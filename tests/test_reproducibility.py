@@ -53,10 +53,10 @@ def snapshot(path, mode, seed, videos):
     trajectory = []
     original_act = ppo.act
 
-    def record_act(state, obs, key):
-        result = original_act(state, obs, key)
+    def record_act(state, obs, carry, episode_starts, key):
+        result = original_act(state, obs, carry, episode_starts, key)
         if obs.shape[0] == config.num_envs:  # Exclude the separate video game.
-            trajectory.append(digest((obs, result)))
+            trajectory.append(digest((obs, carry, episode_starts, result)))
         return result
 
     with TemporaryDirectory() as log_dir:

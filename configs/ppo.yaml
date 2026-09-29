@@ -4,12 +4,15 @@ total_steps: 10000000
 num_envs: 8
 vector_env: async # async (subprocesses) or sync
 num_steps: 128
-num_minibatches: 4
+num_minibatches: 4 # Must divide num_envs; minibatches contain whole sequences
 update_epochs: 4
+lstm_hidden_size: 256
 learning_rate: 0.00025
+anneal_lr: true # Linear decay over the training budget; false keeps a constant rate
 gamma: 0.99
 gae_lambda: 0.95
 clip_coef: 0.1
+target_kl: 0.01 # null disables KL early stopping
 entropy_coef: 0.01
 value_coef: 0.5
 max_grad_norm: 0.5

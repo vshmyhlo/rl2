@@ -1,4 +1,4 @@
-"""Clipped PPO with a shared Atari CNN."""
+"""Recurrent PPO with a shared Atari CNN and LSTM."""
 
 import argparse
 from collections import deque
@@ -30,10 +30,13 @@ class Config:
     num_steps: int
     num_minibatches: int
     update_epochs: int
+    lstm_hidden_size: int
     learning_rate: float
+    anneal_lr: bool
     gamma: float
     gae_lambda: float
     clip_coef: float
+    target_kl: float | None
     entropy_coef: float
     value_coef: float
     max_grad_norm: float
@@ -46,43 +49,99 @@ def load_config(path):
         return Config(**yaml.safe_load(file))
 
 
-class ActorCritic(nn.Module):
-    num_actions: int
+def learning_rate_schedule(config):
+    num_rollouts = config.total_steps // (config.num_envs * config.num_steps)
+    return optax.linear_schedule(
+        config.learning_rate, 0.0 if config.anneal_lr else config.learning_rate, num_rollouts,
+    )
+
+
+def initial_carry(num_envs, hidden_size):
+    return (jnp.zeros((num_envs, hidden_size)), jnp.zeros((num_envs, hidden_size)))
+
+
+class ResetLSTM(nn.Module):
+    features: int
 
     @nn.compact
-    def __call__(self, obs):
+    def __call__(self, carry, inputs):
+        x, episode_starts = inputs
+        carry = jax.tree.map(lambda c: jnp.where(episode_starts[:, None], 0, c), carry)
+        return nn.OptimizedLSTMCell(self.features)(carry, x)
+
+
+class ActorCritic(nn.Module):
+    num_actions: int
+    lstm_hidden_size: int
+
+    @nn.compact
+    def __call__(self, obs, carry, episode_starts):
+        # Time-major sequences: [steps, environments, frames, height, width].
+        steps, environments = obs.shape[:2]
+        obs = obs.reshape((-1, *obs.shape[2:]))
         x = jnp.moveaxis(obs, 1, -1).astype(jnp.float32) / 255.0
         init = nn.initializers.orthogonal(np.sqrt(2))
         for channels, kernel, stride in [(32, 8, 4), (64, 4, 2), (64, 3, 1)]:
-            x = nn.relu(nn.Conv(channels, (kernel, kernel), (stride, stride),
-                                padding="VALID", kernel_init=init)(x))
-        x = nn.relu(nn.Dense(512, kernel_init=init)(x.reshape((x.shape[0], -1))))
-        logits = nn.Dense(self.num_actions, kernel_init=nn.initializers.orthogonal(0.01))(x)
-        value = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(x)
-        return logits, value.squeeze(-1)
+            x = nn.Conv(channels, (kernel, kernel), (stride, stride),
+                        padding="VALID", kernel_init=init)(x)
+            x = nn.relu(nn.LayerNorm(reduction_axes=-1, feature_axes=-1)(x))
+        x = nn.Dense(512, kernel_init=init)(x.reshape((x.shape[0], -1)))
+        x = nn.relu(nn.LayerNorm(name="shared_norm")(x))
+        carry, x = nn.scan(
+            ResetLSTM, variable_broadcast="params", split_rngs={"params": False},
+            in_axes=0, out_axes=0,
+        )(self.lstm_hidden_size, name="lstm")(
+            carry, (x.reshape((steps, environments, -1)), episode_starts),
+        )
+        policy = nn.Dense(256, kernel_init=init, name="policy_hidden")(x)
+        policy = nn.relu(nn.LayerNorm(name="policy_norm")(policy))
+        critic = nn.Dense(256, kernel_init=init, name="value_hidden")(x)
+        critic = nn.relu(nn.LayerNorm(name="value_norm")(critic))
+        logits = nn.Dense(self.num_actions, kernel_init=nn.initializers.orthogonal(0.01),
+                          name="policy_output")(policy)
+        value = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0),
+                         name="value_output")(critic)
+        return carry, logits, value.squeeze(-1)
+
+
+class AtariPreprocessing(gym.wrappers.AtariPreprocessing):
+    def step(self, action):
+        obs, reward, terminated, truncated, info = super().step(action)
+        if truncated and not terminated:
+            # Gymnasium breaks action repeat before capturing the final screen.
+            # Bootstrap from that screen alone, without pooling in stale frames.
+            capture = self.ale.getScreenGrayscale if self.grayscale_obs else self.ale.getScreenRGB
+            capture(self.obs_buffer[0])
+            self.obs_buffer[1].fill(0)
+            obs = self._get_obs()
+        return obs, reward, terminated, truncated, info
 
 
 def make_env(env_id, render_mode=None):
     gym.register_envs(ale_py)
     env = gym.make(env_id, frameskip=1, render_mode=render_mode)
-    env = gym.wrappers.AtariPreprocessing(env)
+    env = AtariPreprocessing(env)
     return gym.wrappers.FrameStackObservation(env, stack_size=4)
 
 
 def action_log_prob(logits, actions):
-    return jnp.take_along_axis(jax.nn.log_softmax(logits), actions[:, None], axis=-1)[:, 0]
+    return jnp.take_along_axis(jax.nn.log_softmax(logits), actions[..., None], axis=-1)[..., 0]
 
 
 @jax.jit
-def act(state, obs, key):
-    logits, values = state.apply_fn({"params": state.params}, obs)
+def act(state, obs, carry, episode_starts, key):
+    carry, logits, values = state.apply_fn(
+        {"params": state.params}, obs[None], carry, episode_starts[None],
+    )
+    logits, values = logits[0], values[0]
     actions = jax.random.categorical(key, logits)
-    return actions, action_log_prob(logits, actions), values
+    return actions, action_log_prob(logits, actions), values, carry
 
 
 @jax.jit
-def value(state, obs):
-    return state.apply_fn({"params": state.params}, obs)[1]
+def value(state, obs, carry, episode_starts):
+    # Peek at the next value without advancing the rollout's recurrent state.
+    return state.apply_fn({"params": state.params}, obs[None], carry, episode_starts[None])[2][0]
 
 
 def log_video(state, config, writer, episode, steps):
@@ -91,10 +150,11 @@ def log_video(state, config, writer, episode, steps):
         obs, _ = env.reset(seed=config.seed + episode)
         key = jax.random.fold_in(jax.random.key(config.seed), episode)
         frames = [env.render()]
+        carry = initial_carry(1, config.lstm_hidden_size)
         done = False
         while not done:
             key, action_key = jax.random.split(key)
-            actions, _, _ = act(state, obs[None], action_key)
+            actions, _, _, carry = act(state, obs[None], carry, jnp.zeros(1, dtype=bool), action_key)
             obs, _, terminated, truncated, _ = env.step(int(actions[0]))
             frames.append(env.render())
             done = terminated or truncated
@@ -124,38 +184,57 @@ def gae(rewards, dones, values, next_value, gamma, gae_lambda):
     return advantages, advantages + values
 
 
+def explained_variance(values, returns):
+    variance = np.var(returns)
+    return float(1 - np.var(returns - values) / variance) if variance > 0 else np.nan
+
+
 @partial(jax.jit, static_argnames="config")
 def update(state, batch, config):
-    obs, actions, old_log_probs, advantages, returns = batch
+    obs, actions, old_log_probs, advantages, returns, carry, episode_starts = batch
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     def loss_fn(params):
-        logits, values = state.apply_fn({"params": params}, obs)
+        _, logits, values = state.apply_fn({"params": params}, obs, carry, episode_starts)
         log_probs = action_log_prob(logits, actions)
-        ratio = jnp.exp(log_probs - old_log_probs)
+        log_ratio = log_probs - old_log_probs
+        ratio = jnp.exp(log_ratio)
         clipped = jnp.clip(ratio, 1 - config.clip_coef, 1 + config.clip_coef)
         policy_loss = -jnp.minimum(ratio * advantages, clipped * advantages).mean()
         value_loss = 0.5 * jnp.square(values - returns).mean()
         entropy = -(jax.nn.softmax(logits) * jax.nn.log_softmax(logits)).sum(-1).mean()
         loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy
-        return loss, (policy_loss, value_loss, entropy)
+        approx_kl = (jnp.expm1(log_ratio) - log_ratio).mean()
+        clip_fraction = (jnp.abs(ratio - 1) > config.clip_coef).mean()
+        return loss, (policy_loss, value_loss, entropy, approx_kl, clip_fraction)
 
     (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-    return state.apply_gradients(grads=grads), metrics
+    if config.target_kl is None:
+        return state.apply_gradients(grads=grads), metrics
+    state = jax.lax.cond(
+        metrics[3] > config.target_kl,
+        lambda: state,
+        lambda: state.apply_gradients(grads=grads),
+    )
+    return state, metrics
 
 
 def train(config: Config):
     batch_size = config.num_envs * config.num_steps
     if min(config.num_envs, config.num_steps, config.num_minibatches, config.update_epochs) < 1:
         raise ValueError("Environment, rollout, minibatch, and epoch counts must be positive")
-    if batch_size % config.num_minibatches:
-        raise ValueError("num_envs * num_steps must be divisible by num_minibatches")
+    if config.num_envs % config.num_minibatches:
+        raise ValueError("num_envs must be divisible by num_minibatches to preserve sequences")
+    if config.lstm_hidden_size < 1:
+        raise ValueError("lstm_hidden_size must be positive")
     if config.total_steps < batch_size:
         raise ValueError("total_steps must cover at least one rollout")
     if config.video_every_episodes < 0:
         raise ValueError("video_every_episodes must be nonnegative (0 disables videos)")
     if config.vector_env not in ("sync", "async"):
         raise ValueError("vector_env must be 'sync' or 'async'")
+    if config.target_kl is not None and (not np.isfinite(config.target_kl) or config.target_kl <= 0):
+        raise ValueError("target_kl must be positive and finite, or null to disable stopping")
 
     vector_cls = gym.vector.AsyncVectorEnv if config.vector_env == "async" else gym.vector.SyncVectorEnv
     # Spawn avoids forking JAX's threads or accelerator runtime.
@@ -177,12 +256,19 @@ def train(config: Config):
         writer.add_text("devices", devices, 0)
         obs, _ = envs.reset(seed=config.seed)
         key, init_key = jax.random.split(jax.random.key(config.seed))
-        model = ActorCritic(envs.single_action_space.n)
+        model = ActorCritic(envs.single_action_space.n, config.lstm_hidden_size)
+        carry = initial_carry(config.num_envs, config.lstm_hidden_size)
+        episode_start = np.ones(config.num_envs, dtype=bool)
+        lr_schedule = learning_rate_schedule(config)
+        optimizer = optax.inject_hyperparams(lambda learning_rate: optax.chain(
+            optax.clip_by_global_norm(config.max_grad_norm),
+            optax.adam(learning_rate, eps=1e-5),
+        ))
         state = TrainState.create(
             apply_fn=model.apply,
-            params=model.init(init_key, obs[:1])["params"],
-            tx=optax.chain(optax.clip_by_global_norm(config.max_grad_norm),
-                           optax.adam(config.learning_rate, eps=1e-5)),
+            params=model.init(init_key, obs[None, :1],
+                              initial_carry(1, config.lstm_hidden_size), episode_start[None, :1])["params"],
+            tx=optimizer(config.learning_rate),
         )
         rng = np.random.default_rng(config.seed)
         episode_returns = np.zeros(config.num_envs)
@@ -197,19 +283,27 @@ def train(config: Config):
         actions = np.empty(shape, dtype=np.int32)
         log_probs, values, rewards = [np.empty(shape, dtype=np.float32) for _ in range(3)]
         dones = np.empty(shape, dtype=bool)
+        episode_starts = np.empty(shape, dtype=bool)
 
         for iteration in range(config.total_steps // batch_size):
+            # Truncated BPTT: preserve memory, but gradients stop at rollout boundaries.
+            rollout_carry = jax.tree.map(jax.lax.stop_gradient, carry)
             for t in range(config.num_steps):
                 observations[t] = obs
+                episode_starts[t] = episode_start
                 key, action_key = jax.random.split(key)
-                actions[t], log_probs[t], values[t] = jax.device_get(act(state, obs, action_key))
+                action, log_prob, prediction, carry = act(state, obs, carry, episode_start, action_key)
+                actions[t], log_probs[t], values[t] = jax.device_get((action, log_prob, prediction))
                 obs, reward, terminated, truncated, _ = envs.step(actions[t])
                 dones[t] = terminated | truncated
                 rewards[t] = np.sign(reward)
                 # Bootstrap time limits from the final observation, before resetting.
                 timeout = truncated & ~terminated
                 if timeout.any():
-                    rewards[t] += config.gamma * np.asarray(value(state, obs)) * timeout
+                    rewards[t] += config.gamma * np.asarray(value(
+                        state, obs, carry, np.zeros(config.num_envs, dtype=bool),
+                    )) * timeout
+                episode_start = dones[t].copy()
                 episode_returns += reward
                 episode_lengths += 1
                 recent_returns.extend(episode_returns[dones[t]])
@@ -221,21 +315,43 @@ def train(config: Config):
                     obs, _ = envs.reset(options={"reset_mask": dones[t].copy()})
 
             advantages, returns = jax.device_get(gae(
-                rewards, dones, values, value(state, obs), config.gamma, config.gae_lambda,
+                rewards, dones, values, value(state, obs, carry, episode_start), config.gamma, config.gae_lambda,
             ))
             # Keep uint8 rollouts on the host; transfer only each minibatch to JAX.
-            batch = [x.reshape((batch_size, *x.shape[2:])) for x in
-                     (observations, actions, log_probs, advantages, returns)]
+            batch = (observations, actions, log_probs, advantages, returns)
+            learning_rate = float(lr_schedule(iteration))
+            state = state.replace(opt_state=state.opt_state._replace(hyperparams={
+                **state.opt_state.hyperparams, "learning_rate": jnp.asarray(learning_rate),
+            }))
             metrics = []
+            early_stop = False
+            updates_done = 0
             for _ in range(config.update_epochs):
-                for indices in np.split(rng.permutation(batch_size), config.num_minibatches):
-                    state, metric = update(state, tuple(x[indices] for x in batch), config)
+                for indices in np.split(rng.permutation(config.num_envs), config.num_minibatches):
+                    minibatch = (*[x[:, indices] for x in batch],
+                                 jax.tree.map(lambda c: c[indices], rollout_carry), episode_starts[:, indices])
+                    state, metric = update(state, minibatch, config)
                     metrics.append(metric)
-            policy_loss, value_loss, entropy = np.mean(jax.device_get(metrics), axis=0)
+                    if config.target_kl is not None and float(metric[3]) > config.target_kl:
+                        early_stop = True
+                        break
+                    updates_done += 1
+                if early_stop:
+                    break
+            policy_loss, value_loss, entropy, approx_kl, clip_fraction = np.mean(
+                jax.device_get(metrics), axis=0,
+            )
+            # Evaluate rollout-time predictions against the full rollout's GAE returns.
+            explained_var = explained_variance(values, returns)
             steps = (iteration + 1) * batch_size
             sps = steps / (monotonic() - start)
             for tag, scalar in {"losses/policy": policy_loss, "losses/value": value_loss,
                                 "policy/entropy": entropy, "charts/steps_per_second": sps,
+                                "policy/approx_kl": approx_kl, "policy/clip_fraction": clip_fraction,
+                                "value/explained_variance": explained_var,
+                                "charts/learning_rate": learning_rate,
+                                "charts/updates_per_rollout": updates_done,
+                                "policy/early_stop": early_stop,
                                 "charts/total_episodes": completed_episodes}.items():
                 writer.add_scalar(tag, float(scalar), steps)
             if recent_returns:
@@ -248,8 +364,10 @@ def train(config: Config):
             score = f"{np.mean(recent_returns):.1f}" if recent_returns else "n/a"
             length = f"{np.mean(recent_lengths):.1f}" if recent_lengths else "n/a"
             print(f"step={steps} episodes={completed_episodes} return={score} "
-                  f"episode_length={length} sps={sps:.0f} "
-                  f"policy={policy_loss:.3f} value={value_loss:.3f} entropy={entropy:.3f}",
+                  f"episode_length={length} sps={sps:.0f} lr={learning_rate:.3g} "
+                  f"policy={policy_loss:.3f} value={value_loss:.3f} entropy={entropy:.3f} "
+                  f"kl={approx_kl:.4f} clipfrac={clip_fraction:.3f} ev={explained_var:.3f} "
+                  f"updates={updates_done} early_stop={early_stop}",
                   flush=True)
         return state
     finally:
