@@ -1,5 +1,7 @@
 import contextlib
+from dataclasses import replace
 import io
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -7,7 +9,7 @@ import gymnasium as gym
 import jax
 import numpy as np
 
-from rl2.ppo import Config, gae, make_env, train
+from rl2.ppo import gae, load_config, make_env, train
 
 
 class PPOTests(unittest.TestCase):
@@ -41,8 +43,9 @@ class PPOTests(unittest.TestCase):
             created.append(env)
             return env
 
-        config = Config(total_steps=16, num_envs=2, num_steps=4,
-                        num_minibatches=2, update_epochs=1)
+        config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+                         total_steps=16, num_envs=2, num_steps=4,
+                         num_minibatches=2, update_epochs=1)
         output = io.StringIO()
         with patch("rl2.ppo.make_env", side_effect=short_env), contextlib.redirect_stdout(output):
             state = train(config)

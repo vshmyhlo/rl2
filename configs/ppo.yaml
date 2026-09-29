@@ -1,0 +1,14 @@
+env_id: ALE/Pong-v5
+seed: 1
+total_steps: 10000000
+num_envs: 8
+num_steps: 128
+num_minibatches: 4
+update_epochs: 4
+learning_rate: 0.00025
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.1
+entropy_coef: 0.01
+value_coef: 0.5
+max_grad_norm: 0.5

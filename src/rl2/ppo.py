@@ -1,5 +1,6 @@
 """Clipped PPO with a shared Atari CNN."""
 
+import argparse
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
@@ -13,25 +14,30 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import tyro
+import yaml
 
 
 @dataclass(frozen=True)
 class Config:
-    env_id: str = "ALE/Pong-v5"
-    seed: int = 1
-    total_steps: int = 10_000_000
-    num_envs: int = 8
-    num_steps: int = 128
-    num_minibatches: int = 4
-    update_epochs: int = 4
-    learning_rate: float = 2.5e-4
-    gamma: float = 0.99
-    gae_lambda: float = 0.95
-    clip_coef: float = 0.1
-    entropy_coef: float = 0.01
-    value_coef: float = 0.5
-    max_grad_norm: float = 0.5
+    env_id: str
+    seed: int
+    total_steps: int
+    num_envs: int
+    num_steps: int
+    num_minibatches: int
+    update_epochs: int
+    learning_rate: float
+    gamma: float
+    gae_lambda: float
+    clip_coef: float
+    entropy_coef: float
+    value_coef: float
+    max_grad_norm: float
+
+
+def load_config(path):
+    with open(path) as file:
+        return Config(**yaml.safe_load(file))
 
 
 class ActorCritic(nn.Module):
@@ -185,7 +191,9 @@ def train(config: Config):
 
 
 def main():
-    train(tyro.cli(Config))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="configs/ppo.yaml", help="Path to a YAML config")
+    train(load_config(parser.parse_args().config))
 
 
 if __name__ == "__main__":
