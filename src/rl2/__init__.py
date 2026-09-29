@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from rl2!")
+"""Barebones reinforcement learning experiments."""

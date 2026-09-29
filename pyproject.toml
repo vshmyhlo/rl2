@@ -1,16 +1,25 @@
 [project]
 name = "rl2"
 version = "0.1.0"
-description = "Add your description here"
+description = "Barebones PPO for Atari in JAX and Flax"
 readme = "README.md"
 authors = [
     { name = "vshmyhlo", email = "vlad@cohere.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "ale-py>=0.11,<0.12",
+    "flax>=0.10,<0.13",
+    "gymnasium>=1.1,<2",
+    "jax>=0.4.35,<0.10",
+    "numpy>=2,<3",
+    "opencv-python-headless>=4.10,<5",
+    "optax>=0.2.4,<0.3",
+    "tyro>=0.9,<1",
+]
 
 [project.scripts]
-rl2 = "rl2:main"
+rl2 = "rl2.ppo:main"
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
