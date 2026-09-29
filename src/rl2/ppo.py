@@ -37,6 +37,7 @@ class Config:
     value_coef: float
     max_grad_norm: float
     log_dir: str
+    video_every_episodes: int
 
 
 def load_config(path):
@@ -60,9 +61,9 @@ class ActorCritic(nn.Module):
         return logits, value.squeeze(-1)
 
 
-def make_env(env_id):
+def make_env(env_id, render_mode=None):
     gym.register_envs(ale_py)
-    env = gym.make(env_id, frameskip=1)
+    env = gym.make(env_id, frameskip=1, render_mode=render_mode)
     env = gym.wrappers.AtariPreprocessing(env)
     return gym.wrappers.FrameStackObservation(env, stack_size=4)
 
@@ -81,6 +82,27 @@ def act(state, obs, key):
 @jax.jit
 def value(state, obs):
     return state.apply_fn({"params": state.params}, obs)[1]
+
+
+def log_video(state, config, writer, episode, steps):
+    env = make_env(config.env_id, render_mode="rgb_array")
+    try:
+        obs, _ = env.reset(seed=config.seed + episode)
+        key = jax.random.fold_in(jax.random.key(config.seed), episode)
+        frames = [env.render()]
+        done = False
+        while not done:
+            key, action_key = jax.random.split(key)
+            actions, _, _ = act(state, obs[None], action_key)
+            obs, _, terminated, truncated, _ = env.step(int(actions[0]))
+            frames.append(env.render())
+            done = terminated or truncated
+        # One RGB frame per agent step; Atari preprocessing repeats each action 4 times.
+        video = np.stack(frames).transpose(0, 3, 1, 2)[None]
+        writer.add_video("gameplay", video, steps, fps=env.metadata["render_fps"] / 4)
+        print(f"Recorded game after {episode} training episodes", flush=True)
+    finally:
+        env.close()
 
 
 @jax.jit
@@ -129,6 +151,8 @@ def train(config: Config):
         raise ValueError("num_envs * num_steps must be divisible by num_minibatches")
     if config.total_steps < batch_size:
         raise ValueError("total_steps must cover at least one rollout")
+    if config.video_every_episodes < 0:
+        raise ValueError("video_every_episodes must be nonnegative (0 disables videos)")
 
     envs = gym.vector.SyncVectorEnv(
         [partial(make_env, config.env_id) for _ in range(config.num_envs)],
@@ -155,6 +179,8 @@ def train(config: Config):
         episode_lengths = np.zeros(config.num_envs, dtype=np.int64)
         recent_returns = deque(maxlen=100)
         recent_lengths = deque(maxlen=100)
+        completed_episodes = 0
+        next_video_episode = config.video_every_episodes
         start = monotonic()
         shape = (config.num_steps, config.num_envs)
         observations = np.empty((*shape, *obs.shape[1:]), dtype=np.uint8)
@@ -178,6 +204,7 @@ def train(config: Config):
                 episode_lengths += 1
                 recent_returns.extend(episode_returns[dones[t]])
                 recent_lengths.extend(episode_lengths[dones[t]])
+                completed_episodes += int(dones[t].sum())
                 episode_returns[dones[t]] = 0
                 episode_lengths[dones[t]] = 0
                 if dones[t].any():
@@ -203,6 +230,9 @@ def train(config: Config):
             if recent_returns:
                 writer.add_scalar("charts/return_mean_100", float(np.mean(recent_returns)), steps)
                 writer.add_scalar("charts/episode_length_mean_100", float(np.mean(recent_lengths)), steps)
+            while config.video_every_episodes and completed_episodes >= next_video_episode:
+                log_video(state, config, writer, next_video_episode, steps)
+                next_video_episode += config.video_every_episodes
             writer.flush()
             score = f"{np.mean(recent_returns):.1f}" if recent_returns else "n/a"
             length = f"{np.mean(recent_lengths):.1f}" if recent_lengths else "n/a"

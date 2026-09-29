@@ -9,6 +9,7 @@ from unittest.mock import patch
 import gymnasium as gym
 import jax
 import numpy as np
+from PIL import Image
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from rl2.ppo import gae, load_config, make_env, train
@@ -39,16 +40,17 @@ class PPOTests(unittest.TestCase):
     def test_atari_training_across_resets(self):
         created = []
 
-        def short_env(env_id):
+        def short_env(env_id, render_mode=None):
             # Stagger timeouts across rollouts; raw rewards differ from clipped rewards.
-            env = gym.wrappers.TransformReward(make_env(env_id), lambda reward: 2.0)
-            env = gym.wrappers.TimeLimit(env, max_episode_steps=2 + 3 * len(created))
+            env = gym.wrappers.TransformReward(make_env(env_id, render_mode), lambda reward: 2.0)
+            limit = 3 if render_mode else 2 + 3 * len(created)
+            env = gym.wrappers.TimeLimit(env, max_episode_steps=limit)
             created.append(env)
             return env
 
         config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
                          total_steps=16, num_envs=2, num_steps=4,
-                         num_minibatches=2, update_epochs=1)
+                         num_minibatches=2, update_epochs=1, video_every_episodes=2)
         output = io.StringIO()
         with TemporaryDirectory() as log_dir:
             with patch("rl2.ppo.make_env", side_effect=short_env), contextlib.redirect_stdout(output):
@@ -71,6 +73,12 @@ class PPOTests(unittest.TestCase):
             )
             config_text = events.Tensors("config/text_summary")[0].tensor_proto.string_val[0]
             self.assertIn(b"env_id: ALE/Pong-v5", config_text)
+            videos = events.Images("gameplay")
+            self.assertEqual([event.step for event in videos], [8, 16])
+            for video in videos:
+                with Image.open(io.BytesIO(video.encoded_image_string)) as image:
+                    self.assertEqual(image.format, "GIF")
+                    self.assertEqual(image.size, (160, 210))
         self.assertEqual(int(state.step), 4)
         for leaf in jax.tree.leaves(state.params):
             self.assertTrue(np.isfinite(leaf).all())

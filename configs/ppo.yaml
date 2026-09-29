@@ -13,3 +13,4 @@ entropy_coef: 0.01
 value_coef: 0.5
 max_grad_norm: 0.5
 log_dir: runs
+video_every_episodes: 100 # 0 disables recording

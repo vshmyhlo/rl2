@@ -12,12 +12,13 @@ dependencies = [
     "flax>=0.10,<0.13",
     "gymnasium>=1.1,<2",
     "jax>=0.4.35,<0.10",
+    "moviepy>=2.2,<3",
     "numpy>=2,<3",
     "opencv-python-headless>=4.10,<5",
     "optax>=0.2.4,<0.3",
     "pyyaml>=6,<7",
     "tensorboard>=2.18,<3",
-    "tensorboardx>=2.6,<3",
+    "tensorboardx>=2.6.5,<3",
 ]
 
 [project.scripts]

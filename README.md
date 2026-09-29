@@ -41,9 +41,16 @@ plotted against agent transitions. Episode metrics include completed episodes on
 (including timeouts) and appear after the first episode ends.
 The Text tab contains each run's YAML config.
 
+Every `video_every_episodes: 100` completed training episodes (across all environments),
+the trainer plays one separate game with the current policy and logs it under
+`gameplay` in TensorBoard's Images tab as an animated GIF. Recording happens after
+the rollout update, includes the whole game, and uses a separate environment and
+random seed. Recorded games do not count toward training steps or episode metrics.
+Set `video_every_episodes: 0` to disable videos. Recording and encoding pause training.
+
 Python 3.12+; `uv` installs dependencies, including ALE's bundled ROMs. The default
 JAX install runs on CPU; for NVIDIA GPUs, install the appropriate
 [JAX accelerator package](https://docs.jax.dev/en/latest/installation.html).
-This is a minimal trainer: no checkpoints or evaluation loop.
+This is a minimal trainer with no checkpoints.
 
 Tests: `uv run python -m unittest discover -s tests`.
