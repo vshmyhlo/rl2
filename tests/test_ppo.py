@@ -68,10 +68,13 @@ class PPOTests(unittest.TestCase):
             events = EventAccumulator(str(run_dir)).Reload()
             for tag in ("losses/policy", "losses/value", "policy/entropy",
                         "charts/steps_per_second", "charts/return_mean_100",
-                        "charts/episode_length_mean_100"):
+                        "charts/episode_length_mean_100", "charts/total_episodes"):
                 scalars = events.Scalars(tag)
                 self.assertEqual([event.step for event in scalars], [8, 16])
                 self.assertTrue(all(np.isfinite(event.value) for event in scalars))
+            self.assertEqual(
+                [event.value for event in events.Scalars("charts/total_episodes")], [2, 5],
+            )
             np.testing.assert_allclose(
                 [event.value for event in events.Scalars("charts/episode_length_mean_100")],
                 [2.0, 2.6],
@@ -92,6 +95,7 @@ class PPOTests(unittest.TestCase):
         for leaf in jax.tree.leaves(state.params):
             self.assertTrue(np.isfinite(leaf).all())
         self.assertIn("step=16", output.getvalue())
+        self.assertIn("step=16 episodes=5", output.getvalue())
         self.assertNotIn("return=n/a", output.getvalue())
         self.assertIn("episode_length=2.6", output.getvalue())
 

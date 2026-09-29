@@ -41,7 +41,8 @@ uv run tensorboard --logdir runs
 ```
 
 Visit http://localhost:6006 to compare runs. Scalars show policy/value losses,
-entropy, steps/second, `charts/return_mean_100`, and `charts/episode_length_mean_100`,
+entropy, steps/second, `charts/return_mean_100`, `charts/episode_length_mean_100`,
+and `charts/total_episodes` (cumulative completed training episodes across all environments),
 plotted against agent transitions. Episode metrics include completed episodes only
 (including timeouts) and appear after the first episode ends.
 The Text tab contains each run's YAML config.
@@ -74,3 +75,21 @@ This is a minimal trainer with no checkpoints.
 Tests: `uv run python -m unittest discover -s tests`.
 Metal tests: `JAX_PLATFORMS=metal uv run --extra metal python -m unittest discover -s tests`.
 Both pass with JAX 0.11.2, Flax 0.12.10, and metaljax 0.11.9 on macOS 26.6.2.
+
+Reproducibility: `seed` controls model initialization, action sampling, minibatch
+shuffling, and Atari seeds (`seed + environment index`). Video games use separate
+random keys and environments. Keep the same code, YAML, backend, hardware, and
+locked dependencies (`uv run --locked ...`) when reproducing a run. Exact equality
+across CPU/Metal or different library versions is not guaranteed; timestamps,
+run directory names, and throughput will differ even for identical training.
+
+The reproducibility regression compares six fresh processes with 128 training
+transitions each, shortened Atari episodes to exercise resets, and 16 gradient
+updates. It checks exact model/optimizer state, observations, sampled actions,
+log-probabilities, values, and metrics across repeated runs, sync/async execution,
+and videos on/off, plus a different-seed control. Run it on the desired backend:
+
+```sh
+JAX_PLATFORMS=cpu uv run --locked python -m unittest discover -s tests -p test_reproducibility.py -v
+JAX_PLATFORMS=metal uv run --locked --extra metal python -m unittest discover -s tests -p test_reproducibility.py -v
+```

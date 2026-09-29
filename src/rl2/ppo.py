@@ -235,7 +235,8 @@ def train(config: Config):
             steps = (iteration + 1) * batch_size
             sps = steps / (monotonic() - start)
             for tag, scalar in {"losses/policy": policy_loss, "losses/value": value_loss,
-                                "policy/entropy": entropy, "charts/steps_per_second": sps}.items():
+                                "policy/entropy": entropy, "charts/steps_per_second": sps,
+                                "charts/total_episodes": completed_episodes}.items():
                 writer.add_scalar(tag, float(scalar), steps)
             if recent_returns:
                 writer.add_scalar("charts/return_mean_100", float(np.mean(recent_returns)), steps)
@@ -246,7 +247,8 @@ def train(config: Config):
             writer.flush()
             score = f"{np.mean(recent_returns):.1f}" if recent_returns else "n/a"
             length = f"{np.mean(recent_lengths):.1f}" if recent_lengths else "n/a"
-            print(f"step={steps} return={score} episode_length={length} sps={sps:.0f} "
+            print(f"step={steps} episodes={completed_episodes} return={score} "
+                  f"episode_length={length} sps={sps:.0f} "
                   f"policy={policy_loss:.3f} value={value_loss:.3f} entropy={entropy:.3f}",
                   flush=True)
         return state
