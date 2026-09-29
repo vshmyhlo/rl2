@@ -15,6 +15,19 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 from rl2.ppo import gae, load_config, make_env, train
 
 
+class ShortEpisodes(gym.wrappers.TimeLimit):
+    def reset(self, *, seed=None, options=None):
+        # Seeded limits work in spawned workers and stagger resets across rollouts.
+        if seed is not None:
+            self._max_episode_steps = 3 if self.render_mode else 2 + 3 * ((seed - 1) % 2)
+        return super().reset(seed=seed, options=options)
+
+
+def short_env(env_id, render_mode=None):
+    env = gym.wrappers.TransformReward(make_env(env_id, render_mode), lambda reward: 2.0)
+    return ShortEpisodes(env, max_episode_steps=3)
+
+
 class PPOTests(unittest.TestCase):
     def test_gae_stops_at_game_over(self):
         advantages, returns = gae(
@@ -38,22 +51,18 @@ class PPOTests(unittest.TestCase):
         np.testing.assert_allclose(returns, [[4.564], [4.7]], rtol=1e-6)
 
     def test_atari_training_across_resets(self):
-        created = []
+        for mode in ("sync", "async"):
+            with self.subTest(vector_env=mode):
+                self.check_atari_training(mode)
 
-        def short_env(env_id, render_mode=None):
-            # Stagger timeouts across rollouts; raw rewards differ from clipped rewards.
-            env = gym.wrappers.TransformReward(make_env(env_id, render_mode), lambda reward: 2.0)
-            limit = 3 if render_mode else 2 + 3 * len(created)
-            env = gym.wrappers.TimeLimit(env, max_episode_steps=limit)
-            created.append(env)
-            return env
-
+    def check_atari_training(self, mode):
         config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
                          total_steps=16, num_envs=2, num_steps=4,
-                         num_minibatches=2, update_epochs=1, video_every_episodes=2)
+                         num_minibatches=2, update_epochs=1, video_every_episodes=2,
+                         vector_env=mode)
         output = io.StringIO()
         with TemporaryDirectory() as log_dir:
-            with patch("rl2.ppo.make_env", side_effect=short_env), contextlib.redirect_stdout(output):
+            with patch("rl2.ppo.make_env", new=short_env), contextlib.redirect_stdout(output):
                 state = train(replace(config, log_dir=log_dir))
             run_dir, = Path(log_dir).iterdir()
             events = EventAccumulator(str(run_dir)).Reload()

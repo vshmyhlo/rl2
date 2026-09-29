@@ -15,6 +15,11 @@ uv run rl2 --config configs/custom.yaml # load your own config
 uv run rl2 --help
 ```
 
+`vector_env: async` (default) runs the `num_envs` Atari environments in separate
+spawned processes with shared observation memory. Set `vector_env: sync` to run
+them sequentially in the training process. PPO batch sizes stay the same; compare
+steps/second to see which mode is faster on your machine.
+
 For a quick CPU smoke run, copy the config and set `total_steps: 32`, `num_envs: 2`,
 `num_steps: 16`, `num_minibatches: 2`, and `update_epochs: 1`:
 

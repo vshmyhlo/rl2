@@ -26,6 +26,7 @@ class Config:
     seed: int
     total_steps: int
     num_envs: int
+    vector_env: str
     num_steps: int
     num_minibatches: int
     update_epochs: int
@@ -153,10 +154,16 @@ def train(config: Config):
         raise ValueError("total_steps must cover at least one rollout")
     if config.video_every_episodes < 0:
         raise ValueError("video_every_episodes must be nonnegative (0 disables videos)")
+    if config.vector_env not in ("sync", "async"):
+        raise ValueError("vector_env must be 'sync' or 'async'")
 
-    envs = gym.vector.SyncVectorEnv(
+    vector_cls = gym.vector.AsyncVectorEnv if config.vector_env == "async" else gym.vector.SyncVectorEnv
+    # Spawn avoids forking JAX's threads or accelerator runtime.
+    vector_options = {"context": "spawn"} if config.vector_env == "async" else {}
+    envs = vector_cls(
         [partial(make_env, config.env_id) for _ in range(config.num_envs)],
         autoreset_mode=gym.vector.AutoresetMode.DISABLED,
+        **vector_options,
     )
     writer = None
     try:

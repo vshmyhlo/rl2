@@ -2,6 +2,7 @@ env_id: ALE/Pong-v5
 seed: 1
 total_steps: 10000000
 num_envs: 8
+vector_env: async # async (subprocesses) or sync
 num_steps: 128
 num_minibatches: 4
 update_epochs: 4
