@@ -4,8 +4,13 @@ Tinkering with RL and other things.
 
 Barebones Atari PPO in [JAX + Flax](src/rl2/ppo.py), using Optax and
 Gymnasium/ALE. Shared CNN + LSTM, clipped policy loss, GAE, entropy bonus, gradient
-clipping, and shuffled sequence minibatches. Atari observations use 84×84 grayscale,
-4-frame stacks and action repeat 4; training rewards are sign-clipped.
+clipping, and shuffled sequence minibatches. `atari_preprocessing: false` (default)
+uses native RGB images (210×160 for Pong) and one emulator frame per agent step.
+Set it to `true` for 84×84 grayscale, action repeat 4, max pooling, and random
+no-ops at reset. Raw images require more memory and computation.
+Training rewards are sign-clipped in both modes. `frame_stack: false` (default)
+uses one frame per step, with the LSTM carrying history; `true` stacks 4 frames.
+Both options apply to training and video games, independently of each other.
 
 Each convolution is followed by channel-only LayerNorm and ReLU. Normalization
 is independent at each spatial location and does not use batch statistics.
@@ -56,13 +61,14 @@ For a quick CPU smoke run, copy the config and set `total_steps: 32`, `num_envs:
 uv run rl2 --config configs/smoke.yaml
 ```
 
-`total_steps` counts agent transitions across all environments (roughly four
-Atari frames each), rounded down to full rollouts. Logs show total raw return and
-total episode length, each averaged over the last 100 completed episodes, plus
+`total_steps` counts agent transitions across all environments (one Atari frame
+each, or roughly four with preprocessing), rounded down to full rollouts.
+Logs show total raw return and total episode length, each averaged over the last
+100 completed episodes, plus
 losses, entropy and steps/second. Episode length counts agent steps. Time limits
 bootstrap from the final observation; game overs stop bootstrapping.
-At ALE timeouts, the last stacked frame is captured directly from the emulator
-to avoid Gymnasium's stale frame buffer when action repeat ends early.
+With preprocessing enabled, the final frame at ALE timeouts is captured directly
+from the emulator to avoid Gymnasium's stale frame buffer when action repeat ends early.
 
 Each run also logs to a separate directory under `log_dir` (default: `runs`).
 Open the local TensorBoard UI in another terminal:

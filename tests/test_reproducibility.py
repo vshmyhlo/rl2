@@ -30,8 +30,8 @@ class ShortGame(gym.wrappers.TimeLimit):
 make_atari = ppo.make_env
 
 
-def short_game(env_id, render_mode=None):
-    return ShortGame(make_atari(env_id, render_mode), max_episode_steps=31)
+def short_game(env_id, render_mode=None, frame_stack=False, atari_preprocessing=False):
+    return ShortGame(make_atari(env_id, render_mode, frame_stack, atari_preprocessing), max_episode_steps=31)
 
 
 def digest(tree):

@@ -32,8 +32,10 @@ class ShortEpisodes(gym.wrappers.TimeLimit):
         return super().reset(seed=seed, options=options)
 
 
-def short_env(env_id, render_mode=None):
-    env = gym.wrappers.TransformReward(make_env(env_id, render_mode), lambda reward: 2.0)
+def short_env(env_id, render_mode=None, frame_stack=False, atari_preprocessing=False):
+    env = gym.wrappers.TransformReward(
+        make_env(env_id, render_mode, frame_stack, atari_preprocessing), lambda reward: 2.0,
+    )
     return ShortEpisodes(env, max_episode_steps=3)
 
 
@@ -47,7 +49,7 @@ class PPOTests(unittest.TestCase):
                     return gym_make(*args, **kwargs, max_num_frames_per_episode=frame_limit)
 
                 with patch("rl2.ppo.gym.make", new=limited_env):
-                    env = make_env("ALE/Pong-v5")
+                    env = make_env("ALE/Pong-v5", atari_preprocessing=True)
                 try:
                     env.env.noop_max = 0
                     obs, _ = env.reset(seed=1)
@@ -216,17 +218,20 @@ class PPOTests(unittest.TestCase):
 
     def test_atari_training_across_resets(self):
         for mode in ("sync", "async"):
-            with self.subTest(vector_env=mode):
-                self.check_atari_training(mode)
+            for frame_stack in (False, True):
+                for preprocessing in (False, True):
+                    with self.subTest(vector_env=mode, frame_stack=frame_stack, preprocessing=preprocessing):
+                        self.check_atari_training(mode, frame_stack=frame_stack, preprocessing=preprocessing)
 
     def test_early_stop_resumes_next_rollout_and_anneals_lr(self):
         self.check_atari_training("sync", target_kl=1e-8, update_epochs=3)
 
-    def check_atari_training(self, mode, target_kl=None, update_epochs=1):
+    def check_atari_training(self, mode, target_kl=None, update_epochs=1, frame_stack=False, preprocessing=False):
         config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
                          total_steps=16, num_envs=2, num_steps=4,
                          num_minibatches=2, update_epochs=update_epochs, video_every_episodes=2,
-                         vector_env=mode, target_kl=target_kl)
+                         vector_env=mode, target_kl=target_kl, frame_stack=frame_stack,
+                         atari_preprocessing=preprocessing)
         output = io.StringIO()
         training_steps = 0
         checked_rollouts = set()
@@ -234,6 +239,8 @@ class PPOTests(unittest.TestCase):
 
         def checked_act(state, obs, carry, starts, key):
             nonlocal training_steps, previous_carry
+            image_shape = (84, 84) if preprocessing else (210, 160, 3)
+            self.assertEqual(obs.shape[1:], (4 if frame_stack else 1, *image_shape))
             if obs.shape[0] == config.num_envs:
                 # Memory crosses rollout boundaries and video games cannot overwrite it.
                 np.testing.assert_array_equal(carry, previous_carry)

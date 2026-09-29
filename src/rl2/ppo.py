@@ -23,6 +23,8 @@ import yaml
 @dataclass(frozen=True)
 class Config:
     env_id: str
+    frame_stack: bool
+    atari_preprocessing: bool
     seed: int
     total_steps: int
     num_envs: int
@@ -76,10 +78,15 @@ class ActorCritic(nn.Module):
 
     @nn.compact
     def __call__(self, obs, carry, episode_starts):
-        # Time-major sequences: [steps, environments, frames, height, width].
+        # [steps, environments, frames, height, width, (RGB channels)].
         steps, environments = obs.shape[:2]
         obs = obs.reshape((-1, *obs.shape[2:]))
-        x = jnp.moveaxis(obs, 1, -1).astype(jnp.float32) / 255.0
+        if obs.ndim == 5:  # Raw RGB: combine stacked frames and color channels.
+            x = jnp.transpose(obs, (0, 2, 3, 1, 4))
+            x = x.reshape((*x.shape[:3], -1))
+        else:
+            x = jnp.moveaxis(obs, 1, -1)
+        x = x.astype(jnp.float32) / 255.0
         init = nn.initializers.orthogonal(np.sqrt(2))
         for channels, kernel, stride in [(32, 8, 4), (64, 4, 2), (64, 3, 1)]:
             x = nn.Conv(channels, (kernel, kernel), (stride, stride),
@@ -117,11 +124,14 @@ class AtariPreprocessing(gym.wrappers.AtariPreprocessing):
         return obs, reward, terminated, truncated, info
 
 
-def make_env(env_id, render_mode=None):
+def make_env(env_id, render_mode=None, frame_stack=False, atari_preprocessing=False):
     gym.register_envs(ale_py)
     env = gym.make(env_id, frameskip=1, render_mode=render_mode)
-    env = AtariPreprocessing(env)
-    return gym.wrappers.FrameStackObservation(env, stack_size=4)
+    if atari_preprocessing:
+        env = AtariPreprocessing(env)
+    if frame_stack:
+        return gym.wrappers.FrameStackObservation(env, stack_size=4)
+    return gym.wrappers.ReshapeObservation(env, (1, *env.observation_space.shape))
 
 
 def action_log_prob(logits, actions):
@@ -145,7 +155,8 @@ def value(state, obs, carry, episode_starts):
 
 
 def log_video(state, config, writer, episode, steps):
-    env = make_env(config.env_id, render_mode="rgb_array")
+    env = make_env(config.env_id, render_mode="rgb_array", frame_stack=config.frame_stack,
+                   atari_preprocessing=config.atari_preprocessing)
     try:
         obs, _ = env.reset(seed=config.seed + episode)
         key = jax.random.fold_in(jax.random.key(config.seed), episode)
@@ -158,9 +169,10 @@ def log_video(state, config, writer, episode, steps):
             obs, _, terminated, truncated, _ = env.step(int(actions[0]))
             frames.append(env.render())
             done = terminated or truncated
-        # One RGB frame per agent step; Atari preprocessing repeats each action 4 times.
+        # One recorded frame per agent step, accounting for optional action repeat.
         video = np.stack(frames).transpose(0, 3, 1, 2)[None]
-        writer.add_video("gameplay", video, steps, fps=env.metadata["render_fps"] / 4)
+        writer.add_video("gameplay", video, steps,
+                         fps=env.metadata["render_fps"] / (4 if config.atari_preprocessing else 1))
         print(f"Recorded game after {episode} training episodes", flush=True)
     finally:
         env.close()
@@ -240,7 +252,8 @@ def train(config: Config):
     # Spawn avoids forking JAX's threads or accelerator runtime.
     vector_options = {"context": "spawn"} if config.vector_env == "async" else {}
     envs = vector_cls(
-        [partial(make_env, config.env_id) for _ in range(config.num_envs)],
+        [partial(make_env, config.env_id, frame_stack=config.frame_stack,
+                 atari_preprocessing=config.atari_preprocessing) for _ in range(config.num_envs)],
         autoreset_mode=gym.vector.AutoresetMode.DISABLED,
         **vector_options,
     )

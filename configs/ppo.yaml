@@ -1,4 +1,6 @@
 env_id: ALE/Pong-v5
+frame_stack: false # true stacks 4 frames; false uses a single frame
+atari_preprocessing: false # true enables 84x84 grayscale, action repeat 4, max pooling, and random reset no-ops
 seed: 1
 total_steps: 10000000
 num_envs: 8
