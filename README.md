@@ -51,6 +51,21 @@ Set `video_every_episodes: 0` to disable videos. Recording and encoding pause tr
 Python 3.12+; `uv` installs dependencies, including ALE's bundled ROMs. The default
 JAX install runs on CPU; for NVIDIA GPUs, install the appropriate
 [JAX accelerator package](https://docs.jax.dev/en/latest/installation.html).
+
+On Apple Silicon with macOS 14+, the optional `metal` extra uses the community
+[metaljax backend](https://github.com/eterevsky/metaljax) (beta):
+
+```sh
+JAX_PLATFORMS=metal uv run --extra metal rl2
+```
+
+The trainer prints its JAX devices and saves them in TensorBoard's Text tab;
+the Metal run should report `MetalDevice`. Atari emulation still runs on CPU.
+Use `JAX_PLATFORMS=cpu uv run rl2` to explicitly select CPU. The Metal extra
+requires JAX 0.11.x; use `--extra metal` whenever running with the Metal backend.
+
 This is a minimal trainer with no checkpoints.
 
 Tests: `uv run python -m unittest discover -s tests`.
+Metal tests: `JAX_PLATFORMS=metal uv run --extra metal python -m unittest discover -s tests`.
+Both pass with JAX 0.11.2, Flax 0.12.10, and metaljax 0.11.9 on macOS 26.6.2.
