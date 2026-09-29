@@ -17,6 +17,7 @@ dependencies = [
     "opencv-python-headless>=4.10,<5",
     "optax>=0.2.4,<0.3",
     "pyyaml>=6,<7",
+    "ruff>=0.16.9",
     "tensorboard>=2.18,<3",
     "tensorboardx>=2.6.5,<3",
 ]
@@ -32,3 +33,6 @@ rl2 = "rl2.ppo:main"
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 120

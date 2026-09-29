@@ -7,6 +7,7 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path
 from time import monotonic
+from typing import Any, SupportsFloat
 
 import ale_py
 from flax import linen as nn
@@ -15,9 +16,16 @@ import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
+from numpy.typing import NDArray
 import optax
 from tensorboardX import SummaryWriter
 import yaml
+
+
+type Array = jax.Array | NDArray[Any]
+type LSTMCarry = tuple[jax.Array, jax.Array]
+type PPOBatch = tuple[Array, Array, Array, Array, Array, LSTMCarry, Array]
+type PPOMetrics = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
 
 
 @dataclass(frozen=True)
@@ -46,19 +54,21 @@ class Config:
     video_every_episodes: int
 
 
-def load_config(path):
+def load_config(path: str | Path) -> Config:
     with open(path) as file:
         return Config(**yaml.safe_load(file))
 
 
-def learning_rate_schedule(config):
+def learning_rate_schedule(config: Config) -> optax.Schedule:
     num_rollouts = config.total_steps // (config.num_envs * config.num_steps)
     return optax.linear_schedule(
-        config.learning_rate, 0.0 if config.anneal_lr else config.learning_rate, num_rollouts,
+        config.learning_rate,
+        0.0 if config.anneal_lr else config.learning_rate,
+        num_rollouts,
     )
 
 
-def initial_carry(num_envs, hidden_size):
+def initial_carry(num_envs: int, hidden_size: int) -> LSTMCarry:
     return (jnp.zeros((num_envs, hidden_size)), jnp.zeros((num_envs, hidden_size)))
 
 
@@ -66,7 +76,11 @@ class ResetLSTM(nn.Module):
     features: int
 
     @nn.compact
-    def __call__(self, carry, inputs):
+    def __call__(
+        self,
+        carry: LSTMCarry,
+        inputs: tuple[jax.Array, jax.Array],
+    ) -> tuple[LSTMCarry, jax.Array]:
         x, episode_starts = inputs
         carry = jax.tree.map(lambda c: jnp.where(episode_starts[:, None], 0, c), carry)
         return nn.OptimizedLSTMCell(self.features)(carry, x)
@@ -77,7 +91,12 @@ class ActorCritic(nn.Module):
     lstm_hidden_size: int
 
     @nn.compact
-    def __call__(self, obs, carry, episode_starts):
+    def __call__(
+        self,
+        obs: Array,
+        carry: LSTMCarry,
+        episode_starts: Array,
+    ) -> tuple[LSTMCarry, jax.Array, jax.Array]:
         # [steps, environments, frames, height, width, (RGB channels)].
         steps, environments = obs.shape[:2]
         obs = obs.reshape((-1, *obs.shape[2:]))
@@ -89,30 +108,34 @@ class ActorCritic(nn.Module):
         x = x.astype(jnp.float32) / 255.0
         init = nn.initializers.orthogonal(np.sqrt(2))
         for channels, kernel, stride in [(32, 8, 4), (64, 4, 2), (64, 3, 1)]:
-            x = nn.Conv(channels, (kernel, kernel), (stride, stride),
-                        padding="VALID", kernel_init=init)(x)
+            x = nn.Conv(channels, (kernel, kernel), (stride, stride), padding="VALID", kernel_init=init)(x)
             x = nn.relu(nn.LayerNorm(reduction_axes=-1, feature_axes=-1)(x))
         x = nn.Dense(512, kernel_init=init)(x.reshape((x.shape[0], -1)))
         x = nn.relu(nn.LayerNorm(name="shared_norm")(x))
         carry, x = nn.scan(
-            ResetLSTM, variable_broadcast="params", split_rngs={"params": False},
-            in_axes=0, out_axes=0,
+            ResetLSTM,
+            variable_broadcast="params",
+            split_rngs={"params": False},
+            in_axes=0,
+            out_axes=0,
         )(self.lstm_hidden_size, name="lstm")(
-            carry, (x.reshape((steps, environments, -1)), episode_starts),
+            carry,
+            (x.reshape((steps, environments, -1)), episode_starts),
         )
         policy = nn.Dense(256, kernel_init=init, name="policy_hidden")(x)
         policy = nn.relu(nn.LayerNorm(name="policy_norm")(policy))
         critic = nn.Dense(256, kernel_init=init, name="value_hidden")(x)
         critic = nn.relu(nn.LayerNorm(name="value_norm")(critic))
-        logits = nn.Dense(self.num_actions, kernel_init=nn.initializers.orthogonal(0.01),
-                          name="policy_output")(policy)
-        value = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0),
-                         name="value_output")(critic)
+        logits = nn.Dense(self.num_actions, kernel_init=nn.initializers.orthogonal(0.01), name="policy_output")(policy)
+        value = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0), name="value_output")(critic)
         return carry, logits, value.squeeze(-1)
 
 
 class AtariPreprocessing(gym.wrappers.AtariPreprocessing):
-    def step(self, action):
+    def step(
+        self,
+        action: int | np.integer[Any],
+    ) -> tuple[NDArray[Any], SupportsFloat, bool, bool, dict[str, Any]]:
         obs, reward, terminated, truncated, info = super().step(action)
         if truncated and not terminated:
             # Gymnasium breaks action repeat before capturing the final screen.
@@ -124,7 +147,12 @@ class AtariPreprocessing(gym.wrappers.AtariPreprocessing):
         return obs, reward, terminated, truncated, info
 
 
-def make_env(env_id, render_mode=None, frame_stack=False, atari_preprocessing=False):
+def make_env(
+    env_id: str,
+    render_mode: str | None = None,
+    frame_stack: bool = False,
+    atari_preprocessing: bool = False,
+) -> gym.Env[NDArray[np.uint8], int | np.integer[Any]]:
     gym.register_envs(ale_py)
     env = gym.make(env_id, frameskip=1, render_mode=render_mode)
     if atari_preprocessing:
@@ -134,14 +162,23 @@ def make_env(env_id, render_mode=None, frame_stack=False, atari_preprocessing=Fa
     return gym.wrappers.ReshapeObservation(env, (1, *env.observation_space.shape))
 
 
-def action_log_prob(logits, actions):
+def action_log_prob(logits: Array, actions: Array) -> jax.Array:
     return jnp.take_along_axis(jax.nn.log_softmax(logits), actions[..., None], axis=-1)[..., 0]
 
 
 @jax.jit
-def act(state, obs, carry, episode_starts, key):
+def act(
+    state: TrainState,
+    obs: Array,
+    carry: LSTMCarry,
+    episode_starts: Array,
+    key: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, LSTMCarry]:
     carry, logits, values = state.apply_fn(
-        {"params": state.params}, obs[None], carry, episode_starts[None],
+        {"params": state.params},
+        obs[None],
+        carry,
+        episode_starts[None],
     )
     logits, values = logits[0], values[0]
     actions = jax.random.categorical(key, logits)
@@ -149,14 +186,24 @@ def act(state, obs, carry, episode_starts, key):
 
 
 @jax.jit
-def value(state, obs, carry, episode_starts):
+def value(state: TrainState, obs: Array, carry: LSTMCarry, episode_starts: Array) -> jax.Array:
     # Peek at the next value without advancing the rollout's recurrent state.
     return state.apply_fn({"params": state.params}, obs[None], carry, episode_starts[None])[2][0]
 
 
-def log_video(state, config, writer, episode, steps):
-    env = make_env(config.env_id, render_mode="rgb_array", frame_stack=config.frame_stack,
-                   atari_preprocessing=config.atari_preprocessing)
+def log_video(
+    state: TrainState,
+    config: Config,
+    writer: SummaryWriter,
+    episode: int,
+    steps: int,
+) -> None:
+    env = make_env(
+        config.env_id,
+        render_mode="rgb_array",
+        frame_stack=config.frame_stack,
+        atari_preprocessing=config.atari_preprocessing,
+    )
     try:
         obs, _ = env.reset(seed=config.seed + episode)
         key = jax.random.fold_in(jax.random.key(config.seed), episode)
@@ -171,17 +218,29 @@ def log_video(state, config, writer, episode, steps):
             done = terminated or truncated
         # One recorded frame per agent step, accounting for optional action repeat.
         video = np.stack(frames).transpose(0, 3, 1, 2)[None]
-        writer.add_video("gameplay", video, steps,
-                         fps=env.metadata["render_fps"] / (4 if config.atari_preprocessing else 1))
+        writer.add_video(
+            "gameplay", video, steps, fps=env.metadata["render_fps"] / (4 if config.atari_preprocessing else 1)
+        )
         print(f"Recorded game after {episode} training episodes", flush=True)
     finally:
         env.close()
 
 
 @jax.jit
-def gae(rewards, dones, values, next_value, gamma, gae_lambda):
+def gae(
+    rewards: Array,
+    dones: Array,
+    values: Array,
+    next_value: Array,
+    gamma: float,
+    gae_lambda: float,
+) -> tuple[jax.Array, jax.Array]:
     """Truncation bootstrap is already included in rewards; dones stop traces."""
-    def step(carry, transition):
+
+    def step(
+        carry: tuple[jax.Array, jax.Array],
+        transition: tuple[jax.Array, jax.Array, jax.Array],
+    ) -> tuple[tuple[jax.Array, jax.Array], jax.Array]:
         advantage, next_value = carry
         reward, done, value = transition
         discount = gamma * (1.0 - done)
@@ -190,23 +249,25 @@ def gae(rewards, dones, values, next_value, gamma, gae_lambda):
         return (advantage, value), advantage
 
     _, advantages = jax.lax.scan(
-        step, (jnp.zeros_like(next_value), next_value),
-        (rewards, dones, values), reverse=True,
+        step,
+        (jnp.zeros_like(next_value), next_value),
+        (rewards, dones, values),
+        reverse=True,
     )
     return advantages, advantages + values
 
 
-def explained_variance(values, returns):
+def explained_variance(values: Array, returns: Array) -> float:
     variance = np.var(returns)
     return float(1 - np.var(returns - values) / variance) if variance > 0 else np.nan
 
 
 @partial(jax.jit, static_argnames="config")
-def update(state, batch, config):
+def update(state: TrainState, batch: PPOBatch, config: Config) -> tuple[TrainState, PPOMetrics]:
     obs, actions, old_log_probs, advantages, returns, carry, episode_starts = batch
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-    def loss_fn(params):
+    def loss_fn(params: optax.Params) -> tuple[jax.Array, PPOMetrics]:
         _, logits, values = state.apply_fn({"params": params}, obs, carry, episode_starts)
         log_probs = action_log_prob(logits, actions)
         log_ratio = log_probs - old_log_probs
@@ -231,7 +292,7 @@ def update(state, batch, config):
     return state, metrics
 
 
-def train(config: Config):
+def train(config: Config) -> TrainState:
     batch_size = config.num_envs * config.num_steps
     if min(config.num_envs, config.num_steps, config.num_minibatches, config.update_epochs) < 1:
         raise ValueError("Environment, rollout, minibatch, and epoch counts must be positive")
@@ -252,8 +313,12 @@ def train(config: Config):
     # Spawn avoids forking JAX's threads or accelerator runtime.
     vector_options = {"context": "spawn"} if config.vector_env == "async" else {}
     envs = vector_cls(
-        [partial(make_env, config.env_id, frame_stack=config.frame_stack,
-                 atari_preprocessing=config.atari_preprocessing) for _ in range(config.num_envs)],
+        [
+            partial(
+                make_env, config.env_id, frame_stack=config.frame_stack, atari_preprocessing=config.atari_preprocessing
+            )
+            for _ in range(config.num_envs)
+        ],
         autoreset_mode=gym.vector.AutoresetMode.DISABLED,
         **vector_options,
     )
@@ -273,14 +338,17 @@ def train(config: Config):
         carry = initial_carry(config.num_envs, config.lstm_hidden_size)
         episode_start = np.ones(config.num_envs, dtype=bool)
         lr_schedule = learning_rate_schedule(config)
-        optimizer = optax.inject_hyperparams(lambda learning_rate: optax.chain(
-            optax.clip_by_global_norm(config.max_grad_norm),
-            optax.adam(learning_rate, eps=1e-5),
-        ))
+        optimizer = optax.inject_hyperparams(
+            lambda learning_rate: optax.chain(
+                optax.clip_by_global_norm(config.max_grad_norm),
+                optax.adam(learning_rate, eps=1e-5),
+            )
+        )
         state = TrainState.create(
             apply_fn=model.apply,
-            params=model.init(init_key, obs[None, :1],
-                              initial_carry(1, config.lstm_hidden_size), episode_start[None, :1])["params"],
+            params=model.init(
+                init_key, obs[None, :1], initial_carry(1, config.lstm_hidden_size), episode_start[None, :1]
+            )["params"],
             tx=optimizer(config.learning_rate),
         )
         rng = np.random.default_rng(config.seed)
@@ -313,9 +381,18 @@ def train(config: Config):
                 # Bootstrap time limits from the final observation, before resetting.
                 timeout = truncated & ~terminated
                 if timeout.any():
-                    rewards[t] += config.gamma * np.asarray(value(
-                        state, obs, carry, np.zeros(config.num_envs, dtype=bool),
-                    )) * timeout
+                    rewards[t] += (
+                        config.gamma
+                        * np.asarray(
+                            value(
+                                state,
+                                obs,
+                                carry,
+                                np.zeros(config.num_envs, dtype=bool),
+                            )
+                        )
+                        * timeout
+                    )
                 episode_start = dones[t].copy()
                 episode_returns += reward
                 episode_lengths += 1
@@ -327,22 +404,37 @@ def train(config: Config):
                 if dones[t].any():
                     obs, _ = envs.reset(options={"reset_mask": dones[t].copy()})
 
-            advantages, returns = jax.device_get(gae(
-                rewards, dones, values, value(state, obs, carry, episode_start), config.gamma, config.gae_lambda,
-            ))
+            advantages, returns = jax.device_get(
+                gae(
+                    rewards,
+                    dones,
+                    values,
+                    value(state, obs, carry, episode_start),
+                    config.gamma,
+                    config.gae_lambda,
+                )
+            )
             # Keep uint8 rollouts on the host; transfer only each minibatch to JAX.
             batch = (observations, actions, log_probs, advantages, returns)
             learning_rate = float(lr_schedule(iteration))
-            state = state.replace(opt_state=state.opt_state._replace(hyperparams={
-                **state.opt_state.hyperparams, "learning_rate": jnp.asarray(learning_rate),
-            }))
+            state = state.replace(
+                opt_state=state.opt_state._replace(
+                    hyperparams={
+                        **state.opt_state.hyperparams,
+                        "learning_rate": jnp.asarray(learning_rate),
+                    }
+                )
+            )
             metrics = []
             early_stop = False
             updates_done = 0
             for _ in range(config.update_epochs):
                 for indices in np.split(rng.permutation(config.num_envs), config.num_minibatches):
-                    minibatch = (*[x[:, indices] for x in batch],
-                                 jax.tree.map(lambda c: c[indices], rollout_carry), episode_starts[:, indices])
+                    minibatch = (
+                        *[x[:, indices] for x in batch],
+                        jax.tree.map(lambda c: c[indices], rollout_carry),
+                        episode_starts[:, indices],
+                    )
                     state, metric = update(state, minibatch, config)
                     metrics.append(metric)
                     if config.target_kl is not None and float(metric[3]) > config.target_kl:
@@ -352,20 +444,26 @@ def train(config: Config):
                 if early_stop:
                     break
             policy_loss, value_loss, entropy, approx_kl, clip_fraction = np.mean(
-                jax.device_get(metrics), axis=0,
+                jax.device_get(metrics),
+                axis=0,
             )
             # Evaluate rollout-time predictions against the full rollout's GAE returns.
             explained_var = explained_variance(values, returns)
             steps = (iteration + 1) * batch_size
             sps = steps / (monotonic() - start)
-            for tag, scalar in {"losses/policy": policy_loss, "losses/value": value_loss,
-                                "policy/entropy": entropy, "charts/steps_per_second": sps,
-                                "policy/approx_kl": approx_kl, "policy/clip_fraction": clip_fraction,
-                                "value/explained_variance": explained_var,
-                                "charts/learning_rate": learning_rate,
-                                "charts/updates_per_rollout": updates_done,
-                                "policy/early_stop": early_stop,
-                                "charts/total_episodes": completed_episodes}.items():
+            for tag, scalar in {
+                "losses/policy": policy_loss,
+                "losses/value": value_loss,
+                "policy/entropy": entropy,
+                "charts/steps_per_second": sps,
+                "policy/approx_kl": approx_kl,
+                "policy/clip_fraction": clip_fraction,
+                "value/explained_variance": explained_var,
+                "charts/learning_rate": learning_rate,
+                "charts/updates_per_rollout": updates_done,
+                "policy/early_stop": early_stop,
+                "charts/total_episodes": completed_episodes,
+            }.items():
                 writer.add_scalar(tag, float(scalar), steps)
             if recent_returns:
                 writer.add_scalar("charts/return_mean_100", float(np.mean(recent_returns)), steps)
@@ -376,12 +474,14 @@ def train(config: Config):
             writer.flush()
             score = f"{np.mean(recent_returns):.1f}" if recent_returns else "n/a"
             length = f"{np.mean(recent_lengths):.1f}" if recent_lengths else "n/a"
-            print(f"step={steps} episodes={completed_episodes} return={score} "
-                  f"episode_length={length} sps={sps:.0f} lr={learning_rate:.3g} "
-                  f"policy={policy_loss:.3f} value={value_loss:.3f} entropy={entropy:.3f} "
-                  f"kl={approx_kl:.4f} clipfrac={clip_fraction:.3f} ev={explained_var:.3f} "
-                  f"updates={updates_done} early_stop={early_stop}",
-                  flush=True)
+            print(
+                f"step={steps} episodes={completed_episodes} return={score} "
+                f"episode_length={length} sps={sps:.0f} lr={learning_rate:.3g} "
+                f"policy={policy_loss:.3f} value={value_loss:.3f} entropy={entropy:.3f} "
+                f"kl={approx_kl:.4f} clipfrac={clip_fraction:.3f} ev={explained_var:.3f} "
+                f"updates={updates_done} early_stop={early_stop}",
+                flush=True,
+            )
         return state
     finally:
         envs.close()
@@ -389,7 +489,7 @@ def train(config: Config):
             writer.close()
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/ppo.yaml", help="Path to a YAML config")
     train(load_config(parser.parse_args().config))
