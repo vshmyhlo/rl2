@@ -2,8 +2,10 @@
 
 import argparse
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime
 from functools import partial
+from pathlib import Path
 from time import monotonic
 
 import ale_py
@@ -14,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from tensorboardX import SummaryWriter
 import yaml
 
 
@@ -33,6 +36,7 @@ class Config:
     entropy_coef: float
     value_coef: float
     max_grad_norm: float
+    log_dir: str
 
 
 def load_config(path):
@@ -130,7 +134,13 @@ def train(config: Config):
         [partial(make_env, config.env_id) for _ in range(config.num_envs)],
         autoreset_mode=gym.vector.AutoresetMode.DISABLED,
     )
+    writer = None
     try:
+        run_name = f"{config.env_id.replace('/', '_')}_seed{config.seed}_{datetime.now():%Y%m%d-%H%M%S-%f}"
+        run_dir = Path(config.log_dir) / run_name
+        writer = SummaryWriter(logdir=str(run_dir))
+        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", 0)
+        print(f"TensorBoard run: {run_dir}", flush=True)
         obs, _ = envs.reset(seed=config.seed)
         key, init_key = jax.random.split(jax.random.key(config.seed))
         model = ActorCritic(envs.single_action_space.n)
@@ -142,7 +152,9 @@ def train(config: Config):
         )
         rng = np.random.default_rng(config.seed)
         episode_returns = np.zeros(config.num_envs)
+        episode_lengths = np.zeros(config.num_envs, dtype=np.int64)
         recent_returns = deque(maxlen=100)
+        recent_lengths = deque(maxlen=100)
         start = monotonic()
         shape = (config.num_steps, config.num_envs)
         observations = np.empty((*shape, *obs.shape[1:]), dtype=np.uint8)
@@ -163,8 +175,11 @@ def train(config: Config):
                 if timeout.any():
                     rewards[t] += config.gamma * np.asarray(value(state, obs)) * timeout
                 episode_returns += reward
+                episode_lengths += 1
                 recent_returns.extend(episode_returns[dones[t]])
+                recent_lengths.extend(episode_lengths[dones[t]])
                 episode_returns[dones[t]] = 0
+                episode_lengths[dones[t]] = 0
                 if dones[t].any():
                     obs, _ = envs.reset(options={"reset_mask": dones[t].copy()})
 
@@ -181,13 +196,24 @@ def train(config: Config):
                     metrics.append(metric)
             policy_loss, value_loss, entropy = np.mean(jax.device_get(metrics), axis=0)
             steps = (iteration + 1) * batch_size
+            sps = steps / (monotonic() - start)
+            for tag, scalar in {"losses/policy": policy_loss, "losses/value": value_loss,
+                                "policy/entropy": entropy, "charts/steps_per_second": sps}.items():
+                writer.add_scalar(tag, float(scalar), steps)
+            if recent_returns:
+                writer.add_scalar("charts/return_mean_100", float(np.mean(recent_returns)), steps)
+                writer.add_scalar("charts/episode_length_mean_100", float(np.mean(recent_lengths)), steps)
+            writer.flush()
             score = f"{np.mean(recent_returns):.1f}" if recent_returns else "n/a"
-            print(f"step={steps} return={score} sps={steps / (monotonic() - start):.0f} "
+            length = f"{np.mean(recent_lengths):.1f}" if recent_lengths else "n/a"
+            print(f"step={steps} return={score} episode_length={length} sps={sps:.0f} "
                   f"policy={policy_loss:.3f} value={value_loss:.3f} entropy={entropy:.3f}",
                   flush=True)
         return state
     finally:
         envs.close()
+        if writer is not None:
+            writer.close()
 
 
 def main():

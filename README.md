@@ -23,13 +23,27 @@ uv run rl2 --config configs/smoke.yaml
 ```
 
 `total_steps` counts agent transitions across all environments (roughly four
-Atari frames each), rounded down to full rollouts. Logs show the mean raw return
-over the last 100 completed games, losses, entropy and steps/second. Time limits
+Atari frames each), rounded down to full rollouts. Logs show total raw return and
+total episode length, each averaged over the last 100 completed episodes, plus
+losses, entropy and steps/second. Episode length counts agent steps. Time limits
 bootstrap from the final observation; game overs stop bootstrapping.
+
+Each run also logs to a separate directory under `log_dir` (default: `runs`).
+Open the local TensorBoard UI in another terminal:
+
+```sh
+uv run tensorboard --logdir runs
+```
+
+Visit http://localhost:6006 to compare runs. Scalars show policy/value losses,
+entropy, steps/second, `charts/return_mean_100`, and `charts/episode_length_mean_100`,
+plotted against agent transitions. Episode metrics include completed episodes only
+(including timeouts) and appear after the first episode ends.
+The Text tab contains each run's YAML config.
 
 Python 3.12+; `uv` installs dependencies, including ALE's bundled ROMs. The default
 JAX install runs on CPU; for NVIDIA GPUs, install the appropriate
 [JAX accelerator package](https://docs.jax.dev/en/latest/installation.html).
-This is a minimal trainer: no checkpoints, evaluation loop or experiment tracker.
+This is a minimal trainer: no checkpoints or evaluation loop.
 
 Tests: `uv run python -m unittest discover -s tests`.

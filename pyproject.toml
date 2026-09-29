@@ -16,6 +16,8 @@ dependencies = [
     "opencv-python-headless>=4.10,<5",
     "optax>=0.2.4,<0.3",
     "pyyaml>=6,<7",
+    "tensorboard>=2.18,<3",
+    "tensorboardx>=2.6,<3",
 ]
 
 [project.scripts]
