@@ -3,28 +3,37 @@
 Tinkering with RL and other things.
 
 Barebones Atari PPO in [JAX + Flax](src/rl2/ppo.py), using Optax and
-Gymnasium/ALE. Shared CNN + LSTM, clipped policy loss, GAE, entropy bonus, gradient
-clipping, and shuffled sequence minibatches. `atari_preprocessing: false` (default)
-uses native RGB images (210×160 for Pong) and one emulator frame per agent step.
-Set it to `true` for 84×84 grayscale, action repeat 4, max pooling, and random
-no-ops at reset. Raw images require more memory and computation.
-Training rewards are sign-clipped in both modes. `frame_stack: false` (default)
-uses one frame per step, with the LSTM carrying history; `true` stacks 4 frames.
-Both options apply to training and video games, independently of each other.
+Gymnasium/ALE. Shared residual CNN + LSTM, clipped policy loss, GAE, entropy bonus,
+gradient clipping, and shuffled sequence minibatches. `observation_size: 84` resizes
+observations to 84×84 with area interpolation while preserving RGB channels.
+Set it to `null` to retain the original resolution. Resizing happens before frame
+stacking and applies to training and video policy inputs; recorded video retains
+its original resolution.
 
-Each convolution is followed by channel-only LayerNorm and ReLU. Normalization
-is independent at each spatial location and does not use batch statistics.
-The CNN feeds a shared 512-unit dense layer, a shared LSTM (`lstm_hidden_size: 256`),
-then separate policy and value MLP heads with 256-unit hidden layers.
-Each dense hidden layer uses LayerNorm followed by ReLU. The final outputs are
-linear: action logits for the policy and one scalar for the value.
+`atari_preprocessing: false` (default) keeps one emulator frame per agent step.
+Set it to `true` for grayscale, action repeat 4, temporal max pooling, and random
+no-ops at reset. Resize-only observations do not enable any of those behaviors.
+Training rewards remain sign-clipped. `frame_stack: false` uses one frame per step,
+with the LSTM carrying history; `true` stacks 4 frames.
+
+The encoder uses four IMPALA-inspired stages with widths 128, 256, 384, and 512.
+Each stage has a 3×3 convolution, stride-2 spatial max pooling, and two residual
+blocks. Blocks use channel-only pre-activation LayerNorm/ReLU and scale residual
+sums by 1/√2. Normalization does not use batch statistics. The final 6×6 feature
+map retains spatial position before a 768-unit projection and 1536-unit LSTM.
+Separate policy and value heads each have 512 hidden units and LayerNorm/ReLU;
+outputs are linear. The default 84×84 RGB model has approximately 50.56M parameters;
+the exact count is printed and logged at startup. Changing input resolution or
+LSTM size changes the count. The encoder follows the residual design from
+[IMPALA](https://proceedings.mlr.press/v80/espeholt18a.html), with added normalization.
+This architecture requires new training; its parameter shapes differ from the old CNN.
 
 Each environment has its own LSTM cell and hidden state, carried across steps and
 rollouts and reset before the first observation of each new episode. Video games
 have separate memory. PPO trains on complete `num_steps` sequences, shuffling
 environments rather than timesteps; gradients stop at rollout and episode boundaries.
 `num_envs` must be divisible by `num_minibatches`. With the default config, each
-minibatch contains 2 environments × 128 steps = 256 transitions. Memory collected
+minibatch contains 8 environments × 128 steps = 1024 transitions. Memory collected
 under the previous policy is retained when parameters change between rollouts.
 
 Edit [configs/ppo.yaml](configs/ppo.yaml), then run from the repository root:

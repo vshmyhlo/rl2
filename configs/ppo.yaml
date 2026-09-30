@@ -1,4 +1,5 @@
 env_id: ALE/SpaceInvaders-v5
+observation_size: 84 # Resize only; null preserves the original resolution
 frame_stack: false # true stacks 4 frames; false uses a single frame
 atari_preprocessing: false # true enables 84x84 grayscale, action repeat 4, max pooling, and random reset no-ops
 seed: 1
@@ -8,7 +9,7 @@ vector_env: async # async (subprocesses) or sync
 num_steps: 128
 num_minibatches: 4 # Must divide num_envs; minibatches contain whole sequences
 update_epochs: 4
-lstm_hidden_size: 1536 # About 50M parameters with stacked 84x84 grayscale observations
+lstm_hidden_size: 1536 # About 50.56M parameters with the residual encoder and 84x84 RGB observations
 bf16: true # Mixed precision compute; parameters, recurrent memory, and losses stay float32
 learning_rate: 0.00025
 anneal_lr: true # Linear decay over the training budget; false keeps a constant rate

@@ -1,4 +1,4 @@
-"""Recurrent PPO with a shared Atari CNN and LSTM."""
+"""Recurrent PPO with a normalized residual Atari CNN and LSTM."""
 
 import argparse
 from collections import deque
@@ -10,17 +10,16 @@ from time import monotonic
 from typing import Any, SupportsFloat
 
 import ale_py
-from flax import linen as nn
-from flax.training.train_state import TrainState
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
-from numpy.typing import NDArray
 import optax
-from tensorboardX import SummaryWriter
 import yaml
-
+from flax import linen as nn
+from flax.training.train_state import TrainState
+from numpy.typing import NDArray
+from tensorboardX import SummaryWriter
 
 type Array = jax.Array | NDArray[Any]
 type LSTMCarry = tuple[jax.Array, jax.Array]
@@ -54,6 +53,7 @@ class Config:
     video_every_episodes: int
     video_speed: float
     bf16: bool = True
+    observation_size: int | None = None
 
 
 def load_config(path: str | Path) -> Config:
@@ -91,10 +91,33 @@ class ResetLSTM(nn.Module):
         return carry, x.astype(self.dtype)
 
 
+class ResidualBlock(nn.Module):
+    """Pre-activation residual block with per-pixel channel normalization."""
+
+    channels: int
+    dtype: jax.typing.DTypeLike = jnp.float32
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        residual = x
+        for index in range(2):
+            x = nn.relu(nn.LayerNorm(dtype=self.dtype)(x))
+            x = nn.Conv(
+                self.channels,
+                (3, 3),
+                padding="SAME",
+                kernel_init=nn.initializers.variance_scaling(2.0 if index == 0 else 1.0, "fan_in", "truncated_normal"),
+                dtype=self.dtype,
+            )(x)
+        return (residual + x) * jnp.asarray(2**-0.5, dtype=self.dtype)
+
+
 class ActorCritic(nn.Module):
     num_actions: int
     lstm_hidden_size: int
     dtype: jax.typing.DTypeLike = jnp.float32
+    encoder_channels: tuple[int, ...] = (128, 256, 384, 512)
+    embedding_size: int = 768
 
     @nn.compact
     def __call__(
@@ -114,12 +137,17 @@ class ActorCritic(nn.Module):
         x = (x.astype(jnp.float32) / 255.0).astype(self.dtype)
         # Flax keeps parameters and LayerNorm statistics in float32 by default.
         init = nn.initializers.orthogonal(np.sqrt(2))
-        for channels, kernel, stride in [(128, 8, 4), (256, 4, 2), (256, 3, 1)]:
-            x = nn.Conv(
-                channels, (kernel, kernel), (stride, stride), padding="VALID", kernel_init=init, dtype=self.dtype
-            )(x)
-            x = nn.relu(nn.LayerNorm(reduction_axes=-1, feature_axes=-1, dtype=self.dtype)(x))
-        x = nn.Dense(2048, kernel_init=init, dtype=self.dtype)(x.reshape((x.shape[0], -1)))
+        # IMPALA-style stages; normalization is independent of rollout/minibatch size.
+        # Variance scaling avoids expensive QR initialization of large visual kernels.
+        visual_init = nn.initializers.variance_scaling(2.0, "fan_in", "truncated_normal")
+        for stage, channels in enumerate(self.encoder_channels):
+            x = nn.Conv(channels, (3, 3), padding="SAME", kernel_init=visual_init, dtype=self.dtype)(x)
+            x = nn.max_pool(x, window_shape=(3, 3), strides=(2, 2), padding="SAME")
+            for block in range(2):
+                x = ResidualBlock(channels, dtype=self.dtype, name=f"stage_{stage}_block_{block}")(x)
+        x = nn.relu(nn.LayerNorm(name="encoder_norm", dtype=self.dtype)(x))
+        # Preserve spatial position (6x6 at 84x84 input) for aiming and movement.
+        x = nn.Dense(self.embedding_size, kernel_init=visual_init, dtype=self.dtype)(x.reshape((x.shape[0], -1)))
         x = nn.relu(nn.LayerNorm(name="shared_norm", dtype=self.dtype)(x))
         carry, x = nn.scan(
             ResetLSTM,
@@ -164,11 +192,16 @@ def make_env(
     render_mode: str | None = None,
     frame_stack: bool = False,
     atari_preprocessing: bool = False,
+    observation_size: int | None = None,
 ) -> gym.Env[NDArray[np.uint8], int | np.integer[Any]]:
+    if observation_size is not None and (type(observation_size) is not int or observation_size < 1):
+        raise ValueError("observation_size must be a positive integer or null")
     gym.register_envs(ale_py)
     env = gym.make(env_id, frameskip=1, render_mode=render_mode)
     if atari_preprocessing:
         env = AtariPreprocessing(env)
+    if observation_size is not None:
+        env = gym.wrappers.ResizeObservation(env, (observation_size, observation_size))
     if frame_stack:
         return gym.wrappers.FrameStackObservation(env, stack_size=4)
     return gym.wrappers.ReshapeObservation(env, (1, *env.observation_space.shape))
@@ -215,6 +248,7 @@ def log_video(
         render_mode="rgb_array",
         frame_stack=config.frame_stack,
         atari_preprocessing=config.atari_preprocessing,
+        observation_size=config.observation_size,
     )
     try:
         obs, _ = env.reset(seed=config.seed + episode)
@@ -332,7 +366,11 @@ def train(config: Config) -> TrainState:
     envs = vector_cls(
         [
             partial(
-                make_env, config.env_id, frame_stack=config.frame_stack, atari_preprocessing=config.atari_preprocessing
+                make_env,
+                config.env_id,
+                frame_stack=config.frame_stack,
+                atari_preprocessing=config.atari_preprocessing,
+                observation_size=config.observation_size,
             )
             for _ in range(config.num_envs)
         ],
@@ -372,6 +410,10 @@ def train(config: Config) -> TrainState:
             )["params"],
             tx=optimizer(config.learning_rate),
         )
+        parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
+        writer.add_scalar("model/params_millions", parameter_count / 1_000_000, 0)
+        print(f"Model parameters: {parameter_count:,}", flush=True)
+        writer.add_text("model/parameter_count", str(parameter_count), 0)
         rng = np.random.default_rng(config.seed)
         episode_returns = np.zeros(config.num_envs)
         episode_lengths = np.zeros(config.num_envs, dtype=np.int64)
