@@ -46,6 +46,7 @@ from dataclasses import asdict, dataclass
 from functools import partial
 from importlib.metadata import version
 from pathlib import Path
+from time import monotonic
 from typing import Any, Literal
 
 import ale_py
@@ -170,12 +171,15 @@ def evaluate(
     *,
     baselines: ScoreBaselines | None = None,
     output_path: str | Path | None = None,
+    show_progress: bool = True,
 ) -> EvaluationResult:
     """Evaluate frozen parameters with fresh environment, RNG, and LSTM state.
 
     ``training`` must describe the supplied state's actual training setup.
     Returns a JSON-compatible report; optionally writes it to ``output_path``.
     Baselines default to the bundled DQN Zoo Atari-57 table when available.
+    Progress prints at startup, after each game, and every 10 seconds during
+    a game (after an environment step). Set show_progress=False to silence it.
     The caller owns checkpoint selection and independent-training-seed repeats.
     """
     evaluation = evaluation or EvaluationConfig()
@@ -187,7 +191,25 @@ def evaluate(
             baselines = ScoreBaselines(training.env_id, scores[0], scores[1], REFERENCE_SOURCE)
     env = make_evaluation_env(training, evaluation)
     episodes: list[dict[str, Any]] = []
+    total_return = 0.0
+    started = last_report = monotonic() if show_progress else 0.0
+
+    def report_progress(now: float, episode: int, score: float, frames: int) -> None:
+        completed = len(episodes)
+        elapsed = now - started
+        mean = f"{total_return / completed:.1f}" if completed else "n/a"
+        eta = f"{elapsed / completed * (evaluation.episodes - completed):.0f}s" if completed else "n/a"
+        print(
+            f"Evaluation progress: completed={completed}/{evaluation.episodes} "
+            f"({100 * completed / evaluation.episodes:.0f}%) "
+            f"episode={episode} return={score:.1f} frames={frames} "
+            f"mean_return={mean} elapsed={elapsed:.0f}s eta={eta}",
+            flush=True,
+        )
+
     try:
+        if show_progress:
+            report_progress(started, 1, 0.0, 0)
         action_meanings = env.unwrapped.get_action_meanings()
         for index in range(evaluation.episodes):
             seed = evaluation.seed + index
@@ -210,6 +232,12 @@ def evaluate(
                 obs, reward, terminated, truncated, info = env.step(int(action))
                 episode_return += float(reward)
                 agent_steps += 1
+                if show_progress and not (terminated or truncated):
+                    now = monotonic()
+                    if now - last_report >= 10.0:
+                        report_progress(now, index + 1, episode_return, int(info["episode_frame_number"]))
+                        last_report = now
+            total_return += episode_return
             episodes.append(
                 {
                     "seed": seed,
@@ -221,6 +249,9 @@ def evaluate(
                     "truncated": bool(truncated),
                 }
             )
+            if show_progress:
+                last_report = monotonic()
+                report_progress(last_report, index + 1, episode_return, int(info["episode_frame_number"]))
     finally:
         env.close()
 

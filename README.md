@@ -132,7 +132,12 @@ finishes. If one rollout crosses several thresholds, its updated policy is evalu
 once. Evaluation games do not count toward training episodes or steps, and use fresh
 LSTM memory and a separate RNG. `eval_seed: 10000` fixes the evaluation seed set across
 checkpoints. Set `eval_every_episodes: 0` to disable evaluation (also the default for
-older configs that omit this setting).
+older configs that omit this setting). Evaluation prints progress at startup,
+after each game, and every 10 seconds during longer games. Updates include the
+completed game count and percentage, current game's return and emulator frames,
+mean return over completed games, elapsed time, and an estimated remaining time
+once a game has finished. Standalone callers can use `evaluate(..., show_progress=False)`
+to silence progress output.
 
 Evaluation requires training with `atari_preprocessing: true` and
 `observation_size: 84` or `null`. It uses sampled PPO actions, sticky actions 0.25,

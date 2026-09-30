@@ -357,3 +357,45 @@ def test_training_omits_unavailable_normalized_scalar() -> None:
     tags = [call.args[0] for call in writer.add_scalar.call_args_list]
     assert "eval/return_mean" in tags
     assert "eval/human_normalized_score_percent" not in tags
+
+
+def test_progress_tracks_completed_games_and_long_running_games(capsys: pytest.CaptureFixture[str]) -> None:
+    state = policy_state()
+    options = EvaluationConfig(episodes=2)
+    with (
+        patch("rl2.atari_eval.make_evaluation_env", return_value=ScoringEnv()),
+        patch("rl2.atari_eval.monotonic", side_effect=[100.0, 101.0, 104.0, 115.0, 120.0]),
+    ):
+        result = evaluate(state, training_config(), options)
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 4
+    assert "completed=0/2 (0%)" in lines[0]
+    assert "mean_return=n/a elapsed=0s eta=n/a" in lines[0]
+    assert "completed=1/2 (50%) episode=1 return=3.0 frames=11" in lines[1]
+    assert "mean_return=3.0 elapsed=4s eta=4s" in lines[1]
+    # Partial returns must not enter the completed-game mean or advance the count.
+    assert "completed=1/2 (50%) episode=2 return=5.0 frames=7" in lines[2]
+    assert "mean_return=3.0 elapsed=15s eta=15s" in lines[2]
+    assert "completed=2/2 (100%) episode=2 return=7.0 frames=11" in lines[3]
+    assert "mean_return=5.0 elapsed=20s eta=0s" in lines[3]
+    with (
+        patch("rl2.atari_eval.make_evaluation_env", return_value=ScoringEnv()),
+        patch("rl2.atari_eval.monotonic", side_effect=AssertionError("quiet evaluation should not track time")),
+    ):
+        quiet_result = evaluate(state, training_config(), options, show_progress=False)
+    assert quiet_result == result
+    assert capsys.readouterr().out == ""
+
+
+def test_failed_evaluation_does_not_report_completion(capsys: pytest.CaptureFixture[str]) -> None:
+    env = ScoringEnv()
+    with (
+        patch("rl2.atari_eval.make_evaluation_env", return_value=env),
+        patch("rl2.atari_eval._action", side_effect=RuntimeError("policy failure")),
+        pytest.raises(RuntimeError, match="policy failure"),
+    ):
+        evaluate(policy_state(), training_config(), EvaluationConfig(episodes=1))
+    output = capsys.readouterr().out
+    assert "completed=0/1" in output
+    assert "completed=1/1" not in output
+    assert env.closed
