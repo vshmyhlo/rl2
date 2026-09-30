@@ -29,6 +29,9 @@ under the previous policy is retained when parameters change between rollouts.
 
 Edit [configs/ppo.yaml](configs/ppo.yaml), then run from the repository root:
 
+`env_id` selects the Atari game; the default is `ALE/SpaceInvaders-v5`.
+For example, set `env_id: ALE/Pong-v5` to play Pong instead.
+
 ```sh
 uv run rl2                              # load configs/ppo.yaml
 uv run rl2 --config configs/custom.yaml # load your own config
@@ -103,6 +106,8 @@ the trainer plays one separate game with the current policy and logs it under
 the rollout update, includes the whole game, and uses a separate environment and
 random seed. Recorded games do not count toward training steps or episode metrics.
 Set `video_every_episodes: 0` to disable videos. Recording and encoding pause training.
+`video_speed: 2.0` plays recorded games at double speed; use `1.0` for normal speed
+or `0.5` for half speed. This controls playback FPS, not environment stepping.
 
 Python 3.12+; `uv` installs dependencies, including ALE's bundled ROMs. The default
 JAX install runs on CPU; for NVIDIA GPUs, install the appropriate

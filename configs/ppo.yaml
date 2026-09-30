@@ -1,4 +1,4 @@
-env_id: ALE/Pong-v5
+env_id: ALE/SpaceInvaders-v5
 frame_stack: true # true stacks 4 frames; false uses a single frame
 atari_preprocessing: true # true enables 84x84 grayscale, action repeat 4, max pooling, and random reset no-ops
 seed: 1
@@ -20,3 +20,4 @@ value_coef: 0.5
 max_grad_norm: 0.5
 log_dir: runs
 video_every_episodes: 100 # 0 disables recording
+video_speed: 2.0 # Playback multiplier: 1.0 normal, 2.0 double speed

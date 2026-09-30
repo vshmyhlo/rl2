@@ -52,6 +52,7 @@ class Config:
     max_grad_norm: float
     log_dir: str
     video_every_episodes: int
+    video_speed: float
 
 
 def load_config(path: str | Path) -> Config:
@@ -219,7 +220,10 @@ def log_video(
         # One recorded frame per agent step, accounting for optional action repeat.
         video = np.stack(frames).transpose(0, 3, 1, 2)[None]
         writer.add_video(
-            "gameplay", video, steps, fps=env.metadata["render_fps"] / (4 if config.atari_preprocessing else 1)
+            "gameplay",
+            video,
+            steps,
+            fps=config.video_speed * env.metadata["render_fps"] / (4 if config.atari_preprocessing else 1),
         )
         print(f"Recorded game after {episode} training episodes", flush=True)
     finally:
@@ -304,6 +308,8 @@ def train(config: Config) -> TrainState:
         raise ValueError("total_steps must cover at least one rollout")
     if config.video_every_episodes < 0:
         raise ValueError("video_every_episodes must be nonnegative (0 disables videos)")
+    if not np.isfinite(config.video_speed) or config.video_speed <= 0:
+        raise ValueError("video_speed must be positive and finite")
     if config.vector_env not in ("sync", "async"):
         raise ValueError("vector_env must be 'sync' or 'async'")
     if config.target_kl is not None and (not np.isfinite(config.target_kl) or config.target_kl <= 0):

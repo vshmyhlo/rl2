@@ -19,8 +19,18 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 
 from rl2 import ppo
 from rl2.ppo import (
-    ActorCritic, ResetLSTM, action_log_prob, explained_variance, gae, initial_carry,
-    learning_rate_schedule, load_config, make_env, train, update, value,
+    ActorCritic,
+    ResetLSTM,
+    action_log_prob,
+    explained_variance,
+    gae,
+    initial_carry,
+    learning_rate_schedule,
+    load_config,
+    make_env,
+    train,
+    update,
+    value,
 )
 
 
@@ -34,7 +44,8 @@ class ShortEpisodes(gym.wrappers.TimeLimit):
 
 def short_env(env_id, render_mode=None, frame_stack=False, atari_preprocessing=False):
     env = gym.wrappers.TransformReward(
-        make_env(env_id, render_mode, frame_stack, atari_preprocessing), lambda reward: 2.0,
+        make_env(env_id, render_mode, frame_stack, atari_preprocessing),
+        lambda reward: 2.0,
     )
     return ShortEpisodes(env, max_episode_steps=3)
 
@@ -45,6 +56,7 @@ class PPOTests(unittest.TestCase):
         gym_make = gym.make
         for frame_limit in (101, 102, 103, 104):
             with self.subTest(frame_limit=frame_limit):
+
                 def limited_env(*args, **kwargs):
                     return gym_make(*args, **kwargs, max_num_frames_per_episode=frame_limit)
 
@@ -59,30 +71,43 @@ class PPOTests(unittest.TestCase):
                             break
                     self.assertTrue(truncated)
                     self.assertFalse(terminated)
-                    expected = cv2.resize(env.unwrapped.ale.getScreenGrayscale(), (84, 84),
-                                          interpolation=cv2.INTER_AREA)
+                    expected = cv2.resize(
+                        env.unwrapped.ale.getScreenGrayscale(), (84, 84), interpolation=cv2.INTER_AREA
+                    )
                     np.testing.assert_array_equal(obs[-1], expected)
                 finally:
                     env.close()
 
     def test_clipped_policy_loss_and_gradient_direction(self):
-        config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-                         target_kl=None, entropy_coef=0.0, value_coef=0.0)
+        config = replace(
+            load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+            target_kl=None,
+            entropy_coef=0.0,
+            value_coef=0.0,
+        )
         probabilities = np.array([0.25, 0.75, 0.75, 0.25], dtype=np.float32).reshape(2, 2)
         logits = jnp.log(jnp.stack((probabilities, 1 - probabilities), axis=-1))
         state = TrainState.create(
             apply_fn=lambda variables, obs, carry, starts: (carry, variables["params"]["logits"], jnp.zeros((2, 2))),
-            params={"logits": logits}, tx=optax.sgd(0.1),
+            params={"logits": logits},
+            tx=optax.sgd(0.1),
         )
         advantages = np.array([[-3.0, -1.0], [1.0, 3.0]])
-        batch = (jnp.zeros((2, 2, 1)), jnp.zeros((2, 2), dtype=jnp.int32),
-                 jnp.full((2, 2), np.log(0.5)), advantages, jnp.ones((2, 2)),
-                 initial_carry(2, 1), jnp.zeros((2, 2), dtype=bool))
+        batch = (
+            jnp.zeros((2, 2, 1)),
+            jnp.zeros((2, 2), dtype=jnp.int32),
+            jnp.full((2, 2), np.log(0.5)),
+            advantages,
+            jnp.ones((2, 2)),
+            initial_carry(2, 1),
+            jnp.zeros((2, 2), dtype=bool),
+        )
         updated, metrics = update(state, batch, config)
         normalized = advantages / advantages.std()
         ratio = probabilities / 0.5
-        expected = -np.minimum(ratio * normalized,
-                               np.clip(ratio, 1 - config.clip_coef, 1 + config.clip_coef) * normalized).mean()
+        expected = -np.minimum(
+            ratio * normalized, np.clip(ratio, 1 - config.clip_coef, 1 + config.clip_coef) * normalized
+        ).mean()
         self.assertAlmostEqual(float(metrics[0]), expected, places=6)
         self.assertAlmostEqual(float(metrics[1]), 0.5, places=6)
         np.testing.assert_array_equal(updated.params["logits"][:, 0], logits[:, 0])  # Both clipped signs.
@@ -99,7 +124,7 @@ class PPOTests(unittest.TestCase):
         final, logits, values = apply(params, obs, carry, starts)
         stepped_logits, stepped_values = [], []
         for t in range(4):
-            carry, policy, critic = apply(params, obs[t:t + 1], carry, starts[t:t + 1])
+            carry, policy, critic = apply(params, obs[t : t + 1], carry, starts[t : t + 1])
             stepped_logits.append(policy[0])
             stepped_values.append(critic[0])
         np.testing.assert_allclose(logits, jnp.stack(stepped_logits), atol=1e-6)
@@ -119,8 +144,7 @@ class PPOTests(unittest.TestCase):
         self.assertGreater(float(jnp.max(jnp.abs(suffix_values[:, 1] - fresh_values[:, 1]))), 1e-5)
 
     def test_lstm_gradients_follow_history_but_stop_at_episode_reset(self):
-        cell = nn.scan(ResetLSTM, variable_broadcast="params", split_rngs={"params": False},
-                       in_axes=0, out_axes=0)(8)
+        cell = nn.scan(ResetLSTM, variable_broadcast="params", split_rngs={"params": False}, in_axes=0, out_axes=0)(8)
         inputs = jax.random.normal(jax.random.key(2), (4, 2, 5))
         starts = jnp.zeros((4, 2), dtype=bool).at[2, 0].set(True)
         carry = initial_carry(2, 8)
@@ -131,15 +155,25 @@ class PPOTests(unittest.TestCase):
         self.assertGreater(float(jnp.linalg.norm(grads[2:, 0])), 0)
 
     def test_recurrent_minibatches_require_whole_environments(self):
-        config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-                         num_envs=3, num_steps=4, num_minibatches=2)
+        config = replace(
+            load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+            num_envs=3,
+            num_steps=4,
+            num_minibatches=2,
+        )
         with self.assertRaisesRegex(ValueError, "num_envs must be divisible"):
             train(config)
 
     def test_learning_rate_schedule(self):
-        config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-                         num_envs=2, num_steps=4, total_steps=19,
-                         num_minibatches=2, update_epochs=3, anneal_lr=True)
+        config = replace(
+            load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+            num_envs=2,
+            num_steps=4,
+            total_steps=19,
+            num_minibatches=2,
+            update_epochs=3,
+            anneal_lr=True,
+        )
         schedule = learning_rate_schedule(config)
         # Advance by rollouts, independently of how many optimizer updates were applied.
         expected = config.learning_rate * np.array([1.0, 0.5, 0.0, 0.0])
@@ -151,16 +185,21 @@ class PPOTests(unittest.TestCase):
         self.assertEqual(float(single(1)), 0.0)
 
     def test_kl_rejects_update_without_changing_optimizer(self):
-        config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-                         target_kl=0.01)
+        config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), target_kl=0.01)
         state = TrainState.create(
             apply_fn=lambda variables, obs, carry, starts: (carry, variables["params"]["logits"], jnp.zeros(2)),
             params={"logits": jnp.log(jnp.array([[0.9, 0.1], [0.1, 0.9]]))},
             tx=optax.adam(0.01),
         )
-        batch = (jnp.zeros((2, 1)), jnp.zeros(2, dtype=jnp.int32),
-                 jnp.full(2, np.log(0.5)), jnp.array([1.0, -1.0]), jnp.zeros(2),
-                 initial_carry(2, 1), jnp.zeros(2, dtype=bool))
+        batch = (
+            jnp.zeros((2, 1)),
+            jnp.zeros(2, dtype=jnp.int32),
+            jnp.full(2, np.log(0.5)),
+            jnp.array([1.0, -1.0]),
+            jnp.zeros(2),
+            initial_carry(2, 1),
+            jnp.zeros(2, dtype=bool),
+        )
         stopped, metrics = update(state, batch, config)
         self.assertGreater(float(metrics[3]), config.target_kl)
         for before, after in zip(jax.tree.leaves(state), jax.tree.leaves(stopped)):
@@ -174,11 +213,18 @@ class PPOTests(unittest.TestCase):
         probabilities = jnp.array([[0.2, 0.8], [0.5, 0.5], [0.8, 0.2], [0.52, 0.48]])
         state = TrainState.create(
             apply_fn=lambda variables, obs, carry, starts: (carry, variables["params"]["logits"], jnp.zeros(4)),
-            params={"logits": jnp.log(probabilities)}, tx=optax.sgd(0.0),
+            params={"logits": jnp.log(probabilities)},
+            tx=optax.sgd(0.0),
         )
-        batch = (jnp.zeros((4, 1)), jnp.zeros(4, dtype=jnp.int32),
-                 jnp.full(4, np.log(0.5)), jnp.arange(4.0), jnp.arange(4.0),
-                 initial_carry(4, 1), jnp.zeros(4, dtype=bool))
+        batch = (
+            jnp.zeros((4, 1)),
+            jnp.zeros(4, dtype=jnp.int32),
+            jnp.full(4, np.log(0.5)),
+            jnp.arange(4.0),
+            jnp.arange(4.0),
+            initial_carry(4, 1),
+            jnp.zeros(4, dtype=bool),
+        )
         _, metrics = update(state, batch, config)
         ratios = np.array([0.4, 1.0, 1.6, 1.04])
         self.assertAlmostEqual(float(metrics[3]), float(np.mean(ratios - 1 - np.log(ratios))), places=6)
@@ -200,7 +246,9 @@ class PPOTests(unittest.TestCase):
             np.array([[1.0], [2.0]], dtype=np.float32),
             np.array([[True], [False]]),
             np.array([[0.5], [1.0]], dtype=np.float32),
-            np.array([3.0], dtype=np.float32), 0.9, 0.8,
+            np.array([3.0], dtype=np.float32),
+            0.9,
+            0.8,
         )
         np.testing.assert_allclose(advantages, [[0.5], [3.7]], rtol=1e-6)
         np.testing.assert_allclose(returns, [[1.0], [4.7]], rtol=1e-6)
@@ -211,7 +259,9 @@ class PPOTests(unittest.TestCase):
             np.array([[1.0], [2.0 + 0.9 * 3.0]], dtype=np.float32),
             np.array([[False], [True]]),
             np.array([[0.5], [1.0]], dtype=np.float32),
-            np.array([100.0], dtype=np.float32), 0.9, 0.8,
+            np.array([100.0], dtype=np.float32),
+            0.9,
+            0.8,
         )
         np.testing.assert_allclose(advantages, [[4.064], [3.7]], rtol=1e-6)
         np.testing.assert_allclose(returns, [[4.564], [4.7]], rtol=1e-6)
@@ -226,12 +276,27 @@ class PPOTests(unittest.TestCase):
     def test_early_stop_resumes_next_rollout_and_anneals_lr(self):
         self.check_atari_training("sync", target_kl=1e-8, update_epochs=3)
 
-    def check_atari_training(self, mode, target_kl=None, update_epochs=1, frame_stack=False, preprocessing=False):
-        config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-                         total_steps=16, num_envs=2, num_steps=4,
-                         num_minibatches=2, update_epochs=update_epochs, video_every_episodes=2,
-                         vector_env=mode, target_kl=target_kl, frame_stack=frame_stack,
-                         atari_preprocessing=preprocessing)
+    def check_atari_training(
+        self,
+        mode: str,
+        target_kl: float | None = None,
+        update_epochs: int = 1,
+        frame_stack: bool = False,
+        preprocessing: bool = False,
+    ) -> None:
+        config = replace(
+            load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+            total_steps=16,
+            num_envs=2,
+            num_steps=4,
+            num_minibatches=2,
+            update_epochs=update_epochs,
+            video_every_episodes=2,
+            vector_env=mode,
+            target_kl=target_kl,
+            frame_stack=frame_stack,
+            atari_preprocessing=preprocessing,
+        )
         output = io.StringIO()
         training_steps = 0
         checked_rollouts = set()
@@ -262,23 +327,37 @@ class PPOTests(unittest.TestCase):
 
         ppo_act = ppo.act
         with TemporaryDirectory() as log_dir:
-            with (patch("rl2.ppo.make_env", new=short_env),
-                  patch("rl2.ppo.act", new=checked_act),
-                  patch("rl2.ppo.update", new=checked_update), contextlib.redirect_stdout(output)):
+            with (
+                patch("rl2.ppo.make_env", new=short_env),
+                patch("rl2.ppo.act", new=checked_act),
+                patch("rl2.ppo.update", new=checked_update),
+                contextlib.redirect_stdout(output),
+            ):
                 state = train(replace(config, log_dir=log_dir))
-            run_dir, = Path(log_dir).iterdir()
+            (run_dir,) = Path(log_dir).iterdir()
             events = EventAccumulator(str(run_dir)).Reload()
-            for tag in ("losses/policy", "losses/value", "policy/entropy",
-                        "policy/approx_kl", "policy/clip_fraction", "value/explained_variance",
-                        "charts/learning_rate", "charts/updates_per_rollout", "policy/early_stop",
-                        "charts/steps_per_second", "charts/return_mean_100",
-                        "charts/episode_length_mean_100", "charts/total_episodes"):
+            for tag in (
+                "losses/policy",
+                "losses/value",
+                "policy/entropy",
+                "policy/approx_kl",
+                "policy/clip_fraction",
+                "value/explained_variance",
+                "charts/learning_rate",
+                "charts/updates_per_rollout",
+                "policy/early_stop",
+                "charts/steps_per_second",
+                "charts/return_mean_100",
+                "charts/episode_length_mean_100",
+                "charts/total_episodes",
+            ):
                 scalars = events.Scalars(tag)
                 self.assertEqual([event.step for event in scalars], [8, 16])
                 self.assertTrue(all(np.isfinite(event.value) for event in scalars))
             np.testing.assert_allclose(
                 [event.value for event in events.Scalars("charts/learning_rate")],
-                [config.learning_rate, config.learning_rate / 2], rtol=1e-6,
+                [config.learning_rate, config.learning_rate / 2],
+                rtol=1e-6,
             )
             self.assertEqual(
                 [event.value for event in events.Scalars("charts/updates_per_rollout")],
@@ -289,7 +368,8 @@ class PPOTests(unittest.TestCase):
                 [1, 1] if target_kl is not None else [0, 0],
             )
             self.assertEqual(
-                [event.value for event in events.Scalars("charts/total_episodes")], [2, 5],
+                [event.value for event in events.Scalars("charts/total_episodes")],
+                [2, 5],
             )
             np.testing.assert_allclose(
                 [event.value for event in events.Scalars("charts/episode_length_mean_100")],
@@ -300,7 +380,7 @@ class PPOTests(unittest.TestCase):
                 [4.0, 5.2],
             )
             config_text = events.Tensors("config/text_summary")[0].tensor_proto.string_val[0]
-            self.assertIn(b"env_id: ALE/Pong-v5", config_text)
+            self.assertIn(f"env_id: {config.env_id}".encode(), config_text)
             videos = events.Images("gameplay")
             self.assertEqual([event.step for event in videos], [8, 16])
             for video in videos:
