@@ -20,4 +20,4 @@ value_coef: 0.5
 max_grad_norm: 0.5
 log_dir: runs
 video_every_episodes: 100 # 0 disables recording
-video_speed: 2.0 # Playback multiplier: 1.0 normal, 2.0 double speed
+video_speed: 4.0 # Playback multiplier: 1.0 normal, 2.0 double speed
