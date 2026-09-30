@@ -95,8 +95,8 @@ class ScoreBaselines:
             raise ValueError("baseline source is required")
 
 
-def make_evaluation_env(training: Config, evaluation: EvaluationConfig) -> gym.Env:
-    """Build an explicitly configured ALE environment without training wrappers."""
+def validate_training_config(training: Config) -> None:
+    """Reject incompatible policy inputs before starting training or evaluation."""
     if not training.atari_preprocessing or training.observation_size not in (None, 84):
         raise ValueError(
             "Standard evaluation requires a policy trained with atari_preprocessing=True "
@@ -105,6 +105,11 @@ def make_evaluation_env(training: Config, evaluation: EvaluationConfig) -> gym.E
         )
     if not training.env_id.startswith("ALE/") or not training.env_id.endswith("-v5"):
         raise ValueError("Use an explicit ALE/<Game>-v5 environment ID")
+
+
+def make_evaluation_env(training: Config, evaluation: EvaluationConfig) -> gym.Env:
+    """Build an explicitly configured ALE environment without training wrappers."""
+    validate_training_config(training)
     gym.register_envs(ale_py)
     env = gym.make(
         training.env_id,

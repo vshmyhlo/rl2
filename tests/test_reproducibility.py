@@ -6,23 +6,26 @@ import io
 import json
 import subprocess
 import sys
-import unittest
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest.mock import patch
 
 import gymnasium as gym
 import jax
 import numpy as np
+import pytest
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from rl2 import ppo
 
 
 class ShortGame(gym.wrappers.TimeLimit):
-    def reset(self, *, seed=None, options=None):
+    def reset(
+        self, *, seed: int | None = None, options: dict[str, Any] | None = None
+    ) -> tuple[ppo.Array, dict[str, Any]]:
         if seed is not None:
             self._max_episode_steps = 7 if self.render_mode else 31 + 16 * (seed % 2)
         return super().reset(seed=seed, options=options)
@@ -43,7 +46,7 @@ def short_game(
     )
 
 
-def digest(tree):
+def digest(tree: Any) -> str:
     result = hashlib.sha256()
     for leaf in jax.tree.leaves(jax.device_get(tree)):
         array = np.asarray(leaf)
@@ -109,38 +112,36 @@ def snapshot(path: str, mode: str, seed: int, videos: bool) -> None:
         Path(path).write_text(json.dumps(result))
 
 
-class ReproducibilityTests(unittest.TestCase):
-    def test_fresh_process_runs(self):
-        with TemporaryDirectory() as directory:
+def run_snapshot(path: Path, mode: str, seed: int = 11, videos: bool = False) -> dict[str, Any]:
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--snapshot", str(path), mode, str(seed), str(int(videos))],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return json.loads(path.read_text())
 
-            def run(mode, seed=11, videos=False):
-                path = Path(directory) / "snapshot.json"
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        str(Path(__file__).resolve()),
-                        "--snapshot",
-                        str(path),
-                        mode,
-                        str(seed),
-                        str(int(videos)),
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=180,
-                )
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                return json.loads(path.read_text())
 
-            baseline = run("sync")
-            for mode, videos in [("sync", False), ("async", False), ("async", False), ("async", True)]:
-                with self.subTest(vector_env=mode, videos=videos):
-                    self.assertEqual(baseline, run(mode, videos=videos))
-            self.assertNotEqual(baseline["state"], run("async", seed=12)["state"])
+@pytest.fixture(scope="module")
+def baseline(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    return run_snapshot(tmp_path_factory.mktemp("baseline") / "snapshot.json", "sync")
+
+
+@pytest.mark.parametrize(
+    ("mode", "videos"),
+    [("sync", False), ("async", False), ("async", False), ("async", True)],  # noqa: PT014 - Check repeated async runs.
+    ids=["sync", "async-first", "async-repeat", "async-video"],
+)
+def test_fresh_process_runs(baseline: dict[str, Any], tmp_path: Path, mode: str, videos: bool) -> None:
+    assert baseline == run_snapshot(tmp_path / "snapshot.json", mode, videos=videos)
+
+
+def test_different_seed_changes_state(baseline: dict[str, Any], tmp_path: Path) -> None:
+    assert baseline["state"] != run_snapshot(tmp_path / "snapshot.json", "async", seed=12)["state"]
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--snapshot":
         snapshot(sys.argv[2], sys.argv[3], int(sys.argv[4]), bool(int(sys.argv[5])))
-    else:
-        unittest.main()

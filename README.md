@@ -125,6 +125,27 @@ Set `video_every_episodes: 0` to disable videos. Recording and encoding pause tr
 `video_speed: 2.0` plays recorded games at double speed; use `1.0` for normal speed
 or `0.5` for half speed. This controls playback FPS, not environment stepping.
 
+Evaluation runs after the rollout update whenever another `eval_every_episodes: 100`
+training episodes have completed across all environments. Each evaluation plays
+`eval_episodes: 100` full games with the frozen policy and pauses training until it
+finishes. If one rollout crosses several thresholds, its updated policy is evaluated
+once. Evaluation games do not count toward training episodes or steps, and use fresh
+LSTM memory and a separate RNG. `eval_seed: 10000` fixes the evaluation seed set across
+checkpoints. Set `eval_every_episodes: 0` to disable evaluation (also the default for
+older configs that omit this setting).
+
+Evaluation requires training with `atari_preprocessing: true` and
+`observation_size: 84` or `null`. It uses sampled PPO actions, sticky actions 0.25,
+action repeat 4, random reset no-ops, unclipped full-game returns, and a 108,000-emulator-frame
+limit. TensorBoard logs `eval/return_mean`, `eval/return_median`, `eval/return_std`,
+and `eval/return_sem` against training steps. The Text tab's `eval/report` includes
+all episode scores, seeds, protocol settings, and actual training step/episode
+counts; these reports work with local and GCS log directories. Evaluation duration
+is logged under `time/evaluation_seconds`. Episode SEM describes the fixed policy's
+evaluation variability; paper comparisons still require matching training budgets,
+protocols, and multiple independent training seeds. See
+[src/rl2/atari_eval.py](src/rl2/atari_eval.py) for the complete protocol.
+
 Python 3.12+; `uv` installs dependencies, including ALE's bundled ROMs. The default
 JAX install runs on CPU. For NVIDIA GPUs on Linux, use the `cuda12` extra, which
 installs JAX with CUDA 12 and cuDNN libraries (a compatible NVIDIA driver is required):
@@ -152,8 +173,8 @@ requires JAX 0.11.x; use `--extra metal` whenever running with the Metal backend
 
 This is a minimal trainer with no checkpoints.
 
-Tests: `uv run python -m unittest discover -s tests`.
-Metal tests: `JAX_PLATFORMS=metal uv run --extra metal python -m unittest discover -s tests`.
+Tests: `uv run pytest`.
+Metal tests: `JAX_PLATFORMS=metal uv run --extra metal pytest`.
 
 Reproducibility: `seed` controls model initialization, action sampling, minibatch
 shuffling, and Atari seeds (`seed + environment index`). Video games use separate
@@ -170,8 +191,8 @@ repeated runs, sync/async execution, and videos on/off, plus a different-seed
 control. Run it on the desired backend:
 
 ```sh
-JAX_PLATFORMS=cpu uv run --locked python -m unittest discover -s tests -p test_reproducibility.py -v
-JAX_PLATFORMS=metal uv run --locked --extra metal python -m unittest discover -s tests -p test_reproducibility.py -v
+JAX_PLATFORMS=cpu uv run --locked pytest tests/test_reproducibility.py -v
+JAX_PLATFORMS=metal uv run --locked --extra metal pytest tests/test_reproducibility.py -v
 ```
 
 
