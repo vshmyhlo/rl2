@@ -287,7 +287,7 @@ def log_evaluation(state: TrainState, config: Config, writer: SummaryWriter, epi
     print(f"Evaluating {config.eval_episodes} games after {episode} training episodes", flush=True)
     started = monotonic()
     result = evaluate(state, config, EvaluationConfig(episodes=config.eval_episodes, seed=config.eval_seed))
-    for name in ("return_mean", "return_median", "return_std", "return_sem"):
+    for name in ("return_mean", "return_median", "return_std", "return_sem", "human_normalized_score_percent"):
         if result[name] is not None:
             writer.add_scalar(f"eval/{name}", result[name], steps)
     writer.add_scalar("eval/training_episodes", episode, steps)
@@ -295,7 +295,11 @@ def log_evaluation(state: TrainState, config: Config, writer: SummaryWriter, epi
     result["training_steps"] = steps
     result["training_episodes"] = episode
     writer.add_text("eval/report", f"```json\n{json.dumps(result, indent=2, allow_nan=False)}\n```", steps)
-    print(f"Evaluation: return={result['return_mean']:.1f} over {config.eval_episodes} games", flush=True)
+    normalized = result["human_normalized_score_percent"]
+    normalized_text = f" human_normalized={normalized:.1f}%" if normalized is not None else " human_normalized=n/a"
+    print(
+        f"Evaluation: return={result['return_mean']:.1f}{normalized_text} over {config.eval_episodes} games", flush=True
+    )
 
 
 @jax.jit

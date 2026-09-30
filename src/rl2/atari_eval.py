@@ -31,9 +31,11 @@ https://gymnasium.farama.org/api/wrappers/misc_wrappers/#gymnasium.wrappers.Atar
 
 Report per-game means over all requested episodes, including timeouts. For
 benchmark aggregates, normalize each game's mean before averaging across
-games: 100 * (agent - random) / (human - random). Optional baselines must come
-from the SAME game and reference protocol; there is deliberately no implicit
-baseline table. Report multiple independent training seeds and their spread;
+games: 100 * (agent - random) / (human - random). The vendored DQN Zoo
+Atari-57 table supplies reference scores by default; explicit baselines override
+it for comparisons to papers using other tables. Games outside Atari-57 report
+null baselines and a null normalized score. Normalization does not establish
+that evaluation protocols match. Report multiple independent training seeds and their spread;
 episode SEM below only measures evaluation variability of this fixed policy.
 Do not select the best evaluation episode/checkpoint or average raw scores
 across different games. This evaluator does not train or update the policy.
@@ -53,6 +55,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax.training.train_state import TrainState
 
+from rl2.atari_scores import REFERENCE_SOURCE, get_reference_scores
 from rl2.ppo import Array, AtariPreprocessing, Config, LSTMCarry, initial_carry
 
 type EvaluationResult = dict[str, Any]
@@ -172,11 +175,16 @@ def evaluate(
 
     ``training`` must describe the supplied state's actual training setup.
     Returns a JSON-compatible report; optionally writes it to ``output_path``.
+    Baselines default to the bundled DQN Zoo Atari-57 table when available.
     The caller owns checkpoint selection and independent-training-seed repeats.
     """
     evaluation = evaluation or EvaluationConfig()
     if baselines is not None and baselines.env_id != training.env_id:
         raise ValueError("baseline env_id must match the evaluated game")
+    if baselines is None:
+        scores = get_reference_scores(training.env_id)
+        if scores is not None:
+            baselines = ScoreBaselines(training.env_id, scores[0], scores[1], REFERENCE_SOURCE)
     env = make_evaluation_env(training, evaluation)
     episodes: list[dict[str, Any]] = []
     try:
@@ -246,6 +254,8 @@ def evaluate(
         "return_std": std,
         "return_sem": std / np.sqrt(len(returns)) if std is not None else None,
         "episodes": episodes,
+        "baselines": None,
+        "human_normalized_score_percent": None,
     }
     if baselines is not None:
         result["baselines"] = asdict(baselines)

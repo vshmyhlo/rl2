@@ -138,7 +138,14 @@ Evaluation requires training with `atari_preprocessing: true` and
 `observation_size: 84` or `null`. It uses sampled PPO actions, sticky actions 0.25,
 action repeat 4, random reset no-ops, unclipped full-game returns, and a 108,000-emulator-frame
 limit. TensorBoard logs `eval/return_mean`, `eval/return_median`, `eval/return_std`,
-and `eval/return_sem` against training steps. The Text tab's `eval/report` includes
+and `eval/return_sem` against training steps. For Atari-57 games it also logs
+`eval/human_normalized_score_percent`, using the bundled
+[DQN Zoo reference table](src/rl2/atari_scores.py): 0% is random performance and
+100% is human performance. Scores are not clipped. Reports include the reference
+values and their pinned source URL. Games outside the table retain raw scores
+and report null normalization; standalone evaluation accepts explicit baseline
+overrides for other reference tables. Match the target paper's normalization
+references as well as its evaluation protocol. The Text tab's `eval/report` includes
 all episode scores, seeds, protocol settings, and actual training step/episode
 counts; these reports work with local and GCS log directories. Evaluation duration
 is logged under `time/evaluation_seconds`. Episode SEM describes the fixed policy's

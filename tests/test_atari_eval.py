@@ -18,6 +18,7 @@ from flax.training.train_state import TrainState
 
 from rl2 import ppo
 from rl2.atari_eval import EvaluationConfig, ScoreBaselines, _action, evaluate, make_evaluation_env
+from rl2.atari_scores import ATARI_REFERENCE_SCORES, REFERENCE_SOURCE, get_reference_scores
 from rl2.ppo import Array, Config, LSTMCarry, initial_carry, load_config
 
 
@@ -106,6 +107,7 @@ def test_full_games_raw_returns_memory_and_json(tmp_path: Path) -> None:
     assert result["return_std"] == pytest.approx(np.sqrt(8), rel=0, abs=5e-08)
     assert result["return_sem"] == pytest.approx(2, rel=0, abs=5e-08)
     assert result["human_normalized_score_percent"] == 50
+    assert result["baselines"]["source"] == "test reference"
     assert starts == [True, False, True, False]
     assert memories == [0, 1, 0, 1]
     assert result["episodes"][0]["terminated"]
@@ -222,10 +224,17 @@ def test_training_schedules_evaluation_after_updates_without_changing_state() ->
             events = EventAccumulator(str(run_dir)).Reload()
             if expected_steps:
                 assert [event.step for event in events.Scalars("eval/return_mean")] == expected_steps
+                normalized = events.Scalars("eval/human_normalized_score_percent")
+                assert [event.step for event in normalized] == expected_steps
+                assert [event.value for event in normalized] == pytest.approx(
+                    [100 * (5 + 20.7) / (14.6 + 20.7)] * len(expected_steps)
+                )
                 for event in events.Tensors("eval/report/text_summary"):
                     text = event.tensor_proto.string_val[0].decode()
                     report = json.loads(text.removeprefix("```json\n").removesuffix("\n```"))
                     assert report["training_steps"] == event.step
+                    assert report["baselines"]["source"] == REFERENCE_SOURCE
+                    assert report["human_normalized_score_percent"] == pytest.approx(100 * (5 + 20.7) / 35.3)
                     assert report["training_episodes"] == event.step // 2
             else:
                 assert "eval/return_mean" not in events.Tags()["scalars"]
@@ -273,3 +282,78 @@ def test_evaluation_rejects_baseline_env_mismatch() -> None:
 def test_baselines_reject_equal_scores() -> None:
     with pytest.raises(ValueError):
         ScoreBaselines("ALE/Pong-v5", 1, 1, "test")
+
+
+def test_reference_table_contains_all_57_games() -> None:
+    assert len(ATARI_REFERENCE_SCORES) == 57
+    assert get_reference_scores("ALE/SpaceInvaders-v5") == (148.0, 1668.7)
+    assert get_reference_scores("ALE/Pong-v5") == (-20.7, 14.6)
+    assert get_reference_scores("ALE/VideoPinball-v5") == (16256.9, 17667.9)
+
+
+@pytest.mark.parametrize("game,scores", ATARI_REFERENCE_SCORES.items())
+def test_reference_names_match_registered_ale_games(game: str, scores: tuple[float, float]) -> None:
+    env_id = "ALE/" + "".join(part.title() for part in game.split("_")) + "-v5"
+    assert gym.spec(env_id).kwargs["game"] == game
+    assert get_reference_scores(env_id) == scores
+    assert np.isfinite(scores).all()
+    assert scores[0] != scores[1]
+
+
+@pytest.mark.parametrize("env_id", ["ALE/Adventure-v5", "ALE/Pong-v4", "PongNoFrameskip-v4", "other/Pong-v5"])
+def test_reference_lookup_does_not_guess_unknown_games(env_id: str) -> None:
+    assert get_reference_scores(env_id) is None
+
+
+@pytest.mark.parametrize(
+    "env_id,score,expected",
+    [
+        ("ALE/SpaceInvaders-v5", 148.0, 0.0),
+        ("ALE/SpaceInvaders-v5", 1668.7, 100.0),
+        ("ALE/SpaceInvaders-v5", 3189.4, 200.0),
+        ("ALE/SpaceInvaders-v5", -1372.7, -100.0),
+        ("ALE/Skiing-v5", -17098.1, 0.0),
+        ("ALE/Skiing-v5", -4336.9, 100.0),
+    ],
+)
+def test_evaluation_automatically_normalizes_from_published_scores(
+    env_id: str, score: float, expected: float, tmp_path: Path
+) -> None:
+    env = ScoringEnv()
+    transition = (np.zeros((1, 84, 84), dtype=np.uint8), score, True, False, {"episode_frame_number": 7})
+    output = tmp_path / "report.json"
+    with (
+        patch("rl2.atari_eval.make_evaluation_env", return_value=env),
+        patch.object(env, "step", return_value=transition),
+    ):
+        result = evaluate(
+            policy_state(), replace(training_config(), env_id=env_id), EvaluationConfig(episodes=1), output_path=output
+        )
+    assert result["return_mean"] == score
+    assert result["human_normalized_score_percent"] == pytest.approx(expected)
+    assert result["baselines"]["env_id"] == env_id
+    assert result["baselines"]["source"] == REFERENCE_SOURCE
+    assert json.loads(output.read_text()) == result
+
+
+def test_evaluation_without_reference_scores_keeps_raw_returns() -> None:
+    with patch("rl2.atari_eval.make_evaluation_env", return_value=ScoringEnv()):
+        result = evaluate(
+            policy_state(), replace(training_config(), env_id="ALE/Adventure-v5"), EvaluationConfig(episodes=2)
+        )
+    assert result["return_mean"] == 5
+    assert result["baselines"] is None
+    assert result["human_normalized_score_percent"] is None
+    json.dumps(result, allow_nan=False)
+
+
+def test_training_omits_unavailable_normalized_scalar() -> None:
+    config = replace(training_config(), env_id="ALE/Adventure-v5", eval_episodes=2)
+    with (
+        patch("rl2.atari_eval.make_evaluation_env", return_value=ScoringEnv()),
+        patch("rl2.ppo.SummaryWriter") as writer,
+    ):
+        ppo.log_evaluation(policy_state(), config, writer, 100, 5000)
+    tags = [call.args[0] for call in writer.add_scalar.call_args_list]
+    assert "eval/return_mean" in tags
+    assert "eval/human_normalized_score_percent" not in tags
