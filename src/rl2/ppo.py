@@ -53,6 +53,7 @@ class Config:
     log_dir: str
     video_every_episodes: int
     video_speed: float
+    bf16: bool = True
 
 
 def load_config(path: str | Path) -> Config:
@@ -75,6 +76,7 @@ def initial_carry(num_envs: int, hidden_size: int) -> LSTMCarry:
 
 class ResetLSTM(nn.Module):
     features: int
+    dtype: jax.typing.DTypeLike = jnp.float32
 
     @nn.compact
     def __call__(
@@ -84,12 +86,15 @@ class ResetLSTM(nn.Module):
     ) -> tuple[LSTMCarry, jax.Array]:
         x, episode_starts = inputs
         carry = jax.tree.map(lambda c: jnp.where(episode_starts[:, None], 0, c), carry)
-        return nn.OptimizedLSTMCell(self.features)(carry, x)
+        # Float32 carry preserves recurrent accumulation and scan dtype stability.
+        carry, x = nn.OptimizedLSTMCell(self.features, dtype=self.dtype)(carry, x)
+        return carry, x.astype(self.dtype)
 
 
 class ActorCritic(nn.Module):
     num_actions: int
     lstm_hidden_size: int
+    dtype: jax.typing.DTypeLike = jnp.float32
 
     @nn.compact
     def __call__(
@@ -106,29 +111,35 @@ class ActorCritic(nn.Module):
             x = x.reshape((*x.shape[:3], -1))
         else:
             x = jnp.moveaxis(obs, 1, -1)
-        x = x.astype(jnp.float32) / 255.0
+        x = (x.astype(jnp.float32) / 255.0).astype(self.dtype)
+        # Flax keeps parameters and LayerNorm statistics in float32 by default.
         init = nn.initializers.orthogonal(np.sqrt(2))
-        for channels, kernel, stride in [(32, 8, 4), (64, 4, 2), (64, 3, 1)]:
-            x = nn.Conv(channels, (kernel, kernel), (stride, stride), padding="VALID", kernel_init=init)(x)
-            x = nn.relu(nn.LayerNorm(reduction_axes=-1, feature_axes=-1)(x))
-        x = nn.Dense(512, kernel_init=init)(x.reshape((x.shape[0], -1)))
-        x = nn.relu(nn.LayerNorm(name="shared_norm")(x))
+        for channels, kernel, stride in [(128, 8, 4), (256, 4, 2), (256, 3, 1)]:
+            x = nn.Conv(
+                channels, (kernel, kernel), (stride, stride), padding="VALID", kernel_init=init, dtype=self.dtype
+            )(x)
+            x = nn.relu(nn.LayerNorm(reduction_axes=-1, feature_axes=-1, dtype=self.dtype)(x))
+        x = nn.Dense(2048, kernel_init=init, dtype=self.dtype)(x.reshape((x.shape[0], -1)))
+        x = nn.relu(nn.LayerNorm(name="shared_norm", dtype=self.dtype)(x))
         carry, x = nn.scan(
             ResetLSTM,
             variable_broadcast="params",
             split_rngs={"params": False},
             in_axes=0,
             out_axes=0,
-        )(self.lstm_hidden_size, name="lstm")(
+        )(self.lstm_hidden_size, dtype=self.dtype, name="lstm")(
             carry,
             (x.reshape((steps, environments, -1)), episode_starts),
         )
-        policy = nn.Dense(256, kernel_init=init, name="policy_hidden")(x)
-        policy = nn.relu(nn.LayerNorm(name="policy_norm")(policy))
-        critic = nn.Dense(256, kernel_init=init, name="value_hidden")(x)
-        critic = nn.relu(nn.LayerNorm(name="value_norm")(critic))
-        logits = nn.Dense(self.num_actions, kernel_init=nn.initializers.orthogonal(0.01), name="policy_output")(policy)
-        value = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0), name="value_output")(critic)
+        policy = nn.Dense(512, kernel_init=init, name="policy_hidden", dtype=self.dtype)(x)
+        policy = nn.relu(nn.LayerNorm(name="policy_norm", dtype=self.dtype)(policy))
+        critic = nn.Dense(512, kernel_init=init, name="value_hidden", dtype=self.dtype)(x)
+        critic = nn.relu(nn.LayerNorm(name="value_norm", dtype=self.dtype)(critic))
+        # Float32 heads keep action probabilities, values, and PPO losses precise.
+        logits = nn.Dense(
+            self.num_actions, kernel_init=nn.initializers.orthogonal(0.01), name="policy_output", dtype=jnp.float32
+        )(policy)
+        value = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0), name="value_output", dtype=jnp.float32)(critic)
         return carry, logits, value.squeeze(-1)
 
 
@@ -340,7 +351,11 @@ def train(config: Config) -> TrainState:
         writer.add_text("devices", devices, 0)
         obs, _ = envs.reset(seed=config.seed)
         key, init_key = jax.random.split(jax.random.key(config.seed))
-        model = ActorCritic(envs.single_action_space.n, config.lstm_hidden_size)
+        model = ActorCritic(
+            envs.single_action_space.n,
+            config.lstm_hidden_size,
+            dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
+        )
         carry = initial_carry(config.num_envs, config.lstm_hidden_size)
         episode_start = np.ones(config.num_envs, dtype=bool)
         lr_schedule = learning_rate_schedule(config)
@@ -372,21 +387,32 @@ def train(config: Config) -> TrainState:
         dones = np.empty(shape, dtype=bool)
         episode_starts = np.empty(shape, dtype=bool)
 
+        # Keep asynchronous initialization out of the first rollout's timing.
+        jax.block_until_ready((state, carry, key))
         for iteration in range(config.total_steps // batch_size):
+            rollout_start = monotonic()
+            env_seconds = 0.0
+            model_seconds = 0.0
             # Truncated BPTT: preserve memory, but gradients stop at rollout boundaries.
             rollout_carry = jax.tree.map(jax.lax.stop_gradient, carry)
             for t in range(config.num_steps):
                 observations[t] = obs
                 episode_starts[t] = episode_start
+                model_start = monotonic()
                 key, action_key = jax.random.split(key)
                 action, log_prob, prediction, carry = act(state, obs, carry, episode_start, action_key)
                 actions[t], log_probs[t], values[t] = jax.device_get((action, log_prob, prediction))
+                jax.block_until_ready(carry)
+                model_seconds += monotonic() - model_start
+                env_start = monotonic()
                 obs, reward, terminated, truncated, _ = envs.step(actions[t])
+                env_seconds += monotonic() - env_start
                 dones[t] = terminated | truncated
                 rewards[t] = np.sign(reward)
                 # Bootstrap time limits from the final observation, before resetting.
                 timeout = truncated & ~terminated
                 if timeout.any():
+                    model_start = monotonic()
                     rewards[t] += (
                         config.gamma
                         * np.asarray(
@@ -399,6 +425,7 @@ def train(config: Config) -> TrainState:
                         )
                         * timeout
                     )
+                    model_seconds += monotonic() - model_start
                 episode_start = dones[t].copy()
                 episode_returns += reward
                 episode_lengths += 1
@@ -408,18 +435,25 @@ def train(config: Config) -> TrainState:
                 episode_returns[dones[t]] = 0
                 episode_lengths[dones[t]] = 0
                 if dones[t].any():
+                    env_start = monotonic()
                     obs, _ = envs.reset(options={"reset_mask": dones[t].copy()})
+                    env_seconds += monotonic() - env_start
 
+            model_start = monotonic()
+            next_value = jax.block_until_ready(value(state, obs, carry, episode_start))
+            model_seconds += monotonic() - model_start
             advantages, returns = jax.device_get(
                 gae(
                     rewards,
                     dones,
                     values,
-                    value(state, obs, carry, episode_start),
+                    next_value,
                     config.gamma,
                     config.gae_lambda,
                 )
             )
+            rollout_seconds = monotonic() - rollout_start
+            optimization_start = monotonic()
             # Keep uint8 rollouts on the host; transfer only each minibatch to JAX.
             batch = (observations, actions, log_probs, advantages, returns)
             learning_rate = float(lr_schedule(iteration))
@@ -449,6 +483,9 @@ def train(config: Config) -> TrainState:
                     updates_done += 1
                 if early_stop:
                     break
+            # Metrics alone may be ready before the optimizer's parameter updates.
+            jax.block_until_ready((state, metrics))
+            optimization_seconds = monotonic() - optimization_start
             policy_loss, value_loss, entropy, approx_kl, clip_fraction = np.mean(
                 jax.device_get(metrics),
                 axis=0,
@@ -462,6 +499,10 @@ def train(config: Config) -> TrainState:
                 "losses/value": value_loss,
                 "policy/entropy": entropy,
                 "charts/steps_per_second": sps,
+                "time/rollout_seconds": rollout_seconds,
+                "time/rollout_env_seconds": env_seconds,
+                "time/rollout_model_seconds": model_seconds,
+                "time/optimization_seconds": optimization_seconds,
                 "policy/approx_kl": approx_kl,
                 "policy/clip_fraction": clip_fraction,
                 "value/explained_variance": explained_var,

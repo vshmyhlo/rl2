@@ -114,6 +114,51 @@ class PPOTests(unittest.TestCase):
         self.assertLess(float(updated.params["logits"][0, 1, 0]), float(logits[0, 1, 0]))
         self.assertGreater(float(updated.params["logits"][1, 1, 0]), float(logits[1, 1, 0]))
 
+    def test_bf16_recurrent_training_keeps_float32_state_and_losses(self) -> None:
+        config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), target_kl=None)
+        self.assertTrue(config.bf16)
+        model = ActorCritic(3, 8, dtype=jnp.bfloat16)
+        obs = jax.random.randint(jax.random.key(2), (3, 2, 1, 84, 84), 0, 256, dtype=jnp.uint8)
+        carry = initial_carry(2, 8)
+        starts = jnp.array([[True, True], [False, False], [True, False]])
+        params = model.init(jax.random.key(1), obs, carry, starts)["params"]
+        (final, logits, values), captured = model.apply(
+            {"params": params}, obs, carry, starts, capture_intermediates=True, mutable=["intermediates"]
+        )
+        self.assertEqual(captured["intermediates"]["Conv_0"]["__call__"][0].dtype, jnp.bfloat16)
+        self.assertEqual(captured["intermediates"]["policy_hidden"]["__call__"][0].dtype, jnp.bfloat16)
+        for array in (*final, logits, values, *jax.tree.leaves(params)):
+            self.assertEqual(array.dtype, jnp.float32)
+        state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(0.001))
+        replayed_log_probs = []
+        for t in range(3):
+            actions, log_probs, prediction, carry = ppo.act(state, obs[t], carry, starts[t], jax.random.key(t))
+            np.testing.assert_allclose(prediction, values[t], atol=1e-6)
+            np.testing.assert_allclose(log_probs, action_log_prob(logits[t], actions), atol=1e-6)
+            replayed_log_probs.append(action_log_prob(logits[t], jnp.zeros(2, dtype=jnp.int32)))
+        np.testing.assert_allclose(carry, final, atol=1e-6)
+        batch = (
+            obs,
+            jnp.zeros((3, 2), dtype=jnp.int32),
+            jnp.stack(replayed_log_probs),
+            jnp.arange(6, dtype=jnp.float32).reshape(3, 2),
+            jnp.ones((3, 2)),
+            initial_carry(2, 8),
+            starts,
+        )
+        updated, metrics = update(state, batch, config)
+        self.assertEqual(int(updated.step), 1)
+        for array in (*metrics, *jax.tree.leaves((updated.params, updated.opt_state))):
+            self.assertTrue(np.isfinite(array).all())
+            if jnp.issubdtype(array.dtype, jnp.floating):
+                self.assertEqual(array.dtype, jnp.float32)
+        self.assertTrue(
+            any(
+                not np.array_equal(before, after)
+                for before, after in zip(jax.tree.leaves(params), jax.tree.leaves(updated.params))
+            )
+        )
+
     def test_recurrent_sequences_match_steps_and_reset_only_finished_env(self):
         model = ActorCritic(3, 16)
         obs = jax.random.randint(jax.random.key(2), (4, 2, 4, 84, 84), 0, 256, dtype=jnp.uint8)
