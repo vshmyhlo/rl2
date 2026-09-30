@@ -110,8 +110,17 @@ Set `video_every_episodes: 0` to disable videos. Recording and encoding pause tr
 or `0.5` for half speed. This controls playback FPS, not environment stepping.
 
 Python 3.12+; `uv` installs dependencies, including ALE's bundled ROMs. The default
-JAX install runs on CPU; for NVIDIA GPUs, install the appropriate
-[JAX accelerator package](https://docs.jax.dev/en/latest/installation.html).
+JAX install runs on CPU. For NVIDIA GPUs on Linux, use the `cuda12` extra, which
+installs JAX with CUDA 12 and cuDNN libraries (a compatible NVIDIA driver is required):
+
+```sh
+uv run --extra cuda12 rl2 --platform cuda
+```
+
+`--platform cuda` requires CUDA and fails if it is unavailable. Omit `--platform`
+to use `JAX_PLATFORMS` or JAX's automatic device selection. See the
+[JAX installation requirements](https://docs.jax.dev/en/latest/installation.html)
+for supported GPUs and drivers.
 
 On Apple Silicon with macOS 14+, the optional `metal` extra uses the community
 [metaljax backend](https://github.com/eterevsky/metaljax) (beta):
