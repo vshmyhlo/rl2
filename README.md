@@ -230,3 +230,14 @@ Use the same task, config, and seed to replay the same questions.
 
 Reasoning Gym is installed with the project dependencies. If installation fails
 because `cc` is missing but GCC is installed, use `CC=gcc uv sync`.
+
+## Reading materials
+
+- [Programmatically Interpretable Reinforcement Learning](https://proceedings.mlr.press/v80/verma18a.html)
+  (Verma et al., ICML 2018): Uses a trained neural policy to guide the search for
+  interpretable policies written in a domain-specific language. Relevant to
+  learning programs that play Atari; evaluated on simulated driving in TORCS.
+- [OCAtari: Object-Centric Atari 2600 Reinforcement Learning Environments](https://arxiv.org/abs/2306.08649)
+  (Delfosse et al., 2023): Extracts structured object observations from Atari games
+  using RAM or vision. Useful for studying programmatic policies over objects
+  and their attributes while separating control learning from perception.
