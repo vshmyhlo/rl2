@@ -19,6 +19,7 @@ dependencies = [
     "opencv-python-headless>=4.10,<5",
     "optax>=0.2.4,<0.3",
     "pyyaml>=6,<7",
+    "reasoning-gym>=0.1.25",
     "ruff>=0.16.9",
     "tensorboard>=2.18,<3",
     "tensorboardx>=2.6.5,<3",
@@ -34,6 +35,7 @@ metal = [
 
 [project.scripts]
 rl2 = "rl2.ppo:main"
+rl2-reasoning = "rl2.reasoning_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]

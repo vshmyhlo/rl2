@@ -173,3 +173,26 @@ control. Run it on the desired backend:
 JAX_PLATFORMS=cpu uv run --locked python -m unittest discover -s tests -p test_reproducibility.py -v
 JAX_PLATFORMS=metal uv run --locked --extra metal python -m unittest discover -s tests -p test_reproducibility.py -v
 ```
+
+
+## Interactive Reasoning Gym
+
+Play generated math, logic, and programming tasks in the terminal:
+
+```sh
+uv run rl2-reasoning                       # choose a task interactively
+uv run rl2-reasoning --list                # list available tasks
+uv run rl2-reasoning countdown --size 5 --seed 42
+uv run rl2-reasoning countdown --describe  # show default task settings
+uv run rl2-reasoning countdown --config '{"min_numbers": 3, "max_numbers": 3}'
+```
+
+Enter an answer to get the task's score (0–1) and a reference answer, then
+continue to the next question. `/skip` reveals the reference answer; `/quit`,
+Ctrl-C, or EOF ends the session. `/multi` accepts a multiline answer (for example,
+code); finish with `/submit` on its own line. `/help` lists the commands.
+The final mean score includes submitted answers only, with skips counted separately.
+Use the same task, config, and seed to replay the same questions.
+
+Reasoning Gym is installed with the project dependencies. If installation fails
+because `cc` is missing but GCC is installed, use `CC=gcc uv sync`.
