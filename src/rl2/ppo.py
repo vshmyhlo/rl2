@@ -55,7 +55,7 @@ class Config:
     video_speed: float
     bf16: bool = True
     observation_size: int | None = None
-    eval_every_episodes: int = 0
+    eval_every_minutes: float = 0.0
     eval_episodes: int = 100
     eval_seed: int = 10_000
 
@@ -387,9 +387,13 @@ def train(config: Config) -> TrainState:
     if config.target_kl is not None and (not np.isfinite(config.target_kl) or config.target_kl <= 0):
         raise ValueError("target_kl must be positive and finite, or null to disable stopping")
 
-    if type(config.eval_every_episodes) is not int or config.eval_every_episodes < 0:
-        raise ValueError("eval_every_episodes must be a nonnegative integer (0 disables evaluation)")
-    if config.eval_every_episodes:
+    if (
+        type(config.eval_every_minutes) not in (int, float)
+        or not np.isfinite(config.eval_every_minutes)
+        or config.eval_every_minutes < 0
+    ):
+        raise ValueError("eval_every_minutes must be finite and nonnegative (0 disables evaluation)")
+    if config.eval_every_minutes:
         from rl2.atari_eval import EvaluationConfig, validate_training_config
 
         EvaluationConfig(episodes=config.eval_episodes, seed=config.eval_seed)
@@ -456,8 +460,6 @@ def train(config: Config) -> TrainState:
         recent_lengths = deque(maxlen=100)
         completed_episodes = 0
         next_video_episode = config.video_every_episodes
-        next_eval_episode = config.eval_every_episodes
-        start = monotonic()
         shape = (config.num_steps, config.num_envs)
         observations = np.empty((*shape, *obs.shape[1:]), dtype=np.uint8)
         actions = np.empty(shape, dtype=np.int32)
@@ -467,6 +469,9 @@ def train(config: Config) -> TrainState:
 
         # Keep asynchronous initialization out of the first rollout's timing.
         jax.block_until_ready((state, carry, key))
+        start = monotonic()
+        eval_interval_seconds = config.eval_every_minutes * 60
+        next_eval_time = start + eval_interval_seconds
         for iteration in range(config.total_steps // batch_size):
             rollout_start = monotonic()
             env_seconds = 0.0
@@ -596,10 +601,10 @@ def train(config: Config) -> TrainState:
             while config.video_every_episodes and completed_episodes >= next_video_episode:
                 log_video(state, config, writer, next_video_episode, steps)
                 next_video_episode += config.video_every_episodes
-            if config.eval_every_episodes and completed_episodes >= next_eval_episode:
+            if eval_interval_seconds and monotonic() >= next_eval_time:
                 log_evaluation(state, config, writer, completed_episodes, steps)
-                # A rollout can cross several thresholds; evaluate its updated policy once.
-                next_eval_episode = (completed_episodes // config.eval_every_episodes + 1) * config.eval_every_episodes
+                # Restart after evaluation so long evaluations never cause catch-up runs.
+                next_eval_time = monotonic() + eval_interval_seconds
             writer.flush()
             score = f"{np.mean(recent_returns):.1f}" if recent_returns else "n/a"
             length = f"{np.mean(recent_lengths):.1f}" if recent_lengths else "n/a"

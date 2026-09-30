@@ -398,7 +398,7 @@ def check_atari_training(
         num_minibatches=2,
         update_epochs=update_epochs,
         video_every_episodes=2,
-        eval_every_episodes=0,
+        eval_every_minutes=0,
         observation_size=84,
         vector_env=mode,
         target_kl=target_kl,

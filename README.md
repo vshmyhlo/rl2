@@ -125,13 +125,14 @@ Set `video_every_episodes: 0` to disable videos. Recording and encoding pause tr
 `video_speed: 2.0` plays recorded games at double speed; use `1.0` for normal speed
 or `0.5` for half speed. This controls playback FPS, not environment stepping.
 
-Evaluation runs after the rollout update whenever another `eval_every_episodes: 100`
-training episodes have completed across all environments. Each evaluation plays
-`eval_episodes: 100` full games with the frozen policy and pauses training until it
-finishes. If one rollout crosses several thresholds, its updated policy is evaluated
-once. Evaluation games do not count toward training episodes or steps, and use fresh
-LSTM memory and a separate RNG. `eval_seed: 10000` fixes the evaluation seed set across
-checkpoints. Set `eval_every_episodes: 0` to disable evaluation (also the default for
+Evaluation runs every `eval_every_minutes: 10` wall-clock minutes, checked after
+each rollout update. The first interval starts after initialization; subsequent
+intervals start when the previous evaluation finishes. Long rollouts delay the
+check until their update completes, and missed intervals do not trigger catch-up
+runs. Each evaluation plays `eval_episodes: 100` full games with the frozen policy
+and pauses training until it finishes. Evaluation games do not count toward
+training episodes or steps, and use fresh LSTM memory and a separate RNG. `eval_seed: 10000` fixes the evaluation seed set across
+checkpoints. Set `eval_every_minutes: 0` to disable evaluation (also the default for
 older configs that omit this setting). Evaluation prints progress at startup,
 after each game, and every 10 seconds during longer games. Updates include the
 completed game count and percentage, current game's return and emulator frames,

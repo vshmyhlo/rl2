@@ -6,7 +6,7 @@ from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import gymnasium as gym
 import jax
@@ -175,7 +175,7 @@ def test_cleanup_on_policy_failure() -> None:
     assert env.closed
 
 
-def test_training_schedules_evaluation_after_updates_without_changing_state() -> None:
+def test_training_schedules_evaluation_by_time_without_changing_state() -> None:
     config = replace(
         training_config(),
         frame_stack=False,
@@ -198,8 +198,27 @@ def test_training_schedules_evaluation_after_updates_without_changing_state() ->
     def evaluation_env(*args: Any) -> ScoringEnv:
         return ScoringEnv()
 
+    original_update = ppo.update
+
+    def timed_update(state: TrainState, batch: ppo.PPOBatch, config: Config) -> tuple[TrainState, ppo.PPOMetrics]:
+        result = original_update(state, batch, config)
+        clock.return_value += next(rollout_durations)
+        return result
+
+    def timed_evaluate(state: TrainState, training: Config, evaluation: EvaluationConfig) -> dict[str, Any]:
+        result = evaluate(state, training, evaluation)
+        clock.return_value += 1200.0  # Evaluation itself takes longer than the scheduling interval.
+        return result
+
     states: list[TrainState] = []
-    for interval, expected_steps in ((0, []), (3, [8, 12]), (1, [4, 8, 12])):
+    for interval, durations, expected_steps in (
+        (0, [599.0, 1.0, 600.0], []),
+        (10, [599.0, 1.0, 600.0], [8, 12]),
+        (5, [599.0, 1.0, 600.0], [4, 12]),
+        (10, [1800.0, 1.0, 600.0], [4, 12]),  # One long rollout crosses several intervals.
+    ):
+        clock = Mock(return_value=0.0)
+        rollout_durations = iter(durations)
         with TemporaryDirectory() as directory:
             with (
                 patch("rl2.ppo.make_env", side_effect=training_env),
@@ -208,10 +227,12 @@ def test_training_schedules_evaluation_after_updates_without_changing_state() ->
                     new=partial(ppo.ActorCritic, encoder_channels=(2,), embedding_size=4),
                 ),
                 patch("rl2.atari_eval.make_evaluation_env", side_effect=evaluation_env),
-                patch("rl2.atari_eval.evaluate", wraps=evaluate) as evaluation,
+                patch("rl2.atari_eval.evaluate", side_effect=timed_evaluate) as evaluation,
+                patch("rl2.ppo.monotonic", new=clock),
+                patch("rl2.ppo.update", side_effect=timed_update),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
-                states.append(ppo.train(replace(config, log_dir=directory, eval_every_episodes=interval)))
+                states.append(ppo.train(replace(config, log_dir=directory, eval_every_minutes=interval)))
             assert evaluation.call_count == len(expected_steps)
             assert [int(call.args[0].step) for call in evaluation.call_args_list] == [
                 step // 4 for step in expected_steps
@@ -247,10 +268,13 @@ def test_training_schedules_evaluation_after_updates_without_changing_state() ->
 @pytest.mark.parametrize(
     "overrides",
     (
-        {"eval_every_episodes": -1},
-        {"eval_every_episodes": 100, "atari_preprocessing": False},
-        {"eval_every_episodes": 100, "eval_episodes": 0},
-        {"eval_every_episodes": 100, "eval_seed": -1},
+        {"eval_every_minutes": -1},
+        {"eval_every_minutes": float("nan")},
+        {"eval_every_minutes": float("inf")},
+        {"eval_every_minutes": "10"},
+        {"eval_every_minutes": 100, "atari_preprocessing": False},
+        {"eval_every_minutes": 100, "eval_episodes": 0},
+        {"eval_every_minutes": 100, "eval_seed": -1},
     ),
 )
 def test_training_rejects_invalid_evaluation_before_creating_environments(overrides: dict[str, Any]) -> None:
