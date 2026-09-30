@@ -331,8 +331,8 @@ def train(config: Config) -> TrainState:
     writer = None
     try:
         run_name = f"{config.env_id.replace('/', '_')}_seed{config.seed}_{datetime.now():%Y%m%d-%H%M%S-%f}"
-        run_dir = Path(config.log_dir) / run_name
-        writer = SummaryWriter(logdir=str(run_dir))
+        run_dir = f"{config.log_dir.rstrip('/')}/{run_name}"
+        writer = SummaryWriter(logdir=run_dir)
         writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", 0)
         print(f"TensorBoard run: {run_dir}", flush=True)
         devices = str(jax.devices())

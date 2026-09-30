@@ -73,13 +73,20 @@ bootstrap from the final observation; game overs stop bootstrapping.
 With preprocessing enabled, the final frame at ALE timeouts is captured directly
 from the emulator to avoid Gymnasium's stale frame buffer when action repeat ends early.
 
-Each run also logs to a separate directory under `log_dir` (default: `runs`).
-Open the local TensorBoard UI in another terminal:
+Each run also logs to a separate directory under `log_dir`
+(default: `gs://cohere-dev/vlad/rl2`). GCS logging uses Google Application Default
+Credentials with write access to the bucket. For local development, authenticate
+with `gcloud auth application-default login` before training.
+Set `log_dir: runs` to log locally instead.
+
+To view GCS logs locally, download them and open TensorBoard:
 
 ```sh
+gcloud storage rsync --recursive gs://cohere-dev/vlad/rl2 runs
 uv run tensorboard --logdir runs
 ```
 
+Repeat the sync to refresh downloaded logs, or skip it when logging locally.
 Visit http://localhost:6006 to compare runs. Scalars show policy/value losses,
 entropy, steps/second, `charts/return_mean_100`, `charts/episode_length_mean_100`,
 and `charts/total_episodes` (cumulative completed training episodes across all environments),
