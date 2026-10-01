@@ -34,7 +34,8 @@ metal = [
 ]
 
 [project.scripts]
-rl2 = "rl2.ppo:main"
+ppo = "rl2.ppo:main"
+ppo_rnd = "rl2.ppo_rnd:main"
 rl2-reasoning = "rl2.reasoning_cli:main"
 
 [build-system]

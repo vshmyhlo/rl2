@@ -1,0 +1,44 @@
+# Experimental PPO + RND; not yet benchmarked on Montezuma.
+# Run: uv run ppo_rnd --config configs/ppo_rnd_montezuma.yaml
+# RND reward/optimizer settings follow https://arxiv.org/abs/1810.12894, Appendix A.4.
+# This uses a roughly 50M-parameter recurrent residual policy, not the paper's CNN architecture.
+env_id: ALE/MontezumaRevenge-v5 # Montezuma's Revenge
+observation_size: null # Keep Atari preprocessing's 84x84 output
+frame_stack: true # true stacks 4 frames; false uses a single frame
+atari_preprocessing: true # true enables 84x84 grayscale, action repeat 4, max pooling, and random reset no-ops
+seed: 1
+total_steps: 100000000 # Initial budget: ~400M emulator frames; paper's typical runs used ~2B frames
+num_envs: 32
+vector_env: async # async (subprocesses) or sync
+num_steps: 128 # Recurrent memory carries across rollouts; gradients span 128 steps
+num_minibatches: 8 # 4 whole sequences per minibatch; 512 transitions
+update_epochs: 4
+encoder_channels: [128, 256, 384, 512]
+embedding_size: 768
+lstm_hidden_size: 1536
+bf16: true # Mixed precision compute; parameters, recurrent memory, and losses stay float32
+learning_rate: 0.0001 # Conservative updates for longer-horizon value targets
+anneal_lr: false # Keep learning when rewards are discovered late in training
+gamma: 0.999 # Discount horizon of about 1000 agent steps for sparse game rewards
+gae_lambda: 0.95 # RND reference setting; lower variance than 0.99
+clip_coef: 0.1
+target_kl: 0.01 # null disables KL early stopping
+entropy_coef: 0.001 # RND provides directed exploration; reference entropy weight
+value_coef: 0.5
+max_grad_norm: 0.5
+log_dir: gs://cohere-dev/vlad/rl2
+video_every_episodes: 1000 # Reduce recording overhead during a long run; 0 disables recording
+video_max_frames: 1800 # Bound recording memory and training pauses; 120 seconds at action repeat 4
+video_speed: 4.0 # Playback multiplier: 1.0 normal, 2.0 double speed
+eval_every_minutes: 30 # Periodic full-game evaluation
+eval_episodes: 10 # Lightweight periodic check; use 100 games for final score reporting
+eval_seed: 10000 # Fixed evaluation seed set, separate from training RNG
+
+# Intrinsic returns continue across game resets; policy memory still resets.
+intrinsic_gamma: 0.99
+extrinsic_coef: 2.0 # Weight on the extrinsic advantage before combined normalization
+intrinsic_coef: 1.0 # Weight on the intrinsic advantage
+rnd_learning_rate: 0.0001 # Fixed predictor learning rate, independent of PPO
+rnd_update_epochs: 4 # Independent of PPO's KL early stopping
+rnd_update_fraction: 1.0 # Reference uses min(1, 32 / num_envs); 0.25 is for 128 envs
+rnd_warmup_steps: 6400 # Reference random warmup; 204800 agent steps at 32 envs, outside total_steps
