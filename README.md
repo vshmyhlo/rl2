@@ -6,6 +6,16 @@ Tinkering with RL and other things.
 
 Entries are ordered from most recent at the top to oldest at the bottom.
 
+### Solving Atari57 with a Single Trained Model
+
+Try solving Atari57 with a single trained model using
+[multi_atari.py](src/rl2/multi_atari.py).
+
+### Solving Reasoning Problems with reasoning-gym
+
+Try solving reasoning problems with
+[reasoning-gym](https://github.com/open-thought/reasoning-gym).
+
 ### Learning When to Think or Act in RL
 
 Can RL policies learn to “think” or plan before acting, similar to thinking in
