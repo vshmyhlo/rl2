@@ -6,6 +6,12 @@ Tinkering with RL and other things.
 
 Entries are ordered from most recent at the top to oldest at the bottom.
 
+### Learning When to Think or Act in RL
+
+Can RL policies learn to “think” or plan before acting, similar to thinking in
+LLMs, with the policy itself deciding how long to think or plan before taking
+an action?
+
 ### Solving Atari with Program Induction/Synthesis
 
 In Progress
