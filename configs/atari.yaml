@@ -23,6 +23,6 @@ max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2
 video_every_episodes: 100 # 0 disables recording
 video_speed: 4.0 # Playback multiplier: 1.0 normal, 2.0 double speed
-eval_every_minutes: 20 # Wall-clock minutes between evaluations; timer restarts after evaluation; 0 disables
+eval_every_minutes: 30 # Wall-clock minutes between evaluations; timer restarts after evaluation; 0 disables
 eval_episodes: 100 # Full games per evaluation, after the rollout update; training pauses during evaluation
 eval_seed: 10000 # Fixed evaluation seed set, separate from training RNG
