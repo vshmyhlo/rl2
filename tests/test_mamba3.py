@@ -106,7 +106,7 @@ def test_resets_clear_all_history_without_affecting_other_examples(rank: int) ->
     np.testing.assert_allclose(reset_y, zero_y, atol=2e-6)
 
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 def test_causal_gradients_and_training(dtype: jax.typing.DTypeLike) -> None:
     model = Mamba3(8, d_state=8, headdim=4, mimo_rank=2, outproj_norm=True, dtype=dtype)
     x = jax.random.normal(jax.random.key(4), (5, 2, 8))
@@ -179,14 +179,18 @@ def test_invalid_input_and_carry_shapes() -> None:
         model.apply(variables, x[0], episode_starts=jnp.zeros((1, 2)), method=model.step)
 
 
-@pytest.mark.parametrize("rank", [1, 2])
+@pytest.mark.parametrize("rank", [1, 2, 4])
 @pytest.mark.parametrize("fraction", [0.5, 1.0])
 @pytest.mark.parametrize("norm", [False, True])
-def test_matches_official_module_outputs_states_and_gradients(rank: int, fraction: float, norm: bool) -> None:
+@pytest.mark.parametrize("chunk_size", [2, 6])
+def test_matches_official_module_outputs_states_and_gradients(
+    rank: int, fraction: float, norm: bool, chunk_size: int
+) -> None:
     """Fixtures execute upstream Mamba3 with its CPU reference kernels.
 
     See generate_mamba3_reference.py for pinned provenance and reproduction.
     PyTorch and the upstream repository are not needed for normal pytest runs.
+    Chunked evaluation must preserve both history and its gradient graph.
     """
     model = Mamba3(
         8,
@@ -204,7 +208,18 @@ def test_matches_official_module_outputs_states_and_gradients(rank: int, fractio
     params = unflatten_dict(
         {key.removeprefix("params/"): value for key, value in case.items() if key.startswith("params/")}, sep="/"
     )
-    carry, y = model.apply({"params": params}, case["x"])
+
+    def forward(parameters: Any, inputs: jax.Array) -> tuple[Mamba3Carry, jax.Array]:
+        chex.assert_shape(inputs, (6, 2, 8))
+        chex.assert_type(inputs, jnp.float32)
+        carry = model.initial_carry(inputs.shape[1])
+        outputs = []
+        for start in range(0, inputs.shape[0], chunk_size):
+            carry, output = model.apply({"params": parameters}, inputs[start : start + chunk_size], carry)
+            outputs.append(output)
+        return carry, jnp.concatenate(outputs)
+
+    carry, y = forward(params, case["x"])
     np.testing.assert_allclose(y, case["y"], rtol=5e-5, atol=3e-6)
     for name, leaf in zip(carry._fields, carry):
         np.testing.assert_allclose(leaf, case[f"carry/{name}"], rtol=5e-5, atol=3e-6)
@@ -212,7 +227,7 @@ def test_matches_official_module_outputs_states_and_gradients(rank: int, fractio
     def loss_fn(parameters: Any, x: jax.Array) -> jax.Array:
         chex.assert_shape(x, (6, 2, 8))
         chex.assert_type(x, jnp.float32)
-        _, output = model.apply({"params": parameters}, x)
+        _, output = forward(parameters, x)
         return jnp.sum(output * case["probe"])
 
     grads, dx = jax.jit(jax.grad(loss_fn, argnums=(0, 1)))(params, case["x"])

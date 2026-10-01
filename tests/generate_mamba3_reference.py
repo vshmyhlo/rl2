@@ -134,7 +134,7 @@ def generate(root: Path, destination: Path) -> None:
     def save(name: str, tensor: torch.Tensor) -> None:
         arrays[name] = tensor.detach().numpy().copy()
 
-    for rank in (1, 2):
+    for rank in (1, 2, 4):
         for fraction in (0.5, 1.0):
             for norm in (False, True):
                 torch.manual_seed(2026 + rank + int(fraction * 10) + int(norm))
