@@ -1,0 +1,32 @@
+# Experimental sparse-reward PPO baseline; these settings have not been benchmarked.
+# Config tuning alone is unlikely to solve Montezuma: this trainer has no intrinsic reward (e.g. RND).
+# The gamma choice follows the extrinsic-reward setting in https://github.com/openai/random-network-distillation
+env_id: ALE/MontezumaRevenge-v5 # Montezuma's Revenge
+observation_size: null # Resize only; null preserves the original resolution
+frame_stack: true # true stacks 4 frames; false uses a single frame
+atari_preprocessing: true # true enables 84x84 grayscale, action repeat 4, max pooling, and random reset no-ops
+seed: 1
+total_steps: 100000000 # Agent steps across all envs; roughly 400M emulator frames with action repeat 4
+num_envs: 32
+vector_env: async # async (subprocesses) or sync
+num_steps: 256 # Longer recurrent sequences for delayed rewards
+num_minibatches: 8 # 4 whole sequences per minibatch; 1024 transitions, as in the base config
+update_epochs: 4
+lstm_hidden_size: 1536 # About 50.56M parameters with the residual encoder and 84x84 RGB observations
+bf16: true # Mixed precision compute; parameters, recurrent memory, and losses stay float32
+learning_rate: 0.0001 # Conservative updates for longer-horizon value targets
+anneal_lr: false # Keep learning when rewards are discovered late in training
+gamma: 0.999 # Discount horizon of about 1000 agent steps for sparse game rewards
+gae_lambda: 0.99 # Propagate sparse rewards farther within each rollout; higher variance
+clip_coef: 0.1
+target_kl: 0.01 # null disables KL early stopping
+entropy_coef: 0.01
+value_coef: 0.5
+max_grad_norm: 0.5
+log_dir: gs://cohere-dev/vlad/rl2
+video_every_episodes: 1000 # Reduce recording overhead during a long run; 0 disables recording
+video_max_frames: null # Record the full episode, until termination or truncation
+video_speed: 4.0 # Playback multiplier: 1.0 normal, 2.0 double speed
+eval_every_minutes: 30 # Periodic full-game evaluation
+eval_episodes: 100 # Full games per evaluation, after the rollout update; training pauses during evaluation
+eval_seed: 10000 # Fixed evaluation seed set, separate from training RNG

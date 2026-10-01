@@ -185,7 +185,8 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
         np.testing.assert_allclose(prediction, values[t], atol=0.02, rtol=0.02)
         np.testing.assert_allclose(log_probs, action_log_prob(logits[t], actions), atol=1e-3, rtol=0)
         replayed_log_probs.append(action_log_prob(logits[t], jnp.zeros(2, dtype=jnp.int32)))
-    np.testing.assert_allclose(carry, final, atol=0.01, rtol=0.02)
+    # Float32 carry still accumulates differences from the BF16 encoder.
+    np.testing.assert_allclose(carry, final, atol=0.03, rtol=0.02)
     batch = (
         obs,
         jnp.zeros((3, 2), dtype=jnp.int32),
@@ -209,7 +210,9 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
     )
 
 
+@jax.default_matmul_precision("highest")
 def test_recurrent_sequences_match_steps_and_reset_only_finished_env() -> None:
+    # Test sequence/reset semantics in float32, without GPU TF32 approximation.
     model = ActorCritic(3, 16, encoder_channels=(8, 16, 16, 16), embedding_size=32)
     obs = jax.random.randint(jax.random.key(2), (4, 2, 4, 84, 84), 0, 256, dtype=jnp.uint8)
     carry = initial_carry(2, 16)
@@ -505,3 +508,120 @@ def check_atari_training(
     assert "step=16 episodes=5" in output.getvalue()
     assert "return=n/a" not in output.getvalue()
     assert "episode_length=2.6" in output.getvalue()
+
+
+class SyntheticAtariEnv(gym.Env):
+    """Expose a distinct screen on each raw step, including the final step."""
+
+    def __init__(self, end_step: int, terminated: bool) -> None:
+        self.observation_space = gym.spaces.Box(0, 255, (210, 160, 3), np.uint8)
+        self.action_space = gym.spaces.Discrete(18)
+        self._frameskip = 1
+        self.ale = self
+        self.end_step = end_step
+        self.terminated = terminated
+        self.steps = 0
+
+    def reset(
+        self, *, seed: int | None = None, options: dict[str, Any] | None = None
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        super().reset(seed=seed)
+        self.steps = 0
+        return np.zeros(self.observation_space.shape, np.uint8), {}
+
+    def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+        self.steps += 1
+        done = self.steps >= self.end_step
+        return (
+            np.full(self.observation_space.shape, self.steps, np.uint8),
+            0.0,
+            done and self.terminated,
+            done and not self.terminated,
+            {},
+        )
+
+    def lives(self) -> int:
+        return 1
+
+    def getScreenGrayscale(self, output: np.ndarray) -> None:
+        output.fill(self.steps)
+
+    def getScreenRGB(self, output: np.ndarray) -> None:
+        output.fill(self.steps)
+
+
+@pytest.mark.parametrize("end_step", (1, 2, 3, 4))
+@pytest.mark.parametrize("terminated", (False, True))
+@pytest.mark.parametrize("grayscale", (False, True))
+def test_preprocessing_returns_final_screen(end_step: int, terminated: bool, grayscale: bool) -> None:
+    with ppo.AtariPreprocessing(SyntheticAtariEnv(end_step, terminated), noop_max=0, grayscale_obs=grayscale) as env:
+        env.reset(seed=0)
+        obs, _, actual_terminated, actual_truncated, _ = env.step(0)
+        assert actual_terminated == terminated
+        assert actual_truncated == (not terminated)
+        np.testing.assert_array_equal(obs, np.full(obs.shape, end_step, np.uint8))
+
+
+@pytest.mark.parametrize("frame_budget", (1, 5))
+def test_video_recording_stops_at_frame_budget(frame_budget: int) -> None:
+    from unittest.mock import Mock
+
+    config = replace(
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), video_max_frames=frame_budget
+    )
+    env = Mock()
+    env.metadata = {"render_fps": 60}
+    env.reset.return_value = (np.zeros((4, 84, 84), np.uint8), {})
+    env.step.return_value = (np.zeros((4, 84, 84), np.uint8), 0.0, False, False, {})
+    env.render.return_value = np.zeros((210, 160, 3), np.uint8)
+    writer = Mock()
+    carry = initial_carry(1, config.lstm_hidden_size)
+    with (
+        patch("rl2.ppo.make_env", return_value=env),
+        patch("rl2.ppo.act", return_value=(np.array([0]), np.array([0.0]), np.array([0.0]), carry)),
+    ):
+        ppo.log_video(Mock(), config, writer, episode=1, steps=128)
+    assert env.step.call_count == frame_budget - 1
+    video = writer.add_video.call_args.args[1]
+    assert video.shape == (1, frame_budget, 3, 210, 160)
+    assert writer.add_video.call_args.kwargs["fps"] == 60
+    env.close.assert_called_once()
+
+
+@pytest.mark.parametrize("frame_budget", (0, -1, 1.5, True))
+def test_invalid_video_frame_budget_fails_before_environment_creation(frame_budget: Any) -> None:
+    config = replace(
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), video_max_frames=frame_budget
+    )
+    with (
+        patch("rl2.ppo.make_env") as create_env,
+        pytest.raises(ValueError, match="video_max_frames"),
+    ):
+        train(config)
+    create_env.assert_not_called()
+
+
+@pytest.mark.parametrize("terminated", (False, True))
+@pytest.mark.parametrize("frame_budget", (None, 10))
+def test_video_recording_stops_at_episode_end(frame_budget: int | None, terminated: bool) -> None:
+    from unittest.mock import Mock
+
+    config = replace(
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), video_max_frames=frame_budget
+    )
+    env = Mock()
+    env.metadata = {"render_fps": 60}
+    obs = np.zeros((4, 84, 84), np.uint8)
+    env.reset.return_value = (obs, {})
+    env.step.side_effect = [(obs, 0.0, False, False, {})] * 6 + [(obs, 0.0, terminated, not terminated, {})]
+    env.render.return_value = np.zeros((210, 160, 3), np.uint8)
+    writer = Mock()
+    carry = initial_carry(1, config.lstm_hidden_size)
+    with (
+        patch("rl2.ppo.make_env", return_value=env),
+        patch("rl2.ppo.act", return_value=(np.array([0]), np.array([0.0]), np.array([0.0]), carry)),
+    ):
+        ppo.log_video(Mock(), config, writer, episode=1, steps=128)
+    assert env.step.call_count == 7
+    assert writer.add_video.call_args.args[1].shape == (1, 8, 3, 210, 160)
+    env.close.assert_called_once()

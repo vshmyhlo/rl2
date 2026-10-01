@@ -22,6 +22,8 @@ from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
+from rl2.multi_atari import register_envs
+
 type Array = jax.Array | NDArray[Any]
 type LSTMCarry = tuple[jax.Array, jax.Array]
 type PPOBatch = tuple[Array, Array, Array, Array, Array, LSTMCarry, Array]
@@ -54,6 +56,7 @@ class Config:
     video_every_episodes: int
     video_speed: float
     bf16: bool = True
+    video_max_frames: int | None = 900
     observation_size: int | None = None
     eval_every_minutes: float = 0.0
     eval_episodes: int = 100
@@ -181,9 +184,9 @@ class AtariPreprocessing(gym.wrappers.AtariPreprocessing):
         action: int | np.integer[Any],
     ) -> tuple[NDArray[Any], SupportsFloat, bool, bool, dict[str, Any]]:
         obs, reward, terminated, truncated, info = super().step(action)
-        if truncated and not terminated:
+        if terminated or truncated:
             # Gymnasium breaks action repeat before capturing the final screen.
-            # Bootstrap from that screen alone, without pooling in stale frames.
+            # Return the actual final screen, including for timeout bootstrapping.
             capture = self.ale.getScreenGrayscale if self.grayscale_obs else self.ale.getScreenRGB
             capture(self.obs_buffer[0])
             self.obs_buffer[1].fill(0)
@@ -201,6 +204,7 @@ def make_env(
     if observation_size is not None and (type(observation_size) is not int or observation_size < 1):
         raise ValueError("observation_size must be a positive integer or null")
     gym.register_envs(ale_py)
+    register_envs()
     env = gym.make(env_id, frameskip=1, render_mode=render_mode)
     if atari_preprocessing:
         env = AtariPreprocessing(env)
@@ -259,13 +263,13 @@ def log_video(
         key = jax.random.fold_in(jax.random.key(config.seed), episode)
         frames = [env.render()]
         carry = initial_carry(1, config.lstm_hidden_size)
-        done = False
-        while not done:
+        while config.video_max_frames is None or len(frames) < config.video_max_frames:
             key, action_key = jax.random.split(key)
             actions, _, _, carry = act(state, obs[None], carry, jnp.zeros(1, dtype=bool), action_key)
             obs, _, terminated, truncated, _ = env.step(int(actions[0]))
             frames.append(env.render())
-            done = terminated or truncated
+            if terminated or truncated:
+                break
         # One recorded frame per agent step, accounting for optional action repeat.
         video = np.stack(frames).transpose(0, 3, 1, 2)[None]
         writer.add_video(
@@ -274,7 +278,7 @@ def log_video(
             steps,
             fps=config.video_speed * env.metadata["render_fps"] / (4 if config.atari_preprocessing else 1),
         )
-        print(f"Recorded game after {episode} training episodes", flush=True)
+        print(f"Recorded {len(frames)} gameplay frames after {episode} training episodes", flush=True)
     finally:
         env.close()
 
@@ -378,6 +382,10 @@ def train(config: Config) -> TrainState:
         raise ValueError("lstm_hidden_size must be positive")
     if config.total_steps < batch_size:
         raise ValueError("total_steps must cover at least one rollout")
+    if config.video_max_frames is not None and (
+        type(config.video_max_frames) is not int or config.video_max_frames < 1
+    ):
+        raise ValueError("video_max_frames must be a positive integer or null for a full episode")
     if config.video_every_episodes < 0:
         raise ValueError("video_every_episodes must be nonnegative (0 disables videos)")
     if not np.isfinite(config.video_speed) or config.video_speed <= 0:
