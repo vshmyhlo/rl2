@@ -1,15 +1,19 @@
+from pathlib import Path
 from typing import Any
 
+import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax.traverse_util import flatten_dict, unflatten_dict
 
 from rl2.mamba3 import Mamba3, Mamba3Carry, _ssm_step
 
 
 def assert_carry_close(actual: Mamba3Carry, expected: Mamba3Carry) -> None:
+    chex.assert_trees_all_equal_shapes_and_dtypes(actual, expected)
     for a, b in zip(actual, expected):
         np.testing.assert_allclose(a, b, rtol=2e-5, atol=2e-6)
 
@@ -39,10 +43,14 @@ def test_recurrence_matches_independent_complex_ssm(rank: int, trap: float) -> N
         starts = jnp.zeros((2,), dtype=jnp.bool_)
         inputs = (x, b, c, dt, a, np.full_like(dt, trap), delta, starts)
         carry, y = _ssm_step(carry, jax.tree.map(jnp.asarray, inputs), jnp.asarray(weights))
-        # Adjacent real pairs represent one complex coordinate. Upstream's
-        # positive B/C rotation corresponds to a negative local state rotation.
-        complex_b = b[..., ::2].astype(np.float64) + 1j * b[..., 1::2]
-        complex_c = c[..., ::2].astype(np.float64) + 1j * c[..., 1::2]
+        # SISO uses adjacent pairs, MIMO pairs corresponding half-vectors.
+        # Positive B/C rotation corresponds to negative local state rotation.
+        if rank == 1:
+            complex_b = b[..., ::2].astype(np.float64) + 1j * b[..., 1::2]
+            complex_c = c[..., ::2].astype(np.float64) + 1j * c[..., 1::2]
+        else:
+            complex_b = b[..., :2].astype(np.float64) + 1j * b[..., 2:]
+            complex_c = c[..., :2].astype(np.float64) + 1j * c[..., 2:]
         drive = np.einsum("bhrn,bhp,hrp->bhpn", complex_b, x, weights)
         phase = np.concatenate((delta, np.zeros_like(delta)), axis=-1)
         transition = np.exp((dt * a)[..., None, None] - 1j * phase[..., None, :])
@@ -105,6 +113,8 @@ def test_causal_gradients_and_training(dtype: jax.typing.DTypeLike) -> None:
     params = model.init(jax.random.key(5), x)["params"]
 
     def loss_fn(parameters: Any, inputs: jax.Array) -> jax.Array:
+        chex.assert_shape(inputs, (5, 2, 8))
+        chex.assert_type(inputs, jnp.float32)
         _, y = model.apply({"params": parameters}, inputs)
         return jnp.mean(jnp.square(y.astype(jnp.float32) - 1))
 
@@ -115,6 +125,7 @@ def test_causal_gradients_and_training(dtype: jax.typing.DTypeLike) -> None:
         assert np.any(np.asarray(grad) != 0)
 
     def gradient_step(grad: jax.Array) -> jax.Array:
+        chex.assert_type(grad, jnp.float32)
         return -0.01 * grad
 
     updated = optax.apply_updates(params, jax.tree.map(gradient_step, grads))
@@ -124,6 +135,8 @@ def test_causal_gradients_and_training(dtype: jax.typing.DTypeLike) -> None:
     assert all(leaf.dtype == jnp.float32 for leaf in carry)
 
     def prefix_loss(inputs: jax.Array) -> jax.Array:
+        chex.assert_shape(inputs, (5, 2, 8))
+        chex.assert_type(inputs, jnp.float32)
         _, outputs = model.apply({"params": params}, inputs)
         return outputs[:2].astype(jnp.float32).sum()
 
@@ -148,7 +161,7 @@ def test_causal_gradients_and_training(dtype: jax.typing.DTypeLike) -> None:
 )
 def test_invalid_configuration(options: dict[str, Any]) -> None:
     settings = {"d_model": 8, "d_state": 8, "headdim": 4, **options}
-    with pytest.raises(ValueError):
+    with pytest.raises((ValueError, AssertionError)):
         Mamba3(**settings).initial_carry(2)
 
 
@@ -156,11 +169,82 @@ def test_invalid_input_and_carry_shapes() -> None:
     model = Mamba3(8, d_state=8, headdim=4)
     x = jnp.zeros((3, 2, 8))
     variables = model.init(jax.random.key(0), x)
-    with pytest.raises(ValueError, match="x must have shape"):
+    with pytest.raises(AssertionError):
         model.apply(variables, x[0])
-    with pytest.raises(ValueError, match="carry shapes"):
+    with pytest.raises(AssertionError):
         model.apply(variables, x, model.initial_carry(1))
-    with pytest.raises(ValueError, match="episode_starts"):
+    with pytest.raises(AssertionError):
         model.apply(variables, x, episode_starts=jnp.zeros((2, 3)))
-    with pytest.raises(ValueError, match="step episode_starts"):
+    with pytest.raises(AssertionError):
         model.apply(variables, x[0], episode_starts=jnp.zeros((1, 2)), method=model.step)
+
+
+@pytest.mark.parametrize("rank", [1, 2])
+@pytest.mark.parametrize("fraction", [0.5, 1.0])
+@pytest.mark.parametrize("norm", [False, True])
+def test_matches_official_module_outputs_states_and_gradients(rank: int, fraction: float, norm: bool) -> None:
+    """Fixtures execute upstream Mamba3 with its CPU reference kernels.
+
+    See generate_mamba3_reference.py for pinned provenance and reproduction.
+    PyTorch and the upstream repository are not needed for normal pytest runs.
+    """
+    model = Mamba3(
+        8,
+        d_state=8,
+        headdim=4,
+        mimo_rank=rank,
+        rope_fraction=fraction,
+        ngroups=2 if norm else 1,
+        outproj_norm=norm,
+    )
+    prefix = f"r{rank}_f{int(fraction * 100)}_n{int(norm)}/"
+    with np.load(Path(__file__).parent / "data" / "mamba3_reference.npz", allow_pickle=False) as fixture:
+        assert str(fixture["upstream_revision"]) == "e9594ce1c732d97440f0332fdc43170a2294dbfa"
+        case = {key.removeprefix(prefix): jnp.asarray(fixture[key]) for key in fixture.files if key.startswith(prefix)}
+    params = unflatten_dict(
+        {key.removeprefix("params/"): value for key, value in case.items() if key.startswith("params/")}, sep="/"
+    )
+    carry, y = model.apply({"params": params}, case["x"])
+    np.testing.assert_allclose(y, case["y"], rtol=5e-5, atol=3e-6)
+    for name, leaf in zip(carry._fields, carry):
+        np.testing.assert_allclose(leaf, case[f"carry/{name}"], rtol=5e-5, atol=3e-6)
+
+    def loss_fn(parameters: Any, x: jax.Array) -> jax.Array:
+        chex.assert_shape(x, (6, 2, 8))
+        chex.assert_type(x, jnp.float32)
+        _, output = model.apply({"params": parameters}, x)
+        return jnp.sum(output * case["probe"])
+
+    grads, dx = jax.jit(jax.grad(loss_fn, argnums=(0, 1)))(params, case["x"])
+    np.testing.assert_allclose(dx, case["dx"], rtol=1e-4, atol=1e-5)
+    for name, gradient in flatten_dict(grads, sep="/").items():
+        np.testing.assert_allclose(gradient, case[f"grads/{name}"], rtol=1e-4, atol=1e-5, err_msg=name)
+
+
+def test_official_initialization_and_bounded_phase() -> None:
+    model = Mamba3(32, d_state=8, headdim=8, mimo_rank=2)
+    x = jnp.ones((1, 1, 32), jnp.float32)
+    params = model.init(jax.random.key(7), x)["params"]
+    for name in ("in_proj", "out_proj"):
+        kernel = np.asarray(params[name]["kernel"])
+        bound = kernel.shape[0] ** -0.5
+        assert np.max(np.abs(kernel)) <= bound
+        assert np.var(kernel) == pytest.approx(1 / (3 * kernel.shape[0]), rel=0.1)
+    dt = jax.nn.softplus(params["dt_bias"])
+    assert np.all((dt >= model.dt_min) & (dt <= model.dt_max))
+    for name, value in (("B_bias", 1), ("C_bias", 1), ("D", 1), ("mimo_x", 0.5), ("mimo_z", 1), ("mimo_o", 0.5)):
+        np.testing.assert_array_equal(params[name], value)
+    carry = model.initial_carry(1)
+    carry = carry._replace(angle=jnp.full_like(carry.angle, 100 * jnp.pi))
+    carry, _ = model.apply({"params": params}, x, carry)
+    assert np.all((carry.angle >= 0) & (carry.angle < 2 * jnp.pi))
+
+
+def test_rejects_nonfloating_inputs_and_nonboolean_resets() -> None:
+    model = Mamba3(8, d_state=8, headdim=4)
+    x = jnp.ones((3, 2, 8), jnp.float32)
+    params = model.init(jax.random.key(0), x)
+    with pytest.raises(AssertionError):
+        model.apply(params, x.astype(jnp.int32))
+    with pytest.raises(AssertionError):
+        model.apply(params, x, episode_starts=jnp.ones((3, 2), jnp.float32))

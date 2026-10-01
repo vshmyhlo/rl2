@@ -3,12 +3,15 @@
 Implements exponential-trapezoidal discretization, data-dependent rotary B/C,
 B/C RMS normalization and biases, and factorized MIMO projections from
 https://arxiv.org/abs/2603.15569. Parameterization follows the authors' module:
-https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba3.py.
+https://github.com/state-spaces/mamba/blob/e9594ce1c732d97440f0332fdc43170a2294dbfa/mamba_ssm/modules/mamba3.py.
 
 Sequences are time-major, matching rl2's recurrent policies. This reference uses
 ``lax.scan``, not the upstream fused CUDA/chunked SSD kernels. It is a mixer,
 without an outer residual connection, pre-norm, embedding, or prediction head.
 Parameters and recurrent accumulation remain float32 with bf16 projections.
+This intentionally differs from the intermediate rounding of upstream fused
+mixed-precision kernels. As in upstream's ``_no_weight_decay`` metadata, callers
+using weight decay should exclude ``dt_bias`` and ``D`` from it.
 
 Example::
 
@@ -22,6 +25,7 @@ Example::
 import math
 from typing import NamedTuple
 
+import chex
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
@@ -44,27 +48,59 @@ class Mamba3Carry(NamedTuple):
 type StepInputs = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
 
 
-def _rotate(x: jax.Array, angle: jax.Array) -> jax.Array:
-    """Rotate adjacent pairs in the leading rotary portion of the state axis."""
-    width = 2 * angle.shape[-1]
-    pairs = x[..., :width].reshape((*x.shape[:-1], -1, 2))
+def _rotate(x: jax.Array, angle: jax.Array, pairwise: bool) -> jax.Array:
+    """Match upstream SISO adjacent pairs or MIMO (i, i + N/2) pairs."""
+    chex.assert_rank(x, 4)
+    chex.assert_shape(angle, (*x.shape[:2], None))
+    chex.assert_type((x, angle), jnp.float32)
+    chex.assert_is_divisible(x.shape[-1], 2)
+    count = angle.shape[-1]
+    chex.assert_scalar_in(count, 1, x.shape[-1] // 2)
+    if pairwise:
+        pairs = x[..., : 2 * count].reshape((*x.shape[:-1], count, 2))
+        real, imag = pairs[..., 0], pairs[..., 1]
+    else:
+        half = x.shape[-1] // 2
+        real, imag = x[..., :count], x[..., half : half + count]
     cos, sin = jnp.cos(angle)[..., None, :], jnp.sin(angle)[..., None, :]
-    real, imag = pairs[..., 0], pairs[..., 1]
-    rotated = jnp.stack((real * cos - imag * sin, real * sin + imag * cos), axis=-1)
-    return jnp.concatenate((rotated.reshape((*x.shape[:-1], width)), x[..., width:]), axis=-1)
+    rotated_real, rotated_imag = real * cos - imag * sin, real * sin + imag * cos
+    if pairwise:
+        rotated = jnp.stack((rotated_real, rotated_imag), axis=-1).reshape((*x.shape[:-1], 2 * count))
+        return jnp.concatenate((rotated, x[..., 2 * count :]), axis=-1)
+    return jnp.concatenate((rotated_real, x[..., count:half], rotated_imag, x[..., half + count :]), axis=-1)
 
 
 def _ssm_step(carry: Mamba3Carry, inputs: StepInputs, mimo_x: jax.Array) -> tuple[Mamba3Carry, jax.Array]:
     """Trapezoidal recurrence in the rotating B/C coordinate system."""
     x, b, c, dt, a, trap, angle_delta, starts = inputs
+    chex.assert_rank(x, 3)
+    batch, heads, width = x.shape
+    chex.assert_shape(mimo_x, (heads, None, width))
+    rank = mimo_x.shape[1]
+    chex.assert_shape(b, (batch, heads, rank, None))
+    chex.assert_equal_shape((b, c))
+    chex.assert_shape((dt, a, trap), (batch, heads))
+    chex.assert_shape(angle_delta, (batch, heads, None))
+    chex.assert_shape(starts, (batch,))
+    chex.assert_type(inputs[:-1], jnp.float32)
+    chex.assert_type(starts, jnp.bool_)
+    chex.assert_type(mimo_x, jnp.float32)
+    chex.assert_shape(carry.state, (batch, heads, width, b.shape[-1]))
+    chex.assert_equal_shape((carry.key, b))
+    chex.assert_equal_shape((carry.value, x))
+    chex.assert_equal_shape((carry.angle, angle_delta))
+    chex.assert_type(carry, jnp.float32)
 
     def reset(leaf: jax.Array) -> jax.Array:
+        chex.assert_type(leaf, jnp.float32)
         mask = starts.reshape((starts.shape[0],) + (1,) * (leaf.ndim - 1))
         return jnp.where(mask, 0.0, leaf)
 
     carry = jax.tree.map(reset, carry)
-    angle = carry.angle + angle_delta
-    b, c = _rotate(b, angle), _rotate(c, angle)
+    # Upstream prefill keeps phase modulo 2*pi; bounding it also avoids losing
+    # small increments to float32 rounding in long-running recurrent policies.
+    angle = jnp.mod(carry.angle + angle_delta, 2 * jnp.pi)
+    b, c = _rotate(b, angle, pairwise=rank == 1), _rotate(c, angle, pairwise=rank == 1)
     alpha = jnp.exp(dt * a)[..., None, None]
     beta = ((1.0 - trap) * dt)[..., None, None] * alpha
     gamma = (trap * dt)[..., None, None]
@@ -81,8 +117,9 @@ class Mamba3(nn.Module):
 
     ``mimo_rank=1`` selects SISO; larger ranks enable MIMO. B/C projections
     are shared within ``ngroups``, with separate learned biases per head/rank.
-    Adjacent rotary pairs are used for both modes (upstream MIMO uses a
-    permuted layout). This module does not load upstream checkpoints directly.
+    Rotary layout and initialization match the official standalone mixer.
+    This module does not load upstream checkpoints directly. It provides the
+    mixer only; the paper's full LM also uses pre-norm residual/SwiGLU blocks.
     """
 
     d_model: int
@@ -103,16 +140,16 @@ class Mamba3(nn.Module):
     def _dimensions(self) -> tuple[int, int, int]:
         for name in ("d_model", "d_state", "expand", "headdim", "ngroups", "mimo_rank"):
             value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                raise ValueError(f"{name} must be a positive integer")
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be a positive integer")
+            chex.assert_scalar_positive(value)
         inner = self.expand * self.d_model
-        if inner % self.headdim:
-            raise ValueError("expand * d_model must be divisible by headdim")
+        chex.assert_is_divisible(inner, self.headdim)
         heads = inner // self.headdim
-        if heads % self.ngroups:
-            raise ValueError("number of heads must be divisible by ngroups")
-        if self.d_state % 2 or self.rope_fraction not in (0.5, 1.0):
-            raise ValueError("d_state must be even and rope_fraction must be 0.5 or 1.0")
+        chex.assert_is_divisible(heads, self.ngroups)
+        chex.assert_is_divisible(self.d_state, 2)
+        if self.rope_fraction not in (0.5, 1.0):
+            raise ValueError("rope_fraction must be 0.5 or 1.0")
         pairs = int(self.d_state * self.rope_fraction) // 2
         if pairs < 1:
             raise ValueError("rope_fraction * d_state must allow at least one rotary pair")
@@ -128,8 +165,7 @@ class Mamba3(nn.Module):
     def initial_carry(self, batch_size: int) -> Mamba3Carry:
         """Allocate zero history, usable without initializing model parameters."""
         _, heads, pairs = self._dimensions()
-        if batch_size < 1:
-            raise ValueError("batch_size must be positive")
+        chex.assert_scalar_positive(batch_size)
         return Mamba3Carry(
             jnp.zeros((batch_size, heads, self.headdim, self.d_state), jnp.float32),
             jnp.zeros((batch_size, heads, self.mimo_rank, self.d_state), jnp.float32),
@@ -151,33 +187,41 @@ class Mamba3(nn.Module):
         Gradients flow through supplied carry unless the caller detaches it.
         """
         inner, heads, pairs = self._dimensions()
-        if x.ndim != 3 or x.shape[-1] != self.d_model:
-            raise ValueError("x must have shape [time, batch, d_model]")
+        chex.assert_shape(x, (None, None, self.d_model))
+        chex.assert_type(x, jnp.floating)
         steps, batch = x.shape[:2]
         fresh = self.initial_carry(batch)
         if carry is None:
             carry = fresh
-        if not isinstance(carry, Mamba3Carry) or any(a.shape != b.shape for a, b in zip(carry, fresh)):
-            raise ValueError("carry shapes must match the model and input batch size")
+        if not isinstance(carry, Mamba3Carry):
+            raise TypeError("carry must be a Mamba3Carry")
+        chex.assert_trees_all_equal_shapes(carry, fresh)
+        chex.assert_type(carry, jnp.floating)
 
         def to_float32(leaf: jax.Array) -> jax.Array:
+            chex.assert_type(leaf, jnp.floating)
             return leaf.astype(jnp.float32)
 
         carry = jax.tree.map(to_float32, carry)
         if episode_starts is None:
             episode_starts = jnp.zeros((steps, batch), dtype=jnp.bool_)
-        elif episode_starts.shape != (steps, batch):
-            raise ValueError("episode_starts must have shape [time, batch]")
-        episode_starts = episode_starts.astype(jnp.bool_)
+        chex.assert_shape(episode_starts, (steps, batch))
+        chex.assert_type(episode_starts, jnp.bool_)
         rank = self.mimo_rank
         bc_size = self.ngroups * rank * self.d_state
         sizes = (inner, inner, bc_size, bc_size, heads, heads, heads, pairs)
-        projected = nn.Dense(sum(sizes), use_bias=False, dtype=self.dtype, name="in_proj")(x).astype(jnp.float32)
+        # torch.nn.Linear defaults to U(-1/sqrt(fan_in), 1/sqrt(fan_in)).
+        linear_init = nn.initializers.variance_scaling(1 / 3, "fan_in", "uniform")
+        projected = nn.Dense(sum(sizes), use_bias=False, kernel_init=linear_init, dtype=self.dtype, name="in_proj")(
+            x
+        ).astype(jnp.float32)
         offsets = tuple(sum(sizes[:i]) for i in range(1, len(sizes)))
         z, value, b, c, raw_dt, raw_a, raw_trap, raw_angle = jnp.split(projected, offsets, axis=-1)
         z, value = (v.reshape((steps, batch, heads, self.headdim)) for v in (z, value))
 
         def normalize_bc(v: jax.Array, name: str) -> jax.Array:
+            chex.assert_shape(v, (steps, batch, bc_size))
+            chex.assert_type(v, jnp.float32)
             v = v.reshape((steps, batch, rank, self.ngroups, self.d_state))
             v = nn.RMSNorm(epsilon=1e-5, dtype=jnp.float32, name=f"{name}_norm")(v)
             v = jnp.repeat(jnp.swapaxes(v, -3, -2), heads // self.ngroups, axis=-3)
@@ -187,6 +231,8 @@ class Mamba3(nn.Module):
         b, c = normalize_bc(b, "B"), normalize_bc(c, "C")
 
         def init_dt(key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+            chex.assert_rank(jax.random.key_data(key), 1)
+            chex.assert_type(jax.random.key_data(key), jnp.uint32)
             log_dt = jax.random.uniform(key, shape, minval=math.log(self.dt_min), maxval=math.log(self.dt_max))
             dt = jnp.maximum(jnp.exp(log_dt), self.dt_init_floor)
             return dt + jnp.log(-jnp.expm1(-dt))  # Inverse softplus.
@@ -214,7 +260,7 @@ class Mamba3(nn.Module):
             y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + 1e-5) * scale[:, None, :]
         y = y * nn.silu(z[..., None, :] * mimo_z)
         y = jnp.sum(y * mimo_o, axis=-2).reshape((steps, batch, inner))
-        y = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype, name="out_proj")(y)
+        y = nn.Dense(self.d_model, use_bias=False, kernel_init=linear_init, dtype=self.dtype, name="out_proj")(y)
         return carry, y
 
     def step(
@@ -224,10 +270,11 @@ class Mamba3(nn.Module):
         episode_starts: jax.Array | None = None,
     ) -> tuple[Mamba3Carry, jax.Array]:
         """One recurrent step on [batch,d_model], using the same parameters."""
-        if x.ndim != 2:
-            raise ValueError("step x must have shape [batch, d_model]")
-        if episode_starts is not None and episode_starts.shape != (x.shape[0],):
-            raise ValueError("step episode_starts must have shape [batch]")
+        chex.assert_shape(x, (None, self.d_model))
+        chex.assert_type(x, jnp.floating)
+        if episode_starts is not None:
+            chex.assert_shape(episode_starts, (x.shape[0],))
+            chex.assert_type(episode_starts, jnp.bool_)
         starts = None if episode_starts is None else episode_starts[None]
         carry, y = self(x[None], carry, starts)
         return carry, y[0]
