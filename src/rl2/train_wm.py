@@ -32,7 +32,7 @@ from tensorboardX import SummaryWriter
 
 from rl2.observation_encoder import ConvStage, ConvStages, validate_stages
 from rl2.ppo import make_env
-from rl2.wm import MambaWorldModel, WorldModelState, categorical_kl, check_keys, latent_kl_losses
+from rl2.wm import MambaWorldModel, WorldModelState, categorical_entropy, categorical_kl, check_keys, latent_kl_losses
 
 
 @dataclass(frozen=True)
@@ -131,6 +131,18 @@ def load_config(path: str | Path) -> Config:
     if "encoder_stages" in settings:
         settings["encoder_stages"] = tuple(ConvStage(**stage) for stage in settings["encoder_stages"])
     return Config(**settings)
+
+
+def learning_rate_schedule(config: Config) -> optax.Schedule:
+    """Cosine decay from the configured rate to zero after all planned updates.
+
+    The schedule takes the number of completed optimizer updates, starting at
+    zero. Include a short final rollout in the update count. Even a one-update
+    run uses the initial learning rate; zero is reached after its final update.
+    """
+    rollout_size = config.num_envs * config.num_steps
+    num_updates = (config.total_steps + rollout_size - 1) // rollout_size
+    return optax.cosine_decay_schedule(config.learning_rate, decay_steps=num_updates)
 
 
 @struct.dataclass
@@ -255,8 +267,8 @@ def update(
             "dynamics_kl_loss": dynamics_loss,
             "representation_kl_loss": representation_loss,
             "kl": dynamics_kl.mean(),
-            "prior_entropy": -jnp.sum(jnp.exp(prior) * prior, axis=(-2, -1)).mean(),
-            "posterior_entropy": -jnp.sum(jnp.exp(posterior) * posterior, axis=(-2, -1)).mean(),
+            "prior_entropy": categorical_entropy(prior).mean(),
+            "posterior_entropy": categorical_entropy(posterior).mean(),
         }
         return loss, (final_carry, metrics)
 
@@ -430,10 +442,11 @@ def train(config: Config) -> str:
             jnp.asarray(observation[:1]),
             sample_key,
         )["params"]
+        lr_schedule = learning_rate_schedule(config)
         state = TrainState.create(
             apply_fn=model.apply,
             params=params,
-            tx=optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adam(config.learning_rate)),
+            tx=optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adam(lr_schedule)),
         )
         carry = model.initial_carry(config.num_envs)
         run_name = f"{config.env_id.replace('/', '_')}_seed{config.seed}_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"
@@ -454,12 +467,17 @@ def train(config: Config) -> str:
         devices = str(jax.devices())
         print(f"JAX devices: {devices}", flush=True)
         writer.add_text("devices", devices, 0)
+        parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
+        writer.add_scalar("model/params_millions", parameter_count / 1_000_000, 0)
+        print(f"Model parameters: {parameter_count:,}", flush=True)
+        writer.add_text("model/parameter_count", str(parameter_count), 0)
         start = monotonic()
         steps, iteration = 0, 0
         next_video_step = config.video_every_steps
         while steps < config.total_steps:
             num_steps = min(config.num_steps, (config.total_steps - steps) // config.num_envs)
             batch, observation, episode_start = collect_rollout(envs, observation, episode_start, rng, num_steps)
+            learning_rate = float(lr_schedule(state.step))
             state, carry, metrics = update(
                 state,
                 model,
@@ -480,11 +498,12 @@ def train(config: Config) -> str:
             writer.add_scalar("rollout/mean_reward", float(batch.rewards.mean()), steps)
             writer.add_scalar("rollout/termination_rate", float(batch.terminated.mean()), steps)
             writer.add_scalar("charts/steps_per_second", steps / (monotonic() - start), steps)
+            writer.add_scalar("charts/learning_rate", learning_rate, steps)
             if iteration == 1 or iteration % config.log_every == 0 or steps == config.total_steps:
                 print(
                     f"steps={steps}/{config.total_steps} loss={values['loss']:.4f} "
                     f"observation={values['observation_loss']:.4f} reward={values['reward_loss']:.4f} "
-                    f"termination={values['termination_loss']:.4f} kl={values['kl']:.4f}",
+                    f"termination={values['termination_loss']:.4f} kl={values['kl']:.4f} lr={learning_rate:.3g}",
                     flush=True,
                 )
                 writer.flush()

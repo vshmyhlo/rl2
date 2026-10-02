@@ -10,7 +10,14 @@ import pytest
 from flax import linen as nn
 
 from rl2.observation_encoder import ConvObservationEncoder, ConvStage
-from rl2.wm import MambaWorldModel, ObserveInputs, WorldModelState, categorical_kl, latent_kl_losses
+from rl2.wm import (
+    MambaWorldModel,
+    ObserveInputs,
+    WorldModelState,
+    categorical_entropy,
+    categorical_kl,
+    latent_kl_losses,
+)
 
 
 def small_model(**kwargs: Any) -> MambaWorldModel:
@@ -247,3 +254,46 @@ def test_gradients_cross_sampled_states_and_stop_at_episode_resets() -> None:
     np.testing.assert_array_equal(gradients[2], 0)
     reset = jax.jit(jax.grad(loss_fn))(embeddings, jnp.array([[False], [False], [True]]))
     np.testing.assert_array_equal(reset, 0)
+
+
+@pytest.mark.parametrize("zero_logit", [-jnp.inf, -1e30])
+def test_zero_probability_categories_have_finite_losses_and_gradients(zero_logit: float) -> None:
+    q = jnp.array([[[0.0, zero_logit], [0.0, 0.0]]], jnp.float32)
+    p = jnp.zeros_like(q)
+    np.testing.assert_allclose(categorical_kl(q, p), np.log(2), rtol=1e-6)
+    np.testing.assert_allclose(categorical_kl(q, q), 0, atol=1e-6)
+    np.testing.assert_allclose(categorical_entropy(q), np.log(2), rtol=1e-6)
+    np.testing.assert_allclose(categorical_entropy(p), 2 * np.log(2), rtol=1e-6)
+    for prior in (p, q):
+        grad_q, grad_p = jax.grad(lambda a, b: categorical_kl(a, b).sum(), argnums=(0, 1))(q, prior)
+        assert np.isfinite(grad_q).all()
+        assert np.isfinite(grad_p).all()
+    assert np.isfinite(jax.grad(lambda a: categorical_entropy(a).sum())(q)).all()
+    # Disjoint support must remain infinite, and wholly invalid distributions
+    # must remain NaN so training's finite-metric check can detect them.
+    assert np.isinf(
+        categorical_kl(jnp.array([[[0.0, -jnp.inf]]], jnp.float32), jnp.array([[[-jnp.inf, 0.0]]], jnp.float32))
+    ).all()
+    assert np.isnan(categorical_entropy(jnp.full_like(q, -jnp.inf))).all()
+
+
+def test_straight_through_samples_stay_float32_with_x64_enabled() -> None:
+    model = small_model()
+    with jax.enable_x64():
+        logits = jnp.zeros((2, 4, 4), jnp.float32)
+        key = jax.random.key(24)
+        sample = model.apply({}, logits, key, method=model._sample)
+        chex.assert_type(sample, jnp.float32)
+        np.testing.assert_array_equal(sample.sum(-1), 1)
+        assert set(np.unique(sample)) <= {0, 1}
+        weights = jnp.arange(16, dtype=jnp.float32).reshape(4, 4)
+
+        def sample_loss(values: jax.Array) -> jax.Array:
+            chex.assert_shape(values, (2, 4, 4))
+            chex.assert_type(values, jnp.float32)
+            return (model.apply({}, values, key, method=model._sample) * weights).sum()
+
+        gradients = jax.grad(sample_loss)(logits)
+        expected = jax.grad(lambda a: (jax.nn.softmax(a, axis=-1) * weights).sum())(logits)
+        chex.assert_type(gradients, jnp.float32)
+        np.testing.assert_allclose(gradients, expected)

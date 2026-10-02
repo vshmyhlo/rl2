@@ -82,7 +82,31 @@ def categorical_kl(posterior_logits: jax.Array, prior_logits: jax.Array) -> jax.
     chex.assert_scalar_non_negative(posterior_logits.ndim - 2)
     log_q = jax.nn.log_softmax(posterior_logits, axis=-1)
     log_p = jax.nn.log_softmax(prior_logits, axis=-1)
-    return jnp.sum(jnp.exp(log_q) * (log_q - log_p), axis=(-2, -1))
+    probs = jnp.exp(log_q)
+    # A zero-mass category contributes zero, including when both log
+    # probabilities are -inf. Mask operands before multiplication so the
+    # backward pass does not encounter 0 * inf or -inf - -inf either.
+    log_q = jnp.where(probs > 0, log_q, 0.0)
+    log_p = jnp.where(probs > 0, log_p, 0.0)
+    return jnp.sum(probs * (log_q - log_p), axis=(-2, -1))
+
+
+def categorical_entropy(logits: jax.Array) -> jax.Array:
+    """Return entropy in nats, summing variables/classes and retaining leading axes.
+
+    Args:
+        logits: Float32 [*leading, stochastic_size, stochastic_classes].
+            Zero-probability categories may be represented by -inf logits.
+
+    Returns:
+        Float32 entropy shaped ``leading``. Each categorical variable must have
+        at least one finite logit; an entirely invalid distribution remains NaN.
+    """
+    chex.assert_type(logits, jnp.float32)
+    chex.assert_scalar_non_negative(logits.ndim - 2)
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    probs = jnp.exp(log_probs)
+    return -jnp.sum(probs * jnp.where(probs > 0, log_probs, 0.0), axis=(-2, -1))
 
 
 def latent_kl_losses(
@@ -284,7 +308,9 @@ class MambaWorldModel(WorldModel):
         chex.assert_type(logits, jnp.float32)
         check_keys(key, ())
         probs = jax.nn.softmax(logits, axis=-1)
-        sample = jax.nn.one_hot(jax.random.categorical(key, logits, axis=-1), self.stochastic_classes)
+        sample = jax.nn.one_hot(
+            jax.random.categorical(key, logits, axis=-1), self.stochastic_classes, dtype=jnp.float32
+        )
         return sample + (probs - jax.lax.stop_gradient(probs))
 
     def _reset(self, state: WorldModelState, starts: jax.Array) -> WorldModelState:

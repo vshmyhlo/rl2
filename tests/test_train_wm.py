@@ -32,7 +32,10 @@ def training_config(**overrides: Any) -> train_wm.Config:
 
 
 class ShortEpisodes(gym.Env[NDArray[np.uint8], int]):
-    def __init__(self, timeout: bool = False) -> None:
+    def __init__(self, timeout: bool = False, episode_length: int = 2) -> None:
+        chex.assert_type(episode_length, int)
+        chex.assert_scalar_positive(episode_length)
+        self.episode_length = episode_length
         self.observation_space = gym.spaces.Box(0, 255, (1, 2, 2), dtype=np.uint8)
         self.action_space = gym.spaces.Discrete(3)
         self.timeout = timeout
@@ -49,7 +52,7 @@ class ShortEpisodes(gym.Env[NDArray[np.uint8], int]):
     def step(self, action: int) -> tuple[NDArray[np.uint8], SupportsFloat, bool, bool, dict[str, Any]]:
         assert self.action_space.contains(action)
         self.elapsed += 1
-        done = self.elapsed == 2
+        done = self.elapsed == self.episode_length
         observation = np.full(self.observation_space.shape, 10 * self.elapsed, np.uint8)
         return observation, float(action), done and not self.timeout, done and self.timeout, {}
 
@@ -249,6 +252,11 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
     assert metadata["observation_shape"] == [1, 2, 2]
     events = EventAccumulator(str(local_dir)).Reload()
     assert [event.step for event in events.Scalars("train/loss")] == [6, 10]
+    learning_rates = events.Scalars("charts/learning_rate")
+    assert [event.step for event in learning_rates] == [6, 10]
+    np.testing.assert_allclose(
+        [event.value for event in learning_rates], [config.learning_rate, config.learning_rate / 2], rtol=1e-6
+    )
     assert [event.step for event in events.Scalars("train/kl")] == [6, 10]
     assert events.Scalars("train/prior_entropy")
     assert events.Scalars("train/posterior_entropy")
@@ -450,3 +458,64 @@ def test_main_uses_default_atari_config(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(train_wm, "train", train)
     train_wm.main()
     assert calls == [train_wm.load_config("configs/train_wm_atari.yaml")]
+
+
+@pytest.mark.parametrize("vector_env", ["sync", "async"])
+def test_partial_resets_preserve_other_streams_with_reused_buffers(vector_env: str) -> None:
+    vector_cls = gym.vector.AsyncVectorEnv if vector_env == "async" else gym.vector.SyncVectorEnv
+    options = {"context": "spawn"} if vector_env == "async" else {}
+    envs = vector_cls(
+        [ShortEpisodes, partial(ShortEpisodes, timeout=True, episode_length=3)],
+        autoreset_mode=gym.vector.AutoresetMode.DISABLED,
+        copy=False,
+        **options,
+    )
+    try:
+        observation, _ = envs.reset(seed=3)
+        batch, final, starts = train_wm.collect_rollout(
+            envs,
+            observation,
+            np.ones(2, np.bool_),
+            np.random.default_rng(3),
+            6,
+        )
+        np.testing.assert_array_equal(
+            batch.observations[:, :, 0, 0, 0], [[0, 0], [10, 10], [0, 20], [10, 0], [0, 10], [10, 20]]
+        )
+        np.testing.assert_array_equal(
+            batch.next_observations[:, :, 0, 0, 0], [[10, 10], [20, 20], [10, 30], [20, 10], [10, 20], [20, 30]]
+        )
+        np.testing.assert_array_equal(
+            batch.episode_starts,
+            [[True, True], [False, False], [True, False], [False, True], [True, False], [False, False]],
+        )
+        np.testing.assert_array_equal(batch.terminated[:, 0], [False, True, False, True, False, True])
+        np.testing.assert_array_equal(batch.terminated[:, 1], False)
+        np.testing.assert_array_equal(final, 0)
+        np.testing.assert_array_equal(starts, True)
+    finally:
+        envs.close()
+
+
+@pytest.mark.parametrize("total_steps,expected_updates", [(2, 1), (10, 2), (12, 2), (30, 5)])
+def test_learning_rate_schedule_counts_short_rollouts_and_decays_to_zero(
+    total_steps: int, expected_updates: int
+) -> None:
+    config = training_config(total_steps=total_steps, num_envs=2, num_steps=3, learning_rate=0.001)
+    schedule = train_wm.learning_rate_schedule(config)
+    counts = jnp.arange(expected_updates + 2, dtype=jnp.int32)
+    actual = jax.jit(jax.vmap(schedule))(counts)
+    expected = config.learning_rate * (1 + np.cos(np.pi * np.minimum(counts, expected_updates) / expected_updates)) / 2
+    np.testing.assert_allclose(actual, expected, atol=1e-10, rtol=1e-6)
+    np.testing.assert_allclose(actual[0], config.learning_rate)
+    np.testing.assert_array_equal(actual[expected_updates:], 0)
+    assert np.all(np.diff(actual) <= 0)
+    # Optax consumes the schedule before incrementing its update count. Check
+    # the actual update magnitudes, including the one-update-run boundary.
+    optimizer = optax.adam(schedule)
+    params = jnp.zeros(1, jnp.float32)
+    optimizer_state = optimizer.init(params)
+    for expected_rate in expected:
+        updates, optimizer_state = optimizer.update(jnp.ones_like(params), optimizer_state, params)
+        np.testing.assert_allclose(-updates[0], expected_rate, rtol=1e-5, atol=1e-10)
+        params = optax.apply_updates(params, updates)
