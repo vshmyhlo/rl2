@@ -319,7 +319,6 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         {"log_flush_secs": 0},
         {"log_flush_secs": -1},
         {"encoder_stages": ()},
-        {"encoder_stages": (ConvStage(4), ConvStage(8, project=False))},
         {"num_layers": 0},
         {"d_intermediate": -1},
         {"stochastic_size": 0},
@@ -440,6 +439,7 @@ def test_video_orders_labeled_panels_and_uses_recorded_actions(monkeypatch: pyte
     config = training_config(video_num_steps=2, video_prefill_frames=10, video_fps=12)
     frames = np.ones((3, 12, *shape), np.float32)
     frames[:, :, -1] = np.array([-1, 0.5, 2], np.float32).reshape((3, 1) + (1,) * (len(shape) - 1))
+    frames[:, :10] = 0.25
     compare = Mock(return_value=jnp.asarray(frames))
     monkeypatch.setattr(train_wm, "comparison_frames", compare)
     actions = (np.arange(11, dtype=np.int32) % 3)[:, None]
@@ -464,8 +464,14 @@ def test_video_orders_labeled_panels_and_uses_recorded_actions(monkeypatch: pyte
     chex.assert_shape(video, (1, 12, 3, 21, 252))
     chex.assert_type(video, np.uint8)
     for panel, value in enumerate((0, 128, 255)):
-        pixels = video[0, :, :, 18:, panel * 84 : (panel + 1) * 84]
+        pixels = video[0, 10:, :, 18:, panel * 84 : (panel + 1) * 84]
         np.testing.assert_array_equal(pixels, np.full_like(pixels, value))
+    np.testing.assert_array_equal(video[0, :10, :, 18:], 64)
+    scalar_values = {call.args[0]: call.args[1] for call in writer.add_scalar.call_args_list}
+    # Half the stacked frames are identical across panels. MSE uses raw values
+    # over the whole observation, excludes context, and precedes display clipping.
+    assert scalar_values["diagnostics/posterior_mse"] == 2.25 / 2
+    assert scalar_values["diagnostics/prior_mse"] == 9.0 / 2
     # The header visibly changes from shared context to the three panel labels.
     assert video[0, 0, :, :18].any()
     assert not np.array_equal(video[0, 0, :, :18], video[0, 10, :, :18])
@@ -477,7 +483,7 @@ def test_video_orders_labeled_panels_and_uses_recorded_actions(monkeypatch: pyte
     )
 
 
-def test_bf16_is_default_and_can_be_disabled(tmp_path: Path) -> None:
+def test_bf16_fallback_and_explicit_fp32_config(tmp_path: Path) -> None:
     assert training_config().bf16
     settings = asdict(training_config())
     del settings["bf16"]
@@ -543,6 +549,10 @@ def test_main_uses_default_atari_config(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(train_wm, "train", train)
     train_wm.main()
     assert calls == [train_wm.load_config("configs/train_wm_atari.yaml")]
+    config = calls[0]
+    assert config.num_envs == 8 and config.vector_env == "async" and config.bf16
+    schedule = train_wm.learning_rate_schedule(config)
+    assert float(schedule(1000)) < float(schedule(0))
 
 
 @pytest.mark.parametrize("vector_env", ["sync", "async"])

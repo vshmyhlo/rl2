@@ -138,7 +138,7 @@ def load_config(path: str | Path) -> Config:
 
 
 def learning_rate_schedule(config: Config) -> optax.Schedule:
-    """Cosine decay from the configured rate to zero after all planned updates.
+    """Cosine learning-rate decay to zero over the training run.
 
     The schedule takes the number of completed optimizer updates, starting at
     zero. Include a short final rollout in the update count. Even a one-update
@@ -473,6 +473,10 @@ def log_video(
     )
     chex.assert_shape(frames, (3, num_frames, *model.observation_shape))
     chex.assert_type(frames, np.float32)
+    targets = frames[0, config.video_prefill_frames :]
+    for panel, name in enumerate(("posterior", "prior"), start=1):
+        error = frames[panel, config.video_prefill_frames :] - targets
+        writer.add_scalar(f"diagnostics/{name}_mse", float(np.mean(np.square(error))), steps)
     frames = frames[:, :, -1]  # Show the newest frame from each observation stack.
     if frames.ndim == 4:
         frames = np.repeat(frames[..., None], 3, axis=-1)
@@ -522,7 +526,7 @@ def save_checkpoint(state: TrainState, run_dir: str | Path) -> None:
 
 
 def train(config: Config) -> str:
-    """Train on freshly collected random rollouts and return the artifact directory."""
+    """Train on fresh random-policy rollouts and return the log directory."""
     vector_cls = gym.vector.AsyncVectorEnv if config.vector_env == "async" else gym.vector.SyncVectorEnv
     vector_options = {"context": "spawn"} if config.vector_env == "async" else {}
     envs = vector_cls(

@@ -7,15 +7,16 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from rl2.observation_encoder import DEFAULT_STAGES, ConvStages, ResidualBlock, validate_stages
+from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationStage, ConvStages, validate_stages
 
 
 class ConvObservationDecoder(nn.Module):
     """Decode [batch, embedding] into [batch, frames, height, width, (RGB)].
 
     Supply the same explicit stages as the encoder, in encoder order. Decoding
-    traverses them in reverse: residual blocks, optional 3x3 projection, then
-    bilinear resizing to the corresponding pre-downsampling spatial size.
+    traverses them in reverse, with each stage resizing to the corresponding
+    pre-downsampling spatial size, convolving to the previous channel
+    width, then applying residual blocks at that resolution and width.
     The final 7x7 convolution mirrors the encoder stem. Outputs are unbounded
     floating-point predictions on the normalized pixel scale, not uint8 pixels.
     """
@@ -50,26 +51,16 @@ class ConvObservationDecoder(nn.Module):
         x = nn.relu(nn.LayerNorm(name="projection_norm", dtype=self.dtype)(x))
         for index in reversed(range(len(self.stages))):
             stage = self.stages[index]
-            for block in reversed(range(stage.blocks)):
-                x = ResidualBlock(stage.channels, dtype=self.dtype, name=f"stage_{index}_block_{block}")(x)
             previous_channels = self.stages[max(index - 1, 0)].channels
-            if stage.project:
-                x = nn.Conv(
-                    previous_channels,
-                    (3, 3),
-                    padding="SAME",
-                    kernel_init=visual_init,
-                    dtype=self.dtype,
-                    name=f"stage_{index}_projection",
-                )(x)
-            x = jax.image.resize(
-                x,
-                (x.shape[0], *spatial_shapes[index], previous_channels),
-                method="bilinear",
-                antialias=True,
-            )
-        x = nn.relu(nn.LayerNorm(name="output_norm", dtype=self.dtype)(x))
+            x = ConvObservationStage(
+                channels=previous_channels,
+                spatial_shape=spatial_shapes[index],
+                blocks=stage.blocks,
+                dtype=self.dtype,
+                name=f"stage_{index}",
+            )(x)
         colors = self.observation_shape[3] if len(self.observation_shape) == 4 else 1
+        # Keep the pixel prediction head linear so outputs remain unbounded.
         x = nn.Conv(
             frames * colors,
             (7, 7),

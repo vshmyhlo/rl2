@@ -10,46 +10,41 @@ import numpy as np
 from flax import linen as nn
 from numpy.typing import NDArray
 
+from rl2.resize_conv import ResizeConv
+
 
 @dataclass(frozen=True)
 class ConvStage:
-    """One resize stage, with an optional 3x3 projection and residual blocks."""
+    """One resize-convolution stage followed by residual blocks."""
 
     channels: int
     blocks: int = 2
-    project: bool = True
 
     def __post_init__(self) -> None:
         chex.assert_type((self.channels, self.blocks), int)
         chex.assert_scalar_positive(self.channels)
         chex.assert_scalar_positive(self.blocks)
-        chex.assert_type(self.project, bool)
 
 
 type ConvStages = tuple[ConvStage, ...]
 
 DEFAULT_STAGES: ConvStages = (
-    ConvStage(32, blocks=2, project=True),
-    ConvStage(64, blocks=2, project=True),
-    ConvStage(128, blocks=2, project=True),
-    ConvStage(256, blocks=2, project=True),
-    ConvStage(256, blocks=1, project=False),
-    ConvStage(256, blocks=1, project=False),
+    ConvStage(32, blocks=2),
+    ConvStage(64, blocks=2),
+    ConvStage(128, blocks=2),
+    ConvStage(256, blocks=2),
+    ConvStage(256, blocks=1),
+    ConvStage(256, blocks=1),
 )
 
 
 def validate_stages(stages: ConvStages) -> None:
     """Validate a fixed stage list shared by an encoder and its decoder."""
     chex.assert_scalar_positive(len(stages))
-    channels = stages[0].channels
-    for stage in stages:
-        if not stage.project and stage.channels != channels:
-            raise ValueError("A stage that changes channel width must set project=True")
-        channels = stage.channels
 
 
 class ResidualBlock(nn.Module):
-    """Pre-activation residual block with per-pixel channel normalization."""
+    """Two Conv-LayerNorm-ReLU layers followed by a scaled residual sum."""
 
     channels: int
     dtype: jax.typing.DTypeLike = jnp.float32
@@ -60,16 +55,37 @@ class ResidualBlock(nn.Module):
         chex.assert_type(x, self.dtype)
         chex.assert_scalar_positive(self.channels)
         residual = x
-        for index in range(2):
-            x = nn.relu(nn.LayerNorm(dtype=self.dtype)(x))
+        for _ in range(2):
             x = nn.Conv(
                 self.channels,
                 (3, 3),
                 padding="SAME",
-                kernel_init=nn.initializers.variance_scaling(2.0 if index == 0 else 1.0, "fan_in", "truncated_normal"),
+                kernel_init=nn.initializers.variance_scaling(2.0, "fan_in", "truncated_normal"),
                 dtype=self.dtype,
             )(x)
+            x = nn.relu(nn.LayerNorm(dtype=self.dtype)(x))
         return (residual + x) * jnp.asarray(2**-0.5, dtype=self.dtype)
+
+
+class ConvObservationStage(nn.Module):
+    """Resize, convolve, and apply residual blocks."""
+
+    channels: int
+    spatial_shape: tuple[int, int]
+    blocks: int = 2
+    dtype: jax.typing.DTypeLike = jnp.float32
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        chex.assert_rank(x, 4)
+        chex.assert_type(x, self.dtype)
+        chex.assert_type((self.channels, self.blocks), int)
+        chex.assert_scalar_positive(self.channels)
+        chex.assert_scalar_positive(self.blocks)
+        x = ResizeConv(self.channels, self.spatial_shape, dtype=self.dtype, name="resize_conv")(x)
+        for block in range(self.blocks):
+            x = ResidualBlock(self.channels, dtype=self.dtype, name=f"block_{block}")(x)
+        return x
 
 
 class ConvObservationEncoder(nn.Module):
@@ -77,8 +93,8 @@ class ConvObservationEncoder(nn.Module):
 
     A 7x7 stem convolution followed by LayerNorm and ReLU extracts features at
     the original resolution using the first configured channel width.
-    Every stage is explicitly specified by channels, residual-block count, and
-    whether to apply a 3x3 projection. No stages are inferred from input size.
+    Every stage resizes then applies a 3x3 convolution followed by the configured
+    residual blocks. No stages are inferred from input size.
     Resizing uses antialiased bilinear interpolation and rounds each halved
     spatial dimension up.
     Stage count and projection weights are fixed by the initialization shape.
@@ -118,17 +134,13 @@ class ConvObservationEncoder(nn.Module):
         )(x)
         x = nn.relu(nn.LayerNorm(name="stem_norm", dtype=self.dtype)(x))
         for index, stage in enumerate(self.stages):
-            x = jax.image.resize(
-                x,
-                (x.shape[0], (x.shape[1] + 1) // 2, (x.shape[2] + 1) // 2, x.shape[-1]),
-                method="bilinear",
-                antialias=True,
-            )
-            if stage.project:
-                x = nn.Conv(stage.channels, (3, 3), padding="SAME", kernel_init=visual_init, dtype=self.dtype)(x)
-            for block in range(stage.blocks):
-                x = ResidualBlock(stage.channels, dtype=self.dtype, name=f"stage_{index}_block_{block}")(x)
-        x = nn.relu(nn.LayerNorm(name="encoder_norm", dtype=self.dtype)(x))
+            x = ConvObservationStage(
+                channels=stage.channels,
+                spatial_shape=((x.shape[1] + 1) // 2, (x.shape[2] + 1) // 2),
+                blocks=stage.blocks,
+                dtype=self.dtype,
+                name=f"stage_{index}",
+            )(x)
         # Keep the remaining spatial positions distinct in the projection.
         x = nn.Dense(self.embedding_size, kernel_init=visual_init, dtype=self.dtype)(
             x.reshape((x.shape[0], math.prod(x.shape[1:])))
