@@ -105,7 +105,7 @@ class ActorCritic(nn.Module):
     num_actions: int
     lstm_hidden_size: int
     dtype: jax.typing.DTypeLike = jnp.float32
-    encoder_channels: tuple[int, ...] = (128, 256, 384, 512)
+    encoder_channels: tuple[int, ...] = (32, 64, 128, 256)
     embedding_size: int = 768
     encoder_max_flattened_size: int | None = 8192
 

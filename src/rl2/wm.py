@@ -170,7 +170,7 @@ class MambaWorldModel(WorldModel):
     expand: int = 2
     headdim: int = 32
     mimo_rank: int = 1
-    encoder_channels: tuple[int, ...] = (128, 256, 384, 512)
+    encoder_channels: tuple[int, ...] = (32, 64, 128, 256)
     dtype: jax.typing.DTypeLike = jnp.float32
     encoder_max_flattened_size: int | None = 8192
 

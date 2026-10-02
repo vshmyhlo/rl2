@@ -39,7 +39,8 @@ def load_definitions(root: Path, path: str, names: set[str], namespace: Namespac
     exec(compile(ast.Module(body=definitions, type_ignores=[]), path, "exec"), namespace)  # noqa: S102
 
 
-def generate(root: Path, destination: Path) -> None:
+def reference_namespace(root: Path) -> tuple[Namespace, Namespace]:
+    """Load the official mixer with CPU reference kernels and captured states."""
     namespace: Namespace = {
         "torch": torch,
         "nn": nn,
@@ -129,6 +130,11 @@ def generate(root: Path, destination: Path) -> None:
 
     namespace.update(RMSNormGated=ReferenceRMSNorm, mamba3_siso_combined=siso, mamba3_mimo_combined=mimo)
     load_definitions(root, "mamba_ssm/modules/mamba3.py", {"heavy_tail_activation", "Mamba3"}, namespace)
+    return namespace, captured
+
+
+def generate(root: Path, destination: Path) -> None:
+    namespace, captured = reference_namespace(root)
     arrays: dict[str, np.ndarray] = {"upstream_revision": np.asarray(UPSTREAM_REVISION)}
 
     def save(name: str, tensor: torch.Tensor) -> None:

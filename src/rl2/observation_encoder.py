@@ -41,12 +41,14 @@ class ConvObservationEncoder(nn.Module):
     downsampling stages until the flattened size is at most max_flattened_size.
     Set the limit to None to use only encoder_channels. The limit must be at
     least the final channel width, which is the minimum size at 1x1 resolution.
-    Each stage downsamples with antialiased bilinear resizing, rounding each
-    halved spatial dimension up.
+    Each configured stage resizes before its convolution and two residual
+    blocks. Automatic extra stages use only a resize and one residual block.
+    Resizing uses antialiased bilinear interpolation and rounds each halved
+    spatial dimension up.
     Stage count and projection weights are fixed by the initialization shape.
     """
 
-    encoder_channels: tuple[int, ...] = (128, 256, 384, 512)
+    encoder_channels: tuple[int, ...] = (32, 64, 128, 256)
     embedding_size: int = 768
     dtype: jax.typing.DTypeLike = jnp.float32
     max_flattened_size: int | None = 8192
@@ -82,14 +84,16 @@ class ConvObservationEncoder(nn.Module):
                 stage_channels += (stage_channels[-1],)
                 height, width = (height + 1) // 2, (width + 1) // 2
         for stage, channels in enumerate(stage_channels):
-            x = nn.Conv(channels, (3, 3), padding="SAME", kernel_init=visual_init, dtype=self.dtype)(x)
             x = jax.image.resize(
                 x,
-                (x.shape[0], (x.shape[1] + 1) // 2, (x.shape[2] + 1) // 2, channels),
+                (x.shape[0], (x.shape[1] + 1) // 2, (x.shape[2] + 1) // 2, x.shape[-1]),
                 method="bilinear",
                 antialias=True,
             )
-            for block in range(2):
+            configured_stage = stage < len(self.encoder_channels)
+            if configured_stage:
+                x = nn.Conv(channels, (3, 3), padding="SAME", kernel_init=visual_init, dtype=self.dtype)(x)
+            for block in range(2 if configured_stage else 1):
                 x = ResidualBlock(channels, dtype=self.dtype, name=f"stage_{stage}_block_{block}")(x)
         x = nn.relu(nn.LayerNorm(name="encoder_norm", dtype=self.dtype)(x))
         # Keep the remaining spatial positions distinct in the projection.

@@ -92,9 +92,8 @@ def test_default_model_parameter_budget_and_rgb_shapes() -> None:
     starts = jnp.ones((1, 1), dtype=bool)
     variables = jax.eval_shape(model.init, jax.random.key(0), obs, carry, starts)
     count = sum(parameter.size for parameter in jax.tree.leaves(variables["params"]))
-    assert variables["params"]["encoder"]["Dense_0"]["kernel"].shape == (4608, 768)
-    assert count > 48000000
-    assert count < 52000000
+    assert variables["params"]["encoder"]["Dense_0"]["kernel"].shape == (2304, 768)
+    assert 21_000_000 < count < 24_000_000
     final, logits, values = jax.eval_shape(model.apply, variables, obs, carry, starts)
     assert logits.shape == (1, 1, 6)
     assert values.shape == (1, 1)

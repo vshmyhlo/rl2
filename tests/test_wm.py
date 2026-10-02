@@ -13,10 +13,10 @@ from rl2.observation_encoder import ConvObservationEncoder
 from rl2.wm import MambaWorldModel, Prediction
 
 
-def assert_tree_close(actual: Any, expected: Any) -> None:
+def assert_tree_close(actual: Any, expected: Any, *, atol: float = 3e-6) -> None:
     chex.assert_trees_all_equal_shapes_and_dtypes(actual, expected)
     for a, b in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
-        np.testing.assert_allclose(a, b, rtol=3e-5, atol=3e-6)
+        np.testing.assert_allclose(a, b, rtol=3e-5, atol=atol)
 
 
 @pytest.mark.parametrize("rank,rgb", [(1, False), (2, True)])
@@ -52,7 +52,8 @@ def test_sequence_steps_chunks_and_base_interface_agree(rank: int, rgb: bool) ->
     carry, last_latents, last = observe(obs[2:], actions[2:], carry)
     joined = jax.tree.map(lambda a, b: jnp.concatenate((a, b)), first, last)
     assert_tree_close((carry, jnp.concatenate((first_latents, last_latents)), joined), (final, latents, prediction))
-    assert_tree_close(model.apply(variables, obs, actions), (latents, prediction))
+    # Eager and fused JIT kernels can accumulate slightly different float32 rounding.
+    assert_tree_close(model.apply(variables, obs, actions), (latents, prediction), atol=5e-6)
     encoded = model.apply(variables, obs, method=model.encode)
     # The shared encoder receives intact images; only time/batch are flattened.
     encoder = ConvObservationEncoder(encoder_channels=(4,), embedding_size=8)

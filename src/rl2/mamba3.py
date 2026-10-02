@@ -1,4 +1,4 @@
-"""Portable JAX/Flax Mamba-3 sequence mixer (SISO and MIMO).
+"""Portable JAX/Flax Mamba-3 sequence mixer and stack (SISO and MIMO).
 
 Implements exponential-trapezoidal discretization, data-dependent rotary B/C,
 B/C RMS normalization and biases, and factorized MIMO projections from
@@ -6,8 +6,9 @@ https://arxiv.org/abs/2603.15569. Parameterization follows the authors' module:
 https://github.com/state-spaces/mamba/blob/e9594ce1c732d97440f0332fdc43170a2294dbfa/mamba_ssm/modules/mamba3.py.
 
 Sequences are time-major, matching rl2's recurrent policies. This reference uses
-``lax.scan``, not the upstream fused CUDA/chunked SSD kernels. It is a mixer,
-without an outer residual connection, pre-norm, embedding, or prediction head.
+``lax.scan``, not the upstream fused CUDA/chunked SSD kernels. ``Mamba3`` is a
+mixer; ``Mamba3Stack`` adds pre-norm residual layers and SwiGLU feed-forwards.
+Neither includes an embedding or prediction head.
 Parameters and recurrent accumulation remain float32 with bf16 projections.
 This intentionally differs from the intermediate rounding of upstream fused
 mixed-precision kernels. As in upstream's ``_no_weight_decay`` metadata, callers
@@ -120,6 +121,8 @@ class Mamba3(nn.Module):
     Rotary layout and initialization match the official standalone mixer.
     This module does not load upstream checkpoints directly. It provides the
     mixer only; the paper's full LM also uses pre-norm residual/SwiGLU blocks.
+    ``out_proj_init_scale`` scales output weights only at initialization, for
+    depth-aware residual initialization in Mamba3Stack; standalone default is 1.
     """
 
     d_model: int
@@ -135,6 +138,7 @@ class Mamba3(nn.Module):
     a_floor: float = 1e-4
     outproj_norm: bool = False
     dtype: jax.typing.DTypeLike = jnp.float32
+    out_proj_init_scale: float = 1.0
 
     @nn.nowrap
     def _dimensions(self) -> tuple[int, int, int]:
@@ -157,6 +161,8 @@ class Mamba3(nn.Module):
             raise ValueError("require 0 < dt_min <= dt_max and 0 < dt_init_floor <= dt_max, all finite")
         if not 0 < self.a_floor < math.inf:
             raise ValueError("a_floor must be positive and finite")
+        if not 0 < self.out_proj_init_scale < math.inf:
+            raise ValueError("out_proj_init_scale must be positive and finite")
         if jnp.dtype(self.dtype) not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
             raise ValueError("dtype must be float32, bfloat16, or float16")
         return inner, heads, pairs
@@ -260,7 +266,10 @@ class Mamba3(nn.Module):
             y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + 1e-5) * scale[:, None, :]
         y = y * nn.silu(z[..., None, :] * mimo_z)
         y = jnp.sum(y * mimo_o, axis=-2).reshape((steps, batch, inner))
-        y = nn.Dense(self.d_model, use_bias=False, kernel_init=linear_init, dtype=self.dtype, name="out_proj")(y)
+        # The standalone mixer is unscaled; a stack scales residual projections
+        # at initialization, as upstream MixerModel._init_weights does.
+        out_init = nn.initializers.variance_scaling(self.out_proj_init_scale**2 / 3, "fan_in", "uniform")
+        y = nn.Dense(self.d_model, use_bias=False, kernel_init=out_init, dtype=self.dtype, name="out_proj")(y)
         return carry, y
 
     def step(
@@ -270,6 +279,203 @@ class Mamba3(nn.Module):
         episode_starts: jax.Array | None = None,
     ) -> tuple[Mamba3Carry, jax.Array]:
         """One recurrent step on [batch,d_model], using the same parameters."""
+        chex.assert_shape(x, (None, self.d_model))
+        chex.assert_type(x, jnp.floating)
+        if episode_starts is not None:
+            chex.assert_shape(episode_starts, (x.shape[0],))
+            chex.assert_type(episode_starts, jnp.bool_)
+        starts = None if episode_starts is None else episode_starts[None]
+        carry, y = self(x[None], carry, starts)
+        return carry, y[0]
+
+
+type Mamba3StackCarry = tuple[Mamba3Carry, ...]
+
+
+class _Mamba3Block(nn.Module):
+    """Pre-norm mixer and optional SwiGLU with two residual additions."""
+
+    mixer: Mamba3
+    d_intermediate: int
+    rms_norm: bool
+    norm_epsilon: float
+    residual_in_fp32: bool
+
+    @nn.compact
+    def __call__(
+        self, x: jax.Array, carry: Mamba3Carry, episode_starts: jax.Array | None
+    ) -> tuple[Mamba3Carry, jax.Array]:
+        chex.assert_shape(x, (None, None, self.mixer.d_model))
+        chex.assert_type(x, jnp.floating)
+        norm_cls = nn.RMSNorm if self.rms_norm else nn.LayerNorm
+        dtype = self.mixer.dtype
+        residual_dtype = jnp.float32 if self.residual_in_fp32 else dtype
+        x = x.astype(residual_dtype)
+        normalized = norm_cls(epsilon=self.norm_epsilon, dtype=dtype, name="norm")(x)
+        # The mixer validates all carry leaves and the reset mask.
+        carry, y = self.mixer(normalized, carry, episode_starts)
+        x = x + y.astype(residual_dtype)
+        if self.d_intermediate:
+            y = norm_cls(epsilon=self.norm_epsilon, dtype=dtype, name="norm2")(x)
+            linear_init = nn.initializers.variance_scaling(1 / 3, "fan_in", "uniform")
+            y = nn.Dense(2 * self.d_intermediate, use_bias=False, kernel_init=linear_init, dtype=dtype, name="fc1")(y)
+            value, gate = jnp.split(y, 2, axis=-1)
+            y = value * nn.silu(gate)
+            out_init = nn.initializers.variance_scaling(self.mixer.out_proj_init_scale**2 / 3, "fan_in", "uniform")
+            y = nn.Dense(self.mixer.d_model, use_bias=False, kernel_init=out_init, dtype=dtype, name="fc2")(y)
+            x = x + y.astype(residual_dtype)
+        return carry, x
+
+
+class Mamba3Stack(nn.Module):
+    """Configurable Mamba-3 backbone on continuous, time-major features.
+
+    Each of ``num_layers`` layers has independent parameters and implements
+    ``x += Mamba3(norm(x)); x += SwiGLU(norm2(x))``, followed by a final norm
+    after the stack. This follows paper section 3.4 and the official Block,
+    GatedMLP, and MixerModel at revision e9594ce1c732d97440f0332fdc43170a2294dbfa:
+    https://github.com/state-spaces/mamba/tree/e9594ce1c732d97440f0332fdc43170a2294dbfa/mamba_ssm
+
+    ``d_intermediate=None`` uses GatedMLP's default ``int(8*d_model/3)``;
+    positive widths round up to ``mlp_multiple_of`` (upstream defaults to 128).
+    Set the multiple to 1 to use exact paper widths, e.g. 3824 for 1.5B MIMO.
+    Zero disables the MLP. RMSNorm and final normalization default on;
+    ``rms_norm=False`` selects LayerNorm. Residuals default to float32, while
+    projection/returned output dtype is ``dtype`` and parameters stay float32.
+    With ``rescale_prenorm_residual``, mixer and MLP output weights initialize
+    with scale ``1/sqrt(num_layers * (2 if MLP else 1))``, as in MixerModel.
+
+    Carry is a tuple with one Mamba3Carry per layer. Sequence, chunk, step,
+    and episode reset semantics match Mamba3; resets apply to every layer.
+    No embedding or prediction head is included. This uses portable JAX
+    operations, without upstream fused kernels or checkpoint loading.
+
+    Example::
+
+        model = Mamba3Stack(d_model=128, num_layers=4, d_intermediate=256)
+        x = jnp.zeros((16, 8, 128))
+        variables = model.init(jax.random.key(0), x)
+        carry, y = model.apply(variables, x)
+        carry, y_next = model.apply(variables, x[0], carry, method=model.step)
+    """
+
+    d_model: int
+    num_layers: int
+    d_intermediate: int | None = None
+    mlp_multiple_of: int = 128
+    rms_norm: bool = True
+    norm_epsilon: float = 1e-5
+    residual_in_fp32: bool = True
+    final_norm: bool = True
+    rescale_prenorm_residual: bool = True
+    d_state: int = 128
+    expand: int = 2
+    headdim: int = 64
+    ngroups: int = 1
+    mimo_rank: int = 1
+    rope_fraction: float = 0.5
+    dt_min: float = 0.001
+    dt_max: float = 0.1
+    dt_init_floor: float = 1e-4
+    a_floor: float = 1e-4
+    outproj_norm: bool = False
+    dtype: jax.typing.DTypeLike = jnp.float32
+
+    @nn.nowrap
+    def _mlp_width(self) -> int:
+        for name in ("d_model", "num_layers", "mlp_multiple_of"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be a positive integer")
+            chex.assert_scalar_positive(value)
+        if not 0 < self.norm_epsilon < math.inf:
+            raise ValueError("norm_epsilon must be positive and finite")
+        width = int(8 * self.d_model / 3) if self.d_intermediate is None else self.d_intermediate
+        if not isinstance(width, int) or isinstance(width, bool):
+            raise TypeError("d_intermediate must be a nonnegative integer or None")
+        chex.assert_scalar_non_negative(width)
+        return (width + self.mlp_multiple_of - 1) // self.mlp_multiple_of * self.mlp_multiple_of
+
+    @nn.nowrap
+    def _make_mixer(self) -> Mamba3:
+        width = self._mlp_width()
+        scale = 1 / math.sqrt(self.num_layers * (2 if width else 1)) if self.rescale_prenorm_residual else 1.0
+        return Mamba3(
+            d_model=self.d_model,
+            d_state=self.d_state,
+            expand=self.expand,
+            headdim=self.headdim,
+            ngroups=self.ngroups,
+            mimo_rank=self.mimo_rank,
+            rope_fraction=self.rope_fraction,
+            dt_min=self.dt_min,
+            dt_max=self.dt_max,
+            dt_init_floor=self.dt_init_floor,
+            a_floor=self.a_floor,
+            outproj_norm=self.outproj_norm,
+            dtype=self.dtype,
+            out_proj_init_scale=scale,
+            parent=None,
+        )
+
+    def setup(self) -> None:
+        width = self._mlp_width()
+        self.layers = tuple(
+            _Mamba3Block(
+                mixer=self._make_mixer(),
+                d_intermediate=width,
+                rms_norm=self.rms_norm,
+                norm_epsilon=self.norm_epsilon,
+                residual_in_fp32=self.residual_in_fp32,
+                name=f"layers_{i}",
+            )
+            for i in range(self.num_layers)
+        )
+        if self.final_norm:
+            norm_cls = nn.RMSNorm if self.rms_norm else nn.LayerNorm
+            self.norm_f = norm_cls(epsilon=self.norm_epsilon, dtype=self.dtype)
+
+    @nn.nowrap
+    def initial_carry(self, batch_size: int) -> Mamba3StackCarry:
+        """Allocate independent float32 history for every layer, without init."""
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool):
+            raise TypeError("batch_size must be a positive integer")
+        mixer = self._make_mixer()
+        return tuple(mixer.initial_carry(batch_size) for _ in range(self.num_layers))
+
+    def __call__(
+        self,
+        x: jax.Array,
+        carry: Mamba3StackCarry | None = None,
+        episode_starts: jax.Array | None = None,
+    ) -> tuple[Mamba3StackCarry, jax.Array]:
+        """Map [time,batch,d_model] to (per-layer carry, same-shaped output)."""
+        chex.assert_shape(x, (None, None, self.d_model))
+        chex.assert_type(x, jnp.floating)
+        if carry is None:
+            carry = self.initial_carry(x.shape[1])
+        if not isinstance(carry, tuple) or len(carry) != self.num_layers:
+            raise ValueError("carry must be a tuple with one Mamba3Carry per layer")
+        if episode_starts is not None:
+            chex.assert_shape(episode_starts, x.shape[:2])
+            chex.assert_type(episode_starts, jnp.bool_)
+        next_carry = []
+        for layer, state in zip(self.layers, carry):
+            if not isinstance(state, Mamba3Carry):
+                raise TypeError("each layer carry must be a Mamba3Carry")
+            state, x = layer(x, state, episode_starts)
+            next_carry.append(state)
+        if self.final_norm:
+            x = self.norm_f(x)
+        return tuple(next_carry), x.astype(self.dtype)
+
+    def step(
+        self,
+        x: jax.Array,
+        carry: Mamba3StackCarry | None = None,
+        episode_starts: jax.Array | None = None,
+    ) -> tuple[Mamba3StackCarry, jax.Array]:
+        """One recurrent step on [batch,d_model], sharing sequence parameters."""
         chex.assert_shape(x, (None, self.d_model))
         chex.assert_type(x, jnp.floating)
         if episode_starts is not None:

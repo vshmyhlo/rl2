@@ -1,3 +1,5 @@
+from functools import partial
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -11,13 +13,14 @@ from rl2.observation_encoder import ConvObservationEncoder
 @pytest.mark.parametrize(
     "height,width,limit,flattened,stages",
     [
-        (210, 160, 8192, 6144, 6),
-        (84, 84, 8192, 4608, 5),
-        (64, 64, 8192, 8192, 4),
-        (84, 84, None, 18432, 4),
-        (210, 160, None, 71680, 4),
-        (84, 84, 512, 512, 7),
-        (1, 257, 8192, 4608, 5),
+        (210, 160, 8192, 3072, 6),
+        (84, 84, 8192, 2304, 5),
+        (64, 64, 8192, 4096, 4),
+        (128, 64, 8192, 8192, 4),
+        (84, 84, None, 9216, 4),
+        (210, 160, None, 35840, 4),
+        (84, 84, 256, 256, 7),
+        (1, 257, 8192, 4352, 4),
     ],
 )
 def test_projection_budget(height: int, width: int, limit: int | None, flattened: int, stages: int) -> None:
@@ -26,10 +29,23 @@ def test_projection_budget(height: int, width: int, limit: int | None, flattened
     variables = jax.eval_shape(model.init, jax.random.key(0), obs)
     params = variables["params"]
     assert params["Dense_0"]["kernel"].shape == (flattened, 768)
-    assert len([name for name in params if name.startswith("Conv_")]) == stages
+    assert len([name for name in params if name.startswith("Conv_")]) == len(model.encoder_channels)
+    assert len([name for name in params if name.startswith("stage_")]) == len(model.encoder_channels) + stages
+    for stage in range(len(model.encoder_channels), stages):
+        assert f"stage_{stage}_block_0" in params
+        assert f"stage_{stage}_block_1" not in params
     output = jax.eval_shape(model.apply, variables, obs)
     chex.assert_shape(output, (2, 768))
     chex.assert_type(output, jnp.float32)
+
+
+def test_native_encoder_parameter_budget() -> None:
+    model = ConvObservationEncoder(embedding_size=128)
+    obs = jax.ShapeDtypeStruct((1, 1, 210, 160, 3), jnp.uint8)
+    variables = jax.eval_shape(model.init, jax.random.key(0), obs)
+    count = sum(parameter.size for parameter in jax.tree.leaves(variables["params"]))
+    assert 6_000_000 < count < 7_000_000
+    assert variables["params"]["Dense_0"]["kernel"].shape == (3072, 128)
 
 
 @pytest.mark.parametrize("limit", [0, -1, 3, 8.5])
@@ -44,7 +60,10 @@ def test_extra_stages_support_jit_and_gradients(dtype: jax.typing.DTypeLike) -> 
     model = ConvObservationEncoder(encoder_channels=(4,), embedding_size=8, dtype=dtype, max_flattened_size=16)
     obs = jax.random.randint(jax.random.key(0), (2, 2, 17, 13), 0, 256, dtype=jnp.uint8)
     variables = model.init(jax.random.key(1), obs)
-    output = jax.jit(model.apply)(variables, obs)
+    output, captured = jax.jit(partial(model.apply, capture_intermediates=True, mutable=["intermediates"]))(
+        variables, obs
+    )
+    chex.assert_shape(captured["intermediates"]["Conv_0"]["__call__"][0], (2, 9, 7, 4))
     chex.assert_shape(output, (2, 8))
     chex.assert_type(output, dtype)
     assert variables["params"]["Dense_0"]["kernel"].shape == (8, 8)

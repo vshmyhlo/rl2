@@ -6,9 +6,9 @@ seed: 1
 total_steps: 100000 # Environment transitions across all workers; must divide evenly by num_envs
 num_envs: 32
 vector_env: async # async (spawned subprocesses) or sync
-num_steps: 256 # Sequence length per update; recurrent memory carries across chunks
+num_steps: 64 # Shorter sequences limit activation memory; recurrent memory carries across chunks
 d_model: 128 # Latent and Mamba model width
-encoder_channels: [128, 256, 384, 512] # Shared residual convolutional encoder; outputs d_model features
+encoder_channels: [32, 64, 128, 256] # Shared residual convolutional encoder; outputs d_model features
 encoder_max_flattened_size: 8192 # Add stages at the final channel width until within this limit; null disables
 d_state: 64 # Mamba state width; even and at least 4
 headdim: 32 # Must divide 2 * d_model
