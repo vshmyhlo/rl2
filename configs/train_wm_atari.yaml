@@ -8,6 +8,7 @@ num_envs: 32
 vector_env: async # async (spawned subprocesses) or sync
 num_steps: 256 # Sequence length per update; recurrent memory carries across chunks
 d_model: 128 # Latent and Mamba model width
+encoder_channels: [128, 256, 384, 512] # Shared residual convolutional encoder; outputs d_model features
 d_state: 64 # Mamba state width; even and at least 4
 headdim: 32 # Must divide 2 * d_model
 bf16: false # Mixed precision projections; parameters, carry, and losses stay float32

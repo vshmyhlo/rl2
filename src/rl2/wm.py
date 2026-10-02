@@ -9,6 +9,7 @@ from flax import linen as nn
 from flax import struct
 
 from rl2.mamba3 import Mamba3, Mamba3Carry
+from rl2.observation_encoder import ConvObservationEncoder
 
 
 @struct.dataclass
@@ -22,8 +23,8 @@ class Prediction:
     Attributes:
         observation: Predicted observation with shape
             ``[*leading, *observation_shape]``, where ``leading`` is batch or
-            time and batch. Values use the caller's preprocessed observation
-            scale and are not clipped.
+            time and batch. Values use the implementation's target scale and
+            are not clipped. MambaWorldModel targets pixels normalized to [0, 1].
         reward: Reward for the transition into this observation, with shape
             ``[*leading]``.
         termination_logits: Unnormalized terminal-state scores with shape
@@ -110,10 +111,14 @@ type RecurrentPrediction = tuple[Mamba3Carry, jax.Array, Prediction]
 
 
 class MambaWorldModel(WorldModel):
-    """MLP observation encoder/decoder around action-conditioned Mamba dynamics.
+    """Convolutional observation encoder and MLP decoder around Mamba dynamics.
 
-    Observations must be floating point, preprocessed by the caller, with shape
+    Observations must be uint8 Atari frames, with shape
     ``[batch, *observation_shape]`` or ``[time, batch, *observation_shape]``.
+    The shared convolutional encoder normalizes pixels and produces hidden
+    features. Mamba processes only action-conditioned hidden features, with no
+    knowledge of image layout or pixel normalization. Decoded observations are
+    predictions on the normalized [0, 1] target scale, without clipping.
     Actions are integer IDs in ``[0, num_actions)`` with matching batch/time
     dimensions. Predictions at index t target observation t+1, reward t, and
     termination of that transition. Observation and reward heads are unbounded.
@@ -128,8 +133,9 @@ class MambaWorldModel(WorldModel):
 
     Example::
 
-        model = MambaWorldModel(observation_shape=(4,), num_actions=2)
-        obs, actions = jnp.zeros((8, 4)), jnp.zeros(8, dtype=jnp.int32)
+        model = MambaWorldModel(observation_shape=(1, 84, 84), num_actions=2)
+        obs = jnp.zeros((8, 1, 84, 84), dtype=jnp.uint8)
+        actions = jnp.zeros(8, dtype=jnp.int32)
         variables = model.init(jax.random.key(0), obs, actions)
         carry, latent, prediction = model.apply(variables, obs, actions, method=model.observe)
         carry, latent, prediction = model.apply(variables, latent, actions, carry, method=model.imagine)
@@ -138,9 +144,9 @@ class MambaWorldModel(WorldModel):
     ``dtype`` controls the internal projection precision.
 
     Args:
-        observation_shape: Nonempty tuple of positive observation dimensions,
-            excluding time and batch. The encoder flattens these dimensions
-            and the decoder restores them.
+        observation_shape: Positive dimensions ``[frames, height, width]`` for
+            grayscale or ``[frames, height, width, 3]`` for RGB, excluding time
+            and batch. Stacked frames become channels inside the encoder.
         num_actions: Positive number of discrete actions, indexed from zero.
         d_model: Positive latent width and Mamba input/output width.
         d_state: Mamba recurrent state width; must be even and at least four
@@ -150,6 +156,8 @@ class MambaWorldModel(WorldModel):
         headdim: Positive width of each Mamba head; must divide the inner width.
         mimo_rank: Positive Mamba projection rank. One selects SISO; larger
             values select MIMO.
+        encoder_channels: Positive channel widths for the shared convolutional
+            encoder's residual stages. Its output embedding has width d_model.
         dtype: Internal projection dtype: float32, bfloat16, or float16.
     """
 
@@ -160,6 +168,7 @@ class MambaWorldModel(WorldModel):
     expand: int = 2
     headdim: int = 32
     mimo_rank: int = 1
+    encoder_channels: tuple[int, ...] = (128, 256, 384, 512)
     dtype: jax.typing.DTypeLike = jnp.float32
 
     @nn.nowrap
@@ -182,8 +191,13 @@ class MambaWorldModel(WorldModel):
         for size in (*self.observation_shape, self.num_actions):
             chex.assert_type(size, int)
             chex.assert_scalar_positive(size)
-        self.encoder_hidden = nn.Dense(self.d_model, dtype=self.dtype)
-        self.encoder_out = nn.Dense(self.d_model, dtype=self.dtype)
+        if len(self.observation_shape) not in (3, 4):
+            raise ValueError("observation_shape must be [frames, height, width] or [frames, height, width, 3]")
+        if len(self.observation_shape) == 4 and self.observation_shape[-1] != 3:
+            raise ValueError("RGB observations must have exactly three color channels")
+        self.encoder = ConvObservationEncoder(
+            encoder_channels=self.encoder_channels, embedding_size=self.d_model, dtype=self.dtype
+        )
         self.action_embedding = nn.Embed(self.num_actions, self.d_model, dtype=self.dtype)
         self.input_projection = nn.Dense(self.d_model, dtype=self.dtype)
         self.pre_norm = nn.LayerNorm(dtype=self.dtype)
@@ -229,10 +243,10 @@ class MambaWorldModel(WorldModel):
         """Encode batched observations or time-major sequences into latents.
 
         Args:
-            observation: Floating-point preprocessed observations shaped
+            observation: Uint8 pixel observations shaped
                 ``[batch, *observation_shape]`` or
-                ``[time, batch, *observation_shape]``. The caller handles
-                normalization; raw uint8 pixels are not accepted.
+                ``[time, batch, *observation_shape]``. The convolutional encoder
+                normalizes pixels internally; do not divide by 255 beforehand.
 
         Returns:
             Float32 latents shaped ``[batch, d_model]`` or
@@ -241,12 +255,13 @@ class MambaWorldModel(WorldModel):
         """
         observation_rank = len(self.observation_shape)
         chex.assert_rank(observation, {observation_rank + 1, observation_rank + 2})
-        chex.assert_type(observation, float)
+        chex.assert_type(observation, jnp.uint8)
         leading = observation.shape[:-observation_rank]
         chex.assert_shape(observation, (*leading, *self.observation_shape))
         chex.assert_scalar_positive(leading[-1])
-        flat = observation.reshape((*leading, math.prod(self.observation_shape)))
-        latent = self.encoder_out(nn.silu(self.encoder_hidden(flat))).astype(jnp.float32)
+        # Merge time and batch only; spatial dimensions stay intact for Conv.
+        images = observation.reshape((math.prod(leading), *self.observation_shape))
+        latent = self.encoder(images).astype(jnp.float32).reshape((*leading, self.d_model))
         self._check_latent(latent)
         return latent
 
@@ -347,7 +362,7 @@ class MambaWorldModel(WorldModel):
         """Predict from actual observations, preserving history across calls.
 
         Args:
-            observation: Floating-point preprocessed observations shaped
+            observation: Uint8 pixel observations shaped
                 ``[batch, *observation_shape]`` or
                 ``[time, batch, *observation_shape]``.
             action: Integer IDs in ``[0, num_actions)``, shaped ``[batch]`` or

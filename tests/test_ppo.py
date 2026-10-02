@@ -173,7 +173,7 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
     (final, logits, values), captured = jax.jit(
         partial(model.apply, capture_intermediates=True, mutable=["intermediates"])
     )({"params": params}, obs, carry, starts)
-    assert captured["intermediates"]["Conv_0"]["__call__"][0].dtype == jnp.bfloat16
+    assert captured["intermediates"]["encoder"]["Conv_0"]["__call__"][0].dtype == jnp.bfloat16
     assert captured["intermediates"]["policy_hidden"]["__call__"][0].dtype == jnp.bfloat16
     for array in (*final, logits, values, *jax.tree.leaves(params)):
         assert array.dtype == jnp.float32

@@ -81,7 +81,7 @@ def test_random_collection_preserves_terminal_frames_and_reset_masks() -> None:
 
 
 def test_update_targets_losses_carry_and_learning() -> None:
-    model = MambaWorldModel((1, 2, 2), 3, d_model=8, d_state=4, headdim=4)
+    model = MambaWorldModel((1, 2, 2), 3, d_model=8, d_state=4, headdim=4, encoder_channels=(4,))
     batch = train_wm.Batch(
         observations=jnp.zeros((3, 2, 1, 2, 2), jnp.uint8),
         actions=jnp.arange(6, dtype=jnp.int32).reshape(3, 2) % 3,
@@ -90,7 +90,7 @@ def test_update_targets_losses_carry_and_learning() -> None:
         terminated=jnp.array([[False, False], [True, False], [False, False]]),
         episode_starts=jnp.array([[True, True], [False, False], [True, True]]),
     )
-    inputs = batch.observations.astype(jnp.float32) / 255.0
+    inputs = batch.observations
     variables = model.init(jax.random.key(0), inputs, batch.actions)
     state = TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optax.adam(1e-3))
     carry = model.initial_carry(2)
@@ -179,6 +179,7 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         num_envs=2,
         num_steps=3,
         d_model=8,
+        encoder_channels=(4,),
         d_state=4,
         headdim=4,
         atari_preprocessing=True,
@@ -246,6 +247,8 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         {"video_fps": float("inf")},
         {"log_flush_secs": 0},
         {"log_flush_secs": -1},
+        {"encoder_channels": ()},
+        {"encoder_channels": (4, 0)},
     ],
 )
 def test_invalid_config(options: dict[str, Any]) -> None:
@@ -254,18 +257,18 @@ def test_invalid_config(options: dict[str, Any]) -> None:
 
 
 def test_imagination_feeds_back_latents_and_resets_history() -> None:
-    model = MambaWorldModel((2, 3, 4), 3, d_model=8, d_state=4, headdim=4)
+    model = MambaWorldModel((2, 3, 4), 3, d_model=8, d_state=4, headdim=4, encoder_channels=(4,))
     observation = jnp.arange(24, dtype=jnp.uint8).reshape((1, 2, 3, 4))
     normalized = observation.astype(jnp.float32) / 255.0
     actions = jnp.array([[0], [1], [2]], jnp.int32)
-    variables = model.init(jax.random.key(8), normalized, actions[0])
+    variables = model.init(jax.random.key(8), observation, actions[0])
     state = TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optax.sgd(0.01))
-    history, _, _ = model.apply(variables, normalized, actions[0], method=model.observe)
+    history, _, _ = model.apply(variables, observation, actions[0], method=model.observe)
     frames = train_wm.imagine_frames(state, model, observation, history, jnp.zeros(1, jnp.bool_), actions)
     chex.assert_shape(frames, (4, 2, 3, 4))
     chex.assert_type(frames, jnp.float32)
     np.testing.assert_array_equal(frames[0], normalized[0])
-    latent = model.apply(variables, normalized, method=model.encode)
+    latent = model.apply(variables, observation, method=model.encode)
     for index, action in enumerate(actions):
         history, latent, prediction = model.apply(variables, latent, action, history, method=model.imagine)
         np.testing.assert_allclose(frames[index + 1], prediction.observation[0], atol=2e-6)
@@ -279,7 +282,7 @@ def test_video_uses_newest_frame_clips_pixels_and_has_repeatable_actions(
     monkeypatch: pytest.MonkeyPatch, rgb: bool
 ) -> None:
     shape = (2, 3, 4, 3) if rgb else (2, 3, 4)
-    model = MambaWorldModel(shape, 3, d_model=8, d_state=4, headdim=4)
+    model = MambaWorldModel(shape, 3, d_model=8, d_state=4, headdim=4, encoder_channels=(4,))
     config = training_config(video_num_steps=2, video_fps=12)
     frames = np.ones((3, *shape), np.float32)
     frames[:, -1] = np.array([-1, 0.5, 2], np.float32).reshape((3,) + (1,) * (len(shape) - 1))

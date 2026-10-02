@@ -9,6 +9,7 @@ import optax
 import pytest
 
 from rl2.mamba3 import Mamba3Carry
+from rl2.observation_encoder import ConvObservationEncoder
 from rl2.wm import MambaWorldModel, Prediction
 
 
@@ -18,10 +19,11 @@ def assert_tree_close(actual: Any, expected: Any) -> None:
         np.testing.assert_allclose(a, b, rtol=3e-5, atol=3e-6)
 
 
-@pytest.mark.parametrize("rank", [1, 2])
-def test_sequence_steps_chunks_and_base_interface_agree(rank: int) -> None:
-    model = MambaWorldModel((2, 3), 3, d_model=8, d_state=4, headdim=4, mimo_rank=rank)
-    obs = jax.random.normal(jax.random.key(0), (5, 2, 2, 3))
+@pytest.mark.parametrize("rank,rgb", [(1, False), (2, True)])
+def test_sequence_steps_chunks_and_base_interface_agree(rank: int, rgb: bool) -> None:
+    shape = (2, 4, 4, 3) if rgb else (2, 4, 4)
+    model = MambaWorldModel(shape, 3, d_model=8, d_state=4, headdim=4, mimo_rank=rank, encoder_channels=(4,))
+    obs = jax.random.randint(jax.random.key(0), (5, 2, *shape), 0, 256, dtype=jnp.uint8)
     actions = jnp.arange(10, dtype=jnp.int32).reshape(5, 2) % 3
     # Initializing the original interface creates every parameter used by the
     # recurrent methods, even when initialization only sees a single step.
@@ -37,8 +39,8 @@ def test_sequence_steps_chunks_and_base_interface_agree(rank: int) -> None:
         carry: Mamba3Carry, inputs: tuple[jax.Array, jax.Array]
     ) -> tuple[Mamba3Carry, tuple[jax.Array, Prediction]]:
         observation, action = inputs
-        chex.assert_shape(observation, (2, 2, 3))
-        chex.assert_type(observation, jnp.float32)
+        chex.assert_shape(observation, (2, *shape))
+        chex.assert_type(observation, jnp.uint8)
         chex.assert_shape(action, (2,))
         chex.assert_type(action, jnp.int32)
         carry, latent, output = observe(observation, action, carry)
@@ -52,18 +54,22 @@ def test_sequence_steps_chunks_and_base_interface_agree(rank: int) -> None:
     assert_tree_close((carry, jnp.concatenate((first_latents, last_latents)), joined), (final, latents, prediction))
     assert_tree_close(model.apply(variables, obs, actions), (latents, prediction))
     encoded = model.apply(variables, obs, method=model.encode)
+    # The shared encoder receives intact images; only time/batch are flattened.
+    encoder = ConvObservationEncoder(encoder_channels=(4,), embedding_size=8)
+    expected_encoding = encoder.apply({"params": variables["params"]["encoder"]}, obs.reshape((10, *shape)))
+    assert_tree_close(encoded, expected_encoding.reshape((5, 2, 8)))
     transitioned = model.apply(variables, encoded, actions, method=model.transition)
     assert_tree_close(transitioned, latents)
     assert_tree_close(model.apply(variables, latents, method=model.decode), prediction)
     empty_carry, empty_latents, empty_prediction = observe(obs[:0], actions[:0], final)
     assert_tree_close(empty_carry, final)
     chex.assert_shape(empty_latents, (0, 2, 8))
-    chex.assert_shape(empty_prediction.observation, (0, 2, 2, 3))
+    chex.assert_shape(empty_prediction.observation, (0, 2, *shape))
 
 
 def test_episode_resets_and_causality() -> None:
-    model = MambaWorldModel((3,), 2, d_model=8, d_state=4, headdim=4)
-    obs = jax.random.normal(jax.random.key(2), (6, 2, 3))
+    model = MambaWorldModel((1, 4, 4), 2, d_model=8, d_state=4, headdim=4, encoder_channels=(4,))
+    obs = jax.random.randint(jax.random.key(2), (6, 2, 1, 4, 4), 0, 256, dtype=jnp.uint8)
     actions = jnp.arange(12, dtype=jnp.int32).reshape(6, 2) % 2
     variables = model.init(jax.random.key(3), obs, actions)
     observe = jax.jit(partial(model.apply, variables, method=model.observe))
@@ -93,8 +99,8 @@ def test_episode_resets_and_causality() -> None:
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 def test_imagination_gradients_and_training(dtype: jax.typing.DTypeLike) -> None:
-    model = MambaWorldModel((3,), 2, d_model=8, d_state=4, headdim=4, dtype=dtype)
-    obs = jax.random.normal(jax.random.key(4), (4, 2, 3))
+    model = MambaWorldModel((1, 4, 4), 2, d_model=8, d_state=4, headdim=4, dtype=dtype, encoder_channels=(4,))
+    obs = jax.random.randint(jax.random.key(4), (4, 2, 1, 4, 4), 0, 256, dtype=jnp.uint8)
     actions = jnp.arange(8, dtype=jnp.int32).reshape(4, 2) % 2
     variables = model.init(jax.random.key(5), obs, actions)
     carry, latent, _ = model.apply(variables, obs[0], actions[0], method=model.observe)
@@ -134,14 +140,14 @@ def test_imagination_gradients_and_training(dtype: jax.typing.DTypeLike) -> None
 
 
 def test_invalid_shapes_and_dtypes() -> None:
-    model = MambaWorldModel((3,), 2, d_model=8, d_state=4, headdim=4)
-    obs, actions = jnp.zeros((2, 3)), jnp.zeros(2, dtype=jnp.int32)
+    model = MambaWorldModel((1, 4, 4), 2, d_model=8, d_state=4, headdim=4, encoder_channels=(4,))
+    obs, actions = jnp.zeros((2, 1, 4, 4), jnp.uint8), jnp.zeros(2, dtype=jnp.int32)
     variables = model.init(jax.random.key(6), obs, actions)
     observe = partial(model.apply, variables, method=model.observe)
     with pytest.raises(AssertionError):
-        observe(jnp.zeros((2, 4)), actions)
+        observe(jnp.zeros((2, 1, 4, 5), jnp.uint8), actions)
     with pytest.raises(AssertionError):
-        observe(obs.astype(jnp.uint8), actions)
+        observe(obs.astype(jnp.float32), actions)
     with pytest.raises(AssertionError):
         observe(obs, actions.astype(jnp.float32))
     with pytest.raises(AssertionError):
@@ -158,8 +164,15 @@ def test_invalid_shapes_and_dtypes() -> None:
         model.apply(variables, jnp.zeros((2, 7)), actions, method=model.imagine)
 
 
-@pytest.mark.parametrize("shape,num_actions", [((0,), 2), ((3,), 0), ((3.5,), 2)])
+@pytest.mark.parametrize("shape,num_actions", [((0, 4, 4), 2), ((1, 4, 4), 0), ((3.5, 4, 4), 2)])
 def test_invalid_configuration(shape: tuple[int | float, ...], num_actions: int) -> None:
-    model = MambaWorldModel(shape, num_actions, d_model=8, d_state=4, headdim=4)
+    model = MambaWorldModel(shape, num_actions, d_model=8, d_state=4, headdim=4, encoder_channels=(4,))
     with pytest.raises(AssertionError):
-        model.init(jax.random.key(0), jnp.zeros((2, 3)), jnp.zeros(2, dtype=jnp.int32))
+        model.init(jax.random.key(0), jnp.zeros((2, 1, 4, 4), jnp.uint8), jnp.zeros(2, dtype=jnp.int32))
+
+
+@pytest.mark.parametrize("shape", [(3,), (4, 4), (1, 4, 4, 2)])
+def test_invalid_image_layout(shape: tuple[int, ...]) -> None:
+    model = MambaWorldModel(shape, 2, d_model=8, d_state=4, headdim=4, encoder_channels=(4,))
+    with pytest.raises(ValueError):
+        model.init(jax.random.key(0), jnp.zeros((2, *shape), jnp.uint8), jnp.zeros(2, jnp.int32))

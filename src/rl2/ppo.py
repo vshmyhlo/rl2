@@ -11,6 +11,7 @@ from time import monotonic
 from typing import Any, SupportsFloat
 
 import ale_py
+import chex
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
@@ -23,6 +24,7 @@ from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
 from rl2.multi_atari import register_envs
+from rl2.observation_encoder import ConvObservationEncoder
 
 type Array = jax.Array | NDArray[Any]
 type LSTMCarry = tuple[jax.Array, jax.Array]
@@ -98,27 +100,6 @@ class ResetLSTM(nn.Module):
         return carry, x.astype(self.dtype)
 
 
-class ResidualBlock(nn.Module):
-    """Pre-activation residual block with per-pixel channel normalization."""
-
-    channels: int
-    dtype: jax.typing.DTypeLike = jnp.float32
-
-    @nn.compact
-    def __call__(self, x: jax.Array) -> jax.Array:
-        residual = x
-        for index in range(2):
-            x = nn.relu(nn.LayerNorm(dtype=self.dtype)(x))
-            x = nn.Conv(
-                self.channels,
-                (3, 3),
-                padding="SAME",
-                kernel_init=nn.initializers.variance_scaling(2.0 if index == 0 else 1.0, "fan_in", "truncated_normal"),
-                dtype=self.dtype,
-            )(x)
-        return (residual + x) * jnp.asarray(2**-0.5, dtype=self.dtype)
-
-
 class ActorCritic(nn.Module):
     num_actions: int
     lstm_hidden_size: int
@@ -134,28 +115,20 @@ class ActorCritic(nn.Module):
         episode_starts: Array,
     ) -> tuple[LSTMCarry, jax.Array, jax.Array]:
         # [steps, environments, frames, height, width, (RGB channels)].
+        chex.assert_rank(obs, {5, 6})
+        chex.assert_type(obs, jnp.uint8)
         steps, environments = obs.shape[:2]
-        obs = obs.reshape((-1, *obs.shape[2:]))
-        if obs.ndim == 5:  # Raw RGB: combine stacked frames and color channels.
-            x = jnp.transpose(obs, (0, 2, 3, 1, 4))
-            x = x.reshape((*x.shape[:3], -1))
-        else:
-            x = jnp.moveaxis(obs, 1, -1)
-        x = (x.astype(jnp.float32) / 255.0).astype(self.dtype)
-        # Flax keeps parameters and LayerNorm statistics in float32 by default.
+        chex.assert_shape(carry, (environments, self.lstm_hidden_size))
+        chex.assert_type(carry, jnp.float32)
+        chex.assert_shape(episode_starts, (steps, environments))
+        chex.assert_type(episode_starts, jnp.bool_)
+        x = ConvObservationEncoder(
+            encoder_channels=self.encoder_channels,
+            embedding_size=self.embedding_size,
+            dtype=self.dtype,
+            name="encoder",
+        )(obs.reshape((-1, *obs.shape[2:])))
         init = nn.initializers.orthogonal(np.sqrt(2))
-        # IMPALA-style stages; normalization is independent of rollout/minibatch size.
-        # Variance scaling avoids expensive QR initialization of large visual kernels.
-        visual_init = nn.initializers.variance_scaling(2.0, "fan_in", "truncated_normal")
-        for stage, channels in enumerate(self.encoder_channels):
-            x = nn.Conv(channels, (3, 3), padding="SAME", kernel_init=visual_init, dtype=self.dtype)(x)
-            x = nn.max_pool(x, window_shape=(3, 3), strides=(2, 2), padding="SAME")
-            for block in range(2):
-                x = ResidualBlock(channels, dtype=self.dtype, name=f"stage_{stage}_block_{block}")(x)
-        x = nn.relu(nn.LayerNorm(name="encoder_norm", dtype=self.dtype)(x))
-        # Preserve spatial position (6x6 at 84x84 input) for aiming and movement.
-        x = nn.Dense(self.embedding_size, kernel_init=visual_init, dtype=self.dtype)(x.reshape((x.shape[0], -1)))
-        x = nn.relu(nn.LayerNorm(name="shared_norm", dtype=self.dtype)(x))
         carry, x = nn.scan(
             ResetLSTM,
             variable_broadcast="params",

@@ -1,8 +1,9 @@
 """Train a Mamba world model on Space Invaders with a uniform random policy.
 
 Run with ``uv run python -m rl2.train_wm --config configs/train_wm_atari.yaml``.
-The default config uses single grayscale frames, normalized to [0, 1]; rewards
-retain their environment scale. Each rollout receives one Adam update using
+The convolutional encoder accepts uint8 frames and normalizes them internally;
+reconstruction targets use [0, 1] and rewards retain their environment scale.
+Each rollout receives one Adam update using
 next-frame MSE, reward MSE, and terminal
 binary cross entropy. Mamba history crosses chunks with truncated BPTT and
 resets at episode boundaries. No policy is learned.
@@ -46,6 +47,7 @@ class Config:
     vector_env: str
     num_steps: int
     d_model: int
+    encoder_channels: tuple[int, ...]
     d_state: int
     headdim: int
     learning_rate: float
@@ -77,6 +79,10 @@ class Config:
             chex.assert_scalar_positive(value)
         chex.assert_type(self.video_every_steps, int)
         chex.assert_scalar_non_negative(self.video_every_steps)
+        chex.assert_scalar_positive(len(self.encoder_channels))
+        for channels in self.encoder_channels:
+            chex.assert_type(channels, int)
+            chex.assert_scalar_positive(channels)
         if self.observation_size is not None:
             chex.assert_type(self.observation_size, int)
             chex.assert_scalar_positive(self.observation_size)
@@ -103,6 +109,8 @@ def load_config(path: str | Path) -> Config:
         settings = yaml.safe_load(file)
     if not isinstance(settings, dict):
         raise TypeError("The YAML config must contain a mapping of training settings")
+    if "encoder_channels" in settings:
+        settings["encoder_channels"] = tuple(settings["encoder_channels"])
     return Config(**settings)
 
 
@@ -176,12 +184,11 @@ def update(
     batch.validate()
     chex.assert_trees_all_equal_shapes_and_dtypes(carry, model.initial_carry(batch.actions.shape[1]))
     carry = jax.tree.map(jax.lax.stop_gradient, carry)
-    observations = batch.observations.astype(jnp.float32) / 255.0
     targets = batch.next_observations.astype(jnp.float32) / 255.0
 
     def loss_fn(params: optax.Params) -> tuple[jax.Array, tuple[Mamba3Carry, dict[str, jax.Array]]]:
         final_carry, _, prediction = state.apply_fn(
-            {"params": params}, observations, batch.actions, carry, batch.episode_starts, method=model.observe
+            {"params": params}, batch.observations, batch.actions, carry, batch.episode_starts, method=model.observe
         )
         observation_loss = jnp.mean(jnp.square(prediction.observation - targets))
         reward_loss = jnp.mean(jnp.square(prediction.reward - batch.rewards))
@@ -230,7 +237,7 @@ def imagine_frames(
     chex.assert_type(actions, jnp.int32)
     chex.assert_scalar_positive(actions.shape[0])
     normalized = observation.astype(jnp.float32) / 255.0
-    latent = state.apply_fn({"params": state.params}, normalized, method=model.encode)
+    latent = state.apply_fn({"params": state.params}, observation, method=model.encode)
     starts = jnp.zeros(actions.shape, dtype=jnp.bool_).at[0].set(episode_start)
 
     def step(memory: ImaginationCarry, inputs: tuple[jax.Array, jax.Array]) -> tuple[ImaginationCarry, jax.Array]:
@@ -333,13 +340,14 @@ def train(config: Config) -> str:
             observation_shape=envs.single_observation_space.shape,
             num_actions=int(envs.single_action_space.n),
             d_model=config.d_model,
+            encoder_channels=config.encoder_channels,
             d_state=config.d_state,
             headdim=config.headdim,
             dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
         )
         params = model.init(
             jax.random.key(config.seed),
-            jnp.asarray(observation[:1], dtype=jnp.float32) / 255.0,
+            jnp.asarray(observation[:1]),
             jnp.zeros(1, dtype=jnp.int32),
         )["params"]
         state = TrainState.create(
