@@ -1,8 +1,9 @@
 """Train a Mamba world model on Space Invaders with a uniform random policy.
 
-Run with ``uv run python -m rl2.train_wm``. Observations are single grayscale
-frames, normalized to [0, 1]; rewards retain their environment scale. Each
-rollout receives one Adam update using next-frame MSE, reward MSE, and terminal
+Run with ``uv run python -m rl2.train_wm --config configs/train_wm_atari.yaml``.
+The default config uses single grayscale frames, normalized to [0, 1]; rewards
+retain their environment scale. Each rollout receives one Adam update using
+next-frame MSE, reward MSE, and terminal
 binary cross entropy. Mamba history crosses chunks with truncated BPTT and
 resets at episode boundaries. No policy is learned.
 """
@@ -21,8 +22,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import yaml
 from flax import serialization, struct
 from flax.training.train_state import TrainState
+from google.cloud import storage
 from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
@@ -33,27 +36,30 @@ from rl2.wm import MambaWorldModel
 
 @dataclass(frozen=True)
 class Config:
-    seed: int = 1
-    total_steps: int = 100_000
-    num_envs: int = 8
-    num_steps: int = 32
-    observation_size: int = 84
-    d_model: int = 128
-    d_state: int = 64
-    headdim: int = 32
-    learning_rate: float = 3e-4
-    max_grad_norm: float = 1.0
-    bf16: bool = False
-    log_dir: str = "runs/wm"
-    log_every: int = 10
-    checkpoint_every: int = 100
+    env_id: str
+    observation_size: int | None
+    frame_stack: bool
+    atari_preprocessing: bool
+    seed: int
+    total_steps: int
+    num_envs: int
+    vector_env: str
+    num_steps: int
+    d_model: int
+    d_state: int
+    headdim: int
+    learning_rate: float
+    max_grad_norm: float
+    bf16: bool
+    log_dir: str
+    log_every: int
+    checkpoint_every: int
 
     def __post_init__(self) -> None:
         for value in (
             self.total_steps,
             self.num_envs,
             self.num_steps,
-            self.observation_size,
             self.d_model,
             self.d_state,
             self.headdim,
@@ -62,6 +68,12 @@ class Config:
         ):
             chex.assert_type(value, int)
             chex.assert_scalar_positive(value)
+        if self.observation_size is not None:
+            chex.assert_type(self.observation_size, int)
+            chex.assert_scalar_positive(self.observation_size)
+        chex.assert_type((self.frame_stack, self.atari_preprocessing, self.bf16), bool)
+        if self.vector_env not in ("sync", "async"):
+            raise ValueError("vector_env must be 'sync' or 'async'")
         chex.assert_is_divisible(self.total_steps, self.num_envs)
         chex.assert_is_divisible(2 * self.d_model, self.headdim)
         chex.assert_is_divisible(self.d_state, 2)
@@ -74,6 +86,15 @@ class Config:
             chex.assert_scalar_positive(value)
             if not np.isfinite(value):
                 raise ValueError("learning_rate and max_grad_norm must be finite")
+
+
+def load_config(path: str | Path) -> Config:
+    """Load world-model training settings from a YAML mapping."""
+    with open(path) as file:
+        settings = yaml.safe_load(file)
+    if not isinstance(settings, dict):
+        raise TypeError("The YAML config must contain a mapping of training settings")
+    return Config(**settings)
 
 
 @struct.dataclass
@@ -173,22 +194,41 @@ def update(
     return state.apply_gradients(grads=gradients), jax.tree.map(jax.lax.stop_gradient, carry), metrics
 
 
-def save_checkpoint(state: TrainState, run_dir: Path) -> None:
-    """Atomically replace the latest parameters, optimizer state, and update count."""
-    temporary = run_dir / "checkpoint.msgpack.tmp"
-    temporary.write_bytes(serialization.to_bytes(state))
-    temporary.replace(run_dir / "checkpoint.msgpack")
+def write_artifact(path: str, data: bytes) -> None:
+    """Upload a complete GCS object or replace a local file atomically."""
+    if path.startswith("gs://"):
+        blob = storage.Blob.from_uri(path, client=storage.Client())
+        blob.upload_from_string(data)
+    else:
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f"{destination.name}.tmp")
+        temporary.write_bytes(data)
+        temporary.replace(destination)
 
 
-def train(config: Config) -> Path:
+def save_checkpoint(state: TrainState, run_dir: str | Path) -> None:
+    """Save the latest parameters, optimizer state, and update count beside logs."""
+    write_artifact(f"{str(run_dir).rstrip('/')}/checkpoint.msgpack", serialization.to_bytes(state))
+
+
+def train(config: Config) -> str:
     """Train on freshly collected random rollouts and return the artifact directory."""
-    env_id = "ALE/SpaceInvaders-v5"
-    envs = gym.vector.SyncVectorEnv(
+    vector_cls = gym.vector.AsyncVectorEnv if config.vector_env == "async" else gym.vector.SyncVectorEnv
+    vector_options = {"context": "spawn"} if config.vector_env == "async" else {}
+    envs = vector_cls(
         [
-            partial(make_env, env_id, atari_preprocessing=True, observation_size=config.observation_size)
+            partial(
+                make_env,
+                config.env_id,
+                frame_stack=config.frame_stack,
+                atari_preprocessing=config.atari_preprocessing,
+                observation_size=config.observation_size,
+            )
             for _ in range(config.num_envs)
         ],
         autoreset_mode=gym.vector.AutoresetMode.DISABLED,
+        **vector_options,
     )
     writer = None
     try:
@@ -214,18 +254,20 @@ def train(config: Config) -> Path:
             tx=optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adam(config.learning_rate)),
         )
         carry = model.initial_carry(config.num_envs)
-        run_dir = Path(config.log_dir) / f"SpaceInvaders_seed{config.seed}_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"
-        run_dir.mkdir(parents=True, exist_ok=False)
+        run_name = f"{config.env_id.replace('/', '_')}_seed{config.seed}_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"
+        run_dir = f"{config.log_dir.rstrip('/')}/{run_name}"
         metadata = {
             **asdict(config),
-            "env_id": env_id,
             "observation_shape": model.observation_shape,
             "num_actions": model.num_actions,
         }
-        (run_dir / "config.json").write_text(json.dumps(metadata, indent=2) + "\n")
-        writer = SummaryWriter(logdir=str(run_dir))
-        writer.add_text("config", json.dumps(metadata, indent=2), 0)
-        print(f"Run: {run_dir}\nJAX devices: {jax.devices()}", flush=True)
+        writer = SummaryWriter(logdir=run_dir)
+        write_artifact(f"{run_dir}/config.json", (json.dumps(metadata, indent=2) + "\n").encode())
+        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", 0)
+        print(f"TensorBoard run: {run_dir}", flush=True)
+        devices = str(jax.devices())
+        print(f"JAX devices: {devices}", flush=True)
+        writer.add_text("devices", devices, 0)
         start = monotonic()
         steps, iteration = 0, 0
         while steps < config.total_steps:
@@ -259,26 +301,10 @@ def train(config: Config) -> Path:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    defaults = Config()
-    for name in (
-        "seed",
-        "total_steps",
-        "num_envs",
-        "num_steps",
-        "observation_size",
-        "d_model",
-        "d_state",
-        "headdim",
-        "log_every",
-        "checkpoint_every",
-    ):
-        parser.add_argument(f"--{name.replace('_', '-')}", type=int, default=getattr(defaults, name))
-    parser.add_argument("--learning-rate", type=float, default=defaults.learning_rate)
-    parser.add_argument("--max-grad-norm", type=float, default=defaults.max_grad_norm)
-    parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=defaults.bf16)
-    parser.add_argument("--log-dir", default=defaults.log_dir)
-    train(Config(**vars(parser.parse_args())))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="configs/train_wm_atari.yaml", help="Path to a YAML config")
+    args = parser.parse_args()
+    train(load_config(args.config))
 
 
 if __name__ == "__main__":

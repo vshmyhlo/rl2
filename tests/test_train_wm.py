@@ -1,4 +1,7 @@
 import json
+import sys
+from dataclasses import asdict, replace
+from functools import partial
 from pathlib import Path
 from typing import Any, SupportsFloat
 
@@ -9,13 +12,20 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import yaml
 from flax import serialization
 from flax.training.train_state import TrainState
+from google.cloud import storage
 from numpy.typing import NDArray
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from rl2 import train_wm
 from rl2.wm import MambaWorldModel
+
+
+def training_config(**overrides: Any) -> train_wm.Config:
+    path = Path(__file__).resolve().parents[1] / "configs/train_wm_atari.yaml"
+    return replace(train_wm.load_config(path), **overrides)
 
 
 class ShortEpisodes(gym.Env[NDArray[np.uint8], int]):
@@ -106,34 +116,73 @@ def test_update_targets_losses_carry_and_learning() -> None:
     assert all(np.isfinite(value) for value in metrics.values())
 
 
+@pytest.mark.parametrize("remote", [False, True])
 def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remote: bool
 ) -> None:
     environments: list[ShortEpisodes] = []
+    uploads: dict[str, bytes] = {}
+    if remote:
+        client = storage.Client.create_anonymous_client()
 
-    def make_env(env_id: str, atari_preprocessing: bool, observation_size: int) -> ShortEpisodes:
+        def make_client() -> storage.Client:
+            return client
+
+        def upload(blob: storage.Blob, data: bytes, **kwargs: Any) -> None:
+            # TensorBoard may close again from __del__ after monkeypatch teardown.
+            blob.upload_from_string = partial(upload, blob)
+            uploads[f"gs://{blob.bucket.name}/{blob.name}"] = data
+
+        monkeypatch.setattr(storage, "Client", make_client)
+        monkeypatch.setattr(storage.Blob, "upload_from_string", upload)
+        monkeypatch.chdir(tmp_path)
+
+    def make_env(
+        env_id: str, frame_stack: bool, atari_preprocessing: bool, observation_size: int | None
+    ) -> ShortEpisodes:
         assert env_id == "ALE/SpaceInvaders-v5"
+        assert not frame_stack
         assert atari_preprocessing
         env = ShortEpisodes()
         environments.append(env)
         return env
 
     monkeypatch.setattr(train_wm, "make_env", make_env)
-    config = train_wm.Config(
-        total_steps=10, num_envs=2, num_steps=3, d_model=8, d_state=4, headdim=4, log_dir=str(tmp_path)
+    config = training_config(
+        total_steps=10,
+        num_envs=2,
+        num_steps=3,
+        d_model=8,
+        d_state=4,
+        headdim=4,
+        log_dir="gs://test-bucket/rl2/" if remote else f"{tmp_path}/",
+        checkpoint_every=1,
     )
     run_dir = train_wm.train(config)
-    saved = serialization.msgpack_restore((run_dir / "checkpoint.msgpack").read_bytes())
+    assert run_dir.startswith(f"{config.log_dir.rstrip('/')}/ALE_SpaceInvaders-v5_seed1_")
+    local_dir = tmp_path / "download" if remote else Path(run_dir)
+    if remote:
+        assert uploads
+        assert not (tmp_path / "gs:").exists()
+        local_dir.mkdir()
+        for path, data in uploads.items():
+            assert path.startswith(f"{run_dir}/")
+            (local_dir / path.rsplit("/", 1)[-1]).write_bytes(data)
+    saved = serialization.msgpack_restore((local_dir / "checkpoint.msgpack").read_bytes())
     assert int(saved["step"]) == 2
     assert "mixer" in saved["params"]
     assert "opt_state" in saved
-    metadata = json.loads((run_dir / "config.json").read_text())
+    metadata = json.loads((local_dir / "config.json").read_text())
     assert metadata["env_id"] == "ALE/SpaceInvaders-v5"
     assert metadata["observation_shape"] == [1, 2, 2]
-    events = EventAccumulator(str(run_dir)).Reload()
+    events = EventAccumulator(str(local_dir)).Reload()
     assert [event.step for event in events.Scalars("train/loss")] == [6, 10]
+    config_text = events.Tensors("config/text_summary")[0].tensor_proto.string_val[0].decode()
+    assert config_text.startswith("```yaml\n")
+    assert config.log_dir in config_text
+    assert events.Tensors("devices/text_summary")
     assert all(env.closed for env in environments)
-    assert not (run_dir / "checkpoint.msgpack.tmp").exists()
+    assert not (local_dir / "checkpoint.msgpack.tmp").exists()
 
 
 @pytest.mark.parametrize(
@@ -142,4 +191,60 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
 )
 def test_invalid_config(options: dict[str, Any]) -> None:
     with pytest.raises((AssertionError, ValueError)):
-        train_wm.Config(**options)
+        training_config(**options)
+
+
+def test_config_requires_all_training_settings(tmp_path: Path) -> None:
+    settings = asdict(training_config())
+    del settings["learning_rate"]
+    path = tmp_path / "incomplete.yaml"
+    path.write_text(yaml.safe_dump(settings))
+    with pytest.raises(TypeError, match="learning_rate"):
+        train_wm.load_config(path)
+
+
+def test_main_loads_yaml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "train.yaml"
+    expected = training_config(
+        env_id="ALE/Pong-v5",
+        num_envs=2,
+        num_steps=7,
+        learning_rate=0.001,
+        observation_size=None,
+        frame_stack=True,
+        atari_preprocessing=False,
+        vector_env="async",
+        bf16=True,
+    )
+    path.write_text(yaml.safe_dump(asdict(expected)))
+    calls: list[train_wm.Config] = []
+
+    def train(config: train_wm.Config) -> str:
+        calls.append(config)
+        return str(tmp_path)
+
+    monkeypatch.setattr(sys, "argv", ["train_wm", "--config", str(path)])
+    monkeypatch.setattr(train_wm, "train", train)
+    train_wm.main()
+    assert calls == [expected]
+
+
+def test_main_rejects_cli_training_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["train_wm", "--num-steps", "5"])
+    with pytest.raises(SystemExit) as error:
+        train_wm.main()
+    assert error.value.code == 2
+
+
+def test_main_uses_default_atari_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+    monkeypatch.setattr(sys, "argv", ["train_wm"])
+    calls: list[train_wm.Config] = []
+
+    def train(config: train_wm.Config) -> str:
+        calls.append(config)
+        return config.log_dir
+
+    monkeypatch.setattr(train_wm, "train", train)
+    train_wm.main()
+    assert calls == [train_wm.load_config("configs/train_wm_atari.yaml")]

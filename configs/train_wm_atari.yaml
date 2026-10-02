@@ -1,0 +1,18 @@
+env_id: ALE/SpaceInvaders-v5
+observation_size: 84 # Resize only; null preserves the preprocessed or original resolution
+frame_stack: false # Mamba maintains history; false uses a single frame
+atari_preprocessing: true # 84x84 grayscale, action repeat 4, max pooling, and random reset no-ops
+seed: 1
+total_steps: 100000 # Environment transitions across all workers; must divide evenly by num_envs
+num_envs: 8
+vector_env: sync # async (spawned subprocesses) or sync
+num_steps: 32 # Sequence length per update; recurrent memory carries across chunks
+d_model: 128 # Latent and Mamba model width
+d_state: 64 # Mamba state width; even and at least 4
+headdim: 32 # Must divide 2 * d_model
+bf16: false # Mixed precision projections; parameters, carry, and losses stay float32
+learning_rate: 0.0003
+max_grad_norm: 1.0
+log_dir: gs://cohere-dev/vlad/rl2/wm # Local path or GCS prefix for logs, config.json, and checkpoint.msgpack
+log_every: 10 # Print training metrics every N updates
+checkpoint_every: 100 # Save every N updates and at the end of training
