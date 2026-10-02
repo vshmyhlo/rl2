@@ -18,6 +18,7 @@ from pathlib import Path
 from time import monotonic
 
 import chex
+import cv2
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
@@ -282,7 +283,7 @@ def update(
 
 
 def update_video_history(history: Batch | None, batch: Batch, num_frames: int) -> Batch:
-    """Retain enough recent transitions per environment for a num_frames prefill.
+    """Retain recent transitions for a num_frames diagnostic video window.
 
     History spans rollout chunks. Episode masks are retained so selection can
     reject windows crossing resets. At least one transition is kept even for
@@ -299,7 +300,7 @@ def update_video_history(history: Batch | None, batch: Batch, num_frames: int) -
     return jax.tree.map(lambda old, new: jnp.concatenate((old, new), axis=0)[-keep:], history, batch)
 
 
-def select_video_prefill(
+def select_video_window(
     history: Batch,
     episode_start: NDArray[np.bool_],
     num_frames: int,
@@ -310,7 +311,8 @@ def select_video_prefill(
         history: Consecutive recent transitions, possibly spanning chunks.
         episode_start: Bool [environments], true if the next collector input is
             a reset observation. This excludes both terminal and truncated endpoints.
-        num_frames: Positive number of real frames, connected by num_frames-1 actions.
+        num_frames: Total real frames (prefill plus prediction targets), connected
+            by num_frames-1 recorded actions.
 
     Returns:
         Uint8 [num_frames, 1, *image] observations and int32 [num_frames-1, 1]
@@ -347,42 +349,52 @@ def select_video_prefill(
     return np.asarray(observations), np.asarray(actions)
 
 
-@partial(jax.jit, static_argnames=("model",))
-def imagine_frames(
+@partial(jax.jit, static_argnames=("model", "num_prefill_frames"))
+def comparison_frames(
     state: TrainState,
     model: MambaWorldModel,
-    prefill_observations: jax.Array,
-    prefill_actions: jax.Array,
+    observations: jax.Array,
     actions: jax.Array,
+    num_prefill_frames: int,
     key: jax.Array,
 ) -> jax.Array:
-    """Return real prefill frames followed by samples from the learned prior.
+    """Compare real targets, posterior reconstructions, and prior imagination.
 
-    Prefill is uint8 [N, 1, *image] plus the int32 [N-1, 1] actions connecting
-    those frames within one episode. Starting with fresh memory, observe all
-    transitions using current parameters, then retain the final posterior
-    sample for imagination. No training carry or extra seed resampling is used.
-    Imagined actions are int32 [time, 1]; key is a scalar JAX key. The result
-    is float32 [N+time, *image]. Fixed-horizon videos ignore predicted termination.
+    Args:
+        state: Current training parameters and the model's apply function.
+        model: World model used to condition, observe, imagine, and decode.
+        observations: Uint8 [N+T, 1, *image] consecutive real frames from one episode.
+        actions: Int32 [N+T-1, 1] recorded actions connecting those frames.
+        num_prefill_frames: N real context frames; N and T must both be positive.
+        key: Scalar JAX sampling key, independent of training randomness.
+
+    Returns:
+        Float32 [3, N+T, *image], ordered real, posterior, prior. All panels show
+        the real context for the first N frames. Both model branches start from
+        exactly the same posterior state, rebuilt with current weights. Thereafter
+        posterior reconstruction sees each real target; prior imagination sees
+        only recorded actions and its own sampled latent history. Predicted
+        termination does not stop the comparison.
     """
-    chex.assert_shape(prefill_observations, (None, 1, *model.observation_shape))
-    chex.assert_type(prefill_observations, jnp.uint8)
-    num_frames = prefill_observations.shape[0]
-    chex.assert_scalar_positive(num_frames)
-    chex.assert_shape(prefill_actions, (num_frames - 1, 1))
-    chex.assert_type(prefill_actions, jnp.int32)
-    chex.assert_shape(actions, (None, 1))
+    chex.assert_shape(observations, (None, 1, *model.observation_shape))
+    chex.assert_type(observations, jnp.uint8)
+    chex.assert_type(num_prefill_frames, int)
+    chex.assert_scalar_positive(num_prefill_frames)
+    chex.assert_scalar_positive(observations.shape[0] - num_prefill_frames)
+    chex.assert_shape(actions, (observations.shape[0] - 1, 1))
     chex.assert_type(actions, jnp.int32)
-    chex.assert_scalar_positive(actions.shape[0])
     check_keys(key, ())
-    prefill_key, imagination_key = jax.random.split(key)
-    if num_frames > 1:
+    prefill_observations = observations[:num_prefill_frames]
+    prefill_actions = actions[: num_prefill_frames - 1]
+    future_actions = actions[num_prefill_frames - 1 :]
+    prefill_key, imagination_key, posterior_key = jax.random.split(key, 3)
+    if num_prefill_frames > 1:
         carry, _ = state.apply_fn(
             {"params": state.params},
             prefill_observations[:-1],
             prefill_actions,
             prefill_observations[1:],
-            jax.random.split(prefill_key, num_frames - 1),
+            jax.random.split(prefill_key, num_prefill_frames - 1),
             method=model.observe,
         )
     else:
@@ -394,6 +406,16 @@ def imagine_frames(
             prefill_key,
             method=model.condition,
         )
+
+    _, posterior = state.apply_fn(
+        {"params": state.params},
+        observations[num_prefill_frames - 1 : -1],
+        future_actions,
+        observations[num_prefill_frames:],
+        jax.random.split(posterior_key, future_actions.shape[0]),
+        carry,
+        method=model.observe,
+    )
 
     def step(memory: WorldModelState, inputs: tuple[jax.Array, jax.Array]) -> tuple[WorldModelState, jax.Array]:
         action, sample_key = inputs
@@ -409,8 +431,11 @@ def imagine_frames(
         )
         return memory, prediction.observation[0]
 
-    _, frames = jax.lax.scan(step, carry, (actions, jax.random.split(imagination_key, actions.shape[0])))
-    return jnp.concatenate((prefill_observations[:, 0].astype(jnp.float32) / 255.0, frames), axis=0)
+    _, frames = jax.lax.scan(step, carry, (future_actions, jax.random.split(imagination_key, future_actions.shape[0])))
+    real = observations[:, 0].astype(jnp.float32) / 255.0
+    reconstruction = jnp.concatenate((real[:num_prefill_frames], posterior.prediction.observation[:, 0]), axis=0)
+    imagination = jnp.concatenate((real[:num_prefill_frames], frames), axis=0)
+    return jnp.stack((real, reconstruction, imagination))
 
 
 def log_video(
@@ -418,42 +443,62 @@ def log_video(
     model: MambaWorldModel,
     config: Config,
     writer: SummaryWriter,
-    prefill_observations: NDArray[np.uint8],
-    prefill_actions: NDArray[np.int32],
+    observations: NDArray[np.uint8],
+    actions: NDArray[np.int32],
     steps: int,
 ) -> None:
-    """Log real prefill followed by random-action imagination without stepping environments."""
-    chex.assert_shape(prefill_observations, (config.video_prefill_frames, 1, *model.observation_shape))
-    chex.assert_type(prefill_observations, np.uint8)
-    chex.assert_shape(prefill_actions, (config.video_prefill_frames - 1, 1))
-    chex.assert_type(prefill_actions, np.int32)
+    """Log labeled real/posterior/prior panels using a recorded same-episode window.
+
+    Observations are uint8 [prefill+future, 1, *image]; actions are int32
+    [prefill+future-1, 1]. Frames are shown side by side in that order, with a
+    header marking shared real context before prediction begins. No environments
+    are stepped and no training random state is consumed. Returns None.
+    """
+    num_frames = config.video_prefill_frames + config.video_num_steps
+    chex.assert_shape(observations, (num_frames, 1, *model.observation_shape))
+    chex.assert_type(observations, np.uint8)
+    chex.assert_shape(actions, (num_frames - 1, 1))
+    chex.assert_type(actions, np.int32)
     chex.assert_type(steps, int)
     chex.assert_scalar_non_negative(steps)
-    # Separate fixed diagnostic streams leave training collection/sampling untouched.
-    rng = np.random.default_rng(config.seed)
-    actions = rng.integers(model.num_actions, size=(config.video_num_steps, 1), dtype=np.int32)
     frames = np.asarray(
-        imagine_frames(
+        comparison_frames(
             state,
             model,
-            jnp.asarray(prefill_observations),
-            jnp.asarray(prefill_actions),
+            jnp.asarray(observations),
             jnp.asarray(actions),
+            config.video_prefill_frames,
             jax.random.key(config.seed),
         )
     )
-    chex.assert_shape(frames, (config.video_prefill_frames + config.video_num_steps, *model.observation_shape))
+    chex.assert_shape(frames, (3, num_frames, *model.observation_shape))
     chex.assert_type(frames, np.float32)
-    frames = frames[:, -1]  # Show the newest frame from each observation stack.
-    if frames.ndim == 3:
-        frames = frames[:, None]
-    else:
-        frames = frames.transpose(0, 3, 1, 2)
-    video = np.rint(np.clip(frames, 0.0, 1.0) * 255).astype(np.uint8)[None]
-    writer.add_video("imagination/random_policy", video, steps, fps=config.video_fps)
+    frames = frames[:, :, -1]  # Show the newest frame from each observation stack.
+    if frames.ndim == 4:
+        frames = np.repeat(frames[..., None], 3, axis=-1)
+    pixels = np.rint(np.clip(frames, 0.0, 1.0) * 255).astype(np.uint8)
+    _, _, height, width, _ = pixels.shape
+    header_height = 18
+    panels = np.zeros((3, num_frames, height + header_height, width, 3), np.uint8)
+    panels[:, :, header_height:] = pixels
+    for panel, label in enumerate(("Real", "Posterior", "Prior")):
+        for t in range(num_frames):
+            cv2.putText(
+                panels[panel, t],
+                "Context" if t < config.video_prefill_frames else label,
+                (2, 12),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.35,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+    video = np.concatenate(tuple(panels), axis=2).transpose(0, 3, 1, 2)[None]
+    writer.add_video("imagination/real_posterior_prior", video, steps, fps=config.video_fps)
     writer.flush()
     print(
-        f"Recorded {config.video_prefill_frames} real + {config.video_num_steps} imagined frames at step {steps}",
+        f"Recorded comparison: {config.video_prefill_frames} context + {config.video_num_steps} predicted frames "
+        f"at step {steps} (real | posterior | prior)",
         flush=True,
     )
 
@@ -559,7 +604,9 @@ def train(config: Config) -> str:
             num_steps = min(config.num_steps, (config.total_steps - steps) // config.num_envs)
             batch, observation, episode_start = collect_rollout(envs, observation, episode_start, rng, num_steps)
             if config.video_every_steps:
-                video_history = update_video_history(video_history, batch, config.video_prefill_frames)
+                video_history = update_video_history(
+                    video_history, batch, config.video_prefill_frames + config.video_num_steps
+                )
             learning_rate = float(lr_schedule(state.step))
             state, carry, metrics = update(
                 state,
@@ -594,12 +641,13 @@ def train(config: Config) -> str:
                 save_checkpoint(state, checkpoint_run_dir)
             if config.video_every_steps and steps >= next_video_step:
                 assert video_history is not None
-                prefill = select_video_prefill(video_history, episode_start, config.video_prefill_frames)
-                if prefill is not None:
-                    log_video(state, model, config, writer, *prefill, steps)
+                num_video_frames = config.video_prefill_frames + config.video_num_steps
+                window = select_video_window(video_history, episode_start, num_video_frames)
+                if window is not None:
+                    log_video(state, model, config, writer, *window, steps)
                 else:
                     print(
-                        f"Skipped video at step {steps}: no {config.video_prefill_frames}-frame live episode window",
+                        f"Skipped video at step {steps}: no {num_video_frames}-frame live episode window",
                         flush=True,
                     )
                 next_video_step = (steps // config.video_every_steps + 1) * config.video_every_steps

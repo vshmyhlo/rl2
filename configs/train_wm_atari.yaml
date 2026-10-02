@@ -8,18 +8,18 @@ total_steps: 5000000 # Agent transitions (~20M emulator frames); ~9,766 updates 
 num_envs: 8 # 512 transitions per update; limits convolutional activation memory
 vector_env: async # async (spawned subprocesses) or sync
 num_steps: 64 # ~4.3 seconds per sequence at action repeat 4; memory carries across chunks
-d_model: 224 # ~10.020M total parameters for this config: (1,84,84,3) observations and 6 actions
+d_model: 576 # ~50.567M total parameters for this config: (1,84,84,3) observations and 6 actions
 num_layers: 4 # Independent Mamba blocks, each with its own recurrent carry
 d_intermediate: null # SwiGLU width: null uses int(8*d_model/3), rounded up to 128; 0 disables the MLP
 encoder_stages: # 84 -> 42 -> 21 -> 11 -> 6 spatial sizes; decoder mirrors these stages
-  - { channels: 16, blocks: 2, project: true }
   - { channels: 32, blocks: 2, project: true }
   - { channels: 64, blocks: 2, project: true }
   - { channels: 128, blocks: 2, project: true }
-d_state: 64 # Mamba state width; even and at least 4
-headdim: 32 # Must divide 2 * d_model
+  - { channels: 256, blocks: 2, project: true }
+d_state: 128 # Mamba state width; even and at least 4
+headdim: 64 # Must divide 2 * d_model
 stochastic_size: 32 # Number of categorical latent variables
-stochastic_classes: 16 # Classes per latent variable; sampled once per state
+stochastic_classes: 32 # Classes per latent variable; sampled once per state
 unimix: 0.01 # Uniform probability mixture for prior and posterior
 dynamics_kl_scale: 1.0 # Train the prior toward a stopped-gradient posterior
 representation_kl_scale: 0.1 # Regularize the posterior toward a stopped-gradient prior
@@ -33,6 +33,6 @@ log_flush_secs: 30 # Background TensorBoard flush interval; also flush after pro
 checkpoint_dir: gs://cohere-dev/vlad/rl2_cp/wm # Uses the same run name as log_dir; saves checkpoint.msgpack and config.json
 checkpoint_every: 500 # Every ~256k transitions, plus the final checkpoint
 video_every_steps: 100000 # Collected transitions; record after the rollout crossing each interval; 0 disables
-video_prefill_frames: 10 # Real frames shown and observed before sampling imagined states
-video_num_steps: 64 # ~4.3 seconds of sampled imagination; fixed horizon, ignoring predicted termination
+video_prefill_frames: 10 # Shared real context before the real/posterior/prior comparison
+video_num_steps: 64 # Recorded future transitions compared side by side; needs 74 same-episode frames total
 video_fps: 15 # Matches 60 Hz emulator / action repeat 4

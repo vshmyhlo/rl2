@@ -220,7 +220,7 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         assert not frame_stack
         assert atari_preprocessing
         assert not grayscale_obs
-        env = ShortEpisodes()
+        env = ShortEpisodes(episode_length=6)
         environments.append(env)
         return env
 
@@ -248,7 +248,7 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         video_prefill_frames=2,
     )
     run_dir = train_wm.train(config)
-    assert flushes == ["flush"] * (4 if config.video_every_steps else 2) + ["close"]
+    assert flushes == ["flush"] * (3 if config.video_every_steps else 2) + ["close"]
     assert run_dir.startswith(f"{config.log_dir.rstrip('/')}/ALE_SpaceInvaders-v5_seed1_")
     run_name = run_dir.rsplit("/", 1)[-1]
     checkpoint_run_dir = f"{config.checkpoint_dir.rstrip('/')}/{run_name}"
@@ -291,12 +291,13 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
     assert config.log_dir in config_text
     assert events.Tensors("devices/text_summary")
     if config.video_every_steps:
-        videos = events.Images("imagination/random_policy")
-        assert [video.step for video in videos] == [6, 10]
-        assert all(video.width == 2 and video.height == 2 for video in videos)
+        videos = events.Images("imagination/real_posterior_prior")
+        # The first chunk has too little history; the next spans both chunks.
+        assert [video.step for video in videos] == [10]
+        assert all(video.width == 6 and video.height == 20 for video in videos)
         assert all(video.encoded_image_string.startswith(b"GIF") for video in videos)
     else:
-        assert "imagination/random_policy" not in events.Tags()["images"]
+        assert "imagination/real_posterior_prior" not in events.Tags()["images"]
     assert all(env.closed for env in environments)
     assert not (local_checkpoint_dir / "checkpoint.msgpack.tmp").exists()
 
@@ -337,9 +338,10 @@ def test_invalid_config(options: dict[str, Any]) -> None:
 
 
 @pytest.mark.parametrize("num_frames", [1, 10])
-def test_imagination_prefills_real_frames_and_feeds_back_sampled_latents(num_frames: int) -> None:
+def test_comparison_aligns_branches_and_keeps_future_frames_out_of_imagination(num_frames: int) -> None:
+    shape = (2, 3, 4, 3) if num_frames == 10 else (2, 3, 4)
     model = MambaWorldModel(
-        (2, 3, 4),
+        shape,
         3,
         d_model=8,
         num_layers=2,
@@ -350,16 +352,19 @@ def test_imagination_prefills_real_frames_and_feeds_back_sampled_latents(num_fra
         stochastic_classes=4,
     )
     key = jax.random.key(8)
-    observations = jax.random.randint(key, (num_frames, 1, 2, 3, 4), 0, 256, jnp.uint8)
-    prefill_actions = (jnp.arange(num_frames - 1, dtype=jnp.int32) % 3)[:, None]
-    actions = jnp.array([[0], [1], [2]], jnp.int32)
+    observations = jax.random.randint(key, (num_frames + 3, 1, *shape), 0, 256, jnp.uint8)
+    actions = (jnp.arange(num_frames + 2, dtype=jnp.int32) % 3)[:, None]
+    prefill_actions = actions[: num_frames - 1]
+    future_actions = actions[num_frames - 1 :]
     variables = model.init(key, observations[0], actions[0], observations[0], key)
     state = TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optax.sgd(0.01))
-    frames = train_wm.imagine_frames(state, model, observations, prefill_actions, actions, key)
-    chex.assert_shape(frames, (num_frames + 3, 2, 3, 4))
+    frames = train_wm.comparison_frames(state, model, observations, actions, num_frames, key)
+    chex.assert_shape(frames, (3, num_frames + 3, *shape))
     chex.assert_type(frames, jnp.float32)
-    np.testing.assert_array_equal(frames[:num_frames], observations[:, 0].astype(jnp.float32) / 255.0)
-    prefill_key, imagination_key = jax.random.split(key)
+    np.testing.assert_array_equal(frames[0], observations[:, 0].astype(jnp.float32) / 255.0)
+    for panel in frames[1:]:
+        np.testing.assert_array_equal(panel[:num_frames], frames[0, :num_frames])
+    prefill_key, imagination_key, posterior_key = jax.random.split(key, 3)
     history = model.initial_carry(1)
     if num_frames > 1:
         keys = jax.random.split(prefill_key, num_frames - 1)
@@ -373,21 +378,54 @@ def test_imagination_prefills_real_frames_and_feeds_back_sampled_latents(num_fra
         history = model.apply(
             variables, observations[0], history, jnp.ones(1, jnp.bool_), prefill_key, method=model.condition
         )
-    for index, (action, sample_key) in enumerate(zip(actions, jax.random.split(imagination_key, 3))):
+    prefilled_history = history
+    posterior_history = history
+    posterior_keys = jax.random.split(posterior_key, 3)
+    posterior_logits: list[jax.Array] = []
+    for index, (action, sample_key) in enumerate(zip(future_actions, jax.random.split(imagination_key, 3))):
         history, prediction = model.apply(variables, history, action, sample_key, method=model.imagine)
-        np.testing.assert_allclose(frames[num_frames + index], prediction.observation[0], atol=3e-6)
-    repeat = train_wm.imagine_frames(state, model, observations, prefill_actions, actions, key)
+        np.testing.assert_allclose(frames[2, num_frames + index], prediction.observation[0], atol=3e-6)
+        t = num_frames - 1 + index
+        posterior_history, output = model.apply(
+            variables,
+            observations[t],
+            action,
+            observations[t + 1],
+            posterior_keys[index],
+            posterior_history,
+            method=model.observe,
+        )
+        posterior_logits.append(output.posterior_logits)
+        np.testing.assert_allclose(frames[1, num_frames + index], output.prediction.observation[0], atol=3e-6)
+    repeat = train_wm.comparison_frames(state, model, observations, actions, num_frames, key)
     np.testing.assert_array_equal(frames, repeat)
+    # The posterior sees targets, but imagination must not leak any future pixels.
+    changed_targets = observations.at[num_frames:].set(255 - observations[num_frames:])
+    altered = train_wm.comparison_frames(state, model, changed_targets, actions, num_frames, key)
+    np.testing.assert_array_equal(frames[2], altered[2])
+    _, changed_output = model.apply(
+        variables,
+        changed_targets[num_frames - 1 : -1],
+        future_actions,
+        changed_targets[num_frames:],
+        posterior_keys,
+        prefilled_history,
+        method=model.observe,
+    )
+    # Different posterior probabilities can yield the same discrete sample.
+    assert not np.allclose(jnp.stack(posterior_logits), changed_output.posterior_logits)
+    np.testing.assert_allclose(altered[1, num_frames:], changed_output.prediction.observation[:, 0], atol=3e-6)
+    changed_actions = actions.at[num_frames - 1, 0].set((actions[num_frames - 1, 0] + 1) % 3)
+    altered = train_wm.comparison_frames(state, model, observations, changed_actions, num_frames, key)
+    assert not np.allclose(frames[2, num_frames:], altered[2, num_frames:])
     if num_frames > 1:
-        altered = train_wm.imagine_frames(state, model, observations, prefill_actions.at[0, 0].set(1), actions, key)
-        assert not np.allclose(frames[num_frames:], altered[num_frames:])
+        altered = train_wm.comparison_frames(state, model, observations, actions.at[0, 0].set(1), num_frames, key)
+        assert not np.allclose(frames[2, num_frames:], altered[2, num_frames:])
 
 
 @pytest.mark.parametrize("rgb", [False, True])
-def test_video_uses_newest_frame_clips_pixels_and_has_repeatable_actions(
-    monkeypatch: pytest.MonkeyPatch, rgb: bool
-) -> None:
-    shape = (2, 3, 4, 3) if rgb else (2, 3, 4)
+def test_video_orders_labeled_panels_and_uses_recorded_actions(monkeypatch: pytest.MonkeyPatch, rgb: bool) -> None:
+    shape = (2, 3, 84, 3) if rgb else (2, 3, 84)
     model = MambaWorldModel(
         shape,
         3,
@@ -400,10 +438,11 @@ def test_video_uses_newest_frame_clips_pixels_and_has_repeatable_actions(
         stochastic_classes=4,
     )
     config = training_config(video_num_steps=2, video_prefill_frames=10, video_fps=12)
-    frames = np.ones((12, *shape), np.float32)
-    frames[:, -1] = np.tile(np.array([-1, 0.5, 2], np.float32), 4).reshape((12,) + (1,) * (len(shape) - 1))
-    imagine = Mock(return_value=jnp.asarray(frames))
-    monkeypatch.setattr(train_wm, "imagine_frames", imagine)
+    frames = np.ones((3, 12, *shape), np.float32)
+    frames[:, :, -1] = np.array([-1, 0.5, 2], np.float32).reshape((3, 1) + (1,) * (len(shape) - 1))
+    compare = Mock(return_value=jnp.asarray(frames))
+    monkeypatch.setattr(train_wm, "comparison_frames", compare)
+    actions = (np.arange(11, dtype=np.int32) % 3)[:, None]
     writer = Mock()
     state = Mock(spec=TrainState)
     for steps in (10, 20):
@@ -412,23 +451,29 @@ def test_video_uses_newest_frame_clips_pixels_and_has_repeatable_actions(
             model,
             config,
             writer,
-            np.zeros((10, 1, *shape), np.uint8),
-            np.zeros((9, 1), np.int32),
+            np.zeros((12, 1, *shape), np.uint8),
+            actions,
             steps,
         )
     call = writer.add_video.call_args
-    assert call.args[0] == "imagination/random_policy"
+    assert call.args[0] == "imagination/real_posterior_prior"
     assert call.args[2] == 20
     assert call.kwargs["fps"] == 12
     assert writer.flush.call_count == 2
     video = call.args[1]
-    chex.assert_shape(video, (1, 12, 3 if rgb else 1, 3, 4))
+    chex.assert_shape(video, (1, 12, 3, 21, 252))
     chex.assert_type(video, np.uint8)
-    for frame, value in zip(video[0], (0, 128, 255) * 4):
-        np.testing.assert_array_equal(frame, np.full_like(frame, value))
-    np.testing.assert_array_equal(imagine.call_args_list[0].args[-2], imagine.call_args_list[1].args[-2])
+    for panel, value in enumerate((0, 128, 255)):
+        pixels = video[0, :, :, 18:, panel * 84 : (panel + 1) * 84]
+        np.testing.assert_array_equal(pixels, np.full_like(pixels, value))
+    # The header visibly changes from shared context to the three panel labels.
+    assert video[0, 0, :, :18].any()
+    assert not np.array_equal(video[0, 0, :, :18], video[0, 10, :, :18])
+    for comparison_call in compare.call_args_list:
+        np.testing.assert_array_equal(comparison_call.args[3], actions)
+        assert comparison_call.args[4] == 10
     np.testing.assert_array_equal(
-        jax.random.key_data(imagine.call_args_list[0].args[-1]), jax.random.key_data(imagine.call_args_list[1].args[-1])
+        jax.random.key_data(compare.call_args_list[0].args[-1]), jax.random.key_data(compare.call_args_list[1].args[-1])
     )
 
 
@@ -572,13 +617,13 @@ def test_video_prefill_history_spans_chunks_and_excludes_episode_boundaries() ->
         episode_starts=jnp.zeros((12, 2), jnp.bool_),
     )
     history = train_wm.update_video_history(None, jax.tree.map(lambda x: x[:4], batch), 10)
-    assert train_wm.select_video_prefill(history, np.zeros(2, np.bool_), 10) is None
+    assert train_wm.select_video_window(history, np.zeros(2, np.bool_), 10) is None
     for start in (4, 8):
         history = train_wm.update_video_history(
             history, jax.tree.map(lambda x, start=start: x[start : start + 4], batch), 10
         )
     assert history.actions.shape == (9, 2)
-    selected = train_wm.select_video_prefill(history, np.zeros(2, np.bool_), 10)
+    selected = train_wm.select_video_window(history, np.zeros(2, np.bool_), 10)
     assert selected is not None
     frames, actions = selected
     chex.assert_shape(frames, (10, 1, 1, 1, 1))
@@ -587,14 +632,14 @@ def test_video_prefill_history_spans_chunks_and_excludes_episode_boundaries() ->
     np.testing.assert_array_equal(actions, batch.actions[3:, :1])
     # A reset at the first prefill frame is fine; one inside the window is not.
     history = history.replace(episode_starts=history.episode_starts.at[0].set(True).at[4, 0].set(True))
-    selected = train_wm.select_video_prefill(history, np.zeros(2, np.bool_), 10)
+    selected = train_wm.select_video_window(history, np.zeros(2, np.bool_), 10)
     assert selected is not None
     np.testing.assert_array_equal(selected[0][:, 0, 0, 0, 0], np.arange(7, 27, 2))
     # Do not seed imagination from the terminal/truncated target immediately
     # before a reset, even if the window itself contains no reset flags.
-    assert train_wm.select_video_prefill(history, np.array([False, True]), 10) is None
+    assert train_wm.select_video_window(history, np.array([False, True]), 10) is None
     history = history.replace(terminated=history.terminated.at[-1, 1].set(True))
-    assert train_wm.select_video_prefill(history, np.zeros(2, np.bool_), 10) is None
+    assert train_wm.select_video_window(history, np.zeros(2, np.bool_), 10) is None
 
 
 def test_video_prefill_one_frame_uses_last_live_target() -> None:
@@ -603,7 +648,7 @@ def test_video_prefill_one_frame_uses_last_live_target() -> None:
         obs, _ = envs.reset(seed=1)
         batch, _, starts = train_wm.collect_rollout(envs, obs, np.ones(1, np.bool_), np.random.default_rng(1), 1)
         history = train_wm.update_video_history(None, batch, 1)
-        selected = train_wm.select_video_prefill(history, starts, 1)
+        selected = train_wm.select_video_window(history, starts, 1)
         assert selected is not None
         frames, actions = selected
         np.testing.assert_array_equal(frames, batch.next_observations)
