@@ -15,6 +15,7 @@ from time import monotonic
 from typing import Any, SupportsFloat
 
 import ale_py
+import chex
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
@@ -134,18 +135,27 @@ class RNDNetwork(nn.Module):
     predictor: bool = False
     channels: tuple[int, ...] = (32, 64, 64)
     feature_size: int = 512
+    dtype: jax.typing.DTypeLike = jnp.float32
 
     @nn.compact
     def __call__(self, obs: Array) -> jax.Array:
-        x = jnp.asarray(obs, dtype=jnp.float32)
+        chex.assert_rank(obs, 4)
+        chex.assert_type(obs, jnp.floating)
+        x = jnp.asarray(obs, dtype=self.dtype)
         init = nn.initializers.variance_scaling(2.0, "fan_in", "truncated_normal")
         for channels, kernel, stride in zip(self.channels, (8, 4, 3), (4, 2, 1)):
-            x = nn.leaky_relu(nn.Conv(channels, (kernel, kernel), strides=(stride, stride), kernel_init=init)(x))
+            x = nn.leaky_relu(
+                nn.Conv(channels, (kernel, kernel), strides=(stride, stride), kernel_init=init, dtype=self.dtype)(x)
+            )
         x = x.reshape((x.shape[0], -1))
         if self.predictor:
             for _ in range(2):
-                x = nn.relu(nn.Dense(self.feature_size, kernel_init=init)(x))
-        return nn.Dense(self.feature_size, kernel_init=init)(x)
+                x = nn.relu(nn.Dense(self.feature_size, kernel_init=init, dtype=self.dtype)(x))
+        x = nn.Dense(self.feature_size, kernel_init=init, dtype=self.dtype)(x)
+        chex.assert_shape(x, (obs.shape[0], self.feature_size))
+        chex.assert_type(x, self.dtype)
+        # Intrinsic rewards and predictor losses accumulate in float32.
+        return x.astype(jnp.float32)
 
 
 @jax.jit
@@ -241,7 +251,13 @@ class ActorCritic(nn.Module):
         episode_starts: Array,
     ) -> tuple[LSTMCarry, jax.Array, jax.Array]:
         # [steps, environments, frames, height, width, (RGB channels)].
+        chex.assert_rank(obs, {5, 6})
+        chex.assert_type(obs, jnp.uint8)
         steps, environments = obs.shape[:2]
+        chex.assert_shape(carry, (environments, self.lstm_hidden_size))
+        chex.assert_type(carry, jnp.float32)
+        chex.assert_shape(episode_starts, (steps, environments))
+        chex.assert_type(episode_starts, jnp.bool_)
         obs = obs.reshape((-1, *obs.shape[2:]))
         if obs.ndim == 5:  # Raw RGB: combine stacked frames and color channels.
             x = jnp.transpose(obs, (0, 2, 3, 1, 4))
@@ -277,12 +293,12 @@ class ActorCritic(nn.Module):
         policy = nn.relu(nn.LayerNorm(name="policy_norm", dtype=self.dtype)(policy))
         critic = nn.Dense(512, kernel_init=init, name="value_hidden", dtype=self.dtype)(x)
         critic = nn.relu(nn.LayerNorm(name="value_norm", dtype=self.dtype)(critic))
-        # Float32 heads keep action probabilities, values, and PPO losses precise.
+        # Heads use the compute dtype; float32 outputs keep PPO loss arithmetic precise.
         logits = nn.Dense(
-            self.num_actions, kernel_init=nn.initializers.orthogonal(0.01), name="policy_output", dtype=jnp.float32
+            self.num_actions, kernel_init=nn.initializers.orthogonal(0.01), name="policy_output", dtype=self.dtype
         )(policy)
-        value = nn.Dense(2, kernel_init=nn.initializers.orthogonal(1.0), name="value_output", dtype=jnp.float32)(critic)
-        return carry, logits, value
+        value = nn.Dense(2, kernel_init=nn.initializers.orthogonal(1.0), name="value_output", dtype=self.dtype)(critic)
+        return carry, logits.astype(jnp.float32), value.astype(jnp.float32)
 
 
 class AtariPreprocessing(gym.wrappers.AtariPreprocessing):
@@ -569,7 +585,9 @@ def train(config: Config) -> TrainState:
         key, init_key, predictor_key, target_key = jax.random.split(jax.random.key(config.seed), 4)
         # Keep RND's random stream independent of policy sampling and evaluation.
         rnd_key = jax.random.fold_in(key, 1)
-        predictor_model, target_model = RNDNetwork(predictor=True), RNDNetwork()
+        compute_dtype = jnp.bfloat16 if config.bf16 else jnp.float32
+        predictor_model = RNDNetwork(predictor=True, dtype=compute_dtype)
+        target_model = RNDNetwork(dtype=compute_dtype)
         rnd_example = normalize_rnd_observations(rnd_frames(obs[:1]), obs_moments)
         predictor = TrainState.create(
             apply_fn=predictor_model.apply,
@@ -584,7 +602,7 @@ def train(config: Config) -> TrainState:
         model = ActorCritic(
             envs.single_action_space.n,
             config.lstm_hidden_size,
-            dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
+            dtype=compute_dtype,
             encoder_channels=config.encoder_channels,
             embedding_size=config.embedding_size,
         )

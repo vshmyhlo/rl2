@@ -30,7 +30,7 @@ def generate(root: Path, destination: Path) -> None:
     def save(name: str, tensor: torch.Tensor) -> None:
         arrays[name] = tensor.detach().numpy().copy()
 
-    for rank, rms_norm, width in ((1, True, 16), (2, True, 16), (1, False, 0)):
+    for rank, rms_norm, width in ((1, True, 16), (2, True, 16), (1, False, 0), (4, True, 16), (2, False, 16)):
         torch.manual_seed(703 + rank + width)
         prefix = f"r{rank}_rms{int(rms_norm)}_w{width}"
         norm_cls = partial(nn.RMSNorm if rms_norm else nn.LayerNorm, eps=1e-5)

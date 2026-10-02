@@ -18,7 +18,9 @@ def assert_carry_close(actual: Mamba3StackCarry, expected: Mamba3StackCarry) -> 
         np.testing.assert_allclose(a, b, rtol=3e-5, atol=3e-6)
 
 
-@pytest.mark.parametrize("rank,rms_norm,width", [(1, True, 16), (2, True, 16), (1, False, 0)])
+@pytest.mark.parametrize(
+    "rank,rms_norm,width", [(1, True, 16), (2, True, 16), (1, False, 0), (4, True, 16), (2, False, 16)]
+)
 def test_matches_official_blocks_outputs_states_and_gradients(rank: int, rms_norm: bool, width: int) -> None:
     """Fixtures execute upstream Block, GatedMLP and Mamba3 with CPU kernels."""
     model = Mamba3Stack(
@@ -209,3 +211,34 @@ def test_invalid_input_carry_and_reset() -> None:
             model.apply(variables, x, episode_starts=bad)
     with pytest.raises(AssertionError):
         model.apply(variables, x[0], episode_starts=jnp.zeros((1, 2), jnp.bool_), method=model.step)
+
+
+@pytest.mark.parametrize("final_norm", [False, True])
+def test_layernorm_stack_is_stable_under_large_input_offsets(final_norm: bool) -> None:
+    """A featurewise constant offset must not change any normalized branch.
+
+    Exercise both prenorms and the final norm. Flax's default fast variance
+    loses the small feature variance at this offset, unlike torch LayerNorm.
+    Integer-valued inputs avoid introducing input quantization differences.
+    """
+    model = Mamba3Stack(
+        8,
+        2,
+        d_state=8,
+        headdim=4,
+        d_intermediate=16,
+        mlp_multiple_of=1,
+        rms_norm=False,
+        final_norm=final_norm,
+    )
+    x = jnp.arange(48, dtype=jnp.float32).reshape(3, 2, 8) % 11
+    variables = model.init(jax.random.key(19), x)
+    forward = jax.jit(model.apply)
+    carry, y = forward(variables, x)
+    shifted_carry, shifted_y = forward(variables, x + 10000)
+    if not final_norm:
+        shifted_y = shifted_y - 10000
+    # Residual additions at magnitude 1e4 round to about 1e-3 in float32.
+    np.testing.assert_allclose(shifted_y, y, rtol=1e-3, atol=2e-3)
+    for a, b in zip(jax.tree.leaves(shifted_carry), jax.tree.leaves(carry)):
+        np.testing.assert_allclose(a, b, rtol=2e-3, atol=5e-4)

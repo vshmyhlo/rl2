@@ -28,6 +28,7 @@ def test_projection_budget(height: int, width: int, limit: int | None, flattened
     obs = jax.ShapeDtypeStruct((2, 1, height, width, 3), jnp.uint8)
     variables = jax.eval_shape(model.init, jax.random.key(0), obs)
     params = variables["params"]
+    assert params["stem"]["kernel"].shape == (7, 7, 3, model.encoder_channels[0])
     assert params["Dense_0"]["kernel"].shape == (flattened, 768)
     assert len([name for name in params if name.startswith("Conv_")]) == len(model.encoder_channels)
     assert len([name for name in params if name.startswith("stage_")]) == len(model.encoder_channels) + stages
@@ -63,6 +64,13 @@ def test_extra_stages_support_jit_and_gradients(dtype: jax.typing.DTypeLike) -> 
     output, captured = jax.jit(partial(model.apply, capture_intermediates=True, mutable=["intermediates"]))(
         variables, obs
     )
+    stem = captured["intermediates"]["stem"]["__call__"][0]
+    chex.assert_shape(stem, (2, 17, 13, 4))
+    chex.assert_type(stem, dtype)
+    normalized_stem = captured["intermediates"]["stem_norm"]["__call__"][0]
+    chex.assert_equal_shape((stem, normalized_stem))
+    chex.assert_type(normalized_stem, dtype)
+    assert variables["params"]["stem"]["kernel"].shape == (7, 7, 2, 4)
     chex.assert_shape(captured["intermediates"]["Conv_0"]["__call__"][0], (2, 9, 7, 4))
     chex.assert_shape(output, (2, 8))
     chex.assert_type(output, dtype)
@@ -79,4 +87,5 @@ def test_extra_stages_support_jit_and_gradients(dtype: jax.typing.DTypeLike) -> 
     chex.assert_trees_all_equal_shapes_and_dtypes(gradients, variables["params"])
     for gradient in jax.tree.leaves(gradients):
         assert np.isfinite(gradient).all()
+    assert np.any(np.asarray(gradients["stem"]["kernel"]) != 0)
     assert np.any(np.asarray(gradients["stage_3_block_0"]["Conv_0"]["kernel"]) != 0)

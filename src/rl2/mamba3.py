@@ -9,9 +9,12 @@ Sequences are time-major, matching rl2's recurrent policies. This reference uses
 ``lax.scan``, not the upstream fused CUDA/chunked SSD kernels. ``Mamba3`` is a
 mixer; ``Mamba3Stack`` adds pre-norm residual layers and SwiGLU feed-forwards.
 Neither includes an embedding or prediction head.
-Parameters and recurrent accumulation remain float32 with bf16 projections.
-This intentionally differs from the intermediate rounding of upstream fused
-mixed-precision kernels. As in upstream's ``_no_weight_decay`` metadata, callers
+Parameters and recurrent accumulation remain float32; projection precision is
+controlled by ``dtype`` (float32 by default). Normalization statistics also use
+float32, including the stack's residual stream before casting norm outputs.
+This intentionally differs from the intermediate rounding of upstream
+mixed-precision paths, so this is not a bitwise reproduction of CUDA kernels.
+As in upstream's ``_no_weight_decay`` metadata, callers
 using weight decay should exclude ``dt_bias`` and ``D`` from it.
 
 Example::
@@ -311,12 +314,14 @@ class _Mamba3Block(nn.Module):
         dtype = self.mixer.dtype
         residual_dtype = jnp.float32 if self.residual_in_fp32 else dtype
         x = x.astype(residual_dtype)
-        normalized = norm_cls(epsilon=self.norm_epsilon, dtype=dtype, name="norm")(x)
+        # PyTorch LayerNorm uses centered variance. E[x^2] - E[x]^2 can
+        # catastrophically cancel for large-offset inputs in float32.
+        normalized = norm_cls(epsilon=self.norm_epsilon, dtype=dtype, use_fast_variance=False, name="norm")(x)
         # The mixer validates all carry leaves and the reset mask.
         carry, y = self.mixer(normalized, carry, episode_starts)
         x = x + y.astype(residual_dtype)
         if self.d_intermediate:
-            y = norm_cls(epsilon=self.norm_epsilon, dtype=dtype, name="norm2")(x)
+            y = norm_cls(epsilon=self.norm_epsilon, dtype=dtype, use_fast_variance=False, name="norm2")(x)
             linear_init = nn.initializers.variance_scaling(1 / 3, "fan_in", "uniform")
             y = nn.Dense(2 * self.d_intermediate, use_bias=False, kernel_init=linear_init, dtype=dtype, name="fc1")(y)
             value, gate = jnp.split(y, 2, axis=-1)
@@ -433,7 +438,7 @@ class Mamba3Stack(nn.Module):
         )
         if self.final_norm:
             norm_cls = nn.RMSNorm if self.rms_norm else nn.LayerNorm
-            self.norm_f = norm_cls(epsilon=self.norm_epsilon, dtype=self.dtype)
+            self.norm_f = norm_cls(epsilon=self.norm_epsilon, dtype=self.dtype, use_fast_variance=False)
 
     @nn.nowrap
     def initial_carry(self, batch_size: int) -> Mamba3StackCarry:

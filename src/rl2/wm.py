@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax import struct
 
-from rl2.mamba3 import Mamba3, Mamba3Carry
+from rl2.mamba3 import Mamba3Stack, Mamba3StackCarry
 from rl2.observation_encoder import ConvObservationEncoder
 
 
@@ -107,11 +107,11 @@ class WorldModel(nn.Module):
         return latent, self.decode(latent)
 
 
-type RecurrentPrediction = tuple[Mamba3Carry, jax.Array, Prediction]
+type RecurrentPrediction = tuple[Mamba3StackCarry, jax.Array, Prediction]
 
 
 class MambaWorldModel(WorldModel):
-    """Convolutional observation encoder and MLP decoder around Mamba dynamics.
+    """Convolutional encoder and MLP decoder around a stack of Mamba blocks.
 
     Observations must be uint8 Atari frames, with shape
     ``[batch, *observation_shape]`` or ``[time, batch, *observation_shape]``.
@@ -129,7 +129,8 @@ class MambaWorldModel(WorldModel):
     Both return ``(carry, next_latent, prediction)`` and accept episode-start
     masks that clear history before the corresponding input. After a reset,
     use ``observe`` with the new initial observation to replace the old latent.
-    A sequence returns all predicted latents but only the final carry.
+    Carry is a tuple with one recurrent state per stack layer. A sequence
+    returns all predicted latents but only the final carry for each layer.
 
     Example::
 
@@ -141,7 +142,8 @@ class MambaWorldModel(WorldModel):
         carry, latent, prediction = model.apply(variables, latent, actions, carry, method=model.imagine)
 
     Parameters, returned latents, predictions, and carry remain float32;
-    ``dtype`` controls the internal projection precision.
+    ``dtype`` controls all convolution, embedding, and dense layer computation,
+    including prediction heads. Head outputs are cast to float32 for losses.
 
     Args:
         observation_shape: Positive dimensions ``[frames, height, width]`` for
@@ -161,6 +163,10 @@ class MambaWorldModel(WorldModel):
         dtype: Internal projection dtype: float32, bfloat16, or float16.
         encoder_max_flattened_size: Maximum encoder features before projection;
             None disables automatic extra downsampling stages.
+        num_layers: Positive number of independently parameterized Mamba blocks.
+        d_intermediate: SwiGLU width inside each block. None uses the stack's
+            default int(8*d_model/3), rounded up to a multiple of 128; positive
+            explicit widths use the same rounding. Zero disables the MLP.
     """
 
     observation_shape: tuple[int, ...]
@@ -173,12 +179,16 @@ class MambaWorldModel(WorldModel):
     encoder_channels: tuple[int, ...] = (32, 64, 128, 256)
     dtype: jax.typing.DTypeLike = jnp.float32
     encoder_max_flattened_size: int | None = 8192
+    num_layers: int = 4
+    d_intermediate: int | None = None
 
     @nn.nowrap
-    def _make_mixer(self) -> Mamba3:
-        """Return an unbound Mamba-3 mixer configured from this model's fields."""
-        return Mamba3(
+    def _make_dynamics(self) -> Mamba3Stack:
+        """Return an unbound feature-processing stack with independent layers."""
+        return Mamba3Stack(
             d_model=self.d_model,
+            num_layers=self.num_layers,
+            d_intermediate=self.d_intermediate,
             d_state=self.d_state,
             expand=self.expand,
             headdim=self.headdim,
@@ -206,28 +216,27 @@ class MambaWorldModel(WorldModel):
         )
         self.action_embedding = nn.Embed(self.num_actions, self.d_model, dtype=self.dtype)
         self.input_projection = nn.Dense(self.d_model, dtype=self.dtype)
-        self.pre_norm = nn.LayerNorm(dtype=self.dtype)
-        self.mixer = self._make_mixer()
-        self.post_norm = nn.LayerNorm(dtype=jnp.float32)
+        self.dynamics = self._make_dynamics()
         self.decoder_hidden = nn.Dense(self.d_model, dtype=self.dtype)
-        self.observation_head = nn.Dense(math.prod(self.observation_shape), dtype=jnp.float32)
-        self.outcome_head = nn.Dense(2, dtype=jnp.float32)
+        self.observation_head = nn.Dense(math.prod(self.observation_shape), dtype=self.dtype)
+        self.outcome_head = nn.Dense(2, dtype=self.dtype)
 
     @nn.nowrap
-    def initial_carry(self, batch_size: int) -> Mamba3Carry:
+    def initial_carry(self, batch_size: int) -> Mamba3StackCarry:
         """Allocate zero Mamba history without initializing model parameters.
 
         Args:
             batch_size: Positive number of independent environments or streams.
 
         Returns:
-            A zero-filled float32 ``Mamba3Carry`` containing the recurrent
-            state, previous key/value, and rotary angle. Each leaf has leading
-            dimension ``batch_size`` and trailing dimensions set by the mixer.
+            A ``Mamba3StackCarry`` tuple with ``num_layers`` independent states.
+            Each layer contains zero-filled float32 recurrent state, previous
+            key/value, and rotary angle arrays. Every leaf has leading dimension
+            ``batch_size`` and trailing dimensions set by the mixer.
         """
         chex.assert_type(batch_size, int)
         chex.assert_scalar_positive(batch_size)
-        return self._make_mixer().initial_carry(batch_size)
+        return self._make_dynamics().initial_carry(batch_size)
 
     @nn.nowrap
     def _check_latent(self, latent: jax.Array) -> None:
@@ -275,9 +284,9 @@ class MambaWorldModel(WorldModel):
         self,
         latent: jax.Array,
         action: jax.Array,
-        carry: Mamba3Carry | None = None,
+        carry: Mamba3StackCarry | None = None,
         episode_starts: jax.Array | None = None,
-    ) -> tuple[Mamba3Carry, jax.Array]:
+    ) -> tuple[Mamba3StackCarry, jax.Array]:
         """Apply action-conditioned recurrent dynamics to supplied latents.
 
         Args:
@@ -285,7 +294,8 @@ class MambaWorldModel(WorldModel):
                 or ``[time, batch, d_model]``.
             action: Integer action IDs in ``[0, num_actions)``, shaped
                 ``[batch]`` or ``[time, batch]`` to match ``latent``.
-            carry: Float32 Mamba history matching the model and batch size.
+            carry: Tuple of float32 Mamba states, one per layer, matching the
+                model and batch size.
                 ``None`` initializes zero history. Gradients flow through a
                 supplied carry unless the caller applies ``stop_gradient``.
             episode_starts: Boolean reset mask with the same shape as
@@ -308,12 +318,12 @@ class MambaWorldModel(WorldModel):
             chex.assert_type(episode_starts, bool)
         action_features = self.action_embedding(action).astype(jnp.float32)
         inputs = self.input_projection(jnp.concatenate((latent, action_features), axis=-1)).astype(jnp.float32)
-        normalized = self.pre_norm(inputs)
+        # The stack owns its pre-norms, residual additions, MLPs, and final norm.
         if latent.ndim == 2:
-            carry, mixed = self.mixer.step(normalized, carry, episode_starts)
+            carry, next_latent = self.dynamics.step(inputs, carry, episode_starts)
         else:
-            carry, mixed = self.mixer(normalized, carry, episode_starts)
-        next_latent = self.post_norm(inputs + mixed.astype(jnp.float32))
+            carry, next_latent = self.dynamics(inputs, carry, episode_starts)
+        next_latent = next_latent.astype(jnp.float32)
         chex.assert_equal_shape((latent, next_latent))
         chex.assert_type(next_latent, jnp.float32)
         return carry, next_latent
@@ -352,8 +362,9 @@ class MambaWorldModel(WorldModel):
         """
         self._check_latent(latent)
         hidden = nn.silu(self.decoder_hidden(latent))
-        observation = self.observation_head(hidden).reshape((*latent.shape[:-1], *self.observation_shape))
-        outcomes = self.outcome_head(hidden)
+        observation = self.observation_head(hidden).astype(jnp.float32)
+        observation = observation.reshape((*latent.shape[:-1], *self.observation_shape))
+        outcomes = self.outcome_head(hidden).astype(jnp.float32)
         chex.assert_shape(outcomes, (*latent.shape[:-1], 2))
         chex.assert_type((observation, outcomes), jnp.float32)
         return Prediction(observation, outcomes[..., 0], outcomes[..., 1])
@@ -362,7 +373,7 @@ class MambaWorldModel(WorldModel):
         self,
         observation: jax.Array,
         action: jax.Array,
-        carry: Mamba3Carry | None = None,
+        carry: Mamba3StackCarry | None = None,
         episode_starts: jax.Array | None = None,
     ) -> RecurrentPrediction:
         """Predict from actual observations, preserving history across calls.
@@ -374,7 +385,8 @@ class MambaWorldModel(WorldModel):
             action: Integer IDs in ``[0, num_actions)``, shaped ``[batch]`` or
                 ``[time, batch]``. At index t, the action is taken from
                 observation t, and the prediction targets observation t+1.
-            carry: Float32 history matching this model and batch size, or
+            carry: Tuple of float32 states, one per layer, matching this model
+                and batch size, or
                 ``None`` to start with zero history. It is not detached from
                 the gradient graph automatically.
             episode_starts: Boolean mask matching ``action``; True resets
@@ -395,7 +407,7 @@ class MambaWorldModel(WorldModel):
         self,
         latent: jax.Array,
         action: jax.Array,
-        carry: Mamba3Carry | None = None,
+        carry: Mamba3StackCarry | None = None,
         episode_starts: jax.Array | None = None,
     ) -> RecurrentPrediction:
         """Advance supplied latents without observations and decode predictions.
@@ -409,7 +421,8 @@ class MambaWorldModel(WorldModel):
                 ``encode`` and then use the previous predicted latent.
             action: Integer IDs in ``[0, num_actions)``, shaped ``[batch]`` or
                 ``[time, batch]`` to match ``latent``.
-            carry: Float32 history matching this model and batch size, or
+            carry: Tuple of float32 states, one per layer, matching this model
+                and batch size, or
                 ``None`` for zero history. Use the previous returned carry to
                 continue a rollout; detach it explicitly for truncated BPTT.
             episode_starts: Boolean mask matching ``action``; True clears

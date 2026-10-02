@@ -175,6 +175,8 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
     )({"params": params}, obs, carry, starts)
     assert captured["intermediates"]["encoder"]["Conv_0"]["__call__"][0].dtype == jnp.bfloat16
     assert captured["intermediates"]["policy_hidden"]["__call__"][0].dtype == jnp.bfloat16
+    assert captured["intermediates"]["policy_output"]["__call__"][0].dtype == jnp.bfloat16
+    assert captured["intermediates"]["value_output"]["__call__"][0].dtype == jnp.bfloat16
     for array in (*final, logits, values, *jax.tree.leaves(params)):
         assert array.dtype == jnp.float32
     state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(0.001))

@@ -37,6 +37,8 @@ class ResidualBlock(nn.Module):
 class ConvObservationEncoder(nn.Module):
     """Encode uint8 observations shaped [batch, frames, height, width, (RGB)].
 
+    A 7x7 stem convolution followed by LayerNorm and ReLU extracts features at
+    the original resolution using the first configured channel width.
     After the configured stages, repeat the final channel width with additional
     downsampling stages until the flattened size is at most max_flattened_size.
     Set the limit to None to use only encoder_channels. The limit must be at
@@ -75,6 +77,15 @@ class ConvObservationEncoder(nn.Module):
         # IMPALA-style stages; normalization is independent of rollout/minibatch size.
         # Variance scaling avoids expensive QR initialization of large visual kernels.
         visual_init = nn.initializers.variance_scaling(2.0, "fan_in", "truncated_normal")
+        x = nn.Conv(
+            self.encoder_channels[0],
+            (7, 7),
+            padding="SAME",
+            kernel_init=visual_init,
+            dtype=self.dtype,
+            name="stem",
+        )(x)
+        x = nn.relu(nn.LayerNorm(name="stem_norm", dtype=self.dtype)(x))
         stage_channels = self.encoder_channels
         # Each resize halves the spatial dimensions, rounding up at every stage.
         stride = 2 ** len(stage_channels)

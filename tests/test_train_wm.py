@@ -81,7 +81,7 @@ def test_random_collection_preserves_terminal_frames_and_reset_masks() -> None:
 
 
 def test_update_targets_losses_carry_and_learning() -> None:
-    model = MambaWorldModel((1, 2, 2), 3, d_model=8, d_state=4, headdim=4, encoder_channels=(4,))
+    model = MambaWorldModel((1, 2, 2), 3, d_model=8, num_layers=2, d_state=4, headdim=4, encoder_channels=(4,))
     batch = train_wm.Batch(
         observations=jnp.zeros((3, 2, 1, 2, 2), jnp.uint8),
         actions=jnp.arange(6, dtype=jnp.int32).reshape(3, 2) % 3,
@@ -108,7 +108,7 @@ def test_update_targets_losses_carry_and_learning() -> None:
     np.testing.assert_allclose(metrics["termination_loss"], expected_terminal, rtol=1e-5)
     np.testing.assert_allclose(metrics["loss"], expected_observation + expected_reward + expected_terminal, rtol=1e-5)
     chex.assert_trees_all_equal_shapes_and_dtypes(final, expected_carry)
-    for actual, expected in zip(final, expected_carry):
+    for actual, expected in zip(jax.tree.leaves(final), jax.tree.leaves(expected_carry)):
         np.testing.assert_allclose(actual, expected, atol=1e-6)
     first_loss = float(metrics["loss"])
     for _ in range(4):
@@ -179,6 +179,7 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         num_envs=2,
         num_steps=3,
         d_model=8,
+        num_layers=2,
         encoder_channels=(4,),
         d_state=4,
         headdim=4,
@@ -211,7 +212,7 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
     assert not (local_dir / "checkpoint.msgpack").exists()
     saved = serialization.msgpack_restore((local_checkpoint_dir / "checkpoint.msgpack").read_bytes())
     assert int(saved["step"]) == 2
-    assert "mixer" in saved["params"]
+    assert "layers_1" in saved["params"]["dynamics"]
     assert "opt_state" in saved
     metadata = json.loads((local_dir / "config.json").read_text())
     assert json.loads((local_checkpoint_dir / "config.json").read_text()) == metadata
@@ -249,6 +250,8 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         {"log_flush_secs": -1},
         {"encoder_channels": ()},
         {"encoder_channels": (4, 0)},
+        {"num_layers": 0},
+        {"d_intermediate": -1},
         {"encoder_max_flattened_size": 0},
         {"encoder_max_flattened_size": 3},
         {"encoder_max_flattened_size": 8192.5},
@@ -260,7 +263,7 @@ def test_invalid_config(options: dict[str, Any]) -> None:
 
 
 def test_imagination_feeds_back_latents_and_resets_history() -> None:
-    model = MambaWorldModel((2, 3, 4), 3, d_model=8, d_state=4, headdim=4, encoder_channels=(4,))
+    model = MambaWorldModel((2, 3, 4), 3, d_model=8, num_layers=2, d_state=4, headdim=4, encoder_channels=(4,))
     observation = jnp.arange(24, dtype=jnp.uint8).reshape((1, 2, 3, 4))
     normalized = observation.astype(jnp.float32) / 255.0
     actions = jnp.array([[0], [1], [2]], jnp.int32)
@@ -285,7 +288,7 @@ def test_video_uses_newest_frame_clips_pixels_and_has_repeatable_actions(
     monkeypatch: pytest.MonkeyPatch, rgb: bool
 ) -> None:
     shape = (2, 3, 4, 3) if rgb else (2, 3, 4)
-    model = MambaWorldModel(shape, 3, d_model=8, d_state=4, headdim=4, encoder_channels=(4,))
+    model = MambaWorldModel(shape, 3, d_model=8, num_layers=2, d_state=4, headdim=4, encoder_channels=(4,))
     config = training_config(video_num_steps=2, video_fps=12)
     frames = np.ones((3, *shape), np.float32)
     frames[:, -1] = np.array([-1, 0.5, 2], np.float32).reshape((3,) + (1,) * (len(shape) - 1))
@@ -315,6 +318,18 @@ def test_video_uses_newest_frame_clips_pixels_and_has_repeatable_actions(
     for frame, value in zip(video[0], (0, 128, 255)):
         np.testing.assert_array_equal(frame, np.full_like(frame, value))
     np.testing.assert_array_equal(imagine.call_args_list[0].args[-1], imagine.call_args_list[1].args[-1])
+
+
+def test_bf16_is_default_and_can_be_disabled(tmp_path: Path) -> None:
+    assert training_config().bf16
+    settings = asdict(training_config())
+    del settings["bf16"]
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(settings))
+    assert train_wm.load_config(path).bf16
+    settings["bf16"] = False
+    path.write_text(yaml.safe_dump(settings))
+    assert not train_wm.load_config(path).bf16
 
 
 def test_config_requires_all_training_settings(tmp_path: Path) -> None:

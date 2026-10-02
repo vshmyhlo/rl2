@@ -30,7 +30,7 @@ from google.cloud import storage
 from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
-from rl2.mamba3 import Mamba3Carry
+from rl2.mamba3 import Mamba3StackCarry
 from rl2.ppo import make_env
 from rl2.wm import MambaWorldModel
 
@@ -47,12 +47,13 @@ class Config:
     vector_env: str
     num_steps: int
     d_model: int
+    num_layers: int
+    d_intermediate: int | None
     encoder_channels: tuple[int, ...]
     d_state: int
     headdim: int
     learning_rate: float
     max_grad_norm: float
-    bf16: bool
     log_dir: str
     log_every: int
     log_flush_secs: int
@@ -61,6 +62,7 @@ class Config:
     video_every_steps: int
     video_num_steps: int
     video_fps: float
+    bf16: bool = True
     encoder_max_flattened_size: int | None = 8192
 
     def __post_init__(self) -> None:
@@ -69,6 +71,7 @@ class Config:
             self.num_envs,
             self.num_steps,
             self.d_model,
+            self.num_layers,
             self.d_state,
             self.headdim,
             self.log_every,
@@ -80,6 +83,9 @@ class Config:
             chex.assert_scalar_positive(value)
         chex.assert_type(self.video_every_steps, int)
         chex.assert_scalar_non_negative(self.video_every_steps)
+        if self.d_intermediate is not None:
+            chex.assert_type(self.d_intermediate, int)
+            chex.assert_scalar_non_negative(self.d_intermediate)
         chex.assert_scalar_positive(len(self.encoder_channels))
         for channels in self.encoder_channels:
             chex.assert_type(channels, int)
@@ -182,15 +188,15 @@ def collect_rollout(
 
 @partial(jax.jit, static_argnames=("model",))
 def update(
-    state: TrainState, model: MambaWorldModel, batch: Batch, carry: Mamba3Carry
-) -> tuple[TrainState, Mamba3Carry, dict[str, jax.Array]]:
+    state: TrainState, model: MambaWorldModel, batch: Batch, carry: Mamba3StackCarry
+) -> tuple[TrainState, Mamba3StackCarry, dict[str, jax.Array]]:
     """One supervised update; terminal labels exclude time-limit truncations."""
     batch.validate()
     chex.assert_trees_all_equal_shapes_and_dtypes(carry, model.initial_carry(batch.actions.shape[1]))
     carry = jax.tree.map(jax.lax.stop_gradient, carry)
     targets = batch.next_observations.astype(jnp.float32) / 255.0
 
-    def loss_fn(params: optax.Params) -> tuple[jax.Array, tuple[Mamba3Carry, dict[str, jax.Array]]]:
+    def loss_fn(params: optax.Params) -> tuple[jax.Array, tuple[Mamba3StackCarry, dict[str, jax.Array]]]:
         final_carry, _, prediction = state.apply_fn(
             {"params": params}, batch.observations, batch.actions, carry, batch.episode_starts, method=model.observe
         )
@@ -214,7 +220,7 @@ def update(
     return state.apply_gradients(grads=gradients), jax.tree.map(jax.lax.stop_gradient, carry), metrics
 
 
-type ImaginationCarry = tuple[Mamba3Carry, jax.Array]
+type ImaginationCarry = tuple[Mamba3StackCarry, jax.Array]
 
 
 @partial(jax.jit, static_argnames=("model",))
@@ -222,7 +228,7 @@ def imagine_frames(
     state: TrainState,
     model: MambaWorldModel,
     observation: jax.Array,
-    carry: Mamba3Carry,
+    carry: Mamba3StackCarry,
     episode_start: jax.Array,
     actions: jax.Array,
 ) -> jax.Array:
@@ -266,7 +272,7 @@ def log_video(
     config: Config,
     writer: SummaryWriter,
     observation: NDArray[np.uint8],
-    carry: Mamba3Carry,
+    carry: Mamba3StackCarry,
     episode_start: NDArray[np.bool_],
     steps: int,
 ) -> None:
@@ -344,6 +350,8 @@ def train(config: Config) -> str:
             observation_shape=envs.single_observation_space.shape,
             num_actions=int(envs.single_action_space.n),
             d_model=config.d_model,
+            num_layers=config.num_layers,
+            d_intermediate=config.d_intermediate,
             encoder_channels=config.encoder_channels,
             encoder_max_flattened_size=config.encoder_max_flattened_size,
             d_state=config.d_state,

@@ -146,12 +146,12 @@ class ActorCritic(nn.Module):
         policy = nn.relu(nn.LayerNorm(name="policy_norm", dtype=self.dtype)(policy))
         critic = nn.Dense(512, kernel_init=init, name="value_hidden", dtype=self.dtype)(x)
         critic = nn.relu(nn.LayerNorm(name="value_norm", dtype=self.dtype)(critic))
-        # Float32 heads keep action probabilities, values, and PPO losses precise.
+        # Heads use the compute dtype; float32 outputs keep PPO loss arithmetic precise.
         logits = nn.Dense(
-            self.num_actions, kernel_init=nn.initializers.orthogonal(0.01), name="policy_output", dtype=jnp.float32
+            self.num_actions, kernel_init=nn.initializers.orthogonal(0.01), name="policy_output", dtype=self.dtype
         )(policy)
-        value = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0), name="value_output", dtype=jnp.float32)(critic)
-        return carry, logits, value.squeeze(-1)
+        value = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0), name="value_output", dtype=self.dtype)(critic)
+        return carry, logits.astype(jnp.float32), value.squeeze(-1).astype(jnp.float32)
 
 
 class AtariPreprocessing(gym.wrappers.AtariPreprocessing):

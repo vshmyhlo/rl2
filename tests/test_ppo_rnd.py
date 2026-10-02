@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import chex
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
@@ -57,16 +58,25 @@ def test_intrinsic_reward_scaling_preserves_filter_across_rollouts() -> None:
     np.testing.assert_allclose(continued, [2.75, 3.5])
 
 
-def test_rnd_learns_without_changing_target() -> None:
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_rnd_learns_without_changing_target(dtype: jax.typing.DTypeLike) -> None:
     obs = jax.random.normal(jax.random.key(1), (4, 16, 16, 1))
     states = []
     for predictor, seed in ((True, 2), (False, 3)):
-        model = rnd.RNDNetwork(predictor=predictor, channels=(4, 4, 4), feature_size=8)
+        model = rnd.RNDNetwork(predictor=predictor, channels=(4, 4, 4), feature_size=8, dtype=dtype)
         states.append(
             TrainState.create(
                 apply_fn=model.apply, params=model.init(jax.random.key(seed), obs)["params"], tx=optax.adam(1e-3)
             )
         )
+        features, captured = model.apply(
+            {"params": states[-1].params}, obs, capture_intermediates=True, mutable=["intermediates"]
+        )
+        chex.assert_shape(features, (4, 8))
+        chex.assert_type(features, jnp.float32)
+        for name, intermediate in captured["intermediates"].items():
+            if name.startswith(("Conv_", "Dense_")):
+                chex.assert_type(intermediate["__call__"][0], dtype)
     predictor, target = states
     target_before = jax.tree.map(np.array, target)
     reward_before = rnd.rnd_reward(predictor, target, obs)
@@ -76,6 +86,11 @@ def test_rnd_learns_without_changing_target() -> None:
     for i in range(30):
         predictor, loss = rnd.update_rnd(predictor, target, obs, jax.random.key(i), 1.0)
         assert np.isfinite(loss)
+        chex.assert_type(loss, jnp.float32)
+    chex.assert_type(jax.tree.leaves(predictor.params), jnp.float32)
+    for leaf in jax.tree.leaves(predictor.opt_state):
+        if jnp.issubdtype(leaf.dtype, jnp.floating):
+            chex.assert_type(leaf, jnp.float32)
     assert float(rnd.rnd_reward(predictor, target, obs).mean()) < float(reward_before.mean()) * 0.9
     for before, after in zip(jax.tree.leaves(target_before), jax.tree.leaves(target)):
         np.testing.assert_array_equal(before, after)
@@ -84,6 +99,40 @@ def test_rnd_learns_without_changing_target() -> None:
     assert float(loss) == 0
     for before, after in zip(jax.tree.leaves(predictor), jax.tree.leaves(skipped)):
         np.testing.assert_array_equal(before, after)
+
+
+def test_bf16_policy_heads_and_update() -> None:
+    model = rnd.ActorCritic(3, 8, dtype=jnp.bfloat16, encoder_channels=(4,), embedding_size=8)
+    obs = jax.random.randint(jax.random.key(0), (3, 2, 4, 16, 16), 0, 256, dtype=jnp.uint8)
+    carry = rnd.initial_carry(2, 8)
+    starts = jnp.zeros((3, 2), dtype=jnp.bool_)
+    params = model.init(jax.random.key(1), obs, carry, starts)["params"]
+    (final, logits, values), captured = jax.jit(
+        partial(model.apply, capture_intermediates=True, mutable=["intermediates"])
+    )({"params": params}, obs, carry, starts)
+    for name in ("Conv_0", "policy_hidden", "value_hidden", "policy_output", "value_output"):
+        chex.assert_type(captured["intermediates"][name]["__call__"][0], jnp.bfloat16)
+    chex.assert_type(jax.tree.leaves((final, logits, values, params)), jnp.float32)
+    chex.assert_shape(logits, (3, 2, 3))
+    chex.assert_shape(values, (3, 2, 2))
+    actions = jnp.zeros((3, 2), dtype=jnp.int32)
+    batch = (
+        obs,
+        actions,
+        rnd.action_log_prob(logits, actions),
+        jnp.arange(6.0).reshape(3, 2),
+        values + 1,
+        carry,
+        starts,
+    )
+    state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(1e-3))
+    updated, metrics = rnd.update(state, batch, replace(config(), target_kl=None))
+    assert int(updated.step) == 1
+    for leaf in jax.tree.leaves((updated.params, updated.opt_state, metrics)):
+        assert np.isfinite(leaf).all()
+        if jnp.issubdtype(leaf.dtype, jnp.floating):
+            chex.assert_type(leaf, jnp.float32)
+    assert any(not np.array_equal(a, b) for a, b in zip(jax.tree.leaves(params), jax.tree.leaves(updated.params)))
 
 
 def test_two_value_outputs_recurrence_and_evaluation() -> None:
@@ -176,7 +225,7 @@ def test_training_resets_returns_and_predictor_independence(
         lstm_hidden_size=8,
         encoder_channels=(4,),
         embedding_size=8,
-        bf16=False,
+        bf16=stop_ppo,
         vector_env="sync",
         log_dir=str(tmp_path),
         video_every_episodes=0,
