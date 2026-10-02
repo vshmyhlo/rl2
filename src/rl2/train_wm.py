@@ -61,6 +61,7 @@ class Config:
     video_every_steps: int
     video_num_steps: int
     video_fps: float
+    encoder_max_flattened_size: int | None = 8192
 
     def __post_init__(self) -> None:
         for value in (
@@ -83,6 +84,9 @@ class Config:
         for channels in self.encoder_channels:
             chex.assert_type(channels, int)
             chex.assert_scalar_positive(channels)
+        if self.encoder_max_flattened_size is not None:
+            chex.assert_type(self.encoder_max_flattened_size, int)
+            chex.assert_scalar_non_negative(self.encoder_max_flattened_size - self.encoder_channels[-1])
         if self.observation_size is not None:
             chex.assert_type(self.observation_size, int)
             chex.assert_scalar_positive(self.observation_size)
@@ -341,6 +345,7 @@ def train(config: Config) -> str:
             num_actions=int(envs.single_action_space.n),
             d_model=config.d_model,
             encoder_channels=config.encoder_channels,
+            encoder_max_flattened_size=config.encoder_max_flattened_size,
             d_state=config.d_state,
             headdim=config.headdim,
             dtype=jnp.bfloat16 if config.bf16 else jnp.float32,

@@ -63,6 +63,7 @@ class Config:
     eval_every_minutes: float = 0.0
     eval_episodes: int = 100
     eval_seed: int = 10_000
+    encoder_max_flattened_size: int | None = 8192
 
 
 def load_config(path: str | Path) -> Config:
@@ -106,6 +107,7 @@ class ActorCritic(nn.Module):
     dtype: jax.typing.DTypeLike = jnp.float32
     encoder_channels: tuple[int, ...] = (128, 256, 384, 512)
     embedding_size: int = 768
+    encoder_max_flattened_size: int | None = 8192
 
     @nn.compact
     def __call__(
@@ -125,6 +127,7 @@ class ActorCritic(nn.Module):
         x = ConvObservationEncoder(
             encoder_channels=self.encoder_channels,
             embedding_size=self.embedding_size,
+            max_flattened_size=self.encoder_max_flattened_size,
             dtype=self.dtype,
             name="encoder",
         )(obs.reshape((-1, *obs.shape[2:])))
@@ -413,6 +416,7 @@ def train(config: Config) -> TrainState:
             envs.single_action_space.n,
             config.lstm_hidden_size,
             dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
+            encoder_max_flattened_size=config.encoder_max_flattened_size,
         )
         carry = initial_carry(config.num_envs, config.lstm_hidden_size)
         episode_start = np.ones(config.num_envs, dtype=bool)

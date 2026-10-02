@@ -9,6 +9,7 @@ vector_env: async # async (spawned subprocesses) or sync
 num_steps: 256 # Sequence length per update; recurrent memory carries across chunks
 d_model: 128 # Latent and Mamba model width
 encoder_channels: [128, 256, 384, 512] # Shared residual convolutional encoder; outputs d_model features
+encoder_max_flattened_size: 8192 # Add stages at the final channel width until within this limit; null disables
 d_state: 64 # Mamba state width; even and at least 4
 headdim: 32 # Must divide 2 * d_model
 bf16: false # Mixed precision projections; parameters, carry, and losses stay float32
@@ -20,5 +21,5 @@ log_flush_secs: 30 # Background TensorBoard flush interval; also flush after pro
 checkpoint_dir: gs://cohere-dev/vlad/rl2_cp/wm # Uses the same run name as log_dir; saves checkpoint.msgpack and config.json
 checkpoint_every: 10000 # Save every N updates and at the end of training
 video_every_steps: 10000 # Collected transitions; record after the rollout crossing each interval; 0 disables
-video_num_steps: 20 # Imagined transitions after one real seed frame; fixed horizon, ignoring predicted termination
-video_fps: 4 # Playback frames per second; Atari preprocessing repeats each action for 4 emulator frames
+video_num_steps: 5 # Imagined transitions after one real seed frame; fixed horizon, ignoring predicted termination
+video_fps: 1 # Playback frames per second; Atari preprocessing repeats each action for 4 emulator frames

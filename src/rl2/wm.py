@@ -159,6 +159,8 @@ class MambaWorldModel(WorldModel):
         encoder_channels: Positive channel widths for the shared convolutional
             encoder's residual stages. Its output embedding has width d_model.
         dtype: Internal projection dtype: float32, bfloat16, or float16.
+        encoder_max_flattened_size: Maximum encoder features before projection;
+            None disables automatic extra downsampling stages.
     """
 
     observation_shape: tuple[int, ...]
@@ -170,6 +172,7 @@ class MambaWorldModel(WorldModel):
     mimo_rank: int = 1
     encoder_channels: tuple[int, ...] = (128, 256, 384, 512)
     dtype: jax.typing.DTypeLike = jnp.float32
+    encoder_max_flattened_size: int | None = 8192
 
     @nn.nowrap
     def _make_mixer(self) -> Mamba3:
@@ -196,7 +199,10 @@ class MambaWorldModel(WorldModel):
         if len(self.observation_shape) == 4 and self.observation_shape[-1] != 3:
             raise ValueError("RGB observations must have exactly three color channels")
         self.encoder = ConvObservationEncoder(
-            encoder_channels=self.encoder_channels, embedding_size=self.d_model, dtype=self.dtype
+            encoder_channels=self.encoder_channels,
+            embedding_size=self.d_model,
+            dtype=self.dtype,
+            max_flattened_size=self.encoder_max_flattened_size,
         )
         self.action_embedding = nn.Embed(self.num_actions, self.d_model, dtype=self.dtype)
         self.input_projection = nn.Dense(self.d_model, dtype=self.dtype)

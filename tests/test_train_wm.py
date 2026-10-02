@@ -249,6 +249,9 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         {"log_flush_secs": -1},
         {"encoder_channels": ()},
         {"encoder_channels": (4, 0)},
+        {"encoder_max_flattened_size": 0},
+        {"encoder_max_flattened_size": 3},
+        {"encoder_max_flattened_size": 8192.5},
     ],
 )
 def test_invalid_config(options: dict[str, Any]) -> None:
