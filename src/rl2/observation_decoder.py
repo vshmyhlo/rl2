@@ -48,7 +48,7 @@ class ConvObservationDecoder(nn.Module):
         visual_init = nn.initializers.variance_scaling(2.0, "fan_in", "truncated_normal")
         x = nn.Dense(math.prod(base_shape), kernel_init=visual_init, dtype=self.dtype, name="projection")(latent)
         x = x.reshape((latent.shape[0], *base_shape))
-        x = nn.relu(nn.LayerNorm(name="projection_norm", dtype=self.dtype)(x))
+        x = nn.silu(nn.LayerNorm(name="projection_norm", dtype=self.dtype)(x))
         for index in reversed(range(len(self.stages))):
             stage = self.stages[index]
             previous_channels = self.stages[max(index - 1, 0)].channels

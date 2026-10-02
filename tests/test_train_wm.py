@@ -108,7 +108,37 @@ def test_random_collection_preserves_terminal_frames_and_reset_masks() -> None:
         envs.close()
 
 
-def test_update_targets_losses_carry_and_learning() -> None:
+@pytest.mark.parametrize("loss", ["l1", "l2", "charbonnier"])
+def test_observation_reconstruction_loss_value_and_gradient(loss: train_wm.ObservationLoss) -> None:
+    errors = np.broadcast_to(np.array([[-0.5, -0.1], [0.25, 1.0]], np.float32), (2, 3, 1, 2, 2))
+    target = jnp.full(errors.shape, 0.5, jnp.float32)
+    prediction = target + errors
+    epsilon = 0.01
+    if loss == "l1":
+        penalties, derivatives = np.abs(errors), np.sign(errors)
+    elif loss == "l2":
+        penalties, derivatives = 0.5 * errors**2, errors
+    else:
+        root = np.sqrt(errors**2 + epsilon**2)
+        penalties, derivatives = root - epsilon, errors / root
+    loss_fn = partial(train_wm.observation_reconstruction_loss, target=target, loss=loss, epsilon=epsilon)
+    value, gradient = jax.jit(jax.value_and_grad(loss_fn))(prediction)
+    chex.assert_shape(value, ())
+    chex.assert_type((value, gradient), jnp.float32)
+    np.testing.assert_allclose(value, penalties.sum(axis=(2, 3, 4)).mean(), rtol=1e-6)
+    np.testing.assert_allclose(gradient, derivatives / 6, rtol=1e-6)
+
+
+def test_charbonnier_perfect_match_has_zero_loss_and_gradient() -> None:
+    target = jnp.zeros((2, 1, 1, 2, 2, 3), jnp.float32)
+    loss_fn = partial(train_wm.observation_reconstruction_loss, target=target, loss="charbonnier", epsilon=1e-3)
+    value, gradient = jax.jit(jax.value_and_grad(loss_fn))(target)
+    np.testing.assert_allclose(value, 0, atol=1e-8)
+    np.testing.assert_array_equal(gradient, jnp.zeros_like(target))
+
+
+@pytest.mark.parametrize("loss", ["l1", "l2", "charbonnier"])
+def test_update_targets_losses_carry_and_learning(loss: train_wm.ObservationLoss) -> None:
     model = MambaWorldModel(
         (1, 2, 2),
         3,
@@ -145,7 +175,7 @@ def test_update_targets_losses_carry_and_learning() -> None:
         method=model.observe,
     )
     prediction = output.prediction
-    state, final, metrics = train_wm.update(state, model, batch, carry, key, 1.0, 0.1, 0.0)
+    state, final, metrics = train_wm.update(state, model, batch, carry, key, 1.0, 0.1, 0.0, observation_loss=loss)
     expected_observation = jnp.square(prediction.observation - 128 / 255.0).mean()
     expected_reward = jnp.square(prediction.reward - 1.0).mean()
     expected_terminal = optax.sigmoid_binary_cross_entropy(
@@ -156,15 +186,23 @@ def test_update_targets_losses_carry_and_learning() -> None:
     np.testing.assert_allclose(metrics["termination_loss"], expected_terminal, rtol=1e-5)
     expected_kl = categorical_kl(output.posterior_logits, output.prior_logits).mean()
     np.testing.assert_allclose(metrics["kl"], expected_kl, rtol=1e-5)
+    error = prediction.observation - 128 / 255.0
+    if loss == "l1":
+        expected_reconstruction = 4 * jnp.abs(error).mean()
+    elif loss == "l2":
+        expected_reconstruction = 2 * expected_observation
+    else:
+        expected_reconstruction = 4 * (jnp.sqrt(error**2 + 1e-6) - 1e-3).mean()
+    np.testing.assert_allclose(metrics["reconstruction_loss"], expected_reconstruction, rtol=1e-5)
     np.testing.assert_allclose(
-        metrics["loss"], 2 * expected_observation + expected_reward + expected_terminal + 1.1 * expected_kl, rtol=1e-5
+        metrics["loss"], expected_reconstruction + expected_reward + expected_terminal + 1.1 * expected_kl, rtol=1e-5
     )
     chex.assert_trees_all_equal_shapes_and_dtypes(final, expected_carry)
     for actual, expected in zip(jax.tree.leaves(final), jax.tree.leaves(expected_carry)):
         np.testing.assert_allclose(actual, expected, atol=1e-6)
     first_loss = float(metrics["loss"])
     for _ in range(4):
-        state, _, metrics = train_wm.update(state, model, batch, carry, key, 1.0, 0.1, 0.0)
+        state, _, metrics = train_wm.update(state, model, batch, carry, key, 1.0, 0.1, 0.0, observation_loss=loss)
     assert int(state.step) == 5
     assert float(metrics["loss"]) < first_loss
     assert all(np.isfinite(value) for value in metrics.values())
@@ -227,6 +265,8 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
     monkeypatch.setattr(train_wm, "make_env", make_env)
     checkpoint_spy = Mock(wraps=train_wm.save_checkpoint)
     monkeypatch.setattr(train_wm, "save_checkpoint", checkpoint_spy)
+    update_spy = Mock(wraps=train_wm.update)
+    monkeypatch.setattr(train_wm, "update", update_spy)
     config = training_config(
         total_steps=10,
         num_envs=2,
@@ -248,6 +288,12 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         video_prefill_frames=2,
     )
     run_dir = train_wm.train(config)
+    assert config.observation_loss == "charbonnier"
+    for call in update_spy.call_args_list:
+        assert call.kwargs == {
+            "observation_loss": config.observation_loss,
+            "charbonnier_epsilon": config.charbonnier_epsilon,
+        }
     assert flushes == ["flush"] * (3 if config.video_every_steps else 2) + ["close"]
     assert run_dir.startswith(f"{config.log_dir.rstrip('/')}/ALE_SpaceInvaders-v5_seed1_")
     run_name = run_dir.rsplit("/", 1)[-1]
@@ -329,6 +375,11 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         {"dynamics_kl_scale": -1},
         {"representation_kl_scale": float("inf")},
         {"free_nats": -1},
+        {"observation_loss": "unknown"},
+        {"charbonnier_epsilon": 0},
+        {"charbonnier_epsilon": -0.001},
+        {"charbonnier_epsilon": float("inf")},
+        {"charbonnier_epsilon": float("nan")},
     ],
 )
 def test_invalid_config(options: dict[str, Any]) -> None:

@@ -24,6 +24,8 @@ unimix: 0.01 # Uniform probability mixture for prior and posterior
 dynamics_kl_scale: 1.0 # Train the prior toward a stopped-gradient posterior
 representation_kl_scale: 0.1 # Regularize the posterior toward a stopped-gradient prior
 free_nats: 1.0 # KL floor per transition, summed across latent variables
+observation_loss: charbonnier # l1, l2 (half squared error), or charbonnier; summed over pixels/channels
+charbonnier_epsilon: 0.001 # Smoothing scale for normalized [0, 1] pixels
 bf16: true # BF16 compute; parameters, recurrent state, and losses remain float32
 learning_rate: 0.0001 # Initial Adam rate; cosine decay over the planned optimizer updates
 max_grad_norm: 1.0

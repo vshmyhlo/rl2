@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from time import monotonic
+from typing import Literal
 
 import chex
 import cv2
@@ -34,6 +35,8 @@ from tensorboardX import SummaryWriter
 from rl2.observation_encoder import ConvStage, ConvStages, validate_stages
 from rl2.ppo import make_env
 from rl2.wm import MambaWorldModel, WorldModelState, categorical_entropy, categorical_kl, check_keys, latent_kl_losses
+
+ObservationLoss = Literal["l1", "l2", "charbonnier"]
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,8 @@ class Config:
     video_prefill_frames: int
     video_fps: float
     bf16: bool = True
+    observation_loss: ObservationLoss = "l2"
+    charbonnier_epsilon: float = 1e-3
 
     def __post_init__(self) -> None:
         for value in (
@@ -94,6 +99,7 @@ class Config:
             chex.assert_scalar_positive(value)
         chex.assert_type(self.video_every_steps, int)
         chex.assert_scalar_non_negative(self.video_every_steps)
+        validate_observation_loss(self.observation_loss, self.charbonnier_epsilon)
         if self.d_intermediate is not None:
             chex.assert_type(self.d_intermediate, int)
             chex.assert_scalar_non_negative(self.d_intermediate)
@@ -211,7 +217,49 @@ def collect_rollout(
     return batch, observation, episode_start
 
 
-@partial(jax.jit, static_argnames=("model",))
+def validate_observation_loss(loss: ObservationLoss, epsilon: float) -> None:
+    """Validate the reconstruction penalty and its smoothing scale."""
+    if loss not in ("l1", "l2", "charbonnier"):
+        raise ValueError("observation_loss must be 'l1', 'l2', or 'charbonnier'")
+    chex.assert_scalar_positive(epsilon)
+    if not np.isfinite(epsilon):
+        raise ValueError("charbonnier_epsilon must be finite")
+
+
+def observation_reconstruction_loss(
+    prediction: jax.Array,
+    target: jax.Array,
+    loss: ObservationLoss,
+    epsilon: float,
+) -> jax.Array:
+    """Sum pixel/channel penalties per frame, then average time and batch.
+
+    Args:
+        prediction: Floating predictions shaped [time, batch, *observation_shape].
+        target: Matching floating targets normalized to [0, 1].
+        loss: 'l1' uses abs(error); 'l2' uses 0.5 * error**2, preserving the
+            original Gaussian objective; 'charbonnier' uses
+            sqrt(error**2 + epsilon**2) - epsilon (zero at a perfect match).
+        epsilon: Positive Charbonnier smoothing scale in normalized pixel units.
+
+    Returns:
+        Scalar float32 reconstruction loss, without clipping predictions.
+    """
+    chex.assert_equal_shape((prediction, target))
+    chex.assert_type((prediction, target), jnp.floating)
+    chex.assert_scalar_positive(prediction.ndim - 2)
+    validate_observation_loss(loss, epsilon)
+    error = prediction.astype(jnp.float32) - target.astype(jnp.float32)
+    if loss == "l1":
+        penalty = jnp.abs(error)
+    elif loss == "l2":
+        penalty = 0.5 * jnp.square(error)
+    else:
+        penalty = jnp.sqrt(jnp.square(error) + epsilon**2) - epsilon
+    return jnp.mean(jnp.sum(penalty, axis=tuple(range(2, penalty.ndim))))
+
+
+@partial(jax.jit, static_argnames=("model", "observation_loss", "charbonnier_epsilon"))
 def update(
     state: TrainState,
     model: MambaWorldModel,
@@ -221,11 +269,13 @@ def update(
     dynamics_kl_scale: float,
     representation_kl_scale: float,
     free_nats: float,
+    observation_loss: ObservationLoss = "l2",
+    charbonnier_epsilon: float = 1e-3,
 ) -> tuple[TrainState, WorldModelState, dict[str, jax.Array]]:
     """Train posterior reconstruction and balanced KL using a fresh sampling key.
 
-    Carry is detached only at chunk boundaries. The Gaussian reconstruction
-    term sums pixels per frame; observation_loss retains mean pixel MSE for
+    Carry is detached only at chunk boundaries. The selected reconstruction
+    term sums pixels per frame; the observation_loss metric retains pixel MSE for
     readable logs. KL sums categorical variables and applies free_nats per
     transition before batch averaging, independently for the two gradient paths.
     """
@@ -248,10 +298,10 @@ def update(
             method=model.observe,
         )
         prediction = output.prediction
-        squared_error = jnp.square(prediction.observation - targets)
-        observation_loss = jnp.mean(squared_error)
-        # Fixed unit-variance Gaussian negative log likelihood, omitting constants.
-        reconstruction_loss = 0.5 * jnp.mean(jnp.sum(squared_error, axis=tuple(range(2, squared_error.ndim))))
+        observation_mse = jnp.mean(jnp.square(prediction.observation.astype(jnp.float32) - targets))
+        reconstruction_loss = observation_reconstruction_loss(
+            prediction.observation, targets, observation_loss, charbonnier_epsilon
+        )
         reward_loss = jnp.mean(jnp.square(prediction.reward - batch.rewards))
         termination_loss = jnp.mean(
             optax.sigmoid_binary_cross_entropy(prediction.termination_logits, batch.terminated.astype(jnp.float32))
@@ -263,7 +313,7 @@ def update(
         loss = reconstruction_loss + reward_loss + termination_loss + kl_loss
         metrics = {
             "loss": loss,
-            "observation_loss": observation_loss,
+            "observation_loss": observation_mse,
             "reconstruction_loss": reconstruction_loss,
             "reward_loss": reward_loss,
             "termination_loss": termination_loss,
@@ -621,6 +671,8 @@ def train(config: Config) -> str:
                 config.dynamics_kl_scale,
                 config.representation_kl_scale,
                 config.free_nats,
+                observation_loss=config.observation_loss,
+                charbonnier_epsilon=config.charbonnier_epsilon,
             )
             values = {name: float(value) for name, value in jax.device_get(metrics).items()}
             if not all(np.isfinite(value) for value in values.values()):

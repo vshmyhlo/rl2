@@ -44,7 +44,7 @@ def validate_stages(stages: ConvStages) -> None:
 
 
 class ResidualBlock(nn.Module):
-    """Two Conv-LayerNorm-ReLU layers followed by a scaled residual sum."""
+    """Two Conv-LayerNorm-SiLU layers followed by a scaled residual sum."""
 
     channels: int
     dtype: jax.typing.DTypeLike = jnp.float32
@@ -63,7 +63,7 @@ class ResidualBlock(nn.Module):
                 kernel_init=nn.initializers.variance_scaling(2.0, "fan_in", "truncated_normal"),
                 dtype=self.dtype,
             )(x)
-            x = nn.relu(nn.LayerNorm(dtype=self.dtype)(x))
+            x = nn.silu(nn.LayerNorm(dtype=self.dtype)(x))
         return (residual + x) * jnp.asarray(2**-0.5, dtype=self.dtype)
 
 
@@ -91,7 +91,7 @@ class ConvObservationStage(nn.Module):
 class ConvObservationEncoder(nn.Module):
     """Encode uint8 observations shaped [batch, frames, height, width, (RGB)].
 
-    A 7x7 stem convolution followed by LayerNorm and ReLU extracts features at
+    A 7x7 stem convolution followed by LayerNorm and SiLU extracts features at
     the original resolution using the first configured channel width.
     Every stage resizes then applies a 3x3 convolution followed by the configured
     residual blocks. No stages are inferred from input size.
@@ -132,7 +132,7 @@ class ConvObservationEncoder(nn.Module):
             dtype=self.dtype,
             name="stem",
         )(x)
-        x = nn.relu(nn.LayerNorm(name="stem_norm", dtype=self.dtype)(x))
+        x = nn.silu(nn.LayerNorm(name="stem_norm", dtype=self.dtype)(x))
         for index, stage in enumerate(self.stages):
             x = ConvObservationStage(
                 channels=stage.channels,
@@ -145,7 +145,7 @@ class ConvObservationEncoder(nn.Module):
         x = nn.Dense(self.embedding_size, kernel_init=visual_init, dtype=self.dtype)(
             x.reshape((x.shape[0], math.prod(x.shape[1:])))
         )
-        x = nn.relu(nn.LayerNorm(name="shared_norm", dtype=self.dtype)(x))
+        x = nn.silu(nn.LayerNorm(name="shared_norm", dtype=self.dtype)(x))
         chex.assert_shape(x, (obs.shape[0], self.embedding_size))
         chex.assert_type(x, self.dtype)
         return x

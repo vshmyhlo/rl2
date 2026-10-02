@@ -12,7 +12,7 @@ from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, Conv
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_residual_branch_normalizes_and_activates_after_final_convolution(dtype: jax.typing.DTypeLike) -> None:
+def test_residual_branch_normalizes_and_applies_silu_after_final_convolution(dtype: jax.typing.DTypeLike) -> None:
     model = ResidualBlock(4, dtype=dtype)
     x = jnp.full((1, 3, 5, 4), -3, dtype=dtype)
     params = model.init(jax.random.key(0), x)["params"]
@@ -23,7 +23,8 @@ def test_residual_branch_normalizes_and_activates_after_final_convolution(dtype:
     output = model.apply({"params": params}, x)
     chex.assert_shape(output, x.shape)
     chex.assert_type(output, dtype)
-    expected = (x + jnp.asarray([2, 0, 1, 0], dtype=dtype)) * jnp.asarray(2**-0.5, dtype=dtype)
+    bias = jnp.asarray([2, -2, 1, -1], dtype=dtype)
+    expected = (x + jax.nn.silu(bias)) * jnp.asarray(2**-0.5, dtype=dtype)
     np.testing.assert_allclose(output.astype(jnp.float32), expected.astype(jnp.float32))
 
 
