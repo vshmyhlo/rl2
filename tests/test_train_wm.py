@@ -31,6 +31,30 @@ def training_config(**overrides: Any) -> train_wm.Config:
     return replace(train_wm.load_config(path), **overrides)
 
 
+@pytest.mark.parametrize("frame_stack", [False, True])
+@pytest.mark.parametrize("grayscale_obs", [False, True])
+def test_atari_observation_colors(grayscale_obs: bool, frame_stack: bool) -> None:
+    config = training_config()
+    assert not config.grayscale_obs
+    with train_wm.make_env(
+        config.env_id,
+        frame_stack=frame_stack,
+        atari_preprocessing=config.atari_preprocessing,
+        observation_size=config.observation_size,
+        grayscale_obs=grayscale_obs,
+    ) as env:
+        observation, _ = env.reset(seed=config.seed)
+        shape = (4 if frame_stack else 1, 84, 84) + (() if grayscale_obs else (3,))
+        chex.assert_shape(observation, shape)
+        chex.assert_type(observation, np.uint8)
+        assert env.observation_space.contains(observation)
+        if not grayscale_obs:
+            assert np.any(observation[..., 0] != observation[..., 1])
+        observation, _, _, _, _ = env.step(0)
+        chex.assert_shape(observation, shape)
+        chex.assert_type(observation, np.uint8)
+
+
 class ShortEpisodes(gym.Env[NDArray[np.uint8], int]):
     def __init__(self, timeout: bool = False, episode_length: int = 2) -> None:
         chex.assert_type(episode_length, int)
@@ -190,11 +214,12 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         monkeypatch.chdir(tmp_path)
 
     def make_env(
-        env_id: str, frame_stack: bool, atari_preprocessing: bool, observation_size: int | None
+        env_id: str, frame_stack: bool, atari_preprocessing: bool, observation_size: int | None, grayscale_obs: bool
     ) -> ShortEpisodes:
         assert env_id == "ALE/SpaceInvaders-v5"
         assert not frame_stack
         assert atari_preprocessing
+        assert not grayscale_obs
         env = ShortEpisodes()
         environments.append(env)
         return env
@@ -220,6 +245,7 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         checkpoint_every=checkpoint_every,
         video_every_steps=5 if checkpoint_every == 1 else 0,
         video_num_steps=3,
+        video_prefill_frames=2,
     )
     run_dir = train_wm.train(config)
     assert flushes == ["flush"] * (4 if config.video_every_steps else 2) + ["close"]
@@ -279,11 +305,14 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
     "options",
     [
         {"num_steps": 0},
+        {"grayscale_obs": "false"},
         {"total_steps": 9, "num_envs": 2},
         {"learning_rate": float("inf")},
         {"d_state": 2},
         {"video_every_steps": -1},
         {"video_num_steps": 0},
+        {"video_prefill_frames": 0},
+        {"video_prefill_frames": -1},
         {"video_fps": 0},
         {"video_fps": float("inf")},
         {"log_flush_secs": 0},
@@ -303,11 +332,12 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
     ],
 )
 def test_invalid_config(options: dict[str, Any]) -> None:
-    with pytest.raises((AssertionError, ValueError)):
+    with pytest.raises((AssertionError, TypeError, ValueError)):
         training_config(**options)
 
 
-def test_imagination_feeds_back_latents_and_resets_history() -> None:
+@pytest.mark.parametrize("num_frames", [1, 10])
+def test_imagination_prefills_real_frames_and_feeds_back_sampled_latents(num_frames: int) -> None:
     model = MambaWorldModel(
         (2, 3, 4),
         3,
@@ -319,27 +349,38 @@ def test_imagination_feeds_back_latents_and_resets_history() -> None:
         stochastic_size=4,
         stochastic_classes=4,
     )
-    observation = jnp.arange(24, dtype=jnp.uint8).reshape((1, 2, 3, 4))
-    normalized = observation.astype(jnp.float32) / 255.0
-    actions = jnp.array([[0], [1], [2]], jnp.int32)
     key = jax.random.key(8)
-    variables = model.init(key, observation, actions[0], observation, key)
+    observations = jax.random.randint(key, (num_frames, 1, 2, 3, 4), 0, 256, jnp.uint8)
+    prefill_actions = (jnp.arange(num_frames - 1, dtype=jnp.int32) % 3)[:, None]
+    actions = jnp.array([[0], [1], [2]], jnp.int32)
+    variables = model.init(key, observations[0], actions[0], observations[0], key)
     state = TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optax.sgd(0.01))
-    history, _ = model.apply(variables, observation, actions[0], observation, key, method=model.observe)
-    frames = train_wm.imagine_frames(state, model, observation, history, jnp.zeros(1, jnp.bool_), actions, key)
-    chex.assert_shape(frames, (4, 2, 3, 4))
+    frames = train_wm.imagine_frames(state, model, observations, prefill_actions, actions, key)
+    chex.assert_shape(frames, (num_frames + 3, 2, 3, 4))
     chex.assert_type(frames, jnp.float32)
-    np.testing.assert_array_equal(frames[0], normalized[0])
-    keys = jax.random.split(key, 4)
-    history = model.apply(variables, observation, history, jnp.zeros(1, jnp.bool_), keys[0], method=model.condition)
-    for index, action in enumerate(actions):
-        history, prediction = model.apply(variables, history, action, keys[index + 1], method=model.imagine)
-        np.testing.assert_allclose(frames[index + 1], prediction.observation[0], atol=2e-6)
-    reset = train_wm.imagine_frames(state, model, observation, history, jnp.ones(1, jnp.bool_), actions, key)
-    fresh = train_wm.imagine_frames(
-        state, model, observation, model.initial_carry(1), jnp.zeros(1, jnp.bool_), actions, key
-    )
-    np.testing.assert_allclose(reset, fresh, atol=2e-6)
+    np.testing.assert_array_equal(frames[:num_frames], observations[:, 0].astype(jnp.float32) / 255.0)
+    prefill_key, imagination_key = jax.random.split(key)
+    history = model.initial_carry(1)
+    if num_frames > 1:
+        keys = jax.random.split(prefill_key, num_frames - 1)
+        # Explicit one-step posterior updates verify all real frames/actions
+        # are consumed in order, without resampling the last posterior.
+        for t, action in enumerate(prefill_actions):
+            history, _ = model.apply(
+                variables, observations[t], action, observations[t + 1], keys[t], history, method=model.observe
+            )
+    else:
+        history = model.apply(
+            variables, observations[0], history, jnp.ones(1, jnp.bool_), prefill_key, method=model.condition
+        )
+    for index, (action, sample_key) in enumerate(zip(actions, jax.random.split(imagination_key, 3))):
+        history, prediction = model.apply(variables, history, action, sample_key, method=model.imagine)
+        np.testing.assert_allclose(frames[num_frames + index], prediction.observation[0], atol=3e-6)
+    repeat = train_wm.imagine_frames(state, model, observations, prefill_actions, actions, key)
+    np.testing.assert_array_equal(frames, repeat)
+    if num_frames > 1:
+        altered = train_wm.imagine_frames(state, model, observations, prefill_actions.at[0, 0].set(1), actions, key)
+        assert not np.allclose(frames[num_frames:], altered[num_frames:])
 
 
 @pytest.mark.parametrize("rgb", [False, True])
@@ -358,9 +399,9 @@ def test_video_uses_newest_frame_clips_pixels_and_has_repeatable_actions(
         stochastic_size=4,
         stochastic_classes=4,
     )
-    config = training_config(video_num_steps=2, video_fps=12)
-    frames = np.ones((3, *shape), np.float32)
-    frames[:, -1] = np.array([-1, 0.5, 2], np.float32).reshape((3,) + (1,) * (len(shape) - 1))
+    config = training_config(video_num_steps=2, video_prefill_frames=10, video_fps=12)
+    frames = np.ones((12, *shape), np.float32)
+    frames[:, -1] = np.tile(np.array([-1, 0.5, 2], np.float32), 4).reshape((12,) + (1,) * (len(shape) - 1))
     imagine = Mock(return_value=jnp.asarray(frames))
     monkeypatch.setattr(train_wm, "imagine_frames", imagine)
     writer = Mock()
@@ -371,9 +412,8 @@ def test_video_uses_newest_frame_clips_pixels_and_has_repeatable_actions(
             model,
             config,
             writer,
-            np.zeros((1, *shape), np.uint8),
-            model.initial_carry(1),
-            np.zeros(1, np.bool_),
+            np.zeros((10, 1, *shape), np.uint8),
+            np.zeros((9, 1), np.int32),
             steps,
         )
     call = writer.add_video.call_args
@@ -382,9 +422,9 @@ def test_video_uses_newest_frame_clips_pixels_and_has_repeatable_actions(
     assert call.kwargs["fps"] == 12
     assert writer.flush.call_count == 2
     video = call.args[1]
-    chex.assert_shape(video, (1, 3, 3 if rgb else 1, 3, 4))
+    chex.assert_shape(video, (1, 12, 3 if rgb else 1, 3, 4))
     chex.assert_type(video, np.uint8)
-    for frame, value in zip(video[0], (0, 128, 255)):
+    for frame, value in zip(video[0], (0, 128, 255) * 4):
         np.testing.assert_array_equal(frame, np.full_like(frame, value))
     np.testing.assert_array_equal(imagine.call_args_list[0].args[-2], imagine.call_args_list[1].args[-2])
     np.testing.assert_array_equal(
@@ -519,3 +559,55 @@ def test_learning_rate_schedule_counts_short_rollouts_and_decays_to_zero(
         updates, optimizer_state = optimizer.update(jnp.ones_like(params), optimizer_state, params)
         np.testing.assert_allclose(-updates[0], expected_rate, rtol=1e-5, atol=1e-10)
         params = optax.apply_updates(params, updates)
+
+
+def test_video_prefill_history_spans_chunks_and_excludes_episode_boundaries() -> None:
+    observations = jnp.arange(24, dtype=jnp.uint8).reshape(12, 2, 1, 1, 1)
+    batch = train_wm.Batch(
+        observations=observations,
+        next_observations=observations + 2,
+        actions=jnp.arange(24, dtype=jnp.int32).reshape(12, 2) % 3,
+        rewards=jnp.zeros((12, 2), jnp.float32),
+        terminated=jnp.zeros((12, 2), jnp.bool_),
+        episode_starts=jnp.zeros((12, 2), jnp.bool_),
+    )
+    history = train_wm.update_video_history(None, jax.tree.map(lambda x: x[:4], batch), 10)
+    assert train_wm.select_video_prefill(history, np.zeros(2, np.bool_), 10) is None
+    for start in (4, 8):
+        history = train_wm.update_video_history(
+            history, jax.tree.map(lambda x, start=start: x[start : start + 4], batch), 10
+        )
+    assert history.actions.shape == (9, 2)
+    selected = train_wm.select_video_prefill(history, np.zeros(2, np.bool_), 10)
+    assert selected is not None
+    frames, actions = selected
+    chex.assert_shape(frames, (10, 1, 1, 1, 1))
+    chex.assert_type(frames, np.uint8)
+    np.testing.assert_array_equal(frames[:, 0, 0, 0, 0], np.arange(6, 26, 2))
+    np.testing.assert_array_equal(actions, batch.actions[3:, :1])
+    # A reset at the first prefill frame is fine; one inside the window is not.
+    history = history.replace(episode_starts=history.episode_starts.at[0].set(True).at[4, 0].set(True))
+    selected = train_wm.select_video_prefill(history, np.zeros(2, np.bool_), 10)
+    assert selected is not None
+    np.testing.assert_array_equal(selected[0][:, 0, 0, 0, 0], np.arange(7, 27, 2))
+    # Do not seed imagination from the terminal/truncated target immediately
+    # before a reset, even if the window itself contains no reset flags.
+    assert train_wm.select_video_prefill(history, np.array([False, True]), 10) is None
+    history = history.replace(terminated=history.terminated.at[-1, 1].set(True))
+    assert train_wm.select_video_prefill(history, np.zeros(2, np.bool_), 10) is None
+
+
+def test_video_prefill_one_frame_uses_last_live_target() -> None:
+    envs = gym.vector.SyncVectorEnv([ShortEpisodes], autoreset_mode=gym.vector.AutoresetMode.DISABLED)
+    try:
+        obs, _ = envs.reset(seed=1)
+        batch, _, starts = train_wm.collect_rollout(envs, obs, np.ones(1, np.bool_), np.random.default_rng(1), 1)
+        history = train_wm.update_video_history(None, batch, 1)
+        selected = train_wm.select_video_prefill(history, starts, 1)
+        assert selected is not None
+        frames, actions = selected
+        np.testing.assert_array_equal(frames, batch.next_observations)
+        chex.assert_shape(actions, (0, 1))
+        chex.assert_type(actions, np.int32)
+    finally:
+        envs.close()

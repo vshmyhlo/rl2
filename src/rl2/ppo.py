@@ -177,14 +177,16 @@ def make_env(
     frame_stack: bool = False,
     atari_preprocessing: bool = False,
     observation_size: int | None = None,
+    grayscale_obs: bool = True,
 ) -> gym.Env[NDArray[np.uint8], int | np.integer[Any]]:
+    chex.assert_type(grayscale_obs, bool)
     if observation_size is not None and (type(observation_size) is not int or observation_size < 1):
         raise ValueError("observation_size must be a positive integer or null")
     gym.register_envs(ale_py)
     register_envs()
     env = gym.make(env_id, frameskip=1, render_mode=render_mode)
     if atari_preprocessing:
-        env = AtariPreprocessing(env)
+        env = AtariPreprocessing(env, grayscale_obs=grayscale_obs)
     if observation_size is not None:
         env = gym.wrappers.ResizeObservation(env, (observation_size, observation_size))
     if frame_stack:
