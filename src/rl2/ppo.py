@@ -24,7 +24,7 @@ from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
 from rl2.multi_atari import register_envs
-from rl2.observation_encoder import ConvObservationEncoder
+from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages
 
 type Array = jax.Array | NDArray[Any]
 type LSTMCarry = tuple[jax.Array, jax.Array]
@@ -63,12 +63,15 @@ class Config:
     eval_every_minutes: float = 0.0
     eval_episodes: int = 100
     eval_seed: int = 10_000
-    encoder_max_flattened_size: int | None = 8192
+    encoder_stages: ConvStages = DEFAULT_STAGES
 
 
 def load_config(path: str | Path) -> Config:
     with open(path) as file:
-        return Config(**yaml.safe_load(file))
+        settings = yaml.safe_load(file)
+    if "encoder_stages" in settings:
+        settings["encoder_stages"] = tuple(ConvStage(**stage) for stage in settings["encoder_stages"])
+    return Config(**settings)
 
 
 def learning_rate_schedule(config: Config) -> optax.Schedule:
@@ -105,9 +108,8 @@ class ActorCritic(nn.Module):
     num_actions: int
     lstm_hidden_size: int
     dtype: jax.typing.DTypeLike = jnp.float32
-    encoder_channels: tuple[int, ...] = (32, 64, 128, 256)
+    encoder_stages: ConvStages = DEFAULT_STAGES
     embedding_size: int = 768
-    encoder_max_flattened_size: int | None = 8192
 
     @nn.compact
     def __call__(
@@ -125,9 +127,8 @@ class ActorCritic(nn.Module):
         chex.assert_shape(episode_starts, (steps, environments))
         chex.assert_type(episode_starts, jnp.bool_)
         x = ConvObservationEncoder(
-            encoder_channels=self.encoder_channels,
+            stages=self.encoder_stages,
             embedding_size=self.embedding_size,
-            max_flattened_size=self.encoder_max_flattened_size,
             dtype=self.dtype,
             name="encoder",
         )(obs.reshape((-1, *obs.shape[2:])))
@@ -416,7 +417,7 @@ def train(config: Config) -> TrainState:
             envs.single_action_space.n,
             config.lstm_hidden_size,
             dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
-            encoder_max_flattened_size=config.encoder_max_flattened_size,
+            encoder_stages=config.encoder_stages,
         )
         carry = initial_carry(config.num_envs, config.lstm_hidden_size)
         episode_start = np.ones(config.num_envs, dtype=bool)

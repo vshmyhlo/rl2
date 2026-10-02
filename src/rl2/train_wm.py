@@ -4,7 +4,7 @@ Run with ``uv run python -m rl2.train_wm --config configs/train_wm_atari.yaml``.
 The convolutional encoder accepts uint8 frames and normalizes them internally;
 reconstruction targets use [0, 1] and rewards retain their environment scale.
 Each rollout receives one Adam update using
-next-frame MSE, reward MSE, and terminal
+posterior reconstruction, balanced categorical KL, reward MSE, and terminal
 binary cross entropy. Mamba history crosses chunks with truncated BPTT and
 resets at episode boundaries. No policy is learned.
 """
@@ -30,9 +30,9 @@ from google.cloud import storage
 from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
-from rl2.mamba3 import Mamba3StackCarry
+from rl2.observation_encoder import ConvStage, ConvStages, validate_stages
 from rl2.ppo import make_env
-from rl2.wm import MambaWorldModel
+from rl2.wm import MambaWorldModel, WorldModelState, categorical_kl, check_keys, latent_kl_losses
 
 
 @dataclass(frozen=True)
@@ -49,9 +49,15 @@ class Config:
     d_model: int
     num_layers: int
     d_intermediate: int | None
-    encoder_channels: tuple[int, ...]
+    encoder_stages: ConvStages
     d_state: int
     headdim: int
+    stochastic_size: int
+    stochastic_classes: int
+    unimix: float
+    dynamics_kl_scale: float
+    representation_kl_scale: float
+    free_nats: float
     learning_rate: float
     max_grad_norm: float
     log_dir: str
@@ -63,7 +69,6 @@ class Config:
     video_num_steps: int
     video_fps: float
     bf16: bool = True
-    encoder_max_flattened_size: int | None = 8192
 
     def __post_init__(self) -> None:
         for value in (
@@ -74,6 +79,8 @@ class Config:
             self.num_layers,
             self.d_state,
             self.headdim,
+            self.stochastic_size,
+            self.stochastic_classes,
             self.log_every,
             self.log_flush_secs,
             self.checkpoint_every,
@@ -86,13 +93,15 @@ class Config:
         if self.d_intermediate is not None:
             chex.assert_type(self.d_intermediate, int)
             chex.assert_scalar_non_negative(self.d_intermediate)
-        chex.assert_scalar_positive(len(self.encoder_channels))
-        for channels in self.encoder_channels:
-            chex.assert_type(channels, int)
-            chex.assert_scalar_positive(channels)
-        if self.encoder_max_flattened_size is not None:
-            chex.assert_type(self.encoder_max_flattened_size, int)
-            chex.assert_scalar_non_negative(self.encoder_max_flattened_size - self.encoder_channels[-1])
+        if self.stochastic_classes < 2:
+            raise ValueError("stochastic_classes must be at least two")
+        if not np.isfinite(self.unimix) or not 0 <= self.unimix < 1:
+            raise ValueError("unimix must be finite and in [0, 1)")
+        for value in (self.dynamics_kl_scale, self.representation_kl_scale, self.free_nats):
+            chex.assert_scalar_non_negative(value)
+            if not np.isfinite(value):
+                raise ValueError("KL scales and free_nats must be finite")
+        validate_stages(self.encoder_stages)
         if self.observation_size is not None:
             chex.assert_type(self.observation_size, int)
             chex.assert_scalar_positive(self.observation_size)
@@ -119,8 +128,8 @@ def load_config(path: str | Path) -> Config:
         settings = yaml.safe_load(file)
     if not isinstance(settings, dict):
         raise TypeError("The YAML config must contain a mapping of training settings")
-    if "encoder_channels" in settings:
-        settings["encoder_channels"] = tuple(settings["encoder_channels"])
+    if "encoder_stages" in settings:
+        settings["encoder_stages"] = tuple(ConvStage(**stage) for stage in settings["encoder_stages"])
     return Config(**settings)
 
 
@@ -188,29 +197,66 @@ def collect_rollout(
 
 @partial(jax.jit, static_argnames=("model",))
 def update(
-    state: TrainState, model: MambaWorldModel, batch: Batch, carry: Mamba3StackCarry
-) -> tuple[TrainState, Mamba3StackCarry, dict[str, jax.Array]]:
-    """One supervised update; terminal labels exclude time-limit truncations."""
+    state: TrainState,
+    model: MambaWorldModel,
+    batch: Batch,
+    carry: WorldModelState,
+    key: jax.Array,
+    dynamics_kl_scale: float,
+    representation_kl_scale: float,
+    free_nats: float,
+) -> tuple[TrainState, WorldModelState, dict[str, jax.Array]]:
+    """Train posterior reconstruction and balanced KL using a fresh sampling key.
+
+    Carry is detached only at chunk boundaries. The Gaussian reconstruction
+    term sums pixels per frame; observation_loss retains mean pixel MSE for
+    readable logs. KL sums categorical variables and applies free_nats per
+    transition before batch averaging, independently for the two gradient paths.
+    """
     batch.validate()
+    check_keys(key, ())
     chex.assert_trees_all_equal_shapes_and_dtypes(carry, model.initial_carry(batch.actions.shape[1]))
     carry = jax.tree.map(jax.lax.stop_gradient, carry)
     targets = batch.next_observations.astype(jnp.float32) / 255.0
+    keys = jax.random.split(key, batch.actions.shape[0])
 
-    def loss_fn(params: optax.Params) -> tuple[jax.Array, tuple[Mamba3StackCarry, dict[str, jax.Array]]]:
-        final_carry, _, prediction = state.apply_fn(
-            {"params": params}, batch.observations, batch.actions, carry, batch.episode_starts, method=model.observe
+    def loss_fn(params: optax.Params) -> tuple[jax.Array, tuple[WorldModelState, dict[str, jax.Array]]]:
+        final_carry, output = state.apply_fn(
+            {"params": params},
+            batch.observations,
+            batch.actions,
+            batch.next_observations,
+            keys,
+            carry,
+            batch.episode_starts,
+            method=model.observe,
         )
-        observation_loss = jnp.mean(jnp.square(prediction.observation - targets))
+        prediction = output.prediction
+        squared_error = jnp.square(prediction.observation - targets)
+        observation_loss = jnp.mean(squared_error)
+        # Fixed unit-variance Gaussian negative log likelihood, omitting constants.
+        reconstruction_loss = 0.5 * jnp.mean(jnp.sum(squared_error, axis=tuple(range(2, squared_error.ndim))))
         reward_loss = jnp.mean(jnp.square(prediction.reward - batch.rewards))
         termination_loss = jnp.mean(
             optax.sigmoid_binary_cross_entropy(prediction.termination_logits, batch.terminated.astype(jnp.float32))
         )
-        loss = observation_loss + reward_loss + termination_loss
+        prior, posterior = output.prior_logits, output.posterior_logits
+        dynamics_kl = categorical_kl(posterior, prior)
+        dynamics_loss, representation_loss = latent_kl_losses(posterior, prior, free_nats)
+        kl_loss = dynamics_kl_scale * dynamics_loss + representation_kl_scale * representation_loss
+        loss = reconstruction_loss + reward_loss + termination_loss + kl_loss
         metrics = {
             "loss": loss,
             "observation_loss": observation_loss,
+            "reconstruction_loss": reconstruction_loss,
             "reward_loss": reward_loss,
             "termination_loss": termination_loss,
+            "kl_loss": kl_loss,
+            "dynamics_kl_loss": dynamics_loss,
+            "representation_kl_loss": representation_loss,
+            "kl": dynamics_kl.mean(),
+            "prior_entropy": -jnp.sum(jnp.exp(prior) * prior, axis=(-2, -1)).mean(),
+            "posterior_entropy": -jnp.sum(jnp.exp(posterior) * posterior, axis=(-2, -1)).mean(),
         }
         return loss, (final_carry, metrics)
 
@@ -220,23 +266,22 @@ def update(
     return state.apply_gradients(grads=gradients), jax.tree.map(jax.lax.stop_gradient, carry), metrics
 
 
-type ImaginationCarry = tuple[Mamba3StackCarry, jax.Array]
-
-
 @partial(jax.jit, static_argnames=("model",))
 def imagine_frames(
     state: TrainState,
     model: MambaWorldModel,
     observation: jax.Array,
-    carry: Mamba3StackCarry,
+    carry: WorldModelState,
     episode_start: jax.Array,
     actions: jax.Array,
+    key: jax.Array,
 ) -> jax.Array:
-    """Return the real seed frame followed by fixed-horizon imagined observations.
+    """Return a real seed frame followed by samples from the learned prior.
 
-    Inputs describe one environment. Only the seed observation is encoded;
-    subsequent steps feed back predicted latents. Predicted termination does
-    not reset or stop this diagnostic rollout.
+    Inputs describe one environment: uint8 [1, *image], bool [1] reset mask,
+    int32 [time, 1] actions, aligned world-model state, and a scalar JAX key.
+    Only the seed frame conditions a posterior. Each imagined sample feeds the
+    next transition. Fixed-horizon videos ignore predicted termination.
     """
     chex.assert_shape(observation, (1, *model.observation_shape))
     chex.assert_type(observation, jnp.uint8)
@@ -246,24 +291,33 @@ def imagine_frames(
     chex.assert_shape(actions, (None, 1))
     chex.assert_type(actions, jnp.int32)
     chex.assert_scalar_positive(actions.shape[0])
-    normalized = observation.astype(jnp.float32) / 255.0
-    latent = state.apply_fn({"params": state.params}, observation, method=model.encode)
-    starts = jnp.zeros(actions.shape, dtype=jnp.bool_).at[0].set(episode_start)
+    check_keys(key, ())
+    keys = jax.random.split(key, actions.shape[0] + 1)
+    carry = state.apply_fn(
+        {"params": state.params},
+        observation,
+        carry,
+        episode_start,
+        keys[0],
+        method=model.condition,
+    )
 
-    def step(memory: ImaginationCarry, inputs: tuple[jax.Array, jax.Array]) -> tuple[ImaginationCarry, jax.Array]:
-        history, latent = memory
-        action, reset = inputs
-        chex.assert_shape(latent, (1, model.d_model))
-        chex.assert_type(latent, jnp.float32)
-        chex.assert_shape((action, reset), (1,))
-        chex.assert_type((action, reset), (jnp.int32, jnp.bool_))
-        history, latent, prediction = state.apply_fn(
-            {"params": state.params}, latent, action, history, reset, method=model.imagine
+    def step(memory: WorldModelState, inputs: tuple[jax.Array, jax.Array]) -> tuple[WorldModelState, jax.Array]:
+        action, sample_key = inputs
+        chex.assert_shape(action, (1,))
+        chex.assert_type(action, jnp.int32)
+        check_keys(sample_key, ())
+        memory, prediction = state.apply_fn(
+            {"params": state.params},
+            memory,
+            action,
+            sample_key,
+            method=model.imagine,
         )
-        return (history, latent), prediction.observation[0]
+        return memory, prediction.observation[0]
 
-    _, frames = jax.lax.scan(step, (carry, latent), (actions, starts))
-    return jnp.concatenate((normalized, frames), axis=0)
+    _, frames = jax.lax.scan(step, carry, (actions, keys[1:]))
+    return jnp.concatenate((observation.astype(jnp.float32) / 255.0, frames), axis=0)
 
 
 def log_video(
@@ -272,7 +326,7 @@ def log_video(
     config: Config,
     writer: SummaryWriter,
     observation: NDArray[np.uint8],
-    carry: Mamba3StackCarry,
+    carry: WorldModelState,
     episode_start: NDArray[np.bool_],
     steps: int,
 ) -> None:
@@ -288,7 +342,15 @@ def log_video(
     rng = np.random.default_rng(config.seed)
     actions = rng.integers(model.num_actions, size=(config.video_num_steps, 1), dtype=np.int32)
     frames = np.asarray(
-        imagine_frames(state, model, jnp.asarray(observation), carry, jnp.asarray(episode_start), jnp.asarray(actions))
+        imagine_frames(
+            state,
+            model,
+            jnp.asarray(observation),
+            carry,
+            jnp.asarray(episode_start),
+            jnp.asarray(actions),
+            jax.random.key(config.seed),
+        )
     )
     # make_env returns [stack, height, width] or [stack, height, width, RGB].
     chex.assert_rank(frames, {4, 5})
@@ -352,16 +414,21 @@ def train(config: Config) -> str:
             d_model=config.d_model,
             num_layers=config.num_layers,
             d_intermediate=config.d_intermediate,
-            encoder_channels=config.encoder_channels,
-            encoder_max_flattened_size=config.encoder_max_flattened_size,
+            encoder_stages=config.encoder_stages,
             d_state=config.d_state,
             headdim=config.headdim,
+            stochastic_size=config.stochastic_size,
+            stochastic_classes=config.stochastic_classes,
+            unimix=config.unimix,
             dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
         )
+        parameter_key, sample_key, training_key = jax.random.split(jax.random.key(config.seed), 3)
         params = model.init(
-            jax.random.key(config.seed),
+            parameter_key,
             jnp.asarray(observation[:1]),
             jnp.zeros(1, dtype=jnp.int32),
+            jnp.asarray(observation[:1]),
+            sample_key,
         )["params"]
         state = TrainState.create(
             apply_fn=model.apply,
@@ -393,7 +460,16 @@ def train(config: Config) -> str:
         while steps < config.total_steps:
             num_steps = min(config.num_steps, (config.total_steps - steps) // config.num_envs)
             batch, observation, episode_start = collect_rollout(envs, observation, episode_start, rng, num_steps)
-            state, carry, metrics = update(state, model, batch, carry)
+            state, carry, metrics = update(
+                state,
+                model,
+                batch,
+                carry,
+                jax.random.fold_in(training_key, state.step),
+                config.dynamics_kl_scale,
+                config.representation_kl_scale,
+                config.free_nats,
+            )
             values = {name: float(value) for name, value in jax.device_get(metrics).items()}
             if not all(np.isfinite(value) for value in values.values()):
                 raise FloatingPointError(f"Non-finite training metrics: {values}")
@@ -408,7 +484,7 @@ def train(config: Config) -> str:
                 print(
                     f"steps={steps}/{config.total_steps} loss={values['loss']:.4f} "
                     f"observation={values['observation_loss']:.4f} reward={values['reward_loss']:.4f} "
-                    f"termination={values['termination_loss']:.4f}",
+                    f"termination={values['termination_loss']:.4f} kl={values['kl']:.4f}",
                     flush=True,
                 )
                 writer.flush()

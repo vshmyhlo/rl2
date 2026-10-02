@@ -22,7 +22,8 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 from tensorboardX import SummaryWriter
 
 from rl2 import train_wm
-from rl2.wm import MambaWorldModel
+from rl2.observation_encoder import ConvStage
+from rl2.wm import MambaWorldModel, categorical_kl
 
 
 def training_config(**overrides: Any) -> train_wm.Config:
@@ -81,7 +82,17 @@ def test_random_collection_preserves_terminal_frames_and_reset_masks() -> None:
 
 
 def test_update_targets_losses_carry_and_learning() -> None:
-    model = MambaWorldModel((1, 2, 2), 3, d_model=8, num_layers=2, d_state=4, headdim=4, encoder_channels=(4,))
+    model = MambaWorldModel(
+        (1, 2, 2),
+        3,
+        d_model=8,
+        num_layers=2,
+        d_state=4,
+        headdim=4,
+        encoder_stages=(ConvStage(4),),
+        stochastic_size=4,
+        stochastic_classes=4,
+    )
     batch = train_wm.Batch(
         observations=jnp.zeros((3, 2, 1, 2, 2), jnp.uint8),
         actions=jnp.arange(6, dtype=jnp.int32).reshape(3, 2) % 3,
@@ -91,13 +102,23 @@ def test_update_targets_losses_carry_and_learning() -> None:
         episode_starts=jnp.array([[True, True], [False, False], [True, True]]),
     )
     inputs = batch.observations
-    variables = model.init(jax.random.key(0), inputs, batch.actions)
+    key = jax.random.key(17)
+    keys = jax.random.split(key, batch.actions.shape[0])
+    variables = model.init(jax.random.key(0), inputs, batch.actions, batch.next_observations, keys)
     state = TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optax.adam(1e-3))
     carry = model.initial_carry(2)
-    expected_carry, _, prediction = model.apply(
-        variables, inputs, batch.actions, carry, batch.episode_starts, method=model.observe
+    expected_carry, output = model.apply(
+        variables,
+        inputs,
+        batch.actions,
+        batch.next_observations,
+        keys,
+        carry,
+        batch.episode_starts,
+        method=model.observe,
     )
-    state, final, metrics = train_wm.update(state, model, batch, carry)
+    prediction = output.prediction
+    state, final, metrics = train_wm.update(state, model, batch, carry, key, 1.0, 0.1, 0.0)
     expected_observation = jnp.square(prediction.observation - 128 / 255.0).mean()
     expected_reward = jnp.square(prediction.reward - 1.0).mean()
     expected_terminal = optax.sigmoid_binary_cross_entropy(
@@ -106,13 +127,17 @@ def test_update_targets_losses_carry_and_learning() -> None:
     np.testing.assert_allclose(metrics["observation_loss"], expected_observation, rtol=1e-5)
     np.testing.assert_allclose(metrics["reward_loss"], expected_reward, rtol=1e-5)
     np.testing.assert_allclose(metrics["termination_loss"], expected_terminal, rtol=1e-5)
-    np.testing.assert_allclose(metrics["loss"], expected_observation + expected_reward + expected_terminal, rtol=1e-5)
+    expected_kl = categorical_kl(output.posterior_logits, output.prior_logits).mean()
+    np.testing.assert_allclose(metrics["kl"], expected_kl, rtol=1e-5)
+    np.testing.assert_allclose(
+        metrics["loss"], 2 * expected_observation + expected_reward + expected_terminal + 1.1 * expected_kl, rtol=1e-5
+    )
     chex.assert_trees_all_equal_shapes_and_dtypes(final, expected_carry)
     for actual, expected in zip(jax.tree.leaves(final), jax.tree.leaves(expected_carry)):
         np.testing.assert_allclose(actual, expected, atol=1e-6)
     first_loss = float(metrics["loss"])
     for _ in range(4):
-        state, _, metrics = train_wm.update(state, model, batch, carry)
+        state, _, metrics = train_wm.update(state, model, batch, carry, key, 1.0, 0.1, 0.0)
     assert int(state.step) == 5
     assert float(metrics["loss"]) < first_loss
     assert all(np.isfinite(value) for value in metrics.values())
@@ -180,7 +205,9 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         num_steps=3,
         d_model=8,
         num_layers=2,
-        encoder_channels=(4,),
+        encoder_stages=(ConvStage(4),),
+        stochastic_size=4,
+        stochastic_classes=4,
         d_state=4,
         headdim=4,
         atari_preprocessing=True,
@@ -213,6 +240,8 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
     saved = serialization.msgpack_restore((local_checkpoint_dir / "checkpoint.msgpack").read_bytes())
     assert int(saved["step"]) == 2
     assert "layers_1" in saved["params"]["dynamics"]
+    assert "prior_head" in saved["params"]
+    assert "posterior_head" in saved["params"]
     assert "opt_state" in saved
     metadata = json.loads((local_dir / "config.json").read_text())
     assert json.loads((local_checkpoint_dir / "config.json").read_text()) == metadata
@@ -220,6 +249,9 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
     assert metadata["observation_shape"] == [1, 2, 2]
     events = EventAccumulator(str(local_dir)).Reload()
     assert [event.step for event in events.Scalars("train/loss")] == [6, 10]
+    assert [event.step for event in events.Scalars("train/kl")] == [6, 10]
+    assert events.Scalars("train/prior_entropy")
+    assert events.Scalars("train/posterior_entropy")
     config_text = events.Tensors("config/text_summary")[0].tensor_proto.string_val[0].decode()
     assert config_text.startswith("```yaml\n")
     assert config.log_dir in config_text
@@ -248,13 +280,18 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         {"video_fps": float("inf")},
         {"log_flush_secs": 0},
         {"log_flush_secs": -1},
-        {"encoder_channels": ()},
-        {"encoder_channels": (4, 0)},
+        {"encoder_stages": ()},
+        {"encoder_stages": (ConvStage(4), ConvStage(8, project=False))},
         {"num_layers": 0},
         {"d_intermediate": -1},
-        {"encoder_max_flattened_size": 0},
-        {"encoder_max_flattened_size": 3},
-        {"encoder_max_flattened_size": 8192.5},
+        {"stochastic_size": 0},
+        {"stochastic_classes": 1},
+        {"unimix": -0.1},
+        {"unimix": 1.0},
+        {"unimix": float("nan")},
+        {"dynamics_kl_scale": -1},
+        {"representation_kl_scale": float("inf")},
+        {"free_nats": -1},
     ],
 )
 def test_invalid_config(options: dict[str, Any]) -> None:
@@ -263,23 +300,37 @@ def test_invalid_config(options: dict[str, Any]) -> None:
 
 
 def test_imagination_feeds_back_latents_and_resets_history() -> None:
-    model = MambaWorldModel((2, 3, 4), 3, d_model=8, num_layers=2, d_state=4, headdim=4, encoder_channels=(4,))
+    model = MambaWorldModel(
+        (2, 3, 4),
+        3,
+        d_model=8,
+        num_layers=2,
+        d_state=4,
+        headdim=4,
+        encoder_stages=(ConvStage(4),),
+        stochastic_size=4,
+        stochastic_classes=4,
+    )
     observation = jnp.arange(24, dtype=jnp.uint8).reshape((1, 2, 3, 4))
     normalized = observation.astype(jnp.float32) / 255.0
     actions = jnp.array([[0], [1], [2]], jnp.int32)
-    variables = model.init(jax.random.key(8), observation, actions[0])
+    key = jax.random.key(8)
+    variables = model.init(key, observation, actions[0], observation, key)
     state = TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optax.sgd(0.01))
-    history, _, _ = model.apply(variables, observation, actions[0], method=model.observe)
-    frames = train_wm.imagine_frames(state, model, observation, history, jnp.zeros(1, jnp.bool_), actions)
+    history, _ = model.apply(variables, observation, actions[0], observation, key, method=model.observe)
+    frames = train_wm.imagine_frames(state, model, observation, history, jnp.zeros(1, jnp.bool_), actions, key)
     chex.assert_shape(frames, (4, 2, 3, 4))
     chex.assert_type(frames, jnp.float32)
     np.testing.assert_array_equal(frames[0], normalized[0])
-    latent = model.apply(variables, observation, method=model.encode)
+    keys = jax.random.split(key, 4)
+    history = model.apply(variables, observation, history, jnp.zeros(1, jnp.bool_), keys[0], method=model.condition)
     for index, action in enumerate(actions):
-        history, latent, prediction = model.apply(variables, latent, action, history, method=model.imagine)
+        history, prediction = model.apply(variables, history, action, keys[index + 1], method=model.imagine)
         np.testing.assert_allclose(frames[index + 1], prediction.observation[0], atol=2e-6)
-    reset = train_wm.imagine_frames(state, model, observation, history, jnp.ones(1, jnp.bool_), actions)
-    fresh = train_wm.imagine_frames(state, model, observation, model.initial_carry(1), jnp.zeros(1, jnp.bool_), actions)
+    reset = train_wm.imagine_frames(state, model, observation, history, jnp.ones(1, jnp.bool_), actions, key)
+    fresh = train_wm.imagine_frames(
+        state, model, observation, model.initial_carry(1), jnp.zeros(1, jnp.bool_), actions, key
+    )
     np.testing.assert_allclose(reset, fresh, atol=2e-6)
 
 
@@ -288,7 +339,17 @@ def test_video_uses_newest_frame_clips_pixels_and_has_repeatable_actions(
     monkeypatch: pytest.MonkeyPatch, rgb: bool
 ) -> None:
     shape = (2, 3, 4, 3) if rgb else (2, 3, 4)
-    model = MambaWorldModel(shape, 3, d_model=8, num_layers=2, d_state=4, headdim=4, encoder_channels=(4,))
+    model = MambaWorldModel(
+        shape,
+        3,
+        d_model=8,
+        num_layers=2,
+        d_state=4,
+        headdim=4,
+        encoder_stages=(ConvStage(4),),
+        stochastic_size=4,
+        stochastic_classes=4,
+    )
     config = training_config(video_num_steps=2, video_fps=12)
     frames = np.ones((3, *shape), np.float32)
     frames[:, -1] = np.array([-1, 0.5, 2], np.float32).reshape((3,) + (1,) * (len(shape) - 1))
@@ -317,7 +378,10 @@ def test_video_uses_newest_frame_clips_pixels_and_has_repeatable_actions(
     chex.assert_type(video, np.uint8)
     for frame, value in zip(video[0], (0, 128, 255)):
         np.testing.assert_array_equal(frame, np.full_like(frame, value))
-    np.testing.assert_array_equal(imagine.call_args_list[0].args[-1], imagine.call_args_list[1].args[-1])
+    np.testing.assert_array_equal(imagine.call_args_list[0].args[-2], imagine.call_args_list[1].args[-2])
+    np.testing.assert_array_equal(
+        jax.random.key_data(imagine.call_args_list[0].args[-1]), jax.random.key_data(imagine.call_args_list[1].args[-1])
+    )
 
 
 def test_bf16_is_default_and_can_be_disabled(tmp_path: Path) -> None:

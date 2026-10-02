@@ -9,9 +9,23 @@ import optax
 import pytest
 from flax import linen as nn
 
-from rl2.mamba3 import Mamba3StackCarry
-from rl2.observation_encoder import ConvObservationEncoder
-from rl2.wm import MambaWorldModel, Prediction
+from rl2.observation_encoder import ConvObservationEncoder, ConvStage
+from rl2.wm import MambaWorldModel, ObserveInputs, WorldModelState, categorical_kl, latent_kl_losses
+
+
+def small_model(**kwargs: Any) -> MambaWorldModel:
+    settings = {
+        "observation_shape": (1, 4, 4),
+        "num_actions": 3,
+        "d_model": 8,
+        "num_layers": 2,
+        "d_state": 4,
+        "headdim": 4,
+        "encoder_stages": (ConvStage(4),),
+        "stochastic_size": 4,
+        "stochastic_classes": 4,
+    }
+    return MambaWorldModel(**(settings | kwargs))
 
 
 def assert_tree_close(actual: Any, expected: Any, *, atol: float = 3e-6) -> None:
@@ -20,188 +34,216 @@ def assert_tree_close(actual: Any, expected: Any, *, atol: float = 3e-6) -> None
         np.testing.assert_allclose(a, b, rtol=3e-5, atol=atol)
 
 
-@pytest.mark.parametrize("rank,rgb,depth", [(1, False, 1), (2, True, 3)])
-def test_sequence_steps_chunks_and_base_interface_agree(rank: int, rgb: bool, depth: int) -> None:
+@pytest.mark.parametrize("rank,rgb,depth", [(1, False, 4), (2, True, 2)])
+def test_sequence_steps_chunks_and_initialization_agree(rank: int, rgb: bool, depth: int) -> None:
     shape = (2, 4, 4, 3) if rgb else (2, 4, 4)
-    model = MambaWorldModel(
-        shape, 3, d_model=8, num_layers=depth, d_state=4, headdim=4, mimo_rank=rank, encoder_channels=(4,)
-    )
+    model = small_model(observation_shape=shape, num_layers=depth, mimo_rank=rank)
     obs = jax.random.randint(jax.random.key(0), (5, 2, *shape), 0, 256, dtype=jnp.uint8)
-    actions = jnp.arange(10, dtype=jnp.int32).reshape(5, 2) % 3
-    # Initializing the original interface creates every parameter used by the
-    # recurrent methods, even when initialization only sees a single step.
-    variables = model.init(jax.random.key(1), obs[0], actions[0])
+    actions = jnp.arange(8, dtype=jnp.int32).reshape(4, 2) % 3
+    keys = jax.random.split(jax.random.key(1), 4)
+    # Single-step initialization must create parameters used by all other APIs.
+    variables = model.init(jax.random.key(2), obs[0], actions[0], obs[1], keys[0])
     observe = jax.jit(partial(model.apply, variables, method=model.observe))
-    final, latents, prediction = observe(obs, actions)
-    chex.assert_shape(latents, (5, 2, 8))
-    chex.assert_shape(prediction.observation, obs.shape)
-    chex.assert_shape((prediction.reward, prediction.termination_logits), (5, 2))
-    chex.assert_type(jax.tree.leaves((final, latents, prediction)), jnp.float32)
-    assert len(final) == depth
+    final, output = observe(obs[:-1], actions, obs[1:], keys)
+    chex.assert_shape(output.features, (4, 2, 24))
+    chex.assert_shape((output.prior_logits, output.posterior_logits), (4, 2, 4, 4))
+    chex.assert_shape(output.prediction.observation, (4, 2, *shape))
+    chex.assert_shape((output.prediction.reward, output.prediction.termination_logits), (4, 2))
+    chex.assert_type(jax.tree.leaves(output), jnp.float32)
+    assert len(final.memory) == depth
+    np.testing.assert_array_equal(final.stoch.sum(-1), 1)
+    assert set(np.unique(final.stoch)) <= {0, 1}
     for index in range(depth):
         assert f"layers_{index}" in variables["params"]["dynamics"]
-
-    def step(
-        carry: Mamba3StackCarry, inputs: tuple[jax.Array, jax.Array]
-    ) -> tuple[Mamba3StackCarry, tuple[jax.Array, Prediction]]:
-        observation, action = inputs
-        chex.assert_shape(observation, (2, *shape))
-        chex.assert_type(observation, jnp.uint8)
-        chex.assert_shape(action, (2,))
-        chex.assert_type(action, jnp.int32)
-        carry, latent, output = observe(observation, action, carry)
-        return carry, (latent, output)
-
-    stepped, (step_latents, step_prediction) = jax.lax.scan(step, model.initial_carry(2), (obs, actions))
-    assert_tree_close((stepped, step_latents, step_prediction), (final, latents, prediction))
-    carry, first_latents, first = observe(obs[:2], actions[:2])
-    carry, last_latents, last = observe(obs[2:], actions[2:], carry)
+    current = model.initial_carry(2)
+    outputs = []
+    for t in range(4):
+        current, result = observe(obs[t], actions[t], obs[t + 1], keys[t], current)
+        outputs.append(result)
+    stacked = jax.tree.map(lambda *x: jnp.stack(x), *outputs)
+    assert_tree_close((current, stacked), (final, output))
+    current, first = observe(obs[:2], actions[:2], obs[1:3], keys[:2])
+    current, last = observe(obs[2:4], actions[2:], obs[3:], keys[2:], current)
     joined = jax.tree.map(lambda a, b: jnp.concatenate((a, b)), first, last)
-    assert_tree_close((carry, jnp.concatenate((first_latents, last_latents)), joined), (final, latents, prediction))
-    # Eager and fused JIT kernels can accumulate slightly different float32 rounding.
-    assert_tree_close(model.apply(variables, obs, actions), (latents, prediction), atol=5e-6)
+    assert_tree_close((current, joined), (final, output))
     encoded = model.apply(variables, obs, method=model.encode)
-    # The shared encoder receives intact images; only time/batch are flattened.
-    encoder = ConvObservationEncoder(encoder_channels=(4,), embedding_size=8)
-    expected_encoding = encoder.apply({"params": variables["params"]["encoder"]}, obs.reshape((10, *shape)))
-    assert_tree_close(encoded, expected_encoding.reshape((5, 2, 8)))
-    transitioned = model.apply(variables, encoded, actions, method=model.transition)
-    assert_tree_close(transitioned, latents)
-    assert_tree_close(model.apply(variables, latents, method=model.decode), prediction)
-    empty_carry, empty_latents, empty_prediction = observe(obs[:0], actions[:0], final)
-    assert_tree_close(empty_carry, final)
-    chex.assert_shape(empty_latents, (0, 2, 8))
-    chex.assert_shape(empty_prediction.observation, (0, 2, *shape))
+    encoder = ConvObservationEncoder(stages=(ConvStage(4),), embedding_size=8)
+    expected = encoder.apply({"params": variables["params"]["encoder"]}, obs.reshape((10, *shape)))
+    assert_tree_close(encoded, expected.reshape((5, 2, 8)))
+    assert_tree_close(model.apply(variables, output.features, method=model.decode), output.prediction)
 
 
-def test_episode_resets_and_causality() -> None:
-    model = MambaWorldModel((1, 4, 4), 2, d_model=8, num_layers=2, d_state=4, headdim=4, encoder_channels=(4,))
-    obs = jax.random.randint(jax.random.key(2), (6, 2, 1, 4, 4), 0, 256, dtype=jnp.uint8)
-    actions = jnp.arange(12, dtype=jnp.int32).reshape(6, 2) % 2
-    variables = model.init(jax.random.key(3), obs, actions)
+def test_episode_resets_causality_and_no_future_leakage() -> None:
+    model = small_model()
+    obs = jax.random.randint(jax.random.key(3), (5, 2, 1, 4, 4), 0, 256, dtype=jnp.uint8)
+    actions = jnp.arange(8, dtype=jnp.int32).reshape(4, 2) % 3
+    keys = jax.random.split(jax.random.key(4), 4)
+    variables = model.init(jax.random.key(5), obs[0], actions[0], obs[1], keys[0])
     observe = jax.jit(partial(model.apply, variables, method=model.observe))
-    starts = jnp.zeros((6, 2), dtype=jnp.bool_).at[3, 0].set(True)
-    final, latents, predictions = observe(obs, actions, episode_starts=starts)
-    fresh = observe(obs[3:, :1], actions[3:, :1])
-    continuous = observe(obs[:, 1:], actions[:, 1:])
-    assert_tree_close(
-        (jax.tree.map(lambda x: x[:1], final), latents[3:, :1], jax.tree.map(lambda x: x[3:, :1], predictions)),
-        fresh,
-    )
-    assert_tree_close(
-        (jax.tree.map(lambda x: x[1:], final), latents[:, 1:], jax.tree.map(lambda x: x[:, 1:], predictions)),
-        continuous,
-    )
-    assert_tree_close(observe(obs[0], actions[0], final, jnp.ones(2, dtype=jnp.bool_)), observe(obs[0], actions[0]))
-    _, baseline, _ = observe(obs, actions)
-    _, changed, _ = observe(obs.at[3:].set(100), actions.at[3:].set(1 - actions[3:]))
-    np.testing.assert_array_equal(changed[:3], baseline[:3])
-    # Changing the action with the observation held fixed affects predictions.
-    _, other_action, _ = observe(obs[0], 1 - actions[0])
-    assert not np.allclose(other_action, baseline[0])
-    # Incoming memory matters when there is no reset.
-    _, continued, _ = observe(obs[0], actions[0], final)
-    assert not np.allclose(continued, baseline[0])
+    starts = jnp.zeros((4, 2), jnp.bool_).at[2].set(True)
+    final, output = observe(obs[:-1], actions, obs[1:], keys, episode_starts=starts)
+    fresh, fresh_output = observe(obs[2:-1], actions[2:], obs[3:], keys[2:])
+    assert_tree_close((final, jax.tree.map(lambda x: x[2:], output)), (fresh, fresh_output))
+    # Changing the target affects this step's posterior, but not its prior.
+    _, changed = observe(obs[:-1], actions, obs[1:].at[2:].set(255), keys)
+    _, baseline = observe(obs[:-1], actions, obs[1:], keys)
+    np.testing.assert_allclose(changed.prior_logits[:3], baseline.prior_logits[:3], atol=1e-6)
+    assert not np.allclose(changed.posterior_logits[2], baseline.posterior_logits[2])
+    np.testing.assert_array_equal(changed.features[:2], baseline.features[:2])
+    # Selective reset clears history only for the selected environment.
+    mask = jnp.array([True, False])
+    continued, _ = observe(obs[0], actions[0], obs[1], keys[0], final)
+    reset, _ = observe(obs[0], actions[0], obs[1], keys[0], final, mask)
+    zero, _ = observe(obs[0], actions[0], obs[1], keys[0])
+    assert_tree_close(jax.tree.map(lambda x: x[:1], reset), jax.tree.map(lambda x: x[:1], zero))
+    assert_tree_close(jax.tree.map(lambda x: x[1:], reset), jax.tree.map(lambda x: x[1:], continued))
+
+
+def test_sampling_reproducibility_and_effect_on_future_dynamics() -> None:
+    model = small_model()
+    obs = jnp.full((2, 1, 4, 4), 120, jnp.uint8)
+    actions = jnp.zeros(2, jnp.int32)
+    key = jax.random.key(6)
+    variables = model.init(key, obs, actions, obs, key)
+    initial = model.apply(variables, obs, model.initial_carry(2), jnp.ones(2, jnp.bool_), key, method=model.condition)
+    imagine = jax.jit(partial(model.apply, variables, method=model.imagine))
+    first, image = imagine(initial, actions, jax.random.key(7))
+    assert_tree_close((first, image), imagine(initial, actions, jax.random.key(7)))
+    second, other = imagine(initial, actions, jax.random.key(8))
+    assert not np.array_equal(first.stoch, second.stoch)
+    assert not np.allclose(image.observation, other.observation)
+    np.testing.assert_array_equal(first.deter, second.deter)
+    future_a, _ = imagine(first, actions, key)
+    future_b, _ = imagine(second, actions, key)
+    assert not np.allclose(future_a.deter, future_b.deter)
+    assert not np.allclose(imagine(initial, 1 + actions, key)[0].deter, first.deter)
+    # Imagination cannot consult the posterior or encoder.
+    poisoned = jax.tree.map(lambda x: x, variables)
+    for name in ("posterior_hidden", "posterior_head", "encoder"):
+        poisoned["params"][name] = jax.tree.map(lambda x: jnp.full_like(x, jnp.nan), poisoned["params"][name])
+    assert_tree_close(model.apply(poisoned, initial, actions, jax.random.key(7), method=model.imagine), (first, image))
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_imagination_gradients_and_training(dtype: jax.typing.DTypeLike) -> None:
-    model = MambaWorldModel(
-        (1, 4, 4), 2, d_model=8, num_layers=2, d_state=4, headdim=4, dtype=dtype, encoder_channels=(4,)
-    )
-    obs = jax.random.randint(jax.random.key(4), (4, 2, 1, 4, 4), 0, 256, dtype=jnp.uint8)
-    actions = jnp.arange(8, dtype=jnp.int32).reshape(4, 2) % 2
-    variables = model.init(jax.random.key(5), obs, actions)
+def test_straight_through_gradients_and_compute_dtypes(dtype: jax.typing.DTypeLike) -> None:
+    model = small_model(dtype=dtype)
+    obs = jax.random.randint(jax.random.key(9), (3, 2, 1, 4, 4), 0, 256, dtype=jnp.uint8)
+    actions = jnp.array([[0, 1], [1, 2]], jnp.int32)
+    keys = jax.random.split(jax.random.key(10), 2)
+    variables = model.init(jax.random.key(11), obs[0], actions[0], obs[1], keys[0])
 
-    def capture_compute_layers(module: nn.Module, method: str) -> bool:
+    def capture(module: nn.Module, method: str) -> bool:
         return method == "__call__" and isinstance(module, (nn.Conv, nn.Dense, nn.Embed))
 
-    (carry, latent, _), captured = model.apply(
-        variables,
-        obs[0],
-        actions[0],
-        method=model.observe,
-        capture_intermediates=capture_compute_layers,
-        mutable=["intermediates"],
+    (_, out), intermediates = model.apply(
+        variables, obs[0], actions[0], obs[1], keys[0], capture_intermediates=capture, mutable=["intermediates"]
     )
-    # Includes encoder, dynamics/MLP projections, decoder, and prediction heads.
-    chex.assert_type(jax.tree.leaves(captured), dtype)
-    chex.assert_type(jax.tree.leaves(variables["params"]), jnp.float32)
-
-    def rollout_step(
-        state: tuple[Mamba3StackCarry, jax.Array], action: jax.Array
-    ) -> tuple[tuple[Mamba3StackCarry, jax.Array], Prediction]:
-        chex.assert_shape(action, (2,))
-        chex.assert_type(action, jnp.int32)
-        carry, latent = state
-        chex.assert_shape(latent, (2, 8))
-        chex.assert_type(latent, jnp.float32)
-        carry, latent, prediction = model.apply(variables, latent, action, carry, method=model.imagine)
-        return (carry, latent), prediction
-
-    (_, imagined), predictions = jax.jit(partial(jax.lax.scan, rollout_step))((carry, latent), actions)
-    chex.assert_shape(imagined, (2, 8))
-    chex.assert_shape(predictions.observation, obs.shape)
-    chex.assert_type(jax.tree.leaves(predictions), jnp.float32)
-    assert all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(carry))
+    chex.assert_type(jax.tree.leaves(intermediates), dtype)
+    chex.assert_type(jax.tree.leaves((variables["params"], out)), jnp.float32)
 
     def loss_fn(params: optax.Params) -> jax.Array:
-        _, _, output = model.apply({"params": params}, obs, actions, method=model.observe)
-        observation_loss = jnp.mean(jnp.square(output.observation - 0.5))
-        reward_loss = jnp.mean(jnp.square(output.reward - 1.0))
-        terminal_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(output.termination_logits, jnp.zeros((4, 2))))
-        return observation_loss + reward_loss + terminal_loss
+        _, result = model.apply({"params": params}, obs[:-1], actions, obs[1:], keys)
+        prediction = result.prediction
+        return (
+            jnp.square(prediction.observation - obs[1:] / 255).mean()
+            + jnp.square(prediction.reward - 1).mean()
+            + optax.sigmoid_binary_cross_entropy(prediction.termination_logits, jnp.zeros((2, 2))).mean()
+            + categorical_kl(result.posterior_logits, result.prior_logits).mean()
+        )
 
     loss, gradients = jax.jit(jax.value_and_grad(loss_fn))(variables["params"])
     assert np.isfinite(loss)
-    for component in gradients.values():
-        assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(component))
-        assert any(np.any(np.asarray(leaf) != 0) for leaf in jax.tree.leaves(component))
-    for index in range(model.num_layers):
-        layer = gradients["dynamics"][f"layers_{index}"]
-        assert np.any(np.asarray(layer["mixer"]["in_proj"]["kernel"]) != 0)
-        assert np.any(np.asarray(layer["fc1"]["kernel"]) != 0)
-    updates = jax.tree.map(lambda gradient: -0.01 * gradient, gradients)
-    updated = optax.apply_updates(variables["params"], updates)
-    assert float(loss_fn(updated)) < float(loss)
+    for name, component in gradients.items():
+        assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(component)), name
+        assert any(np.any(np.asarray(leaf) != 0) for leaf in jax.tree.leaves(component)), name
+    for layer in gradients["dynamics"].values():
+        if "mixer" in layer:
+            assert np.any(np.asarray(layer["mixer"]["in_proj"]["kernel"]) != 0)
 
 
-def test_invalid_shapes_and_dtypes() -> None:
-    model = MambaWorldModel((1, 4, 4), 2, d_model=8, num_layers=2, d_state=4, headdim=4, encoder_channels=(4,))
-    obs, actions = jnp.zeros((2, 1, 4, 4), jnp.uint8), jnp.zeros(2, dtype=jnp.int32)
-    variables = model.init(jax.random.key(6), obs, actions)
+def test_kl_values_gradient_routing_and_free_nats() -> None:
+    q = jnp.log(jnp.array([[[0.8, 0.2]], [[0.6, 0.4]]], jnp.float32))
+    p = jnp.log(jnp.array([[[0.4, 0.6]], [[0.5, 0.5]]], jnp.float32))
+    expected = np.sum(np.exp(q) * (q - p), axis=(-2, -1))
+    np.testing.assert_allclose(categorical_kl(q, p), expected, rtol=1e-5)
+    np.testing.assert_allclose(categorical_kl(q, q), 0, atol=1e-6)
+    for index in (0, 1):
+        grad_q, grad_p = jax.grad(lambda a, b, index=index: latent_kl_losses(a, b, 0.0)[index], argnums=(0, 1))(q, p)
+        np.testing.assert_array_equal(grad_q if index == 0 else grad_p, 0)
+        assert np.any(np.asarray(grad_p if index == 0 else grad_q) != 0)
+    np.testing.assert_allclose(latent_kl_losses(q, p, 1.0), (1.0, 1.0))
+    floored = jax.grad(lambda a: sum(latent_kl_losses(a, p, 1.0)))(q)
+    np.testing.assert_array_equal(floored, 0)
+
+
+def test_invalid_shapes_dtypes_and_keys() -> None:
+    model = small_model()
+    obs, actions = jnp.zeros((2, 1, 4, 4), jnp.uint8), jnp.zeros(2, jnp.int32)
+    key = jax.random.key(12)
+    variables = model.init(key, obs, actions, obs, key)
     observe = partial(model.apply, variables, method=model.observe)
+    for bad_obs in (obs.astype(jnp.float32), jnp.zeros((2, 1, 4, 5), jnp.uint8)):
+        with pytest.raises(AssertionError):
+            observe(bad_obs, actions, obs, key)
+    for bad_actions in (actions.astype(jnp.float32), actions[:, None]):
+        with pytest.raises(AssertionError):
+            observe(obs, bad_actions, obs, key)
     with pytest.raises(AssertionError):
-        observe(jnp.zeros((2, 1, 4, 5), jnp.uint8), actions)
+        observe(obs, actions, obs, key, model.initial_carry(1))
     with pytest.raises(AssertionError):
-        observe(obs.astype(jnp.float32), actions)
+        observe(obs, actions, obs, key, episode_starts=jnp.zeros(2))
     with pytest.raises(AssertionError):
-        observe(obs, actions.astype(jnp.float32))
-    with pytest.raises(AssertionError):
-        observe(obs, actions[:, None])
-    with pytest.raises(AssertionError):
-        observe(obs, actions, episode_starts=jnp.zeros(2))
-    with pytest.raises(AssertionError):
-        observe(obs, actions, episode_starts=jnp.zeros((1, 2), dtype=jnp.bool_))
-    with pytest.raises(AssertionError):
-        observe(obs, actions, model.initial_carry(1))
-    with pytest.raises(AssertionError):
-        observe(obs, actions, model.initial_carry(2)[:1])
-    with pytest.raises(AssertionError):
-        observe(obs, actions, jax.tree.map(lambda x: x.astype(jnp.bfloat16), model.initial_carry(2)))
-    with pytest.raises(AssertionError):
-        model.apply(variables, jnp.zeros((2, 7)), actions, method=model.imagine)
+        observe(obs, actions, obs, jax.random.split(key, 2))
 
 
-@pytest.mark.parametrize("shape,num_actions", [((0, 4, 4), 2), ((1, 4, 4), 0), ((3.5, 4, 4), 2)])
-def test_invalid_configuration(shape: tuple[int | float, ...], num_actions: int) -> None:
-    model = MambaWorldModel(shape, num_actions, d_model=8, num_layers=2, d_state=4, headdim=4, encoder_channels=(4,))
-    with pytest.raises(AssertionError):
-        model.init(jax.random.key(0), jnp.zeros((2, 1, 4, 4), jnp.uint8), jnp.zeros(2, dtype=jnp.int32))
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"observation_shape": (0, 4, 4)},
+        {"num_actions": 0},
+        {"stochastic_size": 0},
+        {"stochastic_classes": 1},
+        {"unimix": -0.1},
+        {"unimix": 1.0},
+        {"unimix": float("nan")},
+        {"observation_shape": (3,)},
+        {"observation_shape": (1, 4, 4, 2)},
+    ],
+)
+def test_invalid_configuration(settings: dict[str, Any]) -> None:
+    model = small_model(**settings)
+    key = jax.random.key(0)
+    obs = jnp.zeros((2, 1, 4, 4), jnp.uint8)
+    with pytest.raises((AssertionError, ValueError)):
+        model.init(key, obs, jnp.zeros(2, jnp.int32), obs, key)
 
 
-@pytest.mark.parametrize("shape", [(3,), (4, 4), (1, 4, 4, 2)])
-def test_invalid_image_layout(shape: tuple[int, ...]) -> None:
-    model = MambaWorldModel(shape, 2, d_model=8, num_layers=2, d_state=4, headdim=4, encoder_channels=(4,))
-    with pytest.raises(ValueError):
-        model.init(jax.random.key(0), jnp.zeros((2, *shape), jnp.uint8), jnp.zeros(2, jnp.int32))
+def test_gradients_cross_sampled_states_and_stop_at_episode_resets() -> None:
+    model = small_model()
+    key = jax.random.key(20)
+    obs = jnp.ones((1, 1, 4, 4), jnp.uint8)
+    variables = model.init(key, obs, jnp.zeros(1, jnp.int32), obs, key)
+    keys = jax.random.split(key, 3)
+    embeddings = jax.random.normal(key, (3, 1, 8))
+
+    def last_hidden(module: MambaWorldModel, carry: WorldModelState, inputs: ObserveInputs) -> jax.Array:
+        scan = nn.scan(MambaWorldModel._observe_step, variable_broadcast="params", split_rngs={"params": False})
+        final, _ = scan(module, carry, inputs)
+        return final.deter[0, 0]
+
+    def loss_fn(next_embeddings: jax.Array, starts: jax.Array) -> jax.Array:
+        chex.assert_shape(next_embeddings, (3, 1, 8))
+        chex.assert_type(next_embeddings, jnp.float32)
+        chex.assert_shape(starts, (3, 1))
+        chex.assert_type(starts, jnp.bool_)
+        inputs = (embeddings, jnp.zeros((3, 1), jnp.int32), next_embeddings, starts, keys)
+        return model.apply(variables, model.initial_carry(1), inputs, method=last_hidden)
+
+    gradients = jax.jit(jax.grad(loss_fn))(embeddings, jnp.zeros((3, 1), jnp.bool_))
+    # Last hidden state depends on earlier posterior samples via straight-through
+    # gradients and Mamba memory, but cannot see its own next-frame embedding.
+    assert np.any(np.asarray(gradients[0]) != 0)
+    assert np.any(np.asarray(gradients[1]) != 0)
+    np.testing.assert_array_equal(gradients[2], 0)
+    reset = jax.jit(jax.grad(loss_fn))(embeddings, jnp.array([[False], [False], [True]]))
+    np.testing.assert_array_equal(reset, 0)

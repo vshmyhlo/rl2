@@ -7,13 +7,24 @@ total_steps: 1000000 # Environment transitions across all workers; must divide e
 num_envs: 32
 vector_env: async # async (spawned subprocesses) or sync
 num_steps: 64 # Shorter sequences limit activation memory; recurrent memory carries across chunks
-d_model: 88 # Latent and Mamba model width; ~9.93M total parameters with native 210x160 RGB input
+d_model: 88 # Latent and Mamba model width
 num_layers: 4 # Independent Mamba blocks, each with its own recurrent carry
 d_intermediate: null # SwiGLU width: null uses int(8*d_model/3), rounded up to 128; 0 disables the MLP
-encoder_channels: [8, 16, 32, 64] # Shared residual convolutional encoder; outputs d_model features
-encoder_max_flattened_size: 2048 # Add stages at the final channel width until within this limit; null disables
+encoder_stages: # Explicit downsampling stages; the observation decoder mirrors this list
+  - {channels: 8, blocks: 2, project: true}
+  - {channels: 16, blocks: 2, project: true}
+  - {channels: 32, blocks: 2, project: true}
+  - {channels: 64, blocks: 2, project: true}
+  - {channels: 64, blocks: 1, project: false}
+  - {channels: 64, blocks: 1, project: false}
 d_state: 16 # Mamba state width; even and at least 4
 headdim: 8 # Must divide 2 * d_model
+stochastic_size: 16 # Number of categorical latent variables
+stochastic_classes: 16 # Classes per latent variable; sampled once per state
+unimix: 0.01 # Uniform probability mixture for prior and posterior
+dynamics_kl_scale: 1.0 # Train the prior toward a stopped-gradient posterior
+representation_kl_scale: 0.1 # Regularize the posterior toward a stopped-gradient prior
+free_nats: 1.0 # KL floor per transition, summed across latent variables
 bf16: true # BF16 compute in all convolution/dense layers; parameters, carry, and losses stay float32
 learning_rate: 0.0003
 max_grad_norm: 1.0

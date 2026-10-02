@@ -1,6 +1,7 @@
 """Normalized residual convolutional encoder for Atari observations."""
 
 import math
+from dataclasses import dataclass
 
 import chex
 import jax
@@ -8,6 +9,43 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from numpy.typing import NDArray
+
+
+@dataclass(frozen=True)
+class ConvStage:
+    """One resize stage, with an optional 3x3 projection and residual blocks."""
+
+    channels: int
+    blocks: int = 2
+    project: bool = True
+
+    def __post_init__(self) -> None:
+        chex.assert_type((self.channels, self.blocks), int)
+        chex.assert_scalar_positive(self.channels)
+        chex.assert_scalar_positive(self.blocks)
+        chex.assert_type(self.project, bool)
+
+
+type ConvStages = tuple[ConvStage, ...]
+
+DEFAULT_STAGES: ConvStages = (
+    ConvStage(32, blocks=2, project=True),
+    ConvStage(64, blocks=2, project=True),
+    ConvStage(128, blocks=2, project=True),
+    ConvStage(256, blocks=2, project=True),
+    ConvStage(256, blocks=1, project=False),
+    ConvStage(256, blocks=1, project=False),
+)
+
+
+def validate_stages(stages: ConvStages) -> None:
+    """Validate a fixed stage list shared by an encoder and its decoder."""
+    chex.assert_scalar_positive(len(stages))
+    channels = stages[0].channels
+    for stage in stages:
+        if not stage.project and stage.channels != channels:
+            raise ValueError("A stage that changes channel width must set project=True")
+        channels = stage.channels
 
 
 class ResidualBlock(nn.Module):
@@ -39,33 +77,26 @@ class ConvObservationEncoder(nn.Module):
 
     A 7x7 stem convolution followed by LayerNorm and ReLU extracts features at
     the original resolution using the first configured channel width.
-    After the configured stages, repeat the final channel width with additional
-    downsampling stages until the flattened size is at most max_flattened_size.
-    Set the limit to None to use only encoder_channels. The limit must be at
-    least the final channel width, which is the minimum size at 1x1 resolution.
-    Each configured stage resizes before its convolution and two residual
-    blocks. Automatic extra stages use only a resize and one residual block.
+    Every stage is explicitly specified by channels, residual-block count, and
+    whether to apply a 3x3 projection. No stages are inferred from input size.
     Resizing uses antialiased bilinear interpolation and rounds each halved
     spatial dimension up.
     Stage count and projection weights are fixed by the initialization shape.
     """
 
-    encoder_channels: tuple[int, ...] = (32, 64, 128, 256)
+    stages: ConvStages = DEFAULT_STAGES
     embedding_size: int = 768
     dtype: jax.typing.DTypeLike = jnp.float32
-    max_flattened_size: int | None = 8192
 
     @nn.compact
     def __call__(self, obs: jax.Array | NDArray[np.uint8]) -> jax.Array:
         chex.assert_rank(obs, {4, 5})
         chex.assert_type(obs, jnp.uint8)
-        chex.assert_scalar_positive(len(self.encoder_channels))
-        for size in (*self.encoder_channels, self.embedding_size):
-            chex.assert_type(size, int)
+        validate_stages(self.stages)
+        chex.assert_type(self.embedding_size, int)
+        chex.assert_scalar_positive(self.embedding_size)
+        for size in obs.shape[1:4]:
             chex.assert_scalar_positive(size)
-        if self.max_flattened_size is not None:
-            chex.assert_type(self.max_flattened_size, int)
-            chex.assert_scalar_non_negative(self.max_flattened_size - self.encoder_channels[-1])
         if obs.ndim == 5:  # Raw RGB: combine stacked frames and color channels.
             chex.assert_shape(obs, (None, None, None, None, 3))
             x = jnp.transpose(obs, (0, 2, 3, 1, 4))
@@ -78,7 +109,7 @@ class ConvObservationEncoder(nn.Module):
         # Variance scaling avoids expensive QR initialization of large visual kernels.
         visual_init = nn.initializers.variance_scaling(2.0, "fan_in", "truncated_normal")
         x = nn.Conv(
-            self.encoder_channels[0],
+            self.stages[0].channels,
             (7, 7),
             padding="SAME",
             kernel_init=visual_init,
@@ -86,26 +117,17 @@ class ConvObservationEncoder(nn.Module):
             name="stem",
         )(x)
         x = nn.relu(nn.LayerNorm(name="stem_norm", dtype=self.dtype)(x))
-        stage_channels = self.encoder_channels
-        # Each resize halves the spatial dimensions, rounding up at every stage.
-        stride = 2 ** len(stage_channels)
-        height, width = ((size + stride - 1) // stride for size in x.shape[1:3])
-        if self.max_flattened_size is not None:
-            while height * width * stage_channels[-1] > self.max_flattened_size:
-                stage_channels += (stage_channels[-1],)
-                height, width = (height + 1) // 2, (width + 1) // 2
-        for stage, channels in enumerate(stage_channels):
+        for index, stage in enumerate(self.stages):
             x = jax.image.resize(
                 x,
                 (x.shape[0], (x.shape[1] + 1) // 2, (x.shape[2] + 1) // 2, x.shape[-1]),
                 method="bilinear",
                 antialias=True,
             )
-            configured_stage = stage < len(self.encoder_channels)
-            if configured_stage:
-                x = nn.Conv(channels, (3, 3), padding="SAME", kernel_init=visual_init, dtype=self.dtype)(x)
-            for block in range(2 if configured_stage else 1):
-                x = ResidualBlock(channels, dtype=self.dtype, name=f"stage_{stage}_block_{block}")(x)
+            if stage.project:
+                x = nn.Conv(stage.channels, (3, 3), padding="SAME", kernel_init=visual_init, dtype=self.dtype)(x)
+            for block in range(stage.blocks):
+                x = ResidualBlock(stage.channels, dtype=self.dtype, name=f"stage_{index}_block_{block}")(x)
         x = nn.relu(nn.LayerNorm(name="encoder_norm", dtype=self.dtype)(x))
         # Keep the remaining spatial positions distinct in the projection.
         x = nn.Dense(self.embedding_size, kernel_init=visual_init, dtype=self.dtype)(

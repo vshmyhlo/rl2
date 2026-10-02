@@ -19,6 +19,7 @@ from flax.training.train_state import TrainState
 from rl2 import ppo
 from rl2.atari_eval import EvaluationConfig, ScoreBaselines, _action, evaluate, make_evaluation_env
 from rl2.atari_scores import ATARI_REFERENCE_SCORES, REFERENCE_SOURCE, get_reference_scores
+from rl2.observation_encoder import ConvStage
 from rl2.ppo import Array, Config, LSTMCarry, initial_carry, load_config
 
 
@@ -224,7 +225,7 @@ def test_training_schedules_evaluation_by_time_without_changing_state() -> None:
                 patch("rl2.ppo.make_env", side_effect=training_env),
                 patch(
                     "rl2.ppo.ActorCritic",
-                    new=partial(ppo.ActorCritic, encoder_channels=(2,), embedding_size=4),
+                    new=partial(ppo.ActorCritic, encoder_stages=(ConvStage(2),), embedding_size=4),
                 ),
                 patch("rl2.atari_eval.make_evaluation_env", side_effect=evaluation_env),
                 patch("rl2.atari_eval.evaluate", side_effect=timed_evaluate) as evaluation,
@@ -232,7 +233,11 @@ def test_training_schedules_evaluation_by_time_without_changing_state() -> None:
                 patch("rl2.ppo.update", side_effect=timed_update),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
-                states.append(ppo.train(replace(config, log_dir=directory, eval_every_minutes=interval)))
+                states.append(
+                    ppo.train(
+                        replace(config, log_dir=directory, eval_every_minutes=interval, encoder_stages=(ConvStage(2),))
+                    )
+                )
             assert evaluation.call_count == len(expected_steps)
             assert [int(call.args[0].step) for call in evaluation.call_args_list] == [
                 step // 4 for step in expected_steps

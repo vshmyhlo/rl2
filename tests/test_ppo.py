@@ -20,6 +20,7 @@ from PIL import Image
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from rl2 import ppo
+from rl2.observation_encoder import ConvStage
 from rl2.ppo import (
     ActorCritic,
     ResetLSTM,
@@ -92,7 +93,7 @@ def test_default_model_parameter_budget_and_rgb_shapes() -> None:
     starts = jnp.ones((1, 1), dtype=bool)
     variables = jax.eval_shape(model.init, jax.random.key(0), obs, carry, starts)
     count = sum(parameter.size for parameter in jax.tree.leaves(variables["params"]))
-    assert variables["params"]["encoder"]["Dense_0"]["kernel"].shape == (2304, 768)
+    assert variables["params"]["encoder"]["Dense_0"]["kernel"].shape == (1024, 768)
     assert 21_000_000 < count < 24_000_000
     final, logits, values = jax.eval_shape(model.apply, variables, obs, carry, starts)
     assert logits.shape == (1, 1, 6)
@@ -165,7 +166,13 @@ def test_clipped_policy_loss_and_gradient_direction() -> None:
 def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
     config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), target_kl=None)
     assert config.bf16
-    model = ActorCritic(3, 8, dtype=jnp.bfloat16, encoder_channels=(8, 16, 16, 16), embedding_size=32)
+    model = ActorCritic(
+        3,
+        8,
+        dtype=jnp.bfloat16,
+        encoder_stages=(ConvStage(8), ConvStage(16), ConvStage(16), ConvStage(16)),
+        embedding_size=32,
+    )
     obs = jax.random.randint(jax.random.key(2), (3, 2, 1, 84, 84), 0, 256, dtype=jnp.uint8)
     carry = initial_carry(2, 8)
     starts = jnp.array([[True, True], [False, False], [True, False]])
@@ -215,7 +222,9 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
 @jax.default_matmul_precision("highest")
 def test_recurrent_sequences_match_steps_and_reset_only_finished_env() -> None:
     # Test sequence/reset semantics in float32, without GPU TF32 approximation.
-    model = ActorCritic(3, 16, encoder_channels=(8, 16, 16, 16), embedding_size=32)
+    model = ActorCritic(
+        3, 16, encoder_stages=(ConvStage(8), ConvStage(16), ConvStage(16), ConvStage(16)), embedding_size=32
+    )
     obs = jax.random.randint(jax.random.key(2), (4, 2, 4, 84, 84), 0, 256, dtype=jnp.uint8)
     carry = initial_carry(2, 16)
     starts = jnp.array([[True, True], [False, False], [True, False], [False, False]])
@@ -396,6 +405,7 @@ def check_atari_training(
     config = replace(
         load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
         lstm_hidden_size=16,
+        encoder_stages=(ConvStage(8), ConvStage(16), ConvStage(16), ConvStage(16)),
         bf16=False,
         total_steps=16,
         num_envs=2,
@@ -447,7 +457,14 @@ def check_atari_training(
     ppo_act = ppo.act
     with TemporaryDirectory() as log_dir:
         with (
-            patch("rl2.ppo.ActorCritic", new=partial(ActorCritic, encoder_channels=(8, 16, 16, 16), embedding_size=32)),
+            patch(
+                "rl2.ppo.ActorCritic",
+                new=partial(
+                    ActorCritic,
+                    encoder_stages=(ConvStage(8), ConvStage(16), ConvStage(16), ConvStage(16)),
+                    embedding_size=32,
+                ),
+            ),
             patch("rl2.ppo.make_env", new=short_env),
             patch("rl2.ppo.act", new=checked_act),
             patch("rl2.ppo.update", new=checked_update),

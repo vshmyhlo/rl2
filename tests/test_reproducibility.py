@@ -20,6 +20,7 @@ import pytest
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from rl2 import ppo
+from rl2.observation_encoder import ConvStage
 
 
 class ShortGame(gym.wrappers.TimeLimit):
@@ -61,6 +62,7 @@ def snapshot(path: str, mode: str, seed: int, videos: bool) -> None:
     config = replace(
         ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
         lstm_hidden_size=16,
+        encoder_stages=(ConvStage(8), ConvStage(16), ConvStage(16), ConvStage(16)),
         seed=seed,
         vector_env=mode,
         total_steps=128,
@@ -88,7 +90,12 @@ def snapshot(path: str, mode: str, seed: int, videos: bool) -> None:
     with TemporaryDirectory() as log_dir:
         with (
             patch(
-                "rl2.ppo.ActorCritic", new=partial(ppo.ActorCritic, encoder_channels=(8, 16, 16, 16), embedding_size=32)
+                "rl2.ppo.ActorCritic",
+                new=partial(
+                    ppo.ActorCritic,
+                    encoder_stages=(ConvStage(8), ConvStage(16), ConvStage(16), ConvStage(16)),
+                    embedding_size=32,
+                ),
             ),
             patch("rl2.ppo.make_env", new=short_game),
             patch("rl2.ppo.act", new=record_act),

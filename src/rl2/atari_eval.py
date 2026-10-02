@@ -257,6 +257,9 @@ def evaluate(
 
     returns = np.asarray([episode["return"] for episode in episodes], dtype=np.float64)
     std = float(returns.std(ddof=1)) if len(returns) > 1 else None
+    training_metadata = asdict(training)
+    # Stage tuples must also be lists in memory so the report survives a JSON round trip.
+    training_metadata["encoder_stages"] = list(training_metadata["encoder_stages"])
     result: EvaluationResult = {
         "env_id": training.env_id,
         "evaluation": asdict(evaluation),
@@ -277,7 +280,7 @@ def evaluate(
             "mode": 0,
             "difficulty": 0,
         },
-        "training_config": asdict(training),  # Configured budget, not proof of frames actually trained.
+        "training_config": training_metadata,  # Configured budget, not proof of frames actually trained.
         "optimizer_steps": int(state.step),
         "versions": {name: version(name) for name in ("ale-py", "gymnasium", "jax", "flax", "numpy")},
         "return_mean": float(returns.mean()),

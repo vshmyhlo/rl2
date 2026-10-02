@@ -1,4 +1,5 @@
 from functools import partial
+from typing import Any
 
 import chex
 import jax
@@ -7,34 +8,31 @@ import numpy as np
 import optax
 import pytest
 
-from rl2.observation_encoder import ConvObservationEncoder
+from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages
 
 
 @pytest.mark.parametrize(
-    "height,width,limit,flattened,stages",
+    "height,width,stages,flattened",
     [
-        (210, 160, 8192, 3072, 6),
-        (84, 84, 8192, 2304, 5),
-        (64, 64, 8192, 4096, 4),
-        (128, 64, 8192, 8192, 4),
-        (84, 84, None, 9216, 4),
-        (210, 160, None, 35840, 4),
-        (84, 84, 256, 256, 7),
-        (1, 257, 8192, 4352, 4),
+        (210, 160, DEFAULT_STAGES, 3072),
+        (84, 84, DEFAULT_STAGES, 1024),
+        (84, 84, DEFAULT_STAGES[:5], 2304),
+        (64, 64, DEFAULT_STAGES[:4], 4096),
+        (128, 64, DEFAULT_STAGES[:4], 8192),
+        (84, 84, DEFAULT_STAGES[:4], 9216),
+        (210, 160, DEFAULT_STAGES[:4], 35840),
+        (1, 257, DEFAULT_STAGES, 1280),
     ],
 )
-def test_projection_budget(height: int, width: int, limit: int | None, flattened: int, stages: int) -> None:
-    model = ConvObservationEncoder(max_flattened_size=limit)
+def test_explicit_stages(height: int, width: int, stages: ConvStages, flattened: int) -> None:
+    model = ConvObservationEncoder(stages=stages)
     obs = jax.ShapeDtypeStruct((2, 1, height, width, 3), jnp.uint8)
     variables = jax.eval_shape(model.init, jax.random.key(0), obs)
     params = variables["params"]
-    assert params["stem"]["kernel"].shape == (7, 7, 3, model.encoder_channels[0])
+    assert params["stem"]["kernel"].shape == (7, 7, 3, stages[0].channels)
     assert params["Dense_0"]["kernel"].shape == (flattened, 768)
-    assert len([name for name in params if name.startswith("Conv_")]) == len(model.encoder_channels)
-    assert len([name for name in params if name.startswith("stage_")]) == len(model.encoder_channels) + stages
-    for stage in range(len(model.encoder_channels), stages):
-        assert f"stage_{stage}_block_0" in params
-        assert f"stage_{stage}_block_1" not in params
+    assert len([name for name in params if name.startswith("Conv_")]) == sum(stage.project for stage in stages)
+    assert len([name for name in params if name.startswith("stage_")]) == sum(stage.blocks for stage in stages)
     output = jax.eval_shape(model.apply, variables, obs)
     chex.assert_shape(output, (2, 768))
     chex.assert_type(output, jnp.float32)
@@ -49,16 +47,25 @@ def test_native_encoder_parameter_budget() -> None:
     assert variables["params"]["Dense_0"]["kernel"].shape == (3072, 128)
 
 
-@pytest.mark.parametrize("limit", [0, -1, 3, 8.5])
-def test_invalid_projection_budget(limit: float) -> None:
-    model = ConvObservationEncoder(encoder_channels=(4,), max_flattened_size=limit)
+@pytest.mark.parametrize(
+    "options", [{"channels": 0}, {"channels": 3.5}, {"channels": 4, "blocks": 0}, {"channels": 4, "project": 1}]
+)
+def test_invalid_stage(options: dict[str, Any]) -> None:
     with pytest.raises(AssertionError):
+        ConvStage(**options)
+
+
+@pytest.mark.parametrize("stages", [(), (ConvStage(4), ConvStage(8, project=False))])
+def test_invalid_stage_sequence(stages: ConvStages) -> None:
+    model = ConvObservationEncoder(stages=stages)
+    with pytest.raises((AssertionError, ValueError)):
         model.init(jax.random.key(0), jnp.zeros((1, 1, 8, 8), dtype=jnp.uint8))
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_extra_stages_support_jit_and_gradients(dtype: jax.typing.DTypeLike) -> None:
-    model = ConvObservationEncoder(encoder_channels=(4,), embedding_size=8, dtype=dtype, max_flattened_size=16)
+def test_explicit_stages_support_jit_and_gradients(dtype: jax.typing.DTypeLike) -> None:
+    stages = (ConvStage(4), ConvStage(4, 1, False), ConvStage(4, 1, False), ConvStage(4, 1, False))
+    model = ConvObservationEncoder(stages=stages, embedding_size=8, dtype=dtype)
     obs = jax.random.randint(jax.random.key(0), (2, 2, 17, 13), 0, 256, dtype=jnp.uint8)
     variables = model.init(jax.random.key(1), obs)
     output, captured = jax.jit(partial(model.apply, capture_intermediates=True, mutable=["intermediates"]))(
