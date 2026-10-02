@@ -53,7 +53,12 @@ class Config:
     bf16: bool
     log_dir: str
     log_every: int
+    log_flush_secs: int
+    checkpoint_dir: str
     checkpoint_every: int
+    video_every_steps: int
+    video_num_steps: int
+    video_fps: float
 
     def __post_init__(self) -> None:
         for value in (
@@ -64,10 +69,14 @@ class Config:
             self.d_state,
             self.headdim,
             self.log_every,
+            self.log_flush_secs,
             self.checkpoint_every,
+            self.video_num_steps,
         ):
             chex.assert_type(value, int)
             chex.assert_scalar_positive(value)
+        chex.assert_type(self.video_every_steps, int)
+        chex.assert_scalar_non_negative(self.video_every_steps)
         if self.observation_size is not None:
             chex.assert_type(self.observation_size, int)
             chex.assert_scalar_positive(self.observation_size)
@@ -82,10 +91,10 @@ class Config:
         chex.assert_type(self.seed, int)
         if not 0 <= self.seed < 2**32:
             raise ValueError("seed must be in [0, 2**32)")
-        for value in (self.learning_rate, self.max_grad_norm):
+        for value in (self.learning_rate, self.max_grad_norm, self.video_fps):
             chex.assert_scalar_positive(value)
             if not np.isfinite(value):
-                raise ValueError("learning_rate and max_grad_norm must be finite")
+                raise ValueError("learning_rate, max_grad_norm, and video_fps must be finite")
 
 
 def load_config(path: str | Path) -> Config:
@@ -194,6 +203,91 @@ def update(
     return state.apply_gradients(grads=gradients), jax.tree.map(jax.lax.stop_gradient, carry), metrics
 
 
+type ImaginationCarry = tuple[Mamba3Carry, jax.Array]
+
+
+@partial(jax.jit, static_argnames=("model",))
+def imagine_frames(
+    state: TrainState,
+    model: MambaWorldModel,
+    observation: jax.Array,
+    carry: Mamba3Carry,
+    episode_start: jax.Array,
+    actions: jax.Array,
+) -> jax.Array:
+    """Return the real seed frame followed by fixed-horizon imagined observations.
+
+    Inputs describe one environment. Only the seed observation is encoded;
+    subsequent steps feed back predicted latents. Predicted termination does
+    not reset or stop this diagnostic rollout.
+    """
+    chex.assert_shape(observation, (1, *model.observation_shape))
+    chex.assert_type(observation, jnp.uint8)
+    chex.assert_trees_all_equal_shapes_and_dtypes(carry, model.initial_carry(1))
+    chex.assert_shape(episode_start, (1,))
+    chex.assert_type(episode_start, jnp.bool_)
+    chex.assert_shape(actions, (None, 1))
+    chex.assert_type(actions, jnp.int32)
+    chex.assert_scalar_positive(actions.shape[0])
+    normalized = observation.astype(jnp.float32) / 255.0
+    latent = state.apply_fn({"params": state.params}, normalized, method=model.encode)
+    starts = jnp.zeros(actions.shape, dtype=jnp.bool_).at[0].set(episode_start)
+
+    def step(memory: ImaginationCarry, inputs: tuple[jax.Array, jax.Array]) -> tuple[ImaginationCarry, jax.Array]:
+        history, latent = memory
+        action, reset = inputs
+        chex.assert_shape(latent, (1, model.d_model))
+        chex.assert_type(latent, jnp.float32)
+        chex.assert_shape((action, reset), (1,))
+        chex.assert_type((action, reset), (jnp.int32, jnp.bool_))
+        history, latent, prediction = state.apply_fn(
+            {"params": state.params}, latent, action, history, reset, method=model.imagine
+        )
+        return (history, latent), prediction.observation[0]
+
+    _, frames = jax.lax.scan(step, (carry, latent), (actions, starts))
+    return jnp.concatenate((normalized, frames), axis=0)
+
+
+def log_video(
+    state: TrainState,
+    model: MambaWorldModel,
+    config: Config,
+    writer: SummaryWriter,
+    observation: NDArray[np.uint8],
+    carry: Mamba3Carry,
+    episode_start: NDArray[np.bool_],
+    steps: int,
+) -> None:
+    """Log a random-action imagination clip without stepping training environments."""
+    chex.assert_shape(observation, (1, *model.observation_shape))
+    chex.assert_type(observation, np.uint8)
+    chex.assert_shape(episode_start, (1,))
+    chex.assert_type(episode_start, np.bool_)
+    chex.assert_type(steps, int)
+    chex.assert_scalar_non_negative(steps)
+    # A separate, fixed random stream allows comparisons without changing the
+    # training collector's actions or consuming its random state.
+    rng = np.random.default_rng(config.seed)
+    actions = rng.integers(model.num_actions, size=(config.video_num_steps, 1), dtype=np.int32)
+    frames = np.asarray(
+        imagine_frames(state, model, jnp.asarray(observation), carry, jnp.asarray(episode_start), jnp.asarray(actions))
+    )
+    # make_env returns [stack, height, width] or [stack, height, width, RGB].
+    chex.assert_rank(frames, {4, 5})
+    chex.assert_type(frames, np.float32)
+    frames = frames[:, -1]  # Show only the newest frame of each predicted stack.
+    if frames.ndim == 3:
+        frames = frames[:, None]
+    else:
+        chex.assert_shape(frames, (config.video_num_steps + 1, None, None, 3))
+        frames = frames.transpose(0, 3, 1, 2)
+    video = np.rint(np.clip(frames, 0.0, 1.0) * 255).astype(np.uint8)[None]
+    writer.add_video("imagination/random_policy", video, steps, fps=config.video_fps)
+    writer.flush()
+    print(f"Recorded {config.video_num_steps} imagined transitions at step {steps}", flush=True)
+
+
 def write_artifact(path: str, data: bytes) -> None:
     """Upload a complete GCS object or replace a local file atomically."""
     if path.startswith("gs://"):
@@ -208,7 +302,7 @@ def write_artifact(path: str, data: bytes) -> None:
 
 
 def save_checkpoint(state: TrainState, run_dir: str | Path) -> None:
-    """Save the latest parameters, optimizer state, and update count beside logs."""
+    """Save the latest parameters, optimizer state, and update count in the checkpoint run directory."""
     write_artifact(f"{str(run_dir).rstrip('/')}/checkpoint.msgpack", serialization.to_bytes(state))
 
 
@@ -256,20 +350,25 @@ def train(config: Config) -> str:
         carry = model.initial_carry(config.num_envs)
         run_name = f"{config.env_id.replace('/', '_')}_seed{config.seed}_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"
         run_dir = f"{config.log_dir.rstrip('/')}/{run_name}"
+        checkpoint_run_dir = f"{config.checkpoint_dir.rstrip('/')}/{run_name}"
         metadata = {
             **asdict(config),
             "observation_shape": model.observation_shape,
             "num_actions": model.num_actions,
         }
-        writer = SummaryWriter(logdir=run_dir)
-        write_artifact(f"{run_dir}/config.json", (json.dumps(metadata, indent=2) + "\n").encode())
+        writer = SummaryWriter(logdir=run_dir, flush_secs=config.log_flush_secs)
+        metadata_bytes = (json.dumps(metadata, indent=2) + "\n").encode()
+        write_artifact(f"{run_dir}/config.json", metadata_bytes)
+        write_artifact(f"{checkpoint_run_dir}/config.json", metadata_bytes)
         writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", 0)
         print(f"TensorBoard run: {run_dir}", flush=True)
+        print(f"Checkpoint: {checkpoint_run_dir}/checkpoint.msgpack", flush=True)
         devices = str(jax.devices())
         print(f"JAX devices: {devices}", flush=True)
         writer.add_text("devices", devices, 0)
         start = monotonic()
         steps, iteration = 0, 0
+        next_video_step = config.video_every_steps
         while steps < config.total_steps:
             num_steps = min(config.num_steps, (config.total_steps - steps) // config.num_envs)
             batch, observation, episode_start = collect_rollout(envs, observation, episode_start, rng, num_steps)
@@ -291,8 +390,13 @@ def train(config: Config) -> str:
                     f"termination={values['termination_loss']:.4f}",
                     flush=True,
                 )
+                writer.flush()
             if iteration % config.checkpoint_every == 0 or steps == config.total_steps:
-                save_checkpoint(state, run_dir)
+                save_checkpoint(state, checkpoint_run_dir)
+            if config.video_every_steps and steps >= next_video_step:
+                video_carry = jax.tree.map(lambda leaf: leaf[:1], carry)
+                log_video(state, model, config, writer, observation[:1], video_carry, episode_start[:1], steps)
+                next_video_step = (steps // config.video_every_steps + 1) * config.video_every_steps
         return run_dir
     finally:
         envs.close()

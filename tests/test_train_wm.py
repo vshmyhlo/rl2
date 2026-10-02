@@ -4,6 +4,7 @@ from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
 from typing import Any, SupportsFloat
+from unittest.mock import Mock
 
 import chex
 import gymnasium as gym
@@ -18,6 +19,7 @@ from flax.training.train_state import TrainState
 from google.cloud import storage
 from numpy.typing import NDArray
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+from tensorboardX import SummaryWriter
 
 from rl2 import train_wm
 from rl2.wm import MambaWorldModel
@@ -117,10 +119,32 @@ def test_update_targets_losses_carry_and_learning() -> None:
 
 
 @pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("checkpoint_every", [1, 100])
 def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remote: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remote: bool, checkpoint_every: int
 ) -> None:
     environments: list[ShortEpisodes] = []
+    flushes: list[str] = []
+
+    def make_writer(logdir: str, flush_secs: int) -> SummaryWriter:
+        assert flush_secs == config.log_flush_secs
+        writer = SummaryWriter(logdir=logdir, flush_secs=flush_secs)
+        original_flush = writer.flush
+        original_close = writer.close
+
+        def flush() -> None:
+            flushes.append("flush")
+            original_flush()
+
+        def close() -> None:
+            flushes.append("close")
+            original_close()
+
+        monkeypatch.setattr(writer, "flush", flush)
+        monkeypatch.setattr(writer, "close", close)
+        return writer
+
+    monkeypatch.setattr(train_wm, "SummaryWriter", make_writer)
     uploads: dict[str, bytes] = {}
     if remote:
         client = storage.Client.create_anonymous_client()
@@ -148,6 +172,8 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         return env
 
     monkeypatch.setattr(train_wm, "make_env", make_env)
+    checkpoint_spy = Mock(wraps=train_wm.save_checkpoint)
+    monkeypatch.setattr(train_wm, "save_checkpoint", checkpoint_spy)
     config = training_config(
         total_steps=10,
         num_envs=2,
@@ -155,24 +181,39 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         d_model=8,
         d_state=4,
         headdim=4,
-        log_dir="gs://test-bucket/rl2/" if remote else f"{tmp_path}/",
-        checkpoint_every=1,
+        atari_preprocessing=True,
+        log_flush_secs=7,
+        log_dir="gs://test-bucket/rl2/wm/" if remote else f"{tmp_path}/logs/",
+        checkpoint_dir="gs://test-bucket/rl2_cp/wm/" if remote else f"{tmp_path}/checkpoints/",
+        checkpoint_every=checkpoint_every,
+        video_every_steps=5 if checkpoint_every == 1 else 0,
+        video_num_steps=3,
     )
     run_dir = train_wm.train(config)
+    assert flushes == ["flush"] * (4 if config.video_every_steps else 2) + ["close"]
     assert run_dir.startswith(f"{config.log_dir.rstrip('/')}/ALE_SpaceInvaders-v5_seed1_")
+    run_name = run_dir.rsplit("/", 1)[-1]
+    checkpoint_run_dir = f"{config.checkpoint_dir.rstrip('/')}/{run_name}"
     local_dir = tmp_path / "download" if remote else Path(run_dir)
+    local_checkpoint_dir = tmp_path / "download_checkpoints" if remote else Path(checkpoint_run_dir)
     if remote:
         assert uploads
         assert not (tmp_path / "gs:").exists()
         local_dir.mkdir()
+        local_checkpoint_dir.mkdir()
         for path, data in uploads.items():
-            assert path.startswith(f"{run_dir}/")
-            (local_dir / path.rsplit("/", 1)[-1]).write_bytes(data)
-    saved = serialization.msgpack_restore((local_dir / "checkpoint.msgpack").read_bytes())
+            assert path.startswith((f"{run_dir}/", f"{checkpoint_run_dir}/"))
+            destination = local_checkpoint_dir if path.startswith(f"{checkpoint_run_dir}/") else local_dir
+            (destination / path.rsplit("/", 1)[-1]).write_bytes(data)
+    assert checkpoint_spy.call_count == (2 if checkpoint_every == 1 else 1)
+    assert checkpoint_spy.call_args.args[1] == checkpoint_run_dir
+    assert not (local_dir / "checkpoint.msgpack").exists()
+    saved = serialization.msgpack_restore((local_checkpoint_dir / "checkpoint.msgpack").read_bytes())
     assert int(saved["step"]) == 2
     assert "mixer" in saved["params"]
     assert "opt_state" in saved
     metadata = json.loads((local_dir / "config.json").read_text())
+    assert json.loads((local_checkpoint_dir / "config.json").read_text()) == metadata
     assert metadata["env_id"] == "ALE/SpaceInvaders-v5"
     assert metadata["observation_shape"] == [1, 2, 2]
     events = EventAccumulator(str(local_dir)).Reload()
@@ -181,17 +222,93 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
     assert config_text.startswith("```yaml\n")
     assert config.log_dir in config_text
     assert events.Tensors("devices/text_summary")
+    if config.video_every_steps:
+        videos = events.Images("imagination/random_policy")
+        assert [video.step for video in videos] == [6, 10]
+        assert all(video.width == 2 and video.height == 2 for video in videos)
+        assert all(video.encoded_image_string.startswith(b"GIF") for video in videos)
+    else:
+        assert "imagination/random_policy" not in events.Tags()["images"]
     assert all(env.closed for env in environments)
-    assert not (local_dir / "checkpoint.msgpack.tmp").exists()
+    assert not (local_checkpoint_dir / "checkpoint.msgpack.tmp").exists()
 
 
 @pytest.mark.parametrize(
     "options",
-    [{"num_steps": 0}, {"total_steps": 9, "num_envs": 2}, {"learning_rate": float("inf")}, {"d_state": 2}],
+    [
+        {"num_steps": 0},
+        {"total_steps": 9, "num_envs": 2},
+        {"learning_rate": float("inf")},
+        {"d_state": 2},
+        {"video_every_steps": -1},
+        {"video_num_steps": 0},
+        {"video_fps": 0},
+        {"video_fps": float("inf")},
+        {"log_flush_secs": 0},
+        {"log_flush_secs": -1},
+    ],
 )
 def test_invalid_config(options: dict[str, Any]) -> None:
     with pytest.raises((AssertionError, ValueError)):
         training_config(**options)
+
+
+def test_imagination_feeds_back_latents_and_resets_history() -> None:
+    model = MambaWorldModel((2, 3, 4), 3, d_model=8, d_state=4, headdim=4)
+    observation = jnp.arange(24, dtype=jnp.uint8).reshape((1, 2, 3, 4))
+    normalized = observation.astype(jnp.float32) / 255.0
+    actions = jnp.array([[0], [1], [2]], jnp.int32)
+    variables = model.init(jax.random.key(8), normalized, actions[0])
+    state = TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optax.sgd(0.01))
+    history, _, _ = model.apply(variables, normalized, actions[0], method=model.observe)
+    frames = train_wm.imagine_frames(state, model, observation, history, jnp.zeros(1, jnp.bool_), actions)
+    chex.assert_shape(frames, (4, 2, 3, 4))
+    chex.assert_type(frames, jnp.float32)
+    np.testing.assert_array_equal(frames[0], normalized[0])
+    latent = model.apply(variables, normalized, method=model.encode)
+    for index, action in enumerate(actions):
+        history, latent, prediction = model.apply(variables, latent, action, history, method=model.imagine)
+        np.testing.assert_allclose(frames[index + 1], prediction.observation[0], atol=2e-6)
+    reset = train_wm.imagine_frames(state, model, observation, history, jnp.ones(1, jnp.bool_), actions)
+    fresh = train_wm.imagine_frames(state, model, observation, model.initial_carry(1), jnp.zeros(1, jnp.bool_), actions)
+    np.testing.assert_allclose(reset, fresh, atol=2e-6)
+
+
+@pytest.mark.parametrize("rgb", [False, True])
+def test_video_uses_newest_frame_clips_pixels_and_has_repeatable_actions(
+    monkeypatch: pytest.MonkeyPatch, rgb: bool
+) -> None:
+    shape = (2, 3, 4, 3) if rgb else (2, 3, 4)
+    model = MambaWorldModel(shape, 3, d_model=8, d_state=4, headdim=4)
+    config = training_config(video_num_steps=2, video_fps=12)
+    frames = np.ones((3, *shape), np.float32)
+    frames[:, -1] = np.array([-1, 0.5, 2], np.float32).reshape((3,) + (1,) * (len(shape) - 1))
+    imagine = Mock(return_value=jnp.asarray(frames))
+    monkeypatch.setattr(train_wm, "imagine_frames", imagine)
+    writer = Mock()
+    state = Mock(spec=TrainState)
+    for steps in (10, 20):
+        train_wm.log_video(
+            state,
+            model,
+            config,
+            writer,
+            np.zeros((1, *shape), np.uint8),
+            model.initial_carry(1),
+            np.zeros(1, np.bool_),
+            steps,
+        )
+    call = writer.add_video.call_args
+    assert call.args[0] == "imagination/random_policy"
+    assert call.args[2] == 20
+    assert call.kwargs["fps"] == 12
+    assert writer.flush.call_count == 2
+    video = call.args[1]
+    chex.assert_shape(video, (1, 3, 3 if rgb else 1, 3, 4))
+    chex.assert_type(video, np.uint8)
+    for frame, value in zip(video[0], (0, 128, 255)):
+        np.testing.assert_array_equal(frame, np.full_like(frame, value))
+    np.testing.assert_array_equal(imagine.call_args_list[0].args[-1], imagine.call_args_list[1].args[-1])
 
 
 def test_config_requires_all_training_settings(tmp_path: Path) -> None:

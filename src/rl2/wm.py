@@ -18,6 +18,16 @@ class Prediction:
     Observation shape matches the model's observation space. Reward and
     termination logits have only the leading batch dimensions; termination
     denotes an environment terminal state, excluding time-limit truncation.
+
+    Attributes:
+        observation: Predicted observation with shape
+            ``[*leading, *observation_shape]``, where ``leading`` is batch or
+            time and batch. Values use the caller's preprocessed observation
+            scale and are not clipped.
+        reward: Reward for the transition into this observation, with shape
+            ``[*leading]``.
+        termination_logits: Unnormalized terminal-state scores with shape
+            ``[*leading]``. Apply ``jax.nn.sigmoid`` to obtain probabilities.
     """
 
     observation: jax.Array
@@ -40,19 +50,58 @@ class WorldModel(nn.Module):
     """
 
     def encode(self, observation: jax.Array) -> jax.Array:
-        """Encode the current observation into a latent state."""
+        """Encode the current observation into a latent state.
+
+        Args:
+            observation: Preprocessed observations with leading batch
+                dimensions and an implementation-defined observation shape.
+
+        Returns:
+            Latent states preserving the observation's leading dimensions;
+            the latent representation and dtype are implementation-defined.
+        """
         raise NotImplementedError
 
     def transition(self, latent: jax.Array, action: jax.Array) -> jax.Array:
-        """Predict the next latent state after taking an action."""
+        """Predict the next latent state after taking an action.
+
+        Args:
+            latent: Current latent states, as produced by ``encode`` or a
+                previous transition.
+            action: Actions sharing the latent states' leading dimensions.
+                Action encoding and dtype are implementation-defined.
+
+        Returns:
+            Predicted next latent states with the same leading dimensions.
+        """
         raise NotImplementedError
 
     def decode(self, latent: jax.Array) -> Prediction:
-        """Predict an observation and incoming reward/termination from a state."""
+        """Predict an observation and incoming reward/termination from a state.
+
+        Args:
+            latent: Latent states representing predicted next observations.
+
+        Returns:
+            A ``Prediction`` containing observations, rewards, and termination
+            logits with the same leading dimensions as ``latent``.
+        """
         raise NotImplementedError
 
     def __call__(self, observation: jax.Array, action: jax.Array) -> tuple[jax.Array, Prediction]:
-        """Return the next latent state and predictions for this transition."""
+        """Return the next latent state and predictions for this transition.
+
+        Args:
+            observation: Current observations accepted by ``encode``.
+            action: Actions taken from those observations, accepted by
+                ``transition`` and aligned with the observations' leading axes.
+
+        Returns:
+            ``(next_latent, prediction)`` after encoding the observations,
+            applying the actions, and decoding the resulting states. For
+            ``MambaWorldModel``, this call starts with zero recurrent history;
+            use ``observe`` or ``imagine`` to retain history across calls.
+        """
         latent = self.transition(self.encode(observation), action)
         return latent, self.decode(latent)
 
@@ -87,6 +136,21 @@ class MambaWorldModel(WorldModel):
 
     Parameters, returned latents, predictions, and carry remain float32;
     ``dtype`` controls the internal projection precision.
+
+    Args:
+        observation_shape: Nonempty tuple of positive observation dimensions,
+            excluding time and batch. The encoder flattens these dimensions
+            and the decoder restores them.
+        num_actions: Positive number of discrete actions, indexed from zero.
+        d_model: Positive latent width and Mamba input/output width.
+        d_state: Mamba recurrent state width; must be even and at least four
+            for the mixer's default rotary fraction.
+        expand: Positive multiplier defining the Mamba inner width as
+            ``expand * d_model``.
+        headdim: Positive width of each Mamba head; must divide the inner width.
+        mimo_rank: Positive Mamba projection rank. One selects SISO; larger
+            values select MIMO.
+        dtype: Internal projection dtype: float32, bfloat16, or float16.
     """
 
     observation_shape: tuple[int, ...]
@@ -100,6 +164,7 @@ class MambaWorldModel(WorldModel):
 
     @nn.nowrap
     def _make_mixer(self) -> Mamba3:
+        """Return an unbound Mamba-3 mixer configured from this model's fields."""
         return Mamba3(
             d_model=self.d_model,
             d_state=self.d_state,
@@ -111,6 +176,7 @@ class MambaWorldModel(WorldModel):
         )
 
     def setup(self) -> None:
+        """Validate observation/action dimensions and register the Linen layers."""
         if not isinstance(self.observation_shape, tuple) or not self.observation_shape:
             raise ValueError("observation_shape must be a nonempty tuple of positive integers")
         for size in (*self.observation_shape, self.num_actions):
@@ -129,20 +195,50 @@ class MambaWorldModel(WorldModel):
 
     @nn.nowrap
     def initial_carry(self, batch_size: int) -> Mamba3Carry:
-        """Allocate zero Mamba history without initializing model parameters."""
+        """Allocate zero Mamba history without initializing model parameters.
+
+        Args:
+            batch_size: Positive number of independent environments or streams.
+
+        Returns:
+            A zero-filled float32 ``Mamba3Carry`` containing the recurrent
+            state, previous key/value, and rotary angle. Each leaf has leading
+            dimension ``batch_size`` and trailing dimensions set by the mixer.
+        """
         chex.assert_type(batch_size, int)
         chex.assert_scalar_positive(batch_size)
         return self._make_mixer().initial_carry(batch_size)
 
     @nn.nowrap
     def _check_latent(self, latent: jax.Array) -> None:
+        """Validate latent shape and dtype without modifying the array.
+
+        Args:
+            latent: Floating-point array shaped ``[batch, d_model]`` or
+                ``[time, batch, d_model]``, with a positive batch size.
+
+        Returns:
+            None. Chex raises ``AssertionError`` for invalid inputs.
+        """
         chex.assert_rank(latent, {2, 3})
         chex.assert_shape(latent, (*latent.shape[:-1], self.d_model))
         chex.assert_type(latent, float)
         chex.assert_scalar_positive(latent.shape[-2])
 
     def encode(self, observation: jax.Array) -> jax.Array:
-        """Encode batched observations or time-major sequences into latents."""
+        """Encode batched observations or time-major sequences into latents.
+
+        Args:
+            observation: Floating-point preprocessed observations shaped
+                ``[batch, *observation_shape]`` or
+                ``[time, batch, *observation_shape]``. The caller handles
+                normalization; raw uint8 pixels are not accepted.
+
+        Returns:
+            Float32 latents shaped ``[batch, d_model]`` or
+            ``[time, batch, d_model]``. Each observation is encoded independently
+            without reading or updating recurrent history.
+        """
         observation_rank = len(self.observation_shape)
         chex.assert_rank(observation, {observation_rank + 1, observation_rank + 2})
         chex.assert_type(observation, float)
@@ -161,6 +257,26 @@ class MambaWorldModel(WorldModel):
         carry: Mamba3Carry | None = None,
         episode_starts: jax.Array | None = None,
     ) -> tuple[Mamba3Carry, jax.Array]:
+        """Apply action-conditioned recurrent dynamics to supplied latents.
+
+        Args:
+            latent: Floating-point current states shaped ``[batch, d_model]``
+                or ``[time, batch, d_model]``.
+            action: Integer action IDs in ``[0, num_actions)``, shaped
+                ``[batch]`` or ``[time, batch]`` to match ``latent``.
+            carry: Float32 Mamba history matching the model and batch size.
+                ``None`` initializes zero history. Gradients flow through a
+                supplied carry unless the caller applies ``stop_gradient``.
+            episode_starts: Boolean reset mask with the same shape as
+                ``action``. True clears that stream's history before processing
+                the input; it does not replace the supplied latent. ``None``
+                means no resets.
+
+        Returns:
+            ``(final_carry, next_latent)`` with float32 leaves. The carry holds
+            history after the final input; latents have the same shape as the
+            input and include predictions for every supplied timestep.
+        """
         self._check_latent(latent)
         chex.assert_shape(action, latent.shape[:-1])
         chex.assert_type(action, int)
@@ -182,12 +298,37 @@ class MambaWorldModel(WorldModel):
         return carry, next_latent
 
     def transition(self, latent: jax.Array, action: jax.Array) -> jax.Array:
-        """Predict next latents from zero history; use ``imagine`` to keep carry."""
+        """Predict next latents from zero history; use ``imagine`` to keep carry.
+
+        Args:
+            latent: Floating-point states shaped ``[batch, d_model]`` or
+                ``[time, batch, d_model]``. Sequence inputs provide each
+                timestep's state explicitly.
+            action: Integer IDs in ``[0, num_actions)``, shaped ``[batch]`` or
+                ``[time, batch]`` to match ``latent``.
+
+        Returns:
+            Float32 next latents with the same shape as ``latent``. History is
+            propagated within a sequence but discarded at the end of the call.
+        """
         _, next_latent = self._transition(latent, action)
         return next_latent
 
     def decode(self, latent: jax.Array) -> Prediction:
-        """Decode next-observation, reward, and termination-logit predictions."""
+        """Decode next-observation, reward, and termination-logit predictions.
+
+        Args:
+            latent: Floating-point predicted states shaped ``[batch, d_model]``
+                or ``[time, batch, d_model]``.
+
+        Returns:
+            A float32 ``Prediction``. Observations have shape
+            ``[*leading, *observation_shape]``; rewards and termination logits
+            have shape ``[*leading]``, where ``leading`` is ``[batch]`` or
+            ``[time, batch]``. All heads are unbounded; termination probabilities
+            require a sigmoid. Rewards and termination refer to the transition
+            into the decoded observation.
+        """
         self._check_latent(latent)
         hidden = nn.silu(self.decoder_hidden(latent))
         observation = self.observation_head(hidden).reshape((*latent.shape[:-1], *self.observation_shape))
@@ -203,7 +344,30 @@ class MambaWorldModel(WorldModel):
         carry: Mamba3Carry | None = None,
         episode_starts: jax.Array | None = None,
     ) -> RecurrentPrediction:
-        """Predict from actual observations, preserving history across calls."""
+        """Predict from actual observations, preserving history across calls.
+
+        Args:
+            observation: Floating-point preprocessed observations shaped
+                ``[batch, *observation_shape]`` or
+                ``[time, batch, *observation_shape]``.
+            action: Integer IDs in ``[0, num_actions)``, shaped ``[batch]`` or
+                ``[time, batch]``. At index t, the action is taken from
+                observation t, and the prediction targets observation t+1.
+            carry: Float32 history matching this model and batch size, or
+                ``None`` to start with zero history. It is not detached from
+                the gradient graph automatically.
+            episode_starts: Boolean mask matching ``action``; True resets
+                history before processing that step's dynamics. Supply the new
+                episode's initial observation at reset positions. ``None``
+                means no resets.
+
+        Returns:
+            ``(final_carry, next_latent, prediction)`` with float32 leaves.
+            Latents have shape ``[batch, d_model]`` or
+            ``[time, batch, d_model]``; prediction shapes follow ``decode``.
+            A sequence uses actual observations at every step (teacher forcing)
+            and returns predictions for all steps plus only the final carry.
+        """
         return self.imagine(self.encode(observation), action, carry, episode_starts)
 
     def imagine(
@@ -217,6 +381,27 @@ class MambaWorldModel(WorldModel):
 
         For an autoregressive rollout, feed each returned latent and carry into
         the next call. Sequence inputs supply each step's latent explicitly.
+
+        Args:
+            latent: Floating-point current states shaped ``[batch, d_model]``
+                or ``[time, batch, d_model]``. For a rollout, seed with
+                ``encode`` and then use the previous predicted latent.
+            action: Integer IDs in ``[0, num_actions)``, shaped ``[batch]`` or
+                ``[time, batch]`` to match ``latent``.
+            carry: Float32 history matching this model and batch size, or
+                ``None`` for zero history. Use the previous returned carry to
+                continue a rollout; detach it explicitly for truncated BPTT.
+            episode_starts: Boolean mask matching ``action``; True clears
+                history before that input. It does not replace ``latent``;
+                use a newly encoded observation when starting an episode.
+                ``None`` means no resets.
+
+        Returns:
+            ``(final_carry, next_latent, prediction)`` with float32 leaves.
+            Next latents have the same shape as ``latent``; predictions follow
+            ``decode`` and describe the observation and outcomes after each
+            action. Predicted termination is an output only: it does not reset
+            history or stop the rollout automatically.
         """
         carry, next_latent = self._transition(latent, action, carry, episode_starts)
         return carry, next_latent, self.decode(next_latent)
