@@ -165,8 +165,8 @@ def test_target_matching_checks_heading_markers_and_position(
 @pytest.mark.parametrize(
     "program,reason,reward",
     [
-        ("m)", "syntax_error", -2.0),
-        ("DEF run m( WHILE c( frontIsClear c) w( move m)", "syntax_error", -2.0),
+        ("m)", "syntax_error", -1.8),  # Four missing tokens.
+        ("DEF run m( WHILE c( frontIsClear c) w( move m)", "syntax_error", -1.5),  # Missing w).
         ("DEF run m( pickMarker pickMarker m)", "runtime_error", -1.0),
         ("DEF run m( WHILE c( markersPresent c) w( turnLeft w) m)", "execution_limit", -1.0),
     ],
@@ -200,9 +200,18 @@ def test_token_limit_and_terminal_boundary(fixed_env: KarelProgramEnv) -> None:
     env.reset()
     assert submit(env, ["DEF", "run", "m(", "move", "m)"])[1] == 1.0
     env.reset()
-    assert submit(env, ["move"] * 5) == (None, -2.0, False, True, {"success": False, "error": "token_limit"})
+    assert submit(env, ["move"] * 5) == (None, -1.8, False, True, {"success": False, "error": "token_limit"})
     with pytest.raises(gym.error.ResetNeeded):
         env.step(env.terminal_token_id)
+
+
+def test_incomplete_program_gets_syntax_credit_without_execution(fixed_env: KarelProgramEnv) -> None:
+    env = KarelProgramEnv(KarelConfig(max_program_tokens=6))
+    env.reset()
+    # Only m) is missing. The completed program would solve this task, but must
+    # never be repaired and executed when determining the reward.
+    result = submit(env, ["DEF", "run", "m(", "turnLeft", "turnRight", "move"])
+    assert result == (None, -1.5, False, True, {"success": False, "error": "token_limit"})
 
 
 def test_episode_lifecycle_and_invalid_action(fixed_env: KarelProgramEnv) -> None:

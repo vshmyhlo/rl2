@@ -5,7 +5,8 @@ States are int32 arrays shaped (height, width, 6): four one-hot robot headings
 The outer closing token m) executes the program against the initial state. This is a plain
 class, not a Gymnasium Env: step observations deliberately are always None.
 Terminal reward is normalized progress toward the target, clipped to [-1, 1];
-syntax errors and missing m) receive -2 (failure score -1 plus syntax penalty -1).
+syntax errors and missing m) receive -2 + 1/(1+d), where d is the minimum
+token edit distance to a complete syntactically valid program.
 Valid syntax with execution failures receives -1. PAD is reserved for batching.
 Intermediate rewards are zero.
 """
@@ -21,6 +22,8 @@ import chex
 import gymnasium as gym
 import numpy as np
 from numpy.typing import NDArray
+
+from rl2.karel_syntax import MAX_BLOCK_DEPTH, syntax_reward
 
 type State = NDArray[np.int32]
 type StepResult = tuple[None, float, bool, bool, dict[str, object]]
@@ -203,8 +206,8 @@ def _parse(tokens: Sequence[str]) -> tuple[_Statement, ...]:
         return predicate, negate
 
     def block(end: str, depth: int) -> tuple[_Statement, ...]:
-        if depth > 64:
-            raise KarelProgramError("syntax_error", "Program nesting exceeds 64 blocks")
+        if depth > MAX_BLOCK_DEPTH:
+            raise KarelProgramError("syntax_error", f"Program nesting exceeds {MAX_BLOCK_DEPTH} blocks")
         statements: list[_Statement] = []
         while position < len(tokens) and tokens[position] != end:
             kind = take()
@@ -412,9 +415,10 @@ class KarelProgramEnv:
     reset() returns KarelPair(initial, target), without an info wrapper.
     step() returns (None, reward, terminated, truncated, info). The token m) terminates
     and scores progress_reward(); info['success'] still means exact state equality.
-    Syntax errors receive -2; runtime errors and execution-budget failures receive -1.
-    Exhausting max_program_tokens without m)
-    truncates with -2 and no evaluation. PAD is not a valid environment action.
+    Syntax errors receive -2 + 1/(1+d), using minimum syntax edit distance d.
+    Runtime errors and execution-budget failures receive -1. Exhausting
+    max_program_tokens without m) truncates with the same syntax-distance score
+    and no execution. PAD is not a valid environment action.
     No partial execution credit is given on errors or execution-budget failures.
     """
 
@@ -472,12 +476,12 @@ class KarelProgramEnv:
                     max_markers=self.config.max_markers,
                 )
             except KarelProgramError as exc:
-                reward = -2.0 if exc.reason == "syntax_error" else -1.0
+                reward = syntax_reward(self._program) if exc.reason == "syntax_error" else -1.0
                 return None, reward, True, False, {"success": False, "error": exc.reason}
             success = bool(np.array_equal(output, self._task.target))
             reward = progress_reward(self._task.initial, output, self._task.target, self.config)
             return None, reward, True, False, {"success": success, "error": None}
         if len(self._program) >= self.config.max_program_tokens:
             self._needs_reset = True
-            return None, -2.0, False, True, {"success": False, "error": "token_limit"}
+            return None, syntax_reward(self._program), False, True, {"success": False, "error": "token_limit"}
         return None, 0.0, False, False, {}

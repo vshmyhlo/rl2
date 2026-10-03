@@ -155,7 +155,7 @@ def test_collection_shares_pairs_and_handles_terminal_and_truncation(
     for start in range(0, len(envs), config.group_size):
         np.testing.assert_array_equal(batch.initial[start], batch.initial[start + 1])
         np.testing.assert_array_equal(batch.target[start], batch.target[start + 1])
-    np.testing.assert_array_equal(rewards, -2)
+    np.testing.assert_array_equal(rewards, np.float32(-1.8))
     np.testing.assert_array_equal(batch.advantages, 0)
     expected_length = 1 if token == "m)" else config.env.max_program_tokens
     np.testing.assert_array_equal(batch.mask.sum(axis=0), expected_length)
@@ -163,7 +163,7 @@ def test_collection_shares_pairs_and_handles_terminal_and_truncation(
     np.testing.assert_array_equal(batch.mask, batch.actions != KarelProgramEnv.pad_token_id)
     assert diagnostics["charts/truncation_rate"] == (token == "move")
     assert diagnostics["charts/syntax_error_rate"] == (token == "m)")
-    assert diagnostics["charts/reward_mean"] == -2.0
+    assert diagnostics["charts/reward_mean"] == pytest.approx(-1.8)
     assert diagnostics["charts/success_rate"] == diagnostics["charts/group_success_rate"] == 0.0
     _, logits = state.apply_fn({"params": state.params}, batch.initial, batch.target, batch.actions[:-1])
     recomputed = np.asarray(action_log_prob(logits, batch.actions))
@@ -221,14 +221,40 @@ def test_partial_rewards_are_not_logged_as_successes(
     monkeypatch.setattr("rl2.grpo.act", scripted_act)
     envs = [KarelProgramEnv(config.env) for _ in range(4)]
     batch, rewards, diagnostics, _ = collect_rollout(state, envs, np.random.default_rng(0), jax.random.key(0), config)
-    np.testing.assert_array_equal(rewards, [0.5, 0.0, reward, -2.0])
+    np.testing.assert_array_equal(rewards, np.asarray([0.5, 0.0, reward, -1.8], dtype=np.float32))
     np.testing.assert_allclose(batch.advantages, [1.0, -1.0, 1.0, -1.0])
-    assert diagnostics["charts/reward_mean"] == (reward - 1.5) / 4
+    assert diagnostics["charts/reward_mean"] == pytest.approx((reward - 1.3) / 4)
     assert diagnostics["charts/success_rate"] == float(success) / 4
     assert diagnostics["charts/group_success_rate"] == float(success) / 2
     assert diagnostics["charts/syntax_error_rate"] == 0.25
     assert diagnostics["charts/runtime_error_rate"] == float(error == "runtime_error") / 4
     assert diagnostics["charts/informative_group_fraction"] == 1.0
+
+
+def test_different_syntax_errors_provide_group_advantages(
+    config: Config, state: TrainState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    programs = ["m)", "DEF run m( m)"]  # Four edits versus one insertion.
+    scripted = np.full((4, 2), KarelProgramEnv.pad_token_id, dtype=np.int32)
+    for column, program in enumerate(programs):
+        ids = [KarelProgramEnv.token_to_id[token] for token in program.split()]
+        scripted[: len(ids), column] = ids
+    steps = iter(scripted)
+
+    def scripted_act(logits: jax.Array, key: jax.Array) -> tuple[jax.Array, jax.Array]:
+        chex.assert_shape(logits, (2, len(TOKENS)))
+        chex.assert_type(logits, jnp.float32)
+        chex.assert_shape(key, ())
+        return jnp.asarray(next(steps)), jnp.zeros(2, dtype=jnp.float32)
+
+    monkeypatch.setattr("rl2.grpo.act", scripted_act)
+    envs = [KarelProgramEnv(config.env) for _ in programs]
+    batch, rewards, diagnostics, _ = collect_rollout(state, envs, np.random.default_rng(0), jax.random.key(0), config)
+    np.testing.assert_allclose(rewards, [-1.8, -1.5])
+    np.testing.assert_allclose(batch.advantages, [-1, 1], atol=1e-6)
+    assert diagnostics["charts/syntax_error_rate"] == 1.0
+    assert diagnostics["charts/informative_group_fraction"] == 1.0
+    assert diagnostics["charts/success_rate"] == 0.0
 
 
 def test_update_changes_policy_and_kl_limit_skips_update(config: Config, state: TrainState) -> None:

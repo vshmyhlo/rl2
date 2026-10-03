@@ -3,11 +3,12 @@
 Each rollout samples group_size programs per initial/target pair. Advantages
 are normalized within each pair's group; the clipped objective averages tokens
 within programs, then programs within the minibatch. Terminal m) is included, PAD
-is excluded, and token-limit failures receive the environment's -2 penalty.
+is excluded, and syntax/token-limit failures receive a syntax edit-distance score.
 
 This sketch starts from random weights with no grammar mask or supervised
 warmup. Terminal rewards measure progress toward the target; exact success is
-logged separately. Equal-reward groups (e.g. all syntax errors) have zero advantages.
+logged separately. Equal-reward groups have zero advantages; syntax errors can
+now earn different rewards according to their minimum repair costs.
 An optional KL penalty uses a frozen copy of the initial model as reference.
 See https://arxiv.org/abs/2402.03300 for the GRPO objective.
 """
@@ -319,7 +320,7 @@ def train(config: Config) -> TrainState:
             flush=True,
         )
         print(
-            "Progress rewards: equal-reward groups (including all-syntax-error groups) have zero GRPO advantages.",
+            "Syntax-distance and progress rewards: equal-reward groups have zero GRPO advantages.",
             flush=True,
         )
         start = monotonic()
