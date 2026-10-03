@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from rl2.grpo import generation_logits
 from rl2.karel import TOKENS, KarelConfig, KarelProgramEnv, sample_task
 from rl2.karel_model import KarelProgramModel
 
@@ -28,10 +29,42 @@ def model_and_variables(inputs: tuple[jax.Array, jax.Array, jax.Array]) -> tuple
     return model, variables
 
 
-def test_prefill_and_steps_match_teacher_forcing(
+@pytest.fixture(scope="module")
+def nonzero_head_model_and_variables(
+    model_and_variables: tuple[KarelProgramModel, dict[str, Any]],
+) -> tuple[KarelProgramModel, dict[str, Any]]:
+    """Use a nonzero head so sequence-equivalence and causality checks are nontrivial."""
+    model, variables = model_and_variables
+    params = variables["params"]
+    kernel = params["head"]["kernel"]
+    head = {**params["head"], "kernel": jax.random.normal(jax.random.key(1), kernel.shape) / np.sqrt(model.d_model)}
+    return model, {"params": {**params, "head": head}}
+
+
+def test_fresh_policy_is_uniform_except_pad(
     inputs: tuple[jax.Array, jax.Array, jax.Array], model_and_variables: tuple[KarelProgramModel, dict[str, Any]]
 ) -> None:
     model, variables = model_and_variables
+    initial, target, tokens = inputs
+    _, logits = jax.jit(model.apply)(variables, *inputs)
+    chex.assert_shape(logits, (tokens.shape[0] + 1, initial.shape[0], len(TOKENS)))
+    chex.assert_type(logits, jnp.float32)
+    expected = np.full(len(TOKENS), 1 / (len(TOKENS) - 1), dtype=np.float32)
+    expected[KarelProgramEnv.pad_token_id] = 0
+    np.testing.assert_allclose(jax.nn.softmax(generation_logits(logits)), np.broadcast_to(expected, logits.shape))
+    carry, first = model.apply(variables, initial, target, method=model.prefill)
+    _, next_logits = model.apply(variables, tokens[0], carry, method=model.step)
+    for prediction in (first, next_logits):
+        np.testing.assert_allclose(
+            jax.nn.softmax(generation_logits(prediction)), np.broadcast_to(expected, prediction.shape)
+        )
+
+
+def test_prefill_and_steps_match_teacher_forcing(
+    inputs: tuple[jax.Array, jax.Array, jax.Array],
+    nonzero_head_model_and_variables: tuple[KarelProgramModel, dict[str, Any]],
+) -> None:
+    model, variables = nonzero_head_model_and_variables
     initial, target, tokens = inputs
     expected_carry, expected = jax.jit(model.apply)(variables, *inputs)
     assert expected.shape == (tokens.shape[0] + 1, 2, len(TOKENS))
@@ -46,9 +79,10 @@ def test_prefill_and_steps_match_teacher_forcing(
 
 
 def test_future_tokens_do_not_change_earlier_predictions(
-    inputs: tuple[jax.Array, jax.Array, jax.Array], model_and_variables: tuple[KarelProgramModel, dict[str, Any]]
+    inputs: tuple[jax.Array, jax.Array, jax.Array],
+    nonzero_head_model_and_variables: tuple[KarelProgramModel, dict[str, Any]],
 ) -> None:
-    model, variables = model_and_variables
+    model, variables = nonzero_head_model_and_variables
     initial, target, tokens = inputs
     forward = jax.jit(model.apply)
     _, original = forward(variables, *inputs)
@@ -71,10 +105,25 @@ def test_token_loss_trains_encoder_and_backbone(
 
     def loss(params: dict[str, Any]) -> jax.Array:
         _, logits = model.apply({"params": params}, initial, target, tokens)
-        log_probs = jax.nn.log_softmax(logits)
+        log_probs = jax.nn.log_softmax(generation_logits(logits))
         return -jnp.take_along_axis(log_probs, labels[..., None], axis=-1).mean()
 
-    value, grads = jax.jit(jax.value_and_grad(loss))(variables["params"])
+    value_and_grad = jax.jit(jax.value_and_grad(loss))
+    value, grads = value_and_grad(variables["params"])
+    assert np.isfinite(value)
+    assert np.any(np.asarray(grads["head"]["kernel"]) != 0)
+    for name in ("conv_0", "context_projection", "token_embedding", "backbone"):
+        for leaf in jax.tree.leaves(grads[name]):
+            np.testing.assert_array_equal(leaf, 0)
+
+    def gradient_step(param: jax.Array, grad: jax.Array) -> jax.Array:
+        chex.assert_equal_shape((param, grad))
+        chex.assert_type((param, grad), jnp.float32)
+        return param - 0.1 * grad
+
+    # A first head update unlocks gradients through the encoder and backbone.
+    updated = jax.tree.map(gradient_step, variables["params"], grads)
+    value, grads = value_and_grad(updated)
     assert np.isfinite(value)
     for name in ("conv_0", "context_projection", "token_embedding", "backbone", "head"):
         leaves = jax.tree.leaves(grads[name])

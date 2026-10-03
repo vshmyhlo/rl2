@@ -114,10 +114,16 @@ def learning_rate_schedule(config: Config) -> optax.Schedule:
 
 @jax.jit
 def group_advantages(rewards: Array) -> jax.Array:
+    """Normalize within each task, preserving exactly zero advantages for ties."""
     chex.assert_rank(rewards, 2)
     chex.assert_type(rewards, jnp.float32)
     chex.assert_scalar_positive(rewards.shape[1] - 1)
-    return (rewards - rewards.mean(axis=1, keepdims=True)) / (rewards.std(axis=1, keepdims=True) + 1e-8)
+    # Subtract a member first: reducing identical fractional rewards directly can
+    # round their mean away from that value and create a spurious advantage.
+    shifted = rewards - rewards[:, :1]
+    centered = shifted - shifted.mean(axis=1, keepdims=True)
+    std = jnp.sqrt(jnp.square(centered).mean(axis=1, keepdims=True))
+    return centered / (std + 1e-8)
 
 
 def generation_logits(logits: jax.Array) -> jax.Array:
@@ -197,7 +203,7 @@ def collect_rollout(
         "charts/reward_mean": float(rewards.mean()),
         "charts/success_rate": float(successes.mean()),
         "charts/group_success_rate": float(successes.reshape((config.num_tasks, config.group_size)).any(axis=1).mean()),
-        "charts/informative_group_fraction": float((grouped_rewards.std(axis=1) > 0).mean()),
+        "charts/informative_group_fraction": float((np.ptp(grouped_rewards, axis=1) > 0).mean()),
         "charts/episode_length_mean": float(mask.sum(axis=0).mean()),
         "charts/truncation_rate": errors.count("token_limit") / batch_size,
         "charts/syntax_error_rate": errors.count("syntax_error") / batch_size,

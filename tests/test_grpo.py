@@ -22,7 +22,7 @@ from rl2.grpo import (
     train,
     update,
 )
-from rl2.karel import TOKENS, KarelConfig, KarelProgramEnv, KarelTask
+from rl2.karel import TOKENS, KarelConfig, KarelProgramEnv, KarelTask, StepResult
 from rl2.karel_model import KarelProgramModel
 
 
@@ -67,6 +67,38 @@ def batch_from_logits(logits: jax.Array, mask: jax.Array, advantages: jax.Array)
 def test_advantages_are_group_relative_and_constant_groups_are_zero() -> None:
     rewards = jnp.asarray([[0, 1, 0, 1], [0, 0, 0, 0], [1, 1, 1, 1]], dtype=jnp.float32)
     np.testing.assert_allclose(group_advantages(rewards), [[-1, 1, -1, 1], [0, 0, 0, 0], [0, 0, 0, 0]])
+
+
+@pytest.mark.parametrize("group_size", [8, 16, 32, 128])
+def test_identical_fractional_rewards_have_exactly_zero_advantages(group_size: int) -> None:
+    values = jnp.asarray([0.1, 1 / 3, -1 / 3, 0.7, -2.0], dtype=jnp.float32)
+    rewards = jnp.broadcast_to(values[:, None], (len(values), group_size))
+    np.testing.assert_array_equal(group_advantages(rewards), 0)
+
+
+def test_fractional_advantages_match_float64_reference() -> None:
+    rewards = np.asarray([[0.1, 0.1, 0.100001, 0.099999], [-2, -1, 1 / 3, 0.7]], dtype=np.float32)
+    reference = rewards.astype(np.float64)
+    expected = (reference - reference.mean(axis=1, keepdims=True)) / (reference.std(axis=1, keepdims=True) + 1e-8)
+    np.testing.assert_allclose(group_advantages(rewards), expected, atol=2e-7, rtol=2e-7)
+
+
+def test_equal_partial_rewards_are_not_logged_as_informative(
+    config: Config, state: TrainState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(config, group_size=128)
+
+    def equal_reward_step(self: KarelProgramEnv, action: int) -> StepResult:
+        # Isolate rollout statistics with identical fractional terminal rewards.
+        assert self.action_space.contains(action)
+        return None, 0.1, True, False, {"success": False, "error": None}
+
+    monkeypatch.setattr(KarelProgramEnv, "step", equal_reward_step)
+    envs = [KarelProgramEnv(config.env) for _ in range(config.group_size)]
+    batch, rewards, diagnostics, _ = collect_rollout(state, envs, np.random.default_rng(0), jax.random.key(0), config)
+    np.testing.assert_array_equal(rewards, np.float32(0.1))
+    np.testing.assert_array_equal(batch.advantages, 0)
+    assert diagnostics["charts/informative_group_fraction"] == 0.0
 
 
 def test_objective_weights_programs_equally_and_masks_padding(config: Config) -> None:
@@ -228,10 +260,15 @@ def test_update_changes_policy_and_kl_limit_skips_update(config: Config, state: 
 
 
 def test_sampled_log_probs_match_teacher_forcing(config: Config, state: TrainState) -> None:
+    # A zero head makes all probabilities identical, hiding shifts/state bugs.
+    head = state.params["head"]
+    nonzero_head = {**head, "kernel": jax.random.normal(jax.random.key(20), head["kernel"].shape) * 0.1}
+    state = state.replace(params={**state.params, "head": nonzero_head})
     envs = [KarelProgramEnv(config.env) for _ in range(config.num_tasks * config.group_size)]
     batch, _, _, _ = collect_rollout(state, envs, np.random.default_rng(9), jax.random.key(9), config)
     _, logits = state.apply_fn({"params": state.params}, batch.initial, batch.target, batch.actions[:-1])
     recomputed = np.asarray(action_log_prob(logits, batch.actions))
+    assert np.ptp(batch.old_log_probs[batch.mask]) > 0
     np.testing.assert_allclose(recomputed[batch.mask], batch.old_log_probs[batch.mask], rtol=3e-5, atol=3e-6)
 
 

@@ -10,6 +10,8 @@ For generation, prefill(initial, target) starts fresh and returns the carry and
 first-token logits. Then step(sampled_token, carry) returns next-token logits.
 Stop externally at m) or the environment's token limit. The trainer excludes
 PAD from sampling and loss probabilities; this model returns raw logits.
+The output head starts at zero, giving a uniform prior over the 50 program
+tokens after PAD masking. The encoder and backbone retain random initialization.
 """
 
 import chex
@@ -57,7 +59,11 @@ class KarelProgramModel(nn.Module):
             d_state=self.d_state,
             headdim=self.headdim,
         )
-        self.head = nn.Dense(len(TOKENS))
+        # Equal logits give an exactly uniform initial policy after PAD masking.
+        # The head learns first; gradients reach the backbone once it is nonzero.
+        self.head = nn.Dense(
+            len(TOKENS), kernel_init=nn.initializers.zeros_init(), bias_init=nn.initializers.zeros_init()
+        )
 
     def encode_pair(self, initial: jax.Array, target: jax.Array) -> jax.Array:
         """Encode aligned initial/target grids into one [B,D] context token."""
