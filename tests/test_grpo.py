@@ -1,5 +1,6 @@
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import chex
 import jax
@@ -49,6 +50,8 @@ def config() -> Config:
         decision_batch_size=5,
         entropy_coef=0.01,
         target_kl=None,
+        log_interval=1,
+        log_program_interval=1,
         env=KarelConfig(height=3, width=3, max_depth=0, max_statements=1, max_program_tokens=8),
     )
 
@@ -229,6 +232,55 @@ def test_train_checkpoint_tensorboard(
     assert events.Scalars("charts/reward_mean")
     assert events.Scalars("charts/program_token_length_mean")
     assert "samples/generated_programs/text_summary" in events.Tags()["tensors"]
+
+
+def test_logging_every_20_rollouts_survives_resume(
+    config: Config,
+    state: TrainState,
+    rollout: tuple[GRPOBatch, np.ndarray, dict[str, float], jax.Array],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(
+        config,
+        total_updates=21,
+        log_dir=str(tmp_path),
+        run_id="logging",
+        log_interval=20,
+        log_program_interval=20,
+    )
+    writer = MagicMock(spec=SummaryWriter)
+    monkeypatch.setattr(grpo, "SummaryWriter", MagicMock(return_value=writer))
+    monkeypatch.setattr(grpo, "create_state", MagicMock(return_value=state))
+    monkeypatch.setattr(grpo, "collect_rollout", MagicMock(return_value=rollout))
+    monkeypatch.setattr(grpo, "update", MagicMock(return_value=(state, tuple(jnp.asarray(0.0) for _ in range(5)))))
+    formatter = MagicMock(return_value="sample programs")
+    monkeypatch.setattr(grpo, "format_group_programs", formatter)
+    train(config)
+    checkpoint = tmp_path / "logging" / "checkpoint.msgpack"
+    assert serialization.msgpack_restore(checkpoint.read_bytes())["iteration"] == 21
+    assert writer.flush.call_count == 1
+    train(replace(config, total_updates=41))
+    saved = serialization.msgpack_restore(checkpoint.read_bytes())
+    assert saved["iteration"] == 41 and saved["logged_groups"] == 2
+    assert writer.flush.call_count == 2
+    assert formatter.call_count == 2
+    steps_per_rollout = int(rollout[0].mask.sum())
+    reward_steps = [call.args[2] for call in writer.add_scalar.call_args_list if call.args[0] == "charts/reward_mean"]
+    assert reward_steps == [20 * steps_per_rollout, 40 * steps_per_rollout]
+    sample_steps = [
+        call.args[2] for call in writer.add_text.call_args_list if call.args[0] == "samples/generated_programs"
+    ]
+    assert sample_steps == reward_steps
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("iteration=")]
+    assert [line.split()[0] for line in lines] == ["iteration=20", "iteration=40"]
+
+
+@pytest.mark.parametrize("interval", [0, -1, 1.5, True])
+def test_invalid_log_interval(config: Config, interval: float | bool) -> None:
+    with pytest.raises((AssertionError, TypeError)):
+        replace(config, log_interval=interval)
 
 
 def test_gcs_checkpoint_paths(config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -27,7 +27,8 @@ max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/grpo_karel
 run_id: karel_ast_parallel_v4 # Reuse to resume; change for a new run, or null for a timestamped run
 checkpoint_interval_seconds: 300 # Save to log_dir/run_id on GCS every 5 minutes (at rollout boundaries), plus final
-log_program_interval: 10 # First rollout and every 10th; rotate through task groups
+log_interval: 20 # TensorBoard scalars, stdout, and flushes every 20 completed rollouts
+log_program_interval: 20 # Samples on logging iterations divisible by this interval; rotate through task groups
 log_program_count: 8 # Compare first 8 samples from the same group; 0 disables
 env:
   height: 8

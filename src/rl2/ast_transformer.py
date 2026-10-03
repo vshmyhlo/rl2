@@ -47,13 +47,12 @@ class _ASTBlock(nn.Module):
         value = nn.Dense(self.num_kv_heads * head_dim, use_bias=False, dtype=self.dtype, name="value")(normalized)
         query = query.reshape(batch, length, self.num_heads, head_dim)
         key, value = (v.reshape(batch, length, self.num_kv_heads, head_dim) for v in (key, value))
-        # Mask keys, not queries: padded queries still see the always-present pair
-        # prefix, avoiding an all-masked softmax. Their outputs never become keys.
-        mask = jnp.broadcast_to(present[:, None, None, :], (batch, 1, length, length))
+        # The pair prefix and preorder nodes form a contiguous live prefix.
+        # Lengths exclude padding for both queries and keys, including any
+        # extra position added below for cuDNN alignment.
+        lengths = present.sum(axis=-1, dtype=jnp.int32)
         if self.attention_implementation == "cudnn" and length % 2:
             query, key, value = (jnp.pad(v, ((0, 0), (0, 1), (0, 0), (0, 0))) for v in (query, key, value))
-            mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 1), (0, 1)))
-            mask = mask.at[:, :, -1, 0].set(True)
             bias = jnp.pad(bias, ((0, 0), (0, 0), (0, 1), (0, 1)))
         attention_dtype = jnp.float32 if self.attention_implementation == "xla" else self.dtype
         attended = (
@@ -62,7 +61,8 @@ class _ASTBlock(nn.Module):
                 key.astype(attention_dtype),
                 value.astype(attention_dtype),
                 bias=bias.astype(attention_dtype),
-                mask=mask,
+                query_seq_lengths=lengths,
+                key_value_seq_lengths=lengths,
                 is_causal=False,
                 implementation=self.attention_implementation,
             )[:, :length]

@@ -1,6 +1,7 @@
 from dataclasses import replace
 from pathlib import Path
 from typing import NamedTuple
+from unittest.mock import patch
 
 import chex
 import jax
@@ -19,6 +20,7 @@ from rl2.grpo import (
 )
 from rl2.karel import KarelConfig, _parse
 from rl2.karel_ast import ACTION_ID, AST_ACTIONS, ASTFeatures, KarelAST, batch_features, teacher_forcing
+from rl2.transformer import AttentionImplementation
 from rl2.tree_attention import Relation, tree_relations
 
 
@@ -114,7 +116,9 @@ def test_bidirectional_attention_matches_numpy_and_excludes_padding(use_bias: bo
                 weights = np.exp(scores - scores.max())
                 attended[b, t, h] = weights / weights.sum() @ value[b, :, 0]
     expected = x + attended.reshape(2, 5, 16) @ params["attention_out"]["kernel"]
-    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
+    np.testing.assert_allclose(actual[present], expected[present], rtol=2e-5, atol=2e-6)
+    # With query lengths, padded attention outputs are zero (the residual remains).
+    np.testing.assert_array_equal(actual[~present], x[~present])
 
     def first_output(inputs: jax.Array) -> jax.Array:
         chex.assert_shape(inputs, x.shape)
@@ -124,6 +128,62 @@ def test_bidirectional_attention_matches_numpy_and_excludes_padding(use_bias: bo
     gradients = jax.grad(first_output)(x)
     assert np.linalg.norm(gradients[0, 2]) > 1e-5  # A later present node influences the first position.
     np.testing.assert_array_equal(gradients[0, 3:], 0)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_sequence_lengths_match_explicit_mask_outputs_and_gradients(dtype: jax.typing.DTypeLike) -> None:
+    block = _ASTBlock(16, 2, 1, 32, 1, dtype, "xla")
+    x = jax.random.normal(jax.random.key(31), (3, 6, 16))
+    # Prefix-only, partially filled, and completely filled sequences in one batch.
+    present = jnp.arange(6)[None] < jnp.asarray([1, 3, 6])[:, None]
+    depths = jnp.asarray([[0, 0, 0, 0, 0], [0, 1, 0, 0, 0], [0, 1, 2, 1, 2]], jnp.int32)
+    relations = tree_relations(depths, present[:, 1:])
+    params = block.init(jax.random.key(32), x, present, relations)["params"]
+    params["tree_bias"] = jax.tree.map(
+        lambda v: jax.random.normal(jax.random.key(v.size), v.shape), params["tree_bias"]
+    )
+    attention = jax.nn.dot_product_attention
+
+    def masked_attention(
+        query: jax.Array,
+        key: jax.Array,
+        value: jax.Array,
+        *,
+        bias: jax.Array,
+        query_seq_lengths: jax.Array,
+        key_value_seq_lengths: jax.Array,
+        is_causal: bool,
+        implementation: AttentionImplementation,
+    ) -> jax.Array:
+        chex.assert_rank((query, key, value, bias), 4)
+        chex.assert_type((query, key, value, bias), jnp.floating)
+        chex.assert_shape((query_seq_lengths, key_value_seq_lengths), (3,))
+        chex.assert_type((query_seq_lengths, key_value_seq_lengths), jnp.int32)
+        return attention(
+            query,
+            key,
+            value,
+            bias=bias,
+            mask=present[:, None, None, :],
+            is_causal=is_causal,
+            implementation=implementation,
+        )
+
+    def loss(parameters: dict, inputs: jax.Array) -> tuple[jax.Array, jax.Array]:
+        chex.assert_shape(inputs, x.shape)
+        chex.assert_type(inputs, jnp.float32)
+        output = block.apply({"params": parameters}, inputs, present, relations)
+        live = jnp.where(present[..., None], output, 0)
+        return jnp.square(live).sum(), live
+
+    (_, actual), actual_grads = jax.value_and_grad(loss, argnums=(0, 1), has_aux=True)(params, x)
+    with patch("jax.nn.dot_product_attention", side_effect=masked_attention):
+        (_, expected), expected_grads = jax.value_and_grad(loss, argnums=(0, 1), has_aux=True)(params, x)
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+    for actual_grad, expected_grad in zip(jax.tree.leaves(actual_grads), jax.tree.leaves(expected_grads)):
+        assert np.isfinite(actual_grad).all()
+        np.testing.assert_allclose(actual_grad, expected_grad, rtol=1e-5, atol=1e-5)
+    np.testing.assert_array_equal(actual_grads[1][~present], 0)
 
 
 @pytest.mark.skipif(not any(device.platform == "gpu" for device in jax.devices()), reason="cuDNN requires a GPU")

@@ -70,7 +70,8 @@ class Config:
     log_dir: str = "runs"
     run_id: str | None = None  # Same ID resumes; None creates a timestamped run.
     checkpoint_interval_seconds: float = 300.0  # Save at the next completed rollout boundary.
-    log_program_interval: int = 10  # First rollout, then every N rollouts.
+    log_interval: int = 20  # TensorBoard scalars, stdout, and flushes every N completed rollouts.
+    log_program_interval: int = 20  # Program samples on logging iterations divisible by this interval.
     log_program_count: int = 8  # First N programs in one group; zero disables samples.
     env: KarelConfig = field(default_factory=KarelConfig)
 
@@ -93,9 +94,10 @@ class Config:
             raise ValueError("attention_implementation must be 'xla' or 'cudnn'")
         if self.attention_implementation == "cudnn" and not self.bf16:
             raise ValueError("cuDNN attention requires bf16=True")
-        for value in (self.log_program_interval, self.log_program_count):
+        for value in (self.log_interval, self.log_program_interval, self.log_program_count):
             if type(value) is not int:
-                raise TypeError("Program logging settings must be integers")
+                raise TypeError("Logging settings must be integers")
+        chex.assert_scalar_positive(self.log_interval)
         chex.assert_scalar_positive(self.log_program_interval)
         chex.assert_scalar_non_negative(self.log_program_count)
         for value in (self.total_updates, self.num_tasks, self.group_size, self.num_minibatches, self.update_epochs):
@@ -743,35 +745,37 @@ def train(config: Config) -> TrainState:
                     updates_done += 1
                 if early_stop:
                     break
-            jax.block_until_ready((state, metrics))
-            policy_loss, entropy, approx_kl, clip_fraction, reference_kl = np.mean(jax.device_get(metrics), axis=0)
-            for tag, scalar in {
-                **diagnostics,
-                "losses/policy": policy_loss,
-                "policy/entropy": entropy,
-                "policy/approx_kl": approx_kl,
-                "policy/clip_fraction": clip_fraction,
-                "policy/reference_kl": reference_kl,
-                "policy/early_stop": early_stop,
-                "charts/learning_rate": learning_rate,
-                "charts/updates_per_rollout": updates_done,
-                "charts/total_episodes": episodes,
-                "charts/steps_per_second": (steps - start_steps) / (monotonic() - start),
-                "time/rollout_seconds": rollout_seconds,
-                "time/optimization_seconds": monotonic() - optimization_start,
-            }.items():
-                writer.add_scalar(tag, float(scalar), steps)
-            if config.log_program_count and (iteration == 0 or (iteration + 1) % config.log_program_interval == 0):
-                samples = format_group_programs(
-                    batch,
-                    rewards,
-                    config=config,
-                    group_size=config.group_size,
-                    group_index=logged_groups % config.num_tasks,
-                    count=config.log_program_count,
-                )
-                logged_groups += 1
-                writer.add_text("samples/generated_programs", samples, steps)
+            log_iteration = (iteration + 1) % config.log_interval == 0
+            if log_iteration:
+                jax.block_until_ready((state, metrics))
+                policy_loss, entropy, approx_kl, clip_fraction, reference_kl = np.mean(jax.device_get(metrics), axis=0)
+                for tag, scalar in {
+                    **diagnostics,
+                    "losses/policy": policy_loss,
+                    "policy/entropy": entropy,
+                    "policy/approx_kl": approx_kl,
+                    "policy/clip_fraction": clip_fraction,
+                    "policy/reference_kl": reference_kl,
+                    "policy/early_stop": early_stop,
+                    "charts/learning_rate": learning_rate,
+                    "charts/updates_per_rollout": updates_done,
+                    "charts/total_episodes": episodes,
+                    "charts/steps_per_second": (steps - start_steps) / (monotonic() - start),
+                    "time/rollout_seconds": rollout_seconds,
+                    "time/optimization_seconds": monotonic() - optimization_start,
+                }.items():
+                    writer.add_scalar(tag, float(scalar), steps)
+                if config.log_program_count and (iteration + 1) % config.log_program_interval == 0:
+                    samples = format_group_programs(
+                        batch,
+                        rewards,
+                        config=config,
+                        group_size=config.group_size,
+                        group_index=logged_groups % config.num_tasks,
+                        count=config.log_program_count,
+                    )
+                    logged_groups += 1
+                    writer.add_text("samples/generated_programs", samples, steps)
             if (
                 monotonic() - last_checkpoint_time >= config.checkpoint_interval_seconds
                 or iteration + 1 == config.total_updates
@@ -782,21 +786,22 @@ def train(config: Config) -> TrainState:
                     rng,
                 )
                 last_checkpoint_time = monotonic()
-            writer.flush()
-            print(
-                f"iteration={iteration + 1} step={steps} success={diagnostics['charts/success_rate']:.3f} "
-                f"reward={diagnostics['charts/reward_mean']:.3f} "
-                f"syntax={diagnostics['charts/reward_syntax_mean']:.3f} "
-                f"runtime={diagnostics['charts/reward_runtime_mean']:.3f} "
-                f"distance={diagnostics['charts/reward_distance_mean']:.3f} "
-                f"trajectory={diagnostics['charts/reward_trajectory_mean']:.3f} "
-                f"length_penalty={diagnostics['charts/reward_length_mean']:.4f} "
-                f"execution_penalty={diagnostics['charts/reward_execution_mean']:.4f} "
-                f"informative_groups={diagnostics['charts/informative_group_fraction']:.3f} "
-                f"policy={policy_loss:.3f} entropy={entropy:.3f} kl={approx_kl:.4f} "
-                f"updates={updates_done} early_stop={early_stop}",
-                flush=True,
-            )
+            if log_iteration:
+                writer.flush()
+                print(
+                    f"iteration={iteration + 1} step={steps} success={diagnostics['charts/success_rate']:.3f} "
+                    f"reward={diagnostics['charts/reward_mean']:.3f} "
+                    f"syntax={diagnostics['charts/reward_syntax_mean']:.3f} "
+                    f"runtime={diagnostics['charts/reward_runtime_mean']:.3f} "
+                    f"distance={diagnostics['charts/reward_distance_mean']:.3f} "
+                    f"trajectory={diagnostics['charts/reward_trajectory_mean']:.3f} "
+                    f"length_penalty={diagnostics['charts/reward_length_mean']:.4f} "
+                    f"execution_penalty={diagnostics['charts/reward_execution_mean']:.4f} "
+                    f"informative_groups={diagnostics['charts/informative_group_fraction']:.3f} "
+                    f"policy={policy_loss:.3f} entropy={entropy:.3f} kl={approx_kl:.4f} "
+                    f"updates={updates_done} early_stop={early_stop}",
+                    flush=True,
+                )
         return state
     finally:
         writer.close()
