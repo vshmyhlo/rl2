@@ -5,16 +5,17 @@ group_size: 8 # Independent program samples for each pair
 num_minibatches: 4 # Must divide num_tasks * group_size; keep whole programs together
 update_epochs: 1
 max_nodes: 128 # Maximum AST nodes/expansion actions, including list and value nodes
-max_depth: 32 # AST depth, including list nodes; distinct from env.max_depth
+max_depth: 16 # AST depth, including list nodes; distinct from env.max_depth
 decision_batch_size: 32 # Partial-tree rounds per microbatch (all holes predicted together); gradients accumulate per program minibatch
 bf16: true # AST Transformer compute in BF16; parameters, optimizer, and loss in FP32
 attention_implementation: cudnn # Requires a supported NVIDIA GPU; use xla for CPU
-d_model: 320 # 9,234,920 parameters with max_nodes=128 and 8x8 pairs
+d_model: 320 # About 9.2M parameters; exact count depends on max_depth and grid size
 num_layers: 7
 num_heads: 5 # Transformer head dimension = d_model / num_heads = 64
 num_kv_heads: null # Full multi-head attention; fewer KV heads enables grouped-query attention
 # All current holes expand in parallel from one encoding per round; new children wait for the next round.
 # At most min(max_nodes, max_depth + 1) rounds; no causal KV cache.
+# Tree-relative attention is always enabled; checkpoints from before this change require a new run_id.
 learning_rate: 0.0001
 anneal_lr: true
 clip_coef: 0.2
@@ -24,7 +25,7 @@ entropy_coef: 0.01
 kl_coef: 0.0 # Optional penalty against the frozen initial model; no reference forward when zero
 max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/grpo_karel
-run_id: karel_ast_parallel_v1 # Reuse to resume; change for a new run, or null for a timestamped run
+run_id: karel_ast_parallel_v4 # Reuse to resume; change for a new run, or null for a timestamped run
 checkpoint_interval_seconds: 300 # Save to log_dir/run_id on GCS every 5 minutes (at rollout boundaries), plus final
 log_program_interval: 10 # First rollout and every 10th; rotate through task groups
 log_program_count: 8 # Compare first 8 samples from the same group; 0 disables

@@ -19,6 +19,7 @@ from rl2.grpo import (
 )
 from rl2.karel import KarelConfig, _parse
 from rl2.karel_ast import ACTION_ID, AST_ACTIONS, ASTFeatures, KarelAST, batch_features, teacher_forcing
+from rl2.tree_attention import Relation, tree_relations
 
 
 class ModelBatch(NamedTuple):
@@ -77,13 +78,27 @@ def config() -> Config:
     )
 
 
-def test_bidirectional_attention_matches_numpy_and_excludes_padding() -> None:
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_bidirectional_attention_matches_numpy_and_excludes_padding(use_bias: bool) -> None:
     block = _ASTBlock(16, 2, 1, 32, 1, jnp.float32, "xla")
     x = jax.random.normal(jax.random.key(12), (2, 5, 16))
     present = jnp.asarray([[True, True, True, False, False], [True, True, True, True, True]])
-    params = block.init(jax.random.key(13), x, present)["params"]
+    relations = tree_relations(jnp.asarray([[0, 1, 0, 0], [0, 1, 2, 1]], jnp.int32), present[:, 1:])
+    params = block.init(jax.random.key(13), x, present, relations)["params"]
     params = {**params, "down": {"kernel": jnp.zeros_like(params["down"]["kernel"])}}
-    actual = block.apply({"params": params}, x, present)
+    if use_bias:
+        params["tree_bias"] = jax.tree.map(
+            lambda v: jax.random.normal(jax.random.key(v.size), v.shape), params["tree_bias"]
+        )
+    actual = block.apply({"params": params}, x, present, relations)
+    tables = {name: np.asarray(value) for name, value in params["tree_bias"].items()}
+    bias = tables["relation"][relations.kind]
+    bias += np.where(
+        (relations.kind <= Relation.OTHER)[..., None],
+        tables["distance"][relations.distance] + tables["relative_depth"][relations.relative_depth],
+        0,
+    )
+    bias = np.where((relations.kind != Relation.PADDING)[..., None], bias, 0)
     normalized = np.asarray(x) / np.sqrt(np.mean(np.asarray(x) ** 2, axis=-1, keepdims=True) + 1e-6)
     normalized *= np.asarray(params["attention_norm"]["scale"])
     query = (normalized @ params["query"]["kernel"]).reshape(2, 5, 2, 8)
@@ -94,6 +109,7 @@ def test_bidirectional_attention_matches_numpy_and_excludes_padding() -> None:
         for t in range(5):
             for h in range(2):
                 scores = np.asarray(key[b, :, 0] @ query[b, t, h]) / np.sqrt(8)
+                scores += bias[b, t, :, h]
                 scores = np.where(present[b], scores, -np.inf)
                 weights = np.exp(scores - scores.max())
                 attended[b, t, h] = weights / weights.sum() @ value[b, :, 0]
@@ -103,11 +119,40 @@ def test_bidirectional_attention_matches_numpy_and_excludes_padding() -> None:
     def first_output(inputs: jax.Array) -> jax.Array:
         chex.assert_shape(inputs, x.shape)
         chex.assert_type(inputs, jnp.float32)
-        return block.apply({"params": params}, inputs, present)[0, 0].sum()
+        return block.apply({"params": params}, inputs, present, relations)[0, 0].sum()
 
     gradients = jax.grad(first_output)(x)
     assert np.linalg.norm(gradients[0, 2]) > 1e-5  # A later present node influences the first position.
     np.testing.assert_array_equal(gradients[0, 3:], 0)
+
+
+@pytest.mark.skipif(not any(device.platform == "gpu" for device in jax.devices()), reason="cuDNN requires a GPU")
+def test_cudnn_tree_bias_matches_xla_forward_and_gradients() -> None:
+    # Odd length exercises the cuDNN padding path; different trees exercise
+    # per-example bias gradients rather than a bias shared across the batch.
+    x = jax.random.normal(jax.random.key(3), (2, 5, 32))
+    present = jnp.asarray([[True, True, True, False, False], [True, True, True, True, True]])
+    relations = tree_relations(jnp.asarray([[0, 1, 0, 0], [0, 1, 1, 2]], jnp.int32), present[:, 1:])
+    xla = _ASTBlock(32, 2, 1, 32, 1, jnp.bfloat16, "xla")
+    cudnn = _ASTBlock(32, 2, 1, 32, 1, jnp.bfloat16, "cudnn")
+    params = xla.init(jax.random.key(4), x, present, relations)["params"]
+    params["tree_bias"] = jax.tree.map(
+        lambda v: jax.random.normal(jax.random.key(v.size), v.shape), params["tree_bias"]
+    )
+
+    def loss(parameters: dict, block: _ASTBlock) -> jax.Array:
+        output = block.apply({"params": parameters}, x, present, relations)
+        return jnp.where(present[..., None], output**2, 0).mean()
+
+    expected, expected_grad = jax.jit(jax.value_and_grad(lambda p: loss(p, xla)))(params)
+    actual, actual_grad = jax.jit(jax.value_and_grad(lambda p: loss(p, cudnn)))(params)
+    np.testing.assert_allclose(actual, expected, rtol=0.02, atol=0.01)
+    for name in params["tree_bias"]:
+        assert np.isfinite(actual_grad["tree_bias"][name]).all()
+        assert np.linalg.norm(actual_grad["tree_bias"][name]) > 0
+        np.testing.assert_allclose(
+            actual_grad["tree_bias"][name], expected_grad["tree_bias"][name], rtol=0.1, atol=0.005
+        )
 
 
 def test_initial_policy_is_uniform_over_typed_actions(config: Config, batch: ModelBatch) -> None:
@@ -129,6 +174,10 @@ def test_padded_features_do_not_affect_predictions(config: Config, batch: ModelB
     params = dict(state.params)
     for name in ("constructor_head", "value_head"):
         params[name] = {**params[name], "kernel": jax.random.normal(jax.random.key(5), params[name]["kernel"].shape)}
+    params["layers_0"] = dict(params["layers_0"])
+    params["layers_0"]["tree_bias"] = jax.tree.map(
+        lambda v: jax.random.normal(jax.random.key(v.size), v.shape), params["layers_0"]["tree_bias"]
+    )
     state = state.replace(params=params)
     dirty = ASTFeatures(
         *(np.where(batch.tree.node_mask, array, 999999).astype(np.int32) for array in batch.tree[:5]),
@@ -176,6 +225,8 @@ def test_masked_head_gradients_are_finite_and_learnable(config: Config, batch: M
             not np.array_equal(a, b)
             for a, b in zip(jax.tree.leaves(initial_params[name]), jax.tree.leaves(state.params[name]))
         )
+    for name in ("relation", "distance", "relative_depth"):
+        assert np.linalg.norm(state.params["layers_0"]["tree_bias"][name]) > 0
 
 
 def test_sampling_finishes_and_completed_trees_use_safe_dummy_logits(config: Config, batch: ModelBatch) -> None:

@@ -1,6 +1,8 @@
 """AST-aware Transformer for parallel typed-hole expansions, conditioned on a grid pair.
 
 The entire current tree is re-encoded each round with bidirectional attention.
+Each layer/head adds learned tree-relation, distance, and relative-depth biases
+to attention scores, derived from the existing preorder depths.
 Only the present partial tree is visible, including unresolved sibling holes;
 there is no causal action-history cache and no access to future expansions.
 Constructor/value heads predict an expansion at every current hole in parallel.
@@ -17,6 +19,7 @@ from flax import linen as nn
 from rl2.karel_ast import AST_ACTIONS, CONSTRUCTORS, NUM_NODE_TYPES, VALUES, ASTFeatures, Field
 from rl2.karel_syntax import MAX_BLOCK_DEPTH
 from rl2.transformer import AttentionImplementation
+from rl2.tree_attention import TreeAttentionBias, TreeRelations, tree_relations
 
 
 class _ASTBlock(nn.Module):
@@ -29,12 +32,14 @@ class _ASTBlock(nn.Module):
     attention_implementation: AttentionImplementation
 
     @nn.compact
-    def __call__(self, x: jax.Array, present: jax.Array) -> jax.Array:
+    def __call__(self, x: jax.Array, present: jax.Array, relations: TreeRelations) -> jax.Array:
         chex.assert_shape(x, (None, None, self.d_model))
         chex.assert_type(x, jnp.floating)
         chex.assert_shape(present, x.shape[:2])
         chex.assert_type(present, jnp.bool_)
         batch, length, _ = x.shape
+        chex.assert_shape(relations, (batch, length, length))
+        bias = TreeAttentionBias(self.num_heads, name="tree_bias")(relations)
         head_dim = self.d_model // self.num_heads
         normalized = nn.RMSNorm(dtype=self.dtype, name="attention_norm")(x)
         query = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype, name="query")(normalized)
@@ -49,12 +54,14 @@ class _ASTBlock(nn.Module):
             query, key, value = (jnp.pad(v, ((0, 0), (0, 1), (0, 0), (0, 0))) for v in (query, key, value))
             mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 1), (0, 1)))
             mask = mask.at[:, :, -1, 0].set(True)
+            bias = jnp.pad(bias, ((0, 0), (0, 0), (0, 1), (0, 1)))
         attention_dtype = jnp.float32 if self.attention_implementation == "xla" else self.dtype
         attended = (
             jax.nn.dot_product_attention(
                 query.astype(attention_dtype),
                 key.astype(attention_dtype),
                 value.astype(attention_dtype),
+                bias=bias.astype(attention_dtype),
                 mask=mask,
                 is_causal=False,
                 implementation=self.attention_implementation,
@@ -194,8 +201,9 @@ class ASTTransformer(nn.Module):
         x = jnp.concatenate((context[:, None], nodes), axis=1)
         x = x + self.position_embedding(jnp.arange(self.max_nodes + 1, dtype=jnp.int32))[None]
         present = jnp.concatenate((jnp.ones((batch, 1), jnp.bool_), tree.node_mask), axis=1)
+        relations = tree_relations(tree.depth, tree.node_mask)
         for layer in self.layers:
-            x = layer(x, present)
+            x = layer(x, present, relations)
         nodes = self.final_norm(x[:, 1:])
         logits = jnp.concatenate(
             (
