@@ -288,3 +288,98 @@ def test_world_shape_dtype_and_robot_validation(world: State) -> None:
     world[1, 1, 0] = 1
     with pytest.raises(ValueError, match="exactly one"):
         execute("move", world)
+
+
+@pytest.mark.parametrize("heading,destination", [(0, (1, 2)), (1, (2, 3)), (2, (3, 2)), (3, (2, 1))])
+def test_movement_and_marker_update_in_every_direction(
+    world: State, heading: int, destination: tuple[int, int]
+) -> None:
+    world[..., :4] = 0
+    world[2, 2, heading] = 1
+    result = execute("move putMarker", world)
+    expected = world.copy()
+    expected[..., :4] = 0
+    row, col = destination
+    expected[row, col, heading] = 1
+    expected[row, col, 5] += 1
+    np.testing.assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize("heading", range(4))
+def test_unwalled_array_edges_are_blocked(heading: int) -> None:
+    world = np.zeros((1, 1, 6), dtype=np.int32)
+    world[0, 0, heading] = 1
+    result = execute("IFELSE c( frontIsClear c) i( move i) ELSE e( putMarker e)", world)
+    assert result[0, 0, 5] == 1
+    with pytest.raises(KarelProgramError, match="out of bounds"):
+        execute("move", world)
+
+
+@pytest.mark.parametrize(
+    "body,required_steps",
+    [
+        ("move", 1),
+        ("REPEAT R=2 r( move r)", 3),
+        ("WHILE c( frontIsClear c) w( move w)", 8),
+    ],
+)
+def test_exact_execution_budget(world: State, body: str, required_steps: int) -> None:
+    expected = execute(body, world)
+    np.testing.assert_array_equal(execute(body, world, max_steps=required_steps), expected)
+    if required_steps > 1:
+        with pytest.raises(KarelProgramError) as error:
+            execute(body, world, max_steps=required_steps - 1)
+        assert error.value.reason == "execution_limit"
+
+
+def test_zero_repeat_and_false_branch_skip_invalid_actions(world: State) -> None:
+    result = execute(
+        "REPEAT R=0 r( REPEAT R=19 r( move r) r) "
+        "IF c( noMarkersPresent c) i( REPEAT R=19 r( move r) i) "
+        "pickMarker IF c( not c( markersPresent c) c) i( putMarker i)",
+        world,
+    )
+    np.testing.assert_array_equal(result, world)
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_minimum_task_and_submission_budgets(seed: int) -> None:
+    env = KarelProgramEnv(
+        KarelConfig(
+            height=3,
+            width=3,
+            wall_probability=1.0,
+            marker_probability=1.0,
+            max_markers=1,
+            max_program_tokens=6,
+            max_execution_steps=1,
+        )
+    )
+    initial, target = env.reset(seed=seed)
+    assert not np.array_equal(initial, target)
+    assert len(env.reference_program) == 6
+    for token_id in env.reference_program:
+        result = env.step(token_id)
+    assert result == (None, 1.0, True, False, {"success": True, "error": None})
+
+
+def test_failed_reset_invalidates_old_task_and_can_recover(monkeypatch: pytest.MonkeyPatch) -> None:
+    env = KarelProgramEnv()
+    env.reset(seed=1)
+    env.step(env.token_to_id["DEF"])
+
+    def fail_sampling(rng: np.random.Generator, config: KarelConfig) -> KarelTask:
+        raise RuntimeError("Sampling failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("rl2.karel.sample_task", fail_sampling)
+        with pytest.raises(RuntimeError, match="Sampling failed"):
+            env.reset()
+    with pytest.raises(gym.error.ResetNeeded):
+        env.step(env.eos_token_id)
+    with pytest.raises(gym.error.ResetNeeded):
+        _ = env.reference_program
+    env.reset(seed=2)
+    for token_id in env.reference_program:
+        result = env.step(token_id)
+    assert result[1:4] == (1.0, True, False)
