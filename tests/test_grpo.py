@@ -26,14 +26,17 @@ from rl2.karel import TOKENS, KarelConfig, KarelProgramEnv, KarelTask, StepResul
 from rl2.karel_model import KarelProgramModel
 
 
-@pytest.fixture(scope="module")
-def config() -> Config:
+@pytest.fixture(scope="module", params=["mamba3", "transformer"])
+def config(request: pytest.FixtureRequest) -> Config:
     return Config(
         total_updates=1,
         num_tasks=1,
         group_size=2,
         num_minibatches=1,
         update_epochs=1,
+        backbone_type=request.param,
+        num_heads=2,
+        num_kv_heads=1,
         d_model=8,
         num_layers=1,
         d_state=8,
@@ -47,6 +50,10 @@ def config() -> Config:
 @pytest.fixture(scope="module")
 def state(config: Config) -> TrainState:
     model = KarelProgramModel(
+        backbone_type=config.backbone_type,
+        num_heads=config.num_heads,
+        num_kv_heads=config.num_kv_heads,
+        max_seq_len=config.env.max_program_tokens,
         d_model=config.d_model,
         num_layers=config.num_layers,
         d_state=config.d_state,
@@ -366,18 +373,36 @@ def test_pad_labels_and_logits_have_no_loss_gradient(config: Config) -> None:
 
 def test_config_and_lr_schedule(config: Config) -> None:
     loaded = load_config(Path(__file__).parents[1] / "configs/grpo_karel.yaml")
+    assert loaded.backbone_type == "transformer"
+    assert loaded.num_heads == 5
+    assert loaded.bf16 is True
+    assert loaded.attention_implementation == "cudnn"
     assert isinstance(loaded.env, KarelConfig)
     assert isinstance(loaded.conv_channels, tuple)
     schedule = learning_rate_schedule(config)
     np.testing.assert_allclose(schedule(0), config.learning_rate)
     np.testing.assert_allclose(schedule(config.total_updates), 0)
-    for options in ({"group_size": 1}, {"num_minibatches": 3}, {"total_updates": 0}, {"target_kl": -1}):
+    for options in (
+        {"group_size": 1},
+        {"num_minibatches": 3},
+        {"total_updates": 0},
+        {"target_kl": -1},
+        {"backbone_type": "unknown"},
+        {"attention_implementation": "unknown"},
+        {"attention_implementation": "cudnn", "bf16": False},
+        {"backbone_type": "mamba3", "attention_implementation": "cudnn", "bf16": True},
+    ):
         with pytest.raises((AssertionError, ValueError)):
             replace(config, **options)
 
 
-def test_one_rollout_training_smoke(config: Config, tmp_path: Path) -> None:
-    result = train(replace(config, log_dir=str(tmp_path)))
+@pytest.mark.parametrize("bf16", [False, True])
+def test_one_rollout_training_smoke(config: Config, tmp_path: Path, bf16: bool) -> None:
+    result = train(replace(config, log_dir=str(tmp_path), bf16=bf16))
     assert int(result.step) == 1
+    chex.assert_type(jax.tree.leaves(result.params), jnp.float32)
+    for leaf in jax.tree.leaves(result.opt_state):
+        if jnp.issubdtype(leaf.dtype, jnp.floating):
+            chex.assert_type(leaf, jnp.float32)
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(result.params))
     assert list(tmp_path.glob("karel_grpo_*/events.out.tfevents.*"))

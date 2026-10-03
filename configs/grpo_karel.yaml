@@ -4,10 +4,14 @@ num_tasks: 16 # Sampled pairs per rollout
 group_size: 16 # Independent program samples for each pair
 num_minibatches: 4 # Must divide num_tasks * group_size; keep whole programs together
 update_epochs: 2
-d_model: 384 # 10,216,371 parameters with the 8x8 grid and model settings below
-num_layers: 4
-d_state: 64
-headdim: 64
+backbone_type: transformer # mamba3 remains available
+bf16: true # Compute/transformer KV cache in BF16; parameters, optimizer, and loss in FP32
+attention_implementation: cudnn # Requires a supported NVIDIA GPU; use xla for CPU
+d_model: 320 # 10,296,403 total parameters with this 8x8 grid and CNN
+num_layers: 7
+num_heads: 5 # Transformer head dimension = d_model / num_heads = 64
+num_kv_heads: null # Full multi-head attention; fewer KV heads enables grouped-query attention
+# Transformer cache length follows env.max_program_tokens, including the image-pair prefix.
 conv_channels: [32, 64, 64]
 learning_rate: 0.00025
 anneal_lr: true

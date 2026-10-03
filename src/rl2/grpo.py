@@ -32,8 +32,8 @@ from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
 from rl2.karel import REWARD_COMPONENTS, TOKENS, KarelConfig, KarelProgramEnv
-from rl2.karel_model import KarelProgramModel
-from rl2.mamba3 import Mamba3StackCarry
+from rl2.karel_model import BackboneType, KarelModelCarry, KarelModelOutput, KarelProgramModel
+from rl2.transformer import AttentionImplementation
 
 type Array = jax.Array | NDArray[Any]
 type Metrics = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
@@ -51,6 +51,11 @@ class Config:
     num_layers: int = 4
     d_state: int = 64
     headdim: int = 64
+    backbone_type: BackboneType = "mamba3"
+    num_heads: int = 8
+    num_kv_heads: int | None = None
+    bf16: bool = False
+    attention_implementation: AttentionImplementation = "xla"
     conv_channels: tuple[int, ...] = (32, 64, 64)
     learning_rate: float = 0.00025
     anneal_lr: bool = True
@@ -63,6 +68,14 @@ class Config:
     env: KarelConfig = field(default_factory=KarelConfig)
 
     def __post_init__(self) -> None:
+        if self.backbone_type not in ("mamba3", "transformer"):
+            raise ValueError("backbone_type must be 'mamba3' or 'transformer'")
+        if type(self.bf16) is not bool:
+            raise TypeError("bf16 must be a boolean")
+        if self.attention_implementation not in ("xla", "cudnn"):
+            raise ValueError("attention_implementation must be 'xla' or 'cudnn'")
+        if self.attention_implementation == "cudnn" and (self.backbone_type != "transformer" or not self.bf16):
+            raise ValueError("cuDNN attention requires backbone_type='transformer' and bf16=True")
         for value in (self.total_updates, self.num_tasks, self.group_size, self.num_minibatches, self.update_epochs):
             if type(value) is not int:
                 raise TypeError("Rollout and update counts must be integers")
@@ -145,12 +158,12 @@ def action_log_prob(logits: jax.Array, actions: Array) -> jax.Array:
 
 
 @jax.jit
-def prefill(state: TrainState, initial: Array, target: Array) -> tuple[Mamba3StackCarry, jax.Array]:
+def prefill(state: TrainState, initial: Array, target: Array) -> KarelModelOutput:
     return state.apply_fn({"params": state.params}, initial, target, method=KarelProgramModel.prefill)
 
 
 @jax.jit
-def decode_step(state: TrainState, actions: Array, carry: Mamba3StackCarry) -> tuple[Mamba3StackCarry, jax.Array]:
+def decode_step(state: TrainState, actions: Array, carry: KarelModelCarry) -> KarelModelOutput:
     return state.apply_fn({"params": state.params}, actions, carry, method=KarelProgramModel.step)
 
 
@@ -295,6 +308,13 @@ def train(config: Config) -> TrainState:
         num_layers=config.num_layers,
         d_state=config.d_state,
         headdim=config.headdim,
+        backbone_type=config.backbone_type,
+        num_heads=config.num_heads,
+        num_kv_heads=config.num_kv_heads,
+        dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
+        attention_implementation=config.attention_implementation,
+        # Predicting L tokens consumes one context token and L-1 program tokens.
+        max_seq_len=config.env.max_program_tokens,
         conv_channels=config.conv_channels,
         max_markers=config.env.max_markers,
     )
