@@ -1,10 +1,21 @@
 from itertools import product
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from rl2.karel import ACTIONS, PREDICATES, _parse, execute_program, sample_task
-from rl2.karel_ast import ACTION_ID, AST_ACTIONS, Field, KarelAST, batch_features, program_actions, teacher_forcing
+from rl2.karel_ast import (
+    ACTION_ID,
+    AST_ACTIONS,
+    ASTFeatures,
+    Field,
+    KarelAST,
+    batch_features,
+    program_actions,
+    teacher_forcing,
+)
 
 
 def build(program: str, max_nodes: int = 256, max_depth: int = 64) -> KarelAST:
@@ -288,3 +299,46 @@ def test_invalid_parallel_actions_leave_original_tree_unchanged(bad: int) -> Non
         tree.expand_round(np.zeros(7, np.int32))
     with pytest.raises(AssertionError):
         tree.expand_round(np.zeros(8, np.float32))
+
+
+@pytest.mark.parametrize("leading_shape", [(), (3,), (2, 3)])
+def test_is_hole_is_derived_for_numpy_and_jitted_jax(leading_shape: tuple[int, ...]) -> None:
+    tree = KarelAST.empty(32, 16)
+    # A resolved repeat count (including literal zero) coexists with open holes
+    # and resolved constructor nodes in the same partial tree.
+    for name in ("Program", "ConsNonEmpty", "REPEAT", "R=0"):
+        tree = tree.expand(ACTION_ID[name])
+    features = tree.features()
+    expected = np.zeros(32, np.bool_)
+    for position, index in enumerate(tree.preorder()):
+        expected[position] = tree.nodes[index].is_hole
+    # Padding remains inactive even if its type/value looks like a hole.
+    features = features._replace(node_type=np.where(features.node_mask, features.node_type, 999).astype(np.int32))
+    features = ASTFeatures(*(np.broadcast_to(array, (*leading_shape, *array.shape)) for array in features))
+    assert isinstance(features.is_hole, np.ndarray)
+    np.testing.assert_array_equal(features.is_hole, np.broadcast_to(expected, (*leading_shape, 32)))
+
+    @jax.jit
+    def infer(arrays: ASTFeatures) -> jax.Array:
+        return arrays.is_hole
+
+    actual = infer(jax.tree.map(jnp.asarray, features))
+    assert actual.dtype == jnp.bool_
+    np.testing.assert_array_equal(actual, features.is_hole)
+    # The property follows value changes without a second mask to synchronize.
+    count_position = int(np.flatnonzero(tree.features().value)[0])
+    values = np.array(features.value)
+    values[..., count_position] = 0
+    assert features._replace(value=values).is_hole[..., count_position].all()
+    assert not features.is_hole[..., count_position].any()
+
+
+def test_resolved_predicate_is_not_a_hole() -> None:
+    tree = KarelAST.empty(32, 16)
+    for name in ("Program", "ConsNonEmpty", "IF", "Test"):
+        tree = tree.expand(ACTION_ID[name])
+    before = tree.features()
+    position = int(before.frontier)
+    after = tree.expand(ACTION_ID["frontIsClear"]).features()
+    assert before.node_type[position] == after.node_type[position]
+    assert before.is_hole[position] and not after.is_hole[position]

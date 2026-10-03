@@ -156,7 +156,8 @@ class ASTTransformer(nn.Module):
                 into one context token.
             tree: Batched ASTFeatures before the next expansion. Node/type,
                 field, depth, child-index, and value IDs are int32 [B, max_nodes];
-                is_hole and node_mask are bool arrays of the same shape.
+                node_mask is bool with the same shape; is_hole is computed from
+                node_mask, node_type, and value.
                 frontier is int32 [B], retained for sequential utilities but unused
                 by this model. action_mask is bool [B, max_nodes, A], where
                 A = len(AST_ACTIONS), and marks legal expansions per hole.
@@ -173,7 +174,7 @@ class ASTTransformer(nn.Module):
         for size in initial.shape[:3]:
             chex.assert_scalar_positive(size)
         batch = initial.shape[0]
-        chex.assert_shape(tree[:7], (batch, self.max_nodes))
+        chex.assert_shape(tree[:6], (batch, self.max_nodes))
         chex.assert_type(tree[:5], jnp.int32)
         chex.assert_type((tree.is_hole, tree.node_mask, tree.action_mask), jnp.bool_)
         chex.assert_shape(tree.frontier, (batch,))
@@ -191,7 +192,7 @@ class ASTTransformer(nn.Module):
             + self.depth_embedding(ids[2])
             + self.child_embedding(ids[3])
             + self.value_embedding(ids[4])
-            + self.hole_embedding(jnp.where(tree.node_mask, tree.is_hole, False).astype(jnp.int32))
+            + self.hole_embedding(tree.is_hole.astype(jnp.int32))
         )
         x = jnp.concatenate((context[:, None], nodes), axis=1)
         x = x + self.position_embedding(jnp.arange(self.max_nodes + 1, dtype=jnp.int32))[None]

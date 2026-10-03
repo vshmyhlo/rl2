@@ -150,7 +150,8 @@ class ASTFeatures(NamedTuple):
             the root uses 0.
         value: Int32 1-based index into VALUES for resolved predicates/counts,
             otherwise 0. These indices are not AST action IDs.
-        is_hole: Bool mask marking unresolved nodes awaiting expansion.
+        is_hole: Computed bool mask for unresolved nodes: present nodes with
+            a hole/value type and value=0. Not stored in the tuple.
         node_mask: Bool mask marking all existing nodes, including holes;
             False marks padding excluded from attention keys.
         frontier: Int32 scalar or [B] array giving the first hole's zero-based
@@ -168,10 +169,20 @@ class ASTFeatures(NamedTuple):
     depth: FeatureArray
     child_index: FeatureArray
     value: FeatureArray
-    is_hole: FeatureArray
     node_mask: FeatureArray
     frontier: FeatureArray  # Scalar/[B], preorder position; 0 for a finished tree.
     action_mask: FeatureArray  # [N,A]/[B,N,A]; inactive node rows are all false.
+
+    @property
+    def is_hole(self) -> jax.Array | NDArray[np.bool_]:
+        """Infer unresolved nodes from their type/value, excluding padding.
+
+        Preserves NumPy or JAX arrays and any batch/rollout leading dimensions.
+        """
+        chex.assert_equal_shape((self.node_mask, self.node_type, self.value))
+        chex.assert_type(self.node_mask, np.bool_)
+        chex.assert_type((self.node_type, self.value), np.int32)
+        return self.node_mask & (self.node_type > len(CONSTRUCTORS)) & (self.value == 0)
 
 
 @dataclass(frozen=True)
@@ -350,7 +361,6 @@ class KarelAST:
     def features(self, *, parallel: bool = True) -> ASTFeatures:
         order = self.preorder()
         integers = np.zeros((5, self.max_nodes), np.int32)
-        holes = np.zeros(self.max_nodes, np.bool_)
         mask = np.zeros(self.max_nodes, np.bool_)
         for position, index in enumerate(order):
             node = self.nodes[index]
@@ -361,7 +371,7 @@ class KarelAST:
                 node.child_index,
                 node.value,
             )
-            holes[position], mask[position] = node.is_hole, True
+            mask[position] = True
         frontier = self.frontier
         action_mask = (
             self.parallel_action_mask() if parallel else np.zeros((self.max_nodes, len(AST_ACTIONS)), np.bool_)
@@ -370,7 +380,6 @@ class KarelAST:
             action_mask[order.index(frontier)] = self.allowed_actions()
         return ASTFeatures(
             *integers,
-            holes,
             mask,
             np.asarray(order.index(frontier) if frontier is not None else 0, np.int32),
             action_mask,

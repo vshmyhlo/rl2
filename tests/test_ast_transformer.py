@@ -132,7 +132,6 @@ def test_padded_features_do_not_affect_predictions(config: Config, batch: ModelB
     state = state.replace(params=params)
     dirty = ASTFeatures(
         *(np.where(batch.tree.node_mask, array, 999999).astype(np.int32) for array in batch.tree[:5]),
-        np.where(batch.tree.node_mask, batch.tree.is_hole, True),
         batch.tree.node_mask,
         batch.tree.frontier,
         batch.tree.action_mask,
