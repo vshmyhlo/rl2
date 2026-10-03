@@ -57,7 +57,6 @@ class Config:
     num_kv_heads: int | None = None
     bf16: bool = False
     attention_implementation: AttentionImplementation = "xla"
-    conv_channels: tuple[int, ...] = (32, 64, 64)
     learning_rate: float = 0.00025
     anneal_lr: bool = True
     clip_coef: float = 0.2
@@ -123,8 +122,6 @@ def load_config(path: str | Path) -> Config:
         settings = yaml.safe_load(file) or {}
     if "env" in settings:
         settings["env"] = KarelConfig(**settings["env"])
-    if "conv_channels" in settings:
-        settings["conv_channels"] = tuple(settings["conv_channels"])
     return Config(**settings)
 
 
@@ -394,7 +391,6 @@ def train(config: Config) -> TrainState:
         attention_implementation=config.attention_implementation,
         # Predicting L tokens consumes one context token and L-1 program tokens.
         max_seq_len=config.env.max_program_tokens,
-        conv_channels=config.conv_channels,
         max_markers=config.env.max_markers,
     )
     initial, target = envs[0].reset(seed=config.seed)

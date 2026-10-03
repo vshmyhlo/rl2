@@ -44,7 +44,6 @@ def config(request: pytest.FixtureRequest) -> Config:
         num_layers=1,
         d_state=8,
         headdim=4,
-        conv_channels=(4,),
         target_kl=None,
         env=KarelConfig(height=3, width=3, max_depth=0, max_statements=1, max_program_tokens=6),
     )
@@ -61,7 +60,6 @@ def state(config: Config) -> TrainState:
         num_layers=config.num_layers,
         d_state=config.d_state,
         headdim=config.headdim,
-        conv_channels=config.conv_channels,
     )
     initial, target = KarelProgramEnv(config.env).reset(seed=42)
     params = model.init(jax.random.key(0), initial[None], target[None], jnp.empty((0, 1), jnp.int32))["params"]
@@ -385,7 +383,9 @@ def test_config_and_lr_schedule(config: Config) -> None:
     assert loaded.bf16 is True
     assert loaded.attention_implementation == "cudnn"
     assert isinstance(loaded.env, KarelConfig)
-    assert isinstance(loaded.conv_channels, tuple)
+    assert loaded.update_epochs == 1
+    assert loaded.learning_rate == 0.0001
+    assert loaded.entropy_coef == 0.01
     schedule = learning_rate_schedule(config)
     np.testing.assert_allclose(schedule(0), config.learning_rate)
     np.testing.assert_allclose(schedule(config.total_updates), 0)

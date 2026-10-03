@@ -1,4 +1,4 @@
-"""Minimal CNN + Mamba3 or transformer model for Karel program generation.
+"""Flattened-grid projection + Mamba3 or transformer for Karel program generation.
 
 Initialize through __call__(initial, target, tokens), with states [B,H,W,6]
 and teacher-forced token IDs [T,B]. The context predicts the first token;
@@ -33,8 +33,8 @@ type KarelModelOutput = tuple[KarelModelCarry, jax.Array]
 class KarelProgramModel(nn.Module):
     """A single image-pair prefix followed by autoregressive program tokens.
 
-    Spatial dimensions must match initialization because the CNN features are
-    flattened before projection. Set max_markers to match the environment.
+    Spatial dimensions must match initialization because the paired grids are
+    flattened before a single linear projection. Set max_markers to match the environment.
     dtype controls compute and transformer KV storage; parameters stay float32.
     Logits are always float32 for sampling and loss arithmetic. cuDNN attention
     requires a transformer, reduced-precision dtype, and a supported NVIDIA GPU.
@@ -44,7 +44,6 @@ class KarelProgramModel(nn.Module):
     num_layers: int = 4
     d_state: int = 64
     headdim: int = 64
-    conv_channels: tuple[int, ...] = (32, 64, 64)
     max_markers: int = 10
     backbone_type: BackboneType = "mamba3"
     num_heads: int = 8
@@ -62,14 +61,6 @@ class KarelProgramModel(nn.Module):
             raise ValueError("cuDNN attention requires the transformer backbone")
         chex.assert_type(self.max_markers, int)
         chex.assert_scalar_positive(self.max_markers)
-        chex.assert_scalar_positive(len(self.conv_channels))
-        for channels in self.conv_channels:
-            chex.assert_type(channels, int)
-            chex.assert_scalar_positive(channels)
-        self.convs = tuple(
-            nn.Conv(channels, (3, 3), padding="SAME", dtype=self.dtype, name=f"conv_{index}")
-            for index, channels in enumerate(self.conv_channels)
-        )
         self.context_projection = nn.Dense(self.d_model, dtype=self.dtype)
         self.context_norm = nn.LayerNorm(dtype=self.dtype)
         self.token_embedding = nn.Embed(len(TOKENS), self.d_model, dtype=self.dtype)
@@ -101,7 +92,7 @@ class KarelProgramModel(nn.Module):
         )
 
     def encode_pair(self, initial: jax.Array, target: jax.Array) -> jax.Array:
-        """Encode aligned initial/target grids into one [B,D] context token."""
+        """Normalize, flatten [B,H,W,12], then linearly project and LayerNorm to [B,D]."""
         chex.assert_shape(initial, (None, None, None, 6))
         chex.assert_equal_shape((initial, target))
         chex.assert_type((initial, target), jnp.int32)
@@ -109,8 +100,6 @@ class KarelProgramModel(nn.Module):
             chex.assert_scalar_positive(size)
         scale = jnp.asarray([1, 1, 1, 1, 1, self.max_markers] * 2, dtype=jnp.float32)
         x = jnp.concatenate((initial, target), axis=-1).astype(jnp.float32) / scale
-        for conv in self.convs:
-            x = nn.silu(conv(x))
         x = self.context_projection(x.reshape((x.shape[0], -1)))
         return self.context_norm(x)
 

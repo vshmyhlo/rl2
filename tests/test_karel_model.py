@@ -32,7 +32,6 @@ def model_and_variables(
         num_layers=1,
         d_state=8,
         headdim=4,
-        conv_channels=(4, 4),
         backbone_type=request.param,
         num_heads=2,
         num_kv_heads=1,
@@ -125,7 +124,7 @@ def test_token_loss_trains_encoder_and_backbone(
     value, grads = value_and_grad(variables["params"])
     assert np.isfinite(value)
     assert np.any(np.asarray(grads["head"]["kernel"]) != 0)
-    for name in ("conv_0", "context_projection", "token_embedding", "backbone"):
+    for name in ("context_projection", "token_embedding", "backbone"):
         for leaf in jax.tree.leaves(grads[name]):
             np.testing.assert_array_equal(leaf, 0)
 
@@ -138,7 +137,7 @@ def test_token_loss_trains_encoder_and_backbone(
     updated = jax.tree.map(gradient_step, variables["params"], grads)
     value, grads = value_and_grad(updated)
     assert np.isfinite(value)
-    for name in ("conv_0", "context_projection", "token_embedding", "backbone", "head"):
+    for name in ("context_projection", "token_embedding", "backbone", "head"):
         leaves = jax.tree.leaves(grads[name])
         assert all(np.isfinite(leaf).all() for leaf in leaves)
         assert any(np.any(np.asarray(leaf) != 0) for leaf in leaves), name
@@ -171,7 +170,6 @@ def test_bf16_transformer_generation_and_gradients(
         num_layers=1,
         num_heads=2,
         max_seq_len=8,
-        conv_channels=(4,),
         dtype=jnp.bfloat16,
         attention_implementation=implementation,
     )
@@ -208,7 +206,7 @@ def test_bf16_transformer_generation_and_gradients(
     value, grads = jax.jit(jax.value_and_grad(loss))(params)
     chex.assert_type((value, *jax.tree.leaves(grads)), jnp.float32)
     assert np.isfinite(value)
-    for name in ("conv_0", "context_projection", "token_embedding", "backbone", "head"):
+    for name in ("context_projection", "token_embedding", "backbone", "head"):
         leaves = jax.tree.leaves(grads[name])
         assert all(np.isfinite(leaf).all() for leaf in leaves)
         assert any(np.any(np.asarray(leaf) != 0) for leaf in leaves), name
