@@ -163,18 +163,20 @@ def test_target_matching_checks_heading_markers_and_position(
 
 
 @pytest.mark.parametrize(
-    "program,reason",
+    "program,reason,reward",
     [
-        ("m)", "syntax_error"),
-        ("DEF run m( WHILE c( frontIsClear c) w( move m)", "syntax_error"),
-        ("DEF run m( pickMarker pickMarker m)", "runtime_error"),
-        ("DEF run m( WHILE c( markersPresent c) w( turnLeft w) m)", "execution_limit"),
+        ("m)", "syntax_error", -2.0),
+        ("DEF run m( WHILE c( frontIsClear c) w( move m)", "syntax_error", -2.0),
+        ("DEF run m( pickMarker pickMarker m)", "runtime_error", -1.0),
+        ("DEF run m( WHILE c( markersPresent c) w( turnLeft w) m)", "execution_limit", -1.0),
     ],
 )
-def test_failed_programs_terminate_with_penalty(fixed_env: KarelProgramEnv, program: str, reason: str) -> None:
+def test_failed_program_rewards_distinguish_syntax(
+    fixed_env: KarelProgramEnv, program: str, reason: str, reward: float
+) -> None:
     fixed_env.reset()
     result = submit(fixed_env, program.split())
-    assert result == (None, -1.0, True, False, {"success": False, "error": reason})
+    assert result == (None, reward, True, False, {"success": False, "error": reason})
 
 
 def test_observations_cannot_mutate_private_task(fixed_env: KarelProgramEnv) -> None:
@@ -198,7 +200,7 @@ def test_token_limit_and_terminal_boundary(fixed_env: KarelProgramEnv) -> None:
     env.reset()
     assert submit(env, ["DEF", "run", "m(", "move", "m)"])[1] == 1.0
     env.reset()
-    assert submit(env, ["move"] * 5) == (None, -1.0, False, True, {"success": False, "error": "token_limit"})
+    assert submit(env, ["move"] * 5) == (None, -2.0, False, True, {"success": False, "error": "token_limit"})
     with pytest.raises(gym.error.ResetNeeded):
         env.step(env.terminal_token_id)
 

@@ -123,7 +123,7 @@ def test_collection_shares_pairs_and_handles_terminal_and_truncation(
     for start in range(0, len(envs), config.group_size):
         np.testing.assert_array_equal(batch.initial[start], batch.initial[start + 1])
         np.testing.assert_array_equal(batch.target[start], batch.target[start + 1])
-    np.testing.assert_array_equal(rewards, -1)
+    np.testing.assert_array_equal(rewards, -2)
     np.testing.assert_array_equal(batch.advantages, 0)
     expected_length = 1 if token == "m)" else config.env.max_program_tokens
     np.testing.assert_array_equal(batch.mask.sum(axis=0), expected_length)
@@ -131,15 +131,29 @@ def test_collection_shares_pairs_and_handles_terminal_and_truncation(
     np.testing.assert_array_equal(batch.mask, batch.actions != KarelProgramEnv.pad_token_id)
     assert diagnostics["charts/truncation_rate"] == (token == "move")
     assert diagnostics["charts/syntax_error_rate"] == (token == "m)")
-    assert diagnostics["charts/reward_mean"] == -1.0
+    assert diagnostics["charts/reward_mean"] == -2.0
     assert diagnostics["charts/success_rate"] == diagnostics["charts/group_success_rate"] == 0.0
     _, logits = state.apply_fn({"params": state.params}, batch.initial, batch.target, batch.actions[:-1])
     recomputed = np.asarray(action_log_prob(logits, batch.actions))
     np.testing.assert_allclose(recomputed[batch.mask], batch.old_log_probs[batch.mask], atol=1e-6)
 
 
+@pytest.mark.parametrize(
+    "body,reward,success,error",
+    [
+        ("pickMarker pickMarker", 1.0, True, None),
+        ("putMarker", -0.5, False, None),  # Regression still beats invalid syntax.
+        ("pickMarker pickMarker pickMarker", -1.0, False, "runtime_error"),
+    ],
+)
 def test_partial_rewards_are_not_logged_as_successes(
-    config: Config, state: TrainState, monkeypatch: pytest.MonkeyPatch
+    config: Config,
+    state: TrainState,
+    monkeypatch: pytest.MonkeyPatch,
+    body: str,
+    reward: float,
+    success: bool,
+    error: str | None,
 ) -> None:
     config = replace(config, num_tasks=2, env=replace(config.env, max_program_tokens=8))
     initial = np.zeros((3, 3, 6), dtype=np.int32)
@@ -156,7 +170,7 @@ def test_partial_rewards_are_not_logged_as_successes(
     programs = [
         "DEF run m( pickMarker m)",
         "DEF run m( turnLeft turnRight m)",
-        "DEF run m( pickMarker pickMarker m)",
+        f"DEF run m( {body} m)",
         "m)",
     ]
     scripted = np.full((8, 4), KarelProgramEnv.pad_token_id, dtype=np.int32)
@@ -175,11 +189,13 @@ def test_partial_rewards_are_not_logged_as_successes(
     monkeypatch.setattr("rl2.grpo.act", scripted_act)
     envs = [KarelProgramEnv(config.env) for _ in range(4)]
     batch, rewards, diagnostics, _ = collect_rollout(state, envs, np.random.default_rng(0), jax.random.key(0), config)
-    np.testing.assert_array_equal(rewards, [0.5, 0.0, 1.0, -1.0])
+    np.testing.assert_array_equal(rewards, [0.5, 0.0, reward, -2.0])
     np.testing.assert_allclose(batch.advantages, [1.0, -1.0, 1.0, -1.0])
-    assert diagnostics["charts/reward_mean"] == 0.125
-    assert diagnostics["charts/success_rate"] == 0.25
-    assert diagnostics["charts/group_success_rate"] == 0.5
+    assert diagnostics["charts/reward_mean"] == (reward - 1.5) / 4
+    assert diagnostics["charts/success_rate"] == float(success) / 4
+    assert diagnostics["charts/group_success_rate"] == float(success) / 2
+    assert diagnostics["charts/syntax_error_rate"] == 0.25
+    assert diagnostics["charts/runtime_error_rate"] == float(error == "runtime_error") / 4
     assert diagnostics["charts/informative_group_fraction"] == 1.0
 
 

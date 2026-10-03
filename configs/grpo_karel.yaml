@@ -1,7 +1,7 @@
 seed: 1
 total_updates: 100000 # Rollout batches; TensorBoard steps include terminal m), exclude PAD
 num_tasks: 8 # Sampled pairs per rollout
-group_size: 8 # Independent program samples for each pair
+group_size: 16 # Independent program samples for each pair
 num_minibatches: 4 # Must divide num_tasks * group_size; keep whole programs together
 update_epochs: 2
 d_model: 384 # 10,216,371 parameters with the 8x8 grid and model settings below
@@ -28,9 +28,10 @@ env:
   max_program_tokens: 128 # Includes terminal m); PAD is used only for batching
   max_execution_steps: 256
   max_sampling_attempts: 1000
-  # Terminal reward = clip(1 - D(final,target) / D(initial,target), -1, 1).
+  # Successful execution: reward = clip(1 - D(final,target) / D(initial,target), -1, 1).
   # D combines these errors; all weights must be finite and strictly positive.
   position_weight: 1.0 # Manhattan distance (ignores intervening walls)
   orientation_weight: 1.0 # 1 for any wrong heading, 0 for a match
   marker_weight: 1.0 # Sum of absolute marker-count errors across all cells
-  # Invalid programs / execution-limit failures / missing m) always receive -1.
+  # Syntax errors / missing m): -2 (-1 failure plus -1 syntax penalty).
+  # Valid syntax with runtime / execution-limit failures: -1, without partial execution credit.

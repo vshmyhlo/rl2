@@ -5,7 +5,8 @@ States are int32 arrays shaped (height, width, 6): four one-hot robot headings
 The outer closing token m) executes the program against the initial state. This is a plain
 class, not a Gymnasium Env: step observations deliberately are always None.
 Terminal reward is normalized progress toward the target, clipped to [-1, 1];
-invalid programs and missing m) receive -1. PAD is reserved for batching.
+syntax errors and missing m) receive -2 (failure score -1 plus syntax penalty -1).
+Valid syntax with execution failures receives -1. PAD is reserved for batching.
 Intermediate rewards are zero.
 """
 
@@ -146,7 +147,8 @@ def progress_reward(initial: State, final: State, target: State, config: KarelCo
     """Score a successfully executed program: clip(1 - D(final,t)/D(initial,t), -1, 1).
 
     Exact targets score 1, unchanged distance scores 0, and regressions score
-    below 0 (bounded by -1). The sampler excludes identical initial/target pairs;
+    below 0 (bounded by -1).
+    The sampler excludes identical initial/target pairs;
     strictly positive weights therefore guarantee a positive denominator.
     Execution failures bypass this function and receive -1 in step().
     """
@@ -410,8 +412,9 @@ class KarelProgramEnv:
     reset() returns KarelPair(initial, target), without an info wrapper.
     step() returns (None, reward, terminated, truncated, info). The token m) terminates
     and scores progress_reward(); info['success'] still means exact state equality.
-    Invalid programs receive -1. Exhausting max_program_tokens without m)
-    truncates with -1 and no evaluation. PAD is not a valid environment action.
+    Syntax errors receive -2; runtime errors and execution-budget failures receive -1.
+    Exhausting max_program_tokens without m)
+    truncates with -2 and no evaluation. PAD is not a valid environment action.
     No partial execution credit is given on errors or execution-budget failures.
     """
 
@@ -469,11 +472,12 @@ class KarelProgramEnv:
                     max_markers=self.config.max_markers,
                 )
             except KarelProgramError as exc:
-                return None, -1.0, True, False, {"success": False, "error": exc.reason}
+                reward = -2.0 if exc.reason == "syntax_error" else -1.0
+                return None, reward, True, False, {"success": False, "error": exc.reason}
             success = bool(np.array_equal(output, self._task.target))
             reward = progress_reward(self._task.initial, output, self._task.target, self.config)
             return None, reward, True, False, {"success": success, "error": None}
         if len(self._program) >= self.config.max_program_tokens:
             self._needs_reset = True
-            return None, -1.0, False, True, {"success": False, "error": "token_limit"}
+            return None, -2.0, False, True, {"success": False, "error": "token_limit"}
         return None, 0.0, False, False, {}
