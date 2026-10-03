@@ -490,7 +490,6 @@ def train(config: Config) -> TrainState:
                 )
                 logged_groups += 1
                 writer.add_text("samples/generated_programs", samples, steps)
-                print(f"Generated programs — rollout {iteration + 1}, step {steps}\n{samples}", flush=True)
             writer.flush()
             print(
                 f"iteration={iteration + 1} step={steps} success={diagnostics['charts/success_rate']:.3f} "

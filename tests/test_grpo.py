@@ -432,13 +432,14 @@ def test_one_rollout_training_smoke(
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(result.params))
     assert list(tmp_path.glob("karel_grpo_*/events.out.tfevents.*"))
     output = capsys.readouterr().out
-    assert "Generated programs — rollout 1" in output
-    assert "Group 0: 2/2 programs for the same initial/target pair." in output
-    assert "Sample 0: reward=" in output and "Sample 1: reward=" in output
+    assert "iteration=1" in output
+    assert "Generated programs" not in output
+    assert "Sample 0: reward=" not in output
     samples = [(text, step) for tag, text, step in logged_text if tag == "samples/generated_programs"]
     assert len(samples) == 1
     text, step = samples[0]
-    assert text in output  # TensorBoard receives exactly the displayed, formatted samples.
+    assert text not in output
+    assert "Group 0: 2/2 programs for the same initial/target pair." in text
     assert "### Sample 0" in text and "```text\n" in text
     assert step is not None and step > 0
 
