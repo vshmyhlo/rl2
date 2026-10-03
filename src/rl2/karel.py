@@ -4,6 +4,8 @@ States are int32 arrays shaped (height, width, 6): four one-hot robot headings
 (north, east, south, west), walls, and marker counts. Actions are DSL token IDs;
 EOS executes the complete program against the initial state. This is a plain
 class, not a Gymnasium Env: step observations deliberately are always None.
+Terminal reward is normalized progress toward the target, clipped to [-1, 1];
+invalid programs and missing EOS receive -1. Intermediate rewards are zero.
 """
 
 from __future__ import annotations
@@ -70,6 +72,9 @@ class KarelConfig:
     max_program_tokens: int = 128  # Includes EOS.
     max_execution_steps: int = 256  # Statements and loop-condition checks.
     max_sampling_attempts: int = 1000
+    position_weight: float = 1.0  # Weight per cell of Manhattan robot-position error.
+    orientation_weight: float = 1.0  # Weight for any incorrect robot heading.
+    marker_weight: float = 1.0  # Weight per missing or extra marker, summed over all cells.
 
     def __post_init__(self) -> None:
         for value in (
@@ -94,6 +99,10 @@ class KarelConfig:
         chex.assert_scalar_in(self.max_markers, 1, np.iinfo(np.int32).max - 1)
         chex.assert_scalar_in(self.wall_probability, 0, 1)
         chex.assert_scalar_in(self.marker_probability, 0, 1)
+        for weight in (self.position_weight, self.orientation_weight, self.marker_weight):
+            chex.assert_scalar_positive(weight)
+            if not np.isfinite(weight):
+                raise ValueError("Reward distance weights must be finite and strictly positive")
 
 
 @dataclass(frozen=True)
@@ -101,6 +110,50 @@ class KarelTask:
     initial: State
     target: State
     program: tuple[str, ...]  # Reference program, without EOS.
+
+
+def state_distance(state: State, target: State, config: KarelConfig) -> float:
+    """Weighted position, heading, and marker error between valid Karel states.
+
+    D(s,t) = position_weight * Manhattan(robot_s, robot_t)
+           + orientation_weight * (heading_s != heading_t)
+           + marker_weight * sum_cells(abs(markers_s - markers_t)).
+
+    Walls must be identical and are not scored. Manhattan distance ignores walls
+    and is a closeness heuristic, not a minimum-action solution cost. All wrong
+    headings have the same cost; marker errors include initially correct cells.
+    """
+    chex.assert_shape(state, (None, None, 6))
+    chex.assert_equal_shape((state, target))
+    chex.assert_type((state, target), np.int32)
+    if not np.array_equal(state[..., 4], target[..., 4]):
+        raise ValueError("Reward distance requires identical walls")
+    robot = np.argwhere(state[..., :4])
+    target_robot = np.argwhere(target[..., :4])
+    chex.assert_shape((robot, target_robot), (1, 3))
+    position_error = int(np.abs(robot[0, :2] - target_robot[0, :2]).sum())
+    orientation_error = int(robot[0, 2] != target_robot[0, 2])
+    marker_error = int(np.abs(state[..., 5].astype(np.int64) - target[..., 5].astype(np.int64)).sum())
+    return float(
+        config.position_weight * position_error
+        + config.orientation_weight * orientation_error
+        + config.marker_weight * marker_error
+    )
+
+
+def progress_reward(initial: State, final: State, target: State, config: KarelConfig) -> float:
+    """Score a successfully executed program: clip(1 - D(final,t)/D(initial,t), -1, 1).
+
+    Exact targets score 1, unchanged distance scores 0, and regressions score
+    below 0 (bounded by -1). The sampler excludes identical initial/target pairs;
+    strictly positive weights therefore guarantee a positive denominator.
+    Execution failures bypass this function and receive -1 in step().
+    """
+    initial_distance = state_distance(initial, target, config)
+    if initial_distance <= 0:
+        raise ValueError("Progress reward requires a non-identical initial/target pair")
+    final_distance = state_distance(final, target, config)
+    return float(np.clip(1.0 - final_distance / initial_distance, -1.0, 1.0))
 
 
 class KarelProgramError(ValueError):
@@ -355,8 +408,10 @@ class KarelProgramEnv:
 
     reset() returns KarelPair(initial, target), without an info wrapper.
     step() returns (None, reward, terminated, truncated, info). EOS terminates
-    and scores exact state equality; invalid programs receive zero. Exhausting
-    max_program_tokens without EOS truncates with zero reward and no evaluation.
+    and scores progress_reward(); info['success'] still means exact state equality.
+    Invalid programs receive -1. Exhausting max_program_tokens without EOS
+    truncates with -1 and no evaluation, even if the prefix is a complete solution.
+    No partial execution credit is given on errors or execution-budget failures.
     """
 
     tokens = TOKENS
@@ -409,11 +464,12 @@ class KarelProgramEnv:
                     max_markers=self.config.max_markers,
                 )
             except KarelProgramError as exc:
-                return None, 0.0, True, False, {"success": False, "error": exc.reason}
+                return None, -1.0, True, False, {"success": False, "error": exc.reason}
             success = bool(np.array_equal(output, self._task.target))
-            return None, float(success), True, False, {"success": success, "error": None}
+            reward = progress_reward(self._task.initial, output, self._task.target, self.config)
+            return None, reward, True, False, {"success": success, "error": None}
         self._program.append(TOKENS[int(action)])
         if len(self._program) >= self.config.max_program_tokens:
             self._needs_reset = True
-            return None, 0.0, False, True, {"success": False, "error": "token_limit"}
+            return None, -1.0, False, True, {"success": False, "error": "token_limit"}
         return None, 0.0, False, False, {}

@@ -12,7 +12,9 @@ from rl2.karel import (
     State,
     StepResult,
     execute_program,
+    progress_reward,
     sample_task,
+    state_distance,
 )
 
 
@@ -151,11 +153,13 @@ def test_equivalent_program_gets_full_reward(fixed_env: KarelProgramEnv) -> None
     assert result == (None, 1.0, True, False, {"success": True, "error": None})
 
 
-@pytest.mark.parametrize("body", ["move turnLeft", "move pickMarker", "turnLeft"])
-def test_target_matching_checks_heading_markers_and_position(fixed_env: KarelProgramEnv, body: str) -> None:
+@pytest.mark.parametrize("body,reward", [("move turnLeft", 0.0), ("move pickMarker", 0.0), ("turnLeft", -1.0)])
+def test_target_matching_checks_heading_markers_and_position(
+    fixed_env: KarelProgramEnv, body: str, reward: float
+) -> None:
     fixed_env.reset()
     result = submit(fixed_env, f"DEF run m( {body} m) <eos>".split())
-    assert result == (None, 0.0, True, False, {"success": False, "error": None})
+    assert result == (None, reward, True, False, {"success": False, "error": None})
 
 
 @pytest.mark.parametrize(
@@ -167,10 +171,10 @@ def test_target_matching_checks_heading_markers_and_position(fixed_env: KarelPro
         ("DEF run m( WHILE c( markersPresent c) w( turnLeft w) m) <eos>", "execution_limit"),
     ],
 )
-def test_failed_programs_terminate_with_zero_reward(fixed_env: KarelProgramEnv, program: str, reason: str) -> None:
+def test_failed_programs_terminate_with_penalty(fixed_env: KarelProgramEnv, program: str, reason: str) -> None:
     fixed_env.reset()
     result = submit(fixed_env, program.split())
-    assert result == (None, 0.0, True, False, {"success": False, "error": reason})
+    assert result == (None, -1.0, True, False, {"success": False, "error": reason})
 
 
 def test_observations_cannot_mutate_private_task(fixed_env: KarelProgramEnv) -> None:
@@ -194,7 +198,7 @@ def test_token_limit_and_eos_boundary(fixed_env: KarelProgramEnv) -> None:
     env.reset()
     assert submit(env, ["DEF", "run", "m(", "move", "m)", "<eos>"])[1] == 1.0
     env.reset()
-    assert submit(env, ["move"] * 6) == (None, 0.0, False, True, {"success": False, "error": "token_limit"})
+    assert submit(env, ["move"] * 6) == (None, -1.0, False, True, {"success": False, "error": "token_limit"})
     with pytest.raises(gym.error.ResetNeeded):
         env.step(env.eos_token_id)
 
@@ -383,3 +387,66 @@ def test_failed_reset_invalidates_old_task_and_can_recover(monkeypatch: pytest.M
     for token_id in env.reference_program:
         result = env.step(token_id)
     assert result[1:4] == (1.0, True, False)
+
+
+@pytest.mark.parametrize(
+    "body,reward,success,error",
+    [
+        ("move", 0.5, False, None),
+        ("turnLeft turnRight", 0.0, False, None),
+        ("turnLeft", -0.5, False, None),
+        ("turnLeft move putMarker", -1.0, False, None),
+        ("move move", 1.0, True, None),
+        ("move putMarker", 0.0, False, None),  # Undo progress by spoiling a correct cell.
+        ("move move pickMarker", 0.5, False, None),
+        ("move move move move", -1.0, False, "runtime_error"),  # No credit for a prefix reaching the target.
+    ],
+)
+def test_terminal_progress_reward(
+    world: State, monkeypatch: pytest.MonkeyPatch, body: str, reward: float, success: bool, error: str | None
+) -> None:
+    target = world.copy()
+    target[..., :4] = 0
+    target[2, 3, 1] = 1
+
+    def fixed_task(rng: np.random.Generator, config: KarelConfig) -> KarelTask:
+        return KarelTask(world, target, ("DEF", "run", "m(", "move", "move", "m)"))
+
+    monkeypatch.setattr("rl2.karel.sample_task", fixed_task)
+    env = KarelProgramEnv()
+    env.reset()
+    for token in f"DEF run m( {body} m)".split():
+        assert env.step(env.token_to_id[token]) == (None, 0.0, False, False, {})
+    assert env.step(env.eos_token_id) == (None, reward, True, False, {"success": success, "error": error})
+
+
+def test_distance_weights_and_marker_counts(world: State) -> None:
+    target = world.copy()
+    target[..., :4] = 0
+    target[1, 3, 2] = 1
+    target[2, 1, 5] = 4
+    target[3, 3, 5] = 2
+    config = KarelConfig(position_weight=2.0, orientation_weight=3.0, marker_weight=4.0)
+    # Three Manhattan steps, one heading mismatch, and five marker edits.
+    assert state_distance(world, target, config) == 2 * 3 + 3 * 1 + 4 * 5
+    assert progress_reward(world, world, target, config) == 0.0
+    assert progress_reward(world, target, target, config) == 1.0
+    final = world.copy()
+    final[2, 1, 5] += 1
+    assert progress_reward(world, final, target, config) == pytest.approx(4 / 29)
+
+
+@pytest.mark.parametrize("weight_name", ["position_weight", "orientation_weight", "marker_weight"])
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_reward_weights_must_be_positive_and_finite(weight_name: str, value: float) -> None:
+    with pytest.raises((AssertionError, ValueError)):
+        KarelConfig(**{weight_name: value})
+
+
+def test_reward_rejects_zero_baseline_and_changed_walls(world: State) -> None:
+    with pytest.raises(ValueError, match="non-identical"):
+        progress_reward(world, world, world, KarelConfig())
+    changed = world.copy()
+    changed[1, 1, 4] = 1
+    with pytest.raises(ValueError, match="identical walls"):
+        state_distance(world, changed, KarelConfig())
