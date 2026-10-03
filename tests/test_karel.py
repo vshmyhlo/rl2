@@ -913,3 +913,103 @@ def test_token_limit_applies_full_length_penalty_without_execution(fixed_env: Ka
 def test_efficiency_weights_must_be_finite_and_nonnegative(field: str, value: float) -> None:
     with pytest.raises((ValueError, AssertionError)):
         KarelConfig(**{field: value})
+
+
+@pytest.mark.parametrize("seed", range(5))
+@pytest.mark.parametrize("suffix", ["", "move", "REPEAT R=19 r( REPEAT R=19 r( turnLeft r) r)"])
+def test_combined_default_rewards_match_recorded_execution(seed: int, suffix: str) -> None:
+    config = KarelConfig(max_depth=1, max_statements=2, max_execution_steps=32)
+    env = KarelProgramEnv(config)
+    pair = env.reset(seed=seed)
+    tokens = [env.tokens[index] for index in env.reference_program[:-1]] + suffix.split() + ["m)"]
+    assert len(tokens) <= config.max_program_tokens
+    trace: list[State] = [pair.initial]
+    stats = ExecutionStats()
+    error = None
+    try:
+        final = execute_program(
+            tokens, pair.initial, max_steps=config.max_execution_steps, execution_stats=stats, on_action=trace.append
+        )
+    except KarelProgramError as exc:
+        error = exc.reason
+        assert exc.partial_state is not None
+        final = exc.partial_state
+    distances = np.asarray([state_distance(state, pair.target, config) for state in trace])
+    final_distance = state_distance(final, pair.target, config)
+    assert distances[-1] == final_distance
+    backward = np.maximum(np.diff(distances), 0).sum()
+    progress = float(np.clip(1 - 0.5 * final_distance / distances[0], 0, 1))
+    success = error is None and np.array_equal(final, pair.target)
+    expected = {
+        "reward_syntax": 1.0,
+        "reward_runtime": progress,
+        "reward_distance": progress if error is None else 0.0,
+        "reward_success": float(success),
+        "reward_trajectory": config.trajectory_weight
+        * max(0.0, distances[0] - final_distance)
+        / (distances[0] + backward),
+        "reward_length": -config.length_penalty_weight * len(tokens) / config.max_program_tokens,
+        "reward_execution": -config.execution_penalty_weight * stats.steps / config.max_execution_steps,
+    }
+    result = submit(env, tokens)
+    assert result[2:4] == (True, False)
+    assert result[4]["success"] == success
+    assert result[4]["error"] == error
+    for name, value in expected.items():
+        assert result[4][name] == pytest.approx(value)
+    assert result[1] == pytest.approx(sum(expected.values()))
+
+
+@pytest.mark.parametrize("field", ["length_penalty_weight", "execution_penalty_weight", "trajectory_weight"])
+def test_large_finite_reward_weights_do_not_overflow(fixed_env: KarelProgramEnv, field: str) -> None:
+    from dataclasses import replace
+
+    fixed_env.config = replace(fixed_env.config, position_weight=4.0, **{field: 1e308})
+    fixed_env.reset()
+    # The two turns add a backward-distance unit before reaching the target.
+    result = submit(fixed_env, ["DEF", "run", "m(", "turnLeft", "turnRight", "move", "m)"])
+    expected = {
+        "length_penalty_weight": -1e308 * (7 / fixed_env.config.max_program_tokens),
+        "execution_penalty_weight": -1e308 * (3 / fixed_env.config.max_execution_steps),
+        "trajectory_weight": 8e307,
+    }
+    assert np.isfinite(result[1])
+    assert result[1] == pytest.approx(expected[field])
+
+
+def test_large_distance_scale_keeps_trajectory_bonus(fixed_env: KarelProgramEnv) -> None:
+    from dataclasses import replace
+
+    fixed_env.config = replace(
+        fixed_env.config,
+        position_weight=1e308,
+        orientation_weight=1e308,
+        trajectory_weight=0.25,
+    )
+    fixed_env.reset()
+    # Reach the target first: all distances remain finite, but D0+B would overflow.
+    result = submit(fixed_env, ["DEF", "run", "m(", "move", "turnLeft", "turnRight", "m)"])
+    assert result[4]["reward_trajectory"] == pytest.approx(0.125)
+    assert result[1] == pytest.approx(4.125)
+
+
+def test_distance_overflow_raises_instead_of_returning_nan(world: State) -> None:
+    target = execute("move move", world)
+    config = KarelConfig(position_weight=1e308)
+    with pytest.raises(ValueError, match="overflowed"):
+        progress_reward(world, target, target, config)
+
+
+def test_total_reward_overflow_is_rejected(fixed_env: KarelProgramEnv) -> None:
+    from dataclasses import replace
+
+    fixed_env.config = replace(
+        fixed_env.config,
+        max_program_tokens=5,
+        max_execution_steps=1,
+        length_penalty_weight=1e308,
+        execution_penalty_weight=1e308,
+    )
+    fixed_env.reset()
+    with pytest.raises(ValueError, match="Total reward overflowed"):
+        submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])

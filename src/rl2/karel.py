@@ -174,6 +174,8 @@ def state_distance(
     An optional distance_map must come from target_distance_map for this target's
     position and walls. Unreachable robot positions raise ValueError; sampled
     tasks and their executions always remain in the target's connected component.
+    Weighted totals that overflow float64 also raise ValueError instead of
+    allowing nonfinite progress rewards to reach the trainer.
     """
     chex.assert_shape(state, (None, None, 6))
     chex.assert_equal_shape((state, target))
@@ -194,11 +196,14 @@ def state_distance(
         raise ValueError("Robot position cannot reach the target through free cells")
     orientation_error = int(robot[0, 2] != target_robot[0, 2])
     marker_error = int(np.abs(state[..., 5].astype(np.int64) - target[..., 5].astype(np.int64)).sum())
-    return float(
+    distance = float(
         config.position_weight * position_error
         + config.orientation_weight * orientation_error
         + config.marker_weight * marker_error
     )
+    if not np.isfinite(distance):
+        raise ValueError("Weighted state distance overflowed; reduce distance weights")
+    return distance
 
 
 def progress_reward(
@@ -579,8 +584,10 @@ class KarelProgramEnv:
     ) -> StepResult:
         """Expose the exact terms summed into the terminal reward for diagnostics."""
         self._needs_reset = True
-        length_penalty = -self.config.length_penalty_weight * len(self._program) / self.config.max_program_tokens
-        execution_penalty = -self.config.execution_penalty_weight * execution_steps / self.config.max_execution_steps
+        # Normalize before multiplying: finite weights can overflow if multiplied
+        # by raw counts, even when the final normalized penalty is representable.
+        length_penalty = -self.config.length_penalty_weight * (len(self._program) / self.config.max_program_tokens)
+        execution_penalty = -self.config.execution_penalty_weight * (execution_steps / self.config.max_execution_steps)
         components = dict(
             zip(
                 REWARD_COMPONENTS,
@@ -589,7 +596,10 @@ class KarelProgramEnv:
         )
         info: dict[str, object] = {"success": success, "error": error}
         info.update({f"reward_{name}": value for name, value in components.items()})
-        return None, sum(components.values()), not truncated, truncated, info
+        reward = sum(components.values())
+        if not np.isfinite(reward):
+            raise ValueError("Total reward overflowed; reduce reward weights")
+        return None, reward, not truncated, truncated, info
 
     def step(self, action: int | np.integer) -> StepResult:
         if self._needs_reset or self._task is None:
@@ -608,13 +618,17 @@ class KarelProgramEnv:
             initial_distance = state_distance(
                 self._task.initial, self._task.target, self.config, distance_map=self._distance_map
             )
+            if initial_distance <= 0:
+                raise ValueError("Progress reward requires a non-identical initial/target pair")
             previous_distance = initial_distance
-            backward_distance = 0.0
+            # Normalize each increase before accumulation so D_initial + B need
+            # not be representable when the distance weights are very large.
+            backward_ratio = 0.0
 
             def observe_action(state: State) -> None:
-                nonlocal previous_distance, backward_distance
+                nonlocal previous_distance, backward_ratio
                 distance = state_distance(state, self._task.target, self.config, distance_map=self._distance_map)
-                backward_distance += max(0.0, distance - previous_distance)
+                backward_ratio += max(0.0, distance - previous_distance) / initial_distance
                 previous_distance = distance
 
             def trajectory_bonus() -> float:
@@ -622,10 +636,8 @@ class KarelProgramEnv:
                 # credit only net improvement, discounted by all backward steps.
                 if self.config.trajectory_weight == 0:
                     return 0.0
-                return (
-                    self.config.trajectory_weight
-                    * max(0.0, initial_distance - previous_distance)
-                    / (initial_distance + backward_distance)
+                return self.config.trajectory_weight * (
+                    max(0.0, initial_distance - previous_distance) / initial_distance / (1.0 + backward_ratio)
                 )
 
             execution_stats = ExecutionStats()
