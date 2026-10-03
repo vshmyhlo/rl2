@@ -3,21 +3,20 @@ total_updates: 100000 # Rollout batches; TensorBoard steps include terminal m), 
 num_tasks: 16 # Sampled pairs per rollout
 group_size: 16 # Independent program samples for each pair
 num_minibatches: 4 # Must divide num_tasks * group_size; keep whole programs together
-update_epochs: 2
+update_epochs: 1
 backbone_type: transformer # mamba3 remains available
 bf16: true # Compute/transformer KV cache in BF16; parameters, optimizer, and loss in FP32
 attention_implementation: cudnn # Requires a supported NVIDIA GPU; use xla for CPU
-d_model: 320 # 10,296,403 total parameters with this 8x8 grid and CNN
+d_model: 320 # 9,172,531 parameters with the flattened 8x8 pair projection
 num_layers: 7
 num_heads: 5 # Transformer head dimension = d_model / num_heads = 64
 num_kv_heads: null # Full multi-head attention; fewer KV heads enables grouped-query attention
 # Transformer cache length follows env.max_program_tokens, including the image-pair prefix.
-conv_channels: [32, 64, 64]
-learning_rate: 0.00025
+learning_rate: 0.0001
 anneal_lr: true
 clip_coef: 0.2
 target_kl: 0.02 # Old-policy KL early stopping; null disables
-entropy_coef: 0.0
+entropy_coef: 0.01
 kl_coef: 0.0 # Optional penalty against the frozen initial model; no reference forward when zero
 max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/grpo_karel
@@ -34,7 +33,7 @@ env:
   max_program_tokens: 128 # Includes terminal m); PAD is used only for batching
   max_execution_steps: 256
   max_sampling_attempts: 1000
-  # reward = syntax + runtime + distance + exact_success + weighted trajectory (default total 0..4.25).
+  # reward = syntax + runtime + distance + exact_success + trajectory - length cost - execution cost.
   # progress(s) = clip(1 - 0.5 * D(s,target) / D(initial,target), 0, 1).
   # Exact target: 1; unchanged distance: 0.5; doubled distance or worse: 0.
   # D combines these errors; all weights must be finite and strictly positive.
@@ -42,6 +41,8 @@ env:
   orientation_weight: 1.0 # 1 for any wrong heading, 0 for a match
   marker_weight: 1.0 # Sum of absolute marker-count errors across all cells
   trajectory_weight: 0.25 # 0 disables; finite and nonnegative
+  length_penalty_weight: 0.05 # Deduct weight * generated tokens / max_program_tokens (all outcomes)
+  execution_penalty_weight: 0.05 # Deduct weight * consumed ticks / max_execution_steps; zero if not executed
   # trajectory = max(0, D_initial - D_last) / (D_initial + sum of positive distance increases).
   # Add trajectory_weight * trajectory after completed or failed executions; zero on syntax/token limits.
   # Syntax errors / missing m): (1/(1+d), 0, 0), d = minimum syntax token edits.

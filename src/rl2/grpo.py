@@ -7,7 +7,7 @@ is excluded, and syntax/token-limit failures receive a syntax edit-distance scor
 
 This sketch starts from random weights with no grammar mask or supervised
 warmup. Terminal rewards sum syntax, runtime, and distance terms, plus a +1
-exact-success bonus and weighted trajectory bonus. Exact success is also logged separately. Equal-reward groups have zero advantages; syntax errors can
+exact-success and weighted trajectory bonuses, minus length and execution costs. Exact success is also logged separately. Equal-reward groups have zero advantages; syntax errors can
 now earn different rewards according to their minimum repair costs.
 An optional KL penalty uses a frozen copy of the initial model as reference.
 See https://arxiv.org/abs/2402.03300 for the GRPO objective.
@@ -419,7 +419,7 @@ def train(config: Config) -> TrainState:
             flush=True,
         )
         print(
-            "Syntax + runtime + distance + exact-success + trajectory rewards: equal-reward groups have zero GRPO advantages.",
+            "Task/trajectory rewards minus length/execution costs: equal-reward groups have zero GRPO advantages.",
             flush=True,
         )
         start = monotonic()
@@ -494,6 +494,8 @@ def train(config: Config) -> TrainState:
                 f"runtime={diagnostics['charts/reward_runtime_mean']:.3f} "
                 f"distance={diagnostics['charts/reward_distance_mean']:.3f} "
                 f"trajectory={diagnostics['charts/reward_trajectory_mean']:.3f} "
+                f"length_penalty={diagnostics['charts/reward_length_mean']:.4f} "
+                f"execution_penalty={diagnostics['charts/reward_execution_mean']:.4f} "
                 f"informative_groups={diagnostics['charts/informative_group_fraction']:.3f} "
                 f"policy={policy_loss:.3f} entropy={entropy:.3f} kl={approx_kl:.4f} "
                 f"updates={updates_done} early_stop={early_stop}",

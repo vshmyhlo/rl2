@@ -6,6 +6,7 @@ import pytest
 
 from rl2.karel import (
     DistanceMap,
+    ExecutionStats,
     KarelConfig,
     KarelProgramEnv,
     KarelProgramError,
@@ -58,6 +59,8 @@ def expected_info(reward: float, success: bool = False, error: str | None = None
         "reward_distance": distance,
         "reward_success": float(success),
         "reward_trajectory": 0.0,
+        "reward_length": 0.0,
+        "reward_execution": 0.0,
     }
 
 
@@ -72,7 +75,7 @@ def fixed_env(world: State, monkeypatch: pytest.MonkeyPatch) -> KarelProgramEnv:
         return task
 
     monkeypatch.setattr("rl2.karel.sample_task", fixed_task)
-    return KarelProgramEnv(KarelConfig(trajectory_weight=0.0))
+    return KarelProgramEnv(KarelConfig(length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0))
 
 
 def test_corridor_program_collects_markers_without_mutating_input(world: State) -> None:
@@ -244,7 +247,11 @@ def test_reset_discards_partial_program(fixed_env: KarelProgramEnv) -> None:
 
 def test_token_limit_and_terminal_boundary(fixed_env: KarelProgramEnv) -> None:
     # The fixed reference uses five tokens including m), exactly the limit.
-    env = KarelProgramEnv(KarelConfig(trajectory_weight=0.0, max_program_tokens=5))
+    env = KarelProgramEnv(
+        KarelConfig(
+            length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0, max_program_tokens=5
+        )
+    )
     env.reset()
     assert submit(env, ["DEF", "run", "m(", "move", "m)"])[1] == 4.0
     env.reset()
@@ -254,7 +261,11 @@ def test_token_limit_and_terminal_boundary(fixed_env: KarelProgramEnv) -> None:
 
 
 def test_incomplete_program_gets_syntax_credit_without_execution(fixed_env: KarelProgramEnv) -> None:
-    env = KarelProgramEnv(KarelConfig(trajectory_weight=0.0, max_program_tokens=6))
+    env = KarelProgramEnv(
+        KarelConfig(
+            length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0, max_program_tokens=6
+        )
+    )
     env.reset()
     # Only m) is missing. The completed program would solve this task, but must
     # never be repaired and executed when determining the reward.
@@ -289,6 +300,8 @@ def test_pad_is_reserved_and_cannot_change_program(fixed_env: KarelProgramEnv) -
 @pytest.mark.parametrize("seed", range(20))
 def test_sampled_task_is_reachable_changed_and_within_limits(seed: int) -> None:
     config = KarelConfig(
+        length_penalty_weight=0.0,
+        execution_penalty_weight=0.0,
         trajectory_weight=0.0,
     )
     task = sample_task(np.random.default_rng(seed), config)
@@ -301,8 +314,8 @@ def test_sampled_task_is_reachable_changed_and_within_limits(seed: int) -> None:
 
 def test_seed_reproduces_task_stream_and_reference_solves() -> None:
     first, second = (
-        KarelProgramEnv(KarelConfig(trajectory_weight=0.0)),
-        KarelProgramEnv(KarelConfig(trajectory_weight=0.0)),
+        KarelProgramEnv(KarelConfig(length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0)),
+        KarelProgramEnv(KarelConfig(length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0)),
     )
     pairs: set[bytes] = set()
     for episode in range(10):
@@ -320,7 +333,7 @@ def test_seed_reproduces_task_stream_and_reference_solves() -> None:
 
 
 def test_depth_zero_samples_only_primitive_actions() -> None:
-    config = KarelConfig(trajectory_weight=0.0, max_depth=0)
+    config = KarelConfig(length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0, max_depth=0)
     for seed in range(10):
         task = sample_task(np.random.default_rng(seed), config)
         assert not {"WHILE", "REPEAT", "IF", "IFELSE"}.intersection(task.program)
@@ -332,7 +345,12 @@ def test_sampling_failure_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("rl2.karel._sample_program", identity_program)
     with pytest.raises(RuntimeError, match="max_sampling_attempts"):
-        sample_task(np.random.default_rng(0), KarelConfig(trajectory_weight=0.0, max_sampling_attempts=2))
+        sample_task(
+            np.random.default_rng(0),
+            KarelConfig(
+                length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0, max_sampling_attempts=2
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -355,7 +373,7 @@ def test_sampling_failure_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
 )
 def test_config_validation(options: dict[str, int | float]) -> None:
     with pytest.raises((AssertionError, TypeError, ValueError)):
-        KarelConfig(trajectory_weight=0.0, **options)
+        KarelConfig(length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0, **options)
 
 
 def test_world_shape_dtype_and_robot_validation(world: State) -> None:
@@ -424,6 +442,8 @@ def test_zero_repeat_and_false_branch_skip_invalid_actions(world: State) -> None
 def test_minimum_task_and_submission_budgets(seed: int) -> None:
     env = KarelProgramEnv(
         KarelConfig(
+            length_penalty_weight=0.0,
+            execution_penalty_weight=0.0,
             trajectory_weight=0.0,
             height=3,
             width=3,
@@ -443,7 +463,7 @@ def test_minimum_task_and_submission_budgets(seed: int) -> None:
 
 
 def test_failed_reset_invalidates_old_task_and_can_recover(monkeypatch: pytest.MonkeyPatch) -> None:
-    env = KarelProgramEnv(KarelConfig(trajectory_weight=0.0))
+    env = KarelProgramEnv(KarelConfig(length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0))
     env.reset(seed=1)
     env.step(env.token_to_id["DEF"])
 
@@ -488,7 +508,7 @@ def test_terminal_progress_reward(
         return KarelTask(world, target, ("DEF", "run", "m(", "move", "move", "m)"))
 
     monkeypatch.setattr("rl2.karel.sample_task", fixed_task)
-    env = KarelProgramEnv(KarelConfig(trajectory_weight=0.0))
+    env = KarelProgramEnv(KarelConfig(length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0))
     env.reset()
     for token in f"DEF run m( {body}".split():
         assert env.step(env.token_to_id[token]) == (None, 0.0, False, False, {})
@@ -513,7 +533,11 @@ def test_runtime_score_uses_partial_progress(
         return KarelTask(world, target, ("DEF", "run", "m(", "move", "move", "m)"))
 
     monkeypatch.setattr("rl2.karel.sample_task", fixed_task)
-    env = KarelProgramEnv(KarelConfig(trajectory_weight=0.0, max_execution_steps=budget))
+    env = KarelProgramEnv(
+        KarelConfig(
+            length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0, max_execution_steps=budget
+        )
+    )
     env.reset()
     result = submit(env, f"DEF run m( move {action} m)".split())
     # Syntax=1, normalized runtime progress=0.75, distance=0 on failure.
@@ -534,7 +558,11 @@ def test_failure_at_exact_target_has_no_distance_or_success_bonus(
         return KarelTask(world, target, program)
 
     monkeypatch.setattr("rl2.karel.sample_task", fixed_task)
-    env = KarelProgramEnv(KarelConfig(trajectory_weight=0.0, max_execution_steps=budget))
+    env = KarelProgramEnv(
+        KarelConfig(
+            length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0, max_execution_steps=budget
+        )
+    )
     env.reset()
     assert submit(env, f"DEF run m( {prefix} {suffix} m)".split()) == (
         None,
@@ -553,7 +581,14 @@ def test_distance_weights_and_marker_counts(world: State) -> None:
     target[1, 3, 2] = 1
     target[2, 1, 5] = 4
     target[3, 3, 5] = 2
-    config = KarelConfig(trajectory_weight=0.0, position_weight=2.0, orientation_weight=3.0, marker_weight=4.0)
+    config = KarelConfig(
+        length_penalty_weight=0.0,
+        execution_penalty_weight=0.0,
+        trajectory_weight=0.0,
+        position_weight=2.0,
+        orientation_weight=3.0,
+        marker_weight=4.0,
+    )
     # Three free-cell moves, one heading mismatch, and five marker edits.
     assert state_distance(world, target, config) == 2 * 3 + 3 * 1 + 4 * 5
     assert progress_reward(world, world, target, config) == 0.5
@@ -575,6 +610,8 @@ def test_normalized_progress_preserves_regressions(world: State, error: int, sco
             final,
             target,
             KarelConfig(
+                length_penalty_weight=0.0,
+                execution_penalty_weight=0.0,
                 trajectory_weight=0.0,
             ),
         )
@@ -586,7 +623,9 @@ def test_normalized_progress_preserves_regressions(world: State, error: int, sco
 @pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
 def test_reward_weights_must_be_positive_and_finite(weight_name: str, value: float) -> None:
     with pytest.raises((AssertionError, ValueError)):
-        KarelConfig(trajectory_weight=0.0, **{weight_name: value})
+        KarelConfig(
+            length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0, **{weight_name: value}
+        )
 
 
 def test_reward_rejects_zero_baseline_and_changed_walls(world: State) -> None:
@@ -596,6 +635,8 @@ def test_reward_rejects_zero_baseline_and_changed_walls(world: State) -> None:
             world,
             world,
             KarelConfig(
+                length_penalty_weight=0.0,
+                execution_penalty_weight=0.0,
                 trajectory_weight=0.0,
             ),
         )
@@ -606,6 +647,8 @@ def test_reward_rejects_zero_baseline_and_changed_walls(world: State) -> None:
             world,
             changed,
             KarelConfig(
+                length_penalty_weight=0.0,
+                execution_penalty_weight=0.0,
                 trajectory_weight=0.0,
             ),
         )
@@ -627,7 +670,9 @@ def test_wall_detour_progress_and_reset_cache(
     target[1, 3, 1] = 1
     prefix = "turnRight move turnLeft"
     final = execute(prefix, initial)
-    config = KarelConfig(trajectory_weight=0.0, max_execution_steps=budget)
+    config = KarelConfig(
+        length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0, max_execution_steps=budget
+    )
     distances = target_distance_map(target)
     assert distances[1, 1] == 6
     assert distances[2, 1] == 5
@@ -687,6 +732,8 @@ def test_distance_rejects_unreachable_robot_and_wall_target(world: State) -> Non
             initial,
             target,
             KarelConfig(
+                length_penalty_weight=0.0,
+                execution_penalty_weight=0.0,
                 trajectory_weight=0.0,
             ),
         )
@@ -696,6 +743,8 @@ def test_distance_rejects_unreachable_robot_and_wall_target(world: State) -> Non
             target,
             target,
             KarelConfig(
+                length_penalty_weight=0.0,
+                execution_penalty_weight=0.0,
                 trajectory_weight=0.0,
             ),
         )
@@ -737,7 +786,9 @@ def test_trajectory_bonus_credits_net_progress_and_penalizes_reversals(
         return KarelTask(initial, target, ("DEF", "run", "m(", "pickMarker", "pickMarker", "m)"))
 
     monkeypatch.setattr("rl2.karel.sample_task", fixed_task)
-    env = KarelProgramEnv(KarelConfig(max_execution_steps=budget))
+    env = KarelProgramEnv(
+        KarelConfig(length_penalty_weight=0.0, execution_penalty_weight=0.0, max_execution_steps=budget)
+    )
     env.reset()
     result = submit(env, f"DEF run m( {body} m)".split())
     assert result[1] == pytest.approx(base + bonus)
@@ -746,7 +797,11 @@ def test_trajectory_bonus_credits_net_progress_and_penalizes_reversals(
     assert result[4]["success"] == (base == 4.0)
     assert sum(value for key, value in result[4].items() if key.startswith("reward_")) == pytest.approx(result[1])
     # Disabling the bonus restores the original score on exactly the same task.
-    disabled = KarelProgramEnv(KarelConfig(max_execution_steps=budget, trajectory_weight=0.0))
+    disabled = KarelProgramEnv(
+        KarelConfig(
+            length_penalty_weight=0.0, execution_penalty_weight=0.0, max_execution_steps=budget, trajectory_weight=0.0
+        )
+    )
     disabled.reset()
     assert submit(disabled, f"DEF run m( {body} m)".split())[1] == pytest.approx(base)
 
@@ -780,4 +835,81 @@ def test_action_observer_gets_independent_primitive_snapshots(world: State) -> N
 @pytest.mark.parametrize("weight", [-1.0, float("nan"), float("inf")])
 def test_invalid_trajectory_weight(weight: float) -> None:
     with pytest.raises((ValueError, AssertionError)):
-        KarelConfig(trajectory_weight=weight)
+        KarelConfig(length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=weight)
+
+
+@pytest.mark.parametrize(
+    "program,budget,steps,error",
+    [
+        ("DEF run m( move m)", 256, 1, None),
+        ("DEF run m( REPEAT R=0 r( move r) m)", 256, 1, None),
+        ("DEF run m( WHILE c( frontIsClear c) w( move w) m)", 256, 8, None),
+        ("DEF run m( pickMarker pickMarker m)", 256, 2, "runtime_error"),
+        ("DEF run m( REPEAT R=9 r( turnLeft r) m)", 3, 3, "execution_limit"),
+        ("m)", 256, 0, "syntax_error"),
+    ],
+)
+def test_execution_stats_count_budget_ticks(
+    world: State, program: str, budget: int, steps: int, error: str | None
+) -> None:
+    stats = ExecutionStats(steps=999)  # Reused stats must reset, including on syntax failure.
+    if error is None:
+        execute_program(program.split(), world, max_steps=budget, execution_stats=stats)
+    else:
+        with pytest.raises(KarelProgramError, match=".") as caught:
+            execute_program(program.split(), world, max_steps=budget, execution_stats=stats)
+        assert caught.value.reason == error
+    assert stats.steps == steps
+
+
+@pytest.mark.parametrize(
+    "program,limit,steps,error",
+    [
+        ("DEF run m( move m)", 256, 1, None),
+        ("DEF run m( REPEAT R=8 r( turnLeft r) move m)", 256, 10, None),
+        ("DEF run m( turnLeft turnLeft turnLeft turnLeft turnLeft turnLeft turnLeft turnLeft move m)", 256, 9, None),
+        ("DEF run m( pickMarker pickMarker m)", 256, 2, "runtime_error"),
+        ("DEF run m( REPEAT R=9 r( turnLeft r) m)", 3, 3, "execution_limit"),
+        ("m)", 256, 0, "syntax_error"),
+    ],
+)
+def test_efficiency_penalties_are_separate_and_sum_into_reward(
+    fixed_env: KarelProgramEnv, program: str, limit: int, steps: int, error: str | None
+) -> None:
+    from dataclasses import replace
+
+    fixed_env.config = replace(fixed_env.config, max_execution_steps=limit)
+    fixed_env.reset()
+    baseline = submit(fixed_env, program.split())
+    fixed_env.config = replace(fixed_env.config, length_penalty_weight=0.05, execution_penalty_weight=0.05)
+    fixed_env.reset()
+    result = submit(fixed_env, program.split())
+    length_term = -0.05 * len(program.split()) / fixed_env.config.max_program_tokens
+    execution_term = -0.05 * steps / limit
+    assert result[4]["reward_length"] == pytest.approx(length_term)
+    assert result[4]["reward_execution"] == pytest.approx(execution_term)
+    assert result[1] == pytest.approx(baseline[1] + length_term + execution_term)
+    assert result[4]["error"] == error
+    assert result[4]["success"] == baseline[4]["success"]
+    assert sum(value for key, value in result[4].items() if key.startswith("reward_")) == pytest.approx(result[1])
+
+
+def test_token_limit_applies_full_length_penalty_without_execution(fixed_env: KarelProgramEnv) -> None:
+    from dataclasses import replace
+
+    fixed_env.config = replace(
+        fixed_env.config, max_program_tokens=5, length_penalty_weight=0.05, execution_penalty_weight=0.05
+    )
+    fixed_env.reset()
+    result = submit(fixed_env, ["DEF", "run", "m(", "move", "move"])
+    assert result[3] and result[4]["error"] == "token_limit"
+    assert result[4]["reward_length"] == -0.05
+    assert result[4]["reward_execution"] == 0.0
+    assert result[1] == pytest.approx(result[4]["reward_syntax"] - 0.05)
+
+
+@pytest.mark.parametrize("field", ["length_penalty_weight", "execution_penalty_weight"])
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_efficiency_weights_must_be_finite_and_nonnegative(field: str, value: float) -> None:
+    with pytest.raises((ValueError, AssertionError)):
+        KarelConfig(**{field: value})

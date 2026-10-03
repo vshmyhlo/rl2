@@ -45,7 +45,15 @@ def config(request: pytest.FixtureRequest) -> Config:
         d_state=8,
         headdim=4,
         target_kl=None,
-        env=KarelConfig(height=3, width=3, max_depth=0, max_statements=1, max_program_tokens=6),
+        env=KarelConfig(
+            length_penalty_weight=0.0,
+            execution_penalty_weight=0.0,
+            height=3,
+            width=3,
+            max_depth=0,
+            max_statements=1,
+            max_program_tokens=6,
+        ),
     )
 
 
@@ -112,6 +120,8 @@ def test_equal_partial_rewards_are_not_logged_as_informative(
                 "reward_distance": 0.0,
                 "reward_success": 0.0,
                 "reward_trajectory": 0.0,
+                "reward_length": 0.0,
+                "reward_execution": 0.0,
             },
         )
 
@@ -187,7 +197,7 @@ def test_collection_shares_pairs_and_handles_terminal_and_truncation(
     assert diagnostics["charts/syntax_error_rate"] == (token == "m)")
     assert diagnostics["charts/reward_mean"] == pytest.approx(0.2)
     assert diagnostics["charts/reward_syntax_mean"] == pytest.approx(0.2)
-    for name in ("runtime", "distance", "success", "trajectory"):
+    for name in ("runtime", "distance", "success", "trajectory", "length", "execution"):
         assert diagnostics[f"charts/reward_{name}_mean"] == 0.0
     assert diagnostics["charts/success_rate"] == diagnostics["charts/group_success_rate"] == 0.0
     _, logits = state.apply_fn({"params": state.params}, batch.initial, batch.target, batch.actions[:-1])
@@ -212,7 +222,11 @@ def test_partial_rewards_are_not_logged_as_successes(
     success: bool,
     error: str | None,
 ) -> None:
-    config = replace(config, num_tasks=2, env=replace(config.env, max_program_tokens=8))
+    config = replace(
+        config,
+        num_tasks=2,
+        env=replace(config.env, max_program_tokens=8, length_penalty_weight=0.05, execution_penalty_weight=0.05),
+    )
     initial = np.zeros((3, 3, 6), dtype=np.int32)
     initial[..., 4] = 1
     initial[1, 1, 4] = 0
@@ -246,9 +260,16 @@ def test_partial_rewards_are_not_logged_as_successes(
     monkeypatch.setattr("rl2.grpo.act", scripted_act)
     envs = [KarelProgramEnv(config.env) for _ in range(4)]
     batch, rewards, diagnostics, _ = collect_rollout(state, envs, np.random.default_rng(0), jax.random.key(0), config)
-    np.testing.assert_array_equal(rewards, np.asarray([2.625, 2.0, reward, 0.2], dtype=np.float32))
+    lengths = np.asarray([len(program.split()) for program in programs])
+    ticks = np.asarray([1, 2, len(body.split()), 0])
+    length_terms = -0.05 * lengths / 8
+    execution_terms = -0.05 * ticks / config.env.max_execution_steps
+    expected_rewards = np.asarray([2.625, 2.0, reward, 0.2]) + length_terms + execution_terms
+    np.testing.assert_allclose(rewards, expected_rewards, atol=2e-7)
+    assert diagnostics["charts/reward_length_mean"] == pytest.approx(length_terms.mean())
+    assert diagnostics["charts/reward_execution_mean"] == pytest.approx(execution_terms.mean())
     np.testing.assert_allclose(batch.advantages, [1.0, -1.0, 1.0, -1.0], atol=2e-7)
-    assert diagnostics["charts/reward_mean"] == pytest.approx((reward + 4.825) / 4)
+    assert diagnostics["charts/reward_mean"] == pytest.approx(expected_rewards.mean())
     assert diagnostics["charts/reward_syntax_mean"] == pytest.approx(0.8)
     third_progress = 0.25 if body == "putMarker" else 1.0
     assert diagnostics["charts/reward_runtime_mean"] == pytest.approx((0.75 + 0.5 + third_progress) / 4)
@@ -259,7 +280,8 @@ def test_partial_rewards_are_not_logged_as_successes(
         (0.125 + (0.0 if body == "putMarker" else 0.25)) / 4
     )
     assert sum(
-        diagnostics[f"charts/reward_{name}_mean"] for name in ("syntax", "runtime", "distance", "success", "trajectory")
+        diagnostics[f"charts/reward_{name}_mean"]
+        for name in ("syntax", "runtime", "distance", "success", "trajectory", "length", "execution")
     ) == pytest.approx(diagnostics["charts/reward_mean"])
     assert diagnostics["charts/success_rate"] == float(success) / 4
     assert diagnostics["charts/group_success_rate"] == float(success) / 2
