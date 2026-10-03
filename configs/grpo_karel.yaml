@@ -1,7 +1,7 @@
 seed: 1
 total_updates: 100000 # Rollout batches; TensorBoard steps include terminal m), exclude PAD
-num_tasks: 8 # Sampled pairs per rollout
-group_size: 16 # Independent program samples for each pair
+num_tasks: 32 # Sampled pairs per rollout
+group_size: 8 # Independent program samples for each pair
 num_minibatches: 4 # Must divide num_tasks * group_size; keep whole programs together
 update_epochs: 2
 d_model: 384 # 10,216,371 parameters with the 8x8 grid and model settings below
