@@ -14,6 +14,7 @@ Intermediate rewards are zero.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -27,6 +28,7 @@ from numpy.typing import NDArray
 from rl2.karel_syntax import MAX_BLOCK_DEPTH, syntax_reward
 
 type State = NDArray[np.int32]
+type DistanceMap = NDArray[np.int32]
 type StepResult = tuple[None, float, bool, bool, dict[str, object]]
 REWARD_COMPONENTS = ("syntax", "runtime", "distance", "success")
 
@@ -79,7 +81,7 @@ class KarelConfig:
     max_program_tokens: int = 128  # Includes the terminal m); excludes padding.
     max_execution_steps: int = 256  # Statements and loop-condition checks.
     max_sampling_attempts: int = 1000
-    position_weight: float = 1.0  # Weight per cell of Manhattan robot-position error.
+    position_weight: float = 1.0  # Weight per step of shortest-path robot-position error.
     orientation_weight: float = 1.0  # Weight for any incorrect robot heading.
     marker_weight: float = 1.0  # Weight per missing or extra marker, summed over all cells.
 
@@ -119,16 +121,48 @@ class KarelTask:
     program: tuple[str, ...]  # Complete reference program, including terminal m).
 
 
-def state_distance(state: State, target: State, config: KarelConfig) -> float:
+def target_distance_map(target: State) -> DistanceMap:
+    """BFS distances to the target robot through free cells; walls/unreachable = -1.
+
+    Counts orthogonal moves, ignoring heading and markers. The map can be reused
+    while the target robot position and wall layout stay fixed.
+    """
+    chex.assert_shape(target, (None, None, 6))
+    chex.assert_type(target, np.int32)
+    robot = np.argwhere(target[..., :4])
+    chex.assert_shape(robot, (1, 3))
+    row, col = map(int, robot[0, :2])
+    if target[row, col, 4]:
+        raise ValueError("Target robot must occupy a free cell")
+    distances = np.full(target.shape[:2], -1, dtype=np.int32)
+    distances[row, col] = 0
+    queue = deque([(row, col)])
+    height, width = distances.shape
+    while queue:
+        row, col = queue.popleft()
+        for dr, dc in _DIRECTIONS:
+            nr, nc = row + dr, col + dc
+            if 0 <= nr < height and 0 <= nc < width and not target[nr, nc, 4] and distances[nr, nc] == -1:
+                distances[nr, nc] = distances[row, col] + 1
+                queue.append((nr, nc))
+    return distances
+
+
+def state_distance(
+    state: State, target: State, config: KarelConfig, *, distance_map: DistanceMap | None = None
+) -> float:
     """Weighted position, heading, and marker error between valid Karel states.
 
-    D(s,t) = position_weight * Manhattan(robot_s, robot_t)
+    D(s,t) = position_weight * shortest_path(robot_s, robot_t)
            + orientation_weight * (heading_s != heading_t)
            + marker_weight * sum_cells(abs(markers_s - markers_t)).
 
-    Walls must be identical and are not scored. Manhattan distance ignores walls
-    and is a closeness heuristic, not a minimum-action solution cost. All wrong
+    Walls must be identical and constrain movement but are not scored directly.
+    Position counts orthogonal moves through free cells, not turning costs. All wrong
     headings have the same cost; marker errors include initially correct cells.
+    An optional distance_map must come from target_distance_map for this target's
+    position and walls. Unreachable robot positions raise ValueError; sampled
+    tasks and their executions always remain in the target's connected component.
     """
     chex.assert_shape(state, (None, None, 6))
     chex.assert_equal_shape((state, target))
@@ -138,7 +172,15 @@ def state_distance(state: State, target: State, config: KarelConfig) -> float:
     robot = np.argwhere(state[..., :4])
     target_robot = np.argwhere(target[..., :4])
     chex.assert_shape((robot, target_robot), (1, 3))
-    position_error = int(np.abs(robot[0, :2] - target_robot[0, :2]).sum())
+    if distance_map is None:
+        distance_map = target_distance_map(target)
+    chex.assert_shape(distance_map, target.shape[:2])
+    chex.assert_type(distance_map, np.int32)
+    if distance_map[tuple(target_robot[0, :2])] != 0:
+        raise ValueError("Distance map must be rooted at the target robot")
+    position_error = int(distance_map[tuple(robot[0, :2])])
+    if position_error < 0:
+        raise ValueError("Robot position cannot reach the target through free cells")
     orientation_error = int(robot[0, 2] != target_robot[0, 2])
     marker_error = int(np.abs(state[..., 5].astype(np.int64) - target[..., 5].astype(np.int64)).sum())
     return float(
@@ -148,7 +190,9 @@ def state_distance(state: State, target: State, config: KarelConfig) -> float:
     )
 
 
-def progress_reward(initial: State, final: State, target: State, config: KarelConfig) -> float:
+def progress_reward(
+    initial: State, final: State, target: State, config: KarelConfig, *, distance_map: DistanceMap | None = None
+) -> float:
     """Map signed progress from [-1, 1] to [0, 1] for a final or partial state.
 
     Score = clip(1 - D(final,t)/(2*D(initial,t)), 0, 1). Exact targets score 1,
@@ -159,10 +203,12 @@ def progress_reward(initial: State, final: State, target: State, config: KarelCo
     This is always the runtime term and also the distance term on normal
     completion; the other reward terms are added by step().
     """
-    initial_distance = state_distance(initial, target, config)
+    if distance_map is None:
+        distance_map = target_distance_map(target)
+    initial_distance = state_distance(initial, target, config, distance_map=distance_map)
     if initial_distance <= 0:
         raise ValueError("Progress reward requires a non-identical initial/target pair")
-    final_distance = state_distance(final, target, config)
+    final_distance = state_distance(final, target, config, distance_map=distance_map)
     return float(np.clip(1.0 - 0.5 * (final_distance / initial_distance), 0.0, 1.0))
 
 
@@ -449,6 +495,7 @@ class KarelProgramEnv:
         self.action_space = gym.spaces.Discrete(len(TOKENS))
         self._rng = np.random.default_rng()
         self._task: KarelTask | None = None
+        self._distance_map: DistanceMap | None = None
         self._program: list[str] = []
         self._needs_reset = True
 
@@ -462,11 +509,13 @@ class KarelProgramEnv:
     def reset(self, *, seed: int | None = None) -> KarelPair:
         self._needs_reset = True
         self._task = None
+        self._distance_map = None
         self._program.clear()
         if seed is not None:
             self._rng = np.random.default_rng(seed)
             self.action_space.seed(seed)
         self._task = sample_task(self._rng, self.config)
+        self._distance_map = target_distance_map(self._task.target)
         self._needs_reset = False
         # Callers may transform observations without changing the task we evaluate.
         return KarelPair(self._task.initial.copy(), self._task.target.copy())
@@ -515,11 +564,17 @@ class KarelProgramEnv:
                 else:
                     assert exc.partial_state is not None
                     runtime_score = progress_reward(
-                        self._task.initial, exc.partial_state, self._task.target, self.config
+                        self._task.initial,
+                        exc.partial_state,
+                        self._task.target,
+                        self.config,
+                        distance_map=self._distance_map,
                     )
                     return self._finish(1.0, runtime_score, error=exc.reason)
             success = bool(np.array_equal(output, self._task.target))
-            distance = progress_reward(self._task.initial, output, self._task.target, self.config)
+            distance = progress_reward(
+                self._task.initial, output, self._task.target, self.config, distance_map=self._distance_map
+            )
             return self._finish(1.0, distance, distance, success=success)
         if len(self._program) >= self.config.max_program_tokens:
             self._needs_reset = True

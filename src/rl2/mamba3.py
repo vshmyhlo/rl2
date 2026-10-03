@@ -12,6 +12,9 @@ Neither includes an embedding or prediction head.
 Parameters and recurrent accumulation remain float32; projection precision is
 controlled by ``dtype`` (float32 by default). Normalization statistics also use
 float32, including the stack's residual stream before casting norm outputs.
+For mixed-precision training, set ``dtype=jnp.bfloat16`` on the mixer or stack;
+inputs may be float32 or bfloat16. Keep the initialized parameters and optimizer
+state in float32 and compute the loss in float32. Recurrent carry stays float32.
 This intentionally differs from the intermediate rounding of upstream
 mixed-precision paths, so this is not a bitwise reproduction of CUDA kernels.
 As in upstream's ``_no_weight_decay`` metadata, callers

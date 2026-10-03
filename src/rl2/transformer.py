@@ -5,6 +5,10 @@ SwiGLU residual blocks and a final RMSNorm. Neither includes embeddings or a
 prediction head. Projections are bias-free, parameters/norm statistics are
 float32, and ``dtype`` controls projections, outputs and cached keys/values.
 The XLA float16 path evaluates attention in float32 for CPU portability.
+For mixed-precision training, set ``dtype=jnp.bfloat16`` on the mixer or stack;
+inputs may be float32 or bfloat16. Keep the initialized parameters and optimizer
+state in float32 and compute the loss in float32. KV entries use bfloat16, while
+RoPE trigonometry and normalization statistics stay float32.
 
 The fixed-size ring cache implements sliding causal attention: each query sees
 at most ``max_seq_len`` tokens, including itself. Set it to the maximum episode

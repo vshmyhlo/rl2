@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from rl2.karel import (
+    DistanceMap,
     KarelConfig,
     KarelProgramEnv,
     KarelProgramError,
@@ -15,6 +16,7 @@ from rl2.karel import (
     progress_reward,
     sample_task,
     state_distance,
+    target_distance_map,
 )
 
 
@@ -545,7 +547,7 @@ def test_distance_weights_and_marker_counts(world: State) -> None:
     target[2, 1, 5] = 4
     target[3, 3, 5] = 2
     config = KarelConfig(position_weight=2.0, orientation_weight=3.0, marker_weight=4.0)
-    # Three Manhattan steps, one heading mismatch, and five marker edits.
+    # Three free-cell moves, one heading mismatch, and five marker edits.
     assert state_distance(world, target, config) == 2 * 3 + 3 * 1 + 4 * 5
     assert progress_reward(world, world, target, config) == 0.5
     assert progress_reward(world, target, target, config) == 1.0
@@ -577,3 +579,83 @@ def test_reward_rejects_zero_baseline_and_changed_walls(world: State) -> None:
     changed[1, 1, 4] = 1
     with pytest.raises(ValueError, match="identical walls"):
         state_distance(world, changed, KarelConfig())
+
+
+@pytest.mark.parametrize(
+    "suffix,budget,error", [("", 256, None), ("move", 256, "runtime_error"), ("move", 3, "execution_limit")]
+)
+def test_wall_detour_progress_and_reset_cache(
+    world: State, monkeypatch: pytest.MonkeyPatch, suffix: str, budget: int, error: str | None
+) -> None:
+    initial = world.copy()
+    initial[..., :4] = 0
+    initial[1, 1, 1] = 1
+    initial[1:3, 2, 4] = 1  # Must travel down to row 3 to cross this wall.
+    initial[1:3, 2, 5] = 0
+    target = initial.copy()
+    target[..., :4] = 0
+    target[1, 3, 1] = 1
+    prefix = "turnRight move turnLeft"
+    final = execute(prefix, initial)
+    config = KarelConfig(max_execution_steps=budget)
+    distances = target_distance_map(target)
+    assert distances[1, 1] == 6
+    assert distances[2, 1] == 5
+    assert distances[1, 3] == 0
+    assert distances[1, 2] == -1
+    assert state_distance(initial, target, config) == 6.0
+    assert state_distance(final, target, config, distance_map=distances) == 5.0
+    assert progress_reward(initial, final, target, config) == pytest.approx(7 / 12)
+
+    # A new target on reset must replace the previous episode's cached map.
+    targets = iter([target, final])
+    map_calls: list[State] = []
+
+    def fixed_task(rng: np.random.Generator, config: KarelConfig) -> KarelTask:
+        return KarelTask(initial, next(targets), tuple(f"DEF run m( {prefix} m)".split()))
+
+    def counted_map(target: State) -> DistanceMap:
+        map_calls.append(target)
+        return target_distance_map(target)
+
+    monkeypatch.setattr("rl2.karel.sample_task", fixed_task)
+    monkeypatch.setattr("rl2.karel.target_distance_map", counted_map)
+    env = KarelProgramEnv(config)
+    env.reset()
+    assert len(map_calls) == 1
+    result = submit(env, f"DEF run m( {prefix} {suffix} m)".split())
+    expected_distance = 7 / 12 if error is None else 0.0
+    assert result[1] == pytest.approx(1 + 7 / 12 + expected_distance)
+    assert result[2:4] == (True, False)
+    assert result[4]["reward_runtime"] == pytest.approx(7 / 12)
+    assert result[4]["reward_distance"] == pytest.approx(expected_distance)
+    assert result[4]["reward_success"] == 0.0
+    assert result[4]["error"] == error
+    assert len(map_calls) == 1  # Evaluation reuses reset's map for both states.
+    env.reset()
+    assert len(map_calls) == 2
+    assert submit(env, f"DEF run m( {prefix} m)".split())[1] == 4.0
+    assert len(map_calls) == 2
+
+
+def test_distance_map_handles_open_edges() -> None:
+    target = np.zeros((2, 3, 6), dtype=np.int32)
+    target[0, 0, 0] = 1
+    np.testing.assert_array_equal(target_distance_map(target), [[0, 1, 2], [1, 2, 3]])
+
+
+def test_distance_rejects_unreachable_robot_and_wall_target(world: State) -> None:
+    initial = world.copy()
+    initial[1:4, 2, 4] = 1  # Completely separates robot and target.
+    initial[1:4, 2, 5] = 0
+    target = initial.copy()
+    target[..., :4] = 0
+    target[2, 3, 1] = 1
+    assert target_distance_map(target)[2, 1] == -1
+    with pytest.raises(ValueError, match="cannot reach"):
+        state_distance(initial, target, KarelConfig())
+    with pytest.raises(ValueError, match="cannot reach"):
+        progress_reward(initial, target, target, KarelConfig())
+    target[2, 3, 4] = 1
+    with pytest.raises(ValueError, match="free cell"):
+        target_distance_map(target)

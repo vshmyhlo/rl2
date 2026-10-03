@@ -32,7 +32,7 @@ env:
   # progress(s) = clip(1 - 0.5 * D(s,target) / D(initial,target), 0, 1).
   # Exact target: 1; unchanged distance: 0.5; doubled distance or worse: 0.
   # D combines these errors; all weights must be finite and strictly positive.
-  position_weight: 1.0 # Manhattan distance (ignores intervening walls)
+  position_weight: 1.0 # Shortest-path distance through free cells
   orientation_weight: 1.0 # 1 for any wrong heading, 0 for a match
   marker_weight: 1.0 # Sum of absolute marker-count errors across all cells
   # Syntax errors / missing m): (1/(1+d), 0, 0), d = minimum syntax token edits.
