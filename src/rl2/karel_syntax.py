@@ -6,8 +6,9 @@ and deletion; empty spans allow insertion. Binary rules combine spans, and a
 precomputed weighted unary closure accounts for inserted sibling subtrees.
 Cost is one per inserted, deleted, or replaced token. PAD is not a grammar token.
 
-The usual 128-token case uses the compact recursive grammar. Longer inputs use
-a depth-expanded grammar to match the interpreter's 64-block nesting limit.
+The compact recursive grammar is used whenever a repair-length bound proves
+the interpreter's 64-block limit cannot matter. Otherwise a depth-expanded
+grammar enforces that limit explicitly.
 Neither the task's reference program nor execution/token budgets constrain the
 hypothetical repair. Only the submitted program is ever executed.
 """
@@ -135,6 +136,28 @@ def _grammar(max_depth: int | None) -> _Grammar:
     return _Grammar(tuple(terminals), binary_array, empty, closure)
 
 
+def _flat_program_distance(tokens: tuple[str, ...]) -> int:
+    """Distance to DEF run m( ACTION+ m), an upper bound for the full grammar.
+
+    Six automaton states track the five required tokens, with an action loop at
+    state four. Deletions keep the state; insertions and matches advance it.
+    This takes linear time and does not change the grammar used for scoring.
+    """
+    from rl2.karel import ACTIONS
+
+    previous = list(range(6))  # Cost of inserting each prefix before any input.
+    for token in tokens:
+        costs = [value + 1 for value in previous]  # Delete this token.
+        mismatch = (token != "DEF", token != "run", token != "m(", token not in ACTIONS, token != "m)")
+        for state, replace in enumerate(mismatch, 1):
+            costs[state] = min(costs[state], previous[state - 1] + replace)
+        costs[4] = min(costs[4], previous[4] + (token not in ACTIONS))
+        for state in range(1, 6):
+            costs[state] = min(costs[state], costs[state - 1] + 1)
+        previous = costs
+    return previous[-1]
+
+
 def syntax_edit_distance(tokens: Sequence[str]) -> int:
     """Fewest token edits to any complete program accepted by the Karel grammar.
 
@@ -146,10 +169,10 @@ def syntax_edit_distance(tokens: Sequence[str]) -> int:
     if any(not isinstance(token, str) for token in tokens):
         raise TypeError("Expected a sequence of token strings")
     size = len(tokens)
-    # A five-token primitive program is at most max(n, 5) edits away. Thus any
-    # optimal repair is at most n + max(n, 5) tokens long. Nesting 65 controls
-    # needs at least 4*65 + 5 tokens, so short inputs cannot need the depth bound.
-    bounded = size + max(size, 5) >= 4 * (MAX_BLOCK_DEPTH + 1) + 5
+    # Any optimal repair has at most n + upper_bound tokens. Nesting 65 controls
+    # needs at least 4*65 + 5 tokens. A cheap distance to primitive-only programs
+    # gives a tighter bound than max(n, 5), avoiding unnecessary grammar expansion.
+    bounded = size + _flat_program_distance(tokens) >= 4 * (MAX_BLOCK_DEPTH + 1) + 5
     grammar = _grammar(MAX_BLOCK_DEPTH if bounded else None)
     if size == 0:
         return int(grammar.empty[0])

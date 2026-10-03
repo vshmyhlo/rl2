@@ -3,8 +3,8 @@ from itertools import product
 import numpy as np
 import pytest
 
-from rl2.karel import ACTIONS, PREDICATES, KarelConfig, KarelProgramError, _parse, sample_task
-from rl2.karel_syntax import syntax_edit_distance, syntax_reward
+from rl2.karel import ACTIONS, PREDICATES, TOKENS, KarelConfig, KarelProgramError, _parse, sample_task
+from rl2.karel_syntax import _flat_program_distance, _Grammar, _grammar, syntax_edit_distance, syntax_reward
 
 
 def token_distance(left: tuple[str, ...], right: tuple[str, ...]) -> int:
@@ -60,7 +60,32 @@ def test_short_inputs_match_exhaustive_nearest_program_oracle() -> None:
     alphabet = ("DEF", "run", "m(", "move", "m)", "REPEAT", "unknown")
     for length in range(3):
         for tokens in product(alphabet, repeat=length):
-            assert syntax_edit_distance(tokens) == min(token_distance(tokens, candidate) for candidate in valid)
+            expected = min(token_distance(tokens, candidate) for candidate in valid)
+            assert syntax_edit_distance(tokens) == expected
+            assert _flat_program_distance(tokens) == expected
+
+
+def test_flat_distance_agrees_with_depth_zero_chart(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("rl2.karel_syntax.MAX_BLOCK_DEPTH", 0)
+    rng = np.random.default_rng(36)
+    for size in range(3, 20):
+        tokens = tuple(rng.choice(TOKENS[1:], size).tolist())
+        assert syntax_edit_distance(tokens) == _flat_program_distance(tokens)
+
+
+def test_long_nearly_valid_program_avoids_expanded_grammar(monkeypatch: pytest.MonkeyPatch) -> None:
+    def compact_only(max_depth: int | None) -> _Grammar:
+        assert max_depth is None, "A short repair must not trigger the large grammar"
+        return _grammar(max_depth)
+
+    monkeypatch.setattr("rl2.karel_syntax._grammar", compact_only)
+    tokens = ("DEF", "run", "m(", *(["move"] * 129))
+    assert len(tokens) == 132
+    # Adding one action crosses the old 132-token threshold, but both inputs
+    # still need just a closing m). The exact reward must not change.
+    assert syntax_edit_distance(tokens) == 1
+    assert syntax_edit_distance((*tokens, "turnLeft")) == 1
+    assert syntax_edit_distance(["move"] * 133) == 4
 
 
 def test_all_controls_predicates_negations_and_counts_match_parser() -> None:
@@ -98,6 +123,53 @@ def test_generated_programs_and_single_edits_agree_with_parser() -> None:
             else:
                 expected = 0
             assert syntax_edit_distance(edited) == expected
+
+
+def accepts(tokens: tuple[str, ...]) -> bool:
+    """Use only the interpreter for an independent one-edit search."""
+    try:
+        _parse(tokens)
+    except KarelProgramError:
+        return False
+    return True
+
+
+def has_one_edit_repair(tokens: tuple[str, ...]) -> bool:
+    for index in range(len(tokens) + 1):
+        prefix, suffix = tokens[:index], tokens[index:]
+        if suffix and accepts(prefix + suffix[1:]):
+            return True
+        for token in TOKENS[1:]:
+            if accepts((*prefix, token, *suffix)):
+                return True
+            if suffix and accepts((*prefix, token, *suffix[1:])):
+                return True
+    return False
+
+
+def test_two_edit_corruptions_match_independent_repair_search() -> None:
+    rng = np.random.default_rng(53)
+    bodies = (
+        "move turnLeft putMarker",
+        "REPEAT R=2 r( move turnLeft r)",
+        "IFELSE c( not c( markersPresent c) c) i( move i) ELSE e( turnLeft e)",
+        "WHILE c( frontIsClear c) w( REPEAT R=1 r( move r) w)",
+    )
+    for body in bodies:
+        original = tuple(f"DEF run m( {body} m)".split())
+        for _ in range(5):
+            edited = list(original)
+            for _ in range(2):
+                index = int(rng.integers(len(edited)))
+                if rng.integers(2):
+                    edited.insert(index, str(rng.choice(TOKENS[1:])))
+                else:
+                    del edited[index]
+            tokens = tuple(edited)
+            # The original is a witness at distance <=2. Enumerating all one-edit
+            # repairs distinguishes 0, 1, and 2 without using the scoring grammar.
+            expected = 0 if accepts(tokens) else 1 if has_one_edit_repair(tokens) else 2
+            assert syntax_edit_distance(tokens) == expected
 
 
 def test_depth_bounded_grammar_matches_interpreter(monkeypatch: pytest.MonkeyPatch) -> None:
