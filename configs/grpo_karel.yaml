@@ -1,11 +1,11 @@
 seed: 1
 total_updates: 100000 # Rollout batches; TensorBoard steps count AST expansions, exclude PAD
-num_tasks: 16 # Sampled pairs per rollout
-group_size: 16 # Independent program samples for each pair
+num_tasks: 32 # Sampled pairs per rollout
+group_size: 8 # Independent program samples for each pair
 num_minibatches: 4 # Must divide num_tasks * group_size; keep whole programs together
 update_epochs: 1
 max_nodes: 128 # Maximum AST nodes/expansion actions, including list and value nodes
-max_depth: 64 # AST depth, including list nodes; distinct from env.max_depth
+max_depth: 32 # AST depth, including list nodes; distinct from env.max_depth
 decision_batch_size: 32 # Partial-tree rounds per microbatch (all holes predicted together); gradients accumulate per program minibatch
 bf16: true # AST Transformer compute in BF16; parameters, optimizer, and loss in FP32
 attention_implementation: cudnn # Requires a supported NVIDIA GPU; use xla for CPU

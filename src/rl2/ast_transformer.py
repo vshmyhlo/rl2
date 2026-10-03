@@ -158,8 +158,7 @@ class ASTTransformer(nn.Module):
                 field, depth, child-index, and value IDs are int32 [B, max_nodes];
                 node_mask is bool with the same shape; is_hole is computed from
                 node_mask, node_type, and value.
-                frontier is int32 [B], retained for sequential utilities but unused
-                by this model. action_mask is bool [B, max_nodes, A], where
+                action_mask is bool [B, max_nodes, A], where
                 A = len(AST_ACTIONS), and marks legal expansions per hole.
 
         Returns:
@@ -177,8 +176,6 @@ class ASTTransformer(nn.Module):
         chex.assert_shape(tree[:6], (batch, self.max_nodes))
         chex.assert_type(tree[:5], jnp.int32)
         chex.assert_type((tree.is_hole, tree.node_mask, tree.action_mask), jnp.bool_)
-        chex.assert_shape(tree.frontier, (batch,))
-        chex.assert_type(tree.frontier, jnp.int32)
         chex.assert_shape(tree.action_mask, (batch, self.max_nodes, len(AST_ACTIONS)))
         scale = jnp.asarray([1, 1, 1, 1, 1, self.max_markers] * 2, jnp.float32)
         pair = jnp.concatenate((initial, target), axis=-1).astype(jnp.float32) / scale

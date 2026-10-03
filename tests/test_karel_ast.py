@@ -81,7 +81,7 @@ def test_typed_frontier_and_preorder_features() -> None:
         tree = tree.expand(ACTION_ID[name])
     assert {AST_ACTIONS[a] for a in np.flatnonzero(tree.allowed_actions())} == {"Test", "Not"}
     features = tree.features()
-    assert int(features.frontier) == 3
+    assert int(features.is_hole.argmax()) == 3
     # Full preorder includes the unexpanded branches and the outer list tail.
     np.testing.assert_array_equal(
         features.field[:7], [Field.ROOT, Field.BODY, Field.HEAD, Field.CONDITION, Field.THEN, Field.ELSE, Field.TAIL]
@@ -112,7 +112,7 @@ def test_teacher_forcing_contains_only_prefix_information() -> None:
         assert tree.tokens() == program
     batched = batch_features(tuple(e[0][2] for e in examples))
     assert batched.node_type.shape == (2, 8)
-    assert batched.frontier.shape == (2,)
+    assert batched.action_mask.shape == (2, 8, len(AST_ACTIONS))
 
 
 def test_invalid_actions_and_unfinished_printing_fail_without_mutating_tree() -> None:
@@ -338,7 +338,7 @@ def test_resolved_predicate_is_not_a_hole() -> None:
     for name in ("Program", "ConsNonEmpty", "IF", "Test"):
         tree = tree.expand(ACTION_ID[name])
     before = tree.features()
-    position = int(before.frontier)
+    position = int(before.is_hole.argmax())
     after = tree.expand(ACTION_ID["frontIsClear"]).features()
     assert before.node_type[position] == after.node_type[position]
     assert before.is_hole[position] and not after.is_hole[position]

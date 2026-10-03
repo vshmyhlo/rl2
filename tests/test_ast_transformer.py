@@ -114,9 +114,9 @@ def test_initial_policy_is_uniform_over_typed_actions(config: Config, batch: Mod
     state = create_state(config, batch.initial[:1], batch.target[:1])
     logits = predict(state, batch.initial, batch.target, batch.tree)
     chex.assert_shape(logits, (len(batch.actions), config.max_nodes, len(AST_ACTIONS)))
-    logits = logits[jnp.arange(len(batch.actions)), batch.tree.frontier]
+    logits = logits[jnp.arange(len(batch.actions)), batch.tree.action_mask.any(axis=-1).argmax(axis=-1)]
     chex.assert_type(logits, jnp.float32)
-    masks = batch.tree.action_mask[np.arange(len(batch.actions)), batch.tree.frontier]
+    masks = batch.tree.action_mask[np.arange(len(batch.actions)), batch.tree.action_mask.any(axis=-1).argmax(axis=-1)]
     expected = masks / masks.sum(axis=-1, keepdims=True)
     np.testing.assert_allclose(jax.nn.softmax(logits), expected, rtol=1e-6)
     assert np.isneginf(np.asarray(logits)[:, 0]).all()
@@ -133,7 +133,6 @@ def test_padded_features_do_not_affect_predictions(config: Config, batch: ModelB
     dirty = ASTFeatures(
         *(np.where(batch.tree.node_mask, array, 999999).astype(np.int32) for array in batch.tree[:5]),
         batch.tree.node_mask,
-        batch.tree.frontier,
         batch.tree.action_mask,
     )
     np.testing.assert_array_equal(
@@ -150,7 +149,7 @@ def test_masked_head_gradients_are_finite_and_learnable(config: Config, batch: M
     def train_step(state: TrainState) -> tuple[TrainState, jax.Array]:
         def loss(params: dict) -> jax.Array:
             logits = state.apply_fn({"params": params}, batch.initial, batch.target, batch.tree)
-            logits = logits[jnp.arange(len(batch.actions)), batch.tree.frontier]
+            logits = logits[jnp.arange(len(batch.actions)), batch.tree.action_mask.any(axis=-1).argmax(axis=-1)]
             return -jnp.take_along_axis(jax.nn.log_softmax(logits), jnp.asarray(batch.actions)[:, None], axis=-1).mean()
 
         value, grads = jax.value_and_grad(loss)(state.params)
@@ -199,7 +198,7 @@ def test_example_config_and_invalid_model_dimensions(batch: ModelBatch) -> None:
         model.init(jax.random.key(1), batch.initial, batch.target, batch.tree)
 
 
-def test_parallel_predictions_cover_every_hole_and_ignore_frontier(config: Config, batch: ModelBatch) -> None:
+def test_parallel_predictions_cover_every_hole_without_frontier(config: Config, batch: ModelBatch) -> None:
     tree = KarelAST.empty(config.max_nodes, config.max_depth)
     for name in ("Program", "ConsNonEmpty", "IFELSE"):
         tree = tree.expand(ACTION_ID[name])
@@ -215,6 +214,4 @@ def test_parallel_predictions_cover_every_hole_and_ignore_frontier(config: Confi
             np.testing.assert_allclose(probabilities[0, position], allowed / allowed.sum(), rtol=1e-6)
         else:
             assert probabilities[0, position, 0] == 1
-    # The legacy DFS frontier cannot affect which holes receive predictions.
-    changed = features._replace(frontier=np.asarray([config.max_nodes - 1], np.int32))
-    np.testing.assert_array_equal(logits, predict(state, batch.initial[:1], batch.target[:1], changed))
+    assert not hasattr(features, "frontier")

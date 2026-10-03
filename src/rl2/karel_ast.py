@@ -154,9 +154,6 @@ class ASTFeatures(NamedTuple):
             a hole/value type and value=0. Not stored in the tuple.
         node_mask: Bool mask marking all existing nodes, including holes;
             False marks padding excluded from attention keys.
-        frontier: Int32 scalar or [B] array giving the first hole's zero-based
-            preorder position, without the model's context prefix. Finished
-            trees use 0 as a placeholder, not as an expandable position.
         action_mask: Bool [N, A] or [B, N, A] array of legal expansions at
             each current hole. Shared completion budgets are allocated before
             sampling so any combination of allowed choices fits. Resolved nodes,
@@ -170,7 +167,6 @@ class ASTFeatures(NamedTuple):
     child_index: FeatureArray
     value: FeatureArray
     node_mask: FeatureArray
-    frontier: FeatureArray  # Scalar/[B], preorder position; 0 for a finished tree.
     action_mask: FeatureArray  # [N,A]/[B,N,A]; inactive node rows are all false.
 
     @property
@@ -372,16 +368,16 @@ class KarelAST:
                 node.value,
             )
             mask[position] = True
-        frontier = self.frontier
         action_mask = (
             self.parallel_action_mask() if parallel else np.zeros((self.max_nodes, len(AST_ACTIONS)), np.bool_)
         )
-        if not parallel and frontier is not None:
-            action_mask[order.index(frontier)] = self.allowed_actions()
+        if not parallel:
+            frontier = self.frontier
+            if frontier is not None:
+                action_mask[order.index(frontier)] = self.allowed_actions()
         return ASTFeatures(
             *integers,
             mask,
-            np.asarray(order.index(frontier) if frontier is not None else 0, np.int32),
             action_mask,
         )
 

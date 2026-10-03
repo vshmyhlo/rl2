@@ -543,7 +543,7 @@ def update(
     chex.assert_type(batch.actions, jnp.int32)
     chex.assert_type((batch.old_log_probs, batch.advantages), jnp.float32)
     chex.assert_type(batch.mask, jnp.bool_)
-    chex.assert_type(batch.tree[:5] + (batch.tree.frontier,), jnp.int32)
+    chex.assert_type(batch.tree[:5], jnp.int32)
     chex.assert_type((batch.tree.is_hole, batch.tree.node_mask, batch.tree.action_mask), jnp.bool_)
     steps, programs, _ = batch.actions.shape
     count = steps * programs
