@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from rl2.karel import TOKENS, KarelConfig, sample_task
+from rl2.karel import TOKENS, KarelConfig, KarelProgramEnv, sample_task
 from rl2.karel_model import KarelProgramModel
 
 
@@ -66,7 +66,8 @@ def test_token_loss_trains_encoder_and_backbone(
 ) -> None:
     model, variables = model_and_variables
     initial, target, tokens = inputs
-    labels = jnp.concatenate((tokens, jnp.zeros((1, tokens.shape[1]), dtype=jnp.int32)), axis=0)
+    terminal = jnp.full((1, tokens.shape[1]), KarelProgramEnv.terminal_token_id, dtype=jnp.int32)
+    labels = jnp.concatenate((tokens, terminal), axis=0)
 
     def loss(params: dict[str, Any]) -> jax.Array:
         _, logits = model.apply({"params": params}, initial, target, tokens)

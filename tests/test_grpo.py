@@ -12,6 +12,7 @@ from flax.training.train_state import TrainState
 from rl2.grpo import (
     Config,
     GRPOBatch,
+    act,
     action_log_prob,
     collect_rollout,
     group_advantages,
@@ -58,7 +59,7 @@ def state(config: Config) -> TrainState:
 
 
 def batch_from_logits(logits: jax.Array, mask: jax.Array, advantages: jax.Array) -> GRPOBatch:
-    actions = jnp.zeros(logits.shape[:2], dtype=jnp.int32)
+    actions = jnp.where(mask, KarelProgramEnv.terminal_token_id, KarelProgramEnv.pad_token_id).astype(jnp.int32)
     initial = jnp.zeros((logits.shape[1], 3, 3, 6), dtype=jnp.int32)
     return GRPOBatch(initial, initial, actions, action_log_prob(logits, actions), mask, advantages)
 
@@ -74,10 +75,10 @@ def test_objective_weights_programs_equally_and_masks_padding(config: Config) ->
     batch = batch_from_logits(logits, mask, jnp.asarray([1.0, -1.0]))
     loss, metrics = objective(logits, batch, config)
     np.testing.assert_allclose(loss, 0, atol=1e-6)
-    np.testing.assert_allclose(metrics[1], np.log(len(TOKENS)), rtol=1e-6)
+    np.testing.assert_allclose(metrics[1], np.log(len(TOKENS) - 1), rtol=1e-6)
     # Even extreme log-probabilities in padding must not affect loss or gradients.
     padded_batch = batch._replace(old_log_probs=jnp.where(mask, batch.old_log_probs, -1000.0))
-    changed = logits.at[1:, 0, 0].set(10)
+    changed = logits.at[1:, 0, KarelProgramEnv.terminal_token_id].set(10)
     padded_loss, padded_metrics = objective(changed, padded_batch, config)
     np.testing.assert_allclose(padded_loss, loss, atol=1e-6)
     np.testing.assert_allclose(padded_metrics, metrics, atol=1e-6)
@@ -104,8 +105,10 @@ def test_clipped_objective_and_reference_penalty(config: Config) -> None:
     np.testing.assert_allclose(penalized, loss + 0.1 * np.exp(-1), atol=1e-6)
 
 
-@pytest.mark.parametrize("token", ["<eos>", "move"])
-def test_collection_shares_pairs_and_handles_eos_and_truncation(config: Config, state: TrainState, token: str) -> None:
+@pytest.mark.parametrize("token", ["m)", "move"])
+def test_collection_shares_pairs_and_handles_terminal_and_truncation(
+    config: Config, state: TrainState, token: str
+) -> None:
     config = replace(config, num_tasks=2)
     params = {
         **state.params,
@@ -122,10 +125,12 @@ def test_collection_shares_pairs_and_handles_eos_and_truncation(config: Config, 
         np.testing.assert_array_equal(batch.target[start], batch.target[start + 1])
     np.testing.assert_array_equal(rewards, -1)
     np.testing.assert_array_equal(batch.advantages, 0)
-    expected_length = 1 if token == "<eos>" else config.env.max_program_tokens
+    expected_length = 1 if token == "m)" else config.env.max_program_tokens
     np.testing.assert_array_equal(batch.mask.sum(axis=0), expected_length)
+    np.testing.assert_array_equal(batch.actions[~batch.mask], KarelProgramEnv.pad_token_id)
+    np.testing.assert_array_equal(batch.mask, batch.actions != KarelProgramEnv.pad_token_id)
     assert diagnostics["charts/truncation_rate"] == (token == "move")
-    assert diagnostics["charts/syntax_error_rate"] == (token == "<eos>")
+    assert diagnostics["charts/syntax_error_rate"] == (token == "m)")
     assert diagnostics["charts/reward_mean"] == -1.0
     assert diagnostics["charts/success_rate"] == diagnostics["charts/group_success_rate"] == 0.0
     _, logits = state.apply_fn({"params": state.params}, batch.initial, batch.target, batch.actions[:-1])
@@ -149,12 +154,12 @@ def test_partial_rewards_are_not_logged_as_successes(
         return KarelTask(initial, target, ("DEF", "run", "m(", "pickMarker", "pickMarker", "m)"))
 
     programs = [
-        "DEF run m( pickMarker m) <eos>",
-        "DEF run m( turnLeft turnRight m) <eos>",
-        "DEF run m( pickMarker pickMarker m) <eos>",
-        "<eos>",
+        "DEF run m( pickMarker m)",
+        "DEF run m( turnLeft turnRight m)",
+        "DEF run m( pickMarker pickMarker m)",
+        "m)",
     ]
-    scripted = np.full((8, 4), KarelProgramEnv.eos_token_id, dtype=np.int32)
+    scripted = np.full((8, 4), KarelProgramEnv.pad_token_id, dtype=np.int32)
     for column, program in enumerate(programs):
         ids = [KarelProgramEnv.token_to_id[token] for token in program.split()]
         scripted[: len(ids), column] = ids
@@ -182,7 +187,7 @@ def test_update_changes_policy_and_kl_limit_skips_update(config: Config, state: 
     pair = KarelProgramEnv(config.env).reset(seed=3)
     initial = jnp.asarray(np.stack([pair.initial] * 2))
     target = jnp.asarray(np.stack([pair.target] * 2))
-    actions = jnp.asarray([[1, 1], [2, 2], [3, 3], [22, 23], [4, 4], [0, 0]], dtype=jnp.int32)
+    actions = jnp.asarray([[1, 1], [2, 2], [3, 3], [22, 23], [4, 4]], dtype=jnp.int32)
     _, logits = state.apply_fn({"params": state.params}, initial, target, actions[:-1])
     batch = GRPOBatch(
         initial,
@@ -222,6 +227,37 @@ def test_no_reward_variation_gives_no_policy_gradient(config: Config) -> None:
         return objective(values, batch, config)[0]
 
     np.testing.assert_array_equal(jax.grad(loss_fn)(logits), 0)
+
+
+def test_pad_is_never_sampled_even_with_largest_logit() -> None:
+    logits = jnp.zeros((256, len(TOKENS)), dtype=jnp.float32).at[:, KarelProgramEnv.pad_token_id].set(1e6)
+    actions, log_probs = act(logits, jax.random.key(19))
+    assert not np.any(np.asarray(actions) == KarelProgramEnv.pad_token_id)
+    np.testing.assert_allclose(log_probs, -np.log(len(TOKENS) - 1), rtol=1e-6)
+
+
+def test_pad_labels_and_logits_have_no_loss_gradient(config: Config) -> None:
+    config = replace(config, entropy_coef=0.1, kl_coef=0.1)
+    logits = jax.random.normal(jax.random.key(7), (3, 2, len(TOKENS)))
+    mask = jnp.asarray([[True, True], [False, True], [False, True]])
+    batch = batch_from_logits(logits, mask, jnp.asarray([1.0, -1.0]))
+    # PAD labels remain ignored even if a caller supplies an all-true mask.
+    batch = batch._replace(mask=jnp.ones_like(mask))
+    reference = action_log_prob(logits + 0.2, batch.actions)
+
+    def loss_fn(values: jax.Array) -> jax.Array:
+        chex.assert_equal_shape((values, logits))
+        chex.assert_type(values, jnp.float32)
+        return objective(values, batch, config, reference)[0]
+
+    value, grads = jax.value_and_grad(loss_fn)(logits)
+    assert np.isfinite(value) and np.isfinite(grads).all()
+    np.testing.assert_array_equal(grads[1:, 0], 0)
+    np.testing.assert_array_equal(grads[..., KarelProgramEnv.pad_token_id], 0)
+    # The actual terminal m) prediction still contributes a policy gradient.
+    assert float(grads[0, 0, KarelProgramEnv.terminal_token_id]) != 0
+    changed = logits.at[..., KarelProgramEnv.pad_token_id].set(1e6)
+    np.testing.assert_allclose(loss_fn(changed), value, atol=1e-6)
 
 
 def test_config_and_lr_schedule(config: Config) -> None:

@@ -3,12 +3,13 @@
 Initialize through __call__(initial, target, tokens), with states [B,H,W,6]
 and teacher-forced token IDs [T,B]. The context predicts the first token;
 each supplied token predicts the next. Output logits are [T+1,B,len(TOKENS)].
-For a reference program p without EOS, use p as input and p + [EOS] as labels.
-Mask padded labels in the training loss.
+For a complete reference program p ending in m), use p[:-1] as input and p as
+labels. Batch with the dedicated <pad> ID and mask padded labels in the loss.
 
 For generation, prefill(initial, target) starts fresh and returns the carry and
 first-token logits. Then step(sampled_token, carry) returns next-token logits.
-Stop externally at EOS or the environment's token limit.
+Stop externally at m) or the environment's token limit. The trainer excludes
+PAD from sampling and loss probabilities; this model returns raw logits.
 """
 
 import chex
@@ -73,7 +74,7 @@ class KarelProgramModel(nn.Module):
         return self.context_norm(x)
 
     def __call__(self, initial: jax.Array, target: jax.Array, tokens: jax.Array) -> KarelModelOutput:
-        """Teacher forcing: [context, embed(tokens)] predicts [tokens, EOS]."""
+        """Teacher forcing: [context, embed(p[:-1])] predicts complete program p."""
         context = self.encode_pair(initial, target)
         chex.assert_shape(tokens, (None, context.shape[0]))
         chex.assert_type(tokens, jnp.int32)

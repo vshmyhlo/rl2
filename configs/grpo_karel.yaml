@@ -1,5 +1,5 @@
 seed: 1
-total_updates: 100000 # Rollout batches; TensorBoard steps count emitted tokens, including EOS
+total_updates: 100000 # Rollout batches; TensorBoard steps include terminal m), exclude PAD
 num_tasks: 8 # Sampled pairs per rollout
 group_size: 8 # Independent program samples for each pair
 num_minibatches: 4 # Must divide num_tasks * group_size; keep whole programs together
@@ -25,7 +25,7 @@ env:
   max_markers: 10
   max_depth: 2
   max_statements: 3
-  max_program_tokens: 128
+  max_program_tokens: 128 # Includes terminal m); PAD is used only for batching
   max_execution_steps: 256
   max_sampling_attempts: 1000
   # Terminal reward = clip(1 - D(final,target) / D(initial,target), -1, 1).
@@ -33,4 +33,4 @@ env:
   position_weight: 1.0 # Manhattan distance (ignores intervening walls)
   orientation_weight: 1.0 # 1 for any wrong heading, 0 for a match
   marker_weight: 1.0 # Sum of absolute marker-count errors across all cells
-  # Invalid programs / execution-limit failures / missing EOS always receive -1.
+  # Invalid programs / execution-limit failures / missing m) always receive -1.

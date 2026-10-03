@@ -138,18 +138,18 @@ def test_excessive_nesting_is_rejected_before_execution(world: State) -> None:
         execute(body, world)
 
 
-def test_reset_pair_and_eos_only_evaluation(fixed_env: KarelProgramEnv) -> None:
+def test_reset_pair_and_terminal_only_evaluation(fixed_env: KarelProgramEnv) -> None:
     initial, target = fixed_env.reset()
     assert initial.shape == target.shape == (5, 6, 6)
     assert initial.dtype == target.dtype == np.int32
-    for token in ["DEF", "run", "m(", "move", "m)"]:
+    for token in ["DEF", "run", "m(", "move"]:
         assert fixed_env.step(fixed_env.token_to_id[token]) == (None, 0.0, False, False, {})
-    assert fixed_env.step(fixed_env.eos_token_id) == (None, 1.0, True, False, {"success": True, "error": None})
+    assert fixed_env.step(fixed_env.terminal_token_id) == (None, 1.0, True, False, {"success": True, "error": None})
 
 
 def test_equivalent_program_gets_full_reward(fixed_env: KarelProgramEnv) -> None:
     fixed_env.reset()
-    result = submit(fixed_env, ["DEF", "run", "m(", "turnLeft", "turnRight", "move", "m)", "<eos>"])
+    result = submit(fixed_env, ["DEF", "run", "m(", "turnLeft", "turnRight", "move", "m)"])
     assert result == (None, 1.0, True, False, {"success": True, "error": None})
 
 
@@ -158,17 +158,17 @@ def test_target_matching_checks_heading_markers_and_position(
     fixed_env: KarelProgramEnv, body: str, reward: float
 ) -> None:
     fixed_env.reset()
-    result = submit(fixed_env, f"DEF run m( {body} m) <eos>".split())
+    result = submit(fixed_env, f"DEF run m( {body} m)".split())
     assert result == (None, reward, True, False, {"success": False, "error": None})
 
 
 @pytest.mark.parametrize(
     "program,reason",
     [
-        ("<eos>", "syntax_error"),
-        ("DEF run m( move <eos>", "syntax_error"),
-        ("DEF run m( pickMarker pickMarker m) <eos>", "runtime_error"),
-        ("DEF run m( WHILE c( markersPresent c) w( turnLeft w) m) <eos>", "execution_limit"),
+        ("m)", "syntax_error"),
+        ("DEF run m( WHILE c( frontIsClear c) w( move m)", "syntax_error"),
+        ("DEF run m( pickMarker pickMarker m)", "runtime_error"),
+        ("DEF run m( WHILE c( markersPresent c) w( turnLeft w) m)", "execution_limit"),
     ],
 )
 def test_failed_programs_terminate_with_penalty(fixed_env: KarelProgramEnv, program: str, reason: str) -> None:
@@ -181,7 +181,7 @@ def test_observations_cannot_mutate_private_task(fixed_env: KarelProgramEnv) -> 
     pair = fixed_env.reset()
     pair.initial.fill(0)
     pair.target.fill(0)
-    result = submit(fixed_env, ["DEF", "run", "m(", "move", "m)", "<eos>"])
+    result = submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])
     assert result[1] == 1.0
 
 
@@ -189,18 +189,18 @@ def test_reset_discards_partial_program(fixed_env: KarelProgramEnv) -> None:
     fixed_env.reset()
     submit(fixed_env, ["IF", "move"])
     fixed_env.reset()
-    assert submit(fixed_env, ["DEF", "run", "m(", "move", "m)", "<eos>"])[1] == 1.0
+    assert submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])[1] == 1.0
 
 
-def test_token_limit_and_eos_boundary(fixed_env: KarelProgramEnv) -> None:
-    # The fixed reference uses five program tokens plus EOS, exactly the limit.
-    env = KarelProgramEnv(KarelConfig(max_program_tokens=6))
+def test_token_limit_and_terminal_boundary(fixed_env: KarelProgramEnv) -> None:
+    # The fixed reference uses five tokens including m), exactly the limit.
+    env = KarelProgramEnv(KarelConfig(max_program_tokens=5))
     env.reset()
-    assert submit(env, ["DEF", "run", "m(", "move", "m)", "<eos>"])[1] == 1.0
+    assert submit(env, ["DEF", "run", "m(", "move", "m)"])[1] == 1.0
     env.reset()
-    assert submit(env, ["move"] * 6) == (None, -1.0, False, True, {"success": False, "error": "token_limit"})
+    assert submit(env, ["move"] * 5) == (None, -1.0, False, True, {"success": False, "error": "token_limit"})
     with pytest.raises(gym.error.ResetNeeded):
-        env.step(env.eos_token_id)
+        env.step(env.terminal_token_id)
 
 
 def test_episode_lifecycle_and_invalid_action(fixed_env: KarelProgramEnv) -> None:
@@ -209,19 +209,29 @@ def test_episode_lifecycle_and_invalid_action(fixed_env: KarelProgramEnv) -> Non
     with pytest.raises(gym.error.ResetNeeded):
         _ = fixed_env.reference_program
     fixed_env.reset()
-    for invalid in (-1, len(fixed_env.tokens), 1.5, True, "move"):
+    for invalid in (-1, len(fixed_env.tokens), 1.5, True, "move", fixed_env.pad_token_id):
         with pytest.raises(gym.error.InvalidAction):
             fixed_env.step(invalid)
-    fixed_env.step(np.int64(fixed_env.eos_token_id))
+    fixed_env.step(np.int64(fixed_env.terminal_token_id))
     with pytest.raises(gym.error.ResetNeeded):
         fixed_env.step(0)
+
+
+def test_pad_is_reserved_and_cannot_change_program(fixed_env: KarelProgramEnv) -> None:
+    assert "<eos>" not in fixed_env.tokens
+    assert fixed_env.pad_token_id != fixed_env.terminal_token_id
+    fixed_env.reset()
+    assert fixed_env.reference_program[-1] == fixed_env.terminal_token_id
+    with pytest.raises(gym.error.InvalidAction, match="PAD"):
+        fixed_env.step(fixed_env.pad_token_id)
+    assert submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])[1] == 1.0
 
 
 @pytest.mark.parametrize("seed", range(20))
 def test_sampled_task_is_reachable_changed_and_within_limits(seed: int) -> None:
     config = KarelConfig()
     task = sample_task(np.random.default_rng(seed), config)
-    assert len(task.program) + 1 <= config.max_program_tokens
+    assert len(task.program) <= config.max_program_tokens
     assert not np.array_equal(task.initial, task.target)
     np.testing.assert_array_equal(execute_program(task.program, task.initial), task.target)
     assert np.all(task.initial[[0, -1], :, 4] == 1)
@@ -269,7 +279,7 @@ def test_sampling_failure_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
         {"max_depth": -1},
         {"max_depth": 33},
         {"max_statements": 0},
-        {"max_program_tokens": 5},
+        {"max_program_tokens": 4},
         {"max_execution_steps": 0},
         {"wall_probability": 1.1},
         {"marker_probability": -0.1},
@@ -355,13 +365,13 @@ def test_minimum_task_and_submission_budgets(seed: int) -> None:
             wall_probability=1.0,
             marker_probability=1.0,
             max_markers=1,
-            max_program_tokens=6,
+            max_program_tokens=5,
             max_execution_steps=1,
         )
     )
     initial, target = env.reset(seed=seed)
     assert not np.array_equal(initial, target)
-    assert len(env.reference_program) == 6
+    assert len(env.reference_program) == 5
     for token_id in env.reference_program:
         result = env.step(token_id)
     assert result == (None, 1.0, True, False, {"success": True, "error": None})
@@ -380,7 +390,7 @@ def test_failed_reset_invalidates_old_task_and_can_recover(monkeypatch: pytest.M
         with pytest.raises(RuntimeError, match="Sampling failed"):
             env.reset()
     with pytest.raises(gym.error.ResetNeeded):
-        env.step(env.eos_token_id)
+        env.step(env.terminal_token_id)
     with pytest.raises(gym.error.ResetNeeded):
         _ = env.reference_program
     env.reset(seed=2)
@@ -415,9 +425,9 @@ def test_terminal_progress_reward(
     monkeypatch.setattr("rl2.karel.sample_task", fixed_task)
     env = KarelProgramEnv()
     env.reset()
-    for token in f"DEF run m( {body} m)".split():
+    for token in f"DEF run m( {body}".split():
         assert env.step(env.token_to_id[token]) == (None, 0.0, False, False, {})
-    assert env.step(env.eos_token_id) == (None, reward, True, False, {"success": success, "error": error})
+    assert env.step(env.terminal_token_id) == (None, reward, True, False, {"success": success, "error": error})
 
 
 def test_distance_weights_and_marker_counts(world: State) -> None:

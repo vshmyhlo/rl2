@@ -2,7 +2,7 @@
 
 Each rollout samples group_size programs per initial/target pair. Advantages
 are normalized within each pair's group; the clipped objective averages tokens
-within programs, then programs within the minibatch. EOS is included, padding
+within programs, then programs within the minibatch. Terminal m) is included, PAD
 is excluded, and token-limit failures receive the environment's -1 penalty.
 
 This sketch starts from random weights with no grammar mask or supervised
@@ -90,9 +90,9 @@ class Config:
 class GRPOBatch(NamedTuple):
     initial: Array  # [B,H,W,6], grouped by task during collection.
     target: Array
-    actions: Array  # [T,B], including EOS; padded with EOS afterwards.
+    actions: Array  # [T,B], including terminal m); padded with <pad> afterwards.
     old_log_probs: Array
-    mask: Array  # [T,B], includes the first EOS or every token on truncation.
+    mask: Array  # [T,B], includes terminal m) or every token on truncation, excludes PAD.
     advantages: Array  # [B], computed before shuffling/minibatching.
 
 
@@ -120,11 +120,21 @@ def group_advantages(rewards: Array) -> jax.Array:
     return (rewards - rewards.mean(axis=1, keepdims=True)) / (rewards.std(axis=1, keepdims=True) + 1e-8)
 
 
+def generation_logits(logits: jax.Array) -> jax.Array:
+    """Exclude the batching-only PAD symbol from every policy distribution."""
+    chex.assert_shape(logits, (*logits.shape[:-1], len(TOKENS)))
+    chex.assert_type(logits, jnp.float32)
+    return logits.at[..., KarelProgramEnv.pad_token_id].set(-jnp.inf)
+
+
 def action_log_prob(logits: jax.Array, actions: Array) -> jax.Array:
     chex.assert_shape(logits, (*actions.shape, len(TOKENS)))
     chex.assert_type(logits, jnp.float32)
     chex.assert_type(actions, jnp.int32)
-    return jnp.take_along_axis(jax.nn.log_softmax(logits), actions[..., None], axis=-1)[..., 0]
+    log_probs = jax.nn.log_softmax(generation_logits(logits))
+    selected = jnp.take_along_axis(log_probs, actions[..., None], axis=-1)[..., 0]
+    # Padded labels have no probability/loss contribution; avoid -inf arithmetic.
+    return jnp.where(actions == KarelProgramEnv.pad_token_id, 0.0, selected)
 
 
 @jax.jit
@@ -141,7 +151,7 @@ def decode_step(state: TrainState, actions: Array, carry: Mamba3StackCarry) -> t
 def act(logits: jax.Array, key: jax.Array) -> tuple[jax.Array, jax.Array]:
     chex.assert_shape(logits, (None, len(TOKENS)))
     chex.assert_type(logits, jnp.float32)
-    actions = jax.random.categorical(key, logits).astype(jnp.int32)
+    actions = jax.random.categorical(key, generation_logits(logits)).astype(jnp.int32)
     return actions, action_log_prob(logits, actions)
 
 
@@ -157,7 +167,7 @@ def collect_rollout(
     initial = np.stack([pair.initial for pair in pairs])
     target = np.stack([pair.target for pair in pairs])
     shape = (config.env.max_program_tokens, batch_size)
-    actions = np.full(shape, KarelProgramEnv.eos_token_id, dtype=np.int32)
+    actions = np.full(shape, KarelProgramEnv.pad_token_id, dtype=np.int32)
     old_log_probs = np.zeros(shape, dtype=np.float32)
     mask = np.zeros(shape, dtype=np.bool_)
     rewards = np.zeros(batch_size, dtype=np.float32)
@@ -206,20 +216,25 @@ def objective(
     chex.assert_shape(batch.advantages, (batch.actions.shape[1],))
     chex.assert_type((batch.old_log_probs, batch.advantages), jnp.float32)
     chex.assert_type(batch.mask, jnp.bool_)
+    mask = batch.mask & (batch.actions != KarelProgramEnv.pad_token_id)
     log_probs = action_log_prob(logits, batch.actions)
 
     def average(values: jax.Array) -> jax.Array:
         chex.assert_equal_shape((values, batch.mask))
         chex.assert_type(values, jnp.float32)
-        return (jnp.where(batch.mask, values, 0).sum(axis=0) / jnp.maximum(batch.mask.sum(axis=0), 1)).mean()
+        return (jnp.where(mask, values, 0).sum(axis=0) / jnp.maximum(mask.sum(axis=0), 1)).mean()
 
-    log_ratio = jnp.where(batch.mask, log_probs - jax.lax.stop_gradient(batch.old_log_probs), 0.0)
+    log_ratio = jnp.where(mask, log_probs - jax.lax.stop_gradient(batch.old_log_probs), 0.0)
     ratio = jnp.exp(log_ratio)
     advantage = jax.lax.stop_gradient(batch.advantages)[None]
     policy_loss = -average(
         jnp.minimum(ratio * advantage, jnp.clip(ratio, 1 - config.clip_coef, 1 + config.clip_coef) * advantage)
     )
-    entropy = average(-(jax.nn.softmax(logits) * jax.nn.log_softmax(logits)).sum(axis=-1))
+    policy_logits = generation_logits(logits)
+    # PAD has probability zero. Replace its log-probability before multiplying
+    # to avoid 0 * -inf and NaN gradients in the entropy term.
+    entropy_log_probs = jax.nn.log_softmax(policy_logits).at[..., KarelProgramEnv.pad_token_id].set(0.0)
+    entropy = average(-(jax.nn.softmax(policy_logits) * entropy_log_probs).sum(axis=-1))
     approx_kl = average(jnp.expm1(log_ratio) - log_ratio)
     clip_fraction = average((jnp.abs(ratio - 1) > config.clip_coef).astype(jnp.float32))
     reference_kl = jnp.asarray(0.0, dtype=jnp.float32)
@@ -228,7 +243,7 @@ def objective(
             raise ValueError("Reference log probabilities are required when kl_coef > 0")
         chex.assert_equal_shape((reference_log_probs, batch.actions))
         chex.assert_type(reference_log_probs, jnp.float32)
-        delta = jnp.where(batch.mask, jax.lax.stop_gradient(reference_log_probs) - log_probs, 0.0)
+        delta = jnp.where(mask, jax.lax.stop_gradient(reference_log_probs) - log_probs, 0.0)
         reference_kl = average(jnp.expm1(delta) - delta)
     loss = policy_loss - config.entropy_coef * entropy + config.kl_coef * reference_kl
     return loss, (policy_loss, entropy, approx_kl, clip_fraction, reference_kl)
@@ -248,7 +263,7 @@ def update(
         reference_log_probs = action_log_prob(reference_logits, batch.actions)
 
     def loss_fn(params: optax.Params) -> tuple[jax.Array, Metrics]:
-        # Context predicts action[0]; action[t-1] predicts action[t], including EOS.
+        # Context predicts action[0]; action[t-1] predicts action[t], including m).
         _, logits = state.apply_fn({"params": params}, batch.initial, batch.target, batch.actions[:-1])
         return objective(logits, batch, config, reference_log_probs)
 

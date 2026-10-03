@@ -2,10 +2,11 @@
 
 States are int32 arrays shaped (height, width, 6): four one-hot robot headings
 (north, east, south, west), walls, and marker counts. Actions are DSL token IDs;
-EOS executes the complete program against the initial state. This is a plain
+The outer closing token m) executes the program against the initial state. This is a plain
 class, not a Gymnasium Env: step observations deliberately are always None.
 Terminal reward is normalized progress toward the target, clipped to [-1, 1];
-invalid programs and missing EOS receive -1. Intermediate rewards are zero.
+invalid programs and missing m) receive -1. PAD is reserved for batching.
+Intermediate rewards are zero.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ type StepResult = tuple[None, float, bool, bool, dict[str, object]]
 ACTIONS = ("move", "turnLeft", "turnRight", "pickMarker", "putMarker")
 PREDICATES = ("frontIsClear", "leftIsClear", "rightIsClear", "markersPresent", "noMarkersPresent")
 TOKENS = (
-    "<eos>",
+    "<pad>",
     "DEF",
     "run",
     "m(",
@@ -69,7 +70,7 @@ class KarelConfig:
     max_markers: int = 10
     max_depth: int = 2
     max_statements: int = 3
-    max_program_tokens: int = 128  # Includes EOS.
+    max_program_tokens: int = 128  # Includes the terminal m); excludes padding.
     max_execution_steps: int = 256  # Statements and loop-condition checks.
     max_sampling_attempts: int = 1000
     position_weight: float = 1.0  # Weight per cell of Manhattan robot-position error.
@@ -91,8 +92,8 @@ class KarelConfig:
             chex.assert_scalar_positive(value)
         if self.height < 3 or self.width < 3:
             raise ValueError("The grid must include an interior cell and its border walls")
-        if self.max_program_tokens < 6:
-            raise ValueError("At least six tokens are needed for DEF run m( action m) <eos>")
+        if self.max_program_tokens < 5:
+            raise ValueError("At least five tokens are needed for DEF run m( action m)")
         if type(self.max_depth) is not int:
             raise TypeError("max_depth must be an integer")
         chex.assert_scalar_in(self.max_depth, 0, 32)
@@ -109,7 +110,7 @@ class KarelConfig:
 class KarelTask:
     initial: State
     target: State
-    program: tuple[str, ...]  # Reference program, without EOS.
+    program: tuple[str, ...]  # Complete reference program, including terminal m).
 
 
 def state_distance(state: State, target: State, config: KarelConfig) -> float:
@@ -242,7 +243,7 @@ def _parse(tokens: Sequence[str]) -> tuple[_Statement, ...]:
 
 
 def execute_program(tokens: Sequence[str], initial: State, *, max_steps: int = 256, max_markers: int = 10) -> State:
-    """Execute DSL tokens (without EOS), returning a new state or raising KarelProgramError.
+    """Execute a complete program ending in m), returning a new state or raising KarelProgramError.
 
     Every statement and while-condition check consumes execution budget, including
     loops whose bodies do nothing. Invalid moves/picks/puts fail the whole program.
@@ -335,8 +336,8 @@ def _sample_program(rng: np.random.Generator, config: KarelConfig) -> tuple[str,
 
     def emit(*parts: str) -> None:
         tokens.extend(parts)
-        if len(tokens) >= config.max_program_tokens:
-            raise KarelProgramError("token_limit", "Sampled program is too long to submit with EOS")
+        if len(tokens) > config.max_program_tokens:
+            raise KarelProgramError("token_limit", "Sampled program exceeds the token limit")
 
     def block(depth: int) -> None:
         for _ in range(int(rng.integers(1, config.max_statements + 1))):
@@ -407,16 +408,17 @@ class KarelProgramEnv:
     """Generate one program token per step, receiving the task only at reset.
 
     reset() returns KarelPair(initial, target), without an info wrapper.
-    step() returns (None, reward, terminated, truncated, info). EOS terminates
+    step() returns (None, reward, terminated, truncated, info). The token m) terminates
     and scores progress_reward(); info['success'] still means exact state equality.
-    Invalid programs receive -1. Exhausting max_program_tokens without EOS
-    truncates with -1 and no evaluation, even if the prefix is a complete solution.
+    Invalid programs receive -1. Exhausting max_program_tokens without m)
+    truncates with -1 and no evaluation. PAD is not a valid environment action.
     No partial execution credit is given on errors or execution-budget failures.
     """
 
     tokens = TOKENS
     token_to_id = TOKEN_TO_ID
-    eos_token_id = TOKEN_TO_ID["<eos>"]
+    terminal_token_id = TOKEN_TO_ID["m)"]
+    pad_token_id = TOKEN_TO_ID["<pad>"]
 
     def __init__(self, config: KarelConfig | None = None) -> None:
         self.config = config if config is not None else KarelConfig()
@@ -428,10 +430,10 @@ class KarelProgramEnv:
 
     @property
     def reference_program(self) -> tuple[int, ...]:
-        """Privileged supervision/debugging solution, including EOS; never in observations."""
+        """Privileged supervision/debugging solution ending in m); never in observations."""
         if self._task is None:
             raise gym.error.ResetNeeded("Call reset() before requesting a reference program")
-        return tuple(TOKEN_TO_ID[token] for token in self._task.program) + (self.eos_token_id,)
+        return tuple(TOKEN_TO_ID[token] for token in self._task.program)
 
     def reset(self, *, seed: int | None = None) -> KarelPair:
         self._needs_reset = True
@@ -454,7 +456,10 @@ class KarelProgramEnv:
             or not self.action_space.contains(action)
         ):
             raise gym.error.InvalidAction(f"Expected a token ID in [0, {len(TOKENS) - 1}], got {action!r}")
-        if int(action) == self.eos_token_id:
+        if int(action) == self.pad_token_id:
+            raise gym.error.InvalidAction("PAD is reserved for batching, not program generation")
+        self._program.append(TOKENS[int(action)])
+        if int(action) == self.terminal_token_id:
             self._needs_reset = True
             try:
                 output = execute_program(
@@ -468,7 +473,6 @@ class KarelProgramEnv:
             success = bool(np.array_equal(output, self._task.target))
             reward = progress_reward(self._task.initial, output, self._task.target, self.config)
             return None, reward, True, False, {"success": success, "error": None}
-        self._program.append(TOKENS[int(action)])
         if len(self._program) >= self.config.max_program_tokens:
             self._needs_reset = True
             return None, -1.0, False, True, {"success": False, "error": "token_limit"}
