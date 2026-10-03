@@ -5,10 +5,13 @@ are normalized within each pair's group; the clipped objective averages tokens
 within programs, then programs within the minibatch. Terminal m) is included, PAD
 is excluded, and syntax/token-limit failures receive a syntax edit-distance score.
 
-This sketch starts from random weights with no grammar mask or supervised
-warmup. Terminal rewards sum syntax, runtime, and distance terms, plus a +1
-exact-success and weighted trajectory bonuses, minus length and execution costs. Exact success is also logged separately. Equal-reward groups have zero advantages; syntax errors can
-now earn different rewards according to their minimum repair costs.
+This sketch starts from random weights without supervised warmup. Optional
+grammar masking (enabled in the YAML) restricts logits to syntactically valid
+continuations that can finish within the token budget. Sampling, training, and
+reference probabilities use the same masks. Runtime failures remain possible.
+Terminal rewards sum syntax, runtime, and distance terms, plus exact-success
+and trajectory bonuses, minus length and execution costs. Exact success is also
+logged separately. Equal-reward groups have zero advantages.
 An optional KL penalty uses a frozen copy of the initial model as reference.
 See https://arxiv.org/abs/2402.03300 for the GRPO objective.
 """
@@ -33,6 +36,7 @@ from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
 from rl2.karel import ACTIONS, REWARD_COMPONENTS, TOKENS, KarelConfig, KarelProgramEnv
+from rl2.karel_grammar import grammar_step, initial_grammar_state, mask_grammar_logits, mask_sequence_logits
 from rl2.karel_model import BackboneType, KarelModelCarry, KarelModelOutput, KarelProgramModel
 from rl2.transformer import AttentionImplementation
 
@@ -63,6 +67,7 @@ class Config:
     target_kl: float | None = 0.02
     entropy_coef: float = 0.0
     kl_coef: float = 0.0  # Zero disables the frozen-reference KL penalty.
+    grammar_masking: bool = False  # YAML enables syntax- and token-budget-aware policy masking.
     max_grad_norm: float = 0.5
     log_dir: str = "runs"
     log_program_interval: int = 10  # First rollout, then every N rollouts.
@@ -74,6 +79,8 @@ class Config:
             raise ValueError("backbone_type must be 'mamba3' or 'transformer'")
         if type(self.bf16) is not bool:
             raise TypeError("bf16 must be a boolean")
+        if type(self.grammar_masking) is not bool:
+            raise TypeError("grammar_masking must be a boolean")
         if self.attention_implementation not in ("xla", "cudnn"):
             raise ValueError("attention_implementation must be 'xla' or 'cudnn'")
         if self.attention_implementation == "cudnn" and (self.backbone_type != "transformer" or not self.bf16):
@@ -201,8 +208,11 @@ def collect_rollout(
     active = np.ones(batch_size, dtype=np.bool_)
     errors: list[str | None] = [None] * batch_size
     carry, logits = prefill(state, initial, target)
+    grammar = initial_grammar_state(batch_size, config.env.max_program_tokens) if config.grammar_masking else None
     for t in range(shape[0]):
         key, sample_key = jax.random.split(key)
+        if grammar is not None:
+            logits = mask_grammar_logits(logits, grammar)
         sampled, log_probs = jax.device_get(act(logits, sample_key))
         mask[t] = active
         actions[t, active] = sampled[active]
@@ -218,6 +228,8 @@ def collect_rollout(
                     values[index] = info[f"reward_{name}"]
         if not active.any():
             break
+        if grammar is not None:
+            grammar = grammar_step(grammar, jnp.asarray(actions[t]))
         carry, logits = decode_step(state, actions[t], carry)
     grouped_rewards = rewards.reshape((config.num_tasks, config.group_size))
     advantages = np.asarray(group_advantages(grouped_rewards)).reshape(-1)
@@ -317,6 +329,8 @@ def objective(
     chex.assert_type((batch.old_log_probs, batch.advantages), jnp.float32)
     chex.assert_type(batch.mask, jnp.bool_)
     mask = batch.mask & (batch.actions != KarelProgramEnv.pad_token_id)
+    if config.grammar_masking:
+        logits = mask_sequence_logits(logits, jnp.asarray(batch.actions), config.env.max_program_tokens)
     log_probs = action_log_prob(logits, batch.actions)
 
     def average(values: jax.Array) -> jax.Array:
@@ -331,9 +345,9 @@ def objective(
         jnp.minimum(ratio * advantage, jnp.clip(ratio, 1 - config.clip_coef, 1 + config.clip_coef) * advantage)
     )
     policy_logits = generation_logits(logits)
-    # PAD has probability zero. Replace its log-probability before multiplying
-    # to avoid 0 * -inf and NaN gradients in the entropy term.
-    entropy_log_probs = jax.nn.log_softmax(policy_logits).at[..., KarelProgramEnv.pad_token_id].set(0.0)
+    # PAD and grammar-invalid tokens have probability zero. Replace their log
+    # probabilities before multiplying to avoid 0 * -inf and NaN gradients.
+    entropy_log_probs = jnp.where(jnp.isfinite(policy_logits), jax.nn.log_softmax(policy_logits), 0.0)
     entropy = average(-(jax.nn.softmax(policy_logits) * entropy_log_probs).sum(axis=-1))
     approx_kl = average(jnp.expm1(log_ratio) - log_ratio)
     clip_fraction = average((jnp.abs(ratio - 1) > config.clip_coef).astype(jnp.float32))
@@ -360,6 +374,10 @@ def update(
         _, reference_logits = state.apply_fn(
             {"params": reference_params}, batch.initial, batch.target, batch.actions[:-1]
         )
+        if config.grammar_masking:
+            reference_logits = mask_sequence_logits(
+                reference_logits, jnp.asarray(batch.actions), config.env.max_program_tokens
+            )
         reference_log_probs = action_log_prob(reference_logits, batch.actions)
 
     def loss_fn(params: optax.Params) -> tuple[jax.Array, Metrics]:

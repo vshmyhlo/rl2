@@ -10,8 +10,9 @@ For generation, prefill(initial, target) starts fresh and returns the carry and
 first-token logits. Then step(sampled_token, carry) returns next-token logits.
 Stop externally at m) or the environment's token limit. The trainer excludes
 PAD from sampling and loss probabilities; this model returns raw logits.
-The output head starts at zero, giving a uniform prior over the 50 program
-tokens after PAD masking. The encoder and backbone retain random initialization.
+The output head starts at zero, giving a uniform prior over tokens permitted by
+the trainer's masks (all 50 program tokens if only PAD is masked). The encoder
+and backbone retain random initialization.
 """
 
 from typing import Literal

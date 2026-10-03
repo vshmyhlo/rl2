@@ -17,6 +17,7 @@ anneal_lr: true
 clip_coef: 0.2
 target_kl: 0.02 # Old-policy KL early stopping; null disables
 entropy_coef: 0.01
+grammar_masking: true # Mask invalid next tokens and reserve enough tokens to close every block
 kl_coef: 0.0 # Optional penalty against the frozen initial model; no reference forward when zero
 max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/grpo_karel

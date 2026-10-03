@@ -26,6 +26,7 @@ from rl2.grpo import (
     update,
 )
 from rl2.karel import TOKENS, KarelConfig, KarelProgramEnv, KarelTask, StepResult
+from rl2.karel_grammar import mask_sequence_logits
 from rl2.karel_model import KarelProgramModel
 
 
@@ -408,6 +409,7 @@ def test_config_and_lr_schedule(config: Config) -> None:
     assert loaded.update_epochs == 1
     assert loaded.learning_rate == 0.0001
     assert loaded.entropy_coef == 0.01
+    assert loaded.grammar_masking is True
     schedule = learning_rate_schedule(config)
     np.testing.assert_allclose(schedule(0), config.learning_rate)
     np.testing.assert_allclose(schedule(config.total_updates), 0)
@@ -520,3 +522,47 @@ def test_program_format_preserves_malformed_and_truncated_tokens(program: str) -
     formatted = format_program(tokens)
     assert formatted.split() == tokens
     assert all(len(line) <= 100 for line in formatted.splitlines())
+
+
+def test_grammar_masked_rollout_probabilities_gradients_and_reference_kl(config: Config, state: TrainState) -> None:
+    config = replace(config, grammar_masking=True, entropy_coef=0.01, kl_coef=0.01)
+    head = state.params["head"]
+    state = state.replace(
+        params={
+            **state.params,
+            "head": {
+                **head,
+                "kernel": jax.random.normal(jax.random.key(29), head["kernel"].shape) * 0.1,
+            },
+        }
+    )
+    envs = [KarelProgramEnv(config.env) for _ in range(config.num_tasks * config.group_size)]
+    batch, _, diagnostics, _ = collect_rollout(state, envs, np.random.default_rng(4), jax.random.key(3), config)
+    assert diagnostics["charts/syntax_error_rate"] == 0.0
+    assert diagnostics["charts/truncation_rate"] == 0.0
+    _, logits = state.apply_fn({"params": state.params}, batch.initial, batch.target, batch.actions[:-1])
+    masked = mask_sequence_logits(logits, jnp.asarray(batch.actions), config.env.max_program_tokens)
+    reference = action_log_prob(masked, batch.actions)
+    np.testing.assert_allclose(np.asarray(reference)[batch.mask], batch.old_log_probs[batch.mask], rtol=3e-5, atol=3e-6)
+    batch = batch._replace(advantages=jnp.asarray([1.0, -1.0]))
+
+    def loss(predictions: jax.Array) -> jax.Array:
+        chex.assert_equal_shape((predictions, logits))
+        chex.assert_type(predictions, jnp.float32)
+        return objective(predictions, batch, config, reference)[0]
+
+    value, grads = jax.jit(jax.value_and_grad(loss))(logits)
+    assert np.isfinite(value) and np.isfinite(grads).all()
+    np.testing.assert_array_equal(np.asarray(grads)[~np.isfinite(np.asarray(masked))], 0.0)
+    next_state, metrics = update(state, batch, config, state.params)
+    assert int(next_state.step) == 1
+    assert all(np.isfinite(metric) for metric in metrics)
+    np.testing.assert_allclose(metrics[2], 0.0, atol=1e-6)
+    np.testing.assert_allclose(metrics[4], 0.0, atol=1e-6)
+    assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(next_state.params))
+
+
+def test_grammar_masked_training_smoke(config: Config, tmp_path: Path) -> None:
+    result = train(replace(config, grammar_masking=True, entropy_coef=0.01, bf16=True, log_dir=str(tmp_path)))
+    assert int(result.step) == 1
+    assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(result.params))
