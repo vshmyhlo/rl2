@@ -115,6 +115,31 @@ def test_invalid_robot_actions_fail(world: State, body: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "prefix,suffix,budget,reason",
+    [
+        ("move turnLeft move", "move", 256, "runtime_error"),
+        ("move pickMarker", "pickMarker", 256, "runtime_error"),
+        ("move REPEAT R=9 r( putMarker r)", "putMarker", 256, "runtime_error"),
+        ("move turnLeft putMarker", "move", 3, "execution_limit"),
+        ("move", "WHILE c( frontIsClear c) w( move w)", 3, "execution_limit"),
+    ],
+)
+def test_execution_error_exposes_last_valid_state(
+    world: State, prefix: str, suffix: str, budget: int, reason: str
+) -> None:
+    before = world.copy()
+    expected = execute(prefix, world)
+    with pytest.raises(KarelProgramError) as error:
+        execute(f"{prefix} {suffix}", world, max_steps=budget)
+    assert error.value.reason == reason
+    assert error.value.partial_state is not None
+    np.testing.assert_array_equal(error.value.partial_state, expected)
+    np.testing.assert_array_equal(world, before)
+    error.value.partial_state.fill(0)
+    np.testing.assert_array_equal(world, before)
+
+
+@pytest.mark.parametrize(
     "program",
     [
         "",
@@ -130,6 +155,7 @@ def test_invalid_syntax_is_rejected(world: State, program: str) -> None:
     with pytest.raises(KarelProgramError) as error:
         execute_program(program.split(), world)
     assert error.value.reason == "syntax_error"
+    assert error.value.partial_state is None
 
 
 def test_excessive_nesting_is_rejected_before_execution(world: State) -> None:
@@ -144,16 +170,16 @@ def test_reset_pair_and_terminal_only_evaluation(fixed_env: KarelProgramEnv) -> 
     assert initial.dtype == target.dtype == np.int32
     for token in ["DEF", "run", "m(", "move"]:
         assert fixed_env.step(fixed_env.token_to_id[token]) == (None, 0.0, False, False, {})
-    assert fixed_env.step(fixed_env.terminal_token_id) == (None, 1.0, True, False, {"success": True, "error": None})
+    assert fixed_env.step(fixed_env.terminal_token_id) == (None, 3.0, True, False, {"success": True, "error": None})
 
 
 def test_equivalent_program_gets_full_reward(fixed_env: KarelProgramEnv) -> None:
     fixed_env.reset()
     result = submit(fixed_env, ["DEF", "run", "m(", "turnLeft", "turnRight", "move", "m)"])
-    assert result == (None, 1.0, True, False, {"success": True, "error": None})
+    assert result == (None, 3.0, True, False, {"success": True, "error": None})
 
 
-@pytest.mark.parametrize("body,reward", [("move turnLeft", 0.0), ("move pickMarker", 0.0), ("turnLeft", -1.0)])
+@pytest.mark.parametrize("body,reward", [("move turnLeft", 2.5), ("move pickMarker", 2.5), ("turnLeft", 2.0)])
 def test_target_matching_checks_heading_markers_and_position(
     fixed_env: KarelProgramEnv, body: str, reward: float
 ) -> None:
@@ -165,10 +191,10 @@ def test_target_matching_checks_heading_markers_and_position(
 @pytest.mark.parametrize(
     "program,reason,reward",
     [
-        ("m)", "syntax_error", -1.8),  # Four missing tokens.
-        ("DEF run m( WHILE c( frontIsClear c) w( move m)", "syntax_error", -1.5),  # Missing w).
-        ("DEF run m( pickMarker pickMarker m)", "runtime_error", -1.0),
-        ("DEF run m( WHILE c( markersPresent c) w( turnLeft w) m)", "execution_limit", -1.0),
+        ("m)", "syntax_error", 0.2),  # Four missing tokens.
+        ("DEF run m( WHILE c( frontIsClear c) w( move m)", "syntax_error", 0.5),  # Missing w).
+        ("DEF run m( pickMarker pickMarker m)", "runtime_error", 1.0),
+        ("DEF run m( WHILE c( markersPresent c) w( turnLeft w) m)", "execution_limit", 1.0),
     ],
 )
 def test_failed_program_rewards_distinguish_syntax(
@@ -184,23 +210,23 @@ def test_observations_cannot_mutate_private_task(fixed_env: KarelProgramEnv) -> 
     pair.initial.fill(0)
     pair.target.fill(0)
     result = submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])
-    assert result[1] == 1.0
+    assert result[1] == 3.0
 
 
 def test_reset_discards_partial_program(fixed_env: KarelProgramEnv) -> None:
     fixed_env.reset()
     submit(fixed_env, ["IF", "move"])
     fixed_env.reset()
-    assert submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])[1] == 1.0
+    assert submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])[1] == 3.0
 
 
 def test_token_limit_and_terminal_boundary(fixed_env: KarelProgramEnv) -> None:
     # The fixed reference uses five tokens including m), exactly the limit.
     env = KarelProgramEnv(KarelConfig(max_program_tokens=5))
     env.reset()
-    assert submit(env, ["DEF", "run", "m(", "move", "m)"])[1] == 1.0
+    assert submit(env, ["DEF", "run", "m(", "move", "m)"])[1] == 3.0
     env.reset()
-    assert submit(env, ["move"] * 5) == (None, -1.8, False, True, {"success": False, "error": "token_limit"})
+    assert submit(env, ["move"] * 5) == (None, 0.2, False, True, {"success": False, "error": "token_limit"})
     with pytest.raises(gym.error.ResetNeeded):
         env.step(env.terminal_token_id)
 
@@ -211,7 +237,7 @@ def test_incomplete_program_gets_syntax_credit_without_execution(fixed_env: Kare
     # Only m) is missing. The completed program would solve this task, but must
     # never be repaired and executed when determining the reward.
     result = submit(env, ["DEF", "run", "m(", "turnLeft", "turnRight", "move"])
-    assert result == (None, -1.5, False, True, {"success": False, "error": "token_limit"})
+    assert result == (None, 0.5, False, True, {"success": False, "error": "token_limit"})
 
 
 def test_episode_lifecycle_and_invalid_action(fixed_env: KarelProgramEnv) -> None:
@@ -235,7 +261,7 @@ def test_pad_is_reserved_and_cannot_change_program(fixed_env: KarelProgramEnv) -
     assert fixed_env.reference_program[-1] == fixed_env.terminal_token_id
     with pytest.raises(gym.error.InvalidAction, match="PAD"):
         fixed_env.step(fixed_env.pad_token_id)
-    assert submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])[1] == 1.0
+    assert submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])[1] == 3.0
 
 
 @pytest.mark.parametrize("seed", range(20))
@@ -262,7 +288,7 @@ def test_seed_reproduces_task_stream_and_reference_solves() -> None:
         for token_id in first.reference_program:
             observation, reward, terminated, truncated, info = first.step(token_id)
             assert observation is None
-        assert (reward, terminated, truncated, info) == (1.0, True, False, {"success": True, "error": None})
+        assert (reward, terminated, truncated, info) == (3.0, True, False, {"success": True, "error": None})
     assert len(pairs) == 10
 
 
@@ -385,7 +411,7 @@ def test_minimum_task_and_submission_budgets(seed: int) -> None:
     assert len(env.reference_program) == 5
     for token_id in env.reference_program:
         result = env.step(token_id)
-    assert result == (None, 1.0, True, False, {"success": True, "error": None})
+    assert result == (None, 3.0, True, False, {"success": True, "error": None})
 
 
 def test_failed_reset_invalidates_old_task_and_can_recover(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -407,20 +433,20 @@ def test_failed_reset_invalidates_old_task_and_can_recover(monkeypatch: pytest.M
     env.reset(seed=2)
     for token_id in env.reference_program:
         result = env.step(token_id)
-    assert result[1:4] == (1.0, True, False)
+    assert result[1:4] == (3.0, True, False)
 
 
 @pytest.mark.parametrize(
     "body,reward,success,error",
     [
-        ("move", 0.5, False, None),
-        ("turnLeft turnRight", 0.0, False, None),
-        ("turnLeft", -0.5, False, None),
-        ("turnLeft move putMarker", -1.0, False, None),
-        ("move move", 1.0, True, None),
-        ("move putMarker", 0.0, False, None),  # Undo progress by spoiling a correct cell.
-        ("move move pickMarker", 0.5, False, None),
-        ("move move move move", -1.0, False, "runtime_error"),  # No credit for a prefix reaching the target.
+        ("move", 2.75, False, None),
+        ("turnLeft turnRight", 2.5, False, None),
+        ("turnLeft", 2.25, False, None),
+        ("turnLeft move putMarker", 2.0, False, None),
+        ("move move", 3.0, True, None),
+        ("move putMarker", 2.5, False, None),  # Undo progress by spoiling a correct cell.
+        ("move move pickMarker", 2.75, False, None),
+        ("move move move move", 1.75, False, "runtime_error"),  # Latest state, not the earlier exact target.
     ],
 )
 def test_terminal_progress_reward(
@@ -441,6 +467,58 @@ def test_terminal_progress_reward(
     assert env.step(env.terminal_token_id) == (None, reward, True, False, {"success": success, "error": error})
 
 
+@pytest.mark.parametrize(
+    "action,markers,budget,reason",
+    [
+        ("pickMarker", 0, 256, "runtime_error"),
+        ("putMarker", 10, 256, "runtime_error"),
+        ("REPEAT R=0 r( move r) turnLeft", 1, 2, "execution_limit"),
+    ],
+)
+def test_runtime_score_uses_partial_progress(
+    world: State, monkeypatch: pytest.MonkeyPatch, action: str, markers: int, budget: int, reason: str
+) -> None:
+    world[2, 2, 5] = markers
+    target = execute("move move", world)
+
+    def fixed_task(rng: np.random.Generator, config: KarelConfig) -> KarelTask:
+        return KarelTask(world, target, ("DEF", "run", "m(", "move", "move", "m)"))
+
+    monkeypatch.setattr("rl2.karel.sample_task", fixed_task)
+    env = KarelProgramEnv(KarelConfig(max_execution_steps=budget))
+    env.reset()
+    result = submit(env, f"DEF run m( move {action} m)".split())
+    # Syntax=1, normalized runtime progress=0.75, distance=0 on failure.
+    assert result == (None, 1.75, True, False, {"success": False, "error": reason})
+
+
+@pytest.mark.parametrize(
+    "prefix,suffix,budget,reason",
+    [("move turnLeft move", "move", 256, "runtime_error"), ("move", "turnLeft", 1, "execution_limit")],
+)
+def test_failure_at_exact_target_has_no_distance_bonus(
+    world: State, monkeypatch: pytest.MonkeyPatch, prefix: str, suffix: str, budget: int, reason: str
+) -> None:
+    program = tuple(f"DEF run m( {prefix} m)".split())
+    target = execute(prefix, world)
+
+    def fixed_task(rng: np.random.Generator, config: KarelConfig) -> KarelTask:
+        return KarelTask(world, target, program)
+
+    monkeypatch.setattr("rl2.karel.sample_task", fixed_task)
+    env = KarelProgramEnv(KarelConfig(max_execution_steps=budget))
+    env.reset()
+    assert submit(env, f"DEF run m( {prefix} {suffix} m)".split()) == (
+        None,
+        2.0,
+        True,
+        False,
+        {"success": False, "error": reason},
+    )
+    env.reset()
+    assert submit(env, program) == (None, 3.0, True, False, {"success": True, "error": None})
+
+
 def test_distance_weights_and_marker_counts(world: State) -> None:
     target = world.copy()
     target[..., :4] = 0
@@ -450,11 +528,20 @@ def test_distance_weights_and_marker_counts(world: State) -> None:
     config = KarelConfig(position_weight=2.0, orientation_weight=3.0, marker_weight=4.0)
     # Three Manhattan steps, one heading mismatch, and five marker edits.
     assert state_distance(world, target, config) == 2 * 3 + 3 * 1 + 4 * 5
-    assert progress_reward(world, world, target, config) == 0.0
+    assert progress_reward(world, world, target, config) == 0.5
     assert progress_reward(world, target, target, config) == 1.0
     final = world.copy()
     final[2, 1, 5] += 1
-    assert progress_reward(world, final, target, config) == pytest.approx(4 / 29)
+    assert progress_reward(world, final, target, config) == pytest.approx(33 / 58)
+
+
+@pytest.mark.parametrize("error,score", [(0, 1.0), (1, 0.75), (2, 0.5), (3, 0.25), (4, 0.0), (5, 0.0)])
+def test_normalized_progress_preserves_regressions(world: State, error: int, score: float) -> None:
+    target = world.copy()
+    target[2, 1, 5] += 2  # Initial distance is two markers.
+    final = target.copy()
+    final[2, 1, 5] += error
+    assert progress_reward(world, final, target, KarelConfig()) == score
 
 
 @pytest.mark.parametrize("weight_name", ["position_weight", "orientation_weight", "marker_weight"])

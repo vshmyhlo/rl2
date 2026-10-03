@@ -4,10 +4,10 @@ States are int32 arrays shaped (height, width, 6): four one-hot robot headings
 (north, east, south, west), walls, and marker counts. Actions are DSL token IDs;
 The outer closing token m) executes the program against the initial state. This is a plain
 class, not a Gymnasium Env: step observations deliberately are always None.
-Terminal reward is normalized progress toward the target, clipped to [-1, 1];
-syntax errors and missing m) receive -2 + 1/(1+d), where d is the minimum
-token edit distance to a complete syntactically valid program.
-Valid syntax with execution failures receives -1. PAD is reserved for batching.
+Terminal reward sums syntax, runtime, and distance scores, each in [0, 1].
+Invalid syntax receives only 1/(1+d), where d is the minimum syntax edit count.
+Execution failures receive 1 plus progress from the last valid state; completed
+executions receive 2 plus final-state progress. PAD is reserved for batching.
 Intermediate rewards are zero.
 """
 
@@ -147,27 +147,30 @@ def state_distance(state: State, target: State, config: KarelConfig) -> float:
 
 
 def progress_reward(initial: State, final: State, target: State, config: KarelConfig) -> float:
-    """Score a successfully executed program: clip(1 - D(final,t)/D(initial,t), -1, 1).
+    """Map signed progress from [-1, 1] to [0, 1] for a final or partial state.
 
-    Exact targets score 1, unchanged distance scores 0, and regressions score
-    below 0 (bounded by -1).
+    Score = clip(1 - D(final,t)/(2*D(initial,t)), 0, 1). Exact targets score 1,
+    unchanged distance scores 0.5, and doubled or greater distance scores 0.
+    Smaller regressions score between 0 and 0.5.
     The sampler excludes identical initial/target pairs;
     strictly positive weights therefore guarantee a positive denominator.
-    Execution failures bypass this function and receive -1 in step().
+    This is the runtime term on execution failure and the distance term on
+    successful completion; the other reward terms are added by step().
     """
     initial_distance = state_distance(initial, target, config)
     if initial_distance <= 0:
         raise ValueError("Progress reward requires a non-identical initial/target pair")
     final_distance = state_distance(final, target, config)
-    return float(np.clip(1.0 - final_distance / initial_distance, -1.0, 1.0))
+    return float(np.clip(1.0 - 0.5 * (final_distance / initial_distance), 0.0, 1.0))
 
 
 class KarelProgramError(ValueError):
-    """An invalid, unsafe, or nonterminating candidate program."""
+    """A failed program, with its last valid state when execution has started."""
 
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(message)
         self.reason = reason
+        self.partial_state: State | None = None
 
 
 @dataclass(frozen=True)
@@ -251,7 +254,9 @@ def execute_program(tokens: Sequence[str], initial: State, *, max_steps: int = 2
     """Execute a complete program ending in m), returning a new state or raising KarelProgramError.
 
     Every statement and while-condition check consumes execution budget, including
-    loops whose bodies do nothing. Invalid moves/picks/puts fail the whole program.
+    loops whose bodies do nothing. Invalid moves/picks/puts stop before applying
+    the offending action. Runtime/budget exceptions expose partial_state, with
+    all earlier actions applied and the latest robot position and heading.
     """
     chex.assert_shape(initial, (None, None, 6))
     chex.assert_type(initial, np.int32)
@@ -330,7 +335,15 @@ def execute_program(tokens: Sequence[str], initial: State, *, max_steps: int = 2
                     raise KarelProgramError("runtime_error", "Robot exceeded the marker limit")
                 state[row, col, 5] += 1
 
-    run(program)
+    try:
+        run(program)
+    except KarelProgramError as exc:
+        # Movement and turning live in local variables during execution. Commit
+        # them before exposing the last valid state, including on budget failures.
+        state[..., :4] = 0
+        state[row, col, heading] = 1
+        exc.partial_state = state
+        raise
     state[..., :4] = 0
     state[row, col, heading] = 1
     return state
@@ -414,12 +427,13 @@ class KarelProgramEnv:
 
     reset() returns KarelPair(initial, target), without an info wrapper.
     step() returns (None, reward, terminated, truncated, info). The token m) terminates
-    and scores progress_reward(); info['success'] still means exact state equality.
-    Syntax errors receive -2 + 1/(1+d), using minimum syntax edit distance d.
-    Runtime errors and execution-budget failures receive -1. Exhausting
-    max_program_tokens without m) truncates with the same syntax-distance score
-    and no execution. PAD is not a valid environment action.
-    No partial execution credit is given on errors or execution-budget failures.
+    and sums syntax, runtime, and distance terms. Completed execution scores
+    1 + 1 + progress_reward(final); execution failures score 1 +
+    progress_reward(last_valid_state) + 0. Invalid syntax scores 1/(1+d) + 0 + 0.
+    Exhausting max_program_tokens without m) truncates with the syntax score
+    and no execution. PAD is not a valid environment action. Exact success
+    requires both normal completion and target equality, even if a failed
+    program visited or stopped at the target.
     """
 
     tokens = TOKENS
@@ -476,10 +490,17 @@ class KarelProgramEnv:
                     max_markers=self.config.max_markers,
                 )
             except KarelProgramError as exc:
-                reward = syntax_reward(self._program) if exc.reason == "syntax_error" else -1.0
+                if exc.reason == "syntax_error":
+                    reward = syntax_reward(self._program)  # Runtime and distance terms are zero.
+                else:
+                    assert exc.partial_state is not None
+                    runtime_score = progress_reward(
+                        self._task.initial, exc.partial_state, self._task.target, self.config
+                    )
+                    reward = 1.0 + runtime_score  # Valid syntax, partial runtime credit, no distance bonus.
                 return None, reward, True, False, {"success": False, "error": exc.reason}
             success = bool(np.array_equal(output, self._task.target))
-            reward = progress_reward(self._task.initial, output, self._task.target, self.config)
+            reward = 2.0 + progress_reward(self._task.initial, output, self._task.target, self.config)
             return None, reward, True, False, {"success": success, "error": None}
         if len(self._program) >= self.config.max_program_tokens:
             self._needs_reset = True

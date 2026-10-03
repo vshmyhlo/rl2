@@ -209,10 +209,9 @@ def syntax_edit_distance(tokens: Sequence[str]) -> int:
 
 
 def syntax_reward(tokens: Sequence[str]) -> float:
-    """Score invalid/incomplete syntax in (-2, -1], without executing a repair.
+    """Syntax term in [0, 1]: 1/(1+d), without executing a repair.
 
-    A zero distance is accepted for diagnostics and returns -1. The environment
-    calls this only on syntax errors and incomplete submissions (distance >= 1),
-    whose rewards are at most -1.5. Valid programs use execution rewards instead.
+    Valid syntax scores 1. Invalid/incomplete submissions have distance >= 1
+    and score at most 0.5; their runtime and distance terms are zero.
     """
-    return -2.0 + 1.0 / (1.0 + syntax_edit_distance(tokens))
+    return 1.0 / (1.0 + syntax_edit_distance(tokens))

@@ -45,12 +45,13 @@ def test_known_minimum_repairs(program: str, distance: int) -> None:
     tokens = program.split()
     assert syntax_edit_distance(tokens) == distance
     if distance:
-        assert -2 < syntax_reward(tokens) <= -1.5
-        assert syntax_reward(tokens) == -2 + 1 / (1 + distance)
+        assert 0 < syntax_reward(tokens) <= 0.5
+        assert syntax_reward(tokens) == 1 / (1 + distance)
         with pytest.raises(KarelProgramError):
             _parse(tokens)
     else:
         _parse(tokens)
+        assert syntax_reward(tokens) == 1.0
 
 
 def test_short_inputs_match_exhaustive_nearest_program_oracle() -> None:

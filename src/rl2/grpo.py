@@ -6,7 +6,7 @@ within programs, then programs within the minibatch. Terminal m) is included, PA
 is excluded, and syntax/token-limit failures receive a syntax edit-distance score.
 
 This sketch starts from random weights with no grammar mask or supervised
-warmup. Terminal rewards measure progress toward the target; exact success is
+warmup. Terminal rewards sum syntax, runtime, and distance terms; exact success is
 logged separately. Equal-reward groups have zero advantages; syntax errors can
 now earn different rewards according to their minimum repair costs.
 An optional KL penalty uses a frozen copy of the initial model as reference.
@@ -320,7 +320,7 @@ def train(config: Config) -> TrainState:
             flush=True,
         )
         print(
-            "Syntax-distance and progress rewards: equal-reward groups have zero GRPO advantages.",
+            "Syntax + runtime + distance rewards: equal-reward groups have zero GRPO advantages.",
             flush=True,
         )
         start = monotonic()
