@@ -283,15 +283,39 @@ def test_cudnn_mask_padding_preserves_outputs_and_gradients(
         np.testing.assert_allclose(np.asarray(a, np.float32), np.asarray(b, np.float32), rtol=0.02, atol=0.02)
 
 
-@pytest.mark.skipif(
-    not any(d.platform == "gpu" for d in jax.devices()), reason="cuDNN attention requires an NVIDIA GPU"
+def assert_gradient_close(actual: jax.Array, expected: jax.Array) -> None:
+    """Compare each gradient tensor relative to its own magnitude."""
+    chex.assert_equal_shape((actual, expected))
+    chex.assert_type((actual, expected), jnp.floating)
+    actual_array, expected_array = np.asarray(actual, np.float32), np.asarray(expected, np.float32)
+    assert np.isfinite(actual_array).all()
+    assert np.isfinite(expected_array).all()
+    reference_norm = np.linalg.norm(expected_array)
+    assert reference_norm > 0, "the probe loss must exercise every gradient tensor"
+    relative_error = np.linalg.norm(actual_array - expected_array) / reference_norm
+    assert relative_error < 0.03, f"gradient relative L2 error {relative_error} exceeds 3%"
+
+
+@pytest.mark.parametrize(
+    "implementation",
+    [
+        "xla",
+        pytest.param(
+            "cudnn",
+            marks=pytest.mark.skipif(
+                not any(d.platform == "gpu" for d in jax.devices()),
+                reason="cuDNN attention requires an NVIDIA GPU",
+            ),
+        ),
+    ],
 )
 @pytest.mark.parametrize("cached", [False, True])
 @pytest.mark.parametrize("window", [8, 32])
-def test_cudnn_matches_xla_forward_backward_and_decode(cached: bool, window: int) -> None:
+def test_attention_backend_forward_backward_and_decode(cached: bool, window: int, implementation: str) -> None:
     model = TransformerStack(128, 1, num_heads=2, num_kv_heads=1, max_seq_len=window, dtype=jnp.bfloat16)
-    fused = model.clone(attention_implementation="cudnn")
+    backend = model.clone(attention_implementation=implementation)
     x = jax.random.normal(jax.random.key(14), (15, 2, 128))
+    probe = jax.random.normal(jax.random.key(18), x.shape) / jnp.sqrt(x.size)
     starts = jnp.zeros((15, 2), jnp.bool_).at[8, 0].set(True) if cached else None
     params = model.init(jax.random.key(15), x)["params"]
     initial = model.apply({"params": params}, x[:4])[0] if cached else None
@@ -302,18 +326,27 @@ def test_cudnn_matches_xla_forward_backward_and_decode(cached: bool, window: int
         chex.assert_shape(inputs, (15, 2, 128))
         chex.assert_type(inputs, jnp.float32)
         state, y = network.apply({"params": parameters}, inputs, initial, starts)
-        return jnp.mean(jnp.square(y.astype(jnp.float32))), (state, y)
+        # A squared norm is nearly constant after RMSNorm and hides broken
+        # attention gradients. A random projection exercises all directions.
+        return jnp.sum(y.astype(jnp.float32) * probe), (state, y)
 
     expected, expected_grad = jax.jit(jax.value_and_grad(partial(loss, network=model), argnums=(0, 1), has_aux=True))(
         params, x
     )
-    actual, actual_grad = jax.jit(jax.value_and_grad(partial(loss, network=fused), argnums=(0, 1), has_aux=True))(
+    actual, actual_grad = jax.jit(jax.value_and_grad(partial(loss, network=backend), argnums=(0, 1), has_aux=True))(
         params, x
     )
-    for a, b in zip(jax.tree.leaves((actual, actual_grad)), jax.tree.leaves((expected, expected_grad))):
+    for a, b in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
         np.testing.assert_allclose(np.asarray(a, np.float32), np.asarray(b, np.float32), rtol=0.05, atol=0.015)
+    chex.assert_trees_all_equal_shapes_and_dtypes(actual_grad, expected_grad)
+    for a, b in zip(jax.tree.leaves(actual_grad), jax.tree.leaves(expected_grad)):
+        assert_gradient_close(a, b)
+        # Run this negative control on CPU too, so a permissive comparison or
+        # degenerate loss cannot quietly invalidate the GPU-only coverage.
+        with pytest.raises(AssertionError, match="gradient relative L2 error"):
+            assert_gradient_close(jnp.zeros_like(b), b)
     cache = actual[1][0]
     expected_state, expected_y = model.apply({"params": params}, x[0], cache, method=model.step)
-    actual_state, actual_y = jax.jit(partial(fused.apply, method=fused.step))({"params": params}, x[0], cache)
+    actual_state, actual_y = jax.jit(partial(backend.apply, method=backend.step))({"params": params}, x[0], cache)
     np.testing.assert_allclose(actual_y.astype(jnp.float32), expected_y.astype(jnp.float32), rtol=0.05, atol=0.015)
     assert_carry_close(actual_state, expected_state, tolerance=0.04)

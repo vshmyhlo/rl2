@@ -190,7 +190,7 @@ def test_collection_shares_pairs_and_handles_terminal_and_truncation(
     "body,reward,success,error",
     [
         ("pickMarker pickMarker", 4.0, True, None),
-        ("putMarker", 2.25, False, None),  # Regression still beats invalid syntax.
+        ("putMarker", 1.5, False, None),  # Regression still beats invalid syntax.
         ("pickMarker pickMarker pickMarker", 2.0, False, "runtime_error"),
     ],
 )
@@ -237,11 +237,12 @@ def test_partial_rewards_are_not_logged_as_successes(
     monkeypatch.setattr("rl2.grpo.act", scripted_act)
     envs = [KarelProgramEnv(config.env) for _ in range(4)]
     batch, rewards, diagnostics, _ = collect_rollout(state, envs, np.random.default_rng(0), jax.random.key(0), config)
-    np.testing.assert_array_equal(rewards, np.asarray([2.75, 2.5, reward, 0.2], dtype=np.float32))
+    np.testing.assert_array_equal(rewards, np.asarray([2.5, 2.0, reward, 0.2], dtype=np.float32))
     np.testing.assert_allclose(batch.advantages, [1.0, -1.0, 1.0, -1.0], atol=2e-7)
-    assert diagnostics["charts/reward_mean"] == pytest.approx((reward + 5.45) / 4)
+    assert diagnostics["charts/reward_mean"] == pytest.approx((reward + 4.7) / 4)
     assert diagnostics["charts/reward_syntax_mean"] == pytest.approx(0.8)
-    assert diagnostics["charts/reward_runtime_mean"] == pytest.approx(0.75)
+    third_progress = 0.25 if body == "putMarker" else 1.0
+    assert diagnostics["charts/reward_runtime_mean"] == pytest.approx((0.75 + 0.5 + third_progress) / 4)
     third_distance = 0.0 if error else (1.0 if success else 0.25)
     assert diagnostics["charts/reward_distance_mean"] == pytest.approx((0.75 + 0.5 + third_distance) / 4)
     assert diagnostics["charts/reward_success_mean"] == float(success) / 4

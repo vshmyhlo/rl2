@@ -13,7 +13,7 @@ learning_rate: 0.00025
 anneal_lr: true
 clip_coef: 0.2
 target_kl: 0.02 # Old-policy KL early stopping; null disables
-entropy_coef: 0.01
+entropy_coef: 0.0
 kl_coef: 0.0 # Optional penalty against the frozen initial model; no reference forward when zero
 max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/grpo_karel
@@ -37,4 +37,4 @@ env:
   marker_weight: 1.0 # Sum of absolute marker-count errors across all cells
   # Syntax errors / missing m): (1/(1+d), 0, 0), d = minimum syntax token edits.
   # Runtime / execution-limit failure: (1, progress(last_valid_state), 0).
-  # Normal completion: (1, 1, progress(final_state)); +1 for exact success, total 4.
+  # Normal completion: (1, progress(final_state), progress(final_state)); +1 for exact success, total 4.

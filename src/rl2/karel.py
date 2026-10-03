@@ -8,7 +8,7 @@ Terminal reward sums syntax, runtime, and distance scores, each in [0, 1],
 plus a +1 exact-success bonus. Terminal info exposes all four components.
 Invalid syntax receives only 1/(1+d), where d is the minimum syntax edit count.
 Execution failures receive 1 plus progress from the last valid state; completed
-executions receive 2 plus final-state progress and the success bonus. PAD is reserved for batching.
+executions receive 1 plus twice final-state progress and the success bonus. PAD is reserved for batching.
 Intermediate rewards are zero.
 """
 
@@ -156,8 +156,8 @@ def progress_reward(initial: State, final: State, target: State, config: KarelCo
     Smaller regressions score between 0 and 0.5.
     The sampler excludes identical initial/target pairs;
     strictly positive weights therefore guarantee a positive denominator.
-    This is the runtime term on execution failure and the distance term on
-    successful completion; the other reward terms are added by step().
+    This is always the runtime term and also the distance term on normal
+    completion; the other reward terms are added by step().
     """
     initial_distance = state_distance(initial, target, config)
     if initial_distance <= 0:
@@ -430,7 +430,7 @@ class KarelProgramEnv:
     reset() returns KarelPair(initial, target), without an info wrapper.
     step() returns (None, reward, terminated, truncated, info). The token m) terminates
     and sums syntax, runtime, and distance terms, plus a +1 exact-success bonus.
-    Completed execution scores 1 + 1 + progress_reward(final) + float(success),
+    Completed execution scores 1 + 2 * progress_reward(final) + float(success),
     reaching 4 for an exact solution; execution failures score 1 +
     progress_reward(last_valid_state) + 0. Invalid syntax scores 1/(1+d) + 0 + 0.
     Exhausting max_program_tokens without m) truncates with the syntax score
@@ -520,7 +520,7 @@ class KarelProgramEnv:
                     return self._finish(1.0, runtime_score, error=exc.reason)
             success = bool(np.array_equal(output, self._task.target))
             distance = progress_reward(self._task.initial, output, self._task.target, self.config)
-            return self._finish(1.0, 1.0, distance, success=success)
+            return self._finish(1.0, distance, distance, success=success)
         if len(self._program) >= self.config.max_program_tokens:
             self._needs_reset = True
             return self._finish(syntax_reward(self._program), error="token_limit", truncated=True)

@@ -46,7 +46,8 @@ def expected_info(reward: float, success: bool = False, error: str | None = None
     elif error in ("runtime_error", "execution_limit"):
         syntax, runtime, distance = 1.0, reward - 1.0, 0.0
     else:
-        syntax, runtime, distance = 1.0, 1.0, reward - 2.0 - float(success)
+        syntax = 1.0
+        runtime = distance = (reward - 1.0 - float(success)) / 2.0
     return {
         "success": success,
         "error": error,
@@ -197,7 +198,7 @@ def test_equivalent_program_gets_full_reward(fixed_env: KarelProgramEnv) -> None
     assert result == (None, 4.0, True, False, expected_info(4.0, success=True))
 
 
-@pytest.mark.parametrize("body,reward", [("move turnLeft", 2.5), ("move pickMarker", 2.5), ("turnLeft", 2.0)])
+@pytest.mark.parametrize("body,reward", [("move turnLeft", 2.0), ("move pickMarker", 2.0), ("turnLeft", 1.0)])
 def test_target_matching_checks_heading_markers_and_position(
     fixed_env: KarelProgramEnv, body: str, reward: float
 ) -> None:
@@ -457,13 +458,13 @@ def test_failed_reset_invalidates_old_task_and_can_recover(monkeypatch: pytest.M
 @pytest.mark.parametrize(
     "body,reward,success,error",
     [
-        ("move", 2.75, False, None),
-        ("turnLeft turnRight", 2.5, False, None),
-        ("turnLeft", 2.25, False, None),
-        ("turnLeft move putMarker", 2.0, False, None),
+        ("move", 2.5, False, None),
+        ("turnLeft turnRight", 2.0, False, None),
+        ("turnLeft", 1.5, False, None),
+        ("turnLeft move putMarker", 1.0, False, None),
         ("move move", 4.0, True, None),
-        ("move putMarker", 2.5, False, None),  # Undo progress by spoiling a correct cell.
-        ("move move pickMarker", 2.75, False, None),
+        ("move putMarker", 2.0, False, None),  # Undo progress by spoiling a correct cell.
+        ("move move pickMarker", 2.5, False, None),
         ("move move move move", 1.75, False, "runtime_error"),  # Latest state, not the earlier exact target.
     ],
 )
