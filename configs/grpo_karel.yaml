@@ -28,7 +28,7 @@ env:
   max_program_tokens: 128 # Includes terminal m); PAD is used only for batching
   max_execution_steps: 256
   max_sampling_attempts: 1000
-  # reward = syntax + runtime + distance (each 0..1; total 0..3).
+  # reward = syntax + runtime + distance + exact_success (each 0..1; total 0..4).
   # progress(s) = clip(1 - 0.5 * D(s,target) / D(initial,target), 0, 1).
   # Exact target: 1; unchanged distance: 0.5; doubled distance or worse: 0.
   # D combines these errors; all weights must be finite and strictly positive.
@@ -37,4 +37,4 @@ env:
   marker_weight: 1.0 # Sum of absolute marker-count errors across all cells
   # Syntax errors / missing m): (1/(1+d), 0, 0), d = minimum syntax token edits.
   # Runtime / execution-limit failure: (1, progress(last_valid_state), 0).
-  # Normal completion: (1, 1, progress(final_state)); exact solution earns 3.
+  # Normal completion: (1, 1, progress(final_state)); +1 for exact success, total 4.

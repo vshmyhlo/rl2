@@ -6,8 +6,8 @@ within programs, then programs within the minibatch. Terminal m) is included, PA
 is excluded, and syntax/token-limit failures receive a syntax edit-distance score.
 
 This sketch starts from random weights with no grammar mask or supervised
-warmup. Terminal rewards sum syntax, runtime, and distance terms; exact success is
-logged separately. Equal-reward groups have zero advantages; syntax errors can
+warmup. Terminal rewards sum syntax, runtime, and distance terms, plus a +1
+exact-success bonus. Exact success is also logged separately. Equal-reward groups have zero advantages; syntax errors can
 now earn different rewards according to their minimum repair costs.
 An optional KL penalty uses a frozen copy of the initial model as reference.
 See https://arxiv.org/abs/2402.03300 for the GRPO objective.
@@ -31,7 +31,7 @@ from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
-from rl2.karel import TOKENS, KarelConfig, KarelProgramEnv
+from rl2.karel import REWARD_COMPONENTS, TOKENS, KarelConfig, KarelProgramEnv
 from rl2.karel_model import KarelProgramModel
 from rl2.mamba3 import Mamba3StackCarry
 
@@ -178,6 +178,7 @@ def collect_rollout(
     old_log_probs = np.zeros(shape, dtype=np.float32)
     mask = np.zeros(shape, dtype=np.bool_)
     rewards = np.zeros(batch_size, dtype=np.float32)
+    reward_components = {name: np.zeros(batch_size, dtype=np.float32) for name in REWARD_COMPONENTS}
     successes = np.zeros(batch_size, dtype=np.bool_)
     active = np.ones(batch_size, dtype=np.bool_)
     errors: list[str | None] = [None] * batch_size
@@ -195,6 +196,8 @@ def collect_rollout(
                 active[index] = False
                 errors[index] = info["error"]
                 successes[index] = bool(info["success"])
+                for name, values in reward_components.items():
+                    values[index] = info[f"reward_{name}"]
         if not active.any():
             break
         carry, logits = decode_step(state, actions[t], carry)
@@ -202,6 +205,7 @@ def collect_rollout(
     advantages = np.asarray(group_advantages(grouped_rewards)).reshape(-1)
     diagnostics = {
         "charts/reward_mean": float(rewards.mean()),
+        **{f"charts/reward_{name}_mean": float(values.mean()) for name, values in reward_components.items()},
         "charts/success_rate": float(successes.mean()),
         "charts/group_success_rate": float(successes.reshape((config.num_tasks, config.group_size)).any(axis=1).mean()),
         "charts/informative_group_fraction": float((np.ptp(grouped_rewards, axis=1) > 0).mean()),
@@ -320,7 +324,7 @@ def train(config: Config) -> TrainState:
             flush=True,
         )
         print(
-            "Syntax + runtime + distance rewards: equal-reward groups have zero GRPO advantages.",
+            "Syntax + runtime + distance + exact-success rewards: equal-reward groups have zero GRPO advantages.",
             flush=True,
         )
         start = monotonic()
@@ -380,6 +384,9 @@ def train(config: Config) -> TrainState:
             print(
                 f"iteration={iteration + 1} step={steps} success={diagnostics['charts/success_rate']:.3f} "
                 f"reward={diagnostics['charts/reward_mean']:.3f} "
+                f"syntax={diagnostics['charts/reward_syntax_mean']:.3f} "
+                f"runtime={diagnostics['charts/reward_runtime_mean']:.3f} "
+                f"distance={diagnostics['charts/reward_distance_mean']:.3f} "
                 f"informative_groups={diagnostics['charts/informative_group_fraction']:.3f} "
                 f"policy={policy_loss:.3f} entropy={entropy:.3f} kl={approx_kl:.4f} "
                 f"updates={updates_done} early_stop={early_stop}",

@@ -4,10 +4,11 @@ States are int32 arrays shaped (height, width, 6): four one-hot robot headings
 (north, east, south, west), walls, and marker counts. Actions are DSL token IDs;
 The outer closing token m) executes the program against the initial state. This is a plain
 class, not a Gymnasium Env: step observations deliberately are always None.
-Terminal reward sums syntax, runtime, and distance scores, each in [0, 1].
+Terminal reward sums syntax, runtime, and distance scores, each in [0, 1],
+plus a +1 exact-success bonus. Terminal info exposes all four components.
 Invalid syntax receives only 1/(1+d), where d is the minimum syntax edit count.
 Execution failures receive 1 plus progress from the last valid state; completed
-executions receive 2 plus final-state progress. PAD is reserved for batching.
+executions receive 2 plus final-state progress and the success bonus. PAD is reserved for batching.
 Intermediate rewards are zero.
 """
 
@@ -27,6 +28,7 @@ from rl2.karel_syntax import MAX_BLOCK_DEPTH, syntax_reward
 
 type State = NDArray[np.int32]
 type StepResult = tuple[None, float, bool, bool, dict[str, object]]
+REWARD_COMPONENTS = ("syntax", "runtime", "distance", "success")
 
 ACTIONS = ("move", "turnLeft", "turnRight", "pickMarker", "putMarker")
 PREDICATES = ("frontIsClear", "leftIsClear", "rightIsClear", "markersPresent", "noMarkersPresent")
@@ -427,8 +429,9 @@ class KarelProgramEnv:
 
     reset() returns KarelPair(initial, target), without an info wrapper.
     step() returns (None, reward, terminated, truncated, info). The token m) terminates
-    and sums syntax, runtime, and distance terms. Completed execution scores
-    1 + 1 + progress_reward(final); execution failures score 1 +
+    and sums syntax, runtime, and distance terms, plus a +1 exact-success bonus.
+    Completed execution scores 1 + 1 + progress_reward(final) + float(success),
+    reaching 4 for an exact solution; execution failures score 1 +
     progress_reward(last_valid_state) + 0. Invalid syntax scores 1/(1+d) + 0 + 0.
     Exhausting max_program_tokens without m) truncates with the syntax score
     and no execution. PAD is not a valid environment action. Exact success
@@ -468,6 +471,23 @@ class KarelProgramEnv:
         # Callers may transform observations without changing the task we evaluate.
         return KarelPair(self._task.initial.copy(), self._task.target.copy())
 
+    def _finish(
+        self,
+        syntax: float,
+        runtime: float = 0.0,
+        distance: float = 0.0,
+        *,
+        success: bool = False,
+        error: str | None = None,
+        truncated: bool = False,
+    ) -> StepResult:
+        """Expose the exact terms summed into the terminal reward for diagnostics."""
+        self._needs_reset = True
+        components = dict(zip(REWARD_COMPONENTS, (syntax, runtime, distance, float(success))))
+        info: dict[str, object] = {"success": success, "error": error}
+        info.update({f"reward_{name}": value for name, value in components.items()})
+        return None, sum(components.values()), not truncated, truncated, info
+
     def step(self, action: int | np.integer) -> StepResult:
         if self._needs_reset or self._task is None:
             raise gym.error.ResetNeeded("Call reset() before stepping a new episode")
@@ -491,18 +511,17 @@ class KarelProgramEnv:
                 )
             except KarelProgramError as exc:
                 if exc.reason == "syntax_error":
-                    reward = syntax_reward(self._program)  # Runtime and distance terms are zero.
+                    return self._finish(syntax_reward(self._program), error=exc.reason)
                 else:
                     assert exc.partial_state is not None
                     runtime_score = progress_reward(
                         self._task.initial, exc.partial_state, self._task.target, self.config
                     )
-                    reward = 1.0 + runtime_score  # Valid syntax, partial runtime credit, no distance bonus.
-                return None, reward, True, False, {"success": False, "error": exc.reason}
+                    return self._finish(1.0, runtime_score, error=exc.reason)
             success = bool(np.array_equal(output, self._task.target))
-            reward = 2.0 + progress_reward(self._task.initial, output, self._task.target, self.config)
-            return None, reward, True, False, {"success": success, "error": None}
+            distance = progress_reward(self._task.initial, output, self._task.target, self.config)
+            return self._finish(1.0, 1.0, distance, success=success)
         if len(self._program) >= self.config.max_program_tokens:
             self._needs_reset = True
-            return None, syntax_reward(self._program), False, True, {"success": False, "error": "token_limit"}
+            return self._finish(syntax_reward(self._program), error="token_limit", truncated=True)
         return None, 0.0, False, False, {}

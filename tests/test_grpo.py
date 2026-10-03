@@ -91,7 +91,20 @@ def test_equal_partial_rewards_are_not_logged_as_informative(
     def equal_reward_step(self: KarelProgramEnv, action: int) -> StepResult:
         # Isolate rollout statistics with identical fractional terminal rewards.
         assert self.action_space.contains(action)
-        return None, 0.1, True, False, {"success": False, "error": None}
+        return (
+            None,
+            0.1,
+            True,
+            False,
+            {
+                "success": False,
+                "error": "syntax_error",
+                "reward_syntax": 0.1,
+                "reward_runtime": 0.0,
+                "reward_distance": 0.0,
+                "reward_success": 0.0,
+            },
+        )
 
     monkeypatch.setattr(KarelProgramEnv, "step", equal_reward_step)
     envs = [KarelProgramEnv(config.env) for _ in range(config.group_size)]
@@ -164,6 +177,9 @@ def test_collection_shares_pairs_and_handles_terminal_and_truncation(
     assert diagnostics["charts/truncation_rate"] == (token == "move")
     assert diagnostics["charts/syntax_error_rate"] == (token == "m)")
     assert diagnostics["charts/reward_mean"] == pytest.approx(0.2)
+    assert diagnostics["charts/reward_syntax_mean"] == pytest.approx(0.2)
+    for name in ("runtime", "distance", "success"):
+        assert diagnostics[f"charts/reward_{name}_mean"] == 0.0
     assert diagnostics["charts/success_rate"] == diagnostics["charts/group_success_rate"] == 0.0
     _, logits = state.apply_fn({"params": state.params}, batch.initial, batch.target, batch.actions[:-1])
     recomputed = np.asarray(action_log_prob(logits, batch.actions))
@@ -173,7 +189,7 @@ def test_collection_shares_pairs_and_handles_terminal_and_truncation(
 @pytest.mark.parametrize(
     "body,reward,success,error",
     [
-        ("pickMarker pickMarker", 3.0, True, None),
+        ("pickMarker pickMarker", 4.0, True, None),
         ("putMarker", 2.25, False, None),  # Regression still beats invalid syntax.
         ("pickMarker pickMarker pickMarker", 2.0, False, "runtime_error"),
     ],
@@ -224,6 +240,14 @@ def test_partial_rewards_are_not_logged_as_successes(
     np.testing.assert_array_equal(rewards, np.asarray([2.75, 2.5, reward, 0.2], dtype=np.float32))
     np.testing.assert_allclose(batch.advantages, [1.0, -1.0, 1.0, -1.0], atol=2e-7)
     assert diagnostics["charts/reward_mean"] == pytest.approx((reward + 5.45) / 4)
+    assert diagnostics["charts/reward_syntax_mean"] == pytest.approx(0.8)
+    assert diagnostics["charts/reward_runtime_mean"] == pytest.approx(0.75)
+    third_distance = 0.0 if error else (1.0 if success else 0.25)
+    assert diagnostics["charts/reward_distance_mean"] == pytest.approx((0.75 + 0.5 + third_distance) / 4)
+    assert diagnostics["charts/reward_success_mean"] == float(success) / 4
+    assert sum(
+        diagnostics[f"charts/reward_{name}_mean"] for name in ("syntax", "runtime", "distance", "success")
+    ) == pytest.approx(diagnostics["charts/reward_mean"])
     assert diagnostics["charts/success_rate"] == float(success) / 4
     assert diagnostics["charts/group_success_rate"] == float(success) / 2
     assert diagnostics["charts/syntax_error_rate"] == 0.25

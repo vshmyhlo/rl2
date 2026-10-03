@@ -39,6 +39,24 @@ def submit(env: KarelProgramEnv, tokens: Sequence[str]) -> StepResult:
     return result
 
 
+def expected_info(reward: float, success: bool = False, error: str | None = None) -> dict[str, object]:
+    """Expand an expected terminal reward using the documented component boundaries."""
+    if error in ("syntax_error", "token_limit"):
+        syntax, runtime, distance = reward, 0.0, 0.0
+    elif error in ("runtime_error", "execution_limit"):
+        syntax, runtime, distance = 1.0, reward - 1.0, 0.0
+    else:
+        syntax, runtime, distance = 1.0, 1.0, reward - 2.0 - float(success)
+    return {
+        "success": success,
+        "error": error,
+        "reward_syntax": syntax,
+        "reward_runtime": runtime,
+        "reward_distance": distance,
+        "reward_success": float(success),
+    }
+
+
 @pytest.fixture
 def fixed_env(world: State, monkeypatch: pytest.MonkeyPatch) -> KarelProgramEnv:
     target = world.copy()
@@ -170,13 +188,13 @@ def test_reset_pair_and_terminal_only_evaluation(fixed_env: KarelProgramEnv) -> 
     assert initial.dtype == target.dtype == np.int32
     for token in ["DEF", "run", "m(", "move"]:
         assert fixed_env.step(fixed_env.token_to_id[token]) == (None, 0.0, False, False, {})
-    assert fixed_env.step(fixed_env.terminal_token_id) == (None, 3.0, True, False, {"success": True, "error": None})
+    assert fixed_env.step(fixed_env.terminal_token_id) == (None, 4.0, True, False, expected_info(4.0, success=True))
 
 
 def test_equivalent_program_gets_full_reward(fixed_env: KarelProgramEnv) -> None:
     fixed_env.reset()
     result = submit(fixed_env, ["DEF", "run", "m(", "turnLeft", "turnRight", "move", "m)"])
-    assert result == (None, 3.0, True, False, {"success": True, "error": None})
+    assert result == (None, 4.0, True, False, expected_info(4.0, success=True))
 
 
 @pytest.mark.parametrize("body,reward", [("move turnLeft", 2.5), ("move pickMarker", 2.5), ("turnLeft", 2.0)])
@@ -185,7 +203,7 @@ def test_target_matching_checks_heading_markers_and_position(
 ) -> None:
     fixed_env.reset()
     result = submit(fixed_env, f"DEF run m( {body} m)".split())
-    assert result == (None, reward, True, False, {"success": False, "error": None})
+    assert result == (None, reward, True, False, expected_info(reward))
 
 
 @pytest.mark.parametrize(
@@ -202,7 +220,7 @@ def test_failed_program_rewards_distinguish_syntax(
 ) -> None:
     fixed_env.reset()
     result = submit(fixed_env, program.split())
-    assert result == (None, reward, True, False, {"success": False, "error": reason})
+    assert result == (None, reward, True, False, expected_info(reward, error=reason))
 
 
 def test_observations_cannot_mutate_private_task(fixed_env: KarelProgramEnv) -> None:
@@ -210,23 +228,23 @@ def test_observations_cannot_mutate_private_task(fixed_env: KarelProgramEnv) -> 
     pair.initial.fill(0)
     pair.target.fill(0)
     result = submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])
-    assert result[1] == 3.0
+    assert result[1] == 4.0
 
 
 def test_reset_discards_partial_program(fixed_env: KarelProgramEnv) -> None:
     fixed_env.reset()
     submit(fixed_env, ["IF", "move"])
     fixed_env.reset()
-    assert submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])[1] == 3.0
+    assert submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])[1] == 4.0
 
 
 def test_token_limit_and_terminal_boundary(fixed_env: KarelProgramEnv) -> None:
     # The fixed reference uses five tokens including m), exactly the limit.
     env = KarelProgramEnv(KarelConfig(max_program_tokens=5))
     env.reset()
-    assert submit(env, ["DEF", "run", "m(", "move", "m)"])[1] == 3.0
+    assert submit(env, ["DEF", "run", "m(", "move", "m)"])[1] == 4.0
     env.reset()
-    assert submit(env, ["move"] * 5) == (None, 0.2, False, True, {"success": False, "error": "token_limit"})
+    assert submit(env, ["move"] * 5) == (None, 0.2, False, True, expected_info(0.2, error="token_limit"))
     with pytest.raises(gym.error.ResetNeeded):
         env.step(env.terminal_token_id)
 
@@ -237,7 +255,7 @@ def test_incomplete_program_gets_syntax_credit_without_execution(fixed_env: Kare
     # Only m) is missing. The completed program would solve this task, but must
     # never be repaired and executed when determining the reward.
     result = submit(env, ["DEF", "run", "m(", "turnLeft", "turnRight", "move"])
-    assert result == (None, 0.5, False, True, {"success": False, "error": "token_limit"})
+    assert result == (None, 0.5, False, True, expected_info(0.5, error="token_limit"))
 
 
 def test_episode_lifecycle_and_invalid_action(fixed_env: KarelProgramEnv) -> None:
@@ -261,7 +279,7 @@ def test_pad_is_reserved_and_cannot_change_program(fixed_env: KarelProgramEnv) -
     assert fixed_env.reference_program[-1] == fixed_env.terminal_token_id
     with pytest.raises(gym.error.InvalidAction, match="PAD"):
         fixed_env.step(fixed_env.pad_token_id)
-    assert submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])[1] == 3.0
+    assert submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])[1] == 4.0
 
 
 @pytest.mark.parametrize("seed", range(20))
@@ -288,7 +306,7 @@ def test_seed_reproduces_task_stream_and_reference_solves() -> None:
         for token_id in first.reference_program:
             observation, reward, terminated, truncated, info = first.step(token_id)
             assert observation is None
-        assert (reward, terminated, truncated, info) == (3.0, True, False, {"success": True, "error": None})
+        assert (reward, terminated, truncated, info) == (4.0, True, False, expected_info(4.0, success=True))
     assert len(pairs) == 10
 
 
@@ -411,7 +429,7 @@ def test_minimum_task_and_submission_budgets(seed: int) -> None:
     assert len(env.reference_program) == 5
     for token_id in env.reference_program:
         result = env.step(token_id)
-    assert result == (None, 3.0, True, False, {"success": True, "error": None})
+    assert result == (None, 4.0, True, False, expected_info(4.0, success=True))
 
 
 def test_failed_reset_invalidates_old_task_and_can_recover(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -433,7 +451,7 @@ def test_failed_reset_invalidates_old_task_and_can_recover(monkeypatch: pytest.M
     env.reset(seed=2)
     for token_id in env.reference_program:
         result = env.step(token_id)
-    assert result[1:4] == (3.0, True, False)
+    assert result[1:4] == (4.0, True, False)
 
 
 @pytest.mark.parametrize(
@@ -443,7 +461,7 @@ def test_failed_reset_invalidates_old_task_and_can_recover(monkeypatch: pytest.M
         ("turnLeft turnRight", 2.5, False, None),
         ("turnLeft", 2.25, False, None),
         ("turnLeft move putMarker", 2.0, False, None),
-        ("move move", 3.0, True, None),
+        ("move move", 4.0, True, None),
         ("move putMarker", 2.5, False, None),  # Undo progress by spoiling a correct cell.
         ("move move pickMarker", 2.75, False, None),
         ("move move move move", 1.75, False, "runtime_error"),  # Latest state, not the earlier exact target.
@@ -464,7 +482,7 @@ def test_terminal_progress_reward(
     env.reset()
     for token in f"DEF run m( {body}".split():
         assert env.step(env.token_to_id[token]) == (None, 0.0, False, False, {})
-    assert env.step(env.terminal_token_id) == (None, reward, True, False, {"success": success, "error": error})
+    assert env.step(env.terminal_token_id) == (None, reward, True, False, expected_info(reward, success, error))
 
 
 @pytest.mark.parametrize(
@@ -489,14 +507,14 @@ def test_runtime_score_uses_partial_progress(
     env.reset()
     result = submit(env, f"DEF run m( move {action} m)".split())
     # Syntax=1, normalized runtime progress=0.75, distance=0 on failure.
-    assert result == (None, 1.75, True, False, {"success": False, "error": reason})
+    assert result == (None, 1.75, True, False, expected_info(1.75, error=reason))
 
 
 @pytest.mark.parametrize(
     "prefix,suffix,budget,reason",
     [("move turnLeft move", "move", 256, "runtime_error"), ("move", "turnLeft", 1, "execution_limit")],
 )
-def test_failure_at_exact_target_has_no_distance_bonus(
+def test_failure_at_exact_target_has_no_distance_or_success_bonus(
     world: State, monkeypatch: pytest.MonkeyPatch, prefix: str, suffix: str, budget: int, reason: str
 ) -> None:
     program = tuple(f"DEF run m( {prefix} m)".split())
@@ -513,10 +531,10 @@ def test_failure_at_exact_target_has_no_distance_bonus(
         2.0,
         True,
         False,
-        {"success": False, "error": reason},
+        expected_info(2.0, error=reason),
     )
     env.reset()
-    assert submit(env, program) == (None, 3.0, True, False, {"success": True, "error": None})
+    assert submit(env, program) == (None, 4.0, True, False, expected_info(4.0, success=True))
 
 
 def test_distance_weights_and_marker_counts(world: State) -> None:
