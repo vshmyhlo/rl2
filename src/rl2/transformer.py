@@ -39,6 +39,8 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from rl2.block_stack import BlockStack
+
 type AttentionImplementation = Literal["xla", "cudnn"]
 
 
@@ -297,7 +299,7 @@ class _TransformerBlock(nn.Module):
         return carry, x + y.astype(residual_dtype)
 
 
-class TransformerStack(nn.Module):
+class TransformerStack(BlockStack[TransformerStackCarry]):
     """Modern decoder backbone with independent pre-RMSNorm/SwiGLU layers.
 
     Same sequence/step/reset interface as Mamba3Stack. Carry is a tuple of one
@@ -306,8 +308,6 @@ class TransformerStack(nn.Module):
     Output projections initialize with depth scale 1/sqrt(2*num_layers).
     """
 
-    d_model: int
-    num_layers: int
     num_heads: int = 8
     num_kv_heads: int | None = None
     max_seq_len: int = 2048
@@ -387,19 +387,3 @@ class TransformerStack(nn.Module):
         if self.final_norm:
             x = self.norm_f(x)
         return tuple(next_carry), x.astype(self.dtype)
-
-    def step(
-        self,
-        x: jax.Array,
-        carry: TransformerStackCarry | None = None,
-        episode_starts: jax.Array | None = None,
-    ) -> tuple[TransformerStackCarry, jax.Array]:
-        """Process [batch,d_model] using the same parameters as sequence calls."""
-        chex.assert_shape(x, (None, self.d_model))
-        chex.assert_type(x, jnp.floating)
-        if episode_starts is not None:
-            chex.assert_shape(episode_starts, (x.shape[0],))
-            chex.assert_type(episode_starts, jnp.bool_)
-        starts = None if episode_starts is None else episode_starts[None]
-        carry, y = self(x[None], carry, starts)
-        return carry, y[0]

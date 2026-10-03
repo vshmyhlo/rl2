@@ -34,6 +34,8 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from rl2.block_stack import BlockStack
+
 
 class Mamba3Carry(NamedTuple):
     """Float32 recurrent state; all leaves have batch as their leading axis.
@@ -332,7 +334,7 @@ class _Mamba3Block(nn.Module):
         return carry, x
 
 
-class Mamba3Stack(nn.Module):
+class Mamba3Stack(BlockStack[Mamba3StackCarry]):
     """Configurable Mamba-3 backbone on continuous, time-major features.
 
     Each of ``num_layers`` layers has independent parameters and implements
@@ -364,8 +366,6 @@ class Mamba3Stack(nn.Module):
         carry, y_next = model.apply(variables, x[0], carry, method=model.step)
     """
 
-    d_model: int
-    num_layers: int
     d_intermediate: int | None = None
     mlp_multiple_of: int = 128
     rms_norm: bool = True
@@ -473,19 +473,3 @@ class Mamba3Stack(nn.Module):
         if self.final_norm:
             x = self.norm_f(x)
         return tuple(next_carry), x.astype(self.dtype)
-
-    def step(
-        self,
-        x: jax.Array,
-        carry: Mamba3StackCarry | None = None,
-        episode_starts: jax.Array | None = None,
-    ) -> tuple[Mamba3StackCarry, jax.Array]:
-        """One recurrent step on [batch,d_model], sharing sequence parameters."""
-        chex.assert_shape(x, (None, self.d_model))
-        chex.assert_type(x, jnp.floating)
-        if episode_starts is not None:
-            chex.assert_shape(episode_starts, (x.shape[0],))
-            chex.assert_type(episode_starts, jnp.bool_)
-        starts = None if episode_starts is None else episode_starts[None]
-        carry, y = self(x[None], carry, starts)
-        return carry, y[0]
