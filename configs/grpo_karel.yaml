@@ -21,6 +21,8 @@ entropy_coef: 0.0
 kl_coef: 0.0 # Optional penalty against the frozen initial model; no reference forward when zero
 max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/grpo_karel
+log_program_interval: 10 # First rollout and every 10th; rotate through task groups
+log_program_count: 8 # Compare first 8 samples from the same group; 0 disables
 env:
   height: 8
   width: 8
@@ -32,13 +34,16 @@ env:
   max_program_tokens: 128 # Includes terminal m); PAD is used only for batching
   max_execution_steps: 256
   max_sampling_attempts: 1000
-  # reward = syntax + runtime + distance + exact_success (each 0..1; total 0..4).
+  # reward = syntax + runtime + distance + exact_success + weighted trajectory (default total 0..4.25).
   # progress(s) = clip(1 - 0.5 * D(s,target) / D(initial,target), 0, 1).
   # Exact target: 1; unchanged distance: 0.5; doubled distance or worse: 0.
   # D combines these errors; all weights must be finite and strictly positive.
   position_weight: 1.0 # Shortest-path distance through free cells
   orientation_weight: 1.0 # 1 for any wrong heading, 0 for a match
   marker_weight: 1.0 # Sum of absolute marker-count errors across all cells
+  trajectory_weight: 0.25 # 0 disables; finite and nonnegative
+  # trajectory = max(0, D_initial - D_last) / (D_initial + sum of positive distance increases).
+  # Add trajectory_weight * trajectory after completed or failed executions; zero on syntax/token limits.
   # Syntax errors / missing m): (1/(1+d), 0, 0), d = minimum syntax token edits.
   # Runtime / execution-limit failure: (1, progress(last_valid_state), 0).
-  # Normal completion: (1, progress(final_state), progress(final_state)); +1 for exact success, total 4.
+  # Normal completion: (1, progress(final_state), progress(final_state)); +1 for exact success, base total 4, plus trajectory bonus.

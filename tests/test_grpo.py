@@ -8,6 +8,7 @@ import numpy as np
 import optax
 import pytest
 from flax.training.train_state import TrainState
+from tensorboardX import SummaryWriter
 
 from rl2.grpo import (
     Config,
@@ -15,6 +16,8 @@ from rl2.grpo import (
     act,
     action_log_prob,
     collect_rollout,
+    format_group_programs,
+    format_program,
     group_advantages,
     learning_rate_schedule,
     load_config,
@@ -110,6 +113,7 @@ def test_equal_partial_rewards_are_not_logged_as_informative(
                 "reward_runtime": 0.0,
                 "reward_distance": 0.0,
                 "reward_success": 0.0,
+                "reward_trajectory": 0.0,
             },
         )
 
@@ -185,7 +189,7 @@ def test_collection_shares_pairs_and_handles_terminal_and_truncation(
     assert diagnostics["charts/syntax_error_rate"] == (token == "m)")
     assert diagnostics["charts/reward_mean"] == pytest.approx(0.2)
     assert diagnostics["charts/reward_syntax_mean"] == pytest.approx(0.2)
-    for name in ("runtime", "distance", "success"):
+    for name in ("runtime", "distance", "success", "trajectory"):
         assert diagnostics[f"charts/reward_{name}_mean"] == 0.0
     assert diagnostics["charts/success_rate"] == diagnostics["charts/group_success_rate"] == 0.0
     _, logits = state.apply_fn({"params": state.params}, batch.initial, batch.target, batch.actions[:-1])
@@ -196,9 +200,9 @@ def test_collection_shares_pairs_and_handles_terminal_and_truncation(
 @pytest.mark.parametrize(
     "body,reward,success,error",
     [
-        ("pickMarker pickMarker", 4.0, True, None),
+        ("pickMarker pickMarker", 4.25, True, None),
         ("putMarker", 1.5, False, None),  # Regression still beats invalid syntax.
-        ("pickMarker pickMarker pickMarker", 2.0, False, "runtime_error"),
+        ("pickMarker pickMarker pickMarker", 2.25, False, "runtime_error"),
     ],
 )
 def test_partial_rewards_are_not_logged_as_successes(
@@ -244,17 +248,20 @@ def test_partial_rewards_are_not_logged_as_successes(
     monkeypatch.setattr("rl2.grpo.act", scripted_act)
     envs = [KarelProgramEnv(config.env) for _ in range(4)]
     batch, rewards, diagnostics, _ = collect_rollout(state, envs, np.random.default_rng(0), jax.random.key(0), config)
-    np.testing.assert_array_equal(rewards, np.asarray([2.5, 2.0, reward, 0.2], dtype=np.float32))
+    np.testing.assert_array_equal(rewards, np.asarray([2.625, 2.0, reward, 0.2], dtype=np.float32))
     np.testing.assert_allclose(batch.advantages, [1.0, -1.0, 1.0, -1.0], atol=2e-7)
-    assert diagnostics["charts/reward_mean"] == pytest.approx((reward + 4.7) / 4)
+    assert diagnostics["charts/reward_mean"] == pytest.approx((reward + 4.825) / 4)
     assert diagnostics["charts/reward_syntax_mean"] == pytest.approx(0.8)
     third_progress = 0.25 if body == "putMarker" else 1.0
     assert diagnostics["charts/reward_runtime_mean"] == pytest.approx((0.75 + 0.5 + third_progress) / 4)
     third_distance = 0.0 if error else (1.0 if success else 0.25)
     assert diagnostics["charts/reward_distance_mean"] == pytest.approx((0.75 + 0.5 + third_distance) / 4)
     assert diagnostics["charts/reward_success_mean"] == float(success) / 4
+    assert diagnostics["charts/reward_trajectory_mean"] == pytest.approx(
+        (0.125 + (0.0 if body == "putMarker" else 0.25)) / 4
+    )
     assert sum(
-        diagnostics[f"charts/reward_{name}_mean"] for name in ("syntax", "runtime", "distance", "success")
+        diagnostics[f"charts/reward_{name}_mean"] for name in ("syntax", "runtime", "distance", "success", "trajectory")
     ) == pytest.approx(diagnostics["charts/reward_mean"])
     assert diagnostics["charts/success_rate"] == float(success) / 4
     assert diagnostics["charts/group_success_rate"] == float(success) / 2
@@ -388,6 +395,8 @@ def test_config_and_lr_schedule(config: Config) -> None:
         {"total_updates": 0},
         {"target_kl": -1},
         {"backbone_type": "unknown"},
+        {"log_program_interval": 0},
+        {"log_program_count": -1},
         {"attention_implementation": "unknown"},
         {"attention_implementation": "cudnn", "bf16": False},
         {"backbone_type": "mamba3", "attention_implementation": "cudnn", "bf16": True},
@@ -397,7 +406,23 @@ def test_config_and_lr_schedule(config: Config) -> None:
 
 
 @pytest.mark.parametrize("bf16", [False, True])
-def test_one_rollout_training_smoke(config: Config, tmp_path: Path, bf16: bool) -> None:
+def test_one_rollout_training_smoke(
+    config: Config, tmp_path: Path, bf16: bool, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logged_text: list[tuple[str, str, int | None]] = []
+    add_text = SummaryWriter.add_text
+
+    def record_text(
+        self: SummaryWriter,
+        tag: str,
+        text_string: str,
+        global_step: int | None = None,
+        walltime: float | None = None,
+    ) -> None:
+        logged_text.append((tag, text_string, global_step))
+        add_text(self, tag, text_string, global_step, walltime)
+
+    monkeypatch.setattr(SummaryWriter, "add_text", record_text)
     result = train(replace(config, log_dir=str(tmp_path), bf16=bf16))
     assert int(result.step) == 1
     chex.assert_type(jax.tree.leaves(result.params), jnp.float32)
@@ -406,3 +431,69 @@ def test_one_rollout_training_smoke(config: Config, tmp_path: Path, bf16: bool) 
             chex.assert_type(leaf, jnp.float32)
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(result.params))
     assert list(tmp_path.glob("karel_grpo_*/events.out.tfevents.*"))
+    output = capsys.readouterr().out
+    assert "Generated programs — rollout 1" in output
+    assert "Group 0: 2/2 programs for the same initial/target pair." in output
+    assert "Sample 0: reward=" in output and "Sample 1: reward=" in output
+    samples = [(text, step) for tag, text, step in logged_text if tag == "samples/generated_programs"]
+    assert len(samples) == 1
+    text, step = samples[0]
+    assert text in output  # TensorBoard receives exactly the displayed, formatted samples.
+    assert "### Sample 0" in text and "```text\n" in text
+    assert step is not None and step > 0
+
+
+def test_program_log_keeps_one_group_and_omits_padding() -> None:
+    programs = ["m)", "move", "DEF run m( move m)", "DEF run m( turnLeft"]
+    actions = np.full((6, 4), KarelProgramEnv.pad_token_id, dtype=np.int32)
+    for index, program in enumerate(programs):
+        tokens = [KarelProgramEnv.token_to_id[token] for token in program.split()]
+        actions[: len(tokens), index] = tokens
+    mask = actions != KarelProgramEnv.pad_token_id
+    grids = np.zeros((4, 3, 3, 6), dtype=np.int32)
+    batch = GRPOBatch(grids, grids, actions, np.zeros_like(actions, dtype=np.float32), mask, np.zeros(4, np.float32))
+    rewards = np.asarray([0.2, 0.3, 4.0, 0.5], dtype=np.float32)
+    text = format_group_programs(batch, rewards, group_size=2, group_index=1, count=8)
+    assert "Group 1: 2/2 programs" in text
+    assert "Sample 0: reward=4.0000, tokens=5" in text
+    assert "Sample 1: reward=0.5000, tokens=4" in text
+    assert "DEF run m(\n  move\nm)" in text
+    assert "DEF run m(\n  turnLeft\n```" in text  # Preserve incomplete programs exactly.
+    assert "<pad>" not in text
+    assert "reward=0.2000" not in text and "reward=0.3000" not in text
+    one = format_group_programs(batch, rewards, group_size=2, group_index=1, count=1)
+    assert "Sample 1" not in one and "turnLeft" not in one
+
+
+def test_program_format_indents_nested_blocks_and_preserves_conditions() -> None:
+    program = (
+        "DEF run m( WHILE c( frontIsClear c) w( IFELSE c( not c( markersPresent c) c) "
+        "i( putMarker i) ELSE e( REPEAT R=2 r( turnLeft r) e) move w) m)"
+    )
+    tokens = program.split()
+    formatted = format_program(tokens)
+    assert (
+        formatted
+        == """DEF run m(
+  WHILE c( frontIsClear c) w(
+    IFELSE c( not c( markersPresent c) c) i(
+      putMarker
+    i)
+    ELSE e(
+      REPEAT R=2 r(
+        turnLeft
+      r)
+    e)
+    move
+  w)
+m)"""
+    )
+    assert formatted.split() == tokens
+
+
+@pytest.mark.parametrize("program", ["", "m) w) move", "DEF run m( IF c( not", "m( " * 70, "frontIsClear " * 128])
+def test_program_format_preserves_malformed_and_truncated_tokens(program: str) -> None:
+    tokens = program.split()
+    formatted = format_program(tokens)
+    assert formatted.split() == tokens
+    assert all(len(line) <= 100 for line in formatted.splitlines())

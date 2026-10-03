@@ -7,13 +7,14 @@ is excluded, and syntax/token-limit failures receive a syntax edit-distance scor
 
 This sketch starts from random weights with no grammar mask or supervised
 warmup. Terminal rewards sum syntax, runtime, and distance terms, plus a +1
-exact-success bonus. Exact success is also logged separately. Equal-reward groups have zero advantages; syntax errors can
+exact-success bonus and weighted trajectory bonus. Exact success is also logged separately. Equal-reward groups have zero advantages; syntax errors can
 now earn different rewards according to their minimum repair costs.
 An optional KL penalty uses a frozen copy of the initial model as reference.
 See https://arxiv.org/abs/2402.03300 for the GRPO objective.
 """
 
 import argparse
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from functools import partial
@@ -31,7 +32,7 @@ from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
-from rl2.karel import REWARD_COMPONENTS, TOKENS, KarelConfig, KarelProgramEnv
+from rl2.karel import ACTIONS, REWARD_COMPONENTS, TOKENS, KarelConfig, KarelProgramEnv
 from rl2.karel_model import BackboneType, KarelModelCarry, KarelModelOutput, KarelProgramModel
 from rl2.transformer import AttentionImplementation
 
@@ -65,6 +66,8 @@ class Config:
     kl_coef: float = 0.0  # Zero disables the frozen-reference KL penalty.
     max_grad_norm: float = 0.5
     log_dir: str = "runs"
+    log_program_interval: int = 10  # First rollout, then every N rollouts.
+    log_program_count: int = 8  # First N programs in one group; zero disables samples.
     env: KarelConfig = field(default_factory=KarelConfig)
 
     def __post_init__(self) -> None:
@@ -76,6 +79,11 @@ class Config:
             raise ValueError("attention_implementation must be 'xla' or 'cudnn'")
         if self.attention_implementation == "cudnn" and (self.backbone_type != "transformer" or not self.bf16):
             raise ValueError("cuDNN attention requires backbone_type='transformer' and bf16=True")
+        for value in (self.log_program_interval, self.log_program_count):
+            if type(value) is not int:
+                raise TypeError("Program logging settings must be integers")
+        chex.assert_scalar_positive(self.log_program_interval)
+        chex.assert_scalar_non_negative(self.log_program_count)
         for value in (self.total_updates, self.num_tasks, self.group_size, self.num_minibatches, self.update_epochs):
             if type(value) is not int:
                 raise TypeError("Rollout and update counts must be integers")
@@ -231,6 +239,77 @@ def collect_rollout(
     return GRPOBatch(initial, target, actions, old_log_probs, mask, advantages), rewards, diagnostics, key
 
 
+def format_program(tokens: Sequence[str]) -> str:
+    """Indent DSL blocks and put actions on separate lines without changing tokens.
+
+    Conditions stay inline. Invalid/incomplete programs are formatted best-effort,
+    never repaired; unmatched closers cannot produce negative indentation. Wrap
+    long malformed headers and cap display indentation to keep logs readable.
+    """
+    lines: list[str] = []
+    current: list[str] = []
+    depth = 0
+
+    def flush() -> None:
+        if current:
+            lines.append("  " * min(depth, 16) + " ".join(current))
+            current.clear()
+
+    for token in tokens:
+        if token in ("m)", "w)", "i)", "e)", "r)"):
+            flush()
+            depth = max(0, depth - 1)
+            current.append(token)
+            flush()
+        elif token in ("m(", "w(", "i(", "e(", "r("):
+            current.append(token)
+            flush()
+            depth += 1
+        elif token in ACTIONS:
+            flush()
+            current.append(token)
+            flush()
+        else:
+            if token in ("DEF", "WHILE", "IF", "IFELSE", "ELSE", "REPEAT"):
+                flush()
+            if sum(len(part) + 1 for part in current) + len(token) + 2 * min(depth, 16) > 100:
+                flush()
+            current.append(token)
+    flush()
+    return "\n".join(lines)
+
+
+def format_group_programs(batch: GRPOBatch, rewards: Array, *, group_size: int, group_index: int, count: int) -> str:
+    """Format actual rollout tokens from one task group, without resampling or ranking.
+
+    Rows retain sampling order. Only generated (nonpadding) tokens are displayed,
+    including terminal m) when present. Reward and length belong to that rollout.
+    """
+    chex.assert_rank(batch.actions, 2)
+    chex.assert_equal_shape((batch.actions, batch.mask))
+    chex.assert_type(batch.actions, jnp.int32)
+    chex.assert_type(batch.mask, jnp.bool_)
+    chex.assert_shape(rewards, (batch.actions.shape[1],))
+    chex.assert_type(rewards, jnp.float32)
+    for value in (group_size, group_index, count):
+        chex.assert_type(value, int)
+    chex.assert_scalar_positive(group_size)
+    chex.assert_is_divisible(batch.actions.shape[1], group_size)
+    chex.assert_scalar_in(group_index, 0, batch.actions.shape[1] // group_size - 1)
+    chex.assert_scalar_positive(count)
+    count = min(count, group_size)
+    actions, mask, rewards = jax.device_get((batch.actions, batch.mask, rewards))
+    lines = [f"## Group {group_index}: {count}/{group_size} programs for the same initial/target pair."]
+    for sample in range(count):
+        index = group_index * group_size + sample
+        tokens = actions[mask[:, index], index]
+        program = format_program([TOKENS[int(token)] for token in tokens])
+        lines.append(
+            f"### Sample {sample}: reward={float(rewards[index]):.4f}, tokens={len(tokens)}\n\n```text\n{program}\n```"
+        )
+    return "\n\n".join(lines)
+
+
 def objective(
     logits: jax.Array, batch: GRPOBatch, config: Config, reference_log_probs: jax.Array | None = None
 ) -> tuple[jax.Array, Metrics]:
@@ -344,14 +423,15 @@ def train(config: Config) -> TrainState:
             flush=True,
         )
         print(
-            "Syntax + runtime + distance + exact-success rewards: equal-reward groups have zero GRPO advantages.",
+            "Syntax + runtime + distance + exact-success + trajectory rewards: equal-reward groups have zero GRPO advantages.",
             flush=True,
         )
         start = monotonic()
         steps = 0
+        logged_groups = 0
         for iteration in range(config.total_updates):
             rollout_start = monotonic()
-            batch, _, diagnostics, key = collect_rollout(state, envs, rng, key, config)
+            batch, rewards, diagnostics, key = collect_rollout(state, envs, rng, key, config)
             rollout_seconds = monotonic() - rollout_start
             steps += int(batch.mask.sum())
             learning_rate = float(schedule(iteration))
@@ -400,6 +480,17 @@ def train(config: Config) -> TrainState:
                 "time/optimization_seconds": monotonic() - optimization_start,
             }.items():
                 writer.add_scalar(tag, float(scalar), steps)
+            if config.log_program_count and (iteration == 0 or (iteration + 1) % config.log_program_interval == 0):
+                samples = format_group_programs(
+                    batch,
+                    rewards,
+                    group_size=config.group_size,
+                    group_index=logged_groups % config.num_tasks,
+                    count=config.log_program_count,
+                )
+                logged_groups += 1
+                writer.add_text("samples/generated_programs", samples, steps)
+                print(f"Generated programs — rollout {iteration + 1}, step {steps}\n{samples}", flush=True)
             writer.flush()
             print(
                 f"iteration={iteration + 1} step={steps} success={diagnostics['charts/success_rate']:.3f} "
@@ -407,6 +498,7 @@ def train(config: Config) -> TrainState:
                 f"syntax={diagnostics['charts/reward_syntax_mean']:.3f} "
                 f"runtime={diagnostics['charts/reward_runtime_mean']:.3f} "
                 f"distance={diagnostics['charts/reward_distance_mean']:.3f} "
+                f"trajectory={diagnostics['charts/reward_trajectory_mean']:.3f} "
                 f"informative_groups={diagnostics['charts/informative_group_fraction']:.3f} "
                 f"policy={policy_loss:.3f} entropy={entropy:.3f} kl={approx_kl:.4f} "
                 f"updates={updates_done} early_stop={early_stop}",

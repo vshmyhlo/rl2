@@ -42,7 +42,7 @@ def submit(env: KarelProgramEnv, tokens: Sequence[str]) -> StepResult:
 
 
 def expected_info(reward: float, success: bool = False, error: str | None = None) -> dict[str, object]:
-    """Expand an expected terminal reward using the documented component boundaries."""
+    """Expected components for legacy reward cases with trajectory_weight=0."""
     if error in ("syntax_error", "token_limit"):
         syntax, runtime, distance = reward, 0.0, 0.0
     elif error in ("runtime_error", "execution_limit"):
@@ -57,6 +57,7 @@ def expected_info(reward: float, success: bool = False, error: str | None = None
         "reward_runtime": runtime,
         "reward_distance": distance,
         "reward_success": float(success),
+        "reward_trajectory": 0.0,
     }
 
 
@@ -71,7 +72,7 @@ def fixed_env(world: State, monkeypatch: pytest.MonkeyPatch) -> KarelProgramEnv:
         return task
 
     monkeypatch.setattr("rl2.karel.sample_task", fixed_task)
-    return KarelProgramEnv()
+    return KarelProgramEnv(KarelConfig(trajectory_weight=0.0))
 
 
 def test_corridor_program_collects_markers_without_mutating_input(world: State) -> None:
@@ -243,7 +244,7 @@ def test_reset_discards_partial_program(fixed_env: KarelProgramEnv) -> None:
 
 def test_token_limit_and_terminal_boundary(fixed_env: KarelProgramEnv) -> None:
     # The fixed reference uses five tokens including m), exactly the limit.
-    env = KarelProgramEnv(KarelConfig(max_program_tokens=5))
+    env = KarelProgramEnv(KarelConfig(trajectory_weight=0.0, max_program_tokens=5))
     env.reset()
     assert submit(env, ["DEF", "run", "m(", "move", "m)"])[1] == 4.0
     env.reset()
@@ -253,7 +254,7 @@ def test_token_limit_and_terminal_boundary(fixed_env: KarelProgramEnv) -> None:
 
 
 def test_incomplete_program_gets_syntax_credit_without_execution(fixed_env: KarelProgramEnv) -> None:
-    env = KarelProgramEnv(KarelConfig(max_program_tokens=6))
+    env = KarelProgramEnv(KarelConfig(trajectory_weight=0.0, max_program_tokens=6))
     env.reset()
     # Only m) is missing. The completed program would solve this task, but must
     # never be repaired and executed when determining the reward.
@@ -287,7 +288,9 @@ def test_pad_is_reserved_and_cannot_change_program(fixed_env: KarelProgramEnv) -
 
 @pytest.mark.parametrize("seed", range(20))
 def test_sampled_task_is_reachable_changed_and_within_limits(seed: int) -> None:
-    config = KarelConfig()
+    config = KarelConfig(
+        trajectory_weight=0.0,
+    )
     task = sample_task(np.random.default_rng(seed), config)
     assert len(task.program) <= config.max_program_tokens
     assert not np.array_equal(task.initial, task.target)
@@ -297,7 +300,10 @@ def test_sampled_task_is_reachable_changed_and_within_limits(seed: int) -> None:
 
 
 def test_seed_reproduces_task_stream_and_reference_solves() -> None:
-    first, second = KarelProgramEnv(), KarelProgramEnv()
+    first, second = (
+        KarelProgramEnv(KarelConfig(trajectory_weight=0.0)),
+        KarelProgramEnv(KarelConfig(trajectory_weight=0.0)),
+    )
     pairs: set[bytes] = set()
     for episode in range(10):
         seed = 42 if episode == 0 else None
@@ -314,7 +320,7 @@ def test_seed_reproduces_task_stream_and_reference_solves() -> None:
 
 
 def test_depth_zero_samples_only_primitive_actions() -> None:
-    config = KarelConfig(max_depth=0)
+    config = KarelConfig(trajectory_weight=0.0, max_depth=0)
     for seed in range(10):
         task = sample_task(np.random.default_rng(seed), config)
         assert not {"WHILE", "REPEAT", "IF", "IFELSE"}.intersection(task.program)
@@ -326,7 +332,7 @@ def test_sampling_failure_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("rl2.karel._sample_program", identity_program)
     with pytest.raises(RuntimeError, match="max_sampling_attempts"):
-        sample_task(np.random.default_rng(0), KarelConfig(max_sampling_attempts=2))
+        sample_task(np.random.default_rng(0), KarelConfig(trajectory_weight=0.0, max_sampling_attempts=2))
 
 
 @pytest.mark.parametrize(
@@ -349,7 +355,7 @@ def test_sampling_failure_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
 )
 def test_config_validation(options: dict[str, int | float]) -> None:
     with pytest.raises((AssertionError, TypeError, ValueError)):
-        KarelConfig(**options)
+        KarelConfig(trajectory_weight=0.0, **options)
 
 
 def test_world_shape_dtype_and_robot_validation(world: State) -> None:
@@ -418,6 +424,7 @@ def test_zero_repeat_and_false_branch_skip_invalid_actions(world: State) -> None
 def test_minimum_task_and_submission_budgets(seed: int) -> None:
     env = KarelProgramEnv(
         KarelConfig(
+            trajectory_weight=0.0,
             height=3,
             width=3,
             wall_probability=1.0,
@@ -436,7 +443,7 @@ def test_minimum_task_and_submission_budgets(seed: int) -> None:
 
 
 def test_failed_reset_invalidates_old_task_and_can_recover(monkeypatch: pytest.MonkeyPatch) -> None:
-    env = KarelProgramEnv()
+    env = KarelProgramEnv(KarelConfig(trajectory_weight=0.0))
     env.reset(seed=1)
     env.step(env.token_to_id["DEF"])
 
@@ -481,7 +488,7 @@ def test_terminal_progress_reward(
         return KarelTask(world, target, ("DEF", "run", "m(", "move", "move", "m)"))
 
     monkeypatch.setattr("rl2.karel.sample_task", fixed_task)
-    env = KarelProgramEnv()
+    env = KarelProgramEnv(KarelConfig(trajectory_weight=0.0))
     env.reset()
     for token in f"DEF run m( {body}".split():
         assert env.step(env.token_to_id[token]) == (None, 0.0, False, False, {})
@@ -506,7 +513,7 @@ def test_runtime_score_uses_partial_progress(
         return KarelTask(world, target, ("DEF", "run", "m(", "move", "move", "m)"))
 
     monkeypatch.setattr("rl2.karel.sample_task", fixed_task)
-    env = KarelProgramEnv(KarelConfig(max_execution_steps=budget))
+    env = KarelProgramEnv(KarelConfig(trajectory_weight=0.0, max_execution_steps=budget))
     env.reset()
     result = submit(env, f"DEF run m( move {action} m)".split())
     # Syntax=1, normalized runtime progress=0.75, distance=0 on failure.
@@ -527,7 +534,7 @@ def test_failure_at_exact_target_has_no_distance_or_success_bonus(
         return KarelTask(world, target, program)
 
     monkeypatch.setattr("rl2.karel.sample_task", fixed_task)
-    env = KarelProgramEnv(KarelConfig(max_execution_steps=budget))
+    env = KarelProgramEnv(KarelConfig(trajectory_weight=0.0, max_execution_steps=budget))
     env.reset()
     assert submit(env, f"DEF run m( {prefix} {suffix} m)".split()) == (
         None,
@@ -546,7 +553,7 @@ def test_distance_weights_and_marker_counts(world: State) -> None:
     target[1, 3, 2] = 1
     target[2, 1, 5] = 4
     target[3, 3, 5] = 2
-    config = KarelConfig(position_weight=2.0, orientation_weight=3.0, marker_weight=4.0)
+    config = KarelConfig(trajectory_weight=0.0, position_weight=2.0, orientation_weight=3.0, marker_weight=4.0)
     # Three free-cell moves, one heading mismatch, and five marker edits.
     assert state_distance(world, target, config) == 2 * 3 + 3 * 1 + 4 * 5
     assert progress_reward(world, world, target, config) == 0.5
@@ -562,23 +569,46 @@ def test_normalized_progress_preserves_regressions(world: State, error: int, sco
     target[2, 1, 5] += 2  # Initial distance is two markers.
     final = target.copy()
     final[2, 1, 5] += error
-    assert progress_reward(world, final, target, KarelConfig()) == score
+    assert (
+        progress_reward(
+            world,
+            final,
+            target,
+            KarelConfig(
+                trajectory_weight=0.0,
+            ),
+        )
+        == score
+    )
 
 
 @pytest.mark.parametrize("weight_name", ["position_weight", "orientation_weight", "marker_weight"])
 @pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
 def test_reward_weights_must_be_positive_and_finite(weight_name: str, value: float) -> None:
     with pytest.raises((AssertionError, ValueError)):
-        KarelConfig(**{weight_name: value})
+        KarelConfig(trajectory_weight=0.0, **{weight_name: value})
 
 
 def test_reward_rejects_zero_baseline_and_changed_walls(world: State) -> None:
     with pytest.raises(ValueError, match="non-identical"):
-        progress_reward(world, world, world, KarelConfig())
+        progress_reward(
+            world,
+            world,
+            world,
+            KarelConfig(
+                trajectory_weight=0.0,
+            ),
+        )
     changed = world.copy()
     changed[1, 1, 4] = 1
     with pytest.raises(ValueError, match="identical walls"):
-        state_distance(world, changed, KarelConfig())
+        state_distance(
+            world,
+            changed,
+            KarelConfig(
+                trajectory_weight=0.0,
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -597,7 +627,7 @@ def test_wall_detour_progress_and_reset_cache(
     target[1, 3, 1] = 1
     prefix = "turnRight move turnLeft"
     final = execute(prefix, initial)
-    config = KarelConfig(max_execution_steps=budget)
+    config = KarelConfig(trajectory_weight=0.0, max_execution_steps=budget)
     distances = target_distance_map(target)
     assert distances[1, 1] == 6
     assert distances[2, 1] == 5
@@ -653,9 +683,101 @@ def test_distance_rejects_unreachable_robot_and_wall_target(world: State) -> Non
     target[2, 3, 1] = 1
     assert target_distance_map(target)[2, 1] == -1
     with pytest.raises(ValueError, match="cannot reach"):
-        state_distance(initial, target, KarelConfig())
+        state_distance(
+            initial,
+            target,
+            KarelConfig(
+                trajectory_weight=0.0,
+            ),
+        )
     with pytest.raises(ValueError, match="cannot reach"):
-        progress_reward(initial, target, target, KarelConfig())
+        progress_reward(
+            initial,
+            target,
+            target,
+            KarelConfig(
+                trajectory_weight=0.0,
+            ),
+        )
     target[2, 3, 4] = 1
     with pytest.raises(ValueError, match="free cell"):
         target_distance_map(target)
+
+
+@pytest.mark.parametrize(
+    "body,budget,base,bonus,error",
+    [
+        ("pickMarker", 256, 2.5, 0.125, None),
+        ("pickMarker pickMarker", 256, 4.0, 0.25, None),
+        ("putMarker pickMarker pickMarker pickMarker", 256, 4.0, 1 / 6, None),
+        ("pickMarker putMarker pickMarker pickMarker", 256, 4.0, 1 / 6, None),
+        ("turnLeft pickMarker turnRight pickMarker", 256, 4.0, 1 / 6, None),
+        ("pickMarker putMarker", 256, 2.0, 0.0, None),
+        ("putMarker", 256, 1.5, 0.0, None),
+        ("REPEAT R=0 r( pickMarker r)", 256, 2.0, 0.0, None),
+        ("pickMarker pickMarker pickMarker", 256, 2.0, 0.25, "runtime_error"),
+        ("pickMarker move", 256, 1.75, 0.125, "runtime_error"),
+        ("pickMarker pickMarker", 1, 1.75, 0.125, "execution_limit"),
+        ("pickMarker pickMarker putMarker", 2, 2.0, 0.25, "execution_limit"),
+        ("", 256, 0.5, 0.0, "syntax_error"),
+    ],
+)
+def test_trajectory_bonus_credits_net_progress_and_penalizes_reversals(
+    monkeypatch: pytest.MonkeyPatch, body: str, budget: int, base: float, bonus: float, error: str | None
+) -> None:
+    initial = np.zeros((3, 3, 6), dtype=np.int32)
+    initial[..., 4] = 1
+    initial[1, 1, 4] = 0
+    initial[1, 1, 0] = 1
+    initial[1, 1, 5] = 2
+    target = initial.copy()
+    target[1, 1, 5] = 0
+
+    def fixed_task(rng: np.random.Generator, config: KarelConfig) -> KarelTask:
+        return KarelTask(initial, target, ("DEF", "run", "m(", "pickMarker", "pickMarker", "m)"))
+
+    monkeypatch.setattr("rl2.karel.sample_task", fixed_task)
+    env = KarelProgramEnv(KarelConfig(max_execution_steps=budget))
+    env.reset()
+    result = submit(env, f"DEF run m( {body} m)".split())
+    assert result[1] == pytest.approx(base + bonus)
+    assert result[4]["reward_trajectory"] == pytest.approx(bonus)
+    assert result[4]["error"] == error
+    assert result[4]["success"] == (base == 4.0)
+    assert sum(value for key, value in result[4].items() if key.startswith("reward_")) == pytest.approx(result[1])
+    # Disabling the bonus restores the original score on exactly the same task.
+    disabled = KarelProgramEnv(KarelConfig(max_execution_steps=budget, trajectory_weight=0.0))
+    disabled.reset()
+    assert submit(disabled, f"DEF run m( {body} m)".split())[1] == pytest.approx(base)
+
+
+def test_trajectory_token_limit_never_executes(fixed_env: KarelProgramEnv) -> None:
+    from dataclasses import replace
+
+    fixed_env.config = replace(fixed_env.config, trajectory_weight=0.25, max_program_tokens=5)
+    fixed_env.reset()
+    result = submit(fixed_env, ["DEF", "run", "m(", "move", "move"])
+    assert result[3]
+    assert result[4]["reward_trajectory"] == 0.0
+    assert result[4]["error"] == "token_limit"
+
+
+def test_action_observer_gets_independent_primitive_snapshots(world: State) -> None:
+    snapshots: list[State] = []
+
+    def observe(state: State) -> None:
+        snapshots.append(state.copy())
+        state.fill(0)  # Mutating a callback snapshot must not alter execution.
+
+    program = "DEF run m( REPEAT R=2 r( move r) turnLeft m)"
+    output = execute_program(program.split(), world, on_action=observe)
+    assert len(snapshots) == 3
+    for actual, body in zip(snapshots, ("move", "move move", "move move turnLeft")):
+        np.testing.assert_array_equal(actual, execute(body, world))
+    np.testing.assert_array_equal(output, snapshots[-1])
+
+
+@pytest.mark.parametrize("weight", [-1.0, float("nan"), float("inf")])
+def test_invalid_trajectory_weight(weight: float) -> None:
+    with pytest.raises((ValueError, AssertionError)):
+        KarelConfig(trajectory_weight=weight)
