@@ -81,13 +81,19 @@ def config() -> Config:
 
 
 @pytest.mark.parametrize("use_bias", [False, True])
-def test_bidirectional_attention_matches_numpy_and_excludes_padding(use_bias: bool) -> None:
+@pytest.mark.parametrize("zero_qk", [False, True])
+def test_bidirectional_attention_matches_numpy_and_excludes_padding(use_bias: bool, zero_qk: bool) -> None:
     block = _ASTBlock(16, 2, 1, 32, 1, jnp.float32, "xla")
     x = jax.random.normal(jax.random.key(12), (2, 5, 16))
     present = jnp.asarray([[True, True, True, False, False], [True, True, True, True, True]])
     relations = tree_relations(jnp.asarray([[0, 1, 0, 0], [0, 1, 2, 1]], jnp.int32), present[:, 1:])
     params = block.init(jax.random.key(13), x, present, relations)["params"]
     params = {**params, "down": {"kernel": jnp.zeros_like(params["down"]["kernel"])}}
+    params["query_norm"]["scale"] = jnp.linspace(0.5, 1.5, 8)
+    params["key_norm"]["scale"] = jnp.linspace(1.5, 0.5, 8)
+    if zero_qk:
+        for name in ("query", "key"):
+            params[name]["kernel"] = jnp.zeros_like(params[name]["kernel"])
     if use_bias:
         params["tree_bias"] = jax.tree.map(
             lambda v: jax.random.normal(jax.random.key(v.size), v.shape), params["tree_bias"]
@@ -106,6 +112,10 @@ def test_bidirectional_attention_matches_numpy_and_excludes_padding(use_bias: bo
     query = (normalized @ params["query"]["kernel"]).reshape(2, 5, 2, 8)
     key = (normalized @ params["key"]["kernel"]).reshape(2, 5, 1, 8)
     value = (normalized @ params["value"]["kernel"]).reshape(2, 5, 1, 8)
+    query = np.asarray(query) / np.sqrt(np.mean(np.asarray(query) ** 2, axis=-1, keepdims=True) + 1e-6)
+    key = np.asarray(key) / np.sqrt(np.mean(np.asarray(key) ** 2, axis=-1, keepdims=True) + 1e-6)
+    query *= np.asarray(params["query_norm"]["scale"])
+    key *= np.asarray(params["key_norm"]["scale"])
     attended = np.zeros((2, 5, 2, 8), np.float32)
     for b in range(2):
         for t in range(5):
@@ -287,6 +297,8 @@ def test_masked_head_gradients_are_finite_and_learnable(config: Config, batch: M
         )
     for name in ("relation", "distance", "relative_depth"):
         assert np.linalg.norm(state.params["layers_0"]["tree_bias"][name]) > 0
+    for name in ("query_norm", "key_norm"):
+        assert not np.array_equal(initial_params["layers_0"][name]["scale"], state.params["layers_0"][name]["scale"])
 
 
 def test_sampling_finishes_and_completed_trees_use_safe_dummy_logits(config: Config, batch: ModelBatch) -> None:

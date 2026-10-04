@@ -13,6 +13,7 @@ from flax.training.train_state import TrainState
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 from tensorboardX import SummaryWriter
 
+from rl2 import karel
 from rl2 import train_karel_ast_grpo as grpo
 from rl2.karel import REWARD_COMPONENTS, TOKEN_TO_ID, KarelConfig, KarelProgramEnv, _parse
 from rl2.karel_ast import ACTION_ID, AST_ACTIONS, ASTFeatures, KarelAST, batch_features
@@ -47,7 +48,6 @@ def config() -> Config:
         num_kv_heads=1,
         max_nodes=12,
         max_depth=8,
-        decision_batch_size=5,
         entropy_coef=0.01,
         target_kl=None,
         log_interval=1,
@@ -74,6 +74,25 @@ def state(config: Config) -> TrainState:
 def rollout(config: Config, state: TrainState) -> tuple[GRPOBatch, np.ndarray, dict[str, float], jax.Array]:
     envs = [KarelProgramEnv(config.env) for _ in range(config.group_size)]
     return collect_rollout(state, envs, np.random.default_rng(4), jax.random.key(3), config)
+
+
+def test_rollout_samples_task_and_distance_map_once_per_group(
+    config: Config, state: TrainState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(config, num_tasks=2, group_size=3)
+    sampler = MagicMock(wraps=karel.sample_task)
+    distance_map = MagicMock(wraps=karel.target_distance_map)
+    monkeypatch.setattr(karel, "sample_task", sampler)
+    monkeypatch.setattr(karel, "target_distance_map", distance_map)
+    envs = [KarelProgramEnv(config.env) for _ in range(config.num_tasks * config.group_size)]
+    batch, _, _, _ = collect_rollout(state, envs, np.random.default_rng(4), jax.random.key(3), config)
+    assert sampler.call_count == distance_map.call_count == config.num_tasks
+    seeds = np.random.default_rng(4).integers(0, 2**31, size=config.num_tasks)
+    for group, seed in enumerate(seeds):
+        expected = KarelProgramEnv(config.env).reset(seed=int(seed))
+        for index in range(group * config.group_size, (group + 1) * config.group_size):
+            np.testing.assert_array_equal(batch.initial[index], expected.initial)
+            np.testing.assert_array_equal(batch.target[index], expected.target)
 
 
 def replay_logits(state: TrainState, batch: GRPOBatch, params: optax.Params | None = None) -> jax.Array:
@@ -180,12 +199,12 @@ def test_rollout_pairs_masks_replay_and_exact_environment_rewards(
     assert diagnostics["charts/group_success_rate"] == float(any(successes))
 
 
-@pytest.mark.parametrize("microbatch", [1, 5, 32])
-def test_microbatch_update_matches_full_batch_gradient(
-    config: Config, state: TrainState, rollout: tuple, microbatch: int
+@pytest.mark.parametrize("kl_coef", [0.0, 0.05])
+def test_single_pass_update_matches_roundwise_gradient(
+    config: Config, state: TrainState, rollout: tuple, kl_coef: float
 ) -> None:
     batch = rollout[0]._replace(advantages=jnp.asarray([1.0, -1.0], jnp.float32))
-    config = replace(config, decision_batch_size=microbatch, kl_coef=0.05)
+    config = replace(config, kl_coef=kl_coef)
     reference_params = jax.tree.map(lambda x: x * 0.99, state.params)
     reference = action_log_prob(replay_logits(state, batch, reference_params), batch.actions)
 
@@ -194,7 +213,18 @@ def test_microbatch_update_matches_full_batch_gradient(
 
     (_, expected_metrics), grads = jax.jit(jax.value_and_grad(full_loss, has_aux=True))(state.params)
     expected = state.apply_gradients(grads=grads)
-    actual, metrics = update(state, batch, config, reference_params)
+    calls: list[int] = []
+    rows = batch.actions.shape[0] * batch.actions.shape[1]
+
+    def apply(variables: dict, initial: jax.Array, target: jax.Array, tree: ASTFeatures) -> jax.Array:
+        chex.assert_shape(initial, (rows, *batch.initial.shape[1:]))
+        chex.assert_equal_shape((initial, target))
+        chex.assert_type((initial, target), jnp.int32)
+        calls.append(initial.shape[0])
+        return state.apply_fn(variables, initial, target, tree)
+
+    actual, metrics = update(state.replace(apply_fn=apply), batch, config, reference_params)
+    assert calls == [rows] * (2 if kl_coef else 1)
     np.testing.assert_allclose(metrics, expected_metrics, atol=2e-6, rtol=2e-5)
     for a, b in zip(jax.tree.leaves(actual.params), jax.tree.leaves(expected.params)):
         np.testing.assert_allclose(a, b, atol=2e-6, rtol=2e-5)
@@ -234,6 +264,7 @@ def test_train_checkpoint_tensorboard(
     assert "samples/generated_programs/text_summary" in events.Tags()["tensors"]
 
 
+@pytest.mark.parametrize("legacy_steps", [False, True])
 def test_logging_every_20_rollouts_survives_resume(
     config: Config,
     state: TrainState,
@@ -241,6 +272,7 @@ def test_logging_every_20_rollouts_survives_resume(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    legacy_steps: bool,
 ) -> None:
     config = replace(
         config,
@@ -259,22 +291,31 @@ def test_logging_every_20_rollouts_survives_resume(
     monkeypatch.setattr(grpo, "format_group_programs", formatter)
     train(config)
     checkpoint = tmp_path / "logging" / "checkpoint.msgpack"
-    assert serialization.msgpack_restore(checkpoint.read_bytes())["iteration"] == 21
+    saved = serialization.msgpack_restore(checkpoint.read_bytes())
+    episodes_per_rollout = config.num_tasks * config.group_size
+    assert saved["iteration"] == 21
+    assert saved["steps"] == saved["episodes"] == 21 * episodes_per_rollout
+    if legacy_steps:
+        saved["steps"] = 21 * int(rollout[0].mask.sum())
+        assert saved["steps"] != saved["episodes"]
+        checkpoint.write_bytes(serialization.msgpack_serialize(saved))
     assert writer.flush.call_count == 1
     train(replace(config, total_updates=41))
     saved = serialization.msgpack_restore(checkpoint.read_bytes())
     assert saved["iteration"] == 41 and saved["logged_groups"] == 2
+    assert saved["steps"] == saved["episodes"] == 41 * episodes_per_rollout
+    assert grpo.SummaryWriter.call_args.kwargs["purge_step"] == 21 * episodes_per_rollout + 1
     assert writer.flush.call_count == 2
     assert formatter.call_count == 2
-    steps_per_rollout = int(rollout[0].mask.sum())
     reward_steps = [call.args[2] for call in writer.add_scalar.call_args_list if call.args[0] == "charts/reward_mean"]
-    assert reward_steps == [20 * steps_per_rollout, 40 * steps_per_rollout]
+    assert reward_steps == [20 * episodes_per_rollout, 40 * episodes_per_rollout]
     sample_steps = [
         call.args[2] for call in writer.add_text.call_args_list if call.args[0] == "samples/generated_programs"
     ]
     assert sample_steps == reward_steps
     lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("iteration=")]
     assert [line.split()[0] for line in lines] == ["iteration=20", "iteration=40"]
+    assert [line.split()[1] for line in lines] == [f"step={step}" for step in reward_steps]
 
 
 @pytest.mark.parametrize("interval", [0, -1, 1.5, True])
@@ -331,9 +372,13 @@ def test_formatted_samples_replay_ast_source(config: Config, rollout: tuple) -> 
 
 def test_configuration_and_schedule(config: Config, tmp_path: Path) -> None:
     loaded = load_config(Path(__file__).resolve().parents[1] / "configs/karel_ast_grpo.yaml")
-    assert loaded.max_nodes == 128 and loaded.decision_batch_size == 32
+    assert loaded.max_nodes == 128
+    assert not hasattr(loaded, "decision_batch_size")
     assert loaded.bf16 and loaded.attention_implementation == "cudnn"
-    assert loaded.d_model == 320 and loaded.num_layers == 7 and loaded.num_heads == 5
+    # Model size is a tunable experiment setting; require cuDNN-compatible
+    # head dimensions rather than pinning the example to one architecture.
+    assert loaded.d_model > 0 and loaded.num_layers > 0 and loaded.num_heads > 0
+    assert loaded.d_model % (8 * loaded.num_heads) == 0
     assert loaded.env.success_weight == 1.0
     weighted = replace(
         loaded, env=replace(loaded.env, syntax_weight=0.25, runtime_weight=0, distance_weight=2.5, success_weight=2.0)
@@ -341,11 +386,12 @@ def test_configuration_and_schedule(config: Config, tmp_path: Path) -> None:
     config_path = tmp_path / "weighted.yaml"
     config_path.write_text(grpo.yaml.safe_dump(grpo.asdict(weighted)))
     assert load_config(config_path) == weighted
+    # Older saved run configs still load for inference/resume.
+    config_path.write_text(grpo.yaml.safe_dump({**grpo.asdict(weighted), "decision_batch_size": 32}))
+    assert load_config(config_path) == weighted
     schedule = learning_rate_schedule(config)
     np.testing.assert_allclose(schedule(0), config.learning_rate)
     np.testing.assert_allclose(schedule(config.total_updates), 0.0)
-    with pytest.raises(AssertionError):
-        replace(config, decision_batch_size=0)
 
 
 @pytest.mark.parametrize("success_weight", [0.0, 2.0])
@@ -466,6 +512,9 @@ def test_resume_uses_modified_config_and_counts_prior_episodes(config: Config, t
     directory = tmp_path / "mutable"
     payload = serialization.msgpack_restore((directory / "checkpoint.msgpack").read_bytes())
     assert payload["iteration"] == 2 and payload["episodes"] == 6
+    assert payload["steps"] == 6
+    events = EventAccumulator(str(directory)).Reload().Scalars("charts/reward_mean")
+    assert [event.step for event in events] == [2, 6]
     # A newly enabled KL penalty anchors at the resumed weights.
     chex.assert_trees_all_equal(payload["reference_params"], initial.params)
     assert load_config(directory / "config.yaml") == changed

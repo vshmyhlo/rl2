@@ -5,8 +5,8 @@ current holes from one shared tree encoding; new children wait for the next roun
 Completed trees are printed and submitted to KarelProgramEnv for its unchanged
 terminal rewards. Rollouts store the partial tree BEFORE each round, including
 its per-hole masks. Updates replay those states and normalize losses per program.
-Round microbatches accumulate gradients before one optimizer update, bounding
-memory without changing program weighting or clipping gradients per microbatch.
+Each optimizer minibatch replays all program rounds in one forward/backward
+pass, then clips gradients and applies one optimizer update.
 """
 
 import argparse
@@ -34,7 +34,7 @@ from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
 from rl2.ast_transformer import ASTTransformer
-from rl2.karel import ACTIONS, REWARD_COMPONENTS, TOKEN_TO_ID, KarelConfig, KarelProgramEnv
+from rl2.karel import ACTIONS, REWARD_COMPONENTS, TOKEN_TO_ID, KarelConfig, KarelPair, KarelProgramEnv
 from rl2.karel_ast import AST_ACTIONS, ASTFeatures, KarelAST, batch_features
 from rl2.transformer import AttentionImplementation
 
@@ -55,7 +55,6 @@ class Config:
     num_layers: int = 7
     max_nodes: int = 128
     max_depth: int = 64
-    decision_batch_size: int = 32  # Partial-tree rounds per microbatch; each predicts all holes.
     num_heads: int = 5
     num_kv_heads: int | None = None
     bf16: bool = False
@@ -85,9 +84,6 @@ class Config:
         if not np.isfinite(self.checkpoint_interval_seconds):
             raise ValueError("checkpoint_interval_seconds must be finite")
         KarelAST.empty(self.max_nodes, self.max_depth, self.env.max_program_tokens)
-        if type(self.decision_batch_size) is not int:
-            raise TypeError("decision_batch_size must be an integer")
-        chex.assert_scalar_positive(self.decision_batch_size)
         if type(self.bf16) is not bool:
             raise TypeError("bf16 must be a boolean")
         if self.attention_implementation not in ("xla", "cudnn"):
@@ -179,7 +175,7 @@ class TrainingProgress(NamedTuple):
     reference_params: optax.Params | None
     key: jax.Array
     iteration: int  # Number of fully completed rollout batches.
-    steps: int  # Cumulative sampled hole decisions, for TensorBoard.
+    steps: int  # Completed program episodes, for TensorBoard (same as episodes).
     logged_groups: int
     episodes: int
 
@@ -233,11 +229,16 @@ def _restore_checkpoint(data: bytes, config: Config, state: TrainState, rng: np.
         if type(counter) is not int or counter < 0:
             raise ValueError("Invalid checkpoint counters")
     rng.bit_generator.state = json.loads(payload["numpy_rng"])
-    return TrainingProgress(restored, reference, key, *counters)
+    iteration, _, logged_groups, episodes = counters
+    # Older checkpoints counted hole decisions in steps; episodes already holds
+    # the correct total, including runs whose batch size changed on resume.
+    return TrainingProgress(restored, reference, key, iteration, episodes, logged_groups, episodes)
 
 
 def load_config(path: str | Path) -> Config:
     settings = yaml.safe_load(_read_bytes(str(path))) or {}
+    # Saved run configs may still contain the retired gradient-accumulation knob.
+    settings.pop("decision_batch_size", None)
     if "env" in settings:
         settings["env"] = KarelConfig(**settings["env"])
     return Config(**settings)
@@ -334,9 +335,14 @@ def collect_rollout(
     batch_size = config.num_tasks * config.group_size
     if len(envs) != batch_size or any(env.config != config.env for env in envs):
         raise ValueError("Expected num_tasks * group_size environments with the configured limits")
-    # Same reset seed gives every member of a group the same sampled pair.
-    seeds = np.repeat(rng.integers(0, 2**31, size=config.num_tasks), config.group_size)
-    pairs = [env.reset(seed=int(seed)) for env, seed in zip(envs, seeds)]
+    # Sample once per group; copies retain independent episode and RNG state.
+    seeds = rng.integers(0, 2**31, size=config.num_tasks)
+    pairs: list[KarelPair] = []
+    for group, seed in enumerate(seeds):
+        start = group * config.group_size
+        first = envs[start]
+        pairs.append(first.reset(seed=int(seed)))
+        pairs.extend(env.reset_from(first) for env in envs[start + 1 : start + config.group_size])
     initial = np.stack([pair.initial for pair in pairs])
     target = np.stack([pair.target for pair in pairs])
     shape = (config.max_rounds, batch_size, config.max_nodes)
@@ -488,7 +494,6 @@ def objective(
     batch: GRPOBatch,
     config: Config,
     reference_log_probs: jax.Array | None = None,
-    normalization: jax.Array | None = None,
 ) -> tuple[jax.Array, Metrics]:
     """Clip each hole decision; average all decisions equally within each program."""
     chex.assert_rank(batch.actions, 3)
@@ -498,8 +503,7 @@ def objective(
     chex.assert_type(batch.mask, jnp.bool_)
     mask = batch.mask & (batch.actions != KarelProgramEnv.pad_token_id)
     log_probs = action_log_prob(logits, batch.actions)
-    if normalization is None:
-        normalization = mask.astype(jnp.float32) / jnp.maximum(mask.sum(axis=(0, 2)), 1)[None, :, None] / mask.shape[1]
+    normalization = mask.astype(jnp.float32) / jnp.maximum(mask.sum(axis=(0, 2)), 1)[None, :, None] / mask.shape[1]
     chex.assert_shape(normalization, mask.shape)
     chex.assert_type(normalization, jnp.float32)
 
@@ -537,7 +541,7 @@ def objective(
 def update(
     state: TrainState, batch: GRPOBatch, config: Config, reference_params: optax.Params | None = None
 ) -> tuple[TrainState, Metrics]:
-    """Accumulate round microbatch gradients; apply one program-level update."""
+    """Replay all rounds in one forward/backward pass per optimizer minibatch."""
     if config.kl_coef and reference_params is None:
         raise ValueError("Frozen reference parameters are required when kl_coef > 0")
     chex.assert_rank(batch.actions, 3)
@@ -549,61 +553,30 @@ def update(
     chex.assert_type((batch.tree.is_hole, batch.tree.node_mask, batch.tree.action_mask), jnp.bool_)
     steps, programs, _ = batch.actions.shape
     count = steps * programs
-    width = config.decision_batch_size
-    padded = ((count + width - 1) // width) * width
+    chex.assert_shape(batch.initial, (programs, None, None, 6))
+    chex.assert_equal_shape((batch.initial, batch.target))
+    chex.assert_type((batch.initial, batch.target), jnp.int32)
 
     def flatten(value: Array) -> jax.Array:
         chex.assert_shape(value, (steps, programs, *value.shape[2:]))
-        value = jnp.asarray(value).reshape(count, *value.shape[2:])
-        return jnp.pad(value, ((0, padded - count),) + ((0, 0),) * (value.ndim - 1))
+        return jnp.asarray(value).reshape(count, *value.shape[2:])
 
-    trees = ASTFeatures(*(flatten(value) for value in batch.tree))
-    actions, old_log_probs, mask = (flatten(value) for value in (batch.actions, batch.old_log_probs, batch.mask))
-    weights = flatten(
-        batch.mask.astype(jnp.float32) / jnp.maximum(batch.mask.sum(axis=(0, 2)), 1)[None, :, None] / programs
-    )
-    zeros = jax.tree.map(jnp.zeros_like, state.params)
-    metric_zeros = tuple(jnp.asarray(0.0, jnp.float32) for _ in range(5))
+    tree = ASTFeatures(*(flatten(value) for value in batch.tree))
+    # Round-major flattening: each round repeats the same ordered grid pairs.
+    rows = jnp.arange(count, dtype=jnp.int32) % programs
+    initial, target = batch.initial[rows], batch.target[rows]
 
-    def scan(
-        accumulated: tuple[optax.Params, Metrics], indices: jax.Array
-    ) -> tuple[tuple[optax.Params, Metrics], None]:
-        chex.assert_shape(indices, (width,))
-        chex.assert_type(indices, jnp.int32)
-        rows = indices % programs
-        tree = ASTFeatures(*(value[indices] for value in trees))
-        chunk = GRPOBatch(
-            batch.initial[rows],
-            batch.target[rows],
-            ASTFeatures(*(x[None] for x in tree)),
-            actions[indices][None],
-            old_log_probs[indices][None],
-            mask[indices][None],
-            batch.advantages[rows],
-        )
+    def replay(params: optax.Params) -> jax.Array:
+        logits = state.apply_fn({"params": params}, initial, target, tree)
+        return logits.reshape(*batch.actions.shape, len(AST_ACTIONS))
 
-        def evaluate() -> tuple[optax.Params, Metrics]:
-            reference = None
-            if config.kl_coef:
-                logits = state.apply_fn({"params": reference_params}, chunk.initial, chunk.target, tree)
-                reference = action_log_prob(logits, chunk.actions[0])[None]
+    reference = action_log_prob(replay(reference_params), batch.actions) if config.kl_coef else None
 
-            def loss_fn(params: optax.Params) -> tuple[jax.Array, Metrics]:
-                logits = state.apply_fn({"params": params}, chunk.initial, chunk.target, tree)
-                return objective(logits[None], chunk, config, reference, weights[indices][None])
+    def loss_fn(params: optax.Params) -> tuple[jax.Array, Metrics]:
+        # Restore round/program axes so the objective retains equal program weights.
+        return objective(replay(params), batch, config, reference)
 
-            (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-            return grads, metrics
-
-        grads, metrics = jax.lax.cond(chunk.mask.any(), evaluate, lambda: (zeros, metric_zeros))
-        return (
-            jax.tree.map(jnp.add, accumulated[0], grads),
-            tuple(a + b for a, b in zip(accumulated[1], metrics)),
-        ), None
-
-    (grads, metrics), _ = jax.lax.scan(
-        scan, (zeros, metric_zeros), jnp.arange(padded, dtype=jnp.int32).reshape(-1, width)
-    )
+    (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     if config.target_kl is None:
         return state.apply_gradients(grads=grads), metrics
     state = jax.lax.cond(metrics[2] > config.target_kl, lambda: state, lambda: state.apply_gradients(grads=grads))
@@ -714,8 +687,8 @@ def train(config: Config) -> TrainState:
             rollout_start = monotonic()
             batch, rewards, diagnostics, key = collect_rollout(state, envs, rng, key, config)
             rollout_seconds = monotonic() - rollout_start
-            steps += int(batch.mask.sum())
             episodes += batch_size
+            steps = episodes
             learning_rate = float(learning_rate_schedule(config)(iteration))
             state = state.replace(
                 opt_state=state.opt_state._replace(

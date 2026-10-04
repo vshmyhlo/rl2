@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import NamedTuple
@@ -228,8 +229,9 @@ def progress_reward(
     Smaller regressions score between 0 and 0.5.
     The sampler excludes identical initial/target pairs;
     strictly positive weights therefore guarantee a positive denominator.
-    This is always the runtime term and also the distance term on normal
-    completion; the other reward terms are added by step().
+    This is the distance term on both normal completion and execution failure.
+    The runtime term separately records normal completion; step() adds the
+    remaining terms and applies their weights.
     """
     if distance_map is None:
         distance_map = target_distance_map(target)
@@ -585,6 +587,25 @@ class KarelProgramEnv:
         # Callers may transform observations without changing the task we evaluate.
         return KarelPair(self._task.initial.copy(), self._task.target.copy())
 
+    def reset_from(self, source: KarelProgramEnv) -> KarelPair:
+        """Start an independent episode from a freshly reset matching environment.
+
+        Reuse its sampled task and BFS map without recomputing either. Copy all
+        mutable arrays and RNG state so execution, observation edits, and future
+        resets cannot affect the source or other members of a sampling group.
+        """
+        if self.config != source.config:
+            raise ValueError("Cannot copy a task between environments with different configs")
+        if source._needs_reset or source._task is None or source._distance_map is None or source._program:
+            raise ValueError("Source environment must be freshly reset")
+        self._task = KarelTask(source._task.initial.copy(), source._task.target.copy(), source._task.program)
+        self._distance_map = source._distance_map.copy()
+        self._rng = deepcopy(source._rng)
+        self.action_space.np_random.bit_generator.state = deepcopy(source.action_space.np_random.bit_generator.state)
+        self._program.clear()
+        self._needs_reset = False
+        return KarelPair(self._task.initial.copy(), self._task.target.copy())
+
     def _finish(
         self,
         syntax: float,
@@ -638,18 +659,23 @@ class KarelProgramEnv:
         self._program.append(TOKENS[int(action)])
         if int(action) == self.terminal_token_id:
             self._needs_reset = True
-            initial_distance = state_distance(
-                self._task.initial, self._task.target, self.config, distance_map=self._distance_map
-            )
-            if initial_distance <= 0:
-                raise ValueError("Progress reward requires a non-identical initial/target pair")
-            previous_distance = initial_distance
+            initial_distance: float | None = None
+            previous_distance = 0.0
             # Normalize each increase before accumulation so D_initial + B need
             # not be representable when the distance weights are very large.
             backward_ratio = 0.0
 
             def observe_action(state: State) -> None:
-                nonlocal previous_distance, backward_ratio
+                nonlocal initial_distance, previous_distance, backward_ratio
+                # Only executable programs with an enabled trajectory term need
+                # this baseline. Syntax failures must not evaluate state distance.
+                if initial_distance is None:
+                    initial_distance = state_distance(
+                        self._task.initial, self._task.target, self.config, distance_map=self._distance_map
+                    )
+                    if initial_distance <= 0:
+                        raise ValueError("Progress reward requires a non-identical initial/target pair")
+                    previous_distance = initial_distance
                 distance = state_distance(state, self._task.target, self.config, distance_map=self._distance_map)
                 backward_ratio += max(0.0, distance - previous_distance) / initial_distance
                 previous_distance = distance
@@ -657,7 +683,7 @@ class KarelProgramEnv:
             def trajectory_bonus() -> float:
                 # A sum of positive changes would reward undo/redo loops. Instead
                 # credit only net improvement, discounted by all backward steps.
-                if self.config.trajectory_weight == 0:
+                if initial_distance is None:
                     return 0.0
                 return self.config.trajectory_weight * (
                     max(0.0, initial_distance - previous_distance) / initial_distance / (1.0 + backward_ratio)
@@ -679,13 +705,15 @@ class KarelProgramEnv:
                     return self._finish(score, error=exc.reason)
                 else:
                     assert exc.partial_state is not None
-                    distance = progress_reward(
-                        self._task.initial,
-                        exc.partial_state,
-                        self._task.target,
-                        self.config,
-                        distance_map=self._distance_map,
-                    )
+                    distance = 0.0
+                    if self.config.distance_weight:
+                        distance = progress_reward(
+                            self._task.initial,
+                            exc.partial_state,
+                            self._task.target,
+                            self.config,
+                            distance_map=self._distance_map,
+                        )
                     return self._finish(
                         1.0,
                         runtime=0.0,
@@ -695,9 +723,11 @@ class KarelProgramEnv:
                         execution_steps=execution_stats.steps,
                     )
             success = bool(np.array_equal(output, self._task.target))
-            distance = progress_reward(
-                self._task.initial, output, self._task.target, self.config, distance_map=self._distance_map
-            )
+            distance = 0.0
+            if self.config.distance_weight:
+                distance = progress_reward(
+                    self._task.initial, output, self._task.target, self.config, distance_map=self._distance_map
+                )
             return self._finish(
                 1.0,
                 runtime=1.0,

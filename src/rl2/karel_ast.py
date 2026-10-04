@@ -11,7 +11,7 @@ AST depth includes list nodes and is distinct from interpreter control depth.
 
 from dataclasses import dataclass, replace
 from enum import IntEnum
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from types import MappingProxyType
 from typing import NamedTuple
 
@@ -113,6 +113,23 @@ def _minimum_sizes(max_depth: int, source: bool = False) -> NDArray[np.int32]:
     return sizes
 
 
+@lru_cache(maxsize=2 * (MAX_BLOCK_DEPTH + 1) * len(Hole))
+def _action_costs(remaining_depth: int, hole: Hole, source: bool) -> NDArray[np.int64]:
+    """Read-only grammar costs shared by nodes with the same type and depth budget."""
+    sizes = _minimum_sizes(remaining_depth, source)
+    costs = np.full(len(AST_ACTIONS), _INF, np.int64)
+    for action, constructor in enumerate(CONSTRUCTORS, 1):
+        if constructor.result != hole or (constructor.fields and remaining_depth == 0):
+            continue
+        local = _SOURCE_COST[constructor.name] if source else 1
+        costs[action] = local + sum(int(sizes[remaining_depth - 1, child]) for _, child in constructor.fields)
+    for value, (_, value_hole) in enumerate(VALUES, 1):
+        if value_hole == hole:
+            costs[len(CONSTRUCTORS) + value] = 1
+    costs.flags.writeable = False
+    return costs
+
+
 @dataclass(frozen=True)
 class Node:
     hole_type: Hole
@@ -202,6 +219,10 @@ class KarelAST:
         return cls((Node(Hole.PROGRAM),), max_nodes, max_depth, max_program_tokens)
 
     def preorder(self) -> tuple[int, ...]:
+        return self._preorder
+
+    @cached_property
+    def _preorder(self) -> tuple[int, ...]:
         order: list[int] = []
         pending = [0]
         while pending:
@@ -221,19 +242,7 @@ class KarelAST:
     def _costs(self, index: int, *, source: bool = False) -> NDArray[np.int64]:
         """Minimum completed subtree costs for each grammar-legal action."""
         node = self.nodes[index]
-        sizes = _minimum_sizes(self.max_depth, source)
-        costs = np.full(len(AST_ACTIONS), _INF, np.int64)
-        for action, constructor in enumerate(CONSTRUCTORS, 1):
-            if constructor.result != node.hole_type or (constructor.fields and node.depth == self.max_depth):
-                continue
-            local = _SOURCE_COST[constructor.name] if source else 1
-            costs[action] = local + sum(
-                int(sizes[self.max_depth - node.depth - 1, child]) for _, child in constructor.fields
-            )
-        for value, (_, hole) in enumerate(VALUES, 1):
-            if hole == node.hole_type:
-                costs[len(CONSTRUCTORS) + value] = 1
-        return costs
+        return _action_costs(self.max_depth - node.depth, node.hole_type, source)
 
     def _minimum_completion(self, *, source: bool = False) -> int:
         sizes = _minimum_sizes(self.max_depth, source)
@@ -262,6 +271,15 @@ class KarelAST:
         return allowed
 
     def parallel_action_mask(self) -> NDArray[np.bool_]:
+        """Read-only mask cached for this immutable tree, including during validation.
+
+        Expansion returns a new tree with a fresh cache, so features() and
+        expand_round() reuse the same mask without accepting caller-supplied masks.
+        """
+        return self._parallel_action_mask
+
+    @cached_property
+    def _parallel_action_mask(self) -> NDArray[np.bool_]:
         """Allocate shared slack before sampling independent choices at every hole.
 
         Reserve the cheapest completion of every hole, then split extra capacity
@@ -274,6 +292,7 @@ class KarelAST:
         holes = [(position, index) for position, index in enumerate(order) if self.nodes[index].is_hole]
         result = np.zeros((self.max_nodes, len(AST_ACTIONS)), np.bool_)
         if not holes:
+            result.flags.writeable = False
             return result
         extras = []
         slacks = []
@@ -305,6 +324,7 @@ class KarelAST:
             allocated &= costs <= shares[:, None]
         for (position, _), allowed in zip(holes, allocated):
             result[position] = allowed
+        result.flags.writeable = False
         return result
 
     def expand_round(self, actions: NDArray[np.int32]) -> "KarelAST":

@@ -26,6 +26,35 @@ def build(program: str, max_nodes: int = 256, max_depth: int = 64) -> KarelAST:
     return tree
 
 
+def test_parallel_mask_cache_reused_and_invalidated_on_expansion(monkeypatch: pytest.MonkeyPatch) -> None:
+    tree = KarelAST.empty(16, 4, 16)
+    mask = tree.features().action_mask
+    assert tree.parallel_action_mask() is mask
+    assert tree.preorder() is tree.preorder()
+    with pytest.raises(ValueError, match="read-only"):
+        mask[0, ACTION_ID["move"]] = True
+    original_costs = KarelAST._costs
+    calls = []
+
+    def costs(self: KarelAST, index: int, *, source: bool = False) -> np.ndarray:
+        calls.append(index)
+        return original_costs(self, index, source=source)
+
+    monkeypatch.setattr(KarelAST, "_costs", costs)
+    actions = np.zeros(16, np.int32)
+    actions[0] = ACTION_ID["Program"]
+    expanded = tree.expand_round(actions)
+    assert not calls  # Validation reuses the mask that supplied the logits.
+    new_mask = expanded.features().action_mask
+    assert calls
+    assert new_mask is not mask
+    assert new_mask[1, ACTION_ID["ConsNonEmpty"]]
+    assert not new_mask[0].any()
+    actions[0] = ACTION_ID["move"]
+    with pytest.raises(ValueError, match="Invalid AST action"):
+        tree.expand_round(actions)
+
+
 def test_all_karel_constructs_round_trip() -> None:
     bodies = [*ACTIONS, *(f"REPEAT R={i} r( move r)" for i in range(20))]
     for predicate in PREDICATES:
