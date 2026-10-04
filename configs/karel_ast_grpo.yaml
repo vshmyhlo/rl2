@@ -24,11 +24,11 @@ entropy_coef: 0.01
 # AST constructor/value masking is always enabled, including node/depth/source budgets.
 kl_coef: 0.0 # Optional penalty against the frozen initial model; no reference forward when zero
 max_grad_norm: 0.5
-log_dir: gs://cohere-dev/vlad/rl2/grpo_karel
-run_id: karel_ast_parallel_v4 # Reuse to resume; change for a new run, or null for a timestamped run
+log_dir: gs://cohere-dev/vlad/rl2/karel_ast_grpo
+run_id: v1 # Reuse to resume; change for a new run, or null for a timestamped run
 checkpoint_interval_seconds: 300 # Save to log_dir/run_id on GCS every 5 minutes (at rollout boundaries), plus final
-log_interval: 20 # TensorBoard scalars, stdout, and flushes every 20 completed rollouts
-log_program_interval: 20 # Samples on logging iterations divisible by this interval; rotate through task groups
+log_interval: 10 # TensorBoard scalars, stdout, and flushes every 20 completed rollouts
+log_program_interval: 10 # Samples on logging iterations divisible by this interval; rotate through task groups
 log_program_count: 8 # Compare first 8 samples from the same group; 0 disables
 env:
   height: 8
@@ -41,7 +41,13 @@ env:
   max_program_tokens: 128 # Printed-source limit (including m)); also enforced by the AST mask
   max_execution_steps: 256
   max_sampling_attempts: 1000
-  # reward = syntax + runtime + distance + exact_success + trajectory - length cost - execution cost.
+  # reward = syntax_weight * syntax + runtime_weight * runtime + distance_weight * distance
+  #          + success_weight * exact_success + trajectory - length cost - execution cost.
+  # Active reward: final/last-valid distance progress + exact-success bonus; exact success earns 2.
+  syntax_weight: 0.0 # Scale syntax score; 0 disables. Reward weights must be finite and nonnegative.
+  runtime_weight: 0.0 # Scale binary completion: 1 completed, 0 runtime error/execution limit; 0 weight disables.
+  distance_weight: 1.0 # Scale progress from final or last valid execution state; 0 disables.
+  success_weight: 1.0 # Bonus for normal completion at the exact target; 0 disables.
   # progress(s) = clip(1 - 0.5 * D(s,target) / D(initial,target), 0, 1).
   # Exact target: 1; unchanged distance: 0.5; doubled distance or worse: 0.
   # D combines these errors; all weights must be finite and strictly positive.
@@ -53,6 +59,7 @@ env:
   execution_penalty_weight: 0.0 # Deduct weight * consumed ticks / max_execution_steps; zero if not executed
   # trajectory = max(0, D_initial - D_last) / (D_initial + sum of positive distance increases).
   # Add trajectory_weight * trajectory after completed or failed executions; zero on syntax/token limits.
+  # Unweighted (syntax, runtime, distance) scores below; multiply by the weights above.
   # Syntax errors / missing m): (1/(1+d), 0, 0), d = minimum syntax token edits.
-  # Runtime / execution-limit failure: (1, progress(last_valid_state), 0).
-  # Normal completion: (1, progress(final_state), progress(final_state)); +1 for exact success, base total 4, plus trajectory bonus.
+  # Runtime / execution-limit failure: (1, 0, progress(last_valid_state)).
+  # Normal completion: (1, 1, progress(final_state)); +success_weight for exact success.

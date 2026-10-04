@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from dataclasses import replace
 
 import gymnasium as gym
 import numpy as np
@@ -47,10 +48,11 @@ def expected_info(reward: float, success: bool = False, error: str | None = None
     if error in ("syntax_error", "token_limit"):
         syntax, runtime, distance = reward, 0.0, 0.0
     elif error in ("runtime_error", "execution_limit"):
-        syntax, runtime, distance = 1.0, reward - 1.0, 0.0
+        syntax, runtime, distance = 1.0, 0.0, reward - 1.0
     else:
         syntax = 1.0
-        runtime = distance = (reward - 1.0 - float(success)) / 2.0
+        runtime = 1.0
+        distance = reward - 2.0 - float(success)
     return {
         "success": success,
         "error": error,
@@ -204,7 +206,7 @@ def test_equivalent_program_gets_full_reward(fixed_env: KarelProgramEnv) -> None
     assert result == (None, 4.0, True, False, expected_info(4.0, success=True))
 
 
-@pytest.mark.parametrize("body,reward", [("move turnLeft", 2.0), ("move pickMarker", 2.0), ("turnLeft", 1.0)])
+@pytest.mark.parametrize("body,reward", [("move turnLeft", 2.5), ("move pickMarker", 2.5), ("turnLeft", 2.0)])
 def test_target_matching_checks_heading_markers_and_position(
     fixed_env: KarelProgramEnv, body: str, reward: float
 ) -> None:
@@ -487,13 +489,13 @@ def test_failed_reset_invalidates_old_task_and_can_recover(monkeypatch: pytest.M
 @pytest.mark.parametrize(
     "body,reward,success,error",
     [
-        ("move", 2.5, False, None),
-        ("turnLeft turnRight", 2.0, False, None),
-        ("turnLeft", 1.5, False, None),
-        ("turnLeft move putMarker", 1.0, False, None),
+        ("move", 2.75, False, None),
+        ("turnLeft turnRight", 2.5, False, None),
+        ("turnLeft", 2.25, False, None),
+        ("turnLeft move putMarker", 2.0, False, None),
         ("move move", 4.0, True, None),
-        ("move putMarker", 2.0, False, None),  # Undo progress by spoiling a correct cell.
-        ("move move pickMarker", 2.5, False, None),
+        ("move putMarker", 2.5, False, None),  # Undo progress by spoiling a correct cell.
+        ("move move pickMarker", 2.75, False, None),
         ("move move move move", 1.75, False, "runtime_error"),  # Latest state, not the earlier exact target.
     ],
 )
@@ -523,7 +525,7 @@ def test_terminal_progress_reward(
         ("REPEAT R=0 r( move r) turnLeft", 1, 2, "execution_limit"),
     ],
 )
-def test_runtime_score_uses_partial_progress(
+def test_distance_score_uses_partial_progress_after_failure(
     world: State, monkeypatch: pytest.MonkeyPatch, action: str, markers: int, budget: int, reason: str
 ) -> None:
     world[2, 2, 5] = markers
@@ -540,7 +542,7 @@ def test_runtime_score_uses_partial_progress(
     )
     env.reset()
     result = submit(env, f"DEF run m( move {action} m)".split())
-    # Syntax=1, normalized runtime progress=0.75, distance=0 on failure.
+    # Syntax=1, runtime=0, distance progress=0.75 on failure.
     assert result == (None, 1.75, True, False, expected_info(1.75, error=reason))
 
 
@@ -699,11 +701,11 @@ def test_wall_detour_progress_and_reset_cache(
     env.reset()
     assert len(map_calls) == 1
     result = submit(env, f"DEF run m( {prefix} {suffix} m)".split())
-    expected_distance = 7 / 12 if error is None else 0.0
-    assert result[1] == pytest.approx(1 + 7 / 12 + expected_distance)
+    expected_runtime = float(error is None)
+    assert result[1] == pytest.approx(1 + expected_runtime + 7 / 12)
     assert result[2:4] == (True, False)
-    assert result[4]["reward_runtime"] == pytest.approx(7 / 12)
-    assert result[4]["reward_distance"] == pytest.approx(expected_distance)
+    assert result[4]["reward_runtime"] == expected_runtime
+    assert result[4]["reward_distance"] == pytest.approx(7 / 12)
     assert result[4]["reward_success"] == 0.0
     assert result[4]["error"] == error
     assert len(map_calls) == 1  # Evaluation reuses reset's map for both states.
@@ -756,14 +758,14 @@ def test_distance_rejects_unreachable_robot_and_wall_target(world: State) -> Non
 @pytest.mark.parametrize(
     "body,budget,base,bonus,error",
     [
-        ("pickMarker", 256, 2.5, 0.125, None),
+        ("pickMarker", 256, 2.75, 0.125, None),
         ("pickMarker pickMarker", 256, 4.0, 0.25, None),
         ("putMarker pickMarker pickMarker pickMarker", 256, 4.0, 1 / 6, None),
         ("pickMarker putMarker pickMarker pickMarker", 256, 4.0, 1 / 6, None),
         ("turnLeft pickMarker turnRight pickMarker", 256, 4.0, 1 / 6, None),
-        ("pickMarker putMarker", 256, 2.0, 0.0, None),
-        ("putMarker", 256, 1.5, 0.0, None),
-        ("REPEAT R=0 r( pickMarker r)", 256, 2.0, 0.0, None),
+        ("pickMarker putMarker", 256, 2.5, 0.0, None),
+        ("putMarker", 256, 2.25, 0.0, None),
+        ("REPEAT R=0 r( pickMarker r)", 256, 2.5, 0.0, None),
         ("pickMarker pickMarker pickMarker", 256, 2.0, 0.25, "runtime_error"),
         ("pickMarker move", 256, 1.75, 0.125, "runtime_error"),
         ("pickMarker pickMarker", 1, 1.75, 0.125, "execution_limit"),
@@ -942,8 +944,8 @@ def test_combined_default_rewards_match_recorded_execution(seed: int, suffix: st
     success = error is None and np.array_equal(final, pair.target)
     expected = {
         "reward_syntax": 1.0,
-        "reward_runtime": progress,
-        "reward_distance": progress if error is None else 0.0,
+        "reward_runtime": float(error is None),
+        "reward_distance": progress,
         "reward_success": float(success),
         "reward_trajectory": config.trajectory_weight
         * max(0.0, distances[0] - final_distance)
@@ -1013,3 +1015,107 @@ def test_total_reward_overflow_is_rejected(fixed_env: KarelProgramEnv) -> None:
     fixed_env.reset()
     with pytest.raises(ValueError, match="Total reward overflowed"):
         submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])
+
+
+@pytest.mark.parametrize("weights", [(1, 1, 1), (0, 1, 1), (1, 0, 1), (1, 1, 0), (0, 0, 0), (0.25, 2, 3)])
+@pytest.mark.parametrize(
+    "source,budget,token_limit,scores,error,success",
+    [
+        ("DEF run m( move m)", 256, 128, (1, 1, 1), None, True),
+        ("DEF run m( turnLeft turnRight m)", 256, 128, (1, 1, 0.5), None, False),
+        ("DEF run m( move pickMarker pickMarker m)", 256, 128, (1, 0, 0.5), "runtime_error", False),
+        ("DEF run m( move turnLeft m)", 1, 128, (1, 0, 1), "execution_limit", False),
+        ("DEF run m( m)", 256, 128, (0.5, 0, 0), "syntax_error", False),
+        ("DEF run m( move move", 256, 5, (0.5, 0, 0), "token_limit", False),
+    ],
+)
+def test_weighted_reward_terms(
+    fixed_env: KarelProgramEnv,
+    weights: tuple[float, float, float],
+    source: str,
+    budget: int,
+    token_limit: int,
+    scores: tuple[float, float, float],
+    error: str | None,
+    success: bool,
+) -> None:
+    fixed_env.config = replace(
+        fixed_env.config,
+        syntax_weight=weights[0],
+        runtime_weight=weights[1],
+        distance_weight=weights[2],
+        max_execution_steps=budget,
+        max_program_tokens=token_limit,
+    )
+    fixed_env.reset()
+    _, reward, terminated, truncated, info = submit(fixed_env, source.split())
+    assert info["error"] == error and info["success"] == success
+    assert truncated == (error == "token_limit") and terminated == (not truncated)
+    expected = dict(zip(("syntax", "runtime", "distance"), (weight * score for weight, score in zip(weights, scores))))
+    for name, value in expected.items():
+        assert info[f"reward_{name}"] == pytest.approx(value)
+    assert info["reward_success"] == float(success)
+    assert reward == pytest.approx(sum(expected.values()) + float(success))
+    assert reward == pytest.approx(sum(value for key, value in info.items() if key.startswith("reward_")))
+
+
+@pytest.mark.parametrize("weight_name", ["syntax_weight", "runtime_weight", "distance_weight", "success_weight"])
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), -float("inf")])
+def test_term_weights_must_be_finite_and_nonnegative(weight_name: str, value: float) -> None:
+    with pytest.raises((AssertionError, ValueError)):
+        KarelConfig(**{weight_name: value})
+
+
+@pytest.mark.parametrize("success_weight", [0.0, 0.25, 1.0, 2.0])
+@pytest.mark.parametrize(
+    "body,budget,distance,success,error",
+    [
+        ("move", 256, 1.0, True, None),
+        ("turnLeft turnRight", 256, 0.5, False, None),
+        ("putMarker", 256, 0.5, False, "runtime_error"),  # Fails before any action succeeds.
+        ("move putMarker", 256, 1.0, False, "runtime_error"),
+        ("move turnLeft", 1, 1.0, False, "execution_limit"),
+        ("", 256, 0.0, False, "syntax_error"),
+    ],
+)
+def test_distance_only_reward_preserves_failed_execution_progress(
+    fixed_env: KarelProgramEnv,
+    body: str,
+    budget: int,
+    distance: float,
+    success: bool,
+    error: str | None,
+    success_weight: float,
+) -> None:
+    fixed_env.config = replace(
+        fixed_env.config,
+        syntax_weight=0,
+        runtime_weight=0,
+        distance_weight=1,
+        success_weight=success_weight,
+        max_markers=1,
+        max_execution_steps=budget,
+    )
+    fixed_env.reset()
+    result = submit(fixed_env, f"DEF run m( {body} m)".split())
+    assert result[1] == pytest.approx(distance + success_weight * float(success))
+    assert result[4]["reward_success"] == pytest.approx(success_weight * float(success))
+    assert result[4]["reward_runtime"] == 0
+    assert result[4]["reward_distance"] == pytest.approx(distance)
+    assert result[4]["success"] == success
+    assert result[4]["error"] == error
+
+
+@pytest.mark.parametrize("source", ["DEF run m( m)", "DEF run m( move move"])
+def test_disabled_syntax_reward_skips_edit_distance(
+    fixed_env: KarelProgramEnv, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    def unexpected_score(tokens: Sequence[str]) -> float:
+        raise AssertionError("Disabled syntax reward must not compute edit distance")
+
+    monkeypatch.setattr("rl2.karel.syntax_reward", unexpected_score)
+    fixed_env.config = replace(fixed_env.config, syntax_weight=0, max_program_tokens=5)
+    fixed_env.reset()
+    result = submit(fixed_env, source.split())
+    assert result[1] == 0 and result[4]["reward_syntax"] == 0
+    assert result[4]["error"] in ("syntax_error", "token_limit")

@@ -4,11 +4,11 @@ States are int32 arrays shaped (height, width, 6): four one-hot robot headings
 (north, east, south, west), walls, and marker counts. Actions are DSL token IDs;
 The outer closing token m) executes the program against the initial state. This is a plain
 class, not a Gymnasium Env: step observations deliberately are always None.
-Terminal reward sums syntax, runtime, and distance scores, each in [0, 1],
-plus exact-success and weighted trajectory bonuses. Terminal info exposes all seven components.
-Invalid syntax receives only 1/(1+d), where d is the minimum syntax edit count.
+Terminal reward sums weighted syntax, runtime, and distance scores, each originally in [0, 1],
+plus weighted exact-success and trajectory bonuses. Terminal info exposes all seven components.
+With default term weights, invalid syntax receives only 1/(1+d), where d is the minimum syntax edit count.
 Execution failures receive 1 plus progress from the last valid state; completed
-executions receive 1 plus twice final-state progress and the success bonus.
+executions receive 2 plus final-state progress and the success bonus.
 Terminal rewards deduct normalized program-length and execution-step costs.
 Executable programs also receive a trajectory bonus for net progress discounted
 by cumulative distance increases. PAD is reserved for batching.
@@ -87,6 +87,10 @@ class KarelConfig:
     position_weight: float = 1.0  # Weight per step of shortest-path robot-position error.
     orientation_weight: float = 1.0  # Weight for any incorrect robot heading.
     marker_weight: float = 1.0  # Weight per missing or extra marker, summed over all cells.
+    syntax_weight: float = 1.0  # Scale the syntax reward contribution; zero disables.
+    runtime_weight: float = 1.0  # Scale binary execution completion (1 completed, 0 failed); zero disables.
+    distance_weight: float = 1.0  # Scale progress from the final or last valid execution state; zero disables.
+    success_weight: float = 1.0  # Bonus for normal completion at the exact target; zero disables.
     trajectory_weight: float = 0.25  # Net progress discounted by cumulative distance increases; zero disables.
     length_penalty_weight: float = 0.05  # Maximum deduction at the generated-token limit.
     execution_penalty_weight: float = 0.05  # Maximum deduction at the execution-step limit.
@@ -118,7 +122,15 @@ class KarelConfig:
             chex.assert_scalar_positive(weight)
             if not np.isfinite(weight):
                 raise ValueError("Reward distance weights must be finite and strictly positive")
-        for name in ("trajectory_weight", "length_penalty_weight", "execution_penalty_weight"):
+        for name in (
+            "syntax_weight",
+            "runtime_weight",
+            "distance_weight",
+            "success_weight",
+            "trajectory_weight",
+            "length_penalty_weight",
+            "execution_penalty_weight",
+        ):
             weight = getattr(self, name)
             chex.assert_scalar_non_negative(weight)
             if not np.isfinite(weight):
@@ -519,8 +531,11 @@ class KarelProgramEnv:
 
     reset() returns KarelPair(initial, target), without an info wrapper.
     step() returns (None, reward, terminated, truncated, info). The token m) terminates
-    and sums syntax, runtime, and distance terms, plus a +1 exact-success bonus.
-    Completed execution scores 1 + 2 * progress_reward(final) + float(success),
+    and sums weighted syntax, runtime, and distance terms, plus a weighted exact-success bonus.
+    Each term's weight defaults to 1; zero disables its reward contribution,
+    without changing execution, error classification, or exact-success detection.
+    The formulas below assume these default weights.
+    Completed execution scores 2 + progress_reward(final) + float(success),
     before the trajectory bonus; execution failures score 1 +
     progress_reward(last_valid_state) + 0. Both receive trajectory_weight *
     max(0, D_initial - D_last) / (D_initial + backward_distance), where backward
@@ -591,7 +606,15 @@ class KarelProgramEnv:
         components = dict(
             zip(
                 REWARD_COMPONENTS,
-                (syntax, runtime, distance, float(success), trajectory, length_penalty, execution_penalty),
+                (
+                    self.config.syntax_weight * syntax,
+                    self.config.runtime_weight * runtime,
+                    self.config.distance_weight * distance,
+                    self.config.success_weight * float(success),
+                    trajectory,
+                    length_penalty,
+                    execution_penalty,
+                ),
             )
         )
         info: dict[str, object] = {"success": success, "error": error}
@@ -652,10 +675,11 @@ class KarelProgramEnv:
                 )
             except KarelProgramError as exc:
                 if exc.reason == "syntax_error":
-                    return self._finish(syntax_reward(self._program), error=exc.reason)
+                    score = syntax_reward(self._program) if self.config.syntax_weight else 0.0
+                    return self._finish(score, error=exc.reason)
                 else:
                     assert exc.partial_state is not None
-                    runtime_score = progress_reward(
+                    distance = progress_reward(
                         self._task.initial,
                         exc.partial_state,
                         self._task.target,
@@ -664,7 +688,8 @@ class KarelProgramEnv:
                     )
                     return self._finish(
                         1.0,
-                        runtime_score,
+                        runtime=0.0,
+                        distance=distance,
                         error=exc.reason,
                         trajectory=trajectory_bonus(),
                         execution_steps=execution_stats.steps,
@@ -675,13 +700,14 @@ class KarelProgramEnv:
             )
             return self._finish(
                 1.0,
-                distance,
-                distance,
+                runtime=1.0,
+                distance=distance,
                 success=success,
                 trajectory=trajectory_bonus(),
                 execution_steps=execution_stats.steps,
             )
         if len(self._program) >= self.config.max_program_tokens:
             self._needs_reset = True
-            return self._finish(syntax_reward(self._program), error="token_limit", truncated=True)
+            score = syntax_reward(self._program) if self.config.syntax_weight else 0.0
+            return self._finish(score, error="token_limit", truncated=True)
         return None, 0.0, False, False, {}

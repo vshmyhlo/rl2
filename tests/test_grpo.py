@@ -329,16 +329,47 @@ def test_formatted_samples_replay_ast_source(config: Config, rollout: tuple) -> 
         assert "\n  " in source
 
 
-def test_configuration_and_schedule(config: Config) -> None:
+def test_configuration_and_schedule(config: Config, tmp_path: Path) -> None:
     loaded = load_config(Path(__file__).resolve().parents[1] / "configs/karel_ast_grpo.yaml")
     assert loaded.max_nodes == 128 and loaded.decision_batch_size == 32
     assert loaded.bf16 and loaded.attention_implementation == "cudnn"
     assert loaded.d_model == 320 and loaded.num_layers == 7 and loaded.num_heads == 5
+    assert loaded.env.success_weight == 1.0
+    weighted = replace(
+        loaded, env=replace(loaded.env, syntax_weight=0.25, runtime_weight=0, distance_weight=2.5, success_weight=2.0)
+    )
+    config_path = tmp_path / "weighted.yaml"
+    config_path.write_text(grpo.yaml.safe_dump(grpo.asdict(weighted)))
+    assert load_config(config_path) == weighted
     schedule = learning_rate_schedule(config)
     np.testing.assert_allclose(schedule(0), config.learning_rate)
     np.testing.assert_allclose(schedule(config.total_updates), 0.0)
     with pytest.raises(AssertionError):
         replace(config, decision_batch_size=0)
+
+
+@pytest.mark.parametrize("success_weight", [0.0, 2.0])
+def test_rollout_logs_weighted_reward_contributions(
+    config: Config,
+    state: TrainState,
+    rollout: tuple[GRPOBatch, np.ndarray, dict[str, float], jax.Array],
+    success_weight: float,
+) -> None:
+    config = replace(
+        config,
+        env=replace(
+            config.env, syntax_weight=0.25, runtime_weight=0, distance_weight=2.5, success_weight=success_weight
+        ),
+    )
+    envs = [KarelProgramEnv(config.env) for _ in range(config.group_size)]
+    batch, rewards, diagnostics, _ = collect_rollout(state, envs, np.random.default_rng(4), jax.random.key(3), config)
+    np.testing.assert_array_equal(batch.actions, rollout[0].actions)
+    for name in REWARD_COMPONENTS:
+        weight = {"syntax": 0.25, "runtime": 0, "distance": 2.5, "success": success_weight}.get(name, 1.0)
+        tag = f"charts/reward_{name}_mean"
+        assert diagnostics[tag] == pytest.approx(weight * rollout[2][tag])
+    assert diagnostics["charts/success_rate"] == rollout[2]["charts/success_rate"]
+    assert rewards.mean() == pytest.approx(sum(diagnostics[f"charts/reward_{name}_mean"] for name in REWARD_COMPONENTS))
 
 
 @pytest.mark.skipif(not any(d.platform == "gpu" for d in jax.devices()), reason="cuDNN needs NVIDIA GPU")
