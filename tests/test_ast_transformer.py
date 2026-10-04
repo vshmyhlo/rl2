@@ -15,6 +15,7 @@ from rl2.karel import KarelConfig, _parse
 from rl2.karel_ast import ACTION_ID, AST_ACTIONS, ASTFeatures, KarelAST, batch_features, teacher_forcing
 from rl2.train_karel_ast_grpo import (
     Config,
+    bucket_tree,
     create_state,
     generate,
     load_config,
@@ -78,6 +79,40 @@ def config() -> Config:
         log_program_count=2,
         env=KarelConfig(height=4, width=4, max_depth=0, max_statements=2),
     )
+
+
+def test_trimmed_sequence_matches_full_logits_and_gradients(config: Config, batch: ModelBatch) -> None:
+    config = replace(config, max_nodes=64)
+    initial, target = batch.initial[:4], batch.target[:4]
+    tree = ASTFeatures(
+        *(np.pad(field[:4], ((0, 0), (0, 64 - field.shape[1])) + ((0, 0),) * (field.ndim - 2)) for field in batch.tree)
+    )
+    trimmed = bucket_tree(tree)
+    assert trimmed.node_mask.shape == (4, 32)
+    state = create_state(config, initial, target)
+    params = dict(state.params)
+    for name in ("constructor_head", "value_head"):
+        params[name] = {
+            **params[name],
+            "kernel": jax.random.normal(jax.random.key(5), params[name]["kernel"].shape),
+        }
+    params["layers_0"] = {
+        **params["layers_0"],
+        "tree_bias": jax.tree.map(
+            lambda value: jax.random.normal(jax.random.key(value.size), value.shape), params["layers_0"]["tree_bias"]
+        ),
+    }
+
+    def loss(parameters: dict, features: ASTFeatures) -> tuple[jax.Array, jax.Array]:
+        logits = state.apply_fn({"params": parameters}, initial, target, features)
+        # Ignore impossible productions in both the objective and its gradient.
+        return jnp.where(features.action_mask, logits, 0).sum(), logits
+
+    (full_loss, full_logits), full_grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(params, tree)
+    (small_loss, small_logits), small_grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(params, trimmed)
+    np.testing.assert_allclose(small_logits, full_logits[:, :32], atol=3e-5, rtol=3e-5)
+    np.testing.assert_allclose(small_loss, full_loss, atol=3e-5, rtol=3e-5)
+    chex.assert_trees_all_close(small_grads, full_grads, atol=3e-5, rtol=3e-5)
 
 
 @pytest.mark.parametrize("use_bias", [False, True])

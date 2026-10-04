@@ -214,7 +214,8 @@ def test_single_pass_update_matches_roundwise_gradient(
     (_, expected_metrics), grads = jax.jit(jax.value_and_grad(full_loss, has_aux=True))(state.params)
     expected = state.apply_gradients(grads=grads)
     calls: list[int] = []
-    rows = batch.actions.shape[0] * batch.actions.shape[1]
+    packed, _ = grpo.pack_replay(batch)
+    rows = packed.actions.shape[1]
 
     def apply(variables: dict, initial: jax.Array, target: jax.Array, tree: ASTFeatures) -> jax.Array:
         chex.assert_shape(initial, (rows, *batch.initial.shape[1:]))
@@ -228,7 +229,184 @@ def test_single_pass_update_matches_roundwise_gradient(
     np.testing.assert_allclose(metrics, expected_metrics, atol=2e-6, rtol=2e-5)
     for a, b in zip(jax.tree.leaves(actual.params), jax.tree.leaves(expected.params)):
         np.testing.assert_allclose(a, b, atol=2e-6, rtol=2e-5)
+    chex.assert_trees_all_close(actual.opt_state, expected.opt_state, atol=2e-6, rtol=2e-5)
     assert int(actual.step) == 1
+
+
+@pytest.mark.parametrize(
+    "required,capacity,expected",
+    [
+        (0, 1088, 272),
+        (272, 1088, 272),
+        (273, 1088, 544),
+        (544, 1088, 544),
+        (545, 1088, 816),
+        (816, 1088, 816),
+        (817, 1088, 1088),
+        (1088, 1088, 1088),
+        (0, 18, 5),
+        (6, 18, 10),
+        (11, 18, 15),
+        (16, 18, 18),
+        (18, 18, 18),
+        (0, 1, 1),
+        (1, 1, 1),
+        (0, 3, 1),
+        (3, 3, 3),
+    ],
+)
+def test_bucket_boundaries(required: int, capacity: int, expected: int) -> None:
+    assert grpo.bucket_size(required, capacity) == expected
+
+
+@pytest.mark.parametrize("capacity", [1, 3, 5, 18, 40, 1088])
+def test_row_buckets_use_fixed_step_and_cover_capacity(capacity: int) -> None:
+    buckets = sorted({grpo.bucket_size(required, capacity) for required in range(capacity + 1)})
+    step = (capacity + 3) // 4
+    assert len(buckets) <= 4
+    assert buckets[-1] == capacity
+    assert buckets[:-1] == [step * index for index in range(1, len(buckets))]
+    for required in range(capacity + 1):
+        assert max(1, required) <= grpo.bucket_size(required, capacity) <= capacity
+
+
+@pytest.mark.parametrize("required,capacity", [(-1, 16), (17, 16), (0, 0)])
+def test_invalid_bucket_sizes(required: int, capacity: int) -> None:
+    with pytest.raises(AssertionError):
+        grpo.bucket_size(required, capacity)
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_invalid_compile_logging_flag(config: Config, value: object) -> None:
+    with pytest.raises(TypeError, match="log_compiles must be a boolean"):
+        replace(config, log_compiles=value)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_pack_replay_removes_padding_and_preserves_program_weights(rollout: tuple, empty: bool) -> None:
+    batch = rollout[0]
+    rounds, programs, nodes = batch.actions.shape
+
+    def pad(value: grpo.Array) -> np.ndarray:
+        return np.pad(value, ((0, 32 - rounds), (0, 0), (0, 64 - nodes)) + ((0, 0),) * (value.ndim - 3))
+
+    batch = batch._replace(
+        tree=ASTFeatures(*(pad(field) for field in batch.tree)),
+        actions=pad(batch.actions),
+        old_log_probs=pad(batch.old_log_probs),
+        mask=pad(batch.mask) if not empty else np.zeros((32, programs, 64), np.bool_),
+        advantages=np.arange(programs, dtype=np.float32),
+    )
+    packed, weights = grpo.pack_replay(batch)
+    live = np.flatnonzero(batch.mask.any(axis=-1).reshape(-1))
+    assert packed.actions.shape == (1, grpo.bucket_size(len(live), 32 * programs), 32)
+    assert packed.actions.shape[1] < 32 * programs
+    assert not packed.mask[:, len(live) :].any()
+    assert not weights[:, len(live) :].any()
+    assert not packed.tree.node_mask[:, len(live) :].any()
+    for position, index in enumerate(live):
+        round_id, program_id = divmod(index, programs)
+        np.testing.assert_array_equal(packed.actions[0, position], batch.actions[round_id, program_id, :32])
+        np.testing.assert_array_equal(packed.initial[position], batch.initial[program_id])
+        assert packed.advantages[position] == batch.advantages[program_id]
+        expected = batch.mask[round_id, program_id, :32] / batch.mask[:, program_id].sum() / programs
+        np.testing.assert_allclose(weights[0, position], expected)
+    assert weights.sum() == pytest.approx(0 if empty else 1)
+
+
+def test_empty_replay_has_zero_metrics_and_finite_update(config: Config, state: TrainState, rollout: tuple) -> None:
+    batch = rollout[0]._replace(mask=np.zeros_like(rollout[0].mask))
+    updated, metrics = update(state, batch, config)
+    np.testing.assert_array_equal(metrics, 0)
+    chex.assert_trees_all_close(updated.params, state.params)
+    assert int(updated.step) == int(state.step) + 1
+
+
+@pytest.mark.parametrize(
+    "required,capacity,expected",
+    [
+        (0, 128, 32),
+        (1, 128, 32),
+        (32, 128, 32),
+        (33, 128, 64),
+        (64, 128, 64),
+        (65, 128, 96),
+        (96, 128, 96),
+        (97, 128, 128),
+        (128, 128, 128),
+        (129, 160, 160),
+        (1, 24, 24),
+        (97, 100, 100),
+    ],
+)
+def test_tree_bucket_keeps_resolved_context_nodes(required: int, capacity: int, expected: int) -> None:
+    features = batch_features((KarelAST.empty(capacity, 8).features(),))
+    present = np.zeros((1, capacity), np.bool_)
+    present[:, :required] = True
+    features = features._replace(node_mask=present)
+    trimmed = grpo.bucket_tree(features)
+    assert trimmed.node_mask.shape == (1, expected)
+    np.testing.assert_array_equal(trimmed.node_mask, present[:, :expected])
+
+
+def test_compilation_logs_only_on_new_update_trace(
+    config: Config, state: TrainState, rollout: tuple, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = replace(config, log_compiles=True)
+    original_apply = state.apply_fn
+
+    # Unique apply function gives this test its own JIT cache entry.
+    def apply(variables: dict, initial: jax.Array, target: jax.Array, tree: ASTFeatures) -> jax.Array:
+        chex.assert_equal_shape((initial, target))
+        chex.assert_type((initial, target), jnp.int32)
+        return original_apply(variables, initial, target, tree)
+
+    state = state.replace(apply_fn=apply)
+    update(state, rollout[0], config)
+    update(state, rollout[0], config)
+    output = capsys.readouterr()
+    assert output.out.count("JIT trace update: bucket_shape=") == 1
+    assert not output.err
+    empty = rollout[0]._replace(mask=np.zeros_like(rollout[0].mask))
+    # Explicitly use another valid node bucket to exercise a shape cache miss.
+    packed, weights = grpo.pack_replay(empty)
+    packed = packed._replace(
+        tree=ASTFeatures(*(field[:, :, :4] for field in packed.tree)),
+        actions=packed.actions[:, :, :4],
+        old_log_probs=packed.old_log_probs[:, :, :4],
+        mask=packed.mask[:, :, :4],
+    )
+    grpo._update(state, packed, weights[:, :, :4], config)
+    output = capsys.readouterr()
+    assert output.out == f"JIT trace update: bucket_shape=({packed.actions.shape[1]}, 4)\n"
+    assert not output.err
+    grpo._update(state, packed, weights[:, :, :4], replace(config, log_compiles=False))
+    assert not capsys.readouterr().out
+
+
+def test_prediction_prints_bucket_shape_only_on_new_trace(
+    state: TrainState, rollout: tuple, capsys: pytest.CaptureFixture[str]
+) -> None:
+    batch = rollout[0]
+    original_apply = state.apply_fn
+
+    def apply(variables: dict, initial: jax.Array, target: jax.Array, tree: ASTFeatures) -> jax.Array:
+        chex.assert_equal_shape((initial, target))
+        chex.assert_type((initial, target), jnp.int32)
+        return original_apply(variables, initial, target, tree)
+
+    state = state.replace(apply_fn=apply)
+    tree = ASTFeatures(*(field[0] for field in batch.tree))
+    for _ in range(2):
+        grpo.predict(state, batch.initial, batch.target, tree, log_compiles=True)
+    output = capsys.readouterr()
+    assert output.out == f"JIT trace predict: bucket_shape={tree.node_mask.shape}\n"
+    assert not output.err
+    trimmed = ASTFeatures(*(field[:, :4] for field in tree))
+    grpo.predict(state, batch.initial, batch.target, trimmed, log_compiles=True)
+    assert capsys.readouterr().out == f"JIT trace predict: bucket_shape={trimmed.node_mask.shape}\n"
+    grpo.predict(state, batch.initial, batch.target, trimmed, log_compiles=False)
+    assert not capsys.readouterr().out
 
 
 def test_padding_and_rejected_kl_do_not_update_state(config: Config, state: TrainState, rollout: tuple) -> None:

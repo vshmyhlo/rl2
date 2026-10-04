@@ -5,8 +5,8 @@ current holes from one shared tree encoding; new children wait for the next roun
 Completed trees are printed and submitted to KarelProgramEnv for its unchanged
 terminal rewards. Rollouts store the partial tree BEFORE each round, including
 its per-hole masks. Updates replay those states and normalize losses per program.
-Each optimizer minibatch replays all program rounds in one forward/backward
-pass, then clips gradients and applies one optimizer update.
+Each optimizer minibatch packs active program-rounds into row/sequence buckets
+for one forward/backward pass, then clips gradients and applies one update.
 """
 
 import argparse
@@ -72,6 +72,7 @@ class Config:
     log_interval: int = 20  # TensorBoard scalars, stdout, and flushes every N completed rollouts.
     log_program_interval: int = 20  # Program samples on logging iterations divisible by this interval.
     log_program_count: int = 8  # First N programs in one group; zero disables samples.
+    log_compiles: bool = False  # Print bucket shapes on new prediction/update JIT traces.
     env: KarelConfig = field(default_factory=KarelConfig)
 
     def __post_init__(self) -> None:
@@ -86,6 +87,8 @@ class Config:
         KarelAST.empty(self.max_nodes, self.max_depth, self.env.max_program_tokens)
         if type(self.bf16) is not bool:
             raise TypeError("bf16 must be a boolean")
+        if type(self.log_compiles) is not bool:
+            raise TypeError("log_compiles must be a boolean")
         if self.attention_implementation not in ("xla", "cudnn"):
             raise ValueError("attention_implementation must be 'xla' or 'cudnn'")
         if self.attention_implementation == "cudnn" and not self.bf16:
@@ -134,6 +137,80 @@ class GRPOBatch(NamedTuple):
     old_log_probs: Array
     mask: Array  # Includes the final expansion, excludes PAD.
     advantages: Array  # [B], normalized within task groups before minibatching.
+
+
+def bucket_size(required: int, capacity: int) -> int:
+    """Round replay rows up in steps of ceil(capacity / 4), capped at capacity.
+
+    This gives at most four buckets. The last may be shorter when capacity
+    is not divisible by four; an empty replay uses the smallest bucket.
+    """
+    chex.assert_scalar_positive(capacity)
+    chex.assert_scalar_in(required, 0, capacity)
+    step = (capacity + 3) // 4
+    return min(capacity, max(1, (required + step - 1) // step) * step)
+
+
+def bucket_tree(tree: ASTFeatures) -> ASTFeatures:
+    """Trim to 32-node increments, capped at capacity; preserve all context nodes."""
+    chex.assert_rank(tree.node_mask, 2)
+    chex.assert_type(tree.node_mask, np.bool_)
+    capacity = tree.node_mask.shape[-1]
+    chex.assert_scalar_positive(capacity)
+    # Use the final present position, rather than assuming masks are contiguous.
+    required = int(np.max(np.where(tree.node_mask, np.arange(capacity) + 1, 0), initial=0))
+    width = min(capacity, max(32, ((required + 31) // 32) * 32))
+    return ASTFeatures(*(field[:, :width] for field in tree))
+
+
+def pack_replay(batch: GRPOBatch) -> tuple[GRPOBatch, NDArray[np.float32]]:
+    """Pack live program-rounds into one row bucket and trim its node capacity.
+
+    The returned GRPOBatch has a singleton round axis and one row per original
+    live program-round. Explicit weights retain normalization by the original
+    number of programs and each program's total decisions, including when their
+    round counts differ. Bucket filler has zero features, actions, and weights.
+    """
+    chex.assert_rank(batch.actions, 3)
+    chex.assert_equal_shape((batch.actions, batch.old_log_probs, batch.mask))
+    chex.assert_type(batch.actions, np.int32)
+    chex.assert_type((batch.old_log_probs, batch.advantages), np.float32)
+    chex.assert_type(batch.mask, np.bool_)
+    rounds, programs, nodes = batch.actions.shape
+    chex.assert_shape(batch.advantages, (programs,))
+    chex.assert_shape(batch.initial, (programs, None, None, 6))
+    chex.assert_equal_shape((batch.initial, batch.target))
+    chex.assert_type((batch.initial, batch.target), np.int32)
+    chex.assert_shape(batch.tree[:6], (rounds, programs, nodes))
+    chex.assert_shape(batch.tree.action_mask, (rounds, programs, nodes, len(AST_ACTIONS)))
+    chex.assert_type(batch.tree[:5], np.int32)
+    chex.assert_type((batch.tree.node_mask, batch.tree.action_mask), np.bool_)
+    mask = np.asarray(batch.mask) & (np.asarray(batch.actions) != KarelProgramEnv.pad_token_id)
+    indices = np.flatnonzero(mask.any(axis=-1).reshape(-1))
+    rows = bucket_size(len(indices), rounds * programs)
+    padding = rows - len(indices)
+
+    def select(value: Array) -> NDArray[Any]:
+        chex.assert_shape(value, (rounds, programs, *value.shape[2:]))
+        selected = np.asarray(value).reshape(rounds * programs, *value.shape[2:])[indices]
+        return np.pad(selected, ((0, padding),) + ((0, 0),) * (selected.ndim - 1))
+
+    tree = bucket_tree(ASTFeatures(*(select(field) for field in batch.tree)))
+    width = tree.node_mask.shape[-1]
+    program_ids = np.pad(indices % programs, (0, padding))
+    normalization = (mask.astype(np.float32) / np.maximum(mask.sum(axis=(0, 2)), 1)[None, :, None] / programs).astype(
+        np.float32
+    )
+    packed = GRPOBatch(
+        np.asarray(batch.initial)[program_ids],
+        np.asarray(batch.target)[program_ids],
+        ASTFeatures(*(field[None] for field in tree)),
+        select(batch.actions)[None, :, :width],
+        select(batch.old_log_probs)[None, :, :width],
+        select(mask)[None, :, :width],
+        np.asarray(batch.advantages)[program_ids],
+    )
+    return packed, select(normalization)[None, :, :width]
 
 
 def _read_bytes(path: str) -> bytes:
@@ -316,8 +393,12 @@ def action_log_prob(logits: jax.Array, actions: Array) -> jax.Array:
     return jnp.where(actions == 0, 0.0, selected)
 
 
-@jax.jit
-def predict(state: TrainState, initial: Array, target: Array, tree: ASTFeatures) -> jax.Array:
+@partial(jax.jit, static_argnames="log_compiles")
+def predict(
+    state: TrainState, initial: Array, target: Array, tree: ASTFeatures, *, log_compiles: bool = False
+) -> jax.Array:
+    if log_compiles:
+        print(f"JIT trace predict: bucket_shape=({initial.shape[0]}, {tree.node_mask.shape[-1]})", flush=True)
     return state.apply_fn({"params": state.params}, initial, target, tree)
 
 
@@ -360,14 +441,15 @@ def collect_rollout(
     for t in range(shape[0]):
         features = batch_features(tuple(tree.features() for tree in trees))
         snapshots.append(features)
-        logits = predict(state, initial, target, features)
         key, sample_key = jax.random.split(key)
+        logits = predict(state, initial, target, bucket_tree(features), log_compiles=config.log_compiles)
         sampled, log_probs = jax.device_get(act(logits, sample_key))
         mask[t] = features.action_mask.any(axis=-1)
-        actions[t] = sampled
-        old_log_probs[t] = log_probs
+        width = sampled.shape[-1]
+        actions[t, :, :width] = sampled
+        old_log_probs[t, :, :width] = log_probs
         for index in np.flatnonzero(active):
-            trees[index] = trees[index].expand_round(sampled[index])
+            trees[index] = trees[index].expand_round(actions[t, index])
             if trees[index].complete:
                 source = trees[index].tokens()
                 source_lengths[index] = len(source)
@@ -494,8 +576,13 @@ def objective(
     batch: GRPOBatch,
     config: Config,
     reference_log_probs: jax.Array | None = None,
+    normalization: jax.Array | None = None,
 ) -> tuple[jax.Array, Metrics]:
-    """Clip each hole decision; average all decisions equally within each program."""
+    """Clip each hole decision; average all decisions equally within each program.
+
+    Packed replay supplies the original per-program normalization explicitly;
+    ordinary rollout batches derive it from their round/program axes.
+    """
     chex.assert_rank(batch.actions, 3)
     chex.assert_equal_shape((batch.actions, batch.old_log_probs, batch.mask))
     chex.assert_shape(batch.advantages, (batch.actions.shape[1],))
@@ -503,7 +590,8 @@ def objective(
     chex.assert_type(batch.mask, jnp.bool_)
     mask = batch.mask & (batch.actions != KarelProgramEnv.pad_token_id)
     log_probs = action_log_prob(logits, batch.actions)
-    normalization = mask.astype(jnp.float32) / jnp.maximum(mask.sum(axis=(0, 2)), 1)[None, :, None] / mask.shape[1]
+    if normalization is None:
+        normalization = mask.astype(jnp.float32) / jnp.maximum(mask.sum(axis=(0, 2)), 1)[None, :, None] / mask.shape[1]
     chex.assert_shape(normalization, mask.shape)
     chex.assert_type(normalization, jnp.float32)
 
@@ -537,11 +625,25 @@ def objective(
     return loss, (policy_loss, entropy, approx_kl, clip_fraction, reference_kl)
 
 
-@partial(jax.jit, static_argnames="config")
 def update(
     state: TrainState, batch: GRPOBatch, config: Config, reference_params: optax.Params | None = None
 ) -> tuple[TrainState, Metrics]:
-    """Replay all rounds in one forward/backward pass per optimizer minibatch."""
+    """Pack on the host, then run one forward/backward pass per minibatch."""
+    packed, normalization = pack_replay(batch)
+    return _update(state, packed, normalization, config, reference_params)
+
+
+@partial(jax.jit, static_argnames="config")
+def _update(
+    state: TrainState,
+    batch: GRPOBatch,
+    normalization: Array,
+    config: Config,
+    reference_params: optax.Params | None = None,
+) -> tuple[TrainState, Metrics]:
+    """One compiled update per row/node bucket; filler has zero loss weight."""
+    if config.log_compiles:
+        print(f"JIT trace update: bucket_shape={batch.actions.shape[1:]}", flush=True)
     if config.kl_coef and reference_params is None:
         raise ValueError("Frozen reference parameters are required when kl_coef > 0")
     chex.assert_rank(batch.actions, 3)
@@ -574,7 +676,7 @@ def update(
 
     def loss_fn(params: optax.Params) -> tuple[jax.Array, Metrics]:
         # Restore round/program axes so the objective retains equal program weights.
-        return objective(replay(params), batch, config, reference)
+        return objective(replay(params), batch, config, reference, normalization)
 
     (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     if config.target_kl is None:
@@ -602,9 +704,11 @@ def generate(
         raise TypeError("Expected a typed JAX PRNG key from jax.random.key")
     trees = [KarelAST.empty(max_nodes, max_depth, max_program_tokens) for _ in initial]
     for _ in range(min(max_nodes, max_depth + 1)):
-        logits = predict(state, initial, target, batch_features(tuple(tree.features() for tree in trees)))
+        features = bucket_tree(batch_features(tuple(tree.features() for tree in trees)))
+        logits = predict(state, initial, target, features)
         key, sample_key = jax.random.split(key)
         actions = np.asarray(jax.random.categorical(sample_key, logits), dtype=np.int32)
+        actions = np.pad(actions, ((0, 0), (0, max_nodes - actions.shape[-1])))
         trees = [tree.expand_round(action) for tree, action in zip(trees, actions)]
         if all(tree.complete for tree in trees):
             return tuple(trees)
