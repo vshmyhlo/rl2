@@ -11,15 +11,15 @@ import pytest
 from flax.training.train_state import TrainState
 
 from rl2.ast_transformer import ASTTransformer, _ASTBlock
-from rl2.grpo import (
+from rl2.karel import KarelConfig, _parse
+from rl2.karel_ast import ACTION_ID, AST_ACTIONS, ASTFeatures, KarelAST, batch_features, teacher_forcing
+from rl2.train_karel_ast_grpo import (
     Config,
     create_state,
     generate,
     load_config,
     predict,
 )
-from rl2.karel import KarelConfig, _parse
-from rl2.karel_ast import ACTION_ID, AST_ACTIONS, ASTFeatures, KarelAST, batch_features, teacher_forcing
 from rl2.transformer import AttentionImplementation
 from rl2.tree_attention import Relation, tree_relations
 
@@ -302,7 +302,7 @@ def test_sampling_finishes_and_completed_trees_use_safe_dummy_logits(config: Con
 
 
 def test_example_config_and_invalid_model_dimensions(batch: ModelBatch) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/grpo_karel.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/karel_ast_grpo.yaml")
     assert config.bf16 and config.max_nodes == 128
     model = ASTTransformer(d_model=15, num_heads=2, num_layers=1, max_nodes=24)
     with pytest.raises(AssertionError):

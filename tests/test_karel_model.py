@@ -7,9 +7,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from rl2.grpo import generation_logits
 from rl2.karel import TOKENS, KarelConfig, KarelProgramEnv, sample_task
 from rl2.karel_model import KarelProgramModel
+from rl2.train_karel_ast_grpo import generation_logits
 from rl2.transformer import AttentionImplementation
 
 

@@ -809,7 +809,7 @@ def train(config: Config) -> TrainState:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/grpo_karel.yaml", help="Path to a YAML config")
+    parser.add_argument("--config", default="configs/karel_ast_grpo.yaml", help="Path to a YAML config")
     parser.add_argument("--platform", choices=("cpu", "cuda", "metal"), help="Require a JAX backend")
     args = parser.parse_args()
     if args.platform is not None:

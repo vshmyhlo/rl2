@@ -13,8 +13,10 @@ from flax.training.train_state import TrainState
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 from tensorboardX import SummaryWriter
 
-from rl2 import grpo
-from rl2.grpo import (
+from rl2 import train_karel_ast_grpo as grpo
+from rl2.karel import REWARD_COMPONENTS, TOKEN_TO_ID, KarelConfig, KarelProgramEnv, _parse
+from rl2.karel_ast import ACTION_ID, AST_ACTIONS, ASTFeatures, KarelAST, batch_features
+from rl2.train_karel_ast_grpo import (
     Config,
     GRPOBatch,
     action_log_prob,
@@ -29,8 +31,6 @@ from rl2.grpo import (
     train,
     update,
 )
-from rl2.karel import REWARD_COMPONENTS, TOKEN_TO_ID, KarelConfig, KarelProgramEnv, _parse
-from rl2.karel_ast import ACTION_ID, AST_ACTIONS, ASTFeatures, KarelAST, batch_features
 
 
 @pytest.fixture(scope="module")
@@ -301,8 +301,8 @@ def test_gcs_checkpoint_paths(config: Config, tmp_path: Path, monkeypatch: pytes
         paths.append(logdir)
         return SummaryWriter(logdir=str(tmp_path), purge_step=purge_step)
 
-    monkeypatch.setattr("rl2.grpo.gcsfs.GCSFileSystem", FakeGCS)
-    monkeypatch.setattr("rl2.grpo.SummaryWriter", writer)
+    monkeypatch.setattr("rl2.train_karel_ast_grpo.gcsfs.GCSFileSystem", FakeGCS)
+    monkeypatch.setattr("rl2.train_karel_ast_grpo.SummaryWriter", writer)
     cloud_config = replace(config, log_dir="gs://test-bucket/grpo/", run_id="resume-test")
     state = train(cloud_config)
     assert set(files) == {f"{paths[0]}/config.yaml", f"{paths[0]}/checkpoint.msgpack"}
@@ -330,7 +330,7 @@ def test_formatted_samples_replay_ast_source(config: Config, rollout: tuple) -> 
 
 
 def test_configuration_and_schedule(config: Config) -> None:
-    loaded = load_config(Path(__file__).resolve().parents[1] / "configs/grpo_karel.yaml")
+    loaded = load_config(Path(__file__).resolve().parents[1] / "configs/karel_ast_grpo.yaml")
     assert loaded.max_nodes == 128 and loaded.decision_batch_size == 32
     assert loaded.bf16 and loaded.attention_implementation == "cudnn"
     assert loaded.d_model == 320 and loaded.num_layers == 7 and loaded.num_heads == 5
