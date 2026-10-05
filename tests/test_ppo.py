@@ -170,17 +170,17 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
         3,
         8,
         dtype=jnp.bfloat16,
-        encoder_stages=(ConvStage(8), ConvStage(16), ConvStage(16), ConvStage(16)),
-        embedding_size=32,
+        encoder_stages=(ConvStage(4, blocks=1),),
+        embedding_size=8,
     )
-    obs = jax.random.randint(jax.random.key(2), (3, 2, 1, 84, 84), 0, 256, dtype=jnp.uint8)
+    obs = jax.random.randint(jax.random.key(2), (3, 2, 1, 8, 8), 0, 256, dtype=jnp.uint8)
     carry = initial_carry(2, 8)
     starts = jnp.array([[True, True], [False, False], [True, False]])
     params = model.init(jax.random.key(1), obs, carry, starts)["params"]
     (final, logits, values), captured = jax.jit(
         partial(model.apply, capture_intermediates=True, mutable=["intermediates"])
     )({"params": params}, obs, carry, starts)
-    assert captured["intermediates"]["encoder"]["Conv_0"]["__call__"][0].dtype == jnp.bfloat16
+    assert captured["intermediates"]["encoder"]["stem"]["__call__"][0].dtype == jnp.bfloat16
     assert captured["intermediates"]["policy_hidden"]["__call__"][0].dtype == jnp.bfloat16
     assert captured["intermediates"]["policy_output"]["__call__"][0].dtype == jnp.bfloat16
     assert captured["intermediates"]["value_output"]["__call__"][0].dtype == jnp.bfloat16
@@ -222,10 +222,8 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
 @jax.default_matmul_precision("highest")
 def test_recurrent_sequences_match_steps_and_reset_only_finished_env() -> None:
     # Test sequence/reset semantics in float32, without GPU TF32 approximation.
-    model = ActorCritic(
-        3, 16, encoder_stages=(ConvStage(8), ConvStage(16), ConvStage(16), ConvStage(16)), embedding_size=32
-    )
-    obs = jax.random.randint(jax.random.key(2), (4, 2, 4, 84, 84), 0, 256, dtype=jnp.uint8)
+    model = ActorCritic(3, 16, encoder_stages=(ConvStage(4, blocks=1),), embedding_size=8)
+    obs = jax.random.randint(jax.random.key(2), (4, 2, 4, 8, 8), 0, 256, dtype=jnp.uint8)
     carry = initial_carry(2, 16)
     starts = jnp.array([[True, True], [False, False], [True, False], [False, False]])
     params = model.init(jax.random.key(1), obs, carry, starts)
@@ -384,9 +382,11 @@ def test_gae_timeout_bootstrap_and_trace() -> None:
     np.testing.assert_allclose(returns, [[4.564], [4.7]], rtol=1e-6)
 
 
-@pytest.mark.parametrize("mode", ("sync", "async"))
-@pytest.mark.parametrize("frame_stack", (False, True))
-@pytest.mark.parametrize("preprocessing", (False, True))
+# Pairwise coverage of vector mode, stacking, and preprocessing.
+@pytest.mark.parametrize(
+    "mode,frame_stack,preprocessing",
+    [("sync", False, False), ("sync", True, True), ("async", False, True), ("async", True, False)],
+)
 def test_atari_training_across_resets(mode: str, frame_stack: bool, preprocessing: bool) -> None:
     check_atari_training(mode, frame_stack=frame_stack, preprocessing=preprocessing)
 
@@ -405,7 +405,7 @@ def check_atari_training(
     config = replace(
         load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
         lstm_hidden_size=16,
-        encoder_stages=(ConvStage(8), ConvStage(16), ConvStage(16), ConvStage(16)),
+        encoder_stages=(ConvStage(4, blocks=1),),
         bf16=False,
         total_steps=16,
         num_envs=2,
@@ -414,7 +414,7 @@ def check_atari_training(
         update_epochs=update_epochs,
         video_every_episodes=2,
         eval_every_minutes=0,
-        observation_size=84,
+        observation_size=8,
         vector_env=mode,
         target_kl=target_kl,
         frame_stack=frame_stack,
@@ -433,7 +433,7 @@ def check_atari_training(
         key: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array, ppo.LSTMCarry]:
         nonlocal training_steps, previous_carry
-        image_shape = (84, 84) if preprocessing else (84, 84, 3)
+        image_shape = (8, 8) if preprocessing else (8, 8, 3)
         assert obs.shape[1:] == (4 if frame_stack else 1, *image_shape)
         if obs.shape[0] == config.num_envs:
             # Memory crosses rollout boundaries and video games cannot overwrite it.
@@ -461,8 +461,8 @@ def check_atari_training(
                 "rl2.ppo.ActorCritic",
                 new=partial(
                     ActorCritic,
-                    encoder_stages=(ConvStage(8), ConvStage(16), ConvStage(16), ConvStage(16)),
-                    embedding_size=32,
+                    encoder_stages=(ConvStage(4, blocks=1),),
+                    embedding_size=8,
                 ),
             ),
             patch("rl2.ppo.make_env", new=short_env),

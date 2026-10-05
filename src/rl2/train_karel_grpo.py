@@ -1,12 +1,9 @@
-"""GRPO over grammar-constrained AST expansions for Karel program synthesis.
+"""GRPO for autoregressive, grammar-masked Karel program synthesis.
 
-Each pair has a group of independently generated ASTs. Each round expands all
-current holes from one shared tree encoding; new children wait for the next round.
-Completed trees are printed and submitted to KarelProgramEnv for its unchanged
-terminal rewards. Rollouts store the partial tree BEFORE each round, including
-its per-hole masks. Updates replay those states and normalize losses per program.
-Each optimizer minibatch packs active program-rounds into row/sequence buckets
-for one forward/backward pass, then clips gradients and applies one update.
+A causal transformer conditions on an initial/target grid pair and samples tokens
+with a KV cache. Grammar masks reserve enough tokens to close every block within
+the environment's budget. Updates replay complete programs with teacher forcing
+and the same prefix-dependent masks, averaging token losses within each program.
 """
 
 import argparse
@@ -30,9 +27,15 @@ from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
-from rl2.ast_transformer import ASTTransformer
-from rl2.karel import ACTIONS, REWARD_COMPONENTS, TASK_CATEGORIES, TOKEN_TO_ID, KarelConfig, KarelPair, KarelProgramEnv
-from rl2.karel_ast import AST_ACTIONS, ASTFeatures, KarelAST, batch_features
+from rl2.karel import ACTIONS, REWARD_COMPONENTS, TASK_CATEGORIES, TOKENS, KarelConfig, KarelPair, KarelProgramEnv
+from rl2.karel_grammar import (
+    GrammarState,
+    grammar_step,
+    initial_grammar_state,
+    mask_grammar_logits,
+    mask_sequence_logits,
+)
+from rl2.karel_model import KarelModelCarry, KarelProgramModel
 from rl2.transformer import AttentionImplementation
 from rl2.utils import read_bytes, read_optional, write_bytes
 
@@ -51,8 +54,6 @@ class Config:
     update_epochs: int = 2
     d_model: int = 320
     num_layers: int = 7
-    max_nodes: int = 128
-    max_depth: int = 64
     num_heads: int = 5
     num_kv_heads: int | None = None
     bf16: bool = False
@@ -69,7 +70,7 @@ class Config:
     log_interval: int = 20  # TensorBoard scalars, stdout, and flushes every N completed rollouts.
     log_program_interval: int = 20  # Program samples on logging iterations divisible by this interval.
     log_program_count: int = 8  # First N programs in one group; zero disables samples.
-    log_compiles: bool = False  # Print bucket shapes on new prediction/update JIT traces.
+    log_compiles: bool = False  # Print sequence shapes on new generation/update JIT traces.
     env: KarelConfig = field(default_factory=KarelConfig)
 
     def __post_init__(self) -> None:
@@ -81,7 +82,17 @@ class Config:
         chex.assert_scalar_positive(self.checkpoint_interval_seconds)
         if not np.isfinite(self.checkpoint_interval_seconds):
             raise ValueError("checkpoint_interval_seconds must be finite")
-        KarelAST.empty(self.max_nodes, self.max_depth, self.env.max_program_tokens)
+        for value in (self.d_model, self.num_layers, self.num_heads):
+            if type(value) is not int:
+                raise TypeError("Model dimensions must be integers")
+            chex.assert_scalar_positive(value)
+        kv_heads = self.num_heads if self.num_kv_heads is None else self.num_kv_heads
+        if type(kv_heads) is not int:
+            raise TypeError("num_kv_heads must be an integer or null")
+        chex.assert_scalar_positive(kv_heads)
+        chex.assert_is_divisible(self.d_model, self.num_heads)
+        chex.assert_is_divisible(self.num_heads, kv_heads)
+        chex.assert_is_divisible(self.d_model // self.num_heads, 2)
         if type(self.bf16) is not bool:
             raise TypeError("bf16 must be a boolean")
         if type(self.log_compiles) is not bool:
@@ -90,6 +101,8 @@ class Config:
             raise ValueError("attention_implementation must be 'xla' or 'cudnn'")
         if self.attention_implementation == "cudnn" and not self.bf16:
             raise ValueError("cuDNN attention requires bf16=True")
+        if self.attention_implementation == "cudnn":
+            chex.assert_is_divisible(self.d_model // self.num_heads, 8)
         for value in (self.log_interval, self.log_program_interval, self.log_program_count):
             if type(value) is not int:
                 raise TypeError("Logging settings must be integers")
@@ -119,94 +132,14 @@ class Config:
             if not np.isfinite(self.target_kl):
                 raise ValueError("target_kl must be finite or null")
 
-    @property
-    def max_rounds(self) -> int:
-        """Each round resolves one AST depth level; no more rounds than nodes."""
-        return min(self.max_nodes, self.max_depth + 1)
-
 
 class GRPOBatch(NamedTuple):
     initial: Array  # [B,H,W,6], grouped by task during collection.
     target: Array
-    tree: ASTFeatures  # [R,B,N] features, [R,B,N,A] masks; snapshots BEFORE each round.
-    actions: Array  # [R,B,N] constructor/value IDs; PAD=0 at non-hole positions.
+    actions: Array  # [T,B] generated tokens, including terminal m); PAD after completion.
     old_log_probs: Array
-    mask: Array  # Includes the final expansion, excludes PAD.
+    mask: Array  # Includes terminal m), excludes PAD.
     advantages: Array  # [B], normalized within task groups before minibatching.
-
-
-def bucket_size(required: int, capacity: int) -> int:
-    """Round replay rows up in steps of ceil(capacity / 4), capped at capacity.
-
-    This gives at most four buckets. The last may be shorter when capacity
-    is not divisible by four; an empty replay uses the smallest bucket.
-    """
-    chex.assert_scalar_positive(capacity)
-    chex.assert_scalar_in(required, 0, capacity)
-    step = (capacity + 3) // 4
-    return min(capacity, max(1, (required + step - 1) // step) * step)
-
-
-def bucket_tree(tree: ASTFeatures) -> ASTFeatures:
-    """Trim to 32-node increments, capped at capacity; preserve all context nodes."""
-    chex.assert_rank(tree.node_mask, 2)
-    chex.assert_type(tree.node_mask, np.bool_)
-    capacity = tree.node_mask.shape[-1]
-    chex.assert_scalar_positive(capacity)
-    # Use the final present position, rather than assuming masks are contiguous.
-    required = int(np.max(np.where(tree.node_mask, np.arange(capacity) + 1, 0), initial=0))
-    width = min(capacity, max(32, ((required + 31) // 32) * 32))
-    return ASTFeatures(*(field[:, :width] for field in tree))
-
-
-def pack_replay(batch: GRPOBatch) -> tuple[GRPOBatch, NDArray[np.float32]]:
-    """Pack live program-rounds into one row bucket and trim its node capacity.
-
-    The returned GRPOBatch has a singleton round axis and one row per original
-    live program-round. Explicit weights retain normalization by the original
-    number of programs and each program's total decisions, including when their
-    round counts differ. Bucket filler has zero features, actions, and weights.
-    """
-    chex.assert_rank(batch.actions, 3)
-    chex.assert_equal_shape((batch.actions, batch.old_log_probs, batch.mask))
-    chex.assert_type(batch.actions, np.int32)
-    chex.assert_type((batch.old_log_probs, batch.advantages), np.float32)
-    chex.assert_type(batch.mask, np.bool_)
-    rounds, programs, nodes = batch.actions.shape
-    chex.assert_shape(batch.advantages, (programs,))
-    chex.assert_shape(batch.initial, (programs, None, None, 6))
-    chex.assert_equal_shape((batch.initial, batch.target))
-    chex.assert_type((batch.initial, batch.target), np.int32)
-    chex.assert_shape(batch.tree[:6], (rounds, programs, nodes))
-    chex.assert_shape(batch.tree.action_mask, (rounds, programs, nodes, len(AST_ACTIONS)))
-    chex.assert_type(batch.tree[:5], np.int32)
-    chex.assert_type((batch.tree.node_mask, batch.tree.action_mask), np.bool_)
-    mask = np.asarray(batch.mask) & (np.asarray(batch.actions) != KarelProgramEnv.pad_token_id)
-    indices = np.flatnonzero(mask.any(axis=-1).reshape(-1))
-    rows = bucket_size(len(indices), rounds * programs)
-    padding = rows - len(indices)
-
-    def select(value: Array) -> NDArray[Any]:
-        chex.assert_shape(value, (rounds, programs, *value.shape[2:]))
-        selected = np.asarray(value).reshape(rounds * programs, *value.shape[2:])[indices]
-        return np.pad(selected, ((0, padding),) + ((0, 0),) * (selected.ndim - 1))
-
-    tree = bucket_tree(ASTFeatures(*(select(field) for field in batch.tree)))
-    width = tree.node_mask.shape[-1]
-    program_ids = np.pad(indices % programs, (0, padding))
-    normalization = (mask.astype(np.float32) / np.maximum(mask.sum(axis=(0, 2)), 1)[None, :, None] / programs).astype(
-        np.float32
-    )
-    packed = GRPOBatch(
-        np.asarray(batch.initial)[program_ids],
-        np.asarray(batch.target)[program_ids],
-        ASTFeatures(*(field[None] for field in tree)),
-        select(batch.actions)[None, :, :width],
-        select(batch.old_log_probs)[None, :, :width],
-        select(mask)[None, :, :width],
-        np.asarray(batch.advantages)[program_ids],
-    )
-    return packed, select(normalization)[None, :, :width]
 
 
 class TrainingProgress(NamedTuple):
@@ -258,8 +191,7 @@ def _restore_checkpoint(data: bytes, state: TrainState, rng: np.random.Generator
             raise ValueError("Invalid checkpoint counters")
     rng.bit_generator.state = json.loads(payload["numpy_rng"])
     iteration, _, logged_groups, episodes = counters
-    # Older checkpoints counted hole decisions in steps; episodes already holds
-    # the correct total, including runs whose batch size changed on resume.
+    # Episodes retain the correct total even when batch size changes on resume.
     return TrainingProgress(restored, key, iteration, episodes, logged_groups, episodes)
 
 
@@ -267,8 +199,6 @@ def load_config(path: str | Path) -> Config:
     settings = yaml.safe_load(read_bytes(str(path))) or {}
     # Ignore the removed reference-KL setting in older saved run configs.
     settings.pop("kl_coef", None)
-    # Saved run configs may still contain the retired gradient-accumulation knob.
-    settings.pop("decision_batch_size", None)
     if "env" in settings:
         settings["env"] = KarelConfig(**settings["env"])
     return Config(**settings)
@@ -286,24 +216,20 @@ def create_state(config: Config, initial: Grids, target: Grids) -> TrainState:
     chex.assert_shape(initial, (None, None, None, 6))
     chex.assert_equal_shape((initial, target))
     chex.assert_type((initial, target), jnp.int32)
-    model = ASTTransformer(
+    model = KarelProgramModel(
+        backbone_type="transformer",
         d_model=config.d_model,
         num_layers=config.num_layers,
         num_heads=config.num_heads,
         num_kv_heads=config.num_kv_heads,
-        max_nodes=config.max_nodes,
-        max_depth=config.max_depth,
+        # Context plus p[:-1] predicts all max_program_tokens labels.
+        max_seq_len=config.env.max_program_tokens,
         max_markers=config.env.max_markers,
         dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
         attention_implementation=config.attention_implementation,
     )
-    features = batch_features(
-        tuple(
-            KarelAST.empty(config.max_nodes, config.max_depth, config.env.max_program_tokens).features()
-            for _ in initial
-        )
-    )
-    params = model.init(jax.random.key(config.seed), initial, target, features)["params"]
+    tokens = jnp.empty((0, initial.shape[0]), jnp.int32)
+    params = model.init(jax.random.key(config.seed), initial, target, tokens)["params"]
 
     def optimizer(learning_rate: float | jax.Array) -> optax.GradientTransformation:
         return optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adam(learning_rate, eps=1e-5))
@@ -338,7 +264,7 @@ def generation_logits(logits: jax.Array) -> jax.Array:
 
 
 def action_log_prob(logits: jax.Array, actions: Array) -> jax.Array:
-    chex.assert_shape(logits, (*actions.shape, len(AST_ACTIONS)))
+    chex.assert_shape(logits, (*actions.shape, len(TOKENS)))
     chex.assert_type(logits, jnp.float32)
     chex.assert_type(actions, jnp.int32)
     log_probs = jax.nn.log_softmax(generation_logits(logits))
@@ -346,21 +272,62 @@ def action_log_prob(logits: jax.Array, actions: Array) -> jax.Array:
     return jnp.where(actions == 0, 0.0, selected)
 
 
-@partial(jax.jit, static_argnames="log_compiles")
-def predict(
-    state: TrainState, initial: Array, target: Array, tree: ASTFeatures, *, log_compiles: bool = False
-) -> jax.Array:
+type GenerationCarry = tuple[KarelModelCarry, jax.Array, GrammarState, jax.Array]
+type GenerationOutput = tuple[jax.Array, jax.Array, jax.Array]
+
+
+@partial(jax.jit, static_argnames=("max_program_tokens", "log_compiles"))
+def generate(
+    state: TrainState,
+    initial: Grids,
+    target: Grids,
+    key: jax.Array,
+    max_program_tokens: int = 128,
+    *,
+    log_compiles: bool = False,
+) -> GenerationOutput:
+    """Return [T,B] token IDs, masked log probabilities, and the advanced RNG key.
+
+    Completed programs receive PAD and zero log probability. Generation always
+    uses grammar masking, including the source-length and interpreter depth limits.
+    Use the model's configured token budget to retain full-context attention.
+    """
+    chex.assert_shape(initial, (None, None, None, 6))
+    chex.assert_equal_shape((initial, target))
+    chex.assert_type((initial, target), jnp.int32)
+    chex.assert_scalar_positive(initial.shape[0])
+    chex.assert_shape(key, ())
+    if not jax.dtypes.issubdtype(key.dtype, jax.dtypes.prng_key):
+        raise TypeError("Expected a typed JAX PRNG key from jax.random.key")
+    grammar = initial_grammar_state(initial.shape[0], max_program_tokens)
     if log_compiles:
-        print(f"JIT trace predict: bucket_shape=({initial.shape[0]}, {tree.node_mask.shape[-1]})", flush=True)
-    return state.apply_fn({"params": state.params}, initial, target, tree)
+        print(f"JIT trace generate: sequence_shape=({max_program_tokens}, {initial.shape[0]})", flush=True)
+    variables = {"params": state.params}
+    cache, logits = state.apply_fn(variables, initial, target, method=KarelProgramModel.prefill)
 
+    def step(carry: GenerationCarry, index: jax.Array) -> tuple[GenerationCarry, tuple[jax.Array, jax.Array]]:
+        cache, logits, grammar, key = carry
+        chex.assert_shape(index, ())
+        chex.assert_type(index, jnp.int32)
+        key, sample_key = jax.random.split(key)
+        masked = mask_grammar_logits(logits, grammar)
+        tokens = jax.random.categorical(sample_key, masked).astype(jnp.int32)
+        tokens = jnp.where(grammar.size > 0, tokens, KarelProgramEnv.pad_token_id)
+        log_probs = action_log_prob(masked, tokens)
+        grammar = grammar_step(grammar, tokens)
+        # Do not consume the last label: context + preceding tokens already
+        # fills the cache. Also skip model work once every program has finished.
+        cache, logits = jax.lax.cond(
+            (index < max_program_tokens - 1) & (grammar.size > 0).any(),
+            lambda: state.apply_fn(variables, tokens, cache, method=KarelProgramModel.step),
+            lambda: (cache, logits),
+        )
+        return (cache, logits, grammar, key), (tokens, log_probs)
 
-@jax.jit
-def act(logits: jax.Array, key: jax.Array) -> tuple[jax.Array, jax.Array]:
-    chex.assert_shape(logits, (None, None, len(AST_ACTIONS)))
-    chex.assert_type(logits, jnp.float32)
-    actions = jax.random.categorical(key, generation_logits(logits)).astype(jnp.int32)
-    return actions, action_log_prob(logits, actions)
+    (_, _, _, key), (actions, log_probs) = jax.lax.scan(
+        step, (cache, logits, grammar, key), jnp.arange(max_program_tokens, dtype=jnp.int32)
+    )
+    return actions, log_probs, key
 
 
 def collect_rollout(
@@ -379,55 +346,27 @@ def collect_rollout(
         pairs.extend(env.reset_from(first) for env in envs[start + 1 : start + config.group_size])
     initial = np.stack([pair.initial for pair in pairs])
     target = np.stack([pair.target for pair in pairs])
-    shape = (config.max_rounds, batch_size, config.max_nodes)
-    actions = np.full(shape, KarelProgramEnv.pad_token_id, dtype=np.int32)
-    old_log_probs = np.zeros(shape, dtype=np.float32)
-    mask = np.zeros(shape, dtype=np.bool_)
+    actions, old_log_probs, key = jax.device_get(
+        generate(state, initial, target, key, config.env.max_program_tokens, log_compiles=config.log_compiles)
+    )
+    mask = actions != KarelProgramEnv.pad_token_id
     rewards = np.zeros(batch_size, dtype=np.float32)
     reward_components = {name: np.zeros(batch_size, dtype=np.float32) for name in REWARD_COMPONENTS}
     successes = np.zeros(batch_size, dtype=np.bool_)
-    active = np.ones(batch_size, dtype=np.bool_)
     errors: list[str | None] = [None] * batch_size
-    trees = [KarelAST.empty(config.max_nodes, config.max_depth, config.env.max_program_tokens) for _ in envs]
-    snapshots: list[ASTFeatures] = []
-    source_lengths = np.zeros(batch_size, np.int32)
-    for t in range(shape[0]):
-        features = batch_features(tuple(tree.features() for tree in trees))
-        snapshots.append(features)
-        key, sample_key = jax.random.split(key)
-        logits = predict(state, initial, target, bucket_tree(features), log_compiles=config.log_compiles)
-        sampled, log_probs = jax.device_get(act(logits, sample_key))
-        mask[t] = features.action_mask.any(axis=-1)
-        width = sampled.shape[-1]
-        actions[t, :, :width] = sampled
-        old_log_probs[t, :, :width] = log_probs
-        for index in np.flatnonzero(active):
-            trees[index] = trees[index].expand_round(actions[t, index])
-            if trees[index].complete:
-                source = trees[index].tokens()
-                source_lengths[index] = len(source)
-                # The AST mask guarantees this fits the unchanged environment.
-                assert len(source) <= config.env.max_program_tokens
-                for token in source:
-                    _, reward, terminated, truncated, info = envs[index].step(TOKEN_TO_ID[token])
-                    if terminated or truncated:
-                        break
-                if not (terminated or truncated):
-                    raise RuntimeError("A completed AST did not terminate its Karel environment")
-                rewards[index] = reward
-                active[index] = False
-                errors[index] = info["error"]
-                successes[index] = bool(info["success"])
-                for name, values in reward_components.items():
-                    values[index] = info[f"reward_{name}"]
-        if not active.any():
-            break
-    if active.any():
-        raise RuntimeError("AST generation exhausted its budget with unfinished holes")
-    # Pad only the time dimension. Finished rows get the model's safe dummy
-    # distribution, and their probabilities/entropy/gradients are masked out.
-    stored = ASTFeatures(*(np.stack(fields) for fields in zip(*snapshots)))
-    stored = ASTFeatures(*(np.pad(x, ((0, shape[0] - len(snapshots)),) + ((0, 0),) * (x.ndim - 1)) for x in stored))
+    for index, env in enumerate(envs):
+        program = actions[:, index][mask[:, index]]
+        if len(program) == 0 or program[-1] != KarelProgramEnv.terminal_token_id:
+            raise RuntimeError("Grammar-masked generation did not finish within its token budget")
+        for token in program:
+            _, reward, terminated, truncated, info = env.step(token)
+        if not (terminated or truncated):
+            raise RuntimeError("A completed program did not terminate its Karel environment")
+        rewards[index] = reward
+        errors[index] = info["error"]
+        successes[index] = bool(info["success"])
+        for name, values in reward_components.items():
+            values[index] = info[f"reward_{name}"]
     grouped_rewards = rewards.reshape((config.num_tasks, config.group_size))
     advantages = np.asarray(group_advantages(grouped_rewards)).reshape(-1)
     diagnostics = {
@@ -436,9 +375,8 @@ def collect_rollout(
         "charts/success_rate": float(successes.mean()),
         "charts/group_success_rate": float(successes.reshape((config.num_tasks, config.group_size)).any(axis=1).mean()),
         "charts/informative_group_fraction": float((np.ptp(grouped_rewards, axis=1) > 0).mean()),
-        "charts/episode_length_mean": float(mask.sum(axis=(0, 2)).mean()),
-        "charts/generation_rounds_mean": float(mask.any(axis=-1).sum(axis=0).mean()),
-        "charts/program_token_length_mean": float(source_lengths.mean()),
+        "charts/episode_length_mean": float(mask.sum(axis=0).mean()),
+        "charts/program_token_length_mean": float(mask.sum(axis=0).mean()),
         "charts/truncation_rate": errors.count("token_limit") / batch_size,
         "charts/syntax_error_rate": errors.count("syntax_error") / batch_size,
         "charts/runtime_error_rate": errors.count("runtime_error") / batch_size,
@@ -455,7 +393,7 @@ def collect_rollout(
             diagnostics[f"sampling/{category}_acceptance_rate"] = len(selected) / sum(
                 stats.attempts for stats in selected
             )
-    return GRPOBatch(initial, target, stored, actions, old_log_probs, mask, advantages), rewards, diagnostics, key
+    return GRPOBatch(initial, target, actions, old_log_probs, mask, advantages), rewards, diagnostics, key
 
 
 def format_program(tokens: Sequence[str]) -> str:
@@ -501,12 +439,8 @@ def format_program(tokens: Sequence[str]) -> str:
 def format_group_programs(
     batch: GRPOBatch, rewards: Array, *, config: Config, group_size: int, group_index: int, count: int
 ) -> str:
-    """Format actual rollout ASTs from one task group, without resampling or ranking.
-
-    Rows retain sampling order. Replay AST expansions and print their source;
-    reward and action/source lengths belong to that rollout.
-    """
-    chex.assert_rank(batch.actions, 3)
+    """Format actual sampled programs from one task group in sampling order."""
+    chex.assert_rank(batch.actions, 2)
     chex.assert_equal_shape((batch.actions, batch.mask))
     chex.assert_type(batch.actions, jnp.int32)
     chex.assert_type(batch.mask, jnp.bool_)
@@ -523,14 +457,10 @@ def format_group_programs(
     lines = [f"## Group {group_index}: {count}/{group_size} programs for the same initial/target pair."]
     for sample in range(count):
         index = group_index * group_size + sample
-        rounds = np.flatnonzero(mask[:, index].any(axis=-1))
-        tree = KarelAST.empty(config.max_nodes, config.max_depth, config.env.max_program_tokens)
-        for step in rounds:
-            tree = tree.expand_round(actions[step, index])
-        program = tree.source()
+        tokens = [TOKENS[token] for token in actions[:, index][mask[:, index]]]
+        program = format_program(tokens)
         lines.append(
-            f"### Sample {sample}: reward={float(rewards[index]):.4f}, actions={int(mask[:, index].sum())}, rounds={len(rounds)}, "
-            f"tokens={len(tree.tokens())}\n\n```text\n{program}\n```"
+            f"### Sample {sample}: reward={float(rewards[index]):.4f}, tokens={len(tokens)}\n\n```text\n{program}\n```"
         )
     return "\n\n".join(lines)
 
@@ -539,24 +469,17 @@ def objective(
     logits: jax.Array,
     batch: GRPOBatch,
     config: Config,
-    normalization: jax.Array | None = None,
 ) -> tuple[jax.Array, Metrics]:
-    """Clip each hole decision; average all decisions equally within each program.
-
-    Packed replay supplies the original per-program normalization explicitly;
-    ordinary rollout batches derive it from their round/program axes.
-    """
-    chex.assert_rank(batch.actions, 3)
+    """Apply grammar masks, clip each token ratio, and weight programs equally."""
+    chex.assert_rank(batch.actions, 2)
+    logits = mask_sequence_logits(logits, batch.actions, config.env.max_program_tokens)
     chex.assert_equal_shape((batch.actions, batch.old_log_probs, batch.mask))
     chex.assert_shape(batch.advantages, (batch.actions.shape[1],))
     chex.assert_type((batch.old_log_probs, batch.advantages), jnp.float32)
     chex.assert_type(batch.mask, jnp.bool_)
     mask = batch.mask & (batch.actions != KarelProgramEnv.pad_token_id)
     log_probs = action_log_prob(logits, batch.actions)
-    if normalization is None:
-        normalization = mask.astype(jnp.float32) / jnp.maximum(mask.sum(axis=(0, 2)), 1)[None, :, None] / mask.shape[1]
-    chex.assert_shape(normalization, mask.shape)
-    chex.assert_type(normalization, jnp.float32)
+    normalization = mask.astype(jnp.float32) / jnp.maximum(mask.sum(axis=0), 1)[None, :] / mask.shape[1]
 
     def average(values: jax.Array) -> jax.Array:
         chex.assert_equal_shape((values, batch.mask))
@@ -565,7 +488,7 @@ def objective(
 
     log_ratio = jnp.where(mask, log_probs - jax.lax.stop_gradient(batch.old_log_probs), 0.0)
     ratio = jnp.exp(log_ratio)
-    advantage = jax.lax.stop_gradient(batch.advantages)[None, :, None]
+    advantage = jax.lax.stop_gradient(batch.advantages)[None, :]
     policy_loss = -average(
         jnp.minimum(ratio * advantage, jnp.clip(ratio, 1 - config.clip_coef, 1 + config.clip_coef) * advantage)
     )
@@ -580,87 +503,32 @@ def objective(
     return loss, (policy_loss, entropy, approx_kl, clip_fraction)
 
 
-def update(state: TrainState, batch: GRPOBatch, config: Config) -> tuple[TrainState, Metrics]:
-    """Pack on the host, then run one forward/backward pass per minibatch."""
-    packed, normalization = pack_replay(batch)
-    return _update(state, packed, normalization, config)
-
-
 @partial(jax.jit, static_argnames="config")
-def _update(
-    state: TrainState,
-    batch: GRPOBatch,
-    normalization: Array,
-    config: Config,
-) -> tuple[TrainState, Metrics]:
-    """One compiled update per row/node bucket; filler has zero loss weight."""
+def update(state: TrainState, batch: GRPOBatch, config: Config) -> tuple[TrainState, Metrics]:
+    """Replay whole programs with teacher forcing in one forward/backward pass."""
     if config.log_compiles:
-        print(f"JIT trace update: bucket_shape={batch.actions.shape[1:]}", flush=True)
-    chex.assert_rank(batch.actions, 3)
+        print(f"JIT trace update: sequence_shape={batch.actions.shape}", flush=True)
+    chex.assert_rank(batch.actions, 2)
     chex.assert_equal_shape((batch.actions, batch.old_log_probs, batch.mask))
     chex.assert_type(batch.actions, jnp.int32)
     chex.assert_type((batch.old_log_probs, batch.advantages), jnp.float32)
     chex.assert_type(batch.mask, jnp.bool_)
-    chex.assert_type(batch.tree[:5], jnp.int32)
-    chex.assert_type((batch.tree.is_hole, batch.tree.node_mask, batch.tree.action_mask), jnp.bool_)
-    steps, programs, _ = batch.actions.shape
-    count = steps * programs
-    chex.assert_shape(batch.initial, (programs, None, None, 6))
+    chex.assert_shape(batch.initial, (batch.actions.shape[1], None, None, 6))
     chex.assert_equal_shape((batch.initial, batch.target))
     chex.assert_type((batch.initial, batch.target), jnp.int32)
 
-    def flatten(value: Array) -> jax.Array:
-        chex.assert_shape(value, (steps, programs, *value.shape[2:]))
-        return jnp.asarray(value).reshape(count, *value.shape[2:])
-
-    tree = ASTFeatures(*(flatten(value) for value in batch.tree))
-    # Round-major flattening: each round repeats the same ordered grid pairs.
-    rows = jnp.arange(count, dtype=jnp.int32) % programs
-    initial, target = batch.initial[rows], batch.target[rows]
-
     def replay(params: optax.Params) -> jax.Array:
-        logits = state.apply_fn({"params": params}, initial, target, tree)
-        return logits.reshape(*batch.actions.shape, len(AST_ACTIONS))
+        _, logits = state.apply_fn({"params": params}, batch.initial, batch.target, batch.actions[:-1])
+        return logits
 
     def loss_fn(params: optax.Params) -> tuple[jax.Array, Metrics]:
-        # Restore round/program axes so the objective retains equal program weights.
-        return objective(replay(params), batch, config, normalization)
+        return objective(replay(params), batch, config)
 
     (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     if config.target_kl is None:
         return state.apply_gradients(grads=grads), metrics
     state = jax.lax.cond(metrics[2] > config.target_kl, lambda: state, lambda: state.apply_gradients(grads=grads))
     return state, metrics
-
-
-def generate(
-    state: TrainState,
-    initial: Grids,
-    target: Grids,
-    key: jax.Array,
-    max_nodes: int = 128,
-    max_depth: int = 64,
-    max_program_tokens: int = 128,
-) -> tuple[KarelAST, ...]:
-    """Sample complete trees; illegal expansions and unfinished output are errors."""
-    chex.assert_shape(initial, (None, None, None, 6))
-    chex.assert_equal_shape((initial, target))
-    chex.assert_type((initial, target), jnp.int32)
-    chex.assert_scalar_positive(initial.shape[0])
-    chex.assert_shape(key, ())
-    if not jax.dtypes.issubdtype(key.dtype, jax.dtypes.prng_key):
-        raise TypeError("Expected a typed JAX PRNG key from jax.random.key")
-    trees = [KarelAST.empty(max_nodes, max_depth, max_program_tokens) for _ in initial]
-    for _ in range(min(max_nodes, max_depth + 1)):
-        features = bucket_tree(batch_features(tuple(tree.features() for tree in trees)))
-        logits = predict(state, initial, target, features)
-        key, sample_key = jax.random.split(key)
-        actions = np.asarray(jax.random.categorical(sample_key, logits), dtype=np.int32)
-        actions = np.pad(actions, ((0, 0), (0, max_nodes - actions.shape[-1])))
-        trees = [tree.expand_round(action) for tree, action in zip(trees, actions)]
-        if all(tree.complete for tree in trees):
-            return tuple(trees)
-    raise RuntimeError("AST generation failed to finish within its node budget")
 
 
 def load_model(
@@ -755,7 +623,6 @@ def train(config: Config) -> TrainState:
                     minibatch = GRPOBatch(
                         batch.initial[indices],
                         batch.target[indices],
-                        ASTFeatures(*(x[:, indices] for x in batch.tree)),
                         batch.actions[:, indices],
                         batch.old_log_probs[:, indices],
                         batch.mask[:, indices],
@@ -832,7 +699,7 @@ def train(config: Config) -> TrainState:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/karel_ast_grpo.yaml", help="Path to a YAML config")
+    parser.add_argument("--config", default="configs/karel_grpo.yaml", help="Path to a YAML config")
     args = parser.parse_args()
     train(load_config(args.config))
 

@@ -116,9 +116,12 @@ def test_full_games_raw_returns_memory_and_json(tmp_path: Path) -> None:
     assert env.closed
 
 
-@pytest.mark.parametrize("stacked", (False, True))
-@pytest.mark.parametrize("protocol", ("sticky", "legacy_noop"))
-@pytest.mark.parametrize("cap", (101, 102, 103, 104))
+# Check every frame-skip remainder under both protocols, with both stack modes.
+@pytest.mark.parametrize(
+    "stacked,protocol,cap",
+    [(bool(cap % 2), "sticky", cap) for cap in (101, 102, 103, 104)]
+    + [(not bool(cap % 2), "legacy_noop", cap) for cap in (101, 102, 103, 104)],
+)
 def test_real_ale_frame_cap_stacking_and_protocol(stacked: bool, protocol: str, cap: int) -> None:
     config = replace(training_config(), frame_stack=stacked)
     env = make_evaluation_env(config, EvaluationConfig(episodes=1, protocol=protocol, max_episode_frames=cap))

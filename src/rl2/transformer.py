@@ -10,10 +10,10 @@ inputs may be float32 or bfloat16. Keep the initialized parameters and optimizer
 state in float32 and compute the loss in float32. KV entries use bfloat16, while
 RoPE trigonometry and normalization statistics stay float32.
 
-The fixed-size ring cache implements sliding causal attention: each query sees
-at most ``max_seq_len`` tokens, including itself. Set it to the maximum episode
-length for full-context attention. RoPE positions continue across cache wraps
-and restart on per-example ``episode_starts``. Sequence, chunk and step calls
+Attention is fully causal within each episode. The fixed-size cache retains
+all episode tokens, up to ``max_seq_len``; exceeding that capacity raises an
+error, including under JIT. Per-example ``episode_starts`` clear the cache and
+restart RoPE positions. Sequence, chunk and step calls
 have identical semantics; prefill computes attention in parallel, without a
 token-by-token attention scan. Gradients flow through supplied caches unless
 the caller applies ``jax.lax.stop_gradient``.
@@ -21,7 +21,7 @@ the caller applies ``jax.lax.stop_gradient``.
 ``attention_implementation="xla"`` is portable (the default). Select ``"cudnn"``
 with float16/bfloat16 and a supported NVIDIA GPU for JAX's cuDNN fused attention.
 Backend shape/device restrictions are reported by JAX, without silent fallback.
-Fresh, unsegmented prefill uses the native causal/window mask; cached or packed
+Fresh, unsegmented prefill uses the native causal mask; cached or packed
 sequences use an explicit boolean mask to handle offsets and episode resets.
 Masked cuDNN calls pad odd sequence lengths for its backward-pass constraints.
 
@@ -49,10 +49,10 @@ type AttentionImplementation = Literal["xla", "cudnn"]
 
 
 class TransformerCarry(NamedTuple):
-    """Batch-leading KV ring buffer and next RoPE position within each episode.
+    """Batch-leading KV cache and next RoPE position within each episode.
 
     key/value: [B,max_seq_len,num_kv_heads,headdim], in projection dtype.
-    position: [B], int32. Slot ``p % max_seq_len`` stores position ``p``.
+    position: [B], int32. Slot ``p`` stores position ``p``.
     Keys are already rotated. Unused slots are zero, including after resets.
     """
 
@@ -68,6 +68,36 @@ def _positive_integer(value: int, name: str) -> None:
     if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError(f"{name} must be a positive integer")
     chex.assert_scalar_positive(value)
+
+
+def _check_positions(positions: jax.Array, capacity: int) -> None:
+    """Reject cache overflow eagerly and inside compiled sequence/scan calls."""
+    chex.assert_rank(positions, 2)
+    chex.assert_type(positions, jnp.int32)
+    _positive_integer(capacity, "capacity")
+
+    invalid = jnp.any((positions < 0) | (positions >= capacity))
+
+    def fail_if_invalid(value: jax.Array) -> None:
+        chex.assert_shape(value, ())
+        chex.assert_type(value, jnp.bool_)
+        if bool(value):
+            raise ValueError("Episode exceeds max_seq_len cache capacity; increase max_seq_len or reset the episode")
+
+    def report_failure() -> None:
+        # vmap may evaluate both cond branches, so the callback also checks
+        # its predicate instead of unconditionally raising.
+        jax.debug.callback(fail_if_invalid, invalid)
+
+    def success() -> None:
+        pass
+
+    if isinstance(invalid, jax.core.Tracer):
+        # Only transfer control to the host on failure; normal decoding keeps
+        # its fixed-shape carry on device and works inside lax.scan.
+        jax.lax.cond(invalid, report_failure, success)
+    elif bool(invalid):
+        fail_if_invalid(invalid)
 
 
 def _rope(x: jax.Array, positions: jax.Array, theta: float) -> jax.Array:
@@ -100,6 +130,7 @@ class Transformer(nn.Module):
     num_kv_heads: int | None = None
     max_seq_len: int = 2048
     rope_theta: float = 10000.0
+    norm_epsilon: float = 1e-6
     attention_implementation: AttentionImplementation = "xla"
     dtype: jax.typing.DTypeLike = jnp.float32
     out_proj_init_scale: float = 1.0
@@ -114,7 +145,7 @@ class Transformer(nn.Module):
         chex.assert_is_divisible(self.num_heads, kv_heads)
         head_dim = self.d_model // self.num_heads
         chex.assert_is_divisible(head_dim, 2)
-        for name in ("rope_theta", "out_proj_init_scale"):
+        for name in ("rope_theta", "out_proj_init_scale", "norm_epsilon"):
             if not 0 < getattr(self, name) < math.inf:
                 raise ValueError(f"{name} must be positive and finite")
         if self.attention_implementation not in ("xla", "cudnn"):
@@ -177,6 +208,8 @@ class Transformer(nn.Module):
         value = nn.Dense(kv_heads * head_dim, use_bias=False, dtype=self.dtype, name="v_proj")(x)
         query = query.reshape((batch, steps, self.num_heads, head_dim))
         key, value = (v.reshape((batch, steps, kv_heads, head_dim)) for v in (key, value))
+        query = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="q_norm")(query)
+        key = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="k_norm")(key)
         if steps:
             starts = episode_starts.T
             index = jnp.arange(steps, dtype=jnp.int32)[None, :]
@@ -185,16 +218,15 @@ class Transformer(nn.Module):
                 jnp.maximum, jnp.where(starts, index, -carry.position[:, None]), axis=1
             )
             positions = index - last_reset
+            _check_positions(positions, self.max_seq_len)
             query, key = _rope(query, positions, self.rope_theta), _rope(key, positions, self.rope_theta)
             slots = jnp.arange(self.max_seq_len, dtype=jnp.int32)[None, :]
-            old_positions = carry.position[:, None] - 1
-            old_positions = old_positions - (old_positions - slots) % self.max_seq_len
+            old_positions = jnp.where(slots < carry.position[:, None], slots, -1)
 
-            mask, window = None, None
+            mask = None
             native_causal = fresh and unsegmented
             if native_causal:
                 # Let cuDNN handle causality without materializing a dense mask.
-                window = (self.max_seq_len - 1, 0) if steps > self.max_seq_len else None
                 keys, values = key, value
             else:
                 segments = jnp.cumsum(starts, axis=1, dtype=jnp.int32)
@@ -205,7 +237,7 @@ class Transformer(nn.Module):
                     key_positions = jnp.concatenate((old_positions, positions), 1)
                     key_segments = jnp.concatenate((jnp.zeros_like(old_positions), segments), 1)
                 distance = positions[:, :, None] - key_positions[:, None, :]
-                mask = (distance >= 0) & (distance < self.max_seq_len)
+                mask = distance >= 0
                 mask &= key_positions[:, None, :] >= 0
                 mask &= segments[:, :, None] == key_segments[:, None, :]
                 mask = mask[:, None]
@@ -233,19 +265,18 @@ class Transformer(nn.Module):
                 values.astype(attention_dtype),
                 mask=mask,
                 is_causal=native_causal,
-                local_window_size=window,
+                local_window_size=None,
                 implementation=self.attention_implementation,
             )[:, :steps].astype(self.dtype)
 
             next_position = positions[:, -1] + 1
-            # Gather the last write to each ring slot. Unlike a scatter with
-            # duplicate indices, this is deterministic for chunks > cache size.
-            slot_positions = next_position[:, None] - 1
-            slot_positions = slot_positions - (slot_positions - slots) % self.max_seq_len
-            source = steps - next_position[:, None] + slot_positions
+            # Gather writes from the final episode in this chunk. Earlier
+            # cache entries survive only when that episode continued the carry.
+            source = steps - next_position[:, None] + slots
             gather = jnp.clip(source, 0, steps - 1)[..., None, None]
             new_key, new_value = (jnp.take_along_axis(v, gather, axis=1) for v in (key, value))
-            written, valid = (source >= 0)[..., None, None], (slot_positions >= 0)[..., None, None]
+            written = (source >= 0)[..., None, None]
+            valid = (slots < next_position[:, None])[..., None, None]
             carry = TransformerCarry(
                 jnp.where(valid, jnp.where(written, new_key, carry.key), 0),
                 jnp.where(valid, jnp.where(written, new_value, carry.value), 0),
@@ -307,7 +338,8 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
     """Modern decoder backbone with independent pre-RMSNorm/SwiGLU layers.
 
     Same sequence/step/reset interface as Mamba3Stack. Carry is a tuple of one
-    TransformerCarry per layer. The default MLP width is 8*d_model/3 rounded
+    TransformerCarry per layer. The default MLP width is 2*d_model, configurable
+    via ``mlp_expansion`` or an explicit ``d_intermediate`` override, then rounded
     up to ``mlp_multiple_of``. Final RMSNorm and float32 residuals default on.
     Output projections initialize with depth scale 1/sqrt(2*num_layers).
     """
@@ -317,8 +349,9 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
     max_seq_len: int = 2048
     rope_theta: float = 10000.0
     d_intermediate: int | None = None
-    mlp_multiple_of: int = 128
-    norm_epsilon: float = 1e-5
+    mlp_expansion: float = 2.0
+    mlp_multiple_of: int = 1
+    norm_epsilon: float = 1e-6
     residual_in_fp32: bool = True
     final_norm: bool = True
     rescale_prenorm_residual: bool = True
@@ -331,7 +364,9 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
             _positive_integer(getattr(self, name), name)
         if not 0 < self.norm_epsilon < math.inf:
             raise ValueError("norm_epsilon must be positive and finite")
-        width = int(8 * self.d_model / 3) if self.d_intermediate is None else self.d_intermediate
+        if not 0 < self.mlp_expansion < math.inf:
+            raise ValueError("mlp_expansion must be positive and finite")
+        width = int(self.mlp_expansion * self.d_model) if self.d_intermediate is None else self.d_intermediate
         _positive_integer(width, "d_intermediate")
         return (width + self.mlp_multiple_of - 1) // self.mlp_multiple_of * self.mlp_multiple_of
 
@@ -344,6 +379,7 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
             num_kv_heads=self.num_kv_heads,
             max_seq_len=self.max_seq_len,
             rope_theta=self.rope_theta,
+            norm_epsilon=self.norm_epsilon,
             attention_implementation=self.attention_implementation,
             dtype=self.dtype,
             out_proj_init_scale=1 / math.sqrt(2 * self.num_layers) if self.rescale_prenorm_residual else 1.0,

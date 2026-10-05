@@ -30,11 +30,10 @@ def test_default_decoder_mirrors_encoder_shapes(shape: tuple[int, ...]) -> None:
             assert stage_params[f"block_{block}"]["Conv_0"]["kernel"].shape == (3, 3, channels, channels)
 
 
-@pytest.mark.parametrize("rgb", [False, True])
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("rgb,dtype", [(False, jnp.float32), (True, jnp.bfloat16)])
 def test_decoder_jit_gradients_and_frame_layout(rgb: bool, dtype: jax.typing.DTypeLike) -> None:
-    shape = (2, 17, 13, 3) if rgb else (2, 17, 13)
-    stages = (ConvStage(4), ConvStage(8), ConvStage(8, blocks=1))
+    shape = (2, 5, 3, 3) if rgb else (2, 5, 3)
+    stages = (ConvStage(4), ConvStage(4, blocks=1), ConvStage(4))
     model = ConvObservationDecoder(shape, stages=stages, dtype=dtype)
     latent = jax.random.normal(jax.random.key(0), (2, 8)).astype(dtype)
     params = model.init(jax.random.key(1), latent)["params"]
@@ -44,13 +43,14 @@ def test_decoder_jit_gradients_and_frame_layout(rgb: bool, dtype: jax.typing.DTy
     chex.assert_shape(output, (2, *shape))
     chex.assert_type(output, dtype)
     chex.assert_type(jax.tree.leaves(params), jnp.float32)
-    for index, (height, width) in enumerate(((17, 13), (9, 7), (5, 4))):
+    for index, (height, width) in enumerate(((5, 3), (3, 2), (2, 1))):
         stage_intermediates = captured["intermediates"][f"stage_{index}"]
         channels = stages[max(index - 1, 0)].channels
         chex.assert_shape(stage_intermediates["resize_conv"]["__call__"][0], (2, height, width, channels))
-        intermediate = stage_intermediates["block_0"]["__call__"][0]
-        chex.assert_shape(intermediate, (2, height, width, channels))
-        chex.assert_type(intermediate, dtype)
+        for block in range(stages[index].blocks):
+            intermediate = stage_intermediates[f"block_{block}"]["__call__"][0]
+            chex.assert_shape(intermediate, (2, height, width, channels))
+            chex.assert_type(intermediate, dtype)
 
     def loss(parameters: optax.Params, features: jax.Array) -> jax.Array:
         chex.assert_trees_all_equal_shapes_and_dtypes(parameters, params)

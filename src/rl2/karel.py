@@ -20,7 +20,8 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from time import perf_counter
 from types import MappingProxyType
 from typing import NamedTuple
 
@@ -35,6 +36,7 @@ type State = NDArray[np.int32]
 type DistanceMap = NDArray[np.int32]
 type StepResult = tuple[None, float, bool, bool, dict[str, object]]
 REWARD_COMPONENTS = ("syntax", "runtime", "distance", "success", "trajectory", "length", "execution")
+TASK_CATEGORIES = ("easy", "navigation", "marker", "combined")
 
 ACTIONS = ("move", "turnLeft", "turnRight", "pickMarker", "putMarker")
 PREDICATES = ("frontIsClear", "leftIsClear", "rightIsClear", "markersPresent", "noMarkersPresent")
@@ -85,6 +87,15 @@ class KarelConfig:
     max_program_tokens: int = 128  # Includes the terminal m); excludes padding.
     max_execution_steps: int = 256  # Statements and loop-condition checks.
     max_sampling_attempts: int = 1000
+    # Relative category weights; defaults retain unrestricted sampling.
+    task_easy_weight: float = 1.0
+    task_navigation_weight: float = 0.0
+    task_marker_weight: float = 0.0
+    task_combined_weight: float = 0.0
+    navigation_min_distance: int = 3
+    marker_min_edits: int = 3
+    combined_min_distance: int = 2
+    combined_min_edits: int = 2
     position_weight: float = 1.0  # Weight per step of shortest-path robot-position error.
     orientation_weight: float = 1.0  # Weight for any incorrect robot heading.
     marker_weight: float = 1.0  # Weight per missing or extra marker, summed over all cells.
@@ -105,6 +116,10 @@ class KarelConfig:
             self.max_program_tokens,
             self.max_execution_steps,
             self.max_sampling_attempts,
+            self.navigation_min_distance,
+            self.marker_min_edits,
+            self.combined_min_distance,
+            self.combined_min_edits,
         ):
             if type(value) is not int:
                 raise TypeError("Karel sizes and limits must be integers")
@@ -119,6 +134,9 @@ class KarelConfig:
         chex.assert_scalar_in(self.max_markers, 1, np.iinfo(np.int32).max - 1)
         chex.assert_scalar_in(self.wall_probability, 0, 1)
         chex.assert_scalar_in(self.marker_probability, 0, 1)
+        task_weights = [getattr(self, f"task_{category}_weight") for category in TASK_CATEGORIES]
+        if any(not np.isfinite(weight) or weight < 0 for weight in task_weights) or not any(task_weights):
+            raise ValueError("Task category weights must be finite, nonnegative, and not all zero")
         for weight in (self.position_weight, self.orientation_weight, self.marker_weight):
             chex.assert_scalar_positive(weight)
             if not np.isfinite(weight):
@@ -138,11 +156,22 @@ class KarelConfig:
                 raise ValueError(f"{name} must be finite and nonnegative")
 
 
+class TaskSamplingStats(NamedTuple):
+    category: str
+    attempts: int
+    seconds: float
+
+
+_DEFAULT_SAMPLING_STATS = TaskSamplingStats("easy", 1, 0.0)
+
+
 @dataclass(frozen=True)
 class KarelTask:
     initial: State
     target: State
     program: tuple[str, ...]  # Complete reference program, including terminal m).
+    sampling: TaskSamplingStats = _DEFAULT_SAMPLING_STATS
+    distance_map: DistanceMap | None = None  # Reuse acceptance-check BFS at reset.
 
 
 def target_distance_map(target: State) -> DistanceMap:
@@ -503,10 +532,22 @@ def sample_task(rng: np.random.Generator, config: KarelConfig | None = None) -> 
     """Sample a reachable, changed target by executing a random grammar program.
 
     Rejection sampling discards invalid, over-budget, and identity executions.
-    Sampling is with replacement; uniqueness across calls is not guaranteed.
+    Select a category once, before retries, then filter by necessary movement
+    and marker edits. Exhaustion raises rather than falling back to easier tasks.
+    Categories may overlap. Sampling is with replacement; uniqueness is not guaranteed.
     """
     config = config if config is not None else KarelConfig()
-    for _ in range(config.max_sampling_attempts):
+    start = perf_counter()
+    weights = np.asarray([getattr(config, f"task_{category}_weight") for category in TASK_CATEGORIES], np.float64)
+    weights /= weights.max()  # Avoid overflow when normalizing large finite weights.
+    enabled = np.flatnonzero(weights)
+    # Preserve the old seeded task stream when only the easy category is enabled.
+    category = TASK_CATEGORIES[int(enabled[0] if len(enabled) == 1 else rng.choice(4, p=weights / weights.sum()))]
+    min_distance = {"navigation": config.navigation_min_distance, "combined": config.combined_min_distance}.get(
+        category, 0
+    )
+    min_edits = {"marker": config.marker_min_edits, "combined": config.combined_min_edits}.get(category, 0)
+    for attempt in range(1, config.max_sampling_attempts + 1):
         initial = np.zeros((config.height, config.width, 6), dtype=np.int32)
         initial[..., 4] = rng.random(initial.shape[:2]) < config.wall_probability
         initial[[0, -1], :, 4] = 1
@@ -523,9 +564,21 @@ def sample_task(rng: np.random.Generator, config: KarelConfig | None = None) -> 
             )
         except KarelProgramError:
             continue
-        if not np.array_equal(initial, target):
-            return KarelTask(initial, target, program)
-    raise RuntimeError("Could not sample a nontrivial Karel task within max_sampling_attempts")
+        if np.array_equal(initial, target):
+            continue
+        marker_edits = int(np.abs(initial[..., 5].astype(np.int64) - target[..., 5]).sum())
+        if marker_edits < min_edits:
+            continue
+        distance_map = target_distance_map(target)
+        if int(distance_map[row, col]) < min_distance:
+            continue
+        return KarelTask(
+            initial, target, program, TaskSamplingStats(category, attempt, perf_counter() - start), distance_map
+        )
+    raise RuntimeError(
+        f"Could not sample a nontrivial Karel task in category {category!r} within max_sampling_attempts="
+        f"{config.max_sampling_attempts} (minimum position distance={min_distance}, marker edits={min_edits})"
+    )
 
 
 class KarelProgramEnv:
@@ -573,6 +626,13 @@ class KarelProgramEnv:
             raise gym.error.ResetNeeded("Call reset() before requesting a reference program")
         return tuple(TOKEN_TO_ID[token] for token in self._task.program)
 
+    @property
+    def sampling_stats(self) -> TaskSamplingStats:
+        """Generation diagnostics for the current task, excluded from observations."""
+        if self._task is None:
+            raise gym.error.ResetNeeded("Call reset() before requesting sampling statistics")
+        return self._task.sampling
+
     def reset(self, *, seed: int | None = None) -> KarelPair:
         self._needs_reset = True
         self._task = None
@@ -582,7 +642,9 @@ class KarelProgramEnv:
             self._rng = np.random.default_rng(seed)
             self.action_space.seed(seed)
         self._task = sample_task(self._rng, self.config)
-        self._distance_map = target_distance_map(self._task.target)
+        self._distance_map = self._task.distance_map
+        if self._distance_map is None:
+            self._distance_map = target_distance_map(self._task.target)
         self._needs_reset = False
         # Callers may transform observations without changing the task we evaluate.
         return KarelPair(self._task.initial.copy(), self._task.target.copy())
@@ -598,8 +660,13 @@ class KarelProgramEnv:
             raise ValueError("Cannot copy a task between environments with different configs")
         if source._needs_reset or source._task is None or source._distance_map is None or source._program:
             raise ValueError("Source environment must be freshly reset")
-        self._task = KarelTask(source._task.initial.copy(), source._task.target.copy(), source._task.program)
         self._distance_map = source._distance_map.copy()
+        self._task = replace(
+            source._task,
+            initial=source._task.initial.copy(),
+            target=source._task.target.copy(),
+            distance_map=self._distance_map,
+        )
         self._rng = deepcopy(source._rng)
         self.action_space.np_random.bit_generator.state = deepcopy(source.action_space.np_random.bit_generator.state)
         self._program.clear()

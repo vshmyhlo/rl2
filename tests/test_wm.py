@@ -25,10 +25,10 @@ def small_model(**kwargs: Any) -> MambaWorldModel:
         "observation_shape": (1, 4, 4),
         "num_actions": 3,
         "d_model": 8,
-        "num_layers": 2,
+        "num_layers": 1,
         "d_state": 4,
         "headdim": 4,
-        "encoder_stages": (ConvStage(4),),
+        "encoder_stages": (ConvStage(4, blocks=1),),
         "stochastic_size": 4,
         "stochastic_classes": 4,
     }
@@ -41,7 +41,7 @@ def assert_tree_close(actual: Any, expected: Any, *, atol: float = 3e-6) -> None
         np.testing.assert_allclose(a, b, rtol=3e-5, atol=atol)
 
 
-@pytest.mark.parametrize("rank,rgb,depth", [(1, False, 4), (2, True, 2)])
+@pytest.mark.parametrize("rank,rgb,depth", [(1, False, 2), (2, True, 1)])
 def test_sequence_steps_chunks_and_initialization_agree(rank: int, rgb: bool, depth: int) -> None:
     shape = (2, 4, 4, 3) if rgb else (2, 4, 4)
     model = small_model(observation_shape=shape, num_layers=depth, mimo_rank=rank)
@@ -74,7 +74,7 @@ def test_sequence_steps_chunks_and_initialization_agree(rank: int, rgb: bool, de
     joined = jax.tree.map(lambda a, b: jnp.concatenate((a, b)), first, last)
     assert_tree_close((current, joined), (final, output))
     encoded = model.apply(variables, obs, method=model.encode)
-    encoder = ConvObservationEncoder(stages=(ConvStage(4),), embedding_size=8)
+    encoder = ConvObservationEncoder(stages=(ConvStage(4, blocks=1),), embedding_size=8)
     expected = encoder.apply({"params": variables["params"]["encoder"]}, obs.reshape((10, *shape)))
     assert_tree_close(encoded, expected.reshape((5, 2, 8)))
     assert_tree_close(model.apply(variables, output.features, method=model.decode), output.prediction)

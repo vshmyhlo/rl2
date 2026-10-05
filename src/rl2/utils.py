@@ -1,7 +1,46 @@
-"""Shared numerical utilities."""
+"""Shared numerical and file-storage utilities."""
 
+import os
+import tempfile
+from pathlib import Path
+
+import gcsfs
 import numpy as np
 from numpy.typing import ArrayLike
+
+
+def read_bytes(path: str) -> bytes:
+    if path.startswith("gs://"):
+        return gcsfs.GCSFileSystem().cat_file(path)
+    return Path(path).read_bytes()
+
+
+def write_bytes(path: str, data: bytes) -> None:
+    if path.startswith("gs://"):
+        gcsfs.GCSFileSystem().pipe_file(path, data)
+    else:
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        # Commit a whole checkpoint, never truncate the previous good file.
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=f".{destination.name}.", delete=False) as f:
+                temporary = Path(f.name)
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, destination)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+
+def read_optional(path: str) -> bytes | None:
+    """Only a missing object means a new run; storage/authentication errors propagate."""
+    try:
+        return read_bytes(path)
+    except FileNotFoundError:
+        return None
 
 
 class RunningMeanStd:

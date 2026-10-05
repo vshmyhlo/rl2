@@ -85,8 +85,17 @@ def test_rollout_samples_task_and_distance_map_once_per_group(
     monkeypatch.setattr(karel, "sample_task", sampler)
     monkeypatch.setattr(karel, "target_distance_map", distance_map)
     envs = [KarelProgramEnv(config.env) for _ in range(config.num_tasks * config.group_size)]
-    batch, _, _, _ = collect_rollout(state, envs, np.random.default_rng(4), jax.random.key(3), config)
+    batch, _, diagnostics, _ = collect_rollout(state, envs, np.random.default_rng(4), jax.random.key(3), config)
     assert sampler.call_count == distance_map.call_count == config.num_tasks
+    stats = [env.sampling_stats for env in envs[:: config.group_size]]
+    assert diagnostics["sampling/easy_fraction"] == 1
+    assert diagnostics["sampling/navigation_fraction"] == 0
+    assert "sampling/navigation_attempts_mean" not in diagnostics
+    assert diagnostics["sampling/easy_attempts_mean"] == pytest.approx(np.mean([item.attempts for item in stats]))
+    assert diagnostics["sampling/easy_acceptance_rate"] == pytest.approx(
+        config.num_tasks / sum(item.attempts for item in stats)
+    )
+    assert diagnostics["sampling/easy_seconds_mean"] >= 0
     seeds = np.random.default_rng(4).integers(0, 2**31, size=config.num_tasks)
     for group, seed in enumerate(seeds):
         expected = KarelProgramEnv(config.env).reset(seed=int(seed))
@@ -154,10 +163,6 @@ def test_objective_program_weighting_padding_entropy_and_clipping(config: Config
     loss, metrics = objective(logits, clipped, config)
     np.testing.assert_allclose(loss, -config.clip_coef, atol=1e-6)
     np.testing.assert_allclose(metrics[3], 1.0, atol=1e-6)
-    reference = action_log_prob(logits, clipped.actions) - 1
-    penalized, kl = objective(logits, clipped, replace(config, kl_coef=0.1), reference)
-    np.testing.assert_allclose(kl[4], np.exp(-1), atol=1e-6)
-    np.testing.assert_allclose(penalized, loss + 0.1 * np.exp(-1), atol=1e-6)
 
 
 def test_rollout_pairs_masks_replay_and_exact_environment_rewards(
@@ -199,17 +204,11 @@ def test_rollout_pairs_masks_replay_and_exact_environment_rewards(
     assert diagnostics["charts/group_success_rate"] == float(any(successes))
 
 
-@pytest.mark.parametrize("kl_coef", [0.0, 0.05])
-def test_single_pass_update_matches_roundwise_gradient(
-    config: Config, state: TrainState, rollout: tuple, kl_coef: float
-) -> None:
+def test_single_pass_update_matches_roundwise_gradient(config: Config, state: TrainState, rollout: tuple) -> None:
     batch = rollout[0]._replace(advantages=jnp.asarray([1.0, -1.0], jnp.float32))
-    config = replace(config, kl_coef=kl_coef)
-    reference_params = jax.tree.map(lambda x: x * 0.99, state.params)
-    reference = action_log_prob(replay_logits(state, batch, reference_params), batch.actions)
 
     def full_loss(params: optax.Params) -> tuple[jax.Array, tuple]:
-        return objective(replay_logits(state, batch, params), batch, config, reference)
+        return objective(replay_logits(state, batch, params), batch, config)
 
     (_, expected_metrics), grads = jax.jit(jax.value_and_grad(full_loss, has_aux=True))(state.params)
     expected = state.apply_gradients(grads=grads)
@@ -224,8 +223,8 @@ def test_single_pass_update_matches_roundwise_gradient(
         calls.append(initial.shape[0])
         return state.apply_fn(variables, initial, target, tree)
 
-    actual, metrics = update(state.replace(apply_fn=apply), batch, config, reference_params)
-    assert calls == [rows] * (2 if kl_coef else 1)
+    actual, metrics = update(state.replace(apply_fn=apply), batch, config)
+    assert calls == [rows]
     np.testing.assert_allclose(metrics, expected_metrics, atol=2e-6, rtol=2e-5)
     for a, b in zip(jax.tree.leaves(actual.params), jax.tree.leaves(expected.params)):
         np.testing.assert_allclose(a, b, atol=2e-6, rtol=2e-5)
@@ -419,8 +418,6 @@ def test_padding_and_rejected_kl_do_not_update_state(config: Config, state: Trai
     rejected = batch._replace(old_log_probs=batch.old_log_probs - 2.0)
     result, _ = update(state, rejected, replace(config, target_kl=0.001))
     chex.assert_trees_all_equal(result, state)
-    with pytest.raises(ValueError, match="Frozen reference"):
-        update(state, batch, replace(config, kl_coef=0.1))
 
 
 @pytest.mark.parametrize("bf16", [False, True])
@@ -440,6 +437,7 @@ def test_train_checkpoint_tensorboard(
     assert events.Scalars("charts/reward_mean")
     assert events.Scalars("charts/program_token_length_mean")
     assert "samples/generated_programs/text_summary" in events.Tags()["tensors"]
+    assert "policy/reference_kl" not in events.Tags()["scalars"]
 
 
 @pytest.mark.parametrize("legacy_steps", [False, True])
@@ -464,7 +462,7 @@ def test_logging_every_20_rollouts_survives_resume(
     monkeypatch.setattr(grpo, "SummaryWriter", MagicMock(return_value=writer))
     monkeypatch.setattr(grpo, "create_state", MagicMock(return_value=state))
     monkeypatch.setattr(grpo, "collect_rollout", MagicMock(return_value=rollout))
-    monkeypatch.setattr(grpo, "update", MagicMock(return_value=(state, tuple(jnp.asarray(0.0) for _ in range(5)))))
+    monkeypatch.setattr(grpo, "update", MagicMock(return_value=(state, tuple(jnp.asarray(0.0) for _ in range(4)))))
     formatter = MagicMock(return_value="sample programs")
     monkeypatch.setattr(grpo, "format_group_programs", formatter)
     train(config)
@@ -520,7 +518,7 @@ def test_gcs_checkpoint_paths(config: Config, tmp_path: Path, monkeypatch: pytes
         paths.append(logdir)
         return SummaryWriter(logdir=str(tmp_path), purge_step=purge_step)
 
-    monkeypatch.setattr("rl2.train_karel_ast_grpo.gcsfs.GCSFileSystem", FakeGCS)
+    monkeypatch.setattr("rl2.utils.gcsfs.GCSFileSystem", FakeGCS)
     monkeypatch.setattr("rl2.train_karel_ast_grpo.SummaryWriter", writer)
     cloud_config = replace(config, log_dir="gs://test-bucket/grpo/", run_id="resume-test")
     state = train(cloud_config)
@@ -611,7 +609,7 @@ def test_cudnn_ast_grpo(config: Config) -> None:
 def test_interrupted_resume_matches_uninterrupted_training(
     config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = replace(config, total_updates=3, kl_coef=0.05, log_dir=str(tmp_path), log_program_interval=10)
+    config = replace(config, total_updates=3, log_dir=str(tmp_path), log_program_interval=10)
     collect = grpo.collect_rollout
     save = grpo._save_checkpoint
     calls = 0
@@ -682,7 +680,6 @@ def test_resume_uses_modified_config_and_counts_prior_episodes(config: Config, t
         max_grad_norm=1.0,
         seed=999,
         env=replace(config.env, marker_weight=2.0),
-        kl_coef=0.05,
     )
     result = train(changed)
     assert int(result.step) == int(initial.step) + 2
@@ -693,8 +690,7 @@ def test_resume_uses_modified_config_and_counts_prior_episodes(config: Config, t
     assert payload["steps"] == 6
     events = EventAccumulator(str(directory)).Reload().Scalars("charts/reward_mean")
     assert [event.step for event in events] == [2, 6]
-    # A newly enabled KL penalty anchors at the resumed weights.
-    chex.assert_trees_all_equal(payload["reference_params"], initial.params)
+    assert "reference_params" not in payload
     assert load_config(directory / "config.yaml") == changed
 
 
@@ -736,30 +732,6 @@ def test_incompatible_or_corrupt_checkpoint_is_not_overwritten(config: Config, t
     assert checkpoint.read_bytes() == serialization.msgpack_serialize({"version": 999})
 
 
-def test_checkpoint_io_preserves_previous_file_and_propagates_storage_errors(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    destination = tmp_path / "checkpoint.msgpack"
-    destination.write_bytes(b"old")
-
-    def failed_replace(source: Path, target: Path) -> None:
-        raise OSError("simulated replace failure")
-
-    monkeypatch.setattr(grpo.os, "replace", failed_replace)
-    with pytest.raises(OSError, match="replace failure"):
-        grpo._write_bytes(str(destination), b"new")
-    assert destination.read_bytes() == b"old"
-    assert list(tmp_path.iterdir()) == [destination]
-    assert grpo._read_optional(str(tmp_path / "missing")) is None
-
-    def denied(path: str) -> bytes:
-        raise PermissionError("storage access denied")
-
-    monkeypatch.setattr(grpo, "_read_bytes", denied)
-    with pytest.raises(PermissionError, match="denied"):
-        grpo._read_optional("gs://bucket/run/checkpoint.msgpack")
-
-
 @pytest.mark.parametrize("run_id", ["", " ", ".", "..", "../run", "foo/bar", "foo\\bar", 1])
 def test_invalid_run_id(config: Config, run_id: str | int) -> None:
     with pytest.raises((ValueError, TypeError)):
@@ -783,3 +755,23 @@ def test_legacy_weights_load_for_inference_but_cannot_resume(config: Config, sta
     with pytest.raises(ValueError, match="only inference weights"):
         train(config)
     assert not (directory / "checkpoint.msgpack").exists()
+
+
+def test_legacy_reference_checkpoint_and_config_load_without_reference(
+    config: grpo.Config, state: TrainState, tmp_path: Path
+) -> None:
+    rng = np.random.default_rng(12)
+    progress = grpo.TrainingProgress(state, jax.random.key(3), 2, 8, 1, 8)
+    grpo._save_checkpoint(str(tmp_path), progress, rng)
+    payload = serialization.msgpack_restore((tmp_path / "checkpoint.msgpack").read_bytes())
+    assert "reference_params" not in payload
+    assert "kl_coef" not in grpo.asdict(config)
+    # Older checkpoints may contain a separate reference with different weights.
+    payload["reference_params"] = {"obsolete_reference": np.zeros(1, np.float32)}
+    restored_rng = np.random.default_rng(99)
+    restored = grpo._restore_checkpoint(serialization.msgpack_serialize(payload), state, restored_rng)
+    chex.assert_trees_all_equal(restored, progress)
+    np.testing.assert_array_equal(restored_rng.integers(100, size=4), rng.integers(100, size=4))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(grpo.yaml.safe_dump({**grpo.asdict(config), "kl_coef": 0.25}))
+    assert grpo.load_config(config_path) == config

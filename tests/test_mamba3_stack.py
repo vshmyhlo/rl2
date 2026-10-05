@@ -33,19 +33,19 @@ def test_matches_official_blocks_outputs_states_and_gradients(rank: int, rms_nor
     params = unflatten_dict(
         {key.removeprefix("params/"): value for key, value in case.items() if key.startswith("params/")}, sep="/"
     )
-    carry, y = jax.jit(model.apply)({"params": params}, case["x"])
+
+    def loss(parameters: Any, x: jax.Array) -> tuple[jax.Array, tuple[Mamba3StackCarry, jax.Array]]:
+        chex.assert_shape(x, (6, 2, 8))
+        chex.assert_type(x, jnp.float32)
+        chex.assert_trees_all_equal_shapes_and_dtypes(parameters, params)
+        carry, y = model.apply({"params": parameters}, x)
+        return jnp.sum(y * case["probe"]), (carry, y)
+
+    (_, (carry, y)), (grads, dx) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True))(params, case["x"])
     np.testing.assert_allclose(y, case["y"], rtol=5e-5, atol=3e-6)
     for i, state in enumerate(carry):
         for name, leaf in zip(state._fields, state):
             np.testing.assert_allclose(leaf, case[f"carry/{i}/{name}"], rtol=5e-5, atol=3e-6)
-
-    def loss(parameters: Any, x: jax.Array) -> jax.Array:
-        chex.assert_shape(x, (6, 2, 8))
-        chex.assert_type(x, jnp.float32)
-        _, y = model.apply({"params": parameters}, x)
-        return jnp.sum(y * case["probe"])
-
-    grads, dx = jax.jit(jax.grad(loss, argnums=(0, 1)))(params, case["x"])
     np.testing.assert_allclose(dx, case["dx"], rtol=1e-4, atol=1e-5)
     for name, gradient in flatten_dict(grads, sep="/").items():
         np.testing.assert_allclose(gradient, case[f"grads/{name}"], rtol=1e-4, atol=1e-5, err_msg=name)

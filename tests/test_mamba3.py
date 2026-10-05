@@ -179,10 +179,19 @@ def test_invalid_input_and_carry_shapes() -> None:
         model.apply(variables, x[0], episode_starts=jnp.zeros((1, 2)), method=model.step)
 
 
-@pytest.mark.parametrize("rank", [1, 2, 4])
-@pytest.mark.parametrize("fraction", [0.5, 1.0])
-@pytest.mark.parametrize("norm", [False, True])
-@pytest.mark.parametrize("chunk_size", [2, 6])
+# Cover each rank with both RoPE fractions and normalization modes, and
+# exercise both full and chunked gradients without their Cartesian product.
+@pytest.mark.parametrize(
+    "rank,fraction,norm,chunk_size",
+    [
+        (1, 0.5, False, 6),
+        (1, 1.0, True, 2),
+        (2, 0.5, True, 6),
+        (2, 1.0, False, 2),
+        (4, 0.5, False, 2),
+        (4, 1.0, True, 6),
+    ],
+)
 def test_matches_official_module_outputs_states_and_gradients(
     rank: int, fraction: float, norm: bool, chunk_size: int
 ) -> None:
@@ -219,18 +228,17 @@ def test_matches_official_module_outputs_states_and_gradients(
             outputs.append(output)
         return carry, jnp.concatenate(outputs)
 
-    carry, y = forward(params, case["x"])
+    def loss_fn(parameters: Any, x: jax.Array) -> tuple[jax.Array, tuple[Mamba3Carry, jax.Array]]:
+        chex.assert_shape(x, (6, 2, 8))
+        chex.assert_type(x, jnp.float32)
+        chex.assert_trees_all_equal_shapes_and_dtypes(parameters, params)
+        carry, output = forward(parameters, x)
+        return jnp.sum(output * case["probe"]), (carry, output)
+
+    (_, (carry, y)), (grads, dx) = jax.jit(jax.value_and_grad(loss_fn, argnums=(0, 1), has_aux=True))(params, case["x"])
     np.testing.assert_allclose(y, case["y"], rtol=5e-5, atol=3e-6)
     for name, leaf in zip(carry._fields, carry):
         np.testing.assert_allclose(leaf, case[f"carry/{name}"], rtol=5e-5, atol=3e-6)
-
-    def loss_fn(parameters: Any, x: jax.Array) -> jax.Array:
-        chex.assert_shape(x, (6, 2, 8))
-        chex.assert_type(x, jnp.float32)
-        _, output = forward(parameters, x)
-        return jnp.sum(output * case["probe"])
-
-    grads, dx = jax.jit(jax.grad(loss_fn, argnums=(0, 1)))(params, case["x"])
     np.testing.assert_allclose(dx, case["dx"], rtol=1e-4, atol=1e-5)
     for name, gradient in flatten_dict(grads, sep="/").items():
         np.testing.assert_allclose(gradient, case[f"grads/{name}"], rtol=1e-4, atol=1e-5, err_msg=name)

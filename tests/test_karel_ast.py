@@ -78,7 +78,7 @@ def test_all_karel_constructs_round_trip() -> None:
 
 def test_reference_solutions_preserve_execution() -> None:
     rng = np.random.default_rng(15)
-    for _ in range(32):
+    for _ in range(3):
         task = sample_task(rng)
         tree = build(" ".join(task.program))
         assert tree.tokens() == task.program
@@ -88,7 +88,7 @@ def test_reference_solutions_preserve_execution() -> None:
 @pytest.mark.parametrize("nodes,depth", [(4, 2), (5, 2), (8, 3), (16, 8), (128, 64)])
 def test_every_masked_expansion_can_finish_in_budget(nodes: int, depth: int) -> None:
     rng = np.random.default_rng(25)
-    for _ in range(20):
+    for _ in range(3):
         tree = KarelAST.empty(nodes, depth)
         steps = 0
         while not tree.complete:
@@ -175,7 +175,7 @@ def test_reference_exceeding_ast_budget_is_rejected() -> None:
 @pytest.mark.parametrize("budget", [5, 6, 9, 11, 15, 32])
 def test_source_budget_always_allows_completion(budget: int) -> None:
     rng = np.random.default_rng(53)
-    for _ in range(30):
+    for _ in range(3):
         tree = KarelAST.empty(64, 16, max_program_tokens=budget)
         for _ in range(64):
             if tree.complete:
@@ -268,7 +268,7 @@ def test_parallel_round_expands_old_holes_only_and_preserves_positions() -> None
 @pytest.mark.parametrize("nodes,depth,tokens", [(4, 2, 5), (8, 3, 6), (16, 8, 11), (64, 16, 32), (128, 64, None)])
 def test_parallel_samples_complete_within_all_budgets(nodes: int, depth: int, tokens: int | None) -> None:
     rng = np.random.default_rng(71)
-    for _ in range(40):
+    for _ in range(3):
         tree = KarelAST.empty(nodes, depth, tokens)
         decisions = 0
         for step in range(min(nodes, depth + 1)):

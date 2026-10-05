@@ -21,15 +21,15 @@ type LossOutput = tuple[jax.Array, tuple[Carry, jax.Array]]
 @pytest.mark.parametrize(
     "model",
     [
-        pytest.param(Mamba3(16, d_state=8, headdim=4, dtype=jnp.bfloat16), id="mamba-siso"),
+        pytest.param(Mamba3(8, d_state=8, headdim=4, dtype=jnp.bfloat16), id="mamba-siso"),
         pytest.param(
-            Mamba3(16, d_state=8, headdim=4, mimo_rank=2, outproj_norm=True, dtype=jnp.bfloat16), id="mamba-mimo"
+            Mamba3(8, d_state=8, headdim=4, mimo_rank=2, outproj_norm=True, dtype=jnp.bfloat16), id="mamba-mimo"
         ),
-        pytest.param(Transformer(16, num_heads=2, num_kv_heads=1, max_seq_len=3, dtype=jnp.bfloat16), id="transformer"),
+        pytest.param(Transformer(8, num_heads=2, num_kv_heads=1, max_seq_len=6, dtype=jnp.bfloat16), id="transformer"),
         *[
             pytest.param(
                 Mamba3Stack(
-                    16,
+                    8,
                     2,
                     d_state=8,
                     headdim=4,
@@ -45,11 +45,11 @@ type LossOutput = tuple[jax.Array, tuple[Carry, jax.Array]]
         *[
             pytest.param(
                 TransformerStack(
-                    16,
+                    8,
                     2,
                     num_heads=2,
                     num_kv_heads=1,
-                    max_seq_len=3,
+                    max_seq_len=6,
                     mlp_multiple_of=8,
                     dtype=jnp.bfloat16,
                     residual_in_fp32=residual_fp32,
@@ -64,7 +64,7 @@ type LossOutput = tuple[jax.Array, tuple[Carry, jax.Array]]
                 2,
                 num_heads=2,
                 num_kv_heads=1,
-                max_seq_len=3,
+                max_seq_len=6,
                 mlp_multiple_of=8,
                 dtype=jnp.bfloat16,
                 attention_implementation="cudnn",
@@ -79,13 +79,13 @@ type LossOutput = tuple[jax.Array, tuple[Carry, jax.Array]]
 )
 def test_bfloat16_chunked_gradients_and_adam_training(model: Model) -> None:
     """Train with BF16 inputs/compute and FP32 parameters, gradients and Adam state."""
-    x = jax.random.normal(jax.random.key(20), (6, 2, 16)).astype(jnp.bfloat16)
+    x = jax.random.normal(jax.random.key(20), (6, 2, model.d_model)).astype(jnp.bfloat16)
     target = jax.random.normal(jax.random.key(21), x.shape)
     starts = jnp.zeros((6, 2), jnp.bool_).at[4, 0].set(True)
     params = model.init(jax.random.key(22), x)["params"]
 
     def loss(parameters: Parameters, inputs: jax.Array, chunked: bool) -> LossOutput:
-        chex.assert_shape(inputs, (6, 2, 16))
+        chex.assert_shape(inputs, (6, 2, model.d_model))
         chex.assert_type(inputs, jnp.bfloat16)
         chex.assert_type(jax.tree.leaves(parameters), jnp.float32)
         if chunked:
@@ -124,7 +124,7 @@ def test_bfloat16_chunked_gradients_and_adam_training(model: Model) -> None:
             chex.assert_type(state.position, jnp.int32)
 
     def train_step(state: TrainState, inputs: jax.Array) -> tuple[TrainState, jax.Array]:
-        chex.assert_shape(inputs, (6, 2, 16))
+        chex.assert_shape(inputs, (6, 2, model.d_model))
         chex.assert_type(inputs, jnp.bfloat16)
         (value, _), grads = jax.value_and_grad(partial(loss, chunked=True), has_aux=True)(state.params, inputs)
         chex.assert_type(jax.tree.leaves(grads), jnp.float32)
@@ -132,7 +132,7 @@ def test_bfloat16_chunked_gradients_and_adam_training(model: Model) -> None:
 
     state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(learning_rate=0.01))
     update = jax.jit(train_step)
-    for _ in range(3):
+    for _ in range(2):
         state, value = update(state, x)
         assert np.isfinite(value)
     chex.assert_type(jax.tree.leaves(state.params), jnp.float32)

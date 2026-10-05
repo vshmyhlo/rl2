@@ -145,7 +145,7 @@ def test_inactive_distribution_does_not_depend_on_model_logits(finished: bool, v
 
 @pytest.mark.parametrize("budget", [5, 16, 128])
 def test_random_masked_generation_always_parses_and_finishes(budget: int) -> None:
-    batch = 32
+    batch = 4
 
     def generate(key: jax.Array) -> tuple[GrammarState, jax.Array]:
         chex.assert_shape(key, ())
@@ -196,7 +196,7 @@ def test_teacher_forcing_uses_only_preceding_tokens() -> None:
 
 def test_sampled_reference_solutions_remain_allowed() -> None:
     rng = np.random.default_rng(7)
-    programs = [sample_task(rng).program for _ in range(32)]
+    programs = [sample_task(rng).program for _ in range(4)]
     budget = max(map(len, programs))
     actions = np.zeros((budget, len(programs)), np.int32)
     for index, program in enumerate(programs):

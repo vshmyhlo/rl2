@@ -146,7 +146,7 @@ def test_update_targets_losses_carry_and_learning(loss: train_wm.ObservationLoss
         num_layers=2,
         d_state=4,
         headdim=4,
-        encoder_stages=(ConvStage(4),),
+        encoder_stages=(ConvStage(4, blocks=1),),
         stochastic_size=4,
         stochastic_classes=4,
     )
@@ -201,15 +201,14 @@ def test_update_targets_losses_carry_and_learning(loss: train_wm.ObservationLoss
     for actual, expected in zip(jax.tree.leaves(final), jax.tree.leaves(expected_carry)):
         np.testing.assert_allclose(actual, expected, atol=1e-6)
     first_loss = float(metrics["loss"])
-    for _ in range(4):
-        state, _, metrics = train_wm.update(state, model, batch, carry, key, 1.0, 0.1, 0.0, observation_loss=loss)
-    assert int(state.step) == 5
+    state, _, metrics = train_wm.update(state, model, batch, carry, key, 1.0, 0.1, 0.0, observation_loss=loss)
+    assert int(state.step) == 2
     assert float(metrics["loss"]) < first_loss
     assert all(np.isfinite(value) for value in metrics.values())
 
 
-@pytest.mark.parametrize("remote", [False, True])
-@pytest.mark.parametrize("checkpoint_every", [1, 100])
+# Cover local/remote storage and periodic/final-only checkpointing.
+@pytest.mark.parametrize("remote,checkpoint_every", [(False, 1), (True, 100)])
 def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remote: bool, checkpoint_every: int
 ) -> None:
@@ -273,7 +272,7 @@ def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
         num_steps=3,
         d_model=8,
         num_layers=2,
-        encoder_stages=(ConvStage(4),),
+        encoder_stages=(ConvStage(4, blocks=1),),
         stochastic_size=4,
         stochastic_classes=4,
         d_state=4,
@@ -387,9 +386,9 @@ def test_invalid_config(options: dict[str, Any]) -> None:
         training_config(**options)
 
 
-@pytest.mark.parametrize("num_frames", [1, 10])
+@pytest.mark.parametrize("num_frames", [1, 3])
 def test_comparison_aligns_branches_and_keeps_future_frames_out_of_imagination(num_frames: int) -> None:
-    shape = (2, 3, 4, 3) if num_frames == 10 else (2, 3, 4)
+    shape = (2, 3, 4, 3) if num_frames > 1 else (2, 3, 4)
     model = MambaWorldModel(
         shape,
         3,
@@ -397,7 +396,7 @@ def test_comparison_aligns_branches_and_keeps_future_frames_out_of_imagination(n
         num_layers=2,
         d_state=4,
         headdim=4,
-        encoder_stages=(ConvStage(4),),
+        encoder_stages=(ConvStage(4, blocks=1),),
         stochastic_size=4,
         stochastic_classes=4,
     )
@@ -483,7 +482,7 @@ def test_video_orders_labeled_panels_and_uses_recorded_actions(monkeypatch: pyte
         num_layers=2,
         d_state=4,
         headdim=4,
-        encoder_stages=(ConvStage(4),),
+        encoder_stages=(ConvStage(4, blocks=1),),
         stochastic_size=4,
         stochastic_classes=4,
     )

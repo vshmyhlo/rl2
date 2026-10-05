@@ -4,33 +4,27 @@ num_tasks: 32 # Sampled pairs per rollout
 group_size: 8 # Independent program samples for each pair
 num_minibatches: 4 # Must divide num_tasks * group_size; keep whole programs together
 update_epochs: 1
-max_nodes: 128 # Maximum AST nodes/expansion actions, including list and value nodes
-max_depth: 16 # AST depth, including list nodes; distinct from env.max_depth
-bf16: true # AST Transformer compute in BF16; parameters, optimizer, and loss in FP32
+bf16: true # Autoregressive Transformer compute in BF16; parameters, optimizer, and loss in FP32
 attention_implementation: cudnn # Requires a supported NVIDIA GPU; use xla for CPU
-d_model: 256 # About 9.2M parameters; exact count depends on max_depth and grid size
+d_model: 256
 num_layers: 8
-num_heads: 8 # Transformer head dimension = d_model / num_heads = 64
+num_heads: 8 # Transformer head dimension = d_model / num_heads = 32
 num_kv_heads: null # Full multi-head attention; fewer KV heads enables grouped-query attention
-# All current holes expand in parallel from one encoding per round; new children wait for the next round.
-# At most min(max_nodes, max_depth + 1) rounds; no causal KV cache.
-# Tree-relative attention and Q/K RMSNorm are always enabled; older architectures require a new run_id.
 learning_rate: 0.0001
 anneal_lr: true
 clip_coef: 0.2
 target_kl: 0.02 # Old-policy KL early stopping; null disables
 entropy_coef: 0.01
-# AST constructor/value masking is always enabled, including node/depth/source budgets.
+# Grammar masking is always enabled for sampling and replay, including token/depth limits.
+# KV cache covers the grid-pair prefix and all preceding tokens; no sliding-window truncation.
 max_grad_norm: 0.5
-log_dir: gs://cohere-dev/vlad/rl2/karel_ast_grpo
-run_id: v4 # Reuse to resume; change for a new run, or null for a timestamped run
+log_dir: gs://cohere-dev/vlad/rl2/karel_grpo
+run_id: v1 # Reuse to resume; change for a new run, or null for a timestamped run
 checkpoint_interval_seconds: 300 # Save to log_dir/run_id on GCS every 5 minutes (at rollout boundaries), plus final
-log_interval: 10 # TensorBoard scalars, stdout, and flushes every 20 completed rollouts
+log_interval: 10 # TensorBoard scalars, stdout, and flushes every 10 completed rollouts
 log_program_interval: 10 # Samples on logging iterations divisible by this interval; rotate through task groups
 log_program_count: 8 # Compare first 8 samples from the same group; 0 disables
-log_compiles: true # Print (rows, nodes) bucket shape on new JIT traces; cached calls stay quiet.
-# Replay row buckets: step=ceil(max_rounds * programs_per_minibatch / 4), capped at capacity (up to 4 buckets).
-# Node buckets: 32/64/96/128/..., capped at max_nodes.
+log_compiles: true # Print (tokens, programs) sequence shape on new JIT traces; cached calls stay quiet.
 env:
   height: 8
   width: 8
@@ -39,7 +33,7 @@ env:
   max_markers: 10
   max_depth: 2
   max_statements: 3
-  max_program_tokens: 128 # Printed-source limit (including m)); also enforced by the AST mask
+  max_program_tokens: 128 # Generated-token limit (including m)); also enforced by grammar masking
   max_execution_steps: 256
   max_sampling_attempts: 10000 # Hard categories need more rejection-sampling attempts; exhaustion raises.
   # Choose a category once per task, then retry within that category; weights are relative.

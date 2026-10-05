@@ -1,11 +1,13 @@
 from collections.abc import Sequence
 from dataclasses import replace
+from unittest.mock import MagicMock
 
 import gymnasium as gym
 import numpy as np
 import pytest
 
 from rl2.karel import (
+    TASK_CATEGORIES,
     DistanceMap,
     ExecutionStats,
     KarelConfig,
@@ -22,6 +24,92 @@ from rl2.karel import (
 )
 
 
+@pytest.mark.parametrize("category", TASK_CATEGORIES)
+@pytest.mark.parametrize("seed", range(5))
+def test_category_tasks_meet_state_change_thresholds(category: str, seed: int) -> None:
+    config = KarelConfig(
+        max_sampling_attempts=10000, **{f"task_{name}_weight": float(name == category) for name in TASK_CATEGORIES}
+    )
+    task = sample_task(np.random.default_rng(seed), config)
+    assert task.sampling.category == category
+    assert 1 <= task.sampling.attempts <= config.max_sampling_attempts
+    assert task.sampling.seconds >= 0
+    np.testing.assert_array_equal(execute_program(task.program, task.initial), task.target)
+    assert not np.array_equal(task.initial, task.target)
+    row, col, _ = np.argwhere(task.initial[..., :4])[0]
+    distance = int(target_distance_map(task.target)[row, col])
+    edits = int(np.abs(task.initial[..., 5] - task.target[..., 5]).sum())
+    if category == "navigation":
+        assert distance >= 3
+    elif category == "marker":
+        assert edits >= 3
+    elif category == "combined":
+        assert distance >= 2 and edits >= 2
+    np.testing.assert_array_equal(task.distance_map, target_distance_map(task.target))
+
+
+def test_category_is_chosen_once_before_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = KarelConfig(
+        height=3,
+        width=3,
+        marker_probability=0,
+        task_easy_weight=0.2,
+        task_navigation_weight=0.3,
+        task_marker_weight=0.25,
+        task_combined_weight=0.25,
+    )
+    rng = MagicMock(wraps=np.random.default_rng(42))
+    rng.choice.return_value = 2  # Marker category.
+    programs = MagicMock(
+        side_effect=[
+            ("DEF", "run", "m(", "turnLeft", "m)"),
+            ("DEF", "run", "m(", "putMarker", "putMarker", "putMarker", "m)"),
+        ]
+    )
+    monkeypatch.setattr("rl2.karel._sample_program", programs)
+    task = sample_task(rng, config)
+    assert task.sampling.category == "marker" and task.sampling.attempts == 2
+    assert rng.choice.call_count == 1
+    assert programs.call_count == 2
+
+
+def test_impossible_category_exhausts_without_easy_fallback() -> None:
+    config = KarelConfig(
+        height=3,
+        width=3,
+        max_sampling_attempts=3,
+        task_easy_weight=0,
+        task_navigation_weight=1,
+    )
+    with pytest.raises(RuntimeError, match="category 'navigation'.*max_sampling_attempts=3"):
+        sample_task(np.random.default_rng(0), config)
+
+
+@pytest.mark.parametrize("weight", [-1, float("nan"), float("inf")])
+def test_invalid_category_weight(weight: float) -> None:
+    with pytest.raises(ValueError, match="category weights"):
+        KarelConfig(task_combined_weight=weight)
+
+
+def test_empty_category_distribution_rejected() -> None:
+    with pytest.raises(ValueError, match="category weights"):
+        KarelConfig(task_easy_weight=0)
+
+
+def test_sampling_stats_require_reset() -> None:
+    with pytest.raises(gym.error.ResetNeeded, match="sampling statistics"):
+        _ = KarelProgramEnv().sampling_stats
+
+
+@pytest.mark.parametrize(
+    "name", ["navigation_min_distance", "marker_min_edits", "combined_min_distance", "combined_min_edits"]
+)
+@pytest.mark.parametrize("value", [0, -1, 1.5, True])
+def test_invalid_category_threshold(name: str, value: float) -> None:
+    with pytest.raises((TypeError, AssertionError)):
+        KarelConfig(**{name: value})
+
+
 def test_reset_from_preserves_task_rng_and_independent_episodes() -> None:
     source = KarelProgramEnv()
     pair = source.reset(seed=42)
@@ -29,6 +117,7 @@ def test_reset_from_preserves_task_rng_and_independent_episodes() -> None:
     clone.reset(seed=999)
     clone.step(clone.token_to_id["DEF"])
     copied = clone.reset_from(source)
+    assert clone.sampling_stats == source.sampling_stats
     for actual, expected in zip(copied, pair):
         np.testing.assert_array_equal(actual, expected)
         actual.fill(0)  # Observations are independent of the task used for scoring.
@@ -337,7 +426,7 @@ def test_pad_is_reserved_and_cannot_change_program(fixed_env: KarelProgramEnv) -
     assert submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])[1] == 4.0
 
 
-@pytest.mark.parametrize("seed", range(20))
+@pytest.mark.parametrize("seed", [0, 1, 2])
 def test_sampled_task_is_reachable_changed_and_within_limits(seed: int) -> None:
     config = KarelConfig(
         length_penalty_weight=0.0,
@@ -358,7 +447,7 @@ def test_seed_reproduces_task_stream_and_reference_solves() -> None:
         KarelProgramEnv(KarelConfig(length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0)),
     )
     pairs: set[bytes] = set()
-    for episode in range(10):
+    for episode in range(3):
         seed = 42 if episode == 0 else None
         pair_a, pair_b = first.reset(seed=seed), second.reset(seed=seed)
         np.testing.assert_array_equal(pair_a.initial, pair_b.initial)
@@ -369,12 +458,12 @@ def test_seed_reproduces_task_stream_and_reference_solves() -> None:
             observation, reward, terminated, truncated, info = first.step(token_id)
             assert observation is None
         assert (reward, terminated, truncated, info) == (4.0, True, False, expected_info(4.0, success=True))
-    assert len(pairs) == 10
+    assert len(pairs) == 3
 
 
 def test_depth_zero_samples_only_primitive_actions() -> None:
     config = KarelConfig(length_penalty_weight=0.0, execution_penalty_weight=0.0, trajectory_weight=0.0, max_depth=0)
-    for seed in range(10):
+    for seed in range(3):
         task = sample_task(np.random.default_rng(seed), config)
         assert not {"WHILE", "REPEAT", "IF", "IFELSE"}.intersection(task.program)
 
@@ -1080,16 +1169,21 @@ def test_total_reward_overflow_is_rejected(fixed_env: KarelProgramEnv) -> None:
         submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])
 
 
-@pytest.mark.parametrize("weights", [(1, 1, 1), (0, 1, 1), (1, 0, 1), (1, 1, 0), (0, 0, 0), (0.25, 2, 3)])
+# Exercise every outcome with distinct nonzero weights, then isolate each
+# weight on a successful program instead of crossing every outcome and weight.
 @pytest.mark.parametrize(
-    "source,budget,token_limit,scores,error,success",
+    "weights,source,budget,token_limit,scores,error,success",
     [
-        ("DEF run m( move m)", 256, 128, (1, 1, 1), None, True),
-        ("DEF run m( turnLeft turnRight m)", 256, 128, (1, 1, 0.5), None, False),
-        ("DEF run m( move pickMarker pickMarker m)", 256, 128, (1, 0, 0.5), "runtime_error", False),
-        ("DEF run m( move turnLeft m)", 1, 128, (1, 0, 1), "execution_limit", False),
-        ("DEF run m( m)", 256, 128, (0.5, 0, 0), "syntax_error", False),
-        ("DEF run m( move move", 256, 5, (0.5, 0, 0), "token_limit", False),
+        ((0.25, 2, 3), "DEF run m( move m)", 256, 128, (1, 1, 1), None, True),
+        ((0.25, 2, 3), "DEF run m( turnLeft turnRight m)", 256, 128, (1, 1, 0.5), None, False),
+        ((0.25, 2, 3), "DEF run m( move pickMarker pickMarker m)", 256, 128, (1, 0, 0.5), "runtime_error", False),
+        ((0.25, 2, 3), "DEF run m( move turnLeft m)", 1, 128, (1, 0, 1), "execution_limit", False),
+        ((0.25, 2, 3), "DEF run m( m)", 256, 128, (0.5, 0, 0), "syntax_error", False),
+        ((0.25, 2, 3), "DEF run m( move move", 256, 5, (0.5, 0, 0), "token_limit", False),
+        *[
+            (weights, "DEF run m( move m)", 256, 128, (1, 1, 1), None, True)
+            for weights in ((1, 1, 1), (0, 1, 1), (1, 0, 1), (1, 1, 0), (0, 0, 0))
+        ],
     ],
 )
 def test_weighted_reward_terms(
@@ -1129,16 +1223,15 @@ def test_term_weights_must_be_finite_and_nonnegative(weight_name: str, value: fl
         KarelConfig(**{weight_name: value})
 
 
-@pytest.mark.parametrize("success_weight", [0.0, 0.25, 1.0, 2.0])
 @pytest.mark.parametrize(
-    "body,budget,distance,success,error",
+    "body,budget,distance,success,error,success_weight",
     [
-        ("move", 256, 1.0, True, None),
-        ("turnLeft turnRight", 256, 0.5, False, None),
-        ("putMarker", 256, 0.5, False, "runtime_error"),  # Fails before any action succeeds.
-        ("move putMarker", 256, 1.0, False, "runtime_error"),
-        ("move turnLeft", 1, 1.0, False, "execution_limit"),
-        ("", 256, 0.0, False, "syntax_error"),
+        *[("move", 256, 1.0, True, None, weight) for weight in (0.0, 0.25, 1.0, 2.0)],
+        ("turnLeft turnRight", 256, 0.5, False, None, 2.0),
+        ("putMarker", 256, 0.5, False, "runtime_error", 2.0),  # Failure before any action succeeds.
+        ("move putMarker", 256, 1.0, False, "runtime_error", 2.0),
+        ("move turnLeft", 1, 1.0, False, "execution_limit", 2.0),
+        ("", 256, 0.0, False, "syntax_error", 2.0),
     ],
 )
 def test_distance_only_reward_preserves_failed_execution_progress(

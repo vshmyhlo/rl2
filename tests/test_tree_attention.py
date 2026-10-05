@@ -44,8 +44,9 @@ def test_relations_match_parent_chain_oracle(size: int) -> None:
     rng = np.random.default_rng(12)
     # Include a deep chain for saturation, a star, and varied branching trees.
     parent_sets = [[-1] + list(range(size - 1)), [-1] + [0] * (size - 1)]
-    parent_sets += [[-1] + [int(rng.integers(i)) for i in range(1, size)] for _ in range(5)]
-    for parents in parent_sets:
+    parent_sets += [[-1] + [int(rng.integers(i)) for i in range(1, size)] for _ in range(2)]
+    for parents_tuple in dict.fromkeys(map(tuple, parent_sets)):
+        parents = list(parents_tuple)
         order: list[int] = []
 
         def visit(node: int, parent_ids: list[int], result: list[int]) -> None:

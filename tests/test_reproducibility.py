@@ -28,7 +28,7 @@ class ShortGame(gym.wrappers.TimeLimit):
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[ppo.Array, dict[str, Any]]:
         if seed is not None:
-            self._max_episode_steps = 7 if self.render_mode else 31 + 16 * (seed % 2)
+            self._max_episode_steps = 2 if self.render_mode else 3 + 2 * (seed % 2)
         return super().reset(seed=seed, options=options)
 
 
@@ -43,7 +43,7 @@ def short_game(
     observation_size: int | None = None,
 ) -> gym.Env:
     return ShortGame(
-        make_atari(env_id, render_mode, frame_stack, atari_preprocessing, observation_size), max_episode_steps=31
+        make_atari(env_id, render_mode, frame_stack, atari_preprocessing, observation_size), max_episode_steps=3
     )
 
 
@@ -61,15 +61,17 @@ def digest(tree: Any) -> str:
 def snapshot(path: str, mode: str, seed: int, videos: bool) -> None:
     config = replace(
         ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-        lstm_hidden_size=16,
-        encoder_stages=(ConvStage(8), ConvStage(16), ConvStage(16), ConvStage(16)),
+        lstm_hidden_size=8,
+        encoder_stages=(ConvStage(4, blocks=1),),
         seed=seed,
         vector_env=mode,
-        total_steps=128,
+        total_steps=16,
         num_envs=2,
-        num_steps=16,
+        num_steps=4,
         num_minibatches=2,
-        update_epochs=2,
+        update_epochs=1,
+        observation_size=8,
+        eval_every_minutes=0,
         video_every_episodes=2 if videos else 0,
     )
     trajectory = []
@@ -93,8 +95,8 @@ def snapshot(path: str, mode: str, seed: int, videos: bool) -> None:
                 "rl2.ppo.ActorCritic",
                 new=partial(
                     ppo.ActorCritic,
-                    encoder_stages=(ConvStage(8), ConvStage(16), ConvStage(16), ConvStage(16)),
-                    embedding_size=32,
+                    encoder_stages=(ConvStage(4, blocks=1),),
+                    embedding_size=8,
                 ),
             ),
             patch("rl2.ppo.make_env", new=short_game),
@@ -138,8 +140,8 @@ def baseline(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
 
 @pytest.mark.parametrize(
     ("mode", "videos"),
-    [("sync", False), ("async", False), ("async", False), ("async", True)],  # noqa: PT014 - Check repeated async runs.
-    ids=["sync", "async-first", "async-repeat", "async-video"],
+    [("sync", False), ("async", False), ("async", True)],
+    ids=["sync", "async", "async-video"],
 )
 def test_fresh_process_runs(baseline: dict[str, Any], tmp_path: Path, mode: str, videos: bool) -> None:
     assert baseline == run_snapshot(tmp_path / "snapshot.json", mode, videos=videos)

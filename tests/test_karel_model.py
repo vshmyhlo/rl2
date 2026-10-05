@@ -144,7 +144,7 @@ def test_token_loss_trains_encoder_and_backbone(
 
 
 def test_invalid_backbone_is_rejected(inputs: tuple[jax.Array, jax.Array, jax.Array]) -> None:
-    model = KarelProgramModel(backbone_type="unknown")
+    model = KarelProgramModel(d_model=8, num_layers=1, d_state=8, headdim=4, backbone_type="unknown")
     with pytest.raises(ValueError, match="backbone_type"):
         model.init(jax.random.key(0), *inputs)
 
@@ -166,7 +166,7 @@ def test_bf16_transformer_generation_and_gradients(
 ) -> None:
     model = KarelProgramModel(
         backbone_type="transformer",
-        d_model=128,
+        d_model=16,
         num_layers=1,
         num_heads=2,
         max_seq_len=8,

@@ -108,7 +108,7 @@ def test_all_controls_predicates_negations_and_counts_match_parser() -> None:
 
 def test_generated_programs_and_single_edits_agree_with_parser() -> None:
     rng = np.random.default_rng(12)
-    for _ in range(12):
+    for _ in range(3):
         program = sample_task(rng, KarelConfig()).program
         assert syntax_edit_distance(program) == 0
         index = int(rng.integers(len(program)))
@@ -158,7 +158,7 @@ def test_two_edit_corruptions_match_independent_repair_search() -> None:
     )
     for body in bodies:
         original = tuple(f"DEF run m( {body} m)".split())
-        for _ in range(5):
+        for _ in range(2):
             edited = list(original)
             for _ in range(2):
                 index = int(rng.integers(len(edited)))

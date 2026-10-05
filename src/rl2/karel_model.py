@@ -49,7 +49,7 @@ class KarelProgramModel(nn.Module):
     backbone_type: BackboneType = "mamba3"
     num_heads: int = 8
     num_kv_heads: int | None = None
-    max_seq_len: int = 128  # Transformer window, including the image-pair prefix.
+    max_seq_len: int = 128  # Transformer cache capacity, including the image-pair prefix.
     dtype: jax.typing.DTypeLike = jnp.float32
     attention_implementation: AttentionImplementation = "xla"
 

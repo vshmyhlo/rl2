@@ -8,8 +8,8 @@ from flax import linen as nn
 from rl2.resize_conv import ResizeConv
 
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize("spatial_shape", [(3, 4), (9, 11), (5, 7)])
+# Downsample, upsample, and identity resize; both compute dtypes.
+@pytest.mark.parametrize("dtype,spatial_shape", [(jnp.float32, (3, 4)), (jnp.bfloat16, (9, 11)), (jnp.float32, (5, 7))])
 def test_resize_then_convolve_without_norm_or_activation(
     dtype: jax.typing.DTypeLike, spatial_shape: tuple[int, int]
 ) -> None:

@@ -849,16 +849,7 @@ def train(config: Config) -> TrainState:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/ppo_rnd_montezuma.yaml", help="Path to a YAML config")
-    parser.add_argument(
-        "--platform",
-        choices=("cpu", "cuda", "metal"),
-        help="Require a JAX backend (default: JAX_PLATFORMS or automatic selection; CUDA needs --extra cuda12)",
-    )
     args = parser.parse_args()
-    if args.platform is not None:
-        # Select before initializing JAX; an unavailable backend must fail instead of falling back to CPU.
-        jax.config.update("jax_platforms", args.platform)
-        jax.devices()
     train(load_config(args.config))
 
 

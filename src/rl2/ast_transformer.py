@@ -47,6 +47,10 @@ class _ASTBlock(nn.Module):
         value = nn.Dense(self.num_kv_heads * head_dim, use_bias=False, dtype=self.dtype, name="value")(normalized)
         query = query.reshape(batch, length, self.num_heads, head_dim)
         key, value = (v.reshape(batch, length, self.num_kv_heads, head_dim) for v in (key, value))
+        # Normalize each head over head_dim; Q and K have separate learned
+        # scales shared across their respective heads. V remains unnormalized.
+        query = nn.RMSNorm(dtype=self.dtype, name="query_norm")(query)
+        key = nn.RMSNorm(dtype=self.dtype, name="key_norm")(key)
         # The pair prefix and preorder nodes form a contiguous live prefix.
         # Lengths exclude padding for both queries and keys, including any
         # extra position added below for cuDNN alignment.
@@ -85,7 +89,7 @@ class _ASTBlock(nn.Module):
 class ASTTransformer(nn.Module):
     """One position per AST node, plus a flattened initial/target grid prefix.
 
-    Inputs are [B,H,W,6] int32 grids and batched ASTFeatures with N=max_nodes.
+    Inputs are [B,H,W,6] int32 grids and batched ASTFeatures with N<=max_nodes.
     Returns [B,N,len(AST_ACTIONS)] float32, grammar-masked logits. PAD is excluded
     from active decisions. Non-hole positions use constant dummy PAD logits;
     callers stop expansion when the AST has no holes.
@@ -162,14 +166,15 @@ class ASTTransformer(nn.Module):
                 normalized by max_markers, and the flattened pair is projected
                 into one context token.
             tree: Batched ASTFeatures before the next expansion. Node/type,
-                field, depth, child-index, and value IDs are int32 [B, max_nodes];
+                field, depth, child-index, and value IDs are int32 [B, N], with
+                1 <= N <= max_nodes (a trimmed sequence bucket);
                 node_mask is bool with the same shape; is_hole is computed from
                 node_mask, node_type, and value.
-                action_mask is bool [B, max_nodes, A], where
+                action_mask is bool [B, N, A], where
                 A = len(AST_ACTIONS), and marks legal expansions per hole.
 
         Returns:
-            Float32 logits of shape [B, max_nodes, A], ordered as AST_ACTIONS (PAD, then
+            Float32 logits of shape [B, N, A], ordered as AST_ACTIONS (PAD, then
             constructors, then values). Illegal actions have logit -inf.
             PAD is excluded on active rows; rows with no legal actions use
             PAD=0 and all other logits=-inf as a safe batching fallback.
@@ -180,10 +185,13 @@ class ASTTransformer(nn.Module):
         for size in initial.shape[:3]:
             chex.assert_scalar_positive(size)
         batch = initial.shape[0]
-        chex.assert_shape(tree[:6], (batch, self.max_nodes))
+        chex.assert_rank(tree.node_mask, 2)
+        nodes_count = tree.node_mask.shape[1]
+        chex.assert_scalar_in(nodes_count, 1, self.max_nodes)
+        chex.assert_shape(tree[:6], (batch, nodes_count))
         chex.assert_type(tree[:5], jnp.int32)
         chex.assert_type((tree.is_hole, tree.node_mask, tree.action_mask), jnp.bool_)
-        chex.assert_shape(tree.action_mask, (batch, self.max_nodes, len(AST_ACTIONS)))
+        chex.assert_shape(tree.action_mask, (batch, nodes_count, len(AST_ACTIONS)))
         scale = jnp.asarray([1, 1, 1, 1, 1, self.max_markers] * 2, jnp.float32)
         pair = jnp.concatenate((initial, target), axis=-1).astype(jnp.float32) / scale
         context = self.context_norm(self.context_projection(pair.reshape(batch, -1)))
@@ -199,7 +207,7 @@ class ASTTransformer(nn.Module):
             + self.hole_embedding(tree.is_hole.astype(jnp.int32))
         )
         x = jnp.concatenate((context[:, None], nodes), axis=1)
-        x = x + self.position_embedding(jnp.arange(self.max_nodes + 1, dtype=jnp.int32))[None]
+        x = x + self.position_embedding(jnp.arange(nodes_count + 1, dtype=jnp.int32))[None]
         present = jnp.concatenate((jnp.ones((batch, 1), jnp.bool_), tree.node_mask), axis=1)
         relations = tree_relations(tree.depth, tree.node_mask)
         for layer in self.layers:
@@ -207,7 +215,7 @@ class ASTTransformer(nn.Module):
         nodes = self.final_norm(x[:, 1:])
         logits = jnp.concatenate(
             (
-                jnp.full((batch, self.max_nodes, 1), -jnp.inf, jnp.float32),
+                jnp.full((batch, nodes_count, 1), -jnp.inf, jnp.float32),
                 self.constructor_head(nodes).astype(jnp.float32),
                 self.value_head(nodes).astype(jnp.float32),
             ),
