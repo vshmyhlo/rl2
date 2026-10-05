@@ -148,6 +148,139 @@ def _expanded_mlp_width(dim: int, mlp_expansion: float) -> int:
     return width
 
 
+def _attention(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    carry: TransformerCarry | None = None,
+    episode_starts: jax.Array | None = None,
+    *,
+    max_seq_len: int,
+    rope_theta: float,
+    causal: bool,
+    implementation: AttentionImplementation,
+) -> tuple[TransformerCarry, jax.Array]:
+    """Apply RoPE attention to projected Q/K/V and update the episode cache.
+
+    Queries are [batch,time,query_heads,head_dim]; keys and values are
+    [batch,time,kv_heads,head_dim], all with the same floating dtype.
+    Optional [batch,time] episode starts reset history and RoPE positions.
+    Return the updated cache and [batch,time,query_heads,head_dim] output.
+    """
+    dtype = query.dtype
+    sc = ShapeChecker(C=max_seq_len, U=1)
+    sc.check(query, "BTHF", dtype)
+    chex.assert_type(query, jnp.floating)
+    sc.check((key, value), "BTKF", dtype)
+    batch, steps, num_heads, head_dim = query.shape
+    kv_heads = key.shape[2]
+    chex.assert_is_divisible(num_heads, kv_heads)
+    _positive_integer(batch, "batch_size")
+    _positive_integer(max_seq_len, "max_seq_len")
+    fresh = carry is None
+    if carry is None:
+        carry = TransformerCarry(
+            jnp.zeros(sc["BCKF"], dtype),
+            jnp.zeros(sc["BCKF"], dtype),
+            jnp.zeros(sc["B"], jnp.int32),
+        )
+    if not isinstance(carry, TransformerCarry):
+        raise TypeError("carry must be a TransformerCarry")
+    sc.check((carry.key, carry.value), "BCKF", dtype)
+    sc.check(carry.position, "B", jnp.int32)
+    unsegmented = episode_starts is None
+    if episode_starts is None:
+        episode_starts = jnp.zeros(sc["BT"], jnp.bool_)
+    sc.check(episode_starts, "BT", jnp.bool_)
+
+    starts = episode_starts
+    index = jnp.arange(steps, dtype=jnp.int32)[None, :]
+    # The virtual start of a continued episode is -carry.position.
+    last_reset = jax.lax.associative_scan(jnp.maximum, jnp.where(starts, index, -carry.position[:, None]), axis=1)
+    positions = index - last_reset
+    sc.check((last_reset, positions), "BT", jnp.int32)
+    _check_positions(positions, max_seq_len)
+    query, key = _rope(query, positions, rope_theta), _rope(key, positions, rope_theta)
+    slots = jnp.arange(max_seq_len, dtype=jnp.int32)[None, :]
+    old_positions = jnp.where(slots < carry.position[:, None], slots, -1)
+    sc.check(old_positions, "BC", jnp.int32)
+
+    mask = None
+    native_attention = fresh and unsegmented
+    if native_attention:
+        # Let the backend handle causality without a dense mask.
+        keys, values = key, value
+    else:
+        segments = jnp.cumsum(starts, axis=1, dtype=jnp.int32)
+        if fresh:
+            keys, values, key_positions, key_segments = key, value, positions, segments
+        else:
+            keys, values = jnp.concatenate((carry.key, key), 1), jnp.concatenate((carry.value, value), 1)
+            key_positions = jnp.concatenate((old_positions, positions), 1)
+            key_segments = jnp.concatenate((jnp.zeros_like(old_positions), segments), 1)
+        sc.check(segments, "BT", jnp.int32)
+        sc.check((key_positions, key_segments), "BS", jnp.int32)
+        mask = segments[:, :, None] == key_segments[:, None, :]
+        mask &= key_positions[:, None, :] >= 0
+        if causal:
+            distance = positions[:, :, None] - key_positions[:, None, :]
+            sc.check(distance, "BTS", jnp.int32)
+            mask &= distance >= 0
+        mask = mask[:, None]
+        sc.check(mask, "BUTS", jnp.bool_)
+    queries = query
+    if implementation == "cudnn" and mask is not None:
+        # cuDNN masked backward requires even Q and KV lengths. Give
+        # a padded query the preceding valid mask to avoid all-masked
+        # softmax rows; its output is discarded below.
+        if steps % 2:
+            queries = jnp.pad(queries, ((0, 0), (0, 1), (0, 0), (0, 0)))
+            mask = jnp.concatenate((mask, mask[:, :, -1:]), axis=2)
+        if keys.shape[1] % 2:
+            keys, values = (jnp.pad(v, ((0, 0), (0, 1), (0, 0), (0, 0))) for v in (keys, values))
+            mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 0), (0, 1)))
+    # JAX's F16_F16_F32 dot algorithm is unsupported on CPU. Keep
+    # projections/cache in float16 but use portable float32 attention.
+    attention_dtype = jnp.float32 if implementation == "xla" and jnp.dtype(dtype) == jnp.float16 else dtype
+    # Q/S may include cuDNN padding, independently of the chunk length T.
+    attention_sc = ShapeChecker(B=batch, H=num_heads, K=kv_heads, F=head_dim, U=1)
+    queries, keys, values = (v.astype(attention_dtype) for v in (queries, keys, values))
+    attention_sc.check(queries, "BQHF", attention_dtype)
+    attention_sc.check((keys, values), "BSKF", attention_dtype)
+    if mask is not None:
+        attention_sc.check(mask, "BUQS", jnp.bool_)
+    attended = jax.nn.dot_product_attention(
+        queries,
+        keys,
+        values,
+        mask=mask,
+        is_causal=causal and native_attention,
+        local_window_size=None,
+        implementation=implementation,
+    )
+    attention_sc.check(attended, "BQHF", attention_dtype)
+    attended = attended[:, :steps].astype(dtype)
+
+    next_position = positions[:, -1] + 1
+    # Gather writes from the final episode in this chunk. Earlier
+    # cache entries survive only when that episode continued the carry.
+    source = steps - next_position[:, None] + slots
+    gather = jnp.clip(source, 0, steps - 1)[..., None, None]
+    new_key, new_value = (jnp.take_along_axis(v, gather, axis=1) for v in (key, value))
+    sc.check((new_key, new_value), "BCKF", dtype)
+    written = (source >= 0)[..., None, None]
+    valid = (slots < next_position[:, None])[..., None, None]
+    carry = TransformerCarry(
+        jnp.where(valid, jnp.where(written, new_key, carry.key), 0),
+        jnp.where(valid, jnp.where(written, new_value, carry.value), 0),
+        next_position,
+    )
+    sc.check((carry.key, carry.value), "BCKF", dtype)
+    sc.check(carry.position, "B", jnp.int32)
+    sc.check(attended, "BTHF", dtype)
+    return carry, attended
+
+
 class TransformerBlock(nn.Module):
     """Llama 3 pre-RMSNorm attention and SwiGLU MLP with residual connections.
 
@@ -229,6 +362,7 @@ class TransformerBlock(nn.Module):
     ) -> tuple[TransformerCarry, jax.Array]:
         """Map [batch,time,dim] to (updated KV cache, same-shaped output).
 
+        Input dimensions are assumed nonempty.
         A True entry in ``episode_starts[batch,time]`` discards all preceding
         history for that example before processing its current input.
         """
@@ -239,19 +373,14 @@ class TransformerBlock(nn.Module):
         sc = ShapeChecker(D=self.dim, H=self.num_heads, K=kv_heads, F=head_dim, C=self.max_seq_len, I=width, U=1)
         sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
-        batch, steps = x.shape[:2]
-        _positive_integer(batch, "batch_size")
-        fresh = carry is None
-        if carry is None:
-            carry = self.initial_carry(batch)
-        if not isinstance(carry, TransformerCarry):
-            raise TypeError("carry must be a TransformerCarry")
-        sc.check((carry.key, carry.value), "BCKF", self.dtype)
-        sc.check(carry.position, "B", jnp.int32)
-        unsegmented = episode_starts is None
-        if episode_starts is None:
-            episode_starts = jnp.zeros((batch, steps), jnp.bool_)
-        sc.check(episode_starts, "BT", jnp.bool_)
+        _positive_integer(x.shape[0], "batch_size")
+        if carry is not None:
+            if not isinstance(carry, TransformerCarry):
+                raise TypeError("carry must be a TransformerCarry")
+            sc.check((carry.key, carry.value), "BCKF", self.dtype)
+            sc.check(carry.position, "B", jnp.int32)
+        if episode_starts is not None:
+            sc.check(episode_starts, "BT", jnp.bool_)
 
         # Attention projections use [batch,time,heads,head_dim].
         residual = x
@@ -268,100 +397,17 @@ class TransformerBlock(nn.Module):
         key, value = (v.reshape(sc["BTKF"]) for v in (key, value))
         sc.check(query, "BTHF", self.dtype)
         sc.check((key, value), "BTKF", self.dtype)
-        if steps:
-            starts = episode_starts
-            index = jnp.arange(steps, dtype=jnp.int32)[None, :]
-            # The virtual start of a continued episode is -carry.position.
-            last_reset = jax.lax.associative_scan(
-                jnp.maximum, jnp.where(starts, index, -carry.position[:, None]), axis=1
-            )
-            positions = index - last_reset
-            sc.check((last_reset, positions), "BT", jnp.int32)
-            _check_positions(positions, self.max_seq_len)
-            query, key = _rope(query, positions, self.rope_theta), _rope(key, positions, self.rope_theta)
-            slots = jnp.arange(self.max_seq_len, dtype=jnp.int32)[None, :]
-            old_positions = jnp.where(slots < carry.position[:, None], slots, -1)
-            sc.check(old_positions, "BC", jnp.int32)
-
-            mask = None
-            native_attention = fresh and unsegmented
-            if native_attention:
-                # Let the backend handle causality without a dense mask.
-                keys, values = key, value
-            else:
-                segments = jnp.cumsum(starts, axis=1, dtype=jnp.int32)
-                if fresh:
-                    keys, values, key_positions, key_segments = key, value, positions, segments
-                else:
-                    keys, values = jnp.concatenate((carry.key, key), 1), jnp.concatenate((carry.value, value), 1)
-                    key_positions = jnp.concatenate((old_positions, positions), 1)
-                    key_segments = jnp.concatenate((jnp.zeros_like(old_positions), segments), 1)
-                sc.check(segments, "BT", jnp.int32)
-                sc.check((key_positions, key_segments), "BS", jnp.int32)
-                mask = segments[:, :, None] == key_segments[:, None, :]
-                mask &= key_positions[:, None, :] >= 0
-                if self.causal:
-                    distance = positions[:, :, None] - key_positions[:, None, :]
-                    sc.check(distance, "BTS", jnp.int32)
-                    mask &= distance >= 0
-                mask = mask[:, None]
-                sc.check(mask, "BUTS", jnp.bool_)
-            queries = query
-            if self.attention_implementation == "cudnn" and mask is not None:
-                # cuDNN masked backward requires even Q and KV lengths. Give
-                # a padded query the preceding valid mask to avoid all-masked
-                # softmax rows; its output is discarded below.
-                if steps % 2:
-                    queries = jnp.pad(queries, ((0, 0), (0, 1), (0, 0), (0, 0)))
-                    mask = jnp.concatenate((mask, mask[:, :, -1:]), axis=2)
-                if keys.shape[1] % 2:
-                    keys, values = (jnp.pad(v, ((0, 0), (0, 1), (0, 0), (0, 0))) for v in (keys, values))
-                    mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 0), (0, 1)))
-            # JAX's F16_F16_F32 dot algorithm is unsupported on CPU. Keep
-            # projections/cache in float16 but use portable float32 attention.
-            attention_dtype = (
-                jnp.float32
-                if self.attention_implementation == "xla" and jnp.dtype(self.dtype) == jnp.float16
-                else self.dtype
-            )
-            # Q/S may include cuDNN padding, independently of the chunk length T.
-            attention_sc = ShapeChecker(B=batch, H=self.num_heads, K=kv_heads, F=head_dim, U=1)
-            queries, keys, values = (v.astype(attention_dtype) for v in (queries, keys, values))
-            attention_sc.check(queries, "BQHF", attention_dtype)
-            attention_sc.check((keys, values), "BSKF", attention_dtype)
-            if mask is not None:
-                attention_sc.check(mask, "BUQS", jnp.bool_)
-            attended = jax.nn.dot_product_attention(
-                queries,
-                keys,
-                values,
-                mask=mask,
-                is_causal=self.causal and native_attention,
-                local_window_size=None,
-                implementation=self.attention_implementation,
-            )
-            attention_sc.check(attended, "BQHF", attention_dtype)
-            attended = attended[:, :steps].astype(self.dtype)
-
-            next_position = positions[:, -1] + 1
-            # Gather writes from the final episode in this chunk. Earlier
-            # cache entries survive only when that episode continued the carry.
-            source = steps - next_position[:, None] + slots
-            gather = jnp.clip(source, 0, steps - 1)[..., None, None]
-            new_key, new_value = (jnp.take_along_axis(v, gather, axis=1) for v in (key, value))
-            sc.check((new_key, new_value), "BCKF", self.dtype)
-            written = (source >= 0)[..., None, None]
-            valid = (slots < next_position[:, None])[..., None, None]
-            carry = TransformerCarry(
-                jnp.where(valid, jnp.where(written, new_key, carry.key), 0),
-                jnp.where(valid, jnp.where(written, new_value, carry.value), 0),
-                next_position,
-            )
-        else:
-            attended = query
-        sc.check((carry.key, carry.value), "BCKF", self.dtype)
-        sc.check(carry.position, "B", jnp.int32)
-        sc.check(attended, "BTHF", self.dtype)
+        carry, attended = _attention(
+            query,
+            key,
+            value,
+            carry,
+            episode_starts,
+            max_seq_len=self.max_seq_len,
+            rope_theta=self.rope_theta,
+            causal=self.causal,
+            implementation=self.attention_implementation,
+        )
         attended = attended.reshape(sc["BTD"])
         y = nn.Dense(self.dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="out_proj")(attended)
         sc.check(y, "BTD", self.dtype)

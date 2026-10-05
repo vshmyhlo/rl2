@@ -13,10 +13,62 @@ from rl2.transformer import (
     TransformerCarry,
     TransformerStack,
     TransformerStackCarry,
+    _attention,
     _rope,
 )
 
 type Carry = TransformerCarry | TransformerStackCarry
+
+
+@pytest.mark.parametrize("causal", [True, False])
+def test_attention_uniform_values_and_cache_reset(causal: bool) -> None:
+    query = jnp.zeros((1, 2, 2, 2), jnp.float32)
+    key = jnp.zeros((1, 2, 1, 2), jnp.float32)
+    value = jnp.broadcast_to(jnp.asarray([2.0, 6.0])[None, :, None, None], key.shape)
+    attend = jax.jit(partial(_attention, max_seq_len=3, rope_theta=10000.0, causal=causal, implementation="xla"))
+    carry, output = attend(query, key, value)
+    sc = ShapeChecker(B=1, T=2, H=2, K=1, F=2, C=3, U=1)
+    sc.check(output, "BTHF", jnp.float32)
+    expected = jnp.asarray([2.0, 4.0] if causal else [4.0, 4.0])[None, :, None, None]
+    np.testing.assert_allclose(output, jnp.broadcast_to(expected, output.shape))
+    sc.check((carry.key, carry.value), "BCKF", jnp.float32)
+    sc.check(carry.position, "B", jnp.int32)
+    np.testing.assert_array_equal(carry.position, [2])
+    np.testing.assert_array_equal(carry.value[:, :2], value)
+    np.testing.assert_array_equal(carry.value[:, 2:], 0)
+
+    next_value = jnp.full((1, 1, 1, 2), 10.0)
+    continued, output = attend(query[:, :1], key[:, :1], next_value, carry)
+    sc.check(output, "BUHF", jnp.float32)
+    np.testing.assert_allclose(output, 6.0)
+    np.testing.assert_array_equal(continued.position, [3])
+    reset, output = attend(query[:, :1], key[:, :1], next_value, carry, jnp.ones((1, 1), jnp.bool_))
+    sc.check(output, "BUHF", jnp.float32)
+    np.testing.assert_allclose(output, 10.0)
+    np.testing.assert_array_equal(reset.position, [1])
+    np.testing.assert_array_equal(reset.value[:, :1], next_value)
+    np.testing.assert_array_equal(reset.value[:, 1:], 0)
+
+
+@pytest.mark.parametrize(
+    "value_shape,value_dtype",
+    [
+        pytest.param((1, 2, 2), jnp.float32, id="rank"),
+        pytest.param((1, 1, 1, 2), jnp.float32, id="time-dimension"),
+        pytest.param((1, 2, 1, 2), jnp.bfloat16, id="dtype"),
+    ],
+)
+def test_attention_rejects_incompatible_values(value_shape: tuple[int, ...], value_dtype: jax.typing.DTypeLike) -> None:
+    with pytest.raises(AssertionError):
+        _attention(
+            jnp.zeros((1, 2, 2, 2), jnp.float32),
+            jnp.zeros((1, 2, 1, 2), jnp.float32),
+            jnp.zeros(value_shape, value_dtype),
+            max_seq_len=3,
+            rope_theta=10000.0,
+            causal=True,
+            implementation="xla",
+        )
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
@@ -202,10 +254,6 @@ def test_noncausal_packed_and_cached_attention_matches_reference() -> None:
     )
     sc.check(stepped, "BD", jnp.float32)
     np.testing.assert_allclose(stepped, step_expected[:, -1], atol=2e-6, rtol=2e-5)
-    unchanged_carry, empty = model.apply(variables, x[:, :0], carry)
-    sc.check(empty, "BED", jnp.float32)
-    assert empty.shape[1] == 0
-    assert_carry_close(unchanged_carry, carry)
 
 
 @pytest.mark.parametrize("compiled", [False, True])
@@ -335,7 +383,7 @@ def test_invalid_mlp_expansion(expansion: float) -> None:
 
 def test_projection_initialization_is_normal_and_independent_of_depth() -> None:
     model = TransformerStack(32, 2, num_heads=4, num_kv_heads=2, max_seq_len=1)
-    x = jnp.zeros((1, 0, 32))
+    x = jnp.zeros((1, 1, 32))
     key = jax.random.key(28)
     params = model.init(key, x)["params"]
     shallow = model.clone(num_layers=1).init(key, x)["params"]
@@ -397,9 +445,6 @@ def test_full_chunks_and_scanned_steps_agree(stack: bool, window: int, resets: b
     actual = jnp.swapaxes(actual, 0, 1)
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=5e-6)
     assert_carry_close(carry, final)
-    empty_carry, empty = jax.jit(model.apply)(variables, x[:, :0], final)
-    assert empty.shape == (2, 0, 16)
-    assert_carry_close(empty_carry, final)
     fresh, single = model.apply(variables, x[:, 0], method=model.step)
     initial, sequence = model.apply(variables, x[:, :1])
     assert_carry_close(fresh, initial)
@@ -464,10 +509,10 @@ def test_gradients_through_chunked_cache_match_full_sequence() -> None:
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
-def test_precision_empty_initialization_and_parameter_independence(dtype: jax.typing.DTypeLike) -> None:
+def test_precision_initialization_and_parameter_independence(dtype: jax.typing.DTypeLike) -> None:
     model = TransformerStack(16, 2, num_heads=4, max_seq_len=4, dtype=dtype)
     x = jax.random.normal(jax.random.key(11), (2, 3, 16))
-    variables = model.init(jax.random.key(12), x[:, :0])
+    variables = model.init(jax.random.key(12), x[:, :1])
     carry, y = jax.jit(model.apply)(variables, x)
     assert y.dtype == dtype
     assert np.isfinite(y).all()
