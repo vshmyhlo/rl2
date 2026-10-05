@@ -281,7 +281,7 @@ class EditTransformer(nn.Module):
         self.token_embedding = nn.Embed(1 + self.max_nodes + len(AST_ACTIONS), self.d_model, dtype=self.dtype)
         self.kind_embedding = nn.Embed(4, self.d_model, dtype=self.dtype)
         self.backbone = TransformerStack(
-            d_model=self.d_model,
+            dim=self.d_model,
             num_layers=self.num_layers,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,

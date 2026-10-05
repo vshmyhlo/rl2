@@ -68,16 +68,17 @@ type LossOutput = tuple[jax.Array, tuple[Carry, jax.Array]]
 )
 def test_bfloat16_chunked_gradients_and_adam_training(model: Model) -> None:
     """Train with BF16 inputs/compute and FP32 parameters, gradients and Adam state."""
-    x = jax.random.normal(jax.random.key(20), (6, 2, model.d_model)).astype(jnp.bfloat16)
+    batch_major = isinstance(model, (TransformerBlock, TransformerStack))
+    dim = model.dim if batch_major else model.d_model
+    x = jax.random.normal(jax.random.key(20), (6, 2, dim)).astype(jnp.bfloat16)
     target = jax.random.normal(jax.random.key(21), x.shape)
     starts = jnp.zeros((6, 2), jnp.bool_).at[4, 0].set(True)
-    batch_major = isinstance(model, (TransformerBlock, TransformerStack))
     params = model.init(jax.random.key(22), jnp.swapaxes(x, 0, 1) if batch_major else x)["params"]
 
     def apply_sequence(
         parameters: Parameters, inputs: jax.Array, resets: jax.Array, carry: Carry | None = None
     ) -> tuple[Carry, jax.Array]:
-        chex.assert_shape(inputs, (None, 2, model.d_model))
+        chex.assert_shape(inputs, (None, 2, dim))
         chex.assert_type(inputs, jnp.bfloat16)
         chex.assert_shape(resets, inputs.shape[:2])
         chex.assert_type(resets, jnp.bool_)
@@ -87,7 +88,7 @@ def test_bfloat16_chunked_gradients_and_adam_training(model: Model) -> None:
         return model.apply({"params": parameters}, inputs, carry, resets)
 
     def loss(parameters: Parameters, inputs: jax.Array, chunked: bool) -> LossOutput:
-        chex.assert_shape(inputs, (6, 2, model.d_model))
+        chex.assert_shape(inputs, (6, 2, dim))
         chex.assert_type(inputs, jnp.bfloat16)
         chex.assert_type(jax.tree.leaves(parameters), jnp.float32)
         if chunked:
@@ -126,7 +127,7 @@ def test_bfloat16_chunked_gradients_and_adam_training(model: Model) -> None:
             chex.assert_type(state.position, jnp.int32)
 
     def train_step(state: TrainState, inputs: jax.Array) -> tuple[TrainState, jax.Array]:
-        chex.assert_shape(inputs, (6, 2, model.d_model))
+        chex.assert_shape(inputs, (6, 2, dim))
         chex.assert_type(inputs, jnp.bfloat16)
         (value, _), grads = jax.value_and_grad(partial(loss, chunked=True), has_aux=True)(state.params, inputs)
         chex.assert_type(jax.tree.leaves(grads), jnp.float32)

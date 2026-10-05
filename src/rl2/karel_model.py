@@ -75,7 +75,7 @@ class KarelProgramModel(nn.Module):
             )
         else:
             self.backbone = TransformerStack(
-                d_model=self.d_model,
+                dim=self.d_model,
                 num_layers=self.num_layers,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,

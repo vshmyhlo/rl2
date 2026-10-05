@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from rl2.shape_checker import ShapeChecker
 from rl2.transformer import (
     TransformerBlock,
     TransformerCarry,
@@ -19,19 +20,20 @@ type Carry = TransformerCarry | TransformerStackCarry
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
-def test_rope_rotates_with_activation_dtype_coefficients(dtype: jax.typing.DTypeLike) -> None:
+def test_rope_matches_llama_adjacent_pairs_in_float32(dtype: jax.typing.DTypeLike) -> None:
     x = jnp.asarray([[[[1.25, -0.75, 0.5, 1.75]], [[1.25, -0.75, 0.5, 1.75]], [[0.25, 1.5, -1.25, -0.5]]]], dtype=dtype)
     positions = jnp.asarray([[0, 3, 17]], jnp.int32)
-    # Independent NumPy oracle: quantize the coefficients and each arithmetic
-    # result as in the reference's activation-dtype rotate_half expression.
+    # Independent complex64 oracle matching Meta's adjacent-pair rotation.
+    sc = ShapeChecker(B=1, T=3, H=1, F=4)
+    sc.check(x, "BTHF", dtype)
+    sc.check(positions, "BT", jnp.int32)
     angles = np.asarray(positions, np.float32)[..., None, None] * np.asarray([1, 0.01], np.float32)
-    values = np.asarray(x)
-    cos = np.tile(np.cos(angles), 2).astype(values.dtype)
-    sin = np.tile(np.sin(angles), 2).astype(values.dtype)
-    rotated = np.concatenate((-values[..., 2:], values[..., :2]), axis=-1)
-    expected = values * cos + rotated * sin
+    values = np.asarray(x, np.float32)
+    complex_values = values[..., ::2] + 1j * values[..., 1::2]
+    rotated = complex_values * np.exp(1j * angles)
+    expected = np.stack((rotated.real, rotated.imag), axis=-1).reshape(x.shape).astype(x.dtype)
     actual = _rope(x, positions, 10000.0)
-    chex.assert_type(actual, dtype)
+    sc.check(actual, "BTHF", dtype)
     np.testing.assert_array_equal(actual, expected)
     np.testing.assert_array_equal(actual[:, 0], x[:, 0])
     compiled = jax.jit(_rope, static_argnums=2)(x, positions, 10000.0)
@@ -43,7 +45,7 @@ def test_rope_rotates_with_activation_dtype_coefficients(dtype: jax.typing.DType
 @pytest.mark.parametrize("input_dtype", [jnp.bfloat16, jnp.float16, jnp.float32])
 def test_block_preserves_residual_dtype(input_dtype: jax.typing.DTypeLike) -> None:
     compute_dtype = jnp.bfloat16 if input_dtype == jnp.float32 else input_dtype
-    block = TransformerBlock(8, d_intermediate=16, num_heads=2, max_seq_len=2, dtype=compute_dtype)
+    block = TransformerBlock(8, mlp_expansion=2.0, num_heads=2, max_seq_len=2, dtype=compute_dtype)
     x = jax.random.normal(jax.random.key(29), (1, 2, 8)).astype(input_dtype)
     variables = block.init(jax.random.key(30), x, None, None)
     carry, output = jax.jit(block.apply)(variables, x, None, None)
@@ -67,13 +69,13 @@ def reference_block(
     heads: int,
     kv_heads: int,
     theta: float,
-    epsilon: float = 1e-6,
+    epsilon: float = 1e-5,
 ) -> np.ndarray:
     """Float64 NumPy oracle with explicit per-episode, per-query attention."""
-    chex.assert_rank(x, 3)
+    sc = ShapeChecker(H=heads, K=kv_heads)
+    sc.check(x, "BTD")
     chex.assert_type(x, np.floating)
-    chex.assert_shape(starts, x.shape[:2])
-    chex.assert_type(starts, np.bool_)
+    sc.check(starts, "BT", np.bool_)
     batch, steps, width = x.shape
     head_dim = width // heads
     residual = x.astype(np.float64)
@@ -82,10 +84,8 @@ def reference_block(
     projected = [x @ np.asarray(params[f"{name}_proj"]["kernel"]) for name in ("q", "k", "v")]
     query = projected[0].reshape(batch, steps, heads, head_dim)
     key, value = (v.reshape(batch, steps, kv_heads, head_dim) for v in projected[1:])
-    query = query / np.sqrt(np.mean(query**2, axis=-1, keepdims=True) + epsilon)
-    key = key / np.sqrt(np.mean(key**2, axis=-1, keepdims=True) + epsilon)
-    query *= np.asarray(params["q_norm"]["scale"])
-    key *= np.asarray(params["k_norm"]["scale"])
+    sc.check(query, "BTHF", np.float64)
+    sc.check((key, value), "BTKF", np.float64)
     output = np.zeros_like(query)
     for b in range(batch):
         start = 0
@@ -96,10 +96,10 @@ def reference_block(
                 angle = (t - start) / theta ** (2 * pair / head_dim)
                 c, s = np.cos(angle), np.sin(angle)
                 for tensor in (query, key):
-                    real = tensor[b, t, :, pair].copy()
-                    imag = tensor[b, t, :, pair + head_dim // 2].copy()
-                    tensor[b, t, :, pair] = real * c - imag * s
-                    tensor[b, t, :, pair + head_dim // 2] = real * s + imag * c
+                    real = tensor[b, t, :, 2 * pair].copy()
+                    imag = tensor[b, t, :, 2 * pair + 1].copy()
+                    tensor[b, t, :, 2 * pair] = real * c - imag * s
+                    tensor[b, t, :, 2 * pair + 1] = real * s + imag * c
             left = start
             for h in range(heads):
                 group = h // (heads // kv_heads)
@@ -111,19 +111,25 @@ def reference_block(
     normalized *= np.asarray(params["norm2"]["scale"])
     gate = normalized @ np.asarray(params["gate_proj"]["kernel"])
     value = normalized @ np.asarray(params["up_proj"]["kernel"])
-    return x + ((gate / (1 + np.exp(-gate))) * value) @ np.asarray(params["down_proj"]["kernel"])
+    sc.check((gate, value), "BTI", np.float64)
+    result = x + ((gate / (1 + np.exp(-gate))) * value) @ np.asarray(params["down_proj"]["kernel"])
+    sc.check(result, "BTD", np.float64)
+    return result
 
 
 @pytest.mark.parametrize("kv_heads", [1, 2, 4])
 def test_attention_matches_numpy_reference(kv_heads: int) -> None:
-    model = TransformerBlock(16, num_heads=4, num_kv_heads=kv_heads, max_seq_len=9, rope_theta=137.0)
+    model = TransformerBlock(
+        16, num_heads=4, num_kv_heads=kv_heads, max_seq_len=9, rope_theta=137.0, initializer_range=0.2
+    )
     x = jax.random.normal(jax.random.key(1), (2, 9, 16))
     starts = jnp.zeros((2, 9), jnp.bool_).at[0, 4].set(True).at[1, 1].set(True).at[1, 7].set(True)
     variables = model.init(jax.random.key(2), x)
-    # Nonuniform learned scales detect normalization across heads, misplaced
-    # normalization after RoPE, and omitted affine parameters.
-    variables["params"]["q_norm"]["scale"] = jnp.asarray([0.5, 1.0, 1.5, 2.0])
-    variables["params"]["k_norm"]["scale"] = jnp.asarray([1.5, 0.5, 2.0, 1.0])
+    # Larger weights expose QK normalization and RoPE pairing differences.
+    variables["params"]["norm"]["scale"] = jnp.linspace(0.5, 1.5, 16)
+    variables["params"]["norm2"]["scale"] = jnp.linspace(1.5, 0.5, 16)
+    assert "q_norm" not in variables["params"]
+    assert "k_norm" not in variables["params"]
     _, actual = jax.jit(model.apply)(variables, x, None, starts)
     expected = reference_block(np.asarray(x), variables["params"], np.asarray(starts), 4, kv_heads, 137.0)
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
@@ -133,7 +139,7 @@ def test_attention_matches_numpy_reference(kv_heads: int) -> None:
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
 
 
-def test_qk_norm_epsilon_and_full_history() -> None:
+def test_norm_epsilon_and_full_history() -> None:
     model = TransformerBlock(8, num_heads=2, num_kv_heads=1, max_seq_len=4, norm_epsilon=1e-4)
     x = jax.random.normal(jax.random.key(23), (1, 4, 8)) * 0.01
     variables = model.init(jax.random.key(24), x)
@@ -193,14 +199,17 @@ def test_cache_capacity_and_packed_episode_resets(compiled: bool) -> None:
 @pytest.mark.parametrize(
     "kwargs,width",
     [
-        pytest.param({}, 16, id="default"),
+        pytest.param({}, 16, id="default-expansion"),
+        pytest.param({"mlp_expansion": 3.0}, 24, id="explicit-expansion"),
+        pytest.param({"mlp_expansion": 0.125}, 1, id="minimum-width"),
         pytest.param({"mlp_expansion": 1.4}, 11, id="round-down"),
         pytest.param({"mlp_expansion": 1.45}, 12, id="round-up"),
     ],
 )
 def test_mlp_expansion_width(kwargs: dict[str, Any], width: int) -> None:
-    model = TransformerStack(8, 1, num_heads=2, max_seq_len=1, **kwargs)
-    assert model._mlp_width() == width
+    block = TransformerBlock(8, num_heads=2, **kwargs)
+    stack = TransformerStack(8, 1, num_heads=2, **kwargs)
+    assert block._mlp_width() == stack._mlp_width() == stack._make_block()._mlp_width() == width
 
 
 def test_mlp_shapes_and_norm_defaults() -> None:
@@ -212,18 +221,72 @@ def test_mlp_shapes_and_norm_defaults() -> None:
     assert layer["gate_proj"]["kernel"].shape == (8, width)
     assert layer["up_proj"]["kernel"].shape == (8, width)
     assert layer["down_proj"]["kernel"].shape == (width, 8)
-    assert model.norm_epsilon == model._make_block().norm_epsilon == 1e-6
+    assert model.norm_epsilon == model._make_block().norm_epsilon == 1e-5
     _, output = model.apply(variables, x)
     assert np.isfinite(output).all()
 
 
+def test_transformer_defaults() -> None:
+    block = TransformerBlock(dim=8, num_heads=2)
+    stack = TransformerStack(dim=8, num_layers=1, num_heads=2)
+    assert block.dim == stack.dim == stack._make_block().dim == 8
+    assert block.norm_epsilon == stack.norm_epsilon == 1e-5
+    assert block.rope_theta == stack.rope_theta == stack._make_block().rope_theta == 10000.0
+    assert block.mlp_expansion == stack.mlp_expansion == 2.0
+
+
+def test_stack_matches_llama_reference_with_final_norm() -> None:
+    model = TransformerStack(
+        8,
+        2,
+        num_heads=2,
+        num_kv_heads=1,
+        max_seq_len=3,
+        mlp_expansion=4.0,
+        initializer_range=0.2,
+    )
+    x = jax.random.normal(jax.random.key(31), (1, 3, 8))
+    sc = ShapeChecker(B=1, T=3, D=8)
+    sc.check(x, "BTD", jnp.float32)
+    variables = model.init(jax.random.key(32), x)
+    params = variables["params"]
+    params["norm_f"]["scale"] = jnp.linspace(0.5, 1.5, 8)
+    expected = np.asarray(x)
+    for index in range(2):
+        layer = params[f"layers_{index}"]
+        assert layer["gate_proj"]["kernel"].shape == (8, 32)
+        assert set(layer) == {
+            "norm",
+            "norm2",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "out_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        }
+        for name in ("q_proj", "k_proj", "v_proj", "out_proj", "gate_proj", "up_proj", "down_proj"):
+            assert set(layer[name]) == {"kernel"}
+        expected = reference_block(expected, layer, np.zeros((1, 3), bool), 2, 1, model.rope_theta)
+    expected /= np.sqrt(np.mean(expected**2, axis=-1, keepdims=True) + model.norm_epsilon)
+    expected *= np.asarray(params["norm_f"]["scale"])
+    _, actual = jax.jit(model.apply)(variables, x)
+    sc.check(actual, "BTD", jnp.float32)
+    np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-5)
+
+
 @pytest.mark.parametrize("expansion", [0.0, -1.0, float("inf"), float("nan"), 0.01])
 def test_invalid_mlp_expansion(expansion: float) -> None:
-    with pytest.raises((ValueError, AssertionError)):
-        TransformerStack(8, 1, num_heads=2, mlp_expansion=expansion).initial_carry(1)
+    for model in (
+        TransformerBlock(8, num_heads=2, mlp_expansion=expansion),
+        TransformerStack(8, 1, num_heads=2, mlp_expansion=expansion),
+    ):
+        with pytest.raises((ValueError, AssertionError)):
+            model._mlp_width()
 
 
-def test_qwen_projection_initialization_is_normal_and_independent_of_depth() -> None:
+def test_projection_initialization_is_normal_and_independent_of_depth() -> None:
     model = TransformerStack(32, 2, num_heads=4, num_kv_heads=2, max_seq_len=1)
     x = jnp.zeros((1, 0, 32))
     key = jax.random.key(28)
@@ -242,7 +305,7 @@ def test_qwen_projection_initialization_is_normal_and_independent_of_depth() -> 
             assert abs(weights.mean()) < 0.003
             assert np.max(np.abs(weights)) > 2.5 * 0.02
             np.testing.assert_allclose(scaled[name]["kernel"], weights * 2, atol=0, rtol=0)
-        for norm in (layer["norm"], layer["norm2"], layer["q_norm"], layer["k_norm"]):
+        for norm in (layer["norm"], layer["norm2"]):
             np.testing.assert_array_equal(norm["scale"], 1)
     np.testing.assert_array_equal(params["norm_f"]["scale"], 1)
 
@@ -259,7 +322,7 @@ def test_invalid_initializer_range(initializer_range: float) -> None:
 
 @pytest.mark.parametrize("stack,window,resets", [(False, 9, True), (True, 9, True), (True, 9, False), (True, 1, True)])
 def test_full_chunks_and_scanned_steps_agree(stack: bool, window: int, resets: bool) -> None:
-    kwargs = {"d_model": 16, "num_heads": 4, "num_kv_heads": 2, "max_seq_len": window}
+    kwargs = {"dim": 16, "num_heads": 4, "num_kv_heads": 2, "max_seq_len": window}
     model = TransformerStack(**kwargs, num_layers=2) if stack else TransformerBlock(**kwargs)
     x = jax.random.normal(jax.random.key(3), (2, 9, 16))
     starts = jnp.zeros((2, 9), jnp.bool_)
@@ -378,9 +441,7 @@ def test_precision_empty_initialization_and_parameter_independence(dtype: jax.ty
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"d_intermediate": 0},
-        {"d_intermediate": 1.5},
-        {"d_model": 15},
+        {"dim": 15},
         {"num_heads": 3},
         {"num_kv_heads": 3},
         {"max_seq_len": 0},
@@ -392,12 +453,12 @@ def test_precision_empty_initialization_and_parameter_independence(dtype: jax.ty
         {"attention_implementation": "invalid"},
         {"attention_implementation": "cudnn"},
         {"num_heads": True},
-        {"d_model": 12, "num_heads": 4},
+        {"dim": 12, "num_heads": 4},
     ],
 )
 def test_invalid_configuration(kwargs: dict[str, Any]) -> None:
     with pytest.raises((ValueError, TypeError, AssertionError)):
-        TransformerBlock(**({"d_model": 16, "num_heads": 4} | kwargs)).initial_carry(2)
+        TransformerBlock(**({"dim": 16, "num_heads": 4} | kwargs)).initial_carry(2)
 
 
 def test_invalid_inputs_and_carries() -> None:
@@ -417,8 +478,48 @@ def test_invalid_inputs_and_carries() -> None:
         model.apply(variables, x, carry._replace(position=jnp.zeros((1,), jnp.float32)))
     with pytest.raises(AssertionError):
         model.apply(variables, x, carry._replace(key=carry.key[:, :2]))
+    with pytest.raises(AssertionError):
+        model.apply(variables, x, carry._replace(value=carry.value.astype(jnp.bfloat16)))
+    with pytest.raises(AssertionError):
+        model.apply(variables, x[..., :8])
+    with pytest.raises(AssertionError):
+        model.apply(variables, x[:, 0])
     with pytest.raises(TypeError):
         model.apply(variables, x, tuple(carry))
+
+
+@pytest.mark.parametrize("stack,step", [(False, True), (True, False), (True, True)])
+def test_sequence_and_step_validate_inputs_before_projections(stack: bool, step: bool) -> None:
+    model = TransformerStack(8, 1, num_heads=2) if stack else TransformerBlock(8, num_heads=2)
+    shape = (1, 8) if step else (1, 2, 8)
+    x = jnp.zeros(shape, jnp.float32)
+    method = model.step if step else model.__call__
+    # Empty variables ensure invalid metadata is rejected before any projection.
+    with pytest.raises(AssertionError):
+        model.apply({}, x[..., :4], method=method)
+    with pytest.raises(AssertionError):
+        model.apply({}, x[None], method=method)
+    with pytest.raises(AssertionError):
+        model.apply({}, x.astype(jnp.int32), method=method)
+    with pytest.raises(AssertionError):
+        model.apply({}, x, episode_starts=jnp.zeros(shape[:-1], jnp.int32), method=method)
+    with pytest.raises(AssertionError):
+        model.apply({}, x, episode_starts=jnp.zeros((2, *shape[1:-1]), jnp.bool_), method=method)
+
+
+@pytest.mark.parametrize(
+    "positions_shape,positions_dtype",
+    [
+        pytest.param((2,), jnp.int32, id="position-rank"),
+        pytest.param((2, 1), jnp.int32, id="position-dimensions"),
+        pytest.param((1, 2), jnp.float32, id="position-dtype"),
+    ],
+)
+def test_rope_rejects_invalid_positions(
+    positions_shape: tuple[int, ...], positions_dtype: jax.typing.DTypeLike
+) -> None:
+    with pytest.raises(AssertionError):
+        _rope(jnp.zeros((1, 2, 1, 2), jnp.float32), jnp.zeros(positions_shape, positions_dtype), 10000.0)
 
 
 @pytest.mark.parametrize("steps,window", [(1, 4), (3, 7)])

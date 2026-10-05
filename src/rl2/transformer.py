@@ -1,7 +1,11 @@
-"""Causal RoPE transformer with batch-major sequences and explicit KV caches.
+"""Llama 3 decoder backbone with batch-major sequences and explicit KV caches.
 
 ``TransformerBlock`` combines RoPE attention with pre-RMSNorm and SwiGLU
 residual layers; ``TransformerStack`` repeats it and adds a final RMSNorm.
+The attention and SwiGLU architecture follow Meta's reference:
+https://github.com/meta-llama/llama3/blob/main/llama/model.py
+MLP width is ``round(dim * mlp_expansion)``, with a default expansion of 2.
+Model sizes and KV head counts remain configurable.
 Neither includes embeddings or a prediction head. Projections are bias-free, parameters/norm statistics are
 float32, and ``dtype`` controls projections, outputs and cached keys/values.
 All projection weights use normal initialization with standard deviation
@@ -11,8 +15,10 @@ For mixed-precision training, set ``dtype=jnp.bfloat16`` on the block or stack;
 inputs may be float32 or bfloat16. Keep the initialized parameters and optimizer
 state in float32 and compute the loss in float32. KV entries use bfloat16, while
 RoPE trigonometry and normalization statistics stay float32.
-RoPE sine/cosine are cast to the activation dtype before rotation. Residual
-additions use their operands' dtypes without explicitly promoting to float32.
+RoPE rotates adjacent feature pairs in float32, then casts back to the
+activation dtype, matching Meta's Llama 3 reference. Queries and keys have
+no additional normalization. Residual additions use their operands' dtypes
+without explicitly promoting to float32.
 
 Attention is fully causal within each episode. The fixed-size cache retains
 all episode tokens, up to ``max_seq_len``; exceeding that capacity raises an
@@ -31,7 +37,7 @@ Masked cuDNN calls pad odd sequence lengths for its backward-pass constraints.
 
 Example::
 
-    model = TransformerStack(d_model=256, num_layers=4, num_heads=8,
+    model = TransformerStack(dim=256, num_layers=4, num_heads=8,
                              num_kv_heads=2, max_seq_len=1024)
     x = jnp.zeros((8, 16, 256))
     variables = model.init(jax.random.key(0), x)
@@ -47,7 +53,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from rl2.block_stack import BlockStack
+from rl2.shape_checker import ShapeChecker
 
 type AttentionImplementation = Literal["xla", "cudnn"]
 
@@ -76,15 +82,15 @@ def _positive_integer(value: int, name: str) -> None:
 
 def _check_positions(positions: jax.Array, capacity: int) -> None:
     """Reject cache overflow eagerly and inside compiled sequence/scan calls."""
-    chex.assert_rank(positions, 2)
-    chex.assert_type(positions, jnp.int32)
+    sc = ShapeChecker()
+    sc.check(positions, "BT", jnp.int32)
     _positive_integer(capacity, "capacity")
 
     invalid = jnp.any((positions < 0) | (positions >= capacity))
+    sc.check(invalid, "", jnp.bool_)
 
     def fail_if_invalid(value: jax.Array) -> None:
-        chex.assert_shape(value, ())
-        chex.assert_type(value, jnp.bool_)
+        ShapeChecker().check(value, "", jnp.bool_)
         if bool(value):
             raise ValueError("Episode exceeds max_seq_len cache capacity; increase max_seq_len or reset the episode")
 
@@ -106,54 +112,75 @@ def _check_positions(positions: jax.Array, capacity: int) -> None:
 
 def _rope(x: jax.Array, positions: jax.Array, theta: float) -> jax.Array:
     """Rotate [batch,time,heads,head_dim] using [batch,time] positions."""
-    chex.assert_rank(x, 4)
+    sc = ShapeChecker(U=1)
+    sc.check(x, "BTHF")
     chex.assert_type(x, jnp.floating)
-    chex.assert_shape(positions, x.shape[:2])
-    chex.assert_type(positions, jnp.int32)
+    sc.check(positions, "BT", jnp.int32)
     chex.assert_is_divisible(x.shape[-1], 2)
     chex.assert_scalar_positive(theta)
     half = x.shape[-1] // 2
     frequencies = theta ** (-jnp.arange(half, dtype=jnp.float32) / half)
     angles = positions.astype(jnp.float32)[..., None, None] * frequencies
-    real, imag = jnp.split(x, 2, axis=-1)
-    cos, sin = jnp.cos(angles).astype(x.dtype), jnp.sin(angles).astype(x.dtype)
-    return jnp.concatenate((real * cos - imag * sin, imag * cos + real * sin), axis=-1)
+    real, imag = x[..., ::2].astype(jnp.float32), x[..., 1::2].astype(jnp.float32)
+    cos, sin = jnp.cos(angles), jnp.sin(angles)
+    sc.check(frequencies, "R", jnp.float32)
+    sc.check(angles, "BTUR", jnp.float32)
+    sc.check((real, imag), "BTHR", jnp.float32)
+    sc.check((cos, sin), "BTUR", jnp.float32)
+    pairs = jnp.stack((real * cos - imag * sin, imag * cos + real * sin), axis=-1)
+    sc.check(pairs, "BTHRP", jnp.float32)
+    rotated = pairs.reshape(x.shape).astype(x.dtype)
+    sc.check(rotated, "BTHF", x.dtype)
+    return rotated
+
+
+def _expanded_mlp_width(dim: int, mlp_expansion: float) -> int:
+    """Scale the model dimension and round to the nearest integer width."""
+    _positive_integer(dim, "dim")
+    if not 0 < mlp_expansion < math.inf:
+        raise ValueError("mlp_expansion must be positive and finite")
+    width = round(dim * mlp_expansion)
+    _positive_integer(width, "MLP width")
+    return width
 
 
 class TransformerBlock(nn.Module):
-    """Pre-RMSNorm RoPE attention and SwiGLU MLP with residual connections.
+    """Llama 3 pre-RMSNorm attention and SwiGLU MLP with residual connections.
 
-    ``d_intermediate=None`` defaults to twice ``d_model``.
+    MLP width is ``round(dim * mlp_expansion)``; expansion defaults to 2.
     ``num_kv_heads=None`` gives ordinary multi-head attention.
 
     Fewer KV heads enable grouped-query attention (one gives multi-query
-    attention). ``d_model`` must be divisible by ``num_heads``, and the query
+    attention). ``dim`` must be divisible by ``num_heads``, and the query
     head count must be divisible by the KV head count. Head width must be even
     for RoPE.
     """
 
-    d_model: int
-    d_intermediate: int | None = None
+    dim: int
+    mlp_expansion: float = 2.0
     num_heads: int = 8
     num_kv_heads: int | None = None
     max_seq_len: int = 2048
     rope_theta: float = 10000.0
-    norm_epsilon: float = 1e-6
+    norm_epsilon: float = 1e-5
     attention_implementation: AttentionImplementation = "xla"
     dtype: jax.typing.DTypeLike = jnp.float32
     initializer_range: float = 0.02
 
     @nn.nowrap
+    def _mlp_width(self) -> int:
+        return _expanded_mlp_width(self.dim, self.mlp_expansion)
+
+    @nn.nowrap
     def _dimensions(self) -> tuple[int, int]:
-        for name in ("d_model", "num_heads", "max_seq_len"):
+        for name in ("dim", "num_heads", "max_seq_len"):
             _positive_integer(getattr(self, name), name)
-        if self.d_intermediate is not None:
-            _positive_integer(self.d_intermediate, "d_intermediate")
+        self._mlp_width()
         kv_heads = self.num_heads if self.num_kv_heads is None else self.num_kv_heads
         _positive_integer(kv_heads, "num_kv_heads")
-        chex.assert_is_divisible(self.d_model, self.num_heads)
+        chex.assert_is_divisible(self.dim, self.num_heads)
         chex.assert_is_divisible(self.num_heads, kv_heads)
-        head_dim = self.d_model // self.num_heads
+        head_dim = self.dim // self.num_heads
         chex.assert_is_divisible(head_dim, 2)
         for name in ("rope_theta", "initializer_range", "norm_epsilon"):
             if not 0 < getattr(self, name) < math.inf:
@@ -174,10 +201,15 @@ class TransformerBlock(nn.Module):
         """Allocate a fixed-size empty cache without initializing parameters."""
         kv_heads, head_dim = self._dimensions()
         _positive_integer(batch_size, "batch_size")
-        shape = (batch_size, self.max_seq_len, kv_heads, head_dim)
-        return TransformerCarry(
-            jnp.zeros(shape, self.dtype), jnp.zeros(shape, self.dtype), jnp.zeros((batch_size,), jnp.int32)
+        sc = ShapeChecker(B=batch_size, C=self.max_seq_len, K=kv_heads, F=head_dim)
+        carry = TransformerCarry(
+            jnp.zeros(sc["BCKF"], self.dtype),
+            jnp.zeros(sc["BCKF"], self.dtype),
+            jnp.zeros(sc["B"], jnp.int32),
         )
+        sc.check((carry.key, carry.value), "BCKF", self.dtype)
+        sc.check(carry.position, "B", jnp.int32)
+        return carry
 
     @nn.compact
     def __call__(
@@ -186,13 +218,17 @@ class TransformerBlock(nn.Module):
         carry: TransformerCarry | None = None,
         episode_starts: jax.Array | None = None,
     ) -> tuple[TransformerCarry, jax.Array]:
-        """Map [batch,time,d_model] to (updated KV cache, same-shaped output).
+        """Map [batch,time,dim] to (updated KV cache, same-shaped output).
 
         A True entry in ``episode_starts[batch,time]`` discards all preceding
         history for that example before processing its current input.
         """
         kv_heads, head_dim = self._dimensions()
-        chex.assert_shape(x, (None, None, self.d_model))
+        width = self._mlp_width()
+        # B/T: batch/time, D: model width, H/K: query/KV heads,
+        # F: head width, C: cache capacity, I: MLP width, U: singleton.
+        sc = ShapeChecker(D=self.dim, H=self.num_heads, K=kv_heads, F=head_dim, C=self.max_seq_len, I=width, U=1)
+        sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
         batch, steps = x.shape[:2]
         _positive_integer(batch, "batch_size")
@@ -201,29 +237,28 @@ class TransformerBlock(nn.Module):
             carry = self.initial_carry(batch)
         if not isinstance(carry, TransformerCarry):
             raise TypeError("carry must be a TransformerCarry")
-        chex.assert_shape((carry.key, carry.value), (batch, self.max_seq_len, kv_heads, head_dim))
-        chex.assert_type((carry.key, carry.value), self.dtype)
-        chex.assert_shape(carry.position, (batch,))
-        chex.assert_type(carry.position, jnp.int32)
+        sc.check((carry.key, carry.value), "BCKF", self.dtype)
+        sc.check(carry.position, "B", jnp.int32)
         unsegmented = episode_starts is None
         if episode_starts is None:
             episode_starts = jnp.zeros((batch, steps), jnp.bool_)
-        chex.assert_shape(episode_starts, (batch, steps))
-        chex.assert_type(episode_starts, jnp.bool_)
+        sc.check(episode_starts, "BT", jnp.bool_)
 
         # Attention projections use [batch,time,heads,head_dim].
         residual = x
         x = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(x)
+        sc.check(x, "BTD", self.dtype)
         kernel_init = nn.initializers.normal(stddev=self.initializer_range)
-        query = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="q_proj")(x)
+        query = nn.Dense(self.dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="q_proj")(x)
         key = nn.Dense(kv_heads * head_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="k_proj")(x)
         value = nn.Dense(kv_heads * head_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="v_proj")(
             x
         )
-        query = query.reshape((batch, steps, self.num_heads, head_dim))
-        key, value = (v.reshape((batch, steps, kv_heads, head_dim)) for v in (key, value))
-        query = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="q_norm")(query)
-        key = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="k_norm")(key)
+        sc.check(query, "BTD", self.dtype)
+        query = query.reshape(sc["BTHF"])
+        key, value = (v.reshape(sc["BTKF"]) for v in (key, value))
+        sc.check(query, "BTHF", self.dtype)
+        sc.check((key, value), "BTKF", self.dtype)
         if steps:
             starts = episode_starts
             index = jnp.arange(steps, dtype=jnp.int32)[None, :]
@@ -232,10 +267,12 @@ class TransformerBlock(nn.Module):
                 jnp.maximum, jnp.where(starts, index, -carry.position[:, None]), axis=1
             )
             positions = index - last_reset
+            sc.check((last_reset, positions), "BT", jnp.int32)
             _check_positions(positions, self.max_seq_len)
             query, key = _rope(query, positions, self.rope_theta), _rope(key, positions, self.rope_theta)
             slots = jnp.arange(self.max_seq_len, dtype=jnp.int32)[None, :]
             old_positions = jnp.where(slots < carry.position[:, None], slots, -1)
+            sc.check(old_positions, "BC", jnp.int32)
 
             mask = None
             native_causal = fresh and unsegmented
@@ -250,11 +287,15 @@ class TransformerBlock(nn.Module):
                     keys, values = jnp.concatenate((carry.key, key), 1), jnp.concatenate((carry.value, value), 1)
                     key_positions = jnp.concatenate((old_positions, positions), 1)
                     key_segments = jnp.concatenate((jnp.zeros_like(old_positions), segments), 1)
+                sc.check(segments, "BT", jnp.int32)
+                sc.check((key_positions, key_segments), "BS", jnp.int32)
                 distance = positions[:, :, None] - key_positions[:, None, :]
                 mask = distance >= 0
                 mask &= key_positions[:, None, :] >= 0
                 mask &= segments[:, :, None] == key_segments[:, None, :]
                 mask = mask[:, None]
+                sc.check(distance, "BTS", jnp.int32)
+                sc.check(mask, "BUTS", jnp.bool_)
             queries = query
             if self.attention_implementation == "cudnn" and mask is not None:
                 # cuDNN masked backward requires even Q and KV lengths. Give
@@ -273,15 +314,24 @@ class TransformerBlock(nn.Module):
                 if self.attention_implementation == "xla" and jnp.dtype(self.dtype) == jnp.float16
                 else self.dtype
             )
+            # Q/S may include cuDNN padding, independently of the chunk length T.
+            attention_sc = ShapeChecker(B=batch, H=self.num_heads, K=kv_heads, F=head_dim, U=1)
+            queries, keys, values = (v.astype(attention_dtype) for v in (queries, keys, values))
+            attention_sc.check(queries, "BQHF", attention_dtype)
+            attention_sc.check((keys, values), "BSKF", attention_dtype)
+            if mask is not None:
+                attention_sc.check(mask, "BUQS", jnp.bool_)
             attended = jax.nn.dot_product_attention(
-                queries.astype(attention_dtype),
-                keys.astype(attention_dtype),
-                values.astype(attention_dtype),
+                queries,
+                keys,
+                values,
                 mask=mask,
                 is_causal=native_causal,
                 local_window_size=None,
                 implementation=self.attention_implementation,
-            )[:, :steps].astype(self.dtype)
+            )
+            attention_sc.check(attended, "BQHF", attention_dtype)
+            attended = attended[:, :steps].astype(self.dtype)
 
             next_position = positions[:, -1] + 1
             # Gather writes from the final episode in this chunk. Earlier
@@ -289,6 +339,7 @@ class TransformerBlock(nn.Module):
             source = steps - next_position[:, None] + slots
             gather = jnp.clip(source, 0, steps - 1)[..., None, None]
             new_key, new_value = (jnp.take_along_axis(v, gather, axis=1) for v in (key, value))
+            sc.check((new_key, new_value), "BCKF", self.dtype)
             written = (source >= 0)[..., None, None]
             valid = (slots < next_position[:, None])[..., None, None]
             carry = TransformerCarry(
@@ -298,16 +349,27 @@ class TransformerBlock(nn.Module):
             )
         else:
             attended = query
-        attended = attended.reshape((batch, steps, self.d_model))
-        y = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="out_proj")(attended)
+        sc.check((carry.key, carry.value), "BCKF", self.dtype)
+        sc.check(carry.position, "B", jnp.int32)
+        sc.check(attended, "BTHF", self.dtype)
+        attended = attended.reshape(sc["BTD"])
+        y = nn.Dense(self.dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="out_proj")(attended)
+        sc.check(y, "BTD", self.dtype)
         x = residual + y
+        residual_dtype = jnp.result_type(residual.dtype, self.dtype)
+        sc.check(x, "BTD", residual_dtype)
         y = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm2")(x)
-        width = 2 * self.d_model if self.d_intermediate is None else self.d_intermediate
+        sc.check(y, "BTD", self.dtype)
         gate = nn.Dense(width, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="gate_proj")(y)
         value = nn.Dense(width, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="up_proj")(y)
+        sc.check((gate, value), "BTI", self.dtype)
         y = nn.silu(gate) * value
-        y = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="down_proj")(y)
-        return carry, x + y
+        sc.check(y, "BTI", self.dtype)
+        y = nn.Dense(self.dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="down_proj")(y)
+        sc.check(y, "BTD", self.dtype)
+        output = x + y
+        sc.check(output, "BTD", residual_dtype)
+        return carry, output
 
     def step(
         self,
@@ -315,34 +377,39 @@ class TransformerBlock(nn.Module):
         carry: TransformerCarry | None = None,
         episode_starts: jax.Array | None = None,
     ) -> tuple[TransformerCarry, jax.Array]:
-        """Process [batch,d_model] using the same parameters as sequence calls."""
-        chex.assert_shape(x, (None, self.d_model))
+        """Process [batch,dim] using the same parameters as sequence calls."""
+        sc = ShapeChecker(D=self.dim)
+        sc.check(x, "BD")
         chex.assert_type(x, jnp.floating)
         if episode_starts is not None:
-            chex.assert_shape(episode_starts, (x.shape[0],))
-            chex.assert_type(episode_starts, jnp.bool_)
+            sc.check(episode_starts, "B", jnp.bool_)
         starts = None if episode_starts is None else episode_starts[:, None]
         carry, y = self(x[:, None], carry, starts)
-        return carry, y[:, 0]
+        output = y[:, 0]
+        sc.check(output, "BD", jnp.result_type(x.dtype, self.dtype))
+        return carry, output
 
 
-class TransformerStack(BlockStack[TransformerStackCarry]):
-    """Modern decoder backbone with independent pre-RMSNorm/SwiGLU layers.
+class TransformerStack(nn.Module):
+    """Llama 3 decoder backbone with independent pre-RMSNorm/SwiGLU layers.
 
     Sequences and reset masks are batch-major. Carry is a tuple of one
-    TransformerCarry per layer. The MLP width is round(mlp_expansion*d_model),
-    with a default expansion of 2. Final RMSNorm defaults on; residual additions
+    TransformerCarry per layer. MLP width is ``round(dim * mlp_expansion)``,
+    with a default expansion of 2, shared by every block.
+    Final RMSNorm defaults on; residual additions
     preserve the operands' normal dtype promotion rules.
     All projections use normal initialization with standard deviation
     ``initializer_range`` (default 0.02), independent of depth.
     """
 
+    dim: int
+    num_layers: int
     num_heads: int = 8
     num_kv_heads: int | None = None
     max_seq_len: int = 2048
     rope_theta: float = 10000.0
     mlp_expansion: float = 2.0
-    norm_epsilon: float = 1e-6
+    norm_epsilon: float = 1e-5
     final_norm: bool = True
     initializer_range: float = 0.02
     attention_implementation: AttentionImplementation = "xla"
@@ -350,21 +417,17 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
 
     @nn.nowrap
     def _mlp_width(self) -> int:
-        for name in ("d_model", "num_layers"):
+        for name in ("dim", "num_layers"):
             _positive_integer(getattr(self, name), name)
         if not 0 < self.norm_epsilon < math.inf:
             raise ValueError("norm_epsilon must be positive and finite")
-        if not 0 < self.mlp_expansion < math.inf:
-            raise ValueError("mlp_expansion must be positive and finite")
-        width = round(self.mlp_expansion * self.d_model)
-        _positive_integer(width, "MLP width")
-        return width
+        return _expanded_mlp_width(self.dim, self.mlp_expansion)
 
     @nn.nowrap
     def _make_block(self) -> TransformerBlock:
         block = TransformerBlock(
-            d_model=self.d_model,
-            d_intermediate=self._mlp_width(),
+            dim=self.dim,
+            mlp_expansion=self.mlp_expansion,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             max_seq_len=self.max_seq_len,
@@ -396,14 +459,14 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
         carry: TransformerStackCarry | None = None,
         episode_starts: jax.Array | None = None,
     ) -> tuple[TransformerStackCarry, jax.Array]:
-        """Map [batch,time,d_model] to (per-layer KV caches, output)."""
-        chex.assert_shape(x, (None, None, self.d_model))
+        """Map [batch,time,dim] to (per-layer KV caches, output)."""
+        sc = ShapeChecker(D=self.dim)
+        sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
         if carry is not None and (not isinstance(carry, tuple) or len(carry) != self.num_layers):
             raise ValueError("carry must be a tuple with one TransformerCarry per layer")
         if episode_starts is not None:
-            chex.assert_shape(episode_starts, x.shape[:2])
-            chex.assert_type(episode_starts, jnp.bool_)
+            sc.check(episode_starts, "BT", jnp.bool_)
         next_carry = []
         for i, layer in enumerate(self.layers):
             state = None if carry is None else carry[i]
@@ -413,7 +476,9 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
             next_carry.append(state)
         if self.final_norm:
             x = self.norm_f(x)
-        return tuple(next_carry), x.astype(self.dtype)
+        output = x.astype(self.dtype)
+        sc.check(output, "BTD", self.dtype)
+        return tuple(next_carry), output
 
     def step(
         self,
@@ -421,12 +486,14 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
         carry: TransformerStackCarry | None = None,
         episode_starts: jax.Array | None = None,
     ) -> tuple[TransformerStackCarry, jax.Array]:
-        """Process [batch,d_model] using the same parameters as sequence calls."""
-        chex.assert_shape(x, (None, self.d_model))
+        """Process [batch,dim] using the same parameters as sequence calls."""
+        sc = ShapeChecker(D=self.dim)
+        sc.check(x, "BD")
         chex.assert_type(x, jnp.floating)
         if episode_starts is not None:
-            chex.assert_shape(episode_starts, (x.shape[0],))
-            chex.assert_type(episode_starts, jnp.bool_)
+            sc.check(episode_starts, "B", jnp.bool_)
         starts = None if episode_starts is None else episode_starts[:, None]
         carry, y = self(x[:, None], carry, starts)
-        return carry, y[:, 0]
+        output = y[:, 0]
+        sc.check(output, "BD", self.dtype)
+        return carry, output
