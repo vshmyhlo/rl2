@@ -32,6 +32,7 @@ from google.cloud import storage
 from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
+from rl2.jax_cache import configure_compilation_cache
 from rl2.observation_encoder import ConvStage, ConvStages, validate_stages
 from rl2.ppo import make_env
 from rl2.wm import MambaWorldModel, WorldModelState, categorical_entropy, categorical_kl, check_keys, latent_kl_losses
@@ -577,6 +578,7 @@ def save_checkpoint(state: TrainState, run_dir: str | Path) -> None:
 
 def train(config: Config) -> str:
     """Train on fresh random-policy rollouts and return the log directory."""
+    configure_compilation_cache()
     vector_cls = gym.vector.AsyncVectorEnv if config.vector_env == "async" else gym.vector.SyncVectorEnv
     vector_options = {"context": "spawn"} if config.vector_env == "async" else {}
     envs = vector_cls(

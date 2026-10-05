@@ -27,6 +27,7 @@ from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
+from rl2.jax_cache import configure_compilation_cache
 from rl2.karel import ACTIONS, REWARD_COMPONENTS, TASK_CATEGORIES, TOKENS, KarelConfig, KarelPair, KarelProgramEnv
 from rl2.karel_grammar import (
     GrammarState,
@@ -559,6 +560,7 @@ def load_model(
 
 
 def train(config: Config) -> TrainState:
+    configure_compilation_cache()
     batch_size = config.num_tasks * config.group_size
     envs = [KarelProgramEnv(config.env) for _ in range(batch_size)]
     rng = np.random.default_rng(config.seed)

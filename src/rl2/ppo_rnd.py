@@ -27,6 +27,7 @@ from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
+from rl2.jax_cache import configure_compilation_cache
 from rl2.multi_atari import register_envs
 from rl2.utils import RunningMeanStd
 
@@ -497,6 +498,7 @@ def update(state: TrainState, batch: PPOBatch, config: Config) -> tuple[TrainSta
 
 
 def train(config: Config) -> TrainState:
+    configure_compilation_cache()
     batch_size = config.num_envs * config.num_steps
     if min(config.num_envs, config.num_steps, config.num_minibatches, config.update_epochs) < 1:
         raise ValueError("Environment, rollout, minibatch, and epoch counts must be positive")

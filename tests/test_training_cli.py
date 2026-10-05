@@ -7,6 +7,16 @@ import pytest
 
 
 @pytest.mark.parametrize("name", ["ppo", "ppo_rnd", "train_karel_ast_grpo", "train_karel_grpo", "train_wm"])
+def test_training_configures_cache_before_initialization(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = importlib.import_module(f"rl2.{name}")
+    configure_cache = MagicMock(side_effect=RuntimeError("cache configured before model or environment setup"))
+    monkeypatch.setattr(module, "configure_compilation_cache", configure_cache)
+    with pytest.raises(RuntimeError, match="cache configured before model or environment setup"):
+        module.train(object())
+    configure_cache.assert_called_once_with()
+
+
+@pytest.mark.parametrize("name", ["ppo", "ppo_rnd", "train_karel_ast_grpo", "train_karel_grpo", "train_wm"])
 def test_training_cli_uses_environment_backend(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
     module = importlib.import_module(f"rl2.{name}")
     config = object()

@@ -4,6 +4,8 @@
 SwiGLU residual blocks and a final RMSNorm. Neither includes embeddings or a
 prediction head. Projections are bias-free, parameters/norm statistics are
 float32, and ``dtype`` controls projections, outputs and cached keys/values.
+All projection weights use normal initialization with standard deviation
+``initializer_range`` (default 0.02), without depth-dependent scaling.
 The XLA float16 path evaluates attention in float32 for CPU portability.
 For mixed-precision training, set ``dtype=jnp.bfloat16`` on the mixer or stack;
 inputs may be float32 or bfloat16. Keep the initialized parameters and optimizer
@@ -133,7 +135,7 @@ class Transformer(nn.Module):
     norm_epsilon: float = 1e-6
     attention_implementation: AttentionImplementation = "xla"
     dtype: jax.typing.DTypeLike = jnp.float32
-    out_proj_init_scale: float = 1.0
+    initializer_range: float = 0.02
 
     @nn.nowrap
     def _dimensions(self) -> tuple[int, int]:
@@ -145,7 +147,7 @@ class Transformer(nn.Module):
         chex.assert_is_divisible(self.num_heads, kv_heads)
         head_dim = self.d_model // self.num_heads
         chex.assert_is_divisible(head_dim, 2)
-        for name in ("rope_theta", "out_proj_init_scale", "norm_epsilon"):
+        for name in ("rope_theta", "initializer_range", "norm_epsilon"):
             if not 0 < getattr(self, name) < math.inf:
                 raise ValueError(f"{name} must be positive and finite")
         if self.attention_implementation not in ("xla", "cudnn"):
@@ -203,9 +205,12 @@ class Transformer(nn.Module):
 
         # Batch-major projections for jax.nn.dot_product_attention (BTNH).
         x = jnp.swapaxes(x, 0, 1)
-        query = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype, name="q_proj")(x)
-        key = nn.Dense(kv_heads * head_dim, use_bias=False, dtype=self.dtype, name="k_proj")(x)
-        value = nn.Dense(kv_heads * head_dim, use_bias=False, dtype=self.dtype, name="v_proj")(x)
+        kernel_init = nn.initializers.normal(stddev=self.initializer_range)
+        query = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="q_proj")(x)
+        key = nn.Dense(kv_heads * head_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="k_proj")(x)
+        value = nn.Dense(kv_heads * head_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="v_proj")(
+            x
+        )
         query = query.reshape((batch, steps, self.num_heads, head_dim))
         key, value = (v.reshape((batch, steps, kv_heads, head_dim)) for v in (key, value))
         query = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="q_norm")(query)
@@ -285,8 +290,7 @@ class Transformer(nn.Module):
         else:
             attended = query
         attended = attended.reshape((batch, steps, self.d_model))
-        out_init = nn.initializers.variance_scaling(self.out_proj_init_scale**2, "fan_in", "truncated_normal")
-        y = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype, kernel_init=out_init, name="out_proj")(attended)
+        y = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="out_proj")(attended)
         return carry, jnp.swapaxes(y, 0, 1)
 
     def step(
@@ -326,11 +330,11 @@ class _TransformerBlock(nn.Module):
         carry, y = self.mixer(normalized, carry, episode_starts)
         x = x + y.astype(residual_dtype)
         y = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=dtype, name="norm2")(x)
-        gate = nn.Dense(self.d_intermediate, use_bias=False, dtype=dtype, name="gate_proj")(y)
-        value = nn.Dense(self.d_intermediate, use_bias=False, dtype=dtype, name="up_proj")(y)
+        kernel_init = nn.initializers.normal(stddev=self.mixer.initializer_range)
+        gate = nn.Dense(self.d_intermediate, use_bias=False, dtype=dtype, kernel_init=kernel_init, name="gate_proj")(y)
+        value = nn.Dense(self.d_intermediate, use_bias=False, dtype=dtype, kernel_init=kernel_init, name="up_proj")(y)
         y = nn.silu(gate) * value
-        out_init = nn.initializers.variance_scaling(self.mixer.out_proj_init_scale**2, "fan_in", "truncated_normal")
-        y = nn.Dense(self.mixer.d_model, use_bias=False, dtype=dtype, kernel_init=out_init, name="down_proj")(y)
+        y = nn.Dense(self.mixer.d_model, use_bias=False, dtype=dtype, kernel_init=kernel_init, name="down_proj")(y)
         return carry, x + y.astype(residual_dtype)
 
 
@@ -338,37 +342,35 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
     """Modern decoder backbone with independent pre-RMSNorm/SwiGLU layers.
 
     Same sequence/step/reset interface as Mamba3Stack. Carry is a tuple of one
-    TransformerCarry per layer. The default MLP width is 2*d_model, configurable
-    via ``mlp_expansion`` or an explicit ``d_intermediate`` override, then rounded
-    up to ``mlp_multiple_of``. Final RMSNorm and float32 residuals default on.
-    Output projections initialize with depth scale 1/sqrt(2*num_layers).
+    TransformerCarry per layer. The MLP width is round(mlp_expansion*d_model),
+    with a default expansion of 2. Final RMSNorm and float32 residuals default on.
+    All projections use normal initialization with standard deviation
+    ``initializer_range`` (default 0.02), independent of depth.
     """
 
     num_heads: int = 8
     num_kv_heads: int | None = None
     max_seq_len: int = 2048
     rope_theta: float = 10000.0
-    d_intermediate: int | None = None
     mlp_expansion: float = 2.0
-    mlp_multiple_of: int = 1
     norm_epsilon: float = 1e-6
     residual_in_fp32: bool = True
     final_norm: bool = True
-    rescale_prenorm_residual: bool = True
+    initializer_range: float = 0.02
     attention_implementation: AttentionImplementation = "xla"
     dtype: jax.typing.DTypeLike = jnp.float32
 
     @nn.nowrap
     def _mlp_width(self) -> int:
-        for name in ("d_model", "num_layers", "mlp_multiple_of"):
+        for name in ("d_model", "num_layers"):
             _positive_integer(getattr(self, name), name)
         if not 0 < self.norm_epsilon < math.inf:
             raise ValueError("norm_epsilon must be positive and finite")
         if not 0 < self.mlp_expansion < math.inf:
             raise ValueError("mlp_expansion must be positive and finite")
-        width = int(self.mlp_expansion * self.d_model) if self.d_intermediate is None else self.d_intermediate
-        _positive_integer(width, "d_intermediate")
-        return (width + self.mlp_multiple_of - 1) // self.mlp_multiple_of * self.mlp_multiple_of
+        width = round(self.mlp_expansion * self.d_model)
+        _positive_integer(width, "MLP width")
+        return width
 
     @nn.nowrap
     def _make_mixer(self) -> Transformer:
@@ -382,7 +384,7 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
             norm_epsilon=self.norm_epsilon,
             attention_implementation=self.attention_implementation,
             dtype=self.dtype,
-            out_proj_init_scale=1 / math.sqrt(2 * self.num_layers) if self.rescale_prenorm_residual else 1.0,
+            initializer_range=self.initializer_range,
             parent=None,
         )
         mixer._dimensions()

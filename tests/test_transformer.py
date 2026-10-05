@@ -142,7 +142,10 @@ def test_cache_capacity_and_packed_episode_resets(compiled: bool) -> None:
         ({}, 16),
         ({"mlp_expansion": 3.0}, 24),
         ({"mlp_expansion": 1.5}, 12),
-        ({"d_intermediate": 11, "mlp_multiple_of": 4}, 12),
+        ({"mlp_expansion": 1.4}, 11),
+        ({"mlp_expansion": 1.45}, 12),
+        ({"mlp_expansion": 1.3125}, 10),
+        ({"mlp_expansion": 1.4375}, 12),
     ],
 )
 def test_mlp_expansion_and_norm_defaults(kwargs: dict[str, Any], width: int) -> None:
@@ -164,10 +167,45 @@ def test_invalid_mlp_expansion(expansion: float) -> None:
         TransformerStack(8, 1, num_heads=2, mlp_expansion=expansion).initial_carry(1)
 
 
+def test_qwen_projection_initialization_is_normal_and_independent_of_depth() -> None:
+    model = TransformerStack(32, 2, num_heads=4, num_kv_heads=2, max_seq_len=1)
+    x = jnp.zeros((0, 1, 32))
+    key = jax.random.key(28)
+    params = model.init(key, x)["params"]
+    shallow = model.clone(num_layers=1).init(key, x)["params"]
+    chex.assert_trees_all_equal(params["layers_0"], shallow["layers_0"])
+    wider = model.clone(initializer_range=0.04).init(key, x)["params"]
+    assert model.initializer_range == 0.02
+    for index in range(2):
+        layer, scaled = params[f"layers_{index}"], wider[f"layers_{index}"]
+        for name in ("q_proj", "k_proj", "v_proj", "out_proj", "gate_proj", "up_proj", "down_proj"):
+            branch, scaled_branch = (layer["mixer"], scaled["mixer"]) if name in layer["mixer"] else (layer, scaled)
+            weights = np.asarray(branch[name]["kernel"])
+            # Each projection has at least 512 samples; fixed seeds keep these
+            # distribution checks deterministic while tolerating sampling noise.
+            np.testing.assert_allclose(weights.std(), 0.02, rtol=0.12)
+            assert abs(weights.mean()) < 0.003
+            assert np.max(np.abs(weights)) > 2.5 * 0.02
+            np.testing.assert_allclose(scaled_branch[name]["kernel"], weights * 2, atol=0, rtol=0)
+        for norm in (layer["norm"], layer["norm2"], layer["mixer"]["q_norm"], layer["mixer"]["k_norm"]):
+            np.testing.assert_array_equal(norm["scale"], 1)
+    np.testing.assert_array_equal(params["norm_f"]["scale"], 1)
+
+
+@pytest.mark.parametrize("initializer_range", [0.0, -0.02, float("inf"), float("nan")])
+def test_invalid_initializer_range(initializer_range: float) -> None:
+    for model in (
+        Transformer(8, num_heads=2, initializer_range=initializer_range),
+        TransformerStack(8, 1, num_heads=2, initializer_range=initializer_range),
+    ):
+        with pytest.raises(ValueError, match="initializer_range must be positive and finite"):
+            model.initial_carry(1)
+
+
 @pytest.mark.parametrize("stack,window,resets", [(False, 9, True), (True, 9, True), (True, 9, False), (True, 1, True)])
 def test_full_chunks_and_scanned_steps_agree(stack: bool, window: int, resets: bool) -> None:
     kwargs = {"d_model": 16, "num_heads": 4, "num_kv_heads": 2, "max_seq_len": window}
-    model = TransformerStack(**kwargs, num_layers=2, mlp_multiple_of=8) if stack else Transformer(**kwargs)
+    model = TransformerStack(**kwargs, num_layers=2) if stack else Transformer(**kwargs)
     x = jax.random.normal(jax.random.key(3), (9, 2, 16))
     starts = jnp.zeros((9, 2), jnp.bool_)
     if window == 1:
@@ -203,7 +241,7 @@ def test_full_chunks_and_scanned_steps_agree(stack: bool, window: int, resets: b
 
 
 def test_causality_episode_isolation_and_cache_clearing() -> None:
-    model = TransformerStack(16, 2, num_heads=4, num_kv_heads=1, max_seq_len=8, mlp_multiple_of=8)
+    model = TransformerStack(16, 2, num_heads=4, num_kv_heads=1, max_seq_len=8)
     x = jax.random.normal(jax.random.key(5), (7, 2, 16))
     variables = model.init(jax.random.key(6), x)
     _, baseline = model.apply(variables, x)
@@ -228,7 +266,7 @@ def test_causality_episode_isolation_and_cache_clearing() -> None:
 
 
 def test_gradients_through_chunked_cache_match_full_sequence() -> None:
-    model = TransformerStack(8, 2, num_heads=2, num_kv_heads=1, max_seq_len=7, mlp_multiple_of=4)
+    model = TransformerStack(8, 2, num_heads=2, num_kv_heads=1, max_seq_len=7)
     x = jax.random.normal(jax.random.key(7), (7, 2, 8))
     starts = jnp.zeros((7, 2), jnp.bool_).at[4, 0].set(True)
     params = model.init(jax.random.key(8), x)["params"]
@@ -261,7 +299,7 @@ def test_gradients_through_chunked_cache_match_full_sequence() -> None:
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 def test_precision_empty_initialization_and_parameter_independence(dtype: jax.typing.DTypeLike) -> None:
-    model = TransformerStack(16, 2, num_heads=4, max_seq_len=4, mlp_multiple_of=8, dtype=dtype)
+    model = TransformerStack(16, 2, num_heads=4, max_seq_len=4, dtype=dtype)
     x = jax.random.normal(jax.random.key(11), (3, 2, 16))
     variables = model.init(jax.random.key(12), x[:0])
     carry, y = jax.jit(model.apply)(variables, x)
@@ -414,9 +452,7 @@ def assert_gradient_close(actual: jax.Array, expected: jax.Array) -> None:
     ],
 )
 def test_attention_backend_forward_backward_and_decode(cached: bool, window: int, implementation: str) -> None:
-    model = TransformerStack(
-        16, 1, num_heads=2, num_kv_heads=1, max_seq_len=window, mlp_multiple_of=8, dtype=jnp.bfloat16
-    )
+    model = TransformerStack(16, 1, num_heads=2, num_kv_heads=1, max_seq_len=window, dtype=jnp.bfloat16)
     backend = model.clone(attention_implementation=implementation)
     x = jax.random.normal(jax.random.key(14), (5, 2, 16))
     probe = jax.random.normal(jax.random.key(18), x.shape) / jnp.sqrt(x.size)
