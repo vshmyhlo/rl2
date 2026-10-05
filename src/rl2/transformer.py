@@ -1,13 +1,13 @@
-"""Causal RoPE transformer with the time-major, explicit-carry Mamba3 API.
+"""Causal RoPE transformer with batch-major sequences and explicit KV caches.
 
-``Transformer`` is the attention mixer; ``TransformerStack`` adds pre-RMSNorm,
-SwiGLU residual blocks and a final RMSNorm. Neither includes embeddings or a
-prediction head. Projections are bias-free, parameters/norm statistics are
+``TransformerBlock`` combines RoPE attention with pre-RMSNorm and SwiGLU
+residual layers; ``TransformerStack`` repeats it and adds a final RMSNorm.
+Neither includes embeddings or a prediction head. Projections are bias-free, parameters/norm statistics are
 float32, and ``dtype`` controls projections, outputs and cached keys/values.
 All projection weights use normal initialization with standard deviation
 ``initializer_range`` (default 0.02), without depth-dependent scaling.
 The XLA float16 path evaluates attention in float32 for CPU portability.
-For mixed-precision training, set ``dtype=jnp.bfloat16`` on the mixer or stack;
+For mixed-precision training, set ``dtype=jnp.bfloat16`` on the block or stack;
 inputs may be float32 or bfloat16. Keep the initialized parameters and optimizer
 state in float32 and compute the loss in float32. KV entries use bfloat16, while
 RoPE trigonometry and normalization statistics stay float32.
@@ -33,10 +33,10 @@ Example::
 
     model = TransformerStack(d_model=256, num_layers=4, num_heads=8,
                              num_kv_heads=2, max_seq_len=1024)
-    x = jnp.zeros((16, 8, 256))
+    x = jnp.zeros((8, 16, 256))
     variables = model.init(jax.random.key(0), x)
     carry, y = model.apply(variables, x)
-    carry, next_y = model.apply(variables, x[0], carry, method=model.step)
+    carry, next_y = model.apply(variables, x[:, 0], carry, method=model.step)
 """
 
 import math
@@ -105,7 +105,7 @@ def _check_positions(positions: jax.Array, capacity: int) -> None:
 
 
 def _rope(x: jax.Array, positions: jax.Array, theta: float) -> jax.Array:
-    """Full-head RoPE with float32 trigonometry and activation-dtype rotation."""
+    """Rotate [batch,time,heads,head_dim] using [batch,time] positions."""
     chex.assert_rank(x, 4)
     chex.assert_type(x, jnp.floating)
     chex.assert_shape(positions, x.shape[:2])
@@ -120,8 +120,11 @@ def _rope(x: jax.Array, positions: jax.Array, theta: float) -> jax.Array:
     return jnp.concatenate((real * cos - imag * sin, imag * cos + real * sin), axis=-1)
 
 
-class Transformer(nn.Module):
-    """RoPE attention mixer; ``num_kv_heads=None`` gives ordinary multi-head attention.
+class TransformerBlock(nn.Module):
+    """Pre-RMSNorm RoPE attention and SwiGLU MLP with residual connections.
+
+    ``d_intermediate=None`` defaults to twice ``d_model``.
+    ``num_kv_heads=None`` gives ordinary multi-head attention.
 
     Fewer KV heads enable grouped-query attention (one gives multi-query
     attention). ``d_model`` must be divisible by ``num_heads``, and the query
@@ -130,6 +133,7 @@ class Transformer(nn.Module):
     """
 
     d_model: int
+    d_intermediate: int | None = None
     num_heads: int = 8
     num_kv_heads: int | None = None
     max_seq_len: int = 2048
@@ -143,6 +147,8 @@ class Transformer(nn.Module):
     def _dimensions(self) -> tuple[int, int]:
         for name in ("d_model", "num_heads", "max_seq_len"):
             _positive_integer(getattr(self, name), name)
+        if self.d_intermediate is not None:
+            _positive_integer(self.d_intermediate, "d_intermediate")
         kv_heads = self.num_heads if self.num_kv_heads is None else self.num_kv_heads
         _positive_integer(kv_heads, "num_kv_heads")
         chex.assert_is_divisible(self.d_model, self.num_heads)
@@ -180,15 +186,15 @@ class Transformer(nn.Module):
         carry: TransformerCarry | None = None,
         episode_starts: jax.Array | None = None,
     ) -> tuple[TransformerCarry, jax.Array]:
-        """Map [time,batch,d_model] to (updated KV cache, same-shaped output).
+        """Map [batch,time,d_model] to (updated KV cache, same-shaped output).
 
-        A True entry in ``episode_starts[time,batch]`` discards all preceding
+        A True entry in ``episode_starts[batch,time]`` discards all preceding
         history for that example before processing its current input.
         """
         kv_heads, head_dim = self._dimensions()
         chex.assert_shape(x, (None, None, self.d_model))
         chex.assert_type(x, jnp.floating)
-        steps, batch = x.shape[:2]
+        batch, steps = x.shape[:2]
         _positive_integer(batch, "batch_size")
         fresh = carry is None
         if carry is None:
@@ -201,12 +207,13 @@ class Transformer(nn.Module):
         chex.assert_type(carry.position, jnp.int32)
         unsegmented = episode_starts is None
         if episode_starts is None:
-            episode_starts = jnp.zeros((steps, batch), jnp.bool_)
-        chex.assert_shape(episode_starts, (steps, batch))
+            episode_starts = jnp.zeros((batch, steps), jnp.bool_)
+        chex.assert_shape(episode_starts, (batch, steps))
         chex.assert_type(episode_starts, jnp.bool_)
 
-        # Batch-major projections for jax.nn.dot_product_attention (BTNH).
-        x = jnp.swapaxes(x, 0, 1)
+        # Attention projections use [batch,time,heads,head_dim].
+        residual = x
+        x = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(x)
         kernel_init = nn.initializers.normal(stddev=self.initializer_range)
         query = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="q_proj")(x)
         key = nn.Dense(kv_heads * head_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="k_proj")(x)
@@ -218,7 +225,7 @@ class Transformer(nn.Module):
         query = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="q_norm")(query)
         key = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="k_norm")(key)
         if steps:
-            starts = episode_starts.T
+            starts = episode_starts
             index = jnp.arange(steps, dtype=jnp.int32)[None, :]
             # The virtual start of a continued episode is -carry.position.
             last_reset = jax.lax.associative_scan(
@@ -293,7 +300,14 @@ class Transformer(nn.Module):
             attended = query
         attended = attended.reshape((batch, steps, self.d_model))
         y = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="out_proj")(attended)
-        return carry, jnp.swapaxes(y, 0, 1)
+        x = residual + y
+        y = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm2")(x)
+        width = 2 * self.d_model if self.d_intermediate is None else self.d_intermediate
+        gate = nn.Dense(width, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="gate_proj")(y)
+        value = nn.Dense(width, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="up_proj")(y)
+        y = nn.silu(gate) * value
+        y = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="down_proj")(y)
+        return carry, x + y
 
     def step(
         self,
@@ -307,40 +321,15 @@ class Transformer(nn.Module):
         if episode_starts is not None:
             chex.assert_shape(episode_starts, (x.shape[0],))
             chex.assert_type(episode_starts, jnp.bool_)
-        starts = None if episode_starts is None else episode_starts[None]
-        carry, y = self(x[None], carry, starts)
-        return carry, y[0]
-
-
-class _TransformerBlock(nn.Module):
-    mixer: Transformer
-    d_intermediate: int
-    norm_epsilon: float
-
-    @nn.compact
-    def __call__(
-        self, x: jax.Array, carry: TransformerCarry | None, episode_starts: jax.Array | None
-    ) -> tuple[TransformerCarry, jax.Array]:
-        chex.assert_shape(x, (None, None, self.mixer.d_model))
-        chex.assert_type(x, jnp.floating)
-        dtype = self.mixer.dtype
-        normalized = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=dtype, name="norm")(x)
-        # The mixer validates carry and episode_starts.
-        carry, y = self.mixer(normalized, carry, episode_starts)
-        x = x + y
-        y = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=dtype, name="norm2")(x)
-        kernel_init = nn.initializers.normal(stddev=self.mixer.initializer_range)
-        gate = nn.Dense(self.d_intermediate, use_bias=False, dtype=dtype, kernel_init=kernel_init, name="gate_proj")(y)
-        value = nn.Dense(self.d_intermediate, use_bias=False, dtype=dtype, kernel_init=kernel_init, name="up_proj")(y)
-        y = nn.silu(gate) * value
-        y = nn.Dense(self.mixer.d_model, use_bias=False, dtype=dtype, kernel_init=kernel_init, name="down_proj")(y)
-        return carry, x + y
+        starts = None if episode_starts is None else episode_starts[:, None]
+        carry, y = self(x[:, None], carry, starts)
+        return carry, y[:, 0]
 
 
 class TransformerStack(BlockStack[TransformerStackCarry]):
     """Modern decoder backbone with independent pre-RMSNorm/SwiGLU layers.
 
-    Same sequence/step/reset interface as Mamba3Stack. Carry is a tuple of one
+    Sequences and reset masks are batch-major. Carry is a tuple of one
     TransformerCarry per layer. The MLP width is round(mlp_expansion*d_model),
     with a default expansion of 2. Final RMSNorm defaults on; residual additions
     preserve the operands' normal dtype promotion rules.
@@ -372,10 +361,10 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
         return width
 
     @nn.nowrap
-    def _make_mixer(self) -> Transformer:
-        self._mlp_width()
-        mixer = Transformer(
+    def _make_block(self) -> TransformerBlock:
+        block = TransformerBlock(
             d_model=self.d_model,
+            d_intermediate=self._mlp_width(),
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             max_seq_len=self.max_seq_len,
@@ -386,23 +375,20 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
             initializer_range=self.initializer_range,
             parent=None,
         )
-        mixer._dimensions()
-        return mixer
+        block._dimensions()
+        return block
 
     def setup(self) -> None:
-        width = self._mlp_width()
-        self.layers = tuple(
-            _TransformerBlock(self._make_mixer(), width, self.norm_epsilon, name=f"layers_{i}")
-            for i in range(self.num_layers)
-        )
+        self._mlp_width()
+        self.layers = tuple(self._make_block().clone(parent=self, name=f"layers_{i}") for i in range(self.num_layers))
         if self.final_norm:
             self.norm_f = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
 
     @nn.nowrap
     def initial_carry(self, batch_size: int) -> TransformerStackCarry:
         """Allocate independent caches for all layers without parameter init."""
-        mixer = self._make_mixer()
-        return tuple(mixer.initial_carry(batch_size) for _ in range(self.num_layers))
+        block = self._make_block()
+        return tuple(block.initial_carry(batch_size) for _ in range(self.num_layers))
 
     def __call__(
         self,
@@ -410,7 +396,7 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
         carry: TransformerStackCarry | None = None,
         episode_starts: jax.Array | None = None,
     ) -> tuple[TransformerStackCarry, jax.Array]:
-        """Map [time,batch,d_model] to (per-layer KV caches, output)."""
+        """Map [batch,time,d_model] to (per-layer KV caches, output)."""
         chex.assert_shape(x, (None, None, self.d_model))
         chex.assert_type(x, jnp.floating)
         if carry is not None and (not isinstance(carry, tuple) or len(carry) != self.num_layers):
@@ -428,3 +414,19 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
         if self.final_norm:
             x = self.norm_f(x)
         return tuple(next_carry), x.astype(self.dtype)
+
+    def step(
+        self,
+        x: jax.Array,
+        carry: TransformerStackCarry | None = None,
+        episode_starts: jax.Array | None = None,
+    ) -> tuple[TransformerStackCarry, jax.Array]:
+        """Process [batch,d_model] using the same parameters as sequence calls."""
+        chex.assert_shape(x, (None, self.d_model))
+        chex.assert_type(x, jnp.floating)
+        if episode_starts is not None:
+            chex.assert_shape(episode_starts, (x.shape[0],))
+            chex.assert_type(episode_starts, jnp.bool_)
+        starts = None if episode_starts is None else episode_starts[:, None]
+        carry, y = self(x[:, None], carry, starts)
+        return carry, y[:, 0]

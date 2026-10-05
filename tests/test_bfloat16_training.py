@@ -10,9 +10,9 @@ import pytest
 from flax.training.train_state import TrainState
 
 from rl2.mamba3 import Mamba3, Mamba3Carry, Mamba3Stack, Mamba3StackCarry
-from rl2.transformer import Transformer, TransformerCarry, TransformerStack, TransformerStackCarry
+from rl2.transformer import TransformerBlock, TransformerCarry, TransformerStack, TransformerStackCarry
 
-type Model = Mamba3 | Mamba3Stack | Transformer | TransformerStack
+type Model = Mamba3 | Mamba3Stack | TransformerBlock | TransformerStack
 type Carry = Mamba3Carry | Mamba3StackCarry | TransformerCarry | TransformerStackCarry
 type Parameters = dict[str, Any]
 type LossOutput = tuple[jax.Array, tuple[Carry, jax.Array]]
@@ -25,7 +25,9 @@ type LossOutput = tuple[jax.Array, tuple[Carry, jax.Array]]
         pytest.param(
             Mamba3(8, d_state=8, headdim=4, mimo_rank=2, outproj_norm=True, dtype=jnp.bfloat16), id="mamba-mimo"
         ),
-        pytest.param(Transformer(8, num_heads=2, num_kv_heads=1, max_seq_len=6, dtype=jnp.bfloat16), id="transformer"),
+        pytest.param(
+            TransformerBlock(8, num_heads=2, num_kv_heads=1, max_seq_len=6, dtype=jnp.bfloat16), id="transformer"
+        ),
         *[
             pytest.param(
                 Mamba3Stack(
@@ -69,18 +71,31 @@ def test_bfloat16_chunked_gradients_and_adam_training(model: Model) -> None:
     x = jax.random.normal(jax.random.key(20), (6, 2, model.d_model)).astype(jnp.bfloat16)
     target = jax.random.normal(jax.random.key(21), x.shape)
     starts = jnp.zeros((6, 2), jnp.bool_).at[4, 0].set(True)
-    params = model.init(jax.random.key(22), x)["params"]
+    batch_major = isinstance(model, (TransformerBlock, TransformerStack))
+    params = model.init(jax.random.key(22), jnp.swapaxes(x, 0, 1) if batch_major else x)["params"]
+
+    def apply_sequence(
+        parameters: Parameters, inputs: jax.Array, resets: jax.Array, carry: Carry | None = None
+    ) -> tuple[Carry, jax.Array]:
+        chex.assert_shape(inputs, (None, 2, model.d_model))
+        chex.assert_type(inputs, jnp.bfloat16)
+        chex.assert_shape(resets, inputs.shape[:2])
+        chex.assert_type(resets, jnp.bool_)
+        if batch_major:
+            carry, output = model.apply({"params": parameters}, jnp.swapaxes(inputs, 0, 1), carry, resets.T)
+            return carry, jnp.swapaxes(output, 0, 1)
+        return model.apply({"params": parameters}, inputs, carry, resets)
 
     def loss(parameters: Parameters, inputs: jax.Array, chunked: bool) -> LossOutput:
         chex.assert_shape(inputs, (6, 2, model.d_model))
         chex.assert_type(inputs, jnp.bfloat16)
         chex.assert_type(jax.tree.leaves(parameters), jnp.float32)
         if chunked:
-            carry, first = model.apply({"params": parameters}, inputs[:3], episode_starts=starts[:3])
-            carry, second = model.apply({"params": parameters}, inputs[3:], carry, starts[3:])
+            carry, first = apply_sequence(parameters, inputs[:3], starts[:3])
+            carry, second = apply_sequence(parameters, inputs[3:], starts[3:], carry)
             output = jnp.concatenate((first, second))
         else:
-            carry, output = model.apply({"params": parameters}, inputs, episode_starts=starts)
+            carry, output = apply_sequence(parameters, inputs, starts)
         chex.assert_type(output, jnp.bfloat16)
         return jnp.mean(jnp.square(output.astype(jnp.float32) - target)), (carry, output)
 

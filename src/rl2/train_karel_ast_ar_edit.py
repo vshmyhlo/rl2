@@ -335,7 +335,8 @@ class EditTransformer(nn.Module):
     def __call__(self, history: History) -> ModelOutput:
         """Encode the complete causal history and return its cache and next-action logits."""
         inputs = self.encode_events(history.events, history.initial, history.target)
-        carry, features = self.backbone(inputs)
+        carry, features = self.backbone(jnp.swapaxes(inputs, 0, 1))
+        features = jnp.swapaxes(features, 0, 1)
         return EditCarry(carry, history.initial, history.target), self.head(features).astype(jnp.float32)
 
     def prefill(self, history: History) -> ModelOutput:

@@ -110,7 +110,11 @@ class KarelProgramModel(nn.Module):
         chex.assert_shape(tokens, (None, context.shape[0]))
         chex.assert_type(tokens, jnp.int32)
         inputs = jnp.concatenate((context[None], self.token_embedding(tokens)), axis=0)
-        carry, features = self.backbone(inputs)
+        if self.backbone_type == "transformer":
+            carry, features = self.backbone(jnp.swapaxes(inputs, 0, 1))
+            features = jnp.swapaxes(features, 0, 1)
+        else:
+            carry, features = self.backbone(inputs)
         return carry, self.head(features).astype(jnp.float32)
 
     def prefill(self, initial: jax.Array, target: jax.Array) -> KarelModelOutput:
