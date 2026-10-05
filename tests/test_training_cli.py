@@ -6,7 +6,9 @@ import jax
 import pytest
 
 
-@pytest.mark.parametrize("name", ["ppo", "ppo_rnd", "train_karel_ast_grpo", "train_karel_grpo", "train_wm"])
+@pytest.mark.parametrize(
+    "name", ["ppo", "ppo_rnd", "train_karel_ast_grpo", "train_karel_ast_ar_edit", "train_karel_grpo", "train_wm"]
+)
 def test_training_configures_cache_before_initialization(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
     module = importlib.import_module(f"rl2.{name}")
     configure_cache = MagicMock(side_effect=RuntimeError("cache configured before model or environment setup"))
@@ -16,7 +18,9 @@ def test_training_configures_cache_before_initialization(name: str, monkeypatch:
     configure_cache.assert_called_once_with()
 
 
-@pytest.mark.parametrize("name", ["ppo", "ppo_rnd", "train_karel_ast_grpo", "train_karel_grpo", "train_wm"])
+@pytest.mark.parametrize(
+    "name", ["ppo", "ppo_rnd", "train_karel_ast_grpo", "train_karel_ast_ar_edit", "train_karel_grpo", "train_wm"]
+)
 def test_training_cli_uses_environment_backend(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
     module = importlib.import_module(f"rl2.{name}")
     config = object()
@@ -36,7 +40,9 @@ def test_training_cli_uses_environment_backend(name: str, monkeypatch: pytest.Mo
     update_config.assert_not_called()
 
 
-@pytest.mark.parametrize("name", ["ppo", "ppo_rnd", "train_karel_ast_grpo", "train_karel_grpo", "train_wm"])
+@pytest.mark.parametrize(
+    "name", ["ppo", "ppo_rnd", "train_karel_ast_grpo", "train_karel_ast_ar_edit", "train_karel_grpo", "train_wm"]
+)
 def test_training_cli_rejects_platform_option(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
     module = importlib.import_module(f"rl2.{name}")
     train = MagicMock()

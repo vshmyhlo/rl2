@@ -1,0 +1,69 @@
+seed: 1
+total_updates: 100000
+num_tasks: 32
+group_size: 8 # Independent editing episodes per task, all starting from seed_program
+num_minibatches: 4 # Must divide num_tasks * group_size; episodes stay together
+update_epochs: 1
+max_edits: 3 # Complete subtree replacements; STOP may end the episode sooner
+seed_program: "DEF run m( turnLeft m)"
+max_nodes: 64 # Whole candidate tree, including lists and values
+max_depth: 16 # AST edges, including lists
+replay_batch_size: 4 # Whole episode sequences per gradient microbatch; accumulate before one update
+bf16: true
+attention_implementation: cudnn # Use xla for CPU
+d_model: 256
+num_layers: 8
+num_heads: 8
+num_kv_heads: null
+learning_rate: 0.0001
+anneal_lr: true
+clip_coef: 0.2 # Per decoder decision, including location selection and STOP
+target_kl: 0.02
+entropy_coef: 0.01
+max_grad_norm: 1.0
+log_dir: gs://cohere-dev/vlad/rl2/karel_ast_ar_edit # Local or gs:// path
+run_id: v3 # Causal model: use a new run; incompatible with the previous tree-encoder checkpoints
+checkpoint_interval_seconds: 300
+log_interval: 10
+log_program_interval: 10
+log_program_count: 4
+log_compiles: true
+# Causal Transformer with KV caching: task -> seed tokens -> execution update -> actions -> update -> ...
+# Each edit chooses a location, then expands ONE DFS hole per action token.
+# Feedback enters the sequence only after executing a complete candidate.
+# Cache capacity is derived: 2 + max_nodes + max_edits * (1 + max_nodes) + max_edits.
+# Replay uses full causal histories; seed, update and padding predictions have no policy loss.
+# Replacement size varies; masks reserve enough space to complete every hole.
+# Execute only complete candidates, always from the original input grid.
+# Feedback: last final/partial grid, reward, success/error, ticks, size, edits left.
+# Final candidate reward trains every decision in the episode using GRPO.
+# Regressive edits are accepted; success does not force early stopping.
+env:
+  height: 8
+  width: 8
+  wall_probability: 0.1
+  marker_probability: 0.2
+  max_markers: 10
+  max_depth: 2
+  max_statements: 3
+  max_program_tokens: 128
+  max_execution_steps: 256
+  max_sampling_attempts: 10000
+  task_easy_weight: 0.20
+  task_navigation_weight: 0.30
+  task_marker_weight: 0.25
+  task_combined_weight: 0.25
+  navigation_min_distance: 3
+  marker_min_edits: 3
+  combined_min_distance: 2
+  combined_min_edits: 2
+  syntax_weight: 0.0
+  runtime_weight: 0.0
+  distance_weight: 1.0
+  success_weight: 1.0
+  position_weight: 1.0
+  orientation_weight: 1.0
+  marker_weight: 1.0
+  trajectory_weight: 0.0
+  length_penalty_weight: 0.05
+  execution_penalty_weight: 0.05
