@@ -15,7 +15,7 @@ def config() -> editing.EditConfig:
     return editing.EditConfig(
         max_nodes=8,
         max_depth=4,
-        max_seq_len=12,
+        max_seq_len=10,
         env=KarelConfig(
             height=3,
             width=3,
@@ -56,7 +56,7 @@ def test_improvement_regression_and_stop(config: editing.EditConfig, monkeypatch
     monkeypatch.setattr(editing, "evaluate", evaluate)
     initial = env.reset(task=turning_task(config))
     assert initial.feedback[-2] == 0 and evaluate.call_count == 1
-    assert env.remaining == 7  # Four seed tokens and one initial UPDATE consumed.
+    assert env.remaining == 5  # Four seed tokens and one initial UPDATE consumed.
     seed_score = env.seed_score
     first = env.step(3)  # Select the primitive statement.
     assert first.reward == 0 and not first.reevaluated
@@ -67,7 +67,7 @@ def test_improvement_regression_and_stop(config: editing.EditConfig, monkeypatch
     assert improved.observation.feedback[-2] == pytest.approx(improved.reward)
     assert env.result.success and not env.done  # Success permits further edits.
     assert evaluate.call_count == 2
-    assert env.remaining == 4  # Location + replacement + execution UPDATE.
+    assert env.remaining == 3  # Location + replacement; feedback adds no token.
     assert env.step(3).reward == 0
     regressed = env.step(1 + config.max_nodes + ACTION_ID["turnLeft"])
     assert regressed.reward == pytest.approx(-improved.reward)
@@ -86,7 +86,7 @@ def test_improvement_regression_and_stop(config: editing.EditConfig, monkeypatch
 
 
 def test_runtime_failure_at_budget_boundary(config: editing.EditConfig) -> None:
-    config = replace(config, max_seq_len=8)
+    config = replace(config, max_seq_len=7)
     env = editing.KarelASTEditEnv(config)
     task = turning_task(config)
     env.reset(task=task)

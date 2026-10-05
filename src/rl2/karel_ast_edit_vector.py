@@ -46,7 +46,7 @@ def _reset_worker(tasks: list[KarelProgramEnv]) -> list[Observation]:
 
 
 def _step_worker(actions: list[int | None]) -> list[EditStep | None]:
-    """Step selected members; None leaves both completed and feedback-waiting members untouched."""
+    """Step selected members; None leaves paused or completed members untouched."""
     return [env.step(action) if action is not None else None for env, action in zip(_worker_envs, actions, strict=True)]
 
 

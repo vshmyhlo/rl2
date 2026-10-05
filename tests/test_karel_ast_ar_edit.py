@@ -36,7 +36,7 @@ def config() -> edit.Config:
         num_heads=2,
         max_nodes=8,
         max_depth=4,
-        max_seq_len=16,
+        max_seq_len=14,
         target_kl=None,
         entropy_coef=0.01,
         log_interval=1,
@@ -397,13 +397,9 @@ def test_generation_executes_atomic_replacements(
         chex.assert_type(logits, jnp.float32)
         chex.assert_shape(key, ())
         chex.assert_type(jax.random.key_data(key), jnp.uint32)
-        # Forced UPDATE positions have only dummy STOP and are not policy actions.
-        if np.isfinite(logits[0, 0]) and np.isfinite(logits).sum() == 1:
-            action = 0
-        else:
-            action = script[len(selected)]
-            assert np.isfinite(logits[0, action])
-            selected.append(action)
+        action = script[len(selected)]
+        assert np.isfinite(logits[0, action])
+        selected.append(action)
         actions = jnp.asarray([action], jnp.int32)
         return actions, edit.action_log_prob(logits, actions)
 
@@ -416,11 +412,11 @@ def test_generation_executes_atomic_replacements(
     assert result.tokens() == ("DEF", "run", "m(", "putMarker", "turnLeft", "m)")
     assert selected == script and evaluate.call_count == 3  # Seed plus two complete edits.
     consumed = [call.args[1] for call in step.call_args_list]
-    updates = [event for event in consumed if event.kind[0] == edit.UPDATE_EVENT]
-    assert len(updates) == 1 and updates[0].feedback[0, -1] == pytest.approx(3 / config.max_seq_len)
-    assert len(consumed) == len(script)  # Nonterminal actions plus one intervening update.
-    assert consumed[len(grammar) + 1].kind[0] == edit.UPDATE_EVENT
-    assert updates[0].feedback.shape[-1] == 8
+    assert len(consumed) == len(script) - 1  # Every nonterminal action is decoded exactly once.
+    assert all(event.kind[0] == edit.ACTION_EVENT for event in consumed)
+    completion = consumed[len(grammar)]
+    assert completion.feedback[0, -1] == pytest.approx(2 / config.max_seq_len)
+    assert completion.feedback.shape[-1] == 8
     assert KarelProgramEnv(config.env).reset_from(task) is not None
     with pytest.raises(ValueError, match="limits"):
         edit.generate(state, task, jax.random.key(7), replace(config, env=replace(config.env, max_execution_steps=1)))
@@ -513,11 +509,11 @@ def test_history_is_causal_and_retains_action_and_update_context(
     np.testing.assert_allclose(predict(state, padded)[: last + 1], logits[: last + 1], atol=1e-6)
 
 
-def test_asynchronous_updates_and_finished_padding_replay_exactly(
+def test_action_feedback_and_finished_padding_replay_exactly(
     config: edit.Config, state: TrainState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # One member stops immediately; the other must consume execution feedback
-    # between edits. This exercises simultaneous action/update/PAD stream phases.
+    # on the completing action. Finished members contribute only PAD.
     grammar = program_actions(("DEF", "run", "m(", "turnRight", "turnLeft", "m)"))
     scripts = [[0], [1, *(1 + config.max_nodes + a for a in grammar), 3, 1 + config.max_nodes + ACTION_ID["putMarker"]]]
     offsets = [0, 0]
@@ -545,14 +541,17 @@ def test_asynchronous_updates_and_finished_padding_replay_exactly(
     np.testing.assert_array_equal(batch.actions[batch.mask[:, 1], 1], scripts[1])
     events = batch.history.events
     initial_update = len(program_actions(tuple(config.seed_program.split())))
-    later = np.flatnonzero(events.kind[initial_update + 1 :, 1] == edit.UPDATE_EVENT) + initial_update + 1
-    assert len(later) == 1
-    assert not batch.mask[later[0] - 1, 1] and batch.mask[later[0], 1]
-    assert events.feedback[later[0], 1, -1] == pytest.approx(3 / config.max_seq_len)
-    assert events.feedback[later[0], 1, -2] == pytest.approx(batch.rewards[later[0] - 2, 1])
-    # The image switches on the action that completes the edit and remains the
-    # same through the following update and unfinished replacement actions.
-    completion = later[0] - 1
+    assert not np.any(events.kind[initial_update + 1 :] == edit.UPDATE_EVENT)
+    completion = initial_update + 1 + len(grammar)
+    assert events.kind[completion, 1] == edit.ACTION_EVENT
+    assert batch.mask[completion - 1, 1] and batch.mask[completion, 1]
+    # No missing decision positions between the seed report and terminal action.
+    np.testing.assert_array_equal(
+        np.flatnonzero(batch.mask[:, 1]), np.arange(initial_update, initial_update + len(scripts[1]))
+    )
+    assert events.feedback[completion, 1, -1] == pytest.approx(2 / config.max_seq_len)
+    assert events.feedback[completion, 1, -2] == pytest.approx(batch.rewards[completion - 1, 1])
+    # The image switches with the completing action and persists through partial edits.
     np.testing.assert_array_equal(
         events.output[:completion, 1],
         np.broadcast_to(events.output[0, 1], events.output[:completion, 1].shape),
@@ -575,7 +574,13 @@ def test_asynchronous_updates_and_finished_padding_replay_exactly(
     changed = batch.history._replace(events=events._replace(value=values))
     changed_logits = predict(state, changed)
     np.testing.assert_array_equal(changed_logits[:action_index], logits[:action_index])
-    assert not np.allclose(changed_logits[later[0], 1], logits[later[0], 1])
+    assert not np.allclose(changed_logits[completion, 1], logits[completion, 1])
+    feedback = np.array(events.feedback)
+    feedback[completion, 1, 0] += 10
+    changed = batch.history._replace(events=events._replace(feedback=feedback))
+    feedback_logits = predict(state, changed)
+    np.testing.assert_array_equal(feedback_logits[:completion], logits[:completion])
+    assert not np.allclose(feedback_logits[completion, 1], logits[completion, 1])
 
 
 def test_sequence_budget_reserves_complete_replacements(config: edit.Config) -> None:
@@ -585,21 +590,20 @@ def test_sequence_budget_reserves_complete_replacements(config: edit.Config) -> 
     result = editing.evaluate(tree, task, KarelProgramEnv(config.env), pair.initial)
     only_stop = editing.observe(tree, pair, result, 1, config).legal
     assert np.flatnonzero(only_stop).tolist() == [0]
-    assert np.flatnonzero(editing.observe(tree, pair, result, 2, config).legal).tolist() == [0]
-    three_tokens = editing.observe(tree, pair, result, 3, config).legal
-    assert three_tokens[3]  # Select the primitive statement, then replace it with a leaf.
-    assert not three_tokens[1]  # Replacing Program needs more than one grammar action.
-    assert editing.observe(tree, pair, result, 6, config).legal[1]  # Location + four-node completion + update.
+    two_tokens = editing.observe(tree, pair, result, 2, config).legal
+    assert two_tokens[3]  # Select the primitive statement, then replace it with a leaf.
+    assert not two_tokens[1]  # Replacing Program needs more than one grammar action.
+    assert editing.observe(tree, pair, result, 5, config).legal[1]  # Location + four-node completion.
 
     # Root replacement has two sibling holes after Program/ConsNonEmpty. Both
-    # need a reserved action, plus one token for their execution update.
+    # need a reserved action each; feedback costs no extra token.
     partial = editing.open_subtree(tree, 0).expand(ACTION_ID["Program"]).expand(ACTION_ID["ConsNonEmpty"])
-    legal = editing.observe(partial, pair, result, 3, config).legal
+    legal = editing.observe(partial, pair, result, 2, config).legal
     offset = 1 + config.max_nodes
     assert legal[offset + ACTION_ID["move"]]
     assert not legal[offset + ACTION_ID["REPEAT"]]
     partial = partial.expand(ACTION_ID["turnRight"])
-    legal = editing.observe(partial, pair, result, 2, config).legal
+    legal = editing.observe(partial, pair, result, 1, config).legal
     assert np.flatnonzero(legal).tolist() == [offset + ACTION_ID["End"]]
     assert partial.expand(ACTION_ID["End"]).complete
 
@@ -607,8 +611,8 @@ def test_sequence_budget_reserves_complete_replacements(config: edit.Config) -> 
 def test_more_than_three_edits_fit_sequence_budget(
     config: edit.Config, state: TrainState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Four location+leaf+update edits fill the sequence after the five-token seed prefill.
-    config = replace(config, max_seq_len=17)
+    # Four location+leaf edits fill the sequence after the five-token seed prefill.
+    config = replace(config, max_seq_len=13)
     task = KarelProgramEnv(config.env)
     pair = task.reset(seed=4)
     state = edit.create_state(config, pair.initial[None], pair.target[None]).replace(params=state.params)
@@ -626,7 +630,7 @@ def test_more_than_three_edits_fit_sequence_budget(
             elif allowed[1 + config.max_nodes + ACTION_ID["turnRight"]]:
                 actions[index] = 1 + config.max_nodes + ACTION_ID["turnRight"]
             else:
-                assert allowed[0]  # Forced update or final STOP.
+                assert allowed[0]  # Final STOP.
         actions = jnp.asarray(actions)
         return actions, edit.action_log_prob(logits, actions)
 

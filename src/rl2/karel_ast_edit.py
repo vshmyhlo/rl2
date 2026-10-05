@@ -97,7 +97,7 @@ def open_subtree(tree: KarelAST, position: int) -> KarelAST:
 
 
 class Observation(NamedTuple):
-    """Host-side edit state used to build masks and execution-update events."""
+    """Host-side edit state returned with every action transition."""
 
     initial: NDArray[np.int32]
     target: NDArray[np.int32]
@@ -170,19 +170,19 @@ def observe(
     legal = np.zeros(1 + config.max_nodes + len(AST_ACTIONS), np.bool_)
     if tree.complete:
         legal[0] = True
-        # Reserve the location action, cheapest typed replacement, and execution update.
+        # Reserve the location action plus the cheapest typed replacement.
         # In this grammar minimum-node completions also minimize source length.
         for position, index in enumerate(tree.preorder()):
-            legal[1 + position] = 2 + int(tree._costs(index).min()) <= tokens_left
+            legal[1 + position] = 1 + int(tree._costs(index).min()) <= tokens_left
     else:
         # One grammar expansion resolves exactly one node. Reserve actions for
-        # ALL remaining holes plus the execution update after completion.
+        # ALL remaining holes. Feedback travels with the completing action.
         frontier = tree.frontier
         assert frontier is not None
         costs = tree._costs(frontier)
         resolved = sum(not node.is_hole for node in tree.nodes)
         required = tree._minimum_completion() - resolved
-        legal[1 + config.max_nodes :] = tree.allowed_actions() & (required - costs.min() + costs + 1 <= tokens_left)
+        legal[1 + config.max_nodes :] = tree.allowed_actions() & (required - costs.min() + costs <= tokens_left)
     feedback = np.asarray(
         [
             result.score,
@@ -217,9 +217,9 @@ class KarelASTEditEnv:
     preorder locations 1..max_nodes, or offset grammar IDs. A completed edit
     refreshes execution feedback and yields its signed score improvement.
     STOP terminates normally; completing an edit at the sequence limit truncates.
-    Seed tokens, the initial update, actions, and each completed edit's update
-    share max_seq_len. step() charges the update token when an edit completes,
-    including a terminal edit whose feedback need not be decoded.
+    Seed tokens, the initial report, and action/result tokens share max_seq_len.
+    Every step costs one token; execution feedback is part of that action's
+    resulting observation, with no additional token or pause.
     Both are terminal for this finite-budget optimization objective.
     """
 
@@ -283,7 +283,6 @@ class KarelASTEditEnv:
                     reward = self.result.score - previous_score
                     reevaluated = True
                     self.completed_edits += 1
-                    self.remaining -= 1  # Reserve the completed edit's execution UPDATE.
         truncated = self.remaining == 0 and not terminated
         self.done = terminated or truncated
         if self.done and not self.tree.complete:

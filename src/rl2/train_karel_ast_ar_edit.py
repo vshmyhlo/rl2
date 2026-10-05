@@ -1,14 +1,13 @@
 """Execution-guided autoregressive Karel editing with improvement rewards.
 
 The policy consumes a causal sequence with a persistent KV cache:
-    seed DFS tokens -> execution update -> edit actions
-               -> execution update -> more edit actions -> ... -> STOP
+    seed DFS tokens -> initial execution report -> action/result -> action/result -> ... -> STOP
 Every token, including seed prefill, receives the original input,
 target, and current execution image. These 18 channels pass through a shared
 32-channel 1x1 convolution, GELU, flattening, and projection. This image embedding
 is added to each event embedding. The current image starts at the seed's final
 or last-valid output and changes only when a complete edit is re-evaluated.
-The completing action carries the new image; its following UPDATE supplies
+Each action carries its resulting image and
 eight feedback scalars: score, success, runtime error, execution limit,
 normalized ticks, source length, last score difference, and remaining sequence budget.
 KarelASTEditEnv owns AST edits, masks, execution, rewards, and termination. The
@@ -30,12 +29,12 @@ Example 1: the target requires one right turn (max_seq_len=17).
     S0 -- select the turnLeft statement --> (r=0, S1)
     S1: <Statement>; unchanged execution feedback; sequence tokens left=11
     S1 -- turnRight --> (r=S_right-S_left, S2)
-    S2: turnRight; execute and refresh score/grid/delta; sequence tokens left=9
+    S2: turnRight; execute and refresh score/grid/delta; sequence tokens left=10
     S2 -- STOP --> (r=0, Terminal)
 
     SEED(Program,ConsNonEmpty,turnLeft,End)
-        -> UPDATE(seed score,delta=0) -> ACTION(select) -> ACTION(turnRight)
-        -> UPDATE(new score,delta=S_right-S_left) -> ACTION(STOP)
+        -> UPDATE(seed score,delta=0) -> ACTION(select; resulting observation)
+        -> ACTION(turnRight; new score/grid,delta=S_right-S_left) -> ACTION(STOP)
 
 Example 2: replace a statement with REPEAT 3 { move }.
 
@@ -120,7 +119,7 @@ class Config:
     seed_program: str = "DEF run m( turnLeft m)"
     max_nodes: int = 128  # AST node budget for grammar masking; also sizes edit locations.
     max_depth: int = 64  # AST depth limit for grammar masking only.
-    max_seq_len: int = 256  # Total seed, action, and execution-update tokens per episode.
+    max_seq_len: int = 256  # Total seed tokens, one initial report, and action/result tokens per episode.
 
     # Rollout groups and update batching.
     num_tasks: int = 8
@@ -221,7 +220,7 @@ class Events(NamedTuple):
     NamedTuple makes this a JAX pytree; tree.map preserves its type and fields.
     kind/value: int32 [T,B] (or [B]); output: int32 [T,B,H,W,6];
     feedback: float32 [T,B,8]. Every event carries the latest execution image;
-    only UPDATE events use feedback scalars.
+    ACTION events carry resulting feedback scalars; UPDATE is used only for the initial seed report.
     SEED values are the initial program's DFS grammar actions in policy IDs.
     ACTION values are sampled location/grammar/STOP IDs. PAD is trailing only.
     """
@@ -250,7 +249,7 @@ type ModelOutput = tuple[EditCarry, jax.Array]
 
 
 class EditTransformer(nn.Module):
-    """Causal seed -> update -> actions -> update stream with a KV cache.
+    """Causal seed -> initial update -> action/result stream with a KV cache.
 
     __call__ returns logits [T,B,V]; row t consumes event t and predicts the
     next event. Loss applies only when that next event is a sampled action;
@@ -327,7 +326,9 @@ class EditTransformer(nn.Module):
         context = self.context_norm(self.context_projection(grids))
         update = self.feedback_norm(self.feedback_projection(events.feedback))
         token = self.token_embedding(events.value)
-        x = jnp.where((events.kind == UPDATE_EVENT)[..., None], update, token)
+        x = jnp.where((events.kind == UPDATE_EVENT)[..., None], 0, token)
+        has_feedback = (events.kind == ACTION_EVENT) | (events.kind == UPDATE_EVENT)
+        x += jnp.where(has_feedback[..., None], update, 0)
         x += context + self.kind_embedding(events.kind)
         return jnp.where((events.kind != PAD_EVENT)[..., None], x, 0)
 
@@ -500,11 +501,10 @@ def run_episodes(
     key: jax.Array,
     config: Config,
 ) -> EpisodeResults:
-    """One causal stream per episode; forced updates interleave asynchronously.
+    """Step active episodes and feed each action together with its resulting observation.
 
-    The logits after an action completing an edit do NOT choose the next action:
-    first consume its execution UPDATE, then sample using the new logits. Other
-    batch members may still be emitting grammar actions at the same stream index.
+    Completing an edit immediately refreshes the action token's image and
+    feedback. Its logits choose the next action with no intervening event.
     Finished members only consume trailing PAD, with no further policy loss.
     """
     count = len(tasks)
@@ -526,10 +526,8 @@ def run_episodes(
     legal = np.zeros((*shape, 1 + config.max_nodes + len(AST_ACTIONS)), np.bool_)
     legal[..., 0] = True
     active = np.ones(count, np.bool_)
-    pending_update = np.zeros(count, np.bool_)
     for _ in range(config.max_seq_len - position - 1):
-        ready = active & ~pending_update
-        updates = active & pending_update
+        ready = active.copy()
         for index in np.flatnonzero(ready):
             legal[position, index] = observations[index].legal
         key, sample_key = jax.random.split(key)
@@ -540,10 +538,6 @@ def run_episodes(
         transitions = envs.step(sampled, ready)
         event = jax.tree.map(itemgetter(0), empty_events(1, count, config))
         event.output[:] = np.stack([observation.output for observation in observations])
-        for index in np.flatnonzero(updates):
-            event.kind[index] = UPDATE_EVENT
-            event.feedback[index] = observations[index].feedback
-            pending_update[index] = False
         for index in np.flatnonzero(ready):
             action = int(sampled[index])
             event.kind[index] = ACTION_EVENT
@@ -553,8 +547,8 @@ def run_episodes(
             rewards[position, index] = transition.reward
             observations[index] = transition.observation
             event.output[index] = transition.observation.output
+            event.feedback[index] = transition.observation.feedback
             active[index] = not (transition.terminated or transition.truncated)
-            pending_update[index] = active[index] and transition.reevaluated
         if not active.any():
             break
         for destination, value in zip(stored, event):
@@ -600,7 +594,7 @@ def collect_rollout(
     grouped = rewards.reshape(config.num_tasks, config.group_size)
     batch = batch._replace(advantages=np.asarray(group_advantages(grouped)).reshape(-1))
     successes = np.asarray([result.success for result in results])
-    sequence_lengths = config.edit_config.prefill_length + batch.mask.sum(axis=0) + completed_edits
+    sequence_lengths = config.edit_config.prefill_length + batch.mask.sum(axis=0)
     # Final candidate sizes; AST depth counts edges from the root, including list nodes.
     node_count_mean = float(np.mean([len(tree.nodes) for tree in programs]))
     depth_mean = float(np.mean([max(node.depth for node in tree.nodes) for tree in programs]))

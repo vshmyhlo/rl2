@@ -26,7 +26,7 @@ def test_parallel_matches_local_masked_steps_and_cleans_up() -> None:
     config = EditConfig(
         max_nodes=8,
         max_depth=4,
-        max_seq_len=11,
+        max_seq_len=9,
         env=KarelConfig(height=3, width=3, max_depth=0, max_statements=1, max_program_tokens=8),
     )
     tasks = [KarelProgramEnv(config.env) for _ in range(3)]
@@ -56,7 +56,7 @@ def test_parallel_matches_local_masked_steps_and_cleans_up() -> None:
                 assert_transition_equal(actual, expected)
         actual, expected = parallel.summaries(), local.summaries()
         assert [summary.completed_edits for summary in actual] == [0, 2, 1]
-        assert [summary.remaining for summary in actual] == [5, 0, 2]
+        assert [summary.remaining for summary in actual] == [3, 0, 1]
         for left, right in zip(actual, expected, strict=True):
             assert left.tree == right.tree
             assert left[2:] == right[2:]
