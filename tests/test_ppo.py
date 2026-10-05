@@ -393,9 +393,10 @@ class SyntheticAtariEnv(gym.Env):
         output.fill(self.steps)
 
 
-@pytest.mark.parametrize("end_step", (1, 2, 3, 4))
-@pytest.mark.parametrize("terminated", (False, True))
-@pytest.mark.parametrize("grayscale", (False, True))
+# Every action-repeat offset matters; color and end flags do not require a product.
+@pytest.mark.parametrize(
+    "end_step,terminated,grayscale", [(1, False, False), (2, True, True), (3, False, True), (4, True, False)]
+)
 def test_preprocessing_returns_final_screen(end_step: int, terminated: bool, grayscale: bool) -> None:
     with ppo.AtariPreprocessing(SyntheticAtariEnv(end_step, terminated), noop_max=0, grayscale_obs=grayscale) as env:
         env.reset(seed=0)
@@ -444,8 +445,7 @@ def test_invalid_video_frame_budget_fails_before_environment_creation(frame_budg
     create_env.assert_not_called()
 
 
-@pytest.mark.parametrize("terminated", (False, True))
-@pytest.mark.parametrize("frame_budget", (None, 10))
+@pytest.mark.parametrize("frame_budget,terminated", [(None, True), (10, False)])
 def test_video_recording_stops_at_episode_end(frame_budget: int | None, terminated: bool) -> None:
     from unittest.mock import Mock
 

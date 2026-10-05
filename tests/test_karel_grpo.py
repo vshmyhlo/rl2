@@ -141,7 +141,7 @@ def test_parallel_sampling_matches_serial_and_propagates_errors(config: grpo.Con
             grpo._reset_environments(failed_envs, parallel_rng, impossible, executor)
 
 
-@pytest.mark.parametrize("budget", [5, 12, 32])
+@pytest.mark.parametrize("budget", [pytest.param(5, id="minimum"), pytest.param(12, id="branching")])
 def test_generation_finishes_at_budget_and_is_deterministic(config: grpo.Config, budget: int) -> None:
     config = replace(config, env=replace(config.env, max_program_tokens=budget))
     grids = jnp.zeros((2, 3, 3, 6), jnp.int32)

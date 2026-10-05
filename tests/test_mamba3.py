@@ -18,8 +18,8 @@ def assert_carry_close(actual: Mamba3Carry, expected: Mamba3Carry) -> None:
         np.testing.assert_allclose(a, b, rtol=2e-5, atol=2e-6)
 
 
-@pytest.mark.parametrize("rank", [1, 3])
-@pytest.mark.parametrize("trap", [0.0, 0.37, 1.0])
+# Check both discretization endpoints once, and both rotation layouts in the interior.
+@pytest.mark.parametrize("rank,trap", [(1, 0.0), (1, 1.0), (1, 0.37), (3, 0.37)])
 def test_recurrence_matches_independent_complex_ssm(rank: int, trap: float) -> None:
     """Compare rotary B/C implementation to an explicitly complex transition.
 
@@ -179,8 +179,8 @@ def test_invalid_input_and_carry_shapes() -> None:
         model.apply(variables, x[0], episode_starts=jnp.zeros((1, 2)), method=model.step)
 
 
-# Cover each rank with both RoPE fractions and normalization modes, and
-# exercise both full and chunked gradients without their Cartesian product.
+# SISO and MIMO have different rotation layouts; larger MIMO ranks share a path.
+# Cover both RoPE fractions, normalization modes, and full/chunked gradients.
 @pytest.mark.parametrize(
     "rank,fraction,norm,chunk_size",
     [
@@ -188,8 +188,6 @@ def test_invalid_input_and_carry_shapes() -> None:
         (1, 1.0, True, 2),
         (2, 0.5, True, 6),
         (2, 1.0, False, 2),
-        (4, 0.5, False, 2),
-        (4, 1.0, True, 6),
     ],
 )
 def test_matches_official_module_outputs_states_and_gradients(

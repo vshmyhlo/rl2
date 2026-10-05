@@ -85,7 +85,7 @@ def test_reference_solutions_preserve_execution() -> None:
         np.testing.assert_array_equal(execute_program(tree.tokens(), task.initial), task.target)
 
 
-@pytest.mark.parametrize("nodes,depth", [(4, 2), (5, 2), (8, 3), (16, 8), (128, 64)])
+@pytest.mark.parametrize("nodes,depth", [(4, 2), (16, 8)])  # Minimum tree and room for branching.
 def test_every_masked_expansion_can_finish_in_budget(nodes: int, depth: int) -> None:
     rng = np.random.default_rng(25)
     for _ in range(3):
@@ -172,7 +172,7 @@ def test_reference_exceeding_ast_budget_is_rejected() -> None:
         teacher_forcing(("DEF", "run", "m(", "move", "turnLeft", "m)"), max_nodes=4, max_depth=2)
 
 
-@pytest.mark.parametrize("budget", [5, 6, 9, 11, 15, 32])
+@pytest.mark.parametrize("budget", [5, 15])  # Minimum and branching; exact construct limits are tested below.
 def test_source_budget_always_allows_completion(budget: int) -> None:
     rng = np.random.default_rng(53)
     for _ in range(3):
@@ -265,7 +265,7 @@ def test_parallel_round_expands_old_holes_only_and_preserves_positions() -> None
     assert tree.expand_round(np.zeros(tree.max_nodes, np.int32)) == tree
 
 
-@pytest.mark.parametrize("nodes,depth,tokens", [(4, 2, 5), (8, 3, 6), (16, 8, 11), (64, 16, 32), (128, 64, None)])
+@pytest.mark.parametrize("nodes,depth,tokens", [(4, 2, 5), (16, 8, 11), (16, 8, None)])
 def test_parallel_samples_complete_within_all_budgets(nodes: int, depth: int, tokens: int | None) -> None:
     rng = np.random.default_rng(71)
     for _ in range(3):

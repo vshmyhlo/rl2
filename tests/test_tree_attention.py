@@ -39,7 +39,7 @@ def _oracle(parents: list[int]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return kind, distance, depth_delta + MAX_RELATIVE_DEPTH
 
 
-@pytest.mark.parametrize("size", [1, 8, 40])
+@pytest.mark.parametrize("size", [1, 40])  # Singleton and a tree deep enough to saturate distance buckets.
 def test_relations_match_parent_chain_oracle(size: int) -> None:
     rng = np.random.default_rng(12)
     # Include a deep chain for saturation, a star, and varied branching trees.

@@ -183,17 +183,19 @@ def test_cache_capacity_and_packed_episode_resets(compiled: bool) -> None:
 @pytest.mark.parametrize(
     "kwargs,width",
     [
-        ({}, 16),
-        ({"mlp_expansion": 3.0}, 24),
-        ({"mlp_expansion": 1.5}, 12),
-        ({"mlp_expansion": 1.4}, 11),
-        ({"mlp_expansion": 1.45}, 12),
-        ({"mlp_expansion": 1.3125}, 10),
-        ({"mlp_expansion": 1.4375}, 12),
+        pytest.param({}, 16, id="default"),
+        pytest.param({"mlp_expansion": 1.4}, 11, id="round-down"),
+        pytest.param({"mlp_expansion": 1.45}, 12, id="round-up"),
     ],
 )
-def test_mlp_expansion_and_norm_defaults(kwargs: dict[str, Any], width: int) -> None:
+def test_mlp_expansion_width(kwargs: dict[str, Any], width: int) -> None:
     model = TransformerStack(8, 1, num_heads=2, max_seq_len=1, **kwargs)
+    assert model._mlp_width() == width
+
+
+def test_mlp_shapes_and_norm_defaults() -> None:
+    model = TransformerStack(8, 1, num_heads=2, max_seq_len=1, mlp_expansion=1.45)
+    width = 12
     x = jnp.ones((1, 1, 8))
     variables = model.init(jax.random.key(27), x)
     layer = variables["params"]["layers_0"]

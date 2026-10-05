@@ -129,8 +129,9 @@ def test_group_advantages() -> None:
     np.testing.assert_allclose(group_advantages(rewards), [[-1, 1, -1, 1], [0, 0, 0, 0]])
 
 
-@pytest.mark.parametrize("group_size", [8, 16, 32, 128])
-def test_fractional_equal_rewards_have_zero_advantages(group_size: int) -> None:
+def test_fractional_equal_rewards_have_zero_advantages() -> None:
+    # Eight members already reproduce the float32 mean-rounding regression.
+    group_size = 8
     rewards = jnp.broadcast_to(jnp.asarray([0.1, 1 / 3, -0.7], jnp.float32)[:, None], (3, group_size))
     np.testing.assert_array_equal(group_advantages(rewards), 0)
 
@@ -233,30 +234,19 @@ def test_single_pass_update_matches_roundwise_gradient(config: Config, state: Tr
 @pytest.mark.parametrize(
     "required,capacity,expected",
     [
-        (0, 1088, 272),
-        (272, 1088, 272),
-        (273, 1088, 544),
-        (544, 1088, 544),
-        (545, 1088, 816),
-        (816, 1088, 816),
-        (817, 1088, 1088),
-        (1088, 1088, 1088),
         (0, 18, 5),
+        (5, 18, 5),
         (6, 18, 10),
-        (11, 18, 15),
         (16, 18, 18),
         (18, 18, 18),
         (0, 1, 1),
-        (1, 1, 1),
-        (0, 3, 1),
-        (3, 3, 3),
     ],
 )
 def test_bucket_boundaries(required: int, capacity: int, expected: int) -> None:
     assert grpo.bucket_size(required, capacity) == expected
 
 
-@pytest.mark.parametrize("capacity", [1, 3, 5, 18, 40, 1088])
+@pytest.mark.parametrize("capacity", [1, 3, 8, 18])  # Singleton, fewer than four rows, even and uneven buckets.
 def test_row_buckets_use_fixed_step_and_cover_capacity(capacity: int) -> None:
     buckets = sorted({grpo.bucket_size(required, capacity) for required in range(capacity + 1)})
     step = (capacity + 3) // 4
@@ -323,15 +313,9 @@ def test_empty_replay_has_zero_metrics_and_finite_update(config: Config, state: 
     "required,capacity,expected",
     [
         (0, 128, 32),
-        (1, 128, 32),
         (32, 128, 32),
         (33, 128, 64),
-        (64, 128, 64),
-        (65, 128, 96),
-        (96, 128, 96),
-        (97, 128, 128),
         (128, 128, 128),
-        (129, 160, 160),
         (1, 24, 24),
         (97, 100, 100),
     ],

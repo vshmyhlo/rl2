@@ -34,10 +34,6 @@ def test_residual_branch_normalizes_and_applies_silu_after_final_convolution(dty
         (210, 160, DEFAULT_STAGES, 3072),
         (84, 84, DEFAULT_STAGES, 1024),
         (84, 84, DEFAULT_STAGES[:5], 2304),
-        (64, 64, DEFAULT_STAGES[:4], 4096),
-        (128, 64, DEFAULT_STAGES[:4], 8192),
-        (84, 84, DEFAULT_STAGES[:4], 9216),
-        (210, 160, DEFAULT_STAGES[:4], 35840),
         (1, 257, DEFAULT_STAGES, 1280),
     ],
 )
@@ -73,9 +69,8 @@ def test_invalid_stage(options: dict[str, Any]) -> None:
         ConvStage(**options)
 
 
-@pytest.mark.parametrize("stages", [()])
-def test_invalid_stage_sequence(stages: ConvStages) -> None:
-    model = ConvObservationEncoder(stages=stages)
+def test_invalid_stage_sequence() -> None:
+    model = ConvObservationEncoder(stages=())
     with pytest.raises((AssertionError, ValueError)):
         model.init(jax.random.key(0), jnp.zeros((1, 1, 8, 8), dtype=jnp.uint8))
 

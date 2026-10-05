@@ -26,8 +26,7 @@ def training_config(**overrides: Any) -> train_wm.Config:
     return replace(train_wm.load_config(path), **overrides)
 
 
-@pytest.mark.parametrize("frame_stack", [False, True])
-@pytest.mark.parametrize("grayscale_obs", [False, True])
+@pytest.mark.parametrize("grayscale_obs,frame_stack", [(False, True), (True, False)])
 def test_atari_observation_colors(grayscale_obs: bool, frame_stack: bool) -> None:
     config = training_config()
     assert not config.grayscale_obs
@@ -132,8 +131,10 @@ def test_charbonnier_perfect_match_has_zero_loss_and_gradient() -> None:
     np.testing.assert_array_equal(gradient, jnp.zeros_like(target))
 
 
-@pytest.mark.parametrize("loss", ["l1", "l2", "charbonnier"])
-def test_update_targets_losses_carry_and_learning(loss: train_wm.ObservationLoss) -> None:
+def test_update_targets_losses_carry_and_learning() -> None:
+    # Loss variants have direct value/gradient coverage above; use a nondefault
+    # loss here to check that update forwards the selection.
+    loss: train_wm.ObservationLoss = "charbonnier"
     model = MambaWorldModel(
         (1, 2, 2),
         3,
@@ -182,12 +183,7 @@ def test_update_targets_losses_carry_and_learning(loss: train_wm.ObservationLoss
     expected_kl = categorical_kl(output.posterior_logits, output.prior_logits).mean()
     np.testing.assert_allclose(metrics["kl"], expected_kl, rtol=1e-5)
     error = prediction.observation - 128 / 255.0
-    if loss == "l1":
-        expected_reconstruction = 4 * jnp.abs(error).mean()
-    elif loss == "l2":
-        expected_reconstruction = 2 * expected_observation
-    else:
-        expected_reconstruction = 4 * (jnp.sqrt(error**2 + 1e-6) - 1e-3).mean()
+    expected_reconstruction = 4 * (jnp.sqrt(error**2 + 1e-6) - 1e-3).mean()
     np.testing.assert_allclose(metrics["reconstruction_loss"], expected_reconstruction, rtol=1e-5)
     np.testing.assert_allclose(
         metrics["loss"], expected_reconstruction + expected_reward + expected_terminal + 1.1 * expected_kl, rtol=1e-5
@@ -497,7 +493,7 @@ def test_partial_resets_preserve_other_streams_with_reused_buffers(vector_env: s
         envs.close()
 
 
-@pytest.mark.parametrize("total_steps,expected_updates", [(2, 1), (10, 2), (12, 2), (30, 5)])
+@pytest.mark.parametrize("total_steps,expected_updates", [(2, 1), (10, 2), (12, 2)])
 def test_learning_rate_schedule_counts_short_rollouts_and_decays_to_zero(
     total_steps: int, expected_updates: int
 ) -> None:

@@ -124,8 +124,7 @@ def test_padding_done_and_invalid_prefixes_are_safe() -> None:
     assert not np.asarray(allowed_tokens(invalid)).any()
 
 
-@pytest.mark.parametrize("finished", [False, True])
-@pytest.mark.parametrize("value", [-jnp.inf, jnp.inf, jnp.nan])
+@pytest.mark.parametrize("finished,value", [(False, jnp.nan), (True, -jnp.inf), (True, jnp.inf)])
 def test_inactive_distribution_does_not_depend_on_model_logits(finished: bool, value: float) -> None:
     state = prefix_state("DEF run m( move m)") if finished else initial_grammar_state(1, 5)
     if not finished:
@@ -143,7 +142,7 @@ def test_inactive_distribution_does_not_depend_on_model_logits(finished: bool, v
     np.testing.assert_array_equal(jax.grad(loss)(logits), 0.0)
 
 
-@pytest.mark.parametrize("budget", [5, 16, 128])
+@pytest.mark.parametrize("budget", [pytest.param(5, id="minimum"), pytest.param(16, id="branching")])
 def test_random_masked_generation_always_parses_and_finishes(budget: int) -> None:
     batch = 4
 

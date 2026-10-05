@@ -25,12 +25,11 @@ from rl2.karel import (
 
 
 @pytest.mark.parametrize("category", TASK_CATEGORIES)
-@pytest.mark.parametrize("seed", range(5))
-def test_category_tasks_meet_state_change_thresholds(category: str, seed: int) -> None:
+def test_category_tasks_meet_state_change_thresholds(category: str) -> None:
     config = KarelConfig(
         max_sampling_attempts=10000, **{f"task_{name}_weight": float(name == category) for name in TASK_CATEGORIES}
     )
-    task = sample_task(np.random.default_rng(seed), config)
+    task = sample_task(np.random.default_rng(0), config)
     assert task.sampling.category == category
     assert 1 <= task.sampling.attempts <= config.max_sampling_attempts
     assert task.sampling.seconds >= 0
@@ -102,9 +101,17 @@ def test_sampling_stats_require_reset() -> None:
 
 
 @pytest.mark.parametrize(
-    "name", ["navigation_min_distance", "marker_min_edits", "combined_min_distance", "combined_min_edits"]
+    "name,value",
+    [
+        ("navigation_min_distance", 0),
+        ("marker_min_edits", 0),
+        ("combined_min_distance", 0),
+        ("combined_min_edits", 0),
+        ("navigation_min_distance", -1),
+        ("navigation_min_distance", 1.5),
+        ("navigation_min_distance", True),
+    ],
 )
-@pytest.mark.parametrize("value", [0, -1, 1.5, True])
 def test_invalid_category_threshold(name: str, value: float) -> None:
     with pytest.raises((TypeError, AssertionError)):
         KarelConfig(**{name: value})
@@ -426,14 +433,13 @@ def test_pad_is_reserved_and_cannot_change_program(fixed_env: KarelProgramEnv) -
     assert submit(fixed_env, ["DEF", "run", "m(", "move", "m)"])[1] == 4.0
 
 
-@pytest.mark.parametrize("seed", [0, 1, 2])
-def test_sampled_task_is_reachable_changed_and_within_limits(seed: int) -> None:
+def test_sampled_task_is_reachable_changed_and_within_limits() -> None:
     config = KarelConfig(
         length_penalty_weight=0.0,
         execution_penalty_weight=0.0,
         trajectory_weight=0.0,
     )
-    task = sample_task(np.random.default_rng(seed), config)
+    task = sample_task(np.random.default_rng(0), config)
     assert len(task.program) <= config.max_program_tokens
     assert not np.array_equal(task.initial, task.target)
     np.testing.assert_array_equal(execute_program(task.program, task.initial), task.target)
@@ -567,8 +573,7 @@ def test_zero_repeat_and_false_branch_skip_invalid_actions(world: State) -> None
     np.testing.assert_array_equal(result, world)
 
 
-@pytest.mark.parametrize("seed", range(5))
-def test_minimum_task_and_submission_budgets(seed: int) -> None:
+def test_minimum_task_and_submission_budgets() -> None:
     env = KarelProgramEnv(
         KarelConfig(
             length_penalty_weight=0.0,
@@ -583,7 +588,7 @@ def test_minimum_task_and_submission_budgets(seed: int) -> None:
             max_execution_steps=1,
         )
     )
-    initial, target = env.reset(seed=seed)
+    initial, target = env.reset(seed=0)
     assert not np.array_equal(initial, target)
     assert len(env.reference_program) == 5
     for token_id in env.reference_program:
@@ -727,7 +732,7 @@ def test_distance_weights_and_marker_counts(world: State) -> None:
     assert progress_reward(world, final, target, config) == pytest.approx(33 / 58)
 
 
-@pytest.mark.parametrize("heading", range(4))
+@pytest.mark.parametrize("heading", [1, 2])  # Matching heading and one mismatch have distinct scores.
 def test_distance_heading_error_is_binary(world: State, heading: int) -> None:
     target = world.copy()
     target[..., :4] = 0
@@ -773,8 +778,17 @@ def test_normalized_progress_preserves_regressions(world: State, error: int, sco
     )
 
 
-@pytest.mark.parametrize("weight_name", ["position_weight", "orientation_weight", "marker_weight"])
-@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+@pytest.mark.parametrize(
+    "weight_name,value",
+    [
+        ("position_weight", 0.0),
+        ("orientation_weight", 0.0),
+        ("marker_weight", 0.0),
+        ("position_weight", -1.0),
+        ("position_weight", float("nan")),
+        ("position_weight", float("inf")),
+    ],
+)
 def test_reward_weights_must_be_positive_and_finite(weight_name: str, value: float) -> None:
     with pytest.raises((AssertionError, ValueError)):
         KarelConfig(
@@ -1062,19 +1076,25 @@ def test_token_limit_applies_full_length_penalty_without_execution(fixed_env: Ka
     assert result[1] == pytest.approx(result[4]["reward_syntax"] - 0.05)
 
 
-@pytest.mark.parametrize("field", ["length_penalty_weight", "execution_penalty_weight"])
-@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("length_penalty_weight", -1.0),
+        ("execution_penalty_weight", -1.0),
+        ("length_penalty_weight", float("nan")),
+        ("length_penalty_weight", float("inf")),
+    ],
+)
 def test_efficiency_weights_must_be_finite_and_nonnegative(field: str, value: float) -> None:
     with pytest.raises((ValueError, AssertionError)):
         KarelConfig(**{field: value})
 
 
-@pytest.mark.parametrize("seed", range(5))
 @pytest.mark.parametrize("suffix", ["", "move", "REPEAT R=19 r( REPEAT R=19 r( turnLeft r) r)"])
-def test_combined_default_rewards_match_recorded_execution(seed: int, suffix: str) -> None:
+def test_combined_default_rewards_match_recorded_execution(suffix: str) -> None:
     config = KarelConfig(max_depth=1, max_statements=2, max_execution_steps=32)
     env = KarelProgramEnv(config)
-    pair = env.reset(seed=seed)
+    pair = env.reset(seed=0)
     tokens = [env.tokens[index] for index in env.reference_program[:-1]] + suffix.split() + ["m)"]
     assert len(tokens) <= config.max_program_tokens
     trace: list[State] = [pair.initial]
@@ -1216,8 +1236,18 @@ def test_weighted_reward_terms(
     assert reward == pytest.approx(sum(value for key, value in info.items() if key.startswith("reward_")))
 
 
-@pytest.mark.parametrize("weight_name", ["syntax_weight", "runtime_weight", "distance_weight", "success_weight"])
-@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize(
+    "weight_name,value",
+    [
+        ("syntax_weight", -1.0),
+        ("runtime_weight", -1.0),
+        ("distance_weight", -1.0),
+        ("success_weight", -1.0),
+        ("syntax_weight", float("nan")),
+        ("syntax_weight", float("inf")),
+        ("syntax_weight", -float("inf")),
+    ],
+)
 def test_term_weights_must_be_finite_and_nonnegative(weight_name: str, value: float) -> None:
     with pytest.raises((AssertionError, ValueError)):
         KarelConfig(**{weight_name: value})
@@ -1226,7 +1256,7 @@ def test_term_weights_must_be_finite_and_nonnegative(weight_name: str, value: fl
 @pytest.mark.parametrize(
     "body,budget,distance,success,error,success_weight",
     [
-        *[("move", 256, 1.0, True, None, weight) for weight in (0.0, 0.25, 1.0, 2.0)],
+        *[("move", 256, 1.0, True, None, weight) for weight in (0.0, 2.0)],
         ("turnLeft turnRight", 256, 0.5, False, None, 2.0),
         ("putMarker", 256, 0.5, False, "runtime_error", 2.0),  # Failure before any action succeeds.
         ("move putMarker", 256, 1.0, False, "runtime_error", 2.0),

@@ -19,7 +19,9 @@ def assert_carry_close(actual: Mamba3StackCarry, expected: Mamba3StackCarry) -> 
 
 
 @pytest.mark.parametrize(
-    "rank,rms_norm,width", [(1, True, 16), (2, True, 16), (1, False, 0), (4, True, 16), (2, False, 16)]
+    # RMSNorm, no MLP, and LayerNorm with MIMO/MLP wiring. Mixer rank coverage lives in test_mamba3.
+    "rank,rms_norm,width",
+    [(1, True, 16), (1, False, 0), (2, False, 16)],
 )
 def test_matches_official_blocks_outputs_states_and_gradients(rank: int, rms_norm: bool, width: int) -> None:
     """Fixtures execute upstream Block, GatedMLP and Mamba3 with CPU kernels."""

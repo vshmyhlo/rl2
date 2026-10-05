@@ -120,8 +120,14 @@ def test_trimmed_sequence_matches_full_logits_and_gradients(config: Config, batc
     chex.assert_trees_all_close(small_grads, full_grads, atol=3e-5, rtol=3e-5)
 
 
-@pytest.mark.parametrize("use_bias", [False, True])
-@pytest.mark.parametrize("zero_qk", [False, True])
+@pytest.mark.parametrize(
+    "use_bias,zero_qk",
+    [
+        pytest.param(False, False, id="content"),
+        pytest.param(True, False, id="content-and-bias"),
+        pytest.param(True, True, id="bias-only"),
+    ],
+)
 def test_bidirectional_attention_matches_numpy_and_excludes_padding(use_bias: bool, zero_qk: bool) -> None:
     block = _ASTBlock(16, 2, 1, 32, 1, jnp.float32, "xla")
     x = jax.random.normal(jax.random.key(12), (2, 5, 16))
