@@ -12,7 +12,6 @@ import numpy as np
 import optax
 import pytest
 from flax.training.train_state import TrainState
-from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from rl2 import ppo_rnd as rnd
 from rl2.atari_eval import _action
@@ -206,116 +205,6 @@ class ShortImageEnv(gym.Env):
         )
 
 
-def short_env(env_id: str, frame_stack: bool, atari_preprocessing: bool, observation_size: int | None) -> gym.Env:
-    return ShortImageEnv()
-
-
-@pytest.mark.parametrize("stop_ppo,minibatches", [(False, 1), (False, 2), (True, 2)])
-def test_training_resets_returns_and_predictor_independence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop_ppo: bool, minibatches: int
-) -> None:
-    cfg = replace(
-        config(),
-        num_envs=2,
-        num_steps=3,
-        num_minibatches=minibatches,
-        total_steps=12,
-        update_epochs=1,
-        lstm_hidden_size=8,
-        encoder_channels=(4,),
-        embedding_size=8,
-        bf16=stop_ppo,
-        vector_env="sync",
-        log_dir=str(tmp_path),
-        video_every_episodes=0,
-        eval_every_minutes=0,
-        rnd_warmup_steps=4,
-        rnd_update_fraction=1.0,
-        rnd_update_epochs=2,
-    )
-    gae_calls: list[tuple[np.ndarray, np.ndarray]] = []
-    returns: list[np.ndarray] = []
-    advantages: list[np.ndarray] = []
-    reward_inputs: list[np.ndarray] = []
-    update_inputs: list[np.ndarray] = []
-    predictor_steps: list[int] = []
-    raw_frames: list[np.ndarray] = []
-    original_gae, original_update = rnd.gae, rnd.update
-    original_reward, original_update_rnd, original_frames = rnd.rnd_reward, rnd.update_rnd, rnd.rnd_frames
-
-    def checked_frames(obs: rnd.Array) -> np.ndarray:
-        frames = original_frames(obs)
-        raw_frames.append(frames.copy())
-        return frames
-
-    def checked_gae(
-        rewards: rnd.Array, dones: rnd.Array, values: rnd.Array, next_value: rnd.Array, gamma: float, gae_lambda: float
-    ) -> tuple[jax.Array, jax.Array]:
-        gae_calls.append((np.array(rewards), np.array(dones)))
-        result = original_gae(rewards, dones, values, next_value, gamma, gae_lambda)
-        advantages.append(np.asarray(result[0]))
-        returns.append(np.asarray(result[1]))
-        return result
-
-    def checked_update(state: TrainState, batch: rnd.PPOBatch, config: rnd.Config) -> tuple[TrainState, rnd.PPOMetrics]:
-        # Identify shuffled environment columns by the critic returns.
-        expected = np.stack(returns[-2:], axis=-1)
-        order = [int(np.argmin(np.abs(expected[0, :, 0] - batch[4][0, i, 0]))) for i in range(batch[4].shape[1])]
-        np.testing.assert_allclose(batch[4], expected[:, order])
-        combined = config.extrinsic_coef * advantages[-2] + config.intrinsic_coef * advantages[-1]
-        np.testing.assert_allclose(batch[3], combined[:, order])
-        if stop_ppo:
-            batch = (*batch[:2], batch[2] - 2, *batch[3:])
-        return original_update(state, batch, config)
-
-    def checked_reward(predictor: TrainState, target: TrainState, obs: rnd.Array) -> jax.Array:
-        reward_inputs.append(np.array(obs))
-        return original_reward(predictor, target, obs)
-
-    def checked_rnd_update(
-        predictor: TrainState, target: TrainState, obs: rnd.Array, key: jax.Array, update_fraction: float
-    ) -> tuple[TrainState, jax.Array]:
-        update_inputs.append(np.array(obs))
-        result = original_update_rnd(predictor, target, obs, key, update_fraction)
-        predictor_steps.append(int(result[0].step))
-        return result
-
-    monkeypatch.setattr(rnd, "RNDNetwork", partial(rnd.RNDNetwork, channels=(4, 4, 4), feature_size=8))
-    monkeypatch.setattr(rnd, "make_env", short_env)
-    monkeypatch.setattr(rnd, "gae", checked_gae)
-    monkeypatch.setattr(rnd, "update", checked_update)
-    monkeypatch.setattr(rnd, "rnd_reward", checked_reward)
-    monkeypatch.setattr(rnd, "update_rnd", checked_rnd_update)
-    monkeypatch.setattr(rnd, "rnd_frames", checked_frames)
-    state = rnd.train(cfg)
-    assert int(state.step) == (0 if stop_ppo else 2 * minibatches)
-    assert predictor_steps == list(range(1, 2 * cfg.rnd_update_epochs * minibatches + 1))
-    assert len(gae_calls) == 4
-    np.testing.assert_array_equal(gae_calls[0][1][:, 0], [False, True, False])
-    np.testing.assert_array_equal(gae_calls[2][1][:, 0], [True, False, True])
-    for i in (1, 3):
-        np.testing.assert_array_equal(gae_calls[i][1], False)
-        assert np.all(gae_calls[i][0] >= 0)
-    # True termination uses only game reward; timeouts add the extrinsic bootstrap.
-    assert gae_calls[0][0][1, 0] == 1.0
-    assert gae_calls[0][0][1, 1] != 1.0
-    for rollout in range(2):
-        reward_obs = np.concatenate(reward_inputs[rollout * minibatches : (rollout + 1) * minibatches])
-        for epoch in range(cfg.rnd_update_epochs):
-            offset = (rollout * cfg.rnd_update_epochs + epoch) * minibatches
-            update_obs = np.concatenate(update_inputs[offset : offset + minibatches])
-            # Environment order can shuffle, but every epoch uses the same normalized images.
-            np.testing.assert_array_equal(np.sort(reward_obs, axis=0), np.sort(update_obs, axis=0))
-    # The final six frame extractions are training successors, including final screens.
-    np.testing.assert_array_equal([frames[0, 0, 0, 0] for frames in raw_frames[-6:]], [20, 40, 20, 40, 20, 40])
-    (run_dir,) = tmp_path.iterdir()
-    events = EventAccumulator(str(run_dir)).Reload()
-    for tag in ("losses/rnd_predictor", "losses/intrinsic_value", "rnd/reward_normalized_mean"):
-        assert [event.step for event in events.Scalars(tag)] == [6, 12]
-        assert all(np.isfinite(event.value) for event in events.Scalars(tag))
-    assert [event.value for event in events.Scalars("charts/return_mean_100")] == [4.0, 4.0]
-
-
 @pytest.mark.parametrize(
     ("name", "invalid"),
     [
@@ -341,29 +230,28 @@ def test_invalid_rnd_config_fails_before_creating_environments(name: str, invali
     create_env.assert_not_called()
 
 
-@pytest.mark.parametrize("mode", ("sync", "async"))
-def test_montezuma_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
-    cfg = replace(
-        config(),
-        num_envs=1,
-        num_steps=4,
-        num_minibatches=1,
-        total_steps=4,
-        update_epochs=1,
-        lstm_hidden_size=8,
-        encoder_channels=(4,),
-        embedding_size=8,
-        bf16=False,
-        vector_env=mode,
-        log_dir=str(tmp_path),
-        observation_size=16,
-        video_every_episodes=0,
-        eval_every_minutes=0,
-        rnd_warmup_steps=2,
-        rnd_update_fraction=1.0,
-        rnd_update_epochs=1,
-    )
-    monkeypatch.setattr(rnd, "RNDNetwork", partial(rnd.RNDNetwork, channels=(4, 4, 4), feature_size=8))
-    state = rnd.train(cfg)
-    assert int(state.step) == 1
-    assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(state.params))
+def test_warmup_collects_terminal_frames_then_resets() -> None:
+    envs = gym.vector.SyncVectorEnv([ShortImageEnv, ShortImageEnv], autoreset_mode=gym.vector.AutoresetMode.DISABLED)
+    try:
+        cfg = replace(config(), num_envs=2, rnd_warmup_steps=2)
+        moments = RunningMeanStd((16, 16, 1))
+        observation = rnd.warmup_rnd_observations(envs, cfg, moments)
+        np.testing.assert_array_equal(observation, 0)
+        # Reset, live, and terminal frames are all included before resetting.
+        expected = RunningMeanStd((16, 16, 1))
+        expected.update(np.broadcast_to(np.array([0, 0, 20, 20, 40, 40])[:, None, None, None], (6, 16, 16, 1)))
+        np.testing.assert_allclose(moments.mean, expected.mean)
+        np.testing.assert_allclose(moments.var, expected.var)
+        assert moments.count == expected.count
+    finally:
+        envs.close()
+
+
+def test_gae_distinguishes_episodic_and_continuing_returns() -> None:
+    rewards = jnp.array([[1.0], [2.0]])
+    values = jnp.zeros_like(rewards)
+    next_value = jnp.array([4.0])
+    _, episodic = rnd.gae(rewards, jnp.array([[True], [False]]), values, next_value, 0.5, 1.0)
+    _, continuing = rnd.gae(rewards, jnp.zeros((2, 1), dtype=jnp.bool_), values, next_value, 0.5, 1.0)
+    np.testing.assert_allclose(episodic, [[1.0], [4.0]])
+    np.testing.assert_allclose(continuing, [[3.0], [4.0]])

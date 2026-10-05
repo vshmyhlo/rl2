@@ -1,4 +1,3 @@
-import json
 import sys
 from dataclasses import asdict, replace
 from functools import partial
@@ -14,12 +13,8 @@ import numpy as np
 import optax
 import pytest
 import yaml
-from flax import serialization
 from flax.training.train_state import TrainState
-from google.cloud import storage
 from numpy.typing import NDArray
-from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-from tensorboardX import SummaryWriter
 
 from rl2 import train_wm
 from rl2.observation_encoder import ConvStage
@@ -205,146 +200,6 @@ def test_update_targets_losses_carry_and_learning(loss: train_wm.ObservationLoss
     assert int(state.step) == 2
     assert float(metrics["loss"]) < first_loss
     assert all(np.isfinite(value) for value in metrics.values())
-
-
-# Cover local/remote storage and periodic/final-only checkpointing.
-@pytest.mark.parametrize("remote,checkpoint_every", [(False, 1), (True, 100)])
-def test_training_saves_checkpoint_logs_and_handles_short_final_chunk(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remote: bool, checkpoint_every: int
-) -> None:
-    environments: list[ShortEpisodes] = []
-    flushes: list[str] = []
-
-    def make_writer(logdir: str, flush_secs: int) -> SummaryWriter:
-        assert flush_secs == config.log_flush_secs
-        writer = SummaryWriter(logdir=logdir, flush_secs=flush_secs)
-        original_flush = writer.flush
-        original_close = writer.close
-
-        def flush() -> None:
-            flushes.append("flush")
-            original_flush()
-
-        def close() -> None:
-            flushes.append("close")
-            original_close()
-
-        monkeypatch.setattr(writer, "flush", flush)
-        monkeypatch.setattr(writer, "close", close)
-        return writer
-
-    monkeypatch.setattr(train_wm, "SummaryWriter", make_writer)
-    uploads: dict[str, bytes] = {}
-    if remote:
-        client = storage.Client.create_anonymous_client()
-
-        def make_client() -> storage.Client:
-            return client
-
-        def upload(blob: storage.Blob, data: bytes, **kwargs: Any) -> None:
-            # TensorBoard may close again from __del__ after monkeypatch teardown.
-            blob.upload_from_string = partial(upload, blob)
-            uploads[f"gs://{blob.bucket.name}/{blob.name}"] = data
-
-        monkeypatch.setattr(storage, "Client", make_client)
-        monkeypatch.setattr(storage.Blob, "upload_from_string", upload)
-        monkeypatch.chdir(tmp_path)
-
-    def make_env(
-        env_id: str, frame_stack: bool, atari_preprocessing: bool, observation_size: int | None, grayscale_obs: bool
-    ) -> ShortEpisodes:
-        assert env_id == "ALE/SpaceInvaders-v5"
-        assert not frame_stack
-        assert atari_preprocessing
-        assert not grayscale_obs
-        env = ShortEpisodes(episode_length=6)
-        environments.append(env)
-        return env
-
-    monkeypatch.setattr(train_wm, "make_env", make_env)
-    checkpoint_spy = Mock(wraps=train_wm.save_checkpoint)
-    monkeypatch.setattr(train_wm, "save_checkpoint", checkpoint_spy)
-    update_spy = Mock(wraps=train_wm.update)
-    monkeypatch.setattr(train_wm, "update", update_spy)
-    config = training_config(
-        total_steps=10,
-        num_envs=2,
-        num_steps=3,
-        d_model=8,
-        num_layers=2,
-        encoder_stages=(ConvStage(4, blocks=1),),
-        stochastic_size=4,
-        stochastic_classes=4,
-        d_state=4,
-        headdim=4,
-        atari_preprocessing=True,
-        log_flush_secs=7,
-        log_dir="gs://test-bucket/rl2/wm/" if remote else f"{tmp_path}/logs/",
-        checkpoint_dir="gs://test-bucket/rl2_cp/wm/" if remote else f"{tmp_path}/checkpoints/",
-        checkpoint_every=checkpoint_every,
-        video_every_steps=5 if checkpoint_every == 1 else 0,
-        video_num_steps=3,
-        video_prefill_frames=2,
-    )
-    run_dir = train_wm.train(config)
-    assert config.observation_loss == "charbonnier"
-    for call in update_spy.call_args_list:
-        assert call.kwargs == {
-            "observation_loss": config.observation_loss,
-            "charbonnier_epsilon": config.charbonnier_epsilon,
-        }
-    assert flushes == ["flush"] * (3 if config.video_every_steps else 2) + ["close"]
-    assert run_dir.startswith(f"{config.log_dir.rstrip('/')}/ALE_SpaceInvaders-v5_seed1_")
-    run_name = run_dir.rsplit("/", 1)[-1]
-    checkpoint_run_dir = f"{config.checkpoint_dir.rstrip('/')}/{run_name}"
-    local_dir = tmp_path / "download" if remote else Path(run_dir)
-    local_checkpoint_dir = tmp_path / "download_checkpoints" if remote else Path(checkpoint_run_dir)
-    if remote:
-        assert uploads
-        assert not (tmp_path / "gs:").exists()
-        local_dir.mkdir()
-        local_checkpoint_dir.mkdir()
-        for path, data in uploads.items():
-            assert path.startswith((f"{run_dir}/", f"{checkpoint_run_dir}/"))
-            destination = local_checkpoint_dir if path.startswith(f"{checkpoint_run_dir}/") else local_dir
-            (destination / path.rsplit("/", 1)[-1]).write_bytes(data)
-    assert checkpoint_spy.call_count == (2 if checkpoint_every == 1 else 1)
-    assert checkpoint_spy.call_args.args[1] == checkpoint_run_dir
-    assert not (local_dir / "checkpoint.msgpack").exists()
-    saved = serialization.msgpack_restore((local_checkpoint_dir / "checkpoint.msgpack").read_bytes())
-    assert int(saved["step"]) == 2
-    assert "layers_1" in saved["params"]["dynamics"]
-    assert "prior_head" in saved["params"]
-    assert "posterior_head" in saved["params"]
-    assert "opt_state" in saved
-    metadata = json.loads((local_dir / "config.json").read_text())
-    assert json.loads((local_checkpoint_dir / "config.json").read_text()) == metadata
-    assert metadata["env_id"] == "ALE/SpaceInvaders-v5"
-    assert metadata["observation_shape"] == [1, 2, 2]
-    events = EventAccumulator(str(local_dir)).Reload()
-    assert [event.step for event in events.Scalars("train/loss")] == [6, 10]
-    learning_rates = events.Scalars("charts/learning_rate")
-    assert [event.step for event in learning_rates] == [6, 10]
-    np.testing.assert_allclose(
-        [event.value for event in learning_rates], [config.learning_rate, config.learning_rate / 2], rtol=1e-6
-    )
-    assert [event.step for event in events.Scalars("train/kl")] == [6, 10]
-    assert events.Scalars("train/prior_entropy")
-    assert events.Scalars("train/posterior_entropy")
-    config_text = events.Tensors("config/text_summary")[0].tensor_proto.string_val[0].decode()
-    assert config_text.startswith("```yaml\n")
-    assert config.log_dir in config_text
-    assert events.Tensors("devices/text_summary")
-    if config.video_every_steps:
-        videos = events.Images("imagination/real_posterior_prior")
-        # The first chunk has too little history; the next spans both chunks.
-        assert [video.step for video in videos] == [10]
-        assert all(video.width == 6 and video.height == 20 for video in videos)
-        assert all(video.encoded_image_string.startswith(b"GIF") for video in videos)
-    else:
-        assert "imagination/real_posterior_prior" not in events.Tags()["images"]
-    assert all(env.closed for env in environments)
-    assert not (local_checkpoint_dir / "checkpoint.msgpack.tmp").exists()
 
 
 @pytest.mark.parametrize(

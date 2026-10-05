@@ -11,6 +11,8 @@ For mixed-precision training, set ``dtype=jnp.bfloat16`` on the mixer or stack;
 inputs may be float32 or bfloat16. Keep the initialized parameters and optimizer
 state in float32 and compute the loss in float32. KV entries use bfloat16, while
 RoPE trigonometry and normalization statistics stay float32.
+RoPE sine/cosine are cast to the activation dtype before rotation. Residual
+additions use their operands' dtypes without explicitly promoting to float32.
 
 Attention is fully causal within each episode. The fixed-size cache retains
 all episode tokens, up to ``max_seq_len``; exceeding that capacity raises an
@@ -103,7 +105,7 @@ def _check_positions(positions: jax.Array, capacity: int) -> None:
 
 
 def _rope(x: jax.Array, positions: jax.Array, theta: float) -> jax.Array:
-    """Full-head RoPE with split-half pairs and float32 trigonometry."""
+    """Full-head RoPE with float32 trigonometry and activation-dtype rotation."""
     chex.assert_rank(x, 4)
     chex.assert_type(x, jnp.floating)
     chex.assert_shape(positions, x.shape[:2])
@@ -113,9 +115,9 @@ def _rope(x: jax.Array, positions: jax.Array, theta: float) -> jax.Array:
     half = x.shape[-1] // 2
     frequencies = theta ** (-jnp.arange(half, dtype=jnp.float32) / half)
     angles = positions.astype(jnp.float32)[..., None, None] * frequencies
-    real, imag = jnp.split(x.astype(jnp.float32), 2, axis=-1)
-    cos, sin = jnp.cos(angles), jnp.sin(angles)
-    return jnp.concatenate((real * cos - imag * sin, imag * cos + real * sin), axis=-1).astype(x.dtype)
+    real, imag = jnp.split(x, 2, axis=-1)
+    cos, sin = jnp.cos(angles).astype(x.dtype), jnp.sin(angles).astype(x.dtype)
+    return jnp.concatenate((real * cos - imag * sin, imag * cos + real * sin), axis=-1)
 
 
 class Transformer(nn.Module):
@@ -314,7 +316,6 @@ class _TransformerBlock(nn.Module):
     mixer: Transformer
     d_intermediate: int
     norm_epsilon: float
-    residual_in_fp32: bool
 
     @nn.compact
     def __call__(
@@ -323,19 +324,17 @@ class _TransformerBlock(nn.Module):
         chex.assert_shape(x, (None, None, self.mixer.d_model))
         chex.assert_type(x, jnp.floating)
         dtype = self.mixer.dtype
-        residual_dtype = jnp.float32 if self.residual_in_fp32 else dtype
-        x = x.astype(residual_dtype)
         normalized = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=dtype, name="norm")(x)
         # The mixer validates carry and episode_starts.
         carry, y = self.mixer(normalized, carry, episode_starts)
-        x = x + y.astype(residual_dtype)
+        x = x + y
         y = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=dtype, name="norm2")(x)
         kernel_init = nn.initializers.normal(stddev=self.mixer.initializer_range)
         gate = nn.Dense(self.d_intermediate, use_bias=False, dtype=dtype, kernel_init=kernel_init, name="gate_proj")(y)
         value = nn.Dense(self.d_intermediate, use_bias=False, dtype=dtype, kernel_init=kernel_init, name="up_proj")(y)
         y = nn.silu(gate) * value
         y = nn.Dense(self.mixer.d_model, use_bias=False, dtype=dtype, kernel_init=kernel_init, name="down_proj")(y)
-        return carry, x + y.astype(residual_dtype)
+        return carry, x + y
 
 
 class TransformerStack(BlockStack[TransformerStackCarry]):
@@ -343,7 +342,8 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
 
     Same sequence/step/reset interface as Mamba3Stack. Carry is a tuple of one
     TransformerCarry per layer. The MLP width is round(mlp_expansion*d_model),
-    with a default expansion of 2. Final RMSNorm and float32 residuals default on.
+    with a default expansion of 2. Final RMSNorm defaults on; residual additions
+    preserve the operands' normal dtype promotion rules.
     All projections use normal initialization with standard deviation
     ``initializer_range`` (default 0.02), independent of depth.
     """
@@ -354,7 +354,6 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
     rope_theta: float = 10000.0
     mlp_expansion: float = 2.0
     norm_epsilon: float = 1e-6
-    residual_in_fp32: bool = True
     final_norm: bool = True
     initializer_range: float = 0.02
     attention_implementation: AttentionImplementation = "xla"
@@ -393,7 +392,7 @@ class TransformerStack(BlockStack[TransformerStackCarry]):
     def setup(self) -> None:
         width = self._mlp_width()
         self.layers = tuple(
-            _TransformerBlock(self._make_mixer(), width, self.norm_epsilon, self.residual_in_fp32, name=f"layers_{i}")
+            _TransformerBlock(self._make_mixer(), width, self.norm_epsilon, name=f"layers_{i}")
             for i in range(self.num_layers)
         )
         if self.final_norm:

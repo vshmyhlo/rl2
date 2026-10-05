@@ -1,12 +1,13 @@
 seed: 1
 total_updates: 100000 # Rollout batches; TensorBoard steps count completed program episodes
 num_tasks: 32 # Sampled pairs per rollout
+sampling_workers: 8 # Persistent CPU sampling processes; 0 runs sampling in the training process
 group_size: 8 # Independent program samples for each pair
 num_minibatches: 4 # Must divide num_tasks * group_size; keep whole programs together
 update_epochs: 1
 bf16: true # Autoregressive Transformer compute in BF16; parameters, optimizer, and loss in FP32
 attention_implementation: cudnn # Requires a supported NVIDIA GPU; use xla for CPU
-d_model: 256
+d_model: 512
 num_layers: 8
 num_heads: 8 # Transformer head dimension = d_model / num_heads = 32
 num_kv_heads: null # Full multi-head attention; fewer KV heads enables grouped-query attention
@@ -19,7 +20,7 @@ entropy_coef: 0.01
 # KV cache covers the grid-pair prefix and all preceding tokens; no sliding-window truncation.
 max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/karel_grpo
-run_id: v1 # Reuse to resume; change for a new run, or null for a timestamped run
+run_id: v3 # Reuse to resume; change for a new run, or null for a timestamped run
 checkpoint_interval_seconds: 300 # Save to log_dir/run_id on GCS every 5 minutes (at rollout boundaries), plus final
 log_interval: 10 # TensorBoard scalars, stdout, and flushes every 10 completed rollouts
 log_program_interval: 10 # Samples on logging iterations divisible by this interval; rotate through task groups

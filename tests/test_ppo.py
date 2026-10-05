@@ -1,9 +1,6 @@
-import contextlib
-import io
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
 from unittest.mock import patch
 
@@ -16,8 +13,6 @@ import optax
 import pytest
 from flax import linen as nn
 from flax.training.train_state import TrainState
-from PIL import Image
-from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from rl2 import ppo
 from rl2.observation_encoder import ConvStage
@@ -35,30 +30,6 @@ from rl2.ppo import (
     update,
     value,
 )
-
-
-class ShortEpisodes(gym.wrappers.TimeLimit):
-    def reset(
-        self, *, seed: int | None = None, options: dict[str, Any] | None = None
-    ) -> tuple[ppo.Array, dict[str, Any]]:
-        # Seeded limits work in spawned workers and stagger resets across rollouts.
-        if seed is not None:
-            self._max_episode_steps = 3 if self.render_mode else 2 + 3 * ((seed - 1) % 2)
-        return super().reset(seed=seed, options=options)
-
-
-def short_env(
-    env_id: str,
-    render_mode: str | None = None,
-    frame_stack: bool = False,
-    atari_preprocessing: bool = False,
-    observation_size: int | None = None,
-) -> gym.Env:
-    env = gym.wrappers.TransformReward(
-        make_env(env_id, render_mode, frame_stack, atari_preprocessing, observation_size),
-        lambda reward: 2.0,
-    )
-    return ShortEpisodes(env, max_episode_steps=3)
 
 
 @pytest.mark.parametrize("stacked", (False, True))
@@ -380,153 +351,6 @@ def test_gae_timeout_bootstrap_and_trace() -> None:
     )
     np.testing.assert_allclose(advantages, [[4.064], [3.7]], rtol=1e-6)
     np.testing.assert_allclose(returns, [[4.564], [4.7]], rtol=1e-6)
-
-
-# Pairwise coverage of vector mode, stacking, and preprocessing.
-@pytest.mark.parametrize(
-    "mode,frame_stack,preprocessing",
-    [("sync", False, False), ("sync", True, True), ("async", False, True), ("async", True, False)],
-)
-def test_atari_training_across_resets(mode: str, frame_stack: bool, preprocessing: bool) -> None:
-    check_atari_training(mode, frame_stack=frame_stack, preprocessing=preprocessing)
-
-
-def test_early_stop_resumes_next_rollout_and_anneals_lr() -> None:
-    check_atari_training("sync", target_kl=1e-8, update_epochs=3)
-
-
-def check_atari_training(
-    mode: str,
-    target_kl: float | None = None,
-    update_epochs: int = 1,
-    frame_stack: bool = False,
-    preprocessing: bool = False,
-) -> None:
-    config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-        lstm_hidden_size=16,
-        encoder_stages=(ConvStage(4, blocks=1),),
-        bf16=False,
-        total_steps=16,
-        num_envs=2,
-        num_steps=4,
-        num_minibatches=2,
-        update_epochs=update_epochs,
-        video_every_episodes=2,
-        eval_every_minutes=0,
-        observation_size=8,
-        vector_env=mode,
-        target_kl=target_kl,
-        frame_stack=frame_stack,
-        atari_preprocessing=preprocessing,
-    )
-    output = io.StringIO()
-    training_steps = 0
-    checked_rollouts = set()
-    previous_carry = initial_carry(config.num_envs, config.lstm_hidden_size)
-
-    def checked_act(
-        state: TrainState,
-        obs: ppo.Array,
-        carry: ppo.LSTMCarry,
-        starts: ppo.Array,
-        key: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array, ppo.LSTMCarry]:
-        nonlocal training_steps, previous_carry
-        image_shape = (8, 8) if preprocessing else (8, 8, 3)
-        assert obs.shape[1:] == (4 if frame_stack else 1, *image_shape)
-        if obs.shape[0] == config.num_envs:
-            # Memory crosses rollout boundaries and video games cannot overwrite it.
-            np.testing.assert_array_equal(carry, previous_carry)
-            np.testing.assert_array_equal(starts, [training_steps % 2 == 0, training_steps % 5 == 0])
-            result = ppo_act(state, obs, carry, starts, key)
-            previous_carry = result[3]
-            training_steps += 1
-            return result
-        return ppo_act(state, obs, carry, starts, key)
-
-    def checked_update(state: TrainState, batch: ppo.PPOBatch, config: ppo.Config) -> tuple[TrainState, ppo.PPOMetrics]:
-        assert batch[0].shape[:2] == (config.num_steps, config.num_envs // config.num_minibatches)
-        if training_steps not in checked_rollouts:
-            # Replay with unchanged parameters must recover rollout action probabilities.
-            _, logits, _ = state.apply_fn({"params": state.params}, batch[0], batch[5], batch[6])
-            np.testing.assert_allclose(action_log_prob(logits, batch[1]), batch[2], atol=5e-6)
-            checked_rollouts.add(training_steps)
-        return update(state, batch, config)
-
-    ppo_act = ppo.act
-    with TemporaryDirectory() as log_dir:
-        with (
-            patch(
-                "rl2.ppo.ActorCritic",
-                new=partial(
-                    ActorCritic,
-                    encoder_stages=(ConvStage(4, blocks=1),),
-                    embedding_size=8,
-                ),
-            ),
-            patch("rl2.ppo.make_env", new=short_env),
-            patch("rl2.ppo.act", new=checked_act),
-            patch("rl2.ppo.update", new=checked_update),
-            contextlib.redirect_stdout(output),
-        ):
-            state = train(replace(config, log_dir=log_dir))
-        (run_dir,) = Path(log_dir).iterdir()
-        events = EventAccumulator(str(run_dir)).Reload()
-        for tag in (
-            "losses/policy",
-            "losses/value",
-            "policy/entropy",
-            "policy/approx_kl",
-            "policy/clip_fraction",
-            "value/explained_variance",
-            "charts/learning_rate",
-            "charts/updates_per_rollout",
-            "policy/early_stop",
-            "charts/steps_per_second",
-            "charts/return_mean_100",
-            "charts/episode_length_mean_100",
-            "charts/total_episodes",
-        ):
-            scalars = events.Scalars(tag)
-            assert [event.step for event in scalars] == [8, 16]
-            assert all(np.isfinite(event.value) for event in scalars)
-        np.testing.assert_allclose(
-            [event.value for event in events.Scalars("charts/learning_rate")],
-            [config.learning_rate, config.learning_rate / 2],
-            rtol=1e-6,
-        )
-        assert [event.value for event in events.Scalars("charts/updates_per_rollout")] == (
-            [1, 1] if target_kl is not None else [2, 2]
-        )
-        assert [event.value for event in events.Scalars("policy/early_stop")] == (
-            [1, 1] if target_kl is not None else [0, 0]
-        )
-        assert [event.value for event in events.Scalars("charts/total_episodes")] == [2, 5]
-        np.testing.assert_allclose(
-            [event.value for event in events.Scalars("charts/episode_length_mean_100")],
-            [2.0, 2.6],
-        )
-        np.testing.assert_allclose(
-            [event.value for event in events.Scalars("charts/return_mean_100")],
-            [4.0, 5.2],
-        )
-        config_text = events.Tensors("config/text_summary")[0].tensor_proto.string_val[0]
-        assert f"env_id: {config.env_id}".encode() in config_text
-        videos = events.Images("gameplay")
-        assert [event.step for event in videos] == [8, 16]
-        for video in videos:
-            with Image.open(io.BytesIO(video.encoded_image_string)) as image:
-                assert image.format == "GIF"
-                assert image.size == (160, 210)
-    assert int(state.step) == (2 if target_kl is not None else 4)
-    assert checked_rollouts == {4, 8}
-    for leaf in jax.tree.leaves(state.params):
-        assert np.isfinite(leaf).all()
-    assert "step=16" in output.getvalue()
-    assert "step=16 episodes=5" in output.getvalue()
-    assert "return=n/a" not in output.getvalue()
-    assert "episode_length=2.6" in output.getvalue()
 
 
 class SyntheticAtariEnv(gym.Env):

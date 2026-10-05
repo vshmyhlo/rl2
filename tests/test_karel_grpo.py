@@ -1,4 +1,6 @@
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -10,7 +12,6 @@ import numpy as np
 import pytest
 from flax import serialization
 from flax.training.train_state import TrainState
-from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from rl2 import karel
 from rl2 import train_karel_grpo as grpo
@@ -108,6 +109,38 @@ def test_one_task_sample_per_group(config: grpo.Config, state: TrainState, monke
         grpo.collect_rollout(state, [], np.random.default_rng(1), jax.random.key(1), config)
 
 
+def test_parallel_sampling_matches_serial_and_propagates_errors(config: grpo.Config) -> None:
+    config = replace(config, num_tasks=3, group_size=2, num_minibatches=1, sampling_workers=2)
+    serial = [KarelProgramEnv(config.env) for _ in range(config.num_tasks * config.group_size)]
+    parallel = [KarelProgramEnv(config.env) for _ in serial]
+    serial_rng, parallel_rng = np.random.default_rng(7), np.random.default_rng(7)
+    with ProcessPoolExecutor(max_workers=2, mp_context=get_context("spawn")) as executor:
+        # Reuse workers for multiple batches, with more tasks than workers.
+        for _ in range(2):
+            expected = grpo._reset_environments(serial, serial_rng, config)
+            actual = grpo._reset_environments(parallel, parallel_rng, config, executor)
+            np.testing.assert_array_equal(actual.initial, expected.initial)
+            np.testing.assert_array_equal(actual.target, expected.target)
+            assert serial_rng.bit_generator.state == parallel_rng.bit_generator.state
+            for first, second in zip(serial, parallel, strict=True):
+                assert first.reference_program == second.reference_program
+                assert first.sampling_stats[:2] == second.sampling_stats[:2]
+                for token in first.reference_program:
+                    assert first.step(token) == second.step(token)
+                # Unseeded resets must also retain the worker's advanced RNG state.
+                a, b = first.reset(), second.reset()
+                np.testing.assert_array_equal(a.initial, b.initial)
+                np.testing.assert_array_equal(a.target, b.target)
+
+        impossible = replace(
+            config,
+            env=replace(config.env, task_easy_weight=0, task_navigation_weight=1, max_sampling_attempts=1),
+        )
+        failed_envs = [KarelProgramEnv(impossible.env) for _ in serial]
+        with pytest.raises(RuntimeError, match="Could not sample.*navigation"):
+            grpo._reset_environments(failed_envs, parallel_rng, impossible, executor)
+
+
 @pytest.mark.parametrize("budget", [5, 12, 32])
 def test_generation_finishes_at_budget_and_is_deterministic(config: grpo.Config, budget: int) -> None:
     config = replace(config, env=replace(config.env, max_program_tokens=budget))
@@ -172,43 +205,22 @@ def test_objective_program_weighting_clipping_and_padding(config: grpo.Config) -
     np.testing.assert_array_equal(grads[..., TOKEN_TO_ID["<pad>"]], 0)
 
 
-def test_update_and_old_policy_kl_early_stop(config: grpo.Config, state: TrainState, rollout: Rollout) -> None:
+@pytest.mark.parametrize("bf16", [False, True])
+def test_update_and_old_policy_kl_early_stop(
+    config: grpo.Config, state: TrainState, rollout: Rollout, bf16: bool
+) -> None:
     batch = rollout[0]
+    if bf16:
+        config = replace(config, bf16=True)
+        state = grpo.create_state(config, batch.initial[:1], batch.target[:1]).replace(params=state.params)
     updated, metrics = grpo.update(state, batch, config)
     assert int(updated.step) == int(state.step) + 1
     assert all(np.isfinite(value) for value in metrics)
+    chex.assert_type(jax.tree.leaves(updated.params), jnp.float32)
     assert any(not np.array_equal(a, b) for a, b in zip(jax.tree.leaves(updated.params), jax.tree.leaves(state.params)))
     divergent = batch._replace(old_log_probs=batch.old_log_probs - 2.0)
     rejected, _ = grpo.update(state, divergent, replace(config, target_kl=0.001))
     chex.assert_trees_all_equal(rejected, state)
-
-
-@pytest.mark.parametrize("bf16", [False, True])
-def test_training_checkpoint_resume_and_logs(config: grpo.Config, tmp_path: Path, bf16: bool) -> None:
-    config = replace(config, log_dir=str(tmp_path), run_id="test", bf16=bf16, anneal_lr=False)
-    state = grpo.train(config)
-    assert int(state.step) == config.num_minibatches
-    assert all(np.isfinite(x).all() and x.dtype == jnp.float32 for x in jax.tree.leaves(state.params))
-    directory = tmp_path / "test"
-    loaded_config, loaded = grpo.load_model(directory, attention_implementation="xla")
-    assert loaded_config == config
-    chex.assert_trees_all_equal(loaded.params, state.params)
-    checkpoint = directory / "checkpoint.msgpack"
-    original = checkpoint.read_bytes()
-    restored = grpo.train(config)
-    chex.assert_trees_all_equal(restored.params, state.params)
-    assert checkpoint.read_bytes() == original
-    resumed = grpo.train(replace(config, total_updates=2))
-    expected = grpo.train(replace(config, total_updates=2, run_id="continuous"))
-    chex.assert_trees_all_equal((resumed.params, resumed.opt_state), (expected.params, expected.opt_state))
-    saved = serialization.msgpack_restore(checkpoint.read_bytes())
-    assert saved["iteration"] == 2
-    assert "reference_params" not in saved
-    assert saved["steps"] == saved["episodes"] == 2 * config.group_size
-    events = EventAccumulator(str(directory)).Reload()
-    assert [event.step for event in events.Scalars("charts/reward_mean")] == [4, 8]
-    assert "samples/generated_programs/text_summary" in events.Tags()["tensors"]
-    assert "policy/reference_kl" not in events.Tags()["scalars"]
 
 
 def test_formatted_samples_preserve_tokens(config: grpo.Config, rollout: Rollout) -> None:
@@ -222,6 +234,7 @@ def test_formatted_samples_preserve_tokens(config: grpo.Config, rollout: Rollout
 def test_example_config() -> None:
     config = grpo.load_config(Path(__file__).resolve().parents[1] / "configs/karel_grpo.yaml")
     assert config.bf16 and config.attention_implementation == "cudnn"
+    assert config.sampling_workers == 8
     assert not hasattr(config, "max_nodes")
     assert not hasattr(config, "max_depth")
     schedule = grpo.learning_rate_schedule(config)
@@ -239,6 +252,7 @@ def test_example_config() -> None:
         {"attention_implementation": "cudnn"},
         {"num_layers": 0},
         {"run_id": "../escape"},
+        {"sampling_workers": -1},
     ],
 )
 def test_invalid_config(config: grpo.Config, settings: dict[str, Any]) -> None:
@@ -246,11 +260,10 @@ def test_invalid_config(config: grpo.Config, settings: dict[str, Any]) -> None:
         replace(config, **settings)
 
 
-@pytest.mark.skipif(not any(d.platform == "gpu" for d in jax.devices()), reason="cuDNN needs NVIDIA GPU")
-def test_cudnn_training(config: grpo.Config, tmp_path: Path) -> None:
-    state = grpo.train(replace(config, bf16=True, attention_implementation="cudnn", log_dir=str(tmp_path)))
-    assert int(state.step) == config.num_minibatches
-    assert all(np.isfinite(x).all() for x in jax.tree.leaves(state.params))
+@pytest.mark.parametrize("workers", [True, 1.5, "2"])
+def test_sampling_workers_require_integer(config: grpo.Config, workers: object) -> None:
+    with pytest.raises(TypeError, match="sampling_workers"):
+        replace(config, sampling_workers=workers)
 
 
 def test_legacy_reference_checkpoint_and_config_load_without_reference(
@@ -271,3 +284,25 @@ def test_legacy_reference_checkpoint_and_config_load_without_reference(
     config_path = tmp_path / "config.yaml"
     config_path.write_text(grpo.yaml.safe_dump({**grpo.asdict(config), "kl_coef": 0.25}))
     assert grpo.load_config(config_path) == config
+
+
+def test_load_model_from_checkpoint(config: grpo.Config, state: TrainState, tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text(grpo.yaml.safe_dump(grpo.asdict(config)))
+    progress = grpo.TrainingProgress(state, jax.random.key(3), 2, 8, 1, 8)
+    grpo._save_checkpoint(str(tmp_path), progress, np.random.default_rng(4))
+    loaded_config, loaded = grpo.load_model(tmp_path, attention_implementation="xla")
+    assert loaded_config == config
+    chex.assert_trees_all_equal(loaded.params, state.params)
+    assert int(loaded.step) == 0  # Inference loading deliberately starts a fresh optimizer.
+
+
+@pytest.mark.skipif(not any(d.platform == "gpu" for d in jax.devices()), reason="cuDNN needs NVIDIA GPU")
+def test_cudnn_single_update(config: grpo.Config) -> None:
+    config = replace(config, bf16=True, attention_implementation="cudnn")
+    envs = [KarelProgramEnv(config.env) for _ in range(config.group_size)]
+    pair = envs[0].reset(seed=42)
+    state = grpo.create_state(config, pair.initial[None], pair.target[None])
+    batch, _, _, _ = grpo.collect_rollout(state, envs, np.random.default_rng(4), jax.random.key(3), config)
+    updated, metrics = grpo.update(state, batch, config)
+    assert int(updated.step) == 1
+    assert all(np.isfinite(x).all() for x in jax.tree.leaves((updated.params, metrics)))

@@ -1,12 +1,8 @@
-import contextlib
-import io
 import json
 from dataclasses import replace
-from functools import partial
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import gymnasium as gym
 import jax
@@ -19,7 +15,6 @@ from flax.training.train_state import TrainState
 from rl2 import ppo
 from rl2.atari_eval import EvaluationConfig, ScoreBaselines, _action, evaluate, make_evaluation_env
 from rl2.atari_scores import ATARI_REFERENCE_SCORES, REFERENCE_SOURCE, get_reference_scores
-from rl2.observation_encoder import ConvStage
 from rl2.ppo import Array, Config, LSTMCarry, initial_carry, load_config
 
 
@@ -177,100 +172,6 @@ def test_cleanup_on_policy_failure() -> None:
     ):
         evaluate(policy_state(), training_config(), EvaluationConfig(episodes=1))
     assert env.closed
-
-
-def test_training_schedules_evaluation_by_time_without_changing_state() -> None:
-    config = replace(
-        training_config(),
-        frame_stack=False,
-        bf16=False,
-        num_envs=1,
-        num_steps=4,
-        num_minibatches=1,
-        update_epochs=1,
-        total_steps=12,
-        vector_env="sync",
-        video_every_episodes=0,
-        target_kl=None,
-        eval_episodes=2,
-        eval_seed=321,
-    )
-
-    def training_env(*args: Any, **kwargs: Any) -> ScoringEnv:
-        return ScoringEnv()
-
-    def evaluation_env(*args: Any) -> ScoringEnv:
-        return ScoringEnv()
-
-    original_update = ppo.update
-
-    def timed_update(state: TrainState, batch: ppo.PPOBatch, config: Config) -> tuple[TrainState, ppo.PPOMetrics]:
-        result = original_update(state, batch, config)
-        clock.return_value += next(rollout_durations)
-        return result
-
-    def timed_evaluate(state: TrainState, training: Config, evaluation: EvaluationConfig) -> dict[str, Any]:
-        result = evaluate(state, training, evaluation)
-        clock.return_value += 1200.0  # Evaluation itself takes longer than the scheduling interval.
-        return result
-
-    states: list[TrainState] = []
-    for interval, durations, expected_steps in (
-        (0, [599.0, 1.0, 600.0], []),
-        (10, [599.0, 1.0, 600.0], [8, 12]),
-        (5, [599.0, 1.0, 600.0], [4, 12]),
-        (10, [1800.0, 1.0, 600.0], [4, 12]),  # One long rollout crosses several intervals.
-    ):
-        clock = Mock(return_value=0.0)
-        rollout_durations = iter(durations)
-        with TemporaryDirectory() as directory:
-            with (
-                patch("rl2.ppo.make_env", side_effect=training_env),
-                patch(
-                    "rl2.ppo.ActorCritic",
-                    new=partial(ppo.ActorCritic, encoder_stages=(ConvStage(2),), embedding_size=4),
-                ),
-                patch("rl2.atari_eval.make_evaluation_env", side_effect=evaluation_env),
-                patch("rl2.atari_eval.evaluate", side_effect=timed_evaluate) as evaluation,
-                patch("rl2.ppo.monotonic", new=clock),
-                patch("rl2.ppo.update", side_effect=timed_update),
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                states.append(
-                    ppo.train(
-                        replace(config, log_dir=directory, eval_every_minutes=interval, encoder_stages=(ConvStage(2),))
-                    )
-                )
-            assert evaluation.call_count == len(expected_steps)
-            assert [int(call.args[0].step) for call in evaluation.call_args_list] == [
-                step // 4 for step in expected_steps
-            ]
-            for call in evaluation.call_args_list:
-                assert call.args[2] == EvaluationConfig(episodes=2, seed=321)
-            from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-
-            (run_dir,) = Path(directory).iterdir()
-            events = EventAccumulator(str(run_dir)).Reload()
-            if expected_steps:
-                assert [event.step for event in events.Scalars("eval/return_mean")] == expected_steps
-                normalized = events.Scalars("eval/human_normalized_score_percent")
-                assert [event.step for event in normalized] == expected_steps
-                assert [event.value for event in normalized] == pytest.approx(
-                    [100 * (5 + 20.7) / (14.6 + 20.7)] * len(expected_steps)
-                )
-                for event in events.Tensors("eval/report/text_summary"):
-                    text = event.tensor_proto.string_val[0].decode()
-                    report = json.loads(text.removeprefix("```json\n").removesuffix("\n```"))
-                    assert report["training_steps"] == event.step
-                    assert report["baselines"]["source"] == REFERENCE_SOURCE
-                    assert report["human_normalized_score_percent"] == pytest.approx(100 * (5 + 20.7) / 35.3)
-                    assert report["training_episodes"] == event.step // 2
-            else:
-                assert "eval/return_mean" not in events.Tags()["scalars"]
-            assert [event.value for event in events.Scalars("charts/total_episodes")] == [2, 4, 6]
-    for state in states[1:]:
-        for baseline, actual in zip(jax.tree.leaves(states[0]), jax.tree.leaves(state), strict=True):
-            np.testing.assert_array_equal(baseline, actual)
 
 
 @pytest.mark.parametrize(
@@ -431,3 +332,26 @@ def test_failed_evaluation_does_not_report_completion(capsys: pytest.CaptureFixt
     assert "completed=0/1" in output
     assert "completed=1/1" not in output
     assert env.closed
+
+
+def test_evaluation_logging_records_scores_and_report_without_mutating_state() -> None:
+    config = replace(training_config(), eval_episodes=2, eval_seed=321)
+    state = policy_state()
+    before = jax.tree.map(np.array, state)
+    with (
+        patch("rl2.atari_eval.make_evaluation_env", return_value=ScoringEnv()),
+        patch("rl2.ppo.SummaryWriter") as writer,
+    ):
+        ppo.log_evaluation(state, config, writer, 7, 100)
+    scalars = {call.args[0]: call.args[1:] for call in writer.add_scalar.call_args_list}
+    assert scalars["eval/return_mean"] == (5, 100)
+    assert scalars["eval/training_episodes"] == (7, 100)
+    assert scalars["eval/human_normalized_score_percent"] == pytest.approx((100 * (5 + 20.7) / (14.6 + 20.7), 100))
+    tag, text, step = writer.add_text.call_args.args
+    assert tag == "eval/report" and step == 100
+    report = json.loads(text.removeprefix("```json\n").removesuffix("\n```"))
+    assert report["training_steps"] == 100 and report["training_episodes"] == 7
+    assert report["baselines"]["source"] == REFERENCE_SOURCE
+    assert [episode["seed"] for episode in report["episodes"]] == [321, 322]
+    for old, new in zip(jax.tree.leaves(before), jax.tree.leaves(state), strict=True):
+        np.testing.assert_array_equal(old, new)

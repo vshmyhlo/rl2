@@ -42,21 +42,10 @@ type LossOutput = tuple[jax.Array, tuple[Carry, jax.Array]]
             )
             for residual_fp32 in (True, False)
         ],
-        *[
-            pytest.param(
-                TransformerStack(
-                    8,
-                    2,
-                    num_heads=2,
-                    num_kv_heads=1,
-                    max_seq_len=6,
-                    dtype=jnp.bfloat16,
-                    residual_in_fp32=residual_fp32,
-                ),
-                id=f"transformer-stack-residual-fp32-{residual_fp32}",
-            )
-            for residual_fp32 in (True, False)
-        ],
+        pytest.param(
+            TransformerStack(8, 2, num_heads=2, num_kv_heads=1, max_seq_len=6, dtype=jnp.bfloat16),
+            id="transformer-stack",
+        ),
         pytest.param(
             TransformerStack(
                 16,

@@ -9,9 +9,12 @@ and the same prefix-dependent masks, averaging token losses within each program.
 import argparse
 import json
 from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
+from multiprocessing import get_context
 from pathlib import Path
 from time import monotonic
 from typing import Any, NamedTuple
@@ -50,6 +53,7 @@ class Config:
     seed: int = 1
     total_updates: int = 1000  # Number of rollout batches, independent of program length.
     num_tasks: int = 8
+    sampling_workers: int = 0  # Persistent CPU processes; zero samples in the training process.
     group_size: int = 8
     num_minibatches: int = 4
     update_epochs: int = 2
@@ -110,6 +114,9 @@ class Config:
         chex.assert_scalar_positive(self.log_interval)
         chex.assert_scalar_positive(self.log_program_interval)
         chex.assert_scalar_non_negative(self.log_program_count)
+        if type(self.sampling_workers) is not int:
+            raise TypeError("sampling_workers must be an integer")
+        chex.assert_scalar_non_negative(self.sampling_workers)
         for value in (self.total_updates, self.num_tasks, self.group_size, self.num_minibatches, self.update_epochs):
             if type(value) is not int:
                 raise TypeError("Rollout and update counts must be integers")
@@ -331,22 +338,47 @@ def generate(
     return actions, log_probs, key
 
 
-def collect_rollout(
-    state: TrainState, envs: list[KarelProgramEnv], rng: np.random.Generator, key: jax.Array, config: Config
-) -> tuple[GRPOBatch, NDArray[np.float32], dict[str, float], jax.Array]:
+def _sample_environment(config: KarelConfig, seed: int) -> KarelProgramEnv:
+    """Return a freshly reset CPU environment, including its post-sampling RNG state."""
+    env = KarelProgramEnv(config)
+    env.reset(seed=seed)
+    return env
+
+
+def _reset_environments(
+    envs: list[KarelProgramEnv],
+    rng: np.random.Generator,
+    config: Config,
+    executor: ProcessPoolExecutor | None = None,
+) -> KarelPair:
     batch_size = config.num_tasks * config.group_size
     if len(envs) != batch_size or any(env.config != config.env for env in envs):
         raise ValueError("Expected num_tasks * group_size environments with the configured limits")
     # Sample once per group; copies retain independent episode and RNG state.
     seeds = rng.integers(0, 2**31, size=config.num_tasks)
+    # map preserves seed order even when workers finish out of order. Workers
+    # never consume the trainer RNG, so checkpoint/resume needs no pool state.
+    sampled = None if executor is None else executor.map(partial(_sample_environment, config.env), map(int, seeds))
     pairs: list[KarelPair] = []
     for group, seed in enumerate(seeds):
         start = group * config.group_size
         first = envs[start]
-        pairs.append(first.reset(seed=int(seed)))
+        pairs.append(first.reset(seed=int(seed)) if sampled is None else first.reset_from(next(sampled)))
         pairs.extend(env.reset_from(first) for env in envs[start + 1 : start + config.group_size])
-    initial = np.stack([pair.initial for pair in pairs])
-    target = np.stack([pair.target for pair in pairs])
+    return KarelPair(np.stack([pair.initial for pair in pairs]), np.stack([pair.target for pair in pairs]))
+
+
+def collect_rollout(
+    state: TrainState,
+    envs: list[KarelProgramEnv],
+    rng: np.random.Generator,
+    key: jax.Array,
+    config: Config,
+    *,
+    executor: ProcessPoolExecutor | None = None,
+) -> tuple[GRPOBatch, NDArray[np.float32], dict[str, float], jax.Array]:
+    batch_size = config.num_tasks * config.group_size
+    initial, target = _reset_environments(envs, rng, config, executor)
     actions, old_log_probs, key = jax.device_get(
         generate(state, initial, target, key, config.env.max_program_tokens, log_compiles=config.log_compiles)
     )
@@ -587,8 +619,20 @@ def train(config: Config) -> TrainState:
         _save_checkpoint(run_dir, progress, rng)
     # Hide events from unsaved rollouts after an interruption, retaining the
     # checkpoint's own step. New runs do not need a TensorBoard restart marker.
-    writer = SummaryWriter(logdir=run_dir, purge_step=steps + 1 if checkpoint is not None else None)
-    try:
+    with ExitStack() as resources:
+        writer = SummaryWriter(logdir=run_dir, purge_step=steps + 1 if checkpoint is not None else None)
+        resources.callback(writer.close)
+        # Spawn avoids forking JAX's multithreaded CUDA runtime. Keep the pool
+        # alive across rollouts, and close it on completion or any exception.
+        executor = (
+            resources.enter_context(
+                ProcessPoolExecutor(
+                    max_workers=min(config.sampling_workers, config.num_tasks), mp_context=get_context("spawn")
+                )
+            )
+            if config.sampling_workers
+            else None
+        )
         writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", steps)
         writer.add_text("devices", str(jax.devices()), steps)
         parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
@@ -606,7 +650,7 @@ def train(config: Config) -> TrainState:
         start_steps = steps
         for iteration in range(start_iteration, config.total_updates):
             rollout_start = monotonic()
-            batch, rewards, diagnostics, key = collect_rollout(state, envs, rng, key, config)
+            batch, rewards, diagnostics, key = collect_rollout(state, envs, rng, key, config, executor=executor)
             rollout_seconds = monotonic() - rollout_start
             episodes += batch_size
             steps = episodes
@@ -695,8 +739,6 @@ def train(config: Config) -> TrainState:
                     flush=True,
                 )
         return state
-    finally:
-        writer.close()
 
 
 def main() -> None:

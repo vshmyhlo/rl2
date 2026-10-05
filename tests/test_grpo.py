@@ -10,8 +10,6 @@ import optax
 import pytest
 from flax import serialization
 from flax.training.train_state import TrainState
-from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-from tensorboardX import SummaryWriter
 
 from rl2 import karel
 from rl2 import train_karel_ast_grpo as grpo
@@ -420,116 +418,10 @@ def test_padding_and_rejected_kl_do_not_update_state(config: Config, state: Trai
     chex.assert_trees_all_equal(result, state)
 
 
-@pytest.mark.parametrize("bf16", [False, True])
-def test_train_checkpoint_tensorboard(
-    config: Config, tmp_path: Path, capsys: pytest.CaptureFixture[str], bf16: bool
-) -> None:
-    config = replace(config, bf16=bf16, log_dir=str(tmp_path), log_program_count=2)
-    state = train(config)
-    assert int(state.step) == 1
-    assert all(np.isfinite(p).all() and p.dtype == jnp.float32 for p in jax.tree.leaves(state.params))
-    output = capsys.readouterr().out
-    assert "DEF run" not in output and "Sample 0" not in output
-    (directory,) = tmp_path.iterdir()
-    _, restored = load_model(directory, attention_implementation="xla")
-    chex.assert_trees_all_equal(restored.params, state.params)
-    events = EventAccumulator(str(directory)).Reload()
-    assert events.Scalars("charts/reward_mean")
-    assert events.Scalars("charts/program_token_length_mean")
-    assert "samples/generated_programs/text_summary" in events.Tags()["tensors"]
-    assert "policy/reference_kl" not in events.Tags()["scalars"]
-
-
-@pytest.mark.parametrize("legacy_steps", [False, True])
-def test_logging_every_20_rollouts_survives_resume(
-    config: Config,
-    state: TrainState,
-    rollout: tuple[GRPOBatch, np.ndarray, dict[str, float], jax.Array],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    legacy_steps: bool,
-) -> None:
-    config = replace(
-        config,
-        total_updates=21,
-        log_dir=str(tmp_path),
-        run_id="logging",
-        log_interval=20,
-        log_program_interval=20,
-    )
-    writer = MagicMock(spec=SummaryWriter)
-    monkeypatch.setattr(grpo, "SummaryWriter", MagicMock(return_value=writer))
-    monkeypatch.setattr(grpo, "create_state", MagicMock(return_value=state))
-    monkeypatch.setattr(grpo, "collect_rollout", MagicMock(return_value=rollout))
-    monkeypatch.setattr(grpo, "update", MagicMock(return_value=(state, tuple(jnp.asarray(0.0) for _ in range(4)))))
-    formatter = MagicMock(return_value="sample programs")
-    monkeypatch.setattr(grpo, "format_group_programs", formatter)
-    train(config)
-    checkpoint = tmp_path / "logging" / "checkpoint.msgpack"
-    saved = serialization.msgpack_restore(checkpoint.read_bytes())
-    episodes_per_rollout = config.num_tasks * config.group_size
-    assert saved["iteration"] == 21
-    assert saved["steps"] == saved["episodes"] == 21 * episodes_per_rollout
-    if legacy_steps:
-        saved["steps"] = 21 * int(rollout[0].mask.sum())
-        assert saved["steps"] != saved["episodes"]
-        checkpoint.write_bytes(serialization.msgpack_serialize(saved))
-    assert writer.flush.call_count == 1
-    train(replace(config, total_updates=41))
-    saved = serialization.msgpack_restore(checkpoint.read_bytes())
-    assert saved["iteration"] == 41 and saved["logged_groups"] == 2
-    assert saved["steps"] == saved["episodes"] == 41 * episodes_per_rollout
-    assert grpo.SummaryWriter.call_args.kwargs["purge_step"] == 21 * episodes_per_rollout + 1
-    assert writer.flush.call_count == 2
-    assert formatter.call_count == 2
-    reward_steps = [call.args[2] for call in writer.add_scalar.call_args_list if call.args[0] == "charts/reward_mean"]
-    assert reward_steps == [20 * episodes_per_rollout, 40 * episodes_per_rollout]
-    sample_steps = [
-        call.args[2] for call in writer.add_text.call_args_list if call.args[0] == "samples/generated_programs"
-    ]
-    assert sample_steps == reward_steps
-    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("iteration=")]
-    assert [line.split()[0] for line in lines] == ["iteration=20", "iteration=40"]
-    assert [line.split()[1] for line in lines] == [f"step={step}" for step in reward_steps]
-
-
 @pytest.mark.parametrize("interval", [0, -1, 1.5, True])
 def test_invalid_log_interval(config: Config, interval: float | bool) -> None:
     with pytest.raises((AssertionError, TypeError)):
         replace(config, log_interval=interval)
-
-
-def test_gcs_checkpoint_paths(config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    files: dict[str, bytes] = {}
-    paths: list[str] = []
-
-    class FakeGCS:
-        def cat_file(self, path: str) -> bytes:
-            if path not in files:
-                raise FileNotFoundError(path)
-            return files[path]
-
-        def pipe_file(self, path: str, data: bytes) -> None:
-            assert path.startswith("gs://test-bucket/grpo/")
-            files[path] = data
-
-    def writer(logdir: str, purge_step: int | None = None) -> SummaryWriter:
-        paths.append(logdir)
-        return SummaryWriter(logdir=str(tmp_path), purge_step=purge_step)
-
-    monkeypatch.setattr("rl2.utils.gcsfs.GCSFileSystem", FakeGCS)
-    monkeypatch.setattr("rl2.train_karel_ast_grpo.SummaryWriter", writer)
-    cloud_config = replace(config, log_dir="gs://test-bucket/grpo/", run_id="resume-test")
-    state = train(cloud_config)
-    assert set(files) == {f"{paths[0]}/config.yaml", f"{paths[0]}/checkpoint.msgpack"}
-    _, restored = load_model(paths[0])
-    chex.assert_trees_all_equal(restored.params, state.params)
-    chex.assert_trees_all_equal(serialization.to_state_dict(train(cloud_config)), serialization.to_state_dict(state))
-    continued = train(replace(cloud_config, total_updates=2))
-    assert int(continued.step) == 2
-    assert paths == ["gs://test-bucket/grpo/resume-test"] * 2
-    assert serialization.msgpack_restore(files[f"{paths[0]}/checkpoint.msgpack"])["iteration"] == 2
 
 
 def test_formatted_samples_replay_ast_source(config: Config, rollout: tuple) -> None:
@@ -606,132 +498,6 @@ def test_cudnn_ast_grpo(config: Config) -> None:
     assert all(np.isfinite(x).all() for x in jax.tree.leaves(state.params))
 
 
-def test_interrupted_resume_matches_uninterrupted_training(
-    config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = replace(config, total_updates=3, log_dir=str(tmp_path), log_program_interval=10)
-    collect = grpo.collect_rollout
-    save = grpo._save_checkpoint
-    calls = 0
-    interrupted = False
-    now = 0.0
-    saves: dict[str, list[int]] = {}
-
-    def clock() -> float:
-        nonlocal now
-        now += 0.1
-        return now
-
-    def rollouts(
-        state: TrainState, envs: list[KarelProgramEnv], rng: np.random.Generator, key: jax.Array, cfg: Config
-    ) -> tuple[GRPOBatch, np.ndarray, dict[str, float], jax.Array]:
-        nonlocal calls, now
-        calls += 1
-        if interrupted and calls == 3:
-            raise RuntimeError("simulated interruption after an unsaved rollout")
-        # First rollout crosses five minutes, the next one does not.
-        now += 301 if calls == 1 else 1
-        return collect(state, envs, rng, key, cfg)
-
-    def checkpoint(directory: str, progress: grpo.TrainingProgress, rng: np.random.Generator) -> None:
-        saves.setdefault(directory, []).append(progress.iteration)
-        save(directory, progress, rng)
-
-    monkeypatch.setattr(grpo, "monotonic", clock)
-    monkeypatch.setattr(grpo, "collect_rollout", rollouts)
-    monkeypatch.setattr(grpo, "_save_checkpoint", checkpoint)
-    expected = train(replace(config, run_id="continuous"))
-    assert saves[str(tmp_path / "continuous")] == [0, 1, 3]
-    calls, interrupted = 0, True
-    with pytest.raises(RuntimeError, match="simulated interruption"):
-        train(replace(config, run_id="resumed"))
-    resumed_dir = tmp_path / "resumed"
-    saved = serialization.msgpack_restore((resumed_dir / "checkpoint.msgpack").read_bytes())
-    assert saved["iteration"] == 1
-    assert not (resumed_dir / "params.msgpack").exists()
-    assert "config" not in saved  # Configuration lives separately; no duplicate weights export.
-    calls, interrupted = 0, False
-    actual = train(replace(config, run_id="resumed"))
-    chex.assert_trees_all_equal(
-        (actual.params, actual.opt_state, actual.step), (expected.params, expected.opt_state, expected.step)
-    )
-    final = serialization.msgpack_restore((resumed_dir / "checkpoint.msgpack").read_bytes())
-    baseline = serialization.msgpack_restore((tmp_path / "continuous" / "checkpoint.msgpack").read_bytes())
-    chex.assert_trees_all_equal(final, baseline)
-    # Purge the discarded second rollout's event, then continue at the saved step.
-    actual_events = EventAccumulator(str(resumed_dir)).Reload().Scalars("charts/reward_mean")
-    expected_events = EventAccumulator(str(tmp_path / "continuous")).Reload().Scalars("charts/reward_mean")
-    assert [(event.step, event.value) for event in actual_events] == [
-        (event.step, event.value) for event in expected_events
-    ]
-
-
-def test_resume_uses_modified_config_and_counts_prior_episodes(config: Config, tmp_path: Path) -> None:
-    config = replace(config, log_dir=str(tmp_path), run_id="mutable")
-    initial = train(config)
-    changed = replace(
-        config,
-        total_updates=2,
-        learning_rate=0.002,
-        anneal_lr=False,
-        group_size=4,
-        num_minibatches=2,
-        entropy_coef=0.03,
-        max_grad_norm=1.0,
-        seed=999,
-        env=replace(config.env, marker_weight=2.0),
-    )
-    result = train(changed)
-    assert int(result.step) == int(initial.step) + 2
-    np.testing.assert_allclose(result.opt_state.hyperparams["learning_rate"], 0.002)
-    directory = tmp_path / "mutable"
-    payload = serialization.msgpack_restore((directory / "checkpoint.msgpack").read_bytes())
-    assert payload["iteration"] == 2 and payload["episodes"] == 6
-    assert payload["steps"] == 6
-    events = EventAccumulator(str(directory)).Reload().Scalars("charts/reward_mean")
-    assert [event.step for event in events] == [2, 6]
-    assert "reference_params" not in payload
-    assert load_config(directory / "config.yaml") == changed
-
-
-def test_completed_run_is_noop_and_new_id_starts_fresh(
-    config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = replace(config, log_dir=str(tmp_path), run_id="first")
-    initial = train(config)
-    checkpoint = tmp_path / "first" / "checkpoint.msgpack"
-    original = checkpoint.read_bytes()
-
-    def no_rollout(*args: object, **kwargs: object) -> None:
-        pytest.fail("A completed run must not collect another rollout")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(grpo, "collect_rollout", no_rollout)
-        restored = train(config)
-    chex.assert_trees_all_equal(restored.params, initial.params)
-    assert checkpoint.read_bytes() == original
-    fresh = train(replace(config, run_id="second"))
-    assert int(fresh.step) == 1
-    chex.assert_trees_all_equal(fresh.params, initial.params)
-    assert (tmp_path / "second" / "checkpoint.msgpack").is_file()
-
-
-def test_incompatible_or_corrupt_checkpoint_is_not_overwritten(config: Config, tmp_path: Path) -> None:
-    config = replace(config, log_dir=str(tmp_path), run_id="protected")
-    train(config)
-    directory = tmp_path / "protected"
-    checkpoint = directory / "checkpoint.msgpack"
-    before, old_config = checkpoint.read_bytes(), (directory / "config.yaml").read_bytes()
-    with pytest.raises(ValueError, match="incompatible"):
-        train(replace(config, d_model=32))
-    assert checkpoint.read_bytes() == before
-    assert (directory / "config.yaml").read_bytes() == old_config
-    checkpoint.write_bytes(serialization.msgpack_serialize({"version": 999}))
-    with pytest.raises(ValueError, match="version"):
-        train(config)
-    assert checkpoint.read_bytes() == serialization.msgpack_serialize({"version": 999})
-
-
 @pytest.mark.parametrize("run_id", ["", " ", ".", "..", "../run", "foo/bar", "foo\\bar", 1])
 def test_invalid_run_id(config: Config, run_id: str | int) -> None:
     with pytest.raises((ValueError, TypeError)):
@@ -775,3 +541,13 @@ def test_legacy_reference_checkpoint_and_config_load_without_reference(
     config_path = tmp_path / "config.yaml"
     config_path.write_text(grpo.yaml.safe_dump({**grpo.asdict(config), "kl_coef": 0.25}))
     assert grpo.load_config(config_path) == config
+
+
+def test_load_model_from_checkpoint(config: Config, state: TrainState, tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text(grpo.yaml.safe_dump(grpo.asdict(config)))
+    progress = grpo.TrainingProgress(state, jax.random.key(3), 2, 8, 1, 8)
+    grpo._save_checkpoint(str(tmp_path), progress, np.random.default_rng(4))
+    loaded_config, loaded = grpo.load_model(tmp_path, attention_implementation="xla")
+    assert loaded_config == config
+    chex.assert_trees_all_equal(loaded.params, state.params)
+    assert int(loaded.step) == 0

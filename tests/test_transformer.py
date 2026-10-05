@@ -7,9 +7,53 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from rl2.transformer import Transformer, TransformerCarry, TransformerStack, TransformerStackCarry
+from rl2.transformer import (
+    Transformer,
+    TransformerCarry,
+    TransformerStack,
+    TransformerStackCarry,
+    _rope,
+    _TransformerBlock,
+)
 
 type Carry = TransformerCarry | TransformerStackCarry
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
+def test_rope_rotates_with_activation_dtype_coefficients(dtype: jax.typing.DTypeLike) -> None:
+    x = jnp.asarray([[[[1.25, -0.75, 0.5, 1.75]], [[1.25, -0.75, 0.5, 1.75]], [[0.25, 1.5, -1.25, -0.5]]]], dtype=dtype)
+    positions = jnp.asarray([[0, 3, 17]], jnp.int32)
+    # Independent NumPy oracle: quantize the coefficients and each arithmetic
+    # result as in the reference's activation-dtype rotate_half expression.
+    angles = np.asarray(positions, np.float32)[..., None, None] * np.asarray([1, 0.01], np.float32)
+    values = np.asarray(x)
+    cos = np.tile(np.cos(angles), 2).astype(values.dtype)
+    sin = np.tile(np.sin(angles), 2).astype(values.dtype)
+    rotated = np.concatenate((-values[..., 2:], values[..., :2]), axis=-1)
+    expected = values * cos + rotated * sin
+    actual = _rope(x, positions, 10000.0)
+    chex.assert_type(actual, dtype)
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(actual[:, 0], x[:, 0])
+    compiled = jax.jit(_rope, static_argnums=2)(x, positions, 10000.0)
+    np.testing.assert_allclose(
+        compiled.astype(jnp.float32), expected.astype(np.float32), atol=0, rtol=2 * jnp.finfo(dtype).eps
+    )
+
+
+@pytest.mark.parametrize("input_dtype", [jnp.bfloat16, jnp.float16, jnp.float32])
+def test_block_preserves_residual_dtype(input_dtype: jax.typing.DTypeLike) -> None:
+    compute_dtype = jnp.bfloat16 if input_dtype == jnp.float32 else input_dtype
+    mixer = Transformer(8, num_heads=2, max_seq_len=2, dtype=compute_dtype)
+    block = _TransformerBlock(mixer, d_intermediate=16, norm_epsilon=1e-6)
+    x = jax.random.normal(jax.random.key(29), (2, 1, 8)).astype(input_dtype)
+    variables = block.init(jax.random.key(30), x, None, None)
+    carry, output = jax.jit(block.apply)(variables, x, None, None)
+    chex.assert_shape(output, x.shape)
+    chex.assert_type(output, input_dtype)
+    chex.assert_type((carry.key, carry.value), compute_dtype)
+    chex.assert_type(jax.tree.leaves(variables["params"]), jnp.float32)
+    assert np.isfinite(output).all()
 
 
 def assert_carry_close(actual: Carry, expected: Carry, tolerance: float = 5e-6) -> None:
