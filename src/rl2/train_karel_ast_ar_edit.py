@@ -66,6 +66,7 @@ final scores, while delta rewards and feedback remain available during editing.
 
 import argparse
 import math
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
@@ -93,7 +94,8 @@ from rl2.karel import (
     KarelProgramEnv,
 )
 from rl2.karel_ast import AST_ACTIONS, KarelAST, program_actions
-from rl2.karel_ast_edit import FEEDBACK_SIZE, EditConfig, Evaluation, KarelASTEditEnv, Observation
+from rl2.karel_ast_edit import FEEDBACK_SIZE, EditConfig, Evaluation, Observation
+from rl2.karel_ast_edit_vector import KarelASTEditVectorEnv
 from rl2.train_karel_ast_grpo import (
     Array,
     Metrics,
@@ -123,6 +125,7 @@ class Config:
     # Rollout groups and update batching.
     num_tasks: int = 8
     group_size: int = 8
+    env_workers: int = 0  # Spawned environment shards; zero steps locally.
     num_minibatches: int = 4
     update_epochs: int = 2
 
@@ -165,6 +168,9 @@ class Config:
             raise TypeError("bf16 must be a boolean")
         if type(self.log_compiles) is not bool:
             raise TypeError("log_compiles must be a boolean")
+        if type(self.env_workers) is not int:
+            raise TypeError("env_workers must be an integer")
+        chex.assert_scalar_non_negative(self.env_workers)
         if self.attention_implementation not in ("xla", "cudnn"):
             raise ValueError("attention_implementation must be 'xla' or 'cudnn'")
         if self.attention_implementation == "cudnn" and not self.bf16:
@@ -490,7 +496,7 @@ type EpisodeResults = tuple[
 def run_episodes(
     state: TrainState,
     tasks: list[KarelProgramEnv],
-    envs: list[KarelASTEditEnv],
+    envs: KarelASTEditVectorEnv,
     key: jax.Array,
     config: Config,
 ) -> EpisodeResults:
@@ -502,10 +508,10 @@ def run_episodes(
     Finished members only consume trailing PAD, with no further policy loss.
     """
     count = len(tasks)
-    if not count or len(envs) != count:
+    if not count or envs.num_envs != count or envs.config != config.edit_config:
         raise ValueError("Expected matching nonempty tasks and editing environments")
-    observations = [env.reset(task=task) for env, task in zip(envs, tasks)]
-    seed_scores = np.asarray([env.seed_score for env in envs], np.float32)
+    observations = envs.reset(tasks)
+    seed_scores = np.asarray([observation.feedback[0] for observation in observations], np.float32)
     history = initial_history(observations, config)
     carry, logits = prefill(state, history, log_compiles=config.log_compiles)
     position = history.events.kind.shape[0] - 1
@@ -531,6 +537,7 @@ def run_episodes(
         actions[position] = np.where(ready, sampled, 0)
         old_log_probs[position] = np.where(ready, log_probs, 0)
         mask[position] = ready
+        transitions = envs.step(sampled, ready)
         event = jax.tree.map(itemgetter(0), empty_events(1, count, config))
         event.output[:] = np.stack([observation.output for observation in observations])
         for index in np.flatnonzero(updates):
@@ -541,7 +548,8 @@ def run_episodes(
             action = int(sampled[index])
             event.kind[index] = ACTION_EVENT
             event.value[index] = action
-            transition = envs[index].step(action)
+            transition = transitions[index]
+            assert transition is not None
             rewards[position, index] = transition.reward
             observations[index] = transition.observation
             event.output[index] = transition.observation.output
@@ -553,7 +561,8 @@ def run_episodes(
             destination[position + 1] = value
         position += 1
         carry, logits = decode_step(state, event, carry, log_compiles=config.log_compiles)
-    if active.any() or not all(env.tree.complete for env in envs):
+    summaries = envs.summaries()
+    if active.any() or not all(summary.tree.complete for summary in summaries):
         raise RuntimeError("Editing exhausted its bounded history with unfinished episodes")
     # Bucketing only adds trailing padding, which cannot affect earlier causal logits.
     length = min(config.max_seq_len, ((position + 1 + 31) // 32) * 32)
@@ -568,18 +577,17 @@ def run_episodes(
         rewards[:length],
         np.zeros(count, np.float32),
     )
-    results = [env.result for env in envs]
-    assert all(result is not None for result in results)
-    completed_edits = np.asarray([env.completed_edits for env in envs], np.int32)
-    return batch, results, seed_scores, completed_edits, key, tuple(env.tree for env in envs)
+    results = [summary.result for summary in summaries]
+    completed_edits = np.asarray([summary.completed_edits for summary in summaries], np.int32)
+    return batch, results, seed_scores, completed_edits, key, tuple(summary.tree for summary in summaries)
 
 
 def collect_rollout(
-    state: TrainState, envs: list[KarelASTEditEnv], rng: np.random.Generator, key: jax.Array, config: Config
+    state: TrainState, envs: KarelASTEditVectorEnv, rng: np.random.Generator, key: jax.Array, config: Config
 ) -> Rollout:
     """Sample task groups, run editing episodes, and compute advantages and diagnostics."""
     count = config.num_tasks * config.group_size
-    if len(envs) != count or any(env.config != config.edit_config for env in envs):
+    if envs.num_envs != count or envs.config != config.edit_config:
         raise ValueError("Expected num_tasks * group_size environments with configured limits")
     tasks: list[KarelProgramEnv] = []
     for seed in rng.integers(0, 2**31, size=config.num_tasks):
@@ -592,6 +600,10 @@ def collect_rollout(
     grouped = rewards.reshape(config.num_tasks, config.group_size)
     batch = batch._replace(advantages=np.asarray(group_advantages(grouped)).reshape(-1))
     successes = np.asarray([result.success for result in results])
+    sequence_lengths = config.edit_config.prefill_length + batch.mask.sum(axis=0) + completed_edits
+    # Final candidate sizes; AST depth counts edges from the root, including list nodes.
+    node_count_mean = float(np.mean([len(tree.nodes) for tree in programs]))
+    depth_mean = float(np.mean([max(node.depth for node in tree.nodes) for tree in programs]))
     diagnostics = {
         "charts/reward_mean": float(rewards.mean()),
         "charts/score_mean": float(scores.mean()),
@@ -600,10 +612,14 @@ def collect_rollout(
         "charts/group_success_rate": float(successes.reshape(config.num_tasks, config.group_size).any(axis=1).mean()),
         "charts/reward_diverse_group_fraction": float((np.ptp(grouped, axis=1) > 0).mean()),
         "charts/edits_mean": float(completed_edits.mean()),
-        "charts/sequence_budget_exhausted_rate": float(np.mean([env.remaining == 0 for env in envs])),
-        "charts/sequence_length_mean": float(np.mean([config.max_seq_len - env.remaining for env in envs])),
+        "charts/sequence_budget_exhausted_rate": float(np.mean(sequence_lengths == config.max_seq_len)),
+        "charts/sequence_length_mean": float(sequence_lengths.mean()),
         "charts/decisions_mean": float(batch.mask.sum()) / count,
         "charts/program_token_length_mean": float(np.mean([len(tree.tokens()) for tree in programs])),
+        "charts/program_node_count_mean": node_count_mean,
+        "charts/program_node_ratio_mean": node_count_mean / config.max_nodes,
+        "charts/program_depth_mean": depth_mean,
+        "charts/program_depth_ratio_mean": depth_mean / config.max_depth,
         **{
             f"charts/reward_{name}_mean": float(np.mean([result.components[name] for result in results]))
             for name in REWARD_COMPONENTS
@@ -761,8 +777,8 @@ def generate(state: TrainState, task: KarelProgramEnv, key: jax.Array, config: C
         raise TypeError("Expected a typed JAX PRNG key from jax.random.key")
     if task.config != config.env:
         raise ValueError("Task must use the configured environment limits")
-    env = KarelASTEditEnv(config.edit_config)
-    _, _, _, _, _, programs = run_episodes(state, [task], [env], key, config)
+    with KarelASTEditVectorEnv(config.edit_config, 1) as envs:
+        _, _, _, _, _, programs = run_episodes(state, [task], envs, key, config)
     return programs[0]
 
 
@@ -788,7 +804,6 @@ def train(config: Config) -> TrainState:
     """Run or resume editing-policy training with grouped rollouts, KL stopping, logs, and checkpoints."""
     configure_compilation_cache()
     batch_size = config.num_tasks * config.group_size
-    envs = [KarelASTEditEnv(config.edit_config) for _ in range(batch_size)]
     rng = np.random.default_rng(config.seed)
     key = jax.random.key(config.seed)
     dummy = np.zeros((1, config.env.height, config.env.width, 6), np.int32)
@@ -814,7 +829,11 @@ def train(config: Config) -> TrainState:
     # Hide events from unsaved rollouts after an interruption, retaining the
     # checkpoint's own step. New runs do not need a TensorBoard restart marker.
     writer = SummaryWriter(logdir=run_dir, purge_step=steps + 1 if checkpoint is not None else None)
-    try:
+    with ExitStack() as resources:
+        resources.callback(writer.close)
+        envs = resources.enter_context(
+            KarelASTEditVectorEnv(config.edit_config, batch_size, workers=config.env_workers)
+        )
         writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", steps)
         writer.add_text("devices", str(jax.devices()), steps)
         parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
@@ -913,6 +932,10 @@ def train(config: Config) -> TrainState:
                     f"reward_diverse_groups={diagnostics['charts/reward_diverse_group_fraction']:.3f} "
                     f"decisions_mean={diagnostics['charts/decisions_mean']:.3f} "
                     f"sequence_length_mean={diagnostics['charts/sequence_length_mean']:.3f} "
+                    f"program_node_count_mean={diagnostics['charts/program_node_count_mean']:.3f} "
+                    f"program_node_ratio_mean={diagnostics['charts/program_node_ratio_mean']:.3f} "
+                    f"program_depth_mean={diagnostics['charts/program_depth_mean']:.3f} "
+                    f"program_depth_ratio_mean={diagnostics['charts/program_depth_ratio_mean']:.3f} "
                     f"edits_mean={diagnostics['charts/edits_mean']:.3f} "
                     f"sequence_budget_exhausted_rate={diagnostics['charts/sequence_budget_exhausted_rate']:.3f} "
                     f"policy={policy_loss:.3f} entropy={entropy:.3f} kl={approx_kl:.4f} "
@@ -920,8 +943,6 @@ def train(config: Config) -> TrainState:
                     flush=True,
                 )
         return state
-    finally:
-        writer.close()
 
 
 def main() -> None:

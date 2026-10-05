@@ -62,7 +62,7 @@ def state(config: edit.Config) -> TrainState:
 def rollout(config: edit.Config, state: TrainState) -> edit.Rollout:
     return edit.collect_rollout(
         state,
-        [editing.KarelASTEditEnv(config.edit_config) for _ in range(2)],
+        edit.KarelASTEditVectorEnv(config.edit_config, 2),
         np.random.default_rng(4),
         jax.random.key(7),
         config,
@@ -203,7 +203,13 @@ def test_rollout_replay_rewards_and_minibatches(config: edit.Config, state: Trai
     with pytest.raises(ValueError, match="unique"):
         edit.select_episodes(batch, np.asarray([0, 0], np.int64))
     with pytest.raises(ValueError, match="environments"):
-        edit.collect_rollout(state, [], np.random.default_rng(4), jax.random.key(7), config)
+        edit.collect_rollout(
+            state,
+            edit.KarelASTEditVectorEnv(config.edit_config, 1),
+            np.random.default_rng(4),
+            jax.random.key(7),
+            config,
+        )
 
 
 def test_stop_is_a_real_decision(config: edit.Config, state: TrainState) -> None:
@@ -211,7 +217,7 @@ def test_stop_is_a_real_decision(config: edit.Config, state: TrainState) -> None
     stopped = state.replace(params=params)
     batch, rewards, diagnostics, _, programs = edit.collect_rollout(
         stopped,
-        [editing.KarelASTEditEnv(config.edit_config) for _ in range(2)],
+        edit.KarelASTEditVectorEnv(config.edit_config, 2),
         np.random.default_rng(4),
         jax.random.key(7),
         config,
@@ -221,6 +227,12 @@ def test_stop_is_a_real_decision(config: edit.Config, state: TrainState) -> None
     np.testing.assert_array_equal(batch.advantages, 0)
     assert all(tree.tokens() == editing.seed_tree(config.edit_config).tokens() for tree in programs)
     assert rewards[0] == rewards[1]
+    # The unchanged seed has Program, ConsNonEmpty, turnLeft, End: four nodes,
+    # with both statement and End two edges from the root.
+    assert diagnostics["charts/program_node_count_mean"] == 4
+    assert diagnostics["charts/program_node_ratio_mean"] == 4 / config.max_nodes
+    assert diagnostics["charts/program_depth_mean"] == 2
+    assert diagnostics["charts/program_depth_ratio_mean"] == 2 / config.max_depth
 
 
 def test_update_and_episode_normalization(
@@ -278,10 +290,12 @@ def test_update_rejects_invalid_replay(
 
 def test_config_and_checkpoint(config: edit.Config, state: TrainState, tmp_path: Path) -> None:
     supplied = edit.load_config("configs/karel_ast_ar_edit.yaml")
-    assert supplied.max_seq_len == 449
+    assert supplied.edit_config.max_seq_len == supplied.max_seq_len
     for changes, error in (
         ({"max_seq_len": 0}, AssertionError),
         ({"max_seq_len": True}, TypeError),
+        ({"env_workers": -1}, AssertionError),
+        ({"env_workers": True}, TypeError),
         ({"max_seq_len": 5}, ValueError),
         ({"seed_program": "DEF run m( m)"}, ValueError),
         ({"seed_program": "DEF run m( turnLeft turnRight putMarker move m)"}, ValueError),
@@ -330,14 +344,28 @@ def test_training_wiring(
     monkeypatch.setattr(edit, "update", update)
     writer = MagicMock()
     monkeypatch.setattr(edit, "SummaryWriter", MagicMock(return_value=writer))
+    vector = edit.KarelASTEditVectorEnv(config.edit_config, config.num_tasks * config.group_size)
+    vector_factory = MagicMock(return_value=vector)
+    monkeypatch.setattr(edit, "KarelASTEditVectorEnv", vector_factory)
     config = replace(config, log_dir=str(tmp_path), run_id="test", update_epochs=2)
     edit.train(config)
+    vector_factory.assert_called_once_with(config.edit_config, 2, workers=config.env_workers)
+    assert vector.closed
     assert collect.call_count == 1
     assert update.call_count == (1 if rejected else 2)
     writer.add_scalar.assert_any_call("charts/updates_per_rollout", 0.0 if rejected else 2.0, 2)
     writer.add_scalar.assert_any_call("policy/early_stop", float(rejected), 2)
     output = capsys.readouterr().out
-    for name in ("decisions_mean", "sequence_length_mean", "edits_mean", "sequence_budget_exhausted_rate"):
+    for name in (
+        "decisions_mean",
+        "sequence_length_mean",
+        "edits_mean",
+        "sequence_budget_exhausted_rate",
+        "program_node_count_mean",
+        "program_node_ratio_mean",
+        "program_depth_mean",
+        "program_depth_ratio_mean",
+    ):
         value = rollout[2][f"charts/{name}"]
         assert f"{name}={value:.3f}" in output
         writer.add_scalar.assert_any_call(f"charts/{name}", value, 2)
@@ -510,13 +538,8 @@ def test_asynchronous_updates_and_finished_padding_replay_exactly(
         return actions, edit.action_log_prob(logits, actions)
 
     monkeypatch.setattr(edit, "act", act)
-    batch, _, _, _, _ = edit.collect_rollout(
-        state,
-        [editing.KarelASTEditEnv(config.edit_config) for _ in range(2)],
-        np.random.default_rng(4),
-        jax.random.key(7),
-        config,
-    )
+    with edit.KarelASTEditVectorEnv(config.edit_config, 2, workers=2) as envs:
+        batch, _, _, _, _ = edit.collect_rollout(state, envs, np.random.default_rng(4), jax.random.key(7), config)
     assert offsets == [len(script) for script in scripts]
     np.testing.assert_array_equal(batch.actions[batch.mask[:, 0], 0], scripts[0])
     np.testing.assert_array_equal(batch.actions[batch.mask[:, 1], 1], scripts[1])
@@ -610,7 +633,7 @@ def test_more_than_three_edits_fit_sequence_budget(
     monkeypatch.setattr(edit, "act", act)
     batch, _, metrics, _, programs = edit.collect_rollout(
         state,
-        [editing.KarelASTEditEnv(config.edit_config) for _ in range(2)],
+        edit.KarelASTEditVectorEnv(config.edit_config, 2),
         np.random.default_rng(4),
         jax.random.key(7),
         config,

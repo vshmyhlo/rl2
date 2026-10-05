@@ -2,6 +2,7 @@ seed: 1
 total_updates: 100000
 num_tasks: 32
 group_size: 8 # Independent editing episodes per task, all starting from seed_program
+env_workers: 8 # Persistent spawned workers for batched reset/stepping; 0 runs locally
 num_minibatches: 4 # Must divide num_tasks * group_size; episodes stay together
 update_epochs: 1
 max_seq_len: 512 # Total seed, action, and execution-update tokens per episode
@@ -21,7 +22,7 @@ target_kl: 0.02
 entropy_coef: 0.01
 max_grad_norm: 1.0
 log_dir: gs://cohere-dev/vlad/rl2/karel_ast_ar_edit # Local or gs:// path
-run_id: delta_conv_all_steps_v1 # Every-token image encoder; use a fresh run, incompatible with older encoders
+run_id: delta_conv_all_steps_v2 # Every-token image encoder; use a fresh run, incompatible with older encoders
 checkpoint_interval_seconds: 300
 log_interval: 10
 log_program_interval: 10
