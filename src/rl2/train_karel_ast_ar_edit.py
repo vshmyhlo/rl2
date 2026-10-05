@@ -184,8 +184,7 @@ class Config:
             if type(value) is not int:
                 raise TypeError("Rollout and update counts must be integers")
             chex.assert_scalar_positive(value)
-        if self.group_size < 2:
-            raise ValueError("GRPO requires group_size >= 2")
+        self._validate_group_size()
         if self.num_tasks * self.group_size % self.num_minibatches:
             raise ValueError("num_minibatches must divide num_tasks * group_size")
         chex.assert_type(self.seed, int)
@@ -204,6 +203,11 @@ class Config:
                 raise ValueError("target_kl must be finite or null")
 
         _ = self.edit_config
+
+    def _validate_group_size(self) -> None:
+        """Require multiple samples for the GRPO baseline; PPO overrides this constraint."""
+        if self.group_size < 2:
+            raise ValueError("GRPO requires group_size >= 2")
 
     @property
     def edit_config(self) -> EditConfig:

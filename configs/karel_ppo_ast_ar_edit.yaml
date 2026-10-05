@@ -1,7 +1,7 @@
 seed: 1
 total_updates: 100000
 num_tasks: 32
-group_size: 8 # Independent editing episodes per task, all starting from seed_program
+group_size: 8 # Optional repeated episodes per task; PPO also supports 1
 env_workers: 8 # Persistent spawned workers for batched reset/stepping; 0 runs locally
 num_minibatches: 4 # Must divide num_tasks * group_size; episodes stay together
 update_epochs: 1
@@ -18,11 +18,14 @@ num_kv_heads: null
 learning_rate: 0.0001
 anneal_lr: true
 clip_coef: 0.2 # Per decoder decision, including location selection and STOP
+gamma: 0.99 # Discount per editing decision
+gae_lambda: 0.95
+value_coef: 0.5 # Unclipped half squared-error critic loss
 target_kl: 0.02
 entropy_coef: 0.01
 max_grad_norm: 1.0
-log_dir: gs://cohere-dev/vlad/rl2/karel_ast_ar_edit # Local or gs:// path
-run_id: delta_conv_all_steps_v3 # Every-token image encoder; use a fresh run, incompatible with older encoders
+log_dir: runs/karel_ppo_ast_ar_edit # Local or gs:// path
+run_id: null # Creates a new run; reuse a PPO run ID to resume
 checkpoint_interval_seconds: 300
 log_interval: 10
 log_program_interval: 10
@@ -38,8 +41,9 @@ log_compiles: true
 # Replacement size varies; masks reserve nodes/source tokens AND sequence tokens to complete every hole; feedback uses no extra token.
 # Execute only complete candidates, always from the original input grid.
 # Feedback: last final/partial grid, score, success/error, ticks, size, score delta, sequence tokens left.
-# Edit rewards are score differences; GRPO normalizes summed episode returns within each task group.
-# Every decision, including STOP, shares the episode advantage. No critic or extra terminal reward.
+# Edit rewards are score differences; PPO uses a shared-backbone critic and per-decision GAE.
+# Advantages normalize over valid decisions per minibatch; policy and value losses exclude seed/PAD.
+# STOP and the sequence budget are terminal: zero bootstrap and no extra terminal reward.
 # Regressive edits are accepted; success does not force early stopping.
 env:
   height: 8

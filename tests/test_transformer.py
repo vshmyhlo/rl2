@@ -70,6 +70,7 @@ def reference_block(
     kv_heads: int,
     theta: float,
     epsilon: float = 1e-5,
+    causal: bool = True,
 ) -> np.ndarray:
     """Float64 NumPy oracle with explicit per-episode, per-query attention."""
     sc = ShapeChecker(H=heads, K=kv_heads)
@@ -100,12 +101,18 @@ def reference_block(
                     imag = tensor[b, t, :, 2 * pair + 1].copy()
                     tensor[b, t, :, 2 * pair] = real * c - imag * s
                     tensor[b, t, :, 2 * pair + 1] = real * s + imag * c
+        start = 0
+        for t in range(steps):
+            if starts[b, t]:
+                start = t
             left = start
+            following_resets = np.flatnonzero(starts[b, t + 1 :])
+            right = t + 1 if causal else (t + 1 + following_resets[0] if following_resets.size else steps)
             for h in range(heads):
                 group = h // (heads // kv_heads)
-                logits = key[b, left : t + 1, group] @ query[b, t, h] / np.sqrt(head_dim)
+                logits = key[b, left:right, group] @ query[b, t, h] / np.sqrt(head_dim)
                 weights = np.exp(logits - logits.max())
-                output[b, t, h] = (weights / weights.sum()) @ value[b, left : t + 1, group]
+                output[b, t, h] = (weights / weights.sum()) @ value[b, left:right, group]
     x = residual + output.reshape(x.shape) @ np.asarray(params["out_proj"]["kernel"])
     normalized = x / np.sqrt(np.mean(x**2, axis=-1, keepdims=True) + epsilon)
     normalized *= np.asarray(params["norm2"]["scale"])
@@ -162,6 +169,43 @@ def test_norm_epsilon_and_full_history() -> None:
     contribution = jnp.tile(delta @ variables["params"]["v_proj"]["kernel"], 2)
     contribution = contribution @ variables["params"]["out_proj"]["kernel"] / 4
     np.testing.assert_allclose(perturbed[0, -1] - baseline[0, -1], contribution, atol=1e-6)
+
+
+def test_noncausal_packed_and_cached_attention_matches_reference() -> None:
+    model = TransformerBlock(8, num_heads=2, num_kv_heads=1, max_seq_len=6, initializer_range=0.2, causal=False)
+    x = jax.random.normal(jax.random.key(33), (2, 5, 8))
+    starts = jnp.zeros((2, 5), jnp.bool_).at[0, 3].set(True).at[1, 2].set(True)
+    sc = ShapeChecker(B=2, T=5, D=8, C=6, K=1, F=4)
+    sc.check(x, "BTD", jnp.float32)
+    sc.check(starts, "BT", jnp.bool_)
+    variables = model.init(jax.random.key(34), x)
+    expected = reference_block(
+        np.asarray(x), variables["params"], np.asarray(starts), 2, 1, model.rope_theta, causal=False
+    )
+    full_carry, actual = jax.jit(model.apply)(variables, x, episode_starts=starts)
+    sc.check(actual, "BTD", jnp.float32)
+    np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-5)
+
+    carry, _ = model.apply(variables, x[:, :1])
+    # Unused slots must be excluded even when they contain nonzero data.
+    carry = carry._replace(key=carry.key.at[:, 1:].set(100), value=carry.value.at[:, 1:].set(100))
+    sc.check((carry.key, carry.value), "BCKF", jnp.float32)
+    cached_carry, cached = jax.jit(model.apply)(variables, x[:, 1:], carry, starts[:, 1:])
+    sc.check(cached, "BSD", jnp.float32)
+    np.testing.assert_allclose(cached, expected[:, 1:], atol=2e-6, rtol=2e-5)
+    assert_carry_close(cached_carry, full_carry)
+
+    # A single step can attend to supplied history, but has no future input.
+    _, stepped = model.apply(variables, x[:, 1], carry, method=model.step)
+    step_expected = reference_block(
+        np.asarray(x[:, :2]), variables["params"], np.asarray(starts[:, :2]), 2, 1, model.rope_theta, causal=False
+    )
+    sc.check(stepped, "BD", jnp.float32)
+    np.testing.assert_allclose(stepped, step_expected[:, -1], atol=2e-6, rtol=2e-5)
+    unchanged_carry, empty = model.apply(variables, x[:, :0], carry)
+    sc.check(empty, "BED", jnp.float32)
+    assert empty.shape[1] == 0
+    assert_carry_close(unchanged_carry, carry)
 
 
 @pytest.mark.parametrize("compiled", [False, True])
@@ -233,9 +277,11 @@ def test_transformer_defaults() -> None:
     assert block.norm_epsilon == stack.norm_epsilon == 1e-5
     assert block.rope_theta == stack.rope_theta == stack._make_block().rope_theta == 10000.0
     assert block.mlp_expansion == stack.mlp_expansion == 2.0
+    assert block.causal is stack.causal is stack._make_block().causal is True
 
 
-def test_stack_matches_llama_reference_with_final_norm() -> None:
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
+def test_stack_matches_llama_reference_with_final_norm(causal: bool) -> None:
     model = TransformerStack(
         8,
         2,
@@ -244,6 +290,7 @@ def test_stack_matches_llama_reference_with_final_norm() -> None:
         max_seq_len=3,
         mlp_expansion=4.0,
         initializer_range=0.2,
+        causal=causal,
     )
     x = jax.random.normal(jax.random.key(31), (1, 3, 8))
     sc = ShapeChecker(B=1, T=3, D=8)
@@ -268,7 +315,7 @@ def test_stack_matches_llama_reference_with_final_norm() -> None:
         }
         for name in ("q_proj", "k_proj", "v_proj", "out_proj", "gate_proj", "up_proj", "down_proj"):
             assert set(layer[name]) == {"kernel"}
-        expected = reference_block(expected, layer, np.zeros((1, 3), bool), 2, 1, model.rope_theta)
+        expected = reference_block(expected, layer, np.zeros((1, 3), bool), 2, 1, model.rope_theta, causal=causal)
     expected /= np.sqrt(np.mean(expected**2, axis=-1, keepdims=True) + model.norm_epsilon)
     expected *= np.asarray(params["norm_f"]["scale"])
     _, actual = jax.jit(model.apply)(variables, x)
@@ -452,6 +499,7 @@ def test_precision_empty_initialization_and_parameter_independence(dtype: jax.ty
         {"dtype": jnp.int32},
         {"attention_implementation": "invalid"},
         {"attention_implementation": "cudnn"},
+        {"causal": "false"},
         {"num_heads": True},
         {"dim": 12, "num_heads": 4},
     ],
@@ -522,12 +570,15 @@ def test_rope_rejects_invalid_positions(
         _rope(jnp.zeros((1, 2, 1, 2), jnp.float32), jnp.zeros(positions_shape, positions_dtype), 10000.0)
 
 
-@pytest.mark.parametrize("steps,window", [(1, 4), (3, 7)])
+@pytest.mark.parametrize(
+    "steps,window,causal",
+    [(1, 4, True), (3, 7, True), pytest.param(3, 7, False, id="noncausal-padding")],
+)
 def test_cudnn_mask_padding_preserves_outputs_and_gradients(
-    monkeypatch: pytest.MonkeyPatch, steps: int, window: int
+    monkeypatch: pytest.MonkeyPatch, steps: int, window: int, causal: bool
 ) -> None:
     """Exercise backend routing/padding on CPU; real kernels are tested below."""
-    model = TransformerBlock(16, num_heads=2, num_kv_heads=1, max_seq_len=window, dtype=jnp.bfloat16)
+    model = TransformerBlock(16, num_heads=2, num_kv_heads=1, max_seq_len=window, dtype=jnp.bfloat16, causal=causal)
     fused = model.clone(attention_implementation="cudnn")
     x = jax.random.normal(jax.random.key(16), (2, steps, 16))
     variables = model.init(jax.random.key(17), x)

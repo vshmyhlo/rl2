@@ -20,10 +20,14 @@ activation dtype, matching Meta's Llama 3 reference. Queries and keys have
 no additional normalization. Residual additions use their operands' dtypes
 without explicitly promoting to float32.
 
-Attention is fully causal within each episode. The fixed-size cache retains
+Attention defaults to causal within each episode; set ``causal=False`` for
+bidirectional attention over the current chunk and valid cached history in
+the same episode. Cached states are not recomputed, so non-causal outputs
+depend on chunk boundaries and step calls cannot see future inputs.
+The fixed-size cache retains
 all episode tokens, up to ``max_seq_len``; exceeding that capacity raises an
 error, including under JIT. Per-example ``episode_starts`` clear the cache and
-restart RoPE positions. Sequence, chunk and step calls
+restart RoPE positions. With causal attention, sequence, chunk and step calls
 have identical semantics; prefill computes attention in parallel, without a
 token-by-token attention scan. Gradients flow through supplied caches unless
 the caller applies ``jax.lax.stop_gradient``.
@@ -31,7 +35,7 @@ the caller applies ``jax.lax.stop_gradient``.
 ``attention_implementation="xla"`` is portable (the default). Select ``"cudnn"``
 with float16/bfloat16 and a supported NVIDIA GPU for JAX's cuDNN fused attention.
 Backend shape/device restrictions are reported by JAX, without silent fallback.
-Fresh, unsegmented prefill uses the native causal mask; cached or packed
+Fresh, unsegmented prefill uses the native attention mode; cached or packed
 sequences use an explicit boolean mask to handle offsets and episode resets.
 Masked cuDNN calls pad odd sequence lengths for its backward-pass constraints.
 
@@ -149,6 +153,8 @@ class TransformerBlock(nn.Module):
 
     MLP width is ``round(dim * mlp_expansion)``; expansion defaults to 2.
     ``num_kv_heads=None`` gives ordinary multi-head attention.
+    ``causal=False`` allows attention to future tokens in the current chunk,
+    within the same episode. Defaults to causal attention.
 
     Fewer KV heads enable grouped-query attention (one gives multi-query
     attention). ``dim`` must be divisible by ``num_heads``, and the query
@@ -166,6 +172,7 @@ class TransformerBlock(nn.Module):
     attention_implementation: AttentionImplementation = "xla"
     dtype: jax.typing.DTypeLike = jnp.float32
     initializer_range: float = 0.02
+    causal: bool = True
 
     @nn.nowrap
     def _mlp_width(self) -> int:
@@ -187,6 +194,8 @@ class TransformerBlock(nn.Module):
                 raise ValueError(f"{name} must be positive and finite")
         if self.attention_implementation not in ("xla", "cudnn"):
             raise ValueError("attention_implementation must be 'xla' or 'cudnn'")
+        if not isinstance(self.causal, bool):
+            raise TypeError("causal must be a bool")
         dtype = jnp.dtype(self.dtype)
         if dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
             raise ValueError("dtype must be float32, bfloat16, or float16")
@@ -275,9 +284,9 @@ class TransformerBlock(nn.Module):
             sc.check(old_positions, "BC", jnp.int32)
 
             mask = None
-            native_causal = fresh and unsegmented
-            if native_causal:
-                # Let cuDNN handle causality without materializing a dense mask.
+            native_attention = fresh and unsegmented
+            if native_attention:
+                # Let the backend handle causality without a dense mask.
                 keys, values = key, value
             else:
                 segments = jnp.cumsum(starts, axis=1, dtype=jnp.int32)
@@ -289,12 +298,13 @@ class TransformerBlock(nn.Module):
                     key_segments = jnp.concatenate((jnp.zeros_like(old_positions), segments), 1)
                 sc.check(segments, "BT", jnp.int32)
                 sc.check((key_positions, key_segments), "BS", jnp.int32)
-                distance = positions[:, :, None] - key_positions[:, None, :]
-                mask = distance >= 0
+                mask = segments[:, :, None] == key_segments[:, None, :]
                 mask &= key_positions[:, None, :] >= 0
-                mask &= segments[:, :, None] == key_segments[:, None, :]
+                if self.causal:
+                    distance = positions[:, :, None] - key_positions[:, None, :]
+                    sc.check(distance, "BTS", jnp.int32)
+                    mask &= distance >= 0
                 mask = mask[:, None]
-                sc.check(distance, "BTS", jnp.int32)
                 sc.check(mask, "BUTS", jnp.bool_)
             queries = query
             if self.attention_implementation == "cudnn" and mask is not None:
@@ -326,7 +336,7 @@ class TransformerBlock(nn.Module):
                 keys,
                 values,
                 mask=mask,
-                is_causal=native_causal,
+                is_causal=self.causal and native_attention,
                 local_window_size=None,
                 implementation=self.attention_implementation,
             )
@@ -400,6 +410,9 @@ class TransformerStack(nn.Module):
     preserve the operands' normal dtype promotion rules.
     All projections use normal initialization with standard deviation
     ``initializer_range`` (default 0.02), independent of depth.
+    ``causal`` controls attention in every block and defaults to True.
+    Non-causal attention sees the current chunk and cached history within
+    each episode; results depend on chunk boundaries.
     """
 
     dim: int
@@ -414,6 +427,7 @@ class TransformerStack(nn.Module):
     initializer_range: float = 0.02
     attention_implementation: AttentionImplementation = "xla"
     dtype: jax.typing.DTypeLike = jnp.float32
+    causal: bool = True
 
     @nn.nowrap
     def _mlp_width(self) -> int:
@@ -436,6 +450,7 @@ class TransformerStack(nn.Module):
             attention_implementation=self.attention_implementation,
             dtype=self.dtype,
             initializer_range=self.initializer_range,
+            causal=self.causal,
             parent=None,
         )
         block._dimensions()
