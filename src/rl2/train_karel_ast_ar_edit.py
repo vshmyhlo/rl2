@@ -2,8 +2,9 @@
 
 A macro action selects a preorder location and fills its typed hole with DFS
 constructor/value decisions. Only complete replacements execute. STOP returns
-the current program; max_edits bounds the episode. Every candidate executes
-from the task's original input, including after a failed or regressive edit.
+the current program; max_decisions bounds total policy actions per episode.
+Every candidate executes from the task's original input, including after a
+failed or regressive edit.
 The policy consumes a causal sequence with a persistent KV cache:
     task grids -> seed DFS tokens -> execution update -> edit actions
                -> execution update -> more edit actions -> ... -> STOP
@@ -21,14 +22,14 @@ original input grid. During replacement generation, execution feedback stays
 from the previous complete program. Partial-tree changes are represented by
 action tokens; scalar feedback is supplied only at execution-update boundaries,
 where the length feature is the complete candidate's source length. STOP returns
-the current candidate without executing it again. The final candidate's reward trains all decisions
-in the episode; intermediate evaluations supply observations, not separate
-per-edit training rewards.
+the current candidate without executing it again. The final candidate's reward
+trains all decisions in the episode; intermediate evaluations supply observations,
+not separate per-edit training rewards.
 
-Below, S describes the host state (current AST, last execution feedback, edits
+Below, S describes the host state (current AST, last execution feedback, actions
 left); the model observes its serialized event history rather than S directly.
 Program bodies are shown without the surrounding DEF run m( ... m) wrapper.
-Assume max_edits=3.
+Assume max_decisions=12; locations, grammar expansions and STOP each cost one action.
 Each transition reads S -> action -> (r, next S). Here r describes the equivalent
 terminal-only training reward: zero until termination, then R(final program).
 R(p) is the environment's execution score for program p, including configured
@@ -44,10 +45,10 @@ Example 1: the target requires one right turn.
     S1 -- turnRight --> (r=0, S2)
     S2 -- STOP --> (r=R(turnRight), Terminal)
 
-    S0: turnLeft; feedback from seed execution; edits left=3
-    S1: <Statement>; same execution feedback; edits left=3
+    S0: turnLeft; feedback from seed execution; actions left=12
+    S1: <Statement>; same execution feedback; actions left=11
     S2: turnRight; replacement complete, so execute from original input;
-        refreshed feedback contains R(turnRight) and success; edits left=2
+        refreshed feedback contains R(turnRight) and success; actions left=10
     Terminal: return turnRight and train using its reward.
 
     Corresponding model input/decision stream:
@@ -67,32 +68,36 @@ Example 2: the target requires moving three cells along a clear path.
     S5 -- End --> (r=0, S6)
     S6 -- STOP --> (r=R(REPEAT 3 { move }), Terminal)
 
-    S0: turnLeft; feedback from seed execution; edits left=3
+    S0: turnLeft; feedback from seed execution; actions left=12
     S1: <Statement>
     S2: REPEAT <Count> { <Nonempty body> }
     S3: REPEAT 3 { <Nonempty body> }
     S4: REPEAT 3 { <Statement>; <List tail> }
     S5: REPEAT 3 { move; <List tail> }
     S6: REPEAT 3 { move }; replacement complete, so execute from original input;
-        refreshed feedback contains R(REPEAT 3 { move }) and success; edits left=2
+        refreshed feedback contains R(REPEAT 3 { move }) and success; actions left=6
     Terminal: return the repeat program and train using its reward.
 
-S1-S5 in example 2 retain S0's execution feedback and edits left=3. Choosing
-Cons instead of End at S5 would create another statement hole and list-tail
+S1-S5 in example 2 retain S0's execution feedback, while actions left decrease
+from 11 to 7. Choosing Cons instead of End at S5 would create another statement
+hole and list-tail
 hole, extending the replacement if the budgets allow it. Grammar masks reserve
-enough capacity to finish all holes. After max_edits complete replacements,
-the episode ends automatically; reaching the target does not force a STOP.
-If an edit uses the last available edit, its final grammar action instead leads
-directly to (r=R(completed program), Terminal), with no additional STOP decision.
+enough node/source capacity and enough remaining policy actions to finish all
+holes. There is no separate limit on completed edits. STOP or exhaustion of the
+action budget ends the episode; reaching the target does not force a STOP.
+If a completion consumes the last available action, it leads directly to
+(r=R(completed program), Terminal), with no additional STOP decision. With only
+one action remaining on a complete tree, only STOP is legal. Execution-update
+events do not consume policy actions; cache space for them is reserved separately.
 
 If execution fails, refresh feedback with the last valid grid and error status.
 The AST is still complete, so the next decision can select another subtree to
-repair or STOP, provided the edit budget has not already ended the episode.
+repair or STOP, provided the action budget has not already ended the episode.
 """
 
 import argparse
 import math
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -132,42 +137,120 @@ from rl2.train_karel_ast_grpo import (
     group_advantages,
     learning_rate_schedule,
 )
-from rl2.train_karel_ast_grpo import (
-    Config as BaseConfig,
-)
 from rl2.transformer import AttentionImplementation, TransformerStack, TransformerStackCarry
 from rl2.utils import read_bytes, read_optional, write_bytes
 
-FEEDBACK_SIZE = 7  # reward, success, runtime error, execution limit, ticks, source length, edits left
+FEEDBACK_SIZE = 7  # reward, success, runtime error, execution limit, ticks, source length, actions left
 
 
 @dataclass(frozen=True)
-class Config(BaseConfig):
-    max_edits: int = 3
-    replay_batch_size: int = 4  # Whole episodes per gradient microbatch; preserve their complete histories.
+class Config:
+    # Reproducibility and training duration.
+    seed: int = 1
+    total_updates: int = 1000  # Number of rollout batches, independent of program length.
+
+    # Task environment and program editing.
+    env: KarelConfig = field(default_factory=KarelConfig)
     seed_program: str = "DEF run m( turnLeft m)"
+    max_nodes: int = 128  # AST node budget for grammar masking; also sizes edit locations and sequence capacity.
+    max_depth: int = 64  # AST depth limit for grammar masking only.
+    max_decisions: int = 64  # Total sampled actions, including locations, grammar actions and STOP.
+
+    # Rollout groups and update batching.
+    num_tasks: int = 8
+    group_size: int = 8
+    num_minibatches: int = 4
+    update_epochs: int = 2
+
+    # Transformer architecture and numerical backend.
+    d_model: int = 320
+    num_layers: int = 7
+    num_heads: int = 5
+    num_kv_heads: int | None = None
+    bf16: bool = False
+    attention_implementation: AttentionImplementation = "xla"
+
+    # Optimizer and GRPO objective.
+    learning_rate: float = 0.00025
+    anneal_lr: bool = True
+    clip_coef: float = 0.2
+    target_kl: float | None = 0.02
+    entropy_coef: float = 0.0
+    max_grad_norm: float = 0.5
+
+    # Run storage, checkpointing, and logging.
+    log_dir: str = "runs"
+    run_id: str | None = None  # Same ID resumes; None creates a timestamped run.
+    checkpoint_interval_seconds: float = 300.0  # Save at the next completed rollout boundary.
+    log_interval: int = 20  # TensorBoard scalars, stdout, and flushes every N completed rollouts.
+    log_program_interval: int = 20  # Program samples on logging iterations divisible by this interval.
+    log_program_count: int = 8  # First N programs in one group; zero disables samples.
+    log_compiles: bool = False  # Print bucket shapes on new prediction/update JIT traces.
 
     def __post_init__(self) -> None:
-        super().__post_init__()
-        for value in (self.max_edits, self.replay_batch_size):
+        """Validate training settings, backend compatibility, and seed-program budgets."""
+        if self.run_id is not None:
+            if not isinstance(self.run_id, str):
+                raise TypeError("run_id must be a string or null")
+            if not self.run_id.strip() or self.run_id in (".", "..") or any(c in self.run_id for c in "/\\"):
+                raise ValueError("run_id must be a nonempty directory name, without slashes or traversal")
+        chex.assert_scalar_positive(self.checkpoint_interval_seconds)
+        if not np.isfinite(self.checkpoint_interval_seconds):
+            raise ValueError("checkpoint_interval_seconds must be finite")
+        KarelAST.empty(self.max_nodes, self.max_depth, self.env.max_program_tokens)
+        if type(self.bf16) is not bool:
+            raise TypeError("bf16 must be a boolean")
+        if type(self.log_compiles) is not bool:
+            raise TypeError("log_compiles must be a boolean")
+        if self.attention_implementation not in ("xla", "cudnn"):
+            raise ValueError("attention_implementation must be 'xla' or 'cudnn'")
+        if self.attention_implementation == "cudnn" and not self.bf16:
+            raise ValueError("cuDNN attention requires bf16=True")
+        for value in (self.log_interval, self.log_program_interval, self.log_program_count):
             if type(value) is not int:
-                raise TypeError("Edit and replay budgets must be integers")
+                raise TypeError("Logging settings must be integers")
+        chex.assert_scalar_positive(self.log_interval)
+        chex.assert_scalar_positive(self.log_program_interval)
+        chex.assert_scalar_non_negative(self.log_program_count)
+        for value in (self.total_updates, self.num_tasks, self.group_size, self.num_minibatches, self.update_epochs):
+            if type(value) is not int:
+                raise TypeError("Rollout and update counts must be integers")
             chex.assert_scalar_positive(value)
+        if self.group_size < 2:
+            raise ValueError("GRPO requires group_size >= 2")
+        if self.num_tasks * self.group_size % self.num_minibatches:
+            raise ValueError("num_minibatches must divide num_tasks * group_size")
+        chex.assert_type(self.seed, int)
+        chex.assert_scalar_non_negative(self.seed)
+        chex.assert_scalar_in(self.clip_coef, 0, 1, included=False)
+        for value in (self.learning_rate, self.max_grad_norm):
+            chex.assert_scalar_positive(value)
+            if not np.isfinite(value):
+                raise ValueError("Optimizer settings must be finite")
+        chex.assert_scalar_non_negative(self.entropy_coef)
+        if not np.isfinite(self.entropy_coef):
+            raise ValueError("entropy_coef must be finite")
+        if self.target_kl is not None:
+            chex.assert_scalar_positive(self.target_kl)
+            if not np.isfinite(self.target_kl):
+                raise ValueError("target_kl must be finite or null")
+
+        if type(self.max_decisions) is not int:
+            raise TypeError("Action budget must be an integer")
+        chex.assert_scalar_positive(self.max_decisions)
         if not isinstance(self.seed_program, str):
             raise TypeError("seed_program must be source text")
         seed_tree(self)
 
     @property
-    def max_decisions(self) -> int:
-        return self.max_edits * (1 + self.max_nodes)
-
-    @property
     def max_seq_len(self) -> int:
         """Task + maximum seed + initial update + all actions and edit updates."""
-        return 2 + self.max_nodes + self.max_decisions + self.max_edits
+        # Each completed edit needs at least a location action and one expansion.
+        return 2 + self.max_nodes + self.max_decisions + self.max_decisions // 2
 
 
 def seed_tree(config: Config) -> KarelAST:
+    """Build the episode's starting AST by replaying its source as grammar actions."""
     tree = KarelAST.empty(config.max_nodes, config.max_depth, config.env.max_program_tokens)
     for action in program_actions(tuple(config.seed_program.split())):
         tree = tree.expand(action)
@@ -190,6 +273,7 @@ def open_subtree(tree: KarelAST, position: int) -> KarelAST:
     nodes: list[Node] = []
 
     def copy(index: int) -> int:
+        """Copy reachable nodes, replacing the selected subtree with one typed hole."""
         node = tree.nodes[index]
         destination = len(nodes)
         nodes.append(replace(node, constructor=0, value=0, children=()) if index == selected else node)
@@ -257,12 +341,13 @@ class EditTransformer(nn.Module):
     num_heads: int = 8
     num_kv_heads: int | None = None
     max_nodes: int = 64
-    max_seq_len: int = 264
+    max_seq_len: int = 354
     max_markers: int = 10
     dtype: jax.typing.DTypeLike = jnp.float32
     attention_implementation: AttentionImplementation = "xla"
 
     def setup(self) -> None:
+        """Create task and feedback encoders, event embeddings, and the causal policy."""
         for value in (self.max_nodes, self.max_markers):
             chex.assert_type(value, int)
             chex.assert_scalar_positive(value)
@@ -286,6 +371,7 @@ class EditTransformer(nn.Module):
         )
 
     def encode_pair(self, initial: jax.Array, target: jax.Array) -> jax.Array:
+        """Encode each task's normalized input and target grids as one prefix token."""
         chex.assert_shape(initial, (None, None, None, 6))
         chex.assert_equal_shape((initial, target))
         chex.assert_type((initial, target), jnp.int32)
@@ -296,6 +382,7 @@ class EditTransformer(nn.Module):
         return self.context_norm(self.context_projection(grids.reshape(initial.shape[0], -1)))
 
     def encode_events(self, events: Events) -> jax.Array:
+        """Embed seed/action IDs and execution feedback, zeroing trailing padding."""
         chex.assert_rank(events.kind, 2)
         chex.assert_equal_shape((events.kind, events.value))
         chex.assert_type((events.kind, events.value, events.output), jnp.int32)
@@ -315,6 +402,7 @@ class EditTransformer(nn.Module):
         return jnp.where((events.kind != PAD_EVENT)[..., None], x, 0)
 
     def __call__(self, history: History) -> ModelOutput:
+        """Encode the complete causal history and return its cache and next-action logits."""
         context = self.encode_pair(history.initial, history.target)
         chex.assert_shape(history.events.kind, (None, context.shape[0]))
         inputs = jnp.concatenate((context[None], self.encode_events(history.events)), axis=0)
@@ -327,6 +415,7 @@ class EditTransformer(nn.Module):
         return carry, logits[-1]
 
     def step(self, event: Events, carry: TransformerStackCarry) -> ModelOutput:
+        """Append one event per episode to the KV cache and predict the next action."""
         chex.assert_rank(event.kind, 1)
         if carry is None:
             raise ValueError("Use prefill before step")
@@ -336,6 +425,7 @@ class EditTransformer(nn.Module):
 
 
 def empty_events(time: int, batch: int, config: Config) -> Events:
+    """Allocate writable host arrays initialized to padding for a batch of event streams."""
     chex.assert_scalar_non_negative(time)
     chex.assert_scalar_positive(batch)
     return Events(
@@ -347,6 +437,7 @@ def empty_events(time: int, batch: int, config: Config) -> Events:
 
 
 def initial_history(observations: list[Observation], config: Config) -> History:
+    """Assemble task grids, seed grammar tokens, and the seed's execution feedback."""
     if not observations:
         raise ValueError("Cannot initialize an empty history")
     seed = program_actions(tuple(config.seed_program.split()))
@@ -361,6 +452,7 @@ def initial_history(observations: list[Observation], config: Config) -> History:
 
 @partial(jax.jit, static_argnames="log_compiles")
 def prefill(state: TrainState, history: History, *, log_compiles: bool = False) -> ModelOutput:
+    """Initialize rollout KV caches and first-decision logits with the current policy."""
     if log_compiles:
         print(f"JIT trace edit prefill: events={history.events.kind.shape}", flush=True)
     return state.apply_fn({"params": state.params}, history, method=EditTransformer.prefill)
@@ -370,20 +462,15 @@ def prefill(state: TrainState, history: History, *, log_compiles: bool = False) 
 def decode_step(
     state: TrainState, event: Events, carry: TransformerStackCarry, *, log_compiles: bool = False
 ) -> ModelOutput:
+    """Advance cached rollout histories by one action, feedback, or padding event."""
     if log_compiles:
         print(f"JIT trace edit step: batch={event.kind.shape[0]}", flush=True)
     return state.apply_fn({"params": state.params}, event, carry, method=EditTransformer.step)
 
 
 @jax.jit
-def predict(state: TrainState, history: History) -> jax.Array:
-    """Replay the entire causal history for testing or scoring."""
-    _, logits = state.apply_fn({"params": state.params}, history)
-    return logits
-
-
-@jax.jit
 def mask_logits(logits: jax.Array, legal: Array) -> jax.Array:
+    """Exclude illegal actions from sampling and policy-loss probability calculations."""
     chex.assert_equal_shape((logits, legal))
     chex.assert_type(logits, jnp.float32)
     chex.assert_type(legal, jnp.bool_)
@@ -441,15 +528,25 @@ def evaluate(tree: KarelAST, task: KarelProgramEnv, env: KarelProgramEnv, initia
     )
 
 
-def observe(tree: KarelAST, pair: KarelPair, result: Evaluation, edits_left: int, config: Config) -> Observation:
-    chex.assert_scalar_in(edits_left, 0, config.max_edits)
+def observe(tree: KarelAST, pair: KarelPair, result: Evaluation, decisions_left: int, config: Config) -> Observation:
+    """Build host feedback and action masks that reserve enough budget to finish edits."""
+    chex.assert_scalar_in(decisions_left, 0, config.max_decisions)
     legal = np.zeros(1 + config.max_nodes + len(AST_ACTIONS), np.bool_)
     if tree.complete:
         legal[0] = True
-        if edits_left:
-            legal[1 : 1 + len(tree.nodes)] = True
+        # Reserve the location action plus the cheapest typed replacement.
+        # In this grammar minimum-node completions also minimize source length.
+        for position, index in enumerate(tree.preorder()):
+            legal[1 + position] = 1 + int(tree._costs(index).min()) <= decisions_left
     else:
-        legal[1 + config.max_nodes :] = tree.allowed_actions()
+        # One grammar expansion resolves exactly one node. Reserve actions for
+        # ALL remaining holes, not only the next hole or the sampled constructor.
+        frontier = tree.frontier
+        assert frontier is not None
+        costs = tree._costs(frontier)
+        resolved = sum(not node.is_hole for node in tree.nodes)
+        required = tree._minimum_completion() - resolved
+        legal[1 + config.max_nodes :] = tree.allowed_actions() & (required - costs.min() + costs <= decisions_left)
     feedback = np.asarray(
         [
             result.reward,
@@ -459,7 +556,7 @@ def observe(tree: KarelAST, pair: KarelPair, result: Evaluation, edits_left: int
             result.ticks / config.env.max_execution_steps,
             # During replacement, length describes the current partial tree's minimum completion.
             tree._minimum_completion(source=True) / config.env.max_program_tokens,
-            edits_left / config.max_edits,
+            decisions_left / config.max_decisions,
         ],
         np.float32,
     )
@@ -467,6 +564,7 @@ def observe(tree: KarelAST, pair: KarelPair, result: Evaluation, edits_left: int
 
 
 def load_config(path: str | Path) -> Config:
+    """Load local or remote YAML into validated training and environment settings."""
     settings = yaml.safe_load(read_bytes(str(path))) or {}
     if "env" in settings:
         settings["env"] = KarelConfig(**settings["env"])
@@ -474,6 +572,7 @@ def load_config(path: str | Path) -> Config:
 
 
 def create_state(config: Config, initial: Array, target: Array) -> TrainState:
+    """Initialize policy parameters and Adam state using the supplied task-grid shapes."""
     chex.assert_shape(initial, (None, config.env.height, config.env.width, 6))
     chex.assert_equal_shape((initial, target))
     chex.assert_type((initial, target), jnp.int32)
@@ -494,6 +593,7 @@ def create_state(config: Config, initial: Array, target: Array) -> TrainState:
     params = model.init(jax.random.key(config.seed), History(initial, target, events))["params"]
 
     def optimizer(learning_rate: float | jax.Array) -> optax.GradientTransformation:
+        """Clip the global gradient norm before applying Adam at the scheduled rate."""
         return optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adam(learning_rate, eps=1e-5))
 
     return TrainState.create(
@@ -501,8 +601,8 @@ def create_state(config: Config, initial: Array, target: Array) -> TrainState:
     )
 
 
-@jax.jit
 def action_log_prob(logits: jax.Array, actions: Array) -> jax.Array:
+    """Extract selected-action log probabilities across batch or sequence dimensions."""
     chex.assert_shape(logits, (*actions.shape, None))
     chex.assert_type(logits, jnp.float32)
     chex.assert_type(actions, jnp.int32)
@@ -511,6 +611,7 @@ def action_log_prob(logits: jax.Array, actions: Array) -> jax.Array:
 
 @jax.jit
 def act(logits: jax.Array, key: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Sample one action per episode and retain its log probability for GRPO replay."""
     chex.assert_shape(logits, (None, None))
     chex.assert_type(logits, jnp.float32)
     chex.assert_shape(key, ())
@@ -551,9 +652,10 @@ def run_episodes(
     trees = [seed_tree(config) for _ in tasks]
     results = [evaluate(tree, task, env, pair.initial) for tree, task, env, pair in zip(trees, tasks, envs, pairs)]
     seed_rewards = np.asarray([result.reward for result in results], np.float32)
-    remaining = np.full(count, config.max_edits, np.int32)
+    remaining = np.full(count, config.max_decisions, np.int32)
+    completed_edits = np.zeros(count, np.int32)
     observations = [
-        observe(tree, pair, result, config.max_edits, config) for tree, pair, result in zip(trees, pairs, results)
+        observe(tree, pair, result, config.max_decisions, config) for tree, pair, result in zip(trees, pairs, results)
     ]
     history = initial_history(observations, config)
     carry, logits = prefill(state, history, log_compiles=config.log_compiles)
@@ -569,7 +671,7 @@ def run_episodes(
     legal[..., 0] = True
     active = np.ones(count, np.bool_)
     pending_update = np.zeros(count, np.bool_)
-    for _ in range(config.max_decisions + config.max_edits):
+    for _ in range(config.max_decisions + config.max_decisions // 2):
         ready = active & ~pending_update
         updates = active & pending_update
         observations = [
@@ -591,6 +693,7 @@ def run_episodes(
             pending_update[index] = False
         for index in np.flatnonzero(ready):
             action = int(sampled[index])
+            remaining[index] -= 1
             event.kind[index] = ACTION_EVENT
             event.value[index] = action
             tree = trees[index]
@@ -604,7 +707,7 @@ def run_episodes(
                 trees[index] = tree
                 if tree.complete:
                     results[index] = evaluate(tree, tasks[index], envs[index], pairs[index].initial)
-                    remaining[index] -= 1
+                    completed_edits[index] += 1
                     active[index] = remaining[index] > 0
                     pending_update[index] = active[index]
         if not active.any():
@@ -627,12 +730,13 @@ def run_episodes(
         np.zeros(count, np.float32),
         tuple(trees),
     )
-    return batch, results, seed_rewards, remaining, key
+    return batch, results, seed_rewards, completed_edits, key
 
 
 def collect_rollout(
     state: TrainState, envs: list[KarelProgramEnv], rng: np.random.Generator, key: jax.Array, config: Config
 ) -> tuple[GRPOBatch, NDArray[np.float32], dict[str, float], jax.Array]:
+    """Sample task groups, run editing episodes, and compute advantages and diagnostics."""
     count = config.num_tasks * config.group_size
     if len(envs) != count or any(env.config != config.env for env in envs):
         raise ValueError("Expected num_tasks * group_size environments with configured limits")
@@ -643,7 +747,7 @@ def collect_rollout(
         pair = task.reset(seed=int(seed))
         tasks.extend([task] * config.group_size)
         pairs.extend([pair] * config.group_size)
-    batch, results, seed_rewards, remaining, key = run_episodes(state, tasks, envs, pairs, key, config)
+    batch, results, seed_rewards, completed_edits, key = run_episodes(state, tasks, envs, pairs, key, config)
     rewards = np.asarray([result.reward for result in results], np.float32)
     grouped = rewards.reshape(config.num_tasks, config.group_size)
     batch = batch._replace(advantages=np.asarray(group_advantages(grouped)).reshape(-1))
@@ -655,7 +759,8 @@ def collect_rollout(
         "charts/success_rate": float(successes.mean()),
         "charts/group_success_rate": float(successes.reshape(config.num_tasks, config.group_size).any(axis=1).mean()),
         "charts/informative_group_fraction": float((np.ptp(grouped, axis=1) > 0).mean()),
-        "charts/edits_mean": float((config.max_edits - remaining).mean()),
+        "charts/edits_mean": float(completed_edits.mean()),
+        "charts/action_budget_exhausted_rate": float((batch.mask.sum(axis=0) == config.max_decisions).mean()),
         "charts/decisions_mean": float(batch.mask.sum()) / count,
         "charts/program_token_length_mean": float(np.mean([len(tree.tokens()) for tree in batch.programs])),
         **{
@@ -681,6 +786,7 @@ def collect_rollout(
 def objective(
     logits: jax.Array, actions: Array, old_log_probs: Array, advantages: Array, weights: Array, config: Config
 ) -> tuple[jax.Array, Metrics]:
+    """Compute the weighted clipped policy loss, entropy bonus, and update diagnostics."""
     chex.assert_shape(logits, (*actions.shape, 1 + config.max_nodes + len(AST_ACTIONS)))
     chex.assert_equal_shape((actions, old_log_probs, advantages, weights))
     chex.assert_type(actions, jnp.int32)
@@ -706,10 +812,11 @@ class Replay(NamedTuple):
     old_log_probs: Array
     legal: Array
     advantages: Array  # [T,B], broadcast from terminal episode advantages.
-    weights: Array  # [T,B], zero on seed/update/PAD predictions and filler episodes.
+    weights: Array  # [T,B], zero on seed/update/PAD predictions.
 
 
 def replay_batch(batch: GRPOBatch) -> Replay:
+    """Prepare full-history replay with equal episode weights and loss only on decisions."""
     chex.assert_rank(batch.actions, 2)
     chex.assert_equal_shape((batch.actions, batch.old_log_probs, batch.mask))
     chex.assert_type(batch.actions, np.int32)
@@ -726,6 +833,7 @@ def replay_batch(batch: GRPOBatch) -> Replay:
 
 
 def take_history(history: History, indices: NDArray[np.int64]) -> History:
+    """Select episode columns while preserving their complete event histories."""
     chex.assert_rank(indices, 1)
     chex.assert_type(indices, np.integer)
     return History(
@@ -734,11 +842,17 @@ def take_history(history: History, indices: NDArray[np.int64]) -> History:
 
 
 @partial(jax.jit, static_argnames="config")
-def sequence_gradients(state: TrainState, replay: Replay, config: Config) -> tuple[Metrics, optax.Params]:
+def update(state: TrainState, replay: Replay, config: Config) -> tuple[TrainState, Metrics]:
+    """Compute gradients and conditionally apply them within one compiled update.
+
+    Gradients flow through complete histories, including prior actions and
+    execution updates. Replay weights give each episode equal total weight.
+    """
     if config.log_compiles:
         print(f"JIT trace edit update: sequence_shape={replay.actions.shape}", flush=True)
 
     def loss_fn(params: optax.Params) -> tuple[jax.Array, Metrics]:
+        """Replay the minibatch under candidate parameters and evaluate its masked loss."""
         _, logits = state.apply_fn({"params": params}, replay.history)
         return objective(
             mask_logits(logits, replay.legal),
@@ -750,47 +864,24 @@ def sequence_gradients(state: TrainState, replay: Replay, config: Config) -> tup
         )
 
     (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-    return metrics, grads
 
+    def apply_update(current: TrainState) -> TrainState:
+        """Apply the computed gradients and advance optimizer state for an accepted update."""
+        return current.apply_gradients(grads=grads)
 
-@jax.jit
-def apply_gradients(state: TrainState, gradients: optax.Params) -> TrainState:
-    return state.apply_gradients(grads=gradients)
+    def skip_update(current: TrainState) -> TrainState:
+        """Preserve parameters and optimizer state when the KL guard rejects an update."""
+        return current
 
-
-def update(state: TrainState, batch: GRPOBatch, config: Config) -> tuple[TrainState, Metrics]:
-    """Replay complete causal histories; accumulate episode microbatches before clipping.
-
-    No detached history caches enter training: gradients flow through all prior
-    actions and execution updates. Global episode weights survive microbatching.
-    """
-    replay = replay_batch(batch)
-    count = len(batch.programs)
-    width = min(config.replay_batch_size, count)
-    total_grads = jax.tree.map(jnp.zeros_like, state.params)
-    total_metrics = jnp.zeros(4, jnp.float32)
-    for start in range(0, count, width):
-        stop = min(start + width, count)
-        indices = np.pad(np.arange(start, stop), (0, width - (stop - start)), mode="edge")
-        weights = replay.weights[:, indices].copy()
-        weights[:, stop - start :] = 0
-        chunk = Replay(
-            take_history(replay.history, indices),
-            replay.actions[:, indices],
-            replay.old_log_probs[:, indices],
-            replay.legal[:, indices],
-            replay.advantages[:, indices],
-            weights,
-        )
-        metrics, grads = sequence_gradients(state, chunk, config)
-        total_grads = jax.tree.map(jnp.add, total_grads, grads)
-        total_metrics += jnp.asarray(metrics)
-    if config.target_kl is None or float(total_metrics[2]) <= config.target_kl:
-        state = apply_gradients(state, total_grads)
-    return state, tuple(total_metrics)
+    if config.target_kl is None:
+        state = apply_update(state)
+    else:
+        state = jax.lax.cond(metrics[2] <= config.target_kl, apply_update, skip_update, state)
+    return state, metrics
 
 
 def select_episodes(batch: GRPOBatch, indices: NDArray[np.int64]) -> GRPOBatch:
+    """Create a minibatch of distinct episodes, retaining histories and rollout metadata."""
     chex.assert_rank(indices, 1)
     chex.assert_type(indices, np.integer)
     if (
@@ -811,6 +902,7 @@ def select_episodes(batch: GRPOBatch, indices: NDArray[np.int64]) -> GRPOBatch:
 
 
 def format_group_programs(batch: GRPOBatch, rewards: Array, *, config: Config, group_index: int) -> str:
+    """Format the seed and sampled final programs from one task group for TensorBoard."""
     chex.assert_shape(rewards, (len(batch.programs),))
     chex.assert_type(rewards, np.float32)
     chex.assert_scalar_in(group_index, 0, config.num_tasks - 1)
@@ -845,6 +937,10 @@ def generate(state: TrainState, task: KarelProgramEnv, key: jax.Array, config: C
 def load_model(
     run_dir: str | Path, *, attention_implementation: AttentionImplementation | None = None
 ) -> tuple[Config, TrainState]:
+    """Load checkpoint policy weights for inference, optionally overriding the attention backend.
+
+    Optimizer state is freshly initialized; training resume is handled by train().
+    """
     directory = str(run_dir).rstrip("/")
     config = load_config(f"{directory}/config.yaml")
     if attention_implementation is not None:
@@ -857,6 +953,7 @@ def load_model(
 
 
 def train(config: Config) -> TrainState:
+    """Run or resume GRPO training with grouped rollouts, KL stopping, logs, and checkpoints."""
     configure_compilation_cache()
     batch_size = config.num_tasks * config.group_size
     envs = [KarelProgramEnv(config.env) for _ in range(batch_size)]
@@ -920,7 +1017,7 @@ def train(config: Config) -> TrainState:
             for _ in range(config.update_epochs):
                 for indices in np.split(rng.permutation(batch_size), config.num_minibatches):
                     minibatch = select_episodes(batch, indices)
-                    state, metric = update(state, minibatch, config)
+                    state, metric = update(state, replay_batch(minibatch), config)
                     metrics.append(metric)
                     if config.target_kl is not None and float(metric[2]) > config.target_kl:
                         early_stop = True
@@ -978,6 +1075,9 @@ def train(config: Config) -> TrainState:
                     f"length_penalty={diagnostics['charts/reward_length_mean']:.4f} "
                     f"execution_penalty={diagnostics['charts/reward_execution_mean']:.4f} "
                     f"informative_groups={diagnostics['charts/informative_group_fraction']:.3f} "
+                    f"decisions_mean={diagnostics['charts/decisions_mean']:.3f} "
+                    f"edits_mean={diagnostics['charts/edits_mean']:.3f} "
+                    f"action_budget_exhausted_rate={diagnostics['charts/action_budget_exhausted_rate']:.3f} "
                     f"policy={policy_loss:.3f} entropy={entropy:.3f} kl={approx_kl:.4f} "
                     f"updates={updates_done} early_stop={early_stop}",
                     flush=True,
@@ -988,6 +1088,7 @@ def train(config: Config) -> TrainState:
 
 
 def main() -> None:
+    """Parse the config path and launch the autoregressive AST editing trainer."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/karel_ast_ar_edit.yaml", help="Path to a YAML config")
     args = parser.parse_args()

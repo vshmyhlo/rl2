@@ -4,14 +4,13 @@ num_tasks: 32
 group_size: 8 # Independent editing episodes per task, all starting from seed_program
 num_minibatches: 4 # Must divide num_tasks * group_size; episodes stay together
 update_epochs: 1
-max_edits: 3 # Complete subtree replacements; STOP may end the episode sooner
+max_decisions: 256 # Total location/grammar/STOP actions; no separate edit-count limit
 seed_program: "DEF run m( turnLeft m)"
 max_nodes: 64 # Whole candidate tree, including lists and values
 max_depth: 16 # AST edges, including lists
-replay_batch_size: 4 # Whole episode sequences per gradient microbatch; accumulate before one update
 bf16: true
 attention_implementation: cudnn # Use xla for CPU
-d_model: 256
+d_model: 512
 num_layers: 8
 num_heads: 8
 num_kv_heads: null
@@ -22,7 +21,7 @@ target_kl: 0.02
 entropy_coef: 0.01
 max_grad_norm: 1.0
 log_dir: gs://cohere-dev/vlad/rl2/karel_ast_ar_edit # Local or gs:// path
-run_id: v3 # Causal model: use a new run; incompatible with the previous tree-encoder checkpoints
+run_id: v4 # Causal model: use a new run; incompatible with the previous tree-encoder checkpoints
 checkpoint_interval_seconds: 300
 log_interval: 10
 log_program_interval: 10
@@ -31,11 +30,11 @@ log_compiles: true
 # Causal Transformer with KV caching: task -> seed tokens -> execution update -> actions -> update -> ...
 # Each edit chooses a location, then expands ONE DFS hole per action token.
 # Feedback enters the sequence only after executing a complete candidate.
-# Cache capacity is derived: 2 + max_nodes + max_edits * (1 + max_nodes) + max_edits.
+# Cache capacity is derived: 2 + max_nodes + max_decisions + max_decisions // 2.
 # Replay uses full causal histories; seed, update and padding predictions have no policy loss.
-# Replacement size varies; masks reserve enough space to complete every hole.
+# Replacement size varies; masks reserve nodes/source tokens AND actions to complete every hole.
 # Execute only complete candidates, always from the original input grid.
-# Feedback: last final/partial grid, reward, success/error, ticks, size, edits left.
+# Feedback: last final/partial grid, reward, success/error, ticks, size, actions left.
 # Final candidate reward trains every decision in the episode using GRPO.
 # Regressive edits are accepted; success does not force early stopping.
 env:

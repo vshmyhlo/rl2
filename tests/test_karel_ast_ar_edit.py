@@ -15,6 +15,13 @@ from rl2.karel import TOKEN_TO_ID, KarelConfig, KarelPair, KarelProgramEnv
 from rl2.karel_ast import ACTION_ID, KarelAST, program_actions
 
 
+@jax.jit
+def predict(state: TrainState, history: edit.History) -> jax.Array:
+    """Replay the complete history to verify rollout and training behavior."""
+    _, logits = state.apply_fn({"params": state.params}, history)
+    return logits
+
+
 @pytest.fixture(scope="module")
 def config() -> edit.Config:
     return edit.Config(
@@ -28,8 +35,7 @@ def config() -> edit.Config:
         num_heads=2,
         max_nodes=8,
         max_depth=4,
-        max_edits=2,
-        replay_batch_size=1,
+        max_decisions=9,
         target_kl=None,
         entropy_coef=0.01,
         log_interval=1,
@@ -140,12 +146,12 @@ def test_execution_feedback_and_restart(config: edit.Config) -> None:
     np.testing.assert_array_equal(result.output, target)
     assert result.reward == pytest.approx(sum(result.components.values()))
     observation = edit.observe(bad, pair, result, 1, config)
-    assert observation.feedback[2] == 1 and observation.feedback[-1] == 0.5
+    assert observation.feedback[2] == 1 and observation.feedback[-1] == pytest.approx(1 / config.max_decisions)
     # Failure does not poison the next execution or make it start from the partial state.
     good = edit.evaluate(edit.seed_tree(config), task, env, initial)
     assert good.success and good.error is None and good.ticks == 1
     partial = edit.open_subtree(bad, 0)
-    during = edit.observe(partial, pair, result, 1, config)
+    during = edit.observe(partial, pair, result, config.max_decisions, config)
     np.testing.assert_array_equal(during.output, result.output)
     assert not during.legal[: 1 + config.max_nodes].any()
     assert during.legal[1 + config.max_nodes + ACTION_ID["Program"]]
@@ -155,7 +161,7 @@ def test_rollout_replay_rewards_and_minibatches(
     config: edit.Config, state: TrainState, rollout: tuple[edit.GRPOBatch, np.ndarray, dict[str, float], jax.Array]
 ) -> None:
     batch, rewards, diagnostics, _ = rollout
-    logits = edit.mask_logits(edit.predict(state, batch.history), batch.legal)
+    logits = edit.mask_logits(predict(state, batch.history), batch.legal)
     np.testing.assert_allclose(edit.action_log_prob(logits, batch.actions), batch.old_log_probs, atol=2e-6)
     assert np.take_along_axis(batch.legal, batch.actions[..., None], axis=-1).all()
     assert np.isfinite(batch.old_log_probs).all()
@@ -195,19 +201,21 @@ def test_stop_is_a_real_decision(config: edit.Config, state: TrainState) -> None
     assert rewards[0] == rewards[1]
 
 
-def test_update_and_chunk_normalization(
-    config: edit.Config, state: TrainState, rollout: tuple[edit.GRPOBatch, np.ndarray, dict[str, float], jax.Array]
+def test_update_and_episode_normalization(
+    config: edit.Config,
+    state: TrainState,
+    rollout: tuple[edit.GRPOBatch, np.ndarray, dict[str, float], jax.Array],
 ) -> None:
     batch = rollout[0]._replace(advantages=np.asarray([-1, 1], np.float32))
-    assert len(batch.programs) > config.replay_batch_size  # Accumulate complete episode sequences.
-    updated, metrics = edit.update(state, batch, config)
+    replay = edit.replay_batch(batch)
+    updated, metrics = edit.update(state, replay, config)
     assert int(updated.step) == int(state.step) + 1
     assert np.isfinite(np.asarray(metrics)).all() and abs(float(metrics[2])) < 1e-6
     assert any(not np.array_equal(a, b) for a, b in zip(jax.tree.leaves(state.params), jax.tree.leaves(updated.params)))
-    # Compare summed chunks to one independently normalized objective.
+    # Preserve equal episode weights even when their decision counts differ.
     weights = (batch.mask / batch.mask.sum(axis=0)[None] / 2).astype(np.float32)
     _, expected = edit.objective(
-        edit.mask_logits(edit.predict(state, batch.history), batch.legal),
+        edit.mask_logits(predict(state, batch.history), batch.legal),
         batch.actions,
         batch.old_log_probs,
         np.broadcast_to(batch.advantages, batch.actions.shape),
@@ -215,20 +223,23 @@ def test_update_and_chunk_normalization(
         config,
     )
     np.testing.assert_allclose(metrics, expected, atol=2e-6)
+    # Enabling the KL guard still accepts a fresh rollout and performs the same update.
+    guarded_config = replace(config, target_kl=0.01)
+    accepted, _ = edit.update(state, replay, guarded_config)
+    chex.assert_trees_all_close(accepted, updated, atol=2e-6)
     # A stale rollout must reject the ENTIRE minibatch before applying gradients.
     stale = batch._replace(old_log_probs=batch.old_log_probs + np.float32(2))
-    unchanged, metrics = edit.update(state, stale, replace(config, target_kl=0.01))
+    unchanged, metrics = edit.update(state, edit.replay_batch(stale), guarded_config)
     assert float(metrics[2]) > 0.01 and int(unchanged.step) == int(state.step)
-    for a, b in zip(jax.tree.leaves(state.params), jax.tree.leaves(unchanged.params)):
-        np.testing.assert_array_equal(a, b)
+    chex.assert_trees_all_equal(unchanged, state)
 
 
 def test_config_and_checkpoint(config: edit.Config, state: TrainState, tmp_path: Path) -> None:
     supplied = edit.load_config("configs/karel_ast_ar_edit.yaml")
-    assert supplied.max_seq_len == 2 + supplied.max_nodes + supplied.max_decisions + supplied.max_edits
+    assert supplied.max_seq_len == 2 + supplied.max_nodes + supplied.max_decisions + supplied.max_decisions // 2
     for changes, error in (
-        ({"max_edits": 0}, AssertionError),
-        ({"replay_batch_size": True}, TypeError),
+        ({"max_decisions": 0}, AssertionError),
+        ({"max_decisions": True}, TypeError),
         ({"seed_program": "DEF run m( m)"}, ValueError),
         ({"seed_program": "DEF run m( turnLeft turnRight putMarker move m)"}, ValueError),
     ):
@@ -251,6 +262,7 @@ def test_training_wiring(
     rollout: tuple[edit.GRPOBatch, np.ndarray, dict[str, float], jax.Array],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     # Exercise orchestration/checkpoint boundaries without another rollout or training update.
     monkeypatch.setattr(edit, "create_state", MagicMock(return_value=state))
@@ -263,6 +275,11 @@ def test_training_wiring(
     config = replace(config, log_dir=str(tmp_path), run_id="test")
     edit.train(config)
     assert collect.call_count == update.call_count == 1
+    output = capsys.readouterr().out
+    for name in ("decisions_mean", "edits_mean", "action_budget_exhausted_rate"):
+        value = rollout[2][f"charts/{name}"]
+        assert f"{name}={value:.3f}" in output
+        writer.add_scalar.assert_any_call(f"charts/{name}", value, 2)
     assert (tmp_path / "test" / "checkpoint.msgpack").is_file()
     writer.add_text.assert_any_call(
         "samples/generated_programs",
@@ -278,7 +295,7 @@ def test_generation_executes_atomic_replacements(
     config: edit.Config, state: TrainState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A root replacement of a different size, then a statement edit. No execution
-    # happens during the grammar decisions, and max_edits ends without STOP.
+    # happens during the grammar decisions, and the action budget ends without STOP.
     grammar = program_actions(("DEF", "run", "m(", "turnRight", "turnLeft", "m)"))
     script = [1, *(1 + config.max_nodes + a for a in grammar), 3, 1 + config.max_nodes + ACTION_ID["putMarker"]]
     selected: list[int] = []
@@ -311,7 +328,7 @@ def test_generation_executes_atomic_replacements(
     assert selected == script and evaluate.call_count == 3  # Seed plus two complete edits.
     consumed = [call.args[1] for call in step.call_args_list]
     updates = [event for event in consumed if event.kind[0] == edit.UPDATE_EVENT]
-    assert len(updates) == 1 and updates[0].feedback[0, -1] == 0.5
+    assert len(updates) == 1 and updates[0].feedback[0, -1] == pytest.approx(2 / config.max_decisions)
     assert len(consumed) == len(script)  # Nonterminal actions plus one intervening update.
     assert consumed[len(grammar) + 1].kind[0] == edit.UPDATE_EVENT
     assert KarelProgramEnv(config.env).reset_from(task) is not None
@@ -339,21 +356,21 @@ def test_history_is_causal_and_retains_action_and_update_context(
     rollout: tuple[edit.GRPOBatch, np.ndarray, dict[str, float], jax.Array],
 ) -> None:
     history = rollout[0].history
-    logits = np.asarray(edit.predict(state, history))
+    logits = np.asarray(predict(state, history))
     # The initial execution report is a forced observation, not a prediction
     # target. Changing it must affect only predictions AFTER it is consumed.
     update_index = len(program_actions(tuple(config.seed_program.split())))
     feedback = np.array(history.events.feedback)
     feedback[update_index, :, 0] += 10
     changed = history._replace(events=history.events._replace(feedback=feedback))
-    new_logits = np.asarray(edit.predict(state, changed))
+    new_logits = np.asarray(predict(state, changed))
     np.testing.assert_array_equal(logits[: update_index + 1], new_logits[: update_index + 1])
     assert not np.allclose(logits[update_index + 1], new_logits[update_index + 1])
     # An earlier seed token remains in causal context after the initial report.
     values = np.array(history.events.value)
     values[2] = 1 + config.max_nodes + ACTION_ID["turnRight"]
     edited = history._replace(events=history.events._replace(value=values))
-    edited_logits = np.asarray(edit.predict(state, edited))
+    edited_logits = np.asarray(predict(state, edited))
     np.testing.assert_array_equal(logits[:3], edited_logits[:3])
     assert not np.allclose(logits[update_index + 1], edited_logits[update_index + 1])
     # Trailing filler cannot influence any real decision.
@@ -361,7 +378,7 @@ def test_history_is_causal_and_retains_action_and_update_context(
     kinds = np.array(history.events.kind)
     kinds[last:] = edit.UPDATE_EVENT
     padded = history._replace(events=history.events._replace(kind=kinds))
-    np.testing.assert_allclose(edit.predict(state, padded)[: last + 1], logits[: last + 1], atol=1e-6)
+    np.testing.assert_allclose(predict(state, padded)[: last + 1], logits[: last + 1], atol=1e-6)
 
 
 def test_asynchronous_updates_and_finished_padding_replay_exactly(
@@ -400,9 +417,9 @@ def test_asynchronous_updates_and_finished_padding_replay_exactly(
     later = np.flatnonzero(events.kind[initial_update + 1 :, 1] == edit.UPDATE_EVENT) + initial_update + 1
     assert len(later) == 1
     assert not batch.mask[later[0], 1] and batch.mask[later[0] + 1, 1]
-    assert events.feedback[later[0], 1, -1] == 0.5
+    assert events.feedback[later[0], 1, -1] == pytest.approx(2 / config.max_decisions)
     assert np.all(events.kind[initial_update + 2 :, 0] == edit.PAD_EVENT)
-    logits = edit.predict(state, batch.history)
+    logits = predict(state, batch.history)
     replay = edit.action_log_prob(edit.mask_logits(logits, batch.legal), batch.actions)
     np.testing.assert_allclose(replay, batch.old_log_probs, atol=2e-6)
     # An earlier action remains visible after a subsequent execution update.
@@ -410,6 +427,87 @@ def test_asynchronous_updates_and_finished_padding_replay_exactly(
     action_index = initial_update + 3  # First grammar action after location selection.
     values[action_index, 1] = 1 + config.max_nodes + ACTION_ID["turnLeft"]
     changed = batch.history._replace(events=events._replace(value=values))
-    changed_logits = edit.predict(state, changed)
+    changed_logits = predict(state, changed)
     np.testing.assert_array_equal(changed_logits[: action_index + 1], logits[: action_index + 1])
     assert not np.allclose(changed_logits[later[0] + 1, 1], logits[later[0] + 1, 1])
+
+
+def test_action_budget_reserves_complete_replacements(config: edit.Config) -> None:
+    task = KarelProgramEnv(config.env)
+    pair = task.reset(seed=42)
+    tree = edit.seed_tree(config)
+    result = edit.evaluate(tree, task, KarelProgramEnv(config.env), pair.initial)
+    only_stop = edit.observe(tree, pair, result, 1, config).legal
+    assert np.flatnonzero(only_stop).tolist() == [0]
+    two_actions = edit.observe(tree, pair, result, 2, config).legal
+    assert two_actions[3]  # Select the primitive statement, then replace it with a leaf.
+    assert not two_actions[1]  # Replacing Program needs more than one grammar action.
+    assert edit.observe(tree, pair, result, 5, config).legal[1]  # Location + four-node completion.
+
+    # Root replacement has two sibling holes after Program/ConsNonEmpty. Both
+    # need a reserved action: the final statement and the list End.
+    partial = edit.open_subtree(tree, 0).expand(ACTION_ID["Program"]).expand(ACTION_ID["ConsNonEmpty"])
+    legal = edit.observe(partial, pair, result, 2, config).legal
+    offset = 1 + config.max_nodes
+    assert legal[offset + ACTION_ID["move"]]
+    assert not legal[offset + ACTION_ID["REPEAT"]]
+    partial = partial.expand(ACTION_ID["turnRight"])
+    legal = edit.observe(partial, pair, result, 1, config).legal
+    assert np.flatnonzero(legal).tolist() == [offset + ACTION_ID["End"]]
+    assert partial.expand(ACTION_ID["End"]).complete
+
+
+def test_more_than_three_edits_fit_action_budget(
+    config: edit.Config, state: TrainState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Nine actions fit four location+leaf edits followed by STOP. The old
+    # max_edits=3 behavior would terminate before the fourth replacement.
+    def act(logits: jax.Array, key: jax.Array) -> tuple[jax.Array, jax.Array]:
+        chex.assert_shape(logits, (2, 1 + config.max_nodes + len(edit.AST_ACTIONS)))
+        chex.assert_type(logits, jnp.float32)
+        chex.assert_shape(key, ())
+        chex.assert_type(jax.random.key_data(key), jnp.uint32)
+        actions = np.zeros(2, np.int32)
+        for index in range(2):
+            allowed = np.isfinite(logits[index])
+            if allowed[3]:
+                actions[index] = 3  # Preorder statement location.
+            elif allowed[1 + config.max_nodes + ACTION_ID["turnRight"]]:
+                actions[index] = 1 + config.max_nodes + ACTION_ID["turnRight"]
+            else:
+                assert allowed[0]  # Forced update or final STOP.
+        actions = jnp.asarray(actions)
+        return actions, edit.action_log_prob(logits, actions)
+
+    monkeypatch.setattr(edit, "act", act)
+    batch, _, metrics, _ = edit.collect_rollout(
+        state, [KarelProgramEnv(config.env) for _ in range(2)], np.random.default_rng(4), jax.random.key(7), config
+    )
+    assert metrics["charts/edits_mean"] == 4
+    assert metrics["charts/action_budget_exhausted_rate"] == 1
+    np.testing.assert_array_equal(batch.mask.sum(axis=0), config.max_decisions)
+    assert all(tree.complete and "turnRight" in tree.tokens() for tree in batch.programs)
+    for index in range(2):
+        assert batch.actions[batch.mask[:, index], index][-1] == 0
+    assert batch.history.events.kind.shape[0] + 1 <= config.max_seq_len
+    replay = edit.action_log_prob(edit.mask_logits(predict(state, batch.history), batch.legal), batch.actions)
+    np.testing.assert_allclose(replay, batch.old_log_probs, atol=2e-6)
+
+
+@pytest.mark.parametrize(
+    "changes,error,match",
+    [
+        ({"run_id": "../outside"}, ValueError, "run_id"),
+        ({"group_size": 1}, ValueError, "group_size"),
+        ({"num_minibatches": 3}, ValueError, "num_minibatches"),
+        ({"attention_implementation": "cudnn", "bf16": False}, ValueError, "bf16"),
+        ({"learning_rate": float("inf")}, ValueError, "finite"),
+        ({"log_interval": True}, TypeError, "Logging"),
+    ],
+    ids=["run-path", "group-minimum", "minibatch-divisibility", "cudnn-dtype", "optimizer-finite", "logging-type"],
+)
+def test_config_validates_training_settings(
+    config: edit.Config, changes: dict[str, object], error: type[Exception], match: str
+) -> None:
+    with pytest.raises(error, match=match):
+        replace(config, **changes)
