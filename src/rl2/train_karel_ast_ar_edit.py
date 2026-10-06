@@ -69,7 +69,6 @@ final scores, while delta rewards and feedback remain available during editing.
 """
 
 import argparse
-import math
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -85,12 +84,21 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import yaml
-from flax import linen as nn
 from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
 from rl2.attention import AttentionType
+from rl2.edit_transformer import (
+    ACTION_EVENT,
+    SEED_EVENT,
+    UPDATE_EVENT,
+    EditCarry,
+    EditTransformer,
+    Events,
+    History,
+    ModelOutput,
+)
 from rl2.jax_cache import configure_compilation_cache
 from rl2.karel import (
     TASK_CATEGORIES,
@@ -100,7 +108,6 @@ from rl2.karel import (
 from rl2.karel_ast import AST_ACTIONS, KarelAST, program_actions
 from rl2.karel_ast_edit import EDIT_REWARD_COMPONENTS, FEEDBACK_SIZE, EditConfig, Evaluation, Observation
 from rl2.karel_ast_edit_vector import KarelASTEditVectorEnv
-from rl2.shape_checker import ShapeChecker
 from rl2.train_karel_ast_grpo import (
     Array,
     Metrics,
@@ -110,7 +117,6 @@ from rl2.train_karel_ast_grpo import (
     group_advantages,
     learning_rate_schedule,
 )
-from rl2.transformer import ARTransformer, TransformerStackCarry
 from rl2.utils import read_bytes, read_optional, write_bytes
 
 
@@ -222,166 +228,6 @@ class Config:
         return EditConfig(
             self.env, self.max_nodes, self.max_depth, self.max_seq_len, self.seed_program, allow_stop=self.allow_stop
         )
-
-
-PAD_EVENT, SEED_EVENT, ACTION_EVENT, UPDATE_EVENT = range(4)
-
-
-class Events(NamedTuple):
-    """Time-major history, or one batched event for cached decoding.
-
-    NamedTuple makes this a JAX pytree; tree.map preserves its type and fields.
-    kind/value: int32 [T,B] (or [B]); output: int32 [T,B,H,W,6];
-    feedback: float32 [T,B,8]. Every event carries the latest execution image;
-    ACTION events carry resulting feedback scalars; UPDATE is used only for the initial seed report.
-    SEED values are the initial program's DFS grammar actions in policy IDs.
-    ACTION values are sampled location/grammar/STOP IDs. PAD is trailing only.
-    """
-
-    kind: Array
-    value: Array
-    output: Array
-    feedback: Array
-
-
-class History(NamedTuple):
-    initial: Array  # [B,H,W,6], supplied to every token's image encoder.
-    target: Array
-    events: Events
-
-
-class EditCarry(NamedTuple):
-    """KV caches and fixed task grids used alongside every event's current image."""
-
-    transformer: TransformerStackCarry
-    initial: Array
-    target: Array
-
-
-type ModelOutput = tuple[EditCarry, jax.Array]
-
-
-class EditTransformer(nn.Module):
-    """Causal seed -> initial update -> action/result stream with a KV cache.
-
-    __call__ returns logits [T,B,V]; row t consumes event t and predicts the
-    next event. Loss applies only when that next event is a sampled action;
-    updates and seed tokens are provided by the host and are never targets.
-    No AST encoder or tree-relative attention is used. Location IDs refer to the
-    current host AST's preorder, reconstructed by applying the preceding edits.
-    """
-
-    d_model: int = 256
-    num_layers: int = 4
-    num_heads: int = 8
-    num_kv_heads: int | None = None
-    max_nodes: int = 64
-    max_seq_len: int = 256
-    max_markers: int = 10
-    dtype: jax.typing.DTypeLike = jnp.float32
-    attention_implementation: AttentionType = "xla"
-
-    def setup(self) -> None:
-        """Create task and feedback encoders, event embeddings, and the causal policy."""
-        for value in (self.max_nodes, self.max_markers):
-            chex.assert_type(value, int)
-            chex.assert_scalar_positive(value)
-        self.grid_conv = nn.Conv(32, kernel_size=(1, 1), dtype=self.dtype)
-        self.context_projection = nn.Dense(self.d_model, dtype=self.dtype)
-        self.context_norm = nn.LayerNorm(dtype=self.dtype)
-        self.feedback_projection = nn.Dense(self.d_model, dtype=self.dtype)
-        self.feedback_norm = nn.LayerNorm(dtype=self.dtype)
-        self.token_embedding = nn.Embed(1 + self.max_nodes + len(AST_ACTIONS), self.d_model, dtype=self.dtype)
-        self.kind_embedding = nn.Embed(4, self.d_model, dtype=self.dtype)
-        self.backbone = ARTransformer(
-            dim=self.d_model,
-            num_layers=self.num_layers,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            max_seq_len=self.max_seq_len,
-            dtype=self.dtype,
-            attention_implementation=self.attention_implementation,
-        )
-        self.head = nn.Dense(
-            1 + self.max_nodes + len(AST_ACTIONS), dtype=self.dtype, kernel_init=nn.initializers.zeros_init()
-        )
-
-    def encode_grids(self, initial: jax.Array, target: jax.Array, output: jax.Array) -> jax.Array:
-        """Mix normalized input/target/result channels per cell, preserving spatial positions."""
-        chex.assert_scalar_non_negative(initial.ndim - 4)
-        chex.assert_shape(initial, (*initial.shape[:-3], None, None, 6))
-        chex.assert_equal_shape((initial, target, output))
-        chex.assert_type((initial, target, output), jnp.int32)
-        for size in initial.shape[-3:-1]:
-            chex.assert_scalar_positive(size)
-        scale = jnp.asarray([1, 1, 1, 1, 1, self.max_markers] * 3, jnp.float32)
-        grids = jnp.concatenate((initial, target, output), axis=-1).astype(jnp.float32) / scale
-        features = nn.gelu(self.grid_conv(grids))
-        return features.reshape(*initial.shape[:-3], math.prod(features.shape[-3:]))
-
-    def encode_events(self, events: Events, initial: jax.Array, target: jax.Array) -> jax.Array:
-        """Add the task/current-image embedding to every event's token or feedback embedding."""
-        chex.assert_rank(events.kind, 2)
-        chex.assert_equal_shape((events.kind, events.value))
-        chex.assert_type((events.kind, events.value, events.output), jnp.int32)
-        time, batch = events.kind.shape
-        chex.assert_shape(initial, (batch, None, None, 6))
-        chex.assert_equal_shape((initial, target))
-        chex.assert_type((initial, target), jnp.int32)
-        chex.assert_shape(events.output, (time, *initial.shape))
-        chex.assert_shape(events.feedback, (time, batch, FEEDBACK_SIZE))
-        chex.assert_type(events.feedback, jnp.float32)
-        grids = self.encode_grids(
-            jnp.broadcast_to(initial, events.output.shape),
-            jnp.broadcast_to(target, events.output.shape),
-            events.output,
-        )
-        context = self.context_norm(self.context_projection(grids))
-        update = self.feedback_norm(self.feedback_projection(events.feedback))
-        token = self.token_embedding(events.value)
-        x = jnp.where((events.kind == UPDATE_EVENT)[..., None], 0, token)
-        has_feedback = (events.kind == ACTION_EVENT) | (events.kind == UPDATE_EVENT)
-        x += jnp.where(has_feedback[..., None], update, 0)
-        x += context + self.kind_embedding(events.kind)
-        return jnp.where((events.kind != PAD_EVENT)[..., None], x, 0)
-
-    def __call__(self, history: History) -> ModelOutput:
-        """Encode the complete causal history and return its cache and next-action logits."""
-        sc = ShapeChecker(C=6, D=self.d_model, V=1 + self.max_nodes + len(AST_ACTIONS))
-        sc.check((history.initial, history.target), "BHWC", jnp.int32)
-        inputs = self.encode_events(history.events, history.initial, history.target)
-        sc.check(inputs, "TBD", self.dtype)
-        x_len = jnp.full(sc["B"], inputs.shape[0], jnp.int32)
-        sc.check(x_len, "B", jnp.int32)
-        carry, features = self.backbone(jnp.swapaxes(inputs, 0, 1), x_len)
-        features = jnp.swapaxes(features, 0, 1)
-        sc.check(features, "TBD", self.dtype)
-        logits = self.head(features).astype(jnp.float32)
-        sc.check(logits, "TBV", jnp.float32)
-        return EditCarry(carry, history.initial, history.target), logits
-
-    def prefill(self, history: History) -> ModelOutput:
-        """Consume the seed program and initial execution update once."""
-        carry, logits = self(history)
-        return carry, logits[-1]
-
-    def step(self, event: Events, carry: EditCarry) -> ModelOutput:
-        """Append one event per episode to the KV cache and predict the next action."""
-        sc = ShapeChecker(C=6, F=FEEDBACK_SIZE, D=self.d_model, V=1 + self.max_nodes + len(AST_ACTIONS))
-        sc.check((carry.initial, carry.target), "BHWC", jnp.int32)
-        sc.check((event.kind, event.value), "B", jnp.int32)
-        sc.check(event.output, "BHWC", jnp.int32)
-        sc.check(event.feedback, "BF", jnp.float32)
-        sequence = jax.tree.map(partial(jnp.expand_dims, axis=0), event)
-        x_active = jnp.ones(sc["B"], jnp.bool_)
-        sc.check(x_active, "B", jnp.bool_)
-        transformer, features = self.backbone.step(
-            self.encode_events(sequence, carry.initial, carry.target)[0], x_active, carry.transformer
-        )
-        sc.check(features, "BD", self.dtype)
-        logits = self.head(features).astype(jnp.float32)
-        sc.check(logits, "BV", jnp.float32)
-        return carry._replace(transformer=transformer), logits
 
 
 def empty_events(time: int, batch: int, config: Config) -> Events:

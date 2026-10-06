@@ -106,9 +106,9 @@ class ASTTransformer(nn.Module):
             tree: Batched ASTFeatures before the next expansion. Node/type,
                 field, depth, child-index, and value IDs are int32 [B, N], with
                 1 <= N <= max_nodes (a trimmed sequence bucket);
-                node_mask is bool with the same shape and marks a contiguous
-                live prefix followed by padding; live depths are in
-                [0, max_depth]. is_hole is computed from node_mask, node_type,
+                seq_len is int32 [B] and gives the length of the left-aligned
+                valid segment followed by right padding; live depths are in
+                [0, max_depth]. is_hole is computed from seq_len, node_type,
                 and value.
                 action_mask is bool [B, N, A], where
                 A = len(AST_ACTIONS), and marks legal expansions per hole.
@@ -124,10 +124,10 @@ class ASTTransformer(nn.Module):
         for size in initial.shape[:3]:
             chex.assert_scalar_positive(size)
         batch = initial.shape[0]
-        sc.check(tree.node_mask, "BN", jnp.bool_)
-        nodes_count = tree.node_mask.shape[1]
-        chex.assert_scalar_in(nodes_count, 1, self.max_nodes)
+        sc.check(tree.seq_len, "B", jnp.int32)
         sc.check(tree[:5], "BN", jnp.int32)
+        nodes_count = tree.node_type.shape[1]
+        chex.assert_scalar_in(nodes_count, 1, self.max_nodes)
         sc.check(tree.is_hole, "BN", jnp.bool_)
         sc.check(tree.action_mask, "BNA", jnp.bool_)
         scale = jnp.asarray([1, 1, 1, 1, 1, self.max_markers] * 2, jnp.float32)
@@ -137,7 +137,9 @@ class ASTTransformer(nn.Module):
         sc.check(context, "BD", self.dtype)
         # Canonicalize padding before embedding so even dirty padded IDs cannot
         # affect live nodes or index outside an embedding table.
-        ids = [jnp.where(tree.node_mask, feature, 0) for feature in tree[:5]]
+        node_mask = jnp.arange(nodes_count)[None, :] < tree.seq_len[:, None]
+        sc.check(node_mask, "BN", jnp.bool_)
+        ids = [jnp.where(node_mask, feature, 0) for feature in tree[:5]]
         nodes = (
             self.node_embedding(ids[0])
             + self.field_embedding(ids[1])
@@ -152,9 +154,9 @@ class ASTTransformer(nn.Module):
         # Start the shared residual stream in float32, as in the former AST blocks.
         x = x.astype(jnp.float32)
         sc.check(x, "BTD", jnp.float32)
-        lengths = 1 + tree.node_mask.sum(axis=-1, dtype=jnp.int32)
+        lengths = 1 + tree.seq_len
         sc.check(lengths, "B", jnp.int32)
-        relations = tree_relations(tree.depth, tree.node_mask)
+        relations = tree_relations(tree.depth, tree.seq_len)
         sc.check(relations, "BTT", jnp.int32)
         biases = tuple(tree_bias(relations) for tree_bias in self.tree_biases)
         bias_sc = ShapeChecker(B=batch, H=self.num_heads, T=nodes_count + 1)

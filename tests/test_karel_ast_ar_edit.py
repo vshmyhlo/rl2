@@ -12,6 +12,7 @@ from flax.training.train_state import TrainState
 
 from rl2 import karel_ast_edit as editing
 from rl2 import train_karel_ast_ar_edit as edit
+from rl2.edit_transformer import PAD_EVENT, EditTransformer
 from rl2.karel import TOKEN_TO_ID, KarelConfig, KarelPair, KarelProgramEnv
 from rl2.karel_ast import ACTION_ID, KarelAST, program_actions
 
@@ -491,9 +492,7 @@ def test_grid_encoder_mixes_all_three_images_per_cell(config: edit.Config, state
     initial[0, 1, 1, 0] = 1
     target[1, 1, 1, 0] = 1
     output[2, 1, 1, 0] = 1
-    encoded = state.apply_fn(
-        {"params": state.params}, initial, target, output, method=edit.EditTransformer.encode_grids
-    )
+    encoded = state.apply_fn({"params": state.params}, initial, target, output, method=EditTransformer.encode_grids)
     features = np.array(encoded).reshape(3, 3, 3, 32)
     assert np.all(np.any(features[:, 1, 1] != 0, axis=-1))
     assert not np.allclose(features[0, 1, 1], features[1, 1, 1])
@@ -504,11 +503,11 @@ def test_grid_encoder_mixes_all_three_images_per_cell(config: edit.Config, state
     events = edit.empty_events(3, 1, config)
     events.kind[:, 0] = [edit.SEED_EVENT, edit.ACTION_EVENT, edit.UPDATE_EVENT]
     original = state.apply_fn(
-        {"params": state.params}, events, initial[:1], target[:1], method=edit.EditTransformer.encode_events
+        {"params": state.params}, events, initial[:1], target[:1], method=EditTransformer.encode_events
     )
     events.output[:, 0, 1, 1, 5] = 1
     changed = state.apply_fn(
-        {"params": state.params}, events, initial[:1], target[:1], method=edit.EditTransformer.encode_events
+        {"params": state.params}, events, initial[:1], target[:1], method=EditTransformer.encode_events
     )
     assert np.all(np.any(np.abs(np.asarray(changed - original)) > 1e-6, axis=-1))
 
@@ -612,7 +611,7 @@ def test_action_feedback_and_finished_padding_replay_exactly(
     )
     assert not np.array_equal(events.output[completion, 1], events.output[0, 1])
     np.testing.assert_array_equal(events.output[:, 0], np.broadcast_to(events.output[0, 0], events.output[:, 0].shape))
-    assert np.all(events.kind[initial_update + 2 :, 0] == edit.PAD_EVENT)
+    assert np.all(events.kind[initial_update + 2 :, 0] == PAD_EVENT)
     logits = predict(state, batch.history)
     replay = edit.action_log_prob(edit.mask_logits(logits, batch.legal), batch.actions)
     np.testing.assert_allclose(replay, batch.old_log_probs, atol=2e-6)

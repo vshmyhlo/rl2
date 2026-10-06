@@ -275,7 +275,10 @@ def test_pack_replay_removes_padding_and_preserves_program_weights(rollout: tupl
     rounds, programs, nodes = batch.actions.shape
 
     def pad(value: grpo.Array) -> np.ndarray:
-        return np.pad(value, ((0, 32 - rounds), (0, 0), (0, 64 - nodes)) + ((0, 0),) * (value.ndim - 3))
+        padding = ((0, 32 - rounds), (0, 0))
+        if value.ndim >= 3:
+            padding += ((0, 64 - nodes),) + ((0, 0),) * (value.ndim - 3)
+        return np.pad(value, padding)
 
     batch = batch._replace(
         tree=ASTFeatures(*(pad(field) for field in batch.tree)),
@@ -290,9 +293,10 @@ def test_pack_replay_removes_padding_and_preserves_program_weights(rollout: tupl
     assert packed.actions.shape[1] < 32 * programs
     assert not packed.mask[:, len(live) :].any()
     assert not weights[:, len(live) :].any()
-    assert not packed.tree.node_mask[:, len(live) :].any()
+    assert not packed.tree.seq_len[:, len(live) :].any()
     for position, index in enumerate(live):
         round_id, program_id = divmod(index, programs)
+        assert packed.tree.seq_len[0, position] == batch.tree.seq_len[round_id, program_id]
         np.testing.assert_array_equal(packed.actions[0, position], batch.actions[round_id, program_id, :32])
         np.testing.assert_array_equal(packed.initial[position], batch.initial[program_id])
         assert packed.advantages[position] == batch.advantages[program_id]
@@ -322,12 +326,18 @@ def test_empty_replay_has_zero_metrics_and_finite_update(config: Config, state: 
 )
 def test_tree_bucket_keeps_resolved_context_nodes(required: int, capacity: int, expected: int) -> None:
     features = batch_features((KarelAST.empty(capacity, 8).features(),))
-    present = np.zeros((1, capacity), np.bool_)
-    present[:, :required] = True
-    features = features._replace(node_mask=present)
+    features = features._replace(seq_len=np.asarray([required], np.int32))
     trimmed = grpo.bucket_tree(features)
-    assert trimmed.node_mask.shape == (1, expected)
-    np.testing.assert_array_equal(trimmed.node_mask, present[:, :expected])
+    assert trimmed.node_type.shape == (1, expected)
+    np.testing.assert_array_equal(trimmed.seq_len, features.seq_len)
+
+
+@pytest.mark.parametrize("seq_len", [-1, 5])
+def test_tree_bucket_rejects_lengths_outside_capacity(seq_len: int) -> None:
+    features = batch_features((KarelAST.empty(4, 2).features(),))
+    features = features._replace(seq_len=np.asarray([seq_len], np.int32))
+    with pytest.raises(AssertionError):
+        grpo.bucket_tree(features)
 
 
 def test_compilation_logs_only_on_new_update_trace(
@@ -352,7 +362,11 @@ def test_compilation_logs_only_on_new_update_trace(
     # Explicitly use another valid node bucket to exercise a shape cache miss.
     packed, weights = grpo.pack_replay(empty)
     packed = packed._replace(
-        tree=ASTFeatures(*(field[:, :, :4] for field in packed.tree)),
+        tree=ASTFeatures(
+            *(field[:, :, :4] for field in packed.tree[:5]),
+            packed.tree.seq_len,
+            packed.tree.action_mask[:, :, :4],
+        ),
         actions=packed.actions[:, :, :4],
         old_log_probs=packed.old_log_probs[:, :, :4],
         mask=packed.mask[:, :, :4],
@@ -381,11 +395,11 @@ def test_prediction_prints_bucket_shape_only_on_new_trace(
     for _ in range(2):
         grpo.predict(state, batch.initial, batch.target, tree, log_compiles=True)
     output = capsys.readouterr()
-    assert output.out == f"JIT trace predict: bucket_shape={tree.node_mask.shape}\n"
+    assert output.out == f"JIT trace predict: bucket_shape={tree.node_type.shape}\n"
     assert not output.err
-    trimmed = ASTFeatures(*(field[:, :4] for field in tree))
+    trimmed = ASTFeatures(*(field[:, :4] for field in tree[:5]), tree.seq_len, tree.action_mask[:, :4])
     grpo.predict(state, batch.initial, batch.target, trimmed, log_compiles=True)
-    assert capsys.readouterr().out == f"JIT trace predict: bucket_shape={trimmed.node_mask.shape}\n"
+    assert capsys.readouterr().out == f"JIT trace predict: bucket_shape={trimmed.node_type.shape}\n"
     grpo.predict(state, batch.initial, batch.target, trimmed, log_compiles=False)
     assert not capsys.readouterr().out
 

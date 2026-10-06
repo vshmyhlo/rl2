@@ -35,6 +35,7 @@ from rl2.attention import AttentionType
 from rl2.jax_cache import configure_compilation_cache
 from rl2.karel import ACTIONS, REWARD_COMPONENTS, TASK_CATEGORIES, TOKEN_TO_ID, KarelConfig, KarelPair, KarelProgramEnv
 from rl2.karel_ast import AST_ACTIONS, ASTFeatures, KarelAST, batch_features
+from rl2.shape_checker import ShapeChecker
 from rl2.utils import read_bytes, read_optional, write_bytes
 
 type Array = jax.Array | NDArray[Any]
@@ -129,7 +130,7 @@ class Config:
 class GRPOBatch(NamedTuple):
     initial: Array  # [B,H,W,6], grouped by task during collection.
     target: Array
-    tree: ASTFeatures  # [R,B,N] features, [R,B,N,A] masks; snapshots BEFORE each round.
+    tree: ASTFeatures  # [R,B,N] features, [R,B] seq_len, [R,B,N,A] masks; snapshots BEFORE each round.
     actions: Array  # [R,B,N] constructor/value IDs; PAD=0 at non-hole positions.
     old_log_probs: Array
     mask: Array  # Includes the final expansion, excludes PAD.
@@ -150,14 +151,17 @@ def bucket_size(required: int, capacity: int) -> int:
 
 def bucket_tree(tree: ASTFeatures) -> ASTFeatures:
     """Trim to 32-node increments, capped at capacity; preserve all context nodes."""
-    chex.assert_rank(tree.node_mask, 2)
-    chex.assert_type(tree.node_mask, np.bool_)
-    capacity = tree.node_mask.shape[-1]
+    sc = ShapeChecker(A=len(AST_ACTIONS))
+    sc.check(tree[:5], "BN", np.int32)
+    sc.check(tree.seq_len, "B", np.int32)
+    sc.check(tree.action_mask, "BNA", np.bool_)
+    capacity = tree.node_type.shape[-1]
     chex.assert_scalar_positive(capacity)
-    # Use the final present position, rather than assuming masks are contiguous.
-    required = int(np.max(np.where(tree.node_mask, np.arange(capacity) + 1, 0), initial=0))
+    chex.assert_scalar_non_negative(int(np.min(tree.seq_len, initial=0)))
+    required = int(np.max(tree.seq_len, initial=0))
+    chex.assert_scalar_in(required, 0, capacity)
     width = min(capacity, max(32, ((required + 31) // 32) * 32))
-    return ASTFeatures(*(field[:, :width] for field in tree))
+    return ASTFeatures(*(field[:, :width] for field in tree[:5]), tree.seq_len, tree.action_mask[:, :width])
 
 
 def pack_replay(batch: GRPOBatch) -> tuple[GRPOBatch, NDArray[np.float32]]:
@@ -178,10 +182,10 @@ def pack_replay(batch: GRPOBatch) -> tuple[GRPOBatch, NDArray[np.float32]]:
     chex.assert_shape(batch.initial, (programs, None, None, 6))
     chex.assert_equal_shape((batch.initial, batch.target))
     chex.assert_type((batch.initial, batch.target), np.int32)
-    chex.assert_shape(batch.tree[:6], (rounds, programs, nodes))
-    chex.assert_shape(batch.tree.action_mask, (rounds, programs, nodes, len(AST_ACTIONS)))
-    chex.assert_type(batch.tree[:5], np.int32)
-    chex.assert_type((batch.tree.node_mask, batch.tree.action_mask), np.bool_)
+    sc = ShapeChecker(R=rounds, B=programs, N=nodes, A=len(AST_ACTIONS))
+    sc.check(batch.tree[:5], "RBN", np.int32)
+    sc.check(batch.tree.seq_len, "RB", np.int32)
+    sc.check(batch.tree.action_mask, "RBNA", np.bool_)
     mask = np.asarray(batch.mask) & (np.asarray(batch.actions) != KarelProgramEnv.pad_token_id)
     indices = np.flatnonzero(mask.any(axis=-1).reshape(-1))
     rows = bucket_size(len(indices), rounds * programs)
@@ -193,7 +197,7 @@ def pack_replay(batch: GRPOBatch) -> tuple[GRPOBatch, NDArray[np.float32]]:
         return np.pad(selected, ((0, padding),) + ((0, 0),) * (selected.ndim - 1))
 
     tree = bucket_tree(ASTFeatures(*(select(field) for field in batch.tree)))
-    width = tree.node_mask.shape[-1]
+    width = tree.node_type.shape[-1]
     program_ids = np.pad(indices % programs, (0, padding))
     normalization = (mask.astype(np.float32) / np.maximum(mask.sum(axis=(0, 2)), 1)[None, :, None] / programs).astype(
         np.float32
@@ -352,7 +356,7 @@ def predict(
     state: TrainState, initial: Array, target: Array, tree: ASTFeatures, *, log_compiles: bool = False
 ) -> jax.Array:
     if log_compiles:
-        print(f"JIT trace predict: bucket_shape=({initial.shape[0]}, {tree.node_mask.shape[-1]})", flush=True)
+        print(f"JIT trace predict: bucket_shape=({initial.shape[0]}, {tree.node_type.shape[-1]})", flush=True)
     return state.apply_fn({"params": state.params}, initial, target, tree)
 
 
@@ -602,9 +606,12 @@ def _update(
     chex.assert_type(batch.actions, jnp.int32)
     chex.assert_type((batch.old_log_probs, batch.advantages), jnp.float32)
     chex.assert_type(batch.mask, jnp.bool_)
-    chex.assert_type(batch.tree[:5], jnp.int32)
-    chex.assert_type((batch.tree.is_hole, batch.tree.node_mask, batch.tree.action_mask), jnp.bool_)
-    steps, programs, _ = batch.actions.shape
+    steps, programs, nodes = batch.actions.shape
+    sc = ShapeChecker(R=steps, B=programs, N=nodes, A=len(AST_ACTIONS))
+    sc.check(batch.tree[:5], "RBN", jnp.int32)
+    sc.check(batch.tree.seq_len, "RB", jnp.int32)
+    sc.check(batch.tree.is_hole, "RBN", jnp.bool_)
+    sc.check(batch.tree.action_mask, "RBNA", jnp.bool_)
     count = steps * programs
     chex.assert_shape(batch.initial, (programs, None, None, 6))
     chex.assert_equal_shape((batch.initial, batch.target))

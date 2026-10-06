@@ -60,7 +60,7 @@ def test_relations_match_parent_chain_oracle(size: int) -> None:
         depths: list[int] = []
         for parent in reordered:
             depths.append(0 if parent < 0 else depths[parent] + 1)
-        relations = jax.jit(tree_relations)(jnp.asarray([depths], jnp.int32), jnp.ones((1, size), jnp.bool_))
+        relations = jax.jit(tree_relations)(jnp.asarray([depths], jnp.int32), jnp.asarray([size], jnp.int32))
         for actual, expected in zip(relations, _oracle(reordered)):
             np.testing.assert_array_equal(actual[0, 1:, 1:], expected)
         np.testing.assert_array_equal(relations.kind[0, 0, 1:], Relation.CONTEXT_TO_NODE)
@@ -71,8 +71,9 @@ def test_relations_match_parent_chain_oracle(size: int) -> None:
 def test_relation_bias_ignores_padding_and_context_geometry() -> None:
     depth = jnp.asarray([[0, 1, 2, 1, 999999], [0, 999999, -999999, 999999, 999999]], jnp.int32)
     mask = jnp.asarray([[True, True, True, True, False], [True, False, False, False, False]])
-    relations = tree_relations(depth, mask)
-    clean = tree_relations(jnp.where(mask, depth, 0), mask)
+    seq_len = jnp.asarray([4, 1], jnp.int32)
+    relations = tree_relations(depth, seq_len)
+    clean = tree_relations(jnp.where(mask, depth, 0), seq_len)
     for actual, expected in zip(relations, clean):
         np.testing.assert_array_equal(actual, expected)
     model = TreeAttentionBias(2)
@@ -84,13 +85,13 @@ def test_relation_bias_ignores_padding_and_context_geometry() -> None:
     np.testing.assert_array_equal(bias, np.repeat(expected[:, None], 2, axis=1))
 
 
-@pytest.mark.parametrize("bad", ["dtype", "mask_dtype", "shape", "rank", "empty"])
+@pytest.mark.parametrize("bad", ["dtype", "length_dtype", "shape", "rank", "empty"])
 def test_relations_validate_inputs(bad: str) -> None:
     depth = jnp.zeros((2, 4), jnp.float32 if bad == "dtype" else jnp.int32)
-    mask = jnp.ones((2, 3 if bad == "shape" else 4), jnp.int32 if bad == "mask_dtype" else jnp.bool_)
+    seq_len = jnp.ones((3 if bad == "shape" else 2,), jnp.bool_ if bad == "length_dtype" else jnp.int32)
     if bad == "rank":
-        depth, mask = depth[0], mask[0]
+        depth, seq_len = depth[0], seq_len[0]
     elif bad == "empty":
-        depth, mask = depth[:, :0], mask[:, :0]
+        depth = depth[:, :0]
     with pytest.raises(AssertionError):
-        tree_relations(depth, mask)
+        tree_relations(depth, seq_len)

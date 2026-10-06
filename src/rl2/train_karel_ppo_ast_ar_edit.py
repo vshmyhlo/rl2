@@ -38,6 +38,7 @@ from tensorboardX import SummaryWriter
 
 from rl2 import train_karel_ast_ar_edit as edit
 from rl2.attention import AttentionType
+from rl2.edit_transformer import ACTION_EVENT, PAD_EVENT, UPDATE_EVENT, EditCarry, EditTransformer, Events, History
 from rl2.jax_cache import configure_compilation_cache
 from rl2.karel import TASK_CATEGORIES, KarelConfig, KarelProgramEnv
 from rl2.karel_ast import AST_ACTIONS, KarelAST
@@ -45,11 +46,6 @@ from rl2.karel_ast_edit import EDIT_REWARD_COMPONENTS, FEEDBACK_SIZE, Evaluation
 from rl2.karel_ast_edit_vector import KarelASTEditVectorEnv
 from rl2.shape_checker import ShapeChecker
 from rl2.train_karel_ast_ar_edit import (
-    ACTION_EVENT,
-    UPDATE_EVENT,
-    EditCarry,
-    Events,
-    History,
     act,
     empty_events,
     format_group_programs,
@@ -101,7 +97,7 @@ def check_history(history: History) -> None:
     sc.check(history.events.feedback, "TBF", dtype=np.float32)
 
 
-class EditActorCritic(edit.EditTransformer):
+class EditActorCritic(EditTransformer):
     """The editing policy's shared causal backbone with an additional value head."""
 
     def setup(self) -> None:
@@ -118,20 +114,26 @@ class EditActorCritic(edit.EditTransformer):
         )
         inputs = self.encode_events(history.events, history.initial, history.target)
         sc.check(inputs, "TBD", dtype=self.dtype)
-        x_len = jnp.full(sc["B"], inputs.shape[0], jnp.int32)
+        active = history.events.kind != PAD_EVENT
+        x_len = jnp.sum(active, axis=0, dtype=jnp.int32)
         sc.check(x_len, "B", jnp.int32)
         carry, features = self.backbone(jnp.swapaxes(inputs, 0, 1), x_len)
         features = jnp.swapaxes(features, 0, 1)
         sc.check(features, "TBD", dtype=self.dtype)
         logits = self.head(features).astype(jnp.float32)
         values = self.value_head(features)[..., 0].astype(jnp.float32)
+        logits = jnp.where(active[..., None], logits, 0)
+        values = jnp.where(active, values, 0)
         sc.check(logits, "TBV", dtype=jnp.float32)
         sc.check(values, "TB", dtype=jnp.float32)
         return EditCarry(carry, history.initial, history.target), logits, values
 
     def prefill(self, history: History) -> ModelOutput:
         carry, logits, values = self(history)
-        return carry, logits[-1], values[-1]
+        lengths = jnp.sum(history.events.kind != PAD_EVENT, axis=0, dtype=jnp.int32)
+        last = jnp.maximum(lengths - 1, 0)
+        batch = jnp.arange(logits.shape[1])
+        return carry, logits[last, batch], values[last, batch]
 
     def step(self, event: Events, carry: EditCarry) -> ModelOutput:
         sc = ShapeChecker(C=6, F=FEEDBACK_SIZE, D=self.d_model, V=1 + self.max_nodes + len(AST_ACTIONS))
@@ -140,7 +142,7 @@ class EditActorCritic(edit.EditTransformer):
         sc.check(event.output, "BHWC", dtype=jnp.int32)
         sc.check(event.feedback, "BF", dtype=jnp.float32)
         sequence = jax.tree.map(partial(jnp.expand_dims, axis=0), event)
-        x_active = jnp.ones(sc["B"], jnp.bool_)
+        x_active = event.kind != PAD_EVENT
         sc.check(x_active, "B", jnp.bool_)
         transformer, features = self.backbone.step(
             self.encode_events(sequence, carry.initial, carry.target)[0], x_active, carry.transformer
@@ -148,6 +150,8 @@ class EditActorCritic(edit.EditTransformer):
         sc.check(features, "BD", dtype=self.dtype)
         logits = self.head(features).astype(jnp.float32)
         values = self.value_head(features)[..., 0].astype(jnp.float32)
+        logits = jnp.where(x_active[:, None], logits, 0)
+        values = jnp.where(x_active, values, 0)
         sc.check(logits, "BV", dtype=jnp.float32)
         sc.check(values, "B", dtype=jnp.float32)
         return carry._replace(transformer=transformer), logits, values

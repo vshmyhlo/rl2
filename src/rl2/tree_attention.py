@@ -8,6 +8,8 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from rl2.shape_checker import ShapeChecker
+
 
 class Relation(IntEnum):
     """Relationship of the key node to the query node."""
@@ -42,19 +44,21 @@ class TreeRelations(NamedTuple):
     relative_depth: jax.Array
 
 
-def tree_relations(depth: jax.Array, node_mask: jax.Array) -> TreeRelations:
+def tree_relations(depth: jax.Array, seq_len: jax.Array) -> TreeRelations:
     """Compute relations for valid rooted-tree preorder input in O(B*N^2).
 
     Depths count AST edges, including list nodes and holes. Live nodes form a
-    contiguous prefix; masked depths may contain arbitrary values. Relations
+    left-aligned segment of length seq_len [B]; right-padded depths may contain
+    arbitrary values. Depth is int32 [B, N] and seq_len is int32 [B]. Relations
     are recomputed once per forward pass and shared by all attention layers.
     """
-    chex.assert_rank(depth, 2)
-    chex.assert_equal_shape((depth, node_mask))
-    chex.assert_type(depth, jnp.int32)
-    chex.assert_type(node_mask, jnp.bool_)
+    sc = ShapeChecker()
+    sc.check(depth, "BN", jnp.int32)
+    sc.check(seq_len, "B", jnp.int32)
     batch, size = depth.shape
     chex.assert_scalar_positive(size)
+    node_mask = jnp.arange(size)[None, :] < seq_len[:, None]
+    sc.check(node_mask, "BN", jnp.bool_)
     depth = jnp.where(node_mask, depth, 0)
     index = jnp.arange(size)
     # For i < j, the LCA depth is min(depth[i], min(depth[i+1:j+1])-1).
@@ -81,7 +85,9 @@ def tree_relations(depth: jax.Array, node_mask: jax.Array) -> TreeRelations:
     distance = jnp.clip(up + down, 0, MAX_DISTANCE)
     relative_depth = jnp.clip(depth[:, None, :] - depth[:, :, None], -MAX_RELATIVE_DEPTH, MAX_RELATIVE_DEPTH)
     padding = ((0, 0), (1, 0), (1, 0))
-    return TreeRelations(kind, jnp.pad(distance, padding), jnp.pad(relative_depth + MAX_RELATIVE_DEPTH, padding))
+    result = TreeRelations(kind, jnp.pad(distance, padding), jnp.pad(relative_depth + MAX_RELATIVE_DEPTH, padding))
+    sc.check(result, "BTT", jnp.int32)
+    return result
 
 
 class TreeAttentionBias(nn.Module):

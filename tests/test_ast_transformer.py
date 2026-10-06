@@ -89,10 +89,13 @@ def test_trimmed_sequence_matches_full_logits_and_gradients(config: Config, batc
     config = replace(config, max_nodes=64)
     initial, target = batch.initial[:4], batch.target[:4]
     tree = ASTFeatures(
-        *(np.pad(field[:4], ((0, 0), (0, 64 - field.shape[1])) + ((0, 0),) * (field.ndim - 2)) for field in batch.tree)
+        *(np.pad(field[:4], ((0, 0), (0, 40))) for field in batch.tree[:5]),
+        batch.tree.seq_len[:4],
+        np.pad(batch.tree.action_mask[:4], ((0, 0), (0, 40), (0, 0))),
     )
     trimmed = bucket_tree(tree)
-    assert trimmed.node_mask.shape == (4, 32)
+    assert trimmed.node_type.shape == (4, 32)
+    np.testing.assert_array_equal(trimmed.seq_len, tree.seq_len)
     state = create_state(config, initial, target)
     params = dict(state.params)
     for name in ("constructor_head", "value_head"):
@@ -163,9 +166,10 @@ def test_padded_features_do_not_affect_predictions(config: Config, batch: ModelB
         for name, array in params["tree_bias_0"].items()
     }
     state = state.replace(params=params)
+    present = np.arange(config.max_nodes)[None, :] < batch.tree.seq_len[:, None]
     dirty = ASTFeatures(
-        *(np.where(batch.tree.node_mask, array, 999999).astype(np.int32) for array in batch.tree[:5]),
-        batch.tree.node_mask,
+        *(np.where(present, array, 999999).astype(np.int32) for array in batch.tree[:5]),
+        batch.tree.seq_len,
         batch.tree.action_mask,
     )
     np.testing.assert_array_equal(

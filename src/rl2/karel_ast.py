@@ -199,9 +199,10 @@ class ASTFeatures(NamedTuple):
             a hole/value type and value=0. Not stored in the tuple.
             Example: [False, False, False, False, False, True, True, True,
             False]; the resolved count and padding are not holes.
-        node_mask: Bool mask marking all existing nodes, including holes;
-            False marks padding excluded from attention keys.
-            Example: [True, True, True, True, True, True, True, True, False].
+        seq_len: Int32 scalar, or [B] for a batch, counting existing nodes,
+            including holes. Nodes occupy the left-aligned valid segment
+            [0, seq_len); the remaining positions are right padding excluded
+            from attention keys. Example: 8.
         action_mask: Bool [N, A] or [B, N, A] array of legal expansions at
             each current hole. Shared completion budgets are allocated before
             sampling so any combination of allowed choices fits. Resolved nodes,
@@ -219,7 +220,7 @@ class ASTFeatures(NamedTuple):
     depth: FeatureArray
     child_index: FeatureArray
     value: FeatureArray
-    node_mask: FeatureArray
+    seq_len: jax.Array | NDArray[np.int32]
     action_mask: FeatureArray  # [N,A]/[B,N,A]; inactive node rows are all false.
 
     @property
@@ -228,10 +229,14 @@ class ASTFeatures(NamedTuple):
 
         Preserves NumPy or JAX arrays and any batch/rollout leading dimensions.
         """
-        chex.assert_equal_shape((self.node_mask, self.node_type, self.value))
-        chex.assert_type(self.node_mask, np.bool_)
-        chex.assert_type((self.node_type, self.value), np.int32)
-        return self.node_mask & (self.node_type > len(CONSTRUCTORS)) & (self.value == 0)
+        sc = ShapeChecker()
+        leading_dims = "abcdefghijklmnopqrstuvwxyz"[: self.seq_len.ndim]
+        sc.check(self.seq_len, leading_dims, np.int32)
+        sc.check((self.node_type, self.value), leading_dims + "N", np.int32)
+        present = np.arange(self.node_type.shape[-1]) < self.seq_len[..., None]
+        result = present & (self.node_type > len(CONSTRUCTORS)) & (self.value == 0)
+        sc.check(result, leading_dims + "N", np.bool_)
+        return result
 
 
 @dataclass(frozen=True)
@@ -414,7 +419,6 @@ class KarelAST:
     def features(self, *, parallel: bool = True) -> ASTFeatures:
         order = self.preorder()
         integers = np.zeros((5, self.max_nodes), np.int32)
-        mask = np.zeros(self.max_nodes, np.bool_)
         for position, index in enumerate(order):
             node = self.nodes[index]
             integers[:, position] = (
@@ -424,7 +428,6 @@ class KarelAST:
                 node.child_index,
                 node.value,
             )
-            mask[position] = True
         action_mask = (
             self.parallel_action_mask() if parallel else np.zeros((self.max_nodes, len(AST_ACTIONS)), np.bool_)
         )
@@ -434,7 +437,7 @@ class KarelAST:
                 action_mask[order.index(frontier)] = self.allowed_actions()
         return ASTFeatures(
             *integers,
-            mask,
+            np.asarray(len(order), np.int32),
             action_mask,
         )
 
@@ -528,10 +531,11 @@ def batch_features(features: tuple[ASTFeatures, ...]) -> ASTFeatures:
     sc = ShapeChecker(B=len(features), A=len(AST_ACTIONS))
     for snapshot in features:
         sc.check(snapshot[:5], "N", dtype=np.int32)
-        sc.check(snapshot.node_mask, "N", dtype=np.bool_)
+        sc.check(snapshot.seq_len, "", dtype=np.int32)
+        chex.assert_scalar_in(int(snapshot.seq_len), 0, snapshot.node_type.shape[-1])
         sc.check(snapshot.action_mask, "NA", dtype=np.bool_)
     result = ASTFeatures(*(np.stack(values) for values in zip(*features)))
     sc.check(result[:5], "BN", dtype=np.int32)
-    sc.check(result.node_mask, "BN", dtype=np.bool_)
+    sc.check(result.seq_len, "B", dtype=np.int32)
     sc.check(result.action_mask, "BNA", dtype=np.bool_)
     return result

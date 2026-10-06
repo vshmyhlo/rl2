@@ -118,7 +118,9 @@ def test_typed_frontier_and_preorder_features() -> None:
     np.testing.assert_array_equal(features.depth[:7], [0, 1, 2, 3, 3, 3, 2])
     np.testing.assert_array_equal(features.child_index[:7], [0, 0, 0, 0, 1, 2, 1])
     np.testing.assert_array_equal(features.is_hole[:7], [False, False, False, True, True, True, True])
-    assert features.node_mask.sum() == 7
+    assert features.seq_len.shape == () and features.seq_len.dtype == np.int32
+    assert features.seq_len == 7
+    assert not features.node_type[7:].any()
     tree = tree.expand(ACTION_ID["Not"])
     assert {AST_ACTIONS[a] for a in np.flatnonzero(tree.allowed_actions())} == set(PREDICATES)
     tree = tree.expand(ACTION_ID["frontIsClear"])
@@ -141,18 +143,25 @@ def test_teacher_forcing_contains_only_prefix_information() -> None:
         assert tree.tokens() == program
     batched = batch_features(tuple(e[0][2] for e in examples))
     assert batched.node_type.shape == (2, 8)
+    np.testing.assert_array_equal(batched.seq_len, [4, 4])
     assert batched.action_mask.shape == (2, 8, len(AST_ACTIONS))
 
 
-@pytest.mark.parametrize("invalid", ["node_shape", "action_width", "mask_dtype"])
+@pytest.mark.parametrize(
+    "invalid", ["node_shape", "action_width", "length_dtype", "length_shape", "negative", "overflow"]
+)
 def test_batch_features_rejects_inconsistent_arrays(invalid: str) -> None:
     features = KarelAST.empty(4, 2).features()
     if invalid == "node_shape":
         features = features._replace(value=features.value[:-1])
     elif invalid == "action_width":
         features = features._replace(action_mask=features.action_mask[:, :-1])
+    elif invalid == "length_dtype":
+        features = features._replace(seq_len=features.seq_len.astype(np.bool_))
+    elif invalid == "length_shape":
+        features = features._replace(seq_len=features.seq_len[None])
     else:
-        features = features._replace(node_mask=features.node_mask.astype(np.int32))
+        features = features._replace(seq_len=np.asarray(-1 if invalid == "negative" else 5, np.int32))
     with pytest.raises(AssertionError):
         batch_features((features,))
 
@@ -287,7 +296,7 @@ def test_parallel_samples_complete_within_all_budgets(nodes: int, depth: int, to
         for step in range(min(nodes, depth + 1)):
             features = tree.features()
             masks = features.action_mask
-            np.testing.assert_array_equal(masks.any(axis=-1), features.is_hole & features.node_mask)
+            np.testing.assert_array_equal(masks.any(axis=-1), features.is_hole)
             actions = np.zeros(nodes, np.int32)
             positions = np.flatnonzero(features.is_hole)
             # Every hole created in the previous round is at this depth level.
@@ -355,7 +364,8 @@ def test_is_hole_is_derived_for_numpy_and_jitted_jax(leading_shape: tuple[int, .
     for position, index in enumerate(tree.preorder()):
         expected[position] = tree.nodes[index].is_hole
     # Padding remains inactive even if its type/value looks like a hole.
-    features = features._replace(node_type=np.where(features.node_mask, features.node_type, 999).astype(np.int32))
+    present = np.arange(32) < features.seq_len
+    features = features._replace(node_type=np.where(present, features.node_type, 999).astype(np.int32))
     features = ASTFeatures(*(np.broadcast_to(array, (*leading_shape, *array.shape)) for array in features))
     assert isinstance(features.is_hole, np.ndarray)
     np.testing.assert_array_equal(features.is_hole, np.broadcast_to(expected, (*leading_shape, 32)))
@@ -367,6 +377,9 @@ def test_is_hole_is_derived_for_numpy_and_jitted_jax(leading_shape: tuple[int, .
     actual = infer(jax.tree.map(jnp.asarray, features))
     assert actual.dtype == jnp.bool_
     np.testing.assert_array_equal(actual, features.is_hole)
+    empty = features._replace(seq_len=np.zeros_like(features.seq_len))
+    assert not empty.is_hole.any()
+    assert not infer(jax.tree.map(jnp.asarray, empty)).any()
     # The property follows value changes without a second mask to synchronize.
     count_position = int(np.flatnonzero(tree.features().value)[0])
     values = np.array(features.value)
