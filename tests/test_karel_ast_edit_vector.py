@@ -27,7 +27,9 @@ def test_parallel_matches_local_masked_steps_and_cleans_up() -> None:
         max_nodes=8,
         max_depth=4,
         max_seq_len=9,
-        env=KarelConfig(height=3, width=3, max_depth=0, max_statements=1, max_program_tokens=8),
+        env=KarelConfig(
+            height=3, width=3, max_depth=0, max_statements=1, max_program_tokens=8, depth_penalty_weight=0.1
+        ),
     )
     tasks = [KarelProgramEnv(config.env) for _ in range(3)]
     for index, task in enumerate(tasks):
@@ -62,6 +64,8 @@ def test_parallel_matches_local_masked_steps_and_cleans_up() -> None:
             assert left[2:] == right[2:]
             assert left.result.score == right.result.score
             assert left.result.error == right.result.error
+            assert left.result.components == right.result.components
+            assert left.result.components["depth"] == pytest.approx(-0.1 * 2 / 4)
             np.testing.assert_array_equal(left.result.output, right.result.output)
         # Persistent workers reset cleanly for the next rollout and propagate errors.
         parallel.reset(tasks)

@@ -30,6 +30,9 @@ class ASTTransformer(nn.Module):
     """One position per AST node, plus a flattened initial/target grid prefix.
 
     Inputs are [B,H,W,6] int32 grids and batched ASTFeatures with N<=max_nodes.
+    Grid dimensions H and W stay fixed for a given parameter set. Live AST
+    nodes form a contiguous preorder prefix, followed by right padding.
+    max_depth bounds AST edge depth, including list nodes, not control nesting.
     Returns [B,N,len(AST_ACTIONS)] float32, grammar-masked logits. PAD is excluded
     from active decisions. Non-hole positions use constant dummy PAD logits;
     callers stop expansion when the AST has no holes.
@@ -47,15 +50,9 @@ class ASTTransformer(nn.Module):
 
     def setup(self) -> None:
         for name in ("d_model", "num_layers", "num_heads", "max_nodes", "max_markers"):
-            if type(getattr(self, name)) is not int:
-                raise TypeError(f"{name} must be an integer")
             chex.assert_scalar_positive(getattr(self, name))
-        if type(self.max_depth) is not int:
-            raise TypeError("max_depth must be an integer")
         chex.assert_scalar_in(self.max_depth, 0, MAX_BLOCK_DEPTH)
         kv_heads = self.num_heads if self.num_kv_heads is None else self.num_kv_heads
-        if type(kv_heads) is not int:
-            raise TypeError("num_kv_heads must be an integer")
         chex.assert_scalar_positive(kv_heads)
         chex.assert_is_divisible(self.d_model, self.num_heads)
         chex.assert_is_divisible(self.num_heads, kv_heads)
@@ -109,8 +106,10 @@ class ASTTransformer(nn.Module):
             tree: Batched ASTFeatures before the next expansion. Node/type,
                 field, depth, child-index, and value IDs are int32 [B, N], with
                 1 <= N <= max_nodes (a trimmed sequence bucket);
-                node_mask is bool with the same shape; is_hole is computed from
-                node_mask, node_type, and value.
+                node_mask is bool with the same shape and marks a contiguous
+                live prefix followed by padding; live depths are in
+                [0, max_depth]. is_hole is computed from node_mask, node_type,
+                and value.
                 action_mask is bool [B, N, A], where
                 A = len(AST_ACTIONS), and marks legal expansions per hole.
 

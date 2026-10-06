@@ -18,6 +18,9 @@ Reward timing and example trajectories
 Execute the seed before the first action, with no reward. Execute again only
 after all holes in a replacement are filled, always from the original task input.
 A completed replacement receives r = score(new program) - score(previous program).
+Scores subtract weighted AST depth / max_depth, AST node count / max_nodes,
+and consumed execution ticks / max_execution_steps. All three penalty weights
+live in env; depth is normalized by the editor's candidate AST depth limit.
 Location choices, unfinished grammar expansions, and STOP receive zero reward.
 An execution failure is scored from its last valid grid and can be repaired by
 later edits. The environment accepts regressive edits and does not auto-stop on
@@ -88,13 +91,12 @@ from tensorboardX import SummaryWriter
 from rl2.attention import AttentionType
 from rl2.jax_cache import configure_compilation_cache
 from rl2.karel import (
-    REWARD_COMPONENTS,
     TASK_CATEGORIES,
     KarelConfig,
     KarelProgramEnv,
 )
 from rl2.karel_ast import AST_ACTIONS, KarelAST, program_actions
-from rl2.karel_ast_edit import FEEDBACK_SIZE, EditConfig, Evaluation, Observation
+from rl2.karel_ast_edit import EDIT_REWARD_COMPONENTS, FEEDBACK_SIZE, EditConfig, Evaluation, Observation
 from rl2.karel_ast_edit_vector import KarelASTEditVectorEnv
 from rl2.shape_checker import ShapeChecker
 from rl2.train_karel_ast_grpo import (
@@ -120,7 +122,7 @@ class Config:
     env: KarelConfig = field(default_factory=KarelConfig)
     seed_program: str = "DEF run m( turnLeft m)"
     max_nodes: int = 128  # AST node budget for grammar masking; also sizes edit locations.
-    max_depth: int = 64  # AST depth limit for grammar masking only.
+    max_depth: int = 64  # AST depth limit for grammar masking and penalty normalization.
     max_seq_len: int = 256  # Total seed tokens, one initial report, and action/result tokens per episode.
 
     # Rollout groups and update batching.
@@ -638,7 +640,7 @@ def collect_rollout(
         "charts/program_depth_ratio_mean": depth_mean / config.max_depth,
         **{
             f"charts/reward_{name}_mean": float(np.mean([result.components[name] for result in results]))
-            for name in REWARD_COMPONENTS
+            for name in EDIT_REWARD_COMPONENTS
         },
         **{
             f"charts/{error}_rate": float(np.mean([result.error == error for result in results]))
@@ -944,6 +946,7 @@ def train(config: Config) -> TrainState:
                     f"distance={diagnostics['charts/reward_distance_mean']:.3f} "
                     f"trajectory={diagnostics['charts/reward_trajectory_mean']:.3f} "
                     f"length_penalty={diagnostics['charts/reward_length_mean']:.4f} "
+                    f"depth_penalty={diagnostics['charts/reward_depth_mean']:.4f} "
                     f"execution_penalty={diagnostics['charts/reward_execution_mean']:.4f} "
                     f"reward_diverse_groups={diagnostics['charts/reward_diverse_group_fraction']:.3f} "
                     f"decisions_mean={diagnostics['charts/decisions_mean']:.3f} "

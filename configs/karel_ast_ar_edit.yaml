@@ -68,5 +68,6 @@ env:
   orientation_weight: 1.0
   marker_weight: 1.0
   trajectory_weight: 0.0
-  length_penalty_weight: 0.05
-  execution_penalty_weight: 0.05
+  length_penalty_weight: 0.1 # AST node count / max_nodes (including lists and values)
+  depth_penalty_weight: 0.1 # AST depth / top-level max_depth (candidate AST limit)
+  execution_penalty_weight: 0.1 # Consumed execution ticks / max_execution_steps

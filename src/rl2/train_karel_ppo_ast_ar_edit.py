@@ -39,9 +39,9 @@ from tensorboardX import SummaryWriter
 from rl2 import train_karel_ast_ar_edit as edit
 from rl2.attention import AttentionType
 from rl2.jax_cache import configure_compilation_cache
-from rl2.karel import REWARD_COMPONENTS, TASK_CATEGORIES, KarelConfig, KarelProgramEnv
+from rl2.karel import TASK_CATEGORIES, KarelConfig, KarelProgramEnv
 from rl2.karel_ast import AST_ACTIONS, KarelAST
-from rl2.karel_ast_edit import FEEDBACK_SIZE, Evaluation
+from rl2.karel_ast_edit import EDIT_REWARD_COMPONENTS, FEEDBACK_SIZE, Evaluation
 from rl2.karel_ast_edit_vector import KarelASTEditVectorEnv
 from rl2.shape_checker import ShapeChecker
 from rl2.train_karel_ast_ar_edit import (
@@ -370,7 +370,7 @@ def collect_rollout(
         "charts/program_depth_ratio_mean": depth_mean / config.max_depth,
         **{
             f"charts/reward_{name}_mean": float(np.mean([result.components[name] for result in results]))
-            for name in REWARD_COMPONENTS
+            for name in EDIT_REWARD_COMPONENTS
         },
         **{
             f"charts/{error}_rate": float(np.mean([result.error == error for result in results]))
@@ -681,6 +681,7 @@ def train(config: Config) -> TrainState:
                     f"distance={diagnostics['charts/reward_distance_mean']:.3f} "
                     f"trajectory={diagnostics['charts/reward_trajectory_mean']:.3f} "
                     f"length_penalty={diagnostics['charts/reward_length_mean']:.4f} "
+                    f"depth_penalty={diagnostics['charts/reward_depth_mean']:.4f} "
                     f"execution_penalty={diagnostics['charts/reward_execution_mean']:.4f} "
                     f"reward_diverse_groups={diagnostics['charts/reward_diverse_group_fraction']:.3f} "
                     f"decisions_mean={diagnostics['charts/decisions_mean']:.3f} "

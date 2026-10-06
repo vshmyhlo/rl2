@@ -144,6 +144,19 @@ def test_teacher_forcing_contains_only_prefix_information() -> None:
     assert batched.action_mask.shape == (2, 8, len(AST_ACTIONS))
 
 
+@pytest.mark.parametrize("invalid", ["node_shape", "action_width", "mask_dtype"])
+def test_batch_features_rejects_inconsistent_arrays(invalid: str) -> None:
+    features = KarelAST.empty(4, 2).features()
+    if invalid == "node_shape":
+        features = features._replace(value=features.value[:-1])
+    elif invalid == "action_width":
+        features = features._replace(action_mask=features.action_mask[:, :-1])
+    else:
+        features = features._replace(node_mask=features.node_mask.astype(np.int32))
+    with pytest.raises(AssertionError):
+        batch_features((features,))
+
+
 def test_invalid_actions_and_unfinished_printing_fail_without_mutating_tree() -> None:
     tree = KarelAST.empty(8, 4)
     for action in (-1, 0, len(AST_ACTIONS), ACTION_ID["move"]):

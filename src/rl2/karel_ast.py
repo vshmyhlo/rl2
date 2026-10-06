@@ -22,6 +22,7 @@ from numpy.typing import NDArray
 
 from rl2.karel import ACTIONS, PREDICATES, _parse, _Statement
 from rl2.karel_syntax import MAX_BLOCK_DEPTH
+from rl2.shape_checker import ShapeChecker
 
 
 class Hole(IntEnum):
@@ -151,6 +152,23 @@ type FeatureArray = jax.Array | NDArray[np.int32] | NDArray[np.bool_]
 class ASTFeatures(NamedTuple):
     """Fixed-capacity preorder representation of the current partial AST.
 
+    Example partial AST with max_nodes=9, max_depth=4, and no source-token
+    budget (? marks an unresolved hole)::
+
+        Program
+          BODY: ConsNonEmpty
+            HEAD: REPEAT
+              COUNT: R=2
+              BODY: ConsNonEmpty
+                HEAD: ?STATEMENT
+                TAIL: ?LIST
+            TAIL: ?LIST
+        <padding>
+
+    This represents a repeat block whose first statement and list endings
+    are still undecided. The attribute examples below use this tree in
+    preorder, displaying names instead of numeric IDs where applicable.
+
     N is max_nodes and A is len(AST_ACTIONS). Node arrays have shape [N]
     for one tree or [B, N] for a batch. Features contain only existing nodes
     and unresolved holes, with unused positions padded with zeros/False.
@@ -159,23 +177,41 @@ class ASTFeatures(NamedTuple):
         node_type: Int32 constructor IDs (1-based), or
             1 + len(CONSTRUCTORS) + Hole ID for holes and resolved value nodes.
             Zero denotes padding; is_hole distinguishes holes from filled values.
+            Example: [Program, ConsNonEmpty, REPEAT, COUNT, ConsNonEmpty,
+            STATEMENT, LIST, LIST, <padding>]. R=2 retains the COUNT type.
         field: Int32 Field IDs identifying each node's role in its parent
             (BODY, CONDITION, etc.); the root uses Field.ROOT.
+            Example: [ROOT, BODY, HEAD, COUNT, BODY, HEAD, TAIL, TAIL,
+            <padding>].
         depth: Int32 distance from the root in AST edges. The root is at 0;
             list nodes count toward depth, unlike control-block nesting depth.
+            Example: [0, 1, 2, 3, 3, 4, 4, 2, 0]; the statement hole has
+            AST depth 4 even though it is inside just one repeat block.
         child_index: Int32 zero-based position among the parent's children;
             the root uses 0.
+            Example: REPEAT's COUNT is its first child and BODY is its
+            second child; each ConsNonEmpty has HEAD first and TAIL second.
         value: Int32 1-based index into VALUES for resolved predicates/counts,
             otherwise 0. These indices are not AST action IDs.
+            Example: [<unset>, <unset>, <unset>, R=2, <unset>, <unset>,
+            <unset>, <unset>, <padding>]. Only the COUNT node has a value.
         is_hole: Computed bool mask for unresolved nodes: present nodes with
             a hole/value type and value=0. Not stored in the tuple.
+            Example: [False, False, False, False, False, True, True, True,
+            False]; the resolved count and padding are not holes.
         node_mask: Bool mask marking all existing nodes, including holes;
             False marks padding excluded from attention keys.
+            Example: [True, True, True, True, True, True, True, True, False].
         action_mask: Bool [N, A] or [B, N, A] array of legal expansions at
             each current hole. Shared completion budgets are allocated before
             sampling so any combination of allowed choices fits. Resolved nodes,
             padding, and finished trees have all-False masks; PAD is never legal.
             Sequential utility snapshots enable only the frontier row.
+            Example: shape [9, 41], with True entries for move, turnLeft,
+            turnRight, pickMarker, and putMarker at the STATEMENT hole,
+            and for End at both LIST holes. All other entries are False.
+            The depth/node budgets rule out larger expansions.
+            With features(parallel=False), only the STATEMENT hole is enabled.
     """
 
     node_type: FeatureArray
@@ -333,9 +369,10 @@ class KarelAST:
         All inactive positions must contain PAD=0. Validate the whole round
         before applying it; children created here wait until the next round.
         """
-        chex.assert_shape(actions, (self.max_nodes,))
-        chex.assert_type(actions, np.int32)
+        sc = ShapeChecker(N=self.max_nodes, A=len(AST_ACTIONS))
+        sc.check(actions, "N", dtype=np.int32)
         mask = self.parallel_action_mask()
+        sc.check(mask, "NA", dtype=np.bool_)
         active = mask.any(axis=-1)
         if np.any(actions[~active] != 0):
             raise ValueError("Non-hole positions must use PAD")
@@ -485,6 +522,16 @@ def teacher_forcing(
 
 
 def batch_features(features: tuple[ASTFeatures, ...]) -> ASTFeatures:
+    """Stack unbatched snapshots with matching capacities and valid array metadata."""
     if not features:
         raise ValueError("Cannot batch zero ASTs")
-    return ASTFeatures(*(np.stack(values) for values in zip(*features)))
+    sc = ShapeChecker(B=len(features), A=len(AST_ACTIONS))
+    for snapshot in features:
+        sc.check(snapshot[:5], "N", dtype=np.int32)
+        sc.check(snapshot.node_mask, "N", dtype=np.bool_)
+        sc.check(snapshot.action_mask, "NA", dtype=np.bool_)
+    result = ASTFeatures(*(np.stack(values) for values in zip(*features)))
+    sc.check(result[:5], "BN", dtype=np.int32)
+    sc.check(result.node_mask, "BN", dtype=np.bool_)
+    sc.check(result.action_mask, "BNA", dtype=np.bool_)
+    return result

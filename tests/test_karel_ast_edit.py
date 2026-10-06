@@ -7,7 +7,7 @@ import pytest
 
 from rl2 import karel_ast_edit as editing
 from rl2.karel import KarelConfig, KarelProgramEnv, target_distance_map
-from rl2.karel_ast import ACTION_ID
+from rl2.karel_ast import ACTION_ID, program_actions
 
 
 @pytest.fixture
@@ -111,6 +111,93 @@ def test_seed_prefill_leaves_only_stop(config: editing.EditConfig) -> None:
     transition = env.step(0)
     assert transition.terminated and env.remaining == 0
     assert env.tree.complete and env.completed_edits == 0
+
+
+@pytest.mark.parametrize(
+    "source,nodes,depth,ticks,error",
+    [
+        pytest.param("turnRight", 4, 2, 1, None, id="successful-primitive"),
+        pytest.param("turnRight move", 6, 3, 2, "runtime_error", id="failed-attempt-counts"),
+        pytest.param("REPEAT R=2 r( turnRight r)", 8, 4, 3, None, id="ast-and-execution-limits"),
+        pytest.param("REPEAT R=3 r( turnRight r)", 8, 4, 3, "execution_limit", id="exhausted-execution"),
+    ],
+)
+def test_normalized_program_penalties(
+    config: editing.EditConfig, source: str, nodes: int, depth: int, ticks: int, error: str | None
+) -> None:
+    config = replace(
+        config,
+        seed_program=f"DEF run m( {source} m)",
+        max_seq_len=16,
+        env=replace(
+            config.env,
+            depth_penalty_weight=0.2,
+            max_program_tokens=12,
+            max_execution_steps=3,
+            length_penalty_weight=0.3,
+            execution_penalty_weight=0.4,
+        ),
+    )
+    task = turning_task(config)
+    env = editing.KarelASTEditEnv(config)
+    observation = env.reset(task=task)
+    result = env.result
+    assert result is not None
+    assert result.error == error and result.ticks == ticks
+    assert result.components["depth"] == pytest.approx(-0.2 * depth / 4)
+    assert result.components["length"] == pytest.approx(-0.3 * nodes / 8)
+    assert result.components["execution"] == pytest.approx(-0.4 * ticks / 3)
+    assert result.score == pytest.approx(sum(result.components.values()))
+    assert observation.feedback[0] == pytest.approx(result.score)
+    assert env.step(0).reward == 0
+
+    # Zero weights recover task-only scores, including on failed executions.
+    unpenalized = replace(
+        config,
+        env=replace(config.env, depth_penalty_weight=0.0, length_penalty_weight=0.0, execution_penalty_weight=0.0),
+    )
+    baseline = editing.KarelASTEditEnv(unpenalized)
+    baseline.reset(task=turning_task(unpenalized))
+    assert baseline.result is not None
+    assert baseline.result.score == pytest.approx(
+        sum(value for name, value in result.components.items() if name not in ("depth", "length", "execution"))
+    )
+
+
+def test_penalties_reward_smaller_equivalent_programs(config: editing.EditConfig) -> None:
+    config = replace(
+        config,
+        max_seq_len=24,
+        env=replace(config.env, depth_penalty_weight=0.1, length_penalty_weight=0.1, execution_penalty_weight=0.1),
+    )
+    env = editing.KarelASTEditEnv(config)
+    initial = env.reset(task=turning_task(config))
+
+    def replace_program(source: str) -> float:
+        assert env.step(1).reward == 0  # Replace the root.
+        actions = program_actions(tuple(source.split()))
+        for index, action in enumerate(actions):
+            transition = env.step(1 + config.max_nodes + action)
+            if index < len(actions) - 1:
+                assert transition.reward == 0 and not transition.reevaluated
+        assert transition.reevaluated
+        np.testing.assert_array_equal(transition.observation.output, initial.output)
+        assert transition.observation.feedback[-2] == pytest.approx(transition.reward)
+        return transition.reward
+
+    grown = replace_program("DEF run m( turnRight turnRight turnRight m)")
+    # Equivalent output; only the extra four nodes, two depth edges and two ticks cost reward.
+    assert grown == pytest.approx(-0.1 * (4 / 8 + 2 / 4 + 2 / config.env.max_execution_steps))
+    shrunk = replace_program(config.seed_program)
+    assert shrunk == pytest.approx(-grown)
+    assert env.result is not None and env.result.score == pytest.approx(env.seed_score)
+    assert env.step(0).reward == 0
+
+
+@pytest.mark.parametrize("weight", [-0.1, float("inf"), float("nan")], ids=["negative", "infinite", "nan"])
+def test_invalid_depth_penalty(config: editing.EditConfig, weight: float) -> None:
+    with pytest.raises(ValueError, match="depth_penalty_weight"):
+        replace(config.env, depth_penalty_weight=weight)
 
 
 def test_invalid_actions_and_reset_contract(config: editing.EditConfig) -> None:

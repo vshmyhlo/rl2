@@ -41,7 +41,9 @@ def config() -> edit.Config:
         entropy_coef=0.01,
         log_interval=1,
         log_program_interval=1,
-        env=KarelConfig(height=3, width=3, max_depth=0, max_statements=1, max_program_tokens=8),
+        env=KarelConfig(
+            height=3, width=3, max_depth=0, max_statements=1, max_program_tokens=8, depth_penalty_weight=0.1
+        ),
     )
 
 
@@ -187,11 +189,17 @@ def test_rollout_replay_rewards_and_minibatches(config: edit.Config, state: Trai
         pair = env.reset(seed=seed)
         np.testing.assert_array_equal(batch.history.initial[index], pair.initial)
         for token in tree.tokens():
-            _, reward, terminated, truncated, _ = env.step(TOKEN_TO_ID[token])
+            _, reward, terminated, truncated, info = env.step(TOKEN_TO_ID[token])
         assert terminated and not truncated
+        reward -= float(info["reward_length"])
+        reward -= config.env.length_penalty_weight * len(tree.nodes) / config.max_nodes
+        reward -= config.env.depth_penalty_weight * max(node.depth for node in tree.nodes) / config.max_depth
         env.reset(seed=seed)
         seed_score = editing.evaluate(
-            editing.seed_tree(config.edit_config), env, KarelProgramEnv(config.env), pair.initial
+            editing.seed_tree(config.edit_config),
+            env,
+            KarelProgramEnv(config.env),
+            pair.initial,
         ).score
         assert rewards[index] == pytest.approx(reward - seed_score)
     assert diagnostics["charts/syntax_error_rate"] == diagnostics["charts/token_limit_rate"] == 0
@@ -233,6 +241,12 @@ def test_stop_is_a_real_decision(config: edit.Config, state: TrainState) -> None
     assert diagnostics["charts/program_node_ratio_mean"] == 4 / config.max_nodes
     assert diagnostics["charts/program_depth_mean"] == 2
     assert diagnostics["charts/program_depth_ratio_mean"] == 2 / config.max_depth
+    assert diagnostics["charts/reward_depth_mean"] == pytest.approx(
+        -config.env.depth_penalty_weight * 2 / config.max_depth
+    )
+    assert diagnostics["charts/reward_length_mean"] == pytest.approx(
+        -config.env.length_penalty_weight * 4 / config.max_nodes
+    )
 
 
 def test_update_and_episode_normalization(
@@ -291,6 +305,8 @@ def test_update_rejects_invalid_replay(
 def test_config_and_checkpoint(config: edit.Config, state: TrainState, tmp_path: Path) -> None:
     supplied = edit.load_config("configs/karel_ast_ar_edit.yaml")
     assert supplied.edit_config.max_seq_len == supplied.max_seq_len
+    assert supplied.edit_config.env.depth_penalty_weight == 0.1
+    assert supplied.env.length_penalty_weight == supplied.env.execution_penalty_weight == 0.1
     for changes, error in (
         ({"max_seq_len": 0}, AssertionError),
         ({"max_seq_len": True}, TypeError),
@@ -356,6 +372,9 @@ def test_training_wiring(
     writer.add_scalar.assert_any_call("charts/updates_per_rollout", 0.0 if rejected else 2.0, 2)
     writer.add_scalar.assert_any_call("policy/early_stop", float(rejected), 2)
     output = capsys.readouterr().out
+    depth_penalty = rollout.diagnostics["charts/reward_depth_mean"]
+    assert f"depth_penalty={depth_penalty:.4f}" in output
+    writer.add_scalar.assert_any_call("charts/reward_depth_mean", depth_penalty, 2)
     for name in (
         "decisions_mean",
         "sequence_length_mean",

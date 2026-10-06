@@ -106,6 +106,7 @@ class KarelConfig:
     trajectory_weight: float = 0.25  # Net progress discounted by cumulative distance increases; zero disables.
     length_penalty_weight: float = 0.05  # Maximum deduction at the generated-token limit.
     execution_penalty_weight: float = 0.05  # Maximum deduction at the execution-step limit.
+    depth_penalty_weight: float = 0.0  # AST editor only: maximum deduction at its candidate depth limit.
 
     def __post_init__(self) -> None:
         for value in (
@@ -141,6 +142,8 @@ class KarelConfig:
             chex.assert_scalar_positive(weight)
             if not np.isfinite(weight):
                 raise ValueError("Reward distance weights must be finite and strictly positive")
+        if not np.isfinite(self.depth_penalty_weight) or self.depth_penalty_weight < 0:
+            raise ValueError("depth_penalty_weight must be finite and nonnegative")
         for name in (
             "syntax_weight",
             "runtime_weight",

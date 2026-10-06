@@ -25,8 +25,10 @@ from rl2.karel import (
     execute_program,
 )
 from rl2.karel_ast import AST_ACTIONS, KarelAST, Node, program_actions
+from rl2.shape_checker import ShapeChecker
 
 FEEDBACK_SIZE = 8  # score, success, runtime error, execution limit, ticks, length, score delta, sequence tokens left
+EDIT_REWARD_COMPONENTS = (*REWARD_COMPONENTS, "depth")
 
 
 @dataclass(frozen=True)
@@ -116,20 +118,27 @@ class Evaluation:
     components: dict[str, float]
 
 
-def evaluate(tree: KarelAST, task: KarelProgramEnv, env: KarelProgramEnv, initial: NDArray[np.int32]) -> Evaluation:
-    """Reuse the environment's exact scoring; replay once to obtain grid/tick feedback.
+def evaluate(
+    tree: KarelAST,
+    task: KarelProgramEnv,
+    env: KarelProgramEnv,
+    initial: NDArray[np.int32],
+) -> Evaluation:
+    """Score task performance minus normalized AST size, depth, and execution costs.
 
     Task remains freshly reset, allowing arbitrary successive candidates to use
     the same initial state and cached target distance map. No reference labels
-    enter either the observation or the reward.
+    enter either the observation or the reward. Length counts all AST nodes;
+    depth counts edges from the root, including lists. Execution counts consumed
+    statement/condition ticks, including failed attempts, rather than wall time.
     """
-    chex.assert_shape(initial, (task.config.height, task.config.width, 6))
-    chex.assert_type(initial, np.int32)
+    sc = ShapeChecker(H=task.config.height, W=task.config.width, C=6)
+    sc.check(initial, "HWC", dtype=np.int32)
     tokens = tree.tokens()
     env.reset_from(task)
-    reward, info = 0.0, {}
+    info = {}
     for token in tokens:
-        _, reward, terminated, truncated, info = env.step(TOKEN_TO_ID[token])
+        _, _, terminated, truncated, info = env.step(TOKEN_TO_ID[token])
         if terminated or truncated:
             break
     if info.get("error") in ("syntax_error", "token_limit"):
@@ -147,13 +156,20 @@ def evaluate(tree: KarelAST, task: KarelProgramEnv, env: KarelProgramEnv, initia
         if error.partial_state is None:
             raise
         output = error.partial_state
+    sc.check(output, "HWC", dtype=np.int32)
+    components = {name: float(info[f"reward_{name}"]) for name in REWARD_COMPONENTS}
+    components["length"] = -task.config.length_penalty_weight * (len(tree.nodes) / tree.max_nodes)
+    components["depth"] = -task.config.depth_penalty_weight * (max(node.depth for node in tree.nodes) / tree.max_depth)
+    score = sum(components.values())
+    if not np.isfinite(score):
+        raise ValueError("Total reward overflowed; reduce reward weights")
     return Evaluation(
         output,
-        reward,
+        score,
         bool(info["success"]),
         info["error"],
         stats.steps,
-        {name: float(info[f"reward_{name}"]) for name in REWARD_COMPONENTS},
+        components,
     )
 
 
