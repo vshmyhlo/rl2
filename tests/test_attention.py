@@ -107,6 +107,25 @@ def test_rope_matches_llama_adjacent_pairs_in_float32(dtype: jax.typing.DTypeLik
 
 
 @pytest.mark.parametrize(
+    "theta",
+    [
+        pytest.param(1e40, id="base-overflows-float32"),
+        pytest.param(1e-40, id="base-is-subnormal-float32"),
+    ],
+)
+def test_rope_preserves_frequencies_for_extreme_finite_theta(theta: float) -> None:
+    x = jnp.tile(jnp.asarray([1.0, 0.0], jnp.float32), 8).reshape(1, 1, 1, 16)
+    positions = jnp.ones((1, 1), jnp.int32)
+    # The base need not fit float32 even though all resulting frequencies do.
+    frequencies = np.power(theta, -np.arange(8, dtype=np.float64) / 8).astype(np.float32)
+    expected = np.stack((np.cos(frequencies), np.sin(frequencies)), axis=-1).reshape(x.shape)
+    for actual in (_rope(x, positions, theta), jax.jit(_rope, static_argnums=2)(x, positions, theta)):
+        sc = ShapeChecker(B=1, T=1, H=1, F=16)
+        sc.check(actual, "BTHF", jnp.float32)
+        np.testing.assert_allclose(actual, expected, atol=1e-7, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
     "positions_shape,positions_dtype",
     [
         pytest.param((2,), jnp.int32, id="position-rank"),

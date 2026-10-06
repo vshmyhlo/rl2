@@ -21,6 +21,12 @@ def test_public_model_exports() -> None:
     }
 
 
+def test_bidirectional_model_has_no_decoding_interface() -> None:
+    model = BDTransformer(4, 1, num_heads=1, max_seq_len=3)
+    assert not hasattr(model, "step")
+    assert not hasattr(model, "initial_carry")
+
+
 def test_autoregressive_sequence_chunks_and_steps_match_from_fresh_and_supplied_carry() -> None:
     model = ARTransformer(4, 2, num_heads=1, max_seq_len=5, initializer_range=0.2)
     assert isinstance(model, Transformer)
@@ -53,7 +59,7 @@ def test_autoregressive_sequence_chunks_and_steps_match_from_fresh_and_supplied_
         state = initial
         outputs = []
         for t in range(3):
-            state, output = step(variables, padded[:, t], state, active=t < x_len)
+            state, output = step(variables, padded[:, t], t < x_len, state)
             sc.check(output, "BD", jnp.float32)
             outputs.append(output)
         chex.assert_trees_all_close((state, jnp.stack(outputs, 1)), (final, expected), atol=2e-6)
@@ -69,12 +75,12 @@ def test_autoregressive_sequence_chunks_and_steps_match_from_fresh_and_supplied_
     _, perturbed = apply(variables, x.at[:, -1].add(10), x_len)
     _, baseline = apply(variables, x, x_len)
     np.testing.assert_allclose(perturbed[:, :-1], baseline[:, :-1], atol=2e-6)
-    # Omitted active advances everyone, including examples skipped previously.
+    # An all-true mask advances everyone, including examples skipped previously.
     for initial in (None, supplied):
-        actual = step(variables, x[:, 0], initial)
+        actual = step(variables, x[:, 0], jnp.ones((3,), jnp.bool_), initial)
         expected_step = apply(variables, x[:, :1], jnp.ones((3,), jnp.int32), initial)
         chex.assert_trees_all_close(actual, (expected_step[0], expected_step[1][:, 0]), atol=2e-6)
-    skipped, zero = step(variables, padded[:, 0], final, active=jnp.zeros((3,), jnp.bool_))
+    skipped, zero = step(variables, padded[:, 0], jnp.zeros((3,), jnp.bool_), final)
     chex.assert_trees_all_equal(skipped, final)
     np.testing.assert_array_equal(zero, 0)
 
@@ -112,7 +118,7 @@ def test_bidirectional_valid_prefixes_and_gradients_ignore_padding() -> None:
     np.testing.assert_array_equal(gradient[~valid], 0)
     assert np.linalg.norm(gradient[valid]) > 0
     with pytest.raises(ValueError, match="requires causal=True"):
-        model.apply(variables, x[:, 0], method=model.step)
+        model.apply(variables, x[:, 0], jnp.ones((3,), jnp.bool_), method=model.step)
     for lengths in (jnp.array([-1, 2, 3], jnp.int32), jnp.array([0, 2, 4], jnp.int32)):
         with pytest.raises(ValueError, match="x_len must be between"):
             model.apply(variables, x, lengths)
@@ -129,9 +135,9 @@ def test_specialized_stacks_validate_lengths_and_fixed_direction(model_type: typ
         model.clone(causal=not model.causal).apply({}, x, jnp.array([3], jnp.int32))
 
 
-def test_autoregressive_step_validates_active_metadata() -> None:
+def test_autoregressive_step_validates_x_active_metadata() -> None:
     model = ARTransformer(4, 1, num_heads=1, max_seq_len=3)
     x = jnp.zeros((1, 4), jnp.float32)
-    for active in (jnp.ones((1,), jnp.int32), jnp.ones((1, 1), jnp.bool_), jnp.ones((2,), jnp.bool_)):
+    for x_active in (jnp.ones((1,), jnp.int32), jnp.ones((1, 1), jnp.bool_), jnp.ones((2,), jnp.bool_)):
         with pytest.raises(AssertionError):
-            model.apply({}, x, active=active, method=model.step)
+            model.apply({}, x, x_active=x_active, method=model.step)

@@ -366,8 +366,10 @@ class EditTransformer(nn.Module):
         sc.check(event.output, "BHWC", jnp.int32)
         sc.check(event.feedback, "BF", jnp.float32)
         sequence = jax.tree.map(partial(jnp.expand_dims, axis=0), event)
+        x_active = jnp.ones(sc["B"], jnp.bool_)
+        sc.check(x_active, "B", jnp.bool_)
         transformer, features = self.backbone.step(
-            self.encode_events(sequence, carry.initial, carry.target)[0], carry.transformer
+            self.encode_events(sequence, carry.initial, carry.target)[0], x_active, carry.transformer
         )
         sc.check(features, "BD", self.dtype)
         logits = self.head(features).astype(jnp.float32)

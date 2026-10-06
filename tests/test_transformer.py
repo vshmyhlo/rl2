@@ -185,7 +185,7 @@ def test_noncausal_step_is_rejected_before_projections(stack: bool) -> None:
     x = jnp.zeros((1, 4), jnp.float32)
     sc = ShapeChecker(B=1, D=4)
     sc.check(x, "BD", jnp.float32)
-    step = partial(model.apply, method=model.step)
+    step = partial(model.apply, x_active=jnp.ones((1,), jnp.bool_), method=model.step)
     with pytest.raises(ValueError, match=r"step\(\) requires causal=True"):
         step({}, x)
     with pytest.raises(ValueError, match=r"step\(\) requires causal=True"):
@@ -367,17 +367,17 @@ def test_full_chunks_and_scanned_steps_agree(stack: bool) -> None:
     assert_carry_close(carry, final)
 
     def step(state: Carry, inputs: tuple[jax.Array, jax.Array]) -> tuple[Carry, jax.Array]:
-        token, active = inputs
+        token, x_active = inputs
         sc = ShapeChecker(B=2, D=8)
         sc.check(token, "BD", jnp.float32)
-        sc.check(active, "B", jnp.bool_)
-        return model.apply(variables, token, state, active=active, method=model.step)
+        sc.check(x_active, "B", jnp.bool_)
+        return model.apply(variables, token, x_active, state, method=model.step)
 
-    active = jnp.arange(5)[:, None] < x_len
-    carry, actual = jax.jit(partial(jax.lax.scan, step))(model.initial_carry(2), (jnp.swapaxes(x, 0, 1), active))
+    x_active = jnp.arange(5)[:, None] < x_len
+    carry, actual = jax.jit(partial(jax.lax.scan, step))(model.initial_carry(2), (jnp.swapaxes(x, 0, 1), x_active))
     np.testing.assert_allclose(jnp.swapaxes(actual, 0, 1), expected, rtol=2e-5, atol=5e-6)
     assert_carry_close(carry, final)
-    fresh, single = model.apply(variables, x[:, 0], method=model.step)
+    fresh, single = model.apply(variables, x[:, 0], jnp.ones((2,), jnp.bool_), method=model.step)
     initial, sequence = model.apply(variables, x[:, :1])
     assert_carry_close(fresh, initial)
     np.testing.assert_allclose(single, sequence[:, 0])
@@ -520,22 +520,23 @@ def test_sequence_and_step_validate_inputs_before_projections(stack: bool, step:
     shape = (1, 8) if step else (1, 2, 8)
     x = jnp.zeros(shape, jnp.float32)
     method = model.step if step else model.__call__
+    apply = partial(model.apply, method=method, **({"x_active": jnp.ones((1,), jnp.bool_)} if step else {}))
     # Empty variables ensure invalid metadata is rejected before any projection.
     with pytest.raises(AssertionError):
-        model.apply({}, x[..., :4], method=method)
+        apply({}, x[..., :4])
     with pytest.raises(AssertionError):
-        model.apply({}, x[None], method=method)
+        apply({}, x[None])
     with pytest.raises(AssertionError):
-        model.apply({}, x.astype(jnp.int32), method=method)
-    argument = "active" if step else "x_len"
+        apply({}, x.astype(jnp.int32))
+    argument = "x_active" if step else "x_len"
     dtype = jnp.bool_ if step else jnp.int32
     with pytest.raises(AssertionError):
-        model.apply({}, x, **{argument: jnp.zeros((1,), jnp.float32)}, method=method)
+        apply({}, x, **{argument: jnp.zeros((1,), jnp.float32)})
     with pytest.raises(AssertionError):
-        model.apply({}, x, **{argument: jnp.zeros((1, 1), dtype)}, method=method)
+        apply({}, x, **{argument: jnp.zeros((1, 1), dtype)})
     if stack:
         with pytest.raises(ValueError, match="one TransformerCarry per layer"):
-            model.apply({}, x, carry=(), method=method)
+            apply({}, x, carry=())
 
 
 @pytest.mark.parametrize(
@@ -666,9 +667,11 @@ def test_attention_backend_forward_backward_and_decode(cached: bool, window: int
         with pytest.raises(AssertionError, match="gradient relative L2 error"):
             assert_gradient_close(jnp.zeros_like(b), b)
     cache = actual[1][0]
-    expected_state, expected_y = model.apply({"params": params}, x[:, 0], carry=cache, method=model.step)
+    expected_state, expected_y = model.apply(
+        {"params": params}, x[:, 0], jnp.ones((2,), jnp.bool_), cache, method=model.step
+    )
     actual_state, actual_y = jax.jit(partial(backend.apply, method=backend.step))(
-        {"params": params}, x[:, 0], carry=cache
+        {"params": params}, x[:, 0], jnp.ones((2,), jnp.bool_), cache
     )
     np.testing.assert_allclose(actual_y.astype(jnp.float32), expected_y.astype(jnp.float32), rtol=0.05, atol=0.015)
     assert_carry_close(actual_state, expected_state, tolerance=0.04)

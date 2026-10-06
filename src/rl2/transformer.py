@@ -39,8 +39,8 @@ Sequence calls require int32 ``x_len[batch]`` to delimit each left-aligned
 valid prefix; remaining input tokens are right padding. Lengths must be between
 zero and the input length. Padded outputs are zero. Only valid tokens advance
 an autoregressive cache and its RoPE positions; omit carry to start fresh.
-Autoregressive steps accept an optional boolean ``active[batch]`` mask, defaulting
-to all active. Inactive examples return zero output and preserve their carry.
+Autoregressive steps require a boolean ``x_active[batch]`` mask immediately after
+``x``. Inactive examples return zero output and preserve their carry.
 
 ``attention_implementation="xla"`` is portable (the default). Select ``"cudnn"``
 with float16/bfloat16 and a supported NVIDIA GPU for JAX's cuDNN fused attention.
@@ -56,7 +56,7 @@ Example::
     x_len = jnp.full((8,), 16, jnp.int32)
     variables = model.init(jax.random.key(0), x, x_len)
     carry, y = model.apply(variables, x, x_len)
-    carry, next_y = model.apply(variables, x[:, 0], carry, method=model.step)
+    carry, next_y = model.apply(variables, x[:, 0], jnp.ones((8,), jnp.bool_), carry, method=model.step)
 """
 
 import math
@@ -257,23 +257,21 @@ class _TransformerBlock(nn.Module):
     def step(
         self,
         x: jax.Array,
+        x_active: jax.Array,
         carry: TransformerCarry | None = None,
-        *,
-        active: jax.Array | None = None,
     ) -> tuple[TransformerCarry, jax.Array]:
-        """Process [batch,dim] with an optional boolean active[batch] mask.
+        """Process [batch,dim] with a required boolean x_active[batch] mask.
 
-        All examples advance by default. Inactive examples return zero output
-        and preserve carry. Requires causal=True.
+        Inactive examples return zero output and preserve carry.
+        Requires causal=True.
         """
         if not self.causal:
             raise ValueError("step() requires causal=True; use __call__() for bidirectional attention")
         sc = ShapeChecker(D=self.dim)
         sc.check(x, "BD")
         chex.assert_type(x, jnp.floating)
-        if active is not None:
-            sc.check(active, "B", jnp.bool_)
-        x_len = jnp.ones(sc["B"], jnp.int32) if active is None else active.astype(jnp.int32)
+        sc.check(x_active, "B", jnp.bool_)
+        x_len = x_active.astype(jnp.int32)
         sc.check(x_len, "B", jnp.int32)
         carry, y = self(x[:, None], x_len, carry)
         output = y[:, 0]
@@ -382,23 +380,21 @@ class Transformer(nn.Module):
     def step(
         self,
         x: jax.Array,
+        x_active: jax.Array,
         carry: TransformerStackCarry | None = None,
-        *,
-        active: jax.Array | None = None,
     ) -> tuple[TransformerStackCarry, jax.Array]:
-        """Process [batch,dim] with an optional boolean active[batch] mask.
+        """Process [batch,dim] with a required boolean x_active[batch] mask.
 
-        All examples advance by default. Inactive examples return zero output
-        and preserve carry. Requires causal=True.
+        Inactive examples return zero output and preserve carry.
+        Requires causal=True.
         """
         if not self.causal:
             raise ValueError("step() requires causal=True; use __call__() for bidirectional attention")
         sc = ShapeChecker(D=self.dim)
         sc.check(x, "BD")
         chex.assert_type(x, jnp.floating)
-        if active is not None:
-            sc.check(active, "B", jnp.bool_)
-        x_len = jnp.ones(sc["B"], jnp.int32) if active is None else active.astype(jnp.int32)
+        sc.check(x_active, "B", jnp.bool_)
+        x_len = x_active.astype(jnp.int32)
         sc.check(x_len, "B", jnp.int32)
         carry, y = self(x[:, None], x_len, carry)
         output = y[:, 0]

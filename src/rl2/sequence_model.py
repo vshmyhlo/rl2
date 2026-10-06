@@ -46,7 +46,7 @@ class ARSequenceModel[CarryT](ABC):
     calling ``self(x, x_len, c)`` must produce the same outputs and final carry
     as processing ``x[:, t]`` in increasing time order with ``step``, passing
     each returned carry to the next step. At time ``t``, pass the boolean
-    mask ``active=t < x_len``; stack the step outputs along axis 1.
+    mask ``x_active=t < x_len``; stack the step outputs along axis 1.
 
     This invariant applies both from scratch (``c=None``) and from any valid
     supplied carry. Both methods must support either starting mode. Splitting
@@ -92,19 +92,18 @@ class ARSequenceModel[CarryT](ABC):
     def step(
         self,
         x: jax.Array,
+        x_active: jax.Array,
         carry: CarryT | None = None,
-        *,
-        active: jax.Array | None = None,
     ) -> tuple[CarryT, jax.Array]:
         """Process [batch,dim], returning (updated carry, same-shaped output).
 
-        Optional boolean active[batch] selects examples to advance; omission
-        means all examples are active. Inactive inputs are ignored, produce
+        Required boolean x_active[batch] selects examples to advance.
+        Inactive inputs are ignored, produce
         zero output, and preserve that example's carry. With no supplied carry,
         inactive examples retain the model's fresh initial carry.
         Omitted carry starts fresh; supplied carry continues prior history.
         Equivalent to ``__call__`` with a singleton time axis and int32 lengths
-        obtained from active (or all ones), removing that axis from the output.
+        obtained from x_active, removing that axis from the output.
         Repeated steps must satisfy the class equivalence invariant.
         """
         raise NotImplementedError

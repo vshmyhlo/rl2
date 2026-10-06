@@ -59,7 +59,10 @@ def _rope(x: jax.Array, positions: jax.Array, theta: float) -> jax.Array:
     chex.assert_is_divisible(x.shape[-1], 2)
     chex.assert_scalar_positive(theta)
     half = x.shape[-1] // 2
-    frequencies = theta ** (-jnp.arange(half, dtype=jnp.float32) / half)
+    # Theta and the head width are static. Compute frequencies before casting:
+    # a finite theta can overflow or lose precision in float32 even when its
+    # inverse powers are representable. Trigonometry remains in float32.
+    frequencies = jnp.asarray([theta ** (-i / half) for i in range(half)], dtype=jnp.float32)
     angles = positions.astype(jnp.float32)[..., None, None] * frequencies
     real, imag = x[..., ::2].astype(jnp.float32), x[..., 1::2].astype(jnp.float32)
     cos, sin = jnp.cos(angles), jnp.sin(angles)

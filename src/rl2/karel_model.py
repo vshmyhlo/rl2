@@ -140,7 +140,12 @@ class KarelProgramModel(nn.Module):
         sc.check(token, "B", jnp.int32)
         inputs = self.token_embedding(token)
         sc.check(inputs, "BD", self.dtype)
-        carry, features = self.backbone.step(inputs, carry=carry)
+        if self.backbone_type == "transformer":
+            x_active = jnp.ones(sc["B"], jnp.bool_)
+            sc.check(x_active, "B", jnp.bool_)
+            carry, features = self.backbone.step(inputs, x_active, carry)
+        else:
+            carry, features = self.backbone.step(inputs, carry=carry)
         sc.check(features, "BD", self.dtype)
         logits = self.head(features).astype(jnp.float32)
         sc.check(logits, "BV", jnp.float32)
