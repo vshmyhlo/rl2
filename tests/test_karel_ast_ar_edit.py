@@ -221,6 +221,47 @@ def test_rollout_replay_rewards_and_minibatches(config: edit.Config, state: Trai
         )
 
 
+@pytest.mark.parametrize("improvement", [0.0, 1e-8], ids=["equal-final-scores", "small-real-improvement"])
+def test_advantages_use_final_scores_without_delta_roundoff(
+    config: edit.Config,
+    state: TrainState,
+    rollout: edit.Rollout,
+    monkeypatch: pytest.MonkeyPatch,
+    improvement: float,
+) -> None:
+    # One episode cycles 0.3 -> 0.4 -> 0.1 -> 0.3; the other stops or improves.
+    # Casting each delta to float32 before summing invents a difference on ties.
+    rewards = np.zeros_like(rollout.batch.rewards)
+    rewards[4:7, 0] = [0.1, -0.3, 0.2]
+    rewards[4, 1] = improvement
+    assert rewards[:, 0].sum() != 0
+    results = [
+        editing.Evaluation(
+            np.zeros((3, 3, 6), np.int32), score, False, None, 0, dict.fromkeys(edit.EDIT_REWARD_COMPONENTS, 0.0)
+        )
+        for score in (0.3, 0.3 + improvement)
+    ]
+    monkeypatch.setattr(
+        edit,
+        "run_episodes",
+        MagicMock(
+            return_value=(
+                rollout.batch._replace(rewards=rewards),
+                results,
+                np.full(2, 0.3, np.float32),
+                np.asarray([3, 0], np.int32),
+                rollout.key,
+                rollout.programs,
+            )
+        ),
+    )
+    with edit.KarelASTEditVectorEnv(config.edit_config, 2) as envs:
+        collected = edit.collect_rollout(state, envs, np.random.default_rng(4), rollout.key, config)
+    expected = np.asarray([-improvement / 2, improvement / 2]) / (improvement / 2 + 1e-8)
+    np.testing.assert_allclose(collected.batch.advantages, expected, atol=1e-7)
+    assert collected.diagnostics["charts/reward_diverse_group_fraction"] == float(improvement > 0)
+
+
 def test_stop_is_a_real_decision(config: edit.Config, state: TrainState) -> None:
     params = {**state.params, "head": {**state.params["head"], "bias": state.params["head"]["bias"].at[0].set(100)}}
     stopped = state.replace(params=params)
@@ -233,6 +274,7 @@ def test_stop_is_a_real_decision(config: edit.Config, state: TrainState) -> None
     )
     np.testing.assert_array_equal(batch.actions[batch.mask], [0, 0])
     assert batch.mask.sum() == 2 and diagnostics["charts/edits_mean"] == 0
+    assert diagnostics["charts/sequence_budget_exhausted_rate"] == 0
     np.testing.assert_array_equal(batch.advantages, 0)
     assert all(tree.tokens() == editing.seed_tree(config.edit_config).tokens() for tree in programs)
     assert rewards[0] == rewards[1]
@@ -336,8 +378,17 @@ def test_update_rejects_invalid_replay(
 def test_config_and_checkpoint(config: edit.Config, state: TrainState, tmp_path: Path) -> None:
     supplied = edit.load_config("configs/karel_ast_ar_edit.yaml")
     assert supplied.edit_config.max_seq_len == supplied.max_seq_len
-    assert supplied.edit_config.env.depth_penalty_weight == 0.1
-    assert supplied.env.length_penalty_weight == supplied.env.execution_penalty_weight == 0.1
+    assert supplied.edit_config.env == supplied.env
+    # Test parsing independently of the tunable checked-in experiment settings.
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {"env": {"depth_penalty_weight": 0.1, "length_penalty_weight": 0.2, "execution_penalty_weight": 0.3}}
+        )
+    )
+    parsed = edit.load_config(tmp_path / "config.yaml")
+    assert parsed.env.depth_penalty_weight == 0.1
+    assert parsed.env.length_penalty_weight == 0.2
+    assert parsed.env.execution_penalty_weight == 0.3
     for changes, error in (
         ({"max_seq_len": 0}, AssertionError),
         ({"max_seq_len": True}, TypeError),
@@ -428,6 +479,28 @@ def test_training_wiring(
     edit.train(config)
     assert collect.call_count == 1  # Resume recognizes the completed rollout.
     writer.close.assert_called_once()
+    if not rejected:
+        # Different attention head layouts have identical parameter shapes but
+        # change the meaning of the saved projections and rotary positions.
+        saved_config = (tmp_path / "test" / "config.yaml").read_bytes()
+        with pytest.raises(ValueError, match="num_heads"):
+            edit.train(replace(config, num_heads=4, total_updates=2))
+        assert collect.call_count == 1
+        assert (tmp_path / "test" / "config.yaml").read_bytes() == saved_config
+
+
+def test_resume_config_preserves_model_semantics(config: edit.Config) -> None:
+    # Explicit KV heads equal to query heads are equivalent to the default.
+    # Training duration, precision and episode budgets may change on resume.
+    edit.check_resume_config(
+        replace(config, num_kv_heads=config.num_heads, total_updates=2, bf16=True, max_seq_len=16), config
+    )
+    saved = replace(config, env=replace(config.env, height=3, width=6))
+    # Equal cell counts preserve projection shapes, but change spatial positions.
+    with pytest.raises(ValueError, match="env.height, env.width"):
+        edit.check_resume_config(replace(saved, env=replace(saved.env, height=6, width=3)), saved)
+    with pytest.raises(ValueError, match="env.max_markers"):
+        edit.check_resume_config(replace(config, env=replace(config.env, max_markers=20)), config)
 
 
 def test_generation_executes_atomic_replacements(
@@ -672,6 +745,7 @@ def test_disabled_stop_keeps_editing_despite_stop_biased_policy(config: edit.Con
     assert metrics["charts/edits_mean"] == 4
     np.testing.assert_array_equal(batch.mask.sum(axis=0), 8)
     assert metrics["charts/sequence_length_mean"] == config.max_seq_len - 1
+    assert metrics["charts/sequence_budget_exhausted_rate"] == 1
     assert not batch.legal[..., 0][batch.mask].any()
     assert np.all(batch.actions[batch.mask] != 0)
     assert all(tree.complete and "turnRight" in tree.tokens() for tree in programs)

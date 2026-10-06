@@ -65,7 +65,8 @@ groups have zero policy advantages. The clipped loss averages decisions within
 each episode, then across episodes; host events and padding have zero loss.
 The episode return telescopes to final_score - seed_score. Since each task group
 shares the seed score, its normalized advantages are equivalent to normalizing
-final scores, while delta rewards and feedback remain available during editing.
+final scores. Training normalizes final scores directly to avoid float32 delta
+accumulation breaking ties; delta rewards and feedback remain available during editing.
 """
 
 import argparse
@@ -108,6 +109,7 @@ from rl2.karel import (
 from rl2.karel_ast import AST_ACTIONS, KarelAST, program_actions
 from rl2.karel_ast_edit import EDIT_REWARD_COMPONENTS, FEEDBACK_SIZE, EditConfig, Evaluation, Observation
 from rl2.karel_ast_edit_vector import KarelASTEditVectorEnv
+from rl2.shape_checker import ShapeChecker
 from rl2.train_karel_ast_grpo import (
     Array,
     Metrics,
@@ -467,12 +469,27 @@ def collect_rollout(
         task.reset(seed=int(seed))
         tasks.extend([task] * config.group_size)
     batch, results, seed_scores, completed_edits, key, programs = run_episodes(state, tasks, envs, key, config)
-    scores = np.asarray([result.score for result in results], np.float32)
+    sc = ShapeChecker(B=count, T=batch.actions.shape[0])
+    sc.check(batch.rewards, "TB", np.float32)
+    sc.check(batch.actions, "TB", np.int32)
+    sc.check(batch.mask, "TB", np.bool_)
+    sc.check(seed_scores, "B", np.float32)
+    scores = np.asarray([result.score for result in results], np.float64)
+    sc.check(scores, "B", np.float64)
     rewards = batch.rewards.sum(axis=0)
-    grouped = rewards.reshape(config.num_tasks, config.group_size)
-    batch = batch._replace(advantages=np.asarray(group_advantages(grouped)).reshape(-1))
+    # All group members share a seed score. Normalize the equivalent final
+    # scores, avoiding path-dependent rounding when float32 edit deltas sum.
+    # Center in host float64 first so casting does not erase small real gains.
+    grouped = scores.reshape(config.num_tasks, config.group_size)
+    shifted = (grouped - grouped[:, :1]).astype(np.float32)
+    advantages = np.asarray(group_advantages(shifted)).reshape(-1)
+    sc.check((rewards, advantages), "B", np.float32)
+    batch = batch._replace(advantages=advantages)
     successes = np.asarray([result.success for result in results])
     sequence_lengths = config.edit_config.prefill_length + batch.mask.sum(axis=0)
+    # STOP is the only voluntary termination. With STOP disabled, exhausting
+    # the budget can leave one unused token, too little for a complete edit.
+    budget_exhausted = (sequence_lengths == config.max_seq_len) | ~np.any(batch.mask & (batch.actions == 0), axis=0)
     # Final candidate sizes; AST depth counts edges from the root, including list nodes.
     node_count_mean = float(np.mean([len(tree.nodes) for tree in programs]))
     depth_mean = float(np.mean([max(node.depth for node in tree.nodes) for tree in programs]))
@@ -484,7 +501,7 @@ def collect_rollout(
         "charts/group_success_rate": float(successes.reshape(config.num_tasks, config.group_size).any(axis=1).mean()),
         "charts/reward_diverse_group_fraction": float((np.ptp(grouped, axis=1) > 0).mean()),
         "charts/edits_mean": float(completed_edits.mean()),
-        "charts/sequence_budget_exhausted_rate": float(np.mean(sequence_lengths == config.max_seq_len)),
+        "charts/sequence_budget_exhausted_rate": float(budget_exhausted.mean()),
         "charts/sequence_length_mean": float(sequence_lengths.mean()),
         "charts/decisions_mean": float(batch.mask.sum()) / count,
         "charts/program_token_length_mean": float(np.mean([len(tree.tokens()) for tree in programs])),
@@ -672,6 +689,22 @@ def load_model(
     return config, state.replace(params=restored.state.params)
 
 
+def check_resume_config(config: Config, saved: Config) -> None:
+    """Reject changes that reinterpret saved weights even when their shapes match."""
+
+    def model_settings(settings: Config) -> dict[str, int]:
+        return {
+            **{name: getattr(settings, name) for name in ("d_model", "num_layers", "num_heads", "max_nodes")},
+            "num_kv_heads": settings.num_heads if settings.num_kv_heads is None else settings.num_kv_heads,
+            **{f"env.{name}": getattr(settings.env, name) for name in ("height", "width", "max_markers")},
+        }
+
+    previous = model_settings(saved)
+    changed = [name for name, value in model_settings(config).items() if value != previous[name]]
+    if changed:
+        raise ValueError(f"Checkpoint model settings are incompatible: {', '.join(changed)}. Use a new run_id.")
+
+
 def train(config: Config) -> TrainState:
     """Run or resume editing-policy training with grouped rollouts, KL stopping, logs, and checkpoints."""
     configure_compilation_cache()
@@ -686,6 +719,7 @@ def train(config: Config) -> TrainState:
     checkpoint = read_optional(f"{run_dir}/checkpoint.msgpack")
     progress = TrainingProgress(state, key, 0, 0, 0, 0)
     if checkpoint is not None:
+        check_resume_config(config, load_config(f"{run_dir}/config.yaml"))
         progress = _restore_checkpoint(checkpoint, state, rng)
         print(f"Resuming {run_dir} at rollout {progress.iteration}, step {progress.steps}", flush=True)
     else:
