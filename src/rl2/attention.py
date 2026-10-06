@@ -130,6 +130,8 @@ def attention(
     Padding produces zero output and does not update the cache.
     Carry is (rotated keys, values, next positions), shaped [batch,capacity,
     kv_heads,head_dim], [batch,capacity,kv_heads,head_dim], and int32 [batch].
+    Cached calls append valid tokens before attending over the updated cache.
+    Sequence lengths exclude padding; causal chunks also mask future positions.
     Return the updated carry tuple and [batch,time,query_heads,head_dim] output.
     """
     dtype = query.dtype
@@ -178,32 +180,49 @@ def attention(
     query, key, value = (jnp.where(valid_tokens[..., None, None], v, 0) for v in (query, key, value))
     query, key = _rope(query, positions, rope_theta), _rope(key, positions, rope_theta)
     slots = jnp.arange(max_seq_len, dtype=jnp.int32)[None, :]
-    old_valid = slots < cache_position[:, None]
-    sc.check(old_valid, "BC", jnp.bool_)
+
+    # Append each valid prefix immediately after that example's cached history.
+    source = slots - cache_position[:, None]
+    sc.check(source, "BC", jnp.int32)
+    gather = jnp.clip(source, 0, steps - 1)[..., None, None]
+    new_key, new_value = (jnp.take_along_axis(v, gather, axis=1) for v in (key, value))
+    sc.check((new_key, new_value), "BCKF", dtype)
+    written = ((source >= 0) & (source < x_len[:, None]))[..., None, None]
+    sc.check(written, "BCUU", jnp.bool_)
+    carry = (
+        jnp.where(written, new_key, cache_key),
+        jnp.where(written, new_value, cache_value),
+        next_position,
+    )
+    sc.check((carry[0], carry[1]), "BCKF", dtype)
+    sc.check(carry[2], "B", jnp.int32)
 
     mask = None
-    if native_attention:
-        # Let the backend handle causality without a dense mask.
+    if fresh:
+        # Prefill need only attend over the input, not the entire cache capacity.
         keys, values = key, value
+        kv_lengths = x_len
     else:
-        if fresh:
-            keys, values, key_positions, key_valid = key, value, positions, valid_tokens
-        else:
-            old_key, old_value = (jnp.where(old_valid[..., None, None], v, 0) for v in (cache_key, cache_value))
-            keys, values = jnp.concatenate((old_key, key), 1), jnp.concatenate((old_value, value), 1)
-            key_positions = jnp.concatenate((jnp.broadcast_to(slots, sc["BC"]), positions), 1)
-            key_valid = jnp.concatenate((old_valid, valid_tokens), 1)
-        sc.check(key_positions, "BS", jnp.int32)
-        sc.check(key_valid, "BS", jnp.bool_)
-        mask = jnp.broadcast_to(key_valid[:, None, :], sc["BTS"])
-        if causal:
-            mask &= positions[:, :, None] >= key_positions[:, None, :]
-        # Invalid queries attend a harmless slot, avoiding all-masked softmax
-        # rows (and NaN gradients in fused backends). Their output is zeroed.
-        fallback = jnp.arange(keys.shape[1]) == 0
-        mask = jnp.where(valid_tokens[:, :, None], mask, fallback)
-        mask = mask[:, None]
-        sc.check(mask, "BUTS", jnp.bool_)
+        key_valid = slots < next_position[:, None]
+        sc.check(key_valid, "BC", jnp.bool_)
+        # Sanitize unused slots without changing the returned cache. Masking
+        # alone would not isolate NaNs in these slots from attention gradients.
+        keys, values = (jnp.where(key_valid[..., None, None], v, 0) for v in carry[:2])
+        kv_lengths = next_position
+        if causal and steps > 1:
+            # Queries start at each example's old cache position, so the
+            # backend's zero-offset causal triangle would exclude history.
+            # Invalid queries have position zero and can safely attend slot 0.
+            mask = (positions[:, :, None] >= slots[:, None, :])[:, None]
+            sc.check(mask, "BUTC", jnp.bool_)
+    query_seq_lengths = key_value_seq_lengths = None
+    if not native_attention:
+        # Give empty examples one safe dummy query/key instead of an empty
+        # softmax in fused backends. Padded inputs are zero; outputs are zeroed
+        # below, and only the original valid prefixes enter the returned cache.
+        query_seq_lengths = jnp.maximum(x_len, 1)
+        key_value_seq_lengths = jnp.maximum(kv_lengths, 1)
+        sc.check((query_seq_lengths, key_value_seq_lengths), "B", jnp.int32)
     queries = query
     if implementation == "cudnn" and mask is not None:
         # cuDNN masked backward requires even Q and KV lengths. Give
@@ -230,27 +249,14 @@ def attention(
         keys,
         values,
         mask=mask,
-        is_causal=causal and native_attention,
+        query_seq_lengths=query_seq_lengths,
+        key_value_seq_lengths=key_value_seq_lengths,
+        is_causal=causal and fresh,
         local_window_size=None,
         implementation=implementation,
     )
     attention_sc.check(attended, "BQHF", attention_dtype)
     attended = jnp.where(valid_tokens[..., None, None], attended[:, :steps].astype(dtype), 0)
 
-    # Append each valid prefix immediately after that example's cached history.
-    source = slots - cache_position[:, None]
-    sc.check(source, "BC", jnp.int32)
-    gather = jnp.clip(source, 0, steps - 1)[..., None, None]
-    new_key, new_value = (jnp.take_along_axis(v, gather, axis=1) for v in (key, value))
-    sc.check((new_key, new_value), "BCKF", dtype)
-    written = ((source >= 0) & (source < x_len[:, None]))[..., None, None]
-    sc.check(written, "BCUU", jnp.bool_)
-    carry = (
-        jnp.where(written, new_key, cache_key),
-        jnp.where(written, new_value, cache_value),
-        next_position,
-    )
-    sc.check((carry[0], carry[1]), "BCKF", dtype)
-    sc.check(carry[2], "B", jnp.int32)
     sc.check(attended, "BTHF", dtype)
     return carry, attended

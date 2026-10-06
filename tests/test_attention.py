@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from rl2.attention import _rope, attention
+from rl2.attention import AttentionState, _rope, attention
 from rl2.shape_checker import ShapeChecker
 
 
@@ -40,6 +40,61 @@ def test_attention_uniform_values_and_zero_length(causal: bool) -> None:
     np.testing.assert_array_equal(output, 0)
     np.testing.assert_array_equal(empty[2], 0)
     np.testing.assert_array_equal(empty[1], 0)
+
+
+@pytest.mark.parametrize("causal", [True, False])
+def test_cached_attention_ignores_unused_slots_and_preserves_gradients(causal: bool) -> None:
+    positions = jnp.asarray([1, 2, 0], jnp.int32)
+    lengths = jnp.asarray([2, 0, 0], jnp.int32)
+    old_valid = jnp.arange(3)[None, :] < positions[:, None]
+    valid = jnp.arange(2)[None, :] < lengths[:, None]
+    cache_key = jnp.broadcast_to(jnp.where(old_valid[..., None, None], 0.0, jnp.nan), (3, 3, 1, 2))
+    cache_value = jnp.where(old_valid[..., None, None], 2.0, cache_key)
+    query = jnp.broadcast_to(jnp.where(valid[..., None, None], 0.0, jnp.nan), (3, 2, 2, 2))
+    key = query[:, :, :1]
+    value = jnp.where(valid[..., None, None], jnp.asarray([6.0, 10.0])[None, :, None, None], key)
+
+    def loss(
+        q: jax.Array, k: jax.Array, v: jax.Array, old_k: jax.Array, old_v: jax.Array
+    ) -> tuple[jax.Array, tuple[AttentionState, jax.Array]]:
+        sc = ShapeChecker(B=3, T=2, H=2, K=1, F=2, C=3)
+        sc.check(q, "BTHF", jnp.float32)
+        sc.check((k, v), "BTKF", jnp.float32)
+        sc.check((old_k, old_v), "BCKF", jnp.float32)
+        state, output = attention(
+            q,
+            k,
+            v,
+            (old_k, old_v, positions),
+            lengths,
+            max_seq_len=3,
+            rope_theta=10000.0,
+            causal=causal,
+            implementation="xla",
+        )
+        return output.sum(), (state, output)
+
+    (_, (state, output)), grads = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2, 3, 4), has_aux=True))(
+        query, key, value, cache_key, cache_value
+    )
+    expected = jnp.asarray([4.0, 6.0] if causal else [6.0, 6.0])[:, None, None]
+    np.testing.assert_allclose(output[0], jnp.broadcast_to(expected, output[0].shape))
+    np.testing.assert_array_equal(output[1:], 0)
+    np.testing.assert_array_equal(state[2], [3, 2, 0])
+    np.testing.assert_array_equal(state[1][0, :, 0, 0], [2, 6, 10])
+    for before, after in zip((cache_key, cache_value), state[:2]):
+        np.testing.assert_array_equal(after[1:], before[1:])
+    for gradient in grads:
+        assert np.isfinite(gradient).all()
+    for gradient in grads[:3]:
+        np.testing.assert_array_equal(gradient[~valid], 0)
+    for gradient in grads[3:]:
+        np.testing.assert_array_equal(gradient[~old_valid], 0)
+        np.testing.assert_array_equal(gradient[1:], 0)
+    # Both old and appended values receive gradients through the packed cache.
+    expected_new = jnp.asarray([5 / 3, 2 / 3] if causal else [4 / 3, 4 / 3])[:, None, None]
+    np.testing.assert_allclose(grads[2][0], jnp.broadcast_to(expected_new, grads[2][0].shape))
+    np.testing.assert_allclose(grads[4][0, 0], 5 / 3 if causal else 4 / 3)
 
 
 @pytest.mark.parametrize(

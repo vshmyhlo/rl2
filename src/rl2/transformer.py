@@ -1,7 +1,7 @@
 """Llama 3 decoder backbone with batch-major sequences and explicit KV caches.
 
 The internal block combines RoPE attention with pre-RMSNorm and SwiGLU
-residual layers; the internal ``Transformer`` base repeats it and adds a final RMSNorm.
+residual layers; a shared internal stack repeats it and adds a final RMSNorm.
 ``ARTransformer`` implements the autoregressive sequence/carry contract;
 ``BDTransformer`` exposes bidirectional sequence outputs without carry.
 Both specialized stacks require explicit ``x_len`` arrays for sequence calls.
@@ -45,7 +45,7 @@ Autoregressive steps require a boolean ``x_active[batch]`` mask immediately afte
 ``attention_implementation="xla"`` is portable (the default). Select ``"cudnn"``
 with float16/bfloat16 and a supported NVIDIA GPU for JAX's cuDNN fused attention.
 Backend shape/device restrictions are reported by JAX, without silent fallback.
-Explicit boolean attention masks handle valid lengths and cached offsets.
+Sequence lengths handle padding; explicit masks handle causal offsets in cached chunks.
 Masked cuDNN calls pad odd sequence lengths for its backward-pass constraints.
 
 Example::
@@ -279,19 +279,16 @@ class _TransformerBlock(nn.Module):
         return carry, output
 
 
-class Transformer(nn.Module):
-    """Llama 3 decoder backbone with independent pre-RMSNorm/SwiGLU layers.
+class _TransformerStack(nn.Module):
+    """Shared Llama 3 layers and computation without a public decoding interface.
 
-    Sequences are batch-major; optional int32 x_len has shape [batch]. Carry is a tuple of one
-    layer cache per layer. MLP width is ``round(dim * mlp_expansion)``,
+    MLP width is ``round(dim * mlp_expansion)``,
     with a default expansion of 2, shared by every block.
     Final RMSNorm defaults on; residual additions
     preserve the operands' normal dtype promotion rules.
     All projections use normal initialization with standard deviation
     ``initializer_range`` (default 0.02), independent of depth.
     ``causal`` controls attention in every block and defaults to True.
-    Non-causal attention sees the current chunk and cached history within
-    each sequence; results depend on chunk boundaries.
     """
 
     dim: int
@@ -341,14 +338,7 @@ class Transformer(nn.Module):
         if self.final_norm:
             self.norm_f = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
 
-    @nn.nowrap
-    def initial_carry(self, batch_size: int) -> TransformerStackCarry:
-        """Allocate independent caches for all layers without parameter init."""
-        self._mlp_width()
-        block = self._make_block()
-        return tuple(block.initial_carry(batch_size) for _ in range(self.num_layers))
-
-    def __call__(
+    def _forward(
         self,
         x: jax.Array,
         x_len: jax.Array | None = None,
@@ -376,6 +366,31 @@ class Transformer(nn.Module):
         output = x.astype(self.dtype)
         sc.check(output, "BTD", self.dtype)
         return tuple(next_carry), output
+
+
+class Transformer(_TransformerStack):
+    """Internal stack exposing optional lengths and per-layer KV caches.
+
+    Sequences are batch-major; optional int32 x_len has shape [batch].
+    Carry is a tuple of one layer cache per layer. Non-causal attention sees
+    the current chunk and cached history; its results depend on chunk boundaries.
+    """
+
+    @nn.nowrap
+    def initial_carry(self, batch_size: int) -> TransformerStackCarry:
+        """Allocate independent caches for all layers without parameter init."""
+        self._mlp_width()
+        block = self._make_block()
+        return tuple(block.initial_carry(batch_size) for _ in range(self.num_layers))
+
+    def __call__(
+        self,
+        x: jax.Array,
+        x_len: jax.Array | None = None,
+        carry: TransformerStackCarry | None = None,
+    ) -> tuple[TransformerStackCarry, jax.Array]:
+        """Process [batch,time,dim], returning per-layer caches and output."""
+        return self._forward(x, x_len, carry)
 
     def step(
         self,
@@ -431,12 +446,12 @@ class ARTransformer(Transformer, ARSequenceModel[TransformerStackCarry]):
         return carry, output
 
 
-class BDTransformer(Transformer, BDSequenceModel):
+class BDTransformer(_TransformerStack, BDSequenceModel):
     """Bidirectional stack with required valid lengths and array-only output.
 
     Every call processes a fresh sequence, attending only to its valid prefix.
     ``causal`` must remain False. Carry is neither accepted nor returned;
-    the inherited ``step`` operation is unsupported and raises ValueError.
+    there is no single-step decoding or carry initialization interface.
     Parameter names match ``Transformer``.
     """
 
@@ -453,6 +468,6 @@ class BDTransformer(Transformer, BDSequenceModel):
         sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
         sc.check(x_len, "B", jnp.int32)
-        _, output = super().__call__(x, x_len)
+        _, output = self._forward(x, x_len)
         sc.check(output, "BTD", self.dtype)
         return output

@@ -87,14 +87,17 @@ def test_autoregressive_sequence_chunks_and_steps_match_from_fresh_and_supplied_
 
 def test_bidirectional_valid_prefixes_and_gradients_ignore_padding() -> None:
     model = BDTransformer(4, 2, num_heads=1, max_seq_len=3, initializer_range=0.2)
-    assert isinstance(model, Transformer)
     assert isinstance(model, BDSequenceModel)
     x = jax.random.normal(jax.random.key(2), (3, 3, 4))
     x_len = jnp.array([0, 2, 3], jnp.int32)
     valid = jnp.arange(3)[None, :] < x_len[:, None]
     padded = jnp.where(valid[..., None], x, jnp.nan)
     variables = model.init(jax.random.key(3), x, x_len)
+    # The shared stack retains checkpoint parameter names and computation.
+    reference_model = Transformer(4, 2, num_heads=1, max_seq_len=3, causal=False)
+    _, reference_output = reference_model.apply(variables, x, x_len)
     output = jax.jit(model.apply)(variables, padded, x_len)
+    np.testing.assert_allclose(output, reference_output, atol=2e-6)
     sc = ShapeChecker(B=3, T=3, D=4)
     sc.check(output, "BTD", jnp.float32)
     np.testing.assert_array_equal(output[~valid], 0)
@@ -117,15 +120,15 @@ def test_bidirectional_valid_prefixes_and_gradients_ignore_padding() -> None:
     assert np.isfinite(gradient).all()
     np.testing.assert_array_equal(gradient[~valid], 0)
     assert np.linalg.norm(gradient[valid]) > 0
-    with pytest.raises(ValueError, match="requires causal=True"):
-        model.apply(variables, x[:, 0], jnp.ones((3,), jnp.bool_), method=model.step)
     for lengths in (jnp.array([-1, 2, 3], jnp.int32), jnp.array([0, 2, 4], jnp.int32)):
         with pytest.raises(ValueError, match="x_len must be between"):
             model.apply(variables, x, lengths)
 
 
 @pytest.mark.parametrize("model_type", [ARTransformer, BDTransformer])
-def test_specialized_stacks_validate_lengths_and_fixed_direction(model_type: type[Transformer]) -> None:
+def test_specialized_stacks_validate_lengths_and_fixed_direction(
+    model_type: type[ARTransformer] | type[BDTransformer],
+) -> None:
     model = model_type(4, 1, num_heads=1, max_seq_len=3)
     x = jnp.zeros((1, 3, 4), jnp.float32)
     for lengths in (jnp.ones((1,), jnp.bool_), jnp.ones((1, 1), jnp.int32)):

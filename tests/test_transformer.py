@@ -540,19 +540,25 @@ def test_sequence_and_step_validate_inputs_before_projections(stack: bool, step:
 
 
 @pytest.mark.parametrize(
-    "steps,window,causal",
-    [(1, 4, True), (3, 7, True), pytest.param(3, 7, False, id="noncausal-padding")],
+    "steps,window,causal,cached",
+    [
+        pytest.param(1, 4, True, True, id="decode"),
+        pytest.param(3, 7, True, True, id="causal-chunk-padding"),
+        pytest.param(3, 7, False, True, id="noncausal-cache"),
+        pytest.param(3, 7, True, False, id="causal-prefill"),
+        pytest.param(3, 7, False, False, id="noncausal-prefill"),
+    ],
 )
-def test_cudnn_mask_padding_preserves_outputs_and_gradients(
-    monkeypatch: pytest.MonkeyPatch, steps: int, window: int, causal: bool
+def test_cudnn_lengths_and_mask_padding_preserve_outputs_and_gradients(
+    monkeypatch: pytest.MonkeyPatch, steps: int, window: int, causal: bool, cached: bool
 ) -> None:
     """Exercise backend routing/padding on CPU; real kernels are tested below."""
     model = _TransformerBlock(16, num_heads=2, num_kv_heads=1, max_seq_len=window, dtype=jnp.bfloat16, causal=causal)
     fused = model.clone(attention_implementation="cudnn")
     x = jax.random.normal(jax.random.key(16), (2, steps, 16))
     variables = model.init(jax.random.key(17), x)
-    carry = model.apply(variables, x)[0]
     x_len = jnp.array([0, steps], jnp.int32)
+    carry = model.apply(variables, x, x_len)[0] if cached else None
     original_attention = jax.nn.dot_product_attention
     routed = []
 
@@ -562,25 +568,35 @@ def test_cudnn_mask_padding_preserves_outputs_and_gradients(
         value: jax.Array,
         *,
         mask: jax.Array | None,
+        query_seq_lengths: jax.Array | None,
+        key_value_seq_lengths: jax.Array | None,
         is_causal: bool,
         local_window_size: tuple[int, int] | None,
         implementation: str,
     ) -> jax.Array:
-        chex.assert_shape(query, (2, None, 2, 8))
-        chex.assert_shape((key, value), (2, None, 1, 8))
-        chex.assert_type((query, key, value), jnp.bfloat16)
+        sc = ShapeChecker(B=2, H=2, K=1, F=8, U=1)
+        sc.check(query, "BQHF", jnp.bfloat16)
+        sc.check((key, value), "BSKF", jnp.bfloat16)
+        assert query_seq_lengths is not None and key_value_seq_lengths is not None
+        sc.check((query_seq_lengths, key_value_seq_lengths), "B", jnp.int32)
         if mask is not None:
-            chex.assert_shape(mask, (2, 1, query.shape[1], key.shape[1]))
-            chex.assert_type(mask, jnp.bool_)
+            sc.check(mask, "BUQS", jnp.bool_)
+        assert (mask is not None) == (cached and causal and steps > 1)
+        assert is_causal == (causal and not cached)
+        expected_keys = window if cached else steps
         if implementation == "cudnn":
-            assert mask is not None
-            assert query.shape[1] % 2 == key.shape[1] % 2 == 0
+            if mask is not None:
+                assert query.shape[1] % 2 == key.shape[1] % 2 == 0
+                expected_keys += expected_keys % 2
             routed.append(True)
+        assert key.shape[1] == expected_keys
         return original_attention(
             query,
             key,
             value,
             mask=mask,
+            query_seq_lengths=query_seq_lengths,
+            key_value_seq_lengths=key_value_seq_lengths,
             is_causal=is_causal,
             local_window_size=local_window_size,
             implementation="xla",
@@ -615,29 +631,38 @@ def assert_gradient_close(actual: jax.Array, expected: jax.Array) -> None:
 
 
 @pytest.mark.parametrize(
-    "cached,window,implementation",
+    "cached,window,padded,implementation",
     [
-        (True, 8, "xla"),
+        (True, 8, True, "xla"),
         *[
             pytest.param(
                 cached,
                 window,
+                padded,
                 "cudnn",
                 marks=pytest.mark.skipif(
                     not any(d.platform == "gpu" for d in jax.devices()),
                     reason="cuDNN attention requires an NVIDIA GPU",
                 ),
             )
-            for cached, window in ((False, 8), (False, 9), (True, 8), (True, 9))
+            for cached, window, padded in (
+                (False, 8, False),
+                (False, 9, False),
+                (True, 8, True),
+                (True, 9, True),
+                (False, 9, True),
+            )
         ],
     ],
 )
-def test_attention_backend_forward_backward_and_decode(cached: bool, window: int, implementation: str) -> None:
+def test_attention_backend_forward_backward_and_decode(
+    cached: bool, window: int, padded: bool, implementation: str
+) -> None:
     model = Transformer(16, 1, num_heads=2, num_kv_heads=1, max_seq_len=window, dtype=jnp.bfloat16)
     backend = model.clone(attention_implementation=implementation)
     x = jax.random.normal(jax.random.key(14), (2, 5, 16))
     probe = jax.random.normal(jax.random.key(18), x.shape) / jnp.sqrt(x.size)
-    x_len = jnp.array([0, 5], jnp.int32) if cached else None
+    x_len = jnp.array([0, 5], jnp.int32) if padded else None
     params = model.init(jax.random.key(15), x)["params"]
     initial = model.apply({"params": params}, x[:, :2])[0] if cached else None
 
