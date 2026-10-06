@@ -1,8 +1,40 @@
-"""Abstract base for autoregressive sequence models with explicit state."""
+"""Abstract bases for autoregressive and bidirectional sequence models."""
 
 from abc import ABC, abstractmethod
 
 import jax
+
+
+class BDSequenceModel(ABC):
+    """Bidirectional sequence operation without carry or single-step decoding.
+
+    Inputs are floating-point arrays with shape [batch,time,dim]. Required
+    int32 ``x_len[batch]`` lies in [0, time] and denotes each example's
+    left-aligned valid prefix, ``x[b, :x_len[b]]``. Remaining positions are
+    right padding. Padding values must not affect valid outputs; padded
+    outputs are zero. A zero length produces an all-zero output for that
+    example.
+
+    Each call returns an array with the same shape as its input. Valid outputs
+    may depend on all valid tokens, including future tokens. There is no carry
+    input or output, no step method, and no chunk-equivalence requirement.
+
+    Output dtype and parameter storage are implementation-specific.
+    Implementations validate shapes, dtypes, and length bounds, and must test
+    padding isolation; abstract methods alone cannot enforce it. For Flax
+    modules, invoke through ``init``/``apply``, on a bound module, or as a
+    submodule.
+    """
+
+    @abstractmethod
+    def __call__(self, x: jax.Array, x_len: jax.Array) -> jax.Array:
+        """Process [batch,time,dim], returning same-shaped bidirectional output.
+
+        Required int32 lengths have shape [batch] and lie in [0, time],
+        delimiting left-aligned valid tokens. Right-padded outputs are zero.
+        Implementations may require nonempty batch and time dimensions.
+        """
+        raise NotImplementedError
 
 
 class ARSequenceModel[CarryT](ABC):

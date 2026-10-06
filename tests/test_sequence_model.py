@@ -1,7 +1,7 @@
 import jax
 import pytest
 
-from rl2.sequence_model import ARSequenceModel
+from rl2.sequence_model import ARSequenceModel, BDSequenceModel
 
 
 class CallOnly(ARSequenceModel[None]):
@@ -25,3 +25,18 @@ def test_subclass_implementing_both_methods_can_be_instantiated() -> None:
         pass
 
     assert isinstance(BothMethods(), ARSequenceModel)
+
+
+def test_bidirectional_base_cannot_be_instantiated() -> None:
+    with pytest.raises(TypeError, match="abstract"):
+        BDSequenceModel()
+
+
+def test_bidirectional_subclass_only_requires_call() -> None:
+    class CallOnlyBidirectional(BDSequenceModel):
+        def __call__(self, x: jax.Array, x_len: jax.Array) -> jax.Array:
+            raise NotImplementedError("Test stub; only method completeness is exercised")
+
+    model = CallOnlyBidirectional()
+    assert isinstance(model, BDSequenceModel)
+    assert not hasattr(model, "step")

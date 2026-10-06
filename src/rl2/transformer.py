@@ -2,6 +2,9 @@
 
 ``TransformerBlock`` combines RoPE attention with pre-RMSNorm and SwiGLU
 residual layers; ``TransformerStack`` repeats it and adds a final RMSNorm.
+``ARTransformerStack`` implements the autoregressive sequence/carry contract;
+``BDTransformerStack`` exposes bidirectional sequence outputs without carry.
+Both specialized stacks require explicit ``x_len`` arrays.
 The attention and SwiGLU architecture follow Meta's reference:
 https://github.com/meta-llama/llama3/blob/main/llama/model.py
 MLP width is ``round(dim * mlp_expansion)``, with a default expansion of 2.
@@ -63,6 +66,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from rl2.sequence_model import ARSequenceModel, BDSequenceModel
 from rl2.shape_checker import ShapeChecker
 
 type AttentionImplementation = Literal["xla", "cudnn"]
@@ -629,3 +633,80 @@ class TransformerStack(nn.Module):
         output = y[:, 0]
         sc.check(output, "BD", self.dtype)
         return carry, output
+
+
+class ARTransformerStack(TransformerStack, ARSequenceModel[TransformerStackCarry]):
+    """Autoregressive stack with required valid lengths and optional KV carry.
+
+    Full sequences, chunks, and repeated steps produce equivalent outputs and
+    final carry, whether starting fresh or continuing supplied history.
+    ``causal`` must remain True. Parameter names match ``TransformerStack``.
+    """
+
+    def setup(self) -> None:
+        if self.causal is not True:
+            raise ValueError("ARTransformerStack requires causal=True")
+        super().setup()
+
+    def __call__(
+        self,
+        x: jax.Array,
+        x_len: jax.Array,
+        carry: TransformerStackCarry | None = None,
+    ) -> tuple[TransformerStackCarry, jax.Array]:
+        """Process [batch,time,dim] with required int32 [batch] prefix lengths."""
+        if x_len is None:
+            raise TypeError("x_len must be an int32 array, not None")
+        sc = ShapeChecker(D=self.dim)
+        sc.check(x, "BTD")
+        chex.assert_type(x, jnp.floating)
+        sc.check(x_len, "B", jnp.int32)
+        carry, output = super().__call__(x, x_len, carry)
+        sc.check(output, "BTD", self.dtype)
+        return carry, output
+
+    def step(
+        self,
+        x: jax.Array,
+        x_len: jax.Array,
+        carry: TransformerStackCarry | None = None,
+    ) -> tuple[TransformerStackCarry, jax.Array]:
+        """Process [batch,dim]; int32 [batch] lengths of zero skip examples."""
+        if x_len is None:
+            raise TypeError("x_len must be an int32 array, not None")
+        sc = ShapeChecker(D=self.dim)
+        sc.check(x, "BD")
+        chex.assert_type(x, jnp.floating)
+        sc.check(x_len, "B", jnp.int32)
+        carry, output = super().step(x, x_len, carry)
+        sc.check(output, "BD", self.dtype)
+        return carry, output
+
+
+class BDTransformerStack(TransformerStack, BDSequenceModel):
+    """Bidirectional stack with required valid lengths and array-only output.
+
+    Every call processes a fresh sequence, attending only to its valid prefix.
+    ``causal`` must remain False. Carry is neither accepted nor returned;
+    the inherited ``step`` operation is unsupported and raises ValueError.
+    Parameter names match ``TransformerStack``.
+    """
+
+    causal: bool = False
+
+    def setup(self) -> None:
+        if self.causal is not False:
+            raise ValueError("BDTransformerStack requires causal=False")
+        super().setup()
+
+    def __call__(self, x: jax.Array, x_len: jax.Array) -> jax.Array:
+        """Process [batch,time,dim]; int32 [batch] lengths delimit valid prefixes."""
+        if x_len is None:
+            raise TypeError("x_len must be an int32 array, not None")
+        sc = ShapeChecker(D=self.dim)
+        sc.check(x, "BTD")
+        chex.assert_type(x, jnp.floating)
+        sc.check(x_len, "B", jnp.int32)
+        _, output = super().__call__(x, x_len)
+        sc.check(output, "BTD", self.dtype)
+        return output

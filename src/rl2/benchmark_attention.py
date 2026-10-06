@@ -1,7 +1,7 @@
 """Compare attention kernels (no projections, RoPE, or KV-cache updates).
 
 Run with JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false
-uv run --extra cuda12 --extra benchmark python -m rl2.benchmark_attention.
+uv run --extra cuda12 python -m rl2.benchmark_attention.
 Timings use CUPTI, exclude compilation, and include all returned Q/K/V gradients
 in backward mode. Tokamax uses default kernel configurations, without autotuning.
 """
