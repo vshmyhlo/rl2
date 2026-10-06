@@ -95,8 +95,6 @@ def test_bidirectional_valid_prefixes_and_gradients_ignore_padding() -> None:
     assert np.isfinite(gradient).all()
     np.testing.assert_array_equal(gradient[~valid], 0)
     assert np.linalg.norm(gradient[valid]) > 0
-    with pytest.raises(TypeError):
-        model.apply(variables, x, x_len, carry=None)
     with pytest.raises(ValueError, match="requires causal=True"):
         model.apply(variables, x[:, 0], jnp.ones((3,), jnp.int32), method=model.step)
     for lengths in (jnp.array([-1, 2, 3], jnp.int32), jnp.array([0, 2, 4], jnp.int32)):
@@ -105,20 +103,11 @@ def test_bidirectional_valid_prefixes_and_gradients_ignore_padding() -> None:
 
 
 @pytest.mark.parametrize("model_type", [ARTransformerStack, BDTransformerStack])
-def test_specialized_stacks_require_lengths_and_fixed_direction(model_type: type[TransformerStack]) -> None:
+def test_specialized_stacks_validate_lengths_and_fixed_direction(model_type: type[TransformerStack]) -> None:
     model = model_type(4, 1, num_heads=1, max_seq_len=3)
     x = jnp.zeros((1, 3, 4), jnp.float32)
-    with pytest.raises(TypeError, match="x_len"):
-        model.apply({}, x)
-    with pytest.raises(TypeError, match="x_len"):
-        model.apply({}, x, None)
     for lengths in (jnp.ones((1,), jnp.bool_), jnp.ones((1, 1), jnp.int32)):
         with pytest.raises(AssertionError):
             model.apply({}, x, lengths)
     with pytest.raises(ValueError, match=f"{model_type.__name__} requires causal="):
         model.clone(causal=not model.causal).apply({}, x, jnp.array([3], jnp.int32))
-    if isinstance(model, ARTransformerStack):
-        with pytest.raises(TypeError, match="x_len"):
-            model.apply({}, x[:, 0], method=model.step)
-        with pytest.raises(TypeError, match="x_len"):
-            model.apply({}, x[:, 0], None, method=model.step)

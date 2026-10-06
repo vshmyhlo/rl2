@@ -73,20 +73,10 @@ def test_attention_rejects_incompatible_values(value_shape: tuple[int, ...], val
         )
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        pytest.param({"causal": "false"}, id="non-bool-causal"),
-        pytest.param({"implementation": None}, id="implicit-backend"),
-        pytest.param({"rope_theta": float("inf")}, id="infinite-rope-theta"),
-        pytest.param({"max_seq_len": True}, id="boolean-capacity"),
-    ],
-)
-def test_attention_rejects_invalid_configuration(kwargs: dict[str, Any]) -> None:
+def test_attention_rejects_invalid_configuration() -> None:
     x = jnp.zeros((1, 1, 1, 2), jnp.float32)
-    config = {"max_seq_len": 2, "rope_theta": 10000.0, "causal": True, "implementation": "xla"}
-    with pytest.raises((ValueError, TypeError, AssertionError)):
-        _attention(x, x, x, **(config | kwargs))
+    with pytest.raises(ValueError, match="rope_theta must be positive and finite"):
+        _attention(x, x, x, max_seq_len=2, rope_theta=float("inf"), causal=True, implementation="xla")
 
 
 @pytest.mark.parametrize(
@@ -103,7 +93,7 @@ def test_attention_rejects_empty_dimensions(shape: tuple[int, ...]) -> None:
         _attention(x, x, x, max_seq_len=2, rope_theta=10000.0, causal=True, implementation="xla")
 
 
-@pytest.mark.parametrize("num_layers", [0, -1, True])
+@pytest.mark.parametrize("num_layers", [0, -1])
 def test_stack_initial_carry_rejects_invalid_layer_count(num_layers: int) -> None:
     with pytest.raises((ValueError, TypeError, AssertionError)):
         TransformerStack(4, num_layers, num_heads=1, max_seq_len=2).initial_carry(1)
@@ -588,10 +578,7 @@ def test_precision_initialization_and_parameter_independence(dtype: jax.typing.D
         {"rope_theta": 0},
         {"rope_theta": float("inf")},
         {"dtype": jnp.int32},
-        {"attention_implementation": "invalid"},
         {"attention_implementation": "cudnn"},
-        {"causal": "false"},
-        {"num_heads": True},
         {"dim": 12, "num_heads": 4},
     ],
 )
@@ -623,8 +610,6 @@ def test_invalid_inputs_and_carries() -> None:
         model.apply(variables, x[..., :8])
     with pytest.raises(AssertionError):
         model.apply(variables, x[:, 0])
-    with pytest.raises(TypeError):
-        model.apply(variables, x, carry=tuple(carry))
 
 
 @pytest.mark.parametrize("stack,step", [(False, True), (True, False), (True, True)])
@@ -644,6 +629,9 @@ def test_sequence_and_step_validate_inputs_before_projections(stack: bool, step:
         model.apply({}, x, x_len=jnp.zeros((1,), jnp.float32), method=method)
     with pytest.raises(AssertionError):
         model.apply({}, x, x_len=jnp.zeros((1, 1), jnp.int32), method=method)
+    if stack:
+        with pytest.raises(ValueError, match="one TransformerCarry per layer"):
+            model.apply({}, x, carry=(), method=method)
 
 
 @pytest.mark.parametrize(

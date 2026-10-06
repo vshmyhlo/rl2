@@ -89,9 +89,7 @@ type TransformerStackCarry = tuple[TransformerCarry, ...]
 
 
 def _positive_integer(value: int, name: str) -> None:
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise TypeError(f"{name} must be a positive integer")
-    chex.assert_scalar_positive(value)
+    chex.assert_scalar_positive(value, custom_message=f"{name} must be positive")
 
 
 def _check_range(values: jax.Array, maximum: int, message: str) -> None:
@@ -161,7 +159,6 @@ def _check_attention_config(
     head_dim: int,
     max_seq_len: int,
     rope_theta: float,
-    causal: bool,
     implementation: AttentionImplementation,
     dtype: jax.typing.DTypeLike,
 ) -> None:
@@ -177,10 +174,6 @@ def _check_attention_config(
     chex.assert_is_divisible(head_dim, 2)
     if not 0 < rope_theta < math.inf:
         raise ValueError("rope_theta must be positive and finite")
-    if implementation not in ("xla", "cudnn"):
-        raise ValueError("attention_implementation must be 'xla' or 'cudnn'")
-    if not isinstance(causal, bool):
-        raise TypeError("causal must be a bool")
     dtype = jnp.dtype(dtype)
     if dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
         raise ValueError("dtype must be float32, bfloat16, or float16")
@@ -226,7 +219,6 @@ def _attention(
         head_dim=head_dim,
         max_seq_len=max_seq_len,
         rope_theta=rope_theta,
-        causal=causal,
         implementation=implementation,
         dtype=dtype,
     )
@@ -237,8 +229,6 @@ def _attention(
             jnp.zeros(sc["BCKF"], dtype),
             jnp.zeros(sc["B"], jnp.int32),
         )
-    if not isinstance(carry, TransformerCarry):
-        raise TypeError("carry must be a TransformerCarry")
     sc.check((carry.key, carry.value), "BCKF", dtype)
     sc.check(carry.position, "B", jnp.int32)
     native_attention = fresh and x_len is None
@@ -381,7 +371,6 @@ class TransformerBlock(nn.Module):
             head_dim=head_dim,
             max_seq_len=self.max_seq_len,
             rope_theta=self.rope_theta,
-            causal=self.causal,
             implementation=self.attention_implementation,
             dtype=self.dtype,
         )
@@ -429,8 +418,6 @@ class TransformerBlock(nn.Module):
         _positive_integer(x.shape[0], "batch_size")
         _positive_integer(x.shape[1], "sequence_length")
         if carry is not None:
-            if not isinstance(carry, TransformerCarry):
-                raise TypeError("carry must be a TransformerCarry")
             sc.check((carry.key, carry.value), "BCKF", self.dtype)
             sc.check(carry.position, "B", jnp.int32)
         if x_len is not None:
@@ -595,15 +582,13 @@ class TransformerStack(nn.Module):
         sc = ShapeChecker(D=self.dim)
         sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
-        if carry is not None and (not isinstance(carry, tuple) or len(carry) != self.num_layers):
-            raise ValueError("carry must be a tuple with one TransformerCarry per layer")
+        if carry is not None and len(carry) != self.num_layers:
+            raise ValueError("carry must contain one TransformerCarry per layer")
         if x_len is not None:
             sc.check(x_len, "B", jnp.int32)
         next_carry = []
         for i, layer in enumerate(self.layers):
             state = None if carry is None else carry[i]
-            if carry is not None and not isinstance(state, TransformerCarry):
-                raise TypeError("each layer carry must be a TransformerCarry")
             state, x = layer(x, x_len, state)
             next_carry.append(state)
         if self.final_norm:
@@ -644,7 +629,7 @@ class ARTransformerStack(TransformerStack, ARSequenceModel[TransformerStackCarry
     """
 
     def setup(self) -> None:
-        if self.causal is not True:
+        if not self.causal:
             raise ValueError("ARTransformerStack requires causal=True")
         super().setup()
 
@@ -655,8 +640,6 @@ class ARTransformerStack(TransformerStack, ARSequenceModel[TransformerStackCarry
         carry: TransformerStackCarry | None = None,
     ) -> tuple[TransformerStackCarry, jax.Array]:
         """Process [batch,time,dim] with required int32 [batch] prefix lengths."""
-        if x_len is None:
-            raise TypeError("x_len must be an int32 array, not None")
         sc = ShapeChecker(D=self.dim)
         sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
@@ -672,8 +655,6 @@ class ARTransformerStack(TransformerStack, ARSequenceModel[TransformerStackCarry
         carry: TransformerStackCarry | None = None,
     ) -> tuple[TransformerStackCarry, jax.Array]:
         """Process [batch,dim]; int32 [batch] lengths of zero skip examples."""
-        if x_len is None:
-            raise TypeError("x_len must be an int32 array, not None")
         sc = ShapeChecker(D=self.dim)
         sc.check(x, "BD")
         chex.assert_type(x, jnp.floating)
@@ -695,14 +676,12 @@ class BDTransformerStack(TransformerStack, BDSequenceModel):
     causal: bool = False
 
     def setup(self) -> None:
-        if self.causal is not False:
+        if self.causal:
             raise ValueError("BDTransformerStack requires causal=False")
         super().setup()
 
     def __call__(self, x: jax.Array, x_len: jax.Array) -> jax.Array:
         """Process [batch,time,dim]; int32 [batch] lengths delimit valid prefixes."""
-        if x_len is None:
-            raise TypeError("x_len must be an int32 array, not None")
         sc = ShapeChecker(D=self.dim)
         sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
