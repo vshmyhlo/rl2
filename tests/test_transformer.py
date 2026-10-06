@@ -9,6 +9,8 @@ import pytest
 
 from rl2.shape_checker import ShapeChecker
 from rl2.transformer import (
+    BDTransformer,
+    LayerAttentionBiases,
     Transformer,
     TransformerCarry,
     TransformerStackCarry,
@@ -60,12 +62,17 @@ def reference_block(
     theta: float,
     epsilon: float = 1e-5,
     causal: bool = True,
+    use_rope: bool = True,
+    bias: np.ndarray | None = None,
 ) -> np.ndarray:
     """Float64 NumPy oracle with explicit attention over valid prefixes."""
     sc = ShapeChecker(H=heads, K=kv_heads)
     sc.check(x, "BTD")
     chex.assert_type(x, np.floating)
     sc.check(x_len, "B", np.int32)
+    if bias is not None:
+        sc.check(bias, "BHTT")
+        chex.assert_type(bias, np.floating)
     batch, steps, width = x.shape
     head_dim = width // heads
     residual = x.astype(np.float64)
@@ -79,7 +86,7 @@ def reference_block(
     output = np.zeros_like(query)
     for b in range(batch):
         for t in range(x_len[b]):
-            for pair in range(head_dim // 2):
+            for pair in range(head_dim // 2 if use_rope else 0):
                 angle = t / theta ** (2 * pair / head_dim)
                 c, s = np.cos(angle), np.sin(angle)
                 for tensor in (query, key):
@@ -93,6 +100,8 @@ def reference_block(
             for h in range(heads):
                 group = h // (heads // kv_heads)
                 logits = key[b, left:right, group] @ query[b, t, h] / np.sqrt(head_dim)
+                if bias is not None:
+                    logits += bias[b, h, t, left:right]
                 weights = np.exp(logits - logits.max())
                 output[b, t, h] = (weights / weights.sum()) @ value[b, left:right, group]
     x = residual + output.reshape(x.shape) @ np.asarray(params["out_proj"]["kernel"])
@@ -567,6 +576,7 @@ def test_cudnn_lengths_and_mask_padding_preserve_outputs_and_gradients(
         key: jax.Array,
         value: jax.Array,
         *,
+        bias: jax.Array | None,
         mask: jax.Array | None,
         query_seq_lengths: jax.Array | None,
         key_value_seq_lengths: jax.Array | None,
@@ -575,6 +585,7 @@ def test_cudnn_lengths_and_mask_padding_preserve_outputs_and_gradients(
         implementation: str,
     ) -> jax.Array:
         sc = ShapeChecker(B=2, H=2, K=1, F=8, U=1)
+        assert bias is None
         sc.check(query, "BQHF", jnp.bfloat16)
         sc.check((key, value), "BSKF", jnp.bfloat16)
         assert query_seq_lengths is not None and key_value_seq_lengths is not None
@@ -700,3 +711,55 @@ def test_attention_backend_forward_backward_and_decode(
     )
     np.testing.assert_allclose(actual_y.astype(jnp.float32), expected_y.astype(jnp.float32), rtol=0.05, atol=0.015)
     assert_carry_close(actual_state, expected_state, tolerance=0.04)
+
+
+def test_bidirectional_layer_biases_without_rope_match_numpy_and_receive_gradients() -> None:
+    # Odd head width verifies that disabling RoPE reaches both validation and attention.
+    model = BDTransformer(6, 2, num_heads=2, num_kv_heads=1, max_seq_len=3, use_rope=False, initializer_range=0.2)
+    x = jax.random.normal(jax.random.key(42), (2, 3, 6))
+    lengths = jnp.asarray([2, 3], jnp.int32)
+    biases = tuple(jax.random.normal(jax.random.key(43 + i), (2, 2, 3, 3)) for i in range(2))
+    variables = model.init(jax.random.key(45), x, lengths, biases=biases)
+    actual = jax.jit(model.apply)(variables, x, lengths, biases=biases)
+    expected = np.asarray(x)
+    for i, bias in enumerate(biases):
+        expected = reference_block(
+            expected,
+            variables["params"][f"layers_{i}"],
+            np.asarray(lengths),
+            2,
+            1,
+            model.rope_theta,
+            causal=False,
+            use_rope=False,
+            bias=np.asarray(bias),
+        )
+    expected /= np.sqrt(np.mean(expected**2, axis=-1, keepdims=True) + model.norm_epsilon)
+    expected *= np.asarray(variables["params"]["norm_f"]["scale"])
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
+
+    def loss(inputs: jax.Array, biases: LayerAttentionBiases) -> jax.Array:
+        sc = ShapeChecker(B=2, T=3, D=6, H=2)
+        sc.check(inputs, "BTD", jnp.float32)
+        sc.check(biases, "BHTT", jnp.float32)
+        # A first-position output must depend on later live positions.
+        return model.apply(variables, inputs, lengths, biases=biases)[:, 0, 0].sum()
+
+    input_gradient, bias_gradients = jax.jit(jax.grad(loss, argnums=(0, 1)))(x, biases)
+    assert np.linalg.norm(input_gradient[0, 1]) > 0
+    np.testing.assert_array_equal(input_gradient[0, 2], 0)
+    for gradient in bias_gradients:
+        assert np.isfinite(gradient).all()
+        assert np.linalg.norm(gradient) > 0
+        np.testing.assert_array_equal(gradient[0, :, 2], 0)
+        np.testing.assert_array_equal(gradient[0, :, :, 2], 0)
+
+
+@pytest.mark.parametrize("invalid", ["count", "shape", "dtype"])
+def test_bidirectional_stack_rejects_invalid_biases(invalid: str) -> None:
+    model = BDTransformer(6, 2, num_heads=2, max_seq_len=3, use_rope=False)
+    x = jnp.zeros((1, 3, 6), jnp.float32)
+    bias = jnp.zeros((1, 2, 3, 2 if invalid == "shape" else 3), jnp.int32 if invalid == "dtype" else jnp.float32)
+    biases = (bias,) if invalid == "count" else (bias, bias)
+    with pytest.raises(ValueError if invalid == "count" else AssertionError):
+        model.apply({}, x, jnp.asarray([3], jnp.int32), biases=biases)

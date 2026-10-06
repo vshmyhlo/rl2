@@ -5,6 +5,8 @@ residual layers; a shared internal stack repeats it and adds a final RMSNorm.
 ``ARTransformer`` implements the autoregressive sequence/carry contract;
 ``BDTransformer`` exposes bidirectional sequence outputs without carry.
 Both specialized stacks require explicit ``x_len`` arrays for sequence calls.
+RoPE can be disabled with ``use_rope=False``. ``BDTransformer`` accepts an
+optional tuple of additive attention biases, one per layer, supplied by callers.
 The attention and SwiGLU architecture follow Meta's reference:
 https://github.com/meta-llama/llama3/blob/main/llama/model.py
 MLP width is ``round(dim * mlp_expansion)``, with a default expansion of 2.
@@ -79,7 +81,7 @@ class TransformerCarry(NamedTuple):
 
     key/value: [B,max_seq_len,num_kv_heads,headdim], in projection dtype.
     position: [B], int32. Slot ``p`` stores position ``p``.
-    Keys are already rotated. Unused slots are initialized to zero.
+    Keys are already rotated when use_rope=True. Unused slots start at zero.
     """
 
     key: jax.Array
@@ -88,6 +90,7 @@ class TransformerCarry(NamedTuple):
 
 
 type TransformerStackCarry = tuple[TransformerCarry, ...]
+type LayerAttentionBiases = tuple[jax.Array, ...]
 
 
 def _positive_integer(value: int, name: str) -> None:
@@ -129,6 +132,7 @@ class _TransformerBlock(nn.Module):
     dtype: jax.typing.DTypeLike = jnp.float32
     initializer_range: float = 0.02
     causal: bool = True
+    use_rope: bool = True
 
     @nn.nowrap
     def _mlp_width(self) -> int:
@@ -150,6 +154,7 @@ class _TransformerBlock(nn.Module):
             rope_theta=self.rope_theta,
             implementation=self.attention_implementation,
             dtype=self.dtype,
+            use_rope=self.use_rope,
         )
         for name in ("initializer_range", "norm_epsilon"):
             if not 0 < getattr(self, name) < math.inf:
@@ -177,6 +182,8 @@ class _TransformerBlock(nn.Module):
         x: jax.Array,
         x_len: jax.Array | None = None,
         carry: TransformerCarry | None = None,
+        *,
+        bias: jax.Array | None = None,
     ) -> tuple[TransformerCarry, jax.Array]:
         """Map [batch,time,dim] to (updated KV cache, same-shaped output).
 
@@ -184,6 +191,8 @@ class _TransformerBlock(nn.Module):
         ``x_len`` is int32 [batch], in [0, time], defaulting to time.
         Only the left-aligned valid prefix updates history; right-padded
         outputs are zero. A zero length preserves that example's cache.
+        Optional floating bias is [batch,num_heads,time,key_length], with
+        key_length=time for fresh calls and max_seq_len for cached calls.
         """
         kv_heads, head_dim = self._dimensions()
         width = self._mlp_width()
@@ -199,6 +208,9 @@ class _TransformerBlock(nn.Module):
             sc.check(carry.position, "B", jnp.int32)
         if x_len is not None:
             sc.check(x_len, "B", jnp.int32)
+        if bias is not None:
+            sc.check(bias, "BHTT" if carry is None else "BHTC")
+            chex.assert_type(bias, jnp.floating)
 
         valid_tokens = None
         if x_len is not None:
@@ -231,6 +243,8 @@ class _TransformerBlock(nn.Module):
             rope_theta=self.rope_theta,
             causal=self.causal,
             implementation=self.attention_implementation,
+            bias=bias,
+            use_rope=self.use_rope,
         )
         carry = TransformerCarry(*attention_state)
         attended = attended.reshape(sc["BTD"])
@@ -304,6 +318,7 @@ class _TransformerStack(nn.Module):
     attention_implementation: _attention.AttentionType = "xla"
     dtype: jax.typing.DTypeLike = jnp.float32
     causal: bool = True
+    use_rope: bool = True
 
     @nn.nowrap
     def _mlp_width(self) -> int:
@@ -327,6 +342,7 @@ class _TransformerStack(nn.Module):
             dtype=self.dtype,
             initializer_range=self.initializer_range,
             causal=self.causal,
+            use_rope=self.use_rope,
             parent=None,
         )
         block._dimensions()
@@ -343,23 +359,32 @@ class _TransformerStack(nn.Module):
         x: jax.Array,
         x_len: jax.Array | None = None,
         carry: TransformerStackCarry | None = None,
+        *,
+        biases: LayerAttentionBiases | None = None,
     ) -> tuple[TransformerStackCarry, jax.Array]:
         """Map [batch,time,dim] to (per-layer KV caches, output).
 
         Optional int32 x_len[batch] counts valid prefix tokens in this chunk.
         Right padding returns zero output and leaves cached history unchanged.
+        Optional biases contains one floating [batch,num_heads,time,key_length]
+        array per layer. key_length is time without carry, else max_seq_len.
         """
-        sc = ShapeChecker(D=self.dim)
+        sc = ShapeChecker(D=self.dim, H=self.num_heads, C=self.max_seq_len)
         sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
         if carry is not None and len(carry) != self.num_layers:
             raise ValueError("carry must contain one TransformerCarry per layer")
+        if biases is not None:
+            if len(biases) != self.num_layers:
+                raise ValueError("biases must contain one attention bias per layer")
+            sc.check(biases, "BHTT" if carry is None else "BHTC")
+            chex.assert_type(biases, jnp.floating)
         if x_len is not None:
             sc.check(x_len, "B", jnp.int32)
         next_carry = []
         for i, layer in enumerate(self.layers):
             state = None if carry is None else carry[i]
-            state, x = layer(x, x_len, state)
+            state, x = layer(x, x_len, state, bias=None if biases is None else biases[i])
             next_carry.append(state)
         if self.final_norm:
             x = self.norm_f(x)
@@ -462,12 +487,17 @@ class BDTransformer(_TransformerStack, BDSequenceModel):
             raise ValueError("BDTransformer requires causal=False")
         super().setup()
 
-    def __call__(self, x: jax.Array, x_len: jax.Array) -> jax.Array:
-        """Process [batch,time,dim]; int32 [batch] lengths delimit valid prefixes."""
+    def __call__(self, x: jax.Array, x_len: jax.Array, *, biases: LayerAttentionBiases | None = None) -> jax.Array:
+        """Process [batch,time,dim]; int32 [batch] lengths delimit valid prefixes.
+
+        Optional biases contains one floating [batch,num_heads,time,time] array
+        per layer, added before attention softmax. Biases cannot override padding.
+        Callers own any learned bias parameters; the stack stays domain-agnostic.
+        """
         sc = ShapeChecker(D=self.dim)
         sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
         sc.check(x_len, "B", jnp.int32)
-        _, output = self._forward(x, x_len)
+        _, output = self._forward(x, x_len, biases=biases)
         sc.check(output, "BTD", self.dtype)
         return output

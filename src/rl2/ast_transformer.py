@@ -1,6 +1,8 @@
 """AST-aware Transformer for parallel typed-hole expansions, conditioned on a grid pair.
 
-The entire current tree is re-encoded each round with bidirectional attention.
+The entire current tree is re-encoded each round with a shared BDTransformer.
+It uses learned absolute positions with RoPE disabled, standard backbone
+projections (no Q/K normalization), and one final RMSNorm inside the stack.
 Each layer/head adds learned tree-relation, distance, and relative-depth biases
 to attention scores, derived from the existing preorder depths.
 Only the present partial tree is visible, including unresolved sibling holes;
@@ -19,71 +21,9 @@ from flax import linen as nn
 from rl2.attention import AttentionType
 from rl2.karel_ast import AST_ACTIONS, CONSTRUCTORS, NUM_NODE_TYPES, VALUES, ASTFeatures, Field
 from rl2.karel_syntax import MAX_BLOCK_DEPTH
-from rl2.tree_attention import TreeAttentionBias, TreeRelations, tree_relations
-
-
-class _ASTBlock(nn.Module):
-    d_model: int
-    num_heads: int
-    num_kv_heads: int
-    d_intermediate: int
-    num_layers: int
-    dtype: jax.typing.DTypeLike
-    attention_implementation: AttentionType
-
-    @nn.compact
-    def __call__(self, x: jax.Array, present: jax.Array, relations: TreeRelations) -> jax.Array:
-        chex.assert_shape(x, (None, None, self.d_model))
-        chex.assert_type(x, jnp.floating)
-        chex.assert_shape(present, x.shape[:2])
-        chex.assert_type(present, jnp.bool_)
-        batch, length, _ = x.shape
-        chex.assert_shape(relations, (batch, length, length))
-        bias = TreeAttentionBias(self.num_heads, name="tree_bias")(relations)
-        head_dim = self.d_model // self.num_heads
-        normalized = nn.RMSNorm(dtype=self.dtype, name="attention_norm")(x)
-        query = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype, name="query")(normalized)
-        key = nn.Dense(self.num_kv_heads * head_dim, use_bias=False, dtype=self.dtype, name="key")(normalized)
-        value = nn.Dense(self.num_kv_heads * head_dim, use_bias=False, dtype=self.dtype, name="value")(normalized)
-        query = query.reshape(batch, length, self.num_heads, head_dim)
-        key, value = (v.reshape(batch, length, self.num_kv_heads, head_dim) for v in (key, value))
-        # Normalize each head over head_dim; Q and K have separate learned
-        # scales shared across their respective heads. V remains unnormalized.
-        query = nn.RMSNorm(dtype=self.dtype, name="query_norm")(query)
-        key = nn.RMSNorm(dtype=self.dtype, name="key_norm")(key)
-        # The pair prefix and preorder nodes form a contiguous live prefix.
-        # Lengths exclude padding for both queries and keys, including any
-        # extra position added below for cuDNN alignment.
-        lengths = present.sum(axis=-1, dtype=jnp.int32)
-        if self.attention_implementation == "cudnn" and length % 2:
-            query, key, value = (jnp.pad(v, ((0, 0), (0, 1), (0, 0), (0, 0))) for v in (query, key, value))
-            bias = jnp.pad(bias, ((0, 0), (0, 0), (0, 1), (0, 1)))
-        attention_dtype = jnp.float32 if self.attention_implementation == "xla" else self.dtype
-        attended = (
-            jax.nn.dot_product_attention(
-                query.astype(attention_dtype),
-                key.astype(attention_dtype),
-                value.astype(attention_dtype),
-                bias=bias.astype(attention_dtype),
-                query_seq_lengths=lengths,
-                key_value_seq_lengths=lengths,
-                is_causal=False,
-                implementation=self.attention_implementation,
-            )[:, :length]
-            .reshape(batch, length, self.d_model)
-            .astype(self.dtype)
-        )
-        out_init = nn.initializers.variance_scaling(1 / (2 * self.num_layers), "fan_in", "truncated_normal")
-        attended = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype, kernel_init=out_init, name="attention_out")(
-            attended
-        )
-        x = x.astype(jnp.float32) + attended.astype(jnp.float32)
-        normalized = nn.RMSNorm(dtype=self.dtype, name="mlp_norm")(x)
-        gate = nn.Dense(self.d_intermediate, use_bias=False, dtype=self.dtype, name="gate")(normalized)
-        up = nn.Dense(self.d_intermediate, use_bias=False, dtype=self.dtype, name="up")(normalized)
-        hidden = nn.silu(gate) * up
-        hidden = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype, kernel_init=out_init, name="down")(hidden)
-        return x + hidden.astype(jnp.float32)
+from rl2.shape_checker import ShapeChecker
+from rl2.transformer import BDTransformer
+from rl2.tree_attention import TreeAttentionBias, tree_relations
 
 
 class ASTTransformer(nn.Module):
@@ -137,20 +77,21 @@ class ASTTransformer(nn.Module):
         self.hole_embedding = nn.Embed(2, self.d_model, dtype=self.dtype)
         self.position_embedding = nn.Embed(self.max_nodes + 1, self.d_model, dtype=self.dtype)
         width = math.ceil((8 * self.d_model / 3) / 128) * 128
-        self.layers = tuple(
-            _ASTBlock(
-                self.d_model,
-                self.num_heads,
-                kv_heads,
-                width,
-                self.num_layers,
-                self.dtype,
-                self.attention_implementation,
-                name=f"layers_{i}",
-            )
-            for i in range(self.num_layers)
+        self.tree_biases = tuple(
+            TreeAttentionBias(self.num_heads, name=f"tree_bias_{i}") for i in range(self.num_layers)
         )
-        self.final_norm = nn.RMSNorm(dtype=self.dtype)
+        self.backbone = BDTransformer(
+            dim=self.d_model,
+            num_layers=self.num_layers,
+            num_heads=self.num_heads,
+            num_kv_heads=kv_heads,
+            max_seq_len=self.max_nodes + 1,
+            mlp_expansion=width / self.d_model,
+            norm_epsilon=1e-6,
+            use_rope=False,
+            dtype=self.dtype,
+            attention_implementation=self.attention_implementation,
+        )
         # Initially uniform over the legal productions for each hole type.
         self.constructor_head = nn.Dense(len(CONSTRUCTORS), dtype=self.dtype, kernel_init=nn.initializers.zeros_init())
         self.value_head = nn.Dense(len(VALUES), dtype=self.dtype, kernel_init=nn.initializers.zeros_init())
@@ -179,22 +120,22 @@ class ASTTransformer(nn.Module):
             PAD is excluded on active rows; rows with no legal actions use
             PAD=0 and all other logits=-inf as a safe batching fallback.
         """
-        chex.assert_shape(initial, (None, None, None, 6))
-        chex.assert_equal_shape((initial, target))
-        chex.assert_type((initial, target), jnp.int32)
+        sc = ShapeChecker(C=6, D=self.d_model, A=len(AST_ACTIONS))
+        sc.check((initial, target), "BHWC", jnp.int32)
         for size in initial.shape[:3]:
             chex.assert_scalar_positive(size)
         batch = initial.shape[0]
-        chex.assert_rank(tree.node_mask, 2)
+        sc.check(tree.node_mask, "BN", jnp.bool_)
         nodes_count = tree.node_mask.shape[1]
         chex.assert_scalar_in(nodes_count, 1, self.max_nodes)
-        chex.assert_shape(tree[:6], (batch, nodes_count))
-        chex.assert_type(tree[:5], jnp.int32)
-        chex.assert_type((tree.is_hole, tree.node_mask, tree.action_mask), jnp.bool_)
-        chex.assert_shape(tree.action_mask, (batch, nodes_count, len(AST_ACTIONS)))
+        sc.check(tree[:5], "BN", jnp.int32)
+        sc.check(tree.is_hole, "BN", jnp.bool_)
+        sc.check(tree.action_mask, "BNA", jnp.bool_)
         scale = jnp.asarray([1, 1, 1, 1, 1, self.max_markers] * 2, jnp.float32)
         pair = jnp.concatenate((initial, target), axis=-1).astype(jnp.float32) / scale
+        sc.check(pair, "BHWP", jnp.float32)
         context = self.context_norm(self.context_projection(pair.reshape(batch, -1)))
+        sc.check(context, "BD", self.dtype)
         # Canonicalize padding before embedding so even dirty padded IDs cannot
         # affect live nodes or index outside an embedding table.
         ids = [jnp.where(tree.node_mask, feature, 0) for feature in tree[:5]]
@@ -206,13 +147,23 @@ class ASTTransformer(nn.Module):
             + self.value_embedding(ids[4])
             + self.hole_embedding(tree.is_hole.astype(jnp.int32))
         )
+        sc.check(nodes, "BND", self.dtype)
         x = jnp.concatenate((context[:, None], nodes), axis=1)
         x = x + self.position_embedding(jnp.arange(nodes_count + 1, dtype=jnp.int32))[None]
-        present = jnp.concatenate((jnp.ones((batch, 1), jnp.bool_), tree.node_mask), axis=1)
+        # Start the shared residual stream in float32, as in the former AST blocks.
+        x = x.astype(jnp.float32)
+        sc.check(x, "BTD", jnp.float32)
+        lengths = 1 + tree.node_mask.sum(axis=-1, dtype=jnp.int32)
+        sc.check(lengths, "B", jnp.int32)
         relations = tree_relations(tree.depth, tree.node_mask)
-        for layer in self.layers:
-            x = layer(x, present, relations)
-        nodes = self.final_norm(x[:, 1:])
+        sc.check(relations, "BTT", jnp.int32)
+        biases = tuple(tree_bias(relations) for tree_bias in self.tree_biases)
+        bias_sc = ShapeChecker(B=batch, H=self.num_heads, T=nodes_count + 1)
+        bias_sc.check(biases, "BHTT", jnp.float32)
+        x = self.backbone(x, lengths, biases=biases)
+        sc.check(x, "BTD", self.dtype)
+        nodes = x[:, 1:]
+        sc.check(nodes, "BND", self.dtype)
         logits = jnp.concatenate(
             (
                 jnp.full((batch, nodes_count, 1), -jnp.inf, jnp.float32),
@@ -221,5 +172,8 @@ class ASTTransformer(nn.Module):
             ),
             axis=-1,
         )
+        sc.check(logits, "BNA", jnp.float32)
         masked = jnp.where(tree.action_mask, logits, -jnp.inf)
-        return masked.at[..., 0].set(jnp.where(tree.action_mask.any(axis=-1), -jnp.inf, 0.0))
+        output = masked.at[..., 0].set(jnp.where(tree.action_mask.any(axis=-1), -jnp.inf, 0.0))
+        sc.check(output, "BNA", jnp.float32)
+        return output

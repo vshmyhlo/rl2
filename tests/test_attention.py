@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from rl2.attention import AttentionState, _rope, attention
+from rl2.attention import AttentionState, AttentionType, _check_attention_config, _rope, attention
 from rl2.shape_checker import ShapeChecker
 
 
@@ -125,6 +125,36 @@ def test_attention_rejects_invalid_configuration() -> None:
 
 
 @pytest.mark.parametrize(
+    "theta,capacity",
+    [
+        pytest.param(1e-100, 1, id="frequency-overflow-even-at-position-zero"),
+        pytest.param(1e-76, 5, id="angle-overflow-at-last-cache-position"),
+    ],
+)
+def test_attention_rejects_overflowing_rope_configuration(theta: float, capacity: int) -> None:
+    with pytest.raises(ValueError, match="RoPE.*float32"):
+        _check_attention_config(
+            num_heads=1,
+            num_kv_heads=1,
+            head_dim=4,
+            max_seq_len=capacity,
+            rope_theta=theta,
+            implementation="xla",
+            dtype=jnp.float32,
+        )
+
+
+def test_attention_accepts_large_finite_rope_angles() -> None:
+    # The largest angle is about 3e38; one more position would overflow float32.
+    x = jnp.ones((1, 4, 1, 4), jnp.float32)
+    state, output = jax.jit(partial(attention, max_seq_len=4, rope_theta=1e-76, causal=True, implementation="xla"))(
+        x, x, x
+    )
+    assert np.isfinite(state[0]).all()
+    np.testing.assert_allclose(output, 1.0)
+
+
+@pytest.mark.parametrize(
     "shape",
     [
         pytest.param((1, 0, 1, 2), id="empty-time"),
@@ -193,3 +223,231 @@ def test_rope_rejects_invalid_positions(
 ) -> None:
     with pytest.raises(AssertionError):
         _rope(jnp.zeros((1, 2, 1, 2), jnp.float32), jnp.zeros(positions_shape, positions_dtype), 10000.0)
+
+
+def test_biased_attention_without_rope_matches_numpy_outputs_and_bias_gradients() -> None:
+    query = jax.random.normal(jax.random.key(21), (3, 3, 2, 3))
+    key, value = jax.random.normal(jax.random.key(22), (2, 3, 3, 1, 3))
+    lengths = jnp.asarray([3, 2, 0], jnp.int32)
+    valid = jnp.arange(3)[None, :] < lengths[:, None]
+    bias_valid = valid[:, None, :, None] & valid[:, None, None, :]
+    bias = jnp.where(bias_valid, jax.random.normal(jax.random.key(23), (3, 2, 3, 3)), jnp.nan)
+
+    def loss(bias: jax.Array) -> tuple[jax.Array, tuple[AttentionState, jax.Array]]:
+        sc = ShapeChecker(B=3, H=2, T=3)
+        sc.check(bias, "BHTT", jnp.float32)
+        state, output = attention(
+            query,
+            key,
+            value,
+            x_len=lengths,
+            max_seq_len=3,
+            rope_theta=float("inf"),
+            causal=False,
+            implementation="xla",
+            bias=bias,
+            use_rope=False,
+        )
+        return output.sum(), (state, output)
+
+    (_, (state, output)), gradient = jax.jit(jax.value_and_grad(loss, has_aux=True))(bias)
+    expected = np.zeros(query.shape, np.float32)
+    expected_gradient = np.zeros(bias.shape, np.float32)
+    q, k, v, b = map(np.asarray, (query, key, value, bias))
+    for batch, length in enumerate(np.asarray(lengths)):
+        if length == 0:
+            continue
+        for head in range(2):
+            scores = q[batch, :length, head] @ k[batch, :length, 0].T / np.sqrt(3)
+            scores += b[batch, head, :length, :length]
+            weights = np.exp(scores - scores.max(axis=-1, keepdims=True))
+            weights /= weights.sum(axis=-1, keepdims=True)
+            result = weights @ v[batch, :length, 0]
+            expected[batch, :length, head] = result
+            expected_gradient[batch, head, :length, :length] = weights * (
+                v[batch, :length, 0].sum(axis=-1)[None, :] - result.sum(axis=-1)[:, None]
+            )
+    np.testing.assert_allclose(output, expected, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(gradient, expected_gradient, rtol=1e-5, atol=1e-6)
+    assert np.linalg.norm(expected_gradient) > 0
+    # Disabling RoPE must also leave cached keys unrotated, including odd head widths.
+    np.testing.assert_array_equal(state[0], jnp.where(valid[..., None, None], key, 0))
+    np.testing.assert_array_equal(state[2], lengths)
+
+
+@pytest.mark.parametrize("use_rope", [True, False])
+def test_biased_causal_chunks_match_full_outputs_and_gradients(use_rope: bool) -> None:
+    query = jax.random.normal(jax.random.key(24), (1, 3, 2, 2))
+    key, value = jax.random.normal(jax.random.key(25), (2, 1, 3, 1, 2))
+    bias = jax.random.normal(jax.random.key(26), (1, 2, 3, 3))
+    attend = partial(attention, max_seq_len=3, rope_theta=10000.0, causal=True, implementation="xla", use_rope=use_rope)
+
+    def loss(bias: jax.Array, chunked: bool) -> tuple[jax.Array, tuple[AttentionState, jax.Array]]:
+        sc = ShapeChecker(B=1, H=2, T=3)
+        sc.check(bias, "BHTT", jnp.float32)
+        if chunked:
+            state, prefix = attend(query[:, :1], key[:, :1], value[:, :1], bias=bias[:, :, :1, :1])
+            state, suffix = attend(query[:, 1:], key[:, 1:], value[:, 1:], state, bias=bias[:, :, 1:])
+            output = jnp.concatenate((prefix, suffix), axis=1)
+        else:
+            state, output = attend(query, key, value, bias=bias)
+        return jnp.sum(output**2), (state, output)
+
+    full = jax.jit(jax.value_and_grad(partial(loss, chunked=False), has_aux=True))(bias)
+    chunks = jax.jit(jax.value_and_grad(partial(loss, chunked=True), has_aux=True))(bias)
+    chex.assert_trees_all_close(chunks, full, rtol=1e-5, atol=1e-6)
+    gradient = full[1]
+    np.testing.assert_array_equal(gradient[:, :, np.triu_indices(3, 1)[0], np.triu_indices(3, 1)[1]], 0)
+    assert np.linalg.norm(gradient) > 0
+
+
+@pytest.mark.parametrize(
+    "shape,dtype,cached",
+    [
+        pytest.param((2, 2, 2), jnp.float32, False, id="rank"),
+        pytest.param((1, 1, 2, 2), jnp.float32, False, id="no-head-broadcast"),
+        pytest.param((1, 2, 1, 2), jnp.float32, False, id="query-length"),
+        pytest.param((1, 2, 2, 3), jnp.float32, False, id="fresh-keys-use-input-length"),
+        pytest.param((1, 2, 2, 2), jnp.float32, True, id="cached-keys-use-capacity"),
+        pytest.param((1, 2, 2, 2), jnp.int32, False, id="nonfloating-bias"),
+    ],
+)
+def test_attention_rejects_invalid_bias(shape: tuple[int, ...], dtype: jax.typing.DTypeLike, cached: bool) -> None:
+    query = jnp.zeros((1, 2, 2, 2), jnp.float32)
+    key = query[:, :, :1]
+    carry = (jnp.zeros((1, 3, 1, 2)), jnp.zeros((1, 3, 1, 2)), jnp.zeros((1,), jnp.int32)) if cached else None
+    with pytest.raises(AssertionError):
+        attention(
+            query,
+            key,
+            key,
+            carry,
+            max_seq_len=3,
+            rope_theta=10000.0,
+            causal=False,
+            implementation="xla",
+            bias=jnp.zeros(shape, dtype),
+        )
+
+
+def test_disabling_rope_preserves_backend_head_width_constraints() -> None:
+    with pytest.raises(AssertionError):
+        _check_attention_config(
+            num_heads=1,
+            num_kv_heads=1,
+            head_dim=3,
+            max_seq_len=3,
+            rope_theta=float("inf"),
+            implementation="cudnn",
+            dtype=jnp.bfloat16,
+            use_rope=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "cached,padded,real_cudnn",
+    [
+        pytest.param(False, False, False, id="fresh-implicit-lengths"),
+        pytest.param(False, True, False, id="fresh-padding-and-empty-example"),
+        pytest.param(True, True, False, id="cached-causal-mask-and-bias"),
+        pytest.param(
+            False,
+            True,
+            True,
+            id="real-cudnn",
+            marks=pytest.mark.skipif(
+                not any(d.platform == "gpu" for d in jax.devices()), reason="cuDNN requires a GPU"
+            ),
+        ),
+    ],
+)
+def test_cudnn_bias_padding_preserves_outputs_and_gradients(
+    monkeypatch: pytest.MonkeyPatch, cached: bool, padded: bool, real_cudnn: bool
+) -> None:
+    query = jax.random.normal(jax.random.key(27), (3, 3, 2, 8), jnp.bfloat16)
+    key, value = jax.random.normal(jax.random.key(28), (2, 3, 3, 1, 8), jnp.bfloat16)
+    lengths = jnp.asarray([3, 2, 0], jnp.int32) if padded else None
+    carry = None
+    if cached:
+        carry = (jnp.ones((3, 5, 1, 8), jnp.bfloat16), jnp.ones((3, 5, 1, 8), jnp.bfloat16), jnp.ones((3,), jnp.int32))
+    bias = jax.random.normal(jax.random.key(29), (3, 2, 3, 5 if cached else 3))
+    original_attention = jax.nn.dot_product_attention
+    routed = []
+
+    def portable_attention(
+        query: jax.Array,
+        key: jax.Array,
+        value: jax.Array,
+        *,
+        bias: jax.Array,
+        mask: jax.Array | None,
+        query_seq_lengths: jax.Array | None,
+        key_value_seq_lengths: jax.Array | None,
+        is_causal: bool,
+        local_window_size: tuple[int, int] | None,
+        implementation: AttentionType,
+    ) -> jax.Array:
+        sc = ShapeChecker(B=3, H=2, K=1, F=8, U=1)
+        sc.check(query, "BQHF", jnp.bfloat16)
+        sc.check((key, value), "BSKF", jnp.bfloat16)
+        sc.check(bias, "BHQS", jnp.bfloat16)
+        assert query_seq_lengths is not None and key_value_seq_lengths is not None
+        sc.check((query_seq_lengths, key_value_seq_lengths), "B", jnp.int32)
+        if mask is not None:
+            sc.check(mask, "BUQS", jnp.bool_)
+        if implementation == "cudnn":
+            assert query.shape[1] == 4
+            assert key.shape[1] == (6 if cached else 4)
+            routed.append(True)
+        return original_attention(
+            query,
+            key,
+            value,
+            bias=bias,
+            mask=mask,
+            query_seq_lengths=query_seq_lengths,
+            key_value_seq_lengths=key_value_seq_lengths,
+            is_causal=is_causal,
+            local_window_size=local_window_size,
+            implementation="xla",
+        )
+
+    if not real_cudnn:
+        monkeypatch.setattr(jax.nn, "dot_product_attention", portable_attention)
+
+    def loss(
+        q: jax.Array, k: jax.Array, v: jax.Array, b: jax.Array, implementation: AttentionType
+    ) -> tuple[jax.Array, jax.Array]:
+        sc = ShapeChecker(B=3, T=3, H=2, K=1, F=8, S=5 if cached else 3)
+        sc.check(q, "BTHF", jnp.bfloat16)
+        sc.check((k, v), "BTKF", jnp.bfloat16)
+        sc.check(b, "BHTS", jnp.float32)
+        _, output = attention(
+            q,
+            k,
+            v,
+            carry,
+            lengths,
+            max_seq_len=5,
+            rope_theta=10000.0,
+            causal=cached,
+            implementation=implementation,
+            bias=b,
+            use_rope=False,
+        )
+        return jnp.sum(output.astype(jnp.float32) ** 2), output
+
+    expected = jax.jit(jax.value_and_grad(partial(loss, implementation="xla"), argnums=(0, 1, 2, 3), has_aux=True))(
+        query, key, value, bias
+    )
+    actual = jax.jit(jax.value_and_grad(partial(loss, implementation="cudnn"), argnums=(0, 1, 2, 3), has_aux=True))(
+        query, key, value, bias
+    )
+    assert real_cudnn or routed
+    for a, b in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
+        np.testing.assert_allclose(np.asarray(a, np.float32), np.asarray(b, np.float32), rtol=0.05, atol=0.02)
+    for gradient in actual[1]:
+        assert np.isfinite(gradient).all()
+        assert np.linalg.norm(np.asarray(gradient, np.float32)) > 0
+        if padded:
+            np.testing.assert_array_equal(gradient[2], 0)

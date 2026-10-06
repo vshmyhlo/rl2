@@ -1,4 +1,4 @@
-"""Projected RoPE attention with padding, KV caching, and XLA/cuDNN backends.
+"""Projected attention with optional RoPE/bias, KV caching, and XLA/cuDNN backends.
 
 This module operates on arrays and cache tuples without depending on
 transformer model classes. Projections, residual layers, and model-specific
@@ -86,6 +86,7 @@ def _check_attention_config(
     rope_theta: float,
     implementation: AttentionType,
     dtype: jax.typing.DTypeLike,
+    use_rope: bool = True,
 ) -> None:
     """Keep module and standalone attention validation consistent."""
     for name, value in (
@@ -96,9 +97,16 @@ def _check_attention_config(
     ):
         _positive_integer(value, name)
     chex.assert_is_divisible(num_heads, num_kv_heads)
-    chex.assert_is_divisible(head_dim, 2)
-    if not 0 < rope_theta < math.inf:
-        raise ValueError("rope_theta must be positive and finite")
+    if use_rope:
+        chex.assert_is_divisible(head_dim, 2)
+        if not 0 < rope_theta < math.inf:
+            raise ValueError("rope_theta must be positive and finite")
+        # Bases below one increase frequencies. Check in log space so validation
+        # itself cannot overflow, including when only position zero is used (0*inf).
+        max_log_frequency = max(0.0, -(1 - 2 / head_dim) * math.log(rope_theta))
+        max_log_angle = max_log_frequency + math.log(max(1, max_seq_len - 1))
+        if max_log_angle > math.log(float(jnp.finfo(jnp.float32).max)):
+            raise ValueError("RoPE frequencies and angles must fit in float32 for all cache positions")
     dtype = jnp.dtype(dtype)
     if dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
         raise ValueError("dtype must be float32, bfloat16, or float16")
@@ -119,19 +127,32 @@ def attention(
     rope_theta: float,
     causal: bool,
     implementation: AttentionType,
+    bias: jax.Array | None = None,
+    use_rope: bool = True,
 ) -> tuple[AttentionState, jax.Array]:
-    """Apply RoPE attention to projected Q/K/V and update the sequence cache.
+    """Attend to projected Q/K/V and update the sequence cache.
 
     Queries are [batch,time,query_heads,head_dim]; keys and values are
     [batch,time,kv_heads,head_dim], all with the same floating dtype and
     nonempty dimensions. Query heads must be divisible by KV heads; head width
-    must be even. cuDNN requires float16/bfloat16 and head width divisible by 8.
+    must be even when use_rope=True (the default). cuDNN requires
+    float16/bfloat16 and head width divisible by 8 regardless of use_rope.
+    With RoPE enabled, frequencies and angles through max_seq_len must fit in
+    float32. With RoPE disabled, rope_theta is ignored and keys are unrotated.
     Optional int32 [batch] x_len gives valid prefix lengths in [0, time].
     Padding produces zero output and does not update the cache.
-    Carry is (rotated keys, values, next positions), shaped [batch,capacity,
+    Carry is (keys, values, next positions), shaped [batch,capacity,
     kv_heads,head_dim], [batch,capacity,kv_heads,head_dim], and int32 [batch].
     Cached calls append valid tokens before attending over the updated cache.
     Sequence lengths exclude padding; causal chunks also mask future positions.
+    Keep use_rope and rope_theta consistent when reusing a cache.
+
+    Optional floating bias has exact shape [batch,query_heads,time,key_length],
+    without broadcasting. key_length is time for fresh calls and max_seq_len
+    for cached calls; cached columns address absolute cache slots after append.
+    Bias is added to scaled attention scores before softmax, cast to the
+    attention compute dtype. Padded rows/columns are ignored. It is not cached
+    and cannot override causal or sequence-length masks.
     Return the updated carry tuple and [batch,time,query_heads,head_dim] output.
     """
     dtype = query.dtype
@@ -151,8 +172,12 @@ def attention(
         rope_theta=rope_theta,
         implementation=implementation,
         dtype=dtype,
+        use_rope=use_rope,
     )
     fresh = carry is None
+    if bias is not None:
+        sc.check(bias, "BHTT" if fresh else "BHTC")
+        chex.assert_type(bias, jnp.floating)
     if carry is None:
         carry = (
             jnp.zeros(sc["BCKF"], dtype),
@@ -162,7 +187,7 @@ def attention(
     cache_key, cache_value, cache_position = carry
     sc.check((cache_key, cache_value), "BCKF", dtype)
     sc.check(cache_position, "B", jnp.int32)
-    native_attention = fresh and x_len is None
+    native_attention = fresh and x_len is None and bias is None
     if x_len is None:
         x_len = jnp.full(sc["B"], steps, jnp.int32)
     sc.check(x_len, "B", jnp.int32)
@@ -178,7 +203,8 @@ def attention(
     sc.check(valid_tokens, "BT", jnp.bool_)
     sc.check(positions, "BT", jnp.int32)
     query, key, value = (jnp.where(valid_tokens[..., None, None], v, 0) for v in (query, key, value))
-    query, key = _rope(query, positions, rope_theta), _rope(key, positions, rope_theta)
+    if use_rope:
+        query, key = _rope(query, positions, rope_theta), _rope(key, positions, rope_theta)
     slots = jnp.arange(max_seq_len, dtype=jnp.int32)[None, :]
 
     # Append each valid prefix immediately after that example's cached history.
@@ -215,6 +241,14 @@ def attention(
             # Invalid queries have position zero and can safely attend slot 0.
             mask = (positions[:, :, None] >= slots[:, None, :])[:, None]
             sc.check(mask, "BUTC", jnp.bool_)
+    if bias is not None:
+        sc.check((keys, values), "BSKF", dtype)
+        key_valid = jnp.arange(keys.shape[1])[None, :] < kv_lengths[:, None]
+        sc.check(key_valid, "BS", jnp.bool_)
+        bias_valid = valid_tokens[:, None, :, None] & key_valid[:, None, None, :]
+        sc.check(bias_valid, "BUTS", jnp.bool_)
+        bias = jnp.where(bias_valid, bias, 0)
+        sc.check(bias, "BHTS")
     query_seq_lengths = key_value_seq_lengths = None
     if not native_attention:
         # Give empty examples one safe dummy query/key instead of an empty
@@ -224,16 +258,22 @@ def attention(
         key_value_seq_lengths = jnp.maximum(kv_lengths, 1)
         sc.check((query_seq_lengths, key_value_seq_lengths), "B", jnp.int32)
     queries = query
-    if implementation == "cudnn" and mask is not None:
-        # cuDNN masked backward requires even Q and KV lengths. Give
+    if implementation == "cudnn" and (mask is not None or bias is not None):
+        # cuDNN masked/biased backward requires even Q and KV lengths. Give
         # a padded query the preceding valid mask to avoid all-masked
         # softmax rows; its output is discarded below.
         if steps % 2:
             queries = jnp.pad(queries, ((0, 0), (0, 1), (0, 0), (0, 0)))
-            mask = jnp.concatenate((mask, mask[:, :, -1:]), axis=2)
+            if mask is not None:
+                mask = jnp.concatenate((mask, mask[:, :, -1:]), axis=2)
+            if bias is not None:
+                bias = jnp.pad(bias, ((0, 0), (0, 0), (0, 1), (0, 0)))
         if keys.shape[1] % 2:
             keys, values = (jnp.pad(v, ((0, 0), (0, 1), (0, 0), (0, 0))) for v in (keys, values))
-            mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 0), (0, 1)))
+            if mask is not None:
+                mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 0), (0, 1)))
+            if bias is not None:
+                bias = jnp.pad(bias, ((0, 0), (0, 0), (0, 0), (0, 1)))
     # JAX's F16_F16_F32 dot algorithm is unsupported on CPU. Keep
     # projections/cache in float16 but use portable float32 attention.
     attention_dtype = jnp.float32 if implementation == "xla" and jnp.dtype(dtype) == jnp.float16 else dtype
@@ -244,10 +284,14 @@ def attention(
     attention_sc.check((keys, values), "BSKF", attention_dtype)
     if mask is not None:
         attention_sc.check(mask, "BUQS", jnp.bool_)
+    if bias is not None:
+        bias = bias.astype(attention_dtype)
+        attention_sc.check(bias, "BHQS", attention_dtype)
     attended = jax.nn.dot_product_attention(
         queries,
         keys,
         values,
+        bias=bias,
         mask=mask,
         query_seq_lengths=query_seq_lengths,
         key_value_seq_lengths=key_value_seq_lengths,

@@ -1,7 +1,7 @@
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import NamedTuple
-from unittest.mock import patch
 
 import chex
 import jax
@@ -10,10 +10,10 @@ import numpy as np
 import pytest
 from flax.training.train_state import TrainState
 
-from rl2.ast_transformer import ASTTransformer, _ASTBlock
-from rl2.attention import AttentionType
+from rl2.ast_transformer import ASTTransformer
 from rl2.karel import KarelConfig, _parse
 from rl2.karel_ast import ACTION_ID, AST_ACTIONS, ASTFeatures, KarelAST, batch_features, teacher_forcing
+from rl2.shape_checker import ShapeChecker
 from rl2.train_karel_ast_grpo import (
     Config,
     bucket_tree,
@@ -22,7 +22,6 @@ from rl2.train_karel_ast_grpo import (
     load_config,
     predict,
 )
-from rl2.tree_attention import Relation, tree_relations
 
 
 class ModelBatch(NamedTuple):
@@ -101,12 +100,8 @@ def test_trimmed_sequence_matches_full_logits_and_gradients(config: Config, batc
             **params[name],
             "kernel": jax.random.normal(jax.random.key(5), params[name]["kernel"].shape),
         }
-    params["layers_0"] = {
-        **params["layers_0"],
-        "tree_bias": jax.tree.map(
-            lambda value: jax.random.normal(jax.random.key(value.size), value.shape), params["layers_0"]["tree_bias"]
-        ),
-    }
+    for name, array in params["tree_bias_0"].items():
+        params["tree_bias_0"][name] = jax.random.normal(jax.random.key(array.size), array.shape)
 
     def loss(parameters: dict, features: ASTFeatures) -> tuple[jax.Array, jax.Array]:
         logits = state.apply_fn({"params": parameters}, initial, target, features)
@@ -120,155 +115,30 @@ def test_trimmed_sequence_matches_full_logits_and_gradients(config: Config, batc
     chex.assert_trees_all_close(small_grads, full_grads, atol=3e-5, rtol=3e-5)
 
 
-@pytest.mark.parametrize(
-    "use_bias,zero_qk",
-    [
-        pytest.param(False, False, id="content"),
-        pytest.param(True, False, id="content-and-bias"),
-        pytest.param(True, True, id="bias-only"),
-    ],
-)
-def test_bidirectional_attention_matches_numpy_and_excludes_padding(use_bias: bool, zero_qk: bool) -> None:
-    block = _ASTBlock(16, 2, 1, 32, 1, jnp.float32, "xla")
-    x = jax.random.normal(jax.random.key(12), (2, 5, 16))
-    present = jnp.asarray([[True, True, True, False, False], [True, True, True, True, True]])
-    relations = tree_relations(jnp.asarray([[0, 1, 0, 0], [0, 1, 2, 1]], jnp.int32), present[:, 1:])
-    params = block.init(jax.random.key(13), x, present, relations)["params"]
-    params = {**params, "down": {"kernel": jnp.zeros_like(params["down"]["kernel"])}}
-    params["query_norm"]["scale"] = jnp.linspace(0.5, 1.5, 8)
-    params["key_norm"]["scale"] = jnp.linspace(1.5, 0.5, 8)
-    if zero_qk:
-        for name in ("query", "key"):
-            params[name]["kernel"] = jnp.zeros_like(params[name]["kernel"])
-    if use_bias:
-        params["tree_bias"] = jax.tree.map(
-            lambda v: jax.random.normal(jax.random.key(v.size), v.shape), params["tree_bias"]
-        )
-    actual = block.apply({"params": params}, x, present, relations)
-    tables = {name: np.asarray(value) for name, value in params["tree_bias"].items()}
-    bias = tables["relation"][relations.kind]
-    bias += np.where(
-        (relations.kind <= Relation.OTHER)[..., None],
-        tables["distance"][relations.distance] + tables["relative_depth"][relations.relative_depth],
-        0,
-    )
-    bias = np.where((relations.kind != Relation.PADDING)[..., None], bias, 0)
-    normalized = np.asarray(x) / np.sqrt(np.mean(np.asarray(x) ** 2, axis=-1, keepdims=True) + 1e-6)
-    normalized *= np.asarray(params["attention_norm"]["scale"])
-    query = (normalized @ params["query"]["kernel"]).reshape(2, 5, 2, 8)
-    key = (normalized @ params["key"]["kernel"]).reshape(2, 5, 1, 8)
-    value = (normalized @ params["value"]["kernel"]).reshape(2, 5, 1, 8)
-    query = np.asarray(query) / np.sqrt(np.mean(np.asarray(query) ** 2, axis=-1, keepdims=True) + 1e-6)
-    key = np.asarray(key) / np.sqrt(np.mean(np.asarray(key) ** 2, axis=-1, keepdims=True) + 1e-6)
-    query *= np.asarray(params["query_norm"]["scale"])
-    key *= np.asarray(params["key_norm"]["scale"])
-    attended = np.zeros((2, 5, 2, 8), np.float32)
-    for b in range(2):
-        for t in range(5):
-            for h in range(2):
-                scores = np.asarray(key[b, :, 0] @ query[b, t, h]) / np.sqrt(8)
-                scores += bias[b, t, :, h]
-                scores = np.where(present[b], scores, -np.inf)
-                weights = np.exp(scores - scores.max())
-                attended[b, t, h] = weights / weights.sum() @ value[b, :, 0]
-    expected = x + attended.reshape(2, 5, 16) @ params["attention_out"]["kernel"]
-    np.testing.assert_allclose(actual[present], expected[present], rtol=2e-5, atol=2e-6)
-    # With query lengths, padded attention outputs are zero (the residual remains).
-    np.testing.assert_array_equal(actual[~present], x[~present])
-
-    def first_output(inputs: jax.Array) -> jax.Array:
-        chex.assert_shape(inputs, x.shape)
-        chex.assert_type(inputs, jnp.float32)
-        return block.apply({"params": params}, inputs, present, relations)[0, 0].sum()
-
-    gradients = jax.grad(first_output)(x)
-    assert np.linalg.norm(gradients[0, 2]) > 1e-5  # A later present node influences the first position.
-    np.testing.assert_array_equal(gradients[0, 3:], 0)
-
-
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_sequence_lengths_match_explicit_mask_outputs_and_gradients(dtype: jax.typing.DTypeLike) -> None:
-    block = _ASTBlock(16, 2, 1, 32, 1, dtype, "xla")
-    x = jax.random.normal(jax.random.key(31), (3, 6, 16))
-    # Prefix-only, partially filled, and completely filled sequences in one batch.
-    present = jnp.arange(6)[None] < jnp.asarray([1, 3, 6])[:, None]
-    depths = jnp.asarray([[0, 0, 0, 0, 0], [0, 1, 0, 0, 0], [0, 1, 2, 1, 2]], jnp.int32)
-    relations = tree_relations(depths, present[:, 1:])
-    params = block.init(jax.random.key(32), x, present, relations)["params"]
-    params["tree_bias"] = jax.tree.map(
-        lambda v: jax.random.normal(jax.random.key(v.size), v.shape), params["tree_bias"]
-    )
-    attention = jax.nn.dot_product_attention
-
-    def masked_attention(
-        query: jax.Array,
-        key: jax.Array,
-        value: jax.Array,
-        *,
-        bias: jax.Array,
-        query_seq_lengths: jax.Array,
-        key_value_seq_lengths: jax.Array,
-        is_causal: bool,
-        implementation: AttentionType,
-    ) -> jax.Array:
-        chex.assert_rank((query, key, value, bias), 4)
-        chex.assert_type((query, key, value, bias), jnp.floating)
-        chex.assert_shape((query_seq_lengths, key_value_seq_lengths), (3,))
-        chex.assert_type((query_seq_lengths, key_value_seq_lengths), jnp.int32)
-        return attention(
-            query,
-            key,
-            value,
-            bias=bias,
-            mask=present[:, None, None, :],
-            is_causal=is_causal,
-            implementation=implementation,
-        )
-
-    def loss(parameters: dict, inputs: jax.Array) -> tuple[jax.Array, jax.Array]:
-        chex.assert_shape(inputs, x.shape)
-        chex.assert_type(inputs, jnp.float32)
-        output = block.apply({"params": parameters}, inputs, present, relations)
-        live = jnp.where(present[..., None], output, 0)
-        return jnp.square(live).sum(), live
-
-    (_, actual), actual_grads = jax.value_and_grad(loss, argnums=(0, 1), has_aux=True)(params, x)
-    with patch("jax.nn.dot_product_attention", side_effect=masked_attention):
-        (_, expected), expected_grads = jax.value_and_grad(loss, argnums=(0, 1), has_aux=True)(params, x)
-    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
-    for actual_grad, expected_grad in zip(jax.tree.leaves(actual_grads), jax.tree.leaves(expected_grads)):
-        assert np.isfinite(actual_grad).all()
-        np.testing.assert_allclose(actual_grad, expected_grad, rtol=1e-5, atol=1e-5)
-    np.testing.assert_array_equal(actual_grads[1][~present], 0)
-
-
 @pytest.mark.skipif(not any(device.platform == "gpu" for device in jax.devices()), reason="cuDNN requires a GPU")
-def test_cudnn_tree_bias_matches_xla_forward_and_gradients() -> None:
-    # Odd length exercises the cuDNN padding path; different trees exercise
-    # per-example bias gradients rather than a bias shared across the batch.
-    x = jax.random.normal(jax.random.key(3), (2, 5, 32))
-    present = jnp.asarray([[True, True, True, False, False], [True, True, True, True, True]])
-    relations = tree_relations(jnp.asarray([[0, 1, 0, 0], [0, 1, 1, 2]], jnp.int32), present[:, 1:])
-    xla = _ASTBlock(32, 2, 1, 32, 1, jnp.bfloat16, "xla")
-    cudnn = _ASTBlock(32, 2, 1, 32, 1, jnp.bfloat16, "cudnn")
-    params = xla.init(jax.random.key(4), x, present, relations)["params"]
-    params["tree_bias"] = jax.tree.map(
-        lambda v: jax.random.normal(jax.random.key(v.size), v.shape), params["tree_bias"]
-    )
+def test_cudnn_tree_bias_matches_xla_forward_and_gradients(batch: ModelBatch) -> None:
+    model = ASTTransformer(d_model=16, num_heads=2, num_kv_heads=1, num_layers=1, max_nodes=24, dtype=jnp.bfloat16)
+    fused = model.clone(attention_implementation="cudnn")
+    initial, target = batch.initial[:4], batch.target[:4]
+    tree = ASTFeatures(*(field[:4] for field in batch.tree))
+    params = model.init(jax.random.key(4), initial, target, tree)["params"]
+    for name in ("constructor_head", "value_head"):
+        params[name]["kernel"] = jax.random.normal(jax.random.key(5), params[name]["kernel"].shape)
+    for name, array in params["tree_bias_0"].items():
+        params["tree_bias_0"][name] = jax.random.normal(jax.random.key(array.size), array.shape)
 
-    def loss(parameters: dict, block: _ASTBlock) -> jax.Array:
-        output = block.apply({"params": parameters}, x, present, relations)
-        return jnp.where(present[..., None], output**2, 0).mean()
+    def loss(parameters: dict, model: ASTTransformer) -> jax.Array:
+        logits = model.apply({"params": parameters}, initial, target, tree)
+        return jnp.where(tree.action_mask, logits, 0).sum()
 
-    expected, expected_grad = jax.jit(jax.value_and_grad(lambda p: loss(p, xla)))(params)
-    actual, actual_grad = jax.jit(jax.value_and_grad(lambda p: loss(p, cudnn)))(params)
+    expected, expected_grad = jax.jit(jax.value_and_grad(partial(loss, model=model)))(params)
+    actual, actual_grad = jax.jit(jax.value_and_grad(partial(loss, model=fused)))(params)
     np.testing.assert_allclose(actual, expected, rtol=0.02, atol=0.01)
-    for name in params["tree_bias"]:
-        assert np.isfinite(actual_grad["tree_bias"][name]).all()
-        assert np.linalg.norm(actual_grad["tree_bias"][name]) > 0
-        np.testing.assert_allclose(
-            actual_grad["tree_bias"][name], expected_grad["tree_bias"][name], rtol=0.1, atol=0.005
-        )
+    for name in params["tree_bias_0"]:
+        gradient, reference = actual_grad["tree_bias_0"][name], expected_grad["tree_bias_0"][name]
+        assert np.isfinite(gradient).all()
+        assert np.linalg.norm(gradient) > 0
+        np.testing.assert_allclose(gradient, reference, rtol=0.1, atol=0.005)
 
 
 def test_initial_policy_is_uniform_over_typed_actions(config: Config, batch: ModelBatch, state: TrainState) -> None:
@@ -288,10 +158,10 @@ def test_padded_features_do_not_affect_predictions(config: Config, batch: ModelB
     params = dict(state.params)
     for name in ("constructor_head", "value_head"):
         params[name] = {**params[name], "kernel": jax.random.normal(jax.random.key(5), params[name]["kernel"].shape)}
-    params["layers_0"] = dict(params["layers_0"])
-    params["layers_0"]["tree_bias"] = jax.tree.map(
-        lambda v: jax.random.normal(jax.random.key(v.size), v.shape), params["layers_0"]["tree_bias"]
-    )
+    params["tree_bias_0"] = {
+        name: jax.random.normal(jax.random.key(array.size), array.shape)
+        for name, array in params["tree_bias_0"].items()
+    }
     state = state.replace(params=params)
     dirty = ASTFeatures(
         *(np.where(batch.tree.node_mask, array, 999999).astype(np.int32) for array in batch.tree[:5]),
@@ -333,16 +203,15 @@ def test_masked_head_gradients_are_finite_and_learnable(config: Config, batch: M
         "value_embedding",
         "constructor_head",
         "value_head",
-        "layers_0",
+        "backbone",
+        "tree_bias_0",
     ):
         assert any(
             not np.array_equal(a, b)
             for a, b in zip(jax.tree.leaves(initial_params[name]), jax.tree.leaves(state.params[name]))
         )
     for name in ("relation", "distance", "relative_depth"):
-        assert np.linalg.norm(state.params["layers_0"]["tree_bias"][name]) > 0
-    for name in ("query_norm", "key_norm"):
-        assert not np.array_equal(initial_params["layers_0"][name]["scale"], state.params["layers_0"][name]["scale"])
+        assert np.linalg.norm(state.params["tree_bias_0"][name]) > 0
 
 
 def test_sampling_finishes_and_completed_trees_use_safe_dummy_logits(
@@ -384,3 +253,14 @@ def test_parallel_predictions_cover_every_hole_without_frontier(
         else:
             assert probabilities[0, position, 0] == 1
     assert not hasattr(features, "frontier")
+
+
+def test_ast_backbone_accepts_odd_head_width_without_rope(batch: ModelBatch) -> None:
+    model = ASTTransformer(d_model=6, num_heads=2, num_kv_heads=1, num_layers=2, max_nodes=24)
+    initial, target = batch.initial[:1], batch.target[:1]
+    tree = ASTFeatures(*(field[:1] for field in batch.tree))
+    variables = model.init(jax.random.key(41), initial, target, tree)
+    logits = model.apply(variables, initial, target, tree)
+    sc = ShapeChecker(B=1, N=24, A=len(AST_ACTIONS))
+    sc.check(logits, "BNA", jnp.float32)
+    np.testing.assert_array_equal(np.isfinite(logits[..., 1:]), tree.action_mask[..., 1:])
