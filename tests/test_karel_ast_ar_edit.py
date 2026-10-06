@@ -627,33 +627,12 @@ def test_sequence_budget_reserves_complete_replacements(config: edit.Config) -> 
     assert partial.expand(ACTION_ID["End"]).complete
 
 
-def test_more_than_three_edits_fit_sequence_budget(
-    config: edit.Config, state: TrainState, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Four location+leaf edits fill the sequence after the five-token seed prefill.
-    config = replace(config, max_seq_len=13)
-    task = KarelProgramEnv(config.env)
-    pair = task.reset(seed=4)
-    state = edit.create_state(config, pair.initial[None], pair.target[None]).replace(params=state.params)
-
-    def act(logits: jax.Array, key: jax.Array) -> tuple[jax.Array, jax.Array]:
-        chex.assert_shape(logits, (2, 1 + config.max_nodes + len(edit.AST_ACTIONS)))
-        chex.assert_type(logits, jnp.float32)
-        chex.assert_shape(key, ())
-        chex.assert_type(jax.random.key_data(key), jnp.uint32)
-        actions = np.zeros(2, np.int32)
-        for index in range(2):
-            allowed = np.isfinite(logits[index])
-            if allowed[3]:
-                actions[index] = 3  # Preorder statement location.
-            elif allowed[1 + config.max_nodes + ACTION_ID["turnRight"]]:
-                actions[index] = 1 + config.max_nodes + ACTION_ID["turnRight"]
-            else:
-                assert allowed[0]  # Final STOP.
-        actions = jnp.asarray(actions)
-        return actions, edit.action_log_prob(logits, actions)
-
-    monkeypatch.setattr(edit, "act", act)
+def test_disabled_stop_keeps_editing_despite_stop_biased_policy(config: edit.Config, state: TrainState) -> None:
+    # Four location+leaf edits leave one token, too little for another edit.
+    config = replace(config, allow_stop=False)
+    replacement = 1 + config.max_nodes + ACTION_ID["turnRight"]
+    bias = state.params["head"]["bias"].at[0].set(200).at[3].set(100).at[replacement].set(100)
+    state = state.replace(params={**state.params, "head": {**state.params["head"], "bias": bias}})
     batch, _, metrics, _, programs = edit.collect_rollout(
         state,
         edit.KarelASTEditVectorEnv(config.edit_config, 2),
@@ -662,9 +641,10 @@ def test_more_than_three_edits_fit_sequence_budget(
         config,
     )
     assert metrics["charts/edits_mean"] == 4
-    assert metrics["charts/sequence_budget_exhausted_rate"] == 1
     np.testing.assert_array_equal(batch.mask.sum(axis=0), 8)
-    assert metrics["charts/sequence_length_mean"] == config.max_seq_len
+    assert metrics["charts/sequence_length_mean"] == config.max_seq_len - 1
+    assert not batch.legal[..., 0][batch.mask].any()
+    assert np.all(batch.actions[batch.mask] != 0)
     assert all(tree.complete and "turnRight" in tree.tokens() for tree in programs)
     for index in range(2):
         assert batch.actions[batch.mask[:, index], index][-1] == 1 + config.max_nodes + ACTION_ID["turnRight"]
@@ -672,6 +652,18 @@ def test_more_than_three_edits_fit_sequence_budget(
     assert batch.history.events.kind.shape[0] <= config.max_seq_len
     replay = edit.action_log_prob(edit.mask_logits(predict(state, batch.history), batch.legal), batch.actions)
     np.testing.assert_allclose(replay, batch.old_log_probs, atol=2e-6)
+
+
+def test_load_config_stop_option(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("allow_stop: false\n")
+    config = edit.load_config(path)
+    assert not config.allow_stop and not config.edit_config.allow_stop
+    path.write_text("{}\n")
+    assert edit.load_config(path).allow_stop  # Existing saved configurations retain STOP.
+    path.write_text('allow_stop: "false"\n')
+    with pytest.raises(TypeError, match="allow_stop must be a boolean"):
+        edit.load_config(path)
 
 
 @pytest.mark.parametrize(

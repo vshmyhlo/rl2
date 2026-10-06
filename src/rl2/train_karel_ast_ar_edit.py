@@ -12,6 +12,8 @@ eight feedback scalars: score, success, runtime error, execution limit,
 normalized ticks, source length, last score difference, and remaining sequence budget.
 KarelASTEditEnv owns AST edits, masks, execution, rewards, and termination. The
 policy infers the current program from its seed and edit history.
+Set allow_stop=False to mask STOP and keep editing until the remaining sequence
+budget cannot fit another complete replacement.
 
 Reward timing and example trajectories
 --------------------------------------
@@ -124,6 +126,7 @@ class Config:
     max_nodes: int = 128  # AST node budget for grammar masking; also sizes edit locations.
     max_depth: int = 64  # AST depth limit for grammar masking and penalty normalization.
     max_seq_len: int = 256  # Total seed tokens, one initial report, and action/result tokens per episode.
+    allow_stop: bool = True  # False keeps editing until no complete edit fits the sequence budget.
 
     # Rollout groups and update batching.
     num_tasks: int = 8
@@ -216,7 +219,9 @@ class Config:
     @property
     def edit_config(self) -> EditConfig:
         """Build the independent editing environment's validated settings."""
-        return EditConfig(self.env, self.max_nodes, self.max_depth, self.max_seq_len, self.seed_program)
+        return EditConfig(
+            self.env, self.max_nodes, self.max_depth, self.max_seq_len, self.seed_program, allow_stop=self.allow_stop
+        )
 
 
 PAD_EVENT, SEED_EVENT, ACTION_EVENT, UPDATE_EVENT = range(4)
@@ -436,6 +441,8 @@ def load_config(path: str | Path) -> Config:
     settings = yaml.safe_load(read_bytes(str(path))) or {}
     # Older checkpoints stored the retired gradient-accumulation setting.
     settings.pop("replay_batch_size", None)
+    if "allow_stop" in settings and type(settings["allow_stop"]) is not bool:
+        raise TypeError("allow_stop must be a boolean")
     if "env" in settings:
         settings["env"] = KarelConfig(**settings["env"])
     return Config(**settings)

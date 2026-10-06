@@ -40,6 +40,7 @@ class EditConfig:
     max_depth: int = 64
     max_seq_len: int = 256
     seed_program: str = "DEF run m( turnLeft m)"
+    allow_stop: bool = True
 
     def __post_init__(self) -> None:
         """Reject invalid sequence budgets and seeds that violate the AST limits."""
@@ -51,6 +52,8 @@ class EditConfig:
         seed_tree(self)
         if self.max_seq_len <= self.prefill_length:
             raise ValueError("max_seq_len must fit the seed, initial update, and at least one action")
+        if not self.allow_stop and self.max_seq_len < self.prefill_length + 2:
+            raise ValueError("max_seq_len must fit at least one complete edit when allow_stop=False")
 
     @property
     def prefill_length(self) -> int:
@@ -183,9 +186,13 @@ def observe(
 ) -> Observation:
     """Build host feedback and action masks that reserve enough budget to finish edits."""
     chex.assert_scalar_in(tokens_left, 0, config.max_seq_len)
+    sc = ShapeChecker(
+        H=config.env.height, W=config.env.width, C=6, V=1 + config.max_nodes + len(AST_ACTIONS), F=FEEDBACK_SIZE
+    )
+    sc.check([pair.initial, pair.target, result.output], "HWC", dtype=np.int32)
     legal = np.zeros(1 + config.max_nodes + len(AST_ACTIONS), np.bool_)
     if tree.complete:
-        legal[0] = True
+        legal[0] = config.allow_stop
         # Reserve the location action plus the cheapest typed replacement.
         # In this grammar minimum-node completions also minimize source length.
         for position, index in enumerate(tree.preorder()):
@@ -213,6 +220,8 @@ def observe(
         ],
         np.float32,
     )
+    sc.check(legal, "V", dtype=np.bool_)
+    sc.check(feedback, "F", dtype=np.float32)
     return Observation(pair.initial, pair.target, result.output, feedback, legal)
 
 
@@ -233,6 +242,8 @@ class KarelASTEditEnv:
     preorder locations 1..max_nodes, or offset grammar IDs. A completed edit
     refreshes execution feedback and yields its signed score improvement.
     STOP terminates normally; completing an edit at the sequence limit truncates.
+    With allow_stop=False, STOP is illegal and completion also truncates when
+    the remaining budget cannot fit another edit.
     Seed tokens, the initial report, and action/result tokens share max_seq_len.
     Every step costs one token; execution feedback is part of that action's
     resulting observation, with no additional token or pause.
@@ -299,12 +310,12 @@ class KarelASTEditEnv:
                     reward = self.result.score - previous_score
                     reevaluated = True
                     self.completed_edits += 1
-        truncated = self.remaining == 0 and not terminated
-        self.done = terminated or truncated
-        if self.done and not self.tree.complete:
-            raise RuntimeError("Action masks allowed an unfinished terminal program")
         # Incomplete edits retain the last execution's delta as feedback. Their
         # actual transition reward is still zero.
         delta = reward if reevaluated else float(self.observation.feedback[-2])
         self.observation = observe(self.tree, self.pair, self.result, self.remaining, self.config, delta)
+        truncated = not terminated and (self.remaining == 0 or not self.observation.legal.any())
+        self.done = terminated or truncated
+        if self.done and not self.tree.complete:
+            raise RuntimeError("Action masks allowed an unfinished terminal program")
         return EditStep(self.observation, reward, terminated, truncated, reevaluated)

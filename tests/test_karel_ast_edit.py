@@ -113,6 +113,40 @@ def test_seed_prefill_leaves_only_stop(config: editing.EditConfig) -> None:
     assert env.tree.complete and env.completed_edits == 0
 
 
+@pytest.mark.parametrize("max_seq_len", [9, 10], ids=["exact-budget", "one-unusable-token"])
+def test_disabled_stop_continues_until_no_edit_fits(config: editing.EditConfig, max_seq_len: int) -> None:
+    config = replace(config, allow_stop=False, max_seq_len=max_seq_len)
+    env = editing.KarelASTEditEnv(config)
+    observation = env.reset(task=turning_task(config))
+    assert not observation.legal[0]
+    with pytest.raises(gym.error.InvalidAction):
+        env.step(0)
+    assert env.step(3).reward == 0
+    improved = env.step(1 + config.max_nodes + ACTION_ID["turnRight"])
+    assert env.result is not None and env.result.success
+    assert not improved.terminated and not improved.truncated
+    assert not improved.observation.legal[0]
+    assert env.step(3).reward == 0
+    regressed = env.step(1 + config.max_nodes + ACTION_ID["turnLeft"])
+    assert regressed.truncated and not regressed.terminated
+    assert regressed.reevaluated and regressed.reward == pytest.approx(-improved.reward)
+    assert not regressed.observation.legal.any()
+    assert env.done and env.tree.complete and env.completed_edits == 2
+    assert env.remaining == max_seq_len - 9
+    with pytest.raises(gym.error.ResetNeeded):
+        env.step(3)
+
+
+def test_disabled_stop_requires_budget_for_an_edit(config: editing.EditConfig) -> None:
+    with pytest.raises(ValueError, match="complete edit"):
+        replace(config, allow_stop=False, max_seq_len=config.prefill_length + 1)
+    minimum = replace(config, allow_stop=False, max_seq_len=config.prefill_length + 2)
+    env = editing.KarelASTEditEnv(minimum)
+    assert env.reset(task=turning_task(minimum)).legal[3]
+    env.step(3)
+    assert env.step(1 + minimum.max_nodes + ACTION_ID["turnRight"]).truncated
+
+
 @pytest.mark.parametrize(
     "source,nodes,depth,ticks,error",
     [
