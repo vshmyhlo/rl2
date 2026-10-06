@@ -4,7 +4,7 @@ The internal block combines RoPE attention with pre-RMSNorm and SwiGLU
 residual layers; the internal ``Transformer`` base repeats it and adds a final RMSNorm.
 ``ARTransformer`` implements the autoregressive sequence/carry contract;
 ``BDTransformer`` exposes bidirectional sequence outputs without carry.
-Both specialized stacks require explicit ``x_len`` arrays.
+Both specialized stacks require explicit ``x_len`` arrays for sequence calls.
 The attention and SwiGLU architecture follow Meta's reference:
 https://github.com/meta-llama/llama3/blob/main/llama/model.py
 MLP width is ``round(dim * mlp_expansion)``, with a default expansion of 2.
@@ -35,10 +35,12 @@ the caller applies ``jax.lax.stop_gradient``.
 ``BDTransformer`` attends bidirectionally over each complete valid sequence.
 Its sequence call accepts no carry and returns only the output array.
 
-Both public models require int32 ``x_len[batch]`` to delimit each left-aligned
+Sequence calls require int32 ``x_len[batch]`` to delimit each left-aligned
 valid prefix; remaining input tokens are right padding. Lengths must be between
 zero and the input length. Padded outputs are zero. Only valid tokens advance
 an autoregressive cache and its RoPE positions; omit carry to start fresh.
+Autoregressive steps accept an optional boolean ``active[batch]`` mask, defaulting
+to all active. Inactive examples return zero output and preserve their carry.
 
 ``attention_implementation="xla"`` is portable (the default). Select ``"cudnn"``
 with float16/bfloat16 and a supported NVIDIA GPU for JAX's cuDNN fused attention.
@@ -54,7 +56,7 @@ Example::
     x_len = jnp.full((8,), 16, jnp.int32)
     variables = model.init(jax.random.key(0), x, x_len)
     carry, y = model.apply(variables, x, x_len)
-    carry, next_y = model.apply(variables, x[:, 0], jnp.ones((8,), jnp.int32), carry, method=model.step)
+    carry, next_y = model.apply(variables, x[:, 0], carry, method=model.step)
 """
 
 import math
@@ -480,20 +482,24 @@ class _TransformerBlock(nn.Module):
     def step(
         self,
         x: jax.Array,
-        x_len: jax.Array | None = None,
         carry: TransformerCarry | None = None,
+        *,
+        active: jax.Array | None = None,
     ) -> tuple[TransformerCarry, jax.Array]:
-        """Process [batch,dim] with optional int32 [batch] x_len of 0 or 1.
+        """Process [batch,dim] with an optional boolean active[batch] mask.
 
-        Zero lengths skip the example and return zero output. Requires causal=True.
+        All examples advance by default. Inactive examples return zero output
+        and preserve carry. Requires causal=True.
         """
         if not self.causal:
             raise ValueError("step() requires causal=True; use __call__() for bidirectional attention")
         sc = ShapeChecker(D=self.dim)
         sc.check(x, "BD")
         chex.assert_type(x, jnp.floating)
-        if x_len is not None:
-            sc.check(x_len, "B", jnp.int32)
+        if active is not None:
+            sc.check(active, "B", jnp.bool_)
+        x_len = jnp.ones(sc["B"], jnp.int32) if active is None else active.astype(jnp.int32)
+        sc.check(x_len, "B", jnp.int32)
         carry, y = self(x[:, None], x_len, carry)
         output = y[:, 0]
         sc.check(output, "BD", jnp.result_type(x.dtype, self.dtype))
@@ -601,20 +607,24 @@ class Transformer(nn.Module):
     def step(
         self,
         x: jax.Array,
-        x_len: jax.Array | None = None,
         carry: TransformerStackCarry | None = None,
+        *,
+        active: jax.Array | None = None,
     ) -> tuple[TransformerStackCarry, jax.Array]:
-        """Process [batch,dim] with optional int32 [batch] x_len of 0 or 1.
+        """Process [batch,dim] with an optional boolean active[batch] mask.
 
-        Zero lengths skip the example and return zero output. Requires causal=True.
+        All examples advance by default. Inactive examples return zero output
+        and preserve carry. Requires causal=True.
         """
         if not self.causal:
             raise ValueError("step() requires causal=True; use __call__() for bidirectional attention")
         sc = ShapeChecker(D=self.dim)
         sc.check(x, "BD")
         chex.assert_type(x, jnp.floating)
-        if x_len is not None:
-            sc.check(x_len, "B", jnp.int32)
+        if active is not None:
+            sc.check(active, "B", jnp.bool_)
+        x_len = jnp.ones(sc["B"], jnp.int32) if active is None else active.astype(jnp.int32)
+        sc.check(x_len, "B", jnp.int32)
         carry, y = self(x[:, None], x_len, carry)
         output = y[:, 0]
         sc.check(output, "BD", self.dtype)
@@ -622,7 +632,7 @@ class Transformer(nn.Module):
 
 
 class ARTransformer(Transformer, ARSequenceModel[TransformerStackCarry]):
-    """Autoregressive stack with required valid lengths and optional KV carry.
+    """Autoregressive stack with sequence lengths, step activity masks, and KV carry.
 
     Full sequences, chunks, and repeated steps produce equivalent outputs and
     final carry, whether starting fresh or continuing supplied history.
@@ -647,21 +657,6 @@ class ARTransformer(Transformer, ARSequenceModel[TransformerStackCarry]):
         sc.check(x_len, "B", jnp.int32)
         carry, output = super().__call__(x, x_len, carry)
         sc.check(output, "BTD", self.dtype)
-        return carry, output
-
-    def step(
-        self,
-        x: jax.Array,
-        x_len: jax.Array,
-        carry: TransformerStackCarry | None = None,
-    ) -> tuple[TransformerStackCarry, jax.Array]:
-        """Process [batch,dim]; int32 [batch] lengths of zero skip examples."""
-        sc = ShapeChecker(D=self.dim)
-        sc.check(x, "BD")
-        chex.assert_type(x, jnp.floating)
-        sc.check(x_len, "B", jnp.int32)
-        carry, output = super().step(x, x_len, carry)
-        sc.check(output, "BD", self.dtype)
         return carry, output
 
 

@@ -465,14 +465,14 @@ def test_full_chunks_and_scanned_steps_agree(stack: bool) -> None:
     assert_carry_close(carry, final)
 
     def step(state: Carry, inputs: tuple[jax.Array, jax.Array]) -> tuple[Carry, jax.Array]:
-        token, length = inputs
+        token, active = inputs
         sc = ShapeChecker(B=2, D=8)
         sc.check(token, "BD", jnp.float32)
-        sc.check(length, "B", jnp.int32)
-        return model.apply(variables, token, length, state, method=model.step)
+        sc.check(active, "B", jnp.bool_)
+        return model.apply(variables, token, state, active=active, method=model.step)
 
-    lengths = (jnp.arange(5)[:, None] < x_len).astype(jnp.int32)
-    carry, actual = jax.jit(partial(jax.lax.scan, step))(model.initial_carry(2), (jnp.swapaxes(x, 0, 1), lengths))
+    active = jnp.arange(5)[:, None] < x_len
+    carry, actual = jax.jit(partial(jax.lax.scan, step))(model.initial_carry(2), (jnp.swapaxes(x, 0, 1), active))
     np.testing.assert_allclose(jnp.swapaxes(actual, 0, 1), expected, rtol=2e-5, atol=5e-6)
     assert_carry_close(carry, final)
     fresh, single = model.apply(variables, x[:, 0], method=model.step)
@@ -625,10 +625,12 @@ def test_sequence_and_step_validate_inputs_before_projections(stack: bool, step:
         model.apply({}, x[None], method=method)
     with pytest.raises(AssertionError):
         model.apply({}, x.astype(jnp.int32), method=method)
+    argument = "active" if step else "x_len"
+    dtype = jnp.bool_ if step else jnp.int32
     with pytest.raises(AssertionError):
-        model.apply({}, x, x_len=jnp.zeros((1,), jnp.float32), method=method)
+        model.apply({}, x, **{argument: jnp.zeros((1,), jnp.float32)}, method=method)
     with pytest.raises(AssertionError):
-        model.apply({}, x, x_len=jnp.zeros((1, 1), jnp.int32), method=method)
+        model.apply({}, x, **{argument: jnp.zeros((1, 1), dtype)}, method=method)
     if stack:
         with pytest.raises(ValueError, match="one TransformerCarry per layer"):
             model.apply({}, x, carry=(), method=method)

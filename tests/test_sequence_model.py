@@ -10,7 +10,7 @@ class CallOnly(ARSequenceModel[None]):
 
 
 class StepOnly(ARSequenceModel[None]):
-    def step(self, x: jax.Array, x_len: jax.Array, carry: None = None) -> tuple[None, jax.Array]:
+    def step(self, x: jax.Array, carry: None = None, *, active: jax.Array | None = None) -> tuple[None, jax.Array]:
         raise NotImplementedError("Test stub; only method completeness is exercised")
 
 

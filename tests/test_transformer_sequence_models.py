@@ -54,7 +54,7 @@ def test_autoregressive_sequence_chunks_and_steps_match_from_fresh_and_supplied_
         state = initial
         outputs = []
         for t in range(3):
-            state, output = step(variables, padded[:, t], (t < x_len).astype(jnp.int32), state)
+            state, output = step(variables, padded[:, t], state, active=t < x_len)
             sc.check(output, "BD", jnp.float32)
             outputs.append(output)
         chex.assert_trees_all_close((state, jnp.stack(outputs, 1)), (final, expected), atol=2e-6)
@@ -70,8 +70,14 @@ def test_autoregressive_sequence_chunks_and_steps_match_from_fresh_and_supplied_
     _, perturbed = apply(variables, x.at[:, -1].add(10), x_len)
     _, baseline = apply(variables, x, x_len)
     np.testing.assert_allclose(perturbed[:, :-1], baseline[:, :-1], atol=2e-6)
-    with pytest.raises(ValueError, match="x_len must be between"):
-        model.apply(variables, x[:, 0], jnp.array([0, 1, 2], jnp.int32), method=model.step)
+    # Omitted active advances everyone, including examples skipped previously.
+    for initial in (None, supplied):
+        actual = step(variables, x[:, 0], initial)
+        expected_step = apply(variables, x[:, :1], jnp.ones((3,), jnp.int32), initial)
+        chex.assert_trees_all_close(actual, (expected_step[0], expected_step[1][:, 0]), atol=2e-6)
+    skipped, zero = step(variables, padded[:, 0], final, active=jnp.zeros((3,), jnp.bool_))
+    chex.assert_trees_all_equal(skipped, final)
+    np.testing.assert_array_equal(zero, 0)
 
 
 def test_bidirectional_valid_prefixes_and_gradients_ignore_padding() -> None:
@@ -107,7 +113,7 @@ def test_bidirectional_valid_prefixes_and_gradients_ignore_padding() -> None:
     np.testing.assert_array_equal(gradient[~valid], 0)
     assert np.linalg.norm(gradient[valid]) > 0
     with pytest.raises(ValueError, match="requires causal=True"):
-        model.apply(variables, x[:, 0], jnp.ones((3,), jnp.int32), method=model.step)
+        model.apply(variables, x[:, 0], method=model.step)
     for lengths in (jnp.array([-1, 2, 3], jnp.int32), jnp.array([0, 2, 4], jnp.int32)):
         with pytest.raises(ValueError, match="x_len must be between"):
             model.apply(variables, x, lengths)
@@ -122,3 +128,11 @@ def test_specialized_stacks_validate_lengths_and_fixed_direction(model_type: typ
             model.apply({}, x, lengths)
     with pytest.raises(ValueError, match=f"{model_type.__name__} requires causal="):
         model.clone(causal=not model.causal).apply({}, x, jnp.array([3], jnp.int32))
+
+
+def test_autoregressive_step_validates_active_metadata() -> None:
+    model = ARTransformer(4, 1, num_heads=1, max_seq_len=3)
+    x = jnp.zeros((1, 4), jnp.float32)
+    for active in (jnp.ones((1,), jnp.int32), jnp.ones((1, 1), jnp.bool_), jnp.ones((2,), jnp.bool_)):
+        with pytest.raises(AssertionError):
+            model.apply({}, x, active=active, method=model.step)

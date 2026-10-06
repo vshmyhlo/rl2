@@ -45,8 +45,8 @@ class ARSequenceModel[CarryT](ABC):
     ``x[batch,time,dim]``, lengths ``x_len[batch]``, and initial carry ``c``,
     calling ``self(x, x_len, c)`` must produce the same outputs and final carry
     as processing ``x[:, t]`` in increasing time order with ``step``, passing
-    each returned carry to the next step. At time ``t``, the step length is
-    ``(t < x_len).astype(int32)``; stack its outputs along axis 1.
+    each returned carry to the next step. At time ``t``, pass the boolean
+    mask ``active=t < x_len``; stack the step outputs along axis 1.
 
     This invariant applies both from scratch (``c=None``) and from any valid
     supplied carry. Both methods must support either starting mode. Splitting
@@ -92,15 +92,19 @@ class ARSequenceModel[CarryT](ABC):
     def step(
         self,
         x: jax.Array,
-        x_len: jax.Array,
         carry: CarryT | None = None,
+        *,
+        active: jax.Array | None = None,
     ) -> tuple[CarryT, jax.Array]:
         """Process [batch,dim], returning (updated carry, same-shaped output).
 
-        Required int32 lengths have shape [batch] and must be 0 or 1. A zero
-        length produces zero output and preserves that example's carry.
+        Optional boolean active[batch] selects examples to advance; omission
+        means all examples are active. Inactive inputs are ignored, produce
+        zero output, and preserve that example's carry. With no supplied carry,
+        inactive examples retain the model's fresh initial carry.
         Omitted carry starts fresh; supplied carry continues prior history.
-        Equivalent to ``__call__`` with a singleton time axis, removed from
-        the output. Repeated steps must satisfy the class equivalence invariant.
+        Equivalent to ``__call__`` with a singleton time axis and int32 lengths
+        obtained from active (or all ones), removing that axis from the output.
+        Repeated steps must satisfy the class equivalence invariant.
         """
         raise NotImplementedError
