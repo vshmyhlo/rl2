@@ -118,7 +118,9 @@ class EditActorCritic(edit.EditTransformer):
         )
         inputs = self.encode_events(history.events, history.initial, history.target)
         sc.check(inputs, "TBD", dtype=self.dtype)
-        carry, features = self.backbone(jnp.swapaxes(inputs, 0, 1))
+        x_len = jnp.full(sc["B"], inputs.shape[0], jnp.int32)
+        sc.check(x_len, "B", jnp.int32)
+        carry, features = self.backbone(jnp.swapaxes(inputs, 0, 1), x_len)
         features = jnp.swapaxes(features, 0, 1)
         sc.check(features, "TBD", dtype=self.dtype)
         logits = self.head(features).astype(jnp.float32)
@@ -132,16 +134,16 @@ class EditActorCritic(edit.EditTransformer):
         return carry, logits[-1], values[-1]
 
     def step(self, event: Events, carry: EditCarry) -> ModelOutput:
-        if carry is None:
-            raise ValueError("Use prefill before step")
         sc = ShapeChecker(C=6, F=FEEDBACK_SIZE, D=self.d_model, V=1 + self.max_nodes + len(AST_ACTIONS))
         sc.check([carry.initial, carry.target], "BHWC", dtype=jnp.int32)
         sc.check([event.kind, event.value], "B", dtype=jnp.int32)
         sc.check(event.output, "BHWC", dtype=jnp.int32)
         sc.check(event.feedback, "BF", dtype=jnp.float32)
         sequence = jax.tree.map(partial(jnp.expand_dims, axis=0), event)
+        x_len = jnp.ones(sc["B"], jnp.int32)
+        sc.check(x_len, "B", jnp.int32)
         transformer, features = self.backbone.step(
-            self.encode_events(sequence, carry.initial, carry.target)[0], carry.transformer
+            self.encode_events(sequence, carry.initial, carry.target)[0], x_len, carry.transformer
         )
         sc.check(features, "BD", dtype=self.dtype)
         logits = self.head(features).astype(jnp.float32)

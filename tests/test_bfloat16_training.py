@@ -11,9 +11,9 @@ from flax.training.train_state import TrainState
 
 from rl2.mamba3 import Mamba3, Mamba3Carry, Mamba3Stack, Mamba3StackCarry
 from rl2.shape_checker import ShapeChecker
-from rl2.transformer import TransformerBlock, TransformerCarry, TransformerStack, TransformerStackCarry
+from rl2.transformer import ARTransformer, TransformerCarry, TransformerStackCarry, _TransformerBlock
 
-type Model = Mamba3 | Mamba3Stack | TransformerBlock | TransformerStack
+type Model = Mamba3 | Mamba3Stack | _TransformerBlock | ARTransformer
 type Carry = Mamba3Carry | Mamba3StackCarry | TransformerCarry | TransformerStackCarry
 type Parameters = dict[str, Any]
 type LossOutput = tuple[jax.Array, tuple[Carry, jax.Array]]
@@ -27,7 +27,7 @@ type LossOutput = tuple[jax.Array, tuple[Carry, jax.Array]]
             Mamba3(8, d_state=8, headdim=4, mimo_rank=2, outproj_norm=True, dtype=jnp.bfloat16), id="mamba-mimo"
         ),
         pytest.param(
-            TransformerBlock(8, num_heads=2, num_kv_heads=1, max_seq_len=6, dtype=jnp.bfloat16), id="transformer"
+            _TransformerBlock(8, num_heads=2, num_kv_heads=1, max_seq_len=6, dtype=jnp.bfloat16), id="transformer"
         ),
         *[
             pytest.param(
@@ -46,11 +46,11 @@ type LossOutput = tuple[jax.Array, tuple[Carry, jax.Array]]
             for residual_fp32 in (True, False)
         ],
         pytest.param(
-            TransformerStack(8, 2, num_heads=2, num_kv_heads=1, max_seq_len=6, dtype=jnp.bfloat16),
+            ARTransformer(8, 2, num_heads=2, num_kv_heads=1, max_seq_len=6, dtype=jnp.bfloat16),
             id="transformer-stack",
         ),
         pytest.param(
-            TransformerStack(
+            ARTransformer(
                 16,
                 2,
                 num_heads=2,
@@ -69,12 +69,15 @@ type LossOutput = tuple[jax.Array, tuple[Carry, jax.Array]]
 )
 def test_bfloat16_chunked_gradients_and_adam_training(model: Model) -> None:
     """Train with BF16 inputs/compute and FP32 parameters, gradients and Adam state."""
-    batch_major = isinstance(model, (TransformerBlock, TransformerStack))
+    batch_major = isinstance(model, (_TransformerBlock, ARTransformer))
     dim = model.dim if batch_major else model.d_model
     x = jax.random.normal(jax.random.key(20), (6, 2, dim)).astype(jnp.bfloat16)
     target = jax.random.normal(jax.random.key(21), x.shape)
     starts = jnp.zeros((6, 2), jnp.bool_).at[4, 0].set(True)
-    params = model.init(jax.random.key(22), jnp.swapaxes(x, 0, 1) if batch_major else x)["params"]
+    if batch_major:
+        params = model.init(jax.random.key(22), jnp.swapaxes(x, 0, 1), jnp.full((2,), 6, jnp.int32))["params"]
+    else:
+        params = model.init(jax.random.key(22), x)["params"]
 
     def apply_sequence(
         parameters: Parameters, inputs: jax.Array, resets: jax.Array, carry: Carry | None = None
@@ -83,7 +86,9 @@ def test_bfloat16_chunked_gradients_and_adam_training(model: Model) -> None:
         sc.check(inputs, "TBD", jnp.bfloat16)
         sc.check(resets, "TB", jnp.bool_)
         if batch_major:
-            carry, output = model.apply({"params": parameters}, jnp.swapaxes(inputs, 0, 1), carry=carry)
+            x_len = jnp.full(sc["B"], inputs.shape[0], jnp.int32)
+            sc.check(x_len, "B", jnp.int32)
+            carry, output = model.apply({"params": parameters}, jnp.swapaxes(inputs, 0, 1), x_len, carry)
             return carry, jnp.swapaxes(output, 0, 1)
         return model.apply({"params": parameters}, inputs, carry, resets)
 

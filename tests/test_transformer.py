@@ -9,12 +9,12 @@ import pytest
 
 from rl2.shape_checker import ShapeChecker
 from rl2.transformer import (
-    TransformerBlock,
+    Transformer,
     TransformerCarry,
-    TransformerStack,
     TransformerStackCarry,
     _attention,
     _rope,
+    _TransformerBlock,
 )
 
 type Carry = TransformerCarry | TransformerStackCarry
@@ -96,12 +96,12 @@ def test_attention_rejects_empty_dimensions(shape: tuple[int, ...]) -> None:
 @pytest.mark.parametrize("num_layers", [0, -1])
 def test_stack_initial_carry_rejects_invalid_layer_count(num_layers: int) -> None:
     with pytest.raises((ValueError, TypeError, AssertionError)):
-        TransformerStack(4, num_layers, num_heads=1, max_seq_len=2).initial_carry(1)
+        Transformer(4, num_layers, num_heads=1, max_seq_len=2).initial_carry(1)
 
 
 @pytest.mark.parametrize("stack", [False, True])
 def test_empty_sequence_is_rejected_before_projections(stack: bool) -> None:
-    model = TransformerStack(4, 1, num_heads=1) if stack else TransformerBlock(4, num_heads=1)
+    model = Transformer(4, 1, num_heads=1) if stack else _TransformerBlock(4, num_heads=1)
     with pytest.raises((ValueError, AssertionError)):
         model.apply({}, jnp.zeros((1, 0, 4), jnp.float32))
 
@@ -132,7 +132,7 @@ def test_rope_matches_llama_adjacent_pairs_in_float32(dtype: jax.typing.DTypeLik
 @pytest.mark.parametrize("input_dtype", [jnp.bfloat16, jnp.float16, jnp.float32])
 def test_block_preserves_residual_dtype(input_dtype: jax.typing.DTypeLike) -> None:
     compute_dtype = jnp.bfloat16 if input_dtype == jnp.float32 else input_dtype
-    block = TransformerBlock(8, mlp_expansion=2.0, num_heads=2, max_seq_len=2, dtype=compute_dtype)
+    block = _TransformerBlock(8, mlp_expansion=2.0, num_heads=2, max_seq_len=2, dtype=compute_dtype)
     x = jax.random.normal(jax.random.key(29), (1, 2, 8)).astype(input_dtype)
     variables = block.init(jax.random.key(30), x, None, None)
     carry, output = jax.jit(block.apply)(variables, x, None, None)
@@ -206,7 +206,7 @@ def reference_block(
 
 @pytest.mark.parametrize("kv_heads", [1, 2, 4])
 def test_attention_matches_numpy_reference(kv_heads: int) -> None:
-    model = TransformerBlock(
+    model = _TransformerBlock(
         16, num_heads=4, num_kv_heads=kv_heads, max_seq_len=9, rope_theta=137.0, initializer_range=0.2
     )
     x = jax.random.normal(jax.random.key(1), (2, 9, 16))
@@ -227,7 +227,7 @@ def test_attention_matches_numpy_reference(kv_heads: int) -> None:
 
 
 def test_norm_epsilon_and_full_history() -> None:
-    model = TransformerBlock(8, num_heads=2, num_kv_heads=1, max_seq_len=4, norm_epsilon=1e-4)
+    model = _TransformerBlock(8, num_heads=2, num_kv_heads=1, max_seq_len=4, norm_epsilon=1e-4)
     x = jax.random.normal(jax.random.key(23), (1, 4, 8)) * 0.01
     variables = model.init(jax.random.key(24), x)
     carry, actual = model.apply(variables, x[:, :3])
@@ -252,7 +252,7 @@ def test_norm_epsilon_and_full_history() -> None:
 
 
 def test_noncausal_padded_and_cached_attention_matches_reference() -> None:
-    model = TransformerBlock(8, num_heads=2, num_kv_heads=1, max_seq_len=6, initializer_range=0.2, causal=False)
+    model = _TransformerBlock(8, num_heads=2, num_kv_heads=1, max_seq_len=6, initializer_range=0.2, causal=False)
     x = jax.random.normal(jax.random.key(33), (2, 5, 8))
     x_len = jnp.array([3, 5], jnp.int32)
     sc = ShapeChecker(B=2, T=5, D=8, C=6, K=1, F=4)
@@ -279,7 +279,7 @@ def test_noncausal_padded_and_cached_attention_matches_reference() -> None:
 @pytest.mark.parametrize("stack", [False, True], ids=["block", "stack"])
 def test_noncausal_step_is_rejected_before_projections(stack: bool) -> None:
     kwargs = {"dim": 4, "num_heads": 1, "max_seq_len": 2, "causal": False}
-    model = TransformerStack(**kwargs, num_layers=1) if stack else TransformerBlock(**kwargs)
+    model = Transformer(**kwargs, num_layers=1) if stack else _TransformerBlock(**kwargs)
     x = jnp.zeros((1, 4), jnp.float32)
     sc = ShapeChecker(B=1, D=4)
     sc.check(x, "BD", jnp.float32)
@@ -292,7 +292,7 @@ def test_noncausal_step_is_rejected_before_projections(stack: bool) -> None:
 
 @pytest.mark.parametrize("compiled", [False, True])
 def test_cache_capacity_and_length_validation(compiled: bool) -> None:
-    model = TransformerBlock(4, num_heads=1, max_seq_len=3)
+    model = _TransformerBlock(4, num_heads=1, max_seq_len=3)
     x = jax.random.normal(jax.random.key(25), (1, 4, 4))
     variables = model.init(jax.random.key(26), x[:, :1])
     apply = jax.jit(model.apply) if compiled else model.apply
@@ -335,13 +335,13 @@ def test_cache_capacity_and_length_validation(compiled: bool) -> None:
     ],
 )
 def test_mlp_expansion_width(kwargs: dict[str, Any], width: int) -> None:
-    block = TransformerBlock(8, num_heads=2, **kwargs)
-    stack = TransformerStack(8, 1, num_heads=2, **kwargs)
+    block = _TransformerBlock(8, num_heads=2, **kwargs)
+    stack = Transformer(8, 1, num_heads=2, **kwargs)
     assert block._mlp_width() == stack._mlp_width() == stack._make_block()._mlp_width() == width
 
 
 def test_mlp_shapes_and_norm_defaults() -> None:
-    model = TransformerStack(8, 1, num_heads=2, max_seq_len=1, mlp_expansion=1.45)
+    model = Transformer(8, 1, num_heads=2, max_seq_len=1, mlp_expansion=1.45)
     width = 12
     x = jnp.ones((1, 1, 8))
     variables = model.init(jax.random.key(27), x)
@@ -355,8 +355,8 @@ def test_mlp_shapes_and_norm_defaults() -> None:
 
 
 def test_transformer_defaults() -> None:
-    block = TransformerBlock(dim=8, num_heads=2)
-    stack = TransformerStack(dim=8, num_layers=1, num_heads=2)
+    block = _TransformerBlock(dim=8, num_heads=2)
+    stack = Transformer(dim=8, num_layers=1, num_heads=2)
     assert block.dim == stack.dim == stack._make_block().dim == 8
     assert block.norm_epsilon == stack.norm_epsilon == 1e-5
     assert block.rope_theta == stack.rope_theta == stack._make_block().rope_theta == 10000.0
@@ -366,7 +366,7 @@ def test_transformer_defaults() -> None:
 
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
 def test_stack_matches_llama_reference_with_final_norm(causal: bool) -> None:
-    model = TransformerStack(
+    model = Transformer(
         8,
         2,
         num_heads=2,
@@ -410,15 +410,15 @@ def test_stack_matches_llama_reference_with_final_norm(causal: bool) -> None:
 @pytest.mark.parametrize("expansion", [0.0, -1.0, float("inf"), float("nan"), 0.01])
 def test_invalid_mlp_expansion(expansion: float) -> None:
     for model in (
-        TransformerBlock(8, num_heads=2, mlp_expansion=expansion),
-        TransformerStack(8, 1, num_heads=2, mlp_expansion=expansion),
+        _TransformerBlock(8, num_heads=2, mlp_expansion=expansion),
+        Transformer(8, 1, num_heads=2, mlp_expansion=expansion),
     ):
         with pytest.raises((ValueError, AssertionError)):
             model._mlp_width()
 
 
 def test_projection_initialization_is_normal_and_independent_of_depth() -> None:
-    model = TransformerStack(32, 2, num_heads=4, num_kv_heads=2, max_seq_len=1)
+    model = Transformer(32, 2, num_heads=4, num_kv_heads=2, max_seq_len=1)
     x = jnp.zeros((1, 1, 32))
     key = jax.random.key(28)
     params = model.init(key, x)["params"]
@@ -444,8 +444,8 @@ def test_projection_initialization_is_normal_and_independent_of_depth() -> None:
 @pytest.mark.parametrize("initializer_range", [0.0, -0.02, float("inf"), float("nan")])
 def test_invalid_initializer_range(initializer_range: float) -> None:
     for model in (
-        TransformerBlock(8, num_heads=2, initializer_range=initializer_range),
-        TransformerStack(8, 1, num_heads=2, initializer_range=initializer_range),
+        _TransformerBlock(8, num_heads=2, initializer_range=initializer_range),
+        Transformer(8, 1, num_heads=2, initializer_range=initializer_range),
     ):
         with pytest.raises(ValueError, match="initializer_range must be positive and finite"):
             model.initial_carry(1)
@@ -454,7 +454,7 @@ def test_invalid_initializer_range(initializer_range: float) -> None:
 @pytest.mark.parametrize("stack", [False, True], ids=["block", "stack"])
 def test_full_chunks_and_scanned_steps_agree(stack: bool) -> None:
     kwargs = {"dim": 8, "num_heads": 2, "num_kv_heads": 1, "max_seq_len": 5}
-    model = TransformerStack(**kwargs, num_layers=2) if stack else TransformerBlock(**kwargs)
+    model = Transformer(**kwargs, num_layers=2) if stack else _TransformerBlock(**kwargs)
     x = jax.random.normal(jax.random.key(3), (2, 5, 8))
     x_len = jnp.array([2, 5], jnp.int32)
     variables = model.init(jax.random.key(4), x, x_len=x_len)
@@ -490,7 +490,7 @@ def test_full_chunks_and_scanned_steps_agree(stack: bool) -> None:
 
 @pytest.mark.parametrize("causal", [True, False])
 def test_padding_isolation_and_empty_examples(causal: bool) -> None:
-    model = TransformerStack(8, 2, num_heads=2, num_kv_heads=1, max_seq_len=4, causal=causal)
+    model = Transformer(8, 2, num_heads=2, num_kv_heads=1, max_seq_len=4, causal=causal)
     x = jax.random.normal(jax.random.key(5), (2, 4, 8))
     x_len = jnp.array([2, 0], jnp.int32)
     valid = jnp.arange(4)[None, :] < x_len[:, None]
@@ -512,7 +512,7 @@ def test_padding_isolation_and_empty_examples(causal: bool) -> None:
 
 
 def test_gradients_through_chunked_cache_match_full_sequence() -> None:
-    model = TransformerStack(8, 2, num_heads=2, num_kv_heads=1, max_seq_len=7)
+    model = Transformer(8, 2, num_heads=2, num_kv_heads=1, max_seq_len=7)
     x = jax.random.normal(jax.random.key(7), (2, 7, 8))
     x_len = jnp.array([4, 7], jnp.int32)
     params = model.init(jax.random.key(8), x)["params"]
@@ -546,7 +546,7 @@ def test_gradients_through_chunked_cache_match_full_sequence() -> None:
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 def test_precision_initialization_and_parameter_independence(dtype: jax.typing.DTypeLike) -> None:
-    model = TransformerStack(16, 2, num_heads=4, max_seq_len=4, dtype=dtype)
+    model = Transformer(16, 2, num_heads=4, max_seq_len=4, dtype=dtype)
     x = jax.random.normal(jax.random.key(11), (2, 3, 16))
     variables = model.init(jax.random.key(12), x[:, :1])
     carry, y = jax.jit(model.apply)(variables, x)
@@ -584,11 +584,11 @@ def test_precision_initialization_and_parameter_independence(dtype: jax.typing.D
 )
 def test_invalid_configuration(kwargs: dict[str, Any]) -> None:
     with pytest.raises((ValueError, TypeError, AssertionError)):
-        TransformerBlock(**({"dim": 16, "num_heads": 4} | kwargs)).initial_carry(2)
+        _TransformerBlock(**({"dim": 16, "num_heads": 4} | kwargs)).initial_carry(2)
 
 
 def test_invalid_inputs_and_carries() -> None:
-    model = TransformerBlock(16, num_heads=4, max_seq_len=4)
+    model = _TransformerBlock(16, num_heads=4, max_seq_len=4)
     x = jnp.zeros((1, 2, 16))
     variables = model.init(jax.random.key(13), x)
     carry = model.initial_carry(1)
@@ -614,7 +614,7 @@ def test_invalid_inputs_and_carries() -> None:
 
 @pytest.mark.parametrize("stack,step", [(False, True), (True, False), (True, True)])
 def test_sequence_and_step_validate_inputs_before_projections(stack: bool, step: bool) -> None:
-    model = TransformerStack(8, 1, num_heads=2) if stack else TransformerBlock(8, num_heads=2)
+    model = Transformer(8, 1, num_heads=2) if stack else _TransformerBlock(8, num_heads=2)
     shape = (1, 8) if step else (1, 2, 8)
     x = jnp.zeros(shape, jnp.float32)
     method = model.step if step else model.__call__
@@ -657,7 +657,7 @@ def test_cudnn_mask_padding_preserves_outputs_and_gradients(
     monkeypatch: pytest.MonkeyPatch, steps: int, window: int, causal: bool
 ) -> None:
     """Exercise backend routing/padding on CPU; real kernels are tested below."""
-    model = TransformerBlock(16, num_heads=2, num_kv_heads=1, max_seq_len=window, dtype=jnp.bfloat16, causal=causal)
+    model = _TransformerBlock(16, num_heads=2, num_kv_heads=1, max_seq_len=window, dtype=jnp.bfloat16, causal=causal)
     fused = model.clone(attention_implementation="cudnn")
     x = jax.random.normal(jax.random.key(16), (2, steps, 16))
     variables = model.init(jax.random.key(17), x)
@@ -698,7 +698,7 @@ def test_cudnn_mask_padding_preserves_outputs_and_gradients(
 
     monkeypatch.setattr(jax.nn, "dot_product_attention", portable_attention)
 
-    def loss(inputs: jax.Array, network: TransformerBlock) -> tuple[jax.Array, jax.Array]:
+    def loss(inputs: jax.Array, network: _TransformerBlock) -> tuple[jax.Array, jax.Array]:
         chex.assert_shape(inputs, (2, steps, 16))
         chex.assert_type(inputs, jnp.float32)
         _, output = network.apply(variables, inputs, x_len, carry)
@@ -743,7 +743,7 @@ def assert_gradient_close(actual: jax.Array, expected: jax.Array) -> None:
     ],
 )
 def test_attention_backend_forward_backward_and_decode(cached: bool, window: int, implementation: str) -> None:
-    model = TransformerStack(16, 1, num_heads=2, num_kv_heads=1, max_seq_len=window, dtype=jnp.bfloat16)
+    model = Transformer(16, 1, num_heads=2, num_kv_heads=1, max_seq_len=window, dtype=jnp.bfloat16)
     backend = model.clone(attention_implementation=implementation)
     x = jax.random.normal(jax.random.key(14), (2, 5, 16))
     probe = jax.random.normal(jax.random.key(18), x.shape) / jnp.sqrt(x.size)
@@ -752,7 +752,7 @@ def test_attention_backend_forward_backward_and_decode(cached: bool, window: int
     initial = model.apply({"params": params}, x[:, :2])[0] if cached else None
 
     def loss(
-        parameters: Any, inputs: jax.Array, network: TransformerStack
+        parameters: Any, inputs: jax.Array, network: Transformer
     ) -> tuple[jax.Array, tuple[TransformerStackCarry, jax.Array]]:
         chex.assert_shape(inputs, (2, 5, 16))
         chex.assert_type(inputs, jnp.float32)

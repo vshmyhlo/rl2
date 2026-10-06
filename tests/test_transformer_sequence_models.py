@@ -6,14 +6,25 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from rl2 import transformer
 from rl2.sequence_model import ARSequenceModel, BDSequenceModel
 from rl2.shape_checker import ShapeChecker
-from rl2.transformer import ARTransformerStack, BDTransformerStack, TransformerStack
+from rl2.transformer import ARTransformer, BDTransformer, Transformer
+
+
+def test_public_model_exports() -> None:
+    assert set(transformer.__all__) == {
+        "ARTransformer",
+        "BDTransformer",
+        "AttentionImplementation",
+        "TransformerCarry",
+        "TransformerStackCarry",
+    }
 
 
 def test_autoregressive_sequence_chunks_and_steps_match_from_fresh_and_supplied_carry() -> None:
-    model = ARTransformerStack(4, 2, num_heads=1, max_seq_len=5, initializer_range=0.2)
-    assert isinstance(model, TransformerStack)
+    model = ARTransformer(4, 2, num_heads=1, max_seq_len=5, initializer_range=0.2)
+    assert isinstance(model, Transformer)
     assert isinstance(model, ARSequenceModel)
     x = jax.random.normal(jax.random.key(0), (3, 3, 4))
     x_len = jnp.array([0, 2, 3], jnp.int32)
@@ -64,8 +75,8 @@ def test_autoregressive_sequence_chunks_and_steps_match_from_fresh_and_supplied_
 
 
 def test_bidirectional_valid_prefixes_and_gradients_ignore_padding() -> None:
-    model = BDTransformerStack(4, 2, num_heads=1, max_seq_len=3, initializer_range=0.2)
-    assert isinstance(model, TransformerStack)
+    model = BDTransformer(4, 2, num_heads=1, max_seq_len=3, initializer_range=0.2)
+    assert isinstance(model, Transformer)
     assert isinstance(model, BDSequenceModel)
     x = jax.random.normal(jax.random.key(2), (3, 3, 4))
     x_len = jnp.array([0, 2, 3], jnp.int32)
@@ -102,8 +113,8 @@ def test_bidirectional_valid_prefixes_and_gradients_ignore_padding() -> None:
             model.apply(variables, x, lengths)
 
 
-@pytest.mark.parametrize("model_type", [ARTransformerStack, BDTransformerStack])
-def test_specialized_stacks_validate_lengths_and_fixed_direction(model_type: type[TransformerStack]) -> None:
+@pytest.mark.parametrize("model_type", [ARTransformer, BDTransformer])
+def test_specialized_stacks_validate_lengths_and_fixed_direction(model_type: type[Transformer]) -> None:
     model = model_type(4, 1, num_heads=1, max_seq_len=3)
     x = jnp.zeros((1, 3, 4), jnp.float32)
     for lengths in (jnp.ones((1,), jnp.bool_), jnp.ones((1, 1), jnp.int32)):

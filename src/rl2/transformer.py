@@ -1,9 +1,9 @@
 """Llama 3 decoder backbone with batch-major sequences and explicit KV caches.
 
-``TransformerBlock`` combines RoPE attention with pre-RMSNorm and SwiGLU
-residual layers; ``TransformerStack`` repeats it and adds a final RMSNorm.
-``ARTransformerStack`` implements the autoregressive sequence/carry contract;
-``BDTransformerStack`` exposes bidirectional sequence outputs without carry.
+The internal block combines RoPE attention with pre-RMSNorm and SwiGLU
+residual layers; the internal ``Transformer`` base repeats it and adds a final RMSNorm.
+``ARTransformer`` implements the autoregressive sequence/carry contract;
+``BDTransformer`` exposes bidirectional sequence outputs without carry.
 Both specialized stacks require explicit ``x_len`` arrays.
 The attention and SwiGLU architecture follow Meta's reference:
 https://github.com/meta-llama/llama3/blob/main/llama/model.py
@@ -25,37 +25,36 @@ activation dtype, matching Meta's Llama 3 reference. Queries and keys have
 no additional normalization. Residual additions use their operands' dtypes
 without explicitly promoting to float32.
 
-Attention defaults to causal; set ``causal=False`` for
-bidirectional attention over the current chunk and valid cached history in
-the sequence. Cached states are not recomputed, so non-causal outputs
-depend on chunk boundaries. Step calls require ``causal=True`` and raise
-``ValueError`` for bidirectional attention.
-The fixed-size cache retains
-all valid tokens, up to ``max_seq_len``; exceeding that capacity raises an
-error, including under JIT. Optional int32 ``x_len[batch]`` delimits each
-left-aligned valid prefix; remaining input tokens are right padding. Only valid
-tokens advance the cache and RoPE positions. Lengths must be between zero and
-the chunk length; omission means all tokens are valid. Padded outputs are zero.
-Pass a fresh carry to restart a sequence. With causal attention, sequence, chunk and step calls
-have identical semantics; prefill computes attention in parallel, without a
-token-by-token attention scan. Gradients flow through supplied caches unless
+``ARTransformer`` uses causal attention and maintains an explicit KV cache.
+Its fixed-size cache retains all valid tokens up to ``max_seq_len``; exceeding
+that capacity raises an error, including under JIT. Sequence, chunk, and step
+calls have identical semantics. Prefill computes attention in parallel, without
+a token-by-token attention scan. Gradients flow through supplied caches unless
 the caller applies ``jax.lax.stop_gradient``.
+
+``BDTransformer`` attends bidirectionally over each complete valid sequence.
+Its sequence call accepts no carry and returns only the output array.
+
+Both public models require int32 ``x_len[batch]`` to delimit each left-aligned
+valid prefix; remaining input tokens are right padding. Lengths must be between
+zero and the input length. Padded outputs are zero. Only valid tokens advance
+an autoregressive cache and its RoPE positions; omit carry to start fresh.
 
 ``attention_implementation="xla"`` is portable (the default). Select ``"cudnn"``
 with float16/bfloat16 and a supported NVIDIA GPU for JAX's cuDNN fused attention.
 Backend shape/device restrictions are reported by JAX, without silent fallback.
-Fresh, unpadded prefill uses the native attention mode; cached or padded
-sequences use an explicit boolean mask to handle offsets and valid lengths.
+Explicit boolean attention masks handle valid lengths and cached offsets.
 Masked cuDNN calls pad odd sequence lengths for its backward-pass constraints.
 
 Example::
 
-    model = TransformerStack(dim=256, num_layers=4, num_heads=8,
+    model = ARTransformer(dim=256, num_layers=4, num_heads=8,
                              num_kv_heads=2, max_seq_len=1024)
     x = jnp.zeros((8, 16, 256))
-    variables = model.init(jax.random.key(0), x)
-    carry, y = model.apply(variables, x)
-    carry, next_y = model.apply(variables, x[:, 0], carry=carry, method=model.step)
+    x_len = jnp.full((8,), 16, jnp.int32)
+    variables = model.init(jax.random.key(0), x, x_len)
+    carry, y = model.apply(variables, x, x_len)
+    carry, next_y = model.apply(variables, x[:, 0], jnp.ones((8,), jnp.int32), carry, method=model.step)
 """
 
 import math
@@ -68,6 +67,8 @@ from flax import linen as nn
 
 from rl2.sequence_model import ARSequenceModel, BDSequenceModel
 from rl2.shape_checker import ShapeChecker
+
+__all__ = ["ARTransformer", "AttentionImplementation", "BDTransformer", "TransformerCarry", "TransformerStackCarry"]
 
 type AttentionImplementation = Literal["xla", "cudnn"]
 
@@ -199,7 +200,7 @@ def _attention(
 
     Queries are [batch,time,query_heads,head_dim]; keys and values are
     [batch,time,kv_heads,head_dim], all with the same floating dtype and
-    nonempty dimensions. Configuration constraints match TransformerBlock.
+    nonempty dimensions. Configuration constraints match _TransformerBlock.
     Optional int32 [batch] x_len gives valid prefix lengths in [0, time].
     Padding produces zero output and does not update the cache.
     Return the updated cache and [batch,time,query_heads,head_dim] output.
@@ -327,7 +328,7 @@ def _attention(
     return carry, attended
 
 
-class TransformerBlock(nn.Module):
+class _TransformerBlock(nn.Module):
     """Llama 3 pre-RMSNorm attention and SwiGLU MLP with residual connections.
 
     MLP width is ``round(dim * mlp_expansion)``; expansion defaults to 2.
@@ -499,11 +500,11 @@ class TransformerBlock(nn.Module):
         return carry, output
 
 
-class TransformerStack(nn.Module):
+class Transformer(nn.Module):
     """Llama 3 decoder backbone with independent pre-RMSNorm/SwiGLU layers.
 
     Sequences are batch-major; optional int32 x_len has shape [batch]. Carry is a tuple of one
-    TransformerCarry per layer. MLP width is ``round(dim * mlp_expansion)``,
+    layer cache per layer. MLP width is ``round(dim * mlp_expansion)``,
     with a default expansion of 2, shared by every block.
     Final RMSNorm defaults on; residual additions
     preserve the operands' normal dtype promotion rules.
@@ -537,8 +538,8 @@ class TransformerStack(nn.Module):
         return _expanded_mlp_width(self.dim, self.mlp_expansion)
 
     @nn.nowrap
-    def _make_block(self) -> TransformerBlock:
-        block = TransformerBlock(
+    def _make_block(self) -> _TransformerBlock:
+        block = _TransformerBlock(
             dim=self.dim,
             mlp_expansion=self.mlp_expansion,
             num_heads=self.num_heads,
@@ -620,17 +621,17 @@ class TransformerStack(nn.Module):
         return carry, output
 
 
-class ARTransformerStack(TransformerStack, ARSequenceModel[TransformerStackCarry]):
+class ARTransformer(Transformer, ARSequenceModel[TransformerStackCarry]):
     """Autoregressive stack with required valid lengths and optional KV carry.
 
     Full sequences, chunks, and repeated steps produce equivalent outputs and
     final carry, whether starting fresh or continuing supplied history.
-    ``causal`` must remain True. Parameter names match ``TransformerStack``.
+    ``causal`` must remain True. Parameter names match ``Transformer``.
     """
 
     def setup(self) -> None:
         if not self.causal:
-            raise ValueError("ARTransformerStack requires causal=True")
+            raise ValueError("ARTransformer requires causal=True")
         super().setup()
 
     def __call__(
@@ -664,20 +665,20 @@ class ARTransformerStack(TransformerStack, ARSequenceModel[TransformerStackCarry
         return carry, output
 
 
-class BDTransformerStack(TransformerStack, BDSequenceModel):
+class BDTransformer(Transformer, BDSequenceModel):
     """Bidirectional stack with required valid lengths and array-only output.
 
     Every call processes a fresh sequence, attending only to its valid prefix.
     ``causal`` must remain False. Carry is neither accepted nor returned;
     the inherited ``step`` operation is unsupported and raises ValueError.
-    Parameter names match ``TransformerStack``.
+    Parameter names match ``Transformer``.
     """
 
     causal: bool = False
 
     def setup(self) -> None:
         if self.causal:
-            raise ValueError("BDTransformerStack requires causal=False")
+            raise ValueError("BDTransformer requires causal=False")
         super().setup()
 
     def __call__(self, x: jax.Array, x_len: jax.Array) -> jax.Array:

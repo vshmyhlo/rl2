@@ -24,7 +24,8 @@ from flax import linen as nn
 
 from rl2.karel import TOKENS
 from rl2.mamba3 import Mamba3Stack, Mamba3StackCarry
-from rl2.transformer import AttentionImplementation, TransformerStack, TransformerStackCarry
+from rl2.shape_checker import ShapeChecker
+from rl2.transformer import ARTransformer, AttentionImplementation, TransformerStackCarry
 
 type BackboneType = Literal["mamba3", "transformer"]
 type KarelModelCarry = Mamba3StackCarry | TransformerStackCarry
@@ -74,7 +75,7 @@ class KarelProgramModel(nn.Module):
                 dtype=self.dtype,
             )
         else:
-            self.backbone = TransformerStack(
+            self.backbone = ARTransformer(
                 dim=self.d_model,
                 num_layers=self.num_layers,
                 num_heads=self.num_heads,
@@ -106,16 +107,24 @@ class KarelProgramModel(nn.Module):
 
     def __call__(self, initial: jax.Array, target: jax.Array, tokens: jax.Array) -> KarelModelOutput:
         """Teacher forcing: [context, embed(p[:-1])] predicts complete program p."""
+        sc = ShapeChecker(C=6, D=self.d_model, V=len(TOKENS))
+        sc.check((initial, target), "BHWC", jnp.int32)
+        sc.check(tokens, "TB", jnp.int32)
         context = self.encode_pair(initial, target)
-        chex.assert_shape(tokens, (None, context.shape[0]))
-        chex.assert_type(tokens, jnp.int32)
+        sc.check(context, "BD", self.dtype)
         inputs = jnp.concatenate((context[None], self.token_embedding(tokens)), axis=0)
+        sc.check(inputs, "SBD", self.dtype)
         if self.backbone_type == "transformer":
-            carry, features = self.backbone(jnp.swapaxes(inputs, 0, 1))
+            x_len = jnp.full(sc["B"], inputs.shape[0], jnp.int32)
+            sc.check(x_len, "B", jnp.int32)
+            carry, features = self.backbone(jnp.swapaxes(inputs, 0, 1), x_len)
             features = jnp.swapaxes(features, 0, 1)
         else:
             carry, features = self.backbone(inputs)
-        return carry, self.head(features).astype(jnp.float32)
+        sc.check(features, "SBD", self.dtype)
+        logits = self.head(features).astype(jnp.float32)
+        sc.check(logits, "SBV", jnp.float32)
+        return carry, logits
 
     def prefill(self, initial: jax.Array, target: jax.Array) -> KarelModelOutput:
         """Reset history, encode the pair once, and predict the first token [B,V]."""
@@ -126,9 +135,17 @@ class KarelProgramModel(nn.Module):
 
     def step(self, token: jax.Array, carry: KarelModelCarry) -> KarelModelOutput:
         """Consume one previously generated token [B] and predict the next [B,V]."""
-        chex.assert_rank(token, 1)
-        chex.assert_type(token, jnp.int32)
-        if carry is None:
-            raise ValueError("Use prefill() to condition on a pair before step()")
-        carry, features = self.backbone.step(self.token_embedding(token), carry)
-        return carry, self.head(features).astype(jnp.float32)
+        sc = ShapeChecker(D=self.d_model)
+        sc.check(token, "B", jnp.int32)
+        inputs = self.token_embedding(token)
+        sc.check(inputs, "BD", self.dtype)
+        if self.backbone_type == "transformer":
+            x_len = jnp.ones(sc["B"], jnp.int32)
+            sc.check(x_len, "B", jnp.int32)
+            carry, features = self.backbone.step(inputs, x_len, carry)
+        else:
+            carry, features = self.backbone.step(inputs, carry=carry)
+        sc.check(features, "BD", self.dtype)
+        logits = self.head(features).astype(jnp.float32)
+        sc.check(logits, "BV", jnp.float32)
+        return carry, logits

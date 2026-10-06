@@ -105,7 +105,7 @@ from rl2.train_karel_ast_grpo import (
     group_advantages,
     learning_rate_schedule,
 )
-from rl2.transformer import AttentionImplementation, TransformerStack, TransformerStackCarry
+from rl2.transformer import ARTransformer, AttentionImplementation, TransformerStackCarry
 from rl2.utils import read_bytes, read_optional, write_bytes
 
 
@@ -285,7 +285,7 @@ class EditTransformer(nn.Module):
         self.feedback_norm = nn.LayerNorm(dtype=self.dtype)
         self.token_embedding = nn.Embed(1 + self.max_nodes + len(AST_ACTIONS), self.d_model, dtype=self.dtype)
         self.kind_embedding = nn.Embed(4, self.d_model, dtype=self.dtype)
-        self.backbone = TransformerStack(
+        self.backbone = ARTransformer(
             dim=self.d_model,
             num_layers=self.num_layers,
             num_heads=self.num_heads,
@@ -339,10 +339,18 @@ class EditTransformer(nn.Module):
 
     def __call__(self, history: History) -> ModelOutput:
         """Encode the complete causal history and return its cache and next-action logits."""
+        sc = ShapeChecker(C=6, D=self.d_model, V=1 + self.max_nodes + len(AST_ACTIONS))
+        sc.check((history.initial, history.target), "BHWC", jnp.int32)
         inputs = self.encode_events(history.events, history.initial, history.target)
-        carry, features = self.backbone(jnp.swapaxes(inputs, 0, 1))
+        sc.check(inputs, "TBD", self.dtype)
+        x_len = jnp.full(sc["B"], inputs.shape[0], jnp.int32)
+        sc.check(x_len, "B", jnp.int32)
+        carry, features = self.backbone(jnp.swapaxes(inputs, 0, 1), x_len)
         features = jnp.swapaxes(features, 0, 1)
-        return EditCarry(carry, history.initial, history.target), self.head(features).astype(jnp.float32)
+        sc.check(features, "TBD", self.dtype)
+        logits = self.head(features).astype(jnp.float32)
+        sc.check(logits, "TBV", jnp.float32)
+        return EditCarry(carry, history.initial, history.target), logits
 
     def prefill(self, history: History) -> ModelOutput:
         """Consume the seed program and initial execution update once."""
@@ -351,16 +359,16 @@ class EditTransformer(nn.Module):
 
     def step(self, event: Events, carry: EditCarry) -> ModelOutput:
         """Append one event per episode to the KV cache and predict the next action."""
-        if carry is None:
-            raise ValueError("Use prefill before step")
         sc = ShapeChecker(C=6, F=FEEDBACK_SIZE, D=self.d_model, V=1 + self.max_nodes + len(AST_ACTIONS))
         sc.check((carry.initial, carry.target), "BHWC", jnp.int32)
         sc.check((event.kind, event.value), "B", jnp.int32)
         sc.check(event.output, "BHWC", jnp.int32)
         sc.check(event.feedback, "BF", jnp.float32)
         sequence = jax.tree.map(partial(jnp.expand_dims, axis=0), event)
+        x_len = jnp.ones(sc["B"], jnp.int32)
+        sc.check(x_len, "B", jnp.int32)
         transformer, features = self.backbone.step(
-            self.encode_events(sequence, carry.initial, carry.target)[0], carry=carry.transformer
+            self.encode_events(sequence, carry.initial, carry.target)[0], x_len, carry.transformer
         )
         sc.check(features, "BD", self.dtype)
         logits = self.head(features).astype(jnp.float32)
