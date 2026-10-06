@@ -158,7 +158,7 @@ class Config:
     log_interval: int = 20  # TensorBoard scalars, stdout, and flushes every N completed rollouts.
     log_program_interval: int = 20  # Program samples on logging iterations divisible by this interval.
     log_program_count: int = 8  # First N programs in one group; zero disables samples.
-    log_compiles: bool = False  # Print bucket shapes on new prediction/update JIT traces.
+    log_compiles: bool = False  # Print named dimensions (b=batch, t=time) on new prediction/update JIT traces.
 
     def __post_init__(self) -> None:
         """Validate training settings, backend compatibility, and seed-program budgets."""
@@ -415,7 +415,8 @@ def initial_history(observations: list[Observation], config: Config) -> History:
 def prefill(state: TrainState, history: History, *, log_compiles: bool = False) -> ModelOutput:
     """Initialize rollout KV caches and first-decision logits with the current policy."""
     if log_compiles:
-        print(f"JIT trace edit prefill: events={history.events.kind.shape}", flush=True)
+        time, batch = history.events.kind.shape
+        print(f"JIT trace edit prefill: b={batch}, t={time}", flush=True)
     return state.apply_fn({"params": state.params}, history, method=EditTransformer.prefill)
 
 
@@ -423,7 +424,7 @@ def prefill(state: TrainState, history: History, *, log_compiles: bool = False) 
 def decode_step(state: TrainState, event: Events, carry: EditCarry, *, log_compiles: bool = False) -> ModelOutput:
     """Advance cached rollout histories by one action, feedback, or padding event."""
     if log_compiles:
-        print(f"JIT trace edit step: batch={event.kind.shape[0]}", flush=True)
+        print(f"JIT trace edit step: b={event.kind.shape[0]}", flush=True)
     return state.apply_fn({"params": state.params}, event, carry, method=EditTransformer.step)
 
 
@@ -723,7 +724,7 @@ def update(state: TrainState, batch: EditBatch, config: Config) -> tuple[TrainSt
     weights = batch.mask.astype(jnp.float32) / jnp.maximum(counts[None], 1) / count
     advantages = jnp.broadcast_to(batch.advantages, batch.actions.shape)
     if config.log_compiles:
-        print(f"JIT trace edit update: sequence_shape={batch.actions.shape}", flush=True)
+        print(f"JIT trace edit update: b={count}, t={time}", flush=True)
 
     def loss_fn(params: optax.Params) -> tuple[jax.Array, Metrics]:
         """Replay the minibatch under candidate parameters and evaluate its masked loss."""

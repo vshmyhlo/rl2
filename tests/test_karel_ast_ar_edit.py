@@ -249,6 +249,36 @@ def test_stop_is_a_real_decision(config: edit.Config, state: TrainState) -> None
     )
 
 
+def test_compile_logs_name_dimensions(
+    config: edit.Config,
+    state: TrainState,
+    rollout: edit.Rollout,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    batch = rollout.batch
+    history = batch.history._replace(events=jax.tree.map(lambda x: x[:4], batch.history.events))
+    # Trace without compiling/executing extra model updates just to inspect their logs.
+    carry, _ = jax.eval_shape(edit.prefill, state, history)
+    event = jax.tree.map(lambda x: x[0], history.events)
+    assert capsys.readouterr().out == ""
+    for _ in range(2):
+        edit.prefill.lower(state, history, log_compiles=True)
+        edit.decode_step.lower(state, event, carry, log_compiles=True)
+        edit.update.lower(state, batch, replace(config, log_compiles=True))
+    assert capsys.readouterr().out == (
+        "JIT trace edit prefill: b=2, t=4\n"
+        "JIT trace edit step: b=2\n"
+        f"JIT trace edit update: b=2, t={batch.actions.shape[0]}\n"
+    )
+    shorter = history._replace(events=jax.tree.map(lambda x: x[:3], history.events))
+    edit.prefill.lower(state, shorter, log_compiles=True)
+    assert capsys.readouterr().out == "JIT trace edit prefill: b=2, t=3\n"
+    edit.prefill.lower(state, shorter)
+    edit.decode_step.lower(state, event, carry)
+    edit.update.lower(state, batch, config)
+    assert capsys.readouterr().out == ""
+
+
 def test_update_and_episode_normalization(
     config: edit.Config,
     state: TrainState,
