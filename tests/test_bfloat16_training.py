@@ -10,6 +10,7 @@ import pytest
 from flax.training.train_state import TrainState
 
 from rl2.mamba3 import Mamba3, Mamba3Carry, Mamba3Stack, Mamba3StackCarry
+from rl2.shape_checker import ShapeChecker
 from rl2.transformer import TransformerBlock, TransformerCarry, TransformerStack, TransformerStackCarry
 
 type Model = Mamba3 | Mamba3Stack | TransformerBlock | TransformerStack
@@ -78,12 +79,11 @@ def test_bfloat16_chunked_gradients_and_adam_training(model: Model) -> None:
     def apply_sequence(
         parameters: Parameters, inputs: jax.Array, resets: jax.Array, carry: Carry | None = None
     ) -> tuple[Carry, jax.Array]:
-        chex.assert_shape(inputs, (None, 2, dim))
-        chex.assert_type(inputs, jnp.bfloat16)
-        chex.assert_shape(resets, inputs.shape[:2])
-        chex.assert_type(resets, jnp.bool_)
+        sc = ShapeChecker(B=2, D=dim)
+        sc.check(inputs, "TBD", jnp.bfloat16)
+        sc.check(resets, "TB", jnp.bool_)
         if batch_major:
-            carry, output = model.apply({"params": parameters}, jnp.swapaxes(inputs, 0, 1), carry, resets.T)
+            carry, output = model.apply({"params": parameters}, jnp.swapaxes(inputs, 0, 1), carry=carry)
             return carry, jnp.swapaxes(output, 0, 1)
         return model.apply({"params": parameters}, inputs, carry, resets)
 

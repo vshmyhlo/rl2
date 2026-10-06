@@ -6,8 +6,10 @@ The attention and SwiGLU architecture follow Meta's reference:
 https://github.com/meta-llama/llama3/blob/main/llama/model.py
 MLP width is ``round(dim * mlp_expansion)``, with a default expansion of 2.
 Model sizes and KV head counts remain configurable.
-Neither includes embeddings or a prediction head. Projections are bias-free, parameters/norm statistics are
-float32, and ``dtype`` controls projections, outputs and cached keys/values.
+Neither includes embeddings or a prediction head. Projections are bias-free,
+parameters/norm statistics are float32, and ``dtype`` controls projections and
+cached keys/values. Block outputs use the residual operands' promoted dtype;
+stack outputs are cast to ``dtype`` even when the final norm is disabled.
 All projection weights use normal initialization with standard deviation
 ``initializer_range`` (default 0.02), without depth-dependent scaling.
 The XLA float16 path evaluates attention in float32 for CPU portability.
@@ -20,14 +22,18 @@ activation dtype, matching Meta's Llama 3 reference. Queries and keys have
 no additional normalization. Residual additions use their operands' dtypes
 without explicitly promoting to float32.
 
-Attention defaults to causal within each episode; set ``causal=False`` for
+Attention defaults to causal; set ``causal=False`` for
 bidirectional attention over the current chunk and valid cached history in
-the same episode. Cached states are not recomputed, so non-causal outputs
-depend on chunk boundaries and step calls cannot see future inputs.
+the sequence. Cached states are not recomputed, so non-causal outputs
+depend on chunk boundaries. Step calls require ``causal=True`` and raise
+``ValueError`` for bidirectional attention.
 The fixed-size cache retains
-all episode tokens, up to ``max_seq_len``; exceeding that capacity raises an
-error, including under JIT. Per-example ``episode_starts`` clear the cache and
-restart RoPE positions. With causal attention, sequence, chunk and step calls
+all valid tokens, up to ``max_seq_len``; exceeding that capacity raises an
+error, including under JIT. Optional int32 ``x_len[batch]`` delimits each
+left-aligned valid prefix; remaining input tokens are right padding. Only valid
+tokens advance the cache and RoPE positions. Lengths must be between zero and
+the chunk length; omission means all tokens are valid. Padded outputs are zero.
+Pass a fresh carry to restart a sequence. With causal attention, sequence, chunk and step calls
 have identical semantics; prefill computes attention in parallel, without a
 token-by-token attention scan. Gradients flow through supplied caches unless
 the caller applies ``jax.lax.stop_gradient``.
@@ -35,8 +41,8 @@ the caller applies ``jax.lax.stop_gradient``.
 ``attention_implementation="xla"`` is portable (the default). Select ``"cudnn"``
 with float16/bfloat16 and a supported NVIDIA GPU for JAX's cuDNN fused attention.
 Backend shape/device restrictions are reported by JAX, without silent fallback.
-Fresh, unsegmented prefill uses the native attention mode; cached or packed
-sequences use an explicit boolean mask to handle offsets and episode resets.
+Fresh, unpadded prefill uses the native attention mode; cached or padded
+sequences use an explicit boolean mask to handle offsets and valid lengths.
 Masked cuDNN calls pad odd sequence lengths for its backward-pass constraints.
 
 Example::
@@ -46,7 +52,7 @@ Example::
     x = jnp.zeros((8, 16, 256))
     variables = model.init(jax.random.key(0), x)
     carry, y = model.apply(variables, x)
-    carry, next_y = model.apply(variables, x[:, 0], carry, method=model.step)
+    carry, next_y = model.apply(variables, x[:, 0], carry=carry, method=model.step)
 """
 
 import math
@@ -63,11 +69,11 @@ type AttentionImplementation = Literal["xla", "cudnn"]
 
 
 class TransformerCarry(NamedTuple):
-    """Batch-leading KV cache and next RoPE position within each episode.
+    """Batch-leading KV cache and next RoPE position within each sequence.
 
     key/value: [B,max_seq_len,num_kv_heads,headdim], in projection dtype.
     position: [B], int32. Slot ``p`` stores position ``p``.
-    Keys are already rotated. Unused slots are zero, including after resets.
+    Keys are already rotated. Unused slots are initialized to zero.
     """
 
     key: jax.Array
@@ -84,31 +90,27 @@ def _positive_integer(value: int, name: str) -> None:
     chex.assert_scalar_positive(value)
 
 
-def _check_positions(positions: jax.Array, capacity: int) -> None:
-    """Reject cache overflow eagerly and inside compiled sequence/scan calls."""
+def _check_range(values: jax.Array, maximum: int, message: str) -> None:
+    """Reject out-of-range counts eagerly and inside compiled calls."""
     sc = ShapeChecker()
-    sc.check(positions, "BT", jnp.int32)
-    _positive_integer(capacity, "capacity")
-
-    invalid = jnp.any((positions < 0) | (positions >= capacity))
+    sc.check(values, "B", jnp.int32)
+    invalid = jnp.any((values < 0) | (values > maximum))
     sc.check(invalid, "", jnp.bool_)
 
     def fail_if_invalid(value: jax.Array) -> None:
-        ShapeChecker().check(value, "", jnp.bool_)
+        sc = ShapeChecker()
+        sc.check(value, "", jnp.bool_)
         if bool(value):
-            raise ValueError("Episode exceeds max_seq_len cache capacity; increase max_seq_len or reset the episode")
+            raise ValueError(message)
 
     def report_failure() -> None:
-        # vmap may evaluate both cond branches, so the callback also checks
-        # its predicate instead of unconditionally raising.
+        # vmap may evaluate both branches, so check the predicate in the callback.
         jax.debug.callback(fail_if_invalid, invalid)
 
     def success() -> None:
         pass
 
     if isinstance(invalid, jax.core.Tracer):
-        # Only transfer control to the host on failure; normal decoding keeps
-        # its fixed-shape carry on device and works inside lax.scan.
         jax.lax.cond(invalid, report_failure, success)
     elif bool(invalid):
         fail_if_invalid(invalid)
@@ -148,23 +150,61 @@ def _expanded_mlp_width(dim: int, mlp_expansion: float) -> int:
     return width
 
 
+def _check_attention_config(
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    max_seq_len: int,
+    rope_theta: float,
+    causal: bool,
+    implementation: AttentionImplementation,
+    dtype: jax.typing.DTypeLike,
+) -> None:
+    """Keep module and standalone attention validation consistent."""
+    for name, value in (
+        ("num_heads", num_heads),
+        ("num_kv_heads", num_kv_heads),
+        ("head_dim", head_dim),
+        ("max_seq_len", max_seq_len),
+    ):
+        _positive_integer(value, name)
+    chex.assert_is_divisible(num_heads, num_kv_heads)
+    chex.assert_is_divisible(head_dim, 2)
+    if not 0 < rope_theta < math.inf:
+        raise ValueError("rope_theta must be positive and finite")
+    if implementation not in ("xla", "cudnn"):
+        raise ValueError("attention_implementation must be 'xla' or 'cudnn'")
+    if not isinstance(causal, bool):
+        raise TypeError("causal must be a bool")
+    dtype = jnp.dtype(dtype)
+    if dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
+        raise ValueError("dtype must be float32, bfloat16, or float16")
+    if implementation == "cudnn":
+        if dtype == jnp.float32:
+            raise ValueError("cuDNN attention requires dtype=float16 or bfloat16")
+        chex.assert_is_divisible(head_dim, 8)
+
+
 def _attention(
     query: jax.Array,
     key: jax.Array,
     value: jax.Array,
     carry: TransformerCarry | None = None,
-    episode_starts: jax.Array | None = None,
+    x_len: jax.Array | None = None,
     *,
     max_seq_len: int,
     rope_theta: float,
     causal: bool,
     implementation: AttentionImplementation,
 ) -> tuple[TransformerCarry, jax.Array]:
-    """Apply RoPE attention to projected Q/K/V and update the episode cache.
+    """Apply RoPE attention to projected Q/K/V and update the sequence cache.
 
     Queries are [batch,time,query_heads,head_dim]; keys and values are
-    [batch,time,kv_heads,head_dim], all with the same floating dtype.
-    Optional [batch,time] episode starts reset history and RoPE positions.
+    [batch,time,kv_heads,head_dim], all with the same floating dtype and
+    nonempty dimensions. Configuration constraints match TransformerBlock.
+    Optional int32 [batch] x_len gives valid prefix lengths in [0, time].
+    Padding produces zero output and does not update the cache.
     Return the updated cache and [batch,time,query_heads,head_dim] output.
     """
     dtype = query.dtype
@@ -174,9 +214,18 @@ def _attention(
     sc.check((key, value), "BTKF", dtype)
     batch, steps, num_heads, head_dim = query.shape
     kv_heads = key.shape[2]
-    chex.assert_is_divisible(num_heads, kv_heads)
     _positive_integer(batch, "batch_size")
-    _positive_integer(max_seq_len, "max_seq_len")
+    _positive_integer(steps, "sequence_length")
+    _check_attention_config(
+        num_heads=num_heads,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        max_seq_len=max_seq_len,
+        rope_theta=rope_theta,
+        causal=causal,
+        implementation=implementation,
+        dtype=dtype,
+    )
     fresh = carry is None
     if carry is None:
         carry = TransformerCarry(
@@ -188,44 +237,48 @@ def _attention(
         raise TypeError("carry must be a TransformerCarry")
     sc.check((carry.key, carry.value), "BCKF", dtype)
     sc.check(carry.position, "B", jnp.int32)
-    unsegmented = episode_starts is None
-    if episode_starts is None:
-        episode_starts = jnp.zeros(sc["BT"], jnp.bool_)
-    sc.check(episode_starts, "BT", jnp.bool_)
+    native_attention = fresh and x_len is None
+    if x_len is None:
+        x_len = jnp.full(sc["B"], steps, jnp.int32)
+    sc.check(x_len, "B", jnp.int32)
+    _check_range(x_len, steps, "x_len must be between 0 and the input sequence length")
+    _check_range(carry.position, max_seq_len, "Invalid cache position for max_seq_len cache capacity")
+    next_position = carry.position + x_len
+    sc.check(next_position, "B", jnp.int32)
+    _check_range(next_position, max_seq_len, "Sequence exceeds max_seq_len cache capacity")
 
-    starts = episode_starts
     index = jnp.arange(steps, dtype=jnp.int32)[None, :]
-    # The virtual start of a continued episode is -carry.position.
-    last_reset = jax.lax.associative_scan(jnp.maximum, jnp.where(starts, index, -carry.position[:, None]), axis=1)
-    positions = index - last_reset
-    sc.check((last_reset, positions), "BT", jnp.int32)
-    _check_positions(positions, max_seq_len)
+    valid_tokens = index < x_len[:, None]
+    positions = jnp.where(valid_tokens, carry.position[:, None] + index, 0)
+    sc.check(valid_tokens, "BT", jnp.bool_)
+    sc.check(positions, "BT", jnp.int32)
+    query, key, value = (jnp.where(valid_tokens[..., None, None], v, 0) for v in (query, key, value))
     query, key = _rope(query, positions, rope_theta), _rope(key, positions, rope_theta)
     slots = jnp.arange(max_seq_len, dtype=jnp.int32)[None, :]
-    old_positions = jnp.where(slots < carry.position[:, None], slots, -1)
-    sc.check(old_positions, "BC", jnp.int32)
+    old_valid = slots < carry.position[:, None]
+    sc.check(old_valid, "BC", jnp.bool_)
 
     mask = None
-    native_attention = fresh and unsegmented
     if native_attention:
         # Let the backend handle causality without a dense mask.
         keys, values = key, value
     else:
-        segments = jnp.cumsum(starts, axis=1, dtype=jnp.int32)
         if fresh:
-            keys, values, key_positions, key_segments = key, value, positions, segments
+            keys, values, key_positions, key_valid = key, value, positions, valid_tokens
         else:
-            keys, values = jnp.concatenate((carry.key, key), 1), jnp.concatenate((carry.value, value), 1)
-            key_positions = jnp.concatenate((old_positions, positions), 1)
-            key_segments = jnp.concatenate((jnp.zeros_like(old_positions), segments), 1)
-        sc.check(segments, "BT", jnp.int32)
-        sc.check((key_positions, key_segments), "BS", jnp.int32)
-        mask = segments[:, :, None] == key_segments[:, None, :]
-        mask &= key_positions[:, None, :] >= 0
+            old_key, old_value = (jnp.where(old_valid[..., None, None], v, 0) for v in (carry.key, carry.value))
+            keys, values = jnp.concatenate((old_key, key), 1), jnp.concatenate((old_value, value), 1)
+            key_positions = jnp.concatenate((jnp.broadcast_to(slots, sc["BC"]), positions), 1)
+            key_valid = jnp.concatenate((old_valid, valid_tokens), 1)
+        sc.check(key_positions, "BS", jnp.int32)
+        sc.check(key_valid, "BS", jnp.bool_)
+        mask = jnp.broadcast_to(key_valid[:, None, :], sc["BTS"])
         if causal:
-            distance = positions[:, :, None] - key_positions[:, None, :]
-            sc.check(distance, "BTS", jnp.int32)
-            mask &= distance >= 0
+            mask &= positions[:, :, None] >= key_positions[:, None, :]
+        # Invalid queries attend a harmless slot, avoiding all-masked softmax
+        # rows (and NaN gradients in fused backends). Their output is zeroed.
+        fallback = jnp.arange(keys.shape[1]) == 0
+        mask = jnp.where(valid_tokens[:, :, None], mask, fallback)
         mask = mask[:, None]
         sc.check(mask, "BUTS", jnp.bool_)
     queries = query
@@ -259,20 +312,19 @@ def _attention(
         implementation=implementation,
     )
     attention_sc.check(attended, "BQHF", attention_dtype)
-    attended = attended[:, :steps].astype(dtype)
+    attended = jnp.where(valid_tokens[..., None, None], attended[:, :steps].astype(dtype), 0)
 
-    next_position = positions[:, -1] + 1
-    # Gather writes from the final episode in this chunk. Earlier
-    # cache entries survive only when that episode continued the carry.
-    source = steps - next_position[:, None] + slots
+    # Append each valid prefix immediately after that example's cached history.
+    source = slots - carry.position[:, None]
+    sc.check(source, "BC", jnp.int32)
     gather = jnp.clip(source, 0, steps - 1)[..., None, None]
     new_key, new_value = (jnp.take_along_axis(v, gather, axis=1) for v in (key, value))
     sc.check((new_key, new_value), "BCKF", dtype)
-    written = (source >= 0)[..., None, None]
-    valid = (slots < next_position[:, None])[..., None, None]
+    written = ((source >= 0) & (source < x_len[:, None]))[..., None, None]
+    sc.check(written, "BCUU", jnp.bool_)
     carry = TransformerCarry(
-        jnp.where(valid, jnp.where(written, new_key, carry.key), 0),
-        jnp.where(valid, jnp.where(written, new_value, carry.value), 0),
+        jnp.where(written, new_key, carry.key),
+        jnp.where(written, new_value, carry.value),
         next_position,
     )
     sc.check((carry.key, carry.value), "BCKF", dtype)
@@ -287,7 +339,7 @@ class TransformerBlock(nn.Module):
     MLP width is ``round(dim * mlp_expansion)``; expansion defaults to 2.
     ``num_kv_heads=None`` gives ordinary multi-head attention.
     ``causal=False`` allows attention to future tokens in the current chunk,
-    within the same episode. Defaults to causal attention.
+    within the sequence. Defaults to causal attention.
 
     Fewer KV heads enable grouped-query attention (one gives multi-query
     attention). ``dim`` must be divisible by ``num_heads``, and the query
@@ -313,29 +365,25 @@ class TransformerBlock(nn.Module):
 
     @nn.nowrap
     def _dimensions(self) -> tuple[int, int]:
-        for name in ("dim", "num_heads", "max_seq_len"):
+        for name in ("dim", "num_heads"):
             _positive_integer(getattr(self, name), name)
         self._mlp_width()
         kv_heads = self.num_heads if self.num_kv_heads is None else self.num_kv_heads
-        _positive_integer(kv_heads, "num_kv_heads")
         chex.assert_is_divisible(self.dim, self.num_heads)
-        chex.assert_is_divisible(self.num_heads, kv_heads)
         head_dim = self.dim // self.num_heads
-        chex.assert_is_divisible(head_dim, 2)
-        for name in ("rope_theta", "initializer_range", "norm_epsilon"):
+        _check_attention_config(
+            num_heads=self.num_heads,
+            num_kv_heads=kv_heads,
+            head_dim=head_dim,
+            max_seq_len=self.max_seq_len,
+            rope_theta=self.rope_theta,
+            causal=self.causal,
+            implementation=self.attention_implementation,
+            dtype=self.dtype,
+        )
+        for name in ("initializer_range", "norm_epsilon"):
             if not 0 < getattr(self, name) < math.inf:
                 raise ValueError(f"{name} must be positive and finite")
-        if self.attention_implementation not in ("xla", "cudnn"):
-            raise ValueError("attention_implementation must be 'xla' or 'cudnn'")
-        if not isinstance(self.causal, bool):
-            raise TypeError("causal must be a bool")
-        dtype = jnp.dtype(self.dtype)
-        if dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
-            raise ValueError("dtype must be float32, bfloat16, or float16")
-        if self.attention_implementation == "cudnn" and dtype == jnp.float32:
-            raise ValueError("cuDNN attention requires dtype=float16 or bfloat16")
-        if self.attention_implementation == "cudnn":
-            chex.assert_is_divisible(head_dim, 8)
         return kv_heads, head_dim
 
     @nn.nowrap
@@ -357,30 +405,38 @@ class TransformerBlock(nn.Module):
     def __call__(
         self,
         x: jax.Array,
+        x_len: jax.Array | None = None,
         carry: TransformerCarry | None = None,
-        episode_starts: jax.Array | None = None,
     ) -> tuple[TransformerCarry, jax.Array]:
         """Map [batch,time,dim] to (updated KV cache, same-shaped output).
 
-        Input dimensions are assumed nonempty.
-        A True entry in ``episode_starts[batch,time]`` discards all preceding
-        history for that example before processing its current input.
+        Input dimensions must be nonempty.
+        ``x_len`` is int32 [batch], in [0, time], defaulting to time.
+        Only the left-aligned valid prefix updates history; right-padded
+        outputs are zero. A zero length preserves that example's cache.
         """
         kv_heads, head_dim = self._dimensions()
         width = self._mlp_width()
         # B/T: batch/time, D: model width, H/K: query/KV heads,
-        # F: head width, C: cache capacity, I: MLP width, U: singleton.
-        sc = ShapeChecker(D=self.dim, H=self.num_heads, K=kv_heads, F=head_dim, C=self.max_seq_len, I=width, U=1)
+        # F: head width, C: cache capacity, I: MLP width.
+        sc = ShapeChecker(D=self.dim, H=self.num_heads, K=kv_heads, F=head_dim, C=self.max_seq_len, I=width)
         sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
         _positive_integer(x.shape[0], "batch_size")
+        _positive_integer(x.shape[1], "sequence_length")
         if carry is not None:
             if not isinstance(carry, TransformerCarry):
                 raise TypeError("carry must be a TransformerCarry")
             sc.check((carry.key, carry.value), "BCKF", self.dtype)
             sc.check(carry.position, "B", jnp.int32)
-        if episode_starts is not None:
-            sc.check(episode_starts, "BT", jnp.bool_)
+        if x_len is not None:
+            sc.check(x_len, "B", jnp.int32)
+
+        valid_tokens = None
+        if x_len is not None:
+            valid_tokens = jnp.arange(x.shape[1])[None, :] < x_len[:, None]
+            sc.check(valid_tokens, "BT", jnp.bool_)
+            x = jnp.where(valid_tokens[..., None], x, 0)
 
         # Attention projections use [batch,time,heads,head_dim].
         residual = x
@@ -402,7 +458,7 @@ class TransformerBlock(nn.Module):
             key,
             value,
             carry,
-            episode_starts,
+            x_len,
             max_seq_len=self.max_seq_len,
             rope_theta=self.rope_theta,
             causal=self.causal,
@@ -424,23 +480,29 @@ class TransformerBlock(nn.Module):
         y = nn.Dense(self.dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="down_proj")(y)
         sc.check(y, "BTD", self.dtype)
         output = x + y
+        if valid_tokens is not None:
+            output = jnp.where(valid_tokens[..., None], output, 0)
         sc.check(output, "BTD", residual_dtype)
         return carry, output
 
     def step(
         self,
         x: jax.Array,
+        x_len: jax.Array | None = None,
         carry: TransformerCarry | None = None,
-        episode_starts: jax.Array | None = None,
     ) -> tuple[TransformerCarry, jax.Array]:
-        """Process [batch,dim] using the same parameters as sequence calls."""
+        """Process [batch,dim] with optional int32 [batch] x_len of 0 or 1.
+
+        Zero lengths skip the example and return zero output. Requires causal=True.
+        """
+        if not self.causal:
+            raise ValueError("step() requires causal=True; use __call__() for bidirectional attention")
         sc = ShapeChecker(D=self.dim)
         sc.check(x, "BD")
         chex.assert_type(x, jnp.floating)
-        if episode_starts is not None:
-            sc.check(episode_starts, "B", jnp.bool_)
-        starts = None if episode_starts is None else episode_starts[:, None]
-        carry, y = self(x[:, None], carry, starts)
+        if x_len is not None:
+            sc.check(x_len, "B", jnp.int32)
+        carry, y = self(x[:, None], x_len, carry)
         output = y[:, 0]
         sc.check(output, "BD", jnp.result_type(x.dtype, self.dtype))
         return carry, output
@@ -449,7 +511,7 @@ class TransformerBlock(nn.Module):
 class TransformerStack(nn.Module):
     """Llama 3 decoder backbone with independent pre-RMSNorm/SwiGLU layers.
 
-    Sequences and reset masks are batch-major. Carry is a tuple of one
+    Sequences are batch-major; optional int32 x_len has shape [batch]. Carry is a tuple of one
     TransformerCarry per layer. MLP width is ``round(dim * mlp_expansion)``,
     with a default expansion of 2, shared by every block.
     Final RMSNorm defaults on; residual additions
@@ -458,7 +520,7 @@ class TransformerStack(nn.Module):
     ``initializer_range`` (default 0.02), independent of depth.
     ``causal`` controls attention in every block and defaults to True.
     Non-causal attention sees the current chunk and cached history within
-    each episode; results depend on chunk boundaries.
+    each sequence; results depend on chunk boundaries.
     """
 
     dim: int
@@ -511,29 +573,34 @@ class TransformerStack(nn.Module):
     @nn.nowrap
     def initial_carry(self, batch_size: int) -> TransformerStackCarry:
         """Allocate independent caches for all layers without parameter init."""
+        self._mlp_width()
         block = self._make_block()
         return tuple(block.initial_carry(batch_size) for _ in range(self.num_layers))
 
     def __call__(
         self,
         x: jax.Array,
+        x_len: jax.Array | None = None,
         carry: TransformerStackCarry | None = None,
-        episode_starts: jax.Array | None = None,
     ) -> tuple[TransformerStackCarry, jax.Array]:
-        """Map [batch,time,dim] to (per-layer KV caches, output)."""
+        """Map [batch,time,dim] to (per-layer KV caches, output).
+
+        Optional int32 x_len[batch] counts valid prefix tokens in this chunk.
+        Right padding returns zero output and leaves cached history unchanged.
+        """
         sc = ShapeChecker(D=self.dim)
         sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
         if carry is not None and (not isinstance(carry, tuple) or len(carry) != self.num_layers):
             raise ValueError("carry must be a tuple with one TransformerCarry per layer")
-        if episode_starts is not None:
-            sc.check(episode_starts, "BT", jnp.bool_)
+        if x_len is not None:
+            sc.check(x_len, "B", jnp.int32)
         next_carry = []
         for i, layer in enumerate(self.layers):
             state = None if carry is None else carry[i]
             if carry is not None and not isinstance(state, TransformerCarry):
                 raise TypeError("each layer carry must be a TransformerCarry")
-            state, x = layer(x, state, episode_starts)
+            state, x = layer(x, x_len, state)
             next_carry.append(state)
         if self.final_norm:
             x = self.norm_f(x)
@@ -544,17 +611,21 @@ class TransformerStack(nn.Module):
     def step(
         self,
         x: jax.Array,
+        x_len: jax.Array | None = None,
         carry: TransformerStackCarry | None = None,
-        episode_starts: jax.Array | None = None,
     ) -> tuple[TransformerStackCarry, jax.Array]:
-        """Process [batch,dim] using the same parameters as sequence calls."""
+        """Process [batch,dim] with optional int32 [batch] x_len of 0 or 1.
+
+        Zero lengths skip the example and return zero output. Requires causal=True.
+        """
+        if not self.causal:
+            raise ValueError("step() requires causal=True; use __call__() for bidirectional attention")
         sc = ShapeChecker(D=self.dim)
         sc.check(x, "BD")
         chex.assert_type(x, jnp.floating)
-        if episode_starts is not None:
-            sc.check(episode_starts, "B", jnp.bool_)
-        starts = None if episode_starts is None else episode_starts[:, None]
-        carry, y = self(x[:, None], carry, starts)
+        if x_len is not None:
+            sc.check(x_len, "B", jnp.int32)
+        carry, y = self(x[:, None], x_len, carry)
         output = y[:, 0]
         sc.check(output, "BD", self.dtype)
         return carry, output

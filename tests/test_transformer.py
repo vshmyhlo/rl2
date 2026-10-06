@@ -21,7 +21,7 @@ type Carry = TransformerCarry | TransformerStackCarry
 
 
 @pytest.mark.parametrize("causal", [True, False])
-def test_attention_uniform_values_and_cache_reset(causal: bool) -> None:
+def test_attention_uniform_values_and_zero_length(causal: bool) -> None:
     query = jnp.zeros((1, 2, 2, 2), jnp.float32)
     key = jnp.zeros((1, 2, 1, 2), jnp.float32)
     value = jnp.broadcast_to(jnp.asarray([2.0, 6.0])[None, :, None, None], key.shape)
@@ -42,12 +42,14 @@ def test_attention_uniform_values_and_cache_reset(causal: bool) -> None:
     sc.check(output, "BUHF", jnp.float32)
     np.testing.assert_allclose(output, 6.0)
     np.testing.assert_array_equal(continued.position, [3])
-    reset, output = attend(query[:, :1], key[:, :1], next_value, carry, jnp.ones((1, 1), jnp.bool_))
+    skipped, output = attend(query[:, :1], key[:, :1], next_value, continued, jnp.zeros((1,), jnp.int32))
     sc.check(output, "BUHF", jnp.float32)
-    np.testing.assert_allclose(output, 10.0)
-    np.testing.assert_array_equal(reset.position, [1])
-    np.testing.assert_array_equal(reset.value[:, :1], next_value)
-    np.testing.assert_array_equal(reset.value[:, 1:], 0)
+    np.testing.assert_array_equal(output, 0)
+    assert_carry_close(skipped, continued)
+    empty, output = attend(query, key, value, x_len=jnp.zeros((1,), jnp.int32))
+    np.testing.assert_array_equal(output, 0)
+    np.testing.assert_array_equal(empty.position, 0)
+    np.testing.assert_array_equal(empty.value, 0)
 
 
 @pytest.mark.parametrize(
@@ -69,6 +71,49 @@ def test_attention_rejects_incompatible_values(value_shape: tuple[int, ...], val
             causal=True,
             implementation="xla",
         )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({"causal": "false"}, id="non-bool-causal"),
+        pytest.param({"implementation": None}, id="implicit-backend"),
+        pytest.param({"rope_theta": float("inf")}, id="infinite-rope-theta"),
+        pytest.param({"max_seq_len": True}, id="boolean-capacity"),
+    ],
+)
+def test_attention_rejects_invalid_configuration(kwargs: dict[str, Any]) -> None:
+    x = jnp.zeros((1, 1, 1, 2), jnp.float32)
+    config = {"max_seq_len": 2, "rope_theta": 10000.0, "causal": True, "implementation": "xla"}
+    with pytest.raises((ValueError, TypeError, AssertionError)):
+        _attention(x, x, x, **(config | kwargs))
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param((1, 0, 1, 2), id="empty-time"),
+        pytest.param((1, 1, 0, 2), id="empty-heads"),
+        pytest.param((1, 1, 1, 0), id="empty-head-width"),
+    ],
+)
+def test_attention_rejects_empty_dimensions(shape: tuple[int, ...]) -> None:
+    x = jnp.zeros(shape, jnp.float32)
+    with pytest.raises((ValueError, AssertionError)):
+        _attention(x, x, x, max_seq_len=2, rope_theta=10000.0, causal=True, implementation="xla")
+
+
+@pytest.mark.parametrize("num_layers", [0, -1, True])
+def test_stack_initial_carry_rejects_invalid_layer_count(num_layers: int) -> None:
+    with pytest.raises((ValueError, TypeError, AssertionError)):
+        TransformerStack(4, num_layers, num_heads=1, max_seq_len=2).initial_carry(1)
+
+
+@pytest.mark.parametrize("stack", [False, True])
+def test_empty_sequence_is_rejected_before_projections(stack: bool) -> None:
+    model = TransformerStack(4, 1, num_heads=1) if stack else TransformerBlock(4, num_heads=1)
+    with pytest.raises((ValueError, AssertionError)):
+        model.apply({}, jnp.zeros((1, 0, 4), jnp.float32))
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
@@ -117,18 +162,18 @@ def assert_carry_close(actual: Carry, expected: Carry, tolerance: float = 5e-6) 
 def reference_block(
     x: np.ndarray,
     params: dict[str, Any],
-    starts: np.ndarray,
+    x_len: np.ndarray,
     heads: int,
     kv_heads: int,
     theta: float,
     epsilon: float = 1e-5,
     causal: bool = True,
 ) -> np.ndarray:
-    """Float64 NumPy oracle with explicit per-episode, per-query attention."""
+    """Float64 NumPy oracle with explicit attention over valid prefixes."""
     sc = ShapeChecker(H=heads, K=kv_heads)
     sc.check(x, "BTD")
     chex.assert_type(x, np.floating)
-    sc.check(starts, "BT", np.bool_)
+    sc.check(x_len, "B", np.int32)
     batch, steps, width = x.shape
     head_dim = width // heads
     residual = x.astype(np.float64)
@@ -141,25 +186,18 @@ def reference_block(
     sc.check((key, value), "BTKF", np.float64)
     output = np.zeros_like(query)
     for b in range(batch):
-        start = 0
-        for t in range(steps):
-            if starts[b, t]:
-                start = t
+        for t in range(x_len[b]):
             for pair in range(head_dim // 2):
-                angle = (t - start) / theta ** (2 * pair / head_dim)
+                angle = t / theta ** (2 * pair / head_dim)
                 c, s = np.cos(angle), np.sin(angle)
                 for tensor in (query, key):
                     real = tensor[b, t, :, 2 * pair].copy()
                     imag = tensor[b, t, :, 2 * pair + 1].copy()
                     tensor[b, t, :, 2 * pair] = real * c - imag * s
                     tensor[b, t, :, 2 * pair + 1] = real * s + imag * c
-        start = 0
-        for t in range(steps):
-            if starts[b, t]:
-                start = t
-            left = start
-            following_resets = np.flatnonzero(starts[b, t + 1 :])
-            right = t + 1 if causal else (t + 1 + following_resets[0] if following_resets.size else steps)
+        for t in range(x_len[b]):
+            left = 0
+            right = t + 1 if causal else x_len[b]
             for h in range(heads):
                 group = h // (heads // kv_heads)
                 logits = key[b, left:right, group] @ query[b, t, h] / np.sqrt(head_dim)
@@ -173,7 +211,7 @@ def reference_block(
     sc.check((gate, value), "BTI", np.float64)
     result = x + ((gate / (1 + np.exp(-gate))) * value) @ np.asarray(params["down_proj"]["kernel"])
     sc.check(result, "BTD", np.float64)
-    return result
+    return np.where((np.arange(steps)[None, :] < x_len[:, None])[..., None], result, 0)
 
 
 @pytest.mark.parametrize("kv_heads", [1, 2, 4])
@@ -182,19 +220,19 @@ def test_attention_matches_numpy_reference(kv_heads: int) -> None:
         16, num_heads=4, num_kv_heads=kv_heads, max_seq_len=9, rope_theta=137.0, initializer_range=0.2
     )
     x = jax.random.normal(jax.random.key(1), (2, 9, 16))
-    starts = jnp.zeros((2, 9), jnp.bool_).at[0, 4].set(True).at[1, 1].set(True).at[1, 7].set(True)
+    x_len = jnp.array([4, 9], jnp.int32)
     variables = model.init(jax.random.key(2), x)
     # Larger weights expose QK normalization and RoPE pairing differences.
     variables["params"]["norm"]["scale"] = jnp.linspace(0.5, 1.5, 16)
     variables["params"]["norm2"]["scale"] = jnp.linspace(1.5, 0.5, 16)
     assert "q_norm" not in variables["params"]
     assert "k_norm" not in variables["params"]
-    _, actual = jax.jit(model.apply)(variables, x, None, starts)
-    expected = reference_block(np.asarray(x), variables["params"], np.asarray(starts), 4, kv_heads, 137.0)
+    _, actual = jax.jit(model.apply)(variables, x, x_len)
+    expected = reference_block(np.asarray(x), variables["params"], np.asarray(x_len), 4, kv_heads, 137.0)
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
     # Also exercise the native full causal path without a supplied mask.
     _, actual = model.apply(variables, x)
-    expected = reference_block(np.asarray(x), variables["params"], np.zeros((2, 9), bool), 4, kv_heads, 137.0)
+    expected = reference_block(np.asarray(x), variables["params"], np.full((2,), 9, np.int32), 4, kv_heads, 137.0)
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
 
 
@@ -203,9 +241,9 @@ def test_norm_epsilon_and_full_history() -> None:
     x = jax.random.normal(jax.random.key(23), (1, 4, 8)) * 0.01
     variables = model.init(jax.random.key(24), x)
     carry, actual = model.apply(variables, x[:, :3])
-    final, last = model.apply(variables, x[:, 3:], carry)
+    final, last = model.apply(variables, x[:, 3:], carry=carry)
     expected = reference_block(
-        np.asarray(x), variables["params"], np.zeros((1, 4), bool), 2, 1, model.rope_theta, model.norm_epsilon
+        np.asarray(x), variables["params"], np.full((1,), 4, np.int32), 2, 1, model.rope_theta, model.norm_epsilon
     )
     np.testing.assert_allclose(jnp.concatenate((actual, last), axis=1), expected, atol=1e-7, rtol=2e-5)
     np.testing.assert_array_equal(final.position, [4])
@@ -223,69 +261,77 @@ def test_norm_epsilon_and_full_history() -> None:
     np.testing.assert_allclose(perturbed[0, -1] - baseline[0, -1], contribution, atol=1e-6)
 
 
-def test_noncausal_packed_and_cached_attention_matches_reference() -> None:
+def test_noncausal_padded_and_cached_attention_matches_reference() -> None:
     model = TransformerBlock(8, num_heads=2, num_kv_heads=1, max_seq_len=6, initializer_range=0.2, causal=False)
     x = jax.random.normal(jax.random.key(33), (2, 5, 8))
-    starts = jnp.zeros((2, 5), jnp.bool_).at[0, 3].set(True).at[1, 2].set(True)
+    x_len = jnp.array([3, 5], jnp.int32)
     sc = ShapeChecker(B=2, T=5, D=8, C=6, K=1, F=4)
     sc.check(x, "BTD", jnp.float32)
-    sc.check(starts, "BT", jnp.bool_)
+    sc.check(x_len, "B", jnp.int32)
     variables = model.init(jax.random.key(34), x)
     expected = reference_block(
-        np.asarray(x), variables["params"], np.asarray(starts), 2, 1, model.rope_theta, causal=False
+        np.asarray(x), variables["params"], np.asarray(x_len), 2, 1, model.rope_theta, causal=False
     )
-    full_carry, actual = jax.jit(model.apply)(variables, x, episode_starts=starts)
+    full_carry, actual = jax.jit(model.apply)(variables, x, x_len=x_len)
     sc.check(actual, "BTD", jnp.float32)
     np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-5)
 
     carry, _ = model.apply(variables, x[:, :1])
     # Unused slots must be excluded even when they contain nonzero data.
-    carry = carry._replace(key=carry.key.at[:, 1:].set(100), value=carry.value.at[:, 1:].set(100))
+    carry = carry._replace(key=carry.key.at[:, 1:3].set(100), value=carry.value.at[:, 1:3].set(100))
     sc.check((carry.key, carry.value), "BCKF", jnp.float32)
-    cached_carry, cached = jax.jit(model.apply)(variables, x[:, 1:], carry, starts[:, 1:])
+    cached_carry, cached = jax.jit(model.apply)(variables, x[:, 1:], x_len - 1, carry)
     sc.check(cached, "BSD", jnp.float32)
     np.testing.assert_allclose(cached, expected[:, 1:], atol=2e-6, rtol=2e-5)
     assert_carry_close(cached_carry, full_carry)
 
-    # A single step can attend to supplied history, but has no future input.
-    _, stepped = model.apply(variables, x[:, 1], carry, method=model.step)
-    step_expected = reference_block(
-        np.asarray(x[:, :2]), variables["params"], np.asarray(starts[:, :2]), 2, 1, model.rope_theta, causal=False
-    )
-    sc.check(stepped, "BD", jnp.float32)
-    np.testing.assert_allclose(stepped, step_expected[:, -1], atol=2e-6, rtol=2e-5)
+
+@pytest.mark.parametrize("stack", [False, True], ids=["block", "stack"])
+def test_noncausal_step_is_rejected_before_projections(stack: bool) -> None:
+    kwargs = {"dim": 4, "num_heads": 1, "max_seq_len": 2, "causal": False}
+    model = TransformerStack(**kwargs, num_layers=1) if stack else TransformerBlock(**kwargs)
+    x = jnp.zeros((1, 4), jnp.float32)
+    sc = ShapeChecker(B=1, D=4)
+    sc.check(x, "BD", jnp.float32)
+    step = partial(model.apply, method=model.step)
+    with pytest.raises(ValueError, match=r"step\(\) requires causal=True"):
+        step({}, x)
+    with pytest.raises(ValueError, match=r"step\(\) requires causal=True"):
+        jax.jit(step)({}, x)
 
 
 @pytest.mark.parametrize("compiled", [False, True])
-def test_cache_capacity_and_packed_episode_resets(compiled: bool) -> None:
-    model = TransformerBlock(8, num_heads=2, max_seq_len=3)
-    x = jax.random.normal(jax.random.key(25), (1, 6, 8))
+def test_cache_capacity_and_length_validation(compiled: bool) -> None:
+    model = TransformerBlock(4, num_heads=1, max_seq_len=3)
+    x = jax.random.normal(jax.random.key(25), (1, 4, 4))
     variables = model.init(jax.random.key(26), x[:, :1])
     apply = jax.jit(model.apply) if compiled else model.apply
-    starts = jnp.zeros((1, 6), jnp.bool_).at[:, 3].set(True)
-    carry, actual = apply(variables, x, episode_starts=starts)
-    expected = reference_block(np.asarray(x), variables["params"], np.asarray(starts), 2, 2, model.rope_theta)
-    np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-5)
-    fresh, expected = apply(variables, x[:, 3:])
+    lengths = jnp.array([3], jnp.int32)
+    carry, actual = apply(variables, x, x_len=lengths)
+    fresh, expected = model.apply(variables, x[:, :3])
     assert_carry_close(carry, fresh)
-    # A full cache may be reused after an explicit reset.
-    reset, output = apply(variables, x[:, :1], carry, jnp.ones((1, 1), jnp.bool_))
-    fresh, expected = apply(variables, x[:, :1])
-    assert_carry_close(reset, fresh)
-    np.testing.assert_allclose(output, expected, atol=2e-6)
+    np.testing.assert_allclose(actual[:, :3], expected, atol=2e-6)
+    np.testing.assert_array_equal(actual[:, 3:], 0)
+    skipped, output = apply(variables, x, jnp.zeros_like(lengths), carry)
+    assert_carry_close(skipped, carry)
+    np.testing.assert_array_equal(output, 0)
     if compiled:
-        # Batched conditionals must not report overflow for valid episodes.
-        mapped = jax.jit(jax.vmap(model.apply, in_axes=(None, 0)))
-        _, outputs = mapped(variables, jnp.stack((x[:, :3], x[:, 3:])))
-        np.testing.assert_allclose(outputs[1], actual[:, 3:], atol=2e-6, rtol=2e-5)
+        mapped = jax.jit(jax.vmap(model.apply, in_axes=(None, 0, 0)))
+        _, outputs = mapped(variables, x[None], lengths[None])
+        np.testing.assert_allclose(outputs[0], actual, atol=2e-6)
     error = jax.errors.JaxRuntimeError if compiled else ValueError
     with pytest.raises(error, match="max_seq_len cache capacity"):
-        jax.block_until_ready(apply(variables, x[:, :4]))
+        jax.block_until_ready(apply(variables, x))
     with pytest.raises(error, match="max_seq_len cache capacity"):
-        jax.block_until_ready(apply(variables, x[:, :1], carry))
-    # Overflow before a later reset must also fail.
-    with pytest.raises(error, match="max_seq_len cache capacity"):
-        jax.block_until_ready(apply(variables, x, episode_starts=starts.at[:, 3].set(False).at[:, 4].set(True)))
+        jax.block_until_ready(apply(variables, x[:, :1], carry=carry))
+    for invalid in (-1, 5):
+        with pytest.raises(error, match="x_len must be between"):
+            jax.block_until_ready(apply(variables, x, x_len=jnp.array([invalid], jnp.int32)))
+    for invalid in (-1, 4):
+        with pytest.raises(error, match="Invalid cache position"):
+            jax.block_until_ready(
+                apply(variables, x, jnp.zeros_like(lengths), carry._replace(position=jnp.array([invalid], jnp.int32)))
+            )
 
 
 @pytest.mark.parametrize(
@@ -363,7 +409,7 @@ def test_stack_matches_llama_reference_with_final_norm(causal: bool) -> None:
         }
         for name in ("q_proj", "k_proj", "v_proj", "out_proj", "gate_proj", "up_proj", "down_proj"):
             assert set(layer[name]) == {"kernel"}
-        expected = reference_block(expected, layer, np.zeros((1, 3), bool), 2, 1, model.rope_theta, causal=causal)
+        expected = reference_block(expected, layer, np.full((1,), 3, np.int32), 2, 1, model.rope_theta, causal=causal)
     expected /= np.sqrt(np.mean(expected**2, axis=-1, keepdims=True) + model.norm_epsilon)
     expected *= np.asarray(params["norm_f"]["scale"])
     _, actual = jax.jit(model.apply)(variables, x)
@@ -415,71 +461,70 @@ def test_invalid_initializer_range(initializer_range: float) -> None:
             model.initial_carry(1)
 
 
-@pytest.mark.parametrize("stack,window,resets", [(False, 9, True), (True, 9, True), (True, 9, False), (True, 1, True)])
-def test_full_chunks_and_scanned_steps_agree(stack: bool, window: int, resets: bool) -> None:
-    kwargs = {"dim": 16, "num_heads": 4, "num_kv_heads": 2, "max_seq_len": window}
+@pytest.mark.parametrize("stack", [False, True], ids=["block", "stack"])
+def test_full_chunks_and_scanned_steps_agree(stack: bool) -> None:
+    kwargs = {"dim": 8, "num_heads": 2, "num_kv_heads": 1, "max_seq_len": 5}
     model = TransformerStack(**kwargs, num_layers=2) if stack else TransformerBlock(**kwargs)
-    x = jax.random.normal(jax.random.key(3), (2, 9, 16))
-    starts = jnp.zeros((2, 9), jnp.bool_)
-    if window == 1:
-        starts = jnp.ones_like(starts)
-    elif resets:
-        starts = starts.at[0, 2].set(True).at[0, 3].set(True).at[1, 6].set(True)
-    variables = model.init(jax.random.key(4), x, episode_starts=starts)
-    final, expected = jax.jit(model.apply)(variables, x, None, starts if resets else None)
-    carry, first = model.apply(variables, x[:, :2], episode_starts=starts[:, :2])
-    carry, second = model.apply(variables, x[:, 2:7], carry, starts[:, 2:7])
-    carry, third = model.apply(variables, x[:, 7:], carry, starts[:, 7:])
-    np.testing.assert_allclose(jnp.concatenate((first, second, third), axis=1), expected, rtol=2e-5, atol=5e-6)
+    x = jax.random.normal(jax.random.key(3), (2, 5, 8))
+    x_len = jnp.array([2, 5], jnp.int32)
+    variables = model.init(jax.random.key(4), x, x_len=x_len)
+    final, expected = jax.jit(model.apply)(variables, x, x_len=x_len)
+    carry, first = model.apply(variables, x[:, :3], x_len=jnp.minimum(x_len, 3))
+    carry, second = model.apply(variables, x[:, 3:], jnp.maximum(x_len - 3, 0), carry)
+    np.testing.assert_allclose(jnp.concatenate((first, second), axis=1), expected, rtol=2e-5, atol=5e-6)
     assert_carry_close(carry, final)
 
     def step(state: Carry, inputs: tuple[jax.Array, jax.Array]) -> tuple[Carry, jax.Array]:
-        token, reset = inputs
-        chex.assert_shape(token, (2, 16))
-        chex.assert_type(token, jnp.float32)
-        chex.assert_shape(reset, (2,))
-        chex.assert_type(reset, jnp.bool_)
-        return model.apply(variables, token, state, reset, method=model.step)
+        token, length = inputs
+        sc = ShapeChecker(B=2, D=8)
+        sc.check(token, "BD", jnp.float32)
+        sc.check(length, "B", jnp.int32)
+        return model.apply(variables, token, length, state, method=model.step)
 
-    carry, actual = jax.jit(partial(jax.lax.scan, step))(model.initial_carry(2), (jnp.swapaxes(x, 0, 1), starts.T))
-    actual = jnp.swapaxes(actual, 0, 1)
-    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=5e-6)
+    lengths = (jnp.arange(5)[:, None] < x_len).astype(jnp.int32)
+    carry, actual = jax.jit(partial(jax.lax.scan, step))(model.initial_carry(2), (jnp.swapaxes(x, 0, 1), lengths))
+    np.testing.assert_allclose(jnp.swapaxes(actual, 0, 1), expected, rtol=2e-5, atol=5e-6)
     assert_carry_close(carry, final)
     fresh, single = model.apply(variables, x[:, 0], method=model.step)
     initial, sequence = model.apply(variables, x[:, :1])
     assert_carry_close(fresh, initial)
     np.testing.assert_allclose(single, sequence[:, 0])
+    # A later valid chunk appends at each example's own position after padding.
+    continued, output = model.apply(variables, x[:, :1], jnp.array([1, 0], jnp.int32), final)
+    reference, reference_output = model.apply(variables, jnp.concatenate((x[:1, :2], x[:1, :1]), axis=1))
+    np.testing.assert_allclose(output[:1], reference_output[:, -1:], atol=5e-6)
+    np.testing.assert_array_equal(output[1:], 0)
+    for actual_state, reference_state in zip(jax.tree.leaves(continued), jax.tree.leaves(reference)):
+        np.testing.assert_allclose(actual_state[:1], reference_state, atol=5e-6)
 
 
-def test_causality_episode_isolation_and_cache_clearing() -> None:
-    model = TransformerStack(16, 2, num_heads=4, num_kv_heads=1, max_seq_len=8)
-    x = jax.random.normal(jax.random.key(5), (2, 7, 16))
+@pytest.mark.parametrize("causal", [True, False])
+def test_padding_isolation_and_empty_examples(causal: bool) -> None:
+    model = TransformerStack(8, 2, num_heads=2, num_kv_heads=1, max_seq_len=4, causal=causal)
+    x = jax.random.normal(jax.random.key(5), (2, 4, 8))
+    x_len = jnp.array([2, 0], jnp.int32)
+    valid = jnp.arange(4)[None, :] < x_len[:, None]
     variables = model.init(jax.random.key(6), x)
-    _, baseline = model.apply(variables, x)
-    _, perturbed = model.apply(variables, x.at[:, 4:].add(100))
-    np.testing.assert_allclose(baseline[:, :4], perturbed[:, :4], atol=1e-6)
-    starts = jnp.zeros((2, 7), jnp.bool_).at[0, 5].set(True)
-    final, actual = model.apply(variables, x, episode_starts=starts)
-    fresh, expected = model.apply(variables, x[:1, 5:])
-    np.testing.assert_allclose(actual[:1, 5:], expected, rtol=2e-5, atol=5e-6)
-    np.testing.assert_allclose(actual[1], baseline[1], rtol=2e-5, atol=5e-6)
-
-    def first_example(leaf: jax.Array) -> jax.Array:
-        chex.assert_axis_dimension(leaf, 0, 2)
-        chex.assert_type(leaf, jnp.int32 if leaf.ndim == 1 else jnp.float32)
-        return leaf[:1]
-
+    final, actual = jax.jit(model.apply)(variables, jnp.where(valid[..., None], x, jnp.nan), x_len=x_len)
+    fresh, expected = model.apply(variables, x[:1, :2])
+    np.testing.assert_allclose(actual[:1, :2], expected, rtol=2e-5, atol=5e-6)
+    np.testing.assert_array_equal(actual[~valid], 0)
     for state, new_state in zip(final, fresh):
-        np.testing.assert_array_equal(state.position, [2, 7])
-        assert_carry_close(jax.tree.map(first_example, state), new_state)
-        np.testing.assert_array_equal(state.key[0, 2:], 0)
-        np.testing.assert_array_equal(state.value[0, 2:], 0)
+        np.testing.assert_array_equal(state.position, [2, 0])
+        np.testing.assert_allclose(state.key[:1], new_state.key, atol=5e-6)
+        np.testing.assert_allclose(state.value[:1], new_state.value, atol=5e-6)
+        np.testing.assert_array_equal(state.key[1:], 0)
+        np.testing.assert_array_equal(state.value[1:], 0)
+    if causal:
+        _, baseline = model.apply(variables, x)
+        _, perturbed = model.apply(variables, x.at[:, 2:].add(100))
+        np.testing.assert_allclose(baseline[:, :2], perturbed[:, :2], atol=1e-6)
 
 
 def test_gradients_through_chunked_cache_match_full_sequence() -> None:
     model = TransformerStack(8, 2, num_heads=2, num_kv_heads=1, max_seq_len=7)
     x = jax.random.normal(jax.random.key(7), (2, 7, 8))
-    starts = jnp.zeros((2, 7), jnp.bool_).at[0, 4].set(True)
+    x_len = jnp.array([4, 7], jnp.int32)
     params = model.init(jax.random.key(8), x)["params"]
     probe = jax.random.normal(jax.random.key(9), x.shape)
 
@@ -487,11 +532,11 @@ def test_gradients_through_chunked_cache_match_full_sequence() -> None:
         chex.assert_shape(inputs, (2, 7, 8))
         chex.assert_type(inputs, jnp.float32)
         if chunked:
-            carry, first = model.apply({"params": parameters}, inputs[:, :3], episode_starts=starts[:, :3])
-            _, second = model.apply({"params": parameters}, inputs[:, 3:], carry, starts[:, 3:])
+            carry, first = model.apply({"params": parameters}, inputs[:, :3], x_len=jnp.minimum(x_len, 3))
+            _, second = model.apply({"params": parameters}, inputs[:, 3:], jnp.maximum(x_len - 3, 0), carry)
             output = jnp.concatenate((first, second), axis=1)
         else:
-            _, output = model.apply({"params": parameters}, inputs, episode_starts=starts)
+            _, output = model.apply({"params": parameters}, inputs, x_len=x_len)
         return jnp.sum(output * probe)
 
     full = jax.jit(jax.grad(partial(loss, chunked=False), argnums=(0, 1)))(params, x)
@@ -499,6 +544,7 @@ def test_gradients_through_chunked_cache_match_full_sequence() -> None:
     for a, b in zip(jax.tree.leaves(full), jax.tree.leaves(chunks)):
         assert np.isfinite(a).all()
         np.testing.assert_allclose(a, b, rtol=3e-4, atol=2e-5)
+    np.testing.assert_array_equal(full[1][0, 4:], 0)
     # Numerical directional derivative also checks the shared backward path.
     direction = jax.random.normal(jax.random.key(10), x.shape)
     epsilon = 1e-3
@@ -523,7 +569,7 @@ def test_precision_initialization_and_parameter_independence(dtype: jax.typing.D
     layers = variables["params"]
     assert not np.array_equal(layers["layers_0"]["q_proj"]["kernel"], layers["layers_1"]["q_proj"]["kernel"])
     state, first = model.apply(variables, x[:, :1])
-    state, rest = model.apply(variables, x[:, 1:], state)
+    state, rest = model.apply(variables, x[:, 1:], carry=state)
     np.testing.assert_allclose(
         jnp.concatenate((first, rest), axis=1).astype(jnp.float32), y.astype(jnp.float32), atol=0.04, rtol=0.04
     )
@@ -562,23 +608,23 @@ def test_invalid_inputs_and_carries() -> None:
     with pytest.raises(AssertionError):
         model.apply(variables, x.astype(jnp.int32))
     with pytest.raises(AssertionError):
-        model.apply(variables, x, episode_starts=jnp.zeros((1, 2), jnp.int32))
+        model.apply(variables, x, x_len=jnp.zeros((1,), jnp.bool_))
     with pytest.raises(AssertionError):
-        model.apply(variables, x, episode_starts=jnp.zeros((2, 1), jnp.bool_))
+        model.apply(variables, x, x_len=jnp.zeros((2,), jnp.int32))
     with pytest.raises(AssertionError):
-        model.apply(variables, x, model.initial_carry(2))
+        model.apply(variables, x, carry=model.initial_carry(2))
     with pytest.raises(AssertionError):
-        model.apply(variables, x, carry._replace(position=jnp.zeros((1,), jnp.float32)))
+        model.apply(variables, x, carry=carry._replace(position=jnp.zeros((1,), jnp.float32)))
     with pytest.raises(AssertionError):
-        model.apply(variables, x, carry._replace(key=carry.key[:, :2]))
+        model.apply(variables, x, carry=carry._replace(key=carry.key[:, :2]))
     with pytest.raises(AssertionError):
-        model.apply(variables, x, carry._replace(value=carry.value.astype(jnp.bfloat16)))
+        model.apply(variables, x, carry=carry._replace(value=carry.value.astype(jnp.bfloat16)))
     with pytest.raises(AssertionError):
         model.apply(variables, x[..., :8])
     with pytest.raises(AssertionError):
         model.apply(variables, x[:, 0])
     with pytest.raises(TypeError):
-        model.apply(variables, x, tuple(carry))
+        model.apply(variables, x, carry=tuple(carry))
 
 
 @pytest.mark.parametrize("stack,step", [(False, True), (True, False), (True, True)])
@@ -595,9 +641,9 @@ def test_sequence_and_step_validate_inputs_before_projections(stack: bool, step:
     with pytest.raises(AssertionError):
         model.apply({}, x.astype(jnp.int32), method=method)
     with pytest.raises(AssertionError):
-        model.apply({}, x, episode_starts=jnp.zeros(shape[:-1], jnp.int32), method=method)
+        model.apply({}, x, x_len=jnp.zeros((1,), jnp.float32), method=method)
     with pytest.raises(AssertionError):
-        model.apply({}, x, episode_starts=jnp.zeros((2, *shape[1:-1]), jnp.bool_), method=method)
+        model.apply({}, x, x_len=jnp.zeros((1, 1), jnp.int32), method=method)
 
 
 @pytest.mark.parametrize(
@@ -628,7 +674,7 @@ def test_cudnn_mask_padding_preserves_outputs_and_gradients(
     x = jax.random.normal(jax.random.key(16), (2, steps, 16))
     variables = model.init(jax.random.key(17), x)
     carry = model.apply(variables, x)[0]
-    starts = jnp.zeros((2, steps), jnp.bool_).at[0, 0].set(True)
+    x_len = jnp.array([0, steps], jnp.int32)
     original_attention = jax.nn.dot_product_attention
     routed = []
 
@@ -667,7 +713,7 @@ def test_cudnn_mask_padding_preserves_outputs_and_gradients(
     def loss(inputs: jax.Array, network: TransformerBlock) -> tuple[jax.Array, jax.Array]:
         chex.assert_shape(inputs, (2, steps, 16))
         chex.assert_type(inputs, jnp.float32)
-        _, output = network.apply(variables, inputs, carry, starts)
+        _, output = network.apply(variables, inputs, x_len, carry)
         return jnp.sum(output.astype(jnp.float32) ** 2), output
 
     expected = jax.jit(jax.value_and_grad(partial(loss, network=model), has_aux=True))(x)
@@ -713,7 +759,7 @@ def test_attention_backend_forward_backward_and_decode(cached: bool, window: int
     backend = model.clone(attention_implementation=implementation)
     x = jax.random.normal(jax.random.key(14), (2, 5, 16))
     probe = jax.random.normal(jax.random.key(18), x.shape) / jnp.sqrt(x.size)
-    starts = jnp.zeros((2, 5), jnp.bool_).at[0, 3].set(True) if cached else None
+    x_len = jnp.array([0, 5], jnp.int32) if cached else None
     params = model.init(jax.random.key(15), x)["params"]
     initial = model.apply({"params": params}, x[:, :2])[0] if cached else None
 
@@ -722,7 +768,7 @@ def test_attention_backend_forward_backward_and_decode(cached: bool, window: int
     ) -> tuple[jax.Array, tuple[TransformerStackCarry, jax.Array]]:
         chex.assert_shape(inputs, (2, 5, 16))
         chex.assert_type(inputs, jnp.float32)
-        state, y = network.apply({"params": parameters}, inputs, initial, starts)
+        state, y = network.apply({"params": parameters}, inputs, x_len, initial)
         # A squared norm is nearly constant after RMSNorm and hides broken
         # attention gradients. A random projection exercises all directions.
         return jnp.sum(y.astype(jnp.float32) * probe), (state, y)
@@ -743,7 +789,9 @@ def test_attention_backend_forward_backward_and_decode(cached: bool, window: int
         with pytest.raises(AssertionError, match="gradient relative L2 error"):
             assert_gradient_close(jnp.zeros_like(b), b)
     cache = actual[1][0]
-    expected_state, expected_y = model.apply({"params": params}, x[:, 0], cache, method=model.step)
-    actual_state, actual_y = jax.jit(partial(backend.apply, method=backend.step))({"params": params}, x[:, 0], cache)
+    expected_state, expected_y = model.apply({"params": params}, x[:, 0], carry=cache, method=model.step)
+    actual_state, actual_y = jax.jit(partial(backend.apply, method=backend.step))(
+        {"params": params}, x[:, 0], carry=cache
+    )
     np.testing.assert_allclose(actual_y.astype(jnp.float32), expected_y.astype(jnp.float32), rtol=0.05, atol=0.015)
     assert_carry_close(actual_state, expected_state, tolerance=0.04)

@@ -95,6 +95,7 @@ from rl2.karel import (
 from rl2.karel_ast import AST_ACTIONS, KarelAST, program_actions
 from rl2.karel_ast_edit import FEEDBACK_SIZE, EditConfig, Evaluation, Observation
 from rl2.karel_ast_edit_vector import KarelASTEditVectorEnv
+from rl2.shape_checker import ShapeChecker
 from rl2.train_karel_ast_grpo import (
     Array,
     Metrics,
@@ -350,14 +351,21 @@ class EditTransformer(nn.Module):
 
     def step(self, event: Events, carry: EditCarry) -> ModelOutput:
         """Append one event per episode to the KV cache and predict the next action."""
-        chex.assert_rank(event.kind, 1)
         if carry is None:
             raise ValueError("Use prefill before step")
+        sc = ShapeChecker(C=6, F=FEEDBACK_SIZE, D=self.d_model, V=1 + self.max_nodes + len(AST_ACTIONS))
+        sc.check((carry.initial, carry.target), "BHWC", jnp.int32)
+        sc.check((event.kind, event.value), "B", jnp.int32)
+        sc.check(event.output, "BHWC", jnp.int32)
+        sc.check(event.feedback, "BF", jnp.float32)
         sequence = jax.tree.map(partial(jnp.expand_dims, axis=0), event)
         transformer, features = self.backbone.step(
-            self.encode_events(sequence, carry.initial, carry.target)[0], carry.transformer
+            self.encode_events(sequence, carry.initial, carry.target)[0], carry=carry.transformer
         )
-        return carry._replace(transformer=transformer), self.head(features).astype(jnp.float32)
+        sc.check(features, "BD", self.dtype)
+        logits = self.head(features).astype(jnp.float32)
+        sc.check(logits, "BV", jnp.float32)
+        return carry._replace(transformer=transformer), logits
 
 
 def empty_events(time: int, batch: int, config: Config) -> Events:
