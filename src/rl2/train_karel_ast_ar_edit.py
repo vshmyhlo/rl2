@@ -85,6 +85,7 @@ from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
+from rl2.attention import AttentionType
 from rl2.jax_cache import configure_compilation_cache
 from rl2.karel import (
     REWARD_COMPONENTS,
@@ -105,7 +106,7 @@ from rl2.train_karel_ast_grpo import (
     group_advantages,
     learning_rate_schedule,
 )
-from rl2.transformer import ARTransformer, AttentionImplementation, TransformerStackCarry
+from rl2.transformer import ARTransformer, TransformerStackCarry
 from rl2.utils import read_bytes, read_optional, write_bytes
 
 
@@ -135,7 +136,7 @@ class Config:
     num_heads: int = 5
     num_kv_heads: int | None = None
     bf16: bool = False
-    attention_implementation: AttentionImplementation = "xla"
+    attention_implementation: AttentionType = "xla"
 
     # Optimizer and clipped policy objective.
     learning_rate: float = 0.00025
@@ -271,7 +272,7 @@ class EditTransformer(nn.Module):
     max_seq_len: int = 256
     max_markers: int = 10
     dtype: jax.typing.DTypeLike = jnp.float32
-    attention_implementation: AttentionImplementation = "xla"
+    attention_implementation: AttentionType = "xla"
 
     def setup(self) -> None:
         """Create task and feedback encoders, event embeddings, and the causal policy."""
@@ -365,10 +366,8 @@ class EditTransformer(nn.Module):
         sc.check(event.output, "BHWC", jnp.int32)
         sc.check(event.feedback, "BF", jnp.float32)
         sequence = jax.tree.map(partial(jnp.expand_dims, axis=0), event)
-        x_len = jnp.ones(sc["B"], jnp.int32)
-        sc.check(x_len, "B", jnp.int32)
         transformer, features = self.backbone.step(
-            self.encode_events(sequence, carry.initial, carry.target)[0], x_len, carry.transformer
+            self.encode_events(sequence, carry.initial, carry.target)[0], carry.transformer
         )
         sc.check(features, "BD", self.dtype)
         logits = self.head(features).astype(jnp.float32)
@@ -798,7 +797,7 @@ def generate(state: TrainState, task: KarelProgramEnv, key: jax.Array, config: C
 
 
 def load_model(
-    run_dir: str | Path, *, attention_implementation: AttentionImplementation | None = None
+    run_dir: str | Path, *, attention_implementation: AttentionType | None = None
 ) -> tuple[Config, TrainState]:
     """Load checkpoint policy weights for inference, optionally overriding the attention backend.
 

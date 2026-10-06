@@ -11,6 +11,7 @@ import pytest
 from flax.training.train_state import TrainState
 
 from rl2.ast_transformer import ASTTransformer, _ASTBlock
+from rl2.attention import AttentionType
 from rl2.karel import KarelConfig, _parse
 from rl2.karel_ast import ACTION_ID, AST_ACTIONS, ASTFeatures, KarelAST, batch_features, teacher_forcing
 from rl2.train_karel_ast_grpo import (
@@ -21,7 +22,6 @@ from rl2.train_karel_ast_grpo import (
     load_config,
     predict,
 )
-from rl2.transformer import AttentionImplementation
 from rl2.tree_attention import Relation, tree_relations
 
 
@@ -209,7 +209,7 @@ def test_sequence_lengths_match_explicit_mask_outputs_and_gradients(dtype: jax.t
         query_seq_lengths: jax.Array,
         key_value_seq_lengths: jax.Array,
         is_causal: bool,
-        implementation: AttentionImplementation,
+        implementation: AttentionType,
     ) -> jax.Array:
         chex.assert_rank((query, key, value, bias), 4)
         chex.assert_type((query, key, value, bias), jnp.floating)

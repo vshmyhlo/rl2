@@ -16,7 +16,6 @@ def test_public_model_exports() -> None:
     assert set(transformer.__all__) == {
         "ARTransformer",
         "BDTransformer",
-        "AttentionImplementation",
         "TransformerCarry",
         "TransformerStackCarry",
     }

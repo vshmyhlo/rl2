@@ -7,10 +7,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from rl2.attention import AttentionType
 from rl2.karel import TOKENS, KarelConfig, KarelProgramEnv, sample_task
 from rl2.karel_model import KarelProgramModel
 from rl2.train_karel_ast_grpo import generation_logits
-from rl2.transformer import AttentionImplementation
 
 
 @pytest.fixture(scope="module")
@@ -162,7 +162,7 @@ def test_invalid_backbone_is_rejected(inputs: tuple[jax.Array, jax.Array, jax.Ar
     ],
 )
 def test_bf16_transformer_generation_and_gradients(
-    inputs: tuple[jax.Array, jax.Array, jax.Array], implementation: AttentionImplementation
+    inputs: tuple[jax.Array, jax.Array, jax.Array], implementation: AttentionType
 ) -> None:
     model = KarelProgramModel(
         backbone_type="transformer",

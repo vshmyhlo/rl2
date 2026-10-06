@@ -22,10 +22,11 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from rl2.attention import AttentionType
 from rl2.karel import TOKENS
 from rl2.mamba3 import Mamba3Stack, Mamba3StackCarry
 from rl2.shape_checker import ShapeChecker
-from rl2.transformer import ARTransformer, AttentionImplementation, TransformerStackCarry
+from rl2.transformer import ARTransformer, TransformerStackCarry
 
 type BackboneType = Literal["mamba3", "transformer"]
 type KarelModelCarry = Mamba3StackCarry | TransformerStackCarry
@@ -52,7 +53,7 @@ class KarelProgramModel(nn.Module):
     num_kv_heads: int | None = None
     max_seq_len: int = 128  # Transformer cache capacity, including the image-pair prefix.
     dtype: jax.typing.DTypeLike = jnp.float32
-    attention_implementation: AttentionImplementation = "xla"
+    attention_implementation: AttentionType = "xla"
 
     def setup(self) -> None:
         if self.backbone_type not in ("mamba3", "transformer"):
@@ -139,12 +140,7 @@ class KarelProgramModel(nn.Module):
         sc.check(token, "B", jnp.int32)
         inputs = self.token_embedding(token)
         sc.check(inputs, "BD", self.dtype)
-        if self.backbone_type == "transformer":
-            x_len = jnp.ones(sc["B"], jnp.int32)
-            sc.check(x_len, "B", jnp.int32)
-            carry, features = self.backbone.step(inputs, x_len, carry)
-        else:
-            carry, features = self.backbone.step(inputs, carry=carry)
+        carry, features = self.backbone.step(inputs, carry=carry)
         sc.check(features, "BD", self.dtype)
         logits = self.head(features).astype(jnp.float32)
         sc.check(logits, "BV", jnp.float32)

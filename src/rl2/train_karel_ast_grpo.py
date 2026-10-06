@@ -31,10 +31,10 @@ from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
 from rl2.ast_transformer import ASTTransformer
+from rl2.attention import AttentionType
 from rl2.jax_cache import configure_compilation_cache
 from rl2.karel import ACTIONS, REWARD_COMPONENTS, TASK_CATEGORIES, TOKEN_TO_ID, KarelConfig, KarelPair, KarelProgramEnv
 from rl2.karel_ast import AST_ACTIONS, ASTFeatures, KarelAST, batch_features
-from rl2.transformer import AttentionImplementation
 from rl2.utils import read_bytes, read_optional, write_bytes
 
 type Array = jax.Array | NDArray[Any]
@@ -57,7 +57,7 @@ class Config:
     num_heads: int = 5
     num_kv_heads: int | None = None
     bf16: bool = False
-    attention_implementation: AttentionImplementation = "xla"
+    attention_implementation: AttentionType = "xla"
     learning_rate: float = 0.00025
     anneal_lr: bool = True
     clip_coef: float = 0.2
@@ -665,7 +665,7 @@ def generate(
 
 
 def load_model(
-    run_dir: str | Path, *, attention_implementation: AttentionImplementation | None = None
+    run_dir: str | Path, *, attention_implementation: AttentionType | None = None
 ) -> tuple[Config, TrainState]:
     """Restore weights for inference; override attention with xla to load on CPU.
 

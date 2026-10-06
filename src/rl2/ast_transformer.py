@@ -16,9 +16,9 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from rl2.attention import AttentionType
 from rl2.karel_ast import AST_ACTIONS, CONSTRUCTORS, NUM_NODE_TYPES, VALUES, ASTFeatures, Field
 from rl2.karel_syntax import MAX_BLOCK_DEPTH
-from rl2.transformer import AttentionImplementation
 from rl2.tree_attention import TreeAttentionBias, TreeRelations, tree_relations
 
 
@@ -29,7 +29,7 @@ class _ASTBlock(nn.Module):
     d_intermediate: int
     num_layers: int
     dtype: jax.typing.DTypeLike
-    attention_implementation: AttentionImplementation
+    attention_implementation: AttentionType
 
     @nn.compact
     def __call__(self, x: jax.Array, present: jax.Array, relations: TreeRelations) -> jax.Array:
@@ -103,7 +103,7 @@ class ASTTransformer(nn.Module):
     max_depth: int = 64
     max_markers: int = 10
     dtype: jax.typing.DTypeLike = jnp.float32
-    attention_implementation: AttentionImplementation = "xla"
+    attention_implementation: AttentionType = "xla"
 
     def setup(self) -> None:
         for name in ("d_model", "num_layers", "num_heads", "max_nodes", "max_markers"):

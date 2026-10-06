@@ -37,6 +37,7 @@ from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
 from rl2 import train_karel_ast_ar_edit as edit
+from rl2.attention import AttentionType
 from rl2.jax_cache import configure_compilation_cache
 from rl2.karel import REWARD_COMPONENTS, TASK_CATEGORIES, KarelConfig, KarelProgramEnv
 from rl2.karel_ast import AST_ACTIONS, KarelAST
@@ -63,7 +64,6 @@ from rl2.train_karel_ast_grpo import (
     _save_checkpoint,
     learning_rate_schedule,
 )
-from rl2.transformer import AttentionImplementation
 from rl2.utils import read_bytes, read_optional, write_bytes
 
 
@@ -140,10 +140,8 @@ class EditActorCritic(edit.EditTransformer):
         sc.check(event.output, "BHWC", dtype=jnp.int32)
         sc.check(event.feedback, "BF", dtype=jnp.float32)
         sequence = jax.tree.map(partial(jnp.expand_dims, axis=0), event)
-        x_len = jnp.ones(sc["B"], jnp.int32)
-        sc.check(x_len, "B", jnp.int32)
         transformer, features = self.backbone.step(
-            self.encode_events(sequence, carry.initial, carry.target)[0], x_len, carry.transformer
+            self.encode_events(sequence, carry.initial, carry.target)[0], carry.transformer
         )
         sc.check(features, "BD", dtype=self.dtype)
         logits = self.head(features).astype(jnp.float32)
@@ -535,7 +533,7 @@ def generate(state: TrainState, task: KarelProgramEnv, key: jax.Array, config: C
 
 
 def load_model(
-    run_dir: str | Path, *, attention_implementation: AttentionImplementation | None = None
+    run_dir: str | Path, *, attention_implementation: AttentionType | None = None
 ) -> tuple[Config, TrainState]:
     """Load checkpoint policy weights for inference, optionally overriding the attention backend.
 
