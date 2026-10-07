@@ -135,6 +135,51 @@ def test_step_active_validation(active: jax.Array) -> None:
         model.init(jax.random.key(1), jnp.zeros((1, 4)), active, method=model.step)
 
 
+@pytest.mark.parametrize("size", [1, 3], ids=["no-history", "two-token-history"])
+def test_short_conv_prefix_masking(size: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("jax_triton")
+    from rl2.gdn2 import triton_backend
+
+    def convolve(x: jax.Array, weight: jax.Array, bias: jax.Array) -> jax.Array:
+        sc = ShapeChecker(C=size)
+        sc.check(x, "BLD", jnp.float32)
+        sc.check(weight, "CD", jnp.float32)
+        sc.check(bias, "D", jnp.float32)
+        time = x.shape[1] - size + 1
+        return jax.nn.silu(sum(x[:, i : i + time] * weight[i] for i in range(size)) + bias)
+
+    # Exercise the host wrapper without launching a GPU kernel.
+    monkeypatch.setattr(triton_backend, "_conv", convolve)
+    x = jnp.arange(18, dtype=jnp.float32).reshape(3, 3, 2) / 10
+    history = jnp.full((3, size - 1, 2), 0.2, jnp.float32)
+    weight = jnp.full((size, 2), 0.3, jnp.float32)
+    bias = jnp.ones((2,), jnp.float32)
+    lengths = jnp.array([3, 1, 0], jnp.int32)
+    valid = jnp.arange(3)[None, :] < lengths[:, None]
+    padded = jnp.where(valid[..., None], x, jnp.nan)
+    state, output = jax.jit(triton_backend.short_conv)(padded, lengths, history, weight, bias)
+    for b, length in enumerate((3, 1, 0)):
+        joined = jnp.concatenate((history[b : b + 1], x[b : b + 1, :length]), axis=1)
+        np.testing.assert_array_equal(state[b], joined[0, length:])
+        if length:
+            np.testing.assert_allclose(output[b, :length], convolve(joined, weight, bias)[0], atol=1e-6)
+    np.testing.assert_array_equal(output[~valid], 0)
+
+    def loss(inputs: jax.Array) -> jax.Array:
+        sc = ShapeChecker(B=3, T=3, D=2)
+        sc.check(inputs, "BTD", jnp.float32)
+        state, output = triton_backend.short_conv(inputs, lengths, history, weight, bias)
+        return state.sum() + output.sum()
+
+    gradient = jax.jit(jax.grad(loss))(padded)
+    assert np.all(np.isfinite(gradient))
+    np.testing.assert_array_equal(gradient[~valid], 0)
+    assert np.all(np.asarray(gradient[valid]) > 0)
+    empty_state, empty = triton_backend.short_conv(x[:, :0], jnp.zeros_like(lengths), history, weight, bias)
+    np.testing.assert_array_equal(empty_state, history)
+    assert empty.shape == (3, 0, 2)
+
+
 def _assert_tree_close(actual: Any, expected: Any) -> None:
     chex.assert_trees_all_equal_shapes_and_dtypes(actual, expected)
     for a, b in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
@@ -319,46 +364,6 @@ def test_mixer_matches_numpy_reference(config: GatedDeltaNet2Config) -> None:
     assert np.all((np.exp(params["A_log"]) >= 1) & (np.exp(params["A_log"]) <= 16))
     dt = jax.nn.softplus(params["dt_bias"])
     assert np.all((dt >= 0.001) & (dt <= 0.1))
-
-
-def test_mixer_streaming_resets_padding_causality_and_empty_input() -> None:
-    model = GatedDeltaNet2(GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1, conv_size=3))
-    x = jax.random.normal(jax.random.key(4), (2, 4, 4))
-    # The LM retains arbitrary resets and masks through this internal path.
-    variables = model.init(jax.random.key(5), x, method=model._forward)
-    apply = partial(model.apply, method=model._forward)
-    starts = jnp.zeros((2, 4), jnp.bool_).at[0, 2].set(True).at[1, 1].set(True)
-    mask = jnp.ones((2, 4), jnp.bool_).at[1, 1].set(False)
-    padded_x = x.at[1, 1].set(jnp.nan)
-    final, y = jax.jit(apply)(variables, padded_x, None, starts, mask)
-    carry, first = apply(variables, padded_x[:, :2], episode_starts=starts[:, :2], mask=mask[:, :2])
-    carry, second = apply(variables, padded_x[:, 2:], carry, starts[:, 2:], mask[:, 2:])
-    _assert_tree_close(carry, final)
-    np.testing.assert_allclose(jnp.concatenate((first, second), axis=1), y, atol=1e-7)
-    carry = model.initial_carry(2)
-    outputs = []
-    step = jax.jit(apply)
-    for i in range(x.shape[1]):
-        carry, output = step(variables, padded_x[:, i : i + 1], carry, starts[:, i : i + 1], mask[:, i : i + 1])
-        outputs.append(output[:, 0])
-    _assert_tree_close(carry, final)
-    np.testing.assert_allclose(jnp.stack(outputs, axis=1), y, atol=1e-7)
-    _, reset_output = apply(variables, x[:1, 2:])
-    np.testing.assert_allclose(reset_output[0], y[0, 2:], atol=1e-7)
-    # Padding skips both the convolution and recurrence, including a masked reset.
-    compressed_carry, compressed = apply(variables, x[1:, jnp.array([0, 2, 3])])
-    np.testing.assert_allclose(compressed[0], y[1, jnp.array([0, 2, 3])], atol=1e-7)
-    _assert_tree_close(compressed_carry, GatedDeltaNet2Carry(*(leaf[1:] for leaf in final)))
-    np.testing.assert_array_equal(y[1, 1], 0)
-    _, changed = apply(variables, x.at[:, 2:].add(100))
-    _, original = apply(variables, x)
-    np.testing.assert_array_equal(changed[:, :2], original[:, :2])
-    empty_carry, empty = apply(variables, x[:, :0], final)
-    _assert_tree_close(empty_carry, final)
-    assert empty.shape == (2, 0, 4)
-    unchanged, zeros = apply(variables, x, final, jnp.ones_like(mask), jnp.zeros_like(mask))
-    _assert_tree_close(unchanged, final)
-    np.testing.assert_array_equal(zeros, 0)
 
 
 def test_stack_matches_explicit_residual_blocks() -> None:

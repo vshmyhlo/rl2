@@ -10,6 +10,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
+from rl2.gdn2.masking import prefix_mask
 from rl2.shape_checker import ShapeChecker
 
 try:
@@ -424,24 +425,35 @@ _conv.defvjp(_conv_forward, _conv_backward)
 
 def short_conv(
     x: jax.Array,
+    x_len: jax.Array,
     history: jax.Array,
     weight: jax.Array,
     bias: jax.Array,
 ) -> Result:
-    """Return (final history, SiLU(depthwise causal convolution)) for [B,T,D]."""
+    """Convolve [B,T,D] with required int32 valid-prefix lengths x_len[B].
+
+    Return (final history, SiLU(depthwise causal convolution)). Right padding
+    produces zero output and leaves history at the last valid token; zero
+    lengths preserve the supplied history.
+    """
     sc = ShapeChecker()
     sc.check(x, "BTD", jnp.float32)
     sc.check(weight, "CD", jnp.float32)
     sc.check(bias, "D", jnp.float32)
     sc.check(history, "BND", jnp.float32)
+    valid = prefix_mask(x_len, x.shape[0], x.shape[1])
     if history.shape[1] != weight.shape[0] - 1:
         raise ValueError("Convolution history must contain conv_size - 1 tokens")
     if x.shape[1] == 0:
         return history, x
+    x = jnp.where(valid[..., None], x, 0)
     joined = jnp.concatenate((history, x), axis=1)
     output = _conv(joined, weight, bias)
+    output = jnp.where(valid[..., None], output, 0)
     # This also covers conv_size=1, where the history has length zero.
-    final_history = joined[:, x.shape[1] :]
+    indices = x_len[:, None] + jnp.arange(history.shape[1], dtype=jnp.int32)[None, :]
+    sc.check(indices, "BN", jnp.int32)
+    final_history = jnp.take_along_axis(joined, indices[..., None], axis=1)
     sc.check(final_history, "BND", jnp.float32)
     sc.check(output, "BTD", jnp.float32)
     return final_history, output

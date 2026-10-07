@@ -88,23 +88,39 @@ def test_short_conv_outputs_and_gradients(size: int) -> None:
 
     rng = np.random.default_rng(18)
     args = tuple(
-        jnp.asarray(rng.normal(size=s).astype(np.float32)) for s in [(1, 2, 7), (1, size - 1, 7), (size, 7), (7,)]
+        jnp.asarray(rng.normal(size=s).astype(np.float32)) for s in [(3, 2, 7), (3, size - 1, 7), (size, 7), (7,)]
     )
 
-    def reference(x: jax.Array, history: jax.Array, weight: jax.Array, bias: jax.Array) -> tuple[jax.Array, jax.Array]:
-        joined = jnp.concatenate((history, x), axis=1)
-        z = sum(joined[:, c : c + x.shape[1]] * weight[c] for c in range(size)) + bias
-        return joined[:, x.shape[1] :], jax.nn.silu(z)
+    lengths = jnp.array([2, 1, 0], jnp.int32)
+    valid = jnp.arange(2)[None, :] < lengths[:, None]
 
-    for got, want in zip(jax.jit(short_conv)(*args), reference(*args), strict=True):
+    def actual(x: jax.Array, history: jax.Array, weight: jax.Array, bias: jax.Array) -> tuple[jax.Array, jax.Array]:
+        return short_conv(x, lengths, history, weight, bias)
+
+    def reference(x: jax.Array, history: jax.Array, weight: jax.Array, bias: jax.Array) -> tuple[jax.Array, jax.Array]:
+        outputs = []
+        for t in range(x.shape[1]):
+            active = (t < lengths)[:, None, None]
+            token = jnp.where(active, x[:, t : t + 1], 0)
+            window = jnp.concatenate((history, token), axis=1)
+            y = jax.nn.silu(jnp.sum(window * weight, axis=1) + bias)
+            history = jnp.where(active, window[:, 1:], history)
+            outputs.append(jnp.where(active[:, 0], y, 0))
+        return history, jnp.stack(outputs, axis=1)
+
+    padded_args = (jnp.where(valid[..., None], args[0], jnp.nan), *args[1:])
+    for got, want in zip(jax.jit(actual)(*padded_args), reference(*padded_args), strict=True):
         np.testing.assert_allclose(got, want, atol=3e-6, rtol=3e-5)
+    empty_state, empty = short_conv(args[0][:, :0], jnp.zeros_like(lengths), *args[1:])
+    np.testing.assert_array_equal(empty_state, args[1])
+    assert empty.shape == (3, 0, 7)
 
     def loss(rule: Rule, *a: jax.Array) -> jax.Array:
         state, y = rule(*a)
         return jnp.sum(jnp.sin(y)) + jnp.sum(jnp.sin(state))
 
     def actual_loss(*a: jax.Array) -> jax.Array:
-        return loss(short_conv, *a)
+        return loss(actual, *a)
 
     def expected_loss(*a: jax.Array) -> jax.Array:
         return loss(reference, *a)
@@ -142,8 +158,7 @@ def test_gated_norm_outputs_and_gradients() -> None:
         np.testing.assert_allclose(got, want, atol=3e-6, rtol=3e-5)
 
 
-@pytest.mark.parametrize("mode", ["plain", "masked", "reset"])
-def test_mixer_streaming_and_padding(mode: str) -> None:
+def test_mixer_streaming_and_padding() -> None:
     pytest.importorskip("jax_triton")
     from rl2.gdn2 import GatedDeltaNet2, GatedDeltaNet2Config
 
@@ -159,54 +174,38 @@ def test_mixer_streaming_and_padding(mode: str) -> None:
     )
     reference = GatedDeltaNet2(config)
     model = reference.clone(backend="triton")
-    x = jnp.asarray(np.random.default_rng(11).normal(size=(2, 5, 16)).astype(np.float32))
-    variables = reference.init(jax.random.key(12), x, method=reference._forward)
-    mask = None if mode == "plain" else jnp.array([[1, 0, 1, 1, 0], [1, 1, 0, 1, 0]], jnp.bool_)
-    starts = jnp.array([[0, 1, 0, 1, 1], [0, 0, 0, 1, 0]], jnp.bool_) if mode == "reset" else None
-    if mask is not None:
-        x = jnp.where(mask[..., None], x, jnp.nan)
-    expected = jax.jit(reference.apply, static_argnames=("method",))(
-        variables, x, episode_starts=starts, mask=mask, method=reference._forward
-    )
-    actual = jax.jit(model.apply, static_argnames=("method",))(
-        variables, x, episode_starts=starts, mask=mask, method=model._forward
-    )
+    x = jnp.asarray(np.random.default_rng(11).normal(size=(3, 5, 16)).astype(np.float32))
+    lengths = jnp.array([5, 3, 0], jnp.int32)
+    valid = jnp.arange(5)[None, :] < lengths[:, None]
+    x = jnp.where(valid[..., None], x, jnp.nan)
+    variables = reference.init(jax.random.key(12), x, lengths)
+
+    # Populate history so zero-length examples must preserve nonzero state.
+    def populate(leaf: jax.Array) -> jax.Array:
+        return jnp.full_like(leaf, 0.1)
+
+    initial = jax.tree.map(populate, model.initial_carry(3))
+    expected = jax.jit(reference.apply)(variables, x, lengths, initial)
+    actual = jax.jit(model.apply)(variables, x, lengths, initial)
     for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_allclose(got, want, atol=3e-6, rtol=5e-4)
+    np.testing.assert_array_equal(actual[1][~valid], 0)
+    for got, want in zip(jax.tree.leaves(actual[0]), jax.tree.leaves(initial), strict=True):
+        np.testing.assert_array_equal(got[2], want[2])
     step = jax.jit(model.apply, static_argnames=("method",))
-    state = model.initial_carry(2)
+    state = initial
     outputs = []
     for t in range(x.shape[1]):
-        state, y = step(
-            variables,
-            x[:, t : t + 1],
-            state,
-            None if starts is None else starts[:, t : t + 1],
-            None if mask is None else mask[:, t : t + 1],
-            method=model._forward,
-        )
-        outputs.append(y[:, 0])
-    streamed = state, jnp.stack(outputs, axis=1)
-    for got, want in zip(jax.tree.leaves(streamed), jax.tree.leaves(expected), strict=True):
+        state, y = step(variables, x[:, t], t < lengths, state, method=model.step)
+        outputs.append(y)
+    for got, want in zip(jax.tree.leaves((state, jnp.stack(outputs, axis=1))), jax.tree.leaves(expected), strict=True):
         np.testing.assert_allclose(got, want, atol=3e-6, rtol=5e-4)
-
-    if mode == "masked":
-        lengths = jnp.array([3, 0], jnp.int32)
-        sequence = jnp.nan_to_num(x)
-        sequence = jnp.where(jnp.arange(5)[None, :, None] < lengths[:, None, None], sequence, jnp.nan)
-        expected = jax.jit(reference.apply)(variables, sequence, lengths)
-        actual = jax.jit(model.apply)(variables, sequence, lengths)
-        for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
-            np.testing.assert_allclose(got, want, atol=3e-6, rtol=5e-4)
-        state = None
-        outputs = []
-        for t in range(sequence.shape[1]):
-            state, y = step(variables, sequence[:, t], t < lengths, state, method=model.step)
-            outputs.append(y)
-        for got, want in zip(
-            jax.tree.leaves((state, jnp.stack(outputs, axis=1))), jax.tree.leaves(actual), strict=True
-        ):
-            np.testing.assert_allclose(got, want, atol=3e-6, rtol=5e-4)
+    state, first = jax.jit(model.apply)(variables, x[:, :2], jnp.minimum(lengths, 2), initial)
+    state, second = jax.jit(model.apply)(variables, x[:, 2:], jnp.maximum(lengths - 2, 0), state)
+    for got, want in zip(
+        jax.tree.leaves((state, jnp.concatenate((first, second), axis=1))), jax.tree.leaves(expected), strict=True
+    ):
+        np.testing.assert_allclose(got, want, atol=3e-6, rtol=5e-4)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])

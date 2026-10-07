@@ -24,6 +24,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from rl2.gdn2.core import delta_rule_step
+from rl2.gdn2.masking import prefix_mask
 from rl2.sequence_model import ARSequenceModel
 from rl2.shape_checker import ShapeChecker
 
@@ -88,7 +89,7 @@ type GatedDeltaNet2Backend = Literal["jax", "triton"]
 
 
 type GatedDeltaNet2StackCarry = tuple[GatedDeltaNet2Carry, ...]
-type MixerInputs = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
+type MixerInputs = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
 
 
 def _initial_carry(config: GatedDeltaNet2Config, batch_size: int) -> GatedDeltaNet2Carry:
@@ -104,13 +105,13 @@ def _initial_carry(config: GatedDeltaNet2Config, batch_size: int) -> GatedDeltaN
     )
 
 
-def _select(mask: jax.Array, yes: jax.Array, no: jax.Array) -> jax.Array:
+def _select(x_active: jax.Array, yes: jax.Array, no: jax.Array) -> jax.Array:
     sc = ShapeChecker()
-    sc.check(mask, "B", jnp.bool_)
+    sc.check(x_active, "B", jnp.bool_)
     # Shapes vary between recurrence and convolution histories.
     names = "B" + "XYZ"[: yes.ndim - 1]
     sc.check([yes, no], names, jnp.float32)
-    return jnp.where(mask.reshape((mask.shape[0],) + (1,) * (yes.ndim - 1)), yes, no)
+    return jnp.where(x_active.reshape((x_active.shape[0],) + (1,) * (yes.ndim - 1)), yes, no)
 
 
 def _linear_init(key: jax.Array, shape: tuple[int, ...], dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
@@ -131,37 +132,7 @@ def _sequence_mask(x: jax.Array, x_len: jax.Array, hidden_size: int) -> jax.Arra
     sc = ShapeChecker(D=hidden_size)
     sc.check(x, "BTD")
     chex.assert_type(x, jnp.floating)
-    return _prefix_mask(x_len, x.shape[0], x.shape[1])
-
-
-def _prefix_mask(x_len: jax.Array, batch_size: int, sequence_length: int) -> jax.Array:
-    """Validate prefix lengths and construct a mask for features or token IDs."""
-    sc = ShapeChecker(B=batch_size, T=sequence_length)
-    chex.assert_scalar_positive(batch_size)
-    sc.check(x_len, "B", jnp.int32)
-    invalid = jnp.any((x_len < 0) | (x_len > sequence_length))
-    sc.check(invalid, "", jnp.bool_)
-
-    def fail_if_invalid(value: jax.Array) -> None:
-        sc = ShapeChecker()
-        sc.check(value, "", jnp.bool_)
-        if bool(value):
-            raise ValueError("x_len must be between 0 and the input sequence length")
-
-    def report_failure() -> None:
-        # Under vmap both branches can run; the callback checks the predicate.
-        jax.debug.callback(fail_if_invalid, invalid)
-
-    def success() -> None:
-        pass
-
-    if isinstance(invalid, jax.core.Tracer):
-        jax.lax.cond(invalid, report_failure, success)
-    else:
-        fail_if_invalid(invalid)
-    valid = jnp.arange(sequence_length)[None, :] < x_len[:, None]
-    sc.check(valid, "BT", jnp.bool_)
-    return valid
+    return prefix_mask(x_len, x.shape[0], x.shape[1])
 
 
 class GatedDeltaNet2(nn.Module, ARSequenceModel[GatedDeltaNet2Carry]):
@@ -181,6 +152,7 @@ class GatedDeltaNet2(nn.Module, ARSequenceModel[GatedDeltaNet2Carry]):
     def initial_carry(self, batch_size: int) -> GatedDeltaNet2Carry:
         return _initial_carry(self.config, batch_size)
 
+    @nn.compact
     def __call__(
         self,
         x: jax.Array,
@@ -188,26 +160,10 @@ class GatedDeltaNet2(nn.Module, ARSequenceModel[GatedDeltaNet2Carry]):
         carry: GatedDeltaNet2Carry | None = None,
     ) -> tuple[GatedDeltaNet2Carry, jax.Array]:
         valid = _sequence_mask(x, x_len, self.config.hidden_size)
-        carry, y = self._forward(x, carry, mask=valid)
-        sc = ShapeChecker(B=x.shape[0], T=x.shape[1], D=self.config.hidden_size)
-        sc.check(y, "BTD", self.config.dtype)
-        return carry, y
-
-    @nn.compact
-    def _forward(
-        self,
-        x: jax.Array,
-        carry: GatedDeltaNet2Carry | None = None,
-        episode_starts: jax.Array | None = None,
-        mask: jax.Array | None = None,
-    ) -> tuple[GatedDeltaNet2Carry, jax.Array]:
         c = self.config
         sc = ShapeChecker(D=c.hidden_size, H=c.value_heads, K=c.head_dim, V=c.value_head_dim)
         sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
-        starts = jnp.zeros(sc["BT"], jnp.bool_) if episode_starts is None else episode_starts
-        valid = jnp.ones(sc["BT"], jnp.bool_) if mask is None else mask
-        sc.check([starts, valid], "BT", jnp.bool_)
         carry = self.initial_carry(x.shape[0]) if carry is None else carry
         sc.check(carry.state, "BHKV", jnp.float32)
         history = c.conv_size - 1 if c.use_short_conv else 0
@@ -255,17 +211,13 @@ class GatedDeltaNet2(nn.Module, ARSequenceModel[GatedDeltaNet2Carry]):
                 )
 
         def step(previous: GatedDeltaNet2Carry, inputs: MixerInputs) -> tuple[GatedDeltaNet2Carry, jax.Array]:
-            qt, kt, vt, gt, bt, wt, reset, active = inputs
-
-            def reset_leaf(leaf: jax.Array) -> jax.Array:
-                return _select(reset, jnp.zeros_like(leaf), leaf)
+            qt, kt, vt, gt, bt, wt, x_active = inputs
 
             def preserve_padding(new: jax.Array, old: jax.Array) -> jax.Array:
-                return _select(active, new, old)
+                return _select(x_active, new, old)
 
-            reset_carry = jax.tree.map(reset_leaf, previous)
             projections = [qt, kt, vt]
-            histories = [reset_carry.q, reset_carry.k, reset_carry.v]
+            histories = [previous.q, previous.k, previous.v]
             for i in range(3):
                 if c.use_short_conv:
                     window = jnp.concatenate((histories[i], projections[i][:, None]), axis=1)
@@ -281,47 +233,22 @@ class GatedDeltaNet2(nn.Module, ARSequenceModel[GatedDeltaNet2Carry]):
             repeats = c.value_heads // c.num_heads
             qt, kt, gt, bt = (jnp.repeat(a, repeats, axis=1) for a in (qt, kt, gt, bt))
             vt, wt = (a.reshape((x.shape[0], c.value_heads, c.value_head_dim)) for a in (vt, wt))
-            state, output = delta_rule_step(reset_carry.state, qt, kt, vt, gt, bt, wt)
+            state, output = delta_rule_step(previous.state, qt, kt, vt, gt, bt, wt)
             updated = GatedDeltaNet2Carry(state, *histories)
             updated = jax.tree.map(preserve_padding, updated, previous)
-            output = _select(active, output, jnp.zeros_like(output))
+            output = _select(x_active, output, jnp.zeros_like(output))
             return updated, output
 
-        if self.backend == "triton" and episode_starts is None:
+        if self.backend == "triton":
             from rl2.gdn2.triton_backend import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule, short_conv
 
             projections = [q, k, v]
             histories = [carry.q, carry.k, carry.v]
             for i in range(3):
-                if c.use_short_conv and mask is None:
-                    histories[i], projections[i] = short_conv(projections[i], histories[i], kernels[i], biases[i])
-                elif c.use_short_conv:
-                    # Masked tokens do not advance convolution history. This
-                    # small scan precedes the chunked recurrent-state kernel.
-                    kernel, bias = kernels[i], biases[i]
-
-                    def conv_step(
-                        previous: jax.Array,
-                        inputs: tuple[jax.Array, jax.Array],
-                        kernel: jax.Array = kernel,
-                        bias: jax.Array = bias,
-                    ) -> tuple[jax.Array, jax.Array]:
-                        token, active = inputs
-                        sc = ShapeChecker()
-                        sc.check(previous, "BND", jnp.float32)
-                        sc.check(token, "BD", jnp.float32)
-                        sc.check(active, "B", jnp.bool_)
-                        sc.check(kernel, "CD", jnp.float32)
-                        sc.check(bias, "D", jnp.float32)
-                        window = jnp.concatenate((previous, token[:, None]), axis=1)
-                        sc.check(window, "BCD", jnp.float32)
-                        value = jax.nn.silu(jnp.sum(window * kernel, axis=1) + bias)
-                        return _select(active, window[:, 1:], previous), value
-
-                    histories[i], projected = jax.lax.scan(
-                        conv_step, histories[i], (projections[i].swapaxes(0, 1), valid.T)
+                if c.use_short_conv:
+                    histories[i], projections[i] = short_conv(
+                        projections[i], x_len, histories[i], kernels[i], biases[i]
                     )
-                    projections[i] = projected.swapaxes(0, 1)
                 else:
                     projections[i] = jax.nn.silu(projections[i])
             q, k, v = projections
@@ -340,9 +267,7 @@ class GatedDeltaNet2(nn.Module, ARSequenceModel[GatedDeltaNet2Carry]):
             state, output = rule(q, k, v, log_decay, erase, write, carry.state)
             carry = GatedDeltaNet2Carry(state, *histories)
         else:
-            # Arbitrary per-batch episode boundaries retain the portable scan's
-            # exact reset and masked-reset semantics, including gradients.
-            inputs = tuple(a.swapaxes(0, 1) for a in (q, k, v, log_decay, erase, write, starts, valid))
+            inputs = tuple(a.swapaxes(0, 1) for a in (q, k, v, log_decay, erase, write, valid))
             carry, output = jax.lax.scan(step, carry, inputs)
             output = output.swapaxes(0, 1)
         sc.check(output, "BTHV", jnp.float32)
@@ -404,6 +329,7 @@ class GatedDeltaNet2Stack(nn.Module, ARSequenceModel[GatedDeltaNet2StackCarry]):
             raise ValueError("num_layers must be positive")
         return tuple(_initial_carry(self.config, batch_size) for _ in range(self.num_layers))
 
+    @nn.compact
     def __call__(
         self,
         x: jax.Array,
@@ -411,32 +337,15 @@ class GatedDeltaNet2Stack(nn.Module, ARSequenceModel[GatedDeltaNet2StackCarry]):
         carry: GatedDeltaNet2StackCarry | None = None,
     ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
         valid = _sequence_mask(x, x_len, self.config.hidden_size)
-        carry, y = self._forward(x, carry, mask=valid)
-        sc = ShapeChecker(B=x.shape[0], T=x.shape[1], D=self.config.hidden_size)
-        sc.check(y, "BTD", self.config.dtype)
-        return carry, y
-
-    @nn.compact
-    def _forward(
-        self,
-        x: jax.Array,
-        carry: GatedDeltaNet2StackCarry | None = None,
-        episode_starts: jax.Array | None = None,
-        mask: jax.Array | None = None,
-    ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
         c = self.config
         sc = ShapeChecker(D=c.hidden_size, I=self.intermediate_size)
         sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
-        for value in (episode_starts, mask):
-            if value is not None:
-                sc.check(value, "BT", jnp.bool_)
         carry = self.initial_carry(x.shape[0]) if carry is None else carry
         if len(carry) != self.num_layers:
             raise ValueError("carry must contain one state per layer")
         x = x.astype(jnp.float32)
-        if mask is not None:
-            x = jnp.where(mask[..., None], x, 0)
+        x = jnp.where(valid[..., None], x, 0)
         updated: list[GatedDeltaNet2Carry] = []
         # Upstream mamba_init uses PyTorch linear defaults and scales the
         # MLP residual output by sqrt(2 * depth).
@@ -444,7 +353,7 @@ class GatedDeltaNet2Stack(nn.Module, ARSequenceModel[GatedDeltaNet2StackCarry]):
         residual_init = nn.initializers.variance_scaling(1 / (6 * self.num_layers), "fan_in", "uniform")
         for i, mixer in enumerate(self.mixers):
             normed = nn.RMSNorm(epsilon=c.norm_eps, dtype=c.dtype, name=f"norm_mixer_{i}")(x)
-            state, mixed = mixer._forward(normed, carry[i], episode_starts, mask)
+            state, mixed = mixer(normed, x_len, carry[i])
             updated.append(state)
             x = x + mixed.astype(jnp.float32)
             normed = nn.RMSNorm(epsilon=c.norm_eps, dtype=c.dtype, name=f"norm_mlp_{i}")(x)
@@ -460,8 +369,7 @@ class GatedDeltaNet2Stack(nn.Module, ARSequenceModel[GatedDeltaNet2StackCarry]):
                 c.hidden_size, use_bias=False, dtype=c.dtype, kernel_init=residual_init, name=f"mlp_down_{i}"
             )(hidden).astype(jnp.float32)
         y = nn.RMSNorm(epsilon=c.norm_eps, dtype=c.dtype, name="final_norm")(x)
-        if mask is not None:
-            y = jnp.where(mask[..., None], y, 0)
+        y = jnp.where(valid[..., None], y, 0)
         sc.check(y, "BTD", c.dtype)
         return tuple(updated), y
 
@@ -531,9 +439,9 @@ class GatedDeltaNet2LM(nn.Module):
         sc = ShapeChecker(V=self.vocab_size)
         sc.check(tokens, "BT")
         chex.assert_type(tokens, jnp.integer)
-        valid = _prefix_mask(x_len, tokens.shape[0], tokens.shape[1])
+        valid = prefix_mask(x_len, tokens.shape[0], tokens.shape[1])
         tokens = jnp.where(valid, tokens, 0)
-        carry, hidden = self.backbone._forward(self.embedding(tokens), carry, mask=valid)
+        carry, hidden = self.backbone(self.embedding(tokens), x_len, carry)
         logits = self.lm_head(hidden.astype(jnp.float32))
         sc.check(logits, "BTV", jnp.float32)
         return carry, logits
