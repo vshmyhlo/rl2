@@ -434,3 +434,17 @@ class GatedDeltaNet2LM(nn.Module):
             None if mask is None else mask[None],
         )
         return carry, logits[0]
+
+
+def gdn2_370m(dtype: jax.typing.DTypeLike = jnp.float32) -> GatedDeltaNet2LM:
+    """380,603,648-parameter architecture used by the paper-matched 370M checkpoint.
+
+    The checkpoint has 16 mixer heads, independent of the GPT config's n_head.
+    This constructs the module without allocating or initializing parameters.
+    """
+    return GatedDeltaNet2LM(
+        GatedDeltaNet2Config(hidden_size=1024, head_dim=128, num_heads=16, dtype=dtype),
+        num_layers=16,
+        intermediate_size=2048,
+        vocab_size=32000,
+    )

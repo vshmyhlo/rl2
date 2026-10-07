@@ -85,12 +85,60 @@ The upstream recurrent 1.3B architecture can be configured with
 `intermediate_size=6208`, and `vocab_size=32000`. The upstream GPT configuration's
 18 attention heads do not override its GDN-2 mixer's default 16 heads.
 
+## Paper-matched 370M checkpoint
+
+`gdn2_370m()` constructs the architecture used by
+[LLM-OS-Models2/gdn2-370m-fineweb-edu-30b-paper-matched](https://huggingface.co/LLM-OS-Models2/gdn2-370m-fineweb-edu-30b-paper-matched/tree/6f3458a5d7979ed3d85622b1e71e8eee25895742).
+Its actual tensors have 380,603,648 parameters: hidden size 1024, **16 mixer
+heads** of width 128, 16 layers, SwiGLU width 2048, and vocabulary size 32000.
+The mixer's head count is independent of the GPT configuration's `n_head`.
+
+The converted artifact is in `checkpoints/gdn2/paper-matched-30b/` at the
+repository root. It contains float32 parameters in `params.npz` and a
+`manifest.json` with architecture, source revision/checksum, training metadata,
+and output checksum. Optimizer state is not included. Load it without PyTorch:
+
+```python
+from pathlib import Path
+import jax
+import jax.numpy as jnp
+from rl2.gdn2.checkpoints import load_checkpoint
+
+model, variables = load_checkpoint(Path("checkpoints/gdn2/paper-matched-30b"))
+tokens = jnp.array([[1], [42], [100]], dtype=jnp.int32)  # time, batch
+carry, logits = jax.jit(model.apply)(variables, tokens)
+```
+
+For reduced-precision inference, pass `dtype=jnp.bfloat16` to `load_checkpoint`;
+stored parameters remain float32. The checkpoint does not include a tokenizer.
+Loading verifies checksums, names, shapes, dtypes, and finite values without
+initializing a second set of model weights. The returned variables contain NumPy
+leaves that JAX transfers to the selected device when used.
+
+To reproduce the conversion, install CPU PyTorch separately (only needed to read
+the original `.pth`) and download the pinned source:
+
+```bash
+uv pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.6'
+curl -L --fail 'https://huggingface.co/LLM-OS-Models2/gdn2-370m-fineweb-edu-30b-paper-matched/resolve/6f3458a5d7979ed3d85622b1e71e8eee25895742/model.pth' -o /tmp/gdn2-paper-matched.pth
+uv run --no-sync python -m rl2.gdn2.checkpoints \
+  --input /tmp/gdn2-paper-matched.pth \
+  --output checkpoints/gdn2/paper-matched-30b
+```
+
+The CLI verifies the pinned source SHA256 and refuses to overwrite an existing
+destination. It uses `torch.load(weights_only=True, mmap=True)` on CPU, without
+executing downloaded Python code. Conversion transposes linear matrices and
+permutes depthwise convolution axes; it does not quantize or retrain weights.
+`convert_litgpt_state_dict(state, model)` exposes the generic NumPy mapping for
+other explicitly configured models using the same LitGPT parameter layout.
+
 ## Scope and verification
 
 This is a portable `jax.lax.scan` implementation supporting JIT and autodiff on
 JAX backends. It does not implement the upstream Triton chunkwise WY algorithm,
-custom fused backward, hybrid sliding-window attention, checkpoint conversion,
-or the pretraining data pipeline. Training retains scan intermediates; it is
+custom fused backward, hybrid sliding-window attention, or the pretraining data
+pipeline. Training retains scan intermediates; it is
 intended as a usable reference implementation, not a throughput match for the
 upstream GPU kernels. Float32 internal activations also differ from upstream
 mixed-precision intermediate rounding.
@@ -100,6 +148,10 @@ matrices, numerical gradients, NumPy reproduction of the mixer wiring, gate
 limits, streaming/chunk equivalence, resets, padding, causality, and a tiny
 bfloat16 language-model gradient/update. The tests do not execute the upstream
 Triton kernels.
+
+`tests/test_gdn2_checkpoints.py` covers strict conversion, checkpoint integrity,
+save/load behavior, and converted-model logits against an independent PyTorch
+CPU implementation. PyTorch-specific tests require the optional PyTorch install.
 
 ```bash
 JAX_PLATFORMS=cpu uv run pytest tests/test_gdn2.py

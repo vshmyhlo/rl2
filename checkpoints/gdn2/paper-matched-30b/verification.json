@@ -1,0 +1,43 @@
+{
+  "source_sha256": "acac9407c19cb0941d7d0ee364c60e691fdd7a7d0edf99bd9eee0f4269f70824",
+  "params_sha256": "9a8d227e0cbdffa1fea8564fc5c0025dfb1ed730f80c4a62e46978d0d60a9086",
+  "parameter_count": 380603648,
+  "exactly_preserved_tensors": 355,
+  "tokens_time_major": [
+    [
+      1
+    ],
+    [
+      42
+    ],
+    [
+      100
+    ],
+    [
+      31999
+    ]
+  ],
+  "backend": "cpu",
+  "jax_version": "0.11.2",
+  "torch_version": "2.14.1+cpu",
+  "reference": "Independent PyTorch CPU source-layout equations; not upstream Triton kernels.",
+  "max_absolute_logit_error": 2.3603439331054688e-05,
+  "rms_logit_error": 4.156181603320874e-06,
+  "all_top1_tokens_match": true,
+  "top1_tokens": [
+    [
+      450
+    ],
+    [
+      338
+    ],
+    [
+      338
+    ],
+    [
+      30544
+    ]
+  ],
+  "rtol": 0.0005,
+  "atol": 0.0005
+}

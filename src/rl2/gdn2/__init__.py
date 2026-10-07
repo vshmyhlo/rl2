@@ -8,6 +8,7 @@ from rl2.gdn2.model import (
     GatedDeltaNet2LM,
     GatedDeltaNet2Stack,
     GatedDeltaNet2StackCarry,
+    gdn2_370m,
 )
 
 __all__ = [
@@ -19,4 +20,5 @@ __all__ = [
     "GatedDeltaNet2StackCarry",
     "delta_rule_step",
     "gated_delta_rule",
+    "gdn2_370m",
 ]

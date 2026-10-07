@@ -1,0 +1,46 @@
+{
+  "format": "rl2.gdn2.npz",
+  "version": 1,
+  "model": {
+    "mixer": {
+      "hidden_size": 1024,
+      "head_dim": 128,
+      "num_heads": 16,
+      "num_v_heads": null,
+      "expand_v": 1.0,
+      "use_short_conv": true,
+      "conv_size": 4,
+      "conv_bias": false,
+      "allow_neg_eigval": false,
+      "norm_eps": 1e-05
+    },
+    "num_layers": 16,
+    "intermediate_size": 2048,
+    "vocab_size": 32000
+  },
+  "parameter_count": 380603648,
+  "metadata": {
+    "source": {
+      "repo_id": "LLM-OS-Models2/gdn2-370m-fineweb-edu-30b-paper-matched",
+      "revision": "6f3458a5d7979ed3d85622b1e71e8eee25895742",
+      "filename": "model.pth",
+      "sha256": "acac9407c19cb0941d7d0ee364c60e691fdd7a7d0edf99bd9eee0f4269f70824"
+    },
+    "training": {
+      "iter_num": 114440,
+      "step_count": 57220,
+      "hparams": {
+        "devices": 8,
+        "name": "tsz128x4k_30B_gdn2_370m_fineweb_edu_30bt_paper_matched",
+        "nodes": 1,
+        "micro_batch_size": 8,
+        "max_tokens": 30000000000,
+        "global_batch_size": 128,
+        "gradient_accumulation_steps": 2,
+        "log_iter_interval": 20
+      }
+    },
+    "conversion": "Float32 weights; dense transpose and depthwise convolution axis permutation only."
+  },
+  "params_sha256": "9a8d227e0cbdffa1fea8564fc5c0025dfb1ed730f80c4a62e46978d0d60a9086"
+}
