@@ -32,7 +32,7 @@ def test_sampling_greedy_top_k_and_seed() -> None:
 @pytest.fixture(scope="module")
 def tiny_model() -> tuple[GatedDeltaNet2LM, Parameters]:
     model = GatedDeltaNet2LM(GatedDeltaNet2Config(hidden_size=2, head_dim=2, num_heads=1, conv_size=2), 1, 3, 5)
-    variables = model.init(jax.random.key(1), jnp.array([[1, 3]], jnp.int32))
+    variables = model.init(jax.random.key(1), jnp.array([[1, 3]], jnp.int32), jnp.array([2], jnp.int32))
     return model, variables
 
 
@@ -43,7 +43,7 @@ def test_cached_generation_matches_full_context_and_eos(tiny_model: tuple[GatedD
     context = prompt.copy()
     expected = []
     for _ in range(2):
-        _, logits = model.apply(variables, jnp.array(context, jnp.int32)[None, :])
+        _, logits = model.apply(variables, jnp.array(context, jnp.int32)[None, :], jnp.array([len(context)], jnp.int32))
         token = int(jnp.argmax(logits[0, -1]))
         expected.append(token)
         context.append(token)

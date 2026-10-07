@@ -129,7 +129,7 @@ def generate_tokens(
     def prefill(params: Parameters, ids: jax.Array) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
         sc = ShapeChecker(B=1, V=model.vocab_size)
         sc.check(ids, "BT", jnp.int32)
-        carry, logits = model.apply(params, ids)
+        carry, logits = model.apply(params, ids, jnp.full((1,), ids.shape[1], jnp.int32))
         sc.check(logits, "BTV", jnp.float32)
         return carry, logits[0, -1]
 
@@ -140,7 +140,7 @@ def generate_tokens(
     ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
         sc = ShapeChecker(B=1, V=model.vocab_size)
         sc.check(ids, "B", jnp.int32)
-        carry, logits = model.apply(params, ids, carry, method=model.step)
+        carry, logits = model.apply(params, ids, jnp.ones((1,), jnp.bool_), carry, method=model.step)
         sc.check(logits, "BV", jnp.float32)
         return carry, logits[0]
 

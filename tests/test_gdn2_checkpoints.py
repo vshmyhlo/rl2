@@ -178,7 +178,7 @@ def test_conversion_roundtrip_and_logits(
     loaded_model, variables = load_checkpoint(destination)
     for name, array in flatten_dict(variables["params"], sep="/").items():
         np.testing.assert_array_equal(array, flatten_dict(params, sep="/")[name])
-    carry, actual = jax.jit(loaded_model.apply)(variables, jnp.asarray(tokens))
+    carry, actual = jax.jit(loaded_model.apply)(variables, jnp.asarray(tokens), jnp.full((2,), 3, jnp.int32))
     np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=3e-5)
     assert len(carry) == 2
     bf16_model, _ = load_checkpoint(destination, dtype=jnp.bfloat16, backend="triton")

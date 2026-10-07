@@ -219,10 +219,11 @@ def test_lm_parameter_gradients(dtype: jax.typing.DTypeLike) -> None:
     reference = GatedDeltaNet2LM(config, num_layers=1, intermediate_size=24, vocab_size=19)
     model = reference.clone(backend="triton")
     tokens = jnp.array([[1, 2, 3]], jnp.int32)
-    variables = reference.init(jax.random.key(5), tokens)
+    x_len = jnp.array([3], jnp.int32)
+    variables = reference.init(jax.random.key(5), tokens, x_len)
 
     def loss(module: GatedDeltaNet2LM, params: Parameters) -> jax.Array:
-        state, logits = module.apply(params, tokens)
+        state, logits = module.apply(params, tokens, x_len)
         return jnp.mean(jax.nn.log_softmax(logits)[..., 4]) + 0.1 * jnp.sum(state[0].state)
 
     def actual_loss(params: Parameters) -> jax.Array:

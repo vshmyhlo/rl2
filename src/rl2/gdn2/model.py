@@ -131,9 +131,15 @@ def _sequence_mask(x: jax.Array, x_len: jax.Array, hidden_size: int) -> jax.Arra
     sc = ShapeChecker(D=hidden_size)
     sc.check(x, "BTD")
     chex.assert_type(x, jnp.floating)
-    chex.assert_scalar_positive(x.shape[0])
+    return _prefix_mask(x_len, x.shape[0], x.shape[1])
+
+
+def _prefix_mask(x_len: jax.Array, batch_size: int, sequence_length: int) -> jax.Array:
+    """Validate prefix lengths and construct a mask for features or token IDs."""
+    sc = ShapeChecker(B=batch_size, T=sequence_length)
+    chex.assert_scalar_positive(batch_size)
     sc.check(x_len, "B", jnp.int32)
-    invalid = jnp.any((x_len < 0) | (x_len > x.shape[1]))
+    invalid = jnp.any((x_len < 0) | (x_len > sequence_length))
     sc.check(invalid, "", jnp.bool_)
 
     def fail_if_invalid(value: jax.Array) -> None:
@@ -153,7 +159,7 @@ def _sequence_mask(x: jax.Array, x_len: jax.Array, hidden_size: int) -> jax.Arra
         jax.lax.cond(invalid, report_failure, success)
     else:
         fail_if_invalid(invalid)
-    valid = jnp.arange(x.shape[1])[None, :] < x_len[:, None]
+    valid = jnp.arange(sequence_length)[None, :] < x_len[:, None]
     sc.check(valid, "BT", jnp.bool_)
     return valid
 
@@ -478,8 +484,12 @@ class GatedDeltaNet2Stack(nn.Module, ARSequenceModel[GatedDeltaNet2StackCarry]):
 class GatedDeltaNet2LM(nn.Module):
     """Causal language model with untied embedding/head and explicit layer state.
 
-    Accepts integer tokens [B,T]; returns (carry, float32 logits [B,T,vocab_size]).
-    Token IDs must be in [0,vocab_size); callers validate external token input.
+    ``__call__(tokens, x_len, carry=None)`` accepts integer tokens [B,T] and
+    required int32 prefix lengths [B], returning (carry, float32 logits
+    [B,T,vocab_size]). ``step(tokens, x_active, carry=None)`` accepts tokens
+    [B] and required boolean x_active [B]. Padding returns zero logits and
+    preserves every carry leaf, following the sequence model convention.
+    Valid token IDs must be in [0,vocab_size); callers validate external input.
     This is the recurrent-only architecture, without hybrid sliding attention.
     """
 
@@ -515,17 +525,15 @@ class GatedDeltaNet2LM(nn.Module):
     def __call__(
         self,
         tokens: jax.Array,
+        x_len: jax.Array,
         carry: GatedDeltaNet2StackCarry | None = None,
-        episode_starts: jax.Array | None = None,
-        mask: jax.Array | None = None,
     ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
         sc = ShapeChecker(V=self.vocab_size)
         sc.check(tokens, "BT")
         chex.assert_type(tokens, jnp.integer)
-        if mask is not None:
-            sc.check(mask, "BT", jnp.bool_)
-            tokens = jnp.where(mask, tokens, 0)
-        carry, hidden = self.backbone._forward(self.embedding(tokens), carry, episode_starts, mask)
+        valid = _prefix_mask(x_len, tokens.shape[0], tokens.shape[1])
+        tokens = jnp.where(valid, tokens, 0)
+        carry, hidden = self.backbone._forward(self.embedding(tokens), carry, mask=valid)
         logits = self.lm_head(hidden.astype(jnp.float32))
         sc.check(logits, "BTV", jnp.float32)
         return carry, logits
@@ -533,24 +541,17 @@ class GatedDeltaNet2LM(nn.Module):
     def step(
         self,
         tokens: jax.Array,
+        x_active: jax.Array,
         carry: GatedDeltaNet2StackCarry | None = None,
-        episode_starts: jax.Array | None = None,
-        mask: jax.Array | None = None,
     ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
-        sc = ShapeChecker()
+        sc = ShapeChecker(V=self.vocab_size)
         sc.check(tokens, "B")
         chex.assert_type(tokens, jnp.integer)
-        for value in (episode_starts, mask):
-            if value is not None:
-                sc.check(value, "B", jnp.bool_)
-        carry, logits = self(
-            tokens[:, None],
-            carry,
-            None if episode_starts is None else episode_starts[:, None],
-            None if mask is None else mask[:, None],
-        )
-        sc.check(logits, "BTV", jnp.float32)
-        return carry, logits[:, 0]
+        sc.check(x_active, "B", jnp.bool_)
+        carry, logits = self(tokens[:, None], x_active.astype(jnp.int32), carry)
+        output = logits[:, 0]
+        sc.check(output, "BV", jnp.float32)
+        return carry, output
 
 
 def gdn2_370m(

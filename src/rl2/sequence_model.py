@@ -8,16 +8,18 @@ import jax
 class BDSequenceModel(ABC):
     """Bidirectional sequence operation without carry or single-step decoding.
 
-    Inputs are floating-point arrays with shape [batch,time,dim]. Required
+    Inputs are floating-point arrays with shape [batch,time,input_dim]. Required
     int32 ``x_len[batch]`` lies in [0, time] and denotes each example's
     left-aligned valid prefix, ``x[b, :x_len[b]]``. Remaining positions are
     right padding. Padding values must not affect valid outputs; padded
     outputs are zero. A zero length produces an all-zero output for that
     example.
 
-    Each call returns an array with the same shape as its input. Valid outputs
-    may depend on all valid tokens, including future tokens. There is no carry
-    input or output, no step method, and no chunk-equivalence requirement.
+    Each call returns an array with shape [batch,time,output_dim]. The output
+    feature dimension need not match input_dim (for example, output logits
+    may have one feature per vocabulary token). Valid outputs may depend on
+    all valid tokens, including future tokens. There is no carry input or
+    output, no step method, and no chunk-equivalence requirement.
 
     Output dtype and parameter storage are implementation-specific.
     Implementations validate shapes, dtypes, and length bounds, and must test
@@ -28,8 +30,9 @@ class BDSequenceModel(ABC):
 
     @abstractmethod
     def __call__(self, x: jax.Array, x_len: jax.Array) -> jax.Array:
-        """Process [batch,time,dim], returning same-shaped bidirectional output.
+        """Process [batch,time,input_dim], returning [batch,time,output_dim].
 
+        The output feature dimension need not match the input feature dimension.
         Required int32 lengths have shape [batch] and lie in [0, time],
         delimiting left-aligned valid tokens. Right-padded outputs are zero.
         Implementations may require nonempty batch and time dimensions.
@@ -42,11 +45,16 @@ class ARSequenceModel[CarryT](ABC):
 
     Every implementation must make ``__call__`` equivalent to time-stacked
     ``step`` calls, up to floating-point numerical tolerance. For input
-    ``x[batch,time,dim]``, lengths ``x_len[batch]``, and initial carry ``c``,
+    ``x[batch,time,input_dim]``, lengths ``x_len[batch]``, and initial carry ``c``,
     calling ``self(x, x_len, c)`` must produce the same outputs and final carry
     as processing ``x[:, t]`` in increasing time order with ``step``, passing
     each returned carry to the next step. At time ``t``, pass the boolean
     mask ``x_active=t < x_len``; stack the step outputs along axis 1.
+
+    Sequence outputs have shape [batch,time,output_dim], and step outputs
+    have shape [batch,output_dim]. The output feature dimension need not match
+    input_dim (for example, output logits may have one feature per vocabulary
+    token), but must agree between sequence and step operations.
 
     This invariant applies both from scratch (``c=None``) and from any valid
     supplied carry. Both methods must support either starting mode. Splitting
@@ -79,10 +87,12 @@ class ARSequenceModel[CarryT](ABC):
         x_len: jax.Array,
         carry: CarryT | None = None,
     ) -> tuple[CarryT, jax.Array]:
-        """Process [batch,time,dim] equivalently to repeated ``step`` calls.
+        """Process [batch,time,input_dim] equivalently to repeated ``step`` calls.
 
-        Return (final carry, same-shaped output). Required int32 lengths have
-        shape [batch] and lie in [0, time], delimiting left-aligned valid tokens.
+        Return (final carry, output with shape [batch,time,output_dim]). The
+        output feature dimension need not match the input feature dimension.
+        Required int32 lengths have shape [batch] and lie in [0, time],
+        delimiting left-aligned valid tokens.
         Omitted carry starts fresh; supplied carry continues prior history.
         Implementations may require nonempty batch and time dimensions.
         """
@@ -95,8 +105,9 @@ class ARSequenceModel[CarryT](ABC):
         x_active: jax.Array,
         carry: CarryT | None = None,
     ) -> tuple[CarryT, jax.Array]:
-        """Process [batch,dim], returning (updated carry, same-shaped output).
+        """Process [batch,input_dim], returning (updated carry, [batch,output_dim]).
 
+        The output feature dimension need not match the input feature dimension.
         Required boolean x_active[batch] selects examples to advance.
         Inactive inputs are ignored, produce
         zero output, and preserve that example's carry. With no supplied carry,

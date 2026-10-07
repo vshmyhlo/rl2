@@ -49,7 +49,7 @@ def main() -> None:
     del source
     gc.collect()
     print("PyTorch CPU reference completed; evaluating JAX.", flush=True)
-    _, logits = jax.jit(model.apply)(variables, jnp.asarray(tokens))
+    _, logits = jax.jit(model.apply)(variables, jnp.asarray(tokens), jnp.full((1,), tokens.shape[1], jnp.int32))
     actual = np.asarray(logits)
     np.testing.assert_allclose(actual, expected, rtol=5e-4, atol=5e-4)
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))

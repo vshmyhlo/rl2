@@ -391,38 +391,80 @@ def test_stack_matches_explicit_residual_blocks() -> None:
         model.apply(variables, x, x_len, ())
 
 
+@pytest.mark.parametrize(
+    "lengths",
+    [
+        jnp.array([-1], jnp.int32),
+        jnp.array([2], jnp.int32),
+        jnp.array([1.0], jnp.float32),
+        jnp.array([[1]], jnp.int32),
+        jnp.array([1, 1], jnp.int32),
+    ],
+    ids=["negative", "too-long", "dtype", "rank", "batch"],
+)
+def test_language_model_length_validation(lengths: jax.Array) -> None:
+    model = GatedDeltaNet2LM(GatedDeltaNet2Config(hidden_size=2, head_dim=2, num_heads=1), 1, 3, 5)
+    with pytest.raises((ValueError, AssertionError)):
+        model.init(jax.random.key(1), jnp.ones((1, 1), jnp.int32), lengths)
+
+
+@pytest.mark.parametrize("active", [jnp.ones((1,), jnp.int32), jnp.ones((1, 1), jnp.bool_)], ids=["dtype", "rank"])
+def test_language_model_active_validation(active: jax.Array) -> None:
+    model = GatedDeltaNet2LM(GatedDeltaNet2Config(hidden_size=2, head_dim=2, num_heads=1), 1, 3, 5)
+    with pytest.raises(AssertionError):
+        model.init(jax.random.key(1), jnp.ones((1,), jnp.int32), active, method=model.step)
+
+
 def test_language_model_bfloat16_streaming_and_training() -> None:
     config = GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1, conv_size=2, dtype=jnp.bfloat16)
     model = GatedDeltaNet2LM(config, num_layers=2, intermediate_size=6, vocab_size=7)
-    tokens = jnp.array([[1, 2, 3, 4], [4, 3, 2, 1]], jnp.int32)
-    starts = jnp.array([[False, False, True, False], [False, False, True, False]])
-    variables = model.init(jax.random.key(6), tokens)
-    final, logits = jax.jit(model.apply)(variables, tokens, None, starts)
-    assert logits.shape == (2, 4, 7)
-    chex.assert_type((logits, *jax.tree.leaves(final), *jax.tree.leaves(variables)), jnp.float32)
-    carry = model.initial_carry(2)
-    step = jax.jit(partial(model.apply, method=model.step))
-    outputs = []
-    for i in range(4):
-        carry, output = step(variables, tokens[:, i], carry, starts[:, i])
-        outputs.append(output)
-    _assert_tree_close(carry, final)
-    np.testing.assert_allclose(jnp.stack(outputs, axis=1), logits, atol=1e-6)
-    _, fresh = model.apply(variables, tokens[:, 2:])
-    np.testing.assert_allclose(fresh, logits[:, 2:], atol=1e-6)
-    empty_carry, empty = model.apply(variables, tokens[:, :0], final)
-    _assert_tree_close(empty_carry, final)
-    assert empty.shape == (2, 0, 7)
+    tokens = jnp.array([[1, 2, 3, 4], [4, 3, 2, 1], [1, 2, 3, 4]], jnp.int32)
+    lengths = jnp.array([4, 2, 0], jnp.int32)
+    active = jnp.arange(4)[None, :] < lengths[:, None]
     # Padding is ignored even if external token IDs would be out of vocabulary.
-    unchanged, zero = model.apply(variables, jnp.full_like(tokens, -1), final, mask=jnp.zeros(tokens.shape, jnp.bool_))
+    padded = jnp.where(active, tokens, model.vocab_size)
+    variables = model.init(jax.random.key(6), padded, x_len=lengths)
+    apply = jax.jit(model.apply)
+    step = jax.jit(partial(model.apply, method=model.step))
+    fresh = model.initial_carry(3)
+
+    def populate(leaf: jax.Array) -> jax.Array:
+        return jnp.full_like(leaf, 0.1)
+
+    for initial in (None, jax.tree.map(populate, fresh)):
+        final, logits = apply(variables, padded, lengths, initial)
+        assert logits.shape == (3, 4, 7)
+        chex.assert_type((logits, *jax.tree.leaves(final), *jax.tree.leaves(variables)), jnp.float32)
+        _assert_tree_close((final, logits), apply(variables, tokens, lengths, initial))
+        np.testing.assert_array_equal(logits[~active], 0)
+        start = fresh if initial is None else initial
+        for before, after in zip(jax.tree.leaves(start), jax.tree.leaves(final), strict=True):
+            np.testing.assert_array_equal(after[2], before[2])
+        carry = initial
+        outputs = []
+        for i in range(4):
+            carry, output = step(variables, padded[:, i], x_active=i < lengths, carry=carry)
+            outputs.append(output)
+        _assert_tree_close((carry, jnp.stack(outputs, axis=1)), (final, logits))
+        carry, first = apply(variables, padded[:, :2], jnp.minimum(lengths, 2), initial)
+        carry, second = apply(variables, padded[:, 2:], jnp.maximum(lengths - 2, 0), carry)
+        _assert_tree_close((carry, jnp.concatenate((first, second), axis=1)), (final, logits))
+        empty_carry, empty = apply(variables, tokens[:, :0], jnp.zeros_like(lengths), initial)
+        _assert_tree_close(empty_carry, start)
+        assert empty.shape == (3, 0, 7)
+
+    unchanged, zero = step(variables, jnp.full_like(tokens[:, 0], -1), jnp.zeros((3,), jnp.bool_), final)
     _assert_tree_close(unchanged, final)
     np.testing.assert_array_equal(zero, 0)
+    _, changed = apply(variables, tokens.at[:, 2:].set(0), lengths)
+    _, original = apply(variables, tokens, lengths)
+    np.testing.assert_array_equal(changed[:, :2], original[:, :2])
     # Every layer must receive its own parameters.
     p = variables["params"]["backbone"]
     assert not np.array_equal(p["mixer_0"]["q_proj"]["kernel"], p["mixer_1"]["q_proj"]["kernel"])
 
     def loss(params: Parameters) -> jax.Array:
-        _, predictions = model.apply({"params": params}, tokens, episode_starts=starts)
+        _, predictions = model.apply({"params": params}, tokens, jnp.full((3,), 4, jnp.int32))
         return optax.softmax_cross_entropy_with_integer_labels(predictions[:, :-1], tokens[:, 1:]).mean()
 
     value, gradients = jax.jit(jax.value_and_grad(loss))(variables["params"])
