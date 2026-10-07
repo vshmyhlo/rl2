@@ -17,10 +17,10 @@ type Rule = Callable[..., tuple[jax.Array, jax.Array]]
 
 def _inputs(time: int = 65, key: int = 32, value: int = 32) -> Arrays:
     rng = np.random.default_rng(3)
-    q, k = (jnp.asarray(rng.normal(size=(time, 2, 2, key)).astype(np.float32)) for _ in range(2))
+    q, k = (jnp.asarray(rng.normal(size=(2, time, 2, key)).astype(np.float32)) for _ in range(2))
     q = q / jnp.linalg.norm(q, axis=-1, keepdims=True) / key**0.5
     k = k / jnp.linalg.norm(k, axis=-1, keepdims=True)
-    v = jnp.asarray(rng.normal(size=(time, 2, 2, value)).astype(np.float32))
+    v = jnp.asarray(rng.normal(size=(2, time, 2, value)).astype(np.float32))
     g = jnp.asarray(-rng.uniform(0.005, 0.08, q.shape).astype(np.float32))
     b = jnp.asarray(rng.uniform(0, 1, q.shape).astype(np.float32))
     w = jnp.asarray(rng.uniform(0, 1, v.shape).astype(np.float32))
@@ -68,9 +68,9 @@ def test_fused_recurrence_and_streaming_gradients() -> None:
         np.testing.assert_allclose(got, want, atol=3e-6, rtol=3e-5)
 
     def streamed(*a: jax.Array) -> jax.Array:
-        state, first = fused_recurrent_gated_delta_rule(*(x[:1] for x in a[:-1]), a[-1])
-        state, rest = fused_recurrent_gated_delta_rule(*(x[1:] for x in a[:-1]), state)
-        return jnp.sum(jnp.sin(jnp.concatenate((first, rest)))) + jnp.sum(jnp.sin(state)) * 0.3
+        state, first = fused_recurrent_gated_delta_rule(*(x[:, :1] for x in a[:-1]), a[-1])
+        state, rest = fused_recurrent_gated_delta_rule(*(x[:, 1:] for x in a[:-1]), state)
+        return jnp.sum(jnp.sin(jnp.concatenate((first, rest), axis=1))) + jnp.sum(jnp.sin(state)) * 0.3
 
     def reference(*a: jax.Array) -> jax.Array:
         return _loss(gated_delta_rule, *a)
@@ -88,13 +88,13 @@ def test_short_conv_outputs_and_gradients(size: int) -> None:
 
     rng = np.random.default_rng(18)
     args = tuple(
-        jnp.asarray(rng.normal(size=s).astype(np.float32)) for s in [(2, 2, 7), (2, size - 1, 7), (size, 7), (7,)]
+        jnp.asarray(rng.normal(size=s).astype(np.float32)) for s in [(1, 2, 7), (1, size - 1, 7), (size, 7), (7,)]
     )
 
     def reference(x: jax.Array, history: jax.Array, weight: jax.Array, bias: jax.Array) -> tuple[jax.Array, jax.Array]:
-        joined = jnp.concatenate((history, x.swapaxes(0, 1)), axis=1)
-        z = sum(joined[:, c : c + x.shape[0]] * weight[c] for c in range(size)) + bias
-        return joined[:, x.shape[0] :], jax.nn.silu(z).swapaxes(0, 1)
+        joined = jnp.concatenate((history, x), axis=1)
+        z = sum(joined[:, c : c + x.shape[1]] * weight[c] for c in range(size)) + bias
+        return joined[:, x.shape[1] :], jax.nn.silu(z)
 
     for got, want in zip(jax.jit(short_conv)(*args), reference(*args), strict=True):
         np.testing.assert_allclose(got, want, atol=3e-6, rtol=3e-5)
@@ -159,10 +159,10 @@ def test_mixer_streaming_and_padding(mode: str) -> None:
     )
     reference = GatedDeltaNet2(config)
     model = reference.clone(backend="triton")
-    x = jnp.asarray(np.random.default_rng(11).normal(size=(5, 2, 16)).astype(np.float32))
+    x = jnp.asarray(np.random.default_rng(11).normal(size=(2, 5, 16)).astype(np.float32))
     variables = reference.init(jax.random.key(12), x, method=reference._forward)
-    mask = None if mode == "plain" else jnp.array([[1, 1], [0, 1], [1, 0], [1, 1], [0, 0]], jnp.bool_)
-    starts = jnp.array([[0, 0], [1, 0], [0, 0], [1, 1], [1, 0]], jnp.bool_) if mode == "reset" else None
+    mask = None if mode == "plain" else jnp.array([[1, 0, 1, 1, 0], [1, 1, 0, 1, 0]], jnp.bool_)
+    starts = jnp.array([[0, 1, 0, 1, 1], [0, 0, 0, 1, 0]], jnp.bool_) if mode == "reset" else None
     if mask is not None:
         x = jnp.where(mask[..., None], x, jnp.nan)
     expected = jax.jit(reference.apply, static_argnames=("method",))(
@@ -176,23 +176,23 @@ def test_mixer_streaming_and_padding(mode: str) -> None:
     step = jax.jit(model.apply, static_argnames=("method",))
     state = model.initial_carry(2)
     outputs = []
-    for t in range(x.shape[0]):
+    for t in range(x.shape[1]):
         state, y = step(
             variables,
-            x[t : t + 1],
+            x[:, t : t + 1],
             state,
-            None if starts is None else starts[t : t + 1],
-            None if mask is None else mask[t : t + 1],
+            None if starts is None else starts[:, t : t + 1],
+            None if mask is None else mask[:, t : t + 1],
             method=model._forward,
         )
-        outputs.append(y[0])
-    streamed = state, jnp.stack(outputs)
+        outputs.append(y[:, 0])
+    streamed = state, jnp.stack(outputs, axis=1)
     for got, want in zip(jax.tree.leaves(streamed), jax.tree.leaves(expected), strict=True):
         np.testing.assert_allclose(got, want, atol=3e-6, rtol=5e-4)
 
     if mode == "masked":
         lengths = jnp.array([3, 0], jnp.int32)
-        sequence = jnp.nan_to_num(x).swapaxes(0, 1)
+        sequence = jnp.nan_to_num(x)
         sequence = jnp.where(jnp.arange(5)[None, :, None] < lengths[:, None, None], sequence, jnp.nan)
         expected = jax.jit(reference.apply)(variables, sequence, lengths)
         actual = jax.jit(model.apply)(variables, sequence, lengths)
@@ -218,7 +218,7 @@ def test_lm_parameter_gradients(dtype: jax.typing.DTypeLike) -> None:
     config = GatedDeltaNet2Config(hidden_size=16, head_dim=16, num_heads=1, dtype=dtype)
     reference = GatedDeltaNet2LM(config, num_layers=1, intermediate_size=24, vocab_size=19)
     model = reference.clone(backend="triton")
-    tokens = jnp.array([[1], [2], [3]], jnp.int32)
+    tokens = jnp.array([[1, 2, 3]], jnp.int32)
     variables = reference.init(jax.random.key(5), tokens)
 
     def loss(module: GatedDeltaNet2LM, params: Parameters) -> jax.Array:

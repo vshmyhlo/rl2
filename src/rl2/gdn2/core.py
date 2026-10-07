@@ -61,21 +61,24 @@ def gated_delta_rule(
     write: jax.Array,
     initial_state: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Scan time-major [T,B,H,K/V] inputs; return (final state, [T,B,H,V]).
+    """Scan batch-first [B,T,H,K/V] inputs; return (final state, [B,T,H,V]).
 
     Normalization and scaling are the caller's responsibility, as in
     :func:`delta_rule_step`. Empty inputs preserve the initial state.
     """
     sc = ShapeChecker()
-    sc.check([q, k, log_decay, erase], "TBHK", jnp.float32)
-    sc.check([v, write], "TBHV", jnp.float32)
+    sc.check([q, k, log_decay, erase], "BTHK", jnp.float32)
+    sc.check([v, write], "BTHV", jnp.float32)
     state = jnp.zeros(sc["BHKV"], jnp.float32) if initial_state is None else initial_state
     sc.check(state, "BHKV", jnp.float32)
 
     def step(carry: jax.Array, inputs: DeltaInputs) -> tuple[jax.Array, jax.Array]:
         return delta_rule_step(carry, *inputs)
 
-    state, output = jax.lax.scan(step, state, (q, k, v, log_decay, erase, write))
+    # lax.scan consumes its leading axis; keep this layout conversion local.
+    inputs = tuple(a.swapaxes(0, 1) for a in (q, k, v, log_decay, erase, write))
+    state, output = jax.lax.scan(step, state, inputs)
+    output = output.swapaxes(0, 1)
     sc.check(state, "BHKV", jnp.float32)
-    sc.check(output, "TBHV", jnp.float32)
+    sc.check(output, "BTHV", jnp.float32)
     return state, output

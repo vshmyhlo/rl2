@@ -84,7 +84,7 @@ def torch_reference_logits(
     from torch.nn import functional as f
 
     sc = ShapeChecker()
-    sc.check(tokens, "TB", np.int32)
+    sc.check(tokens, "BT", np.int32)
     c = model.config
     weights = {key: torch.from_numpy(value) for key, value in state.items()}
 
@@ -105,12 +105,12 @@ def torch_reference_logits(
                 projected = linear(a, attn + name + "_proj")
                 if c.use_short_conv:
                     projected = f.conv1d(
-                        projected.permute(1, 2, 0),
+                        projected.permute(0, 2, 1),
                         weights[attn + name + "_conv1d.weight"],
                         weights.get(attn + name + "_conv1d.bias"),
                         padding=c.conv_size - 1,
                         groups=projected.shape[-1],
-                    )[..., : len(tokens)].permute(2, 0, 1)
+                    )[..., : tokens.shape[1]].permute(0, 2, 1)
                 qkv.append(f.silu(projected))
             q, k, v = qkv
             key_shape = (*tokens.shape, c.num_heads, c.head_dim)
@@ -131,15 +131,15 @@ def torch_reference_logits(
                 for t in (q, k, decay, erase)
             )
             v = v.reshape(value_shape)
-            memory = torch.zeros((tokens.shape[1], c.value_heads, c.head_dim, c.value_head_dim))
+            memory = torch.zeros((tokens.shape[0], c.value_heads, c.head_dim, c.value_head_dim))
             identity = torch.eye(c.head_dim)
             outputs = []
-            for t in range(len(tokens)):
-                transition = identity - k[t][..., :, None] * (erase[t] * k[t])[..., None, :]
-                memory = transition @ (decay[t].exp()[..., None] * memory)
-                memory = memory + k[t][..., :, None] * (write[t] * v[t])[..., None, :]
-                outputs.append((q[t][..., None, :] @ memory).squeeze(-2))
-            y = norm(torch.stack(outputs), attn + "o_norm")
+            for t in range(tokens.shape[1]):
+                transition = identity - k[:, t][..., :, None] * (erase[:, t] * k[:, t])[..., None, :]
+                memory = transition @ (decay[:, t].exp()[..., None] * memory)
+                memory = memory + k[:, t][..., :, None] * (write[:, t] * v[:, t])[..., None, :]
+                outputs.append((q[:, t][..., None, :] @ memory).squeeze(-2))
+            y = norm(torch.stack(outputs, dim=1), attn + "o_norm")
             gate = linear(linear(a, attn + "g_proj.0"), attn + "g_proj.1").reshape(value_shape)
             x = x + linear((y * f.silu(gate)).flatten(-2), attn + "o_proj")
             a = norm(x, layer + "norm_2")
@@ -147,8 +147,8 @@ def torch_reference_logits(
             x = x + linear(hidden, layer + "mlp.swiglu.w3")
         output = linear(norm(x, "transformer.ln_f"), "lm_head").numpy()
     sc = ShapeChecker(V=model.vocab_size)
-    sc.check(tokens, "TB", np.int32)
-    sc.check(output, "TBV", np.float32)
+    sc.check(tokens, "BT", np.int32)
+    sc.check(output, "BTV", np.float32)
     return output
 
 
@@ -171,7 +171,7 @@ def test_conversion_roundtrip_and_logits(
     np.testing.assert_array_equal(
         params["backbone"]["mixer_0"]["q_conv_kernel"], source_state["transformer.h.0.attn.q_conv1d.weight"][:, 0, :].T
     )
-    tokens = np.array([[1], [2], [3]], np.int32)
+    tokens = np.array([[1, 2, 3], [3, 1, 2]], np.int32)
     expected = torch_reference_logits(source_state, tiny_model, tokens)
     destination = tmp_path / "model"
     save_checkpoint(destination, tiny_model, params, {"step_count": 12})

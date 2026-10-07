@@ -1,7 +1,7 @@
 """Optional JAX bindings for NVIDIA's GDN-2 Triton kernels.
 
-Imports no PyTorch. Public arrays follow the portable core's time-major,
-float32 convention; chunk kernels internally use batch-major blocks of 64.
+Imports no PyTorch. Arrays use batch-first BTD/BTHD layouts and float32,
+matching the portable core and the kernels' blocks of 64 time steps.
 """
 
 from functools import partial
@@ -259,26 +259,24 @@ def chunk_gated_delta_rule(
 ) -> Result:
     """Chunked forward and first-order reverse-mode gradients on NVIDIA GPUs.
 
-    Same time-major float32 contract as core.gated_delta_rule. Key dimensions
+    Same batch-first float32 contract as core.gated_delta_rule. Key dimensions
     up to 256 are supported. Tail padding is internal and preserves final state.
     """
     sc = ShapeChecker()
-    sc.check([q, k, log_decay, erase], "TBHK", jnp.float32)
-    sc.check([v, write], "TBHV", jnp.float32)
+    sc.check([q, k, log_decay, erase], "BTHK", jnp.float32)
+    sc.check([v, write], "BTHV", jnp.float32)
     state = jnp.zeros(sc["BHKV"], jnp.float32) if initial_state is None else initial_state
     sc.check(state, "BHKV", jnp.float32)
     if q.shape[-1] > 256:
         raise ValueError("Triton chunk kernels support head_dim <= 256")
-    if q.shape[0] == 0:
+    if q.shape[1] == 0:
         return state, jnp.zeros_like(v)
-    pad = (-q.shape[0]) % 64
-    inputs = tuple(
-        jnp.pad(a.swapaxes(0, 1), ((0, 0), (0, pad), (0, 0), (0, 0))) for a in (q, k, v, log_decay, erase, write)
-    )
+    pad = (-q.shape[1]) % 64
+    inputs = tuple(jnp.pad(a, ((0, 0), (0, pad), (0, 0), (0, 0))) for a in (q, k, v, log_decay, erase, write))
     final_state, output = _chunk(*inputs, state)
-    output = output[:, : q.shape[0]].swapaxes(0, 1)
+    output = output[:, : q.shape[1]]
     sc.check(final_state, "BHKV", jnp.float32)
-    sc.check(output, "TBHV", jnp.float32)
+    sc.check(output, "BTHV", jnp.float32)
     return final_state, output
 
 
@@ -320,11 +318,7 @@ def _recurrent_forward(*inputs: jax.Array) -> tuple[Result, Arrays]:
 def _recurrent_backward(inputs: Arrays, cotangent: Result) -> Arrays:
     # Decoding normally has no gradient. If differentiated, recompute via the
     # chunked primitive and use its custom backward, including initial state.
-    def forward(*args: jax.Array) -> Result:
-        state, output = chunk_gated_delta_rule(*(a.swapaxes(0, 1) for a in args[:-1]), args[-1])
-        return state, output.swapaxes(0, 1)
-
-    _, pullback = jax.vjp(forward, *inputs)
+    _, pullback = jax.vjp(chunk_gated_delta_rule, *inputs)
     return pullback(cotangent)
 
 
@@ -342,18 +336,17 @@ def fused_recurrent_gated_delta_rule(
 ) -> Result:
     """Fused decoding/prefill recurrence; autodiff uses chunked backward."""
     sc = ShapeChecker()
-    sc.check([q, k, log_decay, erase], "TBHK", jnp.float32)
-    sc.check([v, write], "TBHV", jnp.float32)
+    sc.check([q, k, log_decay, erase], "BTHK", jnp.float32)
+    sc.check([v, write], "BTHV", jnp.float32)
     state = jnp.zeros(sc["BHKV"], jnp.float32) if initial_state is None else initial_state
     sc.check(state, "BHKV", jnp.float32)
     if q.shape[-1] > 256:
         raise ValueError("Triton kernels support head_dim <= 256")
-    if q.shape[0] == 0:
+    if q.shape[1] == 0:
         return state, jnp.zeros_like(v)
-    final_state, output = _recurrent(*(a.swapaxes(0, 1) for a in (q, k, v, log_decay, erase, write)), state)
-    output = output.swapaxes(0, 1)
+    final_state, output = _recurrent(q, k, v, log_decay, erase, write, state)
     sc.check(final_state, "BHKV", jnp.float32)
-    sc.check(output, "TBHV", jnp.float32)
+    sc.check(output, "BTHV", jnp.float32)
     return final_state, output
 
 
@@ -435,22 +428,22 @@ def short_conv(
     weight: jax.Array,
     bias: jax.Array,
 ) -> Result:
-    """Return (final history, SiLU(depthwise causal convolution)) for [T,B,D]."""
+    """Return (final history, SiLU(depthwise causal convolution)) for [B,T,D]."""
     sc = ShapeChecker()
-    sc.check(x, "TBD", jnp.float32)
+    sc.check(x, "BTD", jnp.float32)
     sc.check(weight, "CD", jnp.float32)
     sc.check(bias, "D", jnp.float32)
     sc.check(history, "BND", jnp.float32)
     if history.shape[1] != weight.shape[0] - 1:
         raise ValueError("Convolution history must contain conv_size - 1 tokens")
-    if x.shape[0] == 0:
+    if x.shape[1] == 0:
         return history, x
-    joined = jnp.concatenate((history, x.swapaxes(0, 1)), axis=1)
-    output = _conv(joined, weight, bias).swapaxes(0, 1)
+    joined = jnp.concatenate((history, x), axis=1)
+    output = _conv(joined, weight, bias)
     # This also covers conv_size=1, where the history has length zero.
-    final_history = joined[:, x.shape[0] :]
+    final_history = joined[:, x.shape[1] :]
     sc.check(final_history, "BND", jnp.float32)
-    sc.check(output, "TBD", jnp.float32)
+    sc.check(output, "BTD", jnp.float32)
     return final_history, output
 
 
@@ -462,7 +455,7 @@ def gated_rms_norm(x: jax.Array, gate: jax.Array, weight: jax.Array, eps: float)
     from rl2.gdn2._triton.pointwise import norm_forward
 
     sc = ShapeChecker()
-    sc.check([x, gate], "TBHV", jnp.float32)
+    sc.check([x, gate], "BTHV", jnp.float32)
     sc.check(weight, "V", jnp.float32)
     value = x.shape[-1]
     if x.size == 0:
@@ -489,7 +482,7 @@ def _norm_backward(eps: float, residual: Arrays, dy: jax.Array) -> Arrays:
 
     x, gate, weight = residual
     sc = ShapeChecker()
-    sc.check([x, gate, dy], "TBHV", jnp.float32)
+    sc.check([x, gate, dy], "BTHV", jnp.float32)
     sc.check(weight, "V", jnp.float32)
     value = x.shape[-1]
     if x.size == 0:

@@ -152,44 +152,44 @@ def _numpy_rule(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Use the full transition matrix, independently of the rank-one JAX code."""
     sc = ShapeChecker()
-    sc.check([q, k, g, b], "TBHK", np.float32)
-    sc.check([v, w], "TBHV", np.float32)
+    sc.check([q, k, g, b], "BTHK", np.float32)
+    sc.check([v, w], "BTHV", np.float32)
     sc.check(state, "BHKV", np.float32)
     state = state.copy()
     outputs = []
-    for t in range(q.shape[0]):
-        for batch in range(q.shape[1]):
+    for t in range(q.shape[1]):
+        for batch in range(q.shape[0]):
             for head in range(q.shape[2]):
-                kt = k[t, batch, head]
-                transition = np.eye(k.shape[-1]) - np.outer(kt, b[t, batch, head] * kt)
-                decay = np.diag(np.exp(g[t, batch, head]))
+                kt = k[batch, t, head]
+                transition = np.eye(k.shape[-1]) - np.outer(kt, b[batch, t, head] * kt)
+                decay = np.diag(np.exp(g[batch, t, head]))
                 state[batch, head] = transition @ decay @ state[batch, head] + np.outer(
-                    kt, w[t, batch, head] * v[t, batch, head]
+                    kt, w[batch, t, head] * v[batch, t, head]
                 )
-        outputs.append(np.einsum("bhk,bhkv->bhv", q[t], state))
-    return state, np.stack(outputs)
+        outputs.append(np.einsum("bhk,bhkv->bhv", q[:, t], state))
+    return state, np.stack(outputs, axis=1)
 
 
 def test_recurrence_matches_dense_equation_and_chunk_continuation() -> None:
     rng = np.random.default_rng(4)
-    q, k, g, b = (rng.normal(size=(4, 1, 2, 2)).astype(np.float32) for _ in range(4))
-    v, w = (rng.normal(size=(4, 1, 2, 3)).astype(np.float32) for _ in range(2))
+    q, k, g, b = (rng.normal(size=(2, 4, 2, 2)).astype(np.float32) for _ in range(4))
+    v, w = (rng.normal(size=(2, 4, 2, 3)).astype(np.float32) for _ in range(2))
     k /= np.sqrt(np.sum(k**2, axis=-1, keepdims=True) + 1e-6)
     g = -np.abs(g)
     b, w = 1 / (1 + np.exp(-b)), 1 / (1 + np.exp(-w))
-    state = rng.normal(size=(1, 2, 2, 3)).astype(np.float32)
+    state = rng.normal(size=(2, 2, 2, 3)).astype(np.float32)
     inputs = tuple(jnp.asarray(a) for a in (q, k, v, g, b, w))
     expected_state, expected_y = _numpy_rule(q, k, v, g, b, w, state)
     final, y = jax.jit(gated_delta_rule)(*inputs, jnp.asarray(state))
     np.testing.assert_allclose(final, expected_state, atol=1e-6)
     np.testing.assert_allclose(y, expected_y, atol=1e-6)
-    middle, first = gated_delta_rule(*(a[:2] for a in inputs), jnp.asarray(state))
-    end, second = gated_delta_rule(*(a[2:] for a in inputs), middle)
+    middle, first = gated_delta_rule(*(a[:, :2] for a in inputs), jnp.asarray(state))
+    end, second = gated_delta_rule(*(a[:, 2:] for a in inputs), middle)
     _assert_tree_close(end, final)
-    np.testing.assert_allclose(jnp.concatenate((first, second)), y, atol=1e-6)
-    empty_state, empty = gated_delta_rule(*(a[:0] for a in inputs), final)
+    np.testing.assert_allclose(jnp.concatenate((first, second), axis=1), y, atol=1e-6)
+    empty_state, empty = gated_delta_rule(*(a[:, :0] for a in inputs), final)
     _assert_tree_close(empty_state, final)
-    assert empty.shape == (0, 1, 2, 3)
+    assert empty.shape == (2, 0, 2, 3)
 
 
 @pytest.mark.parametrize(
@@ -230,11 +230,11 @@ def _numpy_mixer(
     """Upstream projection/conv/gate/norm recipe with NumPy matrix recurrence."""
     c = config
     sc = ShapeChecker(D=c.hidden_size)
-    sc.check(x, "TBD", np.float32)
+    sc.check(x, "BTD", np.float32)
 
     def linear(a: np.ndarray, name: str) -> np.ndarray:
         sc = ShapeChecker()
-        sc.check(a, "TBI", np.float32)
+        sc.check(a, "BTI", np.float32)
         p = params[name]
         return a @ np.asarray(p["kernel"]) + np.asarray(p.get("bias", np.float32(0)))
 
@@ -245,15 +245,18 @@ def _numpy_mixer(
     for name in ("q", "k", "v"):
         raw = linear(x, f"{name}_proj")
         history = c.conv_size - 1 if c.use_short_conv else 0
-        padded = np.concatenate((np.zeros((history, *raw.shape[1:]), np.float32), raw))
+        padded = np.concatenate((np.zeros((x.shape[0], history, raw.shape[-1]), np.float32), raw), axis=1)
         if c.use_short_conv:
             kernel = np.asarray(params[f"{name}_conv_kernel"])
-            projected = np.stack([np.einsum("sbd,sd->bd", padded[t : t + c.conv_size], kernel) for t in range(len(x))])
+            projected = np.stack(
+                [np.einsum("bsd,sd->bd", padded[:, t : t + c.conv_size], kernel) for t in range(x.shape[1])],
+                axis=1,
+            )
             projected += np.asarray(params.get(f"{name}_conv_bias", np.float32(0)))
         else:
             projected = raw
         projections.append(silu(projected))
-        histories.append(np.swapaxes(padded[len(x) :], 0, 1))
+        histories.append(padded[:, x.shape[1] :])
     q, k, v = projections
     key_shape = (*x.shape[:2], c.num_heads, c.head_dim)
     value_shape = (*x.shape[:2], c.value_heads, c.value_head_dim)
@@ -274,7 +277,7 @@ def _numpy_mixer(
         g,
         b,
         w.reshape(value_shape),
-        np.zeros((x.shape[1], c.value_heads, c.head_dim, c.value_head_dim), np.float32),
+        np.zeros((x.shape[0], c.value_heads, c.head_dim, c.value_head_dim), np.float32),
     )
     gate = linear(linear(x, "g_proj_in"), "g_proj_out").reshape(value_shape)
     y = y / np.sqrt(np.mean(y * y, axis=-1, keepdims=True) + c.norm_eps)
@@ -309,9 +312,9 @@ def test_mixer_matches_numpy_reference(config: GatedDeltaNet2Config) -> None:
     # Nontrivial output norm weights/bias exercise behavior hidden by default initialization.
     params["o_norm_scale"] = jnp.linspace(0.8, 1.2, config.value_head_dim)
     params["g_proj_out"]["bias"] = jnp.linspace(-0.2, 0.3, config.value_heads * config.value_head_dim)
-    expected_carry, expected = _numpy_mixer(config, params, np.asarray(x.swapaxes(0, 1)))
+    expected_carry, expected = _numpy_mixer(config, params, np.asarray(x))
     carry, y = jax.jit(model.apply)({"params": params}, x, x_len)
-    np.testing.assert_allclose(y, expected.swapaxes(0, 1), rtol=3e-5, atol=1e-7)
+    np.testing.assert_allclose(y, expected, rtol=3e-5, atol=1e-7)
     _assert_tree_close(carry, expected_carry)
     assert np.all((np.exp(params["A_log"]) >= 1) & (np.exp(params["A_log"]) <= 16))
     dt = jax.nn.softplus(params["dt_bias"])
@@ -320,39 +323,39 @@ def test_mixer_matches_numpy_reference(config: GatedDeltaNet2Config) -> None:
 
 def test_mixer_streaming_resets_padding_causality_and_empty_input() -> None:
     model = GatedDeltaNet2(GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1, conv_size=3))
-    x = jax.random.normal(jax.random.key(4), (4, 2, 4))
+    x = jax.random.normal(jax.random.key(4), (2, 4, 4))
     # The LM retains arbitrary resets and masks through this internal path.
     variables = model.init(jax.random.key(5), x, method=model._forward)
     apply = partial(model.apply, method=model._forward)
-    starts = jnp.zeros((4, 2), jnp.bool_).at[2, 0].set(True).at[1, 1].set(True)
-    mask = jnp.ones((4, 2), jnp.bool_).at[1, 1].set(False)
+    starts = jnp.zeros((2, 4), jnp.bool_).at[0, 2].set(True).at[1, 1].set(True)
+    mask = jnp.ones((2, 4), jnp.bool_).at[1, 1].set(False)
     padded_x = x.at[1, 1].set(jnp.nan)
     final, y = jax.jit(apply)(variables, padded_x, None, starts, mask)
-    carry, first = apply(variables, padded_x[:2], episode_starts=starts[:2], mask=mask[:2])
-    carry, second = apply(variables, padded_x[2:], carry, starts[2:], mask[2:])
+    carry, first = apply(variables, padded_x[:, :2], episode_starts=starts[:, :2], mask=mask[:, :2])
+    carry, second = apply(variables, padded_x[:, 2:], carry, starts[:, 2:], mask[:, 2:])
     _assert_tree_close(carry, final)
-    np.testing.assert_allclose(jnp.concatenate((first, second)), y, atol=1e-7)
+    np.testing.assert_allclose(jnp.concatenate((first, second), axis=1), y, atol=1e-7)
     carry = model.initial_carry(2)
     outputs = []
     step = jax.jit(apply)
-    for i in range(len(x)):
-        carry, output = step(variables, padded_x[i : i + 1], carry, starts[i : i + 1], mask[i : i + 1])
-        outputs.append(output[0])
+    for i in range(x.shape[1]):
+        carry, output = step(variables, padded_x[:, i : i + 1], carry, starts[:, i : i + 1], mask[:, i : i + 1])
+        outputs.append(output[:, 0])
     _assert_tree_close(carry, final)
-    np.testing.assert_allclose(jnp.stack(outputs), y, atol=1e-7)
-    _, reset_output = apply(variables, x[2:, :1])
-    np.testing.assert_allclose(reset_output[:, 0], y[2:, 0], atol=1e-7)
+    np.testing.assert_allclose(jnp.stack(outputs, axis=1), y, atol=1e-7)
+    _, reset_output = apply(variables, x[:1, 2:])
+    np.testing.assert_allclose(reset_output[0], y[0, 2:], atol=1e-7)
     # Padding skips both the convolution and recurrence, including a masked reset.
-    compressed_carry, compressed = apply(variables, x[jnp.array([0, 2, 3]), 1:])
-    np.testing.assert_allclose(compressed[:, 0], y[jnp.array([0, 2, 3]), 1], atol=1e-7)
+    compressed_carry, compressed = apply(variables, x[1:, jnp.array([0, 2, 3])])
+    np.testing.assert_allclose(compressed[0], y[1, jnp.array([0, 2, 3])], atol=1e-7)
     _assert_tree_close(compressed_carry, GatedDeltaNet2Carry(*(leaf[1:] for leaf in final)))
     np.testing.assert_array_equal(y[1, 1], 0)
-    _, changed = apply(variables, x.at[2:].add(100))
+    _, changed = apply(variables, x.at[:, 2:].add(100))
     _, original = apply(variables, x)
-    np.testing.assert_array_equal(changed[:2], original[:2])
-    empty_carry, empty = apply(variables, x[:0], final)
+    np.testing.assert_array_equal(changed[:, :2], original[:, :2])
+    empty_carry, empty = apply(variables, x[:, :0], final)
     _assert_tree_close(empty_carry, final)
-    assert empty.shape == (0, 2, 4)
+    assert empty.shape == (2, 0, 4)
     unchanged, zeros = apply(variables, x, final, jnp.ones_like(mask), jnp.zeros_like(mask))
     _assert_tree_close(unchanged, final)
     np.testing.assert_array_equal(zeros, 0)
@@ -361,14 +364,14 @@ def test_mixer_streaming_resets_padding_causality_and_empty_input() -> None:
 def test_stack_matches_explicit_residual_blocks() -> None:
     config = GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1, conv_size=2)
     model = GatedDeltaNet2Stack(config, num_layers=1, intermediate_size=6)
-    x = jax.random.normal(jax.random.key(7), (4, 1, 4))
+    x = jax.random.normal(jax.random.key(7), (1, 4, 4))
     x_len = jnp.array([4], jnp.int32)
-    variables = model.init(jax.random.key(8), x.swapaxes(0, 1), x_len)
+    variables = model.init(jax.random.key(8), x, x_len)
     p = variables["params"]
 
     def norm(a: np.ndarray, name: str) -> np.ndarray:
         sc = ShapeChecker(D=4)
-        sc.check(a, "TBD", np.float32)
+        sc.check(a, "BTD", np.float32)
         return a / np.sqrt(np.mean(a * a, axis=-1, keepdims=True) + config.norm_eps) * np.asarray(p[name]["scale"])
 
     state, mixed = _numpy_mixer(config, p["mixer_0"], norm(np.asarray(x), "norm_mixer_0"))
@@ -378,38 +381,38 @@ def test_stack_matches_explicit_residual_blocks() -> None:
     value = normalized @ np.asarray(p["mlp_up_0"]["kernel"])
     hidden = gate / (1 + np.exp(-gate)) * value
     expected = norm(residual + hidden @ np.asarray(p["mlp_down_0"]["kernel"]), "final_norm")
-    carry, y = model.apply(variables, x.swapaxes(0, 1), x_len)
-    np.testing.assert_allclose(y.swapaxes(0, 1), expected, rtol=3e-5, atol=1e-6)
+    carry, y = model.apply(variables, x, x_len)
+    np.testing.assert_allclose(y, expected, rtol=3e-5, atol=1e-6)
     _assert_tree_close(carry, (state,))
-    step_carry, single = model.apply(variables, x[0], jnp.ones((1,), jnp.bool_), method=model.step)
+    step_carry, single = model.apply(variables, x[:, 0], jnp.ones((1,), jnp.bool_), method=model.step)
     np.testing.assert_allclose(single, y[:, 0], atol=1e-6)
     assert len(step_carry) == 1
     with pytest.raises(ValueError, match="one state per layer"):
-        model.apply(variables, x.swapaxes(0, 1), x_len, ())
+        model.apply(variables, x, x_len, ())
 
 
 def test_language_model_bfloat16_streaming_and_training() -> None:
     config = GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1, conv_size=2, dtype=jnp.bfloat16)
     model = GatedDeltaNet2LM(config, num_layers=2, intermediate_size=6, vocab_size=7)
-    tokens = jnp.array([[1], [2], [3], [4]], jnp.int32)
-    starts = jnp.array([[False], [False], [True], [False]])
+    tokens = jnp.array([[1, 2, 3, 4], [4, 3, 2, 1]], jnp.int32)
+    starts = jnp.array([[False, False, True, False], [False, False, True, False]])
     variables = model.init(jax.random.key(6), tokens)
     final, logits = jax.jit(model.apply)(variables, tokens, None, starts)
-    assert logits.shape == (4, 1, 7)
+    assert logits.shape == (2, 4, 7)
     chex.assert_type((logits, *jax.tree.leaves(final), *jax.tree.leaves(variables)), jnp.float32)
-    carry = model.initial_carry(1)
+    carry = model.initial_carry(2)
     step = jax.jit(partial(model.apply, method=model.step))
     outputs = []
     for i in range(4):
-        carry, output = step(variables, tokens[i], carry, starts[i])
+        carry, output = step(variables, tokens[:, i], carry, starts[:, i])
         outputs.append(output)
     _assert_tree_close(carry, final)
-    np.testing.assert_allclose(jnp.stack(outputs), logits, atol=1e-6)
-    _, fresh = model.apply(variables, tokens[2:])
-    np.testing.assert_allclose(fresh, logits[2:], atol=1e-6)
-    empty_carry, empty = model.apply(variables, tokens[:0], final)
+    np.testing.assert_allclose(jnp.stack(outputs, axis=1), logits, atol=1e-6)
+    _, fresh = model.apply(variables, tokens[:, 2:])
+    np.testing.assert_allclose(fresh, logits[:, 2:], atol=1e-6)
+    empty_carry, empty = model.apply(variables, tokens[:, :0], final)
     _assert_tree_close(empty_carry, final)
-    assert empty.shape == (0, 1, 7)
+    assert empty.shape == (2, 0, 7)
     # Padding is ignored even if external token IDs would be out of vocabulary.
     unchanged, zero = model.apply(variables, jnp.full_like(tokens, -1), final, mask=jnp.zeros(tokens.shape, jnp.bool_))
     _assert_tree_close(unchanged, final)
@@ -420,7 +423,7 @@ def test_language_model_bfloat16_streaming_and_training() -> None:
 
     def loss(params: Parameters) -> jax.Array:
         _, predictions = model.apply({"params": params}, tokens, episode_starts=starts)
-        return optax.softmax_cross_entropy_with_integer_labels(predictions[:-1], tokens[1:]).mean()
+        return optax.softmax_cross_entropy_with_integer_labels(predictions[:, :-1], tokens[:, 1:]).mean()
 
     value, gradients = jax.jit(jax.value_and_grad(loss))(variables["params"])
     assert np.isfinite(value)

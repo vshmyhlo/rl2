@@ -124,14 +124,14 @@ def generate_tokens(
     if max_new_tokens == 0:
         return []
     variables = jax.device_put(variables)
-    tokens = jnp.asarray(prompt_ids, jnp.int32)[:, None]
+    tokens = jnp.asarray(prompt_ids, jnp.int32)[None, :]
 
     def prefill(params: Parameters, ids: jax.Array) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
         sc = ShapeChecker(B=1, V=model.vocab_size)
-        sc.check(ids, "TB", jnp.int32)
+        sc.check(ids, "BT", jnp.int32)
         carry, logits = model.apply(params, ids)
-        sc.check(logits, "TBV", jnp.float32)
-        return carry, logits[-1, 0]
+        sc.check(logits, "BTV", jnp.float32)
+        return carry, logits[0, -1]
 
     def step(
         params: Parameters,

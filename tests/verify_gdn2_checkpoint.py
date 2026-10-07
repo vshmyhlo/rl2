@@ -44,7 +44,7 @@ def main() -> None:
             original = original[:, 0, :].T
         np.testing.assert_array_equal(flat[spec.target], original, err_msg=spec.source)
     print(f"All {len(specs)} converted tensors exactly preserve source values.", flush=True)
-    tokens = np.array([[1], [42], [100], [model.vocab_size - 1]], np.int32)
+    tokens = np.array([[1, 42, 100, model.vocab_size - 1]], np.int32)
     expected = torch_reference_logits(source, model, tokens)
     del source
     gc.collect()
@@ -59,7 +59,7 @@ def main() -> None:
         "params_sha256": manifest["params_sha256"],
         "parameter_count": manifest["parameter_count"],
         "exactly_preserved_tensors": len(specs),
-        "tokens_time_major": tokens.tolist(),
+        "tokens_batch_first": tokens.tolist(),
         "backend": jax.default_backend(),
         "jax_version": jax.__version__,
         "torch_version": torch.__version__,
