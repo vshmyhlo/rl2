@@ -17,9 +17,9 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from flax.traverse_util import flatten_dict
+from test_gdn2_checkpoints import torch_reference_logits
 
 from rl2.gdn2.checkpoints import load_checkpoint, read_pytorch_checkpoint, sha256_file, weight_specs
-from test_gdn2_checkpoints import torch_reference_logits
 
 
 def main() -> None:

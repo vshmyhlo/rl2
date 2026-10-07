@@ -170,6 +170,7 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.8, help="0 for greedy decoding (default: 0.8)")
     parser.add_argument("--top-k", type=int, default=40, help="0 disables top-k filtering (default: 40)")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--backend", choices=("jax", "triton"), default="jax")
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="float32")
     parser.add_argument("--no-bos", action="store_true", help="Do not prepend the tokenizer's BOS token")
     args = parser.parse_args()
@@ -185,7 +186,7 @@ def main() -> None:
         if not prompt_ids:
             raise ValueError("The prompt must contain at least one token; enable BOS for an empty prompt")
         print(f"Loading {args.checkpoint} ({args.dtype})", file=sys.stderr)
-        model, variables = load_checkpoint(args.checkpoint, dtype=jnp.dtype(args.dtype))
+        model, variables = load_checkpoint(args.checkpoint, dtype=jnp.dtype(args.dtype), backend=args.backend)
         if tokenizer.vocab_size() != model.vocab_size:
             raise ValueError("Tokenizer vocabulary size does not match checkpoint vocabulary size")
         print(f"Generating up to {args.max_new_tokens} tokens from {len(prompt_ids)} prompt tokens...", file=sys.stderr)

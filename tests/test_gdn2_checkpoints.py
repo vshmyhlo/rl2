@@ -181,7 +181,8 @@ def test_conversion_roundtrip_and_logits(
     carry, actual = jax.jit(loaded_model.apply)(variables, jnp.asarray(tokens))
     np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=3e-5)
     assert len(carry) == 2
-    bf16_model, _ = load_checkpoint(destination, dtype=jnp.bfloat16)
+    bf16_model, _ = load_checkpoint(destination, dtype=jnp.bfloat16, backend="triton")
+    assert bf16_model.backend == "triton"
     assert bf16_model.config.dtype == jnp.bfloat16
     assert json.loads((destination / "manifest.json").read_text())["metadata"] == {"step_count": 12}
     with pytest.raises(FileExistsError):

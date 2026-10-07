@@ -3,6 +3,7 @@
 from rl2.gdn2.core import delta_rule_step, gated_delta_rule
 from rl2.gdn2.model import (
     GatedDeltaNet2,
+    GatedDeltaNet2Backend,
     GatedDeltaNet2Carry,
     GatedDeltaNet2Config,
     GatedDeltaNet2LM,
@@ -13,6 +14,7 @@ from rl2.gdn2.model import (
 
 __all__ = [
     "GatedDeltaNet2",
+    "GatedDeltaNet2Backend",
     "GatedDeltaNet2Carry",
     "GatedDeltaNet2Config",
     "GatedDeltaNet2LM",

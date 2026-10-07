@@ -19,7 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import flatten_dict, unflatten_dict
 
-from rl2.gdn2.model import GatedDeltaNet2Config, GatedDeltaNet2LM, gdn2_370m
+from rl2.gdn2.model import GatedDeltaNet2Backend, GatedDeltaNet2Config, GatedDeltaNet2LM, gdn2_370m
 from rl2.shape_checker import ShapeChecker
 
 type Parameters = dict[str, Any]
@@ -270,17 +270,19 @@ def load_checkpoint(
     directory: Path,
     *,
     dtype: jax.typing.DTypeLike = jnp.float32,
+    backend: GatedDeltaNet2Backend = "jax",
 ) -> tuple[GatedDeltaNet2LM, Parameters]:
     """Load a model and its Flax variables without initializing random parameters.
 
     Returns ``(model, {"params": ...})`` with float32 NumPy leaves, accepted by
-    ``model.apply`` and JAX transformations. dtype controls model computation.
+    ``model.apply`` and JAX transformations. dtype controls model computation;
+    backend selects portable JAX or optional Triton kernels without changing weights.
     Verifies the stored checksum, exact parameter names, shapes, and dtypes.
     """
     manifest = json.loads((directory / "manifest.json").read_text())
     if not isinstance(manifest, dict) or manifest.get("format") != "rl2.gdn2.npz" or manifest.get("version") != 1:
         raise ValueError("Unsupported GDN-2 checkpoint format/version")
-    model = _model_from_config(manifest.get("model"), dtype)
+    model = _model_from_config(manifest.get("model"), dtype).clone(backend=backend)
     if sha256_file(directory / "params.npz") != manifest.get("params_sha256"):
         raise ValueError("Checkpoint params.npz checksum mismatch")
     specs = weight_specs(model)

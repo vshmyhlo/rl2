@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from rl2.gdn2 import GatedDeltaNet2Config, GatedDeltaNet2LM
+from rl2.gdn2 import GatedDeltaNet2Backend, GatedDeltaNet2Config, GatedDeltaNet2LM
 from rl2.gdn2 import generate as generation
 from rl2.gdn2.checkpoints import Parameters
 
@@ -144,8 +144,11 @@ def test_cli_wiring(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixtu
         assert path is None
         return FakeTokenizer()
 
-    def checkpoint(path: Path, *, dtype: jax.typing.DTypeLike) -> tuple[GatedDeltaNet2LM, Parameters]:
+    def checkpoint(
+        path: Path, *, dtype: jax.typing.DTypeLike, backend: GatedDeltaNet2Backend
+    ) -> tuple[GatedDeltaNet2LM, Parameters]:
         assert path == generation.DEFAULT_CHECKPOINT and dtype == jnp.dtype(jnp.bfloat16)
+        assert backend == "triton"
         return model, params
 
     def generate(m: GatedDeltaNet2LM, p: Parameters, prompt: list[int], **kwargs: Any) -> list[int]:
@@ -173,6 +176,8 @@ def test_cli_wiring(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixtu
             "8",
             "--dtype",
             "bfloat16",
+            "--backend",
+            "triton",
         ],
     )
     generation.main()

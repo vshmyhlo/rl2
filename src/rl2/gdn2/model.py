@@ -16,7 +16,7 @@ Distributed under the NVIDIA Source Code License-NC; see LICENSE in this directo
 
 import math
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import chex
 import jax
@@ -83,6 +83,9 @@ class GatedDeltaNet2Carry(NamedTuple):
     v: jax.Array
 
 
+type GatedDeltaNet2Backend = Literal["jax", "triton"]
+
+
 type GatedDeltaNet2StackCarry = tuple[GatedDeltaNet2Carry, ...]
 type MixerInputs = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
 
@@ -130,9 +133,12 @@ class GatedDeltaNet2(nn.Module):
     that token; false mask entries skip the token and return zero. Padding
     takes precedence over resets, so a masked reset does not affect carry.
     No hidden mutable cache is used. Use ``method=model.step`` for [B,D].
+    backend="triton" enables optional GPU kernels; explicit episode_starts
+    retain the portable recurrence scan. Parameters and carries are shared.
     """
 
     config: GatedDeltaNet2Config = GatedDeltaNet2Config()
+    backend: GatedDeltaNet2Backend = "jax"
 
     @nn.nowrap
     def initial_carry(self, batch_size: int) -> GatedDeltaNet2Carry:
@@ -232,13 +238,70 @@ class GatedDeltaNet2(nn.Module):
             output = _select(active, output, jnp.zeros_like(output))
             return updated, output
 
-        carry, output = jax.lax.scan(step, carry, (q, k, v, log_decay, erase, write, starts, valid))
+        if self.backend == "triton" and episode_starts is None:
+            from rl2.gdn2.triton_backend import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule, short_conv
+
+            projections = [q, k, v]
+            histories = [carry.q, carry.k, carry.v]
+            for i in range(3):
+                if c.use_short_conv and mask is None:
+                    histories[i], projections[i] = short_conv(projections[i], histories[i], kernels[i], biases[i])
+                elif c.use_short_conv:
+                    # Masked tokens do not advance convolution history. This
+                    # small scan precedes the chunked recurrent-state kernel.
+                    kernel, bias = kernels[i], biases[i]
+
+                    def conv_step(
+                        previous: jax.Array,
+                        inputs: tuple[jax.Array, jax.Array],
+                        kernel: jax.Array = kernel,
+                        bias: jax.Array = bias,
+                    ) -> tuple[jax.Array, jax.Array]:
+                        token, active = inputs
+                        sc = ShapeChecker()
+                        sc.check(previous, "BND", jnp.float32)
+                        sc.check(token, "BD", jnp.float32)
+                        sc.check(active, "B", jnp.bool_)
+                        sc.check(kernel, "CD", jnp.float32)
+                        sc.check(bias, "D", jnp.float32)
+                        window = jnp.concatenate((previous, token[:, None]), axis=1)
+                        sc.check(window, "BCD", jnp.float32)
+                        value = jax.nn.silu(jnp.sum(window * kernel, axis=1) + bias)
+                        return _select(active, window[:, 1:], previous), value
+
+                    histories[i], projections[i] = jax.lax.scan(conv_step, histories[i], (projections[i], valid))
+                else:
+                    projections[i] = jax.nn.silu(projections[i])
+            q, k, v = projections
+            shape = (*x.shape[:2], c.num_heads, c.head_dim)
+            q, k, log_decay, erase = (a.reshape(shape) for a in (q, k, log_decay, erase))
+            q = q * jax.lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + 1e-6) * c.head_dim**-0.5
+            k = k * jax.lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + 1e-6)
+            repeats = c.value_heads // c.num_heads
+            q, k, log_decay, erase = (jnp.repeat(a, repeats, axis=2) for a in (q, k, log_decay, erase))
+            v, write = (a.reshape((*x.shape[:2], c.value_heads, c.value_head_dim)) for a in (v, write))
+            # Zero decay/keys/values make padding an identity state transition.
+            q, k, v, log_decay, erase, write = (
+                jnp.where(valid[..., None, None], a, 0) for a in (q, k, v, log_decay, erase, write)
+            )
+            rule = fused_recurrent_gated_delta_rule if x.shape[0] == 1 else chunk_gated_delta_rule
+            state, output = rule(q, k, v, log_decay, erase, write, carry.state)
+            carry = GatedDeltaNet2Carry(state, *histories)
+        else:
+            # Arbitrary per-batch episode boundaries retain the portable scan's
+            # exact reset and masked-reset semantics, including gradients.
+            carry, output = jax.lax.scan(step, carry, (q, k, v, log_decay, erase, write, starts, valid))
         sc.check(output, "TBHV", jnp.float32)
         gate = dense(dense(x, c.value_head_dim, "g_proj_in"), value_width, "g_proj_out", bias=True)
         gate = gate.astype(jnp.float32).reshape(output.shape)
         norm_weight = self.param("o_norm_scale", nn.initializers.ones, (c.value_head_dim,), jnp.float32)
-        output = output * jax.lax.rsqrt(jnp.mean(output**2, axis=-1, keepdims=True) + c.norm_eps)
-        output = output * norm_weight * jax.nn.silu(gate)
+        if self.backend == "triton":
+            from rl2.gdn2.triton_backend import gated_rms_norm
+
+            output = gated_rms_norm(output, gate, norm_weight, c.norm_eps)
+        else:
+            output = output * jax.lax.rsqrt(jnp.mean(output**2, axis=-1, keepdims=True) + c.norm_eps)
+            output = output * norm_weight * jax.nn.silu(gate)
         y = dense(output.reshape((*x.shape[:2], value_width)).astype(c.dtype), c.hidden_size, "o_proj")
         y = jnp.where(valid[..., None], y, 0)
         sc.check(y, "TBD", c.dtype)
@@ -277,11 +340,14 @@ class GatedDeltaNet2Stack(nn.Module):
     config: GatedDeltaNet2Config
     num_layers: int
     intermediate_size: int
+    backend: GatedDeltaNet2Backend = "jax"
 
     def setup(self) -> None:
         if self.num_layers <= 0 or self.intermediate_size <= 0:
             raise ValueError("num_layers and intermediate_size must be positive")
-        self.mixers = [GatedDeltaNet2(self.config, name=f"mixer_{i}") for i in range(self.num_layers)]
+        self.mixers = [
+            GatedDeltaNet2(self.config, backend=self.backend, name=f"mixer_{i}") for i in range(self.num_layers)
+        ]
 
     @nn.nowrap
     def initial_carry(self, batch_size: int) -> GatedDeltaNet2StackCarry:
@@ -372,11 +438,12 @@ class GatedDeltaNet2LM(nn.Module):
     num_layers: int
     intermediate_size: int
     vocab_size: int
+    backend: GatedDeltaNet2Backend = "jax"
 
     def setup(self) -> None:
         if self.vocab_size <= 0:
             raise ValueError("vocab_size must be positive")
-        self.backbone = GatedDeltaNet2Stack(self.config, self.num_layers, self.intermediate_size)
+        self.backbone = GatedDeltaNet2Stack(self.config, self.num_layers, self.intermediate_size, backend=self.backend)
         self.embedding = nn.Embed(
             self.vocab_size,
             self.config.hidden_size,
@@ -436,7 +503,11 @@ class GatedDeltaNet2LM(nn.Module):
         return carry, logits[0]
 
 
-def gdn2_370m(dtype: jax.typing.DTypeLike = jnp.float32) -> GatedDeltaNet2LM:
+def gdn2_370m(
+    dtype: jax.typing.DTypeLike = jnp.float32,
+    *,
+    backend: GatedDeltaNet2Backend = "jax",
+) -> GatedDeltaNet2LM:
     """380,603,648-parameter architecture used by the paper-matched 370M checkpoint.
 
     The checkpoint has 16 mixer heads, independent of the GPT config's n_head.
@@ -447,4 +518,5 @@ def gdn2_370m(dtype: jax.typing.DTypeLike = jnp.float32) -> GatedDeltaNet2LM:
         num_layers=16,
         intermediate_size=2048,
         vocab_size=32000,
+        backend=backend,
     )
