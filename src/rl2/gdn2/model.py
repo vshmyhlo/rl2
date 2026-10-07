@@ -24,6 +24,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from rl2.gdn2.core import delta_rule_step
+from rl2.sequence_model import ARSequenceModel
 from rl2.shape_checker import ShapeChecker
 
 
@@ -125,16 +126,46 @@ def _dt_init(key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
     return dt + jnp.log(-jnp.expm1(-dt))
 
 
-class GatedDeltaNet2(nn.Module):
-    """Time-major token mixer with explicit state, resets, and padding masks.
+def _sequence_mask(x: jax.Array, x_len: jax.Array, hidden_size: int) -> jax.Array:
+    """Validate batch-first sequence inputs and construct their valid prefixes."""
+    sc = ShapeChecker(D=hidden_size)
+    sc.check(x, "BTD")
+    chex.assert_type(x, jnp.floating)
+    chex.assert_scalar_positive(x.shape[0])
+    sc.check(x_len, "B", jnp.int32)
+    invalid = jnp.any((x_len < 0) | (x_len > x.shape[1]))
+    sc.check(invalid, "", jnp.bool_)
 
-    Call with x [T,B,D], optional carry, episode_starts [T,B] and mask [T,B].
-    Returns (carry, y [T,B,D]). True episode_starts reset all history before
-    that token; false mask entries skip the token and return zero. Padding
-    takes precedence over resets, so a masked reset does not affect carry.
-    No hidden mutable cache is used. Use ``method=model.step`` for [B,D].
-    backend="triton" enables optional GPU kernels; explicit episode_starts
-    retain the portable recurrence scan. Parameters and carries are shared.
+    def fail_if_invalid(value: jax.Array) -> None:
+        sc = ShapeChecker()
+        sc.check(value, "", jnp.bool_)
+        if bool(value):
+            raise ValueError("x_len must be between 0 and the input sequence length")
+
+    def report_failure() -> None:
+        # Under vmap both branches can run; the callback checks the predicate.
+        jax.debug.callback(fail_if_invalid, invalid)
+
+    def success() -> None:
+        pass
+
+    if isinstance(invalid, jax.core.Tracer):
+        jax.lax.cond(invalid, report_failure, success)
+    else:
+        fail_if_invalid(invalid)
+    valid = jnp.arange(x.shape[1])[None, :] < x_len[:, None]
+    sc.check(valid, "BT", jnp.bool_)
+    return valid
+
+
+class GatedDeltaNet2(nn.Module, ARSequenceModel[GatedDeltaNet2Carry]):
+    """Batch-first autoregressive token mixer with explicit recurrent state.
+
+    ``__call__(x, x_len, carry=None)`` accepts floating x [B,T,D] and required
+    int32 prefix lengths [B], returning (carry, y [B,T,D]). ``step`` accepts
+    x [B,D] and required boolean x_active [B]. Padding returns zero and
+    preserves every carry leaf. No hidden mutable cache is used.
+    backend="triton" enables optional GPU kernels with shared parameters/carry.
     """
 
     config: GatedDeltaNet2Config = GatedDeltaNet2Config()
@@ -144,8 +175,21 @@ class GatedDeltaNet2(nn.Module):
     def initial_carry(self, batch_size: int) -> GatedDeltaNet2Carry:
         return _initial_carry(self.config, batch_size)
 
-    @nn.compact
     def __call__(
+        self,
+        x: jax.Array,
+        x_len: jax.Array,
+        carry: GatedDeltaNet2Carry | None = None,
+    ) -> tuple[GatedDeltaNet2Carry, jax.Array]:
+        valid = _sequence_mask(x, x_len, self.config.hidden_size)
+        carry, y = self._forward(x.swapaxes(0, 1), carry, mask=valid.T)
+        y = y.swapaxes(0, 1)
+        sc = ShapeChecker(B=x.shape[0], T=x.shape[1], D=self.config.hidden_size)
+        sc.check(y, "BTD", self.config.dtype)
+        return carry, y
+
+    @nn.compact
+    def _forward(
         self,
         x: jax.Array,
         carry: GatedDeltaNet2Carry | None = None,
@@ -310,28 +354,23 @@ class GatedDeltaNet2(nn.Module):
     def step(
         self,
         x: jax.Array,
+        x_active: jax.Array,
         carry: GatedDeltaNet2Carry | None = None,
-        episode_starts: jax.Array | None = None,
-        mask: jax.Array | None = None,
     ) -> tuple[GatedDeltaNet2Carry, jax.Array]:
         sc = ShapeChecker(D=self.config.hidden_size)
         sc.check(x, "BD")
         chex.assert_type(x, jnp.floating)
-        for value in (episode_starts, mask):
-            if value is not None:
-                sc.check(value, "B", jnp.bool_)
-        carry, y = self(
-            x[None],
-            carry,
-            None if episode_starts is None else episode_starts[None],
-            None if mask is None else mask[None],
-        )
-        return carry, y[0]
+        sc.check(x_active, "B", jnp.bool_)
+        carry, y = self(x[:, None], x_active.astype(jnp.int32), carry)
+        output = y[:, 0]
+        sc.check(output, "BD", self.config.dtype)
+        return carry, output
 
 
-class GatedDeltaNet2Stack(nn.Module):
+class GatedDeltaNet2Stack(nn.Module, ARSequenceModel[GatedDeltaNet2StackCarry]):
     """Recurrent-only pre-RMSNorm residual blocks with SwiGLU and final RMSNorm.
 
+    Implements the same batch-first length/active-mask interface as the mixer.
     The mixer config is shared; each layer has independent parameters and carry.
     ``intermediate_size`` is the SwiGLU width (upstream 1.3B recipe uses 6208).
     Residual accumulation and normalization statistics stay float32.
@@ -355,8 +394,21 @@ class GatedDeltaNet2Stack(nn.Module):
             raise ValueError("num_layers must be positive")
         return tuple(_initial_carry(self.config, batch_size) for _ in range(self.num_layers))
 
-    @nn.compact
     def __call__(
+        self,
+        x: jax.Array,
+        x_len: jax.Array,
+        carry: GatedDeltaNet2StackCarry | None = None,
+    ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
+        valid = _sequence_mask(x, x_len, self.config.hidden_size)
+        carry, y = self._forward(x.swapaxes(0, 1), carry, mask=valid.T)
+        y = y.swapaxes(0, 1)
+        sc = ShapeChecker(B=x.shape[0], T=x.shape[1], D=self.config.hidden_size)
+        sc.check(y, "BTD", self.config.dtype)
+        return carry, y
+
+    @nn.compact
+    def _forward(
         self,
         x: jax.Array,
         carry: GatedDeltaNet2StackCarry | None = None,
@@ -383,7 +435,7 @@ class GatedDeltaNet2Stack(nn.Module):
         residual_init = nn.initializers.variance_scaling(1 / (6 * self.num_layers), "fan_in", "uniform")
         for i, mixer in enumerate(self.mixers):
             normed = nn.RMSNorm(epsilon=c.norm_eps, dtype=c.dtype, name=f"norm_mixer_{i}")(x)
-            state, mixed = mixer(normed, carry[i], episode_starts, mask)
+            state, mixed = mixer._forward(normed, carry[i], episode_starts, mask)
             updated.append(state)
             x = x + mixed.astype(jnp.float32)
             normed = nn.RMSNorm(epsilon=c.norm_eps, dtype=c.dtype, name=f"norm_mlp_{i}")(x)
@@ -407,23 +459,17 @@ class GatedDeltaNet2Stack(nn.Module):
     def step(
         self,
         x: jax.Array,
+        x_active: jax.Array,
         carry: GatedDeltaNet2StackCarry | None = None,
-        episode_starts: jax.Array | None = None,
-        mask: jax.Array | None = None,
     ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
         sc = ShapeChecker(D=self.config.hidden_size)
         sc.check(x, "BD")
         chex.assert_type(x, jnp.floating)
-        for value in (episode_starts, mask):
-            if value is not None:
-                sc.check(value, "B", jnp.bool_)
-        carry, y = self(
-            x[None],
-            carry,
-            None if episode_starts is None else episode_starts[None],
-            None if mask is None else mask[None],
-        )
-        return carry, y[0]
+        sc.check(x_active, "B", jnp.bool_)
+        carry, y = self(x[:, None], x_active.astype(jnp.int32), carry)
+        output = y[:, 0]
+        sc.check(output, "BD", self.config.dtype)
+        return carry, output
 
 
 class GatedDeltaNet2LM(nn.Module):
@@ -476,7 +522,7 @@ class GatedDeltaNet2LM(nn.Module):
         if mask is not None:
             sc.check(mask, "TB", jnp.bool_)
             tokens = jnp.where(mask, tokens, 0)
-        carry, hidden = self.backbone(self.embedding(tokens), carry, episode_starts, mask)
+        carry, hidden = self.backbone._forward(self.embedding(tokens), carry, episode_starts, mask)
         logits = self.lm_head(hidden.astype(jnp.float32))
         sc.check(logits, "TBV", jnp.float32)
         return carry, logits

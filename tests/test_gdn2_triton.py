@@ -160,13 +160,17 @@ def test_mixer_streaming_and_padding(mode: str) -> None:
     reference = GatedDeltaNet2(config)
     model = reference.clone(backend="triton")
     x = jnp.asarray(np.random.default_rng(11).normal(size=(5, 2, 16)).astype(np.float32))
-    variables = reference.init(jax.random.key(12), x)
+    variables = reference.init(jax.random.key(12), x, method=reference._forward)
     mask = None if mode == "plain" else jnp.array([[1, 1], [0, 1], [1, 0], [1, 1], [0, 0]], jnp.bool_)
     starts = jnp.array([[0, 0], [1, 0], [0, 0], [1, 1], [1, 0]], jnp.bool_) if mode == "reset" else None
     if mask is not None:
         x = jnp.where(mask[..., None], x, jnp.nan)
-    expected = jax.jit(reference.apply)(variables, x, episode_starts=starts, mask=mask)
-    actual = jax.jit(model.apply)(variables, x, episode_starts=starts, mask=mask)
+    expected = jax.jit(reference.apply, static_argnames=("method",))(
+        variables, x, episode_starts=starts, mask=mask, method=reference._forward
+    )
+    actual = jax.jit(model.apply, static_argnames=("method",))(
+        variables, x, episode_starts=starts, mask=mask, method=model._forward
+    )
     for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_allclose(got, want, atol=3e-6, rtol=5e-4)
     step = jax.jit(model.apply, static_argnames=("method",))
@@ -175,16 +179,34 @@ def test_mixer_streaming_and_padding(mode: str) -> None:
     for t in range(x.shape[0]):
         state, y = step(
             variables,
-            x[t],
+            x[t : t + 1],
             state,
-            None if starts is None else starts[t],
-            None if mask is None else mask[t],
-            method=model.step,
+            None if starts is None else starts[t : t + 1],
+            None if mask is None else mask[t : t + 1],
+            method=model._forward,
         )
-        outputs.append(y)
+        outputs.append(y[0])
     streamed = state, jnp.stack(outputs)
     for got, want in zip(jax.tree.leaves(streamed), jax.tree.leaves(expected), strict=True):
         np.testing.assert_allclose(got, want, atol=3e-6, rtol=5e-4)
+
+    if mode == "masked":
+        lengths = jnp.array([3, 0], jnp.int32)
+        sequence = jnp.nan_to_num(x).swapaxes(0, 1)
+        sequence = jnp.where(jnp.arange(5)[None, :, None] < lengths[:, None, None], sequence, jnp.nan)
+        expected = jax.jit(reference.apply)(variables, sequence, lengths)
+        actual = jax.jit(model.apply)(variables, sequence, lengths)
+        for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_allclose(got, want, atol=3e-6, rtol=5e-4)
+        state = None
+        outputs = []
+        for t in range(sequence.shape[1]):
+            state, y = step(variables, sequence[:, t], t < lengths, state, method=model.step)
+            outputs.append(y)
+        for got, want in zip(
+            jax.tree.leaves((state, jnp.stack(outputs, axis=1))), jax.tree.leaves(actual), strict=True
+        ):
+            np.testing.assert_allclose(got, want, atol=3e-6, rtol=5e-4)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])

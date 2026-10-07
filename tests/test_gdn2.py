@@ -21,9 +21,118 @@ from rl2.gdn2 import (
     delta_rule_step,
     gated_delta_rule,
 )
+from rl2.sequence_model import ARSequenceModel
 from rl2.shape_checker import ShapeChecker
 
 type Parameters = dict[str, Any]
+type SequenceModule = GatedDeltaNet2 | GatedDeltaNet2Stack
+
+
+@pytest.fixture(params=["mixer", "stack"])
+def sequence_model(request: pytest.FixtureRequest) -> SequenceModule:
+    config = GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1, conv_size=2)
+    if request.param == "mixer":
+        return GatedDeltaNet2(config)
+    return GatedDeltaNet2Stack(config, num_layers=1, intermediate_size=6)
+
+
+def test_sequence_contract(sequence_model: SequenceModule) -> None:
+    model = sequence_model
+    assert isinstance(model, ARSequenceModel)
+    x = jax.random.normal(jax.random.key(20), (3, 4, 4))
+    lengths = jnp.array([4, 2, 0], jnp.int32)
+    active = jnp.arange(4)[None, :] < lengths[:, None]
+    padded = jnp.where(active[..., None], x, jnp.nan)
+    variables = model.init(jax.random.key(21), padded, lengths)
+    apply = jax.jit(model.apply)
+    step = jax.jit(partial(model.apply, method=model.step))
+    fresh = model.initial_carry(3)
+
+    def populate(leaf: jax.Array) -> jax.Array:
+        return jnp.full_like(leaf, 0.1)
+
+    # Both starting modes must obey the same sequence/step/chunk contract.
+    for initial in (None, jax.tree.map(populate, fresh)):
+        final, y = apply(variables, padded, lengths, initial)
+        _assert_tree_close((final, y), apply(variables, x, lengths, initial))
+        np.testing.assert_array_equal(y[~active], 0)
+        start = fresh if initial is None else initial
+        for before, after in zip(jax.tree.leaves(start), jax.tree.leaves(final), strict=True):
+            np.testing.assert_array_equal(after[2], before[2])
+        carry = initial
+        outputs = []
+        for t in range(x.shape[1]):
+            carry, output = step(variables, padded[:, t], t < lengths, carry)
+            outputs.append(output)
+        _assert_tree_close((carry, jnp.stack(outputs, axis=1)), (final, y))
+        carry, first = apply(variables, padded[:, :2], jnp.minimum(lengths, 2), initial)
+        carry, second = apply(variables, padded[:, 2:], jnp.maximum(lengths - 2, 0), carry)
+        _assert_tree_close((carry, jnp.concatenate((first, second), axis=1)), (final, y))
+        empty_carry, empty = apply(variables, x[:, :0], jnp.zeros_like(lengths), initial)
+        _assert_tree_close(empty_carry, start)
+        assert empty.shape == (3, 0, 4)
+
+    # Inactive steps also preserve populated history when followed by active steps.
+    unchanged, zero = step(variables, jnp.full_like(x[:, 0], jnp.nan), jnp.zeros((3,), jnp.bool_), final)
+    _assert_tree_close(unchanged, final)
+    np.testing.assert_array_equal(zero, 0)
+    _, changed = apply(variables, x.at[:, 2:].add(100), lengths)
+    _, original = apply(variables, x, lengths)
+    np.testing.assert_array_equal(changed[:, :2], original[:, :2])
+
+
+def test_sequence_carry_gradients(sequence_model: SequenceModule) -> None:
+    model = sequence_model
+    x = jax.random.normal(jax.random.key(22), (1, 4, 4))
+    lengths = jnp.array([4], jnp.int32)
+    variables = model.init(jax.random.key(23), x, lengths)
+
+    def loss(inputs: jax.Array, *, chunked: bool) -> jax.Array:
+        sc = ShapeChecker(B=1, T=4, D=4)
+        sc.check(inputs, "BTD", jnp.float32)
+        if chunked:
+            carry, _ = model.apply(variables, inputs[:, :2], lengths // 2)
+            carry, output = model.apply(variables, inputs[:, 2:], lengths // 2, carry)
+        else:
+            carry, output = model.apply(variables, inputs, lengths)
+        return output[:, -1].sum() + sum(leaf.sum() for leaf in jax.tree.leaves(carry))
+
+    full = jax.jit(jax.grad(partial(loss, chunked=False)))(x)
+    chunked = jax.jit(jax.grad(partial(loss, chunked=True)))(x)
+    np.testing.assert_allclose(chunked, full, rtol=3e-5, atol=2e-6)
+    assert np.any(np.asarray(chunked[:, :2]) != 0)
+
+
+@pytest.mark.parametrize(
+    "lengths",
+    [
+        jnp.array([-1], jnp.int32),
+        jnp.array([2], jnp.int32),
+        jnp.array([1.0], jnp.float32),
+        jnp.array([[1]], jnp.int32),
+        jnp.array([1, 1], jnp.int32),
+    ],
+    ids=["negative", "too-long", "dtype", "rank", "batch"],
+)
+def test_sequence_length_validation(lengths: jax.Array) -> None:
+    model = GatedDeltaNet2(GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1))
+    with pytest.raises((ValueError, AssertionError)):
+        model.init(jax.random.key(1), jnp.zeros((1, 1, 4)), lengths)
+
+
+def test_sequence_length_validation_under_jit() -> None:
+    model = GatedDeltaNet2(GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1))
+    x = jnp.zeros((1, 1, 4))
+    variables = model.init(jax.random.key(1), x, jnp.ones((1,), jnp.int32))
+    with pytest.raises(jax.errors.JaxRuntimeError, match="x_len must be between"):
+        jax.block_until_ready(jax.jit(model.apply)(variables, x, jnp.array([2], jnp.int32)))
+
+
+@pytest.mark.parametrize("active", [jnp.ones((1,), jnp.int32), jnp.ones((1, 1), jnp.bool_)], ids=["dtype", "rank"])
+def test_step_active_validation(active: jax.Array) -> None:
+    model = GatedDeltaNet2(GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1))
+    with pytest.raises(AssertionError):
+        model.init(jax.random.key(1), jnp.zeros((1, 4)), active, method=model.step)
 
 
 def _assert_tree_close(actual: Any, expected: Any) -> None:
@@ -194,14 +303,15 @@ def _numpy_mixer(
 )
 def test_mixer_matches_numpy_reference(config: GatedDeltaNet2Config) -> None:
     model = GatedDeltaNet2(config)
-    x = jax.random.normal(jax.random.key(2), (4, 1, 4))
-    params = model.init(jax.random.key(3), x)["params"]
+    x = jax.random.normal(jax.random.key(2), (1, 4, 4))
+    x_len = jnp.array([4], jnp.int32)
+    params = model.init(jax.random.key(3), x, x_len)["params"]
     # Nontrivial output norm weights/bias exercise behavior hidden by default initialization.
     params["o_norm_scale"] = jnp.linspace(0.8, 1.2, config.value_head_dim)
     params["g_proj_out"]["bias"] = jnp.linspace(-0.2, 0.3, config.value_heads * config.value_head_dim)
-    expected_carry, expected = _numpy_mixer(config, params, np.asarray(x))
-    carry, y = jax.jit(model.apply)({"params": params}, x)
-    np.testing.assert_allclose(y, expected, rtol=3e-5, atol=1e-7)
+    expected_carry, expected = _numpy_mixer(config, params, np.asarray(x.swapaxes(0, 1)))
+    carry, y = jax.jit(model.apply)({"params": params}, x, x_len)
+    np.testing.assert_allclose(y, expected.swapaxes(0, 1), rtol=3e-5, atol=1e-7)
     _assert_tree_close(carry, expected_carry)
     assert np.all((np.exp(params["A_log"]) >= 1) & (np.exp(params["A_log"]) <= 16))
     dt = jax.nn.softplus(params["dt_bias"])
@@ -211,37 +321,39 @@ def test_mixer_matches_numpy_reference(config: GatedDeltaNet2Config) -> None:
 def test_mixer_streaming_resets_padding_causality_and_empty_input() -> None:
     model = GatedDeltaNet2(GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1, conv_size=3))
     x = jax.random.normal(jax.random.key(4), (4, 2, 4))
-    variables = model.init(jax.random.key(5), x)
+    # The LM retains arbitrary resets and masks through this internal path.
+    variables = model.init(jax.random.key(5), x, method=model._forward)
+    apply = partial(model.apply, method=model._forward)
     starts = jnp.zeros((4, 2), jnp.bool_).at[2, 0].set(True).at[1, 1].set(True)
     mask = jnp.ones((4, 2), jnp.bool_).at[1, 1].set(False)
     padded_x = x.at[1, 1].set(jnp.nan)
-    final, y = jax.jit(model.apply)(variables, padded_x, None, starts, mask)
-    carry, first = model.apply(variables, padded_x[:2], episode_starts=starts[:2], mask=mask[:2])
-    carry, second = model.apply(variables, padded_x[2:], carry, starts[2:], mask[2:])
+    final, y = jax.jit(apply)(variables, padded_x, None, starts, mask)
+    carry, first = apply(variables, padded_x[:2], episode_starts=starts[:2], mask=mask[:2])
+    carry, second = apply(variables, padded_x[2:], carry, starts[2:], mask[2:])
     _assert_tree_close(carry, final)
     np.testing.assert_allclose(jnp.concatenate((first, second)), y, atol=1e-7)
     carry = model.initial_carry(2)
     outputs = []
-    step = jax.jit(partial(model.apply, method=model.step))
+    step = jax.jit(apply)
     for i in range(len(x)):
-        carry, output = step(variables, padded_x[i], carry, starts[i], mask[i])
-        outputs.append(output)
+        carry, output = step(variables, padded_x[i : i + 1], carry, starts[i : i + 1], mask[i : i + 1])
+        outputs.append(output[0])
     _assert_tree_close(carry, final)
     np.testing.assert_allclose(jnp.stack(outputs), y, atol=1e-7)
-    _, reset_output = model.apply(variables, x[2:, :1])
+    _, reset_output = apply(variables, x[2:, :1])
     np.testing.assert_allclose(reset_output[:, 0], y[2:, 0], atol=1e-7)
     # Padding skips both the convolution and recurrence, including a masked reset.
-    compressed_carry, compressed = model.apply(variables, x[jnp.array([0, 2, 3]), 1:])
+    compressed_carry, compressed = apply(variables, x[jnp.array([0, 2, 3]), 1:])
     np.testing.assert_allclose(compressed[:, 0], y[jnp.array([0, 2, 3]), 1], atol=1e-7)
     _assert_tree_close(compressed_carry, GatedDeltaNet2Carry(*(leaf[1:] for leaf in final)))
     np.testing.assert_array_equal(y[1, 1], 0)
-    _, changed = model.apply(variables, x.at[2:].add(100))
-    _, original = model.apply(variables, x)
+    _, changed = apply(variables, x.at[2:].add(100))
+    _, original = apply(variables, x)
     np.testing.assert_array_equal(changed[:2], original[:2])
-    empty_carry, empty = model.apply(variables, x[:0], final)
+    empty_carry, empty = apply(variables, x[:0], final)
     _assert_tree_close(empty_carry, final)
     assert empty.shape == (0, 2, 4)
-    unchanged, zeros = model.apply(variables, x, final, jnp.ones_like(mask), jnp.zeros_like(mask))
+    unchanged, zeros = apply(variables, x, final, jnp.ones_like(mask), jnp.zeros_like(mask))
     _assert_tree_close(unchanged, final)
     np.testing.assert_array_equal(zeros, 0)
 
@@ -250,7 +362,8 @@ def test_stack_matches_explicit_residual_blocks() -> None:
     config = GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1, conv_size=2)
     model = GatedDeltaNet2Stack(config, num_layers=1, intermediate_size=6)
     x = jax.random.normal(jax.random.key(7), (4, 1, 4))
-    variables = model.init(jax.random.key(8), x)
+    x_len = jnp.array([4], jnp.int32)
+    variables = model.init(jax.random.key(8), x.swapaxes(0, 1), x_len)
     p = variables["params"]
 
     def norm(a: np.ndarray, name: str) -> np.ndarray:
@@ -265,14 +378,14 @@ def test_stack_matches_explicit_residual_blocks() -> None:
     value = normalized @ np.asarray(p["mlp_up_0"]["kernel"])
     hidden = gate / (1 + np.exp(-gate)) * value
     expected = norm(residual + hidden @ np.asarray(p["mlp_down_0"]["kernel"]), "final_norm")
-    carry, y = model.apply(variables, x)
-    np.testing.assert_allclose(y, expected, rtol=3e-5, atol=1e-6)
+    carry, y = model.apply(variables, x.swapaxes(0, 1), x_len)
+    np.testing.assert_allclose(y.swapaxes(0, 1), expected, rtol=3e-5, atol=1e-6)
     _assert_tree_close(carry, (state,))
-    step_carry, single = model.apply(variables, x[0], method=model.step)
-    np.testing.assert_allclose(single, y[0], atol=1e-6)
+    step_carry, single = model.apply(variables, x[0], jnp.ones((1,), jnp.bool_), method=model.step)
+    np.testing.assert_allclose(single, y[:, 0], atol=1e-6)
     assert len(step_carry) == 1
     with pytest.raises(ValueError, match="one state per layer"):
-        model.apply(variables, x, ())
+        model.apply(variables, x.swapaxes(0, 1), x_len, ())
 
 
 def test_language_model_bfloat16_streaming_and_training() -> None:
@@ -363,10 +476,11 @@ def test_array_shape_dtype_and_carry_validation() -> None:
         delta_rule_step(state.astype(jnp.bfloat16), q, q, q, q, q, q)
     model = GatedDeltaNet2(GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1))
     x = jnp.zeros((1, 1, 4), jnp.float32)
-    variables = model.init(jax.random.key(1), x)
+    x_len = jnp.ones((1,), jnp.int32)
+    variables = model.init(jax.random.key(1), x, x_len)
     with pytest.raises(AssertionError):
-        model.apply(variables, x, mask=jnp.ones((1, 1), jnp.int32))
+        model.apply(variables, x, jnp.ones((1, 1), jnp.int32))
     with pytest.raises(AssertionError):
-        model.apply(variables, x, model.initial_carry(2))
+        model.apply(variables, x, x_len, model.initial_carry(2))
     with pytest.raises(AssertionError):
-        model.apply(variables, x[..., :3])
+        model.apply(variables, x[..., :3], x_len)
