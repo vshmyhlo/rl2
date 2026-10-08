@@ -7,7 +7,16 @@ import pytest
 
 
 @pytest.mark.parametrize(
-    "name", ["ppo", "ppo_rnd", "train_karel_ast_grpo", "train_karel_ast_ar_edit", "train_karel_grpo", "train_wm"]
+    "name",
+    [
+        "ppo",
+        "ppo_rnd",
+        "train_karel_ast_grpo",
+        "train_karel_ast_ar_edit",
+        "train_karel_grpo",
+        "train_grpo_reasoning",
+        "train_wm",
+    ],
 )
 def test_training_configures_cache_before_initialization(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
     module = importlib.import_module(f"rl2.{name}")
@@ -19,7 +28,16 @@ def test_training_configures_cache_before_initialization(name: str, monkeypatch:
 
 
 @pytest.mark.parametrize(
-    "name", ["ppo", "ppo_rnd", "train_karel_ast_grpo", "train_karel_ast_ar_edit", "train_karel_grpo", "train_wm"]
+    "name",
+    [
+        "ppo",
+        "ppo_rnd",
+        "train_karel_ast_grpo",
+        "train_karel_ast_ar_edit",
+        "train_karel_grpo",
+        "train_grpo_reasoning",
+        "train_wm",
+    ],
 )
 def test_training_cli_uses_environment_backend(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
     module = importlib.import_module(f"rl2.{name}")
@@ -41,7 +59,16 @@ def test_training_cli_uses_environment_backend(name: str, monkeypatch: pytest.Mo
 
 
 @pytest.mark.parametrize(
-    "name", ["ppo", "ppo_rnd", "train_karel_ast_grpo", "train_karel_ast_ar_edit", "train_karel_grpo", "train_wm"]
+    "name",
+    [
+        "ppo",
+        "ppo_rnd",
+        "train_karel_ast_grpo",
+        "train_karel_ast_ar_edit",
+        "train_karel_grpo",
+        "train_grpo_reasoning",
+        "train_wm",
+    ],
 )
 def test_training_cli_rejects_platform_option(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
     module = importlib.import_module(f"rl2.{name}")

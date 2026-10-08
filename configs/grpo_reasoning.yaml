@@ -1,0 +1,42 @@
+# uv run --extra cuda12 --extra gdn2 --extra gdn2-triton python -m rl2.train_grpo_reasoning --config configs/grpo_reasoning.yaml
+# Start new runs from GDN2 370M pretrained on 30B FineWeb-Edu tokens.
+# Model architecture and weights are loaded from this converted checkpoint.
+checkpoint: checkpoints/gdn2/paper-matched-30b
+tokenizer: null # Cached TinyLlama SentencePiece tokenizer; or a local .model file
+backend: triton # Requires CUDA and the gdn2-triton extra
+dtype: bfloat16
+
+task: leg_counting # Any reasoning_gym.create_dataset task name
+task_config: # Start with simple questions to obtain useful rewards
+  min_animals: 1
+  max_animals: 3
+  min_instances: 1
+  max_instances: 3
+prompt_examples: # Worked examples teach the pretrained model the completion format
+  - question: How many legs are there in total if you have 2 dogs?
+    completion: |-
+      Dogs have 4 legs each. 2 * 4 = 8.
+      <answer>8</answer>
+  - question: How many legs are there in total if you have 1 human and 2 spiders?
+    completion: |-
+      Humans have 2 legs and spiders have 8. 1 * 2 + 2 * 8 = 18.
+      <answer>18</answer>
+seed: 1
+total_updates: 100000
+num_tasks: 2 # Unique questions per rollout
+group_size: 8 # Independent completions per question; must be >= 2
+num_minibatches: 8 # Must divide num_tasks * group_size
+update_epochs: 1
+max_prompt_tokens: 256 # Includes instructions/BOS; oversized prompts fail, never truncate
+max_new_tokens: 128 # Includes EOS; unfinished completions are still scored
+# Full-vocabulary sampling, with the same temperature in policy replay.
+temperature: 1.0
+learning_rate: 0.000001
+clip_coef: 0.2
+beta: 0.01 # Frozen initial-policy KL penalty; 0 disables reference replay
+max_grad_norm: 1.0
+
+log_dir: gs://cohere-dev/vlad/rl2/grpo_reasoning
+run_id: leg_counting_easy_fewshot_v1 # New run from pretrained weights; keep this ID to resume
+log_interval: 10
+checkpoint_interval_seconds: 600 # Every 10 minutes at the next completed rollout, plus final
