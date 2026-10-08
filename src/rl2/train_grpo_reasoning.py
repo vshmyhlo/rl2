@@ -80,6 +80,7 @@ class Config:
     log_dir: str = "runs"
     run_id: str | None = None
     log_interval: int = 10
+    log_completion_count: int = 4
     checkpoint_interval_seconds: float = 600.0
 
     def __post_init__(self) -> None:
@@ -97,6 +98,8 @@ class Config:
                 raise ValueError(f"{name} must be positive")
         if self.group_size < 2:
             raise ValueError("GRPO requires group_size >= 2")
+        if not 2 <= self.log_completion_count <= 4:
+            raise ValueError("log_completion_count must be between 2 and 4")
         if self.num_tasks * self.group_size % self.num_minibatches:
             raise ValueError("num_minibatches must divide num_tasks * group_size")
         if not 0 <= self.seed < 2**32:
@@ -194,21 +197,29 @@ def build_prompt(question: str, examples: Sequence[PromptExample] = ()) -> str:
         "Solve the following problem. You may reason before answering. "
         "Put only your final answer inside <answer>...</answer>.\n\n"
     )
-    demonstrations = "".join(f"Question: {example.question}\n\nAnswer: {example.completion}\n\n" for example in examples)
+    demonstrations = "".join(
+        f"Question: {example.question}\n\nAnswer: {example.completion}\n\n" for example in examples
+    )
     return instruction + demonstrations + f"Question: {question}\n\nAnswer:"
 
 
-def format_sample(prompt: str, completion: str, reward: float) -> str:
-    """Render labeled, literal text blocks in TensorBoard's Markdown viewer."""
+def format_group_samples(prompt: str, completions: Sequence[str], rewards: Sequence[float]) -> str:
+    """Render one shared prompt and numbered completions as literal Markdown blocks."""
 
     def literal(text: str) -> str:
         return "    " + text.replace("\n", "\n    ")
 
-    return f"### Prompt\n\n{literal(prompt)}\n\n### Completion\n\n{literal(completion)}\n\n**Reward:** {reward:.3f}"
+    sections = [f"### Shared prompt\n\n{literal(prompt)}"]
+    for index, (completion, reward) in enumerate(zip(completions, rewards, strict=True), start=1):
+        sections.append(f"### Completion {index}\n\n{literal(completion)}\n\n**Reward:** {reward:.3f}")
+    return "\n\n---\n\n".join(sections)
 
 
 def encode_prompts(
-    entries: list[Entry], tokenizer: Tokenizer, max_tokens: int, examples: Sequence[PromptExample] = (),
+    entries: list[Entry],
+    tokenizer: Tokenizer,
+    max_tokens: int,
+    examples: Sequence[PromptExample] = (),
 ) -> tuple[jax.Array, jax.Array]:
     prompts = np.zeros((len(entries), max_tokens), np.int32)
     lengths = np.empty(len(entries), np.int32)
@@ -406,9 +417,10 @@ def collect_rollout(
     key: jax.Array,
     iteration: int,
     config: Config,
-) -> tuple[GRPOBatch, dict[str, float], list[str], jax.Array]:
+) -> tuple[GRPOBatch, dict[str, float], str, jax.Array]:
     entries = [dataset[iteration * config.num_tasks + i] for i in range(config.num_tasks)]
     prompts, lengths = encode_prompts(entries, tokenizer, config.max_prompt_tokens, config.prompt_examples)
+    generation_start = monotonic()
     tokens, log_probs, mask, key = generate(
         model,
         state.params,
@@ -421,11 +433,17 @@ def collect_rollout(
         eos_token_id=tokenizer.eos_id(),
     )
     host_tokens, host_mask = jax.device_get((tokens, mask))
+    generation_seconds = monotonic() - generation_start
+    decoding_start = monotonic()
     texts = [
         tokenizer.decode(ids[valid & (ids != tokenizer.eos_id())].tolist())
         for ids, valid in zip(host_tokens, host_mask, strict=True)
     ]
+    decoding_seconds = monotonic() - decoding_start
+    scoring_start = monotonic()
     rewards = score_completions(dataset, entries, texts, config.group_size)
+    scoring_seconds = monotonic() - scoring_start
+    processing_start = monotonic()
     grouped = rewards.reshape(config.num_tasks, config.group_size)
     batch = GRPOBatch(
         jnp.repeat(prompts, config.group_size, axis=0),
@@ -450,91 +468,151 @@ def collect_rollout(
         "charts/completion_length_mean": float(mask.sum(axis=1).mean()),
         "charts/truncation_rate": float((~jnp.any(mask & (tokens == tokenizer.eos_id()), axis=1)).mean()),
     }
-    samples = [
-        format_sample(
-            build_prompt(entries[i // config.group_size]["question"], config.prompt_examples), text, float(rewards[i])
-        )
-        for i, text in enumerate(texts[: config.group_size])
-    ]
+    processing_seconds = monotonic() - processing_start
+    diagnostics.update(
+        {
+            "time/generation_seconds": generation_seconds,
+            "time/decoding_seconds": decoding_seconds,
+            "time/scoring_seconds": scoring_seconds,
+            "time/rollout_processing_seconds": processing_seconds,
+            "time/jax_seconds": generation_seconds + processing_seconds,
+        }
+    )
+    count = min(config.log_completion_count, config.group_size)
+    samples = format_group_samples(
+        build_prompt(entries[0]["question"], config.prompt_examples),
+        texts[:count],
+        np.asarray(rewards[:count]).tolist(),
+    )
     return batch, diagnostics, samples, key
 
 
-def _resume_config(config: Config) -> dict[str, Any]:
-    # Extending a run and changing reporting frequency do not change its policy/data stream.
-    ignored = {"total_updates", "log_interval", "checkpoint_interval_seconds", "log_dir", "run_id"}
-    return {name: value for name, value in asdict(config).items() if name not in ignored}
-
-
-def save_training_checkpoint(run_dir: str, state: TrainState, key: jax.Array, iteration: int, config: Config) -> None:
+def save_training_checkpoint(
+    run_dir: str,
+    state: TrainState,
+    key: jax.Array,
+    iteration: int,
+    config: Config,
+    *,
+    prompts_seen: int,
+) -> None:
     sc = ShapeChecker()
     sc.check(jax.random.key_data(key), "R", jnp.uint32)
     payload = {
         "version": 1,
         "state": serialization.to_state_dict(state),
         "iteration": iteration,
+        "prompts_seen": prompts_seen,
         "key": np.asarray(jax.random.key_data(key)),
         "key_impl": str(jax.random.key_impl(key)),
-        "config": _resume_config(config),
+        "config": asdict(config),  # Provenance only; compatibility is determined by the saved state.
     }
     write_bytes(f"{run_dir}/checkpoint.msgpack", serialization.msgpack_serialize(payload))
 
 
-def restore_training_checkpoint(data: bytes, state: TrainState, config: Config) -> tuple[TrainState, jax.Array, int]:
+def restore_training_checkpoint(data: bytes, state: TrainState) -> tuple[TrainState, jax.Array, int, int]:
+    """Restore compatible state while retaining the current model/optimizer functions."""
     payload = serialization.msgpack_restore(data)
     if payload["version"] != 1:
         raise ValueError("Unsupported reasoning GRPO checkpoint version")
-    if payload["config"] != _resume_config(config):
-        raise ValueError("Training configuration differs from checkpoint; use a new run_id")
-    restored = serialization.from_state_dict(state, payload["state"])
-    chex.assert_trees_all_equal_shapes_and_dtypes(
-        (state.params, state.opt_state), (restored.params, restored.opt_state)
-    )
+    try:
+        # Compare serialized trees before restoration: Flax can ignore extra dict
+        # keys, so checking only the reconstructed state would miss those changes.
+        chex.assert_trees_all_equal_shapes_and_dtypes(
+            (serialization.to_state_dict(state.params), serialization.to_state_dict(state.opt_state)),
+            (payload["state"]["params"], payload["state"]["opt_state"]),
+        )
+        restored = serialization.from_state_dict(state, payload["state"])
+    except (AssertionError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(
+            "Checkpoint model/optimizer structure, shapes, or dtypes are incompatible with the current state"
+        ) from error
     sc = ShapeChecker()
     sc.check(payload["key"], "R", np.uint32)
     iteration = payload["iteration"]
     if type(iteration) is not int or iteration < 0:
         raise ValueError("Invalid checkpoint iteration")
+    if "prompts_seen" in payload:
+        prompts_seen = payload["prompts_seen"]
+    else:
+        # Legacy checkpoints did not store this counter; use their own task batch size.
+        num_tasks = payload["config"]["num_tasks"]
+        if type(num_tasks) is not int or num_tasks < 1:
+            raise ValueError("Invalid checkpoint num_tasks")
+        prompts_seen = iteration * num_tasks
+    if type(prompts_seen) is not int or prompts_seen < 0:
+        raise ValueError("Invalid checkpoint prompts_seen")
     key = jax.random.wrap_key_data(jnp.asarray(payload["key"]), impl=payload["key_impl"])
-    return restored, key, iteration
+    return restored, key, iteration, prompts_seen
 
 
 def train(config: Config) -> TrainState:
+    init_start = monotonic()
+
+    def log_init(message: str) -> None:
+        print(f"[init +{monotonic() - init_start:.1f}s] {message}", flush=True)
+
+    log_init("Configuring compilation cache")
     configure_compilation_cache()
+    log_init("Initializing JAX devices")
+    devices = jax.devices()
+    log_init(f"JAX devices ready: {devices}")
+    log_init(f"Creating {config.task} dataset ({config.total_updates * config.num_tasks:,} questions)")
     dataset = reasoning_gym.create_dataset(
         config.task,
         seed=config.seed,
         size=config.total_updates * config.num_tasks,
         **config.task_config,
     )
+    log_init(f"Loading tokenizer: {config.tokenizer or 'cached TinyLlama default'}")
     tokenizer = load_tokenizer(Path(config.tokenizer) if config.tokenizer is not None else None)
+    log_init(f"Tokenizer ready: vocabulary size {tokenizer.vocab_size():,}")
+    log_init(f"Loading pretrained checkpoint: {config.checkpoint} (backend={config.backend}, dtype={config.dtype})")
     model, variables = load_checkpoint(Path(config.checkpoint), dtype=jnp.dtype(config.dtype), backend=config.backend)
+    parameter_count = sum(leaf.size for leaf in jax.tree.leaves(variables["params"]))
+    log_init(f"Pretrained checkpoint loaded: {parameter_count:,} parameters")
     if tokenizer.vocab_size() != model.vocab_size:
         raise ValueError("Tokenizer vocabulary size does not match checkpoint vocabulary size")
     if not 0 <= tokenizer.eos_id() < model.vocab_size:
         raise ValueError("Tokenizer must define an EOS token within the model vocabulary")
+    log_init("Transferring weights to device and initializing Adam optimizer")
     ref_params = jax.device_put(variables["params"])
     state = create_state(model, ref_params, config)
+    jax.block_until_ready(state)
+    log_init("Model and optimizer ready")
     if not config.beta:
         ref_params = {}
     del variables
     config = replace(config, run_id=config.run_id or f"grpo_reasoning_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}")
     run_dir = f"{config.log_dir.rstrip('/')}/{config.run_id}"
+    log_init(f"Checking for saved training state: {run_dir}/checkpoint.msgpack (reading if present)")
     saved = read_optional(f"{run_dir}/checkpoint.msgpack")
-    key, start_iteration = jax.random.key(config.seed), 0
+    key, start_iteration, prompts_seen = jax.random.key(config.seed), 0, 0
     if saved is not None:
-        state, key, start_iteration = restore_training_checkpoint(saved, state, config)
+        log_init(f"Training checkpoint read ({len(saved) / 1_000_000:.1f} MB); restoring model, optimizer, and RNG")
+        state, key, start_iteration, prompts_seen = restore_training_checkpoint(saved, state)
         print(
             f"Restored {run_dir}/checkpoint.msgpack at rollout {start_iteration}, optimizer step {int(state.step)}",
             flush=True,
         )
+    else:
+        log_init("No training checkpoint found; starting from pretrained weights")
+    log_init(f"Writing run configuration: {run_dir}/config.yaml")
     write_bytes(f"{run_dir}/config.yaml", yaml.safe_dump(asdict(config)).encode())
     last_checkpoint = monotonic()
     batch_size = config.num_tasks * config.group_size
-    print(f"Run: {run_dir}; devices: {jax.devices()}; starting at rollout {start_iteration}", flush=True)
-    with SummaryWriter(logdir=run_dir, purge_step=start_iteration * batch_size + 1 if saved else None) as writer:
-        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", start_iteration * batch_size)
+    first_log_iteration = (start_iteration // config.log_interval + 1) * config.log_interval
+    print(f"Run: {run_dir}; devices: {devices}; starting at rollout {start_iteration}", flush=True)
+    log_init(f"Opening TensorBoard writer: {run_dir}")
+    with SummaryWriter(logdir=run_dir, purge_step=prompts_seen + 1 if saved else None) as writer:
+        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", prompts_seen)
+        log_init("Initialization complete")
+        window_timings: dict[str, float] = {}
+        window_rollouts = 0
+        window_start = monotonic()
         for iteration in range(start_iteration, config.total_updates):
-            start = monotonic()
+            if iteration == start_iteration:
+                print("[startup] Collecting first rollout; generation may trigger JAX compilation", flush=True)
             batch, diagnostics, samples, key = collect_rollout(
                 state,
                 model,
@@ -545,7 +623,12 @@ def train(config: Config) -> TrainState:
                 iteration,
                 config,
             )
+            if iteration == start_iteration:
+                print(
+                    "[startup] First rollout collected; starting optimization (may trigger JAX compilation)", flush=True
+                )
             metrics: list[Metrics] = []
+            update_start = monotonic()
             for _ in range(config.update_epochs):
                 key, shuffle_key = jax.random.split(key)
                 for indices in np.split(
@@ -561,20 +644,50 @@ def train(config: Config) -> TrainState:
                         beta=config.beta,
                     )
                     metrics.append(metric)
+            diagnostics["time/update_dispatch_seconds"] = monotonic() - update_start
+            diagnostics["time/jax_seconds"] += diagnostics["time/update_dispatch_seconds"]
+            window_rollouts += 1
+            for name, value in diagnostics.items():
+                if name.startswith("time/"):
+                    window_timings[name] = window_timings.get(name, 0.0) + value
             completed = iteration + 1
-            if completed % config.log_interval == 0 or completed == config.total_updates:
-                jax.block_until_ready(state)
+            prompts_seen += config.num_tasks
+            summary = f"rollout_batches={completed} reward={diagnostics['charts/reward_mean']:.3f}"
+            log_interval_reached = completed % config.log_interval == 0 or completed == config.total_updates
+            if log_interval_reached:
+                # Updates stay asynchronous inside the window. Charge the final
+                # outstanding work here; generation already waits for CPU scoring.
+                wait_start = monotonic()
+                jax.block_until_ready((state, metrics))
+                wait_seconds = monotonic() - wait_start
+                window_timings["time/jax_wait_seconds"] = wait_seconds
+                window_timings["time/jax_seconds"] += wait_seconds
+                window_timings["time/window_seconds"] = monotonic() - window_start
+                window_timings["time/iteration_seconds"] = window_timings["time/window_seconds"] / window_rollouts
                 means = {name: float(np.mean([m[name] for m in jax.device_get(metrics)])) for name in metrics[0]}
-                for name, value in {**diagnostics, **means, "time/iteration_seconds": monotonic() - start}.items():
-                    writer.add_scalar(name, value, completed * batch_size)
-                writer.add_text("samples/completions", "\n\n---\n\n".join(samples), completed * batch_size)
+                for name, value in {
+                    **diagnostics,
+                    **means,
+                    **window_timings,
+                    "time/window_rollouts": window_rollouts,
+                }.items():
+                    writer.add_scalar(name, value, prompts_seen)
+                writer.add_text("samples/completions", samples, prompts_seen)
                 writer.flush()
-                print(
-                    f"iteration={completed} reward={diagnostics['charts/reward_mean']:.3f} loss={means['losses/total']:.4f}",
-                    flush=True,
+                summary += (
+                    f" loss={means['losses/total']:.4f} window_rollouts={window_rollouts}"
+                    f" jax={window_timings['time/jax_seconds']:.3f}s"
+                    f" scoring={window_timings['time/scoring_seconds']:.3f}s"
+                    f" decode={window_timings['time/decoding_seconds']:.3f}s"
+                    f" window={window_timings['time/window_seconds']:.3f}s"
                 )
+                window_timings = {}
+                window_rollouts = 0
+                window_start = monotonic()
+            if completed <= first_log_iteration or log_interval_reached:
+                print(summary, flush=True)
             if monotonic() - last_checkpoint >= config.checkpoint_interval_seconds or completed == config.total_updates:
-                save_training_checkpoint(run_dir, state, key, completed, config)
+                save_training_checkpoint(run_dir, state, key, completed, config, prompts_seen=prompts_seen)
                 last_checkpoint = monotonic()
                 print(f"Saved {run_dir}/checkpoint.msgpack at rollout {completed}", flush=True)
     # Export a standard converted checkpoint usable by rl2.gdn2.generate.
@@ -590,6 +703,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/grpo_reasoning.yaml", help="Path to YAML config")
     args = parser.parse_args()
+    print(f"[init] Loading configuration: {args.config}", flush=True)
     train(load_config(args.config))
 
 

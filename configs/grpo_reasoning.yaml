@@ -23,7 +23,7 @@ prompt_examples: # Worked examples teach the pretrained model the completion for
       <answer>18</answer>
 seed: 1
 total_updates: 100000
-num_tasks: 2 # Unique questions per rollout
+num_tasks: 16 # Unique questions per rollout
 group_size: 8 # Independent completions per question; must be >= 2
 num_minibatches: 8 # Must divide num_tasks * group_size
 update_epochs: 1
@@ -38,5 +38,6 @@ max_grad_norm: 1.0
 
 log_dir: gs://cohere-dev/vlad/rl2/grpo_reasoning
 run_id: leg_counting_easy_fewshot_v1 # New run from pretrained weights; keep this ID to resume
-log_interval: 10
+log_interval: 10 # Rollout batches; TensorBoard steps count prompts/tasks, not completions
+log_completion_count: 4 # Show one prompt and 2–4 completions from its group in TensorBoard
 checkpoint_interval_seconds: 600 # Every 10 minutes at the next completed rollout, plus final
