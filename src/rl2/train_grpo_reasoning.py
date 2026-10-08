@@ -76,6 +76,7 @@ class Config:
     learning_rate: float = 1e-6
     clip_coef: float = 0.2
     beta: float = 0.01
+    duration_penalty_coef: float = 0.0
     max_grad_norm: float = 1.0
     log_dir: str = "runs"
     run_id: str | None = None
@@ -111,6 +112,8 @@ class Config:
             raise ValueError("clip_coef must be between 0 and 1")
         if not 0 <= self.beta < math.inf:
             raise ValueError("beta must be finite and nonnegative")
+        if not 0 <= self.duration_penalty_coef < math.inf:
+            raise ValueError("duration_penalty_coef must be finite and nonnegative")
         if self.backend not in ("jax", "triton") or self.dtype not in ("float32", "bfloat16"):
             raise ValueError("backend must be jax/triton and dtype must be float32/bfloat16")
         if {"seed", "size"} & self.task_config.keys():
@@ -408,6 +411,20 @@ def score_completions(
     return jnp.asarray(rewards)
 
 
+def apply_duration_penalty(
+    task_rewards: jax.Array, mask: jax.Array, coefficient: float,
+) -> tuple[jax.Array, jax.Array]:
+    """Deduct a token-budget-normalized cost, counting EOS but excluding padding."""
+    sc = ShapeChecker()
+    sc.check(task_rewards, "B", jnp.float32)
+    sc.check(mask, "BT", jnp.bool_)
+    chex.assert_scalar_positive(mask.shape[1])
+    penalties = coefficient * mask.sum(axis=1, dtype=jnp.float32) / mask.shape[1]
+    rewards = task_rewards - penalties
+    sc.check([penalties, rewards], "B", jnp.float32)
+    return rewards, penalties
+
+
 def collect_rollout(
     state: TrainState,
     model: GatedDeltaNet2LM,
@@ -441,9 +458,10 @@ def collect_rollout(
     ]
     decoding_seconds = monotonic() - decoding_start
     scoring_start = monotonic()
-    rewards = score_completions(dataset, entries, texts, config.group_size)
+    task_rewards = score_completions(dataset, entries, texts, config.group_size)
     scoring_seconds = monotonic() - scoring_start
     processing_start = monotonic()
+    rewards, duration_penalties = apply_duration_penalty(task_rewards, mask, config.duration_penalty_coef)
     grouped = rewards.reshape(config.num_tasks, config.group_size)
     batch = GRPOBatch(
         jnp.repeat(prompts, config.group_size, axis=0),
@@ -463,7 +481,9 @@ def collect_rollout(
         batch = batch._replace(ref_log_probs=jnp.concatenate(ref))
     diagnostics = {
         "charts/reward_mean": float(rewards.mean()),
-        "charts/success_rate": float((rewards == 1).mean()),
+        "charts/task_reward_mean": float(task_rewards.mean()),
+        "charts/duration_penalty_mean": float(duration_penalties.mean()),
+        "charts/success_rate": float((task_rewards == 1).mean()),
         "charts/informative_group_fraction": float((jnp.ptp(grouped, axis=1) > 0).mean()),
         "charts/completion_length_mean": float(mask.sum(axis=1).mean()),
         "charts/truncation_rate": float((~jnp.any(mask & (tokens == tokenizer.eos_id()), axis=1)).mean()),

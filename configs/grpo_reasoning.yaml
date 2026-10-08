@@ -34,6 +34,7 @@ temperature: 1.0
 learning_rate: 0.000001
 clip_coef: 0.2
 beta: 0.01 # Frozen initial-policy KL penalty; 0 disables reference replay
+duration_penalty_coef: 0.1 # Subtract coef * generated tokens / max_new_tokens; EOS counts, padding does not
 max_grad_norm: 1.0
 
 log_dir: gs://cohere-dev/vlad/rl2/grpo_reasoning
