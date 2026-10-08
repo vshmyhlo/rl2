@@ -271,14 +271,16 @@ def test_rollout_replay_rewards_and_minibatches(config: edit.Config, state: Trai
     assert not batch.mask[: len(program_actions(tuple(config.seed_program.split())))].any()
     seed_end = len(program_actions(tuple(config.seed_program.split()))) + 1
     np.testing.assert_array_equal(
-        batch.history.events.output[:seed_end],
-        np.broadcast_to(batch.history.events.output[0], batch.history.events.output[:seed_end].shape),
+        batch.history.events.grid[:seed_end],
+        np.broadcast_to(batch.history.events.grid[0], batch.history.events.grid[:seed_end].shape),
     )
     seed = int(np.random.default_rng(4).integers(0, 2**31, size=1)[0])
     env = KarelProgramEnv(config.env)
     for index, tree in enumerate(programs):
         pair = env.reset(seed=seed)
-        np.testing.assert_array_equal(batch.history.initial[index], pair.initial)
+        for image_index, expected in enumerate((pair.initial, pair.target)):
+            images = batch.history.events.grid[:, index, image_index]
+            np.testing.assert_array_equal(images, np.broadcast_to(expected, images.shape))
         for token in tree.tokens():
             _, reward, terminated, truncated, info = env.step(TOKEN_TO_ID[token])
         assert terminated and not truncated
@@ -298,7 +300,7 @@ def test_rollout_replay_rewards_and_minibatches(config: edit.Config, state: Trai
     np.testing.assert_array_equal(subset.actions, batch.actions[:, ::-1])
     np.testing.assert_array_equal(subset.rewards, batch.rewards[:, ::-1])
     np.testing.assert_array_equal(subset.advantages, batch.advantages[::-1])
-    np.testing.assert_array_equal(subset.history.events.output, batch.history.events.output[:, ::-1])
+    np.testing.assert_array_equal(subset.history.events.grid, batch.history.events.grid[:, ::-1])
     with pytest.raises(ValueError, match="unique"):
         edit.select_episodes(batch, np.asarray([0, 0], np.int64))
     with pytest.raises(ValueError, match="environments"):
@@ -655,7 +657,9 @@ def test_grid_encoder_mixes_all_three_images_per_cell(config: edit.Config, state
     initial[0, 1, 1, 0] = 1
     target[1, 1, 1, 0] = 1
     output[2, 1, 1, 0] = 1
-    encoded = state.apply_fn({"params": state.params}, initial, target, output, method=EditTransformer.encode_grids)
+    encoded = state.apply_fn(
+        {"params": state.params}, np.stack((initial, target, output), axis=1), method=EditTransformer.encode_grids
+    )
     features = np.array(encoded).reshape(3, 3, 3, 32)
     assert np.all(np.any(features[:, 1, 1] != 0, axis=-1))
     assert not np.allclose(features[0, 1, 1], features[1, 1, 1])
@@ -665,13 +669,11 @@ def test_grid_encoder_mixes_all_three_images_per_cell(config: edit.Config, state
     # Every real event kind receives its current image, including seed and action tokens.
     events = edit.empty_events(3, 1, config)
     events.kind[:, 0] = [edit.SEED_EVENT, edit.ACTION_EVENT, edit.UPDATE_EVENT]
-    original = state.apply_fn(
-        {"params": state.params}, events, initial[:1], target[:1], method=EditTransformer.encode_events
-    )
-    events.output[:, 0, 1, 1, 5] = 1
-    changed = state.apply_fn(
-        {"params": state.params}, events, initial[:1], target[:1], method=EditTransformer.encode_events
-    )
+    events.grid[:, :, 0] = initial[:1]
+    events.grid[:, :, 1] = target[:1]
+    original = state.apply_fn({"params": state.params}, events, method=EditTransformer.encode_events)
+    events.grid[:, 0, 2, 1, 1, 5] = 1
+    changed = state.apply_fn({"params": state.params}, events, method=EditTransformer.encode_events)
     assert np.all(np.any(np.abs(np.asarray(changed - original)) > 1e-6, axis=-1))
 
 
@@ -684,9 +686,9 @@ def test_history_is_causal_and_retains_action_and_update_context(
     logits = np.asarray(predict(state, history))
     assert logits.shape[:2] == history.events.kind.shape
     assert np.all(history.events.kind[0] == edit.SEED_EVENT)
-    output = np.array(history.events.output)
-    output[0, :, 1, 1, 5] += 1
-    changed = history._replace(events=history.events._replace(output=output))
+    grid = np.array(history.events.grid)
+    grid[0, :, 2, 1, 1, 5] += 1
+    changed = history._replace(events=history.events._replace(grid=grid))
     seed_logits = np.asarray(predict(state, changed))
     assert not np.allclose(logits[0], seed_logits[0])
     # The initial execution report is a forced observation, not a prediction
@@ -699,9 +701,9 @@ def test_history_is_causal_and_retains_action_and_update_context(
     np.testing.assert_array_equal(logits[:update_index], new_logits[:update_index])
     assert not np.allclose(logits[update_index], new_logits[update_index])
     # Changing one event's image cannot affect predictions preceding that event.
-    output = np.array(history.events.output)
-    output[update_index, :, 1, 1, 5] += 1
-    changed = history._replace(events=history.events._replace(output=output))
+    grid = np.array(history.events.grid)
+    grid[update_index, :, 2, 1, 1, 5] += 1
+    changed = history._replace(events=history.events._replace(grid=grid))
     image_logits = np.asarray(predict(state, changed))
     np.testing.assert_array_equal(logits[:update_index], image_logits[:update_index])
     assert not np.allclose(logits[update_index], image_logits[update_index])
@@ -763,17 +765,21 @@ def test_action_feedback_and_finished_padding_replay_exactly(
     assert events.feedback[completion, 1, -1] == pytest.approx(2 / config.max_seq_len)
     assert events.feedback[completion, 1, -2] == pytest.approx(batch.rewards[completion - 1, 1])
     # The image switches with the completing action and persists through partial edits.
+    current = events.grid[:, :, 2]
     np.testing.assert_array_equal(
-        events.output[:completion, 1],
-        np.broadcast_to(events.output[0, 1], events.output[:completion, 1].shape),
+        events.grid[:, :, :2], np.broadcast_to(events.grid[0, :, :2], events.grid[:, :, :2].shape)
+    )
+    np.testing.assert_array_equal(
+        current[:completion, 1],
+        np.broadcast_to(current[0, 1], current[:completion, 1].shape),
     )
     last_decision = int(np.flatnonzero(batch.mask[:, 1])[-1])
     np.testing.assert_array_equal(
-        events.output[completion:last_decision, 1],
-        np.broadcast_to(events.output[completion, 1], events.output[completion:last_decision, 1].shape),
+        current[completion:last_decision, 1],
+        np.broadcast_to(current[completion, 1], current[completion:last_decision, 1].shape),
     )
-    assert not np.array_equal(events.output[completion, 1], events.output[0, 1])
-    np.testing.assert_array_equal(events.output[:, 0], np.broadcast_to(events.output[0, 0], events.output[:, 0].shape))
+    assert not np.array_equal(current[completion, 1], current[0, 1])
+    np.testing.assert_array_equal(current[:, 0], np.broadcast_to(current[0, 0], current[:, 0].shape))
     assert np.all(events.kind[initial_update + 2 :, 0] == PAD_EVENT)
     logits = predict(state, batch.history)
     replay = edit.action_log_prob(edit.mask_logits(logits, batch.legal), batch.actions)

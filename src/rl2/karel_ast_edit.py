@@ -51,13 +51,13 @@ class EditConfig:
             raise TypeError("seed_program must be source text")
         seed_tree(self)
         if self.max_seq_len <= self.prefill_length:
-            raise ValueError("max_seq_len must fit the seed, initial update, and at least one action")
-        if not self.allow_stop and self.max_seq_len < self.prefill_length + 2:
+            raise ValueError("max_seq_len must fit the initial program, feedback, and at least one action")
+        if not self.allow_stop and self.max_seq_len < self.prefill_length + 3:
             raise ValueError("max_seq_len must fit at least one complete edit when allow_stop=False")
 
     @property
     def prefill_length(self) -> int:
-        """Count seed grammar tokens and the initial execution update."""
+        """Count initial program EDIT tokens and the initial FEEDBACK report."""
         return len(program_actions(tuple(self.seed_program.split()))) + 1
 
 
@@ -102,13 +102,28 @@ def open_subtree(tree: KarelAST, position: int) -> KarelAST:
 
 
 class Observation(NamedTuple):
-    """Host-side edit state returned with every action transition."""
+    """Host-side edit state returned with every action transition.
+
+    Attributes:
+        initial: Original task input grid, shaped (height, width, 6).
+        target: Desired output grid, shaped (height, width, 6).
+        output: Grid from the last completed program execution, shaped
+            (height, width, 6); retained while a replacement is incomplete.
+        feedback: Eight floats: score, success flag, runtime-error flag,
+            execution-limit flag, ticks / max_execution_steps, minimum
+            completed source length / max_program_tokens, last execution's
+            score delta (initially zero), and tokens_left / max_seq_len.
+        action_mask: Boolean action mask of length 1 + max_nodes + len(AST_ACTIONS).
+            Index 0 is STOP, the next max_nodes entries select subtree roots
+            by preorder position, and the remaining entries follow AST_ACTIONS.
+            True entries satisfy the current edit phase and completion budgets.
+    """
 
     initial: NDArray[np.int32]
     target: NDArray[np.int32]
     output: NDArray[np.int32]
     feedback: NDArray[np.float32]
-    legal: NDArray[np.bool_]
+    action_mask: NDArray[np.bool_]
 
 
 @dataclass(frozen=True)
@@ -190,22 +205,24 @@ def observe(
         H=config.env.height, W=config.env.width, C=6, V=1 + config.max_nodes + len(AST_ACTIONS), F=FEEDBACK_SIZE
     )
     sc.check([pair.initial, pair.target, result.output], "HWC", dtype=np.int32)
-    legal = np.zeros(1 + config.max_nodes + len(AST_ACTIONS), np.bool_)
+    action_mask = np.zeros(1 + config.max_nodes + len(AST_ACTIONS), np.bool_)
     if tree.complete:
-        legal[0] = config.allow_stop
-        # Reserve the location action plus the cheapest typed replacement.
+        action_mask[0] = config.allow_stop
+        # Reserve the location, cheapest typed replacement, and feedback event.
         # In this grammar minimum-node completions also minimize source length.
         for position, index in enumerate(tree.preorder()):
-            legal[1 + position] = 1 + int(tree._costs(index).min()) <= tokens_left
+            action_mask[1 + position] = 2 + int(tree._costs(index).min()) <= tokens_left
     else:
         # One grammar expansion resolves exactly one node. Reserve actions for
-        # ALL remaining holes. Feedback travels with the completing action.
+        # ALL remaining holes plus one execution feedback event.
         frontier = tree.frontier
         assert frontier is not None
         costs = tree._costs(frontier)
         resolved = sum(not node.is_hole for node in tree.nodes)
         required = tree._minimum_completion() - resolved
-        legal[1 + config.max_nodes :] = tree.allowed_actions() & (required - costs.min() + costs <= tokens_left)
+        action_mask[1 + config.max_nodes :] = tree.allowed_actions() & (
+            required - costs.min() + costs + 1 <= tokens_left
+        )
     feedback = np.asarray(
         [
             result.score,
@@ -220,9 +237,9 @@ def observe(
         ],
         np.float32,
     )
-    sc.check(legal, "V", dtype=np.bool_)
+    sc.check(action_mask, "V", dtype=np.bool_)
     sc.check(feedback, "F", dtype=np.float32)
-    return Observation(pair.initial, pair.target, result.output, feedback, legal)
+    return Observation(pair.initial, pair.target, result.output, feedback, action_mask)
 
 
 class EditStep(NamedTuple):
@@ -244,9 +261,9 @@ class KarelASTEditEnv:
     STOP terminates normally; completing an edit at the sequence limit truncates.
     With allow_stop=False, STOP is illegal and completion also truncates when
     the remaining budget cannot fit another edit.
-    Seed tokens, the initial report, and action/result tokens share max_seq_len.
-    Every step costs one token; execution feedback is part of that action's
-    resulting observation, with no additional token or pause.
+    Initial program EDIT tokens, FEEDBACK reports, and policy EDIT tokens share
+    max_seq_len. Each step costs one EDIT token; completing a replacement also
+    reserves one FEEDBACK token, consumed before the next policy decision.
     Both are terminal for this finite-budget optimization objective.
     """
 
@@ -291,7 +308,7 @@ class KarelASTEditEnv:
             isinstance(action, (bool, np.bool_))
             or not isinstance(action, (int, np.integer))
             or not self.action_space.contains(action)
-            or not self.observation.legal[int(action)]
+            or not self.observation.action_mask[int(action)]
         ):
             raise gym.error.InvalidAction(f"Illegal AST editing action: {action!r}")
         action = int(action)
@@ -310,11 +327,12 @@ class KarelASTEditEnv:
                     reward = self.result.score - previous_score
                     reevaluated = True
                     self.completed_edits += 1
+                    self.remaining -= 1  # The resulting FEEDBACK occupies its own event.
         # Incomplete edits retain the last execution's delta as feedback. Their
         # actual transition reward is still zero.
         delta = reward if reevaluated else float(self.observation.feedback[-2])
         self.observation = observe(self.tree, self.pair, self.result, self.remaining, self.config, delta)
-        truncated = not terminated and (self.remaining == 0 or not self.observation.legal.any())
+        truncated = not terminated and (self.remaining == 0 or not self.observation.action_mask.any())
         self.done = terminated or truncated
         if self.done and not self.tree.complete:
             raise RuntimeError("Action masks allowed an unfinished terminal program")

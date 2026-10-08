@@ -18,9 +18,8 @@ type Variables = dict[str, Any]
 @pytest.fixture(scope="module")
 def history() -> History:
     grids = jnp.zeros((3, 2, 2, 6), jnp.int32)
+    grid = jnp.stack((grids, grids.at[:, 0, 0, 5].set(1), grids), axis=1)
     return History(
-        grids,
-        grids.at[:, 0, 0, 5].set(1),
         Events(
             jnp.array(
                 [
@@ -31,7 +30,7 @@ def history() -> History:
                 jnp.int32,
             ),
             jnp.ones((3, 3), jnp.int32),
-            jnp.broadcast_to(grids, (3, *grids.shape)),
+            jnp.broadcast_to(grid, (3, *grid.shape)),
             jnp.ones((3, 3, FEEDBACK_SIZE), jnp.float32),
         ),
     )
@@ -53,7 +52,7 @@ def test_padding_prefill_and_cached_steps(model_class: type[EditTransformer], hi
     model = model_class(d_model=8, num_layers=1, num_heads=2, max_nodes=2, max_seq_len=3)
     variables = initialize(model, history)
     full_carry, *full_outputs = jax.jit(model.apply)(variables, history)
-    np.testing.assert_array_equal(full_carry.transformer[0].position, [3, 1, 0])
+    np.testing.assert_array_equal(full_carry[0].position, [3, 1, 0])
     padding = np.asarray(history.events.kind == PAD_EVENT)
     for output in full_outputs:
         np.testing.assert_array_equal(np.asarray(output)[padding], 0)
@@ -92,10 +91,11 @@ def test_unused_event_fields_do_not_contaminate_gradients(history: History) -> N
     dirty = events._replace(
         action=jnp.where(has_token, events.action, 10000),
         feedback=jnp.where(has_feedback[..., None], events.feedback, jnp.nan),
+        grid=jnp.where((events.kind != PAD_EVENT)[..., None, None, None, None], events.grid, 10000),
     )
 
     def loss(params: Variables, inputs: Events) -> jax.Array:
-        encoded = model.apply({"params": params}, inputs, history.initial, history.target, method=model.encode_events)
+        encoded = model.apply({"params": params}, inputs, method=model.encode_events)
         sc = ShapeChecker(T=3, B=3, D=8)
         sc.check(encoded, "TBD", jnp.float32)
         return jnp.square(encoded).sum()
@@ -107,3 +107,18 @@ def test_unused_event_fields_do_not_contaminate_gradients(history: History) -> N
     for actual, expected in zip(jax.tree.leaves(actual_grad), jax.tree.leaves(expected_grad), strict=True):
         assert np.all(np.isfinite(actual))
         np.testing.assert_allclose(actual, expected, atol=1e-6)
+
+
+@pytest.mark.parametrize("invalid", ["image_count", "channels", "dtype"])
+def test_event_grid_validation(history: History, invalid: str) -> None:
+    grid = history.events.grid
+    if invalid == "image_count":
+        grid = grid[:, :, :2]
+    elif invalid == "channels":
+        grid = grid[..., :5]
+    else:
+        grid = grid.astype(jnp.float32)
+    events = history.events._replace(grid=grid)
+    model = EditTransformer(d_model=8, num_layers=1, num_heads=2, max_nodes=2, max_seq_len=3)
+    with pytest.raises(AssertionError, match="TBIHWC"):
+        model.init(jax.random.key(0), events, method=model.encode_events)

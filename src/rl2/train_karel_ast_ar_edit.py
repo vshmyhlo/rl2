@@ -1,14 +1,13 @@
 """Execution-guided autoregressive Karel editing with improvement rewards.
 
 The policy consumes a causal sequence with a persistent KV cache:
-    seed DFS tokens -> initial execution report -> action/result -> action/result -> ... -> STOP
+    EDIT(seed DFS tokens) -> FEEDBACK -> EDIT(location) -> EDIT(grammar)... -> FEEDBACK -> ... -> EDIT(STOP)
 Every token, including seed prefill, receives the original input,
 target, and current execution image. These 18 channels pass through a shared
 32-channel 1x1 convolution, GELU, flattening, and projection. This image embedding
 is added to each event embedding. The current image starts at the seed's final
-or last-valid output and changes only when a complete edit is re-evaluated.
-Each action carries its resulting image and
-eight feedback scalars: score, success, runtime error, execution limit,
+or last-valid output. A completing EDIT retains the previous execution image;
+the following FEEDBACK introduces the new image and eight scalars: score, success, runtime error, execution limit,
 normalized ticks, source length, last score difference, and remaining sequence budget.
 KarelASTEditEnv owns AST edits, masks, execution, rewards, and termination. The
 policy infers the current program from its seed and edit history.
@@ -34,12 +33,12 @@ Example 1: the target requires one right turn (max_seq_len=17).
     S0 -- select the turnLeft statement --> (r=0, S1)
     S1: <Statement>; unchanged execution feedback; sequence tokens left=11
     S1 -- turnRight --> (r=S_right-S_left, S2)
-    S2: turnRight; execute and refresh score/grid/delta; sequence tokens left=10
+    S2: turnRight; execute and emit FEEDBACK; sequence tokens left=9
     S2 -- STOP --> (r=0, Terminal)
 
-    SEED(Program,ConsNonEmpty,turnLeft,End)
-        -> UPDATE(seed score,delta=0) -> ACTION(select; resulting observation)
-        -> ACTION(turnRight; new score/grid,delta=S_right-S_left) -> ACTION(STOP)
+    EDIT(Program,ConsNonEmpty,turnLeft,End)
+        -> FEEDBACK(seed score,delta=0) -> EDIT(select) -> EDIT(turnRight)
+        -> FEEDBACK(new score/grid,delta=S_right-S_left) -> EDIT(STOP)
 
 Example 2: replace a statement with REPEAT 3 { move }.
 
@@ -53,8 +52,8 @@ Example 2: replace a statement with REPEAT 3 { move }.
 
 Only End completes this replacement and triggers execution. Choosing Cons at S5
 would extend it, if node, depth, source, and sequence budgets allow completion.
-If a completion spends the last action, it receives its score difference and
-ends the episode immediately; no extra STOP or terminal-score bonus is added.
+If a completion and its feedback consume the remaining budget, the episode
+ends with its score difference; no extra STOP or terminal-score bonus is added.
 Feedback events consume context space but do not consume policy decisions.
 
 Training uses regular episode-level GRPO credit assignment. Sum all edit deltas
@@ -91,13 +90,10 @@ from tensorboardX import SummaryWriter
 
 from rl2.attention import AttentionType
 from rl2.edit_transformer import (
-    ACTION_EVENT,
-    SEED_EVENT,
-    UPDATE_EVENT,
-    EditCarry,
+    EDIT_EVENT,
+    FEEDBACK_EVENT,
     EditTransformer,
-    Events,
-    History,
+    Event,
     ModelOutput,
 )
 from rl2.jax_cache import configure_compilation_cache
@@ -119,6 +115,7 @@ from rl2.train_karel_ast_grpo import (
     group_advantages,
     learning_rate_schedule,
 )
+from rl2.transformer import TransformerStackCarry
 from rl2.utils import read_bytes, read_optional, write_bytes
 
 
@@ -133,7 +130,7 @@ class Config:
     seed_program: str = "DEF run m( turnLeft m)"
     max_nodes: int = 128  # AST node budget for grammar masking; also sizes edit locations.
     max_depth: int = 64  # AST depth limit for grammar masking and penalty normalization.
-    max_seq_len: int = 256  # Total seed tokens, one initial report, and action/result tokens per episode.
+    max_seq_len: int = 256  # Total initial program tokens, edit actions, and execution feedback reports per episode.
     allow_stop: bool = True  # False keeps editing until no complete edit fits the sequence budget.
 
     # Rollout groups and update batching.
@@ -238,44 +235,49 @@ class Config:
         )
 
 
-def empty_events(time: int, batch: int, config: Config) -> Events:
+def empty_event(time: int, batch: int, config: Config) -> Event:
     """Allocate writable host arrays initialized to padding for a batch of event streams."""
     chex.assert_scalar_non_negative(time)
     chex.assert_scalar_positive(batch)
-    return Events(
+    return Event(
         np.zeros((time, batch), np.int32),
         np.zeros((time, batch), np.int32),
-        np.zeros((time, batch, config.env.height, config.env.width, 6), np.int32),
+        np.zeros((time, batch, 3, config.env.height, config.env.width, 6), np.int32),
         np.zeros((time, batch, FEEDBACK_SIZE), np.float32),
     )
 
 
-def initial_history(observations: list[Observation], config: Config) -> History:
+def initial_event(observations: list[Observation], config: Config) -> Event:
     """Assemble task grids, seed grammar tokens, and the seed's execution feedback."""
     if not observations:
         raise ValueError("Cannot initialize an empty history")
     seed = program_actions(tuple(config.seed_program.split()))
-    events = empty_events(len(seed) + 1, len(observations), config)
-    events.kind[:-1] = SEED_EVENT
-    events.value[:-1] = (1 + config.max_nodes + np.asarray(seed, np.int32))[:, None]
-    events.kind[-1] = UPDATE_EVENT
-    current = np.stack([observation.output for observation in observations])
-    events.output[:] = current
-    events.feedback[-1] = np.stack([observation.feedback for observation in observations])
-    return History(np.stack([o.initial for o in observations]), np.stack([o.target for o in observations]), events)
+    event = empty_event(len(seed) + 1, len(observations), config)
+    event.kind[:-1] = EDIT_EVENT
+    event.action[:-1] = (1 + config.max_nodes + np.asarray(seed, np.int32))[:, None]
+    event.kind[-1] = FEEDBACK_EVENT
+    event.grid[:] = np.stack([np.stack((o.initial, o.target, o.output)) for o in observations])
+    event.feedback[-1] = np.stack([observation.feedback for observation in observations])
+    return event
 
 
 @partial(jax.jit, static_argnames="log_compiles")
-def prefill(state: TrainState, history: History, *, log_compiles: bool = False) -> ModelOutput:
+def prefill(state: TrainState, event: Event, *, log_compiles: bool = False) -> ModelOutput:
     """Initialize rollout KV caches and first-decision logits with the current policy."""
     if log_compiles:
-        time, batch = history.events.kind.shape
+        time, batch = event.kind.shape
         print(f"JIT trace edit prefill: b={batch}, t={time}", flush=True)
-    return state.apply_fn({"params": state.params}, history, method=EditTransformer.prefill)
+    return state.apply_fn({"params": state.params}, event, method=EditTransformer.prefill)
 
 
 @partial(jax.jit, static_argnames="log_compiles")
-def decode_step(state: TrainState, event: Events, carry: EditCarry, *, log_compiles: bool = False) -> ModelOutput:
+def decode_step(
+    state: TrainState,
+    event: Event,
+    carry: TransformerStackCarry,
+    *,
+    log_compiles: bool = False,
+) -> ModelOutput:
     """Advance cached rollout histories by one action, feedback, or padding event."""
     if log_compiles:
         print(f"JIT trace edit step: b={event.kind.shape[0]}", flush=True)
@@ -320,9 +322,10 @@ def create_state(config: Config, initial: Array, target: Array) -> TrainState:
         dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
         attention_implementation=config.attention_implementation,
     )
-    events = empty_events(1, initial.shape[0], config)
-    events.kind[:] = UPDATE_EVENT
-    params = model.init(jax.random.key(config.seed), History(initial, target, events))["params"]
+    event = empty_event(1, initial.shape[0], config)
+    event.kind[:] = FEEDBACK_EVENT
+    event = event._replace(grid=jnp.stack((initial, target, jnp.zeros_like(initial)), axis=1)[None])
+    params = model.init(jax.random.key(config.seed), event)["params"]
 
     def optimizer(learning_rate: float | jax.Array) -> optax.GradientTransformation:
         """Clip the global gradient norm before applying Adam at the scheduled rate."""
@@ -356,11 +359,11 @@ def act(logits: jax.Array, key: jax.Array) -> tuple[jax.Array, jax.Array]:
 class EditBatch(NamedTuple):
     """Array-only episode histories and policy targets, suitable for a jitted update."""
 
-    history: History  # Events [T,B]; each row predicts the following event.
+    event: Event  # Events [T,B]; each row predicts the following event.
     actions: Array  # [T,B], STOP=0 is a real action wherever mask is true.
     old_log_probs: Array
     legal: Array  # [T,B,V], exactly the rollout masks; dummy STOP on non-decisions.
-    mask: Array  # Only sampled policy actions, never seed/update/PAD events.
+    mask: Array  # True on rows predicting sampled edits; false before forced reports and padding.
     rewards: Array  # [T,B], score differences on completed edits; zero elsewhere.
     advantages: Array  # [B], group-normalized episode returns, shared by all decisions.
 
@@ -387,22 +390,22 @@ def run_episodes(
     key: jax.Array,
     config: Config,
 ) -> EpisodeResults:
-    """Step active episodes and feed each action together with its resulting observation.
+    """Interleave policy EDIT tokens and forced FEEDBACK after completed replacements.
 
-    Completing an edit immediately refreshes the action token's image and
-    feedback. Its logits choose the next action with no intervening event.
-    Finished members only consume trailing PAD, with no further policy loss.
+    Each active member consumes one event per iteration. Members awaiting
+    feedback pause policy sampling, keeping histories contiguous up to final PAD.
+    Rewards and policy targets stay on the row that predicted the edit action.
     """
     count = len(tasks)
     if not count or envs.num_envs != count or envs.config != config.edit_config:
         raise ValueError("Expected matching nonempty tasks and editing environments")
     observations = envs.reset(tasks)
     seed_scores = np.asarray([observation.feedback[0] for observation in observations], np.float32)
-    history = initial_history(observations, config)
-    carry, logits = prefill(state, history, log_compiles=config.log_compiles)
-    position = history.events.kind.shape[0] - 1
-    stored = empty_events(config.max_seq_len, count, config)
-    for destination, prefix in zip(stored, history.events):
+    event = initial_event(observations, config)
+    carry, logits = prefill(state, event, log_compiles=config.log_compiles)
+    position = event.kind.shape[0] - 1
+    stored = empty_event(config.max_seq_len, count, config)
+    for destination, prefix in zip(stored, event):
         destination[: position + 1] = prefix
     shape = (config.max_seq_len, count)
     actions = np.zeros(shape, np.int32)
@@ -412,44 +415,50 @@ def run_episodes(
     legal = np.zeros((*shape, 1 + config.max_nodes + len(AST_ACTIONS)), np.bool_)
     legal[..., 0] = True
     active = np.ones(count, np.bool_)
+    pending_feedback = np.zeros(count, np.bool_)
     for _ in range(config.max_seq_len - position - 1):
-        ready = active.copy()
+        ready = active & ~pending_feedback
         for index in np.flatnonzero(ready):
             legal[position, index] = observations[index].legal
-        key, sample_key = jax.random.split(key)
-        sampled, log_probs = jax.device_get(act(mask_logits(logits, legal[position]), sample_key))
+        if ready.any():
+            key, sample_key = jax.random.split(key)
+            sampled, log_probs = jax.device_get(act(mask_logits(logits, legal[position]), sample_key))
+        else:
+            sampled, log_probs = np.zeros(count, np.int32), np.zeros(count, np.float32)
         actions[position] = np.where(ready, sampled, 0)
         old_log_probs[position] = np.where(ready, log_probs, 0)
         mask[position] = ready
         transitions = envs.step(sampled, ready)
-        event = jax.tree.map(itemgetter(0), empty_events(1, count, config))
-        event.output[:] = np.stack([observation.output for observation in observations])
+        event = jax.tree.map(itemgetter(0), empty_event(1, count, config))
+        event.grid[:] = np.stack([np.stack((o.initial, o.target, o.output)) for o in observations])
+        for index in np.flatnonzero(pending_feedback):
+            event.kind[index] = FEEDBACK_EVENT
+            event.feedback[index] = observations[index].feedback
+        pending_feedback[:] = False
         for index in np.flatnonzero(ready):
-            action = int(sampled[index])
-            event.kind[index] = ACTION_EVENT
-            event.value[index] = action
+            event.kind[index] = EDIT_EVENT
+            event.action[index] = sampled[index]
             transition = transitions[index]
             assert transition is not None
             rewards[position, index] = transition.reward
             observations[index] = transition.observation
-            event.output[index] = transition.observation.output
-            event.feedback[index] = transition.observation.feedback
+            pending_feedback[index] = transition.reevaluated
             active[index] = not (transition.terminated or transition.truncated)
-        if not active.any():
-            break
         for destination, value in zip(stored, event):
             destination[position + 1] = value
         position += 1
+        if not active.any() and not pending_feedback.any():
+            break
         carry, logits = decode_step(state, event, carry, log_compiles=config.log_compiles)
     summaries = envs.summaries()
-    if active.any() or not all(summary.tree.complete for summary in summaries):
+    if active.any() or pending_feedback.any() or not all(summary.tree.complete for summary in summaries):
         raise RuntimeError("Editing exhausted its bounded history with unfinished episodes")
     # Bucketing only adds trailing padding, which cannot affect earlier causal logits.
     length = min(config.max_seq_len, ((position + 1 + 31) // 32) * 32)
-    stored.output[position + 1 :] = np.stack([observation.output for observation in observations])
-    history = history._replace(events=jax.tree.map(itemgetter(slice(length)), stored))
+    stored.grid[position + 1 :] = np.stack([np.stack((o.initial, o.target, o.output)) for o in observations])
+    event = jax.tree.map(itemgetter(slice(length)), stored)
     batch = EditBatch(
-        history,
+        event,
         actions[:length],
         old_log_probs[:length],
         legal[:length],
@@ -510,7 +519,7 @@ def collect_rollout(
     sc.check((rewards, advantages), "B", np.float32)
     batch = batch._replace(advantages=advantages)
     successes = np.asarray([result.success for result in results])
-    sequence_lengths = config.edit_config.prefill_length + batch.mask.sum(axis=0)
+    sequence_lengths = config.edit_config.prefill_length + batch.mask.sum(axis=0) + completed_edits
     # STOP is the only voluntary termination. With STOP disabled, exhausting
     # the budget can leave one unused token, too little for a complete edit.
     budget_exhausted = (sequence_lengths == config.max_seq_len) | ~np.any(batch.mask & (batch.actions == 0), axis=0)
@@ -576,15 +585,11 @@ def objective(
     return policy - config.entropy_coef * entropy, (policy, entropy, kl, clipped)
 
 
-def take_history(history: History, indices: NDArray[np.int64]) -> History:
+def take_event(event: Event, indices: NDArray[np.int64]) -> Event:
     """Select episode columns while preserving their complete event histories."""
     chex.assert_rank(indices, 1)
     chex.assert_type(indices, np.integer)
-    return History(
-        history.initial[indices],
-        history.target[indices],
-        jax.tree.map(itemgetter((slice(None), indices)), history.events),
-    )
+    return jax.tree.map(itemgetter((slice(None), indices)), event)
 
 
 @partial(jax.jit, static_argnames="config")
@@ -606,7 +611,7 @@ def update(state: TrainState, batch: EditBatch, config: Config) -> tuple[TrainSt
     chex.assert_equal_shape((batch.actions, batch.rewards))
     chex.assert_shape(batch.advantages, (count,))
     chex.assert_type(batch.rewards, jnp.float32)
-    chex.assert_shape(batch.history.events.kind, (time, count))
+    chex.assert_shape(batch.event.kind, (time, count))
     counts = jnp.sum(batch.mask, axis=0)
     weights = batch.mask.astype(jnp.float32) / jnp.maximum(counts[None], 1) / count
     advantages = jnp.broadcast_to(batch.advantages, batch.actions.shape)
@@ -615,7 +620,7 @@ def update(state: TrainState, batch: EditBatch, config: Config) -> tuple[TrainSt
 
     def loss_fn(params: optax.Params) -> tuple[jax.Array, Metrics]:
         """Replay the minibatch under candidate parameters and evaluate its masked loss."""
-        _, logits = state.apply_fn({"params": params}, batch.history)
+        _, logits = state.apply_fn({"params": params}, batch.event)
         return objective(
             mask_logits(logits, batch.legal),
             batch.actions,
@@ -653,7 +658,7 @@ def select_episodes(batch: EditBatch, indices: NDArray[np.int64]) -> EditBatch:
     ):
         raise ValueError("Expected unique, in-range episode indices")
     return EditBatch(
-        take_history(batch.history, indices),
+        take_event(batch.event, indices),
         batch.actions[:, indices],
         batch.old_log_probs[:, indices],
         batch.legal[:, indices],

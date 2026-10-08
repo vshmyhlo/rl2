@@ -19,10 +19,10 @@ from rl2.transformer import ARTransformer, TransformerStackCarry
 type Array = jax.Array | NDArray[Any]
 
 
-PAD_EVENT, SEED_EVENT, ACTION_EVENT, UPDATE_EVENT = range(4)
+PAD_EVENT, EDIT_EVENT, FEEDBACK_EVENT = range(3)
 
 
-class Events(NamedTuple):
+class Event(NamedTuple):
     """Time-major history, or one batched event for cached decoding.
 
     NamedTuple makes this a JAX pytree; tree.map preserves its type and fields.
@@ -31,51 +31,38 @@ class Events(NamedTuple):
 
     Attributes:
         kind: int32 [T,B] event types: PAD_EVENT (0) for trailing padding,
-            SEED_EVENT (1) for initial program tokens, ACTION_EVENT (2) for
-            sampled actions and their results, or UPDATE_EVENT (3) for the
-            initial seed execution report. Padding does not advance the cache.
-        action: int32 [T,B] policy token IDs. SEED contains the initial program's
-            depth-first grammar actions; ACTION contains sampled location,
-            grammar, or STOP IDs. Ignored for UPDATE and PAD.
-        output: int32 [T,B,H,W,6] latest execution grid, included in every
-            non-padding event. ACTION carries the resulting observation's grid;
-            actions that do not execute a completed edit retain the latest grid.
+            EDIT_EVENT (1) for AST editing tokens, or FEEDBACK_EVENT (2) for
+            execution reports after complete edits, including the initial program.
+            Padding does not advance the cache.
+        action: int32 [T,B] policy token IDs for EDIT: location, grammar, or STOP.
+            The initial program is supplied as forced depth-first grammar EDIT
+            tokens. Ignored for FEEDBACK and PAD.
+        grid: int32 [T,B,3,H,W,6] images in order: initial, target, current.
+            Current is the latest execution result, including where execution
+            ended. A completing EDIT retains the previous execution image; the
+            following FEEDBACK introduces the new result.
         feedback: float32 [T,B,8] execution feedback in this order: score,
             success, runtime error, execution limit, ticks, length, score delta,
-            and sequence tokens left. ACTION carries the resulting observation's
-            feedback; UPDATE carries the initial seed report. Ignored for SEED
-            and PAD.
+            and sequence tokens left. Used only by FEEDBACK events; ignored for
+            EDIT and PAD.
     """
 
     kind: Array
     action: Array
-    output: Array
+    grid: Array
     feedback: Array
 
 
-class History(NamedTuple):
-    initial: Array  # [B,H,W,6], supplied to every token's image encoder.
-    target: Array
-    events: Events
-
-
-class EditCarry(NamedTuple):
-    """KV caches and fixed task grids used alongside every event's current image."""
-
-    transformer: TransformerStackCarry
-    initial: Array
-    target: Array
-
-
-type ModelOutput = tuple[EditCarry, jax.Array]
+type ModelOutput = tuple[TransformerStackCarry, jax.Array]
 
 
 class EditTransformer(nn.Module):
-    """Causal seed -> initial update -> action/result stream with a KV cache.
+    """Causal EDIT tokens and program FEEDBACK stream with a KV cache.
 
     __call__ returns (carry, logits [T,B,V]); row t consumes event t and predicts the
     next event. Loss applies only when that next event is a sampled action;
-    updates and seed tokens are provided by the host and are never targets.
+    feedback reports and initial program tokens are supplied by the host and
+    are never policy targets.
     No AST encoder or tree-relative attention is used. Location IDs refer to the
     current host AST's preorder, reconstructed by applying the preceding edits.
     Padding produces zero logits. Prefill selects the last real event per
@@ -103,7 +90,7 @@ class EditTransformer(nn.Module):
         self.feedback_projection = nn.Dense(self.d_model, dtype=self.dtype)
         self.feedback_norm = nn.LayerNorm(dtype=self.dtype)
         self.token_embedding = nn.Embed(1 + self.max_nodes + len(AST_ACTIONS), self.d_model, dtype=self.dtype)
-        self.kind_embedding = nn.Embed(4, self.d_model, dtype=self.dtype)
+        self.kind_embedding = nn.Embed(3, self.d_model, dtype=self.dtype)
         self.backbone = ARTransformer(
             dim=self.d_model,
             num_layers=self.num_layers,
@@ -117,39 +104,37 @@ class EditTransformer(nn.Module):
             1 + self.max_nodes + len(AST_ACTIONS), dtype=self.dtype, kernel_init=nn.initializers.zeros_init()
         )
 
-    def encode_grids(self, initial: jax.Array, target: jax.Array, output: jax.Array) -> jax.Array:
-        """Mix normalized input/target/result channels per cell, preserving spatial positions."""
-        chex.assert_scalar_non_negative(initial.ndim - 4)
-        chex.assert_shape(initial, (*initial.shape[:-3], None, None, 6))
-        chex.assert_equal_shape((initial, target, output))
-        chex.assert_type((initial, target, output), jnp.int32)
-        for size in initial.shape[-3:-1]:
+    def encode_grids(self, grid: jax.Array) -> jax.Array:
+        """Mix [initial, target, current] channels per cell, preserving spatial positions."""
+        sc = ShapeChecker(I=3, C=6, P=18, K=32)
+        leading = "TB" if grid.ndim == 6 else "B"
+        sc.check(grid, leading + "IHWC", jnp.int32)
+        for size in sc["HW"]:
             chex.assert_scalar_positive(size)
         scale = jnp.asarray([1, 1, 1, 1, 1, self.max_markers] * 3, jnp.float32)
-        grids = jnp.concatenate((initial, target, output), axis=-1).astype(jnp.float32) / scale
+        grids = jnp.moveaxis(grid, -4, -2).reshape(sc[leading + "HWP"]).astype(jnp.float32) / scale
+        sc.check(grids, leading + "HWP", jnp.float32)
         features = nn.gelu(self.grid_conv(grids))
-        return features.reshape(*initial.shape[:-3], math.prod(features.shape[-3:]))
+        sc.check(features, leading + "HWK", self.dtype)
+        encoded = features.reshape(*sc[leading], math.prod(features.shape[-3:]))
+        sc.check(encoded, leading + "G", self.dtype)
+        return encoded
 
-    def encode_events(self, events: Events, initial: jax.Array, target: jax.Array) -> jax.Array:
+    def encode_event(self, event: Event) -> jax.Array:
         """Add the task/current-image embedding to every event's token or feedback embedding."""
-        sc = ShapeChecker(C=6, F=FEEDBACK_SIZE, D=self.d_model)
-        sc.check((initial, target), "BHWC", jnp.int32)
-        sc.check((events.kind, events.action), "TB", jnp.int32)
-        sc.check(events.output, "TBHWC", jnp.int32)
-        sc.check(events.feedback, "TBF", jnp.float32)
-        active = events.kind != PAD_EVENT
-        has_token = (events.kind == SEED_EVENT) | (events.kind == ACTION_EVENT)
-        has_feedback = (events.kind == ACTION_EVENT) | (events.kind == UPDATE_EVENT)
+        sc = ShapeChecker(I=3, C=6, F=FEEDBACK_SIZE, D=self.d_model)
+        sc.check((event.kind, event.action), "TB", jnp.int32)
+        sc.check(event.grid, "TBIHWC", jnp.int32)
+        sc.check(event.feedback, "TBF", jnp.float32)
+        active = event.kind != PAD_EVENT
+        has_token = event.kind == EDIT_EVENT
+        has_feedback = event.kind == FEEDBACK_EVENT
         # Mask unused fields before nonlinear operations, so ignored NaNs and
         # out-of-range embedding IDs cannot contaminate parameter gradients.
-        feedback = jnp.where(has_feedback[..., None], events.feedback, 0)
-        token_ids = jnp.where(has_token, events.action, 0)
-        output = jnp.where(active[..., None, None, None], events.output, 0)
-        grids = self.encode_grids(
-            jnp.broadcast_to(initial, events.output.shape),
-            jnp.broadcast_to(target, events.output.shape),
-            output,
-        )
+        feedback = jnp.where(has_feedback[..., None], event.feedback, 0)
+        token_ids = jnp.where(has_token, event.action, 0)
+        grid = jnp.where(active[..., None, None, None, None], event.grid, 0)
+        grids = self.encode_grids(grid)
         sc.check(grids, "TBG", self.dtype)
         context = self.context_norm(self.context_projection(grids))
         update = self.feedback_norm(self.feedback_projection(feedback))
@@ -157,18 +142,17 @@ class EditTransformer(nn.Module):
         sc.check((context, update, token), "TBD", self.dtype)
         x = jnp.where(has_token[..., None], token, 0)
         x += jnp.where(has_feedback[..., None], update, 0)
-        x += context + self.kind_embedding(events.kind)
+        x += context + self.kind_embedding(event.kind)
         encoded = jnp.where(active[..., None], x, 0)
         sc.check(encoded, "TBD", self.dtype)
         return encoded
 
-    def __call__(self, history: History) -> ModelOutput:
+    def __call__(self, event: Event) -> ModelOutput:
         """Encode the complete causal history and return its cache and next-action logits."""
         sc = ShapeChecker(C=6, D=self.d_model, V=1 + self.max_nodes + len(AST_ACTIONS))
-        sc.check((history.initial, history.target), "BHWC", jnp.int32)
-        inputs = self.encode_events(history.events, history.initial, history.target)
+        inputs = self.encode_event(event)
         sc.check(inputs, "TBD", self.dtype)
-        active = history.events.kind != PAD_EVENT
+        active = event.kind != PAD_EVENT
         x_len = jnp.sum(active, axis=0, dtype=jnp.int32)
         sc.check(x_len, "B", jnp.int32)
         carry, features = self.backbone(jnp.swapaxes(inputs, 0, 1), x_len)
@@ -177,30 +161,27 @@ class EditTransformer(nn.Module):
         logits = self.head(features).astype(jnp.float32)
         logits = jnp.where(active[..., None], logits, 0)
         sc.check(logits, "TBV", jnp.float32)
-        return EditCarry(carry, history.initial, history.target), logits
+        return carry, logits
 
-    def prefill(self, history: History) -> ModelOutput:
-        """Consume the seed program and initial execution update once."""
-        carry, logits = self(history)
-        lengths = jnp.sum(history.events.kind != PAD_EVENT, axis=0, dtype=jnp.int32)
+    def prefill(self, event: Event) -> ModelOutput:
+        """Consume the initial program EDIT tokens and its FEEDBACK report once."""
+        carry, logits = self(event)
+        lengths = jnp.sum(event.kind != PAD_EVENT, axis=0, dtype=jnp.int32)
         last = jnp.maximum(lengths - 1, 0)
         return carry, logits[last, jnp.arange(logits.shape[1])]
 
-    def step(self, event: Events, carry: EditCarry) -> ModelOutput:
-        """Append each non-PAD event; padding preserves the cache and returns zero logits."""
-        sc = ShapeChecker(C=6, F=FEEDBACK_SIZE, D=self.d_model, V=1 + self.max_nodes + len(AST_ACTIONS))
-        sc.check((carry.initial, carry.target), "BHWC", jnp.int32)
+    def step(self, event: Event, carry: TransformerStackCarry) -> ModelOutput:
+        """Append an event with its three images; PAD preserves the KV cache and yields zero logits."""
+        sc = ShapeChecker(I=3, C=6, F=FEEDBACK_SIZE, D=self.d_model, V=1 + self.max_nodes + len(AST_ACTIONS))
         sc.check((event.kind, event.action), "B", jnp.int32)
-        sc.check(event.output, "BHWC", jnp.int32)
+        sc.check(event.grid, "BIHWC", jnp.int32)
         sc.check(event.feedback, "BF", jnp.float32)
         sequence = jax.tree.map(partial(jnp.expand_dims, axis=0), event)
         x_active = event.kind != PAD_EVENT
         sc.check(x_active, "B", jnp.bool_)
-        transformer, features = self.backbone.step(
-            self.encode_events(sequence, carry.initial, carry.target)[0], x_active, carry.transformer
-        )
+        carry, features = self.backbone.step(self.encode_event(sequence)[0], x_active, carry)
         sc.check(features, "BD", self.dtype)
         logits = self.head(features).astype(jnp.float32)
         logits = jnp.where(x_active[:, None], logits, 0)
         sc.check(logits, "BV", jnp.float32)
-        return carry._replace(transformer=transformer), logits
+        return carry, logits

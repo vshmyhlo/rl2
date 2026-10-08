@@ -108,6 +108,7 @@ def test_cached_rollout_replays_values_and_updates_both_heads(
     for original, reordered in zip(batch[1:], selected[1:], strict=True):
         np.testing.assert_array_equal(reordered, original[:, [1, 0]])
     np.testing.assert_array_equal(selected.history.events.feedback, batch.history.events.feedback[:, [1, 0]])
+    np.testing.assert_array_equal(selected.history.events.grid, batch.history.events.grid[:, [1, 0]])
 
 
 def test_gae_discounts_decisions_and_stops_at_episode_boundaries() -> None:
@@ -132,7 +133,6 @@ def synthetic(config: ppo.Config) -> tuple[TrainState, ppo.EditBatch]:
     shape = (3, 2)
     vocab = 1 + config.max_nodes + len(ppo.AST_ACTIONS)
     events = ppo.empty_events(*shape, config)
-    grid = np.zeros((2, 3, 3, 6), np.int32)
     legal = np.zeros((*shape, vocab), bool)
     legal[..., 0] = True
     legal[:2, :, 1] = True
@@ -141,7 +141,7 @@ def synthetic(config: ppo.Config) -> tuple[TrainState, ppo.EditBatch]:
     logits = np.zeros((*shape, vocab), np.float32)
     logits[..., 0], logits[..., 1] = np.log(probabilities), np.log(1 - probabilities)
     batch = ppo.EditBatch(
-        ppo.History(grid, grid, events),
+        ppo.History(events),
         np.zeros(shape, np.int32),
         np.full(shape, np.log(0.5), np.float32),
         legal,
