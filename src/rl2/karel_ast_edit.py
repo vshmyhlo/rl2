@@ -7,7 +7,7 @@ receive zero. Undiscounted rewards sum to final_score - seed_score.
 """
 
 from dataclasses import dataclass, field, replace
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import chex
 import gymnasium as gym
@@ -101,17 +101,20 @@ def open_subtree(tree: KarelAST, position: int) -> KarelAST:
     return result
 
 
-class Observation(NamedTuple):
-    """Host-side edit state returned with every action transition.
+class ExecutedObservation(NamedTuple):
+    """A complete program's execution state, returned by reset and completed edits.
+
+    STOP also returns this variant with the last execution's output and feedback,
+    an updated token budget, and EditStep.terminated=True.
 
     Attributes:
+        kind: Tag identifying execution observations.
         initial: Original task input grid, shaped (height, width, 6).
         target: Desired output grid, shaped (height, width, 6).
-        output: Grid from the last completed program execution, shaped
-            (height, width, 6); retained while a replacement is incomplete.
+        output: Grid from the completed program execution, shaped (height, width, 6).
         feedback: Eight floats: score, success flag, runtime-error flag,
-            execution-limit flag, ticks / max_execution_steps, minimum
-            completed source length / max_program_tokens, last execution's
+            execution-limit flag, ticks / max_execution_steps,
+            source length / max_program_tokens, last execution's
             score delta (initially zero), and tokens_left / max_seq_len.
         action_mask: Boolean action mask of length 1 + max_nodes + len(AST_ACTIONS).
             Index 0 is STOP, the next max_nodes entries select subtree roots
@@ -119,11 +122,28 @@ class Observation(NamedTuple):
             True entries satisfy the current edit phase and completion budgets.
     """
 
+    kind: Literal["executed"]
     initial: NDArray[np.int32]
     target: NDArray[np.int32]
     output: NDArray[np.int32]
     feedback: NDArray[np.float32]
     action_mask: NDArray[np.bool_]
+
+
+class EditingObservation(NamedTuple):
+    """An incomplete replacement with no new execution output or feedback.
+
+    Attributes:
+        kind: Tag identifying edits in progress.
+        action_mask: Boolean mask with the same layout as ExecutedObservation.
+            Only grammar actions that can finish the replacement are enabled.
+    """
+
+    kind: Literal["editing"]
+    action_mask: NDArray[np.bool_]
+
+
+type Observation = ExecutedObservation | EditingObservation
 
 
 @dataclass(frozen=True)
@@ -199,7 +219,7 @@ def observe(
     config: EditConfig,
     score_delta: float = 0.0,
 ) -> Observation:
-    """Build host feedback and action masks that reserve enough budget to finish edits."""
+    """Return execution feedback for complete trees, or just an in-progress edit mask."""
     chex.assert_scalar_in(tokens_left, 0, config.max_seq_len)
     sc = ShapeChecker(
         H=config.env.height, W=config.env.width, C=6, V=1 + config.max_nodes + len(AST_ACTIONS), F=FEEDBACK_SIZE
@@ -223,6 +243,9 @@ def observe(
         action_mask[1 + config.max_nodes :] = tree.allowed_actions() & (
             required - costs.min() + costs + 1 <= tokens_left
         )
+    sc.check(action_mask, "V", dtype=np.bool_)
+    if not tree.complete:
+        return EditingObservation("editing", action_mask)
     feedback = np.asarray(
         [
             result.score,
@@ -230,26 +253,27 @@ def observe(
             result.error == "runtime_error",
             result.error == "execution_limit",
             result.ticks / config.env.max_execution_steps,
-            # During replacement, length describes the current partial tree's minimum completion.
             tree._minimum_completion(source=True) / config.env.max_program_tokens,
             score_delta,
             tokens_left / config.max_seq_len,
         ],
         np.float32,
     )
-    sc.check(action_mask, "V", dtype=np.bool_)
     sc.check(feedback, "F", dtype=np.float32)
-    return Observation(pair.initial, pair.target, result.output, feedback, action_mask)
+    return ExecutedObservation("executed", pair.initial, pair.target, result.output, feedback, action_mask)
 
 
 class EditStep(NamedTuple):
-    """One policy transition; reevaluated marks a completed replacement."""
+    """One policy transition, tagged by its observation's execution/editing kind.
+
+    An executed observation marks a completed replacement unless terminated is
+    True (STOP). A truncated completed replacement still carries fresh feedback.
+    """
 
     observation: Observation
     reward: float
     terminated: bool
     truncated: bool
-    reevaluated: bool
 
 
 class KarelASTEditEnv:
@@ -281,7 +305,7 @@ class KarelASTEditEnv:
         self.done = True
         self.action_space = gym.spaces.Discrete(1 + config.max_nodes + len(AST_ACTIONS))
 
-    def reset(self, *, task: KarelProgramEnv | None = None, seed: int | None = None) -> Observation:
+    def reset(self, *, task: KarelProgramEnv | None = None, seed: int | None = None) -> ExecutedObservation:
         """Start from the configured seed on a sampled task or a fresh supplied task."""
         if task is not None:
             if seed is not None:
@@ -298,6 +322,7 @@ class KarelASTEditEnv:
         self.completed_edits = 0
         self.done = False
         self.observation = observe(self.tree, self.pair, self.result, self.remaining, self.config)
+        assert isinstance(self.observation, ExecutedObservation)
         return self.observation
 
     def step(self, action: int | np.integer) -> EditStep:
@@ -314,7 +339,6 @@ class KarelASTEditEnv:
         action = int(action)
         self.remaining -= 1
         reward = 0.0
-        reevaluated = False
         terminated = self.tree.complete and action == 0
         if not terminated:
             if self.tree.complete:
@@ -325,15 +349,15 @@ class KarelASTEditEnv:
                     previous_score = self.result.score
                     self.result = evaluate(self.tree, self.task, self.scorer, self.pair.initial)
                     reward = self.result.score - previous_score
-                    reevaluated = True
                     self.completed_edits += 1
                     self.remaining -= 1  # The resulting FEEDBACK occupies its own event.
-        # Incomplete edits retain the last execution's delta as feedback. Their
-        # actual transition reward is still zero.
-        delta = reward if reevaluated else float(self.observation.feedback[-2])
+        delta = reward
+        if terminated:
+            assert isinstance(self.observation, ExecutedObservation)
+            delta = float(self.observation.feedback[-2])
         self.observation = observe(self.tree, self.pair, self.result, self.remaining, self.config, delta)
         truncated = not terminated and (self.remaining == 0 or not self.observation.action_mask.any())
         self.done = terminated or truncated
         if self.done and not self.tree.complete:
             raise RuntimeError("Action masks allowed an unfinished terminal program")
-        return EditStep(self.observation, reward, terminated, truncated, reevaluated)
+        return EditStep(self.observation, reward, terminated, truncated)

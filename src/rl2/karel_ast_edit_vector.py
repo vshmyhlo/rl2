@@ -11,7 +11,7 @@ from numpy.typing import NDArray
 
 from rl2.karel import KarelProgramEnv
 from rl2.karel_ast import KarelAST
-from rl2.karel_ast_edit import EditConfig, EditStep, Evaluation, KarelASTEditEnv, Observation
+from rl2.karel_ast_edit import EditConfig, EditStep, Evaluation, ExecutedObservation, KarelASTEditEnv
 
 
 class EditSummary(NamedTuple):
@@ -40,7 +40,7 @@ def _initialize_worker(config: EditConfig, count: int) -> None:
     _worker_envs = [KarelASTEditEnv(config) for _ in range(count)]
 
 
-def _reset_worker(tasks: list[KarelProgramEnv]) -> list[Observation]:
+def _reset_worker(tasks: list[KarelProgramEnv]) -> list[ExecutedObservation]:
     """Reset the worker's shard from independently copied, already sampled tasks."""
     return [env.reset(task=task) for env, task in zip(_worker_envs, tasks, strict=True)]
 
@@ -98,7 +98,7 @@ class KarelASTEditVectorEnv:
         if self.closed:
             raise RuntimeError("Vector environment is closed")
 
-    def reset(self, tasks: list[KarelProgramEnv]) -> list[Observation]:
+    def reset(self, tasks: list[KarelProgramEnv]) -> list[ExecutedObservation]:
         """Reset every member, preserving task order and same-task rollout groups."""
         self._check_open()
         if len(tasks) != self.num_envs or any(task.config != self.config.env for task in tasks):

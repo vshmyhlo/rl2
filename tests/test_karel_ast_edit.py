@@ -15,7 +15,7 @@ def config() -> editing.EditConfig:
     return editing.EditConfig(
         max_nodes=8,
         max_depth=4,
-        max_seq_len=10,
+        max_seq_len=12,
         env=KarelConfig(
             height=3,
             width=3,
@@ -55,19 +55,23 @@ def test_improvement_regression_and_stop(config: editing.EditConfig, monkeypatch
     evaluate = MagicMock(wraps=editing.evaluate)
     monkeypatch.setattr(editing, "evaluate", evaluate)
     initial = env.reset(task=turning_task(config))
+    assert initial.kind == "executed"
     assert initial.feedback[-2] == 0 and evaluate.call_count == 1
-    assert env.remaining == 5  # Four seed tokens and one initial UPDATE consumed.
+    assert env.remaining == 7  # Four initial EDIT tokens and one FEEDBACK consumed.
     seed_score = env.seed_score
     first = env.step(3)  # Select the primitive statement.
-    assert first.reward == 0 and not first.reevaluated
+    assert first.reward == 0 and first.observation.kind == "editing"
+    assert isinstance(first.observation, editing.EditingObservation)
+    assert first.observation.action_mask[1 + config.max_nodes + ACTION_ID["turnRight"]]
     assert evaluate.call_count == 1
     improved = env.step(1 + config.max_nodes + ACTION_ID["turnRight"])
-    assert improved.reevaluated and improved.reward > 0
+    assert improved.observation.kind == "executed" and improved.reward > 0
+    assert isinstance(improved.observation, editing.ExecutedObservation)
     assert improved.reward == pytest.approx(env.result.score - seed_score)
     assert improved.observation.feedback[-2] == pytest.approx(improved.reward)
     assert env.result.success and not env.done  # Success permits further edits.
     assert evaluate.call_count == 2
-    assert env.remaining == 3  # Location + replacement; feedback adds no token.
+    assert env.remaining == 4  # Location + replacement + feedback consume three tokens.
     assert env.step(3).reward == 0
     regressed = env.step(1 + config.max_nodes + ACTION_ID["turnLeft"])
     assert regressed.reward == pytest.approx(-improved.reward)
@@ -75,24 +79,29 @@ def test_improvement_regression_and_stop(config: editing.EditConfig, monkeypatch
     stopped = env.step(0)
     assert stopped.terminated and not stopped.truncated and stopped.reward == 0
     assert env.remaining == 0
-    assert not stopped.reevaluated and evaluate.call_count == 3
+    assert stopped.observation.kind == "executed" and evaluate.call_count == 3
+    assert isinstance(stopped.observation, editing.ExecutedObservation)
+    assert stopped.observation.feedback[-2] == pytest.approx(regressed.reward)
+    assert stopped.observation.feedback[-1] == 0
+    np.testing.assert_array_equal(stopped.observation.output, initial.output)
     assert improved.reward + regressed.reward == pytest.approx(env.result.score - seed_score)
     assert env.completed_edits == 2 and env.tree.complete
     with pytest.raises(gym.error.ResetNeeded):
         env.step(0)
-    env.reset(task=turning_task(config))
+    reset = env.reset(task=turning_task(config))
     assert env.completed_edits == 0 and env.remaining == config.max_seq_len - config.prefill_length
-    assert env.observation.feedback[-2] == 0
+    assert reset.kind == "executed" and reset.feedback[-2] == 0
 
 
 def test_runtime_failure_at_budget_boundary(config: editing.EditConfig) -> None:
-    config = replace(config, max_seq_len=7)
+    config = replace(config, max_seq_len=8)
     env = editing.KarelASTEditEnv(config)
     task = turning_task(config)
     env.reset(task=task)
     assert env.step(3).reward == 0
     transition = env.step(1 + config.max_nodes + ACTION_ID["move"])
-    assert transition.reevaluated and transition.truncated and not transition.terminated
+    assert transition.observation.kind == "executed" and transition.truncated and not transition.terminated
+    assert isinstance(transition.observation, editing.ExecutedObservation)
     assert env.result.error == "runtime_error"
     assert transition.observation.feedback[2] == 1
     np.testing.assert_array_equal(transition.observation.output, task._task.initial)
@@ -102,47 +111,62 @@ def test_runtime_failure_at_budget_boundary(config: editing.EditConfig) -> None:
         env.step(0)
 
 
+def test_unchanged_replacement_still_returns_execution(config: editing.EditConfig) -> None:
+    config = replace(config, max_seq_len=8)
+    env = editing.KarelASTEditEnv(config)
+    initial = env.reset(task=turning_task(config))
+    assert env.step(3).observation.kind == "editing"
+    transition = env.step(1 + config.max_nodes + ACTION_ID["turnLeft"])
+    assert transition.observation.kind == "executed"
+    assert isinstance(transition.observation, editing.ExecutedObservation)
+    assert transition.reward == 0 and transition.truncated and not transition.terminated
+    assert transition.observation.feedback[-2] == 0
+    assert transition.observation.feedback[-1] == 0
+    np.testing.assert_array_equal(transition.observation.output, initial.output)
+    assert env.completed_edits == 1
+
+
 def test_seed_prefill_leaves_only_stop(config: editing.EditConfig) -> None:
     config = replace(config, max_seq_len=6)
     env = editing.KarelASTEditEnv(config)
     observation = env.reset(task=turning_task(config))
     assert env.remaining == 1
-    assert np.flatnonzero(observation.legal).tolist() == [0]
+    assert np.flatnonzero(observation.action_mask).tolist() == [0]
     transition = env.step(0)
     assert transition.terminated and env.remaining == 0
     assert env.tree.complete and env.completed_edits == 0
 
 
-@pytest.mark.parametrize("max_seq_len", [9, 10], ids=["exact-budget", "one-unusable-token"])
+@pytest.mark.parametrize("max_seq_len", [11, 12], ids=["exact-budget", "one-unusable-token"])
 def test_disabled_stop_continues_until_no_edit_fits(config: editing.EditConfig, max_seq_len: int) -> None:
     config = replace(config, allow_stop=False, max_seq_len=max_seq_len)
     env = editing.KarelASTEditEnv(config)
     observation = env.reset(task=turning_task(config))
-    assert not observation.legal[0]
+    assert not observation.action_mask[0]
     with pytest.raises(gym.error.InvalidAction):
         env.step(0)
     assert env.step(3).reward == 0
     improved = env.step(1 + config.max_nodes + ACTION_ID["turnRight"])
     assert env.result is not None and env.result.success
     assert not improved.terminated and not improved.truncated
-    assert not improved.observation.legal[0]
+    assert not improved.observation.action_mask[0]
     assert env.step(3).reward == 0
     regressed = env.step(1 + config.max_nodes + ACTION_ID["turnLeft"])
     assert regressed.truncated and not regressed.terminated
-    assert regressed.reevaluated and regressed.reward == pytest.approx(-improved.reward)
-    assert not regressed.observation.legal.any()
+    assert regressed.observation.kind == "executed" and regressed.reward == pytest.approx(-improved.reward)
+    assert not regressed.observation.action_mask.any()
     assert env.done and env.tree.complete and env.completed_edits == 2
-    assert env.remaining == max_seq_len - 9
+    assert env.remaining == max_seq_len - 11
     with pytest.raises(gym.error.ResetNeeded):
         env.step(3)
 
 
 def test_disabled_stop_requires_budget_for_an_edit(config: editing.EditConfig) -> None:
     with pytest.raises(ValueError, match="complete edit"):
-        replace(config, allow_stop=False, max_seq_len=config.prefill_length + 1)
-    minimum = replace(config, allow_stop=False, max_seq_len=config.prefill_length + 2)
+        replace(config, allow_stop=False, max_seq_len=config.prefill_length + 2)
+    minimum = replace(config, allow_stop=False, max_seq_len=config.prefill_length + 3)
     env = editing.KarelASTEditEnv(minimum)
-    assert env.reset(task=turning_task(minimum)).legal[3]
+    assert env.reset(task=turning_task(minimum)).action_mask[3]
     env.step(3)
     assert env.step(1 + minimum.max_nodes + ACTION_ID["turnRight"]).truncated
 
@@ -213,8 +237,9 @@ def test_penalties_reward_smaller_equivalent_programs(config: editing.EditConfig
         for index, action in enumerate(actions):
             transition = env.step(1 + config.max_nodes + action)
             if index < len(actions) - 1:
-                assert transition.reward == 0 and not transition.reevaluated
-        assert transition.reevaluated
+                assert transition.reward == 0 and transition.observation.kind == "editing"
+        assert transition.observation.kind == "executed"
+        assert isinstance(transition.observation, editing.ExecutedObservation)
         np.testing.assert_array_equal(transition.observation.output, initial.output)
         assert transition.observation.feedback[-2] == pytest.approx(transition.reward)
         return transition.reward
@@ -252,6 +277,6 @@ def test_invalid_actions_and_reset_contract(config: editing.EditConfig) -> None:
     env.step(3)
     with pytest.raises(gym.error.InvalidAction):
         env.step(0)  # Cannot stop with an unfinished replacement.
-    env.reset(seed=12)
+    assert env.reset(seed=12).kind == "executed"
     stopped = env.step(0)
     assert stopped.reward == 0 and stopped.terminated and env.completed_edits == 0

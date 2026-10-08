@@ -103,7 +103,14 @@ from rl2.karel import (
     KarelProgramEnv,
 )
 from rl2.karel_ast import AST_ACTIONS, KarelAST, program_actions
-from rl2.karel_ast_edit import EDIT_REWARD_COMPONENTS, FEEDBACK_SIZE, EditConfig, Evaluation, Observation
+from rl2.karel_ast_edit import (
+    EDIT_REWARD_COMPONENTS,
+    FEEDBACK_SIZE,
+    EditConfig,
+    Evaluation,
+    ExecutedObservation,
+    Observation,
+)
 from rl2.karel_ast_edit_vector import KarelASTEditVectorEnv
 from rl2.shape_checker import ShapeChecker
 from rl2.train_karel_ast_grpo import (
@@ -247,7 +254,7 @@ def empty_event(time: int, batch: int, config: Config) -> Event:
     )
 
 
-def initial_event(observations: list[Observation], config: Config) -> Event:
+def initial_event(observations: list[ExecutedObservation], config: Config) -> Event:
     """Assemble task grids, seed grammar tokens, and the seed's execution feedback."""
     if not observations:
         raise ValueError("Cannot initialize an empty history")
@@ -399,9 +406,10 @@ def run_episodes(
     count = len(tasks)
     if not count or envs.num_envs != count or envs.config != config.edit_config:
         raise ValueError("Expected matching nonempty tasks and editing environments")
-    observations = envs.reset(tasks)
-    seed_scores = np.asarray([observation.feedback[0] for observation in observations], np.float32)
-    event = initial_event(observations, config)
+    executions = envs.reset(tasks)
+    observations: list[Observation] = list(executions)
+    seed_scores = np.asarray([observation.feedback[0] for observation in executions], np.float32)
+    event = initial_event(executions, config)
     carry, logits = prefill(state, event, log_compiles=config.log_compiles)
     position = event.kind.shape[0] - 1
     stored = empty_event(config.max_seq_len, count, config)
@@ -419,7 +427,7 @@ def run_episodes(
     for _ in range(config.max_seq_len - position - 1):
         ready = active & ~pending_feedback
         for index in np.flatnonzero(ready):
-            legal[position, index] = observations[index].legal
+            legal[position, index] = observations[index].action_mask
         if ready.any():
             key, sample_key = jax.random.split(key)
             sampled, log_probs = jax.device_get(act(mask_logits(logits, legal[position]), sample_key))
@@ -430,10 +438,10 @@ def run_episodes(
         mask[position] = ready
         transitions = envs.step(sampled, ready)
         event = jax.tree.map(itemgetter(0), empty_event(1, count, config))
-        event.grid[:] = np.stack([np.stack((o.initial, o.target, o.output)) for o in observations])
+        event.grid[:] = np.stack([np.stack((o.initial, o.target, o.output)) for o in executions])
         for index in np.flatnonzero(pending_feedback):
             event.kind[index] = FEEDBACK_EVENT
-            event.feedback[index] = observations[index].feedback
+            event.feedback[index] = executions[index].feedback
         pending_feedback[:] = False
         for index in np.flatnonzero(ready):
             event.kind[index] = EDIT_EVENT
@@ -442,7 +450,9 @@ def run_episodes(
             assert transition is not None
             rewards[position, index] = transition.reward
             observations[index] = transition.observation
-            pending_feedback[index] = transition.reevaluated
+            if isinstance(transition.observation, ExecutedObservation):
+                executions[index] = transition.observation
+                pending_feedback[index] = not transition.terminated
             active[index] = not (transition.terminated or transition.truncated)
         for destination, value in zip(stored, event):
             destination[position + 1] = value
@@ -455,7 +465,7 @@ def run_episodes(
         raise RuntimeError("Editing exhausted its bounded history with unfinished episodes")
     # Bucketing only adds trailing padding, which cannot affect earlier causal logits.
     length = min(config.max_seq_len, ((position + 1 + 31) // 32) * 32)
-    stored.grid[position + 1 :] = np.stack([np.stack((o.initial, o.target, o.output)) for o in observations])
+    stored.grid[position + 1 :] = np.stack([np.stack((o.initial, o.target, o.output)) for o in executions])
     event = jax.tree.map(itemgetter(slice(length)), stored)
     batch = EditBatch(
         event,

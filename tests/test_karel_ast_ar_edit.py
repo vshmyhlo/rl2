@@ -20,9 +20,9 @@ from rl2.karel_ast import ACTION_ID, KarelAST, program_actions
 
 
 @jax.jit
-def predict(state: TrainState, history: edit.History) -> jax.Array:
+def predict(state: TrainState, event: edit.Event) -> jax.Array:
     """Replay the complete history to verify rollout and training behavior."""
-    _, logits = state.apply_fn({"params": state.params}, history)
+    _, logits = state.apply_fn({"params": state.params}, event)
     return logits
 
 
@@ -39,7 +39,7 @@ def config() -> edit.Config:
         num_heads=2,
         max_nodes=8,
         max_depth=4,
-        max_seq_len=14,
+        max_seq_len=16,
         target_kl=None,
         entropy_coef=0.01,
         log_interval=1,
@@ -244,21 +244,23 @@ def test_execution_feedback_and_restart(config: edit.Config) -> None:
     np.testing.assert_array_equal(result.output, target)
     assert result.score == pytest.approx(sum(result.components.values()))
     observation = editing.observe(bad, pair, result, 1, config)
+    assert isinstance(observation, editing.ExecutedObservation)
     assert observation.feedback[2] == 1 and observation.feedback[-1] == pytest.approx(1 / config.max_seq_len)
     # Failure does not poison the next execution or make it start from the partial state.
     good = editing.evaluate(editing.seed_tree(config.edit_config), task, env, initial)
     assert good.success and good.error is None and good.ticks == 1
     partial = editing.open_subtree(bad, 0)
     during = editing.observe(partial, pair, result, config.max_seq_len, config)
-    np.testing.assert_array_equal(during.output, result.output)
-    assert not during.legal[: 1 + config.max_nodes].any()
-    assert during.legal[1 + config.max_nodes + ACTION_ID["Program"]]
+    assert isinstance(during, editing.EditingObservation)
+    assert during.kind == "editing"
+    assert not during.action_mask[: 1 + config.max_nodes].any()
+    assert during.action_mask[1 + config.max_nodes + ACTION_ID["Program"]]
 
 
 def test_rollout_replay_rewards_and_minibatches(config: edit.Config, state: TrainState, rollout: edit.Rollout) -> None:
     batch, rewards, diagnostics, _, programs = rollout
     assert all(isinstance(leaf, (np.ndarray, jax.Array)) for leaf in jax.tree.leaves(batch))
-    logits = edit.mask_logits(predict(state, batch.history), batch.legal)
+    logits = edit.mask_logits(predict(state, batch.event), batch.legal)
     np.testing.assert_allclose(edit.action_log_prob(logits, batch.actions), batch.old_log_probs, atol=2e-6)
     assert np.take_along_axis(batch.legal, batch.actions[..., None], axis=-1).all()
     assert np.isfinite(batch.old_log_probs).all()
@@ -271,15 +273,15 @@ def test_rollout_replay_rewards_and_minibatches(config: edit.Config, state: Trai
     assert not batch.mask[: len(program_actions(tuple(config.seed_program.split())))].any()
     seed_end = len(program_actions(tuple(config.seed_program.split()))) + 1
     np.testing.assert_array_equal(
-        batch.history.events.grid[:seed_end],
-        np.broadcast_to(batch.history.events.grid[0], batch.history.events.grid[:seed_end].shape),
+        batch.event.grid[:seed_end],
+        np.broadcast_to(batch.event.grid[0], batch.event.grid[:seed_end].shape),
     )
     seed = int(np.random.default_rng(4).integers(0, 2**31, size=1)[0])
     env = KarelProgramEnv(config.env)
     for index, tree in enumerate(programs):
         pair = env.reset(seed=seed)
         for image_index, expected in enumerate((pair.initial, pair.target)):
-            images = batch.history.events.grid[:, index, image_index]
+            images = batch.event.grid[:, index, image_index]
             np.testing.assert_array_equal(images, np.broadcast_to(expected, images.shape))
         for token in tree.tokens():
             _, reward, terminated, truncated, info = env.step(TOKEN_TO_ID[token])
@@ -300,7 +302,7 @@ def test_rollout_replay_rewards_and_minibatches(config: edit.Config, state: Trai
     np.testing.assert_array_equal(subset.actions, batch.actions[:, ::-1])
     np.testing.assert_array_equal(subset.rewards, batch.rewards[:, ::-1])
     np.testing.assert_array_equal(subset.advantages, batch.advantages[::-1])
-    np.testing.assert_array_equal(subset.history.events.grid, batch.history.events.grid[:, ::-1])
+    np.testing.assert_array_equal(subset.event.grid, batch.event.grid[:, ::-1])
     with pytest.raises(ValueError, match="unique"):
         edit.select_episodes(batch, np.asarray([0, 0], np.int64))
     with pytest.raises(ValueError, match="environments"):
@@ -391,25 +393,25 @@ def test_compile_logs_name_dimensions(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     batch = rollout.batch
-    history = batch.history._replace(events=jax.tree.map(lambda x: x[:4], batch.history.events))
+    event = jax.tree.map(lambda x: x[:4], batch.event)
     # Trace without compiling/executing extra model updates just to inspect their logs.
-    carry, _ = jax.eval_shape(edit.prefill, state, history)
-    event = jax.tree.map(lambda x: x[0], history.events)
+    carry, _ = jax.eval_shape(edit.prefill, state, event)
+    step_event = jax.tree.map(lambda x: x[0], event)
     assert capsys.readouterr().out == ""
     for _ in range(2):
-        edit.prefill.lower(state, history, log_compiles=True)
-        edit.decode_step.lower(state, event, carry, log_compiles=True)
+        edit.prefill.lower(state, event, log_compiles=True)
+        edit.decode_step.lower(state, step_event, carry, log_compiles=True)
         edit.update.lower(state, batch, replace(config, log_compiles=True))
     assert capsys.readouterr().out == (
         "JIT trace edit prefill: b=2, t=4\n"
         "JIT trace edit step: b=2\n"
         f"JIT trace edit update: b=2, t={batch.actions.shape[0]}\n"
     )
-    shorter = history._replace(events=jax.tree.map(lambda x: x[:3], history.events))
+    shorter = jax.tree.map(lambda x: x[:3], event)
     edit.prefill.lower(state, shorter, log_compiles=True)
     assert capsys.readouterr().out == "JIT trace edit prefill: b=2, t=3\n"
     edit.prefill.lower(state, shorter)
-    edit.decode_step.lower(state, event, carry)
+    edit.decode_step.lower(state, step_event, carry)
     edit.update.lower(state, batch, config)
     assert capsys.readouterr().out == ""
 
@@ -429,7 +431,7 @@ def test_update_and_episode_normalization(
     # Preserve equal episode weights even when their decision counts differ.
     weights = (batch.mask / batch.mask.sum(axis=0)[None] / 2).astype(np.float32)
     _, expected = edit.objective(
-        edit.mask_logits(predict(state, batch.history), batch.legal),
+        edit.mask_logits(predict(state, batch.event), batch.legal),
         batch.actions,
         batch.old_log_probs,
         np.broadcast_to(batch.advantages, batch.actions.shape),
@@ -627,10 +629,11 @@ def test_generation_executes_atomic_replacements(
     assert result.tokens() == ("DEF", "run", "m(", "putMarker", "turnLeft", "m)")
     assert selected == script and evaluate.call_count == 3  # Seed plus two complete edits.
     consumed = [call.args[1] for call in step.call_args_list]
-    assert len(consumed) == len(script) - 1  # Every nonterminal action is decoded exactly once.
-    assert all(event.kind[0] == edit.ACTION_EVENT for event in consumed)
-    completion = consumed[len(grammar)]
-    assert completion.feedback[0, -1] == pytest.approx(2 / config.max_seq_len)
+    assert [int(event.action[0]) for event in consumed if event.kind[0] == edit.EDIT_EVENT] == script
+    reports = [event for event in consumed if event.kind[0] == edit.FEEDBACK_EVENT]
+    assert len(reports) == 1  # The terminal feedback is stored but need not be decoded.
+    completion = reports[0]
+    assert completion.feedback[0, -1] == pytest.approx(3 / config.max_seq_len)
     assert completion.feedback.shape[-1] == 8
     assert KarelProgramEnv(config.env).reset_from(task) is not None
     with pytest.raises(ValueError, match="limits"):
@@ -648,7 +651,7 @@ def test_execution_limit_retains_last_valid_grid(config: edit.Config) -> None:
     np.testing.assert_array_equal(failed.output, seed.output)
     observation = editing.observe(tree, pair, failed, 0, config)
     assert observation.feedback[3] == observation.feedback[4] == 1
-    assert observation.legal[0] and observation.legal.sum() == 1
+    assert observation.action_mask[0] and observation.action_mask.sum() == 1
 
 
 def test_grid_encoder_mixes_all_three_images_per_cell(config: edit.Config, state: TrainState) -> None:
@@ -666,15 +669,16 @@ def test_grid_encoder_mixes_all_three_images_per_cell(config: edit.Config, state
     assert not np.allclose(features[1, 1, 1], features[2, 1, 1])
     features[:, 1, 1] = 0
     np.testing.assert_array_equal(features, 0)  # A 1x1 convolution cannot mix neighboring cells.
-    # Every real event kind receives its current image, including seed and action tokens.
-    events = edit.empty_events(3, 1, config)
-    events.kind[:, 0] = [edit.SEED_EVENT, edit.ACTION_EVENT, edit.UPDATE_EVENT]
-    events.grid[:, :, 0] = initial[:1]
-    events.grid[:, :, 1] = target[:1]
-    original = state.apply_fn({"params": state.params}, events, method=EditTransformer.encode_events)
-    events.grid[:, 0, 2, 1, 1, 5] = 1
-    changed = state.apply_fn({"params": state.params}, events, method=EditTransformer.encode_events)
-    assert np.all(np.any(np.abs(np.asarray(changed - original)) > 1e-6, axis=-1))
+    # Both real event kinds receive the current image; padding remains inert.
+    event = edit.empty_event(3, 1, config)
+    event.kind[:, 0] = [edit.EDIT_EVENT, edit.FEEDBACK_EVENT, PAD_EVENT]
+    event.grid[:, :, 0] = initial[:1]
+    event.grid[:, :, 1] = target[:1]
+    original = state.apply_fn({"params": state.params}, event, method=EditTransformer.encode_event)
+    event.grid[:, 0, 2, 1, 1, 5] = 1
+    changed = state.apply_fn({"params": state.params}, event, method=EditTransformer.encode_event)
+    assert np.all(np.any(np.abs(np.asarray(changed - original))[:2] > 1e-6, axis=-1))
+    np.testing.assert_array_equal(changed[2], 0)
 
 
 def test_history_is_causal_and_retains_action_and_update_context(
@@ -682,53 +686,56 @@ def test_history_is_causal_and_retains_action_and_update_context(
     state: TrainState,
     rollout: edit.Rollout,
 ) -> None:
-    history = rollout[0].history
-    logits = np.asarray(predict(state, history))
-    assert logits.shape[:2] == history.events.kind.shape
-    assert np.all(history.events.kind[0] == edit.SEED_EVENT)
-    grid = np.array(history.events.grid)
+    event = rollout[0].event
+    logits = np.asarray(predict(state, event))
+    assert logits.shape[:2] == event.kind.shape
+    assert np.all(event.kind[0] == edit.EDIT_EVENT)
+    grid = np.array(event.grid)
     grid[0, :, 2, 1, 1, 5] += 1
-    changed = history._replace(events=history.events._replace(grid=grid))
+    changed = event._replace(grid=grid)
     seed_logits = np.asarray(predict(state, changed))
     assert not np.allclose(logits[0], seed_logits[0])
     # The initial execution report is a forced observation, not a prediction
     # target. Changing it must affect only predictions AFTER it is consumed.
     update_index = len(program_actions(tuple(config.seed_program.split())))
-    feedback = np.array(history.events.feedback)
+    feedback = np.array(event.feedback)
     feedback[update_index, :, 0] += 10
-    changed = history._replace(events=history.events._replace(feedback=feedback))
+    changed = event._replace(feedback=feedback)
     new_logits = np.asarray(predict(state, changed))
     np.testing.assert_array_equal(logits[:update_index], new_logits[:update_index])
     assert not np.allclose(logits[update_index], new_logits[update_index])
     # Changing one event's image cannot affect predictions preceding that event.
-    grid = np.array(history.events.grid)
+    grid = np.array(event.grid)
     grid[update_index, :, 2, 1, 1, 5] += 1
-    changed = history._replace(events=history.events._replace(grid=grid))
+    changed = event._replace(grid=grid)
     image_logits = np.asarray(predict(state, changed))
     np.testing.assert_array_equal(logits[:update_index], image_logits[:update_index])
     assert not np.allclose(logits[update_index], image_logits[update_index])
     # An earlier seed token remains in causal context after the initial report.
-    values = np.array(history.events.action)
+    values = np.array(event.action)
     values[2] = 1 + config.max_nodes + ACTION_ID["turnRight"]
-    edited = history._replace(events=history.events._replace(action=values))
+    edited = event._replace(action=values)
     edited_logits = np.asarray(predict(state, edited))
     np.testing.assert_array_equal(logits[:2], edited_logits[:2])
     assert not np.allclose(logits[update_index], edited_logits[update_index])
     # Trailing filler cannot influence any real decision.
     last = int(np.flatnonzero(rollout[0].mask.any(axis=1))[-1])
-    kinds = np.array(history.events.kind)
-    kinds[last + 1 :] = edit.UPDATE_EVENT
-    padded = history._replace(events=history.events._replace(kind=kinds))
+    kinds = np.array(event.kind)
+    kinds[last + 1 :] = edit.FEEDBACK_EVENT
+    padded = event._replace(kind=kinds)
     np.testing.assert_allclose(predict(state, padded)[: last + 1], logits[: last + 1], atol=1e-6)
 
 
 def test_action_feedback_and_finished_padding_replay_exactly(
     config: edit.Config, state: TrainState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # One member stops immediately; the other must consume execution feedback
-    # on the completing action. Finished members contribute only PAD.
+    # One member finishes a leaf edit while the other is still constructing
+    # a root replacement. Feedback pauses only that member; finished members pad.
     grammar = program_actions(("DEF", "run", "m(", "turnRight", "turnLeft", "m)"))
-    scripts = [[0], [1, *(1 + config.max_nodes + a for a in grammar), 3, 1 + config.max_nodes + ACTION_ID["putMarker"]]]
+    scripts = [
+        [3, 1 + config.max_nodes + ACTION_ID["turnRight"], 0],
+        [1, *(1 + config.max_nodes + a for a in grammar), 3, 1 + config.max_nodes + ACTION_ID["putMarker"]],
+    ]
     offsets = [0, 0]
 
     def act(logits: jax.Array, key: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -752,52 +759,55 @@ def test_action_feedback_and_finished_padding_replay_exactly(
     assert offsets == [len(script) for script in scripts]
     np.testing.assert_array_equal(batch.actions[batch.mask[:, 0], 0], scripts[0])
     np.testing.assert_array_equal(batch.actions[batch.mask[:, 1], 1], scripts[1])
-    events = batch.history.events
+    event = batch.event
     initial_update = len(program_actions(tuple(config.seed_program.split())))
-    assert not np.any(events.kind[initial_update + 1 :] == edit.UPDATE_EVENT)
     completion = initial_update + 1 + len(grammar)
-    assert events.kind[completion, 1] == edit.ACTION_EVENT
-    assert batch.mask[completion - 1, 1] and batch.mask[completion, 1]
-    # No missing decision positions between the seed report and terminal action.
+    report = completion + 1
+    assert event.kind[completion, 1] == edit.EDIT_EVENT
+    assert event.kind[report, 1] == edit.FEEDBACK_EVENT
+    assert event.kind[-1, 1] == edit.FEEDBACK_EVENT  # Terminal edit still reports execution.
+    assert batch.mask[completion - 1, 1] and not batch.mask[completion, 1]
+    assert batch.mask[report, 1]
     np.testing.assert_array_equal(
-        np.flatnonzero(batch.mask[:, 1]), np.arange(initial_update, initial_update + len(scripts[1]))
+        np.flatnonzero(batch.mask[:, 1]),
+        np.r_[np.arange(initial_update, completion), report, report + 1],
     )
-    assert events.feedback[completion, 1, -1] == pytest.approx(2 / config.max_seq_len)
-    assert events.feedback[completion, 1, -2] == pytest.approx(batch.rewards[completion - 1, 1])
-    # The image switches with the completing action and persists through partial edits.
-    current = events.grid[:, :, 2]
+    assert event.feedback[report, 1, -1] == pytest.approx(3 / config.max_seq_len)
+    assert event.feedback[report, 1, -2] == pytest.approx(batch.rewards[completion - 1, 1])
+    np.testing.assert_array_equal(event.feedback[event.kind != edit.FEEDBACK_EVENT], 0)
+    # Completing EDIT keeps the old image; FEEDBACK introduces the execution result.
+    current = event.grid[:, :, 2]
     np.testing.assert_array_equal(
-        events.grid[:, :, :2], np.broadcast_to(events.grid[0, :, :2], events.grid[:, :, :2].shape)
+        event.grid[:, :, :2], np.broadcast_to(event.grid[0, :, :2], event.grid[:, :, :2].shape)
     )
+    np.testing.assert_array_equal(current[:report, 1], np.broadcast_to(current[0, 1], current[:report, 1].shape))
     np.testing.assert_array_equal(
-        current[:completion, 1],
-        np.broadcast_to(current[0, 1], current[:completion, 1].shape),
+        current[report:-1, 1], np.broadcast_to(current[report, 1], current[report:-1, 1].shape)
     )
-    last_decision = int(np.flatnonzero(batch.mask[:, 1])[-1])
-    np.testing.assert_array_equal(
-        current[completion:last_decision, 1],
-        np.broadcast_to(current[completion, 1], current[completion:last_decision, 1].shape),
-    )
-    assert not np.array_equal(current[completion, 1], current[0, 1])
-    np.testing.assert_array_equal(current[:, 0], np.broadcast_to(current[0, 0], current[:, 0].shape))
-    assert np.all(events.kind[initial_update + 2 :, 0] == PAD_EVENT)
-    logits = predict(state, batch.history)
+    assert not np.array_equal(current[report, 1], current[0, 1])
+    first_report = initial_update + 3
+    assert event.kind[first_report, 0] == edit.FEEDBACK_EVENT
+    assert not batch.mask[first_report - 1, 0] and batch.mask[first_report - 1, 1]
+    assert np.all(event.kind[first_report + 2 :, 0] == PAD_EVENT)
+    # Each example has one initial report plus one report per completed edit.
+    np.testing.assert_array_equal((event.kind == edit.FEEDBACK_EVENT).sum(axis=0), [2, 3])
+    logits = predict(state, batch.event)
     replay = edit.action_log_prob(edit.mask_logits(logits, batch.legal), batch.actions)
     np.testing.assert_allclose(replay, batch.old_log_probs, atol=2e-6)
     # An earlier action remains visible after a subsequent execution update.
-    values = np.array(events.action)
+    values = np.array(event.action)
     action_index = initial_update + 3  # First grammar action after location selection.
     values[action_index, 1] = 1 + config.max_nodes + ACTION_ID["turnLeft"]
-    changed = batch.history._replace(events=events._replace(action=values))
+    changed = event._replace(action=values)
     changed_logits = predict(state, changed)
     np.testing.assert_array_equal(changed_logits[:action_index], logits[:action_index])
     assert not np.allclose(changed_logits[completion, 1], logits[completion, 1])
-    feedback = np.array(events.feedback)
-    feedback[completion, 1, 0] += 10
-    changed = batch.history._replace(events=events._replace(feedback=feedback))
+    feedback = np.array(event.feedback)
+    feedback[report, 1, 0] += 10
+    changed = event._replace(feedback=feedback)
     feedback_logits = predict(state, changed)
-    np.testing.assert_array_equal(feedback_logits[:completion], logits[:completion])
-    assert not np.allclose(feedback_logits[completion, 1], logits[completion, 1])
+    np.testing.assert_array_equal(feedback_logits[:report], logits[:report])
+    assert not np.allclose(feedback_logits[report, 1], logits[report, 1])
 
 
 def test_sequence_budget_reserves_complete_replacements(config: edit.Config) -> None:
@@ -805,28 +815,30 @@ def test_sequence_budget_reserves_complete_replacements(config: edit.Config) -> 
     pair = task.reset(seed=42)
     tree = editing.seed_tree(config.edit_config)
     result = editing.evaluate(tree, task, KarelProgramEnv(config.env), pair.initial)
-    only_stop = editing.observe(tree, pair, result, 1, config).legal
+    only_stop = editing.observe(tree, pair, result, 1, config).action_mask
     assert np.flatnonzero(only_stop).tolist() == [0]
-    two_tokens = editing.observe(tree, pair, result, 2, config).legal
-    assert two_tokens[3]  # Select the primitive statement, then replace it with a leaf.
-    assert not two_tokens[1]  # Replacing Program needs more than one grammar action.
-    assert editing.observe(tree, pair, result, 5, config).legal[1]  # Location + four-node completion.
+    two_tokens = editing.observe(tree, pair, result, 2, config).action_mask
+    assert np.flatnonzero(two_tokens).tolist() == [0]  # No space for the feedback report.
+    three_tokens = editing.observe(tree, pair, result, 3, config).action_mask
+    assert three_tokens[3]  # Select the primitive statement, then replace it with a leaf.
+    assert not three_tokens[1]  # Replacing Program needs more than one grammar action.
+    assert editing.observe(tree, pair, result, 6, config).action_mask[1]  # Location + four-node completion + feedback.
 
     # Root replacement has two sibling holes after Program/ConsNonEmpty. Both
-    # need a reserved action each; feedback costs no extra token.
+    # need a reserved action each, plus the feedback report.
     partial = editing.open_subtree(tree, 0).expand(ACTION_ID["Program"]).expand(ACTION_ID["ConsNonEmpty"])
-    legal = editing.observe(partial, pair, result, 2, config).legal
+    legal = editing.observe(partial, pair, result, 3, config).action_mask
     offset = 1 + config.max_nodes
     assert legal[offset + ACTION_ID["move"]]
     assert not legal[offset + ACTION_ID["REPEAT"]]
     partial = partial.expand(ACTION_ID["turnRight"])
-    legal = editing.observe(partial, pair, result, 1, config).legal
+    legal = editing.observe(partial, pair, result, 2, config).action_mask
     assert np.flatnonzero(legal).tolist() == [offset + ACTION_ID["End"]]
     assert partial.expand(ACTION_ID["End"]).complete
 
 
 def test_disabled_stop_keeps_editing_despite_stop_biased_policy(config: edit.Config, state: TrainState) -> None:
-    # Four location+leaf edits leave one token, too little for another edit.
+    # Three location+leaf+feedback edits leave two tokens, too little for another edit.
     config = replace(config, allow_stop=False)
     replacement = 1 + config.max_nodes + ACTION_ID["turnRight"]
     bias = state.params["head"]["bias"].at[0].set(200).at[3].set(100).at[replacement].set(100)
@@ -838,9 +850,9 @@ def test_disabled_stop_keeps_editing_despite_stop_biased_policy(config: edit.Con
         jax.random.key(7),
         config,
     )
-    assert metrics["charts/edits_mean"] == 4
-    np.testing.assert_array_equal(batch.mask.sum(axis=0), 8)
-    assert metrics["charts/sequence_length_mean"] == config.max_seq_len - 1
+    assert metrics["charts/edits_mean"] == 3
+    np.testing.assert_array_equal(batch.mask.sum(axis=0), 6)
+    assert metrics["charts/sequence_length_mean"] == config.max_seq_len - 2
     assert metrics["charts/sequence_budget_exhausted_rate"] == 1
     assert not batch.legal[..., 0][batch.mask].any()
     assert np.all(batch.actions[batch.mask] != 0)
@@ -848,8 +860,8 @@ def test_disabled_stop_keeps_editing_despite_stop_biased_policy(config: edit.Con
     for index in range(2):
         assert batch.actions[batch.mask[:, index], index][-1] == 1 + config.max_nodes + ACTION_ID["turnRight"]
     np.testing.assert_array_equal(batch.advantages, 0)  # Identical episode returns in this group.
-    assert batch.history.events.kind.shape[0] <= config.max_seq_len
-    replay = edit.action_log_prob(edit.mask_logits(predict(state, batch.history), batch.legal), batch.actions)
+    assert batch.event.kind.shape[0] <= config.max_seq_len
+    replay = edit.action_log_prob(edit.mask_logits(predict(state, batch.event), batch.legal), batch.actions)
     np.testing.assert_allclose(replay, batch.old_log_probs, atol=2e-6)
 
 

@@ -30,7 +30,7 @@ def config() -> ppo.Config:
         num_heads=2,
         max_nodes=8,
         max_depth=4,
-        max_seq_len=9,
+        max_seq_len=11,
         target_kl=None,
         entropy_coef=0.01,
         log_interval=1,
@@ -80,11 +80,13 @@ def test_cached_rollout_replays_values_and_updates_both_heads(
     config: ppo.Config, state: TrainState, rollout: ppo.Rollout
 ) -> None:
     batch = rollout.batch
-    _, logits, values = state.apply_fn({"params": state.params}, batch.history)
+    _, logits, values = state.apply_fn({"params": state.params}, batch.event)
     replay = ppo.edit.action_log_prob(ppo.mask_logits(logits, batch.legal), batch.actions)
     np.testing.assert_allclose(replay, batch.old_log_probs, atol=2e-6)
     np.testing.assert_allclose(np.asarray(values)[batch.mask], batch.values[batch.mask], atol=2e-6)
     np.testing.assert_array_equal(batch.mask.sum(axis=0), [1, 4])
+    # STOP emits no feedback; each completed edit does, including terminal edits.
+    np.testing.assert_array_equal((batch.event.kind == ppo.FEEDBACK_EVENT).sum(axis=0), [1, 3])
     assert batch.actions[config.edit_config.prefill_length - 1, 0] == 0
     assert rollout.diagnostics["charts/sequence_budget_exhausted_rate"] == 0.5
     np.testing.assert_array_equal(batch.returns[~batch.mask], 0)
@@ -107,8 +109,8 @@ def test_cached_rollout_replays_values_and_updates_both_heads(
     selected = ppo.select_episodes(batch, np.array([1, 0], np.int64))
     for original, reordered in zip(batch[1:], selected[1:], strict=True):
         np.testing.assert_array_equal(reordered, original[:, [1, 0]])
-    np.testing.assert_array_equal(selected.history.events.feedback, batch.history.events.feedback[:, [1, 0]])
-    np.testing.assert_array_equal(selected.history.events.grid, batch.history.events.grid[:, [1, 0]])
+    np.testing.assert_array_equal(selected.event.feedback, batch.event.feedback[:, [1, 0]])
+    np.testing.assert_array_equal(selected.event.grid, batch.event.grid[:, [1, 0]])
 
 
 def test_gae_discounts_decisions_and_stops_at_episode_boundaries() -> None:
@@ -120,6 +122,14 @@ def test_gae_discounts_decisions_and_stops_at_episode_boundaries() -> None:
     advantages, returns = ppo.gae(rewards, values, mask, 0.5, 0.5)
     np.testing.assert_allclose(advantages, [[0, 0], [0.4375, 3], [0.75, 0], [-3, 0], [0, 0]])
     np.testing.assert_allclose(returns, [[0, 0], [0.9375, 4], [2.25, 0], [-1, 0], [0, 0]])
+    spaced_mask = np.insert(mask, 2, False, axis=0)
+    spaced_rewards = np.insert(rewards, 2, np.nan, axis=0)
+    spaced_values = np.insert(values, 2, np.nan, axis=0)
+    spaced_advantages, spaced_returns = ppo.gae(spaced_rewards, spaced_values, spaced_mask, 0.5, 0.5)
+    np.testing.assert_allclose(np.delete(spaced_advantages, 2, axis=0), advantages)
+    np.testing.assert_allclose(np.delete(spaced_returns, 2, axis=0), returns)
+    np.testing.assert_array_equal(spaced_advantages[2], 0)
+    np.testing.assert_array_equal(spaced_returns[2], 0)
     # Undiscounted lambda=1 recovers exact return-to-go, not one episode-wide advantage.
     _, returns = ppo.gae(rewards, values, mask, 1.0, 1.0)
     np.testing.assert_allclose(returns, [[0, 0], [1, 4], [1, 0], [-1, 0], [0, 0]])
@@ -132,7 +142,7 @@ def test_gae_discounts_decisions_and_stops_at_episode_boundaries() -> None:
 def synthetic(config: ppo.Config) -> tuple[TrainState, ppo.EditBatch]:
     shape = (3, 2)
     vocab = 1 + config.max_nodes + len(ppo.AST_ACTIONS)
-    events = ppo.empty_events(*shape, config)
+    event = ppo.empty_event(*shape, config)
     legal = np.zeros((*shape, vocab), bool)
     legal[..., 0] = True
     legal[:2, :, 1] = True
@@ -141,7 +151,7 @@ def synthetic(config: ppo.Config) -> tuple[TrainState, ppo.EditBatch]:
     logits = np.zeros((*shape, vocab), np.float32)
     logits[..., 0], logits[..., 1] = np.log(probabilities), np.log(1 - probabilities)
     batch = ppo.EditBatch(
-        ppo.History(events),
+        event,
         np.zeros(shape, np.int32),
         np.full(shape, np.log(0.5), np.float32),
         legal,
@@ -152,8 +162,8 @@ def synthetic(config: ppo.Config) -> tuple[TrainState, ppo.EditBatch]:
         np.zeros(shape, np.float32),
     )
 
-    def apply(variables: dict[str, optax.Params], history: ppo.History) -> tuple[None, jax.Array, jax.Array]:
-        ppo.check_history(history)
+    def apply(variables: dict[str, optax.Params], event: ppo.Event) -> tuple[None, jax.Array, jax.Array]:
+        ppo.check_event(event)
         return None, variables["params"]["logits"], variables["params"]["values"]
 
     state = TrainState.create(
