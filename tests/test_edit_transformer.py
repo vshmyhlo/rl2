@@ -45,6 +45,12 @@ def initialize(model: EditTransformer, event: Event) -> Variables:
 def test_padding_prefill_and_cached_steps(event: Event) -> None:
     model = EditTransformer(d_model=8, num_layers=1, num_heads=2, max_nodes=2, max_seq_len=3)
     variables = initialize(model, event)
+    encode = jax.jit(partial(model.apply, method=model.encode_event))
+    # One batch covers EDIT, FEEDBACK, and PAD through both encoder input layouts.
+    rows = jnp.array([0, 1, 2])
+    columns = jnp.array([1, 0, 2])
+    batched_event = jax.tree.map(itemgetter((rows, columns)), event)
+    np.testing.assert_allclose(encode(variables, batched_event), encode(variables, event)[rows, columns], atol=1e-6)
     full_carry, *full_outputs = jax.jit(model.apply)(variables, event)
     np.testing.assert_array_equal(full_carry[0].position, [3, 1, 0])
     padding = np.asarray(event.kind == PAD_EVENT)
@@ -76,15 +82,26 @@ def test_padding_prefill_and_cached_steps(event: Event) -> None:
         np.testing.assert_array_equal(output, 0)
 
 
+def test_action_is_consumed_for_edit_and_feedback(event: Event) -> None:
+    model = EditTransformer(d_model=8, num_layers=1, num_heads=2, max_nodes=2, max_seq_len=3)
+    variables = initialize(model, event)
+    encode = jax.jit(partial(model.apply, method=model.encode_event))
+    original = np.asarray(encode(variables, event))
+    changed = np.asarray(encode(variables, event._replace(action=event.action + 1)))
+    for kind in (EDIT_EVENT, FEEDBACK_EVENT):
+        assert np.all(np.any(changed[event.kind == kind] != original[event.kind == kind], axis=-1))
+    np.testing.assert_array_equal(changed[event.kind == PAD_EVENT], 0)
+
+
 def test_unused_event_fields_do_not_contaminate_gradients(event: Event) -> None:
     model = EditTransformer(d_model=8, num_layers=1, num_heads=2, max_nodes=2, max_seq_len=3)
     variables = initialize(model, event)
-    has_token = event.kind == EDIT_EVENT
+    has_token = event.kind != PAD_EVENT
     has_feedback = event.kind == FEEDBACK_EVENT
     dirty = event._replace(
         action=jnp.where(has_token, event.action, 10000),
         feedback=jnp.where(has_feedback[..., None], event.feedback, jnp.nan),
-        grid=jnp.where((event.kind != PAD_EVENT)[..., None, None, None, None], event.grid, 10000),
+        grid=jnp.where(has_feedback[..., None, None, None, None], event.grid, 10000),
     )
 
     def loss(params: Variables, event: Event) -> jax.Array:
@@ -100,6 +117,13 @@ def test_unused_event_fields_do_not_contaminate_gradients(event: Event) -> None:
     for actual, expected in zip(jax.tree.leaves(actual_grad), jax.tree.leaves(expected_grad), strict=True):
         assert np.all(np.isfinite(actual))
         np.testing.assert_allclose(actual, expected, atol=1e-6)
+
+    # Without a FEEDBACK event, neither encoder should contribute, even through biases.
+    edits = event._replace(kind=jnp.where(has_feedback, EDIT_EVENT, event.kind))
+    _, edit_grad = evaluate(variables["params"], edits)
+    for name in ("grid_conv", "context_projection", "context_norm", "feedback_projection", "feedback_norm"):
+        for grad in jax.tree.leaves(edit_grad[name]):
+            np.testing.assert_array_equal(grad, 0)
 
 
 @pytest.mark.parametrize("invalid", ["image_count", "channels", "dtype"])

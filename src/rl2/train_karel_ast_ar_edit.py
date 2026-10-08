@@ -2,12 +2,13 @@
 
 The policy consumes a causal sequence with a persistent KV cache:
     EDIT(seed DFS tokens) -> FEEDBACK -> EDIT(location) -> EDIT(grammar)... -> FEEDBACK -> ... -> EDIT(STOP)
-Every token, including seed prefill, receives the original input,
-target, and current execution image. These 18 channels pass through a shared
-32-channel 1x1 convolution, GELU, flattening, and projection. This image embedding
-is added to each event embedding. The current image starts at the seed's final
-or last-valid output. A completing EDIT retains the previous execution image;
-the following FEEDBACK introduces the new image and eight scalars: score, success, runtime error, execution limit,
+Every EDIT and FEEDBACK event receives the previous action token. A FEEDBACK
+event repeats the action that completed the program, including the final seed token.
+Only FEEDBACK receives the original input, target, and current execution image.
+These 18 channels pass through a shared 32-channel 1x1 convolution, GELU,
+flattening, and projection. The image embedding is added only to FEEDBACK events.
+The current image starts at the seed's final or last-valid output.
+Each FEEDBACK introduces the new image and eight scalars: score, success, runtime error, execution limit,
 normalized ticks, source length, last score difference, and remaining sequence budget.
 KarelASTEditEnv owns AST edits, masks, execution, rewards, and termination. The
 policy infers the current program from its seed and edit history.
@@ -16,7 +17,7 @@ budget cannot fit another complete replacement.
 
 Reward timing and example trajectories
 --------------------------------------
-Execute the seed before the first action, with no reward. Execute again only
+Execute the fixed turnLeft program before the first action, with no reward. Execute again only
 after all holes in a replacement are filled, always from the original task input.
 A completed replacement receives r = score(new program) - score(previous program).
 Scores subtract weighted AST depth / max_depth, AST node count / max_nodes,
@@ -102,11 +103,14 @@ from rl2.karel import (
     KarelConfig,
     KarelProgramEnv,
 )
-from rl2.karel_ast import AST_ACTIONS, KarelAST, program_actions
+from rl2.karel_ast import AST_ACTIONS, KarelAST
 from rl2.karel_ast_edit import (
     EDIT_REWARD_COMPONENTS,
     FEEDBACK_SIZE,
+    INITIAL_ACTIONS,
+    INITIAL_PROGRAM,
     EditConfig,
+    EditStep,
     Evaluation,
     ExecutedObservation,
     Observation,
@@ -134,10 +138,9 @@ class Config:
 
     # Task environment and program editing.
     env: KarelConfig = field(default_factory=KarelConfig)
-    seed_program: str = "DEF run m( turnLeft m)"
     max_nodes: int = 128  # AST node budget for grammar masking; also sizes edit locations.
     max_depth: int = 64  # AST depth limit for grammar masking and penalty normalization.
-    max_seq_len: int = 256  # Total initial program tokens, edit actions, and execution feedback reports per episode.
+    max_seq_len: int = 256  # Total prefill tokens, edit actions, and execution feedback reports per episode.
     allow_stop: bool = True  # False keeps editing until no complete edit fits the sequence budget.
 
     # Rollout groups and update batching.
@@ -174,7 +177,7 @@ class Config:
     log_compiles: bool = False  # Print named dimensions (b=batch, t=time) on new prediction/update JIT traces.
 
     def __post_init__(self) -> None:
-        """Validate training settings, backend compatibility, and seed-program budgets."""
+        """Validate training settings, backend compatibility, and initial program completion budgets."""
         if self.run_id is not None:
             if not isinstance(self.run_id, str):
                 raise TypeError("run_id must be a string or null")
@@ -237,9 +240,7 @@ class Config:
     @property
     def edit_config(self) -> EditConfig:
         """Build the independent editing environment's validated settings."""
-        return EditConfig(
-            self.env, self.max_nodes, self.max_depth, self.max_seq_len, self.seed_program, allow_stop=self.allow_stop
-        )
+        return EditConfig(self.env, self.max_nodes, self.max_depth, self.max_seq_len, allow_stop=self.allow_stop)
 
 
 def empty_event(time: int, batch: int, config: Config) -> Event:
@@ -255,16 +256,28 @@ def empty_event(time: int, batch: int, config: Config) -> Event:
 
 
 def initial_event(observations: list[ExecutedObservation], config: Config) -> Event:
-    """Assemble task grids, seed grammar tokens, and the seed's execution feedback."""
+    """Prefill the fixed turnLeft program, then its execution feedback."""
     if not observations:
         raise ValueError("Cannot initialize an empty history")
-    seed = program_actions(tuple(config.seed_program.split()))
-    event = empty_event(len(seed) + 1, len(observations), config)
+    event = empty_event(len(INITIAL_ACTIONS) + 1, len(observations), config)
     event.kind[:-1] = EDIT_EVENT
-    event.action[:-1] = (1 + config.max_nodes + np.asarray(seed, np.int32))[:, None]
+    event.action[:-1] = (1 + config.max_nodes + np.asarray(INITIAL_ACTIONS, np.int32))[:, None]
     event.kind[-1] = FEEDBACK_EVENT
-    event.grid[:] = np.stack([np.stack((o.initial, o.target, o.output)) for o in observations])
+    event.action[-1] = event.action[-2]
+    event.grid[-1] = np.stack([np.stack((o.initial, o.target, o.output)) for o in observations])
     event.feedback[-1] = np.stack([observation.feedback for observation in observations])
+    sc = ShapeChecker(
+        T=len(INITIAL_ACTIONS) + 1,
+        B=len(observations),
+        I=3,
+        H=config.env.height,
+        W=config.env.width,
+        C=6,
+        F=FEEDBACK_SIZE,
+    )
+    sc.check((event.kind, event.action), "TB", np.int32)
+    sc.check(event.grid, "TBIHWC", np.int32)
+    sc.check(event.feedback, "TBF", np.float32)
     return event
 
 
@@ -330,8 +343,6 @@ def create_state(config: Config, initial: Array, target: Array) -> TrainState:
         attention_implementation=config.attention_implementation,
     )
     event = empty_event(1, initial.shape[0], config)
-    event.kind[:] = FEEDBACK_EVENT
-    event = event._replace(grid=jnp.stack((initial, target, jnp.zeros_like(initial)), axis=1)[None])
     params = model.init(jax.random.key(config.seed), event)["params"]
 
     def optimizer(learning_rate: float | jax.Array) -> optax.GradientTransformation:
@@ -390,6 +401,84 @@ type EpisodeResults = tuple[
 ]
 
 
+def _empty_edit_batch(count: int, config: Config) -> EditBatch:
+    """Allocate replay buffers with dummy STOP masks on non-decision rows."""
+    shape = (config.max_seq_len, count)
+    legal = np.zeros((*shape, 1 + config.max_nodes + len(AST_ACTIONS)), np.bool_)
+    legal[..., 0] = True
+    return EditBatch(
+        empty_event(config.max_seq_len, count, config),
+        np.zeros(shape, np.int32),
+        np.zeros(shape, np.float32),
+        legal,
+        np.zeros(shape, np.bool_),
+        np.zeros(shape, np.float32),
+        np.zeros(count, np.float32),
+    )
+
+
+class _EpisodeState:
+    """Track which episodes need an edit, execution feedback, or trailing padding."""
+
+    def __init__(self, executions: list[ExecutedObservation], config: Config) -> None:
+        self.config = config
+        self.executions = executions
+        self.observations: list[Observation] = list(executions)
+        self.active = np.ones(len(executions), np.bool_)
+        self.pending_feedback = np.zeros(len(executions), np.bool_)
+        self.last_actions = np.full(len(executions), 1 + config.max_nodes + INITIAL_ACTIONS[-1], np.int32)
+
+    @property
+    def ready(self) -> NDArray[np.bool_]:
+        return self.active & ~self.pending_feedback
+
+    @property
+    def done(self) -> bool:
+        return not self.active.any() and not self.pending_feedback.any()
+
+    def grids(self) -> NDArray[np.int32]:
+        grids = np.stack([np.stack((o.initial, o.target, o.output)) for o in self.executions])
+        sc = ShapeChecker(B=len(self.executions), I=3, H=self.config.env.height, W=self.config.env.width, C=6)
+        sc.check(grids, "BIHWC", dtype=np.int32)
+        return grids
+
+    def advance(
+        self, actions: NDArray[np.int32], transitions: list[EditStep | None]
+    ) -> tuple[Event, NDArray[np.float32]]:
+        """Emit actions on both kinds, with execution images and scalars only on feedback."""
+        count = len(self.executions)
+        sc = ShapeChecker(B=count, I=3, H=self.config.env.height, W=self.config.env.width, C=6, F=FEEDBACK_SIZE)
+        sc.check(actions, "B", dtype=np.int32)
+        chex.assert_equal(len(transitions), count)
+        event = jax.tree.map(itemgetter(0), empty_event(1, count, self.config))
+        if self.pending_feedback.any():
+            event.grid[self.pending_feedback] = self.grids()[self.pending_feedback]
+        rewards = np.zeros(count, np.float32)
+        for index in np.flatnonzero(self.pending_feedback):
+            event.kind[index] = FEEDBACK_EVENT
+            event.action[index] = self.last_actions[index]
+            event.feedback[index] = self.executions[index].feedback
+        self.pending_feedback[:] = False
+        for index, transition in enumerate(transitions):
+            if transition is None:
+                continue
+            event.kind[index] = EDIT_EVENT
+            event.action[index] = actions[index]
+            self.last_actions[index] = actions[index]
+            rewards[index] = transition.reward
+            self.observations[index] = transition.observation
+            if isinstance(transition.observation, ExecutedObservation):
+                self.executions[index] = transition.observation
+                # Budget exhaustion still emits feedback; STOP does not.
+                self.pending_feedback[index] = not transition.terminated
+            self.active[index] = not (transition.terminated or transition.truncated)
+        sc.check([event.kind, event.action], "B", dtype=np.int32)
+        sc.check(event.feedback, "BF", dtype=np.float32)
+        sc.check(event.grid, "BIHWC", dtype=np.int32)
+        sc.check(rewards, "B", dtype=np.float32)
+        return event, rewards
+
+
 def run_episodes(
     state: TrainState,
     tasks: list[KarelProgramEnv],
@@ -397,84 +486,60 @@ def run_episodes(
     key: jax.Array,
     config: Config,
 ) -> EpisodeResults:
-    """Interleave policy EDIT tokens and forced FEEDBACK after completed replacements.
+    """Sample edits, advance episode event streams, and record policy replay targets.
 
-    Each active member consumes one event per iteration. Members awaiting
-    feedback pause policy sampling, keeping histories contiguous up to final PAD.
-    Rewards and policy targets stay on the row that predicted the edit action.
+    Feedback pauses sampling for its episode. Each event is stored one row after
+    the policy targets and rewards of the decision that produced it.
     """
     count = len(tasks)
     if not count or envs.num_envs != count or envs.config != config.edit_config:
         raise ValueError("Expected matching nonempty tasks and editing environments")
-    executions = envs.reset(tasks)
-    observations: list[Observation] = list(executions)
-    seed_scores = np.asarray([observation.feedback[0] for observation in executions], np.float32)
-    event = initial_event(executions, config)
+    sc = ShapeChecker(B=count, V=1 + config.max_nodes + len(AST_ACTIONS))
+    sc.check(key, "")
+    episodes = _EpisodeState(envs.reset(tasks), config)
+    seed_scores = np.asarray([observation.feedback[0] for observation in episodes.executions], np.float32)
+    event = initial_event(episodes.executions, config)
     carry, logits = prefill(state, event, log_compiles=config.log_compiles)
-    position = event.kind.shape[0] - 1
-    stored = empty_event(config.max_seq_len, count, config)
-    for destination, prefix in zip(stored, event):
-        destination[: position + 1] = prefix
-    shape = (config.max_seq_len, count)
-    actions = np.zeros(shape, np.int32)
-    old_log_probs = np.zeros(shape, np.float32)
-    mask = np.zeros(shape, np.bool_)
-    rewards = np.zeros(shape, np.float32)
-    legal = np.zeros((*shape, 1 + config.max_nodes + len(AST_ACTIONS)), np.bool_)
-    legal[..., 0] = True
-    active = np.ones(count, np.bool_)
-    pending_feedback = np.zeros(count, np.bool_)
-    for _ in range(config.max_seq_len - position - 1):
-        ready = active & ~pending_feedback
+    length = event.kind.shape[0]
+    batch = _empty_edit_batch(count, config)
+    for destination, prefix in zip(batch.event, event):
+        destination[:length] = prefix
+
+    for position in range(length - 1, config.max_seq_len - 1):
+        ready = episodes.ready
         for index in np.flatnonzero(ready):
-            legal[position, index] = observations[index].action_mask
+            batch.legal[position, index] = episodes.observations[index].action_mask
+        sc.check(logits, "BV", dtype=np.float32)
         if ready.any():
             key, sample_key = jax.random.split(key)
-            sampled, log_probs = jax.device_get(act(mask_logits(logits, legal[position]), sample_key))
-        else:
-            sampled, log_probs = np.zeros(count, np.int32), np.zeros(count, np.float32)
-        actions[position] = np.where(ready, sampled, 0)
-        old_log_probs[position] = np.where(ready, log_probs, 0)
-        mask[position] = ready
-        transitions = envs.step(sampled, ready)
-        event = jax.tree.map(itemgetter(0), empty_event(1, count, config))
-        event.grid[:] = np.stack([np.stack((o.initial, o.target, o.output)) for o in executions])
-        for index in np.flatnonzero(pending_feedback):
-            event.kind[index] = FEEDBACK_EVENT
-            event.feedback[index] = executions[index].feedback
-        pending_feedback[:] = False
-        for index in np.flatnonzero(ready):
-            event.kind[index] = EDIT_EVENT
-            event.action[index] = sampled[index]
-            transition = transitions[index]
-            assert transition is not None
-            rewards[position, index] = transition.reward
-            observations[index] = transition.observation
-            if isinstance(transition.observation, ExecutedObservation):
-                executions[index] = transition.observation
-                pending_feedback[index] = not transition.terminated
-            active[index] = not (transition.terminated or transition.truncated)
-        for destination, value in zip(stored, event):
+            sampled, log_probs = jax.device_get(act(mask_logits(logits, batch.legal[position]), sample_key))
+            sc.check(sampled, "B", dtype=np.int32)
+            sc.check(log_probs, "B", dtype=np.float32)
+            batch.actions[position] = np.where(ready, sampled, 0)
+            batch.old_log_probs[position] = np.where(ready, log_probs, 0)
+        batch.mask[position] = ready
+
+        transitions = envs.step(batch.actions[position], ready)
+        event, batch.rewards[position] = episodes.advance(batch.actions[position], transitions)
+        for destination, value in zip(batch.event, event):
             destination[position + 1] = value
-        position += 1
-        if not active.any() and not pending_feedback.any():
+        length = position + 2
+        if episodes.done:
             break
         carry, logits = decode_step(state, event, carry, log_compiles=config.log_compiles)
+
     summaries = envs.summaries()
-    if active.any() or pending_feedback.any() or not all(summary.tree.complete for summary in summaries):
+    if not episodes.done or not all(summary.tree.complete for summary in summaries):
         raise RuntimeError("Editing exhausted its bounded history with unfinished episodes")
     # Bucketing only adds trailing padding, which cannot affect earlier causal logits.
-    length = min(config.max_seq_len, ((position + 1 + 31) // 32) * 32)
-    stored.grid[position + 1 :] = np.stack([np.stack((o.initial, o.target, o.output)) for o in executions])
-    event = jax.tree.map(itemgetter(slice(length)), stored)
-    batch = EditBatch(
-        event,
-        actions[:length],
-        old_log_probs[:length],
-        legal[:length],
-        mask[:length],
-        rewards[:length],
-        np.zeros(count, np.float32),
+    length = min(config.max_seq_len, ((length + 31) // 32) * 32)
+    batch = batch._replace(
+        event=jax.tree.map(itemgetter(slice(length)), batch.event),
+        actions=batch.actions[:length],
+        old_log_probs=batch.old_log_probs[:length],
+        legal=batch.legal[:length],
+        mask=batch.mask[:length],
+        rewards=batch.rewards[:length],
     )
     results = [summary.result for summary in summaries]
     completed_edits = np.asarray([summary.completed_edits for summary in summaries], np.int32)
@@ -679,12 +744,12 @@ def select_episodes(batch: EditBatch, indices: NDArray[np.int64]) -> EditBatch:
 
 
 def format_group_programs(programs: tuple[KarelAST, ...], rewards: Array, *, config: Config, group_index: int) -> str:
-    """Format the seed and sampled final programs from one task group for TensorBoard."""
+    """Format the initial and sampled final programs from one task group for TensorBoard."""
     chex.assert_shape(rewards, (len(programs),))
     chex.assert_type(rewards, np.float32)
     chex.assert_scalar_in(group_index, 0, config.num_tasks - 1)
     start = group_index * config.group_size
-    samples = [f"Seed program:\n```text\n{config.seed_program}\n```"]
+    samples = [f"Initial program:\n```text\n{' '.join(INITIAL_PROGRAM)}\n```"]
     for index in range(start, start + min(config.log_program_count, config.group_size)):
         samples.append(
             f"Sample {index - start}: reward={float(rewards[index]):.4f}\n\n```text\n{programs[index].source()}\n```"
@@ -693,11 +758,10 @@ def format_group_programs(programs: tuple[KarelAST, ...], rewards: Array, *, con
 
 
 def generate(state: TrainState, task: KarelProgramEnv, key: jax.Array, config: Config) -> KarelAST:
-    """Edit seed_program for a freshly reset task, leaving that task untouched.
+    """Build and edit a program for a freshly reset task, leaving that task untouched.
 
     Use load_model() to restore an editing policy, reset a matching environment,
-    then call generate(). To optimize a supplied program, set seed_program to
-    its source using dataclasses.replace(config, seed_program=source).
+    then call generate(). Every episode starts from the fixed turnLeft program and its execution feedback.
     Returns the final candidate, which need not be successful or the best visited.
     """
     chex.assert_shape(key, ())
@@ -758,7 +822,7 @@ def train(config: Config) -> TrainState:
     checkpoint = read_optional(f"{run_dir}/checkpoint.msgpack")
     progress = TrainingProgress(state, key, 0, 0, 0, 0)
     if checkpoint is not None:
-        check_resume_config(config, load_config(f"{run_dir}/config.yaml"))
+        # check_resume_config(config, load_config(f"{run_dir}/config.yaml"))
         progress = _restore_checkpoint(checkpoint, state, rng)
         print(f"Resuming {run_dir} at rollout {progress.iteration}, step {progress.steps}", flush=True)
     else:

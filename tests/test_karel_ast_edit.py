@@ -13,7 +13,6 @@ from rl2.karel_ast import ACTION_ID, program_actions
 @pytest.fixture
 def config() -> editing.EditConfig:
     return editing.EditConfig(
-        seed_program="DEF run m( turnLeft m)",
         max_nodes=8,
         max_depth=4,
         max_seq_len=12,
@@ -51,6 +50,14 @@ def turning_task(config: editing.EditConfig) -> KarelProgramEnv:
     return task
 
 
+def fill_program(env: editing.KarelASTEditEnv, source: str = "DEF run m( turnLeft m)") -> editing.EditStep:
+    """Replace the entire program with a deterministic candidate."""
+    env.step(1)
+    for action in program_actions(tuple(source.split())):
+        transition = env.step(1 + env.config.max_nodes + action)
+    return transition
+
+
 def test_improvement_regression_and_stop(config: editing.EditConfig, monkeypatch: pytest.MonkeyPatch) -> None:
     env = editing.KarelASTEditEnv(config)
     evaluate = MagicMock(wraps=editing.evaluate)
@@ -59,7 +66,7 @@ def test_improvement_regression_and_stop(config: editing.EditConfig, monkeypatch
     assert initial.kind == "executed"
     assert initial.feedback[-2] == 0 and evaluate.call_count == 1
     assert env.remaining == 7  # Four initial EDIT tokens and one FEEDBACK consumed.
-    seed_score = env.seed_score
+    initial_score = env.result.score
     first = env.step(3)  # Select the primitive statement.
     assert first.reward == 0 and first.observation.kind == "editing"
     assert isinstance(first.observation, editing.EditingObservation)
@@ -68,7 +75,7 @@ def test_improvement_regression_and_stop(config: editing.EditConfig, monkeypatch
     improved = env.step(1 + config.max_nodes + ACTION_ID["turnRight"])
     assert improved.observation.kind == "executed" and improved.reward > 0
     assert isinstance(improved.observation, editing.ExecutedObservation)
-    assert improved.reward == pytest.approx(env.result.score - seed_score)
+    assert improved.reward == pytest.approx(env.result.score - initial_score)
     assert improved.observation.feedback[-2] == pytest.approx(improved.reward)
     assert env.result.success and not env.done  # Success permits further edits.
     assert evaluate.call_count == 2
@@ -85,7 +92,7 @@ def test_improvement_regression_and_stop(config: editing.EditConfig, monkeypatch
     assert stopped.observation.feedback[-2] == pytest.approx(regressed.reward)
     assert stopped.observation.feedback[-1] == 0
     np.testing.assert_array_equal(stopped.observation.output, initial.output)
-    assert improved.reward + regressed.reward == pytest.approx(env.result.score - seed_score)
+    assert improved.reward + regressed.reward == pytest.approx(env.result.score - initial_score)
     assert env.completed_edits == 2 and env.tree.complete
     with pytest.raises(gym.error.ResetNeeded):
         env.step(0)
@@ -94,57 +101,11 @@ def test_improvement_regression_and_stop(config: editing.EditConfig, monkeypatch
     assert reset.kind == "executed" and reset.feedback[-2] == 0
 
 
-def test_root_hole_builds_before_editing(config: editing.EditConfig, monkeypatch: pytest.MonkeyPatch) -> None:
-    config = replace(config, seed_program=None, max_seq_len=10)
-    env = editing.KarelASTEditEnv(config)
-    evaluate = MagicMock(wraps=editing.evaluate)
-    monkeypatch.setattr(editing, "evaluate", evaluate)
-    initial = env.reset(task=turning_task(config))
-    assert initial.kind == "editing" and env.result is None and env.seed_score == 0
-    assert config.prefill_length == 1 and env.remaining == 9
-    offset = 1 + config.max_nodes
-    assert np.flatnonzero(initial.action_mask).tolist() == [offset + ACTION_ID["Program"]]
-    for action in (0, 1):  # Neither STOP nor location selection can precede the first program.
-        with pytest.raises(gym.error.InvalidAction):
-            env.step(action)
-    for name in ("Program", "ConsNonEmpty", "turnRight"):
-        transition = env.step(offset + ACTION_ID[name])
-        assert transition.observation.kind == "editing" and transition.reward == 0
-        assert evaluate.call_count == 0
-    completed = env.step(offset + ACTION_ID["End"])
-    assert completed.observation.kind == "executed"
-    assert isinstance(completed.observation, editing.ExecutedObservation)
-    assert env.result is not None and env.result.success
-    assert completed.reward == pytest.approx(env.result.score)
-    assert completed.observation.feedback[-2] == pytest.approx(completed.reward)
-    assert evaluate.call_count == 1 and env.remaining == 4
-    assert env.step(3).observation.kind == "editing"
-    edited = env.step(offset + ACTION_ID["turnLeft"])
-    assert edited.observation.kind == "executed"
-    assert completed.reward + edited.reward == pytest.approx(env.result.score)
-    assert env.step(0).terminated and evaluate.call_count == 2
-    assert env.reset(task=turning_task(config)).kind == "editing"
-    assert env.result is None and env.completed_edits == 0
-
-
-def test_root_hole_requires_budget_to_complete(config: editing.EditConfig) -> None:
-    assert editing.EditConfig().seed_program is None
-    with pytest.raises(ValueError, match="complete program"):
-        replace(config, seed_program=None, max_seq_len=5)
-    config = replace(config, seed_program=None, max_seq_len=6, allow_stop=False)
-    env = editing.KarelASTEditEnv(config)
-    env.reset(task=turning_task(config))
-    for name in ("Program", "ConsNonEmpty", "turnRight", "End"):
-        transition = env.step(1 + config.max_nodes + ACTION_ID[name])
-    assert transition.truncated and not transition.terminated
-    assert transition.observation.kind == "executed" and env.remaining == 0
-
-
 def test_runtime_failure_at_budget_boundary(config: editing.EditConfig) -> None:
     config = replace(config, max_seq_len=8)
     env = editing.KarelASTEditEnv(config)
     task = turning_task(config)
-    env.reset(task=task)
+    initial_score = env.reset(task=task).feedback[0]
     assert env.step(3).reward == 0
     transition = env.step(1 + config.max_nodes + ACTION_ID["move"])
     assert transition.observation.kind == "executed" and transition.truncated and not transition.terminated
@@ -152,7 +113,7 @@ def test_runtime_failure_at_budget_boundary(config: editing.EditConfig) -> None:
     assert env.result.error == "runtime_error"
     assert transition.observation.feedback[2] == 1
     np.testing.assert_array_equal(transition.observation.output, task._task.initial)
-    assert transition.reward == pytest.approx(env.result.score - env.seed_score)
+    assert transition.reward == pytest.approx(env.result.score - initial_score)
     assert env.tree.complete and env.remaining == 0
     with pytest.raises(gym.error.ResetNeeded):
         env.step(0)
@@ -173,7 +134,7 @@ def test_unchanged_replacement_still_returns_execution(config: editing.EditConfi
     assert env.completed_edits == 1
 
 
-def test_seed_prefill_leaves_only_stop(config: editing.EditConfig) -> None:
+def test_initial_prefill_leaves_only_stop(config: editing.EditConfig) -> None:
     config = replace(config, max_seq_len=6)
     env = editing.KarelASTEditEnv(config)
     observation = env.reset(task=turning_task(config))
@@ -232,7 +193,6 @@ def test_normalized_program_penalties(
 ) -> None:
     config = replace(
         config,
-        seed_program=f"DEF run m( {source} m)",
         max_seq_len=16,
         env=replace(
             config.env,
@@ -245,7 +205,9 @@ def test_normalized_program_penalties(
     )
     task = turning_task(config)
     env = editing.KarelASTEditEnv(config)
-    observation = env.reset(task=task)
+    env.reset(task=task)
+    observation = fill_program(env, f"DEF run m( {source} m)").observation
+    assert isinstance(observation, editing.ExecutedObservation)
     result = env.result
     assert result is not None
     assert result.error == error and result.ticks == ticks
@@ -263,6 +225,7 @@ def test_normalized_program_penalties(
     )
     baseline = editing.KarelASTEditEnv(unpenalized)
     baseline.reset(task=turning_task(unpenalized))
+    fill_program(baseline, f"DEF run m( {source} m)")
     assert baseline.result is not None
     assert baseline.result.score == pytest.approx(
         sum(value for name, value in result.components.items() if name not in ("depth", "length", "execution"))
@@ -277,6 +240,7 @@ def test_penalties_reward_smaller_equivalent_programs(config: editing.EditConfig
     )
     env = editing.KarelASTEditEnv(config)
     initial = env.reset(task=turning_task(config))
+    initial_score = env.result.score
 
     def replace_program(source: str) -> float:
         assert env.step(1).reward == 0  # Replace the root.
@@ -294,9 +258,9 @@ def test_penalties_reward_smaller_equivalent_programs(config: editing.EditConfig
     grown = replace_program("DEF run m( turnRight turnRight turnRight m)")
     # Equivalent output; only the extra four nodes, two depth edges and two ticks cost reward.
     assert grown == pytest.approx(-0.1 * (4 / 8 + 2 / 4 + 2 / config.env.max_execution_steps))
-    shrunk = replace_program(config.seed_program)
+    shrunk = replace_program("DEF run m( turnLeft m)")
     assert shrunk == pytest.approx(-grown)
-    assert env.result is not None and env.result.score == pytest.approx(env.seed_score)
+    assert env.result is not None and env.result.score == pytest.approx(initial_score)
     assert env.step(0).reward == 0
 
 

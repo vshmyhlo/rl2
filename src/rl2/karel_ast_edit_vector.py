@@ -11,7 +11,7 @@ from numpy.typing import NDArray
 
 from rl2.karel import KarelProgramEnv
 from rl2.karel_ast import KarelAST
-from rl2.karel_ast_edit import EditConfig, EditStep, EditingObservation, Evaluation, KarelASTEditEnv
+from rl2.karel_ast_edit import EditConfig, EditStep, Evaluation, ExecutedObservation, KarelASTEditEnv
 
 
 class EditSummary(NamedTuple):
@@ -19,6 +19,7 @@ class EditSummary(NamedTuple):
 
     tree: KarelAST
     result: Evaluation
+    seed_score: float
     completed_edits: int
     remaining: int
 
@@ -27,7 +28,7 @@ def _summaries(envs: list[KarelASTEditEnv]) -> list[EditSummary]:
     """Read episode results without transferring the complete environment objects."""
     if any(env.result is None for env in envs):
         raise RuntimeError("Reset environments before reading their summaries")
-    return [EditSummary(env.tree, env.result, env.completed_edits, env.remaining) for env in envs]
+    return [EditSummary(env.tree, env.result, env.seed_score, env.completed_edits, env.remaining) for env in envs]
 
 
 _worker_envs: list[KarelASTEditEnv] = []
@@ -39,7 +40,7 @@ def _initialize_worker(config: EditConfig, count: int) -> None:
     _worker_envs = [KarelASTEditEnv(config) for _ in range(count)]
 
 
-def _reset_worker(tasks: list[KarelProgramEnv]) -> list[EditingObservation]:
+def _reset_worker(tasks: list[KarelProgramEnv]) -> list[ExecutedObservation]:
     """Reset the worker's shard from independently copied, already sampled tasks."""
     return [env.reset(task=task) for env, task in zip(_worker_envs, tasks, strict=True)]
 
@@ -97,7 +98,7 @@ class KarelASTEditVectorEnv:
         if self.closed:
             raise RuntimeError("Vector environment is closed")
 
-    def reset(self, tasks: list[KarelProgramEnv]) -> list[EditingObservation]:
+    def reset(self, tasks: list[KarelProgramEnv]) -> list[ExecutedObservation]:
         """Reset every member, preserving task order and same-task rollout groups."""
         self._check_open()
         if len(tasks) != self.num_envs or any(task.config != self.config.env for task in tasks):

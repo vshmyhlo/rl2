@@ -35,7 +35,6 @@ def config() -> edit.Config:
         d_model=16,
         num_layers=1,
         num_heads=2,
-        seed_program="DEF run m( turnLeft m)",
         max_nodes=8,
         max_depth=4,
         max_seq_len=16,
@@ -78,6 +77,27 @@ def tree_from(source: str, config: edit.Config) -> KarelAST:
     for action in program_actions(tuple(source.split())):
         tree = tree.expand(action)
     return tree
+
+
+def test_initial_prefill_supplies_fixed_program_execution(config: edit.Config) -> None:
+    env = editing.KarelASTEditEnv(config.edit_config)
+    observation = env.reset(seed=12)
+    assert env.tree.tokens() == ("DEF", "run", "m(", "turnLeft", "m)")
+    event = edit.initial_event([observation], config)
+    assert event.kind.shape == (5, 1)
+    np.testing.assert_array_equal(event.kind[:, 0], [edit.EDIT_EVENT] * 4 + [edit.FEEDBACK_EVENT])
+    expected = [ACTION_ID[name] for name in ("Program", "ConsNonEmpty", "turnLeft", "End")]
+    np.testing.assert_array_equal(event.action[:4, 0], 1 + config.max_nodes + np.asarray(expected))
+    assert event.action[-1, 0] == event.action[-2, 0]
+    np.testing.assert_array_equal(event.grid[:-1], 0)
+    np.testing.assert_array_equal(event.feedback[-1, 0], observation.feedback)
+    np.testing.assert_array_equal(event.feedback[:-1], 0)
+    np.testing.assert_array_equal(event.grid[-1, 0, 2], observation.output)
+    assert observation.feedback[-2] == 0
+    assert observation.action_mask[3]  # First policy action can edit the initial statement.
+    assert not observation.action_mask[1 + config.max_nodes :].any()
+    assert "seed_program" not in asdict(config)
+    assert "seed_program" not in asdict(config.edit_config)
 
 
 def test_single_task_repeats_across_rollouts(config: edit.Config) -> None:
@@ -166,7 +186,7 @@ def test_load_config_task_limit(tmp_path: Path) -> None:
 
 
 def test_replacement_grows_shrinks_and_preserves_context(config: edit.Config) -> None:
-    tree = editing.seed_tree(config.edit_config)
+    tree = editing.initial_tree(config.edit_config)
     # Replace the final empty list by two statements; fixed prefix survives.
     position = next(p for p, i in enumerate(tree.preorder()) if tree.nodes[i].constructor == ACTION_ID["End"])
     partial = editing.open_subtree(tree, position)
@@ -204,7 +224,7 @@ def test_replacement_masks_reserve_completion(config: edit.Config, limit: str) -
         "depth": {"max_depth": 2},
     }[limit]
     limited = replace(config, **changes)
-    tree = editing.open_subtree(editing.seed_tree(limited.edit_config), 0)
+    tree = editing.open_subtree(editing.initial_tree(limited.edit_config), 0)
     # Pick the highest legal constructor/value ID to stress nontrivial completions.
     for _ in range(limited.max_nodes):
         legal = tree.allowed_actions()
@@ -243,7 +263,7 @@ def test_execution_feedback_and_restart(config: edit.Config) -> None:
     assert isinstance(observation, editing.ExecutedObservation)
     assert observation.feedback[2] == 1 and observation.feedback[-1] == pytest.approx(1 / config.max_seq_len)
     # Failure does not poison the next execution or make it start from the partial state.
-    good = editing.evaluate(editing.seed_tree(config.edit_config), task, env, initial)
+    good = editing.evaluate(editing.initial_tree(config.edit_config), task, env, initial)
     assert good.success and good.error is None and good.ticks == 1
     partial = editing.open_subtree(bad, 0)
     during = editing.observe(partial, pair, result, config.max_seq_len, config)
@@ -266,18 +286,15 @@ def test_rollout_replay_rewards_and_minibatches(config: edit.Config, state: Trai
     np.testing.assert_allclose(batch.advantages, expected_advantages, atol=1e-6)
     assert np.all(batch.mask.sum(axis=0) <= config.max_seq_len)
     assert batch.actions.shape[0] <= config.max_seq_len
-    assert not batch.mask[: len(program_actions(tuple(config.seed_program.split())))].any()
-    seed_end = len(program_actions(tuple(config.seed_program.split()))) + 1
-    np.testing.assert_array_equal(
-        batch.event.grid[:seed_end],
-        np.broadcast_to(batch.event.grid[0], batch.event.grid[:seed_end].shape),
-    )
+    prefill_end = config.edit_config.prefill_length
+    assert not batch.mask[: prefill_end - 1].any()
+    np.testing.assert_array_equal(batch.event.grid[batch.event.kind != edit.FEEDBACK_EVENT], 0)
     seed = int(np.random.default_rng(4).integers(0, 2**31, size=1)[0])
     env = KarelProgramEnv(config.env)
     for index, tree in enumerate(programs):
         pair = env.reset(seed=seed)
         for image_index, expected in enumerate((pair.initial, pair.target)):
-            images = batch.event.grid[:, index, image_index]
+            images = batch.event.grid[batch.event.kind[:, index] == edit.FEEDBACK_EVENT, index, image_index]
             np.testing.assert_array_equal(images, np.broadcast_to(expected, images.shape))
         for token in tree.tokens():
             _, reward, terminated, truncated, info = env.step(TOKEN_TO_ID[token])
@@ -286,13 +303,10 @@ def test_rollout_replay_rewards_and_minibatches(config: edit.Config, state: Trai
         reward -= config.env.length_penalty_weight * len(tree.nodes) / config.max_nodes
         reward -= config.env.depth_penalty_weight * max(node.depth for node in tree.nodes) / config.max_depth
         env.reset(seed=seed)
-        seed_score = editing.evaluate(
-            editing.seed_tree(config.edit_config),
-            env,
-            KarelProgramEnv(config.env),
-            pair.initial,
+        initial_score = editing.evaluate(
+            editing.initial_tree(config.edit_config), env, KarelProgramEnv(config.env), pair.initial
         ).score
-        assert rewards[index] == pytest.approx(reward - seed_score)
+        assert rewards[index] == pytest.approx(reward - initial_score)
     assert diagnostics["charts/syntax_error_rate"] == diagnostics["charts/token_limit_rate"] == 0
     subset = edit.select_episodes(batch, np.asarray([1, 0], np.int64))
     np.testing.assert_array_equal(subset.actions, batch.actions[:, ::-1])
@@ -352,44 +366,6 @@ def test_advantages_use_final_scores_without_delta_roundoff(
     assert collected.diagnostics["charts/reward_diverse_group_fraction"] == float(improvement > 0)
 
 
-def test_root_hole_prefill_predicts_first_grammar_action(
-    config: edit.Config, state: TrainState, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = replace(config, seed_program=None)
-    script = [1 + config.max_nodes + ACTION_ID[name] for name in ("Program", "ConsNonEmpty", "turnRight", "End")]
-    script.append(0)
-    position = 0
-
-    def act(logits: jax.Array, key: jax.Array) -> tuple[jax.Array, jax.Array]:
-        nonlocal position
-        sc = edit.ShapeChecker(B=2, V=1 + config.max_nodes + len(edit.AST_ACTIONS))
-        sc.check(logits, "BV", jnp.float32)
-        sc.check(key, "")
-        actions = jnp.full((2,), script[position], jnp.int32)
-        assert np.isfinite(np.asarray(logits)[:, script[position]]).all()
-        position += 1
-        return actions, edit.action_log_prob(logits, actions)
-
-    monkeypatch.setattr(edit, "act", act)
-    with edit.KarelASTEditVectorEnv(config.edit_config, 2, workers=2) as envs:
-        rollout = edit.collect_rollout(state, envs, np.random.default_rng(4), jax.random.key(7), config)
-    batch = rollout.batch
-    assert position == len(script)
-    assert batch.mask[0].all()  # The prefill row predicts a policy target immediately.
-    np.testing.assert_array_equal(batch.event.kind[0], edit.EDIT_EVENT)
-    np.testing.assert_array_equal(batch.event.action[0], 1)  # Root-hole token.
-    np.testing.assert_array_equal(batch.event.feedback[0], 0)
-    np.testing.assert_array_equal(batch.event.grid[:5, :, 2], batch.event.grid[:5, :, 0])
-    for index in range(2):
-        np.testing.assert_array_equal(batch.actions[batch.mask[:, index], index], script)
-    np.testing.assert_array_equal((batch.event.kind == edit.FEEDBACK_EVENT).sum(axis=0), 1)
-    assert rollout.diagnostics["charts/seed_score_mean"] == 0
-    np.testing.assert_allclose(batch.rewards.sum(axis=0), batch.event.feedback[5, :, 0])
-    replay = edit.action_log_prob(edit.mask_logits(predict(state, batch.event), batch.legal), batch.actions)
-    np.testing.assert_allclose(replay, batch.old_log_probs, atol=2e-6)
-    assert all(tree.source() == "DEF run m( turnRight m)" for tree in rollout.programs)
-
-
 def test_stop_is_a_real_decision(config: edit.Config, state: TrainState) -> None:
     params = {**state.params, "head": {**state.params["head"], "bias": state.params["head"]["bias"].at[0].set(100)}}
     stopped = state.replace(params=params)
@@ -404,7 +380,7 @@ def test_stop_is_a_real_decision(config: edit.Config, state: TrainState) -> None
     assert batch.mask.sum() == 2 and diagnostics["charts/edits_mean"] == 0
     assert diagnostics["charts/sequence_budget_exhausted_rate"] == 0
     np.testing.assert_array_equal(batch.advantages, 0)
-    assert all(tree.tokens() == editing.seed_tree(config.edit_config).tokens() for tree in programs)
+    assert all(tree.tokens() == editing.initial_tree(config.edit_config).tokens() for tree in programs)
     assert rewards[0] == rewards[1]
     # The unchanged seed has Program, ConsNonEmpty, turnLeft, End: four nodes,
     # with both statement and End two edges from the root.
@@ -523,8 +499,7 @@ def test_config_and_checkpoint(config: edit.Config, state: TrainState, tmp_path:
         ({"env_workers": -1}, AssertionError),
         ({"env_workers": True}, TypeError),
         ({"max_seq_len": 5}, ValueError),
-        ({"seed_program": "DEF run m( m)"}, ValueError),
-        ({"seed_program": "DEF run m( turnLeft turnRight putMarker move m)"}, ValueError),
+        ({"max_nodes": 3}, ValueError),
     ):
         with pytest.raises(error):
             replace(config, **changes)
@@ -678,7 +653,7 @@ def test_execution_limit_retains_last_valid_grid(config: edit.Config) -> None:
     config = replace(config, env=replace(config.env, max_execution_steps=1))
     task, env = KarelProgramEnv(config.env), KarelProgramEnv(config.env)
     pair = task.reset(seed=42)
-    seed = editing.evaluate(editing.seed_tree(config.edit_config), task, env, pair.initial)
+    seed = editing.evaluate(editing.initial_tree(config.edit_config), task, env, pair.initial)
     tree = tree_from("DEF run m( turnLeft turnLeft m)", config)
     failed = editing.evaluate(tree, task, env, pair.initial)
     assert failed.error == "execution_limit" and not failed.success and failed.ticks == 1
@@ -703,7 +678,7 @@ def test_grid_encoder_mixes_all_three_images_per_cell(config: edit.Config, state
     assert not np.allclose(features[1, 1, 1], features[2, 1, 1])
     features[:, 1, 1] = 0
     np.testing.assert_array_equal(features, 0)  # A 1x1 convolution cannot mix neighboring cells.
-    # Both real event kinds receive the current image; padding remains inert.
+    # Only FEEDBACK receives the current image; EDIT ignores it and padding remains inert.
     event = edit.empty_event(3, 1, config)
     event.kind[:, 0] = [edit.EDIT_EVENT, edit.FEEDBACK_EVENT, PAD_EVENT]
     event.grid[:, :, 0] = initial[:1]
@@ -711,7 +686,8 @@ def test_grid_encoder_mixes_all_three_images_per_cell(config: edit.Config, state
     original = state.apply_fn({"params": state.params}, event, method=EditTransformer.encode_event)
     event.grid[:, 0, 2, 1, 1, 5] = 1
     changed = state.apply_fn({"params": state.params}, event, method=EditTransformer.encode_event)
-    assert np.all(np.any(np.abs(np.asarray(changed - original))[:2] > 1e-6, axis=-1))
+    np.testing.assert_array_equal(changed[0], original[0])
+    assert not np.allclose(changed[1], original[1])
     np.testing.assert_array_equal(changed[2], 0)
 
 
@@ -728,10 +704,10 @@ def test_history_is_causal_and_retains_action_and_update_context(
     grid[0, :, 2, 1, 1, 5] += 1
     changed = event._replace(grid=grid)
     seed_logits = np.asarray(predict(state, changed))
-    assert not np.allclose(logits[0], seed_logits[0])
+    np.testing.assert_array_equal(logits, seed_logits)
     # The initial execution report is a forced observation, not a prediction
     # target. Changing it must affect only predictions AFTER it is consumed.
-    update_index = len(program_actions(tuple(config.seed_program.split())))
+    update_index = int(np.flatnonzero((event.kind == edit.FEEDBACK_EVENT).any(axis=1))[0])
     feedback = np.array(event.feedback)
     feedback[update_index, :, 0] += 10
     changed = event._replace(feedback=feedback)
@@ -794,7 +770,7 @@ def test_action_feedback_and_finished_padding_replay_exactly(
     np.testing.assert_array_equal(batch.actions[batch.mask[:, 0], 0], scripts[0])
     np.testing.assert_array_equal(batch.actions[batch.mask[:, 1], 1], scripts[1])
     event = batch.event
-    initial_update = len(program_actions(tuple(config.seed_program.split())))
+    initial_update = config.edit_config.prefill_length - 1
     completion = initial_update + 1 + len(grammar)
     report = completion + 1
     assert event.kind[completion, 1] == edit.EDIT_EVENT
@@ -809,16 +785,17 @@ def test_action_feedback_and_finished_padding_replay_exactly(
     assert event.feedback[report, 1, -1] == pytest.approx(3 / config.max_seq_len)
     assert event.feedback[report, 1, -2] == pytest.approx(batch.rewards[completion - 1, 1])
     np.testing.assert_array_equal(event.feedback[event.kind != edit.FEEDBACK_EVENT], 0)
-    # Completing EDIT keeps the old image; FEEDBACK introduces the execution result.
+    # Images appear only on reports, including after terminal completion.
+    np.testing.assert_array_equal(event.grid[event.kind != edit.FEEDBACK_EVENT], 0)
     current = event.grid[:, :, 2]
-    np.testing.assert_array_equal(
-        event.grid[:, :, :2], np.broadcast_to(event.grid[0, :, :2], event.grid[:, :, :2].shape)
-    )
-    np.testing.assert_array_equal(current[:report, 1], np.broadcast_to(current[0, 1], current[:report, 1].shape))
-    np.testing.assert_array_equal(
-        current[report:-1, 1], np.broadcast_to(current[report, 1], current[report:-1, 1].shape)
-    )
-    assert not np.array_equal(current[report, 1], current[0, 1])
+    for index in range(2):
+        reports = np.flatnonzero(event.kind[:, index] == edit.FEEDBACK_EVENT)
+        np.testing.assert_array_equal(event.action[reports, index], event.action[reports - 1, index])
+        images = event.grid[reports, index, :2]
+        np.testing.assert_array_equal(images, np.broadcast_to(images[0], images.shape))
+    assert event.action[report, 1] == scripts[1][-3]
+    assert event.action[-1, 1] == scripts[1][-1]
+    assert not np.array_equal(current[report, 1], current[initial_update, 1])
     first_report = initial_update + 3
     assert event.kind[first_report, 0] == edit.FEEDBACK_EVENT
     assert not batch.mask[first_report - 1, 0] and batch.mask[first_report - 1, 1]
@@ -847,7 +824,7 @@ def test_action_feedback_and_finished_padding_replay_exactly(
 def test_sequence_budget_reserves_complete_replacements(config: edit.Config) -> None:
     task = KarelProgramEnv(config.env)
     pair = task.reset(seed=42)
-    tree = editing.seed_tree(config.edit_config)
+    tree = editing.initial_tree(config.edit_config)
     result = editing.evaluate(tree, task, KarelProgramEnv(config.env), pair.initial)
     only_stop = editing.observe(tree, pair, result, 1, config).action_mask
     assert np.flatnonzero(only_stop).tolist() == [0]
@@ -871,21 +848,31 @@ def test_sequence_budget_reserves_complete_replacements(config: edit.Config) -> 
     assert partial.expand(ACTION_ID["End"]).complete
 
 
-def test_disabled_stop_keeps_editing_despite_stop_biased_policy(config: edit.Config, state: TrainState) -> None:
+def test_disabled_stop_keeps_editing_despite_stop_biased_policy(
+    config: edit.Config, state: TrainState, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # Three location+leaf+feedback edits leave two tokens, too little for another edit.
     config = replace(config, allow_stop=False)
     replacement = 1 + config.max_nodes + ACTION_ID["turnRight"]
     bias = state.params["head"]["bias"].at[0].set(200).at[3].set(100).at[replacement].set(100)
     state = state.replace(params={**state.params, "head": {**state.params["head"], "bias": bias}})
-    batch, _, metrics, _, programs = edit.collect_rollout(
+    sample = MagicMock(wraps=edit.act)
+    monkeypatch.setattr(edit, "act", sample)
+    key = jax.random.key(7)
+    batch, _, metrics, final_key, programs = edit.collect_rollout(
         state,
         edit.KarelASTEditVectorEnv(config.edit_config, 2),
         np.random.default_rng(4),
-        jax.random.key(7),
+        key,
         config,
     )
     assert metrics["charts/edits_mean"] == 3
     np.testing.assert_array_equal(batch.mask.sum(axis=0), 6)
+    # Feedback-only iterations neither sample actions nor advance the RNG.
+    assert sample.call_count == 6
+    for _ in range(6):
+        key, _ = jax.random.split(key)
+    np.testing.assert_array_equal(jax.random.key_data(final_key), jax.random.key_data(key))
     assert metrics["charts/sequence_length_mean"] == config.max_seq_len - 2
     assert metrics["charts/sequence_budget_exhausted_rate"] == 1
     assert not batch.legal[..., 0][batch.mask].any()

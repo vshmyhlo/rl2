@@ -29,6 +29,8 @@ from rl2.shape_checker import ShapeChecker
 
 FEEDBACK_SIZE = 8  # score, success, runtime error, execution limit, ticks, length, score delta, sequence tokens left
 EDIT_REWARD_COMPONENTS = (*REWARD_COMPONENTS, "depth")
+INITIAL_PROGRAM = ("DEF", "run", "m(", "turnLeft", "m)")
+INITIAL_ACTIONS = program_actions(INITIAL_PROGRAM)
 
 
 @dataclass(frozen=True)
@@ -39,17 +41,14 @@ class EditConfig:
     max_nodes: int = 128
     max_depth: int = 64
     max_seq_len: int = 256
-    seed_program: str = "DEF run m( turnLeft m)"
     allow_stop: bool = True
 
     def __post_init__(self) -> None:
-        """Reject invalid sequence budgets and seeds that violate the AST limits."""
+        """Validate the fixed initial program and reserve room for policy actions."""
         if type(self.max_seq_len) is not int:
             raise TypeError("Sequence length must be an integer")
         chex.assert_scalar_positive(self.max_seq_len)
-        if not isinstance(self.seed_program, str):
-            raise TypeError("seed_program must be source text")
-        seed_tree(self)
+        initial_tree(self)
         if self.max_seq_len <= self.prefill_length:
             raise ValueError("max_seq_len must fit the initial program, feedback, and at least one action")
         if not self.allow_stop and self.max_seq_len < self.prefill_length + 3:
@@ -57,14 +56,14 @@ class EditConfig:
 
     @property
     def prefill_length(self) -> int:
-        """Count initial program EDIT tokens and the initial FEEDBACK report."""
-        return len(program_actions(tuple(self.seed_program.split()))) + 1
+        """Count fixed initial program EDIT tokens and its first FEEDBACK report."""
+        return len(INITIAL_ACTIONS) + 1
 
 
-def seed_tree(config: EditConfig) -> KarelAST:
-    """Build the episode's starting AST by replaying its source as grammar actions."""
+def initial_tree(config: EditConfig) -> KarelAST:
+    """Build the fixed one-statement turnLeft program used by every episode."""
     tree = KarelAST.empty(config.max_nodes, config.max_depth, config.env.max_program_tokens)
-    for action in program_actions(tuple(config.seed_program.split())):
+    for action in INITIAL_ACTIONS:
         tree = tree.expand(action)
     return tree
 
@@ -279,7 +278,7 @@ class EditStep(NamedTuple):
 class KarelASTEditEnv:
     """Own an editing episode independently of the policy and its event history.
 
-    reset() evaluates the seed but issues no reward. step() accepts STOP=0,
+    reset() executes the fixed turnLeft program without reward. step() accepts STOP=0,
     preorder locations 1..max_nodes, or offset grammar IDs. A completed edit
     refreshes execution feedback and yields its signed score improvement.
     STOP terminates normally; completing an edit at the sequence limit truncates.
@@ -296,7 +295,7 @@ class KarelASTEditEnv:
         self.config = config
         self.task = KarelProgramEnv(config.env)
         self.scorer = KarelProgramEnv(config.env)
-        self.tree = seed_tree(config)
+        self.tree = initial_tree(config)
         self.result: Evaluation | None = None
         self.observation: Observation | None = None
         self.remaining = config.max_seq_len - config.prefill_length
@@ -306,7 +305,7 @@ class KarelASTEditEnv:
         self.action_space = gym.spaces.Discrete(1 + config.max_nodes + len(AST_ACTIONS))
 
     def reset(self, *, task: KarelProgramEnv | None = None, seed: int | None = None) -> ExecutedObservation:
-        """Start from the configured seed on a sampled task or a fresh supplied task."""
+        """Execute the fixed turnLeft program on a sampled or supplied task."""
         if task is not None:
             if seed is not None:
                 raise ValueError("Supply either task or seed, not both")
@@ -315,7 +314,7 @@ class KarelASTEditEnv:
             self.pair = self.task.reset_from(task)
         else:
             self.pair = self.task.reset(seed=seed)
-        self.tree = seed_tree(self.config)
+        self.tree = initial_tree(self.config)
         self.result = evaluate(self.tree, self.task, self.scorer, self.pair.initial)
         self.seed_score = self.result.score
         self.remaining = self.config.max_seq_len - self.config.prefill_length
