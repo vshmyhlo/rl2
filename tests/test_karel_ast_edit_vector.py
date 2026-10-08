@@ -26,6 +26,7 @@ def assert_transition_equal(actual: EditStep | None, expected: EditStep | None) 
 def test_parallel_matches_local_masked_steps_and_cleans_up() -> None:
     # Three environments split over two workers exercises unequal shard sizes.
     config = EditConfig(
+        seed_program="DEF run m( turnLeft m)",
         max_nodes=8,
         max_depth=4,
         max_seq_len=11,

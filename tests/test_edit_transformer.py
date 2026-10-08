@@ -10,7 +10,6 @@ import pytest
 from rl2.edit_transformer import EDIT_EVENT, FEEDBACK_EVENT, PAD_EVENT, EditTransformer, Event
 from rl2.karel_ast_edit import FEEDBACK_SIZE
 from rl2.shape_checker import ShapeChecker
-from rl2.train_karel_ppo_ast_ar_edit import EditActorCritic
 
 type Variables = dict[str, Any]
 
@@ -40,14 +39,11 @@ def initialize(model: EditTransformer, event: Event) -> Variables:
     head = variables["params"]["head"]
     head["kernel"] = jax.random.normal(jax.random.key(1), head["kernel"].shape) * 0.1
     head["bias"] = jnp.ones_like(head["bias"])
-    if isinstance(model, EditActorCritic):
-        variables["params"]["value_head"]["bias"] = jnp.ones((1,), jnp.float32)
     return variables
 
 
-@pytest.mark.parametrize("model_class", [EditTransformer, EditActorCritic], ids=["policy", "actor_critic"])
-def test_padding_prefill_and_cached_steps(model_class: type[EditTransformer], event: Event) -> None:
-    model = model_class(d_model=8, num_layers=1, num_heads=2, max_nodes=2, max_seq_len=3)
+def test_padding_prefill_and_cached_steps(event: Event) -> None:
+    model = EditTransformer(d_model=8, num_layers=1, num_heads=2, max_nodes=2, max_seq_len=3)
     variables = initialize(model, event)
     full_carry, *full_outputs = jax.jit(model.apply)(variables, event)
     np.testing.assert_array_equal(full_carry[0].position, [3, 1, 0])

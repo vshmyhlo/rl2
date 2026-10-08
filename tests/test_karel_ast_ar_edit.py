@@ -1,6 +1,5 @@
 from dataclasses import asdict, replace
 from pathlib import Path
-from types import ModuleType
 from unittest.mock import MagicMock
 
 import chex
@@ -13,7 +12,6 @@ from flax.training.train_state import TrainState
 
 from rl2 import karel_ast_edit as editing
 from rl2 import train_karel_ast_ar_edit as edit
-from rl2 import train_karel_ppo_ast_ar_edit as ppo_edit
 from rl2.edit_transformer import PAD_EVENT, EditTransformer
 from rl2.karel import TOKEN_TO_ID, KarelConfig, KarelPair, KarelProgramEnv
 from rl2.karel_ast import ACTION_ID, KarelAST, program_actions
@@ -37,6 +35,7 @@ def config() -> edit.Config:
         d_model=16,
         num_layers=1,
         num_heads=2,
+        seed_program="DEF run m( turnLeft m)",
         max_nodes=8,
         max_depth=4,
         max_seq_len=16,
@@ -125,21 +124,18 @@ def test_task_pool_sampling_and_rng_resume(config: edit.Config, monkeypatch: pyt
         assert sampled_seeds(unlimited, rng) == tuple(expected_rng.integers(0, 2**31, size=config.num_tasks))
 
 
-@pytest.mark.parametrize("trainer", [edit, ppo_edit], ids=["grpo", "ppo"])
-def test_collect_rollout_uses_fixed_task_pool(
-    config: edit.Config, monkeypatch: pytest.MonkeyPatch, trainer: ModuleType
-) -> None:
+def test_collect_rollout_uses_fixed_task_pool(config: edit.Config, monkeypatch: pytest.MonkeyPatch) -> None:
     config = replace(config, max_unique_tasks=1)
     sample = MagicMock(wraps=edit.sample_task_groups)
     monkeypatch.setattr(edit, "sample_task_groups", sample)
     # Stop at the model boundary: sampling wiring needs no policy execution.
     run = MagicMock(side_effect=RuntimeError("episodes reached"))
-    monkeypatch.setattr(trainer, "run_episodes", run)
+    monkeypatch.setattr(edit, "run_episodes", run)
     with (
         edit.KarelASTEditVectorEnv(config.edit_config, config.num_tasks * config.group_size) as envs,
         pytest.raises(RuntimeError, match="episodes reached"),
     ):
-        trainer.collect_rollout(MagicMock(), envs, np.random.default_rng(4), jax.random.key(7), config)
+        edit.collect_rollout(MagicMock(), envs, np.random.default_rng(4), jax.random.key(7), config)
     sample.assert_called_once()
     assert sample.call_args.args[1].max_unique_tasks == 1
     assert len(run.call_args.args[1]) == config.num_tasks * config.group_size
@@ -354,6 +350,44 @@ def test_advantages_use_final_scores_without_delta_roundoff(
     expected = np.asarray([-improvement / 2, improvement / 2]) / (improvement / 2 + 1e-8)
     np.testing.assert_allclose(collected.batch.advantages, expected, atol=1e-7)
     assert collected.diagnostics["charts/reward_diverse_group_fraction"] == float(improvement > 0)
+
+
+def test_root_hole_prefill_predicts_first_grammar_action(
+    config: edit.Config, state: TrainState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(config, seed_program=None)
+    script = [1 + config.max_nodes + ACTION_ID[name] for name in ("Program", "ConsNonEmpty", "turnRight", "End")]
+    script.append(0)
+    position = 0
+
+    def act(logits: jax.Array, key: jax.Array) -> tuple[jax.Array, jax.Array]:
+        nonlocal position
+        sc = edit.ShapeChecker(B=2, V=1 + config.max_nodes + len(edit.AST_ACTIONS))
+        sc.check(logits, "BV", jnp.float32)
+        sc.check(key, "")
+        actions = jnp.full((2,), script[position], jnp.int32)
+        assert np.isfinite(np.asarray(logits)[:, script[position]]).all()
+        position += 1
+        return actions, edit.action_log_prob(logits, actions)
+
+    monkeypatch.setattr(edit, "act", act)
+    with edit.KarelASTEditVectorEnv(config.edit_config, 2, workers=2) as envs:
+        rollout = edit.collect_rollout(state, envs, np.random.default_rng(4), jax.random.key(7), config)
+    batch = rollout.batch
+    assert position == len(script)
+    assert batch.mask[0].all()  # The prefill row predicts a policy target immediately.
+    np.testing.assert_array_equal(batch.event.kind[0], edit.EDIT_EVENT)
+    np.testing.assert_array_equal(batch.event.action[0], 1)  # Root-hole token.
+    np.testing.assert_array_equal(batch.event.feedback[0], 0)
+    np.testing.assert_array_equal(batch.event.grid[:5, :, 2], batch.event.grid[:5, :, 0])
+    for index in range(2):
+        np.testing.assert_array_equal(batch.actions[batch.mask[:, index], index], script)
+    np.testing.assert_array_equal((batch.event.kind == edit.FEEDBACK_EVENT).sum(axis=0), 1)
+    assert rollout.diagnostics["charts/seed_score_mean"] == 0
+    np.testing.assert_allclose(batch.rewards.sum(axis=0), batch.event.feedback[5, :, 0])
+    replay = edit.action_log_prob(edit.mask_logits(predict(state, batch.event), batch.legal), batch.actions)
+    np.testing.assert_allclose(replay, batch.old_log_probs, atol=2e-6)
+    assert all(tree.source() == "DEF run m( turnRight m)" for tree in rollout.programs)
 
 
 def test_stop_is_a_real_decision(config: edit.Config, state: TrainState) -> None:

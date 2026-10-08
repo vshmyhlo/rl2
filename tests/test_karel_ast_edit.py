@@ -13,6 +13,7 @@ from rl2.karel_ast import ACTION_ID, program_actions
 @pytest.fixture
 def config() -> editing.EditConfig:
     return editing.EditConfig(
+        seed_program="DEF run m( turnLeft m)",
         max_nodes=8,
         max_depth=4,
         max_seq_len=12,
@@ -91,6 +92,52 @@ def test_improvement_regression_and_stop(config: editing.EditConfig, monkeypatch
     reset = env.reset(task=turning_task(config))
     assert env.completed_edits == 0 and env.remaining == config.max_seq_len - config.prefill_length
     assert reset.kind == "executed" and reset.feedback[-2] == 0
+
+
+def test_root_hole_builds_before_editing(config: editing.EditConfig, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = replace(config, seed_program=None, max_seq_len=10)
+    env = editing.KarelASTEditEnv(config)
+    evaluate = MagicMock(wraps=editing.evaluate)
+    monkeypatch.setattr(editing, "evaluate", evaluate)
+    initial = env.reset(task=turning_task(config))
+    assert initial.kind == "editing" and env.result is None and env.seed_score == 0
+    assert config.prefill_length == 1 and env.remaining == 9
+    offset = 1 + config.max_nodes
+    assert np.flatnonzero(initial.action_mask).tolist() == [offset + ACTION_ID["Program"]]
+    for action in (0, 1):  # Neither STOP nor location selection can precede the first program.
+        with pytest.raises(gym.error.InvalidAction):
+            env.step(action)
+    for name in ("Program", "ConsNonEmpty", "turnRight"):
+        transition = env.step(offset + ACTION_ID[name])
+        assert transition.observation.kind == "editing" and transition.reward == 0
+        assert evaluate.call_count == 0
+    completed = env.step(offset + ACTION_ID["End"])
+    assert completed.observation.kind == "executed"
+    assert isinstance(completed.observation, editing.ExecutedObservation)
+    assert env.result is not None and env.result.success
+    assert completed.reward == pytest.approx(env.result.score)
+    assert completed.observation.feedback[-2] == pytest.approx(completed.reward)
+    assert evaluate.call_count == 1 and env.remaining == 4
+    assert env.step(3).observation.kind == "editing"
+    edited = env.step(offset + ACTION_ID["turnLeft"])
+    assert edited.observation.kind == "executed"
+    assert completed.reward + edited.reward == pytest.approx(env.result.score)
+    assert env.step(0).terminated and evaluate.call_count == 2
+    assert env.reset(task=turning_task(config)).kind == "editing"
+    assert env.result is None and env.completed_edits == 0
+
+
+def test_root_hole_requires_budget_to_complete(config: editing.EditConfig) -> None:
+    assert editing.EditConfig().seed_program is None
+    with pytest.raises(ValueError, match="complete program"):
+        replace(config, seed_program=None, max_seq_len=5)
+    config = replace(config, seed_program=None, max_seq_len=6, allow_stop=False)
+    env = editing.KarelASTEditEnv(config)
+    env.reset(task=turning_task(config))
+    for name in ("Program", "ConsNonEmpty", "turnRight", "End"):
+        transition = env.step(1 + config.max_nodes + ACTION_ID[name])
+    assert transition.truncated and not transition.terminated
+    assert transition.observation.kind == "executed" and env.remaining == 0
 
 
 def test_runtime_failure_at_budget_boundary(config: editing.EditConfig) -> None:
