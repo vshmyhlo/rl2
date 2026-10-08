@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from rl2.attention import AttentionType
+from rl2.attention import AttentionType, _check_range
 from rl2.karel_ast import AST_ACTIONS, CONSTRUCTORS, NUM_NODE_TYPES, VALUES, ASTFeatures, Field
 from rl2.karel_syntax import MAX_BLOCK_DEPTH
 from rl2.shape_checker import ShapeChecker
@@ -106,9 +106,11 @@ class ASTTransformer(nn.Module):
             tree: Batched ASTFeatures before the next expansion. Node/type,
                 field, depth, child-index, and value IDs are int32 [B, N], with
                 1 <= N <= max_nodes (a trimmed sequence bucket);
-                seq_len is int32 [B] and gives the length of the left-aligned
-                valid segment followed by right padding; live depths are in
-                [0, max_depth]. is_hole is computed from seq_len, node_type,
+                seq_len is int32 [B] in [0, N] and gives the length of the
+                left-aligned valid segment followed by right padding (zero
+                denotes an empty batching row); live depths are in
+                [0, max_depth]. Other live feature IDs must fit their embedding
+                tables. is_hole is computed from seq_len, node_type,
                 and value.
                 action_mask is bool [B, N, A], where
                 A = len(AST_ACTIONS), and marks legal expansions per hole.
@@ -128,7 +130,11 @@ class ASTTransformer(nn.Module):
         sc.check(tree[:5], "BN", jnp.int32)
         nodes_count = tree.node_type.shape[1]
         chex.assert_scalar_in(nodes_count, 1, self.max_nodes)
-        sc.check(tree.is_hole, "BN", jnp.bool_)
+        # Validate before adding the context prefix: -1 would otherwise become
+        # a valid zero-length sequence in the shared attention implementation.
+        _check_range(tree.seq_len, nodes_count, "seq_len must be between 0 and the AST input length")
+        is_hole = tree.is_hole
+        sc.check(is_hole, "BN", jnp.bool_)
         sc.check(tree.action_mask, "BNA", jnp.bool_)
         scale = jnp.asarray([1, 1, 1, 1, 1, self.max_markers] * 2, jnp.float32)
         pair = jnp.concatenate((initial, target), axis=-1).astype(jnp.float32) / scale
@@ -140,13 +146,19 @@ class ASTTransformer(nn.Module):
         node_mask = jnp.arange(nodes_count)[None, :] < tree.seq_len[:, None]
         sc.check(node_mask, "BN", jnp.bool_)
         ids = [jnp.where(node_mask, feature, 0) for feature in tree[:5]]
+        sc.check(ids, "BN", jnp.int32)
+        # JAX embedding lookups can wrap negative IDs or yield NaNs for IDs
+        # above the table. Check live IDs while permitting arbitrary padding.
+        limits = (NUM_NODE_TYPES, len(Field), self.max_depth + 1, 3, len(VALUES) + 1)
+        for name, feature, size in zip(ASTFeatures._fields[:5], ids, limits, strict=True):
+            _check_range(feature.reshape(-1), size - 1, f"Live {name} IDs must be between 0 and {size - 1}")
         nodes = (
             self.node_embedding(ids[0])
             + self.field_embedding(ids[1])
             + self.depth_embedding(ids[2])
             + self.child_embedding(ids[3])
             + self.value_embedding(ids[4])
-            + self.hole_embedding(tree.is_hole.astype(jnp.int32))
+            + self.hole_embedding(is_hole.astype(jnp.int32))
         )
         sc.check(nodes, "BND", self.dtype)
         x = jnp.concatenate((context[:, None], nodes), axis=1)

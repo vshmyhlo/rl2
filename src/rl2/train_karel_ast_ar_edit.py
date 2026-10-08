@@ -138,6 +138,7 @@ class Config:
 
     # Rollout groups and update batching.
     num_tasks: int = 8
+    max_unique_tasks: int | None = None  # Fixed task pool size; 1 overfits one problem, None samples fresh tasks.
     group_size: int = 8
     env_workers: int = 0  # Spawned environment shards; zero steps locally.
     num_minibatches: int = 4
@@ -185,6 +186,11 @@ class Config:
         if type(self.env_workers) is not int:
             raise TypeError("env_workers must be an integer")
         chex.assert_scalar_non_negative(self.env_workers)
+        if self.max_unique_tasks is not None:
+            if type(self.max_unique_tasks) is not int:
+                raise TypeError("max_unique_tasks must be an integer or null")
+            if self.max_unique_tasks < 1:
+                raise ValueError("max_unique_tasks must be positive or null")
         if self.attention_implementation not in ("xla", "cudnn"):
             raise ValueError("attention_implementation must be 'xla' or 'cudnn'")
         if self.attention_implementation == "cudnn" and not self.bf16:
@@ -456,6 +462,28 @@ def run_episodes(
     return batch, results, seed_scores, completed_edits, key, tuple(summary.tree for summary in summaries)
 
 
+def sample_task_groups(rng: np.random.Generator, config: Config) -> list[KarelProgramEnv]:
+    """Sample groups with replacement from fresh tasks or a seed-defined fixed pool.
+
+    Pool entries are generated lazily from (run seed, task index), so restarting
+    or restoring the rollout RNG preserves the pool without extra checkpoint state.
+    num_tasks still controls groups per rollout, even when the pool is smaller.
+    """
+    limit = config.max_unique_tasks
+    indices = rng.integers(0, 2**31 if limit is None else limit, size=config.num_tasks)
+    sc = ShapeChecker(N=config.num_tasks)
+    sc.check(indices, "N", np.int64)
+    tasks: list[KarelProgramEnv] = []
+    for index in indices:
+        seed = int(index)
+        if limit is not None:
+            seed = int(np.random.SeedSequence([config.seed, seed]).generate_state(1).item())
+        task = KarelProgramEnv(config.env)
+        task.reset(seed=seed)
+        tasks.extend([task] * config.group_size)
+    return tasks
+
+
 def collect_rollout(
     state: TrainState, envs: KarelASTEditVectorEnv, rng: np.random.Generator, key: jax.Array, config: Config
 ) -> Rollout:
@@ -463,11 +491,7 @@ def collect_rollout(
     count = config.num_tasks * config.group_size
     if envs.num_envs != count or envs.config != config.edit_config:
         raise ValueError("Expected num_tasks * group_size environments with configured limits")
-    tasks: list[KarelProgramEnv] = []
-    for seed in rng.integers(0, 2**31, size=config.num_tasks):
-        task = KarelProgramEnv(config.env)
-        task.reset(seed=int(seed))
-        tasks.extend([task] * config.group_size)
+    tasks = sample_task_groups(rng, config)
     batch, results, seed_scores, completed_edits, key, programs = run_episodes(state, tasks, envs, key, config)
     sc = ShapeChecker(B=count, T=batch.actions.shape[0])
     sc.check(batch.rewards, "TB", np.float32)

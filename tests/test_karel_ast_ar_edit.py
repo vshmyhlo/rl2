@@ -1,5 +1,6 @@
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock
 
 import chex
@@ -12,6 +13,7 @@ from flax.training.train_state import TrainState
 
 from rl2 import karel_ast_edit as editing
 from rl2 import train_karel_ast_ar_edit as edit
+from rl2 import train_karel_ppo_ast_ar_edit as ppo_edit
 from rl2.edit_transformer import PAD_EVENT, EditTransformer
 from rl2.karel import TOKEN_TO_ID, KarelConfig, KarelPair, KarelProgramEnv
 from rl2.karel_ast import ACTION_ID, KarelAST, program_actions
@@ -77,6 +79,94 @@ def tree_from(source: str, config: edit.Config) -> KarelAST:
     for action in program_actions(tuple(source.split())):
         tree = tree.expand(action)
     return tree
+
+
+def test_single_task_repeats_across_rollouts(config: edit.Config) -> None:
+    config = replace(config, max_unique_tasks=1, num_tasks=2)
+    rng = np.random.default_rng(4)
+    copy = KarelProgramEnv(config.env)
+    first = edit.sample_task_groups(rng, config)
+    expected = copy.reset_from(first[0])
+    for tasks in (first, edit.sample_task_groups(rng, config)):
+        assert len(tasks) == config.num_tasks * config.group_size
+        for start in range(0, len(tasks), config.group_size):
+            assert all(task is tasks[start] for task in tasks[start : start + config.group_size])
+        for task in tasks:
+            pair = copy.reset_from(task)
+            np.testing.assert_array_equal(pair.initial, expected.initial)
+            np.testing.assert_array_equal(pair.target, expected.target)
+            assert task.reference_program == first[0].reference_program
+
+
+def test_task_pool_sampling_and_rng_resume(config: edit.Config, monkeypatch: pytest.MonkeyPatch) -> None:
+    factory = MagicMock()
+    monkeypatch.setattr(edit, "KarelProgramEnv", factory)
+    config = replace(config, num_tasks=4, max_unique_tasks=3)
+    rng = np.random.default_rng(4)
+
+    def sampled_seeds(settings: edit.Config, generator: np.random.Generator) -> tuple[int, ...]:
+        factory.return_value.reset.reset_mock()
+        edit.sample_task_groups(generator, settings)
+        return tuple(call.kwargs["seed"] for call in factory.return_value.reset.call_args_list)
+
+    first = sampled_seeds(config, rng)
+    restored = np.random.default_rng()
+    restored.bit_generator.state = rng.bit_generator.state
+    second = sampled_seeds(config, rng)
+    assert second == sampled_seeds(config, restored)
+    assert 1 < len(set(first + second)) <= 3
+    assert first == sampled_seeds(config, np.random.default_rng(4))
+    assert first != sampled_seeds(replace(config, seed=config.seed + 1), np.random.default_rng(4))
+    # Unlimited sampling retains the original RNG sequence and keeps drawing fresh seeds.
+    unlimited = replace(config, max_unique_tasks=None)
+    expected_rng = np.random.default_rng(4)
+    rng = np.random.default_rng(4)
+    for _ in range(2):
+        assert sampled_seeds(unlimited, rng) == tuple(expected_rng.integers(0, 2**31, size=config.num_tasks))
+
+
+@pytest.mark.parametrize("trainer", [edit, ppo_edit], ids=["grpo", "ppo"])
+def test_collect_rollout_uses_fixed_task_pool(
+    config: edit.Config, monkeypatch: pytest.MonkeyPatch, trainer: ModuleType
+) -> None:
+    config = replace(config, max_unique_tasks=1)
+    sample = MagicMock(wraps=edit.sample_task_groups)
+    monkeypatch.setattr(edit, "sample_task_groups", sample)
+    # Stop at the model boundary: sampling wiring needs no policy execution.
+    run = MagicMock(side_effect=RuntimeError("episodes reached"))
+    monkeypatch.setattr(trainer, "run_episodes", run)
+    with (
+        edit.KarelASTEditVectorEnv(config.edit_config, config.num_tasks * config.group_size) as envs,
+        pytest.raises(RuntimeError, match="episodes reached"),
+    ):
+        trainer.collect_rollout(MagicMock(), envs, np.random.default_rng(4), jax.random.key(7), config)
+    sample.assert_called_once()
+    assert sample.call_args.args[1].max_unique_tasks == 1
+    assert len(run.call_args.args[1]) == config.num_tasks * config.group_size
+
+
+@pytest.mark.parametrize(
+    "value,error",
+    [("0", ValueError), ("-1", ValueError), ("true", TypeError), ("1.5", TypeError)],
+    ids=["zero", "negative", "boolean", "fractional"],
+)
+def test_load_config_rejects_invalid_task_limit(tmp_path: Path, value: str, error: type[Exception]) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(f"max_unique_tasks: {value}\n")
+    with pytest.raises(error, match="max_unique_tasks"):
+        edit.load_config(path)
+
+
+def test_load_config_task_limit(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("max_unique_tasks: 1\n")
+    config = edit.load_config(path)
+    assert config.max_unique_tasks == 1
+    path.write_text(yaml.safe_dump(asdict(config)))
+    assert edit.load_config(path) == config
+    for contents in ("max_unique_tasks: null\n", "{}\n"):
+        path.write_text(contents)
+        assert edit.load_config(path).max_unique_tasks is None
 
 
 def test_replacement_grows_shrinks_and_preserves_context(config: edit.Config) -> None:
@@ -616,9 +706,9 @@ def test_history_is_causal_and_retains_action_and_update_context(
     np.testing.assert_array_equal(logits[:update_index], image_logits[:update_index])
     assert not np.allclose(logits[update_index], image_logits[update_index])
     # An earlier seed token remains in causal context after the initial report.
-    values = np.array(history.events.value)
+    values = np.array(history.events.action)
     values[2] = 1 + config.max_nodes + ACTION_ID["turnRight"]
-    edited = history._replace(events=history.events._replace(value=values))
+    edited = history._replace(events=history.events._replace(action=values))
     edited_logits = np.asarray(predict(state, edited))
     np.testing.assert_array_equal(logits[:2], edited_logits[:2])
     assert not np.allclose(logits[update_index], edited_logits[update_index])
@@ -689,10 +779,10 @@ def test_action_feedback_and_finished_padding_replay_exactly(
     replay = edit.action_log_prob(edit.mask_logits(logits, batch.legal), batch.actions)
     np.testing.assert_allclose(replay, batch.old_log_probs, atol=2e-6)
     # An earlier action remains visible after a subsequent execution update.
-    values = np.array(events.value)
+    values = np.array(events.action)
     action_index = initial_update + 3  # First grammar action after location selection.
     values[action_index, 1] = 1 + config.max_nodes + ACTION_ID["turnLeft"]
-    changed = batch.history._replace(events=events._replace(value=values))
+    changed = batch.history._replace(events=events._replace(action=values))
     changed_logits = predict(state, changed)
     np.testing.assert_array_equal(changed_logits[:action_index], logits[:action_index])
     assert not np.allclose(changed_logits[completion, 1], logits[completion, 1])

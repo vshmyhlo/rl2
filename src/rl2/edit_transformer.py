@@ -26,17 +26,29 @@ class Events(NamedTuple):
     """Time-major history, or one batched event for cached decoding.
 
     NamedTuple makes this a JAX pytree; tree.map preserves its type and fields.
-    kind/value: int32 [T,B] (or [B]); output: int32 [T,B,H,W,6];
-    feedback: float32 [T,B,8]. Every event carries the latest execution image;
-    ACTION events carry resulting feedback scalars; UPDATE is used only for the initial seed report.
-    SEED values are the initial program's DFS grammar actions in policy IDs.
-    ACTION values are sampled location/grammar/STOP IDs. PAD is trailing only
-    and does not advance the cache. Values on UPDATE/PAD and feedback on
-    SEED/PAD are ignored.
+    T is the number of events, B the batch size, and H/W the grid dimensions.
+    For one cached decoding step, omit the leading T dimension from every field.
+
+    Attributes:
+        kind: int32 [T,B] event types: PAD_EVENT (0) for trailing padding,
+            SEED_EVENT (1) for initial program tokens, ACTION_EVENT (2) for
+            sampled actions and their results, or UPDATE_EVENT (3) for the
+            initial seed execution report. Padding does not advance the cache.
+        action: int32 [T,B] policy token IDs. SEED contains the initial program's
+            depth-first grammar actions; ACTION contains sampled location,
+            grammar, or STOP IDs. Ignored for UPDATE and PAD.
+        output: int32 [T,B,H,W,6] latest execution grid, included in every
+            non-padding event. ACTION carries the resulting observation's grid;
+            actions that do not execute a completed edit retain the latest grid.
+        feedback: float32 [T,B,8] execution feedback in this order: score,
+            success, runtime error, execution limit, ticks, length, score delta,
+            and sequence tokens left. ACTION carries the resulting observation's
+            feedback; UPDATE carries the initial seed report. Ignored for SEED
+            and PAD.
     """
 
     kind: Array
-    value: Array
+    action: Array
     output: Array
     feedback: Array
 
@@ -122,7 +134,7 @@ class EditTransformer(nn.Module):
         """Add the task/current-image embedding to every event's token or feedback embedding."""
         sc = ShapeChecker(C=6, F=FEEDBACK_SIZE, D=self.d_model)
         sc.check((initial, target), "BHWC", jnp.int32)
-        sc.check((events.kind, events.value), "TB", jnp.int32)
+        sc.check((events.kind, events.action), "TB", jnp.int32)
         sc.check(events.output, "TBHWC", jnp.int32)
         sc.check(events.feedback, "TBF", jnp.float32)
         active = events.kind != PAD_EVENT
@@ -131,7 +143,7 @@ class EditTransformer(nn.Module):
         # Mask unused fields before nonlinear operations, so ignored NaNs and
         # out-of-range embedding IDs cannot contaminate parameter gradients.
         feedback = jnp.where(has_feedback[..., None], events.feedback, 0)
-        token_ids = jnp.where(has_token, events.value, 0)
+        token_ids = jnp.where(has_token, events.action, 0)
         output = jnp.where(active[..., None, None, None], events.output, 0)
         grids = self.encode_grids(
             jnp.broadcast_to(initial, events.output.shape),
@@ -178,7 +190,7 @@ class EditTransformer(nn.Module):
         """Append each non-PAD event; padding preserves the cache and returns zero logits."""
         sc = ShapeChecker(C=6, F=FEEDBACK_SIZE, D=self.d_model, V=1 + self.max_nodes + len(AST_ACTIONS))
         sc.check((carry.initial, carry.target), "BHWC", jnp.int32)
-        sc.check((event.kind, event.value), "B", jnp.int32)
+        sc.check((event.kind, event.action), "B", jnp.int32)
         sc.check(event.output, "BHWC", jnp.int32)
         sc.check(event.feedback, "BF", jnp.float32)
         sequence = jax.tree.map(partial(jnp.expand_dims, axis=0), event)

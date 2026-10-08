@@ -12,7 +12,17 @@ from flax.training.train_state import TrainState
 
 from rl2.ast_transformer import ASTTransformer
 from rl2.karel import KarelConfig, _parse
-from rl2.karel_ast import ACTION_ID, AST_ACTIONS, ASTFeatures, KarelAST, batch_features, teacher_forcing
+from rl2.karel_ast import (
+    ACTION_ID,
+    AST_ACTIONS,
+    NUM_NODE_TYPES,
+    VALUES,
+    ASTFeatures,
+    Field,
+    KarelAST,
+    batch_features,
+    teacher_forcing,
+)
 from rl2.shape_checker import ShapeChecker
 from rl2.train_karel_ast_grpo import (
     Config,
@@ -268,3 +278,44 @@ def test_ast_backbone_accepts_odd_head_width_without_rope(batch: ModelBatch) -> 
     sc = ShapeChecker(B=1, N=24, A=len(AST_ACTIONS))
     sc.check(logits, "BNA", jnp.float32)
     np.testing.assert_array_equal(np.isfinite(logits[..., 1:]), tree.action_mask[..., 1:])
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        pytest.param("seq_len", -1, id="negative-length"),
+        pytest.param("seq_len", 25, id="length-exceeds-input"),
+        pytest.param("node_type", NUM_NODE_TYPES, id="node-type-overflow"),
+        pytest.param("field", len(Field), id="field-overflow"),
+        pytest.param("depth", 17, id="depth-exceeds-model"),
+        pytest.param("child_index", 3, id="child-index-overflow"),
+        pytest.param("value", len(VALUES) + 1, id="value-overflow"),
+        pytest.param("value", -1, id="negative-id-must-not-wrap"),
+    ],
+)
+def test_invalid_live_features_are_rejected(batch: ModelBatch, state: TrainState, field: str, value: int) -> None:
+    tree = ASTFeatures(*(array[:1].copy() for array in batch.tree))
+    getattr(tree, field).flat[0] = value
+    with pytest.raises(ValueError, match=field):
+        state.apply_fn({"params": state.params}, batch.initial[:1], batch.target[:1], tree)
+
+
+def test_feature_validation_under_jit_preserves_empty_rows(batch: ModelBatch, state: TrainState) -> None:
+    tree = jax.tree.map(jnp.asarray, ASTFeatures(*(array[:1] for array in batch.tree)))
+
+    @jax.jit
+    def apply(features: ASTFeatures) -> jax.Array:
+        return state.apply_fn({"params": state.params}, batch.initial[:1], batch.target[:1], features)
+
+    empty = tree._replace(seq_len=jnp.zeros_like(tree.seq_len), action_mask=jnp.zeros_like(tree.action_mask))
+    empty = ASTFeatures(*(jnp.full_like(array, -999) for array in empty[:5]), *empty[5:])
+    probabilities = jax.nn.softmax(apply(empty))
+    np.testing.assert_array_equal(probabilities[..., 0], 1)
+    np.testing.assert_array_equal(probabilities[..., 1:], 0)
+    for invalid, message in (
+        (tree._replace(seq_len=jnp.full_like(tree.seq_len, -1)), "seq_len"),
+        (tree._replace(depth=tree.depth.at[0, 0].set(17)), "depth"),
+    ):
+        # Exceptions raised by debug callbacks are wrapped by the JAX runtime.
+        with pytest.raises(jax.errors.JaxRuntimeError, match=message):
+            apply(invalid).block_until_ready()

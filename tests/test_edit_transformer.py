@@ -90,7 +90,7 @@ def test_unused_event_fields_do_not_contaminate_gradients(history: History) -> N
     has_token = (events.kind == SEED_EVENT) | (events.kind == ACTION_EVENT)
     has_feedback = (events.kind == UPDATE_EVENT) | (events.kind == ACTION_EVENT)
     dirty = events._replace(
-        value=jnp.where(has_token, events.value, 10000),
+        action=jnp.where(has_token, events.action, 10000),
         feedback=jnp.where(has_feedback[..., None], events.feedback, jnp.nan),
     )
 

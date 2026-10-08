@@ -339,11 +339,7 @@ def collect_rollout(
     count = config.num_tasks * config.group_size
     if envs.num_envs != count or envs.config != config.edit_config:
         raise ValueError("Expected num_tasks * group_size environments with configured limits")
-    tasks: list[KarelProgramEnv] = []
-    for seed in rng.integers(0, 2**31, size=config.num_tasks):
-        task = KarelProgramEnv(config.env)
-        task.reset(seed=int(seed))
-        tasks.extend([task] * config.group_size)
+    tasks = edit.sample_task_groups(rng, config)
     batch, results, seed_scores, completed_edits, key, programs = run_episodes(state, tasks, envs, key, config)
     scores = np.asarray([result.score for result in results], np.float32)
     rewards = batch.rewards.sum(axis=0)
