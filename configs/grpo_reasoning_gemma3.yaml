@@ -1,0 +1,46 @@
+# uv run --extra cuda12 --extra gemma3 python -m rl2.train_grpo_reasoning --config configs/grpo_reasoning_gemma3.yaml
+model_type: gemma3
+checkpoint: gs://gemma-data/checkpoints/gemma3-270m-pt # Or a local native Gemma/Orbax checkpoint
+tokenizer: null # Official Gemma 3 tokenizer; or a local/gs:// SentencePiece .model file
+backend: jax # Gemma uses JAX attention on CPU/GPU; triton is GDN2-only
+dtype: bfloat16
+
+task: basic_arithmetic
+task_config:
+  min_terms: 2
+  max_terms: 2
+  min_digits: 1
+  max_digits: 1
+  operators: ["+"]
+  allow_parentheses: false
+  allow_negation: false
+  format_style: simple
+prompt_examples:
+  - question: Calculate 2 + 3.
+    completion: |-
+      2 + 3 = 5.
+      <answer>5</answer>
+  - question: Calculate 0 + 7.
+    completion: |-
+      0 + 7 = 7.
+      <answer>7</answer>
+seed: 1
+total_updates: 1000
+# Gemma's 262144-token vocabulary makes logits memory intensive; start small.
+num_tasks: 1
+group_size: 4
+num_minibatches: 4
+update_epochs: 1
+max_prompt_tokens: 128
+max_new_tokens: 64
+temperature: 1.0
+learning_rate: 1.0e-6
+clip_coef: 0.2
+beta: 0.0
+duration_penalty_coef: 0.1
+max_grad_norm: 1.0
+log_dir: runs
+run_id: gemma3_270m_official_arithmetic
+log_interval: 10
+log_completion_count: 4
+checkpoint_interval_seconds: 600

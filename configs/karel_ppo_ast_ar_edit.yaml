@@ -1,6 +1,6 @@
 seed: 1
 total_updates: 100000
-num_tasks: 32
+num_tasks: 8
 group_size: 8 # Optional repeated episodes per task; PPO also supports 1
 env_workers: 8 # Persistent spawned workers for batched reset/stepping; 0 runs locally
 num_minibatches: 4 # Must divide num_tasks * group_size; episodes stay together
@@ -11,9 +11,9 @@ max_nodes: 128 # Whole candidate tree, including lists and values
 max_depth: 16 # AST edges, including lists
 bf16: true
 attention_implementation: cudnn # Use xla for CPU
-d_model: 512
-num_layers: 8
-num_heads: 8
+d_model: 1024
+num_layers: 20
+num_heads: 16
 num_kv_heads: null
 learning_rate: 0.0001
 anneal_lr: true

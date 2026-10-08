@@ -31,9 +31,9 @@ max_prompt_tokens: 256 # Includes instructions/BOS; oversized prompts fail, neve
 max_new_tokens: 128 # Includes EOS; unfinished completions are still scored
 # Full-vocabulary sampling, with the same temperature in policy replay.
 temperature: 1.0
-learning_rate: 0.000001
+learning_rate: 1.0e-5
 clip_coef: 0.2
-beta: 0.01 # Frozen initial-policy KL penalty; 0 disables reference replay
+beta: 0 # Frozen initial-policy KL penalty; 0 disables reference replay
 duration_penalty_coef: 0.1 # Subtract coef * generated tokens / max_new_tokens; EOS counts, padding does not
 max_grad_norm: 1.0
 

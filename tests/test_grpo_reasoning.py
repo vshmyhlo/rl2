@@ -245,7 +245,16 @@ class FakeTokenizer:
 def test_prompts_and_real_reasoning_gym_rewards() -> None:
     dataset = reasoning_gym.create_dataset("leg_counting", seed=1, size=2)
     entries = [dataset[i] for i in range(2)]
-    tokens, lengths = grpo.encode_prompts(entries, FakeTokenizer(), 3)
+    tokenizer = Mock(wraps=FakeTokenizer())
+    tokens, lengths = grpo.encode_prompts(entries, tokenizer, 3)
+    prompt = tokenizer.encode.call_args_list[0].args[0]
+    assert prompt.startswith("Answer only the last question.\nGive brief reasoning,")
+    assert "Finish immediately after </answer>." in prompt
+    assert "Question: How many legs are there in total if you have " in prompt
+    assert "Your task is to count" not in prompt
+    assert "Now, how many" not in prompt
+    assert "\n\n\n" not in prompt
+    assert prompt.endswith("?\n\nAnswer:")
     np.testing.assert_array_equal(tokens, [[1, 3, 0], [1, 3, 0]])
     np.testing.assert_array_equal(lengths, [2, 2])
     with pytest.raises(ValueError, match="Increase max_prompt_tokens"):
@@ -263,7 +272,7 @@ def test_prompts_and_real_reasoning_gym_rewards() -> None:
 
 
 def test_prompt_examples_precede_question_without_leaking_target_answer() -> None:
-    examples = [grpo.PromptExample("How many legs do two dogs have?", "2 * 4 = 8.\n<answer>8</answer>")]
+    examples = [grpo.PromptExample("\nHow many legs do two dogs have?\n", "2 * 4 = 8.\n<answer>8</answer>\n")]
     tokenizer = Mock(wraps=FakeTokenizer())
     entry = {"question": "How many legs do three spiders have?", "answer": "24"}
     grpo.encode_prompts([entry], tokenizer, 3, examples)
@@ -271,10 +280,17 @@ def test_prompt_examples_precede_question_without_leaking_target_answer() -> Non
     assert "Question: How many legs do two dogs have?\n\nAnswer: 2 * 4 = 8.\n<answer>8</answer>" in prompt
     assert prompt.endswith("Question: How many legs do three spiders have?\n\nAnswer:")
     assert "24" not in prompt
+    assert "\n\n\n" not in prompt
     # Demonstration answers cannot earn reward for an empty generated completion.
     dataset = Mock()
     np.testing.assert_array_equal(grpo.score_completions(dataset, [entry], [""], 1), [0])
     dataset.score_answer.assert_not_called()
+
+
+def test_prompt_preserves_other_tasks_internal_layout() -> None:
+    question = "  A B\nC   D\n\nExplain how to cross this grid."
+    prompt = grpo.build_prompt(question + "\n\n")
+    assert prompt.endswith(f"Question: {question}\n\nAnswer:")
 
 
 def test_format_group_samples_preserves_literal_multiline_text() -> None:
@@ -294,6 +310,7 @@ def test_logged_completions_are_capped_and_stay_in_one_group(monkeypatch: pytest
     key = jax.random.key(1)
     dataset = Mock()
     dataset.__getitem__ = Mock(side_effect=[{"question": "First question"}, {"question": "Second question"}])
+    dataset.score_answer = Mock(side_effect=[0.0, 0.25, 0.5, 0.0, 0.75, 0.5, 0.1, 0.25] + [1.0] * 8)
     tokenizer = Mock(wraps=FakeTokenizer())
     now = [0.0]
     decoded = [0]
@@ -305,7 +322,7 @@ def test_logged_completions_are_capped_and_stay_in_one_group(monkeypatch: pytest
         now[0] += 0.25
         index = decoded[0]
         decoded[0] += 1
-        return f"sample_{index}"
+        return f"sample_{index}<answer>{index}</answer>"
 
     original_score = grpo.score_completions
 
@@ -332,7 +349,9 @@ def test_logged_completions_are_capped_and_stay_in_one_group(monkeypatch: pytest
             )
         ),
     )
-    _, diagnostics, samples, _ = grpo.collect_rollout(Mock(params={}), Mock(), {}, dataset, tokenizer, key, 0, config)
+    batch, diagnostics, samples, _ = grpo.collect_rollout(
+        Mock(params={}), Mock(), {}, dataset, tokenizer, key, 0, config
+    )
     assert diagnostics["time/decoding_seconds"] == 4.0
     assert diagnostics["time/scoring_seconds"] == 3.0
     assert diagnostics["time/jax_seconds"] == 0.0
@@ -340,10 +359,34 @@ def test_logged_completions_are_capped_and_stay_in_one_group(monkeypatch: pytest
     assert samples.count("### Shared prompt") == 1
     assert "First question" in samples and "Second question" not in samples
     assert samples.count("### Completion ") == 4
-    for index in range(4):
-        assert f"### Completion {index + 1}\n\n    sample_{index}\n" in samples
-    for index in range(4, 16):
-        assert f"sample_{index}" not in samples
+    selected = [4, 2, 5, 1]  # Sort the whole group before capping; preserve ties at/before the cutoff.
+    for rank, (index, reward) in enumerate(zip(selected, [0.75, 0.5, 0.5, 0.25], strict=True), start=1):
+        assert (
+            f"### Completion {rank}\n\n    sample_{index}<answer>{index}</answer>\n\n**Reward:** {reward:.3f}"
+            in samples
+        )
+    for index in set(range(16)) - set(selected):
+        assert f"sample_{index}<answer>" not in samples
+    # Sorting the display does not reorder the training batch's advantages.
+    assert int(jnp.argmax(batch.advantages[:8])) == 4
+
+
+def test_duration_penalty_rewards_shorter_completions_and_ignores_padding() -> None:
+    # Immediate EOS, a two-token response ending in EOS, and a full-budget response.
+    mask = jnp.array([[True, False, False, False], [True, True, False, False], [True, True, True, True]])
+    task_rewards = jnp.array([0, 1, 1], jnp.float32)
+    rewards, penalties = grpo.apply_duration_penalty(task_rewards, mask, 0.2)
+    np.testing.assert_allclose(penalties, [0.05, 0.1, 0.2])
+    np.testing.assert_allclose(rewards, [-0.05, 0.9, 0.8])
+    assert rewards[1] > rewards[2] > rewards[0]
+    advantages = grpo.group_advantages(rewards[None, 1:])
+    assert advantages[0, 0] > 0 and advantages[0, 1] < 0
+    disabled_rewards, disabled_penalties = grpo.apply_duration_penalty(task_rewards, mask, 0.0)
+    np.testing.assert_array_equal(disabled_rewards, task_rewards)
+    np.testing.assert_array_equal(disabled_penalties, [0, 0, 0])
+    # Uniform full-budget penalties cancel under group normalization.
+    tied_rewards, _ = grpo.apply_duration_penalty(jnp.zeros(2, jnp.float32), jnp.ones((2, 4), jnp.bool_), 0.2)
+    np.testing.assert_array_equal(grpo.group_advantages(tied_rewards[None]), [[0, 0]])
 
 
 def test_collect_rollout_grouping_and_reference(
@@ -357,6 +400,7 @@ def test_collect_rollout_grouping_and_reference(
         num_minibatches=1,
         max_prompt_tokens=3,
         max_new_tokens=3,
+        duration_penalty_coef=0.1,
         prompt_examples=[grpo.PromptExample("How many legs does a dog have?", "<answer>4</answer>")],
     )
     state = grpo.create_state(model, params, config)
@@ -381,8 +425,13 @@ def test_collect_rollout_grouping_and_reference(
     assert samples.count("### Completion ") == 2
     encoded_prompt = tokenizer.encode.call_args.args[0]
     assert "### Shared prompt\n\n    " + encoded_prompt.replace("\n", "\n    ") in samples
-    assert "### Completion 1\n\n    <answer>4</answer>\n\n**Reward:** 1.000" in samples
-    assert samples.endswith("**Reward:** 0.000")
+    expected_rewards = np.array([1, 0]) - 0.1 * np.asarray(batch.mask).sum(axis=1) / 3
+    assert f"### Completion 1\n\n    <answer>4</answer>\n\n**Reward:** {expected_rewards[0]:.3f}" in samples
+    assert samples.endswith(f"**Reward:** {expected_rewards[1]:.3f}")
+    np.testing.assert_allclose(diagnostics["charts/reward_mean"], expected_rewards.mean())
+    assert diagnostics["charts/task_reward_mean"] == 0.5
+    assert diagnostics["charts/success_rate"] == 0.5
+    assert diagnostics["charts/duration_penalty_mean"] > 0
     assert diagnostics["charts/informative_group_fraction"] == 1.0
     np.testing.assert_allclose(batch.advantages, [1, -1], atol=3e-4)
     assert jax.random.key_data(key).shape == (2,)
@@ -412,6 +461,8 @@ def test_collect_rollout_grouping_and_reference(
         ({"num_minibatches": 3}, "num_minibatches"),
         ({"temperature": 0}, "temperature"),
         ({"beta": float("nan")}, "beta"),
+        ({"duration_penalty_coef": -0.1}, "duration_penalty_coef"),
+        ({"duration_penalty_coef": float("nan")}, "duration_penalty_coef"),
         ({"max_new_tokens": 0}, "max_new_tokens"),
         ({"clip_coef": 1}, "clip_coef"),
         ({"seed": -1}, "seed"),
@@ -426,9 +477,23 @@ def test_config_validation(overrides: dict[str, Any], match: str) -> None:
 
 def test_yaml_config(tmp_path: Path) -> None:
     config = grpo.load_config("configs/grpo_reasoning.yaml")
-    assert config.task == "leg_counting"
+    assert config.task == "basic_arithmetic"
+    assert config.duration_penalty_coef == 0.1
     assert config.group_size == 8 and config.total_updates == 100000
-    assert config.task_config == {"min_animals": 1, "max_animals": 3, "min_instances": 1, "max_instances": 3}
+    assert config.task_config["min_terms"] == 2
+    assert config.task_config["max_terms"] == 3
+    dataset = reasoning_gym.create_dataset(config.task, seed=config.seed, size=5, **config.task_config)
+    # These indices exercise both term-count boundaries with the configured seed.
+    for index, num_terms in ((0, 2), (4, 3)):
+        entry = dataset[index]
+        parts = entry["metadata"]["expression"].split()
+        operands = [int(value) for value in parts[::2]]
+        assert len(operands) == num_terms
+        assert parts[1::2] == ["+"] * (num_terms - 1)
+        assert all(0 <= value <= 10 for value in operands)
+        assert entry["question"] == f"Calculate {' '.join(parts)}."
+        assert entry["answer"] == str(sum(operands))
+        assert dataset.score_answer(entry["answer"], entry) == 1.0
     assert len(config.prompt_examples) == 2
     assert all(grpo.extract_answer(example.completion) for example in config.prompt_examples)
     assert config.run_id is not None

@@ -1,4 +1,4 @@
-"""Fine-tune a converted GDN2 checkpoint with GRPO on Reasoning Gym.
+"""Fine-tune GDN2 or Gemma 3 270M with GRPO on Reasoning Gym.
 
 Run with ``uv run --extra gdn2 python -m rl2.train_grpo_reasoning --config
 configs/grpo_reasoning.yaml``. Sampling and replay use the same full-vocabulary,
@@ -33,12 +33,14 @@ from tensorboardX import SummaryWriter
 from rl2.gdn2.checkpoints import Parameters, load_checkpoint, save_checkpoint
 from rl2.gdn2.generate import DEFAULT_CHECKPOINT, load_tokenizer
 from rl2.gdn2.model import GatedDeltaNet2Backend, GatedDeltaNet2LM, GatedDeltaNet2StackCarry
+from rl2.gemma3 import Gemma3Carry, Gemma3LM, Gemma3Tokenizer, load_gemma3_checkpoint, save_gemma3_checkpoint
 from rl2.jax_cache import configure_compilation_cache
 from rl2.shape_checker import ShapeChecker
 from rl2.utils import read_bytes, read_optional, write_bytes
 
 type Entry = dict[str, Any]
 type Metrics = dict[str, jax.Array]
+type LanguageModel = GatedDeltaNet2LM | Gemma3LM
 
 
 class Tokenizer(Protocol):
@@ -57,6 +59,7 @@ class PromptExample:
 
 @dataclass(frozen=True)
 class Config:
+    model_type: Literal["gdn2", "gemma3"] = "gdn2"
     checkpoint: str = str(DEFAULT_CHECKPOINT)
     tokenizer: str | None = None
     backend: GatedDeltaNet2Backend = "jax"
@@ -85,6 +88,10 @@ class Config:
     checkpoint_interval_seconds: float = 600.0
 
     def __post_init__(self) -> None:
+        if self.model_type not in ("gdn2", "gemma3"):
+            raise ValueError("model_type must be gdn2/gemma3")
+        if self.model_type == "gemma3" and self.backend != "jax":
+            raise ValueError("Gemma 3 requires backend: jax (also on GPUs)")
         for name in (
             "total_updates",
             "num_tasks",
@@ -196,14 +203,29 @@ def policy_log_probs(logits: jax.Array, tokens: jax.Array, temperature: float) -
 
 def build_prompt(question: str, examples: Sequence[PromptExample] = ()) -> str:
     """Use the same full prompt for tokenization and sample logging."""
+
+    def format_question(text: str) -> str:
+        # Remove only the known redundant leg-counting preamble. Other tasks may
+        # contain meaningful layout, so preserve their internal whitespace.
+        text = text.strip("\n")
+        prefix = (
+            "Your task is to count how many legs there are in total when given a list of animals.\n\n"
+            "Now, how many legs are there in total if you have "
+        )
+        if text.startswith(prefix):
+            return "How many legs are there in total if you have " + text[len(prefix) :]
+        return text
+
     instruction = (
-        "Solve the following problem. You may reason before answering. "
-        "Put only your final answer inside <answer>...</answer>.\n\n"
+        "Answer only the last question.\n"
+        "Give brief reasoning, then put only your final answer inside <answer>...</answer>.\n"
+        "Finish immediately after </answer>.\n\n"
     )
     demonstrations = "".join(
-        f"Question: {example.question}\n\nAnswer: {example.completion}\n\n" for example in examples
+        f"Question: {format_question(example.question)}\n\nAnswer: {example.completion.rstrip('\n')}\n\n"
+        for example in examples
     )
-    return instruction + demonstrations + f"Question: {question}\n\nAnswer:"
+    return instruction + demonstrations + f"Question: {format_question(question)}\n\nAnswer:"
 
 
 def format_group_samples(prompt: str, completions: Sequence[str], rewards: Sequence[float]) -> str:
@@ -241,13 +263,13 @@ def encode_prompts(
     return jnp.asarray(prompts), jnp.asarray(lengths)
 
 
-type DecodeCarry = tuple[GatedDeltaNet2StackCarry, jax.Array, jax.Array, jax.Array]
+type DecodeCarry = tuple[GatedDeltaNet2StackCarry | Gemma3Carry, jax.Array, jax.Array, jax.Array]
 type DecodeOutput = tuple[jax.Array, jax.Array, jax.Array]
 
 
 @partial(jax.jit, static_argnames=("model", "group_size", "max_new_tokens", "temperature", "eos_token_id"))
 def generate(
-    model: GatedDeltaNet2LM,
+    model: LanguageModel,
     params: Parameters,
     prompts: jax.Array,
     lengths: jax.Array,
@@ -258,12 +280,17 @@ def generate(
     temperature: float,
     eos_token_id: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Prefill unique prompts once; independently sample each repeated recurrent state."""
+    """Prefill unique prompts once; independently sample each repeated model state."""
     sc = ShapeChecker(V=model.vocab_size)
     sc.check(prompts, "NP", jnp.int32)
     sc.check(lengths, "N", jnp.int32)
     sc.check(jax.random.key_data(key), "R", jnp.uint32)
-    carry, logits = model.apply({"params": params}, prompts, lengths)
+    if isinstance(model, Gemma3LM):
+        if prompts.shape[1] + max_new_tokens > model.cache_length:
+            raise ValueError("Prompt + completion budget exceeds Gemma cache length")
+        carry, logits = model.prefill(params, prompts, lengths)
+    else:
+        carry, logits = model.apply({"params": params}, prompts, lengths)
     sc.check(logits, "NPV", jnp.float32)
     logits = jnp.repeat(logits[jnp.arange(prompts.shape[0]), lengths - 1], group_size, axis=0)
 
@@ -284,7 +311,10 @@ def generate(
         log_probs = policy_log_probs(logits[:, None], tokens[:, None], temperature)[:, 0]
         output = (tokens, jnp.where(active, log_probs, 0.0), active)
         active = active & (tokens != eos_token_id)
-        carry, logits = model.apply({"params": params}, tokens, active, carry, method=model.step)
+        if isinstance(model, Gemma3LM):
+            carry, logits = model.step(params, tokens, active, carry)
+        else:
+            carry, logits = model.apply({"params": params}, tokens, active, carry, method=model.step)
         return (carry, logits, active, key), output
 
     (_, _, _, key), (tokens, log_probs, mask) = jax.lax.scan(
@@ -303,7 +333,7 @@ def generate(
 
 @partial(jax.jit, static_argnames=("model", "temperature"))
 def completion_log_probs(
-    model: GatedDeltaNet2LM,
+    model: LanguageModel,
     params: Parameters,
     batch: GRPOBatch,
     temperature: float,
@@ -363,7 +393,7 @@ def objective(log_probs: jax.Array, batch: GRPOBatch, clip_coef: float, beta: fl
     return loss, metrics
 
 
-def create_state(model: GatedDeltaNet2LM, params: Parameters, config: Config) -> TrainState:
+def create_state(model: LanguageModel, params: Parameters, config: Config) -> TrainState:
     return TrainState.create(
         apply_fn=model.apply,
         params=jax.device_put(params),
@@ -374,7 +404,7 @@ def create_state(model: GatedDeltaNet2LM, params: Parameters, config: Config) ->
 @partial(jax.jit, static_argnames=("model", "temperature", "clip_coef", "beta"))
 def update(
     state: TrainState,
-    model: GatedDeltaNet2LM,
+    model: LanguageModel,
     batch: GRPOBatch,
     *,
     temperature: float,
@@ -412,7 +442,9 @@ def score_completions(
 
 
 def apply_duration_penalty(
-    task_rewards: jax.Array, mask: jax.Array, coefficient: float,
+    task_rewards: jax.Array,
+    mask: jax.Array,
+    coefficient: float,
 ) -> tuple[jax.Array, jax.Array]:
     """Deduct a token-budget-normalized cost, counting EOS but excluding padding."""
     sc = ShapeChecker()
@@ -427,7 +459,7 @@ def apply_duration_penalty(
 
 def collect_rollout(
     state: TrainState,
-    model: GatedDeltaNet2LM,
+    model: LanguageModel,
     ref_params: Parameters,
     dataset: ProceduralDataset,
     tokenizer: Tokenizer,
@@ -499,10 +531,15 @@ def collect_rollout(
         }
     )
     count = min(config.log_completion_count, config.group_size)
+    group_rewards = np.asarray(rewards[: config.group_size])
+    sc = ShapeChecker(G=config.group_size)
+    sc.check(group_rewards, "G", np.float32)
+    # Stable sorting preserves sampling order for ties; only the displayed group changes.
+    indices = np.argsort(-group_rewards, kind="stable")[:count]
     samples = format_group_samples(
         build_prompt(entries[0]["question"], config.prompt_examples),
-        texts[:count],
-        np.asarray(rewards[:count]).tolist(),
+        [texts[index] for index in indices],
+        group_rewards[indices].tolist(),
     )
     return batch, diagnostics, samples, key
 
@@ -584,11 +621,27 @@ def train(config: Config) -> TrainState:
         size=config.total_updates * config.num_tasks,
         **config.task_config,
     )
-    log_init(f"Loading tokenizer: {config.tokenizer or 'cached TinyLlama default'}")
-    tokenizer = load_tokenizer(Path(config.tokenizer) if config.tokenizer is not None else None)
+    tokenizer_source = config.tokenizer or (
+        "Gemma 3 default" if config.model_type == "gemma3" else "cached TinyLlama default"
+    )
+    log_init(f"Loading tokenizer: {tokenizer_source}")
+    tokenizer = (
+        Gemma3Tokenizer(config.tokenizer)
+        if config.model_type == "gemma3"
+        else load_tokenizer(Path(config.tokenizer) if config.tokenizer is not None else None)
+    )
     log_init(f"Tokenizer ready: vocabulary size {tokenizer.vocab_size():,}")
     log_init(f"Loading pretrained checkpoint: {config.checkpoint} (backend={config.backend}, dtype={config.dtype})")
-    model, variables = load_checkpoint(Path(config.checkpoint), dtype=jnp.dtype(config.dtype), backend=config.backend)
+    if config.model_type == "gemma3":
+        model, variables = load_gemma3_checkpoint(
+            config.checkpoint,
+            cache_length=config.max_prompt_tokens + config.max_new_tokens,
+            dtype=config.dtype,
+        )
+    else:
+        model, variables = load_checkpoint(
+            Path(config.checkpoint), dtype=jnp.dtype(config.dtype), backend=config.backend
+        )
     parameter_count = sum(leaf.size for leaf in jax.tree.leaves(variables["params"]))
     log_init(f"Pretrained checkpoint loaded: {parameter_count:,} parameters")
     if tokenizer.vocab_size() != model.vocab_size:
@@ -710,12 +763,14 @@ def train(config: Config) -> TrainState:
                 save_training_checkpoint(run_dir, state, key, completed, config, prompts_seen=prompts_seen)
                 last_checkpoint = monotonic()
                 print(f"Saved {run_dir}/checkpoint.msgpack at rollout {completed}", flush=True)
-    # Export a standard converted checkpoint usable by rl2.gdn2.generate.
-    # Training state can also live on GCS; converted inference exports are local-only.
+    # Export in the source model format; inference exports are local-only.
     if not run_dir.startswith("gs://"):
         export = Path(run_dir) / f"model-{max(start_iteration, config.total_updates)}"
         if not export.exists():
-            save_checkpoint(export, model, jax.device_get(state.params), {"task": config.task})
+            if isinstance(model, Gemma3LM):
+                save_gemma3_checkpoint(export, jax.device_get(state.params))
+            else:
+                save_checkpoint(export, model, jax.device_get(state.params), {"task": config.task})
     return state
 
 

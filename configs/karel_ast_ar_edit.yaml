@@ -6,9 +6,10 @@ env_workers: 8 # Persistent spawned workers for batched reset/stepping; 0 runs l
 num_minibatches: 4 # Must divide num_tasks * group_size; episodes stay together
 update_epochs: 1
 max_seq_len: 512 # Total seed tokens, one initial report, and action/result tokens per episode
+allow_stop: false # Set false to keep editing until no complete edit fits the remaining sequence budget
 seed_program: "DEF run m( turnLeft m)"
 max_nodes: 128 # Whole candidate tree, including lists and values
-max_depth: 16 # AST edges, including lists
+max_depth: 32 # AST edges, including lists
 bf16: true
 attention_implementation: cudnn # Use xla for CPU
 d_model: 512
@@ -22,7 +23,7 @@ target_kl: 0.02
 entropy_coef: 0.01
 max_grad_norm: 1.0
 log_dir: gs://cohere-dev/vlad/rl2/karel_ast_ar_edit # Local or gs:// path
-run_id: delta_conv_all_steps_v3 # Every-token image encoder; use a fresh run, incompatible with older encoders
+run_id: delta_conv_all_steps_v4 # Every-token image encoder; use a fresh run, incompatible with older encoders
 checkpoint_interval_seconds: 300
 log_interval: 10
 log_program_interval: 10
@@ -68,6 +69,6 @@ env:
   orientation_weight: 1.0
   marker_weight: 1.0
   trajectory_weight: 0.0
-  length_penalty_weight: 0.1 # AST node count / max_nodes (including lists and values)
-  depth_penalty_weight: 0.1 # AST depth / top-level max_depth (candidate AST limit)
-  execution_penalty_weight: 0.1 # Consumed execution ticks / max_execution_steps
+  length_penalty_weight: 0.0 # AST node count / max_nodes (including lists and values)
+  depth_penalty_weight: 0.0 # AST depth / top-level max_depth (candidate AST limit)
+  execution_penalty_weight: 0.0 # Consumed execution ticks / max_execution_steps
