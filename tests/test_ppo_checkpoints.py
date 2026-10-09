@@ -214,6 +214,12 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
             c.args[1] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/steps_per_second"
         ]
         assert sps == [1.0, 1.0]
+        for tag, expected in (
+            ("time/elapsed_seconds", [(1.0, 3), (2.0, 4)]),
+            ("time/eta_seconds", [(1.0, 3), (0.0, 4)]),
+        ):
+            logged = [c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == tag]
+            assert logged == expected
         # An already completed run does not perform more updates or duplicate a save.
         ppo.train(config)
         assert iterations == [0, 1, 2, 3]

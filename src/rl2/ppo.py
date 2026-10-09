@@ -5,7 +5,7 @@ import json
 import os
 from collections import deque
 from dataclasses import asdict, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from operator import itemgetter
 from pathlib import Path
@@ -926,6 +926,11 @@ def train(config: Config) -> TrainState:
                 log_evaluation(state, config, writer, completed_episodes, steps)
                 # Restart after evaluation so long evaluations never cause catch-up runs.
                 next_eval_time = monotonic() + eval_interval_seconds
+            # Estimate from this session's completed rollouts, including evaluation/video overhead.
+            elapsed_seconds = monotonic() - start
+            eta_seconds = elapsed_seconds * (num_iterations - iteration - 1) / (iteration + 1 - start_iteration)
+            writer.add_scalar("time/elapsed_seconds", elapsed_seconds, steps)
+            writer.add_scalar("time/eta_seconds", eta_seconds, steps)
             writer.flush()
             score = f"{np.mean(recent_returns):.1f}" if recent_returns else "n/a"
             length = f"{np.mean(recent_lengths):.1f}" if recent_lengths else "n/a"
@@ -934,7 +939,8 @@ def train(config: Config) -> TrainState:
                 f"episode_length={length} sps={sps:.0f} lr={learning_rate:.3g} "
                 f"policy={policy_loss:.3f} value={value_loss:.3f} entropy={entropy:.3f} "
                 f"kl={approx_kl:.4f} clipfrac={clip_fraction:.3f} ev={explained_var:.3f} "
-                f"updates={updates_done} early_stop={early_stop}",
+                f"updates={updates_done} early_stop={early_stop} "
+                f"elapsed={timedelta(seconds=int(elapsed_seconds))} eta={timedelta(seconds=int(eta_seconds))}",
                 flush=True,
             )
             if (

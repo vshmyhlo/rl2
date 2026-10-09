@@ -536,7 +536,9 @@ def test_train_logs_scheduled_coefficients_with_kl_stopping() -> None:
     [(0.0, []), (10.0, [4]), (1.0, [2, 4])],
     ids=["disabled", "final-before-timer", "periodic-and-final-without-duplicate"],
 )
-def test_train_evaluates_final_policy(eval_every_minutes: float, expected_steps: list[int]) -> None:
+def test_train_evaluates_final_policy(
+    eval_every_minutes: float, expected_steps: list[int], capsys: pytest.CaptureFixture[str]
+) -> None:
     config = replace(
         load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
         env_id="ALE/Pong-v5",
@@ -574,6 +576,10 @@ def test_train_evaluates_final_policy(eval_every_minutes: float, expected_steps:
     def now() -> float:
         return clock
 
+    def advance_evaluation(*args: object) -> None:
+        nonlocal clock
+        clock += 30.0
+
     with (
         patch.object(ppo.gym.vector, "SyncVectorEnv", return_value=envs),
         patch.object(ppo, "make_model", return_value=model),
@@ -585,7 +591,7 @@ def test_train_evaluates_final_policy(eval_every_minutes: float, expected_steps:
         patch.object(ppo, "checkpoint_manager"),
         patch.object(ppo, "restore_checkpoint", return_value=None),
         patch.object(ppo, "save_checkpoint"),
-        patch.object(ppo, "log_evaluation") as evaluate,
+        patch.object(ppo, "log_evaluation", side_effect=advance_evaluation) as evaluate,
     ):
         state = train(config)
     assert [call.args[4] for call in evaluate.call_args_list] == expected_steps
@@ -597,6 +603,17 @@ def test_train_evaluates_final_policy(eval_every_minutes: float, expected_steps:
         assert episodes == steps
     if expected_steps:
         assert evaluate.call_args.args[0] is state
+    first_elapsed = 90.0 if 2 in expected_steps else 60.0
+    final_elapsed = 120.0 + 30.0 * len(expected_steps)
+    for tag, expected in (
+        ("time/elapsed_seconds", [(first_elapsed, 2), (final_elapsed, 4)]),
+        ("time/eta_seconds", [(first_elapsed, 2), (0.0, 4)]),
+    ):
+        logged = [call.args[1:] for call in writer.return_value.add_scalar.call_args_list if call.args[0] == tag]
+        assert logged == expected
+    output = capsys.readouterr().out
+    assert f"elapsed=0:01:{int(first_elapsed % 60):02d} eta=0:01:{int(first_elapsed % 60):02d}" in output
+    assert f"elapsed=0:{int(final_elapsed // 60):02d}:{int(final_elapsed % 60):02d} eta=0:00:00" in output
     envs.close.assert_called_once()
     writer.return_value.close.assert_called_once()
 
