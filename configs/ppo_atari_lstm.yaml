@@ -9,9 +9,11 @@ vector_env: async # async (subprocesses) or sync
 num_steps: 128
 num_minibatches: 4 # Must divide num_envs; minibatches contain whole sequences
 update_epochs: 4
-model: # 10,012,263 total actor-critic parameters with 4x84x84 observations and 6 actions
+model: # 10,079,303 total actor-critic parameters with 4x84x84 observations and 6 actions
   type: lstm
-  hidden_size: 416
+  hidden_size: 256
+  num_layers: 2
+  intermediate_size: 448
 bf16: true # Mixed precision compute; parameters, recurrent memory, and losses stay float32
 learning_rate: 0.00025
 anneal_lr: true # false keeps a constant learning rate

@@ -37,6 +37,7 @@ def test_atari_config_parameter_budget(model_type: ModelType) -> None:
     base = load_config(configs / "ppo_atari.yaml")
     config = load_config(configs / f"ppo_atari_{model_type}.yaml")
     assert config.model.type == model_type
+    assert config.model.num_layers == 2
     assert config.log_dir == f"{base.log_dir}/ppo"
     assert replace(config, model=base.model, log_dir=base.log_dir, run_id=base.run_id) == base
 

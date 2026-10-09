@@ -41,8 +41,9 @@ from rl2.gdn2 import (
 )
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import (
-    LSTM,
-    LSTMCarry,
+    LSTMCarry,  # noqa: F401 -- retain the existing PPO import path
+    LSTMStack,
+    LSTMStackCarry,
     initial_carry,  # noqa: F401 -- retain the existing PPO import path
 )
 from rl2.mamba3 import Mamba3Stack, Mamba3StackCarry
@@ -52,7 +53,7 @@ from rl2.sequence_model import RecurrentSequenceModel
 from rl2.shape_checker import ShapeChecker
 
 type Array = jax.Array | NDArray[Any]
-type RecurrentCarry = LSTMCarry | GatedDeltaNet2StackCarry | Mamba3StackCarry
+type RecurrentCarry = LSTMStackCarry | GatedDeltaNet2StackCarry | Mamba3StackCarry
 type ModelType = Literal["lstm", "gdn2", "mamba3"]
 type PPOBatch = tuple[Array, Array, Array, Array, Array, RecurrentCarry, Array]
 type PPOMetrics = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
@@ -62,6 +63,8 @@ type PPOMetrics = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
 class LSTMConfig:
     type: Literal["lstm"] = "lstm"
     hidden_size: Annotated[int, Field(gt=0, strict=True)] = 1536
+    num_layers: Annotated[int, Field(gt=0, strict=True)] = 1
+    intermediate_size: Annotated[int, Field(ge=0, strict=True)] = 0
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -129,7 +132,7 @@ class Config:
     gamma: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
     gae_lambda: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
     clip_coef: Annotated[float, Field(ge=0, lt=1, allow_inf_nan=False)]
-    target_kl: float | None
+    target_kl: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None
     entropy_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)]
     value_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)]
     max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)]
@@ -293,9 +296,16 @@ class ActorCritic(nn.Module):
 
     @nn.nowrap
     def _make_recurrent(self, *, parent: nn.Module | None = None) -> RecurrentSequenceModel[RecurrentCarry]:
-        recurrent: LSTM | GatedDeltaNet2Recurrent | Mamba3Stack
+        recurrent: LSTMStack | GatedDeltaNet2Recurrent | Mamba3Stack
         if self.model.type == "lstm":
-            recurrent = LSTM(self.model.hidden_size, dtype=self.dtype, name="lstm", parent=parent)
+            recurrent = LSTMStack(
+                self.model.hidden_size,
+                self.model.num_layers,
+                self.model.intermediate_size,
+                dtype=self.dtype,
+                name="lstm",
+                parent=parent,
+            )
         elif self.model.type == "gdn2":
             recurrent = GatedDeltaNet2Recurrent(
                 self.model.mixer_config(self.dtype),
@@ -462,13 +472,17 @@ def make_env(
     gym.register_envs(ale_py)
     register_envs()
     env = gym.make(env_id, frameskip=1, render_mode=render_mode)
-    if atari_preprocessing:
-        env = AtariPreprocessing(env, grayscale_obs=grayscale_obs)
-    if observation_size is not None:
-        env = gym.wrappers.ResizeObservation(env, (observation_size, observation_size))
-    if frame_stack:
-        return gym.wrappers.FrameStackObservation(env, stack_size=4)
-    return gym.wrappers.ReshapeObservation(env, (1, *env.observation_space.shape))
+    try:
+        if atari_preprocessing:
+            env = AtariPreprocessing(env, grayscale_obs=grayscale_obs)
+        if observation_size is not None:
+            env = gym.wrappers.ResizeObservation(env, (observation_size, observation_size))
+        if frame_stack:
+            return gym.wrappers.FrameStackObservation(env, stack_size=4)
+        return gym.wrappers.ReshapeObservation(env, (1, *env.observation_space.shape))
+    except BaseException:
+        env.close()
+        raise
 
 
 def action_log_prob(logits: Array, actions: Array) -> jax.Array:
@@ -675,9 +689,6 @@ def train(config: Config) -> TrainState:
         raise ValueError("video_speed must be positive and finite")
     if config.vector_env not in ("sync", "async"):
         raise ValueError("vector_env must be 'sync' or 'async'")
-    if config.target_kl is not None and (not np.isfinite(config.target_kl) or config.target_kl <= 0):
-        raise ValueError("target_kl must be positive and finite, or null to disable stopping")
-
     if (
         type(config.eval_every_minutes) not in (int, float)
         or not np.isfinite(config.eval_every_minutes)
@@ -911,7 +922,7 @@ def train(config: Config) -> TrainState:
             while config.video_every_episodes and completed_episodes >= next_video_episode:
                 log_video(state, config, writer, next_video_episode, steps)
                 next_video_episode += config.video_every_episodes
-            if eval_interval_seconds and monotonic() >= next_eval_time:
+            if eval_interval_seconds and (iteration + 1 == num_iterations or monotonic() >= next_eval_time):
                 log_evaluation(state, config, writer, completed_episodes, steps)
                 # Restart after evaluation so long evaluations never cause catch-up runs.
                 next_eval_time = monotonic() + eval_interval_seconds

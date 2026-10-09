@@ -35,7 +35,7 @@ from rl2.shape_checker import ShapeChecker
 
 def small_model_config(model_type: ppo.ModelType) -> ppo.ModelConfig:
     if model_type == "lstm":
-        return ppo.LSTMConfig(hidden_size=8)
+        return ppo.LSTMConfig(hidden_size=8, num_layers=2, intermediate_size=8)
     if model_type == "gdn2":
         return ppo.GDN2Config(hidden_size=8, num_heads=1, head_dim=4, intermediate_size=8)
     return ppo.Mamba3Config(hidden_size=8, num_layers=2, intermediate_size=8, state_size=4, head_dim=4, mimo_rank=2)
@@ -64,29 +64,40 @@ def test_resize_only_preserves_emulator_transitions(stacked: bool) -> None:
         resized.close()
 
 
+def test_make_env_closes_emulator_when_wrapping_fails() -> None:
+    env = Mock()
+    with (
+        patch.object(ppo.gym, "make", return_value=env),
+        patch.object(ppo, "AtariPreprocessing", side_effect=ValueError("invalid preprocessing")),
+        pytest.raises(ValueError, match="invalid preprocessing"),
+    ):
+        make_env("ALE/Pong-v5", atari_preprocessing=True)
+    env.close.assert_called_once()
+
+
 def test_default_model_parameter_budget_and_rgb_shapes() -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
     model = ActorCritic(6, config.model)
     # This architecture budget is specifically for 84x84 RGB, independent of the training config.
     obs = jax.ShapeDtypeStruct((1, 1, 1, 84, 84, 3), jnp.uint8)
-    carry = initial_carry(1, config.model.hidden_size)
+    carry = model.initial_carry(1)
     starts = jnp.ones((1, 1), dtype=bool)
     variables = jax.eval_shape(model.init, jax.random.key(0), obs, carry, starts)
     count = sum(parameter.size for parameter in jax.tree.leaves(variables["params"]))
     assert variables["params"]["encoder"]["Dense_0"]["kernel"].shape == (1024, 768)
-    assert "OptimizedLSTMCell_0" in variables["params"]["lstm"]
+    assert "OptimizedLSTMCell_0" in variables["params"]["lstm"]["mixer_0"]
     assert 27_000_000 < count < 30_000_000
     final, logits, values = jax.eval_shape(model.apply, variables, obs, carry, starts)
     assert logits.shape == (1, 1, 6)
     assert values.shape == (1, 1)
-    assert final[0].shape == (1, config.model.hidden_size)
+    assert final[0][0].shape == (1, config.model.hidden_size)
     step_obs = jax.ShapeDtypeStruct(obs.shape[1:], obs.dtype)
     step_final, step_logits, step_values = jax.eval_shape(
         partial(model.apply, method=model.step), variables, step_obs, carry, starts[0]
     )
     assert step_logits.shape == (1, 6)
     assert step_values.shape == (1,)
-    assert step_final[0].shape == final[0].shape
+    assert step_final[0][0].shape == final[0][0].shape
 
 
 @pytest.mark.parametrize("frame_limit", (101, 102, 103, 104))
@@ -194,6 +205,10 @@ def test_single_transition_keeps_policy_gradient() -> None:
         ("gae_lambda", 1.1),
         ("clip_coef", -0.1),
         ("clip_coef", 1.0),
+        ("target_kl", 0.0),
+        ("target_kl", -0.1),
+        ("target_kl", float("nan")),
+        ("target_kl", float("inf")),
         ("entropy_coef", -0.1),
         ("value_coef", -0.1),
         ("max_grad_norm", 0.0),
@@ -516,6 +531,76 @@ def test_train_logs_scheduled_coefficients_with_kl_stopping() -> None:
     writer.close.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    ("eval_every_minutes", "expected_steps"),
+    [(0.0, []), (10.0, [4]), (1.0, [2, 4])],
+    ids=["disabled", "final-before-timer", "periodic-and-final-without-duplicate"],
+)
+def test_train_evaluates_final_policy(eval_every_minutes: float, expected_steps: list[int]) -> None:
+    config = replace(
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        env_id="ALE/Pong-v5",
+        atari_preprocessing=True,
+        num_envs=1,
+        num_steps=2,
+        num_minibatches=1,
+        update_epochs=1,
+        total_steps=5,  # Training ends after two complete rollouts, at step 4.
+        vector_env="sync",
+        video_every_episodes=0,
+        eval_every_minutes=eval_every_minutes,
+        target_kl=None,
+    )
+    obs = np.zeros((1, 1), dtype=np.uint8)
+    zeros = np.zeros(1, dtype=np.float32)
+    dones = np.ones(1, dtype=bool)
+    carry = initial_carry(1, 1)
+    envs = Mock()
+    envs.single_action_space.n = 2
+    envs.reset.return_value = (obs, {})
+    envs.step.return_value = (obs, zeros, dones, ~dones, {})
+    model = Mock()
+    model.initial_carry.return_value = carry
+    model.init.return_value = {"params": {"weight": jnp.zeros(1)}}
+    clock = 0.0
+
+    def advance_update(
+        state: TrainState, batch: ppo.PPOBatch, config: ppo.Config, iteration: int
+    ) -> tuple[TrainState, ppo.PPOMetrics]:
+        nonlocal clock
+        clock += 60.0
+        return state.replace(step=iteration + 1), (jnp.asarray(0.0),) * 5
+
+    def now() -> float:
+        return clock
+
+    with (
+        patch.object(ppo.gym.vector, "SyncVectorEnv", return_value=envs),
+        patch.object(ppo, "make_model", return_value=model),
+        patch.object(ppo, "SummaryWriter") as writer,
+        patch.object(ppo, "act", return_value=(np.zeros(1, dtype=np.int32), zeros, zeros, carry)),
+        patch.object(ppo, "value", return_value=zeros),
+        patch.object(ppo, "update", side_effect=advance_update),
+        patch.object(ppo, "monotonic", side_effect=now),
+        patch.object(ppo, "checkpoint_manager"),
+        patch.object(ppo, "restore_checkpoint", return_value=None),
+        patch.object(ppo, "save_checkpoint"),
+        patch.object(ppo, "log_evaluation") as evaluate,
+    ):
+        state = train(config)
+    assert [call.args[4] for call in evaluate.call_args_list] == expected_steps
+    for call in evaluate.call_args_list:
+        evaluated_state, evaluated_config, evaluated_writer, episodes, steps = call.args
+        assert int(evaluated_state.step) == steps // config.num_steps
+        assert evaluated_config.eval_every_minutes == eval_every_minutes
+        assert evaluated_writer is writer.return_value
+        assert episodes == steps
+    if expected_steps:
+        assert evaluate.call_args.args[0] is state
+    envs.close.assert_called_once()
+    writer.return_value.close.assert_called_once()
+
+
 def test_kl_rejects_update_without_changing_optimizer() -> None:
     config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), target_kl=0.01)
     state = TrainState.create(
@@ -604,6 +689,109 @@ def test_gae_timeout_bootstrap_and_trace() -> None:
     )
     np.testing.assert_allclose(advantages, [[4.064], [3.7]], rtol=1e-6)
     np.testing.assert_allclose(returns, [[4.564], [4.7]], rtol=1e-6)
+
+
+def test_rollout_bootstraps_only_timeouts_before_partial_reset() -> None:
+    config = replace(
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        num_envs=4,
+        num_steps=2,
+        num_minibatches=1,
+        update_epochs=1,
+        total_steps=8,
+        vector_env="sync",
+        gamma=0.5,
+        gae_lambda=1.0,
+        target_kl=None,
+        video_every_episodes=0,
+        eval_every_minutes=0,
+    )
+    # Terminal, timeout, both flags, and continuing: each has distinct semantics.
+    initial_obs = np.arange(1, 5, dtype=np.uint8)[:, None]
+    final_obs = initial_obs + 10
+    reset_obs = np.array([[21], [22], [23], [14]], dtype=np.uint8)
+    next_obs = initial_obs + 30
+    dones = np.array([True, True, True, False])
+    envs = Mock()
+    envs.single_action_space.n = 2
+    envs.reset.side_effect = [(initial_obs, {}), (reset_obs, {})]
+    envs.step.side_effect = [
+        (
+            final_obs,
+            np.array([4.0, -2.0, 0.0, 4.0]),
+            np.array([True, False, True, False]),
+            np.array([False, True, True, False]),
+            {},
+        ),
+        (next_obs, np.array([2.0, -2.0, 2.0, -2.0]), np.zeros(4, dtype=bool), np.zeros(4, dtype=bool), {}),
+    ]
+    carry = initial_carry(4, 1)
+    advanced_carry = jax.tree.map(jnp.ones_like, carry)
+    model = Mock()
+    model.initial_carry.return_value = carry
+    model.init.return_value = {"params": {"weight": jnp.zeros(1)}}
+
+    def predict(state: TrainState, obs: ppo.Array, memory: ppo.RecurrentCarry, starts: ppo.Array) -> np.ndarray:
+        sc = ShapeChecker(B=4, F=1)
+        sc.check(obs, "BF", np.uint8)
+        sc.check(starts, "B", np.bool_)
+        prediction = np.asarray(obs[:, 0], dtype=np.float32)
+        sc.check(prediction, "B", np.float32)
+        return prediction
+
+    def check_batch(
+        state: TrainState, batch: ppo.PPOBatch, config: ppo.Config, iteration: int
+    ) -> tuple[TrainState, ppo.PPOMetrics]:
+        obs, _, _, advantages, returns, memory, starts = batch
+        sc = ShapeChecker(T=2, B=4, F=1)
+        sc.check(obs, "TBF", np.uint8)
+        sc.check([advantages, returns], "TB", np.float32)
+        sc.check(starts, "TB", np.bool_)
+        # Minibatches permute whole environments; recover their original order.
+        order = np.argsort(obs[0, :, 0])
+        np.testing.assert_array_equal(obs[:, order], np.stack([initial_obs, reset_obs]))
+        np.testing.assert_array_equal(starts[:, order], np.stack([np.ones(4, dtype=bool), dones]))
+        expected = [[1.0, 5.0, 0.0, 9.0], [16.5, 15.0, 17.5, 16.0]]
+        np.testing.assert_allclose(returns[:, order], expected)
+        np.testing.assert_allclose(advantages[:, order], expected)
+        for leaf in jax.tree.leaves(memory):
+            np.testing.assert_array_equal(leaf, 0)
+        return state, (jnp.asarray(0.0),) * 5
+
+    with (
+        patch.object(ppo.gym.vector, "SyncVectorEnv", return_value=envs) as vector_env,
+        patch.object(ppo, "make_model", return_value=model),
+        patch.object(ppo, "SummaryWriter") as writer,
+        patch.object(
+            ppo,
+            "act",
+            return_value=(
+                np.zeros(4, dtype=np.int32),
+                np.zeros(4, dtype=np.float32),
+                np.zeros(4, dtype=np.float32),
+                advanced_carry,
+            ),
+        ),
+        patch.object(ppo, "value", side_effect=predict) as predict_value,
+        patch.object(ppo, "update", side_effect=check_batch) as update_batch,
+        patch.object(ppo, "checkpoint_manager"),
+        patch.object(ppo, "restore_checkpoint", return_value=None),
+        patch.object(ppo, "save_checkpoint"),
+    ):
+        train(config)
+    assert vector_env.call_args.kwargs["autoreset_mode"] == gym.vector.AutoresetMode.DISABLED
+    np.testing.assert_array_equal(envs.reset.call_args.kwargs["options"]["reset_mask"], dones)
+    assert predict_value.call_count == 2
+    timeout_call = predict_value.call_args_list[0]
+    np.testing.assert_array_equal(timeout_call.args[1], final_obs)
+    np.testing.assert_array_equal(timeout_call.args[3], False)
+    for leaf in jax.tree.leaves(timeout_call.args[2]):
+        np.testing.assert_array_equal(leaf, 1)
+    update_batch.assert_called_once()
+    scalars = {call.args[0]: call.args[1] for call in writer.return_value.add_scalar.call_args_list}
+    assert scalars["charts/return_mean_100"] == pytest.approx(2 / 3)  # Raw rewards, without clipping or bootstrap.
+    assert scalars["charts/total_episodes"] == 3
+    envs.close.assert_called_once()
 
 
 @pytest.mark.parametrize("invalid", ["broadcast_mask", "float_mask"])
@@ -762,7 +950,10 @@ def test_gdn2_gradients_stop_at_episode_reset() -> None:
         ({"type": "unknown"}, "union_tag_invalid"),
         ({"hidden_size": 8}, "union_tag_not_found"),
         ("lstm", "model"),
-        ({"type": "lstm", "num_layers": 2}, "unexpected_keyword_argument"),
+        ({"type": "lstm", "num_layers": 0}, "greater_than"),
+        ({"type": "lstm", "num_layers": True}, "int_type"),
+        ({"type": "lstm", "intermediate_size": -1}, "greater_than_equal"),
+        ({"type": "lstm", "intermediate_size": 1.5}, "int_type"),
         ({"type": "gdn2", "lstm_hidden_size": 8}, "unexpected_keyword_argument"),
         ({"type": "lstm", "hidden_size": 0}, "greater_than"),
         ({"type": "lstm", "hidden_size": True}, "int_type"),
@@ -882,3 +1073,26 @@ def test_mamba3_config_loading_and_factory(tmp_path: Path) -> None:
     boundary = ppo.Mamba3Config(state_size=2, rope_fraction=1.0, intermediate_size=0)
     assert boundary.intermediate_size == 0
     assert ppo.Mamba3Config().type == "mamba3"
+
+
+def test_lstm_stack_config_loading_and_factory(tmp_path: Path) -> None:
+    config = replace(
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        model=small_model_config("lstm"),
+    )
+    path = tmp_path / "ppo.yaml"
+    path.write_text(yaml.safe_dump(asdict(config)))
+    restored = load_config(path)
+    assert restored == config
+    model = ppo.make_model(restored, 3)
+    recurrent = model._make_recurrent()
+    assert isinstance(recurrent, ppo.LSTMStack)
+    assert recurrent.num_layers == 2
+    assert recurrent.intermediate_size == 8
+    assert recurrent.dtype == jnp.bfloat16
+    carry = ppo.initial_model_carry(restored, 2)
+    assert len(carry) == 2
+    for state in jax.tree.leaves(carry):
+        assert state.shape == (2, 8)
+        assert state.dtype == jnp.float32
+        np.testing.assert_array_equal(state, 0)

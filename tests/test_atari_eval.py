@@ -15,7 +15,8 @@ from flax.training.train_state import TrainState
 from rl2 import ppo
 from rl2.atari_eval import EvaluationConfig, ScoreBaselines, _action, evaluate, make_evaluation_env
 from rl2.atari_scores import ATARI_REFERENCE_SCORES, REFERENCE_SOURCE, get_reference_scores
-from rl2.ppo import Array, Config, LSTMCarry, initial_carry, load_config
+from rl2.ppo import Array, Config, LSTMStackCarry, load_config
+from rl2.shape_checker import ShapeChecker
 
 
 def training_config() -> Config:
@@ -28,11 +29,15 @@ def training_config() -> Config:
 
 
 def policy(
-    variables: dict[str, Any], obs: Array, carry: LSTMCarry, starts: Array, *, method: str
-) -> tuple[LSTMCarry, jax.Array, jax.Array]:
+    variables: dict[str, Any], obs: Array, carry: LSTMStackCarry, starts: Array, *, method: str
+) -> tuple[LSTMStackCarry, jax.Array, jax.Array]:
     assert method == "step"
-    assert obs.ndim == 4
-    carry = tuple(jnp.where(starts[:, None], 0, c) + 1 for c in carry)
+    sc = ShapeChecker()
+    sc.check(obs, "BFHW", jnp.uint8)
+    sc.check(starts, "B", jnp.bool_)
+    for layer in carry:
+        sc.check(layer, "BD", jnp.float32)
+    carry = tuple(tuple(jnp.where(starts[:, None], 0, c) + 1 for c in layer) for layer in carry)
     return carry, variables["params"]["logits"][None], jnp.zeros(1)
 
 
@@ -164,13 +169,14 @@ def test_real_evaluation_reproducible_and_state_unchanged() -> None:
 @pytest.mark.parametrize("greedy", (False, True))
 def test_action_selection_and_recurrent_reset(greedy: bool) -> None:
     state = policy_state()
-    carry = tuple(c + 5 for c in initial_carry(1, 2))
+    carry = tuple(tuple(c + 5 for c in layer) for layer in ppo.initial_model_carry(training_config(), 1))
     obs = np.zeros((1, 84, 84), dtype=np.uint8)
     key = jax.random.key(1)
     action, memory = _action(state, obs, carry, True, key, greedy=greedy)
     expected = 5 if greedy else int(jax.random.categorical(key, state.params["logits"]))
     assert int(action) == expected
-    np.testing.assert_array_equal(memory[0], np.ones((1, 2)))
+    for leaf in jax.tree.leaves(memory):
+        np.testing.assert_array_equal(leaf, np.ones((1, 2)))
 
 
 def test_cleanup_on_policy_failure() -> None:

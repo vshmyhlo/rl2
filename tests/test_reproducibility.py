@@ -19,7 +19,7 @@ def test_seeded_policy_and_update_are_reproducible() -> None:
         3, ppo.LSTMConfig(hidden_size=4), encoder_stages=(ConvStage(2, blocks=1),), embedding_size=4
     )
     obs = jnp.arange(2 * 1 * 8 * 8, dtype=jnp.uint8).reshape(2, 1, 8, 8)
-    carry = ppo.initial_carry(2, 4)
+    carry = model.initial_carry(2)
     starts = jnp.ones(2, dtype=jnp.bool_)
     config = replace(ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), target_kl=None)
     optimizer = optax.adam(1e-3)
