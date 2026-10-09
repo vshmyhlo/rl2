@@ -53,9 +53,7 @@ def test_incoming_carry_gradients_stop_at_resets(model: Mamba3 | Mamba3Stack) ->
     "model",
     [
         Mamba3(4, d_state=4, expand=1, headdim=2, mimo_rank=2, dtype=jnp.bfloat16),
-        Mamba3Stack(
-            4, 2, d_state=4, expand=1, headdim=2, d_intermediate=4, mlp_multiple_of=1, dtype=jnp.bfloat16
-        ),
+        Mamba3Stack(4, 2, d_state=4, expand=1, headdim=2, d_intermediate=4, mlp_multiple_of=1, dtype=jnp.bfloat16),
     ],
     ids=["mimo-mixer", "residual-stack"],
 )

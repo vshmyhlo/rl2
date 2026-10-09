@@ -27,8 +27,11 @@ from tensorboardX import SummaryWriter
 
 from rl2.gdn2 import GatedDeltaNet2Config, GatedDeltaNet2Recurrent, GatedDeltaNet2StackCarry
 from rl2.jax_cache import configure_compilation_cache
-from rl2.lstm import LSTM, LSTMCarry
-from rl2.lstm import initial_carry  # noqa: F401 -- retain the existing PPO import path
+from rl2.lstm import (
+    LSTM,
+    LSTMCarry,
+    initial_carry,  # noqa: F401 -- retain the existing PPO import path
+)
 from rl2.mamba3 import Mamba3Stack, Mamba3StackCarry
 from rl2.multi_atari import register_envs
 from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages
@@ -153,17 +156,17 @@ class ActorCritic(nn.Module):
     embedding_size: int = 768
 
     @nn.nowrap
-    def _make_recurrent(self) -> RecurrentSequenceModel[RecurrentCarry]:
+    def _make_recurrent(self, *, parent: nn.Module | None = None) -> RecurrentSequenceModel[RecurrentCarry]:
         recurrent: LSTM | GatedDeltaNet2Recurrent | Mamba3Stack
         if self.model.type == "lstm":
-            recurrent = LSTM(self.model.hidden_size, dtype=self.dtype, name="lstm", parent=None)
+            recurrent = LSTM(self.model.hidden_size, dtype=self.dtype, name="lstm", parent=parent)
         elif self.model.type == "gdn2":
             recurrent = GatedDeltaNet2Recurrent(
                 self.model.mixer_config(self.dtype),
                 self.model.num_layers,
                 self.model.intermediate_size,
                 name="gdn2",
-                parent=None,
+                parent=parent,
             )
         else:
             recurrent = Mamba3Stack(
@@ -179,7 +182,7 @@ class ActorCritic(nn.Module):
                 rope_fraction=self.model.rope_fraction,
                 dtype=self.dtype,
                 name="mamba3",
-                parent=None,
+                parent=parent,
             )
         # The selected model and its carry always travel together through PPO.
         return cast(RecurrentSequenceModel[RecurrentCarry], recurrent)
@@ -195,9 +198,8 @@ class ActorCritic(nn.Module):
             dtype=self.dtype,
             name="encoder",
         )
-        self.recurrent = self._make_recurrent()
-        if self.model.type != "lstm":
-            self.recurrent_input = nn.Dense(self.model.hidden_size, dtype=self.dtype, name=f"{self.model.type}_input")
+        self.recurrent = self._make_recurrent(parent=self)
+        self.recurrent_input = nn.Dense(self.model.hidden_size, dtype=self.dtype, name=f"{self.model.type}_input")
         init = nn.initializers.orthogonal(np.sqrt(2))
         self.policy_hidden = nn.Dense(512, kernel_init=init, name="policy_hidden", dtype=self.dtype)
         self.policy_norm = nn.LayerNorm(name="policy_norm", dtype=self.dtype)
@@ -216,10 +218,9 @@ class ActorCritic(nn.Module):
         sc.check(obs, "BFHW" if obs.ndim == 4 else "BFHWC", jnp.uint8)
         x = self.encoder(obs)
         sc.check(x, "BE", self.dtype)
-        if self.model.type != "lstm":
-            x = self.recurrent_input(x).astype(self.dtype)
-            projection_sc = ShapeChecker(B=obs.shape[0], D=self.model.hidden_size)
-            projection_sc.check(x, "BD", self.dtype)
+        x = self.recurrent_input(x).astype(self.dtype)
+        projection_sc = ShapeChecker(B=obs.shape[0], D=self.model.hidden_size)
+        projection_sc.check(x, "BD", self.dtype)
         return x
 
     def _heads(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:

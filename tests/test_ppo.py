@@ -73,7 +73,8 @@ def test_default_model_parameter_budget_and_rgb_shapes() -> None:
     variables = jax.eval_shape(model.init, jax.random.key(0), obs, carry, starts)
     count = sum(parameter.size for parameter in jax.tree.leaves(variables["params"]))
     assert variables["params"]["encoder"]["Dense_0"]["kernel"].shape == (1024, 768)
-    assert 21_000_000 < count < 24_000_000
+    assert "OptimizedLSTMCell_0" in variables["params"]["lstm"]
+    assert 27_000_000 < count < 30_000_000
     final, logits, values = jax.eval_shape(model.apply, variables, obs, carry, starts)
     assert logits.shape == (1, 1, 6)
     assert values.shape == (1, 1)
@@ -172,6 +173,7 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses(model_type: ppo.
         partial(model.apply, capture_intermediates=True, mutable=["intermediates"])
     )({"params": params}, obs, carry, starts)
     assert captured["intermediates"]["encoder"]["stem"]["__call__"][0].dtype == jnp.bfloat16
+    assert captured["intermediates"][f"{model_type}_input"]["__call__"][0].dtype == jnp.bfloat16
     assert captured["intermediates"]["policy_hidden"]["__call__"][0].dtype == jnp.bfloat16
     assert captured["intermediates"]["policy_output"]["__call__"][0].dtype == jnp.bfloat16
     assert captured["intermediates"]["value_output"]["__call__"][0].dtype == jnp.bfloat16
@@ -219,12 +221,14 @@ def test_recurrent_sequences_match_steps_and_reset_only_finished_env(model_type:
         3,
         small_model_config(model_type),
         encoder_stages=(ConvStage(4, blocks=1),),
-        embedding_size=8,
+        embedding_size=6,
     )
     obs = jax.random.randint(jax.random.key(2), (4, 2, 4, 8, 8), 0, 256, dtype=jnp.uint8)
     carry = model.initial_carry(2)
     starts = jnp.array([[True, True], [False, False], [True, False], [False, False]])
     params = model.init(jax.random.key(1), obs, carry, starts)
+    encoded = model.apply(params, obs[0], method=model._encode)
+    assert encoded.shape == (2, model.model.hidden_size)
     apply = jax.jit(model.apply)
     step = jax.jit(partial(model.apply, method=model.step))
     final, logits, values = apply(params, obs, carry, starts)
