@@ -1,0 +1,35 @@
+env_id: ALE/SpaceInvaders-v5
+observation_size: null # Resize only; null preserves the original resolution
+frame_stack: true # true stacks 4 frames; false uses a single frame
+atari_preprocessing: true # true enables 84x84 grayscale, action repeat 4, max pooling, and random reset no-ops
+seed: 1
+total_steps: 10000000
+num_envs: 32
+vector_env: async # async (subprocesses) or sync
+num_steps: 128
+num_minibatches: 4 # Must divide num_envs; minibatches contain whole sequences
+update_epochs: 4
+model: # 10,051,791 total actor-critic parameters with 4x84x84 observations and 6 actions
+  type: gdn2
+  hidden_size: 256
+  num_layers: 2
+  num_heads: 4
+  head_dim: 64
+  intermediate_size: 512
+  conv_size: 4
+bf16: true # Mixed precision compute; parameters, recurrent memory, and losses stay float32
+learning_rate: 0.00025
+anneal_lr: true # Linear decay over the training budget; false keeps a constant rate
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.1
+target_kl: 0.01 # null disables KL early stopping
+entropy_coef: 0.01
+value_coef: 0.5
+max_grad_norm: 0.5
+log_dir: gs://cohere-dev/vlad/rl2/ppo
+video_every_episodes: 100 # 0 disables recording
+video_speed: 4.0 # Playback multiplier: 1.0 normal, 2.0 double speed
+eval_every_minutes: 30 # Wall-clock minutes between evaluations; timer restarts after evaluation; 0 disables
+eval_episodes: 100 # Full games per evaluation, after the rollout update; training pauses during evaluation
+eval_seed: 10000 # Fixed evaluation seed set, separate from training RNG
