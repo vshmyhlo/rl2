@@ -136,6 +136,8 @@ class Config:
     eval_seed: int = 10_000
     encoder_stages: ConvStages = DEFAULT_STAGES
     model: ModelConfig = LSTMConfig()
+    lr_decay: Literal["linear", "cosine"] = "linear"
+    entropy_decay: Literal["constant", "cosine"] = "constant"
 
 
 def load_config(path: str | Path) -> Config:
@@ -148,11 +150,20 @@ def load_config(path: str | Path) -> Config:
 
 def learning_rate_schedule(config: Config) -> optax.Schedule:
     num_rollouts = config.total_steps // (config.num_envs * config.num_steps)
+    if config.anneal_lr and config.lr_decay == "cosine":
+        return optax.cosine_decay_schedule(config.learning_rate, num_rollouts)
     return optax.linear_schedule(
         config.learning_rate,
         0.0 if config.anneal_lr else config.learning_rate,
         num_rollouts,
     )
+
+
+def entropy_coef_schedule(config: Config) -> optax.Schedule:
+    if config.entropy_decay == "constant":
+        return optax.constant_schedule(config.entropy_coef)
+    num_rollouts = config.total_steps // (config.num_envs * config.num_steps)
+    return optax.cosine_decay_schedule(config.entropy_coef, num_rollouts)
 
 
 class ActorCritic(nn.Module):
@@ -470,7 +481,15 @@ def explained_variance(values: Array, returns: Array) -> float:
 
 
 @partial(jax.jit, static_argnames="config")
-def update(state: TrainState, batch: PPOBatch, config: Config) -> tuple[TrainState, PPOMetrics]:
+def update(
+    state: TrainState, batch: PPOBatch, config: Config, iteration: int | jax.Array = 0
+) -> tuple[TrainState, PPOMetrics]:
+    sc = ShapeChecker()
+    iteration = jnp.asarray(iteration)
+    sc.check(iteration, "")
+    chex.assert_type(iteration, int)
+    entropy_coef = jnp.asarray(entropy_coef_schedule(config)(iteration), dtype=jnp.float32)
+    sc.check(entropy_coef, "", dtype=jnp.float32)
     obs, actions, old_log_probs, advantages, returns, carry, episode_starts = batch
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -483,7 +502,7 @@ def update(state: TrainState, batch: PPOBatch, config: Config) -> tuple[TrainSta
         policy_loss = -jnp.minimum(ratio * advantages, clipped * advantages).mean()
         value_loss = 0.5 * jnp.square(values - returns).mean()
         entropy = -(jax.nn.softmax(logits) * jax.nn.log_softmax(logits)).sum(-1).mean()
-        loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy
+        loss = policy_loss + config.value_coef * value_loss - entropy_coef * entropy
         approx_kl = (jnp.expm1(log_ratio) - log_ratio).mean()
         clip_fraction = (jnp.abs(ratio - 1) > config.clip_coef).mean()
         return loss, (policy_loss, value_loss, entropy, approx_kl, clip_fraction)
@@ -566,6 +585,7 @@ def train(config: Config) -> TrainState:
         carry = model.initial_carry(config.num_envs)
         episode_start = np.ones(config.num_envs, dtype=bool)
         lr_schedule = learning_rate_schedule(config)
+        entropy_schedule = entropy_coef_schedule(config)
         optimizer = optax.inject_hyperparams(
             lambda learning_rate: optax.chain(
                 optax.clip_by_global_norm(config.max_grad_norm),
@@ -668,6 +688,7 @@ def train(config: Config) -> TrainState:
             # Keep uint8 rollouts on the host; transfer only each minibatch to JAX.
             batch = (observations, actions, log_probs, advantages, returns)
             learning_rate = float(lr_schedule(iteration))
+            entropy_coef = float(entropy_schedule(iteration))
             state = state.replace(
                 opt_state=state.opt_state._replace(
                     hyperparams={
@@ -686,7 +707,7 @@ def train(config: Config) -> TrainState:
                         jax.tree.map(lambda c: c[indices], rollout_carry),
                         episode_starts[:, indices],
                     )
-                    state, metric = update(state, minibatch, config)
+                    state, metric = update(state, minibatch, config, iteration)
                     metrics.append(metric)
                     if config.target_kl is not None and float(metric[3]) > config.target_kl:
                         early_stop = True
@@ -718,6 +739,7 @@ def train(config: Config) -> TrainState:
                 "policy/clip_fraction": clip_fraction,
                 "value/explained_variance": explained_var,
                 "charts/learning_rate": learning_rate,
+                "charts/entropy_coef": entropy_coef,
                 "charts/updates_per_rollout": updates_done,
                 "policy/early_stop": early_stop,
                 "charts/total_episodes": completed_episodes,

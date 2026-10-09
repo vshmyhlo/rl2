@@ -22,12 +22,14 @@ model: # 10,077,799 total actor-critic parameters with 4x84x84 observations and 
   rope_fraction: 0.5
 bf16: true # Mixed precision compute; parameters, recurrent memory, and losses stay float32
 learning_rate: 0.00025
-anneal_lr: true # Linear decay over the training budget; false keeps a constant rate
+anneal_lr: true # false keeps a constant learning rate
+lr_decay: cosine # Decay to zero over the rollout budget
 gamma: 0.99
 gae_lambda: 0.95
 clip_coef: 0.1
 target_kl: 0.01 # null disables KL early stopping
 entropy_coef: 0.01
+entropy_decay: cosine # Decay to zero over the rollout budget
 value_coef: 0.5
 max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/ppo

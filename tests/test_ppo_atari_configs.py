@@ -1,4 +1,4 @@
-"""Keep the Atari backbone comparison configs near the same total model budget."""
+"""Keep the Atari configs' schedules and backbone comparison budgets consistent."""
 
 from dataclasses import replace
 from pathlib import Path
@@ -8,6 +8,15 @@ import jax.numpy as jnp
 import pytest
 
 from rl2.ppo import GDN2Config, ModelType, load_config, make_model
+
+
+def test_atari_configs_enable_cosine_decay() -> None:
+    configs = Path(__file__).resolve().parents[1] / "configs"
+    for path in configs.glob("ppo_atari*.yaml"):
+        config = load_config(path)
+        assert config.anneal_lr, path.name
+        assert config.lr_decay == "cosine", path.name
+        assert config.entropy_decay == "cosine", path.name
 
 
 @pytest.mark.parametrize("model_type", ("lstm", "gdn2", "mamba3"))

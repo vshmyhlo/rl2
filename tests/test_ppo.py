@@ -2,7 +2,7 @@ from dataclasses import FrozenInstanceError, asdict, replace
 from functools import partial
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cv2
 import gymnasium as gym
@@ -308,6 +308,140 @@ def test_learning_rate_schedule() -> None:
     single = learning_rate_schedule(replace(config, total_steps=8))
     assert float(single(0)) == pytest.approx(config.learning_rate, rel=0, abs=5e-08)
     assert float(single(1)) == 0.0
+    entropy = ppo.entropy_coef_schedule(config)
+    assert float(entropy(0)) == config.entropy_coef
+    assert float(entropy(14)) == config.entropy_coef
+
+
+def test_cosine_schedules() -> None:
+    config = replace(
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        num_envs=2,
+        num_steps=4,
+        total_steps=35,  # Four full rollouts; the remaining steps are unused.
+        num_minibatches=2,
+        update_epochs=3,
+        anneal_lr=True,
+        lr_decay="cosine",
+        entropy_decay="cosine",
+    )
+    # The quarter point distinguishes cosine from linear decay.
+    expected = np.array([1.0, (1 + np.sqrt(0.5)) / 2, 0.5, 0.0, 0.0])
+    for schedule_fn, initial in (
+        (learning_rate_schedule, config.learning_rate),
+        (ppo.entropy_coef_schedule, config.entropy_coef),
+    ):
+        schedule = schedule_fn(config)
+        np.testing.assert_allclose([schedule(i) for i in (0, 1, 2, 4, 5)], initial * expected, rtol=1e-6)
+        single = schedule_fn(replace(config, total_steps=8))
+        assert float(single(0)) == pytest.approx(initial)
+        assert float(single(1)) == 0.0
+    constant = learning_rate_schedule(replace(config, anneal_lr=False))
+    np.testing.assert_allclose([constant(i) for i in (0, 1, 4, 5)], config.learning_rate)
+
+
+@pytest.mark.parametrize("field", ("lr_decay", "entropy_decay"))
+def test_invalid_decay_config(field: str) -> None:
+    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"))
+    settings[field] = "unknown"
+    with pytest.raises(ValidationError, match=field):
+        ppo.Config(**settings)
+
+
+def test_entropy_decay_scales_update_by_rollout() -> None:
+    config = replace(
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        num_envs=1,
+        num_steps=1,
+        total_steps=4,
+        entropy_decay="cosine",
+        target_kl=None,
+    )
+
+    def apply(
+        variables: optax.Params, obs: ppo.Array, carry: ppo.RecurrentCarry, starts: ppo.Array
+    ) -> tuple[ppo.RecurrentCarry, jax.Array, jax.Array]:
+        return carry, variables["params"]["logits"], jnp.zeros_like(starts, dtype=jnp.float32)
+
+    probabilities = np.array([[0.8, 0.2]], dtype=np.float32)
+    logits = jnp.log(probabilities)
+    state = TrainState.create(apply_fn=apply, params={"logits": logits}, tx=optax.sgd(1.0))
+    state = state.replace(step=123)  # Optimizer step count must not drive decay.
+    batch = (
+        jnp.zeros((1, 1)),
+        jnp.zeros(1, dtype=jnp.int32),
+        logits[:, 0],
+        jnp.zeros(1),
+        jnp.zeros(1),
+        initial_carry(1, 1),
+        jnp.zeros(1, dtype=bool),
+    )
+    entropy = -(probabilities * np.log(probabilities)).sum()
+    entropy_grad = -probabilities * (np.log(probabilities) + entropy)
+    for iteration, factor in ((0, 1.0), (1, (1 + np.sqrt(0.5)) / 2), (4, 0.0)):
+        updated, metrics = update(state, batch, config, iteration)
+        np.testing.assert_allclose(
+            updated.params["logits"], logits + config.entropy_coef * factor * entropy_grad, atol=1e-7
+        )
+        assert float(metrics[2]) == pytest.approx(entropy)
+        assert int(updated.step) == 124
+
+
+def test_train_logs_scheduled_coefficients_with_kl_stopping() -> None:
+    config = replace(
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        num_envs=1,
+        num_steps=1,
+        num_minibatches=1,
+        update_epochs=2,
+        total_steps=2,
+        vector_env="sync",
+        anneal_lr=True,
+        lr_decay="cosine",
+        entropy_decay="cosine",
+        target_kl=0.01,
+        video_every_episodes=0,
+        eval_every_minutes=0,
+    )
+    obs = np.zeros((1, 1), dtype=np.uint8)
+    zeros = np.zeros(1, dtype=np.float32)
+    dones = np.zeros(1, dtype=bool)
+    carry = initial_carry(1, 1)
+    envs = Mock()
+    envs.single_action_space.n = 2
+    envs.reset.return_value = (obs, {})
+    envs.step.return_value = (obs, zeros, dones, dones, {})
+    model = Mock()
+    model.initial_carry.return_value = carry
+    model.init.return_value = {"params": {"weight": jnp.zeros(1)}}
+    writer = Mock()
+    iterations: list[int] = []
+    learning_rates: list[float] = []
+
+    def reject_update(
+        state: TrainState, batch: ppo.PPOBatch, config: ppo.Config, iteration: int
+    ) -> tuple[TrainState, ppo.PPOMetrics]:
+        iterations.append(iteration)
+        learning_rates.append(float(state.opt_state.hyperparams["learning_rate"]))
+        return state, tuple(jnp.asarray(v) for v in (0.0, 0.0, 0.5, 1.0, 0.0))
+
+    with (
+        patch("rl2.ppo.gym.vector.SyncVectorEnv", return_value=envs),
+        patch("rl2.ppo.make_model", return_value=model),
+        patch("rl2.ppo.SummaryWriter", return_value=writer),
+        patch("rl2.ppo.act", return_value=(np.zeros(1, dtype=np.int32), zeros, zeros, carry)),
+        patch("rl2.ppo.value", return_value=zeros),
+        patch("rl2.ppo.update", side_effect=reject_update),
+    ):
+        state = train(config)
+    assert int(state.step) == 0
+    assert iterations == [0, 1]
+    np.testing.assert_allclose(learning_rates, config.learning_rate * np.array([1.0, 0.5]), rtol=1e-6)
+    for tag, initial in (("charts/learning_rate", config.learning_rate), ("charts/entropy_coef", config.entropy_coef)):
+        logged = [call.args[1:] for call in writer.add_scalar.call_args_list if call.args[0] == tag]
+        np.testing.assert_allclose(logged, [(initial, 1), (initial / 2, 2)], rtol=1e-6)
+    envs.close.assert_called_once()
+    writer.close.assert_called_once()
 
 
 def test_kl_rejects_update_without_changing_optimizer() -> None:
