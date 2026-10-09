@@ -13,7 +13,7 @@ dependencies = [
     "flax>=0.12.10,<0.13",
     "gcsfs",
     "google-cloud-storage>=3.15.1",
-    "gymnasium[other]>=1.1,<2",
+    "gymnasium>=1.1,<2",
     "jax>=0.11.2,<0.12",
     "moviepy>=2.2,<3",
     "numpy>=2,<3",
@@ -57,6 +57,11 @@ build-backend = "uv_build"
 
 [tool.ruff]
 line-length = 120
+
+[tool.uv]
+# Kauldron also requests desktop OpenCV; both variants install the same cv2 files.
+# Use the explicit headless dependency above for server-side Atari preprocessing.
+exclude-dependencies = ["opencv-python"]
 
 [dependency-groups]
 dev = [

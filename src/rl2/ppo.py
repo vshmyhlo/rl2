@@ -25,7 +25,12 @@ from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
-from rl2.gdn2 import GatedDeltaNet2Config, GatedDeltaNet2Recurrent, GatedDeltaNet2StackCarry
+from rl2.gdn2 import (
+    GatedDeltaNet2Backend,
+    GatedDeltaNet2Config,
+    GatedDeltaNet2Recurrent,
+    GatedDeltaNet2StackCarry,
+)
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import (
     LSTM,
@@ -54,6 +59,8 @@ class LSTMConfig:
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class GDN2Config:
     type: Literal["gdn2"] = "gdn2"
+    # Triton accelerates rollout steps and differentiable sequence replay on NVIDIA GPUs.
+    backend: GatedDeltaNet2Backend = "jax"
     hidden_size: Annotated[int, Field(gt=0, strict=True)] = 768
     num_layers: Annotated[int, Field(gt=0, strict=True)] = 2
     num_heads: Annotated[int, Field(gt=0, strict=True)] = 12
@@ -165,6 +172,7 @@ class ActorCritic(nn.Module):
                 self.model.mixer_config(self.dtype),
                 self.model.num_layers,
                 self.model.intermediate_size,
+                backend=self.model.backend,
                 name="gdn2",
                 parent=parent,
             )

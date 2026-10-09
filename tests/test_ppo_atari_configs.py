@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from rl2.ppo import ModelType, load_config, make_model
+from rl2.ppo import GDN2Config, ModelType, load_config, make_model
 
 
 @pytest.mark.parametrize("model_type", ("lstm", "gdn2", "mamba3"))
@@ -18,6 +18,11 @@ def test_atari_config_parameter_budget(model_type: ModelType) -> None:
     assert config.model.type == model_type
     assert config.log_dir == f"{base.log_dir}/ppo"
     assert replace(config, model=base.model, log_dir=base.log_dir) == base
+
+    if isinstance(config.model, GDN2Config):
+        assert config.model.backend == "triton"
+        # Parameter shapes are backend-independent; keep this budget check CPU-only.
+        config = replace(config, model=replace(config.model, backend="jax"))
 
     # Trace parameter shapes without allocating weights or compiling a training run.
     # Space Invaders uses six actions and four stacked 84x84 grayscale frames.

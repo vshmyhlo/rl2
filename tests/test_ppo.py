@@ -150,17 +150,30 @@ def test_clipped_policy_loss_and_gradient_direction() -> None:
     assert float(updated.params["logits"][1, 1, 0]) > float(logits[1, 1, 0])
 
 
-@pytest.mark.parametrize("model_type", ("lstm", "gdn2", "mamba3"))
-def test_bf16_recurrent_training_keeps_float32_state_and_losses(model_type: ppo.ModelType) -> None:
+@pytest.mark.parametrize(
+    "model_type,backend",
+    [("lstm", "jax"), ("gdn2", "jax"), ("mamba3", "jax"), ("gdn2", "triton")],
+)
+def test_bf16_recurrent_training_keeps_float32_state_and_losses(
+    model_type: ppo.ModelType, backend: ppo.GatedDeltaNet2Backend
+) -> None:
+    model_config = small_model_config(model_type)
+    if backend == "triton":
+        if not any("NVIDIA" in device.device_kind for device in jax.devices()):
+            pytest.skip("requires NVIDIA GPU")
+        pytest.importorskip("jax_triton")
+        model_config = ppo.GDN2Config(
+            hidden_size=8, num_layers=1, num_heads=1, head_dim=32, intermediate_size=8, backend=backend
+        )
     config = replace(
         load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
         target_kl=None,
-        model=small_model_config(model_type),
+        model=model_config,
     )
     assert config.bf16
     model = ActorCritic(
         3,
-        small_model_config(model_type),
+        model_config,
         dtype=jnp.bfloat16,
         encoder_stages=(ConvStage(4, blocks=1),),
         embedding_size=8,
@@ -537,6 +550,9 @@ def test_gdn2_gradients_stop_at_episode_reset() -> None:
         ({"type": "lstm", "hidden_size": 0}, "greater_than"),
         ({"type": "lstm", "hidden_size": True}, "int_type"),
         ({"type": "gdn2", "hidden_size": 1.5}, "int_type"),
+        ({"type": "gdn2", "backend": "cudnn"}, "literal_error"),
+        ({"type": "lstm", "backend": "triton"}, "unexpected_keyword_argument"),
+        ({"type": "mamba3", "backend": "triton"}, "unexpected_keyword_argument"),
         ({"type": "mamba3", "conv_size": 4}, "unexpected_keyword_argument"),
         ({"type": "mamba3", "head_dim": 5}, "divisible by head_dim"),
         ({"type": "mamba3", "num_groups": 5}, "divisible by num_groups"),
@@ -569,7 +585,8 @@ def test_flat_model_settings_are_rejected(field: str) -> None:
         ppo.Config(**settings)
 
 
-def test_model_config_loading_and_factory(tmp_path: Path) -> None:
+@pytest.mark.parametrize("backend", ("jax", "triton"))
+def test_model_config_loading_and_factory(tmp_path: Path, backend: str) -> None:
     settings = yaml.safe_load((Path(__file__).resolve().parents[1] / "configs/ppo.yaml").read_text())
     settings.pop("model")
     path = tmp_path / "ppo.yaml"
@@ -584,6 +601,7 @@ def test_model_config_loading_and_factory(tmp_path: Path) -> None:
         "num_layers": 2,
         "intermediate_size": 8,
         "conv_size": 1,
+        "backend": backend,
     }
     path.write_text(yaml.safe_dump(settings))
     config = load_config(path)
@@ -592,6 +610,9 @@ def test_model_config_loading_and_factory(tmp_path: Path) -> None:
     assert model.dtype == jnp.bfloat16
     assert model.model.hidden_size == 8
     assert model.model.intermediate_size == 8
+    recurrent = model._make_recurrent()
+    assert isinstance(recurrent, ppo.GatedDeltaNet2Recurrent)
+    assert recurrent.backend == backend
     assert asdict(config)["model"] == settings["model"]
     path.write_text(yaml.safe_dump(asdict(config)))
     round_trip = load_config(path)

@@ -3,7 +3,7 @@ observation_size: null # Resize only; null preserves the original resolution
 frame_stack: true # true stacks 4 frames; false uses a single frame
 atari_preprocessing: true # true enables 84x84 grayscale, action repeat 4, max pooling, and random reset no-ops
 seed: 1
-total_steps: 10000000
+total_steps: 10_000_000
 num_envs: 32
 vector_env: async # async (subprocesses) or sync
 num_steps: 128
@@ -11,6 +11,7 @@ num_minibatches: 4 # Must divide num_envs; minibatches contain whole sequences
 update_epochs: 4
 model: # 10,051,791 total actor-critic parameters with 4x84x84 observations and 6 actions
   type: gdn2
+  backend: triton # NVIDIA GPU; install with uv sync --extra cuda12 --extra gdn2-triton; use jax for CPU
   hidden_size: 256
   num_layers: 2
   num_heads: 4
