@@ -57,7 +57,7 @@ import numpy as np
 from flax.training.train_state import TrainState
 
 from rl2.atari_scores import REFERENCE_SOURCE, get_reference_scores
-from rl2.ppo import Array, AtariPreprocessing, Config, LSTMCarry, initial_carry
+from rl2.ppo import Array, AtariPreprocessing, Config, RecurrentCarry, initial_model_carry
 
 type EvaluationResult = dict[str, Any]
 
@@ -147,12 +147,12 @@ def make_evaluation_env(training: Config, evaluation: EvaluationConfig) -> gym.E
 def _action(
     state: TrainState,
     obs: Array,
-    carry: LSTMCarry,
+    carry: RecurrentCarry,
     episode_start: bool,
     key: jax.Array,
     *,
     greedy: bool,
-) -> tuple[jax.Array, LSTMCarry]:
+) -> tuple[jax.Array, RecurrentCarry]:
     carry, logits, _ = state.apply_fn(
         {"params": state.params},
         obs[None, None],
@@ -216,7 +216,7 @@ def evaluate(
             obs, info = env.reset(seed=seed)
             reset_frames = int(info["episode_frame_number"])
             key = jax.random.key(seed)
-            carry = initial_carry(1, training.lstm_hidden_size)
+            carry = initial_model_carry(training, 1)
             episode_return, agent_steps = 0.0, 0
             terminated, truncated = False, False
             while not (terminated or truncated):

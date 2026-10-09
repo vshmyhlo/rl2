@@ -1,8 +1,87 @@
-"""Abstract bases for autoregressive and bidirectional sequence models."""
+"""Abstract bases for autoregressive, bidirectional, and recurrent sequence models."""
 
 from abc import ABC, abstractmethod
 
 import jax
+
+
+class RecurentSequenceModel[CarryT](ABC):
+    """Recurrent sequence and step operations with PPO-style episode resets.
+
+    ``__call__`` is the time-stacked version of ``step``. It accepts a leading
+    time dimension, ``x[time,batch,input_dim]``, while ``step`` accepts
+    ``x[batch,input_dim]`` with no time dimension. Both methods accept incoming
+    model-specific carry and return updated outgoing carry. Pass ``carry=None``
+    to start from the model's fresh initial state; supplied carry continues
+    prior history.
+
+    Required boolean ``episode_starts`` masks have shape [time,batch] for
+    ``__call__`` and [batch] for ``step``. Each true entry resets only that
+    example's carry to the model's initial state before processing the current
+    input; a false entry continues from its incoming carry. Every input is
+    processed, including inputs that start a new episode.
+
+    Calling ``self(x, carry, episode_starts)`` must be equivalent, up to
+    floating-point numerical tolerance, to calling
+    ``step(x[t], carry, episode_starts[t])`` in increasing time order and
+    passing each returned carry to the next step. Stacking step outputs on
+    axis 0 must reproduce the sequence output and yield the same final carry.
+    This parity must hold both with any valid supplied initial carry and
+    without initial carry (``carry=None`` for the sequence call and the first
+    step, then the returned carry for subsequent steps), including when resets
+    occur within the sequence. It assumes identical parameters and computation
+    settings.
+    Splitting a sequence into chunks and passing carry between calls must
+    also preserve outputs and final carry. Outputs cannot depend on future
+    inputs or on history preceding the most recent episode reset.
+
+    Both methods return (updated outgoing carry, output). Outputs have shape
+    [time,batch,output_dim] or [batch,output_dim]; output_dim need not match
+    input_dim. Carry structure, initial state, and input/output dtypes are
+    implementation-specific. Gradients flow through supplied carry unless
+    the caller detaches it; episode resets discard the prior history.
+
+    Implementations validate shapes and dtypes and test sequence/step
+    equivalence and reset isolation; abstract methods alone cannot enforce
+    these properties. This base does not prescribe parameter storage.
+    For Flax modules, invoke through ``init``/``apply``, on a bound module,
+    or as a submodule.
+    """
+
+    @abstractmethod
+    def __call__(
+        self,
+        x: jax.Array,
+        carry: CarryT | None,
+        episode_starts: jax.Array,
+    ) -> tuple[CarryT, jax.Array]:
+        """Process [time,batch,input_dim] with boolean resets [time,batch].
+
+        Return (final carry, output [time,batch,output_dim]), equivalently to
+        scanning ``step`` calls with or without supplied initial carry.
+        Pass ``carry=None`` to start fresh. True ``episode_starts`` entries
+        reset carry before processing the corresponding inputs.
+        Implementations may require nonempty batch and time dimensions.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def step(
+        self,
+        x: jax.Array,
+        carry: CarryT | None,
+        episode_starts: jax.Array,
+    ) -> tuple[CarryT, jax.Array]:
+        """Process [batch,input_dim] with boolean resets [batch].
+
+        Return (updated carry, output [batch,output_dim]). Pass ``carry=None``
+        to start fresh; otherwise advance the incoming carry. True
+        ``episode_starts`` entries reset the corresponding examples' carry
+        before processing their input. With either starting mode, equivalent to
+        ``__call__`` with a singleton leading time axis, removing that axis
+        from the output.
+        """
+        raise NotImplementedError
 
 
 class BDSequenceModel(ABC):

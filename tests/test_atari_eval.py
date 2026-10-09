@@ -23,16 +23,17 @@ def training_config() -> Config:
         load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
         env_id="ALE/Pong-v5",
         atari_preprocessing=True,
-        lstm_hidden_size=2,
+        model=ppo.LSTMConfig(hidden_size=2),
     )
 
 
 def policy(
-    variables: dict[str, Any], obs: Array, carry: LSTMCarry, starts: Array
+    variables: dict[str, Any], obs: Array, carry: LSTMCarry, starts: Array, *, method: str
 ) -> tuple[LSTMCarry, jax.Array, jax.Array]:
-    del obs
-    carry = tuple(jnp.where(starts[0, :, None], 0, c) + 1 for c in carry)
-    return carry, variables["params"]["logits"][None, None], jnp.zeros((1, 1))
+    assert method == "step"
+    assert obs.ndim == 4
+    carry = tuple(jnp.where(starts[:, None], 0, c) + 1 for c in carry)
+    return carry, variables["params"]["logits"][None], jnp.zeros(1)
 
 
 def policy_state() -> TrainState:
@@ -73,17 +74,25 @@ class ScoringEnv(gym.Env):
         self.closed = True
 
 
-def test_full_games_raw_returns_memory_and_json(tmp_path: Path) -> None:
+@pytest.mark.parametrize("model_type", ("lstm", "gdn2"))
+def test_full_games_raw_returns_memory_and_json(tmp_path: Path, model_type: ppo.ModelType) -> None:
+    config = replace(
+        training_config(),
+        model=ppo.LSTMConfig(hidden_size=2)
+        if model_type == "lstm"
+        else ppo.GDN2Config(hidden_size=8, num_heads=1, head_dim=4, intermediate_size=8),
+    )
     env = ScoringEnv()
     starts: list[bool] = []
     memories: list[float] = []
 
     def action(
-        state: TrainState, obs: Array, carry: LSTMCarry, episode_start: bool, key: jax.Array, *, greedy: bool
-    ) -> tuple[jax.Array, LSTMCarry]:
+        state: TrainState, obs: Array, carry: ppo.RecurrentCarry, episode_start: bool, key: jax.Array, *, greedy: bool
+    ) -> tuple[jax.Array, ppo.RecurrentCarry]:
         starts.append(episode_start)
-        memories.append(float(carry[0][0, 0]))
-        return jnp.asarray(0), (carry[0] + 1, carry[1] + 1)
+        assert jax.tree.structure(carry) == jax.tree.structure(ppo.initial_model_carry(config, 1))
+        memories.append(float(jax.tree.leaves(carry)[0].reshape(-1)[0]))
+        return jnp.asarray(0), jax.tree.map(lambda leaf: leaf + 1, carry)
 
     output = tmp_path / "evaluation.json"
     with (
@@ -92,7 +101,7 @@ def test_full_games_raw_returns_memory_and_json(tmp_path: Path) -> None:
     ):
         result = evaluate(
             policy_state(),
-            training_config(),
+            config,
             EvaluationConfig(episodes=2),
             baselines=ScoreBaselines("ALE/Pong-v5", -5, 15, "test reference"),
             output_path=output,

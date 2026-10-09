@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, asdict, replace
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -11,8 +11,10 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import yaml
 from flax import linen as nn
 from flax.training.train_state import TrainState
+from pydantic import ValidationError
 
 from rl2 import ppo
 from rl2.observation_encoder import ConvStage
@@ -30,6 +32,12 @@ from rl2.ppo import (
     update,
     value,
 )
+
+
+def small_model_config(model_type: ppo.ModelType) -> ppo.ModelConfig:
+    if model_type == "lstm":
+        return ppo.LSTMConfig(hidden_size=8)
+    return ppo.GDN2Config(hidden_size=8, num_heads=1, head_dim=4, intermediate_size=8)
 
 
 @pytest.mark.parametrize("stacked", (False, True))
@@ -57,10 +65,10 @@ def test_resize_only_preserves_emulator_transitions(stacked: bool) -> None:
 
 def test_default_model_parameter_budget_and_rgb_shapes() -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
-    model = ActorCritic(6, config.lstm_hidden_size)
+    model = ActorCritic(6, config.model)
     # This architecture budget is specifically for 84x84 RGB, independent of the training config.
     obs = jax.ShapeDtypeStruct((1, 1, 1, 84, 84, 3), jnp.uint8)
-    carry = initial_carry(1, config.lstm_hidden_size)
+    carry = initial_carry(1, config.model.hidden_size)
     starts = jnp.ones((1, 1), dtype=bool)
     variables = jax.eval_shape(model.init, jax.random.key(0), obs, carry, starts)
     count = sum(parameter.size for parameter in jax.tree.leaves(variables["params"]))
@@ -69,7 +77,14 @@ def test_default_model_parameter_budget_and_rgb_shapes() -> None:
     final, logits, values = jax.eval_shape(model.apply, variables, obs, carry, starts)
     assert logits.shape == (1, 1, 6)
     assert values.shape == (1, 1)
-    assert final[0].shape == (1, config.lstm_hidden_size)
+    assert final[0].shape == (1, config.model.hidden_size)
+    step_obs = jax.ShapeDtypeStruct(obs.shape[1:], obs.dtype)
+    step_final, step_logits, step_values = jax.eval_shape(
+        partial(model.apply, method=model.step), variables, step_obs, carry, starts[0]
+    )
+    assert step_logits.shape == (1, 6)
+    assert step_values.shape == (1,)
+    assert step_final[0].shape == final[0].shape
 
 
 @pytest.mark.parametrize("frame_limit", (101, 102, 103, 104))
@@ -134,18 +149,23 @@ def test_clipped_policy_loss_and_gradient_direction() -> None:
     assert float(updated.params["logits"][1, 1, 0]) > float(logits[1, 1, 0])
 
 
-def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
-    config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), target_kl=None)
+@pytest.mark.parametrize("model_type", ("lstm", "gdn2"))
+def test_bf16_recurrent_training_keeps_float32_state_and_losses(model_type: ppo.ModelType) -> None:
+    config = replace(
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        target_kl=None,
+        model=small_model_config(model_type),
+    )
     assert config.bf16
     model = ActorCritic(
         3,
-        8,
+        small_model_config(model_type),
         dtype=jnp.bfloat16,
         encoder_stages=(ConvStage(4, blocks=1),),
         embedding_size=8,
     )
     obs = jax.random.randint(jax.random.key(2), (3, 2, 1, 8, 8), 0, 256, dtype=jnp.uint8)
-    carry = initial_carry(2, 8)
+    carry = model.initial_carry(2)
     starts = jnp.array([[True, True], [False, False], [True, False]])
     params = model.init(jax.random.key(1), obs, carry, starts)["params"]
     (final, logits, values), captured = jax.jit(
@@ -155,7 +175,7 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
     assert captured["intermediates"]["policy_hidden"]["__call__"][0].dtype == jnp.bfloat16
     assert captured["intermediates"]["policy_output"]["__call__"][0].dtype == jnp.bfloat16
     assert captured["intermediates"]["value_output"]["__call__"][0].dtype == jnp.bfloat16
-    for array in (*final, logits, values, *jax.tree.leaves(params)):
+    for array in (*jax.tree.leaves(final), logits, values, *jax.tree.leaves(params)):
         assert array.dtype == jnp.float32
     state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(0.001))
     replayed_log_probs = []
@@ -166,14 +186,15 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
         np.testing.assert_allclose(log_probs, action_log_prob(logits[t], actions), atol=1e-3, rtol=0)
         replayed_log_probs.append(action_log_prob(logits[t], jnp.zeros(2, dtype=jnp.int32)))
     # Float32 carry still accumulates differences from the BF16 encoder.
-    np.testing.assert_allclose(carry, final, atol=0.03, rtol=0.02)
+    for actual, expected in zip(jax.tree.leaves(carry), jax.tree.leaves(final), strict=True):
+        np.testing.assert_allclose(actual, expected, atol=0.03, rtol=0.02)
     batch = (
         obs,
         jnp.zeros((3, 2), dtype=jnp.int32),
         jnp.stack(replayed_log_probs),
         jnp.arange(6, dtype=jnp.float32).reshape(3, 2),
         jnp.ones((3, 2)),
-        initial_carry(2, 8),
+        model.initial_carry(2),
         starts,
     )
     updated, metrics = update(state, batch, config)
@@ -190,36 +211,54 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
     )
 
 
+@pytest.mark.parametrize("model_type", ("lstm", "gdn2"))
 @jax.default_matmul_precision("highest")
-def test_recurrent_sequences_match_steps_and_reset_only_finished_env() -> None:
+def test_recurrent_sequences_match_steps_and_reset_only_finished_env(model_type: ppo.ModelType) -> None:
     # Test sequence/reset semantics in float32, without GPU TF32 approximation.
-    model = ActorCritic(3, 16, encoder_stages=(ConvStage(4, blocks=1),), embedding_size=8)
+    model = ActorCritic(
+        3,
+        small_model_config(model_type),
+        encoder_stages=(ConvStage(4, blocks=1),),
+        embedding_size=8,
+    )
     obs = jax.random.randint(jax.random.key(2), (4, 2, 4, 8, 8), 0, 256, dtype=jnp.uint8)
-    carry = initial_carry(2, 16)
+    carry = model.initial_carry(2)
     starts = jnp.array([[True, True], [False, False], [True, False], [False, False]])
     params = model.init(jax.random.key(1), obs, carry, starts)
     apply = jax.jit(model.apply)
+    step = jax.jit(partial(model.apply, method=model.step))
     final, logits, values = apply(params, obs, carry, starts)
     stepped_logits, stepped_values = [], []
     for t in range(4):
-        carry, policy, critic = apply(params, obs[t : t + 1], carry, starts[t : t + 1])
-        stepped_logits.append(policy[0])
-        stepped_values.append(critic[0])
+        carry, policy, critic = step(params, obs[t], carry, starts[t])
+        stepped_logits.append(policy)
+        stepped_values.append(critic)
     np.testing.assert_allclose(logits, jnp.stack(stepped_logits), atol=5e-6)
     np.testing.assert_allclose(values, jnp.stack(stepped_values), atol=5e-6)
-    np.testing.assert_allclose(final, carry, atol=5e-6)
+    step_params = model.init(jax.random.key(1), obs[0], model.initial_carry(2), starts[0], method=model.step)
+    for actual, expected in zip(jax.tree.leaves(step_params), jax.tree.leaves(params), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    for actual, expected in zip(jax.tree.leaves(carry), jax.tree.leaves(final), strict=True):
+        np.testing.assert_allclose(actual, expected, atol=5e-6)
     # Splitting a rollout preserves memory; bootstrapping must not consume it.
-    prefix_carry, _, _ = apply(params, obs[:2], initial_carry(2, 16), starts[:2])
+    prefix_carry, _, _ = apply(params, obs[:2], model.initial_carry(2), starts[:2])
     state = TrainState.create(apply_fn=model.apply, params=params["params"], tx=optax.sgd(0.0))
     peek = value(state, obs[2], prefix_carry, starts[2])
     np.testing.assert_allclose(peek, values[2], atol=5e-6)
     _, suffix_logits, suffix_values = apply(params, obs[2:], prefix_carry, starts[2:])
     np.testing.assert_allclose(suffix_values, values[2:], atol=5e-6)
     # A reset discards history for env 0; env 1 still depends on it.
-    _, fresh_logits, fresh_values = apply(params, obs[2:], initial_carry(2, 16), starts[2:])
+    _, fresh_logits, fresh_values = apply(params, obs[2:], model.initial_carry(2), starts[2:])
     np.testing.assert_allclose(suffix_logits[:, 0], fresh_logits[:, 0], atol=5e-6)
     np.testing.assert_allclose(suffix_values[:, 0], fresh_values[:, 0], atol=5e-6)
     assert float(jnp.max(jnp.abs(suffix_values[:, 1] - fresh_values[:, 1]))) > 1e-05
+
+    selected = jax.tree.map(lambda leaf: leaf[jnp.array([1])], prefix_carry)
+    selected_final, selected_logits, selected_values = apply(params, obs[2:, 1:], selected, starts[2:, 1:])
+    np.testing.assert_allclose(selected_logits, suffix_logits[:, 1:], atol=5e-6)
+    np.testing.assert_allclose(selected_values, suffix_values[:, 1:], atol=5e-6)
+    for actual, expected in zip(jax.tree.leaves(selected_final), jax.tree.leaves(final), strict=True):
+        np.testing.assert_allclose(actual, expected[1:], atol=5e-6)
 
 
 def test_lstm_gradients_follow_history_but_stop_at_episode_reset() -> None:
@@ -406,12 +445,14 @@ def test_preprocessing_returns_final_screen(end_step: int, terminated: bool, gra
         np.testing.assert_array_equal(obs, np.full(obs.shape, end_step, np.uint8))
 
 
-@pytest.mark.parametrize("frame_budget", (1, 5))
-def test_video_recording_stops_at_frame_budget(frame_budget: int) -> None:
+@pytest.mark.parametrize("frame_budget, model_type", ((1, "lstm"), (5, "lstm"), (5, "gdn2")))
+def test_video_recording_stops_at_frame_budget(frame_budget: int, model_type: ppo.ModelType) -> None:
     from unittest.mock import Mock
 
     config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), video_max_frames=frame_budget
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        video_max_frames=frame_budget,
+        model=small_model_config(model_type),
     )
     env = Mock()
     env.metadata = {"render_fps": 60}
@@ -419,12 +460,17 @@ def test_video_recording_stops_at_frame_budget(frame_budget: int) -> None:
     env.step.return_value = (np.zeros((4, 84, 84), np.uint8), 0.0, False, False, {})
     env.render.return_value = np.zeros((210, 160, 3), np.uint8)
     writer = Mock()
-    carry = initial_carry(1, config.lstm_hidden_size)
+    carry = ppo.initial_model_carry(config, 1)
     with (
         patch("rl2.ppo.make_env", return_value=env),
-        patch("rl2.ppo.act", return_value=(np.array([0]), np.array([0.0]), np.array([0.0]), carry)),
+        patch("rl2.ppo.act", return_value=(np.array([0]), np.array([0.0]), np.array([0.0]), carry)) as act,
     ):
         ppo.log_video(Mock(), config, writer, episode=1, steps=128)
+    if frame_budget > 1:
+        actual = act.call_args_list[0].args[2]
+        assert jax.tree.structure(actual) == jax.tree.structure(carry)
+        for leaf in jax.tree.leaves(actual):
+            np.testing.assert_array_equal(leaf, 0)
     assert env.step.call_count == frame_budget - 1
     video = writer.add_video.call_args.args[1]
     assert video.shape == (1, frame_budget, 3, 210, 160)
@@ -434,13 +480,13 @@ def test_video_recording_stops_at_frame_budget(frame_budget: int) -> None:
 
 @pytest.mark.parametrize("frame_budget", (0, -1, 1.5, True))
 def test_invalid_video_frame_budget_fails_before_environment_creation(frame_budget: Any) -> None:
-    config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), video_max_frames=frame_budget
-    )
     with (
         patch("rl2.ppo.make_env") as create_env,
         pytest.raises(ValueError, match="video_max_frames"),
     ):
+        config = replace(
+            load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), video_max_frames=frame_budget
+        )
         train(config)
     create_env.assert_not_called()
 
@@ -459,7 +505,7 @@ def test_video_recording_stops_at_episode_end(frame_budget: int | None, terminat
     env.step.side_effect = [(obs, 0.0, False, False, {})] * 6 + [(obs, 0.0, terminated, not terminated, {})]
     env.render.return_value = np.zeros((210, 160, 3), np.uint8)
     writer = Mock()
-    carry = initial_carry(1, config.lstm_hidden_size)
+    carry = initial_carry(1, config.model.hidden_size)
     with (
         patch("rl2.ppo.make_env", return_value=env),
         patch("rl2.ppo.act", return_value=(np.array([0]), np.array([0.0]), np.array([0.0]), carry)),
@@ -468,3 +514,104 @@ def test_video_recording_stops_at_episode_end(frame_budget: int | None, terminat
     assert env.step.call_count == 7
     assert writer.add_video.call_args.args[1].shape == (1, 8, 3, 210, 160)
     env.close.assert_called_once()
+
+
+@jax.default_matmul_precision("highest")
+def test_gdn2_gradients_stop_at_episode_reset() -> None:
+    config = ppo.GatedDeltaNet2Config(hidden_size=8, num_heads=1, head_dim=4)
+    cell = nn.scan(ppo.ResetGDN2, variable_broadcast="params", split_rngs={"params": False}, in_axes=0, out_axes=0)(
+        config, 2, 8
+    )
+    inputs = jax.random.normal(jax.random.key(2), (4, 2, 8))
+    starts = jnp.zeros((4, 2), dtype=bool).at[2, 0].set(True)
+    carry = ppo.GatedDeltaNet2Stack(config, 2, 8).initial_carry(2)
+    params = cell.init(jax.random.key(1), carry, (inputs, starts))
+
+    def loss(x: jax.Array) -> jax.Array:
+        return cell.apply(params, carry, (x, starts))[1][-1].sum()
+
+    grads = jax.jit(jax.grad(loss))(inputs)
+    np.testing.assert_array_equal(grads[:2, 0], 0)
+    assert float(jnp.linalg.norm(grads[:2, 1])) > 0
+    assert float(jnp.linalg.norm(grads[2:, 0])) > 0
+
+
+@pytest.mark.parametrize(
+    "model_settings, message",
+    [
+        ({"type": "unknown"}, "union_tag_invalid"),
+        ({"hidden_size": 8}, "union_tag_not_found"),
+        ("lstm", "model"),
+        ({"type": "lstm", "num_layers": 2}, "unexpected_keyword_argument"),
+        ({"type": "gdn2", "lstm_hidden_size": 8}, "unexpected_keyword_argument"),
+        ({"type": "lstm", "hidden_size": 0}, "greater_than"),
+        ({"type": "lstm", "hidden_size": True}, "int_type"),
+        ({"type": "gdn2", "hidden_size": 1.5}, "int_type"),
+        *[
+            ({"type": "gdn2", name: 0}, "greater_than")
+            for name in ("hidden_size", "num_heads", "head_dim", "conv_size", "num_layers", "intermediate_size")
+        ],
+    ],
+)
+def test_invalid_model_config(model_settings: Any, message: str) -> None:
+    settings = vars(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")).copy()
+    settings["model"] = model_settings
+    with pytest.raises(ValidationError, match=message):
+        ppo.Config(**settings)
+
+
+@pytest.mark.parametrize("field", ("lstm_hidden_size", "gdn2_hidden_size"))
+def test_flat_model_settings_are_rejected(field: str) -> None:
+    settings = vars(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")).copy()
+    settings[field] = 8
+    with pytest.raises(ValidationError, match=field):
+        ppo.Config(**settings)
+
+
+def test_model_config_loading_and_factory(tmp_path: Path) -> None:
+    settings = yaml.safe_load((Path(__file__).resolve().parents[1] / "configs/ppo.yaml").read_text())
+    settings.pop("model")
+    path = tmp_path / "ppo.yaml"
+    path.write_text(yaml.safe_dump(settings))
+    default = load_config(path)
+    assert ppo.make_model(default, 3).model == ppo.LSTMConfig()
+    settings["model"] = {
+        "type": "gdn2",
+        "hidden_size": 8,
+        "num_heads": 1,
+        "head_dim": 4,
+        "num_layers": 2,
+        "intermediate_size": 8,
+        "conv_size": 1,
+    }
+    path.write_text(yaml.safe_dump(settings))
+    config = load_config(path)
+    model = ppo.make_model(config, 3)
+    assert isinstance(model.model, ppo.GDN2Config)
+    assert model.dtype == jnp.bfloat16
+    assert model.model.hidden_size == 8
+    assert model.model.intermediate_size == 8
+    assert asdict(config)["model"] == settings["model"]
+    path.write_text(yaml.safe_dump(asdict(config)))
+    round_trip = load_config(path)
+    assert round_trip == config
+    assert hash(round_trip) == hash(config)
+    with pytest.raises(FrozenInstanceError):
+        config.model.hidden_size = 16
+    carry = ppo.initial_model_carry(config, 2)
+    assert len(carry) == 2
+    for layer in carry:
+        assert layer.state.shape == (2, 1, 4, 4)
+        assert layer.q.shape == layer.k.shape == layer.v.shape == (2, 0, 4)
+        for leaf in layer:
+            assert leaf.dtype == jnp.float32
+            np.testing.assert_array_equal(leaf, 0)
+
+
+@pytest.mark.parametrize("bad_input", ("observation_dtype", "reset_mask_shape"))
+def test_step_rejects_invalid_array_metadata(bad_input: str) -> None:
+    model = ActorCritic(3, ppo.LSTMConfig(hidden_size=8), encoder_stages=(ConvStage(4, blocks=1),), embedding_size=8)
+    obs = jax.ShapeDtypeStruct((2, 1, 8, 8), jnp.float32 if bad_input == "observation_dtype" else jnp.uint8)
+    starts = jnp.zeros((1, 2) if bad_input == "reset_mask_shape" else (2,), dtype=jnp.bool_)
+    with pytest.raises(AssertionError):
+        jax.eval_shape(partial(model.init, method=model.step), jax.random.key(0), obs, model.initial_carry(2), starts)

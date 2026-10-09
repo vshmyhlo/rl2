@@ -1,14 +1,14 @@
-"""Recurrent PPO with a normalized residual Atari CNN and LSTM."""
+"""Recurrent PPO with a residual Atari CNN and an LSTM or GDN2 backbone."""
 
 import argparse
 import json
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import datetime
 from functools import partial
 from pathlib import Path
 from time import monotonic
-from typing import Any, SupportsFloat
+from typing import Annotated, Any, Literal, SupportsFloat, cast
 
 import ale_py
 import chex
@@ -21,19 +21,54 @@ import yaml
 from flax import linen as nn
 from flax.training.train_state import TrainState
 from numpy.typing import NDArray
+from pydantic import ConfigDict, Field
+from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
+from rl2.gdn2 import GatedDeltaNet2Config, GatedDeltaNet2Stack, GatedDeltaNet2StackCarry
 from rl2.jax_cache import configure_compilation_cache
 from rl2.multi_atari import register_envs
 from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages
+from rl2.shape_checker import ShapeChecker
 
 type Array = jax.Array | NDArray[Any]
 type LSTMCarry = tuple[jax.Array, jax.Array]
-type PPOBatch = tuple[Array, Array, Array, Array, Array, LSTMCarry, Array]
+type RecurrentCarry = LSTMCarry | GatedDeltaNet2StackCarry
+type ModelType = Literal["lstm", "gdn2"]
+type PPOBatch = tuple[Array, Array, Array, Array, Array, RecurrentCarry, Array]
 type PPOMetrics = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class LSTMConfig:
+    type: Literal["lstm"] = "lstm"
+    hidden_size: Annotated[int, Field(gt=0, strict=True)] = 1536
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class GDN2Config:
+    type: Literal["gdn2"] = "gdn2"
+    hidden_size: Annotated[int, Field(gt=0, strict=True)] = 768
+    num_layers: Annotated[int, Field(gt=0, strict=True)] = 2
+    num_heads: Annotated[int, Field(gt=0, strict=True)] = 12
+    head_dim: Annotated[int, Field(gt=0, strict=True)] = 64
+    intermediate_size: Annotated[int, Field(gt=0, strict=True)] = 1536
+    conv_size: Annotated[int, Field(gt=0, strict=True)] = 4
+
+    def mixer_config(self, dtype: jax.typing.DTypeLike) -> GatedDeltaNet2Config:
+        return GatedDeltaNet2Config(
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            conv_size=self.conv_size,
+            dtype=dtype,
+        )
+
+
+type ModelConfig = Annotated[LSTMConfig | GDN2Config, Field(discriminator="type")]
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
 class Config:
     env_id: str
     frame_stack: bool
@@ -45,7 +80,6 @@ class Config:
     num_steps: int
     num_minibatches: int
     update_epochs: int
-    lstm_hidden_size: int
     learning_rate: float
     anneal_lr: bool
     gamma: float
@@ -65,6 +99,7 @@ class Config:
     eval_episodes: int = 100
     eval_seed: int = 10_000
     encoder_stages: ConvStages = DEFAULT_STAGES
+    model: ModelConfig = LSTMConfig()
 
 
 def load_config(path: str | Path) -> Config:
@@ -105,55 +140,175 @@ class ResetLSTM(nn.Module):
         return carry, x.astype(self.dtype)
 
 
-class ActorCritic(nn.Module):
-    num_actions: int
-    lstm_hidden_size: int
-    dtype: jax.typing.DTypeLike = jnp.float32
-    encoder_stages: ConvStages = DEFAULT_STAGES
-    embedding_size: int = 768
+class ResetGDN2(nn.Module):
+    config: GatedDeltaNet2Config
+    num_layers: int
+    intermediate_size: int
 
     @nn.compact
     def __call__(
         self,
-        obs: Array,
-        carry: LSTMCarry,
-        episode_starts: Array,
-    ) -> tuple[LSTMCarry, jax.Array, jax.Array]:
-        # [steps, environments, frames, height, width, (RGB channels)].
-        chex.assert_rank(obs, {5, 6})
-        chex.assert_type(obs, jnp.uint8)
-        steps, environments = obs.shape[:2]
-        chex.assert_shape(carry, (environments, self.lstm_hidden_size))
-        chex.assert_type(carry, jnp.float32)
-        chex.assert_shape(episode_starts, (steps, environments))
-        chex.assert_type(episode_starts, jnp.bool_)
-        x = ConvObservationEncoder(
+        carry: GatedDeltaNet2StackCarry,
+        inputs: tuple[jax.Array, jax.Array],
+    ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
+        x, episode_starts = inputs
+        sc = ShapeChecker(D=self.config.hidden_size)
+        sc.check(x, "BD", self.config.dtype)
+        sc.check(episode_starts, "B", jnp.bool_)
+
+        def reset(leaf: jax.Array) -> jax.Array:
+            sc = ShapeChecker(B=x.shape[0])
+            sc.check(leaf, "B" + "HKV"[: leaf.ndim - 1], jnp.float32)
+            mask = episode_starts.reshape((x.shape[0],) + (1,) * (leaf.ndim - 1))
+            return jnp.where(mask, 0, leaf)
+
+        # Reset matrix memory AND short-convolution history in every layer.
+        carry = jax.tree.map(reset, carry)
+        backbone = GatedDeltaNet2Stack(self.config, self.num_layers, self.intermediate_size)
+        carry, x = backbone.step(x, jnp.ones((x.shape[0],), dtype=jnp.bool_), carry)
+        sc.check(x, "BD", self.config.dtype)
+        return carry, x
+
+
+class ActorCritic(nn.Module):
+    num_actions: int
+    model: ModelConfig = LSTMConfig()
+    dtype: jax.typing.DTypeLike = jnp.float32
+    encoder_stages: ConvStages = DEFAULT_STAGES
+    embedding_size: int = 768
+
+    @nn.nowrap
+    def initial_carry(self, num_envs: int) -> RecurrentCarry:
+        if self.model.type == "lstm":
+            return initial_carry(num_envs, self.model.hidden_size)
+        return GatedDeltaNet2Stack(
+            self.model.mixer_config(self.dtype), self.model.num_layers, self.model.intermediate_size
+        ).initial_carry(num_envs)
+
+    def setup(self) -> None:
+        self.encoder = ConvObservationEncoder(
             stages=self.encoder_stages,
             embedding_size=self.embedding_size,
             dtype=self.dtype,
             name="encoder",
-        )(obs.reshape((-1, *obs.shape[2:])))
+        )
+        if self.model.type == "lstm":
+            self.recurrent = ResetLSTM(self.model.hidden_size, dtype=self.dtype, name="lstm")
+        else:
+            self.gdn2_input = nn.Dense(self.model.hidden_size, dtype=self.dtype, name="gdn2_input")
+            self.recurrent = ResetGDN2(
+                self.model.mixer_config(self.dtype), self.model.num_layers, self.model.intermediate_size, name="gdn2"
+            )
         init = nn.initializers.orthogonal(np.sqrt(2))
+        self.policy_hidden = nn.Dense(512, kernel_init=init, name="policy_hidden", dtype=self.dtype)
+        self.policy_norm = nn.LayerNorm(name="policy_norm", dtype=self.dtype)
+        self.value_hidden = nn.Dense(512, kernel_init=init, name="value_hidden", dtype=self.dtype)
+        self.value_norm = nn.LayerNorm(name="value_norm", dtype=self.dtype)
+        self.policy_output = nn.Dense(
+            self.num_actions, kernel_init=nn.initializers.orthogonal(0.01), name="policy_output", dtype=self.dtype
+        )
+        self.value_output = nn.Dense(
+            1, kernel_init=nn.initializers.orthogonal(1.0), name="value_output", dtype=self.dtype
+        )
+
+    def _encode(self, obs: Array) -> jax.Array:
+        chex.assert_rank(obs, {4, 5})
+        sc = ShapeChecker(E=self.embedding_size)
+        sc.check(obs, "BFHW" if obs.ndim == 4 else "BFHWC", jnp.uint8)
+        x = self.encoder(obs)
+        sc.check(x, "BE", self.dtype)
+        if self.model.type == "gdn2":
+            x = self.gdn2_input(x).astype(self.dtype)
+            projection_sc = ShapeChecker(B=obs.shape[0], D=self.model.hidden_size)
+            projection_sc.check(x, "BD", self.dtype)
+        return x
+
+    def _heads(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
+        # Flatten time and batch for sequence calls, keeping the same heads as step().
+        sc = ShapeChecker(A=self.num_actions)
+        x = x.astype(self.dtype)
+        sc.check(x, "BD", self.dtype)
+        policy = nn.relu(self.policy_norm(self.policy_hidden(x)))
+        critic = nn.relu(self.value_norm(self.value_hidden(x)))
+        # Heads use the compute dtype; float32 outputs keep PPO loss arithmetic precise.
+        logits = self.policy_output(policy).astype(jnp.float32)
+        values = self.value_output(critic).squeeze(-1).astype(jnp.float32)
+        sc.check(logits, "BA", jnp.float32)
+        sc.check(values, "B", jnp.float32)
+        return logits, values
+
+    def __call__(
+        self,
+        obs: Array,
+        carry: RecurrentCarry,
+        episode_starts: Array,
+    ) -> tuple[RecurrentCarry, jax.Array, jax.Array]:
+        """Process time-stacked observations [T,B,F,H,W,(C)] and reset masks [T,B]."""
+        chex.assert_rank(obs, {5, 6})
+        sc = ShapeChecker(A=self.num_actions)
+        sc.check(obs, "TBFHW" if obs.ndim == 5 else "TBFHWC", jnp.uint8)
+        sc.check(episode_starts, "TB", jnp.bool_)
+        steps, environments = sc["TB"]
+        x = self._encode(obs.reshape((-1, *obs.shape[2:])))
+        x = x.reshape((steps, environments, -1))
+        if self.model.type == "lstm":
+            carry_sc = ShapeChecker(B=environments, D=self.model.hidden_size)
+            carry_sc.check(cast(LSTMCarry, carry), "BD", jnp.float32)
+
+        def recurrent_step(
+            cell: ResetLSTM | ResetGDN2,
+            memory: RecurrentCarry,
+            inputs: tuple[jax.Array, jax.Array],
+        ) -> tuple[RecurrentCarry, jax.Array]:
+            return cell(memory, inputs)
+
+        # Scan only recurrence; the CNN and heads still batch all time steps together.
         carry, x = nn.scan(
-            ResetLSTM,
+            recurrent_step,
             variable_broadcast="params",
             split_rngs={"params": False},
             in_axes=0,
             out_axes=0,
-        )(self.lstm_hidden_size, dtype=self.dtype, name="lstm")(
-            carry,
-            (x.reshape((steps, environments, -1)), episode_starts),
-        )
-        policy = nn.Dense(512, kernel_init=init, name="policy_hidden", dtype=self.dtype)(x)
-        policy = nn.relu(nn.LayerNorm(name="policy_norm", dtype=self.dtype)(policy))
-        critic = nn.Dense(512, kernel_init=init, name="value_hidden", dtype=self.dtype)(x)
-        critic = nn.relu(nn.LayerNorm(name="value_norm", dtype=self.dtype)(critic))
-        # Heads use the compute dtype; float32 outputs keep PPO loss arithmetic precise.
-        logits = nn.Dense(
-            self.num_actions, kernel_init=nn.initializers.orthogonal(0.01), name="policy_output", dtype=self.dtype
-        )(policy)
-        value = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0), name="value_output", dtype=self.dtype)(critic)
-        return carry, logits.astype(jnp.float32), value.squeeze(-1).astype(jnp.float32)
+        )(self.recurrent, carry, (x, episode_starts))
+        logits, values = self._heads(x.reshape((steps * environments, -1)))
+        logits = logits.reshape((steps, environments, self.num_actions))
+        values = values.reshape((steps, environments))
+        sc.check(logits, "TBA", jnp.float32)
+        sc.check(values, "TB", jnp.float32)
+        return carry, logits, values
+
+    def step(
+        self,
+        obs: Array,
+        carry: RecurrentCarry,
+        episode_starts: Array,
+    ) -> tuple[RecurrentCarry, jax.Array, jax.Array]:
+        """Process one observation per environment [B,F,H,W,(C)] with reset masks [B]."""
+        chex.assert_rank(obs, {4, 5})
+        sc = ShapeChecker(A=self.num_actions)
+        sc.check(obs, "BFHW" if obs.ndim == 4 else "BFHWC", jnp.uint8)
+        sc.check(episode_starts, "B", jnp.bool_)
+        if self.model.type == "lstm":
+            carry_sc = ShapeChecker(B=obs.shape[0], D=self.model.hidden_size)
+            carry_sc.check(cast(LSTMCarry, carry), "BD", jnp.float32)
+        carry, x = self.recurrent(carry, (self._encode(obs), episode_starts))
+        logits, values = self._heads(x)
+        sc.check(logits, "BA", jnp.float32)
+        sc.check(values, "B", jnp.float32)
+        return carry, logits, values
+
+
+def make_model(config: Config, num_actions: int) -> ActorCritic:
+    return ActorCritic(
+        num_actions,
+        config.model,
+        dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
+        encoder_stages=config.encoder_stages,
+    )
+
+
+def initial_model_carry(config: Config, num_envs: int) -> RecurrentCarry:
+    return make_model(config, num_actions=1).initial_carry(num_envs)
 
 
 class AtariPreprocessing(gym.wrappers.AtariPreprocessing):
@@ -203,25 +358,25 @@ def action_log_prob(logits: Array, actions: Array) -> jax.Array:
 def act(
     state: TrainState,
     obs: Array,
-    carry: LSTMCarry,
+    carry: RecurrentCarry,
     episode_starts: Array,
     key: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array, LSTMCarry]:
+) -> tuple[jax.Array, jax.Array, jax.Array, RecurrentCarry]:
     carry, logits, values = state.apply_fn(
         {"params": state.params},
-        obs[None],
+        obs,
         carry,
-        episode_starts[None],
+        episode_starts,
+        method="step",
     )
-    logits, values = logits[0], values[0]
     actions = jax.random.categorical(key, logits)
     return actions, action_log_prob(logits, actions), values, carry
 
 
 @jax.jit
-def value(state: TrainState, obs: Array, carry: LSTMCarry, episode_starts: Array) -> jax.Array:
+def value(state: TrainState, obs: Array, carry: RecurrentCarry, episode_starts: Array) -> jax.Array:
     # Peek at the next value without advancing the rollout's recurrent state.
-    return state.apply_fn({"params": state.params}, obs[None], carry, episode_starts[None])[2][0]
+    return state.apply_fn({"params": state.params}, obs, carry, episode_starts, method="step")[2]
 
 
 def log_video(
@@ -242,7 +397,7 @@ def log_video(
         obs, _ = env.reset(seed=config.seed + episode)
         key = jax.random.fold_in(jax.random.key(config.seed), episode)
         frames = [env.render()]
-        carry = initial_carry(1, config.lstm_hidden_size)
+        carry = initial_model_carry(config, 1)
         while config.video_max_frames is None or len(frames) < config.video_max_frames:
             key, action_key = jax.random.split(key)
             actions, _, _, carry = act(state, obs[None], carry, jnp.zeros(1, dtype=bool), action_key)
@@ -359,8 +514,6 @@ def train(config: Config) -> TrainState:
         raise ValueError("Environment, rollout, minibatch, and epoch counts must be positive")
     if config.num_envs % config.num_minibatches:
         raise ValueError("num_envs must be divisible by num_minibatches to preserve sequences")
-    if config.lstm_hidden_size < 1:
-        raise ValueError("lstm_hidden_size must be positive")
     if config.total_steps < batch_size:
         raise ValueError("total_steps must cover at least one rollout")
     if config.video_max_frames is not None and (
@@ -417,13 +570,8 @@ def train(config: Config) -> TrainState:
         writer.add_text("devices", devices, 0)
         obs, _ = envs.reset(seed=config.seed)
         key, init_key = jax.random.split(jax.random.key(config.seed))
-        model = ActorCritic(
-            envs.single_action_space.n,
-            config.lstm_hidden_size,
-            dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
-            encoder_stages=config.encoder_stages,
-        )
-        carry = initial_carry(config.num_envs, config.lstm_hidden_size)
+        model = make_model(config, envs.single_action_space.n)
+        carry = model.initial_carry(config.num_envs)
         episode_start = np.ones(config.num_envs, dtype=bool)
         lr_schedule = learning_rate_schedule(config)
         optimizer = optax.inject_hyperparams(
@@ -434,9 +582,7 @@ def train(config: Config) -> TrainState:
         )
         state = TrainState.create(
             apply_fn=model.apply,
-            params=model.init(
-                init_key, obs[None, :1], initial_carry(1, config.lstm_hidden_size), episode_start[None, :1]
-            )["params"],
+            params=model.init(init_key, obs[None, :1], model.initial_carry(1), episode_start[None, :1])["params"],
             tx=optimizer(config.learning_rate),
         )
         parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
