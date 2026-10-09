@@ -31,10 +31,12 @@ def test_atari_configs_enable_cosine_decay() -> None:
         assert config.entropy_decay == "cosine", path.name
 
 
-def test_atari_model_configs_specify_log_directory_templates() -> None:
+def test_atari_model_configs_specify_experiment_settings() -> None:
     configs = Path(__file__).resolve().parents[1] / "configs"
     for model_type in ("lstm", "gdn2", "mamba3"):
         config = load_config(configs / f"ppo_atari_{model_type}.yaml")
+        assert config.env_id == "ALE/Breakout-v5"
+        assert config.total_steps == 10_000_000
         assert config.log_dir == "gs://cohere-dev/vlad/rl2/ppo/${run_id}/${env_id}"
 
 
@@ -45,7 +47,7 @@ def test_atari_config_parameter_budget(model_type: ModelType) -> None:
     config = load_config(configs / f"ppo_atari_{model_type}.yaml")
     assert config.model.type == model_type
     assert config.model.num_layers == 2
-    assert replace(config, model=base.model, log_dir=base.log_dir, run_id=base.run_id) == base
+    assert replace(config, env_id=base.env_id, model=base.model, log_dir=base.log_dir, run_id=base.run_id) == base
 
     if isinstance(config.model, GDN2Config):
         assert config.model.backend == "triton"
