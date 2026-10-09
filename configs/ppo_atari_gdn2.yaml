@@ -1,9 +1,9 @@
-env_id: ALE/Boxing-v5
+env_id: ALE/Breakout-v5
 observation_size: null # Resize only; null preserves the original resolution
 frame_stack: true # true stacks 4 frames; false uses a single frame
 atari_preprocessing: true # true enables 84x84 grayscale, action repeat 4, max pooling, and random reset no-ops
 seed: 1
-total_steps: 100000 # Agent transitions across all envs; full rollouts use 98,304
+total_steps: 10000000 # Agent transitions across all envs; rounded down to full rollouts
 num_envs: 32
 vector_env: async # async (subprocesses) or sync
 num_steps: 128
