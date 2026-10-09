@@ -19,6 +19,7 @@ dependencies = [
     "numpy>=2,<3",
     "opencv-python-headless>=4.10,<5",
     "optax>=0.2.4,<0.3",
+    "orbax-checkpoint>=0.12.6,<0.13",
     "pydantic>=2.13,<3",
     "pyyaml>=6,<7",
     "reasoning-gym>=0.1.25",

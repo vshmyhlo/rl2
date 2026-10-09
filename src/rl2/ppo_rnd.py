@@ -77,6 +77,7 @@ class Config:
     rnd_update_epochs: int = 4
     encoder_channels: tuple[int, ...] = (128, 256, 384, 512)
     embedding_size: int = 768
+    run_id: str | None = None
 
 
 def load_config(path: str | Path) -> Config:
@@ -570,7 +571,9 @@ def train(config: Config) -> TrainState:
     )
     writer = None
     try:
-        run_name = f"ppo_rnd_{config.env_id.replace('/', '_')}_seed{config.seed}_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"
+        run_name = config.run_id or (
+            f"ppo_rnd_{config.env_id.replace('/', '_')}_seed{config.seed}_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"
+        )
         run_dir = f"{config.log_dir.rstrip('/')}/{run_name}"
         writer = SummaryWriter(logdir=run_dir)
         writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", 0)

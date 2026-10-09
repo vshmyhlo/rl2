@@ -2,7 +2,7 @@ from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import chex
 import gymnasium as gym
@@ -20,6 +20,21 @@ from rl2.utils import RunningMeanStd
 
 def config() -> rnd.Config:
     return rnd.load_config(Path(__file__).resolve().parents[1] / "configs/ppo_rnd_montezuma.yaml")
+
+
+def test_tensorboard_uses_config_run_id(tmp_path: Path) -> None:
+    settings = replace(config(), log_dir=str(tmp_path), run_id="rnd-run", vector_env="sync")
+    envs = Mock()
+    envs.reset.side_effect = RuntimeError("stop before training")
+    with (
+        patch.object(rnd.gym.vector, "SyncVectorEnv", return_value=envs),
+        patch.object(rnd, "SummaryWriter") as writer,
+        pytest.raises(RuntimeError, match="stop before training"),
+    ):
+        rnd.train(settings)
+    writer.assert_called_once_with(logdir=f"{tmp_path}/rnd-run")
+    writer.return_value.close.assert_called_once()
+    envs.close.assert_called_once()
 
 
 def test_running_moments_match_combined_samples() -> None:

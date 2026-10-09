@@ -8,6 +8,18 @@ import jax.numpy as jnp
 import pytest
 
 from rl2.ppo import GDN2Config, ModelType, load_config, make_model
+from rl2.ppo_rnd import load_config as load_rnd_config
+
+
+def test_ppo_configs_specify_distinct_run_ids() -> None:
+    configs = Path(__file__).resolve().parents[1] / "configs"
+    run_ids: set[str] = set()
+    for path in configs.glob("ppo*.yaml"):
+        loader = load_rnd_config if path.stem.startswith("ppo_rnd") else load_config
+        config = loader(path)
+        assert config.run_id == path.stem
+        assert config.run_id not in run_ids
+        run_ids.add(config.run_id)
 
 
 def test_atari_configs_enable_cosine_decay() -> None:
@@ -26,7 +38,7 @@ def test_atari_config_parameter_budget(model_type: ModelType) -> None:
     config = load_config(configs / f"ppo_atari_{model_type}.yaml")
     assert config.model.type == model_type
     assert config.log_dir == f"{base.log_dir}/ppo"
-    assert replace(config, model=base.model, log_dir=base.log_dir) == base
+    assert replace(config, model=base.model, log_dir=base.log_dir, run_id=base.run_id) == base
 
     if isinstance(config.model, GDN2Config):
         assert config.model.backend == "triton"

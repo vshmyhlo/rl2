@@ -432,6 +432,9 @@ def test_train_logs_scheduled_coefficients_with_kl_stopping() -> None:
         patch("rl2.ppo.act", return_value=(np.zeros(1, dtype=np.int32), zeros, zeros, carry)),
         patch("rl2.ppo.value", return_value=zeros),
         patch("rl2.ppo.update", side_effect=reject_update),
+        patch("rl2.ppo.checkpoint_manager"),
+        patch("rl2.ppo.restore_checkpoint", return_value=None),
+        patch("rl2.ppo.save_checkpoint"),
     ):
         state = train(config)
     assert int(state.step) == 0

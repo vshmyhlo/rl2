@@ -25,6 +25,7 @@ entropy_decay: cosine # Decay to zero over the rollout budget
 value_coef: 0.5
 max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/ppo
+run_id: ppo_atari_lstm # TensorBoard run directory; change this for a new run
 video_every_episodes: 100 # 0 disables recording
 video_speed: 4.0 # Playback multiplier: 1.0 normal, 2.0 double speed
 eval_every_minutes: 30 # Wall-clock minutes between evaluations; timer restarts after evaluation; 0 disables

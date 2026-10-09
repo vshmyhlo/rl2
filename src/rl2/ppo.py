@@ -3,12 +3,12 @@
 import argparse
 import json
 from collections import deque
-from dataclasses import asdict
-from datetime import datetime
+from dataclasses import asdict, replace
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from time import monotonic
-from typing import Annotated, Any, Literal, SupportsFloat, cast
+from typing import Annotated, Any, Literal, NamedTuple, SupportsFloat, cast
 
 import ale_py
 import chex
@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import orbax.checkpoint as ocp
 import yaml
 from flax import linen as nn
 from flax.training.train_state import TrainState
@@ -138,6 +139,116 @@ class Config:
     model: ModelConfig = LSTMConfig()
     lr_decay: Literal["linear", "cosine"] = "linear"
     entropy_decay: Literal["constant", "cosine"] = "constant"
+    run_id: str | None = None
+    checkpoint_interval_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 600.0
+
+    def __post_init__(self) -> None:
+        if self.run_id is not None and (
+            not self.run_id.strip() or self.run_id in (".", "..") or any(c in self.run_id for c in "/\\")
+        ):
+            raise ValueError("run_id must be a nonempty directory name without slashes or traversal")
+
+
+class TrainingProgress(NamedTuple):
+    state: TrainState
+    key: jax.Array
+    iteration: int  # Number of completed rollouts, independent of optimizer steps.
+    completed_episodes: int
+    recent_returns: tuple[float, ...]
+    recent_lengths: tuple[int, ...]
+
+
+def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
+    directory = f"{run_dir.rstrip('/')}/checkpoints"
+    if not directory.startswith("gs://"):
+        directory = str(Path(directory).resolve())
+    return ocp.CheckpointManager(
+        directory,
+        options=ocp.CheckpointManagerOptions(max_to_keep=2),
+    )
+
+
+def _checkpoint_settings(config: Config) -> dict[str, Any]:
+    # These settings may change on resume without invalidating the saved training state.
+    mutable = {
+        "run_id",
+        "log_dir",
+        "total_steps",
+        "checkpoint_interval_seconds",
+        "vector_env",
+        "video_every_episodes",
+        "video_speed",
+        "video_max_frames",
+        "eval_every_minutes",
+        "eval_episodes",
+        "eval_seed",
+    }
+    # JSON normalizes tuples in encoder_stages to lists for comparison after loading.
+    return json.loads(json.dumps({k: v for k, v in asdict(config).items() if k not in mutable}))
+
+
+def save_checkpoint(
+    manager: ocp.CheckpointManager, progress: TrainingProgress, rng: np.random.Generator, config: Config
+) -> None:
+    """Save a completed rollout; live environment state is deliberately restarted on resume."""
+    sc = ShapeChecker(K=2)
+    key_data = jax.random.key_data(progress.key)
+    sc.check(key_data, "K", jnp.uint32)
+    manager.save(
+        progress.iteration,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardSave({"train_state": progress.state, "key": key_data}),
+            metadata=ocp.args.JsonSave(
+                {
+                    "version": 1,
+                    "config": _checkpoint_settings(config),
+                    "iteration": progress.iteration,
+                    "completed_episodes": progress.completed_episodes,
+                    "recent_returns": list(progress.recent_returns),
+                    "recent_lengths": list(progress.recent_lengths),
+                    "numpy_rng": rng.bit_generator.state,
+                }
+            ),
+        ),
+        force=True,
+    )
+
+
+def restore_checkpoint(
+    manager: ocp.CheckpointManager, state: TrainState, rng: np.random.Generator, config: Config
+) -> TrainingProgress | None:
+    iteration = manager.latest_step()
+    if iteration is None:
+        return None
+    metadata = manager.restore(iteration, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
+    if metadata["version"] != 1:
+        raise ValueError("Unsupported PPO checkpoint version")
+    if metadata["config"] != _checkpoint_settings(config):
+        raise ValueError("Checkpoint training settings are incompatible with this config. Use a new run_id.")
+    if metadata["iteration"] != iteration or iteration < 0 or metadata["completed_episodes"] < 0:
+        raise ValueError("Invalid PPO checkpoint progress")
+    restored = manager.restore(
+        iteration,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardRestore(
+                {
+                    "train_state": state,
+                    "key": jax.random.key_data(jax.random.key(config.seed)),
+                }
+            )
+        ),
+    ).state
+    sc = ShapeChecker(K=2)
+    sc.check(restored["key"], "K", jnp.uint32)
+    rng.bit_generator.state = metadata["numpy_rng"]
+    return TrainingProgress(
+        restored["train_state"],
+        jax.random.wrap_key_data(restored["key"]),
+        iteration,
+        metadata["completed_episodes"],
+        tuple(metadata["recent_returns"]),
+        tuple(metadata["recent_lengths"]),
+    )
 
 
 def load_config(path: str | Path) -> Config:
@@ -570,15 +681,14 @@ def train(config: Config) -> TrainState:
         **vector_options,
     )
     writer = None
+    manager = None
     try:
-        run_name = f"{config.env_id.replace('/', '_')}_seed{config.seed}_{datetime.now():%Y%m%d-%H%M%S-%f}"
+        run_name = config.run_id or (
+            f"{config.env_id.replace('/', '_')}_seed{config.seed}_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"
+        )
+        config = replace(config, run_id=run_name)
         run_dir = f"{config.log_dir.rstrip('/')}/{run_name}"
-        writer = SummaryWriter(logdir=run_dir)
-        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", 0)
-        print(f"TensorBoard run: {run_dir}", flush=True)
-        devices = str(jax.devices())
-        print(f"JAX devices: {devices}", flush=True)
-        writer.add_text("devices", devices, 0)
+        manager = checkpoint_manager(run_dir)
         obs, _ = envs.reset(seed=config.seed)
         key, init_key = jax.random.split(jax.random.key(config.seed))
         model = make_model(config, envs.single_action_space.n)
@@ -597,17 +707,38 @@ def train(config: Config) -> TrainState:
             params=model.init(init_key, obs[None, :1], model.initial_carry(1), episode_start[None, :1])["params"],
             tx=optimizer(config.learning_rate),
         )
-        parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
-        writer.add_scalar("model/params_millions", parameter_count / 1_000_000, 0)
-        print(f"Model parameters: {parameter_count:,}", flush=True)
-        writer.add_text("model/parameter_count", str(parameter_count), 0)
         rng = np.random.default_rng(config.seed)
+        progress = restore_checkpoint(manager, state, rng, config)
+        start_iteration = 0
+        recent_returns: deque[float] = deque(maxlen=100)
+        recent_lengths: deque[int] = deque(maxlen=100)
+        completed_episodes = 0
+        if progress is not None:
+            state, key, start_iteration, completed_episodes, saved_returns, saved_lengths = progress
+            recent_returns.extend(saved_returns)
+            recent_lengths.extend(saved_lengths)
+            # Gym environments and wrappers are not serialized. Start fresh episodes
+            # with fresh recurrent memory, retaining the policy and training RNGs.
+            obs, _ = envs.reset(seed=config.seed + start_iteration * config.num_envs)
+            print(f"Resumed run {run_name} at step {start_iteration * batch_size}", flush=True)
+        initial_steps = start_iteration * batch_size
+        writer = SummaryWriter(logdir=run_dir, purge_step=initial_steps + 1 if progress is not None else None)
+        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", initial_steps)
+        print(f"Run ID: {run_name}\nTensorBoard run: {run_dir}", flush=True)
+        devices = str(jax.devices())
+        print(f"JAX devices: {devices}", flush=True)
+        writer.add_text("devices", devices, initial_steps)
+        parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
+        writer.add_scalar("model/params_millions", parameter_count / 1_000_000, initial_steps)
+        print(f"Model parameters: {parameter_count:,}", flush=True)
+        writer.add_text("model/parameter_count", str(parameter_count), initial_steps)
         episode_returns = np.zeros(config.num_envs)
         episode_lengths = np.zeros(config.num_envs, dtype=np.int64)
-        recent_returns = deque(maxlen=100)
-        recent_lengths = deque(maxlen=100)
-        completed_episodes = 0
-        next_video_episode = config.video_every_episodes
+        next_video_episode = (
+            (completed_episodes // config.video_every_episodes + 1) * config.video_every_episodes
+            if config.video_every_episodes
+            else 0
+        )
         shape = (config.num_steps, config.num_envs)
         observations = np.empty((*shape, *obs.shape[1:]), dtype=np.uint8)
         actions = np.empty(shape, dtype=np.int32)
@@ -618,9 +749,11 @@ def train(config: Config) -> TrainState:
         # Keep asynchronous initialization out of the first rollout's timing.
         jax.block_until_ready((state, carry, key))
         start = monotonic()
+        last_checkpoint_time = start
         eval_interval_seconds = config.eval_every_minutes * 60
         next_eval_time = start + eval_interval_seconds
-        for iteration in range(config.total_steps // batch_size):
+        num_iterations = config.total_steps // batch_size
+        for iteration in range(start_iteration, num_iterations):
             rollout_start = monotonic()
             env_seconds = 0.0
             model_seconds = 0.0
@@ -725,7 +858,7 @@ def train(config: Config) -> TrainState:
             # Evaluate rollout-time predictions against the full rollout's GAE returns.
             explained_var = explained_variance(values, returns)
             steps = (iteration + 1) * batch_size
-            sps = steps / (monotonic() - start)
+            sps = (steps - initial_steps) / (monotonic() - start)
             for tag, scalar in {
                 "losses/policy": policy_loss,
                 "losses/value": value_loss,
@@ -766,11 +899,33 @@ def train(config: Config) -> TrainState:
                 f"updates={updates_done} early_stop={early_stop}",
                 flush=True,
             )
+            if (
+                monotonic() - last_checkpoint_time >= config.checkpoint_interval_seconds
+                or iteration + 1 == num_iterations
+            ):
+                save_checkpoint(
+                    manager,
+                    TrainingProgress(
+                        state,
+                        key,
+                        iteration + 1,
+                        completed_episodes,
+                        tuple(float(v) for v in recent_returns),
+                        tuple(int(v) for v in recent_lengths),
+                    ),
+                    rng,
+                    config,
+                )
+                last_checkpoint_time = monotonic()
         return state
     finally:
-        envs.close()
-        if writer is not None:
-            writer.close()
+        try:
+            if manager is not None:
+                manager.close()  # Finish any asynchronous save before exiting.
+        finally:
+            envs.close()
+            if writer is not None:
+                writer.close()
 
 
 def main() -> None:
