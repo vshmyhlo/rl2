@@ -586,10 +586,20 @@ def test_training_wiring(
         # Different attention head layouts have identical parameter shapes but
         # change the meaning of the saved projections and rotary positions.
         saved_config = (tmp_path / "test" / "config.yaml").read_bytes()
+        saved_checkpoint = (tmp_path / "test" / "checkpoint.msgpack").read_bytes()
         with pytest.raises(ValueError, match="num_heads"):
             edit.train(replace(config, num_heads=4, total_updates=2))
         assert collect.call_count == 1
         assert (tmp_path / "test" / "config.yaml").read_bytes() == saved_config
+        assert (tmp_path / "test" / "checkpoint.msgpack").read_bytes() == saved_checkpoint
+        vector_factory.assert_called_once()
+        # A compatible extension resumes the optimizer step and episode counters.
+        vector_factory.return_value = type(vector)(config.edit_config, 2)
+        resumed = edit.train(replace(config, total_updates=2))
+        assert collect.call_count == 2
+        assert int(resumed.step) == 4
+        writer.add_scalar.assert_any_call("charts/total_episodes", 4.0, 4)
+        assert vector_factory.return_value.closed
 
 
 def test_resume_config_preserves_model_semantics(config: edit.Config) -> None:

@@ -2,13 +2,12 @@ seed: 1
 total_updates: 100000
 num_tasks: 32
 max_unique_tasks: 1 # Set to 1 to overfit one fixed problem across all updates; null samples fresh tasks
-group_size: 8 # Independent editing episodes per task, all starting from seed_program
+group_size: 8 # Independent editing episodes per task, all starting from the fixed turnLeft program
 env_workers: 8 # Persistent spawned workers for batched reset/stepping; 0 runs locally
 num_minibatches: 4 # Must divide num_tasks * group_size; episodes stay together
 update_epochs: 1
 max_seq_len: 512 # Total prefill tokens, policy EDIT tokens, and FEEDBACK reports
 allow_stop: false # Set false to keep editing until no complete edit fits the remaining sequence budget
-seed_program: null # Start with a root hole; set source text to edit an existing program
 max_nodes: 128 # Whole candidate tree, including lists and values
 max_depth: 32 # AST edges, including lists
 bf16: true
@@ -30,17 +29,17 @@ log_interval: 10
 log_program_interval: 10
 log_program_count: 4
 log_compiles: true
-# Causal Transformer with KV caching: EDIT(root hole) -> grammar EDIT actions -> FEEDBACK -> edits -> ...
-# Fill the initial root hole immediately; subsequent edits choose a location before filling holes.
+# Causal Transformer with KV caching: EDIT(turnLeft program) -> FEEDBACK -> EDIT actions -> FEEDBACK -> ...
+# Execute the fixed turnLeft program first; each policy edit selects a location, then fills its holes.
 # Complete programs execute immediately; the following FEEDBACK token introduces their output.
 # Every token, including prefill, receives initial/target/current grids through 1x1 Conv + GELU and projection.
-# Current image starts at the task input and changes only after completed program executions.
+# Current image starts at the initial turnLeft execution result and changes after completed edits.
 # max_seq_len is both the episode token budget and KV-cache capacity.
-# Replay uses full causal histories; the root-hole prefill predicts the first sampled grammar action.
+# Replay uses full causal histories; the initial FEEDBACK predicts the first sampled edit location.
 # Replacement size varies; masks reserve nodes/source tokens AND sequence tokens to complete every hole; each feedback report consumes one token.
 # Execute only complete candidates, always from the original input grid.
 # Feedback: last final/partial grid, score, success/error, ticks, size, score delta, sequence tokens left.
-# The first program earns its score from zero; later edit rewards are score differences; GRPO normalizes summed episode returns within each task group.
+# Edit rewards are score differences from the preceding execution; GRPO normalizes summed episode returns within each task group.
 # Every decision, including STOP, shares the episode advantage. No critic or extra terminal reward.
 # Regressive edits are accepted; success does not force early stopping.
 env:
@@ -70,6 +69,6 @@ env:
   orientation_weight: 1.0
   marker_weight: 1.0
   trajectory_weight: 0.0
-  length_penalty_weight: 0.01 # AST node count / max_nodes (including lists and values)
-  depth_penalty_weight: 0.01 # AST depth / top-level max_depth (candidate AST limit)
-  execution_penalty_weight: 0.01 # Consumed execution ticks / max_execution_steps
+  length_penalty_weight: 0.1 # AST node count / max_nodes (including lists and values)
+  depth_penalty_weight: 0.1 # AST depth / top-level max_depth (candidate AST limit)
+  execution_penalty_weight: 0.1 # Consumed execution ticks / max_execution_steps

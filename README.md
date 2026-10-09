@@ -6,6 +6,11 @@ Tinkering with RL and other things.
 
 Entries are ordered from most recent at the top to oldest at the bottom.
 
+### Sample-Efficient Learning
+
+Can RL agents learn effective policies with fewer environment interactions?
+Explore ways to make better use of each collected experience.
+
 ### Solving Atari57 with a Single Trained Model
 
 Try solving Atari57 with a single trained model using
@@ -36,7 +41,7 @@ Solving sparse reward Atari environments, such as Montezuma’s Revenge.
 
 ### Basic PPO for Atari
 
-[Basic PPO](src/rl2/ppo.py) with [the Atari configuration](configs/atari.yaml)
+[Basic PPO](src/rl2/ppo.py) with [the Atari configuration](configs/ppo_atari.yaml)
 achieves a human-normalized score of **161%** on Space Invaders.
 
 ![PPO gameplay on Space Invaders](images/spaceinvaders.gif)

@@ -596,7 +596,7 @@ def collect_rollout(
     successes = np.asarray([result.success for result in results])
     sequence_lengths = config.edit_config.prefill_length + batch.mask.sum(axis=0) + completed_edits
     # STOP is the only voluntary termination. With STOP disabled, exhausting
-    # the budget can leave one unused token, too little for a complete edit.
+    # the budget can leave up to two unused tokens, too little for a complete edit.
     budget_exhausted = (sequence_lengths == config.max_seq_len) | ~np.any(batch.mask & (batch.actions == 0), axis=0)
     # Final candidate sizes; AST depth counts edges from the root, including list nodes.
     node_count_mean = float(np.mean([len(tree.nodes) for tree in programs]))
@@ -822,7 +822,7 @@ def train(config: Config) -> TrainState:
     checkpoint = read_optional(f"{run_dir}/checkpoint.msgpack")
     progress = TrainingProgress(state, key, 0, 0, 0, 0)
     if checkpoint is not None:
-        # check_resume_config(config, load_config(f"{run_dir}/config.yaml"))
+        check_resume_config(config, load_config(f"{run_dir}/config.yaml"))
         progress = _restore_checkpoint(checkpoint, state, rng)
         print(f"Resuming {run_dir} at rollout {progress.iteration}, step {progress.steps}", flush=True)
     else:
