@@ -25,7 +25,7 @@ from flax import linen as nn
 
 from rl2.gdn2.core import delta_rule_step
 from rl2.gdn2.masking import prefix_mask
-from rl2.sequence_model import ARSequenceModel
+from rl2.sequence_model import ARSequenceModel, RecurrentSequenceModel
 from rl2.shape_checker import ShapeChecker
 
 
@@ -385,6 +385,88 @@ class GatedDeltaNet2Stack(nn.Module, ARSequenceModel[GatedDeltaNet2StackCarry]):
         sc.check(x_active, "B", jnp.bool_)
         carry, y = self(x[:, None], x_active.astype(jnp.int32), carry)
         output = y[:, 0]
+        sc.check(output, "BD", self.config.dtype)
+        return carry, output
+
+
+class GatedDeltaNet2Recurrent(nn.Module, RecurrentSequenceModel[GatedDeltaNet2StackCarry]):
+    """Time-major stack wrapper with per-example episode resets.
+
+    Inputs and outputs have width ``config.hidden_size``. Floating inputs are
+    cast to ``config.dtype`` by the stack; outputs use that dtype and all carry
+    leaves remain float32. Incoming carry is required. Each episode start
+    clears every layer's recurrent state and convolution history before its
+    input is processed. Time and batch dimensions must be nonempty.
+
+    Sequences scan the stack's single-step operation, including with the
+    optional Triton backend, so resets can occur at any time for any example.
+    """
+
+    config: GatedDeltaNet2Config
+    num_layers: int
+    intermediate_size: int
+    backend: GatedDeltaNet2Backend = "jax"
+
+    def setup(self) -> None:
+        self.stack = GatedDeltaNet2Stack(self.config, self.num_layers, self.intermediate_size, backend=self.backend)
+
+    @nn.nowrap
+    def initial_carry(self, num_envs: int) -> GatedDeltaNet2StackCarry:
+        if self.num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+        return tuple(_initial_carry(self.config, num_envs) for _ in range(self.num_layers))
+
+    def __call__(
+        self,
+        x: jax.Array,
+        carry: GatedDeltaNet2StackCarry,
+        episode_starts: jax.Array,
+    ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
+        sc = ShapeChecker(D=self.config.hidden_size)
+        sc.check(x, "TBD")
+        chex.assert_type(x, jnp.floating)
+        sc.check(episode_starts, "TB", jnp.bool_)
+        for size in sc["TB"]:
+            chex.assert_scalar_positive(size)
+
+        def recurrent_step(
+            model: GatedDeltaNet2Recurrent,
+            memory: GatedDeltaNet2StackCarry,
+            inputs: tuple[jax.Array, jax.Array],
+        ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
+            inputs_x, starts = inputs
+            return model.step(inputs_x, memory, starts)
+
+        carry, output = nn.scan(
+            recurrent_step,
+            variable_broadcast="params",
+            split_rngs={"params": False},
+            in_axes=0,
+            out_axes=0,
+        )(self, carry, (x, episode_starts))
+        sc.check(output, "TBD", self.config.dtype)
+        return carry, output
+
+    def step(
+        self,
+        x: jax.Array,
+        carry: GatedDeltaNet2StackCarry,
+        episode_starts: jax.Array,
+    ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
+        sc = ShapeChecker(D=self.config.hidden_size)
+        sc.check(x, "BD")
+        chex.assert_type(x, jnp.floating)
+        sc.check(episode_starts, "B", jnp.bool_)
+        if len(carry) != self.num_layers:
+            raise ValueError("carry must contain one state per layer")
+        fresh = self.initial_carry(x.shape[0])
+
+        def reset(initial: jax.Array, previous: jax.Array) -> jax.Array:
+            # _select validates both leaves before selection can broadcast them.
+            return _select(episode_starts, initial, previous)
+
+        carry = jax.tree.map(reset, fresh, carry)
+        carry, output = self.stack.step(x, jnp.ones((x.shape[0],), jnp.bool_), carry)
         sc.check(output, "BD", self.config.dtype)
         return carry, output
 

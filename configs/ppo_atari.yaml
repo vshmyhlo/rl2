@@ -9,7 +9,9 @@ vector_env: async # async (subprocesses) or sync
 num_steps: 128
 num_minibatches: 4 # Must divide num_envs; minibatches contain whole sequences
 update_epochs: 4
-lstm_hidden_size: 1536 # About 50.56M parameters with the residual encoder and 84x84 RGB observations
+model: # Tagged union: lstm or gdn2; only the selected model's settings are allowed
+  type: lstm
+  hidden_size: 1536
 bf16: true # Mixed precision compute; parameters, recurrent memory, and losses stay float32
 learning_rate: 0.00025
 anneal_lr: true # Linear decay over the training budget; false keeps a constant rate

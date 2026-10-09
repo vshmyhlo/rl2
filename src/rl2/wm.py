@@ -11,6 +11,7 @@ from flax import struct
 from rl2.mamba3 import Mamba3Stack, Mamba3StackCarry
 from rl2.observation_decoder import ConvObservationDecoder
 from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
+from rl2.shape_checker import ShapeChecker
 
 
 @struct.dataclass
@@ -336,10 +337,16 @@ class MambaWorldModel(WorldModel):
 
     def _advance(self, state: WorldModelState, action: jax.Array) -> WorldModelState:
         self._check_state(state)
-        chex.assert_shape(action, (state.deter.shape[0],))
+        sc = ShapeChecker(B=state.deter.shape[0], D=self.d_model)
+        sc.check(action, "B")
         chex.assert_type(action, int)
         inputs = jnp.concatenate((state.stoch.reshape((action.shape[0], -1)), self.action_embedding(action)), axis=-1)
-        memory, deter = self.dynamics.step(self.input_projection(inputs).astype(jnp.float32), state.memory)
+        projected = self.input_projection(inputs).astype(jnp.float32)
+        sc.check(projected, "BD", jnp.float32)
+        starts = jnp.zeros_like(state.initialized)
+        sc.check(starts, "B", jnp.bool_)
+        memory, deter = self.dynamics.step(projected, state.memory, starts)
+        sc.check(deter, "BD", self.dtype)
         return state.replace(
             memory=memory, deter=deter.astype(jnp.float32), initialized=jnp.ones_like(state.initialized)
         )

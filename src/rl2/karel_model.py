@@ -121,7 +121,10 @@ class KarelProgramModel(nn.Module):
             carry, features = self.backbone(jnp.swapaxes(inputs, 0, 1), x_len)
             features = jnp.swapaxes(features, 0, 1)
         else:
-            carry, features = self.backbone(inputs)
+            carry = self.backbone.initial_carry(num_envs=inputs.shape[1])
+            episode_starts = jnp.zeros(sc["SB"], jnp.bool_)
+            sc.check(episode_starts, "SB", jnp.bool_)
+            carry, features = self.backbone(inputs, carry, episode_starts)
         sc.check(features, "SBD", self.dtype)
         logits = self.head(features).astype(jnp.float32)
         sc.check(logits, "SBV", jnp.float32)
@@ -145,7 +148,9 @@ class KarelProgramModel(nn.Module):
             sc.check(x_active, "B", jnp.bool_)
             carry, features = self.backbone.step(inputs, x_active, carry)
         else:
-            carry, features = self.backbone.step(inputs, carry=carry)
+            episode_starts = jnp.zeros(sc["B"], jnp.bool_)
+            sc.check(episode_starts, "B", jnp.bool_)
+            carry, features = self.backbone.step(inputs, carry, episode_starts)
         sc.check(features, "BD", self.dtype)
         logits = self.head(features).astype(jnp.float32)
         sc.check(logits, "BV", jnp.float32)

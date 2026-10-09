@@ -1,7 +1,7 @@
 import jax
 import pytest
 
-from rl2.sequence_model import ARSequenceModel, BDSequenceModel, RecurentSequenceModel
+from rl2.sequence_model import ARSequenceModel, BDSequenceModel, RecurrentSequenceModel
 
 
 class CallOnly(ARSequenceModel[None]):
@@ -42,26 +42,35 @@ def test_bidirectional_subclass_only_requires_call() -> None:
     assert not hasattr(model, "step")
 
 
-class RecurrentCallOnly(RecurentSequenceModel[jax.Array]):
-    def __call__(self, x: jax.Array, carry: jax.Array | None, episode_starts: jax.Array) -> tuple[jax.Array, jax.Array]:
+class RecurrentCallOnly(RecurrentSequenceModel[jax.Array]):
+    def __call__(self, x: jax.Array, carry: jax.Array, episode_starts: jax.Array) -> tuple[jax.Array, jax.Array]:
         raise NotImplementedError("Test stub; only method completeness is exercised")
 
 
-class RecurrentStepOnly(RecurentSequenceModel[jax.Array]):
-    def step(self, x: jax.Array, carry: jax.Array | None, episode_starts: jax.Array) -> tuple[jax.Array, jax.Array]:
+class RecurrentStepOnly(RecurrentSequenceModel[jax.Array]):
+    def step(self, x: jax.Array, carry: jax.Array, episode_starts: jax.Array) -> tuple[jax.Array, jax.Array]:
         raise NotImplementedError("Test stub; only method completeness is exercised")
 
 
-@pytest.mark.parametrize("model_type", [RecurentSequenceModel, RecurrentCallOnly, RecurrentStepOnly])
+@pytest.mark.parametrize("model_type", [RecurrentSequenceModel, RecurrentCallOnly, RecurrentStepOnly])
 def test_incomplete_recurrent_models_cannot_be_instantiated(
-    model_type: type[RecurentSequenceModel[jax.Array]],
+    model_type: type[RecurrentSequenceModel[jax.Array]],
 ) -> None:
     with pytest.raises(TypeError, match="abstract"):
         model_type()
 
 
-def test_recurrent_subclass_implementing_both_methods_can_be_instantiated() -> None:
+def test_recurrent_subclass_without_initial_carry_cannot_be_instantiated() -> None:
     class BothMethods(RecurrentCallOnly, RecurrentStepOnly):
         pass
 
-    assert isinstance(BothMethods(), RecurentSequenceModel)
+    with pytest.raises(TypeError, match="initial_carry"):
+        BothMethods()
+
+
+def test_recurrent_subclass_implementing_all_methods_can_be_instantiated() -> None:
+    class AllMethods(RecurrentCallOnly, RecurrentStepOnly):
+        def initial_carry(self, num_envs: int) -> jax.Array:
+            raise NotImplementedError("Test stub; only method completeness is exercised")
+
+    assert isinstance(AllMethods(), RecurrentSequenceModel)

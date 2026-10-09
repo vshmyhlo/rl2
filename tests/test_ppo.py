@@ -20,7 +20,6 @@ from rl2 import ppo
 from rl2.observation_encoder import ConvStage
 from rl2.ppo import (
     ActorCritic,
-    ResetLSTM,
     action_log_prob,
     explained_variance,
     gae,
@@ -259,18 +258,6 @@ def test_recurrent_sequences_match_steps_and_reset_only_finished_env(model_type:
     np.testing.assert_allclose(selected_values, suffix_values[:, 1:], atol=5e-6)
     for actual, expected in zip(jax.tree.leaves(selected_final), jax.tree.leaves(final), strict=True):
         np.testing.assert_allclose(actual, expected[1:], atol=5e-6)
-
-
-def test_lstm_gradients_follow_history_but_stop_at_episode_reset() -> None:
-    cell = nn.scan(ResetLSTM, variable_broadcast="params", split_rngs={"params": False}, in_axes=0, out_axes=0)(8)
-    inputs = jax.random.normal(jax.random.key(2), (4, 2, 5))
-    starts = jnp.zeros((4, 2), dtype=bool).at[2, 0].set(True)
-    carry = initial_carry(2, 8)
-    params = cell.init(jax.random.key(1), carry, (inputs, starts))
-    grads = jax.grad(lambda x: cell.apply(params, carry, (x, starts))[1][-1].sum())(inputs)
-    np.testing.assert_array_equal(grads[:2, 0], 0)
-    assert float(jnp.linalg.norm(grads[:2, 1])) > 0
-    assert float(jnp.linalg.norm(grads[2:, 0])) > 0
 
 
 def test_recurrent_minibatches_require_whole_environments() -> None:

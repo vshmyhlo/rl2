@@ -9,13 +9,43 @@ import optax
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
 
-from rl2.mamba3 import Mamba3, Mamba3Carry, _ssm_step
+from rl2.mamba3 import Mamba3, Mamba3Carry, Mamba3Stack, Mamba3StackCarry, _ssm_step
+from rl2.sequence_model import RecurrentSequenceModel
+from rl2.shape_checker import ShapeChecker
 
 
 def assert_carry_close(actual: Mamba3Carry, expected: Mamba3Carry) -> None:
     chex.assert_trees_all_equal_shapes_and_dtypes(actual, expected)
     for a, b in zip(actual, expected):
         np.testing.assert_allclose(a, b, rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        Mamba3(4, d_state=4, expand=1, headdim=2),
+        Mamba3Stack(4, 2, d_state=4, expand=1, headdim=2, d_intermediate=0),
+    ],
+    ids=["mixer", "stack"],
+)
+def test_incoming_carry_gradients_stop_at_resets(model: Mamba3 | Mamba3Stack) -> None:
+    x = jax.random.normal(jax.random.key(30), (2, 2, 4))
+    starts = jnp.array([[True, False], [False, False]])
+    initial = model.initial_carry(num_envs=2)
+    variables = model.init(jax.random.key(31), x, initial, starts)
+    incoming, _ = model.apply(variables, x, initial, jnp.zeros_like(starts))
+
+    def loss(carry: Mamba3Carry | Mamba3StackCarry) -> jax.Array:
+        final, output = model.apply(variables, x, carry, starts)
+        sc = ShapeChecker(T=2, B=2, D=4)
+        sc.check(output, "TBD", jnp.float32)
+        return output.sum() + sum(leaf.sum() for leaf in jax.tree.leaves(final))
+
+    gradients = jax.jit(jax.grad(loss))(incoming)
+    for gradient in jax.tree.leaves(gradients):
+        assert np.isfinite(gradient).all()
+        np.testing.assert_array_equal(gradient[0], 0)
+        assert np.any(np.asarray(gradient[1]) != 0)
 
 
 # Check both discretization endpoints once, and both rotation layouts in the interior.
@@ -65,22 +95,27 @@ def test_recurrence_matches_independent_complex_ssm(rank: int, trap: float) -> N
 def test_sequence_chunk_step_and_jit_agree(rank: int, groups: int, norm: bool) -> None:
     model = Mamba3(8, d_state=8, headdim=4, mimo_rank=rank, ngroups=groups, outproj_norm=norm)
     x = jax.random.normal(jax.random.key(0), (7, 2, 8))
-    variables = model.init(jax.random.key(1), x)
-    final, expected = jax.jit(model.apply)(variables, x)
-    carry, first = model.apply(variables, x[:3])
-    carry, second = model.apply(variables, x[3:], carry)
-    np.testing.assert_allclose(jnp.concatenate((first, second)), expected, rtol=2e-5, atol=2e-6)
-    assert_carry_close(carry, final)
-    carry = model.initial_carry(2)
-    outputs = []
-    for token in x:
-        carry, y = model.apply(variables, token, carry, method=model.step)
-        outputs.append(y)
-    np.testing.assert_allclose(jnp.stack(outputs), expected, rtol=2e-5, atol=2e-6)
-    assert_carry_close(carry, final)
+    assert isinstance(model, RecurrentSequenceModel)
+    initial = model.initial_carry(num_envs=2)
+    starts = jnp.zeros(x.shape[:2], jnp.bool_).at[0, 0].set(True).at[4, 1].set(True)
+    variables = model.init(jax.random.key(1), x, initial, starts)
+    warm, _ = model.apply(variables, x[:2], initial, starts[:2])
+    for incoming in (initial, warm):
+        final, expected = jax.jit(model.apply)(variables, x, incoming, starts)
+        carry, first = model.apply(variables, x[:3], incoming, starts[:3])
+        carry, second = model.apply(variables, x[3:], carry, starts[3:])
+        np.testing.assert_allclose(jnp.concatenate((first, second)), expected, rtol=2e-5, atol=2e-6)
+        assert_carry_close(carry, final)
+        carry = incoming
+        outputs = []
+        for token, reset in zip(x, starts):
+            carry, y = model.apply(variables, token, carry, reset, method=model.step)
+            outputs.append(y)
+        np.testing.assert_allclose(jnp.stack(outputs), expected, rtol=2e-5, atol=2e-6)
+        assert_carry_close(carry, final)
     assert final.state.shape == (2, 4, 4, 8)
     # Empty chunks preserve history and the output contract under JIT.
-    empty_carry, empty = jax.jit(model.apply)(variables, x[:0], final)
+    empty_carry, empty = jax.jit(model.apply)(variables, x[:0], final, starts[:0])
     assert empty.shape == (0, 2, 8)
     assert_carry_close(empty_carry, final)
 
@@ -89,11 +124,26 @@ def test_sequence_chunk_step_and_jit_agree(rank: int, groups: int, norm: bool) -
 def test_resets_clear_all_history_without_affecting_other_examples(rank: int) -> None:
     model = Mamba3(8, d_state=8, headdim=4, mimo_rank=rank)
     x = jax.random.normal(jax.random.key(2), (6, 2, 8))
-    variables = model.init(jax.random.key(3), x)
+    variables = model.init(
+        jax.random.key(3),
+        x,
+        carry=model.initial_carry(num_envs=x.shape[-2]),
+        episode_starts=jnp.zeros(x.shape[:-1], jnp.bool_),
+    )
     starts = jnp.zeros((6, 2), dtype=jnp.bool_).at[3, 0].set(True)
-    final, y = jax.jit(model.apply)(variables, x, None, starts)
-    fresh, fresh_y = model.apply(variables, x[3:, :1])
-    continuous, continuous_y = model.apply(variables, x[:, 1:])
+    final, y = jax.jit(model.apply)(variables, x, model.initial_carry(num_envs=x.shape[-2]), starts)
+    fresh, fresh_y = model.apply(
+        variables,
+        x[3:, :1],
+        carry=model.initial_carry(num_envs=x[3:, :1].shape[-2]),
+        episode_starts=jnp.zeros(x[3:, :1].shape[:-1], jnp.bool_),
+    )
+    continuous, continuous_y = model.apply(
+        variables,
+        x[:, 1:],
+        carry=model.initial_carry(num_envs=x[:, 1:].shape[-2]),
+        episode_starts=jnp.zeros(x[:, 1:].shape[:-1], jnp.bool_),
+    )
     np.testing.assert_allclose(y[3:, :1], fresh_y, atol=2e-6)
     np.testing.assert_allclose(y[:, 1:], continuous_y, atol=2e-6)
     for actual, reset, kept in zip(final, fresh, continuous):
@@ -101,7 +151,13 @@ def test_resets_clear_all_history_without_affecting_other_examples(rank: int) ->
         np.testing.assert_allclose(actual[1:], kept, atol=2e-6)
     # Reset an incoming nonzero carry, including previous key/value and phase.
     reset, reset_y = model.apply(variables, x[0], final, jnp.ones(2, dtype=jnp.bool_), method=model.step)
-    zero, zero_y = model.apply(variables, x[0], method=model.step)
+    zero, zero_y = model.apply(
+        variables,
+        x[0],
+        method=model.step,
+        carry=model.initial_carry(num_envs=x[0].shape[-2]),
+        episode_starts=jnp.zeros(x[0].shape[:-1], jnp.bool_),
+    )
     assert_carry_close(reset, zero)
     np.testing.assert_allclose(reset_y, zero_y, atol=2e-6)
 
@@ -110,12 +166,22 @@ def test_resets_clear_all_history_without_affecting_other_examples(rank: int) ->
 def test_causal_gradients_and_training(dtype: jax.typing.DTypeLike) -> None:
     model = Mamba3(8, d_state=8, headdim=4, mimo_rank=2, outproj_norm=True, dtype=dtype)
     x = jax.random.normal(jax.random.key(4), (5, 2, 8))
-    params = model.init(jax.random.key(5), x)["params"]
+    params = model.init(
+        jax.random.key(5),
+        x,
+        carry=model.initial_carry(num_envs=x.shape[-2]),
+        episode_starts=jnp.zeros(x.shape[:-1], jnp.bool_),
+    )["params"]
 
     def loss_fn(parameters: Any, inputs: jax.Array) -> jax.Array:
         chex.assert_shape(inputs, (5, 2, 8))
         chex.assert_type(inputs, jnp.float32)
-        _, y = model.apply({"params": parameters}, inputs)
+        _, y = model.apply(
+            {"params": parameters},
+            inputs,
+            carry=model.initial_carry(num_envs=inputs.shape[-2]),
+            episode_starts=jnp.zeros(inputs.shape[:-1], jnp.bool_),
+        )
         return jnp.mean(jnp.square(y.astype(jnp.float32) - 1))
 
     loss, (grads, input_grads) = jax.jit(jax.value_and_grad(loss_fn, argnums=(0, 1)))(params, x)
@@ -130,19 +196,34 @@ def test_causal_gradients_and_training(dtype: jax.typing.DTypeLike) -> None:
 
     updated = optax.apply_updates(params, jax.tree.map(gradient_step, grads))
     assert float(loss_fn(updated, x)) < float(loss)
-    carry, y = model.apply({"params": params}, x)
+    carry, y = model.apply(
+        {"params": params},
+        x,
+        carry=model.initial_carry(num_envs=x.shape[-2]),
+        episode_starts=jnp.zeros(x.shape[:-1], jnp.bool_),
+    )
     assert y.dtype == dtype
     assert all(leaf.dtype == jnp.float32 for leaf in carry)
 
     def prefix_loss(inputs: jax.Array) -> jax.Array:
         chex.assert_shape(inputs, (5, 2, 8))
         chex.assert_type(inputs, jnp.float32)
-        _, outputs = model.apply({"params": params}, inputs)
+        _, outputs = model.apply(
+            {"params": params},
+            inputs,
+            carry=model.initial_carry(num_envs=inputs.shape[-2]),
+            episode_starts=jnp.zeros(inputs.shape[:-1], jnp.bool_),
+        )
         return outputs[:2].astype(jnp.float32).sum()
 
     grad = jax.grad(prefix_loss)(x)
     np.testing.assert_array_equal(grad[2:], 0)
-    _, changed = model.apply({"params": params}, x.at[2:].set(100))
+    _, changed = model.apply(
+        {"params": params},
+        x.at[2:].set(100),
+        carry=model.initial_carry(num_envs=(x.at[2:].set(100)).shape[-2]),
+        episode_starts=jnp.zeros((x.at[2:].set(100)).shape[:-1], jnp.bool_),
+    )
     np.testing.assert_array_equal(changed[:2], y[:2])
 
 
@@ -168,15 +249,38 @@ def test_invalid_configuration(options: dict[str, Any]) -> None:
 def test_invalid_input_and_carry_shapes() -> None:
     model = Mamba3(8, d_state=8, headdim=4)
     x = jnp.zeros((3, 2, 8))
-    variables = model.init(jax.random.key(0), x)
+    variables = model.init(
+        jax.random.key(0),
+        x,
+        carry=model.initial_carry(num_envs=x.shape[-2]),
+        episode_starts=jnp.zeros(x.shape[:-1], jnp.bool_),
+    )
     with pytest.raises(AssertionError):
-        model.apply(variables, x[0])
+        model.apply(
+            variables,
+            x[0],
+            carry=model.initial_carry(num_envs=x[0].shape[-2]),
+            episode_starts=jnp.zeros(x[0].shape[:-1], jnp.bool_),
+        )
     with pytest.raises(AssertionError):
-        model.apply(variables, x, model.initial_carry(1))
+        model.apply(variables, x, model.initial_carry(1), episode_starts=jnp.zeros(x.shape[:-1], jnp.bool_))
+    carry = model.initial_carry(num_envs=2)
+    starts = jnp.zeros(x.shape[:2], jnp.bool_)
+    for name, leaf in zip(carry._fields, carry):
+        with pytest.raises(AssertionError):
+            model.apply(variables, x, carry._replace(**{name: leaf[..., :-1]}), starts)
     with pytest.raises(AssertionError):
-        model.apply(variables, x, episode_starts=jnp.zeros((2, 3)))
+        model.apply(variables, x, carry._replace(state=carry.state.astype(jnp.bfloat16)), starts)
     with pytest.raises(AssertionError):
-        model.apply(variables, x[0], episode_starts=jnp.zeros((1, 2)), method=model.step)
+        model.apply(variables, x, episode_starts=jnp.zeros((2, 3)), carry=model.initial_carry(num_envs=x.shape[-2]))
+    with pytest.raises(AssertionError):
+        model.apply(
+            variables,
+            x[0],
+            episode_starts=jnp.zeros((1, 2)),
+            method=model.step,
+            carry=model.initial_carry(num_envs=x[0].shape[-2]),
+        )
 
 
 # SISO and MIMO have different rotation layouts; larger MIMO ranks share a path.
@@ -222,7 +326,12 @@ def test_matches_official_module_outputs_states_and_gradients(
         carry = model.initial_carry(inputs.shape[1])
         outputs = []
         for start in range(0, inputs.shape[0], chunk_size):
-            carry, output = model.apply({"params": parameters}, inputs[start : start + chunk_size], carry)
+            carry, output = model.apply(
+                {"params": parameters},
+                inputs[start : start + chunk_size],
+                carry,
+                episode_starts=jnp.zeros(inputs[start : start + chunk_size].shape[:-1], jnp.bool_),
+            )
             outputs.append(output)
         return carry, jnp.concatenate(outputs)
 
@@ -245,7 +354,12 @@ def test_matches_official_module_outputs_states_and_gradients(
 def test_official_initialization_and_bounded_phase() -> None:
     model = Mamba3(32, d_state=8, headdim=8, mimo_rank=2)
     x = jnp.ones((1, 1, 32), jnp.float32)
-    params = model.init(jax.random.key(7), x)["params"]
+    params = model.init(
+        jax.random.key(7),
+        x,
+        carry=model.initial_carry(num_envs=x.shape[-2]),
+        episode_starts=jnp.zeros(x.shape[:-1], jnp.bool_),
+    )["params"]
     for name in ("in_proj", "out_proj"):
         kernel = np.asarray(params[name]["kernel"])
         bound = kernel.shape[0] ** -0.5
@@ -257,15 +371,27 @@ def test_official_initialization_and_bounded_phase() -> None:
         np.testing.assert_array_equal(params[name], value)
     carry = model.initial_carry(1)
     carry = carry._replace(angle=jnp.full_like(carry.angle, 100 * jnp.pi))
-    carry, _ = model.apply({"params": params}, x, carry)
+    carry, _ = model.apply({"params": params}, x, carry, episode_starts=jnp.zeros(x.shape[:-1], jnp.bool_))
     assert np.all((carry.angle >= 0) & (carry.angle < 2 * jnp.pi))
 
 
 def test_rejects_nonfloating_inputs_and_nonboolean_resets() -> None:
     model = Mamba3(8, d_state=8, headdim=4)
     x = jnp.ones((3, 2, 8), jnp.float32)
-    params = model.init(jax.random.key(0), x)
+    params = model.init(
+        jax.random.key(0),
+        x,
+        carry=model.initial_carry(num_envs=x.shape[-2]),
+        episode_starts=jnp.zeros(x.shape[:-1], jnp.bool_),
+    )
     with pytest.raises(AssertionError):
-        model.apply(params, x.astype(jnp.int32))
+        model.apply(
+            params,
+            x.astype(jnp.int32),
+            carry=model.initial_carry(num_envs=(x.astype(jnp.int32)).shape[-2]),
+            episode_starts=jnp.zeros((x.astype(jnp.int32)).shape[:-1], jnp.bool_),
+        )
     with pytest.raises(AssertionError):
-        model.apply(params, x, episode_starts=jnp.ones((3, 2), jnp.float32))
+        model.apply(
+            params, x, episode_starts=jnp.ones((3, 2), jnp.float32), carry=model.initial_carry(num_envs=x.shape[-2])
+        )

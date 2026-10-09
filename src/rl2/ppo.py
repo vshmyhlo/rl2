@@ -27,12 +27,12 @@ from tensorboardX import SummaryWriter
 
 from rl2.gdn2 import GatedDeltaNet2Config, GatedDeltaNet2Stack, GatedDeltaNet2StackCarry
 from rl2.jax_cache import configure_compilation_cache
+from rl2.lstm import LSTM, LSTMCarry, initial_carry
 from rl2.multi_atari import register_envs
 from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages
 from rl2.shape_checker import ShapeChecker
 
 type Array = jax.Array | NDArray[Any]
-type LSTMCarry = tuple[jax.Array, jax.Array]
 type RecurrentCarry = LSTMCarry | GatedDeltaNet2StackCarry
 type ModelType = Literal["lstm", "gdn2"]
 type PPOBatch = tuple[Array, Array, Array, Array, Array, RecurrentCarry, Array]
@@ -119,27 +119,6 @@ def learning_rate_schedule(config: Config) -> optax.Schedule:
     )
 
 
-def initial_carry(num_envs: int, hidden_size: int) -> LSTMCarry:
-    return (jnp.zeros((num_envs, hidden_size)), jnp.zeros((num_envs, hidden_size)))
-
-
-class ResetLSTM(nn.Module):
-    features: int
-    dtype: jax.typing.DTypeLike = jnp.float32
-
-    @nn.compact
-    def __call__(
-        self,
-        carry: LSTMCarry,
-        inputs: tuple[jax.Array, jax.Array],
-    ) -> tuple[LSTMCarry, jax.Array]:
-        x, episode_starts = inputs
-        carry = jax.tree.map(lambda c: jnp.where(episode_starts[:, None], 0, c), carry)
-        # Float32 carry preserves recurrent accumulation and scan dtype stability.
-        carry, x = nn.OptimizedLSTMCell(self.features, dtype=self.dtype)(carry, x)
-        return carry, x.astype(self.dtype)
-
-
 class ResetGDN2(nn.Module):
     config: GatedDeltaNet2Config
     num_layers: int
@@ -193,7 +172,7 @@ class ActorCritic(nn.Module):
             name="encoder",
         )
         if self.model.type == "lstm":
-            self.recurrent = ResetLSTM(self.model.hidden_size, dtype=self.dtype, name="lstm")
+            self.recurrent = LSTM(self.model.hidden_size, dtype=self.dtype, name="lstm")
         else:
             self.gdn2_input = nn.Dense(self.model.hidden_size, dtype=self.dtype, name="gdn2_input")
             self.recurrent = ResetGDN2(
@@ -251,25 +230,25 @@ class ActorCritic(nn.Module):
         steps, environments = sc["TB"]
         x = self._encode(obs.reshape((-1, *obs.shape[2:])))
         x = x.reshape((steps, environments, -1))
+        # Batch the CNN and heads across time; scan only recurrent computation.
         if self.model.type == "lstm":
-            carry_sc = ShapeChecker(B=environments, D=self.model.hidden_size)
-            carry_sc.check(cast(LSTMCarry, carry), "BD", jnp.float32)
+            carry, x = self.recurrent(x, cast(LSTMCarry, carry), episode_starts)
+        else:
 
-        def recurrent_step(
-            cell: ResetLSTM | ResetGDN2,
-            memory: RecurrentCarry,
-            inputs: tuple[jax.Array, jax.Array],
-        ) -> tuple[RecurrentCarry, jax.Array]:
-            return cell(memory, inputs)
+            def recurrent_step(
+                cell: ResetGDN2,
+                memory: GatedDeltaNet2StackCarry,
+                inputs: tuple[jax.Array, jax.Array],
+            ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
+                return cell(memory, inputs)
 
-        # Scan only recurrence; the CNN and heads still batch all time steps together.
-        carry, x = nn.scan(
-            recurrent_step,
-            variable_broadcast="params",
-            split_rngs={"params": False},
-            in_axes=0,
-            out_axes=0,
-        )(self.recurrent, carry, (x, episode_starts))
+            carry, x = nn.scan(
+                recurrent_step,
+                variable_broadcast="params",
+                split_rngs={"params": False},
+                in_axes=0,
+                out_axes=0,
+            )(self.recurrent, cast(GatedDeltaNet2StackCarry, carry), (x, episode_starts))
         logits, values = self._heads(x.reshape((steps * environments, -1)))
         logits = logits.reshape((steps, environments, self.num_actions))
         values = values.reshape((steps, environments))
@@ -288,10 +267,11 @@ class ActorCritic(nn.Module):
         sc = ShapeChecker(A=self.num_actions)
         sc.check(obs, "BFHW" if obs.ndim == 4 else "BFHWC", jnp.uint8)
         sc.check(episode_starts, "B", jnp.bool_)
+        x = self._encode(obs)
         if self.model.type == "lstm":
-            carry_sc = ShapeChecker(B=obs.shape[0], D=self.model.hidden_size)
-            carry_sc.check(cast(LSTMCarry, carry), "BD", jnp.float32)
-        carry, x = self.recurrent(carry, (self._encode(obs), episode_starts))
+            carry, x = self.recurrent.step(x, cast(LSTMCarry, carry), episode_starts)
+        else:
+            carry, x = self.recurrent(cast(GatedDeltaNet2StackCarry, carry), (x, episode_starts))
         logits, values = self._heads(x)
         sc.check(logits, "BA", jnp.float32)
         sc.check(values, "B", jnp.float32)

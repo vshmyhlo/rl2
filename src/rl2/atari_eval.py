@@ -155,11 +155,12 @@ def _action(
 ) -> tuple[jax.Array, RecurrentCarry]:
     carry, logits, _ = state.apply_fn(
         {"params": state.params},
-        obs[None, None],
+        obs[None],
         carry,
-        jnp.asarray([[episode_start]]),
+        jnp.asarray([episode_start]),
+        method="step",
     )
-    logits = logits[0, 0]
+    logits = logits[0]
     action = jnp.argmax(logits) if greedy else jax.random.categorical(key, logits)
     return action, carry
 

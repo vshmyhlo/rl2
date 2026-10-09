@@ -77,7 +77,7 @@ def test_bfloat16_chunked_gradients_and_adam_training(model: Model) -> None:
     if batch_major:
         params = model.init(jax.random.key(22), jnp.swapaxes(x, 0, 1), jnp.full((2,), 6, jnp.int32))["params"]
     else:
-        params = model.init(jax.random.key(22), x)["params"]
+        params = model.init(jax.random.key(22), x, model.initial_carry(num_envs=2), starts)["params"]
 
     def apply_sequence(
         parameters: Parameters, inputs: jax.Array, resets: jax.Array, carry: Carry | None = None
@@ -90,6 +90,8 @@ def test_bfloat16_chunked_gradients_and_adam_training(model: Model) -> None:
             sc.check(x_len, "B", jnp.int32)
             carry, output = model.apply({"params": parameters}, jnp.swapaxes(inputs, 0, 1), x_len, carry)
             return carry, jnp.swapaxes(output, 0, 1)
+        if carry is None:
+            carry = model.initial_carry(num_envs=inputs.shape[1])
         return model.apply({"params": parameters}, inputs, carry, resets)
 
     def loss(parameters: Parameters, inputs: jax.Array, chunked: bool) -> LossOutput:

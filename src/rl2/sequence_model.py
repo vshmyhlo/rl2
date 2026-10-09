@@ -5,15 +5,15 @@ from abc import ABC, abstractmethod
 import jax
 
 
-class RecurentSequenceModel[CarryT](ABC):
+class RecurrentSequenceModel[CarryT](ABC):
     """Recurrent sequence and step operations with PPO-style episode resets.
 
     ``__call__`` is the time-stacked version of ``step``. It accepts a leading
     time dimension, ``x[time,batch,input_dim]``, while ``step`` accepts
-    ``x[batch,input_dim]`` with no time dimension. Both methods accept incoming
-    model-specific carry and return updated outgoing carry. Pass ``carry=None``
-    to start from the model's fresh initial state; supplied carry continues
-    prior history.
+    ``x[batch,input_dim]`` with no time dimension. Both methods require incoming
+    model-specific carry and return updated outgoing carry. To start fresh,
+    supply ``initial_carry(num_envs)``; otherwise supply carry from a previous
+    call to continue prior history. Carry cannot be omitted or ``None``.
 
     Required boolean ``episode_starts`` masks have shape [time,batch] for
     ``__call__`` and [batch] for ``step``. Each true entry resets only that
@@ -26,11 +26,9 @@ class RecurentSequenceModel[CarryT](ABC):
     ``step(x[t], carry, episode_starts[t])`` in increasing time order and
     passing each returned carry to the next step. Stacking step outputs on
     axis 0 must reproduce the sequence output and yield the same final carry.
-    This parity must hold both with any valid supplied initial carry and
-    without initial carry (``carry=None`` for the sequence call and the first
-    step, then the returned carry for subsequent steps), including when resets
-    occur within the sequence. It assumes identical parameters and computation
-    settings.
+    This parity must hold both from the model's fresh initial state and from
+    any valid carry containing prior history, including when resets occur
+    within the sequence. It assumes identical parameters and computation settings.
     Splitting a sequence into chunks and passing carry between calls must
     also preserve outputs and final carry. Outputs cannot depend on future
     inputs or on history preceding the most recent episode reset.
@@ -45,21 +43,32 @@ class RecurentSequenceModel[CarryT](ABC):
     equivalence and reset isolation; abstract methods alone cannot enforce
     these properties. This base does not prescribe parameter storage.
     For Flax modules, invoke through ``init``/``apply``, on a bound module,
-    or as a submodule.
+    or as a submodule. ``initial_carry`` also works on an unbound instance.
     """
+
+    @abstractmethod
+    def initial_carry(self, num_envs: int) -> CarryT:
+        """Return fresh carry for a batch of ``num_envs`` independent examples.
+
+        The result is suitable for both ``__call__`` and ``step`` and represents
+        the same initial state used by episode resets. Carry structure and
+        dtypes are implementation-specific. Implementations may require a
+        nonempty batch. No parameter initialization or prior calls are required.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def __call__(
         self,
         x: jax.Array,
-        carry: CarryT | None,
+        carry: CarryT,
         episode_starts: jax.Array,
     ) -> tuple[CarryT, jax.Array]:
         """Process [time,batch,input_dim] with boolean resets [time,batch].
 
         Return (final carry, output [time,batch,output_dim]), equivalently to
-        scanning ``step`` calls with or without supplied initial carry.
-        Pass ``carry=None`` to start fresh. True ``episode_starts`` entries
+        scanning ``step`` calls from the same required incoming carry.
+        Supply the model's initial state to start fresh. True ``episode_starts`` entries
         reset carry before processing the corresponding inputs.
         Implementations may require nonempty batch and time dimensions.
         """
@@ -69,15 +78,15 @@ class RecurentSequenceModel[CarryT](ABC):
     def step(
         self,
         x: jax.Array,
-        carry: CarryT | None,
+        carry: CarryT,
         episode_starts: jax.Array,
     ) -> tuple[CarryT, jax.Array]:
         """Process [batch,input_dim] with boolean resets [batch].
 
-        Return (updated carry, output [batch,output_dim]). Pass ``carry=None``
-        to start fresh; otherwise advance the incoming carry. True
+        Return (updated carry, output [batch,output_dim]). Incoming carry is
+        required; supply the model's initial state to start fresh. True
         ``episode_starts`` entries reset the corresponding examples' carry
-        before processing their input. With either starting mode, equivalent to
+        before processing their input. Equivalent to
         ``__call__`` with a singleton leading time axis, removing that axis
         from the output.
         """
