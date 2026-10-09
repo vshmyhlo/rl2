@@ -1,3 +1,4 @@
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,40 @@ def test_incoming_carry_gradients_stop_at_resets(model: Mamba3 | Mamba3Stack) ->
         assert np.isfinite(gradient).all()
         np.testing.assert_array_equal(gradient[0], 0)
         assert np.any(np.asarray(gradient[1]) != 0)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        Mamba3(4, d_state=4, expand=1, headdim=2, mimo_rank=2, dtype=jnp.bfloat16),
+        Mamba3Stack(
+            4, 2, d_state=4, expand=1, headdim=2, d_intermediate=4, mlp_multiple_of=1, dtype=jnp.bfloat16
+        ),
+    ],
+    ids=["mimo-mixer", "residual-stack"],
+)
+def test_bfloat16_sequence_step_and_chunk_parity(model: Mamba3 | Mamba3Stack) -> None:
+    x = jax.random.normal(jax.random.key(32), (4, 2, 4))
+    starts = jnp.zeros((4, 2), jnp.bool_).at[2:, 0].set(True)
+    initial = model.initial_carry(2)
+    variables = model.init(jax.random.key(33), x, initial, starts)
+    apply = jax.jit(model.apply)
+    step = jax.jit(partial(model.apply, method=model.step))
+    incoming, _ = apply(variables, x[:2], initial, starts[:2])
+    expected = apply(variables, x, incoming, starts)
+    carry = incoming
+    outputs = []
+    for token, reset in zip(x, starts, strict=True):
+        carry, output = step(variables, token, carry, reset)
+        outputs.append(output)
+    chunk_carry, prefix = apply(variables, x[:2], incoming, starts[:2])
+    chunk_carry, suffix = apply(variables, x[2:], chunk_carry, starts[2:])
+    for actual in ((carry, jnp.stack(outputs)), (chunk_carry, jnp.concatenate((prefix, suffix)))):
+        chex.assert_trees_all_equal_shapes_and_dtypes(actual, expected)
+        for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_allclose(got.astype(jnp.float32), want.astype(jnp.float32), rtol=0.02, atol=1e-5)
+    assert expected[1].dtype == jnp.bfloat16
+    chex.assert_type(jax.tree.leaves(expected[0]), jnp.float32)
 
 
 # Check both discretization endpoints once, and both rotation layouts in the interior.

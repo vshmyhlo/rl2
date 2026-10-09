@@ -27,8 +27,9 @@ def test_lstm_sequence_step_chunks_and_resets(dtype: jax.typing.DTypeLike, suppl
     model = LSTM(4, dtype=dtype)
     assert isinstance(model, RecurrentSequenceModel)
     x = jax.random.normal(jax.random.key(0), (4, 2, 3)).astype(dtype)
-    starts = jnp.zeros((4, 2), dtype=jnp.bool_).at[2, 0].set(True)
-    incoming = (jnp.ones((2, 4)), jnp.full((2, 4), 0.5)) if supplied_carry else None
+    starts = jnp.zeros((4, 2), dtype=jnp.bool_).at[2:, 0].set(True)
+    fresh_carry = model.initial_carry(2)
+    incoming = (jnp.ones((2, 4)), jnp.full((2, 4), 0.5)) if supplied_carry else fresh_carry
     params = model.init(jax.random.key(1), x, incoming, starts)
     apply = jax.jit(model.apply)
     step = jax.jit(partial(model.apply, method=model.step))
@@ -58,7 +59,7 @@ def test_lstm_sequence_step_chunks_and_resets(dtype: jax.typing.DTypeLike, suppl
     np.testing.assert_allclose(jnp.concatenate((prefix, suffix)), output, atol=tolerance, rtol=0)
     for actual, expected in zip(chunk_carry, final, strict=True):
         np.testing.assert_allclose(actual, expected, atol=tolerance, rtol=0)
-    _, fresh = apply(params, x[2:], None, starts[2:])
+    _, fresh = apply(params, x[2:], fresh_carry, starts[2:])
     np.testing.assert_allclose(suffix[:, 0], fresh[:, 0], atol=tolerance, rtol=0)
     assert float(jnp.max(jnp.abs(suffix[:, 1] - fresh[:, 1]))) > 1e-3
 

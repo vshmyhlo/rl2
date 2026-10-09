@@ -74,13 +74,15 @@ class ScoringEnv(gym.Env):
         self.closed = True
 
 
-@pytest.mark.parametrize("model_type", ("lstm", "gdn2"))
+@pytest.mark.parametrize("model_type", ("lstm", "gdn2", "mamba3"))
 def test_full_games_raw_returns_memory_and_json(tmp_path: Path, model_type: ppo.ModelType) -> None:
     config = replace(
         training_config(),
         model=ppo.LSTMConfig(hidden_size=2)
         if model_type == "lstm"
-        else ppo.GDN2Config(hidden_size=8, num_heads=1, head_dim=4, intermediate_size=8),
+        else ppo.GDN2Config(hidden_size=8, num_heads=1, head_dim=4, intermediate_size=8)
+        if model_type == "gdn2"
+        else ppo.Mamba3Config(hidden_size=8, num_layers=1, intermediate_size=8, state_size=4, head_dim=4),
     )
     env = ScoringEnv()
     starts: list[bool] = []

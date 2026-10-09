@@ -26,8 +26,9 @@ def initial_carry(num_envs: int, hidden_size: int) -> LSTMCarry:
 class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
     """Time-major LSTM with inputs/outputs in ``dtype`` and float32 carry.
 
-    Carry is (cell state, hidden state), each [batch, features]. Passing None
-    starts from zeros; episode starts reset both states before consuming input.
+    Carry is (cell state, hidden state), each [batch, features], and is required.
+    Supply ``initial_carry(num_envs)`` to start from zeros; episode starts reset
+    both states before consuming input.
     Input width is inferred from the inputs and may differ from ``features``.
     Time, batch, and input feature dimensions must be nonempty.
     """
@@ -44,14 +45,12 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
     def initial_carry(self, num_envs: int) -> LSTMCarry:
         return initial_carry(num_envs, self.features)
 
-    def __call__(self, x: jax.Array, carry: LSTMCarry | None, episode_starts: jax.Array) -> tuple[LSTMCarry, jax.Array]:
+    def __call__(self, x: jax.Array, carry: LSTMCarry, episode_starts: jax.Array) -> tuple[LSTMCarry, jax.Array]:
         sc = ShapeChecker(D=self.features)
         sc.check(x, "TBI", self.dtype)
         sc.check(episode_starts, "TB", jnp.bool_)
         for size in sc["TBI"]:
             chex.assert_scalar_positive(size)
-        if carry is None:
-            carry = self.initial_carry(x.shape[1])
         sc.check(carry, "BD", jnp.float32)
 
         def recurrent_step(
@@ -71,14 +70,12 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
         sc.check(output, "TBD", self.dtype)
         return carry, output
 
-    def step(self, x: jax.Array, carry: LSTMCarry | None, episode_starts: jax.Array) -> tuple[LSTMCarry, jax.Array]:
+    def step(self, x: jax.Array, carry: LSTMCarry, episode_starts: jax.Array) -> tuple[LSTMCarry, jax.Array]:
         sc = ShapeChecker(D=self.features)
         sc.check(x, "BI", self.dtype)
         sc.check(episode_starts, "B", jnp.bool_)
         for size in sc["BI"]:
             chex.assert_scalar_positive(size)
-        if carry is None:
-            carry = self.initial_carry(x.shape[0])
         sc.check(carry, "BD", jnp.float32)
         cell, hidden = carry
         carry = (

@@ -12,7 +12,6 @@ import numpy as np
 import optax
 import pytest
 import yaml
-from flax import linen as nn
 from flax.training.train_state import TrainState
 from pydantic import ValidationError
 
@@ -36,7 +35,9 @@ from rl2.ppo import (
 def small_model_config(model_type: ppo.ModelType) -> ppo.ModelConfig:
     if model_type == "lstm":
         return ppo.LSTMConfig(hidden_size=8)
-    return ppo.GDN2Config(hidden_size=8, num_heads=1, head_dim=4, intermediate_size=8)
+    if model_type == "gdn2":
+        return ppo.GDN2Config(hidden_size=8, num_heads=1, head_dim=4, intermediate_size=8)
+    return ppo.Mamba3Config(hidden_size=8, num_layers=2, intermediate_size=8, state_size=4, head_dim=4, mimo_rank=2)
 
 
 @pytest.mark.parametrize("stacked", (False, True))
@@ -148,7 +149,7 @@ def test_clipped_policy_loss_and_gradient_direction() -> None:
     assert float(updated.params["logits"][1, 1, 0]) > float(logits[1, 1, 0])
 
 
-@pytest.mark.parametrize("model_type", ("lstm", "gdn2"))
+@pytest.mark.parametrize("model_type", ("lstm", "gdn2", "mamba3"))
 def test_bf16_recurrent_training_keeps_float32_state_and_losses(model_type: ppo.ModelType) -> None:
     config = replace(
         load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
@@ -210,7 +211,7 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses(model_type: ppo.
     )
 
 
-@pytest.mark.parametrize("model_type", ("lstm", "gdn2"))
+@pytest.mark.parametrize("model_type", ("lstm", "gdn2", "mamba3"))
 @jax.default_matmul_precision("highest")
 def test_recurrent_sequences_match_steps_and_reset_only_finished_env(model_type: ppo.ModelType) -> None:
     # Test sequence/reset semantics in float32, without GPU TF32 approximation.
@@ -432,7 +433,7 @@ def test_preprocessing_returns_final_screen(end_step: int, terminated: bool, gra
         np.testing.assert_array_equal(obs, np.full(obs.shape, end_step, np.uint8))
 
 
-@pytest.mark.parametrize("frame_budget, model_type", ((1, "lstm"), (5, "lstm"), (5, "gdn2")))
+@pytest.mark.parametrize("frame_budget, model_type", ((1, "lstm"), (5, "lstm"), (5, "gdn2"), (5, "mamba3")))
 def test_video_recording_stops_at_frame_budget(frame_budget: int, model_type: ppo.ModelType) -> None:
     from unittest.mock import Mock
 
@@ -506,16 +507,14 @@ def test_video_recording_stops_at_episode_end(frame_budget: int | None, terminat
 @jax.default_matmul_precision("highest")
 def test_gdn2_gradients_stop_at_episode_reset() -> None:
     config = ppo.GatedDeltaNet2Config(hidden_size=8, num_heads=1, head_dim=4)
-    cell = nn.scan(ppo.ResetGDN2, variable_broadcast="params", split_rngs={"params": False}, in_axes=0, out_axes=0)(
-        config, 2, 8
-    )
+    cell = ppo.GatedDeltaNet2Recurrent(config, 2, 8)
     inputs = jax.random.normal(jax.random.key(2), (4, 2, 8))
     starts = jnp.zeros((4, 2), dtype=bool).at[2, 0].set(True)
-    carry = ppo.GatedDeltaNet2Stack(config, 2, 8).initial_carry(2)
-    params = cell.init(jax.random.key(1), carry, (inputs, starts))
+    carry = cell.initial_carry(2)
+    params = cell.init(jax.random.key(1), inputs, carry, starts)
 
     def loss(x: jax.Array) -> jax.Array:
-        return cell.apply(params, carry, (x, starts))[1][-1].sum()
+        return cell.apply(params, x, carry, starts)[1][-1].sum()
 
     grads = jax.jit(jax.grad(loss))(inputs)
     np.testing.assert_array_equal(grads[:2, 0], 0)
@@ -534,6 +533,17 @@ def test_gdn2_gradients_stop_at_episode_reset() -> None:
         ({"type": "lstm", "hidden_size": 0}, "greater_than"),
         ({"type": "lstm", "hidden_size": True}, "int_type"),
         ({"type": "gdn2", "hidden_size": 1.5}, "int_type"),
+        ({"type": "mamba3", "conv_size": 4}, "unexpected_keyword_argument"),
+        ({"type": "mamba3", "head_dim": 5}, "divisible by head_dim"),
+        ({"type": "mamba3", "num_groups": 5}, "divisible by num_groups"),
+        ({"type": "mamba3", "state_size": 3}, "state_size must be even"),
+        ({"type": "mamba3", "state_size": 2}, "rotary pair"),
+        ({"type": "mamba3", "rope_fraction": 0.25}, "literal_error"),
+        ({"type": "mamba3", "intermediate_size": -1}, "greater_than_equal"),
+        *[
+            ({"type": "mamba3", name: 0}, "greater_than")
+            for name in ("hidden_size", "num_layers", "state_size", "expand", "head_dim", "num_groups", "mimo_rank")
+        ],
         *[
             ({"type": "gdn2", name: 0}, "greater_than")
             for name in ("hidden_size", "num_heads", "head_dim", "conv_size", "num_layers", "intermediate_size")
@@ -602,3 +612,31 @@ def test_step_rejects_invalid_array_metadata(bad_input: str) -> None:
     starts = jnp.zeros((1, 2) if bad_input == "reset_mask_shape" else (2,), dtype=jnp.bool_)
     with pytest.raises(AssertionError):
         jax.eval_shape(partial(model.init, method=model.step), jax.random.key(0), obs, model.initial_carry(2), starts)
+
+
+def test_mamba3_config_loading_and_factory(tmp_path: Path) -> None:
+    config = replace(
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        model=small_model_config("mamba3"),
+    )
+    path = tmp_path / "ppo.yaml"
+    path.write_text(yaml.safe_dump(asdict(config)))
+    restored = load_config(path)
+    assert restored == config
+    assert hash(restored) == hash(config)
+    model = ppo.make_model(restored, 3)
+    assert model.dtype == jnp.bfloat16
+    carry = ppo.initial_model_carry(restored, 2)
+    assert len(carry) == 2
+    for layer in carry:
+        assert layer.state.shape == (2, 4, 4, 4)
+        assert layer.key.shape == (2, 4, 2, 4)
+        assert layer.value.shape == (2, 4, 4)
+        assert layer.angle.shape == (2, 4, 1)
+        for leaf in layer:
+            assert leaf.dtype == jnp.float32
+            np.testing.assert_array_equal(leaf, 0)
+    # The smallest rotary state works with full rotation; zero disables the MLP.
+    boundary = ppo.Mamba3Config(state_size=2, rope_fraction=1.0, intermediate_size=0)
+    assert boundary.intermediate_size == 0
+    assert ppo.Mamba3Config().type == "mamba3"

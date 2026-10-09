@@ -1,4 +1,4 @@
-"""Recurrent PPO with a residual Atari CNN and an LSTM or GDN2 backbone."""
+"""Recurrent PPO with a residual Atari CNN and an LSTM, GDN2, or Mamba3 backbone."""
 
 import argparse
 import json
@@ -25,16 +25,19 @@ from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
-from rl2.gdn2 import GatedDeltaNet2Config, GatedDeltaNet2Stack, GatedDeltaNet2StackCarry
+from rl2.gdn2 import GatedDeltaNet2Config, GatedDeltaNet2Recurrent, GatedDeltaNet2StackCarry
 from rl2.jax_cache import configure_compilation_cache
-from rl2.lstm import LSTM, LSTMCarry, initial_carry
+from rl2.lstm import LSTM, LSTMCarry
+from rl2.lstm import initial_carry  # noqa: F401 -- retain the existing PPO import path
+from rl2.mamba3 import Mamba3Stack, Mamba3StackCarry
 from rl2.multi_atari import register_envs
 from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages
+from rl2.sequence_model import RecurrentSequenceModel
 from rl2.shape_checker import ShapeChecker
 
 type Array = jax.Array | NDArray[Any]
-type RecurrentCarry = LSTMCarry | GatedDeltaNet2StackCarry
-type ModelType = Literal["lstm", "gdn2"]
+type RecurrentCarry = LSTMCarry | GatedDeltaNet2StackCarry | Mamba3StackCarry
+type ModelType = Literal["lstm", "gdn2", "mamba3"]
 type PPOBatch = tuple[Array, Array, Array, Array, Array, RecurrentCarry, Array]
 type PPOMetrics = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
 
@@ -65,7 +68,30 @@ class GDN2Config:
         )
 
 
-type ModelConfig = Annotated[LSTMConfig | GDN2Config, Field(discriminator="type")]
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class Mamba3Config:
+    type: Literal["mamba3"] = "mamba3"
+    hidden_size: Annotated[int, Field(gt=0, strict=True)] = 768
+    num_layers: Annotated[int, Field(gt=0, strict=True)] = 2
+    intermediate_size: Annotated[int, Field(ge=0, strict=True)] = 1536
+    state_size: Annotated[int, Field(gt=0, strict=True)] = 128
+    expand: Annotated[int, Field(gt=0, strict=True)] = 2
+    head_dim: Annotated[int, Field(gt=0, strict=True)] = 64
+    num_groups: Annotated[int, Field(gt=0, strict=True)] = 1
+    mimo_rank: Annotated[int, Field(gt=0, strict=True)] = 1
+    rope_fraction: Literal[0.5, 1.0] = 0.5
+
+    def __post_init__(self) -> None:
+        inner_size = self.hidden_size * self.expand
+        if inner_size % self.head_dim:
+            raise ValueError("hidden_size * expand must be divisible by head_dim")
+        if (inner_size // self.head_dim) % self.num_groups:
+            raise ValueError("number of heads must be divisible by num_groups")
+        if self.state_size % 2 or int(self.state_size * self.rope_fraction) < 2:
+            raise ValueError("state_size must be even and allow at least one rotary pair")
+
+
+type ModelConfig = Annotated[LSTMConfig | GDN2Config | Mamba3Config, Field(discriminator="type")]
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
@@ -119,36 +145,6 @@ def learning_rate_schedule(config: Config) -> optax.Schedule:
     )
 
 
-class ResetGDN2(nn.Module):
-    config: GatedDeltaNet2Config
-    num_layers: int
-    intermediate_size: int
-
-    @nn.compact
-    def __call__(
-        self,
-        carry: GatedDeltaNet2StackCarry,
-        inputs: tuple[jax.Array, jax.Array],
-    ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
-        x, episode_starts = inputs
-        sc = ShapeChecker(D=self.config.hidden_size)
-        sc.check(x, "BD", self.config.dtype)
-        sc.check(episode_starts, "B", jnp.bool_)
-
-        def reset(leaf: jax.Array) -> jax.Array:
-            sc = ShapeChecker(B=x.shape[0])
-            sc.check(leaf, "B" + "HKV"[: leaf.ndim - 1], jnp.float32)
-            mask = episode_starts.reshape((x.shape[0],) + (1,) * (leaf.ndim - 1))
-            return jnp.where(mask, 0, leaf)
-
-        # Reset matrix memory AND short-convolution history in every layer.
-        carry = jax.tree.map(reset, carry)
-        backbone = GatedDeltaNet2Stack(self.config, self.num_layers, self.intermediate_size)
-        carry, x = backbone.step(x, jnp.ones((x.shape[0],), dtype=jnp.bool_), carry)
-        sc.check(x, "BD", self.config.dtype)
-        return carry, x
-
-
 class ActorCritic(nn.Module):
     num_actions: int
     model: ModelConfig = LSTMConfig()
@@ -157,12 +153,40 @@ class ActorCritic(nn.Module):
     embedding_size: int = 768
 
     @nn.nowrap
-    def initial_carry(self, num_envs: int) -> RecurrentCarry:
+    def _make_recurrent(self) -> RecurrentSequenceModel[RecurrentCarry]:
+        recurrent: LSTM | GatedDeltaNet2Recurrent | Mamba3Stack
         if self.model.type == "lstm":
-            return initial_carry(num_envs, self.model.hidden_size)
-        return GatedDeltaNet2Stack(
-            self.model.mixer_config(self.dtype), self.model.num_layers, self.model.intermediate_size
-        ).initial_carry(num_envs)
+            recurrent = LSTM(self.model.hidden_size, dtype=self.dtype, name="lstm", parent=None)
+        elif self.model.type == "gdn2":
+            recurrent = GatedDeltaNet2Recurrent(
+                self.model.mixer_config(self.dtype),
+                self.model.num_layers,
+                self.model.intermediate_size,
+                name="gdn2",
+                parent=None,
+            )
+        else:
+            recurrent = Mamba3Stack(
+                d_model=self.model.hidden_size,
+                num_layers=self.model.num_layers,
+                d_intermediate=self.model.intermediate_size,
+                mlp_multiple_of=1,
+                d_state=self.model.state_size,
+                expand=self.model.expand,
+                headdim=self.model.head_dim,
+                ngroups=self.model.num_groups,
+                mimo_rank=self.model.mimo_rank,
+                rope_fraction=self.model.rope_fraction,
+                dtype=self.dtype,
+                name="mamba3",
+                parent=None,
+            )
+        # The selected model and its carry always travel together through PPO.
+        return cast(RecurrentSequenceModel[RecurrentCarry], recurrent)
+
+    @nn.nowrap
+    def initial_carry(self, num_envs: int) -> RecurrentCarry:
+        return self._make_recurrent().initial_carry(num_envs)
 
     def setup(self) -> None:
         self.encoder = ConvObservationEncoder(
@@ -171,13 +195,9 @@ class ActorCritic(nn.Module):
             dtype=self.dtype,
             name="encoder",
         )
-        if self.model.type == "lstm":
-            self.recurrent = LSTM(self.model.hidden_size, dtype=self.dtype, name="lstm")
-        else:
-            self.gdn2_input = nn.Dense(self.model.hidden_size, dtype=self.dtype, name="gdn2_input")
-            self.recurrent = ResetGDN2(
-                self.model.mixer_config(self.dtype), self.model.num_layers, self.model.intermediate_size, name="gdn2"
-            )
+        self.recurrent = self._make_recurrent()
+        if self.model.type != "lstm":
+            self.recurrent_input = nn.Dense(self.model.hidden_size, dtype=self.dtype, name=f"{self.model.type}_input")
         init = nn.initializers.orthogonal(np.sqrt(2))
         self.policy_hidden = nn.Dense(512, kernel_init=init, name="policy_hidden", dtype=self.dtype)
         self.policy_norm = nn.LayerNorm(name="policy_norm", dtype=self.dtype)
@@ -196,8 +216,8 @@ class ActorCritic(nn.Module):
         sc.check(obs, "BFHW" if obs.ndim == 4 else "BFHWC", jnp.uint8)
         x = self.encoder(obs)
         sc.check(x, "BE", self.dtype)
-        if self.model.type == "gdn2":
-            x = self.gdn2_input(x).astype(self.dtype)
+        if self.model.type != "lstm":
+            x = self.recurrent_input(x).astype(self.dtype)
             projection_sc = ShapeChecker(B=obs.shape[0], D=self.model.hidden_size)
             projection_sc.check(x, "BD", self.dtype)
         return x
@@ -230,25 +250,10 @@ class ActorCritic(nn.Module):
         steps, environments = sc["TB"]
         x = self._encode(obs.reshape((-1, *obs.shape[2:])))
         x = x.reshape((steps, environments, -1))
-        # Batch the CNN and heads across time; scan only recurrent computation.
-        if self.model.type == "lstm":
-            carry, x = self.recurrent(x, cast(LSTMCarry, carry), episode_starts)
-        else:
-
-            def recurrent_step(
-                cell: ResetGDN2,
-                memory: GatedDeltaNet2StackCarry,
-                inputs: tuple[jax.Array, jax.Array],
-            ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
-                return cell(memory, inputs)
-
-            carry, x = nn.scan(
-                recurrent_step,
-                variable_broadcast="params",
-                split_rngs={"params": False},
-                in_axes=0,
-                out_axes=0,
-            )(self.recurrent, cast(GatedDeltaNet2StackCarry, carry), (x, episode_starts))
+        # Batch the CNN and heads across time; each backbone handles its recurrence.
+        sc.check(x, "TBI", self.dtype)
+        carry, x = self.recurrent(x, carry, episode_starts)
+        sc.check(x, "TBD", self.dtype)
         logits, values = self._heads(x.reshape((steps * environments, -1)))
         logits = logits.reshape((steps, environments, self.num_actions))
         values = values.reshape((steps, environments))
@@ -268,10 +273,8 @@ class ActorCritic(nn.Module):
         sc.check(obs, "BFHW" if obs.ndim == 4 else "BFHWC", jnp.uint8)
         sc.check(episode_starts, "B", jnp.bool_)
         x = self._encode(obs)
-        if self.model.type == "lstm":
-            carry, x = self.recurrent.step(x, cast(LSTMCarry, carry), episode_starts)
-        else:
-            carry, x = self.recurrent(cast(GatedDeltaNet2StackCarry, carry), (x, episode_starts))
+        carry, x = self.recurrent.step(x, carry, episode_starts)
+        sc.check(x, "BD", self.dtype)
         logits, values = self._heads(x)
         sc.check(logits, "BA", jnp.float32)
         sc.check(values, "B", jnp.float32)
