@@ -1,5 +1,8 @@
 """PPO checkpoint serialization and restart wiring without running an Atari model."""
 
+import os
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -14,6 +17,47 @@ from flax.training.train_state import TrainState
 
 from rl2 import ppo
 from rl2.shape_checker import ShapeChecker
+
+
+@pytest.mark.parametrize("use_tf", [None, "true"], ids=["default-gcsfs", "explicit-tensorflow"])
+def test_cloud_filesystem_backend_on_startup(use_tf: str | None) -> None:
+    # Use a fresh process because epath caches backend selection. Fake cloud I/O
+    # and TensorFlow availability so this regression needs neither credentials nor TF.
+    env = os.environ.copy()
+    env.pop("EPATH_USE_TF", None)
+    if use_tf is not None:
+        env["EPATH_USE_TF"] = use_tf
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+from unittest.mock import patch
+from rl2 import ppo
+from etils import epath
+from etils.epath import backend
+
+with (
+    patch("importlib.util.find_spec", return_value=object()),
+    patch.object(backend.fsspec_backend, "exists", return_value=True) as gcsfs_exists,
+    patch.object(backend.tf_backend, "exists", return_value=True) as tf_exists,
+):
+    assert epath.Path("gs://bucket/run/checkpoints").exists()
+    expected, unused = (tf_exists, gcsfs_exists) if sys.argv[1] == "true" else (gcsfs_exists, tf_exists)
+    expected.assert_called_once_with("gs://bucket/run/checkpoints")
+    unused.assert_not_called()
+assert "tensorflow" not in sys.modules
+""",
+            use_tf or "default",
+        ],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.fixture

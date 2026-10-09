@@ -30,6 +30,7 @@ from rl2.ppo import (
     update,
     value,
 )
+from rl2.shape_checker import ShapeChecker
 
 
 def small_model_config(model_type: ppo.ModelType) -> ppo.ModelConfig:
@@ -148,6 +149,74 @@ def test_clipped_policy_loss_and_gradient_direction() -> None:
     np.testing.assert_array_equal(updated.params["logits"][:, 0], logits[:, 0])  # Both clipped signs.
     assert float(updated.params["logits"][0, 1, 0]) < float(logits[0, 1, 0])
     assert float(updated.params["logits"][1, 1, 0]) > float(logits[1, 1, 0])
+
+
+def test_single_transition_keeps_policy_gradient() -> None:
+    config = replace(
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        target_kl=None,
+        entropy_coef=0.0,
+        value_coef=0.0,
+    )
+
+    def apply(
+        variables: optax.Params, obs: ppo.Array, carry: ppo.RecurrentCarry, starts: ppo.Array
+    ) -> tuple[ppo.RecurrentCarry, jax.Array, jax.Array]:
+        sc = ShapeChecker(T=1, B=1, F=1, H=1, W=1, A=2)
+        sc.check(obs, "TBFHW", jnp.uint8)
+        sc.check(starts, "TB", jnp.bool_)
+        sc.check(variables["params"]["logits"], "TBA", jnp.float32)
+        return carry, variables["params"]["logits"], jnp.zeros((1, 1))
+
+    state = TrainState.create(apply_fn=apply, params={"logits": jnp.zeros((1, 1, 2))}, tx=optax.sgd(0.1))
+    batch = (
+        jnp.zeros((1, 1, 1, 1, 1), dtype=jnp.uint8),
+        jnp.zeros((1, 1), dtype=jnp.int32),
+        jnp.full((1, 1), -np.log(2)),
+        jnp.ones((1, 1)),
+        jnp.zeros((1, 1)),
+        initial_carry(1, 1),
+        jnp.ones((1, 1), dtype=bool),
+    )
+    updated, metrics = update(state, batch, config)
+    assert float(metrics[0]) == pytest.approx(-1.0)
+    assert float(jax.nn.softmax(updated.params["logits"])[0, 0, 0]) > 0.5
+
+
+@pytest.mark.parametrize(
+    "field, invalid",
+    [
+        ("learning_rate", -0.1),
+        ("learning_rate", float("nan")),
+        ("gamma", -0.1),
+        ("gamma", 1.1),
+        ("gae_lambda", -0.1),
+        ("gae_lambda", 1.1),
+        ("clip_coef", -0.1),
+        ("clip_coef", 1.0),
+        ("entropy_coef", -0.1),
+        ("value_coef", -0.1),
+        ("max_grad_norm", 0.0),
+        ("max_grad_norm", float("inf")),
+    ],
+)
+def test_invalid_optimization_settings(field: str, invalid: float) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
+    with pytest.raises(ValueError, match=field):
+        replace(config, **{field: invalid})
+
+
+def test_optimization_settings_allow_disabled_terms_and_discount_boundaries() -> None:
+    config = replace(
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        learning_rate=0.0,
+        gamma=0.0,
+        gae_lambda=1.0,
+        clip_coef=0.0,
+        entropy_coef=0.0,
+        value_coef=0.0,
+    )
+    replace(config, gamma=1.0, gae_lambda=0.0)
 
 
 @pytest.mark.parametrize(
@@ -497,6 +566,9 @@ def test_policy_diagnostics() -> None:
     _, metrics = update(state, same_policy_batch, config)
     assert float(metrics[3]) == pytest.approx(0.0, rel=0, abs=5e-07)
     assert float(metrics[4]) == 0.0
+    # A stray singleton dimension would silently broadcast the loss to [B, B].
+    with pytest.raises(AssertionError):
+        update(state, (*batch[:2], batch[2][:, None], *batch[3:]), config)
 
 
 def test_explained_variance() -> None:
@@ -532,6 +604,14 @@ def test_gae_timeout_bootstrap_and_trace() -> None:
     )
     np.testing.assert_allclose(advantages, [[4.064], [3.7]], rtol=1e-6)
     np.testing.assert_allclose(returns, [[4.564], [4.7]], rtol=1e-6)
+
+
+@pytest.mark.parametrize("invalid", ["broadcast_mask", "float_mask"])
+def test_gae_rejects_invalid_mask(invalid: str) -> None:
+    rewards = jnp.ones((2, 2), dtype=jnp.float32)
+    dones = jnp.zeros((2, 1), dtype=jnp.bool_) if invalid == "broadcast_mask" else jnp.zeros((2, 2), dtype=jnp.float32)
+    with pytest.raises(AssertionError):
+        gae(rewards, dones, jnp.zeros_like(rewards), jnp.zeros(2), 0.9, 0.8)
 
 
 class SyntheticAtariEnv(gym.Env):

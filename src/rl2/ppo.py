@@ -2,13 +2,20 @@
 
 import argparse
 import json
+import os
 from collections import deque
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from functools import partial
+from operator import itemgetter
 from pathlib import Path
 from time import monotonic
 from typing import Annotated, Any, Literal, NamedTuple, SupportsFloat, cast
+
+# Orbax's epath otherwise loads TensorFlow for gs:// paths when it is installed.
+# That native runtime can crash a later Triton import; use our gcsfs dependency.
+# Set this before importing Orbax, since epath caches its backend selection.
+os.environ.setdefault("EPATH_USE_TF", "0")
 
 import ale_py
 import chex
@@ -117,15 +124,15 @@ class Config:
     num_steps: int
     num_minibatches: int
     update_epochs: int
-    learning_rate: float
+    learning_rate: Annotated[float, Field(ge=0, allow_inf_nan=False)]
     anneal_lr: bool
-    gamma: float
-    gae_lambda: float
-    clip_coef: float
+    gamma: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+    gae_lambda: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+    clip_coef: Annotated[float, Field(ge=0, lt=1, allow_inf_nan=False)]
     target_kl: float | None
-    entropy_coef: float
-    value_coef: float
-    max_grad_norm: float
+    entropy_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    value_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     log_dir: str
     video_every_episodes: int
     video_speed: float
@@ -565,6 +572,10 @@ def gae(
     gae_lambda: float,
 ) -> tuple[jax.Array, jax.Array]:
     """Truncation bootstrap is already included in rewards; dones stop traces."""
+    sc = ShapeChecker()
+    sc.check([rewards, values], "TB", jnp.float32)
+    sc.check(dones, "TB", jnp.bool_)
+    sc.check(next_value, "B", jnp.float32)
 
     def step(
         carry: tuple[jax.Array, jax.Array],
@@ -583,7 +594,9 @@ def gae(
         (rewards, dones, values),
         reverse=True,
     )
-    return advantages, advantages + values
+    returns = advantages + values
+    sc.check([advantages, returns], "TB", jnp.float32)
+    return advantages, returns
 
 
 def explained_variance(values: Array, returns: Array) -> float:
@@ -602,11 +615,24 @@ def update(
     entropy_coef = jnp.asarray(entropy_coef_schedule(config)(iteration), dtype=jnp.float32)
     sc.check(entropy_coef, "", dtype=jnp.float32)
     obs, actions, old_log_probs, advantages, returns, carry, episode_starts = batch
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    # ActorCritic validates observations and recurrent memory. Match all loss
+    # tensors exactly so a stray singleton axis cannot silently broadcast.
+    batch_dims = "TB" if actions.ndim == 2 else "B"
+    sc.check(actions, batch_dims)
+    chex.assert_type(actions, int)
+    sc.check([old_log_probs, advantages, returns], batch_dims, jnp.float32)
+    sc.check(episode_starts, batch_dims, jnp.bool_)
+    chex.assert_scalar_positive(advantages.size)
+    # Centering a single sample always gives zero and erases its policy gradient.
+    if advantages.size > 1:
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     def loss_fn(params: optax.Params) -> tuple[jax.Array, PPOMetrics]:
         _, logits, values = state.apply_fn({"params": params}, obs, carry, episode_starts)
+        sc.check(logits, batch_dims + "A", jnp.float32)
+        sc.check(values, batch_dims, jnp.float32)
         log_probs = action_log_prob(logits, actions)
+        sc.check(log_probs, batch_dims, jnp.float32)
         log_ratio = log_probs - old_log_probs
         ratio = jnp.exp(log_ratio)
         clipped = jnp.clip(ratio, 1 - config.clip_coef, 1 + config.clip_coef)
@@ -616,6 +642,7 @@ def update(
         loss = policy_loss + config.value_coef * value_loss - entropy_coef * entropy
         approx_kl = (jnp.expm1(log_ratio) - log_ratio).mean()
         clip_fraction = (jnp.abs(ratio - 1) > config.clip_coef).mean()
+        sc.check([loss, policy_loss, value_loss, entropy, approx_kl, clip_fraction], "", jnp.float32)
         return loss, (policy_loss, value_loss, entropy, approx_kl, clip_fraction)
 
     (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
@@ -837,7 +864,7 @@ def train(config: Config) -> TrainState:
                 for indices in np.split(rng.permutation(config.num_envs), config.num_minibatches):
                     minibatch = (
                         *[x[:, indices] for x in batch],
-                        jax.tree.map(lambda c: c[indices], rollout_carry),
+                        jax.tree.map(itemgetter(indices), rollout_carry),
                         episode_starts[:, indices],
                     )
                     state, metric = update(state, minibatch, config, iteration)
