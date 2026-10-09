@@ -31,6 +31,13 @@ def test_atari_configs_enable_cosine_decay() -> None:
         assert config.entropy_decay == "cosine", path.name
 
 
+def test_atari_model_configs_specify_log_directory_templates() -> None:
+    configs = Path(__file__).resolve().parents[1] / "configs"
+    for model_type in ("lstm", "gdn2", "mamba3"):
+        config = load_config(configs / f"ppo_atari_{model_type}.yaml")
+        assert config.log_dir == "gs://cohere-dev/vlad/rl2/ppo/${run_id}/${env_id}"
+
+
 @pytest.mark.parametrize("model_type", ("lstm", "gdn2", "mamba3"))
 def test_atari_config_parameter_budget(model_type: ModelType) -> None:
     configs = Path(__file__).resolve().parents[1] / "configs"
@@ -38,7 +45,6 @@ def test_atari_config_parameter_budget(model_type: ModelType) -> None:
     config = load_config(configs / f"ppo_atari_{model_type}.yaml")
     assert config.model.type == model_type
     assert config.model.num_layers == 2
-    assert config.log_dir == f"{base.log_dir}/ppo"
     assert replace(config, model=base.model, log_dir=base.log_dir, run_id=base.run_id) == base
 
     if isinstance(config.model, GDN2Config):

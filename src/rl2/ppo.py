@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from operator import itemgetter
 from pathlib import Path
+from string import Template
 from time import monotonic
 from typing import Annotated, Any, Literal, NamedTuple, SupportsFloat, cast
 
@@ -166,6 +167,16 @@ class TrainingProgress(NamedTuple):
     completed_episodes: int
     recent_returns: tuple[float, ...]
     recent_lengths: tuple[int, ...]
+
+
+def run_directory(log_dir: str, run_id: str, env_id: str) -> str:
+    """Resolve a full path template, or append the run ID to a plain log directory."""
+    if "$" not in log_dir:
+        return f"{log_dir.rstrip('/')}/{run_id}"
+    try:
+        return Template(log_dir).substitute(run_id=run_id, env_id=env_id.replace("/", "_")).rstrip("/")
+    except (KeyError, ValueError) as error:
+        raise ValueError("log_dir supports only ${run_id} and ${env_id} placeholders") from error
 
 
 def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
@@ -725,7 +736,7 @@ def train(config: Config) -> TrainState:
             f"{config.env_id.replace('/', '_')}_seed{config.seed}_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"
         )
         config = replace(config, run_id=run_name)
-        run_dir = f"{config.log_dir.rstrip('/')}/{run_name}"
+        run_dir = run_directory(config.log_dir, run_name, config.env_id)
         manager = checkpoint_manager(run_dir)
         obs, _ = envs.reset(seed=config.seed)
         key, init_key = jax.random.split(jax.random.key(config.seed))

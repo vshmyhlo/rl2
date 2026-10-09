@@ -1,15 +1,15 @@
-env_id: ALE/SpaceInvaders-v5
+env_id: ALE/Boxing-v5
 observation_size: null # Resize only; null preserves the original resolution
 frame_stack: true # true stacks 4 frames; false uses a single frame
 atari_preprocessing: true # true enables 84x84 grayscale, action repeat 4, max pooling, and random reset no-ops
 seed: 1
-total_steps: 10_000_000
+total_steps: 100000 # Agent transitions across all envs; full rollouts use 98,304
 num_envs: 32
 vector_env: async # async (subprocesses) or sync
 num_steps: 128
 num_minibatches: 4 # Must divide num_envs; minibatches contain whole sequences
 update_epochs: 4
-model: # 10,051,791 total actor-critic parameters with 4x84x84 observations and 6 actions
+model:
   type: gdn2
   backend: triton # NVIDIA GPU; install with uv sync --extra cuda12 --extra gdn2-triton; use jax for CPU
   hidden_size: 256
@@ -30,7 +30,7 @@ entropy_coef: 0.01
 entropy_decay: cosine # Decay to zero over the rollout budget
 value_coef: 0.5
 max_grad_norm: 0.5
-log_dir: gs://cohere-dev/vlad/rl2/ppo
+log_dir: gs://cohere-dev/vlad/rl2/ppo/${run_id}/${env_id} # Full run path; env_id replaces / with _
 run_id: ppo_atari_gdn2 # TensorBoard run directory; change this for a new run
 video_every_episodes: 100 # 0 disables recording
 video_speed: 4.0 # Playback multiplier: 1.0 normal, 2.0 double speed
