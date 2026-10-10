@@ -560,7 +560,11 @@ def test_train_evaluates_final_policy(
     envs = Mock()
     envs.single_action_space.n = 2
     envs.reset.return_value = (obs, {})
-    envs.step.return_value = (obs, zeros, dones, ~dones, {})
+    # The first game spans two steps; the last unfinished game must not count.
+    envs.step.side_effect = [
+        (obs, np.array([reward]), dones if done else ~dones, ~dones, {})
+        for reward, done in ((5.0, False), (-2.0, True), (7.0, True), (1000.0, False))
+    ]
     model = Mock()
     model.initial_carry.return_value = carry
     model.init.return_value = {"params": {"weight": jnp.zeros(1)}}
@@ -576,7 +580,7 @@ def test_train_evaluates_final_policy(
     def now() -> float:
         return clock
 
-    def advance_evaluation(*args: object) -> None:
+    def advance_evaluation(*args: object, **kwargs: object) -> None:
         nonlocal clock
         clock += 30.0
 
@@ -600,7 +604,10 @@ def test_train_evaluates_final_policy(
         assert int(evaluated_state.step) == steps // config.num_steps
         assert evaluated_config.eval_every_minutes == eval_every_minutes
         assert evaluated_writer is writer.return_value
-        assert episodes == steps
+        assert episodes == (1 if steps == 2 else 2)
+        scores = call.kwargs["training_scores"]
+        assert scores.episode_count == episodes
+        assert scores.return_sum == (3.0 if steps == 2 else 10.0)
     if expected_steps:
         assert evaluate.call_args.args[0] is state
     first_elapsed = 90.0 if 2 in expected_steps else 60.0

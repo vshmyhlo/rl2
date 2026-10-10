@@ -14,10 +14,8 @@ import argparse
 import json
 from dataclasses import asdict, replace
 from functools import partial
-from math import isfinite
-from pathlib import Path
 from time import monotonic
-from typing import Any, Literal
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -29,77 +27,14 @@ from flax import linen as nn
 from flax import struct
 from flax.training.train_state import TrainState
 from omegaconf.errors import OmegaConfBaseException
-from pydantic import ConfigDict
-from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
-from rl2.configuration import load_settings, resolve_settings
+from rl2.alphazero.config import Config, load_config
+from rl2.configuration import resolve_settings
 from rl2.shape_checker import ShapeChecker
 
 type Parameters = dict[str, Any]
 type Metrics = dict[str, jax.Array]
-type EnvId = Literal["chess", "gardner_chess", "tic_tac_toe"]
-
-
-@dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
-class Config:
-    env_id: EnvId = "chess"
-    seed: int = 0
-    iterations: int = 100
-    num_envs: int = 8
-    max_moves: int = 512
-    num_simulations: int = 32
-    channels: int = 64
-    num_blocks: int = 3
-    batch_size: int = 128
-    updates_per_iteration: int = 8
-    learning_rate: float = 1e-3
-    weight_decay: float = 1e-4
-    max_grad_norm: float = 1.0
-    dirichlet_alpha: float = 0.3
-    dirichlet_fraction: float = 0.25
-    exploration_moves: int = 30
-    log_dir: str = "runs/alphazero/${run_id}"
-    run_id: str | None = None
-
-    def __post_init__(self) -> None:
-        if self.env_id not in ("chess", "gardner_chess", "tic_tac_toe"):
-            raise ValueError("Expected chess, gardner_chess, or tic_tac_toe")
-        for name in (
-            "iterations",
-            "num_envs",
-            "max_moves",
-            "num_simulations",
-            "channels",
-            "num_blocks",
-            "batch_size",
-            "updates_per_iteration",
-        ):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be positive")
-        for name in ("learning_rate", "max_grad_norm", "dirichlet_alpha"):
-            value = getattr(self, name)
-            if not isfinite(value) or value <= 0:
-                raise ValueError(f"{name} must be finite and positive")
-        if not isfinite(self.weight_decay) or self.weight_decay < 0:
-            raise ValueError("weight_decay must be finite and nonnegative")
-        if not 0 <= self.dirichlet_fraction <= 1:
-            raise ValueError("dirichlet_fraction must be in [0, 1]")
-        if self.exploration_moves < 0:
-            raise ValueError("exploration_moves must be nonnegative")
-        if not 0 <= self.seed < 2**32:
-            raise ValueError("seed must be in [0, 2**32)")
-        if not self.log_dir.strip():
-            raise ValueError("log_dir must not be empty")
-        if self.run_id is not None and (
-            not self.run_id.strip() or self.run_id in (".", "..") or any(c in self.run_id for c in "/\\")
-        ):
-            raise ValueError("run_id must be a nonempty directory name without slashes or traversal")
-
-
-def load_config(path: str | Path) -> Config:
-    """Load and validate training settings from a YAML mapping."""
-    return Config(**load_settings(path, asdict(Config())))
 
 
 class PolicyValueNet(nn.Module):

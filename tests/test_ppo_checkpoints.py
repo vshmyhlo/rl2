@@ -5,6 +5,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import chex
@@ -92,7 +93,7 @@ def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Confi
     directory = f"{config.log_dir}/{config.run_id}"
     rng = np.random.default_rng(12)
     rng.random(3)
-    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 8, (1.5, -2.0), (3, 7))
+    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 8, (1.5, -2.0), (3, 7), 12.5)
     with ppo.checkpoint_manager(directory) as manager:
         assert ppo.restore_checkpoint(manager, state, rng, config) is None
         ppo.save_checkpoint(manager, progress._replace(iteration=1), rng, config)
@@ -119,6 +120,31 @@ def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Confi
         assert manager.all_steps() == [2, 3]
     with ppo.checkpoint_manager(f"{config.log_dir}/different-run") as manager:
         assert ppo.restore_checkpoint(manager, fresh, restored_rng, config) is None
+
+
+def test_legacy_checkpoint_leaves_training_total_unavailable(config: ppo.Config, state: TrainState) -> None:
+    rng = np.random.default_rng(12)
+    manager = Mock()
+    manager.latest_step.return_value = 2
+    manager.restore.side_effect = [
+        SimpleNamespace(
+            metadata={
+                "version": 1,
+                "config": ppo._checkpoint_settings(config),
+                "iteration": 2,
+                "completed_episodes": 101,
+                "recent_returns": [2.0] * 100,
+                "recent_lengths": [3] * 100,
+                "numpy_rng": rng.bit_generator.state,
+            }
+        ),
+        SimpleNamespace(state={"train_state": state, "key": jax.random.key_data(jax.random.key(3))}),
+    ]
+    restored = ppo.restore_checkpoint(manager, state, rng, config)
+    assert restored is not None
+    assert restored.training_return_sum is None
+    assert restored.completed_episodes == 101
+    assert restored.recent_returns == (2.0,) * 100
 
 
 @pytest.mark.parametrize("run_id", ["", " ", "..", "a/b", "a\\b"])
@@ -162,6 +188,7 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
     iterations: list[int] = []
     learning_rates: list[float] = []
     saved_iterations: list[int] = []
+    saved_return_sums: list[float | None] = []
 
     def update(
         state: TrainState, batch: ppo.PPOBatch, config: ppo.Config, iteration: int
@@ -185,6 +212,7 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
         config: ppo.Config,
     ) -> None:
         saved_iterations.append(progress.iteration)
+        saved_return_sums.append(progress.training_return_sum)
         original_save(manager, progress, rng, config)
 
     with (
@@ -204,6 +232,7 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
         writer.reset_mock()
         resumed = ppo.train(config)
         assert saved_iterations == [2, 4]
+        assert saved_return_sums == [2.0, 4.0]
         assert iterations == [0, 1, 2, 3]
         assert int(resumed.step) == 4
         np.testing.assert_allclose(learning_rates, [ppo.learning_rate_schedule(config)(i) for i in range(4)])
@@ -212,6 +241,10 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
             c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/total_episodes"
         ]
         assert episode_logs == [(3.0, 3), (4.0, 4)]
+        return_logs = [
+            c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/return_mean"
+        ]
+        assert return_logs == [(1.0, 3), (1.0, 4)]
         sps = [
             c.args[1] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/steps_per_second"
         ]

@@ -1,18 +1,21 @@
-env_id: chess # Also supports gardner_chess and tic_tac_toe
+# Starting configuration for one A100 40 GB with memory available for this run.
+# Uses fresh self-play batches; the trainer has no replay buffer or checkpoints yet.
+env_id: chess
 seed: 0
-iterations: 100
-num_envs: 8
-max_moves: 512 # Unfinished games contribute policy targets only
-num_simulations: 32
-channels: 64
-num_blocks: 3
-batch_size: 128
-updates_per_iteration: 8
-learning_rate: 0.001
+iterations: 10000 # Up to 1.28M games and 640K optimizer updates
+num_envs: 128 # Independent games searched together; reduce first if memory is tight
+max_moves: 512 # Plies (half-moves); unfinished games contribute policy targets only
+num_simulations: 256 # Search budget per position; increase after measuring self-play throughput
+model:
+  channels: 128
+  num_blocks: 10
+batch_size: 512
+updates_per_iteration: 64 # 32,768 sampled positions per fresh batch, excluding terminal padding
+learning_rate: 0.0003 # Constant AdamW rate; this trainer has no learning-rate schedule
 weight_decay: 0.0001
 max_grad_norm: 1.0
 dirichlet_alpha: 0.3
 dirichlet_fraction: 0.25
-exploration_moves: 30
+exploration_moves: 30 # Sample search visits for the first 30 plies, then select greedily
 log_dir: gs://cohere-dev/vlad/rl2/alphazero/${run_id}/${path_name:${env_id}} # Full run path; env_id replaces / with _
 run_id: alphazero_chess # TensorBoard run directory; change this for a new run

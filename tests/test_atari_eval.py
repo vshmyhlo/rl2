@@ -13,7 +13,7 @@ import pytest
 from flax.training.train_state import TrainState
 
 from rl2 import ppo
-from rl2.atari_eval import EvaluationConfig, ScoreBaselines, _action, evaluate, make_evaluation_env
+from rl2.atari_eval import EvaluationConfig, ScoreBaselines, TrainingScores, _action, evaluate, make_evaluation_env
 from rl2.atari_scores import ATARI_REFERENCE_SCORES, REFERENCE_SOURCE, get_reference_scores
 from rl2.ppo import Array, Config, LSTMStackCarry, load_config
 from rl2.shape_checker import ShapeChecker
@@ -43,6 +43,36 @@ def policy(
 
 def policy_state() -> TrainState:
     return TrainState.create(apply_fn=policy, params={"logits": jnp.arange(6.0)}, tx=optax.sgd(0.1))
+
+
+@pytest.mark.parametrize(
+    "scores,mean",
+    [
+        pytest.param(TrainingScores(0, 0.0), None, id="no-completed-episodes"),
+        pytest.param(TrainingScores(2, -4.0), -2.0, id="negative-returns"),
+        pytest.param(TrainingScores(101, 300.0), 300 / 101, id="entire-history"),
+        pytest.param(TrainingScores(101, None), None, id="unknown-historical-total"),
+    ],
+)
+def test_training_score_means(scores: TrainingScores, mean: float | None) -> None:
+    report = scores.as_report()
+    assert report == {
+        "episode_count": scores.episode_count,
+        "return_mean": mean,
+    }
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "count,total",
+    [
+        pytest.param(-1, 0.0, id="negative-count"),
+        pytest.param(1, float("inf"), id="nonfinite-total"),
+    ],
+)
+def test_training_scores_reject_invalid_history(count: int, total: float | None) -> None:
+    with pytest.raises(ValueError):
+        TrainingScores(count, total)
 
 
 class ScoringEnv(gym.Env):
@@ -116,6 +146,7 @@ def test_full_games_raw_returns_memory_and_json(tmp_path: Path, model_type: ppo.
     assert json.loads(output.read_text()) == result
     assert [episode["return"] for episode in result["episodes"]] == [3, 7]
     assert result["return_mean"] == 5
+    assert result["training_scores"] is None
     assert result["return_std"] == pytest.approx(np.sqrt(8), rel=0, abs=5e-08)
     assert result["return_sem"] == pytest.approx(2, rel=0, abs=5e-08)
     assert result["human_normalized_score_percent"] == 50
@@ -354,19 +385,24 @@ def test_evaluation_logging_records_scores_and_report_without_mutating_state() -
     config = replace(training_config(), eval_episodes=2, eval_seed=321)
     state = policy_state()
     before = jax.tree.map(np.array, state)
+    scores = TrainingScores(101, 300.0)
     with (
         patch("rl2.atari_eval.make_evaluation_env", return_value=ScoringEnv()),
         patch("rl2.ppo.SummaryWriter") as writer,
     ):
-        ppo.log_evaluation(state, config, writer, 7, 100)
+        ppo.log_evaluation(state, config, writer, 101, 100, training_scores=scores)
     scalars = {call.args[0]: call.args[1:] for call in writer.add_scalar.call_args_list}
     assert scalars["eval/return_mean"] == (5, 100)
-    assert scalars["eval/training_episodes"] == (7, 100)
+    assert scalars["eval/training_episodes"] == (101, 100)
+    assert scalars["training/return_mean"] == (300 / 101, 100)
+    assert "training/return_mean_100" not in scalars
+    assert "training/last_100_episode_count" not in scalars
     assert scalars["eval/human_normalized_score_percent"] == pytest.approx((100 * (5 + 20.7) / (14.6 + 20.7), 100))
     tag, text, step = writer.add_text.call_args.args
     assert tag == "eval/report" and step == 100
     report = json.loads(text.removeprefix("```json\n").removesuffix("\n```"))
-    assert report["training_steps"] == 100 and report["training_episodes"] == 7
+    assert report["training_steps"] == 100 and report["training_episodes"] == 101
+    assert report["training_scores"] == scores.as_report()
     assert report["baselines"]["source"] == REFERENCE_SOURCE
     assert [episode["seed"] for episode in report["episodes"]] == [321, 322]
     for old, new in zip(jax.tree.leaves(before), jax.tree.leaves(state), strict=True):

@@ -42,6 +42,7 @@ across different games. This evaluator does not train or update the policy.
 """
 
 import json
+import math
 from dataclasses import asdict, dataclass
 from functools import partial
 from importlib.metadata import version
@@ -58,8 +59,37 @@ from flax.training.train_state import TrainState
 
 from rl2.atari_scores import REFERENCE_SOURCE, get_reference_scores
 from rl2.ppo import Array, AtariPreprocessing, Config, RecurrentCarry, initial_model_carry
+from rl2.shape_checker import ShapeChecker
 
 type EvaluationResult = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TrainingScores:
+    """Mean raw return over all completed training episodes.
+
+    This is the all-training metric from Section 6.4 of
+    https://arxiv.org/abs/1707.06347, separate from frozen-policy evaluation.
+    A missing return_sum (e.g. an older checkpoint) leaves the all-training
+    mean unavailable. Matching this metric does not match Atari protocols.
+    """
+
+    episode_count: int
+    return_sum: float | None
+
+    def __post_init__(self) -> None:
+        if self.episode_count < 0:
+            raise ValueError("episode_count must be nonnegative")
+        if self.return_sum is not None and not math.isfinite(self.return_sum):
+            raise ValueError("training return_sum must be finite or unavailable")
+
+    def as_report(self) -> dict[str, int | float | None]:
+        return {
+            "episode_count": self.episode_count,
+            "return_mean": self.return_sum / self.episode_count
+            if self.episode_count and self.return_sum is not None
+            else None,
+        }
 
 
 @dataclass(frozen=True)
@@ -171,6 +201,7 @@ def evaluate(
     evaluation: EvaluationConfig | None = None,
     *,
     baselines: ScoreBaselines | None = None,
+    training_scores: TrainingScores | None = None,
     output_path: str | Path | None = None,
     show_progress: bool = True,
 ) -> EvaluationResult:
@@ -179,6 +210,9 @@ def evaluate(
     ``training`` must describe the supplied state's actual training setup.
     Returns a JSON-compatible report; optionally writes it to ``output_path``.
     Baselines default to the bundled DQN Zoo Atari-57 table when available.
+    Optional ``training_scores`` adds the PPO paper's training-wide raw episode
+    mean under ``training_scores``; absent history is reported as
+    null. Evaluation episodes never contribute to these training metrics.
     Progress prints at startup, after each game, and every 10 seconds during
     a game (after an environment step). Set show_progress=False to silence it.
     The caller owns checkpoint selection and independent-training-seed repeats.
@@ -257,6 +291,8 @@ def evaluate(
         env.close()
 
     returns = np.asarray([episode["return"] for episode in episodes], dtype=np.float64)
+    sc = ShapeChecker(E=evaluation.episodes)
+    sc.check(returns, "E", np.float64)
     std = float(returns.std(ddof=1)) if len(returns) > 1 else None
     training_metadata = asdict(training)
     # Stage tuples must also be lists in memory so the report survives a JSON round trip.
@@ -282,6 +318,7 @@ def evaluate(
             "difficulty": 0,
         },
         "training_config": training_metadata,  # Configured budget, not proof of frames actually trained.
+        "training_scores": training_scores.as_report() if training_scores is not None else None,
         "optimizer_steps": int(state.step),
         "versions": {name: version(name) for name in ("ale-py", "gymnasium", "jax", "flax", "numpy")},
         "return_mean": float(returns.mean()),

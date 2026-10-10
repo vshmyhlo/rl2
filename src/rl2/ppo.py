@@ -10,7 +10,7 @@ from functools import partial
 from operator import itemgetter
 from pathlib import Path
 from time import monotonic
-from typing import Annotated, Any, Literal, NamedTuple, SupportsFloat, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NamedTuple, SupportsFloat, cast
 
 # Orbax's epath otherwise loads TensorFlow for gs:// paths when it is installed.
 # That native runtime can crash a later Triton import; use our gcsfs dependency.
@@ -52,6 +52,9 @@ from rl2.multi_atari import register_envs
 from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages
 from rl2.sequence_model import RecurrentSequenceModel
 from rl2.shape_checker import ShapeChecker
+
+if TYPE_CHECKING:
+    from rl2.atari_eval import TrainingScores
 
 type Array = jax.Array | NDArray[Any]
 type RecurrentCarry = LSTMStackCarry | GatedDeltaNet2StackCarry | Mamba3StackCarry
@@ -167,6 +170,7 @@ class TrainingProgress(NamedTuple):
     completed_episodes: int
     recent_returns: tuple[float, ...]
     recent_lengths: tuple[int, ...]
+    training_return_sum: float | None = None
 
 
 def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
@@ -217,6 +221,7 @@ def save_checkpoint(
                     "completed_episodes": progress.completed_episodes,
                     "recent_returns": list(progress.recent_returns),
                     "recent_lengths": list(progress.recent_lengths),
+                    "training_return_sum": progress.training_return_sum,
                     "numpy_rng": rng.bit_generator.state,
                 }
             ),
@@ -259,6 +264,7 @@ def restore_checkpoint(
         metadata["completed_episodes"],
         tuple(metadata["recent_returns"]),
         tuple(metadata["recent_lengths"]),
+        metadata.get("training_return_sum"),
     )
 
 
@@ -553,18 +559,35 @@ def log_video(
         env.close()
 
 
-def log_evaluation(state: TrainState, config: Config, writer: SummaryWriter, episode: int, steps: int) -> None:
+def log_evaluation(
+    state: TrainState,
+    config: Config,
+    writer: SummaryWriter,
+    episode: int,
+    steps: int,
+    *,
+    training_scores: "TrainingScores | None" = None,
+) -> None:
     """Evaluate the current policy and save scores plus the complete report to TensorBoard."""
     # Local import: atari_eval reuses PPO's observation wrapper and recurrent types.
     from rl2.atari_eval import EvaluationConfig, evaluate
 
     print(f"Evaluating {config.eval_episodes} games after {episode} training episodes", flush=True)
     started = monotonic()
-    result = evaluate(state, config, EvaluationConfig(episodes=config.eval_episodes, seed=config.eval_seed))
+    result = evaluate(
+        state,
+        config,
+        EvaluationConfig(episodes=config.eval_episodes, seed=config.eval_seed),
+        training_scores=training_scores,
+    )
     for name in ("return_mean", "return_median", "return_std", "return_sem", "human_normalized_score_percent"):
         if result[name] is not None:
             writer.add_scalar(f"eval/{name}", result[name], steps)
     writer.add_scalar("eval/training_episodes", episode, steps)
+    if result["training_scores"] is not None:
+        for name, score in result["training_scores"].items():
+            if score is not None:
+                writer.add_scalar(f"training/{name}", score, steps)
     writer.add_scalar("time/evaluation_seconds", monotonic() - started, steps)
     result["training_steps"] = steps
     result["training_episodes"] = episode
@@ -671,6 +694,8 @@ def update(
 
 
 def train(config: Config) -> TrainState:
+    from rl2.atari_eval import TrainingScores
+
     configure_compilation_cache()
     batch_size = config.num_envs * config.num_steps
     if min(config.num_envs, config.num_steps, config.num_minibatches, config.update_epochs) < 1:
@@ -750,8 +775,11 @@ def train(config: Config) -> TrainState:
         recent_returns: deque[float] = deque(maxlen=100)
         recent_lengths: deque[int] = deque(maxlen=100)
         completed_episodes = 0
+        training_return_sum: float | None = 0.0
         if progress is not None:
-            state, key, start_iteration, completed_episodes, saved_returns, saved_lengths = progress
+            state, key, start_iteration, completed_episodes, saved_returns, saved_lengths, training_return_sum = (
+                progress
+            )
             recent_returns.extend(saved_returns)
             recent_lengths.extend(saved_lengths)
             # Gym environments and wrappers are not serialized. Start fresh episodes
@@ -831,6 +859,8 @@ def train(config: Config) -> TrainState:
                 episode_returns += reward
                 episode_lengths += 1
                 recent_returns.extend(episode_returns[dones[t]])
+                if training_return_sum is not None:
+                    training_return_sum += float(episode_returns[dones[t]].sum())
                 recent_lengths.extend(episode_lengths[dones[t]])
                 completed_episodes += int(dones[t].sum())
                 episode_returns[dones[t]] = 0
@@ -917,12 +947,21 @@ def train(config: Config) -> TrainState:
                 writer.add_scalar(tag, float(scalar), steps)
             if recent_returns:
                 writer.add_scalar("charts/return_mean_100", float(np.mean(recent_returns)), steps)
+                if training_return_sum is not None:
+                    writer.add_scalar("charts/return_mean", training_return_sum / completed_episodes, steps)
                 writer.add_scalar("charts/episode_length_mean_100", float(np.mean(recent_lengths)), steps)
             while config.video_every_episodes and completed_episodes >= next_video_episode:
                 log_video(state, config, writer, next_video_episode, steps)
                 next_video_episode += config.video_every_episodes
             if eval_interval_seconds and (iteration + 1 == num_iterations or monotonic() >= next_eval_time):
-                log_evaluation(state, config, writer, completed_episodes, steps)
+                log_evaluation(
+                    state,
+                    config,
+                    writer,
+                    completed_episodes,
+                    steps,
+                    training_scores=TrainingScores(completed_episodes, training_return_sum),
+                )
                 # Restart after evaluation so long evaluations never cause catch-up runs.
                 next_eval_time = monotonic() + eval_interval_seconds
             # Estimate from this session's completed rollouts, including evaluation/video overhead.
@@ -955,6 +994,7 @@ def train(config: Config) -> TrainState:
                         completed_episodes,
                         tuple(float(v) for v in recent_returns),
                         tuple(int(v) for v in recent_lengths),
+                        training_return_sum,
                     ),
                     rng,
                     config,
