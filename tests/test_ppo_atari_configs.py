@@ -49,7 +49,7 @@ def test_atari_game_configs_match_base_settings() -> None:
         assert config.run_id == f"ppo_atari_ALE_{game}-v5"
         assert config.run_id not in run_ids
         run_ids.add(config.run_id)
-        assert config.log_dir == f"gs://cohere-dev/vlad/rl2/{config.run_id}"
+        assert config.log_dir == f"gs://cohere-dev/vlad/rl2/ppo/{config.run_id}"
         assert replace(config, env_id=base.env_id, run_id=base.run_id, log_dir=base.log_dir) == base
 
 
