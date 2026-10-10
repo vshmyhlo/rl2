@@ -17,15 +17,13 @@ import numpy as np
 import pgx
 
 from rl2.alphazero.config import Config
-from rl2.alphazero.model import PolicyValueNet
-from rl2.alphazero.search import Parameters, masked_logits, recurrent_step
-from rl2.shape_checker import ShapeChecker
+from rl2.alphazero.model import Parameters, PolicyValueNet
+from rl2.alphazero.search import PolicyValueFn, recurrent_step
+from rl2.alphazero.utils import masked_logits
 
 
 def make_opening(key: jax.Array, *, env: pgx.Env, moves: int) -> pgx.State:
     """Generate a live opening; reject moves that would end the game."""
-    sc = ShapeChecker(K=2)
-    sc.check(key, "K", jnp.uint32)
     init_key, move_key = jax.random.split(key)
     state = env.init(init_key)
 
@@ -55,10 +53,12 @@ def play_game(
     max_moves: int,
 ) -> tuple[jax.Array, jax.Array]:
     """Return scalar candidate reward and termination flag; false means unfinished."""
-    sc = ShapeChecker(K=2, P=2)
-    sc.check(key, "K", jnp.uint32)
-    sc.check([state.current_player, candidate_player], "", jnp.int32)
-    recurrent_fn = partial(recurrent_step, env=env, model=model)
+
+    def recurrent_fn(
+        model: PolicyValueFn, _key: jax.Array, actions: jax.Array, states: pgx.State
+    ) -> tuple[mctx.RecurrentFnOutput, pgx.State]:
+        # Mctx requires a PRNG key even for deterministic transitions.
+        return recurrent_step(model, actions, states, env=env)
 
     def ongoing(carry: tuple[pgx.State, jax.Array]) -> jax.Array:
         state, move = carry
@@ -71,17 +71,18 @@ def play_game(
             return jnp.where(state.current_player == candidate_player, candidate, opponent)
 
         params = jax.tree.map(choose, candidate_params, opponent_params)
+        predict = partial(model.apply, {"params": params})
 
         def add_batch(x: jax.Array) -> jax.Array:
             return x[None]
 
         states = jax.tree.map(add_batch, state)
-        logits, value = model.apply({"params": params}, states.observation)
+        logits, value = predict(states.observation)
         root = mctx.RootFnOutput(
             prior_logits=masked_logits(logits, states.legal_action_mask), value=value, embedding=states
         )
         policy = mctx.muzero_policy(
-            params,
+            predict,
             jax.random.fold_in(key, move),
             root,
             recurrent_fn,
@@ -90,18 +91,13 @@ def play_game(
             dirichlet_fraction=0.0,
             temperature=0.0,
         )
-        step_sc = ShapeChecker(B=1, A=env.num_actions)
-        step_sc.check(policy.action_weights, "BA", jnp.float32)
         # Explicit argmax avoids random tie breaking in the policy's sampled action.
         weights = jnp.where(states.legal_action_mask, policy.action_weights, -jnp.inf)
         action = jnp.argmax(weights[0]).astype(jnp.int32)
         return env.step(state, action), move + 1
 
     final, _ = jax.lax.while_loop(ongoing, advance, (state, jnp.int32(0)))
-    sc.check(final.rewards, "P", jnp.float32)
-    sc.check(final.terminated, "", jnp.bool_)
     reward = final.rewards[candidate_player]
-    sc.check(reward, "", jnp.float32)
     return reward, final.terminated
 
 
@@ -116,13 +112,9 @@ def evaluate_batch(
     config: Config,
 ) -> tuple[jax.Array, jax.Array]:
     """Return rewards and termination flags of shape (openings, 2), one per color."""
-    sc = ShapeChecker(C=2)
-    sc.check(opening_ids, "N", jnp.int32)
     seed = jax.random.PRNGKey(config.evaluation.seed)
 
     def play_pair(opening_id: jax.Array) -> tuple[jax.Array, jax.Array]:
-        pair_sc = ShapeChecker(C=2)
-        pair_sc.check(opening_id, "", jnp.int32)
         opening_key, search_key = jax.random.split(jax.random.fold_in(seed, opening_id))
         state = make_opening(opening_key, env=env, moves=config.evaluation.opening_moves)
         game = partial(
@@ -139,13 +131,9 @@ def evaluate_batch(
         # PGX player IDs may be randomly assigned to colors. Using both IDs
         # on the identical state guarantees that the agents swap colors.
         rewards, terminated = jax.vmap(game)(jnp.arange(2, dtype=jnp.int32))
-        pair_sc.check(rewards, "C", jnp.float32)
-        pair_sc.check(terminated, "C", jnp.bool_)
         return rewards, terminated
 
     rewards, terminated = jax.vmap(play_pair)(opening_ids)
-    sc.check(rewards, "NC", jnp.float32)
-    sc.check(terminated, "NC", jnp.bool_)
     return rewards, terminated
 
 
@@ -157,9 +145,6 @@ def summarize_matches(rewards: jax.Array, terminated: jax.Array) -> dict[str, fl
     sampled openings, not strength against other opponents or opening distributions.
     No score/rates are emitted when no game finished; counts and bounds still are.
     """
-    sc = ShapeChecker(C=2)
-    sc.check(rewards, "NC", jnp.float32)
-    sc.check(terminated, "NC", jnp.bool_)
     chex.assert_scalar_positive(rewards.shape[0])
     values, finished = np.asarray(rewards), np.asarray(terminated)
     wins = int(((values > 0) & finished).sum())

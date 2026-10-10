@@ -1,10 +1,12 @@
 """Residual policy and value network for AlphaZero."""
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from rl2.shape_checker import ShapeChecker
+type Parameters = dict[str, Any]
 
 
 class PolicyValueNet(nn.Module):
@@ -26,18 +28,13 @@ class PolicyValueNet(nn.Module):
         """
         # PGX chess observations are floats; tic-tac-toe observations are bools.
         observation = observation.astype(jnp.float32)
-        sc = ShapeChecker(A=self.num_actions, D=self.channels)
-        sc.check(observation, "BHWC", jnp.float32)
         x = nn.relu(nn.Conv(self.channels, (3, 3))(observation))
         for _ in range(self.num_blocks):
             residual = x
             x = nn.relu(nn.LayerNorm()(nn.Conv(self.channels, (3, 3))(x)))
             x = nn.relu(residual + nn.LayerNorm()(nn.Conv(self.channels, (3, 3))(x)))
-        sc.check(x, "BHWD", jnp.float32)
         policy = nn.relu(nn.Conv(2, (1, 1))(x)).reshape((x.shape[0], -1))
         logits = nn.Dense(self.num_actions)(policy)
         value = nn.relu(nn.Conv(1, (1, 1))(x)).reshape((x.shape[0], -1))
         value = jnp.tanh(nn.Dense(1)(nn.relu(nn.Dense(self.channels)(value))))[:, 0]
-        sc.check(logits, "BA", jnp.float32)
-        sc.check(value, "B", jnp.float32)
         return logits, value

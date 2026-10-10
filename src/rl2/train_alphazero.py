@@ -92,10 +92,9 @@ from rl2.alphazero.checkpoints import TrainingProgress, checkpoint_manager, rest
 from rl2.alphazero.config import Config, load_config
 from rl2.alphazero.evaluation import evaluate
 from rl2.alphazero.model import Parameters, PolicyValueNet
-from rl2.alphazero.search import recurrent_step
+from rl2.alphazero.search import PolicyValueFn, recurrent_step
 from rl2.alphazero.utils import masked_logits
 from rl2.configuration import resolve_settings
-from rl2.shape_checker import ShapeChecker
 
 logger = logging.getLogger(__name__)
 
@@ -110,28 +109,14 @@ class Batch:
     policy_mask: jax.Array
     value_mask: jax.Array
 
-    def validate(self) -> None:
-        sc = ShapeChecker()
-        sc.check(self.observations, "BHWC", jnp.float32)
-        sc.check(self.policy_targets, "BA", jnp.float32)
-        sc.check(self.value_targets, "B", jnp.float32)
-        sc.check([self.policy_mask, self.value_mask], "B", jnp.bool_)
-
 
 def outcome_targets(
     players: jax.Array, valid: jax.Array, rewards: jax.Array, terminated: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
     """One game per column: map its final rewards to each recorded actor."""
-    sc = ShapeChecker(P=2)
-    sc.check(players, "TB", jnp.int32)
-    sc.check(valid, "TB", jnp.bool_)
-    sc.check(rewards, "BP", jnp.float32)
-    sc.check(terminated, "B", jnp.bool_)
     targets = rewards[jnp.arange(players.shape[1])[None, :], players]
     mask = valid & terminated[None, :]
     targets = jnp.where(mask, targets, 0.0)
-    sc.check(targets, "TB", jnp.float32)
-    sc.check(mask, "TB", jnp.bool_)
     return targets, mask
 
 
@@ -140,20 +125,20 @@ def collect_selfplay(
     params: Parameters, key: jax.Array, *, env: pgx.Env, model: PolicyValueNet, config: Config
 ) -> tuple[Batch, Metrics]:
     """Collect one fixed-length, terminal-padded game per environment."""
-    sc = ShapeChecker(K=2)
-    sc.check(key, "K", jnp.uint32)
     init_key, play_key = jax.random.split(key)
     states = jax.vmap(env.init)(jax.random.split(init_key, config.num_envs))
     predict = partial(model.apply, {"params": params})
-    recurrent_fn = partial(recurrent_step, env=env)
+
+    def recurrent_fn(
+        model: PolicyValueFn, _key: jax.Array, actions: jax.Array, states: pgx.State
+    ) -> tuple[mctx.RecurrentFnOutput, pgx.State]:
+        # Mctx requires a PRNG key even for deterministic transitions.
+        return recurrent_step(model, actions, states, env=env)
 
     def step(
         states: pgx.State, inputs: tuple[jax.Array, jax.Array]
     ) -> tuple[pgx.State, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
         key, move = inputs
-        step_sc = ShapeChecker(K=2, B=config.num_envs, A=env.num_actions)
-        step_sc.check(key, "K", jnp.uint32)
-        step_sc.check(move, "", jnp.int32)
         logits, value = predict(states.observation)
         done = states.terminated | states.truncated
         root = mctx.RootFnOutput(
@@ -174,8 +159,6 @@ def collect_selfplay(
             dirichlet_fraction=config.dirichlet_fraction,
             temperature=jnp.where(move < config.exploration_moves, 1.0, 0.0),
         )
-        step_sc.check(policy.action, "B", jnp.int32)
-        step_sc.check(policy.action_weights, "BA", jnp.float32)
         next_states = jax.vmap(env.step)(states, policy.action)
 
         def preserve_finished(old: jax.Array, new: jax.Array) -> jax.Array:
@@ -202,7 +185,6 @@ def collect_selfplay(
         valid.reshape(size),
         value_mask.reshape(size),
     )
-    batch.validate()
     return batch, {
         "completed_games": states.terminated.sum(),
         "positions": valid.sum(),
@@ -211,17 +193,12 @@ def collect_selfplay(
 
 
 def loss_fn(params: Parameters, model: PolicyValueNet, batch: Batch) -> tuple[jax.Array, Metrics]:
-    batch.validate()
     logits, values = model.apply({"params": params}, batch.observations)
-    sc = ShapeChecker()
-    sc.check([logits, batch.policy_targets], "BA", jnp.float32)
-    sc.check([values, batch.value_targets], "B", jnp.float32)
     policy_errors = optax.softmax_cross_entropy(logits, batch.policy_targets)
     value_errors = jnp.square(values - batch.value_targets)
     policy_loss = jnp.where(batch.policy_mask, policy_errors, 0.0).sum() / jnp.maximum(batch.policy_mask.sum(), 1)
     value_loss = jnp.where(batch.value_mask, value_errors, 0.0).sum() / jnp.maximum(batch.value_mask.sum(), 1)
     loss = policy_loss + value_loss
-    sc.check([loss, policy_loss, value_loss], "", jnp.float32)
     return loss, {"loss": loss, "policy_loss": policy_loss, "value_loss": value_loss}
 
 
@@ -234,26 +211,18 @@ def train_step(state: TrainState, batch: Batch, *, model: PolicyValueNet) -> tup
 @partial(jax.jit, static_argnames=("batch_size",))
 def sample_batch(batch: Batch, key: jax.Array, batch_size: int) -> Batch:
     """Sample real positions uniformly with replacement; at least one must exist."""
-    batch.validate()
-    sc = ShapeChecker(K=2, N=batch_size)
-    sc.check(key, "K", jnp.uint32)
     sampling_logits = jnp.where(batch.policy_mask, 0.0, -jnp.inf)
     indices = jax.random.categorical(key, sampling_logits, shape=(batch_size,))
-    sc.check(indices, "N", jnp.int32)
 
     def select(x: jax.Array) -> jax.Array:
         return x[indices]
 
-    sampled = jax.tree.map(select, batch)
-    sampled.validate()
-    return sampled
+    return jax.tree.map(select, batch)
 
 
 def train(config: Config) -> TrainState:
     settings = resolve_settings(asdict(config))
     config = replace(config, run_id=settings["run_id"], log_dir=settings["log_dir"])
-    run_name = config.run_id
-    run_dir = config.log_dir
     env = pgx.make(config.env_id)
     model = PolicyValueNet(env.num_actions, config.model.channels, config.model.num_blocks)
     key, init_key, env_key = jax.random.split(jax.random.PRNGKey(config.seed), 3)
@@ -268,9 +237,9 @@ def train(config: Config) -> TrainState:
         ),
     )
     with (
-        checkpoint_manager(run_dir) as manager,
+        checkpoint_manager(config.log_dir) as manager,
         SummaryWriter(
-            logdir=run_dir,
+            logdir=config.log_dir,
             purge_step=(
                 progress.steps + 1 if (progress := restore_checkpoint(manager, state, config)) is not None else None
             ),
@@ -285,8 +254,8 @@ def train(config: Config) -> TrainState:
         writer.add_text("devices", str(jax.devices()), steps)
         parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
         writer.add_scalar("model/params_millions", parameter_count / 1_000_000, steps)
-        logger.info("Run ID: %s", run_name)
-        logger.info("TensorBoard run: %s", run_dir)
+        logger.info("Run ID: %s", config.run_id)
+        logger.info("TensorBoard run: %s", config.log_dir)
         if progress is not None:
             logger.info("Resumed iteration %d, step %d", start_iteration, steps)
         start = monotonic()
@@ -301,24 +270,20 @@ def train(config: Config) -> TrainState:
             iteration_start = monotonic()
             key, play_key = jax.random.split(key)
             batch, rollout_metrics = collect_selfplay(state.params, play_key, env=env, model=model, config=config)
-            losses: dict[str, float] = {}
             for _ in range(config.updates_per_iteration):
                 key, sample_key = jax.random.split(key)
                 minibatch = sample_batch(batch, sample_key, config.batch_size)
                 state, metrics = train_step(state, minibatch, model=model)
                 for name, value in metrics.items():
-                    losses[name] = losses.get(name, 0.0) + float(value) / config.updates_per_iteration
+                    window_losses[name] = window_losses.get(name, 0.0) + float(value) / config.updates_per_iteration
             rollout = {name: float(value) for name, value in rollout_metrics.items()}
             # Use actual played positions as the x-axis, excluding terminal padding.
             steps += int(rollout["positions"])
             completed_games += int(rollout["completed_games"])
-            seconds = monotonic() - iteration_start
+            window_iteration_seconds += monotonic() - iteration_start
             window_iterations += 1
-            for name, value in losses.items():
-                window_losses[name] = window_losses.get(name, 0.0) + value
             for name, value in rollout.items():
                 window_rollout[name] = window_rollout.get(name, 0.0) + value
-            window_iteration_seconds += seconds
             now = monotonic()
             window_seconds = now - window_start
             if window_seconds >= config.log_interval_seconds or iteration + 1 == config.iterations:

@@ -20,7 +20,6 @@ class PolicyValueFn(Protocol):
 
 def recurrent_step(
     model: PolicyValueFn,
-    key: jax.Array,
     actions: jax.Array,
     states: pgx.State,
     *,
@@ -31,7 +30,6 @@ def recurrent_step(
     Args:
         model: Bound observation-to-(logits, value) callable, forwarded through
             Mctx's params argument. Values use the player-to-move perspective.
-        key: (2,) uint32 PRNG key; unused for these deterministic transitions.
         actions: (B,) int32 action IDs.
         states: (B, ...) array leaves forming a batched PGX state pytree.
         env: Game rules and action/observation encodings.
