@@ -9,13 +9,11 @@ from typing import Any, Literal, NamedTuple
 os.environ.setdefault("EPATH_USE_TF", "0")
 
 import jax
-import jax.numpy as jnp
 import orbax.checkpoint as ocp
 from flax.training.train_state import TrainState
 from pydantic import BaseModel, ConfigDict, NonNegativeInt
 
 from rl2.alphazero.config import Config
-from rl2.shape_checker import ShapeChecker
 
 
 class TrainingProgress(NamedTuple):
@@ -53,8 +51,6 @@ def checkpoint_settings(config: Config) -> dict[str, Any]:
 
 def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, config: Config) -> None:
     """Save weights, optimizer, RNG, and counters after a complete iteration."""
-    sc = ShapeChecker(K=2)
-    sc.check(progress.key, "K", jnp.uint32)
     metadata = CheckpointMetadata(
         config=checkpoint_settings(config),
         iteration=progress.iteration,
@@ -87,8 +83,6 @@ def restore_checkpoint(manager: ocp.CheckpointManager, state: TrainState, config
             state=ocp.args.StandardRestore({"train_state": state, "key": jax.random.PRNGKey(config.seed)})
         ),
     ).state
-    sc = ShapeChecker(K=2)
-    sc.check(restored["key"], "K", jnp.uint32)
     return TrainingProgress(
         restored["train_state"], restored["key"], iteration, metadata.steps, metadata.completed_games
     )

@@ -11,7 +11,6 @@ from flax import linen as nn
 from numpy.typing import NDArray
 
 from rl2.resize_conv import ResizeConv
-from rl2.shape_checker import ShapeChecker
 
 
 @dataclass(frozen=True)
@@ -93,8 +92,6 @@ class ConvObservationStage(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        sc = ShapeChecker(C=self.channels)
-        sc.check(x, "BHWI", self.dtype)
         chex.assert_type((self.channels, self.blocks), int)
         chex.assert_scalar_positive(self.channels)
         chex.assert_scalar_non_negative(self.blocks)
@@ -105,10 +102,8 @@ class ConvObservationStage(nn.Module):
             kernel_size=self.kernel_size,
             name="resize_conv",
         )(x)
-        sc.check(x, "BhwC", self.dtype)
         for block in range(self.blocks):
             x = ResidualBlock(self.channels, dtype=self.dtype, name=f"block_{block}")(x)
-        sc.check(x, "BhwC", self.dtype)
         return x
 
 
@@ -129,8 +124,6 @@ class ConvObservationEncoder(nn.Module):
 
     @nn.compact
     def __call__(self, obs: jax.Array | NDArray[np.uint8]) -> jax.Array:
-        sc = ShapeChecker(C=3, E=self.embedding_size)
-        sc.check(obs, "BFHWC" if obs.ndim == 5 else "BFHW", jnp.uint8)
         validate_stages(self.stages)
         chex.assert_type(self.embedding_size, int)
         chex.assert_scalar_positive(self.embedding_size)
@@ -166,12 +159,9 @@ class ConvObservationEncoder(nn.Module):
                 dtype=self.dtype,
                 name=f"stage_{index}",
             )(x)
-            stage_sc = ShapeChecker(B=obs.shape[0], H=spatial_shape[0], W=spatial_shape[1], C=stage.channels)
-            stage_sc.check(x, "BHWC", self.dtype)
         # Keep the remaining spatial positions distinct in the projection.
         x = nn.Dense(self.embedding_size, kernel_init=visual_init, dtype=self.dtype)(
             x.reshape((x.shape[0], math.prod(x.shape[1:])))
         )
         x = nn.silu(nn.LayerNorm(name="shared_norm", dtype=self.dtype)(x))
-        sc.check(x, "BE", self.dtype)
         return x

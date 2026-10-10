@@ -1,6 +1,6 @@
 env_id: ALE/SpaceInvaders-v5
 observation_size: null # Keep the 84x84 output from Atari preprocessing; no second resize
-frame_stack: false # Mamba maintains history; false uses a single frame
+frame_stack: false # Recurrent model maintains history; false uses a single frame
 atari_preprocessing: true # 84x84, action repeat 4, max pooling, and random reset no-ops
 grayscale_obs: false # Preserve RGB channels for real and imagined observations
 seed: 1
@@ -8,16 +8,17 @@ total_steps: 50000000 # Agent transitions (~20M emulator frames); ~9,766 updates
 num_envs: 8 # 512 fresh transitions per update
 vector_env: async # Spawned environment subprocesses
 num_steps: 64 # Training transitions per sequence; recurrent memory carries across rollout chunks
-d_model: 576 # World-model width; actual parameter count is logged
-num_layers: 4 # Independent Mamba blocks, each with its own recurrent carry
-d_intermediate: null # SwiGLU width: null uses int(8*d_model/3), rounded up to 128; 0 disables the MLP
+model: lstm # Opt in to the LSTM stack; omitted defaults to mamba
+d_model: 512 # World-model width and LSTM hidden size; actual parameter count is logged
+num_layers: 4 # Recurrent layers, each with its own carry
+d_intermediate: 0 # SwiGLU width; 0 disables it. null: disabled for LSTM, automatic width for Mamba
 encoder_stages: # 84 -> 42 -> 21 -> 11 -> 6 spatial sizes; decoder mirrors these stages
   - { channels: 32, blocks: 2 }
   - { channels: 64, blocks: 2 }
   - { channels: 128, blocks: 2 }
   - { channels: 256, blocks: 2 }
-d_state: 128 # Mamba state width; even and at least 4
-headdim: 64 # Must divide 2 * d_model
+d_state: 128 # Mamba only: state width; even and at least 4
+headdim: 64 # Mamba only: must divide 2 * d_model
 stochastic_size: 32 # Number of categorical latent variables
 stochastic_classes: 32 # Classes per latent variable; sampled once per state
 unimix: 0.01 # Uniform probability mixture for prior and posterior

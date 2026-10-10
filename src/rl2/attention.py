@@ -12,8 +12,6 @@ import chex
 import jax
 import jax.numpy as jnp
 
-from rl2.shape_checker import ShapeChecker
-
 __all__ = ["AttentionState", "AttentionType", "attention"]
 
 type AttentionType = Literal["xla", "cudnn"]
@@ -26,14 +24,9 @@ def _positive_integer(value: int, name: str) -> None:
 
 def _check_range(values: jax.Array, maximum: int, message: str) -> None:
     """Reject out-of-range counts eagerly and inside compiled calls."""
-    sc = ShapeChecker()
-    sc.check(values, "B", jnp.int32)
     invalid = jnp.any((values < 0) | (values > maximum))
-    sc.check(invalid, "", jnp.bool_)
 
     def fail_if_invalid(value: jax.Array) -> None:
-        sc = ShapeChecker()
-        sc.check(value, "", jnp.bool_)
         if bool(value):
             raise ValueError(message)
 
@@ -52,10 +45,7 @@ def _check_range(values: jax.Array, maximum: int, message: str) -> None:
 
 def _rope(x: jax.Array, positions: jax.Array, theta: float) -> jax.Array:
     """Rotate [batch,time,heads,head_dim] using [batch,time] positions."""
-    sc = ShapeChecker(U=1)
-    sc.check(x, "BTHF")
     chex.assert_type(x, jnp.floating)
-    sc.check(positions, "BT", jnp.int32)
     chex.assert_is_divisible(x.shape[-1], 2)
     chex.assert_scalar_positive(theta)
     half = x.shape[-1] // 2
@@ -66,14 +56,8 @@ def _rope(x: jax.Array, positions: jax.Array, theta: float) -> jax.Array:
     angles = positions.astype(jnp.float32)[..., None, None] * frequencies
     real, imag = x[..., ::2].astype(jnp.float32), x[..., 1::2].astype(jnp.float32)
     cos, sin = jnp.cos(angles), jnp.sin(angles)
-    sc.check(frequencies, "R", jnp.float32)
-    sc.check(angles, "BTUR", jnp.float32)
-    sc.check((real, imag), "BTHR", jnp.float32)
-    sc.check((cos, sin), "BTUR", jnp.float32)
     pairs = jnp.stack((real * cos - imag * sin, imag * cos + real * sin), axis=-1)
-    sc.check(pairs, "BTHRP", jnp.float32)
     rotated = pairs.reshape(x.shape).astype(x.dtype)
-    sc.check(rotated, "BTHF", x.dtype)
     return rotated
 
 
@@ -156,10 +140,7 @@ def attention(
     Return the updated carry tuple and [batch,time,query_heads,head_dim] output.
     """
     dtype = query.dtype
-    sc = ShapeChecker(C=max_seq_len, U=1)
-    sc.check(query, "BTHF", dtype)
     chex.assert_type(query, jnp.floating)
-    sc.check((key, value), "BTKF", dtype)
     batch, steps, num_heads, head_dim = query.shape
     kv_heads = key.shape[2]
     _positive_integer(batch, "batch_size")
@@ -176,32 +157,25 @@ def attention(
     )
     fresh = carry is None
     if bias is not None:
-        sc.check(bias, "BHTT" if fresh else "BHTC")
         chex.assert_type(bias, jnp.floating)
     if carry is None:
         carry = (
-            jnp.zeros(sc["BCKF"], dtype),
-            jnp.zeros(sc["BCKF"], dtype),
-            jnp.zeros(sc["B"], jnp.int32),
+            jnp.zeros((batch, max_seq_len, kv_heads, head_dim), dtype),
+            jnp.zeros((batch, max_seq_len, kv_heads, head_dim), dtype),
+            jnp.zeros((batch,), jnp.int32),
         )
     cache_key, cache_value, cache_position = carry
-    sc.check((cache_key, cache_value), "BCKF", dtype)
-    sc.check(cache_position, "B", jnp.int32)
     native_attention = fresh and x_len is None and bias is None
     if x_len is None:
-        x_len = jnp.full(sc["B"], steps, jnp.int32)
-    sc.check(x_len, "B", jnp.int32)
+        x_len = jnp.full((batch,), steps, jnp.int32)
     _check_range(x_len, steps, "x_len must be between 0 and the input sequence length")
     _check_range(cache_position, max_seq_len, "Invalid cache position for max_seq_len cache capacity")
     next_position = cache_position + x_len
-    sc.check(next_position, "B", jnp.int32)
     _check_range(next_position, max_seq_len, "Sequence exceeds max_seq_len cache capacity")
 
     index = jnp.arange(steps, dtype=jnp.int32)[None, :]
     valid_tokens = index < x_len[:, None]
     positions = jnp.where(valid_tokens, cache_position[:, None] + index, 0)
-    sc.check(valid_tokens, "BT", jnp.bool_)
-    sc.check(positions, "BT", jnp.int32)
     query, key, value = (jnp.where(valid_tokens[..., None, None], v, 0) for v in (query, key, value))
     if use_rope:
         query, key = _rope(query, positions, rope_theta), _rope(key, positions, rope_theta)
@@ -209,19 +183,14 @@ def attention(
 
     # Append each valid prefix immediately after that example's cached history.
     source = slots - cache_position[:, None]
-    sc.check(source, "BC", jnp.int32)
     gather = jnp.clip(source, 0, steps - 1)[..., None, None]
     new_key, new_value = (jnp.take_along_axis(v, gather, axis=1) for v in (key, value))
-    sc.check((new_key, new_value), "BCKF", dtype)
     written = ((source >= 0) & (source < x_len[:, None]))[..., None, None]
-    sc.check(written, "BCUU", jnp.bool_)
     carry = (
         jnp.where(written, new_key, cache_key),
         jnp.where(written, new_value, cache_value),
         next_position,
     )
-    sc.check((carry[0], carry[1]), "BCKF", dtype)
-    sc.check(carry[2], "B", jnp.int32)
 
     mask = None
     if fresh:
@@ -230,7 +199,6 @@ def attention(
         kv_lengths = x_len
     else:
         key_valid = slots < next_position[:, None]
-        sc.check(key_valid, "BC", jnp.bool_)
         # Sanitize unused slots without changing the returned cache. Masking
         # alone would not isolate NaNs in these slots from attention gradients.
         keys, values = (jnp.where(key_valid[..., None, None], v, 0) for v in carry[:2])
@@ -240,15 +208,10 @@ def attention(
             # backend's zero-offset causal triangle would exclude history.
             # Invalid queries have position zero and can safely attend slot 0.
             mask = (positions[:, :, None] >= slots[:, None, :])[:, None]
-            sc.check(mask, "BUTC", jnp.bool_)
     if bias is not None:
-        sc.check((keys, values), "BSKF", dtype)
         key_valid = jnp.arange(keys.shape[1])[None, :] < kv_lengths[:, None]
-        sc.check(key_valid, "BS", jnp.bool_)
         bias_valid = valid_tokens[:, None, :, None] & key_valid[:, None, None, :]
-        sc.check(bias_valid, "BUTS", jnp.bool_)
         bias = jnp.where(bias_valid, bias, 0)
-        sc.check(bias, "BHTS")
     query_seq_lengths = key_value_seq_lengths = None
     if not native_attention:
         # Give empty examples one safe dummy query/key instead of an empty
@@ -256,7 +219,6 @@ def attention(
         # below, and only the original valid prefixes enter the returned cache.
         query_seq_lengths = jnp.maximum(x_len, 1)
         key_value_seq_lengths = jnp.maximum(kv_lengths, 1)
-        sc.check((query_seq_lengths, key_value_seq_lengths), "B", jnp.int32)
     queries = query
     if implementation == "cudnn" and (mask is not None or bias is not None):
         # cuDNN masked/biased backward requires even Q and KV lengths. Give
@@ -277,16 +239,9 @@ def attention(
     # JAX's F16_F16_F32 dot algorithm is unsupported on CPU. Keep
     # projections/cache in float16 but use portable float32 attention.
     attention_dtype = jnp.float32 if implementation == "xla" and jnp.dtype(dtype) == jnp.float16 else dtype
-    # Q/S may include cuDNN padding, independently of the chunk length T.
-    attention_sc = ShapeChecker(B=batch, H=num_heads, K=kv_heads, F=head_dim, U=1)
     queries, keys, values = (v.astype(attention_dtype) for v in (queries, keys, values))
-    attention_sc.check(queries, "BQHF", attention_dtype)
-    attention_sc.check((keys, values), "BSKF", attention_dtype)
-    if mask is not None:
-        attention_sc.check(mask, "BUQS", jnp.bool_)
     if bias is not None:
         bias = bias.astype(attention_dtype)
-        attention_sc.check(bias, "BHQS", attention_dtype)
     attended = jax.nn.dot_product_attention(
         queries,
         keys,
@@ -299,8 +254,6 @@ def attention(
         local_window_size=None,
         implementation=implementation,
     )
-    attention_sc.check(attended, "BQHF", attention_dtype)
     attended = jnp.where(valid_tokens[..., None, None], attended[:, :steps].astype(dtype), 0)
 
-    sc.check(attended, "BTHF", dtype)
     return carry, attended

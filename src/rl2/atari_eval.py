@@ -61,7 +61,6 @@ from rl2.atari_scores import REFERENCE_SOURCE, get_reference_scores
 from rl2.ppo import Array, AtariPreprocessing, Config, RecurrentCarry, initial_model_carry
 from rl2.ppo_rnd import Config as RNDConfig
 from rl2.ppo_rnd import LSTMCarry, initial_carry
-from rl2.shape_checker import ShapeChecker
 
 type EvaluationResult = dict[str, Any]
 type TrainingConfig = Config | RNDConfig
@@ -188,22 +187,15 @@ def _action(
     greedy: bool,
     sequence_policy: bool = False,
 ) -> tuple[jax.Array, EvaluationCarry]:
-    sc = ShapeChecker(T=1, B=1)
-    sc.check(obs, "FHW", jnp.uint8)
-    sc.check(jax.random.key_data(key), "K", jnp.uint32)
     starts = jnp.asarray([episode_start])
-    sc.check(starts, "B", jnp.bool_)
     if sequence_policy:
         # PPO-RND exposes only a time-major sequence call, with two value heads.
         carry, logits, _ = state.apply_fn({"params": state.params}, obs[None, None], carry, starts[None])
-        sc.check(logits, "TBA", jnp.float32)
         logits = logits[0]
     else:
         carry, logits, _ = state.apply_fn({"params": state.params}, obs[None], carry, starts, method="step")
-    sc.check(logits, "BA", jnp.float32)
     logits = logits[0]
     action = jnp.argmax(logits) if greedy else jax.random.categorical(key, logits)
-    sc.check(action, "")
     return action, carry
 
 
@@ -308,8 +300,6 @@ def evaluate(
         env.close()
 
     returns = np.asarray([episode["return"] for episode in episodes], dtype=np.float64)
-    sc = ShapeChecker(E=evaluation.episodes)
-    sc.check(returns, "E", np.float64)
     std = float(returns.std(ddof=1)) if len(returns) > 1 else None
     # Normalize tuples in either config so the in-memory report matches saved JSON.
     training_metadata = json.loads(json.dumps(asdict(training), allow_nan=False))

@@ -51,7 +51,6 @@ from rl2.mamba3 import Mamba3Stack, Mamba3StackCarry
 from rl2.multi_atari import register_envs
 from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages
 from rl2.sequence_model import RecurrentSequenceModel
-from rl2.shape_checker import ShapeChecker
 
 if TYPE_CHECKING:
     from rl2.atari_eval import TrainingScores
@@ -206,9 +205,7 @@ def save_checkpoint(
     manager: ocp.CheckpointManager, progress: TrainingProgress, rng: np.random.Generator, config: Config
 ) -> None:
     """Save a completed rollout; live environment state is deliberately restarted on resume."""
-    sc = ShapeChecker(K=2)
     key_data = jax.random.key_data(progress.key)
-    sc.check(key_data, "K", jnp.uint32)
     manager.save(
         progress.iteration,
         args=ocp.args.Composite(
@@ -254,8 +251,6 @@ def restore_checkpoint(
             )
         ),
     ).state
-    sc = ShapeChecker(K=2)
-    sc.check(restored["key"], "K", jnp.uint32)
     rng.bit_generator.state = metadata["numpy_rng"]
     return TrainingProgress(
         restored["train_state"],
@@ -367,27 +362,18 @@ class ActorCritic(nn.Module):
 
     def _encode(self, obs: Array) -> jax.Array:
         chex.assert_rank(obs, {4, 5})
-        sc = ShapeChecker(E=self.embedding_size)
-        sc.check(obs, "BFHW" if obs.ndim == 4 else "BFHWC", jnp.uint8)
         x = self.encoder(obs)
-        sc.check(x, "BE", self.dtype)
         x = self.recurrent_input(x).astype(self.dtype)
-        projection_sc = ShapeChecker(B=obs.shape[0], D=self.model.hidden_size)
-        projection_sc.check(x, "BD", self.dtype)
         return x
 
     def _heads(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
         # Flatten time and batch for sequence calls, keeping the same heads as step().
-        sc = ShapeChecker(A=self.num_actions)
         x = x.astype(self.dtype)
-        sc.check(x, "BD", self.dtype)
         policy = nn.relu(self.policy_norm(self.policy_hidden(x)))
         critic = nn.relu(self.value_norm(self.value_hidden(x)))
         # Heads use the compute dtype; float32 outputs keep PPO loss arithmetic precise.
         logits = self.policy_output(policy).astype(jnp.float32)
         values = self.value_output(critic).squeeze(-1).astype(jnp.float32)
-        sc.check(logits, "BA", jnp.float32)
-        sc.check(values, "B", jnp.float32)
         return logits, values
 
     def __call__(
@@ -398,21 +384,14 @@ class ActorCritic(nn.Module):
     ) -> tuple[RecurrentCarry, jax.Array, jax.Array]:
         """Process time-stacked observations [T,B,F,H,W,(C)] and reset masks [T,B]."""
         chex.assert_rank(obs, {5, 6})
-        sc = ShapeChecker(A=self.num_actions)
-        sc.check(obs, "TBFHW" if obs.ndim == 5 else "TBFHWC", jnp.uint8)
-        sc.check(episode_starts, "TB", jnp.bool_)
-        steps, environments = sc["TB"]
+        steps, environments = obs.shape[:2]
         x = self._encode(obs.reshape((-1, *obs.shape[2:])))
         x = x.reshape((steps, environments, -1))
         # Batch the CNN and heads across time; each backbone handles its recurrence.
-        sc.check(x, "TBI", self.dtype)
         carry, x = self.recurrent(x, carry, episode_starts)
-        sc.check(x, "TBD", self.dtype)
         logits, values = self._heads(x.reshape((steps * environments, -1)))
         logits = logits.reshape((steps, environments, self.num_actions))
         values = values.reshape((steps, environments))
-        sc.check(logits, "TBA", jnp.float32)
-        sc.check(values, "TB", jnp.float32)
         return carry, logits, values
 
     def step(
@@ -423,15 +402,9 @@ class ActorCritic(nn.Module):
     ) -> tuple[RecurrentCarry, jax.Array, jax.Array]:
         """Process one observation per environment [B,F,H,W,(C)] with reset masks [B]."""
         chex.assert_rank(obs, {4, 5})
-        sc = ShapeChecker(A=self.num_actions)
-        sc.check(obs, "BFHW" if obs.ndim == 4 else "BFHWC", jnp.uint8)
-        sc.check(episode_starts, "B", jnp.bool_)
         x = self._encode(obs)
         carry, x = self.recurrent.step(x, carry, episode_starts)
-        sc.check(x, "BD", self.dtype)
         logits, values = self._heads(x)
-        sc.check(logits, "BA", jnp.float32)
-        sc.check(values, "B", jnp.float32)
         return carry, logits, values
 
 
@@ -609,10 +582,6 @@ def gae(
     gae_lambda: float,
 ) -> tuple[jax.Array, jax.Array]:
     """Truncation bootstrap is already included in rewards; dones stop traces."""
-    sc = ShapeChecker()
-    sc.check([rewards, values], "TB", jnp.float32)
-    sc.check(dones, "TB", jnp.bool_)
-    sc.check(next_value, "B", jnp.float32)
 
     def step(
         carry: tuple[jax.Array, jax.Array],
@@ -632,7 +601,6 @@ def gae(
         reverse=True,
     )
     returns = advantages + values
-    sc.check([advantages, returns], "TB", jnp.float32)
     return advantages, returns
 
 
@@ -645,20 +613,11 @@ def explained_variance(values: Array, returns: Array) -> float:
 def update(
     state: TrainState, batch: PPOBatch, config: Config, iteration: int | jax.Array = 0
 ) -> tuple[TrainState, PPOMetrics]:
-    sc = ShapeChecker()
     iteration = jnp.asarray(iteration)
-    sc.check(iteration, "")
     chex.assert_type(iteration, int)
     entropy_coef = jnp.asarray(entropy_coef_schedule(config)(iteration), dtype=jnp.float32)
-    sc.check(entropy_coef, "", dtype=jnp.float32)
     obs, actions, old_log_probs, advantages, returns, carry, episode_starts = batch
-    # ActorCritic validates observations and recurrent memory. Match all loss
-    # tensors exactly so a stray singleton axis cannot silently broadcast.
-    batch_dims = "TB" if actions.ndim == 2 else "B"
-    sc.check(actions, batch_dims)
     chex.assert_type(actions, int)
-    sc.check([old_log_probs, advantages, returns], batch_dims, jnp.float32)
-    sc.check(episode_starts, batch_dims, jnp.bool_)
     chex.assert_scalar_positive(advantages.size)
     # Centering a single sample always gives zero and erases its policy gradient.
     if advantages.size > 1:
@@ -666,10 +625,7 @@ def update(
 
     def loss_fn(params: optax.Params) -> tuple[jax.Array, PPOMetrics]:
         _, logits, values = state.apply_fn({"params": params}, obs, carry, episode_starts)
-        sc.check(logits, batch_dims + "A", jnp.float32)
-        sc.check(values, batch_dims, jnp.float32)
         log_probs = action_log_prob(logits, actions)
-        sc.check(log_probs, batch_dims, jnp.float32)
         log_ratio = log_probs - old_log_probs
         ratio = jnp.exp(log_ratio)
         clipped = jnp.clip(ratio, 1 - config.clip_coef, 1 + config.clip_coef)
@@ -679,7 +635,6 @@ def update(
         loss = policy_loss + config.value_coef * value_loss - entropy_coef * entropy
         approx_kl = (jnp.expm1(log_ratio) - log_ratio).mean()
         clip_fraction = (jnp.abs(ratio - 1) > config.clip_coef).mean()
-        sc.check([loss, policy_loss, value_loss, entropy, approx_kl, clip_fraction], "", jnp.float32)
         return loss, (policy_loss, value_loss, entropy, approx_kl, clip_fraction)
 
     (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
@@ -960,7 +915,9 @@ def train(config: Config) -> TrainState:
                     writer,
                     completed_episodes,
                     steps,
-                    training_scores=TrainingScores(completed_episodes, training_return_sum),
+                    training_scores=TrainingScores(
+                        completed_episodes, training_return_sum, tuple(float(score) for score in recent_returns)
+                    ),
                 )
                 # Restart after evaluation so long evaluations never cause catch-up runs.
                 next_eval_time = monotonic() + eval_interval_seconds

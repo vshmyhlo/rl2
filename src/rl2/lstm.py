@@ -6,27 +6,20 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from rl2.sequence_model import RecurrentSequenceModel
-from rl2.shape_checker import ShapeChecker
 
 type LSTMCarry = tuple[jax.Array, jax.Array]
 type LSTMStackCarry = tuple[LSTMCarry, ...]
 
 
 def _sigmoid_float32(x: jax.Array) -> jax.Array:
-    sc = ShapeChecker()
-    sc.check(x, "BD")
     chex.assert_type(x, float)
     output = jax.nn.sigmoid(x.astype(jnp.float32))
-    sc.check(output, "BD", jnp.float32)
     return output
 
 
 def _tanh_float32(x: jax.Array) -> jax.Array:
-    sc = ShapeChecker()
-    sc.check(x, "BD")
     chex.assert_type(x, float)
     output = jnp.tanh(x.astype(jnp.float32))
-    sc.check(output, "BD", jnp.float32)
     return output
 
 
@@ -37,8 +30,6 @@ def initial_carry(num_envs: int, hidden_size: int) -> LSTMCarry:
         jnp.zeros((num_envs, hidden_size), dtype=jnp.float32),
         jnp.zeros((num_envs, hidden_size), dtype=jnp.float32),
     )
-    sc = ShapeChecker(B=num_envs, D=hidden_size)
-    sc.check(carry, "BD", jnp.float32)
     return carry
 
 
@@ -73,12 +64,8 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
         return initial_carry(num_envs, self.features)
 
     def __call__(self, x: jax.Array, carry: LSTMCarry, episode_starts: jax.Array) -> tuple[LSTMCarry, jax.Array]:
-        sc = ShapeChecker(D=self.features)
-        sc.check(x, "TBI", self.dtype)
-        sc.check(episode_starts, "TB", jnp.bool_)
-        for size in sc["TBI"]:
+        for size in x.shape:
             chex.assert_scalar_positive(size)
-        sc.check(carry, "BD", jnp.float32)
 
         def recurrent_step(
             model: LSTM, memory: LSTMCarry, inputs: tuple[jax.Array, jax.Array]
@@ -93,17 +80,11 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
             in_axes=0,
             out_axes=0,
         )(self, carry, (x, episode_starts))
-        sc.check(carry, "BD", jnp.float32)
-        sc.check(output, "TBD", self.dtype)
         return carry, output
 
     def step(self, x: jax.Array, carry: LSTMCarry, episode_starts: jax.Array) -> tuple[LSTMCarry, jax.Array]:
-        sc = ShapeChecker(D=self.features)
-        sc.check(x, "BI", self.dtype)
-        sc.check(episode_starts, "B", jnp.bool_)
-        for size in sc["BI"]:
+        for size in x.shape:
             chex.assert_scalar_positive(size)
-        sc.check(carry, "BD", jnp.float32)
         cell, hidden = carry
         carry = (
             jnp.where(episode_starts[:, None], 0, cell),
@@ -111,8 +92,6 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
         )
         carry, output = self.cell(carry, x)
         output = output.astype(self.dtype)
-        sc.check(carry, "BD", jnp.float32)
-        sc.check(output, "BD", self.dtype)
         return carry, output
 
 
@@ -147,15 +126,10 @@ class LSTMStack(nn.Module, RecurrentSequenceModel[LSTMStackCarry]):
         self, x: jax.Array, carry: LSTMStackCarry, episode_starts: jax.Array
     ) -> tuple[LSTMStackCarry, jax.Array]:
         self._validate_config()
-        sc = ShapeChecker(D=self.features, I=self.intermediate_size)
-        sc.check(x, "TBD", self.dtype)
-        sc.check(episode_starts, "TB", jnp.bool_)
-        for size in sc["TB"]:
+        for size in x.shape[:2]:
             chex.assert_scalar_positive(size)
         if len(carry) != self.num_layers:
             raise ValueError("carry must contain one LSTMCarry per layer")
-        for state in carry:
-            sc.check(state, "BD", jnp.float32)
 
         x = x.astype(jnp.float32)
         updated: list[LSTMCarry] = []
@@ -182,7 +156,6 @@ class LSTMStack(nn.Module, RecurrentSequenceModel[LSTMStackCarry]):
                     kernel_init=mlp_init,
                     name=f"mlp_up_{i}",
                 )(normalized)
-                sc.check([gate, value], "TBI", self.dtype)
                 hidden = nn.silu(gate) * value
                 mixed = nn.Dense(
                     self.features,
@@ -191,18 +164,11 @@ class LSTMStack(nn.Module, RecurrentSequenceModel[LSTMStackCarry]):
                     kernel_init=residual_init,
                     name=f"mlp_down_{i}",
                 )(hidden)
-                sc.check(mixed, "TBD", self.dtype)
                 x = x + mixed.astype(jnp.float32)
-            sc.check(x, "TBD", jnp.float32)
         output = nn.RMSNorm(epsilon=1e-5, dtype=self.dtype, name="final_norm")(x)
-        sc.check(output, "TBD", self.dtype)
         return tuple(updated), output
 
     def step(self, x: jax.Array, carry: LSTMStackCarry, episode_starts: jax.Array) -> tuple[LSTMStackCarry, jax.Array]:
-        sc = ShapeChecker(D=self.features)
-        sc.check(x, "BD", self.dtype)
-        sc.check(episode_starts, "B", jnp.bool_)
         carry, output = self(x[None], carry, episode_starts[None])
         output = output[0]
-        sc.check(output, "BD", self.dtype)
         return carry, output

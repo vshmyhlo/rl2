@@ -1,11 +1,11 @@
-"""Train a Mamba world model on Space Invaders with a uniform random policy.
+"""Train a Mamba or LSTM world model with a uniform random policy.
 
 Run with ``uv run python -m rl2.train_wm --config configs/train_wm_atari.yaml``.
 The convolutional encoder accepts uint8 frames and normalizes them internally;
 reconstruction targets use [0, 1] and rewards retain their environment scale.
 Each rollout receives one Adam update using
 posterior reconstruction, balanced categorical KL, reward MSE, and terminal
-binary cross entropy. Mamba history crosses chunks with truncated BPTT and
+binary cross entropy. Recurrent history crosses chunks with truncated BPTT and
 resets at episode boundaries. No policy is learned.
 """
 
@@ -35,7 +35,15 @@ from tensorboardX import SummaryWriter
 from rl2.jax_cache import configure_compilation_cache
 from rl2.observation_encoder import ConvStage, ConvStages, validate_stages
 from rl2.ppo import make_env
-from rl2.wm import MambaWorldModel, WorldModelState, categorical_entropy, categorical_kl, check_keys, latent_kl_losses
+from rl2.wm import (
+    LSTMWorldModel,
+    MambaWorldModel,
+    WorldModelState,
+    categorical_entropy,
+    categorical_kl,
+    check_keys,
+    latent_kl_losses,
+)
 
 ObservationLoss = Literal["l1", "l2", "charbonnier"]
 
@@ -78,6 +86,7 @@ class Config:
     bf16: bool = True
     observation_loss: ObservationLoss = "l2"
     charbonnier_epsilon: float = 1e-3
+    model: Literal["mamba", "lstm"] = "mamba"
 
     def __post_init__(self) -> None:
         for value in (
@@ -86,8 +95,6 @@ class Config:
             self.num_steps,
             self.d_model,
             self.num_layers,
-            self.d_state,
-            self.headdim,
             self.stochastic_size,
             self.stochastic_classes,
             self.log_every,
@@ -120,10 +127,16 @@ class Config:
         if self.vector_env not in ("sync", "async"):
             raise ValueError("vector_env must be 'sync' or 'async'")
         chex.assert_is_divisible(self.total_steps, self.num_envs)
-        chex.assert_is_divisible(2 * self.d_model, self.headdim)
-        chex.assert_is_divisible(self.d_state, 2)
-        if self.d_state < 4:
-            raise ValueError("d_state must be at least 4 for Mamba's default rotary fraction")
+        if self.model not in ("mamba", "lstm"):
+            raise ValueError("model must be 'mamba' or 'lstm'")
+        if self.model == "mamba":
+            for value in (self.d_state, self.headdim):
+                chex.assert_type(value, int)
+                chex.assert_scalar_positive(value)
+            chex.assert_is_divisible(2 * self.d_model, self.headdim)
+            chex.assert_is_divisible(self.d_state, 2)
+            if self.d_state < 4:
+                raise ValueError("d_state must be at least 4 for Mamba's default rotary fraction")
         chex.assert_type(self.seed, int)
         if not 0 <= self.seed < 2**32:
             raise ValueError("seed must be in [0, 2**32)")
@@ -158,7 +171,16 @@ def learning_rate_schedule(config: Config) -> optax.Schedule:
 
 @struct.dataclass
 class Batch:
-    """Time-major transitions; next_observations always precede any reset."""
+    """Time-major transitions; next_observations always precede any reset.
+
+    Attributes:
+        observations: (T, B, *image) uint8 current frames.
+        actions: (T, B) int32 action IDs.
+        next_observations: (T, B, *image) uint8 targets, including terminal frames.
+        rewards: (T, B) float32 incoming rewards.
+        terminated: (T, B) bool terminal labels, excluding truncation.
+        episode_starts: (T, B) bool masks resetting memory before each transition.
+    """
 
     observations: jax.Array
     actions: jax.Array
@@ -168,13 +190,10 @@ class Batch:
     episode_starts: jax.Array
 
     def validate(self) -> None:
-        chex.assert_scalar_positive(self.observations.ndim - 2)
-        chex.assert_equal_shape((self.observations, self.next_observations))
         chex.assert_type((self.observations, self.next_observations), jnp.uint8)
         leading = self.observations.shape[:2]
         for size in leading:
             chex.assert_scalar_positive(size)
-        chex.assert_shape((self.actions, self.rewards, self.terminated, self.episode_starts), leading)
         chex.assert_type(self.actions, jnp.int32)
         chex.assert_type(self.rewards, jnp.float32)
         chex.assert_type((self.terminated, self.episode_starts), jnp.bool_)
@@ -190,9 +209,7 @@ def collect_rollout(
     """Collect random transitions from environments with autoreset disabled."""
     chex.assert_type(num_steps, int)
     chex.assert_scalar_positive(num_steps)
-    chex.assert_shape(observation, (envs.num_envs, *envs.single_observation_space.shape))
     chex.assert_type(observation, np.uint8)
-    chex.assert_shape(episode_start, (envs.num_envs,))
     chex.assert_type(episode_start, np.bool_)
     if envs.autoreset_mode != gym.vector.AutoresetMode.DISABLED:
         raise ValueError("collect_rollout requires disabled autoreset to preserve terminal observations")
@@ -225,6 +242,9 @@ def validate_observation_loss(loss: ObservationLoss, epsilon: float) -> None:
     chex.assert_scalar_positive(epsilon)
     if not np.isfinite(epsilon):
         raise ValueError("charbonnier_epsilon must be finite")
+    limits = np.finfo(np.float32)
+    if not float(limits.tiny) <= epsilon <= float(limits.max):
+        raise ValueError("charbonnier_epsilon must be representable as a positive normal float32")
 
 
 def observation_reconstruction_loss(
@@ -236,19 +256,17 @@ def observation_reconstruction_loss(
     """Sum pixel/channel penalties per frame, then average time and batch.
 
     Args:
-        prediction: Floating predictions shaped [time, batch, *observation_shape].
-        target: Matching floating targets normalized to [0, 1].
+        prediction: (T, B, *observation_shape) floating predictions.
+        target: (T, B, *observation_shape) floating targets normalized to [0, 1].
         loss: 'l1' uses abs(error); 'l2' uses 0.5 * error**2, preserving the
             original Gaussian objective; 'charbonnier' uses
             sqrt(error**2 + epsilon**2) - epsilon (zero at a perfect match).
         epsilon: Positive Charbonnier smoothing scale in normalized pixel units.
 
     Returns:
-        Scalar float32 reconstruction loss, without clipping predictions.
+        () float32 reconstruction loss, without clipping predictions.
     """
-    chex.assert_equal_shape((prediction, target))
     chex.assert_type((prediction, target), jnp.floating)
-    chex.assert_scalar_positive(prediction.ndim - 2)
     validate_observation_loss(loss, epsilon)
     error = prediction.astype(jnp.float32) - target.astype(jnp.float32)
     if loss == "l1":
@@ -256,7 +274,13 @@ def observation_reconstruction_loss(
     elif loss == "l2":
         penalty = 0.5 * jnp.square(error)
     else:
-        penalty = jnp.sqrt(jnp.square(error) + epsilon**2) - epsilon
+        # Scale before squaring and rationalize sqrt(error**2 + epsilon**2)
+        # minus epsilon to avoid overflow, underflow, and cancellation. The
+        # scale cancels algebraically, so it need not participate in autodiff.
+        scale = jax.lax.stop_gradient(jnp.maximum(jnp.abs(error), epsilon))
+        scaled_error, scaled_epsilon = error / scale, epsilon / scale
+        radius = jnp.sqrt(jnp.square(scaled_error) + jnp.square(scaled_epsilon))
+        penalty = error * (scaled_error / (radius + scaled_epsilon))
     return jnp.mean(jnp.sum(penalty, axis=tuple(range(2, penalty.ndim))))
 
 
@@ -281,8 +305,7 @@ def update(
     transition before batch averaging, independently for the two gradient paths.
     """
     batch.validate()
-    check_keys(key, ())
-    chex.assert_trees_all_equal_shapes_and_dtypes(carry, model.initial_carry(batch.actions.shape[1]))
+    check_keys(key)
     carry = jax.tree.map(jax.lax.stop_gradient, carry)
     targets = batch.next_observations.astype(jnp.float32) / 255.0
     keys = jax.random.split(key, batch.actions.shape[0])
@@ -347,7 +370,6 @@ def update_video_history(history: Batch | None, batch: Batch, num_frames: int) -
     if history is None:
         return jax.tree.map(lambda x: x[-keep:], batch)
     history.validate()
-    chex.assert_shape(history.observations, (None, *batch.observations.shape[1:]))
     return jax.tree.map(lambda old, new: jnp.concatenate((old, new), axis=0)[-keep:], history, batch)
 
 
@@ -360,20 +382,20 @@ def select_video_window(
 
     Args:
         history: Consecutive recent transitions, possibly spanning chunks.
-        episode_start: Bool [environments], true if the next collector input is
+        episode_start: (B,) bool mask, true if the next collector input is
             a reset observation. This excludes both terminal and truncated endpoints.
         num_frames: Total real frames (prefill plus prediction targets), connected
             by num_frames-1 recorded actions.
 
     Returns:
-        Uint8 [num_frames, 1, *image] observations and int32 [num_frames-1, 1]
-        actions for the first eligible environment, or None if no full window
-        is available. Terminal targets are never used as imagination seeds.
+        observations: (num_frames, 1, *image) uint8 frames.
+        actions: (num_frames-1, 1) int32 actions for the first eligible environment.
+        Returns None if no full window is available. Terminal targets are never
+        used as imagination seeds.
     """
     history.validate()
     chex.assert_type(num_frames, int)
     chex.assert_scalar_positive(num_frames)
-    chex.assert_shape(episode_start, (history.actions.shape[1],))
     chex.assert_type(episode_start, np.bool_)
     length = num_frames - 1
     if history.actions.shape[0] < length:
@@ -414,27 +436,25 @@ def comparison_frames(
     Args:
         state: Current training parameters and the model's apply function.
         model: World model used to condition, observe, imagine, and decode.
-        observations: Uint8 [N+T, 1, *image] consecutive real frames from one episode.
-        actions: Int32 [N+T-1, 1] recorded actions connecting those frames.
+        observations: (N+T, 1, *image) uint8 consecutive real frames from one episode.
+        actions: (N+T-1, 1) int32 recorded actions connecting those frames.
         num_prefill_frames: N real context frames; N and T must both be positive.
-        key: Scalar JAX sampling key, independent of training randomness.
+        key: () typed JAX sampling key (or a legacy key), independent of training randomness.
 
     Returns:
-        Float32 [3, N+T, *image], ordered real, posterior, prior. All panels show
+        (3, N+T, *image) float32 frames, ordered real, posterior, prior. All panels show
         the real context for the first N frames. Both model branches start from
         exactly the same posterior state, rebuilt with current weights. Thereafter
         posterior reconstruction sees each real target; prior imagination sees
         only recorded actions and its own sampled latent history. Predicted
         termination does not stop the comparison.
     """
-    chex.assert_shape(observations, (None, 1, *model.observation_shape))
     chex.assert_type(observations, jnp.uint8)
     chex.assert_type(num_prefill_frames, int)
     chex.assert_scalar_positive(num_prefill_frames)
     chex.assert_scalar_positive(observations.shape[0] - num_prefill_frames)
-    chex.assert_shape(actions, (observations.shape[0] - 1, 1))
     chex.assert_type(actions, jnp.int32)
-    check_keys(key, ())
+    check_keys(key)
     prefill_observations = observations[:num_prefill_frames]
     prefill_actions = actions[: num_prefill_frames - 1]
     future_actions = actions[num_prefill_frames - 1 :]
@@ -470,9 +490,8 @@ def comparison_frames(
 
     def step(memory: WorldModelState, inputs: tuple[jax.Array, jax.Array]) -> tuple[WorldModelState, jax.Array]:
         action, sample_key = inputs
-        chex.assert_shape(action, (1,))
         chex.assert_type(action, jnp.int32)
-        check_keys(sample_key, ())
+        check_keys(sample_key)
         memory, prediction = state.apply_fn(
             {"params": state.params},
             memory,
@@ -500,15 +519,14 @@ def log_video(
 ) -> None:
     """Log labeled real/posterior/prior panels using a recorded same-episode window.
 
-    Observations are uint8 [prefill+future, 1, *image]; actions are int32
-    [prefill+future-1, 1]. Frames are shown side by side in that order, with a
+    Observations: (prefill+future, 1, *image) uint8 frames.
+    Actions: (prefill+future-1, 1) int32 actions.
+    Frames are shown side by side in that order, with a
     header marking shared real context before prediction begins. No environments
     are stepped and no training random state is consumed. Returns None.
     """
     num_frames = config.video_prefill_frames + config.video_num_steps
-    chex.assert_shape(observations, (num_frames, 1, *model.observation_shape))
     chex.assert_type(observations, np.uint8)
-    chex.assert_shape(actions, (num_frames - 1, 1))
     chex.assert_type(actions, np.int32)
     chex.assert_type(steps, int)
     chex.assert_scalar_non_negative(steps)
@@ -522,7 +540,6 @@ def log_video(
             jax.random.key(config.seed),
         )
     )
-    chex.assert_shape(frames, (3, num_frames, *model.observation_shape))
     chex.assert_type(frames, np.float32)
     targets = frames[0, config.video_prefill_frames :]
     for panel, name in enumerate(("posterior", "prior"), start=1):
@@ -601,7 +618,8 @@ def train(config: Config) -> str:
         observation, _ = envs.reset(seed=config.seed)
         episode_start = np.ones(config.num_envs, dtype=np.bool_)
         rng = np.random.default_rng(config.seed)
-        model = MambaWorldModel(
+        model_class = LSTMWorldModel if config.model == "lstm" else MambaWorldModel
+        model = model_class(
             observation_shape=envs.single_observation_space.shape,
             num_actions=int(envs.single_action_space.n),
             d_model=config.d_model,
@@ -711,9 +729,11 @@ def train(config: Config) -> str:
                 next_video_step = (steps // config.video_every_steps + 1) * config.video_every_steps
         return run_dir
     finally:
-        envs.close()
-        if writer is not None:
-            writer.close()
+        try:
+            envs.close()
+        finally:
+            if writer is not None:
+                writer.close()
 
 
 def main() -> None:

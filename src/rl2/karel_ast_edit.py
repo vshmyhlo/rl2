@@ -25,7 +25,6 @@ from rl2.karel import (
     execute_program,
 )
 from rl2.karel_ast import AST_ACTIONS, KarelAST, Node, program_actions
-from rl2.shape_checker import ShapeChecker
 
 FEEDBACK_SIZE = 8  # score, success, runtime error, execution limit, ticks, length, score delta, sequence tokens left
 EDIT_REWARD_COMPONENTS = (*REWARD_COMPONENTS, "depth")
@@ -169,8 +168,6 @@ def evaluate(
     depth counts edges from the root, including lists. Execution counts consumed
     statement/condition ticks, including failed attempts, rather than wall time.
     """
-    sc = ShapeChecker(H=task.config.height, W=task.config.width, C=6)
-    sc.check(initial, "HWC", dtype=np.int32)
     tokens = tree.tokens()
     env.reset_from(task)
     info = {}
@@ -193,7 +190,6 @@ def evaluate(
         if error.partial_state is None:
             raise
         output = error.partial_state
-    sc.check(output, "HWC", dtype=np.int32)
     components = {name: float(info[f"reward_{name}"]) for name in REWARD_COMPONENTS}
     components["length"] = -task.config.length_penalty_weight * (len(tree.nodes) / tree.max_nodes)
     components["depth"] = -task.config.depth_penalty_weight * (max(node.depth for node in tree.nodes) / tree.max_depth)
@@ -220,10 +216,6 @@ def observe(
 ) -> Observation:
     """Return execution feedback for complete trees, or just an in-progress edit mask."""
     chex.assert_scalar_in(tokens_left, 0, config.max_seq_len)
-    sc = ShapeChecker(
-        H=config.env.height, W=config.env.width, C=6, V=1 + config.max_nodes + len(AST_ACTIONS), F=FEEDBACK_SIZE
-    )
-    sc.check([pair.initial, pair.target, result.output], "HWC", dtype=np.int32)
     action_mask = np.zeros(1 + config.max_nodes + len(AST_ACTIONS), np.bool_)
     if tree.complete:
         action_mask[0] = config.allow_stop
@@ -242,7 +234,6 @@ def observe(
         action_mask[1 + config.max_nodes :] = tree.allowed_actions() & (
             required - costs.min() + costs + 1 <= tokens_left
         )
-    sc.check(action_mask, "V", dtype=np.bool_)
     if not tree.complete:
         return EditingObservation("editing", action_mask)
     feedback = np.asarray(
@@ -258,7 +249,6 @@ def observe(
         ],
         np.float32,
     )
-    sc.check(feedback, "F", dtype=np.float32)
     return ExecutedObservation("executed", pair.initial, pair.target, result.output, feedback, action_mask)
 
 

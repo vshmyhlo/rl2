@@ -37,6 +37,86 @@ def test_tensorboard_uses_config_run_id(tmp_path: Path) -> None:
     envs.close.assert_called_once()
 
 
+def test_training_reports_raw_completed_episode_scores() -> None:
+    settings = replace(
+        config(),
+        env_id="ALE/Pong-v5",
+        atari_preprocessing=True,
+        num_envs=1,
+        num_steps=2,
+        num_minibatches=1,
+        update_epochs=1,
+        rnd_update_epochs=1,
+        lstm_hidden_size=1,
+        total_steps=4,
+        vector_env="sync",
+        video_every_episodes=0,
+        eval_every_minutes=0.01,
+        target_kl=None,
+    )
+    obs = np.zeros((1, 1, 2, 2), dtype=np.uint8)
+    zeros = np.zeros(1, dtype=np.float32)
+    predictions = np.full((1, 2), 50.0, dtype=np.float32)
+    carry = rnd.initial_carry(1, 1)
+    envs = Mock()
+    envs.single_action_space.n = 2
+    envs.reset.return_value = (obs, {})
+    # One game over, one timeout, then an unfinished episode. Raw returns are 3 and 7.
+    envs.step.side_effect = [
+        (obs, np.array([reward]), np.array([terminated]), np.array([truncated]), {})
+        for reward, terminated, truncated in (
+            (5.0, False, False),
+            (-2.0, True, False),
+            (7.0, False, True),
+            (1000.0, False, False),
+        )
+    ]
+    model = Mock()
+    model.init.return_value = {"params": {"weight": jnp.zeros(1)}}
+    clock = 0.0
+
+    def now() -> float:
+        nonlocal clock
+        clock += 1.0
+        return clock
+
+    def update(state: TrainState, batch: rnd.PPOBatch, config: rnd.Config) -> tuple[TrainState, rnd.PPOMetrics]:
+        return state.replace(step=state.step + 1), (jnp.asarray(0.0),) * 6
+
+    def update_rnd(
+        predictor: TrainState, target: TrainState, obs: rnd.Array, key: jax.Array, fraction: float
+    ) -> tuple[TrainState, jax.Array]:
+        return predictor, jnp.asarray(0.0)
+
+    with (
+        patch.object(rnd.gym.vector, "SyncVectorEnv", return_value=envs),
+        patch.object(rnd, "ActorCritic", return_value=model),
+        patch.object(rnd, "RNDNetwork", return_value=model),
+        patch.object(rnd, "SummaryWriter") as writer,
+        patch.object(rnd, "warmup_rnd_observations", return_value=obs),
+        patch.object(rnd, "act", return_value=(np.zeros(1, dtype=np.int32), zeros, predictions, carry)),
+        patch.object(rnd, "value", return_value=predictions),
+        patch.object(rnd, "update", side_effect=update),
+        patch.object(rnd, "rnd_reward", return_value=jnp.full((2,), 100.0)),
+        patch.object(rnd, "update_rnd", side_effect=update_rnd),
+        patch.object(rnd, "monotonic", side_effect=now),
+        patch.object(rnd, "log_evaluation") as evaluate,
+    ):
+        rnd.train(settings)
+    assert evaluate.call_count == 2
+    for call, expected_returns, steps in zip(evaluate.call_args_list, [(3.0,), (3.0, 7.0)], [2, 4], strict=True):
+        scores = call.kwargs["training_scores"]
+        assert scores.episode_count == len(expected_returns)
+        assert scores.return_sum == sum(expected_returns)
+        assert scores.recent_returns == expected_returns
+        assert call.args[3:] == (len(expected_returns), steps)
+    logs = [
+        call.args[1:] for call in writer.return_value.add_scalar.call_args_list if call.args[0] == "charts/return_mean"
+    ]
+    assert logs == [(3.0, 2), (5.0, 4)]
+    envs.close.assert_called_once()
+
+
 def test_running_moments_match_combined_samples() -> None:
     samples = np.arange(48, dtype=np.float32).reshape(6, 2, 4)
     combined, split = RunningMeanStd((2, 4)), RunningMeanStd((2, 4))

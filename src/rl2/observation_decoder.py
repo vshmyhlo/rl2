@@ -8,7 +8,6 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationStage, ConvStages, validate_stages
-from rl2.shape_checker import ShapeChecker
 
 
 class ConvObservationDecoder(nn.Module):
@@ -30,8 +29,6 @@ class ConvObservationDecoder(nn.Module):
 
     @nn.compact
     def __call__(self, latent: jax.Array) -> jax.Array:
-        sc = ShapeChecker()
-        sc.check(latent, "BE")
         chex.assert_type(latent, jnp.floating)
         chex.assert_scalar_positive(latent.shape[-1])
         validate_stages(self.stages)
@@ -79,8 +76,4 @@ class ConvObservationDecoder(nn.Module):
             x = jnp.transpose(x, (0, 3, 1, 2, 4))
         else:
             x = jnp.moveaxis(x, -1, 1)
-        output_sc = ShapeChecker(
-            B=latent.shape[0], F=frames, H=self.observation_shape[1], W=self.observation_shape[2], C=colors
-        )
-        output_sc.check(x, "BFHWC" if len(self.observation_shape) == 4 else "BFHW", self.dtype)
         return x

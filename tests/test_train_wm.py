@@ -18,12 +18,23 @@ from numpy.typing import NDArray
 
 from rl2 import train_wm
 from rl2.observation_encoder import ConvStage
-from rl2.wm import MambaWorldModel, categorical_kl
+from rl2.wm import LSTMWorldModel, MambaWorldModel, WorldModelState, categorical_kl
 
 
 def training_config(**overrides: Any) -> train_wm.Config:
-    path = Path(__file__).resolve().parents[1] / "configs/train_wm_atari.yaml"
-    return replace(train_wm.load_config(path), **overrides)
+    path = Path(__file__).resolve().parents[1] / "configs/wm_atari.yaml"
+    return replace(train_wm.load_config(path), **({"model": "mamba"} | overrides))
+
+
+def test_model_configuration_and_legacy_default() -> None:
+    path = Path(__file__).resolve().parents[1] / "configs/wm_atari.yaml"
+    config = train_wm.load_config(path)
+    assert (config.model, config.num_layers, config.d_model, config.d_intermediate) == ("lstm", 4, 512, 0)
+    settings = {**asdict(config), "encoder_stages": config.encoder_stages}
+    del settings["model"]
+    assert train_wm.Config(**settings).model == "mamba"
+    # Mamba head divisibility and rotary-state constraints do not apply to LSTM.
+    replace(config, d_model=7, headdim=3, d_state=1)
 
 
 @pytest.mark.parametrize("grayscale_obs,frame_stack", [(False, True), (True, False)])
@@ -131,11 +142,30 @@ def test_charbonnier_perfect_match_has_zero_loss_and_gradient() -> None:
     np.testing.assert_array_equal(gradient, jnp.zeros_like(target))
 
 
-def test_update_targets_losses_carry_and_learning() -> None:
+@pytest.mark.parametrize("epsilon", [1e-30, 1e-3, 1e30], ids=["small-scale", "cancellation", "large-scale"])
+def test_charbonnier_extreme_scales_and_small_residuals(epsilon: float) -> None:
+    errors = jnp.array([0.0, 1e-8, 0.5, 1e30], jnp.float32).reshape(4, 1, 1)
+
+    # Compute each frame separately so a large error cannot hide small losses.
+    def frame_loss(error: jax.Array) -> jax.Array:
+        return train_wm.observation_reconstruction_loss(
+            error[None], jnp.zeros_like(error[None]), "charbonnier", epsilon
+        )
+
+    values, gradients = jax.jit(jax.vmap(jax.value_and_grad(frame_loss)))(errors)
+    reference = np.asarray(errors, dtype=np.float64)
+    radius = np.hypot(reference, epsilon)
+    expected = reference * (reference / (radius + epsilon))
+    np.testing.assert_allclose(values, expected[:, 0, 0], rtol=2e-6, atol=1e-37)
+    np.testing.assert_allclose(gradients, reference / radius, rtol=2e-6, atol=1e-37)
+
+
+@pytest.mark.parametrize("model_class", [MambaWorldModel, LSTMWorldModel])
+def test_update_targets_losses_carry_and_learning(model_class: type[MambaWorldModel]) -> None:
     # Loss variants have direct value/gradient coverage above; use a nondefault
     # loss here to check that update forwards the selection.
     loss: train_wm.ObservationLoss = "charbonnier"
-    model = MambaWorldModel(
+    model = model_class(
         (1, 2, 2),
         3,
         d_model=8,
@@ -216,6 +246,7 @@ def test_update_targets_losses_carry_and_learning() -> None:
         {"log_flush_secs": -1},
         {"encoder_stages": ()},
         {"num_layers": 0},
+        {"model": "unknown"},
         {"d_intermediate": -1},
         {"stochastic_size": 0},
         {"stochastic_classes": 1},
@@ -230,6 +261,8 @@ def test_update_targets_losses_carry_and_learning() -> None:
         {"charbonnier_epsilon": -0.001},
         {"charbonnier_epsilon": float("inf")},
         {"charbonnier_epsilon": float("nan")},
+        {"charbonnier_epsilon": 1e-100},
+        {"charbonnier_epsilon": 1e100},
     ],
 )
 def test_invalid_config(options: dict[str, Any]) -> None:
@@ -449,7 +482,7 @@ def test_main_uses_default_atari_config(monkeypatch: pytest.MonkeyPatch) -> None
 
     monkeypatch.setattr(train_wm, "train", train)
     train_wm.main()
-    assert calls == [train_wm.load_config("configs/train_wm_atari.yaml")]
+    assert calls == [train_wm.load_config("configs/wm_atari.yaml")]
     config = calls[0]
     assert config.num_envs == 8 and config.vector_env == "async" and config.bf16
     schedule = train_wm.learning_rate_schedule(config)
@@ -566,4 +599,93 @@ def test_video_prefill_one_frame_uses_last_live_target() -> None:
         chex.assert_shape(actions, (0, 1))
         chex.assert_type(actions, np.int32)
     finally:
+        envs.close()
+
+
+@pytest.mark.parametrize(
+    "outcome,model_name",
+    [("complete", "mamba"), ("complete", "lstm"), ("nonfinite", "mamba"), ("close-error", "mamba")],
+)
+def test_training_loop_short_rollout_checkpoints_and_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str, model_name: str
+) -> None:
+    config = training_config(
+        model=model_name,
+        total_steps=6,
+        num_envs=2,
+        num_steps=2,
+        vector_env="sync",
+        video_every_steps=0,
+        checkpoint_every=10,
+        log_dir=str(tmp_path / "logs"),
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    )
+    envs = gym.vector.SyncVectorEnv([ShortEpisodes, ShortEpisodes], autoreset_mode=gym.vector.AutoresetMode.DISABLED)
+    close = Mock(wraps=envs.close)
+    if outcome == "close-error":
+        close.side_effect = RuntimeError("environment cleanup failed")
+    monkeypatch.setattr(envs, "close", close)
+    monkeypatch.setattr(train_wm.gym.vector, "SyncVectorEnv", Mock(return_value=envs))
+    model = Mock(spec=MambaWorldModel, observation_shape=(1, 2, 2), num_actions=3)
+    model.init.return_value = {"params": {"weight": jnp.zeros(1)}}
+    initial = WorldModelState((), jnp.zeros((2, 1)), jnp.zeros((2, 1, 2)), jnp.zeros(2, jnp.bool_))
+    model.initial_carry.return_value = initial
+    factory = Mock(return_value=model)
+    monkeypatch.setattr(train_wm, "LSTMWorldModel" if model_name == "lstm" else "MambaWorldModel", factory)
+    writer = Mock()
+    monkeypatch.setattr(train_wm, "SummaryWriter", Mock(return_value=writer))
+    save = Mock()
+    monkeypatch.setattr(train_wm, "save_checkpoint", save)
+    batches: list[train_wm.Batch] = []
+    keys: list[jax.Array] = []
+
+    def fake_update(
+        state: TrainState,
+        model: MambaWorldModel,
+        batch: train_wm.Batch,
+        carry: WorldModelState,
+        key: jax.Array,
+        dynamics_kl_scale: float,
+        representation_kl_scale: float,
+        free_nats: float,
+        observation_loss: train_wm.ObservationLoss,
+        charbonnier_epsilon: float,
+    ) -> tuple[TrainState, WorldModelState, dict[str, jax.Array]]:
+        np.testing.assert_array_equal(carry.deter, len(batches))
+        batches.append(batch)
+        keys.append(jax.random.key_data(key))
+        metrics = dict.fromkeys(("loss", "observation_loss", "reward_loss", "termination_loss", "kl"), jnp.asarray(1.0))
+        if outcome == "nonfinite":
+            metrics["loss"] = jnp.asarray(jnp.nan)
+        return state.replace(step=state.step + 1), carry.replace(deter=carry.deter + 1), metrics
+
+    monkeypatch.setattr(train_wm, "update", fake_update)
+    try:
+        if outcome == "nonfinite":
+            with pytest.raises(FloatingPointError, match="Non-finite training metrics"):
+                train_wm.train(config)
+            save.assert_not_called()
+        else:
+            if outcome == "close-error":
+                with pytest.raises(RuntimeError, match="environment cleanup failed"):
+                    train_wm.train(config)
+            else:
+                run_dir = train_wm.train(config)
+                assert Path(run_dir, "config.json").exists()
+            assert [batch.actions.shape for batch in batches] == [(2, 2), (1, 2)]
+            np.testing.assert_array_equal(batches[1].episode_starts, True)
+            assert not np.array_equal(*keys)
+            save.assert_called_once()
+            assert int(save.call_args.args[0].step) == 2
+            logged_steps = [call.args[2] for call in writer.add_scalar.call_args_list if call.args[0] == "train/loss"]
+            assert logged_steps == [4, 6]
+        factory.assert_called_once()
+        assert factory.call_args.kwargs["d_model"] == config.d_model
+        assert factory.call_args.kwargs["num_layers"] == config.num_layers
+        assert factory.call_args.kwargs["d_intermediate"] == config.d_intermediate
+        close.assert_called_once()
+        writer.close.assert_called_once()
+    finally:
+        # Always release the real vector env, including the simulated close failure.
+        close.side_effect = None
         envs.close()

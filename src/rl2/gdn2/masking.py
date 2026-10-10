@@ -4,20 +4,13 @@ import chex
 import jax
 import jax.numpy as jnp
 
-from rl2.shape_checker import ShapeChecker
-
 
 def prefix_mask(x_len: jax.Array, batch_size: int, sequence_length: int) -> jax.Array:
     """Validate prefix lengths and construct a mask for features or token IDs."""
-    sc = ShapeChecker(B=batch_size, T=sequence_length)
     chex.assert_scalar_positive(batch_size)
-    sc.check(x_len, "B", jnp.int32)
     invalid = jnp.any((x_len < 0) | (x_len > sequence_length))
-    sc.check(invalid, "", jnp.bool_)
 
     def fail_if_invalid(value: jax.Array) -> None:
-        sc = ShapeChecker()
-        sc.check(value, "", jnp.bool_)
         if bool(value):
             raise ValueError("x_len must be between 0 and the input sequence length")
 
@@ -33,5 +26,4 @@ def prefix_mask(x_len: jax.Array, batch_size: int, sequence_length: int) -> jax.
     else:
         fail_if_invalid(invalid)
     valid = jnp.arange(sequence_length)[None, :] < x_len[:, None]
-    sc.check(valid, "BT", jnp.bool_)
     return valid

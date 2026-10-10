@@ -23,8 +23,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from rl2.shape_checker import ShapeChecker
-
 type Inputs = tuple[jax.Array, jax.Array, jax.Array, jax.Array]
 type Outputs = tuple[jax.Array, ...]
 type Attention = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
@@ -54,13 +52,9 @@ def make_attention(backend: str, causal: bool) -> Attention:
         kernel = jax.nn.dot_product_attention
 
     def attention(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
-        sc = ShapeChecker()
-        sc.check(q, "BTHD", q.dtype)
-        sc.check((k, v), "BTKD", q.dtype)
         chex.assert_type(q, jnp.floating)
         chex.assert_is_divisible(q.shape[2], k.shape[2])
         out = kernel(q, k, v, is_causal=causal, implementation=None if implementation == "auto" else implementation)
-        sc.check(out, "BTHD", q.dtype)
         return out
 
     return attention
@@ -69,19 +63,13 @@ def make_attention(backend: str, causal: bool) -> Attention:
 def make_workload(attention: Attention, backward: bool) -> Workload:
     def workload(args: Inputs) -> Outputs:
         q, k, v, cotangent = args
-        sc = ShapeChecker()
-        sc.check((q, cotangent), "BTHD", q.dtype)
-        sc.check((k, v), "BTKD", q.dtype)
         if backward:
             out, pullback = jax.vjp(attention, q, k, v)
             dq, dk, dv = pullback(cotangent)
-            sc.check(dq, "BTHD", q.dtype)
-            sc.check((dk, dv), "BTKD", q.dtype)
             result = (out, dq, dk, dv)
         else:
             out = attention(q, k, v)
             result = (out,)
-        sc.check(out, "BTHD", q.dtype)
         return result
 
     return workload
@@ -91,9 +79,6 @@ def check_outputs(actual: Outputs, reference: Outputs) -> list[dict[str, float]]
     """Check finite results and BF16 accuracy against an FP32 oracle."""
     errors = []
     for value, expected in zip(actual, reference, strict=True):
-        sc = ShapeChecker()
-        sc.check(value, "BTHD", jnp.bfloat16)
-        sc.check(expected, "BTHD", jnp.float32)
         a, b = np.asarray(value, np.float32), np.asarray(expected, np.float32)
         if not np.isfinite(a).all() or not np.isfinite(b).all():
             raise AssertionError("Non-finite output or gradient")
@@ -170,9 +155,6 @@ def main() -> None:
                 jax.random.split(jax.random.key(0), 4), (q_shape, kv_shape, kv_shape, q_shape), strict=True
             )
         )
-        sc = ShapeChecker(B=batch, T=args.seq_len, H=args.heads, K=kv_heads, D=args.head_dim)
-        sc.check((inputs[0], inputs[3]), "BTHD", jnp.bfloat16)
-        sc.check(inputs[1:3], "BTKD", jnp.bfloat16)
         for backward in (False, True):
             reference_fn = make_workload(make_attention("jax_xla", not args.noncausal), backward)
             reference = jax.jit(reference_fn)(tuple(x.astype(jnp.float32) for x in inputs))

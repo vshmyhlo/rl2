@@ -1,4 +1,4 @@
-"""Categorical stochastic world model with observation-unaware Mamba dynamics."""
+"""Categorical stochastic world models with observation-unaware recurrent dynamics."""
 
 import math
 
@@ -8,20 +8,24 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax import struct
 
+from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.mamba3 import Mamba3Stack, Mamba3StackCarry
 from rl2.observation_decoder import ConvObservationDecoder
 from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
-from rl2.shape_checker import ShapeChecker
+from rl2.sequence_model import RecurrentSequenceModel
+
+type WorldModelCarry = Mamba3StackCarry | LSTMStackCarry
 
 
 @struct.dataclass
 class Prediction:
     """Decoded state: normalized pixels, incoming reward, and terminal logits.
 
-    ``observation`` has shape ``[*leading, *observation_shape]`` and unbounded
-    float32 values targeting [0, 1]. ``reward`` and ``termination_logits`` are
-    float32 arrays with shape ``leading`` (batch, or time and batch). Terminal
-    labels exclude time-limit truncations; apply sigmoid for probabilities.
+    Attributes:
+        observation: (*leading, *observation_shape) float32 unbounded pixels targeting [0, 1].
+        reward: (*leading,) float32 incoming rewards.
+        termination_logits: (*leading,) float32 terminal logits, excluding time-limit
+            truncations; apply sigmoid for probabilities.
     """
 
     observation: jax.Array
@@ -33,13 +37,15 @@ class Prediction:
 class WorldModelState:
     """History and sampled current state, aligned with the current observation.
 
-    ``memory`` contains one Mamba carry per layer. ``deter`` is [B, D] and
-    ``stoch`` is [B, S, C], containing one-hot samples of S categorical variables
-    with C classes. Floating leaves are float32. ``initialized`` is bool [B];
-    false means the next observe call must condition on its initial frame.
+    Attributes:
+        memory: Per-layer recurrent carries; LSTM leaves are (B, D) float32
+            cell and hidden states, while Mamba uses Mamba3StackCarry.
+        deter: (B, D) float32 deterministic history.
+        stoch: (B, S, C) float32 one-hot samples of S categorical variables with C classes.
+        initialized: (B,) bool; false means observe must condition on its initial frame.
     """
 
-    memory: Mamba3StackCarry
+    memory: WorldModelCarry
     deter: jax.Array
     stoch: jax.Array
     initialized: jax.Array
@@ -49,9 +55,11 @@ class WorldModelState:
 class ObserveOutput:
     """Posterior reconstructions and distributions for each next observation.
 
-    ``features`` is float32 [*leading, D + S*C]. Prior and posterior logits
-    are float32 [*leading, S, C], with uniform mixing already applied.
-    ``prediction`` decodes the posterior sample, not the prior mean.
+    Attributes:
+        features: (*leading, D + S*C) float32 features of the posterior state.
+        prior_logits: (*leading, S, C) float32 prior logits with uniform mixing applied.
+        posterior_logits: (*leading, S, C) float32 posterior logits with uniform mixing applied.
+        prediction: Decoded posterior sample; see Prediction for array shapes.
     """
 
     features: jax.Array
@@ -60,10 +68,9 @@ class ObserveOutput:
     prediction: Prediction
 
 
-def check_keys(keys: jax.Array, leading: tuple[int, ...]) -> None:
-    """Validate typed or legacy JAX keys with the specified leading axes."""
+def check_keys(keys: jax.Array) -> None:
+    """Validate the dtype of typed or legacy JAX keys."""
     data = jax.random.key_data(keys)
-    chex.assert_shape(data, (*leading, None))
     chex.assert_type(data, jnp.uint32)
 
 
@@ -71,16 +78,14 @@ def categorical_kl(posterior_logits: jax.Array, prior_logits: jax.Array) -> jax.
     """Return KL(q || p), summed over variables/classes, preserving leading axes.
 
     Args:
-        posterior_logits: Float32 [*leading, stochastic_size, stochastic_classes].
-        prior_logits: Matching float32 logits. Uniform mixing, if desired, must
-            already be applied by the caller.
+        posterior_logits: (*leading, stochastic_size, stochastic_classes) float32 logits.
+        prior_logits: (*leading, stochastic_size, stochastic_classes) float32 logits.
+            Uniform mixing, if desired, must already be applied by the caller.
 
     Returns:
-        Float32 KL in nats per batch/time element, shaped ``leading``.
+        (*leading,) float32 KL in nats per batch/time element.
     """
-    chex.assert_equal_shape((posterior_logits, prior_logits))
     chex.assert_type((posterior_logits, prior_logits), jnp.float32)
-    chex.assert_scalar_non_negative(posterior_logits.ndim - 2)
     log_q = jax.nn.log_softmax(posterior_logits, axis=-1)
     log_p = jax.nn.log_softmax(prior_logits, axis=-1)
     probs = jnp.exp(log_q)
@@ -96,15 +101,14 @@ def categorical_entropy(logits: jax.Array) -> jax.Array:
     """Return entropy in nats, summing variables/classes and retaining leading axes.
 
     Args:
-        logits: Float32 [*leading, stochastic_size, stochastic_classes].
+        logits: (*leading, stochastic_size, stochastic_classes) float32 logits.
             Zero-probability categories may be represented by -inf logits.
 
     Returns:
-        Float32 entropy shaped ``leading``. Each categorical variable must have
+        (*leading,) float32 entropy. Each categorical variable must have
         at least one finite logit; an entirely invalid distribution remains NaN.
     """
     chex.assert_type(logits, jnp.float32)
-    chex.assert_scalar_non_negative(logits.ndim - 2)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     probs = jnp.exp(log_probs)
     return -jnp.sum(probs * jnp.where(probs > 0, log_probs, 0.0), axis=(-2, -1))
@@ -115,11 +119,18 @@ def latent_kl_losses(
 ) -> tuple[jax.Array, jax.Array]:
     """Return scalar dynamics and representation KL losses with separate gradients.
 
-    Logits are float32 [*leading, variables, classes]. The dynamics loss stops
-    gradients into the posterior; representation stops gradients into the prior.
-    A nonnegative free_nats floor is applied per transition before averaging.
+    The dynamics loss stops gradients into the posterior; representation stops
+    gradients into the prior. A free_nats floor is applied before averaging.
+
+    Args:
+        posterior_logits: (*leading, variables, classes) float32 posterior logits.
+        prior_logits: (*leading, variables, classes) float32 prior logits.
+        free_nats: Nonnegative KL floor per transition.
+
+    Returns:
+        dynamics: () float32 mean dynamics KL loss.
+        representation: () float32 mean representation KL loss.
     """
-    chex.assert_shape(jnp.asarray(free_nats), ())
     dynamics = categorical_kl(jax.lax.stop_gradient(posterior_logits), prior_logits)
     representation = categorical_kl(posterior_logits, jax.lax.stop_gradient(prior_logits))
     return jnp.maximum(dynamics, free_nats).mean(), jnp.maximum(representation, free_nats).mean()
@@ -204,7 +215,7 @@ class MambaWorldModel(WorldModel):
     unimix: float = 0.01
 
     @nn.nowrap
-    def _make_dynamics(self) -> Mamba3Stack:
+    def _make_dynamics(self) -> RecurrentSequenceModel[WorldModelCarry]:
         """Return an unbound feature-processing stack with independent layers."""
         return Mamba3Stack(
             d_model=self.d_model,
@@ -220,7 +231,7 @@ class MambaWorldModel(WorldModel):
 
     def setup(self) -> None:
         """Validate sizes and register shared convolution, dynamics, and latent heads."""
-        if not isinstance(self.observation_shape, tuple) or not self.observation_shape:
+        if not self.observation_shape:
             raise ValueError("observation_shape must be a nonempty tuple of positive integers")
         for size in (*self.observation_shape, self.num_actions, self.stochastic_size, self.stochastic_classes):
             chex.assert_type(size, int)
@@ -262,28 +273,25 @@ class MambaWorldModel(WorldModel):
 
     @nn.nowrap
     def _check_state(self, state: WorldModelState) -> None:
-        chex.assert_rank(state.deter, 2)
-        chex.assert_trees_all_equal_shapes_and_dtypes(state, self.initial_carry(state.deter.shape[0]))
+        chex.assert_type((state.deter, state.stoch, *jax.tree.leaves(state.memory)), jnp.float32)
+        chex.assert_type(state.initialized, jnp.bool_)
 
     @nn.nowrap
     def features(self, state: WorldModelState) -> jax.Array:
-        """Return float32 [batch, d_model + stochastic_size*stochastic_classes]."""
+        """Return (B, d_model + stochastic_size*stochastic_classes) float32 features."""
         self._check_state(state)
         return jnp.concatenate((state.deter, state.stoch.reshape((state.deter.shape[0], -1))), axis=-1)
 
     def encode(self, observation: jax.Array) -> jax.Array:
-        """Encode uint8 [B, *image] or [T, B, *image] into float32 [..., d_model]."""
+        """Encode (B, *image) or (T, B, *image) uint8 frames into (..., d_model) float32 embeddings."""
         rank = len(self.observation_shape)
-        chex.assert_rank(observation, {rank + 1, rank + 2})
         chex.assert_type(observation, jnp.uint8)
         leading = observation.shape[:-rank]
-        chex.assert_shape(observation, (*leading, *self.observation_shape))
         chex.assert_scalar_positive(leading[-1])
         images = observation.reshape((math.prod(leading), *self.observation_shape))
         return self.encoder(images).astype(jnp.float32).reshape((*leading, self.d_model))
 
     def _logits(self, raw: jax.Array) -> jax.Array:
-        chex.assert_shape(raw, (None, self.stochastic_size * self.stochastic_classes))
         chex.assert_type(raw, self.dtype)
         raw = raw.astype(jnp.float32).reshape((-1, self.stochastic_size, self.stochastic_classes))
         log_probs = jax.nn.log_softmax(raw, axis=-1)
@@ -292,22 +300,18 @@ class MambaWorldModel(WorldModel):
         return jnp.logaddexp(log_probs + math.log1p(-self.unimix), math.log(self.unimix / self.stochastic_classes))
 
     def _prior(self, deter: jax.Array) -> jax.Array:
-        chex.assert_shape(deter, (None, self.d_model))
         chex.assert_type(deter, jnp.float32)
         return self._logits(self.prior_head(nn.silu(self.prior_hidden(deter))))
 
     def _posterior(self, deter: jax.Array, embedding: jax.Array) -> jax.Array:
-        chex.assert_shape((deter, embedding), (None, self.d_model))
-        chex.assert_equal_shape((deter, embedding))
         chex.assert_type((deter, embedding), jnp.float32)
         return self._logits(
             self.posterior_head(nn.silu(self.posterior_hidden(jnp.concatenate((deter, embedding), -1))))
         )
 
     def _sample(self, logits: jax.Array, key: jax.Array) -> jax.Array:
-        chex.assert_shape(logits, (None, self.stochastic_size, self.stochastic_classes))
         chex.assert_type(logits, jnp.float32)
-        check_keys(key, ())
+        check_keys(key)
         probs = jax.nn.softmax(logits, axis=-1)
         sample = jax.nn.one_hot(
             jax.random.categorical(key, logits, axis=-1), self.stochastic_classes, dtype=jnp.float32
@@ -316,7 +320,6 @@ class MambaWorldModel(WorldModel):
 
     def _reset(self, state: WorldModelState, starts: jax.Array) -> WorldModelState:
         self._check_state(state)
-        chex.assert_shape(starts, (state.deter.shape[0],))
         chex.assert_type(starts, jnp.bool_)
         return jax.tree.map(
             lambda x: jnp.where(starts.reshape((starts.shape[0],) + (1,) * (x.ndim - 1)), jnp.zeros_like(x), x), state
@@ -325,28 +328,28 @@ class MambaWorldModel(WorldModel):
     def condition(
         self, observation: jax.Array, state: WorldModelState, episode_starts: jax.Array, key: jax.Array
     ) -> WorldModelState:
-        """Infer a posterior state from uint8 [B, *image], existing history, and key.
+        """Infer a posterior state without taking an action or advancing history.
 
-        Bool [B] episode_starts clears every state leaf before conditioning.
-        Returns a state aligned with observation; no action or transition occurs.
+        Args:
+            observation: (B, *image) uint8 current frames.
+            state: Existing history, aligned with observation.
+            episode_starts: (B,) bool mask clearing every state leaf before conditioning.
+            key: () typed JAX sampling key, or a legacy key.
+
+        Returns:
+            State aligned with observation; see WorldModelState for array shapes.
         """
         state = self._reset(state, episode_starts)
-        chex.assert_shape(observation, (state.deter.shape[0], *self.observation_shape))
         logits = self._posterior(state.deter, self.encode(observation))
         return state.replace(stoch=self._sample(logits, key), initialized=jnp.ones_like(state.initialized))
 
     def _advance(self, state: WorldModelState, action: jax.Array) -> WorldModelState:
         self._check_state(state)
-        sc = ShapeChecker(B=state.deter.shape[0], D=self.d_model)
-        sc.check(action, "B")
         chex.assert_type(action, int)
         inputs = jnp.concatenate((state.stoch.reshape((action.shape[0], -1)), self.action_embedding(action)), axis=-1)
         projected = self.input_projection(inputs).astype(jnp.float32)
-        sc.check(projected, "BD", jnp.float32)
         starts = jnp.zeros_like(state.initialized)
-        sc.check(starts, "B", jnp.bool_)
         memory, deter = self.dynamics.step(projected, state.memory, starts)
-        sc.check(deter, "BD", self.dtype)
         return state.replace(
             memory=memory, deter=deter.astype(jnp.float32), initialized=jnp.ones_like(state.initialized)
         )
@@ -361,15 +364,16 @@ class MambaWorldModel(WorldModel):
         return state.replace(stoch=self._sample(self._prior(state.deter), key))
 
     def decode(self, features: jax.Array) -> Prediction:
-        """Decode float32 [B, F] or [T, B, F] features, F = d_model + S*C.
+        """Decode state features into pixels and incoming transition outcomes.
 
-        Returns pixels with the model's image shape and reward/terminal logits
-        with matching leading axes. Pixels/rewards are unbounded float32.
+        Args:
+            features: (B, F) or (T, B, F) float32 features, F = d_model + S*C.
+
+        Returns:
+            observation: (*leading, *observation_shape) float32 unbounded pixels.
+            reward: (*leading,) float32 unbounded incoming rewards.
+            termination_logits: (*leading,) float32 terminal logits.
         """
-        chex.assert_rank(features, {2, 3})
-        chex.assert_shape(
-            features, (*features.shape[:-1], self.d_model + self.stochastic_size * self.stochastic_classes)
-        )
         chex.assert_type(features, jnp.float32)
         observation = self.observation_decoder(features.reshape((-1, features.shape[-1]))).astype(jnp.float32)
         observation = observation.reshape((*features.shape[:-1], *self.observation_shape))
@@ -409,35 +413,31 @@ class MambaWorldModel(WorldModel):
         """Infer posterior states and reconstruct the next frames of real transitions.
 
         Args:
-            observation: Uint8 [B, *image] or time-major [T, B, *image].
-            action: Integer [B] or [T, B], action taken from observation.
-            next_observation: Same shape/dtype as observation; final frames before
+            observation: (B, *image) or (T, B, *image) uint8 frames.
+            action: (B,) or (T, B) integer actions taken from observation.
+            next_observation: (B, *image) or (T, B, *image) uint8 targets; final frames before
                 reset must be preserved rather than replaced with reset frames.
-            sample_keys: Scalar JAX key for a single step, or T independent keys
-                for a sequence. Supplying the same per-step keys makes chunked
+            sample_keys: () or (T,) typed JAX keys (legacy keys add a trailing key-data axis).
+                Supplying the same per-step keys makes chunked
                 and unchunked processing equivalent.
             carry: State aligned with observation[0], or None for zero history.
                 Pass the final state between contiguous chunks; it retains the
                 posterior sample, avoiding resampling at chunk boundaries.
-            episode_starts: Bool matching action; resets history before that step.
+            episode_starts: (B,) or (T, B) bool masks; reset history before that step.
 
         Returns:
             Final WorldModelState and ObserveOutput with all leading batch/time
             axes. Gradients flow through recurrence unless callers detach carry.
         """
-        chex.assert_equal_shape((observation, next_observation))
         chex.assert_type((observation, next_observation), jnp.uint8)
         embedding, next_embedding = self.encode(observation), self.encode(next_observation)
-        chex.assert_shape(action, embedding.shape[:-1])
         chex.assert_type(action, int)
         single = embedding.ndim == 2
-        check_keys(sample_keys, () if single else (action.shape[0],))
+        check_keys(sample_keys)
         if carry is None:
             carry = self.initial_carry(embedding.shape[-2])
         self._check_state(carry)
-        chex.assert_shape(carry.deter, (embedding.shape[-2], self.d_model))
         starts = jnp.zeros(action.shape, jnp.bool_) if episode_starts is None else episode_starts
-        chex.assert_shape(starts, action.shape)
         chex.assert_type(starts, jnp.bool_)
         inputs = (embedding, action, next_embedding, starts, sample_keys)
         if single:
@@ -462,3 +462,23 @@ class MambaWorldModel(WorldModel):
     ) -> tuple[WorldModelState, ObserveOutput]:
         """Initialize/use the full model from real transitions; see observe for shapes."""
         return self.observe(observation, action, next_observation, sample_keys)
+
+
+class LSTMWorldModel(MambaWorldModel):
+    """Categorical world model using a residual, pre-norm LSTM stack for history.
+
+    Uses the same observation, latent-state, and prediction heads as
+    MambaWorldModel. ``d_model`` is each layer's hidden size and ``num_layers``
+    is the stack depth. ``d_intermediate`` sets the optional SwiGLU width;
+    None or zero disables it. Mamba-specific settings are unused.
+    """
+
+    @nn.nowrap
+    def _make_dynamics(self) -> LSTMStack:
+        return LSTMStack(
+            features=self.d_model,
+            num_layers=self.num_layers,
+            intermediate_size=0 if self.d_intermediate is None else self.d_intermediate,
+            dtype=self.dtype,
+            parent=None,
+        )

@@ -48,19 +48,24 @@ def policy_state() -> TrainState:
 
 
 @pytest.mark.parametrize(
-    "scores,mean",
+    "scores,mean,recent_mean,recent_count",
     [
-        pytest.param(TrainingScores(0, 0.0), None, id="no-completed-episodes"),
-        pytest.param(TrainingScores(2, -4.0), -2.0, id="negative-returns"),
-        pytest.param(TrainingScores(101, 300.0), 300 / 101, id="entire-history"),
-        pytest.param(TrainingScores(101, None), None, id="unknown-historical-total"),
+        pytest.param(TrainingScores(0, 0.0, ()), None, None, 0, id="no-completed-episodes"),
+        pytest.param(TrainingScores(2, -4.0, (-1.0, -3.0)), -2.0, -2.0, 2, id="short-history"),
+        pytest.param(TrainingScores(101, 300.0, (2.0,) * 100), 300 / 101, 2.0, 100, id="full-window"),
+        pytest.param(TrainingScores(101, None, (2.0,) * 100), None, 2.0, 100, id="unknown-historical-total"),
+        pytest.param(TrainingScores(101, 300.0), 300 / 101, None, None, id="unknown-recent-history"),
     ],
 )
-def test_training_score_means(scores: TrainingScores, mean: float | None) -> None:
+def test_training_score_means(
+    scores: TrainingScores, mean: float | None, recent_mean: float | None, recent_count: int | None
+) -> None:
     report = scores.as_report()
     assert report == {
         "episode_count": scores.episode_count,
         "return_mean": mean,
+        "return_mean_100": recent_mean,
+        "last_100_episode_count": recent_count,
     }
     json.dumps(report, allow_nan=False)
 
@@ -75,6 +80,19 @@ def test_training_score_means(scores: TrainingScores, mean: float | None) -> Non
 def test_training_scores_reject_invalid_history(count: int, total: float | None) -> None:
     with pytest.raises(ValueError):
         TrainingScores(count, total)
+
+
+@pytest.mark.parametrize(
+    "count,recent_returns",
+    [
+        pytest.param(101, (1.0,) * 101, id="window-too-long"),
+        pytest.param(1, (1.0, 2.0), id="more-than-completed"),
+        pytest.param(1, (float("nan"),), id="nonfinite-return"),
+    ],
+)
+def test_training_scores_reject_invalid_recent_history(count: int, recent_returns: tuple[float, ...]) -> None:
+    with pytest.raises(ValueError):
+        TrainingScores(count, None, recent_returns)
 
 
 class ScoringEnv(gym.Env):
@@ -429,22 +447,32 @@ def test_failed_evaluation_does_not_report_completion(capsys: pytest.CaptureFixt
     assert env.closed
 
 
-def test_evaluation_logging_records_scores_and_report_without_mutating_state() -> None:
-    config = replace(training_config(), eval_episodes=2, eval_seed=321)
+@pytest.mark.parametrize("trainer", ["ppo", "ppo_rnd"])
+def test_evaluation_logging_records_scores_and_report_without_mutating_state(trainer: str) -> None:
+    module = ppo if trainer == "ppo" else ppo_rnd
+    config = replace(
+        training_config()
+        if trainer == "ppo"
+        else ppo_rnd.load_config(Path(__file__).resolve().parents[1] / "configs/ppo_rnd_montezuma.yaml"),
+        env_id="ALE/Pong-v5",
+        eval_episodes=2,
+        eval_seed=321,
+    )
     state = policy_state()
     before = jax.tree.map(np.array, state)
-    scores = TrainingScores(101, 300.0)
+    scores = TrainingScores(101, 300.0, (2.0,) * 100)
     with (
         patch("rl2.atari_eval.make_evaluation_env", return_value=ScoringEnv()),
-        patch("rl2.ppo.SummaryWriter") as writer,
+        patch("rl2.atari_eval._action", return_value=(jnp.asarray(0), ())),
+        patch.object(module, "SummaryWriter") as writer,
     ):
-        ppo.log_evaluation(state, config, writer, 101, 100, training_scores=scores)
+        module.log_evaluation(state, config, writer, 101, 100, training_scores=scores)
     scalars = {call.args[0]: call.args[1:] for call in writer.add_scalar.call_args_list}
     assert scalars["eval/return_mean"] == (5, 100)
     assert scalars["eval/training_episodes"] == (101, 100)
     assert scalars["training/return_mean"] == (300 / 101, 100)
-    assert "training/return_mean_100" not in scalars
-    assert "training/last_100_episode_count" not in scalars
+    assert scalars["training/return_mean_100"] == (2.0, 100)
+    assert scalars["training/last_100_episode_count"] == (100, 100)
     assert scalars["eval/human_normalized_score_percent"] == pytest.approx((100 * (5 + 20.7) / (14.6 + 20.7), 100))
     tag, text, step = writer.add_text.call_args.args
     assert tag == "eval/report" and step == 100

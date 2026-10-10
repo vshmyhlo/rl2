@@ -71,7 +71,6 @@ from flax import linen as nn
 
 from rl2 import attention as _attention
 from rl2.sequence_model import ARSequenceModel, BDSequenceModel
-from rl2.shape_checker import ShapeChecker
 
 __all__ = ["ARTransformer", "BDTransformer", "TransformerCarry", "TransformerStackCarry"]
 
@@ -166,14 +165,11 @@ class _TransformerBlock(nn.Module):
         """Allocate a fixed-size empty cache without initializing parameters."""
         kv_heads, head_dim = self._dimensions()
         _positive_integer(batch_size, "batch_size")
-        sc = ShapeChecker(B=batch_size, C=self.max_seq_len, K=kv_heads, F=head_dim)
         carry = TransformerCarry(
-            jnp.zeros(sc["BCKF"], self.dtype),
-            jnp.zeros(sc["BCKF"], self.dtype),
-            jnp.zeros(sc["B"], jnp.int32),
+            jnp.zeros((batch_size, self.max_seq_len, kv_heads, head_dim), self.dtype),
+            jnp.zeros((batch_size, self.max_seq_len, kv_heads, head_dim), self.dtype),
+            jnp.zeros((batch_size,), jnp.int32),
         )
-        sc.check((carry.key, carry.value), "BCKF", self.dtype)
-        sc.check(carry.position, "B", jnp.int32)
         return carry
 
     @nn.compact
@@ -196,43 +192,28 @@ class _TransformerBlock(nn.Module):
         """
         kv_heads, head_dim = self._dimensions()
         width = self._mlp_width()
-        # B/T: batch/time, D: model width, H/K: query/KV heads,
-        # F: head width, C: cache capacity, I: MLP width.
-        sc = ShapeChecker(D=self.dim, H=self.num_heads, K=kv_heads, F=head_dim, C=self.max_seq_len, I=width)
-        sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
         _positive_integer(x.shape[0], "batch_size")
         _positive_integer(x.shape[1], "sequence_length")
-        if carry is not None:
-            sc.check((carry.key, carry.value), "BCKF", self.dtype)
-            sc.check(carry.position, "B", jnp.int32)
-        if x_len is not None:
-            sc.check(x_len, "B", jnp.int32)
         if bias is not None:
-            sc.check(bias, "BHTT" if carry is None else "BHTC")
             chex.assert_type(bias, jnp.floating)
 
         valid_tokens = None
         if x_len is not None:
             valid_tokens = jnp.arange(x.shape[1])[None, :] < x_len[:, None]
-            sc.check(valid_tokens, "BT", jnp.bool_)
             x = jnp.where(valid_tokens[..., None], x, 0)
 
         # Attention projections use [batch,time,heads,head_dim].
         residual = x
         x = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(x)
-        sc.check(x, "BTD", self.dtype)
         kernel_init = nn.initializers.normal(stddev=self.initializer_range)
         query = nn.Dense(self.dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="q_proj")(x)
         key = nn.Dense(kv_heads * head_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="k_proj")(x)
         value = nn.Dense(kv_heads * head_dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="v_proj")(
             x
         )
-        sc.check(query, "BTD", self.dtype)
-        query = query.reshape(sc["BTHF"])
-        key, value = (v.reshape(sc["BTKF"]) for v in (key, value))
-        sc.check(query, "BTHF", self.dtype)
-        sc.check((key, value), "BTKF", self.dtype)
+        query = query.reshape((*x.shape[:2], self.num_heads, head_dim))
+        key, value = (v.reshape((*x.shape[:2], kv_heads, head_dim)) for v in (key, value))
         attention_state, attended = _attention.attention(
             query,
             key,
@@ -247,25 +228,17 @@ class _TransformerBlock(nn.Module):
             use_rope=self.use_rope,
         )
         carry = TransformerCarry(*attention_state)
-        attended = attended.reshape(sc["BTD"])
+        attended = attended.reshape(x.shape)
         y = nn.Dense(self.dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="out_proj")(attended)
-        sc.check(y, "BTD", self.dtype)
         x = residual + y
-        residual_dtype = jnp.result_type(residual.dtype, self.dtype)
-        sc.check(x, "BTD", residual_dtype)
         y = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm2")(x)
-        sc.check(y, "BTD", self.dtype)
         gate = nn.Dense(width, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="gate_proj")(y)
         value = nn.Dense(width, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="up_proj")(y)
-        sc.check((gate, value), "BTI", self.dtype)
         y = nn.silu(gate) * value
-        sc.check(y, "BTI", self.dtype)
         y = nn.Dense(self.dim, use_bias=False, dtype=self.dtype, kernel_init=kernel_init, name="down_proj")(y)
-        sc.check(y, "BTD", self.dtype)
         output = x + y
         if valid_tokens is not None:
             output = jnp.where(valid_tokens[..., None], output, 0)
-        sc.check(output, "BTD", residual_dtype)
         return carry, output
 
     def step(
@@ -281,15 +254,10 @@ class _TransformerBlock(nn.Module):
         """
         if not self.causal:
             raise ValueError("step() requires causal=True; use __call__() for bidirectional attention")
-        sc = ShapeChecker(D=self.dim)
-        sc.check(x, "BD")
         chex.assert_type(x, jnp.floating)
-        sc.check(x_active, "B", jnp.bool_)
         x_len = x_active.astype(jnp.int32)
-        sc.check(x_len, "B", jnp.int32)
         carry, y = self(x[:, None], x_len, carry)
         output = y[:, 0]
-        sc.check(output, "BD", jnp.result_type(x.dtype, self.dtype))
         return carry, output
 
 
@@ -369,18 +337,13 @@ class _TransformerStack(nn.Module):
         Optional biases contains one floating [batch,num_heads,time,key_length]
         array per layer. key_length is time without carry, else max_seq_len.
         """
-        sc = ShapeChecker(D=self.dim, H=self.num_heads, C=self.max_seq_len)
-        sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
         if carry is not None and len(carry) != self.num_layers:
             raise ValueError("carry must contain one TransformerCarry per layer")
         if biases is not None:
             if len(biases) != self.num_layers:
                 raise ValueError("biases must contain one attention bias per layer")
-            sc.check(biases, "BHTT" if carry is None else "BHTC")
             chex.assert_type(biases, jnp.floating)
-        if x_len is not None:
-            sc.check(x_len, "B", jnp.int32)
         next_carry = []
         for i, layer in enumerate(self.layers):
             state = None if carry is None else carry[i]
@@ -389,7 +352,6 @@ class _TransformerStack(nn.Module):
         if self.final_norm:
             x = self.norm_f(x)
         output = x.astype(self.dtype)
-        sc.check(output, "BTD", self.dtype)
         return tuple(next_carry), output
 
 
@@ -430,15 +392,10 @@ class Transformer(_TransformerStack):
         """
         if not self.causal:
             raise ValueError("step() requires causal=True; use __call__() for bidirectional attention")
-        sc = ShapeChecker(D=self.dim)
-        sc.check(x, "BD")
         chex.assert_type(x, jnp.floating)
-        sc.check(x_active, "B", jnp.bool_)
         x_len = x_active.astype(jnp.int32)
-        sc.check(x_len, "B", jnp.int32)
         carry, y = self(x[:, None], x_len, carry)
         output = y[:, 0]
-        sc.check(output, "BD", self.dtype)
         return carry, output
 
 
@@ -462,12 +419,8 @@ class ARTransformer(Transformer, ARSequenceModel[TransformerStackCarry]):
         carry: TransformerStackCarry | None = None,
     ) -> tuple[TransformerStackCarry, jax.Array]:
         """Process [batch,time,dim] with required int32 [batch] prefix lengths."""
-        sc = ShapeChecker(D=self.dim)
-        sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
-        sc.check(x_len, "B", jnp.int32)
         carry, output = super().__call__(x, x_len, carry)
-        sc.check(output, "BTD", self.dtype)
         return carry, output
 
 
@@ -494,10 +447,6 @@ class BDTransformer(_TransformerStack, BDSequenceModel):
         per layer, added before attention softmax. Biases cannot override padding.
         Callers own any learned bias parameters; the stack stays domain-agnostic.
         """
-        sc = ShapeChecker(D=self.dim)
-        sc.check(x, "BTD")
         chex.assert_type(x, jnp.floating)
-        sc.check(x_len, "B", jnp.int32)
         _, output = self._forward(x, x_len, biases=biases)
-        sc.check(output, "BTD", self.dtype)
         return output

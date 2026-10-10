@@ -11,6 +11,7 @@ from flax import linen as nn
 
 from rl2.observation_encoder import ConvObservationEncoder, ConvStage
 from rl2.wm import (
+    LSTMWorldModel,
     MambaWorldModel,
     ObserveInputs,
     WorldModelState,
@@ -20,7 +21,7 @@ from rl2.wm import (
 )
 
 
-def small_model(**kwargs: Any) -> MambaWorldModel:
+def small_model(model_class: type[MambaWorldModel] = MambaWorldModel, **kwargs: Any) -> MambaWorldModel:
     settings = {
         "observation_shape": (1, 4, 4),
         "num_actions": 3,
@@ -32,7 +33,7 @@ def small_model(**kwargs: Any) -> MambaWorldModel:
         "stochastic_size": 4,
         "stochastic_classes": 4,
     }
-    return MambaWorldModel(**(settings | kwargs))
+    return model_class(**(settings | kwargs))
 
 
 def assert_tree_close(actual: Any, expected: Any, *, atol: float = 3e-6) -> None:
@@ -41,10 +42,15 @@ def assert_tree_close(actual: Any, expected: Any, *, atol: float = 3e-6) -> None
         np.testing.assert_allclose(a, b, rtol=3e-5, atol=atol)
 
 
-@pytest.mark.parametrize("rank,rgb,depth", [(1, False, 2), (2, True, 1)])
-def test_sequence_steps_chunks_and_initialization_agree(rank: int, rgb: bool, depth: int) -> None:
+@pytest.mark.parametrize(
+    "model_class,rank,rgb,depth",
+    [(MambaWorldModel, 1, False, 2), (MambaWorldModel, 2, True, 1), (LSTMWorldModel, 1, False, 2)],
+)
+def test_sequence_steps_chunks_and_initialization_agree(
+    model_class: type[MambaWorldModel], rank: int, rgb: bool, depth: int
+) -> None:
     shape = (2, 4, 4, 3) if rgb else (2, 4, 4)
-    model = small_model(observation_shape=shape, num_layers=depth, mimo_rank=rank)
+    model = small_model(model_class, observation_shape=shape, num_layers=depth, mimo_rank=rank)
     obs = jax.random.randint(jax.random.key(0), (5, 2, *shape), 0, 256, dtype=jnp.uint8)
     actions = jnp.arange(8, dtype=jnp.int32).reshape(4, 2) % 3
     keys = jax.random.split(jax.random.key(1), 4)
@@ -61,7 +67,10 @@ def test_sequence_steps_chunks_and_initialization_agree(rank: int, rgb: bool, de
     np.testing.assert_array_equal(final.stoch.sum(-1), 1)
     assert set(np.unique(final.stoch)) <= {0, 1}
     for index in range(depth):
-        assert f"layers_{index}" in variables["params"]["dynamics"]
+        if model_class is LSTMWorldModel:
+            chex.assert_shape(final.memory[index], (2, 8))
+        else:
+            assert f"layers_{index}" in variables["params"]["dynamics"]
     current = model.initial_carry(2)
     outputs = []
     for t in range(4):
@@ -80,8 +89,9 @@ def test_sequence_steps_chunks_and_initialization_agree(rank: int, rgb: bool, de
     assert_tree_close(model.apply(variables, output.features, method=model.decode), output.prediction)
 
 
-def test_episode_resets_causality_and_no_future_leakage() -> None:
-    model = small_model()
+@pytest.mark.parametrize("model_class", [MambaWorldModel, LSTMWorldModel])
+def test_episode_resets_causality_and_no_future_leakage(model_class: type[MambaWorldModel]) -> None:
+    model = small_model(model_class)
     obs = jax.random.randint(jax.random.key(3), (5, 2, 1, 4, 4), 0, 256, dtype=jnp.uint8)
     actions = jnp.arange(8, dtype=jnp.int32).reshape(4, 2) % 3
     keys = jax.random.split(jax.random.key(4), 4)
@@ -106,8 +116,9 @@ def test_episode_resets_causality_and_no_future_leakage() -> None:
     assert_tree_close(jax.tree.map(lambda x: x[1:], reset), jax.tree.map(lambda x: x[1:], continued))
 
 
-def test_sampling_reproducibility_and_effect_on_future_dynamics() -> None:
-    model = small_model()
+@pytest.mark.parametrize("model_class", [MambaWorldModel, LSTMWorldModel])
+def test_sampling_reproducibility_and_effect_on_future_dynamics(model_class: type[MambaWorldModel]) -> None:
+    model = small_model(model_class)
     obs = jnp.full((2, 1, 4, 4), 120, jnp.uint8)
     actions = jnp.zeros(2, jnp.int32)
     key = jax.random.key(6)
@@ -131,9 +142,14 @@ def test_sampling_reproducibility_and_effect_on_future_dynamics() -> None:
     assert_tree_close(model.apply(poisoned, initial, actions, jax.random.key(7), method=model.imagine), (first, image))
 
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_straight_through_gradients_and_compute_dtypes(dtype: jax.typing.DTypeLike) -> None:
-    model = small_model(dtype=dtype)
+@pytest.mark.parametrize(
+    "model_class,dtype",
+    [(MambaWorldModel, jnp.float32), (MambaWorldModel, jnp.bfloat16), (LSTMWorldModel, jnp.bfloat16)],
+)
+def test_straight_through_gradients_and_compute_dtypes(
+    model_class: type[MambaWorldModel], dtype: jax.typing.DTypeLike
+) -> None:
+    model = small_model(model_class, dtype=dtype)
     obs = jax.random.randint(jax.random.key(9), (3, 2, 1, 4, 4), 0, 256, dtype=jnp.uint8)
     actions = jnp.array([[0, 1], [1, 2]], jnp.int32)
     keys = jax.random.split(jax.random.key(10), 2)
@@ -183,23 +199,19 @@ def test_kl_values_gradient_routing_and_free_nats() -> None:
     np.testing.assert_array_equal(floored, 0)
 
 
-def test_invalid_shapes_dtypes_and_keys() -> None:
+def test_invalid_dtypes_and_keys() -> None:
     model = small_model()
     obs, actions = jnp.zeros((2, 1, 4, 4), jnp.uint8), jnp.zeros(2, jnp.int32)
     key = jax.random.key(12)
     variables = model.init(key, obs, actions, obs, key)
     observe = partial(model.apply, variables, method=model.observe)
-    for bad_obs in (obs.astype(jnp.float32), jnp.zeros((2, 1, 4, 5), jnp.uint8)):
-        with pytest.raises(AssertionError):
-            observe(bad_obs, actions, obs, key)
-    for bad_actions in (actions.astype(jnp.float32), actions[:, None]):
-        with pytest.raises(AssertionError):
-            observe(obs, bad_actions, obs, key)
     with pytest.raises(AssertionError):
-        observe(obs, actions, obs, key, model.initial_carry(1))
+        observe(obs.astype(jnp.float32), actions, obs, key)
+    with pytest.raises(AssertionError):
+        observe(obs, actions.astype(jnp.float32), obs, key)
     with pytest.raises(AssertionError):
         observe(obs, actions, obs, key, episode_starts=jnp.zeros(2))
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="single key"):
         observe(obs, actions, obs, jax.random.split(key, 2))
 
 
@@ -283,6 +295,9 @@ def test_straight_through_samples_stay_float32_with_x64_enabled() -> None:
         logits = jnp.zeros((2, 4, 4), jnp.float32)
         key = jax.random.key(24)
         sample = model.apply({}, logits, key, method=model._sample)
+        legacy_sample = model.apply({}, logits, jax.random.key_data(key), method=model._sample)
+        chex.assert_shape(sample, (2, 4, 4))
+        np.testing.assert_array_equal(sample, legacy_sample)
         chex.assert_type(sample, jnp.float32)
         np.testing.assert_array_equal(sample.sum(-1), 1)
         assert set(np.unique(sample)) <= {0, 1}

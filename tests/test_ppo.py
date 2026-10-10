@@ -610,6 +610,7 @@ def test_train_evaluates_final_policy(
         scores = call.kwargs["training_scores"]
         assert scores.episode_count == episodes
         assert scores.return_sum == (3.0 if steps == 2 else 10.0)
+        assert scores.recent_returns == ((3.0,) if steps == 2 else (3.0, 7.0))
     if expected_steps:
         assert evaluate.call_args.args[0] is state
     first_elapsed = 90.0 if 2 in expected_steps else 60.0

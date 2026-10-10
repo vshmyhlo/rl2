@@ -17,6 +17,7 @@ import pytest
 from flax.training.train_state import TrainState
 
 from rl2 import ppo
+from rl2.atari_eval import TrainingScores
 
 
 @pytest.mark.parametrize("use_tf", [None, "true"], ids=["default-gcsfs", "explicit-tensorflow"])
@@ -144,6 +145,12 @@ def test_legacy_checkpoint_leaves_training_total_unavailable(config: ppo.Config,
     assert restored.training_return_sum is None
     assert restored.completed_episodes == 101
     assert restored.recent_returns == (2.0,) * 100
+    report = TrainingScores(
+        restored.completed_episodes, restored.training_return_sum, restored.recent_returns
+    ).as_report()
+    assert report["return_mean"] is None
+    assert report["return_mean_100"] == 2.0
+    assert report["last_100_episode_count"] == 100
 
 
 @pytest.mark.parametrize("run_id", ["", " ", "..", "a/b", "a\\b"])
@@ -188,6 +195,7 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
     learning_rates: list[float] = []
     saved_iterations: list[int] = []
     saved_return_sums: list[float | None] = []
+    saved_recent_returns: list[tuple[float, ...]] = []
 
     def update(
         state: TrainState, batch: ppo.PPOBatch, config: ppo.Config, iteration: int
@@ -212,6 +220,7 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
     ) -> None:
         saved_iterations.append(progress.iteration)
         saved_return_sums.append(progress.training_return_sum)
+        saved_recent_returns.append(progress.recent_returns)
         original_save(manager, progress, rng, config)
 
     with (
@@ -232,6 +241,7 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
         resumed = ppo.train(config)
         assert saved_iterations == [2, 4]
         assert saved_return_sums == [2.0, 4.0]
+        assert saved_recent_returns == [(1.0, 1.0), (1.0,) * 4]
         assert iterations == [0, 1, 2, 3]
         assert int(resumed.step) == 4
         np.testing.assert_allclose(learning_rates, [ppo.learning_rate_schedule(config)(i) for i in range(4)])

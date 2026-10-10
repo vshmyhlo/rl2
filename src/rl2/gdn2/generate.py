@@ -21,7 +21,6 @@ import numpy as np
 
 from rl2.gdn2.checkpoints import Parameters, load_checkpoint, sha256_file
 from rl2.gdn2.model import GatedDeltaNet2LM, GatedDeltaNet2StackCarry
-from rl2.shape_checker import ShapeChecker
 
 if TYPE_CHECKING:
     from sentencepiece import SentencePieceProcessor
@@ -75,9 +74,6 @@ def sample_token(logits: jax.Array, key: jax.Array, *, temperature: float, top_k
     top_k=0 samples over the full vocabulary. Greedy decoding ignores top_k;
     top-k sampling selects exactly k candidates, including when scores tie.
     """
-    sc = ShapeChecker()
-    sc.check(logits, "V", jnp.float32)
-    sc.check(jax.random.key_data(key), "R", jnp.uint32)
     _validate_sampling(temperature, top_k, logits.shape[0])
     if temperature == 0:
         token = jnp.argmax(logits).astype(jnp.int32)
@@ -89,7 +85,6 @@ def sample_token(logits: jax.Array, key: jax.Array, *, temperature: float, top_k
             token = indices[jax.random.categorical(key, values)].astype(jnp.int32)
         else:
             token = jax.random.categorical(key, logits).astype(jnp.int32)
-    sc.check(token, "", jnp.int32)
     return token
 
 
@@ -127,10 +122,7 @@ def generate_tokens(
     tokens = jnp.asarray(prompt_ids, jnp.int32)[None, :]
 
     def prefill(params: Parameters, ids: jax.Array) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
-        sc = ShapeChecker(B=1, V=model.vocab_size)
-        sc.check(ids, "BT", jnp.int32)
         carry, logits = model.apply(params, ids, jnp.full((1,), ids.shape[1], jnp.int32))
-        sc.check(logits, "BTV", jnp.float32)
         return carry, logits[0, -1]
 
     def step(
@@ -138,10 +130,7 @@ def generate_tokens(
         ids: jax.Array,
         carry: GatedDeltaNet2StackCarry,
     ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
-        sc = ShapeChecker(B=1, V=model.vocab_size)
-        sc.check(ids, "B", jnp.int32)
         carry, logits = model.apply(params, ids, jnp.ones((1,), jnp.bool_), carry, method=model.step)
-        sc.check(logits, "BV", jnp.float32)
         return carry, logits[0]
 
     carry, logits = jax.jit(prefill)(variables, tokens)
