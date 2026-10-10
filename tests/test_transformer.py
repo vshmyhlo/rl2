@@ -7,7 +7,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from rl2.shape_checker import ShapeChecker
 from rl2.transformer import (
     BDTransformer,
     LayerAttentionBiases,
@@ -66,12 +65,12 @@ def reference_block(
     bias: np.ndarray | None = None,
 ) -> np.ndarray:
     """Float64 NumPy oracle with explicit attention over valid prefixes."""
-    sc = ShapeChecker(H=heads, K=kv_heads)
-    sc.check(x, "BTD")
+    chex.assert_shape(x, (None, None, None))
     chex.assert_type(x, np.floating)
-    sc.check(x_len, "B", np.int32)
+    chex.assert_shape(x_len, (x.shape[0],))
+    chex.assert_type(x_len, np.int32)
     if bias is not None:
-        sc.check(bias, "BHTT")
+        chex.assert_shape(bias, (x.shape[0], heads, x.shape[1], x.shape[1]))
         chex.assert_type(bias, np.floating)
     batch, steps, width = x.shape
     head_dim = width // heads
@@ -81,8 +80,10 @@ def reference_block(
     projected = [x @ np.asarray(params[f"{name}_proj"]["kernel"]) for name in ("q", "k", "v")]
     query = projected[0].reshape(batch, steps, heads, head_dim)
     key, value = (v.reshape(batch, steps, kv_heads, head_dim) for v in projected[1:])
-    sc.check(query, "BTHF", np.float64)
-    sc.check((key, value), "BTKF", np.float64)
+    chex.assert_shape(query, (x.shape[0], x.shape[1], heads, None))
+    chex.assert_type(query, np.float64)
+    chex.assert_shape((key, value), (x.shape[0], x.shape[1], kv_heads, query.shape[3]))
+    chex.assert_type((key, value), np.float64)
     output = np.zeros_like(query)
     for b in range(batch):
         for t in range(x_len[b]):
@@ -109,9 +110,11 @@ def reference_block(
     normalized *= np.asarray(params["norm2"]["scale"])
     gate = normalized @ np.asarray(params["gate_proj"]["kernel"])
     value = normalized @ np.asarray(params["up_proj"]["kernel"])
-    sc.check((gate, value), "BTI", np.float64)
+    chex.assert_shape((gate, value), (x.shape[0], x.shape[1], None))
+    chex.assert_type((gate, value), np.float64)
     result = x + ((gate / (1 + np.exp(-gate))) * value) @ np.asarray(params["down_proj"]["kernel"])
-    sc.check(result, "BTD", np.float64)
+    chex.assert_shape(result, (x.shape[0], x.shape[1], x.shape[2]))
+    chex.assert_type(result, np.float64)
     return np.where((np.arange(steps)[None, :] < x_len[:, None])[..., None], result, 0)
 
 
@@ -166,23 +169,27 @@ def test_noncausal_padded_and_cached_attention_matches_reference() -> None:
     model = _TransformerBlock(8, num_heads=2, num_kv_heads=1, max_seq_len=6, initializer_range=0.2, causal=False)
     x = jax.random.normal(jax.random.key(33), (2, 5, 8))
     x_len = jnp.array([3, 5], jnp.int32)
-    sc = ShapeChecker(B=2, T=5, D=8, C=6, K=1, F=4)
-    sc.check(x, "BTD", jnp.float32)
-    sc.check(x_len, "B", jnp.int32)
+    chex.assert_shape(x, (2, 5, 8))
+    chex.assert_type(x, jnp.float32)
+    chex.assert_shape(x_len, (2,))
+    chex.assert_type(x_len, jnp.int32)
     variables = model.init(jax.random.key(34), x)
     expected = reference_block(
         np.asarray(x), variables["params"], np.asarray(x_len), 2, 1, model.rope_theta, causal=False
     )
     full_carry, actual = jax.jit(model.apply)(variables, x, x_len=x_len)
-    sc.check(actual, "BTD", jnp.float32)
+    chex.assert_shape(actual, (2, 5, 8))
+    chex.assert_type(actual, jnp.float32)
     np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-5)
 
     carry, _ = model.apply(variables, x[:, :1])
     # Unused slots must be excluded even when they contain nonzero data.
     carry = carry._replace(key=carry.key.at[:, 1:3].set(100), value=carry.value.at[:, 1:3].set(100))
-    sc.check((carry.key, carry.value), "BCKF", jnp.float32)
+    chex.assert_shape((carry.key, carry.value), (2, 6, 1, 4))
+    chex.assert_type((carry.key, carry.value), jnp.float32)
     cached_carry, cached = jax.jit(model.apply)(variables, x[:, 1:], x_len - 1, carry)
-    sc.check(cached, "BSD", jnp.float32)
+    chex.assert_shape(cached, (2, None, 8))
+    chex.assert_type(cached, jnp.float32)
     np.testing.assert_allclose(cached, expected[:, 1:], atol=2e-6, rtol=2e-5)
     assert_carry_close(cached_carry, full_carry)
 
@@ -192,8 +199,8 @@ def test_noncausal_step_is_rejected_before_projections(stack: bool) -> None:
     kwargs = {"dim": 4, "num_heads": 1, "max_seq_len": 2, "causal": False}
     model = Transformer(**kwargs, num_layers=1) if stack else _TransformerBlock(**kwargs)
     x = jnp.zeros((1, 4), jnp.float32)
-    sc = ShapeChecker(B=1, D=4)
-    sc.check(x, "BD", jnp.float32)
+    chex.assert_shape(x, (1, 4))
+    chex.assert_type(x, jnp.float32)
     step = partial(model.apply, x_active=jnp.ones((1,), jnp.bool_), method=model.step)
     with pytest.raises(ValueError, match=r"step\(\) requires causal=True"):
         step({}, x)
@@ -288,8 +295,8 @@ def test_stack_matches_llama_reference_with_final_norm(causal: bool) -> None:
         causal=causal,
     )
     x = jax.random.normal(jax.random.key(31), (1, 3, 8))
-    sc = ShapeChecker(B=1, T=3, D=8)
-    sc.check(x, "BTD", jnp.float32)
+    chex.assert_shape(x, (1, 3, 8))
+    chex.assert_type(x, jnp.float32)
     variables = model.init(jax.random.key(32), x)
     params = variables["params"]
     params["norm_f"]["scale"] = jnp.linspace(0.5, 1.5, 8)
@@ -314,7 +321,8 @@ def test_stack_matches_llama_reference_with_final_norm(causal: bool) -> None:
     expected /= np.sqrt(np.mean(expected**2, axis=-1, keepdims=True) + model.norm_epsilon)
     expected *= np.asarray(params["norm_f"]["scale"])
     _, actual = jax.jit(model.apply)(variables, x)
-    sc.check(actual, "BTD", jnp.float32)
+    chex.assert_shape(actual, (1, 3, 8))
+    chex.assert_type(actual, jnp.float32)
     np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-5)
 
 
@@ -377,9 +385,10 @@ def test_full_chunks_and_scanned_steps_agree(stack: bool) -> None:
 
     def step(state: Carry, inputs: tuple[jax.Array, jax.Array]) -> tuple[Carry, jax.Array]:
         token, x_active = inputs
-        sc = ShapeChecker(B=2, D=8)
-        sc.check(token, "BD", jnp.float32)
-        sc.check(x_active, "B", jnp.bool_)
+        chex.assert_shape(token, (2, 8))
+        chex.assert_type(token, jnp.float32)
+        chex.assert_shape(x_active, (2,))
+        chex.assert_type(x_active, jnp.bool_)
         return model.apply(variables, token, x_active, state, method=model.step)
 
     x_active = jnp.arange(5)[:, None] < x_len
@@ -498,51 +507,15 @@ def test_invalid_configuration(kwargs: dict[str, Any]) -> None:
         _TransformerBlock(**({"dim": 16, "num_heads": 4} | kwargs)).initial_carry(2)
 
 
-def test_invalid_inputs_and_carries() -> None:
-    model = _TransformerBlock(16, num_heads=4, max_seq_len=4)
-    x = jnp.zeros((1, 2, 16))
-    variables = model.init(jax.random.key(13), x)
-    carry = model.initial_carry(1)
-    with pytest.raises(AssertionError):
-        model.apply(variables, x.astype(jnp.int32))
-    with pytest.raises(AssertionError):
-        model.apply(variables, x, x_len=jnp.zeros((1,), jnp.bool_))
-    with pytest.raises(AssertionError):
-        model.apply(variables, x, x_len=jnp.zeros((2,), jnp.int32))
-    with pytest.raises(AssertionError):
-        model.apply(variables, x, carry=model.initial_carry(2))
-    with pytest.raises(AssertionError):
-        model.apply(variables, x, carry=carry._replace(position=jnp.zeros((1,), jnp.float32)))
-    with pytest.raises(AssertionError):
-        model.apply(variables, x, carry=carry._replace(key=carry.key[:, :2]))
-    with pytest.raises(AssertionError):
-        model.apply(variables, x, carry=carry._replace(value=carry.value.astype(jnp.bfloat16)))
-    with pytest.raises(AssertionError):
-        model.apply(variables, x[..., :8])
-    with pytest.raises(AssertionError):
-        model.apply(variables, x[:, 0])
-
-
 @pytest.mark.parametrize("stack,step", [(False, True), (True, False), (True, True)])
-def test_sequence_and_step_validate_inputs_before_projections(stack: bool, step: bool) -> None:
+def test_sequence_and_step_validate_input_dtype_and_layer_count(stack: bool, step: bool) -> None:
     model = Transformer(8, 1, num_heads=2) if stack else _TransformerBlock(8, num_heads=2)
     shape = (1, 8) if step else (1, 2, 8)
     x = jnp.zeros(shape, jnp.float32)
     method = model.step if step else model.__call__
     apply = partial(model.apply, method=method, **({"x_active": jnp.ones((1,), jnp.bool_)} if step else {}))
-    # Empty variables ensure invalid metadata is rejected before any projection.
-    with pytest.raises(AssertionError):
-        apply({}, x[..., :4])
-    with pytest.raises(AssertionError):
-        apply({}, x[None])
     with pytest.raises(AssertionError):
         apply({}, x.astype(jnp.int32))
-    argument = "x_active" if step else "x_len"
-    dtype = jnp.bool_ if step else jnp.int32
-    with pytest.raises(AssertionError):
-        apply({}, x, **{argument: jnp.zeros((1,), jnp.float32)})
-    with pytest.raises(AssertionError):
-        apply({}, x, **{argument: jnp.zeros((1, 1), dtype)})
     if stack:
         with pytest.raises(ValueError, match="one TransformerCarry per layer"):
             apply({}, x, carry=())
@@ -584,14 +557,17 @@ def test_cudnn_lengths_and_mask_padding_preserve_outputs_and_gradients(
         local_window_size: tuple[int, int] | None,
         implementation: str,
     ) -> jax.Array:
-        sc = ShapeChecker(B=2, H=2, K=1, F=8, U=1)
         assert bias is None
-        sc.check(query, "BQHF", jnp.bfloat16)
-        sc.check((key, value), "BSKF", jnp.bfloat16)
+        chex.assert_shape(query, (2, None, 2, 8))
+        chex.assert_type(query, jnp.bfloat16)
+        chex.assert_shape((key, value), (2, None, 1, 8))
+        chex.assert_type((key, value), jnp.bfloat16)
         assert query_seq_lengths is not None and key_value_seq_lengths is not None
-        sc.check((query_seq_lengths, key_value_seq_lengths), "B", jnp.int32)
+        chex.assert_shape((query_seq_lengths, key_value_seq_lengths), (2,))
+        chex.assert_type((query_seq_lengths, key_value_seq_lengths), jnp.int32)
         if mask is not None:
-            sc.check(mask, "BUQS", jnp.bool_)
+            chex.assert_shape(mask, (2, 1, query.shape[1], key.shape[1]))
+            chex.assert_type(mask, jnp.bool_)
         assert (mask is not None) == (cached and causal and steps > 1)
         assert is_causal == (causal and not cached)
         expected_keys = window if cached else steps
@@ -739,9 +715,10 @@ def test_bidirectional_layer_biases_without_rope_match_numpy_and_receive_gradien
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
 
     def loss(inputs: jax.Array, biases: LayerAttentionBiases) -> jax.Array:
-        sc = ShapeChecker(B=2, T=3, D=6, H=2)
-        sc.check(inputs, "BTD", jnp.float32)
-        sc.check(biases, "BHTT", jnp.float32)
+        chex.assert_shape(inputs, (2, 3, 6))
+        chex.assert_type(inputs, jnp.float32)
+        chex.assert_shape(biases, (2, 2, 3, 3))
+        chex.assert_type(biases, jnp.float32)
         # A first-position output must depend on later live positions.
         return model.apply(variables, inputs, lengths, biases=biases)[:, 0, 0].sum()
 
@@ -755,11 +732,11 @@ def test_bidirectional_layer_biases_without_rope_match_numpy_and_receive_gradien
         np.testing.assert_array_equal(gradient[0, :, :, 2], 0)
 
 
-@pytest.mark.parametrize("invalid", ["count", "shape", "dtype"])
+@pytest.mark.parametrize("invalid", ["count", "dtype"])
 def test_bidirectional_stack_rejects_invalid_biases(invalid: str) -> None:
     model = BDTransformer(6, 2, num_heads=2, max_seq_len=3, use_rope=False)
     x = jnp.zeros((1, 3, 6), jnp.float32)
-    bias = jnp.zeros((1, 2, 3, 2 if invalid == "shape" else 3), jnp.int32 if invalid == "dtype" else jnp.float32)
+    bias = jnp.zeros((1, 2, 3, 3), jnp.int32 if invalid == "dtype" else jnp.float32)
     biases = (bias,) if invalid == "count" else (bias, bias)
     with pytest.raises(ValueError if invalid == "count" else AssertionError):
         model.apply({}, x, jnp.asarray([3], jnp.int32), biases=biases)

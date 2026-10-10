@@ -12,13 +12,12 @@ from pydantic import ValidationError
 
 from rl2.alphazero import checkpoints as ckpt
 from rl2.alphazero.config import Config, EvaluationConfig
-from rl2.shape_checker import ShapeChecker
 
 
 def test_checkpoint_round_trip(tmp_path: Path) -> None:
     def apply(params: dict[str, jax.Array]) -> jax.Array:
-        sc = ShapeChecker(W=1)
-        sc.check(params["weight"], "W", jnp.float32)
+        chex.assert_shape(params["weight"], (1,))
+        chex.assert_type(params["weight"], jnp.float32)
         return params["weight"]
 
     state = TrainState.create(apply_fn=apply, params={"weight": jnp.ones(1)}, tx=optax.adam(1e-3))

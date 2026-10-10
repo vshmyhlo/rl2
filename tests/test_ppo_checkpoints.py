@@ -17,7 +17,6 @@ import pytest
 from flax.training.train_state import TrainState
 
 from rl2 import ppo
-from rl2.shape_checker import ShapeChecker
 
 
 @pytest.mark.parametrize("use_tf", [None, "true"], ids=["default-gcsfs", "explicit-tensorflow"])
@@ -81,8 +80,8 @@ def config(tmp_path: Path) -> ppo.Config:
 @pytest.fixture
 def state() -> TrainState:
     def apply(params: dict[str, jax.Array]) -> jax.Array:
-        sc = ShapeChecker(W=2)
-        sc.check(params["weight"], "W", jnp.float32)
+        chex.assert_shape(params["weight"], (2,))
+        chex.assert_type(params["weight"], jnp.float32)
         return params["weight"]
 
     state = TrainState.create(apply_fn=apply, params={"weight": jnp.array([1.0, -1.0])}, tx=optax.adam(1e-3))

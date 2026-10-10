@@ -3,13 +3,13 @@
 from dataclasses import replace
 from pathlib import Path
 
+import chex
 import jax
 import jax.numpy as jnp
 import pytest
 
 from rl2.ppo import GDN2Config, ModelType, load_config, make_model
 from rl2.ppo_rnd import load_config as load_rnd_config
-from rl2.shape_checker import ShapeChecker
 
 
 def test_ppo_configs_specify_distinct_run_ids() -> None:
@@ -143,9 +143,10 @@ def test_base_atari_config_parameter_budget() -> None:
         model.initial_carry(1),
         jax.ShapeDtypeStruct((1, 1), jnp.bool_),
     )
-    sc = ShapeChecker(T=1, B=1, A=6)
-    sc.check(logits, "TBA", jnp.float32)
-    sc.check(values, "TB", jnp.float32)
+    chex.assert_shape(logits, (1, 1, 6))
+    chex.assert_type(logits, jnp.float32)
+    chex.assert_shape(values, (1, 1))
+    chex.assert_type(values, jnp.float32)
     assert variables["params"]["encoder"]["Dense_0"]["kernel"].shape == (11 * 11 * 64, 768)
     count = sum(parameter.size for parameter in jax.tree.leaves(variables["params"]))
     assert 9_000_000 <= count <= 9_200_000

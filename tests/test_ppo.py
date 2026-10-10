@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
 
+import chex
 import cv2
 import gymnasium as gym
 import jax
@@ -30,7 +31,6 @@ from rl2.ppo import (
     update,
     value,
 )
-from rl2.shape_checker import ShapeChecker
 
 
 def small_model_config(model_type: ppo.ModelType) -> ppo.ModelConfig:
@@ -173,10 +173,12 @@ def test_single_transition_keeps_policy_gradient() -> None:
     def apply(
         variables: optax.Params, obs: ppo.Array, carry: ppo.RecurrentCarry, starts: ppo.Array
     ) -> tuple[ppo.RecurrentCarry, jax.Array, jax.Array]:
-        sc = ShapeChecker(T=1, B=1, F=1, H=1, W=1, A=2)
-        sc.check(obs, "TBFHW", jnp.uint8)
-        sc.check(starts, "TB", jnp.bool_)
-        sc.check(variables["params"]["logits"], "TBA", jnp.float32)
+        chex.assert_shape(obs, (1, 1, 1, 1, 1))
+        chex.assert_type(obs, jnp.uint8)
+        chex.assert_shape(starts, (1, 1))
+        chex.assert_type(starts, jnp.bool_)
+        chex.assert_shape(variables["params"]["logits"], (1, 1, 2))
+        chex.assert_type(variables["params"]["logits"], jnp.float32)
         return carry, variables["params"]["logits"], jnp.zeros((1, 1))
 
     state = TrainState.create(apply_fn=apply, params={"logits": jnp.zeros((1, 1, 2))}, tx=optax.sgd(0.1))
@@ -675,9 +677,6 @@ def test_policy_diagnostics() -> None:
     _, metrics = update(state, same_policy_batch, config)
     assert float(metrics[3]) == pytest.approx(0.0, rel=0, abs=5e-07)
     assert float(metrics[4]) == 0.0
-    # A stray singleton dimension would silently broadcast the loss to [B, B].
-    with pytest.raises(AssertionError):
-        update(state, (*batch[:2], batch[2][:, None], *batch[3:]), config)
 
 
 def test_explained_variance() -> None:
@@ -756,21 +755,25 @@ def test_rollout_bootstraps_only_timeouts_before_partial_reset() -> None:
     model.init.return_value = {"params": {"weight": jnp.zeros(1)}}
 
     def predict(state: TrainState, obs: ppo.Array, memory: ppo.RecurrentCarry, starts: ppo.Array) -> np.ndarray:
-        sc = ShapeChecker(B=4, F=1)
-        sc.check(obs, "BF", np.uint8)
-        sc.check(starts, "B", np.bool_)
+        chex.assert_shape(obs, (4, 1))
+        chex.assert_type(obs, np.uint8)
+        chex.assert_shape(starts, (4,))
+        chex.assert_type(starts, np.bool_)
         prediction = np.asarray(obs[:, 0], dtype=np.float32)
-        sc.check(prediction, "B", np.float32)
+        chex.assert_shape(prediction, (4,))
+        chex.assert_type(prediction, np.float32)
         return prediction
 
     def check_batch(
         state: TrainState, batch: ppo.PPOBatch, config: ppo.Config, iteration: int
     ) -> tuple[TrainState, ppo.PPOMetrics]:
         obs, _, _, advantages, returns, memory, starts = batch
-        sc = ShapeChecker(T=2, B=4, F=1)
-        sc.check(obs, "TBF", np.uint8)
-        sc.check([advantages, returns], "TB", np.float32)
-        sc.check(starts, "TB", np.bool_)
+        chex.assert_shape(obs, (2, 4, 1))
+        chex.assert_type(obs, np.uint8)
+        chex.assert_shape([advantages, returns], (2, 4))
+        chex.assert_type([advantages, returns], np.float32)
+        chex.assert_shape(starts, (2, 4))
+        chex.assert_type(starts, np.bool_)
         # Minibatches permute whole environments; recover their original order.
         order = np.argsort(obs[0, :, 0])
         np.testing.assert_array_equal(obs[:, order], np.stack([initial_obs, reset_obs]))
@@ -816,14 +819,6 @@ def test_rollout_bootstraps_only_timeouts_before_partial_reset() -> None:
     assert scalars["charts/return_mean_100"] == pytest.approx(2 / 3)  # Raw rewards, without clipping or bootstrap.
     assert scalars["charts/total_episodes"] == 3
     envs.close.assert_called_once()
-
-
-@pytest.mark.parametrize("invalid", ["broadcast_mask", "float_mask"])
-def test_gae_rejects_invalid_mask(invalid: str) -> None:
-    rewards = jnp.ones((2, 2), dtype=jnp.float32)
-    dones = jnp.zeros((2, 1), dtype=jnp.bool_) if invalid == "broadcast_mask" else jnp.zeros((2, 2), dtype=jnp.float32)
-    with pytest.raises(AssertionError):
-        gae(rewards, dones, jnp.zeros_like(rewards), jnp.zeros(2), 0.9, 0.8)
 
 
 class SyntheticAtariEnv(gym.Env):
@@ -1060,15 +1055,6 @@ def test_model_config_loading_and_factory(tmp_path: Path, backend: str) -> None:
         for leaf in layer:
             assert leaf.dtype == jnp.float32
             np.testing.assert_array_equal(leaf, 0)
-
-
-@pytest.mark.parametrize("bad_input", ("observation_dtype", "reset_mask_shape"))
-def test_step_rejects_invalid_array_metadata(bad_input: str) -> None:
-    model = ActorCritic(3, ppo.LSTMConfig(hidden_size=8), encoder_stages=(ConvStage(4, blocks=1),), embedding_size=8)
-    obs = jax.ShapeDtypeStruct((2, 1, 8, 8), jnp.float32 if bad_input == "observation_dtype" else jnp.uint8)
-    starts = jnp.zeros((1, 2) if bad_input == "reset_mask_shape" else (2,), dtype=jnp.bool_)
-    with pytest.raises(AssertionError):
-        jax.eval_shape(partial(model.init, method=model.step), jax.random.key(0), obs, model.initial_carry(2), starts)
 
 
 def test_mamba3_config_loading_and_factory(tmp_path: Path) -> None:

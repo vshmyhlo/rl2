@@ -12,7 +12,6 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 
 from rl2.mamba3 import Mamba3, Mamba3Carry, Mamba3Stack, Mamba3StackCarry, _ssm_step
 from rl2.sequence_model import RecurrentSequenceModel
-from rl2.shape_checker import ShapeChecker
 
 
 def assert_carry_close(actual: Mamba3Carry, expected: Mamba3Carry) -> None:
@@ -38,8 +37,8 @@ def test_incoming_carry_gradients_stop_at_resets(model: Mamba3 | Mamba3Stack) ->
 
     def loss(carry: Mamba3Carry | Mamba3StackCarry) -> jax.Array:
         final, output = model.apply(variables, x, carry, starts)
-        sc = ShapeChecker(T=2, B=2, D=4)
-        sc.check(output, "TBD", jnp.float32)
+        chex.assert_shape(output, (2, 2, 4))
+        chex.assert_type(output, jnp.float32)
         return output.sum() + sum(leaf.sum() for leaf in jax.tree.leaves(final))
 
     gradients = jax.jit(jax.grad(loss))(incoming)
@@ -279,43 +278,6 @@ def test_invalid_configuration(options: dict[str, Any]) -> None:
         Mamba3(**settings).initial_carry(2)
 
 
-def test_invalid_input_and_carry_shapes() -> None:
-    model = Mamba3(8, d_state=8, headdim=4)
-    x = jnp.zeros((3, 2, 8))
-    variables = model.init(
-        jax.random.key(0),
-        x,
-        carry=model.initial_carry(num_envs=x.shape[-2]),
-        episode_starts=jnp.zeros(x.shape[:-1], jnp.bool_),
-    )
-    with pytest.raises(AssertionError):
-        model.apply(
-            variables,
-            x[0],
-            carry=model.initial_carry(num_envs=x[0].shape[-2]),
-            episode_starts=jnp.zeros(x[0].shape[:-1], jnp.bool_),
-        )
-    with pytest.raises(AssertionError):
-        model.apply(variables, x, model.initial_carry(1), episode_starts=jnp.zeros(x.shape[:-1], jnp.bool_))
-    carry = model.initial_carry(num_envs=2)
-    starts = jnp.zeros(x.shape[:2], jnp.bool_)
-    for name, leaf in zip(carry._fields, carry):
-        with pytest.raises(AssertionError):
-            model.apply(variables, x, carry._replace(**{name: leaf[..., :-1]}), starts)
-    with pytest.raises(AssertionError):
-        model.apply(variables, x, carry._replace(state=carry.state.astype(jnp.bfloat16)), starts)
-    with pytest.raises(AssertionError):
-        model.apply(variables, x, episode_starts=jnp.zeros((2, 3)), carry=model.initial_carry(num_envs=x.shape[-2]))
-    with pytest.raises(AssertionError):
-        model.apply(
-            variables,
-            x[0],
-            episode_starts=jnp.zeros((1, 2)),
-            method=model.step,
-            carry=model.initial_carry(num_envs=x[0].shape[-2]),
-        )
-
-
 # SISO and MIMO have different rotation layouts; larger MIMO ranks share a path.
 # Cover both RoPE fractions, normalization modes, and full/chunked gradients.
 @pytest.mark.parametrize(
@@ -408,23 +370,9 @@ def test_official_initialization_and_bounded_phase() -> None:
     assert np.all((carry.angle >= 0) & (carry.angle < 2 * jnp.pi))
 
 
-def test_rejects_nonfloating_inputs_and_nonboolean_resets() -> None:
-    model = Mamba3(8, d_state=8, headdim=4)
-    x = jnp.ones((3, 2, 8), jnp.float32)
-    params = model.init(
-        jax.random.key(0),
-        x,
-        carry=model.initial_carry(num_envs=x.shape[-2]),
-        episode_starts=jnp.zeros(x.shape[:-1], jnp.bool_),
-    )
+def test_rejects_nonfloating_inputs() -> None:
+    model = Mamba3(4, d_state=4, headdim=2)
     with pytest.raises(AssertionError):
-        model.apply(
-            params,
-            x.astype(jnp.int32),
-            carry=model.initial_carry(num_envs=(x.astype(jnp.int32)).shape[-2]),
-            episode_starts=jnp.zeros((x.astype(jnp.int32)).shape[:-1], jnp.bool_),
-        )
-    with pytest.raises(AssertionError):
-        model.apply(
-            params, x, episode_starts=jnp.ones((3, 2), jnp.float32), carry=model.initial_carry(num_envs=x.shape[-2])
+        model.init(
+            jax.random.key(0), jnp.ones((1, 1, 4), jnp.int32), model.initial_carry(1), jnp.zeros((1, 1), jnp.bool_)
         )

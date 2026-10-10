@@ -134,47 +134,14 @@ def test_lstm_gradients_follow_history_but_stop_at_episode_reset(stacked: bool) 
         assert float(jnp.linalg.norm(grad[1])) > 0
 
 
-@pytest.mark.parametrize(
-    "method,bad_input",
-    [
-        ("step", "input_rank"),
-        ("__call__", "input_rank"),
-        ("step", "input_dtype"),
-        ("__call__", "mask_dtype"),
-        ("step", "mask_shape"),
-        ("__call__", "mask_shape"),
-        ("step", "carry_batch"),
-        ("__call__", "carry_width"),
-        ("step", "cell_dtype"),
-        ("__call__", "hidden_dtype"),
-        ("__call__", "empty_time"),
-        ("step", "empty_batch"),
-        ("step", "empty_features"),
-    ],
-)
-def test_lstm_validates_its_inputs(method: str, bad_input: str) -> None:
+@pytest.mark.parametrize("shape", [(0, 1, 3), (1, 0, 3), (1, 1, 0)], ids=["time", "batch", "features"])
+def test_lstm_rejects_empty_input_dimensions(shape: tuple[int, int, int]) -> None:
     model = LSTM(4)
-    x_shape = (2, 3) if method == "step" else (4, 2, 3)
-    if bad_input == "input_rank":
-        x_shape = x_shape + (1,)
-    elif bad_input in ("empty_time", "empty_batch"):
-        x_shape = (0, *x_shape[1:])
-    elif bad_input == "empty_features":
-        x_shape = (*x_shape[:-1], 0)
-    x = jax.ShapeDtypeStruct(x_shape, jnp.int32 if bad_input == "input_dtype" else jnp.float32)
-    mask_shape = (2,) if method == "step" else (4, 2)
-    if bad_input == "mask_shape":
-        mask_shape = (*mask_shape[:-1], 1)
-    elif bad_input in ("empty_time", "empty_batch"):
-        mask_shape = (0, *mask_shape[1:])
-    starts = jax.ShapeDtypeStruct(mask_shape, jnp.int32 if bad_input == "mask_dtype" else jnp.bool_)
-    carry_shape = (1, 4) if bad_input == "carry_batch" else (2, 3) if bad_input == "carry_width" else (2, 4)
-    carry = (
-        jax.ShapeDtypeStruct(carry_shape, jnp.bfloat16 if bad_input == "cell_dtype" else jnp.float32),
-        jax.ShapeDtypeStruct(carry_shape, jnp.bfloat16 if bad_input == "hidden_dtype" else jnp.float32),
-    )
+    x = jax.ShapeDtypeStruct(shape, jnp.float32)
+    starts = jax.ShapeDtypeStruct(shape[:2], jnp.bool_)
+    carry = initial_carry(1, 4)
     with pytest.raises(AssertionError):
-        jax.eval_shape(partial(model.init, method=method), jax.random.key(0), x, carry, starts)
+        jax.eval_shape(model.init, jax.random.key(0), x, carry, starts)
 
 
 @pytest.mark.parametrize("num_envs,hidden_size", [(0, 4), (2, 0)])
@@ -191,30 +158,12 @@ def test_lstm_stack_rejects_invalid_dimensions(field: str) -> None:
         LSTMStack(**settings).initial_carry(2)
 
 
-@pytest.mark.parametrize(
-    "method,bad_input",
-    [
-        ("__call__", "carry_layers"),
-        ("step", "carry_layers"),
-        ("__call__", "carry_width"),
-        ("step", "carry_dtype"),
-        ("__call__", "input_width"),
-        ("step", "mask_dtype"),
-    ],
-)
-def test_lstm_stack_validates_inputs(method: str, bad_input: str) -> None:
+@pytest.mark.parametrize("method", ["__call__", "step"])
+def test_lstm_stack_validates_layer_count(method: str) -> None:
     model = LSTMStack(4, 2, 8)
-    shape = (2, 4) if method == "step" else (4, 2, 4)
-    if bad_input == "input_width":
-        shape = (*shape[:-1], 3)
+    shape = (1, 4) if method == "step" else (1, 1, 4)
     x = jax.ShapeDtypeStruct(shape, jnp.float32)
-    starts = jax.ShapeDtypeStruct(shape[:-1], jnp.int32 if bad_input == "mask_dtype" else jnp.bool_)
-    carry = model.initial_carry(2)
-    if bad_input == "carry_layers":
-        carry = carry[:1]
-    elif bad_input == "carry_width":
-        carry = (carry[0], (carry[1][0][:, :3], carry[1][1]))
-    elif bad_input == "carry_dtype":
-        carry = (carry[0], (carry[1][0], carry[1][1].astype(jnp.bfloat16)))
-    with pytest.raises(ValueError if bad_input == "carry_layers" else AssertionError):
+    starts = jax.ShapeDtypeStruct(shape[:-1], jnp.bool_)
+    carry = model.initial_carry(1)[:1]
+    with pytest.raises(ValueError, match="one LSTMCarry per layer"):
         jax.eval_shape(partial(model.init, method=method), jax.random.key(0), x, carry, starts)

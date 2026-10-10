@@ -91,8 +91,9 @@ from tensorboardX import SummaryWriter
 from rl2.alphazero.checkpoints import TrainingProgress, checkpoint_manager, restore_checkpoint, save_checkpoint
 from rl2.alphazero.config import Config, load_config
 from rl2.alphazero.evaluation import evaluate
-from rl2.alphazero.model import PolicyValueNet
-from rl2.alphazero.search import Parameters, masked_logits, recurrent_step
+from rl2.alphazero.model import Parameters, PolicyValueNet
+from rl2.alphazero.search import recurrent_step
+from rl2.alphazero.utils import masked_logits
 from rl2.configuration import resolve_settings
 from rl2.shape_checker import ShapeChecker
 
@@ -143,7 +144,8 @@ def collect_selfplay(
     sc.check(key, "K", jnp.uint32)
     init_key, play_key = jax.random.split(key)
     states = jax.vmap(env.init)(jax.random.split(init_key, config.num_envs))
-    recurrent_fn = partial(recurrent_step, env=env, model=model)
+    predict = partial(model.apply, {"params": params})
+    recurrent_fn = partial(recurrent_step, env=env)
 
     def step(
         states: pgx.State, inputs: tuple[jax.Array, jax.Array]
@@ -152,7 +154,7 @@ def collect_selfplay(
         step_sc = ShapeChecker(K=2, B=config.num_envs, A=env.num_actions)
         step_sc.check(key, "K", jnp.uint32)
         step_sc.check(move, "", jnp.int32)
-        logits, value = model.apply({"params": params}, states.observation)
+        logits, value = predict(states.observation)
         done = states.terminated | states.truncated
         root = mctx.RootFnOutput(
             prior_logits=masked_logits(logits, states.legal_action_mask),
@@ -162,7 +164,7 @@ def collect_selfplay(
         # Mctx calls this muzero_policy; using PGX as the exact transition
         # function makes it AlphaZero-style PUCT, with no learned dynamics.
         policy = mctx.muzero_policy(
-            params,
+            predict,
             key,
             root,
             recurrent_fn,

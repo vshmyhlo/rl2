@@ -9,7 +9,6 @@ import optax
 import pytest
 
 from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages, ResidualBlock
-from rl2.shape_checker import ShapeChecker
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -105,10 +104,11 @@ def test_custom_resize_stages_without_residual_blocks_jit_and_gradients() -> Non
     output, captured = jax.jit(partial(model.apply, capture_intermediates=True, mutable=["intermediates"]))(
         variables, obs
     )
-    sc = ShapeChecker(B=1, H=3, W=2, C=4, E=8)
-    sc.check(output, "BE", jnp.float32)
+    chex.assert_shape(output, (1, 8))
+    chex.assert_type(output, jnp.float32)
     for index, kernel in enumerate((4, 1)):
-        sc.check(captured["intermediates"][f"stage_{index}"]["__call__"][0], "BHWC", jnp.float32)
+        chex.assert_shape(captured["intermediates"][f"stage_{index}"]["__call__"][0], (1, 3, 2, 4))
+        chex.assert_type(captured["intermediates"][f"stage_{index}"]["__call__"][0], jnp.float32)
         params = variables["params"][f"stage_{index}"]
         assert params["resize_conv"]["conv"]["kernel"].shape == (kernel, kernel, 4, 4)
         assert not any(name.startswith("block_") for name in params)
@@ -116,8 +116,8 @@ def test_custom_resize_stages_without_residual_blocks_jit_and_gradients() -> Non
 
     def loss(params: optax.Params) -> jax.Array:
         output = model.apply({"params": params}, obs)
-        sc = ShapeChecker(B=1, E=8)
-        sc.check(output, "BE", jnp.float32)
+        chex.assert_shape(output, (1, 8))
+        chex.assert_type(output, jnp.float32)
         return jnp.square(output).mean()
 
     gradients = jax.jit(jax.grad(loss))(variables["params"])
@@ -137,26 +137,30 @@ def test_explicit_stages_support_jit_and_gradients(dtype: jax.typing.DTypeLike) 
     stages = (ConvStage(4, resize_factor=0.25), ConvStage(4, 1), ConvStage(4, 1), ConvStage(4, 1))
     model = ConvObservationEncoder(stages=stages, embedding_size=8, dtype=dtype)
     obs = jax.random.randint(jax.random.key(0), (2, 2, 17, 13), 0, 256, dtype=jnp.uint8)
-    sc = ShapeChecker(B=2, F=2, H=17, W=13, C=4, E=8, h=5, w=4)
-    sc.check(obs, "BFHW", jnp.uint8)
+    chex.assert_shape(obs, (2, 2, 17, 13))
+    chex.assert_type(obs, jnp.uint8)
     variables = model.init(jax.random.key(1), obs)
     output, captured = jax.jit(partial(model.apply, capture_intermediates=True, mutable=["intermediates"]))(
         variables, obs
     )
     stem = captured["intermediates"]["stem"]["__call__"][0]
-    sc.check(stem, "BHWC", dtype)
+    chex.assert_shape(stem, (2, 17, 13, 4))
+    chex.assert_type(stem, dtype)
     normalized_stem = captured["intermediates"]["stem_norm"]["__call__"][0]
-    sc.check(normalized_stem, "BHWC", dtype)
+    chex.assert_shape(normalized_stem, (2, 17, 13, 4))
+    chex.assert_type(normalized_stem, dtype)
     assert variables["params"]["stem"]["kernel"].shape == (7, 7, 2, 4)
-    sc.check(captured["intermediates"]["stage_0"]["resize_conv"]["__call__"][0], "BhwC", dtype)
-    sc.check(output, "BE", dtype)
+    chex.assert_shape(captured["intermediates"]["stage_0"]["resize_conv"]["__call__"][0], (2, 5, 4, 4))
+    chex.assert_type(captured["intermediates"]["stage_0"]["resize_conv"]["__call__"][0], dtype)
+    chex.assert_shape(output, (2, 8))
+    chex.assert_type(output, dtype)
     assert variables["params"]["Dense_0"]["kernel"].shape == (4, 8)
 
     def loss(params: optax.Params) -> jax.Array:
         chex.assert_trees_all_equal_shapes_and_dtypes(params, variables["params"])
         values = model.apply({"params": params}, obs)
-        sc = ShapeChecker(B=2, E=8)
-        sc.check(values, "BE", dtype)
+        chex.assert_shape(values, (2, 8))
+        chex.assert_type(values, dtype)
         return jnp.square(values.astype(jnp.float32)).mean()
 
     gradients = jax.jit(jax.grad(loss))(variables["params"])

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import chex
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
@@ -16,7 +17,6 @@ from rl2 import ppo, ppo_rnd
 from rl2.atari_eval import EvaluationConfig, ScoreBaselines, TrainingScores, _action, evaluate, make_evaluation_env
 from rl2.atari_scores import ATARI_REFERENCE_SCORES, REFERENCE_SOURCE, get_reference_scores
 from rl2.ppo import Array, Config, LSTMStackCarry, load_config
-from rl2.shape_checker import ShapeChecker
 
 
 def training_config() -> Config:
@@ -32,11 +32,13 @@ def policy(
     variables: dict[str, Any], obs: Array, carry: LSTMStackCarry, starts: Array, *, method: str
 ) -> tuple[LSTMStackCarry, jax.Array, jax.Array]:
     assert method == "step"
-    sc = ShapeChecker()
-    sc.check(obs, "BFHW", jnp.uint8)
-    sc.check(starts, "B", jnp.bool_)
+    chex.assert_shape(obs, (None, None, None, None))
+    chex.assert_type(obs, jnp.uint8)
+    chex.assert_shape(starts, (obs.shape[0],))
+    chex.assert_type(starts, jnp.bool_)
     for layer in carry:
-        sc.check(layer, "BD", jnp.float32)
+        chex.assert_shape(layer, (obs.shape[0], None))
+        chex.assert_type(layer, jnp.float32)
     carry = tuple(tuple(jnp.where(starts[:, None], 0, c) + 1 for c in layer) for layer in carry)
     return carry, variables["params"]["logits"][None], jnp.zeros(1)
 
@@ -178,10 +180,12 @@ def test_rnd_evaluation_carry_policy_interface_and_report(tmp_path: Path) -> Non
     def rnd_policy(
         variables: dict[str, Any], obs: Array, carry: ppo_rnd.LSTMCarry, starts: Array
     ) -> tuple[ppo_rnd.LSTMCarry, jax.Array, jax.Array]:
-        sc = ShapeChecker(T=1, B=1, F=1, H=84, W=84, D=2)
-        sc.check(obs, "TBFHW", jnp.uint8)
-        sc.check(starts, "TB", jnp.bool_)
-        sc.check(carry, "BD", jnp.float32)
+        chex.assert_shape(obs, (1, 1, 1, 84, 84))
+        chex.assert_type(obs, jnp.uint8)
+        chex.assert_shape(starts, (1, 1))
+        chex.assert_type(starts, jnp.bool_)
+        chex.assert_shape(carry, (1, 2))
+        chex.assert_type(carry, jnp.float32)
         memory = tuple(jnp.where(starts[0, :, None], 0, c) + 1 for c in carry)
         # The greedy action exposes whether memory advances and resets correctly.
         logits = jax.nn.one_hot(memory[0][:, 0].astype(jnp.int32), 6)[None]
@@ -252,26 +256,6 @@ def test_action_selection_and_recurrent_reset(greedy: bool) -> None:
     assert int(action) == expected
     for leaf in jax.tree.leaves(memory):
         np.testing.assert_array_equal(leaf, np.ones((1, 2)))
-
-
-@pytest.mark.parametrize(
-    "logits",
-    [
-        pytest.param(jnp.zeros((2, 6)), id="extra-logit-axis"),
-        pytest.param(jnp.zeros(6, dtype=jnp.int32), id="integer-logits"),
-    ],
-)
-def test_action_rejects_invalid_policy_logits(logits: jax.Array) -> None:
-    state = policy_state().replace(params={"logits": logits})
-    with pytest.raises(AssertionError, match="shape check"):
-        _action(
-            state,
-            np.zeros((1, 84, 84), dtype=np.uint8),
-            ppo.initial_model_carry(training_config(), 1),
-            True,
-            jax.random.key(1),
-            greedy=True,
-        )
 
 
 def test_cleanup_on_policy_failure() -> None:

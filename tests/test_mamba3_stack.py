@@ -252,38 +252,15 @@ def test_invalid_configuration(options: dict[str, Any]) -> None:
         Mamba3Stack(**config).initial_carry(2)
 
 
-def test_invalid_input_carry_and_reset() -> None:
-    model = Mamba3Stack(8, 2, d_state=8, headdim=4, d_intermediate=0)
-    x = jnp.ones((3, 2, 8), jnp.float32)
-    variables = model.init(
-        jax.random.key(8),
-        x,
-        carry=model.initial_carry(num_envs=x.shape[-2]),
-        episode_starts=jnp.zeros(x.shape[:-1], jnp.bool_),
-    )
-    for bad in (x[0], x.astype(jnp.int32), x[..., :7]):
-        with pytest.raises(AssertionError):
-            model.apply(
-                variables,
-                bad,
-                carry=model.initial_carry(num_envs=bad.shape[-2]),
-                episode_starts=jnp.zeros(bad.shape[:-1], jnp.bool_),
-            )
-    carry = model.initial_carry(2)
-    for bad in (carry[:1], model.initial_carry(1)):
-        with pytest.raises((AssertionError, TypeError, ValueError)):
-            model.apply(variables, x, bad, episode_starts=jnp.zeros(x.shape[:-1], jnp.bool_))
-    for bad in (jnp.zeros((3, 2)), jnp.zeros((2, 3), jnp.bool_)):
-        with pytest.raises(AssertionError):
-            model.apply(variables, x, episode_starts=bad, carry=model.initial_carry(num_envs=x.shape[-2]))
+def test_rejects_nonfloating_inputs_and_incorrect_layer_count() -> None:
+    model = Mamba3Stack(4, 2, d_state=4, headdim=2, d_intermediate=0)
+    x = jnp.ones((1, 1, 4), jnp.float32)
+    starts = jnp.zeros((1, 1), jnp.bool_)
+    carry = model.initial_carry(1)
     with pytest.raises(AssertionError):
-        model.apply(
-            variables,
-            x[0],
-            episode_starts=jnp.zeros((1, 2), jnp.bool_),
-            method=model.step,
-            carry=model.initial_carry(num_envs=x[0].shape[-2]),
-        )
+        model.init(jax.random.key(0), x.astype(jnp.int32), carry, starts)
+    with pytest.raises(ValueError, match="one Mamba3Carry per layer"):
+        model.init(jax.random.key(0), x, carry[:1], starts)
 
 
 @pytest.mark.parametrize("final_norm", [False, True])

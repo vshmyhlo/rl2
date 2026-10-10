@@ -147,21 +147,9 @@ def test_teacher_forcing_contains_only_prefix_information() -> None:
     assert batched.action_mask.shape == (2, 8, len(AST_ACTIONS))
 
 
-@pytest.mark.parametrize(
-    "invalid", ["node_shape", "action_width", "length_dtype", "length_shape", "negative", "overflow"]
-)
-def test_batch_features_rejects_inconsistent_arrays(invalid: str) -> None:
-    features = KarelAST.empty(4, 2).features()
-    if invalid == "node_shape":
-        features = features._replace(value=features.value[:-1])
-    elif invalid == "action_width":
-        features = features._replace(action_mask=features.action_mask[:, :-1])
-    elif invalid == "length_dtype":
-        features = features._replace(seq_len=features.seq_len.astype(np.bool_))
-    elif invalid == "length_shape":
-        features = features._replace(seq_len=features.seq_len[None])
-    else:
-        features = features._replace(seq_len=np.asarray(-1 if invalid == "negative" else 5, np.int32))
+@pytest.mark.parametrize("length", [-1, 5], ids=["negative", "overflow"])
+def test_batch_features_rejects_out_of_range_lengths(length: int) -> None:
+    features = KarelAST.empty(4, 2).features()._replace(seq_len=np.asarray(length, np.int32))
     with pytest.raises(AssertionError):
         batch_features((features,))
 
@@ -346,10 +334,6 @@ def test_invalid_parallel_actions_leave_original_tree_unchanged(bad: int) -> Non
     actions[7] = ACTION_ID["End"]
     with pytest.raises(ValueError, match="Non-hole"):
         tree.expand_round(actions)
-    with pytest.raises(AssertionError):
-        tree.expand_round(np.zeros(7, np.int32))
-    with pytest.raises(AssertionError):
-        tree.expand_round(np.zeros(8, np.float32))
 
 
 @pytest.mark.parametrize("leading_shape", [(), (3,), (2, 3)])

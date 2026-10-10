@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -19,7 +20,6 @@ from rl2.gdn2.checkpoints import (
     save_checkpoint,
     weight_specs,
 )
-from rl2.shape_checker import ShapeChecker
 
 if TYPE_CHECKING:
     import torch
@@ -83,8 +83,8 @@ def torch_reference_logits(
     import torch
     from torch.nn import functional as f
 
-    sc = ShapeChecker()
-    sc.check(tokens, "BT", np.int32)
+    chex.assert_shape(tokens, (None, None))
+    chex.assert_type(tokens, np.int32)
     c = model.config
     weights = {key: torch.from_numpy(value) for key, value in state.items()}
 
@@ -146,9 +146,10 @@ def torch_reference_logits(
             hidden = f.silu(linear(a, layer + "mlp.swiglu.w1")) * linear(a, layer + "mlp.swiglu.w2")
             x = x + linear(hidden, layer + "mlp.swiglu.w3")
         output = linear(norm(x, "transformer.ln_f"), "lm_head").numpy()
-    sc = ShapeChecker(V=model.vocab_size)
-    sc.check(tokens, "BT", np.int32)
-    sc.check(output, "BTV", np.float32)
+    chex.assert_shape(tokens, (None, None))
+    chex.assert_type(tokens, np.int32)
+    chex.assert_shape(output, (tokens.shape[0], tokens.shape[1], model.vocab_size))
+    chex.assert_type(output, np.float32)
     return output
 
 

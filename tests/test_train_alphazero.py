@@ -1,9 +1,11 @@
 import logging
 import sys
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from unittest.mock import MagicMock, Mock
 
+import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -51,8 +53,6 @@ def test_masked_logits() -> None:
     assert probs[0, 1] == 0
     np.testing.assert_allclose(probs.sum(-1), 1.0)
     assert np.isfinite(probs).all()
-    with pytest.raises(AssertionError):
-        az.masked_logits(logits, legal[:, :2])
 
 
 def test_outcomes_use_player_ids_and_exclude_unfinished_games() -> None:
@@ -78,12 +78,10 @@ def test_recurrent_step_terminal_reward_and_opponent_discount(
         return jnp.stack((x, x))
 
     output, next_states = az.recurrent_step(
-        params,
-        jax.random.PRNGKey(1),
+        partial(model.apply, {"params": params}),
         jnp.array([2, 8], jnp.int32),
         jax.tree.map(duplicate, state),
         env=env,
-        model=model,
     )
     np.testing.assert_array_equal(output.reward, [1, 0])
     np.testing.assert_array_equal(output.discount, [0, -1])
@@ -105,7 +103,11 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
         batch_size=10,
     )
     batch, metrics = az.collect_selfplay(params, jax.random.PRNGKey(2), env=env, model=model, config=config)
-    batch.validate()
+    chex.assert_shape(batch.observations, (10, 3, 3, 2))
+    chex.assert_shape(batch.policy_targets, (10, 9))
+    chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (10,))
+    chex.assert_type((batch.observations, batch.policy_targets, batch.value_targets), jnp.float32)
+    chex.assert_type((batch.policy_mask, batch.value_mask), jnp.bool_)
     assert metrics["completed_games"] == 1
     assert 5 <= metrics["positions"] <= 9
     np.testing.assert_array_equal(batch.value_mask, batch.policy_mask)

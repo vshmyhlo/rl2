@@ -113,7 +113,7 @@ def test_cached_padding_positions_and_bfloat16(tiny_gemma: tuple[Gemma3LM, Param
     assert not carry.valid[0, 4] and carry.valid[1, 4]
 
 
-def test_official_checkpoint_roundtrip_and_validation(
+def test_official_checkpoint_roundtrip(
     tiny_gemma: tuple[Gemma3LM, Parameters],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -134,7 +134,18 @@ def test_official_checkpoint_roundtrip_and_validation(
     for actual, expected in zip(jax.tree.leaves(variables["params"]), jax.tree.leaves(upstream), strict=True):
         assert actual.dtype == jnp.float32
         np.testing.assert_array_equal(actual, expected.astype(jnp.float32))
-    mocked = Mock(return_value={})
+
+
+def test_checkpoint_validation(tiny_gemma: tuple[Gemma3LM, Parameters], monkeypatch: pytest.MonkeyPatch) -> None:
+    model, params = tiny_gemma
+    monkeypatch.setattr(gm.nn, "Gemma3_270M", Mock(return_value=model.model))
+    path = "mock-checkpoint"
+    mocked = Mock(return_value=params)
+    monkeypatch.setattr(gm.ckpts, "load_params", mocked)
+    _, variables = load_gemma3_checkpoint(path, cache_length=6, dtype="bfloat16")
+    for actual, expected in zip(jax.tree.leaves(variables["params"]), jax.tree.leaves(params), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    mocked.return_value = {}
     monkeypatch.setattr(gm.ckpts, "load_params", mocked)
     with pytest.raises(ValueError, match="structure"):
         load_gemma3_checkpoint(str(path), cache_length=6, dtype="float32")

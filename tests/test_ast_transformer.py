@@ -23,7 +23,6 @@ from rl2.karel_ast import (
     batch_features,
     teacher_forcing,
 )
-from rl2.shape_checker import ShapeChecker
 from rl2.train_karel_ast_grpo import (
     Config,
     bucket_tree,
@@ -275,8 +274,8 @@ def test_ast_backbone_accepts_odd_head_width_without_rope(batch: ModelBatch) -> 
     tree = ASTFeatures(*(field[:1] for field in batch.tree))
     variables = model.init(jax.random.key(41), initial, target, tree)
     logits = model.apply(variables, initial, target, tree)
-    sc = ShapeChecker(B=1, N=24, A=len(AST_ACTIONS))
-    sc.check(logits, "BNA", jnp.float32)
+    chex.assert_shape(logits, (1, 24, len(AST_ACTIONS)))
+    chex.assert_type(logits, jnp.float32)
     np.testing.assert_array_equal(np.isfinite(logits[..., 1:]), tree.action_mask[..., 1:])
 
 

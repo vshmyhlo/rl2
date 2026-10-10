@@ -85,13 +85,6 @@ def test_relation_bias_ignores_padding_and_context_geometry() -> None:
     np.testing.assert_array_equal(bias, np.repeat(expected[:, None], 2, axis=1))
 
 
-@pytest.mark.parametrize("bad", ["dtype", "length_dtype", "shape", "rank", "empty"])
-def test_relations_validate_inputs(bad: str) -> None:
-    depth = jnp.zeros((2, 4), jnp.float32 if bad == "dtype" else jnp.int32)
-    seq_len = jnp.ones((3 if bad == "shape" else 2,), jnp.bool_ if bad == "length_dtype" else jnp.int32)
-    if bad == "rank":
-        depth, seq_len = depth[0], seq_len[0]
-    elif bad == "empty":
-        depth = depth[:, :0]
+def test_relations_reject_empty_trees() -> None:
     with pytest.raises(AssertionError):
-        tree_relations(depth, seq_len)
+        tree_relations(jnp.zeros((2, 0), jnp.int32), jnp.zeros((2,), jnp.int32))

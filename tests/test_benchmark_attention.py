@@ -1,13 +1,13 @@
 import argparse
 import signal
 
+import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from rl2 import benchmark_attention as benchmark
-from rl2.shape_checker import ShapeChecker
 
 
 @pytest.mark.parametrize("causal", [True, False])
@@ -18,9 +18,10 @@ def test_benchmark_attention_forward_and_gradients(causal: bool) -> None:
     inputs = (q, k, v, jnp.ones_like(q))
     attention = benchmark.make_attention("jax_xla", causal)
     out, dq, dk, dv = jax.jit(benchmark.make_workload(attention, True))(inputs)
-    sc = ShapeChecker(B=1, T=2, H=2, K=1, D=2)
-    sc.check((out, dq), "BTHD", jnp.bfloat16)
-    sc.check((dk, dv), "BTKD", jnp.bfloat16)
+    chex.assert_shape((out, dq), (1, 2, 2, 2))
+    chex.assert_type((out, dq), jnp.bfloat16)
+    chex.assert_shape((dk, dv), (1, 2, 1, 2))
+    chex.assert_type((dk, dv), jnp.bfloat16)
     expected = jnp.asarray([2, 4] if causal else [4, 4])[None, :, None, None]
     np.testing.assert_allclose(out.astype(jnp.float32), jnp.broadcast_to(expected, out.shape))
     np.testing.assert_array_equal(dq.astype(jnp.float32), 0)

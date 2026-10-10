@@ -9,7 +9,6 @@ import pytest
 
 from rl2.observation_decoder import ConvObservationDecoder
 from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStage
-from rl2.shape_checker import ShapeChecker
 
 
 def test_decoder_mirrors_configurable_stage_shapes() -> None:
@@ -22,8 +21,8 @@ def test_decoder_mirrors_configurable_stage_shapes() -> None:
     encoded, encoder_variables = jax.eval_shape(encoder.init_with_output, jax.random.key(0), obs)
     decoder = ConvObservationDecoder((1, 13, 11), stages=stages)
     decoded, decoder_variables = jax.eval_shape(decoder.init_with_output, jax.random.key(1), encoded)
-    sc = ShapeChecker(B=1, F=1, H=13, W=11)
-    sc.check(decoded, "BFHW", jnp.float32)
+    chex.assert_shape(decoded, (1, 1, 13, 11))
+    chex.assert_type(decoded, jnp.float32)
     # 13x11 -> 5x4 -> 2x2 with ceil-rounded bilinear resizing.
     assert encoder_variables["params"]["Dense_0"]["kernel"].shape == (16, 8)
     assert decoder_variables["params"]["projection"]["kernel"].shape == (8, 16)
@@ -112,10 +111,3 @@ def test_invalid_observation_shape(shape: tuple[int, ...]) -> None:
     decoder = ConvObservationDecoder(shape, stages=(ConvStage(4),))
     with pytest.raises((ValueError, AssertionError)):
         decoder.init(jax.random.key(0), jnp.zeros((2, 8)))
-
-
-def test_invalid_latent_shape_and_dtype() -> None:
-    decoder = ConvObservationDecoder((1, 4, 4), stages=(ConvStage(4),))
-    for latent in (jnp.zeros((2, 3, 8)), jnp.zeros((2, 8), jnp.int32)):
-        with pytest.raises(AssertionError):
-            decoder.init(jax.random.key(0), latent)

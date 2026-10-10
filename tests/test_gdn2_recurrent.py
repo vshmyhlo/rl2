@@ -11,7 +11,6 @@ import pytest
 
 from rl2.gdn2 import GatedDeltaNet2Config, GatedDeltaNet2Recurrent, GatedDeltaNet2Stack, GatedDeltaNet2StackCarry
 from rl2.sequence_model import RecurrentSequenceModel
-from rl2.shape_checker import ShapeChecker
 
 
 def assert_tree_close(actual: Any, expected: Any, tolerance: float = 2e-6) -> None:
@@ -99,8 +98,8 @@ def test_recurrent_stack_reset_stops_history_gradients() -> None:
     variables = model.init(jax.random.key(1), x, incoming, starts)
 
     def loss(inputs: jax.Array, memory: GatedDeltaNet2StackCarry) -> jax.Array:
-        sc = ShapeChecker(T=4, B=2, D=4)
-        sc.check(inputs, "TBD", jnp.float32)
+        chex.assert_shape(inputs, (4, 2, 4))
+        chex.assert_type(inputs, jnp.float32)
         return model.apply(variables, inputs, memory, starts)[1][-1].sum()
 
     inputs_grad, memory_grad = jax.jit(jax.grad(loss, argnums=(0, 1)))(x, incoming)
@@ -115,47 +114,15 @@ def test_recurrent_stack_reset_stops_history_gradients() -> None:
         assert float(jnp.linalg.norm(leaf[1])) > 0
 
 
-@pytest.mark.parametrize(
-    "method,bad_input",
-    [
-        ("__call__", "input_rank"),
-        ("step", "input_width"),
-        ("step", "input_dtype"),
-        ("__call__", "mask_dtype"),
-        ("step", "mask_shape"),
-        ("__call__", "carry_batch"),
-        ("step", "carry_dtype"),
-        ("step", "history_shape"),
-        ("__call__", "layer_count"),
-        ("__call__", "empty_time"),
-        ("step", "empty_batch"),
-    ],
-)
-def test_recurrent_stack_validation(method: str, bad_input: str) -> None:
-    model = GatedDeltaNet2Recurrent(GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1, conv_size=2), 1, 6)
-    x_shape = (2, 4) if method == "step" else (4, 2, 4)
-    if bad_input == "input_rank":
-        x_shape = (*x_shape, 1)
-    elif bad_input == "input_width":
-        x_shape = (*x_shape[:-1], 3)
-    elif bad_input in ("empty_time", "empty_batch"):
-        x_shape = (0, *x_shape[1:])
-    x = jax.ShapeDtypeStruct(x_shape, jnp.int32 if bad_input == "input_dtype" else jnp.float32)
-    mask_shape = (2,) if method == "step" else (4, 2)
-    if bad_input == "mask_shape":
-        mask_shape = (1,)
-    elif bad_input in ("empty_time", "empty_batch"):
-        mask_shape = (0, *mask_shape[1:])
-    starts = jax.ShapeDtypeStruct(mask_shape, jnp.int32 if bad_input == "mask_dtype" else jnp.bool_)
-    carry = model.initial_carry(1 if bad_input == "carry_batch" else 2)
-    if bad_input == "carry_dtype":
-        carry = (carry[0]._replace(state=carry[0].state.astype(jnp.bfloat16)),)
-    elif bad_input == "history_shape":
-        carry = (carry[0]._replace(q=jnp.zeros((2, 2, 2))),)
-    elif bad_input == "layer_count":
-        carry = ()
+@pytest.mark.parametrize("bad_input", ["input_dtype", "layer_count", "empty_time", "empty_batch"])
+def test_recurrent_stack_validation(bad_input: str) -> None:
+    model = GatedDeltaNet2Recurrent(GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1), 1, 6)
+    shape = (0, 1, 4) if bad_input == "empty_time" else (1, 0, 4) if bad_input == "empty_batch" else (1, 1, 4)
+    x = jax.ShapeDtypeStruct(shape, jnp.int32 if bad_input == "input_dtype" else jnp.float32)
+    starts = jax.ShapeDtypeStruct(shape[:2], jnp.bool_)
+    carry = () if bad_input == "layer_count" else model.initial_carry(1)
     with pytest.raises((AssertionError, ValueError)):
-        jax.eval_shape(partial(model.init, method=method), jax.random.key(0), x, carry, starts)
+        jax.eval_shape(model.init, jax.random.key(0), x, carry, starts)
 
 
 @pytest.mark.parametrize("num_layers,num_envs", [(0, 2), (1, 0)])

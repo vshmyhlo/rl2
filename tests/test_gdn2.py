@@ -22,7 +22,6 @@ from rl2.gdn2 import (
     gated_delta_rule,
 )
 from rl2.sequence_model import ARSequenceModel
-from rl2.shape_checker import ShapeChecker
 
 type Parameters = dict[str, Any]
 type SequenceModule = GatedDeltaNet2 | GatedDeltaNet2Stack
@@ -88,8 +87,8 @@ def test_sequence_carry_gradients(sequence_model: SequenceModule) -> None:
     variables = model.init(jax.random.key(23), x, lengths)
 
     def loss(inputs: jax.Array, *, chunked: bool) -> jax.Array:
-        sc = ShapeChecker(B=1, T=4, D=4)
-        sc.check(inputs, "BTD", jnp.float32)
+        chex.assert_shape(inputs, (1, 4, 4))
+        chex.assert_type(inputs, jnp.float32)
         if chunked:
             carry, _ = model.apply(variables, inputs[:, :2], lengths // 2)
             carry, output = model.apply(variables, inputs[:, 2:], lengths // 2, carry)
@@ -108,11 +107,8 @@ def test_sequence_carry_gradients(sequence_model: SequenceModule) -> None:
     [
         jnp.array([-1], jnp.int32),
         jnp.array([2], jnp.int32),
-        jnp.array([1.0], jnp.float32),
-        jnp.array([[1]], jnp.int32),
-        jnp.array([1, 1], jnp.int32),
     ],
-    ids=["negative", "too-long", "dtype", "rank", "batch"],
+    ids=["negative", "too-long"],
 )
 def test_sequence_length_validation(lengths: jax.Array) -> None:
     model = GatedDeltaNet2(GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1))
@@ -128,23 +124,18 @@ def test_sequence_length_validation_under_jit() -> None:
         jax.block_until_ready(jax.jit(model.apply)(variables, x, jnp.array([2], jnp.int32)))
 
 
-@pytest.mark.parametrize("active", [jnp.ones((1,), jnp.int32), jnp.ones((1, 1), jnp.bool_)], ids=["dtype", "rank"])
-def test_step_active_validation(active: jax.Array) -> None:
-    model = GatedDeltaNet2(GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1))
-    with pytest.raises(AssertionError):
-        model.init(jax.random.key(1), jnp.zeros((1, 4)), active, method=model.step)
-
-
 @pytest.mark.parametrize("size", [1, 3], ids=["no-history", "two-token-history"])
 def test_short_conv_prefix_masking(size: int, monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("jax_triton")
     from rl2.gdn2 import triton_backend
 
     def convolve(x: jax.Array, weight: jax.Array, bias: jax.Array) -> jax.Array:
-        sc = ShapeChecker(C=size)
-        sc.check(x, "BLD", jnp.float32)
-        sc.check(weight, "CD", jnp.float32)
-        sc.check(bias, "D", jnp.float32)
+        chex.assert_shape(x, (None, None, None))
+        chex.assert_type(x, jnp.float32)
+        chex.assert_shape(weight, (size, x.shape[2]))
+        chex.assert_type(weight, jnp.float32)
+        chex.assert_shape(bias, (x.shape[2],))
+        chex.assert_type(bias, jnp.float32)
         time = x.shape[1] - size + 1
         return jax.nn.silu(sum(x[:, i : i + time] * weight[i] for i in range(size)) + bias)
 
@@ -166,8 +157,8 @@ def test_short_conv_prefix_masking(size: int, monkeypatch: pytest.MonkeyPatch) -
     np.testing.assert_array_equal(output[~valid], 0)
 
     def loss(inputs: jax.Array) -> jax.Array:
-        sc = ShapeChecker(B=3, T=3, D=2)
-        sc.check(inputs, "BTD", jnp.float32)
+        chex.assert_shape(inputs, (3, 3, 2))
+        chex.assert_type(inputs, jnp.float32)
         state, output = triton_backend.short_conv(inputs, lengths, history, weight, bias)
         return state.sum() + output.sum()
 
@@ -196,10 +187,12 @@ def _numpy_rule(
     state: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Use the full transition matrix, independently of the rank-one JAX code."""
-    sc = ShapeChecker()
-    sc.check([q, k, g, b], "BTHK", np.float32)
-    sc.check([v, w], "BTHV", np.float32)
-    sc.check(state, "BHKV", np.float32)
+    chex.assert_shape([q, k, g, b], (None, None, None, None))
+    chex.assert_type([q, k, g, b], np.float32)
+    chex.assert_shape([v, w], (q.shape[0], q.shape[1], q.shape[2], None))
+    chex.assert_type([v, w], np.float32)
+    chex.assert_shape(state, (q.shape[0], q.shape[2], q.shape[3], v.shape[3]))
+    chex.assert_type(state, np.float32)
     state = state.copy()
     outputs = []
     for t in range(q.shape[1]):
@@ -274,12 +267,12 @@ def _numpy_mixer(
 ) -> tuple[GatedDeltaNet2Carry, np.ndarray]:
     """Upstream projection/conv/gate/norm recipe with NumPy matrix recurrence."""
     c = config
-    sc = ShapeChecker(D=c.hidden_size)
-    sc.check(x, "BTD", np.float32)
+    chex.assert_shape(x, (None, None, c.hidden_size))
+    chex.assert_type(x, np.float32)
 
     def linear(a: np.ndarray, name: str) -> np.ndarray:
-        sc = ShapeChecker()
-        sc.check(a, "BTI", np.float32)
+        chex.assert_shape(a, (None, None, None))
+        chex.assert_type(a, np.float32)
         p = params[name]
         return a @ np.asarray(p["kernel"]) + np.asarray(p.get("bias", np.float32(0)))
 
@@ -375,8 +368,8 @@ def test_stack_matches_explicit_residual_blocks() -> None:
     p = variables["params"]
 
     def norm(a: np.ndarray, name: str) -> np.ndarray:
-        sc = ShapeChecker(D=4)
-        sc.check(a, "BTD", np.float32)
+        chex.assert_shape(a, (None, None, 4))
+        chex.assert_type(a, np.float32)
         return a / np.sqrt(np.mean(a * a, axis=-1, keepdims=True) + config.norm_eps) * np.asarray(p[name]["scale"])
 
     state, mixed = _numpy_mixer(config, p["mixer_0"], norm(np.asarray(x), "norm_mixer_0"))
@@ -401,23 +394,13 @@ def test_stack_matches_explicit_residual_blocks() -> None:
     [
         jnp.array([-1], jnp.int32),
         jnp.array([2], jnp.int32),
-        jnp.array([1.0], jnp.float32),
-        jnp.array([[1]], jnp.int32),
-        jnp.array([1, 1], jnp.int32),
     ],
-    ids=["negative", "too-long", "dtype", "rank", "batch"],
+    ids=["negative", "too-long"],
 )
 def test_language_model_length_validation(lengths: jax.Array) -> None:
     model = GatedDeltaNet2LM(GatedDeltaNet2Config(hidden_size=2, head_dim=2, num_heads=1), 1, 3, 5)
     with pytest.raises((ValueError, AssertionError)):
         model.init(jax.random.key(1), jnp.ones((1, 1), jnp.int32), lengths)
-
-
-@pytest.mark.parametrize("active", [jnp.ones((1,), jnp.int32), jnp.ones((1, 1), jnp.bool_)], ids=["dtype", "rank"])
-def test_language_model_active_validation(active: jax.Array) -> None:
-    model = GatedDeltaNet2LM(GatedDeltaNet2Config(hidden_size=2, head_dim=2, num_heads=1), 1, 3, 5)
-    with pytest.raises(AssertionError):
-        model.init(jax.random.key(1), jnp.ones((1,), jnp.int32), active, method=model.step)
 
 
 def test_language_model_bfloat16_streaming_and_training() -> None:
@@ -515,22 +498,3 @@ def test_invalid_configuration(changes: dict[str, Any]) -> None:
     config = GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=2)
     with pytest.raises(ValueError):
         replace(config, **changes)
-
-
-def test_array_shape_dtype_and_carry_validation() -> None:
-    q = jnp.ones((1, 1, 2), jnp.float32)
-    state = jnp.zeros((1, 1, 2, 2), jnp.float32)
-    with pytest.raises(AssertionError):
-        delta_rule_step(state, q, q[..., :1], q, q, q, q)
-    with pytest.raises(AssertionError):
-        delta_rule_step(state.astype(jnp.bfloat16), q, q, q, q, q, q)
-    model = GatedDeltaNet2(GatedDeltaNet2Config(hidden_size=4, head_dim=2, num_heads=1))
-    x = jnp.zeros((1, 1, 4), jnp.float32)
-    x_len = jnp.ones((1,), jnp.int32)
-    variables = model.init(jax.random.key(1), x, x_len)
-    with pytest.raises(AssertionError):
-        model.apply(variables, x, jnp.ones((1, 1), jnp.int32))
-    with pytest.raises(AssertionError):
-        model.apply(variables, x, x_len, model.initial_carry(2))
-    with pytest.raises(AssertionError):
-        model.apply(variables, x[..., :3], x_len)

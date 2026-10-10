@@ -4,6 +4,7 @@ from math import log, sqrt
 from typing import Any
 from unittest.mock import Mock
 
+import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -15,6 +16,7 @@ mctx = pytest.importorskip("mctx")
 from rl2.alphazero import evaluation as ev
 from rl2.alphazero.config import Config, EvaluationConfig
 from rl2.alphazero.model import PolicyValueNet
+from rl2.alphazero.search import PolicyValueFn
 
 
 def test_match_summary_separates_unfinished_games_and_accounts_for_pairs() -> None:
@@ -91,18 +93,26 @@ def test_search_uses_acting_network_and_greedy_legal_action(monkeypatch: pytest.
     candidate = {"tag": jnp.float32(1)}
     opponent = {"tag": jnp.float32(2)}
     model = Mock()
-    model.apply.return_value = (jnp.zeros((1, 9), jnp.float32), jnp.zeros(1, jnp.float32))
+
+    def apply(variables: dict[str, ev.Parameters], observation: jax.Array) -> tuple[jax.Array, jax.Array]:
+        chex.assert_shape(observation, (1, 3, 3, 2))
+        chex.assert_type(observation, jnp.bool_)
+        return jnp.zeros((1, 9), jnp.float32), jnp.full(1, variables["params"]["tag"], jnp.float32)
+
+    model.apply.side_effect = apply
     seen: list[float] = []
 
     def search(
-        params: ev.Parameters,
+        predict: PolicyValueFn,
         key: jax.Array,
         root: mctx.RootFnOutput,
         recurrent_fn: mctx.RecurrentFn,
         num_simulations: int,
         **kwargs: Any,
     ) -> mctx.PolicyOutput:
-        seen.append(float(params["tag"]))
+        _, value = predict(root.embedding.observation)
+        seen.append(float(value[0]))
+        np.testing.assert_array_equal(value, root.value)
         assert num_simulations == 3
         assert kwargs["temperature"] == kwargs["dirichlet_fraction"] == 0
         np.testing.assert_array_equal(kwargs["invalid_actions"], ~state.legal_action_mask[None])

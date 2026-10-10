@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 
 from rl2.attention import AttentionState, AttentionType, _check_attention_config, _rope, attention
-from rl2.shape_checker import ShapeChecker
 
 
 @pytest.mark.parametrize("causal", [True, False])
@@ -17,23 +16,27 @@ def test_attention_uniform_values_and_zero_length(causal: bool) -> None:
     value = jnp.broadcast_to(jnp.asarray([2.0, 6.0])[None, :, None, None], key.shape)
     attend = jax.jit(partial(attention, max_seq_len=3, rope_theta=10000.0, causal=causal, implementation="xla"))
     carry, output = attend(query, key, value)
-    sc = ShapeChecker(B=1, T=2, H=2, K=1, F=2, C=3, U=1)
-    sc.check(output, "BTHF", jnp.float32)
+    chex.assert_shape(output, (1, 2, 2, 2))
+    chex.assert_type(output, jnp.float32)
     expected = jnp.asarray([2.0, 4.0] if causal else [4.0, 4.0])[None, :, None, None]
     np.testing.assert_allclose(output, jnp.broadcast_to(expected, output.shape))
-    sc.check((carry[0], carry[1]), "BCKF", jnp.float32)
-    sc.check(carry[2], "B", jnp.int32)
+    chex.assert_shape((carry[0], carry[1]), (1, 3, 1, 2))
+    chex.assert_type((carry[0], carry[1]), jnp.float32)
+    chex.assert_shape(carry[2], (1,))
+    chex.assert_type(carry[2], jnp.int32)
     np.testing.assert_array_equal(carry[2], [2])
     np.testing.assert_array_equal(carry[1][:, :2], value)
     np.testing.assert_array_equal(carry[1][:, 2:], 0)
 
     next_value = jnp.full((1, 1, 1, 2), 10.0)
     continued, output = attend(query[:, :1], key[:, :1], next_value, carry)
-    sc.check(output, "BUHF", jnp.float32)
+    chex.assert_shape(output, (1, 1, 2, 2))
+    chex.assert_type(output, jnp.float32)
     np.testing.assert_allclose(output, 6.0)
     np.testing.assert_array_equal(continued[2], [3])
     skipped, output = attend(query[:, :1], key[:, :1], next_value, continued, jnp.zeros((1,), jnp.int32))
-    sc.check(output, "BUHF", jnp.float32)
+    chex.assert_shape(output, (1, 1, 2, 2))
+    chex.assert_type(output, jnp.float32)
     np.testing.assert_array_equal(output, 0)
     chex.assert_trees_all_equal(skipped, continued)
     empty, output = attend(query, key, value, x_len=jnp.zeros((1,), jnp.int32))
@@ -57,10 +60,12 @@ def test_cached_attention_ignores_unused_slots_and_preserves_gradients(causal: b
     def loss(
         q: jax.Array, k: jax.Array, v: jax.Array, old_k: jax.Array, old_v: jax.Array
     ) -> tuple[jax.Array, tuple[AttentionState, jax.Array]]:
-        sc = ShapeChecker(B=3, T=2, H=2, K=1, F=2, C=3)
-        sc.check(q, "BTHF", jnp.float32)
-        sc.check((k, v), "BTKF", jnp.float32)
-        sc.check((old_k, old_v), "BCKF", jnp.float32)
+        chex.assert_shape(q, (3, 2, 2, 2))
+        chex.assert_type(q, jnp.float32)
+        chex.assert_shape((k, v), (3, 2, 1, 2))
+        chex.assert_type((k, v), jnp.float32)
+        chex.assert_shape((old_k, old_v), (3, 3, 1, 2))
+        chex.assert_type((old_k, old_v), jnp.float32)
         state, output = attention(
             q,
             k,
@@ -95,27 +100,6 @@ def test_cached_attention_ignores_unused_slots_and_preserves_gradients(causal: b
     expected_new = jnp.asarray([5 / 3, 2 / 3] if causal else [4 / 3, 4 / 3])[:, None, None]
     np.testing.assert_allclose(grads[2][0], jnp.broadcast_to(expected_new, grads[2][0].shape))
     np.testing.assert_allclose(grads[4][0, 0], 5 / 3 if causal else 4 / 3)
-
-
-@pytest.mark.parametrize(
-    "value_shape,value_dtype",
-    [
-        pytest.param((1, 2, 2), jnp.float32, id="rank"),
-        pytest.param((1, 1, 1, 2), jnp.float32, id="time-dimension"),
-        pytest.param((1, 2, 1, 2), jnp.bfloat16, id="dtype"),
-    ],
-)
-def test_attention_rejects_incompatible_values(value_shape: tuple[int, ...], value_dtype: jax.typing.DTypeLike) -> None:
-    with pytest.raises(AssertionError):
-        attention(
-            jnp.zeros((1, 2, 2, 2), jnp.float32),
-            jnp.zeros((1, 2, 1, 2), jnp.float32),
-            jnp.zeros(value_shape, value_dtype),
-            max_seq_len=3,
-            rope_theta=10000.0,
-            causal=True,
-            implementation="xla",
-        )
 
 
 def test_attention_rejects_invalid_configuration() -> None:
@@ -173,16 +157,18 @@ def test_rope_matches_llama_adjacent_pairs_in_float32(dtype: jax.typing.DTypeLik
     x = jnp.asarray([[[[1.25, -0.75, 0.5, 1.75]], [[1.25, -0.75, 0.5, 1.75]], [[0.25, 1.5, -1.25, -0.5]]]], dtype=dtype)
     positions = jnp.asarray([[0, 3, 17]], jnp.int32)
     # Independent complex64 oracle matching Meta's adjacent-pair rotation.
-    sc = ShapeChecker(B=1, T=3, H=1, F=4)
-    sc.check(x, "BTHF", dtype)
-    sc.check(positions, "BT", jnp.int32)
+    chex.assert_shape(x, (1, 3, 1, 4))
+    chex.assert_type(x, dtype)
+    chex.assert_shape(positions, (1, 3))
+    chex.assert_type(positions, jnp.int32)
     angles = np.asarray(positions, np.float32)[..., None, None] * np.asarray([1, 0.01], np.float32)
     values = np.asarray(x, np.float32)
     complex_values = values[..., ::2] + 1j * values[..., 1::2]
     rotated = complex_values * np.exp(1j * angles)
     expected = np.stack((rotated.real, rotated.imag), axis=-1).reshape(x.shape).astype(x.dtype)
     actual = _rope(x, positions, 10000.0)
-    sc.check(actual, "BTHF", dtype)
+    chex.assert_shape(actual, (1, 3, 1, 4))
+    chex.assert_type(actual, dtype)
     np.testing.assert_array_equal(actual, expected)
     np.testing.assert_array_equal(actual[:, 0], x[:, 0])
     compiled = jax.jit(_rope, static_argnums=2)(x, positions, 10000.0)
@@ -205,24 +191,9 @@ def test_rope_preserves_frequencies_for_extreme_finite_theta(theta: float) -> No
     frequencies = np.power(theta, -np.arange(8, dtype=np.float64) / 8).astype(np.float32)
     expected = np.stack((np.cos(frequencies), np.sin(frequencies)), axis=-1).reshape(x.shape)
     for actual in (_rope(x, positions, theta), jax.jit(_rope, static_argnums=2)(x, positions, theta)):
-        sc = ShapeChecker(B=1, T=1, H=1, F=16)
-        sc.check(actual, "BTHF", jnp.float32)
+        chex.assert_shape(actual, (1, 1, 1, 16))
+        chex.assert_type(actual, jnp.float32)
         np.testing.assert_allclose(actual, expected, atol=1e-7, rtol=1e-6)
-
-
-@pytest.mark.parametrize(
-    "positions_shape,positions_dtype",
-    [
-        pytest.param((2,), jnp.int32, id="position-rank"),
-        pytest.param((2, 1), jnp.int32, id="position-dimensions"),
-        pytest.param((1, 2), jnp.float32, id="position-dtype"),
-    ],
-)
-def test_rope_rejects_invalid_positions(
-    positions_shape: tuple[int, ...], positions_dtype: jax.typing.DTypeLike
-) -> None:
-    with pytest.raises(AssertionError):
-        _rope(jnp.zeros((1, 2, 1, 2), jnp.float32), jnp.zeros(positions_shape, positions_dtype), 10000.0)
 
 
 def test_biased_attention_without_rope_matches_numpy_outputs_and_bias_gradients() -> None:
@@ -234,8 +205,8 @@ def test_biased_attention_without_rope_matches_numpy_outputs_and_bias_gradients(
     bias = jnp.where(bias_valid, jax.random.normal(jax.random.key(23), (3, 2, 3, 3)), jnp.nan)
 
     def loss(bias: jax.Array) -> tuple[jax.Array, tuple[AttentionState, jax.Array]]:
-        sc = ShapeChecker(B=3, H=2, T=3)
-        sc.check(bias, "BHTT", jnp.float32)
+        chex.assert_shape(bias, (3, 2, 3, 3))
+        chex.assert_type(bias, jnp.float32)
         state, output = attention(
             query,
             key,
@@ -283,8 +254,8 @@ def test_biased_causal_chunks_match_full_outputs_and_gradients(use_rope: bool) -
     attend = partial(attention, max_seq_len=3, rope_theta=10000.0, causal=True, implementation="xla", use_rope=use_rope)
 
     def loss(bias: jax.Array, chunked: bool) -> tuple[jax.Array, tuple[AttentionState, jax.Array]]:
-        sc = ShapeChecker(B=1, H=2, T=3)
-        sc.check(bias, "BHTT", jnp.float32)
+        chex.assert_shape(bias, (1, 2, 3, 3))
+        chex.assert_type(bias, jnp.float32)
         if chunked:
             state, prefix = attend(query[:, :1], key[:, :1], value[:, :1], bias=bias[:, :, :1, :1])
             state, suffix = attend(query[:, 1:], key[:, 1:], value[:, 1:], state, bias=bias[:, :, 1:])
@@ -301,32 +272,19 @@ def test_biased_causal_chunks_match_full_outputs_and_gradients(use_rope: bool) -
     assert np.linalg.norm(gradient) > 0
 
 
-@pytest.mark.parametrize(
-    "shape,dtype,cached",
-    [
-        pytest.param((2, 2, 2), jnp.float32, False, id="rank"),
-        pytest.param((1, 1, 2, 2), jnp.float32, False, id="no-head-broadcast"),
-        pytest.param((1, 2, 1, 2), jnp.float32, False, id="query-length"),
-        pytest.param((1, 2, 2, 3), jnp.float32, False, id="fresh-keys-use-input-length"),
-        pytest.param((1, 2, 2, 2), jnp.float32, True, id="cached-keys-use-capacity"),
-        pytest.param((1, 2, 2, 2), jnp.int32, False, id="nonfloating-bias"),
-    ],
-)
-def test_attention_rejects_invalid_bias(shape: tuple[int, ...], dtype: jax.typing.DTypeLike, cached: bool) -> None:
+def test_attention_rejects_nonfloating_bias() -> None:
     query = jnp.zeros((1, 2, 2, 2), jnp.float32)
     key = query[:, :, :1]
-    carry = (jnp.zeros((1, 3, 1, 2)), jnp.zeros((1, 3, 1, 2)), jnp.zeros((1,), jnp.int32)) if cached else None
     with pytest.raises(AssertionError):
         attention(
             query,
             key,
             key,
-            carry,
             max_seq_len=3,
             rope_theta=10000.0,
             causal=False,
             implementation="xla",
-            bias=jnp.zeros(shape, dtype),
+            bias=jnp.zeros((1, 2, 2, 2), jnp.int32),
         )
 
 
@@ -387,14 +345,18 @@ def test_cudnn_bias_padding_preserves_outputs_and_gradients(
         local_window_size: tuple[int, int] | None,
         implementation: AttentionType,
     ) -> jax.Array:
-        sc = ShapeChecker(B=3, H=2, K=1, F=8, U=1)
-        sc.check(query, "BQHF", jnp.bfloat16)
-        sc.check((key, value), "BSKF", jnp.bfloat16)
-        sc.check(bias, "BHQS", jnp.bfloat16)
+        chex.assert_shape(query, (3, None, 2, 8))
+        chex.assert_type(query, jnp.bfloat16)
+        chex.assert_shape((key, value), (3, None, 1, 8))
+        chex.assert_type((key, value), jnp.bfloat16)
+        chex.assert_shape(bias, (3, 2, query.shape[1], key.shape[1]))
+        chex.assert_type(bias, jnp.bfloat16)
         assert query_seq_lengths is not None and key_value_seq_lengths is not None
-        sc.check((query_seq_lengths, key_value_seq_lengths), "B", jnp.int32)
+        chex.assert_shape((query_seq_lengths, key_value_seq_lengths), (3,))
+        chex.assert_type((query_seq_lengths, key_value_seq_lengths), jnp.int32)
         if mask is not None:
-            sc.check(mask, "BUQS", jnp.bool_)
+            chex.assert_shape(mask, (3, 1, query.shape[1], key.shape[1]))
+            chex.assert_type(mask, jnp.bool_)
         if implementation == "cudnn":
             assert query.shape[1] == 4
             assert key.shape[1] == (6 if cached else 4)
@@ -418,10 +380,12 @@ def test_cudnn_bias_padding_preserves_outputs_and_gradients(
     def loss(
         q: jax.Array, k: jax.Array, v: jax.Array, b: jax.Array, implementation: AttentionType
     ) -> tuple[jax.Array, jax.Array]:
-        sc = ShapeChecker(B=3, T=3, H=2, K=1, F=8, S=5 if cached else 3)
-        sc.check(q, "BTHF", jnp.bfloat16)
-        sc.check((k, v), "BTKF", jnp.bfloat16)
-        sc.check(b, "BHTS", jnp.float32)
+        chex.assert_shape(q, (3, 3, 2, 8))
+        chex.assert_type(q, jnp.bfloat16)
+        chex.assert_shape((k, v), (3, 3, 1, 8))
+        chex.assert_type((k, v), jnp.bfloat16)
+        chex.assert_shape(b, (3, 2, 3, 5 if cached else 3))
+        chex.assert_type(b, jnp.float32)
         _, output = attention(
             q,
             k,

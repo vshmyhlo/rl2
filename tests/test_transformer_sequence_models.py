@@ -8,7 +8,6 @@ import pytest
 
 from rl2 import transformer
 from rl2.sequence_model import ARSequenceModel, BDSequenceModel
-from rl2.shape_checker import ShapeChecker
 from rl2.transformer import ARTransformer, BDTransformer, Transformer
 
 
@@ -40,11 +39,11 @@ def test_autoregressive_sequence_chunks_and_steps_match_from_fresh_and_supplied_
     supplied, _ = model.apply(variables, x[:, :2], prefix_len)
     apply = jax.jit(model.apply)
     step = jax.jit(partial(model.apply, method=model.step))
-    sc = ShapeChecker(B=3, T=3, D=4)
 
     for initial in (None, supplied):
         final, expected = apply(variables, padded, x_len, initial)
-        sc.check(expected, "BTD", jnp.float32)
+        chex.assert_shape(expected, (3, 3, 4))
+        chex.assert_type(expected, jnp.float32)
         state, clean = apply(variables, x, x_len, initial)
         chex.assert_trees_all_close((final, expected), (state, clean), atol=2e-6)
         np.testing.assert_array_equal(expected[~valid], 0)
@@ -60,7 +59,8 @@ def test_autoregressive_sequence_chunks_and_steps_match_from_fresh_and_supplied_
         outputs = []
         for t in range(3):
             state, output = step(variables, padded[:, t], t < x_len, state)
-            sc.check(output, "BD", jnp.float32)
+            chex.assert_shape(output, (3, 4))
+            chex.assert_type(output, jnp.float32)
             outputs.append(output)
         chex.assert_trees_all_close((state, jnp.stack(outputs, 1)), (final, expected), atol=2e-6)
 
@@ -98,8 +98,8 @@ def test_bidirectional_valid_prefixes_and_gradients_ignore_padding() -> None:
     _, reference_output = reference_model.apply(variables, x, x_len)
     output = jax.jit(model.apply)(variables, padded, x_len)
     np.testing.assert_allclose(output, reference_output, atol=2e-6)
-    sc = ShapeChecker(B=3, T=3, D=4)
-    sc.check(output, "BTD", jnp.float32)
+    chex.assert_shape(output, (3, 3, 4))
+    chex.assert_type(output, jnp.float32)
     np.testing.assert_array_equal(output[~valid], 0)
     for b in (1, 2):
         reference = model.apply(variables, x[b : b + 1, : x_len[b]], x_len[b : b + 1])
@@ -109,14 +109,16 @@ def test_bidirectional_valid_prefixes_and_gradients_ignore_padding() -> None:
     assert not np.allclose(changed[2, 0], output[2, 0], atol=1e-5)
 
     def loss(inputs: jax.Array) -> jax.Array:
-        sc = ShapeChecker(B=3, T=3, D=4)
-        sc.check(inputs, "BTD", jnp.float32)
+        chex.assert_shape(inputs, (3, 3, 4))
+        chex.assert_type(inputs, jnp.float32)
         y = model.apply(variables, inputs, x_len)
-        sc.check(y, "BTD", jnp.float32)
+        chex.assert_shape(y, (3, 3, 4))
+        chex.assert_type(y, jnp.float32)
         return jnp.sum(y[..., 0])
 
     gradient = jax.jit(jax.grad(loss))(padded)
-    sc.check(gradient, "BTD", jnp.float32)
+    chex.assert_shape(gradient, (3, 3, 4))
+    chex.assert_type(gradient, jnp.float32)
     assert np.isfinite(gradient).all()
     np.testing.assert_array_equal(gradient[~valid], 0)
     assert np.linalg.norm(gradient[valid]) > 0
@@ -126,21 +128,8 @@ def test_bidirectional_valid_prefixes_and_gradients_ignore_padding() -> None:
 
 
 @pytest.mark.parametrize("model_type", [ARTransformer, BDTransformer])
-def test_specialized_stacks_validate_lengths_and_fixed_direction(
-    model_type: type[ARTransformer] | type[BDTransformer],
-) -> None:
+def test_specialized_stacks_validate_fixed_direction(model_type: type[ARTransformer] | type[BDTransformer]) -> None:
     model = model_type(4, 1, num_heads=1, max_seq_len=3)
     x = jnp.zeros((1, 3, 4), jnp.float32)
-    for lengths in (jnp.ones((1,), jnp.bool_), jnp.ones((1, 1), jnp.int32)):
-        with pytest.raises(AssertionError):
-            model.apply({}, x, lengths)
     with pytest.raises(ValueError, match=f"{model_type.__name__} requires causal="):
         model.clone(causal=not model.causal).apply({}, x, jnp.array([3], jnp.int32))
-
-
-def test_autoregressive_step_validates_x_active_metadata() -> None:
-    model = ARTransformer(4, 1, num_heads=1, max_seq_len=3)
-    x = jnp.zeros((1, 4), jnp.float32)
-    for x_active in (jnp.ones((1,), jnp.int32), jnp.ones((1, 1), jnp.bool_), jnp.ones((2,), jnp.bool_)):
-        with pytest.raises(AssertionError):
-            model.apply({}, x, x_active=x_active, method=model.step)

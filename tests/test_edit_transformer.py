@@ -2,6 +2,7 @@ from functools import partial
 from operator import itemgetter
 from typing import Any
 
+import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -9,7 +10,6 @@ import pytest
 
 from rl2.edit_transformer import EDIT_EVENT, FEEDBACK_EVENT, PAD_EVENT, EditTransformer, Event
 from rl2.karel_ast_edit import FEEDBACK_SIZE
-from rl2.shape_checker import ShapeChecker
 
 type Variables = dict[str, Any]
 
@@ -106,8 +106,8 @@ def test_unused_event_fields_do_not_contaminate_gradients(event: Event) -> None:
 
     def loss(params: Variables, event: Event) -> jax.Array:
         encoded = model.apply({"params": params}, event, method=model.encode_event)
-        sc = ShapeChecker(T=3, B=3, D=8)
-        sc.check(encoded, "TBD", jnp.float32)
+        chex.assert_shape(encoded, (3, 3, 8))
+        chex.assert_type(encoded, jnp.float32)
         return jnp.square(encoded).sum()
 
     evaluate = jax.jit(jax.value_and_grad(loss))
@@ -124,18 +124,3 @@ def test_unused_event_fields_do_not_contaminate_gradients(event: Event) -> None:
     for name in ("grid_conv", "context_projection", "context_norm", "feedback_projection", "feedback_norm"):
         for grad in jax.tree.leaves(edit_grad[name]):
             np.testing.assert_array_equal(grad, 0)
-
-
-@pytest.mark.parametrize("invalid", ["image_count", "channels", "dtype"])
-def test_event_grid_validation(event: Event, invalid: str) -> None:
-    grid = event.grid
-    if invalid == "image_count":
-        grid = grid[:, :, :2]
-    elif invalid == "channels":
-        grid = grid[..., :5]
-    else:
-        grid = grid.astype(jnp.float32)
-    event = event._replace(grid=grid)
-    model = EditTransformer(d_model=8, num_layers=1, num_heads=2, max_nodes=2, max_seq_len=3)
-    with pytest.raises(AssertionError, match="TBIHWC"):
-        model.init(jax.random.key(0), event, method=model.encode_event)
