@@ -31,9 +31,9 @@ terminal padding. Each logging window contains complete training iterations:
 - charts/learning_rate: Configured constant optimizer learning rate.
 - charts/SPS: Window positions divided by window wall time, in positions/sec.
 - time/iteration_seconds: Sum of iteration wall times in the window, covering
-  self-play and optimization; excludes logging and checkpoint saving.
+  self-play and optimization; excludes logging, evaluation, and checkpoint saving.
 - time/window_seconds: Wall time since the previous window boundary, including
-  intervening logging and checkpoint overhead.
+  intervening logging, evaluation, and checkpoint overhead.
 - time/elapsed_seconds: Wall time since this training invocation's loop began;
   resets on resume and excludes initialization and checkpoint restoration.
 - time/eta_seconds: Estimated remaining training time from the mean iteration
@@ -44,7 +44,28 @@ config and devices record the resolved configuration and JAX devices as text.
 Stdout reports the latest iteration and cumulative steps, window self-play
 totals, mean losses, and window wall time (seconds).
 
-This scaffold has no persistent replay or evaluation.
+Every evaluation.interval_seconds (default: 1800), at an iteration boundary,
+the current model plays the most recently saved checkpoint, before a new save.
+Evaluation pauses training and uses a separate fixed seed: 50 random legal
+opening prefixes, each played twice with the agents swapping colors, equal
+num_simulations, no root noise, and greedy visit-count actions. max_moves caps
+each game after the opening. The timer restarts after evaluation and on resume.
+If no checkpoint exists yet, evaluation is skipped until the next interval.
+
+Evaluation metrics are logged immediately under eval/, without window averaging:
+- wins, draws, losses, completed_games: Counts from terminated evaluation games.
+- games, truncated_games, truncation_rate: Total attempted games and those
+  unfinished at the move limit (or truncated by the environment).
+- score: (wins + 0.5 * draws) / completed_games; win_rate, draw_rate, loss_rate
+  also use completed_games. Omitted when no game finishes. Truncation can bias
+  this conditional score, so always inspect truncation_rate alongside it.
+- score_lower_bound, score_upper_bound: Conservative 95% bounds for all-game
+  score over sampled openings, using opening pairs as independent samples and
+  allowing unfinished games any outcome. These can be wide for small suites.
+- candidate_iteration, opponent_iteration: Iterations identifying both models.
+- seconds: Wall time for the evaluation, including any initial JIT compilation.
+Evaluation does not alter training RNG, progress counters, or checkpoint policy.
+This scaffold has no persistent replay.
 PGX owns observation/action encodings and draw rules. Values always use the
 player-to-move perspective. This is not an exact reproduction of the paper.
 """
@@ -55,7 +76,6 @@ import sys
 from dataclasses import asdict, replace
 from functools import partial
 from time import monotonic
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -70,52 +90,15 @@ from tensorboardX import SummaryWriter
 
 from rl2.alphazero.checkpoints import TrainingProgress, checkpoint_manager, restore_checkpoint, save_checkpoint
 from rl2.alphazero.config import Config, load_config
+from rl2.alphazero.evaluation import evaluate
 from rl2.alphazero.model import PolicyValueNet
+from rl2.alphazero.search import Parameters, masked_logits, recurrent_step
 from rl2.configuration import resolve_settings
 from rl2.shape_checker import ShapeChecker
 
 logger = logging.getLogger(__name__)
 
-type Parameters = dict[str, Any]
 type Metrics = dict[str, jax.Array]
-
-
-def masked_logits(logits: jax.Array, legal: jax.Array) -> jax.Array:
-    sc = ShapeChecker()
-    sc.check(logits, "BA", jnp.float32)
-    sc.check(legal, "BA", jnp.bool_)
-    # Finite masking also keeps terminal nodes with no legal moves well-defined.
-    return jnp.where(legal, logits - logits.max(axis=-1, keepdims=True), jnp.finfo(jnp.float32).min)
-
-
-def recurrent_step(
-    params: Parameters,
-    key: jax.Array,
-    actions: jax.Array,
-    states: pgx.State,
-    *,
-    env: pgx.Env,
-    model: PolicyValueNet,
-) -> tuple[mctx.RecurrentFnOutput, pgx.State]:
-    """Expand real game states; back up the opponent's value with a minus sign."""
-    sc = ShapeChecker(K=2, P=2)
-    sc.check(key, "K", jnp.uint32)
-    sc.check(actions, "B", jnp.int32)
-    sc.check(states.current_player, "B", jnp.int32)
-    next_states = jax.vmap(env.step)(states, actions)
-    logits, value = model.apply({"params": params}, next_states.observation)
-    sc.check(next_states.rewards, "BP", jnp.float32)
-    sc.check([next_states.terminated, next_states.truncated], "B", jnp.bool_)
-    reward = jnp.take_along_axis(next_states.rewards, states.current_player[:, None], axis=1)[:, 0]
-    done = next_states.terminated | next_states.truncated
-    output = mctx.RecurrentFnOutput(
-        reward=reward,
-        discount=jnp.where(done, 0.0, -1.0),
-        prior_logits=masked_logits(logits, next_states.legal_action_mask),
-        value=jnp.where(done, 0.0, value),
-    )
-    sc.check([output.reward, output.discount, output.value], "B", jnp.float32)
-    return output, next_states
 
 
 @struct.dataclass
@@ -294,6 +277,8 @@ def train(config: Config) -> TrainState:
         start_iteration = steps = completed_games = 0
         if progress is not None:
             state, key, start_iteration, steps, completed_games = progress
+        opponent_params = state.params if progress is not None else None
+        opponent_iteration = start_iteration
         writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", steps)
         writer.add_text("devices", str(jax.devices()), steps)
         parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
@@ -304,6 +289,7 @@ def train(config: Config) -> TrainState:
             logger.info("Resumed iteration %d, step %d", start_iteration, steps)
         start = monotonic()
         last_checkpoint_time = start
+        last_evaluation_time = start
         window_start = start
         window_iterations = 0
         window_losses: dict[str, float] = {}
@@ -368,11 +354,38 @@ def train(config: Config) -> TrainState:
                 window_losses.clear()
                 window_rollout.clear()
                 window_iteration_seconds = 0.0
+            if monotonic() - last_evaluation_time >= config.evaluation.interval_seconds:
+                if opponent_params is None:
+                    logger.info("Skipping evaluation: no previous checkpoint yet")
+                else:
+                    evaluation_start = monotonic()
+                    evaluation_metrics = evaluate(
+                        opponent_params=opponent_params,
+                        candidate_params=state.params,
+                        env=env,
+                        model=model,
+                        config=config,
+                    )
+                    evaluation_metrics.update(
+                        candidate_iteration=iteration + 1,
+                        opponent_iteration=opponent_iteration,
+                        seconds=monotonic() - evaluation_start,
+                    )
+                    for name, value in evaluation_metrics.items():
+                        writer.add_scalar(f"eval/{name}", value, steps)
+                    writer.flush()
+                    logger.info(
+                        "Evaluation | %s",
+                        " | ".join(f"{name}={value:.6g}" for name, value in evaluation_metrics.items()),
+                    )
+                last_evaluation_time = monotonic()
             if (
                 monotonic() - last_checkpoint_time >= config.checkpoint_interval_seconds
                 or iteration + 1 == config.iterations
             ):
                 save_checkpoint(manager, TrainingProgress(state, key, iteration + 1, steps, completed_games), config)
+                opponent_params = state.params
+                opponent_iteration = iteration + 1
                 last_checkpoint_time = monotonic()
         return state
 

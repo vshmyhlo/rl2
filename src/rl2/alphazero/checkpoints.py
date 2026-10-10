@@ -47,7 +47,7 @@ def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
 
 
 def checkpoint_settings(config: Config) -> dict[str, Any]:
-    mutable = {"run_id", "log_dir", "iterations", "log_interval_seconds", "checkpoint_interval_seconds"}
+    mutable = {"run_id", "log_dir", "iterations", "log_interval_seconds", "checkpoint_interval_seconds", "evaluation"}
     return {name: value for name, value in asdict(config).items() if name not in mutable}
 
 

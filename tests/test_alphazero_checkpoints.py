@@ -11,7 +11,7 @@ from flax.training.train_state import TrainState
 from pydantic import ValidationError
 
 from rl2.alphazero import checkpoints as ckpt
-from rl2.alphazero.config import Config
+from rl2.alphazero.config import Config, EvaluationConfig
 from rl2.shape_checker import ShapeChecker
 
 
@@ -46,6 +46,8 @@ def test_checkpoint_settings_allow_log_interval_changes() -> None:
     settings = ckpt.checkpoint_settings(config)
     assert "log_interval_seconds" not in settings  # Also compatible with checkpoints predating this option.
     assert ckpt.checkpoint_settings(replace(config, log_interval_seconds=15.0)) == settings
+    assert "evaluation" not in settings  # Existing checkpoints have no evaluation settings.
+    assert ckpt.checkpoint_settings(replace(config, evaluation=EvaluationConfig(num_openings=2))) == settings
 
 
 def test_checkpoint_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

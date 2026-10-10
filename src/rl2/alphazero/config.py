@@ -19,6 +19,15 @@ class ModelConfig:
     num_blocks: Annotated[int, Field(gt=0, strict=True)] = 3
 
 
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class EvaluationConfig:
+    interval_seconds: Annotated[PositiveFiniteFloat, Field(strict=True)] = 1800.0
+    num_openings: Annotated[PositiveInt, Field(strict=True)] = 50
+    opening_moves: Annotated[NonNegativeInt, Field(strict=True)] = 8
+    openings_per_batch: Annotated[PositiveInt, Field(strict=True)] = 5
+    seed: Annotated[int, Field(ge=0, lt=2**32, strict=True)] = 0
+
+
 @dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
 class Config:
     env_id: EnvId = "chess"
@@ -40,6 +49,7 @@ class Config:
     run_id: str | None = None
     log_interval_seconds: PositiveFiniteFloat = 60.0
     checkpoint_interval_seconds: PositiveFiniteFloat = 600.0
+    evaluation: EvaluationConfig = EvaluationConfig()
 
     @field_validator("run_id")
     @classmethod

@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from rl2.alphazero.config import Config, ModelConfig, load_config
+from rl2.alphazero.config import Config, EvaluationConfig, ModelConfig, load_config
 
 
 @pytest.mark.parametrize(
@@ -61,6 +61,32 @@ def test_load_log_interval(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text("log_interval_seconds: 15.5\n")
     assert load_config(path).log_interval_seconds == 15.5
+
+
+def test_load_evaluation_config(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("evaluation:\n  num_openings: 3\n")
+    config = load_config(path)
+    assert config.evaluation == EvaluationConfig(num_openings=3)
+    assert config.evaluation.interval_seconds == 1800.0
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"interval_seconds": 0.0},
+        {"interval_seconds": float("inf")},
+        {"num_openings": 0},
+        {"num_openings": True},
+        {"opening_moves": -1},
+        {"openings_per_batch": 0},
+        {"seed": 2**32},
+        {"unknown": 1},
+    ],
+)
+def test_evaluation_config_validation(settings: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        EvaluationConfig(**settings)
 
 
 @pytest.mark.parametrize(

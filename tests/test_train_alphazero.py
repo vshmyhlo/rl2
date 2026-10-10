@@ -18,7 +18,7 @@ pytest.importorskip("mctx")
 import pgx
 
 from rl2 import train_alphazero as az
-from rl2.alphazero.config import ModelConfig
+from rl2.alphazero.config import EvaluationConfig, ModelConfig
 
 
 @pytest.fixture(scope="module")
@@ -355,3 +355,96 @@ def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: p
     az.train(config)
     rollout.assert_not_called()
     assert save.call_count == 2
+
+
+def test_evaluation_cadence_previous_checkpoint_and_resume(
+    logging_config: az.Config, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=az.__name__)
+    config = replace(logging_config, iterations=6, updates_per_iteration=1)
+    clock = 0.0
+    original_step = az.train_step
+
+    def now() -> float:
+        return clock
+
+    def timed_step(state: TrainState, batch: az.Batch, *, model: az.PolicyValueNet) -> tuple[TrainState, az.Metrics]:
+        nonlocal clock
+        clock += 600.0
+        state, metrics = original_step(state, batch, model=model)
+        return state.replace(params={"weight": jnp.full(1, state.step, jnp.float32)}), metrics
+
+    def evaluate(
+        candidate_params: az.Parameters,
+        opponent_params: az.Parameters,
+        *,
+        env: pgx.Env,
+        model: az.PolicyValueNet,
+        config: az.Config,
+    ) -> dict[str, float]:
+        nonlocal clock
+        clock += 120.0  # Evaluation time must not trigger another immediate evaluation.
+        return {"score": 0.5, "games": 2.0}
+
+    rollout = Mock(return_value=(None, {"positions": 2, "completed_games": 1, "value_positions": 2}))
+    run_evaluation = Mock(side_effect=evaluate)
+    save = Mock()
+    writer = MagicMock()
+    writer.__enter__.return_value = writer
+    monkeypatch.setattr(az, "collect_selfplay", rollout)
+    monkeypatch.setattr(az, "train_step", timed_step)
+    monkeypatch.setattr(az, "monotonic", now)
+    monkeypatch.setattr(az, "save_checkpoint", save)
+    monkeypatch.setattr(az, "evaluate", run_evaluation)
+    monkeypatch.setattr(az, "SummaryWriter", Mock(return_value=writer))
+    az.train(config)
+    assert run_evaluation.call_count == 2
+    for call, candidate, opponent in zip(run_evaluation.call_args_list, [3, 6], [2, 5], strict=True):
+        assert call.kwargs["candidate_params"]["weight"].item() == candidate
+        assert call.kwargs["opponent_params"]["weight"].item() == opponent
+    logged = [call.args for call in writer.add_scalar.call_args_list if call.args[0].startswith("eval/")]
+    assert ("eval/opponent_iteration", 2, 6) in logged
+    assert ("eval/opponent_iteration", 5, 12) in logged
+    assert ("eval/seconds", 120.0, 12) in logged
+    assert sum(record.getMessage().startswith("Evaluation | ") for record in caplog.records) == 2
+    saved_key = save.call_args.args[1].key
+    saved_second_iteration = save.call_args_list[1].args[1]
+    training_keys = [call.args[1] for call in rollout.call_args_list]
+
+    # Turning off evaluations by extending the interval must not change training RNG.
+    clock = 0.0
+    rollout.reset_mock()
+    az.train(replace(config, evaluation=EvaluationConfig(interval_seconds=10000.0)))
+    for key, call in zip(training_keys, rollout.call_args_list, strict=True):
+        np.testing.assert_array_equal(key, call.args[1])
+    np.testing.assert_array_equal(saved_key, save.call_args.args[1].key)
+    assert run_evaluation.call_count == 2
+
+    # On resume, the restored checkpoint is the first opponent, even when a save is due.
+    clock = 0.0
+    monkeypatch.setattr(az, "restore_checkpoint", Mock(return_value=saved_second_iteration))
+    run_evaluation.reset_mock()
+    az.train(replace(config, iterations=3, evaluation=EvaluationConfig(interval_seconds=600.0)))
+    run_evaluation.assert_called_once()
+    assert run_evaluation.call_args.kwargs["opponent_params"]["weight"].item() == 2
+    assert run_evaluation.call_args.kwargs["candidate_params"]["weight"].item() == 3
+
+
+def test_evaluation_skips_missing_checkpoint(logging_config: az.Config, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = 0.0
+    original_step = az.train_step
+
+    def now() -> float:
+        return clock
+
+    def timed_step(state: TrainState, batch: az.Batch, *, model: az.PolicyValueNet) -> tuple[TrainState, az.Metrics]:
+        nonlocal clock
+        clock += 1800.0
+        return original_step(state, batch, model=model)
+
+    evaluate = Mock()
+    monkeypatch.setattr(az, "monotonic", now)
+    monkeypatch.setattr(az, "train_step", timed_step)
+    monkeypatch.setattr(az, "evaluate", evaluate)
+    az.train(replace(logging_config, iterations=1, updates_per_iteration=1))
+    evaluate.assert_not_called()
