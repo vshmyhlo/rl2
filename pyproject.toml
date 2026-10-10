@@ -17,6 +17,7 @@ dependencies = [
     "jax>=0.11.2,<0.12",
     "moviepy>=2.2,<3",
     "numpy>=2,<3",
+    "omegaconf>=2.4,<3",
     "opencv-python-headless>=4.10,<5",
     "optax>=0.2.4,<0.3",
     "orbax-checkpoint>=0.12.6,<0.13",
@@ -29,6 +30,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+alphazero = [
+    "pgx>=2.6,<3",
+    "mctx>=0.0.6,<0.1",
+]
 gemma3 = [
     "gemma==4.0.1",
     "kauldron>=1.4.4,<2",

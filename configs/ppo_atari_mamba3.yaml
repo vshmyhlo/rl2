@@ -32,7 +32,7 @@ entropy_coef: 0.01
 entropy_decay: cosine # Decay to zero over the rollout budget
 value_coef: 0.5
 max_grad_norm: 0.5
-log_dir: gs://cohere-dev/vlad/rl2/ppo/${run_id}/${env_id} # Full run path; env_id replaces / with _
+log_dir: gs://cohere-dev/vlad/rl2/ppo/${run_id}/${path_name:${env_id}} # Full run path; env_id replaces / with _
 run_id: ppo_atari_mamba3 # TensorBoard run directory; change this for a new run
 video_every_episodes: 100 # 0 disables recording
 video_speed: 4.0 # Playback multiplier: 1.0 normal, 2.0 double speed

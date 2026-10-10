@@ -142,29 +142,9 @@ def test_checkpoint_paths_preserve_gcs_and_resolve_local(tmp_path: Path, monkeyp
         assert manager.call_args.args[0] == str(tmp_path / "logs/run/checkpoints")
 
 
-@pytest.mark.parametrize(
-    ("log_dir", "expected"),
-    [
-        ("gs://bucket/${run_id}/${env_id}/", "gs://bucket/run/ALE_Boxing-v5"),
-        ("logs/${run_id}", "logs/run"),
-        ("logs/${env_id}/${run_id}", "logs/ALE_Boxing-v5/run"),
-        ("logs/", "logs/run"),
-    ],
-    ids=["cloud-with-environment", "run-only", "custom-order", "legacy-base-directory"],
-)
-def test_run_directory_interpolation(log_dir: str, expected: str) -> None:
-    assert ppo.run_directory(log_dir, "run", "ALE/Boxing-v5") == expected
-
-
-@pytest.mark.parametrize("log_dir", ["logs/${unknown}", "logs/${run_id"], ids=["unknown", "malformed"])
-def test_run_directory_rejects_invalid_placeholders(log_dir: str) -> None:
-    with pytest.raises(ValueError, match="log_dir supports only"):
-        ppo.run_directory(log_dir, "run", "ALE/Boxing-v5")
-
-
 def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> None:
     run_dir = f"{config.log_dir}/{config.run_id}/ALE_Boxing-v5"
-    config = replace(config, env_id="ALE/Boxing-v5", log_dir=config.log_dir + "/${run_id}/${env_id}")
+    config = replace(config, env_id="ALE/Boxing-v5", log_dir=config.log_dir + "/${run_id}/${path_name:${env_id}}")
     assert config.checkpoint_interval_seconds == 600.0
     obs = np.zeros((1, 1), dtype=np.uint8)
     zeros = np.zeros(1, dtype=np.float32)

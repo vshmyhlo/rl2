@@ -5,11 +5,10 @@ import json
 import os
 from collections import deque
 from dataclasses import asdict, replace
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from functools import partial
 from operator import itemgetter
 from pathlib import Path
-from string import Template
 from time import monotonic
 from typing import Annotated, Any, Literal, NamedTuple, SupportsFloat, cast
 
@@ -34,6 +33,7 @@ from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
+from rl2.configuration import load_settings, resolve_settings
 from rl2.gdn2 import (
     GatedDeltaNet2Backend,
     GatedDeltaNet2Config,
@@ -169,16 +169,6 @@ class TrainingProgress(NamedTuple):
     recent_lengths: tuple[int, ...]
 
 
-def run_directory(log_dir: str, run_id: str, env_id: str) -> str:
-    """Resolve a full path template, or append the run ID to a plain log directory."""
-    if "$" not in log_dir:
-        return f"{log_dir.rstrip('/')}/{run_id}"
-    try:
-        return Template(log_dir).substitute(run_id=run_id, env_id=env_id.replace("/", "_")).rstrip("/")
-    except (KeyError, ValueError) as error:
-        raise ValueError("log_dir supports only ${run_id} and ${env_id} placeholders") from error
-
-
 def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
     directory = f"{run_dir.rstrip('/')}/checkpoints"
     if not directory.startswith("gs://"):
@@ -273,8 +263,7 @@ def restore_checkpoint(
 
 
 def load_config(path: str | Path) -> Config:
-    with open(path) as file:
-        settings = yaml.safe_load(file)
+    settings = load_settings(path)
     if "encoder_stages" in settings:
         settings["encoder_stages"] = tuple(ConvStage(**stage) for stage in settings["encoder_stages"])
     return Config(**settings)
@@ -732,11 +721,10 @@ def train(config: Config) -> TrainState:
     writer = None
     manager = None
     try:
-        run_name = config.run_id or (
-            f"{config.env_id.replace('/', '_')}_seed{config.seed}_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"
-        )
-        config = replace(config, run_id=run_name)
-        run_dir = run_directory(config.log_dir, run_name, config.env_id)
+        settings = resolve_settings(asdict(config))
+        config = replace(config, run_id=settings["run_id"], log_dir=settings["log_dir"])
+        run_name = config.run_id
+        run_dir = config.log_dir
         manager = checkpoint_manager(run_dir)
         obs, _ = envs.reset(seed=config.seed)
         key, init_key = jax.random.split(jax.random.key(config.seed))

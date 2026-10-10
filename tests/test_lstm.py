@@ -18,6 +18,46 @@ def test_initial_carry_is_zero_float32_even_with_bf16_compute() -> None:
         np.testing.assert_array_equal(state, 0)
 
 
+def test_bf16_lstm_preserves_float32_gate_and_memory_precision() -> None:
+    model = LSTM(1, dtype=jnp.bfloat16)
+    x = jnp.zeros((2, 1, 1), dtype=jnp.bfloat16)
+    starts = jnp.zeros((2, 1), dtype=jnp.bool_)
+    carry = (jnp.full((1, 1), 0.75, dtype=jnp.float32), jnp.zeros((1, 1), dtype=jnp.float32))
+    variables = model.init(jax.random.key(0), x, carry, starts)
+    variables = jax.tree.map(jnp.zeros_like, variables)
+    cell_params = variables["params"]["OptimizedLSTMCell_0"]
+    for gate, bias in {"i": 0.75, "f": 7.0, "g": 0.5, "o": -0.25}.items():
+        cell_params[f"h{gate}"]["bias"] = jnp.full((1,), bias, dtype=jnp.float32)
+
+    # Exactly representable logits isolate activation/update precision from
+    # projection rounding. In BF16, sigmoid(7) would round to exactly one.
+    input_gate, forget_gate, output_gate = 1 / (1 + np.exp(-np.array([0.75, 7.0, -0.25], dtype=np.float32)))
+    expected_cell = np.float32(0.75)
+    expected_hidden = []
+    for _ in range(2):
+        expected_cell = forget_gate * expected_cell + input_gate * np.tanh(np.float32(0.5))
+        expected_hidden.append(output_gate * np.tanh(expected_cell))
+
+    final, output = jax.jit(model.apply)(variables, x, carry, starts)
+    np.testing.assert_allclose(final[0], expected_cell, rtol=1e-6, atol=0)
+    np.testing.assert_allclose(final[1], expected_hidden[-1], rtol=1e-6, atol=0)
+    np.testing.assert_array_equal(output, jnp.array(expected_hidden, dtype=jnp.bfloat16).reshape(2, 1, 1))
+
+
+def test_bf16_lstm_accepts_weakly_typed_float32_carry() -> None:
+    model = LSTM(1, dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((2, 1, 1), jnp.bfloat16)
+    starts = jax.ShapeDtypeStruct((2, 1), jnp.bool_)
+    # Arrays made from Python floats can have weak_type=True while still
+    # satisfying the float32 carry contract; promotion must not narrow them.
+    memory = jax.ShapeDtypeStruct((1, 1), jnp.float32, weak_type=True)
+    (final, output), _ = jax.eval_shape(model.init_with_output, jax.random.key(0), x, (memory, memory), starts)
+    for state in final:
+        assert state.dtype == jnp.float32
+        assert not state.weak_type
+    assert output.dtype == jnp.bfloat16
+
+
 @pytest.mark.parametrize(
     "dtype,supplied_carry,num_layers,intermediate_size",
     [

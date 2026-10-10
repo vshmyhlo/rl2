@@ -5,18 +5,22 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from rl2.shape_checker import ShapeChecker
+
 
 class ResizeConv(nn.Module):
-    """Antialiased bilinear resize followed by a 3x3 convolution."""
+    """Antialiased bilinear resize followed by a configurable SAME convolution."""
 
     channels: int
     spatial_shape: tuple[int, int]
     dtype: jax.typing.DTypeLike = jnp.float32
+    kernel_size: int = 3
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        chex.assert_rank(x, 4)
-        chex.assert_type(x, self.dtype)
+        sc = ShapeChecker(h=self.spatial_shape[0], w=self.spatial_shape[1], C=self.channels)
+        sc.check(x, "BHWI", self.dtype)
+        chex.assert_scalar_positive(self.kernel_size)
         chex.assert_type(self.channels, int)
         chex.assert_scalar_positive(self.channels)
         chex.assert_equal(len(self.spatial_shape), 2)
@@ -31,12 +35,11 @@ class ResizeConv(nn.Module):
         )
         x = nn.Conv(
             self.channels,
-            (3, 3),
+            (self.kernel_size, self.kernel_size),
             padding="SAME",
             kernel_init=nn.initializers.variance_scaling(2.0, "fan_in", "truncated_normal"),
             dtype=self.dtype,
             name="conv",
         )(x)
-        chex.assert_shape(x, (None, *self.spatial_shape, self.channels))
-        chex.assert_type(x, self.dtype)
+        sc.check(x, "BhwC", self.dtype)
         return x

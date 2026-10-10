@@ -9,6 +9,31 @@ import pytest
 
 from rl2.observation_decoder import ConvObservationDecoder
 from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStage
+from rl2.shape_checker import ShapeChecker
+
+
+def test_decoder_mirrors_configurable_stage_shapes() -> None:
+    stages = (
+        ConvStage(4, blocks=0, kernel_size=4, resize_factor=1 / 3),
+        ConvStage(4, blocks=0, kernel_size=1, resize_factor=1 / 3),
+    )
+    obs = jax.ShapeDtypeStruct((1, 1, 13, 11), jnp.uint8)
+    encoder = ConvObservationEncoder(stages=stages, embedding_size=8)
+    encoded, encoder_variables = jax.eval_shape(encoder.init_with_output, jax.random.key(0), obs)
+    decoder = ConvObservationDecoder((1, 13, 11), stages=stages)
+    decoded, decoder_variables = jax.eval_shape(decoder.init_with_output, jax.random.key(1), encoded)
+    sc = ShapeChecker(B=1, F=1, H=13, W=11)
+    sc.check(decoded, "BFHW", jnp.float32)
+    # 13x11 -> 5x4 -> 2x2 with ceil-rounded bilinear resizing.
+    assert encoder_variables["params"]["Dense_0"]["kernel"].shape == (16, 8)
+    assert decoder_variables["params"]["projection"]["kernel"].shape == (8, 16)
+    for index, kernel in enumerate((4, 1)):
+        assert decoder_variables["params"][f"stage_{index}"]["resize_conv"]["conv"]["kernel"].shape == (
+            kernel,
+            kernel,
+            4,
+            4,
+        )
 
 
 @pytest.mark.parametrize("shape", [(1, 210, 160, 3), (4, 84, 84), (2, 17, 13, 3), (1, 1, 257)])

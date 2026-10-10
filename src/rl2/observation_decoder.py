@@ -8,6 +8,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationStage, ConvStages, validate_stages
+from rl2.shape_checker import ShapeChecker
 
 
 class ConvObservationDecoder(nn.Module):
@@ -17,6 +18,8 @@ class ConvObservationDecoder(nn.Module):
     traverses them in reverse, with each stage resizing to the corresponding
     pre-downsampling spatial size, convolving to the previous channel
     width, then applying residual blocks at that resolution and width.
+    Each stage uses bilinear resize followed by a SAME convolution with the
+    configured kernel size.
     The final 7x7 convolution mirrors the encoder stem. Outputs are unbounded
     floating-point predictions on the normalized pixel scale, not uint8 pixels.
     """
@@ -27,7 +30,8 @@ class ConvObservationDecoder(nn.Module):
 
     @nn.compact
     def __call__(self, latent: jax.Array) -> jax.Array:
-        chex.assert_rank(latent, 2)
+        sc = ShapeChecker()
+        sc.check(latent, "BE")
         chex.assert_type(latent, jnp.floating)
         chex.assert_scalar_positive(latent.shape[-1])
         validate_stages(self.stages)
@@ -41,8 +45,8 @@ class ConvObservationDecoder(nn.Module):
         frames, height, width = self.observation_shape[:3]
         # Remember exact sizes: doubling alone cannot invert rounding on odd inputs.
         spatial_shapes = [(height, width)]
-        for _ in self.stages:
-            height, width = (height + 1) // 2, (width + 1) // 2
+        for stage in self.stages:
+            height, width = stage.output_shape(height, width)
             spatial_shapes.append((height, width))
         base_shape = (height, width, self.stages[-1].channels)
         visual_init = nn.initializers.variance_scaling(2.0, "fan_in", "truncated_normal")
@@ -56,6 +60,7 @@ class ConvObservationDecoder(nn.Module):
                 channels=previous_channels,
                 spatial_shape=spatial_shapes[index],
                 blocks=stage.blocks,
+                kernel_size=stage.kernel_size,
                 dtype=self.dtype,
                 name=f"stage_{index}",
             )(x)
@@ -74,6 +79,8 @@ class ConvObservationDecoder(nn.Module):
             x = jnp.transpose(x, (0, 3, 1, 2, 4))
         else:
             x = jnp.moveaxis(x, -1, 1)
-        chex.assert_shape(x, (latent.shape[0], *self.observation_shape))
-        chex.assert_type(x, self.dtype)
+        output_sc = ShapeChecker(
+            B=latent.shape[0], F=frames, H=self.observation_shape[1], W=self.observation_shape[2], C=colors
+        )
+        output_sc.check(x, "BFHWC" if len(self.observation_shape) == 4 else "BFHW", self.dtype)
         return x

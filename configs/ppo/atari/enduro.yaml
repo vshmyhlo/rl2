@@ -1,5 +1,5 @@
 # PPO Atari hyperparameters: https://arxiv.org/pdf/1707.06347, Table 5.
-env_id: ALE/SpaceInvaders-v5
+env_id: ALE/Enduro-v5
 observation_size: null # Resize only; null preserves the original resolution
 frame_stack: true # true stacks 4 frames; false uses a single frame
 atari_preprocessing: true # true enables 84x84 grayscale, action repeat 4, max pooling, and random reset no-ops

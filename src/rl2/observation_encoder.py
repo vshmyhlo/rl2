@@ -11,19 +11,34 @@ from flax import linen as nn
 from numpy.typing import NDArray
 
 from rl2.resize_conv import ResizeConv
+from rl2.shape_checker import ShapeChecker
 
 
 @dataclass(frozen=True)
 class ConvStage:
-    """One resize-convolution stage followed by residual blocks."""
+    """A resize-convolution stage followed by optional 3x3 residual blocks.
+
+    ``resize_factor`` multiplies each spatial dimension, rounding up (0.5 halves,
+    1.0 preserves, 2.0 doubles). ``kernel_size`` applies to the entry convolution
+    only. All stages use SAME padding and bilinear interpolation.
+    """
 
     channels: int
     blocks: int = 2
+    kernel_size: int = 3
+    resize_factor: float = 0.5
 
     def __post_init__(self) -> None:
-        chex.assert_type((self.channels, self.blocks), int)
+        chex.assert_type((self.channels, self.blocks, self.kernel_size), int)
         chex.assert_scalar_positive(self.channels)
-        chex.assert_scalar_positive(self.blocks)
+        chex.assert_scalar_non_negative(self.blocks)
+        chex.assert_scalar_positive(self.kernel_size)
+        if not math.isfinite(self.resize_factor) or self.resize_factor <= 0:
+            raise ValueError("resize_factor must be positive and finite")
+
+    def output_shape(self, height: int, width: int) -> tuple[int, int]:
+        """Compute the resized spatial shape, rounding each dimension up."""
+        return math.ceil(height * self.resize_factor), math.ceil(width * self.resize_factor)
 
 
 type ConvStages = tuple[ConvStage, ...]
@@ -68,23 +83,32 @@ class ResidualBlock(nn.Module):
 
 
 class ConvObservationStage(nn.Module):
-    """Resize, convolve, and apply residual blocks."""
+    """Resize-convolve, then apply optional residual blocks."""
 
     channels: int
     spatial_shape: tuple[int, int]
     blocks: int = 2
     dtype: jax.typing.DTypeLike = jnp.float32
+    kernel_size: int = 3
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        chex.assert_rank(x, 4)
-        chex.assert_type(x, self.dtype)
+        sc = ShapeChecker(C=self.channels)
+        sc.check(x, "BHWI", self.dtype)
         chex.assert_type((self.channels, self.blocks), int)
         chex.assert_scalar_positive(self.channels)
-        chex.assert_scalar_positive(self.blocks)
-        x = ResizeConv(self.channels, self.spatial_shape, dtype=self.dtype, name="resize_conv")(x)
+        chex.assert_scalar_non_negative(self.blocks)
+        x = ResizeConv(
+            self.channels,
+            self.spatial_shape,
+            dtype=self.dtype,
+            kernel_size=self.kernel_size,
+            name="resize_conv",
+        )(x)
+        sc.check(x, "BhwC", self.dtype)
         for block in range(self.blocks):
             x = ResidualBlock(self.channels, dtype=self.dtype, name=f"block_{block}")(x)
+        sc.check(x, "BhwC", self.dtype)
         return x
 
 
@@ -93,10 +117,9 @@ class ConvObservationEncoder(nn.Module):
 
     A 7x7 stem convolution followed by LayerNorm and SiLU extracts features at
     the original resolution using the first configured channel width.
-    Every stage resizes then applies a 3x3 convolution followed by the configured
-    residual blocks. No stages are inferred from input size.
-    Resizing uses antialiased bilinear interpolation and rounds each halved
-    spatial dimension up.
+    Stages use bilinear resize followed by SAME convolution, with configurable
+    kernels and resize factors. Optional residual
+    blocks preserve spatial size. Defaults resize by two and convolve with 3x3.
     Stage count and projection weights are fixed by the initialization shape.
     """
 
@@ -106,8 +129,8 @@ class ConvObservationEncoder(nn.Module):
 
     @nn.compact
     def __call__(self, obs: jax.Array | NDArray[np.uint8]) -> jax.Array:
-        chex.assert_rank(obs, {4, 5})
-        chex.assert_type(obs, jnp.uint8)
+        sc = ShapeChecker(C=3, E=self.embedding_size)
+        sc.check(obs, "BFHWC" if obs.ndim == 5 else "BFHW", jnp.uint8)
         validate_stages(self.stages)
         chex.assert_type(self.embedding_size, int)
         chex.assert_scalar_positive(self.embedding_size)
@@ -134,18 +157,21 @@ class ConvObservationEncoder(nn.Module):
         )(x)
         x = nn.silu(nn.LayerNorm(name="stem_norm", dtype=self.dtype)(x))
         for index, stage in enumerate(self.stages):
+            spatial_shape = stage.output_shape(x.shape[1], x.shape[2])
             x = ConvObservationStage(
                 channels=stage.channels,
-                spatial_shape=((x.shape[1] + 1) // 2, (x.shape[2] + 1) // 2),
+                spatial_shape=spatial_shape,
                 blocks=stage.blocks,
+                kernel_size=stage.kernel_size,
                 dtype=self.dtype,
                 name=f"stage_{index}",
             )(x)
+            stage_sc = ShapeChecker(B=obs.shape[0], H=spatial_shape[0], W=spatial_shape[1], C=stage.channels)
+            stage_sc.check(x, "BHWC", self.dtype)
         # Keep the remaining spatial positions distinct in the projection.
         x = nn.Dense(self.embedding_size, kernel_init=visual_init, dtype=self.dtype)(
             x.reshape((x.shape[0], math.prod(x.shape[1:])))
         )
         x = nn.silu(nn.LayerNorm(name="shared_norm", dtype=self.dtype)(x))
-        chex.assert_shape(x, (obs.shape[0], self.embedding_size))
-        chex.assert_type(x, self.dtype)
+        sc.check(x, "BE", self.dtype)
         return x

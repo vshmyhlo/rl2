@@ -1,0 +1,18 @@
+env_id: chess # Also supports gardner_chess and tic_tac_toe
+seed: 0
+iterations: 100
+num_envs: 8
+max_moves: 512 # Unfinished games contribute policy targets only
+num_simulations: 32
+channels: 64
+num_blocks: 3
+batch_size: 128
+updates_per_iteration: 8
+learning_rate: 0.001
+weight_decay: 0.0001
+max_grad_norm: 1.0
+dirichlet_alpha: 0.3
+dirichlet_fraction: 0.25
+exploration_moves: 30
+log_dir: gs://cohere-dev/vlad/rl2/alphazero/${run_id}/${path_name:${env_id}} # Full run path; env_id replaces / with _
+run_id: alphazero_chess # TensorBoard run directory; change this for a new run

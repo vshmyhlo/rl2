@@ -12,6 +12,24 @@ type LSTMCarry = tuple[jax.Array, jax.Array]
 type LSTMStackCarry = tuple[LSTMCarry, ...]
 
 
+def _sigmoid_float32(x: jax.Array) -> jax.Array:
+    sc = ShapeChecker()
+    sc.check(x, "BD")
+    chex.assert_type(x, float)
+    output = jax.nn.sigmoid(x.astype(jnp.float32))
+    sc.check(output, "BD", jnp.float32)
+    return output
+
+
+def _tanh_float32(x: jax.Array) -> jax.Array:
+    sc = ShapeChecker()
+    sc.check(x, "BD")
+    chex.assert_type(x, float)
+    output = jnp.tanh(x.astype(jnp.float32))
+    sc.check(output, "BD", jnp.float32)
+    return output
+
+
 def initial_carry(num_envs: int, hidden_size: int) -> LSTMCarry:
     chex.assert_scalar_positive(num_envs)
     chex.assert_scalar_positive(hidden_size)
@@ -32,6 +50,8 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
     both states before consuming input.
     Input width is inferred from the inputs and may differ from ``features``.
     Time, batch, and input feature dimensions must be nonempty.
+    Projections use ``dtype``; gate activations and memory updates use float32
+    so reduced-precision gates do not prematurely saturate or round updates.
     """
 
     features: int
@@ -40,7 +60,13 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
     def setup(self) -> None:
         chex.assert_scalar_positive(self.features)
         # Retain the parameter names used by PPO's original LSTM cell.
-        self.cell = nn.OptimizedLSTMCell(self.features, dtype=self.dtype, name="OptimizedLSTMCell_0")
+        self.cell = nn.OptimizedLSTMCell(
+            self.features,
+            dtype=self.dtype,
+            gate_fn=_sigmoid_float32,
+            activation_fn=_tanh_float32,
+            name="OptimizedLSTMCell_0",
+        )
 
     @nn.nowrap
     def initial_carry(self, num_envs: int) -> LSTMCarry:
