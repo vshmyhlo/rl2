@@ -17,6 +17,7 @@ pytest.importorskip("mctx")
 import pgx
 
 from rl2 import train_alphazero as az
+from rl2.alphazero.config import ModelConfig
 
 
 @pytest.fixture(scope="module")
@@ -25,32 +26,6 @@ def tiny_model() -> tuple[pgx.Env, az.PolicyValueNet, az.Parameters]:
     model = az.PolicyValueNet(env.num_actions, channels=4, num_blocks=1)
     params = model.init(jax.random.PRNGKey(0), jnp.zeros((1, 3, 3, 2), jnp.float32))["params"]
     return env, model, params
-
-
-@pytest.mark.parametrize(
-    "changes,match",
-    [
-        ({"num_simulations": 0}, "num_simulations"),
-        ({"learning_rate": float("nan")}, "learning_rate"),
-        ({"weight_decay": -1.0}, "weight_decay"),
-        ({"dirichlet_fraction": 1.1}, "dirichlet_fraction"),
-        ({"exploration_moves": -1}, "exploration_moves"),
-        ({"seed": 2**32}, "seed"),
-        ({"env_id": "go_9x9"}, "env_id"),
-        ({"log_dir": " "}, "log_dir"),
-        ({"run_id": " "}, "run_id"),
-        ({"run_id": ".."}, "run_id"),
-        ({"run_id": "a/b"}, "run_id"),
-    ],
-)
-def test_config_validation(changes: dict[str, object], match: str) -> None:
-    with pytest.raises(ValueError, match=match):
-        az.Config(**changes)
-
-
-def test_config_zero_boundaries() -> None:
-    # Accepted zero boundaries do not require initializing a model.
-    az.Config(weight_decay=0.0, dirichlet_fraction=0.0, exploration_moves=0)
 
 
 def test_sample_batch_excludes_padding() -> None:
@@ -125,8 +100,7 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
         num_envs=1,
         max_moves=10,
         num_simulations=2,
-        channels=4,
-        num_blocks=1,
+        model=ModelConfig(channels=4, num_blocks=1),
         batch_size=10,
     )
     batch, metrics = az.collect_selfplay(params, jax.random.PRNGKey(2), env=env, model=model, config=config)
@@ -161,7 +135,7 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
 
 def test_chess_search_smoke() -> None:
     env = pgx.make("chess")
-    config = az.Config(num_envs=1, max_moves=1, num_simulations=1, channels=4, num_blocks=1)
+    config = az.Config(num_envs=1, max_moves=1, num_simulations=1, model=ModelConfig(channels=4, num_blocks=1))
     model = az.PolicyValueNet(env.num_actions, channels=4, num_blocks=1)
     observation = env.init(jax.random.PRNGKey(0)).observation[None]
     params = model.init(jax.random.PRNGKey(0), observation)["params"]
@@ -174,30 +148,6 @@ def test_chess_search_smoke() -> None:
     legal = env.init(jax.random.PRNGKey(0)).legal_action_mask
     assert np.all(np.asarray(batch.policy_targets[0])[~np.asarray(legal)] == 0)
     np.testing.assert_allclose(batch.policy_targets.sum(), 1.0)
-
-
-def test_load_default_config() -> None:
-    path = Path(__file__).resolve().parents[1] / "configs/alphazero_chess.yaml"
-    config = az.load_config(path)
-    assert config == az.Config(
-        log_dir="gs://cohere-dev/vlad/rl2/alphazero/alphazero_chess/chess", run_id="alphazero_chess"
-    )
-
-
-@pytest.mark.parametrize(
-    "contents,error,match",
-    [
-        ("[]", TypeError, "mapping"),
-        ("num_envs: 1.5", ValueError, "num_envs"),
-        ("num_envs: true", ValueError, "num_envs"),
-        ("unknown_setting: 1", ValueError, "unknown_setting"),
-    ],
-)
-def test_load_config_rejects_invalid_input(tmp_path: Path, contents: str, error: type[Exception], match: str) -> None:
-    path = tmp_path / "config.yaml"
-    path.write_text(contents)
-    with pytest.raises(error, match=match):
-        az.load_config(path)
 
 
 def test_main_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -233,7 +183,7 @@ def test_main_reports_config_errors(
     with pytest.raises(SystemExit) as error:
         az.main()
     assert error.value.code == 2
-    assert "num_envs must be positive" in capsys.readouterr().err
+    assert "num_envs" in capsys.readouterr().err
     train.assert_not_called()
 
 

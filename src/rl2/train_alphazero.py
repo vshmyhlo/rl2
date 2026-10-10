@@ -23,54 +23,18 @@ import mctx
 import optax
 import pgx
 import yaml
-from flax import linen as nn
 from flax import struct
 from flax.training.train_state import TrainState
 from omegaconf.errors import OmegaConfBaseException
 from tensorboardX import SummaryWriter
 
 from rl2.alphazero.config import Config, load_config
+from rl2.alphazero.model import PolicyValueNet
 from rl2.configuration import resolve_settings
 from rl2.shape_checker import ShapeChecker
 
 type Parameters = dict[str, Any]
 type Metrics = dict[str, jax.Array]
-
-
-class PolicyValueNet(nn.Module):
-    num_actions: int
-    channels: int = 64
-    num_blocks: int = 3
-
-    @nn.compact
-    def __call__(self, observation: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """Predict policy logits and values from batched board observations.
-
-        Args:
-            observation: Shape (B, H, W, C), with batch size B, board height H,
-                board width W, and observation channels C. Converted to float32.
-
-        Returns:
-            Float32 policy logits of shape (B, num_actions) and values of shape
-            (B,) in [-1, 1], from the player-to-move perspective.
-        """
-        # PGX chess observations are floats; tic-tac-toe observations are bools.
-        observation = observation.astype(jnp.float32)
-        sc = ShapeChecker(A=self.num_actions, D=self.channels)
-        sc.check(observation, "BHWC", jnp.float32)
-        x = nn.relu(nn.Conv(self.channels, (3, 3))(observation))
-        for _ in range(self.num_blocks):
-            residual = x
-            x = nn.relu(nn.LayerNorm()(nn.Conv(self.channels, (3, 3))(x)))
-            x = nn.relu(residual + nn.LayerNorm()(nn.Conv(self.channels, (3, 3))(x)))
-        sc.check(x, "BHWD", jnp.float32)
-        policy = nn.relu(nn.Conv(2, (1, 1))(x)).reshape((x.shape[0], -1))
-        logits = nn.Dense(self.num_actions)(policy)
-        value = nn.relu(nn.Conv(1, (1, 1))(x)).reshape((x.shape[0], -1))
-        value = jnp.tanh(nn.Dense(1)(nn.relu(nn.Dense(self.channels)(value))))[:, 0]
-        sc.check(logits, "BA", jnp.float32)
-        sc.check(value, "B", jnp.float32)
-        return logits, value
 
 
 def masked_logits(logits: jax.Array, legal: jax.Array) -> jax.Array:
@@ -263,7 +227,7 @@ def train(config: Config) -> TrainState:
     run_name = config.run_id
     run_dir = config.log_dir
     env = pgx.make(config.env_id)
-    model = PolicyValueNet(env.num_actions, config.channels, config.num_blocks)
+    model = PolicyValueNet(env.num_actions, config.model.channels, config.model.num_blocks)
     key, init_key, env_key = jax.random.split(jax.random.PRNGKey(config.seed), 3)
     observation = env.init(env_key).observation[None].astype(jnp.float32)
     params = model.init(init_key, observation)["params"]

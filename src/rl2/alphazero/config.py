@@ -13,6 +13,12 @@ type EnvId = Literal["chess", "gardner_chess", "tic_tac_toe"]
 type PositiveFiniteFloat = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 
 
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class ModelConfig:
+    channels: Annotated[int, Field(gt=0, strict=True)] = 64
+    num_blocks: Annotated[int, Field(gt=0, strict=True)] = 3
+
+
 @dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
 class Config:
     env_id: EnvId = "chess"
@@ -21,8 +27,7 @@ class Config:
     num_envs: PositiveInt = 8
     max_moves: PositiveInt = 512
     num_simulations: PositiveInt = 32
-    channels: PositiveInt = 64
-    num_blocks: PositiveInt = 3
+    model: ModelConfig = ModelConfig()
     batch_size: PositiveInt = 128
     updates_per_iteration: PositiveInt = 8
     learning_rate: PositiveFiniteFloat = 1e-3
