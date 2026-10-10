@@ -12,7 +12,7 @@ import optax
 import pytest
 from flax.training.train_state import TrainState
 
-from rl2 import ppo
+from rl2 import ppo, ppo_rnd
 from rl2.atari_eval import EvaluationConfig, ScoreBaselines, TrainingScores, _action, evaluate, make_evaluation_env
 from rl2.atari_scores import ATARI_REFERENCE_SCORES, REFERENCE_SOURCE, get_reference_scores
 from rl2.ppo import Array, Config, LSTMStackCarry, load_config
@@ -124,8 +124,16 @@ def test_full_games_raw_returns_memory_and_json(tmp_path: Path, model_type: ppo.
     memories: list[float] = []
 
     def action(
-        state: TrainState, obs: Array, carry: ppo.RecurrentCarry, episode_start: bool, key: jax.Array, *, greedy: bool
+        state: TrainState,
+        obs: Array,
+        carry: ppo.RecurrentCarry,
+        episode_start: bool,
+        key: jax.Array,
+        *,
+        greedy: bool,
+        sequence_policy: bool,
     ) -> tuple[jax.Array, ppo.RecurrentCarry]:
+        assert not sequence_policy
         starts.append(episode_start)
         assert jax.tree.structure(carry) == jax.tree.structure(ppo.initial_model_carry(config, 1))
         memories.append(float(jax.tree.leaves(carry)[0].reshape(-1)[0]))
@@ -155,6 +163,42 @@ def test_full_games_raw_returns_memory_and_json(tmp_path: Path, model_type: ppo.
     assert memories == [0, 1, 0, 1]
     assert result["episodes"][0]["terminated"]
     assert result["episodes"][1]["truncated"]
+    assert env.closed
+
+
+def test_rnd_evaluation_carry_policy_interface_and_report(tmp_path: Path) -> None:
+    config = replace(
+        ppo_rnd.load_config(Path(__file__).resolve().parents[1] / "configs/ppo_rnd_montezuma.yaml"),
+        env_id="ALE/Pong-v5",
+        atari_preprocessing=True,
+        frame_stack=False,
+        lstm_hidden_size=2,
+    )
+
+    def rnd_policy(
+        variables: dict[str, Any], obs: Array, carry: ppo_rnd.LSTMCarry, starts: Array
+    ) -> tuple[ppo_rnd.LSTMCarry, jax.Array, jax.Array]:
+        sc = ShapeChecker(T=1, B=1, F=1, H=84, W=84, D=2)
+        sc.check(obs, "TBFHW", jnp.uint8)
+        sc.check(starts, "TB", jnp.bool_)
+        sc.check(carry, "BD", jnp.float32)
+        memory = tuple(jnp.where(starts[0, :, None], 0, c) + 1 for c in carry)
+        # The greedy action exposes whether memory advances and resets correctly.
+        logits = jax.nn.one_hot(memory[0][:, 0].astype(jnp.int32), 6)[None]
+        return memory, logits, jnp.zeros((1, 1, 2))
+
+    state = TrainState.create(apply_fn=rnd_policy, params={}, tx=optax.sgd(0.1))
+    env = ScoringEnv()
+    output = tmp_path / "rnd-evaluation.json"
+    with (
+        patch("rl2.atari_eval.make_evaluation_env", return_value=env),
+        patch.object(env, "step", wraps=env.step) as step,
+    ):
+        result = evaluate(state, config, EvaluationConfig(episodes=2, action_selection="greedy"), output_path=output)
+    assert [call.args[0] for call in step.call_args_list] == [1, 2, 1, 2]
+    assert result["return_mean"] == 5
+    assert result["training_config"]["encoder_channels"] == list(config.encoder_channels)
+    assert json.loads(output.read_text()) == result
     assert env.closed
 
 
@@ -208,6 +252,26 @@ def test_action_selection_and_recurrent_reset(greedy: bool) -> None:
     assert int(action) == expected
     for leaf in jax.tree.leaves(memory):
         np.testing.assert_array_equal(leaf, np.ones((1, 2)))
+
+
+@pytest.mark.parametrize(
+    "logits",
+    [
+        pytest.param(jnp.zeros((2, 6)), id="extra-logit-axis"),
+        pytest.param(jnp.zeros(6, dtype=jnp.int32), id="integer-logits"),
+    ],
+)
+def test_action_rejects_invalid_policy_logits(logits: jax.Array) -> None:
+    state = policy_state().replace(params={"logits": logits})
+    with pytest.raises(AssertionError, match="shape check"):
+        _action(
+            state,
+            np.zeros((1, 84, 84), dtype=np.uint8),
+            ppo.initial_model_carry(training_config(), 1),
+            True,
+            jax.random.key(1),
+            greedy=True,
+        )
 
 
 def test_cleanup_on_policy_failure() -> None:

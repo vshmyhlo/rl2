@@ -11,6 +11,9 @@ from rl2.alphazero.config import Config, ModelConfig, load_config
     "changes,match",
     [
         ({"num_simulations": 0}, "num_simulations"),
+        ({"checkpoint_interval_seconds": 0.0}, "checkpoint_interval_seconds"),
+        ({"log_interval_seconds": 0.0}, "log_interval_seconds"),
+        ({"log_interval_seconds": float("inf")}, "log_interval_seconds"),
         ({"learning_rate": float("nan")}, "learning_rate"),
         ({"max_grad_norm": float("inf")}, "max_grad_norm"),
         ({"weight_decay": -1.0}, "weight_decay"),
@@ -51,6 +54,13 @@ def test_load_partial_model_config(tmp_path: Path) -> None:
     path.write_text("model:\n  channels: 4\n")
     config = load_config(path)
     assert config.model == ModelConfig(channels=4)
+
+
+def test_load_log_interval(tmp_path: Path) -> None:
+    assert Config().log_interval_seconds == 60.0
+    path = tmp_path / "config.yaml"
+    path.write_text("log_interval_seconds: 15.5\n")
+    assert load_config(path).log_interval_seconds == 15.5
 
 
 @pytest.mark.parametrize(

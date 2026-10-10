@@ -1,4 +1,4 @@
-"""Full-game Atari evaluation for the in-memory PPO TrainState.
+"""Full-game Atari evaluation for an in-memory PPO or PPO-RND TrainState.
 
 Example (train with atari_preprocessing=True from the outset)::
 
@@ -17,7 +17,7 @@ repeat 4, last-two-frame max pooling, grayscale 84x84, minimal actions,
 and undiscounted, unclipped rewards. Reset no-ops consume the frame budget;
 as in Gymnasium's preprocessing, their rewards are excluded from the return.
 No automatic FIRE actions: the policy must start/resume games itself.
-Frame stacking follows training (one frame for the LSTM, or four frames).
+Frame stacking follows training (one or four frames).
 PPO actions are sampled by default; greedy evaluation is an explicit option.
 
 There is no single protocol shared by all Atari papers. ``legacy_noop``
@@ -59,9 +59,13 @@ from flax.training.train_state import TrainState
 
 from rl2.atari_scores import REFERENCE_SOURCE, get_reference_scores
 from rl2.ppo import Array, AtariPreprocessing, Config, RecurrentCarry, initial_model_carry
+from rl2.ppo_rnd import Config as RNDConfig
+from rl2.ppo_rnd import LSTMCarry, initial_carry
 from rl2.shape_checker import ShapeChecker
 
 type EvaluationResult = dict[str, Any]
+type TrainingConfig = Config | RNDConfig
+type EvaluationCarry = RecurrentCarry | LSTMCarry
 
 
 @dataclass(frozen=True)
@@ -129,7 +133,7 @@ class ScoreBaselines:
             raise ValueError("baseline source is required")
 
 
-def validate_training_config(training: Config) -> None:
+def validate_training_config(training: TrainingConfig) -> None:
     """Reject incompatible policy inputs before starting training or evaluation."""
     if not training.atari_preprocessing or training.observation_size not in (None, 84):
         raise ValueError(
@@ -141,7 +145,7 @@ def validate_training_config(training: Config) -> None:
         raise ValueError("Use an explicit ALE/<Game>-v5 environment ID")
 
 
-def make_evaluation_env(training: Config, evaluation: EvaluationConfig) -> gym.Env:
+def make_evaluation_env(training: TrainingConfig, evaluation: EvaluationConfig) -> gym.Env:
     """Build an explicitly configured ALE environment without training wrappers."""
     validate_training_config(training)
     gym.register_envs(ale_py)
@@ -173,31 +177,39 @@ def make_evaluation_env(training: Config, evaluation: EvaluationConfig) -> gym.E
         raise
 
 
-@partial(jax.jit, static_argnames=("greedy",))
+@partial(jax.jit, static_argnames=("greedy", "sequence_policy"))
 def _action(
     state: TrainState,
     obs: Array,
-    carry: RecurrentCarry,
+    carry: EvaluationCarry,
     episode_start: bool,
     key: jax.Array,
     *,
     greedy: bool,
-) -> tuple[jax.Array, RecurrentCarry]:
-    carry, logits, _ = state.apply_fn(
-        {"params": state.params},
-        obs[None],
-        carry,
-        jnp.asarray([episode_start]),
-        method="step",
-    )
+    sequence_policy: bool = False,
+) -> tuple[jax.Array, EvaluationCarry]:
+    sc = ShapeChecker(T=1, B=1)
+    sc.check(obs, "FHW", jnp.uint8)
+    sc.check(jax.random.key_data(key), "K", jnp.uint32)
+    starts = jnp.asarray([episode_start])
+    sc.check(starts, "B", jnp.bool_)
+    if sequence_policy:
+        # PPO-RND exposes only a time-major sequence call, with two value heads.
+        carry, logits, _ = state.apply_fn({"params": state.params}, obs[None, None], carry, starts[None])
+        sc.check(logits, "TBA", jnp.float32)
+        logits = logits[0]
+    else:
+        carry, logits, _ = state.apply_fn({"params": state.params}, obs[None], carry, starts, method="step")
+    sc.check(logits, "BA", jnp.float32)
     logits = logits[0]
     action = jnp.argmax(logits) if greedy else jax.random.categorical(key, logits)
+    sc.check(action, "")
     return action, carry
 
 
 def evaluate(
     state: TrainState,
-    training: Config,
+    training: TrainingConfig,
     evaluation: EvaluationConfig | None = None,
     *,
     baselines: ScoreBaselines | None = None,
@@ -205,7 +217,7 @@ def evaluate(
     output_path: str | Path | None = None,
     show_progress: bool = True,
 ) -> EvaluationResult:
-    """Evaluate frozen parameters with fresh environment, RNG, and LSTM state.
+    """Evaluate frozen parameters with fresh environment, RNG, and recurrent state.
 
     ``training`` must describe the supplied state's actual training setup.
     Returns a JSON-compatible report; optionally writes it to ``output_path``.
@@ -251,7 +263,11 @@ def evaluate(
             obs, info = env.reset(seed=seed)
             reset_frames = int(info["episode_frame_number"])
             key = jax.random.key(seed)
-            carry = initial_model_carry(training, 1)
+            carry = (
+                initial_carry(1, training.lstm_hidden_size)
+                if isinstance(training, RNDConfig)
+                else initial_model_carry(training, 1)
+            )
             episode_return, agent_steps = 0.0, 0
             terminated, truncated = False, False
             while not (terminated or truncated):
@@ -263,6 +279,7 @@ def evaluate(
                     agent_steps == 0,
                     action_key,
                     greedy=evaluation.action_selection == "greedy",
+                    sequence_policy=isinstance(training, RNDConfig),
                 )
                 obs, reward, terminated, truncated, info = env.step(int(action))
                 episode_return += float(reward)
@@ -294,9 +311,8 @@ def evaluate(
     sc = ShapeChecker(E=evaluation.episodes)
     sc.check(returns, "E", np.float64)
     std = float(returns.std(ddof=1)) if len(returns) > 1 else None
-    training_metadata = asdict(training)
-    # Stage tuples must also be lists in memory so the report survives a JSON round trip.
-    training_metadata["encoder_stages"] = list(training_metadata["encoder_stages"])
+    # Normalize tuples in either config so the in-memory report matches saved JSON.
+    training_metadata = json.loads(json.dumps(asdict(training), allow_nan=False))
     result: EvaluationResult = {
         "env_id": training.env_id,
         "evaluation": asdict(evaluation),

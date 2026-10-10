@@ -38,6 +38,8 @@ class Config:
     exploration_moves: NonNegativeInt = 30
     log_dir: Annotated[str, Field(pattern=r"\S")] = "runs/alphazero/${run_id}"
     run_id: str | None = None
+    log_interval_seconds: PositiveFiniteFloat = 60.0
+    checkpoint_interval_seconds: PositiveFiniteFloat = 600.0
 
     @field_validator("run_id")
     @classmethod

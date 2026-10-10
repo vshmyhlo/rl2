@@ -1,5 +1,5 @@
 # Starting configuration for one A100 40 GB with memory available for this run.
-# Uses fresh self-play batches; the trainer has no replay buffer or checkpoints yet.
+# Uses fresh self-play batches; the trainer has no replay buffer yet.
 env_id: chess
 seed: 0
 iterations: 10000 # Up to 1.28M games and 640K optimizer updates
@@ -19,3 +19,5 @@ dirichlet_fraction: 0.25
 exploration_moves: 30 # Sample search visits for the first 30 plies, then select greedily
 log_dir: gs://cohere-dev/vlad/rl2/alphazero/${run_id}
 run_id: alphazero_${path_name:${env_id}} # Includes the environment ID; change the prefix for a new run
+log_interval_seconds: 60.0 # Aggregate metrics; emit at iteration boundaries and at normal completion
+checkpoint_interval_seconds: 600.0 # Save after an iteration every 10 minutes, and at normal completion

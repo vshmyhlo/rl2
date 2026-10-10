@@ -1,7 +1,8 @@
+import logging
 import sys
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import jax
 import jax.numpy as jnp
@@ -191,6 +192,10 @@ def test_main_reports_config_errors(
 def logging_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> az.Config:
     """Exercise the training loop's logging without running a model or search."""
     config = az.Config(iterations=2, updates_per_iteration=2, log_dir=str(tmp_path) + "/${run_id}")
+    manager = MagicMock()
+    manager.__enter__.return_value = manager
+    manager.latest_step.return_value = None
+    monkeypatch.setattr(az, "checkpoint_manager", Mock(return_value=manager))
     env = Mock(num_actions=9)
     env.init.return_value.observation = jnp.zeros((3, 3, 2), jnp.float32)
     monkeypatch.setattr(az.pgx, "make", Mock(return_value=env))
@@ -212,36 +217,141 @@ def logging_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> az.Config
     return config
 
 
-def test_tensorboard_progress(logging_config: az.Config, tmp_path: Path) -> None:
-    logging_config = replace(logging_config, log_dir=str(tmp_path) + "/${run_id}/${env_id}", run_id="test-run")
+def test_tensorboard_progress(
+    logging_config: az.Config, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    caplog.set_level(logging.INFO, logger=az.__name__)
+    logging_config = replace(
+        logging_config,
+        iterations=5,
+        log_dir=str(tmp_path) + "/${run_id}/${env_id}",
+        run_id="test-run",
+        log_interval_seconds=30.0,
+    )
+    clock = 0.0
+    durations = [29.0, 1.0, 15.0, 15.0, 5.0]
+    original_step = az.train_step
+    rollouts = list(az.collect_selfplay.side_effect)
+    az.collect_selfplay.side_effect = rollouts * 2 + rollouts[:1]
+
+    def timed_step(state: TrainState, batch: az.Batch, *, model: az.PolicyValueNet) -> tuple[TrainState, az.Metrics]:
+        nonlocal clock
+        clock += durations[state.step // logging_config.updates_per_iteration] / logging_config.updates_per_iteration
+        return original_step(state, batch, model=model)
+
+    def now() -> float:
+        return clock
+
+    monkeypatch.setattr(az, "train_step", timed_step)
+    monkeypatch.setattr(az, "monotonic", now)
     state = az.train(logging_config)
-    assert state.step == 4
+    assert state.step == 10
     events = EventAccumulator(str(tmp_path / "test-run" / "chess")).Reload()
     losses = events.Scalars("losses/loss")
-    assert [event.step for event in losses] == [3, 5]
-    assert [event.value for event in losses] == [2, 6]  # Mean over both updates, not just the last.
-    assert [event.value for event in events.Scalars("charts/completed_games")] == [1, 1]
-    assert [event.value for event in events.Scalars("selfplay/value_positions")] == [2, 0]
-    assert [event.value for event in events.Scalars("charts/iteration")] == [1, 2]
+    assert [event.step for event in losses] == [5, 10, 13]
+    assert [event.value for event in losses] == [4, 12, 18]  # Mean over every update in each window.
+    assert [event.value for event in events.Scalars("charts/completed_games")] == [1, 2, 3]
+    assert [event.value for event in events.Scalars("selfplay/completed_games")] == [1, 1, 1]
+    assert [event.value for event in events.Scalars("selfplay/positions")] == [5, 5, 3]
+    assert [event.value for event in events.Scalars("selfplay/value_positions")] == [2, 2, 2]
+    assert [event.value for event in events.Scalars("charts/iteration")] == [2, 4, 5]
+    assert [event.value for event in events.Scalars("time/window_seconds")] == [30, 30, 5]
+    assert [event.value for event in events.Scalars("time/iteration_seconds")] == [30, 30, 5]
+    assert "time/rollout_seconds" not in events.Tags()["scalars"]
+    assert "time/optimization_seconds" not in events.Tags()["scalars"]
+    assert [event.value for event in events.Scalars("charts/SPS")] == pytest.approx([5 / 30, 5 / 30, 3 / 5])
     assert events.Scalars("time/eta_seconds")[-1].value == 0
     assert events.Scalars("model/params_millions")[0].value == pytest.approx(1e-6)
-    for tag in ("charts/SPS", "time/rollout_seconds", "time/optimization_seconds", "time/elapsed_seconds"):
+    for tag in ("charts/SPS", "time/elapsed_seconds"):
         assert all(np.isfinite(event.value) and event.value >= 0 for event in events.Scalars(tag))
     text = events.Tensors("config/text_summary")[0].tensor_proto.string_val[0].decode()
     saved_config = yaml.safe_load(text.removeprefix("```yaml\n").removesuffix("```"))
     assert saved_config["log_dir"] == str(tmp_path / "test-run" / "chess")
     assert saved_config["run_id"] == "test-run"
     assert "devices/text_summary" in events.Tags()["tensors"]
+    messages = [record.getMessage() for record in caplog.records if record.name == az.__name__]
+    assert "Run ID: test-run" in messages
+    reports = [message for message in messages if message.startswith("Iteration ")]
+    assert len(reports) == 3
+    for report, iteration, steps, loss, positions, seconds in zip(
+        reports, [2, 4, 5], [5, 10, 13], [4, 12, 18], [5, 5, 3], [30, 30, 5], strict=True
+    ):
+        assert report.startswith(f"Iteration {iteration}/5 | steps={steps} | ")
+        assert f" | loss={loss} | " in report
+        assert f" | positions={positions} | " in report
+        assert report.endswith(f"seconds={seconds:.2f}")
 
 
 def test_tensorboard_closes_on_error(logging_config: az.Config, monkeypatch: pytest.MonkeyPatch) -> None:
-    writer = Mock()
+    writer = MagicMock()
+    writer.__enter__.return_value = writer
     make_writer = Mock(return_value=writer)
     monkeypatch.setattr(az, "SummaryWriter", make_writer)
     monkeypatch.setattr(az, "collect_selfplay", Mock(side_effect=RuntimeError("search failed")))
     with pytest.raises(RuntimeError, match="search failed"):
         az.train(logging_config)
-    writer.close.assert_called_once_with()
+    writer.__exit__.assert_called_once()
+    assert writer.__exit__.call_args.args[0] is RuntimeError
+    az.checkpoint_manager.return_value.__exit__.assert_called_once()
     run_dir = Path(make_writer.call_args.kwargs["logdir"])
     assert run_dir.parent == Path(logging_config.log_dir).parent
     assert run_dir.name.startswith("chess_seed0_")
+
+
+def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = replace(logging_config, iterations=4, updates_per_iteration=1, run_id="resume")
+    assert config.checkpoint_interval_seconds == 600.0
+    clock = 0.0
+    interrupted = False
+    original_step = az.train_step
+
+    def timed_step(state: TrainState, batch: az.Batch, *, model: az.PolicyValueNet) -> tuple[TrainState, az.Metrics]:
+        nonlocal clock, interrupted
+        if state.step == 2 and not interrupted:
+            interrupted = True
+            raise RuntimeError("interrupted")
+        clock += 599.0 if state.step == 0 else 1.0
+        return original_step(state, batch, model=model)
+
+    def now() -> float:
+        return clock
+
+    rollout = Mock(return_value=(None, {"positions": 2, "completed_games": 1, "value_positions": 2}))
+    restore = Mock(return_value=None)
+    save = Mock()
+    writer = MagicMock()
+    writer.__enter__.return_value = writer
+    make_writer = Mock(return_value=writer)
+    monkeypatch.setattr(az, "collect_selfplay", rollout)
+    monkeypatch.setattr(az, "train_step", timed_step)
+    monkeypatch.setattr(az, "monotonic", now)
+    monkeypatch.setattr(az, "restore_checkpoint", restore)
+    monkeypatch.setattr(az, "save_checkpoint", save)
+    monkeypatch.setattr(az, "SummaryWriter", make_writer)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        az.train(config)
+    save.assert_called_once()
+    saved = save.call_args.args[1]
+    assert (saved.iteration, saved.steps, saved.completed_games) == (2, 4, 2)
+    manager = az.checkpoint_manager.return_value
+    manager.__exit__.assert_called_once()
+    writer.__exit__.assert_called_once()
+
+    restore.return_value = saved
+    writer.reset_mock()
+    state = az.train(config)
+    assert state.step == 4
+    assert [call.args[1].iteration for call in save.call_args_list] == [2, 4]
+    final = save.call_args.args[1]
+    assert (final.steps, final.completed_games) == (8, 4)
+    assert make_writer.call_args.kwargs["purge_step"] == 5
+    # Replay the interrupted iteration with the same self-play RNG.
+    np.testing.assert_array_equal(rollout.call_args_list[2].args[1], rollout.call_args_list[3].args[1])
+    eta = [call.args[1] for call in writer.add_scalar.call_args_list if call.args[0] == "time/eta_seconds"]
+    assert eta == [0.0]  # Resumed iterations share a final partial logging window.
+
+    restore.return_value = final
+    rollout.reset_mock()
+    az.train(config)
+    rollout.assert_not_called()
+    assert save.call_count == 2

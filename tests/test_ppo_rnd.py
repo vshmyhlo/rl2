@@ -167,7 +167,9 @@ def test_two_value_outputs_recurrence_and_evaluation() -> None:
     # A game reset clears both critics' history for the resetting environment.
     _, _, fresh = model.apply({"params": params}, obs[2:], rnd.initial_carry(2, 8), starts[2:])
     np.testing.assert_allclose(fresh[:, 0], values[2:, 0], atol=5e-6)
-    action, _ = _action(state, obs[0, 0], rnd.initial_carry(1, 8), True, jax.random.key(3), greedy=True)
+    action, _ = _action(
+        state, obs[0, 0], rnd.initial_carry(1, 8), True, jax.random.key(3), greedy=True, sequence_policy=True
+    )
     assert int(action) == int(logits[0, 0].argmax())
     batch = (
         obs,

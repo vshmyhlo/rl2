@@ -5,13 +5,53 @@ For a cheap start, set env_id: tic_tac_toe and max_moves: 9 in the YAML config.
 
 Each iteration starts fresh games and samples updates from that rollout only.
 Unfinished games train the policy but not the value; terminal padding trains
-neither. This scaffold has no persistent replay, evaluation, or checkpoints.
+neither. Orbax checkpoints save every 10 minutes at iteration boundaries and on
+normal completion; reusing a run directory resumes the latest saved iteration.
+Progress metrics aggregate over log_interval_seconds (default: 60), emitted
+at iteration boundaries and on normal completion.
+
+TensorBoard metrics use cumulative played positions as the step axis, excluding
+terminal padding. Each logging window contains complete training iterations:
+
+- losses/policy_loss: Mean policy cross-entropy against MCTS action weights,
+  averaged over optimizer updates in the window. Padding is masked out.
+- losses/value_loss: Mean squared error against final game outcomes, averaged
+  over updates. Only positions from terminated games contribute; an update
+  with no eligible positions contributes zero.
+- losses/loss: Sum of policy and value losses, averaged over updates. AdamW
+  weight decay is applied by the optimizer and is not included in this loss.
+- selfplay/positions: Total played positions collected in the window.
+- selfplay/value_positions: Total positions with terminal outcome targets
+  collected in the window, before sampling training minibatches.
+- selfplay/completed_games: Total terminated games in the window, including
+  draws. Games still unfinished at the rollout limit are excluded.
+- charts/iteration: Latest completed iteration number, starting at one.
+- charts/completed_games: Cumulative terminated games, including restored
+  checkpoint progress.
+- charts/learning_rate: Configured constant optimizer learning rate.
+- charts/SPS: Window positions divided by window wall time, in positions/sec.
+- time/iteration_seconds: Sum of iteration wall times in the window, covering
+  self-play and optimization; excludes logging and checkpoint saving.
+- time/window_seconds: Wall time since the previous window boundary, including
+  intervening logging and checkpoint overhead.
+- time/elapsed_seconds: Wall time since this training invocation's loop began;
+  resets on resume and excludes initialization and checkpoint restoration.
+- time/eta_seconds: Estimated remaining training time from the mean iteration
+  duration since this invocation began, including intervening overhead.
+
+At startup, model/params_millions records the parameter count in millions;
+config and devices record the resolved configuration and JAX devices as text.
+Stdout reports the latest iteration and cumulative steps, window self-play
+totals, mean losses, and window wall time (seconds).
+
+This scaffold has no persistent replay or evaluation.
 PGX owns observation/action encodings and draw rules. Values always use the
 player-to-move perspective. This is not an exact reproduction of the paper.
 """
 
 import argparse
-import json
+import logging
+import sys
 from dataclasses import asdict, replace
 from functools import partial
 from time import monotonic
@@ -28,10 +68,13 @@ from flax.training.train_state import TrainState
 from omegaconf.errors import OmegaConfBaseException
 from tensorboardX import SummaryWriter
 
+from rl2.alphazero.checkpoints import TrainingProgress, checkpoint_manager, restore_checkpoint, save_checkpoint
 from rl2.alphazero.config import Config, load_config
 from rl2.alphazero.model import PolicyValueNet
 from rl2.configuration import resolve_settings
 from rl2.shape_checker import ShapeChecker
+
+logger = logging.getLogger(__name__)
 
 type Parameters = dict[str, Any]
 type Metrics = dict[str, jax.Array]
@@ -239,24 +282,37 @@ def train(config: Config) -> TrainState:
             optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
         ),
     )
-    writer = SummaryWriter(logdir=run_dir)
-    try:
-        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", 0)
-        writer.add_text("devices", str(jax.devices()), 0)
+    with (
+        checkpoint_manager(run_dir) as manager,
+        SummaryWriter(
+            logdir=run_dir,
+            purge_step=(
+                progress.steps + 1 if (progress := restore_checkpoint(manager, state, config)) is not None else None
+            ),
+        ) as writer,
+    ):
+        start_iteration = steps = completed_games = 0
+        if progress is not None:
+            state, key, start_iteration, steps, completed_games = progress
+        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", steps)
+        writer.add_text("devices", str(jax.devices()), steps)
         parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
-        writer.add_scalar("model/params_millions", parameter_count / 1_000_000, 0)
-        print(f"Run ID: {run_name}\nTensorBoard run: {run_dir}", flush=True)
-        steps = 0
-        completed_games = 0
+        writer.add_scalar("model/params_millions", parameter_count / 1_000_000, steps)
+        logger.info("Run ID: %s", run_name)
+        logger.info("TensorBoard run: %s", run_dir)
+        if progress is not None:
+            logger.info("Resumed iteration %d, step %d", start_iteration, steps)
         start = monotonic()
-        for iteration in range(config.iterations):
+        last_checkpoint_time = start
+        window_start = start
+        window_iterations = 0
+        window_losses: dict[str, float] = {}
+        window_rollout: dict[str, float] = {}
+        window_iteration_seconds = 0.0
+        for iteration in range(start_iteration, config.iterations):
             iteration_start = monotonic()
             key, play_key = jax.random.split(key)
-            batch, rollout_metrics = jax.block_until_ready(
-                collect_selfplay(state.params, play_key, env=env, model=model, config=config)
-            )
-            rollout_seconds = monotonic() - iteration_start
-            optimization_start = monotonic()
+            batch, rollout_metrics = collect_selfplay(state.params, play_key, env=env, model=model, config=config)
             losses: dict[str, float] = {}
             for _ in range(config.updates_per_iteration):
                 key, sample_key = jax.random.split(key)
@@ -264,35 +320,61 @@ def train(config: Config) -> TrainState:
                 state, metrics = train_step(state, minibatch, model=model)
                 for name, value in metrics.items():
                     losses[name] = losses.get(name, 0.0) + float(value) / config.updates_per_iteration
-            jax.block_until_ready(state)
-            optimization_seconds = monotonic() - optimization_start
             rollout = {name: float(value) for name, value in rollout_metrics.items()}
             # Use actual played positions as the x-axis, excluding terminal padding.
             steps += int(rollout["positions"])
             completed_games += int(rollout["completed_games"])
             seconds = monotonic() - iteration_start
-            elapsed_seconds = monotonic() - start
-            scalars = {
-                **{f"losses/{name}": value for name, value in losses.items()},
-                **{f"selfplay/{name}": value for name, value in rollout.items()},
-                "charts/iteration": iteration + 1,
-                "charts/completed_games": completed_games,
-                "charts/learning_rate": config.learning_rate,
-                "charts/SPS": rollout["positions"] / max(seconds, 1e-9),
-                "time/rollout_seconds": rollout_seconds,
-                "time/optimization_seconds": optimization_seconds,
-                "time/iteration_seconds": seconds,
-                "time/elapsed_seconds": elapsed_seconds,
-                "time/eta_seconds": elapsed_seconds * (config.iterations - iteration - 1) / (iteration + 1),
-            }
-            for tag, value in scalars.items():
-                writer.add_scalar(tag, value, steps)
-            writer.flush()
-            report = dict(rollout | losses, iteration=iteration + 1, steps=steps, seconds=seconds)
-            print(json.dumps(report), flush=True)
+            window_iterations += 1
+            for name, value in losses.items():
+                window_losses[name] = window_losses.get(name, 0.0) + value
+            for name, value in rollout.items():
+                window_rollout[name] = window_rollout.get(name, 0.0) + value
+            window_iteration_seconds += seconds
+            now = monotonic()
+            window_seconds = now - window_start
+            if window_seconds >= config.log_interval_seconds or iteration + 1 == config.iterations:
+                # Each iteration has the same number of updates, so this is
+                # also the mean over all optimizer updates in the window.
+                mean_losses = {name: value / window_iterations for name, value in window_losses.items()}
+                elapsed_seconds = now - start
+                scalars = {
+                    **{f"losses/{name}": value for name, value in mean_losses.items()},
+                    **{f"selfplay/{name}": value for name, value in window_rollout.items()},
+                    "charts/iteration": iteration + 1,
+                    "charts/completed_games": completed_games,
+                    "charts/learning_rate": config.learning_rate,
+                    "charts/SPS": window_rollout["positions"] / max(window_seconds, 1e-9),
+                    "time/iteration_seconds": window_iteration_seconds,
+                    "time/window_seconds": window_seconds,
+                    "time/elapsed_seconds": elapsed_seconds,
+                    "time/eta_seconds": elapsed_seconds
+                    * (config.iterations - iteration - 1)
+                    / (iteration + 1 - start_iteration),
+                }
+                for tag, value in scalars.items():
+                    writer.add_scalar(tag, value, steps)
+                writer.flush()
+                logger.info(
+                    "Iteration %d/%d | steps=%d | %s | seconds=%.2f",
+                    iteration + 1,
+                    config.iterations,
+                    steps,
+                    " | ".join(f"{name}={value:.6g}" for name, value in (window_rollout | mean_losses).items()),
+                    window_seconds,
+                )
+                window_start = now
+                window_iterations = 0
+                window_losses.clear()
+                window_rollout.clear()
+                window_iteration_seconds = 0.0
+            if (
+                monotonic() - last_checkpoint_time >= config.checkpoint_interval_seconds
+                or iteration + 1 == config.iterations
+            ):
+                save_checkpoint(manager, TrainingProgress(state, key, iteration + 1, steps, completed_games), config)
+                last_checkpoint_time = monotonic()
         return state
-    finally:
-        writer.close()
 
 
 def main() -> None:
@@ -303,6 +385,7 @@ def main() -> None:
         config = load_config(args.config)
     except (OSError, TypeError, ValueError, yaml.YAMLError, OmegaConfBaseException) as error:
         parser.error(str(error))
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stdout)
     train(config)
 
 
