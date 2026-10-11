@@ -151,3 +151,6 @@ increasing it extends the run and recalculates decay schedules for the new targe
 - [JaxUED](https://github.com/DramaCow/jaxued): Unsupervised environment design
   in JAX, with readable single-file implementations of domain randomization,
   Prioritized Level Replay, ACCEL, and PAIRED, plus reusable level-sampling utilities.
+- [Brax](https://github.com/google/brax): JAX-based physics simulation and RL
+  training, including PPO and SAC, with accelerator-parallel execution. Active
+  development focuses on training, with support for MuJoCo Playground environments.
