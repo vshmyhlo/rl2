@@ -4,7 +4,9 @@ TensorBoard outputs use training environment steps as the global step.
 
 Progress scalars:
     losses/policy: PPO policy loss.
-    losses/value: Value prediction loss.
+    losses/value: Value prediction loss before applying value_coef.
+    losses/entropy: Negative action distribution entropy before applying entropy_coef.
+    losses/total: Policy loss + value_coef * value loss + weighted entropy loss.
     policy/entropy: Action distribution entropy.
     policy/approx_kl: Approximate KL divergence from the rollout policy.
     policy/clip_fraction: Fraction of probability ratios outside the clip range.
@@ -196,6 +198,7 @@ class PPOMetrics:
 
     policy_loss: jax.Array  # ()
     value_loss: jax.Array  # ()
+    entropy_loss: jax.Array  # ()
     entropy: jax.Array  # ()
     approx_kl: jax.Array  # ()
     clip_fraction: jax.Array  # ()
@@ -724,12 +727,14 @@ def update(
         policy_loss = -jnp.minimum(ratio * advantages, clipped * advantages).mean()  # ()
         value_loss = 0.5 * jnp.square(values - batch.returns).mean()  # ()
         entropy = -(jax.nn.softmax(logits) * jax.nn.log_softmax(logits)).sum(-1).mean()  # ()
-        loss = policy_loss + config.value_coef * value_loss - entropy_coef * entropy  # ()
+        entropy_loss = -entropy_coef * entropy  # ()
+        loss = policy_loss + config.value_coef * value_loss + entropy_loss  # ()
         approx_kl = (jnp.expm1(log_ratio) - log_ratio).mean()  # ()
         clip_fraction = (jnp.abs(ratio - 1) > config.clip_coef).mean()  # ()
         return loss, PPOMetrics(
             policy_loss=policy_loss,  # ()
             value_loss=value_loss,  # ()
+            entropy_loss=entropy_loss,  # ()
             entropy=entropy,  # ()
             approx_kl=approx_kl,  # ()
             clip_fraction=clip_fraction,  # ()
@@ -1060,6 +1065,10 @@ def train(config: Config) -> TrainState:
                     {
                         "losses/policy": mean_metrics["policy_loss"],
                         "losses/value": mean_metrics["value_loss"],
+                        "losses/entropy": -mean_metrics["entropy"],
+                        "losses/total": mean_metrics["policy_loss"]
+                        + config.value_coef * mean_metrics["value_loss"]
+                        + mean_metrics["entropy_loss"],
                         "policy/entropy": mean_metrics["entropy"],
                         "policy/approx_kl": mean_metrics["approx_kl"],
                         "policy/clip_fraction": mean_metrics["clip_fraction"],
