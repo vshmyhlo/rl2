@@ -105,15 +105,22 @@ def test_training_reports_raw_completed_episode_scores() -> None:
         rnd.train(settings)
     assert evaluate.call_count == 2
     for call, expected_returns, steps in zip(evaluate.call_args_list, [(3.0,), (3.0, 7.0)], [2, 4], strict=True):
+        chex.assert_trees_all_equal(call.kwargs["initial_carry"], carry)
         scores = call.kwargs["training_scores"]
         assert scores.episode_count == len(expected_returns)
         assert scores.return_sum == sum(expected_returns)
         assert scores.recent_returns == expected_returns
+        assert scores.length_sum == (2 if steps == 2 else 3)
+        assert scores.recent_lengths == ((2,) if steps == 2 else (2, 1))
         assert call.args[3:] == (len(expected_returns), steps)
-    logs = [
-        call.args[1:] for call in writer.return_value.add_scalar.call_args_list if call.args[0] == "charts/return_mean"
-    ]
-    assert logs == [(3.0, 2), (5.0, 4)]
+    for tag, expected in {
+        "charts/total_return_mean": [(3.0, 2), (5.0, 4)],
+        "charts/total_episode_length_mean": [(2.0, 2), (1.5, 4)],
+        "charts/return_mean_last_100": [(3.0, 2), (5.0, 4)],
+        "charts/episode_length_mean_last_100": [(2.0, 2), (1.5, 4)],
+    }.items():
+        logs = [call.args[1:] for call in writer.return_value.add_scalar.call_args_list if call.args[0] == tag]
+        assert logs == expected
     envs.close.assert_called_once()
 
 

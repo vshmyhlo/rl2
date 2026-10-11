@@ -1,8 +1,10 @@
 """Recurrent PPO with a residual Atari CNN and an LSTM, GDN2, or Mamba3 backbone.
 
 TensorBoard outputs use training environment steps as the global step.
+Metric names use total_ for all-training statistics, _last_100 for recent episode
+history, and episodes for episode counts. Window statistics have no scope affix.
 
-Progress scalars:
+Progress scalars computed over the logging window:
     losses/policy: PPO policy loss.
     losses/value: Value prediction loss before applying value_coef.
     losses/entropy: Negative action distribution entropy before applying entropy_coef.
@@ -13,41 +15,46 @@ Progress scalars:
     policy/early_stop: Fraction of rollouts stopped early by the KL threshold.
     value/explained_variance: Rollout value predictions versus GAE returns.
     charts/updates_per_rollout: Mean number of accepted minibatch updates.
-    charts/steps_per_second: Training environment steps per wall-clock second.
+    charts/iterations_per_second: Rollouts and their PPO updates per second in the logging window.
+    charts/observations_per_second: Training observations across all environments per second in the logging window.
+    charts/episodes_per_second: Completed training episodes per second in the logging window.
+    charts/episodes: Training episodes completed in the logging window.
+    charts/return_mean: Mean raw return of episodes completed in the window.
+    charts/episode_length_mean: Mean episode length in the window, in steps.
+
+Progress scalars computed across all training:
+    charts/total_episodes: Cumulative completed training episodes.
+    charts/total_observations: Cumulative training observations across all environments.
+    charts/total_return_mean: Mean raw return over all completed training episodes.
+    charts/total_episode_length_mean: Mean length over all completed training episodes, in steps.
+
+Progress scalars computed over recent episode history (independent of logging windows):
+    charts/return_mean_last_100: Mean raw return over up to 100 latest training episodes.
+    charts/episode_length_mean_last_100: Mean length of those episodes, in steps.
+
+Progress scalars reporting the latest rollout's settings:
     charts/learning_rate: Current learning rate.
     charts/entropy_coef: Current entropy bonus coefficient.
-    charts/total_episodes: Cumulative completed training episodes.
-    charts/window_episodes: Training episodes completed in the logging window.
-    charts/return_mean_window: Mean raw return of episodes completed in the window.
-    charts/episode_length_mean_window: Mean episode length in the window, in steps.
-    charts/return_mean_100: Mean raw return over up to 100 latest training episodes.
-    charts/episode_length_mean_100: Mean length of those episodes, in steps.
-    charts/return_mean: Mean raw return over all completed training episodes.
-    time/iteration_seconds: Mean wall time per rollout and its PPO updates.
-    time/window_seconds: Wall time covered by the logging window.
-    time/elapsed_seconds: Wall time elapsed in this training session.
-    time/eta_seconds: Estimated wall time remaining, based on this session.
 
 Startup scalars (also logged when resuming):
     model/params_millions: Model parameter count in millions.
 
 Evaluation scalars (when evaluation is enabled; unavailable scores are omitted):
     eval/return_mean: Mean raw evaluation return.
-    eval/return_median: Median raw evaluation return.
     eval/return_std: Standard deviation of raw evaluation returns.
     eval/return_sem: Standard error of the mean raw evaluation return.
     eval/human_normalized_score_percent: Human-normalized evaluation score.
-    eval/training_episodes: Completed training episodes at evaluation time.
-    training/episode_count: Completed episodes in the training score history.
-    training/return_mean: Mean raw return over all completed training episodes.
-    training/return_mean_100: Mean raw return over up to 100 latest training episodes.
-    training/last_100_episode_count: Number of episodes in that recent history.
+    eval/total_training_episodes: Completed training episodes at evaluation time.
+    training/total_return_mean: Mean raw return over all completed training episodes.
+    training/total_episode_length_mean: Mean length over all completed training episodes, in steps.
+    training/total_episodes: Completed episodes in the training score history.
+    training/return_mean_last_100: Mean raw return over up to 100 latest training episodes.
+    training/episode_length_mean_last_100: Mean length of those episodes, in steps.
+    training/episodes_last_100: Number of episodes in that recent history.
     time/evaluation_seconds: Evaluation wall time.
 
 Text:
     config: Full training configuration as YAML, logged at startup and on resume.
-    devices: JAX device list, logged at startup and on resume.
-    model/parameter_count: Exact parameter count, logged at startup and on resume.
     eval/report: Complete JSON report after each evaluation, including per-episode
         results, aggregate scores, protocol, training configuration and scores,
         library versions, baselines, and training steps/episodes.
@@ -58,12 +65,15 @@ Video/images:
         Recording ends at episode termination/truncation or video_max_frames
         (default: 900; None removes the frame cap). Playback uses video_speed
         and the environment frame rate, adjusted for Atari action repeat.
+    eval/gameplay: RGB video of the last episode in each evaluation run, using
+        the same frame cap and playback speed. Evaluation finishes the full
+        episode even when recording reaches the frame cap.
     No standalone still images, audio, histograms, embeddings, or graphs are logged.
 
 Episode means are omitted when no corresponding episodes or history are available.
 
-Progress metrics aggregate over log_interval_seconds (default: 60), emitted at
-rollout boundaries and on normal completion. Losses, entropy, KL, and clip fraction
+Logging windows span log_interval_seconds (default: 60); progress metrics are emitted
+at rollout boundaries and on normal completion. Losses, entropy, KL, and clip fraction
 average over evaluated minibatches, including KL-rejected updates. Explained
 variance, updates per rollout, and early-stop frequency average over rollouts.
 Seconds per iteration and throughput use window wall time, including intervening
@@ -328,6 +338,7 @@ class TrainingProgress(NamedTuple):
     recent_returns: tuple[float, ...]
     recent_lengths: tuple[int, ...]
     training_return_sum: float | None = None
+    training_length_sum: int | None = None
 
 
 def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
@@ -356,6 +367,7 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
                     "recent_returns": list(progress.recent_returns),
                     "recent_lengths": list(progress.recent_lengths),
                     "training_return_sum": progress.training_return_sum,
+                    "training_length_sum": progress.training_length_sum,
                 }
             ),
         ),
@@ -392,6 +404,7 @@ def restore_checkpoint(manager: ocp.CheckpointManager, state: TrainState, config
         tuple(metadata["recent_returns"]),
         tuple(metadata["recent_lengths"]),
         metadata.get("training_return_sum"),
+        metadata.get("training_length_sum"),
     )
 
 
@@ -671,19 +684,24 @@ def log_evaluation(
     initial_carry: RecurrentCarry,  # leaves: (1, ...), backend-specific memory dimensions
     training_scores: "atari_eval.TrainingScores | None" = None,
 ) -> None:
-    """Evaluate the current policy and save scores plus the complete report to TensorBoard."""
+    """Log evaluation scores, the complete report, and the last episode's video."""
     print(f"Evaluating {config.eval_episodes} games after {episode} training episodes", flush=True)
     started = monotonic()
+
+    def on_video(video: NDArray[uint8], fps: float) -> None:  # video: (1, T, C, H, W)
+        writer.add_video("eval/gameplay", video, steps, fps=fps)
+
     result = atari_eval.evaluate(
         atari_eval.TrainStateAgent(state, initial_carry),
         config,
         atari_eval.EvaluationConfig(episodes=config.eval_episodes, seed=config.eval_seed),
         training_scores=training_scores,
+        on_video=on_video,
     )
-    for name in ("return_mean", "return_median", "return_std", "return_sem", "human_normalized_score_percent"):
+    for name in ("return_mean", "return_std", "return_sem", "human_normalized_score_percent"):
         if result[name] is not None:
             writer.add_scalar(f"eval/{name}", result[name], steps)
-    writer.add_scalar("eval/training_episodes", episode, steps)
+    writer.add_scalar("eval/total_training_episodes", episode, steps)
     if result["training_scores"] is not None:
         for name, score in result["training_scores"].items():
             if score is not None:
@@ -926,10 +944,18 @@ def train(config: Config) -> TrainState:
         recent_lengths: deque[int] = deque(maxlen=100)
         completed_episodes = 0
         training_return_sum: float | None = 0.0
+        training_length_sum: int | None = 0
         if progress is not None:
-            state, key, start_iteration, completed_episodes, saved_returns, saved_lengths, training_return_sum = (
-                progress
-            )
+            (
+                state,
+                key,
+                start_iteration,
+                completed_episodes,
+                saved_returns,
+                saved_lengths,
+                training_return_sum,
+                training_length_sum,
+            ) = progress
             recent_returns.extend(saved_returns)
             recent_lengths.extend(saved_lengths)
             # Gym environments and wrappers are not serialized. Start fresh episodes
@@ -981,11 +1007,14 @@ def train(config: Config) -> TrainState:
             recent_lengths.extend(rollout.completed_lengths)
             finished_count = len(rollout.completed_returns)
             finished_return_sum = sum(rollout.completed_returns)
+            finished_length_sum = sum(rollout.completed_lengths)
             window_episodes += finished_count
             window_return_sum += finished_return_sum
-            window_length_sum += sum(rollout.completed_lengths)
+            window_length_sum += finished_length_sum
             if training_return_sum is not None:
                 training_return_sum += finished_return_sum
+            if training_length_sum is not None:
+                training_length_sum += finished_length_sum
             completed_episodes += finished_count
             learning_rate = float(lr_schedule(iteration))
             entropy_coef = float(entropy_schedule(iteration))
@@ -1047,7 +1076,11 @@ def train(config: Config) -> TrainState:
                     steps,
                     initial_carry=model.initial_carry(1),
                     training_scores=atari_eval.TrainingScores(
-                        completed_episodes, training_return_sum, tuple(float(score) for score in recent_returns)
+                        completed_episodes,
+                        training_return_sum,
+                        tuple(float(score) for score in recent_returns),
+                        length_sum=training_length_sum,
+                        recent_lengths=tuple(recent_lengths),
                     ),
                 )
                 # Restart after evaluation so long evaluations never cause catch-up runs.
@@ -1056,10 +1089,10 @@ def train(config: Config) -> TrainState:
             window_seconds = now - window_start
             if window_seconds >= config.log_interval_seconds or iteration + 1 == num_iterations:
                 mean_metrics = {name: total / window_metric_count for name, total in window_metric_sums.items()}
-                sps = (steps - window_steps) / max(window_seconds, 1e-9)
-                # Estimate from this session's completed rollouts, including evaluation/video overhead.
+                rate_seconds = max(window_seconds, 1e-9)
+                sps = (steps - window_steps) / rate_seconds
+                # Include evaluation/video overhead in this session's elapsed time.
                 elapsed_seconds = now - start
-                eta_seconds = elapsed_seconds * (num_iterations - iteration - 1) / (iteration + 1 - start_iteration)
                 scalars = {tag: total / window_rollouts for tag, total in window_rollout_sums.items()}
                 scalars.update(
                     {
@@ -1072,25 +1105,27 @@ def train(config: Config) -> TrainState:
                         "policy/entropy": mean_metrics["entropy"],
                         "policy/approx_kl": mean_metrics["approx_kl"],
                         "policy/clip_fraction": mean_metrics["clip_fraction"],
-                        "charts/steps_per_second": sps,
+                        "charts/iterations_per_second": window_rollouts / rate_seconds,
+                        "charts/observations_per_second": sps,
+                        "charts/episodes_per_second": window_episodes / rate_seconds,
                         "charts/learning_rate": learning_rate,
                         "charts/entropy_coef": entropy_coef,
                         "charts/total_episodes": completed_episodes,
-                        "charts/window_episodes": window_episodes,
-                        "time/iteration_seconds": window_seconds / window_rollouts,
-                        "time/window_seconds": window_seconds,
+                        "charts/total_observations": steps,
+                        "charts/episodes": window_episodes,
                         "time/elapsed_seconds": elapsed_seconds,
-                        "time/eta_seconds": eta_seconds,
                     }
                 )
                 if window_episodes:
-                    scalars["charts/return_mean_window"] = window_return_sum / window_episodes
-                    scalars["charts/episode_length_mean_window"] = window_length_sum / window_episodes
+                    scalars["charts/return_mean"] = window_return_sum / window_episodes
+                    scalars["charts/episode_length_mean"] = window_length_sum / window_episodes
                 if recent_returns:
-                    scalars["charts/return_mean_100"] = sum(recent_returns) / len(recent_returns)
-                    scalars["charts/episode_length_mean_100"] = sum(recent_lengths) / len(recent_lengths)
+                    scalars["charts/return_mean_last_100"] = sum(recent_returns) / len(recent_returns)
+                    scalars["charts/episode_length_mean_last_100"] = sum(recent_lengths) / len(recent_lengths)
                     if training_return_sum is not None:
-                        scalars["charts/return_mean"] = training_return_sum / completed_episodes
+                        scalars["charts/total_return_mean"] = training_return_sum / completed_episodes
+                    if training_length_sum is not None:
+                        scalars["charts/total_episode_length_mean"] = training_length_sum / completed_episodes
                 for tag, scalar in scalars.items():
                     writer.add_scalar(tag, float(scalar), steps)
                 writer.flush()
@@ -1098,14 +1133,17 @@ def train(config: Config) -> TrainState:
                 length = f"{window_length_sum / window_episodes:.1f}" if window_episodes else "n/a"
                 print(
                     f"step={steps} episodes={completed_episodes} return={score} "
-                    f"episode_length={length} sps={sps:.0f} lr={learning_rate:.3g} "
+                    f"episode_length={length} "
+                    f"iterations/s={scalars['charts/iterations_per_second']:.3f} "
+                    f"observations/s={sps:.3f} episodes/s={scalars['charts/episodes_per_second']:.3f} "
+                    f"lr={learning_rate:.3g} "
                     f"policy={mean_metrics['policy_loss']:.3f} value={mean_metrics['value_loss']:.3f} "
                     f"entropy={mean_metrics['entropy']:.3f} kl={mean_metrics['approx_kl']:.4f} "
                     f"clipfrac={mean_metrics['clip_fraction']:.3f} ev={scalars['value/explained_variance']:.3f} "
                     f"updates={scalars['charts/updates_per_rollout']:.2f} "
                     f"early_stop={scalars['policy/early_stop']:.2f} "
-                    f"s/iteration={scalars['time/iteration_seconds']:.2f} window={window_seconds:.1f}s "
-                    f"elapsed={timedelta(seconds=int(elapsed_seconds))} eta={timedelta(seconds=int(eta_seconds))}",
+                    f"window={window_seconds:.1f}s "
+                    f"elapsed={timedelta(seconds=int(elapsed_seconds))}",
                     flush=True,
                 )
                 window_start = now
@@ -1131,6 +1169,7 @@ def train(config: Config) -> TrainState:
                         tuple(float(v) for v in recent_returns),
                         tuple(int(v) for v in recent_lengths),
                         training_return_sum,
+                        training_length_sum,
                     ),
                     config,
                 )

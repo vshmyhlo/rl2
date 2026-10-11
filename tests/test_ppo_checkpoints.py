@@ -94,7 +94,7 @@ def state() -> TrainState:
 
 def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Config, state: TrainState) -> None:
     directory = f"{config.log_dir}/{config.run_id}"
-    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 8, (1.5, -2.0), (3, 7), 12.5)
+    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 8, (1.5, -2.0), (3, 7), 12.5, 40)
     with ppo.checkpoint_manager(directory) as manager:
         assert ppo.restore_checkpoint(manager, state, config) is None
         ppo.save_checkpoint(manager, progress._replace(iteration=1), config)
@@ -136,6 +136,20 @@ def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Confi
         assert ppo.restore_checkpoint(manager, fresh, config) is None
 
 
+def test_checkpoint_preserves_episode_length_history(config: ppo.Config, state: TrainState) -> None:
+    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 101, (2.0,) * 100, (3,) * 100, 300.0, 305)
+    manager = Mock()
+    ppo.save_checkpoint(manager, progress, config)
+    saved = manager.save.call_args.kwargs["args"]
+    metadata = json.loads(json.dumps(saved.metadata.item))
+    manager.latest_step.return_value = progress.iteration
+    manager.restore.side_effect = [SimpleNamespace(metadata=metadata), SimpleNamespace(state=saved.state.item)]
+    restored = ppo.restore_checkpoint(manager, state, config)
+    assert restored is not None
+    assert restored.training_length_sum == 305
+    assert restored.recent_lengths == (3,) * 100
+
+
 def test_legacy_checkpoint_leaves_training_total_unavailable(config: ppo.Config, state: TrainState) -> None:
     rng = np.random.default_rng(12)
     manager = Mock()
@@ -157,14 +171,21 @@ def test_legacy_checkpoint_leaves_training_total_unavailable(config: ppo.Config,
     restored = ppo.restore_checkpoint(manager, state, config)
     assert restored is not None
     assert restored.training_return_sum is None
+    assert restored.training_length_sum is None
     assert restored.completed_episodes == 101
     assert restored.recent_returns == (2.0,) * 100
     report = TrainingScores(
-        restored.completed_episodes, restored.training_return_sum, restored.recent_returns
+        restored.completed_episodes,
+        restored.training_return_sum,
+        restored.recent_returns,
+        length_sum=restored.training_length_sum,
+        recent_lengths=restored.recent_lengths,
     ).as_report()
-    assert report["return_mean"] is None
-    assert report["return_mean_100"] == 2.0
-    assert report["last_100_episode_count"] == 100
+    assert report["total_return_mean"] is None
+    assert report["return_mean_last_100"] == 2.0
+    assert report["total_episode_length_mean"] is None
+    assert report["episode_length_mean_last_100"] == 3.0
+    assert report["episodes_last_100"] == 100
 
 
 @pytest.mark.parametrize("run_id", ["", " ", "..", "a/b", "a\\b"])
@@ -208,7 +229,7 @@ def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> 
         patch.object(ppo.gym.vector, "SyncVectorEnv"),
         patch.object(ppo, "JaxVectorEnv", return_value=envs),
         patch.object(ppo, "checkpoint_manager", return_value=manager) as make_manager,
-        patch.object(ppo, "make_model", return_value=model),
+        patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo.TrainState, "create"),
         patch.object(ppo, "restore_checkpoint", return_value=None),
         patch.object(ppo, "SummaryWriter", return_value=writer) as make_writer,
@@ -271,6 +292,7 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
         return state.apply_gradients(grads={"weight": jnp.ones(1)}), ppo.PPOMetrics(
             policy_loss=jnp.asarray(0.0),  # ()
             value_loss=jnp.asarray(0.0),  # ()
+            entropy_loss=jnp.asarray(0.0),  # ()
             entropy=jnp.asarray(0.0),  # ()
             approx_kl=jnp.asarray(0.0),  # ()
             clip_fraction=jnp.asarray(0.0),  # ()
@@ -290,7 +312,7 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
 
     with (
         patch.object(ppo.gym.vector, "SyncVectorEnv", return_value=envs),
-        patch.object(ppo, "make_model", return_value=model),
+        patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo, "SummaryWriter") as writer,
         patch.object(ppo, "act", return_value=(jnp.zeros(1, dtype=jnp.int32), zeros, zeros, carry)),
         patch.object(ppo, "value", return_value=zeros),
@@ -315,20 +337,21 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
             c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/total_episodes"
         ]
         assert episode_logs == [(4.0, 4)]
+        writer.return_value.add_scalar.assert_any_call("charts/total_observations", 4.0, 4)
         return_logs = [
-            c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/return_mean"
+            c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/total_return_mean"
         ]
         assert return_logs == [(1.0, 4)]
         sps = [
-            c.args[1] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/steps_per_second"
+            c.args[1]
+            for c in writer.return_value.add_scalar.call_args_list
+            if c.args[0] == "charts/observations_per_second"
         ]
         assert sps == [1.0]
-        for tag, expected in (
-            ("time/elapsed_seconds", [(2.0, 4)]),
-            ("time/eta_seconds", [(0.0, 4)]),
-        ):
-            logged = [c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == tag]
-            assert logged == expected
+        elapsed_logs = [
+            c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "time/elapsed_seconds"
+        ]
+        assert elapsed_logs == [(2.0, 4)]
         # An already completed run does not perform more updates or duplicate a save.
         ppo.train(config)
         assert iterations == [0, 1, 2, 3]

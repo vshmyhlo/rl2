@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from functools import partial
 from importlib.metadata import version
@@ -62,6 +63,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.training.train_state import TrainState
+from numpy.typing import NDArray
 
 from rl2 import ppo, ppo_rnd
 from rl2.atari_scores import REFERENCE_SOURCE, get_reference_scores
@@ -149,10 +151,10 @@ class TrainingScores:
             "return_mean": self.return_sum / self.episode_count
             if self.episode_count and self.return_sum is not None
             else None,
-            "return_mean_100": math.fsum(self.recent_returns) / len(self.recent_returns)
+            "return_mean_last_100": math.fsum(self.recent_returns) / len(self.recent_returns)
             if self.recent_returns
             else None,
-            "last_100_episode_count": len(self.recent_returns) if self.recent_returns is not None else None,
+            "episode_count_last_100": len(self.recent_returns) if self.recent_returns is not None else None,
         }
 
 
@@ -205,13 +207,16 @@ def validate_training_config(training: TrainingConfig) -> None:
         raise ValueError("Use an explicit ALE/<Game>-v5 environment ID")
 
 
-def make_evaluation_env(training: TrainingConfig, evaluation: EvaluationConfig) -> gym.Env:
+def make_evaluation_env(
+    training: TrainingConfig, evaluation: EvaluationConfig, *, render_mode: Literal["rgb_array"] | None = None
+) -> gym.Env:
     """Build an explicitly configured ALE environment without training wrappers."""
     validate_training_config(training)
     gym.register_envs(ale_py)
     # Keep the ROM's default mode, as in training; zero is not valid for every game.
     env = gym.make(
         training.env_id,
+        render_mode=render_mode,
         frameskip=1,  # The preprocessing wrapper alone performs action repeat.
         repeat_action_probability=0.25 if evaluation.protocol == "sticky" else 0.0,
         full_action_space=False,
@@ -273,6 +278,7 @@ def evaluate[Carry](
     training_scores: TrainingScores | None = None,
     output_path: str | Path | None = None,
     show_progress: bool = True,
+    on_video: Callable[[NDArray[np.uint8], float], None] | None = None,  # video: (1, T, C, H, W)
 ) -> EvaluationResult:
     """Evaluate frozen parameters with fresh environment, RNG, and recurrent state.
 
@@ -285,6 +291,9 @@ def evaluate[Carry](
     null. Evaluation episodes never contribute to these training metrics.
     Progress prints at startup, after each game, and every 10 seconds during
     a game (after an environment step). Set show_progress=False to silence it.
+    ``on_video`` receives (1, T, C, H, W) uint8 RGB frames from the last episode
+    and playback FPS, using training.video_max_frames and training.video_speed.
+    The frame cap limits recording only; evaluation always finishes the game.
     The caller owns checkpoint selection and independent-training-seed repeats.
     """
     evaluation = evaluation or EvaluationConfig()
@@ -294,7 +303,7 @@ def evaluate[Carry](
         scores = get_reference_scores(training.env_id)
         if scores is not None:
             baselines = ScoreBaselines(training.env_id, scores[0], scores[1], REFERENCE_SOURCE)
-    env = make_evaluation_env(training, evaluation)
+    env = make_evaluation_env(training, evaluation, render_mode="rgb_array" if on_video is not None else None)
     episodes: list[dict[str, Any]] = []
     total_return = 0.0
     started = last_report = monotonic() if show_progress else 0.0
@@ -320,6 +329,8 @@ def evaluate[Carry](
         for index in range(evaluation.episodes):
             seed = evaluation.seed + index
             obs, info = env.reset(seed=seed)  # obs: (*O,)
+            record_video = on_video is not None and index == evaluation.episodes - 1
+            frames: list[NDArray[np.uint8]] = [env.render().copy()] if record_video else []  # each (H, W, C)
             reset_frames = int(info["episode_frame_number"])
             key = jax.random.key(seed)  # () typed PRNG key
             carry = agent.initial_carry()  # agent-defined memory leaf shapes
@@ -335,6 +346,8 @@ def evaluate[Carry](
                     greedy=evaluation.action_selection == "greedy",
                 )  # () action; agent-defined memory leaf shapes
                 obs, reward, terminated, truncated, info = env.step(int(action))  # obs: (*O,)
+                if record_video and (training.video_max_frames is None or len(frames) < training.video_max_frames):
+                    frames.append(env.render().copy())  # (H, W, C)
                 episode_return += float(reward)
                 agent_steps += 1
                 if show_progress and not (terminated or truncated):
@@ -357,6 +370,9 @@ def evaluate[Carry](
             if show_progress:
                 last_report = monotonic()
                 report_progress(last_report, index + 1, episode_return, int(info["episode_frame_number"]))
+        if on_video is not None:
+            video = np.stack(frames).transpose(0, 3, 1, 2)[None]  # (1, T, C, H, W)
+            on_video(video, training.video_speed * env.metadata["render_fps"] / 4)
     finally:
         env.close()
 
@@ -388,7 +404,6 @@ def evaluate[Carry](
         "training_scores": training_scores.as_report() if training_scores is not None else None,
         "versions": {name: version(name) for name in ("ale-py", "gymnasium", "jax", "flax", "numpy")},
         "return_mean": float(returns.mean()),
-        "return_median": float(np.median(returns)),
         "return_std": std,
         "return_sem": std / np.sqrt(len(returns)) if std is not None else None,
         "episodes": episodes,

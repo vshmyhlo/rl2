@@ -64,9 +64,9 @@ def test_collect_rollout_continues_memory_rng_and_episodes(
 
     def act(
         state: TrainState,
-        observations: ppo.Array,  # (B, *O)
+        observations: jax.Array,  # (B, *O)
         memory: ppo.RecurrentCarry,  # leaves: (B, H)
-        episode_starts: ppo.Array,  # (B,)
+        episode_starts: jax.Array,  # (B,)
         action_key: jax.Array,  # () typed PRNG key
     ) -> tuple[jax.Array, jax.Array, jax.Array, ppo.RecurrentCarry]:
         chex.assert_shape(observations, (num_envs, *obs_shape))

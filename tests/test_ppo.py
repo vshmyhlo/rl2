@@ -172,7 +172,7 @@ def test_single_transition_keeps_policy_gradient() -> None:
     )
 
     def apply(
-        variables: optax.Params, obs: ppo.Array, carry: ppo.RecurrentCarry, starts: ppo.Array
+        variables: optax.Params, obs: jax.Array, carry: ppo.RecurrentCarry, starts: jax.Array
     ) -> tuple[ppo.RecurrentCarry, jax.Array, jax.Array]:
         chex.assert_shape(obs, (1, 1, 1, 1, 1))
         chex.assert_type(obs, jnp.uint8)
@@ -480,7 +480,7 @@ def test_entropy_decay_scales_update_by_rollout() -> None:
     )
 
     def apply(
-        variables: optax.Params, obs: ppo.Array, carry: ppo.RecurrentCarry, starts: ppo.Array
+        variables: optax.Params, obs: jax.Array, carry: ppo.RecurrentCarry, starts: jax.Array
     ) -> tuple[ppo.RecurrentCarry, jax.Array, jax.Array]:
         return carry, variables["params"]["logits"], jnp.zeros_like(starts, dtype=jnp.float32)
 
@@ -506,6 +506,8 @@ def test_entropy_decay_scales_update_by_rollout() -> None:
             updated.params["logits"], logits + config.entropy_coef * factor * entropy_grad, atol=1e-7
         )
         assert float(metrics.entropy) == pytest.approx(entropy)
+        chex.assert_shape(jax.tree.leaves(metrics), ())
+        assert float(metrics.entropy_loss) == pytest.approx(-config.entropy_coef * factor * entropy)
         assert int(updated.step) == 124
 
 
@@ -564,6 +566,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         return state, ppo.PPOMetrics(
             policy_loss=jnp.asarray(loss),  # ()
             value_loss=jnp.asarray(loss * 2),  # ()
+            entropy_loss=jnp.asarray(-config.entropy_coef * (1.0, 0.75, 0.25)[iteration] * loss * 3),  # ()
             entropy=jnp.asarray(loss * 3),  # ()
             approx_kl=jnp.asarray(kl),  # ()
             clip_fraction=jnp.asarray(loss / 100),  # ()
@@ -574,7 +577,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
 
     with (
         patch("rl2.ppo.gym.vector.SyncVectorEnv", return_value=envs),
-        patch("rl2.ppo.make_model", return_value=model),
+        patch("rl2.ppo.ActorCritic", return_value=model) as actor_critic,
         patch("rl2.ppo.SummaryWriter", return_value=writer),
         patch("rl2.ppo.act", return_value=(jnp.zeros(1, dtype=jnp.int32), zeros, zeros, carry)),
         patch("rl2.ppo.value", return_value=zeros),
@@ -586,45 +589,63 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         patch("rl2.ppo.save_checkpoint"),
     ):
         train(config)
+    actor_critic.assert_called_once_with(
+        2,
+        config.model,
+        dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
+        encoder_stages=config.encoder_stages,
+    )
     assert iterations == [0, 0, 1, 2, 2]
     np.testing.assert_allclose(learning_rates, config.learning_rate * np.array([1.0, 1.0, 0.75, 0.25, 0.25]))
     logged: dict[str, list[tuple[float, int]]] = {}
     for call in writer.add_scalar.call_args_list:
         logged.setdefault(call.args[0], []).append(call.args[1:])
+    assert "time/window_seconds" not in logged
+    assert "time/iteration_seconds" not in logged
+    assert "charts/steps_per_second" not in logged
     # Minibatch-weighted means: the rejected rollout contributes one sample, not two.
     for tag, expected in {
         "losses/policy": [(4.0, 2), (12.0, 3)],
         "losses/value": [(8.0, 2), (24.0, 3)],
+        "losses/entropy": [(-12.0, 2), (-36.0, 3)],
+        "losses/total": [
+            (4.0 + config.value_coef * 8.0 - 10.0 * config.entropy_coef, 2),
+            (12.0 + config.value_coef * 24.0 - 9.0 * config.entropy_coef, 3),
+        ],
         "policy/entropy": [(12.0, 2), (36.0, 3)],
         "policy/approx_kl": [(0.02 / 3, 2), (0.0, 3)],
         "policy/clip_fraction": [(0.04, 2), (0.12, 3)],
         "value/explained_variance": [(0.3, 2), (0.8, 3)],
         "charts/updates_per_rollout": [(1.0, 2), (2.0, 3)],
         "policy/early_stop": [(0.5, 2), (0.0, 3)],
-        "time/iteration_seconds": [(30.0, 2), (20.0, 3)],
-        "time/window_seconds": [(60.0, 2), (20.0, 3)],
-        "charts/steps_per_second": [(2 / 60, 2), (1 / 20, 3)],
-        "charts/window_episodes": [(1.0, 2), (0.0, 3)],
-        "charts/return_mean_window": [(8.0, 2)],
-        "charts/episode_length_mean_window": [(2.0, 2)],
-        "charts/return_mean": [(8.0, 2), (8.0, 3)],
-        "charts/return_mean_100": [(8.0, 2), (8.0, 3)],
+        "charts/iterations_per_second": [(2 / 60, 2), (1 / 20, 3)],
+        "charts/observations_per_second": [(2 / 60, 2), (1 / 20, 3)],
+        "charts/episodes_per_second": [(1 / 60, 2), (0.0, 3)],
+        "charts/episodes": [(1.0, 2), (0.0, 3)],
+        "charts/return_mean": [(8.0, 2)],
+        "charts/episode_length_mean": [(2.0, 2)],
+        "charts/total_return_mean": [(8.0, 2), (8.0, 3)],
+        "charts/total_episode_length_mean": [(2.0, 2), (2.0, 3)],
+        "charts/return_mean_last_100": [(8.0, 2), (8.0, 3)],
+        "charts/episode_length_mean_last_100": [(2.0, 2), (2.0, 3)],
         "charts/total_episodes": [(1.0, 2), (1.0, 3)],
+        "charts/total_observations": [(2.0, 2), (3.0, 3)],
         "time/elapsed_seconds": [(60.0, 2), (80.0, 3)],
-        "time/eta_seconds": [(30.0, 2), (0.0, 3)],
     }.items():
         np.testing.assert_allclose(logged[tag], expected, err_msg=tag)
     for tag, initial in (("charts/learning_rate", config.learning_rate), ("charts/entropy_coef", config.entropy_coef)):
         np.testing.assert_allclose(logged[tag], [(initial * 0.75, 2), (initial * 0.25, 3)], rtol=1e-6)
     progress_lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("step=")]
     assert len(progress_lines) == 2
-    assert "s/iteration=30.00" in progress_lines[0]
-    assert "s/iteration=20.00" in progress_lines[1]
+    assert all("s/iteration=" not in line for line in progress_lines)
+    assert "iterations/s=0.033 observations/s=0.033 episodes/s=0.017" in progress_lines[0]
+    assert "iterations/s=0.050 observations/s=0.050 episodes/s=0.000" in progress_lines[1]
     assert not {
         "time/rollout_seconds",
         "time/rollout_env_seconds",
         "time/rollout_model_seconds",
         "time/optimization_seconds",
+        "time/eta_seconds",
     }.intersection(logged)
     assert "step=2 episodes=1 return=8.0 episode_length=2.0" in progress_lines[0]
     assert "step=3 episodes=1 return=n/a episode_length=n/a" in progress_lines[1]
@@ -691,6 +712,7 @@ def test_video_schedule_uses_wall_time_without_catch_up(interval: float, expecte
         return state.replace(step=iteration + 1), ppo.PPOMetrics(
             policy_loss=jnp.asarray(0.0),  # ()
             value_loss=jnp.asarray(0.0),  # ()
+            entropy_loss=jnp.asarray(0.0),  # ()
             entropy=jnp.asarray(0.0),  # ()
             approx_kl=jnp.asarray(0.0),  # ()
             clip_fraction=jnp.asarray(0.0),  # ()
@@ -705,7 +727,7 @@ def test_video_schedule_uses_wall_time_without_catch_up(interval: float, expecte
 
     with (
         patch.object(ppo.gym.vector, "SyncVectorEnv", return_value=envs),
-        patch.object(ppo, "make_model", return_value=model),
+        patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo, "SummaryWriter") as writer,
         patch.object(ppo, "act", return_value=(jnp.zeros(1, dtype=jnp.int32), zeros, zeros, carry)),
         patch.object(ppo, "value", return_value=zeros),
@@ -775,6 +797,7 @@ def test_train_evaluates_final_policy(
         return state.replace(step=iteration + 1), ppo.PPOMetrics(
             policy_loss=jnp.asarray(0.0),  # ()
             value_loss=jnp.asarray(0.0),  # ()
+            entropy_loss=jnp.asarray(0.0),  # ()
             entropy=jnp.asarray(0.0),  # ()
             approx_kl=jnp.asarray(0.0),  # ()
             clip_fraction=jnp.asarray(0.0),  # ()
@@ -789,7 +812,7 @@ def test_train_evaluates_final_policy(
 
     with (
         patch.object(ppo.gym.vector, "SyncVectorEnv", return_value=envs),
-        patch.object(ppo, "make_model", return_value=model),
+        patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo, "SummaryWriter") as writer,
         patch.object(ppo, "act", return_value=(jnp.zeros(1, dtype=jnp.int32), zeros, zeros, carry)),
         patch.object(ppo, "value", return_value=zeros),
@@ -807,25 +830,30 @@ def test_train_evaluates_final_policy(
         assert int(evaluated_state.step) == steps // config.num_steps
         assert evaluated_config.eval_interval_seconds == eval_interval_seconds
         assert evaluated_writer is writer.return_value
+        assert call.kwargs["initial_carry"] is carry
         assert episodes == (1 if steps == 2 else 2)
         scores = call.kwargs["training_scores"]
         assert scores.episode_count == episodes
         assert scores.return_sum == (3.0 if steps == 2 else 10.0)
         assert scores.recent_returns == ((3.0,) if steps == 2 else (3.0, 7.0))
+        assert scores.length_sum == (2 if steps == 2 else 3)
+        assert scores.recent_lengths == ((2,) if steps == 2 else (2, 1))
     if expected_steps:
         assert evaluate.call_args.args[0] is state
     first_elapsed = 90.0 if 2 in expected_steps else 60.0
     final_elapsed = 120.0 + 30.0 * len(expected_steps)
     for tag, expected in (
-        ("time/iteration_seconds", [(first_elapsed, 2), (final_elapsed - first_elapsed, 4)]),
         ("time/elapsed_seconds", [(first_elapsed, 2), (final_elapsed, 4)]),
-        ("time/eta_seconds", [(first_elapsed, 2), (0.0, 4)]),
+        ("charts/iterations_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
+        ("charts/observations_per_second", [(2 / first_elapsed, 2), (2 / (final_elapsed - first_elapsed), 4)]),
+        ("charts/episodes_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
     ):
         logged = [call.args[1:] for call in writer.return_value.add_scalar.call_args_list if call.args[0] == tag]
         assert logged == expected
     output = capsys.readouterr().out
-    assert f"elapsed=0:01:{int(first_elapsed % 60):02d} eta=0:01:{int(first_elapsed % 60):02d}" in output
-    assert f"elapsed=0:{int(final_elapsed // 60):02d}:{int(final_elapsed % 60):02d} eta=0:00:00" in output
+    assert f"elapsed=0:01:{int(first_elapsed % 60):02d}" in output
+    assert f"elapsed=0:{int(final_elapsed // 60):02d}:{int(final_elapsed % 60):02d}" in output
+    assert "eta=" not in output
     envs.close.assert_called_once()
     writer.return_value.close.assert_called_once()
 
@@ -928,9 +956,9 @@ def test_rollout_bootstraps_only_timeouts_before_partial_reset(num_minibatches: 
 
     def predict(
         state: TrainState,
-        obs: ppo.Array,  # (B=4, O=1)
+        obs: jax.Array,  # (B=4, O=1)
         memory: ppo.RecurrentCarry,  # leaves: (B, H=1)
-        starts: ppo.Array,  # (B,)
+        starts: jax.Array,  # (B,)
     ) -> jax.Array:
         chex.assert_shape(obs, (4, 1))
         chex.assert_type(obs, np.uint8)
@@ -974,6 +1002,7 @@ def test_rollout_bootstraps_only_timeouts_before_partial_reset(num_minibatches: 
         return state, ppo.PPOMetrics(
             policy_loss=jnp.asarray(0.0),  # ()
             value_loss=jnp.asarray(0.0),  # ()
+            entropy_loss=jnp.asarray(0.0),  # ()
             entropy=jnp.asarray(0.0),  # ()
             approx_kl=jnp.asarray(0.0),  # ()
             clip_fraction=jnp.asarray(0.0),  # ()
@@ -981,7 +1010,7 @@ def test_rollout_bootstraps_only_timeouts_before_partial_reset(num_minibatches: 
 
     with (
         patch.object(ppo.gym.vector, "SyncVectorEnv", return_value=envs) as vector_env,
-        patch.object(ppo, "make_model", return_value=model),
+        patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo, "SummaryWriter") as writer,
         patch.object(
             ppo,
@@ -1016,7 +1045,7 @@ def test_rollout_bootstraps_only_timeouts_before_partial_reset(num_minibatches: 
     assert update_batch.call_count == num_minibatches
     assert sorted(seen_environments) == list(range(4))
     scalars = {call.args[0]: call.args[1] for call in writer.return_value.add_scalar.call_args_list}
-    assert scalars["charts/return_mean_100"] == pytest.approx(2 / 3)  # Episode scores exclude bootstrap values.
+    assert scalars["charts/return_mean_last_100"] == pytest.approx(2 / 3)  # Episode scores exclude bootstrap values.
     assert scalars["charts/total_episodes"] == 3
     envs.close.assert_called_once()
 
@@ -1089,7 +1118,7 @@ def test_video_recording_stops_at_frame_budget(frame_budget: int, model_type: pp
     env.step.return_value = (np.zeros((4, 84, 84), np.uint8), 0.0, False, False, {})
     env.render.return_value = np.zeros((210, 160, 3), np.uint8)
     writer = Mock()
-    carry = ppo.initial_model_carry(config, 1)  # leaves: (1, ...)
+    carry = ppo.ActorCritic(1, config.model).initial_carry(1)  # leaves: (1, ...)
     with (
         patch("rl2.ppo.make_env", return_value=env),
         patch("rl2.ppo.act", return_value=(np.array([0]), np.array([0.0]), np.array([0.0]), carry)) as act,
@@ -1132,7 +1161,7 @@ def test_video_recording_stops_at_episode_end(frame_budget: int | None, terminat
     env.step.side_effect = [(obs, 0.0, False, False, {})] * 6 + [(obs, 0.0, terminated, not terminated, {})]
     env.render.return_value = np.zeros((210, 160, 3), np.uint8)
     writer = Mock()
-    carry = ppo.initial_model_carry(config, 1)  # leaves: (1, ...)
+    carry = ppo.ActorCritic(1, config.model).initial_carry(1)  # leaves: (1, ...)
     with (
         patch("rl2.ppo.make_env", return_value=env),
         patch("rl2.ppo.act", return_value=(np.array([0]), np.array([0.0]), np.array([0.0]), carry)),
@@ -1217,7 +1246,12 @@ def test_model_config_loading_and_factory(tmp_path: Path, backend: str) -> None:
     path = tmp_path / "ppo.yaml"
     path.write_text(yaml.safe_dump(settings))
     default = load_config(path)
-    assert ppo.make_model(default, 3).model == ppo.LSTMConfig()
+    assert (
+        ppo.ActorCritic(
+            3, default.model, dtype=jnp.bfloat16 if default.bf16 else jnp.float32, encoder_stages=default.encoder_stages
+        ).model
+        == ppo.LSTMConfig()
+    )
     settings["model"] = {
         "type": "gdn2",
         "hidden_size": 8,
@@ -1230,7 +1264,9 @@ def test_model_config_loading_and_factory(tmp_path: Path, backend: str) -> None:
     }
     path.write_text(yaml.safe_dump(settings))
     config = load_config(path)
-    model = ppo.make_model(config, 3)
+    model = ppo.ActorCritic(
+        3, config.model, dtype=jnp.bfloat16 if config.bf16 else jnp.float32, encoder_stages=config.encoder_stages
+    )
     assert isinstance(model.model, ppo.GDN2Config)
     assert model.dtype == jnp.bfloat16
     assert model.model.hidden_size == 8
@@ -1245,7 +1281,7 @@ def test_model_config_loading_and_factory(tmp_path: Path, backend: str) -> None:
     assert hash(round_trip) == hash(config)
     with pytest.raises(FrozenInstanceError):
         config.model.hidden_size = 16
-    carry = ppo.initial_model_carry(config, 2)
+    carry = model.initial_carry(2)  # leaves: (2, ...)
     assert len(carry) == 2
     for layer in carry:
         assert layer.state.shape == (2, 1, 4, 4)
@@ -1265,9 +1301,11 @@ def test_mamba3_config_loading_and_factory(tmp_path: Path) -> None:
     restored = load_config(path)
     assert restored == config
     assert hash(restored) == hash(config)
-    model = ppo.make_model(restored, 3)
+    model = ppo.ActorCritic(
+        3, restored.model, dtype=jnp.bfloat16 if restored.bf16 else jnp.float32, encoder_stages=restored.encoder_stages
+    )
     assert model.dtype == jnp.bfloat16
-    carry = ppo.initial_model_carry(restored, 2)
+    carry = model.initial_carry(2)  # leaves: (2, ...)
     assert len(carry) == 2
     for layer in carry:
         assert layer.state.shape == (2, 4, 4, 4)
@@ -1292,13 +1330,15 @@ def test_lstm_stack_config_loading_and_factory(tmp_path: Path) -> None:
     path.write_text(yaml.safe_dump(asdict(config)))
     restored = load_config(path)
     assert restored == config
-    model = ppo.make_model(restored, 3)
+    model = ppo.ActorCritic(
+        3, restored.model, dtype=jnp.bfloat16 if restored.bf16 else jnp.float32, encoder_stages=restored.encoder_stages
+    )
     recurrent = model._make_recurrent()
     assert isinstance(recurrent, ppo.LSTMStack)
     assert recurrent.num_layers == 2
     assert recurrent.intermediate_size == 8
     assert recurrent.dtype == jnp.bfloat16
-    carry = ppo.initial_model_carry(restored, 2)
+    carry = model.initial_carry(2)  # leaves: (2, ...)
     assert len(carry) == 2
     for state in jax.tree.leaves(carry):
         assert state.shape == (2, 8)

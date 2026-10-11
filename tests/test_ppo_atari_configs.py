@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from rl2.ppo import GDN2Config, ModelType, load_config, make_model
+from rl2.ppo import ActorCritic, GDN2Config, ModelType, load_config
 from rl2.ppo_rnd import load_config as load_rnd_config
 
 
@@ -119,7 +119,9 @@ def test_atari_config_parameter_budget(model_type: ModelType) -> None:
 
     # Trace parameter shapes without allocating weights or compiling a training run.
     # Space Invaders uses six actions and four stacked 84x84 grayscale frames.
-    model = make_model(config, num_actions=6)
+    model = ActorCritic(
+        6, config.model, dtype=jnp.bfloat16 if config.bf16 else jnp.float32, encoder_stages=config.encoder_stages
+    )
     variables = jax.eval_shape(
         model.init,
         jax.random.key(0),
@@ -144,7 +146,9 @@ def test_base_atari_config_parameter_budget() -> None:
     for stage, expected in zip(config.encoder_stages, (21, 11, 11), strict=True):
         height, width = stage.output_shape(height, width)
         assert (height, width) == (expected, expected)
-    model = make_model(config, num_actions=6)
+    model = ActorCritic(
+        6, config.model, dtype=jnp.bfloat16 if config.bf16 else jnp.float32, encoder_stages=config.encoder_stages
+    )
     (_, logits, values), variables = jax.eval_shape(
         model.init_with_output,
         jax.random.key(0),
