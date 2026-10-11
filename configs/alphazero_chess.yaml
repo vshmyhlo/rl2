@@ -21,3 +21,9 @@ log_dir: gs://cohere-dev/vlad/rl2/alphazero/${run_id}
 run_id: alphazero_${path_name:${env_id}} # Includes the environment ID; change the prefix for a new run
 log_interval_seconds: 60.0 # Aggregate metrics; emit at iteration boundaries and at normal completion
 checkpoint_interval_seconds: 600.0 # Save after an iteration every 10 minutes, and at normal completion
+evaluation:
+  interval_seconds: 1800.0 # Evaluate before checkpoint saving at iteration boundaries; pauses training
+  num_openings: 50 # Two games per opening, with the agents swapping colors
+  opening_moves: 8 # Fixed-seed random legal prefix; terminal moves are rejected
+  openings_per_batch: 5 # Ten games searched in parallel; uses training num_simulations and max_moves
+  seed: 0 # Independent of training RNG; keep fixed for comparable evaluations

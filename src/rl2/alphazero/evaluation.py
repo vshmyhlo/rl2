@@ -18,6 +18,7 @@ import pgx
 
 from rl2.alphazero.config import Config
 from rl2.alphazero.model import Parameters, PolicyValueNet
+from rl2.alphazero.puct import puct_policy
 from rl2.alphazero.search import PolicyValueFn, recurrent_step
 from rl2.alphazero.utils import masked_logits
 
@@ -81,14 +82,13 @@ def play_game(
         root = mctx.RootFnOutput(
             prior_logits=masked_logits(logits, states.legal_action_mask), value=value, embedding=states
         )
-        policy = mctx.muzero_policy(
+        policy = puct_policy(
             predict,
             jax.random.fold_in(key, move),
             root,
             recurrent_fn,
             num_simulations,
             invalid_actions=~states.legal_action_mask,
-            dirichlet_fraction=0.0,
             temperature=0.0,
         )
         # Explicit argmax avoids random tie breaking in the policy's sampled action.

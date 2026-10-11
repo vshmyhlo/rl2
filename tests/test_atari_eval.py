@@ -2,7 +2,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import chex
 import gymnasium as gym
@@ -101,6 +101,8 @@ class ScoringEnv(gym.Env):
     def __init__(self) -> None:
         self.observation_space = gym.spaces.Box(0, 255, (1, 84, 84), dtype=np.uint8)
         self.action_space = gym.spaces.Discrete(6)
+        self.ale = Mock(spec=["cloneState"])
+        self.ale.cloneState.return_value.getCurrentMode.return_value = 22
         self.episode = -1
         self.steps = 0
         self.closed = False
@@ -179,6 +181,7 @@ def test_full_games_raw_returns_memory_and_json(tmp_path: Path, model_type: ppo.
     assert result["return_sem"] == pytest.approx(2, rel=0, abs=5e-08)
     assert result["human_normalized_score_percent"] == 50
     assert result["baselines"]["source"] == "test reference"
+    assert result["environment"]["mode"] == 22
     assert starts == [True, False, True, False]
     assert memories == [0, 1, 0, 1]
     assert result["episodes"][0]["terminated"]
@@ -222,6 +225,18 @@ def test_rnd_evaluation_carry_policy_interface_and_report(tmp_path: Path) -> Non
     assert result["training_config"]["encoder_channels"] == list(config.encoder_channels)
     assert json.loads(output.read_text()) == result
     assert env.closed
+
+
+@pytest.mark.parametrize(
+    "game,expected_mode",
+    [("Centipede", 22), ("NameThisGame", 8)],
+)
+def test_real_ale_nonzero_default_mode(game: str, expected_mode: int) -> None:
+    config = replace(training_config(), env_id=f"ALE/{game}-v5", frame_stack=False)
+    with make_evaluation_env(config, EvaluationConfig(episodes=1, max_episode_frames=104)) as env:
+        obs, _ = env.reset(seed=7)
+        assert obs.shape == (1, 84, 84)
+        assert env.unwrapped.ale.cloneState().getCurrentMode() == expected_mode
 
 
 # Cover every frame-skip remainder and both protocols/stack modes without crossing them.

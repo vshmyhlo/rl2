@@ -40,7 +40,6 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from rl2.sequence_model import RecurrentSequenceModel
-from rl2.shape_checker import ShapeChecker
 
 
 class Mamba3Carry(NamedTuple):
@@ -60,18 +59,8 @@ class Mamba3Carry(NamedTuple):
 type StepInputs = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
 
 
-def _check_carry(sc: ShapeChecker, carry: Mamba3Carry) -> None:
-    sc.check(carry.state, "BHPN", jnp.float32)
-    sc.check(carry.key, "BHRN", jnp.float32)
-    sc.check(carry.value, "BHP", jnp.float32)
-    sc.check(carry.angle, "BHQ", jnp.float32)
-
-
 def _rotate(x: jax.Array, angle: jax.Array, pairwise: bool) -> jax.Array:
     """Match upstream SISO adjacent pairs or MIMO (i, i + N/2) pairs."""
-    sc = ShapeChecker()
-    sc.check(x, "BHRN", jnp.float32)
-    sc.check(angle, "BHQ", jnp.float32)
     chex.assert_is_divisible(x.shape[-1], 2)
     count = angle.shape[-1]
     chex.assert_scalar_in(count, 1, x.shape[-1] // 2)
@@ -92,15 +81,7 @@ def _rotate(x: jax.Array, angle: jax.Array, pairwise: bool) -> jax.Array:
 def _ssm_step(carry: Mamba3Carry, inputs: StepInputs, mimo_x: jax.Array) -> tuple[Mamba3Carry, jax.Array]:
     """Trapezoidal recurrence in the rotating B/C coordinate system."""
     x, b, c, dt, a, trap, angle_delta, starts = inputs
-    sc = ShapeChecker()
-    sc.check(x, "BHP", jnp.float32)
-    sc.check(mimo_x, "HRP", jnp.float32)
-    sc.check((b, c), "BHRN", jnp.float32)
-    sc.check((dt, a, trap), "BH", jnp.float32)
-    sc.check(angle_delta, "BHQ", jnp.float32)
-    sc.check(starts, "B", jnp.bool_)
-    _check_carry(sc, carry)
-    (rank,) = sc["R"]
+    rank = mimo_x.shape[1]
 
     def reset(leaf: jax.Array) -> jax.Array:
         chex.assert_type(leaf, jnp.float32)
@@ -121,8 +102,6 @@ def _ssm_step(carry: Mamba3Carry, inputs: StepInputs, mimo_x: jax.Array) -> tupl
     state = alpha * carry.state + beta * previous + gamma * current
     y = jnp.einsum("bhpn,bhrn->bhrp", state, c)
     carry = Mamba3Carry(state, b, x, angle)
-    _check_carry(sc, carry)
-    sc.check(y, "BHRP", jnp.float32)
     return carry, y
 
 
@@ -191,8 +170,6 @@ class Mamba3(nn.Module, RecurrentSequenceModel[Mamba3Carry]):
             jnp.zeros((num_envs, heads, self.headdim), jnp.float32),
             jnp.zeros((num_envs, heads, pairs), jnp.float32),
         )
-        sc = ShapeChecker(B=num_envs, H=heads, P=self.headdim, N=self.d_state, R=self.mimo_rank, Q=pairs)
-        _check_carry(sc, carry)
         return carry
 
     @nn.compact
@@ -209,13 +186,9 @@ class Mamba3(nn.Module, RecurrentSequenceModel[Mamba3Carry]):
         Gradients flow through supplied carry unless the caller detaches it.
         """
         inner, heads, pairs = self._dimensions()
-        sc = ShapeChecker(D=self.d_model, H=heads, P=self.headdim, N=self.d_state, R=self.mimo_rank, Q=pairs)
-        sc.check(x, "TBD")
         chex.assert_type(x, jnp.floating)
-        sc.check(episode_starts, "TB", jnp.bool_)
-        steps, batch = sc["TB"]
+        steps, batch = x.shape[:2]
         chex.assert_scalar_positive(batch)
-        _check_carry(sc, carry)
         rank = self.mimo_rank
         bc_size = self.ngroups * rank * self.d_state
         sizes = (inner, inner, bc_size, bc_size, heads, heads, heads, pairs)
@@ -224,21 +197,16 @@ class Mamba3(nn.Module, RecurrentSequenceModel[Mamba3Carry]):
         projected = nn.Dense(sum(sizes), use_bias=False, kernel_init=linear_init, dtype=self.dtype, name="in_proj")(
             x
         ).astype(jnp.float32)
-        projection_sc = ShapeChecker(T=steps, B=batch, F=sum(sizes))
-        projection_sc.check(projected, "TBF", jnp.float32)
         offsets = tuple(sum(sizes[:i]) for i in range(1, len(sizes)))
         z, value, b, c, raw_dt, raw_a, raw_trap, raw_angle = jnp.split(projected, offsets, axis=-1)
         z, value = (v.reshape((steps, batch, heads, self.headdim)) for v in (z, value))
 
         def normalize_bc(v: jax.Array, name: str) -> jax.Array:
-            bc_sc = ShapeChecker(T=steps, B=batch, C=bc_size, H=heads, R=rank, N=self.d_state)
-            bc_sc.check(v, "TBC", jnp.float32)
             v = v.reshape((steps, batch, rank, self.ngroups, self.d_state))
             v = nn.RMSNorm(epsilon=1e-5, dtype=jnp.float32, name=f"{name}_norm")(v)
             v = jnp.repeat(jnp.swapaxes(v, -3, -2), heads // self.ngroups, axis=-3)
             bias = self.param(f"{name}_bias", nn.initializers.ones_init(), (heads, rank, self.d_state))
             output = v + bias
-            bc_sc.check(output, "TBHRN", jnp.float32)
             return output
 
         b, c = normalize_bc(b, "B"), normalize_bc(c, "C")
@@ -277,8 +245,6 @@ class Mamba3(nn.Module, RecurrentSequenceModel[Mamba3Carry]):
         # at initialization, as upstream MixerModel._init_weights does.
         out_init = nn.initializers.variance_scaling(self.out_proj_init_scale**2 / 3, "fan_in", "uniform")
         y = nn.Dense(self.d_model, use_bias=False, kernel_init=out_init, dtype=self.dtype, name="out_proj")(y)
-        _check_carry(sc, carry)
-        sc.check(y, "TBD", self.dtype)
         return carry, y
 
     def step(
@@ -288,13 +254,9 @@ class Mamba3(nn.Module, RecurrentSequenceModel[Mamba3Carry]):
         episode_starts: jax.Array,
     ) -> tuple[Mamba3Carry, jax.Array]:
         """One recurrent step on [batch,d_model], using the same parameters."""
-        sc = ShapeChecker(D=self.d_model)
-        sc.check(x, "BD")
         chex.assert_type(x, jnp.floating)
-        sc.check(episode_starts, "B", jnp.bool_)
         carry, y = self(x[None], carry, episode_starts[None])
         output = y[0]
-        sc.check(output, "BD", self.dtype)
         return carry, output
 
 
@@ -312,10 +274,7 @@ class _Mamba3Block(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array, carry: Mamba3Carry, episode_starts: jax.Array) -> tuple[Mamba3Carry, jax.Array]:
-        sc = ShapeChecker(D=self.mixer.d_model)
-        sc.check(x, "TBD")
         chex.assert_type(x, jnp.floating)
-        sc.check(episode_starts, "TB", jnp.bool_)
         norm_cls = nn.RMSNorm if self.rms_norm else nn.LayerNorm
         dtype = self.mixer.dtype
         residual_dtype = jnp.float32 if self.residual_in_fp32 else dtype
@@ -335,7 +294,6 @@ class _Mamba3Block(nn.Module):
             out_init = nn.initializers.variance_scaling(self.mixer.out_proj_init_scale**2 / 3, "fan_in", "uniform")
             y = nn.Dense(self.mixer.d_model, use_bias=False, kernel_init=out_init, dtype=dtype, name="fc2")(y)
             x = x + y.astype(residual_dtype)
-        sc.check(x, "TBD", residual_dtype)
         return carry, x
 
 
@@ -462,10 +420,7 @@ class Mamba3Stack(nn.Module, RecurrentSequenceModel[Mamba3StackCarry]):
         episode_starts: jax.Array,
     ) -> tuple[Mamba3StackCarry, jax.Array]:
         """Map [time,batch,d_model] to (per-layer carry, same-shaped output)."""
-        sc = ShapeChecker(D=self.d_model)
-        sc.check(x, "TBD")
         chex.assert_type(x, jnp.floating)
-        sc.check(episode_starts, "TB", jnp.bool_)
         chex.assert_scalar_positive(x.shape[1])
         if len(carry) != self.num_layers:
             raise ValueError("carry must contain one Mamba3Carry per layer")
@@ -476,7 +431,6 @@ class Mamba3Stack(nn.Module, RecurrentSequenceModel[Mamba3StackCarry]):
         if self.final_norm:
             x = self.norm_f(x)
         output = x.astype(self.dtype)
-        sc.check(output, "TBD", self.dtype)
         return tuple(next_carry), output
 
     def step(
@@ -486,11 +440,7 @@ class Mamba3Stack(nn.Module, RecurrentSequenceModel[Mamba3StackCarry]):
         episode_starts: jax.Array,
     ) -> tuple[Mamba3StackCarry, jax.Array]:
         """Process [batch,d_model], resetting each selected example before its input."""
-        sc = ShapeChecker(D=self.d_model)
-        sc.check(x, "BD")
         chex.assert_type(x, jnp.floating)
-        sc.check(episode_starts, "B", jnp.bool_)
         carry, y = self(x[None], carry, episode_starts[None])
         output = y[0]
-        sc.check(output, "BD", self.dtype)
         return carry, output

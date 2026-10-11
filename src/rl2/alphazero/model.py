@@ -2,6 +2,7 @@
 
 from typing import Any
 
+import chex
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
@@ -19,13 +20,16 @@ class PolicyValueNet(nn.Module):
         """Predict policy logits and values from batched board observations.
 
         Args:
-            observation: Shape (B, H, W, C), with batch size B, board height H,
+            observation: (B, H, W, C) board observations, with batch size B, board height H,
                 board width W, and observation channels C. Converted to float32.
 
         Returns:
-            Float32 policy logits of shape (B, num_actions) and values of shape
-            (B,) in [-1, 1], from the player-to-move perspective.
+            logits: (B, num_actions) float32 unmasked policy logits.
+            value: (B,) float32 values in [-1, 1], from the player-to-move perspective.
         """
+        # Flax Conv accepts unbatched inputs and extra batch axes, but the heads
+        # below require exactly one batch axis when flattening board features.
+        chex.assert_rank(observation, 4)
         # PGX chess observations are floats; tic-tac-toe observations are bools.
         observation = observation.astype(jnp.float32)
         x = nn.relu(nn.Conv(self.channels, (3, 3))(observation))

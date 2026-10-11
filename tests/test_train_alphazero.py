@@ -46,6 +46,52 @@ def test_sample_batch_excludes_padding() -> None:
     np.testing.assert_array_equal(sampled.value_targets, np.ones(4))
 
 
+def test_sample_batch_sparse_positions_preserves_fields() -> None:
+    # Leading, interior, and trailing padding; valid targets have distinct labels.
+    labels = jnp.arange(5, dtype=jnp.float32)
+    batch = az.Batch(
+        observations=labels[:, None, None, None],
+        policy_targets=labels[:, None],
+        value_targets=labels,
+        policy_mask=jnp.array([False, True, False, True, False]),
+        value_mask=jnp.array([False, True, False, False, False]),
+    )
+    sampled = az.sample_batch(batch, jax.random.PRNGKey(0), batch_size=128)
+    assert sampled.observations.shape == (128, 1, 1, 1)
+    assert sampled.policy_targets.shape == (128, 1)
+    chex.assert_shape((sampled.value_targets, sampled.policy_mask, sampled.value_mask), (128,))
+    assert sampled.policy_mask.all()
+    np.testing.assert_array_equal(sampled.observations[:, 0, 0, 0], sampled.value_targets)
+    np.testing.assert_array_equal(sampled.policy_targets[:, 0], sampled.value_targets)
+    np.testing.assert_array_equal(sampled.value_mask, sampled.value_targets == 1)
+    labels, counts = np.unique(sampled.value_targets, return_counts=True)
+    np.testing.assert_array_equal(labels, [1, 3])
+    # Generous deterministic bounds catch severe sampling bias without seed sweeps.
+    assert np.all((counts > 32) & (counts < 96))
+
+
+@pytest.mark.parametrize("fraction", [0.0, 0.25, 1.0], ids=["disabled", "mixture", "noise-only"])
+def test_selfplay_prior_noise_uses_only_legal_actions(fraction: float, monkeypatch: pytest.MonkeyPatch) -> None:
+    logits = jnp.log(jnp.array([[3, 1, 500, 500], [1, 1, 1, 1], [1, 1, 1, 1]], jnp.float32))
+    legal = jnp.array([[True, True, False, False], [False, False, True, False], [False] * 4])
+    # Most Gamma mass is on illegal actions; it must not dilute the noise weight.
+    loggamma = Mock(return_value=jnp.log(jnp.array([[1, 3, 1000, 1000], [1, 2, 3, 4], [1, 1, 1, 1]], jnp.float32)))
+    monkeypatch.setattr(az.jax.random, "loggamma", loggamma)
+    noisy = az.selfplay_prior_logits(
+        logits, legal, jax.random.PRNGKey(0), dirichlet_alpha=0.3, dirichlet_fraction=fraction
+    )
+    assert noisy.shape == logits.shape
+    assert noisy.dtype == jnp.float32
+    assert np.isfinite(noisy).all()
+    np.testing.assert_allclose(
+        jax.nn.softmax(noisy),
+        [[0.75 - 0.5 * fraction, 0.25 + 0.5 * fraction, 0, 0], [0, 0, 1, 0], [0.25] * 4],
+        rtol=1e-6,
+    )
+    if fraction == 0.0:
+        loggamma.assert_not_called()
+
+
 def test_masked_logits() -> None:
     logits = jnp.array([[1.0, 100.0, 2.0], [0.0, 0.0, 0.0]], jnp.float32)
     legal = jnp.array([[True, False, True], [False, False, False]])
@@ -55,14 +101,26 @@ def test_masked_logits() -> None:
     assert np.isfinite(probs).all()
 
 
-def test_outcomes_use_player_ids_and_exclude_unfinished_games() -> None:
+def test_outcomes_use_player_ids_and_exclude_unfinished_games(
+    tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Parameters], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env, model, params = tiny_model
+    config = az.Config(num_envs=3, max_moves=3)
     # Columns: win by player 1, draw, unfinished. The last row is padding.
-    players = jnp.array([[1, 0, 0], [0, 1, 1], [1, 0, 0]], jnp.int32)
-    valid = jnp.array([[True] * 3, [True] * 3, [False] * 3])
-    rewards = jnp.array([[-1, 1], [0, 0], [0, 0]], jnp.float32)
-    values, mask = az.outcome_targets(players, valid, rewards, jnp.array([True, True, False]))
-    np.testing.assert_array_equal(values, [[1, 0, 0], [-1, 0, 0], [0, 0, 0]])
-    np.testing.assert_array_equal(mask, [[True, True, False], [True, True, False], [False] * 3])
+    # T: recorded time steps; B: games; P: players; A: actions.
+    players = jnp.array([[1, 0, 0], [0, 1, 1], [1, 0, 0]], jnp.int32)  # (T, B)
+    valid = jnp.array([[True] * 3, [True] * 3, [False] * 3])  # (T, B)
+    rewards = jnp.array([[-1, 1], [0, 0], [1, -1]], jnp.float32)  # (B, P)
+    states = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 3))
+    states = states.replace(rewards=rewards, terminated=jnp.array([True, True, False]))
+    observations = jnp.zeros((3, 3, *states.observation.shape[1:]))  # (T, B, 3, 3, 2)
+    policies = jnp.full((3, 3, env.num_actions), 1 / env.num_actions)  # (T, B, A)
+    monkeypatch.setattr(jax.lax, "scan", Mock(return_value=(states, (observations, policies, players, valid))))
+    batch, metrics = az.collect_selfplay.__wrapped__(params, jax.random.PRNGKey(0), env=env, model=model, config=config)
+    chex.assert_shape((batch.value_targets, batch.value_mask), (9,))
+    np.testing.assert_array_equal(batch.value_targets, [1, 0, 0, -1, 0, 0, 0, 0, 0])
+    np.testing.assert_array_equal(batch.value_mask, [True, True, False, True, True, False, False, False, False])
+    assert metrics["value_positions"] == 4
 
 
 def test_recurrent_step_terminal_reward_and_opponent_discount(
@@ -96,30 +154,33 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
     env, model, params = tiny_model
     config = az.Config(
         env_id="tic_tac_toe",
-        num_envs=1,
-        max_moves=10,
+        num_envs=2,
+        max_moves=10,  # One padding move after the longest possible game.
         num_simulations=2,
         model=ModelConfig(channels=4, num_blocks=1),
         batch_size=10,
     )
     batch, metrics = az.collect_selfplay(params, jax.random.PRNGKey(2), env=env, model=model, config=config)
-    chex.assert_shape(batch.observations, (10, 3, 3, 2))
-    chex.assert_shape(batch.policy_targets, (10, 9))
-    chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (10,))
+    size = config.max_moves * config.num_envs
+    chex.assert_shape(batch.observations, (size, 3, 3, 2))
+    chex.assert_shape(batch.policy_targets, (size, 9))
+    chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (size,))
     chex.assert_type((batch.observations, batch.policy_targets, batch.value_targets), jnp.float32)
     chex.assert_type((batch.policy_mask, batch.value_mask), jnp.bool_)
-    assert metrics["completed_games"] == 1
-    assert 5 <= metrics["positions"] <= 9
+    assert metrics["completed_games"] == 2
+    assert 10 <= metrics["positions"] <= 18
     np.testing.assert_array_equal(batch.value_mask, batch.policy_mask)
-    assert not batch.policy_mask[-1]
+    assert not batch.policy_mask[-2:].any()
     np.testing.assert_allclose(batch.policy_targets.sum(-1), 1.0)
-    occupied = np.asarray(batch.observations).any(axis=-1).reshape(10, 9)
+    occupied = np.asarray(batch.observations).any(axis=-1).reshape(size, 9)
     real_positions = np.asarray(batch.policy_mask)
     assert np.all(np.asarray(batch.policy_targets)[occupied & real_positions[:, None]] == 0)
     # Every valid move has the game's result, alternating with the player to move.
-    targets = np.asarray(batch.value_targets)[real_positions]
-    np.testing.assert_array_equal(targets[:-1], -targets[1:])
-    assert targets[-1] in (0, 1)
+    for game in range(config.num_envs):
+        game_mask = real_positions.reshape(config.max_moves, config.num_envs)[:, game]
+        targets = np.asarray(batch.value_targets).reshape(config.max_moves, config.num_envs)[game_mask, game]
+        np.testing.assert_array_equal(targets[:-1], -targets[1:])
+        assert targets[-1] in (0, 1)
 
     state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(1e-3))
     updated, losses = az.train_step(state, batch, model=model)
@@ -130,7 +191,7 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
         for before, after in zip(jax.tree.leaves(params), jax.tree.leaves(updated.params), strict=True)
     )
     # An unresolved game must not teach a draw; masked losses have zero gradient.
-    empty = batch.replace(policy_mask=jnp.zeros(10, bool), value_mask=jnp.zeros(10, bool))
+    empty = batch.replace(policy_mask=jnp.zeros(size, bool), value_mask=jnp.zeros(size, bool))
     (loss, _), grads = jax.value_and_grad(az.loss_fn, has_aux=True)(params, model, empty)
     assert loss == 0
     assert all(np.all(np.asarray(leaf) == 0) for leaf in jax.tree.leaves(grads))

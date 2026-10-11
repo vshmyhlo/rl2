@@ -18,6 +18,7 @@ and undiscounted, unclipped rewards. Reset no-ops consume the frame budget;
 as in Gymnasium's preprocessing, their rewards are excluded from the return.
 No automatic FIRE actions: the policy must start/resume games itself.
 Frame stacking follows training (one or four frames).
+Game mode follows each ROM's default, matching training.
 PPO actions are sampled by default; greedy evaluation is an explicit option.
 
 There is no single protocol shared by all Atari papers. ``legacy_noop``
@@ -69,22 +70,31 @@ type EvaluationCarry = RecurrentCarry | LSTMCarry
 
 @dataclass(frozen=True)
 class TrainingScores:
-    """Mean raw return over all completed training episodes.
+    """Raw episode-return means over all training and the latest 100 episodes.
 
-    This is the all-training metric from Section 6.4 of
+    These are the training metrics from Section 6.4 of
     https://arxiv.org/abs/1707.06347, separate from frozen-policy evaluation.
     A missing return_sum (e.g. an older checkpoint) leaves the all-training
-    mean unavailable. Matching this metric does not match Atari protocols.
+    mean unavailable. recent_returns contains the most recent completed
+    episodes, up to 100; None denotes unavailable history. Short windows
+    report their actual count so they cannot be mistaken for 100 episodes.
+    Matching these metrics does not match Atari protocols.
     """
 
     episode_count: int
     return_sum: float | None
+    recent_returns: tuple[float, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.episode_count < 0:
             raise ValueError("episode_count must be nonnegative")
         if self.return_sum is not None and not math.isfinite(self.return_sum):
             raise ValueError("training return_sum must be finite or unavailable")
+        if self.recent_returns is not None:
+            if len(self.recent_returns) > min(100, self.episode_count):
+                raise ValueError("recent_returns cannot exceed 100 or the completed episode count")
+            if not all(math.isfinite(score) for score in self.recent_returns):
+                raise ValueError("recent training returns must be finite")
 
     def as_report(self) -> dict[str, int | float | None]:
         return {
@@ -92,6 +102,10 @@ class TrainingScores:
             "return_mean": self.return_sum / self.episode_count
             if self.episode_count and self.return_sum is not None
             else None,
+            "return_mean_100": math.fsum(self.recent_returns) / len(self.recent_returns)
+            if self.recent_returns
+            else None,
+            "last_100_episode_count": len(self.recent_returns) if self.recent_returns is not None else None,
         }
 
 
@@ -148,13 +162,13 @@ def make_evaluation_env(training: TrainingConfig, evaluation: EvaluationConfig) 
     """Build an explicitly configured ALE environment without training wrappers."""
     validate_training_config(training)
     gym.register_envs(ale_py)
+    # Keep the ROM's default mode, as in training; zero is not valid for every game.
     env = gym.make(
         training.env_id,
         frameskip=1,  # The preprocessing wrapper alone performs action repeat.
         repeat_action_probability=0.25 if evaluation.protocol == "sticky" else 0.0,
         full_action_space=False,
         obs_type="rgb",
-        mode=0,
         difficulty=0,
         max_num_frames_per_episode=evaluation.max_episode_frames,
         max_episode_steps=-1,  # Disable Gym TimeLimit; ALE counts actual emulator frames.
@@ -214,8 +228,8 @@ def evaluate(
     ``training`` must describe the supplied state's actual training setup.
     Returns a JSON-compatible report; optionally writes it to ``output_path``.
     Baselines default to the bundled DQN Zoo Atari-57 table when available.
-    Optional ``training_scores`` adds the PPO paper's training-wide raw episode
-    mean under ``training_scores``; absent history is reported as
+    Optional ``training_scores`` adds the PPO paper's all-training and last-100
+    raw episode means with their episode counts; absent history is reported as
     null. Evaluation episodes never contribute to these training metrics.
     Progress prints at startup, after each game, and every 10 seconds during
     a game (after an environment step). Set show_progress=False to silence it.
@@ -250,6 +264,7 @@ def evaluate(
         if show_progress:
             report_progress(started, 1, 0.0, 0)
         action_meanings = env.unwrapped.get_action_meanings()
+        game_mode = int(env.unwrapped.ale.cloneState().getCurrentMode())
         for index in range(evaluation.episodes):
             seed = evaluation.seed + index
             obs, info = env.reset(seed=seed)
@@ -320,7 +335,7 @@ def evaluate(
             "automatic_fire": False,
             "full_action_space": False,
             "action_meanings": action_meanings,
-            "mode": 0,
+            "mode": game_mode,
             "difficulty": 0,
         },
         "training_config": training_metadata,  # Configured budget, not proof of frames actually trained.

@@ -4,9 +4,10 @@ Run: uv run --extra alphazero python -m rl2.train_alphazero --config configs/alp
 For a cheap start, set env_id: tic_tac_toe and max_moves: 9 in the YAML config.
 
 Each iteration starts fresh games and samples updates from that rollout only.
-Unfinished games train the policy but not the value; terminal padding trains
-neither. Orbax checkpoints save every 10 minutes at iteration boundaries and on
-normal completion; reusing a run directory resumes the latest saved iteration.
+Games still active at max_moves are adjudicated as draws and train both heads;
+terminal padding trains neither. Orbax checkpoints save every 10 minutes at
+iteration boundaries and on normal completion; reusing a run directory resumes
+the latest saved iteration.
 Progress metrics aggregate over log_interval_seconds (default: 60), emitted
 at iteration boundaries and on normal completion.
 
@@ -16,17 +17,17 @@ terminal padding. Each logging window contains complete training iterations:
 - losses/policy_loss: Mean policy cross-entropy against MCTS action weights,
   averaged over optimizer updates in the window. Padding is masked out.
 - losses/value_loss: Mean squared error against final game outcomes, averaged
-  over updates. Only positions from terminated games contribute; an update
-  with no eligible positions contributes zero.
+  over updates, including zero targets for move-limit draws. Environment-truncated
+  games are excluded; an update with no eligible positions contributes zero.
 - losses/loss: Sum of policy and value losses, averaged over updates. AdamW
   weight decay is applied by the optimizer and is not included in this loss.
 - selfplay/positions: Total played positions collected in the window.
-- selfplay/value_positions: Total positions with terminal outcome targets
+- selfplay/value_positions: Total positions with outcome targets, including move-limit draws,
   collected in the window, before sampling training minibatches.
-- selfplay/completed_games: Total terminated games in the window, including
-  draws. Games still unfinished at the rollout limit are excluded.
+- selfplay/completed_games: Total completed games in the window, including
+  move-limit draws. Environment-truncated games are excluded.
 - charts/iteration: Latest completed iteration number, starting at one.
-- charts/completed_games: Cumulative terminated games, including restored
+- charts/completed_games: Cumulative completed games, including move-limit draws and restored
   checkpoint progress.
 - charts/learning_rate: Configured constant optimizer learning rate.
 - charts/SPS: Window positions divided by window wall time, in positions/sec.
@@ -66,7 +67,7 @@ Evaluation metrics are logged immediately under eval/, without window averaging:
 - seconds: Wall time for the evaluation, including any initial JIT compilation.
 Evaluation does not alter training RNG, progress counters, or checkpoint policy.
 This scaffold has no persistent replay.
-PGX owns observation/action encodings and draw rules. Values always use the
+PGX owns observation/action encodings and in-game draw rules. Values always use the
 player-to-move perspective. This is not an exact reproduction of the paper.
 """
 
@@ -92,6 +93,7 @@ from rl2.alphazero.checkpoints import TrainingProgress, checkpoint_manager, rest
 from rl2.alphazero.config import Config, load_config
 from rl2.alphazero.evaluation import evaluate
 from rl2.alphazero.model import Parameters, PolicyValueNet
+from rl2.alphazero.puct import puct_policy
 from rl2.alphazero.search import PolicyValueFn, recurrent_step
 from rl2.alphazero.utils import masked_logits
 from rl2.configuration import resolve_settings
@@ -103,92 +105,163 @@ type Metrics = dict[str, jax.Array]
 
 @struct.dataclass
 class Batch:
-    observations: jax.Array
-    policy_targets: jax.Array
-    value_targets: jax.Array
-    policy_mask: jax.Array
-    value_mask: jax.Array
+    # B: batch size; A: number of actions; observation_shape: environment observation dimensions.
+    observations: jax.Array  # (B, *observation_shape)
+    policy_targets: jax.Array  # (B, A)
+    value_targets: jax.Array  # (B,)
+    policy_mask: jax.Array  # (B,)
+    value_mask: jax.Array  # (B,)
 
 
-def outcome_targets(
-    players: jax.Array, valid: jax.Array, rewards: jax.Array, terminated: jax.Array
-) -> tuple[jax.Array, jax.Array]:
-    """One game per column: map its final rewards to each recorded actor."""
-    targets = rewards[jnp.arange(players.shape[1])[None, :], players]
-    mask = valid & terminated[None, :]
-    targets = jnp.where(mask, targets, 0.0)
-    return targets, mask
+def selfplay_prior_logits(
+    logits: jax.Array,
+    legal: jax.Array,
+    key: jax.Array,
+    *,
+    dirichlet_alpha: float,
+    dirichlet_fraction: float,
+) -> jax.Array:
+    """Mix the policy with Dirichlet noise normalized over legal actions only.
+
+    Args:
+        logits: (B, A) float32 network policy logits.
+        legal: (B, A) boolean legal-action mask.
+        key: (2,) uint32 PRNG key.
+        dirichlet_alpha: Positive concentration for each legal action.
+        dirichlet_fraction: Noise mixture weight in [0, 1].
+
+    Returns:
+        (B, A) float32 noisy, masked logits; empty legal rows remain finite.
+    """
+    prior_logits = masked_logits(logits, legal)
+    if dirichlet_fraction == 0.0:
+        return prior_logits
+    # Independent Gamma samples normalized over legal moves form a Dirichlet
+    # sample on that subset. Log space avoids underflow for small concentrations.
+    log_noise = jax.random.loggamma(key, dirichlet_alpha, shape=logits.shape)
+    noise = jax.nn.softmax(masked_logits(log_noise, legal))
+    probs = (1.0 - dirichlet_fraction) * jax.nn.softmax(prior_logits) + dirichlet_fraction * noise
+    return masked_logits(jnp.log(jnp.maximum(probs, jnp.finfo(probs.dtype).tiny)), legal)
 
 
 @partial(jax.jit, static_argnames=("env", "model", "config"))
 def collect_selfplay(
-    params: Parameters, key: jax.Array, *, env: pgx.Env, model: PolicyValueNet, config: Config
+    params: Parameters,
+    key: jax.Array,  # (2,)
+    *,
+    env: pgx.Env,
+    model: PolicyValueNet,
+    config: Config,
 ) -> tuple[Batch, Metrics]:
-    """Collect one fixed-length, terminal-padded game per environment."""
-    init_key, play_key = jax.random.split(key)
-    states = jax.vmap(env.init)(jax.random.split(init_key, config.num_envs))
+    """Collect padded games, adjudicating games still active at max_moves as draws.
+
+    B: games; T: max_moves; A: actions; O: environment observation dimensions.
+    Environment truncations remain excluded from value supervision.
+
+    Args:
+        params: Model parameter pytree.
+        key: (2,) uint32 PRNG key.
+        env: Game rules and encodings.
+        model: Policy and value network.
+        config: Self-play settings.
+
+    Returns:
+        Batch and metrics, with fields:
+            observations: (T * B, *O) float32 recorded observations.
+            policy_targets: (T * B, A) float32 MCTS action weights.
+            value_targets: (T * B,) float32 player-relative outcomes, zero for cutoff draws.
+            policy_mask: (T * B,) bool non-padding positions.
+            value_mask: (T * B,) bool positions with terminal or adjudicated outcomes.
+            completed_games: () integer count including move-limit draws.
+            positions: () integer count of non-padding positions.
+            value_positions: () integer count of positions with outcome targets.
+    """
+    init_key, play_key = jax.random.split(key)  # Each: (2,)
+    states = jax.vmap(env.init)(jax.random.split(init_key, config.num_envs))  # Leaves: (B, ...)
     predict = partial(model.apply, {"params": params})
 
     def recurrent_fn(
-        model: PolicyValueFn, _key: jax.Array, actions: jax.Array, states: pgx.State
+        model: PolicyValueFn,
+        _key: jax.Array,  # (2,)
+        actions: jax.Array,  # (B,)
+        states: pgx.State,  # Leaves: (B, ...)
     ) -> tuple[mctx.RecurrentFnOutput, pgx.State]:
         # Mctx requires a PRNG key even for deterministic transitions.
         return recurrent_step(model, actions, states, env=env)
 
     def step(
-        states: pgx.State, inputs: tuple[jax.Array, jax.Array]
+        states: pgx.State,  # Leaves: (B, ...)
+        inputs: tuple[jax.Array, jax.Array],  # (2,) key and () move index.
     ) -> tuple[pgx.State, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
-        key, move = inputs
-        logits, value = predict(states.observation)
-        done = states.terminated | states.truncated
+        key, move_i = inputs  # key: (2,); move_i: () scalar move index.
+        noise_key, search_key = jax.random.split(key)  # Each: (2,)
+        logits, value = predict(states.observation)  # (B, A), (B,)
+        done = states.terminated | states.truncated  # (B,)
         root = mctx.RootFnOutput(
-            prior_logits=masked_logits(logits, states.legal_action_mask),
-            value=jnp.where(done, 0.0, value),
-            embedding=states,
+            prior_logits=selfplay_prior_logits(
+                logits,
+                states.legal_action_mask,
+                noise_key,
+                dirichlet_alpha=config.dirichlet_alpha,
+                dirichlet_fraction=config.dirichlet_fraction,
+            ),  # (B, A)
+            value=jnp.where(done, 0.0, value),  # (B,)
+            embedding=states,  # Leaves: (B, ...)
         )
-        # Mctx calls this muzero_policy; using PGX as the exact transition
-        # function makes it AlphaZero-style PUCT, with no learned dynamics.
-        policy = mctx.muzero_policy(
+        # PGX supplies exact transitions for Mctx's PUCT, with no learned dynamics.
+        policy = puct_policy(
             predict,
-            key,
+            search_key,
             root,
             recurrent_fn,
             config.num_simulations,
             invalid_actions=~states.legal_action_mask,
-            dirichlet_alpha=config.dirichlet_alpha,
-            dirichlet_fraction=config.dirichlet_fraction,
-            temperature=jnp.where(move < config.exploration_moves, 1.0, 0.0),
+            temperature=jnp.where(move_i < config.exploration_moves, 1.0, 0.0),
         )
-        next_states = jax.vmap(env.step)(states, policy.action)
+        next_states = jax.vmap(env.step)(states, policy.action)  # Leaves: (B, ...)
 
-        def preserve_finished(old: jax.Array, new: jax.Array) -> jax.Array:
+        def preserve_finished(
+            old: jax.Array,  # (B, ...)
+            new: jax.Array,  # (B, ...)
+        ) -> jax.Array:  # (B, ...)
+            """Preserve (B, ...) state leaves for games that have already stopped."""
             # Preserve final rewards: PGX otherwise clears them on later steps.
-            return jnp.where(done.reshape((config.num_envs,) + (1,) * (old.ndim - 1)), old, new)
+            return jnp.where(done.reshape((config.num_envs,) + (1,) * (old.ndim - 1)), old, new)  # (B, ...)
 
-        next_states = jax.tree.map(preserve_finished, states, next_states)
+        next_states = jax.tree.map(preserve_finished, states, next_states)  # Leaves: (B, ...)
+
         return next_states, (
-            states.observation.astype(jnp.float32),
-            policy.action_weights,
-            states.current_player,
-            ~done,
+            states.observation.astype(jnp.float32),  # (B, *O)
+            policy.action_weights,  # (B, A)
+            states.current_player,  # (B,)
+            ~done,  # (B,)
         )
 
+    # Recorded arrays: (T, B, *O), (T, B, A), (T, B), (T, B).
     states, (observations, policies, players, valid) = jax.lax.scan(
-        step, states, (jax.random.split(play_key, config.max_moves), jnp.arange(config.max_moves, dtype=jnp.int32))
+        step,
+        states,
+        (jax.random.split(play_key, config.max_moves), jnp.arange(config.max_moves, dtype=jnp.int32)),
     )
-    values, value_mask = outcome_targets(players, valid, states.rewards, states.terminated)
+    # T: recorded time steps; B: games. Map final rewards to each recorded actor.
+    values = states.rewards[jnp.arange(config.num_envs)[None, :], players]  # (T, B)
+    move_limit_draws = ~(states.terminated | states.truncated)  # (B,)
+    completed = states.terminated | move_limit_draws  # (B,)
+    value_mask = valid & completed[None, :]  # (T, B)
+    # A win on the final allowed move keeps its outcome; only active games draw.
+    values = jnp.where(valid & states.terminated[None, :], values, 0.0)  # (T, B)
     size = config.max_moves * config.num_envs
     batch = Batch(
-        observations.reshape((size, *observations.shape[2:])),
-        policies.reshape((size, env.num_actions)),
-        values.reshape(size),
-        valid.reshape(size),
-        value_mask.reshape(size),
+        observations.reshape((size, *observations.shape[2:])),  # (T * B, *O)
+        policies.reshape((size, env.num_actions)),  # (T * B, A)
+        values.reshape(size),  # (T * B,)
+        valid.reshape(size),  # (T * B,)
+        value_mask.reshape(size),  # (T * B,)
     )
     return batch, {
-        "completed_games": states.terminated.sum(),
-        "positions": valid.sum(),
-        "value_positions": value_mask.sum(),
+        "completed_games": completed.sum(),  # ()
+        "positions": valid.sum(),  # ()
+        "value_positions": value_mask.sum(),  # ()
     }
 
 
@@ -211,8 +284,11 @@ def train_step(state: TrainState, batch: Batch, *, model: PolicyValueNet) -> tup
 @partial(jax.jit, static_argnames=("batch_size",))
 def sample_batch(batch: Batch, key: jax.Array, batch_size: int) -> Batch:
     """Sample real positions uniformly with replacement; at least one must exist."""
-    sampling_logits = jnp.where(batch.policy_mask, 0.0, -jnp.inf)
-    indices = jax.random.categorical(key, sampling_logits, shape=(batch_size,))
+    # Invert cumulative counts instead of generating a (batch_size, rollout_size)
+    # Gumbel array. Right insertion skips padding, including leading zero counts.
+    counts = jnp.cumsum(batch.policy_mask, dtype=jnp.int32)
+    ranks = jax.random.randint(key, (batch_size,), 0, counts[-1])
+    indices = jnp.searchsorted(counts, ranks, side="right")
 
     def select(x: jax.Array) -> jax.Array:
         return x[indices]
@@ -365,7 +441,9 @@ def main() -> None:
         config = load_config(args.config)
     except (OSError, TypeError, ValueError, yaml.YAMLError, OmegaConfBaseException) as error:
         parser.error(str(error))
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stdout)
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stdout, force=True
+    )
     train(config)
 
 

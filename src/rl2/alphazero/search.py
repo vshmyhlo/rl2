@@ -2,6 +2,7 @@
 
 from typing import Protocol
 
+import chex
 import jax
 import jax.numpy as jnp
 import mctx
@@ -44,8 +45,18 @@ def recurrent_step(
         Backup uses reward + discount * child_value, negating the opponent's value.
     """
     next_states = jax.vmap(env.step)(states, actions)
+    finished = states.terminated | states.truncated
+
+    def preserve_finished(old: jax.Array, new: jax.Array) -> jax.Array:
+        return jnp.where(finished.reshape(finished.shape + (1,) * (old.ndim - 1)), old, new)
+
+    # PGX checks action legality even after a game has ended. Keep finished
+    # nodes absorbing, including truncated states whose mask still has illegal moves.
+    next_states = jax.tree.map(preserve_finished, states.replace(rewards=jnp.zeros_like(states.rewards)), next_states)
     logits, value = model(next_states.observation)
     # Check before masking: where would silently broadcast a scalar or (1,) value.
+    chex.assert_shape(logits, (states.current_player.shape[0], env.num_actions))
+    chex.assert_shape(value, states.current_player.shape)
     reward = jnp.take_along_axis(next_states.rewards, states.current_player[:, None], axis=1)[:, 0]
     done = next_states.terminated | next_states.truncated
     output = mctx.RecurrentFnOutput(

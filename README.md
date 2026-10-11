@@ -133,3 +133,21 @@ increasing it extends the run and recalculates decay schedules for the new targe
   (Delfosse et al., 2023): Extracts structured object observations from Atari games
   using RAM or vision. Useful for studying programmatic policies over objects
   and their attributes while separating control learning from perception.
+- [JaxMARL](https://github.com/bold-lab-ai/JaxMARL): Multi-agent RL environments
+  and baseline algorithms in JAX, including SMAX and Hanabi, with
+  GPU-parallel simulation and PPO-based baselines such as IPPO and MAPPO.
+- [Pgx](https://github.com/sotetsuk/pgx): JAX-native game environments, including
+  chess, shogi, Go, and backgammon, with GPU-accelerated parallel simulation
+  and AlphaZero and PPO training examples.
+- [XLand-MiniGrid](https://github.com/dunnolab/xland-minigrid): JAX-based grid-world
+  environments and benchmarks for meta-reinforcement learning, inspired by XLand
+  and MiniGrid, with composable rules and goals and multi-GPU PPO baselines.
+- [DiscoRL](https://github.com/google-deepmind/disco_rl): A minimal JAX framework
+  for meta-learning RL update rules, with pretrained Disco103 weights and notebooks
+  for training agents with the discovered rule or learning new rules.
+- [minimax](https://github.com/facebookresearch/minimax): JAX-based unsupervised
+  environment design baselines for automatic curricula, including PAIRED,
+  Prioritized Level Replay, and ACCEL, with multi-device training support.
+- [JaxUED](https://github.com/DramaCow/jaxued): Unsupervised environment design
+  in JAX, with readable single-file implementations of domain randomization,
+  Prioritized Level Replay, ACCEL, and PAIRED, plus reusable level-sampling utilities.

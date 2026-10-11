@@ -8,8 +8,6 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from rl2.shape_checker import ShapeChecker
-
 
 class Relation(IntEnum):
     """Relationship of the key node to the query node."""
@@ -52,13 +50,9 @@ def tree_relations(depth: jax.Array, seq_len: jax.Array) -> TreeRelations:
     arbitrary values. Depth is int32 [B, N] and seq_len is int32 [B]. Relations
     are recomputed once per forward pass and shared by all attention layers.
     """
-    sc = ShapeChecker()
-    sc.check(depth, "BN", jnp.int32)
-    sc.check(seq_len, "B", jnp.int32)
     batch, size = depth.shape
     chex.assert_scalar_positive(size)
     node_mask = jnp.arange(size)[None, :] < seq_len[:, None]
-    sc.check(node_mask, "BN", jnp.bool_)
     depth = jnp.where(node_mask, depth, 0)
     index = jnp.arange(size)
     # For i < j, the LCA depth is min(depth[i], min(depth[i+1:j+1])-1).
@@ -86,7 +80,6 @@ def tree_relations(depth: jax.Array, seq_len: jax.Array) -> TreeRelations:
     relative_depth = jnp.clip(depth[:, None, :] - depth[:, :, None], -MAX_RELATIVE_DEPTH, MAX_RELATIVE_DEPTH)
     padding = ((0, 0), (1, 0), (1, 0))
     result = TreeRelations(kind, jnp.pad(distance, padding), jnp.pad(relative_depth + MAX_RELATIVE_DEPTH, padding))
-    sc.check(result, "BTT", jnp.int32)
     return result
 
 

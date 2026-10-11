@@ -96,26 +96,40 @@ def test_grpo_rejects_invalid_checkpoint(grpo: ModuleType, state: TrainState, tm
     assert checkpoint.read_bytes() == data
 
 
-@pytest.mark.parametrize("remote", [False, True], ids=["local", "gcs"])
-def test_world_model_checkpoint_roundtrip(
+def test_world_model_checkpoint_roundtrip(state: TrainState, tmp_path: Path) -> None:
+    directory = tmp_path / "checkpoints"
+    directory.mkdir()
+    metadata = directory / "config.json"
+    metadata.write_text('{"model": "lstm"}\n')
+    train_wm.save_checkpoint(state, directory)
+    gradients = {"weight": jnp.array([-0.1, 0.2])}
+    updated = state.apply_gradients(grads=gradients)
+    train_wm.save_checkpoint(updated, str(directory) + "/")
+    fresh = state.replace(
+        step=0, params=jax.tree.map(jnp.zeros_like, state.params), opt_state=state.tx.init(state.params)
+    )
+    with train_wm.ocp.CheckpointManager(directory) as manager:
+        assert manager.all_steps() == [int(updated.step)]
+        restored = manager.restore(manager.latest_step(), args=train_wm.ocp.args.StandardRestore(fresh))
+    chex.assert_trees_all_equal(restored, updated)
+    chex.assert_trees_all_equal(restored.apply_gradients(grads=gradients), updated.apply_gradients(grads=gradients))
+    assert metadata.read_text() == '{"model": "lstm"}\n'
+    assert not (directory / str(int(state.step))).exists()
+
+
+@pytest.mark.parametrize("remote", [False, True], ids=["relative-local", "gcs"])
+def test_world_model_checkpoint_paths(
     state: TrainState, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remote: bool
 ) -> None:
-    uploads: dict[str, bytes] = {}
-
-    class FakeBlob:
-        def upload_from_string(self, data: bytes) -> None:
-            uploads["checkpoint"] = data
-
-    blob = Mock(return_value=FakeBlob())
-    monkeypatch.setattr(train_wm.storage, "Client", Mock())
-    monkeypatch.setattr(train_wm.storage.Blob, "from_uri", blob)
-    directory = "gs://test-bucket/wm" if remote else str(tmp_path / "checkpoints")
-    train_wm.save_checkpoint(state, directory + "/")
-    if remote:
-        assert blob.call_args.args == (f"{directory}/checkpoint.msgpack",)
-        data = uploads["checkpoint"]
-    else:
-        data = (Path(directory) / "checkpoint.msgpack").read_bytes()
-        assert not list(Path(directory).glob("*.tmp"))
-    restored = serialization.from_bytes(state, data)
-    chex.assert_trees_all_equal(restored, state)
+    monkeypatch.chdir(tmp_path)
+    manager = Mock()
+    context = Mock(__enter__=Mock(return_value=manager), __exit__=Mock(return_value=False))
+    factory = Mock(return_value=context)
+    monkeypatch.setattr(train_wm.ocp, "CheckpointManager", factory)
+    directory = "gs://test-bucket/wm/" if remote else "checkpoints/wm/"
+    train_wm.save_checkpoint(state, directory)
+    assert factory.call_args.args == (directory if remote else str(tmp_path / directory),)
+    manager.save.assert_called_once()
+    assert manager.save.call_args.args == (int(state.step),)
+    assert manager.save.call_args.kwargs["args"].item is state
+    context.__exit__.assert_called_once()

@@ -1,6 +1,6 @@
 """Train a Mamba or LSTM world model with a uniform random policy.
 
-Run with ``uv run python -m rl2.train_wm --config configs/train_wm_atari.yaml``.
+Run with ``uv run python -m rl2.train_wm --config configs/wm_atari.yaml``.
 The convolutional encoder accepts uint8 frames and normalizes them internally;
 reconstruction targets use [0, 1] and rewards retain their environment scale.
 Each rollout receives one Adam update using
@@ -11,12 +11,16 @@ resets at episode boundaries. No policy is learned.
 
 import argparse
 import json
+import os
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from time import monotonic
 from typing import Literal
+
+# Use gcsfs for gs:// checkpoints without importing TensorFlow through epath.
+os.environ.setdefault("EPATH_USE_TF", "0")
 
 import chex
 import cv2
@@ -25,8 +29,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import orbax.checkpoint as ocp
 import yaml
-from flax import serialization, struct
+from flax import struct
 from flax.training.train_state import TrainState
 from google.cloud import storage
 from numpy.typing import NDArray
@@ -589,8 +594,15 @@ def write_artifact(path: str, data: bytes) -> None:
 
 
 def save_checkpoint(state: TrainState, run_dir: str | Path) -> None:
-    """Save the latest parameters, optimizer state, and update count in the checkpoint run directory."""
-    write_artifact(f"{str(run_dir).rstrip('/')}/checkpoint.msgpack", serialization.to_bytes(state))
+    """Save parameters, optimizer state, and update count with Orbax, retaining the latest update."""
+    directory = str(run_dir)
+    if not directory.startswith("gs://"):
+        directory = str(Path(directory).resolve())
+    with ocp.CheckpointManager(
+        directory,
+        options=ocp.CheckpointManagerOptions(max_to_keep=1, enable_async_checkpointing=False),
+    ) as manager:
+        manager.save(int(state.step), args=ocp.args.StandardSave(state), force=True)
 
 
 def train(config: Config) -> str:
@@ -662,7 +674,7 @@ def train(config: Config) -> str:
         write_artifact(f"{checkpoint_run_dir}/config.json", metadata_bytes)
         writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", 0)
         print(f"TensorBoard run: {run_dir}", flush=True)
-        print(f"Checkpoint: {checkpoint_run_dir}/checkpoint.msgpack", flush=True)
+        print(f"Orbax checkpoints: {checkpoint_run_dir}/<update>/", flush=True)
         devices = str(jax.devices())
         print(f"JAX devices: {devices}", flush=True)
         writer.add_text("devices", devices, 0)
@@ -738,7 +750,7 @@ def train(config: Config) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/train_wm_atari.yaml", help="Path to a YAML config")
+    parser.add_argument("--config", default="configs/wm_atari.yaml", help="Path to a YAML config")
     args = parser.parse_args()
     train(load_config(args.config))
 

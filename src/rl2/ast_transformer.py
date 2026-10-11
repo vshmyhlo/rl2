@@ -19,9 +19,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from rl2.attention import AttentionType, _check_range
-from rl2.karel_ast import AST_ACTIONS, CONSTRUCTORS, NUM_NODE_TYPES, VALUES, ASTFeatures, Field
+from rl2.karel_ast import CONSTRUCTORS, NUM_NODE_TYPES, VALUES, ASTFeatures, Field
 from rl2.karel_syntax import MAX_BLOCK_DEPTH
-from rl2.shape_checker import ShapeChecker
 from rl2.transformer import BDTransformer
 from rl2.tree_attention import TreeAttentionBias, tree_relations
 
@@ -121,32 +120,22 @@ class ASTTransformer(nn.Module):
             PAD is excluded on active rows; rows with no legal actions use
             PAD=0 and all other logits=-inf as a safe batching fallback.
         """
-        sc = ShapeChecker(C=6, D=self.d_model, A=len(AST_ACTIONS))
-        sc.check((initial, target), "BHWC", jnp.int32)
         for size in initial.shape[:3]:
             chex.assert_scalar_positive(size)
         batch = initial.shape[0]
-        sc.check(tree.seq_len, "B", jnp.int32)
-        sc.check(tree[:5], "BN", jnp.int32)
         nodes_count = tree.node_type.shape[1]
         chex.assert_scalar_in(nodes_count, 1, self.max_nodes)
         # Validate before adding the context prefix: -1 would otherwise become
         # a valid zero-length sequence in the shared attention implementation.
         _check_range(tree.seq_len, nodes_count, "seq_len must be between 0 and the AST input length")
         is_hole = tree.is_hole
-        sc.check(is_hole, "BN", jnp.bool_)
-        sc.check(tree.action_mask, "BNA", jnp.bool_)
         scale = jnp.asarray([1, 1, 1, 1, 1, self.max_markers] * 2, jnp.float32)
         pair = jnp.concatenate((initial, target), axis=-1).astype(jnp.float32) / scale
-        sc.check(pair, "BHWP", jnp.float32)
         context = self.context_norm(self.context_projection(pair.reshape(batch, -1)))
-        sc.check(context, "BD", self.dtype)
         # Canonicalize padding before embedding so even dirty padded IDs cannot
         # affect live nodes or index outside an embedding table.
         node_mask = jnp.arange(nodes_count)[None, :] < tree.seq_len[:, None]
-        sc.check(node_mask, "BN", jnp.bool_)
         ids = [jnp.where(node_mask, feature, 0) for feature in tree[:5]]
-        sc.check(ids, "BN", jnp.int32)
         # JAX embedding lookups can wrap negative IDs or yield NaNs for IDs
         # above the table. Check live IDs while permitting arbitrary padding.
         limits = (NUM_NODE_TYPES, len(Field), self.max_depth + 1, 3, len(VALUES) + 1)
@@ -160,23 +149,15 @@ class ASTTransformer(nn.Module):
             + self.value_embedding(ids[4])
             + self.hole_embedding(is_hole.astype(jnp.int32))
         )
-        sc.check(nodes, "BND", self.dtype)
         x = jnp.concatenate((context[:, None], nodes), axis=1)
         x = x + self.position_embedding(jnp.arange(nodes_count + 1, dtype=jnp.int32))[None]
         # Start the shared residual stream in float32, as in the former AST blocks.
         x = x.astype(jnp.float32)
-        sc.check(x, "BTD", jnp.float32)
         lengths = 1 + tree.seq_len
-        sc.check(lengths, "B", jnp.int32)
         relations = tree_relations(tree.depth, tree.seq_len)
-        sc.check(relations, "BTT", jnp.int32)
         biases = tuple(tree_bias(relations) for tree_bias in self.tree_biases)
-        bias_sc = ShapeChecker(B=batch, H=self.num_heads, T=nodes_count + 1)
-        bias_sc.check(biases, "BHTT", jnp.float32)
         x = self.backbone(x, lengths, biases=biases)
-        sc.check(x, "BTD", self.dtype)
         nodes = x[:, 1:]
-        sc.check(nodes, "BND", self.dtype)
         logits = jnp.concatenate(
             (
                 jnp.full((batch, nodes_count, 1), -jnp.inf, jnp.float32),
@@ -185,8 +166,6 @@ class ASTTransformer(nn.Module):
             ),
             axis=-1,
         )
-        sc.check(logits, "BNA", jnp.float32)
         masked = jnp.where(tree.action_mask, logits, -jnp.inf)
         output = masked.at[..., 0].set(jnp.where(tree.action_mask.any(axis=-1), -jnp.inf, 0.0))
-        sc.check(output, "BNA", jnp.float32)
         return output

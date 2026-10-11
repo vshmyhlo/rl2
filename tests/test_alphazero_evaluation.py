@@ -114,13 +114,13 @@ def test_search_uses_acting_network_and_greedy_legal_action(monkeypatch: pytest.
         seen.append(float(value[0]))
         np.testing.assert_array_equal(value, root.value)
         assert num_simulations == 3
-        assert kwargs["temperature"] == kwargs["dirichlet_fraction"] == 0
+        assert kwargs["temperature"] == 0
         np.testing.assert_array_equal(kwargs["invalid_actions"], ~state.legal_action_mask[None])
         # Illegal square 0 has the highest weight; legal square 2 wins the game.
         weights = jnp.array([[100, 0, 10, 0, 0, 0, 0, 0, 0]], jnp.float32)
         return mctx.PolicyOutput(action=jnp.array([8], jnp.int32), action_weights=weights, search_tree=None)
 
-    monkeypatch.setattr(ev.mctx, "muzero_policy", search)
+    monkeypatch.setattr(ev, "puct_policy", search)
     with jax.disable_jit():
         for player, expected_reward in ((state.current_player, 1), (1 - state.current_player, -1)):
             reward, terminated = ev.play_game(
