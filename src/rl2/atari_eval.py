@@ -1,14 +1,17 @@
-"""Full-game Atari evaluation for an in-memory PPO or PPO-RND TrainState.
+"""Full-game Atari evaluation for recurrent agents, including PPO and PPO-RND.
 
 Example (train with atari_preprocessing=True from the outset)::
 
     from dataclasses import replace
-    from rl2.ppo import load_config, train
-    from rl2.atari_eval import EvaluationConfig, evaluate
+    from rl2.ppo import ActorCritic, load_config, train
+    from rl2.atari_eval import EvaluationConfig, TrainStateAgent, evaluate
 
     config = replace(load_config("configs/ppo.yaml"), atari_preprocessing=True)
     state = train(config)
-    result = evaluate(state, config, EvaluationConfig(), output_path="evaluation.json")
+    result = evaluate(
+        TrainStateAgent(state, ActorCritic(1, config.model).initial_carry(1)),
+        config, EvaluationConfig(), output_path="evaluation.json",
+    )
     print(result["return_mean"])
 
 Default: 100 episodes, sticky actions 0.25, 1..30 reset no-ops, action
@@ -42,6 +45,8 @@ Do not select the best evaluation episode/checkpoint or average raw scores
 across different games. This evaluator does not train or update the policy.
 """
 
+from __future__ import annotations
+
 import json
 import math
 from dataclasses import asdict, dataclass
@@ -49,7 +54,7 @@ from functools import partial
 from importlib.metadata import version
 from pathlib import Path
 from time import monotonic
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import ale_py
 import gymnasium as gym
@@ -58,14 +63,56 @@ import jax.numpy as jnp
 import numpy as np
 from flax.training.train_state import TrainState
 
+from rl2 import ppo, ppo_rnd
 from rl2.atari_scores import REFERENCE_SOURCE, get_reference_scores
-from rl2.ppo import Array, AtariPreprocessing, Config, RecurrentCarry, initial_model_carry
-from rl2.ppo_rnd import Config as RNDConfig
-from rl2.ppo_rnd import LSTMCarry, initial_carry
 
 type EvaluationResult = dict[str, Any]
-type TrainingConfig = Config | RNDConfig
-type EvaluationCarry = RecurrentCarry | LSTMCarry
+type TrainingConfig = ppo.Config | ppo_rnd.Config
+
+
+class EvaluationAgent[Carry](Protocol):
+    """Recurrent policy for one environment; Carry is an agent-defined pytree."""
+
+    def initial_carry(self) -> Carry:  # agent-defined memory leaf shapes
+        """Return fresh recurrent memory for one episode."""
+        ...
+
+    def act(
+        self,
+        obs: jax.Array,  # (*O,) observation dimensions O
+        carry: Carry,  # agent-defined memory leaf shapes
+        episode_start: bool,
+        key: jax.Array,  # () typed PRNG key
+        *,
+        greedy: bool,
+    ) -> tuple[jax.Array, Carry]:  # () action; memory leaf shapes unchanged
+        """Return a scalar action ID and advanced recurrent memory."""
+        ...
+
+
+@dataclass(frozen=True)
+class TrainStateAgent[Carry]:
+    """Adapt a frozen PPO step policy or PPO-RND sequence policy for evaluation."""
+
+    state: TrainState
+    carry: Carry  # leaves: (1, ...), backend-specific memory dimensions
+    sequence_policy: bool = False
+
+    def initial_carry(self) -> Carry:  # leaves: (1, ...)
+        return self.carry  # leaves: (1, ...); JAX arrays are immutable
+
+    def act(
+        self,
+        obs: jax.Array,  # (*O,)
+        carry: Carry,  # leaves: (1, ...)
+        episode_start: bool,
+        key: jax.Array,  # () typed PRNG key
+        *,
+        greedy: bool,
+    ) -> tuple[jax.Array, Carry]:  # () action; carry leaves: (1, ...)
+        return _action(
+            self.state, obs, carry, episode_start, key, greedy=greedy, sequence_policy=self.sequence_policy
+        )  # () action; carry leaves: (1, ...)
 
 
 @dataclass(frozen=True)
@@ -174,7 +221,7 @@ def make_evaluation_env(training: TrainingConfig, evaluation: EvaluationConfig) 
         max_episode_steps=-1,  # Disable Gym TimeLimit; ALE counts actual emulator frames.
     )
     try:
-        env = AtariPreprocessing(
+        env = ppo.AtariPreprocessing(
             env,
             noop_max=30,
             frame_skip=4,
@@ -191,30 +238,34 @@ def make_evaluation_env(training: TrainingConfig, evaluation: EvaluationConfig) 
 
 
 @partial(jax.jit, static_argnames=("greedy", "sequence_policy"))
-def _action(
+def _action[Carry](
     state: TrainState,
-    obs: Array,
-    carry: EvaluationCarry,
+    obs: jax.Array,  # (*O,) observation dimensions O
+    carry: Carry,  # leaves: (1, ...), backend-specific memory dimensions
     episode_start: bool,
-    key: jax.Array,
+    key: jax.Array,  # () typed PRNG key
     *,
     greedy: bool,
     sequence_policy: bool = False,
-) -> tuple[jax.Array, EvaluationCarry]:
-    starts = jnp.asarray([episode_start])
+) -> tuple[jax.Array, Carry]:  # () action; carry leaves: (1, ...)
+    starts = jnp.asarray([episode_start])  # (1,)
     if sequence_policy:
         # PPO-RND exposes only a time-major sequence call, with two value heads.
-        carry, logits, _ = state.apply_fn({"params": state.params}, obs[None, None], carry, starts[None])
-        logits = logits[0]
+        carry, logits, _ = state.apply_fn(
+            {"params": state.params}, obs[None, None], carry, starts[None]
+        )  # carry leaves: (1, ...); logits: (1, 1, A); values: (1, 1, 2)
+        logits = logits[0]  # (1, A)
     else:
-        carry, logits, _ = state.apply_fn({"params": state.params}, obs[None], carry, starts, method="step")
-    logits = logits[0]
-    action = jnp.argmax(logits) if greedy else jax.random.categorical(key, logits)
-    return action, carry
+        carry, logits, _ = state.apply_fn(
+            {"params": state.params}, obs[None], carry, starts, method="step"
+        )  # carry leaves: (1, ...); logits: (1, A); values: (1,)
+    logits = logits[0]  # (A,)
+    action = jnp.argmax(logits) if greedy else jax.random.categorical(key, logits)  # ()
+    return action, carry  # () action; carry leaves: (1, ...)
 
 
-def evaluate(
-    state: TrainState,
+def evaluate[Carry](
+    agent: EvaluationAgent[Carry],
     training: TrainingConfig,
     evaluation: EvaluationConfig | None = None,
     *,
@@ -225,7 +276,8 @@ def evaluate(
 ) -> EvaluationResult:
     """Evaluate frozen parameters with fresh environment, RNG, and recurrent state.
 
-    ``training`` must describe the supplied state's actual training setup.
+    ``agent.initial_carry()`` resets recurrent memory for each episode.
+    ``training`` must describe the agent's actual training setup.
     Returns a JSON-compatible report; optionally writes it to ``output_path``.
     Baselines default to the bundled DQN Zoo Atari-57 table when available.
     Optional ``training_scores`` adds the PPO paper's all-training and last-100
@@ -267,28 +319,22 @@ def evaluate(
         game_mode = int(env.unwrapped.ale.cloneState().getCurrentMode())
         for index in range(evaluation.episodes):
             seed = evaluation.seed + index
-            obs, info = env.reset(seed=seed)
+            obs, info = env.reset(seed=seed)  # obs: (*O,)
             reset_frames = int(info["episode_frame_number"])
-            key = jax.random.key(seed)
-            carry = (
-                initial_carry(1, training.lstm_hidden_size)
-                if isinstance(training, RNDConfig)
-                else initial_model_carry(training, 1)
-            )
+            key = jax.random.key(seed)  # () typed PRNG key
+            carry = agent.initial_carry()  # agent-defined memory leaf shapes
             episode_return, agent_steps = 0.0, 0
             terminated, truncated = False, False
             while not (terminated or truncated):
-                key, action_key = jax.random.split(key)
-                action, carry = _action(
-                    state,
-                    obs,
+                key, action_key = jax.random.split(key)  # () typed PRNG keys
+                action, carry = agent.act(
+                    jnp.asarray(obs),  # (*O,)
                     carry,
                     agent_steps == 0,
                     action_key,
                     greedy=evaluation.action_selection == "greedy",
-                    sequence_policy=isinstance(training, RNDConfig),
-                )
-                obs, reward, terminated, truncated, info = env.step(int(action))
+                )  # () action; agent-defined memory leaf shapes
+                obs, reward, terminated, truncated, info = env.step(int(action))  # obs: (*O,)
                 episode_return += float(reward)
                 agent_steps += 1
                 if show_progress and not (terminated or truncated):
@@ -314,7 +360,7 @@ def evaluate(
     finally:
         env.close()
 
-    returns = np.asarray([episode["return"] for episode in episodes], dtype=np.float64)
+    returns = np.asarray([episode["return"] for episode in episodes], dtype=np.float64)  # (E,) evaluation episodes
     std = float(returns.std(ddof=1)) if len(returns) > 1 else None
     # Normalize tuples in either config so the in-memory report matches saved JSON.
     training_metadata = json.loads(json.dumps(asdict(training), allow_nan=False))
@@ -340,7 +386,6 @@ def evaluate(
         },
         "training_config": training_metadata,  # Configured budget, not proof of frames actually trained.
         "training_scores": training_scores.as_report() if training_scores is not None else None,
-        "optimizer_steps": int(state.step),
         "versions": {name: version(name) for name in ("ale-py", "gymnasium", "jax", "flax", "numpy")},
         "return_mean": float(returns.mean()),
         "return_median": float(np.median(returns)),
