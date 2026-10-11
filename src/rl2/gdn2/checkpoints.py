@@ -14,13 +14,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 from rl2.gdn2.model import GatedDeltaNet2Backend, GatedDeltaNet2Config, GatedDeltaNet2LM, gdn2_370m
-from rl2.shape_checker import ShapeChecker
 
 type Parameters = dict[str, Any]
 type StateDict = Mapping[str, np.ndarray]
@@ -110,10 +110,9 @@ def weight_specs(model: GatedDeltaNet2LM) -> tuple[WeightSpec, ...]:
 
 
 def _check_array(array: np.ndarray, shape: tuple[int, ...], name: str) -> None:
-    names = "ABC"[: len(shape)]
-    sc = ShapeChecker(**dict(zip(names, shape, strict=True)))
     try:
-        sc.check(array, names, np.float32)
+        chex.assert_shape(array, shape)
+        chex.assert_type(array, np.float32)
     except AssertionError as error:
         raise ValueError(f"Invalid weight {name}: {error}") from error
     if not np.isfinite(array).all():

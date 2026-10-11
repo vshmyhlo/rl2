@@ -23,6 +23,15 @@ def test_ppo_configs_specify_distinct_run_ids() -> None:
         run_ids.add(config.run_id)
 
 
+def test_ppo_configs_use_second_intervals() -> None:
+    configs = Path(__file__).resolve().parents[1] / "configs"
+    for path in (*configs.glob("ppo*.yaml"), *configs.glob("ppo/atari/*.yaml")):
+        if not path.stem.startswith("ppo_rnd"):
+            config = load_config(path)
+            assert config.video_interval_seconds == 600.0, path
+            assert config.eval_interval_seconds == (0.0 if path.name == "ppo.yaml" else 1800.0), path
+
+
 def test_atari_model_configs_enable_cosine_decay() -> None:
     configs = Path(__file__).resolve().parents[1] / "configs"
     for path in configs.glob("ppo_atari_*.yaml"):

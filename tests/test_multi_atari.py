@@ -147,7 +147,7 @@ def test_ppo_config_selects_the_registered_mixture() -> None:
 
     config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
     assert config.env_id == ENV_ID
-    assert config.eval_every_minutes == 0
+    assert config.eval_interval_seconds == 0
     with make_env(
         config.env_id,
         frame_stack=config.frame_stack,

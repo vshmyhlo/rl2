@@ -1,9 +1,10 @@
 """PPO checkpoint serialization and restart wiring without running an Atari model."""
 
+import json
 import os
 import subprocess
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -18,6 +19,7 @@ from flax.training.train_state import TrainState
 
 from rl2 import ppo
 from rl2.atari_eval import TrainingScores
+from rl2.lstm import initial_carry
 
 
 @pytest.mark.parametrize("use_tf", [None, "true"], ids=["default-gcsfs", "explicit-tensorflow"])
@@ -65,6 +67,7 @@ assert "tensorflow" not in sys.modules
 def config(tmp_path: Path) -> ppo.Config:
     return replace(
         ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        env_id="ALE/Pong-v5",
         log_dir=str(tmp_path),
         run_id="resume-test",
         num_envs=1,
@@ -73,8 +76,8 @@ def config(tmp_path: Path) -> ppo.Config:
         update_epochs=1,
         total_steps=4,
         vector_env="sync",
-        video_every_episodes=0,
-        eval_every_minutes=0,
+        video_interval_seconds=0,
+        eval_interval_seconds=0,
     )
 
 
@@ -91,35 +94,46 @@ def state() -> TrainState:
 
 def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Config, state: TrainState) -> None:
     directory = f"{config.log_dir}/{config.run_id}"
-    rng = np.random.default_rng(12)
-    rng.random(3)
     progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 8, (1.5, -2.0), (3, 7), 12.5)
     with ppo.checkpoint_manager(directory) as manager:
-        assert ppo.restore_checkpoint(manager, state, rng, config) is None
-        ppo.save_checkpoint(manager, progress._replace(iteration=1), rng, config)
+        assert ppo.restore_checkpoint(manager, state, config) is None
+        ppo.save_checkpoint(manager, progress._replace(iteration=1), config)
         manager.wait_until_finished()
-        ppo.save_checkpoint(manager, progress, rng, config)
+        ppo.save_checkpoint(manager, progress, config)
     fresh = state.replace(
         step=0, params=jax.tree.map(jnp.zeros_like, state.params), opt_state=state.tx.init(state.params)
     )
-    restored_rng = np.random.default_rng(99)
     with ppo.checkpoint_manager(directory) as manager:
-        restored = ppo.restore_checkpoint(manager, fresh, restored_rng, replace(config, total_steps=8))
+        metadata = manager.restore(2, args=ppo.ocp.args.Composite(metadata=ppo.ocp.args.JsonRestore())).metadata
+        assert metadata["config"] == json.loads(json.dumps(asdict(config)))
+        restored = ppo.restore_checkpoint(
+            manager,
+            fresh,
+            replace(
+                config,
+                total_steps=8,
+                num_steps=2,
+                log_interval_seconds=15.0,
+                video_interval_seconds=600.0,
+                eval_interval_seconds=1800.0,
+            ),
+        )
         assert restored is not None
         chex.assert_trees_all_equal(restored, progress)
-        np.testing.assert_array_equal(restored_rng.integers(100, size=4), rng.integers(100, size=4))
+        assert metadata["version"] == 2
+        assert "numpy_rng" not in metadata
+        chex.assert_shape(restored.key, ())
+        chex.assert_trees_all_equal(jax.random.permutation(restored.key, 4), jax.random.permutation(progress.key, 4))
         gradients = {"weight": jnp.array([-0.1, 0.2])}
         chex.assert_trees_all_equal(
             restored.state.apply_gradients(grads=gradients), state.apply_gradients(grads=gradients)
         )
-        with pytest.raises(ValueError, match="incompatible.*new run_id"):
-            ppo.restore_checkpoint(manager, fresh, restored_rng, replace(config, num_steps=2))
         # Retention keeps two complete checkpoints, even after a manager restart.
-        ppo.save_checkpoint(manager, progress._replace(iteration=3), rng, config)
+        ppo.save_checkpoint(manager, progress._replace(iteration=3), config)
         manager.wait_until_finished()
         assert manager.all_steps() == [2, 3]
     with ppo.checkpoint_manager(f"{config.log_dir}/different-run") as manager:
-        assert ppo.restore_checkpoint(manager, fresh, restored_rng, config) is None
+        assert ppo.restore_checkpoint(manager, fresh, config) is None
 
 
 def test_legacy_checkpoint_leaves_training_total_unavailable(config: ppo.Config, state: TrainState) -> None:
@@ -130,7 +144,7 @@ def test_legacy_checkpoint_leaves_training_total_unavailable(config: ppo.Config,
         SimpleNamespace(
             metadata={
                 "version": 1,
-                "config": ppo._checkpoint_settings(config),
+                "config": {"env_id": config.env_id},  # Older checkpoints stored only a subset of settings.
                 "iteration": 2,
                 "completed_episodes": 101,
                 "recent_returns": [2.0] * 100,
@@ -140,7 +154,7 @@ def test_legacy_checkpoint_leaves_training_total_unavailable(config: ppo.Config,
         ),
         SimpleNamespace(state={"train_state": state, "key": jax.random.key_data(jax.random.key(3))}),
     ]
-    restored = ppo.restore_checkpoint(manager, state, rng, config)
+    restored = ppo.restore_checkpoint(manager, state, config)
     assert restored is not None
     assert restored.training_return_sum is None
     assert restored.completed_episodes == 101
@@ -174,16 +188,62 @@ def test_checkpoint_paths_preserve_gcs_and_resolve_local(tmp_path: Path, monkeyp
         assert manager.call_args.args[0] == str(tmp_path / "logs/run/checkpoints")
 
 
+@pytest.mark.parametrize("failure", ["manager", "reset", "writer", "logging", "writer_close"])
+def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> None:
+    envs = Mock(single_action_space=ppo.gym.spaces.Discrete(2))
+    envs.reset.return_value = (np.zeros((1, 1), dtype=np.uint8), {})  # observations: (B=1, O=1)
+    manager = Mock()
+    writer = Mock()
+    model = Mock()
+    model.init.return_value = {"params": {}}
+    # Stop before rollout collection, with no real model or optimizer initialization.
+    writer.add_text.side_effect = RuntimeError("logging")
+    if failure == "reset":
+        envs.reset.side_effect = RuntimeError(failure)
+    elif failure == "writer_close":
+        writer.close.side_effect = RuntimeError(failure)
+
+    with (
+        patch.object(ppo, "configure_compilation_cache"),
+        patch.object(ppo.gym.vector, "SyncVectorEnv"),
+        patch.object(ppo, "JaxVectorEnv", return_value=envs),
+        patch.object(ppo, "checkpoint_manager", return_value=manager) as make_manager,
+        patch.object(ppo, "make_model", return_value=model),
+        patch.object(ppo.TrainState, "create"),
+        patch.object(ppo, "restore_checkpoint", return_value=None),
+        patch.object(ppo, "SummaryWriter", return_value=writer) as make_writer,
+    ):
+        if failure == "manager":
+            make_manager.side_effect = RuntimeError(failure)
+        elif failure == "writer":
+            make_writer.side_effect = RuntimeError(failure)
+        with pytest.raises(RuntimeError, match=failure):
+            ppo.train(config)
+
+    envs.close.assert_called_once_with()
+    if failure == "manager":
+        manager.close.assert_not_called()
+    else:
+        manager.close.assert_called_once_with()
+    if failure in ("logging", "writer_close"):
+        writer.close.assert_called_once_with()
+    else:
+        writer.close.assert_not_called()
+
+
 def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> None:
     run_dir = f"{config.log_dir}/{config.run_id}/ALE_Boxing-v5"
-    config = replace(config, env_id="ALE/Boxing-v5", log_dir=config.log_dir + "/${run_id}/${path_name:${env_id}}")
+    path = Path(config.log_dir) / "config.yaml"
+    settings = asdict(config)
+    settings.update(env_id="ALE/Boxing-v5", log_dir=config.log_dir + "/${run_id}/${path_name:${env_id}}")
+    path.write_text(ppo.yaml.safe_dump(settings))
+    config = ppo.load_config(path)
     assert config.checkpoint_interval_seconds == 600.0
     obs = np.zeros((1, 1), dtype=np.uint8)
     zeros = np.zeros(1, dtype=np.float32)
     dones = np.ones(1, dtype=bool)
-    carry = ppo.initial_carry(1, 1)
-    envs = Mock()
-    envs.single_action_space.n = 2
+    carry = initial_carry(1, 1)
+    envs = Mock(spec=ppo.gym.vector.VectorEnv, single_action_space=ppo.gym.spaces.Discrete(2))
     envs.reset.return_value = (obs, {})
     envs.step.return_value = (obs, np.ones(1), dones, ~dones, {})
     model = Mock()
@@ -208,26 +268,31 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
         clock += 599.0 if iteration == 0 else 1.0
         iterations.append(iteration)
         learning_rates.append(float(state.opt_state.hyperparams["learning_rate"]))
-        return state.apply_gradients(grads={"weight": jnp.ones(1)}), (jnp.asarray(0.0),) * 5
+        return state.apply_gradients(grads={"weight": jnp.ones(1)}), ppo.PPOMetrics(
+            policy_loss=jnp.asarray(0.0),  # ()
+            value_loss=jnp.asarray(0.0),  # ()
+            entropy=jnp.asarray(0.0),  # ()
+            approx_kl=jnp.asarray(0.0),  # ()
+            clip_fraction=jnp.asarray(0.0),  # ()
+        )
 
     original_save = ppo.save_checkpoint
 
     def record_save(
         manager: ppo.ocp.CheckpointManager,
         progress: ppo.TrainingProgress,
-        rng: np.random.Generator,
         config: ppo.Config,
     ) -> None:
         saved_iterations.append(progress.iteration)
         saved_return_sums.append(progress.training_return_sum)
         saved_recent_returns.append(progress.recent_returns)
-        original_save(manager, progress, rng, config)
+        original_save(manager, progress, config)
 
     with (
         patch.object(ppo.gym.vector, "SyncVectorEnv", return_value=envs),
         patch.object(ppo, "make_model", return_value=model),
         patch.object(ppo, "SummaryWriter") as writer,
-        patch.object(ppo, "act", return_value=(np.zeros(1, dtype=np.int32), zeros, zeros, carry)),
+        patch.object(ppo, "act", return_value=(jnp.zeros(1, dtype=jnp.int32), zeros, zeros, carry)),
         patch.object(ppo, "value", return_value=zeros),
         patch.object(ppo, "update", side_effect=update),
         patch.object(ppo, "monotonic", side_effect=lambda: clock + 0.01),
@@ -249,18 +314,18 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
         episode_logs = [
             c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/total_episodes"
         ]
-        assert episode_logs == [(3.0, 3), (4.0, 4)]
+        assert episode_logs == [(4.0, 4)]
         return_logs = [
             c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/return_mean"
         ]
-        assert return_logs == [(1.0, 3), (1.0, 4)]
+        assert return_logs == [(1.0, 4)]
         sps = [
             c.args[1] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/steps_per_second"
         ]
-        assert sps == [1.0, 1.0]
+        assert sps == [1.0]
         for tag, expected in (
-            ("time/elapsed_seconds", [(1.0, 3), (2.0, 4)]),
-            ("time/eta_seconds", [(1.0, 3), (0.0, 4)]),
+            ("time/elapsed_seconds", [(2.0, 4)]),
+            ("time/eta_seconds", [(0.0, 4)]),
         ):
             logged = [c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == tag]
             assert logged == expected

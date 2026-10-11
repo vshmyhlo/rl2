@@ -12,6 +12,7 @@ import numpy as np
 import optax
 import pytest
 from flax.training.train_state import TrainState
+from pydantic import ValidationError
 
 from rl2 import ppo, ppo_rnd
 from rl2.atari_eval import EvaluationConfig, ScoreBaselines, TrainingScores, _action, evaluate, make_evaluation_env
@@ -305,20 +306,39 @@ def test_cleanup_on_policy_failure() -> None:
 @pytest.mark.parametrize(
     "overrides",
     (
-        {"eval_every_minutes": -1},
-        {"eval_every_minutes": float("nan")},
-        {"eval_every_minutes": float("inf")},
-        {"eval_every_minutes": "10"},
-        {"eval_every_minutes": 100, "atari_preprocessing": False},
-        {"eval_every_minutes": 100, "eval_episodes": 0},
-        {"eval_every_minutes": 100, "eval_seed": -1},
+        {"eval_interval_seconds": -1},
+        {"eval_interval_seconds": float("nan")},
+        {"eval_interval_seconds": float("inf")},
+        {"eval_interval_seconds": "10"},
+        {"eval_interval_seconds": 100, "atari_preprocessing": False},
+        {"eval_interval_seconds": 100, "observation_size": 42},
+        {"eval_interval_seconds": 100, "env_id": "rl2/MultiAtari-v0"},
+        {"eval_interval_seconds": 100, "eval_episodes": 0},
+        {"eval_interval_seconds": 100, "eval_seed": -1},
+        {"eval_interval_seconds": 100, "eval_seed": 2**32 - 1, "eval_episodes": 2},
     ),
 )
-def test_training_rejects_invalid_evaluation_before_creating_environments(overrides: dict[str, Any]) -> None:
-    with patch("rl2.ppo.gym.vector.AsyncVectorEnv") as envs:
-        with pytest.raises(ValueError):
-            ppo.train(replace(training_config(), **overrides))
-        envs.assert_not_called()
+def test_training_config_rejects_invalid_evaluation(overrides: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        replace(training_config(), **overrides)
+
+
+def test_training_config_accepts_evaluation_seed_boundary() -> None:
+    config = replace(training_config(), eval_interval_seconds=100, eval_episodes=2, eval_seed=2**32 - 2)
+    assert config.eval_seed + config.eval_episodes == 2**32
+
+
+def test_training_config_skips_disabled_evaluation_validation() -> None:
+    config = replace(
+        training_config(),
+        eval_interval_seconds=0,
+        atari_preprocessing=False,
+        observation_size=42,
+        env_id="rl2/MultiAtari-v0",
+        eval_episodes=0,
+        eval_seed=-1,
+    )
+    assert config.eval_interval_seconds == 0
 
 
 @pytest.mark.parametrize(

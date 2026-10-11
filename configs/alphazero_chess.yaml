@@ -4,7 +4,7 @@ env_id: chess
 seed: 0
 iterations: 10000 # Up to 1.28M games and 640K optimizer updates
 num_envs: 128 # Independent games searched together; reduce first if memory is tight
-max_moves: 512 # Plies (half-moves); unfinished games contribute policy targets only
+max_moves: 512 # Plies (half-moves); self-play games still active at the limit are draws
 num_simulations: 256 # Search budget per position; increase after measuring self-play throughput
 model:
   channels: 128

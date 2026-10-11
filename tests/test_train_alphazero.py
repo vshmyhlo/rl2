@@ -101,26 +101,37 @@ def test_masked_logits() -> None:
     assert np.isfinite(probs).all()
 
 
-def test_outcomes_use_player_ids_and_exclude_unfinished_games(
+def test_outcomes_use_player_ids_and_adjudicate_move_limit_draws(
     tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Parameters], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env, model, params = tiny_model
-    config = az.Config(num_envs=3, max_moves=3)
-    # Columns: win by player 1, draw, unfinished. The last row is padding.
+    config = az.Config(num_envs=4, max_moves=3)
+    # Columns: win on the last allowed move, natural draw, move limit, env truncation.
+    # Only the natural draw and env truncation have padding in the last row.
     # T: recorded time steps; B: games; P: players; A: actions.
-    players = jnp.array([[1, 0, 0], [0, 1, 1], [1, 0, 0]], jnp.int32)  # (T, B)
-    valid = jnp.array([[True] * 3, [True] * 3, [False] * 3])  # (T, B)
-    rewards = jnp.array([[-1, 1], [0, 0], [1, -1]], jnp.float32)  # (B, P)
-    states = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 3))
-    states = states.replace(rewards=rewards, terminated=jnp.array([True, True, False]))
-    observations = jnp.zeros((3, 3, *states.observation.shape[1:]))  # (T, B, 3, 3, 2)
-    policies = jnp.full((3, 3, env.num_actions), 1 / env.num_actions)  # (T, B, A)
+    players = jnp.array([[1, 0, 0, 0], [0, 1, 1, 1], [1, 0, 0, 0]], jnp.int32)  # (T, B)
+    valid = jnp.array([[True] * 4, [True] * 4, [True, False, True, False]])  # (T, B)
+    # Nonterminal rewards must not leak into draw targets or masked targets.
+    rewards = jnp.array([[-1, 1], [0, 0], [1, -1], [1, -1]], jnp.float32)  # (B, P)
+    states = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 4))  # Leaves: (B, ...)
+    states = states.replace(
+        rewards=rewards,  # (B, P)
+        terminated=jnp.array([True, True, False, False]),  # (B,)
+        truncated=jnp.array([False, False, False, True]),  # (B,)
+    )
+    observations = jnp.zeros((3, 4, *states.observation.shape[1:]))  # (T, B, 3, 3, 2)
+    policies = jnp.full((3, 4, env.num_actions), 1 / env.num_actions)  # (T, B, A)
     monkeypatch.setattr(jax.lax, "scan", Mock(return_value=(states, (observations, policies, players, valid))))
     batch, metrics = az.collect_selfplay.__wrapped__(params, jax.random.PRNGKey(0), env=env, model=model, config=config)
-    chex.assert_shape((batch.value_targets, batch.value_mask), (9,))
-    np.testing.assert_array_equal(batch.value_targets, [1, 0, 0, -1, 0, 0, 0, 0, 0])
-    np.testing.assert_array_equal(batch.value_mask, [True, True, False, True, True, False, False, False, False])
-    assert metrics["value_positions"] == 4
+    chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (12,))
+    np.testing.assert_array_equal(batch.value_targets, [1, 0, 0, 0, -1, 0, 0, 0, 1, 0, 0, 0])
+    np.testing.assert_array_equal(
+        batch.value_mask, [True, True, True, False, True, True, True, False, True, False, True, False]
+    )
+    np.testing.assert_array_equal(batch.policy_mask, valid.reshape(-1))
+    assert metrics["value_positions"] == 8
+    assert metrics["positions"] == 10
+    assert metrics["completed_games"] == 3
 
 
 def test_recurrent_step_terminal_reward_and_opponent_discount(
@@ -190,7 +201,7 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
         np.any(np.asarray(before) != np.asarray(after))
         for before, after in zip(jax.tree.leaves(params), jax.tree.leaves(updated.params), strict=True)
     )
-    # An unresolved game must not teach a draw; masked losses have zero gradient.
+    # Padding must not train either head; masked losses have zero gradient.
     empty = batch.replace(policy_mask=jnp.zeros(size, bool), value_mask=jnp.zeros(size, bool))
     (loss, _), grads = jax.value_and_grad(az.loss_fn, has_aux=True)(params, model, empty)
     assert loss == 0
@@ -201,15 +212,19 @@ def test_chess_search_smoke() -> None:
     env = pgx.make("chess")
     config = az.Config(num_envs=1, max_moves=1, num_simulations=1, model=ModelConfig(channels=4, num_blocks=1))
     model = az.PolicyValueNet(env.num_actions, channels=4, num_blocks=1)
-    observation = env.init(jax.random.PRNGKey(0)).observation[None]
+    observation = env.init(jax.random.PRNGKey(0)).observation[None]  # (1, 8, 8, 119)
     params = model.init(jax.random.PRNGKey(0), observation)["params"]
     batch, metrics = az.collect_selfplay(params, jax.random.PRNGKey(0), env=env, model=model, config=config)
     assert batch.observations.shape == (1, *observation.shape[1:])
     assert batch.policy_targets.shape == (1, 4672)
     assert metrics["positions"] == 1
-    assert metrics["completed_games"] == 0
-    assert not batch.value_mask.any()
-    legal = env.init(jax.random.PRNGKey(0)).legal_action_mask
+    chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (1,))
+    assert metrics["completed_games"] == 1
+    assert metrics["value_positions"] == 1
+    assert batch.value_mask.all()
+    assert batch.policy_mask.all()
+    np.testing.assert_array_equal(batch.value_targets, [0.0])
+    legal = env.init(jax.random.PRNGKey(0)).legal_action_mask  # (4672,)
     assert np.all(np.asarray(batch.policy_targets[0])[~np.asarray(legal)] == 0)
     np.testing.assert_allclose(batch.policy_targets.sum(), 1.0)
 

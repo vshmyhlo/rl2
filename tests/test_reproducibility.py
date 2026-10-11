@@ -39,14 +39,15 @@ def test_seeded_policy_and_update_are_reproducible() -> None:
     chex.assert_trees_all_equal((action, log_prob, values, memory), ppo.act(repeated, obs, carry, starts, key))
     _, logits, _ = model.apply({"params": first.params}, obs[None], carry, starts[None])
     np.testing.assert_array_equal(action, jax.random.categorical(key, logits[0]))
-    batch = (
-        obs[None],
-        action[None],
-        log_prob[None],
-        jnp.array([[1.0, -1.0]]),
-        values[None] + 1,
-        carry,
-        starts[None],
+    batch = ppo.PPOBatch(
+        observations=obs[None],  # (*S, *O)
+        actions=action[None],  # (*S,)
+        old_log_probs=log_prob[None],  # (*S,)
+        values=values[None],  # (*S,)
+        advantages=jnp.array([[1.0, -1.0]]),  # (*S,)
+        returns=values[None] + 1,  # (*S,)
+        carry=carry,  # leaves: (B, ...)
+        episode_starts=starts[None],  # (*S,)
     )
     updated, metrics = ppo.update(first, batch, config)
     replayed, replayed_metrics = ppo.update(repeated, batch, config)
