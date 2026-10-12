@@ -436,7 +436,8 @@ def test_checkpoint_validates_kinetix_settings(config: ppo.Config, state: TrainS
 def test_checkpoint_validates_optional_environment_settings(
     config: ppo.Config, state: TrainState, name: str, env_id: str
 ) -> None:
-    config = replace(config, env_id=env_id)
+    encoder = ppo.XMiniGridEncoderConfig() if name == "xminigrid" else ppo.RGBEncoderConfig()
+    config = replace(config, env_id=env_id, model=replace(config.model, encoder=encoder))
     manager = Mock()
     progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 0)
     ppo.save_checkpoint(manager, progress, config)

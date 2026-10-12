@@ -9,7 +9,7 @@ import optax
 import pytest
 from flax import linen as nn
 
-from rl2.observation_encoder import ConvObservationEncoder, ConvStage
+from rl2.model.encoders.rgb import ConvObservationEncoder, ConvStage
 from rl2.wm import (
     LSTMWorldModel,
     MambaWorldModel,

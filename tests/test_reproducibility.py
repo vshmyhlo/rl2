@@ -11,14 +11,14 @@ import optax
 from flax.training.train_state import TrainState
 
 from rl2 import ppo
-from rl2.observation_encoder import ConvStage
+from rl2.model.encoders.rgb import ConvStage
 
 
 def test_seeded_policy_and_update_are_reproducible() -> None:
     model = ppo.ActorCritic(
         3,
         ppo.ModelConfig(
-            encoder=ppo.EncoderConfig(stages=(ConvStage(2, blocks=1),), embedding_size=4),
+            encoder=ppo.RGBEncoderConfig(stages=(ConvStage(2, blocks=1),), embedding_size=4),
             recurrent=ppo.LSTMConfig(hidden_size=4),
         ),
     )

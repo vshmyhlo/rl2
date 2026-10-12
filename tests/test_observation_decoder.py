@@ -7,8 +7,8 @@ import numpy as np
 import optax
 import pytest
 
+from rl2.model.encoders.rgb import DEFAULT_STAGES, ConvObservationEncoder, ConvStage
 from rl2.observation_decoder import ConvObservationDecoder
-from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStage
 
 
 def test_decoder_mirrors_configurable_stage_shapes() -> None:

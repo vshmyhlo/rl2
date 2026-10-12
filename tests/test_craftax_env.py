@@ -1,3 +1,4 @@
+from operator import itemgetter
 from typing import NamedTuple
 
 import chex
@@ -22,6 +23,9 @@ class State(NamedTuple):
 
 
 class Game:
+    def get_obs(self, state: State) -> jax.Array:  # scalar state leaves -> (H=2, W=3, 3)
+        return jnp.full((2, 3, 3), state.color)  # (H, W, 3)
+
     def reset(self, key: jax.Array, params: Params) -> tuple[jax.Array, State]:  # key: ()
         color = jax.random.uniform(key)  # ()
         return jnp.full((2, 3, 3), color), State(jnp.array(0), jnp.array(False), color)  # (H,W,3); scalar leaves
@@ -71,6 +75,9 @@ def test_terminal_timeout_both_and_partial_autoreset() -> None:
     np.testing.assert_array_equal(info["truncated"], [False, True, True, False])
     np.testing.assert_array_equal(done, [True, True, True, False])
     np.testing.assert_array_equal(next_state.timestep, [0, 0, 0, 1])
+    np.testing.assert_array_equal(info["final_state"].timestep, [1, 2, 2, 1])
+    final = jax.tree.map(itemgetter(0), info["final_state"])  # scalar state leaves
+    np.testing.assert_array_equal(env.render(final), env.render_observation(info["final_observation"][0]))
     np.testing.assert_array_equal(rewards, [0.25] * 4)
     assert next_observations.shape == info["final_observation"].shape == (4, 3, 2, 3)
     reset_keys = jax.vmap(jax.random.split)(jax.random.split(key, 4))[:, 1]  # (B,) typed keys
@@ -111,5 +118,6 @@ def test_real_craftax_reset_step_and_video(env_id: str, shape: tuple[int, ...], 
     np.testing.assert_array_equal(info["truncated"], True)
     np.testing.assert_array_equal(next_state.timestep, 0)
     assert np.isfinite(rewards).all()
-    frame = env.render_observation(info["final_observation"])  # (H,W,3)
+    frame = env.render(info["final_state"])  # (H,W,3)
+    np.testing.assert_array_equal(frame, env.render_observation(info["final_observation"]))
     assert frame.shape == (*shape[-2:], 3) and frame.dtype == jnp.uint8

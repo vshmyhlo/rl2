@@ -8,7 +8,7 @@ import numpy as np
 import optax
 import pytest
 
-from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages, ResidualBlock
+from rl2.model.encoders.rgb import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages, ResidualBlock
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])

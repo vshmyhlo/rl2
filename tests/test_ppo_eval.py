@@ -12,7 +12,6 @@ from flax.training.train_state import TrainState
 
 from rl2 import ppo
 from rl2.envs.gymnax_env import GymnaxEnv
-from rl2.training_scores import TrainingScores
 
 
 def policy(
@@ -53,6 +52,30 @@ def test_episode_frame_limits(frame_limit: int | None, stop: bool, expected_leng
     assert all(frame.shape == (160, 160, 3) and frame.dtype == np.uint8 for frame in frames)
 
 
+@pytest.mark.parametrize("record", [True, False])
+def test_episode_renders_state_before_autoreset(record: bool) -> None:
+    config = ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
+    observation = jnp.zeros((4, 2, 2), jnp.uint8)  # (C, H, W)
+    initial, final, reset = {"frame": 10}, {"frame": 20}, {"frame": 30}
+    env = Mock()
+    env.reset.return_value = observation, initial
+    env.step.return_value = observation, reset, jnp.asarray(1.0), jnp.asarray(True), {"final_state": final}
+    env.render.side_effect = [np.full((3, 5, 3), pixel, np.uint8) for pixel in (10, 20)]  # each (P, Q, 3)
+    state = TrainState.create(apply_fn=policy, params={}, tx=optax.sgd(0.1))
+    carry = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
+        1
+    )  # leaves: (1,1)
+    score, length, frames = ppo.play_episode(state, config, jax.random.key(0), carry, record=record, env=env)
+    assert (score, length) == (1.0, 1)
+    if record:
+        assert [call.args[0] for call in env.render.call_args_list] == [initial, final]
+        assert len(frames) == 2 and all(frame.shape == (3, 5, 3) for frame in frames)
+        np.testing.assert_array_equal(frames[-1], 20)
+    else:
+        assert frames == []
+        env.render.assert_not_called()
+
+
 def test_evaluation_logs_raw_scores_and_independent_seeds() -> None:
     config = replace(ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), eval_episodes=2)
     writer = Mock()
@@ -61,9 +84,8 @@ def test_evaluation_logs_raw_scores_and_independent_seeds() -> None:
         1
     )  # leaves: (1,1)
     frame = np.zeros((2, 2, 3), np.uint8)  # (H,W,3)
-    scores = TrainingScores(1, 4.0, length_sum=2)
     with patch.object(ppo, "play_episode", side_effect=[(2.0, 3, []), (4.0, 5, [frame])]) as play:
-        ppo.log_evaluation(state, config, writer, 1, 128, initial_carry=carry, training_scores=scores)
+        ppo.log_evaluation(state, config, writer, 1, 128, initial_carry=carry)
     for index, call in enumerate(play.call_args_list):
         np.testing.assert_array_equal(
             jax.random.key_data(call.args[2]),
@@ -75,7 +97,8 @@ def test_evaluation_logs_raw_scores_and_independent_seeds() -> None:
     assert scalars["eval/return_mean"] == 3
     assert scalars["eval/return_std"] == pytest.approx(2**0.5)
     assert scalars["eval/return_sem"] == pytest.approx(1.0)
-    assert scalars["training/total_return_mean"] == 4
+    assert scalars["eval/total_training_episodes"] == 1
+    assert not any(tag.startswith("training/") for tag in scalars)
     assert not any("last_100" in tag for tag in scalars)
     assert "eval/human_normalized_score_percent" not in scalars
     report = json.loads(writer.add_text.call_args.args[1].removeprefix("```json\n").removesuffix("\n```"))

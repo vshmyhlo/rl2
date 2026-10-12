@@ -11,7 +11,7 @@ from flax.training.train_state import TrainState
 
 from rl2 import ppo
 from rl2.envs.gymnax_env import GymnaxEnv
-from rl2.observation_encoder import ConvStage
+from rl2.model.encoders.rgb import ConvStage
 
 
 def policy(
@@ -52,7 +52,7 @@ def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs:
         observations,
         memory,
         jnp.ones(num_envs, bool),
-        jnp.zeros(num_envs),
+        jnp.arange(1, num_envs + 1, dtype=jnp.float32),  # (B,) returns carried into this rollout
         jnp.zeros(num_envs, jnp.int32),
     )
     state = TrainState.create(apply_fn=policy, params={}, tx=optax.sgd(0.1))
@@ -71,7 +71,9 @@ def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs:
         # No brick hits within two steps. All boundaries here are timeouts.
         expected_count = num_envs * ((num_steps + (0 if result is rollout else num_steps % 2)) // 2)
         assert int(result.completed_count) == expected_count
-        assert float(result.completed_return_sum) == 0
+        completes_initial_episodes = (result is rollout) == (num_steps > 1)
+        expected_return = num_envs * (num_envs + 1) / 2 if completes_initial_episodes else 0
+        assert float(result.completed_return_sum) == expected_return
         assert int(result.completed_length_sum) == 2 * expected_count
         expected_key = key if result is rollout else rollout.key  # ()
         for _ in range(num_steps):
@@ -96,7 +98,7 @@ def test_rollout_and_update_with_real_breakout_model() -> None:
         bf16=False,
         target_kl=None,
         model=ppo.ModelConfig(
-            encoder=ppo.EncoderConfig(stages=(ConvStage(2, blocks=0),), embedding_size=2),
+            encoder=ppo.RGBEncoderConfig(stages=(ConvStage(2, blocks=0),), embedding_size=2),
             recurrent=ppo.LSTMConfig(hidden_size=2),
         ),
     )

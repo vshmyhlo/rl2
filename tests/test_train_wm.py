@@ -17,7 +17,7 @@ from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 
 from rl2 import train_wm
-from rl2.observation_encoder import ConvStage
+from rl2.model.encoders.rgb import ConvStage
 from rl2.wm import LSTMWorldModel, MambaWorldModel, WorldModelState, categorical_kl
 
 

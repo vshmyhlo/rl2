@@ -1,4 +1,4 @@
-"""Recurrent PPO for JAX-native pixel environments with a CNN and LSTM backbone.
+"""Recurrent PPO for JAX-native environments with spatial encoders and an LSTM.
 
 TensorBoard outputs use training environment steps as the global step.
 Metric names use total_ for all-training statistics and episodes for episode
@@ -50,7 +50,7 @@ Text:
 
 Video/images:
     gameplay: RGB gameplay from a separate episode under the current policy,
-        recorded with add_video and stored as an animated GIF image summary.
+        rendered from environment state, recorded with add_video, and stored as an animated GIF image summary.
         Recording ends at episode termination/truncation or video_max_frames
         (default: 900; None removes the frame cap). Playback uses video_speed
         and a playback rate of 10 environment steps per second.
@@ -89,7 +89,7 @@ from math import sqrt
 from operator import itemgetter
 from pathlib import Path
 from time import monotonic
-from typing import Annotated, Literal, NamedTuple, Self
+from typing import Annotated, Any, Literal, NamedTuple, Self
 
 # Orbax's epath otherwise loads TensorFlow for gs:// paths when it is installed.
 # That native runtime can crash a later Triton import; use our gcsfs dependency.
@@ -114,18 +114,19 @@ from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
 from rl2.configuration import load_settings
+from rl2.envs.base import BaseEnv
 from rl2.envs.craftax_env import CraftaxConfig, CraftaxEnv
 from rl2.envs.gymnax_env import GymnaxEnv
 from rl2.envs.kinetix_env import KinetixConfig, KinetixEnv
 from rl2.envs.xminigrid_env import XMiniGridConfig, XMiniGridEnv
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
-from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
+from rl2.model.encoders.rgb import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
+from rl2.model.encoders.xminigrid import XMiniGridEncoder
 from rl2.utils import explained_variance, gae
-from rl2.xminigrid_encoder import XMiniGridEncoder
 
 type RecurrentCarry = LSTMStackCarry
-type PPOEnv = GymnaxEnv | KinetixEnv | XMiniGridEnv | CraftaxEnv
+type PPOEnv = BaseEnv[Any, Any]
 
 
 @struct.dataclass
@@ -282,6 +283,8 @@ class Config:
     def validate_rollout(self) -> Self:
         if self.model.encoder.type == "xminigrid" and self.env_id != "XLand-MiniGrid":
             raise ValueError("xminigrid encoder requires env_id: XLand-MiniGrid")
+        if self.env_id == "XLand-MiniGrid" and self.model.encoder.type != "xminigrid":
+            raise ValueError("XLand-MiniGrid requires model.encoder.type: xminigrid")
         if self.env_id != "Kinetix" and self.kinetix != KinetixConfig():
             raise ValueError("kinetix settings require env_id: Kinetix")
         if self.env_id != "XLand-MiniGrid" and self.xminigrid != XMiniGridConfig():
@@ -299,7 +302,7 @@ def make_env(config: Config) -> PPOEnv:
     if config.env_id == "Kinetix":
         return KinetixEnv(config.kinetix)
     if config.env_id == "XLand-MiniGrid":
-        return XMiniGridEnv(config.xminigrid, rgb=config.model.encoder.type == "rgb")
+        return XMiniGridEnv(config.xminigrid)
     if config.env_id == "Craftax":
         return CraftaxEnv(config.craftax)
     return GymnaxEnv(config.env_id)
@@ -564,7 +567,7 @@ def play_episode(
     memory = initial_carry  # leaves: (1, ...)
     frames: list[NDArray[uint8]] = []  # entries: (H, W, 3)
     if record:
-        frames.append(np.asarray(env.render_observation(observation)))
+        frames.append(np.asarray(env.render(env_state)))
     episode_return = 0.0
     length = 0
     while not (stop_at_frame_limit and config.video_max_frames is not None and len(frames) >= config.video_max_frames):
@@ -577,7 +580,7 @@ def play_episode(
         episode_return += float(reward)
         length += 1
         if record and (config.video_max_frames is None or len(frames) < config.video_max_frames):
-            frames.append(np.asarray(env.render_observation(info["final_observation"])))
+            frames.append(np.asarray(env.render(info["final_state"])))
         if bool(done):
             break
     return episode_return, length, frames

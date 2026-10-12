@@ -11,14 +11,17 @@ num_envs: 32
 num_steps: 128
 num_minibatches: 4
 update_epochs: 4
-encoder_stages:
-  - { channels: 32, blocks: 1, resize_factor: 0.5 }
-  - { channels: 64, blocks: 1, resize_factor: 0.5 }
-  - { channels: 128, blocks: 1, resize_factor: 0.5 }
-  - { channels: 128, blocks: 1, resize_factor: 0.5 }
 model:
-  type: lstm
-  hidden_size: 256
+  encoder:
+    type: xminigrid # Native tile/color IDs; no pixel rendering during rollouts
+    token_size: 32
+    channels: 64
+    blocks: 2
+    embedding_size: 256
+  recurrent:
+    type: lstm
+    hidden_size: 256
+    num_layers: 4
 bf16: true
 learning_rate: 0.00025
 anneal_lr: true
@@ -32,7 +35,7 @@ entropy_decay: constant
 value_coef: 0.5
 max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/ppo/${run_id}
-run_id: ppo_${path_name:${env_id}}
+run_id: ppo_${path_name:${env_id}}_4
 # All intervals count completed PPO iterations (one rollout and its updates).
 log_interval: 10
 video_interval: 100

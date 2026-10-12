@@ -1,4 +1,5 @@
 from dataclasses import replace
+from operator import itemgetter
 from pathlib import Path
 from typing import NamedTuple
 
@@ -13,7 +14,7 @@ from flax.training.train_state import TrainState
 
 from rl2 import ppo
 from rl2.envs.kinetix_env import KinetixConfig, KinetixEnv, encode_pixels
-from rl2.observation_encoder import ConvStage
+from rl2.model.encoders.rgb import ConvStage
 
 
 class Pixels(NamedTuple):
@@ -93,6 +94,9 @@ def test_termination_timeout_and_partial_autoreset() -> None:
     np.testing.assert_array_equal(info["truncated"], [False, True, True, False])
     np.testing.assert_array_equal(done, [True, True, True, False])
     np.testing.assert_array_equal(next_state.timestep, [0, 0, 0, 1])
+    np.testing.assert_array_equal(info["final_state"].timestep, [1, 2, 2, 1])
+    final = jax.tree.map(itemgetter(0), info["final_state"])  # scalar state leaves
+    np.testing.assert_array_equal(env.render(final), env.render_observation(info["final_observation"][0]))
     np.testing.assert_array_equal(rewards, np.full(4, 0.25))
     assert next_observations.shape == info["final_observation"].shape == (4, 3, 2, 3)
     reset_keys = jax.vmap(jax.random.split)(jax.random.split(key, 4))[:, 1]  # (B,) typed keys
@@ -126,7 +130,7 @@ def test_real_kinetix_rollout_update_and_video() -> None:
         bf16=False,
         kinetix=KinetixConfig(levels=("s/h4_thrust_aim.json",), max_steps=2),
         model=ppo.ModelConfig(
-            encoder=ppo.EncoderConfig(stages=(ConvStage(2, blocks=0, resize_factor=0.0625),), embedding_size=2),
+            encoder=ppo.RGBEncoderConfig(stages=(ConvStage(2, blocks=0, resize_factor=0.0625),), embedding_size=2),
             recurrent=ppo.LSTMConfig(hidden_size=2),
         ),
     )

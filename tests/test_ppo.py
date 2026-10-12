@@ -17,7 +17,7 @@ from pydantic import ValidationError
 
 from rl2 import ppo
 from rl2.lstm import initial_carry
-from rl2.observation_encoder import ConvStage
+from rl2.model.encoders.rgb import ConvStage
 from rl2.ppo import (
     ActorCritic,
     action_log_prob,
@@ -31,7 +31,7 @@ from rl2.ppo import (
 
 def small_model_config() -> ppo.ModelConfig:
     return ppo.ModelConfig(
-        encoder=ppo.EncoderConfig(stages=(ConvStage(4, blocks=1),), embedding_size=8),
+        encoder=ppo.RGBEncoderConfig(stages=(ConvStage(4, blocks=1),), embedding_size=8),
         recurrent=ppo.LSTMConfig(hidden_size=8, num_layers=2, intermediate_size=8),
     )
 
@@ -61,44 +61,59 @@ def test_default_model_parameter_budget_and_rgb_shapes() -> None:
     assert step_final[0][0].shape == final[0][0].shape
 
 
-def test_clipped_policy_loss_and_gradient_direction() -> None:
+@pytest.mark.parametrize("shape", [(2, 2), (4,)], ids=["recurrent", "step"])
+def test_clipped_policy_loss_and_gradient_direction(shape: tuple[int, ...]) -> None:
     config = replace(
         load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
         target_kl=None,
         entropy_coef=0.0,
-        value_coef=0.0,
+        value_coef=0.5,
     )
-    probabilities = np.array([0.25, 0.75, 0.75, 0.25], dtype=np.float32).reshape(2, 2)
-    logits = jnp.log(jnp.stack((probabilities, 1 - probabilities), axis=-1))
+    probabilities = np.array([0.25, 0.75, 0.75, 0.25], dtype=np.float32).reshape(shape)  # (*S,)
+    logits = jnp.log(jnp.stack((probabilities, 1 - probabilities), axis=-1))  # (*S, A)
+
+    def apply(
+        variables: optax.Params,  # logits: (*S, A); values: (*S,)
+        obs: jax.Array,  # (*S, 1)
+        carry: ppo.RecurrentCarry,  # leaves: (B, 1)
+        starts: jax.Array,  # (*S,)
+    ) -> tuple[ppo.RecurrentCarry, jax.Array, jax.Array]:
+        return carry, variables["params"]["logits"], variables["params"]["values"]  # leaves: (B, 1); (*S, A); (*S,)
+
     state = TrainState.create(
-        apply_fn=lambda variables, obs, carry, starts: (carry, variables["params"]["logits"], jnp.zeros((2, 2))),
-        params={"logits": logits},
+        apply_fn=apply,
+        params={"logits": logits, "values": jnp.zeros(shape)},  # (*S, A); (*S,)
         tx=optax.sgd(0.1),
     )
-    advantages = np.array([[-3.0, -1.0], [1.0, 3.0]])
+    advantages = jnp.array([-3.0, -1.0, 1.0, 3.0]).reshape(shape)  # (*S,)
+    returns = jnp.array([-1.0, 0.0, 1.0, 2.0]).reshape(shape)  # (*S,)
     batch = ppo.PPOBatch(
-        observations=jnp.zeros((2, 2, 1)),  # (*S, *O)
-        actions=jnp.zeros((2, 2), dtype=jnp.int32),  # (*S,)
-        old_log_probs=jnp.full((2, 2), np.log(0.5)),  # (*S,)
-        values=jnp.zeros((2, 2)),  # (*S,)
+        observations=jnp.zeros((*shape, 1)),  # (*S, *O)
+        actions=jnp.zeros(shape, dtype=jnp.int32),  # (*S,)
+        old_log_probs=jnp.full(shape, np.log(0.5)),  # (*S,)
+        values=jnp.zeros(shape),  # (*S,)
         advantages=advantages,  # (*S,)
-        returns=jnp.ones((2, 2)),  # (*S,)
-        carry=initial_carry(2, 1),  # leaves: (B, ...)
-        episode_starts=jnp.zeros((2, 2), dtype=bool),  # (*S,)
+        returns=returns,  # (*S,)
+        carry=initial_carry(shape[-1], 1),  # leaves: (B, ...)
+        episode_starts=jnp.zeros(shape, dtype=bool),  # (*S,)
     )
     updated, metrics = update(state, batch, config)
     assert isinstance(metrics, ppo.PPOMetrics)
     chex.assert_shape(jax.tree.leaves(metrics), ())
-    normalized = advantages / advantages.std()
-    ratio = probabilities / 0.5
+    normalized = advantages / advantages.std()  # (*S,)
+    ratio = probabilities / 0.5  # (*S,)
     expected = -np.minimum(
         ratio * normalized, np.clip(ratio, 1 - config.clip_coef, 1 + config.clip_coef) * normalized
-    ).mean()
+    ).mean()  # ()
     assert float(metrics.policy_loss) == pytest.approx(expected, rel=0, abs=5e-07)
-    assert float(metrics.value_loss) == pytest.approx(0.5, rel=0, abs=5e-07)
-    np.testing.assert_array_equal(updated.params["logits"][:, 0], logits[:, 0])  # Both clipped signs.
-    assert float(updated.params["logits"][0, 1, 0]) < float(logits[0, 1, 0])
-    assert float(updated.params["logits"][1, 1, 0]) > float(logits[1, 1, 0])
+    assert float(metrics.value_loss) == pytest.approx(0.75, rel=0, abs=5e-07)
+    assert updated.params["logits"].shape == (*shape, 2)
+    assert updated.params["values"].shape == shape
+    np.testing.assert_allclose(updated.params["values"], 0.1 * config.value_coef * returns / returns.size)
+    before, after = jax.tree.map(jnp.ravel, (logits[..., 0], updated.params["logits"][..., 0]))  # (N,)
+    np.testing.assert_array_equal(after[::2], before[::2])  # Both clipped signs.
+    assert float(after[1]) < float(before[1])
+    assert float(after[3]) > float(before[3])
 
 
 def test_single_transition_keeps_policy_gradient() -> None:
@@ -243,7 +258,7 @@ def test_recurrent_sequences_match_steps_and_reset_only_finished_env() -> None:
     # Test sequence/reset semantics in float32, without GPU TF32 approximation.
     model = ActorCritic(
         3,
-        replace(small_model_config(), encoder=ppo.EncoderConfig(stages=(ConvStage(4, blocks=1),), embedding_size=6)),
+        replace(small_model_config(), encoder=ppo.RGBEncoderConfig(stages=(ConvStage(4, blocks=1),), embedding_size=6)),
     )
     obs = jax.random.randint(jax.random.key(2), (4, 2, 4, 8, 8), 0, 256, dtype=jnp.uint8)
     carry = model.initial_carry(2)
@@ -747,15 +762,14 @@ def test_train_evaluates_final_policy(
         assert evaluated_writer is writer.return_value
         assert call.kwargs["initial_carry"] is carry
         assert episodes == (1 if steps == 2 else 2)
-        scores = call.kwargs["training_scores"]
-        assert scores.episode_count == episodes
-        assert scores.return_sum == (3.0 if steps == 2 else 10.0)
-        assert scores.length_sum == (2 if steps == 2 else 3)
     if expected_steps:
         assert evaluate.call_args.args[0] is state
     first_elapsed = 90.0 if 2 in expected_steps else 60.0
     final_elapsed = 120.0 + 30.0 * len(expected_steps)
     for tag, expected in (
+        ("charts/total_episodes", [(1.0, 2), (2.0, 4)]),
+        ("charts/total_return_mean", [(3.0, 2), (5.0, 4)]),
+        ("charts/total_episode_length_mean", [(2.0, 2), (1.5, 4)]),
         ("time/elapsed_seconds", [(first_elapsed, 2), (final_elapsed, 4)]),
         ("charts/iterations_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
         ("charts/observations_per_second", [(2 / first_elapsed, 2), (2 / (final_elapsed - first_elapsed), 4)]),

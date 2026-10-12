@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -6,7 +7,7 @@ from omegaconf.errors import OmegaConfBaseException
 from pydantic import ValidationError
 
 from rl2.envs.kinetix_env import KinetixConfig
-from rl2.ppo import Config, load_config
+from rl2.ppo import Config, RGBEncoderConfig, XMiniGridEncoderConfig, load_config
 
 
 @pytest.fixture
@@ -181,14 +182,14 @@ def test_optional_environment_factory_and_missing_dependency(
     name: str, env_id: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import builtins
-    from dataclasses import replace
     from types import ModuleType
     from typing import Any
     from unittest.mock import Mock
 
     from rl2 import ppo
 
-    config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), env_id=env_id)
+    config = load_config(Path(__file__).resolve().parents[1] / f"configs/ppo/{name}.yaml")
+    assert config.env_id == env_id
     cls = ppo.XMiniGridEnv if name == "xminigrid" else ppo.CraftaxEnv
     constructor = Mock()
     with monkeypatch.context() as patch:
@@ -211,11 +212,11 @@ def test_optional_environment_factory_and_missing_dependency(
 @pytest.mark.parametrize(
     "model,match",
     [
-        ({"encoder": {"stages": []}}, "stages"),
-        ({"encoder": {"stages": [{"channels": 0}]}}, "stages"),
-        ({"encoder": {"embedding_size": 0}}, "embedding_size"),
-        ({"encoder": {"embedding_size": True}}, "embedding_size"),
-        ({"encoder": {"unknown": 1}}, "unknown"),
+        ({"encoder": {"type": "rgb", "stages": []}}, "stages"),
+        ({"encoder": {"type": "rgb", "stages": [{"channels": 0}]}}, "stages"),
+        ({"encoder": {"type": "rgb", "embedding_size": 0}}, "embedding_size"),
+        ({"encoder": {"type": "rgb", "embedding_size": True}}, "embedding_size"),
+        ({"encoder": {"type": "rgb", "unknown": 1}}, "unknown"),
         ({"hidden_size": 8}, "hidden_size"),
         ({"encoder_stages": []}, "encoder_stages"),
     ],
@@ -233,4 +234,61 @@ def test_rejects_top_level_encoder_stages(config_path: Path) -> None:
     settings["encoder_stages"] = [{"channels": 4}]
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match="encoder_stages"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize("kind", ["rgb", "xminigrid"])
+def test_encoder_variant_round_trip(config_path: Path, kind: str) -> None:
+    settings = yaml.safe_load(config_path.read_text())
+    settings["env_id"] = "XLand-MiniGrid" if kind == "xminigrid" else "Breakout-MinAtar"
+    settings["model"]["encoder"] = {"type": kind, "embedding_size": 8}
+    config_path.write_text(yaml.safe_dump(settings))
+    config = load_config(config_path)
+    assert isinstance(config.model.encoder, RGBEncoderConfig if kind == "rgb" else XMiniGridEncoderConfig)
+    assert config.model.encoder.embedding_size == 8
+    config_path.write_text(yaml.safe_dump(asdict(config)))
+    restored = load_config(config_path)
+    assert restored == config and hash(restored) == hash(config)
+
+
+@pytest.mark.parametrize(
+    "encoder,match",
+    [
+        ({}, "union_tag_not_found"),
+        ({"type": "unknown"}, "union_tag_invalid"),
+        ({"type": "rgb", "token_size": 4}, "token_size"),
+        ({"type": "xminigrid", "stages": []}, "stages"),
+        ({"type": "xminigrid", "token_size": 0}, "token_size"),
+        ({"type": "xminigrid", "channels": True}, "channels"),
+        ({"type": "xminigrid", "blocks": -1}, "blocks"),
+        ({"type": "xminigrid", "embedding_size": 0}, "embedding_size"),
+    ],
+)
+def test_invalid_encoder_variants(config_path: Path, encoder: dict[str, object], match: str) -> None:
+    settings = yaml.safe_load(config_path.read_text())
+    settings["env_id"] = "XLand-MiniGrid"
+    settings["model"]["encoder"] = encoder
+    config_path.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValidationError, match=match):
+        load_config(config_path)
+
+
+def test_symbolic_encoder_requires_xminigrid(config_path: Path) -> None:
+    settings = yaml.safe_load(config_path.read_text())
+    settings["model"]["encoder"] = {"type": "xminigrid"}
+    config_path.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValidationError, match="xminigrid encoder requires"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize("explicit_rgb", [True, False], ids=["explicit-rgb", "default-rgb"])
+def test_xminigrid_requires_matching_encoder(config_path: Path, explicit_rgb: bool) -> None:
+    settings = yaml.safe_load(config_path.read_text())
+    settings["env_id"] = "XLand-MiniGrid"
+    if explicit_rgb:
+        settings["model"]["encoder"] = {"type": "rgb"}
+    else:
+        settings["model"].pop("encoder")
+    config_path.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValidationError, match="XLand-MiniGrid requires model.encoder.type: xminigrid"):
         load_config(config_path)

@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from rl2.envs import EnvStep
 from rl2.envs.gymnax_env import GymnaxEnv, render_observation
 
 
@@ -17,13 +18,19 @@ def test_single_reset_step_and_encoder_scale() -> None:
     np.testing.assert_array_equal(observation / 255, np.moveaxis(raw, -1, 0))
     assert observation.shape == (4, 10, 10) and observation.dtype == jnp.uint8
     assert env.num_actions == 3
-    observation, state, reward, done, info = env.step(key, state, jnp.array(0), params)
+    result = env.step(key, state, jnp.array(0), params)  # observation: (4,10,10); state leaves: (...); reward/done: ()
+    assert isinstance(result, EnvStep)
+    observation, state, reward, done, info = result
+    assert result.observation is observation and result.state is state
+    assert result.reward is reward and result.done is done and result.info is info
     # observation/final_observation: (4,10,10); reward/done/flags: (); state leaves: (...)
     assert observation.shape == info["final_observation"].shape == (4, 10, 10)
     chex.assert_shape((reward, done, info["terminated"], info["truncated"], state.time), ())
     assert bool(done) and bool(info["truncated"]) and not bool(info["terminated"])
     assert int(state.time) == 0
-    frame = render_observation(observation)  # (160,160,3)
+    assert int(info["final_state"].time) == 1
+    frame = env.render(info["final_state"])  # (160,160,3)
+    np.testing.assert_array_equal(frame, render_observation(info["final_observation"]))
     assert frame.shape == (160, 160, 3) and frame.dtype == jnp.uint8
 
 
@@ -39,13 +46,16 @@ def test_terminal_timeout_both_and_partial_autoreset() -> None:
         ball_dir=jnp.full(4, 2),
         time=jnp.array([0, 1, 1, 0]),
     )
-    next_observations, next_state, rewards, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
+    result = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
         jax.random.split(jax.random.key(1), 4), state, jnp.zeros(4, jnp.int32), env.params
     )  # (B,C,H,W); leaves: (B,...); rewards/done/flags: (B,); final_observation: (B,C,H,W)
+    assert isinstance(result, EnvStep)
+    next_observations, next_state, rewards, done, info = result  # (B,C,H,W); leaves: (B,...); rewards/done: (B,)
     np.testing.assert_array_equal(info["terminated"], [True, False, True, False])
     np.testing.assert_array_equal(info["truncated"], [False, True, True, False])
     np.testing.assert_array_equal(done, [True, True, True, False])
     np.testing.assert_array_equal(next_state.time, [0, 0, 0, 1])
+    np.testing.assert_array_equal(info["final_state"].time, [1, 2, 2, 1])
     assert next_observations.shape == info["final_observation"].shape == (4, 4, 10, 10)
     np.testing.assert_array_equal(next_observations[3], info["final_observation"][3])
     assert not np.array_equal(next_observations[0], info["final_observation"][0])
