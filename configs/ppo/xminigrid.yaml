@@ -1,0 +1,44 @@
+# XLand tasks sampled independently at every episode reset.
+env_id: XLand-MiniGrid
+xminigrid:
+  env_id: XLand-MiniGrid-R1-9x9
+  benchmark: trivial-21k # Downloaded and cached by xminigrid on first use
+  ruleset_id: null # Set an integer to train on a fixed task
+  max_steps: null # Native limit; also controls the upstream success reward
+seed: 1
+total_steps: 10_000_000
+num_envs: 32
+num_steps: 128
+num_minibatches: 4
+update_epochs: 4
+encoder_stages:
+  - { channels: 32, blocks: 1, resize_factor: 0.5 }
+  - { channels: 64, blocks: 1, resize_factor: 0.5 }
+  - { channels: 128, blocks: 1, resize_factor: 0.5 }
+  - { channels: 128, blocks: 1, resize_factor: 0.5 }
+model:
+  type: lstm
+  hidden_size: 256
+bf16: true
+learning_rate: 0.00025
+anneal_lr: true
+lr_decay: linear
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: 0.01
+entropy_coef: 0.01
+entropy_decay: constant
+value_coef: 0.5
+max_grad_norm: 0.5
+log_dir: gs://cohere-dev/vlad/rl2/ppo/${run_id}
+run_id: ppo_${path_name:${env_id}}
+# All intervals count completed PPO iterations (one rollout and its updates).
+log_interval: 10
+video_interval: 100
+video_max_frames: 900
+video_speed: 4.0
+checkpoint_interval: 1000
+eval_interval: 1000
+eval_episodes: 20
+eval_seed: 10000

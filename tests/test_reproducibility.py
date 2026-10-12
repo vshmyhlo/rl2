@@ -16,7 +16,11 @@ from rl2.observation_encoder import ConvStage
 
 def test_seeded_policy_and_update_are_reproducible() -> None:
     model = ppo.ActorCritic(
-        3, ppo.LSTMConfig(hidden_size=4), encoder_stages=(ConvStage(2, blocks=1),), embedding_size=4
+        3,
+        ppo.ModelConfig(
+            encoder=ppo.EncoderConfig(stages=(ConvStage(2, blocks=1),), embedding_size=4),
+            recurrent=ppo.LSTMConfig(hidden_size=4),
+        ),
     )
     obs = jnp.arange(2 * 1 * 8 * 8, dtype=jnp.uint8).reshape(2, 1, 8, 8)
     carry = model.initial_carry(2)

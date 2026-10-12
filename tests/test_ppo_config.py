@@ -5,6 +5,7 @@ import yaml
 from omegaconf.errors import OmegaConfBaseException
 from pydantic import ValidationError
 
+from rl2.envs.kinetix_env import KinetixConfig
 from rl2.ppo import Config, load_config
 
 
@@ -81,7 +82,9 @@ def test_load_config_rejects_nonpositive_observation_size(config_path: Path, obs
         ("env_id", "ALE/Breakout-v5"),
         ("eval_episodes", 0),
         ("eval_seed", -1),
-        ("eval_interval_seconds", -1),
+        ("eval_interval", -1),
+        ("eval_interval", 1.5),
+        ("eval_interval", True),
     ],
 )
 def test_rejects_unsupported_environment_options(config_path: Path, option: str, value: object) -> None:
@@ -89,4 +92,145 @@ def test_rejects_unsupported_environment_options(config_path: Path, option: str,
     settings[option] = value
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match=option):
+        load_config(config_path)
+
+
+def test_kinetix_config_loads_yaml_levels_as_hashable_tuple() -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml")
+    assert config.env_id == "Kinetix"
+    assert config.kinetix.levels == ("s/h4_thrust_aim.json",)
+    assert hash(config)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"size": "xl"},
+        {"levels": []},
+        {"levels": [""]},
+        {"max_steps": 0},
+        {"frame_skip": 0},
+        {"downscale": 3},
+        {"dense_reward_scale": float("nan")},
+        {"action_type": "continuous"},
+    ],
+)
+def test_kinetix_rejects_invalid_settings(settings: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        KinetixConfig(**settings)
+
+
+def test_kinetix_settings_require_kinetix_environment(config_path: Path) -> None:
+    settings = yaml.safe_load(config_path.read_text())
+    settings["kinetix"] = {"size": "m"}
+    config_path.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValidationError, match="kinetix settings require"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize("name,env_id", [("xminigrid", "XLand-MiniGrid"), ("craftax", "Craftax")])
+def test_optional_environment_configs_load(name: str, env_id: str) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / f"configs/ppo/{name}.yaml")
+    assert config.env_id == env_id
+    assert hash(config)
+
+
+@pytest.mark.parametrize(
+    "name,settings",
+    [
+        ("xminigrid", {"env_id": "unknown"}),
+        ("xminigrid", {"env_id": "XLand-MiniGrid-R1-9x9"}),
+        ("xminigrid", {"benchmark": "trivial-21k"}),
+        ("xminigrid", {"ruleset_id": 0}),
+        ("xminigrid", {"ruleset_id": -1}),
+        ("xminigrid", {"max_steps": 0}),
+        ("craftax", {"env_id": "Craftax-Symbolic-v1"}),
+        ("craftax", {"max_steps": 0}),
+    ],
+    ids=[
+        "unknown-grid",
+        "missing-benchmark",
+        "minigrid-benchmark",
+        "missing-ruleset-benchmark",
+        "negative-id",
+        "grid-horizon",
+        "symbolic-craftax",
+        "craftax-horizon",
+    ],
+)
+def test_optional_environments_reject_invalid_settings(name: str, settings: dict[str, object]) -> None:
+    from rl2.envs.craftax_env import CraftaxConfig
+    from rl2.envs.xminigrid_env import XMiniGridConfig
+
+    cls = {"xminigrid": XMiniGridConfig, "craftax": CraftaxConfig}[name]
+    with pytest.raises(ValidationError):
+        cls(**settings)
+
+
+@pytest.mark.parametrize("name", ["xminigrid", "craftax"])
+def test_optional_settings_require_matching_environment(config_path: Path, name: str) -> None:
+    settings = yaml.safe_load(config_path.read_text())
+    settings[name] = {"max_steps": 1}
+    config_path.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValidationError, match=f"{name} settings require"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize("name,env_id", [("xminigrid", "XLand-MiniGrid"), ("craftax", "Craftax")])
+def test_optional_environment_factory_and_missing_dependency(
+    name: str, env_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import builtins
+    from dataclasses import replace
+    from types import ModuleType
+    from typing import Any
+    from unittest.mock import Mock
+
+    from rl2 import ppo
+
+    config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), env_id=env_id)
+    cls = ppo.XMiniGridEnv if name == "xminigrid" else ppo.CraftaxEnv
+    constructor = Mock()
+    with monkeypatch.context() as patch:
+        patch.setattr(ppo, cls.__name__, constructor)
+        assert ppo.make_env(config) is constructor.return_value
+        constructor.assert_called_once_with(getattr(config, name))
+
+    original_import = builtins.__import__
+
+    def without_dependency(module: str, *args: Any, **kwargs: Any) -> ModuleType:
+        if module.split(".")[0] == name:
+            raise ModuleNotFoundError(name=name)
+        return original_import(module, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_dependency)
+    with pytest.raises(ImportError, match=f"uv sync --extra {name}"):
+        ppo.make_env(config)
+
+
+@pytest.mark.parametrize(
+    "model,match",
+    [
+        ({"encoder": {"stages": []}}, "stages"),
+        ({"encoder": {"stages": [{"channels": 0}]}}, "stages"),
+        ({"encoder": {"embedding_size": 0}}, "embedding_size"),
+        ({"encoder": {"embedding_size": True}}, "embedding_size"),
+        ({"encoder": {"unknown": 1}}, "unknown"),
+        ({"hidden_size": 8}, "hidden_size"),
+        ({"encoder_stages": []}, "encoder_stages"),
+    ],
+)
+def test_rejects_invalid_nested_model(config_path: Path, model: dict[str, object], match: str) -> None:
+    settings = yaml.safe_load(config_path.read_text())
+    settings["model"] = model
+    config_path.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValidationError, match=match):
+        load_config(config_path)
+
+
+def test_rejects_top_level_encoder_stages(config_path: Path) -> None:
+    settings = yaml.safe_load(config_path.read_text())
+    settings["encoder_stages"] = [{"channels": 4}]
+    config_path.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValidationError, match="encoder_stages"):
         load_config(config_path)

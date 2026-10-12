@@ -1,0 +1,39 @@
+env_id: Craftax
+craftax:
+  env_id: Craftax-Pixels-v1 # Or Craftax-Classic-Pixels-v1
+  max_steps: null # Native episode limit
+seed: 1
+total_steps: 10_000_000
+num_envs: 32
+num_steps: 128
+num_minibatches: 4
+update_epochs: 4
+encoder_stages:
+  - { channels: 32, blocks: 1, resize_factor: 0.5 }
+  - { channels: 64, blocks: 1, resize_factor: 0.5 }
+  - { channels: 128, blocks: 1, resize_factor: 0.5 }
+  - { channels: 128, blocks: 1, resize_factor: 0.5 }
+model:
+  type: lstm
+  hidden_size: 256
+bf16: true
+learning_rate: 0.00025
+anneal_lr: true
+lr_decay: linear
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: 0.01
+entropy_coef: 0.01
+entropy_decay: constant
+value_coef: 0.5
+max_grad_norm: 0.5
+log_dir: logs/ppo/${run_id}
+checkpoint_interval_seconds: 600
+log_interval_seconds: 60
+video_interval_seconds: 600
+video_max_frames: 900
+video_speed: 4.0
+eval_interval_seconds: 1800
+eval_episodes: 20
+eval_seed: 10000

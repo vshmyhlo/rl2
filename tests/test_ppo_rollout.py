@@ -10,7 +10,7 @@ import pytest
 from flax.training.train_state import TrainState
 
 from rl2 import ppo
-from rl2.gymnax_env import GymnaxEnv
+from rl2.envs.gymnax_env import GymnaxEnv
 from rl2.observation_encoder import ConvStage
 
 
@@ -41,8 +41,12 @@ def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs:
     )
     env = GymnaxEnv(config.env_id, max_steps_in_episode=2)
     key = jax.random.key(0)  # ()
-    observations, env_state = env.reset(key, num_envs)  # (B,4,10,10); leaves: (B,...)
-    memory = ppo.ActorCritic(3, ppo.LSTMConfig(hidden_size=1)).initial_carry(num_envs)  # leaves: (B,1)
+    observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
+        jax.random.split(key, num_envs), env.params
+    )  # (B,4,10,10); leaves: (B,...)
+    memory = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
+        num_envs
+    )  # leaves: (B,1)
     runner = ppo.RolloutCarry(
         env_state,
         observations,
@@ -58,15 +62,17 @@ def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs:
     chex.assert_trees_all_equal((duplicate, repeated), (first, rollout))
     for result in (rollout, continued):
         chex.assert_shape(result.batch.observations, (num_steps, num_envs, 4, 10, 10))
-        chex.assert_shape(
-            (result.batch.actions, result.batch.returns, result.completed, result.completed_lengths),
-            (num_steps, num_envs),
-        )
+        chex.assert_shape((result.batch.actions, result.batch.returns), (num_steps, num_envs))
+        chex.assert_shape((result.completed_count, result.completed_return_sum, result.completed_length_sum), ())
+        chex.assert_type((result.completed_count, result.completed_length_sum), jnp.int32)
+        chex.assert_type(result.completed_return_sum, jnp.float32)
         chex.assert_type(result.batch.observations, jnp.uint8)
         chex.assert_type(result.batch.actions, jnp.int32)
         # No brick hits within two steps. All boundaries here are timeouts.
-        np.testing.assert_array_equal(result.completed_returns, 0)
-        np.testing.assert_array_equal(result.completed_lengths, np.where(result.completed, 2, 0))
+        expected_count = num_envs * ((num_steps + (0 if result is rollout else num_steps % 2)) // 2)
+        assert int(result.completed_count) == expected_count
+        assert float(result.completed_return_sum) == 0
+        assert int(result.completed_length_sum) == 2 * expected_count
         expected_key = key if result is rollout else rollout.key  # ()
         for _ in range(num_steps):
             expected_key = jax.random.split(expected_key, 3)[0]  # ()
@@ -89,12 +95,16 @@ def test_rollout_and_update_with_real_breakout_model() -> None:
         update_epochs=1,
         bf16=False,
         target_kl=None,
-        model=ppo.LSTMConfig(hidden_size=2),
-        encoder_stages=(ConvStage(2, blocks=0),),
+        model=ppo.ModelConfig(
+            encoder=ppo.EncoderConfig(stages=(ConvStage(2, blocks=0),), embedding_size=2),
+            recurrent=ppo.LSTMConfig(hidden_size=2),
+        ),
     )
     env = GymnaxEnv(config.env_id)
-    observations, env_state = env.reset(jax.random.key(0), 1)  # (1,4,10,10); leaves: (1,...)
-    model = ppo.ActorCritic(3, config.model, encoder_stages=config.encoder_stages, embedding_size=2)
+    observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
+        jax.random.split(jax.random.key(0), 1), env.params
+    )  # (1,4,10,10); leaves: (1,...)
+    model = ppo.ActorCritic(3, config.model)
     carry = model.initial_carry(1)  # leaves: (1,2)
     starts = jnp.ones(1, bool)  # (1,)
     params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]
@@ -116,17 +126,21 @@ def test_terminal_and_timeout_targets_use_final_observations() -> None:
         gamma=0.5,
     )
     env = GymnaxEnv(config.env_id, max_steps_in_episode=2)
-    _, env_state = env.reset(jax.random.key(0), 4)  # leaves: (B=4,...)
+    _, env_state = jax.vmap(env.reset, in_axes=(0, None))(
+        jax.random.split(jax.random.key(0), 4), env.params
+    )  # leaves: (B=4,...)
     env_state = env_state.replace(
         ball_y=jnp.array([8, 3, 8, 3]),
         ball_x=jnp.zeros(4, jnp.int32),
         ball_dir=jnp.full(4, 2),
         time=jnp.array([0, 1, 1, 0]),
     )
-    from rl2.gymnax_env import encode_observations
+    from rl2.envs.gymnax_env import encode_observations
 
     observations = encode_observations(jax.vmap(env.env.get_obs)(env_state))  # (B,4,10,10)
-    memory = ppo.ActorCritic(3, ppo.LSTMConfig(hidden_size=1)).initial_carry(4)  # leaves: (B,1)
+    memory = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
+        4
+    )  # leaves: (B,1)
 
     def position_policy(
         variables: dict[str, jax.Array],
@@ -141,12 +155,25 @@ def test_terminal_and_timeout_targets_use_final_observations() -> None:
         return memory, logits, positions  # leaves: (B,1); (B,3); (B,)
 
     state = TrainState.create(apply_fn=position_policy, params={}, tx=optax.sgd(0.1))
-    runner = ppo.RolloutCarry(env_state, observations, memory, jnp.ones(4, bool), jnp.zeros(4), jnp.zeros(4, jnp.int32))
+    runner = ppo.RolloutCarry(
+        env_state,
+        observations,
+        memory,
+        jnp.ones(4, bool),  # (B,)
+        jnp.array([2.0, -3.0, 4.0, 100.0]),  # (B,)
+        jnp.array([0, 1, 1, 0]),  # (B,)
+    )
     advanced, rollout = ppo.collect_rollout(runner, state, env, config, jax.random.key(1))
     np.testing.assert_array_equal(rollout.batch.returns, [[0, 20.5, 0, 20.5]])
-    np.testing.assert_array_equal(rollout.completed, [[True, True, True, False]])
-    np.testing.assert_array_equal(rollout.completed_returns, 0)  # Raw scores exclude bootstrap values.
+    np.testing.assert_array_equal(advanced.episode_starts, [True, True, True, False])
+    assert int(rollout.completed_count) == 3
+    assert float(rollout.completed_return_sum) == 3.0  # Excludes bootstrap values and unfinished returns.
+    assert int(rollout.completed_length_sum) == 5
+    np.testing.assert_array_equal(advanced.episode_returns, [0, 0, 0, 100])
     advanced, rollout = ppo.collect_rollout(advanced, state, env, config, rollout.key)
+    assert int(rollout.completed_count) == 1
+    assert float(rollout.completed_return_sum) == 100.0
+    assert int(rollout.completed_length_sum) == 2
     np.testing.assert_array_equal(rollout.batch.episode_starts, [[True, True, True, False]])
     for leaf in jax.tree.leaves(advanced.carry):  # (B,1)
         np.testing.assert_array_equal(leaf[:, 0], [1, 1, 1, 2])

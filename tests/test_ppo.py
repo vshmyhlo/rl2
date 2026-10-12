@@ -29,12 +29,11 @@ from rl2.ppo import (
 )
 
 
-def small_model_config(model_type: ppo.ModelType) -> ppo.ModelConfig:
-    if model_type == "lstm":
-        return ppo.LSTMConfig(hidden_size=8, num_layers=2, intermediate_size=8)
-    if model_type == "gdn2":
-        return ppo.GDN2Config(hidden_size=8, num_heads=1, head_dim=4, intermediate_size=8)
-    return ppo.Mamba3Config(hidden_size=8, num_layers=2, intermediate_size=8, state_size=4, head_dim=4, mimo_rank=2)
+def small_model_config() -> ppo.ModelConfig:
+    return ppo.ModelConfig(
+        encoder=ppo.EncoderConfig(stages=(ConvStage(4, blocks=1),), embedding_size=8),
+        recurrent=ppo.LSTMConfig(hidden_size=8, num_layers=2, intermediate_size=8),
+    )
 
 
 def test_default_model_parameter_budget_and_rgb_shapes() -> None:
@@ -52,7 +51,7 @@ def test_default_model_parameter_budget_and_rgb_shapes() -> None:
     final, logits, values = jax.eval_shape(model.apply, variables, obs, carry, starts)
     assert logits.shape == (1, 1, 6)
     assert values.shape == (1, 1)
-    assert final[0][0].shape == (1, config.model.hidden_size)
+    assert final[0][0].shape == (1, config.model.recurrent.hidden_size)
     step_obs = jax.ShapeDtypeStruct(obs.shape[1:], obs.dtype)
     step_final, step_logits, step_values = jax.eval_shape(
         partial(model.apply, method=model.step), variables, step_obs, carry, starts[0]
@@ -177,21 +176,8 @@ def test_optimization_settings_allow_disabled_terms_and_discount_boundaries() ->
     replace(config, gamma=1.0, gae_lambda=0.0)
 
 
-@pytest.mark.parametrize(
-    "model_type,backend",
-    [("lstm", "jax"), ("gdn2", "jax"), ("mamba3", "jax"), ("gdn2", "triton")],
-)
-def test_bf16_recurrent_training_keeps_float32_state_and_losses(
-    model_type: ppo.ModelType, backend: ppo.GatedDeltaNet2Backend
-) -> None:
-    model_config = small_model_config(model_type)
-    if backend == "triton":
-        if not any("NVIDIA" in device.device_kind for device in jax.devices()):
-            pytest.skip("requires NVIDIA GPU")
-        pytest.importorskip("jax_triton")
-        model_config = ppo.GDN2Config(
-            hidden_size=8, num_layers=1, num_heads=1, head_dim=32, intermediate_size=8, backend=backend
-        )
+def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
+    model_config = small_model_config()
     config = replace(
         load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
         target_kl=None,
@@ -202,8 +188,6 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses(
         3,
         model_config,
         dtype=jnp.bfloat16,
-        encoder_stages=(ConvStage(4, blocks=1),),
-        embedding_size=8,
     )
     obs = jax.random.randint(jax.random.key(2), (3, 2, 1, 8, 8), 0, 256, dtype=jnp.uint8)
     carry = model.initial_carry(2)
@@ -213,7 +197,7 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses(
         partial(model.apply, capture_intermediates=True, mutable=["intermediates"])
     )({"params": params}, obs, carry, starts)
     assert captured["intermediates"]["encoder"]["stem"]["__call__"][0].dtype == jnp.bfloat16
-    assert captured["intermediates"][f"{model_type}_input"]["__call__"][0].dtype == jnp.bfloat16
+    assert captured["intermediates"]["lstm_input"]["__call__"][0].dtype == jnp.bfloat16
     assert captured["intermediates"]["policy_hidden"]["__call__"][0].dtype == jnp.bfloat16
     assert captured["intermediates"]["policy_output"]["__call__"][0].dtype == jnp.bfloat16
     assert captured["intermediates"]["value_output"]["__call__"][0].dtype == jnp.bfloat16
@@ -254,22 +238,19 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses(
     )
 
 
-@pytest.mark.parametrize("model_type", ("lstm", "gdn2", "mamba3"))
 @jax.default_matmul_precision("highest")
-def test_recurrent_sequences_match_steps_and_reset_only_finished_env(model_type: ppo.ModelType) -> None:
+def test_recurrent_sequences_match_steps_and_reset_only_finished_env() -> None:
     # Test sequence/reset semantics in float32, without GPU TF32 approximation.
     model = ActorCritic(
         3,
-        small_model_config(model_type),
-        encoder_stages=(ConvStage(4, blocks=1),),
-        embedding_size=6,
+        replace(small_model_config(), encoder=ppo.EncoderConfig(stages=(ConvStage(4, blocks=1),), embedding_size=6)),
     )
     obs = jax.random.randint(jax.random.key(2), (4, 2, 4, 8, 8), 0, 256, dtype=jnp.uint8)
     carry = model.initial_carry(2)
     starts = jnp.array([[True, True], [False, False], [True, False], [False, False]])
     params = model.init(jax.random.key(1), obs, carry, starts)
     encoded = model.apply(params, obs[0], method=model._encode)
-    assert encoded.shape == (2, model.model.hidden_size)
+    assert encoded.shape == (2, model.model.recurrent.hidden_size)
     apply = jax.jit(model.apply)
     step = jax.jit(partial(model.apply, method=model.step))
     final, logits, values = apply(params, obs, carry, starts)
@@ -462,19 +443,19 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         lr_decay="cosine",
         entropy_decay="cosine",
         target_kl=0.01,
-        video_interval_seconds=0,
-        eval_interval_seconds=0,
+        video_interval=0,
+        eval_interval=0,
+        log_interval=2,
     )
-    assert config.log_interval_seconds == 60.0
     obs = np.zeros((1, 1), dtype=np.uint8)  # (B=1, O=1)
     zeros = np.zeros(1, dtype=np.float32)  # (B,)
     dones = np.zeros(1, dtype=bool)  # (B,)
     carry = initial_carry(1, 1)  # pair of (B, H=1)
-    envs = Mock(num_actions=2)
-    envs.reset.return_value = (obs, {})
+    envs = Mock(num_actions=2, params={})
+    envs.reset.return_value = (obs[0], {})
     # One episode spans both rollouts in the first window; the final window has none.
     envs.step.side_effect = [
-        env_step(obs, np.array([reward]), ~dones if done else dones, dones, {})  # (B, O), 3 x (B,), info
+        env_step(obs[0], np.array(reward), ~dones[0] if done else dones[0], dones[0], {})  # (O,), scalar reward/flags
         for reward, done in ((2.0, False), (6.0, True), (100.0, False))
     ]
     model = Mock()
@@ -532,7 +513,6 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         2,
         config.model,
         dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
-        encoder_stages=config.encoder_stages,
     )
     assert iterations == [0, 0, 1, 2, 2]
     np.testing.assert_allclose(learning_rates, config.learning_rate * np.array([1.0, 1.0, 0.75, 0.25, 0.25]))
@@ -542,6 +522,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     assert "time/window_seconds" not in logged
     assert "time/iteration_seconds" not in logged
     assert "charts/steps_per_second" not in logged
+    assert not any("last_100" in tag for tag in logged)
     # Minibatch-weighted means: the rejected rollout contributes one sample, not two.
     for tag, expected in {
         "losses/policy": [(4.0, 2), (12.0, 3)],
@@ -565,8 +546,6 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         "charts/episode_length_mean": [(2.0, 2)],
         "charts/total_return_mean": [(8.0, 2), (8.0, 3)],
         "charts/total_episode_length_mean": [(2.0, 2), (2.0, 3)],
-        "charts/return_mean_last_100": [(8.0, 2), (8.0, 3)],
-        "charts/episode_length_mean_last_100": [(2.0, 2), (2.0, 3)],
         "charts/total_episodes": [(1.0, 2), (1.0, 3)],
         "charts/total_observations": [(2.0, 2), (3.0, 3)],
         "time/elapsed_seconds": [(60.0, 2), (80.0, 3)],
@@ -574,7 +553,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         np.testing.assert_allclose(logged[tag], expected, err_msg=tag)
     for tag, initial in (("charts/learning_rate", config.learning_rate), ("charts/entropy_coef", config.entropy_coef)):
         np.testing.assert_allclose(logged[tag], [(initial * 0.75, 2), (initial * 0.25, 3)], rtol=1e-6)
-    progress_lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("step=")]
+    progress_lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("iteration=")]
     assert len(progress_lines) == 2
     assert all("s/iteration=" not in line for line in progress_lines)
     assert "iterations/s=0.033 observations/s=0.033 episodes/s=0.017" in progress_lines[0]
@@ -592,28 +571,28 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     writer.close.assert_called_once()
 
 
-@pytest.mark.parametrize("interval", [0.0, -1.0, float("inf"), float("nan")])
+@pytest.mark.parametrize("interval", [0, -1, 1.5, True])
 def test_invalid_log_interval(interval: float) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
-    with pytest.raises(ValueError, match="log_interval_seconds"):
-        replace(config, log_interval_seconds=interval)
+    with pytest.raises(ValueError, match="log_interval"):
+        replace(config, log_interval=interval)
 
 
-def test_video_interval_defaults_to_600_seconds() -> None:
+def test_video_interval_defaults_to_600_iterations() -> None:
     settings = vars(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")).copy()
-    settings.pop("video_interval_seconds")
-    assert ppo.Config(**settings).video_interval_seconds == 600.0
+    settings.pop("video_interval")
+    assert ppo.Config(**settings).video_interval == 600
 
 
-@pytest.mark.parametrize("interval", [-1.0, float("inf"), float("nan")])
+@pytest.mark.parametrize("interval", [-1, 1.5, True])
 def test_invalid_video_interval(interval: float) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
-    with pytest.raises(ValidationError, match="video_interval_seconds"):
-        replace(config, video_interval_seconds=interval)
+    with pytest.raises(ValidationError, match="video_interval"):
+        replace(config, video_interval=interval)
 
 
-@pytest.mark.parametrize("interval,expected_steps", [(600.0, [2, 4]), (0.0, [])], ids=["timed", "disabled"])
-def test_video_schedule_uses_wall_time_without_catch_up(interval: float, expected_steps: list[int]) -> None:
+@pytest.mark.parametrize("interval,expected_steps", [(2, [2, 4]), (0, [])], ids=["periodic", "disabled"])
+def test_video_schedule_uses_iterations(interval: int, expected_steps: list[int]) -> None:
     config = replace(
         load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
         num_envs=1,
@@ -621,17 +600,17 @@ def test_video_schedule_uses_wall_time_without_catch_up(interval: float, expecte
         num_minibatches=1,
         update_epochs=1,
         total_steps=5,
-        video_interval_seconds=interval,
-        eval_interval_seconds=0,
+        video_interval=interval,
+        eval_interval=0,
         target_kl=None,
     )
     obs = np.zeros((1, 1), dtype=np.uint8)  # (B=1, O=1)
     zeros = np.zeros(1, dtype=np.float32)  # (B,)
     dones = np.zeros(1, dtype=bool)  # (B,); no episodes complete during training
     carry = initial_carry(1, 1)  # pair of (B, H=1)
-    envs = Mock(num_actions=2)
-    envs.reset.return_value = (obs, {})
-    envs.step.return_value = env_step(obs, zeros, dones, dones, {})
+    envs = Mock(num_actions=2, params={})
+    envs.reset.return_value = (obs[0], {})
+    envs.step.return_value = env_step(obs[0], zeros[0], dones[0], dones[0], {})
     model = Mock()
     model.initial_carry.return_value = carry
     model.init.return_value = {"params": {"weight": jnp.zeros(1)}}  # weight: (1,)
@@ -644,7 +623,7 @@ def test_video_schedule_uses_wall_time_without_catch_up(interval: float, expecte
         iteration: int,
     ) -> tuple[TrainState, ppo.PPOMetrics]:
         nonlocal clock
-        # Before the deadline, exactly at it, and just after a long recording.
+        # Uneven update times must not affect iteration-based recording.
         clock += (599.0, 1.0, 1.0, 599.0, 1.0)[iteration]
         return state.replace(step=iteration + 1), ppo.PPOMetrics(
             policy_loss=jnp.asarray(0.0),  # ()
@@ -660,7 +639,7 @@ def test_video_schedule_uses_wall_time_without_catch_up(interval: float, expecte
 
     def record_video(*args: object, **kwargs: object) -> None:
         nonlocal clock
-        clock += 1200.0  # Recording exceeds the interval; it must not trigger catch-up videos.
+        clock += 1200.0  # Recording time must not affect the schedule.
 
     with (
         jax.disable_jit(),
@@ -681,7 +660,7 @@ def test_video_schedule_uses_wall_time_without_catch_up(interval: float, expecte
     for call in video.call_args_list:
         state, recorded_config, recorded_writer, episodes, steps = call.args
         assert int(state.step) == steps
-        assert recorded_config.video_interval_seconds == interval
+        assert recorded_config.video_interval == interval
         assert recorded_writer is writer.return_value
         assert episodes == 0
         assert call.kwargs["initial_carry"] is carry
@@ -689,12 +668,12 @@ def test_video_schedule_uses_wall_time_without_catch_up(interval: float, expecte
 
 
 @pytest.mark.parametrize(
-    ("eval_interval_seconds", "expected_steps"),
-    [(0.0, []), (600.0, [4]), (60.0, [2, 4])],
-    ids=["disabled", "final-before-timer", "periodic-and-final-without-duplicate"],
+    ("eval_interval", "expected_steps"),
+    [(0, []), (3, [4]), (1, [2, 4])],
+    ids=["disabled", "final-before-interval", "periodic-and-final-without-duplicate"],
 )
 def test_train_evaluates_final_policy(
-    eval_interval_seconds: float, expected_steps: list[int], capsys: pytest.CaptureFixture[str]
+    eval_interval: int, expected_steps: list[int], capsys: pytest.CaptureFixture[str]
 ) -> None:
     config = replace(
         load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
@@ -703,19 +682,20 @@ def test_train_evaluates_final_policy(
         num_minibatches=1,
         update_epochs=1,
         total_steps=5,  # Training ends after two complete rollouts, at step 4.
-        video_interval_seconds=0,
-        eval_interval_seconds=eval_interval_seconds,
+        video_interval=0,
+        eval_interval=eval_interval,
+        log_interval=1,
         target_kl=None,
     )
     obs = np.zeros((1, 1), dtype=np.uint8)
     zeros = np.zeros(1, dtype=np.float32)
     dones = np.ones(1, dtype=bool)
     carry = initial_carry(1, 1)
-    envs = Mock(num_actions=2)
-    envs.reset.return_value = (obs, {})
+    envs = Mock(num_actions=2, params={})
+    envs.reset.return_value = (obs[0], {})
     # The first game spans two steps; the last unfinished game must not count.
     envs.step.side_effect = [
-        env_step(obs, np.array([reward]), dones if done else ~dones, ~dones, {})
+        env_step(obs[0], np.array(reward), dones[0] if done else ~dones[0], ~dones[0], {})
         for reward, done in ((5.0, False), (-2.0, True), (7.0, True), (1000.0, False))
     ]
     model = Mock()
@@ -763,16 +743,14 @@ def test_train_evaluates_final_policy(
     for call in evaluate.call_args_list:
         evaluated_state, evaluated_config, evaluated_writer, episodes, steps = call.args
         assert int(evaluated_state.step) == steps // config.num_steps
-        assert evaluated_config.eval_interval_seconds == eval_interval_seconds
+        assert evaluated_config.eval_interval == eval_interval
         assert evaluated_writer is writer.return_value
         assert call.kwargs["initial_carry"] is carry
         assert episodes == (1 if steps == 2 else 2)
         scores = call.kwargs["training_scores"]
         assert scores.episode_count == episodes
         assert scores.return_sum == (3.0 if steps == 2 else 10.0)
-        assert scores.recent_returns == ((3.0,) if steps == 2 else (3.0, 7.0))
         assert scores.length_sum == (2 if steps == 2 else 3)
-        assert scores.recent_lengths == ((2,) if steps == 2 else (2, 1))
     if expected_steps:
         assert evaluate.call_args.args[0] is state
     first_elapsed = 90.0 if 2 in expected_steps else 60.0
@@ -856,61 +834,25 @@ def test_invalid_video_frame_budget_rejected_by_config(frame_budget: Any) -> Non
         replace(config, video_max_frames=frame_budget)
 
 
-@jax.default_matmul_precision("highest")
-def test_gdn2_gradients_stop_at_episode_reset() -> None:
-    config = ppo.GatedDeltaNet2Config(hidden_size=8, num_heads=1, head_dim=4)
-    cell = ppo.GatedDeltaNet2Recurrent(config, 2, 8)
-    inputs = jax.random.normal(jax.random.key(2), (4, 2, 8))
-    starts = jnp.zeros((4, 2), dtype=bool).at[2, 0].set(True)
-    carry = cell.initial_carry(2)
-    params = cell.init(jax.random.key(1), inputs, carry, starts)
-
-    def loss(x: jax.Array) -> jax.Array:
-        return cell.apply(params, x, carry, starts)[1][-1].sum()
-
-    grads = jax.jit(jax.grad(loss))(inputs)
-    np.testing.assert_array_equal(grads[:2, 0], 0)
-    assert float(jnp.linalg.norm(grads[:2, 1])) > 0
-    assert float(jnp.linalg.norm(grads[2:, 0])) > 0
-
-
 @pytest.mark.parametrize(
     "model_settings, message",
     [
-        ({"type": "unknown"}, "union_tag_invalid"),
-        ({"hidden_size": 8}, "union_tag_not_found"),
+        ({"type": "unknown"}, "literal_error"),
+        ({"type": "gdn2"}, "literal_error"),
+        ({"type": "mamba3"}, "literal_error"),
         ("lstm", "model"),
         ({"type": "lstm", "num_layers": 0}, "greater_than"),
         ({"type": "lstm", "num_layers": True}, "int_type"),
         ({"type": "lstm", "intermediate_size": -1}, "greater_than_equal"),
         ({"type": "lstm", "intermediate_size": 1.5}, "int_type"),
-        ({"type": "gdn2", "lstm_hidden_size": 8}, "unexpected_keyword_argument"),
         ({"type": "lstm", "hidden_size": 0}, "greater_than"),
         ({"type": "lstm", "hidden_size": True}, "int_type"),
-        ({"type": "gdn2", "hidden_size": 1.5}, "int_type"),
-        ({"type": "gdn2", "backend": "cudnn"}, "literal_error"),
         ({"type": "lstm", "backend": "triton"}, "unexpected_keyword_argument"),
-        ({"type": "mamba3", "backend": "triton"}, "unexpected_keyword_argument"),
-        ({"type": "mamba3", "conv_size": 4}, "unexpected_keyword_argument"),
-        ({"type": "mamba3", "head_dim": 5}, "divisible by head_dim"),
-        ({"type": "mamba3", "num_groups": 5}, "divisible by num_groups"),
-        ({"type": "mamba3", "state_size": 3}, "state_size must be even"),
-        ({"type": "mamba3", "state_size": 2}, "rotary pair"),
-        ({"type": "mamba3", "rope_fraction": 0.25}, "literal_error"),
-        ({"type": "mamba3", "intermediate_size": -1}, "greater_than_equal"),
-        *[
-            ({"type": "mamba3", name: 0}, "greater_than")
-            for name in ("hidden_size", "num_layers", "state_size", "expand", "head_dim", "num_groups", "mimo_rank")
-        ],
-        *[
-            ({"type": "gdn2", name: 0}, "greater_than")
-            for name in ("hidden_size", "num_heads", "head_dim", "conv_size", "num_layers", "intermediate_size")
-        ],
     ],
 )
 def test_invalid_model_config(model_settings: Any, message: str) -> None:
     settings = vars(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")).copy()
-    settings["model"] = model_settings
+    settings["model"] = {"recurrent": model_settings}
     with pytest.raises(ValidationError, match=message):
         ppo.Config(**settings)
 
@@ -923,100 +865,30 @@ def test_flat_model_settings_are_rejected(field: str) -> None:
         ppo.Config(**settings)
 
 
-@pytest.mark.parametrize("backend", ("jax", "triton"))
-def test_model_config_loading_and_factory(tmp_path: Path, backend: str) -> None:
+def test_default_model_config(tmp_path: Path) -> None:
     settings = yaml.safe_load((Path(__file__).resolve().parents[1] / "configs/ppo.yaml").read_text())
     settings.pop("model")
     path = tmp_path / "ppo.yaml"
     path.write_text(yaml.safe_dump(settings))
-    default = load_config(path)
-    assert (
-        ppo.ActorCritic(
-            3, default.model, dtype=jnp.bfloat16 if default.bf16 else jnp.float32, encoder_stages=default.encoder_stages
-        ).model
-        == ppo.LSTMConfig()
-    )
-    settings["model"] = {
-        "type": "gdn2",
-        "hidden_size": 8,
-        "num_heads": 1,
-        "head_dim": 4,
-        "num_layers": 2,
-        "intermediate_size": 8,
-        "conv_size": 1,
-        "backend": backend,
-    }
+    assert load_config(path).model == ppo.ModelConfig()
+    settings["model"] = {"recurrent": {"hidden_size": 8}}
     path.write_text(yaml.safe_dump(settings))
-    config = load_config(path)
-    model = ppo.ActorCritic(
-        3, config.model, dtype=jnp.bfloat16 if config.bf16 else jnp.float32, encoder_stages=config.encoder_stages
-    )
-    assert isinstance(model.model, ppo.GDN2Config)
-    assert model.dtype == jnp.bfloat16
-    assert model.model.hidden_size == 8
-    assert model.model.intermediate_size == 8
-    recurrent = model._make_recurrent()
-    assert isinstance(recurrent, ppo.GatedDeltaNet2Recurrent)
-    assert recurrent.backend == backend
-    assert asdict(config)["model"] == settings["model"]
-    path.write_text(yaml.safe_dump(asdict(config)))
-    round_trip = load_config(path)
-    assert round_trip == config
-    assert hash(round_trip) == hash(config)
-    with pytest.raises(FrozenInstanceError):
-        config.model.hidden_size = 16
-    carry = model.initial_carry(2)  # leaves: (2, ...)
-    assert len(carry) == 2
-    for layer in carry:
-        assert layer.state.shape == (2, 1, 4, 4)
-        assert layer.q.shape == layer.k.shape == layer.v.shape == (2, 0, 4)
-        for leaf in layer:
-            assert leaf.dtype == jnp.float32
-            np.testing.assert_array_equal(leaf, 0)
+    assert load_config(path).model == ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=8))
 
 
-def test_mamba3_config_loading_and_factory(tmp_path: Path) -> None:
+def test_lstm_stack_config_loading_and_factory(tmp_path: Path) -> None:
     config = replace(
         load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-        model=small_model_config("mamba3"),
+        model=small_model_config(),
     )
     path = tmp_path / "ppo.yaml"
     path.write_text(yaml.safe_dump(asdict(config)))
     restored = load_config(path)
     assert restored == config
     assert hash(restored) == hash(config)
-    model = ppo.ActorCritic(
-        3, restored.model, dtype=jnp.bfloat16 if restored.bf16 else jnp.float32, encoder_stages=restored.encoder_stages
-    )
-    assert model.dtype == jnp.bfloat16
-    carry = model.initial_carry(2)  # leaves: (2, ...)
-    assert len(carry) == 2
-    for layer in carry:
-        assert layer.state.shape == (2, 4, 4, 4)
-        assert layer.key.shape == (2, 4, 2, 4)
-        assert layer.value.shape == (2, 4, 4)
-        assert layer.angle.shape == (2, 4, 1)
-        for leaf in layer:
-            assert leaf.dtype == jnp.float32
-            np.testing.assert_array_equal(leaf, 0)
-    # The smallest rotary state works with full rotation; zero disables the MLP.
-    boundary = ppo.Mamba3Config(state_size=2, rope_fraction=1.0, intermediate_size=0)
-    assert boundary.intermediate_size == 0
-    assert ppo.Mamba3Config().type == "mamba3"
-
-
-def test_lstm_stack_config_loading_and_factory(tmp_path: Path) -> None:
-    config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-        model=small_model_config("lstm"),
-    )
-    path = tmp_path / "ppo.yaml"
-    path.write_text(yaml.safe_dump(asdict(config)))
-    restored = load_config(path)
-    assert restored == config
-    model = ppo.ActorCritic(
-        3, restored.model, dtype=jnp.bfloat16 if restored.bf16 else jnp.float32, encoder_stages=restored.encoder_stages
-    )
+    with pytest.raises(FrozenInstanceError):
+        config.model.recurrent.hidden_size = 16
+    model = ppo.ActorCritic(3, restored.model, dtype=jnp.bfloat16 if restored.bf16 else jnp.float32)
     recurrent = model._make_recurrent()
     assert isinstance(recurrent, ppo.LSTMStack)
     assert recurrent.num_layers == 2

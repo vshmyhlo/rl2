@@ -11,7 +11,7 @@ import pytest
 from flax.training.train_state import TrainState
 
 from rl2 import ppo
-from rl2.gymnax_env import GymnaxEnv
+from rl2.envs.gymnax_env import GymnaxEnv
 from rl2.training_scores import TrainingScores
 
 
@@ -42,7 +42,9 @@ def test_episode_frame_limits(frame_limit: int | None, stop: bool, expected_leng
     )
     env = GymnaxEnv(config.env_id, max_steps_in_episode=2)
     state = TrainState.create(apply_fn=policy, params={}, tx=optax.sgd(0.1))
-    carry = ppo.ActorCritic(3, ppo.LSTMConfig(hidden_size=1)).initial_carry(1)  # leaves: (1,1)
+    carry = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
+        1
+    )  # leaves: (1,1)
     with patch.object(ppo, "GymnaxEnv", return_value=env):
         score, length, frames = ppo.play_episode(
             state, config, jax.random.key(0), carry, record=True, stop_at_frame_limit=stop, env=env
@@ -55,9 +57,11 @@ def test_evaluation_logs_raw_scores_and_independent_seeds() -> None:
     config = replace(ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), eval_episodes=2)
     writer = Mock()
     state = Mock(spec=TrainState)
-    carry = ppo.ActorCritic(3, ppo.LSTMConfig(hidden_size=1)).initial_carry(1)  # leaves: (1,1)
+    carry = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
+        1
+    )  # leaves: (1,1)
     frame = np.zeros((2, 2, 3), np.uint8)  # (H,W,3)
-    scores = TrainingScores(1, 4.0, (4.0,), 2, (2,))
+    scores = TrainingScores(1, 4.0, length_sum=2)
     with patch.object(ppo, "play_episode", side_effect=[(2.0, 3, []), (4.0, 5, [frame])]) as play:
         ppo.log_evaluation(state, config, writer, 1, 128, initial_carry=carry, training_scores=scores)
     for index, call in enumerate(play.call_args_list):
@@ -72,11 +76,12 @@ def test_evaluation_logs_raw_scores_and_independent_seeds() -> None:
     assert scalars["eval/return_std"] == pytest.approx(2**0.5)
     assert scalars["eval/return_sem"] == pytest.approx(1.0)
     assert scalars["training/total_return_mean"] == 4
+    assert not any("last_100" in tag for tag in scalars)
     assert "eval/human_normalized_score_percent" not in scalars
     report = json.loads(writer.add_text.call_args.args[1].removeprefix("```json\n").removesuffix("\n```"))
     assert report["env_id"] == "Breakout-MinAtar"
     assert report["episodes"] == [{"return": 2, "length": 3}, {"return": 4, "length": 5}]
-    assert report["training_scores"] == scores.as_report()
+    assert "training_scores" not in report
     assert writer.add_video.call_args.args[1].shape == (1, 1, 3, 2, 2)
     assert writer.add_video.call_args.kwargs["fps"] == 10 * config.video_speed
 
@@ -84,7 +89,9 @@ def test_evaluation_logs_raw_scores_and_independent_seeds() -> None:
 def test_log_video_wiring() -> None:
     config = ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
     writer = Mock()
-    carry = ppo.ActorCritic(3, ppo.LSTMConfig(hidden_size=1)).initial_carry(1)  # leaves: (1,1)
+    carry = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
+        1
+    )  # leaves: (1,1)
     with patch.object(ppo, "play_episode", return_value=(0.0, 1, [np.zeros((2, 2, 3), np.uint8)])) as play:
         ppo.log_video(Mock(), config, writer, 2, 128, initial_carry=carry)
     assert play.call_args.kwargs["record"]
@@ -95,9 +102,33 @@ def test_log_video_wiring() -> None:
 def test_single_evaluation_omits_unavailable_uncertainty() -> None:
     config = replace(ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), eval_episodes=1)
     writer = Mock()
-    carry = ppo.ActorCritic(3, ppo.LSTMConfig(hidden_size=1)).initial_carry(1)  # leaves: (1,1)
+    carry = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
+        1
+    )  # leaves: (1,1)
     with patch.object(ppo, "play_episode", return_value=(2.0, 3, [])):
         ppo.log_evaluation(Mock(), config, writer, 0, 0, initial_carry=carry)
     tags = {call.args[0] for call in writer.add_scalar.call_args_list}
     assert "eval/return_mean" in tags
     assert not {"eval/return_std", "eval/return_sem"} & tags
+    report = json.loads(writer.add_text.call_args.args[1].removeprefix("```json\n").removesuffix("\n```"))
+    assert "training_scores" not in report
+
+
+def test_kinetix_video_and_evaluation_use_configured_environment() -> None:
+    config = replace(ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml"), eval_episodes=1)
+    carry = ppo.ActorCritic(11, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
+        1
+    )  # leaves: (1,1)
+    writer = Mock()
+    frame = np.zeros((2, 2, 3), np.uint8)  # (H,W,3)
+    with (
+        patch.object(ppo, "KinetixEnv") as make_env,
+        patch.object(ppo, "play_episode", return_value=(1.0, 2, [frame])) as play,
+    ):
+        ppo.log_video(Mock(), config, writer, 0, 0, initial_carry=carry)
+        ppo.log_evaluation(Mock(), config, writer, 0, 0, initial_carry=carry)
+    assert make_env.call_count == 2
+    assert all(call.args == (config.kinetix,) for call in make_env.call_args_list)
+    assert all(call.kwargs["env"] is make_env.return_value for call in play.call_args_list)
+    report = json.loads(writer.add_text.call_args.args[1].removeprefix("```json\n").removesuffix("\n```"))
+    assert report["env_id"] == "Kinetix" and report["return_mean"] == 1.0

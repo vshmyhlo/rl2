@@ -1,15 +1,15 @@
 """Full-game Atari evaluation for recurrent agents, including PPO and PPO-RND.
 
-Example (train with atari_preprocessing=True from the outset)::
+Example::
 
-    from dataclasses import replace
-    from rl2.ppo import ActorCritic, load_config, train
+    from rl2.ppo_rnd import load_config, train
     from rl2.atari_eval import EvaluationConfig, TrainStateAgent, evaluate
+    from rl2.ppo_rnd import initial_carry
 
-    config = replace(load_config("configs/ppo.yaml"), atari_preprocessing=True)
+    config = load_config("configs/ppo_rnd_montezuma.yaml")
     state = train(config)
     result = evaluate(
-        TrainStateAgent(state, ActorCritic(1, config.model).initial_carry(1)),
+        TrainStateAgent(state, initial_carry(1, config.lstm_hidden_size)),
         config, EvaluationConfig(), output_path="evaluation.json",
     )
     print(result["return_mean"])
@@ -48,7 +48,6 @@ across different games. This evaluator does not train or update the policy.
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from functools import partial
@@ -65,11 +64,13 @@ import numpy as np
 from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 
-from rl2 import ppo, ppo_rnd
+from rl2 import ppo_rnd
+from rl2.atari_env import AtariPreprocessing
 from rl2.atari_scores import REFERENCE_SOURCE, get_reference_scores
+from rl2.training_scores import TrainingScores
 
 type EvaluationResult = dict[str, Any]
-type TrainingConfig = ppo.Config | ppo_rnd.Config
+type TrainingConfig = ppo_rnd.Config
 
 
 class EvaluationAgent[Carry](Protocol):
@@ -115,47 +116,6 @@ class TrainStateAgent[Carry]:
         return _action(
             self.state, obs, carry, episode_start, key, greedy=greedy, sequence_policy=self.sequence_policy
         )  # () action; carry leaves: (1, ...)
-
-
-@dataclass(frozen=True)
-class TrainingScores:
-    """Raw episode-return means over all training and the latest 100 episodes.
-
-    These are the training metrics from Section 6.4 of
-    https://arxiv.org/abs/1707.06347, separate from frozen-policy evaluation.
-    A missing return_sum (e.g. an older checkpoint) leaves the all-training
-    mean unavailable. recent_returns contains the most recent completed
-    episodes, up to 100; None denotes unavailable history. Short windows
-    report their actual count so they cannot be mistaken for 100 episodes.
-    Matching these metrics does not match Atari protocols.
-    """
-
-    episode_count: int
-    return_sum: float | None
-    recent_returns: tuple[float, ...] | None = None
-
-    def __post_init__(self) -> None:
-        if self.episode_count < 0:
-            raise ValueError("episode_count must be nonnegative")
-        if self.return_sum is not None and not math.isfinite(self.return_sum):
-            raise ValueError("training return_sum must be finite or unavailable")
-        if self.recent_returns is not None:
-            if len(self.recent_returns) > min(100, self.episode_count):
-                raise ValueError("recent_returns cannot exceed 100 or the completed episode count")
-            if not all(math.isfinite(score) for score in self.recent_returns):
-                raise ValueError("recent training returns must be finite")
-
-    def as_report(self) -> dict[str, int | float | None]:
-        return {
-            "episode_count": self.episode_count,
-            "return_mean": self.return_sum / self.episode_count
-            if self.episode_count and self.return_sum is not None
-            else None,
-            "return_mean_last_100": math.fsum(self.recent_returns) / len(self.recent_returns)
-            if self.recent_returns
-            else None,
-            "episode_count_last_100": len(self.recent_returns) if self.recent_returns is not None else None,
-        }
 
 
 @dataclass(frozen=True)
@@ -226,7 +186,7 @@ def make_evaluation_env(
         max_episode_steps=-1,  # Disable Gym TimeLimit; ALE counts actual emulator frames.
     )
     try:
-        env = ppo.AtariPreprocessing(
+        env = AtariPreprocessing(
             env,
             noop_max=30,
             frame_skip=4,
@@ -286,8 +246,8 @@ def evaluate[Carry](
     ``training`` must describe the agent's actual training setup.
     Returns a JSON-compatible report; optionally writes it to ``output_path``.
     Baselines default to the bundled DQN Zoo Atari-57 table when available.
-    Optional ``training_scores`` adds the PPO paper's all-training and last-100
-    raw episode means with their episode counts; absent history is reported as
+    Optional ``training_scores`` adds all-training raw episode means and the
+    completed episode count; absent history is reported as
     null. Evaluation episodes never contribute to these training metrics.
     Progress prints at startup, after each game, and every 10 seconds during
     a game (after an environment step). Set show_progress=False to silence it.

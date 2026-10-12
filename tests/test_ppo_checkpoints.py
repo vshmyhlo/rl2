@@ -75,8 +75,8 @@ def config(tmp_path: Path) -> ppo.Config:
         num_minibatches=1,
         update_epochs=1,
         total_steps=4,
-        video_interval_seconds=0,
-        eval_interval_seconds=0,
+        video_interval=0,
+        eval_interval=0,
     )
 
 
@@ -93,7 +93,7 @@ def state() -> TrainState:
 
 def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Config, state: TrainState) -> None:
     directory = f"{config.log_dir}/{config.run_id}"
-    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 8, (1.5, -2.0), (3, 7), 12.5, 40)
+    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 8, 12.5, 40)
     with ppo.checkpoint_manager(directory) as manager:
         assert ppo.restore_checkpoint(manager, state, config) is None
         ppo.save_checkpoint(manager, progress._replace(iteration=1), config)
@@ -111,14 +111,16 @@ def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Confi
             replace(
                 config,
                 total_steps=8,
-                log_interval_seconds=15.0,
-                video_interval_seconds=600.0,
-                eval_interval_seconds=1800.0,
+                log_interval=15,
+                video_interval=600,
+                eval_interval=1800,
             ),
         )
         assert restored is not None
         chex.assert_trees_all_equal(restored, progress)
-        assert metadata["version"] == 2
+        assert metadata["version"] == 3
+        assert "recent_returns" not in metadata
+        assert "recent_lengths" not in metadata
         assert "numpy_rng" not in metadata
         chex.assert_shape(restored.key, ())
         chex.assert_trees_all_equal(jax.random.permutation(restored.key, 4), jax.random.permutation(progress.key, 4))
@@ -134,24 +136,30 @@ def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Confi
         assert ppo.restore_checkpoint(manager, fresh, config) is None
 
 
-def test_checkpoint_preserves_episode_length_history(config: ppo.Config, state: TrainState) -> None:
-    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 101, (2.0,) * 100, (3,) * 100, 300.0, 305)
+@pytest.mark.parametrize("version", [2, 3], ids=["legacy-recent-history", "current-totals-only"])
+def test_checkpoint_preserves_episode_totals(config: ppo.Config, state: TrainState, version: int) -> None:
+    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 101, 300.0, 305)
     manager = Mock()
     ppo.save_checkpoint(manager, progress, config)
     saved = manager.save.call_args.kwargs["args"]
     metadata = json.loads(json.dumps(saved.metadata.item))
+    assert metadata["version"] == 3
+    assert "recent_returns" not in metadata
+    assert "recent_lengths" not in metadata
+    if version == 2:
+        metadata.update(version=2, recent_returns=[2.0] * 100, recent_lengths=[3] * 100)
     manager.latest_step.return_value = progress.iteration
     manager.restore.side_effect = [SimpleNamespace(metadata=metadata), SimpleNamespace(state=saved.state.item)]
     restored = ppo.restore_checkpoint(manager, state, config)
     assert restored is not None
     assert restored.training_length_sum == 305
-    assert restored.recent_lengths == (3,) * 100
+    chex.assert_trees_all_equal(restored, progress)
 
 
 @pytest.mark.parametrize("field", ["num_envs", "num_steps"])
 def test_checkpoint_rejects_changed_rollout_size(config: ppo.Config, state: TrainState, field: str) -> None:
     manager = Mock()
-    ppo.save_checkpoint(manager, ppo.TrainingProgress(state, jax.random.key(3), 2, 0, (), ()), config)
+    ppo.save_checkpoint(manager, ppo.TrainingProgress(state, jax.random.key(3), 2, 0), config)
     saved = manager.save.call_args.kwargs["args"]
     manager.latest_step.return_value = 2
     manager.restore.side_effect = [
@@ -166,7 +174,7 @@ def test_checkpoint_rejects_changed_rollout_size(config: ppo.Config, state: Trai
 
 def test_checkpoint_allows_reshaping_same_rollout_size(config: ppo.Config, state: TrainState) -> None:
     config = replace(config, num_steps=2)
-    progress = ppo.TrainingProgress(state, jax.random.key(3), 1, 0, (), (), 0.0, 0)
+    progress = ppo.TrainingProgress(state, jax.random.key(3), 1, 0, 0.0, 0)
     manager = Mock()
     ppo.save_checkpoint(manager, progress, config)
     saved = manager.save.call_args.kwargs["args"]
@@ -202,19 +210,15 @@ def test_legacy_checkpoint_leaves_training_total_unavailable(config: ppo.Config,
     assert restored.training_return_sum is None
     assert restored.training_length_sum is None
     assert restored.completed_episodes == 101
-    assert restored.recent_returns == (2.0,) * 100
     report = TrainingScores(
         restored.completed_episodes,
         restored.training_return_sum,
-        restored.recent_returns,
         length_sum=restored.training_length_sum,
-        recent_lengths=restored.recent_lengths,
     ).as_report()
     assert report["total_return_mean"] is None
-    assert report["return_mean_last_100"] == 2.0
     assert report["total_episode_length_mean"] is None
-    assert report["episode_length_mean_last_100"] == 3.0
-    assert report["episodes_last_100"] == 100
+    assert report["total_episodes"] == 101
+    assert not any("last_100" in key for key in report)
 
 
 @pytest.mark.parametrize("run_id", ["", " ", "..", "a/b", "a\\b"])
@@ -223,10 +227,10 @@ def test_invalid_run_id(config: ppo.Config, run_id: str) -> None:
         replace(config, run_id=run_id)
 
 
-@pytest.mark.parametrize("interval", [0.0, -1.0, float("inf"), float("nan")])
+@pytest.mark.parametrize("interval", [0, -1, 1.5, True])
 def test_invalid_checkpoint_interval(config: ppo.Config, interval: float) -> None:
-    with pytest.raises(ValueError, match="checkpoint_interval_seconds"):
-        replace(config, checkpoint_interval_seconds=interval)
+    with pytest.raises(ValueError, match="checkpoint_interval"):
+        replace(config, checkpoint_interval=interval)
 
 
 def test_checkpoint_paths_preserve_gcs_and_resolve_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -240,8 +244,8 @@ def test_checkpoint_paths_preserve_gcs_and_resolve_local(tmp_path: Path, monkeyp
 
 @pytest.mark.parametrize("failure", ["manager", "reset", "writer", "logging", "writer_close"])
 def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> None:
-    envs = Mock(num_actions=2)
-    envs.reset.return_value = (np.zeros((1, 1), dtype=np.uint8), {})  # observations: (B=1, O=1)
+    envs = Mock(num_actions=2, params={})
+    envs.reset.return_value = (np.zeros(1, dtype=np.uint8), {})  # observation: (O=1,)
     manager = Mock()
     writer = Mock()
     model = Mock()
@@ -279,21 +283,22 @@ def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> 
         writer.close.assert_not_called()
 
 
-def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> None:
+def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config) -> None:
     run_dir = f"{config.log_dir}/{config.run_id}/Breakout-MinAtar"
     path = Path(config.log_dir) / "config.yaml"
     settings = asdict(config)
     settings.update(env_id="Breakout-MinAtar", log_dir=config.log_dir + "/${run_id}/${path_name:${env_id}}")
     path.write_text(ppo.yaml.safe_dump(settings))
     config = ppo.load_config(path)
-    assert config.checkpoint_interval_seconds == 600.0
+    assert config.checkpoint_interval == 600
+    config = replace(config, checkpoint_interval=2, log_interval=2)
     obs = np.zeros((1, 1), dtype=np.uint8)
     zeros = np.zeros(1, dtype=np.float32)
     dones = np.ones(1, dtype=bool)
     carry = initial_carry(1, 1)
-    envs = Mock(num_actions=2)
-    envs.reset.return_value = (obs, {})
-    envs.step.return_value = env_step(obs, np.ones(1), dones, ~dones, {})
+    envs = Mock(num_actions=2, params={})
+    envs.reset.return_value = (obs[0], {})
+    envs.step.return_value = env_step(obs[0], np.array(1.0), dones[0], ~dones[0], {})
     model = Mock()
     model.initial_carry.return_value = carry
     model.init.return_value = {"params": {"weight": jnp.zeros(1)}}
@@ -303,7 +308,7 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
     learning_rates: list[float] = []
     saved_iterations: list[int] = []
     saved_return_sums: list[float | None] = []
-    saved_recent_returns: list[tuple[float, ...]] = []
+    saved_length_sums: list[int | None] = []
 
     def update(
         state: TrainState, batch: ppo.PPOBatch, config: ppo.Config, iteration: int
@@ -312,7 +317,7 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
         if iteration == 2 and not interrupted:
             interrupted = True
             raise RuntimeError("simulated interruption")
-        # The first rollout is just before the interval; the second reaches it.
+        # Wall time is independent of the checkpoint schedule.
         clock += 599.0 if iteration == 0 else 1.0
         iterations.append(iteration)
         learning_rates.append(float(state.opt_state.hyperparams["learning_rate"]))
@@ -325,17 +330,18 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
             clip_fraction=jnp.asarray(0.0),  # ()
         )
 
-    original_save = ppo.save_checkpoint
+    checkpoint: ppo.TrainingProgress | None = None
 
     def record_save(
         manager: ppo.ocp.CheckpointManager,
         progress: ppo.TrainingProgress,
         config: ppo.Config,
     ) -> None:
+        nonlocal checkpoint
+        checkpoint = progress
         saved_iterations.append(progress.iteration)
         saved_return_sums.append(progress.training_return_sum)
-        saved_recent_returns.append(progress.recent_returns)
-        original_save(manager, progress, config)
+        saved_length_sums.append(progress.training_length_sum)
 
     with (
         jax.disable_jit(),
@@ -346,16 +352,23 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
         patch.object(ppo, "value", return_value=zeros),
         patch.object(ppo, "update", side_effect=update),
         patch.object(ppo, "monotonic", side_effect=lambda: clock + 0.01),
+        patch.object(ppo, "checkpoint_manager"),
+        patch.object(ppo, "restore_checkpoint", side_effect=lambda *args: checkpoint),
         patch.object(ppo, "save_checkpoint", side_effect=record_save),
+        patch.object(ppo, "log_video") as video,
+        patch.object(ppo, "log_evaluation") as evaluate,
     ):
         with pytest.raises(RuntimeError, match="simulated interruption"):
             ppo.train(config)
         assert saved_iterations == [2]
         writer.reset_mock()
+        config = replace(config, checkpoint_interval=3, log_interval=3, video_interval=3, eval_interval=3)
         resumed = ppo.train(config)
-        assert saved_iterations == [2, 4]
-        assert saved_return_sums == [2.0, 4.0]
-        assert saved_recent_returns == [(1.0, 1.0), (1.0,) * 4]
+        assert saved_iterations == [2, 3, 4]
+        assert saved_return_sums == [2.0, 3.0, 4.0]
+        assert saved_length_sums == [2, 3, 4]
+        assert [call.args[4] for call in video.call_args_list] == [3]
+        assert [call.args[4] for call in evaluate.call_args_list] == [3, 4]
         assert iterations == [0, 1, 2, 3]
         assert int(resumed.step) == 4
         np.testing.assert_allclose(learning_rates, [ppo.learning_rate_schedule(config)(i) for i in range(4)])
@@ -363,27 +376,26 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
         episode_logs = [
             c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/total_episodes"
         ]
-        assert episode_logs == [(4.0, 4)]
+        assert episode_logs == [(3.0, 3), (4.0, 4)]
         writer.return_value.add_scalar.assert_any_call("charts/total_observations", 4.0, 4)
         return_logs = [
             c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/total_return_mean"
         ]
-        assert return_logs == [(1.0, 4)]
+        assert return_logs == [(1.0, 3), (1.0, 4)]
         sps = [
             c.args[1]
             for c in writer.return_value.add_scalar.call_args_list
             if c.args[0] == "charts/observations_per_second"
         ]
-        assert sps == [1.0]
+        assert sps == [1.0, 1.0]
         elapsed_logs = [
             c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "time/elapsed_seconds"
         ]
-        assert elapsed_logs == [(2.0, 4)]
+        assert elapsed_logs == [(1.0, 3), (2.0, 4)]
         # An already completed run does not perform more updates or duplicate a save.
         ppo.train(config)
         assert iterations == [0, 1, 2, 3]
-        assert saved_iterations == [2, 4]
-    assert (Path(run_dir) / "checkpoints" / "4").is_dir()
+        assert saved_iterations == [2, 3, 4]
 
 
 def test_checkpoint_rejects_old_atari_environment(config: ppo.Config, state: TrainState) -> None:
@@ -400,3 +412,42 @@ def test_checkpoint_rejects_old_atari_environment(config: ppo.Config, state: Tra
     with pytest.raises(ValueError, match="different environment"):
         ppo.restore_checkpoint(manager, state, config)
     manager.restore.assert_called_once()  # Reject metadata before attempting incompatible parameter restore.
+
+
+def test_checkpoint_validates_kinetix_settings(config: ppo.Config, state: TrainState) -> None:
+    config = replace(config, env_id="Kinetix", kinetix=ppo.KinetixConfig(levels=("s/h4_thrust_aim.json",)))
+    manager = Mock()
+    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 0)
+    ppo.save_checkpoint(manager, progress, config)
+    saved = manager.save.call_args.kwargs["args"]
+    # JSON serializes tuples as lists; they must compare equal on restore.
+    metadata = json.loads(json.dumps(saved.metadata.item))
+    manager.latest_step.return_value = 2
+    manager.restore.side_effect = [SimpleNamespace(metadata=metadata), SimpleNamespace(state=saved.state.item)]
+    chex.assert_trees_all_equal(ppo.restore_checkpoint(manager, state, config), progress)
+    manager.restore.reset_mock(side_effect=True)
+    manager.restore.return_value = SimpleNamespace(metadata=metadata)
+    with pytest.raises(ValueError, match="different kinetix settings"):
+        ppo.restore_checkpoint(manager, state, replace(config, kinetix=replace(config.kinetix, levels=None)))
+    manager.restore.assert_called_once()
+
+
+@pytest.mark.parametrize("name,env_id", [("xminigrid", "XLand-MiniGrid"), ("craftax", "Craftax")])
+def test_checkpoint_validates_optional_environment_settings(
+    config: ppo.Config, state: TrainState, name: str, env_id: str
+) -> None:
+    config = replace(config, env_id=env_id)
+    manager = Mock()
+    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 0)
+    ppo.save_checkpoint(manager, progress, config)
+    saved = manager.save.call_args.kwargs["args"]
+    metadata = json.loads(json.dumps(saved.metadata.item))
+    manager.latest_step.return_value = 2
+    manager.restore.side_effect = [SimpleNamespace(metadata=metadata), SimpleNamespace(state=saved.state.item)]
+    chex.assert_trees_all_equal(ppo.restore_checkpoint(manager, state, config), progress)
+    manager.restore.reset_mock(side_effect=True)
+    manager.restore.return_value = SimpleNamespace(metadata=metadata)
+    changed = replace(config, **{name: replace(getattr(config, name), max_steps=1)})
+    with pytest.raises(ValueError, match=f"different {name} settings"):
+        ppo.restore_checkpoint(manager, state, changed)
+    manager.restore.assert_called_once()

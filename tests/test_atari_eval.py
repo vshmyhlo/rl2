@@ -30,7 +30,7 @@ from rl2.ppo import LSTMStackCarry
 
 @dataclass(frozen=True)
 class AtariConfig(ppo_rnd.Config):
-    model: ppo.ModelConfig = field(default_factory=lambda: ppo.LSTMConfig(hidden_size=2))
+    model: ppo.ModelConfig = field(default_factory=lambda: ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=2)))
 
 
 def training_config() -> AtariConfig:
@@ -58,65 +58,46 @@ def policy_state() -> TrainState:
 
 
 @pytest.mark.parametrize(
-    "scores,mean,recent_mean,recent_count",
+    "scores,mean",
     [
-        pytest.param(TrainingScores(0, 0.0, ()), None, None, 0, id="no-completed-episodes"),
-        pytest.param(TrainingScores(2, -4.0, (-1.0, -3.0)), -2.0, -2.0, 2, id="short-history"),
-        pytest.param(TrainingScores(101, 300.0, (2.0,) * 100), 300 / 101, 2.0, 100, id="full-window"),
-        pytest.param(TrainingScores(101, None, (2.0,) * 100), None, 2.0, 100, id="unknown-historical-total"),
-        pytest.param(TrainingScores(101, 300.0), 300 / 101, None, None, id="unknown-recent-history"),
+        pytest.param(TrainingScores(0, 0.0), None, id="no-completed-episodes"),
+        pytest.param(TrainingScores(2, -4.0), -2.0, id="negative-returns"),
+        pytest.param(TrainingScores(101, 300.0), 300 / 101, id="all-training"),
+        pytest.param(TrainingScores(101, None), None, id="unknown-historical-total"),
     ],
 )
-def test_training_score_means(
-    scores: TrainingScores, mean: float | None, recent_mean: float | None, recent_count: int | None
-) -> None:
+def test_training_score_means(scores: TrainingScores, mean: float | None) -> None:
     report = scores.as_report()
     assert report == {
         "total_episodes": scores.episode_count,
         "total_return_mean": mean,
-        "return_mean_last_100": recent_mean,
-        "episodes_last_100": recent_count,
         "total_episode_length_mean": None,
-        "episode_length_mean_last_100": None,
     }
     json.dumps(report, allow_nan=False)
 
 
 @pytest.mark.parametrize(
-    "count,total,recent,mean,recent_mean",
+    "count,total,mean",
     [
-        pytest.param(0, 0, (), None, None, id="no-completed-episodes"),
-        pytest.param(2, 10, (3, 7), 5.0, 5.0, id="short-history"),
-        pytest.param(101, 305, (3,) * 100, 305 / 101, 3.0, id="full-window"),
-        pytest.param(101, None, (3,) * 100, None, 3.0, id="unknown-historical-total"),
-        pytest.param(2, 10, None, 5.0, None, id="unknown-recent-history"),
+        pytest.param(0, 0, None, id="no-completed-episodes"),
+        pytest.param(101, 305, 305 / 101, id="all-training"),
+        pytest.param(101, None, None, id="unknown-historical-total"),
     ],
 )
 def test_training_episode_length_means(
     count: int,
     total: int | None,
-    recent: tuple[int, ...] | None,
     mean: float | None,
-    recent_mean: float | None,
 ) -> None:
-    report = TrainingScores(count, None, length_sum=total, recent_lengths=recent).as_report()
+    report = TrainingScores(count, None, length_sum=total).as_report()
     assert report["total_episode_length_mean"] == mean
-    assert report["episode_length_mean_last_100"] == recent_mean
+    assert not any("last_100" in key for key in report)
     json.dumps(report, allow_nan=False)
 
 
-@pytest.mark.parametrize(
-    "count,total,recent",
-    [
-        pytest.param(1, -1, None, id="negative-total"),
-        pytest.param(101, None, (1,) * 101, id="window-too-long"),
-        pytest.param(1, None, (1, 2), id="more-than-completed"),
-        pytest.param(1, None, (0,), id="nonpositive-length"),
-    ],
-)
-def test_training_scores_reject_invalid_lengths(count: int, total: int | None, recent: tuple[int, ...] | None) -> None:
+def test_training_scores_reject_negative_length_total() -> None:
     with pytest.raises(ValueError):
-        TrainingScores(count, None, length_sum=total, recent_lengths=recent)
+        TrainingScores(1, None, length_sum=-1)
 
 
 @pytest.mark.parametrize(
@@ -129,19 +110,6 @@ def test_training_scores_reject_invalid_lengths(count: int, total: int | None, r
 def test_training_scores_reject_invalid_history(count: int, total: float | None) -> None:
     with pytest.raises(ValueError):
         TrainingScores(count, total)
-
-
-@pytest.mark.parametrize(
-    "count,recent_returns",
-    [
-        pytest.param(101, (1.0,) * 101, id="window-too-long"),
-        pytest.param(1, (1.0, 2.0), id="more-than-completed"),
-        pytest.param(1, (float("nan"),), id="nonfinite-return"),
-    ],
-)
-def test_training_scores_reject_invalid_recent_history(count: int, recent_returns: tuple[float, ...]) -> None:
-    with pytest.raises(ValueError):
-        TrainingScores(count, None, recent_returns)
 
 
 class ScoringEnv(gym.Env):
@@ -290,16 +258,8 @@ def test_evaluation_accepts_custom_recurrent_agent() -> None:
     assert env.closed
 
 
-@pytest.mark.parametrize("model_type", ("lstm", "gdn2", "mamba3"))
-def test_full_games_raw_returns_memory_and_json(tmp_path: Path, model_type: ppo.ModelType) -> None:
-    config = replace(
-        training_config(),
-        model=ppo.LSTMConfig(hidden_size=2)
-        if model_type == "lstm"
-        else ppo.GDN2Config(hidden_size=8, num_heads=1, head_dim=4, intermediate_size=8)
-        if model_type == "gdn2"
-        else ppo.Mamba3Config(hidden_size=8, num_layers=1, intermediate_size=8, state_size=4, head_dim=4),
-    )
+def test_full_games_raw_returns_memory_and_json(tmp_path: Path) -> None:
+    config = training_config()
     initial = jax.tree.map(lambda leaf: leaf + 3, ppo.ActorCritic(1, config.model).initial_carry(1))  # leaves: (1, ...)
     env = ScoringEnv()
     starts: list[bool] = []
@@ -663,7 +623,7 @@ def test_evaluation_logging_records_scores_and_report_without_mutating_state(tra
         if trainer == "ppo"
         else ppo_rnd.initial_carry(1, config.lstm_hidden_size)
     )
-    scores = TrainingScores(101, 300.0, (2.0,) * 100, length_sum=305, recent_lengths=(3,) * 100)
+    scores = TrainingScores(101, 300.0, length_sum=305)
     with (
         patch("rl2.atari_eval.make_evaluation_env", return_value=ScoringEnv()),
         patch("rl2.atari_eval._action", return_value=(jnp.asarray(0), ())) as action,
@@ -679,12 +639,9 @@ def test_evaluation_logging_records_scores_and_report_without_mutating_state(tra
     assert "eval/training_episodes" not in scalars
     assert scalars["training/total_return_mean"] == (300 / 101, 100)
     assert scalars["training/total_episodes"] == (101, 100)
-    assert scalars["training/return_mean_last_100"] == (2.0, 100)
     assert scalars["training/total_episode_length_mean"] == (305 / 101, 100)
-    assert scalars["training/episode_length_mean_last_100"] == (3.0, 100)
-    assert scalars["training/episodes_last_100"] == (100, 100)
     assert "training/return_mean_100" not in scalars
-    assert "training/last_100_episode_count" not in scalars
+    assert not any("last_100" in tag for tag in scalars)
     assert scalars["eval/human_normalized_score_percent"] == pytest.approx((100 * (5 + 20.7) / (14.6 + 20.7), 100))
     tag, text, step = writer.add_text.call_args.args
     assert tag == "eval/report" and step == 100

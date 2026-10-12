@@ -37,7 +37,7 @@ def test_tensorboard_uses_config_run_id(tmp_path: Path) -> None:
     envs.close.assert_called_once()
 
 
-def test_training_reports_raw_completed_episode_scores() -> None:
+def test_training_reports_raw_completed_episode_scores(capsys: pytest.CaptureFixture[str]) -> None:
     settings = replace(
         config(),
         env_id="ALE/Pong-v5",
@@ -109,18 +109,18 @@ def test_training_reports_raw_completed_episode_scores() -> None:
         scores = call.kwargs["training_scores"]
         assert scores.episode_count == len(expected_returns)
         assert scores.return_sum == sum(expected_returns)
-        assert scores.recent_returns == expected_returns
         assert scores.length_sum == (2 if steps == 2 else 3)
-        assert scores.recent_lengths == ((2,) if steps == 2 else (2, 1))
         assert call.args[3:] == (len(expected_returns), steps)
     for tag, expected in {
         "charts/total_return_mean": [(3.0, 2), (5.0, 4)],
         "charts/total_episode_length_mean": [(2.0, 2), (1.5, 4)],
-        "charts/return_mean_last_100": [(3.0, 2), (5.0, 4)],
-        "charts/episode_length_mean_last_100": [(2.0, 2), (1.5, 4)],
     }.items():
         logs = [call.args[1:] for call in writer.return_value.add_scalar.call_args_list if call.args[0] == tag]
         assert logs == expected
+    assert not any("last_100" in call.args[0] for call in writer.return_value.add_scalar.call_args_list)
+    progress_lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("step=")]
+    assert "return=3.0 episode_length=2.0" in progress_lines[0]
+    assert "return=5.0 episode_length=1.5" in progress_lines[1]
     envs.close.assert_called_once()
 
 

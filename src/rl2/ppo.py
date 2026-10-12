@@ -1,8 +1,8 @@
-"""Recurrent PPO for Gymnax Breakout-MinAtar with a residual CNN and an LSTM backbone.
+"""Recurrent PPO for JAX-native pixel environments with a CNN and LSTM backbone.
 
 TensorBoard outputs use training environment steps as the global step.
-Metric names use total_ for all-training statistics, _last_100 for recent episode
-history, and episodes for episode counts. Window statistics have no scope affix.
+Metric names use total_ for all-training statistics and episodes for episode
+counts. Window statistics have no scope affix.
 
 Progress scalars computed over the logging window:
     losses/policy: PPO policy loss.
@@ -28,10 +28,6 @@ Progress scalars computed across all training:
     charts/total_return_mean: Mean raw return over all completed training episodes.
     charts/total_episode_length_mean: Mean length over all completed training episodes, in steps.
 
-Progress scalars computed over recent episode history (independent of logging windows):
-    charts/return_mean_last_100: Mean raw return over up to 100 latest training episodes.
-    charts/episode_length_mean_last_100: Mean length of those episodes, in steps.
-
 Progress scalars reporting the latest rollout's settings:
     charts/learning_rate: Current learning rate.
     charts/entropy_coef: Current entropy bonus coefficient.
@@ -44,18 +40,12 @@ Evaluation scalars (when evaluation is enabled; unavailable scores are omitted):
     eval/return_std: Standard deviation of raw evaluation returns.
     eval/return_sem: Standard error of the mean raw evaluation return.
     eval/total_training_episodes: Completed training episodes at evaluation time.
-    training/total_return_mean: Mean raw return over all completed training episodes.
-    training/total_episode_length_mean: Mean length over all completed training episodes, in steps.
-    training/total_episodes: Completed episodes in the training score history.
-    training/return_mean_last_100: Mean raw return over up to 100 latest training episodes.
-    training/episode_length_mean_last_100: Mean length of those episodes, in steps.
-    training/episodes_last_100: Number of episodes in that recent history.
     time/evaluation_seconds: Evaluation wall time.
 
 Text:
     config: Full training configuration as YAML, logged at startup and on resume.
     eval/report: Complete JSON report after each evaluation, including per-episode
-        results, aggregate scores, training configuration and scores,
+        results, aggregate scores, training configuration,
         evaluation seeds and training steps/episodes.
 
 Video/images:
@@ -71,24 +61,26 @@ Video/images:
 
 Episode means are omitted when no corresponding episodes or history are available.
 
-Logging windows span log_interval_seconds (default: 60); progress metrics are emitted
+Logging windows span log_interval iterations (default: 60); progress metrics are emitted
 at rollout boundaries and on normal completion. Losses, entropy, KL, and clip fraction
 average over evaluated minibatches, including KL-rejected updates. Explained
 variance, updates per rollout, and early-stop frequency average over rollouts.
 Seconds per iteration and throughput use window wall time, including intervening
 logging, evaluation, video, and checkpoint overhead.
 Episode window means include only episodes completed within that window. Existing
-cumulative and last-100 episode statistics retain their meanings. Learning rate
+cumulative episode statistics retain their meanings. Learning rate
 and entropy coefficient report the latest rollout's settings. Evaluation and
 video schedules are independent of progress logging. Videos are recorded every
-video_interval_seconds (default: 600; 0 disables recording), at rollout boundaries.
-The video timer restarts after recording and on resume, without catch-up videos.
+video_interval iterations (default: 600; 0 disables recording). Evaluation uses
+eval_interval (default: 0, disabled); checkpoints use checkpoint_interval (default: 600).
+One iteration is a rollout and its PPO updates. All schedules use the total completed
+iteration count, including on resume. Enabled evaluation, logging, and checkpoints
+also run on normal completion.
 """
 
 import argparse
 import json
 import os
-from collections import deque
 from contextlib import ExitStack, closing
 from dataclasses import asdict, fields
 from datetime import timedelta
@@ -110,11 +102,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
+import rlax
 import yaml
 from flax import linen as nn
 from flax import struct
 from flax.training.train_state import TrainState
-from gymnax.environments.minatar.breakout import EnvState
 from numpy import stack, uint8
 from numpy.typing import NDArray
 from pydantic import ConfigDict, Field, model_validator
@@ -122,14 +114,18 @@ from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
 from rl2.configuration import load_settings
-from rl2.gymnax_env import GymnaxEnv, render_observation
+from rl2.envs.craftax_env import CraftaxConfig, CraftaxEnv
+from rl2.envs.gymnax_env import GymnaxEnv
+from rl2.envs.kinetix_env import KinetixConfig, KinetixEnv
+from rl2.envs.xminigrid_env import XMiniGridConfig, XMiniGridEnv
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
-from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages
-from rl2.training_scores import TrainingScores
+from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
 from rl2.utils import explained_variance, gae
+from rl2.xminigrid_encoder import XMiniGridEncoder
 
 type RecurrentCarry = LSTMStackCarry
+type PPOEnv = GymnaxEnv | KinetixEnv | XMiniGridEnv | CraftaxEnv
 
 
 @struct.dataclass
@@ -143,7 +139,7 @@ class PPOBatch:
         values: (*S,) rollout-time value predictions for explained variance.
         advantages: (*S,) unnormalized advantage estimates.
         returns: (*S,) value targets.
-        carry: (B, D) initial LSTM memory leaves, where D is model.hidden_size.
+        carry: (B, D) initial LSTM memory leaves, where D is model.recurrent.hidden_size.
         episode_starts: (*S,) boolean episode reset flags.
     """
 
@@ -153,7 +149,7 @@ class PPOBatch:
     values: jax.Array  # (*S,)
     advantages: jax.Array  # (*S,)
     returns: jax.Array  # (*S,)
-    carry: RecurrentCarry  # leaves: (B, D), D is model.hidden_size
+    carry: RecurrentCarry  # leaves: (B, D), D is model.recurrent.hidden_size
     episode_starts: jax.Array  # (*S,)
 
 
@@ -161,15 +157,15 @@ class RolloutCarry(NamedTuple):
     """Live environment state carried between rollouts.
 
     Attributes:
-        env_state: (B, ...) batched Gymnax state leaves.
+        env_state: (B, ...) batched environment state leaves.
         observations: (B, *O) current observations with observation dimensions O.
-        carry: (B, D) LSTM memory leaves, where D is model.hidden_size.
+        carry: (B, D) LSTM memory leaves, where D is model.recurrent.hidden_size.
         episode_starts: (B,) boolean episode reset flags.
         episode_returns: (B,) accumulated raw rewards for unfinished episodes.
         episode_lengths: (B,) step counts for unfinished episodes.
     """
 
-    env_state: EnvState  # leaves: (B, ...)
+    env_state: chex.ArrayTree  # leaves: (B, ...)
     observations: jax.Array  # (B, *O)
     carry: RecurrentCarry  # leaves: (B, ...)
     episode_starts: jax.Array  # (B,)
@@ -183,16 +179,16 @@ class RolloutResult(NamedTuple):
     Attributes:
         batch: (T, B, ...) time-major PPO arrays with (B, ...) initial memory leaves.
         key: () advanced typed PRNG key, also used for minibatch shuffling.
-        completed_returns: (T, B) raw returns, zero for unfinished episodes.
-        completed_lengths: (T, B) lengths, zero for unfinished episodes.
-        completed: (T, B) completed episode mask.
+        completed_return_sum: () sum of raw returns for completed episodes.
+        completed_length_sum: () sum of lengths for completed episodes.
+        completed_count: () number of completed episodes.
     """
 
     batch: PPOBatch  # observations: (T, B, *O); targets/starts: (T, B); carry leaves: (B, ...)
     key: jax.Array  # () typed PRNG key
-    completed_returns: jax.Array  # (T, B)
-    completed_lengths: jax.Array  # (T, B)
-    completed: jax.Array  # (T, B)
+    completed_return_sum: jax.Array  # ()
+    completed_length_sum: jax.Array  # ()
+    completed_count: jax.Array  # ()
 
 
 @struct.dataclass
@@ -215,9 +211,34 @@ class LSTMConfig:
     intermediate_size: Annotated[int, Field(ge=0, strict=True)] = 0
 
 
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class RGBEncoderConfig:
+    type: Literal["rgb"] = "rgb"
+    stages: Annotated[ConvStages, Field(min_length=1)] = DEFAULT_STAGES
+    embedding_size: Annotated[int, Field(gt=0, strict=True)] = 768
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class XMiniGridEncoderConfig:
+    type: Literal["xminigrid"] = "xminigrid"
+    token_size: Annotated[int, Field(gt=0, strict=True)] = 32
+    channels: Annotated[int, Field(gt=0, strict=True)] = 64
+    blocks: Annotated[int, Field(ge=0, strict=True)] = 2
+    embedding_size: Annotated[int, Field(gt=0, strict=True)] = 256
+
+
+type EncoderConfig = Annotated[RGBEncoderConfig | XMiniGridEncoderConfig, Field(discriminator="type")]
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class ModelConfig:
+    encoder: EncoderConfig = RGBEncoderConfig()
+    recurrent: LSTMConfig = LSTMConfig()
+
+
 @dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
 class Config:
-    env_id: Literal["Breakout-MinAtar"]
+    env_id: Literal["Breakout-MinAtar", "Kinetix", "XLand-MiniGrid", "Craftax"]
     seed: int
     total_steps: int
     num_envs: Annotated[int, Field(gt=0)]
@@ -237,17 +258,19 @@ class Config:
     video_speed: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     bf16: bool = True
     video_max_frames: Annotated[int, Field(gt=0)] | None = 900
-    video_interval_seconds: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 600.0
-    eval_interval_seconds: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
+    video_interval: Annotated[int, Field(ge=0)] = 600
+    eval_interval: Annotated[int, Field(ge=0)] = 0
     eval_episodes: Annotated[int, Field(gt=0)] = 100
     eval_seed: Annotated[int, Field(ge=0, lt=2**32)] = 10_000
-    encoder_stages: ConvStages = DEFAULT_STAGES
-    model: LSTMConfig = LSTMConfig()
+    model: ModelConfig = ModelConfig()
     lr_decay: Literal["linear", "cosine"] = "linear"
     entropy_decay: Literal["constant", "cosine"] = "constant"
     run_id: str | None = None
-    checkpoint_interval_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 600.0
-    log_interval_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 60.0
+    checkpoint_interval: Annotated[int, Field(gt=0)] = 600
+    log_interval: Annotated[int, Field(gt=0)] = 60
+    kinetix: KinetixConfig = KinetixConfig()
+    xminigrid: XMiniGridConfig = XMiniGridConfig()
+    craftax: CraftaxConfig = CraftaxConfig()
 
     def __post_init__(self) -> None:
         if self.run_id is not None and (
@@ -257,6 +280,14 @@ class Config:
 
     @model_validator(mode="after")
     def validate_rollout(self) -> Self:
+        if self.model.encoder.type == "xminigrid" and self.env_id != "XLand-MiniGrid":
+            raise ValueError("xminigrid encoder requires env_id: XLand-MiniGrid")
+        if self.env_id != "Kinetix" and self.kinetix != KinetixConfig():
+            raise ValueError("kinetix settings require env_id: Kinetix")
+        if self.env_id != "XLand-MiniGrid" and self.xminigrid != XMiniGridConfig():
+            raise ValueError("xminigrid settings require env_id: XLand-MiniGrid")
+        if self.env_id != "Craftax" and self.craftax != CraftaxConfig():
+            raise ValueError("craftax settings require env_id: Craftax")
         if self.num_envs % self.num_minibatches:
             raise ValueError("num_envs must be divisible by num_minibatches to preserve sequences")
         if self.total_steps < self.num_envs * self.num_steps:
@@ -264,13 +295,21 @@ class Config:
         return self
 
 
+def make_env(config: Config) -> PPOEnv:
+    if config.env_id == "Kinetix":
+        return KinetixEnv(config.kinetix)
+    if config.env_id == "XLand-MiniGrid":
+        return XMiniGridEnv(config.xminigrid, rgb=config.model.encoder.type == "rgb")
+    if config.env_id == "Craftax":
+        return CraftaxEnv(config.craftax)
+    return GymnaxEnv(config.env_id)
+
+
 class TrainingProgress(NamedTuple):
     state: TrainState
     key: jax.Array  # () typed PRNG key
     iteration: int  # Number of completed rollouts, independent of optimizer steps.
     completed_episodes: int
-    recent_returns: tuple[float, ...]
-    recent_lengths: tuple[int, ...]
     training_return_sum: float | None = None
     training_length_sum: int | None = None
 
@@ -294,12 +333,10 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
             state=ocp.args.StandardSave({"train_state": progress.state, "key": key_data}),
             metadata=ocp.args.JsonSave(
                 {
-                    "version": 2,
+                    "version": 3,
                     "config": asdict(config),
                     "iteration": progress.iteration,
                     "completed_episodes": progress.completed_episodes,
-                    "recent_returns": list(progress.recent_returns),
-                    "recent_lengths": list(progress.recent_lengths),
                     "training_return_sum": progress.training_return_sum,
                     "training_length_sum": progress.training_length_sum,
                 }
@@ -314,13 +351,19 @@ def restore_checkpoint(manager: ocp.CheckpointManager, state: TrainState, config
     if iteration is None:
         return None
     metadata = manager.restore(iteration, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
-    if metadata["version"] not in (1, 2):
+    if metadata["version"] not in (1, 2, 3):
         raise ValueError("Unsupported PPO checkpoint version")
     if metadata["iteration"] != iteration or iteration < 0 or metadata["completed_episodes"] < 0:
         raise ValueError("Invalid PPO checkpoint progress")
     saved_config = metadata["config"]
     if saved_config.get("env_id", config.env_id) != config.env_id:
         raise ValueError("Cannot resume PPO with a different environment; use a new run directory")
+    if config.env_id == "Kinetix" and KinetixConfig(**saved_config.get("kinetix", {})) != config.kinetix:
+        raise ValueError("Cannot resume PPO with different kinetix settings; use a new run directory")
+    if config.env_id == "XLand-MiniGrid" and XMiniGridConfig(**saved_config.get("xminigrid", {})) != config.xminigrid:
+        raise ValueError("Cannot resume PPO with different xminigrid settings; use a new run directory")
+    if config.env_id == "Craftax" and CraftaxConfig(**saved_config.get("craftax", {})) != config.craftax:
+        raise ValueError("Cannot resume PPO with different craftax settings; use a new run directory")
     # Progress and schedules count rollouts, so each must still represent the same number of steps.
     if (
         "num_envs" in saved_config
@@ -345,8 +388,6 @@ def restore_checkpoint(manager: ocp.CheckpointManager, state: TrainState, config
         jax.random.wrap_key_data(restored["key"]),
         iteration,
         metadata["completed_episodes"],
-        tuple(metadata["recent_returns"]),
-        tuple(metadata["recent_lengths"]),
         metadata.get("training_return_sum"),
         metadata.get("training_length_sum"),
     )
@@ -355,8 +396,6 @@ def restore_checkpoint(manager: ocp.CheckpointManager, state: TrainState, config
 def load_config(path: str | Path) -> Config:
     """Load, resolve all interpolations and the run ID, and validate a training config."""
     settings = load_settings(path)
-    if "encoder_stages" in settings:
-        settings["encoder_stages"] = tuple(ConvStage(**stage) for stage in settings["encoder_stages"])
     return Config(**settings)
 
 
@@ -380,17 +419,15 @@ def entropy_coef_schedule(config: Config) -> optax.Schedule:
 
 class ActorCritic(nn.Module):
     num_actions: int
-    model: LSTMConfig = LSTMConfig()
+    model: ModelConfig = ModelConfig()
     dtype: jax.typing.DTypeLike = jnp.float32
-    encoder_stages: ConvStages = DEFAULT_STAGES
-    embedding_size: int = 768
 
     @nn.nowrap
     def _make_recurrent(self, *, parent: nn.Module | None = None) -> LSTMStack:
         return LSTMStack(
-            self.model.hidden_size,
-            self.model.num_layers,
-            self.model.intermediate_size,
+            self.model.recurrent.hidden_size,
+            self.model.recurrent.num_layers,
+            self.model.recurrent.intermediate_size,
             dtype=self.dtype,
             name="lstm",
             parent=parent,
@@ -401,14 +438,22 @@ class ActorCritic(nn.Module):
         return self._make_recurrent().initial_carry(num_envs)
 
     def setup(self) -> None:
-        self.encoder = ConvObservationEncoder(
-            stages=self.encoder_stages,
-            embedding_size=self.embedding_size,
-            dtype=self.dtype,
-            name="encoder",
-        )
+        encoder = self.model.encoder
+        if encoder.type == "rgb":
+            self.encoder = ConvObservationEncoder(
+                stages=encoder.stages, embedding_size=encoder.embedding_size, dtype=self.dtype, name="encoder"
+            )
+        else:
+            self.encoder = XMiniGridEncoder(
+                token_size=encoder.token_size,
+                channels=encoder.channels,
+                blocks=encoder.blocks,
+                embedding_size=encoder.embedding_size,
+                dtype=self.dtype,
+                name="encoder",
+            )
         self.recurrent = self._make_recurrent(parent=self)
-        self.recurrent_input = nn.Dense(self.model.hidden_size, dtype=self.dtype, name="lstm_input")
+        self.recurrent_input = nn.Dense(self.model.recurrent.hidden_size, dtype=self.dtype, name="lstm_input")
         init = nn.initializers.orthogonal(sqrt(2))
         self.policy_hidden = nn.Dense(512, kernel_init=init, name="policy_hidden", dtype=self.dtype)
         self.policy_norm = nn.LayerNorm(name="policy_norm", dtype=self.dtype)
@@ -421,9 +466,9 @@ class ActorCritic(nn.Module):
             1, kernel_init=nn.initializers.orthogonal(1.0), name="value_output", dtype=self.dtype
         )
 
-    def _encode(self, obs: jax.Array) -> jax.Array:  # (B, F, H, W[, C]) -> (B, D)
-        x = self.encoder(obs)  # (B, E), E is embedding_size
-        return self.recurrent_input(x).astype(self.dtype)  # (B, D), D is model.hidden_size
+    def _encode(self, obs: jax.Array) -> jax.Array:  # (B, *O) -> (B, D)
+        x = self.encoder(obs)  # (B, E), E is model.encoder.embedding_size
+        return self.recurrent_input(x).astype(self.dtype)  # (B, D), D is model.recurrent.hidden_size
 
     def _heads(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:  # (B, D) -> (B, A), (B,)
         x = x.astype(self.dtype)  # (B, D)
@@ -436,11 +481,11 @@ class ActorCritic(nn.Module):
 
     def __call__(
         self,
-        obs: jax.Array,  # (T, B, F, H, W[, C])
+        obs: jax.Array,  # (T, B, *O): RGB (F,H,W[,3]) or categorical (H,W,2)
         carry: RecurrentCarry,  # leaves: (B, ...)
         episode_starts: jax.Array,  # (T, B)
     ) -> tuple[RecurrentCarry, jax.Array, jax.Array]:  # carry leaves: (B, ...); (T, B, A); (T, B)
-        """Process time-stacked observations [T,B,F,H,W,(C)] and reset masks [T,B]."""
+        """Process obs: (T, B, *O) observations and episode_starts: (T, B) reset masks."""
         chex.assert_rank(obs, {5, 6})
         steps, environments = obs.shape[:2]
         x = self._encode(obs.reshape((-1, *obs.shape[2:])))  # (T * B, D)
@@ -454,11 +499,11 @@ class ActorCritic(nn.Module):
 
     def step(
         self,
-        obs: jax.Array,  # (B, F, H, W[, C])
+        obs: jax.Array,  # (B, *O): RGB (F,H,W[,3]) or categorical (H,W,2)
         carry: RecurrentCarry,  # leaves: (B, ...)
         episode_starts: jax.Array,  # (B,)
     ) -> tuple[RecurrentCarry, jax.Array, jax.Array]:  # carry leaves: (B, ...); (B, A); (B,)
-        """Process one observation per environment [B,F,H,W,(C)] with reset masks [B]."""
+        """Process obs: (B, *O) observations and episode_starts: (B,) reset masks."""
         chex.assert_rank(obs, {4, 5})
         x = self._encode(obs)  # (B, D)
         carry, x = self.recurrent.step(x, carry, episode_starts)  # carry leaves: (B, ...); x: (B, D)
@@ -510,30 +555,30 @@ def play_episode(
     initial_carry: RecurrentCarry,  # leaves: (1, ...)
     *,
     record: bool,
-    env: GymnaxEnv,
+    env: PPOEnv,
     stop_at_frame_limit: bool = False,
 ) -> tuple[float, int, list[NDArray[uint8]]]:
     """Run one episode; frames: list of (H, W, 3) uint8 RGB images."""
     key, reset_key = jax.random.split(key)  # each () typed PRNG key
-    observations, env_state = env.reset(reset_key, 1)  # (1, C, H, W); leaves: (1, ...)
+    observation, env_state = env.reset(reset_key, env.params)  # (*O,); leaves: (...)
     memory = initial_carry  # leaves: (1, ...)
     frames: list[NDArray[uint8]] = []  # entries: (H, W, 3)
     if record:
-        frames.append(np.asarray(render_observation(observations[0])))
+        frames.append(np.asarray(env.render_observation(observation)))
     episode_return = 0.0
     length = 0
     while not (stop_at_frame_limit and config.video_max_frames is not None and len(frames) >= config.video_max_frames):
         key, action_key, env_key = jax.random.split(key, 3)  # each () typed PRNG key
         actions, _, _, memory = act(
-            state, observations, memory, jnp.full(1, length == 0, dtype=bool), action_key
+            state, observation[None], memory, jnp.full(1, length == 0, dtype=bool), action_key
         )  # 3 x (1,); memory leaves: (1, ...)
-        transition = env.step(env_key, env_state, actions)
-        observations, env_state = transition.observations, transition.state  # (1,C,H,W); leaves: (1,...)
-        episode_return += float(transition.rewards[0])
+        observation, env_state, reward, done, info = env.step(env_key, env_state, actions[0], env.params)
+        # observation: (*O,); state leaves: (...); reward/done: (); info final_observation: (*O,)
+        episode_return += float(reward)
         length += 1
         if record and (config.video_max_frames is None or len(frames) < config.video_max_frames):
-            frames.append(np.asarray(render_observation(transition.final_observations[0])))
-        if bool((transition.terminated | transition.truncated)[0]):
+            frames.append(np.asarray(env.render_observation(info["final_observation"])))
+        if bool(done):
             break
     return episode_return, length, frames
 
@@ -554,7 +599,7 @@ def log_video(
         initial_carry,
         record=True,
         stop_at_frame_limit=True,
-        env=GymnaxEnv(config.env_id),
+        env=make_env(config),
     )
     video = stack(frames).transpose(0, 3, 1, 2)[None]  # (1, T, 3, H, W)
     writer.add_video("gameplay", video, steps, fps=10 * config.video_speed)
@@ -569,12 +614,11 @@ def log_evaluation(
     steps: int,
     *,
     initial_carry: RecurrentCarry,  # leaves: (1, ...)
-    training_scores: TrainingScores | None = None,
 ) -> None:
-    """Evaluate fixed Gymnax seeds, log raw scores, and record the last episode."""
+    """Evaluate fixed environment seeds, log raw scores, and record the last episode."""
     started = monotonic()
     episodes: list[dict[str, float | int]] = []
-    env = GymnaxEnv(config.env_id)
+    env = make_env(config)
     for index in range(config.eval_episodes):
         score, length, frames = play_episode(
             state,
@@ -600,16 +644,11 @@ def log_evaluation(
         "training_config": asdict(config),
         "training_steps": steps,
         "training_episodes": episode,
-        "training_scores": training_scores.as_report() if training_scores is not None else None,
     }
     for name in ("return_mean", "return_std", "return_sem"):
         if result[name] is not None:
             writer.add_scalar(f"eval/{name}", result[name], steps)
     writer.add_scalar("eval/total_training_episodes", episode, steps)
-    if result["training_scores"] is not None:
-        for name, score in result["training_scores"].items():
-            if score is not None:
-                writer.add_scalar(f"training/{name}", score, steps)
     writer.add_scalar("time/evaluation_seconds", monotonic() - started, steps)
     writer.add_text("eval/report", f"```json\n{json.dumps(result, indent=2, allow_nan=False)}\n```", steps)
     print(f"Evaluation: return={result['return_mean']:.1f} over {config.eval_episodes} games", flush=True)
@@ -632,17 +671,17 @@ def update(
     if advantages.size > 1:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # (*S,)
 
-    def loss_fn(params: optax.Params) -> tuple[jax.Array, PPOMetrics]:
+    def loss_fn(params: optax.Params) -> tuple[jax.Array, PPOMetrics]:  # (); scalar metric leaves
         _, logits, values = state.apply_fn(
             {"params": params}, batch.observations, batch.carry, batch.episode_starts
         )  # carry leaves: (B, ...); logits: (*S, A); values: (*S,)
         log_probs = action_log_prob(logits, batch.actions)  # (*S,)
         log_ratio = log_probs - batch.old_log_probs  # (*S,)
         ratio = jnp.exp(log_ratio)  # (*S,)
-        clipped = jnp.clip(ratio, 1 - config.clip_coef, 1 + config.clip_coef)  # (*S,)
-        policy_loss = -jnp.minimum(ratio * advantages, clipped * advantages).mean()  # ()
-        value_loss = 0.5 * jnp.square(values - batch.returns).mean()  # ()
-        entropy = -(jax.nn.softmax(logits) * jax.nn.log_softmax(logits)).sum(-1).mean()  # ()
+        flat_ratio, flat_advantages = jax.tree.map(jnp.ravel, (ratio, advantages))  # (N,), N = prod(S)
+        policy_loss = rlax.clipped_surrogate_pg_loss(flat_ratio, flat_advantages, config.clip_coef)  # ()
+        value_loss = rlax.l2_loss(values, batch.returns).mean()  # ()
+        entropy = -rlax.entropy_loss(logits.reshape((-1, logits.shape[-1])), jnp.ones_like(flat_ratio))  # ()
         entropy_loss = -entropy_coef * entropy  # ()
         loss = policy_loss + config.value_coef * value_loss + entropy_loss  # ()
         approx_kl = (jnp.expm1(log_ratio) - log_ratio).mean()  # ()
@@ -671,50 +710,65 @@ def update(
 def collect_rollout(
     rollout_carry: RolloutCarry,  # observations: (B, *O); state/memory leaves: (B, ...)
     train_state: TrainState,
-    envs: GymnaxEnv,
+    envs: PPOEnv,
     config: Config,
     key: jax.Array,  # () typed PRNG key
 ) -> tuple[RolloutCarry, RolloutResult]:
     """Collect (T, B, ...) transitions entirely on device and compute GAE.
 
     Timeouts bootstrap from final observations; both end flags reset recurrence.
-    Completed episode arrays retain fixed (T, B) shapes for JIT compilation.
+    Completed episode returns, lengths, and count are reduced to scalars on device.
     """
+    type Runner = tuple[RolloutCarry, jax.Array, tuple[jax.Array, jax.Array, jax.Array]]
 
     def step(
-        runner: tuple[RolloutCarry, jax.Array],  # state leaves: (B, ...); key: ()
+        runner: Runner,  # state leaves: (B, ...); key/completed totals: ()
         _: None,
-    ) -> tuple[tuple[RolloutCarry, jax.Array], tuple[jax.Array, ...]]:
-        current, key = runner
+    ) -> tuple[Runner, tuple[jax.Array, ...]]:
+        current, key, completed = runner  # state leaves: (B, ...); key/completed totals: ()
         key, action_key, env_key = jax.random.split(key, 3)  # each () typed PRNG key
         actions, log_probs, predictions, memory = act(
             train_state, current.observations, current.carry, current.episode_starts, action_key
         )  # 3 x (B,); memory leaves: (B, ...)
-        transition = envs.step(env_key, current.env_state, actions)
-        done = transition.terminated | transition.truncated  # (B,)
-        timeout = transition.truncated & ~transition.terminated  # (B,)
+        env_keys = jax.random.split(env_key, config.num_envs)  # (B,) typed PRNG keys
+        observations, env_state, raw_rewards, done, info = jax.vmap(envs.step, in_axes=(0, 0, 0, None))(
+            env_keys, current.env_state, actions, envs.params
+        )  # observations: (B,*O); state leaves: (B,...); rewards/done/flags: (B,); final_observation: (B,*O)
+        timeout = info["truncated"] & ~info["terminated"]  # (B,)
 
         def bootstrap(_: None) -> jax.Array:
             predictions = value(
-                train_state, transition.final_observations, memory, jnp.zeros(config.num_envs, dtype=bool)
+                train_state, info["final_observation"], memory, jnp.zeros(config.num_envs, dtype=bool)
             )  # (B,)
             return jnp.where(timeout, predictions, 0.0)  # (B,)
 
         def no_bootstrap(_: None) -> jax.Array:
             return jnp.zeros(config.num_envs)  # (B,)
 
-        rewards = transition.rewards + config.gamma * jax.lax.cond(timeout.any(), bootstrap, no_bootstrap, None)  # (B,)
-        episode_returns = current.episode_returns + transition.rewards  # (B,)
+        rewards = raw_rewards + config.gamma * jax.lax.cond(timeout.any(), bootstrap, no_bootstrap, None)  # (B,)
+        episode_returns = current.episode_returns + raw_rewards  # (B,)
         episode_lengths = current.episode_lengths + 1  # (B,)
+        completed = jax.tree.map(
+            jnp.add,
+            completed,
+            jax.tree.map(
+                jnp.sum,
+                (
+                    jnp.where(done, episode_returns, 0.0),  # (B,)
+                    jnp.where(done, episode_lengths, 0),  # (B,)
+                    done,  # (B,)
+                ),
+            ),
+        )  # each ()
         advanced = RolloutCarry(
-            env_state=transition.state,  # leaves: (B, ...)
-            observations=transition.observations,  # (B, *O)
+            env_state=env_state,  # leaves: (B, ...)
+            observations=observations,  # (B, *O)
             carry=memory,  # leaves: (B, ...)
             episode_starts=done,  # (B,)
             episode_returns=jnp.where(done, 0.0, episode_returns),  # (B,)
             episode_lengths=jnp.where(done, 0, episode_lengths),  # (B,)
         )
-        return (advanced, key), (
+        return (advanced, key, completed), (
             current.observations,  # (B, *O)
             actions,  # (B,)
             log_probs,  # (B,)
@@ -722,12 +776,18 @@ def collect_rollout(
             rewards,  # (B,)
             done,  # (B,)
             current.episode_starts,  # each (B,)
-            jnp.where(done, episode_returns, 0.0),  # (B,)
-            jnp.where(done, episode_lengths, 0),  # (B,)
         )
 
-    (advanced, key), trajectory = jax.lax.scan(step, (rollout_carry, key), None, length=config.num_steps)
-    observations, actions, log_probs, values, rewards, dones, starts, completed_returns, completed_lengths = trajectory
+    completed = jax.tree.map(
+        jnp.zeros_like,
+        jax.tree.map(
+            jnp.sum, (rollout_carry.episode_returns, rollout_carry.episode_lengths, rollout_carry.episode_starts)
+        ),
+    )  # each ()
+    (advanced, key, completed), trajectory = jax.lax.scan(
+        step, (rollout_carry, key, completed), None, length=config.num_steps
+    )
+    observations, actions, log_probs, values, rewards, dones, starts = trajectory
     # observations: (T, B, *O); other trajectory arrays: (T, B)
     next_value = value(train_state, advanced.observations, advanced.carry, advanced.episode_starts)  # (B,)
     advantages, returns = gae(rewards, dones, values, next_value, config.gamma, config.gae_lambda)  # each (T, B)
@@ -741,7 +801,8 @@ def collect_rollout(
         carry=rollout_carry.carry,  # leaves: (B, ...)
         episode_starts=starts,  # (T, B)
     )
-    return advanced, RolloutResult(batch, key, completed_returns, completed_lengths, dones)
+    completed_return_sum, completed_length_sum, completed_count = completed  # each ()
+    return advanced, RolloutResult(batch, key, completed_return_sum, completed_length_sum, completed_count)
 
 
 def train(config: Config) -> TrainState:
@@ -749,17 +810,17 @@ def train(config: Config) -> TrainState:
     with ExitStack() as resources:
         configure_compilation_cache()
         batch_size = config.num_envs * config.num_steps
-        envs = GymnaxEnv(config.env_id)
+        envs = make_env(config)
         run_name = config.run_id
         run_dir = config.log_dir
         manager = resources.enter_context(closing(checkpoint_manager(run_dir)))
         key, init_key, reset_key = jax.random.split(jax.random.key(config.seed), 3)  # each () typed PRNG key
-        obs, env_state = envs.reset(reset_key, config.num_envs)  # (B, *O); state leaves: (B, ...)
+        reset_keys = jax.random.split(reset_key, config.num_envs)  # (B,) typed PRNG keys
+        obs, env_state = jax.vmap(envs.reset, in_axes=(0, None))(reset_keys, envs.params)  # (B,*O); leaves: (B,...)
         model = ActorCritic(
             envs.num_actions,
             config.model,
             dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
-            encoder_stages=config.encoder_stages,
         )
         carry = model.initial_carry(config.num_envs)  # leaves: (B, ...)
         episode_start = jnp.ones(config.num_envs, dtype=bool)  # (B,)
@@ -778,8 +839,6 @@ def train(config: Config) -> TrainState:
         )
         progress = restore_checkpoint(manager, state, config)
         start_iteration = 0
-        recent_returns: deque[float] = deque(maxlen=100)
-        recent_lengths: deque[int] = deque(maxlen=100)
         completed_episodes = 0
         training_return_sum: float | None = 0.0
         training_length_sum: int | None = 0
@@ -789,16 +848,13 @@ def train(config: Config) -> TrainState:
                 key,
                 start_iteration,
                 completed_episodes,
-                saved_returns,
-                saved_lengths,
                 training_return_sum,
                 training_length_sum,
             ) = progress
-            recent_returns.extend(saved_returns)
-            recent_lengths.extend(saved_lengths)
             # Live environment states are not serialized. Start fresh episodes
             # with fresh recurrent memory, retaining the policy and training RNGs.
-            obs, env_state = envs.reset(jax.random.fold_in(key, start_iteration), config.num_envs)  # (B, *O)
+            reset_keys = jax.random.split(jax.random.fold_in(key, start_iteration), config.num_envs)  # (B,) keys
+            obs, env_state = jax.vmap(envs.reset, in_axes=(0, None))(reset_keys, envs.params)  # (B,*O); leaves: (B,...)
             print(f"Resumed run {run_name} at step {start_iteration * batch_size}", flush=True)
         initial_steps = start_iteration * batch_size
         writer = resources.enter_context(
@@ -832,9 +888,6 @@ def train(config: Config) -> TrainState:
         window_episodes = 0
         window_return_sum = 0.0
         window_length_sum = 0
-        last_checkpoint_time = start
-        next_video_time = start + config.video_interval_seconds
-        next_eval_time = start + config.eval_interval_seconds
         num_iterations = config.total_steps // batch_size
         for iteration in range(start_iteration, num_iterations):
             rollout_carry, rollout = collect_rollout(
@@ -842,15 +895,12 @@ def train(config: Config) -> TrainState:
             )  # carry: (B, ...); rollout arrays: (T, B, ...)
             batch = rollout.batch  # observations: (T, B, *O); targets/starts: (T, B); carry leaves: (B, ...)
             key = rollout.key  # () typed PRNG key
-            completed, returns, lengths = jax.device_get(
-                (rollout.completed, rollout.completed_returns, rollout.completed_lengths)
-            )  # each (T, B), host arrays
-            finished_returns, finished_lengths = returns[completed], lengths[completed]  # each (D,)
-            recent_returns.extend(finished_returns.tolist())
-            recent_lengths.extend(finished_lengths.tolist())
-            finished_count = finished_returns.size
-            finished_return_sum = float(finished_returns.sum())
-            finished_length_sum = int(finished_lengths.sum())
+            count, return_sum, length_sum = jax.device_get(
+                (rollout.completed_count, rollout.completed_return_sum, rollout.completed_length_sum)
+            )  # each (), host arrays
+            finished_count = int(count)
+            finished_return_sum = float(return_sum)
+            finished_length_sum = int(length_sum)
             window_episodes += finished_count
             window_return_sum += finished_return_sum
             window_length_sum += finished_length_sum
@@ -907,11 +957,11 @@ def train(config: Config) -> TrainState:
                 "policy/early_stop": early_stop,
             }.items():
                 window_rollout_sums[tag] = window_rollout_sums.get(tag, 0.0) + float(scalar)
-            if config.video_interval_seconds and monotonic() >= next_video_time:
+            if config.video_interval and (iteration + 1) % config.video_interval == 0:
                 log_video(state, config, writer, completed_episodes, steps, initial_carry=model.initial_carry(1))
-                # Restart after recording so long videos never cause catch-up recordings.
-                next_video_time = monotonic() + config.video_interval_seconds
-            if config.eval_interval_seconds and (iteration + 1 == num_iterations or monotonic() >= next_eval_time):
+            if config.eval_interval and (
+                (iteration + 1) % config.eval_interval == 0 or iteration + 1 == num_iterations
+            ):
                 log_evaluation(
                     state,
                     config,
@@ -919,19 +969,10 @@ def train(config: Config) -> TrainState:
                     completed_episodes,
                     steps,
                     initial_carry=model.initial_carry(1),
-                    training_scores=TrainingScores(
-                        completed_episodes,
-                        training_return_sum,
-                        tuple(float(score) for score in recent_returns),
-                        length_sum=training_length_sum,
-                        recent_lengths=tuple(recent_lengths),
-                    ),
                 )
-                # Restart after evaluation so long evaluations never cause catch-up runs.
-                next_eval_time = monotonic() + config.eval_interval_seconds
-            now = monotonic()
-            window_seconds = now - window_start
-            if window_seconds >= config.log_interval_seconds or iteration + 1 == num_iterations:
+            if (iteration + 1) % config.log_interval == 0 or iteration + 1 == num_iterations:
+                now = monotonic()
+                window_seconds = now - window_start
                 mean_metrics = {name: total / window_metric_count for name, total in window_metric_sums.items()}
                 rate_seconds = max(window_seconds, 1e-9)
                 sps = (steps - window_steps) / rate_seconds
@@ -963,9 +1004,7 @@ def train(config: Config) -> TrainState:
                 if window_episodes:
                     scalars["charts/return_mean"] = window_return_sum / window_episodes
                     scalars["charts/episode_length_mean"] = window_length_sum / window_episodes
-                if recent_returns:
-                    scalars["charts/return_mean_last_100"] = sum(recent_returns) / len(recent_returns)
-                    scalars["charts/episode_length_mean_last_100"] = sum(recent_lengths) / len(recent_lengths)
+                if completed_episodes:
                     if training_return_sum is not None:
                         scalars["charts/total_return_mean"] = training_return_sum / completed_episodes
                     if training_length_sum is not None:
@@ -976,7 +1015,7 @@ def train(config: Config) -> TrainState:
                 score = f"{window_return_sum / window_episodes:.1f}" if window_episodes else "n/a"
                 length = f"{window_length_sum / window_episodes:.1f}" if window_episodes else "n/a"
                 print(
-                    f"step={steps} episodes={completed_episodes} return={score} "
+                    f"iteration={iteration + 1} step={steps} episodes={completed_episodes} return={score} "
                     f"episode_length={length} "
                     f"iterations/s={scalars['charts/iterations_per_second']:.3f} "
                     f"observations/s={sps:.3f} episodes/s={scalars['charts/episodes_per_second']:.3f} "
@@ -999,10 +1038,7 @@ def train(config: Config) -> TrainState:
                 window_episodes = 0
                 window_return_sum = 0.0
                 window_length_sum = 0
-            if (
-                monotonic() - last_checkpoint_time >= config.checkpoint_interval_seconds
-                or iteration + 1 == num_iterations
-            ):
+            if (iteration + 1) % config.checkpoint_interval == 0 or iteration + 1 == num_iterations:
                 save_checkpoint(
                     manager,
                     TrainingProgress(
@@ -1010,14 +1046,11 @@ def train(config: Config) -> TrainState:
                         key,
                         iteration + 1,
                         completed_episodes,
-                        tuple(float(v) for v in recent_returns),
-                        tuple(int(v) for v in recent_lengths),
                         training_return_sum,
                         training_length_sum,
                     ),
                     config,
                 )
-                last_checkpoint_time = monotonic()
         return state
 
 

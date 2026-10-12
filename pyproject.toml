@@ -25,12 +25,22 @@ dependencies = [
     "pydantic>=2.13,<3",
     "pyyaml>=6,<7",
     "reasoning-gym>=0.1.25",
+    "rlax>=0.1.8,<0.2",
     "ruff>=0.16.9",
     "tensorboard>=2.18,<3",
     "tensorboardx>=2.6.5,<3",
 ]
 
 [project.optional-dependencies]
+xminigrid = [
+    "xminigrid==0.9.3",
+]
+craftax = [
+    "craftax==1.6.1",
+]
+kinetix = [
+    "kinetix-env==3.0.2",
+]
 alphazero = [
     "pgx>=2.6,<3",
     "mctx>=0.0.6,<0.1",
@@ -69,6 +79,37 @@ line-length = 120
 # Kauldron also requests desktop OpenCV; both variants install the same cv2 files.
 # Use the explicit headless dependency above for server-side Atari preprocessing.
 exclude-dependencies = ["opencv-python"]
+
+# Relax Kinetix's JAX/MoviePy constraints and use Jax2D's current jnp.clip API.
+# Its environment API is tested against rl2's versions; its training scripts are unused.
+[[tool.uv.dependency-metadata]]
+name = "kinetix-env"
+version = "3.0.2"
+requires-dist = [
+    "jax>=0.4.37",
+    "distrax",
+    "optax",
+    "flax>=0.10.4",
+    "numpy",
+    "argparse",
+    "wandb",
+    "orbax-checkpoint",
+    "pygame",
+    "gymnax",
+    "chex",
+    "matplotlib",
+    "imageio",
+    "seaborn",
+    "hydra-core",
+    "safetensors",
+    "pygame_widgets==1.1.5",
+    "jaxgl",
+    "jax2d==1.0.2",
+    "moviepy>=1.0.3",
+    "zarr==2.18.3",
+    "numcodecs==0.13.1",
+    "grain",
+]
 
 [dependency-groups]
 dev = [
