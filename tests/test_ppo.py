@@ -25,7 +25,6 @@ from rl2.ppo import (
     load_config,
     train,
     update,
-    value,
 )
 
 
@@ -322,8 +321,7 @@ def test_recurrent_sequences_match_steps_and_reset_only_finished_env() -> None:
         np.testing.assert_allclose(actual, expected, atol=5e-6)
     # Splitting a rollout preserves memory; bootstrapping must not consume it.
     prefix_carry, _, _ = apply(params, obs[:2], model.initial_carry(2), starts[:2])
-    state = TrainState.create(apply_fn=model.apply, params=params["params"], tx=optax.sgd(0.0))
-    peek = value(state, obs[2], prefix_carry, starts[2])
+    peek = step(params, obs[2], prefix_carry, starts[2])[2]  # (B,)
     np.testing.assert_allclose(peek, values[2], atol=5e-6)
     _, suffix_logits, suffix_values = apply(params, obs[2:], prefix_carry, starts[2:])
     np.testing.assert_allclose(suffix_values, values[2:], atol=5e-6)
@@ -556,7 +554,6 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         patch.object(
             model, "apply", return_value=(carry, jnp.array([[0.0, -jnp.inf]]), zeros)
         ),  # carry leaves: (B,H); (B,A); (B,)
-        patch("rl2.ppo.value", return_value=zeros),
         patch("rl2.ppo.update", side_effect=fake_update),
         patch("rl2.ppo.explained_variance", side_effect=(0.2, 0.4, 0.8)),
         patch("rl2.ppo.monotonic", side_effect=now),
@@ -708,7 +705,6 @@ def test_video_schedule_uses_iterations(interval: int, expected_steps: list[int]
         patch.object(
             model, "apply", return_value=(carry, jnp.array([[0.0, -jnp.inf]]), zeros)
         ),  # carry leaves: (B,H); (B,A); (B,)
-        patch.object(ppo, "value", return_value=zeros),
         patch.object(ppo, "update", side_effect=advance_update),
         patch.object(ppo, "monotonic", side_effect=now),
         patch.object(ppo, "checkpoint_manager"),
@@ -793,7 +789,6 @@ def test_train_evaluates_final_policy(
         patch.object(
             model, "apply", return_value=(carry, jnp.array([[0.0, -jnp.inf]]), zeros)
         ),  # carry leaves: (B,H); (B,A); (B,)
-        patch.object(ppo, "value", return_value=zeros),
         patch.object(ppo, "update", side_effect=advance_update),
         patch.object(ppo, "monotonic", side_effect=now),
         patch.object(ppo, "checkpoint_manager"),

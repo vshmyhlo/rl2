@@ -347,7 +347,6 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         patch.object(
             model, "apply", return_value=(carry, jnp.array([[0.0, -jnp.inf]]), zeros)
         ),  # carry leaves: (B,H); (B,A); (B,)
-        patch.object(ppo, "value", return_value=zeros),
         patch.object(ppo, "update", side_effect=update),
         patch.object(ppo, "monotonic", side_effect=lambda: clock + 0.01),
         patch.object(ppo, "checkpoint_manager"),

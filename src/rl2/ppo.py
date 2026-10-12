@@ -701,12 +701,27 @@ def collect_rollout(
     Timeouts bootstrap from final observations; both end flags reset recurrence.
     Completed episode returns, lengths, and count are reduced to scalars on device.
     """
-    type Runner = tuple[RolloutCarry, jax.Array, tuple[jax.Array, jax.Array, jax.Array]]
+
+    class Runner(NamedTuple):
+        current: RolloutCarry  # state leaves: (B, ...)
+        key: jax.Array  # () typed PRNG key
+        completed: tuple[jax.Array, jax.Array, jax.Array]  # each () return sum, length sum, count
+
+    class Transition(NamedTuple):
+        """S is (B,) per step or (T, B) after scanning."""
+
+        observations: jax.Array  # (*S, *O)
+        actions: jax.Array  # (*S,)
+        log_probs: jax.Array  # (*S,)
+        values: jax.Array  # (*S,)
+        rewards: jax.Array  # (*S,)
+        dones: jax.Array  # (*S,)
+        episode_starts: jax.Array  # (*S,)
 
     def step(
         runner: Runner,  # state leaves: (B, ...); key/completed totals: ()
         _: None,
-    ) -> tuple[Runner, tuple[jax.Array, ...]]:
+    ) -> tuple[Runner, Transition]:
         current, key, completed = runner  # state leaves: (B, ...); key/completed totals: ()
         key, action_key, env_key = jax.random.split(key, 3)  # each () typed PRNG key
         memory, logits, predictions = train_state.apply_fn(
@@ -760,14 +775,14 @@ def collect_rollout(
             episode_returns=jnp.where(done, 0.0, episode_returns),  # (B,)
             episode_lengths=jnp.where(done, 0, episode_lengths),  # (B,)
         )
-        return (advanced, key, completed), (
-            current.observations,  # (B, *O)
-            actions,  # (B,)
-            log_probs,  # (B,)
-            predictions,  # (B,)
-            rewards,  # (B,)
-            done,  # (B,)
-            current.episode_starts,  # each (B,)
+        return Runner(advanced, key, completed), Transition(
+            observations=current.observations,  # (B, *O)
+            actions=actions,  # (B,)
+            log_probs=log_probs,  # (B,)
+            values=predictions,  # (B,)
+            rewards=rewards,  # (B,)
+            dones=done,  # (B,)
+            episode_starts=current.episode_starts,  # (B,)
         )
 
     completed = jax.tree.map(
@@ -777,9 +792,8 @@ def collect_rollout(
         ),
     )  # each ()
     (advanced, key, completed), trajectory = jax.lax.scan(
-        step, (rollout_carry, key, completed), None, length=config.num_steps
+        step, Runner(rollout_carry, key, completed), None, length=config.num_steps
     )
-    observations, actions, log_probs, values, rewards, dones, starts = trajectory
     # observations: (T, B, *O); other trajectory arrays: (T, B)
     # Peek at the next value without advancing the rollout's recurrent state.
     next_value = train_state.apply_fn(
@@ -789,16 +803,18 @@ def collect_rollout(
         advanced.episode_starts,
         method="step",
     )[2]  # (B,)
-    advantages, returns = gae(rewards, dones, values, next_value, config.gamma, config.gae_lambda)  # each (T, B)
+    advantages, returns = gae(
+        trajectory.rewards, trajectory.dones, trajectory.values, next_value, config.gamma, config.gae_lambda
+    )  # each (T, B)
     batch = PPOBatch(
-        observations=observations,  # (T, B, *O)
-        actions=actions,  # (T, B)
-        old_log_probs=log_probs,  # (T, B)
-        values=values,  # (T, B)
+        observations=trajectory.observations,  # (T, B, *O)
+        actions=trajectory.actions,  # (T, B)
+        old_log_probs=trajectory.log_probs,  # (T, B)
+        values=trajectory.values,  # (T, B)
         advantages=advantages,  # (T, B)
         returns=returns,  # (T, B)
         carry=rollout_carry.carry,  # leaves: (B, ...)
-        episode_starts=starts,  # (T, B)
+        episode_starts=trajectory.episode_starts,  # (T, B)
     )
     completed_return_sum, completed_length_sum, completed_count = completed  # each ()
     return advanced, RolloutResult(batch, key, completed_return_sum, completed_length_sum, completed_count)
