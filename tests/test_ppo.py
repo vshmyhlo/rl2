@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError, asdict, replace
+from dataclasses import FrozenInstanceError, asdict, fields, replace
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -34,6 +34,40 @@ def small_model_config() -> ppo.ModelConfig:
         encoder=ppo.RGBEncoderConfig(stages=(ConvStage(4, blocks=1),), embedding_size=8),
         recurrent=ppo.LSTMConfig(hidden_size=8, num_layers=2, intermediate_size=8),
     )
+
+
+@pytest.mark.parametrize(
+    "num_steps,selected",
+    [(1, (1,)), (3, (1, 0))],
+    ids=["single-transition", "reordered-sequences"],
+)
+def test_batch_select_sequences_preserves_time_and_initial_memory(num_steps: int, selected: tuple[int, ...]) -> None:
+    targets = jnp.arange(num_steps * 2).reshape(num_steps, 2)  # (T, B=2)
+    memory = jnp.arange(4, dtype=jnp.float32).reshape(2, 2)  # (B=2, D=2)
+    batch = ppo.PPOBatch(
+        observations=targets[..., None, None, None],  # (T, B, 1, 1, 1)
+        actions=targets % 2,  # (T, B)
+        old_log_probs=-targets.astype(jnp.float32),  # (T, B)
+        values=targets + 1.0,  # (T, B)
+        advantages=targets + 2.0,  # (T, B)
+        returns=targets + 3.0,  # (T, B)
+        carry=((memory, memory + 1), (memory + 2, memory + 3)),  # leaves: (B, D)
+        episode_starts=targets % 2 == 0,  # (T, B)
+    )
+    indices = jnp.asarray(selected)  # (M,)
+    minibatch = batch.select_sequences(indices)  # sequences: (T, M, ...); memory: (M, D)
+    for field in fields(batch):
+        if field.name == "carry":
+            continue
+        actual = getattr(minibatch, field.name)  # (T, M, ...)
+        original = getattr(batch, field.name)  # (T, B, ...)
+        assert actual.shape == (num_steps, len(selected), *original.shape[2:])
+        assert actual.dtype == original.dtype
+        np.testing.assert_array_equal(actual, np.take(original, selected, axis=1))
+    assert len(minibatch.carry) == 2
+    for actual, original in zip(jax.tree.leaves(minibatch.carry), jax.tree.leaves(batch.carry), strict=True):
+        assert actual.shape == (len(selected), 2)
+        np.testing.assert_array_equal(actual, np.take(original, selected, axis=0))
 
 
 def test_default_model_parameter_budget_and_rgb_shapes() -> None:
@@ -220,8 +254,13 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
         assert array.dtype == jnp.float32
     state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(0.001))
     replayed_log_probs = []
+    apply_step = jax.jit(state.apply_fn, static_argnames=("method",))
     for t in range(3):
-        actions, log_probs, prediction, carry = ppo.act(state, obs[t], carry, starts[t], jax.random.key(t))
+        carry, step_logits, prediction = apply_step(
+            {"params": state.params}, obs[t], carry, starts[t], method="step"
+        )  # carry leaves: (B, ...); step_logits: (B, A); prediction: (B,)
+        actions = jax.random.categorical(jax.random.key(t), step_logits)  # (B,)
+        log_probs = action_log_prob(step_logits, actions)  # (B,)
         # BF16 kernels may round differently for sequence and single-step batches.
         np.testing.assert_allclose(prediction, values[t], atol=0.02, rtol=0.02)
         np.testing.assert_allclose(log_probs, action_log_prob(logits[t], actions), atol=1e-3, rtol=0)
@@ -333,8 +372,8 @@ def test_config_accepts_exactly_one_rollout() -> None:
         ("num_steps", 0),
         ("num_minibatches", 0),
         ("update_epochs", 0),
-        ("video_speed", 0.0),
-        ("video_speed", float("inf")),
+        ("video_fps", 0.0),
+        ("video_fps", float("inf")),
         ("vector_env", "unknown"),
     ],
 )
@@ -514,7 +553,9 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         patch("rl2.ppo.GymnaxEnv", return_value=envs),
         patch("rl2.ppo.ActorCritic", return_value=model) as actor_critic,
         patch("rl2.ppo.SummaryWriter", return_value=writer),
-        patch("rl2.ppo.act", return_value=(jnp.zeros(1, dtype=jnp.int32), zeros, zeros, carry)),
+        patch.object(
+            model, "apply", return_value=(carry, jnp.array([[0.0, -jnp.inf]]), zeros)
+        ),  # carry leaves: (B,H); (B,A); (B,)
         patch("rl2.ppo.value", return_value=zeros),
         patch("rl2.ppo.update", side_effect=fake_update),
         patch("rl2.ppo.explained_variance", side_effect=(0.2, 0.4, 0.8)),
@@ -563,6 +604,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         "charts/total_episode_length_mean": [(2.0, 2), (2.0, 3)],
         "charts/total_episodes": [(1.0, 2), (1.0, 3)],
         "charts/total_observations": [(2.0, 2), (3.0, 3)],
+        "charts/training_progress": [(2 / 3, 2), (1.0, 3)],
         "time/elapsed_seconds": [(60.0, 2), (80.0, 3)],
     }.items():
         np.testing.assert_allclose(logged[tag], expected, err_msg=tag)
@@ -570,6 +612,8 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         np.testing.assert_allclose(logged[tag], [(initial * 0.75, 2), (initial * 0.25, 3)], rtol=1e-6)
     progress_lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("iteration=")]
     assert len(progress_lines) == 2
+    assert "progress=0.667" in progress_lines[0]
+    assert "progress=1.000" in progress_lines[1]
     assert all("s/iteration=" not in line for line in progress_lines)
     assert "iterations/s=0.033 observations/s=0.033 episodes/s=0.017" in progress_lines[0]
     assert "iterations/s=0.050 observations/s=0.050 episodes/s=0.000" in progress_lines[1]
@@ -661,7 +705,9 @@ def test_video_schedule_uses_iterations(interval: int, expected_steps: list[int]
         patch.object(ppo, "GymnaxEnv", return_value=envs),
         patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo, "SummaryWriter") as writer,
-        patch.object(ppo, "act", return_value=(jnp.zeros(1, dtype=jnp.int32), zeros, zeros, carry)),
+        patch.object(
+            model, "apply", return_value=(carry, jnp.array([[0.0, -jnp.inf]]), zeros)
+        ),  # carry leaves: (B,H); (B,A); (B,)
         patch.object(ppo, "value", return_value=zeros),
         patch.object(ppo, "update", side_effect=advance_update),
         patch.object(ppo, "monotonic", side_effect=now),
@@ -744,7 +790,9 @@ def test_train_evaluates_final_policy(
         patch.object(ppo, "GymnaxEnv", return_value=envs),
         patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo, "SummaryWriter") as writer,
-        patch.object(ppo, "act", return_value=(jnp.zeros(1, dtype=jnp.int32), zeros, zeros, carry)),
+        patch.object(
+            model, "apply", return_value=(carry, jnp.array([[0.0, -jnp.inf]]), zeros)
+        ),  # carry leaves: (B,H); (B,A); (B,)
         patch.object(ppo, "value", return_value=zeros),
         patch.object(ppo, "update", side_effect=advance_update),
         patch.object(ppo, "monotonic", side_effect=now),

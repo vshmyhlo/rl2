@@ -11,7 +11,7 @@ import jax.numpy as jnp
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
-from rl2.envs.gymnax_env import EnvStep
+from rl2.envs.base import BaseEnv, EnvStep
 
 if TYPE_CHECKING:
     from craftax.craftax.craftax_state import EnvParams
@@ -31,7 +31,7 @@ def encode_pixels(images: jax.Array) -> jax.Array:  # (..., H, W, 3) -> (..., 3,
     return jnp.moveaxis(pixels, -1, -3)  # (..., 3, H, W)
 
 
-class CraftaxEnv:
+class CraftaxEnv(BaseEnv[chex.ArrayTree, "CraftaxParams"]):
     def __init__(self, config: CraftaxConfig) -> None:
         try:
             from craftax.craftax_env import make_craftax_env_from_name
@@ -69,6 +69,7 @@ class CraftaxEnv:
         final_observation = encode_pixels(observation)  # (C, H, W)
         truncated = state.timestep >= params.max_timesteps  # ()
         done = terminated | truncated  # ()
+        final_state = state  # leaves: (...), before autoreset
 
         def reset_done(_: None) -> tuple[jax.Array, chex.ArrayTree]:
             return self.reset(reset_key, params)  # (C, H, W); state leaves: (...)
@@ -77,7 +78,7 @@ class CraftaxEnv:
             return final_observation, state  # (C, H, W); state leaves: (...)
 
         observation, state = jax.lax.cond(done, reset_done, continue_episode, None)  # (C,H,W); leaves: (...)
-        return (
+        return EnvStep(
             observation,  # (C, H, W)
             state,  # leaves: (...)
             reward,  # ()
@@ -86,9 +87,16 @@ class CraftaxEnv:
                 "terminated": terminated,  # ()
                 "truncated": truncated,  # ()
                 "final_observation": final_observation,  # (C, H, W)
+                "final_state": final_state,  # leaves: (...)
             },
         )
 
     @staticmethod
     def render_observation(observation: jax.Array) -> jax.Array:  # (3, H, W) -> (H, W, 3)
         return jnp.moveaxis(observation, 0, -1)  # (H, W, 3)
+
+    @partial(jax.jit, static_argnames="self")
+    def render(self, state: chex.ArrayTree) -> jax.Array:  # state leaves: (...) -> (H, W, 3)
+        """Render the native player-centered view and inventory HUD."""
+        observation = encode_pixels(self.env.get_obs(state))  # (3, H, W)
+        return self.render_observation(observation)  # (H, W, 3)

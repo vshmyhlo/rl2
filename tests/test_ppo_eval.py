@@ -77,7 +77,9 @@ def test_episode_renders_state_before_autoreset(record: bool) -> None:
 
 
 def test_evaluation_logs_raw_scores_and_independent_seeds() -> None:
-    config = replace(ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), eval_episodes=2)
+    config = replace(
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), eval_episodes=2, video_fps=12.5
+    )
     writer = Mock()
     state = Mock(spec=TrainState)
     carry = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
@@ -106,20 +108,24 @@ def test_evaluation_logs_raw_scores_and_independent_seeds() -> None:
     assert report["episodes"] == [{"return": 2, "length": 3}, {"return": 4, "length": 5}]
     assert "training_scores" not in report
     assert writer.add_video.call_args.args[1].shape == (1, 1, 3, 2, 2)
-    assert writer.add_video.call_args.kwargs["fps"] == 10 * config.video_speed
+    assert writer.add_video.call_args.kwargs["fps"] == 12.5
 
 
 def test_log_video_wiring() -> None:
-    config = ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
+    config = ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/xminigrid.yaml")
     writer = Mock()
     carry = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
         1
     )  # leaves: (1,1)
-    with patch.object(ppo, "play_episode", return_value=(0.0, 1, [np.zeros((2, 2, 3), np.uint8)])) as play:
+    with (
+        patch.object(ppo, "make_env"),
+        patch.object(ppo, "play_episode", return_value=(0.0, 1, [np.zeros((2, 2, 3), np.uint8)])) as play,
+    ):
         ppo.log_video(Mock(), config, writer, 2, 128, initial_carry=carry)
     assert play.call_args.kwargs["record"]
     assert play.call_args.kwargs["stop_at_frame_limit"]
     assert writer.add_video.call_args.args[0] == "gameplay"
+    assert writer.add_video.call_args.kwargs["fps"] == 10.0
 
 
 def test_single_evaluation_omits_unavailable_uncertainty() -> None:

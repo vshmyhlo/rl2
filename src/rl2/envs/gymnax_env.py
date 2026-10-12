@@ -1,22 +1,13 @@
 """Single-environment Gymnax Breakout transitions and observation conversion."""
 
 from functools import partial
-from typing import TypedDict
 
 import gymnax
 import jax
 import jax.numpy as jnp
 from gymnax.environments.minatar.breakout import EnvParams, EnvState
 
-
-class StepInfo(TypedDict):
-    terminated: jax.Array  # ()
-    truncated: jax.Array  # ()
-    final_observation: jax.Array  # (C, H, W), uint8, before autoreset
-
-
-# Observation: (C, H, W); state leaves: (...); reward/done: (); info: see StepInfo.
-type EnvStep[State] = tuple[jax.Array, State, jax.Array, jax.Array, StepInfo]
+from rl2.envs.base import BaseEnv, EnvStep
 
 
 def encode_observations(observations: jax.Array) -> jax.Array:  # (..., H, W, C) -> (..., C, H, W)
@@ -24,11 +15,16 @@ def encode_observations(observations: jax.Array) -> jax.Array:  # (..., H, W, C)
     return jnp.moveaxis(observations, -1, -3).astype(jnp.uint8) * 255  # (..., C, H, W)
 
 
-class GymnaxEnv:
+class GymnaxEnv(BaseEnv[EnvState, EnvParams]):
     """Breakout-MinAtar with explicit state, independent RNGs, and same-step reset."""
 
     @staticmethod
     def render_observation(observation: jax.Array) -> jax.Array:  # (4, H, W) -> (H*16, W*16, 3)
+        return render_observation(observation)  # (H*16, W*16, 3)
+
+    @partial(jax.jit, static_argnames="self")
+    def render(self, state: EnvState) -> jax.Array:  # state leaves: (...) -> (H*16, W*16, 3)
+        observation = encode_observations(self.env.get_obs(state, self.params))  # (4, H, W)
         return render_observation(observation)  # (H*16, W*16, 3)
 
     def __init__(self, env_id: str, *, max_steps_in_episode: int | None = None) -> None:
@@ -64,6 +60,7 @@ class GymnaxEnv:
         final_observation = encode_observations(observation)  # (C, H, W)
         truncated = state.time >= params.max_steps_in_episode  # ()
         done = terminated | truncated  # ()
+        final_state = state  # leaves: (...), before autoreset
 
         def reset_done(_: None) -> tuple[jax.Array, EnvState]:
             return self.reset(reset_key, params)  # (C, H, W); state leaves: (...)
@@ -72,7 +69,7 @@ class GymnaxEnv:
             return final_observation, state  # (C, H, W); state leaves: (...)
 
         observation, state = jax.lax.cond(done, reset_done, continue_episode, None)  # (C,H,W); leaves: (...)
-        return (
+        return EnvStep(
             observation,  # (C, H, W)
             state,  # leaves: (...)
             reward,  # ()
@@ -81,6 +78,7 @@ class GymnaxEnv:
                 "terminated": terminated,  # ()
                 "truncated": truncated,  # ()
                 "final_observation": final_observation,  # (C, H, W)
+                "final_state": final_state,  # leaves: (...)
             },
         )
 

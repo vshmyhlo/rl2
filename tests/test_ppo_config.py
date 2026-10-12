@@ -1,11 +1,16 @@
+import builtins
 from dataclasses import asdict
 from pathlib import Path
+from types import ModuleType
+from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import yaml
 from omegaconf.errors import OmegaConfBaseException
 from pydantic import ValidationError
 
+from rl2 import ppo
 from rl2.envs.kinetix_env import KinetixConfig
 from rl2.ppo import Config, RGBEncoderConfig, XMiniGridEncoderConfig, load_config
 
@@ -178,34 +183,27 @@ def test_optional_settings_require_matching_environment(config_path: Path, name:
 
 
 @pytest.mark.parametrize("name,env_id", [("xminigrid", "XLand-MiniGrid"), ("craftax", "Craftax")])
-def test_optional_environment_factory_and_missing_dependency(
-    name: str, env_id: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import builtins
-    from types import ModuleType
-    from typing import Any
-    from unittest.mock import Mock
-
-    from rl2 import ppo
-
+def test_optional_environment_factory(name: str, env_id: str, monkeypatch: pytest.MonkeyPatch) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / f"configs/ppo/{name}.yaml")
     assert config.env_id == env_id
     cls = ppo.XMiniGridEnv if name == "xminigrid" else ppo.CraftaxEnv
     constructor = Mock()
-    with monkeypatch.context() as patch:
-        patch.setattr(ppo, cls.__name__, constructor)
-        assert ppo.make_env(config) is constructor.return_value
-        constructor.assert_called_once_with(getattr(config, name))
+    monkeypatch.setattr(ppo, cls.__name__, constructor)
+    assert ppo.make_env(config) is constructor.return_value
+    constructor.assert_called_once_with(getattr(config, name))
 
+
+def test_craftax_missing_dependency(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax.yaml")
     original_import = builtins.__import__
 
     def without_dependency(module: str, *args: Any, **kwargs: Any) -> ModuleType:
-        if module.split(".")[0] == name:
-            raise ModuleNotFoundError(name=name)
+        if module.split(".")[0] == "craftax":
+            raise ModuleNotFoundError(name="craftax")
         return original_import(module, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", without_dependency)
-    with pytest.raises(ImportError, match=f"uv sync --extra {name}"):
+    with pytest.raises(ImportError, match="uv sync --extra craftax"):
         ppo.make_env(config)
 
 

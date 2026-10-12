@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import chex
 import jax
@@ -10,16 +9,15 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import xminigrid
 from flax.training.train_state import TrainState
+from xminigrid.benchmarks import Benchmark
+from xminigrid.core.constants import TILES_REGISTRY, Colors, Tiles
+from xminigrid.core.goals import AgentOnTileGoal
+from xminigrid.core.rules import EmptyRule
 
 from rl2 import ppo
 from rl2.envs.xminigrid_env import XMiniGridConfig, XMiniGridEnv
-
-if TYPE_CHECKING:
-    from xminigrid.benchmarks import Benchmark
-
-
-pytest.importorskip("xminigrid")
 
 
 def test_full_render_uses_grid_and_agent_pose() -> None:
@@ -64,6 +62,8 @@ def test_terminal_timeout_both_and_partial_autoreset() -> None:
     np.testing.assert_array_equal(info["final_state"].observation, info["final_observation"])
     np.testing.assert_allclose(rewards, [0.55, 0, 0.1, 0], atol=1e-6)
     assert next_observations.shape == info["final_observation"].shape == observations.shape
+    chex.assert_shape((rewards, done, info["terminated"], info["truncated"]), (4,))
+    np.testing.assert_array_equal(next_observations, next_state.observation)
     reset_observations, reset_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(key, 4), env.params
     )  # (B,7,7,2); leaves: (B,...)
@@ -85,12 +85,6 @@ def test_terminal_timeout_both_and_partial_autoreset() -> None:
 
 @pytest.fixture
 def benchmark(monkeypatch: pytest.MonkeyPatch) -> Benchmark:
-    import xminigrid
-    from xminigrid.benchmarks import Benchmark
-    from xminigrid.core.constants import TILES_REGISTRY, Colors, Tiles
-    from xminigrid.core.goals import AgentOnTileGoal
-    from xminigrid.core.rules import EmptyRule
-
     tiles = jnp.stack([TILES_REGISTRY[Tiles.BALL, Colors.RED], TILES_REGISTRY[Tiles.BALL, Colors.BLUE]])  # (N=2,2)
     goals = jnp.stack([AgentOnTileGoal(tile=tile).encode() for tile in tiles])  # (N,G)
     rules = jnp.broadcast_to(EmptyRule().encode(), (2, 1, 7))  # (N,R=1,7)

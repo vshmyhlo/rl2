@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
-from rl2.envs.gymnax_env import EnvStep
+from rl2.envs.base import BaseEnv, EnvStep
 
 if TYPE_CHECKING:
     from kinetix.environment.env_state import EnvParams, EnvState
@@ -33,7 +33,7 @@ def encode_pixels(images: jax.Array) -> jax.Array:  # (..., W, H, 3) -> (..., 3,
     return jnp.moveaxis(pixels, (-1, -2, -3), (-3, -2, -1))[..., ::-1, :]  # (..., 3, H, W)
 
 
-class KinetixEnv:
+class KinetixEnv(BaseEnv["EnvState", "EnvParams"]):
     """Explicit transitions preserve final observations for timeout bootstrapping."""
 
     def __init__(self, config: KinetixConfig) -> None:
@@ -90,6 +90,7 @@ class KinetixEnv:
         final_observation = encode_pixels(observation.image)  # (C, H, W)
         truncated = state.timestep >= params.max_timesteps  # ()
         done = terminated | truncated  # ()
+        final_state = state  # leaves: (...), before autoreset
 
         def reset_done(_: None) -> tuple[jax.Array, EnvState]:
             return self.reset(reset_key, params)  # (C, H, W); state leaves: (...)
@@ -98,7 +99,7 @@ class KinetixEnv:
             return final_observation, state  # (C, H, W); state leaves: (...)
 
         observation, state = jax.lax.cond(done, reset_done, continue_episode, None)  # (C,H,W); leaves: (...)
-        return (
+        return EnvStep(
             observation,  # (C, H, W)
             state,  # leaves: (...)
             reward,  # ()
@@ -107,9 +108,15 @@ class KinetixEnv:
                 "terminated": terminated,  # ()
                 "truncated": truncated,  # ()
                 "final_observation": final_observation,  # (C, H, W)
+                "final_state": final_state,  # leaves: (...)
             },
         )
 
     @staticmethod
     def render_observation(observation: jax.Array) -> jax.Array:  # (3, H, W) -> (H, W, 3)
         return jnp.moveaxis(observation, 0, -1)  # (H, W, 3)
+
+    @partial(jax.jit, static_argnames="self")
+    def render(self, state: EnvState) -> jax.Array:  # state leaves: (...) -> (H, W, 3)
+        observation = encode_pixels(self.env.get_obs(state).image)  # (3, H, W)
+        return self.render_observation(observation)  # (H, W, 3)

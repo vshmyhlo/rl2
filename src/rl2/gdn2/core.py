@@ -16,8 +16,6 @@ Distributed under the NVIDIA Source Code License-NC; see LICENSE in this directo
 import jax
 import jax.numpy as jnp
 
-from rl2.shape_checker import ShapeChecker
-
 type DeltaInputs = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
 
 
@@ -39,16 +37,10 @@ def delta_rule_step(
     eigenvalues), write in [0,1], log_decay <= 0. The primitive also accepts
     unconstrained gates for differentiation and mathematical experiments.
     """
-    sc = ShapeChecker()
-    sc.check(state, "BHKV", jnp.float32)
-    sc.check([q, k, log_decay, erase], "BHK", jnp.float32)
-    sc.check([v, write], "BHV", jnp.float32)
     decayed = jnp.exp(log_decay)[..., None] * state
     removed = jnp.einsum("bhk,bhkv->bhv", erase * k, decayed)
     state = decayed + k[..., None] * (write * v - removed)[..., None, :]
     output = jnp.einsum("bhk,bhkv->bhv", q, state)
-    sc.check(state, "BHKV", jnp.float32)
-    sc.check(output, "BHV", jnp.float32)
     return state, output
 
 
@@ -66,11 +58,11 @@ def gated_delta_rule(
     Normalization and scaling are the caller's responsibility, as in
     :func:`delta_rule_step`. Empty inputs preserve the initial state.
     """
-    sc = ShapeChecker()
-    sc.check([q, k, log_decay, erase], "BTHK", jnp.float32)
-    sc.check([v, write], "BTHV", jnp.float32)
-    state = jnp.zeros(sc["BHKV"], jnp.float32) if initial_state is None else initial_state
-    sc.check(state, "BHKV", jnp.float32)
+    state = (
+        jnp.zeros((q.shape[0], q.shape[2], q.shape[3], v.shape[3]), jnp.float32)
+        if initial_state is None
+        else initial_state
+    )
 
     def step(carry: jax.Array, inputs: DeltaInputs) -> tuple[jax.Array, jax.Array]:
         return delta_rule_step(carry, *inputs)
@@ -79,6 +71,4 @@ def gated_delta_rule(
     inputs = tuple(a.swapaxes(0, 1) for a in (q, k, v, log_decay, erase, write))
     state, output = jax.lax.scan(step, state, inputs)
     output = output.swapaxes(0, 1)
-    sc.check(state, "BHKV", jnp.float32)
-    sc.check(output, "BTHV", jnp.float32)
     return state, output

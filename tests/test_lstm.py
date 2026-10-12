@@ -167,3 +167,44 @@ def test_lstm_stack_validates_layer_count(method: str) -> None:
     carry = model.initial_carry(1)[:1]
     with pytest.raises(ValueError, match="one LSTMCarry per layer"):
         jax.eval_shape(partial(model.init, method=method), jax.random.key(0), x, carry, starts)
+
+
+@pytest.mark.parametrize(
+    "method,invalid",
+    [
+        ("step", "carry_width"),
+        ("step", "cell_width"),
+        ("step", "carry_batch"),
+        ("step", "reset_batch"),
+        ("step", "carry_dtype"),
+        ("step", "reset_dtype"),
+        ("step", "input_dtype"),
+        ("__call__", "input_rank"),
+        ("__call__", "reset_rank"),
+    ],
+)
+def test_lstm_rejects_invalid_array_contracts(method: str, invalid: str) -> None:
+    model = LSTM(4)
+    shape = (2, 3) if method == "step" or invalid == "input_rank" else (1, 2, 3)
+    x = jax.ShapeDtypeStruct(shape, jnp.int32 if invalid == "input_dtype" else jnp.float32)  # (B, I) or (T, B, I)
+    reset_shape = (1,) if invalid == "reset_batch" else (2,)
+    if method != "step" and invalid != "reset_rank":
+        reset_shape = (1, *reset_shape)
+    starts = jax.ShapeDtypeStruct(reset_shape, jnp.int32 if invalid == "reset_dtype" else jnp.bool_)  # (B,) or (T, B)
+    carry_shape = (1 if invalid == "carry_batch" else 2, 1 if invalid == "carry_width" else 4)
+    hidden = jax.ShapeDtypeStruct(carry_shape, jnp.bfloat16 if invalid == "carry_dtype" else jnp.float32)  # (B, H)
+    cell = jax.ShapeDtypeStruct((2, 1), jnp.float32) if invalid == "cell_width" else hidden  # (B, H)
+    with pytest.raises(AssertionError):
+        jax.eval_shape(partial(model.init, method=method), jax.random.key(0), x, (cell, hidden), starts)
+
+
+@pytest.mark.parametrize("invalid", ["input_width", "input_dtype"])
+def test_lstm_stack_rejects_inputs_before_normalization(invalid: str) -> None:
+    model = LSTMStack(4, 1)
+    x = jax.ShapeDtypeStruct(
+        (1, 2, 1 if invalid == "input_width" else 4), jnp.int32 if invalid == "input_dtype" else jnp.float32
+    )  # (T, B, I)
+    starts = jax.ShapeDtypeStruct((1, 2), jnp.bool_)  # (T, B)
+    carry = model.initial_carry(2)  # leaves: (B, H)
+    with pytest.raises(AssertionError):
+        jax.eval_shape(model.init, jax.random.key(0), x, carry, starts)

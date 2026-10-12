@@ -39,8 +39,16 @@ def test_seeded_policy_and_update_are_reproducible() -> None:
         for a, b in zip(jax.tree.leaves(first.params), jax.tree.leaves(different.params), strict=True)
     )
     key = jax.random.key(13)
-    action, log_prob, values, memory = ppo.act(first, obs, carry, starts, key)
-    chex.assert_trees_all_equal((action, log_prob, values, memory), ppo.act(repeated, obs, carry, starts, key))
+    apply_step = jax.jit(model.apply, static_argnames=("method",))
+    memory, step_logits, values = apply_step(
+        {"params": first.params}, obs, carry, starts, method="step"
+    )  # memory leaves: (B, H); step_logits: (B, A); values: (B,)
+    chex.assert_trees_all_equal(
+        (memory, step_logits, values),
+        apply_step({"params": repeated.params}, obs, carry, starts, method="step"),
+    )
+    action = jax.random.categorical(key, step_logits)  # (B,)
+    log_prob = ppo.action_log_prob(step_logits, action)  # (B,)
     _, logits, _ = model.apply({"params": first.params}, obs[None], carry, starts[None])
     np.testing.assert_array_equal(action, jax.random.categorical(key, logits[0]))
     batch = ppo.PPOBatch(

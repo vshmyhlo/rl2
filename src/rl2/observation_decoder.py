@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationStage, ConvStages, validate_stages
+from rl2.model.encoders.rgb import DEFAULT_STAGES, ConvObservationStage, ConvStages, validate_stages
 
 
 class ConvObservationDecoder(nn.Module):
