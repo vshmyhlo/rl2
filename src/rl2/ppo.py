@@ -116,7 +116,7 @@ import yaml
 from flax import linen as nn
 from flax import struct
 from flax.training.train_state import TrainState
-from numpy import asarray, integer, uint8
+from numpy import integer, stack, uint8
 from numpy.typing import NDArray
 from pydantic import ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
@@ -296,7 +296,7 @@ class Config:
     bf16: bool = True
     video_max_frames: Annotated[int, Field(gt=0)] | None = 900
     video_interval_seconds: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 600.0
-    observation_size: int | None = None
+    observation_size: Annotated[int, Field(gt=0)] | None = None
     eval_interval_seconds: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
     eval_episodes: int = 100
     eval_seed: int = 10_000
@@ -384,6 +384,14 @@ def restore_checkpoint(manager: ocp.CheckpointManager, state: TrainState, config
         raise ValueError("Unsupported PPO checkpoint version")
     if metadata["iteration"] != iteration or iteration < 0 or metadata["completed_episodes"] < 0:
         raise ValueError("Invalid PPO checkpoint progress")
+    saved_config = metadata["config"]
+    # Progress and schedules count rollouts, so each must still represent the same number of steps.
+    if (
+        "num_envs" in saved_config
+        and "num_steps" in saved_config
+        and saved_config["num_envs"] * saved_config["num_steps"] != config.num_envs * config.num_steps
+    ):
+        raise ValueError("Cannot resume PPO with a different num_envs * num_steps; use a new run directory")
     restored = manager.restore(
         iteration,
         args=ocp.args.Composite(
@@ -510,14 +518,14 @@ class ActorCritic(nn.Module):
         x = self.encoder(obs)  # (B, E), E is embedding_size
         return self.recurrent_input(x).astype(self.dtype)  # (B, D), D is model.hidden_size
 
-    def _heads(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
-        x = x.astype(self.dtype)
-        policy = nn.relu(self.policy_norm(self.policy_hidden(x)))
-        critic = nn.relu(self.value_norm(self.value_hidden(x)))
+    def _heads(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:  # (B, D) -> (B, A), (B,)
+        x = x.astype(self.dtype)  # (B, D)
+        policy = nn.relu(self.policy_norm(self.policy_hidden(x)))  # (B, 512)
+        critic = nn.relu(self.value_norm(self.value_hidden(x)))  # (B, 512)
         # Heads use the compute dtype; float32 outputs keep PPO loss arithmetic precise.
-        logits = self.policy_output(policy).astype(jnp.float32)
-        values = self.value_output(critic).squeeze(-1).astype(jnp.float32)
-        return logits, values
+        logits = self.policy_output(policy).astype(jnp.float32)  # (B, A)
+        values = self.value_output(critic).squeeze(-1).astype(jnp.float32)  # (B,)
+        return logits, values  # (B, A), (B,)
 
     def __call__(
         self,
@@ -662,10 +670,10 @@ def log_video(
             if terminated or truncated:
                 break
         # One recorded frame per agent step, accounting for optional action repeat.
-        video = jnp.stack(frames).transpose(0, 3, 1, 2)[None]  # (1, T, C, H, W)
+        video = stack(frames).transpose(0, 3, 1, 2)[None]  # (1, T, C, H, W), host array
         writer.add_video(
             "gameplay",
-            asarray(video),  # (1, T, C, H, W); TensorBoard expects a host array
+            video,  # (1, T, C, H, W)
             steps,
             fps=config.video_speed * env.metadata["render_fps"] / (4 if config.atari_preprocessing else 1),
         )
@@ -841,13 +849,11 @@ def collect_rollout(
         if finished_returns.size:
             obs, _ = envs.reset(options={"reset_mask": done})  # (B, *O)
 
-    observations = jnp.stack(observation_steps)  # (T, B, *O)
-    actions = jnp.stack(action_steps)  # (T, B)
-    log_probs = jnp.stack(log_prob_steps)  # (T, B)
-    values = jnp.stack(value_steps)  # (T, B)
-    rewards = jnp.stack(reward_steps)  # (T, B)
-    dones = jnp.stack(done_steps)  # (T, B)
-    episode_starts = jnp.stack(episode_start_steps)  # (T, B)
+    observations, actions, log_probs, values, rewards, dones, episode_starts = jax.tree.map(
+        jnp.stack,
+        (observation_steps, action_steps, log_prob_steps, value_steps, reward_steps, done_steps, episode_start_steps),
+        is_leaf=lambda node: isinstance(node, list),
+    )  # observations: (T, B, *O); others: (T, B)
     next_value = value(state, obs, carry, episode_start)  # (B,)
     advantages, returns = gae(
         rewards,
@@ -1034,14 +1040,15 @@ def train(config: Config) -> TrainState:
                 for indices in jnp.split(permutation, config.num_minibatches):  # each (M,)
                     # M is the number of environments in this minibatch.
                     minibatch = batch.replace(
-                        observations=batch.observations[:, indices],  # (T, M, *O)
-                        actions=batch.actions[:, indices],  # (T, M)
-                        old_log_probs=batch.old_log_probs[:, indices],  # (T, M)
-                        values=batch.values[:, indices],  # (T, M)
-                        advantages=batch.advantages[:, indices],  # (T, M)
-                        returns=batch.returns[:, indices],  # (T, M)
+                        **jax.tree.map(
+                            itemgetter((slice(None), indices)),
+                            {
+                                field.name: getattr(batch, field.name)
+                                for field in fields(batch)
+                                if field.name != "carry"
+                            },
+                        ),  # observations: (T, M, *O); other sequence fields: (T, M)
                         carry=jax.tree.map(itemgetter(indices), batch.carry),  # leaves: (M, ...)
-                        episode_starts=batch.episode_starts[:, indices],  # (T, M)
                     )
                     state, metric = update(state, minibatch, config, iteration)
                     for name in window_metric_sums:
