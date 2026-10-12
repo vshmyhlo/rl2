@@ -1,4 +1,4 @@
-"""Recurrent PPO with a residual Atari CNN and an LSTM, GDN2, or Mamba3 backbone.
+"""Recurrent PPO for Gymnax Breakout-MinAtar with a residual CNN and an LSTM backbone.
 
 TensorBoard outputs use training environment steps as the global step.
 Metric names use total_ for all-training statistics, _last_100 for recent episode
@@ -43,7 +43,6 @@ Evaluation scalars (when evaluation is enabled; unavailable scores are omitted):
     eval/return_mean: Mean raw evaluation return.
     eval/return_std: Standard deviation of raw evaluation returns.
     eval/return_sem: Standard error of the mean raw evaluation return.
-    eval/human_normalized_score_percent: Human-normalized evaluation score.
     eval/total_training_episodes: Completed training episodes at evaluation time.
     training/total_return_mean: Mean raw return over all completed training episodes.
     training/total_episode_length_mean: Mean length over all completed training episodes, in steps.
@@ -56,15 +55,15 @@ Evaluation scalars (when evaluation is enabled; unavailable scores are omitted):
 Text:
     config: Full training configuration as YAML, logged at startup and on resume.
     eval/report: Complete JSON report after each evaluation, including per-episode
-        results, aggregate scores, protocol, training configuration and scores,
-        library versions, baselines, and training steps/episodes.
+        results, aggregate scores, training configuration and scores,
+        evaluation seeds and training steps/episodes.
 
 Video/images:
     gameplay: RGB gameplay from a separate episode under the current policy,
         recorded with add_video and stored as an animated GIF image summary.
         Recording ends at episode termination/truncation or video_max_frames
         (default: 900; None removes the frame cap). Playback uses video_speed
-        and the environment frame rate, adjusted for Atari action repeat.
+        and a playback rate of 10 environment steps per second.
     eval/gameplay: RGB video of the last episode in each evaluation run, using
         the same frame cap and playback speed. Evaluation finishes the full
         episode even when recording reaches the frame cap.
@@ -98,49 +97,39 @@ from math import sqrt
 from operator import itemgetter
 from pathlib import Path
 from time import monotonic
-from typing import Annotated, Any, Literal, NamedTuple, Self, SupportsFloat, cast
+from typing import Annotated, Literal, NamedTuple, Self
 
 # Orbax's epath otherwise loads TensorFlow for gs:// paths when it is installed.
 # That native runtime can crash a later Triton import; use our gcsfs dependency.
 # Set this before importing Orbax, since epath caches its backend selection.
 os.environ.setdefault("EPATH_USE_TF", "0")
 
-import ale_py
 import chex
-import gymnasium as gym
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import yaml
 from flax import linen as nn
 from flax import struct
 from flax.training.train_state import TrainState
-from numpy import integer, stack, uint8
+from gymnax.environments.minatar.breakout import EnvState
+from numpy import stack, uint8
 from numpy.typing import NDArray
 from pydantic import ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
-from rl2 import atari_eval
 from rl2.configuration import load_settings
-from rl2.gdn2 import (
-    GatedDeltaNet2Backend,
-    GatedDeltaNet2Config,
-    GatedDeltaNet2Recurrent,
-    GatedDeltaNet2StackCarry,
-)
+from rl2.gymnax_env import GymnaxEnv, render_observation
 from rl2.jax_cache import configure_compilation_cache
-from rl2.jax_env import JaxVectorEnv
 from rl2.lstm import LSTMStack, LSTMStackCarry
-from rl2.mamba3 import Mamba3Stack, Mamba3StackCarry
-from rl2.multi_atari import register_envs
 from rl2.observation_encoder import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages
-from rl2.sequence_model import RecurrentSequenceModel
+from rl2.training_scores import TrainingScores
 from rl2.utils import explained_variance, gae
 
-type RecurrentCarry = LSTMStackCarry | GatedDeltaNet2StackCarry | Mamba3StackCarry
-type ModelType = Literal["lstm", "gdn2", "mamba3"]
+type RecurrentCarry = LSTMStackCarry
 
 
 @struct.dataclass
@@ -154,7 +143,7 @@ class PPOBatch:
         values: (*S,) rollout-time value predictions for explained variance.
         advantages: (*S,) unnormalized advantage estimates.
         returns: (*S,) value targets.
-        carry: (B, ...) leaves of the initial recurrent memory, with backend-specific trailing dimensions.
+        carry: (B, D) initial LSTM memory leaves, where D is model.hidden_size.
         episode_starts: (*S,) boolean episode reset flags.
     """
 
@@ -164,7 +153,7 @@ class PPOBatch:
     values: jax.Array  # (*S,)
     advantages: jax.Array  # (*S,)
     returns: jax.Array  # (*S,)
-    carry: RecurrentCarry  # leaves: (B, ...), backend-specific trailing dimensions
+    carry: RecurrentCarry  # leaves: (B, D), D is model.hidden_size
     episode_starts: jax.Array  # (*S,)
 
 
@@ -172,13 +161,15 @@ class RolloutCarry(NamedTuple):
     """Live environment state carried between rollouts.
 
     Attributes:
+        env_state: (B, ...) batched Gymnax state leaves.
         observations: (B, *O) current observations with observation dimensions O.
-        carry: (B, ...) recurrent memory leaves with backend-specific trailing dimensions.
+        carry: (B, D) LSTM memory leaves, where D is model.hidden_size.
         episode_starts: (B,) boolean episode reset flags.
         episode_returns: (B,) accumulated raw rewards for unfinished episodes.
         episode_lengths: (B,) step counts for unfinished episodes.
     """
 
+    env_state: EnvState  # leaves: (B, ...)
     observations: jax.Array  # (B, *O)
     carry: RecurrentCarry  # leaves: (B, ...)
     episode_starts: jax.Array  # (B,)
@@ -192,14 +183,16 @@ class RolloutResult(NamedTuple):
     Attributes:
         batch: (T, B, ...) time-major PPO arrays with (B, ...) initial memory leaves.
         key: () advanced typed PRNG key, also used for minibatch shuffling.
-        completed_returns: Raw returns in step order, then environment order.
-        completed_lengths: Episode lengths in the same order as completed_returns.
+        completed_returns: (T, B) raw returns, zero for unfinished episodes.
+        completed_lengths: (T, B) lengths, zero for unfinished episodes.
+        completed: (T, B) completed episode mask.
     """
 
     batch: PPOBatch  # observations: (T, B, *O); targets/starts: (T, B); carry leaves: (B, ...)
     key: jax.Array  # () typed PRNG key
-    completed_returns: tuple[float, ...]
-    completed_lengths: tuple[int, ...]
+    completed_returns: jax.Array  # (T, B)
+    completed_lengths: jax.Array  # (T, B)
+    completed: jax.Array  # (T, B)
 
 
 @struct.dataclass
@@ -222,63 +215,12 @@ class LSTMConfig:
     intermediate_size: Annotated[int, Field(ge=0, strict=True)] = 0
 
 
-@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
-class GDN2Config:
-    type: Literal["gdn2"] = "gdn2"
-    # Triton accelerates rollout steps and differentiable sequence replay on NVIDIA GPUs.
-    backend: GatedDeltaNet2Backend = "jax"
-    hidden_size: Annotated[int, Field(gt=0, strict=True)] = 768
-    num_layers: Annotated[int, Field(gt=0, strict=True)] = 2
-    num_heads: Annotated[int, Field(gt=0, strict=True)] = 12
-    head_dim: Annotated[int, Field(gt=0, strict=True)] = 64
-    intermediate_size: Annotated[int, Field(gt=0, strict=True)] = 1536
-    conv_size: Annotated[int, Field(gt=0, strict=True)] = 4
-
-    def mixer_config(self, dtype: jax.typing.DTypeLike) -> GatedDeltaNet2Config:
-        return GatedDeltaNet2Config(
-            hidden_size=self.hidden_size,
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
-            conv_size=self.conv_size,
-            dtype=dtype,
-        )
-
-
-@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
-class Mamba3Config:
-    type: Literal["mamba3"] = "mamba3"
-    hidden_size: Annotated[int, Field(gt=0, strict=True)] = 768
-    num_layers: Annotated[int, Field(gt=0, strict=True)] = 2
-    intermediate_size: Annotated[int, Field(ge=0, strict=True)] = 1536
-    state_size: Annotated[int, Field(gt=0, strict=True)] = 128
-    expand: Annotated[int, Field(gt=0, strict=True)] = 2
-    head_dim: Annotated[int, Field(gt=0, strict=True)] = 64
-    num_groups: Annotated[int, Field(gt=0, strict=True)] = 1
-    mimo_rank: Annotated[int, Field(gt=0, strict=True)] = 1
-    rope_fraction: Literal[0.5, 1.0] = 0.5
-
-    def __post_init__(self) -> None:
-        inner_size = self.hidden_size * self.expand
-        if inner_size % self.head_dim:
-            raise ValueError("hidden_size * expand must be divisible by head_dim")
-        if (inner_size // self.head_dim) % self.num_groups:
-            raise ValueError("number of heads must be divisible by num_groups")
-        if self.state_size % 2 or int(self.state_size * self.rope_fraction) < 2:
-            raise ValueError("state_size must be even and allow at least one rotary pair")
-
-
-type ModelConfig = Annotated[LSTMConfig | GDN2Config | Mamba3Config, Field(discriminator="type")]
-
-
 @dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
 class Config:
-    env_id: str
-    frame_stack: bool
-    atari_preprocessing: bool
+    env_id: Literal["Breakout-MinAtar"]
     seed: int
     total_steps: int
     num_envs: Annotated[int, Field(gt=0)]
-    vector_env: Literal["sync", "async"]
     num_steps: Annotated[int, Field(gt=0)]
     num_minibatches: Annotated[int, Field(gt=0)]
     update_epochs: Annotated[int, Field(gt=0)]
@@ -296,12 +238,11 @@ class Config:
     bf16: bool = True
     video_max_frames: Annotated[int, Field(gt=0)] | None = 900
     video_interval_seconds: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 600.0
-    observation_size: Annotated[int, Field(gt=0)] | None = None
     eval_interval_seconds: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
-    eval_episodes: int = 100
-    eval_seed: int = 10_000
+    eval_episodes: Annotated[int, Field(gt=0)] = 100
+    eval_seed: Annotated[int, Field(ge=0, lt=2**32)] = 10_000
     encoder_stages: ConvStages = DEFAULT_STAGES
-    model: ModelConfig = LSTMConfig()
+    model: LSTMConfig = LSTMConfig()
     lr_decay: Literal["linear", "cosine"] = "linear"
     entropy_decay: Literal["constant", "cosine"] = "constant"
     run_id: str | None = None
@@ -320,13 +261,6 @@ class Config:
             raise ValueError("num_envs must be divisible by num_minibatches to preserve sequences")
         if self.total_steps < self.num_envs * self.num_steps:
             raise ValueError("total_steps must cover at least one rollout")
-        return self
-
-    @model_validator(mode="after")
-    def validate_evaluation(self) -> Self:
-        if self.eval_interval_seconds:
-            atari_eval.EvaluationConfig(episodes=self.eval_episodes, seed=self.eval_seed)
-            atari_eval.validate_training_config(self)
         return self
 
 
@@ -385,6 +319,8 @@ def restore_checkpoint(manager: ocp.CheckpointManager, state: TrainState, config
     if metadata["iteration"] != iteration or iteration < 0 or metadata["completed_episodes"] < 0:
         raise ValueError("Invalid PPO checkpoint progress")
     saved_config = metadata["config"]
+    if saved_config.get("env_id", config.env_id) != config.env_id:
+        raise ValueError("Cannot resume PPO with a different environment; use a new run directory")
     # Progress and schedules count rollouts, so each must still represent the same number of steps.
     if (
         "num_envs" in saved_config
@@ -444,50 +380,21 @@ def entropy_coef_schedule(config: Config) -> optax.Schedule:
 
 class ActorCritic(nn.Module):
     num_actions: int
-    model: ModelConfig = LSTMConfig()
+    model: LSTMConfig = LSTMConfig()
     dtype: jax.typing.DTypeLike = jnp.float32
     encoder_stages: ConvStages = DEFAULT_STAGES
     embedding_size: int = 768
 
     @nn.nowrap
-    def _make_recurrent(self, *, parent: nn.Module | None = None) -> RecurrentSequenceModel[RecurrentCarry]:
-        recurrent: LSTMStack | GatedDeltaNet2Recurrent | Mamba3Stack
-        if self.model.type == "lstm":
-            recurrent = LSTMStack(
-                self.model.hidden_size,
-                self.model.num_layers,
-                self.model.intermediate_size,
-                dtype=self.dtype,
-                name="lstm",
-                parent=parent,
-            )
-        elif self.model.type == "gdn2":
-            recurrent = GatedDeltaNet2Recurrent(
-                self.model.mixer_config(self.dtype),
-                self.model.num_layers,
-                self.model.intermediate_size,
-                backend=self.model.backend,
-                name="gdn2",
-                parent=parent,
-            )
-        else:
-            recurrent = Mamba3Stack(
-                d_model=self.model.hidden_size,
-                num_layers=self.model.num_layers,
-                d_intermediate=self.model.intermediate_size,
-                mlp_multiple_of=1,
-                d_state=self.model.state_size,
-                expand=self.model.expand,
-                headdim=self.model.head_dim,
-                ngroups=self.model.num_groups,
-                mimo_rank=self.model.mimo_rank,
-                rope_fraction=self.model.rope_fraction,
-                dtype=self.dtype,
-                name="mamba3",
-                parent=parent,
-            )
-        # The selected model and its carry always travel together through PPO.
-        return cast(RecurrentSequenceModel[RecurrentCarry], recurrent)
+    def _make_recurrent(self, *, parent: nn.Module | None = None) -> LSTMStack:
+        return LSTMStack(
+            self.model.hidden_size,
+            self.model.num_layers,
+            self.model.intermediate_size,
+            dtype=self.dtype,
+            name="lstm",
+            parent=parent,
+        )
 
     @nn.nowrap
     def initial_carry(self, num_envs: int) -> RecurrentCarry:
@@ -501,7 +408,7 @@ class ActorCritic(nn.Module):
             name="encoder",
         )
         self.recurrent = self._make_recurrent(parent=self)
-        self.recurrent_input = nn.Dense(self.model.hidden_size, dtype=self.dtype, name=f"{self.model.type}_input")
+        self.recurrent_input = nn.Dense(self.model.hidden_size, dtype=self.dtype, name="lstm_input")
         init = nn.initializers.orthogonal(sqrt(2))
         self.policy_hidden = nn.Dense(512, kernel_init=init, name="policy_hidden", dtype=self.dtype)
         self.policy_norm = nn.LayerNorm(name="policy_norm", dtype=self.dtype)
@@ -538,7 +445,7 @@ class ActorCritic(nn.Module):
         steps, environments = obs.shape[:2]
         x = self._encode(obs.reshape((-1, *obs.shape[2:])))  # (T * B, D)
         x = x.reshape((steps, environments, -1))  # (T, B, D)
-        # Batch the CNN and heads across time; each backbone handles its recurrence.
+        # Batch the CNN and heads across time; the LSTM handles its recurrence.
         carry, x = self.recurrent(x, carry, episode_starts)  # carry leaves: (B, ...); x: (T, B, D)
         logits, values = self._heads(x.reshape((steps * environments, -1)))  # (T * B, A), (T * B,)
         logits = logits.reshape((steps, environments, self.num_actions))  # (T, B, A)
@@ -557,49 +464,6 @@ class ActorCritic(nn.Module):
         carry, x = self.recurrent.step(x, carry, episode_starts)  # carry leaves: (B, ...); x: (B, D)
         logits, values = self._heads(x)  # (B, A), (B,)
         return carry, logits, values  # carry leaves: (B, ...); (B, A); (B,)
-
-
-class AtariPreprocessing(gym.wrappers.AtariPreprocessing):
-    def step(
-        self,
-        action: int | integer[Any],
-    ) -> tuple[NDArray[Any], SupportsFloat, bool, bool, dict[str, Any]]:
-        obs, reward, terminated, truncated, info = super().step(action)
-        if terminated or truncated:
-            # Gymnasium breaks action repeat before capturing the final screen.
-            # Return the actual final screen, including for timeout bootstrapping.
-            capture = self.ale.getScreenGrayscale if self.grayscale_obs else self.ale.getScreenRGB
-            capture(self.obs_buffer[0])
-            self.obs_buffer[1].fill(0)
-            obs = self._get_obs()
-        return obs, reward, terminated, truncated, info
-
-
-def make_env(
-    env_id: str,
-    render_mode: str | None = None,
-    frame_stack: bool = False,
-    atari_preprocessing: bool = False,
-    observation_size: int | None = None,
-    grayscale_obs: bool = True,
-) -> gym.Env[NDArray[uint8], int | integer[Any]]:
-    chex.assert_type(grayscale_obs, bool)
-    if observation_size is not None and (type(observation_size) is not int or observation_size < 1):
-        raise ValueError("observation_size must be a positive integer or null")
-    gym.register_envs(ale_py)
-    register_envs()
-    env = gym.make(env_id, frameskip=1, render_mode=render_mode)
-    try:
-        if atari_preprocessing:
-            env = AtariPreprocessing(env, grayscale_obs=grayscale_obs)
-        if observation_size is not None:
-            env = gym.wrappers.ResizeObservation(env, (observation_size, observation_size))
-        if frame_stack:
-            return gym.wrappers.FrameStackObservation(env, stack_size=4)
-        return gym.wrappers.ReshapeObservation(env, (1, *env.observation_space.shape))
-    except BaseException:
-        env.close()
-        raise
 
 
 def action_log_prob(
@@ -639,6 +503,41 @@ def value(
     return state.apply_fn({"params": state.params}, obs, carry, episode_starts, method="step")[2]  # (B,)
 
 
+def play_episode(
+    state: TrainState,
+    config: Config,
+    key: jax.Array,  # () typed PRNG key
+    initial_carry: RecurrentCarry,  # leaves: (1, ...)
+    *,
+    record: bool,
+    env: GymnaxEnv,
+    stop_at_frame_limit: bool = False,
+) -> tuple[float, int, list[NDArray[uint8]]]:
+    """Run one episode; frames: list of (H, W, 3) uint8 RGB images."""
+    key, reset_key = jax.random.split(key)  # each () typed PRNG key
+    observations, env_state = env.reset(reset_key, 1)  # (1, C, H, W); leaves: (1, ...)
+    memory = initial_carry  # leaves: (1, ...)
+    frames: list[NDArray[uint8]] = []  # entries: (H, W, 3)
+    if record:
+        frames.append(np.asarray(render_observation(observations[0])))
+    episode_return = 0.0
+    length = 0
+    while not (stop_at_frame_limit and config.video_max_frames is not None and len(frames) >= config.video_max_frames):
+        key, action_key, env_key = jax.random.split(key, 3)  # each () typed PRNG key
+        actions, _, _, memory = act(
+            state, observations, memory, jnp.full(1, length == 0, dtype=bool), action_key
+        )  # 3 x (1,); memory leaves: (1, ...)
+        transition = env.step(env_key, env_state, actions)
+        observations, env_state = transition.observations, transition.state  # (1,C,H,W); leaves: (1,...)
+        episode_return += float(transition.rewards[0])
+        length += 1
+        if record and (config.video_max_frames is None or len(frames) < config.video_max_frames):
+            frames.append(np.asarray(render_observation(transition.final_observations[0])))
+        if bool((transition.terminated | transition.truncated)[0]):
+            break
+    return episode_return, length, frames
+
+
 def log_video(
     state: TrainState,
     config: Config,
@@ -648,38 +547,18 @@ def log_video(
     *,
     initial_carry: RecurrentCarry,  # leaves: (1, ...)
 ) -> None:
-    env = make_env(
-        config.env_id,
-        render_mode="rgb_array",
-        frame_stack=config.frame_stack,
-        atari_preprocessing=config.atari_preprocessing,
-        observation_size=config.observation_size,
+    _, _, frames = play_episode(
+        state,
+        config,
+        jax.random.fold_in(jax.random.key(config.seed), episode),
+        initial_carry,
+        record=True,
+        stop_at_frame_limit=True,
+        env=GymnaxEnv(config.env_id),
     )
-    try:
-        obs, _ = env.reset(seed=config.seed + episode)  # (*O,)
-        key = jax.random.fold_in(jax.random.key(config.seed), episode)  # () typed PRNG key
-        frames = [env.render()]  # list of (H, W, C) frames
-        carry = initial_carry  # leaves: (1, ...)
-        while config.video_max_frames is None or len(frames) < config.video_max_frames:
-            key, action_key = jax.random.split(key)  # each () typed PRNG key
-            actions, _, _, carry = act(
-                state, jnp.asarray(obs)[None], carry, jnp.zeros(1, dtype=bool), action_key
-            )  # (1,), (1,), (1,); carry leaves: (1, ...)
-            obs, _, terminated, truncated, _ = env.step(int(actions[0]))  # obs: (*O,)
-            frames.append(env.render())
-            if terminated or truncated:
-                break
-        # One recorded frame per agent step, accounting for optional action repeat.
-        video = stack(frames).transpose(0, 3, 1, 2)[None]  # (1, T, C, H, W), host array
-        writer.add_video(
-            "gameplay",
-            video,  # (1, T, C, H, W)
-            steps,
-            fps=config.video_speed * env.metadata["render_fps"] / (4 if config.atari_preprocessing else 1),
-        )
-        print(f"Recorded {len(frames)} gameplay frames after {episode} training episodes", flush=True)
-    finally:
-        env.close()
+    video = stack(frames).transpose(0, 3, 1, 2)[None]  # (1, T, 3, H, W)
+    writer.add_video("gameplay", video, steps, fps=10 * config.video_speed)
+    print(f"Recorded {len(frames)} gameplay frames after {episode} training episodes", flush=True)
 
 
 def log_evaluation(
@@ -689,24 +568,41 @@ def log_evaluation(
     episode: int,
     steps: int,
     *,
-    initial_carry: RecurrentCarry,  # leaves: (1, ...), backend-specific memory dimensions
-    training_scores: "atari_eval.TrainingScores | None" = None,
+    initial_carry: RecurrentCarry,  # leaves: (1, ...)
+    training_scores: TrainingScores | None = None,
 ) -> None:
-    """Log evaluation scores, the complete report, and the last episode's video."""
-    print(f"Evaluating {config.eval_episodes} games after {episode} training episodes", flush=True)
+    """Evaluate fixed Gymnax seeds, log raw scores, and record the last episode."""
     started = monotonic()
-
-    def on_video(video: NDArray[uint8], fps: float) -> None:  # video: (1, T, C, H, W)
-        writer.add_video("eval/gameplay", video, steps, fps=fps)
-
-    result = atari_eval.evaluate(
-        atari_eval.TrainStateAgent(state, initial_carry),
-        config,
-        atari_eval.EvaluationConfig(episodes=config.eval_episodes, seed=config.eval_seed),
-        training_scores=training_scores,
-        on_video=on_video,
-    )
-    for name in ("return_mean", "return_std", "return_sem", "human_normalized_score_percent"):
+    episodes: list[dict[str, float | int]] = []
+    env = GymnaxEnv(config.env_id)
+    for index in range(config.eval_episodes):
+        score, length, frames = play_episode(
+            state,
+            config,
+            jax.random.fold_in(jax.random.key(config.eval_seed), index),
+            initial_carry,
+            record=index == config.eval_episodes - 1,
+            env=env,
+        )
+        episodes.append({"return": score, "length": length})
+        if frames:
+            video = stack(frames).transpose(0, 3, 1, 2)[None]  # (1, T, 3, H, W)
+            writer.add_video("eval/gameplay", video, steps, fps=10 * config.video_speed)
+    returns = np.array([result["return"] for result in episodes])  # (E,), E evaluation episodes
+    std = float(returns.std(ddof=1)) if config.eval_episodes > 1 else None
+    result = {
+        "env_id": config.env_id,
+        "return_mean": float(returns.mean()),
+        "return_std": std,
+        "return_sem": std / sqrt(config.eval_episodes) if std is not None else None,
+        "episodes": episodes,
+        "eval_seed": config.eval_seed,
+        "training_config": asdict(config),
+        "training_steps": steps,
+        "training_episodes": episode,
+        "training_scores": training_scores.as_report() if training_scores is not None else None,
+    }
+    for name in ("return_mean", "return_std", "return_sem"):
         if result[name] is not None:
             writer.add_scalar(f"eval/{name}", result[name], steps)
     writer.add_scalar("eval/total_training_episodes", episode, steps)
@@ -715,14 +611,8 @@ def log_evaluation(
             if score is not None:
                 writer.add_scalar(f"training/{name}", score, steps)
     writer.add_scalar("time/evaluation_seconds", monotonic() - started, steps)
-    result["training_steps"] = steps
-    result["training_episodes"] = episode
     writer.add_text("eval/report", f"```json\n{json.dumps(result, indent=2, allow_nan=False)}\n```", steps)
-    normalized = result["human_normalized_score_percent"]
-    normalized_text = f" human_normalized={normalized:.1f}%" if normalized is not None else " human_normalized=n/a"
-    print(
-        f"Evaluation: return={result['return_mean']:.1f}{normalized_text} over {config.eval_episodes} games", flush=True
-    )
+    print(f"Evaluation: return={result['return_mean']:.1f} over {config.eval_episodes} games", flush=True)
 
 
 @partial(jax.jit, static_argnames="config")
@@ -777,92 +667,70 @@ def update(
     return state, metrics
 
 
+@partial(jax.jit, static_argnames=("envs", "config"))
 def collect_rollout(
-    rollout_state: RolloutCarry,  # observations: (B, *O); carry leaves: (B, ...); episode fields: (B,)
-    state: TrainState,
-    envs: JaxVectorEnv,
+    rollout_carry: RolloutCarry,  # observations: (B, *O); state/memory leaves: (B, ...)
+    train_state: TrainState,
+    envs: GymnaxEnv,
     config: Config,
     key: jax.Array,  # () typed PRNG key
 ) -> tuple[RolloutCarry, RolloutResult]:
-    """Collect T steps, bootstrap timeouts before resetting, and compute GAE.
+    """Collect (T, B, ...) transitions entirely on device and compute GAE.
 
-    The caller owns the environments, configured with autoreset disabled, and
-    initializes rollout_state after reset. Collection advances the environments
-    without updating policy parameters or writing logs/checkpoints.
-
-    Args:
-        rollout_state: (B, ...) live state; see RolloutCarry for field shapes.
-        state: Policy parameters and model application function.
-        envs: Vector environments wrapped to exchange JAX arrays.
-        config: Rollout length T, environment count B, and discount settings.
-        key: () typed PRNG key for action sampling.
-
-    Returns:
-        carry: (B, ...) continuation state; see RolloutCarry for field shapes.
-        rollout: (T, B, ...) training data and statistics; see RolloutResult for field shapes.
+    Timeouts bootstrap from final observations; both end flags reset recurrence.
+    Completed episode arrays retain fixed (T, B) shapes for JIT compilation.
     """
-    obs = rollout_state.observations  # (B, *O)
-    carry = rollout_state.carry  # leaves: (B, ...)
-    episode_start = rollout_state.episode_starts  # (B,)
-    episode_returns = rollout_state.episode_returns  # (B,)
-    episode_lengths = rollout_state.episode_lengths  # (B,)
-    completed_returns: list[float] = []
-    completed_lengths: list[int] = []
-    observation_steps: list[jax.Array] = []  # T entries of (B, *O)
-    action_steps: list[jax.Array] = []  # T entries of (B,)
-    log_prob_steps: list[jax.Array] = []  # T entries of (B,)
-    value_steps: list[jax.Array] = []  # T entries of (B,)
-    reward_steps: list[jax.Array] = []  # T entries of (B,)
-    done_steps: list[jax.Array] = []  # T entries of (B,)
-    episode_start_steps: list[jax.Array] = []  # T entries of (B,)
 
-    for _ in range(config.num_steps):
-        observation_steps.append(obs)  # (B, *O)
-        episode_start_steps.append(episode_start)  # (B,)
-        key, action_key = jax.random.split(key)  # each () typed PRNG key
-        action, log_prob, prediction, carry = act(
-            state, obs, carry, episode_start, action_key
-        )  # 3 x (B,), carry leaves: (B, ...)
-        action_steps.append(action)  # (B,)
-        log_prob_steps.append(log_prob)  # (B,)
-        value_steps.append(prediction)  # (B,)
-        obs, reward, terminated, truncated, _ = envs.step(action)  # (B, *O), 3 x (B,), info
-        done = terminated | truncated  # (B,)
-        done_steps.append(done)  # (B,)
-        rollout_reward = reward  # (B,) raw environment rewards
-        # Bootstrap time limits from the final observation, before resetting.
-        timeout = truncated & ~terminated  # (B,)
-        if timeout.any():
-            rollout_reward = (
-                reward + config.gamma * value(state, obs, carry, jnp.zeros(config.num_envs, dtype=bool)) * timeout
+    def step(
+        runner: tuple[RolloutCarry, jax.Array],  # state leaves: (B, ...); key: ()
+        _: None,
+    ) -> tuple[tuple[RolloutCarry, jax.Array], tuple[jax.Array, ...]]:
+        current, key = runner
+        key, action_key, env_key = jax.random.split(key, 3)  # each () typed PRNG key
+        actions, log_probs, predictions, memory = act(
+            train_state, current.observations, current.carry, current.episode_starts, action_key
+        )  # 3 x (B,); memory leaves: (B, ...)
+        transition = envs.step(env_key, current.env_state, actions)
+        done = transition.terminated | transition.truncated  # (B,)
+        timeout = transition.truncated & ~transition.terminated  # (B,)
+
+        def bootstrap(_: None) -> jax.Array:
+            predictions = value(
+                train_state, transition.final_observations, memory, jnp.zeros(config.num_envs, dtype=bool)
             )  # (B,)
-        reward_steps.append(rollout_reward)  # (B,)
-        episode_start = done  # (B,)
-        episode_returns = episode_returns + reward  # (B,)
-        episode_lengths = episode_lengths + 1  # (B,)
-        finished_returns = episode_returns[done]  # (D,), D completed episodes this step
-        finished_lengths = episode_lengths[done]  # (D,)
-        completed_returns.extend(finished_returns.tolist())
-        completed_lengths.extend(finished_lengths.tolist())
-        episode_returns = jnp.where(done, 0.0, episode_returns)  # (B,)
-        episode_lengths = jnp.where(done, 0, episode_lengths)  # (B,)
-        if finished_returns.size:
-            obs, _ = envs.reset(options={"reset_mask": done})  # (B, *O)
+            return jnp.where(timeout, predictions, 0.0)  # (B,)
 
-    observations, actions, log_probs, values, rewards, dones, episode_starts = jax.tree.map(
-        jnp.stack,
-        (observation_steps, action_steps, log_prob_steps, value_steps, reward_steps, done_steps, episode_start_steps),
-        is_leaf=lambda node: isinstance(node, list),
-    )  # observations: (T, B, *O); others: (T, B)
-    next_value = value(state, obs, carry, episode_start)  # (B,)
-    advantages, returns = gae(
-        rewards,
-        dones,
-        values,
-        next_value,
-        config.gamma,
-        config.gae_lambda,
-    )  # each (T, B)
+        def no_bootstrap(_: None) -> jax.Array:
+            return jnp.zeros(config.num_envs)  # (B,)
+
+        rewards = transition.rewards + config.gamma * jax.lax.cond(timeout.any(), bootstrap, no_bootstrap, None)  # (B,)
+        episode_returns = current.episode_returns + transition.rewards  # (B,)
+        episode_lengths = current.episode_lengths + 1  # (B,)
+        advanced = RolloutCarry(
+            env_state=transition.state,  # leaves: (B, ...)
+            observations=transition.observations,  # (B, *O)
+            carry=memory,  # leaves: (B, ...)
+            episode_starts=done,  # (B,)
+            episode_returns=jnp.where(done, 0.0, episode_returns),  # (B,)
+            episode_lengths=jnp.where(done, 0, episode_lengths),  # (B,)
+        )
+        return (advanced, key), (
+            current.observations,  # (B, *O)
+            actions,  # (B,)
+            log_probs,  # (B,)
+            predictions,  # (B,)
+            rewards,  # (B,)
+            done,  # (B,)
+            current.episode_starts,  # each (B,)
+            jnp.where(done, episode_returns, 0.0),  # (B,)
+            jnp.where(done, episode_lengths, 0),  # (B,)
+        )
+
+    (advanced, key), trajectory = jax.lax.scan(step, (rollout_carry, key), None, length=config.num_steps)
+    observations, actions, log_probs, values, rewards, dones, starts, completed_returns, completed_lengths = trajectory
+    # observations: (T, B, *O); other trajectory arrays: (T, B)
+    next_value = value(train_state, advanced.observations, advanced.carry, advanced.episode_starts)  # (B,)
+    advantages, returns = gae(rewards, dones, values, next_value, config.gamma, config.gae_lambda)  # each (T, B)
     batch = PPOBatch(
         observations=observations,  # (T, B, *O)
         actions=actions,  # (T, B)
@@ -870,24 +738,10 @@ def collect_rollout(
         values=values,  # (T, B)
         advantages=advantages,  # (T, B)
         returns=returns,  # (T, B)
-        carry=rollout_state.carry,  # leaves: (B, ...), initial memory for replay
-        episode_starts=episode_starts,  # (T, B)
+        carry=rollout_carry.carry,  # leaves: (B, ...)
+        episode_starts=starts,  # (T, B)
     )
-    return (
-        RolloutCarry(
-            observations=obs,  # (B, *O)
-            carry=carry,  # leaves: (B, ...)
-            episode_starts=episode_start,  # (B,)
-            episode_returns=episode_returns,  # (B,)
-            episode_lengths=episode_lengths,  # (B,)
-        ),
-        RolloutResult(
-            batch=batch,  # observations: (T, B, *O); targets/starts: (T, B); carry leaves: (B, ...)
-            key=key,  # () typed PRNG key
-            completed_returns=tuple(completed_returns),
-            completed_lengths=tuple(completed_lengths),
-        ),
-    )
+    return advanced, RolloutResult(batch, key, completed_returns, completed_lengths, dones)
 
 
 def train(config: Config) -> TrainState:
@@ -895,36 +749,14 @@ def train(config: Config) -> TrainState:
     with ExitStack() as resources:
         configure_compilation_cache()
         batch_size = config.num_envs * config.num_steps
-        vector_cls = gym.vector.AsyncVectorEnv if config.vector_env == "async" else gym.vector.SyncVectorEnv
-        # Spawn avoids forking JAX's threads or accelerator runtime.
-        vector_options = {"context": "spawn"} if config.vector_env == "async" else {}
-        envs = resources.enter_context(
-            closing(
-                JaxVectorEnv(
-                    vector_cls(
-                        [
-                            partial(
-                                make_env,
-                                config.env_id,
-                                frame_stack=config.frame_stack,
-                                atari_preprocessing=config.atari_preprocessing,
-                                observation_size=config.observation_size,
-                            )
-                            for _ in range(config.num_envs)
-                        ],
-                        autoreset_mode=gym.vector.AutoresetMode.DISABLED,
-                        **vector_options,
-                    )
-                )
-            )
-        )
+        envs = GymnaxEnv(config.env_id)
         run_name = config.run_id
         run_dir = config.log_dir
         manager = resources.enter_context(closing(checkpoint_manager(run_dir)))
-        obs, _ = envs.reset(seed=config.seed)  # (B, *O)
-        key, init_key = jax.random.split(jax.random.key(config.seed))  # each () typed PRNG key
+        key, init_key, reset_key = jax.random.split(jax.random.key(config.seed), 3)  # each () typed PRNG key
+        obs, env_state = envs.reset(reset_key, config.num_envs)  # (B, *O); state leaves: (B, ...)
         model = ActorCritic(
-            envs.single_action_space.n,
+            envs.num_actions,
             config.model,
             dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
             encoder_stages=config.encoder_stages,
@@ -964,9 +796,9 @@ def train(config: Config) -> TrainState:
             ) = progress
             recent_returns.extend(saved_returns)
             recent_lengths.extend(saved_lengths)
-            # Gym environments and wrappers are not serialized. Start fresh episodes
+            # Live environment states are not serialized. Start fresh episodes
             # with fresh recurrent memory, retaining the policy and training RNGs.
-            obs, _ = envs.reset(seed=config.seed + start_iteration * config.num_envs)  # (B, *O)
+            obs, env_state = envs.reset(jax.random.fold_in(key, start_iteration), config.num_envs)  # (B, *O)
             print(f"Resumed run {run_name} at step {start_iteration * batch_size}", flush=True)
         initial_steps = start_iteration * batch_size
         writer = resources.enter_context(
@@ -981,7 +813,8 @@ def train(config: Config) -> TrainState:
         writer.add_scalar("model/params_millions", parameter_count / 1_000_000, initial_steps)
         print(f"Model parameters: {parameter_count:,}", flush=True)
         writer.add_text("model/parameter_count", str(parameter_count), initial_steps)
-        rollout_state = RolloutCarry(
+        rollout_carry = RolloutCarry(
+            env_state=env_state,  # leaves: (B, ...)
             observations=obs,  # (B, *O)
             carry=carry,  # leaves: (B, ...)
             episode_starts=episode_start,  # (B,)
@@ -1004,16 +837,20 @@ def train(config: Config) -> TrainState:
         next_eval_time = start + config.eval_interval_seconds
         num_iterations = config.total_steps // batch_size
         for iteration in range(start_iteration, num_iterations):
-            rollout_state, rollout = collect_rollout(
-                rollout_state, state, envs, config, key
+            rollout_carry, rollout = collect_rollout(
+                rollout_carry, state, envs, config, key
             )  # carry: (B, ...); rollout arrays: (T, B, ...)
             batch = rollout.batch  # observations: (T, B, *O); targets/starts: (T, B); carry leaves: (B, ...)
             key = rollout.key  # () typed PRNG key
-            recent_returns.extend(rollout.completed_returns)
-            recent_lengths.extend(rollout.completed_lengths)
-            finished_count = len(rollout.completed_returns)
-            finished_return_sum = sum(rollout.completed_returns)
-            finished_length_sum = sum(rollout.completed_lengths)
+            completed, returns, lengths = jax.device_get(
+                (rollout.completed, rollout.completed_returns, rollout.completed_lengths)
+            )  # each (T, B), host arrays
+            finished_returns, finished_lengths = returns[completed], lengths[completed]  # each (D,)
+            recent_returns.extend(finished_returns.tolist())
+            recent_lengths.extend(finished_lengths.tolist())
+            finished_count = finished_returns.size
+            finished_return_sum = float(finished_returns.sum())
+            finished_length_sum = int(finished_lengths.sum())
             window_episodes += finished_count
             window_return_sum += finished_return_sum
             window_length_sum += finished_length_sum
@@ -1082,7 +919,7 @@ def train(config: Config) -> TrainState:
                     completed_episodes,
                     steps,
                     initial_carry=model.initial_carry(1),
-                    training_scores=atari_eval.TrainingScores(
+                    training_scores=TrainingScores(
                         completed_episodes,
                         training_return_sum,
                         tuple(float(score) for score in recent_returns),

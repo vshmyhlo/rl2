@@ -1,5 +1,5 @@
 import json
-from dataclasses import replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
@@ -13,7 +13,6 @@ import optax
 import pytest
 from flax.training.train_state import TrainState
 from numpy.typing import NDArray
-from pydantic import ValidationError
 
 from rl2 import ppo, ppo_rnd
 from rl2.atari_eval import (
@@ -26,16 +25,17 @@ from rl2.atari_eval import (
     make_evaluation_env,
 )
 from rl2.atari_scores import ATARI_REFERENCE_SCORES, REFERENCE_SOURCE, get_reference_scores
-from rl2.ppo import Config, LSTMStackCarry, load_config
+from rl2.ppo import LSTMStackCarry
 
 
-def training_config() -> Config:
-    return replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-        env_id="ALE/Pong-v5",
-        atari_preprocessing=True,
-        model=ppo.LSTMConfig(hidden_size=2),
-    )
+@dataclass(frozen=True)
+class AtariConfig(ppo_rnd.Config):
+    model: ppo.ModelConfig = field(default_factory=lambda: ppo.LSTMConfig(hidden_size=2))
+
+
+def training_config() -> AtariConfig:
+    config = ppo_rnd.load_config(Path(__file__).resolve().parents[1] / "configs/ppo_rnd_montezuma.yaml")
+    return replace(AtariConfig(**asdict(config)), env_id="ALE/Pong-v5", atari_preprocessing=True)
 
 
 def policy(
@@ -494,44 +494,6 @@ def test_cleanup_on_policy_failure() -> None:
 
 
 @pytest.mark.parametrize(
-    "overrides",
-    (
-        {"eval_interval_seconds": -1},
-        {"eval_interval_seconds": float("nan")},
-        {"eval_interval_seconds": float("inf")},
-        {"eval_interval_seconds": "10"},
-        {"eval_interval_seconds": 100, "atari_preprocessing": False},
-        {"eval_interval_seconds": 100, "observation_size": 42},
-        {"eval_interval_seconds": 100, "env_id": "rl2/MultiAtari-v0"},
-        {"eval_interval_seconds": 100, "eval_episodes": 0},
-        {"eval_interval_seconds": 100, "eval_seed": -1},
-        {"eval_interval_seconds": 100, "eval_seed": 2**32 - 1, "eval_episodes": 2},
-    ),
-)
-def test_training_config_rejects_invalid_evaluation(overrides: dict[str, Any]) -> None:
-    with pytest.raises(ValidationError):
-        replace(training_config(), **overrides)
-
-
-def test_training_config_accepts_evaluation_seed_boundary() -> None:
-    config = replace(training_config(), eval_interval_seconds=100, eval_episodes=2, eval_seed=2**32 - 2)
-    assert config.eval_seed + config.eval_episodes == 2**32
-
-
-def test_training_config_skips_disabled_evaluation_validation() -> None:
-    config = replace(
-        training_config(),
-        eval_interval_seconds=0,
-        atari_preprocessing=False,
-        observation_size=42,
-        env_id="rl2/MultiAtari-v0",
-        eval_episodes=0,
-        eval_seed=-1,
-    )
-    assert config.eval_interval_seconds == 0
-
-
-@pytest.mark.parametrize(
     "kwargs", [{"episodes": 0}, {"seed": -1}, {"protocol": "human_starts"}, {"max_episode_frames": 30}]
 )
 def test_invalid_evaluation_config(kwargs: dict[str, Any]) -> None:
@@ -627,25 +589,6 @@ def test_evaluation_without_reference_scores_keeps_raw_returns() -> None:
     json.dumps(result, allow_nan=False)
 
 
-def test_training_omits_unavailable_normalized_scalar() -> None:
-    config = replace(training_config(), env_id="ALE/Adventure-v5", eval_episodes=2)
-    with (
-        patch("rl2.atari_eval.make_evaluation_env", return_value=ScoringEnv()),
-        patch("rl2.ppo.SummaryWriter") as writer,
-    ):
-        ppo.log_evaluation(
-            policy_state(),
-            config,
-            writer,
-            100,
-            5000,
-            initial_carry=ppo.ActorCritic(1, training_config().model).initial_carry(1),
-        )
-    tags = [call.args[0] for call in writer.add_scalar.call_args_list]
-    assert "eval/return_mean" in tags
-    assert "eval/human_normalized_score_percent" not in tags
-
-
 def test_progress_tracks_completed_games_and_long_running_games(capsys: pytest.CaptureFixture[str]) -> None:
     state = policy_state()
     options = EvaluationConfig(episodes=2)
@@ -701,7 +644,7 @@ def test_failed_evaluation_does_not_report_completion(capsys: pytest.CaptureFixt
     assert env.closed
 
 
-@pytest.mark.parametrize("trainer", ["ppo", "ppo_rnd"])
+@pytest.mark.parametrize("trainer", ["ppo_rnd"])
 def test_evaluation_logging_records_scores_and_report_without_mutating_state(trainer: str) -> None:
     module = ppo if trainer == "ppo" else ppo_rnd
     config = replace(

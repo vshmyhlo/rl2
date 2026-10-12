@@ -5,8 +5,6 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 import chex
-import cv2
-import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -14,6 +12,7 @@ import optax
 import pytest
 import yaml
 from flax.training.train_state import TrainState
+from ppo_helpers import env_step
 from pydantic import ValidationError
 
 from rl2 import ppo
@@ -24,7 +23,6 @@ from rl2.ppo import (
     action_log_prob,
     learning_rate_schedule,
     load_config,
-    make_env,
     train,
     update,
     value,
@@ -37,40 +35,6 @@ def small_model_config(model_type: ppo.ModelType) -> ppo.ModelConfig:
     if model_type == "gdn2":
         return ppo.GDN2Config(hidden_size=8, num_heads=1, head_dim=4, intermediate_size=8)
     return ppo.Mamba3Config(hidden_size=8, num_layers=2, intermediate_size=8, state_size=4, head_dim=4, mimo_rank=2)
-
-
-@pytest.mark.parametrize("stacked", (False, True))
-def test_resize_only_preserves_emulator_transitions(stacked: bool) -> None:
-    raw = make_env("ALE/SpaceInvaders-v5", frame_stack=stacked)
-    resized = make_env("ALE/SpaceInvaders-v5", frame_stack=stacked, observation_size=84)
-    try:
-        original, raw_info = raw.reset(seed=7)
-        observation, resized_info = resized.reset(seed=7)
-        assert raw_info == resized_info
-        for action in (None, 0, 1, 2, 3, 0):
-            if action is not None:
-                original, *raw_transition = raw.step(action)
-                observation, *resized_transition = resized.step(action)
-                assert raw_transition == resized_transition
-            expected = np.stack([cv2.resize(frame, (84, 84), interpolation=cv2.INTER_AREA) for frame in original])
-            np.testing.assert_array_equal(observation, expected)
-            assert observation.dtype == np.uint8
-            assert resized.observation_space.contains(observation)
-            assert raw.unwrapped.ale.getFrameNumber() == resized.unwrapped.ale.getFrameNumber()
-    finally:
-        raw.close()
-        resized.close()
-
-
-def test_make_env_closes_emulator_when_wrapping_fails() -> None:
-    env = Mock()
-    with (
-        patch.object(ppo.gym, "make", return_value=env),
-        patch.object(ppo, "AtariPreprocessing", side_effect=ValueError("invalid preprocessing")),
-        pytest.raises(ValueError, match="invalid preprocessing"),
-    ):
-        make_env("ALE/Pong-v5", atari_preprocessing=True)
-    env.close.assert_called_once()
 
 
 def test_default_model_parameter_budget_and_rgb_shapes() -> None:
@@ -96,31 +60,6 @@ def test_default_model_parameter_budget_and_rgb_shapes() -> None:
     assert step_logits.shape == (1, 6)
     assert step_values.shape == (1,)
     assert step_final[0][0].shape == final[0][0].shape
-
-
-@pytest.mark.parametrize("frame_limit", (101, 102, 103, 104))
-def test_atari_timeout_observation_is_current(frame_limit: int) -> None:
-    # End on each offset within action repeat, including before pooling starts.
-    gym_make = gym.make
-
-    def limited_env(*args: Any, **kwargs: Any) -> gym.Env:
-        return gym_make(*args, **kwargs, max_num_frames_per_episode=frame_limit)
-
-    with patch("rl2.ppo.gym.make", new=limited_env):
-        env = make_env("ALE/Pong-v5", atari_preprocessing=True)
-    try:
-        env.env.noop_max = 0
-        obs, _ = env.reset(seed=1)
-        for _ in range(26):
-            obs, _, terminated, truncated, _ = env.step(0)
-            if terminated or truncated:
-                break
-        assert truncated
-        assert not terminated
-        expected = cv2.resize(env.unwrapped.ale.getScreenGrayscale(), (84, 84), interpolation=cv2.INTER_AREA)
-        np.testing.assert_array_equal(obs[-1], expected)
-    finally:
-        env.close()
 
 
 def test_clipped_policy_loss_and_gradient_direction() -> None:
@@ -519,7 +458,6 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         num_minibatches=1,
         update_epochs=2,
         total_steps=3,
-        vector_env="sync",
         anneal_lr=True,
         lr_decay="cosine",
         entropy_decay="cosine",
@@ -532,11 +470,11 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     zeros = np.zeros(1, dtype=np.float32)  # (B,)
     dones = np.zeros(1, dtype=bool)  # (B,)
     carry = initial_carry(1, 1)  # pair of (B, H=1)
-    envs = Mock(spec=gym.vector.VectorEnv, single_action_space=gym.spaces.Discrete(2))
+    envs = Mock(num_actions=2)
     envs.reset.return_value = (obs, {})
     # One episode spans both rollouts in the first window; the final window has none.
     envs.step.side_effect = [
-        (obs, np.array([reward]), ~dones if done else dones, dones, {})  # (B, O), 3 x (B,), info
+        env_step(obs, np.array([reward]), ~dones if done else dones, dones, {})  # (B, O), 3 x (B,), info
         for reward, done in ((2.0, False), (6.0, True), (100.0, False))
     ]
     model = Mock()
@@ -576,7 +514,8 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         return clock
 
     with (
-        patch("rl2.ppo.gym.vector.SyncVectorEnv", return_value=envs),
+        jax.disable_jit(),
+        patch("rl2.ppo.GymnaxEnv", return_value=envs),
         patch("rl2.ppo.ActorCritic", return_value=model) as actor_critic,
         patch("rl2.ppo.SummaryWriter", return_value=writer),
         patch("rl2.ppo.act", return_value=(jnp.zeros(1, dtype=jnp.int32), zeros, zeros, carry)),
@@ -650,7 +589,6 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     assert "step=2 episodes=1 return=8.0 episode_length=2.0" in progress_lines[0]
     assert "step=3 episodes=1 return=n/a episode_length=n/a" in progress_lines[1]
     assert writer.flush.call_count == 2
-    envs.close.assert_called_once()
     writer.close.assert_called_once()
 
 
@@ -683,7 +621,6 @@ def test_video_schedule_uses_wall_time_without_catch_up(interval: float, expecte
         num_minibatches=1,
         update_epochs=1,
         total_steps=5,
-        vector_env="sync",
         video_interval_seconds=interval,
         eval_interval_seconds=0,
         target_kl=None,
@@ -692,9 +629,9 @@ def test_video_schedule_uses_wall_time_without_catch_up(interval: float, expecte
     zeros = np.zeros(1, dtype=np.float32)  # (B,)
     dones = np.zeros(1, dtype=bool)  # (B,); no episodes complete during training
     carry = initial_carry(1, 1)  # pair of (B, H=1)
-    envs = Mock(spec=gym.vector.VectorEnv, single_action_space=gym.spaces.Discrete(2))
+    envs = Mock(num_actions=2)
     envs.reset.return_value = (obs, {})
-    envs.step.return_value = (obs, zeros, dones, dones, {})
+    envs.step.return_value = env_step(obs, zeros, dones, dones, {})
     model = Mock()
     model.initial_carry.return_value = carry
     model.init.return_value = {"params": {"weight": jnp.zeros(1)}}  # weight: (1,)
@@ -726,7 +663,8 @@ def test_video_schedule_uses_wall_time_without_catch_up(interval: float, expecte
         clock += 1200.0  # Recording exceeds the interval; it must not trigger catch-up videos.
 
     with (
-        patch.object(ppo.gym.vector, "SyncVectorEnv", return_value=envs),
+        jax.disable_jit(),
+        patch.object(ppo, "GymnaxEnv", return_value=envs),
         patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo, "SummaryWriter") as writer,
         patch.object(ppo, "act", return_value=(jnp.zeros(1, dtype=jnp.int32), zeros, zeros, carry)),
@@ -747,7 +685,6 @@ def test_video_schedule_uses_wall_time_without_catch_up(interval: float, expecte
         assert recorded_writer is writer.return_value
         assert episodes == 0
         assert call.kwargs["initial_carry"] is carry
-    envs.close.assert_called_once()
     writer.return_value.close.assert_called_once()
 
 
@@ -761,14 +698,11 @@ def test_train_evaluates_final_policy(
 ) -> None:
     config = replace(
         load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-        env_id="ALE/Pong-v5",
-        atari_preprocessing=True,
         num_envs=1,
         num_steps=2,
         num_minibatches=1,
         update_epochs=1,
         total_steps=5,  # Training ends after two complete rollouts, at step 4.
-        vector_env="sync",
         video_interval_seconds=0,
         eval_interval_seconds=eval_interval_seconds,
         target_kl=None,
@@ -777,11 +711,11 @@ def test_train_evaluates_final_policy(
     zeros = np.zeros(1, dtype=np.float32)
     dones = np.ones(1, dtype=bool)
     carry = initial_carry(1, 1)
-    envs = Mock(spec=gym.vector.VectorEnv, single_action_space=gym.spaces.Discrete(2))
+    envs = Mock(num_actions=2)
     envs.reset.return_value = (obs, {})
     # The first game spans two steps; the last unfinished game must not count.
     envs.step.side_effect = [
-        (obs, np.array([reward]), dones if done else ~dones, ~dones, {})
+        env_step(obs, np.array([reward]), dones if done else ~dones, ~dones, {})
         for reward, done in ((5.0, False), (-2.0, True), (7.0, True), (1000.0, False))
     ]
     model = Mock()
@@ -811,7 +745,8 @@ def test_train_evaluates_final_policy(
         clock += 30.0
 
     with (
-        patch.object(ppo.gym.vector, "SyncVectorEnv", return_value=envs),
+        jax.disable_jit(),
+        patch.object(ppo, "GymnaxEnv", return_value=envs),
         patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo, "SummaryWriter") as writer,
         patch.object(ppo, "act", return_value=(jnp.zeros(1, dtype=jnp.int32), zeros, zeros, carry)),
@@ -854,7 +789,6 @@ def test_train_evaluates_final_policy(
     assert f"elapsed=0:01:{int(first_elapsed % 60):02d}" in output
     assert f"elapsed=0:{int(final_elapsed // 60):02d}:{int(final_elapsed % 60):02d}" in output
     assert "eta=" not in output
-    envs.close.assert_called_once()
     writer.return_value.close.assert_called_once()
 
 
@@ -912,232 +846,7 @@ def test_policy_diagnostics() -> None:
     assert float(metrics.clip_fraction) == 0.0
 
 
-@pytest.mark.parametrize("num_minibatches", [1, 2], ids=["whole-rollout", "split-environments"])
-def test_rollout_bootstraps_only_timeouts_before_partial_reset(num_minibatches: int) -> None:
-    config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-        num_envs=4,
-        num_steps=2,
-        num_minibatches=num_minibatches,
-        update_epochs=1,
-        total_steps=8,
-        vector_env="sync",
-        gamma=0.5,
-        gae_lambda=1.0,
-        target_kl=None,
-        video_interval_seconds=0,
-        eval_interval_seconds=0,
-    )
-    # Terminal, timeout, both flags, and continuing: each has distinct semantics.
-    initial_obs = np.arange(1, 5, dtype=np.uint8)[:, None]
-    final_obs = initial_obs + 10
-    reset_obs = np.array([[21], [22], [23], [14]], dtype=np.uint8)
-    next_obs = initial_obs + 30
-    dones = np.array([True, True, True, False])
-    envs = Mock(spec=gym.vector.VectorEnv, single_action_space=gym.spaces.Discrete(2))
-    envs.reset.side_effect = [(initial_obs, {}), (reset_obs, {})]
-    envs.step.side_effect = [
-        (
-            final_obs,
-            np.array([4.0, -2.0, 0.0, 4.0]),
-            np.array([True, False, True, False]),
-            np.array([False, True, True, False]),
-            {},
-        ),
-        (next_obs, np.array([2.0, -2.0, 2.0, -2.0]), np.zeros(4, dtype=bool), np.zeros(4, dtype=bool), {}),
-    ]
-    carry = initial_carry(4, 1)
-    advanced_carry = jax.tree.map(jnp.ones_like, carry)
-    model = Mock()
-    model.initial_carry.return_value = carry
-    model.init.return_value = {"params": {"weight": jnp.zeros(1)}}
-
-    seen_environments: list[int] = []
-
-    def predict(
-        state: TrainState,
-        obs: jax.Array,  # (B=4, O=1)
-        memory: ppo.RecurrentCarry,  # leaves: (B, H=1)
-        starts: jax.Array,  # (B,)
-    ) -> jax.Array:
-        chex.assert_shape(obs, (4, 1))
-        chex.assert_type(obs, np.uint8)
-        chex.assert_shape(starts, (4,))
-        chex.assert_type(starts, np.bool_)
-        prediction = jnp.asarray(obs[:, 0], dtype=jnp.float32)  # (B,)
-        chex.assert_shape(prediction, (4,))
-        chex.assert_type(prediction, np.float32)
-        return prediction  # (B,)
-
-    def check_batch(
-        state: TrainState,
-        batch: ppo.PPOBatch,  # observations: (T, M, O); targets/starts: (T, M); carry leaves: (M, H)
-        config: ppo.Config,
-        iteration: int,
-    ) -> tuple[TrainState, ppo.PPOMetrics]:
-        assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(batch))
-        size = 4 // num_minibatches  # M environments per minibatch
-        obs = batch.observations  # (T=2, M, O=1)
-        advantages, returns = batch.advantages, batch.returns  # each (T, M)
-        memory = batch.carry  # leaves: (M, H=1)
-        starts = batch.episode_starts  # (T, M)
-        chex.assert_shape(obs, (2, size, 1))
-        chex.assert_type(obs, np.uint8)
-        chex.assert_shape([advantages, returns, batch.values], (2, size))
-        chex.assert_type([advantages, returns, batch.values], np.float32)
-        chex.assert_shape(starts, (2, size))
-        chex.assert_type(starts, np.bool_)
-        # Identify the environments selected by the JAX permutation.
-        indices = np.asarray(obs[0, :, 0], dtype=np.int32) - 1  # (M,)
-        seen_environments.extend(indices.tolist())
-        np.testing.assert_array_equal(obs, np.stack([initial_obs, reset_obs])[:, indices])
-        np.testing.assert_array_equal(starts, np.stack([np.ones(4, dtype=bool), dones])[:, indices])
-        # Preserve reward magnitudes and signs, including before timeout bootstrapping.
-        expected = [[4.0, 4.0, 0.0, 11.5], [17.5, 14.0, 18.5, 15.0]]  # (T, B)
-        np.testing.assert_allclose(returns, np.asarray(expected)[:, indices])
-        np.testing.assert_array_equal(batch.values, np.arange(8, dtype=np.float32).reshape(2, 4)[:, indices])
-        np.testing.assert_allclose(advantages, np.asarray(expected)[:, indices] - batch.values)
-        for leaf in jax.tree.leaves(memory):
-            np.testing.assert_array_equal(leaf, 0)
-        return state, ppo.PPOMetrics(
-            policy_loss=jnp.asarray(0.0),  # ()
-            value_loss=jnp.asarray(0.0),  # ()
-            entropy_loss=jnp.asarray(0.0),  # ()
-            entropy=jnp.asarray(0.0),  # ()
-            approx_kl=jnp.asarray(0.0),  # ()
-            clip_fraction=jnp.asarray(0.0),  # ()
-        )
-
-    with (
-        patch.object(ppo.gym.vector, "SyncVectorEnv", return_value=envs) as vector_env,
-        patch.object(ppo, "ActorCritic", return_value=model),
-        patch.object(ppo, "SummaryWriter") as writer,
-        patch.object(
-            ppo,
-            "act",
-            side_effect=[
-                (
-                    jnp.zeros(4, dtype=jnp.int32),  # (B=4,)
-                    np.zeros(4, dtype=np.float32),  # (B,)
-                    np.arange(4, dtype=np.float32) + 4 * step,  # (B,)
-                    advanced_carry,  # leaves: (B, H=1)
-                )
-                for step in range(2)
-            ],
-        ),
-        patch.object(ppo, "value", side_effect=predict) as predict_value,
-        patch.object(ppo, "update", side_effect=check_batch) as update_batch,
-        patch.object(ppo, "checkpoint_manager"),
-        patch.object(ppo, "restore_checkpoint", return_value=None),
-        patch.object(ppo, "save_checkpoint"),
-    ):
-        train(config)
-    assert vector_env.call_args.kwargs["autoreset_mode"] == gym.vector.AutoresetMode.DISABLED
-    np.testing.assert_array_equal(envs.reset.call_args.kwargs["options"]["reset_mask"], dones)
-    assert predict_value.call_count == 2
-    timeout_call = predict_value.call_args_list[0]
-    assert isinstance(timeout_call.args[1], jax.Array)
-    assert isinstance(envs.step.call_args.args[0], np.ndarray)
-    np.testing.assert_array_equal(timeout_call.args[1], final_obs)
-    np.testing.assert_array_equal(timeout_call.args[3], False)
-    for leaf in jax.tree.leaves(timeout_call.args[2]):
-        np.testing.assert_array_equal(leaf, 1)
-    assert update_batch.call_count == num_minibatches
-    assert sorted(seen_environments) == list(range(4))
-    scalars = {call.args[0]: call.args[1] for call in writer.return_value.add_scalar.call_args_list}
-    assert scalars["charts/return_mean_last_100"] == pytest.approx(2 / 3)  # Episode scores exclude bootstrap values.
-    assert scalars["charts/total_episodes"] == 3
-    envs.close.assert_called_once()
-
-
-class SyntheticAtariEnv(gym.Env):
-    """Expose a distinct screen on each raw step, including the final step."""
-
-    def __init__(self, end_step: int, terminated: bool) -> None:
-        self.observation_space = gym.spaces.Box(0, 255, (210, 160, 3), np.uint8)
-        self.action_space = gym.spaces.Discrete(18)
-        self._frameskip = 1
-        self.ale = self
-        self.end_step = end_step
-        self.terminated = terminated
-        self.steps = 0
-
-    def reset(
-        self, *, seed: int | None = None, options: dict[str, Any] | None = None
-    ) -> tuple[np.ndarray, dict[str, Any]]:
-        super().reset(seed=seed)
-        self.steps = 0
-        return np.zeros(self.observation_space.shape, np.uint8), {}
-
-    def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
-        self.steps += 1
-        done = self.steps >= self.end_step
-        return (
-            np.full(self.observation_space.shape, self.steps, np.uint8),
-            0.0,
-            done and self.terminated,
-            done and not self.terminated,
-            {},
-        )
-
-    def lives(self) -> int:
-        return 1
-
-    def getScreenGrayscale(self, output: np.ndarray) -> None:
-        output.fill(self.steps)
-
-    def getScreenRGB(self, output: np.ndarray) -> None:
-        output.fill(self.steps)
-
-
 # Every action-repeat offset matters; color and end flags do not require a product.
-@pytest.mark.parametrize(
-    "end_step,terminated,grayscale", [(1, False, False), (2, True, True), (3, False, True), (4, True, False)]
-)
-def test_preprocessing_returns_final_screen(end_step: int, terminated: bool, grayscale: bool) -> None:
-    with ppo.AtariPreprocessing(SyntheticAtariEnv(end_step, terminated), noop_max=0, grayscale_obs=grayscale) as env:
-        env.reset(seed=0)
-        obs, _, actual_terminated, actual_truncated, _ = env.step(0)
-        assert actual_terminated == terminated
-        assert actual_truncated == (not terminated)
-        np.testing.assert_array_equal(obs, np.full(obs.shape, end_step, np.uint8))
-
-
-@pytest.mark.parametrize("frame_budget, model_type", ((1, "lstm"), (5, "lstm"), (5, "gdn2"), (5, "mamba3")))
-def test_video_recording_stops_at_frame_budget(frame_budget: int, model_type: ppo.ModelType) -> None:
-    from unittest.mock import Mock
-
-    config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-        video_max_frames=frame_budget,
-        model=small_model_config(model_type),
-    )
-    env = Mock()
-    env.metadata = {"render_fps": 60}
-    env.reset.return_value = (np.zeros((4, 84, 84), np.uint8), {})
-    env.step.return_value = (np.zeros((4, 84, 84), np.uint8), 0.0, False, False, {})
-    env.render.return_value = np.zeros((210, 160, 3), np.uint8)
-    writer = Mock()
-    carry = ppo.ActorCritic(1, config.model).initial_carry(1)  # leaves: (1, ...)
-    with (
-        patch("rl2.ppo.make_env", return_value=env),
-        patch("rl2.ppo.act", return_value=(np.array([0]), np.array([0.0]), np.array([0.0]), carry)) as act,
-    ):
-        ppo.log_video(Mock(), config, writer, episode=1, steps=128, initial_carry=carry)
-    if frame_budget > 1:
-        actual = act.call_args_list[0].args[2]  # leaves: (1, ...)
-        assert actual is carry
-        assert jax.tree.structure(actual) == jax.tree.structure(carry)
-        for leaf, expected in zip(jax.tree.leaves(actual), jax.tree.leaves(carry), strict=True):  # each (1, ...)
-            assert leaf.shape == expected.shape
-            np.testing.assert_array_equal(leaf, 0)
-    assert env.step.call_count == frame_budget - 1
-    video = writer.add_video.call_args.args[1]  # (1, T, C, H, W)
-    assert isinstance(video, np.ndarray)
-    assert video.dtype == np.uint8
-    assert video.shape == (1, frame_budget, 3, 210, 160)
-    assert writer.add_video.call_args.kwargs["fps"] == 60
-    env.close.assert_called_once()
 
 
 @pytest.mark.parametrize("frame_budget", (0, -1, 1.5, True))
@@ -1145,31 +854,6 @@ def test_invalid_video_frame_budget_rejected_by_config(frame_budget: Any) -> Non
     config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
     with pytest.raises(ValidationError, match="video_max_frames"):
         replace(config, video_max_frames=frame_budget)
-
-
-@pytest.mark.parametrize("frame_budget,terminated", [(None, True), (10, False)])
-def test_video_recording_stops_at_episode_end(frame_budget: int | None, terminated: bool) -> None:
-    from unittest.mock import Mock
-
-    config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), video_max_frames=frame_budget
-    )
-    env = Mock()
-    env.metadata = {"render_fps": 60}
-    obs = np.zeros((4, 84, 84), np.uint8)  # (F, H, W)
-    env.reset.return_value = (obs, {})
-    env.step.side_effect = [(obs, 0.0, False, False, {})] * 6 + [(obs, 0.0, terminated, not terminated, {})]
-    env.render.return_value = np.zeros((210, 160, 3), np.uint8)
-    writer = Mock()
-    carry = ppo.ActorCritic(1, config.model).initial_carry(1)  # leaves: (1, ...)
-    with (
-        patch("rl2.ppo.make_env", return_value=env),
-        patch("rl2.ppo.act", return_value=(np.array([0]), np.array([0.0]), np.array([0.0]), carry)),
-    ):
-        ppo.log_video(Mock(), config, writer, episode=1, steps=128, initial_carry=carry)
-    assert env.step.call_count == 7
-    assert writer.add_video.call_args.args[1].shape == (1, 8, 3, 210, 160)
-    env.close.assert_called_once()
 
 
 @jax.default_matmul_precision("highest")

@@ -20,7 +20,7 @@ def config_path(tmp_path: Path) -> Path:
 def test_load_config_returns_fully_resolved_config(config_path: Path, run_id: str | None) -> None:
     settings = yaml.safe_load(config_path.read_text())
     settings.update(
-        env_id="ALE/Boxing-v5",
+        env_id="Breakout-MinAtar",
         seed=7,
         log_dir="logs/${run_id}/${path_name:${env_id}}",
         num_minibatches="${num_envs}",
@@ -38,8 +38,8 @@ def test_load_config_returns_fully_resolved_config(config_path: Path, run_id: st
     if run_id == "explicit-run":
         assert config.run_id == run_id
     else:
-        assert config.run_id.startswith("ALE_Boxing-v5_seed7_")
-    assert config.log_dir == f"logs/{config.run_id}/ALE_Boxing-v5"
+        assert config.run_id.startswith("Breakout-MinAtar_seed7_")
+    assert config.log_dir == f"logs/{config.run_id}/Breakout-MinAtar"
     assert config.num_minibatches == config.num_envs
 
 
@@ -59,4 +59,34 @@ def test_load_config_rejects_invalid_settings(
     config_path.write_text(yaml.safe_dump(settings))
 
     with pytest.raises(error, match=match):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize("observation_size", [0, -1])
+def test_load_config_rejects_nonpositive_observation_size(config_path: Path, observation_size: int) -> None:
+    settings = yaml.safe_load(config_path.read_text())
+    settings["observation_size"] = observation_size
+    config_path.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValidationError, match="observation_size"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("frame_stack", True),
+        ("atari_preprocessing", False),
+        ("vector_env", "sync"),
+        ("observation_size", None),
+        ("env_id", "ALE/Breakout-v5"),
+        ("eval_episodes", 0),
+        ("eval_seed", -1),
+        ("eval_interval_seconds", -1),
+    ],
+)
+def test_rejects_unsupported_environment_options(config_path: Path, option: str, value: object) -> None:
+    settings = yaml.safe_load(config_path.read_text())
+    settings[option] = value
+    config_path.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValidationError, match=option):
         load_config(config_path)

@@ -1,7 +1,7 @@
 [project]
 name = "rl2"
 version = "0.1.0"
-description = "Barebones PPO for Atari in JAX and Flax"
+description = "Reinforcement learning with JAX and Flax"
 readme = "README.md"
 authors = [
     { name = "vshmyhlo", email = "vlad@cohere.com" }
@@ -14,6 +14,7 @@ dependencies = [
     "gcsfs",
     "google-cloud-storage>=3.15.1",
     "gymnasium>=1.1,<2",
+    "gymnax>=0.0.9,<0.1",
     "jax>=0.11.2,<0.12",
     "moviepy>=2.2,<3",
     "numpy>=2,<3",

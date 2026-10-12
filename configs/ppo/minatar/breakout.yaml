@@ -1,23 +1,18 @@
-# PPO Atari hyperparameters: https://arxiv.org/pdf/1707.06347, Table 5.
-env_id: ALE/Qbert-v5
-observation_size: null # Resize only; null preserves the original resolution
-frame_stack: true # true stacks 4 frames; false uses a single frame
-atari_preprocessing: true # true enables 84x84 grayscale, action repeat 4, max pooling, and random reset no-ops
+# Enduro PPO hyperparameters adapted to MinAtar: https://arxiv.org/pdf/1707.06347, Table 5.
+env_id: Breakout-MinAtar
 seed: 1
-total_steps: 10_000_000 # Agent transitions; 40M emulator frames with action repeat 4
+total_steps: 10_000_000 # Agent transitions across all environments; only full rollouts run
 num_envs: 8
-vector_env: async # async (subprocesses) or sync
 num_steps: 128
 num_minibatches: 4 # 8 envs * 128 steps / 4 = 256 samples; preserve whole sequences
 update_epochs: 3
-encoder_stages: # Together with the LSTM and heads, ~9.12M total parameters
-  # Reference Atari CNN channels and kernels; resize factors give 84 -> 21 -> 11 -> 11.
-  # Resize + SAME convolution substitutes for VALID strided convolution at 84x84 input.
+encoder_stages:
+  # Enduro CNN settings; MinAtar spatial sizes are 10 -> 3 -> 2 -> 2.
   # The fixed 7x7 stem, 768-wide projection, normalization/SiLU, and deeper heads remain.
   # blocks=0 omits residual blocks; resize-convolution itself has no activation.
-  - { channels: 32, blocks: 0, kernel_size: 8, resize_factor: 0.25 } # 84 -> 21
-  - { channels: 64, blocks: 0, kernel_size: 4, resize_factor: 0.5 } # 21 -> 11
-  - { channels: 64, blocks: 0, kernel_size: 3, resize_factor: 1.0 } # 11 -> 11
+  - { channels: 32, blocks: 0, kernel_size: 8, resize_factor: 0.25 } # 10 -> 3
+  - { channels: 64, blocks: 0, kernel_size: 4, resize_factor: 0.5 } # 3 -> 2
+  - { channels: 64, blocks: 0, kernel_size: 3, resize_factor: 1.0 } # 2 -> 2
 model: # Retain recurrence as requested; this LSTM is an adaptation of the reference CNN policy.
   type: lstm
   hidden_size: 512
@@ -36,7 +31,9 @@ entropy_decay: constant
 value_coef: 2.0 # Paper c1=1 on squared error; trainer multiplies 0.5 * squared error
 max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/ppo/${run_id}
-run_id: ppo_atari_${path_name:${env_id}} # Include env_id with / replaced by _
+run_id: ppo_${path_name:${env_id}} # Include env_id with / replaced by _
+checkpoint_interval_seconds: 600 # Save at rollout boundaries every 10 minutes, plus final checkpoint
+log_interval_seconds: 60 # Log progress at rollout boundaries every minute, plus on completion
 video_interval_seconds: 600 # Wall-clock seconds between recordings; 0 disables recording
 video_speed: 4.0 # Playback multiplier: 1.0 normal, 2.0 double speed
 eval_interval_seconds: 1800 # Wall-clock seconds between evaluations; timer restarts after evaluation; 0 disables

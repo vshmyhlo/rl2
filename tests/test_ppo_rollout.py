@@ -1,154 +1,152 @@
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import Mock, patch
 
 import chex
-import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 from flax.training.train_state import TrainState
 
 from rl2 import ppo
-from rl2.jax_env import JaxVectorEnv
-from rl2.lstm import initial_carry
+from rl2.gymnax_env import GymnaxEnv
+from rl2.observation_encoder import ConvStage
 
 
-@pytest.mark.parametrize(
-    ("num_steps", "num_envs", "obs_shape"),
-    [(1, 1, (1,)), (2, 2, (2, 1))],
-    ids=["single-transition", "sequence-with-partial-reset"],
-)
-def test_collect_rollout_continues_memory_rng_and_episodes(
-    num_steps: int, num_envs: int, obs_shape: tuple[int, ...]
-) -> None:
+def policy(
+    variables: dict[str, jax.Array],
+    observations: jax.Array,  # (B, C, H, W)
+    memory: ppo.RecurrentCarry,  # leaves: (B, H)
+    starts: jax.Array,  # (B,)
+    *,
+    method: str,
+) -> tuple[ppo.RecurrentCarry, jax.Array, jax.Array]:
+    def advance(leaf: jax.Array) -> jax.Array:  # (B, H) -> (B, H)
+        return jnp.where(starts[:, None], 0, leaf) + 1  # (B, H)
+
+    memory = jax.tree.map(advance, memory)  # leaves: (B, H)
+    return memory, jnp.zeros((observations.shape[0], 3)), jnp.full(observations.shape[0], 2.0)
+
+
+@pytest.mark.parametrize("num_envs,num_steps", [(1, 1), (2, 3)], ids=["single-transition", "batched-sequence"])
+def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs: int, num_steps: int) -> None:
     config = replace(
         ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-        num_steps=num_steps,
         num_envs=num_envs,
+        num_steps=num_steps,
         num_minibatches=1,
-        gamma=1.0,
+        gamma=0.5,
         gae_lambda=1.0,
     )
-    obs = jnp.zeros((num_envs, *obs_shape), dtype=jnp.uint8)  # (B, *O)
-    carry = initial_carry(num_envs, 1)  # leaves: (B, H=1)
-    starts = jnp.ones(num_envs, dtype=bool)  # (B,)
-    zeros = jnp.zeros(num_envs, dtype=jnp.float32)  # (B,)
-    rollout_state = ppo.RolloutCarry(
-        observations=obs,  # (B, *O)
-        carry=carry,  # leaves: (B, H)
-        episode_starts=starts,  # (B,)
-        episode_returns=zeros,  # (B,)
-        episode_lengths=jnp.zeros(num_envs, dtype=jnp.int32),  # (B,)
+    env = GymnaxEnv(config.env_id, max_steps_in_episode=2)
+    key = jax.random.key(0)  # ()
+    observations, env_state = env.reset(key, num_envs)  # (B,4,10,10); leaves: (B,...)
+    memory = ppo.ActorCritic(3, ppo.LSTMConfig(hidden_size=1)).initial_carry(num_envs)  # leaves: (B,1)
+    runner = ppo.RolloutCarry(
+        env_state,
+        observations,
+        memory,
+        jnp.ones(num_envs, bool),
+        jnp.zeros(num_envs),
+        jnp.zeros(num_envs, jnp.int32),
     )
-    key = jax.random.key(0)  # () typed PRNG key
-    state = Mock(spec=TrainState)
-    host_env = Mock(spec=gym.vector.VectorEnv)
-    # The first environment finishes at the end of the second rollout.
-    done = np.arange(num_envs) == 0  # (B,)
-    host_env.step.side_effect = [
-        (
-            np.full(obs.shape, step, dtype=np.uint8),  # (B, *O)
-            np.ones(num_envs, dtype=np.float32),  # (B,)
-            done if step == 2 * num_steps else np.zeros(num_envs, dtype=bool),  # (B,)
-            np.zeros(num_envs, dtype=bool),  # (B,)
-            {},
-        )
-        for step in range(1, 2 * num_steps + 1)
-    ]
-    reset_obs = np.full(obs.shape, 2 * num_steps, dtype=np.uint8)  # (B, *O)
-    reset_obs[0] = 0
-    host_env.reset.return_value = (reset_obs, {})
-    envs = JaxVectorEnv(host_env)
-
-    def act(
-        state: TrainState,
-        observations: jax.Array,  # (B, *O)
-        memory: ppo.RecurrentCarry,  # leaves: (B, H)
-        episode_starts: jax.Array,  # (B,)
-        action_key: jax.Array,  # () typed PRNG key
-    ) -> tuple[jax.Array, jax.Array, jax.Array, ppo.RecurrentCarry]:
-        chex.assert_shape(observations, (num_envs, *obs_shape))
-        chex.assert_shape(episode_starts, (num_envs,))
-
-        def advance(leaf: jax.Array) -> jax.Array:  # (B, H) -> (B, H)
-            return jnp.where(episode_starts[:, None], 0, leaf) + 1  # (B, H)
-
-        advanced = jax.tree.map(advance, memory)  # leaves: (B, H)
-        return (
-            jax.random.randint(action_key, (num_envs,), 0, 2),  # (B,)
-            jnp.full(num_envs, -0.5),  # (B,)
-            zeros,  # (B,)
-            advanced,  # leaves: (B, H)
-        )
-
-    with (
-        patch.object(ppo, "act", side_effect=act),
-        patch.object(ppo, "value", return_value=jnp.full(num_envs, 3.0)) as bootstrap,
-    ):
-        first_carry, first = ppo.collect_rollout(
-            rollout_state, state, envs, config, key
-        )  # carry: (B, ...); rollout arrays: (T, B, ...)
-        host_env.reset.assert_not_called()
-        second_carry, second = ppo.collect_rollout(
-            first_carry, state, envs, config, first.key
-        )  # carry: (B, ...); rollout arrays: (T, B, ...)
-
-    expected_key = key  # () typed PRNG key
-    for index, (result_carry, result) in enumerate(((first_carry, first), (second_carry, second))):
-        batch = result.batch  # observations: (T, B, *O); targets/starts: (T, B); memory leaves: (B, H)
-        chex.assert_shape(batch.observations, (num_steps, num_envs, *obs_shape))
+    state = TrainState.create(apply_fn=policy, params={}, tx=optax.sgd(0.1))
+    first, rollout = ppo.collect_rollout(runner, state, env, config, key)
+    second, continued = ppo.collect_rollout(first, state, env, config, rollout.key)
+    duplicate, repeated = ppo.collect_rollout(runner, state, env, config, key)
+    chex.assert_trees_all_equal((duplicate, repeated), (first, rollout))
+    for result in (rollout, continued):
+        chex.assert_shape(result.batch.observations, (num_steps, num_envs, 4, 10, 10))
         chex.assert_shape(
-            (batch.actions, batch.old_log_probs, batch.advantages, batch.returns, batch.episode_starts, batch.values),
+            (result.batch.actions, result.batch.returns, result.completed, result.completed_lengths),
             (num_steps, num_envs),
         )
-        chex.assert_type(batch.observations, jnp.uint8)
-        chex.assert_type(batch.actions, jnp.int32)
-        chex.assert_type(batch.episode_starts, jnp.bool_)
-        chex.assert_type((batch.old_log_probs, batch.advantages, batch.returns, batch.values), jnp.float32)
-        for step in range(num_steps):
-            expected_key, action_key = jax.random.split(expected_key)  # each () typed PRNG key
-            np.testing.assert_array_equal(batch.actions[step], jax.random.randint(action_key, (num_envs,), 0, 2))
-            np.testing.assert_array_equal(batch.observations[step], index * num_steps + step)
+        chex.assert_type(result.batch.observations, jnp.uint8)
+        chex.assert_type(result.batch.actions, jnp.int32)
+        # No brick hits within two steps. All boundaries here are timeouts.
+        np.testing.assert_array_equal(result.completed_returns, 0)
+        np.testing.assert_array_equal(result.completed_lengths, np.where(result.completed, 2, 0))
+        expected_key = key if result is rollout else rollout.key  # ()
+        for _ in range(num_steps):
+            expected_key = jax.random.split(expected_key, 3)[0]  # ()
         chex.assert_trees_all_equal(result.key, expected_key)
-        np.testing.assert_array_equal(batch.values, 0)
-        np.testing.assert_array_equal(batch.old_log_probs, -0.5)
-        expected_returns = np.broadcast_to(
-            np.arange(num_steps, 0, -1, dtype=np.float32)[:, None] + 3, (num_steps, num_envs)
-        ).copy()  # (T, B)
-        if index == 1:
-            expected_returns[:, 0] -= 3  # Terminal episodes do not bootstrap.
-        np.testing.assert_array_equal(batch.returns, expected_returns)
-        np.testing.assert_array_equal(batch.advantages, expected_returns)
-        for leaf in jax.tree.leaves(batch.carry):  # (B, H)
-            np.testing.assert_array_equal(leaf, index * num_steps)
-        for leaf in jax.tree.leaves(result_carry.carry):  # (B, H)
-            np.testing.assert_array_equal(leaf, (index + 1) * num_steps)
-        chex.assert_shape(result_carry.observations, (num_envs, *obs_shape))
-        chex.assert_shape(
-            (result_carry.episode_starts, result_carry.episode_returns, result_carry.episode_lengths), (num_envs,)
-        )
-        np.testing.assert_array_equal(bootstrap.call_args_list[index].args[1], result_carry.observations)
-        chex.assert_trees_all_equal(bootstrap.call_args_list[index].args[2], result_carry.carry)
-        np.testing.assert_array_equal(bootstrap.call_args_list[index].args[3], result_carry.episode_starts)
+    np.testing.assert_array_equal(second.episode_lengths, 2 * num_steps % 2)
+    np.testing.assert_array_equal(second.episode_starts, True)
+    np.testing.assert_array_equal(continued.batch.returns[-1], 1.0)  # gamma * value(final), not zero
+    for leaf in jax.tree.leaves(second.carry):  # (B,1)
+        np.testing.assert_array_equal(leaf, 2)
+    chex.assert_trees_all_equal(continued.batch.carry, first.carry)
+    np.testing.assert_array_equal(runner.episode_lengths, 0)
 
-    assert first.completed_returns == first.completed_lengths == ()
-    assert second.completed_returns == (float(2 * num_steps),)
-    assert second.completed_lengths == (2 * num_steps,)
-    np.testing.assert_array_equal(first_carry.episode_returns, num_steps)
-    np.testing.assert_array_equal(first_carry.episode_lengths, num_steps)
-    np.testing.assert_array_equal(first.batch.episode_starts[0], True)
-    np.testing.assert_array_equal(first.batch.episode_starts[1:], False)
-    np.testing.assert_array_equal(second.batch.episode_starts, False)
-    np.testing.assert_array_equal(second_carry.observations, reset_obs)
-    np.testing.assert_array_equal(second_carry.episode_starts, done)
-    np.testing.assert_array_equal(second_carry.episode_returns, np.where(done, 0, 2 * num_steps))
-    np.testing.assert_array_equal(second_carry.episode_lengths, np.where(done, 0, 2 * num_steps))
-    host_env.reset.assert_called_once()
-    np.testing.assert_array_equal(host_env.reset.call_args.kwargs["options"]["reset_mask"], done)
-    # Collection leaves the supplied state untouched and returns new arrays.
-    np.testing.assert_array_equal(rollout_state.observations, 0)
-    np.testing.assert_array_equal(rollout_state.episode_returns, 0)
-    for leaf in jax.tree.leaves(rollout_state.carry):  # (B, H)
-        np.testing.assert_array_equal(leaf, 0)
+
+def test_rollout_and_update_with_real_breakout_model() -> None:
+    config = replace(
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        num_envs=1,
+        num_steps=2,
+        num_minibatches=1,
+        update_epochs=1,
+        bf16=False,
+        target_kl=None,
+        model=ppo.LSTMConfig(hidden_size=2),
+        encoder_stages=(ConvStage(2, blocks=0),),
+    )
+    env = GymnaxEnv(config.env_id)
+    observations, env_state = env.reset(jax.random.key(0), 1)  # (1,4,10,10); leaves: (1,...)
+    model = ppo.ActorCritic(3, config.model, encoder_stages=config.encoder_stages, embedding_size=2)
+    carry = model.initial_carry(1)  # leaves: (1,2)
+    starts = jnp.ones(1, bool)  # (1,)
+    params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]
+    state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(1e-3))
+    runner = ppo.RolloutCarry(env_state, observations, carry, starts, jnp.zeros(1), jnp.zeros(1, jnp.int32))
+    _, rollout = ppo.collect_rollout(runner, state, env, config, jax.random.key(2))
+    updated, metrics = ppo.update(state, rollout.batch, config)
+    assert int(updated.step) == 1
+    assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves((updated.params, metrics)))
+    assert any(not np.array_equal(a, b) for a, b in zip(jax.tree.leaves(state.params), jax.tree.leaves(updated.params)))
+
+
+def test_terminal_and_timeout_targets_use_final_observations() -> None:
+    config = replace(
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        num_envs=4,
+        num_steps=1,
+        num_minibatches=1,
+        gamma=0.5,
+    )
+    env = GymnaxEnv(config.env_id, max_steps_in_episode=2)
+    _, env_state = env.reset(jax.random.key(0), 4)  # leaves: (B=4,...)
+    env_state = env_state.replace(
+        ball_y=jnp.array([8, 3, 8, 3]),
+        ball_x=jnp.zeros(4, jnp.int32),
+        ball_dir=jnp.full(4, 2),
+        time=jnp.array([0, 1, 1, 0]),
+    )
+    from rl2.gymnax_env import encode_observations
+
+    observations = encode_observations(jax.vmap(env.env.get_obs)(env_state))  # (B,4,10,10)
+    memory = ppo.ActorCritic(3, ppo.LSTMConfig(hidden_size=1)).initial_carry(4)  # leaves: (B,1)
+
+    def position_policy(
+        variables: dict[str, jax.Array],
+        observations: jax.Array,  # (B,C,H,W)
+        memory: ppo.RecurrentCarry,  # leaves: (B,1)
+        starts: jax.Array,  # (B,)
+        *,
+        method: str,
+    ) -> tuple[ppo.RecurrentCarry, jax.Array, jax.Array]:
+        memory, logits, _ = policy(variables, observations, memory, starts, method=method)
+        positions = jnp.argmax(observations[:, 1].reshape((4, -1)), axis=-1).astype(jnp.float32)  # (B,)
+        return memory, logits, positions  # leaves: (B,1); (B,3); (B,)
+
+    state = TrainState.create(apply_fn=position_policy, params={}, tx=optax.sgd(0.1))
+    runner = ppo.RolloutCarry(env_state, observations, memory, jnp.ones(4, bool), jnp.zeros(4), jnp.zeros(4, jnp.int32))
+    advanced, rollout = ppo.collect_rollout(runner, state, env, config, jax.random.key(1))
+    np.testing.assert_array_equal(rollout.batch.returns, [[0, 20.5, 0, 20.5]])
+    np.testing.assert_array_equal(rollout.completed, [[True, True, True, False]])
+    np.testing.assert_array_equal(rollout.completed_returns, 0)  # Raw scores exclude bootstrap values.
+    advanced, rollout = ppo.collect_rollout(advanced, state, env, config, rollout.key)
+    np.testing.assert_array_equal(rollout.batch.episode_starts, [[True, True, True, False]])
+    for leaf in jax.tree.leaves(advanced.carry):  # (B,1)
+        np.testing.assert_array_equal(leaf[:, 0], [1, 1, 1, 2])

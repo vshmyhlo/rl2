@@ -16,6 +16,7 @@ import numpy as np
 import optax
 import pytest
 from flax.training.train_state import TrainState
+from ppo_helpers import env_step
 
 from rl2 import ppo
 from rl2.atari_eval import TrainingScores
@@ -67,7 +68,6 @@ assert "tensorflow" not in sys.modules
 def config(tmp_path: Path) -> ppo.Config:
     return replace(
         ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-        env_id="ALE/Pong-v5",
         log_dir=str(tmp_path),
         run_id="resume-test",
         num_envs=1,
@@ -75,7 +75,6 @@ def config(tmp_path: Path) -> ppo.Config:
         num_minibatches=1,
         update_epochs=1,
         total_steps=4,
-        vector_env="sync",
         video_interval_seconds=0,
         eval_interval_seconds=0,
     )
@@ -112,7 +111,6 @@ def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Confi
             replace(
                 config,
                 total_steps=8,
-                num_steps=2,
                 log_interval_seconds=15.0,
                 video_interval_seconds=600.0,
                 eval_interval_seconds=1800.0,
@@ -148,6 +146,37 @@ def test_checkpoint_preserves_episode_length_history(config: ppo.Config, state: 
     assert restored is not None
     assert restored.training_length_sum == 305
     assert restored.recent_lengths == (3,) * 100
+
+
+@pytest.mark.parametrize("field", ["num_envs", "num_steps"])
+def test_checkpoint_rejects_changed_rollout_size(config: ppo.Config, state: TrainState, field: str) -> None:
+    manager = Mock()
+    ppo.save_checkpoint(manager, ppo.TrainingProgress(state, jax.random.key(3), 2, 0, (), ()), config)
+    saved = manager.save.call_args.kwargs["args"]
+    manager.latest_step.return_value = 2
+    manager.restore.side_effect = [
+        SimpleNamespace(metadata=saved.metadata.item),
+        SimpleNamespace(state=saved.state.item),
+    ]
+    with pytest.raises(ValueError, match=r"num_envs \* num_steps"):
+        ppo.restore_checkpoint(manager, state, replace(config, **{field: 2}))
+    # Reject before restoring optimizer arrays or opening the TensorBoard writer.
+    manager.restore.assert_called_once()
+
+
+def test_checkpoint_allows_reshaping_same_rollout_size(config: ppo.Config, state: TrainState) -> None:
+    config = replace(config, num_steps=2)
+    progress = ppo.TrainingProgress(state, jax.random.key(3), 1, 0, (), (), 0.0, 0)
+    manager = Mock()
+    ppo.save_checkpoint(manager, progress, config)
+    saved = manager.save.call_args.kwargs["args"]
+    manager.latest_step.return_value = 1
+    manager.restore.side_effect = [
+        SimpleNamespace(metadata=saved.metadata.item),
+        SimpleNamespace(state=saved.state.item),
+    ]
+    restored = ppo.restore_checkpoint(manager, state, replace(config, num_envs=2, num_steps=1))
+    chex.assert_trees_all_equal(restored, progress)
 
 
 def test_legacy_checkpoint_leaves_training_total_unavailable(config: ppo.Config, state: TrainState) -> None:
@@ -211,7 +240,7 @@ def test_checkpoint_paths_preserve_gcs_and_resolve_local(tmp_path: Path, monkeyp
 
 @pytest.mark.parametrize("failure", ["manager", "reset", "writer", "logging", "writer_close"])
 def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> None:
-    envs = Mock(single_action_space=ppo.gym.spaces.Discrete(2))
+    envs = Mock(num_actions=2)
     envs.reset.return_value = (np.zeros((1, 1), dtype=np.uint8), {})  # observations: (B=1, O=1)
     manager = Mock()
     writer = Mock()
@@ -226,8 +255,7 @@ def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> 
 
     with (
         patch.object(ppo, "configure_compilation_cache"),
-        patch.object(ppo.gym.vector, "SyncVectorEnv"),
-        patch.object(ppo, "JaxVectorEnv", return_value=envs),
+        patch.object(ppo, "GymnaxEnv", return_value=envs),
         patch.object(ppo, "checkpoint_manager", return_value=manager) as make_manager,
         patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo.TrainState, "create"),
@@ -241,7 +269,6 @@ def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> 
         with pytest.raises(RuntimeError, match=failure):
             ppo.train(config)
 
-    envs.close.assert_called_once_with()
     if failure == "manager":
         manager.close.assert_not_called()
     else:
@@ -253,10 +280,10 @@ def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> 
 
 
 def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> None:
-    run_dir = f"{config.log_dir}/{config.run_id}/ALE_Boxing-v5"
+    run_dir = f"{config.log_dir}/{config.run_id}/Breakout-MinAtar"
     path = Path(config.log_dir) / "config.yaml"
     settings = asdict(config)
-    settings.update(env_id="ALE/Boxing-v5", log_dir=config.log_dir + "/${run_id}/${path_name:${env_id}}")
+    settings.update(env_id="Breakout-MinAtar", log_dir=config.log_dir + "/${run_id}/${path_name:${env_id}}")
     path.write_text(ppo.yaml.safe_dump(settings))
     config = ppo.load_config(path)
     assert config.checkpoint_interval_seconds == 600.0
@@ -264,9 +291,9 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
     zeros = np.zeros(1, dtype=np.float32)
     dones = np.ones(1, dtype=bool)
     carry = initial_carry(1, 1)
-    envs = Mock(spec=ppo.gym.vector.VectorEnv, single_action_space=ppo.gym.spaces.Discrete(2))
+    envs = Mock(num_actions=2)
     envs.reset.return_value = (obs, {})
-    envs.step.return_value = (obs, np.ones(1), dones, ~dones, {})
+    envs.step.return_value = env_step(obs, np.ones(1), dones, ~dones, {})
     model = Mock()
     model.initial_carry.return_value = carry
     model.init.return_value = {"params": {"weight": jnp.zeros(1)}}
@@ -311,7 +338,8 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
         original_save(manager, progress, config)
 
     with (
-        patch.object(ppo.gym.vector, "SyncVectorEnv", return_value=envs),
+        jax.disable_jit(),
+        patch.object(ppo, "GymnaxEnv", return_value=envs),
         patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo, "SummaryWriter") as writer,
         patch.object(ppo, "act", return_value=(jnp.zeros(1, dtype=jnp.int32), zeros, zeros, carry)),
@@ -323,7 +351,6 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
         with pytest.raises(RuntimeError, match="simulated interruption"):
             ppo.train(config)
         assert saved_iterations == [2]
-        assert envs.close.call_count == 1
         writer.reset_mock()
         resumed = ppo.train(config)
         assert saved_iterations == [2, 4]
@@ -356,5 +383,20 @@ def test_train_checkpoints_after_ten_minutes_and_resumes(config: ppo.Config) -> 
         ppo.train(config)
         assert iterations == [0, 1, 2, 3]
         assert saved_iterations == [2, 4]
-        assert envs.close.call_count == 3
     assert (Path(run_dir) / "checkpoints" / "4").is_dir()
+
+
+def test_checkpoint_rejects_old_atari_environment(config: ppo.Config, state: TrainState) -> None:
+    manager = Mock()
+    manager.latest_step.return_value = 1
+    manager.restore.return_value = SimpleNamespace(
+        metadata={
+            "version": 2,
+            "iteration": 1,
+            "completed_episodes": 0,
+            "config": {"env_id": "ALE/Breakout-v5"},
+        }
+    )
+    with pytest.raises(ValueError, match="different environment"):
+        ppo.restore_checkpoint(manager, state, config)
+    manager.restore.assert_called_once()  # Reject metadata before attempting incompatible parameter restore.

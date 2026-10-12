@@ -70,8 +70,8 @@ def test_requires_reset_and_closes_emulator() -> None:
 def test_ppo_wrappers_follow_the_active_game(
     preprocessing: bool, stacked: bool, size: int | None, shape: tuple[int, ...]
 ) -> None:
+    from rl2.atari_env import AtariPreprocessing, make_env
     from rl2.multi_atari import ENV_ID
-    from rl2.ppo import AtariPreprocessing, make_env
 
     with make_env(
         ENV_ID,
@@ -115,8 +115,8 @@ def test_ppo_wrappers_follow_the_active_game(
 def test_vector_env_can_reset_individual_games(asynchronous: bool) -> None:
     from functools import partial
 
+    from rl2.atari_env import make_env
     from rl2.multi_atari import ENV_ID
-    from rl2.ppo import make_env
 
     vector_cls = gym.vector.AsyncVectorEnv if asynchronous else gym.vector.SyncVectorEnv
     options = {"context": "spawn"} if asynchronous else {}
@@ -139,27 +139,8 @@ def test_vector_env_can_reset_individual_games(asynchronous: bool) -> None:
         envs.close()
 
 
-def test_ppo_config_selects_the_registered_mixture() -> None:
-    from pathlib import Path
-
-    from rl2.multi_atari import ENV_ID
-    from rl2.ppo import load_config, make_env
-
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
-    assert config.env_id == ENV_ID
-    assert config.eval_interval_seconds == 0
-    with make_env(
-        config.env_id,
-        frame_stack=config.frame_stack,
-        atari_preprocessing=config.atari_preprocessing,
-        observation_size=config.observation_size,
-    ) as env:
-        assert isinstance(env.unwrapped, MultiAtariEnv)
-        assert env.observation_space.shape == (4, 84, 84)
-
-
 def test_skiing_switch_keeps_shared_actions_and_preprocessing() -> None:
-    from rl2.ppo import AtariPreprocessing
+    from rl2.atari_env import AtariPreprocessing
 
     raw = MultiAtariEnv(["ALE/Pong-v5", "ALE/Skiing-v5"])
     with gym.wrappers.FrameStackObservation(AtariPreprocessing(raw), stack_size=4) as env:
