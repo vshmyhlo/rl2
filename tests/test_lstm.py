@@ -1,5 +1,6 @@
 from functools import partial
 
+import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -132,6 +133,37 @@ def test_lstm_gradients_follow_history_but_stop_at_episode_reset(stacked: bool) 
     for grad in jax.tree.leaves(carry_grads):
         np.testing.assert_array_equal(grad[0], 0)
         assert float(jnp.linalg.norm(grad[1])) > 0
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
+@jax.default_matmul_precision("highest")
+def test_batched_projection_gradients_match_original_cell(dtype: jax.typing.DTypeLike) -> None:
+    model = LSTM(4, dtype=dtype)
+    x = jax.random.normal(jax.random.key(0), (4, 2, 3)).astype(dtype)  # (T, B, I)
+    starts = jnp.zeros((4, 2), bool).at[2, 0].set(True)  # (T, B)
+    memory = jax.tree.map(lambda state: state + 0.25, model.initial_carry(2))  # each (B, H)
+    variables = model.init(jax.random.key(1), x, memory, starts)  # parameter leaves
+
+    def loss(
+        params: chex.ArrayTree, inputs: jax.Array, carry: LSTMCarry, *, sequence: bool
+    ) -> jax.Array:  # inputs: (T, B, I); carry: each (B, H); result: ()
+        if sequence:
+            final, output = model.apply(params, inputs, carry, starts)  # each (B, H); (T, B, H)
+        else:
+
+            def step(
+                state: LSTMCarry, data: tuple[jax.Array, jax.Array]
+            ) -> tuple[LSTMCarry, jax.Array]:  # state: each (B, H); data: (B, I), (B,); output: (B, H)
+                return model.apply(params, data[0], state, data[1], method=model.step)
+
+            final, output = jax.lax.scan(step, carry, (inputs, starts))  # each (B, H); (T, B, H)
+        return jnp.square(output.astype(jnp.float32)).sum() + sum(jnp.square(s).sum() for s in final)  # ()
+
+    actual = jax.jit(jax.value_and_grad(partial(loss, sequence=True), argnums=(0, 1, 2)))(variables, x, memory)
+    expected = jax.jit(jax.value_and_grad(partial(loss, sequence=False), argnums=(0, 1, 2)))(variables, x, memory)
+    chex.assert_trees_all_equal_shapes_and_dtypes(actual, expected)
+    tolerance = 0.02 if dtype == jnp.bfloat16 else 2e-6
+    chex.assert_trees_all_close(actual, expected, atol=tolerance, rtol=tolerance)
 
 
 @pytest.mark.parametrize("shape", [(0, 1, 3), (1, 0, 3), (1, 1, 0)], ids=["time", "batch", "features"])

@@ -2,7 +2,7 @@
 
 The default pool is Atari-57. All of these games share native 210x160 RGB
 observations. Preprocessing, resizing, and frame stacking belong outside this
-environment, in ``ppo.make_env``. Custom pools must share a native screen size.
+environment, in ``atari_env.make_env``. Custom pools must share a native screen size.
 
 Each reset samples uniformly with replacement; rewards keep their native scale.
 Game identity is provided in info, not added to the policy's observation.

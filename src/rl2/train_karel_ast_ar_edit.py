@@ -116,7 +116,6 @@ from rl2.karel_ast_edit import (
     Observation,
 )
 from rl2.karel_ast_edit_vector import KarelASTEditVectorEnv
-from rl2.shape_checker import ShapeChecker
 from rl2.train_karel_ast_grpo import (
     Array,
     Metrics,
@@ -266,18 +265,6 @@ def initial_event(observations: list[ExecutedObservation], config: Config) -> Ev
     event.action[-1] = event.action[-2]
     event.grid[-1] = np.stack([np.stack((o.initial, o.target, o.output)) for o in observations])
     event.feedback[-1] = np.stack([observation.feedback for observation in observations])
-    sc = ShapeChecker(
-        T=len(INITIAL_ACTIONS) + 1,
-        B=len(observations),
-        I=3,
-        H=config.env.height,
-        W=config.env.width,
-        C=6,
-        F=FEEDBACK_SIZE,
-    )
-    sc.check((event.kind, event.action), "TB", np.int32)
-    sc.check(event.grid, "TBIHWC", np.int32)
-    sc.check(event.feedback, "TBF", np.float32)
     return event
 
 
@@ -438,8 +425,6 @@ class _EpisodeState:
 
     def grids(self) -> NDArray[np.int32]:
         grids = np.stack([np.stack((o.initial, o.target, o.output)) for o in self.executions])
-        sc = ShapeChecker(B=len(self.executions), I=3, H=self.config.env.height, W=self.config.env.width, C=6)
-        sc.check(grids, "BIHWC", dtype=np.int32)
         return grids
 
     def advance(
@@ -447,8 +432,6 @@ class _EpisodeState:
     ) -> tuple[Event, NDArray[np.float32]]:
         """Emit actions on both kinds, with execution images and scalars only on feedback."""
         count = len(self.executions)
-        sc = ShapeChecker(B=count, I=3, H=self.config.env.height, W=self.config.env.width, C=6, F=FEEDBACK_SIZE)
-        sc.check(actions, "B", dtype=np.int32)
         chex.assert_equal(len(transitions), count)
         event = jax.tree.map(itemgetter(0), empty_event(1, count, self.config))
         if self.pending_feedback.any():
@@ -472,10 +455,6 @@ class _EpisodeState:
                 # Budget exhaustion still emits feedback; STOP does not.
                 self.pending_feedback[index] = not transition.terminated
             self.active[index] = not (transition.terminated or transition.truncated)
-        sc.check([event.kind, event.action], "B", dtype=np.int32)
-        sc.check(event.feedback, "BF", dtype=np.float32)
-        sc.check(event.grid, "BIHWC", dtype=np.int32)
-        sc.check(rewards, "B", dtype=np.float32)
         return event, rewards
 
 
@@ -494,8 +473,6 @@ def run_episodes(
     count = len(tasks)
     if not count or envs.num_envs != count or envs.config != config.edit_config:
         raise ValueError("Expected matching nonempty tasks and editing environments")
-    sc = ShapeChecker(B=count, V=1 + config.max_nodes + len(AST_ACTIONS))
-    sc.check(key, "")
     episodes = _EpisodeState(envs.reset(tasks), config)
     seed_scores = np.asarray([observation.feedback[0] for observation in episodes.executions], np.float32)
     event = initial_event(episodes.executions, config)
@@ -509,12 +486,9 @@ def run_episodes(
         ready = episodes.ready
         for index in np.flatnonzero(ready):
             batch.legal[position, index] = episodes.observations[index].action_mask
-        sc.check(logits, "BV", dtype=np.float32)
         if ready.any():
             key, sample_key = jax.random.split(key)
             sampled, log_probs = jax.device_get(act(mask_logits(logits, batch.legal[position]), sample_key))
-            sc.check(sampled, "B", dtype=np.int32)
-            sc.check(log_probs, "B", dtype=np.float32)
             batch.actions[position] = np.where(ready, sampled, 0)
             batch.old_log_probs[position] = np.where(ready, log_probs, 0)
         batch.mask[position] = ready
@@ -555,8 +529,6 @@ def sample_task_groups(rng: np.random.Generator, config: Config) -> list[KarelPr
     """
     limit = config.max_unique_tasks
     indices = rng.integers(0, 2**31 if limit is None else limit, size=config.num_tasks)
-    sc = ShapeChecker(N=config.num_tasks)
-    sc.check(indices, "N", np.int64)
     tasks: list[KarelProgramEnv] = []
     for index in indices:
         seed = int(index)
@@ -577,13 +549,7 @@ def collect_rollout(
         raise ValueError("Expected num_tasks * group_size environments with configured limits")
     tasks = sample_task_groups(rng, config)
     batch, results, seed_scores, completed_edits, key, programs = run_episodes(state, tasks, envs, key, config)
-    sc = ShapeChecker(B=count, T=batch.actions.shape[0])
-    sc.check(batch.rewards, "TB", np.float32)
-    sc.check(batch.actions, "TB", np.int32)
-    sc.check(batch.mask, "TB", np.bool_)
-    sc.check(seed_scores, "B", np.float32)
     scores = np.asarray([result.score for result in results], np.float64)
-    sc.check(scores, "B", np.float64)
     rewards = batch.rewards.sum(axis=0)
     # All group members share a seed score. Normalize the equivalent final
     # scores, avoiding path-dependent rounding when float32 edit deltas sum.
@@ -591,7 +557,6 @@ def collect_rollout(
     grouped = scores.reshape(config.num_tasks, config.group_size)
     shifted = (grouped - grouped[:, :1]).astype(np.float32)
     advantages = np.asarray(group_advantages(shifted)).reshape(-1)
-    sc.check((rewards, advantages), "B", np.float32)
     batch = batch._replace(advantages=advantages)
     successes = np.asarray([result.success for result in results])
     sequence_lengths = config.edit_config.prefill_length + batch.mask.sum(axis=0) + completed_edits

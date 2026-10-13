@@ -37,9 +37,9 @@ from google.cloud import storage
 from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
+from rl2.atari_env import make_env
 from rl2.jax_cache import configure_compilation_cache
-from rl2.observation_encoder import ConvStage, ConvStages, validate_stages
-from rl2.ppo import make_env
+from rl2.model.encoders.rgb import ConvStage, ConvStages, validate_stages
 from rl2.wm import (
     LSTMWorldModel,
     MambaWorldModel,

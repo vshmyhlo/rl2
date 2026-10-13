@@ -55,6 +55,16 @@ class BaseEnv[State, Params](ABC):
     ) -> EnvStep[State]:
         """Advance and autoreset when terminated or truncated."""
 
+    def step_batch(
+        self,
+        keys: jax.Array,  # (B,) typed PRNG keys
+        state: State,  # leaves: (B, ...)
+        actions: jax.Array,  # (B,) integer action IDs
+        params: Params,
+    ) -> EnvStep[State]:
+        """Return (B, *O) observations, (B,) scalars and (B, ...) state/info leaves."""
+        return jax.vmap(self.step, in_axes=(0, 0, 0, None))(keys, state, actions, params)
+
     @abstractmethod
     def render(
         self,

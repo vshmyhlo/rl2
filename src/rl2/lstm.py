@@ -1,9 +1,12 @@
 """LSTM sequence model with per-example episode resets and float32 memory."""
 
+from typing import NamedTuple, cast
+
 import chex
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from flax.linen.recurrent import DenseParams
 
 from rl2.sequence_model import RecurrentSequenceModel
 
@@ -19,6 +22,45 @@ def _sigmoid_float32(x: jax.Array) -> jax.Array:  # (*S,) -> (*S,)
 def _tanh_float32(x: jax.Array) -> jax.Array:  # (*S,) -> (*S,)
     chex.assert_type(x, float)
     return jnp.tanh(x.astype(jnp.float32))  # (*S,)
+
+
+class _LSTMWeights(NamedTuple):
+    input: jax.Array  # (I, 4H)
+    recurrent: jax.Array  # (H, 4H)
+    bias: jax.Array  # (4H,)
+
+
+class _LSTMCell(nn.OptimizedLSTMCell):
+    @nn.compact
+    def weights(self, x: jax.Array, hidden: jax.Array) -> _LSTMWeights:  # (T, B, I); (B, H)
+        """Pack the original Flax parameters without changing checkpoint keys."""
+        inputs: list[jax.Array] = []  # each (I, H)
+        recurrent: list[jax.Array] = []  # each (H, H)
+        biases: list[jax.Array] = []  # each (H,)
+        for gate in "ifgo":
+            kernel, _ = DenseParams(self.features, use_bias=False, kernel_init=self.kernel_init, name=f"i{gate}")(
+                x
+            )  # (I, H); None
+            inputs.append(kernel)
+            kernel, bias = DenseParams(self.features, kernel_init=self.recurrent_kernel_init, name=f"h{gate}")(
+                hidden
+            )  # (H, H); (H,)
+            recurrent.append(kernel)
+            biases.append(cast(jax.Array, bias))
+        return _LSTMWeights(
+            jnp.concatenate(inputs, axis=-1).astype(self.dtype),  # (I, 4H)
+            jnp.concatenate(recurrent, axis=-1).astype(self.dtype),  # (H, 4H)
+            jnp.concatenate(biases).astype(self.dtype),  # (4H,)
+        )
+
+
+@jax.checkpoint
+def _apply_gates(cell: jax.Array, gates: jax.Array) -> LSTMCarry:  # (B, H); (B, 4H)
+    """Recompute cheap activations in backward instead of saving each gate."""
+    i, f, g, o = jnp.split(gates.astype(jnp.float32), 4, axis=-1)  # each (B, H)
+    cell = jax.nn.sigmoid(f) * cell + jax.nn.sigmoid(i) * jnp.tanh(g)  # (B, H)
+    hidden = jax.nn.sigmoid(o) * jnp.tanh(cell)  # (B, H)
+    return cell, hidden  # each (B, H), float32
 
 
 def initial_carry(num_envs: int, hidden_size: int) -> LSTMCarry:
@@ -50,7 +92,7 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
     def setup(self) -> None:
         chex.assert_scalar_positive(self.features)
         # Retain the parameter names used by PPO's original LSTM cell.
-        self.cell = nn.OptimizedLSTMCell(
+        self.cell = _LSTMCell(
             self.features,
             dtype=self.dtype,
             gate_fn=_sigmoid_float32,
@@ -69,25 +111,27 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
         episode_starts: jax.Array,  # (T, B), bool
     ) -> tuple[LSTMCarry, jax.Array]:
         chex.assert_rank(x, 3)
+        chex.assert_type(x, float)
+        chex.assert_shape(carry, (x.shape[1], self.features))
+        chex.assert_type(carry, jnp.float32)
         chex.assert_shape(episode_starts, x.shape[:2])
+        chex.assert_type(episode_starts, jnp.bool_)
         for size in x.shape:
             chex.assert_scalar_positive(size)
+        weights = self.cell.weights(x, carry[1])
+        projected = jnp.matmul(x.astype(self.dtype), weights.input)  # (T, B, 4H)
 
         def recurrent_step(
-            model: LSTM,
             memory: LSTMCarry,  # Each (B, H)
-            inputs: tuple[jax.Array, jax.Array],  # (B, I), (B,)
+            inputs: tuple[jax.Array, jax.Array],  # (B, 4H), (B,)
         ) -> tuple[LSTMCarry, jax.Array]:
-            inputs_x, starts = inputs  # (B, I), (B,)
-            return model.step(inputs_x, memory, starts)  # Carry: each (B, H); output: (B, H)
+            inputs_x, starts = inputs  # (B, 4H), (B,)
+            cell, hidden = jax.tree.map(lambda state: jnp.where(starts[:, None], 0, state), memory)  # each (B, H)
+            gates = (jnp.matmul(hidden.astype(self.dtype), weights.recurrent) + weights.bias) + inputs_x  # (B, 4H)
+            memory = _apply_gates(cell, gates)  # each (B, H)
+            return memory, memory[1].astype(self.dtype)  # carry: each (B, H); output: (B, H)
 
-        carry, output = nn.scan(
-            recurrent_step,
-            variable_broadcast="params",
-            split_rngs={"params": False},
-            in_axes=0,
-            out_axes=0,
-        )(self, carry, (x, episode_starts))  # Carry: each (B, H); output: (T, B, H)
+        carry, output = jax.lax.scan(recurrent_step, carry, (projected, episode_starts))  # (B, H) leaves; (T, B, H)
         return carry, output  # Carry: each (B, H); output: (T, B, H)
 
     def step(

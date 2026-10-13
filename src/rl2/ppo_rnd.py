@@ -6,13 +6,12 @@ intrinsic return continues across resets while recurrent memory still resets.
 
 import argparse
 import json
-from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from time import monotonic
-from typing import TYPE_CHECKING, Any, SupportsFloat
+from typing import Any, SupportsFloat
 
 import ale_py
 import chex
@@ -27,12 +26,10 @@ from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 from tensorboardX import SummaryWriter
 
+from rl2 import atari_eval
 from rl2.jax_cache import configure_compilation_cache
 from rl2.multi_atari import register_envs
-from rl2.utils import RunningMeanStd
-
-if TYPE_CHECKING:
-    from rl2.atari_eval import TrainingScores
+from rl2.utils import RunningMeanStd, gae
 
 type Array = jax.Array | NDArray[Any]
 type LSTMCarry = tuple[jax.Array, jax.Array]
@@ -418,24 +415,27 @@ def log_evaluation(
     episode: int,
     steps: int,
     *,
-    training_scores: "TrainingScores | None" = None,
+    initial_carry: LSTMCarry,  # leaves: (1, ...), backend-specific memory dimensions
+    training_scores: "atari_eval.TrainingScores | None" = None,
 ) -> None:
-    """Evaluate the current policy and save scores plus the complete report to TensorBoard."""
-    # Local import: atari_eval reuses PPO's observation wrapper and recurrent types.
-    from rl2.atari_eval import EvaluationConfig, evaluate
-
+    """Log evaluation scores, the complete report, and the last episode's video."""
     print(f"Evaluating {config.eval_episodes} games after {episode} training episodes", flush=True)
     started = monotonic()
-    result = evaluate(
-        state,
+
+    def on_video(video: NDArray[np.uint8], fps: float) -> None:  # video: (1, T, C, H, W)
+        writer.add_video("eval/gameplay", video, steps, fps=fps)
+
+    result = atari_eval.evaluate(
+        atari_eval.TrainStateAgent(state, initial_carry, sequence_policy=True),
         config,
-        EvaluationConfig(episodes=config.eval_episodes, seed=config.eval_seed),
+        atari_eval.EvaluationConfig(episodes=config.eval_episodes, seed=config.eval_seed),
         training_scores=training_scores,
+        on_video=on_video,
     )
-    for name in ("return_mean", "return_median", "return_std", "return_sem", "human_normalized_score_percent"):
+    for name in ("return_mean", "return_std", "return_sem", "human_normalized_score_percent"):
         if result[name] is not None:
             writer.add_scalar(f"eval/{name}", result[name], steps)
-    writer.add_scalar("eval/training_episodes", episode, steps)
+    writer.add_scalar("eval/total_training_episodes", episode, steps)
     if result["training_scores"] is not None:
         for name, score in result["training_scores"].items():
             if score is not None:
@@ -449,37 +449,6 @@ def log_evaluation(
     print(
         f"Evaluation: return={result['return_mean']:.1f}{normalized_text} over {config.eval_episodes} games", flush=True
     )
-
-
-@jax.jit
-def gae(
-    rewards: Array,
-    dones: Array,
-    values: Array,
-    next_value: Array,
-    gamma: float,
-    gae_lambda: float,
-) -> tuple[jax.Array, jax.Array]:
-    """Truncation bootstrap is already included in rewards; dones stop traces."""
-
-    def step(
-        carry: tuple[jax.Array, jax.Array],
-        transition: tuple[jax.Array, jax.Array, jax.Array],
-    ) -> tuple[tuple[jax.Array, jax.Array], jax.Array]:
-        advantage, next_value = carry
-        reward, done, value = transition
-        discount = gamma * (1.0 - done)
-        delta = reward + discount * next_value - value
-        advantage = delta + discount * gae_lambda * advantage
-        return (advantage, value), advantage
-
-    _, advantages = jax.lax.scan(
-        step,
-        (jnp.zeros_like(next_value), next_value),
-        (rewards, dones, values),
-        reverse=True,
-    )
-    return advantages, advantages + values
 
 
 def explained_variance(values: Array, returns: Array) -> float:
@@ -519,8 +488,6 @@ def update(state: TrainState, batch: PPOBatch, config: Config) -> tuple[TrainSta
 
 
 def train(config: Config) -> TrainState:
-    from rl2.atari_eval import TrainingScores
-
     configure_compilation_cache()
     batch_size = config.num_envs * config.num_steps
     if min(config.num_envs, config.num_steps, config.num_minibatches, config.update_epochs) < 1:
@@ -569,10 +536,8 @@ def train(config: Config) -> TrainState:
     ):
         raise ValueError("eval_every_minutes must be finite and nonnegative (0 disables evaluation)")
     if config.eval_every_minutes:
-        from rl2.atari_eval import EvaluationConfig, validate_training_config
-
-        EvaluationConfig(episodes=config.eval_episodes, seed=config.eval_seed)
-        validate_training_config(config)
+        atari_eval.EvaluationConfig(episodes=config.eval_episodes, seed=config.eval_seed)
+        atari_eval.validate_training_config(config)
 
     vector_cls = gym.vector.AsyncVectorEnv if config.vector_env == "async" else gym.vector.SyncVectorEnv
     # Spawn avoids forking JAX's threads or accelerator runtime.
@@ -656,10 +621,9 @@ def train(config: Config) -> TrainState:
         rng = np.random.default_rng(config.seed)
         episode_returns = np.zeros(config.num_envs)
         episode_lengths = np.zeros(config.num_envs, dtype=np.int64)
-        recent_returns: deque[float] = deque(maxlen=100)
-        recent_lengths = deque(maxlen=100)
         completed_episodes = 0
         training_return_sum = 0.0
+        training_length_sum = 0
         next_video_episode = config.video_every_episodes
         shape = (config.num_steps, config.num_envs)
         observations = np.empty((*shape, *obs.shape[1:]), dtype=np.uint8)
@@ -717,9 +681,8 @@ def train(config: Config) -> TrainState:
                 episode_start = dones[t].copy()
                 episode_returns += reward
                 episode_lengths += 1
-                recent_returns.extend(episode_returns[dones[t]])
                 training_return_sum += float(episode_returns[dones[t]].sum())
-                recent_lengths.extend(episode_lengths[dones[t]])
+                training_length_sum += int(episode_lengths[dones[t]].sum())
                 completed_episodes += int(dones[t].sum())
                 episode_returns[dones[t]] = 0
                 episode_lengths[dones[t]] = 0
@@ -847,10 +810,9 @@ def train(config: Config) -> TrainState:
                 "charts/total_episodes": completed_episodes,
             }.items():
                 writer.add_scalar(tag, float(scalar), steps)
-            if recent_returns:
-                writer.add_scalar("charts/return_mean_100", float(np.mean(recent_returns)), steps)
-                writer.add_scalar("charts/return_mean", training_return_sum / completed_episodes, steps)
-                writer.add_scalar("charts/episode_length_mean_100", float(np.mean(recent_lengths)), steps)
+            if completed_episodes:
+                writer.add_scalar("charts/total_return_mean", training_return_sum / completed_episodes, steps)
+                writer.add_scalar("charts/total_episode_length_mean", training_length_sum / completed_episodes, steps)
             while config.video_every_episodes and completed_episodes >= next_video_episode:
                 log_video(state, config, writer, next_video_episode, steps)
                 next_video_episode += config.video_every_episodes
@@ -861,15 +823,18 @@ def train(config: Config) -> TrainState:
                     writer,
                     completed_episodes,
                     steps,
-                    training_scores=TrainingScores(
-                        completed_episodes, training_return_sum, tuple(float(score) for score in recent_returns)
+                    initial_carry=initial_carry(1, config.lstm_hidden_size),
+                    training_scores=atari_eval.TrainingScores(
+                        completed_episodes,
+                        training_return_sum,
+                        length_sum=training_length_sum,
                     ),
                 )
                 # Restart after evaluation so long evaluations never cause catch-up runs.
                 next_eval_time = monotonic() + eval_interval_seconds
             writer.flush()
-            score = f"{np.mean(recent_returns):.1f}" if recent_returns else "n/a"
-            length = f"{np.mean(recent_lengths):.1f}" if recent_lengths else "n/a"
+            score = f"{training_return_sum / completed_episodes:.1f}" if completed_episodes else "n/a"
+            length = f"{training_length_sum / completed_episodes:.1f}" if completed_episodes else "n/a"
             print(
                 f"step={steps} episodes={completed_episodes} return={score} "
                 f"episode_length={length} sps={sps:.0f} lr={learning_rate:.3g} "

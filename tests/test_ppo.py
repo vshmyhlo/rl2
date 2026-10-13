@@ -16,6 +16,7 @@ from ppo_helpers import env_step
 from pydantic import ValidationError
 
 from rl2 import ppo
+from rl2.envs.base import BaseEnv
 from rl2.lstm import initial_carry
 from rl2.model.encoders.rgb import ConvStage
 from rl2.ppo import (
@@ -506,6 +507,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     dones = np.zeros(1, dtype=bool)  # (B,)
     carry = initial_carry(1, 1)  # pair of (B, H=1)
     envs = Mock(num_actions=2, params={})
+    envs.step_batch = partial(BaseEnv.step_batch, envs)
     envs.reset.return_value = (obs[0], {})
     # One episode spans both rollouts in the first window; the final window has none.
     envs.step.side_effect = [
@@ -667,6 +669,7 @@ def test_video_schedule_uses_iterations(interval: int, expected_steps: list[int]
     dones = np.zeros(1, dtype=bool)  # (B,); no episodes complete during training
     carry = initial_carry(1, 1)  # pair of (B, H=1)
     envs = Mock(num_actions=2, params={})
+    envs.step_batch = partial(BaseEnv.step_batch, envs)
     envs.reset.return_value = (obs[0], {})
     envs.step.return_value = env_step(obs[0], zeros[0], dones[0], dones[0], {})
     model = Mock()
@@ -751,6 +754,7 @@ def test_train_evaluates_final_policy(
     dones = np.ones(1, dtype=bool)
     carry = initial_carry(1, 1)
     envs = Mock(num_actions=2, params={})
+    envs.step_batch = partial(BaseEnv.step_batch, envs)
     envs.reset.return_value = (obs[0], {})
     # The first game spans two steps; the last unfinished game must not count.
     envs.step.side_effect = [

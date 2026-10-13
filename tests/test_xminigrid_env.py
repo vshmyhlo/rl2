@@ -15,6 +15,8 @@ from xminigrid.benchmarks import Benchmark
 from xminigrid.core.constants import TILES_REGISTRY, Colors, Tiles
 from xminigrid.core.goals import AgentOnTileGoal
 from xminigrid.core.rules import EmptyRule
+from xminigrid.environment import EnvParams
+from xminigrid.types import TimeStep
 
 from rl2 import ppo
 from rl2.envs.xminigrid_env import XMiniGridConfig, XMiniGridEnv
@@ -51,9 +53,12 @@ def test_terminal_timeout_both_and_partial_autoreset() -> None:
     agent = initial.state.agent.replace(position=jnp.array([[3, 2], [1, 1], [3, 2], [1, 1]]))  # leaves: (B,...)
     state = initial.replace(state=initial.state.replace(agent=agent, step_num=jnp.array([0, 1, 1, 0])))
     key = jax.random.key(1)  # ()
-    next_observations, next_state, rewards, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
+    expected = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
         jax.random.split(key, 4), state, jnp.zeros(4, jnp.int32), env.params
-    )  # (B,H,W,2); leaves: (B,...); rewards/done/flags: (B,); final_observation: (B,H,W,2)
+    )  # observation: (B, H, W, 2); scalar leaves: (B,); state leaves: (B, ...)
+    result = env.step_batch(jax.random.split(key, 4), state, jnp.zeros(4, jnp.int32), env.params)
+    chex.assert_trees_all_equal(result, expected)
+    next_observations, next_state, rewards, done, info = result
     np.testing.assert_array_equal(info["terminated"], [True, False, True, False])
     np.testing.assert_array_equal(info["truncated"], [False, True, True, False])
     np.testing.assert_array_equal(done, [True, True, True, False])
@@ -76,11 +81,40 @@ def test_terminal_timeout_both_and_partial_autoreset() -> None:
     chex.assert_trees_all_equal(actual, expected)
     np.testing.assert_array_equal(next_observations[3], info["final_observation"][3])
     assert not np.array_equal(next_observations[0], info["final_observation"][0])
-    next_observations, next_state, rewards, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
+    next_observations, next_state, rewards, done, info = env.step_batch(
         jax.random.split(key, 4), initial, jnp.zeros(4, jnp.int32), env.params
     )  # (B,H,W,2); leaves: (B,...); rewards/done/flags: (B,); final_observation: (B,H,W,2)
     np.testing.assert_array_equal(next_state.state.step_num, 1)
     np.testing.assert_array_equal(next_observations, info["final_observation"])
+
+
+def test_batch_step_skips_reset_work_until_an_episode_ends(monkeypatch: pytest.MonkeyPatch) -> None:
+    env = XMiniGridEnv(XMiniGridConfig(max_steps=2))
+    keys = jax.random.split(jax.random.key(0), 2)  # (B,) keys
+    _, initial = jax.vmap(env.reset, in_axes=(0, None))(keys, env.params)  # (B, H, W, 2); leaves: (B, ...)
+    calls: list[None] = []
+    original_reset = env.reset
+
+    def record_reset() -> None:
+        calls.append(None)
+
+    def counted_reset(key: jax.Array, params: EnvParams) -> tuple[jax.Array, TimeStep]:  # key: ()
+        jax.debug.callback(record_reset)
+        return original_reset(key, params)  # (H, W, 2); leaves: (...)
+
+    monkeypatch.setattr(env, "reset", counted_reset)
+    actions = jnp.ones(2, jnp.int32)  # (B,) turn, without reaching a goal
+    first = env.step_batch(keys, initial, actions, env.params)
+    jax.block_until_ready(first)
+    jax.effects_barrier()
+    assert not calls
+    np.testing.assert_array_equal(first.done, False)
+    second = env.step_batch(keys, first.state, actions, env.params)
+    jax.block_until_ready(second)
+    jax.effects_barrier()
+    assert len(calls) == 1
+    np.testing.assert_array_equal(second.done, True)
+    np.testing.assert_array_equal(second.state.state.step_num, 0)
 
 
 @pytest.fixture
@@ -115,13 +149,13 @@ def test_xland_rulesets_are_seeded_and_survive_transitions(benchmark: Benchmark,
         assert np.unique(state.state.goal_encoding, axis=0).shape[0] == 2
     else:
         np.testing.assert_array_equal(state.state.goal_encoding, np.broadcast_to(benchmark.goals[0], (4, 5)))
-    next_observations, next_state, _, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
+    next_observations, next_state, _, done, info = env.step_batch(
         jax.random.split(jax.random.key(1), 4), state, jnp.ones(4, jnp.int32), env.params
     )  # (B,H,W,2); leaves: (B,...); rewards/done/flags: (B,); final_observation: (B,H,W,2)
     np.testing.assert_array_equal(next_state.state.goal_encoding, state.state.goal_encoding)
     np.testing.assert_array_equal(next_state.state.rule_encoding, state.state.rule_encoding)
     reset_key = jax.random.key(2)  # ()
-    next_observations, next_state, _, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
+    next_observations, next_state, _, done, info = env.step_batch(
         jax.random.split(reset_key, 4), next_state, jnp.ones(4, jnp.int32), env.params
     )  # (B,H,W,2); leaves: (B,...); rewards/done/flags: (B,); final_observation: (B,H,W,2)
     np.testing.assert_array_equal(info["truncated"], True)

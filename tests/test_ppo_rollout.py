@@ -11,7 +11,7 @@ import pytest
 from flax.training.train_state import TrainState
 
 from rl2 import ppo
-from rl2.envs.gymnax_env import GymnaxEnv
+from rl2.envs.gymnax_env import GymnaxEnv, encode_observations
 from rl2.model.encoders.rgb import ConvStage
 
 
@@ -123,6 +123,15 @@ def test_train_step_matches_separate_rollout_and_updates_with_real_model() -> No
     key = jax.random.key(2)  # ()
     iteration = jnp.asarray(1)  # () nonzero iteration exercises schedule forwarding
     result = ppo.train_step(runner, state, env, config, key, ppo.init_metrics(), iteration)
+
+    def copy_buffer(array: jax.Array | int) -> jax.Array:  # arbitrary parameter/optimizer shape
+        return jnp.array(array, copy=True)  # same shape
+
+    owned_state = jax.tree.map(copy_buffer, state)  # parameter/optimizer leaves
+    donated = ppo.train_step_donated(runner, owned_state, env, config, key, ppo.init_metrics(), iteration)
+    chex.assert_trees_all_close((donated.train_state, donated.metrics), (result.train_state, result.metrics), atol=1e-6)
+    chex.assert_trees_all_equal((donated.rollout_carry, donated.key), (result.rollout_carry, result.key))
+    assert all(leaf.is_deleted() for leaf in jax.tree.leaves(owned_state.params))
     advanced, rollout = ppo.collect_rollout(runner, state, env, config, key)
     expected = state.replace(
         opt_state=state.opt_state._replace(
@@ -150,7 +159,7 @@ def test_train_step_matches_separate_rollout_and_updates_with_real_model() -> No
     chex.assert_trees_all_equal(result.rollout_carry, advanced)
     chex.assert_trees_all_equal(result.key, expected_key)
     chex.assert_shape(jax.tree.leaves(result.metrics.window.minibatch_metrics), ())
-    chex.assert_shape(jax.tree.leaves(result.metrics.window.rollout_metrics), ())
+    chex.assert_shape(result.metrics.window.explained_variance_sum, ())
     assert (
         int(result.train_state.step)
         == int(result.metrics.window.update_count)
@@ -159,7 +168,7 @@ def test_train_step_matches_separate_rollout_and_updates_with_real_model() -> No
     )
     assert not bool(result.metrics.window.early_stop_count)
     np.testing.assert_allclose(
-        result.metrics.window.rollout_metrics.explained_variance,
+        result.metrics.window.explained_variance_sum,
         ppo.explained_variance(rollout.batch.values, rollout.batch.returns),
     )
     assert all(
@@ -298,8 +307,6 @@ def test_terminal_and_timeout_targets_use_final_observations() -> None:
         ball_dir=jnp.full(4, 2),
         time=jnp.array([0, 1, 1, 0]),
     )
-    from rl2.envs.gymnax_env import encode_observations
-
     observations = encode_observations(jax.vmap(env.env.get_obs)(env_state))  # (B,4,10,10)
     memory = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
         4

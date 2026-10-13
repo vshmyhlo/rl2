@@ -35,7 +35,6 @@ from rl2.gdn2.generate import DEFAULT_CHECKPOINT, load_tokenizer
 from rl2.gdn2.model import GatedDeltaNet2Backend, GatedDeltaNet2LM, GatedDeltaNet2StackCarry
 from rl2.gemma3 import Gemma3Carry, Gemma3LM, Gemma3Tokenizer, load_gemma3_checkpoint, save_gemma3_checkpoint
 from rl2.jax_cache import configure_compilation_cache
-from rl2.shape_checker import ShapeChecker
 from rl2.utils import read_bytes, read_optional, write_bytes
 
 type Entry = dict[str, Any]
@@ -173,31 +172,15 @@ class GRPOBatch(NamedTuple):
     ref_log_probs: jax.Array  # [B,C], frozen initial policy (unused when beta=0).
     advantages: jax.Array  # [B], normalized before shuffling/minibatching.
 
-    def validate(self) -> None:
-        sc = ShapeChecker()
-        sc.check(self.prompts, "BP", jnp.int32)
-        sc.check(self.prompt_lengths, "B", jnp.int32)
-        sc.check(self.completions, "BC", jnp.int32)
-        sc.check(self.mask, "BC", jnp.bool_)
-        sc.check([self.old_log_probs, self.ref_log_probs], "BC", jnp.float32)
-        sc.check(self.advantages, "B", jnp.float32)
-
 
 def group_advantages(rewards: jax.Array) -> jax.Array:
-    sc = ShapeChecker()
-    sc.check(rewards, "NG", jnp.float32)
     centered = rewards - rewards.mean(axis=1, keepdims=True)
     result = centered / (rewards.std(axis=1, keepdims=True) + 1e-4)
-    sc.check(result, "NG", jnp.float32)
     return result
 
 
 def policy_log_probs(logits: jax.Array, tokens: jax.Array, temperature: float) -> jax.Array:
-    sc = ShapeChecker()
-    sc.check(logits, "BCV", jnp.float32)
-    sc.check(tokens, "BC", jnp.int32)
     result = jnp.take_along_axis(jax.nn.log_softmax(logits / temperature), tokens[..., None], axis=-1)[..., 0]
-    sc.check(result, "BC", jnp.float32)
     return result
 
 
@@ -257,9 +240,6 @@ def encode_prompts(
             raise ValueError("Prompt token ID outside tokenizer vocabulary")
         prompts[i, : len(ids)] = ids
         lengths[i] = len(ids)
-    sc = ShapeChecker()
-    sc.check(prompts, "BP", np.int32)
-    sc.check(lengths, "B", np.int32)
     return jnp.asarray(prompts), jnp.asarray(lengths)
 
 
@@ -281,17 +261,12 @@ def generate(
     eos_token_id: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prefill unique prompts once; independently sample each repeated model state."""
-    sc = ShapeChecker(V=model.vocab_size)
-    sc.check(prompts, "NP", jnp.int32)
-    sc.check(lengths, "N", jnp.int32)
-    sc.check(jax.random.key_data(key), "R", jnp.uint32)
     if isinstance(model, Gemma3LM):
         if prompts.shape[1] + max_new_tokens > model.cache_length:
             raise ValueError("Prompt + completion budget exceeds Gemma cache length")
         carry, logits = model.prefill(params, prompts, lengths)
     else:
         carry, logits = model.apply({"params": params}, prompts, lengths)
-    sc.check(logits, "NPV", jnp.float32)
     logits = jnp.repeat(logits[jnp.arange(prompts.shape[0]), lengths - 1], group_size, axis=0)
 
     def repeat_carry(x: jax.Array) -> jax.Array:
@@ -302,9 +277,6 @@ def generate(
 
     def step(previous: DecodeCarry, _: None) -> tuple[DecodeCarry, DecodeOutput]:
         carry, logits, active, key = previous
-        sc = ShapeChecker(B=batch_size, V=model.vocab_size)
-        sc.check(logits, "BV", jnp.float32)
-        sc.check(active, "B", jnp.bool_)
         key, sample_key = jax.random.split(key)
         tokens = jax.random.categorical(sample_key, logits / temperature).astype(jnp.int32)
         tokens = jnp.where(active, tokens, 0)
@@ -323,11 +295,7 @@ def generate(
         None,
         length=max_new_tokens,
     )
-    output_sc = ShapeChecker(B=batch_size, C=max_new_tokens)
     tokens, log_probs, mask = tokens.T, log_probs.T, mask.T
-    output_sc.check(tokens, "BC", jnp.int32)
-    output_sc.check(log_probs, "BC", jnp.float32)
-    output_sc.check(mask, "BC", jnp.bool_)
     return tokens, log_probs, mask, key
 
 
@@ -339,7 +307,6 @@ def completion_log_probs(
     temperature: float,
 ) -> jax.Array:
     """Pack prompt+completion without padding gaps; backpropagate through the prompt."""
-    batch.validate()
     b, p = batch.prompts.shape
     c = batch.completions.shape[1]
     positions = jnp.arange(p + c - 1)[None, :]
@@ -350,26 +317,16 @@ def completion_log_probs(
     lengths = batch.prompt_lengths + batch.mask.sum(axis=1, dtype=jnp.int32) - 1
     # Rematerialize model activations during backward instead of retaining every layer.
     _, logits = jax.checkpoint(model.apply)({"params": params}, tokens, lengths)
-    sc = ShapeChecker(B=b, T=p + c - 1, V=model.vocab_size, C=c)
-    sc.check(tokens, "BT", jnp.int32)
-    sc.check(logits, "BTV", jnp.float32)
     indices = batch.prompt_lengths[:, None] - 1 + jnp.arange(c)[None, :]
     logits = logits[jnp.arange(b)[:, None], indices]
     result = policy_log_probs(logits, batch.completions, temperature)
-    sc.check(result, "BC", jnp.float32)
     return jnp.where(batch.mask, result, 0.0)
 
 
 def objective(log_probs: jax.Array, batch: GRPOBatch, clip_coef: float, beta: float) -> tuple[jax.Array, Metrics]:
     """Clipped token ratios and sampled reference KL, averaged equally per completion."""
-    batch.validate()
-    sc = ShapeChecker()
-    sc.check(batch.completions, "BC", jnp.int32)
-    sc.check(log_probs, "BC", jnp.float32)
 
     def average(values: jax.Array) -> jax.Array:
-        sc = ShapeChecker(B=batch.mask.shape[0], C=batch.mask.shape[1])
-        sc.check(values, "BC", jnp.float32)
         return (jnp.where(batch.mask, values, 0).sum(axis=1) / jnp.maximum(batch.mask.sum(axis=1), 1)).mean()
 
     log_ratio = jnp.where(batch.mask, log_probs - jax.lax.stop_gradient(batch.old_log_probs), 0.0)
@@ -389,7 +346,6 @@ def objective(log_probs: jax.Array, batch: GRPOBatch, clip_coef: float, beta: fl
         "policy/approx_kl": average(jnp.expm1(log_ratio) - log_ratio),
         "policy/clip_fraction": average((jnp.abs(ratio - 1) > clip_coef).astype(jnp.float32)),
     }
-    sc.check(list(metrics.values()), "", jnp.float32)
     return loss, metrics
 
 
@@ -436,8 +392,6 @@ def score_completions(
             if not math.isfinite(score) or not 0 <= score <= 1:
                 raise ValueError(f"Task scorer returned invalid reward: {score}")
             rewards[i] = score
-    sc = ShapeChecker(B=len(texts))
-    sc.check(rewards, "B", np.float32)
     return jnp.asarray(rewards)
 
 
@@ -447,13 +401,9 @@ def apply_duration_penalty(
     coefficient: float,
 ) -> tuple[jax.Array, jax.Array]:
     """Deduct a token-budget-normalized cost, counting EOS but excluding padding."""
-    sc = ShapeChecker()
-    sc.check(task_rewards, "B", jnp.float32)
-    sc.check(mask, "BT", jnp.bool_)
     chex.assert_scalar_positive(mask.shape[1])
     penalties = coefficient * mask.sum(axis=1, dtype=jnp.float32) / mask.shape[1]
     rewards = task_rewards - penalties
-    sc.check([penalties, rewards], "B", jnp.float32)
     return rewards, penalties
 
 
@@ -532,8 +482,6 @@ def collect_rollout(
     )
     count = min(config.log_completion_count, config.group_size)
     group_rewards = np.asarray(rewards[: config.group_size])
-    sc = ShapeChecker(G=config.group_size)
-    sc.check(group_rewards, "G", np.float32)
     # Stable sorting preserves sampling order for ties; only the displayed group changes.
     indices = np.argsort(-group_rewards, kind="stable")[:count]
     samples = format_group_samples(
@@ -553,8 +501,6 @@ def save_training_checkpoint(
     *,
     prompts_seen: int,
 ) -> None:
-    sc = ShapeChecker()
-    sc.check(jax.random.key_data(key), "R", jnp.uint32)
     payload = {
         "version": 1,
         "state": serialization.to_state_dict(state),
@@ -584,8 +530,6 @@ def restore_training_checkpoint(data: bytes, state: TrainState) -> tuple[TrainSt
         raise ValueError(
             "Checkpoint model/optimizer structure, shapes, or dtypes are incompatible with the current state"
         ) from error
-    sc = ShapeChecker()
-    sc.check(payload["key"], "R", np.uint32)
     iteration = payload["iteration"]
     if type(iteration) is not int or iteration < 0:
         raise ValueError("Invalid checkpoint iteration")

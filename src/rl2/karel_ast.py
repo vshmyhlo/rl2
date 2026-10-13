@@ -22,7 +22,6 @@ from numpy.typing import NDArray
 
 from rl2.karel import ACTIONS, PREDICATES, _parse, _Statement
 from rl2.karel_syntax import MAX_BLOCK_DEPTH
-from rl2.shape_checker import ShapeChecker
 
 
 class Hole(IntEnum):
@@ -229,13 +228,8 @@ class ASTFeatures(NamedTuple):
 
         Preserves NumPy or JAX arrays and any batch/rollout leading dimensions.
         """
-        sc = ShapeChecker()
-        leading_dims = "abcdefghijklmnopqrstuvwxyz"[: self.seq_len.ndim]
-        sc.check(self.seq_len, leading_dims, np.int32)
-        sc.check((self.node_type, self.value), leading_dims + "N", np.int32)
         present = np.arange(self.node_type.shape[-1]) < self.seq_len[..., None]
         result = present & (self.node_type > len(CONSTRUCTORS)) & (self.value == 0)
-        sc.check(result, leading_dims + "N", np.bool_)
         return result
 
 
@@ -374,10 +368,7 @@ class KarelAST:
         All inactive positions must contain PAD=0. Validate the whole round
         before applying it; children created here wait until the next round.
         """
-        sc = ShapeChecker(N=self.max_nodes, A=len(AST_ACTIONS))
-        sc.check(actions, "N", dtype=np.int32)
         mask = self.parallel_action_mask()
-        sc.check(mask, "NA", dtype=np.bool_)
         active = mask.any(axis=-1)
         if np.any(actions[~active] != 0):
             raise ValueError("Non-hole positions must use PAD")
@@ -525,17 +516,10 @@ def teacher_forcing(
 
 
 def batch_features(features: tuple[ASTFeatures, ...]) -> ASTFeatures:
-    """Stack unbatched snapshots with matching capacities and valid array metadata."""
+    """Stack unbatched snapshots and validate sequence length bounds."""
     if not features:
         raise ValueError("Cannot batch zero ASTs")
-    sc = ShapeChecker(B=len(features), A=len(AST_ACTIONS))
     for snapshot in features:
-        sc.check(snapshot[:5], "N", dtype=np.int32)
-        sc.check(snapshot.seq_len, "", dtype=np.int32)
         chex.assert_scalar_in(int(snapshot.seq_len), 0, snapshot.node_type.shape[-1])
-        sc.check(snapshot.action_mask, "NA", dtype=np.bool_)
     result = ASTFeatures(*(np.stack(values) for values in zip(*features)))
-    sc.check(result[:5], "BN", dtype=np.int32)
-    sc.check(result.seq_len, "B", dtype=np.int32)
-    sc.check(result.action_mask, "BNA", dtype=np.bool_)
     return result

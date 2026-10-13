@@ -35,7 +35,6 @@ from rl2.attention import AttentionType
 from rl2.jax_cache import configure_compilation_cache
 from rl2.karel import ACTIONS, REWARD_COMPONENTS, TASK_CATEGORIES, TOKEN_TO_ID, KarelConfig, KarelPair, KarelProgramEnv
 from rl2.karel_ast import AST_ACTIONS, ASTFeatures, KarelAST, batch_features
-from rl2.shape_checker import ShapeChecker
 from rl2.utils import read_bytes, read_optional, write_bytes
 
 type Array = jax.Array | NDArray[Any]
@@ -151,10 +150,6 @@ def bucket_size(required: int, capacity: int) -> int:
 
 def bucket_tree(tree: ASTFeatures) -> ASTFeatures:
     """Trim to 32-node increments, capped at capacity; preserve all context nodes."""
-    sc = ShapeChecker(A=len(AST_ACTIONS))
-    sc.check(tree[:5], "BN", np.int32)
-    sc.check(tree.seq_len, "B", np.int32)
-    sc.check(tree.action_mask, "BNA", np.bool_)
     capacity = tree.node_type.shape[-1]
     chex.assert_scalar_positive(capacity)
     chex.assert_scalar_non_negative(int(np.min(tree.seq_len, initial=0)))
@@ -177,15 +172,11 @@ def pack_replay(batch: GRPOBatch) -> tuple[GRPOBatch, NDArray[np.float32]]:
     chex.assert_type(batch.actions, np.int32)
     chex.assert_type((batch.old_log_probs, batch.advantages), np.float32)
     chex.assert_type(batch.mask, np.bool_)
-    rounds, programs, nodes = batch.actions.shape
+    rounds, programs, _nodes = batch.actions.shape
     chex.assert_shape(batch.advantages, (programs,))
     chex.assert_shape(batch.initial, (programs, None, None, 6))
     chex.assert_equal_shape((batch.initial, batch.target))
     chex.assert_type((batch.initial, batch.target), np.int32)
-    sc = ShapeChecker(R=rounds, B=programs, N=nodes, A=len(AST_ACTIONS))
-    sc.check(batch.tree[:5], "RBN", np.int32)
-    sc.check(batch.tree.seq_len, "RB", np.int32)
-    sc.check(batch.tree.action_mask, "RBNA", np.bool_)
     mask = np.asarray(batch.mask) & (np.asarray(batch.actions) != KarelProgramEnv.pad_token_id)
     indices = np.flatnonzero(mask.any(axis=-1).reshape(-1))
     rows = bucket_size(len(indices), rounds * programs)
@@ -606,12 +597,7 @@ def _update(
     chex.assert_type(batch.actions, jnp.int32)
     chex.assert_type((batch.old_log_probs, batch.advantages), jnp.float32)
     chex.assert_type(batch.mask, jnp.bool_)
-    steps, programs, nodes = batch.actions.shape
-    sc = ShapeChecker(R=steps, B=programs, N=nodes, A=len(AST_ACTIONS))
-    sc.check(batch.tree[:5], "RBN", jnp.int32)
-    sc.check(batch.tree.seq_len, "RB", jnp.int32)
-    sc.check(batch.tree.is_hole, "RBN", jnp.bool_)
-    sc.check(batch.tree.action_mask, "RBNA", jnp.bool_)
+    steps, programs, _nodes = batch.actions.shape
     count = steps * programs
     chex.assert_shape(batch.initial, (programs, None, None, 6))
     chex.assert_equal_shape((batch.initial, batch.target))

@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from dataclasses import asdict, replace
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -19,6 +20,7 @@ from flax.training.train_state import TrainState
 from ppo_helpers import env_step
 
 from rl2 import ppo
+from rl2.envs.base import BaseEnv
 from rl2.lstm import initial_carry
 
 
@@ -255,6 +257,7 @@ def test_checkpoint_paths_preserve_gcs_and_resolve_local(tmp_path: Path, monkeyp
 @pytest.mark.parametrize("failure", ["manager", "reset", "writer", "logging", "writer_close"])
 def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> None:
     envs = Mock(num_actions=2, params={})
+    envs.step_batch = partial(BaseEnv.step_batch, envs)
     envs.reset.return_value = (np.zeros(1, dtype=np.uint8), {})  # observation: (O=1,)
     manager = Mock()
     writer = Mock()
@@ -307,6 +310,7 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
     dones = np.ones(1, dtype=bool)
     carry = initial_carry(1, 1)
     envs = Mock(num_actions=2, params={})
+    envs.step_batch = partial(BaseEnv.step_batch, envs)
     envs.reset.return_value = (obs[0], {})
     envs.step.return_value = env_step(obs[0], np.array(1.0), dones[0], ~dones[0], {})
     model = Mock()

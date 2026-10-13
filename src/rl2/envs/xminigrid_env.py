@@ -4,6 +4,7 @@ from functools import partial
 from typing import Annotated, Self
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import xminigrid
 from numpy.typing import NDArray
@@ -62,13 +63,15 @@ class XMiniGridEnv(BaseEnv[TimeStep, EnvParams]):
         timestep = self.env.reset(params, key)  # observation: (H, W, 2) tile/color IDs; state leaves: (...)
         return timestep.observation, timestep  # (H, W, 2); leaves: (...)
 
-    @partial(jax.jit, static_argnames="self")
+    @partial(jax.jit, static_argnames=("self", "auto_reset"))
     def step(
         self,
         key: jax.Array,  # () typed PRNG key
         state: TimeStep,  # leaves: (...)
         action: jax.Array,  # ()
         params: EnvParams,
+        *,
+        auto_reset: bool = True,
     ) -> EnvStep[TimeStep]:
         """Advance and autoreset; info retains (H, W, 2) final_observation tile/color IDs."""
         timestep = self.env.step(params, state, action)  # observation: (H, W, 2) tile/color IDs; state leaves: (...)
@@ -82,7 +85,7 @@ class XMiniGridEnv(BaseEnv[TimeStep, EnvParams]):
         def continue_episode(_: None) -> TimeStep:
             return timestep  # leaves: (...)
 
-        state = jax.lax.cond(done, reset_done, continue_episode, None)  # leaves: (...)
+        state = jax.lax.cond(done, reset_done, continue_episode, None) if auto_reset else timestep  # leaves: (...)
         return EnvStep(
             state.observation,  # (H, W, 2)
             state,  # leaves: (...)
@@ -95,6 +98,31 @@ class XMiniGridEnv(BaseEnv[TimeStep, EnvParams]):
                 "final_state": timestep,  # timestep leaves: (...), before autoreset
             },
         )
+
+    @partial(jax.jit, static_argnames="self")
+    def step_batch(
+        self,
+        keys: jax.Array,  # (B,) typed PRNG keys
+        state: TimeStep,  # leaves: (B, ...)
+        actions: jax.Array,  # (B,)
+        params: EnvParams,
+    ) -> EnvStep[TimeStep]:
+        """Skip batch reset generation when no episode ends; retain (B, ...) final info."""
+        result = jax.vmap(partial(self.step, auto_reset=False), in_axes=(0, 0, 0, None))(
+            keys, state, actions, params
+        )  # observations: (B, H, W, 2); scalar leaves: (B,); state leaves: (B, ...)
+
+        def reset_done(_: None) -> TimeStep:
+            _, reset_state = jax.vmap(self.reset, in_axes=(0, None))(keys, params)  # (B, H, W, 2); leaves: (B, ...)
+
+            def select(reset: jax.Array, current: jax.Array) -> jax.Array:  # each (B, ...) -> (B, ...)
+                mask = result.done.reshape((-1,) + (1,) * (current.ndim - 1))  # (B, 1, ...)
+                return jnp.where(mask, reset, current)  # (B, ...)
+
+            return jax.tree.map(select, reset_state, result.state)  # leaves: (B, ...)
+
+        state = jax.lax.cond(result.done.any(), reset_done, lambda _: result.state, None)  # leaves: (B, ...)
+        return result._replace(observation=state.observation, state=state)
 
     def render(self, state: TimeStep) -> NDArray[np.uint8]:  # timestep leaves: (...) -> (P, Q, 3) pixels
         """Render the full grid, actual agent pose, and highlighted observation window."""

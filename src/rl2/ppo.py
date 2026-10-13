@@ -218,13 +218,6 @@ class MinibatchMetrics:
     clip_fraction: jax.Array  # ()
 
 
-@struct.dataclass
-class RolloutMetrics:
-    """Scalar diagnostics for one full rollout batch."""
-
-    explained_variance: jax.Array  # ()
-
-
 class EpisodeMetrics(NamedTuple):
     """Completed-episode statistics, reduced from (B,) leaves to () aggregates."""
 
@@ -236,7 +229,7 @@ class EpisodeMetrics(NamedTuple):
 class WindowMetrics(NamedTuple):
     episodes: EpisodeMetrics  # scalar leaves
     minibatch_metrics: MinibatchMetrics  # scalar leaves, including KL-rejected minibatches
-    rollout_metrics: RolloutMetrics  # scalar leaves, summed over rollouts
+    explained_variance_sum: jax.Array  # () summed over rollouts
     minibatch_count: jax.Array  # () evaluated minibatches
     rollout_count: jax.Array  # () completed rollouts
     update_count: jax.Array  # () accepted minibatches
@@ -383,7 +376,7 @@ def init_metrics(progress: TrainingProgress | None = None) -> TrainingMetrics:
             minibatch_metrics=MinibatchMetrics(
                 **{field.name: jnp.zeros((), jnp.float64) for field in fields(MinibatchMetrics)}
             ),
-            rollout_metrics=RolloutMetrics(explained_variance=jnp.zeros((), jnp.float64)),  # scalar leaves
+            explained_variance_sum=jnp.zeros((), jnp.float64),  # ()
             minibatch_count=jnp.zeros((), jnp.int64),  # ()
             rollout_count=jnp.zeros((), jnp.int64),  # ()
             update_count=jnp.zeros((), jnp.int64),  # ()
@@ -808,7 +801,7 @@ def collect_rollout(
         actions = jax.random.categorical(action_key, logits)  # (B,)
         log_probs = action_log_prob(logits, actions)  # (B,)
         env_keys = jax.random.split(env_key, config.num_envs)  # (B,) typed PRNG keys
-        observations, env_state, raw_rewards, episode_ends, info = jax.vmap(envs.step, in_axes=(0, 0, 0, None))(
+        observations, env_state, raw_rewards, episode_ends, info = envs.step_batch(
             env_keys, current.env_state, actions, envs.params
         )  # observations: (B,*O); state leaves: (B,...); rewards/episode_ends/flags: (B,); final_observation: (B,*O)
         timeout = info["truncated"] & ~info["terminated"]  # (B,)
@@ -858,16 +851,11 @@ def collect_rollout(
             episode_starts=current.episode_starts,  # (B,)
         )
 
-    episode_metrics = RunningSum.init(
-        jax.tree.map(
-            jnp.sum,
-            EpisodeMetrics(
-                episode_count=rollout_carry.episode_starts,  # (B,)
-                episode_return_sum=rollout_carry.episode_returns,  # (B,)
-                episode_length_sum=rollout_carry.episode_step_counts,  # (B,)
-            ),
-        ),
-    )  # each ()
+    episode_metrics = EpisodeMetrics(
+        episode_count=jnp.zeros((), dtype=int),  # ()
+        episode_return_sum=jnp.zeros((), dtype=rollout_carry.episode_returns.dtype),  # ()
+        episode_length_sum=jnp.zeros((), dtype=int),  # ()
+    )
     (advanced, key, episode_metrics), trajectory = jax.lax.scan(
         step, Runner(rollout_carry, key, episode_metrics), None, length=config.num_steps
     )
@@ -978,9 +966,7 @@ def train_step(
     window = WindowMetrics(
         episodes=episodes,  # scalar leaves
         minibatch_metrics=updated.minibatch_metrics,  # scalar leaves
-        rollout_metrics=RolloutMetrics(
-            explained_variance=explained_variance(batch.values, batch.returns),  # ()
-        ),
+        explained_variance_sum=explained_variance(batch.values, batch.returns),  # ()
         minibatch_count=updated.minibatch_count,  # ()
         rollout_count=jnp.asarray(1, dtype=jnp.int32),  # ()
         update_count=updated.minibatch_count - updated.kl_exceeded.astype(jnp.int32),  # ()
@@ -997,13 +983,16 @@ def train_step(
     )
 
 
+# Only the training loop relinquishes ownership; other callers may reuse train_step inputs.
+train_step_donated = jax.jit(train_step, static_argnames=("envs", "config"), donate_argnames=("train_state",))
+
+
 def train(config: Config) -> TrainState:
     """Train with a fully resolved config, as returned by load_config."""
     with ExitStack() as resources:
         configure_compilation_cache()
         batch_size = config.num_envs * config.num_steps
         envs = make_env(config)
-        run_name = config.run_id
         run_dir = config.log_dir
         manager = resources.enter_context(closing(checkpoint_manager(run_dir)))
         key, init_key, reset_key = jax.random.split(jax.random.key(config.seed), 3)  # each () typed PRNG key
@@ -1042,13 +1031,13 @@ def train(config: Config) -> TrainState:
             # with fresh recurrent memory, retaining the policy and training RNGs.
             reset_keys = jax.random.split(jax.random.fold_in(key, start_rollout_index), config.num_envs)  # (B,) keys
             obs, env_state = jax.vmap(envs.reset, in_axes=(0, None))(reset_keys, envs.params)  # (B,*O); leaves: (B,...)
-            print(f"Resumed run {run_name} at step {start_rollout_index * batch_size}", flush=True)
+            print(f"Resumed run {config.run_id} at step {start_rollout_index * batch_size}", flush=True)
         initial_step_count = start_rollout_index * batch_size
         writer = resources.enter_context(
             closing(SummaryWriter(logdir=run_dir, purge_step=initial_step_count + 1 if progress is not None else None))
         )
         writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", initial_step_count)
-        print(f"Run ID: {run_name}\nTensorBoard run: {run_dir}", flush=True)
+        print(f"Run ID: {config.run_id}\nTensorBoard run: {run_dir}", flush=True)
         devices = str(jax.devices())
         print(f"JAX devices: {devices}", flush=True)
         writer.add_text("devices", devices, initial_step_count)
@@ -1065,16 +1054,13 @@ def train(config: Config) -> TrainState:
             episode_step_counts=jnp.zeros(config.num_envs, dtype=jnp.int32),  # (B,)
         )
 
-        start = monotonic()
-        window_start = start
+        start = window_start = monotonic()
         window_start_step_count = initial_step_count
         planned_rollout_count = config.total_steps // batch_size
         for rollout_index in range(start_rollout_index, planned_rollout_count):
-            result = train_step(rollout_carry, train_state, envs, config, key, metrics, rollout_index)
-            train_state = result.train_state
-            rollout_carry = result.rollout_carry  # leaves: (B, ...)
-            key = result.key  # () typed PRNG key
-            metrics = result.metrics  # scalar leaves
+            train_state, rollout_carry, key, metrics = train_step_donated(
+                rollout_carry, train_state, envs, config, key, metrics, rollout_index
+            )  # rollout_carry leaves: (B, ...); key: (); metric leaves: ()
             rollout_count = rollout_index + 1
             is_final_rollout = rollout_count == planned_rollout_count
             step_count = rollout_count * batch_size
@@ -1115,33 +1101,29 @@ def train(config: Config) -> TrainState:
                 # Include evaluation/video overhead in this session's elapsed time.
                 elapsed_seconds = now - start
                 scalars: dict[str, float | int] = {
-                    "value/explained_variance": float(window.rollout_metrics.explained_variance) / window_rollout_count,
+                    "value/explained_variance": float(window.explained_variance_sum) / window_rollout_count,
                     "charts/updates_per_rollout": int(window.update_count) / window_rollout_count,
                     "policy/early_stop": int(window.early_stop_count) / window_rollout_count,
+                    "losses/policy": mean_metrics["policy_loss"],
+                    "losses/value": mean_metrics["value_loss"],
+                    "losses/entropy": -mean_metrics["entropy"],
+                    "losses/total": mean_metrics["policy_loss"]
+                    + config.value_coef * mean_metrics["value_loss"]
+                    + mean_metrics["entropy_loss"],
+                    "policy/entropy": mean_metrics["entropy"],
+                    "policy/approx_kl": mean_metrics["approx_kl"],
+                    "policy/clip_fraction": mean_metrics["clip_fraction"],
+                    "charts/iterations_per_second": window_rollout_count / rate_seconds,
+                    "charts/observations_per_second": sps,
+                    "charts/episodes_per_second": window_episode_count / rate_seconds,
+                    "charts/learning_rate": learning_rate,
+                    "charts/entropy_coef": entropy_coef,
+                    "charts/total_episodes": episode_count,
+                    "charts/total_observations": step_count,
+                    "charts/training_progress": rollout_count / planned_rollout_count,
+                    "charts/episodes": window_episode_count,
+                    "time/elapsed_seconds": elapsed_seconds,
                 }
-                scalars.update(
-                    {
-                        "losses/policy": mean_metrics["policy_loss"],
-                        "losses/value": mean_metrics["value_loss"],
-                        "losses/entropy": -mean_metrics["entropy"],
-                        "losses/total": mean_metrics["policy_loss"]
-                        + config.value_coef * mean_metrics["value_loss"]
-                        + mean_metrics["entropy_loss"],
-                        "policy/entropy": mean_metrics["entropy"],
-                        "policy/approx_kl": mean_metrics["approx_kl"],
-                        "policy/clip_fraction": mean_metrics["clip_fraction"],
-                        "charts/iterations_per_second": window_rollout_count / rate_seconds,
-                        "charts/observations_per_second": sps,
-                        "charts/episodes_per_second": window_episode_count / rate_seconds,
-                        "charts/learning_rate": learning_rate,
-                        "charts/entropy_coef": entropy_coef,
-                        "charts/total_episodes": episode_count,
-                        "charts/total_observations": step_count,
-                        "charts/training_progress": rollout_count / planned_rollout_count,
-                        "charts/episodes": window_episode_count,
-                        "time/elapsed_seconds": elapsed_seconds,
-                    }
-                )
                 if window_episode_count:
                     scalars["charts/return_mean"] = float(window.episodes.episode_return_sum) / window_episode_count
                     scalars["charts/episode_length_mean"] = (
