@@ -1,4 +1,4 @@
-"""Recurrent PPO for JAX-native environments with spatial encoders and an LSTM.
+"""Recurrent PPO for JAX-native environments with observation encoders and an LSTM.
 
 Internal counters use *_count (batched counters: *_counts), zero-based positions
 use *_index, and accumulated values use *_sum or *_sums for pytrees.
@@ -125,6 +125,7 @@ from rl2.envs.kinetix_env import KinetixConfig, KinetixEnv
 from rl2.envs.xminigrid_env import XMiniGridConfig, XMiniGridEnv
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
+from rl2.model.encoders.kinetix import KinetixEncoder
 from rl2.model.encoders.rgb import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
 from rl2.model.encoders.xminigrid import XMiniGridEncoder
 from rl2.running_stats import RunningSum
@@ -275,7 +276,16 @@ class XMiniGridEncoderConfig:
     embedding_size: Annotated[int, Field(gt=0, strict=True)] = 256
 
 
-type EncoderConfig = Annotated[RGBEncoderConfig | XMiniGridEncoderConfig, Field(discriminator="type")]
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class KinetixEncoderConfig:
+    type: Literal["kinetix"] = "kinetix"
+    hidden_size: Annotated[int, Field(gt=0, strict=True)] = 256
+    embedding_size: Annotated[int, Field(gt=0, strict=True)] = 256
+
+
+type EncoderConfig = Annotated[
+    RGBEncoderConfig | XMiniGridEncoderConfig | KinetixEncoderConfig, Field(discriminator="type")
+]
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -328,6 +338,10 @@ class Config:
 
     @model_validator(mode="after")
     def validate_rollout(self) -> Self:
+        if self.model.encoder.type == "kinetix" and self.env_id != "Kinetix":
+            raise ValueError("kinetix encoder requires env_id: Kinetix")
+        if self.env_id == "Kinetix" and self.model.encoder.type != "kinetix":
+            raise ValueError("Kinetix requires model.encoder.type: kinetix")
         if self.model.encoder.type == "xminigrid" and self.env_id != "XLand-MiniGrid":
             raise ValueError("xminigrid encoder requires env_id: XLand-MiniGrid")
         if self.env_id == "XLand-MiniGrid" and self.model.encoder.type != "xminigrid":
@@ -527,11 +541,18 @@ class ActorCritic(nn.Module):
             self.encoder = ConvObservationEncoder(
                 stages=encoder.stages, embedding_size=encoder.embedding_size, dtype=self.dtype, name="encoder"
             )
-        else:
+        elif encoder.type == "xminigrid":
             self.encoder = XMiniGridEncoder(
                 token_size=encoder.token_size,
                 channels=encoder.channels,
                 blocks=encoder.blocks,
+                embedding_size=encoder.embedding_size,
+                dtype=self.dtype,
+                name="encoder",
+            )
+        else:
+            self.encoder = KinetixEncoder(
+                hidden_size=encoder.hidden_size,
                 embedding_size=encoder.embedding_size,
                 dtype=self.dtype,
                 name="encoder",
@@ -580,28 +601,26 @@ class ActorCritic(nn.Module):
 
     def __call__(
         self,
-        obs: jax.Array,  # (T, B, *O): RGB (F,H,W[,3]) or categorical (H,W,2)
+        obs: jax.Array,  # (T, B, *O), O is encoder-specific
         model_carry: RecurrentCarry,  # leaves: (B, ...)
         episode_starts: jax.Array,  # (T, B)
     ) -> ActorCriticOutput:  # carry leaves: (B, ...); policy leaves: (T, B, A/D); values: (T, B)
         """Process obs: (T, B, *O) observations and episode_starts: (T, B) reset masks."""
-        chex.assert_rank(obs, {5, 6})
         step_count, env_count = obs.shape[:2]
         x = self._encode(obs.reshape((-1, *obs.shape[2:])))  # (T * B, H)
         x = x.reshape((step_count, env_count, -1))  # (T, B, H)
-        # Batch the CNN and heads across time; the LSTM handles its recurrence.
+        # Batch the encoder and heads across time; the LSTM handles its recurrence.
         model_carry, x = self.recurrent(x, model_carry, episode_starts)  # model_carry leaves: (B, ...); x: (T, B, H)
         policy, values = self._heads(x)  # policy leaves: (T, B, A/D); (T, B)
         return ActorCriticOutput(model_carry, policy, values)
 
     def step(
         self,
-        obs: jax.Array,  # (B, *O): RGB (F,H,W[,3]) or categorical (H,W,2)
+        obs: jax.Array,  # (B, *O), O is encoder-specific
         model_carry: RecurrentCarry,  # leaves: (B, ...)
         episode_starts: jax.Array,  # (B,)
     ) -> ActorCriticOutput:  # carry leaves: (B, ...); policy leaves: (B, A/D); values: (B,)
         """Process obs: (B, *O) observations and episode_starts: (B,) reset masks."""
-        chex.assert_rank(obs, {4, 5})
         x = self._encode(obs)  # (B, H)
         model_carry, x = self.recurrent.step(x, model_carry, episode_starts)  # model_carry leaves: (B, ...); x: (B, H)
         policy, values = self._heads(x)  # policy leaves: (B, A/D); (B,)

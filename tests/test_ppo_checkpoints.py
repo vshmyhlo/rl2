@@ -464,7 +464,12 @@ def test_checkpoint_rejects_old_atari_environment(config: ppo.Config, state: Tra
 
 
 def test_checkpoint_validates_kinetix_settings(config: ppo.Config, state: TrainState) -> None:
-    config = replace(config, env_id="Kinetix", kinetix=ppo.KinetixConfig(levels=("s/h4_thrust_aim.json",)))
+    config = replace(
+        config,
+        env_id="Kinetix",
+        kinetix=ppo.KinetixConfig(levels=("s/h4_thrust_aim.json",)),
+        model=replace(config.model, encoder=ppo.KinetixEncoderConfig()),
+    )
     manager = Mock()
     progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 0, 0.0, 0)
     ppo.save_checkpoint(manager, progress, config)

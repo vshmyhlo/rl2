@@ -1,4 +1,4 @@
-# Pixel observations and continuous control of Kinetix's easy bipedal walker.
+# Symbolic physics observations and continuous control of Kinetix's easy bipedal walker.
 env_id: Kinetix
 kinetix:
   action_type: continuous
@@ -6,7 +6,7 @@ kinetix:
   levels: [l/mjc_walker_easy.json] # null samples a new procedural level at each reset
   max_steps: 256 # Agent steps, each advancing frame_skip physics steps
   frame_skip: 2
-  downscale: 4 # 500 / 4 = 125 pixels per side
+  downscale: 4 # Evaluation videos only: 500 / 4 = 125 pixels per side
   dense_reward_scale: 0.1 # 0 disables distance-based reward shaping
 seed: 1
 total_steps: 10_000_000
@@ -16,12 +16,9 @@ num_minibatches: 4
 update_epochs: 4
 model:
   encoder:
-    type: rgb
-    stages:
-      - { channels: 32, blocks: 1, resize_factor: 0.5 }
-      - { channels: 64, blocks: 1, resize_factor: 0.5 }
-      - { channels: 128, blocks: 1, resize_factor: 0.5 }
-      - { channels: 128, blocks: 1, resize_factor: 0.5 }
+    type: kinetix
+    hidden_size: 256
+    embedding_size: 256
   recurrent:
     type: lstm
     hidden_size: 256

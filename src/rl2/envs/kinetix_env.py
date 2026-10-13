@@ -1,4 +1,4 @@
-"""Single-environment Kinetix pixel observations and discrete or continuous actions for PPO."""
+"""Single-environment Kinetix symbolic observations and discrete or continuous actions for PPO."""
 
 from functools import partial
 from typing import Annotated, Literal
@@ -9,6 +9,7 @@ from kinetix.environment import ActionType, ObservationType, make_kinetix_env
 from kinetix.environment.env_state import EnvParams, EnvState
 from kinetix.environment.ued.ued import make_reset_fn_list_of_levels, make_reset_fn_sample_kinetix_level
 from kinetix.environment.utils import static_env_params_from_size
+from kinetix.render.renderer_pixels import make_render_pixels
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
@@ -28,12 +29,6 @@ class KinetixConfig:
     dense_reward_scale: Annotated[float, Field(ge=0, allow_inf_nan=False, strict=True)] = 0.1
 
 
-def encode_pixels(images: jax.Array) -> jax.Array:  # (..., W, H, 3) -> (..., 3, H, W)
-    """Convert normalized, y-up Kinetix pixels to channel-first uint8 images."""
-    pixels = jnp.rint(jnp.clip(images, 0, 1) * 255).astype(jnp.uint8)  # (..., W, H, 3)
-    return jnp.swapaxes(pixels, -1, -3)[..., ::-1, :]  # (..., 3, H, W)
-
-
 class KinetixEnv(BaseEnv[EnvState, EnvParams]):
     """Explicit transitions preserve final observations for timeout bootstrapping."""
 
@@ -48,12 +43,13 @@ class KinetixEnv(BaseEnv[EnvState, EnvParams]):
             reset_fn = make_reset_fn_list_of_levels(list(config.levels), static_params)
         self.env = make_kinetix_env(
             action_type=ActionType.DISCRETE if config.action_type == "discrete" else ActionType.CONTINUOUS,
-            observation_type=ObservationType.PIXELS,
+            observation_type=ObservationType.SYMBOLIC_FLAT,
             reset_fn=reset_fn,
             env_params=self.params,
             static_env_params=static_params,
             auto_reset=False,
         )
+        self.render_pixels = make_render_pixels(self.params, static_params)
         space = self.env.action_space(self.params)
         if config.action_type == "discrete":
             self.action_space = DiscreteSpace(space.n)
@@ -64,9 +60,9 @@ class KinetixEnv(BaseEnv[EnvState, EnvParams]):
 
     @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array, params: EnvParams) -> tuple[jax.Array, EnvState]:  # key: ()
-        """Return (C, H, W) uint8 observation and (...) state leaves."""
-        observation, state = self.env.reset(key, params)  # image: (W, H, 3); state leaves: (...)
-        return encode_pixels(observation.image), state  # (C, H, W); state leaves: (...)
+        """Return (F,) float32 symbolic observation and (...) state leaves."""
+        observation, state = self.env.reset(key, params)  # observation: (F,); state leaves: (...)
+        return observation, state  # (F,); state leaves: (...)
 
     @partial(jax.jit, static_argnames="self")
     def step(
@@ -76,41 +72,36 @@ class KinetixEnv(BaseEnv[EnvState, EnvParams]):
         action: jax.Array,  # () integer ID or (D,) continuous action
         params: EnvParams,
     ) -> EnvStep[EnvState]:
-        """Advance and autoreset; info retains (C, H, W) final_observation."""
+        """Advance and autoreset; info retains (F,) final_observation."""
         step_key, reset_key = jax.random.split(key)  # each () typed PRNG key
         # Separate time limits from termination for PPO timeout bootstrapping.
-        observation, final_state, reward, terminated, _ = self.env.step_env(
+        final_observation, final_state, reward, terminated, _ = self.env.step_env(
             step_key, state, action, params.replace(max_timesteps=2**31 - 1)
-        )  # image: (W, H, 3); state leaves: (...); reward/terminated: ()
-        final_observation = encode_pixels(observation.image)  # (C, H, W)
+        )  # observation: (F,); state leaves: (...); reward/terminated: ()
         truncated = final_state.timestep >= params.max_timesteps  # ()
         done = terminated | truncated  # ()
 
         def reset_done(_: None) -> tuple[jax.Array, EnvState]:
-            return self.reset(reset_key, params)  # (C, H, W); state leaves: (...)
+            return self.reset(reset_key, params)  # (F,); state leaves: (...)
 
         def continue_episode(_: None) -> tuple[jax.Array, EnvState]:
-            return final_observation, final_state  # (C, H, W); state leaves: (...)
+            return final_observation, final_state  # (F,); state leaves: (...)
 
-        observation, state = jax.lax.cond(done, reset_done, continue_episode, None)  # (C,H,W); leaves: (...)
+        observation, state = jax.lax.cond(done, reset_done, continue_episode, None)  # (F,); leaves: (...)
         return EnvStep(
-            observation,  # (C, H, W)
+            observation,  # (F,)
             state,  # leaves: (...)
             reward,  # ()
             done,  # ()
             {
                 "terminated": terminated,  # ()
                 "truncated": truncated,  # ()
-                "final_observation": final_observation,  # (C, H, W)
+                "final_observation": final_observation,  # (F,)
                 "final_state": final_state,  # leaves: (...)
             },
         )
 
-    @staticmethod
-    def render_observation(observation: jax.Array) -> jax.Array:  # (3, H, W) -> (H, W, 3)
-        return jnp.moveaxis(observation, 0, -1)  # (H, W, 3)
-
     @partial(jax.jit, static_argnames="self")
     def render(self, state: EnvState) -> jax.Array:  # state leaves: (...) -> (H, W, 3)
-        observation = encode_pixels(self.env.get_obs(state).image)  # (3, H, W)
-        return self.render_observation(observation)  # (H, W, 3)
+        pixels = self.render_pixels(state)  # (W, H, 3), y-up in [0, 255]
+        return jnp.rint(jnp.clip(pixels, 0, 255)).astype(jnp.uint8).swapaxes(0, 1)[::-1]  # (H, W, 3)

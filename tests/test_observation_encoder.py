@@ -11,6 +11,14 @@ import pytest
 from rl2.model.encoders.rgb import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages, ResidualBlock
 
 
+@pytest.mark.parametrize("shape", [(1, 2, 2), (1, 1, 2, 2, 4)], ids=["missing-batch", "wrong-rgb-channels"])
+def test_invalid_observation_shape(shape: tuple[int, ...]) -> None:
+    model = ConvObservationEncoder(stages=(ConvStage(2, blocks=0),), embedding_size=2)
+    obs = jax.ShapeDtypeStruct(shape, jnp.uint8)  # invalid (B,F,H,W[,3]) contract
+    with pytest.raises(AssertionError):
+        jax.eval_shape(model.init, jax.random.key(0), obs)
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 def test_residual_branch_normalizes_and_applies_silu_after_final_convolution(dtype: jax.typing.DTypeLike) -> None:
     model = ResidualBlock(4, dtype=dtype)

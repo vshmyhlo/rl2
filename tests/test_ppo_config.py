@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 from rl2 import ppo
 from rl2.envs.kinetix_env import KinetixConfig
-from rl2.ppo import Config, RGBEncoderConfig, XMiniGridEncoderConfig, load_config
+from rl2.ppo import Config, KinetixEncoderConfig, RGBEncoderConfig, XMiniGridEncoderConfig, load_config
 
 
 @pytest.fixture
@@ -104,8 +104,10 @@ def test_rejects_unsupported_environment_options(config_path: Path, option: str,
 def test_kinetix_config_loads_yaml_levels_as_hashable_tuple() -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml")
     assert config.env_id == "Kinetix"
-    assert config.kinetix.action_type == "discrete"
-    assert config.kinetix.levels == ("s/h4_thrust_aim.json",)
+    assert config.kinetix.action_type == "continuous"
+    assert config.kinetix.size == "l"
+    assert config.model.encoder == KinetixEncoderConfig()
+    assert config.kinetix.levels == ("l/mjc_walker_easy.json",)
     assert hash(config)
 
 
@@ -236,14 +238,17 @@ def test_rejects_top_level_encoder_stages(config_path: Path) -> None:
         load_config(config_path)
 
 
-@pytest.mark.parametrize("kind", ["rgb", "xminigrid"])
+@pytest.mark.parametrize("kind", ["rgb", "xminigrid", "kinetix"])
 def test_encoder_variant_round_trip(config_path: Path, kind: str) -> None:
     settings = yaml.safe_load(config_path.read_text())
-    settings["env_id"] = "XLand-MiniGrid" if kind == "xminigrid" else "Breakout-MinAtar"
+    settings["env_id"] = {"rgb": "Breakout-MinAtar", "xminigrid": "XLand-MiniGrid", "kinetix": "Kinetix"}[kind]
     settings["model"]["encoder"] = {"type": kind, "embedding_size": 8}
     config_path.write_text(yaml.safe_dump(settings))
     config = load_config(config_path)
-    assert isinstance(config.model.encoder, RGBEncoderConfig if kind == "rgb" else XMiniGridEncoderConfig)
+    encoder_class = {"rgb": RGBEncoderConfig, "xminigrid": XMiniGridEncoderConfig, "kinetix": KinetixEncoderConfig}[
+        kind
+    ]
+    assert isinstance(config.model.encoder, encoder_class)
     assert config.model.encoder.embedding_size == 8
     config_path.write_text(yaml.safe_dump(asdict(config)))
     restored = load_config(config_path)
@@ -261,6 +266,10 @@ def test_encoder_variant_round_trip(config_path: Path, kind: str) -> None:
         ({"type": "xminigrid", "channels": True}, "channels"),
         ({"type": "xminigrid", "blocks": -1}, "blocks"),
         ({"type": "xminigrid", "embedding_size": 0}, "embedding_size"),
+        ({"type": "kinetix", "hidden_size": 0}, "hidden_size"),
+        ({"type": "kinetix", "embedding_size": 0}, "embedding_size"),
+        ({"type": "kinetix", "hidden_size": True}, "hidden_size"),
+        ({"type": "kinetix", "stages": []}, "stages"),
     ],
 )
 def test_invalid_encoder_variants(config_path: Path, encoder: dict[str, object], match: str) -> None:
@@ -290,4 +299,17 @@ def test_xminigrid_requires_matching_encoder(config_path: Path, explicit_rgb: bo
         settings["model"].pop("encoder")
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match="XLand-MiniGrid requires model.encoder.type: xminigrid"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "env_id,encoder,match",
+    [("Kinetix", "rgb", "Kinetix requires"), ("Breakout-MinAtar", "kinetix", "kinetix encoder requires")],
+)
+def test_kinetix_requires_matching_encoder(config_path: Path, env_id: str, encoder: str, match: str) -> None:
+    settings = yaml.safe_load(config_path.read_text())
+    settings["env_id"] = env_id
+    settings["model"]["encoder"] = {"type": encoder}
+    config_path.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValidationError, match=match):
         load_config(config_path)

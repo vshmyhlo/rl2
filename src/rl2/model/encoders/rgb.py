@@ -123,7 +123,8 @@ class ConvObservationEncoder(nn.Module):
     dtype: jax.typing.DTypeLike = jnp.float32
 
     @nn.compact
-    def __call__(self, obs: jax.Array | NDArray[np.uint8]) -> jax.Array:
+    def __call__(self, obs: jax.Array | NDArray[np.uint8]) -> jax.Array:  # (B, F, H, W[, 3]) -> (B, E)
+        chex.assert_rank(obs, {4, 5})
         validate_stages(self.stages)
         chex.assert_type(self.embedding_size, int)
         chex.assert_scalar_positive(self.embedding_size)

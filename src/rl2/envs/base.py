@@ -15,14 +15,14 @@ class StepInfo[State](TypedDict):
 
     terminated: jax.Array  # () bool
     truncated: jax.Array  # () bool
-    final_observation: jax.Array  # (*O,) uint8
+    final_observation: jax.Array  # (*O,) adapter-specific dtype
     final_state: State  # leaves: (...)
 
 
 class EnvStep[State](NamedTuple):
     """Step result with observation/state reset when done."""
 
-    observation: jax.Array  # (*O,) uint8
+    observation: jax.Array  # (*O,) adapter-specific dtype
     state: State  # leaves: (...)
     reward: jax.Array  # () floating-point
     done: jax.Array  # () bool, terminated or truncated
@@ -45,7 +45,7 @@ class BaseEnv[State, Params](ABC):
         key: jax.Array,  # () typed PRNG key
         params: Params,
     ) -> tuple[jax.Array, State]:  # (*O,); state leaves: (...)
-        """Return (*O,) uint8 observation and (...) state leaves."""
+        """Return (*O,) observation in the adapter's dtype and (...) state leaves."""
 
     @abstractmethod
     def step(
