@@ -22,12 +22,14 @@ def policy(
     starts: jax.Array,  # (B,)
     *,
     method: str,
-) -> tuple[ppo.RecurrentCarry, jax.Array, jax.Array]:
+) -> ppo.ActorCriticOutput:
     def advance(leaf: jax.Array) -> jax.Array:  # (B, H) -> (B, H)
         return jnp.where(starts[:, None], 0, leaf) + 1  # (B, H)
 
     memory = jax.tree.map(advance, memory)  # leaves: (B, H)
-    return memory, jnp.zeros((observations.shape[0], 3)), jnp.full(observations.shape[0], 2.0)
+    return ppo.ActorCriticOutput(
+        memory, ppo.CategoricalPolicy(jnp.zeros((observations.shape[0], 3))), jnp.full(observations.shape[0], 2.0)
+    )
 
 
 @pytest.mark.parametrize("num_envs,num_steps", [(1, 1), (2, 3)], ids=["single-transition", "batched-sequence"])
@@ -45,9 +47,9 @@ def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs:
     observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(key, num_envs), env.params
     )  # (B,4,10,10); leaves: (B,...)
-    memory = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
-        num_envs
-    )  # leaves: (B,1)
+    memory = ppo.ActorCritic(
+        ppo.DiscreteSpace(3), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
+    ).initial_carry(num_envs)  # leaves: (B,1)
     runner = ppo.RolloutCarry(
         env_state,
         observations,
@@ -111,7 +113,7 @@ def test_train_step_matches_separate_rollout_and_updates_with_real_model() -> No
     observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(jax.random.key(0), 2), env.params
     )  # (B=2,4,10,10); leaves: (B,...)
-    model = ppo.ActorCritic(3, config.model)
+    model = ppo.ActorCritic(ppo.DiscreteSpace(3), config.model)
     carry = model.initial_carry(2)  # leaves: (B,4)
     starts = jnp.ones(2, bool)  # (B,)
     params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]
@@ -197,9 +199,9 @@ def test_train_step_stops_updates_and_rng_at_rejected_minibatch(reject_at: int) 
     observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(key, 2), env.params
     )  # (B=2,4,10,10); leaves: (B,...)
-    memory = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
-        2
-    )  # leaves: (B,1)
+    memory = ppo.ActorCritic(
+        ppo.DiscreteSpace(3), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
+    ).initial_carry(2)  # leaves: (B,1)
     runner = ppo.RolloutCarry(
         env_state, observations, memory, jnp.ones(2, bool), jnp.array([1.0, 2.0]), jnp.zeros(2, jnp.int32)
     )
@@ -309,9 +311,9 @@ def test_terminal_and_timeout_targets_use_final_observations() -> None:
         time=jnp.array([0, 1, 1, 0]),
     )
     observations = encode_observations(jax.vmap(env.env.get_obs)(env_state))  # (B,4,10,10)
-    memory = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
-        4
-    )  # leaves: (B,1)
+    memory = ppo.ActorCritic(
+        ppo.DiscreteSpace(3), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
+    ).initial_carry(4)  # leaves: (B,1)
 
     def position_policy(
         variables: dict[str, jax.Array],
@@ -320,10 +322,10 @@ def test_terminal_and_timeout_targets_use_final_observations() -> None:
         starts: jax.Array,  # (B,)
         *,
         method: str,
-    ) -> tuple[ppo.RecurrentCarry, jax.Array, jax.Array]:
+    ) -> ppo.ActorCriticOutput:
         memory, logits, _ = policy(variables, observations, memory, starts, method=method)
         positions = jnp.argmax(observations[:, 1].reshape((4, -1)), axis=-1).astype(jnp.float32)  # (B,)
-        return memory, logits, positions  # leaves: (B,1); (B,3); (B,)
+        return ppo.ActorCriticOutput(memory, logits, positions)  # leaves: (B,1); (B,3); (B,)
 
     state = TrainState.create(apply_fn=position_policy, params={}, tx=optax.sgd(0.1))
     runner = ppo.RolloutCarry(

@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 from gymnax.environments.minatar.breakout import EnvParams, EnvState
 
+from rl2.actions import DiscreteSpace
 from rl2.envs.base import BaseEnv, EnvStep
 
 
@@ -35,7 +36,7 @@ class GymnaxEnv(BaseEnv[EnvState, EnvParams]):
             if max_steps_in_episode <= 0:
                 raise ValueError("max_steps_in_episode must be positive")
             self.params = self.params.replace(max_steps_in_episode=max_steps_in_episode)
-        self.num_actions = self.env.num_actions
+        self.action_space = DiscreteSpace(self.env.num_actions)
 
     @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array, params: EnvParams) -> tuple[jax.Array, EnvState]:  # key: ()

@@ -16,7 +16,7 @@ from rl2.model.encoders.rgb import ConvStage
 
 def test_seeded_policy_and_update_are_reproducible() -> None:
     model = ppo.ActorCritic(
-        3,
+        ppo.DiscreteSpace(3),
         ppo.ModelConfig(
             encoder=ppo.RGBEncoderConfig(stages=(ConvStage(2, blocks=1),), embedding_size=4),
             recurrent=ppo.LSTMConfig(hidden_size=4),
@@ -43,13 +43,15 @@ def test_seeded_policy_and_update_are_reproducible() -> None:
     memory, step_logits, values = apply_step(
         {"params": first.params}, obs, carry, starts, method="step"
     )  # memory leaves: (B, H); step_logits: (B, A); values: (B,)
+    step_logits = step_logits.logits  # (..., A)
     chex.assert_trees_all_equal(
-        (memory, step_logits, values),
+        ppo.ActorCriticOutput(memory, ppo.CategoricalPolicy(step_logits), values),
         apply_step({"params": repeated.params}, obs, carry, starts, method="step"),
     )
     action = jax.random.categorical(key, step_logits)  # (B,)
-    log_prob = ppo.action_log_prob(step_logits, action)  # (B,)
+    log_prob = ppo.CategoricalPolicy(step_logits).log_prob(action)  # (B,)
     _, logits, _ = model.apply({"params": first.params}, obs[None], carry, starts[None])
+    logits = logits.logits  # (..., A)
     np.testing.assert_array_equal(action, jax.random.categorical(key, logits[0]))
     batch = ppo.PPOBatch(
         observations=obs[None],  # (*S, *O)

@@ -4990,6 +4990,7 @@ source = { editable = "." }
 dependencies = [
     { name = "ale-py" },
     { name = "chex" },
+    { name = "distrax" },
     { name = "flax" },
     { name = "gcsfs" },
     { name = "google-cloud-storage" },
@@ -5009,6 +5010,7 @@ dependencies = [
     { name = "ruff" },
     { name = "tensorboard" },
     { name = "tensorboardx" },
+    { name = "tfp-nightly" },
 ]
 
 [package.optional-dependencies]
@@ -5053,6 +5055,7 @@ requires-dist = [
     { name = "ale-py", specifier = ">=0.11,<0.12" },
     { name = "chex", specifier = ">=0.1.90,<0.2" },
     { name = "craftax", marker = "extra == 'craftax'", specifier = "==1.6.1" },
+    { name = "distrax", specifier = ">=0.1.9,<0.2" },
     { name = "flax", specifier = ">=0.12.10,<0.13" },
     { name = "gcsfs" },
     { name = "gemma", marker = "extra == 'gemma3'", specifier = "==4.0.1" },
@@ -5081,6 +5084,7 @@ requires-dist = [
     { name = "sentencepiece", marker = "extra == 'gdn2'", specifier = ">=0.2,<0.3" },
     { name = "tensorboard", specifier = ">=2.18,<3" },
     { name = "tensorboardx", specifier = ">=2.6.5,<3" },
+    { name = "tfp-nightly", specifier = ">=0.26.0.dev0,<0.27" },
     { name = "tokamax", marker = "sys_platform == 'linux' and extra == 'cuda12'", specifier = ">=0.0.15" },
     { name = "xminigrid", marker = "extra == 'xminigrid'", specifier = "==0.9.3" },
 ]

@@ -1,7 +1,7 @@
 from dataclasses import replace
 from operator import itemgetter
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import chex
 import jax
@@ -13,6 +13,7 @@ from flax import struct
 from flax.training.train_state import TrainState
 
 from rl2 import ppo
+from rl2.actions import ContinuousSpace, DiscreteSpace
 from rl2.envs.kinetix_env import KinetixConfig, KinetixEnv, encode_pixels
 from rl2.model.encoders.rgb import ConvStage
 
@@ -128,19 +129,19 @@ def test_real_kinetix_rollout_update_and_video() -> None:
         update_epochs=1,
         target_kl=None,
         bf16=False,
-        kinetix=KinetixConfig(levels=("s/h4_thrust_aim.json",), max_steps=2),
+        kinetix=KinetixConfig(action_type="continuous", levels=("s/h4_thrust_aim.json",), max_steps=2),
         model=ppo.ModelConfig(
             encoder=ppo.RGBEncoderConfig(stages=(ConvStage(2, blocks=0, resize_factor=0.0625),), embedding_size=2),
             recurrent=ppo.LSTMConfig(hidden_size=2),
         ),
     )
     env = ppo.make_env(config)
-    assert isinstance(env, KinetixEnv) and env.num_actions == 11
+    assert isinstance(env, KinetixEnv) and isinstance(env.action_space, ContinuousSpace)
     observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(jax.random.key(0), 1), env.params
     )  # (1,3,125,125); leaves: (1,...)
     assert observations.shape == (1, 3, 125, 125) and observations.dtype == jnp.uint8
-    model = ppo.ActorCritic(env.num_actions, config.model)
+    model = ppo.ActorCritic(env.action_space, config.model)
     carry = model.initial_carry(1)  # leaves: (1,2)
     starts = jnp.ones(1, bool)  # (1,)
     params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]  # parameter pytree
@@ -148,7 +149,11 @@ def test_real_kinetix_rollout_update_and_video() -> None:
     runner = ppo.RolloutCarry(env_state, observations, carry, starts, jnp.zeros(1), jnp.zeros(1, jnp.int32))
     advanced, rollout = ppo.collect_rollout(runner, state, env, config, jax.random.key(2))
     assert rollout.batch.observations.shape == (2, 1, 3, 125, 125)
-    chex.assert_shape((rollout.batch.actions, rollout.batch.returns), (2, 1))
+    assert rollout.batch.actions.shape == (2, 1, env.action_space.size)
+    assert rollout.batch.actions.dtype == jnp.float32
+    assert rollout.batch.returns.shape == (2, 1)
+    output = model.apply({"params": params}, rollout.batch.observations, carry, rollout.batch.episode_starts)
+    np.testing.assert_allclose(output.policy.log_prob(rollout.batch.actions), rollout.batch.old_log_probs, atol=1e-5)
     chex.assert_shape((rollout.episode_count, rollout.episode_return_sum, rollout.episode_length_sum), ())
     assert int(rollout.episode_count) == 1
     assert int(rollout.episode_length_sum) == 2
@@ -175,3 +180,16 @@ def test_procedural_reset_is_seeded_and_batched() -> None:
         (observations, state), jax.vmap(env.reset, in_axes=(0, None))(jax.random.split(key, 2), env.params)
     )
     assert not np.array_equal(observations[0], observations[1])
+
+
+@pytest.mark.parametrize("action_type", ["discrete", "continuous"])
+def test_kinetix_action_space(action_type: Literal["discrete", "continuous"]) -> None:
+    config = KinetixConfig(action_type=action_type, levels=("s/h4_thrust_aim.json",))
+    env = KinetixEnv(config)
+    if action_type == "discrete":
+        assert env.action_space == DiscreteSpace(11)
+    else:
+        assert isinstance(env.action_space, ContinuousSpace)
+        assert env.action_space.shape == (env.action_space.size,)
+        assert env.action_space.low == (-1.0,) * env.action_space.size
+        assert env.action_space.high == (1.0,) * env.action_space.size

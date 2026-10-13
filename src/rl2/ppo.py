@@ -116,6 +116,7 @@ from pydantic import ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
+from rl2.actions import ActionSpace, CategoricalPolicy, DiscreteSpace, Policy, TruncatedGaussianPolicy
 from rl2.configuration import load_settings
 from rl2.envs.base import BaseEnv
 from rl2.envs.craftax_env import CraftaxConfig, CraftaxEnv
@@ -139,32 +140,32 @@ class PPOBatch:
 
     Attributes:
         observations: (*S, *O) observations with observation dimensions O.
-        actions: (*S,) integer action IDs.
+        actions: (*S,) integer IDs or (*S, *action_shape) bounded continuous actions.
         old_log_probs: (*S,) rollout action log probabilities.
         values: (*S,) rollout-time value predictions for explained variance.
         advantages: (*S,) unnormalized advantage estimates.
         returns: (*S,) value targets.
-        model_carry: (B, D) initial LSTM memory leaves, where D is model.recurrent.hidden_size.
+        model_carry: (B, H) initial LSTM memory leaves, where H is model.recurrent.hidden_size.
         episode_starts: (*S,) boolean episode reset flags.
     """
 
     observations: jax.Array  # (*S, *O)
-    actions: jax.Array  # (*S,)
+    actions: jax.Array  # (*S,) integer IDs or (*S, *action_shape) bounded continuous actions
     old_log_probs: jax.Array  # (*S,)
     values: jax.Array  # (*S,)
     advantages: jax.Array  # (*S,)
     returns: jax.Array  # (*S,)
-    model_carry: RecurrentCarry  # leaves: (B, D), D is model.recurrent.hidden_size
+    model_carry: RecurrentCarry  # leaves: (B, H), H is model.recurrent.hidden_size
     episode_starts: jax.Array  # (*S,)
 
     def select_sequences(self, indices: jax.Array) -> Self:  # (M,) environment indices
-        """Return (T, M, ...) sequence fields and (M, D) initial memory leaves."""
+        """Return (T, M, ...) sequence fields and (M, H) initial memory leaves."""
         return self.replace(
             **jax.tree.map(
                 itemgetter((slice(None), indices)),
                 {field.name: getattr(self, field.name) for field in fields(self) if field.name != "model_carry"},
-            ),  # observations: (T, M, *O); other sequence fields: (T, M)
-            model_carry=jax.tree.map(itemgetter(indices), self.model_carry),  # leaves: (M, D)
+            ),  # observations: (T, M, *O); actions: (T, M, *action_shape); other sequence fields: (T, M)
+            model_carry=jax.tree.map(itemgetter(indices), self.model_carry),  # leaves: (M, H)
         )
 
 
@@ -492,8 +493,16 @@ def entropy_coef_schedule(config: Config) -> optax.Schedule:
     return optax.cosine_decay_schedule(config.entropy_coef, planned_rollout_count)
 
 
+class ActorCriticOutput(NamedTuple):
+    carry: RecurrentCarry  # leaves: (B, ...)
+    policy: Policy  # parameter leaves: (*S, A) discrete or (*S, D) continuous
+    values: jax.Array  # (*S,)
+
+
 class ActorCritic(nn.Module):
-    num_actions: int
+    """A is the discrete action count, D the continuous action size, and H the recurrent width."""
+
+    action_space: ActionSpace
     model: ModelConfig = ModelConfig()
     dtype: jax.typing.DTypeLike = jnp.float32
 
@@ -534,61 +543,69 @@ class ActorCritic(nn.Module):
         self.policy_norm = nn.LayerNorm(name="policy_norm", dtype=self.dtype)
         self.value_hidden = nn.Dense(512, kernel_init=init, name="value_hidden", dtype=self.dtype)
         self.value_norm = nn.LayerNorm(name="value_norm", dtype=self.dtype)
+        policy_size = self.action_space.n if isinstance(self.action_space, DiscreteSpace) else self.action_space.size
+        if not isinstance(self.action_space, DiscreteSpace):
+            self.policy_log_std = self.param("policy_log_std", nn.initializers.zeros, (policy_size,))  # (D,)
         self.policy_output = nn.Dense(
-            self.num_actions, kernel_init=nn.initializers.orthogonal(0.01), name="policy_output", dtype=self.dtype
+            policy_size, kernel_init=nn.initializers.orthogonal(0.01), name="policy_output", dtype=self.dtype
         )
         self.value_output = nn.Dense(
             1, kernel_init=nn.initializers.orthogonal(1.0), name="value_output", dtype=self.dtype
         )
 
-    def _encode(self, obs: jax.Array) -> jax.Array:  # (B, *O) -> (B, D)
+    def _encode(self, obs: jax.Array) -> jax.Array:  # (B, *O) -> (B, H)
         x = self.encoder(obs)  # (B, E), E is model.encoder.embedding_size
-        return self.recurrent_input(x).astype(self.dtype)  # (B, D), D is model.recurrent.hidden_size
+        return self.recurrent_input(x).astype(self.dtype)  # (B, H)
 
-    def _heads(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:  # (*S, D) -> (*S, A), (*S,)
-        x = x.astype(self.dtype)  # (*S, D), S is (B,) or (T, B)
+    def _heads(self, x: jax.Array) -> tuple[Policy, jax.Array]:  # (*S, H) -> policy leaves: (*S, A/D); (*S,)
+        x = x.astype(self.dtype)  # (*S, H), S is (B,) or (T, B)
         policy = nn.relu(self.policy_norm(self.policy_hidden(x)))  # (*S, 512)
         critic = nn.relu(self.value_norm(self.value_hidden(x)))  # (*S, 512)
         # Heads use the compute dtype; float32 outputs keep PPO loss arithmetic precise.
-        logits = self.policy_output(policy).astype(jnp.float32)  # (*S, A)
+        output = self.policy_output(policy).astype(jnp.float32)  # (*S, A/D)
+        distribution: Policy
+        if isinstance(self.action_space, DiscreteSpace):
+            distribution = CategoricalPolicy(output)
+        else:
+            low, high = jnp.asarray((self.action_space.low, self.action_space.high), jnp.float32)  # each (D,)
+            scale = high / 2 - low / 2  # (D,)
+            # Keep the Gaussian center inside the bounds to avoid tail-only truncation.
+            mean = (high / 2 + low / 2) + scale * jnp.tanh(output)  # (*S, D)
+            log_std = jnp.broadcast_to(
+                jnp.clip(self.policy_log_std, -20.0, 2.0) + jnp.log(scale), output.shape
+            )  # (*S, D)
+            distribution = TruncatedGaussianPolicy(mean, log_std, self.action_space)
         values = self.value_output(critic).squeeze(-1).astype(jnp.float32)  # (*S,)
-        return logits, values  # (*S, A), (*S,)
+        return distribution, values  # policy leaves: (*S, A/D); (*S,)
 
     def __call__(
         self,
         obs: jax.Array,  # (T, B, *O): RGB (F,H,W[,3]) or categorical (H,W,2)
         model_carry: RecurrentCarry,  # leaves: (B, ...)
         episode_starts: jax.Array,  # (T, B)
-    ) -> tuple[RecurrentCarry, jax.Array, jax.Array]:  # model_carry leaves: (B, ...); (T, B, A); (T, B)
+    ) -> ActorCriticOutput:  # carry leaves: (B, ...); policy leaves: (T, B, A/D); values: (T, B)
         """Process obs: (T, B, *O) observations and episode_starts: (T, B) reset masks."""
         chex.assert_rank(obs, {5, 6})
         step_count, env_count = obs.shape[:2]
-        x = self._encode(obs.reshape((-1, *obs.shape[2:])))  # (T * B, D)
-        x = x.reshape((step_count, env_count, -1))  # (T, B, D)
+        x = self._encode(obs.reshape((-1, *obs.shape[2:])))  # (T * B, H)
+        x = x.reshape((step_count, env_count, -1))  # (T, B, H)
         # Batch the CNN and heads across time; the LSTM handles its recurrence.
-        model_carry, x = self.recurrent(x, model_carry, episode_starts)  # model_carry leaves: (B, ...); x: (T, B, D)
-        logits, values = self._heads(x)  # (T, B, A), (T, B)
-        return model_carry, logits, values  # model_carry leaves: (B, ...); (T, B, A); (T, B)
+        model_carry, x = self.recurrent(x, model_carry, episode_starts)  # model_carry leaves: (B, ...); x: (T, B, H)
+        policy, values = self._heads(x)  # policy leaves: (T, B, A/D); (T, B)
+        return ActorCriticOutput(model_carry, policy, values)
 
     def step(
         self,
         obs: jax.Array,  # (B, *O): RGB (F,H,W[,3]) or categorical (H,W,2)
         model_carry: RecurrentCarry,  # leaves: (B, ...)
         episode_starts: jax.Array,  # (B,)
-    ) -> tuple[RecurrentCarry, jax.Array, jax.Array]:  # model_carry leaves: (B, ...); (B, A); (B,)
+    ) -> ActorCriticOutput:  # carry leaves: (B, ...); policy leaves: (B, A/D); values: (B,)
         """Process obs: (B, *O) observations and episode_starts: (B,) reset masks."""
         chex.assert_rank(obs, {4, 5})
-        x = self._encode(obs)  # (B, D)
-        model_carry, x = self.recurrent.step(x, model_carry, episode_starts)  # model_carry leaves: (B, ...); x: (B, D)
-        logits, values = self._heads(x)  # (B, A), (B,)
-        return model_carry, logits, values  # model_carry leaves: (B, ...); (B, A); (B,)
-
-
-def action_log_prob(
-    logits: jax.Array,  # (*S, A), S is (B,) or (T, B)
-    actions: jax.Array,  # (*S,)
-) -> jax.Array:  # (*S,)
-    return jnp.take_along_axis(jax.nn.log_softmax(logits), actions[..., None], axis=-1)[..., 0]  # (*S,)
+        x = self._encode(obs)  # (B, H)
+        model_carry, x = self.recurrent.step(x, model_carry, episode_starts)  # model_carry leaves: (B, ...); x: (B, H)
+        policy, values = self._heads(x)  # policy leaves: (B, A/D); (B,)
+        return ActorCriticOutput(model_carry, policy, values)
 
 
 def play_episode(
@@ -613,14 +630,14 @@ def play_episode(
     apply_step = jax.jit(train_state.apply_fn, static_argnames=("method",))
     while not (stop_at_frame_limit and config.video_max_frames is not None and len(frames) >= config.video_max_frames):
         key, action_key, env_key = jax.random.split(key, 3)  # each () typed PRNG key
-        memory, logits, _ = apply_step(
+        memory, policy, _ = apply_step(
             {"params": train_state.params},
             observation[None],
             memory,
             jnp.full(1, episode_step_count == 0, dtype=bool),
             method="step",
-        )  # memory leaves: (1, ...); logits: (1, A); values: (1,)
-        actions = jax.random.categorical(action_key, logits)  # (1,)
+        )  # memory leaves: (1, ...); policy leaves: (1, A/D); values: (1,)
+        actions = policy.sample(seed=action_key)  # (1, *action_shape)
         observation, env_state, reward, episode_end, info = env.step(env_key, env_state, actions[0], env.params)
         # observation: (*O,); state leaves: (...); reward/episode_end: (); final_observation: (*O,)
         episode_return += float(reward)
@@ -714,23 +731,22 @@ def update(
     chex.assert_type(rollout_index, int)
     entropy_coef = jnp.asarray(entropy_coef_schedule(config)(rollout_index), dtype=jnp.float32)  # ()
     advantages = batch.advantages  # (*S,)
-    chex.assert_type(batch.actions, int)
     chex.assert_scalar_positive(advantages.size)
     # Centering a single sample always gives zero and erases its policy gradient.
     if advantages.size > 1:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # (*S,)
 
     def loss_fn(params: optax.Params) -> tuple[jax.Array, MinibatchMetrics]:  # (); scalar metric leaves
-        _, logits, values = train_state.apply_fn(
+        _, policy, values = train_state.apply_fn(
             {"params": params}, batch.observations, batch.model_carry, batch.episode_starts
-        )  # model_carry leaves: (B, ...); logits: (*S, A); values: (*S,)
-        log_probs = action_log_prob(logits, batch.actions)  # (*S,)
+        )  # model_carry leaves: (B, ...); policy leaves: (*S, A/D); values: (*S,)
+        log_probs = policy.log_prob(batch.actions)  # (*S,)
         log_ratio = log_probs - batch.old_log_probs  # (*S,)
         ratio = jnp.exp(log_ratio)  # (*S,)
         flat_ratio, flat_advantages = jax.tree.map(jnp.ravel, (ratio, advantages))  # (N,), N = prod(S)
         policy_loss = rlax.clipped_surrogate_pg_loss(flat_ratio, flat_advantages, config.clip_coef)  # ()
         value_loss = rlax.l2_loss(values, batch.returns).mean()  # ()
-        entropy = -rlax.entropy_loss(logits.reshape((-1, logits.shape[-1])), jnp.ones_like(flat_ratio))  # ()
+        entropy = policy.entropy().mean()  # ()
         entropy_loss = -entropy_coef * entropy  # ()
         loss = policy_loss + config.value_coef * value_loss + entropy_loss  # ()
         approx_kl = (jnp.expm1(log_ratio) - log_ratio).mean()  # ()
@@ -778,7 +794,7 @@ def collect_rollout(
         """S is (B,) per step or (T, B) after scanning."""
 
         observations: jax.Array  # (*S, *O)
-        actions: jax.Array  # (*S,)
+        actions: jax.Array  # (*S,) integer IDs or (*S, *action_shape) bounded continuous actions
         log_probs: jax.Array  # (*S,)
         values: jax.Array  # (*S,)
         rewards: jax.Array  # (*S,)
@@ -791,15 +807,14 @@ def collect_rollout(
     ) -> tuple[Runner, Transition]:
         current, key, episode_metrics = runner  # state leaves: (B, ...); key/completed totals: ()
         key, action_key, env_key = jax.random.split(key, 3)  # each () typed PRNG key
-        memory, logits, predictions = train_state.apply_fn(
+        memory, policy, predictions = train_state.apply_fn(
             {"params": train_state.params},
             current.observations,
             current.model_carry,
             current.episode_starts,
             method="step",
-        )  # memory leaves: (B, ...); logits: (B, A); predictions: (B,)
-        actions = jax.random.categorical(action_key, logits)  # (B,)
-        log_probs = action_log_prob(logits, actions)  # (B,)
+        )  # memory leaves: (B, ...); policy leaves: (B, A/D); predictions: (B,)
+        actions, log_probs = policy.sample_and_log_prob(seed=action_key)  # (B, *action_shape); (B,)
         env_keys = jax.random.split(env_key, config.num_envs)  # (B,) typed PRNG keys
         observations, env_state, raw_rewards, episode_ends, info = envs.step_batch(
             env_keys, current.env_state, actions, envs.params
@@ -843,7 +858,7 @@ def collect_rollout(
         )
         return Runner(advanced, key, episode_metrics), Transition(
             observations=current.observations,  # (B, *O)
-            actions=actions,  # (B,)
+            actions=actions,  # (B, *action_shape)
             log_probs=log_probs,  # (B,)
             values=predictions,  # (B,)
             rewards=rewards,  # (B,)
@@ -859,7 +874,7 @@ def collect_rollout(
     (advanced, key, episode_metrics), trajectory = jax.lax.scan(
         step, Runner(rollout_carry, key, episode_metrics), None, length=config.num_steps
     )
-    # observations: (T, B, *O); other trajectory arrays: (T, B)
+    # observations: (T, B, *O); actions: (T, B, *action_shape); other trajectory arrays: (T, B)
     # Peek at the next value without advancing the rollout's recurrent state.
     next_value = train_state.apply_fn(
         {"params": train_state.params},
@@ -873,7 +888,7 @@ def collect_rollout(
     )  # each (T, B)
     batch = PPOBatch(
         observations=trajectory.observations,  # (T, B, *O)
-        actions=trajectory.actions,  # (T, B)
+        actions=trajectory.actions,  # (T, B, *action_shape)
         old_log_probs=trajectory.log_probs,  # (T, B)
         values=trajectory.values,  # (T, B)
         advantages=advantages,  # (T, B)
@@ -999,7 +1014,7 @@ def train(config: Config) -> TrainState:
         reset_keys = jax.random.split(reset_key, config.num_envs)  # (B,) typed PRNG keys
         obs, env_state = jax.vmap(envs.reset, in_axes=(0, None))(reset_keys, envs.params)  # (B,*O); leaves: (B,...)
         model = ActorCritic(
-            envs.num_actions,
+            envs.action_space,
             config.model,
             dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
         )

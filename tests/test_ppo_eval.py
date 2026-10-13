@@ -21,8 +21,10 @@ def policy(
     starts: jax.Array,  # (B,)
     *,
     method: str,
-) -> tuple[ppo.RecurrentCarry, jax.Array, jax.Array]:
-    return carry, jnp.zeros((observations.shape[0], 3)), jnp.zeros(observations.shape[0])
+) -> ppo.ActorCriticOutput:
+    return ppo.ActorCriticOutput(
+        carry, ppo.CategoricalPolicy(jnp.zeros((observations.shape[0], 3))), jnp.zeros(observations.shape[0])
+    )
 
 
 @pytest.mark.parametrize(
@@ -41,9 +43,9 @@ def test_episode_frame_limits(frame_limit: int | None, stop: bool, expected_leng
     )
     env = GymnaxEnv(config.env_id, max_steps_in_episode=2)
     state = TrainState.create(apply_fn=policy, params={}, tx=optax.sgd(0.1))
-    carry = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
-        1
-    )  # leaves: (1,1)
+    carry = ppo.ActorCritic(
+        ppo.DiscreteSpace(3), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
+    ).initial_carry(1)  # leaves: (1,1)
     with patch.object(ppo, "GymnaxEnv", return_value=env):
         score, length, frames = ppo.play_episode(
             state, config, jax.random.key(0), carry, record=True, stop_at_frame_limit=stop, env=env
@@ -62,9 +64,9 @@ def test_episode_renders_state_before_autoreset(record: bool) -> None:
     env.step.return_value = observation, reset, jnp.asarray(1.0), jnp.asarray(True), {"final_state": final}
     env.render.side_effect = [np.full((3, 5, 3), pixel, np.uint8) for pixel in (10, 20)]  # each (P, Q, 3)
     state = TrainState.create(apply_fn=policy, params={}, tx=optax.sgd(0.1))
-    carry = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
-        1
-    )  # leaves: (1,1)
+    carry = ppo.ActorCritic(
+        ppo.DiscreteSpace(3), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
+    ).initial_carry(1)  # leaves: (1,1)
     score, length, frames = ppo.play_episode(state, config, jax.random.key(0), carry, record=record, env=env)
     assert (score, length) == (1.0, 1)
     if record:
@@ -82,9 +84,9 @@ def test_evaluation_logs_raw_scores_and_independent_seeds() -> None:
     )
     writer = Mock()
     state = Mock(spec=TrainState)
-    carry = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
-        1
-    )  # leaves: (1,1)
+    carry = ppo.ActorCritic(
+        ppo.DiscreteSpace(3), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
+    ).initial_carry(1)  # leaves: (1,1)
     frame = np.zeros((2, 2, 3), np.uint8)  # (H,W,3)
     with patch.object(ppo, "play_episode", side_effect=[(2.0, 3, []), (4.0, 5, [frame])]) as play:
         ppo.log_evaluation(state, config, writer, 1, 128, initial_carry=carry)
@@ -114,9 +116,9 @@ def test_evaluation_logs_raw_scores_and_independent_seeds() -> None:
 def test_log_video_wiring() -> None:
     config = ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/xminigrid.yaml")
     writer = Mock()
-    carry = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
-        1
-    )  # leaves: (1,1)
+    carry = ppo.ActorCritic(
+        ppo.DiscreteSpace(3), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
+    ).initial_carry(1)  # leaves: (1,1)
     with (
         patch.object(ppo, "make_env"),
         patch.object(ppo, "play_episode", return_value=(0.0, 1, [np.zeros((2, 2, 3), np.uint8)])) as play,
@@ -131,9 +133,9 @@ def test_log_video_wiring() -> None:
 def test_single_evaluation_omits_unavailable_uncertainty() -> None:
     config = replace(ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), eval_episodes=1)
     writer = Mock()
-    carry = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
-        1
-    )  # leaves: (1,1)
+    carry = ppo.ActorCritic(
+        ppo.DiscreteSpace(3), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
+    ).initial_carry(1)  # leaves: (1,1)
     with patch.object(ppo, "play_episode", return_value=(2.0, 3, [])):
         ppo.log_evaluation(Mock(), config, writer, 0, 0, initial_carry=carry)
     tags = {call.args[0] for call in writer.add_scalar.call_args_list}
@@ -145,9 +147,9 @@ def test_single_evaluation_omits_unavailable_uncertainty() -> None:
 
 def test_kinetix_video_and_evaluation_use_configured_environment() -> None:
     config = replace(ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml"), eval_episodes=1)
-    carry = ppo.ActorCritic(11, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
-        1
-    )  # leaves: (1,1)
+    carry = ppo.ActorCritic(
+        ppo.DiscreteSpace(11), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
+    ).initial_carry(1)  # leaves: (1,1)
     writer = Mock()
     frame = np.zeros((2, 2, 3), np.uint8)  # (H,W,3)
     with (

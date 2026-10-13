@@ -107,7 +107,7 @@ def test_real_craftax_reset_step_and_video(env_id: str, shape: tuple[int, ...], 
     key = jax.random.key(0)  # ()
     observations, state = env.reset(key, env.params)  # (3,H,W); leaves: (...)
     assert observations.shape == shape and observations.dtype == jnp.uint8
-    assert env.num_actions == num_actions
+    assert env.action_space.n == num_actions
     chex.assert_trees_all_equal((observations, state), env.reset(key, env.params))
     next_observations, next_state, rewards, done, info = env.step(
         jax.random.key(1), state, jnp.array(0), env.params

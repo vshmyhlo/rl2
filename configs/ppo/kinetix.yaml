@@ -1,0 +1,50 @@
+# Pixel observations and continuous control of Kinetix's easy bipedal walker.
+env_id: Kinetix
+kinetix:
+  action_type: continuous
+  size: l # s, m, or l; must accommodate every selected level
+  levels: [l/mjc_walker_easy.json] # null samples a new procedural level at each reset
+  max_steps: 256 # Agent steps, each advancing frame_skip physics steps
+  frame_skip: 2
+  downscale: 4 # 500 / 4 = 125 pixels per side
+  dense_reward_scale: 0.1 # 0 disables distance-based reward shaping
+seed: 1
+total_steps: 10_000_000
+num_envs: 32
+num_steps: 128
+num_minibatches: 4
+update_epochs: 4
+model:
+  encoder:
+    type: rgb
+    stages:
+      - { channels: 32, blocks: 1, resize_factor: 0.5 }
+      - { channels: 64, blocks: 1, resize_factor: 0.5 }
+      - { channels: 128, blocks: 1, resize_factor: 0.5 }
+      - { channels: 128, blocks: 1, resize_factor: 0.5 }
+  recurrent:
+    type: lstm
+    hidden_size: 256
+bf16: true
+learning_rate: 0.00025
+anneal_lr: true
+lr_decay: linear
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: 0.01
+entropy_coef: 0.01
+entropy_decay: constant
+value_coef: 0.5
+max_grad_norm: 0.5
+log_dir: gs://cohere-dev/vlad/rl2/ppo/${run_id}
+run_id: ppo_${path_name:${env_id}}_${path_name:${kinetix.levels.0}}
+# All intervals count completed PPO iterations (one rollout and its updates).
+checkpoint_interval: 600
+log_interval: 60
+video_interval: 600
+video_max_frames: 900
+video_fps: 40.0
+eval_interval: 1800
+eval_episodes: 20
+eval_seed: 10000

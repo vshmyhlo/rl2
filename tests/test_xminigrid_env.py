@@ -48,7 +48,7 @@ def test_terminal_timeout_both_and_partial_autoreset() -> None:
         (observations, initial), jax.vmap(env.reset, in_axes=(0, None))(jax.random.split(key, 4), env.params)
     )
     assert observations.shape == (4, 7, 7, 2) and observations.dtype == jnp.uint8
-    assert env.num_actions == 6
+    assert env.action_space.n == 6
     # Move right into the goal, timeout, both, and continuing, respectively.
     agent = initial.state.agent.replace(position=jnp.array([[3, 2], [1, 1], [3, 2], [1, 1]]))  # leaves: (B,...)
     state = initial.replace(state=initial.state.replace(agent=agent, step_num=jnp.array([0, 1, 1, 0])))
@@ -191,7 +191,7 @@ def test_real_rollout_update_and_video() -> None:
     observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(jax.random.key(0), 1), env.params
     )  # (1,7,7,2); leaves: (1,...)
-    model = ppo.ActorCritic(env.num_actions, config.model)
+    model = ppo.ActorCritic(env.action_space, config.model)
     carry = model.initial_carry(1)  # leaves: (1,2)
     starts = jnp.ones(1, bool)  # (1,)
     params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]  # parameter pytree
@@ -207,7 +207,8 @@ def test_real_rollout_update_and_video() -> None:
     _, logits, values = model.apply(
         {"params": params}, rollout.batch.observations, rollout.batch.model_carry, rollout.batch.episode_starts
     )  # carry leaves: (1,2); (T=2,B=1,A); (T=2,B=1)
-    assert logits.shape == (2, 1, env.num_actions)
+    logits = logits.logits  # (..., A)
+    assert logits.shape == (2, 1, env.action_space.n)
     np.testing.assert_allclose(values, rollout.batch.values, atol=1e-5)
     updated, metrics = ppo.update(state, rollout.batch, config)
     assert int(updated.step) == 1

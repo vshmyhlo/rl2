@@ -256,7 +256,7 @@ def test_checkpoint_paths_preserve_gcs_and_resolve_local(tmp_path: Path, monkeyp
 
 @pytest.mark.parametrize("failure", ["manager", "reset", "writer", "logging", "writer_close"])
 def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> None:
-    envs = Mock(num_actions=2, params={})
+    envs = Mock(action_space=ppo.DiscreteSpace(2), params={})
     envs.step_batch = partial(BaseEnv.step_batch, envs)
     envs.reset.return_value = (np.zeros(1, dtype=np.uint8), {})  # observation: (O=1,)
     manager = Mock()
@@ -309,7 +309,7 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
     zeros = np.zeros(1, dtype=np.float32)
     dones = np.ones(1, dtype=bool)
     carry = initial_carry(1, 1)
-    envs = Mock(num_actions=2, params={})
+    envs = Mock(action_space=ppo.DiscreteSpace(2), params={})
     envs.step_batch = partial(BaseEnv.step_batch, envs)
     envs.reset.return_value = (obs[0], {})
     envs.step.return_value = env_step(obs[0], np.array(1.0), dones[0], ~dones[0], {})
@@ -325,7 +325,10 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
     saved_length_sums: list[int] = []
 
     def update(
-        state: TrainState, batch: ppo.PPOBatch, config: ppo.Config, iteration: int
+        state: TrainState,
+        batch: ppo.PPOBatch,
+        config: ppo.Config,
+        iteration: int,
     ) -> tuple[TrainState, ppo.MinibatchMetrics]:
         nonlocal clock, interrupted
         if iteration == 2 and not interrupted:
@@ -367,7 +370,9 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo, "SummaryWriter") as writer,
         patch.object(
-            model, "apply", return_value=(carry, jnp.array([[0.0, -jnp.inf]]), zeros)
+            model,
+            "apply",
+            return_value=ppo.ActorCriticOutput(carry, ppo.CategoricalPolicy(jnp.array([[0.0, -jnp.inf]])), zeros),
         ),  # carry leaves: (B,H); (B,A); (B,)
         patch.object(ppo, "update", side_effect=update),
         patch.object(ppo, "monotonic", side_effect=lambda: clock + 0.01),
@@ -466,14 +471,17 @@ def test_checkpoint_validates_kinetix_settings(config: ppo.Config, state: TrainS
     saved = manager.save.call_args.kwargs["args"]
     # JSON serializes tuples as lists; they must compare equal on restore.
     metadata = json.loads(json.dumps(saved.metadata.item))
+    # Older discrete checkpoints predate the explicit action mode.
+    del metadata["config"]["kinetix"]["action_type"]
     manager.latest_step.return_value = 2
     manager.restore.side_effect = [SimpleNamespace(metadata=metadata), SimpleNamespace(state=saved.state.item)]
     chex.assert_trees_all_equal(ppo.restore_checkpoint(manager, state, config), progress)
-    manager.restore.reset_mock(side_effect=True)
-    manager.restore.return_value = SimpleNamespace(metadata=metadata)
-    with pytest.raises(ValueError, match="different kinetix settings"):
-        ppo.restore_checkpoint(manager, state, replace(config, kinetix=replace(config.kinetix, levels=None)))
-    manager.restore.assert_called_once()
+    for changed in (replace(config.kinetix, levels=None), replace(config.kinetix, action_type="continuous")):
+        manager.restore.reset_mock(side_effect=True)
+        manager.restore.return_value = SimpleNamespace(metadata=metadata)
+        with pytest.raises(ValueError, match="different kinetix settings"):
+            ppo.restore_checkpoint(manager, state, replace(config, kinetix=changed))
+        manager.restore.assert_called_once()
 
 
 @pytest.mark.parametrize("name,env_id", [("xminigrid", "XLand-MiniGrid"), ("craftax", "Craftax")])

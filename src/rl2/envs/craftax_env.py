@@ -11,6 +11,7 @@ import jax.numpy as jnp
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
+from rl2.actions import DiscreteSpace
 from rl2.envs.base import BaseEnv, EnvStep
 
 if TYPE_CHECKING:
@@ -44,7 +45,7 @@ class CraftaxEnv(BaseEnv[chex.ArrayTree, "CraftaxParams"]):
         self.params = self.env.default_params
         if config.max_steps is not None:
             self.params = self.params.replace(max_timesteps=config.max_steps)
-        self.num_actions = self.env.num_actions
+        self.action_space = DiscreteSpace(self.env.num_actions)
 
     @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array, params: CraftaxParams) -> tuple[jax.Array, chex.ArrayTree]:  # key: ()

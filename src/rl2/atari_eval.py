@@ -221,9 +221,10 @@ def _action[Carry](
         )  # carry leaves: (1, ...); logits: (1, 1, A); values: (1, 1, 2)
         logits = logits[0]  # (1, A)
     else:
-        carry, logits, _ = state.apply_fn(
+        carry, policy, _ = state.apply_fn(
             {"params": state.params}, obs[None], carry, starts, method="step"
-        )  # carry leaves: (1, ...); logits: (1, A); values: (1,)
+        )  # carry leaves: (1, ...); policy.logits: (1, A); values: (1,)
+        logits = policy.logits  # (1, A), Atari uses a categorical policy
     logits = logits[0]  # (A,)
     action = jnp.argmax(logits) if greedy else jax.random.categorical(key, logits)  # ()
     return action, carry  # () action; carry leaves: (1, ...)

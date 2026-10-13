@@ -7,6 +7,8 @@ import jax
 import numpy as np
 from numpy.typing import NDArray
 
+from rl2.actions import ActionSpace
+
 
 class StepInfo[State](TypedDict):
     """Termination flags and final observation/state before autoreset."""
@@ -28,14 +30,14 @@ class EnvStep[State](NamedTuple):
 
 
 class BaseEnv[State, Params](ABC):
-    """Explicit state and RNGs, discrete actions, and same-step autoreset.
+    """Explicit state and RNGs, discrete or continuous actions, and same-step autoreset.
 
     O denotes adapter-specific observation dimensions. Reset and step support
     jax.jit and jax.vmap; rendering may run on the host.
     """
 
     params: Params
-    num_actions: int
+    action_space: ActionSpace
 
     @abstractmethod
     def reset(
@@ -50,7 +52,7 @@ class BaseEnv[State, Params](ABC):
         self,
         key: jax.Array,  # () typed PRNG key
         state: State,  # leaves: (...)
-        action: jax.Array,  # () integer action ID
+        action: jax.Array,  # () integer ID or (*action_shape,) continuous action
         params: Params,
     ) -> EnvStep[State]:
         """Advance and autoreset when terminated or truncated."""
@@ -59,7 +61,7 @@ class BaseEnv[State, Params](ABC):
         self,
         keys: jax.Array,  # (B,) typed PRNG keys
         state: State,  # leaves: (B, ...)
-        actions: jax.Array,  # (B,) integer action IDs
+        actions: jax.Array,  # (B,) integer IDs or (B, *action_shape) continuous actions
         params: Params,
     ) -> EnvStep[State]:
         """Return (B, *O) observations, (B,) scalars and (B, ...) state/info leaves."""

@@ -40,7 +40,7 @@ def training_config() -> AtariConfig:
 
 def policy(
     variables: dict[str, Any], obs: jax.Array, carry: LSTMStackCarry, starts: jax.Array, *, method: str
-) -> tuple[LSTMStackCarry, jax.Array, jax.Array]:
+) -> ppo.ActorCriticOutput:
     assert method == "step"
     chex.assert_shape(obs, (None, None, None, None))
     chex.assert_type(obs, jnp.uint8)
@@ -50,7 +50,7 @@ def policy(
         chex.assert_shape(layer, (obs.shape[0], None))
         chex.assert_type(layer, jnp.float32)
     carry = tuple(tuple(jnp.where(starts[:, None], 0, c) + 1 for c in layer) for layer in carry)
-    return carry, variables["params"]["logits"][None], jnp.zeros(1)
+    return ppo.ActorCriticOutput(carry, ppo.CategoricalPolicy(variables["params"]["logits"][None]), jnp.zeros(1))
 
 
 def policy_state() -> TrainState:
@@ -260,7 +260,9 @@ def test_evaluation_accepts_custom_recurrent_agent() -> None:
 
 def test_full_games_raw_returns_memory_and_json(tmp_path: Path) -> None:
     config = training_config()
-    initial = jax.tree.map(lambda leaf: leaf + 3, ppo.ActorCritic(1, config.model).initial_carry(1))  # leaves: (1, ...)
+    initial = jax.tree.map(
+        lambda leaf: leaf + 3, ppo.ActorCritic(ppo.DiscreteSpace(1), config.model).initial_carry(1)
+    )  # leaves: (1, ...)
     env = ScoringEnv()
     starts: list[bool] = []
     memories: list[float] = []
@@ -398,13 +400,13 @@ def test_real_evaluation_reproducible_and_state_unchanged() -> None:
     before = [np.asarray(leaf).copy() for leaf in jax.tree.leaves(state)]
     options = EvaluationConfig(episodes=2, max_episode_frames=104)
     first = evaluate(
-        TrainStateAgent(state, ppo.ActorCritic(1, training_config().model).initial_carry(1)),
+        TrainStateAgent(state, ppo.ActorCritic(ppo.DiscreteSpace(1), training_config().model).initial_carry(1)),
         training_config(),
         options,
     )
     on_video = Mock()
     second = evaluate(
-        TrainStateAgent(state, ppo.ActorCritic(1, training_config().model).initial_carry(1)),
+        TrainStateAgent(state, ppo.ActorCritic(ppo.DiscreteSpace(1), training_config().model).initial_carry(1)),
         training_config(),
         options,
         on_video=on_video,
@@ -424,7 +426,7 @@ def test_real_evaluation_reproducible_and_state_unchanged() -> None:
 def test_action_selection_and_recurrent_reset(greedy: bool) -> None:
     state = policy_state()
     carry = jax.tree.map(
-        lambda leaf: leaf + 5, ppo.ActorCritic(1, training_config().model).initial_carry(1)
+        lambda leaf: leaf + 5, ppo.ActorCritic(ppo.DiscreteSpace(1), training_config().model).initial_carry(1)
     )  # leaves: (1, 2)
     obs = np.zeros((1, 84, 84), dtype=np.uint8)  # (1, 84, 84)
     key = jax.random.key(1)  # () typed PRNG key
@@ -446,7 +448,9 @@ def test_cleanup_on_policy_failure() -> None:
         pytest.raises(RuntimeError, match="policy failure"),
     ):
         evaluate(
-            TrainStateAgent(policy_state(), ppo.ActorCritic(1, training_config().model).initial_carry(1)),
+            TrainStateAgent(
+                policy_state(), ppo.ActorCritic(ppo.DiscreteSpace(1), training_config().model).initial_carry(1)
+            ),
             training_config(),
             EvaluationConfig(episodes=1),
         )
@@ -470,7 +474,9 @@ def test_evaluation_rejects_policy_input_mismatch(overrides: dict[str, Any]) -> 
 def test_evaluation_rejects_baseline_env_mismatch() -> None:
     with pytest.raises(ValueError, match="env_id"):
         evaluate(
-            TrainStateAgent(policy_state(), ppo.ActorCritic(1, training_config().model).initial_carry(1)),
+            TrainStateAgent(
+                policy_state(), ppo.ActorCritic(ppo.DiscreteSpace(1), training_config().model).initial_carry(1)
+            ),
             training_config(),
             baselines=ScoreBaselines("ALE/Breakout-v5", 0, 1, "test"),
         )
@@ -524,7 +530,9 @@ def test_evaluation_automatically_normalizes_from_published_scores(
         patch.object(env, "step", return_value=transition),
     ):
         result = evaluate(
-            TrainStateAgent(policy_state(), ppo.ActorCritic(1, training_config().model).initial_carry(1)),
+            TrainStateAgent(
+                policy_state(), ppo.ActorCritic(ppo.DiscreteSpace(1), training_config().model).initial_carry(1)
+            ),
             replace(training_config(), env_id=env_id),
             EvaluationConfig(episodes=1),
             output_path=output,
@@ -539,7 +547,9 @@ def test_evaluation_automatically_normalizes_from_published_scores(
 def test_evaluation_without_reference_scores_keeps_raw_returns() -> None:
     with patch("rl2.atari_eval.make_evaluation_env", return_value=ScoringEnv()):
         result = evaluate(
-            TrainStateAgent(policy_state(), ppo.ActorCritic(1, training_config().model).initial_carry(1)),
+            TrainStateAgent(
+                policy_state(), ppo.ActorCritic(ppo.DiscreteSpace(1), training_config().model).initial_carry(1)
+            ),
             replace(training_config(), env_id="ALE/Adventure-v5"),
             EvaluationConfig(episodes=2),
         )
@@ -557,7 +567,7 @@ def test_progress_tracks_completed_games_and_long_running_games(capsys: pytest.C
         patch("rl2.atari_eval.monotonic", side_effect=[100.0, 101.0, 104.0, 115.0, 120.0]),
     ):
         result = evaluate(
-            TrainStateAgent(state, ppo.ActorCritic(1, training_config().model).initial_carry(1)),
+            TrainStateAgent(state, ppo.ActorCritic(ppo.DiscreteSpace(1), training_config().model).initial_carry(1)),
             training_config(),
             options,
         )
@@ -577,7 +587,7 @@ def test_progress_tracks_completed_games_and_long_running_games(capsys: pytest.C
         patch("rl2.atari_eval.monotonic", side_effect=AssertionError("quiet evaluation should not track time")),
     ):
         quiet_result = evaluate(
-            TrainStateAgent(state, ppo.ActorCritic(1, training_config().model).initial_carry(1)),
+            TrainStateAgent(state, ppo.ActorCritic(ppo.DiscreteSpace(1), training_config().model).initial_carry(1)),
             training_config(),
             options,
             show_progress=False,
@@ -594,7 +604,9 @@ def test_failed_evaluation_does_not_report_completion(capsys: pytest.CaptureFixt
         pytest.raises(RuntimeError, match="policy failure"),
     ):
         evaluate(
-            TrainStateAgent(policy_state(), ppo.ActorCritic(1, training_config().model).initial_carry(1)),
+            TrainStateAgent(
+                policy_state(), ppo.ActorCritic(ppo.DiscreteSpace(1), training_config().model).initial_carry(1)
+            ),
             training_config(),
             EvaluationConfig(episodes=1),
         )
@@ -619,7 +631,7 @@ def test_evaluation_logging_records_scores_and_report_without_mutating_state(tra
     state = policy_state()
     before = jax.tree.map(np.array, state)
     initial = (  # leaves: (1, ...), backend-specific memory dimensions
-        ppo.ActorCritic(1, config.model).initial_carry(1)
+        ppo.ActorCritic(ppo.DiscreteSpace(1), config.model).initial_carry(1)
         if trainer == "ppo"
         else ppo_rnd.initial_carry(1, config.lstm_hidden_size)
     )

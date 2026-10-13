@@ -1,23 +1,24 @@
-"""Single-environment Kinetix pixel observations and discrete actions for PPO."""
-
-from __future__ import annotations
+"""Single-environment Kinetix pixel observations and discrete or continuous actions for PPO."""
 
 from functools import partial
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import Annotated, Literal
 
 import jax
 import jax.numpy as jnp
+from kinetix.environment import ActionType, ObservationType, make_kinetix_env
+from kinetix.environment.env_state import EnvParams, EnvState
+from kinetix.environment.ued.ued import make_reset_fn_list_of_levels, make_reset_fn_sample_kinetix_level
+from kinetix.environment.utils import static_env_params_from_size
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
+from rl2.actions import ContinuousSpace, DiscreteSpace
 from rl2.envs.base import BaseEnv, EnvStep
-
-if TYPE_CHECKING:
-    from kinetix.environment.env_state import EnvParams, EnvState
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class KinetixConfig:
+    action_type: Literal["discrete", "continuous"] = "discrete"
     size: Literal["s", "m", "l"] = "s"
     # None samples procedural levels; otherwise sample uniformly from this list.
     levels: Annotated[tuple[Annotated[str, Field(min_length=1)], ...], Field(min_length=1, strict=False)] | None = None
@@ -30,25 +31,13 @@ class KinetixConfig:
 def encode_pixels(images: jax.Array) -> jax.Array:  # (..., W, H, 3) -> (..., 3, H, W)
     """Convert normalized, y-up Kinetix pixels to channel-first uint8 images."""
     pixels = jnp.rint(jnp.clip(images, 0, 1) * 255).astype(jnp.uint8)  # (..., W, H, 3)
-    return jnp.moveaxis(pixels, (-1, -2, -3), (-3, -2, -1))[..., ::-1, :]  # (..., 3, H, W)
+    return jnp.swapaxes(pixels, -1, -3)[..., ::-1, :]  # (..., 3, H, W)
 
 
-class KinetixEnv(BaseEnv["EnvState", "EnvParams"]):
+class KinetixEnv(BaseEnv[EnvState, EnvParams]):
     """Explicit transitions preserve final observations for timeout bootstrapping."""
 
     def __init__(self, config: KinetixConfig) -> None:
-        try:
-            from kinetix.environment import ActionType, EnvParams, ObservationType, make_kinetix_env
-            from kinetix.environment.ued.ued import (
-                make_reset_fn_list_of_levels,
-                make_reset_fn_sample_kinetix_level,
-            )
-            from kinetix.environment.utils import static_env_params_from_size
-        except ModuleNotFoundError as error:
-            if error.name == "kinetix":
-                raise ImportError("Kinetix requires the optional dependency: uv sync --extra kinetix") from error
-            raise
-
         self.params = EnvParams(max_timesteps=config.max_steps, dense_reward_scale=config.dense_reward_scale)
         static_params = static_env_params_from_size(config.size).replace(
             frame_skip=config.frame_skip, downscale=config.downscale
@@ -58,14 +47,20 @@ class KinetixEnv(BaseEnv["EnvState", "EnvParams"]):
         else:
             reset_fn = make_reset_fn_list_of_levels(list(config.levels), static_params)
         self.env = make_kinetix_env(
-            action_type=ActionType.DISCRETE,
+            action_type=ActionType.DISCRETE if config.action_type == "discrete" else ActionType.CONTINUOUS,
             observation_type=ObservationType.PIXELS,
             reset_fn=reset_fn,
             env_params=self.params,
             static_env_params=static_params,
             auto_reset=False,
         )
-        self.num_actions = self.env.action_space(self.params).n
+        space = self.env.action_space(self.params)
+        if config.action_type == "discrete":
+            self.action_space = DiscreteSpace(space.n)
+        else:
+            self.action_space = ContinuousSpace(
+                space.shape, tuple(map(float, space.low.ravel())), tuple(map(float, space.high.ravel()))
+            )
 
     @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array, params: EnvParams) -> tuple[jax.Array, EnvState]:  # key: ()
@@ -78,25 +73,24 @@ class KinetixEnv(BaseEnv["EnvState", "EnvParams"]):
         self,
         key: jax.Array,  # () typed PRNG key
         state: EnvState,  # leaves: (...)
-        action: jax.Array,  # ()
+        action: jax.Array,  # () integer ID or (D,) continuous action
         params: EnvParams,
     ) -> EnvStep[EnvState]:
         """Advance and autoreset; info retains (C, H, W) final_observation."""
         step_key, reset_key = jax.random.split(key)  # each () typed PRNG key
         # Separate time limits from termination for PPO timeout bootstrapping.
-        observation, state, reward, terminated, _ = self.env.step_env(
+        observation, final_state, reward, terminated, _ = self.env.step_env(
             step_key, state, action, params.replace(max_timesteps=2**31 - 1)
         )  # image: (W, H, 3); state leaves: (...); reward/terminated: ()
         final_observation = encode_pixels(observation.image)  # (C, H, W)
-        truncated = state.timestep >= params.max_timesteps  # ()
+        truncated = final_state.timestep >= params.max_timesteps  # ()
         done = terminated | truncated  # ()
-        final_state = state  # leaves: (...), before autoreset
 
         def reset_done(_: None) -> tuple[jax.Array, EnvState]:
             return self.reset(reset_key, params)  # (C, H, W); state leaves: (...)
 
         def continue_episode(_: None) -> tuple[jax.Array, EnvState]:
-            return final_observation, state  # (C, H, W); state leaves: (...)
+            return final_observation, final_state  # (C, H, W); state leaves: (...)
 
         observation, state = jax.lax.cond(done, reset_done, continue_episode, None)  # (C,H,W); leaves: (...)
         return EnvStep(

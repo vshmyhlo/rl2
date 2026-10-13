@@ -104,6 +104,7 @@ def test_rejects_unsupported_environment_options(config_path: Path, option: str,
 def test_kinetix_config_loads_yaml_levels_as_hashable_tuple() -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml")
     assert config.env_id == "Kinetix"
+    assert config.kinetix.action_type == "discrete"
     assert config.kinetix.levels == ("s/h4_thrust_aim.json",)
     assert hash(config)
 
@@ -112,13 +113,13 @@ def test_kinetix_config_loads_yaml_levels_as_hashable_tuple() -> None:
     "settings",
     [
         {"size": "xl"},
+        {"action_type": "multi_discrete"},
         {"levels": []},
         {"levels": [""]},
         {"max_steps": 0},
         {"frame_skip": 0},
         {"downscale": 3},
         {"dense_reward_scale": float("nan")},
-        {"action_type": "continuous"},
     ],
 )
 def test_kinetix_rejects_invalid_settings(settings: dict[str, object]) -> None:

@@ -21,7 +21,6 @@ from rl2.lstm import initial_carry
 from rl2.model.encoders.rgb import ConvStage
 from rl2.ppo import (
     ActorCritic,
-    action_log_prob,
     learning_rate_schedule,
     load_config,
     train,
@@ -74,7 +73,7 @@ def test_batch_select_sequences_preserves_time_and_initial_memory(num_steps: int
 
 def test_default_model_parameter_budget_and_rgb_shapes() -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
-    model = ActorCritic(6, config.model)
+    model = ActorCritic(ppo.DiscreteSpace(6), config.model)
     # This architecture budget is specifically for 84x84 RGB, independent of the training config.
     obs = jax.ShapeDtypeStruct((1, 1, 1, 84, 84, 3), jnp.uint8)
     carry = model.initial_carry(1)
@@ -85,6 +84,7 @@ def test_default_model_parameter_budget_and_rgb_shapes() -> None:
     assert "OptimizedLSTMCell_0" in variables["params"]["lstm"]["mixer_0"]
     assert 27_000_000 < count < 30_000_000
     final, logits, values = jax.eval_shape(model.apply, variables, obs, carry, starts)
+    logits = logits.logits  # (..., A)
     assert logits.shape == (1, 1, 6)
     assert values.shape == (1, 1)
     assert final[0][0].shape == (1, config.model.recurrent.hidden_size)
@@ -92,6 +92,7 @@ def test_default_model_parameter_budget_and_rgb_shapes() -> None:
     step_final, step_logits, step_values = jax.eval_shape(
         partial(model.apply, method=model.step), variables, step_obs, carry, starts[0]
     )
+    step_logits = step_logits.logits  # (..., A)
     assert step_logits.shape == (1, 6)
     assert step_values.shape == (1,)
     assert step_final[0][0].shape == final[0][0].shape
@@ -113,8 +114,10 @@ def test_clipped_policy_loss_and_gradient_direction(shape: tuple[int, ...]) -> N
         obs: jax.Array,  # (*S, 1)
         carry: ppo.RecurrentCarry,  # leaves: (B, 1)
         starts: jax.Array,  # (*S,)
-    ) -> tuple[ppo.RecurrentCarry, jax.Array, jax.Array]:
-        return carry, variables["params"]["logits"], variables["params"]["values"]  # leaves: (B, 1); (*S, A); (*S,)
+    ) -> ppo.ActorCriticOutput:
+        return ppo.ActorCriticOutput(
+            carry, ppo.CategoricalPolicy(variables["params"]["logits"]), variables["params"]["values"]
+        )  # leaves: (B, 1); (*S, A); (*S,)
 
     state = TrainState.create(
         apply_fn=apply,
@@ -162,14 +165,14 @@ def test_single_transition_keeps_policy_gradient() -> None:
 
     def apply(
         variables: optax.Params, obs: jax.Array, carry: ppo.RecurrentCarry, starts: jax.Array
-    ) -> tuple[ppo.RecurrentCarry, jax.Array, jax.Array]:
+    ) -> ppo.ActorCriticOutput:
         chex.assert_shape(obs, (1, 1, 1, 1, 1))
         chex.assert_type(obs, jnp.uint8)
         chex.assert_shape(starts, (1, 1))
         chex.assert_type(starts, jnp.bool_)
         chex.assert_shape(variables["params"]["logits"], (1, 1, 2))
         chex.assert_type(variables["params"]["logits"], jnp.float32)
-        return carry, variables["params"]["logits"], jnp.zeros((1, 1))
+        return ppo.ActorCriticOutput(carry, ppo.CategoricalPolicy(variables["params"]["logits"]), jnp.zeros((1, 1)))
 
     state = TrainState.create(apply_fn=apply, params={"logits": jnp.zeros((1, 1, 2))}, tx=optax.sgd(0.1))
     batch = ppo.PPOBatch(
@@ -236,7 +239,7 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
     )
     assert config.bf16
     model = ActorCritic(
-        3,
+        ppo.DiscreteSpace(3),
         model_config,
         dtype=jnp.bfloat16,
     )
@@ -247,6 +250,7 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
     (final, logits, values), captured = jax.jit(
         partial(model.apply, capture_intermediates=True, mutable=["intermediates"])
     )({"params": params}, obs, carry, starts)
+    logits = logits.logits  # (..., A)
     assert captured["intermediates"]["encoder"]["stem"]["__call__"][0].dtype == jnp.bfloat16
     assert captured["intermediates"]["lstm_input"]["__call__"][0].dtype == jnp.bfloat16
     assert captured["intermediates"]["policy_hidden"]["__call__"][0].dtype == jnp.bfloat16
@@ -261,12 +265,13 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
         carry, step_logits, prediction = apply_step(
             {"params": state.params}, obs[t], carry, starts[t], method="step"
         )  # carry leaves: (B, ...); step_logits: (B, A); prediction: (B,)
+        step_logits = step_logits.logits  # (..., A)
         actions = jax.random.categorical(jax.random.key(t), step_logits)  # (B,)
-        log_probs = action_log_prob(step_logits, actions)  # (B,)
+        log_probs = ppo.CategoricalPolicy(step_logits).log_prob(actions)  # (B,)
         # BF16 kernels may round differently for sequence and single-step batches.
         np.testing.assert_allclose(prediction, values[t], atol=0.02, rtol=0.02)
-        np.testing.assert_allclose(log_probs, action_log_prob(logits[t], actions), atol=1e-3, rtol=0)
-        replayed_log_probs.append(action_log_prob(logits[t], jnp.zeros(2, dtype=jnp.int32)))
+        np.testing.assert_allclose(log_probs, ppo.CategoricalPolicy(logits[t]).log_prob(actions), atol=1e-3, rtol=0)
+        replayed_log_probs.append(ppo.CategoricalPolicy(logits[t]).log_prob(jnp.zeros(2, dtype=jnp.int32)))
     # Float32 carry still accumulates differences from the BF16 encoder.
     for actual, expected in zip(jax.tree.leaves(carry), jax.tree.leaves(final), strict=True):
         np.testing.assert_allclose(actual, expected, atol=0.03, rtol=0.02)
@@ -298,7 +303,7 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
 def test_recurrent_sequences_match_steps_and_reset_only_finished_env() -> None:
     # Test sequence/reset semantics in float32, without GPU TF32 approximation.
     model = ActorCritic(
-        3,
+        ppo.DiscreteSpace(3),
         replace(small_model_config(), encoder=ppo.RGBEncoderConfig(stages=(ConvStage(4, blocks=1),), embedding_size=6)),
     )
     obs = jax.random.randint(jax.random.key(2), (4, 2, 4, 8, 8), 0, 256, dtype=jnp.uint8)
@@ -310,9 +315,11 @@ def test_recurrent_sequences_match_steps_and_reset_only_finished_env() -> None:
     apply = jax.jit(model.apply)
     step = jax.jit(partial(model.apply, method=model.step))
     final, logits, values = apply(params, obs, carry, starts)
+    logits = logits.logits  # (..., A)
     stepped_logits, stepped_values = [], []
     for t in range(4):
         carry, policy, critic = step(params, obs[t], carry, starts[t])
+        policy = policy.logits  # (..., A)
         stepped_logits.append(policy)
         stepped_values.append(critic)
     np.testing.assert_allclose(logits, jnp.stack(stepped_logits), atol=5e-6)
@@ -327,15 +334,18 @@ def test_recurrent_sequences_match_steps_and_reset_only_finished_env() -> None:
     peek = step(params, obs[2], prefix_carry, starts[2])[2]  # (B,)
     np.testing.assert_allclose(peek, values[2], atol=5e-6)
     _, suffix_logits, suffix_values = apply(params, obs[2:], prefix_carry, starts[2:])
+    suffix_logits = suffix_logits.logits  # (..., A)
     np.testing.assert_allclose(suffix_values, values[2:], atol=5e-6)
     # A reset discards history for env 0; env 1 still depends on it.
     _, fresh_logits, fresh_values = apply(params, obs[2:], model.initial_carry(2), starts[2:])
+    fresh_logits = fresh_logits.logits  # (..., A)
     np.testing.assert_allclose(suffix_logits[:, 0], fresh_logits[:, 0], atol=5e-6)
     np.testing.assert_allclose(suffix_values[:, 0], fresh_values[:, 0], atol=5e-6)
     assert float(jnp.max(jnp.abs(suffix_values[:, 1] - fresh_values[:, 1]))) > 1e-05
 
     selected = jax.tree.map(lambda leaf: leaf[jnp.array([1])], prefix_carry)
     selected_final, selected_logits, selected_values = apply(params, obs[2:, 1:], selected, starts[2:, 1:])
+    selected_logits = selected_logits.logits  # (..., A)
     np.testing.assert_allclose(selected_logits, suffix_logits[:, 1:], atol=5e-6)
     np.testing.assert_allclose(selected_values, suffix_values[:, 1:], atol=5e-6)
     for actual, expected in zip(jax.tree.leaves(selected_final), jax.tree.leaves(final), strict=True):
@@ -456,8 +466,10 @@ def test_entropy_decay_scales_update_by_rollout() -> None:
 
     def apply(
         variables: optax.Params, obs: jax.Array, carry: ppo.RecurrentCarry, starts: jax.Array
-    ) -> tuple[ppo.RecurrentCarry, jax.Array, jax.Array]:
-        return carry, variables["params"]["logits"], jnp.zeros_like(starts, dtype=jnp.float32)
+    ) -> ppo.ActorCriticOutput:
+        return ppo.ActorCriticOutput(
+            carry, ppo.CategoricalPolicy(variables["params"]["logits"]), jnp.zeros_like(starts, dtype=jnp.float32)
+        )
 
     probabilities = np.array([[0.8, 0.2]], dtype=np.float32)
     logits = jnp.log(probabilities)
@@ -506,7 +518,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     zeros = np.zeros(1, dtype=np.float32)  # (B,)
     dones = np.zeros(1, dtype=bool)  # (B,)
     carry = initial_carry(1, 1)  # pair of (B, H=1)
-    envs = Mock(num_actions=2, params={})
+    envs = Mock(action_space=ppo.DiscreteSpace(2), params={})
     envs.step_batch = partial(BaseEnv.step_batch, envs)
     envs.reset.return_value = (obs[0], {})
     # One episode spans both rollouts in the first window; the final window has none.
@@ -556,7 +568,9 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         patch("rl2.ppo.ActorCritic", return_value=model) as actor_critic,
         patch("rl2.ppo.SummaryWriter", return_value=writer),
         patch.object(
-            model, "apply", return_value=(carry, jnp.array([[0.0, -jnp.inf]]), zeros)
+            model,
+            "apply",
+            return_value=ppo.ActorCriticOutput(carry, ppo.CategoricalPolicy(jnp.array([[0.0, -jnp.inf]])), zeros),
         ),  # carry leaves: (B,H); (B,A); (B,)
         patch("rl2.ppo.update", side_effect=fake_update),
         patch("rl2.ppo.explained_variance", side_effect=(0.2, 0.4, 0.8)),
@@ -567,7 +581,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     ):
         train(config)
     actor_critic.assert_called_once_with(
-        2,
+        ppo.DiscreteSpace(2),
         config.model,
         dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
     )
@@ -668,7 +682,7 @@ def test_video_schedule_uses_iterations(interval: int, expected_steps: list[int]
     zeros = np.zeros(1, dtype=np.float32)  # (B,)
     dones = np.zeros(1, dtype=bool)  # (B,); no episodes complete during training
     carry = initial_carry(1, 1)  # pair of (B, H=1)
-    envs = Mock(num_actions=2, params={})
+    envs = Mock(action_space=ppo.DiscreteSpace(2), params={})
     envs.step_batch = partial(BaseEnv.step_batch, envs)
     envs.reset.return_value = (obs[0], {})
     envs.step.return_value = env_step(obs[0], zeros[0], dones[0], dones[0], {})
@@ -708,7 +722,9 @@ def test_video_schedule_uses_iterations(interval: int, expected_steps: list[int]
         patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo, "SummaryWriter") as writer,
         patch.object(
-            model, "apply", return_value=(carry, jnp.array([[0.0, -jnp.inf]]), zeros)
+            model,
+            "apply",
+            return_value=ppo.ActorCriticOutput(carry, ppo.CategoricalPolicy(jnp.array([[0.0, -jnp.inf]])), zeros),
         ),  # carry leaves: (B,H); (B,A); (B,)
         patch.object(ppo, "update", side_effect=advance_update),
         patch.object(ppo, "monotonic", side_effect=now),
@@ -753,7 +769,7 @@ def test_train_evaluates_final_policy(
     zeros = np.zeros(1, dtype=np.float32)
     dones = np.ones(1, dtype=bool)
     carry = initial_carry(1, 1)
-    envs = Mock(num_actions=2, params={})
+    envs = Mock(action_space=ppo.DiscreteSpace(2), params={})
     envs.step_batch = partial(BaseEnv.step_batch, envs)
     envs.reset.return_value = (obs[0], {})
     # The first game spans two steps; the last unfinished game must not count.
@@ -767,7 +783,10 @@ def test_train_evaluates_final_policy(
     clock = 0.0
 
     def advance_update(
-        state: TrainState, batch: ppo.PPOBatch, config: ppo.Config, iteration: int
+        state: TrainState,
+        batch: ppo.PPOBatch,
+        config: ppo.Config,
+        iteration: int,
     ) -> tuple[TrainState, ppo.MinibatchMetrics]:
         nonlocal clock
         clock += 60.0
@@ -793,7 +812,9 @@ def test_train_evaluates_final_policy(
         patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo, "SummaryWriter") as writer,
         patch.object(
-            model, "apply", return_value=(carry, jnp.array([[0.0, -jnp.inf]]), zeros)
+            model,
+            "apply",
+            return_value=ppo.ActorCriticOutput(carry, ppo.CategoricalPolicy(jnp.array([[0.0, -jnp.inf]])), zeros),
         ),  # carry leaves: (B,H); (B,A); (B,)
         patch.object(ppo, "update", side_effect=advance_update),
         patch.object(ppo, "monotonic", side_effect=now),
@@ -835,8 +856,19 @@ def test_train_evaluates_final_policy(
 
 def test_kl_rejects_update_without_changing_optimizer() -> None:
     config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), target_kl=0.01)
+
+    def apply(
+        variables: optax.Params,
+        obs: jax.Array,  # (B, 1)
+        carry: ppo.RecurrentCarry,  # leaves: (B, H)
+        starts: jax.Array,  # (B,)
+    ) -> ppo.ActorCriticOutput:
+        return ppo.ActorCriticOutput(
+            carry, ppo.CategoricalPolicy(variables["params"]["logits"]), jnp.zeros_like(starts, dtype=jnp.float32)
+        )  # carry leaves: (B,H); policy.logits: (B,A); values: (B,)
+
     state = TrainState.create(
-        apply_fn=lambda variables, obs, carry, starts: (carry, variables["params"]["logits"], jnp.zeros(2)),
+        apply_fn=apply,
         params={"logits": jnp.log(jnp.array([[0.9, 0.1], [0.1, 0.9]]))},
         tx=optax.adam(0.01),
     )
@@ -862,8 +894,19 @@ def test_kl_rejects_update_without_changing_optimizer() -> None:
 def test_policy_diagnostics() -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
     probabilities = jnp.array([[0.2, 0.8], [0.5, 0.5], [0.8, 0.2], [0.52, 0.48]])
+
+    def apply(
+        variables: optax.Params,
+        obs: jax.Array,  # (B, 1)
+        carry: ppo.RecurrentCarry,  # leaves: (B, H)
+        starts: jax.Array,  # (B,)
+    ) -> ppo.ActorCriticOutput:
+        return ppo.ActorCriticOutput(
+            carry, ppo.CategoricalPolicy(variables["params"]["logits"]), jnp.zeros_like(starts, dtype=jnp.float32)
+        )  # carry leaves: (B,H); policy.logits: (B,A); values: (B,)
+
     state = TrainState.create(
-        apply_fn=lambda variables, obs, carry, starts: (carry, variables["params"]["logits"], jnp.zeros(4)),
+        apply_fn=apply,
         params={"logits": jnp.log(probabilities)},
         tx=optax.sgd(0.0),
     )
@@ -951,7 +994,7 @@ def test_lstm_stack_config_loading_and_factory(tmp_path: Path) -> None:
     assert hash(restored) == hash(config)
     with pytest.raises(FrozenInstanceError):
         config.model.recurrent.hidden_size = 16
-    model = ppo.ActorCritic(3, restored.model, dtype=jnp.bfloat16 if restored.bf16 else jnp.float32)
+    model = ppo.ActorCritic(ppo.DiscreteSpace(3), restored.model, dtype=jnp.bfloat16 if restored.bf16 else jnp.float32)
     recurrent = model._make_recurrent()
     assert isinstance(recurrent, ppo.LSTMStack)
     assert recurrent.num_layers == 2

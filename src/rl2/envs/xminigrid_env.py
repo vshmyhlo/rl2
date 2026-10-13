@@ -15,6 +15,7 @@ from xminigrid.environment import EnvParams
 from xminigrid.rendering.rgb_render import render as render_grid
 from xminigrid.types import TimeStep
 
+from rl2.actions import DiscreteSpace
 from rl2.envs.base import BaseEnv, EnvStep
 
 
@@ -52,7 +53,7 @@ class XMiniGridEnv(BaseEnv[TimeStep, EnvParams]):
                 if config.ruleset_id >= benchmark.num_rulesets():
                     raise ValueError("ruleset_id must be smaller than the benchmark's number of rulesets")
                 self.params = self.params.replace(ruleset=benchmark.get_ruleset(config.ruleset_id))
-        self.num_actions = self.env.num_actions(self.params)
+        self.action_space = DiscreteSpace(self.env.num_actions(self.params))
 
     @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array, params: EnvParams) -> tuple[jax.Array, TimeStep]:  # key: ()

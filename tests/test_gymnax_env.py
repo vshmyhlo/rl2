@@ -17,7 +17,7 @@ def test_single_reset_step_and_encoder_scale() -> None:
     chex.assert_trees_all_equal(state, raw_state)
     np.testing.assert_array_equal(observation / 255, np.moveaxis(raw, -1, 0))
     assert observation.shape == (4, 10, 10) and observation.dtype == jnp.uint8
-    assert env.num_actions == 3
+    assert env.action_space.n == 3
     result = env.step(key, state, jnp.array(0), params)  # observation: (4,10,10); state leaves: (...); reward/done: ()
     assert isinstance(result, EnvStep)
     observation, state, reward, done, info = result
