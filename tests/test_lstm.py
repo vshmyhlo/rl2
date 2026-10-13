@@ -240,3 +240,34 @@ def test_lstm_stack_rejects_inputs_before_normalization(invalid: str) -> None:
     carry = model.initial_carry(2)  # leaves: (B, H)
     with pytest.raises(AssertionError):
         jax.eval_shape(model.init, jax.random.key(0), x, carry, starts)
+
+
+def test_bf16_sequence_accumulates_recurrent_gradients_in_float32() -> None:
+    model = LSTM(1, dtype=jnp.bfloat16)
+    # 512 half-unit contributions expose rounding in a BF16 scan accumulator.
+    x = jnp.zeros((512, 1, 1), jnp.bfloat16)  # (T, B, I)
+    starts = jnp.zeros((512, 1), bool)  # (T, B)
+    carry = model.initial_carry(1)  # each (B, H)
+    params = jax.tree.map(jnp.zeros_like, model.init(jax.random.key(0), x, carry, starts))
+
+    def loss(variables: chex.ArrayTree, *, sequence: bool) -> jax.Array:  # ()
+        if sequence:
+            _, output = model.apply(variables, x, carry, starts)  # carry: (B, H) leaves; output: (T, B, H)
+        else:
+
+            def step(
+                memory: LSTMCarry, data: tuple[jax.Array, jax.Array]
+            ) -> tuple[LSTMCarry, jax.Array]:  # memory: (B, H) leaves; data: (B, I), (B,); output: (B, H)
+                return model.apply(variables, data[0], memory, data[1], method=model.step)
+
+            _, output = jax.lax.scan(step, carry, (x, starts))  # carry: (B, H) leaves; output: (T, B, H)
+        return output.astype(jnp.float32).sum()  # ()
+
+    actual = jax.jit(jax.grad(partial(loss, sequence=True)))(params)  # parameter-shaped leaves
+    expected = jax.jit(jax.grad(partial(loss, sequence=False)))(params)  # parameter-shaped leaves
+    np.testing.assert_allclose(
+        actual["params"]["OptimizedLSTMCell_0"]["hg"]["bias"],
+        expected["params"]["OptimizedLSTMCell_0"]["hg"]["bias"],
+        atol=1e-5,
+        rtol=0,
+    )

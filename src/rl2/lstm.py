@@ -26,8 +26,8 @@ def _tanh_float32(x: jax.Array) -> jax.Array:  # (*S,) -> (*S,)
 
 class _LSTMWeights(NamedTuple):
     input: jax.Array  # (I, 4H)
-    recurrent: jax.Array  # (H, 4H)
-    bias: jax.Array  # (4H,)
+    recurrent: jax.Array  # (H, 4H), float32 for scan gradient accumulation
+    bias: jax.Array  # (4H,), float32
 
 
 class _LSTMCell(nn.OptimizedLSTMCell):
@@ -49,8 +49,8 @@ class _LSTMCell(nn.OptimizedLSTMCell):
             biases.append(cast(jax.Array, bias))
         return _LSTMWeights(
             jnp.concatenate(inputs, axis=-1).astype(self.dtype),  # (I, 4H)
-            jnp.concatenate(recurrent, axis=-1).astype(self.dtype),  # (H, 4H)
-            jnp.concatenate(biases).astype(self.dtype),  # (4H,)
+            jnp.concatenate(recurrent, axis=-1),  # (H, 4H), float32
+            jnp.concatenate(biases),  # (4H,), float32
         )
 
 
@@ -127,7 +127,9 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
         ) -> tuple[LSTMCarry, jax.Array]:
             inputs_x, starts = inputs  # (B, 4H), (B,)
             cell, hidden = jax.tree.map(lambda state: jnp.where(starts[:, None], 0, state), memory)  # each (B, H)
-            gates = (jnp.matmul(hidden.astype(self.dtype), weights.recurrent) + weights.bias) + inputs_x  # (B, 4H)
+            # Cast inside the scan so its parameter-gradient accumulators stay float32.
+            recurrent = jnp.matmul(hidden.astype(self.dtype), weights.recurrent.astype(self.dtype))  # (B, 4H)
+            gates = (recurrent + weights.bias.astype(self.dtype)) + inputs_x  # (B, 4H)
             memory = _apply_gates(cell, gates)  # each (B, H)
             return memory, memory[1].astype(self.dtype)  # carry: each (B, H); output: (B, H)
 

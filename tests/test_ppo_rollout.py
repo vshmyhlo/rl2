@@ -102,8 +102,9 @@ def test_train_step_matches_separate_rollout_and_updates_with_real_model() -> No
         bf16=False,
         target_kl=None,
         model=ppo.ModelConfig(
-            encoder=ppo.RGBEncoderConfig(stages=(ConvStage(2, blocks=0),), embedding_size=2),
-            recurrent=ppo.LSTMConfig(hidden_size=2),
+            # Two-channel LayerNorm magnifies FP32 fusion differences in this comparison.
+            encoder=ppo.RGBEncoderConfig(stages=(ConvStage(4, blocks=0),), embedding_size=4),
+            recurrent=ppo.LSTMConfig(hidden_size=4),
         ),
     )
     env = GymnaxEnv(config.env_id)
@@ -111,7 +112,7 @@ def test_train_step_matches_separate_rollout_and_updates_with_real_model() -> No
         jax.random.split(jax.random.key(0), 2), env.params
     )  # (B=2,4,10,10); leaves: (B,...)
     model = ppo.ActorCritic(3, config.model)
-    carry = model.initial_carry(2)  # leaves: (B,2)
+    carry = model.initial_carry(2)  # leaves: (B,4)
     starts = jnp.ones(2, bool)  # (B,)
     params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]
     state = TrainState.create(
