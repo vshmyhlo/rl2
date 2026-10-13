@@ -144,28 +144,47 @@ def test_rollout_team_gae_death_timeout_and_sequence_selection(config: ppo.Confi
     np.testing.assert_array_equal(repeated.episode_step_counts, 0)
 
 
-def test_local_model_mask_replay_and_separate_memory(config: ppo.Config) -> None:
+def test_local_model_mask_replay_and_shared_memory(config: ppo.Config) -> None:
     model = ppo.ActorCritic(ppo.DiscreteSpace(3), config.model)
     obs = jnp.arange(16, dtype=jnp.float32).reshape(2, 2, 4) / 16  # (T, B, O)
     starts = jnp.array([[True, True], [True, False]])  # (T, B)
     masks = jnp.array([[[True, False, True], [False, True, False]]] * 2)  # (T, B, A)
     memory = model.initial_carry(2)  # leaves: (B, H)
+    assert len(memory) == config.model.recurrent.num_layers
+    chex.assert_shape(jax.tree.leaves(memory), (2, 4))
     params = model.init(jax.random.key(0), obs, memory, starts, masks)
+    # Keep the tiny ReLU encoder active so the test exercises recurrent features.
+    params["params"]["encoder"]["kernel"] = jnp.eye(4)  # (O, F)
     output = model.apply(params, obs, memory, starts, masks)
     first = model.apply(params, obs[0], memory, starts[0], masks[0], method="step")
     second = model.apply(params, obs[1], first.carry, starts[1], masks[1], method="step")
     chex.assert_trees_all_close(second.carry, output.carry, atol=1e-6)
     np.testing.assert_allclose(output.values, jnp.stack([first.values, second.values]), atol=1e-6)
+    np.testing.assert_allclose(output.policy.logits, jnp.stack([first.policy.logits, second.policy.logits]), atol=1e-6)
     actions, log_probs = output.policy.sample_and_log_prob(seed=jax.random.key(2))  # each (T, B)
     assert bool(jnp.take_along_axis(masks, actions[..., None], axis=-1).all())
     assert bool(jnp.isfinite(output.policy.entropy()).all())
     np.testing.assert_allclose(output.policy.log_prob(actions), log_probs, atol=1e-6)
     chex.assert_shape(output.values, (2, 2))
-    changed = dict(params["params"], critic=jax.tree.map(jnp.zeros_like, params["params"]["critic"]))
-    changed["critic"]["output"]["bias"] = jnp.ones(1)  # (1,)
+    # Both heads depend on the shared encoder; changing only the value head leaves policy and memory intact.
+    changed = dict(params["params"], encoder=jax.tree.map(jnp.zeros_like, params["params"]["encoder"]))
+    no_features = model.apply({"params": changed}, obs, memory, starts, masks)
+    assert not np.array_equal(output.policy.logits, no_features.policy.logits)
+    assert not np.array_equal(output.values, no_features.values)
+    changed = dict(params["params"], value_output=jax.tree.map(jnp.zeros_like, params["params"]["value_output"]))
+    changed["value_output"]["bias"] = jnp.ones(1)  # (1,)
     new_output = model.apply({"params": changed}, obs, memory, starts, masks)
-    chex.assert_trees_all_equal(output.policy, new_output.policy)
+    chex.assert_trees_all_equal((output.policy, output.carry), (new_output.policy, new_output.carry))
     assert not np.array_equal(output.values, new_output.values)
+
+
+def test_rejects_checkpoint_with_separate_networks(config: ppo.Config) -> None:
+    manager = Mock()
+    manager.latest_step.return_value = 1
+    manager.restore.return_value.metadata = {"version": 1, "algorithm": "smax_ippo"}
+    state = TrainState.create(apply_fn=scripted_policy, params={}, tx=optax.sgd(0.1))
+    with pytest.raises(ValueError, match="shared encoder/LSTM requires a new run directory"):
+        ppo.restore_checkpoint(manager, state, config)
 
 
 def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_path: Path) -> None:
@@ -232,3 +251,54 @@ def test_config_and_cli(config: ppo.Config, tmp_path: Path, monkeypatch: pytest.
     monkeypatch.setattr(ppo, "train", train)
     ppo.main()
     train.assert_called_once_with(config)
+
+
+def test_training_resume_wiring_and_environment_step_logging(
+    config: ppo.Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(config, video_interval=1, eval_interval=1, checkpoint_interval=1, log_interval=1)
+    env = ScriptedSMAX()
+    writer, manager = Mock(), Mock()
+    video, evaluation, save = Mock(), Mock(), Mock()
+    monkeypatch.setattr(ppo, "make_env", lambda _: env)
+    monkeypatch.setattr(ppo, "SummaryWriter", Mock(return_value=writer))
+    monkeypatch.setattr(ppo, "checkpoint_manager", lambda _: manager)
+    monkeypatch.setattr(ppo, "log_video", video)
+    monkeypatch.setattr(ppo, "log_evaluation", evaluation)
+    monkeypatch.setattr(ppo, "save_checkpoint", save)
+
+    def restore(manager: Any, state: TrainState, config: ppo.Config) -> ppo.TrainingProgress:
+        return ppo.TrainingProgress(state, jax.random.key(7), 1, 1, 3.0, 2)
+
+    def train_step(
+        runner: ppo.RolloutCarry,
+        state: TrainState,
+        env: SMAXEnv,
+        config: ppo.Config,
+        key: jax.Array,
+        metrics: ppo.TrainingMetrics,
+        iteration: int,  # key: (); metrics: scalar leaves
+    ) -> ppo.TrainStepResult:
+        assert iteration == 1
+        chex.assert_shape(runner.observation.observations, (2, 2, 2))
+        chex.assert_shape(jax.tree.leaves(runner.model_carry), (4, 4))
+        np.testing.assert_array_equal(runner.episode_starts, True)
+        np.testing.assert_array_equal(runner.episode_returns, 0)
+        metrics = jax.tree.map(lambda x: x + 1, metrics)  # scalar leaves
+        return ppo.TrainStepResult(state, runner, key, metrics)
+
+    monkeypatch.setattr(ppo, "restore_checkpoint", restore)
+    monkeypatch.setattr(ppo, "train_step_donated", train_step)
+    ppo.train(config)
+    for logger in (video, evaluation):
+        logger.assert_called_once()
+        chex.assert_shape(jax.tree.leaves(logger.call_args.kwargs["initial_carry"]), (2, 4))
+    scalars = {call.args[0]: call.args[1:] for call in writer.add_scalar.call_args_list}
+    assert scalars["charts/total_environment_steps"] == (8.0, 8)
+    assert scalars["charts/total_observations"] == (16.0, 8)
+    assert scalars["charts/total_episodes"] == (2.0, 8)
+    assert scalars["charts/training_progress"] == (1.0, 8)
+    assert save.call_args.args[1].rollout_count == 2
+    writer.close.assert_called_once()
+    manager.close.assert_called_once()

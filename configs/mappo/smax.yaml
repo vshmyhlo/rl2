@@ -33,7 +33,7 @@ run_id: ippo_${path_name:${env_id}}_${path_name:${smax.map_name}}
 log_interval: 10
 video_interval: 100
 video_max_frames: 900
-video_fps: 10.0
+video_fps: 5
 checkpoint_interval: 500
 eval_interval: 500
 eval_episodes: 20

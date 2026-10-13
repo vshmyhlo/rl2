@@ -48,11 +48,11 @@ def test_episode_frame_limits(frame_limit: int | None, stop: bool, expected_leng
         ppo.DiscreteSpace(3), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
     ).initial_carry(1)  # leaves: (1,1)
     with patch.object(ppo, "GymnaxEnv", return_value=env):
-        score, length, frames = ppo.play_episode(
+        result = ppo.play_episode(
             state, config, jax.random.key(0), carry, record=True, stop_at_frame_limit=stop, env=env
         )
-    assert score == 0 and length == expected_length and len(frames) == expected_frames
-    assert all(frame.shape == (160, 160, 3) and frame.dtype == np.uint8 for frame in frames)
+    assert result.episode_return == 0 and result.length == expected_length and len(result.frames) == expected_frames
+    assert all(frame.shape == (160, 160, 3) and frame.dtype == np.uint8 for frame in result.frames)
 
 
 @pytest.mark.parametrize("record", [True, False])
@@ -68,14 +68,14 @@ def test_episode_renders_state_before_autoreset(record: bool) -> None:
     carry = ppo.ActorCritic(
         ppo.DiscreteSpace(3), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
     ).initial_carry(1)  # leaves: (1,1)
-    score, length, frames = ppo.play_episode(state, config, jax.random.key(0), carry, record=record, env=env)
-    assert (score, length) == (1.0, 1)
+    result = ppo.play_episode(state, config, jax.random.key(0), carry, record=record, env=env)
+    assert (result.episode_return, result.length) == (1.0, 1)
     if record:
         assert [call.args[0] for call in env.render.call_args_list] == [initial, final]
-        assert len(frames) == 2 and all(frame.shape == (3, 5, 3) for frame in frames)
-        np.testing.assert_array_equal(frames[-1], 20)
+        assert len(result.frames) == 2 and all(frame.shape == (3, 5, 3) for frame in result.frames)
+        np.testing.assert_array_equal(result.frames[-1], 20)
     else:
-        assert frames == []
+        assert result.frames == []
         env.render.assert_not_called()
 
 

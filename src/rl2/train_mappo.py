@@ -1,7 +1,7 @@
 """Recurrent parameter-sharing IPPO for SMAX, with local actor and critic inputs.
 
-The actor and critic have separate encoders and LSTMs, with each network sharing
-parameters across allies. Both receive only local observations. Unavailable
+The actor and critic share an encoder and LSTM, with separate policy and value
+heads and parameters shared across allies. Both use only local observations. Unavailable
 actions are masked during rollout collection and PPO updates. Agent death resets
 local recurrence but does not end the team's reward stream or GAE trace.
 Battle completion ends traces; time limits bootstrap from final local observations
@@ -58,7 +58,7 @@ Session timing:
     time/elapsed_seconds: Wall time since this training session's rollout loop started.
 
 Startup scalars (also logged when resuming):
-    model/params_millions: Combined actor and critic parameter count in millions.
+    model/params_millions: Model parameter count in millions.
 
 Evaluation scalars (when evaluation is enabled; unavailable scores are omitted):
     eval/return_mean: Mean raw evaluation team return.
@@ -70,7 +70,7 @@ Evaluation scalars (when evaluation is enabled; unavailable scores are omitted):
 Text:
     config: Full training configuration as YAML, logged at startup and on resume.
     devices: JAX devices used by this session.
-    model/parameter_count: Exact combined actor and critic parameter count.
+    model/parameter_count: Exact model parameter count.
     eval/report: Complete JSON report after each evaluation, including per-battle
         results, aggregate scores, training configuration, evaluation seed,
         and training environment steps/completed battles.
@@ -153,12 +153,7 @@ from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.running_stats import RunningSum
 from rl2.utils import explained_variance, gae
 
-
-class RecurrentCarry(NamedTuple):
-    actor: LSTMStackCarry  # leaves: (B, H)
-    critic: LSTMStackCarry  # leaves: (B, H)
-
-
+type RecurrentCarry = LSTMStackCarry
 type PPOEnv = SMAXEnv
 
 
@@ -390,7 +385,7 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
             state=ocp.args.StandardSave({"train_state": progress.train_state, "key": key_data}),
             metadata=ocp.args.JsonSave(
                 {
-                    "version": 1,
+                    "version": 2,
                     "algorithm": "smax_ippo",
                     "config": asdict(config),
                     "iteration": progress.rollout_count,
@@ -411,8 +406,8 @@ def restore_checkpoint(
     if rollout_count is None:
         return None
     metadata = manager.restore(rollout_count, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
-    if metadata["version"] != 1 or metadata.get("algorithm") != "smax_ippo":
-        raise ValueError("Unsupported PPO checkpoint version")
+    if metadata["version"] != 2 or metadata.get("algorithm") != "smax_ippo":
+        raise ValueError("Unsupported PPO checkpoint version; the shared encoder/LSTM requires a new run directory")
     if metadata["iteration"] != rollout_count or rollout_count < 0 or metadata["completed_episodes"] < 0:
         raise ValueError("Invalid PPO checkpoint progress")
     saved_config = metadata["config"]
@@ -480,60 +475,60 @@ class ActorCriticOutput(NamedTuple):
     values: jax.Array  # (*S,)
 
 
-class LocalNetwork(nn.Module):
-    model: ModelConfig
-    output_size: int
-    output_scale: float
-    dtype: jax.typing.DTypeLike = jnp.float32
-
-    def setup(self) -> None:
-        self.encoder = nn.Dense(self.model.hidden_size, dtype=self.dtype)
-        self.recurrent_input = nn.Dense(self.model.recurrent.hidden_size, dtype=self.dtype)
-        self.recurrent = LSTMStack(
-            self.model.recurrent.hidden_size,
-            self.model.recurrent.num_layers,
-            self.model.recurrent.intermediate_size,
-            dtype=self.dtype,
-        )
-        self.hidden = nn.Dense(self.model.hidden_size, dtype=self.dtype)
-        self.output = nn.Dense(
-            self.output_size,
-            kernel_init=nn.initializers.orthogonal(self.output_scale),
-            dtype=self.dtype,
-        )
-
-    def __call__(
-        self,
-        observations: jax.Array,  # (T, B, O)
-        carry: LSTMStackCarry,  # leaves: (B, H)
-        starts: jax.Array,  # (T, B)
-    ) -> tuple[LSTMStackCarry, jax.Array]:  # leaves: (B, H); (T, B, output_size)
-        x = self.recurrent_input(nn.relu(self.encoder(observations)))  # (T, B, H)
-        carry, x = self.recurrent(x, carry, starts)  # leaves: (B, H); (T, B, H)
-        output = self.output(nn.relu(self.hidden(x))).astype(jnp.float32)  # (T, B, output_size)
-        return carry, output
-
-
 class ActorCritic(nn.Module):
-    """Separate local actor/critic LSTMs; each network shares parameters across agents."""
+    """Shared local encoder/LSTM with separate policy and value heads, as in PPO."""
 
     action_space: DiscreteSpace
     model: ModelConfig = ModelConfig()
     dtype: jax.typing.DTypeLike = jnp.float32
 
     @nn.nowrap
-    def initial_carry(self, num_actors: int) -> RecurrentCarry:
-        recurrent = LSTMStack(
+    def _make_recurrent(self, *, parent: nn.Module | None = None) -> LSTMStack:
+        return LSTMStack(
             self.model.recurrent.hidden_size,
             self.model.recurrent.num_layers,
             self.model.recurrent.intermediate_size,
-            parent=None,
+            dtype=self.dtype,
+            name="lstm",
+            parent=parent,
         )
-        return RecurrentCarry(recurrent.initial_carry(num_actors), recurrent.initial_carry(num_actors))
+
+    @nn.nowrap
+    def initial_carry(self, num_actors: int) -> RecurrentCarry:
+        return self._make_recurrent().initial_carry(num_actors)
 
     def setup(self) -> None:
-        self.actor = LocalNetwork(self.model, self.action_space.n, 0.01, self.dtype)
-        self.critic = LocalNetwork(self.model, 1, 1.0, self.dtype)
+        self.encoder = nn.Dense(self.model.hidden_size, dtype=self.dtype, name="encoder")
+        self.recurrent_input = nn.Dense(self.model.recurrent.hidden_size, dtype=self.dtype, name="lstm_input")
+        self.recurrent = self._make_recurrent(parent=self)
+        init = nn.initializers.orthogonal(sqrt(2))
+        self.policy_hidden = nn.Dense(512, kernel_init=init, name="policy_hidden", dtype=self.dtype)
+        self.policy_norm = nn.LayerNorm(name="policy_norm", dtype=self.dtype)
+        self.value_hidden = nn.Dense(512, kernel_init=init, name="value_hidden", dtype=self.dtype)
+        self.value_norm = nn.LayerNorm(name="value_norm", dtype=self.dtype)
+        self.policy_output = nn.Dense(
+            self.action_space.n, kernel_init=nn.initializers.orthogonal(0.01), name="policy_output", dtype=self.dtype
+        )
+        self.value_output = nn.Dense(
+            1, kernel_init=nn.initializers.orthogonal(1.0), name="value_output", dtype=self.dtype
+        )
+
+    def _encode(self, obs: jax.Array) -> jax.Array:  # (*S, O) -> (*S, H)
+        x = nn.relu(self.encoder(obs))  # (*S, F), F is model.hidden_size
+        return self.recurrent_input(x).astype(self.dtype)  # (*S, H)
+
+    def _heads(
+        self,
+        x: jax.Array,  # (*S, H)
+        action_masks: jax.Array,  # (*S, A)
+    ) -> tuple[CategoricalPolicy, jax.Array]:  # logits: (*S, A); values: (*S,)
+        x = x.astype(self.dtype)  # (*S, H)
+        policy = nn.relu(self.policy_norm(self.policy_hidden(x)))  # (*S, 512)
+        critic = nn.relu(self.value_norm(self.value_hidden(x)))  # (*S, 512)
+        logits = self.policy_output(policy).astype(jnp.float32)  # (*S, A)
+        logits = jnp.where(action_masks, logits, -1e10)  # (*S, A)
+        values = self.value_output(critic).squeeze(-1).astype(jnp.float32)  # (*S,)
+        return CategoricalPolicy(logits), values
 
     def __call__(
         self,
@@ -542,14 +537,10 @@ class ActorCritic(nn.Module):
         episode_starts: jax.Array,  # (T, B)
         action_masks: jax.Array,  # (T, B, A)
     ) -> ActorCriticOutput:
-        actor_carry, logits = self.actor(obs, model_carry.actor, episode_starts)  # leaves: (B, H); (T, B, A)
-        critic_carry, values = self.critic(obs, model_carry.critic, episode_starts)  # leaves: (B, H); (T, B, 1)
-        logits = jnp.where(action_masks, logits, -1e10)  # (T, B, A)
-        return ActorCriticOutput(
-            RecurrentCarry(actor_carry, critic_carry),
-            CategoricalPolicy(logits),
-            values.squeeze(-1),  # (T, B)
-        )
+        x = self._encode(obs)  # (T, B, H)
+        model_carry, x = self.recurrent(x, model_carry, episode_starts)  # leaves: (B, H); (T, B, H)
+        policy, values = self._heads(x, action_masks)  # logits: (T, B, A); (T, B)
+        return ActorCriticOutput(model_carry, policy, values)
 
     def step(
         self,
@@ -558,8 +549,10 @@ class ActorCritic(nn.Module):
         episode_starts: jax.Array,  # (B,)
         action_masks: jax.Array,  # (B, A)
     ) -> ActorCriticOutput:
-        carry, policy, values = self(obs[None], model_carry, episode_starts[None], action_masks[None])
-        return ActorCriticOutput(carry, CategoricalPolicy(policy.logits[0]), values[0])  # (B, A); (B,)
+        x = self._encode(obs)  # (B, H)
+        model_carry, x = self.recurrent.step(x, model_carry, episode_starts)  # leaves: (B, H); (B, H)
+        policy, values = self._heads(x, action_masks)  # logits: (B, A); (B,)
+        return ActorCriticOutput(model_carry, policy, values)
 
 
 class EpisodeResult(NamedTuple):

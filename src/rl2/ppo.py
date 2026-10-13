@@ -653,6 +653,12 @@ def sample_policy_step(
     return carry, policy.sample(seed=key)  # carry leaves: (B, H); actions: (B, *action_shape)
 
 
+class EpisodeResult(NamedTuple):
+    episode_return: float
+    length: int
+    frames: list[NDArray[np.uint8]]  # each (H, W, 3)
+
+
 def play_episode(
     train_state: TrainState,
     config: Config,
@@ -662,7 +668,7 @@ def play_episode(
     record: bool,
     env: PPOEnv,
     stop_at_frame_limit: bool = False,
-) -> tuple[float, int, list[NDArray[np.uint8]]]:
+) -> EpisodeResult:
     """Run one episode; frames: list of (H, W, 3) uint8 RGB images."""
     key, reset_key = jax.random.split(key)  # each () typed PRNG key
     observation, env_state = env.reset(reset_key, env.params)  # (*O,); leaves: (...)
@@ -690,7 +696,7 @@ def play_episode(
             frames.append(np.asarray(env.render(info["final_state"])))
         if bool(episode_end):
             break
-    return episode_return, episode_step_count, frames
+    return EpisodeResult(episode_return, episode_step_count, frames)
 
 
 def log_video(
