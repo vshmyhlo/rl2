@@ -58,7 +58,7 @@ def test_seeded_policy_and_update_are_reproducible() -> None:
         values=values[None],  # (*S,)
         advantages=jnp.array([[1.0, -1.0]]),  # (*S,)
         returns=values[None] + 1,  # (*S,)
-        carry=carry,  # leaves: (B, ...)
+        model_carry=carry,  # leaves: (B, ...)
         episode_starts=starts[None],  # (*S,)
     )
     updated, metrics = ppo.update(first, batch, config)

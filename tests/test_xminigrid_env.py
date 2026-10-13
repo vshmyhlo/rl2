@@ -166,12 +166,12 @@ def test_real_rollout_update_and_video() -> None:
     advanced, rollout = ppo.collect_rollout(runner, state, env, config, jax.random.key(2))
     assert rollout.batch.observations.shape == (2, 1, 7, 7, 2)
     chex.assert_shape((rollout.batch.actions, rollout.batch.returns), (2, 1))
-    chex.assert_shape((rollout.completed_count, rollout.completed_return_sum, rollout.completed_length_sum), ())
-    assert int(rollout.completed_count) == 1
-    assert int(rollout.completed_length_sum) == 2
+    chex.assert_shape((rollout.episode_count, rollout.episode_return_sum, rollout.episode_length_sum), ())
+    assert int(rollout.episode_count) == 1
+    assert int(rollout.episode_length_sum) == 2
     np.testing.assert_array_equal(advanced.env_state.state.step_num, 0)
     _, logits, values = model.apply(
-        {"params": params}, rollout.batch.observations, rollout.batch.carry, rollout.batch.episode_starts
+        {"params": params}, rollout.batch.observations, rollout.batch.model_carry, rollout.batch.episode_starts
     )  # carry leaves: (1,2); (T=2,B=1,A); (T=2,B=1)
     assert logits.shape == (2, 1, env.num_actions)
     np.testing.assert_allclose(values, rollout.batch.values, atol=1e-5)

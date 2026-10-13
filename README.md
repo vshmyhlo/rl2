@@ -39,9 +39,8 @@ In Progress
 
 Solving sparse reward Atari environments, such as Montezuma’s Revenge.
 
-### Basic PPO for Atari
+### PPO with JAX-native environments
 
-...
 
 ## Useful links and references
 
@@ -64,3 +63,4 @@ Solving sparse reward Atari environments, such as Montezuma’s Revenge.
 | [Navix](https://github.com/epignatelli/navix) | **(jax env)** Accelerated MiniGrid environments implemented in JAX. |
 | [Kinetix](https://github.com/FLAIROx/Kinetix) | **(jax env)** JAX environments for RL on general 2D physics tasks. |
 | [JAXtari](https://github.com/k4ntz/JAXtari) | **(jax env)** GPU-accelerated Atari environments in JAX, with pixel and object observations and customizable game mechanics. |
+| [continual-foragax](https://pypi.org/project/continual-foragax/) | **(jax env)** JAX grid-world environments for continual learning, with customizable biomes, object placement, respawning, rewards, and multiple observation modalities. |

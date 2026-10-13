@@ -26,6 +26,7 @@ from rl2.lstm import initial_carry
 def test_cloud_filesystem_backend_on_startup(use_tf: str | None) -> None:
     # Use a fresh process because epath caches backend selection. Fake cloud I/O
     # and TensorFlow availability so this regression needs neither credentials nor TF.
+    # Check epath's backend calls; RLAX may independently import TensorFlow when installed.
     env = os.environ.copy()
     env.pop("EPATH_USE_TF", None)
     if use_tf is not None:
@@ -50,7 +51,6 @@ with (
     expected, unused = (tf_exists, gcsfs_exists) if sys.argv[1] == "true" else (gcsfs_exists, tf_exists)
     expected.assert_called_once_with("gs://bucket/run/checkpoints")
     unused.assert_not_called()
-assert "tensorflow" not in sys.modules
 """,
             use_tf or "default",
         ],
@@ -95,7 +95,7 @@ def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Confi
     progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 8, 12.5, 40)
     with ppo.checkpoint_manager(directory) as manager:
         assert ppo.restore_checkpoint(manager, state, config) is None
-        ppo.save_checkpoint(manager, progress._replace(iteration=1), config)
+        ppo.save_checkpoint(manager, progress._replace(rollout_count=1), config)
         manager.wait_until_finished()
         ppo.save_checkpoint(manager, progress, config)
     fresh = state.replace(
@@ -125,10 +125,10 @@ def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Confi
         chex.assert_trees_all_equal(jax.random.permutation(restored.key, 4), jax.random.permutation(progress.key, 4))
         gradients = {"weight": jnp.array([-0.1, 0.2])}
         chex.assert_trees_all_equal(
-            restored.state.apply_gradients(grads=gradients), state.apply_gradients(grads=gradients)
+            restored.train_state.apply_gradients(grads=gradients), state.apply_gradients(grads=gradients)
         )
         # Retention keeps two complete checkpoints, even after a manager restart.
-        ppo.save_checkpoint(manager, progress._replace(iteration=3), config)
+        ppo.save_checkpoint(manager, progress._replace(rollout_count=3), config)
         manager.wait_until_finished()
         assert manager.all_steps() == [2, 3]
     with ppo.checkpoint_manager(f"{config.log_dir}/different-run") as manager:
@@ -147,11 +147,11 @@ def test_checkpoint_preserves_episode_totals(config: ppo.Config, state: TrainSta
     assert "recent_lengths" not in metadata
     if version == 2:
         metadata.update(version=2, recent_returns=[2.0] * 100, recent_lengths=[3] * 100)
-    manager.latest_step.return_value = progress.iteration
+    manager.latest_step.return_value = progress.rollout_count
     manager.restore.side_effect = [SimpleNamespace(metadata=metadata), SimpleNamespace(state=saved.state.item)]
     restored = ppo.restore_checkpoint(manager, state, config)
     assert restored is not None
-    assert restored.training_length_sum == 305
+    assert restored.episode_length_sum == 305
     chex.assert_trees_all_equal(restored, progress)
 
 
@@ -184,6 +184,24 @@ def test_checkpoint_allows_reshaping_same_rollout_size(config: ppo.Config, state
     ]
     restored = ppo.restore_checkpoint(manager, state, replace(config, num_envs=2, num_steps=1))
     chex.assert_trees_all_equal(restored, progress)
+
+
+def test_checkpoint_rejects_changed_model_computation(config: ppo.Config, state: TrainState) -> None:
+    manager = Mock()
+    ppo.save_checkpoint(manager, ppo.TrainingProgress(state, jax.random.key(3), 2, 0, 0.0, 0), config)
+    saved = manager.save.call_args.kwargs["args"]
+    manager.latest_step.return_value = 2
+    manager.restore.side_effect = [
+        SimpleNamespace(metadata=json.loads(json.dumps(saved.metadata.item))),
+        SimpleNamespace(state=saved.state.item),
+    ]
+    # Intermediate resize factors can change computation without changing parameter shapes.
+    encoder = ppo.RGBEncoderConfig()
+    encoder = replace(encoder, stages=(replace(encoder.stages[0], resize_factor=1.0), *encoder.stages[1:]))
+    changed = replace(config, model=replace(config.model, encoder=encoder))
+    with pytest.raises(ValueError, match="different model settings"):
+        ppo.restore_checkpoint(manager, state, changed)
+    manager.restore.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -304,7 +322,7 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
 
     def update(
         state: TrainState, batch: ppo.PPOBatch, config: ppo.Config, iteration: int
-    ) -> tuple[TrainState, ppo.PPOMetrics]:
+    ) -> tuple[TrainState, ppo.MinibatchMetrics]:
         nonlocal clock, interrupted
         if iteration == 2 and not interrupted:
             interrupted = True
@@ -314,7 +332,7 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         iterations.append(iteration)
         chex.assert_shape(state.opt_state.hyperparams["learning_rate"], ())
         learning_rates.append(float(state.opt_state.hyperparams["learning_rate"]))
-        return state.apply_gradients(grads={"weight": jnp.ones(1)}), ppo.PPOMetrics(
+        return state.apply_gradients(grads={"weight": jnp.ones(1)}), ppo.MinibatchMetrics(
             policy_loss=jnp.asarray(0.0),  # ()
             value_loss=jnp.asarray(0.0),  # ()
             entropy_loss=jnp.asarray(0.0),  # ()
@@ -332,12 +350,12 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
     ) -> None:
         nonlocal checkpoint
         checkpoint = progress
-        assert isinstance(progress.completed_episodes, int)
-        assert isinstance(progress.training_return_sum, float)
-        assert isinstance(progress.training_length_sum, int)
-        saved_iterations.append(progress.iteration)
-        saved_return_sums.append(progress.training_return_sum)
-        saved_length_sums.append(progress.training_length_sum)
+        assert isinstance(progress.episode_count, int)
+        assert isinstance(progress.episode_return_sum, float)
+        assert isinstance(progress.episode_length_sum, int)
+        saved_iterations.append(progress.rollout_count)
+        saved_return_sums.append(progress.episode_return_sum)
+        saved_length_sums.append(progress.episode_length_sum)
 
     with (
         jax.disable_jit(),
@@ -404,6 +422,20 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         ppo.train(config)
         assert iterations == [0, 1, 2, 3]
         assert saved_iterations == [2, 3, 4]
+        # Long runs must retain small increments beyond float32 precision and int32 range.
+        assert checkpoint is not None
+        checkpoint = checkpoint._replace(
+            rollout_count=3,
+            episode_count=2**31 - 1,
+            episode_return_sum=float(2**24),
+            episode_length_sum=2**31 - 1,
+        )
+        ppo.train(config)
+        assert checkpoint.episode_count == 2**31
+        assert checkpoint.episode_return_sum == float(2**24 + 1)
+        assert checkpoint.episode_length_sum == 2**31
+        # Restoring these totals must also avoid narrowing them to device scalars.
+        ppo.train(config)
 
 
 def test_checkpoint_rejects_old_atari_environment(config: ppo.Config, state: TrainState) -> None:

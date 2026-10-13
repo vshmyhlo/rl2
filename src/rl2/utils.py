@@ -8,7 +8,7 @@ import gcsfs
 import jax
 import jax.numpy as jnp
 import numpy as np
-from numpy.typing import ArrayLike
+from numpy.typing import ArrayLike, NDArray
 
 
 @jax.jit
@@ -61,9 +61,9 @@ def gae(
 def explained_variance(
     values: jax.Array,  # (*S,)
     returns: jax.Array,  # (*S,)
-) -> float:
+) -> jax.Array:  # ()
     variance = jnp.var(returns)  # ()
-    return float(jnp.where(variance > 0, 1 - jnp.var(returns - values) / variance, jnp.nan))
+    return jnp.where(variance > 0, 1 - jnp.var(returns - values) / variance, jnp.nan)  # ()
 
 
 def read_bytes(path: str) -> bytes:
@@ -75,21 +75,22 @@ def read_bytes(path: str) -> bytes:
 def write_bytes(path: str, data: bytes) -> None:
     if path.startswith("gs://"):
         gcsfs.GCSFileSystem().pipe_file(path, data)
-    else:
-        destination = Path(path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        # Commit a whole checkpoint, never truncate the previous good file.
-        temporary: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=f".{destination.name}.", delete=False) as f:
-                temporary = Path(f.name)
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temporary, destination)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        return
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # Commit a whole checkpoint, never truncate the previous good file.
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=f".{destination.name}.", delete=False) as file:
+            temporary = Path(file.name)
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def read_optional(path: str) -> bytes | None:
@@ -104,19 +105,22 @@ class RunningMeanStd:
     """Host-side parallel moments, using float64 to accumulate long runs."""
 
     def __init__(self, shape: tuple[int, ...] = ()) -> None:
-        self.mean = np.zeros(shape, dtype=np.float64)
-        self.var = np.ones(shape, dtype=np.float64)
+        self.mean: NDArray[np.float64] = np.zeros(shape, dtype=np.float64)  # (*S,)
+        self.var: NDArray[np.float64] = np.ones(shape, dtype=np.float64)  # (*S,)
         self.count = 1e-4
 
-    def update(self, samples: ArrayLike) -> None:
-        samples = np.asarray(samples, dtype=np.float64)
-        if not len(samples):
+    def update(self, samples: ArrayLike) -> None:  # samples: (N, *S)
+        """Merge (N, *S) samples over the leading batch axis; S is the configured shape."""
+        samples = np.asarray(samples, dtype=np.float64)  # (N, *S)
+        batch_count = len(samples)
+        if batch_count == 0:
             return
-        batch_mean, batch_var = samples.mean(axis=0), samples.var(axis=0)
-        total = self.count + len(samples)
-        delta = batch_mean - self.mean
+        batch_mean = samples.mean(axis=0)  # (*S,)
+        batch_var = samples.var(axis=0)  # (*S,)
+        total = self.count + batch_count
+        delta = batch_mean - self.mean  # (*S,)
         self.var = (
-            self.var * self.count + batch_var * len(samples) + delta**2 * self.count * len(samples) / total
-        ) / total
-        self.mean += delta * len(samples) / total
+            self.var * self.count + batch_var * batch_count + delta**2 * self.count * batch_count / total
+        ) / total  # (*S,)
+        self.mean += delta * batch_count / total  # (*S,)
         self.count = total

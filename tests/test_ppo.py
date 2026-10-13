@@ -50,21 +50,23 @@ def test_batch_select_sequences_preserves_time_and_initial_memory(num_steps: int
         values=targets + 1.0,  # (T, B)
         advantages=targets + 2.0,  # (T, B)
         returns=targets + 3.0,  # (T, B)
-        carry=((memory, memory + 1), (memory + 2, memory + 3)),  # leaves: (B, D)
+        model_carry=((memory, memory + 1), (memory + 2, memory + 3)),  # leaves: (B, D)
         episode_starts=targets % 2 == 0,  # (T, B)
     )
     indices = jnp.asarray(selected)  # (M,)
     minibatch = batch.select_sequences(indices)  # sequences: (T, M, ...); memory: (M, D)
     for field in fields(batch):
-        if field.name == "carry":
+        if field.name == "model_carry":
             continue
         actual = getattr(minibatch, field.name)  # (T, M, ...)
         original = getattr(batch, field.name)  # (T, B, ...)
         assert actual.shape == (num_steps, len(selected), *original.shape[2:])
         assert actual.dtype == original.dtype
         np.testing.assert_array_equal(actual, np.take(original, selected, axis=1))
-    assert len(minibatch.carry) == 2
-    for actual, original in zip(jax.tree.leaves(minibatch.carry), jax.tree.leaves(batch.carry), strict=True):
+    assert len(minibatch.model_carry) == 2
+    for actual, original in zip(
+        jax.tree.leaves(minibatch.model_carry), jax.tree.leaves(batch.model_carry), strict=True
+    ):
         assert actual.shape == (len(selected), 2)
         np.testing.assert_array_equal(actual, np.take(original, selected, axis=0))
 
@@ -127,11 +129,11 @@ def test_clipped_policy_loss_and_gradient_direction(shape: tuple[int, ...]) -> N
         values=jnp.zeros(shape),  # (*S,)
         advantages=advantages,  # (*S,)
         returns=returns,  # (*S,)
-        carry=initial_carry(shape[-1], 1),  # leaves: (B, ...)
+        model_carry=initial_carry(shape[-1], 1),  # leaves: (B, ...)
         episode_starts=jnp.zeros(shape, dtype=bool),  # (*S,)
     )
     updated, metrics = update(state, batch, config)
-    assert isinstance(metrics, ppo.PPOMetrics)
+    assert isinstance(metrics, ppo.MinibatchMetrics)
     chex.assert_shape(jax.tree.leaves(metrics), ())
     normalized = advantages / advantages.std()  # (*S,)
     ratio = probabilities / 0.5  # (*S,)
@@ -176,7 +178,7 @@ def test_single_transition_keeps_policy_gradient() -> None:
         values=jnp.zeros((1, 1)),  # (*S,)
         advantages=jnp.ones((1, 1)),  # (*S,)
         returns=jnp.zeros((1, 1)),  # (*S,)
-        carry=initial_carry(1, 1),  # leaves: (B, ...)
+        model_carry=initial_carry(1, 1),  # leaves: (B, ...)
         episode_starts=jnp.ones((1, 1), dtype=bool),  # (*S,)
     )
     updated, metrics = update(state, batch, config)
@@ -274,7 +276,7 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
         values=values,  # (*S,)
         advantages=jnp.arange(6, dtype=jnp.float32).reshape(3, 2),  # (*S,)
         returns=jnp.ones((3, 2)),  # (*S,)
-        carry=model.initial_carry(2),  # leaves: (B, ...)
+        model_carry=model.initial_carry(2),  # leaves: (B, ...)
         episode_starts=starts,  # (*S,)
     )
     updated, metrics = update(state, batch, config)
@@ -467,7 +469,7 @@ def test_entropy_decay_scales_update_by_rollout() -> None:
         values=jnp.zeros(1),  # (*S,)
         advantages=jnp.zeros(1),  # (*S,)
         returns=jnp.zeros(1),  # (*S,)
-        carry=initial_carry(1, 1),  # leaves: (B, ...)
+        model_carry=initial_carry(1, 1),  # leaves: (B, ...)
         episode_starts=jnp.zeros(1, dtype=bool),  # (*S,)
     )
     entropy = -(probabilities * np.log(probabilities)).sum()
@@ -524,7 +526,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         batch: ppo.PPOBatch,  # obs: (T=1, B=1, O=1); targets/starts: (T, B); carry: pair of (B, H)
         config: ppo.Config,
         iteration: int,
-    ) -> tuple[TrainState, ppo.PPOMetrics]:
+    ) -> tuple[TrainState, ppo.MinibatchMetrics]:
         nonlocal clock
         chex.assert_shape(batch.observations, (1, 1, 1))
         chex.assert_shape((batch.actions, batch.old_log_probs, batch.advantages, batch.returns), (1, 1))
@@ -534,7 +536,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         clock = (30.0, 60.0, 80.0)[iteration]
         loss = next(losses)
         kl = 0.02 if iteration == 1 else 0.0
-        return state, ppo.PPOMetrics(
+        return state, ppo.MinibatchMetrics(
             policy_loss=jnp.asarray(loss),  # ()
             value_loss=jnp.asarray(loss * 2),  # ()
             entropy_loss=jnp.asarray(-config.entropy_coef * (1.0, 0.75, 0.25)[iteration] * loss * 3),  # ()
@@ -677,11 +679,11 @@ def test_video_schedule_uses_iterations(interval: int, expected_steps: list[int]
         batch: ppo.PPOBatch,  # observations: (T=1, B, O); targets/starts: (T, B); carry: pair of (B, H)
         config: ppo.Config,
         iteration: int,
-    ) -> tuple[TrainState, ppo.PPOMetrics]:
+    ) -> tuple[TrainState, ppo.MinibatchMetrics]:
         nonlocal clock
         # Uneven update times must not affect iteration-based recording.
         clock += (599.0, 1.0, 1.0, 599.0, 1.0)[iteration]
-        return state.replace(step=iteration + 1), ppo.PPOMetrics(
+        return state.replace(step=iteration + 1), ppo.MinibatchMetrics(
             policy_loss=jnp.asarray(0.0),  # ()
             value_loss=jnp.asarray(0.0),  # ()
             entropy_loss=jnp.asarray(0.0),  # ()
@@ -762,10 +764,10 @@ def test_train_evaluates_final_policy(
 
     def advance_update(
         state: TrainState, batch: ppo.PPOBatch, config: ppo.Config, iteration: int
-    ) -> tuple[TrainState, ppo.PPOMetrics]:
+    ) -> tuple[TrainState, ppo.MinibatchMetrics]:
         nonlocal clock
         clock += 60.0
-        return state.replace(step=iteration + 1), ppo.PPOMetrics(
+        return state.replace(step=iteration + 1), ppo.MinibatchMetrics(
             policy_loss=jnp.asarray(0.0),  # ()
             value_loss=jnp.asarray(0.0),  # ()
             entropy_loss=jnp.asarray(0.0),  # ()
@@ -841,7 +843,7 @@ def test_kl_rejects_update_without_changing_optimizer() -> None:
         values=jnp.zeros(2),  # (*S,)
         advantages=jnp.array([1.0, -1.0]),  # (*S,)
         returns=jnp.zeros(2),  # (*S,)
-        carry=initial_carry(2, 1),  # leaves: (B, ...)
+        model_carry=initial_carry(2, 1),  # leaves: (B, ...)
         episode_starts=jnp.zeros(2, dtype=bool),  # (*S,)
     )
     stopped, metrics = update(state, batch, config)
@@ -868,7 +870,7 @@ def test_policy_diagnostics() -> None:
         values=jnp.zeros(4),  # (*S,)
         advantages=jnp.arange(4.0),  # (*S,)
         returns=jnp.arange(4.0),  # (*S,)
-        carry=initial_carry(4, 1),  # leaves: (B, ...)
+        model_carry=initial_carry(4, 1),  # leaves: (B, ...)
         episode_starts=jnp.zeros(4, dtype=bool),  # (*S,)
     )
     _, metrics = update(state, batch, config)

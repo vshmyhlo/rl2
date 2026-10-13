@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -24,8 +25,9 @@ def test_gae_single_step_keeps_environments_independent() -> None:
 @pytest.mark.parametrize("shape", [(3,), (1, 3), (1,)], ids=["steps", "rollout", "single-return"])
 def test_explained_variance(shape: tuple[int, ...]) -> None:
     returns = jnp.arange(np.prod(shape), dtype=jnp.float32).reshape(shape)  # (*S,)
-    result = utils.explained_variance(returns, returns)
-    assert isinstance(result, float)
+    result = jax.jit(utils.explained_variance)(returns, returns)  # ()
+    assert result.shape == ()
+    assert result.dtype == jnp.float32
     if returns.size == 1:
         assert np.isnan(result)
         return
@@ -57,6 +59,39 @@ def test_checkpoint_io_preserves_previous_file_and_propagates_storage_errors(
     monkeypatch.setattr(utils, "read_bytes", denied)
     with pytest.raises(PermissionError, match="denied"):
         utils.read_optional("gs://bucket/run/checkpoint.msgpack")
+
+
+def test_local_storage_creates_parents_and_replaces_file(tmp_path: Path) -> None:
+    destination = tmp_path / "nested" / "checkpoint.msgpack"
+    utils.write_bytes(str(destination), b"old checkpoint")
+    assert utils.read_bytes(str(destination)) == b"old checkpoint"
+    utils.write_bytes(str(destination), b"new")
+    assert utils.read_optional(str(destination)) == b"new"
+    assert list(destination.parent.iterdir()) == [destination]
+
+
+@pytest.mark.parametrize("shape", [(), (2, 4)], ids=["scalar", "tensor"])
+def test_running_moments_shapes_and_empty_batches(shape: tuple[int, ...]) -> None:
+    moments = utils.RunningMeanStd(shape)
+    assert moments.mean.shape == moments.var.shape == shape
+    np.testing.assert_array_equal(moments.mean, np.zeros(shape))
+    np.testing.assert_array_equal(moments.var, np.ones(shape))
+    prior_count = moments.count
+
+    samples = np.stack([np.full(shape, 2), np.full(shape, 4)])  # (N, *S)
+    moments.update(samples)
+    total = prior_count + len(samples)
+    assert moments.count == total
+    assert moments.mean.shape == moments.var.shape == shape
+    assert moments.mean.dtype == moments.var.dtype == np.float64
+    np.testing.assert_allclose(moments.mean, 6 / total)
+    np.testing.assert_allclose(moments.var, (prior_count + 20) / total - (6 / total) ** 2)
+
+    mean, variance = jax.tree.map(np.copy, (moments.mean, moments.var))  # both (*S,)
+    moments.update(np.empty((0, *shape)))
+    np.testing.assert_array_equal(moments.mean, mean)
+    np.testing.assert_array_equal(moments.var, variance)
+    assert moments.count == total
 
 
 def test_gae_stops_at_game_over() -> None:

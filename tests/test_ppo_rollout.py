@@ -1,5 +1,6 @@
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import chex
 import jax
@@ -63,38 +64,41 @@ def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs:
     for result in (rollout, continued):
         chex.assert_shape(result.batch.observations, (num_steps, num_envs, 4, 10, 10))
         chex.assert_shape((result.batch.actions, result.batch.returns), (num_steps, num_envs))
-        chex.assert_shape((result.completed_count, result.completed_return_sum, result.completed_length_sum), ())
-        chex.assert_type((result.completed_count, result.completed_length_sum), jnp.int32)
-        chex.assert_type(result.completed_return_sum, jnp.float32)
+        chex.assert_shape((result.episode_count, result.episode_return_sum, result.episode_length_sum), ())
+        chex.assert_type((result.episode_count, result.episode_length_sum), jnp.int32)
+        chex.assert_type(result.episode_return_sum, jnp.float32)
         chex.assert_type(result.batch.observations, jnp.uint8)
         chex.assert_type(result.batch.actions, jnp.int32)
         # No brick hits within two steps. All boundaries here are timeouts.
         expected_count = num_envs * ((num_steps + (0 if result is rollout else num_steps % 2)) // 2)
-        assert int(result.completed_count) == expected_count
+        assert int(result.episode_count) == expected_count
         completes_initial_episodes = (result is rollout) == (num_steps > 1)
         expected_return = num_envs * (num_envs + 1) / 2 if completes_initial_episodes else 0
-        assert float(result.completed_return_sum) == expected_return
-        assert int(result.completed_length_sum) == 2 * expected_count
+        assert float(result.episode_return_sum) == expected_return
+        assert int(result.episode_length_sum) == 2 * expected_count
         expected_key = key if result is rollout else rollout.key  # ()
         for _ in range(num_steps):
             expected_key = jax.random.split(expected_key, 3)[0]  # ()
         chex.assert_trees_all_equal(result.key, expected_key)
-    np.testing.assert_array_equal(second.episode_lengths, 2 * num_steps % 2)
+    np.testing.assert_array_equal(second.episode_step_counts, 2 * num_steps % 2)
     np.testing.assert_array_equal(second.episode_starts, True)
     np.testing.assert_array_equal(continued.batch.returns[-1], 1.0)  # gamma * value(final), not zero
-    for leaf in jax.tree.leaves(second.carry):  # (B,1)
+    for leaf in jax.tree.leaves(second.model_carry):  # (B,1)
         np.testing.assert_array_equal(leaf, 2)
-    chex.assert_trees_all_equal(continued.batch.carry, first.carry)
-    np.testing.assert_array_equal(runner.episode_lengths, 0)
+    chex.assert_trees_all_equal(continued.batch.model_carry, first.model_carry)
+    np.testing.assert_array_equal(runner.episode_step_counts, 0)
 
 
-def test_rollout_and_update_with_real_breakout_model() -> None:
+def test_train_step_matches_separate_rollout_and_updates_with_real_model() -> None:
     config = replace(
         ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-        num_envs=1,
+        num_envs=2,
         num_steps=2,
-        num_minibatches=1,
-        update_epochs=1,
+        num_minibatches=2,
+        update_epochs=2,
+        total_steps=16,
+        anneal_lr=True,
+        entropy_decay="cosine",
         bf16=False,
         target_kl=None,
         model=ppo.ModelConfig(
@@ -104,19 +108,176 @@ def test_rollout_and_update_with_real_breakout_model() -> None:
     )
     env = GymnaxEnv(config.env_id)
     observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
-        jax.random.split(jax.random.key(0), 1), env.params
-    )  # (1,4,10,10); leaves: (1,...)
+        jax.random.split(jax.random.key(0), 2), env.params
+    )  # (B=2,4,10,10); leaves: (B,...)
     model = ppo.ActorCritic(3, config.model)
-    carry = model.initial_carry(1)  # leaves: (1,2)
-    starts = jnp.ones(1, bool)  # (1,)
+    carry = model.initial_carry(2)  # leaves: (B,2)
+    starts = jnp.ones(2, bool)  # (B,)
     params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]
-    state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(1e-3))
-    runner = ppo.RolloutCarry(env_state, observations, carry, starts, jnp.zeros(1), jnp.zeros(1, jnp.int32))
-    _, rollout = ppo.collect_rollout(runner, state, env, config, jax.random.key(2))
-    updated, metrics = ppo.update(state, rollout.batch, config)
-    assert int(updated.step) == 1
-    assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves((updated.params, metrics)))
-    assert any(not np.array_equal(a, b) for a, b in zip(jax.tree.leaves(state.params), jax.tree.leaves(updated.params)))
+    state = TrainState.create(
+        apply_fn=model.apply,
+        params=params,
+        tx=optax.inject_hyperparams(optax.adam)(learning_rate=config.learning_rate, eps=1e-5),
+    )
+    runner = ppo.RolloutCarry(env_state, observations, carry, starts, jnp.zeros(2), jnp.zeros(2, jnp.int32))
+    key = jax.random.key(2)  # ()
+    iteration = jnp.asarray(1)  # () nonzero iteration exercises schedule forwarding
+    result = ppo.train_step(runner, state, env, config, key, ppo.init_metrics(), iteration)
+    advanced, rollout = ppo.collect_rollout(runner, state, env, config, key)
+    expected = state.replace(
+        opt_state=state.opt_state._replace(
+            hyperparams={
+                **state.opt_state.hyperparams,
+                "learning_rate": ppo.learning_rate_schedule(config)(iteration),  # ()
+            }
+        )
+    )
+    expected_key = rollout.key  # ()
+    metrics: list[ppo.MinibatchMetrics] = []  # scalar leaves
+    for _ in range(config.update_epochs):
+        expected_key, shuffle_key = jax.random.split(expected_key)  # each ()
+        permutation = jax.random.permutation(shuffle_key, config.num_envs)  # (B,)
+        for indices in jnp.split(permutation, config.num_minibatches):  # (M=1,)
+            expected, update_metrics = ppo.update(expected, rollout.batch.select_sequences(indices), config, iteration)
+            metrics.append(update_metrics)
+
+    def sum_metrics(*leaves: jax.Array) -> jax.Array:  # each ()
+        return jnp.stack(leaves).sum(axis=0)  # ()
+
+    minibatch_metrics = jax.tree.map(sum_metrics, *metrics)  # scalar leaves
+    chex.assert_trees_all_close(result.train_state, expected, atol=1e-6)
+    chex.assert_trees_all_close(result.metrics.window.minibatch_metrics, minibatch_metrics, atol=1e-6)
+    chex.assert_trees_all_equal(result.rollout_carry, advanced)
+    chex.assert_trees_all_equal(result.key, expected_key)
+    chex.assert_shape(jax.tree.leaves(result.metrics.window.minibatch_metrics), ())
+    chex.assert_shape(jax.tree.leaves(result.metrics.window.rollout_metrics), ())
+    assert (
+        int(result.train_state.step)
+        == int(result.metrics.window.update_count)
+        == int(result.metrics.window.minibatch_count)
+        == 4
+    )
+    assert not bool(result.metrics.window.early_stop_count)
+    np.testing.assert_allclose(
+        result.metrics.window.rollout_metrics.explained_variance,
+        ppo.explained_variance(rollout.batch.values, rollout.batch.returns),
+    )
+    assert all(
+        np.isfinite(leaf).all()
+        for leaf in jax.tree.leaves((result.train_state.params, result.metrics.window.minibatch_metrics))
+    )
+    assert any(
+        not np.array_equal(a, b)
+        for a, b in zip(jax.tree.leaves(state.params), jax.tree.leaves(result.train_state.params))
+    )
+
+
+@pytest.mark.parametrize("reject_at", [0, 1, 2], ids=["first-minibatch", "mid-epoch", "next-epoch"])
+def test_train_step_stops_updates_and_rng_at_rejected_minibatch(reject_at: int) -> None:
+    config = replace(
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        num_envs=2,
+        num_steps=1,
+        num_minibatches=2,
+        update_epochs=2,
+        target_kl=0.01,
+    )
+    env = GymnaxEnv(config.env_id, max_steps_in_episode=1)
+    key = jax.random.key(0)  # ()
+    observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
+        jax.random.split(key, 2), env.params
+    )  # (B=2,4,10,10); leaves: (B,...)
+    memory = ppo.ActorCritic(3, ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))).initial_carry(
+        2
+    )  # leaves: (B,1)
+    runner = ppo.RolloutCarry(
+        env_state, observations, memory, jnp.ones(2, bool), jnp.array([1.0, 2.0]), jnp.zeros(2, jnp.int32)
+    )
+    state = TrainState.create(
+        apply_fn=policy, params={"weight": jnp.zeros(1)}, tx=optax.inject_hyperparams(optax.adam)(learning_rate=0.1)
+    )
+
+    def update(
+        state: TrainState,
+        batch: ppo.PPOBatch,  # observations: (T=1,M=1,4,10,10); targets: (T,M); memory: (M,1)
+        config: ppo.Config,
+        iteration: int | jax.Array,  # ()
+    ) -> tuple[TrainState, ppo.MinibatchMetrics]:
+        chex.assert_shape(batch.observations, (1, 1, 4, 10, 10))
+        rejected = state.step == reject_at  # ()
+        loss = jnp.asarray(state.step + 1, jnp.float32)  # ()
+        metrics = ppo.MinibatchMetrics(loss, loss, loss, loss, rejected.astype(jnp.float32), loss)
+        state = jax.lax.cond(rejected, lambda: state, lambda: state.apply_gradients(grads={"weight": jnp.ones(1)}))
+        return state, metrics
+
+    with patch.object(ppo, "update", side_effect=update):
+        result = ppo.train_step(runner, state, env, config, key, ppo.init_metrics())
+    assert int(result.train_state.step) == int(result.metrics.window.update_count) == reject_at
+    assert int(result.metrics.window.minibatch_count) == reject_at + 1
+    assert bool(result.metrics.window.early_stop_count)
+    assert float(result.metrics.window.minibatch_metrics.policy_loss) == (reject_at + 1) * (reject_at + 2) / 2
+    assert float(result.metrics.window.minibatch_metrics.approx_kl) == 1.0
+    expected = state.replace(
+        opt_state=state.opt_state._replace(
+            hyperparams={
+                **state.opt_state.hyperparams,
+                "learning_rate": jnp.asarray(config.learning_rate, jnp.float32),  # ()
+            }
+        )
+    )
+    for _ in range(reject_at):
+        expected = expected.apply_gradients(grads={"weight": jnp.ones(1)})
+    chex.assert_trees_all_close(result.train_state, expected)
+    expected_key = jax.random.split(key, 3)[0]  # () after the single rollout step
+    for _ in range(reject_at // config.num_minibatches + 1):
+        expected_key = jax.random.split(expected_key)[0]  # () one shuffle per started epoch
+    chex.assert_trees_all_equal(result.key, expected_key)
+    chex.assert_shape(result.rollout_carry.observations, (2, 4, 10, 10))
+    chex.assert_shape(jax.tree.leaves(result.rollout_carry.model_carry), (2, 1))
+    chex.assert_shape(jax.tree.leaves(result.metrics.window.minibatch_metrics), ())
+    chex.assert_shape(jax.tree.leaves(result.metrics), ())
+    assert int(result.metrics.total.episode_count) == int(result.metrics.total.episode_length_sum) == 2
+    assert float(result.metrics.total.episode_return_sum) == 3.0
+
+    if reject_at == 1:
+        # Exercise continued windows and resets once, including totals beyond 32-bit precision.
+        x64_enabled = jax.config.x64_enabled
+        metrics = ppo.init_metrics(ppo.TrainingProgress(state, key, 0, 2**31 - 1, float(2**24), 2**31 - 1))._replace(
+            window=result.metrics.window
+        )  # scalar leaves
+        with patch.object(ppo, "update", side_effect=update):
+            continued = ppo.train_step(runner, state, env, config, key, metrics)
+            window = continued.metrics.window  # scalar leaves
+            assert int(window.rollout_count) == int(window.early_stop_count) == int(window.update_count) == 2
+            assert (
+                int(window.minibatch_count)
+                == int(window.episodes.episode_count)
+                == int(window.episodes.episode_length_sum)
+                == 4
+            )
+            assert float(window.minibatch_metrics.policy_loss) == float(window.episodes.episode_return_sum) == 6.0
+            assert (
+                int(continued.metrics.total.episode_count)
+                == int(continued.metrics.total.episode_length_sum)
+                == 2**31 + 1
+            )
+            assert float(continued.metrics.total.episode_return_sum) == float(2**24 + 3)
+            chex.assert_type(
+                (continued.metrics.total.episode_count, continued.metrics.total.episode_length_sum), jnp.int64
+            )
+            chex.assert_type(continued.metrics.total.episode_return_sum, jnp.float64)
+            with jax.enable_x64():
+                reset = continued.metrics._replace(window=ppo.RunningSum.init(window))  # scalar leaves
+            assert all(float(leaf) == 0 for leaf in jax.tree.leaves(reset.window))
+            after_reset = ppo.train_step(runner, state, env, config, key, reset)
+        chex.assert_trees_all_close(after_reset.metrics.window, result.metrics.window)
+        assert (
+            int(after_reset.metrics.total.episode_count)
+            == int(after_reset.metrics.total.episode_length_sum)
+            == 2**31 + 3
+        )
+        assert float(after_reset.metrics.total.episode_return_sum) == float(2**24 + 6)
+        assert jax.config.x64_enabled == x64_enabled
 
 
 def test_terminal_and_timeout_targets_use_final_observations() -> None:
@@ -168,14 +329,14 @@ def test_terminal_and_timeout_targets_use_final_observations() -> None:
     advanced, rollout = ppo.collect_rollout(runner, state, env, config, jax.random.key(1))
     np.testing.assert_array_equal(rollout.batch.returns, [[0, 20.5, 0, 20.5]])
     np.testing.assert_array_equal(advanced.episode_starts, [True, True, True, False])
-    assert int(rollout.completed_count) == 3
-    assert float(rollout.completed_return_sum) == 3.0  # Excludes bootstrap values and unfinished returns.
-    assert int(rollout.completed_length_sum) == 5
+    assert int(rollout.episode_count) == 3
+    assert float(rollout.episode_return_sum) == 3.0  # Excludes bootstrap values and unfinished returns.
+    assert int(rollout.episode_length_sum) == 5
     np.testing.assert_array_equal(advanced.episode_returns, [0, 0, 0, 100])
     advanced, rollout = ppo.collect_rollout(advanced, state, env, config, rollout.key)
-    assert int(rollout.completed_count) == 1
-    assert float(rollout.completed_return_sum) == 100.0
-    assert int(rollout.completed_length_sum) == 2
+    assert int(rollout.episode_count) == 1
+    assert float(rollout.episode_return_sum) == 100.0
+    assert int(rollout.episode_length_sum) == 2
     np.testing.assert_array_equal(rollout.batch.episode_starts, [[True, True, True, False]])
-    for leaf in jax.tree.leaves(advanced.carry):  # (B,1)
+    for leaf in jax.tree.leaves(advanced.model_carry):  # (B,1)
         np.testing.assert_array_equal(leaf[:, 0], [1, 1, 1, 2])

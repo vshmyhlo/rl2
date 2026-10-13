@@ -1,5 +1,9 @@
 """Recurrent PPO for JAX-native environments with spatial encoders and an LSTM.
 
+Internal counters use *_count (batched counters: *_counts), zero-based positions
+use *_index, and accumulated values use *_sum or *_sums for pytrees.
+Configuration sizes retain num_* names; checkpoint keys and log tags remain stable.
+
 TensorBoard outputs use training environment steps as the global step.
 Metric names use total_ for all-training statistics and episodes for episode
 counts. Window statistics have no scope affix.
@@ -122,6 +126,7 @@ from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.model.encoders.rgb import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
 from rl2.model.encoders.xminigrid import XMiniGridEncoder
+from rl2.running_stats import RunningSum
 from rl2.utils import explained_variance, gae
 
 type RecurrentCarry = LSTMStackCarry
@@ -139,7 +144,7 @@ class PPOBatch:
         values: (*S,) rollout-time value predictions for explained variance.
         advantages: (*S,) unnormalized advantage estimates.
         returns: (*S,) value targets.
-        carry: (B, D) initial LSTM memory leaves, where D is model.recurrent.hidden_size.
+        model_carry: (B, D) initial LSTM memory leaves, where D is model.recurrent.hidden_size.
         episode_starts: (*S,) boolean episode reset flags.
     """
 
@@ -149,7 +154,7 @@ class PPOBatch:
     values: jax.Array  # (*S,)
     advantages: jax.Array  # (*S,)
     returns: jax.Array  # (*S,)
-    carry: RecurrentCarry  # leaves: (B, D), D is model.recurrent.hidden_size
+    model_carry: RecurrentCarry  # leaves: (B, D), D is model.recurrent.hidden_size
     episode_starts: jax.Array  # (*S,)
 
     def select_sequences(self, indices: jax.Array) -> Self:  # (M,) environment indices
@@ -157,9 +162,9 @@ class PPOBatch:
         return self.replace(
             **jax.tree.map(
                 itemgetter((slice(None), indices)),
-                {field.name: getattr(self, field.name) for field in fields(self) if field.name != "carry"},
+                {field.name: getattr(self, field.name) for field in fields(self) if field.name != "model_carry"},
             ),  # observations: (T, M, *O); other sequence fields: (T, M)
-            carry=jax.tree.map(itemgetter(indices), self.carry),  # leaves: (M, D)
+            model_carry=jax.tree.map(itemgetter(indices), self.model_carry),  # leaves: (M, D)
         )
 
 
@@ -169,18 +174,18 @@ class RolloutCarry(NamedTuple):
     Attributes:
         env_state: (B, ...) batched environment state leaves.
         observations: (B, *O) current observations with observation dimensions O.
-        carry: (B, D) LSTM memory leaves, where D is model.recurrent.hidden_size.
+        model_carry: (B, D) LSTM memory leaves, where D is model.recurrent.hidden_size.
         episode_starts: (B,) boolean episode reset flags.
         episode_returns: (B,) accumulated raw rewards for unfinished episodes.
-        episode_lengths: (B,) step counts for unfinished episodes.
+        episode_step_counts: (B,) step counts for unfinished episodes.
     """
 
     env_state: chex.ArrayTree  # leaves: (B, ...)
     observations: jax.Array  # (B, *O)
-    carry: RecurrentCarry  # leaves: (B, ...)
+    model_carry: RecurrentCarry  # leaves: (B, ...)
     episode_starts: jax.Array  # (B,)
     episode_returns: jax.Array  # (B,)
-    episode_lengths: jax.Array  # (B,)
+    episode_step_counts: jax.Array  # (B,)
 
 
 class RolloutResult(NamedTuple):
@@ -189,20 +194,20 @@ class RolloutResult(NamedTuple):
     Attributes:
         batch: (T, B, ...) time-major PPO arrays with (B, ...) initial memory leaves.
         key: () advanced typed PRNG key, also used for minibatch shuffling.
-        completed_return_sum: () sum of raw returns for completed episodes.
-        completed_length_sum: () sum of lengths for completed episodes.
-        completed_count: () number of completed episodes.
+        episode_return_sum: () sum of raw returns for completed episodes.
+        episode_length_sum: () sum of lengths for completed episodes.
+        episode_count: () number of completed episodes.
     """
 
-    batch: PPOBatch  # observations: (T, B, *O); targets/starts: (T, B); carry leaves: (B, ...)
+    batch: PPOBatch  # observations: (T, B, *O); targets/starts: (T, B); model_carry leaves: (B, ...)
     key: jax.Array  # () typed PRNG key
-    completed_return_sum: jax.Array  # ()
-    completed_length_sum: jax.Array  # ()
-    completed_count: jax.Array  # ()
+    episode_return_sum: jax.Array  # ()
+    episode_length_sum: jax.Array  # ()
+    episode_count: jax.Array  # ()
 
 
 @struct.dataclass
-class PPOMetrics:
+class MinibatchMetrics:
     """Scalar diagnostics for one evaluated minibatch, including KL-rejected updates."""
 
     policy_loss: jax.Array  # ()
@@ -211,6 +216,45 @@ class PPOMetrics:
     entropy: jax.Array  # ()
     approx_kl: jax.Array  # ()
     clip_fraction: jax.Array  # ()
+
+
+@struct.dataclass
+class RolloutMetrics:
+    """Scalar diagnostics for one full rollout batch."""
+
+    explained_variance: jax.Array  # ()
+
+
+class EpisodeMetrics(NamedTuple):
+    """Completed-episode statistics, reduced from (B,) leaves to () aggregates."""
+
+    episode_count: jax.Array  # () or (B,) before reduction
+    episode_return_sum: jax.Array  # () or (B,) before reduction
+    episode_length_sum: jax.Array  # () or (B,) before reduction
+
+
+class WindowMetrics(NamedTuple):
+    episodes: EpisodeMetrics  # scalar leaves
+    minibatch_metrics: MinibatchMetrics  # scalar leaves, including KL-rejected minibatches
+    rollout_metrics: RolloutMetrics  # scalar leaves, summed over rollouts
+    minibatch_count: jax.Array  # () evaluated minibatches
+    rollout_count: jax.Array  # () completed rollouts
+    update_count: jax.Array  # () accepted minibatches
+    early_stop_count: jax.Array  # () rollouts stopped by the KL threshold
+
+
+class TrainingMetrics(NamedTuple):
+    window: WindowMetrics  # scalar leaves
+    total: EpisodeMetrics  # scalar leaves
+
+
+class TrainStepResult(NamedTuple):
+    """Advanced training state and accumulated metrics."""
+
+    train_state: TrainState
+    rollout_carry: RolloutCarry  # observations: (B, *O); state/memory leaves: (B, ...)
+    key: jax.Array  # () typed PRNG key
+    metrics: TrainingMetrics  # scalar leaves
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -318,12 +362,34 @@ def make_env(config: Config) -> PPOEnv:
 
 
 class TrainingProgress(NamedTuple):
-    state: TrainState
+    train_state: TrainState
     key: jax.Array  # () typed PRNG key
-    iteration: int  # Number of completed rollouts, independent of optimizer steps.
-    completed_episodes: int
-    training_return_sum: float
-    training_length_sum: int
+    rollout_count: int  # Number of completed rollouts, independent of optimizer steps.
+    episode_count: int
+    episode_return_sum: float
+    episode_length_sum: int
+
+
+def init_metrics(progress: TrainingProgress | None = None) -> TrainingMetrics:
+    """Initialize () metric leaves, preserving restored totals with 64-bit dtypes."""
+    with jax.enable_x64():
+        total = EpisodeMetrics(
+            episode_count=jnp.asarray(progress.episode_count if progress else 0, dtype=jnp.int64),  # ()
+            episode_return_sum=jnp.asarray(progress.episode_return_sum if progress else 0.0, dtype=jnp.float64),  # ()
+            episode_length_sum=jnp.asarray(progress.episode_length_sum if progress else 0, dtype=jnp.int64),  # ()
+        )
+        window = WindowMetrics(
+            episodes=RunningSum.init(total),  # scalar leaves
+            minibatch_metrics=MinibatchMetrics(
+                **{field.name: jnp.zeros((), jnp.float64) for field in fields(MinibatchMetrics)}
+            ),
+            rollout_metrics=RolloutMetrics(explained_variance=jnp.zeros((), jnp.float64)),  # scalar leaves
+            minibatch_count=jnp.zeros((), jnp.int64),  # ()
+            rollout_count=jnp.zeros((), jnp.int64),  # ()
+            update_count=jnp.zeros((), jnp.int64),  # ()
+            early_stop_count=jnp.zeros((), jnp.int64),  # ()
+        )
+    return TrainingMetrics(window, total)  # scalar leaves
 
 
 def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
@@ -340,17 +406,17 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
     """Save a completed rollout; live environment state is deliberately restarted on resume."""
     key_data = jax.random.key_data(progress.key)  # (K,) raw PRNG words
     manager.save(
-        progress.iteration,
+        progress.rollout_count,
         args=ocp.args.Composite(
-            state=ocp.args.StandardSave({"train_state": progress.state, "key": key_data}),
+            state=ocp.args.StandardSave({"train_state": progress.train_state, "key": key_data}),
             metadata=ocp.args.JsonSave(
                 {
                     "version": 3,
                     "config": asdict(config),
-                    "iteration": progress.iteration,
-                    "completed_episodes": progress.completed_episodes,
-                    "training_return_sum": progress.training_return_sum,
-                    "training_length_sum": progress.training_length_sum,
+                    "iteration": progress.rollout_count,
+                    "completed_episodes": progress.episode_count,
+                    "training_return_sum": progress.episode_return_sum,
+                    "training_length_sum": progress.episode_length_sum,
                 }
             ),
         ),
@@ -358,18 +424,22 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
     )
 
 
-def restore_checkpoint(manager: ocp.CheckpointManager, state: TrainState, config: Config) -> TrainingProgress | None:
-    iteration = manager.latest_step()
-    if iteration is None:
+def restore_checkpoint(
+    manager: ocp.CheckpointManager, train_state: TrainState, config: Config
+) -> TrainingProgress | None:
+    rollout_count = manager.latest_step()
+    if rollout_count is None:
         return None
-    metadata = manager.restore(iteration, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
+    metadata = manager.restore(rollout_count, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
     if metadata["version"] not in (1, 2, 3):
         raise ValueError("Unsupported PPO checkpoint version")
-    if metadata["iteration"] != iteration or iteration < 0 or metadata["completed_episodes"] < 0:
+    if metadata["iteration"] != rollout_count or rollout_count < 0 or metadata["completed_episodes"] < 0:
         raise ValueError("Invalid PPO checkpoint progress")
     saved_config = metadata["config"]
     if saved_config.get("env_id", config.env_id) != config.env_id:
         raise ValueError("Cannot resume PPO with a different environment; use a new run directory")
+    if "model" in saved_config and ModelConfig(**saved_config["model"]) != config.model:
+        raise ValueError("Cannot resume PPO with different model settings; use a new run directory")
     if config.env_id == "Kinetix" and KinetixConfig(**saved_config.get("kinetix", {})) != config.kinetix:
         raise ValueError("Cannot resume PPO with different kinetix settings; use a new run directory")
     if config.env_id == "XLand-MiniGrid" and XMiniGridConfig(**saved_config.get("xminigrid", {})) != config.xminigrid:
@@ -387,11 +457,11 @@ def restore_checkpoint(manager: ocp.CheckpointManager, state: TrainState, config
         if metadata.get(field) is None:
             raise ValueError(f"PPO checkpoint requires {field}; use a new run directory")
     restored = manager.restore(
-        iteration,
+        rollout_count,
         args=ocp.args.Composite(
             state=ocp.args.StandardRestore(
                 {
-                    "train_state": state,
+                    "train_state": train_state,
                     "key": jax.random.key_data(jax.random.key(config.seed)),
                 }
             )
@@ -401,7 +471,7 @@ def restore_checkpoint(manager: ocp.CheckpointManager, state: TrainState, config
     return TrainingProgress(
         restored["train_state"],
         jax.random.wrap_key_data(restored["key"]),
-        iteration,
+        rollout_count,
         metadata["completed_episodes"],
         metadata["training_return_sum"],
         metadata["training_length_sum"],
@@ -416,17 +486,17 @@ def load_config(path: str | Path) -> Config:
 def learning_rate_schedule(config: Config) -> optax.Schedule:
     if not config.anneal_lr:
         return optax.constant_schedule(config.learning_rate)
-    num_rollouts = config.total_steps // (config.num_envs * config.num_steps)
+    planned_rollout_count = config.total_steps // (config.num_envs * config.num_steps)
     if config.lr_decay == "cosine":
-        return optax.cosine_decay_schedule(config.learning_rate, num_rollouts)
-    return optax.linear_schedule(config.learning_rate, 0.0, num_rollouts)
+        return optax.cosine_decay_schedule(config.learning_rate, planned_rollout_count)
+    return optax.linear_schedule(config.learning_rate, 0.0, planned_rollout_count)
 
 
 def entropy_coef_schedule(config: Config) -> optax.Schedule:
     if config.entropy_decay == "constant":
         return optax.constant_schedule(config.entropy_coef)
-    num_rollouts = config.total_steps // (config.num_envs * config.num_steps)
-    return optax.cosine_decay_schedule(config.entropy_coef, num_rollouts)
+    planned_rollout_count = config.total_steps // (config.num_envs * config.num_steps)
+    return optax.cosine_decay_schedule(config.entropy_coef, planned_rollout_count)
 
 
 class ActorCritic(nn.Module):
@@ -494,31 +564,31 @@ class ActorCritic(nn.Module):
     def __call__(
         self,
         obs: jax.Array,  # (T, B, *O): RGB (F,H,W[,3]) or categorical (H,W,2)
-        carry: RecurrentCarry,  # leaves: (B, ...)
+        model_carry: RecurrentCarry,  # leaves: (B, ...)
         episode_starts: jax.Array,  # (T, B)
-    ) -> tuple[RecurrentCarry, jax.Array, jax.Array]:  # carry leaves: (B, ...); (T, B, A); (T, B)
+    ) -> tuple[RecurrentCarry, jax.Array, jax.Array]:  # model_carry leaves: (B, ...); (T, B, A); (T, B)
         """Process obs: (T, B, *O) observations and episode_starts: (T, B) reset masks."""
         chex.assert_rank(obs, {5, 6})
-        steps, environments = obs.shape[:2]
+        step_count, env_count = obs.shape[:2]
         x = self._encode(obs.reshape((-1, *obs.shape[2:])))  # (T * B, D)
-        x = x.reshape((steps, environments, -1))  # (T, B, D)
+        x = x.reshape((step_count, env_count, -1))  # (T, B, D)
         # Batch the CNN and heads across time; the LSTM handles its recurrence.
-        carry, x = self.recurrent(x, carry, episode_starts)  # carry leaves: (B, ...); x: (T, B, D)
+        model_carry, x = self.recurrent(x, model_carry, episode_starts)  # model_carry leaves: (B, ...); x: (T, B, D)
         logits, values = self._heads(x)  # (T, B, A), (T, B)
-        return carry, logits, values  # carry leaves: (B, ...); (T, B, A); (T, B)
+        return model_carry, logits, values  # model_carry leaves: (B, ...); (T, B, A); (T, B)
 
     def step(
         self,
         obs: jax.Array,  # (B, *O): RGB (F,H,W[,3]) or categorical (H,W,2)
-        carry: RecurrentCarry,  # leaves: (B, ...)
+        model_carry: RecurrentCarry,  # leaves: (B, ...)
         episode_starts: jax.Array,  # (B,)
-    ) -> tuple[RecurrentCarry, jax.Array, jax.Array]:  # carry leaves: (B, ...); (B, A); (B,)
+    ) -> tuple[RecurrentCarry, jax.Array, jax.Array]:  # model_carry leaves: (B, ...); (B, A); (B,)
         """Process obs: (B, *O) observations and episode_starts: (B,) reset masks."""
         chex.assert_rank(obs, {4, 5})
         x = self._encode(obs)  # (B, D)
-        carry, x = self.recurrent.step(x, carry, episode_starts)  # carry leaves: (B, ...); x: (B, D)
+        model_carry, x = self.recurrent.step(x, model_carry, episode_starts)  # model_carry leaves: (B, ...); x: (B, D)
         logits, values = self._heads(x)  # (B, A), (B,)
-        return carry, logits, values  # carry leaves: (B, ...); (B, A); (B,)
+        return model_carry, logits, values  # model_carry leaves: (B, ...); (B, A); (B,)
 
 
 def action_log_prob(
@@ -529,7 +599,7 @@ def action_log_prob(
 
 
 def play_episode(
-    state: TrainState,
+    train_state: TrainState,
     config: Config,
     key: jax.Array,  # () typed PRNG key
     initial_carry: RecurrentCarry,  # leaves: (1, ...)
@@ -546,106 +616,110 @@ def play_episode(
     if record:
         frames.append(np.asarray(env.render(env_state)))
     episode_return = 0.0
-    length = 0
-    apply_step = jax.jit(state.apply_fn, static_argnames=("method",))
+    episode_step_count = 0
+    apply_step = jax.jit(train_state.apply_fn, static_argnames=("method",))
     while not (stop_at_frame_limit and config.video_max_frames is not None and len(frames) >= config.video_max_frames):
         key, action_key, env_key = jax.random.split(key, 3)  # each () typed PRNG key
         memory, logits, _ = apply_step(
-            {"params": state.params}, observation[None], memory, jnp.full(1, length == 0, dtype=bool), method="step"
+            {"params": train_state.params},
+            observation[None],
+            memory,
+            jnp.full(1, episode_step_count == 0, dtype=bool),
+            method="step",
         )  # memory leaves: (1, ...); logits: (1, A); values: (1,)
         actions = jax.random.categorical(action_key, logits)  # (1,)
-        observation, env_state, reward, done, info = env.step(env_key, env_state, actions[0], env.params)
-        # observation: (*O,); state leaves: (...); reward/done: (); info final_observation: (*O,)
+        observation, env_state, reward, episode_end, info = env.step(env_key, env_state, actions[0], env.params)
+        # observation: (*O,); state leaves: (...); reward/episode_end: (); final_observation: (*O,)
         episode_return += float(reward)
-        length += 1
+        episode_step_count += 1
         if record and (config.video_max_frames is None or len(frames) < config.video_max_frames):
             frames.append(np.asarray(env.render(info["final_state"])))
-        if bool(done):
+        if bool(episode_end):
             break
-    return episode_return, length, frames
+    return episode_return, episode_step_count, frames
 
 
 def log_video(
-    state: TrainState,
+    train_state: TrainState,
     config: Config,
     writer: SummaryWriter,
-    episode: int,
-    steps: int,
+    episode_count: int,
+    step_count: int,
     *,
     initial_carry: RecurrentCarry,  # leaves: (1, ...)
 ) -> None:
     _, _, frames = play_episode(
-        state,
+        train_state,
         config,
-        jax.random.fold_in(jax.random.key(config.seed), episode),
+        jax.random.fold_in(jax.random.key(config.seed), episode_count),
         initial_carry,
         record=True,
         stop_at_frame_limit=True,
         env=make_env(config),
     )
     video = np.stack(frames).transpose(0, 3, 1, 2)[None]  # (1, T, 3, H, W)
-    writer.add_video("gameplay", video, steps, fps=config.video_fps)
-    print(f"Recorded {len(frames)} gameplay frames after {episode} training episodes", flush=True)
+    writer.add_video("gameplay", video, step_count, fps=config.video_fps)
+    print(f"Recorded {len(frames)} gameplay frames after {episode_count} training episodes", flush=True)
 
 
 def log_evaluation(
-    state: TrainState,
+    train_state: TrainState,
     config: Config,
     writer: SummaryWriter,
-    episode: int,
-    steps: int,
+    episode_count: int,
+    step_count: int,
     *,
     initial_carry: RecurrentCarry,  # leaves: (1, ...)
 ) -> None:
     """Evaluate fixed environment seeds, log raw scores, and record the last episode."""
     started = monotonic()
-    episodes: list[dict[str, float | int]] = []
+    episode_results: list[dict[str, float | int]] = []
     env = make_env(config)
-    for index in range(config.eval_episodes):
-        score, length, frames = play_episode(
-            state,
+    for episode_index in range(config.eval_episodes):
+        episode_return, episode_step_count, frames = play_episode(
+            train_state,
             config,
-            jax.random.fold_in(jax.random.key(config.eval_seed), index),
+            jax.random.fold_in(jax.random.key(config.eval_seed), episode_index),
             initial_carry,
-            record=index == config.eval_episodes - 1,
+            record=episode_index == config.eval_episodes - 1,
             env=env,
         )
-        episodes.append({"return": score, "length": length})
+        episode_results.append({"return": episode_return, "length": episode_step_count})
         if frames:
             video = np.stack(frames).transpose(0, 3, 1, 2)[None]  # (1, T, 3, H, W)
-            writer.add_video("eval/gameplay", video, steps, fps=config.video_fps)
-    returns = np.array([result["return"] for result in episodes])  # (E,), E evaluation episodes
+            writer.add_video("eval/gameplay", video, step_count, fps=config.video_fps)
+    returns = np.array([result["return"] for result in episode_results])  # (E,), E evaluation episodes
     std = float(returns.std(ddof=1)) if config.eval_episodes > 1 else None
     result = {
         "env_id": config.env_id,
         "return_mean": float(returns.mean()),
         "return_std": std,
         "return_sem": std / sqrt(config.eval_episodes) if std is not None else None,
-        "episodes": episodes,
+        "episodes": episode_results,
         "eval_seed": config.eval_seed,
         "training_config": asdict(config),
-        "training_steps": steps,
-        "training_episodes": episode,
+        "training_steps": step_count,
+        "training_episodes": episode_count,
     }
     for name in ("return_mean", "return_std", "return_sem"):
         if result[name] is not None:
-            writer.add_scalar(f"eval/{name}", result[name], steps)
-    writer.add_scalar("eval/total_training_episodes", episode, steps)
-    writer.add_scalar("time/evaluation_seconds", monotonic() - started, steps)
-    writer.add_text("eval/report", f"```json\n{json.dumps(result, indent=2, allow_nan=False)}\n```", steps)
+            writer.add_scalar(f"eval/{name}", result[name], step_count)
+    writer.add_scalar("eval/total_training_episodes", episode_count, step_count)
+    writer.add_scalar("time/evaluation_seconds", monotonic() - started, step_count)
+    writer.add_text("eval/report", f"```json\n{json.dumps(result, indent=2, allow_nan=False)}\n```", step_count)
     print(f"Evaluation: return={result['return_mean']:.1f} over {config.eval_episodes} games", flush=True)
 
 
 @partial(jax.jit, static_argnames="config")
 def update(
-    state: TrainState,
-    batch: PPOBatch,  # observations: (*S, *O); targets/starts: (*S,); carry leaves: (B, ...)
+    train_state: TrainState,
+    batch: PPOBatch,  # observations: (*S, *O); targets/starts: (*S,); model_carry leaves: (B, ...)
     config: Config,
-    iteration: int | jax.Array = 0,  # ()
-) -> tuple[TrainState, PPOMetrics]:
-    iteration = jnp.asarray(iteration)  # ()
-    chex.assert_type(iteration, int)
-    entropy_coef = jnp.asarray(entropy_coef_schedule(config)(iteration), dtype=jnp.float32)  # ()
+    rollout_index: int | jax.Array = 0,  # () zero-based rollout position for schedules
+) -> tuple[TrainState, MinibatchMetrics]:
+    rollout_index = jnp.asarray(rollout_index)  # ()
+    chex.assert_type(rollout_index, int)
+    entropy_coef = jnp.asarray(entropy_coef_schedule(config)(rollout_index), dtype=jnp.float32)  # ()
     advantages = batch.advantages  # (*S,)
     chex.assert_type(batch.actions, int)
     chex.assert_scalar_positive(advantages.size)
@@ -653,10 +727,10 @@ def update(
     if advantages.size > 1:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # (*S,)
 
-    def loss_fn(params: optax.Params) -> tuple[jax.Array, PPOMetrics]:  # (); scalar metric leaves
-        _, logits, values = state.apply_fn(
-            {"params": params}, batch.observations, batch.carry, batch.episode_starts
-        )  # carry leaves: (B, ...); logits: (*S, A); values: (*S,)
+    def loss_fn(params: optax.Params) -> tuple[jax.Array, MinibatchMetrics]:  # (); scalar metric leaves
+        _, logits, values = train_state.apply_fn(
+            {"params": params}, batch.observations, batch.model_carry, batch.episode_starts
+        )  # model_carry leaves: (B, ...); logits: (*S, A); values: (*S,)
         log_probs = action_log_prob(logits, batch.actions)  # (*S,)
         log_ratio = log_probs - batch.old_log_probs  # (*S,)
         ratio = jnp.exp(log_ratio)  # (*S,)
@@ -668,7 +742,7 @@ def update(
         loss = policy_loss + config.value_coef * value_loss + entropy_loss  # ()
         approx_kl = (jnp.expm1(log_ratio) - log_ratio).mean()  # ()
         clip_fraction = (jnp.abs(ratio - 1) > config.clip_coef).mean()  # ()
-        return loss, PPOMetrics(
+        return loss, MinibatchMetrics(
             policy_loss=policy_loss,  # ()
             value_loss=value_loss,  # ()
             entropy_loss=entropy_loss,  # ()
@@ -677,15 +751,15 @@ def update(
             clip_fraction=clip_fraction,  # ()
         )  # loss: (); metrics: scalar leaves
 
-    (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(train_state.params)
     if config.target_kl is None:
-        return state.apply_gradients(grads=grads), metrics
-    state = jax.lax.cond(
+        return train_state.apply_gradients(grads=grads), metrics
+    train_state = jax.lax.cond(
         metrics.approx_kl > config.target_kl,
-        lambda: state,
-        lambda: state.apply_gradients(grads=grads),
+        lambda: train_state,
+        lambda: train_state.apply_gradients(grads=grads),
     )
-    return state, metrics
+    return train_state, metrics
 
 
 @partial(jax.jit, static_argnames=("envs", "config"))
@@ -705,7 +779,7 @@ def collect_rollout(
     class Runner(NamedTuple):
         current: RolloutCarry  # state leaves: (B, ...)
         key: jax.Array  # () typed PRNG key
-        completed: tuple[jax.Array, jax.Array, jax.Array]  # each () return sum, length sum, count
+        episode_metrics: EpisodeMetrics  # scalar leaves
 
     class Transition(NamedTuple):
         """S is (B,) per step or (T, B) after scanning."""
@@ -715,28 +789,28 @@ def collect_rollout(
         log_probs: jax.Array  # (*S,)
         values: jax.Array  # (*S,)
         rewards: jax.Array  # (*S,)
-        dones: jax.Array  # (*S,)
+        episode_ends: jax.Array  # (*S,)
         episode_starts: jax.Array  # (*S,)
 
     def step(
         runner: Runner,  # state leaves: (B, ...); key/completed totals: ()
         _: None,
     ) -> tuple[Runner, Transition]:
-        current, key, completed = runner  # state leaves: (B, ...); key/completed totals: ()
+        current, key, episode_metrics = runner  # state leaves: (B, ...); key/completed totals: ()
         key, action_key, env_key = jax.random.split(key, 3)  # each () typed PRNG key
         memory, logits, predictions = train_state.apply_fn(
             {"params": train_state.params},
             current.observations,
-            current.carry,
+            current.model_carry,
             current.episode_starts,
             method="step",
         )  # memory leaves: (B, ...); logits: (B, A); predictions: (B,)
         actions = jax.random.categorical(action_key, logits)  # (B,)
         log_probs = action_log_prob(logits, actions)  # (B,)
         env_keys = jax.random.split(env_key, config.num_envs)  # (B,) typed PRNG keys
-        observations, env_state, raw_rewards, done, info = jax.vmap(envs.step, in_axes=(0, 0, 0, None))(
+        observations, env_state, raw_rewards, episode_ends, info = jax.vmap(envs.step, in_axes=(0, 0, 0, None))(
             env_keys, current.env_state, actions, envs.params
-        )  # observations: (B,*O); state leaves: (B,...); rewards/done/flags: (B,); final_observation: (B,*O)
+        )  # observations: (B,*O); state leaves: (B,...); rewards/episode_ends/flags: (B,); final_observation: (B,*O)
         timeout = info["truncated"] & ~info["terminated"]  # (B,)
 
         def bootstrap(_: None) -> jax.Array:
@@ -754,57 +828,60 @@ def collect_rollout(
 
         rewards = raw_rewards + config.gamma * jax.lax.cond(timeout.any(), bootstrap, no_bootstrap, None)  # (B,)
         episode_returns = current.episode_returns + raw_rewards  # (B,)
-        episode_lengths = current.episode_lengths + 1  # (B,)
-        completed = jax.tree.map(
-            jnp.add,
-            completed,
+        episode_step_counts = current.episode_step_counts + 1  # (B,)
+        episode_metrics = RunningSum.update(
+            episode_metrics,
             jax.tree.map(
                 jnp.sum,
-                (
-                    jnp.where(done, episode_returns, 0.0),  # (B,)
-                    jnp.where(done, episode_lengths, 0),  # (B,)
-                    done,  # (B,)
+                EpisodeMetrics(
+                    episode_count=episode_ends,  # (B,)
+                    episode_return_sum=jnp.where(episode_ends, episode_returns, 0.0),  # (B,)
+                    episode_length_sum=jnp.where(episode_ends, episode_step_counts, 0),  # (B,)
                 ),
             ),
         )  # each ()
         advanced = RolloutCarry(
             env_state=env_state,  # leaves: (B, ...)
             observations=observations,  # (B, *O)
-            carry=memory,  # leaves: (B, ...)
-            episode_starts=done,  # (B,)
-            episode_returns=jnp.where(done, 0.0, episode_returns),  # (B,)
-            episode_lengths=jnp.where(done, 0, episode_lengths),  # (B,)
+            model_carry=memory,  # leaves: (B, ...)
+            episode_starts=episode_ends,  # (B,)
+            episode_returns=jnp.where(episode_ends, 0.0, episode_returns),  # (B,)
+            episode_step_counts=jnp.where(episode_ends, 0, episode_step_counts),  # (B,)
         )
-        return Runner(advanced, key, completed), Transition(
+        return Runner(advanced, key, episode_metrics), Transition(
             observations=current.observations,  # (B, *O)
             actions=actions,  # (B,)
             log_probs=log_probs,  # (B,)
             values=predictions,  # (B,)
             rewards=rewards,  # (B,)
-            dones=done,  # (B,)
+            episode_ends=episode_ends,  # (B,)
             episode_starts=current.episode_starts,  # (B,)
         )
 
-    completed = jax.tree.map(
-        jnp.zeros_like,
+    episode_metrics = RunningSum.init(
         jax.tree.map(
-            jnp.sum, (rollout_carry.episode_returns, rollout_carry.episode_lengths, rollout_carry.episode_starts)
+            jnp.sum,
+            EpisodeMetrics(
+                episode_count=rollout_carry.episode_starts,  # (B,)
+                episode_return_sum=rollout_carry.episode_returns,  # (B,)
+                episode_length_sum=rollout_carry.episode_step_counts,  # (B,)
+            ),
         ),
     )  # each ()
-    (advanced, key, completed), trajectory = jax.lax.scan(
-        step, Runner(rollout_carry, key, completed), None, length=config.num_steps
+    (advanced, key, episode_metrics), trajectory = jax.lax.scan(
+        step, Runner(rollout_carry, key, episode_metrics), None, length=config.num_steps
     )
     # observations: (T, B, *O); other trajectory arrays: (T, B)
     # Peek at the next value without advancing the rollout's recurrent state.
     next_value = train_state.apply_fn(
         {"params": train_state.params},
         advanced.observations,
-        advanced.carry,
+        advanced.model_carry,
         advanced.episode_starts,
         method="step",
     )[2]  # (B,)
     advantages, returns = gae(
-        trajectory.rewards, trajectory.dones, trajectory.values, next_value, config.gamma, config.gae_lambda
+        trajectory.rewards, trajectory.episode_ends, trajectory.values, next_value, config.gamma, config.gae_lambda
     )  # each (T, B)
     batch = PPOBatch(
         observations=trajectory.observations,  # (T, B, *O)
@@ -813,11 +890,111 @@ def collect_rollout(
         values=trajectory.values,  # (T, B)
         advantages=advantages,  # (T, B)
         returns=returns,  # (T, B)
-        carry=rollout_carry.carry,  # leaves: (B, ...)
+        model_carry=rollout_carry.model_carry,  # leaves: (B, ...)
         episode_starts=trajectory.episode_starts,  # (T, B)
     )
-    completed_return_sum, completed_length_sum, completed_count = completed  # each ()
-    return advanced, RolloutResult(batch, key, completed_return_sum, completed_length_sum, completed_count)
+    return advanced, RolloutResult(
+        batch=batch,  # observations: (T, B, *O); targets/starts: (T, B); model_carry leaves: (B, ...)
+        key=key,  # ()
+        episode_return_sum=episode_metrics.episode_return_sum,  # ()
+        episode_length_sum=episode_metrics.episode_length_sum,  # ()
+        episode_count=episode_metrics.episode_count,  # ()
+    )
+
+
+@partial(jax.jit, static_argnames=("envs", "config"))
+def train_step(
+    rollout_carry: RolloutCarry,  # observations: (B, *O); state/memory leaves: (B, ...)
+    train_state: TrainState,
+    envs: PPOEnv,
+    config: Config,
+    key: jax.Array,  # () typed PRNG key
+    metrics: TrainingMetrics,  # scalar leaves
+    rollout_index: int | jax.Array = 0,  # () zero-based rollout position for schedules
+) -> TrainStepResult:
+    """Collect a rollout, run PPO epochs, and accumulate window/lifetime metrics."""
+    rollout_carry, rollout = collect_rollout(rollout_carry, train_state, envs, config, key)
+    batch = rollout.batch  # observations: (T, B, *O); targets/starts: (T, B); model_carry leaves: (B, ...)
+    learning_rate = jnp.asarray(learning_rate_schedule(config)(rollout_index), dtype=jnp.float32)  # ()
+    train_state = train_state.replace(
+        opt_state=train_state.opt_state._replace(
+            hyperparams={**train_state.opt_state.hyperparams, "learning_rate": learning_rate}  # ()
+        )
+    )
+
+    class UpdateCarry(NamedTuple):
+        train_state: TrainState
+        key: jax.Array  # () typed PRNG key
+        permutation: jax.Array  # (B,)
+        minibatch_metrics: MinibatchMetrics  # scalar leaves
+        minibatch_count: jax.Array  # () evaluated minibatches
+        kl_exceeded: jax.Array  # () bool
+
+    def should_update(current: UpdateCarry) -> jax.Array:
+        return (current.minibatch_count < config.update_epochs * config.num_minibatches) & ~current.kl_exceeded  # ()
+
+    def update_minibatch(current: UpdateCarry) -> UpdateCarry:
+        def shuffle(key: jax.Array) -> tuple[jax.Array, jax.Array]:  # () typed PRNG key
+            key, shuffle_key = jax.random.split(key)  # each () typed PRNG key
+            return key, jax.random.permutation(shuffle_key, config.num_envs)  # (); (B,)
+
+        def keep_permutation(key: jax.Array) -> tuple[jax.Array, jax.Array]:  # () typed PRNG key
+            return key, current.permutation  # (); (B,)
+
+        minibatch_index = current.minibatch_count % config.num_minibatches  # ()
+        key, permutation = jax.lax.cond(minibatch_index == 0, shuffle, keep_permutation, current.key)  # (); (B,)
+        indices = permutation.reshape(config.num_minibatches, -1)[minibatch_index]  # (M,), M = B / minibatches
+        minibatch = batch.select_sequences(indices)  # sequences: (T, M, ...); memory: (M, D)
+        train_state, metrics = update(current.train_state, minibatch, config, rollout_index)
+        kl_exceeded = jnp.asarray(False) if config.target_kl is None else metrics.approx_kl > config.target_kl  # ()
+        return UpdateCarry(
+            train_state=train_state,
+            key=key,  # ()
+            permutation=permutation,  # (B,)
+            minibatch_metrics=RunningSum.update(current.minibatch_metrics, metrics),  # scalar leaves
+            minibatch_count=current.minibatch_count + 1,  # ()
+            kl_exceeded=kl_exceeded,  # ()
+        )
+
+    updated = jax.lax.while_loop(
+        should_update,
+        update_minibatch,
+        UpdateCarry(
+            train_state=train_state,
+            key=rollout.key,  # ()
+            permutation=jnp.zeros(config.num_envs, dtype=jnp.int32),  # (B,)
+            minibatch_metrics=MinibatchMetrics(
+                **{field.name: jnp.zeros((), jnp.float32) for field in fields(MinibatchMetrics)}
+            ),
+            minibatch_count=jnp.asarray(0, dtype=jnp.int32),  # ()
+            kl_exceeded=jnp.asarray(False),  # ()
+        ),
+    )
+    episodes = EpisodeMetrics(
+        episode_count=rollout.episode_count,  # ()
+        episode_return_sum=rollout.episode_return_sum,  # ()
+        episode_length_sum=rollout.episode_length_sum,  # ()
+    )
+    window = WindowMetrics(
+        episodes=episodes,  # scalar leaves
+        minibatch_metrics=updated.minibatch_metrics,  # scalar leaves
+        rollout_metrics=RolloutMetrics(
+            explained_variance=explained_variance(batch.values, batch.returns),  # ()
+        ),
+        minibatch_count=updated.minibatch_count,  # ()
+        rollout_count=jnp.asarray(1, dtype=jnp.int32),  # ()
+        update_count=updated.minibatch_count - updated.kl_exceeded.astype(jnp.int32),  # ()
+        early_stop_count=updated.kl_exceeded.astype(jnp.int32),  # ()
+    )
+    # Widen only metric arithmetic; model and environment computation keep their dtypes.
+    with jax.enable_x64():
+        metrics = RunningSum.update(metrics, TrainingMetrics(window, episodes))  # scalar leaves
+    return TrainStepResult(
+        train_state=updated.train_state,
+        rollout_carry=rollout_carry,  # leaves: (B, ...)
+        key=updated.key,  # ()
+        metrics=metrics,  # scalar leaves
+    )
 
 
 def train(config: Config) -> TrainState:
@@ -837,8 +1014,8 @@ def train(config: Config) -> TrainState:
             config.model,
             dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
         )
-        carry = model.initial_carry(config.num_envs)  # leaves: (B, ...)
-        episode_start = jnp.ones(config.num_envs, dtype=bool)  # (B,)
+        model_carry = model.initial_carry(config.num_envs)  # leaves: (B, ...)
+        episode_starts = jnp.ones(config.num_envs, dtype=bool)  # (B,)
         lr_schedule = learning_rate_schedule(config)
         entropy_schedule = entropy_coef_schedule(config)
         optimizer = optax.inject_hyperparams(
@@ -847,129 +1024,101 @@ def train(config: Config) -> TrainState:
                 optax.adam(learning_rate, eps=1e-5),
             )
         )
-        state = TrainState.create(
+        train_state = TrainState.create(
             apply_fn=model.apply,
-            params=model.init(init_key, obs[None, :1], model.initial_carry(1), episode_start[None, :1])["params"],
+            params=model.init(init_key, obs[None, :1], model.initial_carry(1), episode_starts[None, :1])["params"],
             tx=optimizer(config.learning_rate),
         )
-        progress = restore_checkpoint(manager, state, config)
-        start_iteration = 0
-        completed_episodes, training_return_sum, training_length_sum = jax.tree.map(jnp.asarray, (0, 0.0, 0))  # each ()
+        progress = restore_checkpoint(manager, train_state, config)
+        metrics = init_metrics(progress)  # scalar leaves
+        start_rollout_index = 0
         if progress is not None:
-            state, key, start_iteration = progress.state, progress.key, progress.iteration  # key: ()
-            completed_episodes, training_return_sum, training_length_sum = jax.tree.map(
-                jnp.asarray, (progress.completed_episodes, progress.training_return_sum, progress.training_length_sum)
-            )  # each ()
+            train_state, key, start_rollout_index = (
+                progress.train_state,
+                progress.key,
+                progress.rollout_count,
+            )  # key: ()
             # Live environment states are not serialized. Start fresh episodes
             # with fresh recurrent memory, retaining the policy and training RNGs.
-            reset_keys = jax.random.split(jax.random.fold_in(key, start_iteration), config.num_envs)  # (B,) keys
+            reset_keys = jax.random.split(jax.random.fold_in(key, start_rollout_index), config.num_envs)  # (B,) keys
             obs, env_state = jax.vmap(envs.reset, in_axes=(0, None))(reset_keys, envs.params)  # (B,*O); leaves: (B,...)
-            print(f"Resumed run {run_name} at step {start_iteration * batch_size}", flush=True)
-        initial_steps = start_iteration * batch_size
+            print(f"Resumed run {run_name} at step {start_rollout_index * batch_size}", flush=True)
+        initial_step_count = start_rollout_index * batch_size
         writer = resources.enter_context(
-            closing(SummaryWriter(logdir=run_dir, purge_step=initial_steps + 1 if progress is not None else None))
+            closing(SummaryWriter(logdir=run_dir, purge_step=initial_step_count + 1 if progress is not None else None))
         )
-        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", initial_steps)
+        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", initial_step_count)
         print(f"Run ID: {run_name}\nTensorBoard run: {run_dir}", flush=True)
         devices = str(jax.devices())
         print(f"JAX devices: {devices}", flush=True)
-        writer.add_text("devices", devices, initial_steps)
-        parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
-        writer.add_scalar("model/params_millions", parameter_count / 1_000_000, initial_steps)
+        writer.add_text("devices", devices, initial_step_count)
+        parameter_count = sum(parameter.size for parameter in jax.tree.leaves(train_state.params))
+        writer.add_scalar("model/params_millions", parameter_count / 1_000_000, initial_step_count)
         print(f"Model parameters: {parameter_count:,}", flush=True)
-        writer.add_text("model/parameter_count", str(parameter_count), initial_steps)
+        writer.add_text("model/parameter_count", str(parameter_count), initial_step_count)
         rollout_carry = RolloutCarry(
             env_state=env_state,  # leaves: (B, ...)
             observations=obs,  # (B, *O)
-            carry=carry,  # leaves: (B, ...)
-            episode_starts=episode_start,  # (B,)
+            model_carry=model_carry,  # leaves: (B, ...)
+            episode_starts=episode_starts,  # (B,)
             episode_returns=jnp.zeros(config.num_envs, dtype=jnp.float32),  # (B,)
-            episode_lengths=jnp.zeros(config.num_envs, dtype=jnp.int32),  # (B,)
+            episode_step_counts=jnp.zeros(config.num_envs, dtype=jnp.int32),  # (B,)
         )
 
         start = monotonic()
         window_start = start
-        window_steps = initial_steps
-        window_rollouts = 0
-        window_metric_count = 0
-        window_metric_sums = dict.fromkeys((field.name for field in fields(PPOMetrics)), 0.0)
-        window_rollout_sums: dict[str, float] = {}
-        window_episodes, window_return_sum, window_length_sum = jax.tree.map(jnp.asarray, (0, 0.0, 0))  # each ()
-        num_iterations = config.total_steps // batch_size
-        for iteration in range(start_iteration, num_iterations):
-            rollout_carry, rollout = collect_rollout(
-                rollout_carry, state, envs, config, key
-            )  # carry: (B, ...); rollout arrays: (T, B, ...)
-            batch = rollout.batch  # observations: (T, B, *O); targets/starts: (T, B); carry leaves: (B, ...)
-            key = rollout.key  # () typed PRNG key
-            window_episodes += rollout.completed_count  # ()
-            window_return_sum += rollout.completed_return_sum  # ()
-            window_length_sum += rollout.completed_length_sum  # ()
-            training_return_sum += rollout.completed_return_sum  # ()
-            training_length_sum += rollout.completed_length_sum  # ()
-            completed_episodes += rollout.completed_count  # ()
-            learning_rate = jnp.asarray(lr_schedule(iteration), dtype=jnp.float32)  # ()
-            entropy_coef = jnp.asarray(entropy_schedule(iteration), dtype=jnp.float32)  # ()
-            state = state.replace(
-                opt_state=state.opt_state._replace(
-                    hyperparams={
-                        **state.opt_state.hyperparams,
-                        "learning_rate": learning_rate,  # ()
-                    }
-                )
-            )
-            early_stop = False
-            updates_done = 0
-            for _ in range(config.update_epochs):
-                key, shuffle_key = jax.random.split(key)  # each () typed PRNG key
-                permutation = jax.random.permutation(shuffle_key, config.num_envs)  # (B,)
-                for indices in jnp.split(permutation, config.num_minibatches):  # each (M,)
-                    # M is the number of environments in this minibatch.
-                    minibatch = batch.select_sequences(indices)  # sequences: (T, M, ...); memory: (M, D)
-                    state, metric = update(state, minibatch, config, iteration)
-                    for name in window_metric_sums:
-                        window_metric_sums[name] += float(getattr(metric, name))
-                    window_metric_count += 1
-                    if config.target_kl is not None and float(metric.approx_kl) > config.target_kl:
-                        early_stop = True
-                        break
-                    updates_done += 1
-                if early_stop:
-                    break
-            window_rollouts += 1
-            # Evaluate rollout-time predictions against the full rollout's GAE returns.
-            explained_var = explained_variance(batch.values, batch.returns)  # ()
-            completed_iterations = iteration + 1
-            final_iteration = completed_iterations == num_iterations
-            steps = completed_iterations * batch_size
-            for tag, scalar in {
-                "value/explained_variance": explained_var,
-                "charts/updates_per_rollout": updates_done,
-                "policy/early_stop": early_stop,
-            }.items():
-                window_rollout_sums[tag] = window_rollout_sums.get(tag, 0.0) + float(scalar)
-            if config.video_interval and completed_iterations % config.video_interval == 0:
-                log_video(state, config, writer, int(completed_episodes), steps, initial_carry=model.initial_carry(1))
-            if config.eval_interval and (completed_iterations % config.eval_interval == 0 or final_iteration):
-                log_evaluation(
-                    state,
+        window_start_step_count = initial_step_count
+        planned_rollout_count = config.total_steps // batch_size
+        for rollout_index in range(start_rollout_index, planned_rollout_count):
+            result = train_step(rollout_carry, train_state, envs, config, key, metrics, rollout_index)
+            train_state = result.train_state
+            rollout_carry = result.rollout_carry  # leaves: (B, ...)
+            key = result.key  # () typed PRNG key
+            metrics = result.metrics  # scalar leaves
+            rollout_count = rollout_index + 1
+            is_final_rollout = rollout_count == planned_rollout_count
+            step_count = rollout_count * batch_size
+            if config.video_interval and rollout_count % config.video_interval == 0:
+                log_video(
+                    train_state,
                     config,
                     writer,
-                    int(completed_episodes),
-                    steps,
+                    int(metrics.total.episode_count),
+                    step_count,
                     initial_carry=model.initial_carry(1),
                 )
-            if completed_iterations % config.log_interval == 0 or final_iteration:
+            if config.eval_interval and (rollout_count % config.eval_interval == 0 or is_final_rollout):
+                log_evaluation(
+                    train_state,
+                    config,
+                    writer,
+                    int(metrics.total.episode_count),
+                    step_count,
+                    initial_carry=model.initial_carry(1),
+                )
+            if rollout_count % config.log_interval == 0 or is_final_rollout:
+                # Synchronize the window before measuring throughput.
+                window, total = jax.device_get(metrics)  # scalar leaves
                 now = monotonic()
                 window_seconds = now - window_start
-                mean_metrics = {name: total / window_metric_count for name, total in window_metric_sums.items()}
+                mean_metrics = {
+                    field.name: float(getattr(window.minibatch_metrics, field.name)) / int(window.minibatch_count)
+                    for field in fields(MinibatchMetrics)
+                }
+                window_rollout_count = int(window.rollout_count)
+                window_episode_count = int(window.episodes.episode_count)
+                episode_count = int(total.episode_count)
+                learning_rate = float(lr_schedule(rollout_index))
+                entropy_coef = float(entropy_schedule(rollout_index))
                 rate_seconds = max(window_seconds, 1e-9)
-                sps = (steps - window_steps) / rate_seconds
+                sps = (step_count - window_start_step_count) / rate_seconds
                 # Include evaluation/video overhead in this session's elapsed time.
                 elapsed_seconds = now - start
-                scalars: dict[str, float | int | jax.Array] = {
-                    tag: total / window_rollouts for tag, total in window_rollout_sums.items()
-                }  # array values: ()
+                scalars: dict[str, float | int] = {
+                    "value/explained_variance": float(window.rollout_metrics.explained_variance) / window_rollout_count,
+                    "charts/updates_per_rollout": int(window.update_count) / window_rollout_count,
+                    "policy/early_stop": int(window.early_stop_count) / window_rollout_count,
+                }
                 scalars.update(
                     {
                         "losses/policy": mean_metrics["policy_loss"],
@@ -981,32 +1130,34 @@ def train(config: Config) -> TrainState:
                         "policy/entropy": mean_metrics["entropy"],
                         "policy/approx_kl": mean_metrics["approx_kl"],
                         "policy/clip_fraction": mean_metrics["clip_fraction"],
-                        "charts/iterations_per_second": window_rollouts / rate_seconds,
+                        "charts/iterations_per_second": window_rollout_count / rate_seconds,
                         "charts/observations_per_second": sps,
-                        "charts/episodes_per_second": window_episodes / rate_seconds,
+                        "charts/episodes_per_second": window_episode_count / rate_seconds,
                         "charts/learning_rate": learning_rate,
                         "charts/entropy_coef": entropy_coef,
-                        "charts/total_episodes": completed_episodes,
-                        "charts/total_observations": steps,
-                        "charts/training_progress": completed_iterations / num_iterations,
-                        "charts/episodes": window_episodes,
+                        "charts/total_episodes": episode_count,
+                        "charts/total_observations": step_count,
+                        "charts/training_progress": rollout_count / planned_rollout_count,
+                        "charts/episodes": window_episode_count,
                         "time/elapsed_seconds": elapsed_seconds,
                     }
                 )
-                if window_episodes:
-                    scalars["charts/return_mean"] = window_return_sum / window_episodes
-                    scalars["charts/episode_length_mean"] = window_length_sum / window_episodes
-                if completed_episodes:
-                    scalars["charts/total_return_mean"] = training_return_sum / completed_episodes
-                    scalars["charts/total_episode_length_mean"] = training_length_sum / completed_episodes
+                if window_episode_count:
+                    scalars["charts/return_mean"] = float(window.episodes.episode_return_sum) / window_episode_count
+                    scalars["charts/episode_length_mean"] = (
+                        int(window.episodes.episode_length_sum) / window_episode_count
+                    )
+                if episode_count:
+                    scalars["charts/total_return_mean"] = float(total.episode_return_sum) / episode_count
+                    scalars["charts/total_episode_length_mean"] = int(total.episode_length_sum) / episode_count
                 for tag, scalar in scalars.items():
-                    writer.add_scalar(tag, float(scalar), steps)
+                    writer.add_scalar(tag, float(scalar), step_count)
                 writer.flush()
-                score = f"{window_return_sum / window_episodes:.1f}" if window_episodes else "n/a"
-                length = f"{window_length_sum / window_episodes:.1f}" if window_episodes else "n/a"
+                episode_return_text = f"{scalars['charts/return_mean']:.1f}" if window_episode_count else "n/a"
+                episode_length_text = f"{scalars['charts/episode_length_mean']:.1f}" if window_episode_count else "n/a"
                 print(
-                    f"iteration={completed_iterations} step={steps} episodes={completed_episodes} return={score} "
-                    f"episode_length={length} "
+                    f"iteration={rollout_count} step={step_count} episodes={episode_count} return={episode_return_text} "
+                    f"episode_length={episode_length_text} "
                     f"progress={scalars['charts/training_progress']:.3f} "
                     f"iterations/s={scalars['charts/iterations_per_second']:.3f} "
                     f"observations/s={sps:.3f} episodes/s={scalars['charts/episodes_per_second']:.3f} "
@@ -1021,28 +1172,23 @@ def train(config: Config) -> TrainState:
                     flush=True,
                 )
                 window_start = now
-                window_steps = steps
-                window_rollouts = 0
-                window_metric_count = 0
-                window_metric_sums = dict.fromkeys(window_metric_sums, 0.0)
-                window_rollout_sums.clear()
-                window_episodes, window_return_sum, window_length_sum = jax.tree.map(
-                    jnp.zeros_like, (window_episodes, window_return_sum, window_length_sum)
-                )  # each ()
-            if completed_iterations % config.checkpoint_interval == 0 or final_iteration:
+                window_start_step_count = step_count
+                with jax.enable_x64():
+                    metrics = metrics._replace(window=RunningSum.init(metrics.window))  # scalar leaves
+            if rollout_count % config.checkpoint_interval == 0 or is_final_rollout:
                 save_checkpoint(
                     manager,
                     TrainingProgress(
-                        state,
+                        train_state,
                         key,
-                        completed_iterations,
-                        int(completed_episodes),
-                        float(training_return_sum),
-                        int(training_length_sum),
+                        rollout_count,
+                        int(metrics.total.episode_count),
+                        float(metrics.total.episode_return_sum),
+                        int(metrics.total.episode_length_sum),
                     ),
                     config,
                 )
-        return state
+        return train_state
 
 
 def main() -> None:
