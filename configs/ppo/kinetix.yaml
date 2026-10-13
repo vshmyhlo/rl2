@@ -13,7 +13,7 @@ total_steps: 10_000_000
 num_envs: 32
 num_steps: 128
 num_minibatches: 4
-update_epochs: 4
+update_epochs: 8
 model:
   encoder:
     type: kinetix
@@ -22,26 +22,26 @@ model:
   recurrent:
     type: lstm
     hidden_size: 256
-bf16: true
-learning_rate: 0.00025
+bf16: false # Keep symbolic features and continuous-control heads in float32
+learning_rate: 0.0003
 anneal_lr: true
 lr_decay: linear
-gamma: 0.99
+gamma: 0.995 # Longer credit horizon for reaching the goal
 gae_lambda: 0.95
 clip_coef: 0.2
 target_kl: 0.01
-entropy_coef: 0.01
-entropy_decay: constant
+entropy_coef: 0.001 # Modest exploration bonus for the continuous action distribution
+entropy_decay: cosine # Let the walker settle into a precise gait late in training
 value_coef: 0.5
 max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/ppo/${run_id}
 run_id: ppo_${path_name:${env_id}}_${path_name:${kinetix.levels.0}}
 # All intervals count completed PPO iterations (one rollout and its updates).
-checkpoint_interval: 600
-log_interval: 60
-video_interval: 600
+checkpoint_interval: 500
+log_interval: 10
+video_interval: 100
 video_max_frames: 900
-video_fps: 40.0
-eval_interval: 1800
+video_fps: 30.0 # 60 Hz physics / frame_skip 2
+eval_interval: 500
 eval_episodes: 20
 eval_seed: 10000
