@@ -34,6 +34,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+jaxmarl = [
+    "jaxmarl==0.2.0",
+]
 xminigrid = [
     "xminigrid==0.9.3",
 ]
@@ -66,6 +69,7 @@ metal = [
 ]
 
 [project.scripts]
+mappo = "rl2.train_mappo:main"
 ppo = "rl2.ppo:main"
 ppo_rnd = "rl2.ppo_rnd:main"
 rl2-reasoning = "rl2.reasoning_cli:main"

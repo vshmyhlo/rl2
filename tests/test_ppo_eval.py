@@ -11,6 +11,7 @@ import pytest
 from flax.training.train_state import TrainState
 
 from rl2 import ppo
+from rl2.actions import ContinuousSpace
 from rl2.envs.gymnax_env import GymnaxEnv
 
 
@@ -76,6 +77,45 @@ def test_episode_renders_state_before_autoreset(record: bool) -> None:
     else:
         assert frames == []
         env.render.assert_not_called()
+
+
+def test_beta_playback_reuses_compiled_sampling_across_steps_and_episodes() -> None:
+    config = ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml")
+    space = ContinuousSpace((2,), (-1.0, -1.0), (1.0, 1.0))
+    observation = jnp.zeros(1)  # (F=1,)
+    carry = ((jnp.zeros((1, 1)), jnp.zeros((1, 1))),)  # leaves: (B=1,H=1)
+
+    def beta_policy(
+        variables: dict[str, dict[str, jax.Array]],
+        observations: jax.Array,  # (B,F)
+        carry: ppo.RecurrentCarry,  # leaves: (B,H)
+        starts: jax.Array,  # (B,)
+        *,
+        method: str,
+    ) -> ppo.ActorCriticOutput:
+        alpha = variables["params"]["alpha"]  # (B,D=2)
+        return ppo.ActorCriticOutput(carry, ppo.BetaPolicy(alpha, jnp.full_like(alpha, 2.0), space), jnp.zeros(1))
+
+    state = TrainState.create(apply_fn=beta_policy, params={"alpha": jnp.full((1, 2), 2.0)}, tx=optax.sgd(0.1))
+    env = Mock(params={})
+    env.reset.return_value = observation, {}
+    env.render.return_value = np.zeros((2, 2, 3), np.uint8)  # (H,W,3)
+    env.step.side_effect = [
+        (observation, {}, jnp.asarray(1.0), jnp.asarray(done), {"final_state": {}})
+        for done in (False, True, False, True)
+    ]
+    with patch.object(ppo.BetaPolicy, "sample", autospec=True, side_effect=ppo.BetaPolicy.sample) as sample:
+        for record in (True, False):
+            score, length, frames = ppo.play_episode(state, config, jax.random.key(0), carry, record=record, env=env)
+            assert (score, length, len(frames)) == (2.0, 2, 3 if record else 0)
+            state = state.replace(params={"alpha": jnp.full((1, 2), 10.0)})
+    # Sampling should execute in the cached graph, including after parameter changes.
+    assert sample.call_count == 1
+    actions = np.stack([call.args[2] for call in env.step.call_args_list])  # (T=4,D=2)
+    assert actions.shape == (4, 2) and np.isfinite(actions).all()
+    assert np.all((actions > -1) & (actions < 1))
+    assert not np.array_equal(actions[0], actions[1])  # Advancing RNG keys changes samples.
+    assert not np.array_equal(actions[:2], actions[2:])  # Updated parameters reach the cached graph.
 
 
 def test_evaluation_logs_raw_scores_and_independent_seeds() -> None:

@@ -85,6 +85,7 @@ also run on normal completion.
 import argparse
 import json
 import os
+from collections.abc import Callable
 from contextlib import ExitStack, closing
 from dataclasses import asdict, fields
 from datetime import timedelta
@@ -635,6 +636,23 @@ class ActorCritic(nn.Module):
         return ActorCriticOutput(model_carry, policy, values)
 
 
+@partial(jax.jit, static_argnames="apply_fn")
+def sample_policy_step(
+    apply_fn: Callable[..., ActorCriticOutput],
+    params: optax.Params,
+    observations: jax.Array,  # (B, *O)
+    carry: RecurrentCarry,  # leaves: (B, H)
+    episode_starts: jax.Array,  # (B,)
+    key: jax.Array,  # () typed PRNG key
+) -> tuple[RecurrentCarry, jax.Array]:  # carry leaves: (B, H); actions: (B, *action_shape)
+    """Compile inference and sampling together; reuse across playback steps and episodes."""
+    carry, policy, _ = apply_fn(
+        {"params": params}, observations, carry, episode_starts, method="step"
+    )  # carry leaves: (B, H); policy leaves: (B, A/D); values: (B,)
+    # Eager Beta sampling rebuilds and recompiles rejection loops on every call.
+    return carry, policy.sample(seed=key)  # carry leaves: (B, H); actions: (B, *action_shape)
+
+
 def play_episode(
     train_state: TrainState,
     config: Config,
@@ -654,17 +672,16 @@ def play_episode(
         frames.append(np.asarray(env.render(env_state)))
     episode_return = 0.0
     episode_step_count = 0
-    apply_step = jax.jit(train_state.apply_fn, static_argnames=("method",))
     while not (stop_at_frame_limit and config.video_max_frames is not None and len(frames) >= config.video_max_frames):
         key, action_key, env_key = jax.random.split(key, 3)  # each () typed PRNG key
-        memory, policy, _ = apply_step(
-            {"params": train_state.params},
+        memory, actions = sample_policy_step(
+            train_state.apply_fn,
+            train_state.params,
             observation[None],
             memory,
             jnp.full(1, episode_step_count == 0, dtype=bool),
-            method="step",
-        )  # memory leaves: (1, ...); policy leaves: (1, A/D); values: (1,)
-        actions = policy.sample(seed=action_key)  # (1, *action_shape)
+            action_key,
+        )  # memory leaves: (1, ...); actions: (1, *action_shape)
         observation, env_state, reward, episode_end, info = env.step(env_key, env_state, actions[0], env.params)
         # observation: (*O,); state leaves: (...); reward/episode_end: (); final_observation: (*O,)
         episode_return += float(reward)
@@ -685,6 +702,7 @@ def log_video(
     *,
     initial_carry: RecurrentCarry,  # leaves: (1, ...)
 ) -> None:
+    print(f"Recording gameplay at step {step_count} after {episode_count} training episodes...", flush=True)
     _, _, frames = play_episode(
         train_state,
         config,
@@ -709,6 +727,7 @@ def log_evaluation(
     initial_carry: RecurrentCarry,  # leaves: (1, ...)
 ) -> None:
     """Evaluate fixed environment seeds, log raw scores, and record the last episode."""
+    print(f"Evaluating {config.eval_episodes} games at step {step_count}...", flush=True)
     started = monotonic()
     episode_results: list[dict[str, float | int]] = []
     env = make_env(config)
@@ -747,7 +766,6 @@ def log_evaluation(
     print(f"Evaluation: return={result['return_mean']:.1f} over {config.eval_episodes} games", flush=True)
 
 
-@partial(jax.jit, static_argnames="config")
 def update(
     train_state: TrainState,
     batch: PPOBatch,  # observations: (*S, *O); targets/starts: (*S,); model_carry leaves: (B, ...)
@@ -798,7 +816,6 @@ def update(
     return train_state, metrics
 
 
-@partial(jax.jit, static_argnames=("envs", "config"))
 def collect_rollout(
     rollout_carry: RolloutCarry,  # observations: (B, *O); state/memory leaves: (B, ...)
     train_state: TrainState,
@@ -932,7 +949,6 @@ def collect_rollout(
     )
 
 
-@partial(jax.jit, static_argnames=("envs", "config"))
 def train_step(
     rollout_carry: RolloutCarry,  # observations: (B, *O); state/memory leaves: (B, ...)
     train_state: TrainState,
@@ -1025,7 +1041,7 @@ def train_step(
     )
 
 
-# Only the training loop relinquishes ownership; other callers may reuse train_step inputs.
+# Compile the rollout and updates together; only the training loop relinquishes ownership.
 train_step_donated = jax.jit(train_step, static_argnames=("envs", "config"), donate_argnames=("train_state",))
 
 

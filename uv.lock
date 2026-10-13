@@ -2422,6 +2422,26 @@ wheels = [
 ]
 
 [[package]]
+name = "jaxmarl"
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "chex" },
+    { name = "flax" },
+    { name = "gymnax" },
+    { name = "jax" },
+    { name = "jaxtyping" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "safetensors" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1a/85/48b316b4edbd87169f9678b5e5f6bdccf7bd07a94460cca06abd6701bcf3/jaxmarl-0.2.0.tar.gz", hash = "sha256:91b6591d40c443a922c2f902dadcc639ac33193b7d70d232e5133add54f65bde", size = 214473, upload-time = "2026-09-10T09:16:05.025Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cf/e0/f268ba1d8333a1f5901caa06b190497b4b01dc775fa50053e9f84096a4f5/jaxmarl-0.2.0-py3-none-any.whl", hash = "sha256:48c7747ee9ff144404c9ca70df07cc3a6b9f3cadca0ca945385e791fecedb327", size = 252531, upload-time = "2026-09-10T09:16:03.865Z" },
+]
+
+[[package]]
 name = "jaxtyping"
 version = "0.3.11"
 source = { registry = "https://pypi.org/simple" }
@@ -5035,6 +5055,9 @@ gemma3 = [
     { name = "gemma" },
     { name = "kauldron" },
 ]
+jaxmarl = [
+    { name = "jaxmarl" },
+]
 kinetix = [
     { name = "kinetix-env" },
 ]
@@ -5065,6 +5088,7 @@ requires-dist = [
     { name = "jax", specifier = ">=0.11.2,<0.12" },
     { name = "jax", extras = ["cuda12"], marker = "sys_platform == 'linux' and extra == 'cuda12'", specifier = ">=0.11.2,<0.12" },
     { name = "jax-triton", marker = "sys_platform == 'linux' and extra == 'gdn2-triton'", specifier = ">=0.4.1,<0.5" },
+    { name = "jaxmarl", marker = "extra == 'jaxmarl'", specifier = "==0.2.0" },
     { name = "kauldron", marker = "extra == 'gemma3'", specifier = ">=1.4.4,<2" },
     { name = "kinetix-env", marker = "extra == 'kinetix'", specifier = "==3.0.2" },
     { name = "mctx", marker = "extra == 'alphazero'", specifier = ">=0.0.6,<0.1" },
@@ -5088,7 +5112,7 @@ requires-dist = [
     { name = "tokamax", marker = "sys_platform == 'linux' and extra == 'cuda12'", specifier = ">=0.0.15" },
     { name = "xminigrid", marker = "extra == 'xminigrid'", specifier = "==0.9.3" },
 ]
-provides-extras = ["xminigrid", "craftax", "kinetix", "alphazero", "gemma3", "gdn2", "gdn2-triton", "cuda12", "metal"]
+provides-extras = ["jaxmarl", "xminigrid", "craftax", "kinetix", "alphazero", "gemma3", "gdn2", "gdn2-triton", "cuda12", "metal"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=9.1.1" }]
