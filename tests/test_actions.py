@@ -1,3 +1,4 @@
+from functools import partial
 from math import prod
 
 import chex
@@ -5,9 +6,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from scipy.stats import beta as beta_distribution
 from scipy.stats import truncnorm
 
-from rl2.actions import CategoricalPolicy, ContinuousSpace, DiscreteSpace, TruncatedGaussianPolicy
+from rl2.actions import BetaPolicy, CategoricalPolicy, ContinuousSpace, DiscreteSpace, TruncatedGaussianPolicy
 
 
 @pytest.mark.parametrize("batch_shape", [(), (2,), (2, 3)], ids=["scalar", "batch", "sequence"])
@@ -159,3 +161,65 @@ def test_truncated_entropy_gradient_moves_mean_toward_center() -> None:
     np.testing.assert_allclose(mean_grad[1, 0], 0, atol=1e-6)
     assert float(mean_grad[2, 0]) < 0
     assert bool(jnp.all(std_grad > 0))
+
+
+@pytest.mark.parametrize(
+    "batch_shape,action_shape,sample_shape",
+    [((), (), ()), ((2,), (1,), 2), ((2, 3), (2, 1), (2, 1))],
+    ids=["scalar-box", "vector-batch-integer-samples", "matrix-actions-sequence-tuple-samples"],
+)
+def test_beta_shapes_bounds_density_and_entropy(
+    batch_shape: tuple[int, ...], action_shape: tuple[int, ...], sample_shape: int | tuple[int, ...]
+) -> None:
+    size = prod(action_shape)
+    space = ContinuousSpace(action_shape, (-2.0, 0.0)[:size], (4.0, 1.0)[:size])
+    alpha, beta = jax.tree.map(partial(jnp.full, (*batch_shape, size)), (2.0, 3.0))  # each (*S, D)
+    policy = BetaPolicy(alpha, beta, space)
+    key = jax.random.key(0)  # ()
+    actions, log_probs = jax.jit(policy.sample_and_log_prob, static_argnames="sample_shape")(
+        seed=key, sample_shape=sample_shape
+    )  # (*sample_shape, *S, *action_shape); (*sample_shape, *S)
+    samples = (sample_shape,) if isinstance(sample_shape, int) else sample_shape
+    assert actions.shape == (*samples, *batch_shape, *action_shape)
+    assert log_probs.shape == (*samples, *batch_shape)
+    assert actions.dtype == log_probs.dtype == jnp.float32
+    np.testing.assert_allclose(actions, policy.sample(seed=key, sample_shape=sample_shape), atol=1e-6)
+    np.testing.assert_allclose(log_probs, jax.jit(policy.log_prob)(actions), atol=2e-6)
+    flat_actions = actions.reshape((*samples, *batch_shape, size))  # (*sample_shape, *S, D)
+    low, high = jnp.asarray((space.low, space.high))  # each (D,)
+    assert bool(jnp.all((flat_actions > low) & (flat_actions < high)))
+    reference = beta_distribution(2.0, 3.0, loc=low, scale=high - low)
+    np.testing.assert_allclose(log_probs, reference.logpdf(flat_actions).sum(axis=-1), atol=3e-6)
+    entropy = jax.jit(policy.entropy)()  # (*S,)
+    assert entropy.shape == batch_shape
+    np.testing.assert_allclose(entropy, reference.entropy().sum(), atol=3e-6)
+    for bound in (low - 1, high + 1):  # each (D,)
+        outside = jnp.broadcast_to(bound, (*batch_shape, size)).reshape(
+            (*batch_shape, *action_shape)
+        )  # (*S, *action_shape)
+        assert bool(jnp.all(jnp.isneginf(policy.log_prob(outside))))
+    with pytest.raises(AssertionError):
+        policy.log_prob(actions.astype(jnp.int32))
+
+
+@pytest.mark.parametrize(
+    "alpha,beta", [(1.0, 1.0), (0.01, 0.01), (1.0, 100.0)], ids=["uniform", "endpoint-singularities", "skewed"]
+)
+def test_beta_boundary_samples_and_gradients(alpha: float, beta: float) -> None:
+    space = ContinuousSpace((2,), (-1.0, 5.0), (1.0, 5.001))
+    policy = BetaPolicy(jnp.full(2, alpha), jnp.full(2, beta), space)  # alpha/beta: (D=2,)
+    actions, log_probs = jax.jit(policy.sample_and_log_prob, static_argnames="sample_shape")(
+        seed=jax.random.key(0), sample_shape=8
+    )  # (N=8, D=2); (N,)
+    low, high = jnp.asarray((space.low, space.high))  # each (D,)
+    assert bool(jnp.all((actions > low) & (actions < high)))
+    assert bool(jnp.all(jnp.isfinite(log_probs)))
+    np.testing.assert_allclose(log_probs, jax.jit(policy.log_prob)(actions), atol=1e-5)
+
+    def objective(alpha: jax.Array, beta: jax.Array) -> jax.Array:  # each (D,) -> ()
+        current = policy.replace(alpha=alpha, beta=beta)
+        return current.log_prob(actions).mean() + current.entropy()  # ()
+
+    value, gradients = jax.jit(jax.value_and_grad(objective, argnums=(0, 1)))(policy.alpha, policy.beta)
+    assert bool(jnp.isfinite(value))
+    assert all(bool(jnp.all(jnp.isfinite(gradient))) for gradient in gradients)

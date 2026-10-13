@@ -111,6 +111,14 @@ def test_kinetix_config_loads_yaml_levels_as_hashable_tuple() -> None:
     assert hash(config)
 
 
+def test_beta_policy_config(config_path: Path) -> None:
+    assert load_config(config_path).model.continuous_policy == "truncated_gaussian"
+    settings = yaml.safe_load(config_path.read_text())
+    settings["model"]["continuous_policy"] = "beta"
+    config_path.write_text(yaml.safe_dump(settings))
+    assert load_config(config_path).model.continuous_policy == "beta"
+
+
 @pytest.mark.parametrize(
     "settings",
     [
@@ -220,6 +228,7 @@ def test_craftax_missing_dependency(monkeypatch: pytest.MonkeyPatch) -> None:
         ({"encoder": {"type": "rgb", "unknown": 1}}, "unknown"),
         ({"hidden_size": 8}, "hidden_size"),
         ({"encoder_stages": []}, "encoder_stages"),
+        ({"continuous_policy": "unknown"}, "continuous_policy"),
     ],
 )
 def test_rejects_invalid_nested_model(config_path: Path, model: dict[str, object], match: str) -> None:

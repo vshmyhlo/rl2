@@ -1,16 +1,17 @@
 from dataclasses import replace
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 from flax.training.train_state import TrainState
 
 from rl2 import ppo
-from rl2.actions import ContinuousSpace, TruncatedGaussianPolicy
+from rl2.actions import BetaPolicy, ContinuousSpace, TruncatedGaussianPolicy
 from rl2.envs.base import BaseEnv, EnvStep
 from rl2.model.encoders.rgb import ConvStage
 
@@ -48,7 +49,10 @@ class ContinuousEnv(BaseEnv[State, None]):
         return jnp.zeros((4, 4, 3), jnp.uint8)  # (H,W,3)
 
 
-def test_continuous_recurrent_training_replays_bounded_actions() -> None:
+@pytest.mark.parametrize("continuous_policy", ["truncated_gaussian", "beta"])
+def test_continuous_recurrent_training_replays_bounded_actions(
+    continuous_policy: Literal["truncated_gaussian", "beta"],
+) -> None:
     config = replace(
         ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
         num_envs=2,
@@ -58,6 +62,7 @@ def test_continuous_recurrent_training_replays_bounded_actions() -> None:
         target_kl=None,
         entropy_coef=0.01,
         model=ppo.ModelConfig(
+            continuous_policy=continuous_policy,
             encoder=ppo.RGBEncoderConfig(stages=(ConvStage(2, blocks=0),), embedding_size=2),
             recurrent=ppo.LSTMConfig(hidden_size=2),
         ),
@@ -70,8 +75,10 @@ def test_continuous_recurrent_training_replays_bounded_actions() -> None:
     carry = model.initial_carry(2)  # leaves: (B,H=2)
     starts = jnp.ones(2, bool)  # (B,)
     params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]
-    # Extreme network outputs must still produce stable truncated distributions.
-    params["policy_output"]["bias"] = jnp.array([12.0, -12.0])  # (D=2,)
+    # Extreme network outputs must still produce stable bounded distributions.
+    params["policy_output"]["bias"] = jnp.array(
+        [12.0, -12.0] * (2 if continuous_policy == "beta" else 1)
+    )  # (D=2 or 2D=4,)
     train_state = TrainState.create(
         apply_fn=model.apply,
         params=params,
@@ -88,9 +95,16 @@ def test_continuous_recurrent_training_replays_bounded_actions() -> None:
     assert bool(jnp.all((batch.actions >= low) & (batch.actions <= high)))
     output = jax.jit(model.apply)({"params": params}, batch.observations, carry, batch.episode_starts)
     assert isinstance(output, ppo.ActorCriticOutput)
-    assert isinstance(output.policy, TruncatedGaussianPolicy)
-    assert output.policy.mean.shape == output.policy.log_std.shape == (2, 2, 2)
-    assert output.policy.mean.dtype == output.policy.log_std.dtype == jnp.float32
+    if continuous_policy == "beta":
+        assert isinstance(output.policy, BetaPolicy)
+        assert output.policy.alpha.shape == output.policy.beta.shape == (2, 2, 2)
+        assert output.policy.alpha.dtype == output.policy.beta.dtype == jnp.float32
+        assert bool(jnp.all(output.policy.alpha >= 1) & jnp.all(output.policy.beta >= 1))
+        assert "policy_log_std" not in params
+    else:
+        assert isinstance(output.policy, TruncatedGaussianPolicy)
+        assert output.policy.mean.shape == output.policy.log_std.shape == (2, 2, 2)
+        assert output.policy.mean.dtype == output.policy.log_std.dtype == jnp.float32
     assert output.values.shape == (2, 2)
     np.testing.assert_allclose(output.policy.log_prob(batch.actions), batch.old_log_probs, atol=1e-5)
     selected = batch.select_sequences(jnp.array([1]))
@@ -100,7 +114,10 @@ def test_continuous_recurrent_training_replays_bounded_actions() -> None:
     chex.assert_trees_all_equal(result, ppo.train_step(runner, train_state, env, config, key, ppo.init_metrics()))
     assert int(result.train_state.step) == 2
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves((result.train_state.params, result.metrics)))
-    assert not np.array_equal(result.train_state.params["policy_log_std"], params["policy_log_std"])
+    if continuous_policy == "beta":
+        assert not np.array_equal(result.train_state.params["policy_output"]["bias"], params["policy_output"]["bias"])
+    else:
+        assert not np.array_equal(result.train_state.params["policy_log_std"], params["policy_log_std"])
     # Direct deterministic updates match the trainer after the same minibatch shuffle.
     expected = train_state
     _, shuffle_key = jax.random.split(rollout.key)  # each ()

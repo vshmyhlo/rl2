@@ -116,7 +116,7 @@ from pydantic import ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
-from rl2.actions import ActionSpace, CategoricalPolicy, DiscreteSpace, Policy, TruncatedGaussianPolicy
+from rl2.actions import ActionSpace, BetaPolicy, CategoricalPolicy, DiscreteSpace, Policy, TruncatedGaussianPolicy
 from rl2.configuration import load_settings
 from rl2.envs.base import BaseEnv
 from rl2.envs.craftax_env import CraftaxConfig, CraftaxEnv
@@ -292,6 +292,7 @@ type EncoderConfig = Annotated[
 class ModelConfig:
     encoder: EncoderConfig = RGBEncoderConfig()
     recurrent: LSTMConfig = LSTMConfig()
+    continuous_policy: Literal["truncated_gaussian", "beta"] = "truncated_gaussian"
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
@@ -566,7 +567,10 @@ class ActorCritic(nn.Module):
         self.value_norm = nn.LayerNorm(name="value_norm", dtype=self.dtype)
         policy_size = self.action_space.n if isinstance(self.action_space, DiscreteSpace) else self.action_space.size
         if not isinstance(self.action_space, DiscreteSpace):
-            self.policy_log_std = self.param("policy_log_std", nn.initializers.zeros, (policy_size,))  # (D,)
+            if self.model.continuous_policy == "beta":
+                policy_size *= 2
+            else:
+                self.policy_log_std = self.param("policy_log_std", nn.initializers.zeros, (policy_size,))  # (D,)
         self.policy_output = nn.Dense(
             policy_size, kernel_init=nn.initializers.orthogonal(0.01), name="policy_output", dtype=self.dtype
         )
@@ -583,10 +587,14 @@ class ActorCritic(nn.Module):
         policy = nn.relu(self.policy_norm(self.policy_hidden(x)))  # (*S, 512)
         critic = nn.relu(self.value_norm(self.value_hidden(x)))  # (*S, 512)
         # Heads use the compute dtype; float32 outputs keep PPO loss arithmetic precise.
-        output = self.policy_output(policy).astype(jnp.float32)  # (*S, A/D)
+        output = self.policy_output(policy).astype(jnp.float32)  # (*S, A/D/2D)
         distribution: Policy
         if isinstance(self.action_space, DiscreteSpace):
             distribution = CategoricalPolicy(output)
+        elif self.model.continuous_policy == "beta":
+            # Concentrations >= 1 avoid singular densities at the action bounds.
+            alpha, beta = jnp.split(jax.nn.softplus(output) + 1.0, 2, axis=-1)  # each (*S, D)
+            distribution = BetaPolicy(alpha, beta, self.action_space)
         else:
             low, high = jnp.asarray((self.action_space.low, self.action_space.high), jnp.float32)  # each (D,)
             scale = high / 2 - low / 2  # (D,)

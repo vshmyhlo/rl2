@@ -116,4 +116,54 @@ class TruncatedGaussianPolicy:
         return self.distribution.entropy()  # (*S,)
 
 
-type Policy = CategoricalPolicy | TruncatedGaussianPolicy
+@struct.dataclass
+class BetaPolicy:
+    """Independent Betas with positive alpha/beta, affinely scaled to Box bounds."""
+
+    alpha: jax.Array  # (*S, D) float32
+    beta: jax.Array  # (*S, D) float32
+    action_space: ContinuousSpace = struct.field(pytree_node=False)
+
+    @property
+    def distribution(self) -> distrax.Independent:
+        low, high = jnp.asarray((self.action_space.low, self.action_space.high), jnp.float32)  # each (D,)
+        beta = tfp.distributions.Beta(self.alpha, self.beta, force_probs_to_zero_outside_support=True)
+        scaled = distrax.Transformed(beta, distrax.ScalarAffine(shift=low, scale=high - low))
+        return distrax.Independent(scaled, reinterpreted_batch_ndims=1)  # batch: (*S,); event: (D,)
+
+    def sample(
+        self,
+        *,
+        seed: jax.Array,  # ()
+        sample_shape: int | tuple[int, ...] = (),
+    ) -> jax.Array:  # (*sample_shape, *S, *action_shape)
+        actions = self.distribution.sample(seed=seed, sample_shape=sample_shape)  # (*sample_shape, *S, D)
+        low, high = jnp.asarray((self.action_space.low, self.action_space.high), jnp.float32)  # each (D,)
+        # Keep rounded samples away from endpoint singularities during PPO replay.
+        margin = jnp.finfo(actions.dtype).eps * (high - low)  # (D,)
+        actions = jnp.clip(
+            actions, jnp.nextafter(low + margin, high), jnp.nextafter(high - margin, low)
+        )  # (*sample_shape, *S, D)
+        return actions.reshape((*actions.shape[:-1], *self.action_space.shape))  # (*sample_shape, *S, *action_shape)
+
+    def sample_and_log_prob(
+        self,
+        *,
+        seed: jax.Array,  # ()
+        sample_shape: int | tuple[int, ...] = (),
+    ) -> tuple[jax.Array, jax.Array]:  # (*sample_shape, *S, *action_shape); (*sample_shape, *S)
+        actions = self.sample(seed=seed, sample_shape=sample_shape)  # (*sample_shape, *S, *action_shape)
+        actions = jax.lax.optimization_barrier(actions)  # (*sample_shape, *S, *action_shape)
+        return actions, self.log_prob(actions)  # (*sample_shape, *S, *action_shape); (*sample_shape, *S)
+
+    def log_prob(self, actions: jax.Array) -> jax.Array:  # (*S, *action_shape) -> (*S,)
+        chex.assert_type(actions, float)
+        batch_shape = actions.shape[: actions.ndim - len(self.action_space.shape)]
+        flat_actions = actions.reshape((*batch_shape, self.action_space.size))  # (*S, D)
+        return self.distribution.log_prob(flat_actions)  # (*S,)
+
+    def entropy(self) -> jax.Array:  # (*S,)
+        return self.distribution.entropy()  # (*S,)
+
+
+type Policy = CategoricalPolicy | TruncatedGaussianPolicy | BetaPolicy

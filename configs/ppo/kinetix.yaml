@@ -15,6 +15,7 @@ num_steps: 128
 num_minibatches: 4
 update_epochs: 8
 model:
+  continuous_policy: truncated_gaussian # beta learns alpha/beta for each bounded action
   encoder:
     type: kinetix
     hidden_size: 256
