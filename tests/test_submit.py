@@ -1,5 +1,7 @@
 import json
+import os
 import runpy
+import shlex
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,7 +39,7 @@ def test_default_gpu_job() -> None:
         pytest.param(["--cpus", "0", "--", "true"], id="zero-cpus"),
         pytest.param(["--cpus", "11", "--", "true"], id="cpu-over-quota"),
         pytest.param(["--memory-gib", "65", "--", "true"], id="memory-over-quota"),
-        pytest.param(["--extra", "jaxmarl --all-extras", "--", "true"], id="extra-flag-injection"),
+        pytest.param(["--extra", "jaxmarl", "--", "true"], id="obsolete-extra-option"),
     ],
 )
 def test_invalid_arguments(argv: list[str]) -> None:
@@ -58,8 +60,6 @@ def test_build_and_submit_preserves_command(monkeypatch: pytest.MonkeyPatch, tmp
             "10",
             "--memory-gib",
             "64",
-            "--extra",
-            "jaxmarl",
             "--",
             *command,
         ]
@@ -69,7 +69,6 @@ def test_build_and_submit_preserves_command(monkeypatch: pytest.MonkeyPatch, tmp
     calls = run.call_args_list
     build = next(call for call in calls if "buildctl" in call.args[0])
     assert f"context={submit.ROOT}" in build.args[0]
-    assert "build-arg:UV_EXTRAS=--extra jaxmarl" in build.args[0]
     created = json.loads(calls[-1].kwargs["input"])
     assert "--dry-run=server" not in calls[-1].args[0]
     assert created["metadata"]["name"] == name
@@ -96,3 +95,17 @@ def test_failure_does_not_submit(failed_step: int) -> None:
         submit.submit(args)
     assert run.call_count == failed_step
     assert not any("create" in c.args[0] and "--dry-run=server" not in c.args[0] for c in run.call_args_list)
+
+
+def test_dockerfile_dependency_sync(tmp_path: Path) -> None:
+    dockerfile = (submit.ROOT / "infra/k3s/training/Dockerfile").read_text()
+    command = next(line.strip() for line in dockerfile.splitlines() if line.strip().startswith("uv sync "))
+    result = subprocess.run(
+        [*shlex.split(command), "--dry-run", "--offline"],
+        cwd=submit.ROOT,
+        env={**os.environ, "UV_CACHE_DIR": str(tmp_path / "uv-cache")},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr

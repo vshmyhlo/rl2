@@ -265,6 +265,88 @@ The host keeps its existing NVIDIA driver and Container Toolkit. The device
 plugin uses the `nvidia` runtime; no GPU Operator or driver replacement is
 needed. See [Kueue's quick start](https://kueue.sigs.k8s.io/docs/getting-started/quick-start/).
 
+### Build and queue training jobs
+
+Run `submit.py` on this k3s host to build the current working tree and submit a
+one-GPU Job to `training/gpu`:
+
+```bash
+./submit.py --prio high -- uv run mappo --config configs/mappo/jaxnav.yaml
+./submit.py --prio low -- uv run ppo --config configs/ppo/kinetix.yaml
+./submit.py --prio low -- uv run python path/to/train.py
+```
+
+One-time host setup (installs BuildKit `v0.34.0`, enables the root
+`rl2-buildkit` service, and creates two Kueue priority classes):
+
+```bash
+sudo bash infra/k3s/training/install.sh
+```
+
+BuildKit uses a root-only Unix socket and k3s's containerd image store. Each
+submission gets a unique local image tag; no registry is needed. Source edits
+and untracked files are included, subject to `.dockerignore`, which excludes
+virtual environments, generated outputs, and common credential paths. Dependency
+layers are cached using `uv.lock`; CUDA12 and the environment packages are
+regular project dependencies. Inside the image, `uv run` uses the
+built environment without syncing dependencies again.
+
+The non-secret `nvida.env` configuration is included in the image and loaded by
+`uv run` automatically through `UV_ENV_FILE=/app/nvida.env`. Use `uv run
+--no-env-file` to disable it. Other `.env` files remain excluded. Never
+put credentials in `nvida.env`; supply secrets at runtime. Resubmit after changing
+this file so the job uses a newly built image.
+
+Defaults are `--prio low --cpus 4 --memory-gib 16`. High priority moves ahead of
+waiting low-priority Jobs; running Jobs are not preempted. The command after
+`--` runs from `/app` with its arguments preserved, plus the internal MLflow URL.
+Use `-- sh -c '...'` explicitly for shell pipelines. Submission returns after
+queueing and prints status/log commands. Failed Jobs are not retried, and
+finished Jobs expire after seven days.
+
+Only the image is a repository snapshot: local credentials and host files are
+not mounted. Container-local outputs are ephemeral; use a durable `log_dir`
+(the existing configs use GCS) and provide access to that storage at runtime.
+Builds and images consume host disk; inspect cache usage with
+`sudo buildctl --addr unix:///run/rl2-buildkit/buildkitd.sock du`.
+
+### Submit jobs with kjobs
+
+[kjobs](https://github.com/kubernetes-sigs/kjob) `v0.1.0` provides the
+`kubectl kjob` CLI and cluster-side templates. Install on this Linux amd64 host:
+
+```bash
+curl -fsSL https://github.com/kubernetes-sigs/kjob/releases/download/v0.1.0/kubectl-kjob-linux-amd64.tar.gz -o /tmp/rl2-kjob.tar.gz
+printf '%s\n' '34fd7e04cacfd49dd361453819ab460101ddef98f94b5fb4a76430ccb1e3a92a  /tmp/rl2-kjob.tar.gz' | sha256sum --check
+mkdir -p /tmp/rl2-kjob-bin
+tar -xzf /tmp/rl2-kjob.tar.gz -C /tmp/rl2-kjob-bin ./kubectl-kjob
+sudo install -m 0755 /tmp/rl2-kjob-bin/kubectl-kjob /usr/local/bin/kubectl-kjob
+sudo k3s kubectl apply --server-side -f https://github.com/kubernetes-sigs/kjob/releases/download/v0.1.0/manifests.yaml
+sudo k3s kubectl wait --for=condition=Established crd/applicationprofiles.kjobctl.x-k8s.io crd/jobtemplates.kjobctl.x-k8s.io --timeout=60s
+sudo k3s kubectl apply -f infra/k3s/kjobs/gpu-profile.yaml
+```
+
+The `gpu-smoke` profile requests one GPU and uses the NVIDIA runtime. Submit:
+
+```bash
+sudo kubectl kjob create job --kubeconfig /etc/rancher/k3s/k3s.yaml \
+  -n training --profile gpu-smoke --localqueue gpu \
+  --skip-localqueue-validation --cmd 'nvidia-smi'
+sudo kubectl kjob list job --kubeconfig /etc/rancher/k3s/k3s.yaml -n training
+sudo k3s kubectl -n training logs job/<generated-job-name>
+```
+
+Add `--dry-run=server -o yaml` to preview a submission. The explicit kubeconfig
+is needed because this plugin does not inherit k3s's default config path.
+`--skip-localqueue-validation` skips kjobs v0.1.0's lookup through the retired
+Kueue `v1beta1` API; the queue label and Kueue admission still apply. Specify the
+existing `gpu` queue; an incorrect name leaves the Job suspended.
+
+This profile uses a CUDA base image for smoke checks, with a 120-second runtime
+limit and ten-minute cleanup. For training, create a profile with your training
+image, command, resource requests, and runtime limit. It already supplies the
+internal `MLFLOW_TRACKING_URI`; kjobs does not upload local code or dependencies.
+
 ### Kueue UI
 
 The controller chart also installs KueueViz `0.20.1`, with read-only access to

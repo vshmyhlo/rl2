@@ -4,7 +4,6 @@
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -20,9 +19,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--prio", choices=("low", "high"), default="low")
     parser.add_argument("--cpus", type=int, choices=range(1, 11), default=4, metavar="1..10")
     parser.add_argument("--memory-gib", type=int, choices=range(1, 65), default=16, metavar="1..64")
-    parser.add_argument(
-        "--extra", action="append", default=[], help="Project extra to install; repeatable. CUDA12 is included."
-    )
     if "--" not in argv:
         parser.parse_args(argv)
         parser.error("separate the container command with --")
@@ -31,8 +27,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args.command = argv[separator + 1 :]
     if not args.command or not args.command[0]:
         parser.error("provide a command after --")
-    if any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", extra) is None for extra in args.extra):
-        parser.error("extra names must contain only letters, digits, underscores, or hyphens")
     return args
 
 
@@ -97,7 +91,6 @@ def submit(args: argparse.Namespace) -> str:
     subprocess.run([*kubectl, "-n", "training", "get", "localqueue", "gpu"], check=True)
     subprocess.run([*kubectl, "get", "workloadpriorityclass", f"train-{args.prio}"], check=True)
     subprocess.run([*kubectl, "create", "--dry-run=server", "-f", "-"], input=manifest, text=True, check=True)
-    extras = " ".join(f"--extra {extra}" for extra in sorted(set(args.extra)))
     print(f"Building {image} from {ROOT}", flush=True)
     subprocess.run(
         [
@@ -114,8 +107,6 @@ def submit(args: argparse.Namespace) -> str:
             f"dockerfile={ROOT}",
             "--opt",
             "filename=infra/k3s/training/Dockerfile",
-            "--opt",
-            f"build-arg:UV_EXTRAS={extras}",
             "--output",
             f"type=image,name={image},unpack=true",
             "--progress",

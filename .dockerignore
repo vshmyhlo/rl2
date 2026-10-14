@@ -12,6 +12,8 @@
 **/.env
 **/.env.*
 **/*.env
+# Non-secret GPU configuration used by uv run --env-file nvida.env.
+!nvida.env
 **/*.pem
 **/*.key
 **/*credentials*.json
