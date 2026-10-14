@@ -32,7 +32,7 @@
       },
       "targets": [
         {
-          "expr": "DCGM_FI_DEV_GPU_UTIL",
+          "expr": "max by (UUID, hostname, gpu, modelName) (DCGM_FI_DEV_GPU_UTIL)",
           "refId": "A",
           "legendFormat": "{{modelName}} GPU {{gpu}}"
         }
@@ -72,7 +72,7 @@
       },
       "targets": [
         {
-          "expr": "DCGM_FI_DEV_FB_USED * 1024 * 1024",
+          "expr": "max by (UUID, hostname, gpu, modelName) (DCGM_FI_DEV_FB_USED * 1024 * 1024)",
           "refId": "A",
           "legendFormat": "{{modelName}} GPU {{gpu}}"
         }
@@ -112,7 +112,7 @@
       },
       "targets": [
         {
-          "expr": "DCGM_FI_DEV_GPU_TEMP",
+          "expr": "max by (UUID, hostname, gpu, modelName) (DCGM_FI_DEV_GPU_TEMP)",
           "refId": "A",
           "legendFormat": "{{modelName}} GPU {{gpu}}"
         }
@@ -152,7 +152,7 @@
       },
       "targets": [
         {
-          "expr": "DCGM_FI_DEV_POWER_USAGE",
+          "expr": "max by (UUID, hostname, gpu, modelName) (DCGM_FI_DEV_POWER_USAGE)",
           "refId": "A",
           "legendFormat": "{{modelName}} GPU {{gpu}}"
         }
@@ -192,12 +192,12 @@
       },
       "targets": [
         {
-          "expr": "DCGM_FI_DEV_GPU_UTIL",
+          "expr": "max by (UUID, hostname, gpu, modelName) (DCGM_FI_DEV_GPU_UTIL)",
           "refId": "A",
           "legendFormat": "{{modelName}} GPU {{gpu}}"
         },
         {
-          "expr": "DCGM_FI_DEV_MEM_COPY_UTIL",
+          "expr": "max by (UUID, hostname, gpu, modelName) (DCGM_FI_DEV_MEM_COPY_UTIL)",
           "refId": "B",
           "legendFormat": "Memory bandwidth"
         }
@@ -238,12 +238,12 @@
       },
       "targets": [
         {
-          "expr": "DCGM_FI_DEV_FB_USED * 1024 * 1024",
+          "expr": "max by (UUID, hostname, gpu, modelName) (DCGM_FI_DEV_FB_USED * 1024 * 1024)",
           "refId": "A",
           "legendFormat": "{{modelName}} GPU {{gpu}}"
         },
         {
-          "expr": "(DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) * 1024 * 1024",
+          "expr": "max by (UUID, hostname, gpu, modelName) ((DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) * 1024 * 1024)",
           "refId": "B",
           "legendFormat": "Total VRAM"
         }
@@ -284,12 +284,12 @@
       },
       "targets": [
         {
-          "expr": "DCGM_FI_DEV_GPU_TEMP",
+          "expr": "max by (UUID, hostname, gpu, modelName) (DCGM_FI_DEV_GPU_TEMP)",
           "refId": "A",
           "legendFormat": "{{modelName}} GPU {{gpu}}"
         },
         {
-          "expr": "DCGM_FI_DEV_MEMORY_TEMP",
+          "expr": "max by (UUID, hostname, gpu, modelName) (DCGM_FI_DEV_MEMORY_TEMP)",
           "refId": "B",
           "legendFormat": "Memory temperature"
         }
@@ -330,7 +330,7 @@
       },
       "targets": [
         {
-          "expr": "DCGM_FI_DEV_POWER_USAGE",
+          "expr": "max by (UUID, hostname, gpu, modelName) (DCGM_FI_DEV_POWER_USAGE)",
           "refId": "A",
           "legendFormat": "{{modelName}} GPU {{gpu}}"
         }
@@ -371,12 +371,12 @@
       },
       "targets": [
         {
-          "expr": "DCGM_FI_DEV_SM_CLOCK",
+          "expr": "max by (UUID, hostname, gpu, modelName) (DCGM_FI_DEV_SM_CLOCK)",
           "refId": "A",
           "legendFormat": "{{modelName}} GPU {{gpu}}"
         },
         {
-          "expr": "DCGM_FI_DEV_MEM_CLOCK",
+          "expr": "max by (UUID, hostname, gpu, modelName) (DCGM_FI_DEV_MEM_CLOCK)",
           "refId": "B",
           "legendFormat": "Memory clock"
         }
@@ -417,7 +417,7 @@
       },
       "targets": [
         {
-          "expr": "DCGM_FI_DEV_ECC_DBE_VOL_TOTAL",
+          "expr": "max by (UUID, hostname, gpu, modelName) (DCGM_FI_DEV_ECC_DBE_VOL_TOTAL)",
           "refId": "A",
           "legendFormat": "{{modelName}} GPU {{gpu}}"
         }

@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 from subprocess import run
 from unittest.mock import patch
@@ -214,3 +215,71 @@ def test_termination_failure_after_success_propagates(client: MlflowClient) -> N
         logger,
     ):
         pass
+
+
+def test_console_capture_uploads_and_preserves_resume_logs(
+    client: MlflowClient, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR", "false")
+    stdout, stderr = sys.stdout, sys.stderr
+    with MLflowLogger(experiment="ppo", run_name="console", resume=False) as logger:
+        print("training started", flush=True)
+        print("training warning", file=sys.stderr, flush=True)
+        captured = capsys.readouterr()
+        assert captured.out == "training started\n"
+        assert captured.err == "training warning\n"
+        logger.log_metrics({"steps": 1}, step=1)
+        artifacts = client.list_artifacts(logger.run_id, "logs")
+        assert len(artifacts) == 1
+        path = Path(client.download_artifacts(logger.run_id, artifacts[0].path))
+        assert path.read_text() == "training started\ntraining warning\n"
+        print("training finished", end="")
+    assert sys.stdout is stdout
+    assert sys.stderr is stderr
+    captured = capsys.readouterr()
+    assert captured.out == "training finished"
+    assert captured.err == ""
+    expected = "training started\ntraining warning\ntraining finished"
+    assert Path(client.download_artifacts(logger.run_id, artifacts[0].path)).read_text() == expected
+
+    with (
+        pytest.raises(RuntimeError, match="training interrupted"),
+        MLflowLogger(experiment="ppo", run_name="console", resume=True) as resumed,
+    ):
+        assert resumed.run_id == logger.run_id
+        print("resuming")
+        raise RuntimeError("training interrupted")
+    resumed_artifacts = client.list_artifacts(logger.run_id, "logs")
+    assert len(resumed_artifacts) == 2
+    resumed_path = next(artifact.path for artifact in resumed_artifacts if artifact.path != artifacts[0].path)
+    text = Path(client.download_artifacts(logger.run_id, resumed_path)).read_text()
+    assert text.startswith("resuming\nTraceback (most recent call last):")
+    assert "RuntimeError: training interrupted" in text
+    assert Path(client.download_artifacts(logger.run_id, artifacts[0].path)).read_text() == expected
+    assert client.get_run(logger.run_id).info.status == "FAILED"
+    assert sys.stdout is stdout
+    assert sys.stderr is stderr
+
+
+@pytest.mark.parametrize("training_fails", [False, True])
+def test_console_upload_failure_restores_streams(client: MlflowClient, training_fails: bool) -> None:
+    stdout, stderr = sys.stdout, sys.stderr
+    logger = MLflowLogger(experiment="ppo", run_name=None, resume=False)
+    training_error = ValueError("training failed")
+    with (
+        pytest.raises(ValueError if training_fails else RuntimeError) as raised,
+        patch.object(logger.client, "log_artifact", side_effect=RuntimeError("upload failed")) as upload,
+        logger,
+    ):
+        print("training output")
+        if training_fails:
+            raise training_error
+    if training_fails:
+        assert raised.value is training_error
+        assert any("upload failed" in note for note in training_error.__notes__)
+    else:
+        assert str(raised.value) == "upload failed"
+    assert sys.stdout is stdout
+    assert sys.stderr is stderr
+    assert not Path(upload.call_args.args[1]).exists()
+    assert client.get_run(logger.run_id).info.status == "FAILED"

@@ -43,6 +43,7 @@ def test_shared_files_survive_pod_replacement() -> None:
             spec.pop("runtimeClassName")
             spec["activeDeadlineSeconds"] = 120
             container = spec["containers"][0]
+            container["imagePullPolicy"] = "IfNotPresent"
             container["workingDir"] = "/tmp"
             container["resources"] = {"requests": {"cpu": "10m", "memory": "16Mi"}, "limits": {"memory": "64Mi"}}
             pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": name, "namespace": "training"}, "spec": spec}

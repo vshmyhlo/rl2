@@ -12,6 +12,7 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent
 BUILD_ADDRESS = "unix:///run/rl2-buildkit/buildkitd.sock"
+IMAGE_MANAGER = "/usr/local/lib/rl2/image_pins.py"
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -98,6 +99,7 @@ def submit(args: argparse.Namespace) -> str:
     subprocess.run([*kubectl, "get", "workloadpriorityclass", f"train-{args.prio}"], check=True)
     subprocess.run([*kubectl, "-n", "training", "get", "pvc", "training-runs"], check=True)
     subprocess.run([*kubectl, "create", "--dry-run=server", "-f", "-"], input=manifest, text=True, check=True)
+    subprocess.run([*privilege, "systemctl", "is-active", "--quiet", "rl2-image-pins.timer"], check=True)
     print(f"Building {image} from {ROOT}", flush=True)
     subprocess.run(
         [
@@ -121,7 +123,7 @@ def submit(args: argparse.Namespace) -> str:
         ],
         check=True,
     )
-    subprocess.run([*kubectl, "create", "-f", "-"], input=manifest, text=True, check=True)
+    subprocess.run([*privilege, "/usr/bin/python3", IMAGE_MANAGER, "submit"], input=manifest, text=True, check=True)
     print(f"Queued {name} (priority={args.prio}, GPU=1)")
     print(f"Status: sudo k3s kubectl -n training get job {name}")
     print(f"Logs:   sudo k3s kubectl -n training logs -f job/{name}")

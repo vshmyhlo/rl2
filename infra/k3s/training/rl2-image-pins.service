@@ -1,0 +1,9 @@
+[Unit]
+Description=Reconcile local training image pins with Kubernetes Jobs
+Requires=k3s.service
+After=k3s.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/rl2/image_pins.py reconcile
+TimeoutStartSec=120

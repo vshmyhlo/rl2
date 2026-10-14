@@ -68,6 +68,7 @@ Evaluation scalars (when evaluation is enabled; unavailable scores are omitted):
 Artifacts (indexed by training step):
     config/<step>.yaml: Full training configuration as YAML, logged at startup and on resume.
     devices/<step>.txt: JAX devices used by this session.
+    logs/<session>.log: Python stdout/stderr after MLflow starts, including failure tracebacks.
     model/parameter_count/<step>.txt: Exact model parameter count.
     eval/report/<step>.json: Complete JSON report after each evaluation, including per-episode
         results, aggregate scores, training configuration, evaluation seed,
@@ -139,7 +140,6 @@ import yaml
 from flax import linen as nn
 from flax import struct
 from flax.training.train_state import TrainState
-from numpy.typing import NDArray
 from pydantic import ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
 
@@ -156,6 +156,7 @@ from rl2.mlflow_logging import MLflowLogger
 from rl2.model.encoders.kinetix import KinetixEncoder
 from rl2.model.encoders.rgb import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
 from rl2.model.encoders.xminigrid import XMiniGridEncoder
+from rl2.playback import EpisodeResult, PlaybackState, finish_episode
 from rl2.running_stats import RunningSum
 from rl2.utils import explained_variance, gae
 
@@ -685,10 +686,37 @@ def sample_policy_step(
     return carry, policy.sample(seed=key)  # carry leaves: (B, H); actions: (B, *action_shape)
 
 
-class EpisodeResult(NamedTuple):
-    episode_return: float
-    length: int
-    frames: list[NDArray[np.uint8]]  # each (H, W, 3)
+type EpisodeState = PlaybackState[jax.Array, Any, RecurrentCarry]
+
+
+def playback_step(
+    env: PPOEnv,
+    apply_fn: Callable[..., ActorCriticOutput],
+    params: optax.Params,
+    state: EpisodeState,  # observation/state/memory leaves as in PlaybackState
+) -> EpisodeState:
+    key, action_key, env_key = jax.random.split(state.key, 3)  # each () typed PRNG key
+    memory, actions = sample_policy_step(
+        apply_fn,
+        params,
+        state.observation[None],
+        state.memory,
+        state.episode_starts,
+        action_key,
+    )  # memory leaves: (1, H); actions: (1, *action_shape)
+    observation, env_state, reward, done, info = env.step(env_key, state.env_state, actions[0], env.params)
+    # observation: (*O,); state leaves: (...); reward/done: ()
+    return state._replace(
+        key=key,  # ()
+        observation=observation,  # (*O,)
+        env_state=env_state,  # leaves: (...)
+        final_state=info["final_state"],  # leaves: (...)
+        memory=memory,  # leaves: (1, H)
+        episode_starts=jnp.zeros(1, dtype=bool),  # (1,)
+        episode_return=state.episode_return + reward,  # ()
+        length=state.length + 1,  # ()
+        done=done,  # ()
+    )
 
 
 def play_episode(
@@ -701,34 +729,30 @@ def play_episode(
     env: PPOEnv,
     stop_at_frame_limit: bool = False,
 ) -> EpisodeResult:
-    """Run one episode, optionally recording (H, W, 3) uint8 RGB frames."""
+    """Run on device, transferring bounded state chunks for optional host rendering."""
     key, reset_key = jax.random.split(key)  # each () typed PRNG key
-    observation, env_state = env.reset(reset_key, env.params)  # (*O,); leaves: (...)
-    memory = initial_carry  # leaves: (1, H)
-    frames: list[NDArray[np.uint8]] = []  # entries: (H, W, 3)
-    if record:
-        frames.append(np.asarray(env.render(env_state)))
-    episode_return = 0.0
-    episode_step_count = 0
-    while not (stop_at_frame_limit and config.video_max_frames is not None and len(frames) >= config.video_max_frames):
-        key, action_key, env_key = jax.random.split(key, 3)  # each () typed PRNG key
-        memory, actions = sample_policy_step(
-            train_state.apply_fn,
-            train_state.params,
-            observation[None],
-            memory,
-            jnp.full(1, episode_step_count == 0, dtype=bool),
-            action_key,
-        )  # memory leaves: (1, H); actions: (1, *action_shape)
-        observation, env_state, reward, episode_end, info = env.step(env_key, env_state, actions[0], env.params)
-        # observation: (*O,); state leaves: (...); reward/episode_end: (); final_observation: (*O,)
-        episode_return += float(reward)
-        episode_step_count += 1
-        if record and (config.video_max_frames is None or len(frames) < config.video_max_frames):
-            frames.append(np.asarray(env.render(info["final_state"])))
-        if bool(episode_end):
-            break
-    return EpisodeResult(episode_return=episode_return, length=episode_step_count, frames=frames)
+    observation, env_state = env.reset(reset_key, env.params)  # observation/state leaves: (...)
+    state = PlaybackState(
+        key=key,  # ()
+        observation=observation,  # (*O,)
+        env_state=env_state,  # leaves: (...)
+        final_state=env_state,  # leaves: (...)
+        memory=initial_carry,  # leaves: (1, H)
+        episode_starts=jnp.ones(1, dtype=bool),  # (1,)
+        episode_return=jnp.asarray(0.0, dtype=jnp.float32),  # ()
+        length=jnp.asarray(0, dtype=jnp.int32),  # ()
+        done=jnp.asarray(False),  # ()
+    )
+    return finish_episode(
+        playback_step,
+        env,
+        train_state.apply_fn,
+        train_state.params,
+        state,
+        record=record,
+        frame_limit=config.video_max_frames,
+        stop_at_frame_limit=stop_at_frame_limit,
+    )
 
 
 def log_video(
@@ -739,6 +763,7 @@ def log_video(
     step_count: int,
     *,
     initial_carry: RecurrentCarry,  # leaves: (1, H)
+    env: PPOEnv | None = None,
 ) -> None:
     """Record a separate episode up to the frame cap and log its gameplay video."""
     print(f"Recording gameplay at step {step_count} after {episode_count} training episodes...", flush=True)
@@ -750,7 +775,7 @@ def log_video(
         initial_carry,
         record=True,
         stop_at_frame_limit=True,
-        env=make_env(config),
+        env=make_env(config) if env is None else env,
     )
     writer.log_video(frames, f"gameplay/{step_count}.mp4", fps=config.video_fps)
     seconds = monotonic() - started
@@ -768,12 +793,13 @@ def log_evaluation(
     step_count: int,
     *,
     initial_carry: RecurrentCarry,  # leaves: (1, H)
+    env: PPOEnv | None = None,
 ) -> None:
     """Evaluate fixed environment seeds, log raw scores, and record the last episode."""
     print(f"Evaluating {config.eval_episodes} games at step {step_count}...", flush=True)
     started = monotonic()
     episode_results: list[dict[str, float | int]] = []
-    env = make_env(config)
+    env = make_env(config) if env is None else env
     for episode_index in range(config.eval_episodes):
         episode_return, episode_step_count, frames = play_episode(
             train_state,
@@ -1135,10 +1161,11 @@ def train(config: Config) -> TrainState:
             # with fresh recurrent memory, retaining the policy and training RNGs.
             reset_keys = jax.random.split(jax.random.fold_in(key, start_rollout_index), config.num_envs)  # (B,) keys
             obs, env_state = jax.vmap(envs.reset, in_axes=(0, None))(reset_keys, envs.params)  # (B,*O); leaves: (B,...)
-            print(f"Resumed run {config.run_id} at step {start_rollout_index * batch_size}", flush=True)
         initial_step_count = start_rollout_index * batch_size
         writer = MLflowLogger(experiment="ppo", run_name=config.run_id, resume=progress is not None)
         resources.enter_context(writer)
+        if progress is not None:
+            print(f"Resumed run {config.run_id} at step {initial_step_count}", flush=True)
         writer.log_text(yaml.safe_dump(asdict(config)), f"config/{initial_step_count}.yaml")
         print(f"Run ID: {config.run_id}\nMLflow run: {writer.run_id}", flush=True)
         devices = str(jax.devices())
@@ -1175,6 +1202,7 @@ def train(config: Config) -> TrainState:
                     int(metrics.total.episode_count),
                     step_count,
                     initial_carry=model.initial_carry(1),
+                    env=envs,
                 )
             if config.eval_interval and (rollout_count % config.eval_interval == 0 or is_final_rollout):
                 log_evaluation(
@@ -1184,6 +1212,7 @@ def train(config: Config) -> TrainState:
                     int(metrics.total.episode_count),
                     step_count,
                     initial_carry=model.initial_carry(1),
+                    env=envs,
                 )
             if rollout_count % config.log_interval == 0 or is_final_rollout:
                 # Synchronize the window before measuring throughput.

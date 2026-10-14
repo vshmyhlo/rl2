@@ -14,6 +14,7 @@ from flax.training.train_state import TrainState
 
 from rl2 import ppo, train_mappo
 from rl2.actions import ContinuousSpace
+from rl2.envs.base import EnvStep
 from rl2.envs.gymnax_env import GymnaxEnv
 
 
@@ -99,22 +100,53 @@ def test_beta_playback_reuses_compiled_sampling_across_steps_and_episodes() -> N
         return ppo.ActorCriticOutput(carry, ppo.BetaPolicy(alpha, jnp.full_like(alpha, 2.0), space), jnp.zeros(1))
 
     state = TrainState.create(apply_fn=beta_policy, params={"alpha": jnp.full((1, 2), 2.0)}, tx=optax.sgd(0.1))
-    env = Mock(params={})
-    env.reset.return_value = observation, {}
-    env.render.return_value = np.zeros((2, 2, 3), np.uint8)  # (H,W,3)
-    env.step.side_effect = [
-        (observation, {}, jnp.asarray(1.0), jnp.asarray(done), {"final_state": {}})
-        for done in (False, True, False, True)
-    ]
-    with patch.object(ppo.BetaPolicy, "sample", autospec=True, side_effect=ppo.BetaPolicy.sample) as sample:
-        for record in (True, False):
-            score, length, frames = ppo.play_episode(state, config, jax.random.key(0), carry, record=record, env=env)
-            assert (score, length, len(frames)) == (2.0, 2, 3 if record else 0)
+
+    class Env:
+        def __init__(self) -> None:
+            self.params = {}
+
+        def reset(self, key: jax.Array, params: dict) -> tuple[jax.Array, dict[str, jax.Array]]:  # key: ()
+            return observation, {"step": jnp.asarray(0), "action": jnp.zeros(2)}  # (F,); (); (D,)
+
+        def step(
+            self,
+            key: jax.Array,  # ()
+            state: dict[str, jax.Array],  # step: (); action: (D,)
+            action: jax.Array,  # (D,)
+            params: dict,
+        ) -> EnvStep:
+            final = {"step": state["step"] + 1, "action": action}  # (); (D,)
+            return EnvStep(
+                observation=observation,  # (F,)
+                state=final,  # (); (D,)
+                reward=jnp.asarray(1.0),  # ()
+                done=final["step"] == 2,  # ()
+                info={
+                    "final_state": final,  # (); (D,)
+                    "final_observation": observation,  # (F,)
+                    "terminated": final["step"] == 2,  # ()
+                    "truncated": jnp.asarray(False),  # ()
+                },
+            )
+
+        def render(self, state: dict[str, jax.Array]) -> np.ndarray:  # state: (); (D,)
+            return np.zeros((2, 2, 3), np.uint8)  # (H, W, 3)
+
+    env = Env()
+    with (
+        patch.object(ppo.BetaPolicy, "sample", autospec=True, side_effect=ppo.BetaPolicy.sample) as sample,
+        patch.object(env, "render", wraps=env.render) as render,
+        patch.object(env, "step", wraps=env.step) as step,
+    ):
+        for _ in range(2):
+            score, length, frames = ppo.play_episode(state, config, jax.random.key(0), carry, record=True, env=env)
+            assert (score, length, len(frames)) == (2.0, 2, 3)
             state = state.replace(params={"alpha": jnp.full((1, 2), 10.0)})
     # Sampling should execute in the cached graph, including after parameter changes.
     assert sample.call_count == 1
-    actions = np.stack([call.args[2] for call in env.step.call_args_list])  # (T=4,D=2)
-    assert actions.shape == (4, 2) and np.isfinite(actions).all()
+    assert step.call_count == 1
+    actions = np.stack([render.call_args_list[i].args[0]["action"] for i in (1, 2, 4, 5)])  # (T=4, D=2)
+    assert actions.shape == (4, 2)
     assert np.all((actions > -1) & (actions < 1))
     assert not np.array_equal(actions[0], actions[1])  # Advancing RNG keys changes samples.
     assert not np.array_equal(actions[:2], actions[2:])  # Updated parameters reach the cached graph.

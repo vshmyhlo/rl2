@@ -21,8 +21,13 @@ tar -xzf "$buildkit_tmp/buildkit.tar.gz" -C "$buildkit_tmp" bin/buildctl bin/bui
 install -m 0755 "$buildkit_tmp/bin/buildctl" "$buildkit_tmp/bin/buildkitd" /usr/local/bin/
 install -m 0644 "$training_dir/buildkitd.toml" /etc/rl2-buildkit.toml
 install -m 0644 "$training_dir/rl2-buildkit.service" /etc/systemd/system/rl2-buildkit.service
+install -d -m 0755 /usr/local/lib/rl2
+install -m 0644 "$training_dir/image_pins.py" /usr/local/lib/rl2/image_pins.py
+install -m 0644 "$training_dir/rl2-image-pins.service" "$training_dir/rl2-image-pins.timer" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable rl2-buildkit
 systemctl restart rl2-buildkit
 k3s kubectl apply -f "$training_dir/priorities.yaml"
 k3s kubectl apply -f "$training_dir/storage.yaml"
+systemctl enable --now rl2-image-pins.timer
+systemctl start rl2-image-pins.service

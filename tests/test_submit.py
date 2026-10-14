@@ -73,7 +73,7 @@ def test_build_and_submit_preserves_command(monkeypatch: pytest.MonkeyPatch, tmp
     build = next(call for call in calls if "buildctl" in call.args[0])
     assert f"context={submit.ROOT}" in build.args[0]
     created = json.loads(calls[-1].kwargs["input"])
-    assert "--dry-run=server" not in calls[-1].args[0]
+    assert calls[-1].args[0][-2:] == [submit.IMAGE_MANAGER, "submit"]
     assert created["metadata"]["name"] == name
     assert created["metadata"]["labels"]["kueue.x-k8s.io/priority-class"] == "train-high"
     container = created["spec"]["template"]["spec"]["containers"][0]
@@ -84,10 +84,15 @@ def test_build_and_submit_preserves_command(monkeypatch: pytest.MonkeyPatch, tmp
     preview = next(call for call in calls if "--dry-run=server" in call.args[0])
     assert preview.kwargs["input"] == calls[-1].kwargs["input"]
     assert calls.index(preview) < calls.index(build) < len(calls) - 1
+    timer_check = next(call for call in calls if "systemctl" in call.args[0])
+    assert calls.index(timer_check) < calls.index(build)
     assert all(not call.kwargs.get("shell", False) for call in calls)
 
 
-@pytest.mark.parametrize("failed_step", [pytest.param(3, id="missing-storage"), pytest.param(5, id="build")])
+@pytest.mark.parametrize(
+    "failed_step",
+    [pytest.param(3, id="missing-storage"), pytest.param(5, id="inactive-cleanup-timer"), pytest.param(6, id="build")],
+)
 def test_failure_does_not_submit(failed_step: int) -> None:
     args = submit.parse_args(["--", "true"])
     failure = subprocess.CalledProcessError(returncode=1, cmd="failed-step")
@@ -98,6 +103,7 @@ def test_failure_does_not_submit(failed_step: int) -> None:
         submit.submit(args)
     assert run.call_count == failed_step
     assert not any("create" in c.args[0] and "--dry-run=server" not in c.args[0] for c in run.call_args_list)
+    assert not any(submit.IMAGE_MANAGER in c.args[0] for c in run.call_args_list)
 
 
 def test_dockerfile_dependency_sync(tmp_path: Path) -> None:

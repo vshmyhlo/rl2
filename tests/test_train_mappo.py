@@ -18,6 +18,7 @@ from ppo_helpers import metric_history
 from rl2 import train_mappo as ppo
 from rl2.envs.multi_agent import AgentObservation, MultiAgentStep
 from rl2.envs.smax_env import SMAXConfig, SMAXEnv
+from rl2.playback import PlaybackState, advance_episode
 
 
 @pytest.fixture(scope="module")
@@ -313,6 +314,31 @@ def test_episode_frame_limits(
     np.testing.assert_array_equal(result.frames[-1], expected_frames - 1)
 
 
+def test_compiled_playback_resets_dead_agent_memory() -> None:
+    env = ScriptedSMAX()
+    key, reset_key = jax.random.split(jax.random.key(0))  # each ()
+    observation, env_state = env.reset(reset_key)  # (N, O)/(N, A); state leaves: (...)
+    state = PlaybackState(
+        key=key,  # ()
+        observation=observation,  # (N=2, O=2)/(N, A=3)
+        env_state=env_state,  # leaves: (...)
+        final_state=env_state,  # leaves: (...)
+        memory=((jnp.full((2, 1), 9.0), jnp.full((2, 1), 9.0)),),  # leaves: (N, H=1)
+        episode_starts=jnp.ones(2, dtype=bool),  # (N,)
+        episode_return=jnp.asarray(0.0),  # ()
+        length=jnp.asarray(0, dtype=jnp.int32),  # ()
+        done=jnp.asarray(False),  # ()
+    )
+    result, saved = advance_episode(ppo.playback_step, env, scripted_policy, {}, state, 100, record=False)
+    assert saved is None and int(result.length) == 2 and float(result.episode_return) == 3.0
+    assert result.observation.observations.shape == (2, 2)
+    assert result.observation.action_masks.shape == (2, 3)
+    for leaf in jax.tree.leaves(result.memory):  # (N, H)
+        np.testing.assert_array_equal(leaf, [[1.0], [2.0]])
+    np.testing.assert_array_equal(result.episode_starts, [True, True])
+    assert int(result.env_state.state.step) == 0 and int(result.final_state.state.step) == 2
+
+
 def test_config_and_cli(config: ppo.Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "smax.yaml"
     path.write_text(yaml.safe_dump(asdict(config)))
@@ -382,6 +408,7 @@ def test_training_resume_wiring_and_environment_step_logging(
     for logger in (video, evaluation):
         logger.assert_called_once()
         chex.assert_shape(jax.tree.leaves(logger.call_args.kwargs["initial_carry"]), (2, 4))
+        assert logger.call_args.kwargs["env"] is env
     scalars = {tag: values[-1] for tag, values in metric_history(writer).items()}
     assert scalars["charts/total_environment_steps"] == (8.0, 8)
     assert scalars["charts/total_observations"] == (16.0, 8)

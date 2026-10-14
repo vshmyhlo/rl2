@@ -1,14 +1,19 @@
-"""MLflow runs, metrics, and playback artifacts shared by PPO trainers."""
+"""MLflow runs, console logs, metrics, and playback artifacts shared by PPO trainers."""
 
 import os
 import posixpath
+import sys
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from hashlib import sha256
+from io import TextIOBase
 from math import inf, isfinite, nextafter
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import time
+from traceback import print_exception
 from types import TracebackType
-from typing import Self
+from typing import Self, TextIO
+from uuid import uuid4
 
 import numpy as np
 from mlflow import MlflowClient
@@ -16,6 +21,31 @@ from mlflow.entities import Metric
 from mlflow.exceptions import MlflowException
 from moviepy import ImageSequenceClip
 from numpy.typing import NDArray
+
+
+class _Tee(TextIOBase):
+    def __init__(self, stream: TextIO, log: TextIO) -> None:
+        self.stream = stream
+        self.log = log
+
+    def write(self, text: str) -> int:
+        self.log.write(text)
+        return self.stream.write(text)
+
+    def flush(self) -> None:
+        self.stream.flush()
+        if not self.log.closed:
+            self.log.flush()
+
+    def isatty(self) -> bool:
+        return self.stream.isatty()
+
+    def fileno(self) -> int:
+        return self.stream.fileno()
+
+    @property
+    def encoding(self) -> str:
+        return self.stream.encoding
 
 
 class MLflowLogger:
@@ -60,19 +90,51 @@ class MLflowLogger:
                 run_name=run_name,
                 tags={"rl2.run_key": key, "rl2.trainer": experiment},
             ).info.run_id
+        self._console_resources = ExitStack()
+        self._console_file: TextIO | None = None
+        self._uploaded_size = 0
 
     def __enter__(self) -> Self:
+        with ExitStack() as resources:
+            directory = resources.enter_context(TemporaryDirectory())
+            self._console_path = Path(directory) / f"{uuid4().hex}.log"
+            self._console_file = resources.enter_context(self._console_path.open("w", encoding="utf-8"))
+            resources.enter_context(redirect_stdout(_Tee(stream=sys.stdout, log=self._console_file)))
+            resources.enter_context(redirect_stderr(_Tee(stream=sys.stderr, log=self._console_file)))
+            self._console_resources = resources.pop_all()
         return self
 
     def __exit__(
         self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None
     ) -> None:
+        failure = exc
         try:
-            self.client.set_terminated(self.run_id, status="FINISHED" if exc_type is None else "FAILED")
+            with self._console_resources:
+                if exc is not None:
+                    print_exception(exc_type, exc, traceback, file=self._console_file)
+                self._upload_console()
+        except Exception as error:  # noqa: BLE001 -- Terminate the run before propagating the failure.
+            if failure is None:
+                failure = error
+            else:
+                failure.add_note(f"MLflow console upload also failed: {error}")
+        try:
+            self.client.set_terminated(self.run_id, status="FINISHED" if failure is None else "FAILED")
         except Exception as error:
-            if exc is None:
+            if failure is None:
                 raise
-            exc.add_note(f"MLflow run {self.run_id} termination also failed: {error}")
+            failure.add_note(f"MLflow run {self.run_id} termination also failed: {error}")
+        if exc is None and failure is not None:
+            raise failure
+
+    def _upload_console(self) -> None:
+        if self._console_file is None or self._console_file.closed:
+            return
+        self._console_file.flush()
+        size = self._console_file.tell()
+        if size != self._uploaded_size:
+            self.client.log_artifact(self.run_id, str(self._console_path), artifact_path="logs")
+            self._uploaded_size = size
 
     def log_metrics(self, metrics: dict[str, float | int], step: int) -> None:
         timestamp = int(time() * 1000)
@@ -83,6 +145,7 @@ class MLflowLogger:
             ],
             synchronous=True,
         )
+        self._upload_console()
 
     def log_text(self, text: str, artifact_file: str) -> None:
         self.client.log_text(self.run_id, text, artifact_file)

@@ -78,6 +78,7 @@ def test_high_preempts_low_and_low_returns() -> None:
             pod_spec = job["spec"]["template"]["spec"]
             pod_spec["terminationGracePeriodSeconds"] = 5
             container = pod_spec["containers"][0]
+            container["imagePullPolicy"] = "IfNotPresent"
             container["workingDir"] = "/tmp"
             container["resources"]["requests"].update(cpu="100m", memory="128Mi")
             container["resources"]["limits"]["memory"] = "256Mi"
