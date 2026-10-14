@@ -18,7 +18,7 @@ PRESETS = Path(__file__).resolve().parents[1] / "configs/mappo/jaxmarl/storm"
 
 @pytest.mark.parametrize("preset,num_agents,grid_size", [("basic", 2, 6), ("advanced", 4, 8)])
 def test_shapes_interactions_and_timeout(preset: str, num_agents: int, grid_size: int) -> None:
-    config = ppo.load_config(PRESETS / f"{preset}.yaml")
+    config = ppo.load_config(PRESETS / f"{preset}.yaml", ppo.Config)
     env = ppo.make_env(replace(config, env=replace(config.env, max_steps=2)))
     assert isinstance(env, STORMEnv)
     assert env.num_agents == num_agents and env.config.grid_size == grid_size
@@ -102,7 +102,7 @@ def test_simultaneous_mixed_payoffs_and_respawn() -> None:
 
 def test_update_and_playback() -> None:
     config = replace(
-        ppo.load_config(PRESETS / "basic.yaml"),
+        ppo.load_config(PRESETS / "basic.yaml", ppo.Config),
         env=STORMConfig(game="coordination", grid_size=6, max_steps=1),
         num_envs=1,
         num_steps=1,

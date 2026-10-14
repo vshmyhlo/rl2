@@ -11,7 +11,7 @@ from rl2.train_mappo import Config, MLPEncoderConfig, ModelConfig, load_config, 
 
 @pytest.mark.parametrize("field", ["model", "encoder"])
 def test_requires_encoder(field: str) -> None:
-    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/mappo/smax.yaml"))
+    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/mappo/smax.yaml", Config))
     (settings if field == "model" else settings["model"]).pop(field)
     with pytest.raises(ValidationError) as error:
         Config(**settings)
@@ -51,7 +51,7 @@ def test_encoder_round_trip() -> None:
     ],
 )
 def test_invalid_environment(env: dict[str, object], error_type: str) -> None:
-    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/mappo/smax.yaml"))
+    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/mappo/smax.yaml", Config))
     settings["env"] = env
     with pytest.raises(ValidationError) as error:
         Config(**settings)
@@ -60,7 +60,7 @@ def test_invalid_environment(env: dict[str, object], error_type: str) -> None:
 
 
 def test_rejects_separate_environment_sections() -> None:
-    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/mappo/smax.yaml"))
+    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/mappo/smax.yaml", Config))
     env = settings.pop("env")
     settings["env_id"] = env.pop("id")
     settings["smax"] = env
@@ -73,7 +73,7 @@ def test_mappo_presets() -> None:
     paths = sorted((Path(__file__).resolve().parents[1] / "configs/mappo").rglob("*.yaml"))
     run_ids: set[str] = set()
     for path in paths:
-        config = load_config(path)
+        config = load_config(path, Config)
         restored = Config(**asdict(config))
         assert restored == config and hash(restored) == hash(config)
         assert {"env_id", "smax", "jaxnav", "mpe"}.isdisjoint(asdict(config))

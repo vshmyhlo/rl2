@@ -120,7 +120,7 @@ def test_termination_timeout_and_partial_autoreset() -> None:
 def test_real_kinetix_rollout_update_and_video() -> None:
     pytest.importorskip("kinetix")
     config = replace(
-        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml"),
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml", ppo.Config),
         num_envs=1,
         num_steps=2,
         num_minibatches=1,

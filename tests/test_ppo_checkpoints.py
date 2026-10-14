@@ -68,7 +68,7 @@ with (
 @pytest.fixture
 def config(tmp_path: Path) -> ppo.Config:
     return replace(
-        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", ppo.Config),
         ckpt_dir=str(tmp_path),
         run_id="resume-test",
         num_envs=1,
@@ -145,7 +145,7 @@ def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Confi
 def test_checkpoint_timing_includes_completed_writes(
     trainer: ModuleType, config_path: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    config = trainer.load_config(Path(__file__).resolve().parents[1] / config_path)
+    config = trainer.load_config(Path(__file__).resolve().parents[1] / config_path, trainer.Config)
     progress = trainer.TrainingProgress(
         train_state=Mock(spec=TrainState),
         key=jax.random.key(0),  # () typed PRNG key
@@ -199,7 +199,7 @@ def test_checkpoint_preserves_episode_totals(config: ppo.Config, state: TrainSta
     ids=["ppo", "mappo"],
 )
 def test_checkpoint_ignores_saved_config(trainer: ModuleType, config_path: str, state: TrainState) -> None:
-    config = trainer.load_config(Path(__file__).resolve().parents[1] / config_path)
+    config = trainer.load_config(Path(__file__).resolve().parents[1] / config_path, trainer.Config)
     progress = trainer.TrainingProgress(
         train_state=state,
         key=jax.random.key(3),  # () typed PRNG key
@@ -322,7 +322,7 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
     settings = asdict(config)
     settings.update(env={"id": "Breakout-MinAtar"}, ckpt_dir=config.ckpt_dir + "/${run_id}/${path_name:${env.id}}")
     path.write_text(ppo.yaml.safe_dump(settings))
-    config = ppo.load_config(path)
+    config = ppo.load_config(path, ppo.Config)
     assert config.checkpoint_interval == 600
     config = replace(config, checkpoint_interval=2, log_interval=2)
     obs = np.zeros((1, 1), dtype=np.uint8)

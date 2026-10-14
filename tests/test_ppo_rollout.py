@@ -35,7 +35,7 @@ def policy(
 @pytest.mark.parametrize("num_envs,num_steps", [(1, 1), (2, 3)], ids=["single-transition", "batched-sequence"])
 def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs: int, num_steps: int) -> None:
     config = replace(
-        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", ppo.Config),
         num_envs=num_envs,
         num_steps=num_steps,
         num_minibatches=1,
@@ -93,7 +93,7 @@ def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs:
 
 def test_train_step_matches_separate_rollout_and_updates_with_real_model() -> None:
     config = replace(
-        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", ppo.Config),
         num_envs=2,
         num_steps=2,
         num_minibatches=2,
@@ -187,7 +187,7 @@ def test_train_step_matches_separate_rollout_and_updates_with_real_model() -> No
 @pytest.mark.parametrize("reject_at", [0, 1, 2], ids=["first-minibatch", "mid-epoch", "next-epoch"])
 def test_train_step_stops_updates_and_rng_at_rejected_minibatch(reject_at: int) -> None:
     config = replace(
-        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", ppo.Config),
         num_envs=2,
         num_steps=1,
         num_minibatches=2,
@@ -294,7 +294,7 @@ def test_train_step_stops_updates_and_rng_at_rejected_minibatch(reject_at: int) 
 
 def test_terminal_and_timeout_targets_use_final_observations() -> None:
     config = replace(
-        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", ppo.Config),
         num_envs=4,
         num_steps=1,
         num_minibatches=1,

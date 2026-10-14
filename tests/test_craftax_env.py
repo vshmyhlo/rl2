@@ -158,7 +158,7 @@ def test_real_craftax_reset_step_and_video(
 
 def test_symbolic_ppo_rollout_and_update() -> None:
     config = replace(
-        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml"),
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml", ppo.Config),
         env=CraftaxConfig(env_id="Craftax-Symbolic-v1", max_steps=2),
         num_envs=1,
         num_steps=2,

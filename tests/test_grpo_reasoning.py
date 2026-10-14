@@ -527,7 +527,7 @@ def test_config_validation(overrides: dict[str, Any], match: str) -> None:
 
 
 def test_yaml_config(tmp_path: Path) -> None:
-    config = grpo.load_config("configs/grpo_reasoning/gemma3.yaml")
+    config = grpo.load_config("configs/grpo_reasoning/gemma3.yaml", grpo.Config)
     assert config.task == "basic_arithmetic"
     assert config.duration_penalty_coef == 0.0
     assert config.group_size == 4 and config.total_updates == 1000
@@ -550,26 +550,26 @@ def test_yaml_config(tmp_path: Path) -> None:
     assert config.checkpoint_interval_seconds == 600
     path = tmp_path / "config.yaml"
     path.write_text("group_size: 2\nnum_minibatches: 1\ntask_config:\n  max_animals: 3\n")
-    default_config = grpo.load_config(path)
+    default_config = grpo.load_config(path, grpo.Config)
     assert default_config.task_config == {"max_animals": 3}
     assert default_config.run_id is not None
-    assert default_config.run_id.startswith("grpo_reasoning_")
+    assert default_config.run_id[0:8].isdigit()
     assert default_config.ckpt_dir == f"runs/grpo_reasoning/{default_config.run_id}"
     path.write_text("group_size: 2.5\n")
     with pytest.raises(ValueError, match="group_size"):
-        grpo.load_config(path)
+        grpo.load_config(path, grpo.Config)
     path.write_text("unknown: 1\n")
     with pytest.raises(ValueError, match="unknown"):
-        grpo.load_config(path)
+        grpo.load_config(path, grpo.Config)
 
 
 def test_checkpoint_directory_interpolation(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text("ckpt_dir: gs://bucket/grpo/${run_id}\nrun_id: reasoning_${task}_seed${seed}\nseed: 7\n")
-    config = grpo.load_config(path)
+    config = grpo.load_config(path, grpo.Config)
     assert config.run_id == "reasoning_leg_counting_seed7"
     assert config.ckpt_dir == "gs://bucket/grpo/reasoning_leg_counting_seed7"
-    assert grpo.resolve_config(config) == config
+    assert config.resolve_run() == config
 
 
 @pytest.mark.parametrize(
@@ -584,7 +584,7 @@ def test_invalid_prompt_examples(example: dict[str, Any], match: str, tmp_path: 
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump({"prompt_examples": [example]}))
     with pytest.raises(ValidationError, match=match):
-        grpo.load_config(path)
+        grpo.load_config(path, grpo.Config)
 
 
 def test_initialization_reports_stage_before_checkpoint_load_failure(

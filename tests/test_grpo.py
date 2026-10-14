@@ -36,6 +36,7 @@ from rl2.train_karel_ast_grpo import (
 @pytest.fixture(scope="module")
 def config() -> Config:
     return Config(
+        run_id="test",
         total_updates=1,
         num_tasks=1,
         group_size=2,
@@ -438,7 +439,7 @@ def test_formatted_samples_replay_ast_source(config: Config, rollout: tuple) -> 
 
 
 def test_configuration_and_schedule(config: Config, tmp_path: Path) -> None:
-    loaded = load_config(Path(__file__).resolve().parents[1] / "configs/karel_ast_grpo.yaml")
+    loaded = load_config(Path(__file__).resolve().parents[1] / "configs/karel_ast_grpo.yaml", Config)
     assert loaded.max_nodes == 128
     assert not hasattr(loaded, "decision_batch_size")
     assert loaded.bf16 and loaded.attention_implementation == "cudnn"
@@ -452,10 +453,10 @@ def test_configuration_and_schedule(config: Config, tmp_path: Path) -> None:
     )
     config_path = tmp_path / "weighted.yaml"
     config_path.write_text(grpo.yaml.safe_dump(grpo.asdict(weighted)))
-    assert load_config(config_path) == weighted
+    assert load_config(config_path, Config) == weighted
     # Older saved run configs still load for inference/resume.
     config_path.write_text(grpo.yaml.safe_dump({**grpo.asdict(weighted), "decision_batch_size": 32}))
-    assert load_config(config_path) == weighted
+    assert load_config(config_path, Config) == weighted
     schedule = learning_rate_schedule(config)
     np.testing.assert_allclose(schedule(0), config.learning_rate)
     np.testing.assert_allclose(schedule(config.total_updates), 0.0)
@@ -510,7 +511,7 @@ def test_invalid_checkpoint_interval(config: Config, interval: float) -> None:
 
 
 def test_legacy_weights_load_for_inference_but_cannot_resume(config: Config, state: TrainState, tmp_path: Path) -> None:
-    config = replace(config, log_dir=str(tmp_path), run_id="legacy")
+    config = replace(config, log_dir=str(tmp_path / "logs"), ckpt_dir=str(tmp_path / "legacy"), run_id="legacy")
     directory = tmp_path / "legacy"
     directory.mkdir()
     (directory / "config.yaml").write_text(grpo.yaml.safe_dump(grpo.asdict(config)))
@@ -539,7 +540,7 @@ def test_legacy_reference_checkpoint_and_config_load_without_reference(
     np.testing.assert_array_equal(restored_rng.integers(100, size=4), rng.integers(100, size=4))
     config_path = tmp_path / "config.yaml"
     config_path.write_text(grpo.yaml.safe_dump({**grpo.asdict(config), "kl_coef": 0.25}))
-    assert grpo.load_config(config_path) == config
+    assert grpo.load_config(config_path, grpo.Config) == config.resolve_run()
 
 
 def test_load_model_from_checkpoint(config: Config, state: TrainState, tmp_path: Path) -> None:
@@ -547,6 +548,6 @@ def test_load_model_from_checkpoint(config: Config, state: TrainState, tmp_path:
     progress = grpo.TrainingProgress(state, jax.random.key(3), 2, 8, 1, 8)
     grpo._save_checkpoint(str(tmp_path), progress, np.random.default_rng(4))
     loaded_config, loaded = grpo.load_model(tmp_path, attention_implementation="xla")
-    assert loaded_config == config
+    assert loaded_config == config.resolve_run()
     chex.assert_trees_all_equal(loaded.params, state.params)
     assert int(loaded.step) == 0

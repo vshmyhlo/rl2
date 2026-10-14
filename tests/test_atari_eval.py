@@ -36,7 +36,7 @@ class AtariConfig(ppo_rnd.Config):
 
 
 def training_config() -> AtariConfig:
-    config = ppo_rnd.load_config(Path(__file__).resolve().parents[1] / "configs/ppo_rnd_montezuma.yaml")
+    config = ppo_rnd.load_config(Path(__file__).resolve().parents[1] / "configs/ppo_rnd_montezuma.yaml", ppo_rnd.Config)
     return replace(AtariConfig(**asdict(config)), env_id="ALE/Pong-v5", atari_preprocessing=True)
 
 
@@ -317,7 +317,7 @@ def test_full_games_raw_returns_memory_and_json(tmp_path: Path) -> None:
 
 def test_rnd_evaluation_carry_policy_interface_and_report(tmp_path: Path) -> None:
     config = replace(
-        ppo_rnd.load_config(Path(__file__).resolve().parents[1] / "configs/ppo_rnd_montezuma.yaml"),
+        ppo_rnd.load_config(Path(__file__).resolve().parents[1] / "configs/ppo_rnd_montezuma.yaml", ppo_rnd.Config),
         env_id="ALE/Pong-v5",
         atari_preprocessing=True,
         frame_stack=False,
@@ -624,7 +624,9 @@ def test_evaluation_logging_records_scores_and_report_without_mutating_state(tra
     config = replace(
         training_config()
         if trainer == "ppo"
-        else ppo_rnd.load_config(Path(__file__).resolve().parents[1] / "configs/ppo_rnd_montezuma.yaml"),
+        else ppo_rnd.load_config(
+            Path(__file__).resolve().parents[1] / "configs/ppo_rnd_montezuma.yaml", ppo_rnd.Config
+        ),
         env_id="ALE/Pong-v5",
         eval_episodes=2,
         eval_seed=321,

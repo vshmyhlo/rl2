@@ -19,6 +19,7 @@ model:
   recurrent:
     type: lstm
     hidden_size: 256
+    num_layers: 4
 bf16: true
 learning_rate: 0.00025
 anneal_lr: true
@@ -39,7 +40,7 @@ checkpoint_interval: 489
 log_interval: 60
 video_interval: 245
 video_max_frames: 900
-video_fps: 40.0
+video_fps: 24
 eval_interval: 489
 eval_episodes: 10
 eval_seed: 10000

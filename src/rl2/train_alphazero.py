@@ -74,7 +74,7 @@ player-to-move perspective. This is not an exact reproduction of the paper.
 import argparse
 import logging
 import sys
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from functools import partial
 from time import monotonic
 
@@ -90,13 +90,13 @@ from omegaconf.errors import OmegaConfBaseException
 from tensorboardX import SummaryWriter
 
 from rl2.alphazero.checkpoints import TrainingProgress, checkpoint_manager, restore_checkpoint, save_checkpoint
-from rl2.alphazero.config import Config, load_config
+from rl2.alphazero.config import Config
 from rl2.alphazero.evaluation import evaluate
 from rl2.alphazero.model import Parameters, PolicyValueNet
 from rl2.alphazero.puct import puct_policy
 from rl2.alphazero.search import PolicyValueFn, recurrent_step
 from rl2.alphazero.utils import masked_logits
-from rl2.configuration import resolve_settings
+from rl2.configuration import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -297,8 +297,7 @@ def sample_batch(batch: Batch, key: jax.Array, batch_size: int) -> Batch:
 
 
 def train(config: Config) -> TrainState:
-    settings = resolve_settings(asdict(config))
-    config = replace(config, run_id=settings["run_id"], log_dir=settings["log_dir"])
+    config = config.resolve_run()
     env = pgx.make(config.env_id)
     model = PolicyValueNet(env.num_actions, config.model.channels, config.model.num_blocks)
     key, init_key, env_key = jax.random.split(jax.random.PRNGKey(config.seed), 3)
@@ -313,7 +312,7 @@ def train(config: Config) -> TrainState:
         ),
     )
     with (
-        checkpoint_manager(config.log_dir) as manager,
+        checkpoint_manager(config.ckpt_dir) as manager,
         SummaryWriter(
             logdir=config.log_dir,
             purge_step=(
@@ -438,7 +437,7 @@ def main() -> None:
     parser.add_argument("--config", default="configs/alphazero_chess.yaml", help="Path to a YAML config")
     args = parser.parse_args()
     try:
-        config = load_config(args.config)
+        config = load_config(args.config, Config)
     except (OSError, TypeError, ValueError, yaml.YAMLError, OmegaConfBaseException) as error:
         parser.error(str(error))
     logging.basicConfig(

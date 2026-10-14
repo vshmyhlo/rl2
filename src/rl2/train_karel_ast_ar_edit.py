@@ -72,12 +72,11 @@ accumulation breaking ties; delta rewards and feedback remain available during e
 import argparse
 from contextlib import ExitStack
 from dataclasses import asdict, field, replace
-from datetime import UTC, datetime
 from functools import partial
 from operator import itemgetter
 from pathlib import Path
 from time import monotonic
-from typing import Annotated, NamedTuple
+from typing import Annotated, Any, NamedTuple
 
 import chex
 import jax
@@ -87,12 +86,12 @@ import optax
 import yaml
 from flax.training.train_state import TrainState
 from numpy.typing import NDArray
-from pydantic import ConfigDict, Field
+from pydantic import Field, model_validator
 from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
 from rl2.attention import AttentionType
-from rl2.configuration import load_settings
+from rl2.configuration import BaseConfig, load_config
 from rl2.edit_transformer import (
     EDIT_EVENT,
     FEEDBACK_EVENT,
@@ -132,8 +131,9 @@ from rl2.transformer import TransformerStackCarry
 from rl2.utils import read_bytes, read_optional, write_bytes
 
 
-@dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
-class Config:
+@dataclass(frozen=True)
+class Config(BaseConfig):
+    ckpt_dir: str = field(default="${log_dir}/${run_id}", kw_only=True)
     # Reproducibility and training duration.
     seed: Annotated[int, Field(ge=0)] = 1
     total_updates: Annotated[int, Field(gt=0)] = 1000  # Number of rollout batches, independent of program length.
@@ -175,7 +175,6 @@ class Config:
 
     # Run storage, checkpointing, and logging.
     log_dir: str = "runs"
-    run_id: str | None = None  # Same ID resumes; None creates a timestamped run.
     checkpoint_interval_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] = (
         300.0  # Save at the next completed rollout boundary.
     )
@@ -188,11 +187,14 @@ class Config:
     log_program_count: Annotated[int, Field(ge=0)] = 8  # First N programs in one group; zero disables samples.
     log_compiles: bool = False  # Print named dimensions (b=batch, t=time) on new prediction/update JIT traces.
 
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_legacy_settings(cls, values: Any) -> Any:
+        if isinstance(values, dict):
+            return {name: value for name, value in values.items() if name not in ("replay_batch_size",)}
+        return values
+
     def __post_init__(self) -> None:
-        if self.run_id is not None and (
-            not self.run_id.strip() or self.run_id in (".", "..") or any(c in self.run_id for c in "/\\")
-        ):
-            raise ValueError("run_id must be a nonempty directory name without slashes or traversal")
         if self.attention_implementation == "cudnn" and not self.bf16:
             raise ValueError("cuDNN attention requires bf16=True")
         if self.num_tasks * self.group_size % self.num_minibatches:
@@ -261,16 +263,6 @@ def mask_logits(logits: jax.Array, legal: Array) -> jax.Array:
     chex.assert_type(logits, jnp.float32)
     chex.assert_type(legal, jnp.bool_)
     return jnp.where(legal, logits, -jnp.inf)
-
-
-def load_config(path: str | Path) -> Config:
-    """Load local or remote YAML into validated training and environment settings."""
-    settings = load_settings(path, asdict(Config()), generate_run_id=False)
-    # Older checkpoints stored the retired gradient-accumulation setting.
-    settings.pop("replay_batch_size", None)
-    if "env" in settings:
-        settings["env"] = KarelConfig(**settings["env"])
-    return Config(**settings)
 
 
 def create_state(config: Config, initial: Array, target: Array) -> TrainState:
@@ -708,7 +700,7 @@ def load_model(
     Optimizer state is freshly initialized; training resume is handled by train().
     """
     directory = str(run_dir).rstrip("/")
-    config = load_config(f"{directory}/config.yaml")
+    config = load_config(f"{directory}/config.yaml", Config)
     if attention_implementation is not None:
         config = replace(config, attention_implementation=attention_implementation)
     dummy = np.zeros((1, config.env.height, config.env.width, 6), np.int32)
@@ -736,19 +728,18 @@ def check_resume_config(config: Config, saved: Config) -> None:
 
 def train(config: Config) -> TrainState:
     """Run or resume editing-policy training with grouped rollouts, KL stopping, logs, and checkpoints."""
+    config = config.resolve_run()
     configure_compilation_cache()
     batch_size = config.num_tasks * config.group_size
     rng = np.random.default_rng(config.seed)
     key = jax.random.key(config.seed)
     dummy = np.zeros((1, config.env.height, config.env.width, 6), np.int32)
     state = create_state(config, dummy, dummy)
-    run_name = config.run_id or f"karel_ast_ar_edit_seed{config.seed}_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"
-    config = replace(config, run_id=run_name)
-    run_dir = f"{config.log_dir.rstrip('/')}/{run_name}"
+    run_dir = config.ckpt_dir.rstrip("/")
     checkpoint = read_optional(f"{run_dir}/checkpoint.msgpack")
     progress = TrainingProgress(state, key, 0, 0, 0, 0)
     if checkpoint is not None:
-        check_resume_config(config, load_config(f"{run_dir}/config.yaml"))
+        check_resume_config(config, load_config(f"{run_dir}/config.yaml", Config))
         progress = _restore_checkpoint(checkpoint, state, rng)
         print(f"Resuming {run_dir} at rollout {progress.iteration}, step {progress.steps}", flush=True)
     else:
@@ -886,7 +877,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/karel_ast_ar_edit.yaml", help="Path to a YAML config")
     args = parser.parse_args()
-    train(load_config(args.config))
+    train(load_config(args.config, Config))
 
 
 if __name__ == "__main__":

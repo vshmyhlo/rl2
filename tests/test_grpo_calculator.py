@@ -14,7 +14,7 @@ from rl2.gemma3 import Gemma3Carry, Gemma3LM, Parameters
 
 
 def test_calculator_config_and_chat_format() -> None:
-    config = grpo.load_config("configs/grpo_reasoning/gemma3.yaml")
+    config = grpo.load_config("configs/grpo_reasoning/gemma3.yaml", grpo.Config)
     assert config.calculator_max_calls == 2 and grpo.Config().calculator_max_calls == 0
     assert config.prompt_examples == []
     for overrides in ({"calculator_max_calls": -1}, {"max_prompt_tokens": 32768}):

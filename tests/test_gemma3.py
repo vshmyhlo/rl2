@@ -231,13 +231,13 @@ def test_official_tokenizer_adapter(tmp_path: Path) -> None:
 
 
 def test_gemma_config_boundaries(tmp_path: Path) -> None:
-    config = grpo.load_config("configs/grpo_reasoning/gemma3.yaml")
+    config = grpo.load_config("configs/grpo_reasoning/gemma3.yaml", grpo.Config)
     assert config.calculator_max_calls == 2
     assert config.checkpoint == str(gm.ckpts.CheckpointPath.GEMMA3_270M_IT)
     path = tmp_path / "config.yaml"
     path.write_text("model_type: unknown")
     with pytest.raises(ValueError, match="model_type"):
-        grpo.load_config(path)
+        grpo.load_config(path, grpo.Config)
     with pytest.raises(ValueError, match="32768-token context"):
         Gemma3LM(gm.nn.Gemma3_270M(), cache_length=32769)
 

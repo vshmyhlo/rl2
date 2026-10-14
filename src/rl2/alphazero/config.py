@@ -1,13 +1,12 @@
 """Validated AlphaZero settings and OmegaConf YAML loading."""
 
-from dataclasses import asdict
-from pathlib import Path
+from dataclasses import field
 from typing import Annotated, Literal
 
-from pydantic import ConfigDict, Field, NonNegativeInt, PositiveInt, field_validator
+from pydantic import ConfigDict, Field, NonNegativeInt, PositiveInt
 from pydantic.dataclasses import dataclass
 
-from rl2.configuration import load_settings
+from rl2.configuration import BaseConfig
 
 type EnvId = Literal["chess", "gardner_chess", "tic_tac_toe"]
 type PositiveFiniteFloat = Annotated[float, Field(gt=0, allow_inf_nan=False)]
@@ -28,8 +27,9 @@ class EvaluationConfig:
     seed: Annotated[int, Field(ge=0, lt=2**32, strict=True)] = 0
 
 
-@dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
-class Config:
+@dataclass(frozen=True)
+class Config(BaseConfig):
+    ckpt_dir: str = field(default="${log_dir}", kw_only=True)
     env_id: EnvId = "chess"
     seed: Annotated[int, Field(ge=0, lt=2**32)] = 0
     iterations: PositiveInt = 100
@@ -46,19 +46,6 @@ class Config:
     dirichlet_fraction: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)] = 0.25
     exploration_moves: NonNegativeInt = 30
     log_dir: Annotated[str, Field(pattern=r"\S")] = "runs/alphazero/${run_id}"
-    run_id: str | None = None
     log_interval_seconds: PositiveFiniteFloat = 60.0
     checkpoint_interval_seconds: PositiveFiniteFloat = 600.0
     evaluation: EvaluationConfig = EvaluationConfig()
-
-    @field_validator("run_id")
-    @classmethod
-    def validate_run_id(cls, value: str | None) -> str | None:
-        if value is not None and (not value.strip() or value in (".", "..") or any(c in value for c in "/\\")):
-            raise ValueError("run_id must be a nonempty directory name without slashes or traversal")
-        return value
-
-
-def load_config(path: str | Path) -> Config:
-    """Load and validate training settings from a YAML mapping."""
-    return Config(**load_settings(path, asdict(Config())))

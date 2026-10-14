@@ -147,7 +147,7 @@ from pydantic import ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
 
 from rl2.actions import ActionSpace, BetaPolicy, CategoricalPolicy, DiscreteSpace, Policy, TruncatedGaussianPolicy
-from rl2.configuration import load_settings
+from rl2.configuration import BaseConfig, load_config
 from rl2.envs.base import BaseEnv
 from rl2.envs.brax_env import BraxConfig, BraxEnv
 from rl2.envs.craftax_env import CraftaxConfig, CraftaxEnv
@@ -349,8 +349,8 @@ class ModelConfig:
     continuous_policy: Literal["truncated_gaussian", "beta"] = "truncated_gaussian"
 
 
-@dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
-class Config:
+@dataclass(frozen=True)
+class Config(BaseConfig):
     model: ModelConfig
     env: Annotated[
         GymnaxConfig | KinetixConfig | XMiniGridConfig | CraftaxConfig | PlaygroundConfig | JAXtariConfig | BraxConfig,
@@ -371,7 +371,6 @@ class Config:
     entropy_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)]
     value_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)]
     max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)]
-    ckpt_dir: str
     video_fps: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     bf16: bool = True
     video_max_frames: Annotated[int, Field(gt=0)] | None = 900
@@ -381,15 +380,8 @@ class Config:
     eval_seed: Annotated[int, Field(ge=0, lt=2**32)] = 10_000
     lr_decay: Literal["linear", "cosine"] = "linear"
     entropy_decay: Literal["constant", "cosine"] = "constant"
-    run_id: str | None = None
     checkpoint_interval: Annotated[int, Field(gt=0)] = 600
     log_interval: Annotated[int, Field(gt=0)] = 60
-
-    def __post_init__(self) -> None:
-        if self.run_id is not None and (
-            not self.run_id.strip() or self.run_id in (".", "..") or any(c in self.run_id for c in "/\\")
-        ):
-            raise ValueError("run_id must be a nonempty directory name without slashes or traversal")
 
     @model_validator(mode="after")
     def validate_rollout(self) -> Self:
@@ -539,11 +531,6 @@ def restore_checkpoint(
         episode_return_sum=metadata["training_return_sum"],
         episode_length_sum=metadata["training_length_sum"],
     )
-
-
-def load_config(path: str | Path) -> Config:
-    """Load, resolve all interpolations and the run ID, and validate a training config."""
-    return Config(**load_settings(path))
 
 
 def learning_rate_schedule(config: Config) -> optax.Schedule:
@@ -1153,6 +1140,7 @@ train_step_donated = jax.jit(train_step, static_argnames=("envs", "config"), don
 
 def train(config: Config) -> TrainState:
     """Train with a fully resolved config, as returned by load_config."""
+    config = config.resolve_run()
     with ExitStack() as resources:
         configure_compilation_cache()
         batch_size = config.num_envs * config.num_steps
@@ -1346,7 +1334,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/ppo.yaml", help="Path to a YAML config")
     args = parser.parse_args()
-    train(load_config(args.config))
+    train(load_config(args.config, Config))
 
 
 if __name__ == "__main__":

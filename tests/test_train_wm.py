@@ -24,12 +24,12 @@ from rl2.wm import LSTMWorldModel, MambaWorldModel, WorldModelState, categorical
 
 def training_config(**overrides: Any) -> train_wm.Config:
     path = Path(__file__).resolve().parents[1] / "configs/wm_atari.yaml"
-    return replace(train_wm.load_config(path), **({"model": "mamba"} | overrides))
+    return replace(train_wm.load_config(path, train_wm.Config), **({"model": "mamba"} | overrides))
 
 
 def test_model_configuration_and_legacy_default() -> None:
     path = Path(__file__).resolve().parents[1] / "configs/wm_atari.yaml"
-    config = train_wm.load_config(path)
+    config = train_wm.load_config(path, train_wm.Config)
     assert (config.model, config.num_layers, config.d_model, config.d_intermediate) == ("lstm", 4, 512, 0)
     settings = {**asdict(config), "encoder_stages": config.encoder_stages}
     del settings["model"]
@@ -424,10 +424,10 @@ def test_bf16_fallback_and_explicit_fp32_config(tmp_path: Path) -> None:
     del settings["bf16"]
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(settings))
-    assert train_wm.load_config(path).bf16
+    assert train_wm.load_config(path, train_wm.Config).bf16
     settings["bf16"] = False
     path.write_text(yaml.safe_dump(settings))
-    assert not train_wm.load_config(path).bf16
+    assert not train_wm.load_config(path, train_wm.Config).bf16
 
 
 def test_config_requires_all_training_settings(tmp_path: Path) -> None:
@@ -436,7 +436,7 @@ def test_config_requires_all_training_settings(tmp_path: Path) -> None:
     path = tmp_path / "incomplete.yaml"
     path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match="learning_rate"):
-        train_wm.load_config(path)
+        train_wm.load_config(path, train_wm.Config)
 
 
 def test_main_loads_yaml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -483,8 +483,10 @@ def test_main_uses_default_atari_config(monkeypatch: pytest.MonkeyPatch) -> None
 
     monkeypatch.setattr(train_wm, "train", train)
     train_wm.main()
-    assert calls == [train_wm.load_config("configs/wm_atari.yaml")]
+    assert len(calls) == 1
     config = calls[0]
+    assert config.run_id is not None
+    assert config.ckpt_dir == f"{config.checkpoint_dir}/{config.run_id}"
     assert config.num_envs == 8 and config.vector_env == "async" and config.bf16
     schedule = train_wm.learning_rate_schedule(config)
     assert float(schedule(1000)) < float(schedule(0))
@@ -619,7 +621,9 @@ def test_training_loop_short_rollout_checkpoints_and_cleanup(
         video_every_steps=0,
         checkpoint_every=10,
         log_dir=str(tmp_path / "logs"),
-        checkpoint_dir=str(tmp_path / "checkpoints"),
+        checkpoint_dir=str(tmp_path / "legacy-checkpoints"),
+        ckpt_dir=str(tmp_path / "checkpoints" / "wm-run"),
+        run_id="wm-run",
     )
     envs = gym.vector.SyncVectorEnv([ShortEpisodes, ShortEpisodes], autoreset_mode=gym.vector.AutoresetMode.DISABLED)
     close = Mock(wraps=envs.close)
@@ -677,6 +681,8 @@ def test_training_loop_short_rollout_checkpoints_and_cleanup(
             np.testing.assert_array_equal(batches[1].episode_starts, True)
             assert not np.array_equal(*keys)
             save.assert_called_once()
+            assert save.call_args.args[1] == config.ckpt_dir
+            assert Path(config.ckpt_dir, "config.json").exists()
             assert int(save.call_args.args[0].step) == 2
             logged_steps = [call.args[2] for call in writer.add_scalar.call_args_list if call.args[0] == "train/loss"]
             assert logged_steps == [4, 6]

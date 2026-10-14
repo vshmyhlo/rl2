@@ -25,6 +25,7 @@ type Rollout = tuple[grpo.GRPOBatch, np.ndarray, dict[str, float], jax.Array]
 @pytest.fixture(scope="module")
 def config() -> grpo.Config:
     return grpo.Config(
+        run_id="test",
         total_updates=1,
         num_tasks=1,
         group_size=4,
@@ -233,7 +234,7 @@ def test_formatted_samples_preserve_tokens(config: grpo.Config, rollout: Rollout
 
 
 def test_example_config() -> None:
-    config = grpo.load_config(Path(__file__).resolve().parents[1] / "configs/karel_grpo.yaml")
+    config = grpo.load_config(Path(__file__).resolve().parents[1] / "configs/karel_grpo.yaml", grpo.Config)
     assert config.bf16 and config.attention_implementation == "cudnn"
     assert config.sampling_workers == 8
     assert not hasattr(config, "max_nodes")
@@ -284,7 +285,7 @@ def test_legacy_reference_checkpoint_and_config_load_without_reference(
     np.testing.assert_array_equal(restored_rng.integers(100, size=4), rng.integers(100, size=4))
     config_path = tmp_path / "config.yaml"
     config_path.write_text(grpo.yaml.safe_dump({**grpo.asdict(config), "kl_coef": 0.25}))
-    assert grpo.load_config(config_path) == config
+    assert grpo.load_config(config_path, grpo.Config) == config.resolve_run()
 
 
 def test_load_model_from_checkpoint(config: grpo.Config, state: TrainState, tmp_path: Path) -> None:
@@ -292,7 +293,7 @@ def test_load_model_from_checkpoint(config: grpo.Config, state: TrainState, tmp_
     progress = grpo.TrainingProgress(state, jax.random.key(3), 2, 8, 1, 8)
     grpo._save_checkpoint(str(tmp_path), progress, np.random.default_rng(4))
     loaded_config, loaded = grpo.load_model(tmp_path, attention_implementation="xla")
-    assert loaded_config == config
+    assert loaded_config == config.resolve_run()
     chex.assert_trees_all_equal(loaded.params, state.params)
     assert int(loaded.step) == 0  # Inference loading deliberately starts a fresh optimizer.
 

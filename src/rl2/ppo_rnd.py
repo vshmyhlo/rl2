@@ -6,10 +6,8 @@ intrinsic return continues across resets while recurrent memory still resets.
 
 import argparse
 import json
-from dataclasses import asdict
-from datetime import UTC, datetime
+from dataclasses import asdict, field
 from functools import partial
-from pathlib import Path
 from time import monotonic
 from typing import Annotated, Any, Literal, SupportsFloat
 
@@ -24,12 +22,12 @@ import yaml
 from flax import linen as nn
 from flax.training.train_state import TrainState
 from numpy.typing import NDArray
-from pydantic import ConfigDict, Field
+from pydantic import Field
 from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
 from rl2 import atari_eval
-from rl2.configuration import load_settings
+from rl2.configuration import BaseConfig, load_config
 from rl2.jax_cache import configure_compilation_cache
 from rl2.multi_atari import register_envs
 from rl2.utils import RunningMeanStd, gae
@@ -40,8 +38,9 @@ type PPOBatch = tuple[Array, Array, Array, Array, Array, LSTMCarry, Array]
 type PPOMetrics = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
 
 
-@dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
-class Config:
+@dataclass(frozen=True)
+class Config(BaseConfig):
+    ckpt_dir: str = field(default="${log_dir}/${run_id}", kw_only=True)
     env_id: str
     frame_stack: bool
     atari_preprocessing: bool
@@ -62,7 +61,7 @@ class Config:
     entropy_coef: float
     value_coef: float
     max_grad_norm: float
-    log_dir: str
+    log_dir: str = field(default="runs", kw_only=True)
     video_every_episodes: Annotated[int, Field(ge=0)]
     video_speed: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     bf16: bool = True
@@ -80,21 +79,12 @@ class Config:
     rnd_update_epochs: Annotated[int, Field(gt=0)] = 4
     encoder_channels: Annotated[tuple[Annotated[int, Field(gt=0)], ...], Field(min_length=1)] = (128, 256, 384, 512)
     embedding_size: Annotated[int, Field(gt=0)] = 768
-    run_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.num_envs % self.num_minibatches:
             raise ValueError("num_envs must be divisible by num_minibatches to preserve sequences")
         if self.total_steps < self.num_envs * self.num_steps:
             raise ValueError("total_steps must cover at least one rollout")
-
-
-def load_config(path: str | Path) -> Config:
-    settings = load_settings(path)
-    if "encoder_channels" in settings:
-        # Config is a static JIT argument, so YAML sequences must be hashable.
-        settings["encoder_channels"] = tuple(settings["encoder_channels"])
-    return Config(**settings)
 
 
 def learning_rate_schedule(config: Config) -> optax.Schedule:
@@ -496,6 +486,7 @@ def update(state: TrainState, batch: PPOBatch, config: Config) -> tuple[TrainSta
 
 
 def train(config: Config) -> TrainState:
+    config = config.resolve_run()
     configure_compilation_cache()
     batch_size = config.num_envs * config.num_steps
     if config.eval_every_minutes:
@@ -521,10 +512,7 @@ def train(config: Config) -> TrainState:
     )
     writer = None
     try:
-        run_name = config.run_id or (
-            f"ppo_rnd_{config.env_id.replace('/', '_')}_seed{config.seed}_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"
-        )
-        run_dir = f"{config.log_dir.rstrip('/')}/{run_name}"
+        run_dir = config.ckpt_dir.rstrip("/")
         writer = SummaryWriter(logdir=run_dir)
         writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", 0)
         print(f"TensorBoard run: {run_dir}", flush=True)
@@ -817,7 +805,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/ppo_rnd_montezuma.yaml", help="Path to a YAML config")
     args = parser.parse_args()
-    train(load_config(args.config))
+    train(load_config(args.config, Config))
 
 
 if __name__ == "__main__":

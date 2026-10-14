@@ -28,7 +28,7 @@ def test_requires_encoder(config_path: Path, field: str) -> None:
     (settings if field == "model" else settings["model"]).pop(field)
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError) as error:
-        load_config(config_path)
+        load_config(config_path, Config)
     assert error.value.errors()[0]["loc"] == (("model",) if field == "model" else ("model", "encoder"))
     assert error.value.errors()[0]["type"] == "missing"
 
@@ -48,14 +48,14 @@ def test_load_config_returns_fully_resolved_config(config_path: Path, run_id: st
         settings["run_id"] = run_id
     config_path.write_text(yaml.safe_dump(settings))
 
-    config = load_config(config_path)
+    config = load_config(config_path, Config)
 
     assert isinstance(config, Config)
     assert config.run_id is not None
     if run_id == "explicit-run":
         assert config.run_id == run_id
     else:
-        assert config.run_id.startswith("Breakout-MinAtar_seed7_")
+        assert config.run_id[0:8].isdigit()
     assert config.ckpt_dir == f"logs/{config.run_id}/Breakout-MinAtar"
     assert config.num_minibatches == config.num_envs
 
@@ -76,7 +76,7 @@ def test_load_config_rejects_invalid_settings(
     config_path.write_text(yaml.safe_dump(settings))
 
     with pytest.raises(error, match=match):
-        load_config(config_path)
+        load_config(config_path, Config)
 
 
 @pytest.mark.parametrize("observation_size", [0, -1])
@@ -85,7 +85,7 @@ def test_load_config_rejects_nonpositive_observation_size(config_path: Path, obs
     settings["observation_size"] = observation_size
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match="observation_size"):
-        load_config(config_path)
+        load_config(config_path, Config)
 
 
 @pytest.mark.parametrize(
@@ -108,11 +108,11 @@ def test_rejects_unsupported_environment_options(config_path: Path, option: str,
     settings[option] = value
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match=option):
-        load_config(config_path)
+        load_config(config_path, Config)
 
 
 def test_kinetix_config_loads_yaml_levels_as_hashable_tuple() -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml", Config)
     assert config.env.id == "Kinetix"
     assert config.env.action_type == "continuous"
     assert config.env.size == "l"
@@ -122,11 +122,11 @@ def test_kinetix_config_loads_yaml_levels_as_hashable_tuple() -> None:
 
 
 def test_beta_policy_config(config_path: Path) -> None:
-    assert load_config(config_path).model.continuous_policy == "truncated_gaussian"
+    assert load_config(config_path, Config).model.continuous_policy == "truncated_gaussian"
     settings = yaml.safe_load(config_path.read_text())
     settings["model"]["continuous_policy"] = "beta"
     config_path.write_text(yaml.safe_dump(settings))
-    assert load_config(config_path).model.continuous_policy == "beta"
+    assert load_config(config_path, Config).model.continuous_policy == "beta"
 
 
 @pytest.mark.parametrize(
@@ -153,7 +153,7 @@ def test_rejects_separate_environment_settings(config_path: Path, name: str) -> 
     settings[name] = {}
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match=name):
-        load_config(config_path)
+        load_config(config_path, Config)
 
 
 @pytest.mark.parametrize(
@@ -170,18 +170,18 @@ def test_rejects_invalid_environment_union(config_path: Path, env: dict[str, obj
     settings["env"] = env
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match=match):
-        load_config(config_path)
+        load_config(config_path, Config)
 
 
 @pytest.mark.parametrize("name,env_id", [("xminigrid", "XLand-MiniGrid"), ("craftax/symbolic", "Craftax")])
 def test_optional_environment_configs_load(name: str, env_id: str) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / f"configs/ppo/{name}.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / f"configs/ppo/{name}.yaml", Config)
     assert config.env.id == env_id
     assert hash(config)
 
 
 def test_craftax_preset_uses_symbolic_encoder() -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml", Config)
     assert config.env.env_id == "Craftax-Symbolic-v1"
     assert config.model.encoder == ppo.CraftaxEncoderConfig()
 
@@ -196,7 +196,7 @@ def test_craftax_preset_uses_symbolic_encoder() -> None:
     ],
 )
 def test_craftax_rejects_mismatched_encoder(env_id: str, encoder: str, expected: str) -> None:
-    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml"))
+    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml", Config))
     settings["env"]["env_id"] = env_id
     settings["model"]["encoder"] = {"type": encoder}
     with pytest.raises(ValidationError, match="requires"):
@@ -256,7 +256,7 @@ def test_optional_environments_reject_invalid_settings(name: str, settings: dict
 def test_environment_round_trip_and_factory(
     filename: str, config_class: type, constructor_name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / f"configs/ppo/{filename}.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / f"configs/ppo/{filename}.yaml", Config)
     assert isinstance(config.env, config_class)
     restored = Config(**yaml.safe_load(yaml.safe_dump(asdict(config))))
     assert restored == config and hash(restored) == hash(config)
@@ -267,7 +267,7 @@ def test_environment_round_trip_and_factory(
 
 
 def test_craftax_encoder_requires_symbolic_environment() -> None:
-    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml"))
+    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml", Config))
     settings["env"] = {"id": "Breakout-MinAtar"}
     with pytest.raises(ValidationError, match="craftax encoder requires symbolic Craftax"):
         Config(**settings)
@@ -291,7 +291,7 @@ def test_rejects_invalid_nested_model(config_path: Path, model: dict[str, object
     settings["model"] = model
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match=match):
-        load_config(config_path)
+        load_config(config_path, Config)
 
 
 def test_rejects_top_level_encoder_stages(config_path: Path) -> None:
@@ -299,7 +299,7 @@ def test_rejects_top_level_encoder_stages(config_path: Path) -> None:
     settings["encoder_stages"] = [{"channels": 4}]
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match="encoder_stages"):
-        load_config(config_path)
+        load_config(config_path, Config)
 
 
 @pytest.mark.parametrize("kind", ["rgb", "xminigrid", "kinetix"])
@@ -308,14 +308,14 @@ def test_encoder_variant_round_trip(config_path: Path, kind: str) -> None:
     settings["env"] = {"id": {"rgb": "Breakout-MinAtar", "xminigrid": "XLand-MiniGrid", "kinetix": "Kinetix"}[kind]}
     settings["model"]["encoder"] = {"type": kind, "embedding_size": 8}
     config_path.write_text(yaml.safe_dump(settings))
-    config = load_config(config_path)
+    config = load_config(config_path, Config)
     encoder_class = {"rgb": RGBEncoderConfig, "xminigrid": XMiniGridEncoderConfig, "kinetix": KinetixEncoderConfig}[
         kind
     ]
     assert isinstance(config.model.encoder, encoder_class)
     assert config.model.encoder.embedding_size == 8
     config_path.write_text(yaml.safe_dump(asdict(config)))
-    restored = load_config(config_path)
+    restored = load_config(config_path, Config)
     assert restored == config and hash(restored) == hash(config)
 
 
@@ -342,7 +342,7 @@ def test_invalid_encoder_variants(config_path: Path, encoder: dict[str, object],
     settings["model"]["encoder"] = encoder
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match=match):
-        load_config(config_path)
+        load_config(config_path, Config)
 
 
 def test_symbolic_encoder_requires_xminigrid(config_path: Path) -> None:
@@ -350,7 +350,7 @@ def test_symbolic_encoder_requires_xminigrid(config_path: Path) -> None:
     settings["model"]["encoder"] = {"type": "xminigrid"}
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match="xminigrid encoder requires"):
-        load_config(config_path)
+        load_config(config_path, Config)
 
 
 def test_xminigrid_requires_matching_encoder(config_path: Path) -> None:
@@ -359,7 +359,7 @@ def test_xminigrid_requires_matching_encoder(config_path: Path) -> None:
     settings["model"]["encoder"] = {"type": "rgb"}
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match="XLand-MiniGrid requires model.encoder.type: xminigrid"):
-        load_config(config_path)
+        load_config(config_path, Config)
 
 
 @pytest.mark.parametrize(
@@ -372,4 +372,4 @@ def test_kinetix_requires_matching_encoder(config_path: Path, env_id: str, encod
     settings["model"]["encoder"] = {"type": encoder}
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match=match):
-        load_config(config_path)
+        load_config(config_path, Config)

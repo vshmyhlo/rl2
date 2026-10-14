@@ -54,7 +54,7 @@ def test_continuous_recurrent_training_replays_bounded_actions(
     continuous_policy: Literal["truncated_gaussian", "beta"],
 ) -> None:
     config = replace(
-        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", ppo.Config),
         num_envs=2,
         num_steps=2,
         num_minibatches=2,

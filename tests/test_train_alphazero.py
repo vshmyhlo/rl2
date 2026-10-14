@@ -237,7 +237,14 @@ def test_main_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(sys, "argv", ["train_alphazero", "--config", str(path)])
     az.main()
     train.assert_called_once_with(
-        replace(az.Config(), env_id="tic_tac_toe", iterations=1, run_id="test", log_dir="runs/alphazero/test")
+        replace(
+            az.Config(),
+            env_id="tic_tac_toe",
+            iterations=1,
+            run_id="test",
+            log_dir="runs/alphazero/test",
+            ckpt_dir="runs/alphazero/test",
+        )
     )
 
 
@@ -304,6 +311,7 @@ def test_tensorboard_progress(
         iterations=5,
         log_dir=str(tmp_path) + "/${run_id}/${env_id}",
         run_id="test-run",
+        ckpt_dir=str(tmp_path / "checkpoints" / "${run_id}"),
         log_interval_seconds=30.0,
     )
     clock = 0.0
@@ -346,6 +354,8 @@ def test_tensorboard_progress(
     saved_config = yaml.safe_load(text.removeprefix("```yaml\n").removesuffix("```"))
     assert saved_config["log_dir"] == str(tmp_path / "test-run" / "chess")
     assert saved_config["run_id"] == "test-run"
+    assert saved_config["ckpt_dir"] == str(tmp_path / "checkpoints" / "test-run")
+    az.checkpoint_manager.assert_called_once_with(str(tmp_path / "checkpoints" / "test-run"))
     assert "devices/text_summary" in events.Tags()["tensors"]
     messages = [record.getMessage() for record in caplog.records if record.name == az.__name__]
     assert "Run ID: test-run" in messages
@@ -373,7 +383,7 @@ def test_tensorboard_closes_on_error(logging_config: az.Config, monkeypatch: pyt
     az.checkpoint_manager.return_value.__exit__.assert_called_once()
     run_dir = Path(make_writer.call_args.kwargs["logdir"])
     assert run_dir.parent == Path(logging_config.log_dir).parent
-    assert run_dir.name.startswith("chess_seed0_")
+    assert run_dir.name[0:8].isdigit()
 
 
 def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: pytest.MonkeyPatch) -> None:

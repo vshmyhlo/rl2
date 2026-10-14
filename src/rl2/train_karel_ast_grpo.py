@@ -13,7 +13,6 @@ import argparse
 import json
 from collections.abc import Sequence
 from dataclasses import asdict, field, replace
-from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from time import monotonic
@@ -28,13 +27,13 @@ import yaml
 from flax import serialization
 from flax.training.train_state import TrainState
 from numpy.typing import NDArray
-from pydantic import ConfigDict, Field
+from pydantic import Field, model_validator
 from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
 from rl2.ast_transformer import ASTTransformer
 from rl2.attention import AttentionType
-from rl2.configuration import load_settings
+from rl2.configuration import BaseConfig, load_config
 from rl2.jax_cache import configure_compilation_cache
 from rl2.karel import ACTIONS, REWARD_COMPONENTS, TASK_CATEGORIES, TOKEN_TO_ID, KarelConfig, KarelPair, KarelProgramEnv
 from rl2.karel_ast import AST_ACTIONS, ASTFeatures, KarelAST, batch_features
@@ -45,8 +44,9 @@ type Grids = Array
 type Metrics = tuple[jax.Array, jax.Array, jax.Array, jax.Array]
 
 
-@dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
-class Config:
+@dataclass(frozen=True)
+class Config(BaseConfig):
+    ckpt_dir: str = field(default="${log_dir}/${run_id}", kw_only=True)
     seed: Annotated[int, Field(ge=0)] = 1
     total_updates: Annotated[int, Field(gt=0)] = 1000  # Number of rollout batches, independent of program length.
     num_tasks: Annotated[int, Field(gt=0)] = 8
@@ -68,7 +68,6 @@ class Config:
     entropy_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
     max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 0.5
     log_dir: str = "runs"
-    run_id: str | None = None  # Same ID resumes; None creates a timestamped run.
     checkpoint_interval_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] = (
         300.0  # Save at the next completed rollout boundary.
     )
@@ -82,11 +81,14 @@ class Config:
     log_compiles: bool = False  # Print bucket shapes on new prediction/update JIT traces.
     env: KarelConfig = field(default_factory=KarelConfig)
 
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_legacy_settings(cls, values: Any) -> Any:
+        if isinstance(values, dict):
+            return {name: value for name, value in values.items() if name not in ("kl_coef", "decision_batch_size")}
+        return values
+
     def __post_init__(self) -> None:
-        if self.run_id is not None and (
-            not self.run_id.strip() or self.run_id in (".", "..") or any(c in self.run_id for c in "/\\")
-        ):
-            raise ValueError("run_id must be a nonempty directory name without slashes or traversal")
         if self.attention_implementation == "cudnn" and not self.bf16:
             raise ValueError("cuDNN attention requires bf16=True")
         if self.num_tasks * self.group_size % self.num_minibatches:
@@ -230,17 +232,6 @@ def _restore_checkpoint(data: bytes, state: TrainState, rng: np.random.Generator
     # Older checkpoints counted hole decisions in steps; episodes already holds
     # the correct total, including runs whose batch size changed on resume.
     return TrainingProgress(restored, key, iteration, episodes, logged_groups, episodes)
-
-
-def load_config(path: str | Path) -> Config:
-    settings = load_settings(path, asdict(Config()), generate_run_id=False)
-    # Ignore the removed reference-KL setting in older saved run configs.
-    settings.pop("kl_coef", None)
-    # Saved run configs may still contain the retired gradient-accumulation knob.
-    settings.pop("decision_batch_size", None)
-    if "env" in settings:
-        settings["env"] = KarelConfig(**settings["env"])
-    return Config(**settings)
 
 
 def learning_rate_schedule(config: Config) -> optax.Schedule:
@@ -643,7 +634,7 @@ def load_model(
     payload = serialization.msgpack_restore(checkpoint) if checkpoint is not None else None
     if payload is not None and payload["version"] != 1:
         raise ValueError("Unsupported GRPO checkpoint version")
-    config = load_config(f"{directory}/config.yaml")
+    config = load_config(f"{directory}/config.yaml", Config)
     if attention_implementation is not None:
         config = replace(config, attention_implementation=attention_implementation)
     dummy = np.zeros((1, config.env.height, config.env.width, 6), np.int32)
@@ -658,6 +649,7 @@ def load_model(
 
 
 def train(config: Config) -> TrainState:
+    config = config.resolve_run()
     configure_compilation_cache()
     batch_size = config.num_tasks * config.group_size
     envs = [KarelProgramEnv(config.env) for _ in range(batch_size)]
@@ -665,9 +657,7 @@ def train(config: Config) -> TrainState:
     key = jax.random.key(config.seed)
     dummy = np.zeros((1, config.env.height, config.env.width, 6), np.int32)
     state = create_state(config, dummy, dummy)
-    run_name = config.run_id or f"karel_grpo_seed{config.seed}_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"
-    config = replace(config, run_id=run_name)
-    run_dir = f"{config.log_dir.rstrip('/')}/{run_name}"
+    run_dir = config.ckpt_dir.rstrip("/")
     checkpoint = read_optional(f"{run_dir}/checkpoint.msgpack")
     progress = TrainingProgress(state, key, 0, 0, 0, 0)
     if checkpoint is not None:
@@ -802,7 +792,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/karel_ast_grpo.yaml", help="Path to a YAML config")
     args = parser.parse_args()
-    train(load_config(args.config))
+    train(load_config(args.config, Config))
 
 
 if __name__ == "__main__":

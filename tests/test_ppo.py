@@ -21,6 +21,7 @@ from rl2.lstm import initial_carry
 from rl2.model.encoders.rgb import ConvStage
 from rl2.ppo import (
     ActorCritic,
+    Config,
     learning_rate_schedule,
     load_config,
     train,
@@ -72,7 +73,7 @@ def test_batch_select_sequences_preserves_time_and_initial_memory(num_steps: int
 
 
 def test_default_model_parameter_budget_and_rgb_shapes() -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config)
     model = ActorCritic(ppo.DiscreteSpace(6), config.model)
     # This architecture budget is specifically for 84x84 RGB, independent of the training config.
     obs = jax.ShapeDtypeStruct((1, 1, 1, 84, 84, 3), jnp.uint8)
@@ -101,7 +102,7 @@ def test_default_model_parameter_budget_and_rgb_shapes() -> None:
 @pytest.mark.parametrize("shape", [(2, 2), (4,)], ids=["recurrent", "step"])
 def test_clipped_policy_loss_and_gradient_direction(shape: tuple[int, ...]) -> None:
     config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config),
         target_kl=None,
         entropy_coef=0.0,
         value_coef=0.5,
@@ -157,7 +158,7 @@ def test_clipped_policy_loss_and_gradient_direction(shape: tuple[int, ...]) -> N
 
 def test_single_transition_keeps_policy_gradient() -> None:
     config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config),
         target_kl=None,
         entropy_coef=0.0,
         value_coef=0.0,
@@ -212,14 +213,14 @@ def test_single_transition_keeps_policy_gradient() -> None:
     ],
 )
 def test_invalid_optimization_settings(field: str, invalid: float) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config)
     with pytest.raises(ValueError, match=field):
         replace(config, **{field: invalid})
 
 
 def test_optimization_settings_allow_disabled_terms_and_discount_boundaries() -> None:
     config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config),
         learning_rate=0.0,
         gamma=0.0,
         gae_lambda=1.0,
@@ -233,7 +234,7 @@ def test_optimization_settings_allow_disabled_terms_and_discount_boundaries() ->
 def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
     model_config = small_model_config()
     config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config),
         target_kl=None,
         model=model_config,
     )
@@ -360,14 +361,14 @@ def test_recurrent_sequences_match_steps_and_reset_only_finished_env() -> None:
     ],
 )
 def test_invalid_rollout_relationships_rejected_by_config(overrides: dict[str, int], message: str) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config)
     with pytest.raises(ValidationError, match=message):
         replace(config, **overrides)
 
 
 def test_config_accepts_exactly_one_rollout() -> None:
     config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config),
         num_envs=2,
         num_steps=4,
         num_minibatches=2,
@@ -389,14 +390,14 @@ def test_config_accepts_exactly_one_rollout() -> None:
     ],
 )
 def test_invalid_rollout_settings_rejected_by_config(field: str, invalid: Any) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config)
     with pytest.raises(ValidationError, match=field):
         replace(config, **{field: invalid})
 
 
 def test_learning_rate_schedule() -> None:
     config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config),
         num_envs=2,
         num_steps=4,
         total_steps=19,
@@ -420,7 +421,7 @@ def test_learning_rate_schedule() -> None:
 
 def test_cosine_schedules() -> None:
     config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config),
         num_envs=2,
         num_steps=4,
         total_steps=35,  # Four full rollouts; the remaining steps are unused.
@@ -447,7 +448,7 @@ def test_cosine_schedules() -> None:
 
 @pytest.mark.parametrize("field", ("lr_decay", "entropy_decay"))
 def test_invalid_decay_config(field: str) -> None:
-    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"))
+    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config))
     settings[field] = "unknown"
     with pytest.raises(ValidationError, match=field):
         ppo.Config(**settings)
@@ -455,7 +456,7 @@ def test_invalid_decay_config(field: str) -> None:
 
 def test_entropy_decay_scales_update_by_rollout() -> None:
     config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config),
         num_envs=1,
         num_steps=1,
         num_minibatches=1,
@@ -500,7 +501,7 @@ def test_entropy_decay_scales_update_by_rollout() -> None:
 
 def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixture[str]) -> None:
     config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config),
         num_envs=1,
         num_steps=1,
         num_minibatches=1,
@@ -649,20 +650,20 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
 
 @pytest.mark.parametrize("interval", [0, -1, 1.5, True])
 def test_invalid_log_interval(interval: float) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config)
     with pytest.raises(ValueError, match="log_interval"):
         replace(config, log_interval=interval)
 
 
 def test_video_interval_defaults_to_600_iterations() -> None:
-    settings = vars(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")).copy()
+    settings = vars(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config)).copy()
     settings.pop("video_interval")
     assert ppo.Config(**settings).video_interval == 600
 
 
 @pytest.mark.parametrize("interval", [-1, 1.5, True])
 def test_invalid_video_interval(interval: float) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config)
     with pytest.raises(ValidationError, match="video_interval"):
         replace(config, video_interval=interval)
 
@@ -674,7 +675,7 @@ def test_invalid_video_interval(interval: float) -> None:
 )
 def test_video_schedule_uses_iterations(interval: int, expected_steps: list[int]) -> None:
     config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config),
         num_envs=1,
         num_steps=1,
         num_minibatches=1,
@@ -760,7 +761,7 @@ def test_train_evaluates_final_policy(
     eval_interval: int, expected_steps: list[int], capsys: pytest.CaptureFixture[str]
 ) -> None:
     config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config),
         num_envs=1,
         num_steps=2,
         num_minibatches=1,
@@ -861,7 +862,7 @@ def test_train_evaluates_final_policy(
 
 
 def test_kl_rejects_update_without_changing_optimizer() -> None:
-    config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), target_kl=0.01)
+    config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config), target_kl=0.01)
 
     def apply(
         variables: optax.Params,
@@ -898,7 +899,7 @@ def test_kl_rejects_update_without_changing_optimizer() -> None:
 
 
 def test_policy_diagnostics() -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config)
     probabilities = jnp.array([[0.2, 0.8], [0.5, 0.5], [0.8, 0.2], [0.52, 0.48]])
 
     def apply(
@@ -941,7 +942,7 @@ def test_policy_diagnostics() -> None:
 
 @pytest.mark.parametrize("frame_budget", (0, -1, 1.5, True))
 def test_invalid_video_frame_budget_rejected_by_config(frame_budget: Any) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config)
     with pytest.raises(ValidationError, match="video_max_frames"):
         replace(config, video_max_frames=frame_budget)
 
@@ -963,7 +964,7 @@ def test_invalid_video_frame_budget_rejected_by_config(frame_budget: Any) -> Non
     ],
 )
 def test_invalid_model_config(model_settings: Any, message: str) -> None:
-    settings = vars(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")).copy()
+    settings = vars(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config)).copy()
     settings["model"] = {"encoder": {"type": "rgb"}, "recurrent": model_settings}
     with pytest.raises(ValidationError, match=message):
         ppo.Config(**settings)
@@ -971,7 +972,7 @@ def test_invalid_model_config(model_settings: Any, message: str) -> None:
 
 @pytest.mark.parametrize("field", ("lstm_hidden_size", "gdn2_hidden_size"))
 def test_flat_model_settings_are_rejected(field: str) -> None:
-    settings = vars(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")).copy()
+    settings = vars(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config)).copy()
     settings[field] = 8
     with pytest.raises(ValidationError, match=field):
         ppo.Config(**settings)
@@ -982,22 +983,22 @@ def test_default_model_config(tmp_path: Path) -> None:
     settings["model"] = {"encoder": {"type": "rgb"}}
     path = tmp_path / "ppo.yaml"
     path.write_text(yaml.safe_dump(settings))
-    assert load_config(path).model == ppo.ModelConfig(encoder=ppo.RGBEncoderConfig())
+    assert load_config(path, Config).model == ppo.ModelConfig(encoder=ppo.RGBEncoderConfig())
     settings["model"]["recurrent"] = {"hidden_size": 8}
     path.write_text(yaml.safe_dump(settings))
-    assert load_config(path).model == ppo.ModelConfig(
+    assert load_config(path, Config).model == ppo.ModelConfig(
         encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=8)
     )
 
 
 def test_lstm_stack_config_loading_and_factory(tmp_path: Path) -> None:
     config = replace(
-        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
+        load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config),
         model=small_model_config(),
     )
     path = tmp_path / "ppo.yaml"
     path.write_text(yaml.safe_dump(asdict(config)))
-    restored = load_config(path)
+    restored = load_config(path, Config)
     assert restored == config
     assert hash(restored) == hash(config)
     with pytest.raises(FrozenInstanceError):

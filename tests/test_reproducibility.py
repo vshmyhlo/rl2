@@ -25,7 +25,9 @@ def test_seeded_policy_and_update_are_reproducible() -> None:
     obs = jnp.arange(2 * 1 * 8 * 8, dtype=jnp.uint8).reshape(2, 1, 8, 8)
     carry = model.initial_carry(2)
     starts = jnp.ones(2, dtype=jnp.bool_)
-    config = replace(ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), target_kl=None)
+    config = replace(
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", ppo.Config), target_kl=None
+    )
     optimizer = optax.adam(1e-3)
 
     def initialize(seed: int) -> TrainState:

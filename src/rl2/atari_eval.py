@@ -2,11 +2,12 @@
 
 Example::
 
-    from rl2.ppo_rnd import load_config, train
+    from rl2.configuration import load_config
+    from rl2.ppo_rnd import Config, train
     from rl2.atari_eval import EvaluationConfig, TrainStateAgent, evaluate
     from rl2.ppo_rnd import initial_carry
 
-    config = load_config("configs/ppo_rnd_montezuma.yaml")
+    config = load_config("configs/ppo_rnd_montezuma.yaml", Config)
     state = train(config)
     result = evaluate(
         TrainStateAgent(state, initial_carry(1, config.lstm_hidden_size)),

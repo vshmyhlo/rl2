@@ -34,7 +34,7 @@ from rl2 import ppo, train_mappo
     ],
 )
 def test_cli_shared_run_directory(trainer: ModuleType, config_path: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    config = trainer.load_config(config_path)
+    config = trainer.load_config(config_path, trainer.Config)
     family = "ppo" if trainer is ppo else "mappo"
     assert config.ckpt_dir == f"/runs/{family}/{config.run_id}"
     assert "${" not in config.ckpt_dir

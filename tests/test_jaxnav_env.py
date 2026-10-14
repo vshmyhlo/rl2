@@ -95,8 +95,8 @@ def test_boundaries_and_action_masks(env: JaxNavEnv, state: State, boundary: str
 
 def test_jaxnav_config_matches_smax_and_validates(monkeypatch: pytest.MonkeyPatch) -> None:
     root = Path(__file__).resolve().parents[1] / "configs/mappo"
-    config = ppo.load_config(root / "jaxnav.yaml")
-    reference = ppo.load_config(root / "smax.yaml")
+    config = ppo.load_config(root / "jaxnav.yaml", ppo.Config)
+    reference = ppo.load_config(root / "smax.yaml", ppo.Config)
     for name in asdict(reference):
         if name not in {"env", "run_id", "ckpt_dir", "video_fps"}:
             assert getattr(config, name) == getattr(reference, name)
@@ -135,7 +135,7 @@ def constant_policy(
 
 def test_jaxnav_rollout_timeout_update_and_evaluation(env: JaxNavEnv, state: State) -> None:
     config = replace(
-        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/mappo/jaxnav.yaml"),
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/mappo/jaxnav.yaml", ppo.Config),
         env=env.config,
         num_envs=1,
         num_steps=1,

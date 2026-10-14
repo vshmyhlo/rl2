@@ -32,7 +32,7 @@ def test_invalid_settings(settings: dict[str, object]) -> None:
 
 
 def test_cli(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = ppo.load_config(CONFIG_PATH)
+    config = ppo.load_config(CONFIG_PATH, ppo.Config)
     assert config.env == BraxConfig()
     assert config.ckpt_dir == f"runs/ppo/{config.run_id}"
     train = Mock()
@@ -86,7 +86,7 @@ def test_render_passes_pipeline_state(env: BraxEnv, monkeypatch: pytest.MonkeyPa
 
 def test_real_pusher_rollout_and_update(env: BraxEnv) -> None:
     config = replace(
-        ppo.load_config(CONFIG_PATH),
+        ppo.load_config(CONFIG_PATH, ppo.Config),
         num_envs=1,
         num_steps=2,
         num_minibatches=1,

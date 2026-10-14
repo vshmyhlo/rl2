@@ -7,7 +7,7 @@ import re
 from collections import deque
 from collections.abc import Sequence
 from contextlib import closing
-from dataclasses import asdict, field, replace
+from dataclasses import asdict, field
 from functools import partial
 from pathlib import Path
 from time import monotonic
@@ -30,7 +30,7 @@ from reasoning_gym.dataset import ProceduralDataset
 from reasoning_gym.utils import extract_answer
 
 from rl2.calculator import calculate
-from rl2.configuration import load_settings, resolve_settings
+from rl2.configuration import BaseConfig, load_config
 from rl2.gemma3 import (
     Gemma3Carry,
     Gemma3LM,
@@ -66,8 +66,9 @@ class PromptExample:
             raise ValueError("Each prompt example completion must contain <answer>...</answer>")
 
 
-@dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
-class Config:
+@dataclass(frozen=True)
+class Config(BaseConfig):
+    ckpt_dir: str = field(default="runs/grpo_reasoning/${run_id}", kw_only=True)
     checkpoint: str = "gs://gemma-data/checkpoints/gemma3-270m-it"
     tokenizer: str | None = None
     dtype: Literal["float32", "bfloat16"] = "float32"
@@ -89,8 +90,6 @@ class Config:
     beta: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.01
     duration_penalty_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
     max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1.0
-    ckpt_dir: str = "runs/grpo_reasoning/${run_id}"
-    run_id: str | None = None
     log_interval: Annotated[int, Field(gt=0)] = 10
     log_completion_count: Annotated[int, Field(ge=2, le=4)] = 4
     checkpoint_interval_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 600.0
@@ -102,19 +101,6 @@ class Config:
             raise ValueError("Prompt + completion budget must fit the 32768-token context")
         if {"seed", "size"} & self.task_config.keys():
             raise ValueError("task_config cannot override seed or size")
-        if self.run_id is not None and (
-            not self.run_id.strip() or self.run_id in (".", "..") or any(c in self.run_id for c in "/\\")
-        ):
-            raise ValueError("run_id must be a nonempty directory name without slashes or traversal")
-
-
-def resolve_config(config: Config) -> Config:
-    settings = resolve_settings(asdict(config), run_id_prefix="grpo_reasoning")
-    return replace(config, run_id=settings["run_id"], ckpt_dir=settings["ckpt_dir"])
-
-
-def load_config(path: str | Path) -> Config:
-    return Config(**load_settings(path, asdict(Config()), run_id_prefix="grpo_reasoning"))
 
 
 class GRPOBatch(NamedTuple):
@@ -830,7 +816,7 @@ def train(config: Config) -> TrainState:
     if not config.beta:
         ref_params = {}
     del variables
-    config = resolve_config(config)
+    config = config.resolve_run()
     run_dir = config.ckpt_dir.rstrip("/")
     log_init(f"Checking for saved training state: {run_dir}/checkpoints")
     with closing(checkpoint_manager(run_dir)) as manager:
@@ -941,7 +927,7 @@ def main() -> None:
     parser.add_argument("--config", default="configs/grpo_reasoning/gemma3.yaml", help="Path to YAML config")
     args = parser.parse_args()
     print(f"[init] Loading configuration: {args.config}", flush=True)
-    train(load_config(args.config))
+    train(load_config(args.config, Config))
 
 
 if __name__ == "__main__":

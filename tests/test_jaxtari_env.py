@@ -33,7 +33,7 @@ def test_invalid_settings(settings: dict[str, object]) -> None:
 
 
 def test_preset_and_encoder_validation() -> None:
-    config = ppo.load_config(CONFIG_PATH)
+    config = ppo.load_config(CONFIG_PATH, ppo.Config)
     assert config.env == JAXtariConfig()
     assert config.model.encoder.type == "rgb"
     assert config.run_id == "ppo_JAXtari_breakout_seed1"
@@ -100,7 +100,7 @@ def test_losing_one_life_continues_the_game(env: JAXtariEnv) -> None:
 
 def test_real_breakout_ppo_rollout_update_and_video(env: JAXtariEnv) -> None:
     config = replace(
-        ppo.load_config(CONFIG_PATH),
+        ppo.load_config(CONFIG_PATH, ppo.Config),
         env=JAXtariConfig(max_steps=2),
         num_envs=1,
         num_steps=2,

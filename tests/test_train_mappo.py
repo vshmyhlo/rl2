@@ -24,7 +24,7 @@ from rl2.playback import PlaybackState, advance_episode
 @pytest.fixture(scope="module")
 def config() -> ppo.Config:
     return replace(
-        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/mappo/smax.yaml"),
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/mappo/smax.yaml", ppo.Config),
         num_envs=2,
         num_steps=2,
         num_minibatches=2,
@@ -392,7 +392,7 @@ def test_compiled_playback_resets_dead_agent_memory() -> None:
 def test_config_and_cli(config: ppo.Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "smax.yaml"
     path.write_text(yaml.safe_dump(asdict(config)))
-    assert ppo.load_config(path) == config
+    assert ppo.load_config(path, ppo.Config) == config
     assert hash(config)
     with pytest.raises(ValueError, match="num_agents"):
         ppo.make_env(replace(config, num_minibatches=4))

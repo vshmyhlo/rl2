@@ -1,11 +1,22 @@
+from dataclasses import FrozenInstanceError, asdict
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 from omegaconf.errors import OmegaConfBaseException
+from pydantic import ValidationError
+from pydantic.dataclasses import dataclass
 
 from rl2 import configuration
-from rl2.configuration import load_settings, resolve_settings
+from rl2.configuration import BaseConfig, load_config
+
+
+@dataclass(frozen=True)
+class ExampleConfig(BaseConfig):
+    required_count: int
+    env_id: str = "ALE/Boxing-v5"
+    iterations: int = 3
+    batch_size: int = 1
 
 
 @pytest.mark.parametrize(
@@ -18,66 +29,83 @@ from rl2.configuration import load_settings, resolve_settings
     ],
     ids=["cloud-path-name", "run-only", "unmodified-env-id", "literal-path"],
 )
-def test_config_interpolation(template: str, expected: str) -> None:
-    config = resolve_settings({"env_id": "ALE/Boxing-v5", "run_id": "run", "log_dir": template})
-    assert config["log_dir"] == expected
-    assert config["env_id"] == "ALE/Boxing-v5"
+def test_config_interpolation(tmp_path: Path, template: str, expected: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(f"required_count: 1\nrun_id: run\nckpt_dir: {template}\n")
+    config = load_config(path, ExampleConfig)
+    assert config.ckpt_dir == expected
+    assert config.env_id == "ALE/Boxing-v5"
 
 
 @pytest.mark.parametrize(
     "template",
-    ["logs/${unknown}", "logs/${run_id", "${log_dir}"],
+    ["logs/${unknown}", "logs/${run_id", "${ckpt_dir}"],
     ids=["unknown-field", "malformed", "cycle"],
 )
-def test_config_rejects_invalid_interpolation(template: str) -> None:
-    with pytest.raises(OmegaConfBaseException):
-        resolve_settings({"env_id": "chess", "run_id": "run", "log_dir": template})
-
-
-@pytest.mark.parametrize("env_yaml", ["env_id: ALE/Boxing-v5", "env:\n  id: ALE/Boxing-v5"], ids=["flat", "tagged"])
-def test_load_settings_resolves_defaults_and_generated_run_id(tmp_path: Path, env_yaml: str) -> None:
+def test_config_rejects_invalid_interpolation(tmp_path: Path, template: str) -> None:
     path = tmp_path / "config.yaml"
-    path.write_text(f"{env_yaml}\niterations: 3\nbatch_size: ${{iterations}}\n")
-    config = load_settings(path, {"seed": 7, "run_id": None, "log_dir": "logs/${run_id}"})
-    assert config["batch_size"] == 3
-    assert isinstance(config["batch_size"], int)
-    assert config["run_id"].startswith("ALE_Boxing-v5_seed7_")
-    assert config["log_dir"] == f"logs/{config['run_id']}"
+    path.write_text(f"ckpt_dir: {template}\n")
+    with pytest.raises(OmegaConfBaseException):
+        load_config(path, BaseConfig)
 
 
-def test_load_remote_settings_with_custom_run_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_config_resolves_schema_defaults(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("required_count: 2\nbatch_size: ${iterations}\n")
+    config = load_config(path, ExampleConfig)
+    assert config.required_count == 2
+    assert config.batch_size == 3
+    assert type(config.batch_size) is int
+    assert config.run_id is not None
+    assert config.ckpt_dir == f"runs/{config.run_id}"
+
+
+def test_load_remote_config(monkeypatch: pytest.MonkeyPatch) -> None:
     read = Mock(return_value=b"run_id: null\nckpt_dir: gs://bucket/${run_id}\n")
     monkeypatch.setattr(configuration, "read_bytes", read)
-    config = load_settings("gs://bucket/config.yaml", run_id_prefix="grpo_reasoning")
+    config = load_config("gs://bucket/config.yaml", BaseConfig)
     read.assert_called_once_with("gs://bucket/config.yaml")
-    assert config["run_id"].startswith("grpo_reasoning_")
-    assert config["ckpt_dir"] == f"gs://bucket/{config['run_id']}"
+    assert config.run_id is not None
+    assert config.ckpt_dir == f"gs://bucket/{config.run_id}"
 
 
-@pytest.mark.parametrize("settings", [{"env_id": "test"}, {"env": {}, "run_id": None}])
-def test_resolution_without_generated_run_id(settings: dict[str, object]) -> None:
-    assert resolve_settings(settings, generate_run_id=False) == settings
-
-
-def test_load_settings_rejects_non_mapping(tmp_path: Path) -> None:
+def test_load_config_rejects_non_mapping(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text("- seed: 1\n")
     with pytest.raises(TypeError, match="mapping"):
-        load_settings(path)
+        load_config(path, BaseConfig)
 
 
-def test_progress_logging_presets() -> None:
-    configs = Path(__file__).resolve().parents[1] / "configs"
-    paths = [
-        configs / "ppo.yaml",
-        *sorted((configs / "ppo").rglob("*.yaml")),
-        *sorted((configs / "mappo").rglob("*.yaml")),
-    ]
-    for path in paths:
-        config = load_settings(path)
-        rollouts = config["total_steps"] // (config["num_envs"] * config["num_steps"])
-        assert config["video_interval"] == (rollouts + 9) // 10, path
-        assert config["eval_interval"] == (rollouts + 4) // 5, path
+@pytest.mark.parametrize("contents", ["{}", "required_count: '1'"], ids=["missing", "wrong-type"])
+def test_load_config_validates_required_fields(tmp_path: Path, contents: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(contents)
+    with pytest.raises(ValidationError, match="required_count"):
+        load_config(path, ExampleConfig)
 
-    config = load_settings(configs / "wm_atari.yaml")
-    assert config["video_every_steps"] == config["total_steps"] // 10
+
+@pytest.mark.parametrize(
+    "settings,match",
+    [
+        ({"run_id": "../escape"}, "run_id"),
+        ({"run_id": " "}, "run_id"),
+        ({"run_id": 1}, "run_id"),
+        ({"ckpt_dir": " "}, "ckpt_dir"),
+        ({"ckpt_dir": None}, "ckpt_dir"),
+        ({"unknown": 1}, "unknown"),
+    ],
+)
+def test_base_config_validation(settings: dict[str, object], match: str) -> None:
+    with pytest.raises(ValidationError, match=match):
+        BaseConfig(**settings)
+
+
+def test_base_config_resolves_run_and_remains_frozen() -> None:
+    config = BaseConfig(ckpt_dir="gs://bucket/${run_id}").resolve_run()
+    assert config.run_id is not None
+    assert config.ckpt_dir == f"gs://bucket/{config.run_id}"
+    assert config.resolve_run() == config
+    assert BaseConfig(**asdict(config)) == config
+    assert hash(BaseConfig(**asdict(config))) == hash(config)
+    with pytest.raises(FrozenInstanceError):
+        config.run_id = "changed"

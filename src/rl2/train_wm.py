@@ -12,8 +12,7 @@ resets at episode boundaries. No policy is learned.
 import argparse
 import json
 import os
-from dataclasses import asdict
-from datetime import UTC, datetime
+from dataclasses import asdict, field
 from functools import partial
 from pathlib import Path
 from time import monotonic
@@ -35,14 +34,14 @@ from flax import struct
 from flax.training.train_state import TrainState
 from google.cloud import storage
 from numpy.typing import NDArray
-from pydantic import ConfigDict, Field
+from pydantic import Field
 from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
 from rl2.atari_env import make_env
-from rl2.configuration import load_settings
+from rl2.configuration import BaseConfig, load_config
 from rl2.jax_cache import configure_compilation_cache
-from rl2.model.encoders.rgb import ConvStage, ConvStages, validate_stages
+from rl2.model.encoders.rgb import ConvStages, validate_stages
 from rl2.wm import (
     LSTMWorldModel,
     MambaWorldModel,
@@ -56,8 +55,9 @@ from rl2.wm import (
 ObservationLoss = Literal["l1", "l2", "charbonnier"]
 
 
-@dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
-class Config:
+@dataclass(frozen=True)
+class Config(BaseConfig):
+    ckpt_dir: str = field(default="${checkpoint_dir}/${run_id}", kw_only=True)
     env_id: str
     observation_size: Annotated[int, Field(gt=0)] | None
     frame_stack: bool
@@ -82,10 +82,10 @@ class Config:
     free_nats: Annotated[float, Field(ge=0, allow_inf_nan=False)]
     learning_rate: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)]
-    log_dir: str
+    log_dir: str = field(default="runs", kw_only=True)
     log_every: Annotated[int, Field(gt=0)]
     log_flush_secs: Annotated[int, Field(gt=0)]
-    checkpoint_dir: str
+    checkpoint_dir: str = field(default="checkpoints", kw_only=True)
     checkpoint_every: Annotated[int, Field(gt=0)]
     video_every_steps: Annotated[int, Field(ge=0)]
     video_num_steps: Annotated[int, Field(gt=0)]
@@ -106,14 +106,6 @@ class Config:
             chex.assert_is_divisible(self.d_state, 2)
             if self.d_state < 4:
                 raise ValueError("d_state must be at least 4 for Mamba's default rotary fraction")
-
-
-def load_config(path: str | Path) -> Config:
-    """Load world-model training settings from a YAML mapping."""
-    settings = load_settings(path, generate_run_id=False)
-    if "encoder_stages" in settings:
-        settings["encoder_stages"] = tuple(ConvStage(**stage) for stage in settings["encoder_stages"])
-    return Config(**settings)
 
 
 def learning_rate_schedule(config: Config) -> optax.Schedule:
@@ -561,6 +553,7 @@ def save_checkpoint(state: TrainState, run_dir: str | Path) -> None:
 
 def train(config: Config) -> str:
     """Train on fresh random-policy rollouts and return the log directory."""
+    config = config.resolve_run()
     configure_compilation_cache()
     vector_cls = gym.vector.AsyncVectorEnv if config.vector_env == "async" else gym.vector.SyncVectorEnv
     vector_options = {"context": "spawn"} if config.vector_env == "async" else {}
@@ -614,9 +607,8 @@ def train(config: Config) -> str:
             tx=optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adam(lr_schedule)),
         )
         carry = model.initial_carry(config.num_envs)
-        run_name = f"{config.env_id.replace('/', '_')}_seed{config.seed}_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"
-        run_dir = f"{config.log_dir.rstrip('/')}/{run_name}"
-        checkpoint_run_dir = f"{config.checkpoint_dir.rstrip('/')}/{run_name}"
+        run_dir = f"{config.log_dir.rstrip('/')}/{config.run_id}"
+        checkpoint_run_dir = config.ckpt_dir.rstrip("/")
         metadata = {
             **asdict(config),
             "observation_shape": model.observation_shape,
@@ -706,7 +698,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/wm_atari.yaml", help="Path to a YAML config")
     args = parser.parse_args()
-    train(load_config(args.config))
+    train(load_config(args.config, Config))
 
 
 if __name__ == "__main__":

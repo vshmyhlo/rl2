@@ -19,11 +19,17 @@ from rl2.utils import RunningMeanStd
 
 
 def config() -> rnd.Config:
-    return rnd.load_config(Path(__file__).resolve().parents[1] / "configs/ppo_rnd_montezuma.yaml")
+    return rnd.load_config(Path(__file__).resolve().parents[1] / "configs/ppo_rnd_montezuma.yaml", rnd.Config)
 
 
 def test_tensorboard_uses_config_run_id(tmp_path: Path) -> None:
-    settings = replace(config(), log_dir=str(tmp_path), run_id="rnd-run", vector_env="sync")
+    settings = replace(
+        config(),
+        log_dir=str(tmp_path / "logs"),
+        ckpt_dir=str(tmp_path / "rnd-run"),
+        run_id="rnd-run",
+        vector_env="sync",
+    )
     envs = Mock()
     envs.reset.side_effect = RuntimeError("stop before training")
     with (

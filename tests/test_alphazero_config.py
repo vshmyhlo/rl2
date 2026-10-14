@@ -4,7 +4,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from rl2.alphazero.config import Config, EvaluationConfig, ModelConfig, load_config
+from rl2.alphazero.config import Config, EvaluationConfig, ModelConfig
+from rl2.configuration import load_config
 
 
 @pytest.mark.parametrize(
@@ -52,7 +53,7 @@ def test_config_remains_frozen_hashable_and_serializable() -> None:
 def test_load_partial_model_config(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text("model:\n  channels: 4\n")
-    config = load_config(path)
+    config = load_config(path, Config)
     assert config.model == ModelConfig(channels=4)
 
 
@@ -60,13 +61,13 @@ def test_load_log_interval(tmp_path: Path) -> None:
     assert Config().log_interval_seconds == 60.0
     path = tmp_path / "config.yaml"
     path.write_text("log_interval_seconds: 15.5\n")
-    assert load_config(path).log_interval_seconds == 15.5
+    assert load_config(path, Config).log_interval_seconds == 15.5
 
 
 def test_load_evaluation_config(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text("evaluation:\n  num_openings: 3\n")
-    config = load_config(path)
+    config = load_config(path, Config)
     assert config.evaluation == EvaluationConfig(num_openings=3)
     assert config.evaluation.interval_seconds == 1800.0
 
@@ -104,12 +105,12 @@ def test_load_rejects_invalid_model_config(tmp_path: Path, contents: str, match:
     path = tmp_path / "config.yaml"
     path.write_text(contents)
     with pytest.raises(ValidationError, match=match):
-        load_config(path)
+        load_config(path, Config)
 
 
 def test_load_default_config() -> None:
     path = Path(__file__).resolve().parents[1] / "configs/alphazero_chess.yaml"
-    config = load_config(path)
+    config = load_config(path, Config)
     assert config.env_id == "chess"
     assert config.run_id == "alphazero_chess"
     assert config.log_dir == "gs://cohere-dev/vlad/rl2/alphazero/alphazero_chess"
@@ -128,4 +129,4 @@ def test_load_config_rejects_invalid_input(tmp_path: Path, contents: str, error:
     path = tmp_path / "config.yaml"
     path.write_text(contents)
     with pytest.raises(error, match=match):
-        load_config(path)
+        load_config(path, Config)

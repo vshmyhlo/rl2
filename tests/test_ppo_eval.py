@@ -43,7 +43,8 @@ def policy(
 )
 def test_episode_frame_limits(frame_limit: int | None, stop: bool, expected_length: int, expected_frames: int) -> None:
     config = replace(
-        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), video_max_frames=frame_limit
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", ppo.Config),
+        video_max_frames=frame_limit,
     )
     env = GymnaxEnv(config.env.id, max_steps_in_episode=2)
     state = TrainState.create(apply_fn=policy, params={}, tx=optax.sgd(0.1))
@@ -60,7 +61,7 @@ def test_episode_frame_limits(frame_limit: int | None, stop: bool, expected_leng
 
 @pytest.mark.parametrize("record", [True, False])
 def test_episode_renders_state_before_autoreset(record: bool) -> None:
-    config = ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
+    config = ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", ppo.Config)
     observation = jnp.zeros((4, 2, 2), jnp.uint8)  # (C, H, W)
     initial, final, reset = {"frame": 10}, {"frame": 20}, {"frame": 30}
     env = Mock()
@@ -83,7 +84,7 @@ def test_episode_renders_state_before_autoreset(record: bool) -> None:
 
 
 def test_beta_playback_reuses_compiled_sampling_across_steps_and_episodes() -> None:
-    config = ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml")
+    config = ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml", ppo.Config)
     space = ContinuousSpace((2,), (-1.0, -1.0), (1.0, 1.0))
     observation = jnp.zeros(1)  # (F=1,)
     carry = ((jnp.zeros((1, 1)), jnp.zeros((1, 1))),)  # leaves: (B=1,H=1)
@@ -161,7 +162,9 @@ def test_evaluation_logs_raw_scores_and_independent_seeds(
     trainer: ModuleType, config_path: str, actor_count: int
 ) -> None:
     config = replace(
-        trainer.load_config(Path(__file__).resolve().parents[1] / config_path), eval_episodes=2, video_fps=12.5
+        trainer.load_config(Path(__file__).resolve().parents[1] / config_path, trainer.Config),
+        eval_episodes=2,
+        video_fps=12.5,
     )
     writer = Mock()
     state = Mock(spec=TrainState)
@@ -202,7 +205,7 @@ def test_evaluation_logs_raw_scores_and_independent_seeds(
 
 
 def test_log_video_wiring() -> None:
-    config = ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/xminigrid.yaml")
+    config = ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/xminigrid.yaml", ppo.Config)
     writer = Mock()
     carry = ppo.ActorCritic(
         ppo.DiscreteSpace(3), ppo.ModelConfig(encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1))
@@ -229,7 +232,9 @@ def test_playback_logging_reports_progress(
     actor_count: int,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    config = replace(trainer.load_config(Path(__file__).resolve().parents[1] / config_path), eval_episodes=1)
+    config = replace(
+        trainer.load_config(Path(__file__).resolve().parents[1] / config_path, trainer.Config), eval_episodes=1
+    )
     writer = Mock()
     carry = ((jnp.zeros((actor_count, 1)), jnp.zeros((actor_count, 1))),)  # leaves: (B, H=1)
     frame = np.zeros((2, 2, 3), np.uint8)  # (H, W, C)
@@ -275,7 +280,9 @@ def test_playback_logging_reports_progress(
 def test_single_evaluation_omits_unavailable_uncertainty(
     trainer: ModuleType, config_path: str, actor_count: int
 ) -> None:
-    config = replace(trainer.load_config(Path(__file__).resolve().parents[1] / config_path), eval_episodes=1)
+    config = replace(
+        trainer.load_config(Path(__file__).resolve().parents[1] / config_path, trainer.Config), eval_episodes=1
+    )
     writer = Mock()
     carry = ((jnp.zeros((actor_count, 1)), jnp.zeros((actor_count, 1))),)  # leaves: (B, H=1)
     with (
@@ -294,7 +301,9 @@ def test_single_evaluation_omits_unavailable_uncertainty(
 
 
 def test_kinetix_video_and_evaluation_use_configured_environment() -> None:
-    config = replace(ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml"), eval_episodes=1)
+    config = replace(
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml", ppo.Config), eval_episodes=1
+    )
     carry = ppo.ActorCritic(
         ppo.DiscreteSpace(11), ppo.ModelConfig(encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1))
     ).initial_carry(1)  # leaves: (1,1)

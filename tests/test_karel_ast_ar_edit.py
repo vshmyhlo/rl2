@@ -28,6 +28,7 @@ def predict(state: TrainState, event: edit.Event) -> jax.Array:
 @pytest.fixture(scope="module")
 def config() -> edit.Config:
     return edit.Config(
+        run_id="test",
         total_updates=1,
         num_tasks=1,
         group_size=2,
@@ -171,19 +172,19 @@ def test_load_config_rejects_invalid_task_limit(tmp_path: Path, value: str, erro
     path = tmp_path / "config.yaml"
     path.write_text(f"max_unique_tasks: {value}\n")
     with pytest.raises(error, match="max_unique_tasks"):
-        edit.load_config(path)
+        edit.load_config(path, edit.Config)
 
 
 def test_load_config_task_limit(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text("max_unique_tasks: 1\n")
-    config = edit.load_config(path)
+    config = edit.load_config(path, edit.Config)
     assert config.max_unique_tasks == 1
     path.write_text(yaml.safe_dump(asdict(config)))
-    assert edit.load_config(path) == config
+    assert edit.load_config(path, edit.Config) == config
     for contents in ("max_unique_tasks: null\n", "{}\n"):
         path.write_text(contents)
-        assert edit.load_config(path).max_unique_tasks is None
+        assert edit.load_config(path, edit.Config).max_unique_tasks is None
 
 
 def test_replacement_grows_shrinks_and_preserves_context(config: edit.Config) -> None:
@@ -481,7 +482,7 @@ def test_update_rejects_invalid_replay(
 
 
 def test_config_and_checkpoint(config: edit.Config, state: TrainState, tmp_path: Path) -> None:
-    supplied = edit.load_config("configs/karel_ast_ar_edit.yaml")
+    supplied = edit.load_config("configs/karel_ast_ar_edit.yaml", edit.Config)
     assert supplied.edit_config.max_seq_len == supplied.max_seq_len
     assert supplied.edit_config.env == supplied.env
     # Test parsing independently of the tunable checked-in experiment settings.
@@ -490,7 +491,7 @@ def test_config_and_checkpoint(config: edit.Config, state: TrainState, tmp_path:
             {"env": {"depth_penalty_weight": 0.1, "length_penalty_weight": 0.2, "execution_penalty_weight": 0.3}}
         )
     )
-    parsed = edit.load_config(tmp_path / "config.yaml")
+    parsed = edit.load_config(tmp_path / "config.yaml", edit.Config)
     assert parsed.env.depth_penalty_weight == 0.1
     assert parsed.env.length_penalty_weight == 0.2
     assert parsed.env.execution_penalty_weight == 0.3
@@ -506,7 +507,7 @@ def test_config_and_checkpoint(config: edit.Config, state: TrainState, tmp_path:
             replace(config, **changes)
     # Runs created before accumulation was removed must still load for inference.
     (tmp_path / "config.yaml").write_text(yaml.safe_dump({**asdict(config), "replay_batch_size": 1}))
-    assert edit.load_config(tmp_path / "config.yaml") == config
+    assert edit.load_config(tmp_path / "config.yaml", edit.Config) == config.resolve_run()
     rng = np.random.default_rng(7)
     progress = edit.TrainingProgress(state, jax.random.key(5), 3, 6, 2, 6)
     edit._save_checkpoint(str(tmp_path), progress, rng)
@@ -549,7 +550,9 @@ def test_training_wiring(
     vector = edit.KarelASTEditVectorEnv(config.edit_config, config.num_tasks * config.group_size)
     vector_factory = MagicMock(return_value=vector)
     monkeypatch.setattr(edit, "KarelASTEditVectorEnv", vector_factory)
-    config = replace(config, log_dir=str(tmp_path), run_id="test", update_epochs=2)
+    config = replace(
+        config, log_dir=str(tmp_path / "logs"), ckpt_dir=str(tmp_path / "test"), run_id="test", update_epochs=2
+    )
     edit.train(config)
     vector_factory.assert_called_once_with(config.edit_config, 2, workers=config.env_workers)
     assert vector.closed
@@ -900,13 +903,13 @@ def test_disabled_stop_keeps_editing_despite_stop_biased_policy(
 def test_load_config_stop_option(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text("allow_stop: false\n")
-    config = edit.load_config(path)
+    config = edit.load_config(path, edit.Config)
     assert not config.allow_stop and not config.edit_config.allow_stop
     path.write_text("{}\n")
-    assert edit.load_config(path).allow_stop  # Existing saved configurations retain STOP.
+    assert edit.load_config(path, edit.Config).allow_stop  # Existing saved configurations retain STOP.
     path.write_text('allow_stop: "false"\n')
     with pytest.raises(ValidationError, match="allow_stop"):
-        edit.load_config(path)
+        edit.load_config(path, edit.Config)
 
 
 @pytest.mark.parametrize(

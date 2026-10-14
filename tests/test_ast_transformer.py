@@ -241,7 +241,7 @@ def test_sampling_finishes_and_completed_trees_use_safe_dummy_logits(
 
 
 def test_example_config_and_invalid_model_dimensions(batch: ModelBatch) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/karel_ast_grpo.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/karel_ast_grpo.yaml", Config)
     assert config.bf16 and config.max_nodes == 128
     model = ASTTransformer(d_model=15, num_heads=2, num_layers=1, max_nodes=24)
     with pytest.raises(AssertionError):

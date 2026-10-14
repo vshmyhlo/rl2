@@ -48,7 +48,7 @@ def env() -> PlaygroundEnv:
 
 
 def test_config_round_trip_and_factory(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = ppo.load_config(CONFIG_PATH)
+    config = ppo.load_config(CONFIG_PATH, ppo.Config)
     assert config.env.id == "MuJoCo-Playground"
     assert config.env == PlaygroundConfig(task="PandaPickCube", max_steps=150)
     assert config.model.encoder == ppo.MLPEncoderConfig()
@@ -82,7 +82,7 @@ def test_invalid_settings(settings: dict[str, object], match: str) -> None:
     ],
 )
 def test_config_rejects_mismatches(env_id: str, encoder: str, match: str) -> None:
-    settings = asdict(ppo.load_config(CONFIG_PATH))
+    settings = asdict(ppo.load_config(CONFIG_PATH, ppo.Config))
     settings.update(env={"id": env_id}, model={"encoder": {"type": encoder}})
     with pytest.raises(ValidationError, match=match):
         ppo.Config(**settings)
@@ -136,7 +136,7 @@ def test_batched_boundaries_preserve_final_observations(env: PlaygroundEnv) -> N
 
 def test_vector_policy_rollout_update_and_playback(env: PlaygroundEnv) -> None:
     config = replace(
-        ppo.load_config(CONFIG_PATH),
+        ppo.load_config(CONFIG_PATH, ppo.Config),
         num_envs=1,
         num_steps=2,
         num_minibatches=1,
@@ -183,7 +183,7 @@ def test_vector_policy_rollout_update_and_playback(env: PlaygroundEnv) -> None:
 def test_real_panda_spaces_controls_reward_and_timeout() -> None:
     if not (Path(playground_env.mjx_env.MENAGERIE_PATH) / "franka_emika_panda/mjx_panda.xml").exists():
         pytest.skip("Install Panda assets with: uv run python -m rl2.envs.playground_assets")
-    env = ppo.make_env(replace(ppo.load_config(CONFIG_PATH), env=PlaygroundConfig(max_steps=1)))
+    env = ppo.make_env(replace(ppo.load_config(CONFIG_PATH, ppo.Config), env=PlaygroundConfig(max_steps=1)))
     assert isinstance(env, PlaygroundEnv)
     assert env.action_space == ContinuousSpace(shape=(8,), low=(-1.0,) * 8, high=(1.0,) * 8)
     obs, state = env.reset(jax.random.key(0), env.params)  # (66,); leaves: (...)

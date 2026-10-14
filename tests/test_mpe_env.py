@@ -69,7 +69,7 @@ def test_invalid_mpe_settings(overrides: dict[str, int | float]) -> None:
 
 
 def test_config_and_cli(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = ppo.load_config(PRESET)
+    config = ppo.load_config(PRESET, ppo.Config)
     assert config.env.id == "MPE_simple_spread_v3"
     assert isinstance(ppo.make_env(config), MPEEnv)
     with pytest.raises(ValueError, match="num_agents"):
@@ -82,7 +82,7 @@ def test_config_and_cli(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_reference_communication_movement_and_timeout() -> None:
-    config = ppo.load_config(PRESET.with_name("simple_reference.yaml"))
+    config = ppo.load_config(PRESET.with_name("simple_reference.yaml"), ppo.Config)
     env = ppo.make_env(replace(config, env=replace(config.env, max_steps=2)))
     observation, state = env.reset(jax.random.key(0))  # (N=2, O=21)/(N, A=50); state leaves: (...)
     chex.assert_shape(observation.observations, (2, 21))
@@ -130,7 +130,7 @@ def test_reference_requires_fixed_agent_and_landmark_counts(num_agents: int, num
 @pytest.mark.parametrize("env_id", ["MPE_simple_spread_v3", "MPE_simple_reference_v3"])
 def test_update_playback_and_checkpoint(tmp_path: Path, env_id: MPEEnvId) -> None:
     config = replace(
-        ppo.load_config(PRESET),
+        ppo.load_config(PRESET, ppo.Config),
         env=MPEConfig(id=env_id, num_agents=2, num_landmarks=3, max_steps=1),
         num_envs=1,
         num_steps=1,
