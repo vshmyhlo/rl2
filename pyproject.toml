@@ -17,6 +17,7 @@ dependencies = [
     "gymnasium>=1.1,<2",
     "gymnax>=0.0.9,<0.1",
     "jax>=0.11.2,<0.12",
+    "mlflow-skinny[db]>=3.17.1,<4",
     "moviepy>=2.2,<3",
     "numpy>=2,<3",
     "omegaconf>=2.4,<3",

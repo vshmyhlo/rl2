@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: training
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: local-a100
+spec:
+  nodeLabels:
+    kubernetes.io/hostname: vlad-dev-gpu-1
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: gpu
+spec:
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: training
+  queueingStrategy: BestEffortFIFO
+  resourceGroups:
+    - coveredResources: [cpu, memory, nvidia.com/gpu]
+      flavors:
+        - name: local-a100
+          resources:
+            - name: cpu
+              nominalQuota: "10"
+            - name: memory
+              nominalQuota: 64Gi
+            - name: nvidia.com/gpu
+              nominalQuota: "1"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: gpu
+  namespace: training
+spec:
+  clusterQueue: gpu

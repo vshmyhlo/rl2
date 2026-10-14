@@ -1,0 +1,31 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: gpu-smoke-
+  namespace: training
+  labels:
+    kueue.x-k8s.io/queue-name: gpu
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      runtimeClassName: nvidia
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: gpu-check
+          image: nvidia/cuda:12.6.3-base-ubuntu22.04
+          command: [sh, -ec, "nvidia-smi; echo gpu-queue-ok"]
+          env:
+            - name: MLFLOW_TRACKING_URI
+              value: http://mlflow.mlflow.svc.cluster.local:5000
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              nvidia.com/gpu: 1
+              memory: 256Mi

@@ -1,0 +1,172 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: dcgm-exporter
+  namespace: kube-system
+spec:
+  repo: https://nvidia.github.io/dcgm-exporter/helm-charts
+  chart: dcgm-exporter
+  version: "4.8.4"
+  targetNamespace: monitoring
+  valuesContent: |-
+    fullnameOverride: dcgm-exporter
+    runtimeClassName: nvidia
+    priorityClassName: ""
+    nodeSelector:
+      kubernetes.io/hostname: vlad-dev-gpu-1
+    serviceMonitor:
+      enabled: false
+    serviceAccount:
+      automountServiceAccountToken: false
+    securityContext:
+      capabilities:
+        add: []
+        drop: [ALL]
+    extraEnv:
+      - name: NVIDIA_VISIBLE_DEVICES
+        value: all
+      - name: NVIDIA_DRIVER_CAPABILITIES
+        value: compute,utility
+      - name: DCGM_EXPORTER_INTERVAL
+        value: "10000"
+    customMetrics: |-
+      DCGM_FI_DEV_GPU_UTIL, gauge, GPU utilization (%).
+      DCGM_FI_DEV_MEM_COPY_UTIL, gauge, Memory bandwidth utilization (%).
+      DCGM_FI_DEV_FB_USED, gauge, Framebuffer memory used (MiB).
+      DCGM_FI_DEV_FB_FREE, gauge, Framebuffer memory free (MiB).
+      DCGM_FI_DEV_GPU_TEMP, gauge, GPU temperature (C).
+      DCGM_FI_DEV_MEMORY_TEMP, gauge, Memory temperature (C).
+      DCGM_FI_DEV_POWER_USAGE, gauge, Power draw (W).
+      DCGM_FI_DEV_SM_CLOCK, gauge, SM clock (MHz).
+      DCGM_FI_DEV_MEM_CLOCK, gauge, Memory clock (MHz).
+      DCGM_FI_DEV_ECC_DBE_VOL_TOTAL, counter, Uncorrectable ECC errors since driver load.
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: gpu-prometheus
+  namespace: kube-system
+spec:
+  repo: https://prometheus-community.github.io/helm-charts
+  chart: prometheus
+  version: "29.37.0"
+  targetNamespace: monitoring
+  valuesContent: |-
+    rbac:
+      create: false
+    alertmanager:
+      enabled: false
+    kube-state-metrics:
+      enabled: false
+    prometheus-node-exporter:
+      enabled: false
+    prometheus-pushgateway:
+      enabled: false
+    server:
+      fullnameOverride: gpu-prometheus
+      automountServiceAccountToken: false
+      retention: 7d
+      retentionSize: 4GB
+      persistentVolume:
+        storageClass: local-path
+        size: 5Gi
+      global:
+        scrape_interval: 15s
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          memory: 1Gi
+    scrapeConfigs:
+      kubernetes-api-servers:
+        enabled: false
+      kubernetes-nodes:
+        enabled: false
+      kubernetes-nodes-cadvisor:
+        enabled: false
+      kubernetes-service-endpoints:
+        enabled: false
+      kubernetes-service-endpoints-slow:
+        enabled: false
+      prometheus-pushgateway:
+        enabled: false
+      kubernetes-services:
+        enabled: false
+      kubernetes-pods:
+        enabled: false
+      kubernetes-pods-slow:
+        enabled: false
+    extraScrapeConfigs: |-
+      - job_name: nvidia-gpu
+        static_configs:
+          - targets: [dcgm-exporter.monitoring.svc.cluster.local:9400]
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: gpu-grafana
+  namespace: kube-system
+spec:
+  repo: https://grafana.github.io/helm-charts
+  chart: grafana
+  version: "10.5.15"
+  targetNamespace: monitoring
+  valuesContent: |-
+    fullnameOverride: gpu-grafana
+    rbac:
+      create: false
+    persistence:
+      enabled: true
+      storageClassName: local-path
+      size: 1Gi
+    deploymentStrategy:
+      type: Recreate
+    initChownData:
+      enabled: false
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 1Gi
+    grafana.ini:
+      auth.anonymous:
+        enabled: true
+        org_role: Viewer
+      users:
+        default_theme: dark
+      dashboards:
+        default_home_dashboard_path: /var/lib/grafana/dashboards/gpu/gpu-dashboard.json
+      analytics:
+        reporting_enabled: false
+        check_for_updates: false
+    datasources:
+      datasources.yaml:
+        apiVersion: 1
+        datasources:
+          - name: GPU Prometheus
+            uid: gpu-prometheus
+            type: prometheus
+            access: proxy
+            url: http://gpu-prometheus.monitoring.svc.cluster.local
+            isDefault: true
+            editable: false
+    dashboardProviders:
+      dashboardproviders.yaml:
+        apiVersion: 1
+        providers:
+          - name: gpu
+            orgId: 1
+            type: file
+            disableDeletion: true
+            updateIntervalSeconds: 10
+            options:
+              path: /var/lib/grafana/dashboards/gpu
+    dashboardsConfigMaps:
+      gpu: gpu-dashboard

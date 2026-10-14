@@ -1,7 +1,7 @@
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import chex
 import jax
@@ -13,9 +13,11 @@ import yaml
 from flax.training.train_state import TrainState
 from jaxmarl.environments.smax.heuristic_enemy_smax_env import State
 from jaxmarl.environments.smax.smax_env import State as BattleState
+from ppo_helpers import metric_history
 
 from rl2 import train_mappo as ppo
-from rl2.envs.smax_env import AgentObservation, SMAXConfig, SMAXEnv, SMAXStep
+from rl2.envs.multi_agent import AgentObservation, MultiAgentStep
+from rl2.envs.smax_env import SMAXConfig, SMAXEnv
 
 
 @pytest.fixture(scope="module")
@@ -65,7 +67,7 @@ class ScriptedSMAX(SMAXEnv):
         state = State(state=battle, enemy_policy_state=jnp.asarray(False))
         return self.observation(state), state
 
-    def step(self, key: jax.Array, state: State, actions: jax.Array) -> SMAXStep:  # key: (); actions: (N,)
+    def step(self, key: jax.Array, state: State, actions: jax.Array) -> MultiAgentStep[State]:  # key: (); actions: (N,)
         step = state.state.step + 1  # ()
         done = step == 2  # ()
         terminated = done & state.enemy_policy_state  # ()
@@ -78,7 +80,7 @@ class ScriptedSMAX(SMAXEnv):
         )
         reset = self.reset(key)[1].replace(enemy_policy_state=state.enemy_policy_state)
         advanced = jax.tree.map(lambda a, b: jnp.where(done, a, b), reset, final)
-        return SMAXStep(
+        return MultiAgentStep(
             self.observation(advanced),
             advanced,
             jnp.full(2, step, jnp.float32),  # rewards: (N,)
@@ -201,7 +203,9 @@ def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_pat
         tx=optax.inject_hyperparams(optax.adam)(learning_rate=config.learning_rate),
     )
     runner = ppo.RolloutCarry(state, observation, memory, starts, jnp.zeros(1), jnp.zeros(1, jnp.int32))
-    result = ppo.train_step(runner, train_state, env, config, jax.random.key(2), ppo.init_metrics())
+    result = jax.jit(ppo.train_step, static_argnames=("envs", "config"))(
+        runner, train_state, env, config, jax.random.key(2), ppo.init_metrics()
+    )
     assert int(result.train_state.step) == 3
     assert int(result.metrics.total.episode_count) == 1
     assert int(result.metrics.total.episode_length_sum) == 1
@@ -237,6 +241,78 @@ def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_pat
             ppo.restore_checkpoint(manager, train_state, replace(config, smax=SMAXConfig(map_name="8m")))
 
 
+def test_playback_reuses_compiled_sampling_with_updated_inputs() -> None:
+    memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (B=2, H=1)
+    observations = jnp.zeros((2, 1))  # (B, O=1)
+    starts = jnp.array([True, False])  # (B,)
+    masks = jnp.array([[True, False, True], [False, True, False]])  # (B, A=3)
+    params = {"logits": jnp.array([[100.0, 0.0, -100.0], [0.0, 0.0, 0.0]])}  # (B, A)
+
+    def policy(
+        variables: dict[str, dict[str, jax.Array]],
+        observations: jax.Array,  # (B, O)
+        carry: ppo.RecurrentCarry,  # leaves: (B, H)
+        episode_starts: jax.Array,  # (B,)
+        action_masks: jax.Array,  # (B, A)
+        *,
+        method: str,
+    ) -> ppo.ActorCriticOutput:
+        carry = jax.tree.map(lambda leaf: jnp.where(episode_starts[:, None], 0, leaf) + 1, carry)  # (B, H)
+        logits = jnp.where(action_masks, variables["params"]["logits"], -1e10)  # (B, A)
+        return ppo.ActorCriticOutput(carry, ppo.CategoricalPolicy(logits), jnp.zeros(2))  # (B, H); (B, A); (B,)
+
+    with patch.object(
+        ppo.CategoricalPolicy, "sample", autospec=True, side_effect=ppo.CategoricalPolicy.sample
+    ) as sample:
+        memory, actions = ppo.sample_policy_step(policy, params, observations, memory, starts, jax.random.key(0), masks)
+        chex.assert_shape(actions, (2,))
+        np.testing.assert_array_equal(actions, [0, 1])
+        params = {"logits": -params["logits"]}  # (B, A)
+        masks = masks.at[1].set(jnp.array([True, False, False]))  # (B, A)
+        memory, actions = ppo.sample_policy_step(policy, params, observations, memory, starts, jax.random.key(1), masks)
+        np.testing.assert_array_equal(actions, [2, 0])
+    assert sample.call_count == 1
+    chex.assert_shape(jax.tree.leaves(memory), (2, 1))
+    for leaf in jax.tree.leaves(memory):  # (B, H)
+        np.testing.assert_array_equal(leaf, [[1], [2]])
+
+
+@pytest.mark.parametrize(
+    "frame_limit,stop,expected_length,expected_frames",
+    [(1, True, 0, 1), (2, True, 1, 2), (1, False, 2, 1), (None, True, 2, 3)],
+    ids=["initial-frame-only", "capped-video", "evaluation-finishes", "uncapped-video"],
+)
+def test_episode_frame_limits(
+    config: ppo.Config,
+    frame_limit: int | None,
+    stop: bool,
+    expected_length: int,
+    expected_frames: int,
+) -> None:
+    env = ScriptedSMAX()
+    state = TrainState.create(apply_fn=scripted_policy, params={}, tx=optax.sgd(0.1))
+    memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
+
+    def render(state: State) -> np.ndarray:  # state leaves: (...)
+        return np.full((2, 2, 3), int(state.state.step), np.uint8)  # (P, Q, 3)
+
+    with patch.object(env, "render", side_effect=render):
+        result = ppo.play_episode(
+            state,
+            replace(config, video_max_frames=frame_limit),
+            jax.random.key(0),
+            memory,
+            record=True,
+            stop_at_frame_limit=stop,
+            env=env,
+        )
+    assert result.length == expected_length and len(result.frames) == expected_frames
+    assert result.episode_return == sum(range(1, expected_length + 1))
+    assert all(frame.shape == (2, 2, 3) and frame.dtype == np.uint8 for frame in result.frames)
+    # The final frame must precede autoreset, which returns the step counter to zero.
+    np.testing.assert_array_equal(result.frames[-1], expected_frames - 1)
+
+
 def test_config_and_cli(config: ppo.Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "smax.yaml"
     path.write_text(yaml.safe_dump(asdict(config)))
@@ -259,10 +335,10 @@ def test_training_resume_wiring_and_environment_step_logging(
 ) -> None:
     config = replace(config, video_interval=1, eval_interval=1, checkpoint_interval=1, log_interval=1)
     env = ScriptedSMAX()
-    writer, manager = Mock(), Mock()
+    writer, manager = MagicMock(), Mock()
     video, evaluation, save = Mock(), Mock(), Mock()
     monkeypatch.setattr(ppo, "make_env", lambda _: env)
-    monkeypatch.setattr(ppo, "SummaryWriter", Mock(return_value=writer))
+    monkeypatch.setattr(ppo, "MLflowLogger", Mock(return_value=writer))
     monkeypatch.setattr(ppo, "checkpoint_manager", lambda _: manager)
     monkeypatch.setattr(ppo, "log_video", video)
     monkeypatch.setattr(ppo, "log_evaluation", evaluation)
@@ -281,7 +357,7 @@ def test_training_resume_wiring_and_environment_step_logging(
         iteration: int,  # key: (); metrics: scalar leaves
     ) -> ppo.TrainStepResult:
         assert iteration == 1
-        chex.assert_shape(runner.observation.observations, (2, 2, 2))
+        chex.assert_shape(runner.observations.observations, (2, 2, 2))
         chex.assert_shape(jax.tree.leaves(runner.model_carry), (4, 4))
         np.testing.assert_array_equal(runner.episode_starts, True)
         np.testing.assert_array_equal(runner.episode_returns, 0)
@@ -294,11 +370,11 @@ def test_training_resume_wiring_and_environment_step_logging(
     for logger in (video, evaluation):
         logger.assert_called_once()
         chex.assert_shape(jax.tree.leaves(logger.call_args.kwargs["initial_carry"]), (2, 4))
-    scalars = {call.args[0]: call.args[1:] for call in writer.add_scalar.call_args_list}
+    scalars = {tag: values[-1] for tag, values in metric_history(writer).items()}
     assert scalars["charts/total_environment_steps"] == (8.0, 8)
     assert scalars["charts/total_observations"] == (16.0, 8)
     assert scalars["charts/total_episodes"] == (2.0, 8)
     assert scalars["charts/training_progress"] == (1.0, 8)
     assert save.call_args.args[1].rollout_count == 2
-    writer.close.assert_called_once()
+    writer.__exit__.assert_called_once()
     manager.close.assert_called_once()

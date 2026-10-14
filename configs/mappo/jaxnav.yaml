@@ -1,0 +1,44 @@
+# Shared local actor/critic (IPPO), navigating random obstacle maps with discrete controls.
+env_id: JaxNav
+jaxnav:
+  num_agents: 4
+  map_size: 11 # Square Grid-Rand-Poly map, including boundary walls
+  fill: 0.3 # Upper bound on random interior obstacle density
+  lidar_num_beams: 200
+  max_steps: 500
+  rew_lambda: 0.5 # Mix individual reward (1.0) with mean team reward (0.0)
+seed: 1
+total_steps: 10_000_000 # Environment transitions; each contains num_agents observations
+num_envs: 128
+num_steps: 128
+num_minibatches: 4 # Divides num_envs * num_agents; keep recurrent sequences intact
+update_epochs: 4
+model:
+  hidden_size: 128
+  recurrent:
+    hidden_size: 128
+    num_layers: 1
+    intermediate_size: 0
+bf16: false
+learning_rate: 0.0003
+anneal_lr: true
+lr_decay: linear
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: null
+entropy_coef: 0.01
+entropy_decay: constant
+value_coef: 1.0
+max_grad_norm: 0.5
+log_dir: gs://cohere-dev/vlad/rl2/mappo/${run_id}
+run_id: ippo_${path_name:${env_id}}_${jaxnav.num_agents}agents_${jaxnav.map_size}x${jaxnav.map_size}
+# All intervals count completed PPO iterations (one rollout and its updates).
+log_interval: 10
+video_interval: 100
+video_max_frames: 900
+video_fps: 10
+checkpoint_interval: 500
+eval_interval: 500
+eval_episodes: 20
+eval_seed: 10000

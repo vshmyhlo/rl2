@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mlflow
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mlflow-data
+  namespace: mlflow
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  namespace: mlflow
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mlflow
+  template:
+    metadata:
+      labels:
+        app: mlflow
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: mlflow
+          image: ghcr.io/mlflow/mlflow:v3.17.1
+          command: [mlflow]
+          args:
+            - server
+            - --host=0.0.0.0
+            - --port=5000
+            - --workers=1
+            - --backend-store-uri=sqlite:////mlflow/mlflow.db
+            - --serve-artifacts
+            - --artifacts-destination=/mlflow/artifacts
+            - --default-artifact-root=mlflow-artifacts:/
+            - --allowed-hosts=localhost:*,127.0.0.1:*,mlflow:*,mlflow.mlflow:*,mlflow.mlflow.svc:*,mlflow.mlflow.svc.cluster.local:*
+            - --cors-allowed-origins=http://localhost:8081,http://127.0.0.1:8081
+          ports:
+            - name: http
+              containerPort: 5000
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: data
+              mountPath: /mlflow
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost:5000
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost:5000
+            timeoutSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mlflow-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow
+  namespace: mlflow
+spec:
+  type: ClusterIP
+  selector:
+    app: mlflow
+  ports:
+    - name: http
+      port: 5000
+      targetPort: http

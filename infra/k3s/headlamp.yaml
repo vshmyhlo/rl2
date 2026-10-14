@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: headlamp
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: headlamp
+  namespace: kube-system
+spec:
+  repo: https://kubernetes-sigs.github.io/headlamp/
+  chart: headlamp
+  version: "0.45.0"
+  targetNamespace: headlamp
+  valuesContent: |-
+    fullnameOverride: headlamp
+    clusterRoleBinding:
+      create: false
+    service:
+      type: ClusterIP
+    ingress:
+      enabled: false
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
+---
+# Login identity; the Headlamp pod uses a separate, unprivileged account.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: headlamp-viewer
+  namespace: headlamp
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: headlamp-viewer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: headlamp-viewer
+    namespace: headlamp
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: headlamp-node-viewer
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: headlamp-node-viewer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: headlamp-node-viewer
+subjects:
+  - kind: ServiceAccount
+    name: headlamp-viewer
+    namespace: headlamp

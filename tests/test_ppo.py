@@ -2,7 +2,7 @@ from dataclasses import FrozenInstanceError, asdict, fields, replace
 from functools import partial
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import chex
 import jax
@@ -12,7 +12,7 @@ import optax
 import pytest
 import yaml
 from flax.training.train_state import TrainState
-from ppo_helpers import env_step
+from ppo_helpers import env_step, metric_history
 from pydantic import ValidationError
 
 from rl2 import ppo
@@ -529,7 +529,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     model = Mock()
     model.initial_carry.return_value = carry
     model.init.return_value = {"params": {"weight": jnp.zeros(1)}}  # weight: (1,)
-    writer = Mock()
+    writer = MagicMock()
     iterations: list[int] = []
     learning_rates: list[float] = []
     losses = iter((1.0, 3.0, 8.0, 10.0, 14.0))
@@ -566,7 +566,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         jax.disable_jit(),
         patch("rl2.ppo.GymnaxEnv", return_value=envs),
         patch("rl2.ppo.ActorCritic", return_value=model) as actor_critic,
-        patch("rl2.ppo.SummaryWriter", return_value=writer),
+        patch("rl2.ppo.MLflowLogger", return_value=writer),
         patch.object(
             model,
             "apply",
@@ -581,15 +581,13 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     ):
         train(config)
     actor_critic.assert_called_once_with(
-        ppo.DiscreteSpace(2),
-        config.model,
+        action_space=ppo.DiscreteSpace(n=2),
+        model=config.model,
         dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
     )
     assert iterations == [0, 0, 1, 2, 2]
     np.testing.assert_allclose(learning_rates, config.learning_rate * np.array([1.0, 1.0, 0.75, 0.25, 0.25]))
-    logged: dict[str, list[tuple[float, int]]] = {}
-    for call in writer.add_scalar.call_args_list:
-        logged.setdefault(call.args[0], []).append(call.args[1:])
+    logged = metric_history(writer)
     assert "time/window_seconds" not in logged
     assert "time/iteration_seconds" not in logged
     assert "charts/steps_per_second" not in logged
@@ -641,8 +639,8 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     }.intersection(logged)
     assert "step=2 episodes=1 return=8.0 episode_length=2.0" in progress_lines[0]
     assert "step=3 episodes=1 return=n/a episode_length=n/a" in progress_lines[1]
-    assert writer.flush.call_count == 2
-    writer.close.assert_called_once()
+    assert writer.log_metrics.call_count == 3  # Startup and two progress windows.
+    writer.__exit__.assert_called_once()
 
 
 @pytest.mark.parametrize("interval", [0, -1, 1.5, True])
@@ -720,7 +718,7 @@ def test_video_schedule_uses_iterations(interval: int, expected_steps: list[int]
         jax.disable_jit(),
         patch.object(ppo, "GymnaxEnv", return_value=envs),
         patch.object(ppo, "ActorCritic", return_value=model),
-        patch.object(ppo, "SummaryWriter") as writer,
+        patch.object(ppo, "MLflowLogger") as writer,
         patch.object(
             model,
             "apply",
@@ -742,7 +740,7 @@ def test_video_schedule_uses_iterations(interval: int, expected_steps: list[int]
         assert recorded_writer is writer.return_value
         assert episodes == 0
         assert call.kwargs["initial_carry"] is carry
-    writer.return_value.close.assert_called_once()
+    writer.return_value.__exit__.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -810,7 +808,7 @@ def test_train_evaluates_final_policy(
         jax.disable_jit(),
         patch.object(ppo, "GymnaxEnv", return_value=envs),
         patch.object(ppo, "ActorCritic", return_value=model),
-        patch.object(ppo, "SummaryWriter") as writer,
+        patch.object(ppo, "MLflowLogger") as writer,
         patch.object(
             model,
             "apply",
@@ -845,13 +843,13 @@ def test_train_evaluates_final_policy(
         ("charts/observations_per_second", [(2 / first_elapsed, 2), (2 / (final_elapsed - first_elapsed), 4)]),
         ("charts/episodes_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
     ):
-        logged = [call.args[1:] for call in writer.return_value.add_scalar.call_args_list if call.args[0] == tag]
+        logged = metric_history(writer.return_value)[tag]
         assert logged == expected
     output = capsys.readouterr().out
     assert f"elapsed=0:01:{int(first_elapsed % 60):02d}" in output
     assert f"elapsed=0:{int(final_elapsed // 60):02d}:{int(final_elapsed % 60):02d}" in output
     assert "eta=" not in output
-    writer.return_value.close.assert_called_once()
+    writer.return_value.__exit__.assert_called_once()
 
 
 def test_kl_rejects_update_without_changing_optimizer() -> None:

@@ -8,7 +8,7 @@ from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import chex
 import jax
@@ -17,7 +17,7 @@ import numpy as np
 import optax
 import pytest
 from flax.training.train_state import TrainState
-from ppo_helpers import env_step
+from ppo_helpers import env_step, metric_history
 
 from rl2 import ppo
 from rl2.envs.base import BaseEnv
@@ -169,7 +169,7 @@ def test_checkpoint_rejects_changed_rollout_size(config: ppo.Config, state: Trai
     ]
     with pytest.raises(ValueError, match=r"num_envs \* num_steps"):
         ppo.restore_checkpoint(manager, state, replace(config, **{field: 2}))
-    # Reject before restoring optimizer arrays or opening the TensorBoard writer.
+    # Reject before restoring optimizer arrays or opening the MLflow run.
     manager.restore.assert_called_once()
 
 
@@ -260,15 +260,15 @@ def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> 
     envs.step_batch = partial(BaseEnv.step_batch, envs)
     envs.reset.return_value = (np.zeros(1, dtype=np.uint8), {})  # observation: (O=1,)
     manager = Mock()
-    writer = Mock()
+    writer = MagicMock()
     model = Mock()
     model.init.return_value = {"params": {}}
     # Stop before rollout collection, with no real model or optimizer initialization.
-    writer.add_text.side_effect = RuntimeError("logging")
+    writer.log_text.side_effect = RuntimeError("logging")
     if failure == "reset":
         envs.reset.side_effect = RuntimeError(failure)
     elif failure == "writer_close":
-        writer.close.side_effect = RuntimeError(failure)
+        writer.__exit__.side_effect = RuntimeError(failure)
 
     with (
         patch.object(ppo, "configure_compilation_cache"),
@@ -277,7 +277,7 @@ def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> 
         patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo.TrainState, "create"),
         patch.object(ppo, "restore_checkpoint", return_value=None),
-        patch.object(ppo, "SummaryWriter", return_value=writer) as make_writer,
+        patch.object(ppo, "MLflowLogger", return_value=writer) as make_writer,
     ):
         if failure == "manager":
             make_manager.side_effect = RuntimeError(failure)
@@ -291,9 +291,9 @@ def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> 
     else:
         manager.close.assert_called_once_with()
     if failure in ("logging", "writer_close"):
-        writer.close.assert_called_once_with()
+        writer.__exit__.assert_called_once()
     else:
-        writer.close.assert_not_called()
+        writer.__exit__.assert_not_called()
 
 
 def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config) -> None:
@@ -368,7 +368,7 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         jax.disable_jit(),
         patch.object(ppo, "GymnaxEnv", return_value=envs),
         patch.object(ppo, "ActorCritic", return_value=model),
-        patch.object(ppo, "SummaryWriter") as writer,
+        patch.object(ppo, "MLflowLogger") as writer,
         patch.object(
             model,
             "apply",
@@ -397,36 +397,15 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         assert iterations == [0, 1, 2, 3]
         assert int(resumed.step) == 4
         np.testing.assert_allclose(learning_rates, [ppo.learning_rate_schedule(config)(i) for i in range(4)])
-        writer.assert_called_once_with(logdir=run_dir, purge_step=3)
-        episode_logs = [
-            c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/total_episodes"
-        ]
-        assert episode_logs == [(3.0, 3), (4.0, 4)]
-        writer.return_value.add_scalar.assert_any_call("charts/total_observations", 4.0, 4)
-        progress_logs = [
-            c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/training_progress"
-        ]
-        assert progress_logs == [(0.75, 3), (1.0, 4)]
-        return_logs = [
-            c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "charts/total_return_mean"
-        ]
-        assert return_logs == [(1.0, 3), (1.0, 4)]
-        length_logs = [
-            c.args[1:]
-            for c in writer.return_value.add_scalar.call_args_list
-            if c.args[0] == "charts/total_episode_length_mean"
-        ]
-        assert length_logs == [(1.0, 3), (1.0, 4)]
-        sps = [
-            c.args[1]
-            for c in writer.return_value.add_scalar.call_args_list
-            if c.args[0] == "charts/observations_per_second"
-        ]
-        assert sps == [1.0, 1.0]
-        elapsed_logs = [
-            c.args[1:] for c in writer.return_value.add_scalar.call_args_list if c.args[0] == "time/elapsed_seconds"
-        ]
-        assert elapsed_logs == [(1.0, 3), (2.0, 4)]
+        writer.assert_called_once_with(experiment="ppo", run_name=config.run_id, run_dir=run_dir, resume=True)
+        logged = metric_history(writer.return_value)
+        assert logged["charts/total_episodes"] == [(3.0, 3), (4.0, 4)]
+        assert logged["charts/total_observations"][-1] == (4.0, 4)
+        assert logged["charts/training_progress"] == [(0.75, 3), (1.0, 4)]
+        assert logged["charts/total_return_mean"] == [(1.0, 3), (1.0, 4)]
+        assert logged["charts/total_episode_length_mean"] == [(1.0, 3), (1.0, 4)]
+        assert [value for value, _ in logged["charts/observations_per_second"]] == [1.0, 1.0]
+        assert logged["time/elapsed_seconds"] == [(1.0, 3), (2.0, 4)]
         # An already completed run does not perform more updates or duplicate a save.
         ppo.train(config)
         assert iterations == [0, 1, 2, 3]

@@ -1,0 +1,446 @@
+{
+  "uid": "gpu-overview",
+  "title": "A100 GPU monitoring",
+  "description": "Live NVIDIA GPU telemetry. Refreshes every 15 seconds; up to seven days of history.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "tags": [
+    "GPU",
+    "NVIDIA"
+  ],
+  "timezone": "browser",
+  "refresh": "15s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "GPU utilization",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_UTIL",
+          "refId": "A",
+          "legendFormat": "{{modelName}} GPU {{gpu}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 2,
+      "title": "VRAM used",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_FB_USED * 1024 * 1024",
+          "refId": "A",
+          "legendFormat": "{{modelName}} GPU {{gpu}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 3,
+      "title": "GPU temperature",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_TEMP",
+          "refId": "A",
+          "legendFormat": "{{modelName}} GPU {{gpu}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Power draw",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_POWER_USAGE",
+          "refId": "A",
+          "legendFormat": "{{modelName}} GPU {{gpu}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watt",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 5,
+      "title": "GPU and memory bandwidth utilization",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_UTIL",
+          "refId": "A",
+          "legendFormat": "{{modelName}} GPU {{gpu}}"
+        },
+        {
+          "expr": "DCGM_FI_DEV_MEM_COPY_UTIL",
+          "refId": "B",
+          "legendFormat": "Memory bandwidth"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "VRAM usage",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_FB_USED * 1024 * 1024",
+          "refId": "A",
+          "legendFormat": "{{modelName}} GPU {{gpu}}"
+        },
+        {
+          "expr": "(DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) * 1024 * 1024",
+          "refId": "B",
+          "legendFormat": "Total VRAM"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "GPU and memory temperature",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_TEMP",
+          "refId": "A",
+          "legendFormat": "{{modelName}} GPU {{gpu}}"
+        },
+        {
+          "expr": "DCGM_FI_DEV_MEMORY_TEMP",
+          "refId": "B",
+          "legendFormat": "Memory temperature"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Power history",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 13,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_POWER_USAGE",
+          "refId": "A",
+          "legendFormat": "{{modelName}} GPU {{gpu}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watt",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "SM and memory clocks",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_SM_CLOCK",
+          "refId": "A",
+          "legendFormat": "{{modelName}} GPU {{gpu}}"
+        },
+        {
+          "expr": "DCGM_FI_DEV_MEM_CLOCK",
+          "refId": "B",
+          "legendFormat": "Memory clock"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "MHz",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Uncorrectable ECC errors",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 21,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_ECC_DBE_VOL_TOTAL",
+          "refId": "A",
+          "legendFormat": "{{modelName}} GPU {{gpu}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    }
+  ]
+}

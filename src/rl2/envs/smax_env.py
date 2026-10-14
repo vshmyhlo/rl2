@@ -1,7 +1,7 @@
 """SMAX team observations, legal actions, and explicit autoreset boundaries."""
 
 from functools import partial
-from typing import Annotated, NamedTuple
+from typing import Annotated
 
 import jax
 import jax.numpy as jnp
@@ -15,6 +15,7 @@ from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
 from rl2.actions import DiscreteSpace
+from rl2.envs.multi_agent import AgentObservation, MultiAgentStep
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -27,25 +28,6 @@ class SMAXConfig:
             map_name_to_scenario(self.map_name)
         except KeyError as error:
             raise ValueError(f"Unknown SMAX map: {self.map_name}") from error
-
-
-class AgentObservation(NamedTuple):
-    """N agents, O local features, A discrete actions; optional leading batch axes."""
-
-    observations: jax.Array  # (..., N, O) float32
-    action_masks: jax.Array  # (..., N, A) bool
-
-
-class SMAXStep(NamedTuple):
-    observation: AgentObservation  # (N, O); (N, A), after autoreset
-    state: State  # leaves: (...)
-    rewards: jax.Array  # (N,) shared team reward
-    done: jax.Array  # () environment completion
-    agent_dones: jax.Array  # (N,) dead agents or environment completion
-    terminated: jax.Array  # () battle ended
-    truncated: jax.Array  # () time limit reached
-    final_observation: AgentObservation  # (N, O); (N, A), before autoreset
-    final_state: State  # leaves: (...), before autoreset
 
 
 class SMAXEnv:
@@ -81,7 +63,7 @@ class SMAXEnv:
         key: jax.Array,  # () typed PRNG key
         state: State,  # leaves: (...)
         actions: jax.Array,  # (N,) int32
-    ) -> SMAXStep:
+    ) -> MultiAgentStep[State]:
         step_key, reset_key = jax.random.split(key)  # each ()
         observations, final_state, rewards, dones, _ = self.env.step_env(
             step_key, state, {agent: actions[i] for i, agent in enumerate(self.agents)}
@@ -95,7 +77,7 @@ class SMAXEnv:
         observation, next_state = jax.lax.cond(
             done, lambda: self.reset(reset_key), lambda: (final_observation, final_state)
         )  # observations: (N, O)/(N, A); state leaves: (...)
-        return SMAXStep(
+        return MultiAgentStep(
             observation,
             next_state,
             jnp.stack([rewards[agent] for agent in self.agents]),  # (N,)
@@ -106,6 +88,9 @@ class SMAXEnv:
             final_observation,
             final_state,
         )
+
+    def memory_resets(self, state: State) -> jax.Array:  # state leaves: (...) -> (N,)
+        return ~state.state.unit_alive[: self.num_agents]  # (N,)
 
     def render(self, state: State) -> NDArray[np.uint8]:  # leaves: (...) -> (H, W, 3)
         figure = Figure(figsize=(5, 5), dpi=80)

@@ -1,6 +1,7 @@
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import Mock, patch
 
 import jax
@@ -10,7 +11,7 @@ import optax
 import pytest
 from flax.training.train_state import TrainState
 
-from rl2 import ppo
+from rl2 import ppo, train_mappo
 from rl2.actions import ContinuousSpace
 from rl2.envs.gymnax_env import GymnaxEnv
 
@@ -137,7 +138,7 @@ def test_evaluation_logs_raw_scores_and_independent_seeds() -> None:
         )
         assert call.args[3] is carry
         assert call.kwargs["record"] == (index == 1)
-    scalars = {call.args[0]: call.args[1] for call in writer.add_scalar.call_args_list}
+    scalars = writer.log_metrics.call_args.args[0]
     assert scalars["eval/return_mean"] == 3
     assert scalars["eval/return_std"] == pytest.approx(2**0.5)
     assert scalars["eval/return_sem"] == pytest.approx(1.0)
@@ -145,12 +146,16 @@ def test_evaluation_logs_raw_scores_and_independent_seeds() -> None:
     assert not any(tag.startswith("training/") for tag in scalars)
     assert not any("last_100" in tag for tag in scalars)
     assert "eval/human_normalized_score_percent" not in scalars
-    report = json.loads(writer.add_text.call_args.args[1].removeprefix("```json\n").removesuffix("\n```"))
+    report = json.loads(writer.log_text.call_args.args[0])
     assert report["env_id"] == "Breakout-MinAtar"
     assert report["episodes"] == [{"return": 2, "length": 3}, {"return": 4, "length": 5}]
     assert "training_scores" not in report
-    assert writer.add_video.call_args.args[1].shape == (1, 1, 3, 2, 2)
-    assert writer.add_video.call_args.kwargs["fps"] == 12.5
+    assert len(writer.log_video.call_args.args[0]) == 1
+    assert writer.log_video.call_args.args[0][0].shape == (2, 2, 3)
+    assert writer.log_video.call_args.args[1] == "eval/gameplay/128.mp4"
+    assert writer.log_text.call_args.args[1] == "eval/report/128.json"
+    assert writer.log_metrics.call_args.args[1] == 128
+    assert writer.log_video.call_args.kwargs["fps"] == 12.5
 
 
 def test_log_video_wiring() -> None:
@@ -166,8 +171,39 @@ def test_log_video_wiring() -> None:
         ppo.log_video(Mock(), config, writer, 2, 128, initial_carry=carry)
     assert play.call_args.kwargs["record"]
     assert play.call_args.kwargs["stop_at_frame_limit"]
-    assert writer.add_video.call_args.args[0] == "gameplay"
-    assert writer.add_video.call_args.kwargs["fps"] == 10.0
+    assert writer.log_video.call_args.args[1] == "gameplay/128.mp4"
+    assert writer.log_video.call_args.kwargs["fps"] == 10.0
+
+
+@pytest.mark.parametrize(
+    "trainer,config_path,actor_count",
+    [(ppo, "configs/ppo.yaml", 1), (train_mappo, "configs/mappo/smax.yaml", 2)],
+    ids=["ppo", "mappo"],
+)
+def test_playback_logging_reports_progress(
+    trainer: ModuleType,
+    config_path: str,
+    actor_count: int,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(trainer.load_config(Path(__file__).resolve().parents[1] / config_path), eval_episodes=1)
+    writer = Mock()
+    carry = ((jnp.zeros((actor_count, 1)), jnp.zeros((actor_count, 1))),)  # leaves: (B, H=1)
+    frame = np.zeros((2, 2, 3), np.uint8)  # (H, W, C)
+    result = trainer.EpisodeResult(episode_return=2.0, length=1, frames=[frame])
+    with patch.object(trainer, "make_env"), patch.object(trainer, "play_episode", return_value=result):
+        trainer.log_video(Mock(), config, writer, 2, 128, initial_carry=carry)
+        trainer.log_evaluation(Mock(), config, writer, 2, 128, initial_carry=carry)
+    assert capsys.readouterr().out.splitlines() == [
+        "Recording gameplay at step 128 after 2 training episodes...",
+        "Recorded 1 gameplay frames after 2 training episodes",
+        "Evaluating 1 games at step 128...",
+        "Evaluation: return=2.0 over 1 games",
+    ]
+    assert [call.args[1] for call in writer.log_video.call_args_list] == ["gameplay/128.mp4", "eval/gameplay/128.mp4"]
+    assert all(
+        len(call.args[0]) == 1 and call.args[0][0].shape == (2, 2, 3) for call in writer.log_video.call_args_list
+    )
 
 
 def test_single_evaluation_omits_unavailable_uncertainty() -> None:
@@ -178,10 +214,10 @@ def test_single_evaluation_omits_unavailable_uncertainty() -> None:
     ).initial_carry(1)  # leaves: (1,1)
     with patch.object(ppo, "play_episode", return_value=(2.0, 3, [])):
         ppo.log_evaluation(Mock(), config, writer, 0, 0, initial_carry=carry)
-    tags = {call.args[0] for call in writer.add_scalar.call_args_list}
+    tags = set(writer.log_metrics.call_args.args[0])
     assert "eval/return_mean" in tags
     assert not {"eval/return_std", "eval/return_sem"} & tags
-    report = json.loads(writer.add_text.call_args.args[1].removeprefix("```json\n").removesuffix("\n```"))
+    report = json.loads(writer.log_text.call_args.args[0])
     assert "training_scores" not in report
 
 
@@ -201,5 +237,5 @@ def test_kinetix_video_and_evaluation_use_configured_environment() -> None:
     assert make_env.call_count == 2
     assert all(call.args == (config.kinetix,) for call in make_env.call_args_list)
     assert all(call.kwargs["env"] is make_env.return_value for call in play.call_args_list)
-    report = json.loads(writer.add_text.call_args.args[1].removeprefix("```json\n").removesuffix("\n```"))
+    report = json.loads(writer.log_text.call_args.args[0])
     assert report["env_id"] == "Kinetix" and report["return_mean"] == 1.0
