@@ -34,6 +34,7 @@ dependencies = [
     "optax>=0.2.4,<0.3",
     "orbax-checkpoint>=0.12.6,<0.13",
     "pgx>=2.6,<3",
+    "playground==0.2.0",
     "pydantic>=2.13,<3",
     "pytest>=9.1.1",
     "pyyaml>=6,<7",
@@ -46,7 +47,6 @@ dependencies = [
     "tfp-nightly>=0.26.0.dev0,<0.27",
     "tokamax>=0.0.15; sys_platform == 'linux'",
     "xminigrid==0.9.3",
-    "playground==0.2.0",
 ]
 
 [project.scripts]

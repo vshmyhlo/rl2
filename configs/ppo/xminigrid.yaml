@@ -1,6 +1,6 @@
 # Simple Four Rooms navigation task.
-env_id: XLand-MiniGrid
-xminigrid:
+env:
+  id: XLand-MiniGrid
   env_id: MiniGrid-FourRooms
   benchmark: null
   ruleset_id: null
@@ -35,7 +35,7 @@ entropy_decay: constant
 value_coef: 0.5
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
-run_id: ppo_${path_name:${env_id}}_${path_name:${xminigrid.env_id}}_seed${seed}
+run_id: ppo_${path_name:${env.id}}_${path_name:${env.env_id}}_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
 # Video, checkpoint, and eval: every 20% of training, rounded up; also run on completion.
 log_interval: 10

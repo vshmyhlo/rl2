@@ -1,4 +1,5 @@
-env_id: Breakout-MinAtar # Gymnax; 10x10 binary planes, three actions
+env:
+  id: Breakout-MinAtar # Gymnax; 10x10 binary planes, three actions
 seed: 1
 total_steps: 10000000 # Agent transitions across all environments; only full rollouts run
 num_envs: 32

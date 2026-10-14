@@ -1,0 +1,44 @@
+# Reach, grasp, and move a cube to a sampled target with the Franka Panda arm.
+# Setup: uv run python -m rl2.envs.playground_assets
+env:
+  id: MuJoCo-Playground
+  task: PandaPickCube
+  max_steps: 150 # 3 simulated seconds at 50 Hz; MJX uses the JAX backend
+seed: 1
+total_steps: 10_000_000
+num_envs: 32
+num_steps: 128
+num_minibatches: 4
+update_epochs: 4
+model:
+  continuous_policy: truncated_gaussian
+  encoder:
+    type: mlp
+    hidden_size: 256
+    embedding_size: 256
+  recurrent:
+    type: lstm
+    hidden_size: 256
+bf16: false
+learning_rate: 0.0003
+anneal_lr: true
+lr_decay: linear
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: 0.01
+entropy_coef: 0.001
+entropy_decay: cosine
+value_coef: 0.5
+max_grad_norm: 0.5
+ckpt_dir: runs/ppo/${run_id}
+run_id: ppo_${path_name:${env.id}}_${env.task}_seed${seed}
+checkpoint_interval: 489
+log_interval: 10
+# Enable video/evaluation with an available OpenGL backend (e.g. MUJOCO_GL=egl).
+video_interval: 0
+video_max_frames: 150
+video_fps: 50.0
+eval_interval: 0
+eval_episodes: 10
+eval_seed: 10000

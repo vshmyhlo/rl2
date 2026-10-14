@@ -19,6 +19,7 @@ from rl2.envs.base import BaseEnv, EnvStep
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class KinetixConfig:
+    id: Literal["Kinetix"] = "Kinetix"
     action_type: Literal["discrete", "continuous"] = "discrete"
     size: Literal["s", "m", "l"] = "s"
     # None samples procedural levels; otherwise sample uniformly from this list.

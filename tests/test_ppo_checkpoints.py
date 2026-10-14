@@ -193,53 +193,37 @@ def test_checkpoint_preserves_episode_totals(config: ppo.Config, state: TrainSta
     chex.assert_trees_all_equal(restored, progress)
 
 
-@pytest.mark.parametrize("field", ["num_envs", "num_steps"])
-def test_checkpoint_rejects_changed_rollout_size(config: ppo.Config, state: TrainState, field: str) -> None:
+@pytest.mark.parametrize(
+    "trainer,config_path",
+    [(ppo, "configs/ppo.yaml"), (train_mappo, "configs/mappo/smax.yaml")],
+    ids=["ppo", "mappo"],
+)
+def test_checkpoint_ignores_saved_config(trainer: ModuleType, config_path: str, state: TrainState) -> None:
+    config = trainer.load_config(Path(__file__).resolve().parents[1] / config_path)
+    progress = trainer.TrainingProgress(
+        train_state=state,
+        key=jax.random.key(3),  # () typed PRNG key
+        rollout_count=2,
+        episode_count=8,
+        episode_return_sum=12.5,
+        episode_length_sum=40,
+    )
     manager = Mock()
-    ppo.save_checkpoint(manager, ppo.TrainingProgress(state, jax.random.key(3), 2, 0, 0.0, 0), config)
+    trainer.save_checkpoint(manager, progress, config)
     saved = manager.save.call_args.kwargs["args"]
-    manager.latest_step.return_value = 2
-    manager.restore.side_effect = [
-        SimpleNamespace(metadata=saved.metadata.item),
-        SimpleNamespace(state=saved.state.item),
-    ]
-    with pytest.raises(ValueError, match=r"num_envs \* num_steps"):
-        ppo.restore_checkpoint(manager, state, replace(config, **{field: 2}))
-    # Reject before restoring optimizer arrays or opening the MLflow run.
-    manager.restore.assert_called_once()
-
-
-def test_checkpoint_allows_reshaping_same_rollout_size(config: ppo.Config, state: TrainState) -> None:
-    config = replace(config, num_steps=2)
-    progress = ppo.TrainingProgress(state, jax.random.key(3), 1, 0, 0.0, 0)
-    manager = Mock()
-    ppo.save_checkpoint(manager, progress, config)
-    saved = manager.save.call_args.kwargs["args"]
-    manager.latest_step.return_value = 1
-    manager.restore.side_effect = [
-        SimpleNamespace(metadata=saved.metadata.item),
-        SimpleNamespace(state=saved.state.item),
-    ]
-    restored = ppo.restore_checkpoint(manager, state, replace(config, num_envs=2, num_steps=1))
+    metadata = json.loads(json.dumps(saved.metadata.item))
+    metadata["config"].update(
+        env={"id": "previous-environment", "retired_setting": True},
+        model={"retired_model_setting": True},
+        num_envs=config.num_envs + 1,
+        num_steps=config.num_steps + 1,
+    )
+    if trainer is train_mappo:
+        metadata["algorithm"] = "previous-environment_ippo"
+    manager.latest_step.return_value = progress.rollout_count
+    manager.restore.side_effect = [SimpleNamespace(metadata=metadata), SimpleNamespace(state=saved.state.item)]
+    restored = trainer.restore_checkpoint(manager, state, config)
     chex.assert_trees_all_equal(restored, progress)
-
-
-def test_checkpoint_rejects_changed_model_computation(config: ppo.Config, state: TrainState) -> None:
-    manager = Mock()
-    ppo.save_checkpoint(manager, ppo.TrainingProgress(state, jax.random.key(3), 2, 0, 0.0, 0), config)
-    saved = manager.save.call_args.kwargs["args"]
-    manager.latest_step.return_value = 2
-    manager.restore.side_effect = [
-        SimpleNamespace(metadata=json.loads(json.dumps(saved.metadata.item))),
-        SimpleNamespace(state=saved.state.item),
-    ]
-    # Intermediate resize factors can change computation without changing parameter shapes.
-    encoder = ppo.RGBEncoderConfig()
-    encoder = replace(encoder, stages=(replace(encoder.stages[0], resize_factor=1.0), *encoder.stages[1:]))
-    changed = replace(config, model=replace(config.model, encoder=encoder))
-    with pytest.raises(ValueError, match="different model settings"):
-        ppo.restore_checkpoint(manager, state, changed)
-    manager.restore.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -335,7 +319,7 @@ def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> 
 def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config) -> None:
     path = Path(config.ckpt_dir) / "config.yaml"
     settings = asdict(config)
-    settings.update(env_id="Breakout-MinAtar", ckpt_dir=config.ckpt_dir + "/${run_id}/${path_name:${env_id}}")
+    settings.update(env={"id": "Breakout-MinAtar"}, ckpt_dir=config.ckpt_dir + "/${run_id}/${path_name:${env.id}}")
     path.write_text(ppo.yaml.safe_dump(settings))
     config = ppo.load_config(path)
     assert config.checkpoint_interval == 600
@@ -462,65 +446,3 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         ppo.train(config)
 
 
-def test_checkpoint_rejects_old_atari_environment(config: ppo.Config, state: TrainState) -> None:
-    manager = Mock()
-    manager.latest_step.return_value = 1
-    manager.restore.return_value = SimpleNamespace(
-        metadata={
-            "version": 2,
-            "iteration": 1,
-            "completed_episodes": 0,
-            "config": {"env_id": "ALE/Breakout-v5"},
-        }
-    )
-    with pytest.raises(ValueError, match="different environment"):
-        ppo.restore_checkpoint(manager, state, config)
-    manager.restore.assert_called_once()  # Reject metadata before attempting incompatible parameter restore.
-
-
-def test_checkpoint_validates_kinetix_settings(config: ppo.Config, state: TrainState) -> None:
-    config = replace(
-        config,
-        env_id="Kinetix",
-        kinetix=ppo.KinetixConfig(levels=("s/h4_thrust_aim.json",)),
-        model=replace(config.model, encoder=ppo.KinetixEncoderConfig()),
-    )
-    manager = Mock()
-    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 0, 0.0, 0)
-    ppo.save_checkpoint(manager, progress, config)
-    saved = manager.save.call_args.kwargs["args"]
-    # JSON serializes tuples as lists; they must compare equal on restore.
-    metadata = json.loads(json.dumps(saved.metadata.item))
-    # Older discrete checkpoints predate the explicit action mode.
-    del metadata["config"]["kinetix"]["action_type"]
-    manager.latest_step.return_value = 2
-    manager.restore.side_effect = [SimpleNamespace(metadata=metadata), SimpleNamespace(state=saved.state.item)]
-    chex.assert_trees_all_equal(ppo.restore_checkpoint(manager, state, config), progress)
-    for changed in (replace(config.kinetix, levels=None), replace(config.kinetix, action_type="continuous")):
-        manager.restore.reset_mock(side_effect=True)
-        manager.restore.return_value = SimpleNamespace(metadata=metadata)
-        with pytest.raises(ValueError, match="different kinetix settings"):
-            ppo.restore_checkpoint(manager, state, replace(config, kinetix=changed))
-        manager.restore.assert_called_once()
-
-
-@pytest.mark.parametrize("name,env_id", [("xminigrid", "XLand-MiniGrid"), ("craftax", "Craftax")])
-def test_checkpoint_validates_optional_environment_settings(
-    config: ppo.Config, state: TrainState, name: str, env_id: str
-) -> None:
-    encoder = ppo.XMiniGridEncoderConfig() if name == "xminigrid" else ppo.RGBEncoderConfig()
-    config = replace(config, env_id=env_id, model=replace(config.model, encoder=encoder))
-    manager = Mock()
-    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 0, 0.0, 0)
-    ppo.save_checkpoint(manager, progress, config)
-    saved = manager.save.call_args.kwargs["args"]
-    metadata = json.loads(json.dumps(saved.metadata.item))
-    manager.latest_step.return_value = 2
-    manager.restore.side_effect = [SimpleNamespace(metadata=metadata), SimpleNamespace(state=saved.state.item)]
-    chex.assert_trees_all_equal(ppo.restore_checkpoint(manager, state, config), progress)
-    manager.restore.reset_mock(side_effect=True)
-    manager.restore.return_value = SimpleNamespace(metadata=metadata)
-    changed = replace(config, **{name: replace(getattr(config, name), max_steps=1)})
-    with pytest.raises(ValueError, match=f"different {name} settings"):
-        ppo.restore_checkpoint(manager, state, changed)
-    manager.restore.assert_called_once()

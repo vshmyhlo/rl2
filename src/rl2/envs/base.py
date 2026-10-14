@@ -32,7 +32,8 @@ class EnvStep[State](NamedTuple):
 class BaseEnv[State, Params](ABC):
     """Explicit state and RNGs, discrete or continuous actions, and same-step autoreset.
 
-    O denotes adapter-specific observation dimensions. Reset and step support
+    Actions and observations retain native values, dtypes, and dimensions.
+    O denotes native observation dimensions. Reset and step support
     jax.jit and jax.vmap; rendering may run on the host.
     """
 

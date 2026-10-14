@@ -1,6 +1,6 @@
 # Symbolic physics observations and continuous control of Kinetix's easy bipedal walker.
-env_id: Kinetix
-kinetix:
+env:
+  id: Kinetix
   action_type: continuous
   size: l # s, m, or l; must accommodate every selected level
   levels: [l/mjc_walker_easy.json] # null samples a new procedural level at each reset
@@ -36,7 +36,7 @@ entropy_decay: cosine # Let the walker settle into a precise gait late in traini
 value_coef: 0.5
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
-run_id: ppo_${path_name:${env_id}}_${path_name:${kinetix.levels.0}}_${model.continuous_policy}_seed${seed}
+run_id: ppo_${path_name:${env.id}}_${path_name:${env.levels.0}}_${model.continuous_policy}_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
 # Video, checkpoint, and eval: every 20% of training, rounded up; also run on completion.
 checkpoint_interval: 489

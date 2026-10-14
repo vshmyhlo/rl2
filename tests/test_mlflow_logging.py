@@ -31,6 +31,45 @@ def client(tracking_uri: str, monkeypatch: pytest.MonkeyPatch) -> MlflowClient:
     return MlflowClient()
 
 
+def test_config_params_are_searchable_and_preserved_on_resume(client: MlflowClient) -> None:
+    config = {
+        "seed": 7,
+        "learning_rate": 0.001,
+        "bf16": True,
+        "target_kl": None,
+        "model": {"recurrent": {"type": "lstm", "hidden_size": 8}, "widths": (4, 8)},
+        "env": {"id": "JaxNav", "empty": {}},
+    }
+    with MLflowLogger(experiment="mappo", run_name="config-params", resume=True) as logger:
+        logger.log_params(config)
+        run_id = logger.run_id
+    expected = {
+        "seed": "7",
+        "learning_rate": "0.001",
+        "bf16": "True",
+        "target_kl": "None",
+        "model.recurrent.type": "lstm",
+        "model.recurrent.hidden_size": "8",
+        "model.widths": "(4, 8)",
+        "env.id": "JaxNav",
+    }
+    run = client.get_run(run_id)
+    assert run.data.params == expected
+    matches = client.search_runs(
+        [run.info.experiment_id], filter_string="params.`model.recurrent.hidden_size` = '8' AND params.seed = '7'"
+    )
+    assert [match.info.run_id for match in matches] == [run_id]
+
+    with MLflowLogger(experiment="mappo", run_name="config-params", resume=True) as resumed:
+        assert resumed.run_id == run_id
+        resumed.log_params({**config, "learning_rate": 0.002, "total_steps": 100})
+        assert client.get_run(run_id).data.params == {**expected, "total_steps": "100"}
+        with patch.object(resumed.client, "log_batch") as log_batch:
+            resumed.log_params(config)
+            resumed.log_params({})
+        log_batch.assert_not_called()
+
+
 def test_metrics_artifacts_and_resume(client: MlflowClient) -> None:
     # Resuming a pre-MLflow checkpoint must also create a run when none exists.
     with MLflowLogger(experiment="ppo", run_name="training", resume=True) as logger:

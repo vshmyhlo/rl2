@@ -1,101 +1,81 @@
 # JAX environments
 
-Environment families offered by the 14 projects marked **(jax env)** in
-[README.md](README.md). Upstream documentation and registries checked on
-2026-10-14; size, difficulty, and layout variants are grouped together.
-Availability here refers to upstream projects; integration into rl2 varies.
+Families from the 14 **(jax env)** projects in [README.md](README.md).
+Upstream inventory checked 2026-10-14; variants grouped. rl2 support varies.
 
-- [JaxMARL](https://github.com/bold-lab-ai/JaxMARL) — multi-agent environments ([registry](https://github.com/bold-lab-ai/JaxMARL/blob/main/jaxmarl/registration.py)).
+- [JaxMARL](https://github.com/bold-lab-ai/JaxMARL) — multi-agent ([registry](https://github.com/bold-lab-ai/JaxMARL/blob/main/jaxmarl/registration.py)).
   - MPE: Simple, Tag, World Comm, Spread, Crypto, Speaker Listener, Push,
     Adversary, Reference, and FACMAC predator–prey variants.
-    - Spaces vary by task. rl2's [adapter](src/rl2/envs/mpe_env.py) supports
-      Simple Spread and Simple Reference with discrete controls.
-      For `MPE_simple_spread_v3`,
-      the [example config](configs/mappo/jaxmarl/mpe/simple_spread.yaml) uses
-      `N = 3` agents and `L = 3` landmarks.
-    - Observation per agent: a float32 vector of length `O = 4N + 2L`
-      (18 in the example), concatenated in this order:
-      - Own velocity `(2,)` and absolute position `(2,)`.
-      - All landmark positions relative to the agent `(L, 2)`, flattened.
-      - Other agents' relative positions `(N - 1, 2)`, flattened.
-      - Other agents' communication values `(N - 1, 2)`, flattened;
-        these stay zero because Simple Spread agents are silent.
-    - Actions per agent: `Discrete(5)` — `0` applies no control force,
-      `1` pushes left (`-x`), `2` right (`+x`), `3` down (`-y`), `4` up (`+y`).
-      Controls apply force; inertia and collisions still affect motion.
-    - Adapter arrays: observations `(N, O)`, int32 actions `(N,)`, and
-      boolean action masks `(N, 5)` with every action valid. Vectorized training
-      adds a leading environment axis `E`: `(E, N, O)`, `(E, N)`, `(E, N, 5)`.
-    - Simple Spread reward per agent: `r_i = -(1 - α) * D - α * C_i`,
-      where `α = local_ratio`, `D` sums each landmark's Euclidean distance to
-      its nearest agent, and `C_i` counts other agents overlapping agent `i`.
-      Each collision penalizes both participants. The preset uses `α = 0.5`,
-      balancing shared landmark coverage against individual collision penalties.
-    - [Simple Reference config](configs/mappo/jaxmarl/mpe/simple_reference.yaml)
-      (`MPE_simple_reference_v3`): two non-silent agents and three landmarks.
-      Each agent sees the partner's target and communicates which landmark to reach.
-      - Observation `(21,)`: own velocity `(2,)`, relative landmark positions `(6,)`,
-        partner's target color `(3,)`, and the partner's last message `(10,)`.
-      - Actions: `Discrete(50)`, encoded as `5 * symbol + movement`, with symbols
-        `0–9` and the same five movement controls as Spread. Every action sends
-        a one-hot message, visible to the partner in the next observation.
-      - Adapter observations `(2, 21)`, actions `(2,)`, and masks `(2, 50)`;
-        the preset uses a shared mean reward (`local_ratio: 0.0`).
-      - Reward: let `d_i` be agent `i`'s Euclidean distance to its assigned
-        landmark and `j` its partner. Agent `i` receives
-        `r_i = -(1 - α) * (d_0 + d_1) / 2 - α * d_j`, where `α = local_ratio`.
-        The local component rewards the partner reaching the target that agent
-        `i` observes. With the preset's `α = 0`, both receive the negative mean
-        target distance. Messages have no direct bonus or cost; they help agents
-        identify their targets. Collisions are disabled.
-    - Both tasks give dense rewards from the state after each step; higher
-      (closer to zero) is better. There is no terminal success bonus, and reaching
-      targets does not end an episode. The adapter truncates at `max_steps`;
-      logged episode return sums the mean agent reward over those steps.
-  - Overcooked and OvercookedV2: cooperative cooking and coordination.
-  - SMAX: simplified StarCraft combat, including heuristic and learned-policy enemies.
-  - Hanabi: cooperative card play with hidden information.
-  - STORM: spatial matrix games, including two-player and multi-player variants.
-  - Coin Game: resource collection and social dilemmas.
-  - Switch Riddle: cooperative communication puzzle.
-  - JaxNav: navigation and collision avoidance for multiple robots.
-  - Multi-Agent Brax: Ant, HalfCheetah, Hopper, Humanoid, Walker2d; requires the optional Brax dependency.
+    - rl2's [adapter](src/rl2/envs/mpe_env.py): discrete Simple Spread/Reference.
+      [Spread preset](configs/mappo/jaxmarl/mpe/simple_spread.yaml)
+      (`MPE_simple_spread_v3`): `N = 3` agents, `L = 3` landmarks.
+    - Observation: float32 `(4N + 2L,)` per agent (18 in preset), in order:
+      - Own velocity `(2,)`, position `(2,)`.
+      - Relative landmark positions `(L, 2)`, flattened.
+      - Relative agent positions `(N - 1, 2)`, flattened.
+      - Other agents' messages `(N - 1, 2)`, flattened; zero (silent agents).
+    - Actions: `Discrete(5)` — 0: no force, 1: left, 2: right, 3: down, 4: up.
+      Inertia and collisions still apply.
+    - Arrays: observations `(N, O)`, int32 actions `(N,)`, all-valid boolean masks
+      `(N, A)`. Here `O = 18`, `A = 5`; batching prepends environment axis `E`.
+    - Reward: `r_i = -(1 - α)D - αC_i`; `α = local_ratio` (preset: 0.5),
+      `D` = sum of landmark-to-nearest-agent distances, `C_i` = agent `i`'s
+      overlaps with others. Collisions penalize both participants.
+    - [Reference preset](configs/mappo/jaxmarl/mpe/simple_reference.yaml)
+      (`MPE_simple_reference_v3`): two communicating agents, three landmarks;
+      each sees the partner's target.
+      - Observation `(21,)`: own velocity (2), relative landmarks (6), partner's
+        target color (3), partner's last message (10).
+      - Actions: `Discrete(50)`, `5 * symbol + movement`; symbols 0–9, Spread
+        movement controls. Each sends a one-hot message visible next step.
+      - Arrays: observations `(2, 21)`, actions `(2,)`, masks `(2, 50)`.
+      - Reward: `r_i = -(1 - α)(d_0 + d_1)/2 - αd_j`; `d_i` = agent `i`'s
+        target distance, `j` = partner. Preset `α = 0`: shared negative mean
+        distance. No collisions or direct communication reward/cost.
+    - Both: dense post-step rewards; higher is better. No success bonus/termination;
+      truncate at `max_steps`. Episode return sums mean agent rewards.
+  - Overcooked and OvercookedV2: cooperative cooking.
+  - SMAX: StarCraft-style combat; heuristic/learned enemies.
+  - Hanabi: cooperative hidden-information card game.
+  - STORM: two-/multi-player spatial matrix games.
+  - Coin Game: resource collection/social dilemmas.
+  - Switch Riddle: communication puzzle.
+  - JaxNav: multi-robot navigation/collision avoidance.
+  - Multi-Agent Brax: Ant, HalfCheetah, Hopper, Humanoid, Walker2d; optional Brax dependency.
   - JaxRobotarium: Navigation, Discovery, Material Transport, Warehouse,
-    Arctic Transport, Foraging, RWARE, Predator Prey; requires its optional package.
+    Arctic Transport, Foraging, RWARE, Predator Prey; optional package.
 
-- [Pgx](https://github.com/sotetsuk/pgx) — board, card, and arcade games ([registry](https://github.com/sotetsuk/pgx/blob/main/pgx/core.py)).
+- [Pgx](https://github.com/sotetsuk/pgx) — games ([registry](https://github.com/sotetsuk/pgx/blob/main/pgx/core.py)).
   - Board games: Backgammon, Chess, Gardner Chess, Shogi, Animal Shogi,
     Go (9×9 and 19×19), Hex, Othello, Connect Four, Tic-Tac-Toe.
   - Card/tile games: Kuhn Poker, Leduc Hold'em, Sparrow Mahjong.
-  - Bridge Bidding: available through the `BridgeBidding` class directly.
+  - Bridge Bidding: `BridgeBidding` class.
   - Puzzle: 2048.
   - MinAtar: Asterix, Breakout, Freeway, Seaquest, Space Invaders.
 
 - [XLand-MiniGrid](https://github.com/dunnolab/xland-minigrid#environments-) — grid worlds and meta-RL.
-  - XLand-MiniGrid: configurable layouts, sizes, goals, and transformation rules;
-    tasks are sampled from ruleset benchmarks.
+  - XLand-MiniGrid: configurable layouts, sizes, goals, transformation rules; benchmark rulesets.
   - Navigation: Empty, EmptyRandom, FourRooms.
   - Keys and doors: LockedRoom, DoorKey, Unlock, UnlockPickUp, BlockedUnlockPickUp.
-  - Memory: remember an initial cue and select the matching object.
-  - Playground: open-ended object interaction without a specified goal.
+  - Memory: match objects to remembered cues.
+  - Playground: open-ended object interaction.
 
-- [minimax](https://github.com/facebookresearch/minimax) — maze environments for automatic curricula.
-  - Maze: navigation through configurable grid layouts, with generated training
-    mazes and held-out evaluation layouts.
-  - Maze UED: a teacher environment that constructs mazes for the navigation agent.
+- [minimax](https://github.com/facebookresearch/minimax) — maze curricula.
+  - Maze: generated training layouts, held-out evaluation layouts.
+  - Maze UED: teacher-generated mazes.
 
-- [JaxUED](https://github.com/DramaCow/jaxued#supported-environments) — environments and adapters for curriculum learning.
-  - Maze: generated and fixed navigation levels, with level editing for curriculum generation.
-  - Craftax: the supplied curriculum example supports symbolic Craftax observations.
-  - Gymnax adapters: CartPole, Acrobot, Pendulum, with varying physical parameters.
+- [JaxUED](https://github.com/DramaCow/jaxued#supported-environments) — curriculum learning.
+  - Maze: generated/fixed levels, curriculum editing.
+  - Craftax: symbolic-observation curriculum example.
+  - Gymnax adapters: CartPole, Acrobot, Pendulum; variable physics.
 
 - [Brax](https://github.com/google/brax) — continuous control ([registry](https://github.com/google/brax/blob/main/brax/envs/__init__.py)).
   - Locomotion: Ant, HalfCheetah, Hopper, Humanoid, Swimmer, Walker2d.
   - Posture and balance: HumanoidStandup, InvertedPendulum, InvertedDoublePendulum.
   - Manipulation: Reacher, Pusher.
-  - Fast: a minimal environment for testing.
+  - Fast: minimal test environment.
 
-- [Gymnax](https://github.com/RobertTLange/gymnax#implemented-accelerated-environments-) — classic control, arcade, and small research tasks.
+- [Gymnax](https://github.com/RobertTLange/gymnax#implemented-accelerated-environments-) — control, arcade, research tasks.
   - Classic control: Acrobot, CartPole, Pendulum, MountainCar, MountainCarContinuous.
   - MinAtar: Asterix, Breakout, Freeway, Seaquest, SpaceInvaders.
   - bsuite: Catch, DeepSea, MemoryChain, UmbrellaChain, DiscountingChain,
@@ -103,34 +83,73 @@ Availability here refers to upstream projects; integration into rl2 varies.
   - Other tasks: FourRooms, MetaMaze, PointRobot, BernoulliBandit,
     GaussianBandit, Reacher, Swimmer.
 
-- [MuJoCo Playground](https://github.com/google-deepmind/mujoco_playground) — robot control with MuJoCo MJX.
+- [MuJoCo Playground](https://github.com/google-deepmind/mujoco_playground) — MuJoCo MJX robotics.
   - [DM Control suite](https://github.com/google-deepmind/mujoco_playground/blob/main/mujoco_playground/_src/dm_control_suite/__init__.py):
     Acrobot swing-up; BallInCup; Cartpole balance/swing-up; Cheetah run;
     Finger spin/turn; Fish swim; Hopper hop/stand; Humanoid stand/walk/run;
     Pendulum swing-up; PointMass; Reacher easy/hard; six-link Swimmer;
-    Walker stand/walk/run. Selected tasks also have sparse-reward variants.
+    Walker stand/walk/run. Some have sparse rewards.
   - [Locomotion](https://github.com/google-deepmind/mujoco_playground/blob/main/mujoco_playground/_src/locomotion/__init__.py):
     joystick control for Apollo, Barkour, Berkeley Humanoid, G1, Go1, OP3,
-    Spot, and T1; flat/rough terrain variants for selected robots;
+    Spot, T1; selected flat/rough terrain variants;
     Go1 get-up/handstand/footstand; H1 in-place and joystick gait tracking;
     Spot get-up and gait tracking.
   - [Manipulation](https://github.com/google-deepmind/mujoco_playground/blob/main/mujoco_playground/_src/manipulation/__init__.py):
     Aloha handover and peg insertion; Panda cube picking (standard,
     orientation, Cartesian), cabinet opening, and Robotiq cube pushing;
     LEAP cube reorientation and Z-axis rotation; Aero cube Z-axis rotation.
+    - **PandaPickCube**: grasp a cube and move it to a target above the table;
+      randomized positions, fixed target orientation.
+      [PPO preset](configs/ppo/mujoco_playground/manipulation/panda_pick_cube.yaml):
+      MLP + LSTM, bounded continuous policy, MJX JAX backend.
+      [Task source](https://github.com/google-deepmind/mujoco_playground/blob/main/mujoco_playground/_src/manipulation/franka_emika_panda/pick.py) (Playground 0.2.0).
+      - Setup/train from repo root:
 
-- [Jumanji](https://github.com/instadeepai/jumanji#environments-) — puzzles and combinatorial optimization.
+        ```bash
+        uv run python -m rl2.envs.playground_assets
+        uv run ppo --config configs/ppo/mujoco_playground/manipulation/panda_pick_cube.yaml
+        ```
+
+        Setup caches pinned Panda XML/meshes in the installed package.
+        Video/evaluation default off; enabling requires intervals and OpenGL
+        (e.g. `MUJOCO_GL=egl` on headless GPUs). Hyperparameters are untuned.
+      - **Observation:** float32 `(66,)`, unnormalized, in order:
+        - Positions (16): arm angles (7), fingers (2), cube XYZ + quaternion (7).
+        - Velocities (15): robot joints (9), cube (6).
+        - Gripper world position (3).
+        - Gripper/cube orientations (6 each): last two rotation-matrix rows.
+        - Cube − gripper (3), target − cube (3).
+        - Target − cube orientation (6): first two matrix rows.
+        - Actuator targets − joint positions (8): arm (7), first finger (1).
+      - **Actions:** float32 `(8,)` in `[-1, 1]`: arm (7), coupled gripper (1).
+        Targets += `0.04 * action`, clipped to actuator limits; radians for arm,
+        metres for finger (`[0, 0.04]`). Gripper + opens, − closes; zero holds.
+        Control: 50 Hz, four 5 ms physics steps. Batching prepends `B` to spaces.
+      - **Reward:** dense post-step `r = 4G + 8IB + 0.25F + 0.3Q`:
+        - `G = 1 - tanh(5 * ||cube - gripper||)` (reaching).
+        - `B = 1 - tanh(5 * (0.9p + 0.1e))` (target matching): `p` = position
+          distance, `e` = norm of first-two-row rotation-matrix difference.
+        - `I` latches to 1 when gripper is <0.012 m from cube (proximity, not grasp).
+        - `F` = 1 without finger-pad/hand floor contact, else 0.
+        - `Q = 1 - tanh(||arm_angles - initial_arm_angles||)` (pose regularization).
+        Clipped to `[-10000, 10000]`; episode return sums rewards.
+        Higher is better; no grasp/success bonus or success termination.
+      - **Episode:** truncates at 150 steps (3 s); terminates if cube `z < 0`, any cube
+        coordinate has `abs > 1 m`, or positions/velocities become NaN.
+        Autoreset preserves final observations for timeout bootstrapping.
+
+- [Jumanji](https://github.com/instadeepai/jumanji#environments-) — puzzles/optimization.
   - Logic: Game2048, GraphColoring, Minesweeper, RubiksCube, SlidingTilePuzzle, Sudoku.
   - Packing and scheduling: BinPack, FlatPack, JobShop, Knapsack, Tetris.
   - Routing: Cleaner, Connector, CVRP, MultiCVRP, Maze, RobotWarehouse,
     Snake, TSP, MMST (multiple minimum spanning trees), PacMan, Sokoban.
 
-- [Craftax](https://github.com/MichaelTMatthews/Craftax) — procedural survival, crafting, and exploration ([factory](https://github.com/MichaelTMatthews/Craftax/blob/main/craftax/craftax_env.py)).
-  - Craftax: expanded roguelike world; `Craftax-Symbolic-v1` and `Craftax-Pixels-v1`.
-  - Craftax Classic: Crafter-style world; `Craftax-Classic-Symbolic-v1`
+- [Craftax](https://github.com/MichaelTMatthews/Craftax) — survival/crafting ([factory](https://github.com/MichaelTMatthews/Craftax/blob/main/craftax/craftax_env.py)).
+  - Craftax: `Craftax-Symbolic-v1` and `Craftax-Pixels-v1`.
+  - Craftax Classic (Crafter-style): `Craftax-Classic-Symbolic-v1`
     and `Craftax-Classic-Pixels-v1`.
 
-- [Navix](https://github.com/epignatelli/navix) — MiniGrid task families ([environment modules](https://github.com/epignatelli/navix/blob/main/navix/environments/__init__.py)).
+- [Navix](https://github.com/epignatelli/navix) — MiniGrid tasks ([environment modules](https://github.com/epignatelli/navix/blob/main/navix/environments/__init__.py)).
   - Navigation: Empty rooms, FourRooms, MultiRoom, Crossings, LavaGap,
     DynamicObstacles, DistShift.
   - Keys and doors: DoorKey, KeyCorridor, LockedRoom, Unlock, UnlockPickup,
@@ -138,34 +157,32 @@ Availability here refers to upstream projects; integration into rl2 varies.
   - Object tasks: GoToDoor, GoToObject, Fetch, PutNear.
   - Memory and exploration: Memory, Playground.
 
-- [Kinetix](https://github.com/FLAIROx/Kinetix) — configurable 2D physics tasks.
-  - Procedural levels: small, medium, and large worlds controlled through motors
-    and thrusters; bring goal objects together while avoiding hazards.
+- [Kinetix](https://github.com/FLAIROx/Kinetix) — 2D physics.
+  - Procedural levels: small/medium/large; motor/thruster control, join goal objects, avoid hazards.
   - [Handmade levels](https://github.com/FLAIROx/Kinetix/blob/main/configs/eval/eval_all.yaml):
     cars, unicycles, thruster control, robot arms, grasping, cartpole, balance,
     lunar landing, pinball, Angry Birds, Flappy Bird, mazes, platformers,
     obstacle avoidance, gears, and lever puzzles.
-  - Locomotion levels: HalfCheetah, Hopper, Swimmer, Walker variants within the same physics framework.
+  - Locomotion: HalfCheetah, Hopper, Swimmer, Walker variants.
 
 - [JAXtari](https://github.com/k4ntz/JAXtari) — Atari reimplementations ([game status list](https://github.com/k4ntz/JAXtari/blob/master/games_covered.md)).
-  - Atari57 games rated close to the originals: Alien, Amidar, Asterix, Asteroids,
+  - Atari57 (close to originals): Alien, Amidar, Asterix, Asteroids,
     Atlantis, Bank Heist, Beam Rider, Berzerk, Boxing, Breakout, Centipede,
     Chopper Command, Enduro, Fishing Derby, Freeway, Frostbite, Gopher,
     Gravitar, Kangaroo, Montezuma's Revenge, Ms. Pac-Man, Name This Game,
     Phoenix, Pong, Q*bert, River Raid, Seaquest, Skiing, Space Invaders,
     Surround, Tennis, Time Pilot, Venture, Video Pinball, Yars' Revenge.
-  - Registered with substantial differences: Assault, Road Runner, Up N Down, Wizard of Wor.
+  - Substantial differences: Assault, Road Runner, Up N Down, Wizard of Wor.
   - Additional games: Air Raid, Backgammon, Basic Math, Blackjack,
     Casino Blackjack/Five Stud Poker/Poker Solitaire, Donkey Kong, Flag Capture,
     Galaxian, Hangman, Haunted House, Human Cannonball, Journey Escape, Kaboom,
     King Kong, Klax, Laser Gates, Miniature Golf, Othello, Pac-Man,
     Sir Lancelot, Slot Machine, Space War, Tetris, Tron, Turmoil,
     Video Checkers, Video Chess, Video Cube, Word Zapper.
-  - Games marked work-in-progress or unimplemented upstream are omitted.
+  - Work-in-progress/unimplemented games omitted.
 
-- [continual-foragax](https://pypi.org/project/continual-foragax/#registry-and-included-environments) — foraging with changing rewards.
-  - `ForagaxBig-v5`: large multi-biome world with Fourier-modulated rewards.
-  - `ForagaxSquareWaveTwoBiome-v11`: two biomes with square-wave reward changes.
-  - `ForagaxTwoBiomeLarge-v1`: 15×15 Morel/Oyster biomes containing Deathcaps.
-  - Custom worlds: configurable objects, biomes, respawning, and rewards;
-    weather-driven rewards can be composed programmatically.
+- [continual-foragax](https://pypi.org/project/continual-foragax/#registry-and-included-environments) — changing-reward foraging.
+  - `ForagaxBig-v5`: multi-biome, Fourier-modulated rewards.
+  - `ForagaxSquareWaveTwoBiome-v11`: two biomes, square-wave rewards.
+  - `ForagaxTwoBiomeLarge-v1`: 15×15 Morel/Oyster biomes, Deathcaps.
+  - Custom worlds: objects, biomes, respawning, rewards; programmable weather-driven rewards.

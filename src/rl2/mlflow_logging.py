@@ -12,12 +12,12 @@ from tempfile import TemporaryDirectory
 from time import time
 from traceback import print_exception
 from types import TracebackType
-from typing import Self, TextIO
+from typing import Any, Self, TextIO
 from uuid import uuid4
 
 import numpy as np
 from mlflow import MlflowClient
-from mlflow.entities import Metric
+from mlflow.entities import Metric, Param
 from mlflow.exceptions import MlflowException
 from moviepy import ImageSequenceClip
 from numpy.typing import NDArray
@@ -149,6 +149,23 @@ class MLflowLogger:
 
     def log_text(self, text: str, artifact_file: str) -> None:
         self.client.log_text(self.run_id, text, artifact_file)
+
+    def log_params(self, config: dict[str, Any]) -> None:
+        """Log nested config with dotted keys, preserving existing parameters on resume."""
+        existing = self.client.get_run(self.run_id).data.params
+        params: list[Param] = []
+
+        def collect(values: dict[str, Any], prefix: str = "") -> None:
+            for name, value in values.items():
+                key = f"{prefix}.{name}" if prefix else name
+                if isinstance(value, dict):
+                    collect(value, key)
+                elif key not in existing:
+                    params.append(Param(key=key, value=str(value)))
+
+        collect(config)
+        if params:
+            self.client.log_batch(self.run_id, params=params, synchronous=True)
 
     def log_video(self, frames: list[NDArray[np.uint8]], artifact_file: str, *, fps: float) -> None:  # each (H, W, 3)
         """Encode (H, W, 3) RGB frames as an MP4 artifact."""

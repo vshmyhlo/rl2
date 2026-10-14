@@ -11,7 +11,9 @@ from omegaconf.errors import OmegaConfBaseException
 from pydantic import ValidationError
 
 from rl2 import ppo
+from rl2.envs.craftax_env import CraftaxConfig
 from rl2.envs.kinetix_env import KinetixConfig
+from rl2.envs.xminigrid_env import XMiniGridConfig
 from rl2.ppo import Config, KinetixEncoderConfig, RGBEncoderConfig, XMiniGridEncoderConfig, load_config
 
 
@@ -38,9 +40,9 @@ def test_requires_encoder(config_path: Path, field: str) -> None:
 def test_load_config_returns_fully_resolved_config(config_path: Path, run_id: str | None) -> None:
     settings = yaml.safe_load(config_path.read_text())
     settings.update(
-        env_id="Breakout-MinAtar",
+        env={"id": "Breakout-MinAtar"},
         seed=7,
-        ckpt_dir="logs/${run_id}/${path_name:${env_id}}",
+        ckpt_dir="logs/${run_id}/${path_name:${env.id}}",
         num_minibatches="${num_envs}",
     )
     if run_id == "missing":
@@ -114,11 +116,11 @@ def test_rejects_unsupported_environment_options(config_path: Path, option: str,
 
 def test_kinetix_config_loads_yaml_levels_as_hashable_tuple() -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml")
-    assert config.env_id == "Kinetix"
-    assert config.kinetix.action_type == "continuous"
-    assert config.kinetix.size == "l"
+    assert config.env.id == "Kinetix"
+    assert config.env.action_type == "continuous"
+    assert config.env.size == "l"
     assert config.model.encoder == KinetixEncoderConfig()
-    assert config.kinetix.levels == ("l/mjc_walker_easy.json",)
+    assert config.env.levels == ("l/mjc_walker_easy.json",)
     assert hash(config)
 
 
@@ -148,18 +150,36 @@ def test_kinetix_rejects_invalid_settings(settings: dict[str, object]) -> None:
         KinetixConfig(**settings)
 
 
-def test_kinetix_settings_require_kinetix_environment(config_path: Path) -> None:
+@pytest.mark.parametrize("name", ["kinetix", "xminigrid", "craftax", "playground"])
+def test_rejects_separate_environment_settings(config_path: Path, name: str) -> None:
     settings = yaml.safe_load(config_path.read_text())
-    settings["kinetix"] = {"size": "m"}
+    settings[name] = {}
     config_path.write_text(yaml.safe_dump(settings))
-    with pytest.raises(ValidationError, match="kinetix settings require"):
+    with pytest.raises(ValidationError, match=name):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "env,match",
+    [
+        ({}, "union_tag_not_found"),
+        ({"id": "unknown"}, "union_tag_invalid"),
+        ({"id": "Breakout-MinAtar", "levels": None}, "levels"),
+        ({"id": "Kinetix", "task": "PandaPickCube"}, "task"),
+    ],
+)
+def test_rejects_invalid_environment_union(config_path: Path, env: dict[str, object], match: str) -> None:
+    settings = yaml.safe_load(config_path.read_text())
+    settings["env"] = env
+    config_path.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValidationError, match=match):
         load_config(config_path)
 
 
 @pytest.mark.parametrize("name,env_id", [("xminigrid", "XLand-MiniGrid"), ("craftax", "Craftax")])
 def test_optional_environment_configs_load(name: str, env_id: str) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / f"configs/ppo/{name}.yaml")
-    assert config.env_id == env_id
+    assert config.env.id == env_id
     assert hash(config)
 
 
@@ -187,32 +207,32 @@ def test_optional_environment_configs_load(name: str, env_id: str) -> None:
     ],
 )
 def test_optional_environments_reject_invalid_settings(name: str, settings: dict[str, object]) -> None:
-    from rl2.envs.craftax_env import CraftaxConfig
-    from rl2.envs.xminigrid_env import XMiniGridConfig
-
     cls = {"xminigrid": XMiniGridConfig, "craftax": CraftaxConfig}[name]
     with pytest.raises(ValidationError):
         cls(**settings)
 
 
-@pytest.mark.parametrize("name", ["xminigrid", "craftax"])
-def test_optional_settings_require_matching_environment(config_path: Path, name: str) -> None:
-    settings = yaml.safe_load(config_path.read_text())
-    settings[name] = {"max_steps": 1}
-    config_path.write_text(yaml.safe_dump(settings))
-    with pytest.raises(ValidationError, match=f"{name} settings require"):
-        load_config(config_path)
-
-
-@pytest.mark.parametrize("name,env_id", [("xminigrid", "XLand-MiniGrid"), ("craftax", "Craftax")])
-def test_optional_environment_factory(name: str, env_id: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / f"configs/ppo/{name}.yaml")
-    assert config.env_id == env_id
-    cls = ppo.XMiniGridEnv if name == "xminigrid" else ppo.CraftaxEnv
+@pytest.mark.parametrize(
+    "filename,config_class,constructor_name",
+    [
+        ("minatar/breakout", ppo.GymnaxConfig, "GymnaxEnv"),
+        ("kinetix", KinetixConfig, "KinetixEnv"),
+        ("xminigrid", XMiniGridConfig, "XMiniGridEnv"),
+        ("craftax", CraftaxConfig, "CraftaxEnv"),
+        ("mujoco_playground/manipulation/panda_pick_cube", ppo.PlaygroundConfig, "PlaygroundEnv"),
+    ],
+)
+def test_environment_round_trip_and_factory(
+    filename: str, config_class: type, constructor_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / f"configs/ppo/{filename}.yaml")
+    assert isinstance(config.env, config_class)
+    restored = Config(**yaml.safe_load(yaml.safe_dump(asdict(config))))
+    assert restored == config and hash(restored) == hash(config)
     constructor = Mock()
-    monkeypatch.setattr(ppo, cls.__name__, constructor)
+    monkeypatch.setattr(ppo, constructor_name, constructor)
     assert ppo.make_env(config) is constructor.return_value
-    constructor.assert_called_once_with(getattr(config, name))
+    constructor.assert_called_once_with(config.env.id if isinstance(config.env, ppo.GymnaxConfig) else config.env)
 
 
 def test_craftax_missing_dependency(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -261,7 +281,7 @@ def test_rejects_top_level_encoder_stages(config_path: Path) -> None:
 @pytest.mark.parametrize("kind", ["rgb", "xminigrid", "kinetix"])
 def test_encoder_variant_round_trip(config_path: Path, kind: str) -> None:
     settings = yaml.safe_load(config_path.read_text())
-    settings["env_id"] = {"rgb": "Breakout-MinAtar", "xminigrid": "XLand-MiniGrid", "kinetix": "Kinetix"}[kind]
+    settings["env"] = {"id": {"rgb": "Breakout-MinAtar", "xminigrid": "XLand-MiniGrid", "kinetix": "Kinetix"}[kind]}
     settings["model"]["encoder"] = {"type": kind, "embedding_size": 8}
     config_path.write_text(yaml.safe_dump(settings))
     config = load_config(config_path)
@@ -294,7 +314,7 @@ def test_encoder_variant_round_trip(config_path: Path, kind: str) -> None:
 )
 def test_invalid_encoder_variants(config_path: Path, encoder: dict[str, object], match: str) -> None:
     settings = yaml.safe_load(config_path.read_text())
-    settings["env_id"] = "XLand-MiniGrid"
+    settings["env"] = {"id": "XLand-MiniGrid"}
     settings["model"]["encoder"] = encoder
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match=match):
@@ -311,7 +331,7 @@ def test_symbolic_encoder_requires_xminigrid(config_path: Path) -> None:
 
 def test_xminigrid_requires_matching_encoder(config_path: Path) -> None:
     settings = yaml.safe_load(config_path.read_text())
-    settings["env_id"] = "XLand-MiniGrid"
+    settings["env"] = {"id": "XLand-MiniGrid"}
     settings["model"]["encoder"] = {"type": "rgb"}
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match="XLand-MiniGrid requires model.encoder.type: xminigrid"):
@@ -324,7 +344,7 @@ def test_xminigrid_requires_matching_encoder(config_path: Path) -> None:
 )
 def test_kinetix_requires_matching_encoder(config_path: Path, env_id: str, encoder: str, match: str) -> None:
     settings = yaml.safe_load(config_path.read_text())
-    settings["env_id"] = env_id
+    settings["env"] = {"id": env_id}
     settings["model"]["encoder"] = {"type": encoder}
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match=match):

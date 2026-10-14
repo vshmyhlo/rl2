@@ -65,6 +65,9 @@ Evaluation scalars (when evaluation is enabled; unavailable scores are omitted):
     eval/total_training_episodes: Completed training episodes at evaluation time.
     time/evaluation_seconds: Evaluation wall time, including gameplay and report uploads.
 
+Config parameters use dotted keys (e.g. model.recurrent.hidden_size) for filtering
+and grouping runs. Existing parameter values are preserved on resume.
+
 Artifacts (indexed by training step):
     config/<step>.yaml: Full training configuration as YAML, logged at startup and on resume.
     devices/<step>.txt: JAX devices used by this session.
@@ -147,13 +150,14 @@ from rl2.actions import ActionSpace, BetaPolicy, CategoricalPolicy, DiscreteSpac
 from rl2.configuration import load_settings
 from rl2.envs.base import BaseEnv
 from rl2.envs.craftax_env import CraftaxConfig, CraftaxEnv
-from rl2.envs.gymnax_env import GymnaxEnv
+from rl2.envs.gymnax_env import GymnaxConfig, GymnaxEnv
 from rl2.envs.kinetix_env import KinetixConfig, KinetixEnv
+from rl2.envs.playground_env import PlaygroundConfig, PlaygroundEnv
 from rl2.envs.xminigrid_env import XMiniGridConfig, XMiniGridEnv
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.mlflow_logging import MLflowLogger
-from rl2.model.encoders.kinetix import KinetixEncoder
+from rl2.model.encoders.mlp import MLPEncoder
 from rl2.model.encoders.rgb import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
 from rl2.model.encoders.xminigrid import XMiniGridEncoder
 from rl2.playback import EpisodeResult, PlaybackState, finish_episode
@@ -312,8 +316,15 @@ class KinetixEncoderConfig:
     embedding_size: Annotated[int, Field(gt=0, strict=True)] = 256
 
 
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class MLPEncoderConfig:
+    type: Literal["mlp"] = "mlp"
+    hidden_size: Annotated[int, Field(gt=0, strict=True)] = 256
+    embedding_size: Annotated[int, Field(gt=0, strict=True)] = 256
+
+
 type EncoderConfig = Annotated[
-    RGBEncoderConfig | XMiniGridEncoderConfig | KinetixEncoderConfig, Field(discriminator="type")
+    RGBEncoderConfig | XMiniGridEncoderConfig | KinetixEncoderConfig | MLPEncoderConfig, Field(discriminator="type")
 ]
 
 
@@ -327,7 +338,9 @@ class ModelConfig:
 @dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
 class Config:
     model: ModelConfig
-    env_id: Literal["Breakout-MinAtar", "Kinetix", "XLand-MiniGrid", "Craftax"]
+    env: Annotated[
+        GymnaxConfig | KinetixConfig | XMiniGridConfig | CraftaxConfig | PlaygroundConfig, Field(discriminator="id")
+    ]
     seed: int
     total_steps: int
     num_envs: Annotated[int, Field(gt=0)]
@@ -356,9 +369,6 @@ class Config:
     run_id: str | None = None
     checkpoint_interval: Annotated[int, Field(gt=0)] = 600
     log_interval: Annotated[int, Field(gt=0)] = 60
-    kinetix: KinetixConfig = KinetixConfig()
-    xminigrid: XMiniGridConfig = XMiniGridConfig()
-    craftax: CraftaxConfig = CraftaxConfig()
 
     def __post_init__(self) -> None:
         if self.run_id is not None and (
@@ -368,20 +378,18 @@ class Config:
 
     @model_validator(mode="after")
     def validate_rollout(self) -> Self:
-        if self.model.encoder.type == "kinetix" and self.env_id != "Kinetix":
-            raise ValueError("kinetix encoder requires env_id: Kinetix")
-        if self.env_id == "Kinetix" and self.model.encoder.type != "kinetix":
+        if self.model.encoder.type == "mlp" and self.env.id != "MuJoCo-Playground":
+            raise ValueError("mlp encoder requires env.id: MuJoCo-Playground")
+        if self.env.id == "MuJoCo-Playground" and self.model.encoder.type != "mlp":
+            raise ValueError("MuJoCo-Playground requires model.encoder.type: mlp")
+        if self.model.encoder.type == "kinetix" and self.env.id != "Kinetix":
+            raise ValueError("kinetix encoder requires env.id: Kinetix")
+        if self.env.id == "Kinetix" and self.model.encoder.type != "kinetix":
             raise ValueError("Kinetix requires model.encoder.type: kinetix")
-        if self.model.encoder.type == "xminigrid" and self.env_id != "XLand-MiniGrid":
-            raise ValueError("xminigrid encoder requires env_id: XLand-MiniGrid")
-        if self.env_id == "XLand-MiniGrid" and self.model.encoder.type != "xminigrid":
+        if self.model.encoder.type == "xminigrid" and self.env.id != "XLand-MiniGrid":
+            raise ValueError("xminigrid encoder requires env.id: XLand-MiniGrid")
+        if self.env.id == "XLand-MiniGrid" and self.model.encoder.type != "xminigrid":
             raise ValueError("XLand-MiniGrid requires model.encoder.type: xminigrid")
-        if self.env_id != "Kinetix" and self.kinetix != KinetixConfig():
-            raise ValueError("kinetix settings require env_id: Kinetix")
-        if self.env_id != "XLand-MiniGrid" and self.xminigrid != XMiniGridConfig():
-            raise ValueError("xminigrid settings require env_id: XLand-MiniGrid")
-        if self.env_id != "Craftax" and self.craftax != CraftaxConfig():
-            raise ValueError("craftax settings require env_id: Craftax")
         if self.num_envs % self.num_minibatches:
             raise ValueError("num_envs must be divisible by num_minibatches to preserve sequences")
         if self.total_steps < self.num_envs * self.num_steps:
@@ -390,13 +398,15 @@ class Config:
 
 
 def make_env(config: Config) -> PPOEnv:
-    if config.env_id == "Kinetix":
-        return KinetixEnv(config.kinetix)
-    if config.env_id == "XLand-MiniGrid":
-        return XMiniGridEnv(config.xminigrid)
-    if config.env_id == "Craftax":
-        return CraftaxEnv(config.craftax)
-    return GymnaxEnv(config.env_id)
+    if isinstance(config.env, PlaygroundConfig):
+        return PlaygroundEnv(config.env)
+    if isinstance(config.env, KinetixConfig):
+        return KinetixEnv(config.env)
+    if isinstance(config.env, XMiniGridConfig):
+        return XMiniGridEnv(config.env)
+    if isinstance(config.env, CraftaxConfig):
+        return CraftaxEnv(config.env)
+    return GymnaxEnv(config.env.id)
 
 
 class TrainingProgress(NamedTuple):
@@ -479,16 +489,23 @@ def restore_checkpoint(
     if metadata["iteration"] != rollout_count or rollout_count < 0 or metadata["completed_episodes"] < 0:
         raise ValueError("Invalid PPO checkpoint progress")
     saved_config = metadata["config"]
-    if saved_config.get("env_id", config.env_id) != config.env_id:
+    saved_env = saved_config.get("env")
+    if saved_env is None:
+        # Checkpoints predating the tagged environment config store separate settings.
+        env_id = saved_config.get("env_id", config.env.id)
+        env_key = {
+            "Kinetix": "kinetix",
+            "XLand-MiniGrid": "xminigrid",
+            "Craftax": "craftax",
+            "MuJoCo-Playground": "playground",
+        }.get(env_id)
+        saved_env = {"id": env_id, **saved_config.get(env_key, {})}
+    if saved_env["id"] != config.env.id:
         raise ValueError("Cannot resume PPO with a different environment; use a new run directory")
     if "model" in saved_config and ModelConfig(**saved_config["model"]) != config.model:
         raise ValueError("Cannot resume PPO with different model settings; use a new run directory")
-    if config.env_id == "Kinetix" and KinetixConfig(**saved_config.get("kinetix", {})) != config.kinetix:
-        raise ValueError("Cannot resume PPO with different kinetix settings; use a new run directory")
-    if config.env_id == "XLand-MiniGrid" and XMiniGridConfig(**saved_config.get("xminigrid", {})) != config.xminigrid:
-        raise ValueError("Cannot resume PPO with different xminigrid settings; use a new run directory")
-    if config.env_id == "Craftax" and CraftaxConfig(**saved_config.get("craftax", {})) != config.craftax:
-        raise ValueError("Cannot resume PPO with different craftax settings; use a new run directory")
+    if type(config.env)(**saved_env) != config.env:
+        raise ValueError("Cannot resume PPO with different environment settings; use a new run directory")
     # Progress and schedules count rollouts, so each must still represent the same number of steps.
     if (
         "num_envs" in saved_config
@@ -574,7 +591,11 @@ class ActorCritic(nn.Module):
         encoder = self.model.encoder
         if encoder.type == "rgb":
             self.encoder = ConvObservationEncoder(
-                stages=encoder.stages, embedding_size=encoder.embedding_size, dtype=self.dtype, name="encoder"
+                channels_last=True,
+                stages=encoder.stages,
+                embedding_size=encoder.embedding_size,
+                dtype=self.dtype,
+                name="encoder",
             )
         elif encoder.type == "xminigrid":
             self.encoder = XMiniGridEncoder(
@@ -586,7 +607,7 @@ class ActorCritic(nn.Module):
                 name="encoder",
             )
         else:
-            self.encoder = KinetixEncoder(
+            self.encoder = MLPEncoder(
                 hidden_size=encoder.hidden_size,
                 embedding_size=encoder.embedding_size,
                 dtype=self.dtype,
@@ -815,7 +836,7 @@ def log_evaluation(
     returns = [result["return"] for result in episode_results]
     std = stdev(returns) if len(returns) > 1 else None
     result = {
-        "env_id": config.env_id,
+        "env_id": config.env.id,
         "return_mean": fmean(returns),
         "return_std": std,
         "return_sem": std / sqrt(config.eval_episodes) if std is not None else None,
@@ -1167,6 +1188,7 @@ def train(config: Config) -> TrainState:
         if progress is not None:
             print(f"Resumed run {config.run_id} at step {initial_step_count}", flush=True)
         writer.log_text(yaml.safe_dump(asdict(config)), f"config/{initial_step_count}.yaml")
+        writer.log_params(asdict(config))
         print(f"Run ID: {config.run_id}\nMLflow run: {writer.run_id}", flush=True)
         devices = str(jax.devices())
         print(f"JAX devices: {devices}", flush=True)

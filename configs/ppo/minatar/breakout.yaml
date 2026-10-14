@@ -1,5 +1,6 @@
 # Enduro PPO hyperparameters adapted to MinAtar: https://arxiv.org/pdf/1707.06347, Table 5.
-env_id: Breakout-MinAtar
+env:
+  id: Breakout-MinAtar
 seed: 1
 total_steps: 10_000_000 # Agent transitions across all environments; only full rollouts run
 num_envs: 8
@@ -34,7 +35,7 @@ entropy_decay: constant
 value_coef: 2.0 # Paper c1=1 on squared error; trainer multiplies 0.5 * squared error
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
-run_id: ppo_${path_name:${env_id}}_seed${seed}
+run_id: ppo_${path_name:${env.id}}_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
 # Video, checkpoint, and eval: every 20% of training, rounded up; also run on completion.
 checkpoint_interval: 1953 # Iterations between checkpoints; also save on completion

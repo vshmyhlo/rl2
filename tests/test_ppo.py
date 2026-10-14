@@ -588,6 +588,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     assert iterations == [0, 0, 1, 2, 2]
     np.testing.assert_allclose(learning_rates, config.learning_rate * np.array([1.0, 1.0, 0.75, 0.25, 0.25]))
     logged = metric_history(writer)
+    writer.log_params.assert_called_once_with(asdict(config))
     assert "time/window_seconds" not in logged
     assert "time/iteration_seconds" not in logged
     assert "charts/steps_per_second" not in logged

@@ -127,7 +127,7 @@ def test_real_kinetix_rollout_update_and_video() -> None:
         update_epochs=1,
         target_kl=None,
         bf16=False,
-        kinetix=KinetixConfig(action_type="continuous", levels=("s/h4_thrust_aim.json",), max_steps=2),
+        env=KinetixConfig(action_type="continuous", levels=("s/h4_thrust_aim.json",), max_steps=2),
         model=ppo.ModelConfig(
             encoder=ppo.KinetixEncoderConfig(hidden_size=4, embedding_size=2),
             recurrent=ppo.LSTMConfig(hidden_size=2),

@@ -32,6 +32,8 @@ class MultiAgentStep[State](NamedTuple):
 class BaseMultiAgentEnv[State](ABC):
     """Explicit state and RNGs, discrete actions, and same-step team autoreset.
 
+    Actions and observations retain native values; agent dictionaries are packed
+    in a fixed order. Masks expose native availability, or all actions when absent.
     N denotes agents, O local observation features, and A discrete actions.
     Reset, step, and memory_resets support jax.jit and jax.vmap;
     rendering may run on the host.

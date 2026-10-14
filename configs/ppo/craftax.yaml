@@ -1,5 +1,5 @@
-env_id: Craftax
-craftax:
+env:
+  id: Craftax
   env_id: Craftax-Pixels-v1 # Or Craftax-Classic-Pixels-v1
   max_steps: null # Native episode limit
 seed: 1
@@ -32,7 +32,7 @@ entropy_decay: constant
 value_coef: 0.5
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
-run_id: ppo_${path_name:${env_id}}_${path_name:${craftax.env_id}}_seed${seed}
+run_id: ppo_${path_name:${env.id}}_${path_name:${env.env_id}}_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
 # Video, checkpoint, and eval: every 20% of training, rounded up; also run on completion.
 checkpoint_interval: 489

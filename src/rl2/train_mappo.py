@@ -73,6 +73,9 @@ Evaluation scalars (when evaluation is enabled; unavailable scores are omitted):
     eval/total_training_episodes: Completed training episodes at evaluation time.
     time/evaluation_seconds: Evaluation wall time, including gameplay and report uploads.
 
+Config parameters use dotted keys (e.g. model.recurrent.hidden_size) for filtering
+and grouping runs. Existing parameter values are preserved on resume.
+
 Artifacts (indexed by training step):
     config/<step>.yaml: Full training configuration as YAML, logged at startup and on resume.
     devices/<step>.txt: JAX devices used by this session.
@@ -1128,6 +1131,7 @@ def train(config: Config) -> TrainState:
         if progress is not None:
             print(f"Resumed run {config.run_id} at step {initial_step_count}", flush=True)
         writer.log_text(yaml.safe_dump(asdict(config)), f"config/{initial_step_count}.yaml")
+        writer.log_params(asdict(config))
         print(f"Run ID: {config.run_id}\nMLflow run: {writer.run_id}", flush=True)
         devices = str(jax.devices())
         print(f"JAX devices: {devices}", flush=True)

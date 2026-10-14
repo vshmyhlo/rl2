@@ -174,7 +174,7 @@ def test_ruleset_index_is_checked_before_jax_indexing(benchmark: Benchmark) -> N
 def test_real_rollout_update_and_video() -> None:
     config = replace(
         ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/xminigrid.yaml"),
-        xminigrid=XMiniGridConfig(max_steps=2),
+        env=XMiniGridConfig(max_steps=2),
         num_envs=1,
         num_steps=2,
         num_minibatches=1,

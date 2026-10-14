@@ -84,7 +84,7 @@ def test_boundaries_and_action_masks(env: JaxNavEnv, state: State, boundary: str
         chex.assert_trees_all_equal(result.state, result.final_state)
         if boundary == "collision":
             np.testing.assert_array_equal(result.agent_dones, [True, False])
-            np.testing.assert_array_equal(result.observation.action_masks[0], jnp.arange(15) == 2)
+            np.testing.assert_array_equal(result.observation.action_masks, True)
             assert float(result.rewards[0]) < float(result.rewards[1])
         else:
             # Native non-evaporating agents can leave their goals to make room for teammates.
@@ -150,7 +150,7 @@ def test_jaxnav_rollout_timeout_update_and_evaluation(env: JaxNavEnv, state: Sta
     model = ppo.ActorCritic(env.action_space, config.model)
     memory = model.initial_carry(2)  # leaves: (B=2, H=4)
     final_input = state.replace(step=jnp.asarray(1))
-    observation = env._observation(env.env.get_obs(final_input), final_input)  # (N, O)/(N, A)
+    observation = env._observation(env.env.get_obs(final_input))  # (N, O)/(N, A)
     batched_state, observations = jax.tree.map(lambda x: jnp.asarray(x)[None], (final_input, observation))
     runner = ppo.RolloutCarry(
         batched_state,

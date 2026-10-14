@@ -108,8 +108,9 @@ class ConvObservationStage(nn.Module):
 
 
 class ConvObservationEncoder(nn.Module):
-    """Encode uint8 observations shaped [batch, frames, height, width, (RGB)].
+    """Encode stacked uint8 frames or native channels-last bool/float observations.
 
+    Uint8 pixels are divided by 255; float/bool inputs retain their scale.
     A 7x7 stem convolution followed by LayerNorm and SiLU extracts features at
     the original resolution using the first configured channel width.
     Stages use bilinear resize followed by SAME convolution, with configurable
@@ -121,9 +122,10 @@ class ConvObservationEncoder(nn.Module):
     stages: ConvStages = DEFAULT_STAGES
     embedding_size: int = 768
     dtype: jax.typing.DTypeLike = jnp.float32
+    channels_last: bool = False
 
     @nn.compact
-    def __call__(self, obs: jax.Array | NDArray[np.uint8]) -> jax.Array:  # (B, F, H, W[, 3]) -> (B, E)
+    def __call__(self, obs: jax.Array | NDArray[np.uint8]) -> jax.Array:  # (B, F, H, W[, 3]) or (B, H, W, C) -> (B, E)
         chex.assert_rank(obs, {4, 5})
         validate_stages(self.stages)
         chex.assert_type(self.embedding_size, int)
@@ -134,9 +136,12 @@ class ConvObservationEncoder(nn.Module):
             chex.assert_shape(obs, (None, None, None, None, 3))
             x = jnp.transpose(obs, (0, 2, 3, 1, 4))
             x = x.reshape((*x.shape[:3], obs.shape[1] * obs.shape[-1]))
+        elif self.channels_last:
+            x = obs  # (B, H, W, C)
         else:
-            x = jnp.moveaxis(obs, 1, -1)
-        x = (x.astype(jnp.float32) / 255.0).astype(self.dtype)
+            x = jnp.moveaxis(obs, 1, -1)  # (B, H, W, F)
+        scale = 255.0 if obs.dtype == jnp.uint8 else 1.0
+        x = (x.astype(jnp.float32) / scale).astype(self.dtype)  # (B, H, W, C)
         # Flax keeps parameters and LayerNorm statistics in float32 by default.
         # IMPALA-style stages; normalization is independent of rollout/minibatch size.
         # Variance scaling avoids expensive QR initialization of large visual kernels.

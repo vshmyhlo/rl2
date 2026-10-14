@@ -237,8 +237,8 @@ def test_restore_legacy_environment_config(
         episode_length_sum=4,
     )
     chex.assert_trees_all_equal(restored, expected)
-    with pytest.raises(ValueError, match="different environment settings"):
-        ppo.restore_checkpoint(manager, state, replace(config, env=replace(env, max_steps=env.max_steps + 1)))
+    changed = replace(config, env=replace(env, max_steps=env.max_steps + 1))
+    chex.assert_trees_all_equal(ppo.restore_checkpoint(manager, state, changed), expected)
 
 
 def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_path: Path) -> None:
@@ -286,11 +286,10 @@ def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_pat
     with ppo.checkpoint_manager(str(tmp_path)) as manager:
         ppo.save_checkpoint(manager, progress, config)
         manager.wait_until_finished()
-        restored = ppo.restore_checkpoint(manager, train_state, config)
+        changed = replace(config, env=SMAXConfig(map_name="8m"), num_envs=2, num_steps=2)
+        restored = ppo.restore_checkpoint(manager, train_state, changed)
         assert restored is not None
         chex.assert_trees_all_equal(restored, progress)
-        with pytest.raises(ValueError, match="environment settings"):
-            ppo.restore_checkpoint(manager, train_state, replace(config, env=SMAXConfig(map_name="8m")))
 
 
 def test_playback_reuses_compiled_sampling_with_updated_inputs() -> None:
@@ -460,6 +459,7 @@ def test_training_resume_wiring_and_environment_step_logging(
     monkeypatch.setattr(ppo, "restore_checkpoint", restore)
     monkeypatch.setattr(ppo, "train_step_donated", train_step)
     state = ppo.train(config)
+    writer.log_params.assert_called_once_with(asdict(config))
     for logger in (video, evaluation):
         if not interval:
             logger.assert_not_called()

@@ -45,21 +45,19 @@ class JaxNavEnv(BaseMultiAgentEnv[State]):
         self.num_agents = config.num_agents
         self.action_space = DiscreteSpace(self.env.action_space(self.agents[0]).n)
 
-    def _observation(self, observations: dict[str, jax.Array], state: State) -> AgentObservation:
-        """Pack observations: (O,) agent leaves and state: (...) leaves in fixed order."""
+    def _observation(self, observations: dict[str, jax.Array]) -> AgentObservation:
+        """Pack observations: (O,) agent leaves in fixed order."""
         # JaxNav's get_avail_actions reports two continuous controls even in discrete mode.
-        # Robots at their goals can still move to yield; collided robots can only stop (action 2).
-        masks = ~state.move_term[:, None] | (jnp.arange(self.action_space.n) == 2)  # (N, A)
         return AgentObservation(
-            jnp.stack([observations[agent] for agent in self.agents]),  # (N, O)
-            masks,  # (N, A)
+            observations=jnp.stack([observations[agent] for agent in self.agents]),  # (N, O)
+            action_masks=jnp.ones((self.num_agents, self.action_space.n), dtype=bool),  # (N, A)
         )
 
     @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array) -> tuple[AgentObservation, State]:  # key: ()
         """Return (N, O)/(N, A) local observations/masks and (...) state leaves."""
         observations, state = self.env.reset(key)  # agent leaves: (O,); state leaves: (...)
-        return self._observation(observations, state), state
+        return self._observation(observations), state
 
     @partial(jax.jit, static_argnames="self")
     def step(
@@ -75,7 +73,7 @@ class JaxNavEnv(BaseMultiAgentEnv[State]):
         terminated = (final_state.goal_reached | final_state.move_term).all()  # ()
         truncated = final_state.step >= self.config.max_steps  # ()
         done = dones["__all__"]  # ()
-        final_observation = self._observation(observations, final_state)
+        final_observation = self._observation(observations)
         observation, next_state = jax.lax.cond(
             done, lambda: self.reset(reset_key), lambda: (final_observation, final_state)
         )  # observations: (N, O)/(N, A); state leaves: (...)

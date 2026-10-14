@@ -58,10 +58,11 @@ def job_manifest(args: argparse.Namespace, name: str, image: str) -> dict[str, A
                             "image": image,
                             "imagePullPolicy": "Never",
                             "workingDir": "/app",
-                            "command": args.command,
+                            # Kubelet expands dollar references even without a shell.
+                            "command": [arg.replace("$", "$$") for arg in args.command],
                             "env": [
                                 {"name": "MLFLOW_TRACKING_URI", "value": "http://mlflow.mlflow.svc.cluster.local:5000"},
-                                {"name": "JAX_PLATFORMS", "value": "cuda"},
+                                {"name": "JAX_PLATFORMS", "value": "cuda,cpu"},
                                 {"name": "NVIDIA_DRIVER_CAPABILITIES", "value": "compute,utility"},
                             ],
                             "resources": {

@@ -1,7 +1,7 @@
 """Single-environment XLand-MiniGrid tasks with categorical observations."""
 
 from functools import partial
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
 import jax
 import jax.numpy as jnp
@@ -21,6 +21,7 @@ from rl2.envs.base import BaseEnv, EnvStep
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class XMiniGridConfig:
+    id: Literal["XLand-MiniGrid"] = "XLand-MiniGrid"
     env_id: Annotated[str, Field(pattern=r"^(MiniGrid|XLand-MiniGrid)-")] = "MiniGrid-Empty-5x5"
     benchmark: Annotated[str, Field(min_length=1)] | None = None
     ruleset_id: Annotated[int, Field(ge=0, strict=True)] | None = None

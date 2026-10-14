@@ -177,3 +177,22 @@ def test_explicit_stages_support_jit_and_gradients(dtype: jax.typing.DTypeLike) 
         assert np.isfinite(gradient).all()
     assert np.any(np.asarray(gradients["stem"]["kernel"]) != 0)
     assert np.any(np.asarray(gradients["stage_3"]["block_0"]["Conv_0"]["kernel"]) != 0)
+
+
+@pytest.mark.parametrize("dtype", [jnp.bool_, jnp.float32, jnp.uint8], ids=["binary", "native-float", "pixels"])
+def test_native_channels_last_values_and_shapes(dtype: jax.typing.DTypeLike) -> None:
+    model = ConvObservationEncoder(channels_last=True, stages=(ConvStage(channels=2, blocks=0),), embedding_size=2)
+    values = jnp.arange(24).reshape(1, 2, 3, 4)  # (B, H, W, C)
+    observations = ((values - 2) / 17 if dtype == jnp.float32 else values % 2).astype(dtype)  # (B, H, W, C)
+    variables = model.init(jax.random.key(0), observations)
+    output, captured = jax.jit(partial(model.apply, capture_intermediates=True, mutable=["intermediates"]))(
+        variables, observations
+    )  # (B, E); intermediate leaves: (...)
+    pixels = observations.astype(jnp.float32) / (255 if dtype == jnp.uint8 else 1)  # (B, H, W, C)
+    stem = variables["params"]["stem"]  # kernel: (7, 7, C, D); bias: (D,)
+    expected = (
+        jax.lax.conv_general_dilated(pixels, stem["kernel"], (1, 1), "SAME", dimension_numbers=("NHWC", "HWIO", "NHWC"))
+        + stem["bias"]
+    )  # (B, H, W, D)
+    np.testing.assert_allclose(captured["intermediates"]["stem"]["__call__"][0], expected, atol=1e-6)
+    assert output.shape == (1, 2) and output.dtype == jnp.float32

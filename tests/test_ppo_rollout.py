@@ -11,13 +11,13 @@ import pytest
 from flax.training.train_state import TrainState
 
 from rl2 import ppo
-from rl2.envs.gymnax_env import GymnaxEnv, encode_observations
+from rl2.envs.gymnax_env import GymnaxEnv
 from rl2.model.encoders.rgb import ConvStage
 
 
 def policy(
     variables: dict[str, jax.Array],
-    observations: jax.Array,  # (B, C, H, W)
+    observations: jax.Array,  # (B, H, W, C)
     memory: ppo.RecurrentCarry,  # leaves: (B, H)
     starts: jax.Array,  # (B,)
     *,
@@ -42,11 +42,11 @@ def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs:
         gamma=0.5,
         gae_lambda=1.0,
     )
-    env = GymnaxEnv(config.env_id, max_steps_in_episode=2)
+    env = GymnaxEnv(config.env.id, max_steps_in_episode=2)
     key = jax.random.key(0)  # ()
     observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(key, num_envs), env.params
-    )  # (B,4,10,10); leaves: (B,...)
+    )  # (B,10,10,4); leaves: (B,...)
     memory = ppo.ActorCritic(
         ppo.DiscreteSpace(3), ppo.ModelConfig(encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1))
     ).initial_carry(num_envs)  # leaves: (B,1)
@@ -64,12 +64,12 @@ def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs:
     duplicate, repeated = ppo.collect_rollout(runner, state, env, config, key)
     chex.assert_trees_all_equal((duplicate, repeated), (first, rollout))
     for result in (rollout, continued):
-        chex.assert_shape(result.batch.observations, (num_steps, num_envs, 4, 10, 10))
+        chex.assert_shape(result.batch.observations, (num_steps, num_envs, 10, 10, 4))
         chex.assert_shape((result.batch.actions, result.batch.returns), (num_steps, num_envs))
         chex.assert_shape((result.episode_count, result.episode_return_sum, result.episode_length_sum), ())
         chex.assert_type((result.episode_count, result.episode_length_sum), jnp.int32)
         chex.assert_type(result.episode_return_sum, jnp.float32)
-        chex.assert_type(result.batch.observations, jnp.uint8)
+        chex.assert_type(result.batch.observations, jnp.float32)
         chex.assert_type(result.batch.actions, jnp.int32)
         # No brick hits within two steps. All boundaries here are timeouts.
         expected_count = num_envs * ((num_steps + (0 if result is rollout else num_steps % 2)) // 2)
@@ -109,7 +109,7 @@ def test_train_step_matches_separate_rollout_and_updates_with_real_model() -> No
             recurrent=ppo.LSTMConfig(hidden_size=4),
         ),
     )
-    env = GymnaxEnv(config.env_id)
+    env = GymnaxEnv(config.env.id)
     observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(jax.random.key(0), 2), env.params
     )  # (B=2,4,10,10); leaves: (B,...)
@@ -194,7 +194,7 @@ def test_train_step_stops_updates_and_rng_at_rejected_minibatch(reject_at: int) 
         update_epochs=2,
         target_kl=0.01,
     )
-    env = GymnaxEnv(config.env_id, max_steps_in_episode=1)
+    env = GymnaxEnv(config.env.id, max_steps_in_episode=1)
     key = jax.random.key(0)  # ()
     observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(key, 2), env.params
@@ -215,7 +215,7 @@ def test_train_step_stops_updates_and_rng_at_rejected_minibatch(reject_at: int) 
         config: ppo.Config,
         iteration: int | jax.Array,  # ()
     ) -> tuple[TrainState, ppo.MinibatchMetrics]:
-        chex.assert_shape(batch.observations, (1, 1, 4, 10, 10))
+        chex.assert_shape(batch.observations, (1, 1, 10, 10, 4))
         rejected = state.step == reject_at  # ()
         loss = jnp.asarray(state.step + 1, jnp.float32)  # ()
         metrics = ppo.MinibatchMetrics(loss, loss, loss, loss, rejected.astype(jnp.float32), loss)
@@ -244,7 +244,7 @@ def test_train_step_stops_updates_and_rng_at_rejected_minibatch(reject_at: int) 
     for _ in range(reject_at // config.num_minibatches + 1):
         expected_key = jax.random.split(expected_key)[0]  # () one shuffle per started epoch
     chex.assert_trees_all_equal(result.key, expected_key)
-    chex.assert_shape(result.rollout_carry.observations, (2, 4, 10, 10))
+    chex.assert_shape(result.rollout_carry.observations, (2, 10, 10, 4))
     chex.assert_shape(jax.tree.leaves(result.rollout_carry.model_carry), (2, 1))
     chex.assert_shape(jax.tree.leaves(result.metrics.window.minibatch_metrics), ())
     chex.assert_shape(jax.tree.leaves(result.metrics), ())
@@ -300,7 +300,7 @@ def test_terminal_and_timeout_targets_use_final_observations() -> None:
         num_minibatches=1,
         gamma=0.5,
     )
-    env = GymnaxEnv(config.env_id, max_steps_in_episode=2)
+    env = GymnaxEnv(config.env.id, max_steps_in_episode=2)
     _, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(jax.random.key(0), 4), env.params
     )  # leaves: (B=4,...)
@@ -310,21 +310,21 @@ def test_terminal_and_timeout_targets_use_final_observations() -> None:
         ball_dir=jnp.full(4, 2),
         time=jnp.array([0, 1, 1, 0]),
     )
-    observations = encode_observations(jax.vmap(env.env.get_obs)(env_state))  # (B,4,10,10)
+    observations = jax.vmap(env.env.get_obs)(env_state)  # (B,10,10,4)
     memory = ppo.ActorCritic(
         ppo.DiscreteSpace(3), ppo.ModelConfig(encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1))
     ).initial_carry(4)  # leaves: (B,1)
 
     def position_policy(
         variables: dict[str, jax.Array],
-        observations: jax.Array,  # (B,C,H,W)
+        observations: jax.Array,  # (B,H,W,C)
         memory: ppo.RecurrentCarry,  # leaves: (B,1)
         starts: jax.Array,  # (B,)
         *,
         method: str,
     ) -> ppo.ActorCriticOutput:
         memory, logits, _ = policy(variables, observations, memory, starts, method=method)
-        positions = jnp.argmax(observations[:, 1].reshape((4, -1)), axis=-1).astype(jnp.float32)  # (B,)
+        positions = jnp.argmax(observations[..., 1].reshape((4, -1)), axis=-1).astype(jnp.float32)  # (B,)
         return ppo.ActorCriticOutput(memory, logits, positions)  # leaves: (B,1); (B,3); (B,)
 
     state = TrainState.create(apply_fn=position_policy, params={}, tx=optax.sgd(0.1))

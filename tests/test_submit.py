@@ -26,6 +26,8 @@ def test_default_gpu_job() -> None:
     container = pod["containers"][0]
     assert container["imagePullPolicy"] == "Never"
     assert container["workingDir"] == "/app"
+    env = {entry["name"]: entry["value"] for entry in container["env"]}
+    assert env["JAX_PLATFORMS"] == "cuda,cpu"
     assert container["resources"]["requests"] == {"cpu": "4", "memory": "16Gi", "nvidia.com/gpu": "1"}
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "1"
     run_mount = next(mount for mount in container["volumeMounts"] if mount["mountPath"] == "/runs")
@@ -49,6 +51,22 @@ def test_invalid_arguments(argv: list[str]) -> None:
     with pytest.raises(SystemExit) as error:
         submit.parse_args(argv)
     assert error.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("argument", "escaped"),
+    [
+        pytest.param("$(JAX_PLATFORMS)", "$$(JAX_PLATFORMS)", id="environment-reference"),
+        pytest.param("echo $$", "echo $$$$", id="shell-pid"),
+        pytest.param("$$(JAX_PLATFORMS)", "$$$$(JAX_PLATFORMS)", id="literal-escaped-reference"),
+        pytest.param("echo $HOME/${HOME}", "echo $$HOME/$${HOME}", id="shell-variables"),
+    ],
+)
+def test_command_escapes_kubernetes_expansion(argument: str, escaped: str) -> None:
+    args = submit.parse_args(["--", "sh", "-c", argument])
+    job = submit.job_manifest(args=args, name="train-test", image="rl2.local/train:test")
+    assert job["spec"]["template"]["spec"]["containers"][0]["command"] == ["sh", "-c", escaped]
+    assert args.command == ["sh", "-c", argument]
 
 
 def test_build_and_submit_preserves_command(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -77,7 +95,7 @@ def test_build_and_submit_preserves_command(monkeypatch: pytest.MonkeyPatch, tmp
     assert created["metadata"]["name"] == name
     assert created["metadata"]["labels"]["kueue.x-k8s.io/priority-class"] == "train-high"
     container = created["spec"]["template"]["spec"]["containers"][0]
-    assert container["command"] == command
+    assert container["command"] == ["uv", "run", "python", "train.py", "--label", "a b; $$(touch /tmp/unused)"]
     assert container["resources"]["requests"]["cpu"] == "10"
     assert container["resources"]["limits"]["memory"] == "64Gi"
     assert f"type=image,name={container['image']},unpack=true" in build.args[0]
