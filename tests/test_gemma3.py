@@ -2,8 +2,10 @@
 
 from contextlib import closing
 from dataclasses import replace
+from functools import partial
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, Mock
 
 import jax
@@ -180,13 +182,14 @@ def test_official_checkpoint_roundtrip(
         np.testing.assert_array_equal(actual, expected.astype(jnp.float32))
 
 
-def test_checkpoint_validation(tiny_gemma: tuple[Gemma3LM, Parameters], monkeypatch: pytest.MonkeyPatch) -> None:
-    model, params = tiny_gemma
+def test_checkpoint_validation(cudnn_gemma: tuple[Gemma3LM, Parameters], monkeypatch: pytest.MonkeyPatch) -> None:
+    model, params = cudnn_gemma
     monkeypatch.setattr(gm.nn, "Gemma3_270M", Mock(return_value=model.model))
     path = "mock-checkpoint"
     mocked = Mock(return_value=params)
     monkeypatch.setattr(gm.ckpts, "load_params", mocked)
-    _, variables = load_gemma3_checkpoint(path, cache_length=6, dtype="bfloat16")
+    loaded, variables = load_gemma3_checkpoint(path, cache_length=6, dtype="bfloat16", attention_backend="cudnn")
+    assert loaded.attention_backend == "cudnn"
     for actual, expected in zip(jax.tree.leaves(variables["params"]), jax.tree.leaves(params), strict=True):
         np.testing.assert_array_equal(actual, expected)
     mocked.return_value = {}
@@ -259,10 +262,121 @@ def test_training_selects_gemma_loader(
                 ckpt_dir=str(tmp_path),
                 max_prompt_tokens=3,
                 max_new_tokens=3,
+                dtype="bfloat16",
+                attention_backend="cudnn",
             )
         )
     grpo.Gemma3Tokenizer.assert_called_once_with(None)
-    load.assert_called_once_with("gs://gemma-data/checkpoints/gemma3-270m-pt", cache_length=6, dtype="float32")
+    load.assert_called_once_with(
+        "gs://gemma-data/checkpoints/gemma3-270m-pt", cache_length=6, dtype="bfloat16", attention_backend="cudnn"
+    )
+
+
+@pytest.fixture(scope="module")
+def cudnn_gemma(tiny_gemma: tuple[Gemma3LM, Parameters]) -> tuple[Gemma3LM, Parameters]:
+    model, _ = tiny_gemma
+    upstream = gm.nn.Gemma3_270M(config=replace(model.model.config, head_dim=8), dtype=jnp.float32)
+    params = upstream.init(jax.random.key(12), tokens=jnp.array([[2, 3]], jnp.int32))["params"]
+    return Gemma3LM(model=upstream, cache_length=5, dtype="bfloat16"), params
+
+
+@pytest.mark.parametrize("real_cudnn", [pytest.param(False, id="cpu-routing"), pytest.param(True, id="gpu")])
+def test_cudnn_attention_matches_gemma(
+    cudnn_gemma: tuple[Gemma3LM, Parameters], monkeypatch: pytest.MonkeyPatch, real_cudnn: bool
+) -> None:
+    if real_cudnn and not any(device.platform == "gpu" for device in jax.devices()):
+        pytest.skip("Requires an NVIDIA GPU with cuDNN")
+    model, params = cudnn_gemma
+    if real_cudnn:
+        device = jax.devices()[0]
+        capability = getattr(device, "compute_capability", "0.0")
+        if tuple(int(part) for part in capability.split(".")) < (9, 0):
+            pytest.skip("Gemma's 256-wide heads require Hopper or newer")
+        upstream = model.model.clone(config=replace(model.model.config, head_dim=256))
+        params = upstream.init(jax.random.key(12), tokens=jnp.array([[2, 3]], jnp.int32))["params"]
+        model = replace(model, model=upstream)
+    fused = replace(model, attention_backend="cudnn")
+    original_attention = jax.nn.dot_product_attention
+    calls = []
+
+    def to_float32(value: jax.Array) -> jax.Array:  # (...)
+        return value.astype(jnp.float32)  # (...)
+
+    def attention(
+        query: jax.Array,  # (B, T, N, H)
+        key: jax.Array,  # (B, S, K, H)
+        value: jax.Array,  # (B, S, K, H)
+        **kwargs: Any,
+    ) -> jax.Array:
+        assert kwargs["implementation"] == "cudnn"
+        assert kwargs["scale"] == 1.0
+        assert query.dtype == key.dtype == value.dtype == jnp.bfloat16
+        assert query.shape[1] % 2 == key.shape[1] % 2 == 0
+        assert kwargs["mask"].shape == (query.shape[0], 1, query.shape[1], key.shape[1])
+        calls.append(query.shape)
+        kwargs["implementation"] = "xla"
+        query, key, value = jax.tree.map(to_float32, (query, key, value))  # (B, T, N, H), each KV: (B, S, K, H)
+        return original_attention(query, key, value, **kwargs).astype(jnp.bfloat16)  # (B, T, N, H)
+
+    if not real_cudnn:
+        monkeypatch.setattr(jax.nn, "dot_product_attention", attention)
+    tokens = jnp.array([[2, 3, 0], [2, 4, 3]], jnp.int32)  # (B=2, T=3)
+    lengths = jnp.array([2, 3], jnp.int32)  # (B,)
+    actual_carry, actual = jax.jit(fused.prefill)(params, tokens, lengths)  # actual: (B, T, V)
+    expected_carry, expected = model.prefill(params, tokens, lengths)  # expected: (B, T, V)
+    assert actual.shape == (2, 3, model.vocab_size)
+    np.testing.assert_allclose(actual, expected, atol=0.04, rtol=0.04)
+    # Odd cache width and single-token queries exercise both cuDNN padding paths.
+    for active in (jnp.array([True, True]), jnp.array([False, True])):  # (B,)
+        next_tokens = jnp.array([5, 6], jnp.int32)  # (B,)
+        actual_carry, actual = jax.jit(fused.step)(params, next_tokens, active, actual_carry)  # actual: (B, V)
+        expected_carry, expected = model.step(params, next_tokens, active, expected_carry)  # expected: (B, V)
+        assert actual.shape == (2, model.vocab_size)
+        np.testing.assert_allclose(actual, expected, atol=0.04, rtol=0.04)
+        for actual_leaf, expected_leaf in zip(
+            jax.tree.leaves(actual_carry), jax.tree.leaves(expected_carry), strict=True
+        ):  # matching cache leaf shapes
+            assert actual_leaf.shape == expected_leaf.shape
+            np.testing.assert_allclose(actual_leaf.astype(jnp.float32), expected_leaf.astype(jnp.float32), atol=0.04)
+
+    def loss(weights: Parameters, lm: Gemma3LM) -> jax.Array:
+        _, logits = lm.apply({"params": weights}, tokens, lengths)  # (B, T, V)
+        return jnp.mean(jnp.square(logits))  # ()
+
+    actual_loss, actual_grad = jax.jit(jax.value_and_grad(partial(loss, lm=fused)))(params)  # loss: ()
+    expected_loss, expected_grad = jax.value_and_grad(partial(loss, lm=model))(params)  # loss: ()
+    np.testing.assert_allclose(actual_loss, expected_loss, atol=0.04, rtol=0.04)
+    for actual_leaf, expected_leaf in zip(jax.tree.leaves(actual_grad), jax.tree.leaves(expected_grad), strict=True):
+        assert actual_leaf.shape == expected_leaf.shape
+        np.testing.assert_allclose(actual_leaf, expected_leaf, atol=0.06, rtol=0.06)
+
+    # A fully masked row and a one-token prompt retain upstream output semantics.
+    short_tokens = tokens[:, :1]  # (B, T=1)
+    short_lengths = jnp.array([0, 1], jnp.int32)  # (B,)
+    _, actual = fused.apply({"params": params}, short_tokens, short_lengths)  # (B, 1, V)
+    _, expected = model.apply({"params": params}, short_tokens, short_lengths)  # (B, 1, V)
+    assert actual.shape == (2, 1, model.vocab_size)
+    np.testing.assert_allclose(actual, expected, atol=0.04, rtol=0.04)
+    if not real_cudnn:
+        assert calls
+
+
+def test_cudnn_validation(cudnn_gemma: tuple[Gemma3LM, Parameters]) -> None:
+    model, _ = cudnn_gemma
+    with pytest.raises(ValueError, match="bfloat16"):
+        replace(model, attention_backend="cudnn", dtype="float32")
+    with pytest.raises(ValueError, match="divisible by 8"):
+        replace(
+            model, attention_backend="cudnn", model=model.model.clone(config=replace(model.model.config, head_dim=4))
+        )
+    with pytest.raises(ValueError, match="soft caps"):
+        replace(
+            model,
+            attention_backend="cudnn",
+            model=model.model.clone(config=replace(model.model.config, attn_logits_soft_cap=30.0)),
+        )
+    with pytest.raises(ValueError, match="bfloat16"):
+        grpo.Config(attention_backend="cudnn")
 
 
 def test_generation_rejects_insufficient_cache(tiny_gemma: tuple[Gemma3LM, Parameters]) -> None:

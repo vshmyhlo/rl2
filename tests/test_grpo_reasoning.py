@@ -554,7 +554,7 @@ def test_yaml_config(tmp_path: Path) -> None:
     assert default_config.task_config == {"max_animals": 3}
     assert default_config.run_id is not None
     assert default_config.run_id[0:8].isdigit()
-    assert default_config.ckpt_dir == f"runs/grpo_reasoning/{default_config.run_id}"
+    assert default_config.ckpt_dir == "runs"
     path.write_text("group_size: 2.5\n")
     with pytest.raises(ValueError, match="group_size"):
         grpo.load_config(path, grpo.Config)
@@ -569,7 +569,6 @@ def test_checkpoint_directory_interpolation(tmp_path: Path) -> None:
     config = grpo.load_config(path, grpo.Config)
     assert config.run_id == "reasoning_leg_counting_seed7"
     assert config.ckpt_dir == "gs://bucket/grpo/reasoning_leg_counting_seed7"
-    assert config.resolve_run() == config
 
 
 @pytest.mark.parametrize(

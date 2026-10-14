@@ -133,7 +133,6 @@ from rl2.utils import read_bytes, read_optional, write_bytes
 
 @dataclass(frozen=True)
 class Config(BaseConfig):
-    ckpt_dir: str = field(default="${log_dir}/${run_id}", kw_only=True)
     # Reproducibility and training duration.
     seed: Annotated[int, Field(ge=0)] = 1
     total_updates: Annotated[int, Field(gt=0)] = 1000  # Number of rollout batches, independent of program length.
@@ -728,7 +727,6 @@ def check_resume_config(config: Config, saved: Config) -> None:
 
 def train(config: Config) -> TrainState:
     """Run or resume editing-policy training with grouped rollouts, KL stopping, logs, and checkpoints."""
-    config = config.resolve_run()
     configure_compilation_cache()
     batch_size = config.num_tasks * config.group_size
     rng = np.random.default_rng(config.seed)

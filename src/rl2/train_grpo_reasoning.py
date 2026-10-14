@@ -68,10 +68,10 @@ class PromptExample:
 
 @dataclass(frozen=True)
 class Config(BaseConfig):
-    ckpt_dir: str = field(default="runs/grpo_reasoning/${run_id}", kw_only=True)
     checkpoint: str = "gs://gemma-data/checkpoints/gemma3-270m-it"
     tokenizer: str | None = None
     dtype: Literal["float32", "bfloat16"] = "float32"
+    attention_backend: Literal["xla", "cudnn"] = "xla"
     task: str = "leg_counting"
     task_config: dict[str, Any] = field(default_factory=dict)
     prompt_examples: list[PromptExample] = field(default_factory=list)
@@ -95,6 +95,8 @@ class Config(BaseConfig):
     checkpoint_interval_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 600.0
 
     def __post_init__(self) -> None:
+        if self.attention_backend == "cudnn" and self.dtype != "bfloat16":
+            raise ValueError("cuDNN attention requires dtype=bfloat16")
         if self.num_tasks * self.group_size % self.num_minibatches:
             raise ValueError("num_minibatches must divide num_tasks * group_size")
         if self.max_prompt_tokens + self.max_new_tokens > 32768:
@@ -801,6 +803,7 @@ def train(config: Config) -> TrainState:
         config.checkpoint,
         cache_length=config.max_prompt_tokens + config.max_new_tokens,
         dtype=config.dtype,
+        attention_backend=config.attention_backend,
     )
     parameter_count = sum(leaf.size for leaf in jax.tree.leaves(variables["params"]))
     log_init(f"Pretrained checkpoint loaded: {parameter_count:,} parameters")
@@ -816,7 +819,6 @@ def train(config: Config) -> TrainState:
     if not config.beta:
         ref_params = {}
     del variables
-    config = config.resolve_run()
     run_dir = config.ckpt_dir.rstrip("/")
     log_init(f"Checking for saved training state: {run_dir}/checkpoints")
     with closing(checkpoint_manager(run_dir)) as manager:

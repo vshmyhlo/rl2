@@ -46,7 +46,6 @@ type Metrics = tuple[jax.Array, jax.Array, jax.Array, jax.Array]
 
 @dataclass(frozen=True)
 class Config(BaseConfig):
-    ckpt_dir: str = field(default="${log_dir}/${run_id}", kw_only=True)
     seed: Annotated[int, Field(ge=0)] = 1
     total_updates: Annotated[int, Field(gt=0)] = 1000  # Number of rollout batches, independent of program length.
     num_tasks: Annotated[int, Field(gt=0)] = 8
@@ -649,7 +648,6 @@ def load_model(
 
 
 def train(config: Config) -> TrainState:
-    config = config.resolve_run()
     configure_compilation_cache()
     batch_size = config.num_tasks * config.group_size
     envs = [KarelProgramEnv(config.env) for _ in range(batch_size)]

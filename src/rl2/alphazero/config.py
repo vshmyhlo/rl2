@@ -1,6 +1,5 @@
 """Validated AlphaZero settings and OmegaConf YAML loading."""
 
-from dataclasses import field
 from typing import Annotated, Literal
 
 from pydantic import ConfigDict, Field, NonNegativeInt, PositiveInt
@@ -29,7 +28,6 @@ class EvaluationConfig:
 
 @dataclass(frozen=True)
 class Config(BaseConfig):
-    ckpt_dir: str = field(default="${log_dir}", kw_only=True)
     env_id: EnvId = "chess"
     seed: Annotated[int, Field(ge=0, lt=2**32)] = 0
     iterations: PositiveInt = 100
@@ -45,7 +43,7 @@ class Config(BaseConfig):
     dirichlet_alpha: PositiveFiniteFloat = 0.3
     dirichlet_fraction: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)] = 0.25
     exploration_moves: NonNegativeInt = 30
-    log_dir: Annotated[str, Field(pattern=r"\S")] = "runs/alphazero/${run_id}"
+    log_dir: Annotated[str, Field(pattern=r"\S")] = "runs/alphazero"
     log_interval_seconds: PositiveFiniteFloat = 60.0
     checkpoint_interval_seconds: PositiveFiniteFloat = 600.0
     evaluation: EvaluationConfig = EvaluationConfig()

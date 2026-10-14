@@ -540,7 +540,7 @@ def test_legacy_reference_checkpoint_and_config_load_without_reference(
     np.testing.assert_array_equal(restored_rng.integers(100, size=4), rng.integers(100, size=4))
     config_path = tmp_path / "config.yaml"
     config_path.write_text(grpo.yaml.safe_dump({**grpo.asdict(config), "kl_coef": 0.25}))
-    assert grpo.load_config(config_path, grpo.Config) == config.resolve_run()
+    assert grpo.load_config(config_path, grpo.Config) == config
 
 
 def test_load_model_from_checkpoint(config: Config, state: TrainState, tmp_path: Path) -> None:
@@ -548,6 +548,6 @@ def test_load_model_from_checkpoint(config: Config, state: TrainState, tmp_path:
     progress = grpo.TrainingProgress(state, jax.random.key(3), 2, 8, 1, 8)
     grpo._save_checkpoint(str(tmp_path), progress, np.random.default_rng(4))
     loaded_config, loaded = grpo.load_model(tmp_path, attention_implementation="xla")
-    assert loaded_config == config.resolve_run()
+    assert loaded_config == config
     chex.assert_trees_all_equal(loaded.params, state.params)
     assert int(loaded.step) == 0

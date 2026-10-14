@@ -57,7 +57,6 @@ ObservationLoss = Literal["l1", "l2", "charbonnier"]
 
 @dataclass(frozen=True)
 class Config(BaseConfig):
-    ckpt_dir: str = field(default="${checkpoint_dir}/${run_id}", kw_only=True)
     env_id: str
     observation_size: Annotated[int, Field(gt=0)] | None
     frame_stack: bool
@@ -553,7 +552,6 @@ def save_checkpoint(state: TrainState, run_dir: str | Path) -> None:
 
 def train(config: Config) -> str:
     """Train on fresh random-policy rollouts and return the log directory."""
-    config = config.resolve_run()
     configure_compilation_cache()
     vector_cls = gym.vector.AsyncVectorEnv if config.vector_env == "async" else gym.vector.SyncVectorEnv
     vector_options = {"context": "spawn"} if config.vector_env == "async" else {}

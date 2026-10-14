@@ -507,7 +507,7 @@ def test_config_and_checkpoint(config: edit.Config, state: TrainState, tmp_path:
             replace(config, **changes)
     # Runs created before accumulation was removed must still load for inference.
     (tmp_path / "config.yaml").write_text(yaml.safe_dump({**asdict(config), "replay_batch_size": 1}))
-    assert edit.load_config(tmp_path / "config.yaml", edit.Config) == config.resolve_run()
+    assert edit.load_config(tmp_path / "config.yaml", edit.Config) == config
     rng = np.random.default_rng(7)
     progress = edit.TrainingProgress(state, jax.random.key(5), 3, 6, 2, 6)
     edit._save_checkpoint(str(tmp_path), progress, rng)

@@ -23,6 +23,7 @@ entropy_coef: 0.01
 # AST constructor/value masking is always enabled, including node/depth/source budgets.
 max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/karel_ast_grpo
+ckpt_dir: ${log_dir}/${run_id}
 run_id: v4 # Reuse to resume; change for a new run, or null for a timestamped run
 checkpoint_interval_seconds: 300 # Save to log_dir/run_id on GCS every 5 minutes (at rollout boundaries), plus final
 log_interval: 10 # TensorBoard scalars, stdout, and flushes every 20 completed rollouts

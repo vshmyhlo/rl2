@@ -101,7 +101,7 @@ def test_karel_config_defaults_and_legacy_roundtrip(
     assert isinstance(config.env, KarelConfig)
     assert config.env.height == config.env.width == 4
     assert config.run_id is not None
-    assert config.ckpt_dir == f"runs/{config.run_id}"
+    assert config.ckpt_dir == "runs"
     path.write_text(yaml.safe_dump(asdict(config) | retired))
     assert trainer.load_config(path, trainer.Config) == config
 
@@ -164,13 +164,12 @@ def test_reasoning_prompt_examples_are_validated_on_construction() -> None:
         (train_karel_ast_ar_edit, "karel_ast_ar_edit.yaml", "log_dir", True),
     ],
 )
-def test_legacy_checkpoint_directory_defaults(trainer: ModuleType, preset: str, root: str, append_run_id: bool) -> None:
+def test_preset_checkpoint_directories(trainer: ModuleType, preset: str, root: str, append_run_id: bool) -> None:
     config = trainer.load_config(Path(__file__).resolve().parents[1] / "configs" / preset, trainer.Config)
     expected = getattr(config, root)
     if append_run_id:
         expected = f"{expected}/{config.run_id}"
     assert config.ckpt_dir == expected
-    assert config.resolve_run() == config
 
 
 def test_progress_logging_presets() -> None:

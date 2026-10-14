@@ -1047,7 +1047,6 @@ train_step_donated = jax.jit(train_step, static_argnames=("envs", "config"), don
 
 def train(config: Config) -> TrainState:
     """Train with a fully resolved config, as returned by load_config."""
-    config = config.resolve_run()
     with ExitStack() as resources:
         configure_compilation_cache()
         batch_size = config.num_envs * config.num_steps

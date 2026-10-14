@@ -2,6 +2,7 @@
 checkpoint: gs://gemma-data/checkpoints/gemma3-270m-it # Instruction-tuned; or a local native Gemma/Orbax checkpoint
 tokenizer: null # Official Gemma 3 tokenizer; or a local/gs:// SentencePiece .model file
 dtype: bfloat16
+attention_backend: xla # cudnn requires bfloat16 and Hopper (H100) or newer for Gemma's 256-wide heads.
 
 task: basic_arithmetic
 task_config:

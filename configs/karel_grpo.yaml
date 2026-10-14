@@ -20,6 +20,7 @@ entropy_coef: 0.01
 # KV cache covers the grid-pair prefix and all preceding tokens; no sliding-window truncation.
 max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/karel_grpo
+ckpt_dir: ${log_dir}/${run_id}
 run_id: v3 # Reuse to resume; change for a new run, or null for a timestamped run
 checkpoint_interval_seconds: 300 # Save to log_dir/run_id on GCS every 5 minutes (at rollout boundaries), plus final
 log_interval: 10 # TensorBoard scalars, stdout, and flushes every 10 completed rollouts

@@ -297,7 +297,6 @@ def sample_batch(batch: Batch, key: jax.Array, batch_size: int) -> Batch:
 
 
 def train(config: Config) -> TrainState:
-    config = config.resolve_run()
     env = pgx.make(config.env_id)
     model = PolicyValueNet(env.num_actions, config.model.channels, config.model.num_blocks)
     key, init_key, env_key = jax.random.split(jax.random.PRNGKey(config.seed), 3)

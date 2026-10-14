@@ -57,7 +57,7 @@ def test_load_config_resolves_schema_defaults(tmp_path: Path) -> None:
     assert config.batch_size == 3
     assert type(config.batch_size) is int
     assert config.run_id is not None
-    assert config.ckpt_dir == f"runs/{config.run_id}"
+    assert config.ckpt_dir == "runs"
 
 
 def test_load_remote_config(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -100,11 +100,10 @@ def test_base_config_validation(settings: dict[str, object], match: str) -> None
         BaseConfig(**settings)
 
 
-def test_base_config_resolves_run_and_remains_frozen() -> None:
-    config = BaseConfig(ckpt_dir="gs://bucket/${run_id}").resolve_run()
-    assert config.run_id is not None
-    assert config.ckpt_dir == f"gs://bucket/{config.run_id}"
-    assert config.resolve_run() == config
+def test_python_config_preserves_literal_strings_and_remains_frozen() -> None:
+    config = BaseConfig(ckpt_dir="gs://bucket/${run_id}")
+    assert config.run_id is None
+    assert config.ckpt_dir == "gs://bucket/${run_id}"
     assert BaseConfig(**asdict(config)) == config
     assert hash(BaseConfig(**asdict(config))) == hash(config)
     with pytest.raises(FrozenInstanceError):

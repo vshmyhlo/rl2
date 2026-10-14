@@ -231,7 +231,9 @@ def test_chess_search_smoke() -> None:
 
 def test_main_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
-    path.write_text("env_id: tic_tac_toe\niterations: 1\nrun_id: test\n")
+    path.write_text(
+        "env_id: tic_tac_toe\niterations: 1\nrun_id: test\nlog_dir: runs/alphazero/${run_id}\nckpt_dir: ${log_dir}\n"
+    )
     train = Mock()
     monkeypatch.setattr(az, "train", train)
     monkeypatch.setattr(sys, "argv", ["train_alphazero", "--config", str(path)])
@@ -276,7 +278,13 @@ def test_main_reports_config_errors(
 @pytest.fixture
 def logging_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> az.Config:
     """Exercise the training loop's logging without running a model or search."""
-    config = az.Config(iterations=2, updates_per_iteration=2, log_dir=str(tmp_path) + "/${run_id}")
+    config = az.Config(
+        iterations=2,
+        updates_per_iteration=2,
+        run_id="test",
+        log_dir=str(tmp_path / "test"),
+        ckpt_dir=str(tmp_path / "checkpoints" / "test"),
+    )
     manager = MagicMock()
     manager.__enter__.return_value = manager
     manager.latest_step.return_value = None
@@ -309,9 +317,9 @@ def test_tensorboard_progress(
     logging_config = replace(
         logging_config,
         iterations=5,
-        log_dir=str(tmp_path) + "/${run_id}/${env_id}",
+        log_dir=str(tmp_path / "test-run" / "chess"),
         run_id="test-run",
-        ckpt_dir=str(tmp_path / "checkpoints" / "${run_id}"),
+        ckpt_dir=str(tmp_path / "checkpoints" / "test-run"),
         log_interval_seconds=30.0,
     )
     clock = 0.0
@@ -371,6 +379,7 @@ def test_tensorboard_progress(
 
 
 def test_tensorboard_closes_on_error(logging_config: az.Config, monkeypatch: pytest.MonkeyPatch) -> None:
+    logging_config = replace(logging_config, log_dir="logs/${run_id}", ckpt_dir="checkpoints/${run_id}")
     writer = MagicMock()
     writer.__enter__.return_value = writer
     make_writer = Mock(return_value=writer)
@@ -382,8 +391,8 @@ def test_tensorboard_closes_on_error(logging_config: az.Config, monkeypatch: pyt
     assert writer.__exit__.call_args.args[0] is RuntimeError
     az.checkpoint_manager.return_value.__exit__.assert_called_once()
     run_dir = Path(make_writer.call_args.kwargs["logdir"])
-    assert run_dir.parent == Path(logging_config.log_dir).parent
-    assert run_dir.name[0:8].isdigit()
+    assert run_dir == Path("logs/${run_id}")
+    az.checkpoint_manager.assert_called_once_with("checkpoints/${run_id}")
 
 
 def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: pytest.MonkeyPatch) -> None:

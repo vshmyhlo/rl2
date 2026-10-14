@@ -34,6 +34,7 @@ log_dir: gs://cohere-dev/vlad/rl2/wm # Local path or GCS prefix for TensorBoard 
 log_every: 10 # Print training metrics every N updates
 log_flush_secs: 30 # Background TensorBoard flush interval; also flush after progress reports and videos
 checkpoint_dir: gs://cohere-dev/vlad/rl2_cp/wm # Same run name as log_dir; latest Orbax <update>/ checkpoint and config.json
+ckpt_dir: ${checkpoint_dir}/${run_id}
 checkpoint_every: 500 # Optimizer updates, plus the final checkpoint of each run
 video_every_steps: 5000000 # Every 10% of online training transitions; 0 disables online videos
 video_prefill_frames: 10 # Shared real context before the real/posterior/prior comparison

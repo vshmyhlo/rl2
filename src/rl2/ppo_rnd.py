@@ -40,7 +40,6 @@ type PPOMetrics = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, j
 
 @dataclass(frozen=True)
 class Config(BaseConfig):
-    ckpt_dir: str = field(default="${log_dir}/${run_id}", kw_only=True)
     env_id: str
     frame_stack: bool
     atari_preprocessing: bool
@@ -486,7 +485,6 @@ def update(state: TrainState, batch: PPOBatch, config: Config) -> tuple[TrainSta
 
 
 def train(config: Config) -> TrainState:
-    config = config.resolve_run()
     configure_compilation_cache()
     batch_size = config.num_envs * config.num_steps
     if config.eval_every_minutes:
