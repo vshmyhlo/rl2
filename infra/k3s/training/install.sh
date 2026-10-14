@@ -29,5 +29,6 @@ systemctl enable rl2-buildkit
 systemctl restart rl2-buildkit
 k3s kubectl apply -f "$training_dir/priorities.yaml"
 k3s kubectl apply -f "$training_dir/storage.yaml"
+k3s kubectl apply -f "$training_dir/headlamp-access.yaml"
 systemctl enable --now rl2-image-pins.timer
 systemctl start rl2-image-pins.service
