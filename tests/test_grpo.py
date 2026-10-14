@@ -10,6 +10,7 @@ import optax
 import pytest
 from flax import serialization
 from flax.training.train_state import TrainState
+from pydantic import ValidationError
 
 from rl2 import karel
 from rl2 import train_karel_ast_grpo as grpo
@@ -265,7 +266,7 @@ def test_invalid_bucket_sizes(required: int, capacity: int) -> None:
 
 @pytest.mark.parametrize("value", [0, 1, "true", None])
 def test_invalid_compile_logging_flag(config: Config, value: object) -> None:
-    with pytest.raises(TypeError, match="log_compiles must be a boolean"):
+    with pytest.raises(ValidationError, match="log_compiles"):
         replace(config, log_compiles=value)
 
 
@@ -418,7 +419,7 @@ def test_padding_and_rejected_kl_do_not_update_state(config: Config, state: Trai
 
 @pytest.mark.parametrize("interval", [0, -1, 1.5, True])
 def test_invalid_log_interval(config: Config, interval: float | bool) -> None:
-    with pytest.raises((AssertionError, TypeError)):
+    with pytest.raises(ValidationError):
         replace(config, log_interval=interval)
 
 

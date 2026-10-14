@@ -1,8 +1,10 @@
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from omegaconf.errors import OmegaConfBaseException
 
+from rl2 import configuration
 from rl2.configuration import load_settings, resolve_settings
 
 
@@ -41,6 +43,27 @@ def test_load_settings_resolves_defaults_and_generated_run_id(tmp_path: Path, en
     assert isinstance(config["batch_size"], int)
     assert config["run_id"].startswith("ALE_Boxing-v5_seed7_")
     assert config["log_dir"] == f"logs/{config['run_id']}"
+
+
+def test_load_remote_settings_with_custom_run_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    read = Mock(return_value=b"run_id: null\nckpt_dir: gs://bucket/${run_id}\n")
+    monkeypatch.setattr(configuration, "read_bytes", read)
+    config = load_settings("gs://bucket/config.yaml", run_id_prefix="grpo_reasoning")
+    read.assert_called_once_with("gs://bucket/config.yaml")
+    assert config["run_id"].startswith("grpo_reasoning_")
+    assert config["ckpt_dir"] == f"gs://bucket/{config['run_id']}"
+
+
+@pytest.mark.parametrize("settings", [{"env_id": "test"}, {"env": {}, "run_id": None}])
+def test_resolution_without_generated_run_id(settings: dict[str, object]) -> None:
+    assert resolve_settings(settings, generate_run_id=False) == settings
+
+
+def test_load_settings_rejects_non_mapping(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("- seed: 1\n")
+    with pytest.raises(TypeError, match="mapping"):
+        load_settings(path)
 
 
 def test_progress_logging_presets() -> None:

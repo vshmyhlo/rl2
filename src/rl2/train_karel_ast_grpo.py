@@ -12,12 +12,12 @@ for one forward/backward pass, then clips gradients and applies one update.
 import argparse
 import json
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, field, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from time import monotonic
-from typing import Any, NamedTuple
+from typing import Annotated, Any, NamedTuple
 
 import chex
 import jax
@@ -28,10 +28,13 @@ import yaml
 from flax import serialization
 from flax.training.train_state import TrainState
 from numpy.typing import NDArray
+from pydantic import ConfigDict, Field
+from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
 from rl2.ast_transformer import ASTTransformer
 from rl2.attention import AttentionType
+from rl2.configuration import load_settings
 from rl2.jax_cache import configure_compilation_cache
 from rl2.karel import ACTIONS, REWARD_COMPONENTS, TASK_CATEGORIES, TOKEN_TO_ID, KarelConfig, KarelPair, KarelProgramEnv
 from rl2.karel_ast import AST_ACTIONS, ASTFeatures, KarelAST, batch_features
@@ -42,83 +45,53 @@ type Grids = Array
 type Metrics = tuple[jax.Array, jax.Array, jax.Array, jax.Array]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
 class Config:
-    seed: int = 1
-    total_updates: int = 1000  # Number of rollout batches, independent of program length.
-    num_tasks: int = 8
-    group_size: int = 8
-    num_minibatches: int = 4
-    update_epochs: int = 2
-    d_model: int = 320
-    num_layers: int = 7
-    max_nodes: int = 128
-    max_depth: int = 64
-    num_heads: int = 5
-    num_kv_heads: int | None = None
+    seed: Annotated[int, Field(ge=0)] = 1
+    total_updates: Annotated[int, Field(gt=0)] = 1000  # Number of rollout batches, independent of program length.
+    num_tasks: Annotated[int, Field(gt=0)] = 8
+    group_size: Annotated[int, Field(ge=2)] = 8
+    num_minibatches: Annotated[int, Field(gt=0)] = 4
+    update_epochs: Annotated[int, Field(gt=0)] = 2
+    d_model: Annotated[int, Field(gt=0)] = 320
+    num_layers: Annotated[int, Field(gt=0)] = 7
+    max_nodes: Annotated[int, Field(gt=0)] = 128
+    max_depth: Annotated[int, Field(ge=0)] = 64
+    num_heads: Annotated[int, Field(gt=0)] = 5
+    num_kv_heads: Annotated[int, Field(gt=0)] | None = None
     bf16: bool = False
     attention_implementation: AttentionType = "xla"
-    learning_rate: float = 0.00025
+    learning_rate: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 0.00025
     anneal_lr: bool = True
-    clip_coef: float = 0.2
-    target_kl: float | None = 0.02
-    entropy_coef: float = 0.0
-    max_grad_norm: float = 0.5
+    clip_coef: Annotated[float, Field(gt=0, lt=1, allow_inf_nan=False)] = 0.2
+    target_kl: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None = 0.02
+    entropy_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
+    max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 0.5
     log_dir: str = "runs"
     run_id: str | None = None  # Same ID resumes; None creates a timestamped run.
-    checkpoint_interval_seconds: float = 300.0  # Save at the next completed rollout boundary.
-    log_interval: int = 20  # TensorBoard scalars, stdout, and flushes every N completed rollouts.
-    log_program_interval: int = 20  # Program samples on logging iterations divisible by this interval.
-    log_program_count: int = 8  # First N programs in one group; zero disables samples.
+    checkpoint_interval_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] = (
+        300.0  # Save at the next completed rollout boundary.
+    )
+    log_interval: Annotated[int, Field(gt=0)] = (
+        20  # TensorBoard scalars, stdout, and flushes every N completed rollouts.
+    )
+    log_program_interval: Annotated[int, Field(gt=0)] = (
+        20  # Program samples on logging iterations divisible by this interval.
+    )
+    log_program_count: Annotated[int, Field(ge=0)] = 8  # First N programs in one group; zero disables samples.
     log_compiles: bool = False  # Print bucket shapes on new prediction/update JIT traces.
     env: KarelConfig = field(default_factory=KarelConfig)
 
     def __post_init__(self) -> None:
-        if self.run_id is not None:
-            if not isinstance(self.run_id, str):
-                raise TypeError("run_id must be a string or null")
-            if not self.run_id.strip() or self.run_id in (".", "..") or any(c in self.run_id for c in "/\\"):
-                raise ValueError("run_id must be a nonempty directory name, without slashes or traversal")
-        chex.assert_scalar_positive(self.checkpoint_interval_seconds)
-        if not np.isfinite(self.checkpoint_interval_seconds):
-            raise ValueError("checkpoint_interval_seconds must be finite")
-        KarelAST.empty(self.max_nodes, self.max_depth, self.env.max_program_tokens)
-        if type(self.bf16) is not bool:
-            raise TypeError("bf16 must be a boolean")
-        if type(self.log_compiles) is not bool:
-            raise TypeError("log_compiles must be a boolean")
-        if self.attention_implementation not in ("xla", "cudnn"):
-            raise ValueError("attention_implementation must be 'xla' or 'cudnn'")
+        if self.run_id is not None and (
+            not self.run_id.strip() or self.run_id in (".", "..") or any(c in self.run_id for c in "/\\")
+        ):
+            raise ValueError("run_id must be a nonempty directory name without slashes or traversal")
         if self.attention_implementation == "cudnn" and not self.bf16:
             raise ValueError("cuDNN attention requires bf16=True")
-        for value in (self.log_interval, self.log_program_interval, self.log_program_count):
-            if type(value) is not int:
-                raise TypeError("Logging settings must be integers")
-        chex.assert_scalar_positive(self.log_interval)
-        chex.assert_scalar_positive(self.log_program_interval)
-        chex.assert_scalar_non_negative(self.log_program_count)
-        for value in (self.total_updates, self.num_tasks, self.group_size, self.num_minibatches, self.update_epochs):
-            if type(value) is not int:
-                raise TypeError("Rollout and update counts must be integers")
-            chex.assert_scalar_positive(value)
-        if self.group_size < 2:
-            raise ValueError("GRPO requires group_size >= 2")
         if self.num_tasks * self.group_size % self.num_minibatches:
             raise ValueError("num_minibatches must divide num_tasks * group_size")
-        chex.assert_type(self.seed, int)
-        chex.assert_scalar_non_negative(self.seed)
-        chex.assert_scalar_in(self.clip_coef, 0, 1, included=False)
-        for value in (self.learning_rate, self.max_grad_norm):
-            chex.assert_scalar_positive(value)
-            if not np.isfinite(value):
-                raise ValueError("Optimizer settings must be finite")
-        chex.assert_scalar_non_negative(self.entropy_coef)
-        if not np.isfinite(self.entropy_coef):
-            raise ValueError("entropy_coef must be finite")
-        if self.target_kl is not None:
-            chex.assert_scalar_positive(self.target_kl)
-            if not np.isfinite(self.target_kl):
-                raise ValueError("target_kl must be finite or null")
+        KarelAST.empty(self.max_nodes, self.max_depth, self.env.max_program_tokens)
 
     @property
     def max_rounds(self) -> int:
@@ -260,7 +233,7 @@ def _restore_checkpoint(data: bytes, state: TrainState, rng: np.random.Generator
 
 
 def load_config(path: str | Path) -> Config:
-    settings = yaml.safe_load(read_bytes(str(path))) or {}
+    settings = load_settings(path, asdict(Config()), generate_run_id=False)
     # Ignore the removed reference-KL setting in older saved run configs.
     settings.pop("kl_coef", None)
     # Saved run configs may still contain the retired gradient-accumulation knob.

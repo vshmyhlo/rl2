@@ -9,8 +9,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import reasoning_gym
+import yaml
 from flax import serialization
 from gemma_helpers import tiny_gemma_model
+from pydantic import ValidationError
 
 from rl2 import train_grpo_reasoning as grpo
 from rl2.gemma3 import Gemma3LM, Parameters
@@ -554,10 +556,10 @@ def test_yaml_config(tmp_path: Path) -> None:
     assert default_config.run_id.startswith("grpo_reasoning_")
     assert default_config.ckpt_dir == f"runs/grpo_reasoning/{default_config.run_id}"
     path.write_text("group_size: 2.5\n")
-    with pytest.raises(ValueError, match="type for group_size"):
+    with pytest.raises(ValueError, match="group_size"):
         grpo.load_config(path)
     path.write_text("unknown: 1\n")
-    with pytest.raises(ValueError, match="Unknown config"):
+    with pytest.raises(ValueError, match="unknown"):
         grpo.load_config(path)
 
 
@@ -573,17 +575,15 @@ def test_checkpoint_directory_interpolation(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "example,match",
     [
-        ({"question": "q"}, "question and completion"),
-        ({"question": "q", "completion": 8}, "question and completion"),
+        ({"question": "q"}, "completion"),
+        ({"question": "q", "completion": 8}, "completion"),
         ({"question": "q", "completion": "8"}, "<answer>"),
     ],
 )
 def test_invalid_prompt_examples(example: dict[str, Any], match: str, tmp_path: Path) -> None:
-    import yaml
-
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump({"prompt_examples": [example]}))
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(ValidationError, match=match):
         grpo.load_config(path)
 
 

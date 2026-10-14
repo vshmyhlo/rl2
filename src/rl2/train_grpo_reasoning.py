@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import argparse
-import math
 import re
 from collections import deque
 from collections.abc import Sequence
 from contextlib import closing
-from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, datetime
+from dataclasses import asdict, field, replace
 from functools import partial
 from pathlib import Path
 from time import monotonic
-from typing import Any, Literal, NamedTuple, Protocol
+from typing import Annotated, Any, Literal, NamedTuple, Protocol
 
 import chex
 import jax
@@ -26,11 +24,13 @@ import yaml
 from flax import serialization
 from flax.training.train_state import TrainState
 from gemma import gm
+from pydantic import ConfigDict, Field
+from pydantic.dataclasses import dataclass
 from reasoning_gym.dataset import ProceduralDataset
 from reasoning_gym.utils import extract_answer
 
 from rl2.calculator import calculate
-from rl2.configuration import resolve_settings
+from rl2.configuration import load_settings, resolve_settings
 from rl2.gemma3 import (
     Gemma3Carry,
     Gemma3LM,
@@ -41,7 +41,7 @@ from rl2.gemma3 import (
 )
 from rl2.jax_cache import configure_compilation_cache
 from rl2.mlflow_logging import MLflowLogger
-from rl2.utils import read_bytes, read_optional, write_bytes
+from rl2.utils import read_optional, write_bytes
 
 type Entry = dict[str, Any]
 type Metrics = dict[str, jax.Array]
@@ -56,13 +56,17 @@ class Tokenizer(Protocol):
     def decode(self, ids: list[int]) -> str: ...
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class PromptExample:
-    question: str
-    completion: str
+    question: Annotated[str, Field(strict=True, pattern=r"\S")]
+    completion: Annotated[str, Field(strict=True, pattern=r"\S")]
+
+    def __post_init__(self) -> None:
+        if extract_answer(self.completion) is None:
+            raise ValueError("Each prompt example completion must contain <answer>...</answer>")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
 class Config:
     checkpoint: str = "gs://gemma-data/checkpoints/gemma3-270m-it"
     tokenizer: str | None = None
@@ -70,61 +74,30 @@ class Config:
     task: str = "leg_counting"
     task_config: dict[str, Any] = field(default_factory=dict)
     prompt_examples: list[PromptExample] = field(default_factory=list)
-    seed: int = 1
-    total_updates: int = 1000
-    num_tasks: int = 2
-    group_size: int = 4
-    num_minibatches: int = 8
-    update_epochs: int = 1
-    max_prompt_tokens: int = 256
-    max_new_tokens: int = 128
-    calculator_max_calls: int = 0
-    temperature: float = 1.0
-    learning_rate: float = 1e-6
-    clip_coef: float = 0.2
-    beta: float = 0.01
-    duration_penalty_coef: float = 0.0
-    max_grad_norm: float = 1.0
+    seed: Annotated[int, Field(ge=0, lt=2**32)] = 1
+    total_updates: Annotated[int, Field(gt=0)] = 1000
+    num_tasks: Annotated[int, Field(gt=0)] = 2
+    group_size: Annotated[int, Field(ge=2)] = 4
+    num_minibatches: Annotated[int, Field(gt=0)] = 8
+    update_epochs: Annotated[int, Field(gt=0)] = 1
+    max_prompt_tokens: Annotated[int, Field(gt=0)] = 256
+    max_new_tokens: Annotated[int, Field(gt=0)] = 128
+    calculator_max_calls: Annotated[int, Field(ge=0)] = 0
+    temperature: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1.0
+    learning_rate: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1e-6
+    clip_coef: Annotated[float, Field(gt=0, lt=1, allow_inf_nan=False)] = 0.2
+    beta: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.01
+    duration_penalty_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
+    max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1.0
     ckpt_dir: str = "runs/grpo_reasoning/${run_id}"
     run_id: str | None = None
-    log_interval: int = 10
-    log_completion_count: int = 4
-    checkpoint_interval_seconds: float = 600.0
+    log_interval: Annotated[int, Field(gt=0)] = 10
+    log_completion_count: Annotated[int, Field(ge=2, le=4)] = 4
+    checkpoint_interval_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 600.0
 
     def __post_init__(self) -> None:
-        for name in (
-            "total_updates",
-            "num_tasks",
-            "group_size",
-            "num_minibatches",
-            "update_epochs",
-            "max_prompt_tokens",
-            "max_new_tokens",
-            "log_interval",
-        ):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be positive")
-        if self.group_size < 2:
-            raise ValueError("GRPO requires group_size >= 2")
-        if self.calculator_max_calls < 0:
-            raise ValueError("calculator_max_calls must be nonnegative")
-        if not 2 <= self.log_completion_count <= 4:
-            raise ValueError("log_completion_count must be between 2 and 4")
         if self.num_tasks * self.group_size % self.num_minibatches:
             raise ValueError("num_minibatches must divide num_tasks * group_size")
-        if not 0 <= self.seed < 2**32:
-            raise ValueError("seed must be between 0 and 2**32 - 1")
-        for name in ("temperature", "learning_rate", "max_grad_norm", "checkpoint_interval_seconds"):
-            if not 0 < getattr(self, name) < math.inf:
-                raise ValueError(f"{name} must be positive and finite")
-        if not 0 < self.clip_coef < 1:
-            raise ValueError("clip_coef must be between 0 and 1")
-        if not 0 <= self.beta < math.inf:
-            raise ValueError("beta must be finite and nonnegative")
-        if not 0 <= self.duration_penalty_coef < math.inf:
-            raise ValueError("duration_penalty_coef must be finite and nonnegative")
-        if self.dtype not in ("float32", "bfloat16"):
-            raise ValueError("dtype must be float32/bfloat16")
         if self.max_prompt_tokens + self.max_new_tokens > 32768:
             raise ValueError("Prompt + completion budget must fit the 32768-token context")
         if {"seed", "size"} & self.task_config.keys():
@@ -136,43 +109,12 @@ class Config:
 
 
 def resolve_config(config: Config) -> Config:
-    settings = resolve_settings(
-        asdict(config) | {"run_id": config.run_id or f"grpo_reasoning_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"}
-    )
+    settings = resolve_settings(asdict(config), run_id_prefix="grpo_reasoning")
     return replace(config, run_id=settings["run_id"], ckpt_dir=settings["ckpt_dir"])
 
 
 def load_config(path: str | Path) -> Config:
-    """Validate untyped YAML values at the configuration boundary."""
-    values = yaml.safe_load(read_bytes(str(path)))
-    if not isinstance(values, dict):
-        raise TypeError("Config must be a YAML mapping")
-    defaults = asdict(Config())
-    for name, value in values.items():
-        if name not in defaults:
-            raise ValueError(f"Unknown config option: {name}")
-        default = defaults[name]
-        if name in ("tokenizer", "run_id"):
-            valid = value is None or isinstance(value, str)
-        elif isinstance(default, float):
-            valid = type(value) in (int, float)
-        else:
-            valid = type(value) is type(default)
-        if not valid:
-            raise ValueError(f"Invalid type for {name}")
-    if "prompt_examples" in values:
-        examples = values["prompt_examples"]
-        for example in examples:
-            if (
-                not isinstance(example, dict)
-                or set(example) != {"question", "completion"}
-                or any(not isinstance(text, str) or not text.strip() for text in example.values())
-            ):
-                raise ValueError("Each prompt example must contain nonempty question and completion strings")
-            if extract_answer(example["completion"]) is None:
-                raise ValueError("Each prompt example completion must contain <answer>...</answer>")
-        values["prompt_examples"] = [PromptExample(**example) for example in examples]
-    return resolve_config(Config(**values))
+    return Config(**load_settings(path, asdict(Config()), run_id_prefix="grpo_reasoning"))
 
 
 class GRPOBatch(NamedTuple):

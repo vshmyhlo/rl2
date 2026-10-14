@@ -15,6 +15,7 @@ import pytest
 import yaml
 from flax.training.train_state import TrainState
 from numpy.typing import NDArray
+from pydantic import ValidationError
 
 from rl2 import train_wm
 from rl2.model.encoders.rgb import ConvStage
@@ -434,7 +435,7 @@ def test_config_requires_all_training_settings(tmp_path: Path) -> None:
     del settings["learning_rate"]
     path = tmp_path / "incomplete.yaml"
     path.write_text(yaml.safe_dump(settings))
-    with pytest.raises(TypeError, match="learning_rate"):
+    with pytest.raises(ValidationError, match="learning_rate"):
         train_wm.load_config(path)
 
 

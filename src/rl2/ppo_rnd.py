@@ -6,12 +6,12 @@ intrinsic return continues across resets while recurrent memory still resets.
 
 import argparse
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from time import monotonic
-from typing import Any, SupportsFloat
+from typing import Annotated, Any, Literal, SupportsFloat
 
 import ale_py
 import chex
@@ -24,9 +24,12 @@ import yaml
 from flax import linen as nn
 from flax.training.train_state import TrainState
 from numpy.typing import NDArray
+from pydantic import ConfigDict, Field
+from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
 from rl2 import atari_eval
+from rl2.configuration import load_settings
 from rl2.jax_cache import configure_compilation_cache
 from rl2.multi_atari import register_envs
 from rl2.utils import RunningMeanStd, gae
@@ -37,52 +40,57 @@ type PPOBatch = tuple[Array, Array, Array, Array, Array, LSTMCarry, Array]
 type PPOMetrics = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
 class Config:
     env_id: str
     frame_stack: bool
     atari_preprocessing: bool
     seed: int
     total_steps: int
-    num_envs: int
-    vector_env: str
-    num_steps: int
-    num_minibatches: int
-    update_epochs: int
-    lstm_hidden_size: int
+    num_envs: Annotated[int, Field(gt=0)]
+    vector_env: Literal["sync", "async"]
+    num_steps: Annotated[int, Field(gt=0)]
+    num_minibatches: Annotated[int, Field(gt=0)]
+    update_epochs: Annotated[int, Field(gt=0)]
+    lstm_hidden_size: Annotated[int, Field(gt=0)]
     learning_rate: float
     anneal_lr: bool
     gamma: float
     gae_lambda: float
     clip_coef: float
-    target_kl: float | None
+    target_kl: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None
     entropy_coef: float
     value_coef: float
     max_grad_norm: float
     log_dir: str
-    video_every_episodes: int
-    video_speed: float
+    video_every_episodes: Annotated[int, Field(ge=0)]
+    video_speed: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     bf16: bool = True
-    video_max_frames: int | None = 900
+    video_max_frames: Annotated[int, Field(gt=0)] | None = 900
     observation_size: int | None = None
-    eval_every_minutes: float = 0.0
+    eval_every_minutes: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
     eval_episodes: int = 100
     eval_seed: int = 10_000
-    intrinsic_gamma: float = 0.99
-    extrinsic_coef: float = 2.0
-    intrinsic_coef: float = 1.0
-    rnd_learning_rate: float = 0.0001
-    rnd_update_fraction: float = 0.25
-    rnd_warmup_steps: int = 128
-    rnd_update_epochs: int = 4
-    encoder_channels: tuple[int, ...] = (128, 256, 384, 512)
-    embedding_size: int = 768
+    intrinsic_gamma: Annotated[float, Field(ge=0, lt=1, allow_inf_nan=False)] = 0.99
+    extrinsic_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 2.0
+    intrinsic_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 1.0
+    rnd_learning_rate: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 0.0001
+    rnd_update_fraction: Annotated[float, Field(gt=0, le=1, allow_inf_nan=False)] = 0.25
+    rnd_warmup_steps: Annotated[int, Field(ge=0)] = 128
+    rnd_update_epochs: Annotated[int, Field(gt=0)] = 4
+    encoder_channels: Annotated[tuple[Annotated[int, Field(gt=0)], ...], Field(min_length=1)] = (128, 256, 384, 512)
+    embedding_size: Annotated[int, Field(gt=0)] = 768
     run_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.num_envs % self.num_minibatches:
+            raise ValueError("num_envs must be divisible by num_minibatches to preserve sequences")
+        if self.total_steps < self.num_envs * self.num_steps:
+            raise ValueError("total_steps must cover at least one rollout")
 
 
 def load_config(path: str | Path) -> Config:
-    with open(path) as file:
-        settings = yaml.safe_load(file)
+    settings = load_settings(path)
     if "encoder_channels" in settings:
         # Config is a static JIT argument, so YAML sequences must be hashable.
         settings["encoder_channels"] = tuple(settings["encoder_channels"])
@@ -490,51 +498,6 @@ def update(state: TrainState, batch: PPOBatch, config: Config) -> tuple[TrainSta
 def train(config: Config) -> TrainState:
     configure_compilation_cache()
     batch_size = config.num_envs * config.num_steps
-    if min(config.num_envs, config.num_steps, config.num_minibatches, config.update_epochs) < 1:
-        raise ValueError("Environment, rollout, minibatch, and epoch counts must be positive")
-    if config.num_envs % config.num_minibatches:
-        raise ValueError("num_envs must be divisible by num_minibatches to preserve sequences")
-    if config.lstm_hidden_size < 1:
-        raise ValueError("lstm_hidden_size must be positive")
-    if not config.encoder_channels or any(type(width) is not int or width < 1 for width in config.encoder_channels):
-        raise ValueError("encoder_channels must contain positive integers")
-    if type(config.embedding_size) is not int or config.embedding_size < 1:
-        raise ValueError("embedding_size must be a positive integer")
-    if config.total_steps < batch_size:
-        raise ValueError("total_steps must cover at least one rollout")
-    if config.video_max_frames is not None and (
-        type(config.video_max_frames) is not int or config.video_max_frames < 1
-    ):
-        raise ValueError("video_max_frames must be a positive integer or null for a full episode")
-    if config.video_every_episodes < 0:
-        raise ValueError("video_every_episodes must be nonnegative (0 disables videos)")
-    if not np.isfinite(config.video_speed) or config.video_speed <= 0:
-        raise ValueError("video_speed must be positive and finite")
-    if config.vector_env not in ("sync", "async"):
-        raise ValueError("vector_env must be 'sync' or 'async'")
-    if config.target_kl is not None and (not np.isfinite(config.target_kl) or config.target_kl <= 0):
-        raise ValueError("target_kl must be positive and finite, or null to disable stopping")
-    if not np.isfinite(config.intrinsic_gamma) or not 0 <= config.intrinsic_gamma < 1:
-        raise ValueError("intrinsic_gamma must be finite and in [0, 1)")
-    for name in ("extrinsic_coef", "intrinsic_coef"):
-        coefficient = getattr(config, name)
-        if not np.isfinite(coefficient) or coefficient < 0:
-            raise ValueError(f"{name} must be finite and nonnegative")
-    if not np.isfinite(config.rnd_learning_rate) or config.rnd_learning_rate <= 0:
-        raise ValueError("rnd_learning_rate must be positive and finite")
-    if not np.isfinite(config.rnd_update_fraction) or not 0 < config.rnd_update_fraction <= 1:
-        raise ValueError("rnd_update_fraction must be in (0, 1]")
-    if type(config.rnd_warmup_steps) is not int or config.rnd_warmup_steps < 0:
-        raise ValueError("rnd_warmup_steps must be a nonnegative integer")
-    if type(config.rnd_update_epochs) is not int or config.rnd_update_epochs < 1:
-        raise ValueError("rnd_update_epochs must be a positive integer")
-
-    if (
-        type(config.eval_every_minutes) not in (int, float)
-        or not np.isfinite(config.eval_every_minutes)
-        or config.eval_every_minutes < 0
-    ):
-        raise ValueError("eval_every_minutes must be finite and nonnegative (0 disables evaluation)")
     if config.eval_every_minutes:
         atari_eval.EvaluationConfig(episodes=config.eval_episodes, seed=config.eval_seed)
         atari_eval.validate_training_config(config)

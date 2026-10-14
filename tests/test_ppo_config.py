@@ -1,8 +1,5 @@
-import builtins
 from dataclasses import asdict
 from pathlib import Path
-from types import ModuleType
-from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -191,7 +188,12 @@ def test_craftax_preset_uses_symbolic_encoder() -> None:
 
 @pytest.mark.parametrize(
     "env_id,encoder,expected",
-    [("Craftax-Symbolic-v1", "rgb", "craftax"), ("Craftax-Pixels-v1", "mlp", "rgb")],
+    [
+        ("Craftax-Symbolic-v1", "rgb", "craftax"),
+        ("Craftax-Symbolic-v1", "mlp", "craftax"),
+        ("Craftax-Pixels-v1", "mlp", "rgb"),
+        ("Craftax-Pixels-v1", "craftax", "rgb"),
+    ],
 )
 def test_craftax_rejects_mismatched_encoder(env_id: str, encoder: str, expected: str) -> None:
     settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml"))
@@ -201,6 +203,12 @@ def test_craftax_rejects_mismatched_encoder(env_id: str, encoder: str, expected:
         Config(**settings)
     settings["model"]["encoder"] = {"type": expected}
     assert Config(**settings).model.encoder.type == expected
+
+
+@pytest.mark.parametrize("settings", [{"channels": 0}, {"blocks": -1}])
+def test_craftax_encoder_rejects_invalid_sizes(settings: dict[str, int]) -> None:
+    with pytest.raises(ValidationError):
+        ppo.CraftaxEncoderConfig(**settings)
 
 
 @pytest.mark.parametrize(
@@ -258,18 +266,11 @@ def test_environment_round_trip_and_factory(
     constructor.assert_called_once_with(config.env.id if isinstance(config.env, ppo.GymnaxConfig) else config.env)
 
 
-def test_craftax_missing_dependency(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml")
-    original_import = builtins.__import__
-
-    def without_dependency(module: str, *args: Any, **kwargs: Any) -> ModuleType:
-        if module.split(".")[0] == "craftax":
-            raise ModuleNotFoundError(name="craftax")
-        return original_import(module, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", without_dependency)
-    with pytest.raises(ImportError, match="uv sync --extra craftax"):
-        ppo.make_env(config)
+def test_craftax_encoder_requires_symbolic_environment() -> None:
+    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml"))
+    settings["env"] = {"id": "Breakout-MinAtar"}
+    with pytest.raises(ValidationError, match="craftax encoder requires symbolic Craftax"):
+        Config(**settings)
 
 
 @pytest.mark.parametrize(

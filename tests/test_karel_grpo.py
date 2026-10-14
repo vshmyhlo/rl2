@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 from flax import serialization
 from flax.training.train_state import TrainState
+from pydantic import ValidationError
 
 from rl2 import karel
 from rl2 import train_karel_grpo as grpo
@@ -262,7 +263,7 @@ def test_invalid_config(config: grpo.Config, settings: dict[str, Any]) -> None:
 
 @pytest.mark.parametrize("workers", [True, 1.5, "2"])
 def test_sampling_workers_require_integer(config: grpo.Config, workers: object) -> None:
-    with pytest.raises(TypeError, match="sampling_workers"):
+    with pytest.raises(ValidationError, match="sampling_workers"):
         replace(config, sampling_workers=workers)
 
 

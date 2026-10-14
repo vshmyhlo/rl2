@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import yaml
 from flax.training.train_state import TrainState
+from pydantic import ValidationError
 
 from rl2 import karel_ast_edit as editing
 from rl2 import train_karel_ast_ar_edit as edit
@@ -163,7 +164,7 @@ def test_collect_rollout_uses_fixed_task_pool(config: edit.Config, monkeypatch: 
 
 @pytest.mark.parametrize(
     "value,error",
-    [("0", ValueError), ("-1", ValueError), ("true", TypeError), ("1.5", TypeError)],
+    [("0", ValidationError), ("-1", ValidationError), ("true", ValidationError), ("1.5", ValidationError)],
     ids=["zero", "negative", "boolean", "fractional"],
 )
 def test_load_config_rejects_invalid_task_limit(tmp_path: Path, value: str, error: type[Exception]) -> None:
@@ -494,10 +495,10 @@ def test_config_and_checkpoint(config: edit.Config, state: TrainState, tmp_path:
     assert parsed.env.length_penalty_weight == 0.2
     assert parsed.env.execution_penalty_weight == 0.3
     for changes, error in (
-        ({"max_seq_len": 0}, AssertionError),
-        ({"max_seq_len": True}, TypeError),
-        ({"env_workers": -1}, AssertionError),
-        ({"env_workers": True}, TypeError),
+        ({"max_seq_len": 0}, ValidationError),
+        ({"max_seq_len": True}, ValidationError),
+        ({"env_workers": -1}, ValidationError),
+        ({"env_workers": True}, ValidationError),
         ({"max_seq_len": 5}, ValueError),
         ({"max_nodes": 3}, ValueError),
     ):
@@ -904,7 +905,7 @@ def test_load_config_stop_option(tmp_path: Path) -> None:
     path.write_text("{}\n")
     assert edit.load_config(path).allow_stop  # Existing saved configurations retain STOP.
     path.write_text('allow_stop: "false"\n')
-    with pytest.raises(TypeError, match="allow_stop must be a boolean"):
+    with pytest.raises(ValidationError, match="allow_stop"):
         edit.load_config(path)
 
 
@@ -916,7 +917,7 @@ def test_load_config_stop_option(tmp_path: Path) -> None:
         ({"num_minibatches": 3}, ValueError, "num_minibatches"),
         ({"attention_implementation": "cudnn", "bf16": False}, ValueError, "bf16"),
         ({"learning_rate": float("inf")}, ValueError, "finite"),
-        ({"log_interval": True}, TypeError, "Logging"),
+        ({"log_interval": True}, ValidationError, "log_interval"),
     ],
     ids=["run-path", "group-minimum", "minibatch-divisibility", "cudnn-dtype", "optimizer-finite", "logging-type"],
 )

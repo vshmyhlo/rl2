@@ -12,12 +12,12 @@ resets at episode boundaries. No policy is learned.
 import argparse
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from time import monotonic
-from typing import Literal
+from typing import Annotated, Literal
 
 # Use gcsfs for gs:// checkpoints without importing TensorFlow through epath.
 os.environ.setdefault("EPATH_USE_TF", "0")
@@ -35,9 +35,12 @@ from flax import struct
 from flax.training.train_state import TrainState
 from google.cloud import storage
 from numpy.typing import NDArray
+from pydantic import ConfigDict, Field
+from pydantic.dataclasses import dataclass
 from tensorboardX import SummaryWriter
 
 from rl2.atari_env import make_env
+from rl2.configuration import load_settings
 from rl2.jax_cache import configure_compilation_cache
 from rl2.model.encoders.rgb import ConvStage, ConvStages, validate_stages
 from rl2.wm import (
@@ -53,110 +56,61 @@ from rl2.wm import (
 ObservationLoss = Literal["l1", "l2", "charbonnier"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
 class Config:
     env_id: str
-    observation_size: int | None
+    observation_size: Annotated[int, Field(gt=0)] | None
     frame_stack: bool
     atari_preprocessing: bool
     grayscale_obs: bool
-    seed: int
-    total_steps: int
-    num_envs: int
-    vector_env: str
-    num_steps: int
-    d_model: int
-    num_layers: int
-    d_intermediate: int | None
+    seed: Annotated[int, Field(ge=0, lt=2**32)]
+    total_steps: Annotated[int, Field(gt=0)]
+    num_envs: Annotated[int, Field(gt=0)]
+    vector_env: Literal["sync", "async"]
+    num_steps: Annotated[int, Field(gt=0)]
+    d_model: Annotated[int, Field(gt=0)]
+    num_layers: Annotated[int, Field(gt=0)]
+    d_intermediate: Annotated[int, Field(ge=0)] | None
     encoder_stages: ConvStages
     d_state: int
     headdim: int
-    stochastic_size: int
-    stochastic_classes: int
-    unimix: float
-    dynamics_kl_scale: float
-    representation_kl_scale: float
-    free_nats: float
-    learning_rate: float
-    max_grad_norm: float
+    stochastic_size: Annotated[int, Field(gt=0)]
+    stochastic_classes: Annotated[int, Field(ge=2)]
+    unimix: Annotated[float, Field(ge=0, lt=1, allow_inf_nan=False)]
+    dynamics_kl_scale: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    representation_kl_scale: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    free_nats: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    learning_rate: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     log_dir: str
-    log_every: int
-    log_flush_secs: int
+    log_every: Annotated[int, Field(gt=0)]
+    log_flush_secs: Annotated[int, Field(gt=0)]
     checkpoint_dir: str
-    checkpoint_every: int
-    video_every_steps: int
-    video_num_steps: int
-    video_prefill_frames: int
-    video_fps: float
+    checkpoint_every: Annotated[int, Field(gt=0)]
+    video_every_steps: Annotated[int, Field(ge=0)]
+    video_num_steps: Annotated[int, Field(gt=0)]
+    video_prefill_frames: Annotated[int, Field(gt=0)]
+    video_fps: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     bf16: bool = True
     observation_loss: ObservationLoss = "l2"
     charbonnier_epsilon: float = 1e-3
     model: Literal["mamba", "lstm"] = "mamba"
 
     def __post_init__(self) -> None:
-        for value in (
-            self.total_steps,
-            self.num_envs,
-            self.num_steps,
-            self.d_model,
-            self.num_layers,
-            self.stochastic_size,
-            self.stochastic_classes,
-            self.log_every,
-            self.log_flush_secs,
-            self.checkpoint_every,
-            self.video_num_steps,
-            self.video_prefill_frames,
-        ):
-            chex.assert_type(value, int)
-            chex.assert_scalar_positive(value)
-        chex.assert_type(self.video_every_steps, int)
-        chex.assert_scalar_non_negative(self.video_every_steps)
         validate_observation_loss(self.observation_loss, self.charbonnier_epsilon)
-        if self.d_intermediate is not None:
-            chex.assert_type(self.d_intermediate, int)
-            chex.assert_scalar_non_negative(self.d_intermediate)
-        if self.stochastic_classes < 2:
-            raise ValueError("stochastic_classes must be at least two")
-        if not np.isfinite(self.unimix) or not 0 <= self.unimix < 1:
-            raise ValueError("unimix must be finite and in [0, 1)")
-        for value in (self.dynamics_kl_scale, self.representation_kl_scale, self.free_nats):
-            chex.assert_scalar_non_negative(value)
-            if not np.isfinite(value):
-                raise ValueError("KL scales and free_nats must be finite")
         validate_stages(self.encoder_stages)
-        if self.observation_size is not None:
-            chex.assert_type(self.observation_size, int)
-            chex.assert_scalar_positive(self.observation_size)
-        chex.assert_type((self.frame_stack, self.atari_preprocessing, self.grayscale_obs, self.bf16), bool)
-        if self.vector_env not in ("sync", "async"):
-            raise ValueError("vector_env must be 'sync' or 'async'")
         chex.assert_is_divisible(self.total_steps, self.num_envs)
-        if self.model not in ("mamba", "lstm"):
-            raise ValueError("model must be 'mamba' or 'lstm'")
         if self.model == "mamba":
-            for value in (self.d_state, self.headdim):
-                chex.assert_type(value, int)
-                chex.assert_scalar_positive(value)
+            chex.assert_scalar_positive(self.headdim)
             chex.assert_is_divisible(2 * self.d_model, self.headdim)
             chex.assert_is_divisible(self.d_state, 2)
             if self.d_state < 4:
                 raise ValueError("d_state must be at least 4 for Mamba's default rotary fraction")
-        chex.assert_type(self.seed, int)
-        if not 0 <= self.seed < 2**32:
-            raise ValueError("seed must be in [0, 2**32)")
-        for value in (self.learning_rate, self.max_grad_norm, self.video_fps):
-            chex.assert_scalar_positive(value)
-            if not np.isfinite(value):
-                raise ValueError("learning_rate, max_grad_norm, and video_fps must be finite")
 
 
 def load_config(path: str | Path) -> Config:
     """Load world-model training settings from a YAML mapping."""
-    with open(path) as file:
-        settings = yaml.safe_load(file)
-    if not isinstance(settings, dict):
-        raise TypeError("The YAML config must contain a mapping of training settings")
+    settings = load_settings(path, generate_run_id=False)
     if "encoder_stages" in settings:
         settings["encoder_stages"] = tuple(ConvStage(**stage) for stage in settings["encoder_stages"])
     return Config(**settings)
