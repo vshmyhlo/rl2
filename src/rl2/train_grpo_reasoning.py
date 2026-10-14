@@ -88,6 +88,8 @@ class Config(BaseConfig):
     learning_rate: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1e-6
     clip_coef: Annotated[float, Field(gt=0, lt=1, allow_inf_nan=False)] = 0.2
     beta: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.01
+    allow_untagged_numeric: bool = False
+    format_reward_weight: Annotated[float, Field(ge=0, lt=1, allow_inf_nan=False)] = 0.0
     duration_penalty_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
     max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1.0
     log_interval: Annotated[int, Field(gt=0)] = 10
@@ -471,24 +473,55 @@ def update(
     return state.apply_gradients(grads=grads), metrics
 
 
+class CompletionScores(NamedTuple):
+    task: jax.Array  # (B,) Dataset correctness scores.
+    format: jax.Array  # (B,) One nonempty answer tag at the end of the response.
+
+
+def extract_numeric_answer(text: str) -> str | None:
+    """Accept a final numeric line, equation result, or explicit answer statement."""
+    if not text.strip() or "<" in text or ">" in text:
+        return None
+    number = r"[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+    prefix = r"(?:[0-9()+*/%×÷.\s-]+=\s*|(?:the\s+)?(?:final\s+)?answer(?:\s+is\s*:?|\s*:)\s*)?"
+    match = re.fullmatch(rf"{prefix}({number})[.!]?", text.strip().splitlines()[-1].strip(), re.IGNORECASE)
+    return match[1] if match else None
+
+
 def score_completions(
     dataset: ProceduralDataset,
     entries: list[Entry],
     texts: list[str],
     group_size: int,
-) -> jax.Array:
-    """Score the last answer tag; missing tags receive zero reward."""
+    *,
+    allow_untagged_numeric: bool = False,
+) -> CompletionScores:
+    """Return task and format scores, each (B,), excluding calculator exchanges."""
     if len(texts) != len(entries) * group_size:
         raise ValueError("Expected group_size completions per entry")
-    rewards = np.zeros(len(texts), np.float32)
+    rewards = np.zeros(len(texts), np.float32)  # (B,)
+    formats = np.zeros(len(texts), np.float32)  # (B,)
     for i, text in enumerate(texts):
+        # Only the response after the last tool exchange can supply the answer.
+        text = re.split(r"</(?:calculator|result)>", text)[-1]
+        if re.search(r"<(?:calculator|result)>", text):
+            continue
         answer = extract_answer(text)
+        formats[i] = bool(
+            answer
+            and "<" not in answer
+            and ">" not in answer
+            and text.count("<answer>") == text.count("</answer>") == 1
+            and text.rstrip().endswith("</answer>")
+        )
+        if answer is None and allow_untagged_numeric:
+            answer = extract_numeric_answer(text)
         if answer is not None:
             score = dataset.score_answer(answer=answer, entry=entries[i // group_size])
             if not 0 <= score <= 1:
                 raise ValueError(f"Task scorer returned invalid reward: {score}")
             rewards[i] = score
-    return jnp.asarray(rewards)
+    return CompletionScores(task=jnp.asarray(rewards), format=jnp.asarray(formats))  # each (B,)
 
 
 def apply_duration_penalty(
@@ -552,10 +585,18 @@ def collect_rollout(
     ]
     decoding_seconds = monotonic() - decoding_start
     scoring_start = monotonic()
-    task_rewards = score_completions(dataset, entries, texts, config.group_size)
+    scores = score_completions(
+        dataset, entries, texts, config.group_size, allow_untagged_numeric=config.allow_untagged_numeric
+    )  # each (B,)
     scoring_seconds = monotonic() - scoring_start
     processing_start = monotonic()
-    rewards, duration_penalties = apply_duration_penalty(task_rewards, mask, config.duration_penalty_coef)
+    task_rewards = scores.task  # (B,)
+    shaped_rewards = (
+        1 - config.format_reward_weight
+    ) * task_rewards + config.format_reward_weight * scores.format  # (B,)
+    rewards, duration_penalties = apply_duration_penalty(
+        shaped_rewards, mask, config.duration_penalty_coef
+    )  # each (B,)
     grouped = rewards.reshape(config.num_tasks, config.group_size)
     batch = GRPOBatch(
         prompts=jnp.repeat(prompts, config.group_size, axis=0),  # (B, P)
@@ -578,6 +619,8 @@ def collect_rollout(
         "charts/task_reward_mean": float(task_rewards.mean()),
         "charts/duration_penalty_mean": float(duration_penalties.mean()),
         "charts/success_rate": float((task_rewards == 1).mean()),
+        "charts/format_rate": float(scores.format.mean()),
+        "charts/formatted_success_rate": float(((task_rewards == 1) & (scores.format == 1)).mean()),
         "charts/informative_group_fraction": float((jnp.ptp(grouped, axis=1) > 0).mean()),
         "charts/completion_length_mean": float(mask.sum(axis=1).mean()),
         "charts/truncation_rate": float(
@@ -670,7 +713,7 @@ def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
     return ocp.CheckpointManager(
         directory,
         item_handlers={"state": ocp.StandardCheckpointHandler(), "metadata": ocp.JsonCheckpointHandler()},
-        options=ocp.CheckpointManagerOptions(max_to_keep=2),
+        options=ocp.CheckpointManagerOptions(max_to_keep=2, enable_async_checkpointing=False),
     )
 
 

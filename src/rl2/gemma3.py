@@ -13,6 +13,7 @@ from typing import Any, Literal, NamedTuple, cast
 import chex
 import jax
 import jax.numpy as jnp
+import orbax.checkpoint as ocp
 from flax import linen as nn
 from flax.linen.module import InterceptorContext
 from gemma import gm
@@ -296,4 +297,6 @@ class Gemma3Tokenizer:
 
 
 def save_gemma3_checkpoint(path: Path, params: Parameters) -> None:
-    gm.ckpts.save_params(params, path.resolve(), wait_until_finished=True)
+    # Keep Gemma's native format without Orbax's asynchronous signaling path.
+    with ocp.Checkpointer(ocp.StandardCheckpointHandler()) as checkpointer:
+        checkpointer.save(path.resolve(), args=ocp.args.StandardSave(params))

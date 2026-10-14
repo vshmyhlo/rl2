@@ -3,7 +3,7 @@ from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
 from typing import Any, SupportsFloat
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import chex
 import gymnasium as gym
@@ -243,8 +243,6 @@ def test_update_targets_losses_carry_and_learning(model_class: type[MambaWorldMo
         {"video_prefill_frames": -1},
         {"video_fps": 0},
         {"video_fps": float("inf")},
-        {"log_flush_secs": 0},
-        {"log_flush_secs": -1},
         {"encoder_stages": ()},
         {"num_layers": 0},
         {"model": "unknown"},
@@ -390,26 +388,24 @@ def test_video_orders_labeled_panels_and_uses_recorded_actions(monkeypatch: pyte
             actions,
             steps,
         )
-    call = writer.add_video.call_args
-    assert call.args[0] == "imagination/real_posterior_prior"
-    assert call.args[2] == 20
+    call = writer.log_video.call_args
+    assert call.args[1] == "imagination/20/real_posterior_prior.mp4"
     assert call.kwargs["fps"] == 12
-    assert writer.flush.call_count == 2
-    video = call.args[1]
-    chex.assert_shape(video, (1, 12, 3, 21, 252))
+    video = np.stack(call.args[0])  # (T, H, W, C)
+    chex.assert_shape(video, (12, 21, 252, 3))
     chex.assert_type(video, np.uint8)
     for panel, value in enumerate((0, 128, 255)):
-        pixels = video[0, 10:, :, 18:, panel * 84 : (panel + 1) * 84]
+        pixels = video[10:, 18:, panel * 84 : (panel + 1) * 84, :]
         np.testing.assert_array_equal(pixels, np.full_like(pixels, value))
-    np.testing.assert_array_equal(video[0, :10, :, 18:], 64)
-    scalar_values = {call.args[0]: call.args[1] for call in writer.add_scalar.call_args_list}
+    np.testing.assert_array_equal(video[:10, 18:], 64)
+    scalar_values = {tag: value for call in writer.log_metrics.call_args_list for tag, value in call.args[0].items()}
     # Half the stacked frames are identical across panels. MSE uses raw values
     # over the whole observation, excludes context, and precedes display clipping.
     assert scalar_values["diagnostics/posterior_mse"] == 2.25 / 2
     assert scalar_values["diagnostics/prior_mse"] == 9.0 / 2
     # The header visibly changes from shared context to the three panel labels.
-    assert video[0, 0, :, :18].any()
-    assert not np.array_equal(video[0, 0, :, :18], video[0, 10, :, :18])
+    assert video[0, :18].any()
+    assert not np.array_equal(video[0, :18], video[10, :18])
     for comparison_call in compare.call_args_list:
         np.testing.assert_array_equal(comparison_call.args[3], actions)
         assert comparison_call.args[4] == 10
@@ -479,14 +475,14 @@ def test_main_uses_default_atari_config(monkeypatch: pytest.MonkeyPatch) -> None
 
     def train(config: train_wm.Config) -> str:
         calls.append(config)
-        return config.log_dir
+        return config.ckpt_dir
 
     monkeypatch.setattr(train_wm, "train", train)
     train_wm.main()
     assert len(calls) == 1
     config = calls[0]
     assert config.run_id is not None
-    assert config.ckpt_dir == f"{config.checkpoint_dir}/{config.run_id}"
+    assert config.ckpt_dir == f"gs://cohere-dev/vlad/rl2_cp/wm/{config.run_id}"
     assert config.num_envs == 8 and config.vector_env == "async" and config.bf16
     schedule = train_wm.learning_rate_schedule(config)
     assert float(schedule(1000)) < float(schedule(0))
@@ -620,8 +616,6 @@ def test_training_loop_short_rollout_checkpoints_and_cleanup(
         vector_env="sync",
         video_every_steps=0,
         checkpoint_every=10,
-        log_dir=str(tmp_path / "logs"),
-        checkpoint_dir=str(tmp_path / "legacy-checkpoints"),
         ckpt_dir=str(tmp_path / "checkpoints" / "wm-run"),
         run_id="wm-run",
     )
@@ -637,8 +631,9 @@ def test_training_loop_short_rollout_checkpoints_and_cleanup(
     model.initial_carry.return_value = initial
     factory = Mock(return_value=model)
     monkeypatch.setattr(train_wm, "LSTMWorldModel" if model_name == "lstm" else "MambaWorldModel", factory)
-    writer = Mock()
-    monkeypatch.setattr(train_wm, "SummaryWriter", Mock(return_value=writer))
+    writer = MagicMock()
+    writer.__enter__.return_value = writer
+    monkeypatch.setattr(train_wm, "MLflowLogger", Mock(return_value=writer))
     save = Mock()
     monkeypatch.setattr(train_wm, "save_checkpoint", save)
     batches: list[train_wm.Batch] = []
@@ -684,14 +679,14 @@ def test_training_loop_short_rollout_checkpoints_and_cleanup(
             assert save.call_args.args[1] == config.ckpt_dir
             assert Path(config.ckpt_dir, "config.json").exists()
             assert int(save.call_args.args[0].step) == 2
-            logged_steps = [call.args[2] for call in writer.add_scalar.call_args_list if call.args[0] == "train/loss"]
+            logged_steps = [call.args[1] for call in writer.log_metrics.call_args_list if "train/loss" in call.args[0]]
             assert logged_steps == [4, 6]
         factory.assert_called_once()
         assert factory.call_args.kwargs["d_model"] == config.d_model
         assert factory.call_args.kwargs["num_layers"] == config.num_layers
         assert factory.call_args.kwargs["d_intermediate"] == config.d_intermediate
         close.assert_called_once()
-        writer.close.assert_called_once()
+        writer.__exit__.assert_called_once()
     finally:
         # Always release the real vector env, including the simulated close failure.
         close.side_effect = None

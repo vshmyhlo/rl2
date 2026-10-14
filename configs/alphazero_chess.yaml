@@ -17,8 +17,7 @@ max_grad_norm: 1.0
 dirichlet_alpha: 0.3
 dirichlet_fraction: 0.25
 exploration_moves: 30 # Sample search visits for the first 30 plies, then select greedily
-log_dir: gs://cohere-dev/vlad/rl2/alphazero/${run_id}
-ckpt_dir: ${log_dir}
+ckpt_dir: gs://cohere-dev/vlad/rl2/alphazero/${run_id}
 run_id: alphazero_${path_name:${env_id}} # Includes the environment ID; change the prefix for a new run
 log_interval_seconds: 60.0 # Aggregate metrics; emit at iteration boundaries and at normal completion
 checkpoint_interval_seconds: 600.0 # Save after an iteration every 10 minutes, and at normal completion

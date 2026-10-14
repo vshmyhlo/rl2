@@ -1,6 +1,7 @@
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import chex
 import jax
@@ -63,3 +64,23 @@ def test_checkpoint_metadata_validation(metadata: dict[str, int]) -> None:
     values = {"config": {}, "iteration": 1, "steps": 1, "completed_games": 0} | metadata
     with pytest.raises(ValidationError):
         ckpt.CheckpointMetadata.model_validate(values)
+
+
+def test_restore_accepts_legacy_logging_paths() -> None:
+    state = TrainState.create(apply_fn=jnp.add, params={"weight": jnp.ones(1)}, tx=optax.adam(1e-3))
+    config = Config(ckpt_dir="new-location")
+    metadata = ckpt.CheckpointMetadata(
+        config=ckpt.checkpoint_settings(config) | {"ckpt_dir": "old-location"},
+        iteration=1,
+        steps=2,
+        completed_games=1,
+    )
+    manager = Mock()
+    manager.latest_step.return_value = 1
+    manager.restore.side_effect = [
+        SimpleNamespace(metadata=metadata.model_dump()),
+        SimpleNamespace(state={"train_state": state, "key": jax.random.PRNGKey(0)}),
+    ]
+    restored = ckpt.restore_checkpoint(manager, state, config)
+    assert restored is not None
+    assert (restored.iteration, restored.steps, restored.completed_games) == (1, 2, 1)

@@ -1,6 +1,7 @@
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -22,10 +23,9 @@ def config() -> rnd.Config:
     return rnd.load_config(Path(__file__).resolve().parents[1] / "configs/ppo_rnd_montezuma.yaml", rnd.Config)
 
 
-def test_tensorboard_uses_config_run_id(tmp_path: Path) -> None:
+def test_mlflow_uses_config_run_id(tmp_path: Path) -> None:
     settings = replace(
         config(),
-        log_dir=str(tmp_path / "logs"),
         ckpt_dir=str(tmp_path / "rnd-run"),
         run_id="rnd-run",
         vector_env="sync",
@@ -34,12 +34,15 @@ def test_tensorboard_uses_config_run_id(tmp_path: Path) -> None:
     envs.reset.side_effect = RuntimeError("stop before training")
     with (
         patch.object(rnd.gym.vector, "SyncVectorEnv", return_value=envs),
-        patch.object(rnd, "SummaryWriter") as writer,
+        patch.object(rnd, "MLflowLogger") as writer,
+        patch.object(rnd, "checkpoint_manager") as manager,
         pytest.raises(RuntimeError, match="stop before training"),
     ):
+        writer.return_value.__enter__.return_value = writer.return_value
+        manager.return_value.__enter__.return_value.latest_step.return_value = None
         rnd.train(settings)
-    writer.assert_called_once_with(logdir=f"{tmp_path}/rnd-run")
-    writer.return_value.close.assert_called_once()
+    writer.assert_called_once_with(experiment="ppo_rnd", run_name="rnd-run")
+    writer.return_value.__exit__.assert_called_once()
     envs.close.assert_called_once()
 
 
@@ -98,7 +101,8 @@ def test_training_reports_raw_completed_episode_scores(capsys: pytest.CaptureFix
         patch.object(rnd.gym.vector, "SyncVectorEnv", return_value=envs),
         patch.object(rnd, "ActorCritic", return_value=model),
         patch.object(rnd, "RNDNetwork", return_value=model),
-        patch.object(rnd, "SummaryWriter") as writer,
+        patch.object(rnd, "MLflowLogger") as writer,
+        patch.object(rnd, "checkpoint_manager") as manager,
         patch.object(rnd, "warmup_rnd_observations", return_value=obs),
         patch.object(rnd, "act", return_value=(np.zeros(1, dtype=np.int32), zeros, predictions, carry)),
         patch.object(rnd, "value", return_value=predictions),
@@ -108,7 +112,21 @@ def test_training_reports_raw_completed_episode_scores(capsys: pytest.CaptureFix
         patch.object(rnd, "monotonic", side_effect=now),
         patch.object(rnd, "log_evaluation") as evaluate,
     ):
+        writer.return_value.__enter__.return_value = writer.return_value
+        manager.return_value.__enter__.return_value.latest_step.return_value = None
         rnd.train(settings)
+        checkpoint_manager = manager.return_value.__enter__.return_value
+        checkpoint_manager.save.assert_called_once()
+        saved = checkpoint_manager.save.call_args.kwargs["args"]
+        assert saved.metadata.item["iteration"] == 2
+        assert saved.metadata.item["episodes"] == 2
+        checkpoint_manager.latest_step.return_value = 2
+        checkpoint_manager.restore.return_value = SimpleNamespace(state=saved.state.item, metadata=saved.metadata.item)
+        resumed = rnd.train(settings)
+        assert int(resumed.step) == 2
+        assert envs.step.call_count == 4  # Completed checkpoints do not replay training.
+        checkpoint_manager.save.assert_called_once()
+
     assert evaluate.call_count == 2
     for call, expected_returns, steps in zip(evaluate.call_args_list, [(3.0,), (3.0, 7.0)], [2, 4], strict=True):
         chex.assert_trees_all_equal(call.kwargs["initial_carry"], carry)
@@ -121,13 +139,17 @@ def test_training_reports_raw_completed_episode_scores(capsys: pytest.CaptureFix
         "charts/total_return_mean": [(3.0, 2), (5.0, 4)],
         "charts/total_episode_length_mean": [(2.0, 2), (1.5, 4)],
     }.items():
-        logs = [call.args[1:] for call in writer.return_value.add_scalar.call_args_list if call.args[0] == tag]
+        logs = [
+            (call.args[0][tag], call.args[1])
+            for call in writer.return_value.log_metrics.call_args_list
+            if tag in call.args[0]
+        ]
         assert logs == expected
-    assert not any("last_100" in call.args[0] for call in writer.return_value.add_scalar.call_args_list)
+    assert not any("last_100" in tag for call in writer.return_value.log_metrics.call_args_list for tag in call.args[0])
     progress_lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("step=")]
     assert "return=3.0 episode_length=2.0" in progress_lines[0]
     assert "return=5.0 episode_length=1.5" in progress_lines[1]
-    envs.close.assert_called_once()
+    assert envs.close.call_count == 2
 
 
 def test_running_moments_match_combined_samples() -> None:

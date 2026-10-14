@@ -13,7 +13,6 @@ import optax
 import pytest
 import yaml
 from flax.training.train_state import TrainState
-from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 pytest.importorskip("pgx")
 pytest.importorskip("mctx")
@@ -231,9 +230,7 @@ def test_chess_search_smoke() -> None:
 
 def test_main_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
-    path.write_text(
-        "env_id: tic_tac_toe\niterations: 1\nrun_id: test\nlog_dir: runs/alphazero/${run_id}\nckpt_dir: ${log_dir}\n"
-    )
+    path.write_text("env_id: tic_tac_toe\niterations: 1\nrun_id: test\nckpt_dir: runs/alphazero/${run_id}\n")
     train = Mock()
     monkeypatch.setattr(az, "train", train)
     monkeypatch.setattr(sys, "argv", ["train_alphazero", "--config", str(path)])
@@ -244,7 +241,6 @@ def test_main_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
             env_id="tic_tac_toe",
             iterations=1,
             run_id="test",
-            log_dir="runs/alphazero/test",
             ckpt_dir="runs/alphazero/test",
         )
     )
@@ -282,9 +278,11 @@ def logging_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> az.Config
         iterations=2,
         updates_per_iteration=2,
         run_id="test",
-        log_dir=str(tmp_path / "test"),
         ckpt_dir=str(tmp_path / "checkpoints" / "test"),
     )
+    writer = MagicMock()
+    writer.__enter__.return_value = writer
+    monkeypatch.setattr(az, "MLflowLogger", Mock(return_value=writer))
     manager = MagicMock()
     manager.__enter__.return_value = manager
     manager.latest_step.return_value = None
@@ -310,14 +308,13 @@ def logging_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> az.Config
     return config
 
 
-def test_tensorboard_progress(
+def test_mlflow_progress(
     logging_config: az.Config, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     caplog.set_level(logging.INFO, logger=az.__name__)
     logging_config = replace(
         logging_config,
         iterations=5,
-        log_dir=str(tmp_path / "test-run" / "chess"),
         run_id="test-run",
         ckpt_dir=str(tmp_path / "checkpoints" / "test-run"),
         log_interval_seconds=30.0,
@@ -340,31 +337,35 @@ def test_tensorboard_progress(
     monkeypatch.setattr(az, "monotonic", now)
     state = az.train(logging_config)
     assert state.step == 10
-    events = EventAccumulator(str(tmp_path / "test-run" / "chess")).Reload()
-    losses = events.Scalars("losses/loss")
-    assert [event.step for event in losses] == [5, 10, 13]
-    assert [event.value for event in losses] == [4, 12, 18]  # Mean over every update in each window.
-    assert [event.value for event in events.Scalars("charts/completed_games")] == [1, 2, 3]
-    assert [event.value for event in events.Scalars("selfplay/completed_games")] == [1, 1, 1]
-    assert [event.value for event in events.Scalars("selfplay/positions")] == [5, 5, 3]
-    assert [event.value for event in events.Scalars("selfplay/value_positions")] == [2, 2, 2]
-    assert [event.value for event in events.Scalars("charts/iteration")] == [2, 4, 5]
-    assert [event.value for event in events.Scalars("time/window_seconds")] == [30, 30, 5]
-    assert [event.value for event in events.Scalars("time/iteration_seconds")] == [30, 30, 5]
-    assert "time/rollout_seconds" not in events.Tags()["scalars"]
-    assert "time/optimization_seconds" not in events.Tags()["scalars"]
-    assert [event.value for event in events.Scalars("charts/SPS")] == pytest.approx([5 / 30, 5 / 30, 3 / 5])
-    assert events.Scalars("time/eta_seconds")[-1].value == 0
-    assert events.Scalars("model/params_millions")[0].value == pytest.approx(1e-6)
-    for tag in ("charts/SPS", "time/elapsed_seconds"):
-        assert all(np.isfinite(event.value) and event.value >= 0 for event in events.Scalars(tag))
-    text = events.Tensors("config/text_summary")[0].tensor_proto.string_val[0].decode()
-    saved_config = yaml.safe_load(text.removeprefix("```yaml\n").removesuffix("```"))
-    assert saved_config["log_dir"] == str(tmp_path / "test-run" / "chess")
+    writer = az.MLflowLogger.return_value
+    az.MLflowLogger.assert_called_once_with(experiment="alphazero", run_name="test-run")
+    metrics: dict[str, list[tuple[float, int]]] = {}
+    for call in writer.log_metrics.call_args_list:
+        for tag, value in call.args[0].items():
+            metrics.setdefault(tag, []).append((value, call.args[1]))
+    assert metrics["losses/loss"] == [(4, 5), (12, 10), (18, 13)]
+    for tag, values in {
+        "charts/completed_games": [1, 2, 3],
+        "selfplay/completed_games": [1, 1, 1],
+        "selfplay/positions": [5, 5, 3],
+        "selfplay/value_positions": [2, 2, 2],
+        "charts/iteration": [2, 4, 5],
+        "time/window_seconds": [30, 30, 5],
+        "time/iteration_seconds": [30, 30, 5],
+    }.items():
+        assert [value for value, _ in metrics[tag]] == values
+    assert "time/rollout_seconds" not in metrics
+    assert "time/optimization_seconds" not in metrics
+    assert [value for value, _ in metrics["charts/SPS"]] == pytest.approx([5 / 30, 5 / 30, 3 / 5])
+    assert metrics["time/eta_seconds"][-1][0] == 0
+    assert metrics["model/params_millions"][0][0] == pytest.approx(1e-6)
+    artifacts = {call.args[1]: call.args[0] for call in writer.log_text.call_args_list}
+    saved_config = yaml.safe_load(artifacts["config.yaml"])
     assert saved_config["run_id"] == "test-run"
     assert saved_config["ckpt_dir"] == str(tmp_path / "checkpoints" / "test-run")
+    writer.log_params.assert_called_once_with(saved_config)
     az.checkpoint_manager.assert_called_once_with(str(tmp_path / "checkpoints" / "test-run"))
-    assert "devices/text_summary" in events.Tags()["tensors"]
+    assert "devices.txt" in artifacts
     messages = [record.getMessage() for record in caplog.records if record.name == az.__name__]
     assert "Run ID: test-run" in messages
     reports = [message for message in messages if message.startswith("Iteration ")]
@@ -378,20 +379,19 @@ def test_tensorboard_progress(
         assert report.endswith(f"seconds={seconds:.2f}")
 
 
-def test_tensorboard_closes_on_error(logging_config: az.Config, monkeypatch: pytest.MonkeyPatch) -> None:
-    logging_config = replace(logging_config, log_dir="logs/${run_id}", ckpt_dir="checkpoints/${run_id}")
+def test_mlflow_closes_on_error(logging_config: az.Config, monkeypatch: pytest.MonkeyPatch) -> None:
+    logging_config = replace(logging_config, ckpt_dir="checkpoints/${run_id}")
     writer = MagicMock()
     writer.__enter__.return_value = writer
     make_writer = Mock(return_value=writer)
-    monkeypatch.setattr(az, "SummaryWriter", make_writer)
+    monkeypatch.setattr(az, "MLflowLogger", make_writer)
     monkeypatch.setattr(az, "collect_selfplay", Mock(side_effect=RuntimeError("search failed")))
     with pytest.raises(RuntimeError, match="search failed"):
         az.train(logging_config)
     writer.__exit__.assert_called_once()
     assert writer.__exit__.call_args.args[0] is RuntimeError
     az.checkpoint_manager.return_value.__exit__.assert_called_once()
-    run_dir = Path(make_writer.call_args.kwargs["logdir"])
-    assert run_dir == Path("logs/${run_id}")
+    make_writer.assert_called_once_with(experiment="alphazero", run_name="test")
     az.checkpoint_manager.assert_called_once_with("checkpoints/${run_id}")
 
 
@@ -424,7 +424,7 @@ def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: p
     monkeypatch.setattr(az, "monotonic", now)
     monkeypatch.setattr(az, "restore_checkpoint", restore)
     monkeypatch.setattr(az, "save_checkpoint", save)
-    monkeypatch.setattr(az, "SummaryWriter", make_writer)
+    monkeypatch.setattr(az, "MLflowLogger", make_writer)
     with pytest.raises(RuntimeError, match="interrupted"):
         az.train(config)
     save.assert_called_once()
@@ -441,10 +441,14 @@ def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: p
     assert [call.args[1].iteration for call in save.call_args_list] == [2, 4]
     final = save.call_args.args[1]
     assert (final.steps, final.completed_games) == (8, 4)
-    assert make_writer.call_args.kwargs["purge_step"] == 5
+    assert make_writer.call_args.kwargs["run_name"] == "resume"
     # Replay the interrupted iteration with the same self-play RNG.
     np.testing.assert_array_equal(rollout.call_args_list[2].args[1], rollout.call_args_list[3].args[1])
-    eta = [call.args[1] for call in writer.add_scalar.call_args_list if call.args[0] == "time/eta_seconds"]
+    eta = [
+        call.args[0]["time/eta_seconds"]
+        for call in writer.log_metrics.call_args_list
+        if "time/eta_seconds" in call.args[0]
+    ]
     assert eta == [0.0]  # Resumed iterations share a final partial logging window.
 
     restore.return_value = final
@@ -493,13 +497,18 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
     monkeypatch.setattr(az, "monotonic", now)
     monkeypatch.setattr(az, "save_checkpoint", save)
     monkeypatch.setattr(az, "evaluate", run_evaluation)
-    monkeypatch.setattr(az, "SummaryWriter", Mock(return_value=writer))
+    monkeypatch.setattr(az, "MLflowLogger", Mock(return_value=writer))
     az.train(config)
     assert run_evaluation.call_count == 2
     for call, candidate, opponent in zip(run_evaluation.call_args_list, [3, 6], [2, 5], strict=True):
         assert call.kwargs["candidate_params"]["weight"].item() == candidate
         assert call.kwargs["opponent_params"]["weight"].item() == opponent
-    logged = [call.args for call in writer.add_scalar.call_args_list if call.args[0].startswith("eval/")]
+    logged = [
+        (tag, value, call.args[1])
+        for call in writer.log_metrics.call_args_list
+        for tag, value in call.args[0].items()
+        if tag.startswith("eval/")
+    ]
     assert ("eval/opponent_iteration", 2, 6) in logged
     assert ("eval/opponent_iteration", 5, 12) in logged
     assert ("eval/seconds", 120.0, 12) in logged

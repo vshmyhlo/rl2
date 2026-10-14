@@ -1,3 +1,4 @@
+import json
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 from multiprocessing import get_context
@@ -17,6 +18,7 @@ from pydantic import ValidationError
 from rl2 import karel
 from rl2 import train_karel_grpo as grpo
 from rl2.karel import REWARD_COMPONENTS, TOKEN_TO_ID, TOKENS, KarelConfig, KarelProgramEnv, _parse
+from rl2.karel_checkpoints import restore_legacy_checkpoint
 from rl2.karel_grammar import mask_sequence_logits
 
 type Rollout = tuple[grpo.GRPOBatch, np.ndarray, dict[str, float], jax.Array]
@@ -273,18 +275,27 @@ def test_legacy_reference_checkpoint_and_config_load_without_reference(
 ) -> None:
     rng = np.random.default_rng(12)
     progress = grpo.TrainingProgress(state, jax.random.key(3), 2, 8, 1, 8)
-    grpo._save_checkpoint(str(tmp_path), progress, rng)
-    payload = serialization.msgpack_restore((tmp_path / "checkpoint.msgpack").read_bytes())
+    payload = {
+        "version": 1,
+        "state": serialization.to_state_dict(state),
+        "key": np.asarray(jax.random.key_data(progress.key)),
+        "key_impl": str(jax.random.key_impl(progress.key)),
+        "numpy_rng": json.dumps(rng.bit_generator.state),
+        "iteration": 2,
+        "steps": 8,
+        "logged_groups": 1,
+        "episodes": 8,
+    }
     assert "reference_params" not in payload
     assert "kl_coef" not in grpo.asdict(config)
     # Older checkpoints may contain a separate reference with different weights.
     payload["reference_params"] = {"obsolete_reference": np.zeros(1, np.float32)}
     restored_rng = np.random.default_rng(99)
-    restored = grpo._restore_checkpoint(serialization.msgpack_serialize(payload), state, restored_rng)
+    restored = restore_legacy_checkpoint(serialization.msgpack_serialize(payload), state, restored_rng)
     chex.assert_trees_all_equal(restored, progress)
     np.testing.assert_array_equal(restored_rng.integers(100, size=4), rng.integers(100, size=4))
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(grpo.yaml.safe_dump({**grpo.asdict(config), "kl_coef": 0.25}))
+    config_path.write_text(grpo.yaml.safe_dump({**grpo.asdict(config), "kl_coef": 0.25, "log_dir": "old-logs"}))
     assert grpo.load_config(config_path, grpo.Config) == config
 
 

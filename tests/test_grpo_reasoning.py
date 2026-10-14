@@ -311,10 +311,102 @@ def test_prompts_and_real_reasoning_gym_rewards() -> None:
         f"<answer>\n{entries[1]['answer']}\n</answer>",
         "<answer>wrong</answer>",
     ]
-    rewards = grpo.score_completions(dataset, entries, texts, 2)
+    scores = grpo.score_completions(dataset, entries, texts, 2)  # each (4,)
+    rewards = scores.task  # (4,)
     np.testing.assert_array_equal(rewards, [1, 0, 1, 0])
+    np.testing.assert_array_equal(scores.format, [0, 0, 1, 1])
+    assert rewards.shape == scores.format.shape == (4,)
     with pytest.raises(ValueError, match="invalid reward"):
         grpo.score_completions(Mock(score_answer=Mock(return_value=float("nan"))), entries[:1], texts[:1], 1)
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("1320", "1320"),
+        ("22 * 60 = 1320", "1320"),
+        ("Working...\nThe final answer is: -1.5e2.", "-1.5e2"),
+        ("Answer: +.5!", "+.5"),
+        ("Working...\n 1320 \n", "1320"),
+        ("", None),
+        ("There are 1320 possibilities", None),
+        ("1320 or 1321", None),
+        ("1320\nI am unsure.", None),
+        ("<answer>1320", None),
+        ("<result>1320", None),
+        ("22 * 60", None),
+        ("1320 / 2", None),
+    ],
+)
+def test_extract_numeric_answer(text: str, expected: str | None) -> None:
+    assert grpo.extract_numeric_answer(text) == expected
+
+
+def test_untagged_scores_exclude_tools_and_keep_tagged_answer_authoritative() -> None:
+    dataset = reasoning_gym.create_dataset("basic_arithmetic", seed=1, size=1)
+    entry = {"question": "Calculate 22 * 60.", "answer": "1320"}
+    texts = [
+        "22 * 60 = 1320",
+        "<calculator>22 * 60</calculator>\n<result>1320</result>",
+        "<calculator>22 * 60</calculator>\n<result>1320</result>\nAnswer: 1320",
+        "<calculator><answer>1320</answer></calculator>",
+        "<result><answer>1320</answer></result>",
+        "<result><answer>1320</answer>",
+        "1320\n<answer>9</answer>",
+        "<answer>1320</answer>\n9",
+        "<answer> </answer>",
+        "<answer><answer>1320</answer></answer>",
+    ]
+    scores = grpo.score_completions(dataset, [entry], texts, len(texts), allow_untagged_numeric=True)  # each (10,)
+    assert scores.task.shape == scores.format.shape == (len(texts),)
+    np.testing.assert_array_equal(scores.task[:9], [1, 0, 1, 0, 0, 0, 0, 1, 0])
+    np.testing.assert_array_equal(scores.format, [0, 0, 0, 0, 0, 0, 1, 0, 0, 0])
+    with pytest.raises(ValueError, match="group_size"):
+        grpo.score_completions(dataset, [entry], texts, 1)
+
+
+def test_zero_shot_reward_shaping_reaches_rollout_advantages(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = grpo.Config(
+        num_tasks=1,
+        group_size=4,
+        num_minibatches=1,
+        max_prompt_tokens=3,
+        max_new_tokens=1,
+        beta=0,
+        allow_untagged_numeric=True,
+        format_reward_weight=0.1,
+    )
+    key = jax.random.key(1)  # ()
+    dataset = reasoning_gym.create_dataset("basic_arithmetic", seed=1, size=1)
+    answer = dataset[0]["answer"]
+    tokenizer = Mock(wraps=FakeTokenizer())
+    tokenizer.decode.side_effect = [answer, f"<answer>{answer}</answer>", "<answer>wrong</answer>", "wrong"]
+    monkeypatch.setattr(
+        grpo,
+        "generate",
+        Mock(
+            return_value=grpo.Generation(
+                tokens=jnp.full((4, 1), 3, jnp.int32),  # (B, C)
+                log_probs=jnp.zeros((4, 1), jnp.float32),  # (B, C)
+                mask=jnp.ones((4, 1), jnp.bool_),  # (B, C)
+                key=key,
+            )
+        ),
+    )
+    batch, diagnostics, samples, _ = grpo.collect_rollout(
+        Mock(params={}), Mock(), {}, dataset, tokenizer, key, 0, config
+    )
+    assert diagnostics["charts/task_reward_mean"] == diagnostics["charts/success_rate"] == 0.5
+    assert diagnostics["charts/format_rate"] == 0.5
+    assert diagnostics["charts/formatted_success_rate"] == 0.25
+    assert diagnostics["charts/reward_mean"] == pytest.approx(0.5)
+    assert diagnostics["charts/informative_group_fraction"] == 1
+    rewards = jnp.array([[0.9, 1.0, 0.1, 0.0]], jnp.float32)  # (N, G)
+    assert batch.advantages.shape == (4,)
+    np.testing.assert_allclose(batch.advantages, grpo.group_advantages(rewards)[0])
+    for reward in (0.9, 1.0, 0.1, 0.0):
+        assert f"**Reward:** {reward:.3f}" in samples
+    assert tokenizer.encode.call_args.args[0].count("<start_of_turn>user") == 1
 
 
 def test_prompt_examples_precede_question_without_leaking_target_answer() -> None:
@@ -334,7 +426,7 @@ def test_prompt_examples_precede_question_without_leaking_target_answer() -> Non
     assert "\n\n\n" not in prompt
     # Demonstration answers cannot earn reward for an empty generated completion.
     dataset = Mock()
-    np.testing.assert_array_equal(grpo.score_completions(dataset, [entry], [""], 1), [0])
+    np.testing.assert_array_equal(grpo.score_completions(dataset, [entry], [""], 1).task, [0])
     dataset.score_answer.assert_not_called()
 
 
@@ -378,10 +470,15 @@ def test_logged_completions_are_capped_and_stay_in_one_group(monkeypatch: pytest
     original_score = grpo.score_completions
 
     def score(
-        dataset: grpo.ProceduralDataset, entries: list[grpo.Entry], texts: list[str], group_size: int
-    ) -> jax.Array:
+        dataset: grpo.ProceduralDataset,
+        entries: list[grpo.Entry],
+        texts: list[str],
+        group_size: int,
+        *,
+        allow_untagged_numeric: bool,
+    ) -> grpo.CompletionScores:
         now[0] += 3.0
-        return original_score(dataset, entries, texts, group_size)
+        return original_score(dataset, entries, texts, group_size, allow_untagged_numeric=allow_untagged_numeric)
 
     tokenizer.decode.side_effect = decode
     monkeypatch.setattr(grpo, "monotonic", clock)
@@ -512,6 +609,9 @@ def test_collect_rollout_grouping_and_reference(
         ({"num_minibatches": 3}, "num_minibatches"),
         ({"temperature": 0}, "temperature"),
         ({"beta": float("nan")}, "beta"),
+        ({"format_reward_weight": -0.1}, "format_reward_weight"),
+        ({"format_reward_weight": 1.0}, "format_reward_weight"),
+        ({"format_reward_weight": float("nan")}, "format_reward_weight"),
         ({"duration_penalty_coef": -0.1}, "duration_penalty_coef"),
         ({"duration_penalty_coef": float("nan")}, "duration_penalty_coef"),
         ({"max_new_tokens": 0}, "max_new_tokens"),
@@ -530,7 +630,8 @@ def test_yaml_config(tmp_path: Path) -> None:
     config = grpo.load_config("configs/grpo_reasoning/gemma3.yaml", grpo.Config)
     assert config.task == "basic_arithmetic"
     assert config.duration_penalty_coef == 0.0
-    assert config.group_size == 4 and config.total_updates == 1000
+    assert config.allow_untagged_numeric and config.format_reward_weight == 0.1
+    assert config.group_size == 4
     assert config.task_config["min_terms"] == 2
     assert config.task_config["max_terms"] == 2
     dataset = reasoning_gym.create_dataset(config.task, seed=config.seed, size=5, **config.task_config)
@@ -551,6 +652,7 @@ def test_yaml_config(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text("group_size: 2\nnum_minibatches: 1\ntask_config:\n  max_animals: 3\n")
     default_config = grpo.load_config(path, grpo.Config)
+    assert not default_config.allow_untagged_numeric and default_config.format_reward_weight == 0.0
     assert default_config.task_config == {"max_animals": 3}
     assert default_config.run_id is not None
     assert default_config.run_id[0:8].isdigit()

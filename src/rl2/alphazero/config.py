@@ -43,7 +43,6 @@ class Config(BaseConfig):
     dirichlet_alpha: PositiveFiniteFloat = 0.3
     dirichlet_fraction: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)] = 0.25
     exploration_moves: NonNegativeInt = 30
-    log_dir: Annotated[str, Field(pattern=r"\S")] = "runs/alphazero"
     log_interval_seconds: PositiveFiniteFloat = 60.0
     checkpoint_interval_seconds: PositiveFiniteFloat = 600.0
     evaluation: EvaluationConfig = EvaluationConfig()

@@ -45,8 +45,6 @@ dependencies = [
     "rlax>=0.1.8,<0.2",
     "ruff>=0.16.9",
     "sentencepiece>=0.2,<0.3",
-    "tensorboard>=2.18,<3",
-    "tensorboardx>=2.6.5,<3",
     "tfp-nightly>=0.26.0.dev0,<0.27",
     "tokamax>=0.0.15; sys_platform == 'linux'",
     "xminigrid==0.9.3",

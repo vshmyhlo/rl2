@@ -7,7 +7,6 @@ and the same prefix-dependent masks, averaging token losses within each program.
 """
 
 import argparse
-import json
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack
@@ -29,12 +28,18 @@ from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 from pydantic import Field, model_validator
 from pydantic.dataclasses import dataclass
-from tensorboardX import SummaryWriter
 
 from rl2.attention import AttentionType
 from rl2.configuration import BaseConfig, load_config
 from rl2.jax_cache import configure_compilation_cache
 from rl2.karel import ACTIONS, REWARD_COMPONENTS, TASK_CATEGORIES, TOKENS, KarelConfig, KarelPair, KarelProgramEnv
+from rl2.karel_checkpoints import (
+    TrainingProgress,
+    restore_checkpoint,
+)
+from rl2.karel_checkpoints import (
+    save_checkpoint as _save_checkpoint,
+)
 from rl2.karel_grammar import (
     GrammarState,
     grammar_step,
@@ -43,6 +48,7 @@ from rl2.karel_grammar import (
     mask_sequence_logits,
 )
 from rl2.karel_model import KarelModelCarry, KarelProgramModel
+from rl2.mlflow_logging import MLflowLogger
 from rl2.utils import read_bytes, read_optional, write_bytes
 
 type Array = jax.Array | NDArray[Any]
@@ -71,13 +77,10 @@ class Config(BaseConfig):
     target_kl: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None = 0.02
     entropy_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
     max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 0.5
-    log_dir: str = "runs"
     checkpoint_interval_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] = (
         300.0  # Save at the next completed rollout boundary.
     )
-    log_interval: Annotated[int, Field(gt=0)] = (
-        20  # TensorBoard scalars, stdout, and flushes every N completed rollouts.
-    )
+    log_interval: Annotated[int, Field(gt=0)] = 20  # MLflow scalars, stdout, and flushes every N completed rollouts.
     log_program_interval: Annotated[int, Field(gt=0)] = (
         20  # Program samples on logging iterations divisible by this interval.
     )
@@ -89,7 +92,15 @@ class Config(BaseConfig):
     @classmethod
     def ignore_legacy_settings(cls, values: Any) -> Any:
         if isinstance(values, dict):
-            return {name: value for name, value in values.items() if name not in ("kl_coef",)}
+            return {
+                name: value
+                for name, value in values.items()
+                if name
+                not in (
+                    "log_dir",
+                    "kl_coef",
+                )
+            }
         return values
 
     def __post_init__(self) -> None:
@@ -112,59 +123,6 @@ class GRPOBatch(NamedTuple):
     old_log_probs: Array
     mask: Array  # Includes terminal m), excludes PAD.
     advantages: Array  # [B], normalized within task groups before minibatching.
-
-
-class TrainingProgress(NamedTuple):
-    state: TrainState
-    key: jax.Array
-    iteration: int  # Number of fully completed rollout batches.
-    steps: int  # Completed program episodes, for TensorBoard (same as episodes).
-    logged_groups: int
-    episodes: int
-
-
-def _save_checkpoint(run_dir: str, progress: TrainingProgress, rng: np.random.Generator) -> None:
-    """Save a complete rollout boundary; checkpoint.msgpack is authoritative."""
-    chex.assert_shape(progress.key, ())
-    payload = {
-        "version": 1,
-        "state": serialization.to_state_dict(progress.state),
-        "key": np.asarray(jax.random.key_data(progress.key)),
-        "key_impl": str(jax.random.key_impl(progress.key)),
-        # PCG64 contains 128-bit integers, which cannot be encoded directly by msgpack.
-        "numpy_rng": json.dumps(rng.bit_generator.state),
-        "iteration": progress.iteration,
-        "steps": progress.steps,
-        "logged_groups": progress.logged_groups,
-        "episodes": progress.episodes,
-    }
-    write_bytes(f"{run_dir}/checkpoint.msgpack", serialization.msgpack_serialize(payload))
-
-
-def _restore_checkpoint(data: bytes, state: TrainState, rng: np.random.Generator) -> TrainingProgress:
-    payload = serialization.msgpack_restore(data)
-    if payload["version"] != 1:
-        raise ValueError("Unsupported GRPO checkpoint version")
-    try:
-        restored = serialization.from_state_dict(state, payload["state"])
-        chex.assert_trees_all_equal_shapes_and_dtypes(
-            (state.params, state.opt_state), (restored.params, restored.opt_state)
-        )
-    except (ValueError, AssertionError) as error:
-        raise ValueError(
-            "Checkpoint model/optimizer structure is incompatible with this config. Use a new run_id."
-        ) from error
-    chex.assert_rank(payload["key"], 1)
-    chex.assert_type(payload["key"], np.uint32)
-    key = jax.random.wrap_key_data(jnp.asarray(payload["key"]), impl=payload["key_impl"])
-    counters = tuple(payload[name] for name in ("iteration", "steps", "logged_groups", "episodes"))
-    for counter in counters:
-        if type(counter) is not int or counter < 0:
-            raise ValueError("Invalid checkpoint counters")
-    rng.bit_generator.state = json.loads(payload["numpy_rng"])
-    iteration, _, logged_groups, episodes = counters
-    # Episodes retain the correct total even when batch size changes on resume.
-    return TrainingProgress(restored, key, iteration, episodes, logged_groups, episodes)
 
 
 def learning_rate_schedule(config: Config) -> optax.Schedule:
@@ -528,19 +486,16 @@ def load_model(
     full training state when the configured run_id has a checkpoint.
     """
     directory = str(run_dir).rstrip("/")
-    checkpoint = read_optional(f"{directory}/checkpoint.msgpack")
-    payload = serialization.msgpack_restore(checkpoint) if checkpoint is not None else None
-    if payload is not None and payload["version"] != 1:
-        raise ValueError("Unsupported GRPO checkpoint version")
     config = load_config(f"{directory}/config.yaml", Config)
     if attention_implementation is not None:
         config = replace(config, attention_implementation=attention_implementation)
     dummy = np.zeros((1, config.env.height, config.env.width, 6), np.int32)
     state = create_state(config, dummy, dummy)
+    progress = restore_checkpoint(directory, state, np.random.default_rng(config.seed))
     params = (
         serialization.from_bytes(state.params, read_bytes(f"{directory}/params.msgpack"))
-        if payload is None
-        else serialization.from_state_dict(state.params, payload["state"]["params"])
+        if progress is None
+        else progress.state.params
     )
     chex.assert_trees_all_equal_shapes_and_dtypes(params, state.params)
     return config, state.replace(params=params)
@@ -555,10 +510,10 @@ def train(config: Config) -> TrainState:
     dummy = np.zeros((1, config.env.height, config.env.width, 6), np.int32)
     state = create_state(config, dummy, dummy)
     run_dir = config.ckpt_dir.rstrip("/")
-    checkpoint = read_optional(f"{run_dir}/checkpoint.msgpack")
-    progress = TrainingProgress(state, key, 0, 0, 0, 0)
+    checkpoint = restore_checkpoint(run_dir, state, rng)
+    progress = TrainingProgress(state=state, key=key, iteration=0, steps=0, logged_groups=0, episodes=0)
     if checkpoint is not None:
-        progress = _restore_checkpoint(checkpoint, state, rng)
+        progress = checkpoint
         print(f"Resuming {run_dir} at rollout {progress.iteration}, step {progress.steps}", flush=True)
     else:
         if read_optional(f"{run_dir}/params.msgpack") is not None:
@@ -570,11 +525,8 @@ def train(config: Config) -> TrainState:
     write_bytes(f"{run_dir}/config.yaml", yaml.safe_dump(asdict(config)).encode())
     if checkpoint is None:
         _save_checkpoint(run_dir, progress, rng)
-    # Hide events from unsaved rollouts after an interruption, retaining the
-    # checkpoint's own step. New runs do not need a TensorBoard restart marker.
     with ExitStack() as resources:
-        writer = SummaryWriter(logdir=run_dir, purge_step=steps + 1 if checkpoint is not None else None)
-        resources.callback(writer.close)
+        writer = resources.enter_context(MLflowLogger(experiment="karel_grpo", run_name=config.run_id))
         # Spawn avoids forking JAX's multithreaded CUDA runtime. Keep the pool
         # alive across rollouts, and close it on completion or any exception.
         executor = (
@@ -586,12 +538,13 @@ def train(config: Config) -> TrainState:
             if config.sampling_workers
             else None
         )
-        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", steps)
-        writer.add_text("devices", str(jax.devices()), steps)
+        writer.log_params(asdict(config))
+        writer.log_text(yaml.safe_dump(asdict(config)), "config.yaml")
+        writer.log_text(str(jax.devices()), "devices.txt")
         parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
-        writer.add_scalar("model/params_millions", parameter_count / 1_000_000, steps)
+        writer.log_metrics({"model/params_millions": parameter_count / 1_000_000}, steps)
         print(
-            f"TensorBoard run: {run_dir}\nJAX devices: {jax.devices()}\nModel parameters: {parameter_count:,}",
+            f"MLflow run: {writer.run_id}\nJAX devices: {jax.devices()}\nModel parameters: {parameter_count:,}",
             flush=True,
         )
         print(
@@ -639,21 +592,26 @@ def train(config: Config) -> TrainState:
             if log_iteration:
                 jax.block_until_ready((state, metrics))
                 policy_loss, entropy, approx_kl, clip_fraction = np.mean(jax.device_get(metrics), axis=0)
-                for tag, scalar in {
-                    **diagnostics,
-                    "losses/policy": policy_loss,
-                    "policy/entropy": entropy,
-                    "policy/approx_kl": approx_kl,
-                    "policy/clip_fraction": clip_fraction,
-                    "policy/early_stop": early_stop,
-                    "charts/learning_rate": learning_rate,
-                    "charts/updates_per_rollout": updates_done,
-                    "charts/total_episodes": episodes,
-                    "charts/steps_per_second": (steps - start_steps) / (monotonic() - start),
-                    "time/rollout_seconds": rollout_seconds,
-                    "time/optimization_seconds": monotonic() - optimization_start,
-                }.items():
-                    writer.add_scalar(tag, float(scalar), steps)
+                writer.log_metrics(
+                    {
+                        tag: float(scalar)
+                        for tag, scalar in {
+                            **diagnostics,
+                            "losses/policy": policy_loss,
+                            "policy/entropy": entropy,
+                            "policy/approx_kl": approx_kl,
+                            "policy/clip_fraction": clip_fraction,
+                            "policy/early_stop": early_stop,
+                            "charts/learning_rate": learning_rate,
+                            "charts/updates_per_rollout": updates_done,
+                            "charts/total_episodes": episodes,
+                            "charts/steps_per_second": (steps - start_steps) / (monotonic() - start),
+                            "time/rollout_seconds": rollout_seconds,
+                            "time/optimization_seconds": monotonic() - optimization_start,
+                        }.items()
+                    },
+                    steps,
+                )
                 if config.log_program_count and (iteration + 1) % config.log_program_interval == 0:
                     samples = format_group_programs(
                         batch,
@@ -664,19 +622,25 @@ def train(config: Config) -> TrainState:
                         count=config.log_program_count,
                     )
                     logged_groups += 1
-                    writer.add_text("samples/generated_programs", samples, steps)
+                    writer.log_text(samples, f"samples/generated_programs/{steps}.md")
             if (
                 monotonic() - last_checkpoint_time >= config.checkpoint_interval_seconds
                 or iteration + 1 == config.total_updates
             ):
                 _save_checkpoint(
                     run_dir,
-                    TrainingProgress(state, key, iteration + 1, steps, logged_groups, episodes),
+                    TrainingProgress(
+                        state=state,
+                        key=key,
+                        iteration=iteration + 1,
+                        steps=steps,
+                        logged_groups=logged_groups,
+                        episodes=episodes,
+                    ),
                     rng,
                 )
                 last_checkpoint_time = monotonic()
             if log_iteration:
-                writer.flush()
                 print(
                     f"iteration={iteration + 1} step={steps} success={diagnostics['charts/success_rate']:.3f} "
                     f"reward={diagnostics['charts/reward_mean']:.3f} "

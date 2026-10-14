@@ -18,7 +18,14 @@ from gemma_helpers import tiny_gemma_model
 
 from rl2 import train_grpo_reasoning as grpo
 from rl2.gdn2.model import GatedDeltaNet2Config, GatedDeltaNet2LM
-from rl2.gemma3 import Gemma3LM, Gemma3Tokenizer, Parameters, load_gemma3_checkpoint, save_gemma3_checkpoint
+from rl2.gemma3 import (
+    Gemma3LM,
+    Gemma3Tokenizer,
+    Parameters,
+    _cudnn_attention,
+    load_gemma3_checkpoint,
+    save_gemma3_checkpoint,
+)
 
 
 @pytest.fixture(scope="module")
@@ -377,6 +384,52 @@ def test_cudnn_validation(cudnn_gemma: tuple[Gemma3LM, Parameters]) -> None:
         )
     with pytest.raises(ValueError, match="bfloat16"):
         grpo.Config(attention_backend="cudnn")
+
+
+@pytest.mark.parametrize("kv_heads", [pytest.param(2, id="grouped-query"), pytest.param(4, id="multi-head")])
+def test_cudnn_projection_layouts_and_empty_rows(kv_heads: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = gm.nn.Attention(
+        num_heads=4,
+        num_kv_heads=kv_heads,
+        features=4,
+        head_dim=8,
+        attn_type=gm.nn.AttentionType.LOCAL_SLIDING,
+        query_pre_attn_scalar=8**-0.5,
+        sliding_window_size=2,
+        use_qk_norm=True,
+    )
+    x = jax.random.normal(jax.random.key(4), (1, 4, 4))  # (B=1, T=4, D=4)
+    positions = jnp.array([[0, 1, 4, 5]], jnp.int32)  # (B, T), including a logical position gap
+    mask = jnp.tril(jnp.ones((1, 4, 4), jnp.bool_)).at[:, 0].set(False)  # (B, T, S=4)
+    variables = module.init(jax.random.key(5), x, positions, None, mask)
+    original_attention = jax.nn.dot_product_attention
+
+    def attention(
+        query: jax.Array,  # (B, T, N, H)
+        key: jax.Array,  # (B, S, K, H)
+        value: jax.Array,  # (B, S, K, H)
+        **kwargs: Any,
+    ) -> jax.Array:
+        assert kwargs["implementation"] == "cudnn"
+        kwargs["implementation"] = "xla"
+        return original_attention(query, key, value, **kwargs)  # (B, T, N, H)
+
+    monkeypatch.setattr(jax.nn, "dot_product_attention", attention)
+
+    def loss(inputs: jax.Array, *, fused: bool) -> tuple[jax.Array, jax.Array]:  # inputs: (B, T, D)
+        _, output = module.apply(
+            variables, inputs, positions, None, mask, method=_cudnn_attention if fused else None
+        )  # output: (B, T, D)
+        return jnp.square(output).sum(), output  # (), (B, T, D)
+
+    # Float32 isolates projection/masking correctness from fused BF16 rounding.
+    (_, actual), actual_grad = jax.jit(jax.value_and_grad(partial(loss, fused=True), has_aux=True))(
+        x
+    )  # each: (B, T, D)
+    (_, expected), expected_grad = jax.value_and_grad(partial(loss, fused=False), has_aux=True)(x)  # each: (B, T, D)
+    assert actual.shape == actual_grad.shape == (1, 4, 4)
+    np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(actual_grad, expected_grad, atol=2e-5, rtol=2e-5)
 
 
 def test_generation_rejects_insufficient_cache(tiny_gemma: tuple[Gemma3LM, Parameters]) -> None:

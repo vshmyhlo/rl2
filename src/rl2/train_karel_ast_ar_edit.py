@@ -88,7 +88,6 @@ from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 from pydantic import Field, model_validator
 from pydantic.dataclasses import dataclass
-from tensorboardX import SummaryWriter
 
 from rl2.attention import AttentionType
 from rl2.configuration import BaseConfig, load_config
@@ -118,17 +117,22 @@ from rl2.karel_ast_edit import (
     Observation,
 )
 from rl2.karel_ast_edit_vector import KarelASTEditVectorEnv
+from rl2.karel_checkpoints import (
+    TrainingProgress,
+    restore_checkpoint,
+)
+from rl2.karel_checkpoints import (
+    save_checkpoint as _save_checkpoint,
+)
+from rl2.mlflow_logging import MLflowLogger
 from rl2.train_karel_ast_grpo import (
     Array,
     Metrics,
-    TrainingProgress,
-    _restore_checkpoint,
-    _save_checkpoint,
     group_advantages,
     learning_rate_schedule,
 )
 from rl2.transformer import TransformerStackCarry
-from rl2.utils import read_bytes, read_optional, write_bytes
+from rl2.utils import read_optional, write_bytes
 
 
 @dataclass(frozen=True)
@@ -173,13 +177,10 @@ class Config(BaseConfig):
     max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 0.5
 
     # Run storage, checkpointing, and logging.
-    log_dir: str = "runs"
     checkpoint_interval_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] = (
         300.0  # Save at the next completed rollout boundary.
     )
-    log_interval: Annotated[int, Field(gt=0)] = (
-        20  # TensorBoard scalars, stdout, and flushes every N completed rollouts.
-    )
+    log_interval: Annotated[int, Field(gt=0)] = 20  # MLflow scalars, stdout, and flushes every N completed rollouts.
     log_program_interval: Annotated[int, Field(gt=0)] = (
         20  # Program samples on logging iterations divisible by this interval.
     )
@@ -190,7 +191,15 @@ class Config(BaseConfig):
     @classmethod
     def ignore_legacy_settings(cls, values: Any) -> Any:
         if isinstance(values, dict):
-            return {name: value for name, value in values.items() if name not in ("replay_batch_size",)}
+            return {
+                name: value
+                for name, value in values.items()
+                if name
+                not in (
+                    "log_dir",
+                    "replay_batch_size",
+                )
+            }
         return values
 
     def __post_init__(self) -> None:
@@ -661,7 +670,7 @@ def select_episodes(batch: EditBatch, indices: NDArray[np.int64]) -> EditBatch:
 
 
 def format_group_programs(programs: tuple[KarelAST, ...], rewards: Array, *, config: Config, group_index: int) -> str:
-    """Format the initial and sampled final programs from one task group for TensorBoard."""
+    """Format the initial and sampled final programs from one task group for MLflow."""
     chex.assert_shape(rewards, (len(programs),))
     chex.assert_type(rewards, np.float32)
     chex.assert_scalar_in(group_index, 0, config.num_tasks - 1)
@@ -704,8 +713,9 @@ def load_model(
         config = replace(config, attention_implementation=attention_implementation)
     dummy = np.zeros((1, config.env.height, config.env.width, 6), np.int32)
     state = create_state(config, dummy, dummy)
-    data = read_bytes(f"{directory}/checkpoint.msgpack")
-    restored = _restore_checkpoint(data, state, np.random.default_rng(config.seed))
+    restored = restore_checkpoint(directory, state, np.random.default_rng(config.seed))
+    if restored is None:
+        raise FileNotFoundError(f"No checkpoint in {directory}")
     return config, state.replace(params=restored.state.params)
 
 
@@ -734,11 +744,11 @@ def train(config: Config) -> TrainState:
     dummy = np.zeros((1, config.env.height, config.env.width, 6), np.int32)
     state = create_state(config, dummy, dummy)
     run_dir = config.ckpt_dir.rstrip("/")
-    checkpoint = read_optional(f"{run_dir}/checkpoint.msgpack")
-    progress = TrainingProgress(state, key, 0, 0, 0, 0)
+    checkpoint = restore_checkpoint(run_dir, state, rng)
+    progress = TrainingProgress(state=state, key=key, iteration=0, steps=0, logged_groups=0, episodes=0)
     if checkpoint is not None:
         check_resume_config(config, load_config(f"{run_dir}/config.yaml", Config))
-        progress = _restore_checkpoint(checkpoint, state, rng)
+        progress = checkpoint
         print(f"Resuming {run_dir} at rollout {progress.iteration}, step {progress.steps}", flush=True)
     else:
         if read_optional(f"{run_dir}/params.msgpack") is not None:
@@ -750,20 +760,18 @@ def train(config: Config) -> TrainState:
     write_bytes(f"{run_dir}/config.yaml", yaml.safe_dump(asdict(config)).encode())
     if checkpoint is None:
         _save_checkpoint(run_dir, progress, rng)
-    # Hide events from unsaved rollouts after an interruption, retaining the
-    # checkpoint's own step. New runs do not need a TensorBoard restart marker.
-    writer = SummaryWriter(logdir=run_dir, purge_step=steps + 1 if checkpoint is not None else None)
     with ExitStack() as resources:
-        resources.callback(writer.close)
+        writer = resources.enter_context(MLflowLogger(experiment="karel_ast_ar_edit", run_name=config.run_id))
         envs = resources.enter_context(
             KarelASTEditVectorEnv(config.edit_config, batch_size, workers=config.env_workers)
         )
-        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", steps)
-        writer.add_text("devices", str(jax.devices()), steps)
+        writer.log_params(asdict(config))
+        writer.log_text(yaml.safe_dump(asdict(config)), "config.yaml")
+        writer.log_text(str(jax.devices()), "devices.txt")
         parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
-        writer.add_scalar("model/params_millions", parameter_count / 1_000_000, steps)
+        writer.log_metrics({"model/params_millions": parameter_count / 1_000_000}, steps)
         print(
-            f"TensorBoard run: {run_dir}\nJAX devices: {jax.devices()}\nModel parameters: {parameter_count:,}",
+            f"MLflow run: {writer.run_id}\nJAX devices: {jax.devices()}\nModel parameters: {parameter_count:,}",
             flush=True,
         )
         print(
@@ -807,21 +815,26 @@ def train(config: Config) -> TrainState:
             if log_iteration:
                 jax.block_until_ready((state, metrics))
                 policy_loss, entropy, approx_kl, clip_fraction = np.mean(jax.device_get(metrics), axis=0)
-                for tag, scalar in {
-                    **diagnostics,
-                    "losses/policy": policy_loss,
-                    "policy/entropy": entropy,
-                    "policy/approx_kl": approx_kl,
-                    "policy/clip_fraction": clip_fraction,
-                    "policy/early_stop": early_stop,
-                    "charts/learning_rate": learning_rate,
-                    "charts/updates_per_rollout": updates_done,
-                    "charts/total_episodes": episodes,
-                    "charts/steps_per_second": (steps - start_steps) / (monotonic() - start),
-                    "time/rollout_seconds": rollout_seconds,
-                    "time/optimization_seconds": monotonic() - optimization_start,
-                }.items():
-                    writer.add_scalar(tag, float(scalar), steps)
+                writer.log_metrics(
+                    {
+                        tag: float(scalar)
+                        for tag, scalar in {
+                            **diagnostics,
+                            "losses/policy": policy_loss,
+                            "policy/entropy": entropy,
+                            "policy/approx_kl": approx_kl,
+                            "policy/clip_fraction": clip_fraction,
+                            "policy/early_stop": early_stop,
+                            "charts/learning_rate": learning_rate,
+                            "charts/updates_per_rollout": updates_done,
+                            "charts/total_episodes": episodes,
+                            "charts/steps_per_second": (steps - start_steps) / (monotonic() - start),
+                            "time/rollout_seconds": rollout_seconds,
+                            "time/optimization_seconds": monotonic() - optimization_start,
+                        }.items()
+                    },
+                    steps,
+                )
                 if config.log_program_count and (iteration + 1) % config.log_program_interval == 0:
                     samples = format_group_programs(
                         programs,
@@ -830,19 +843,25 @@ def train(config: Config) -> TrainState:
                         group_index=logged_groups % config.num_tasks,
                     )
                     logged_groups += 1
-                    writer.add_text("samples/generated_programs", samples, steps)
+                    writer.log_text(samples, f"samples/generated_programs/{steps}.md")
             if (
                 monotonic() - last_checkpoint_time >= config.checkpoint_interval_seconds
                 or iteration + 1 == config.total_updates
             ):
                 _save_checkpoint(
                     run_dir,
-                    TrainingProgress(state, key, iteration + 1, steps, logged_groups, episodes),
+                    TrainingProgress(
+                        state=state,
+                        key=key,
+                        iteration=iteration + 1,
+                        steps=steps,
+                        logged_groups=logged_groups,
+                        episodes=episodes,
+                    ),
                     rng,
                 )
                 last_checkpoint_time = monotonic()
             if log_iteration:
-                writer.flush()
                 print(
                     f"iteration={iteration + 1} step={steps} success={diagnostics['charts/success_rate']:.3f} "
                     f"reward={diagnostics['charts/reward_mean']:.3f} "

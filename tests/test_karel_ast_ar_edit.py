@@ -511,7 +511,7 @@ def test_config_and_checkpoint(config: edit.Config, state: TrainState, tmp_path:
     rng = np.random.default_rng(7)
     progress = edit.TrainingProgress(state, jax.random.key(5), 3, 6, 2, 6)
     edit._save_checkpoint(str(tmp_path), progress, rng)
-    restored = edit._restore_checkpoint((tmp_path / "checkpoint.msgpack").read_bytes(), state, np.random.default_rng(8))
+    restored = edit.restore_checkpoint(str(tmp_path), state, np.random.default_rng(8))
     assert restored.iteration == 3 and restored.steps == 6
     _, loaded = edit.load_model(tmp_path, attention_implementation="xla")
     for a, b in zip(jax.tree.leaves(loaded.params), jax.tree.leaves(state.params)):
@@ -546,24 +546,29 @@ def test_training_wiring(
     update = MagicMock(side_effect=fake_update)
     monkeypatch.setattr(edit, "update", update)
     writer = MagicMock()
-    monkeypatch.setattr(edit, "SummaryWriter", MagicMock(return_value=writer))
+    writer.__enter__.return_value = writer
+    monkeypatch.setattr(edit, "MLflowLogger", MagicMock(return_value=writer))
     vector = edit.KarelASTEditVectorEnv(config.edit_config, config.num_tasks * config.group_size)
     vector_factory = MagicMock(return_value=vector)
     monkeypatch.setattr(edit, "KarelASTEditVectorEnv", vector_factory)
-    config = replace(
-        config, log_dir=str(tmp_path / "logs"), ckpt_dir=str(tmp_path / "test"), run_id="test", update_epochs=2
-    )
+    config = replace(config, ckpt_dir=str(tmp_path / "test"), run_id="test", update_epochs=2)
     edit.train(config)
     vector_factory.assert_called_once_with(config.edit_config, 2, workers=config.env_workers)
     assert vector.closed
     assert collect.call_count == 1
     assert update.call_count == (1 if rejected else 2)
-    writer.add_scalar.assert_any_call("charts/updates_per_rollout", 0.0 if rejected else 2.0, 2)
-    writer.add_scalar.assert_any_call("policy/early_stop", float(rejected), 2)
+    scalars = {
+        tag: value
+        for call in writer.log_metrics.call_args_list
+        if call.args[1] == 2
+        for tag, value in call.args[0].items()
+    }
+    assert scalars["charts/updates_per_rollout"] == (0.0 if rejected else 2.0)
+    assert scalars["policy/early_stop"] == float(rejected)
     output = capsys.readouterr().out
     depth_penalty = rollout.diagnostics["charts/reward_depth_mean"]
     assert f"depth_penalty={depth_penalty:.4f}" in output
-    writer.add_scalar.assert_any_call("charts/reward_depth_mean", depth_penalty, 2)
+    assert scalars["charts/reward_depth_mean"] == depth_penalty
     for name in (
         "decisions_mean",
         "sequence_length_mean",
@@ -576,33 +581,35 @@ def test_training_wiring(
     ):
         value = rollout[2][f"charts/{name}"]
         assert f"{name}={value:.3f}" in output
-        writer.add_scalar.assert_any_call(f"charts/{name}", value, 2)
-    assert (tmp_path / "test" / "checkpoint.msgpack").is_file()
-    writer.add_text.assert_any_call(
-        "samples/generated_programs",
+        assert scalars[f"charts/{name}"] == value
+    assert (tmp_path / "test" / "1" / "_CHECKPOINT_METADATA").is_file()
+    writer.log_text.assert_any_call(
         edit.format_group_programs(rollout.programs, rollout.rewards, config=config, group_index=0),
-        2,
+        "samples/generated_programs/2.md",
     )
     edit.train(config)
     assert collect.call_count == 1  # Resume recognizes the completed rollout.
-    writer.close.assert_called_once()
+    writer.__exit__.assert_called_once()
     if not rejected:
         # Different attention head layouts have identical parameter shapes but
         # change the meaning of the saved projections and rotary positions.
         saved_config = (tmp_path / "test" / "config.yaml").read_bytes()
-        saved_checkpoint = (tmp_path / "test" / "checkpoint.msgpack").read_bytes()
+        saved_checkpoint = (tmp_path / "test" / "1" / "_CHECKPOINT_METADATA").read_bytes()
         with pytest.raises(ValueError, match="num_heads"):
             edit.train(replace(config, num_heads=4, total_updates=2))
         assert collect.call_count == 1
         assert (tmp_path / "test" / "config.yaml").read_bytes() == saved_config
-        assert (tmp_path / "test" / "checkpoint.msgpack").read_bytes() == saved_checkpoint
+        assert (tmp_path / "test" / "1" / "_CHECKPOINT_METADATA").read_bytes() == saved_checkpoint
         vector_factory.assert_called_once()
         # A compatible extension resumes the optimizer step and episode counters.
         vector_factory.return_value = type(vector)(config.edit_config, 2)
         resumed = edit.train(replace(config, total_updates=2))
         assert collect.call_count == 2
         assert int(resumed.step) == 4
-        writer.add_scalar.assert_any_call("charts/total_episodes", 4.0, 4)
+        assert any(
+            call.args[1] == 4 and call.args[0].get("charts/total_episodes") == 4.0
+            for call in writer.log_metrics.call_args_list
+        )
         assert vector_factory.return_value.closed
 
 

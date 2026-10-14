@@ -6,7 +6,8 @@ intrinsic return continues across resets while recurrent memory still resets.
 
 import argparse
 import json
-from dataclasses import asdict, field
+from contextlib import ExitStack, closing
+from dataclasses import asdict
 from functools import partial
 from time import monotonic
 from typing import Annotated, Any, Literal, SupportsFloat
@@ -24,12 +25,13 @@ from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 from pydantic import Field
 from pydantic.dataclasses import dataclass
-from tensorboardX import SummaryWriter
 
 from rl2 import atari_eval
 from rl2.configuration import BaseConfig, load_config
 from rl2.jax_cache import configure_compilation_cache
+from rl2.mlflow_logging import MLflowLogger
 from rl2.multi_atari import register_envs
+from rl2.rnd_checkpoints import TrainingProgress, checkpoint_manager, restore_checkpoint, save_checkpoint
 from rl2.utils import RunningMeanStd, gae
 
 type Array = jax.Array | NDArray[Any]
@@ -60,7 +62,6 @@ class Config(BaseConfig):
     entropy_coef: float
     value_coef: float
     max_grad_norm: float
-    log_dir: str = field(default="runs", kw_only=True)
     video_every_episodes: Annotated[int, Field(ge=0)]
     video_speed: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     bf16: bool = True
@@ -78,6 +79,7 @@ class Config(BaseConfig):
     rnd_update_epochs: Annotated[int, Field(gt=0)] = 4
     encoder_channels: Annotated[tuple[Annotated[int, Field(gt=0)], ...], Field(min_length=1)] = (128, 256, 384, 512)
     embedding_size: Annotated[int, Field(gt=0)] = 768
+    checkpoint_interval_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 600.0
 
     def __post_init__(self) -> None:
         if self.num_envs % self.num_minibatches:
@@ -369,7 +371,7 @@ def value(state: TrainState, obs: Array, carry: LSTMCarry, episode_starts: Array
 def log_video(
     state: TrainState,
     config: Config,
-    writer: SummaryWriter,
+    writer: MLflowLogger,
     episode: int,
     steps: int,
 ) -> None:
@@ -393,11 +395,9 @@ def log_video(
             if terminated or truncated:
                 break
         # One recorded frame per agent step, accounting for optional action repeat.
-        video = np.stack(frames).transpose(0, 3, 1, 2)[None]
-        writer.add_video(
-            "gameplay",
-            video,
-            steps,
+        writer.log_video(
+            frames,
+            f"gameplay/{steps}/{episode}.mp4",
             fps=config.video_speed * env.metadata["render_fps"] / (4 if config.atari_preprocessing else 1),
         )
         print(f"Recorded {len(frames)} gameplay frames after {episode} training episodes", flush=True)
@@ -408,7 +408,7 @@ def log_video(
 def log_evaluation(
     state: TrainState,
     config: Config,
-    writer: SummaryWriter,
+    writer: MLflowLogger,
     episode: int,
     steps: int,
     *,
@@ -420,7 +420,8 @@ def log_evaluation(
     started = monotonic()
 
     def on_video(video: NDArray[np.uint8], fps: float) -> None:  # video: (1, T, C, H, W)
-        writer.add_video("eval/gameplay", video, steps, fps=fps)
+        frames = list(video[0].transpose(0, 2, 3, 1))  # each (H, W, C)
+        writer.log_video(frames, f"eval/{steps}/gameplay.mp4", fps=fps)
 
     result = atari_eval.evaluate(
         atari_eval.TrainStateAgent(state, initial_carry, sequence_policy=True),
@@ -431,16 +432,16 @@ def log_evaluation(
     )
     for name in ("return_mean", "return_std", "return_sem", "human_normalized_score_percent"):
         if result[name] is not None:
-            writer.add_scalar(f"eval/{name}", result[name], steps)
-    writer.add_scalar("eval/total_training_episodes", episode, steps)
+            writer.log_metrics({f"eval/{name}": result[name]}, steps)
+    writer.log_metrics({"eval/total_training_episodes": episode}, steps)
     if result["training_scores"] is not None:
         for name, score in result["training_scores"].items():
             if score is not None:
-                writer.add_scalar(f"training/{name}", score, steps)
-    writer.add_scalar("time/evaluation_seconds", monotonic() - started, steps)
+                writer.log_metrics({f"training/{name}": score}, steps)
+    writer.log_metrics({"time/evaluation_seconds": monotonic() - started}, steps)
     result["training_steps"] = steps
     result["training_episodes"] = episode
-    writer.add_text("eval/report", f"```json\n{json.dumps(result, indent=2, allow_nan=False)}\n```", steps)
+    writer.log_text(json.dumps(result, indent=2, allow_nan=False), f"eval/{steps}/report.json")
     normalized = result["human_normalized_score_percent"]
     normalized_text = f" human_normalized={normalized:.1f}%" if normalized is not None else " human_normalized=n/a"
     print(
@@ -508,15 +509,17 @@ def train(config: Config) -> TrainState:
         autoreset_mode=gym.vector.AutoresetMode.DISABLED,
         **vector_options,
     )
-    writer = None
-    try:
+    with ExitStack() as resources:
+        resources.enter_context(closing(envs))
         run_dir = config.ckpt_dir.rstrip("/")
-        writer = SummaryWriter(logdir=run_dir)
-        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", 0)
-        print(f"TensorBoard run: {run_dir}", flush=True)
+        writer = resources.enter_context(MLflowLogger(experiment="ppo_rnd", run_name=config.run_id))
+        manager = resources.enter_context(checkpoint_manager(run_dir))
+        writer.log_params(asdict(config))
+        writer.log_text(yaml.safe_dump(asdict(config)), "config.yaml")
+        print(f"MLflow run: {writer.run_id}", flush=True)
         devices = str(jax.devices())
         print(f"JAX devices: {devices}", flush=True)
-        writer.add_text("devices", devices, 0)
+        writer.log_text(devices, "devices.txt")
         obs, _ = envs.reset(seed=config.seed)
         obs_moments = RunningMeanStd(rnd_frames(obs).shape[1:])
         print(f"Warming up RND normalization for {config.rnd_warmup_steps} vector steps", flush=True)
@@ -564,16 +567,46 @@ def train(config: Config) -> TrainState:
             tx=optimizer(config.learning_rate),
         )
         parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
-        writer.add_scalar("model/params_millions", parameter_count / 1_000_000, 0)
+        writer.log_metrics({"model/params_millions": parameter_count / 1_000_000}, 0)
         print(f"Model parameters: {parameter_count:,}", flush=True)
-        writer.add_text("model/parameter_count", str(parameter_count), 0)
+        writer.log_text(str(parameter_count), "model/parameter_count.txt")
         rng = np.random.default_rng(config.seed)
         episode_returns = np.zeros(config.num_envs)
         episode_lengths = np.zeros(config.num_envs, dtype=np.int64)
         completed_episodes = 0
         training_return_sum = 0.0
         training_length_sum = 0
+        progress = restore_checkpoint(
+            manager,
+            TrainingProgress(
+                state=state,
+                predictor=predictor,
+                target=target,
+                key=key,
+                rnd_key=rnd_key,
+                iteration=0,
+                episodes=0,
+                return_sum=0.0,
+                length_sum=0,
+            ),
+            obs_moments,
+            reward_moments,
+            rng,
+        )
+        (
+            state,
+            predictor,
+            target,
+            key,
+            rnd_key,
+            start_iteration,
+            completed_episodes,
+            training_return_sum,
+            training_length_sum,
+        ) = progress
         next_video_episode = config.video_every_episodes
+        if config.video_every_episodes:
+            next_video_episode = (completed_episodes // config.video_every_episodes + 1) * config.video_every_episodes
         shape = (config.num_steps, config.num_envs)
         observations = np.empty((*shape, *obs.shape[1:]), dtype=np.uint8)
         actions = np.empty(shape, dtype=np.int32)
@@ -586,9 +619,10 @@ def train(config: Config) -> TrainState:
         # Keep asynchronous initialization out of the first rollout's timing.
         jax.block_until_ready((state, predictor, target, carry, key))
         start = monotonic()
+        last_checkpoint_time = start
         eval_interval_seconds = config.eval_every_minutes * 60
         next_eval_time = start + eval_interval_seconds
-        for iteration in range(config.total_steps // batch_size):
+        for iteration in range(start_iteration, config.total_steps // batch_size):
             rollout_start = monotonic()
             env_seconds = 0.0
             model_seconds = 0.0
@@ -733,35 +767,42 @@ def train(config: Config) -> TrainState:
             # Evaluate rollout-time predictions against the full rollout's GAE returns.
             explained_var = explained_variance(values[..., 0], extrinsic_returns)
             steps = (iteration + 1) * batch_size
-            sps = steps / (monotonic() - start)
-            for tag, scalar in {
-                "losses/policy": policy_loss,
-                "losses/value": value_loss,
-                "losses/intrinsic_value": intrinsic_value_loss,
-                "losses/rnd_predictor": float(np.mean(jax.device_get(rnd_losses))),
-                "rnd/reward_raw_mean": raw_intrinsic_mean,
-                "rnd/reward_normalized_mean": float(intrinsic_rewards.mean()),
-                "rnd/return_std": float(np.sqrt(reward_moments.var)),
-                "rnd/predictor_updates": int(predictor.step),
-                "value/intrinsic_explained_variance": explained_variance(values[..., 1], intrinsic_returns),
-                "policy/entropy": entropy,
-                "charts/steps_per_second": sps,
-                "time/rollout_seconds": rollout_seconds,
-                "time/rollout_env_seconds": env_seconds,
-                "time/rollout_model_seconds": model_seconds,
-                "time/optimization_seconds": optimization_seconds,
-                "policy/approx_kl": approx_kl,
-                "policy/clip_fraction": clip_fraction,
-                "value/explained_variance": explained_var,
-                "charts/learning_rate": learning_rate,
-                "charts/updates_per_rollout": updates_done,
-                "policy/early_stop": early_stop,
-                "charts/total_episodes": completed_episodes,
-            }.items():
-                writer.add_scalar(tag, float(scalar), steps)
+            sps = (steps - start_iteration * batch_size) / (monotonic() - start)
+            writer.log_metrics(
+                {
+                    tag: float(scalar)
+                    for tag, scalar in {
+                        "losses/policy": policy_loss,
+                        "losses/value": value_loss,
+                        "losses/intrinsic_value": intrinsic_value_loss,
+                        "losses/rnd_predictor": float(np.mean(jax.device_get(rnd_losses))),
+                        "rnd/reward_raw_mean": raw_intrinsic_mean,
+                        "rnd/reward_normalized_mean": float(intrinsic_rewards.mean()),
+                        "rnd/return_std": float(np.sqrt(reward_moments.var)),
+                        "rnd/predictor_updates": int(predictor.step),
+                        "value/intrinsic_explained_variance": explained_variance(values[..., 1], intrinsic_returns),
+                        "policy/entropy": entropy,
+                        "charts/steps_per_second": sps,
+                        "time/rollout_seconds": rollout_seconds,
+                        "time/rollout_env_seconds": env_seconds,
+                        "time/rollout_model_seconds": model_seconds,
+                        "time/optimization_seconds": optimization_seconds,
+                        "policy/approx_kl": approx_kl,
+                        "policy/clip_fraction": clip_fraction,
+                        "value/explained_variance": explained_var,
+                        "charts/learning_rate": learning_rate,
+                        "charts/updates_per_rollout": updates_done,
+                        "policy/early_stop": early_stop,
+                        "charts/total_episodes": completed_episodes,
+                    }.items()
+                },
+                steps,
+            )
             if completed_episodes:
-                writer.add_scalar("charts/total_return_mean", training_return_sum / completed_episodes, steps)
-                writer.add_scalar("charts/total_episode_length_mean", training_length_sum / completed_episodes, steps)
+                writer.log_metrics({"charts/total_return_mean": training_return_sum / completed_episodes}, steps)
+                writer.log_metrics(
+                    {"charts/total_episode_length_mean": training_length_sum / completed_episodes}, steps
+                )
             while config.video_every_episodes and completed_episodes >= next_video_episode:
                 log_video(state, config, writer, next_video_episode, steps)
                 next_video_episode += config.video_every_episodes
@@ -781,8 +822,30 @@ def train(config: Config) -> TrainState:
                 )
                 # Restart after evaluation so long evaluations never cause catch-up runs.
                 next_eval_time = monotonic() + eval_interval_seconds
-            writer.flush()
             score = f"{training_return_sum / completed_episodes:.1f}" if completed_episodes else "n/a"
+            if (
+                monotonic() - last_checkpoint_time >= config.checkpoint_interval_seconds
+                or iteration + 1 == config.total_steps // batch_size
+            ):
+                save_checkpoint(
+                    manager,
+                    TrainingProgress(
+                        state=state,
+                        predictor=predictor,
+                        target=target,
+                        key=key,
+                        rnd_key=rnd_key,
+                        iteration=iteration + 1,
+                        episodes=completed_episodes,
+                        return_sum=training_return_sum,
+                        length_sum=training_length_sum,
+                    ),
+                    obs_moments,
+                    reward_moments,
+                    rng,
+                    config,
+                )
+                last_checkpoint_time = monotonic()
             length = f"{training_length_sum / completed_episodes:.1f}" if completed_episodes else "n/a"
             print(
                 f"step={steps} episodes={completed_episodes} return={score} "
@@ -793,10 +856,6 @@ def train(config: Config) -> TrainState:
                 flush=True,
             )
         return state
-    finally:
-        envs.close()
-        if writer is not None:
-            writer.close()
 
 
 def main() -> None:

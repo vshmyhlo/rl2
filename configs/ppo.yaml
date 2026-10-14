@@ -25,7 +25,7 @@ entropy_decay: constant # Keep the exploration bonus throughout training
 value_coef: 0.5
 max_grad_norm: 0.5
 ckpt_dir: gs://cohere-dev/vlad/rl2/${run_id}
-run_id: ppo # TensorBoard run directory; change this for a new run
+run_id: ppo # MLflow run name; change this for a new run
 # All intervals count completed PPO iterations (one rollout and its updates).
 # Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
 video_interval: 245 # Iterations between recordings; 0 disables recording

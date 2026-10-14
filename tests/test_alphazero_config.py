@@ -22,7 +22,7 @@ from rl2.configuration import load_config
         ({"exploration_moves": -1}, "exploration_moves"),
         ({"seed": 2**32}, "seed"),
         ({"env_id": "go_9x9"}, "env_id"),
-        ({"log_dir": " "}, "log_dir"),
+        ({"ckpt_dir": " "}, "ckpt_dir"),
         ({"run_id": " "}, "run_id"),
         ({"run_id": ".."}, "run_id"),
         ({"run_id": "a/b"}, "run_id"),
@@ -113,7 +113,7 @@ def test_load_default_config() -> None:
     config = load_config(path, Config)
     assert config.env_id == "chess"
     assert config.run_id == "alphazero_chess"
-    assert config.log_dir == "gs://cohere-dev/vlad/rl2/alphazero/alphazero_chess"
+    assert config.ckpt_dir == "gs://cohere-dev/vlad/rl2/alphazero/alphazero_chess"
 
 
 @pytest.mark.parametrize(

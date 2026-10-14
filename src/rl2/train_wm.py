@@ -12,7 +12,8 @@ resets at episode boundaries. No policy is learned.
 import argparse
 import json
 import os
-from dataclasses import asdict, field
+from contextlib import ExitStack, closing
+from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from time import monotonic
@@ -36,11 +37,11 @@ from google.cloud import storage
 from numpy.typing import NDArray
 from pydantic import Field
 from pydantic.dataclasses import dataclass
-from tensorboardX import SummaryWriter
 
 from rl2.atari_env import make_env
 from rl2.configuration import BaseConfig, load_config
 from rl2.jax_cache import configure_compilation_cache
+from rl2.mlflow_logging import MLflowLogger
 from rl2.model.encoders.rgb import ConvStages, validate_stages
 from rl2.wm import (
     LSTMWorldModel,
@@ -81,10 +82,7 @@ class Config(BaseConfig):
     free_nats: Annotated[float, Field(ge=0, allow_inf_nan=False)]
     learning_rate: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)]
-    log_dir: str = field(default="runs", kw_only=True)
     log_every: Annotated[int, Field(gt=0)]
-    log_flush_secs: Annotated[int, Field(gt=0)]
-    checkpoint_dir: str = field(default="checkpoints", kw_only=True)
     checkpoint_every: Annotated[int, Field(gt=0)]
     video_every_steps: Annotated[int, Field(ge=0)]
     video_num_steps: Annotated[int, Field(gt=0)]
@@ -462,7 +460,7 @@ def log_video(
     state: TrainState,
     model: MambaWorldModel,
     config: Config,
-    writer: SummaryWriter,
+    writer: MLflowLogger,
     observations: NDArray[np.uint8],
     actions: NDArray[np.int32],
     steps: int,
@@ -494,7 +492,7 @@ def log_video(
     targets = frames[0, config.video_prefill_frames :]
     for panel, name in enumerate(("posterior", "prior"), start=1):
         error = frames[panel, config.video_prefill_frames :] - targets
-        writer.add_scalar(f"diagnostics/{name}_mse", float(np.mean(np.square(error))), steps)
+        writer.log_metrics({f"diagnostics/{name}_mse": float(np.mean(np.square(error)))}, steps)
     frames = frames[:, :, -1]  # Show the newest frame from each observation stack.
     if frames.ndim == 4:
         frames = np.repeat(frames[..., None], 3, axis=-1)
@@ -515,9 +513,8 @@ def log_video(
                 1,
                 cv2.LINE_AA,
             )
-    video = np.concatenate(tuple(panels), axis=2).transpose(0, 3, 1, 2)[None]
-    writer.add_video("imagination/real_posterior_prior", video, steps, fps=config.video_fps)
-    writer.flush()
+    video = np.concatenate(tuple(panels), axis=2)  # (T, H, 3*W, 3)
+    writer.log_video(list(video), f"imagination/{steps}/real_posterior_prior.mp4", fps=config.video_fps)
     print(
         f"Recorded comparison: {config.video_prefill_frames} context + {config.video_num_steps} predicted frames "
         f"at step {steps} (real | posterior | prior)",
@@ -551,7 +548,7 @@ def save_checkpoint(state: TrainState, run_dir: str | Path) -> None:
 
 
 def train(config: Config) -> str:
-    """Train on fresh random-policy rollouts and return the log directory."""
+    """Train on fresh random-policy rollouts and return the checkpoint directory."""
     configure_compilation_cache()
     vector_cls = gym.vector.AsyncVectorEnv if config.vector_env == "async" else gym.vector.SyncVectorEnv
     vector_options = {"context": "spawn"} if config.vector_env == "async" else {}
@@ -570,8 +567,8 @@ def train(config: Config) -> str:
         autoreset_mode=gym.vector.AutoresetMode.DISABLED,
         **vector_options,
     )
-    writer = None
-    try:
+    with ExitStack() as resources:
+        resources.enter_context(closing(envs))
         observation, _ = envs.reset(seed=config.seed)
         episode_start = np.ones(config.num_envs, dtype=np.bool_)
         rng = np.random.default_rng(config.seed)
@@ -605,27 +602,26 @@ def train(config: Config) -> str:
             tx=optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adam(lr_schedule)),
         )
         carry = model.initial_carry(config.num_envs)
-        run_dir = f"{config.log_dir.rstrip('/')}/{config.run_id}"
-        checkpoint_run_dir = config.ckpt_dir.rstrip("/")
+        run_dir = config.ckpt_dir.rstrip("/")
         metadata = {
             **asdict(config),
             "observation_shape": model.observation_shape,
             "num_actions": model.num_actions,
         }
-        writer = SummaryWriter(logdir=run_dir, flush_secs=config.log_flush_secs)
+        writer = resources.enter_context(MLflowLogger(experiment="wm", run_name=config.run_id))
         metadata_bytes = (json.dumps(metadata, indent=2) + "\n").encode()
         write_artifact(f"{run_dir}/config.json", metadata_bytes)
-        write_artifact(f"{checkpoint_run_dir}/config.json", metadata_bytes)
-        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", 0)
-        print(f"TensorBoard run: {run_dir}", flush=True)
-        print(f"Orbax checkpoints: {checkpoint_run_dir}/<update>/", flush=True)
+        writer.log_params(asdict(config))
+        writer.log_text(yaml.safe_dump(asdict(config)), "config.yaml")
+        print(f"MLflow run: {writer.run_id}", flush=True)
+        print(f"Orbax checkpoints: {run_dir}/<update>/", flush=True)
         devices = str(jax.devices())
         print(f"JAX devices: {devices}", flush=True)
-        writer.add_text("devices", devices, 0)
+        writer.log_text(devices, "devices.txt")
         parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
-        writer.add_scalar("model/params_millions", parameter_count / 1_000_000, 0)
+        writer.log_metrics({"model/params_millions": parameter_count / 1_000_000}, 0)
         print(f"Model parameters: {parameter_count:,}", flush=True)
-        writer.add_text("model/parameter_count", str(parameter_count), 0)
+        writer.log_text(str(parameter_count), "model/parameter_count.txt")
         start = monotonic()
         steps, iteration = 0, 0
         next_video_step = config.video_every_steps
@@ -655,12 +651,16 @@ def train(config: Config) -> str:
                 raise FloatingPointError(f"Non-finite training metrics: {values}")
             steps += num_steps * config.num_envs
             iteration += 1
-            for name, value in values.items():
-                writer.add_scalar(f"train/{name}", value, steps)
-            writer.add_scalar("rollout/mean_reward", float(batch.rewards.mean()), steps)
-            writer.add_scalar("rollout/termination_rate", float(batch.terminated.mean()), steps)
-            writer.add_scalar("charts/steps_per_second", steps / (monotonic() - start), steps)
-            writer.add_scalar("charts/learning_rate", learning_rate, steps)
+            writer.log_metrics(
+                {
+                    **{f"train/{name}": value for name, value in values.items()},
+                    "rollout/mean_reward": float(batch.rewards.mean()),
+                    "rollout/termination_rate": float(batch.terminated.mean()),
+                    "charts/steps_per_second": steps / (monotonic() - start),
+                    "charts/learning_rate": learning_rate,
+                },
+                steps,
+            )
             if iteration == 1 or iteration % config.log_every == 0 or steps == config.total_steps:
                 print(
                     f"steps={steps}/{config.total_steps} loss={values['loss']:.4f} "
@@ -668,9 +668,8 @@ def train(config: Config) -> str:
                     f"termination={values['termination_loss']:.4f} kl={values['kl']:.4f} lr={learning_rate:.3g}",
                     flush=True,
                 )
-                writer.flush()
             if iteration % config.checkpoint_every == 0 or steps == config.total_steps:
-                save_checkpoint(state, checkpoint_run_dir)
+                save_checkpoint(state, run_dir)
             if config.video_every_steps and steps >= next_video_step:
                 assert video_history is not None
                 num_video_frames = config.video_prefill_frames + config.video_num_steps
@@ -684,12 +683,6 @@ def train(config: Config) -> str:
                     )
                 next_video_step = (steps // config.video_every_steps + 1) * config.video_every_steps
         return run_dir
-    finally:
-        try:
-            envs.close()
-        finally:
-            if writer is not None:
-                writer.close()
 
 
 def main() -> None:

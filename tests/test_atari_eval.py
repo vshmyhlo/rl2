@@ -643,12 +643,14 @@ def test_evaluation_logging_records_scores_and_report_without_mutating_state(tra
     with (
         patch("rl2.atari_eval.make_evaluation_env", return_value=ScoringEnv()),
         patch("rl2.atari_eval._action", return_value=(jnp.asarray(0), ())) as action,
-        patch.object(module, "SummaryWriter") as writer,
+        patch.object(module, "MLflowLogger") as writer,
     ):
         module.log_evaluation(state, config, writer, 101, 100, training_scores=scores, initial_carry=initial)
     assert action.call_args_list[0].args[2] is initial
     assert action.call_args_list[2].args[2] is initial
-    scalars = {call.args[0]: call.args[1:] for call in writer.add_scalar.call_args_list}
+    scalars = {
+        tag: (value, call.args[1]) for call in writer.log_metrics.call_args_list for tag, value in call.args[0].items()
+    }
     assert scalars["eval/return_mean"] == (5, 100)
     assert "eval/return_median" not in scalars
     assert scalars["eval/total_training_episodes"] == (101, 100)
@@ -659,20 +661,21 @@ def test_evaluation_logging_records_scores_and_report_without_mutating_state(tra
     assert "training/return_mean_100" not in scalars
     assert not any("last_100" in tag for tag in scalars)
     assert scalars["eval/human_normalized_score_percent"] == pytest.approx((100 * (5 + 20.7) / (14.6 + 20.7), 100))
-    tag, text, step = writer.add_text.call_args.args
-    assert tag == "eval/report" and step == 100
-    report = json.loads(text.removeprefix("```json\n").removesuffix("\n```"))
+    text, artifact = writer.log_text.call_args.args
+    assert "100" in artifact and artifact.endswith(".json")
+    report = json.loads(text)
     assert "return_median" not in report
     assert report["training_steps"] == 100 and report["training_episodes"] == 101
     assert report["training_scores"] == scores.as_report()
     assert report["baselines"]["source"] == REFERENCE_SOURCE
     assert [episode["seed"] for episode in report["episodes"]] == [321, 322]
-    writer.add_video.assert_called_once()
-    tag, video, step = writer.add_video.call_args.args  # video: (1, T, C, H, W)
-    assert tag == "eval/gameplay" and step == 100
-    assert video.shape == (1, 3, 3, 2, 3)
+    writer.log_video.assert_called_once()
+    frames, artifact = writer.log_video.call_args.args  # each (H, W, C)
+    assert "100" in artifact and artifact.endswith(".mp4")
+    video = np.stack(frames)  # (T, H, W, C)
+    assert video.shape == (3, 2, 3, 3)
     assert video.dtype == np.uint8
-    np.testing.assert_array_equal(video[0, :, 0, 0, 0], [10, 11, 12])
-    assert writer.add_video.call_args.kwargs["fps"] == 30
+    np.testing.assert_array_equal(video[:, 0, 0, 0], [10, 11, 12])
+    assert writer.log_video.call_args.kwargs["fps"] == 30
     for old, new in zip(jax.tree.leaves(before), jax.tree.leaves(state), strict=True):
         np.testing.assert_array_equal(old, new)

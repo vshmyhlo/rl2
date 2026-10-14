@@ -45,7 +45,7 @@ def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
 
 
 def checkpoint_settings(config: Config) -> dict[str, Any]:
-    mutable = {"run_id", "log_dir", "iterations", "log_interval_seconds", "checkpoint_interval_seconds", "evaluation"}
+    mutable = {"run_id", "ckpt_dir", "iterations", "log_interval_seconds", "checkpoint_interval_seconds", "evaluation"}
     return {name: value for name, value in asdict(config).items() if name not in mutable}
 
 
@@ -73,7 +73,8 @@ def restore_checkpoint(manager: ocp.CheckpointManager, state: TrainState, config
         return None
     saved = manager.restore(iteration, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
     metadata = CheckpointMetadata.model_validate(saved)
-    if metadata.config != checkpoint_settings(config):
+    saved_settings = {name: value for name, value in metadata.config.items() if name not in ("log_dir", "ckpt_dir")}
+    if saved_settings != checkpoint_settings(config):
         raise ValueError("Checkpoint training settings are incompatible with this config. Use a new run_id.")
     if metadata.iteration != iteration:
         raise ValueError("Checkpoint iteration does not match its directory")

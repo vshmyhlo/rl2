@@ -1,4 +1,4 @@
-"""MLflow runs, console logs, metrics, and playback artifacts shared by PPO trainers."""
+"""MLflow runs, console logs, metrics, and playback artifacts shared by trainers."""
 
 import os
 import posixpath

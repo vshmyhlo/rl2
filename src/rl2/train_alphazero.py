@@ -11,7 +11,7 @@ the latest saved iteration.
 Progress metrics aggregate over log_interval_seconds (default: 60), emitted
 at iteration boundaries and on normal completion.
 
-TensorBoard metrics use cumulative played positions as the step axis, excluding
+MLflow metrics use cumulative played positions as the step axis, excluding
 terminal padding. Each logging window contains complete training iterations:
 
 - losses/policy_loss: Mean policy cross-entropy against MCTS action weights,
@@ -87,7 +87,6 @@ import yaml
 from flax import struct
 from flax.training.train_state import TrainState
 from omegaconf.errors import OmegaConfBaseException
-from tensorboardX import SummaryWriter
 
 from rl2.alphazero.checkpoints import TrainingProgress, checkpoint_manager, restore_checkpoint, save_checkpoint
 from rl2.alphazero.config import Config
@@ -97,6 +96,7 @@ from rl2.alphazero.puct import puct_policy
 from rl2.alphazero.search import PolicyValueFn, recurrent_step
 from rl2.alphazero.utils import masked_logits
 from rl2.configuration import load_config
+from rl2.mlflow_logging import MLflowLogger
 
 logger = logging.getLogger(__name__)
 
@@ -312,24 +312,21 @@ def train(config: Config) -> TrainState:
     )
     with (
         checkpoint_manager(config.ckpt_dir) as manager,
-        SummaryWriter(
-            logdir=config.log_dir,
-            purge_step=(
-                progress.steps + 1 if (progress := restore_checkpoint(manager, state, config)) is not None else None
-            ),
-        ) as writer,
+        MLflowLogger(experiment="alphazero", run_name=config.run_id) as writer,
     ):
+        progress = restore_checkpoint(manager, state, config)
         start_iteration = steps = completed_games = 0
         if progress is not None:
             state, key, start_iteration, steps, completed_games = progress
         opponent_params = state.params if progress is not None else None
         opponent_iteration = start_iteration
-        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", steps)
-        writer.add_text("devices", str(jax.devices()), steps)
+        writer.log_params(asdict(config))
+        writer.log_text(yaml.safe_dump(asdict(config)), "config.yaml")
+        writer.log_text(str(jax.devices()), "devices.txt")
         parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
-        writer.add_scalar("model/params_millions", parameter_count / 1_000_000, steps)
+        writer.log_metrics({"model/params_millions": parameter_count / 1_000_000}, steps)
         logger.info("Run ID: %s", config.run_id)
-        logger.info("TensorBoard run: %s", config.log_dir)
+        logger.info("MLflow run: %s", writer.run_id)
         if progress is not None:
             logger.info("Resumed iteration %d, step %d", start_iteration, steps)
         start = monotonic()
@@ -379,9 +376,7 @@ def train(config: Config) -> TrainState:
                     * (config.iterations - iteration - 1)
                     / (iteration + 1 - start_iteration),
                 }
-                for tag, value in scalars.items():
-                    writer.add_scalar(tag, value, steps)
-                writer.flush()
+                writer.log_metrics(scalars, steps)
                 logger.info(
                     "Iteration %d/%d | steps=%d | %s | seconds=%.2f",
                     iteration + 1,
@@ -412,9 +407,7 @@ def train(config: Config) -> TrainState:
                         opponent_iteration=opponent_iteration,
                         seconds=monotonic() - evaluation_start,
                     )
-                    for name, value in evaluation_metrics.items():
-                        writer.add_scalar(f"eval/{name}", value, steps)
-                    writer.flush()
+                    writer.log_metrics({f"eval/{name}": value for name, value in evaluation_metrics.items()}, steps)
                     logger.info(
                         "Evaluation | %s",
                         " | ".join(f"{name}={value:.6g}" for name, value in evaluation_metrics.items()),

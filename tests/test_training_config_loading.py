@@ -50,8 +50,6 @@ def test_training_cli_resolves_yaml(
     settings[field] = f"${{{reference}}}"
     settings["run_id"] = "test_seed${seed}"
     settings["ckpt_dir"] = "gs://checkpoints/${run_id}"
-    settings.pop("log_dir", None)
-    settings.pop("checkpoint_dir", None)
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(settings))
     train = Mock()
@@ -154,22 +152,20 @@ def test_reasoning_prompt_examples_are_validated_on_construction() -> None:
 
 
 @pytest.mark.parametrize(
-    "trainer,preset,root,append_run_id",
+    "trainer,preset,root",
     [
-        (ppo_rnd, "ppo_rnd_montezuma.yaml", "log_dir", True),
-        (train_wm, "wm_atari.yaml", "checkpoint_dir", True),
-        (train_alphazero, "alphazero_chess.yaml", "log_dir", False),
-        (train_karel_grpo, "karel_grpo.yaml", "log_dir", True),
-        (train_karel_ast_grpo, "karel_ast_grpo.yaml", "log_dir", True),
-        (train_karel_ast_ar_edit, "karel_ast_ar_edit.yaml", "log_dir", True),
+        (ppo_rnd, "ppo_rnd_montezuma.yaml", "gs://cohere-dev/vlad/rl2"),
+        (train_wm, "wm_atari.yaml", "gs://cohere-dev/vlad/rl2_cp/wm"),
+        (train_alphazero, "alphazero_chess.yaml", "gs://cohere-dev/vlad/rl2/alphazero"),
+        (train_karel_grpo, "karel_grpo.yaml", "gs://cohere-dev/vlad/rl2/karel_grpo"),
+        (train_karel_ast_grpo, "karel_ast_grpo.yaml", "gs://cohere-dev/vlad/rl2/karel_ast_grpo"),
+        (train_karel_ast_ar_edit, "karel_ast_ar_edit.yaml", "gs://cohere-dev/vlad/rl2/karel_ast_ar_edit"),
     ],
 )
-def test_preset_checkpoint_directories(trainer: ModuleType, preset: str, root: str, append_run_id: bool) -> None:
+def test_preset_checkpoint_directories(trainer: ModuleType, preset: str, root: str) -> None:
     config = trainer.load_config(Path(__file__).resolve().parents[1] / "configs" / preset, trainer.Config)
-    expected = getattr(config, root)
-    if append_run_id:
-        expected = f"{expected}/{config.run_id}"
-    assert config.ckpt_dir == expected
+    assert config.ckpt_dir == f"{root}/{config.run_id}"
+    assert "log_dir" not in asdict(config)
 
 
 def test_progress_logging_presets() -> None:
