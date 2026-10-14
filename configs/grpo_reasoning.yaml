@@ -6,21 +6,25 @@ tokenizer: null # Cached TinyLlama SentencePiece tokenizer; or a local .model fi
 backend: triton # Requires CUDA and the gdn2-triton extra
 dtype: bfloat16
 
-task: leg_counting # Any reasoning_gym.create_dataset task name
-task_config: # Start with simple questions to obtain useful rewards
-  min_animals: 1
-  max_animals: 3
-  min_instances: 1
-  max_instances: 3
+task: basic_arithmetic # Any reasoning_gym.create_dataset task name
+task_config: # Small step up: add two or three nonnegative integers from 0 to 10
+  min_terms: 2
+  max_terms: 3
+  min_digits: 1
+  max_digits: 1
+  operators: ["+"]
+  allow_parentheses: false
+  allow_negation: false
+  format_style: simple
 prompt_examples: # Worked examples teach the pretrained model the completion format
-  - question: How many legs are there in total if you have 2 dogs?
+  - question: Calculate 2 + 3.
     completion: |-
-      Dogs have 4 legs each. 2 * 4 = 8.
-      <answer>8</answer>
-  - question: How many legs are there in total if you have 1 human and 2 spiders?
+      2 + 3 = 5.
+      <answer>5</answer>
+  - question: Calculate 4 + 7 + 2.
     completion: |-
-      Humans have 2 legs and spiders have 8. 1 * 2 + 2 * 8 = 18.
-      <answer>18</answer>
+      4 + 7 = 11. 11 + 2 = 13.
+      <answer>13</answer>
 seed: 1
 total_updates: 100000
 num_tasks: 16 # Unique questions per rollout
@@ -38,7 +42,7 @@ duration_penalty_coef: 0.1 # Subtract coef * generated tokens / max_new_tokens; 
 max_grad_norm: 1.0
 
 log_dir: gs://cohere-dev/vlad/rl2/grpo_reasoning
-run_id: leg_counting_easy_fewshot_v1 # New run from pretrained weights; keep this ID to resume
+run_id: basic_arithmetic_addition_fewshot_v1 # New run from pretrained weights; keep this ID to resume
 log_interval: 10 # Rollout batches; TensorBoard steps count prompts/tasks, not completions
 log_completion_count: 4 # Show one prompt and 2–4 completions from its group in TensorBoard
 checkpoint_interval_seconds: 600 # Every 10 minutes at the next completed rollout, plus final

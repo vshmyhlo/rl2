@@ -1,20 +1,20 @@
 seed: 1
 total_updates: 100000
 num_tasks: 32
-max_unique_tasks: 1 # Set to 1 to overfit one fixed problem across all updates; null samples fresh tasks
+max_unique_tasks: null # Set to 1 to overfit one fixed problem across all updates; null samples fresh tasks
 group_size: 8 # Independent editing episodes per task, all starting from the fixed turnLeft program
 env_workers: 8 # Persistent spawned workers for batched reset/stepping; 0 runs locally
 num_minibatches: 4 # Must divide num_tasks * group_size; episodes stay together
 update_epochs: 1
-max_seq_len: 512 # Total prefill tokens, policy EDIT tokens, and FEEDBACK reports
+max_seq_len: 256 # Total prefill tokens, policy EDIT tokens, and FEEDBACK reports
 allow_stop: false # Set false to keep editing until no complete edit fits the remaining sequence budget
 max_nodes: 128 # Whole candidate tree, including lists and values
 max_depth: 32 # AST edges, including lists
 bf16: true
 attention_implementation: cudnn # Use xla for CPU
-d_model: 512
-num_layers: 8
-num_heads: 8
+d_model: 1024
+num_layers: 16
+num_heads: 16
 num_kv_heads: null
 learning_rate: 0.0001
 anneal_lr: true
@@ -23,7 +23,7 @@ target_kl: 0.02
 entropy_coef: 0.01
 max_grad_norm: 1.0
 log_dir: gs://cohere-dev/vlad/rl2/karel_ast_ar_edit # Local or gs:// path
-run_id: delta_conv_all_steps_v5 # Every-token image encoder; use a fresh run, incompatible with older encoders
+run_id: delta_conv_all_steps_v6 # Every-token image encoder; use a fresh run, incompatible with older encoders
 checkpoint_interval_seconds: 300
 log_interval: 10
 log_program_interval: 10

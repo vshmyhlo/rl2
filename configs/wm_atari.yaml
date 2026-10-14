@@ -33,7 +33,7 @@ max_grad_norm: 1.0
 log_dir: gs://cohere-dev/vlad/rl2/wm # Local path or GCS prefix for TensorBoard logs and config.json
 log_every: 10 # Print training metrics every N updates
 log_flush_secs: 30 # Background TensorBoard flush interval; also flush after progress reports and videos
-checkpoint_dir: gs://cohere-dev/vlad/rl2_cp/wm # Uses the same run name as log_dir; saves checkpoint.msgpack and config.json
+checkpoint_dir: gs://cohere-dev/vlad/rl2_cp/wm # Same run name as log_dir; latest Orbax <update>/ checkpoint and config.json
 checkpoint_every: 500 # Optimizer updates, plus the final checkpoint of each run
 video_every_steps: 100000 # Online-only collected transitions between videos; 0 disables online videos
 video_prefill_frames: 10 # Shared real context before the real/posterior/prior comparison
