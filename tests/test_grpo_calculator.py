@@ -32,11 +32,13 @@ def test_calculator_config_and_chat_format() -> None:
     expected = dialog.Conversation(dialog.User(first_user)).as_text(format="gemma3")
     assert prompt == expected
     turns: list[dialog.User | dialog.Model] = []
-    for index, example in enumerate(config.prompt_examples):
-        expression = example.question.removeprefix("Calculate ").removesuffix(".")
-        answer = grpo.calculate(expression)
+    answers = ("16", "56", "40", "90", "28", "142")
+    for index, (example, answer) in enumerate(zip(config.prompt_examples, answers, strict=True)):
+        assert example.question.startswith("How many legs are there in total if you have ")
         assert grpo.extract_answer(example.completion) == answer
         if "<calculator>" in example.completion:
+            expression = example.completion.split("<calculator>", 1)[1].split("</calculator>", 1)[0]
+            assert grpo.calculate(expression) == answer
             assert f"<calculator>{expression}</calculator>\n<result>{answer}</result>" in example.completion
         content = first_user.removesuffix("12 * 13?") + example.question if index == 0 else example.question
         turns.extend((dialog.User(content), dialog.Model(example.completion.rstrip("\n"))))
@@ -172,7 +174,7 @@ def test_calculator_rollout_and_masking(monkeypatch: pytest.MonkeyPatch) -> None
     assert diagnostics["charts/task_reward_mean"] == 0.75
     assert diagnostics["charts/truncation_rate"] == 0
     assert diagnostics["charts/duration_penalty_mean"] == pytest.approx(0.1 * (5 + 2 + 8 + 11) / 4 / 15)
-    assert "<result>156</result>" in samples and "You may use the calculator" in samples
+    assert "<result>156</result>" in samples and "Calculator (optional; at most 2 calls per question):" in samples
 
 
 @pytest.mark.parametrize("budget", [3, 4, 5], ids=["no-result-space", "no-continuation-space", "exact-fit"])
@@ -250,7 +252,7 @@ def test_tool_tokens_condition_replay_but_have_no_loss(dtype: Literal["float32",
         completions=tokens,
         mask=mask,
         old_log_probs=old,
-        ref_log_probs=old,
+        ref_log_probs=old - 0.3,  # (B, C) Exercise masking with a nonzero KL penalty.
         advantages=jnp.array([1, -1], jnp.float32),
     )
     replay = grpo.completion_log_probs(model, params, batch, 0.7)  # (B, C)
@@ -262,3 +264,4 @@ def test_tool_tokens_condition_replay_but_have_no_loss(dtype: Literal["float32",
 
     gradients = jax.grad(loss)(replay)  # (B, C)
     assert jnp.all(gradients[:, 1] == 0) and jnp.all(gradients[:, 2] != 0)
+    np.testing.assert_allclose(loss(replay.at[:, 1].set(100)), loss(replay), atol=1e-6)

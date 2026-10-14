@@ -13,6 +13,7 @@ import yaml
 from flax import serialization
 from gemma_helpers import tiny_gemma_model
 from pydantic import ValidationError
+from reasoning_gym.arithmetic.leg_counting import ANIMALS
 
 from rl2 import train_grpo_reasoning as grpo
 from rl2.gemma3 import Gemma3LM, Parameters
@@ -114,6 +115,38 @@ def test_group_advantages_and_clipped_sequence_weighting() -> None:
     loss, metrics = grpo.objective(jnp.zeros((2, 3), jnp.float32), batch, 0.2, 0.1)
     np.testing.assert_allclose(loss, 0.1 * np.exp(-1), atol=1e-6)
     assert metrics["policy/ref_kl"] > 0
+
+
+@pytest.mark.parametrize("probabilities", [[0.25, 0.75], [0.7, 0.3]], ids=["on-policy", "off-policy"])
+def test_reference_kl_matches_exact_value_and_gradient(probabilities: list[float]) -> None:
+    # Enumerate the rollout distribution exactly: token 0 once, token 1 three times.
+    tokens = jnp.array([[0], [1], [1], [1]], jnp.int32)  # (B=4, C=1)
+    old = jnp.log(jnp.array([0.25, 0.75], jnp.float32))  # (V=2,)
+    reference = jnp.log(jnp.array([0.6, 0.4], jnp.float32))  # (V,)
+    batch = grpo.GRPOBatch(
+        prompts=jnp.zeros((4, 1), jnp.int32),  # (B, P=1)
+        prompt_lengths=jnp.ones(4, jnp.int32),  # (B,)
+        completions=tokens,  # (B, C)
+        mask=jnp.ones((4, 1), jnp.bool_),  # (B, C)
+        old_log_probs=old[tokens],  # (B, C)
+        ref_log_probs=reference[tokens],  # (B, C)
+        advantages=jnp.zeros(4, jnp.float32),  # (B,)
+    )
+
+    def sampled_loss(logits: jax.Array) -> jax.Array:  # (V,) -> ()
+        log_probs = jax.nn.log_softmax(logits)[tokens]  # (B, C)
+        return grpo.objective(log_probs, batch, clip_coef=0.2, beta=1.0)[0]  # ()
+
+    def exact_kl(logits: jax.Array) -> jax.Array:  # (V,) -> ()
+        log_probs = jax.nn.log_softmax(logits)  # (V,)
+        return jnp.sum(jnp.exp(log_probs) * (log_probs - reference))  # ()
+
+    logits = jnp.log(jnp.array(probabilities, jnp.float32))  # (V,)
+    actual, actual_gradient = jax.value_and_grad(sampled_loss)(logits)  # (), (V,)
+    expected, expected_gradient = jax.value_and_grad(exact_kl)(logits)  # (), (V,)
+    assert actual.shape == () and actual_gradient.shape == (2,)
+    np.testing.assert_allclose(actual, expected, atol=1e-6)
+    np.testing.assert_allclose(actual_gradient, expected_gradient, atol=1e-6)
 
 
 def test_update_and_resumable_checkpoint(
@@ -719,22 +752,33 @@ def test_config_validation(overrides: dict[str, Any], match: str) -> None:
 
 def test_yaml_config(tmp_path: Path) -> None:
     config = grpo.load_config("configs/grpo_reasoning/gemma3.yaml", grpo.Config)
-    assert config.task == "basic_arithmetic"
+    assert config.task == "leg_counting"
     assert config.duration_penalty_coef == 0.0
-    assert config.allow_untagged_numeric and config.format_reward_weight == 0.1
-    assert config.task_config["min_terms"] == 2
-    assert config.task_config["max_terms"] == 2
-    dataset = reasoning_gym.create_dataset(config.task, seed=config.seed, size=5, **config.task_config)
-    for index, num_terms in ((0, 2),):
-        entry = dataset[index]
-        parts = entry["metadata"]["expression"].split()
-        operands = [int(value) for value in parts[::2]]
-        assert len(operands) == num_terms
-        assert parts[1::2] == ["*"] * (num_terms - 1)
-        assert all(10 <= value <= 100 for value in operands)
-        assert entry["question"] == f"Calculate {' '.join(parts)}."
-        assert entry["answer"] == str(operands[0] * operands[1])
-        assert dataset.score_answer(entry["answer"], entry) == 1.0
+    assert not config.allow_untagged_numeric and config.format_reward_weight == 0.0
+    assert config.task_config == {
+        "min_animals": 3,
+        "max_animals": 10,
+        "min_instances": 1,
+        "max_instances": 15,
+    }
+    dataset = reasoning_gym.create_dataset(config.task, seed=config.seed, size=1, **config.task_config)
+    entry = dataset[0]
+    animals = entry["metadata"]["animals"]
+    assert 3 <= len(animals) <= 10
+    assert all(1 <= count <= 15 for count in animals.values())
+    assert "how many legs" in entry["question"]
+    assert entry["answer"] == str(sum(count * ANIMALS[animal] for animal, count in animals.items()))
+    assert dataset.score_answer(entry["answer"], entry) == 1.0
+    texts = [
+        entry["answer"],
+        f"<answer>{entry['answer']}</answer>",
+        "<answer>wrong</answer>",
+        f"<result>{entry['answer']}</result>",
+    ]
+    scores = grpo.score_completions(
+        dataset, [entry], texts, len(texts), allow_untagged_numeric=config.allow_untagged_numeric
+    )  # each (B=4,)
+    np.testing.assert_array_equal(scores.task, [0, 1, 0, 0])
     assert len(config.prompt_examples) == 6
     assert config.max_prompt_tokens >= 512
     assert config.run_id is not None

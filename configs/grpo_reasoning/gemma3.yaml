@@ -4,46 +4,41 @@ tokenizer: null # Official Gemma 3 tokenizer; or a local/gs:// SentencePiece .mo
 dtype: bfloat16
 attention_backend: tokamax # Requires bfloat16 and cuDNN support for 256-wide heads (e.g. H100).
 
-task: basic_arithmetic
+task: leg_counting
 task_config:
-  min_terms: 2
-  max_terms: 2
-  min_digits: 2
-  max_digits: 2
-  operators: ["*"]
-  allow_parentheses: false
-  allow_negation: false
-  format_style: simple
+  min_animals: 3
+  max_animals: 10
+  min_instances: 1
+  max_instances: 15
 prompt_examples: # Uniformly sample 0..len(prompt_examples) examples, in listed order, per question.
-  - question: Calculate 23 * 14.
+  - question: How many legs are there in total if you have 3 dogs, 2 chickens, 4 snakes?
     completion: |
-      23 * 14 = 23 * 10 + 23 * 4.
-      230 + 92 = 322.
-      <answer>322</answer>
-  - question: Calculate 47 * 36.
+      Dogs have 4 legs, chickens 2, and snakes 0.
+      3 * 4 + 2 * 2 + 4 * 0 = 16.
+      <answer>16</answer>
+  - question: How many legs are there in total if you have 5 cats, 3 spiders, 2 ants?
     completion: |
-      <calculator>47 * 36</calculator>
-      <result>1692</result>
-      <answer>1692</answer>
-  - question: Calculate 99 * 18.
+      <calculator>5 * 4 + 3 * 8 + 2 * 6</calculator>
+      <result>56</result>
+      <answer>56</answer>
+  - question: How many legs are there in total if you have 4 cows, 6 ducks, 2 bees?
     completion: |
-      99 * 18 = (100 - 1) * 18.
-      1800 - 18 = 1782.
-      <answer>1782</answer>
-  - question: Calculate 68 * 57.
+      4 * 4 + 6 * 2 + 2 * 6 = 16 + 12 + 12 = 40.
+      <answer>40</answer>
+  - question: How many legs are there in total if you have 7 horses, 4 scorpions, 3 crabs?
     completion: |
-      <calculator>68 * 57</calculator>
-      <result>3876</result>
-      <answer>3876</answer>
-  - question: Calculate 40 * 25.
+      <calculator>7 * 4 + 4 * 8 + 3 * 10</calculator>
+      <result>90</result>
+      <answer>90</answer>
+  - question: How many legs are there in total if you have 2 starfish, 3 insects, 5 jellyfish?
     completion: |
-      <answer>1000</answer>
-  - question: Calculate 86 * 94.
+      <answer>28</answer>
+  - question: How many legs are there in total if you have 6 woodlice, 5 lobsters, 4 birds, 3 snakes?
     completion: |
-      <calculator>86 * 94</calculator>
-      <result>8084</result>
-      <answer>8084</answer>
-seed: 3
+      <calculator>6 * 14 + 5 * 10 + 4 * 2 + 3 * 0</calculator>
+      <result>142</result>
+      <answer>142</answer>
+seed: 1
 total_updates: 10000
 # Gemma's 262144-token vocabulary makes logits memory intensive; start small.
 num_tasks: 4
@@ -57,13 +52,13 @@ calculator_max_calls: 2 # Set to 0 to disable calculator access.
 temperature: 1.0
 learning_rate: 1.0e-6
 clip_coef: 0.2
-beta: 0.0
-allow_untagged_numeric: true
-format_reward_weight: 0.1 # Reward = 0.9 * correctness + 0.1 * valid answer format.
+beta: 0.01
+allow_untagged_numeric: false
+format_reward_weight: 0.0 # Reward only correctness of tagged answers.
 duration_penalty_coef: 0.0 # Learn correctness/tool use before rewarding shorter answers.
 max_grad_norm: 1.0
 ckpt_dir: /runs/grpo_reasoning/${run_id}
-run_id: grpo_reasoning_gemma3_270m_${task}_calculator_multiplication_mixed_shot_seed${seed}
+run_id: grpo_reasoning_gemma3_270m_${task}_calculator_mixed_shot_seed${seed}
 log_interval: 10
 log_completion_count: 4
 checkpoint_interval_seconds: 600

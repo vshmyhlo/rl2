@@ -431,22 +431,30 @@ def completion_log_probs(
     return jnp.where(batch.mask, result, 0.0)  # (B, C)
 
 
-def objective(log_probs: jax.Array, batch: GRPOBatch, clip_coef: float, beta: float) -> tuple[jax.Array, Metrics]:
-    """Clipped token ratios and sampled reference KL, averaged equally per completion."""
+def objective(
+    log_probs: jax.Array,  # (B, C)
+    batch: GRPOBatch,
+    clip_coef: float,
+    beta: float,
+) -> tuple[jax.Array, Metrics]:  # (), scalar metric leaves
+    """Clipped token ratios and importance-corrected reference KL, averaged per completion."""
 
-    def average(values: jax.Array) -> jax.Array:
-        return (jnp.where(batch.mask, values, 0).sum(axis=1) / jnp.maximum(batch.mask.sum(axis=1), 1)).mean()
+    def average(values: jax.Array) -> jax.Array:  # (B, C) -> ()
+        return (jnp.where(batch.mask, values, 0).sum(axis=1) / jnp.maximum(batch.mask.sum(axis=1), 1)).mean()  # ()
 
-    log_ratio = jnp.where(batch.mask, log_probs - jax.lax.stop_gradient(batch.old_log_probs), 0.0)
-    ratio = jnp.exp(log_ratio)
-    advantages = jax.lax.stop_gradient(batch.advantages)[:, None]
-    policy_loss = -average(jnp.minimum(ratio * advantages, jnp.clip(ratio, 1 - clip_coef, 1 + clip_coef) * advantages))
+    log_ratio = jnp.where(batch.mask, log_probs - jax.lax.stop_gradient(batch.old_log_probs), 0.0)  # (B, C)
+    ratio = jnp.exp(log_ratio)  # (B, C)
+    advantages = jax.lax.stop_gradient(batch.advantages)[:, None]  # (B, 1)
+    policy_loss = -average(
+        jnp.minimum(ratio * advantages, jnp.clip(ratio, 1 - clip_coef, 1 + clip_coef) * advantages)
+    )  # ()
     if beta:
-        ref_ratio = jnp.where(batch.mask, jax.lax.stop_gradient(batch.ref_log_probs) - log_probs, 0.0)
-        ref_kl = average(jnp.expm1(ref_ratio) - ref_ratio)
+        ref_ratio = jnp.where(batch.mask, jax.lax.stop_gradient(batch.ref_log_probs) - log_probs, 0.0)  # (B, C)
+        # The differentiable ratio corrects both sampling and the reverse-KL gradient.
+        ref_kl = average(ratio * (jnp.expm1(ref_ratio) - ref_ratio))  # ()
     else:
-        ref_kl = jnp.asarray(0.0, jnp.float32)
-    loss = policy_loss + beta * ref_kl
+        ref_kl = jnp.asarray(0.0, jnp.float32)  # ()
+    loss = policy_loss + beta * ref_kl  # ()
     metrics = {
         "losses/total": loss,
         "losses/policy": policy_loss,
@@ -454,7 +462,7 @@ def objective(log_probs: jax.Array, batch: GRPOBatch, clip_coef: float, beta: fl
         "policy/approx_kl": average(jnp.expm1(log_ratio) - log_ratio),
         "policy/clip_fraction": average((jnp.abs(ratio - 1) > clip_coef).astype(jnp.float32)),
     }
-    return loss, metrics
+    return loss, metrics  # (), scalar metric leaves
 
 
 def create_state(model: Gemma3LM, params: Parameters, config: Config) -> TrainState:
