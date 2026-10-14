@@ -8,6 +8,50 @@ Availability here refers to upstream projects; integration into rl2 varies.
 - [JaxMARL](https://github.com/bold-lab-ai/JaxMARL) — multi-agent environments ([registry](https://github.com/bold-lab-ai/JaxMARL/blob/main/jaxmarl/registration.py)).
   - MPE: Simple, Tag, World Comm, Spread, Crypto, Speaker Listener, Push,
     Adversary, Reference, and FACMAC predator–prey variants.
+    - Spaces vary by task. rl2's [adapter](src/rl2/envs/mpe_env.py) supports
+      Simple Spread and Simple Reference with discrete controls.
+      For `MPE_simple_spread_v3`,
+      the [example config](configs/mappo/jaxmarl/mpe/simple_spread.yaml) uses
+      `N = 3` agents and `L = 3` landmarks.
+    - Observation per agent: a float32 vector of length `O = 4N + 2L`
+      (18 in the example), concatenated in this order:
+      - Own velocity `(2,)` and absolute position `(2,)`.
+      - All landmark positions relative to the agent `(L, 2)`, flattened.
+      - Other agents' relative positions `(N - 1, 2)`, flattened.
+      - Other agents' communication values `(N - 1, 2)`, flattened;
+        these stay zero because Simple Spread agents are silent.
+    - Actions per agent: `Discrete(5)` — `0` applies no control force,
+      `1` pushes left (`-x`), `2` right (`+x`), `3` down (`-y`), `4` up (`+y`).
+      Controls apply force; inertia and collisions still affect motion.
+    - Adapter arrays: observations `(N, O)`, int32 actions `(N,)`, and
+      boolean action masks `(N, 5)` with every action valid. Vectorized training
+      adds a leading environment axis `E`: `(E, N, O)`, `(E, N)`, `(E, N, 5)`.
+    - Simple Spread reward per agent: `r_i = -(1 - α) * D - α * C_i`,
+      where `α = local_ratio`, `D` sums each landmark's Euclidean distance to
+      its nearest agent, and `C_i` counts other agents overlapping agent `i`.
+      Each collision penalizes both participants. The preset uses `α = 0.5`,
+      balancing shared landmark coverage against individual collision penalties.
+    - [Simple Reference config](configs/mappo/jaxmarl/mpe/simple_reference.yaml)
+      (`MPE_simple_reference_v3`): two non-silent agents and three landmarks.
+      Each agent sees the partner's target and communicates which landmark to reach.
+      - Observation `(21,)`: own velocity `(2,)`, relative landmark positions `(6,)`,
+        partner's target color `(3,)`, and the partner's last message `(10,)`.
+      - Actions: `Discrete(50)`, encoded as `5 * symbol + movement`, with symbols
+        `0–9` and the same five movement controls as Spread. Every action sends
+        a one-hot message, visible to the partner in the next observation.
+      - Adapter observations `(2, 21)`, actions `(2,)`, and masks `(2, 50)`;
+        the preset uses a shared mean reward (`local_ratio: 0.0`).
+      - Reward: let `d_i` be agent `i`'s Euclidean distance to its assigned
+        landmark and `j` its partner. Agent `i` receives
+        `r_i = -(1 - α) * (d_0 + d_1) / 2 - α * d_j`, where `α = local_ratio`.
+        The local component rewards the partner reaching the target that agent
+        `i` observes. With the preset's `α = 0`, both receive the negative mean
+        target distance. Messages have no direct bonus or cost; they help agents
+        identify their targets. Collisions are disabled.
+    - Both tasks give dense rewards from the state after each step; higher
+      (closer to zero) is better. There is no terminal success bonus, and reaching
+      targets does not end an episode. The adapter truncates at `max_steps`;
+      logged episode return sums the mean agent reward over those steps.
   - Overcooked and OvercookedV2: cooperative cooking and coordination.
   - SMAX: simplified StarCraft combat, including heuristic and learned-policy enemies.
   - Hanabi: cooperative card play with hidden information.

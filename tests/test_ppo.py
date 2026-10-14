@@ -963,7 +963,7 @@ def test_invalid_video_frame_budget_rejected_by_config(frame_budget: Any) -> Non
 )
 def test_invalid_model_config(model_settings: Any, message: str) -> None:
     settings = vars(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml")).copy()
-    settings["model"] = {"recurrent": model_settings}
+    settings["model"] = {"encoder": {"type": "rgb"}, "recurrent": model_settings}
     with pytest.raises(ValidationError, match=message):
         ppo.Config(**settings)
 
@@ -978,13 +978,15 @@ def test_flat_model_settings_are_rejected(field: str) -> None:
 
 def test_default_model_config(tmp_path: Path) -> None:
     settings = yaml.safe_load((Path(__file__).resolve().parents[1] / "configs/ppo.yaml").read_text())
-    settings.pop("model")
+    settings["model"] = {"encoder": {"type": "rgb"}}
     path = tmp_path / "ppo.yaml"
     path.write_text(yaml.safe_dump(settings))
-    assert load_config(path).model == ppo.ModelConfig()
-    settings["model"] = {"recurrent": {"hidden_size": 8}}
+    assert load_config(path).model == ppo.ModelConfig(encoder=ppo.RGBEncoderConfig())
+    settings["model"]["recurrent"] = {"hidden_size": 8}
     path.write_text(yaml.safe_dump(settings))
-    assert load_config(path).model == ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=8))
+    assert load_config(path).model == ppo.ModelConfig(
+        encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=8)
+    )
 
 
 def test_lstm_stack_config_loading_and_factory(tmp_path: Path) -> None:

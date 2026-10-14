@@ -1,6 +1,6 @@
 # Eight robots sharing a compact, lightly obstructed map: emphasize avoiding one another.
-env_id: JaxNav
-jaxnav:
+env:
+  id: JaxNav
   num_agents: 8
   map_size: 11 # Square Grid-Rand-Poly map, including boundary walls
   fill: 0.1 # Upper bound on random interior obstacle density
@@ -14,7 +14,9 @@ num_steps: 128
 num_minibatches: 4 # Divides num_envs * num_agents; keep recurrent sequences intact
 update_epochs: 4
 model:
-  hidden_size: 128
+  encoder:
+    type: mlp
+    embedding_size: 128
   recurrent:
     hidden_size: 128
     num_layers: 1
@@ -32,7 +34,7 @@ entropy_decay: constant
 value_coef: 1.0
 max_grad_norm: 0.5
 ckpt_dir: /runs/mappo/${run_id}
-run_id: mappo_${path_name:${env_id}}_crowded_${jaxnav.num_agents}agents_${jaxnav.map_size}x${jaxnav.map_size}_seed${seed}
+run_id: mappo_${path_name:${env.id}}_crowded_${env.num_agents}agents_${env.map_size}x${env.map_size}_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
 # Video, checkpoint, and eval: every 20% of training, rounded up; also run on completion.
 log_interval: 10

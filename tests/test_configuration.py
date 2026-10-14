@@ -32,9 +32,10 @@ def test_config_rejects_invalid_interpolation(template: str) -> None:
         resolve_settings({"env_id": "chess", "run_id": "run", "log_dir": template})
 
 
-def test_load_settings_resolves_defaults_and_generated_run_id(tmp_path: Path) -> None:
+@pytest.mark.parametrize("env_yaml", ["env_id: ALE/Boxing-v5", "env:\n  id: ALE/Boxing-v5"], ids=["flat", "tagged"])
+def test_load_settings_resolves_defaults_and_generated_run_id(tmp_path: Path, env_yaml: str) -> None:
     path = tmp_path / "config.yaml"
-    path.write_text("env_id: ALE/Boxing-v5\niterations: 3\nbatch_size: ${iterations}\n")
+    path.write_text(f"{env_yaml}\niterations: 3\nbatch_size: ${{iterations}}\n")
     config = load_settings(path, {"seed": 7, "run_id": None, "log_dir": "logs/${run_id}"})
     assert config["batch_size"] == 3
     assert isinstance(config["batch_size"], int)

@@ -19,7 +19,7 @@ def resolve_settings(settings: dict[str, Any]) -> dict[str, Any]:
     """Generate a missing run ID before resolving references across config fields."""
     config = OmegaConf.create(settings)
     if config.get("run_id") is None:
-        env_name = path_name(str(config.env_id))
+        env_name = path_name(str(config.env.id if "env" in config else config.env_id))
         config.run_id = f"{env_name}_seed{config.get('seed', 0)}_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"
     return cast(dict[str, Any], OmegaConf.to_container(config, resolve=True, throw_on_missing=True))
 

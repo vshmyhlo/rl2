@@ -1,7 +1,7 @@
 """SMAX team observations, legal actions, and explicit autoreset boundaries."""
 
 from functools import partial
-from typing import Annotated
+from typing import Annotated, Literal
 
 import jax
 import jax.numpy as jnp
@@ -15,11 +15,12 @@ from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
 from rl2.actions import DiscreteSpace
-from rl2.envs.multi_agent import AgentObservation, MultiAgentStep
+from rl2.envs.multi_agent import AgentObservation, BaseMultiAgentEnv, MultiAgentStep
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class SMAXConfig:
+    id: Literal["SMAX"] = "SMAX"
     map_name: str = "3m"
     max_steps: Annotated[int, Field(gt=0, strict=True)] = 100
 
@@ -30,7 +31,7 @@ class SMAXConfig:
             raise ValueError(f"Unknown SMAX map: {self.map_name}") from error
 
 
-class SMAXEnv:
+class SMAXEnv(BaseMultiAgentEnv[State]):
     def __init__(self, config: SMAXConfig) -> None:
         self.config = config
         self.env = HeuristicEnemySMAX(

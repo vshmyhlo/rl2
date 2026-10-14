@@ -50,6 +50,28 @@ sudo journalctl -u k3s -n 100 --no-pager
 sudo k3s kubectl get events -A --sort-by=.metadata.creationTimestamp
 ```
 
+## Persistent dashboard access
+
+Install localhost port-forwards that start at boot and retry after disconnects:
+
+```bash
+sudo bash infra/k3s/port-forwards/install.sh
+```
+
+This enables `rl2-forward-{headlamp,mlflow,grafana,kueue-frontend,kueue-backend}`
+systemd services on ports **8080–8084**, respectively. They bind only to
+`127.0.0.1`. When browsing from another machine, also forward these ports through
+your IDE or SSH; Kueue needs both 8083 and 8084. Skip the manual port-forward
+commands below while these services are running. Rerun the installer to update.
+
+```bash
+sudo systemctl status 'rl2-forward-*' --no-pager
+sudo journalctl -u rl2-forward-headlamp -n 30 --no-pager
+```
+
+To stop one forward and disable its boot startup, run
+`sudo systemctl disable --now rl2-forward-headlamp` (substitute its service name).
+
 ## Headlamp dashboard
 
 Headlamp runs in the `headlamp` namespace, managed by k3s's built-in Helm

@@ -319,13 +319,14 @@ type EncoderConfig = Annotated[
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class ModelConfig:
-    encoder: EncoderConfig = RGBEncoderConfig()
+    encoder: EncoderConfig
     recurrent: LSTMConfig = LSTMConfig()
     continuous_policy: Literal["truncated_gaussian", "beta"] = "truncated_gaussian"
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
 class Config:
+    model: ModelConfig
     env_id: Literal["Breakout-MinAtar", "Kinetix", "XLand-MiniGrid", "Craftax"]
     seed: int
     total_steps: int
@@ -350,7 +351,6 @@ class Config:
     eval_interval: Annotated[int, Field(ge=0)] = 0
     eval_episodes: Annotated[int, Field(gt=0)] = 100
     eval_seed: Annotated[int, Field(ge=0, lt=2**32)] = 10_000
-    model: ModelConfig = ModelConfig()
     lr_decay: Literal["linear", "cosine"] = "linear"
     entropy_decay: Literal["constant", "cosine"] = "constant"
     run_id: str | None = None
@@ -552,7 +552,7 @@ class ActorCritic(nn.Module):
     """Shared observation encoder/LSTM with separate policy and value heads."""
 
     action_space: ActionSpace
-    model: ModelConfig = ModelConfig()
+    model: ModelConfig
     dtype: jax.typing.DTypeLike = jnp.float32
 
     @nn.nowrap

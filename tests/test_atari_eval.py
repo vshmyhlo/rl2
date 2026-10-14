@@ -30,7 +30,9 @@ from rl2.ppo import LSTMStackCarry
 
 @dataclass(frozen=True)
 class AtariConfig(ppo_rnd.Config):
-    model: ppo.ModelConfig = field(default_factory=lambda: ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=2)))
+    model: ppo.ModelConfig = field(
+        default_factory=lambda: ppo.ModelConfig(encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=2))
+    )
 
 
 def training_config() -> AtariConfig:

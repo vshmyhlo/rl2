@@ -98,16 +98,13 @@ def test_jaxnav_config_matches_smax_and_validates(monkeypatch: pytest.MonkeyPatc
     config = ppo.load_config(root / "jaxnav.yaml")
     reference = ppo.load_config(root / "smax.yaml")
     for name in asdict(reference):
-        if name not in {"env_id", "jaxnav", "run_id", "ckpt_dir"}:
+        if name not in {"env", "run_id", "ckpt_dir", "video_fps"}:
             assert getattr(config, name) == getattr(reference, name)
-    assert config.env_id == "JaxNav" and hash(config)
-    assert config.run_id == "ippo_JaxNav_4agents_11x11"
-    assert config.ckpt_dir == f"gs://cohere-dev/vlad/rl2/mappo/{config.run_id}"
+    assert config.video_fps == 24 and reference.video_fps == 5
+    assert config.env.id == "JaxNav" and hash(config)
+    assert config.run_id == "mappo_JaxNav_4agents_11x11_seed1"
+    assert config.ckpt_dir == f"/runs/mappo/{config.run_id}"
     assert isinstance(ppo.make_env(config), JaxNavEnv)
-    with pytest.raises(ValidationError, match="jaxnav settings"):
-        replace(config, env_id="SMAX", jaxnav=replace(config.jaxnav, num_agents=2))
-    with pytest.raises(ValidationError, match="smax settings"):
-        replace(config, smax=ppo.SMAXConfig(map_name="8m"))
     with pytest.raises(ValueError, match="num_agents"):
         ppo.make_env(replace(config, num_minibatches=3))
     with pytest.raises(ValidationError, match="fill"):
@@ -139,7 +136,7 @@ def constant_policy(
 def test_jaxnav_rollout_timeout_update_and_evaluation(env: JaxNavEnv, state: State) -> None:
     config = replace(
         ppo.load_config(Path(__file__).resolve().parents[1] / "configs/mappo/jaxnav.yaml"),
-        jaxnav=env.config,
+        env=env.config,
         num_envs=1,
         num_steps=1,
         num_minibatches=1,
@@ -148,7 +145,7 @@ def test_jaxnav_rollout_timeout_update_and_evaluation(env: JaxNavEnv, state: Sta
         gamma=0.5,
         gae_lambda=1.0,
         target_kl=None,
-        model=ppo.ModelConfig(hidden_size=4, recurrent=ppo.LSTMConfig(hidden_size=4)),
+        model=ppo.ModelConfig(encoder=ppo.MLPEncoderConfig(embedding_size=4), recurrent=ppo.LSTMConfig(hidden_size=4)),
     )
     model = ppo.ActorCritic(env.action_space, config.model)
     memory = model.initial_carry(2)  # leaves: (B=2, H=4)

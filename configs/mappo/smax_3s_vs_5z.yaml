@@ -1,6 +1,6 @@
 # Three ranged stalkers against five melee zealots: movement, kiting, and focus fire.
-env_id: SMAX
-smax:
+env:
+  id: SMAX
   map_name: 3s_vs_5z
   max_steps: 200
 seed: 1
@@ -10,7 +10,9 @@ num_steps: 128
 num_minibatches: 4 # Divides num_envs * num_agents; keep recurrent sequences intact
 update_epochs: 4
 model:
-  hidden_size: 128
+  encoder:
+    type: mlp
+    embedding_size: 128
   recurrent:
     hidden_size: 128
     num_layers: 1
@@ -28,7 +30,7 @@ entropy_decay: constant
 value_coef: 1.0
 max_grad_norm: 0.5
 ckpt_dir: /runs/mappo/${run_id}
-run_id: mappo_${path_name:${env_id}}_${path_name:${smax.map_name}}_seed${seed}
+run_id: mappo_${path_name:${env.id}}_${path_name:${env.map_name}}_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
 # Video, checkpoint, and eval: every 20% of training, rounded up; also run on completion.
 log_interval: 10

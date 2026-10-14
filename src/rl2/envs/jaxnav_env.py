@@ -1,7 +1,7 @@
 """JaxNav with discrete controls, local lidar observations, and explicit autoreset."""
 
 from functools import partial
-from typing import Annotated
+from typing import Annotated, Literal
 
 import jax
 import jax.numpy as jnp
@@ -14,11 +14,12 @@ from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
 from rl2.actions import DiscreteSpace
-from rl2.envs.multi_agent import AgentObservation, MultiAgentStep
+from rl2.envs.multi_agent import AgentObservation, BaseMultiAgentEnv, MultiAgentStep
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class JaxNavConfig:
+    id: Literal["JaxNav"] = "JaxNav"
     num_agents: Annotated[int, Field(gt=0, strict=True)] = 4
     map_size: Annotated[int, Field(ge=5, strict=True)] = 11
     fill: Annotated[float, Field(ge=0, lt=1, allow_inf_nan=False)] = 0.3
@@ -27,7 +28,7 @@ class JaxNavConfig:
     rew_lambda: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)] = 0.5
 
 
-class JaxNavEnv:
+class JaxNavEnv(BaseMultiAgentEnv[State]):
     def __init__(self, config: JaxNavConfig) -> None:
         self.config = config
         self.env = JaxNav(

@@ -1,4 +1,4 @@
-"""Recurrent parameter-sharing IPPO for SMAX, JaxNav, and MPE Simple Spread.
+"""Recurrent parameter-sharing IPPO for SMAX, JaxNav, and cooperative MPE tasks.
 
 The actor and critic share an encoder and LSTM, with separate policy and value
 heads and parameters shared across agents. Both use only local observations.
@@ -155,7 +155,7 @@ from rl2.actions import CategoricalPolicy, DiscreteSpace
 from rl2.configuration import load_settings
 from rl2.envs.jaxnav_env import JaxNavConfig, JaxNavEnv
 from rl2.envs.mpe_env import MPEConfig, MPEEnv
-from rl2.envs.multi_agent import AgentObservation
+from rl2.envs.multi_agent import AgentObservation, BaseMultiAgentEnv
 from rl2.envs.smax_env import SMAXConfig, SMAXEnv
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
@@ -165,7 +165,7 @@ from rl2.running_stats import RunningSum
 from rl2.utils import explained_variance, gae
 
 type RecurrentCarry = LSTMStackCarry
-type PPOEnv = SMAXEnv | JaxNavEnv | MPEEnv
+type PPOEnv = BaseMultiAgentEnv[Any]
 
 
 @struct.dataclass
@@ -296,14 +296,21 @@ class LSTMConfig:
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class MLPEncoderConfig:
+    type: Literal["mlp"] = "mlp"
+    embedding_size: Annotated[int, Field(gt=0, strict=True)] = 128
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class ModelConfig:
-    hidden_size: Annotated[int, Field(gt=0, strict=True)] = 128
+    encoder: MLPEncoderConfig
     recurrent: LSTMConfig = LSTMConfig()
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
 class Config:
-    env_id: Literal["SMAX", "JaxNav", "MPE_simple_spread_v3"]
+    model: ModelConfig
+    env: Annotated[SMAXConfig | JaxNavConfig | MPEConfig, Field(discriminator="id")]
     seed: int
     total_steps: int
     num_envs: Annotated[int, Field(gt=0)]
@@ -327,15 +334,11 @@ class Config:
     eval_interval: Annotated[int, Field(ge=0)] = 0
     eval_episodes: Annotated[int, Field(gt=0)] = 100
     eval_seed: Annotated[int, Field(ge=0, lt=2**32)] = 10_000
-    model: ModelConfig = ModelConfig()
     lr_decay: Literal["linear", "cosine"] = "linear"
     entropy_decay: Literal["constant", "cosine"] = "constant"
     run_id: str | None = None
     checkpoint_interval: Annotated[int, Field(gt=0)] = 600
     log_interval: Annotated[int, Field(gt=0)] = 60
-    smax: SMAXConfig = SMAXConfig()
-    jaxnav: JaxNavConfig = JaxNavConfig()
-    mpe: MPEConfig = MPEConfig()
 
     def __post_init__(self) -> None:
         if self.run_id is not None and (
@@ -345,24 +348,19 @@ class Config:
 
     @model_validator(mode="after")
     def validate_rollout(self) -> Self:
-        if self.env_id != "SMAX" and self.smax != SMAXConfig():
-            raise ValueError("smax settings require env_id: SMAX")
-        if self.env_id != "JaxNav" and self.jaxnav != JaxNavConfig():
-            raise ValueError("jaxnav settings require env_id: JaxNav")
-        if self.env_id != "MPE_simple_spread_v3" and self.mpe != MPEConfig():
-            raise ValueError("mpe settings require env_id: MPE_simple_spread_v3")
         if self.total_steps < self.num_envs * self.num_steps:
             raise ValueError("total_steps must cover at least one rollout")
         return self
 
 
 def make_env(config: Config) -> PPOEnv:
-    if config.env_id == "SMAX":
-        env = SMAXEnv(config.smax)
-    elif config.env_id == "JaxNav":
-        env = JaxNavEnv(config.jaxnav)
+    env: PPOEnv
+    if isinstance(config.env, SMAXConfig):
+        env = SMAXEnv(config.env)
+    elif isinstance(config.env, JaxNavConfig):
+        env = JaxNavEnv(config.env)
     else:
-        env = MPEEnv(config.mpe)
+        env = MPEEnv(config.env)
     if config.num_envs * env.num_agents % config.num_minibatches:
         raise ValueError("num_envs * num_agents must be divisible by num_minibatches to preserve sequences")
     return env
@@ -420,7 +418,7 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
             metadata=ocp.args.JsonSave(
                 {
                     "version": 2,
-                    "algorithm": f"{config.env_id.lower()}_ippo",
+                    "algorithm": f"{config.env.id.lower()}_ippo",
                     "config": asdict(config),
                     "iteration": progress.rollout_count,
                     "completed_episodes": progress.episode_count,
@@ -444,21 +442,23 @@ def restore_checkpoint(
     if rollout_count is None:
         return None
     metadata = manager.restore(rollout_count, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
-    if metadata["version"] != 2 or metadata.get("algorithm") != f"{config.env_id.lower()}_ippo":
+    if metadata["version"] != 2 or metadata.get("algorithm") != f"{config.env.id.lower()}_ippo":
         raise ValueError("Unsupported PPO checkpoint version; the shared encoder/LSTM requires a new run directory")
     if metadata["iteration"] != rollout_count or rollout_count < 0 or metadata["completed_episodes"] < 0:
         raise ValueError("Invalid PPO checkpoint progress")
     saved_config = metadata["config"]
-    if saved_config.get("env_id", config.env_id) != config.env_id:
+    saved_env = saved_config.get("env")
+    if saved_env is None:
+        # Checkpoints predating the tagged environment config store separate settings.
+        env_id = saved_config["env_id"]
+        env_key = {"SMAX": "smax", "JaxNav": "jaxnav"}.get(env_id, "mpe")
+        saved_env = {"id": env_id, **saved_config.get(env_key, {})}
+    if saved_env["id"] != config.env.id:
         raise ValueError("Cannot resume PPO with a different environment; use a new run directory")
     if "model" in saved_config and ModelConfig(**saved_config["model"]) != config.model:
         raise ValueError("Cannot resume PPO with different model settings; use a new run directory")
-    if SMAXConfig(**saved_config["smax"]) != config.smax:
-        raise ValueError("Cannot resume PPO with different SMAX settings; use a new run directory")
-    if JaxNavConfig(**saved_config.get("jaxnav", {})) != config.jaxnav:
-        raise ValueError("Cannot resume PPO with different JaxNav settings; use a new run directory")
-    if MPEConfig(**saved_config.get("mpe", {})) != config.mpe:
-        raise ValueError("Cannot resume PPO with different MPE settings; use a new run directory")
+    if type(config.env)(**saved_env) != config.env:
+        raise ValueError("Cannot resume PPO with different environment settings; use a new run directory")
     # Progress and schedules count rollouts, so each must still represent the same number of steps.
     if (
         "num_envs" in saved_config
@@ -521,7 +521,7 @@ class ActorCritic(nn.Module):
     """Shared local observation encoder/LSTM with separate policy and value heads."""
 
     action_space: DiscreteSpace
-    model: ModelConfig = ModelConfig()
+    model: ModelConfig
     dtype: jax.typing.DTypeLike = jnp.float32
 
     @nn.nowrap
@@ -540,7 +540,7 @@ class ActorCritic(nn.Module):
         return self._make_recurrent().initial_carry(actor_count)  # leaves: (B, H)
 
     def setup(self) -> None:
-        self.encoder = nn.Dense(features=self.model.hidden_size, dtype=self.dtype, name="encoder")
+        self.encoder = nn.Dense(features=self.model.encoder.embedding_size, dtype=self.dtype, name="encoder")
         self.recurrent = self._make_recurrent(parent=self)
         self.recurrent_input = nn.Dense(features=self.model.recurrent.hidden_size, dtype=self.dtype, name="lstm_input")
         init = nn.initializers.orthogonal(sqrt(2))
@@ -559,7 +559,7 @@ class ActorCritic(nn.Module):
         )
 
     def _encode(self, obs: jax.Array) -> jax.Array:  # (*S, O) -> (*S, H)
-        x = nn.relu(self.encoder(obs))  # (*S, F), F is model.hidden_size
+        x = nn.relu(self.encoder(obs))  # (*S, F), F is model.encoder.embedding_size
         return self.recurrent_input(x).astype(self.dtype)  # (*S, H)
 
     def _heads(
@@ -750,7 +750,7 @@ def log_evaluation(
     returns = [result["return"] for result in episode_results]
     std = stdev(returns) if len(returns) > 1 else None
     result = {
-        "env_id": config.env_id,
+        "env_id": config.env.id,
         "return_mean": fmean(returns),
         "return_std": std,
         "return_sem": std / sqrt(config.eval_episodes) if std is not None else None,

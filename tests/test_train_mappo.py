@@ -34,7 +34,7 @@ def config() -> ppo.Config:
         gae_lambda=1.0,
         video_interval=0,
         eval_interval=0,
-        model=ppo.ModelConfig(hidden_size=4, recurrent=ppo.LSTMConfig(hidden_size=4)),
+        model=ppo.ModelConfig(encoder=ppo.MLPEncoderConfig(embedding_size=4), recurrent=ppo.LSTMConfig(hidden_size=4)),
     )
 
 
@@ -156,10 +156,13 @@ def test_local_model_mask_replay_and_shared_memory(config: ppo.Config) -> None:
     assert len(memory) == config.model.recurrent.num_layers
     chex.assert_shape(jax.tree.leaves(memory), (2, 4))
     params = model.init(jax.random.key(0), obs, memory, starts, masks)
+    chex.assert_shape(params["params"]["encoder"]["kernel"], (4, config.model.encoder.embedding_size))
     # Keep the tiny ReLU encoder active so the test exercises recurrent features.
     params["params"]["encoder"]["kernel"] = jnp.eye(4)  # (O, F)
     output = model.apply(params, obs, memory, starts, masks)
     first = model.apply(params, obs[0], memory, starts[0], masks[0], method="step")
+    chex.assert_shape(first.policy.logits, (2, 3))
+    chex.assert_shape(first.values, (2,))
     second = model.apply(params, obs[1], first.carry, starts[1], masks[1], method="step")
     chex.assert_trees_all_close(second.carry, output.carry, atol=1e-6)
     np.testing.assert_allclose(output.values, jnp.stack([first.values, second.values]), atol=1e-6)
@@ -169,6 +172,7 @@ def test_local_model_mask_replay_and_shared_memory(config: ppo.Config) -> None:
     assert bool(jnp.isfinite(output.policy.entropy()).all())
     np.testing.assert_allclose(output.policy.log_prob(actions), log_probs, atol=1e-6)
     chex.assert_shape(output.values, (2, 2))
+    chex.assert_shape(output.policy.logits, (2, 2, 3))
     # Both heads depend on the shared encoder; changing only the value head leaves policy and memory intact.
     changed = dict(params["params"], encoder=jax.tree.map(jnp.zeros_like, params["params"]["encoder"]))
     no_features = model.apply({"params": changed}, obs, memory, starts, masks)
@@ -190,8 +194,55 @@ def test_rejects_checkpoint_with_separate_networks(config: ppo.Config) -> None:
         ppo.restore_checkpoint(manager, state, config)
 
 
+@pytest.mark.parametrize(
+    "env",
+    [
+        ppo.SMAXConfig(),
+        ppo.JaxNavConfig(),
+        ppo.MPEConfig(),
+        ppo.MPEConfig(id="MPE_simple_reference_v3", num_agents=2),
+    ],
+    ids=["smax", "jaxnav", "spread", "reference"],
+)
+def test_restore_legacy_environment_config(
+    config: ppo.Config, env: ppo.SMAXConfig | ppo.JaxNavConfig | ppo.MPEConfig
+) -> None:
+    config = replace(config, env=env)
+    saved_config = asdict(config)
+    saved_env = saved_config.pop("env")
+    saved_config["env_id"] = saved_env.pop("id")
+    env_key = {"SMAX": "smax", "JaxNav": "jaxnav"}.get(env.id, "mpe")
+    saved_config[env_key] = saved_env
+    state = TrainState.create(apply_fn=scripted_policy, params={}, tx=optax.sgd(0.1))
+    key = jax.random.key(0)  # ()
+    manager = Mock()
+    manager.latest_step.return_value = 1
+    manager.restore.return_value.metadata = {
+        "version": 2,
+        "algorithm": f"{env.id.lower()}_ippo",
+        "config": saved_config,
+        "iteration": 1,
+        "completed_episodes": 2,
+        "training_return_sum": 3.0,
+        "training_length_sum": 4,
+    }
+    manager.restore.return_value.state = {"train_state": state, "key": jax.random.key_data(key)}
+    restored = ppo.restore_checkpoint(manager, state, config)
+    expected = ppo.TrainingProgress(
+        train_state=state,
+        key=key,  # ()
+        rollout_count=1,
+        episode_count=2,
+        episode_return_sum=3.0,
+        episode_length_sum=4,
+    )
+    chex.assert_trees_all_equal(restored, expected)
+    with pytest.raises(ValueError, match="different environment settings"):
+        ppo.restore_checkpoint(manager, state, replace(config, env=replace(env, max_steps=env.max_steps + 1)))
+
+
 def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_path: Path) -> None:
-    config = replace(config, num_envs=1, num_steps=1, num_minibatches=3, smax=SMAXConfig(max_steps=1))
+    config = replace(config, num_envs=1, num_steps=1, num_minibatches=3, env=SMAXConfig(max_steps=1))
     env = ppo.make_env(config)  # Three agent sequences can form three minibatches in one environment.
     observation, state = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 1))
     model = ppo.ActorCritic(env.action_space, config.model)
@@ -238,8 +289,8 @@ def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_pat
         restored = ppo.restore_checkpoint(manager, train_state, config)
         assert restored is not None
         chex.assert_trees_all_equal(restored, progress)
-        with pytest.raises(ValueError, match="SMAX settings"):
-            ppo.restore_checkpoint(manager, train_state, replace(config, smax=SMAXConfig(map_name="8m")))
+        with pytest.raises(ValueError, match="environment settings"):
+            ppo.restore_checkpoint(manager, train_state, replace(config, env=SMAXConfig(map_name="8m")))
 
 
 def test_playback_reuses_compiled_sampling_with_updated_inputs() -> None:

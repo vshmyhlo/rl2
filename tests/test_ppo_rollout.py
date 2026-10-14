@@ -48,7 +48,7 @@ def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs:
         jax.random.split(key, num_envs), env.params
     )  # (B,4,10,10); leaves: (B,...)
     memory = ppo.ActorCritic(
-        ppo.DiscreteSpace(3), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
+        ppo.DiscreteSpace(3), ppo.ModelConfig(encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1))
     ).initial_carry(num_envs)  # leaves: (B,1)
     runner = ppo.RolloutCarry(
         env_state,
@@ -200,7 +200,7 @@ def test_train_step_stops_updates_and_rng_at_rejected_minibatch(reject_at: int) 
         jax.random.split(key, 2), env.params
     )  # (B=2,4,10,10); leaves: (B,...)
     memory = ppo.ActorCritic(
-        ppo.DiscreteSpace(3), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
+        ppo.DiscreteSpace(3), ppo.ModelConfig(encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1))
     ).initial_carry(2)  # leaves: (B,1)
     runner = ppo.RolloutCarry(
         env_state, observations, memory, jnp.ones(2, bool), jnp.array([1.0, 2.0]), jnp.zeros(2, jnp.int32)
@@ -312,7 +312,7 @@ def test_terminal_and_timeout_targets_use_final_observations() -> None:
     )
     observations = encode_observations(jax.vmap(env.env.get_obs)(env_state))  # (B,4,10,10)
     memory = ppo.ActorCritic(
-        ppo.DiscreteSpace(3), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
+        ppo.DiscreteSpace(3), ppo.ModelConfig(encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1))
     ).initial_carry(4)  # leaves: (B,1)
 
     def position_policy(

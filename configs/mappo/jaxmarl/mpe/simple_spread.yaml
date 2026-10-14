@@ -1,0 +1,46 @@
+# Cooperative landmark coverage with a shared local actor/critic (IPPO).
+# Run: uv run mappo --config configs/mappo/jaxmarl/mpe/simple_spread.yaml
+env:
+  id: MPE_simple_spread_v3
+  num_agents: 3
+  num_landmarks: 3
+  max_steps: 25
+  local_ratio: 0.5 # Collision penalty weight; remaining weight rewards landmark coverage
+seed: 1
+total_steps: 10_000_000 # Environment transitions; each contains num_agents observations
+num_envs: 128
+num_steps: 128
+num_minibatches: 4 # Divides num_envs * num_agents; keep recurrent sequences intact
+update_epochs: 4
+model:
+  encoder:
+    type: mlp
+    embedding_size: 128
+  recurrent:
+    hidden_size: 128
+    num_layers: 1
+    intermediate_size: 0
+bf16: false
+learning_rate: 0.0003
+anneal_lr: true
+lr_decay: linear
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: null
+entropy_coef: 0.01
+entropy_decay: constant
+value_coef: 1.0
+max_grad_norm: 0.5
+ckpt_dir: /runs/mappo/${run_id}
+run_id: mappo_${path_name:${env.id}}_${env.num_agents}agents_${env.num_landmarks}landmarks_seed${seed}
+# All intervals count completed PPO iterations (one rollout and its updates).
+# Video, checkpoint, and eval: every 20% of training, rounded up; also run on completion.
+log_interval: 10
+video_interval: 122
+video_max_frames: 900
+video_fps: 10
+checkpoint_interval: 122
+eval_interval: 122
+eval_episodes: 10
+eval_seed: 10000

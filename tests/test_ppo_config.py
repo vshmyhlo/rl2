@@ -23,6 +23,17 @@ def config_path(tmp_path: Path) -> Path:
     return path
 
 
+@pytest.mark.parametrize("field", ["model", "encoder"])
+def test_requires_encoder(config_path: Path, field: str) -> None:
+    settings = yaml.safe_load(config_path.read_text())
+    (settings if field == "model" else settings["model"]).pop(field)
+    config_path.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValidationError) as error:
+        load_config(config_path)
+    assert error.value.errors()[0]["loc"] == (("model",) if field == "model" else ("model", "encoder"))
+    assert error.value.errors()[0]["type"] == "missing"
+
+
 @pytest.mark.parametrize("run_id", ["explicit-run", None, "missing"])
 def test_load_config_returns_fully_resolved_config(config_path: Path, run_id: str | None) -> None:
     settings = yaml.safe_load(config_path.read_text())
@@ -298,14 +309,10 @@ def test_symbolic_encoder_requires_xminigrid(config_path: Path) -> None:
         load_config(config_path)
 
 
-@pytest.mark.parametrize("explicit_rgb", [True, False], ids=["explicit-rgb", "default-rgb"])
-def test_xminigrid_requires_matching_encoder(config_path: Path, explicit_rgb: bool) -> None:
+def test_xminigrid_requires_matching_encoder(config_path: Path) -> None:
     settings = yaml.safe_load(config_path.read_text())
     settings["env_id"] = "XLand-MiniGrid"
-    if explicit_rgb:
-        settings["model"]["encoder"] = {"type": "rgb"}
-    else:
-        settings["model"].pop("encoder")
+    settings["model"]["encoder"] = {"type": "rgb"}
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match="XLand-MiniGrid requires model.encoder.type: xminigrid"):
         load_config(config_path)

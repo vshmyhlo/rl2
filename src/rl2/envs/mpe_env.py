@@ -1,12 +1,13 @@
-"""MPE Simple Spread with discrete actions and explicit time-limit resets."""
+"""MPE Simple Spread and Reference with discrete actions and time-limit resets."""
 
 from functools import partial
-from typing import Annotated
+from typing import Annotated, Literal
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jaxmarl.environments.mpe.simple import State
+from jaxmarl.environments.mpe.simple import SimpleMPE, State
+from jaxmarl.environments.mpe.simple_reference import SimpleReferenceMPE
 from jaxmarl.environments.mpe.simple_spread import SimpleSpreadMPE
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
@@ -16,21 +17,29 @@ from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
 from rl2.actions import DiscreteSpace
-from rl2.envs.multi_agent import AgentObservation, MultiAgentStep
+from rl2.envs.multi_agent import AgentObservation, BaseMultiAgentEnv, MultiAgentStep
+
+type MPEEnvId = Literal["MPE_simple_spread_v3", "MPE_simple_reference_v3"]
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class MPEConfig:
+    id: MPEEnvId = "MPE_simple_spread_v3"
     num_agents: Annotated[int, Field(gt=0, strict=True)] = 3
     num_landmarks: Annotated[int, Field(gt=0, strict=True)] = 3
     max_steps: Annotated[int, Field(gt=0, strict=True)] = 25
     local_ratio: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)] = 0.5
 
+    def __post_init__(self) -> None:
+        if self.id == "MPE_simple_reference_v3" and (self.num_agents != 2 or self.num_landmarks != 3):
+            raise ValueError("MPE Simple Reference requires 2 agents and 3 landmarks")
 
-class MPEEnv:
+
+class MPEEnv(BaseMultiAgentEnv[State]):
     def __init__(self, config: MPEConfig) -> None:
         self.config = config
-        self.env = SimpleSpreadMPE(
+        env_class = SimpleSpreadMPE if config.id == "MPE_simple_spread_v3" else SimpleReferenceMPE
+        self.env: SimpleMPE = env_class(
             num_agents=config.num_agents,
             num_landmarks=config.num_landmarks,
             max_steps=config.max_steps,
@@ -76,14 +85,15 @@ class MPEEnv:
             rewards=jnp.stack([rewards[agent] for agent in self.agents]),  # (N,)
             done=truncated,  # ()
             agent_dones=jnp.full(self.num_agents, truncated),  # (N,)
-            terminated=jnp.asarray(False),  # () Simple Spread ends only at the time limit.
+            terminated=jnp.asarray(False),  # () Both tasks end only at the time limit.
             truncated=truncated,  # ()
             final_observation=final_observation,  # (N, O)/(N, A)
             final_state=final_state,  # leaves: (...)
         )
 
     def memory_resets(self, state: State) -> jax.Array:  # state leaves: (...) -> (N,)
-        return jnp.full(self.num_agents, state.done)  # (N,)
+        # All agents remain active when bootstrapping the final observation at a time limit.
+        return jnp.zeros(self.num_agents, dtype=bool)  # (N,)
 
     def render(self, state: State) -> NDArray[np.uint8]:  # state leaves: (...) -> (H, W, 3)
         figure = Figure(figsize=(5, 5), dpi=80)
@@ -93,6 +103,7 @@ class MPEEnv:
         extent = max(1.2, float(np.abs(positions).max()) + 0.2)
         axes.set(xlim=(-extent, extent), ylim=(-extent, extent), aspect="equal")
         for i, (position, radius) in enumerate(zip(positions, radii)):
-            axes.add_patch(Circle(position, radius, color="tab:blue" if i < self.num_agents else "gray"))
+            color = tuple(channel / 255 for channel in self.env.colour[i])
+            axes.add_patch(Circle(position, radius, color=color))
         canvas.draw()
         return np.asarray(canvas.buffer_rgba(), dtype=np.uint8)[..., :3].copy()  # (H, W, 3)
