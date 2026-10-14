@@ -666,7 +666,11 @@ def test_invalid_video_interval(interval: float) -> None:
         replace(config, video_interval=interval)
 
 
-@pytest.mark.parametrize("interval,expected_steps", [(2, [2, 4]), (0, [])], ids=["periodic", "disabled"])
+@pytest.mark.parametrize(
+    "interval,expected_steps",
+    [(2, [2, 4, 5]), (6, [5]), (5, [5]), (0, [])],
+    ids=["periodic-and-final", "final-before-interval", "final-on-interval", "disabled"],
+)
 def test_video_schedule_uses_iterations(interval: int, expected_steps: list[int]) -> None:
     config = replace(
         load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),

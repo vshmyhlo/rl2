@@ -105,12 +105,12 @@ episodes completed within that window. Learning rate and entropy coefficient rep
 the latest rollout's settings.
 
 Evaluation and video schedules are independent of progress logging. Videos are
-recorded every video_interval iterations (default: 600; 0 disables periodic
+recorded every video_interval iterations (default: 600; 0 disables gameplay
 recording). Evaluation uses eval_interval (default: 0, disabled) and records its
 last episode independently of video_interval. Checkpoints use checkpoint_interval
 (default: 600). One iteration is a rollout and its PPO updates. All schedules use
 the total completed iteration count, including on resume. Enabled evaluation,
-logging, and checkpoints also run on normal completion. Defaults here refer to
+video, logging, and checkpoints also run on normal completion. Defaults here refer to
 Config; YAML configurations may override them.
 
 Checkpoints retain parameters, optimizer state, RNG, completed iterations, and
@@ -129,6 +129,7 @@ from functools import partial
 from math import sqrt
 from operator import itemgetter
 from pathlib import Path
+from statistics import fmean, stdev
 from time import monotonic
 from typing import Annotated, Any, Literal, NamedTuple, Self
 
@@ -140,7 +141,6 @@ os.environ.setdefault("EPATH_USE_TF", "0")
 import chex
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import rlax
@@ -736,11 +736,11 @@ def log_evaluation(
         episode_results.append({"return": episode_return, "length": episode_step_count})
         if frames:
             writer.log_video(frames, f"eval/gameplay/{step_count}.mp4", fps=config.video_fps)
-    returns = np.array([result["return"] for result in episode_results])  # (E,), E evaluation episodes
-    std = float(returns.std(ddof=1)) if config.eval_episodes > 1 else None
+    returns = [result["return"] for result in episode_results]
+    std = stdev(returns) if len(returns) > 1 else None
     result = {
         "env_id": config.env_id,
-        "return_mean": float(returns.mean()),
+        "return_mean": fmean(returns),
         "return_std": std,
         "return_sem": std / sqrt(config.eval_episodes) if std is not None else None,
         "episodes": episode_results,
@@ -1006,7 +1006,7 @@ def train_step(
         minibatch_index = current.minibatch_count % config.num_minibatches  # ()
         key, permutation = jax.lax.cond(minibatch_index == 0, shuffle, keep_permutation, current.key)  # (); (B,)
         indices = permutation.reshape(config.num_minibatches, -1)[minibatch_index]  # (M,), M = B / minibatches
-        minibatch = batch.select_sequences(indices)  # sequences: (T, M, ...); memory: (M, D)
+        minibatch = batch.select_sequences(indices)  # sequences: (T, M, ...); memory leaves: (M, H)
         train_state, metrics = update(current.train_state, minibatch, config, rollout_index)
         kl_exceeded = jnp.asarray(False) if config.target_kl is None else metrics.approx_kl > config.target_kl  # ()
         return UpdateCarry(
@@ -1144,7 +1144,7 @@ def train(config: Config) -> TrainState:
             rollout_count = rollout_index + 1
             is_final_rollout = rollout_count == planned_rollout_count
             step_count = rollout_count * batch_size
-            if config.video_interval and rollout_count % config.video_interval == 0:
+            if config.video_interval and (rollout_count % config.video_interval == 0 or is_final_rollout):
                 log_video(
                     train_state,
                     config,

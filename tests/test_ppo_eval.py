@@ -152,24 +152,34 @@ def test_beta_playback_reuses_compiled_sampling_across_steps_and_episodes() -> N
     assert not np.array_equal(actions[:2], actions[2:])  # Updated parameters reach the cached graph.
 
 
-def test_evaluation_logs_raw_scores_and_independent_seeds() -> None:
+@pytest.mark.parametrize(
+    "trainer,config_path,actor_count",
+    [(ppo, "configs/ppo.yaml", 1), (train_mappo, "configs/mappo/smax.yaml", 2)],
+    ids=["ppo", "mappo"],
+)
+def test_evaluation_logs_raw_scores_and_independent_seeds(
+    trainer: ModuleType, config_path: str, actor_count: int
+) -> None:
     config = replace(
-        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), eval_episodes=2, video_fps=12.5
+        trainer.load_config(Path(__file__).resolve().parents[1] / config_path), eval_episodes=2, video_fps=12.5
     )
     writer = Mock()
     state = Mock(spec=TrainState)
-    carry = ppo.ActorCritic(
-        ppo.DiscreteSpace(3), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
-    ).initial_carry(1)  # leaves: (1,1)
+    carry = ((jnp.zeros((actor_count, 1)), jnp.zeros((actor_count, 1))),)  # leaves: (B, H=1)
     frame = np.zeros((2, 2, 3), np.uint8)  # (H,W,3)
-    with patch.object(ppo, "play_episode", side_effect=[(2.0, 3, []), (4.0, 5, [frame])]) as play:
-        ppo.log_evaluation(state, config, writer, 1, 128, initial_carry=carry)
+    with (
+        patch.object(trainer, "make_env") as make_env,
+        patch.object(trainer, "play_episode", side_effect=[(2.0, 3, []), (4.0, 5, [frame])]) as play,
+    ):
+        trainer.log_evaluation(state, config, writer, 1, 128, initial_carry=carry)
+    make_env.assert_called_once_with(config)
     for index, call in enumerate(play.call_args_list):
         np.testing.assert_array_equal(
             jax.random.key_data(call.args[2]),
             jax.random.key_data(jax.random.fold_in(jax.random.key(config.eval_seed), index)),
         )
         assert call.args[3] is carry
+        assert call.kwargs["env"] is make_env.return_value
         assert call.kwargs["record"] == (index == 1)
     scalars = writer.log_metrics.call_args.args[0]
     assert scalars["eval/return_mean"] == 3
@@ -180,7 +190,7 @@ def test_evaluation_logs_raw_scores_and_independent_seeds() -> None:
     assert not any("last_100" in tag for tag in scalars)
     assert "eval/human_normalized_score_percent" not in scalars
     report = json.loads(writer.log_text.call_args.args[0])
-    assert report["env_id"] == "Breakout-MinAtar"
+    assert report["env_id"] == config.env_id
     assert report["episodes"] == [{"return": 2, "length": 3}, {"return": 4, "length": 5}]
     assert "training_scores" not in report
     assert len(writer.log_video.call_args.args[0]) == 1
@@ -257,18 +267,29 @@ def test_playback_logging_reports_progress(
     )
 
 
-def test_single_evaluation_omits_unavailable_uncertainty() -> None:
-    config = replace(ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"), eval_episodes=1)
+@pytest.mark.parametrize(
+    "trainer,config_path,actor_count",
+    [(ppo, "configs/ppo.yaml", 1), (train_mappo, "configs/mappo/smax.yaml", 2)],
+    ids=["ppo", "mappo"],
+)
+def test_single_evaluation_omits_unavailable_uncertainty(
+    trainer: ModuleType, config_path: str, actor_count: int
+) -> None:
+    config = replace(trainer.load_config(Path(__file__).resolve().parents[1] / config_path), eval_episodes=1)
     writer = Mock()
-    carry = ppo.ActorCritic(
-        ppo.DiscreteSpace(3), ppo.ModelConfig(recurrent=ppo.LSTMConfig(hidden_size=1))
-    ).initial_carry(1)  # leaves: (1,1)
-    with patch.object(ppo, "play_episode", return_value=(2.0, 3, [])):
-        ppo.log_evaluation(Mock(), config, writer, 0, 0, initial_carry=carry)
+    carry = ((jnp.zeros((actor_count, 1)), jnp.zeros((actor_count, 1))),)  # leaves: (B, H=1)
+    with (
+        patch.object(trainer, "make_env"),
+        patch.object(trainer, "play_episode", return_value=(2.0, 3, [])),
+    ):
+        trainer.log_evaluation(Mock(), config, writer, 0, 0, initial_carry=carry)
     tags = set(writer.log_metrics.call_args.args[0])
     assert "eval/return_mean" in tags
     assert not {"eval/return_std", "eval/return_sem"} & tags
     report = json.loads(writer.log_text.call_args.args[0])
+    assert report["return_mean"] == 2.0
+    assert report["return_std"] is None
+    assert report["return_sem"] is None
     assert "training_scores" not in report
 
 

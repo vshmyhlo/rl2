@@ -355,11 +355,15 @@ def test_config_and_cli(config: ppo.Config, tmp_path: Path, monkeypatch: pytest.
     train.assert_called_once_with(config)
 
 
+@pytest.mark.parametrize("interval", [1, 3, 0], ids=["final-on-interval", "final-before-interval", "disabled"])
 def test_training_resume_wiring_and_environment_step_logging(
     config: ppo.Config,
     monkeypatch: pytest.MonkeyPatch,
+    interval: int,
 ) -> None:
-    config = replace(config, video_interval=1, eval_interval=1, checkpoint_interval=1, log_interval=1)
+    config = replace(
+        config, video_interval=interval, eval_interval=interval, checkpoint_interval=interval or 3, log_interval=1
+    )
     env = ScriptedSMAX()
     writer, manager = MagicMock(), Mock()
     video, evaluation, save = Mock(), Mock(), Mock(return_value=2.5)
@@ -404,9 +408,14 @@ def test_training_resume_wiring_and_environment_step_logging(
 
     monkeypatch.setattr(ppo, "restore_checkpoint", restore)
     monkeypatch.setattr(ppo, "train_step_donated", train_step)
-    ppo.train(config)
+    state = ppo.train(config)
     for logger in (video, evaluation):
+        if not interval:
+            logger.assert_not_called()
+            continue
         logger.assert_called_once()
+        assert logger.call_args.args[0] is state
+        assert logger.call_args.args[3:] == (2, 8)
         chex.assert_shape(jax.tree.leaves(logger.call_args.kwargs["initial_carry"]), (2, 4))
         assert logger.call_args.kwargs["env"] is env
     scalars = {tag: values[-1] for tag, values in metric_history(writer).items()}
@@ -417,6 +426,8 @@ def test_training_resume_wiring_and_environment_step_logging(
     assert scalars["charts/total_updates"] == (6.0, 8)
     assert scalars["charts/training_progress"] == (1.0, 8)
     assert scalars["time/checkpoint_seconds"] == (2.5, 8)
+    save.assert_called_once()
+    assert save.call_args.args[1].train_state is state
     assert save.call_args.args[1].rollout_count == 2
     writer.__exit__.assert_called_once()
     manager.close.assert_called_once()

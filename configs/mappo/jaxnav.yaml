@@ -37,7 +37,7 @@ run_id: mappo_${path_name:${env_id}}_${jaxnav.num_agents}agents_${jaxnav.map_siz
 log_interval: 10
 video_interval: 100
 video_max_frames: 900
-video_fps: 10
+video_fps: 24
 checkpoint_interval: 200
 eval_interval: 200
 eval_episodes: 10

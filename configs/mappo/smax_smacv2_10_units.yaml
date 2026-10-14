@@ -1,0 +1,40 @@
+# Ten-on-ten armies with randomized unit types and starting positions each episode.
+env_id: SMAX
+smax:
+  map_name: smacv2_10_units
+  max_steps: 200
+seed: 1
+total_steps: 30_000_000 # Environment transitions; each contains num_agents observations
+num_envs: 64
+num_steps: 128
+num_minibatches: 4 # Divides num_envs * num_agents; keep recurrent sequences intact
+update_epochs: 4
+model:
+  hidden_size: 128
+  recurrent:
+    hidden_size: 128
+    num_layers: 1
+    intermediate_size: 0
+bf16: false
+learning_rate: 0.0003
+anneal_lr: true
+lr_decay: linear
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: null
+entropy_coef: 0.01
+entropy_decay: constant
+value_coef: 1.0
+max_grad_norm: 0.5
+ckpt_dir: /runs/mappo/${run_id}
+run_id: mappo_${path_name:${env_id}}_${path_name:${smax.map_name}}_seed${seed}
+# All intervals count completed PPO iterations (one rollout and its updates).
+log_interval: 10
+video_interval: 100
+video_max_frames: 900
+video_fps: 5
+checkpoint_interval: 200
+eval_interval: 200
+eval_episodes: 10
+eval_seed: 10000

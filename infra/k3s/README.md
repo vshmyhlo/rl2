@@ -79,11 +79,23 @@ sudo k3s kubectl -n headlamp create token headlamp-viewer --duration=1h
 
 The login account has Kubernetes's built-in `view` role across namespaces, plus
 `get`, `list`, and `watch` access to nodes through `headlamp-node-viewer` (the
-built-in `view` role excludes nodes). It can inspect nodes, workloads, and logs,
-but cannot edit resources or read Secrets;
-some cluster administration views are unavailable. The Headlamp pod uses a
+built-in `view` role excludes nodes). It can inspect nodes, workloads, and logs.
+The training installer also grants deletion of Jobs in `training`; other writes
+and access to Secrets remain disallowed. Some cluster administration views are
+unavailable. The Headlamp pod uses a
 separate service account without a cluster role binding. Tokens are generated
 on demand and are not stored in this repository. Generate another after expiry.
+
+To enable Job deletion on an existing cluster, after creating the `training` namespace:
+
+```bash
+sudo k3s kubectl apply -f infra/k3s/training/headlamp-access.yaml
+```
+
+In Headlamp, open **Workloads → Jobs**, select namespace **training**, open the
+Job, and choose **Delete**. Delete the Job to cancel it and remove it from the
+queue; evicting its Pod can cause a replacement to start. Saved `/runs`
+checkpoints remain. Refresh Headlamp after changing permissions.
 
 To diagnose installation or startup:
 
@@ -135,9 +147,8 @@ proxied through the tracking server, so both host and Pod clients can upload
 and download them without mounting the server's volume. Allowed Host headers
 cover localhost and these internal service names.
 
-The existing PPO and MAPPO trainers still use TensorBoard; they need MLflow
-logging integration before their runs appear here. This deployment tracks
-experiments; submit GPU jobs through the Kueue configuration below.
+PPO and MAPPO log metrics, configuration, evaluation reports, and gameplay
+videos to MLflow. `submit.py` supplies the tracking URL automatically.
 
 The PVC requests 50 GiB. Local-path storage does not enforce this as a disk
 quota. Monitor disk usage and back up the database and artifacts together
@@ -164,6 +175,7 @@ first. Grafana and Prometheus have separate persistent volumes.
 
 ```bash
 sudo k3s kubectl apply -k infra/k3s/monitoring
+sudo k3s kubectl -n monitoring wait --for=create daemonset/dcgm-exporter deployment/gpu-prometheus deployment/gpu-grafana --timeout=180s
 sudo k3s kubectl -n monitoring rollout status daemonset/dcgm-exporter --timeout=180s
 sudo k3s kubectl -n monitoring rollout status deployment/gpu-prometheus --timeout=180s
 sudo k3s kubectl -n monitoring rollout status deployment/gpu-grafana --timeout=180s
@@ -189,6 +201,8 @@ in `monitoring/monitoring.yaml` and k3s's Helm controller manages installation.
 
 This dashboard reports physical GPU telemetry, including work launched directly
 on the host. It does not report per-process utilization or tensor-core profiling.
+Queries group by GPU UUID and stable device labels so changing training Pods
+does not create duplicate GPU entries or split their history.
 The exporter reads the kubelet's pod-resource socket for GPU assignment labels;
 those labels identify GPU assignments for training Pods scheduled through the
 NVIDIA device plugin. It uses the existing NVIDIA runtime and basic DCGM counters
@@ -212,8 +226,9 @@ The `gpu` LocalQueue maps to the `gpu` ClusterQueue, with quota for one GPU,
 10 CPUs, and 64 GiB RAM on `vlad-dev-gpu-1`. This leaves resources for cluster
 services. `BestEffortFIFO` admits eligible Jobs in queue order within a
 priority level, allowing a Job that fits to bypass one that cannot fit.
-Each Job requesting one GPU gets exclusive Kubernetes allocation until it
-finishes; the next Job remains suspended without creating a Pod.
+Each Job requesting one GPU gets exclusive Kubernetes allocation. With
+`withinClusterQueue: LowerPriority`, a higher-priority Job can evict a running
+lower-priority Job; otherwise waiting Jobs remain suspended without a Pod.
 
 Install controllers first, then queue resources:
 
@@ -221,6 +236,7 @@ Install controllers first, then queue resources:
 sudo k3s kubectl apply -f infra/k3s/kueue/controllers.yaml
 sudo k3s kubectl -n kueue-system wait --for=create deployment/kueue-controller-manager --timeout=180s
 sudo k3s kubectl -n kueue-system rollout status deployment/kueue-controller-manager --timeout=180s
+sudo k3s kubectl -n kube-system wait --for=create daemonset/nvidia-device-plugin --timeout=180s
 sudo k3s kubectl -n kube-system rollout status daemonset/nvidia-device-plugin --timeout=180s
 sudo k3s kubectl apply -f infra/k3s/kueue/queues.yaml
 sudo k3s kubectl wait --for=condition=Active clusterqueue/gpu --timeout=60s
@@ -256,9 +272,9 @@ For a training Job, copy the sample and replace its image and command. Keep:
 - Explicit CPU and memory requests within the queue's quota. Increase the
   sample's memory limit and remove or extend its 120-second active deadline.
 
-The template includes the internal MLflow tracking URL. Building the training
-image and adding MLflow calls to PPO/MAPPO are still separate work. Kueue does
-not control processes launched directly on the host or Jobs without its queue
+The template includes the internal MLflow tracking URL. Use `submit.py` below
+to build and queue PPO/MAPPO training jobs. Kueue does not control processes
+launched directly on the host or Jobs without its queue
 label. Its quota tracks declared requests, not actual usage.
 
 The host keeps its existing NVIDIA driver and Container Toolkit. The device
@@ -277,7 +293,8 @@ one-GPU Job to `training/gpu`:
 ```
 
 One-time host setup (installs BuildKit `v0.34.0`, enables the root
-`rl2-buildkit` service, and creates two Kueue priority classes):
+`rl2-buildkit` service and image-pin cleanup timer, creates two Kueue priority
+classes, and provisions run storage; rerun to update an existing installation):
 
 ```bash
 sudo bash infra/k3s/training/install.sh
@@ -291,6 +308,24 @@ layers are cached using `uv.lock`; CUDA12 and the environment packages are
 regular project dependencies. Inside the image, `uv run` uses the
 built environment without syncing dependencies again.
 
+Before creating a Job, the submitter pins its image in containerd so kubelet
+cleanup cannot remove it while queued or preempted. The `rl2-image-pins.timer`
+reconciles pins every minute, releasing them after Jobs finish or are deleted.
+If the Kubernetes API is unavailable, pins are preserved. Unpinning allows
+normal kubelet cleanup; it does not immediately delete images or BuildKit cache.
+Submission requires the timer to be active. Check it with:
+
+```bash
+sudo systemctl status rl2-image-pins.timer --no-pager
+sudo journalctl -u rl2-image-pins.service -n 20 --no-pager
+```
+
+Verify image pinning and release with a tiny CPU-only Job:
+
+```bash
+RL2_K3S_TESTS=1 uv run pytest infra/k3s/tests/test_image_lifecycle.py -q
+```
+
 The non-secret `nvida.env` configuration is included in the image and loaded by
 `uv run` automatically through `UV_ENV_FILE=/app/nvida.env`. Use `uv run
 --no-env-file` to disable it. Other `.env` files remain excluded. Never
@@ -298,17 +333,75 @@ put credentials in `nvida.env`; supply secrets at runtime. Resubmit after changi
 this file so the job uses a newly built image.
 
 Defaults are `--prio low --cpus 4 --memory-gib 16`. High priority moves ahead of
-waiting low-priority Jobs; running Jobs are not preempted. The command after
-`--` runs from `/app` with its arguments preserved, plus the internal MLflow URL.
+waiting low-priority Jobs and preempts running low-priority Jobs when quota is
+full. Kueue suspends the low-priority Job and deletes its Pod, then readmits the
+same Job with a new Pod when higher-priority work finishes. Equal-priority Jobs
+do not preempt each other. Apply the policy to an existing cluster:
+
+```bash
+sudo k3s kubectl apply -f infra/k3s/kueue/queues.yaml -f infra/k3s/training/priorities.yaml
+```
+
+Readmission restarts the command; it does not preserve process or GPU memory.
+PPO/MAPPO restore the latest saved checkpoint from the same `ckpt_dir`. Use durable
+storage (`/runs` or the configured GCS path): container-local files disappear on
+eviction, and progress since the last checkpoint is lost. Preemption does not
+force a new checkpoint. Keep different runs' checkpoint directories distinct.
+
+The command after `--` runs from `/app` with its arguments preserved, plus the
+internal MLflow URL.
 Use `-- sh -c '...'` explicitly for shell pipelines. Submission returns after
 queueing and prints status/log commands. Failed Jobs are not retried, and
 finished Jobs expire after seven days.
 
-Only the image is a repository snapshot: local credentials and host files are
-not mounted. Container-local outputs are ephemeral; use a durable `log_dir`
-(the existing configs use GCS) and provide access to that storage at runtime.
+Only the image is a repository snapshot; local credentials are not mounted.
+Outputs outside `/runs` are ephemeral unless written to external storage.
 Builds and images consume host disk; inspect cache usage with
 `sudo buildctl --addr unix:///run/rl2-buildkit/buildkitd.sock du`.
+
+To check preemption on an idle queue (creates and cleans up two short GPU Jobs):
+
+```bash
+RL2_K3S_TESTS=1 uv run pytest infra/k3s/tests/test_preemption.py -q -s
+```
+
+### Shared on-disk checkpoints
+
+Every newly submitted Job mounts the `training/training-runs` PVC at `/runs`.
+It uses this node's disk through `local-path`, with a 50 GiB storage request
+(not an enforced filesystem quota). Install it on an existing cluster:
+
+```bash
+sudo k3s kubectl apply -f infra/k3s/training/storage.yaml
+```
+
+Configs under `configs/ppo/` and `configs/mappo/` set `ckpt_dir` to
+`/runs/ppo/${run_id}` and `/runs/mappo/${run_id}`, respectively. Choose a separate
+`run_id` in YAML for each experiment; reuse it to resume:
+
+```bash
+./submit.py --prio low -- uv run mappo --config configs/mappo/jaxnav.yaml
+./submit.py --prio high -- uv run ppo --config configs/ppo/minatar/breakout.yaml
+```
+
+Both trainers write to `<ckpt_dir>/checkpoints` and restore the latest completed
+checkpoint automatically. To change the directory, edit `ckpt_dir` in YAML.
+Files survive Pod replacement, preemption, and Job deletion. Do not delete the
+PVC: its storage class deletes the backing directory. This is shared storage on
+one machine, not a backup. Existing Jobs need resubmission to receive the mount.
+
+Locate the backing directory on this host:
+
+```bash
+run_pv=$(sudo k3s kubectl -n training get pvc training-runs -o jsonpath='{.spec.volumeName}')
+sudo k3s kubectl get pv "$run_pv" -o jsonpath='{.spec.local.path}{.spec.hostPath.path}{"\n"}'
+```
+
+The volume binds on first use. Verify persistence using two small CPU-only Pods:
+
+```bash
+RL2_K3S_TESTS=1 uv run pytest infra/k3s/tests/test_storage.py -q
+```
 
 ### Submit jobs with kjobs
 

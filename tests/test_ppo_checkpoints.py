@@ -427,7 +427,7 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         assert saved_iterations == [2, 3, 4]
         assert saved_return_sums == [2.0, 3.0, 4.0]
         assert saved_length_sums == [2, 3, 4]
-        assert [call.args[4] for call in video.call_args_list] == [3]
+        assert [call.args[4] for call in video.call_args_list] == [3, 4]
         assert [call.args[4] for call in evaluate.call_args_list] == [3, 4]
         assert all(isinstance(call.args[3], int) for call in video.call_args_list + evaluate.call_args_list)
         assert iterations == [0, 1, 2, 3]
