@@ -577,7 +577,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         patch("rl2.ppo.monotonic", side_effect=now),
         patch("rl2.ppo.checkpoint_manager"),
         patch("rl2.ppo.restore_checkpoint", return_value=None),
-        patch("rl2.ppo.save_checkpoint"),
+        patch("rl2.ppo.save_checkpoint", return_value=2.5),
     ):
         train(config)
     actor_critic.assert_called_once_with(
@@ -639,7 +639,8 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     }.intersection(logged)
     assert "step=2 episodes=1 return=8.0 episode_length=2.0" in progress_lines[0]
     assert "step=3 episodes=1 return=n/a episode_length=n/a" in progress_lines[1]
-    assert writer.log_metrics.call_count == 3  # Startup and two progress windows.
+    assert logged["time/checkpoint_seconds"] == [(2.5, 3)]
+    assert writer.log_metrics.call_count == 4  # Startup, two progress windows, and checkpoint timing.
     writer.__exit__.assert_called_once()
 
 
@@ -728,7 +729,7 @@ def test_video_schedule_uses_iterations(interval: int, expected_steps: list[int]
         patch.object(ppo, "monotonic", side_effect=now),
         patch.object(ppo, "checkpoint_manager"),
         patch.object(ppo, "restore_checkpoint", return_value=None),
-        patch.object(ppo, "save_checkpoint"),
+        patch.object(ppo, "save_checkpoint", return_value=2.5),
         patch.object(ppo, "log_video", side_effect=record_video) as video,
     ):
         train(config)
@@ -818,7 +819,7 @@ def test_train_evaluates_final_policy(
         patch.object(ppo, "monotonic", side_effect=now),
         patch.object(ppo, "checkpoint_manager"),
         patch.object(ppo, "restore_checkpoint", return_value=None),
-        patch.object(ppo, "save_checkpoint"),
+        patch.object(ppo, "save_checkpoint", return_value=2.5),
         patch.object(ppo, "log_evaluation", side_effect=advance_evaluation) as evaluate,
     ):
         state = train(config)

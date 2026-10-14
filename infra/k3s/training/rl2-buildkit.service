@@ -1,0 +1,15 @@
+[Unit]
+Description=Build training images into the local k3s image store
+Requires=k3s.service
+After=k3s.service
+
+[Service]
+ExecStart=/usr/local/bin/buildkitd --config /etc/rl2-buildkit.toml
+Restart=on-failure
+RuntimeDirectory=rl2-buildkit
+RuntimeDirectoryMode=0700
+KillMode=process
+Delegate=yes
+
+[Install]
+WantedBy=multi-user.target

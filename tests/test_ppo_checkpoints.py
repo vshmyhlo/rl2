@@ -7,7 +7,7 @@ import sys
 from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import chex
@@ -19,7 +19,7 @@ import pytest
 from flax.training.train_state import TrainState
 from ppo_helpers import env_step, metric_history
 
-from rl2 import ppo
+from rl2 import ppo, train_mappo
 from rl2.envs.base import BaseEnv
 from rl2.lstm import initial_carry
 
@@ -135,6 +135,42 @@ def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Confi
         assert manager.all_steps() == [2, 3]
     with ppo.checkpoint_manager(f"{config.log_dir}/different-run") as manager:
         assert ppo.restore_checkpoint(manager, fresh, config) is None
+
+
+@pytest.mark.parametrize(
+    "trainer,config_path",
+    [(ppo, "configs/ppo.yaml"), (train_mappo, "configs/mappo/smax.yaml")],
+    ids=["ppo", "mappo"],
+)
+def test_checkpoint_timing_includes_completed_writes(
+    trainer: ModuleType, config_path: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = trainer.load_config(Path(__file__).resolve().parents[1] / config_path)
+    progress = trainer.TrainingProgress(
+        train_state=Mock(spec=TrainState),
+        key=jax.random.key(0),  # () typed PRNG key
+        rollout_count=2,
+        episode_count=0,
+        episode_return_sum=0.0,
+        episode_length_sum=0,
+    )
+    clock = 10.0
+
+    def advance(seconds: float, *args: object, **kwargs: object) -> None:
+        nonlocal clock
+        clock += seconds
+
+    manager = Mock()
+    manager.save.side_effect = partial(advance, 2.0)
+    manager.wait_until_finished.side_effect = partial(advance, 3.0)
+    with patch.object(trainer, "monotonic", side_effect=lambda: clock):
+        assert trainer.save_checkpoint(manager, progress, config) == 5.0
+        assert [call[0] for call in manager.mock_calls] == ["save", "wait_until_finished"]
+        assert capsys.readouterr().out == "Saved checkpoint at iteration 2 in 5.0s\n"
+        manager.wait_until_finished.side_effect = RuntimeError("write failed")
+        with pytest.raises(RuntimeError, match="write failed"):
+            trainer.save_checkpoint(manager, progress, config)
+        assert capsys.readouterr().out == ""
 
 
 @pytest.mark.parametrize("version", [2, 3], ids=["legacy-recent-history", "current-totals-only"])
@@ -354,7 +390,7 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         manager: ppo.ocp.CheckpointManager,
         progress: ppo.TrainingProgress,
         config: ppo.Config,
-    ) -> None:
+    ) -> float:
         nonlocal checkpoint
         checkpoint = progress
         assert isinstance(progress.episode_count, int)
@@ -363,6 +399,7 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         saved_iterations.append(progress.rollout_count)
         saved_return_sums.append(progress.episode_return_sum)
         saved_length_sums.append(progress.episode_length_sum)
+        return 2.5
 
     with (
         jax.disable_jit(),

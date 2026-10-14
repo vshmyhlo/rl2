@@ -1,5 +1,6 @@
 import json
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import Mock, patch
@@ -190,16 +191,34 @@ def test_playback_logging_reports_progress(
     writer = Mock()
     carry = ((jnp.zeros((actor_count, 1)), jnp.zeros((actor_count, 1))),)  # leaves: (B, H=1)
     frame = np.zeros((2, 2, 3), np.uint8)  # (H, W, C)
-    result = trainer.EpisodeResult(episode_return=2.0, length=1, frames=[frame])
-    with patch.object(trainer, "make_env"), patch.object(trainer, "play_episode", return_value=result):
+    clock = 10.0
+
+    def advance(seconds: float, *args: object, **kwargs: object) -> None:
+        nonlocal clock
+        clock += seconds
+
+    def play_episode(*args: object, **kwargs: object) -> ppo.EpisodeResult:
+        advance(3.0)
+        return ppo.EpisodeResult(episode_return=2.0, length=1, frames=[frame])
+
+    writer.log_video.side_effect = partial(advance, 2.0)
+    writer.log_text.side_effect = partial(advance, 1.0)
+    with (
+        patch.object(trainer, "make_env"),
+        patch.object(trainer, "play_episode", side_effect=play_episode),
+        patch.object(trainer, "monotonic", side_effect=lambda: clock),
+    ):
         trainer.log_video(Mock(), config, writer, 2, 128, initial_carry=carry)
         trainer.log_evaluation(Mock(), config, writer, 2, 128, initial_carry=carry)
     assert capsys.readouterr().out.splitlines() == [
         "Recording gameplay at step 128 after 2 training episodes...",
-        "Recorded 1 gameplay frames after 2 training episodes",
+        "Recorded 1 gameplay frames after 2 training episodes in 5.0s",
         "Evaluating 1 games at step 128...",
-        "Evaluation: return=2.0 over 1 games",
+        "Evaluation: return=2.0 over 1 games in 6.0s",
     ]
+    writer.log_metrics.assert_any_call({"time/video_seconds": 5.0}, 128)
+    assert writer.log_metrics.call_args.args[0]["time/evaluation_seconds"] == 6.0
+    assert writer.log_metrics.call_args.args[1] == 128
     assert [call.args[1] for call in writer.log_video.call_args_list] == ["gameplay/128.mp4", "eval/gameplay/128.mp4"]
     assert all(
         len(call.args[0]) == 1 and call.args[0][0].shape == (2, 2, 3) for call in writer.log_video.call_args_list

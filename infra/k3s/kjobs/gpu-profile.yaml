@@ -1,0 +1,43 @@
+apiVersion: kjobctl.x-k8s.io/v1alpha1
+kind: ApplicationProfile
+metadata:
+  name: gpu-smoke
+  namespace: training
+spec:
+  supportedModes:
+    - name: Job
+      template: gpu-smoke
+      requiredFlags: [localqueue]
+---
+apiVersion: kjobctl.x-k8s.io/v1alpha1
+kind: JobTemplate
+metadata:
+  name: gpu-smoke
+  namespace: training
+template:
+  spec:
+    suspend: true
+    parallelism: 1
+    completions: 1
+    backoffLimit: 0
+    activeDeadlineSeconds: 120
+    ttlSecondsAfterFinished: 600
+    template:
+      spec:
+        runtimeClassName: nvidia
+        restartPolicy: Never
+        automountServiceAccountToken: false
+        containers:
+          - name: gpu-check
+            image: nvidia/cuda:12.6.3-base-ubuntu22.04
+            command: [nvidia-smi]
+            env:
+              - name: MLFLOW_TRACKING_URI
+                value: http://mlflow.mlflow.svc.cluster.local:5000
+            resources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
+              limits:
+                nvidia.com/gpu: 1
+                memory: 256Mi

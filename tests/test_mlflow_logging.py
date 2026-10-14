@@ -1,11 +1,14 @@
 from pathlib import Path
+from subprocess import run
 from unittest.mock import patch
 
-import mlflow
 import numpy as np
 import pytest
 from mlflow import MlflowClient
+from mlflow.exceptions import MlflowException
+from mlflow.protos.databricks_pb2 import ErrorCode
 from moviepy import VideoFileClip
+from moviepy.config import FFMPEG_BINARY
 
 from rl2.mlflow_logging import MLflowLogger
 
@@ -45,7 +48,11 @@ def test_metrics_artifacts_and_resume(client: MlflowClient, tmp_path: Path) -> N
     assert config.read_text() == "seed: 0\n"
     report = Path(client.download_artifacts(run_id, "eval/report/4.json"))
     assert report.read_text() == '{"return_mean": 2.5}'
-    with VideoFileClip(client.download_artifacts(run_id, "eval/gameplay/4.mp4")) as clip:
+    video_path = client.download_artifacts(run_id, "eval/gameplay/4.mp4")
+    probe = run([FFMPEG_BINARY, "-i", video_path, "-f", "null", "-"], capture_output=True, text=True, check=True)
+    assert "yuv420p" in probe.stderr
+    assert "yuv444p" not in probe.stderr
+    with VideoFileClip(video_path) as clip:
         assert clip.size == [6, 4]
         assert clip.fps == 12.5
         assert clip.duration == pytest.approx(1 / 12.5)
@@ -93,13 +100,108 @@ def test_default_experiment_and_artifact_failure(
     # Keep even the automatically created experiment's artifacts inside the test directory.
     monkeypatch.chdir(tmp_path)
     with (
-        patch.object(mlflow, "set_experiment", wraps=mlflow.set_experiment) as select,
         pytest.raises(RuntimeError, match="upload"),
         MLflowLogger(experiment="ppo", run_name=None, run_dir=str(tmp_path), resume=False) as logger,
         patch.object(logger.client, "log_artifact", side_effect=RuntimeError("upload")) as upload,
     ):
         frames = [np.zeros((2, 2, 3), dtype=np.uint8)]  # entries: (H=2, W=2, C=3)
         logger.log_video(frames, "gameplay/0.mp4", fps=10)
-    select.assert_called_once_with(experiment_id=None, experiment_name="ppo")
+    experiment = client.get_experiment(client.get_run(logger.run_id).info.experiment_id)
+    assert experiment.name == "ppo"
     assert client.get_run(logger.run_id).info.status == "FAILED"
     assert not Path(upload.call_args.args[1]).exists()
+
+
+def test_experiment_selection_does_not_leak(client: MlflowClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MLFLOW_EXPERIMENT_NAME")
+    for name in ("ppo", "mappo"):
+        with MLflowLogger(experiment=name, run_name=None, run_dir="gs://bucket/run", resume=False) as logger:
+            experiment = client.get_experiment(client.get_run(logger.run_id).info.experiment_id)
+            assert experiment.name == name
+
+
+@pytest.mark.parametrize("error_code", ["RESOURCE_ALREADY_EXISTS", "INTERNAL_ERROR"])
+def test_experiment_creation_race(client: MlflowClient, monkeypatch: pytest.MonkeyPatch, error_code: str) -> None:
+    name = f"creation-{error_code}"
+    monkeypatch.setenv("MLFLOW_EXPERIMENT_NAME", name)
+
+    def create_experiment(experiment_name: str) -> str:
+        if error_code == "RESOURCE_ALREADY_EXISTS":
+            client.create_experiment(experiment_name)
+        raise MlflowException("creation failed", error_code=ErrorCode.Value(error_code))
+
+    logger_client = MlflowClient()
+    with (
+        patch("rl2.mlflow_logging.MlflowClient", return_value=logger_client),
+        patch.object(logger_client, "create_experiment", side_effect=create_experiment),
+    ):
+        if error_code == "INTERNAL_ERROR":
+            with pytest.raises(MlflowException, match="creation failed"):
+                MLflowLogger(experiment="ppo", run_name=None, run_dir="gs://bucket/run", resume=False)
+        else:
+            with MLflowLogger(experiment="ppo", run_name=None, run_dir="gs://bucket/run", resume=False) as logger:
+                experiment = client.get_experiment(client.get_run(logger.run_id).info.experiment_id)
+                assert experiment.name == name
+
+
+@pytest.mark.parametrize(
+    ("frame_count", "fps"),
+    [pytest.param(31, 30, id="last-frame-rounding"), pytest.param(1, 49, id="single-frame-rounding")],
+)
+def test_video_preserves_frames_at_artifact_root(
+    client: MlflowClient, tmp_path: Path, frame_count: int, fps: float
+) -> None:
+    with MLflowLogger(experiment="ppo", run_name=None, run_dir=str(tmp_path), resume=False) as logger:
+        frames = [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(frame_count)]  # each (H=2, W=2, C=3)
+        frames[-1][:] = 255
+        logger.log_video(frames, "gameplay.mp4", fps=fps)
+    assert [artifact.path for artifact in client.list_artifacts(logger.run_id)] == ["gameplay.mp4"]
+    path = client.download_artifacts(logger.run_id, "gameplay.mp4")
+    decoded = run(
+        [FFMPEG_BINARY, "-i", path, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        capture_output=True,
+        check=True,
+    )
+    assert len(decoded.stdout) == frame_count * 2 * 2 * 3
+    assert min(decoded.stdout[-12:]) >= 250
+
+
+@pytest.mark.parametrize(
+    ("frame_count", "fps", "message"),
+    [
+        pytest.param(0, 10, "at least one frame", id="empty"),
+        pytest.param(1, 0, "finite and positive", id="zero-fps"),
+        pytest.param(1, -10, "finite and positive", id="negative-fps"),
+        pytest.param(1, float("inf"), "finite and positive", id="infinite-fps"),
+        pytest.param(1, float("nan"), "finite and positive", id="nan-fps"),
+    ],
+)
+def test_invalid_video(frame_count: int, fps: float, message: str) -> None:
+    with patch("rl2.mlflow_logging.MlflowClient"):
+        logger = MLflowLogger(experiment="ppo", run_name=None, run_dir="unused", resume=False)
+    frames = [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(frame_count)]  # each (H=2, W=2, C=3)
+    with pytest.raises(ValueError, match=message):
+        logger.log_video(frames, "gameplay.mp4", fps=fps)
+
+
+def test_termination_failure_preserves_training_error(client: MlflowClient, tmp_path: Path) -> None:
+    error = ValueError("training failed")
+    logger = MLflowLogger(experiment="ppo", run_name=None, run_dir=str(tmp_path), resume=False)
+    with (
+        pytest.raises(ValueError, match="training failed") as raised,
+        patch.object(logger.client, "set_terminated", side_effect=RuntimeError("tracking unavailable")),
+        logger,
+    ):
+        raise error
+    assert raised.value is error
+    assert any("tracking unavailable" in note for note in error.__notes__)
+
+
+def test_termination_failure_after_success_propagates(client: MlflowClient, tmp_path: Path) -> None:
+    logger = MLflowLogger(experiment="ppo", run_name=None, run_dir=str(tmp_path), resume=False)
+    with (
+        pytest.raises(RuntimeError, match="tracking unavailable"),
+        patch.object(logger.client, "set_terminated", side_effect=RuntimeError("tracking unavailable")),
+        logger,
+    ):
+        pass

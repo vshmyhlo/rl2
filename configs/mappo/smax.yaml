@@ -28,13 +28,13 @@ entropy_decay: constant
 value_coef: 1.0
 max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/mappo/${run_id}
-run_id: ippo_${path_name:${env_id}}_${path_name:${smax.map_name}}
+run_id: mappo_${path_name:${env_id}}_${path_name:${smax.map_name}}_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
 log_interval: 10
 video_interval: 100
 video_max_frames: 900
 video_fps: 5
-checkpoint_interval: 500
-eval_interval: 500
-eval_episodes: 20
+checkpoint_interval: 200
+eval_interval: 200
+eval_episodes: 10
 eval_seed: 10000

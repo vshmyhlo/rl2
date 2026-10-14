@@ -58,6 +58,8 @@ Progress scalars reporting the latest rollout's settings:
 
 Session timing:
     time/elapsed_seconds: Wall time since this training session's rollout loop started.
+    time/video_seconds: Periodic gameplay recording, encoding, and upload wall time.
+    time/checkpoint_seconds: Checkpoint save wall time, including completion of writes.
 
 Startup scalars (also logged when resuming):
     model/params_millions: Model parameter count in millions.
@@ -67,7 +69,7 @@ Evaluation scalars (when evaluation is enabled; unavailable scores are omitted):
     eval/return_std: Sample standard deviation of raw evaluation team returns.
     eval/return_sem: Standard error of the mean raw evaluation team return.
     eval/total_training_episodes: Completed training episodes at evaluation time.
-    time/evaluation_seconds: Evaluation wall time.
+    time/evaluation_seconds: Evaluation wall time, including gameplay and report uploads.
 
 Artifacts (indexed by training step):
     config/<step>.yaml: Full training configuration as YAML, logged at startup and on resume.
@@ -395,8 +397,9 @@ def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
     )
 
 
-def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, config: Config) -> None:
-    """Save a completed rollout; live environment state is deliberately restarted on resume."""
+def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, config: Config) -> float:
+    """Wait for a completed rollout checkpoint to finish saving and return elapsed seconds."""
+    started = monotonic()
     key_data = jax.random.key_data(progress.key)  # (K,) raw PRNG words
     manager.save(
         progress.rollout_count,
@@ -416,6 +419,10 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
         ),
         force=True,
     )
+    manager.wait_until_finished()
+    seconds = monotonic() - started
+    print(f"Saved checkpoint at iteration {progress.rollout_count} in {seconds:.1f}s", flush=True)
+    return seconds
 
 
 def restore_checkpoint(
@@ -660,6 +667,7 @@ def log_video(
 ) -> None:
     """Record a separate episode up to the frame cap and log its gameplay video."""
     print(f"Recording gameplay at step {step_count} after {episode_count} training episodes...", flush=True)
+    started = monotonic()
     _, _, frames = play_episode(
         train_state,
         config,
@@ -670,7 +678,11 @@ def log_video(
         env=make_env(config),
     )
     writer.log_video(frames, f"gameplay/{step_count}.mp4", fps=config.video_fps)
-    print(f"Recorded {len(frames)} gameplay frames after {episode_count} training episodes", flush=True)
+    seconds = monotonic() - started
+    writer.log_metrics({"time/video_seconds": seconds}, step_count)
+    print(
+        f"Recorded {len(frames)} gameplay frames after {episode_count} training episodes in {seconds:.1f}s", flush=True
+    )
 
 
 def log_evaluation(
@@ -716,10 +728,14 @@ def log_evaluation(
         f"eval/{name}": result[name] for name in ("return_mean", "return_std", "return_sem") if result[name] is not None
     }
     scalars["eval/total_training_episodes"] = episode_count
-    scalars["time/evaluation_seconds"] = monotonic() - started
-    writer.log_metrics(scalars, step_count)
     writer.log_text(json.dumps(result, indent=2, allow_nan=False), f"eval/report/{step_count}.json")
-    print(f"Evaluation: return={result['return_mean']:.1f} over {config.eval_episodes} games", flush=True)
+    seconds = monotonic() - started
+    scalars["time/evaluation_seconds"] = seconds
+    writer.log_metrics(scalars, step_count)
+    print(
+        f"Evaluation: return={result['return_mean']:.1f} over {config.eval_episodes} games in {seconds:.1f}s",
+        flush=True,
+    )
 
 
 def update(
@@ -1197,7 +1213,7 @@ def train(config: Config) -> TrainState:
                 with jax.enable_x64():
                     metrics = metrics._replace(window=RunningSum.init(metrics.window))  # scalar leaves
             if rollout_count % config.checkpoint_interval == 0 or is_final_rollout:
-                save_checkpoint(
+                checkpoint_seconds = save_checkpoint(
                     manager,
                     TrainingProgress(
                         train_state=train_state,
@@ -1209,6 +1225,7 @@ def train(config: Config) -> TrainState:
                     ),
                     config,
                 )
+                writer.log_metrics({"time/checkpoint_seconds": checkpoint_seconds}, step_count)
         return train_state
 
 

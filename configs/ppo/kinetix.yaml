@@ -36,13 +36,13 @@ entropy_decay: cosine # Let the walker settle into a precise gait late in traini
 value_coef: 0.5
 max_grad_norm: 0.5
 log_dir: gs://cohere-dev/vlad/rl2/ppo/${run_id}
-run_id: ppo_${path_name:${env_id}}_${path_name:${kinetix.levels.0}}
+run_id: ppo_${path_name:${env_id}}_${path_name:${kinetix.levels.0}}_${model.continuous_policy}_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
-checkpoint_interval: 500
+checkpoint_interval: 200
 log_interval: 10
 video_interval: 100
 video_max_frames: 900
 video_fps: 30.0 # 60 Hz physics / frame_skip 2
-eval_interval: 500
-eval_episodes: 20
+eval_interval: 200
+eval_episodes: 10
 eval_seed: 10000

@@ -1,0 +1,13 @@
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: train-low
+value: 0
+description: Normal training queue priority.
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: train-high
+value: 100
+description: Run before waiting low-priority training jobs; no running-job preemption.

@@ -336,7 +336,7 @@ def test_training_resume_wiring_and_environment_step_logging(
     config = replace(config, video_interval=1, eval_interval=1, checkpoint_interval=1, log_interval=1)
     env = ScriptedSMAX()
     writer, manager = MagicMock(), Mock()
-    video, evaluation, save = Mock(), Mock(), Mock()
+    video, evaluation, save = Mock(), Mock(), Mock(return_value=2.5)
     monkeypatch.setattr(ppo, "make_env", lambda _: env)
     monkeypatch.setattr(ppo, "MLflowLogger", Mock(return_value=writer))
     monkeypatch.setattr(ppo, "checkpoint_manager", lambda _: manager)
@@ -375,6 +375,7 @@ def test_training_resume_wiring_and_environment_step_logging(
     assert scalars["charts/total_observations"] == (16.0, 8)
     assert scalars["charts/total_episodes"] == (2.0, 8)
     assert scalars["charts/training_progress"] == (1.0, 8)
+    assert scalars["time/checkpoint_seconds"] == (2.5, 8)
     assert save.call_args.args[1].rollout_count == 2
     writer.__exit__.assert_called_once()
     manager.close.assert_called_once()
