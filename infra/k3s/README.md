@@ -75,7 +75,9 @@ To stop one forward and disable its boot startup, run
 ## Headlamp dashboard
 
 Headlamp runs in the `headlamp` namespace, managed by k3s's built-in Helm
-controller with the official chart pinned to `0.45.0`. Install or reconcile it:
+controller with the official chart pinned to `0.45.0`. The Kueue plugin is
+pinned to `0.1.0-alpha` and downloaded with checksum verification by an init
+container on each Pod start. Install or reconcile it:
 
 ```bash
 sudo k3s kubectl apply -f infra/k3s/headlamp.yaml
@@ -101,7 +103,8 @@ sudo k3s kubectl -n headlamp create token headlamp-viewer --duration=1h
 
 The login account has Kubernetes's built-in `view` role across namespaces, plus
 `get`, `list`, and `watch` access to nodes through `headlamp-node-viewer` (the
-built-in `view` role excludes nodes). It can inspect nodes, workloads, and logs.
+built-in `view` role excludes nodes) and Kueue resources through
+`headlamp-kueue-viewer`. It can inspect nodes, workloads, queues, and logs.
 The training installer also grants deletion of Jobs in `training`; other writes
 and access to Secrets remain disallowed. Some cluster administration views are
 unavailable. The Headlamp pod uses a
@@ -118,6 +121,12 @@ In Headlamp, open **Workloads → Jobs**, select namespace **training**, open th
 Job, and choose **Delete**. Delete the Job to cancel it and remove it from the
 queue; evicting its Pod can cause a replacement to start. Saved `/runs`
 checkpoints remain. Refresh Headlamp after changing permissions.
+
+Open **Kueue → Workloads** for admission status, priority, requests, and queue
+conditions. **Kueue → LocalQueues → training/gpu** and **ClusterQueues → gpu**
+show queue usage and related workloads. These alpha plugin views are read-only;
+use **Workloads → Jobs** for logs and deleting Jobs. Refresh the browser after
+installing the plugin. Existing login tokens retain the updated permissions.
 
 To diagnose installation or startup:
 

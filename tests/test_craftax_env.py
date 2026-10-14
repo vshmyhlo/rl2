@@ -14,6 +14,7 @@ from flax.training.train_state import TrainState
 
 from rl2 import ppo
 from rl2.envs.craftax_env import CraftaxConfig, CraftaxEnv
+from rl2.envs.observations import CraftaxObservation, Observation
 
 
 @struct.dataclass
@@ -57,6 +58,7 @@ def test_render_observation_converts_only_video_pixels() -> None:
 
 def test_terminal_timeout_both_and_partial_autoreset() -> None:
     env = object.__new__(CraftaxEnv)
+    env.grid_shape = None
     env.env = Game()
     env.render_env = env.env
     env.params = Params(max_timesteps=2)
@@ -100,6 +102,13 @@ def test_terminal_timeout_both_and_partial_autoreset() -> None:
     np.testing.assert_array_equal(next_observations, info["final_observation"])
 
 
+def flatten_observation(observation: Observation) -> jax.Array:
+    """Reconstruct (D,) native symbolic values, or return (H,W,3) pixels."""
+    if isinstance(observation, CraftaxObservation):
+        return jnp.concatenate((observation.grid.reshape(-1), observation.features))  # (D,)
+    return observation  # (H,W,3)
+
+
 @pytest.mark.parametrize(
     "env_id,shape,frame_shape,num_actions",
     [
@@ -117,13 +126,21 @@ def test_real_craftax_reset_step_and_video(
     env = CraftaxEnv(CraftaxConfig(env_id=env_id, max_steps=1))
     key = jax.random.key(0)  # ()
     observations, state = env.reset(key, env.params)  # (*O,); leaves: (...)
-    assert observations.shape == shape and observations.dtype == jnp.float32
+    flat = flatten_observation(observations)  # (D,) or (H,W,3)
+    assert flat.shape == shape and flat.dtype == jnp.float32
+    if isinstance(observations, CraftaxObservation):
+        grid_shape, features = ((7, 9, 21), 22) if "Classic" in env_id else ((9, 11, 83), 51)
+        assert observations.grid.shape == grid_shape and observations.features.shape == (features,)
     assert env.action_space.n == num_actions
-    chex.assert_trees_all_equal((observations, state), env.env.reset(key, env.params))
+    chex.assert_trees_all_equal((flat, state), env.env.reset(key, env.params))
     next_observations, next_state, rewards, done, info = env.step(
         jax.random.key(1), state, jnp.array(0), env.params
     )  # (*O,); leaves: (...); scalars; final_observation: (*O,)
-    assert next_observations.shape == info["final_observation"].shape == shape
+    assert flatten_observation(next_observations).shape == shape
+    # Compiled rendering can differ from eager rendering by float32 rounding.
+    np.testing.assert_allclose(
+        flatten_observation(info["final_observation"]), env.env.get_obs(info["final_state"]), rtol=2e-6, atol=1e-7
+    )
     chex.assert_shape((rewards, done, info["terminated"], info["truncated"]), ())
     np.testing.assert_array_equal(info["terminated"], False)
     np.testing.assert_array_equal(info["truncated"], True)
@@ -135,12 +152,13 @@ def test_real_craftax_reset_step_and_video(
     batched_obs, _ = jax.eval_shape(
         jax.vmap(env.reset, in_axes=(0, None)), jax.random.split(key, 2), env.params
     )  # (B=2,*O); state leaves: (B,...)
-    assert batched_obs.shape == (2, *shape)
+    for original, batched in zip(jax.tree.leaves(observations), jax.tree.leaves(batched_obs)):
+        assert batched.shape == (2, *original.shape)
 
 
 def test_symbolic_ppo_rollout_and_update() -> None:
     config = replace(
-        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/craftax.yaml"),
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml"),
         env=CraftaxConfig(env_id="Craftax-Symbolic-v1", max_steps=2),
         num_envs=1,
         num_steps=2,
@@ -148,22 +166,22 @@ def test_symbolic_ppo_rollout_and_update() -> None:
         update_epochs=1,
         target_kl=None,
         model=ppo.ModelConfig(
-            encoder=ppo.MLPEncoderConfig(hidden_size=4, embedding_size=2),
+            encoder=ppo.CraftaxEncoderConfig(channels=4, blocks=0, hidden_size=4, embedding_size=2),
             recurrent=ppo.LSTMConfig(hidden_size=2),
         ),
     )
     env = ppo.make_env(config)
     observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(jax.random.key(0), 1), env.params
-    )  # (B=1,F=8268); state leaves: (B,...)
+    )  # grid: (B=1,9,11,83), features: (B,51); state leaves: (B,...)
     model = ppo.ActorCritic(action_space=env.action_space, model=config.model, dtype=jnp.bfloat16)
     carry = model.initial_carry(1)  # leaves: (B,H=2)
     starts = jnp.ones(1, bool)  # (B,)
-    params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]
+    params = model.init(jax.random.key(1), jax.tree.map(lambda x: x[None], observations), carry, starts[None])["params"]
     train_state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(1e-3))
     runner = ppo.RolloutCarry(
         env_state=env_state,  # leaves: (B,...)
-        observations=observations,  # (B,F)
+        observations=observations,  # grid: (B,9,11,83), features: (B,51)
         model_carry=carry,  # leaves: (B,H)
         episode_starts=starts,  # (B,)
         episode_returns=jnp.zeros(1),  # (B,)
@@ -171,7 +189,14 @@ def test_symbolic_ppo_rollout_and_update() -> None:
     )
     advanced, rollout = ppo.collect_rollout(runner, train_state, env, config, jax.random.key(2))
     batch = rollout.batch
-    assert batch.observations.shape == (2, 1, 8268)
+    assert batch.observations.grid.shape == (2, 1, 9, 11, 83)
+    assert batch.observations.features.shape == (2, 1, 51)
+    selected = batch.select_sequences(jnp.array([0, 0]))
+    chex.assert_shape(selected.observations.grid, (2, 2, 9, 11, 83))
+    chex.assert_shape(selected.observations.features, (2, 2, 51))
+    chex.assert_trees_all_equal(
+        jax.tree.map(lambda x: x[:, 0], selected.observations), jax.tree.map(lambda x: x[:, 0], batch.observations)
+    )
     assert batch.actions.shape == batch.returns.shape == (2, 1)
     assert batch.actions.dtype == jnp.int32
     assert bool(jnp.all((batch.actions >= 0) & (batch.actions < 43)))
@@ -182,3 +207,5 @@ def test_symbolic_ppo_rollout_and_update() -> None:
     updated, _ = ppo.update(train_state, batch, config)
     assert int(updated.step) == 1
     assert any(not np.array_equal(a, b) for a, b in zip(jax.tree.leaves(params), jax.tree.leaves(updated.params)))
+    episode = ppo.play_episode(updated, config, jax.random.key(3), carry, record=False, env=env)
+    assert episode.length == 2 and not episode.frames

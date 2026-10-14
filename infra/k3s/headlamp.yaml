@@ -15,6 +15,31 @@ spec:
   targetNamespace: headlamp
   valuesContent: |-
     fullnameOverride: headlamp
+    initContainers:
+      - name: install-kueue-plugin
+        image: busybox:1.37.0
+        command: [sh, -ec]
+        args:
+          - |
+            wget -T 60 -O /tmp/kueue.tar.gz https://github.com/headlamp-k8s/plugins/releases/download/kueue-0.1.0-alpha/headlamp-k8s-kueue-0.1.0-alpha.tar.gz
+            echo '2f8a896dd297a01d03be56bd0d61016194e37b9a8e6c91c583e240b7b7b8a120  /tmp/kueue.tar.gz' | sha256sum -c -
+            tar -xzf /tmp/kueue.tar.gz -C /plugins
+        volumeMounts:
+          - name: kueue-plugin
+            mountPath: /plugins
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            memory: 128Mi
+    volumes:
+      - name: kueue-plugin
+        emptyDir: {}
+    volumeMounts:
+      - name: kueue-plugin
+        mountPath: /headlamp/plugins
+        readOnly: true
     clusterRoleBinding:
       create: false
     service:
@@ -66,6 +91,28 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: headlamp-node-viewer
+subjects:
+  - kind: ServiceAccount
+    name: headlamp-viewer
+    namespace: headlamp
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: headlamp-kueue-viewer
+rules:
+  - apiGroups: [kueue.x-k8s.io]
+    resources: [clusterqueues, localqueues, resourceflavors, workloads, cohorts, workloadpriorityclasses]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: headlamp-kueue-viewer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: headlamp-kueue-viewer
 subjects:
   - kind: ServiceAccount
     name: headlamp-viewer

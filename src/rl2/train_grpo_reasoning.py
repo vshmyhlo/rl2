@@ -30,6 +30,7 @@ from reasoning_gym.dataset import ProceduralDataset
 from reasoning_gym.utils import extract_answer
 
 from rl2.calculator import calculate
+from rl2.configuration import resolve_settings
 from rl2.gemma3 import (
     Gemma3Carry,
     Gemma3LM,
@@ -84,7 +85,7 @@ class Config:
     beta: float = 0.01
     duration_penalty_coef: float = 0.0
     max_grad_norm: float = 1.0
-    log_dir: str = "runs"
+    ckpt_dir: str = "runs/grpo_reasoning/${run_id}"
     run_id: str | None = None
     log_interval: int = 10
     log_completion_count: int = 4
@@ -134,6 +135,13 @@ class Config:
             raise ValueError("run_id must be a nonempty directory name without slashes or traversal")
 
 
+def resolve_config(config: Config) -> Config:
+    settings = resolve_settings(
+        asdict(config) | {"run_id": config.run_id or f"grpo_reasoning_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}"}
+    )
+    return replace(config, run_id=settings["run_id"], ckpt_dir=settings["ckpt_dir"])
+
+
 def load_config(path: str | Path) -> Config:
     """Validate untyped YAML values at the configuration boundary."""
     values = yaml.safe_load(read_bytes(str(path)))
@@ -164,7 +172,7 @@ def load_config(path: str | Path) -> Config:
             if extract_answer(example["completion"]) is None:
                 raise ValueError("Each prompt example completion must contain <answer>...</answer>")
         values["prompt_examples"] = [PromptExample(**example) for example in examples]
-    return Config(**values)
+    return resolve_config(Config(**values))
 
 
 class GRPOBatch(NamedTuple):
@@ -880,8 +888,8 @@ def train(config: Config) -> TrainState:
     if not config.beta:
         ref_params = {}
     del variables
-    config = replace(config, run_id=config.run_id or f"grpo_reasoning_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}")
-    run_dir = f"{config.log_dir.rstrip('/')}/{config.run_id}"
+    config = resolve_config(config)
+    run_dir = config.ckpt_dir.rstrip("/")
     log_init(f"Checking for saved training state: {run_dir}/checkpoints")
     with closing(checkpoint_manager(run_dir)) as manager:
         saved = restore_training_checkpoint(manager, state)

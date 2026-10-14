@@ -9,7 +9,8 @@ from rl2 import ppo, train_mappo
 @pytest.mark.parametrize(
     ("trainer", "config_path"),
     [
-        (ppo, "configs/ppo/craftax/craftax.yaml"),
+        (ppo, "configs/ppo/craftax/symbolic.yaml"),
+        (ppo, "configs/ppo/craftax/pixels.yaml"),
         (ppo, "configs/ppo/kinetix.yaml"),
         (ppo, "configs/ppo/xminigrid.yaml"),
         (ppo, "configs/ppo/minatar/breakout.yaml"),
@@ -19,7 +20,18 @@ from rl2 import ppo, train_mappo
         (train_mappo, "configs/mappo/jaxmarl/storm/basic.yaml"),
         (train_mappo, "configs/mappo/jaxmarl/storm/advanced.yaml"),
     ],
-    ids=["craftax", "kinetix", "xminigrid", "breakout", "jaxtari", "jaxnav", "smax", "storm-basic", "storm-advanced"],
+    ids=[
+        "craftax-symbolic",
+        "craftax-pixels",
+        "kinetix",
+        "xminigrid",
+        "breakout",
+        "jaxtari",
+        "jaxnav",
+        "smax",
+        "storm-basic",
+        "storm-advanced",
+    ],
 )
 def test_cli_shared_run_directory(trainer: ModuleType, config_path: str, monkeypatch: pytest.MonkeyPatch) -> None:
     config = trainer.load_config(config_path)

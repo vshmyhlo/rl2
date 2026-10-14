@@ -8,6 +8,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from rl2.actions import ActionSpace
+from rl2.envs.observations import Observation
 
 
 class StepInfo[State](TypedDict):
@@ -15,14 +16,14 @@ class StepInfo[State](TypedDict):
 
     terminated: jax.Array  # () bool
     truncated: jax.Array  # () bool
-    final_observation: jax.Array  # (*O,) adapter-specific dtype
+    final_observation: Observation  # leaves: (*O,) adapter-specific dtype
     final_state: State  # leaves: (...)
 
 
 class EnvStep[State](NamedTuple):
     """Step result with observation/state reset when done."""
 
-    observation: jax.Array  # (*O,) adapter-specific dtype
+    observation: Observation  # leaves: (*O,) adapter-specific dtype
     state: State  # leaves: (...)
     reward: jax.Array  # () floating-point
     done: jax.Array  # () bool, terminated or truncated
@@ -32,8 +33,8 @@ class EnvStep[State](NamedTuple):
 class BaseEnv[State, Params](ABC):
     """Explicit state and RNGs, discrete or continuous actions, and same-step autoreset.
 
-    Actions and observations retain native values, dtypes, and dimensions.
-    O denotes native observation dimensions. Reset and step support
+    Actions retain native values; observation arrays or pytrees use adapter-specific layouts.
+    O denotes each observation leaf's dimensions. Reset and step support
     jax.jit and jax.vmap; rendering may run on the host.
     """
 
@@ -45,8 +46,8 @@ class BaseEnv[State, Params](ABC):
         self,
         key: jax.Array,  # () typed PRNG key
         params: Params,
-    ) -> tuple[jax.Array, State]:  # (*O,); state leaves: (...)
-        """Return (*O,) observation in the adapter's dtype and (...) state leaves."""
+    ) -> tuple[Observation, State]:  # leaves: (*O,); state leaves: (...)
+        """Return (*O,) observation leaves in the adapter's dtype and (...) state leaves."""
 
     @abstractmethod
     def step(

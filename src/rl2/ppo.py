@@ -5,7 +5,7 @@ heads. Policies support discrete and bounded continuous actions.
 Environment completion ends traces; time limits bootstrap from final observations
 before autoreset, unless the episode also terminated.
 
-B denotes environments, T rollout steps, O observation dimensions, A discrete
+B denotes environments, T rollout steps, O observation leaf dimensions, A discrete
 actions, D continuous action size, and H recurrent width.
 Recurrent minibatches preserve entire environment sequences.
 
@@ -154,11 +154,13 @@ from rl2.envs.craftax_env import CraftaxConfig, CraftaxEnv
 from rl2.envs.gymnax_env import GymnaxConfig, GymnaxEnv
 from rl2.envs.jaxtari_env import JAXtariConfig, JAXtariEnv
 from rl2.envs.kinetix_env import KinetixConfig, KinetixEnv
+from rl2.envs.observations import Observation
 from rl2.envs.playground_env import PlaygroundConfig, PlaygroundEnv
 from rl2.envs.xminigrid_env import XMiniGridConfig, XMiniGridEnv
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.mlflow_logging import MLflowLogger
+from rl2.model.encoders.craftax import CraftaxEncoder
 from rl2.model.encoders.mlp import MLPEncoder
 from rl2.model.encoders.rgb import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
 from rl2.model.encoders.xminigrid import XMiniGridEncoder
@@ -175,7 +177,7 @@ class PPOBatch:
     """PPO inputs; S is (T, B) for sequences or (B,) for step-only policies.
 
     Attributes:
-        observations: (*S, *O) observations with observation dimensions O.
+        observations: (*S, *O) leaves with observation dimensions O.
         actions: (*S,) integer IDs or (*S, *action_shape) bounded continuous actions.
         old_log_probs: (*S,) rollout action log probabilities.
         values: (*S,) rollout-time value predictions for explained variance.
@@ -185,7 +187,7 @@ class PPOBatch:
         episode_starts: (*S,) boolean episode reset flags.
     """
 
-    observations: jax.Array  # (*S, *O)
+    observations: Observation  # leaves: (*S, *O)
     actions: jax.Array  # (*S,) integer IDs or (*S, *action_shape) bounded continuous actions
     old_log_probs: jax.Array  # (*S,)
     values: jax.Array  # (*S,)
@@ -210,7 +212,7 @@ class RolloutCarry(NamedTuple):
 
     Attributes:
         env_state: (B, ...) batched environment state leaves.
-        observations: (B, *O) current observations with observation dimensions O.
+        observations: (B, *O) current observation leaves with observation dimensions O.
         model_carry: (B, H) LSTM memory leaves, where H is model.recurrent.hidden_size.
         episode_starts: (B,) boolean episode reset flags.
         episode_returns: (B,) accumulated raw rewards for unfinished episodes.
@@ -218,7 +220,7 @@ class RolloutCarry(NamedTuple):
     """
 
     env_state: chex.ArrayTree  # leaves: (B, ...)
-    observations: jax.Array  # (B, *O)
+    observations: Observation  # leaves: (B, *O)
     model_carry: RecurrentCarry  # leaves: (B, H)
     episode_starts: jax.Array  # (B,)
     episode_returns: jax.Array  # (B,)
@@ -325,8 +327,18 @@ class MLPEncoderConfig:
     embedding_size: Annotated[int, Field(gt=0, strict=True)] = 256
 
 
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class CraftaxEncoderConfig:
+    type: Literal["craftax"] = "craftax"
+    channels: Annotated[int, Field(gt=0, strict=True)] = 32
+    blocks: Annotated[int, Field(ge=0, strict=True)] = 2
+    hidden_size: Annotated[int, Field(gt=0, strict=True)] = 128
+    embedding_size: Annotated[int, Field(gt=0, strict=True)] = 256
+
+
 type EncoderConfig = Annotated[
-    RGBEncoderConfig | XMiniGridEncoderConfig | KinetixEncoderConfig | MLPEncoderConfig, Field(discriminator="type")
+    RGBEncoderConfig | XMiniGridEncoderConfig | KinetixEncoderConfig | MLPEncoderConfig | CraftaxEncoderConfig,
+    Field(discriminator="type"),
 ]
 
 
@@ -384,16 +396,14 @@ class Config:
         if isinstance(self.env, JAXtariConfig) and self.model.encoder.type != "rgb":
             raise ValueError("JAXtari requires model.encoder.type: rgb")
         symbolic_craftax = isinstance(self.env, CraftaxConfig) and "Symbolic" in self.env.env_id
-        if (
-            self.model.encoder.type == "mlp"
-            and self.env.id not in ("MuJoCo-Playground", "Brax")
-            and not symbolic_craftax
-        ):
-            raise ValueError("mlp encoder requires MuJoCo-Playground, Brax or symbolic Craftax")
+        if self.model.encoder.type == "mlp" and self.env.id not in ("MuJoCo-Playground", "Brax"):
+            raise ValueError("mlp encoder requires MuJoCo-Playground or Brax")
         if isinstance(self.env, CraftaxConfig):
-            encoder = "mlp" if symbolic_craftax else "rgb"
+            encoder = "craftax" if symbolic_craftax else "rgb"
             if self.model.encoder.type != encoder:
                 raise ValueError(f"{self.env.env_id} requires model.encoder.type: {encoder}")
+        if self.model.encoder.type == "craftax" and not symbolic_craftax:
+            raise ValueError("craftax encoder requires symbolic Craftax")
         if self.env.id in ("MuJoCo-Playground", "Brax") and self.model.encoder.type != "mlp":
             raise ValueError(f"{self.env.id} requires model.encoder.type: mlp")
         if self.model.encoder.type == "kinetix" and self.env.id != "Kinetix":
@@ -590,6 +600,15 @@ class ActorCritic(nn.Module):
                 dtype=self.dtype,
                 name="encoder",
             )
+        elif encoder.type == "craftax":
+            self.encoder = CraftaxEncoder(
+                channels=encoder.channels,
+                blocks=encoder.blocks,
+                hidden_size=encoder.hidden_size,
+                embedding_size=encoder.embedding_size,
+                dtype=self.dtype,
+                name="encoder",
+            )
         elif encoder.type == "xminigrid":
             self.encoder = XMiniGridEncoder(
                 token_size=encoder.token_size,
@@ -626,7 +645,7 @@ class ActorCritic(nn.Module):
             features=1, kernel_init=nn.initializers.orthogonal(1.0), name="value_output", dtype=self.dtype
         )
 
-    def _encode(self, obs: jax.Array) -> jax.Array:  # (B, *O) -> (B, H)
+    def _encode(self, obs: Observation) -> jax.Array:  # leaves: (B, *O) -> (B, H)
         x = self.encoder(obs)  # (B, F), F is model.encoder.embedding_size
         return self.recurrent_input(x).astype(self.dtype)  # (B, H)
 
@@ -657,13 +676,13 @@ class ActorCritic(nn.Module):
 
     def __call__(
         self,
-        obs: jax.Array,  # (T, B, *O), O is encoder-specific
+        obs: Observation,  # leaves: (T, B, *O), O is encoder-specific
         model_carry: RecurrentCarry,  # leaves: (B, H)
         episode_starts: jax.Array,  # (T, B)
     ) -> ActorCriticOutput:  # carry leaves: (B, H); policy leaves: (T, B, A/D); values: (T, B)
         """Process observation sequences, resetting memory at episode starts."""
-        step_count, env_count = obs.shape[:2]
-        x = self._encode(obs.reshape((-1, *obs.shape[2:])))  # (T * B, H)
+        step_count, env_count = episode_starts.shape
+        x = self._encode(jax.tree.map(lambda x: x.reshape((-1, *x.shape[2:])), obs))  # (T * B, H)
         x = x.reshape((step_count, env_count, -1))  # (T, B, H)
         # Batch the encoder and heads across time; the LSTM handles its recurrence.
         model_carry, x = self.recurrent(x, model_carry, episode_starts)  # model_carry leaves: (B, H); x: (T, B, H)
@@ -672,7 +691,7 @@ class ActorCritic(nn.Module):
 
     def step(
         self,
-        obs: jax.Array,  # (B, *O), O is encoder-specific
+        obs: Observation,  # leaves: (B, *O), O is encoder-specific
         model_carry: RecurrentCarry,  # leaves: (B, H)
         episode_starts: jax.Array,  # (B,)
     ) -> ActorCriticOutput:  # carry leaves: (B, H); policy leaves: (B, A/D); values: (B,)
@@ -687,7 +706,7 @@ class ActorCritic(nn.Module):
 def sample_policy_step(
     apply_fn: Callable[..., ActorCriticOutput],
     params: optax.Params,
-    observations: jax.Array,  # (B, *O)
+    observations: Observation,  # leaves: (B, *O)
     carry: RecurrentCarry,  # leaves: (B, H)
     episode_starts: jax.Array,  # (B,)
     key: jax.Array,  # () typed PRNG key
@@ -700,7 +719,7 @@ def sample_policy_step(
     return carry, policy.sample(seed=key)  # carry leaves: (B, H); actions: (B, *action_shape)
 
 
-type EpisodeState = PlaybackState[jax.Array, Any, RecurrentCarry]
+type EpisodeState = PlaybackState[Observation, Any, RecurrentCarry]
 
 
 def playback_step(
@@ -713,7 +732,7 @@ def playback_step(
     memory, actions = sample_policy_step(
         apply_fn,
         params,
-        state.observation[None],
+        jax.tree.map(lambda x: x[None], state.observation),
         state.memory,
         state.episode_starts,
         action_key,
@@ -924,7 +943,7 @@ def collect_rollout(
     class Transition(NamedTuple):
         """S is (B,) per step or (T, B) after scanning."""
 
-        observations: jax.Array  # (*S, *O)
+        observations: Observation  # leaves: (*S, *O)
         actions: jax.Array  # (*S,) integer IDs or (*S, *action_shape) bounded continuous actions
         log_probs: jax.Array  # (*S,)
         values: jax.Array  # (*S,)
@@ -1159,7 +1178,9 @@ def train(config: Config) -> TrainState:
         )
         train_state = TrainState.create(
             apply_fn=model.apply,
-            params=model.init(init_key, obs[None, :1], model.initial_carry(1), episode_starts[None, :1])["params"],
+            params=model.init(
+                init_key, jax.tree.map(lambda x: x[None, :1], obs), model.initial_carry(1), episode_starts[None, :1]
+            )["params"],
             tx=optimizer(config.learning_rate),
         )
         progress = restore_checkpoint(manager, train_state, config)

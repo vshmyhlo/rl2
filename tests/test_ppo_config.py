@@ -176,25 +176,25 @@ def test_rejects_invalid_environment_union(config_path: Path, env: dict[str, obj
         load_config(config_path)
 
 
-@pytest.mark.parametrize("name,env_id", [("xminigrid", "XLand-MiniGrid"), ("craftax/craftax", "Craftax")])
+@pytest.mark.parametrize("name,env_id", [("xminigrid", "XLand-MiniGrid"), ("craftax/symbolic", "Craftax")])
 def test_optional_environment_configs_load(name: str, env_id: str) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / f"configs/ppo/{name}.yaml")
     assert config.env.id == env_id
     assert hash(config)
 
 
-def test_craftax_preset_uses_symbolic_mlp() -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/craftax.yaml")
+def test_craftax_preset_uses_symbolic_encoder() -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml")
     assert config.env.env_id == "Craftax-Symbolic-v1"
-    assert config.model.encoder == ppo.MLPEncoderConfig()
+    assert config.model.encoder == ppo.CraftaxEncoderConfig()
 
 
 @pytest.mark.parametrize(
     "env_id,encoder,expected",
-    [("Craftax-Symbolic-v1", "rgb", "mlp"), ("Craftax-Pixels-v1", "mlp", "rgb")],
+    [("Craftax-Symbolic-v1", "rgb", "craftax"), ("Craftax-Pixels-v1", "mlp", "rgb")],
 )
 def test_craftax_rejects_mismatched_encoder(env_id: str, encoder: str, expected: str) -> None:
-    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/craftax.yaml"))
+    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml"))
     settings["env"]["env_id"] = env_id
     settings["model"]["encoder"] = {"type": encoder}
     with pytest.raises(ValidationError, match="requires"):
@@ -240,7 +240,8 @@ def test_optional_environments_reject_invalid_settings(name: str, settings: dict
         ("brax/pusher", ppo.BraxConfig, "BraxEnv"),
         ("kinetix", KinetixConfig, "KinetixEnv"),
         ("xminigrid", XMiniGridConfig, "XMiniGridEnv"),
-        ("craftax/craftax", CraftaxConfig, "CraftaxEnv"),
+        ("craftax/symbolic", CraftaxConfig, "CraftaxEnv"),
+        ("craftax/pixels", CraftaxConfig, "CraftaxEnv"),
         ("mujoco_playground/manipulation/panda_pick_cube", ppo.PlaygroundConfig, "PlaygroundEnv"),
     ],
 )
@@ -258,7 +259,7 @@ def test_environment_round_trip_and_factory(
 
 
 def test_craftax_missing_dependency(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/craftax.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml")
     original_import = builtins.__import__
 
     def without_dependency(module: str, *args: Any, **kwargs: Any) -> ModuleType:

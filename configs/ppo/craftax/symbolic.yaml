@@ -1,0 +1,45 @@
+# Symbolic grid CNN + feature MLP, followed by an LSTM.
+env:
+  id: Craftax
+  env_id: Craftax-Symbolic-v1 # Or Craftax-Classic-Symbolic-v1
+  max_steps: null # Native episode limit
+seed: 1
+total_steps: 10_000_000
+num_envs: 32
+num_steps: 128
+num_minibatches: 4
+update_epochs: 4
+model:
+  encoder:
+    type: craftax
+    channels: 32
+    blocks: 2
+    hidden_size: 128
+    embedding_size: 256
+  recurrent:
+    type: lstm
+    hidden_size: 256
+bf16: true
+learning_rate: 0.00025
+anneal_lr: true
+lr_decay: linear
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: 0.01
+entropy_coef: 0.01
+entropy_decay: constant
+value_coef: 0.5
+max_grad_norm: 0.5
+ckpt_dir: /runs/ppo/${run_id}
+run_id: ppo_${path_name:${env.id}}_${path_name:${env.env_id}}_grid_seed${seed}
+# All intervals count completed PPO iterations (one rollout and its updates).
+# Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
+checkpoint_interval: 489
+log_interval: 60
+video_interval: 245
+video_max_frames: 900
+video_fps: 40.0
+eval_interval: 489
+eval_episodes: 10
+eval_seed: 10000

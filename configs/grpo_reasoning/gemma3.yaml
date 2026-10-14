@@ -30,7 +30,7 @@ clip_coef: 0.2
 beta: 0.0
 duration_penalty_coef: 0.0 # Learn correctness/tool use before rewarding shorter answers.
 max_grad_norm: 1.0
-log_dir: runs
+ckpt_dir: runs/grpo_reasoning/${run_id}
 run_id: gemma3_270m_calculator_multiplication_zero_shot
 log_interval: 10
 log_completion_count: 4

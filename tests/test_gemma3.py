@@ -256,7 +256,7 @@ def test_training_selects_gemma_loader(
         grpo.train(
             grpo.Config(
                 checkpoint="gs://gemma-data/checkpoints/gemma3-270m-pt",
-                log_dir=str(tmp_path),
+                ckpt_dir=str(tmp_path),
                 max_prompt_tokens=3,
                 max_new_tokens=3,
             )

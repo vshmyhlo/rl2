@@ -180,8 +180,8 @@ Upstream inventory checked 2026-10-14; variants grouped. rl2 support varies.
 
 - [Craftax](https://github.com/MichaelTMatthews/Craftax) — survival/crafting ([factory](https://github.com/MichaelTMatthews/Craftax/blob/main/craftax/craftax_env.py)).
   - Craftax: `Craftax-Symbolic-v1` and `Craftax-Pixels-v1`.
-    - **Symbolic:** `(8268,)`; flattened 9×11 tile/item/entity/light features
-      plus 51 inventory, equipment, player-state, and status values.
+    - **Symbolic:** rl2 pytree `grid: (9, 11, 83)`, `features: (51,)`;
+      tile/item/entity/light grid plus inventory, equipment, player-state and status.
     - **Pixels:** `(130, 110, 3)`; 9×11 local tiles plus inventory/status HUD.
     - **Actions:** `Discrete(43)`; Classic controls plus rest, stairs, diamond
       tools, armour, arrows, spells, torches, potions, books, enchanting, attributes.
@@ -190,8 +190,8 @@ Upstream inventory checked 2026-10-14; variants grouped. rl2 support varies.
     - **Episode:** death or defeating the necromancer; default timeout 100,000 steps.
   - Craftax Classic (Crafter-style): `Craftax-Classic-Symbolic-v1`
     and `Craftax-Classic-Pixels-v1`.
-    - **Symbolic:** `(1345,)`; flattened 7×9 tile/entity features plus 22
-      inventory, vitals, facing, light, and sleep values.
+    - **Symbolic:** rl2 pytree `grid: (7, 9, 21)`, `features: (22,)`;
+      tile/entity grid plus inventory, vitals, facing, light and sleep.
     - **Pixels:** `(63, 63, 3)`; 7×9 local tiles plus inventory/status HUD.
     - **Actions:** `Discrete(17)` — 0: no-op; 1–4: left/right/up/down;
       5: interact (mine/attack/eat/drink); 6: sleep; 7–10: place stone/table/furnace/plant;
@@ -199,11 +199,13 @@ Upstream inventory checked 2026-10-14; variants grouped. rl2 support varies.
       Full Craftax shares IDs 0–16.
     - **Achievements:** 22; +1 per first unlock (collecting, crafting, combat, survival).
     - **Episode:** death/lava; default timeout 10,000 steps.
-  - **rl2:** [PPO preset](configs/ppo/craftax/craftax.yaml), symbolic MLP + LSTM;
-    `uv run ppo --config configs/ppo/craftax/craftax.yaml`. Set `env.env_id` to either
-    symbolic variant; pixels require `model.encoder.type: rgb`. Videos remain RGB.
-    Details above use Craftax 1.6.1.
-  - **Arrays:** float32 symbolic `(B, F)` with native feature scaling, or RGB
+  - **rl2:** [Symbolic preset](configs/ppo/craftax/symbolic.yaml): grid CNN + feature
+    MLP → combined embedding → LSTM (`encoder.type: craftax`).
+    [Pixels preset](configs/ppo/craftax/pixels.yaml): RGB CNN + LSTM.
+    Run `uv run ppo --config configs/ppo/craftax/symbolic.yaml` (or `pixels.yaml`);
+    change `env.env_id` to the matching Classic variant. Videos remain RGB.
+    Craftax 1.6.1 vectors `(8268,)`/`(1345,)` are split losslessly; native scaling is preserved.
+  - **Arrays:** float32 symbolic leaves `(B,H,W,C)` and `(B,F)`, or RGB
     `(B, H, W, 3)` in `[0, 1]`; both player-centered. Int32 actions `(B,)`,
     no action mask; unmet prerequisites prevent the effect while the world advances.
   - **Reward:** `r = sum(new achievement weights) + 0.1 * (health_after - health_before)`;
