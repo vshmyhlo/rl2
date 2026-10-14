@@ -7,17 +7,17 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import tokamax
 from flax import linen as nn
 from flax.linen.module import InterceptorContext
 from gemma import gm
-
-from rl2.attention import AttentionType
 
 type Parameters = dict[str, Any]
 
@@ -27,14 +27,17 @@ type Parameters = dict[str, Any]
 # S: attended key slots (prompt width or cache length).
 type Cache = dict[str, dict[str, jax.Array]]
 type ComputeDtype = Literal["float32", "bfloat16"]
+type AttentionBackend = Literal["xla", "cudnn", "tokamax"]
 
 
-def _cudnn_attention(
+def _attention(
     module: gm.nn.Attention,
     x: jax.Array,  # (B, T, D)
     segment_pos: jax.Array,  # (B, T)
     cache: dict[str, jax.Array] | None,
     attn_mask: jax.Array,  # (B, T, S)
+    *,
+    backend: Literal["cudnn", "tokamax"],
 ) -> tuple[dict[str, jax.Array] | None, jax.Array]:
     """Reuse Gemma projections and RoPE; return cache and (B, T, D) output."""
     if module.use_qkv_einsum:
@@ -84,29 +87,39 @@ def _cudnn_attention(
     empty_output = jnp.repeat(value.mean(axis=1), module.num_heads // module.num_kv_heads, axis=1)  # (B, N, H)
     mask = (attn_mask | ~visible[..., None])[:, None]  # (B, 1, T, S)
     # Masked cuDNN backward requires even query and key lengths.
-    if query.shape[1] % 2:
+    if backend == "cudnn" and query.shape[1] % 2:
         query = jnp.pad(query, ((0, 0), (0, 1), (0, 0), (0, 0)))  # (B, T+1, N, H)
         mask = jnp.concatenate((mask, mask[:, :, -1:]), axis=2)  # (B, 1, T+1, S)
-    if key.shape[1] % 2:
+    if backend == "cudnn" and key.shape[1] % 2:
 
         def pad(projected: jax.Array) -> jax.Array:  # (B, S, K, H)
             return jnp.pad(projected, ((0, 0), (0, 1), (0, 0), (0, 0)))  # (B, S+1, K, H)
 
         key, value = jax.tree.map(pad, (key, value))  # each: (B, S+1, K, H)
         mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 0), (0, 1)))  # (B, 1, padded T, S+1)
-    encoded = jax.nn.dot_product_attention(query, key, value, mask=mask, scale=1.0, implementation="cudnn")[
-        :, : x.shape[1]
-    ]  # (B, T, N, H)
+    if backend == "tokamax":
+        encoded = tokamax.dot_product_attention(
+            query, key, value, mask=mask, scale=1.0, logits_soft_cap=module.attn_logits_soft_cap
+        )  # (B, T, N, H)
+    else:
+        encoded = jax.nn.dot_product_attention(query, key, value, mask=mask, scale=1.0, implementation="cudnn")[
+            :, : x.shape[1]
+        ]  # (B, T, N, H)
     encoded = jnp.where(visible[..., None, None], encoded, empty_output[:, None])  # (B, T, N, H)
     output = module.attn_vec_einsum("BTNH,NHD->BTD", encoded)  # (B, T, D)
     return cache, output  # output: (B, T, D)
 
 
 def _intercept_attention(
-    next_fun: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any], context: InterceptorContext
+    next_fun: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    context: InterceptorContext,
+    *,
+    backend: Literal["cudnn", "tokamax"],
 ) -> Any:
     if isinstance(context.module, gm.nn.Attention) and context.method_name == "__call__":
-        return _cudnn_attention(context.module, *args, **kwargs)
+        return _attention(context.module, *args, **kwargs, backend=backend)
     return next_fun(*args, **kwargs)
 
 
@@ -121,7 +134,7 @@ class Gemma3LM:
     model: gm.nn.Transformer
     cache_length: int
     dtype: ComputeDtype = "float32"
-    attention_backend: AttentionType = "xla"
+    attention_backend: AttentionBackend = "xla"
 
     def __post_init__(self) -> None:
         if not 0 < self.cache_length <= 32768:
@@ -138,7 +151,7 @@ class Gemma3LM:
         if self.attention_backend == "xla":
             return self.model.apply(variables, **kwargs)
         # Scoped to this call (and JAX tracing), without patching Gemma globally.
-        with nn.intercept_methods(_intercept_attention):
+        with nn.intercept_methods(partial(_intercept_attention, backend=self.attention_backend)):
             return self.model.apply(variables, **kwargs)
 
     @property
@@ -243,7 +256,7 @@ class Gemma3LM:
 
 
 def load_gemma3_checkpoint(
-    source: str, *, cache_length: int, dtype: ComputeDtype, attention_backend: AttentionType = "xla"
+    source: str, *, cache_length: int, dtype: ComputeDtype, attention_backend: AttentionBackend = "xla"
 ) -> tuple[Gemma3LM, Parameters]:
     model = Gemma3LM(
         model=gm.nn.Gemma3_270M(dtype=jnp.float32),

@@ -292,10 +292,15 @@ def test_prompts_and_real_reasoning_gym_rewards() -> None:
     dataset = reasoning_gym.create_dataset("leg_counting", seed=1, size=2)
     entries = [dataset[i] for i in range(2)]
     tokenizer = Mock(wraps=FakeTokenizer())
-    tokens, lengths = grpo.encode_prompts(entries, tokenizer, 3)
+    prompts = [grpo.build_prompt(entry["question"]) for entry in entries]
+    tokens, lengths = grpo.encode_prompts(prompts, tokenizer, 3)  # (N, P), (N,)
     prompt = tokenizer.encode.call_args_list[0].args[0]
-    assert prompt.startswith("<start_of_turn>user\nPut only your final answer inside <answer>")
-    assert "End your turn immediately after </answer>." in prompt
+    assert prompt.startswith("<start_of_turn>user\nSolve the question accurately.")
+    assert "Show brief working when useful." in prompt
+    assert "Write the final answer exactly once as <answer>...</answer>" in prompt
+    assert "Put any working before <answer>." in prompt
+    assert "End your turn immediately after </answer>; write nothing afterward." in prompt
+    assert "<calculator>" not in prompt
     assert "How many legs are there in total if you have " in prompt
     assert "Your task is to count" not in prompt
     assert "Now, how many" not in prompt
@@ -304,7 +309,7 @@ def test_prompts_and_real_reasoning_gym_rewards() -> None:
     np.testing.assert_array_equal(tokens, [[1, 3, 0], [1, 3, 0]])
     np.testing.assert_array_equal(lengths, [2, 2])
     with pytest.raises(ValueError, match="Increase max_prompt_tokens"):
-        grpo.encode_prompts(entries, FakeTokenizer(), 1)
+        grpo.encode_prompts(prompts, FakeTokenizer(), 1)
     texts = [
         f"work\n<answer>wrong</answer><answer>{entries[0]['answer']}</answer>",
         str(entries[0]["answer"]),  # Correct raw answer still lacks required answer tags.
@@ -410,10 +415,14 @@ def test_zero_shot_reward_shaping_reaches_rollout_advantages(monkeypatch: pytest
 
 
 def test_prompt_examples_precede_question_without_leaking_target_answer() -> None:
-    examples = [grpo.PromptExample("\nHow many legs do two dogs have?\n", "2 * 4 = 8.\n<answer>8</answer>\n")]
+    examples = [
+        grpo.PromptExample(
+            question="\nHow many legs do two dogs have?\n", completion="2 * 4 = 8.\n<answer>8</answer>\n"
+        )
+    ]
     tokenizer = Mock(wraps=FakeTokenizer())
     entry = {"question": "How many legs do three spiders have?", "answer": "24"}
-    grpo.encode_prompts([entry], tokenizer, 3, examples)
+    grpo.encode_prompts([grpo.build_prompt(entry["question"], examples)], tokenizer, 3)
     prompt = tokenizer.encode.call_args.args[0]
     assert (
         "How many legs do two dogs have?<end_of_turn>\n<start_of_turn>model\n2 * 4 = 8.\n<answer>8</answer><end_of_turn>"
@@ -428,6 +437,88 @@ def test_prompt_examples_precede_question_without_leaking_target_answer() -> Non
     dataset = Mock()
     np.testing.assert_array_equal(grpo.score_completions(dataset, [entry], [""], 1).task, [0])
     dataset.score_answer.assert_not_called()
+
+
+def test_sample_prompts_without_examples() -> None:
+    entries = [{"question": "Question?", "answer": "hidden answer"}]
+    prompts = grpo.sample_prompts(entries, jax.random.key(1), grpo.Config())
+    assert len(prompts) == 1
+    assert prompts[0].count("<start_of_turn>user") == 1
+    assert "hidden answer" not in prompts[0]
+    assert prompts[0].endswith("Question?<end_of_turn>\n<start_of_turn>model\n")
+
+
+def test_sample_prompts_includes_zero_intermediate_and_maximum_counts() -> None:
+    config = grpo.Config(
+        prompt_examples=[
+            grpo.PromptExample(question="First example?", completion="<answer>4</answer>"),
+            grpo.PromptExample(question="Second example?", completion="<answer>8</answer>"),
+        ]
+    )
+    entries = [{"question": "Question?", "answer": "hidden answer"}] * 3
+    key = jax.random.key(0)  # () Samples all three possible counts.
+    prompts = grpo.sample_prompts(entries, key, config)
+    assert len(prompts) == 3
+    assert {prompt.count("<start_of_turn>user") - 1 for prompt in prompts} == {0, 1, 2}
+    for prompt in prompts:
+        count = prompt.count("<start_of_turn>user") - 1
+        assert ("First example?" in prompt) == (count >= 1)
+        assert ("Second example?" in prompt) == (count == 2)
+        assert "hidden answer" not in prompt
+    assert grpo.sample_prompts(entries, key, config) == prompts
+
+
+def test_rollout_samples_prompts_per_group_and_logs_actual_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = grpo.Config(
+        num_tasks=2,
+        group_size=2,
+        num_minibatches=1,
+        max_prompt_tokens=3,
+        max_new_tokens=1,
+        beta=0,
+        prompt_examples=[grpo.PromptExample(question="Example?", completion="<answer>4</answer>")],
+    )
+    entries = [{"question": "Question?", "answer": "4"}] * config.num_tasks
+    dataset = Mock()
+    dataset.__getitem__ = Mock(side_effect=entries * 2)
+    dataset.score_answer.return_value = 1.0
+    tokenizer = Mock(wraps=FakeTokenizer())
+
+    # Encode different prompt variants with different lengths and IDs.
+    def encode(text: str, **kwargs: Any) -> list[int]:
+        return [1, 4, 3] if "Example?" in text else [1, 3]
+
+    tokenizer.encode.side_effect = encode
+    key = jax.random.key(6)  # () First question is zero-shot, second is few-shot.
+    generation = Mock(
+        return_value=grpo.Generation(
+            tokens=jnp.full((4, 1), 3, jnp.int32),  # (B, C)
+            log_probs=jnp.zeros((4, 1), jnp.float32),  # (B, C)
+            mask=jnp.ones((4, 1), jnp.bool_),  # (B, C)
+            key=jax.random.key(2),  # ()
+        )
+    )
+    monkeypatch.setattr(grpo, "generate", generation)
+    batch, _, samples, next_key = grpo.collect_rollout(Mock(params={}), Mock(), {}, dataset, tokenizer, key, 0, config)
+    assert batch.prompts.shape == (4, 3) and batch.prompt_lengths.shape == (4,)
+    np.testing.assert_array_equal(batch.prompts, [[1, 3, 0], [1, 3, 0], [1, 4, 3], [1, 4, 3]])
+    np.testing.assert_array_equal(batch.prompt_lengths, [2, 2, 3, 3])
+    encoded = [call.args[0] for call in tokenizer.encode.call_args_list]
+    assert "Example?" not in encoded[0] and "Example?" in encoded[1]
+    assert "### Shared prompt\n\n    " + encoded[0].replace("\n", "\n    ") in samples
+    assert generation.call_args.args[2].shape == (2, 3)
+    np.testing.assert_array_equal(jax.random.key_data(next_key), jax.random.key_data(generation.return_value.key))
+    # Replaying a saved RNG reproduces both the prompts and the generation RNG.
+    generation_key = generation.call_args.args[4]  # ()
+    repeated, _, repeated_samples, _ = grpo.collect_rollout(
+        Mock(params={}), Mock(), {}, dataset, tokenizer, key, 0, config
+    )
+    np.testing.assert_array_equal(repeated.prompts, batch.prompts)
+    assert repeated_samples == samples
+    np.testing.assert_array_equal(
+        jax.random.key_data(generation_key), jax.random.key_data(generation.call_args.args[4])
+    )
+    assert not np.array_equal(jax.random.key_data(generation_key), jax.random.key_data(key))
 
 
 def test_prompt_preserves_other_tasks_internal_layout() -> None:
@@ -631,7 +722,6 @@ def test_yaml_config(tmp_path: Path) -> None:
     assert config.task == "basic_arithmetic"
     assert config.duration_penalty_coef == 0.0
     assert config.allow_untagged_numeric and config.format_reward_weight == 0.1
-    assert config.group_size == 4
     assert config.task_config["min_terms"] == 2
     assert config.task_config["max_terms"] == 2
     dataset = reasoning_gym.create_dataset(config.task, seed=config.seed, size=5, **config.task_config)
@@ -645,7 +735,8 @@ def test_yaml_config(tmp_path: Path) -> None:
         assert entry["question"] == f"Calculate {' '.join(parts)}."
         assert entry["answer"] == str(operands[0] * operands[1])
         assert dataset.score_answer(entry["answer"], entry) == 1.0
-    assert config.prompt_examples == []
+    assert len(config.prompt_examples) == 6
+    assert config.max_prompt_tokens >= 512
     assert config.run_id is not None
     assert config.ckpt_dir == f"/runs/grpo_reasoning/{config.run_id}"
     assert config.checkpoint_interval_seconds == 600

@@ -16,18 +16,35 @@ from rl2.gemma3 import Gemma3Carry, Gemma3LM, Parameters
 def test_calculator_config_and_chat_format() -> None:
     config = grpo.load_config("configs/grpo_reasoning/gemma3.yaml", grpo.Config)
     assert config.calculator_max_calls == 2 and grpo.Config().calculator_max_calls == 0
-    assert config.prompt_examples == []
     for overrides in ({"calculator_max_calls": -1}, {"max_prompt_tokens": 32768}):
         with pytest.raises(ValueError):
             grpo.Config(**overrides)
-    prompt = grpo.build_prompt("12 * 13?", config.prompt_examples, config.calculator_max_calls)
+    prompt = grpo.build_prompt("12 * 13?", calculator_max_calls=config.calculator_max_calls)
     first_user = prompt.split("<end_of_turn>")[0].removeprefix("<start_of_turn>user\n")
+    assert "Calculator (optional; at most 2 calls per question):" in first_user
+    assert "<calculator>expression</calculator> using only numbers, parentheses, and + - * / // % **." in first_user
     assert "do not write the result yourself" in first_user
-    assert "without ending your turn" in first_user
+    assert "Pause immediately after </calculator> without ending your turn." in first_user
+    assert "Wait for <result>...</result>" in first_user
+    assert "Use the returned result to continue solving" in first_user
     assert first_user.endswith("12 * 13?")
     assert "156" not in prompt
     expected = dialog.Conversation(dialog.User(first_user)).as_text(format="gemma3")
     assert prompt == expected
+    turns: list[dialog.User | dialog.Model] = []
+    for index, example in enumerate(config.prompt_examples):
+        expression = example.question.removeprefix("Calculate ").removesuffix(".")
+        answer = grpo.calculate(expression)
+        assert grpo.extract_answer(example.completion) == answer
+        if "<calculator>" in example.completion:
+            assert f"<calculator>{expression}</calculator>\n<result>{answer}</result>" in example.completion
+        content = first_user.removesuffix("12 * 13?") + example.question if index == 0 else example.question
+        turns.extend((dialog.User(content), dialog.Model(example.completion.rstrip("\n"))))
+    turns.append(dialog.User("12 * 13?"))
+    few_shot = grpo.build_prompt("12 * 13?", config.prompt_examples, config.calculator_max_calls)
+    assert few_shot == dialog.Conversation(*turns).as_text(format="gemma3")
+    assert few_shot.count("Solve the question accurately.") == 1
+    assert few_shot.count("Calculator (optional;") == 1
 
 
 class ToolTokenizer:

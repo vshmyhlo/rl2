@@ -5,7 +5,7 @@ from dataclasses import replace
 from functools import partial
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import MagicMock, Mock
 
 import jax
@@ -13,16 +13,18 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import sentencepiece as spm
+import tokamax
 from gemma import gm
 from gemma_helpers import tiny_gemma_model
 
 from rl2 import train_grpo_reasoning as grpo
 from rl2.gdn2.model import GatedDeltaNet2Config, GatedDeltaNet2LM
 from rl2.gemma3 import (
+    AttentionBackend,
     Gemma3LM,
     Gemma3Tokenizer,
     Parameters,
-    _cudnn_attention,
+    _attention,
     load_gemma3_checkpoint,
     save_gemma3_checkpoint,
 )
@@ -195,8 +197,8 @@ def test_checkpoint_validation(cudnn_gemma: tuple[Gemma3LM, Parameters], monkeyp
     path = "mock-checkpoint"
     mocked = Mock(return_value=params)
     monkeypatch.setattr(gm.ckpts, "load_params", mocked)
-    loaded, variables = load_gemma3_checkpoint(path, cache_length=6, dtype="bfloat16", attention_backend="cudnn")
-    assert loaded.attention_backend == "cudnn"
+    loaded, variables = load_gemma3_checkpoint(path, cache_length=6, dtype="bfloat16", attention_backend="tokamax")
+    assert loaded.attention_backend == "tokamax"
     for actual, expected in zip(jax.tree.leaves(variables["params"]), jax.tree.leaves(params), strict=True):
         np.testing.assert_array_equal(actual, expected)
     mocked.return_value = {}
@@ -244,6 +246,7 @@ def test_gemma_config_boundaries(tmp_path: Path) -> None:
     config = grpo.load_config("configs/grpo_reasoning/gemma3.yaml", grpo.Config)
     assert config.calculator_max_calls == 2
     assert config.checkpoint == str(gm.ckpts.CheckpointPath.GEMMA3_270M_IT)
+    assert grpo.Config(attention_backend="tokamax").dtype == "float32"
     path = tmp_path / "config.yaml"
     path.write_text("model_type: unknown")
     with pytest.raises(ValueError, match="model_type"):
@@ -270,12 +273,12 @@ def test_training_selects_gemma_loader(
                 max_prompt_tokens=3,
                 max_new_tokens=3,
                 dtype="bfloat16",
-                attention_backend="cudnn",
+                attention_backend="tokamax",
             )
         )
     grpo.Gemma3Tokenizer.assert_called_once_with(None)
     load.assert_called_once_with(
-        "gs://gemma-data/checkpoints/gemma3-270m-pt", cache_length=6, dtype="bfloat16", attention_backend="cudnn"
+        "gs://gemma-data/checkpoints/gemma3-270m-pt", cache_length=6, dtype="bfloat16", attention_backend="tokamax"
     )
 
 
@@ -287,9 +290,19 @@ def cudnn_gemma(tiny_gemma: tuple[Gemma3LM, Parameters]) -> tuple[Gemma3LM, Para
     return Gemma3LM(model=upstream, cache_length=5, dtype="bfloat16"), params
 
 
-@pytest.mark.parametrize("real_cudnn", [pytest.param(False, id="cpu-routing"), pytest.param(True, id="gpu")])
-def test_cudnn_attention_matches_gemma(
-    cudnn_gemma: tuple[Gemma3LM, Parameters], monkeypatch: pytest.MonkeyPatch, real_cudnn: bool
+@pytest.mark.parametrize(
+    ("backend", "real_cudnn"),
+    [
+        pytest.param("cudnn", False, id="cudnn-cpu-routing"),
+        pytest.param("cudnn", True, id="cudnn-gpu"),
+        pytest.param("tokamax", False, id="tokamax"),
+    ],
+)
+def test_attention_matches_gemma(
+    cudnn_gemma: tuple[Gemma3LM, Parameters],
+    monkeypatch: pytest.MonkeyPatch,
+    backend: AttentionBackend,
+    real_cudnn: bool,
 ) -> None:
     if real_cudnn and not any(device.platform == "gpu" for device in jax.devices()):
         pytest.skip("Requires an NVIDIA GPU with cuDNN")
@@ -302,8 +315,10 @@ def test_cudnn_attention_matches_gemma(
         upstream = model.model.clone(config=replace(model.model.config, head_dim=256))
         params = upstream.init(jax.random.key(12), tokens=jnp.array([[2, 3]], jnp.int32))["params"]
         model = replace(model, model=upstream)
-    fused = replace(model, attention_backend="cudnn")
+    fused = replace(model, attention_backend=backend)
     original_attention = jax.nn.dot_product_attention
+    tokamax_attention = Mock(wraps=tokamax.dot_product_attention)
+    monkeypatch.setattr(tokamax, "dot_product_attention", tokamax_attention)
     calls = []
 
     def to_float32(value: jax.Array) -> jax.Array:  # (...)
@@ -325,7 +340,7 @@ def test_cudnn_attention_matches_gemma(
         query, key, value = jax.tree.map(to_float32, (query, key, value))  # (B, T, N, H), each KV: (B, S, K, H)
         return original_attention(query, key, value, **kwargs).astype(jnp.bfloat16)  # (B, T, N, H)
 
-    if not real_cudnn:
+    if backend == "cudnn" and not real_cudnn:
         monkeypatch.setattr(jax.nn, "dot_product_attention", attention)
     tokens = jnp.array([[2, 3, 0], [2, 4, 3]], jnp.int32)  # (B=2, T=3)
     lengths = jnp.array([2, 3], jnp.int32)  # (B,)
@@ -364,8 +379,10 @@ def test_cudnn_attention_matches_gemma(
     _, expected = model.apply({"params": params}, short_tokens, short_lengths)  # (B, 1, V)
     assert actual.shape == (2, 1, model.vocab_size)
     np.testing.assert_allclose(actual, expected, atol=0.04, rtol=0.04)
-    if not real_cudnn:
+    if backend == "cudnn" and not real_cudnn:
         assert calls
+    if backend == "tokamax":
+        assert tokamax_attention.called
 
 
 def test_cudnn_validation(cudnn_gemma: tuple[Gemma3LM, Parameters]) -> None:
@@ -386,8 +403,18 @@ def test_cudnn_validation(cudnn_gemma: tuple[Gemma3LM, Parameters]) -> None:
         grpo.Config(attention_backend="cudnn")
 
 
-@pytest.mark.parametrize("kv_heads", [pytest.param(2, id="grouped-query"), pytest.param(4, id="multi-head")])
-def test_cudnn_projection_layouts_and_empty_rows(kv_heads: int, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("backend", "kv_heads", "soft_cap"),
+    [
+        pytest.param("cudnn", 2, None, id="cudnn-grouped-query"),
+        pytest.param("cudnn", 4, None, id="cudnn-multi-head"),
+        pytest.param("tokamax", 2, None, id="tokamax-grouped-query"),
+        pytest.param("tokamax", 4, 1.0, id="tokamax-multi-head-soft-cap"),
+    ],
+)
+def test_projection_layouts_and_empty_rows(
+    backend: Literal["cudnn", "tokamax"], kv_heads: int, soft_cap: float | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     module = gm.nn.Attention(
         num_heads=4,
         num_kv_heads=kv_heads,
@@ -397,6 +424,7 @@ def test_cudnn_projection_layouts_and_empty_rows(kv_heads: int, monkeypatch: pyt
         query_pre_attn_scalar=8**-0.5,
         sliding_window_size=2,
         use_qk_norm=True,
+        attn_logits_soft_cap=soft_cap,
     )
     x = jax.random.normal(jax.random.key(4), (1, 4, 4))  # (B=1, T=4, D=4)
     positions = jnp.array([[0, 1, 4, 5]], jnp.int32)  # (B, T), including a logical position gap
@@ -414,11 +442,12 @@ def test_cudnn_projection_layouts_and_empty_rows(kv_heads: int, monkeypatch: pyt
         kwargs["implementation"] = "xla"
         return original_attention(query, key, value, **kwargs)  # (B, T, N, H)
 
-    monkeypatch.setattr(jax.nn, "dot_product_attention", attention)
+    if backend == "cudnn":
+        monkeypatch.setattr(jax.nn, "dot_product_attention", attention)
 
     def loss(inputs: jax.Array, *, fused: bool) -> tuple[jax.Array, jax.Array]:  # inputs: (B, T, D)
         _, output = module.apply(
-            variables, inputs, positions, None, mask, method=_cudnn_attention if fused else None
+            variables, inputs, positions, None, mask, method=partial(_attention, backend=backend) if fused else None
         )  # output: (B, T, D)
         return jnp.square(output).sum(), output  # (), (B, T, D)
 

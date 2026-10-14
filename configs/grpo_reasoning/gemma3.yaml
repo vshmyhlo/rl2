@@ -2,7 +2,7 @@
 checkpoint: gs://gemma-data/checkpoints/gemma3-270m-it # Instruction-tuned; or a local native Gemma/Orbax checkpoint
 tokenizer: null # Official Gemma 3 tokenizer; or a local/gs:// SentencePiece .model file
 dtype: bfloat16
-attention_backend: cudnn # Requires bfloat16 and Hopper (H100) or newer for Gemma's 256-wide heads.
+attention_backend: tokamax # Requires bfloat16 and cuDNN support for 256-wide heads (e.g. H100).
 
 task: basic_arithmetic
 task_config:
@@ -14,14 +14,43 @@ task_config:
   allow_parentheses: false
   allow_negation: false
   format_style: simple
-seed: 1
-total_updates: 1000
+prompt_examples: # Uniformly sample 0..len(prompt_examples) examples, in listed order, per question.
+  - question: Calculate 23 * 14.
+    completion: |
+      23 * 14 = 23 * 10 + 23 * 4.
+      230 + 92 = 322.
+      <answer>322</answer>
+  - question: Calculate 47 * 36.
+    completion: |
+      <calculator>47 * 36</calculator>
+      <result>1692</result>
+      <answer>1692</answer>
+  - question: Calculate 99 * 18.
+    completion: |
+      99 * 18 = (100 - 1) * 18.
+      1800 - 18 = 1782.
+      <answer>1782</answer>
+  - question: Calculate 68 * 57.
+    completion: |
+      <calculator>68 * 57</calculator>
+      <result>3876</result>
+      <answer>3876</answer>
+  - question: Calculate 40 * 25.
+    completion: |
+      <answer>1000</answer>
+  - question: Calculate 86 * 94.
+    completion: |
+      <calculator>86 * 94</calculator>
+      <result>8084</result>
+      <answer>8084</answer>
+seed: 3
+total_updates: 10000
 # Gemma's 262144-token vocabulary makes logits memory intensive; start small.
-num_tasks: 1
-group_size: 4
+num_tasks: 4
+group_size: 8
 num_minibatches: 4
 update_epochs: 1
-max_prompt_tokens: 128
+max_prompt_tokens: 768 # Allow all six examples plus instructions and the current question.
 # Total transcript budget: model tokens plus inserted calculator results.
 max_new_tokens: 128
 calculator_max_calls: 2 # Set to 0 to disable calculator access.
@@ -29,10 +58,12 @@ temperature: 1.0
 learning_rate: 1.0e-6
 clip_coef: 0.2
 beta: 0.0
+allow_untagged_numeric: true
+format_reward_weight: 0.1 # Reward = 0.9 * correctness + 0.1 * valid answer format.
 duration_penalty_coef: 0.0 # Learn correctness/tool use before rewarding shorter answers.
 max_grad_norm: 1.0
-ckpt_dir: runs/grpo_reasoning/${run_id}
-run_id: gemma3_270m_calculator_multiplication_zero_shot
+ckpt_dir: /runs/grpo_reasoning/${run_id}
+run_id: grpo_reasoning_gemma3_270m_${task}_calculator_multiplication_mixed_shot_seed${seed}
 log_interval: 10
 log_completion_count: 4
 checkpoint_interval_seconds: 600

@@ -32,6 +32,7 @@ from reasoning_gym.utils import extract_answer
 from rl2.calculator import calculate
 from rl2.configuration import BaseConfig, load_config
 from rl2.gemma3 import (
+    AttentionBackend,
     Gemma3Carry,
     Gemma3LM,
     Gemma3Tokenizer,
@@ -71,7 +72,7 @@ class Config(BaseConfig):
     checkpoint: str = "gs://gemma-data/checkpoints/gemma3-270m-it"
     tokenizer: str | None = None
     dtype: Literal["float32", "bfloat16"] = "float32"
-    attention_backend: Literal["xla", "cudnn"] = "xla"
+    attention_backend: AttentionBackend = "xla"
     task: str = "leg_counting"
     task_config: dict[str, Any] = field(default_factory=dict)
     prompt_examples: list[PromptExample] = field(default_factory=list)
@@ -143,13 +144,18 @@ def build_prompt(question: str, examples: Sequence[PromptExample] = (), calculat
             return "How many legs are there in total if you have " + text[len(prefix) :]
         return text
 
-    instruction = "Put only your final answer inside <answer>...</answer>. End your turn immediately after </answer>.\n"
+    instruction = (
+        "Solve the question accurately. Show brief working when useful.\n"
+        "Write the final answer exactly once as <answer>...</answer>, with only the answer inside the tags.\n"
+        "Put any working before <answer>. End your turn immediately after </answer>; write nothing afterward.\n"
+    )
     if calculator_max_calls:
         instruction += (
-            f"You may use the calculator up to {calculator_max_calls} times per question. "
-            "Write <calculator>expression</calculator>. Pause there without ending your turn.\n"
-            "The trainer inserts <result>...</result>; do not write the result yourself. Then continue to your answer.\n"
-            "Expressions support numbers, parentheses, and + - * / // % **.\n"
+            f"Calculator (optional; at most {calculator_max_calls} calls per question):\n"
+            "1. Write <calculator>expression</calculator> using only numbers, parentheses, and + - * / // % **.\n"
+            "2. Pause immediately after </calculator> without ending your turn. "
+            "Wait for <result>...</result>; do not write the result yourself.\n"
+            "3. Use the returned result to continue solving, then give your final answer in <answer>...</answer>.\n"
         )
     turns: list[str] = []
     for example in examples:
@@ -177,17 +183,21 @@ def format_group_samples(prompt: str, completions: Sequence[str], rewards: Seque
     return "\n\n---\n\n".join(sections)
 
 
+def sample_prompts(entries: list[Entry], key: jax.Array, config: Config) -> list[str]:  # key: ()
+    """Uniformly sample a prefix length from zero through all examples per question."""
+    counts = jax.random.randint(key, (len(entries),), 0, len(config.prompt_examples) + 1)  # (N,)
+    return [
+        build_prompt(entry["question"], config.prompt_examples[:count], config.calculator_max_calls)
+        for entry, count in zip(entries, jax.device_get(counts), strict=True)
+    ]
+
+
 def encode_prompts(
-    entries: list[Entry],
-    tokenizer: Tokenizer,
-    max_tokens: int,
-    examples: Sequence[PromptExample] = (),
-    calculator_max_calls: int = 0,
+    texts: Sequence[str], tokenizer: Tokenizer, max_tokens: int
 ) -> tuple[jax.Array, jax.Array]:  # (N, P), (N,)
-    prompts = np.zeros((len(entries), max_tokens), np.int32)  # (N, P)
-    lengths = np.empty(len(entries), np.int32)  # (N,)
-    for i, entry in enumerate(entries):
-        text = build_prompt(entry["question"], examples, calculator_max_calls)
+    prompts = np.zeros((len(texts), max_tokens), np.int32)  # (N, P)
+    lengths = np.empty(len(texts), np.int32)  # (N,)
+    for i, text in enumerate(texts):
         ids = tokenizer.encode(text, out_type=int, add_bos=tokenizer.bos_id() >= 0, add_eos=False)
         if not ids or len(ids) > max_tokens:
             raise ValueError(f"Prompt has {len(ids)} tokens; expected 1..{max_tokens}. Increase max_prompt_tokens.")
@@ -195,7 +205,7 @@ def encode_prompts(
             raise ValueError("Prompt token ID outside tokenizer vocabulary")
         prompts[i, : len(ids)] = ids
         lengths[i] = len(ids)
-    return jnp.asarray(prompts), jnp.asarray(lengths)
+    return jnp.asarray(prompts), jnp.asarray(lengths)  # (N, P), (N,)
 
 
 class DecodeCarry(NamedTuple):
@@ -547,9 +557,9 @@ def collect_rollout(
     config: Config,
 ) -> tuple[GRPOBatch, dict[str, float], str, jax.Array]:
     entries = [dataset[iteration * config.num_tasks + i] for i in range(config.num_tasks)]
-    prompts, lengths = encode_prompts(
-        entries, tokenizer, config.max_prompt_tokens, config.prompt_examples, config.calculator_max_calls
-    )  # (N, P), (N,)
+    key, prompt_key = jax.random.split(key)  # each ()
+    prompt_texts = sample_prompts(entries, prompt_key, config)
+    prompts, lengths = encode_prompts(prompt_texts, tokenizer, config.max_prompt_tokens)  # (N, P), (N,)
     generation_start = monotonic()
     if config.calculator_max_calls:
         tokens, log_probs, mask, key = generate_with_calculator(
@@ -642,7 +652,7 @@ def collect_rollout(
     # Stable sorting preserves sampling order for ties; only the displayed group changes.
     indices = np.argsort(-group_rewards, kind="stable")[:count]
     samples = format_group_samples(
-        build_prompt(entries[0]["question"], config.prompt_examples, config.calculator_max_calls),
+        prompt_texts[0],
         [texts[index] for index in indices],
         group_rewards[indices].tolist(),
     )
