@@ -60,8 +60,24 @@ Upstream inventory checked 2026-10-14; variants grouped. rl2 support varies.
   - Switch Riddle: communication puzzle.
   - JaxNav: multi-robot navigation/collision avoidance.
   - Multi-Agent Brax: Ant, HalfCheetah, Hopper, Humanoid, Walker2d; optional Brax dependency.
-  - JaxRobotarium: Navigation, Discovery, Material Transport, Warehouse,
-    Arctic Transport, Foraging, RWARE, Predator Prey; optional package.
+  - [JaxRobotarium](https://github.com/GT-STAR-Lab/JaxRobotarium): Navigation,
+    Discovery, Material Transport, Warehouse, Arctic Transport, Foraging, RWARE, Predator Prey.
+    - [Material Transport](configs/mappo/jaxmarl/jaxrobotarium/material_transport.yaml):
+      four heterogeneous robots move 50 units/source from the center circle and right strip
+      to the left depot; automatic pickup/dropoff. rl2 uses shared MLP/LSTM IPPO.
+    - Observation: float32 `(N, 5N+2)` → `(4, 22)` in the preset: all `(x,y,heading)`
+      poses, two remaining source loads, all `(step_size, capacity)` pairs; self first.
+      Carrying flags are hidden, so memory helps track each robot's load.
+    - Actions: `Discrete(5)` — stay/up/down/right/left (IDs 0–4), all valid.
+      Waypoints use each robot's step size; a unicycle controller executes 30 × 0.033 s
+      substeps/action with collision-avoidance barriers. Two robots use `(0.45 m, 5 units)`,
+      two `(0.15 m, 15 units)`; actual displacement depends on heading/controller limits.
+    - Shared reward: `0.25 × pickups + 0.75 × dropoffs − 0.1 × unfinished` per step,
+      counted per robot, before cargo updates; no collision penalty or completion bonus.
+      Pickup removes up to capacity from its source and sets a binary carrying flag.
+      Logged return sums mean agent rewards. Success does not terminate; truncate at 100 steps.
+    - Run: `uv run mappo --config configs/mappo/jaxmarl/jaxrobotarium/material_transport.yaml`.
+      JaxRobotarium and its simulator are pinned in `pyproject.toml`/`uv.lock`.
 
 - [Pgx](https://github.com/sotetsuk/pgx) — games ([registry](https://github.com/sotetsuk/pgx/blob/main/pgx/core.py)).
   - Board games: Backgammon, Chess, Gardner Chess, Shogi, Animal Shogi,
@@ -257,6 +273,21 @@ Upstream inventory checked 2026-10-14; variants grouped. rl2 support varies.
 
 - [continual-foragax](https://pypi.org/project/continual-foragax/#registry-and-included-environments) — changing-reward foraging.
   - `ForagaxBig-v5`: multi-biome, Fourier-modulated rewards.
-  - `ForagaxSquareWaveTwoBiome-v11`: two biomes, square-wave rewards.
-  - `ForagaxTwoBiomeLarge-v1`: 15×15 Morel/Oyster biomes, Deathcaps.
+  - `ForagaxSquareWaveTwoBiome-v11`: 24×15 toroidal world, two mushroom biomes and walls.
+    - [PPO preset](configs/ppo/foragax/square_wave_two_biome.yaml): local CNN/LSTM,
+      1,024-step reward cycle (native: 500,000), immediate rewards, 4,096-step episodes.
+    - Observation: float32 `(9, 9, 3)` symbolic color grid: Oyster, Chanterelle, wall;
+      empty cells are all zero. Same-colored mushrooms share a channel across biomes.
+      Agent is centered; position, reward phase and previous reward are not included.
+      Adapter also supports `object` `(9, 9, 6)` and `rgb` `(9, 9, 3)` in `[0,1]`;
+      `model.encoder.type: rgb` selects the CNN for all three layouts.
+    - Actions: `Discrete(4)` — down/right/up/left (IDs 0–3), one cell/step;
+      walls block movement, edges wrap, entering food collects it automatically.
+    - Reward: `−5 + a × sign(sin(2πt/period))` per mushroom, with amplitudes
+      `(9, 3, −3, −9)` for left Oyster/Chanterelle, right Oyster/Chanterelle.
+      Empty cells/walls give zero; no survival bonus or death. Collected food respawns.
+    - Native task continues indefinitely. rl2 truncates and bootstraps at `max_steps`,
+      then resets the world, recurrent memory and reward clock to phase zero.
+      Run: `uv run ppo --config configs/ppo/foragax/square_wave_two_biome.yaml`.
+  - `ForagaxTwoBiomeLarge-v1`: 15×15 Morel (+30)/Oyster (+1) biomes, Deathcaps (−1).
   - Custom worlds: objects, biomes, respawning, rewards; programmable weather-driven rewards.

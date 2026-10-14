@@ -18,7 +18,10 @@ from rl2.ppo import Config, KinetixEncoderConfig, RGBEncoderConfig, XMiniGridEnc
 def config_path(tmp_path: Path) -> Path:
     path = tmp_path / "ppo.yaml"
     source = Path(__file__).resolve().parents[1] / "configs/ppo.yaml"
-    path.write_text(source.read_text())
+    settings = yaml.safe_load(source.read_text())
+    # Validation cases remove fields referenced by the preset's run-name interpolation.
+    settings["run_id"] = "test-ppo"
+    path.write_text(yaml.safe_dump(settings))
     return path
 
 
@@ -245,6 +248,7 @@ def test_optional_environments_reject_invalid_settings(name: str, settings: dict
     [
         ("minatar/breakout", ppo.GymnaxConfig, "GymnaxEnv"),
         ("jaxtari/breakout", ppo.JAXtariConfig, "JAXtariEnv"),
+        ("foragax/square_wave_two_biome", ppo.ForagaxConfig, "ForagaxEnv"),
         ("brax/pusher", ppo.BraxConfig, "BraxEnv"),
         ("kinetix", KinetixConfig, "KinetixEnv"),
         ("xminigrid", XMiniGridConfig, "XMiniGridEnv"),

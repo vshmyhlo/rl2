@@ -151,6 +151,7 @@ from rl2.configuration import BaseConfig, load_config
 from rl2.envs.base import BaseEnv
 from rl2.envs.brax_env import BraxConfig, BraxEnv
 from rl2.envs.craftax_env import CraftaxConfig, CraftaxEnv
+from rl2.envs.foragax_env import ForagaxConfig, ForagaxEnv
 from rl2.envs.gymnax_env import GymnaxConfig, GymnaxEnv
 from rl2.envs.jaxtari_env import JAXtariConfig, JAXtariEnv
 from rl2.envs.kinetix_env import KinetixConfig, KinetixEnv
@@ -353,7 +354,14 @@ class ModelConfig:
 class Config(BaseConfig):
     model: ModelConfig
     env: Annotated[
-        GymnaxConfig | KinetixConfig | XMiniGridConfig | CraftaxConfig | PlaygroundConfig | JAXtariConfig | BraxConfig,
+        GymnaxConfig
+        | KinetixConfig
+        | XMiniGridConfig
+        | CraftaxConfig
+        | PlaygroundConfig
+        | JAXtariConfig
+        | BraxConfig
+        | ForagaxConfig,
         Field(discriminator="id"),
     ]
     seed: int
@@ -385,6 +393,8 @@ class Config(BaseConfig):
 
     @model_validator(mode="after")
     def validate_rollout(self) -> Self:
+        if isinstance(self.env, ForagaxConfig) and self.model.encoder.type != "rgb":
+            raise ValueError("Foragax requires model.encoder.type: rgb")
         if isinstance(self.env, JAXtariConfig) and self.model.encoder.type != "rgb":
             raise ValueError("JAXtari requires model.encoder.type: rgb")
         symbolic_craftax = isinstance(self.env, CraftaxConfig) and "Symbolic" in self.env.env_id
@@ -414,6 +424,8 @@ class Config(BaseConfig):
 
 
 def make_env(config: Config) -> PPOEnv:
+    if isinstance(config.env, ForagaxConfig):
+        return ForagaxEnv(config.env)
     if isinstance(config.env, BraxConfig):
         return BraxEnv(config.env)
     if isinstance(config.env, JAXtariConfig):

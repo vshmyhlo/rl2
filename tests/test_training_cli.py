@@ -15,10 +15,12 @@ from rl2 import ppo, train_mappo
         (ppo, "configs/ppo/xminigrid.yaml"),
         (ppo, "configs/ppo/minatar/breakout.yaml"),
         (ppo, "configs/ppo/jaxtari/breakout.yaml"),
+        (ppo, "configs/ppo/foragax/square_wave_two_biome.yaml"),
         (train_mappo, "configs/mappo/jaxnav.yaml"),
         (train_mappo, "configs/mappo/smax.yaml"),
         (train_mappo, "configs/mappo/jaxmarl/storm/basic.yaml"),
         (train_mappo, "configs/mappo/jaxmarl/storm/advanced.yaml"),
+        (train_mappo, "configs/mappo/jaxmarl/jaxrobotarium/material_transport.yaml"),
     ],
     ids=[
         "craftax-symbolic",
@@ -27,10 +29,12 @@ from rl2 import ppo, train_mappo
         "xminigrid",
         "breakout",
         "jaxtari",
+        "foragax",
         "jaxnav",
         "smax",
         "storm-basic",
         "storm-advanced",
+        "material-transport",
     ],
 )
 def test_cli_shared_run_directory(trainer: ModuleType, config_path: str, monkeypatch: pytest.MonkeyPatch) -> None:

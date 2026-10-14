@@ -50,6 +50,10 @@ dependencies = [
     "xminigrid==0.9.3",
     "verifiers>=0.1.8.post1",
     "datasets>=4",
+    "jaxrobotarium",
+    "robotarium-python-simulator",
+    "jaxopt>=0.8.5,<0.9",
+    "continual-foragax==0.57.1",
 ]
 
 [project.scripts]
@@ -100,6 +104,10 @@ requires-dist = [
     "numcodecs==0.13.1",
     "grain",
 ]
+
+[tool.uv.sources]
+jaxrobotarium = { url = "https://github.com/GT-STAR-Lab/JaxRobotarium/archive/6200711f6fb98015579af3e7a534bcfb8bcb69af.tar.gz" }
+robotarium-python-simulator = { url = "https://github.com/shalin-jain/robotarium_python_simulator/archive/117043719147e8ab04a6332ae4abe9ce8511a762.tar.gz" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
