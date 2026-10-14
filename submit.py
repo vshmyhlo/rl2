@@ -63,7 +63,7 @@ def job_manifest(args: argparse.Namespace, name: str, image: str) -> dict[str, A
                             "env": [
                                 {"name": "MLFLOW_TRACKING_URI", "value": "http://mlflow.mlflow.svc.cluster.local:5000"},
                                 {"name": "JAX_PLATFORMS", "value": "cuda,cpu"},
-                                {"name": "NVIDIA_DRIVER_CAPABILITIES", "value": "compute,utility"},
+                                {"name": "NVIDIA_DRIVER_CAPABILITIES", "value": "compute,utility,graphics"},
                             ],
                             "resources": {
                                 "requests": {

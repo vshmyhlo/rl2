@@ -311,7 +311,7 @@ def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> 
     else:
         manager.close.assert_called_once_with()
     if failure in ("logging", "writer_close"):
-        make_writer.assert_called_once_with(experiment="ppo", run_name=config.run_id, resume=True)
+        make_writer.assert_called_once_with(experiment="ppo", run_name=config.run_id)
         writer.__exit__.assert_called_once()
     else:
         writer.__exit__.assert_not_called()
@@ -418,7 +418,7 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         assert iterations == [0, 1, 2, 3]
         assert int(resumed.step) == 4
         np.testing.assert_allclose(learning_rates, [ppo.learning_rate_schedule(config)(i) for i in range(4)])
-        writer.assert_called_once_with(experiment="ppo", run_name=config.run_id, resume=True)
+        writer.assert_called_once_with(experiment="ppo", run_name=config.run_id)
         logged = metric_history(writer.return_value)
         assert logged["charts/total_episodes"] == [(3.0, 3), (4.0, 4)]
         assert logged["charts/total_observations"][-1] == (4.0, 4)

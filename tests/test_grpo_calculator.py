@@ -1,3 +1,5 @@
+from dataclasses import replace
+from typing import Literal
 from unittest.mock import Mock
 
 import dialog
@@ -14,12 +16,18 @@ from rl2.gemma3 import Gemma3Carry, Gemma3LM, Parameters
 def test_calculator_config_and_chat_format() -> None:
     config = grpo.load_config("configs/grpo_reasoning/gemma3.yaml")
     assert config.calculator_max_calls == 2 and grpo.Config().calculator_max_calls == 0
+    assert config.prompt_examples == []
     for overrides in ({"calculator_max_calls": -1}, {"max_prompt_tokens": 32768}):
         with pytest.raises(ValueError):
             grpo.Config(**overrides)
     prompt = grpo.build_prompt("12 * 13?", config.prompt_examples, config.calculator_max_calls)
-    content = prompt.removeprefix("<start_of_turn>user\n").removesuffix("<end_of_turn>\n<start_of_turn>model\n")
-    assert prompt == dialog.Conversation(dialog.User(content)).as_text(format="gemma3")
+    first_user = prompt.split("<end_of_turn>")[0].removeprefix("<start_of_turn>user\n")
+    assert "do not write the result yourself" in first_user
+    assert "without ending your turn" in first_user
+    assert first_user.endswith("12 * 13?")
+    assert "156" not in prompt
+    expected = dialog.Conversation(dialog.User(first_user)).as_text(format="gemma3")
+    assert prompt == expected
 
 
 class ToolTokenizer:
@@ -54,9 +62,13 @@ class ToolTokenizer:
         if add_bos:
             return [1, 4]
         assert not add_eos
-        if text not in self.pieces.values():
-            self.pieces[len(self.pieces)] = text
-        return [next(token for token, piece in self.pieces.items() if piece == text)]
+        parts = [text[:9], text[9:]] if "Error:" in text else [text]
+        ids = []
+        for part in parts:
+            if part not in self.pieces.values():
+                self.pieces[len(self.pieces)] = part
+            ids.append(next(token for token, piece in self.pieces.items() if piece == part))
+        return ids
 
     def decode(self, ids: list[int]) -> str:
         return "".join(self.pieces[token] for token in ids)
@@ -113,7 +125,7 @@ def test_calculator_rollout_and_masking(monkeypatch: pytest.MonkeyPatch) -> None
         group_size=2,
         num_minibatches=1,
         max_prompt_tokens=3,
-        max_new_tokens=14,
+        max_new_tokens=15,
         calculator_max_calls=2,
         beta=0,
         duration_penalty_coef=0.1,
@@ -127,13 +139,13 @@ def test_calculator_rollout_and_masking(monkeypatch: pytest.MonkeyPatch) -> None
     dataset.score_answer = score
     tokenizer = ToolTokenizer()
     batch, diagnostics, samples, key = grpo.collect_rollout(
-        Mock(params={}), Mock(cache_length=17), {}, dataset, tokenizer, jax.random.key(0), 0, config
+        Mock(params={}), Mock(cache_length=18), {}, dataset, tokenizer, jax.random.key(0), 0, config
     )
-    assert batch.completions.shape == batch.mask.shape == batch.old_log_probs.shape == (4, 14)
+    assert batch.completions.shape == batch.mask.shape == batch.old_log_probs.shape == (4, 15)
     assert batch.prompts.shape == (4, 3) and batch.prompt_lengths.shape == (4,)
     assert batch.advantages.shape == (4,) and jax.random.key_data(key).shape == (2,)
     assert batch.mask.sum(axis=1).tolist() == [5, 2, 8, 11]
-    assert grpo.transcript_mask(batch.mask).sum(axis=1).tolist() == [6, 2, 10, 14]
+    assert grpo.transcript_mask(batch.mask).sum(axis=1).tolist() == [6, 2, 11, 15]
     assert not batch.mask[0, 3] and batch.completions[0, 3] == 6
     assert jnp.all(batch.old_log_probs[~batch.mask] == 0)
     transcripts = [tokenizer.decode(row.tolist()) for row in batch.completions]
@@ -142,7 +154,7 @@ def test_calculator_rollout_and_masking(monkeypatch: pytest.MonkeyPatch) -> None
     assert "Error: calculator call limit reached" in transcripts[3]
     assert diagnostics["charts/task_reward_mean"] == 0.75
     assert diagnostics["charts/truncation_rate"] == 0
-    assert diagnostics["charts/duration_penalty_mean"] == pytest.approx(0.1 * (5 + 2 + 8 + 11) / 4 / 14)
+    assert diagnostics["charts/duration_penalty_mean"] == pytest.approx(0.1 * (5 + 2 + 8 + 11) / 4 / 15)
     assert "<result>156</result>" in samples and "You may use the calculator" in samples
 
 
@@ -186,8 +198,10 @@ def test_incomplete_call_is_not_executed(monkeypatch: pytest.MonkeyPatch) -> Non
     calculator.assert_not_called()
 
 
-def test_tool_tokens_condition_replay_but_have_no_loss() -> None:
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_tool_tokens_condition_replay_but_have_no_loss(dtype: Literal["float32", "bfloat16"]) -> None:
     model, params = tiny_gemma_model()
+    model = replace(model, dtype=dtype)
     prompts = jnp.array([[2, 3, 0], [2, 4, 3]], jnp.int32)  # (B=2, P=3)
     lengths = jnp.array([2, 3], jnp.int32)  # (B,)
     carry, logits = grpo.prefill_generation(model, params, prompts, lengths, 1)  # logits: (B, V)
@@ -223,7 +237,7 @@ def test_tool_tokens_condition_replay_but_have_no_loss() -> None:
         advantages=jnp.array([1, -1], jnp.float32),
     )
     replay = grpo.completion_log_probs(model, params, batch, 0.7)  # (B, C)
-    np.testing.assert_allclose(replay, old, atol=2e-6)
+    np.testing.assert_allclose(replay, old, atol=0.03 if dtype == "bfloat16" else 2e-6, rtol=0)
     assert jnp.all(replay[:, 1] == 0)
 
     def loss(log_probs: jax.Array) -> jax.Array:  # (B, C) -> ()

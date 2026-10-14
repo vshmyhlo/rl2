@@ -28,6 +28,7 @@ def test_default_gpu_job() -> None:
     assert container["workingDir"] == "/app"
     env = {entry["name"]: entry["value"] for entry in container["env"]}
     assert env["JAX_PLATFORMS"] == "cuda,cpu"
+    assert set(env["NVIDIA_DRIVER_CAPABILITIES"].split(",")) >= {"compute", "utility", "graphics"}
     assert container["resources"]["requests"] == {"cpu": "4", "memory": "16Gi", "nvidia.com/gpu": "1"}
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "1"
     run_mount = next(mount for mount in container["volumeMounts"] if mount["mountPath"] == "/runs")

@@ -277,7 +277,7 @@ class FakeTokenizer:
         return 8
 
     def encode(self, text: str, *, out_type: type[int], add_bos: bool, add_eos: bool) -> list[int]:
-        assert "<answer>" in text and "Question:" in text
+        assert "<answer>" in text and "<start_of_turn>user" in text
         assert add_bos and not add_eos
         return [1, 3]
 
@@ -292,13 +292,13 @@ def test_prompts_and_real_reasoning_gym_rewards() -> None:
     tokenizer = Mock(wraps=FakeTokenizer())
     tokens, lengths = grpo.encode_prompts(entries, tokenizer, 3)
     prompt = tokenizer.encode.call_args_list[0].args[0]
-    assert prompt.startswith("<start_of_turn>user\nAnswer only the last question.\nGive brief reasoning,")
-    assert "Finish immediately after </answer>." in prompt
-    assert "Question: How many legs are there in total if you have " in prompt
+    assert prompt.startswith("<start_of_turn>user\nPut only your final answer inside <answer>")
+    assert "End your turn immediately after </answer>." in prompt
+    assert "How many legs are there in total if you have " in prompt
     assert "Your task is to count" not in prompt
     assert "Now, how many" not in prompt
     assert "\n\n\n" not in prompt
-    assert prompt.endswith("?\n\nAnswer:<end_of_turn>\n<start_of_turn>model\n")
+    assert prompt.endswith("?<end_of_turn>\n<start_of_turn>model\n")
     np.testing.assert_array_equal(tokens, [[1, 3, 0], [1, 3, 0]])
     np.testing.assert_array_equal(lengths, [2, 2])
     with pytest.raises(ValueError, match="Increase max_prompt_tokens"):
@@ -321,9 +321,12 @@ def test_prompt_examples_precede_question_without_leaking_target_answer() -> Non
     entry = {"question": "How many legs do three spiders have?", "answer": "24"}
     grpo.encode_prompts([entry], tokenizer, 3, examples)
     prompt = tokenizer.encode.call_args.args[0]
-    assert "Question: How many legs do two dogs have?\n\nAnswer: 2 * 4 = 8.\n<answer>8</answer>" in prompt
+    assert (
+        "How many legs do two dogs have?<end_of_turn>\n<start_of_turn>model\n2 * 4 = 8.\n<answer>8</answer><end_of_turn>"
+        in prompt
+    )
     assert prompt.endswith(
-        "Question: How many legs do three spiders have?\n\nAnswer:<end_of_turn>\n<start_of_turn>model\n"
+        "<start_of_turn>user\nHow many legs do three spiders have?<end_of_turn>\n<start_of_turn>model\n"
     )
     assert "24" not in prompt
     assert "\n\n\n" not in prompt
@@ -336,7 +339,7 @@ def test_prompt_examples_precede_question_without_leaking_target_answer() -> Non
 def test_prompt_preserves_other_tasks_internal_layout() -> None:
     question = "  A B\nC   D\n\nExplain how to cross this grid."
     prompt = grpo.build_prompt(question + "\n\n")
-    assert prompt.endswith(f"Question: {question}\n\nAnswer:<end_of_turn>\n<start_of_turn>model\n")
+    assert prompt.endswith(f"{question}<end_of_turn>\n<start_of_turn>model\n")
 
 
 def test_format_group_samples_preserves_literal_multiline_text() -> None:
@@ -524,7 +527,7 @@ def test_config_validation(overrides: dict[str, Any], match: str) -> None:
 def test_yaml_config(tmp_path: Path) -> None:
     config = grpo.load_config("configs/grpo_reasoning/gemma3.yaml")
     assert config.task == "basic_arithmetic"
-    assert config.duration_penalty_coef == 0.1
+    assert config.duration_penalty_coef == 0.0
     assert config.group_size == 4 and config.total_updates == 1000
     assert config.task_config["min_terms"] == 2
     assert config.task_config["max_terms"] == 2
@@ -534,13 +537,12 @@ def test_yaml_config(tmp_path: Path) -> None:
         parts = entry["metadata"]["expression"].split()
         operands = [int(value) for value in parts[::2]]
         assert len(operands) == num_terms
-        assert parts[1::2] == ["+"] * (num_terms - 1)
-        assert all(0 <= value <= 10 for value in operands)
+        assert parts[1::2] == ["*"] * (num_terms - 1)
+        assert all(10 <= value <= 100 for value in operands)
         assert entry["question"] == f"Calculate {' '.join(parts)}."
-        assert entry["answer"] == str(sum(operands))
+        assert entry["answer"] == str(operands[0] * operands[1])
         assert dataset.score_answer(entry["answer"], entry) == 1.0
-    assert len(config.prompt_examples) == 2
-    assert all(grpo.extract_answer(example.completion) for example in config.prompt_examples)
+    assert config.prompt_examples == []
     assert config.run_id is not None
     assert config.checkpoint_interval_seconds == 600
     path = tmp_path / "config.yaml"
@@ -735,7 +737,7 @@ def test_training_loop_resume_and_logging_with_mocked_learning(
     monkeypatch.setattr(grpo, "update", update)
     with pytest.raises(RuntimeError, match="simulated interruption"):
         grpo.train(config)
-    logger.assert_called_once_with(experiment="grpo_reasoning", run_name="test", resume=True)
+    logger.assert_called_once_with(experiment="grpo_reasoning", run_name="test")
     assert writer.__exit__.call_args.args[0] is RuntimeError
     writer.log_params.assert_called_once_with(asdict(config))
     writer.log_text.assert_any_call(grpo.yaml.safe_dump(asdict(config)), "config/0.yaml")
@@ -801,8 +803,8 @@ def test_training_loop_resume_and_logging_with_mocked_learning(
         assert manager.latest_step() == 8
         metadata = manager.restore(8, args=grpo.ocp.args.Composite(metadata=grpo.ocp.args.JsonRestore())).metadata
     assert logger.call_args_list == [
-        call(experiment="grpo_reasoning", run_name="test", resume=True),
-        call(experiment="grpo_reasoning", run_name="test", resume=True),
+        call(experiment="grpo_reasoning", run_name="test"),
+        call(experiment="grpo_reasoning", run_name="test"),
     ]
     writer.__exit__.assert_called_with(None, None, None)
     resumed_config = writer.log_params.call_args.args[0]

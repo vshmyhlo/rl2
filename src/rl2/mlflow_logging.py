@@ -49,7 +49,7 @@ class _Tee(TextIOBase):
 
 
 class MLflowLogger:
-    def __init__(self, *, experiment: str, run_name: str | None, resume: bool) -> None:
+    def __init__(self, *, experiment: str, run_name: str | None) -> None:
         self.client = MlflowClient()
         experiment_id = os.environ.get("MLFLOW_EXPERIMENT_ID")
         # Resolve through the client without changing MLflow's global experiment or environment.
@@ -78,7 +78,7 @@ class MLflowLogger:
                 order_by=["attributes.start_time DESC"],
                 max_results=1,
             )
-            if resume and run_name is not None
+            if run_name is not None
             else []
         )
         if runs:

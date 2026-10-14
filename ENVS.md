@@ -91,6 +91,19 @@ Upstream inventory checked 2026-10-14; variants grouped. rl2 support varies.
   - Locomotion: Ant, HalfCheetah, Hopper, Humanoid, Swimmer, Walker2d.
   - Posture and balance: HumanoidStandup, InvertedPendulum, InvertedDoublePendulum.
   - Manipulation: Reacher, Pusher.
+    - [Pusher PPO preset](configs/ppo/brax/pusher.yaml): seven-joint arm pushes an
+      object to a fixed goal; randomized object position and initial joint velocities.
+      rl2 supports `pusher` with Brax's `generalized` backend, MLP + LSTM.
+    - Observation: float32 `(23,)` — joint angles (7), velocities (7), world XYZ
+      positions of arm tip, object and goal (3 each).
+    - Actions: float32 `(7,)` in `[-1, 1]`, scaled by Brax to motor controls
+      `u = 2a` in `[-2, 2]`; five physics steps/action (20 Hz).
+    - Reward: `-‖object − goal‖ − 0.5‖object − tip‖ − 0.1Σu²`;
+      distances use the **pre-step** state. No success bonus/termination;
+      truncate at 1,000 actions with final-state bootstrapping.
+      [Implementation](https://github.com/google/brax/blob/v0.14.2/brax/envs/pusher.py).
+    - Assets included. Run `uv run ppo --config configs/ppo/brax/pusher.yaml`;
+      video needs OpenGL (e.g. `MUJOCO_GL=egl` on headless servers).
   - Fast: minimal test environment.
 
 - [Gymnax](https://github.com/RobertTLange/gymnax#implemented-accelerated-environments-) — control, arcade, research tasks.

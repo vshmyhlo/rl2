@@ -7,23 +7,12 @@ task: basic_arithmetic
 task_config:
   min_terms: 2
   max_terms: 2
-  min_digits: 1
-  max_digits: 1
-  operators: ["+"]
+  min_digits: 2
+  max_digits: 2
+  operators: ["*"]
   allow_parentheses: false
   allow_negation: false
   format_style: simple
-prompt_examples:
-  - question: Calculate 2 + 3.
-    completion: |-
-      <calculator>2 + 3</calculator>
-      <result>5</result>
-      <answer>5</answer>
-  - question: Calculate 0 + 7.
-    completion: |-
-      <calculator>0 + 7</calculator>
-      <result>7</result>
-      <answer>7</answer>
 seed: 1
 total_updates: 1000
 # Gemma's 262144-token vocabulary makes logits memory intensive; start small.
@@ -31,7 +20,7 @@ num_tasks: 1
 group_size: 4
 num_minibatches: 4
 update_epochs: 1
-max_prompt_tokens: 256
+max_prompt_tokens: 128
 # Total transcript budget: model tokens plus inserted calculator results.
 max_new_tokens: 128
 calculator_max_calls: 2 # Set to 0 to disable calculator access.
@@ -39,10 +28,10 @@ temperature: 1.0
 learning_rate: 1.0e-6
 clip_coef: 0.2
 beta: 0.0
-duration_penalty_coef: 0.1
+duration_penalty_coef: 0.0 # Learn correctness/tool use before rewarding shorter answers.
 max_grad_norm: 1.0
 log_dir: runs
-run_id: gemma3_270m_calculator_arithmetic
+run_id: gemma3_270m_calculator_multiplication_zero_shot
 log_interval: 10
 log_completion_count: 4
 checkpoint_interval_seconds: 600

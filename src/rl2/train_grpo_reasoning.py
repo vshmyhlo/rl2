@@ -203,23 +203,26 @@ def build_prompt(question: str, examples: Sequence[PromptExample] = (), calculat
             return "How many legs are there in total if you have " + text[len(prefix) :]
         return text
 
-    instruction = (
-        "Answer only the last question.\n"
-        "Give brief reasoning, then put only your final answer inside <answer>...</answer>.\n"
-        "Finish immediately after </answer>.\n\n"
-    )
+    instruction = "Put only your final answer inside <answer>...</answer>. End your turn immediately after </answer>.\n"
     if calculator_max_calls:
         instruction += (
-            f"You may use the calculator up to {calculator_max_calls} times. "
-            "Write <calculator>expression</calculator> and wait for <result>...</result>, then continue.\n"
-            "Use numbers, parentheses, and + - * / // % **. Example: <calculator>12 * 13</calculator>.\n\n"
+            f"You may use the calculator up to {calculator_max_calls} times per question. "
+            "Write <calculator>expression</calculator>. Pause there without ending your turn.\n"
+            "The trainer inserts <result>...</result>; do not write the result yourself. Then continue to your answer.\n"
+            "Expressions support numbers, parentheses, and + - * / // % **.\n"
         )
-    demonstrations = "".join(
-        f"Question: {format_question(example.question)}\n\nAnswer: {example.completion.rstrip('\n')}\n\n"
-        for example in examples
-    )
-    content = instruction + demonstrations + f"Question: {format_question(question)}\n\nAnswer:"
-    return f"<start_of_turn>user\n{content}<end_of_turn>\n<start_of_turn>model\n"
+    turns: list[str] = []
+    for example in examples:
+        content = (
+            f"{instruction}\n{format_question(example.question)}" if instruction else format_question(example.question)
+        )
+        completion = example.completion.rstrip("\n")
+        turns.append(f"<start_of_turn>user\n{content}<end_of_turn>\n")
+        turns.append(f"<start_of_turn>model\n{completion}<end_of_turn>\n")
+        instruction = ""
+    content = f"{instruction}\n{format_question(question)}" if instruction else format_question(question)
+    turns.append(f"<start_of_turn>user\n{content}<end_of_turn>\n<start_of_turn>model\n")
+    return "".join(turns)
 
 
 def format_group_samples(prompt: str, completions: Sequence[str], rewards: Sequence[float]) -> str:
@@ -360,9 +363,17 @@ def decode_step(
     stop_token_ids: tuple[int, ...],
 ) -> DecodeStep:
     key, sample_key = jax.random.split(key)  # (), ()
-    sampled = gm.text.RandomSampling(temperature=temperature).get_next_tokens(logits, sample_key)  # (B,)
+
+    def sample(_: None) -> tuple[jax.Array, jax.Array]:  # (B,), (B,)
+        sampled = gm.text.RandomSampling(temperature=temperature).get_next_tokens(logits, sample_key)  # (B,)
+        log_probs = policy_log_probs(logits[:, None], sampled[:, None], temperature)[:, 0]  # (B,)
+        return sampled, log_probs  # (B,), (B,)
+
+    def skip(_: None) -> tuple[jax.Array, jax.Array]:  # (B,), (B,)
+        return jnp.zeros_like(forced), jnp.zeros_like(forced, dtype=jnp.float32)  # (B,), (B,)
+
+    sampled, log_probs = jax.lax.cond(jnp.any(active & (forced < 0)), sample, skip, None)  # (B,), (B,)
     tokens = jnp.where(active, jnp.where(forced >= 0, forced, sampled), 0)  # (B,)
-    log_probs = policy_log_probs(logits[:, None], tokens[:, None], temperature)[:, 0]  # (B,)
     log_probs = jnp.where(active & (forced < 0), log_probs, 0.0)  # (B,)
     active = active & ~jnp.isin(tokens, jnp.asarray(stop_token_ids))  # (B,)
     carry, logits = model.step(params, tokens, active, carry)  # logits: (B, V)
@@ -387,28 +398,27 @@ def generate_with_calculator(
         raise ValueError("Prompt + completion budget exceeds Gemma cache length")
     carry, logits = prefill_generation(model, params, prompts, lengths, group_size)  # logits: (B, V)
     batch_size = prompts.shape[0] * group_size
-    tokens = jnp.zeros((batch_size, max_new_tokens), jnp.int32)  # (B, C)
-    log_probs = jnp.zeros_like(tokens, dtype=jnp.float32)  # (B, C)
-    mask = jnp.zeros_like(tokens, dtype=jnp.bool_)  # (B, C)
+    outputs: list[DecodeOutput] = []  # Each leaf: (B,)
     active = [True] * batch_size
     pending: list[deque[int]] = [deque() for _ in active]
     segments: list[list[int]] = [[] for _ in active]
     calls = [0] * batch_size
+    stop_ids = tokenizer.stop_ids()
     for position in range(max_new_tokens):
-        forced = jnp.asarray([queue.popleft() if queue else -1 for queue in pending], jnp.int32)  # (B,)
-        sampled = jnp.asarray(active) & (forced < 0)  # (B,)
-        step = decode_step(
-            model, params, carry, logits, forced, jnp.asarray(active), key, temperature, tokenizer.stop_ids()
-        )
+        forced_ids = [queue.popleft() if queue else -1 for queue in pending]
+        is_sampled = [enabled and token < 0 for enabled, token in zip(active, forced_ids, strict=True)]
+        forced = jnp.asarray(forced_ids, jnp.int32)  # (B,)
+        sampled = jnp.asarray(is_sampled)  # (B,)
+        step = decode_step(model, params, carry, logits, forced, jnp.asarray(active), key, temperature, stop_ids)
         carry, logits, key = step.carry, step.logits, step.key  # logits: (B, V); key: ()
-        tokens = tokens.at[:, position].set(step.tokens)  # (B, C)
-        log_probs = log_probs.at[:, position].set(step.log_probs)  # (B, C)
-        mask = mask.at[:, position].set(sampled)  # (B, C)
-        host_tokens, host_sampled = jax.device_get((step.tokens, sampled))  # (B,), (B,)
-        for row, (token, is_sampled) in enumerate(zip(host_tokens, host_sampled, strict=True)):
-            if not is_sampled:
+        outputs.append(DecodeOutput(tokens=step.tokens, log_probs=step.log_probs, mask=sampled))
+        if not any(is_sampled):
+            continue
+        host_tokens = jax.device_get(step.tokens)  # (B,)
+        for row, (token, sampled_row) in enumerate(zip(host_tokens, is_sampled, strict=True)):
+            if not sampled_row:
                 continue
-            if token in tokenizer.stop_ids():
+            if token in stop_ids:
                 active[row] = False
                 continue
             segments[row].append(int(token))
@@ -426,6 +436,17 @@ def generate_with_calculator(
             segments[row].clear()
         if not any(active):
             break
+    padding = DecodeOutput(
+        tokens=jnp.zeros(batch_size, jnp.int32),  # (B,)
+        log_probs=jnp.zeros(batch_size, jnp.float32),  # (B,)
+        mask=jnp.zeros(batch_size, jnp.bool_),  # (B,)
+    )
+    outputs.extend([padding] * (max_new_tokens - len(outputs)))
+
+    def stack(*values: jax.Array) -> jax.Array:  # (B,) each -> (B, C)
+        return jnp.stack(values, axis=1)  # (B, C)
+
+    tokens, log_probs, mask = jax.tree.map(stack, *outputs)  # (B, C) each
     return Generation(tokens=tokens, log_probs=log_probs, mask=mask, key=key)
 
 
@@ -881,7 +902,7 @@ def train(config: Config) -> TrainState:
         last_checkpoint = monotonic()
         first_log_iteration = (start_iteration // config.log_interval + 1) * config.log_interval
         log_init(f"Opening MLflow logger: {config.run_id}")
-        with MLflowLogger(experiment="grpo_reasoning", run_name=config.run_id, resume=True) as writer:
+        with MLflowLogger(experiment="grpo_reasoning", run_name=config.run_id) as writer:
             del saved
             print(f"Run: {run_dir}; devices: {devices}; starting at rollout {start_iteration}", flush=True)
             print(f"MLflow run: {writer.run_id}", flush=True)

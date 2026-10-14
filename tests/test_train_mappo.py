@@ -498,4 +498,4 @@ def test_mlflow_resume_without_checkpoint(config: ppo.Config) -> None:
         pytest.raises(RuntimeError, match="stop before training"),
     ):
         ppo.train(config)
-    logger.assert_called_once_with(experiment="mappo", run_name=config.run_id, resume=True)
+    logger.assert_called_once_with(experiment="mappo", run_name=config.run_id)

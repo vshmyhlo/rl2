@@ -1176,7 +1176,7 @@ def train(config: Config) -> TrainState:
             reset_keys = jax.random.split(jax.random.fold_in(key, start_rollout_index), config.num_envs)  # (B,) keys
             obs, env_state = jax.vmap(envs.reset, in_axes=(0, None))(reset_keys, envs.params)  # (B,*O); leaves: (B,...)
         initial_step_count = start_rollout_index * batch_size
-        writer = MLflowLogger(experiment="ppo", run_name=config.run_id, resume=True)
+        writer = MLflowLogger(experiment="ppo", run_name=config.run_id)
         resources.enter_context(writer)
         if progress is not None:
             print(f"Resumed run {config.run_id} at step {initial_step_count}", flush=True)
