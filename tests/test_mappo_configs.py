@@ -6,7 +6,7 @@ from rl2.train_mappo import load_config, make_env
 
 
 def test_mappo_presets() -> None:
-    paths = sorted((Path(__file__).resolve().parents[1] / "configs/mappo").glob("*.yaml"))
+    paths = sorted((Path(__file__).resolve().parents[1] / "configs/mappo").rglob("*.yaml"))
     run_ids: set[str] = set()
     for path in paths:
         config = load_config(path)

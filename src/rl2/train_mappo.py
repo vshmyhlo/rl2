@@ -1,4 +1,4 @@
-"""Recurrent parameter-sharing IPPO for SMAX and JaxNav, with local actor and critic inputs.
+"""Recurrent parameter-sharing IPPO for SMAX, JaxNav, and MPE Simple Spread.
 
 The actor and critic share an encoder and LSTM, with separate policy and value
 heads and parameters shared across agents. Both use only local observations.
@@ -154,6 +154,7 @@ from pydantic.dataclasses import dataclass
 from rl2.actions import CategoricalPolicy, DiscreteSpace
 from rl2.configuration import load_settings
 from rl2.envs.jaxnav_env import JaxNavConfig, JaxNavEnv
+from rl2.envs.mpe_env import MPEConfig, MPEEnv
 from rl2.envs.multi_agent import AgentObservation
 from rl2.envs.smax_env import SMAXConfig, SMAXEnv
 from rl2.jax_cache import configure_compilation_cache
@@ -164,7 +165,7 @@ from rl2.running_stats import RunningSum
 from rl2.utils import explained_variance, gae
 
 type RecurrentCarry = LSTMStackCarry
-type PPOEnv = SMAXEnv | JaxNavEnv
+type PPOEnv = SMAXEnv | JaxNavEnv | MPEEnv
 
 
 @struct.dataclass
@@ -302,7 +303,7 @@ class ModelConfig:
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
 class Config:
-    env_id: Literal["SMAX", "JaxNav"]
+    env_id: Literal["SMAX", "JaxNav", "MPE_simple_spread_v3"]
     seed: int
     total_steps: int
     num_envs: Annotated[int, Field(gt=0)]
@@ -334,6 +335,7 @@ class Config:
     log_interval: Annotated[int, Field(gt=0)] = 60
     smax: SMAXConfig = SMAXConfig()
     jaxnav: JaxNavConfig = JaxNavConfig()
+    mpe: MPEConfig = MPEConfig()
 
     def __post_init__(self) -> None:
         if self.run_id is not None and (
@@ -347,13 +349,20 @@ class Config:
             raise ValueError("smax settings require env_id: SMAX")
         if self.env_id != "JaxNav" and self.jaxnav != JaxNavConfig():
             raise ValueError("jaxnav settings require env_id: JaxNav")
+        if self.env_id != "MPE_simple_spread_v3" and self.mpe != MPEConfig():
+            raise ValueError("mpe settings require env_id: MPE_simple_spread_v3")
         if self.total_steps < self.num_envs * self.num_steps:
             raise ValueError("total_steps must cover at least one rollout")
         return self
 
 
 def make_env(config: Config) -> PPOEnv:
-    env = SMAXEnv(config.smax) if config.env_id == "SMAX" else JaxNavEnv(config.jaxnav)
+    if config.env_id == "SMAX":
+        env = SMAXEnv(config.smax)
+    elif config.env_id == "JaxNav":
+        env = JaxNavEnv(config.jaxnav)
+    else:
+        env = MPEEnv(config.mpe)
     if config.num_envs * env.num_agents % config.num_minibatches:
         raise ValueError("num_envs * num_agents must be divisible by num_minibatches to preserve sequences")
     return env
@@ -448,6 +457,8 @@ def restore_checkpoint(
         raise ValueError("Cannot resume PPO with different SMAX settings; use a new run directory")
     if JaxNavConfig(**saved_config.get("jaxnav", {})) != config.jaxnav:
         raise ValueError("Cannot resume PPO with different JaxNav settings; use a new run directory")
+    if MPEConfig(**saved_config.get("mpe", {})) != config.mpe:
+        raise ValueError("Cannot resume PPO with different MPE settings; use a new run directory")
     # Progress and schedules count rollouts, so each must still represent the same number of steps.
     if (
         "num_envs" in saved_config

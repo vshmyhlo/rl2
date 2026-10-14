@@ -1,0 +1,45 @@
+---
+title: "Quarto rendering example"
+format:
+  html:
+    toc: true
+---
+
+## Text and lists
+
+This is a small **Quarto** document with *emphasis* and `inline code`.
+
+- Headings should appear in the table of contents.
+- The table, equation, and callout below should render as formatted content.
+
+## Table
+
+| Experiment | Steps | Reward |
+|:-----------|------:|-------:|
+| Baseline   |   100 |   12.5 |
+| Variant    |   200 |   18.2 |
+
+## Math
+
+The discounted return uses a discount factor $\gamma$:
+
+$$
+G_t = \sum_{k=0}^{T-t-1} \gamma^k r_{t+k+1}
+$$
+
+## Code
+
+This block displays syntax highlighting without executing Python:
+
+```python
+rewards = [1.0, 0.5, 2.0]
+total_reward = sum(rewards)
+```
+
+## Callout
+
+::: {.callout-note}
+## Rendering check
+
+This text should appear inside a styled note box.
+:::
