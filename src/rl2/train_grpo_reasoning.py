@@ -1,15 +1,13 @@
-"""Fine-tune GDN2 or Gemma 3 270M with GRPO on Reasoning Gym.
-
-Run with ``uv run --extra gdn2 python -m rl2.train_grpo_reasoning --config
-configs/grpo_reasoning.yaml``. Sampling and replay use the same full-vocabulary,
-temperature-scaled policy. Only completion tokens (including EOS) incur loss.
-"""
+"""Fine-tune Gemma 3 270M with GRPO and optional calculator access on Reasoning Gym."""
 
 from __future__ import annotations
 
 import argparse
 import math
+import re
+from collections import deque
 from collections.abc import Sequence
+from contextlib import closing
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
@@ -22,29 +20,36 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import orbax.checkpoint as ocp
 import reasoning_gym
 import yaml
 from flax import serialization
 from flax.training.train_state import TrainState
+from gemma import gm
 from reasoning_gym.dataset import ProceduralDataset
 from reasoning_gym.utils import extract_answer
-from tensorboardX import SummaryWriter
 
-from rl2.gdn2.checkpoints import Parameters, load_checkpoint, save_checkpoint
-from rl2.gdn2.generate import DEFAULT_CHECKPOINT, load_tokenizer
-from rl2.gdn2.model import GatedDeltaNet2Backend, GatedDeltaNet2LM, GatedDeltaNet2StackCarry
-from rl2.gemma3 import Gemma3Carry, Gemma3LM, Gemma3Tokenizer, load_gemma3_checkpoint, save_gemma3_checkpoint
+from rl2.calculator import calculate
+from rl2.gemma3 import (
+    Gemma3Carry,
+    Gemma3LM,
+    Gemma3Tokenizer,
+    Parameters,
+    load_gemma3_checkpoint,
+    save_gemma3_checkpoint,
+)
 from rl2.jax_cache import configure_compilation_cache
+from rl2.mlflow_logging import MLflowLogger
 from rl2.utils import read_bytes, read_optional, write_bytes
 
 type Entry = dict[str, Any]
 type Metrics = dict[str, jax.Array]
-type LanguageModel = GatedDeltaNet2LM | Gemma3LM
 
 
 class Tokenizer(Protocol):
     def bos_id(self) -> int: ...
     def eos_id(self) -> int: ...
+    def stop_ids(self) -> tuple[int, ...]: ...
     def vocab_size(self) -> int: ...
     def encode(self, text: str, *, out_type: type[int], add_bos: bool, add_eos: bool) -> list[int]: ...
     def decode(self, ids: list[int]) -> str: ...
@@ -58,10 +63,8 @@ class PromptExample:
 
 @dataclass(frozen=True)
 class Config:
-    model_type: Literal["gdn2", "gemma3"] = "gdn2"
-    checkpoint: str = str(DEFAULT_CHECKPOINT)
+    checkpoint: str = "gs://gemma-data/checkpoints/gemma3-270m-it"
     tokenizer: str | None = None
-    backend: GatedDeltaNet2Backend = "jax"
     dtype: Literal["float32", "bfloat16"] = "float32"
     task: str = "leg_counting"
     task_config: dict[str, Any] = field(default_factory=dict)
@@ -74,6 +77,7 @@ class Config:
     update_epochs: int = 1
     max_prompt_tokens: int = 256
     max_new_tokens: int = 128
+    calculator_max_calls: int = 0
     temperature: float = 1.0
     learning_rate: float = 1e-6
     clip_coef: float = 0.2
@@ -87,10 +91,6 @@ class Config:
     checkpoint_interval_seconds: float = 600.0
 
     def __post_init__(self) -> None:
-        if self.model_type not in ("gdn2", "gemma3"):
-            raise ValueError("model_type must be gdn2/gemma3")
-        if self.model_type == "gemma3" and self.backend != "jax":
-            raise ValueError("Gemma 3 requires backend: jax (also on GPUs)")
         for name in (
             "total_updates",
             "num_tasks",
@@ -105,6 +105,8 @@ class Config:
                 raise ValueError(f"{name} must be positive")
         if self.group_size < 2:
             raise ValueError("GRPO requires group_size >= 2")
+        if self.calculator_max_calls < 0:
+            raise ValueError("calculator_max_calls must be nonnegative")
         if not 2 <= self.log_completion_count <= 4:
             raise ValueError("log_completion_count must be between 2 and 4")
         if self.num_tasks * self.group_size % self.num_minibatches:
@@ -120,8 +122,10 @@ class Config:
             raise ValueError("beta must be finite and nonnegative")
         if not 0 <= self.duration_penalty_coef < math.inf:
             raise ValueError("duration_penalty_coef must be finite and nonnegative")
-        if self.backend not in ("jax", "triton") or self.dtype not in ("float32", "bfloat16"):
-            raise ValueError("backend must be jax/triton and dtype must be float32/bfloat16")
+        if self.dtype not in ("float32", "bfloat16"):
+            raise ValueError("dtype must be float32/bfloat16")
+        if self.max_prompt_tokens + self.max_new_tokens > 32768:
+            raise ValueError("Prompt + completion budget must fit the 32768-token context")
         if {"seed", "size"} & self.task_config.keys():
             raise ValueError("task_config cannot override seed or size")
         if self.run_id is not None and (
@@ -166,8 +170,8 @@ def load_config(path: str | Path) -> Config:
 class GRPOBatch(NamedTuple):
     prompts: jax.Array  # [B,P], right padded; repeated within each task group.
     prompt_lengths: jax.Array  # [B]
-    completions: jax.Array  # [B,C], right padded after EOS.
-    mask: jax.Array  # [B,C], includes the first EOS.
+    completions: jax.Array  # [B,C], model tokens and inserted tool results, then right padding.
+    mask: jax.Array  # [B,C], model tokens including EOS; excludes tool results and padding.
     old_log_probs: jax.Array  # [B,C], sampled behavior policy.
     ref_log_probs: jax.Array  # [B,C], frozen initial policy (unused when beta=0).
     advantages: jax.Array  # [B], normalized before shuffling/minibatching.
@@ -184,7 +188,7 @@ def policy_log_probs(logits: jax.Array, tokens: jax.Array, temperature: float) -
     return result
 
 
-def build_prompt(question: str, examples: Sequence[PromptExample] = ()) -> str:
+def build_prompt(question: str, examples: Sequence[PromptExample] = (), calculator_max_calls: int = 0) -> str:
     """Use the same full prompt for tokenization and sample logging."""
 
     def format_question(text: str) -> str:
@@ -204,11 +208,18 @@ def build_prompt(question: str, examples: Sequence[PromptExample] = ()) -> str:
         "Give brief reasoning, then put only your final answer inside <answer>...</answer>.\n"
         "Finish immediately after </answer>.\n\n"
     )
+    if calculator_max_calls:
+        instruction += (
+            f"You may use the calculator up to {calculator_max_calls} times. "
+            "Write <calculator>expression</calculator> and wait for <result>...</result>, then continue.\n"
+            "Use numbers, parentheses, and + - * / // % **. Example: <calculator>12 * 13</calculator>.\n\n"
+        )
     demonstrations = "".join(
         f"Question: {format_question(example.question)}\n\nAnswer: {example.completion.rstrip('\n')}\n\n"
         for example in examples
     )
-    return instruction + demonstrations + f"Question: {format_question(question)}\n\nAnswer:"
+    content = instruction + demonstrations + f"Question: {format_question(question)}\n\nAnswer:"
+    return f"<start_of_turn>user\n{content}<end_of_turn>\n<start_of_turn>model\n"
 
 
 def format_group_samples(prompt: str, completions: Sequence[str], rewards: Sequence[float]) -> str:
@@ -228,11 +239,12 @@ def encode_prompts(
     tokenizer: Tokenizer,
     max_tokens: int,
     examples: Sequence[PromptExample] = (),
-) -> tuple[jax.Array, jax.Array]:
-    prompts = np.zeros((len(entries), max_tokens), np.int32)
-    lengths = np.empty(len(entries), np.int32)
+    calculator_max_calls: int = 0,
+) -> tuple[jax.Array, jax.Array]:  # (N, P), (N,)
+    prompts = np.zeros((len(entries), max_tokens), np.int32)  # (N, P)
+    lengths = np.empty(len(entries), np.int32)  # (N,)
     for i, entry in enumerate(entries):
-        text = build_prompt(entry["question"], examples)
+        text = build_prompt(entry["question"], examples, calculator_max_calls)
         ids = tokenizer.encode(text, out_type=int, add_bos=tokenizer.bos_id() >= 0, add_eos=False)
         if not ids or len(ids) > max_tokens:
             raise ValueError(f"Prompt has {len(ids)} tokens; expected 1..{max_tokens}. Increase max_prompt_tokens.")
@@ -243,84 +255,209 @@ def encode_prompts(
     return jnp.asarray(prompts), jnp.asarray(lengths)
 
 
-type DecodeCarry = tuple[GatedDeltaNet2StackCarry | Gemma3Carry, jax.Array, jax.Array, jax.Array]
-type DecodeOutput = tuple[jax.Array, jax.Array, jax.Array]
+class DecodeCarry(NamedTuple):
+    cache: Gemma3Carry  # leaves: (B, ...)
+    logits: jax.Array  # (B, V)
+    active: jax.Array  # (B,)
+    key: jax.Array  # ()
 
 
-@partial(jax.jit, static_argnames=("model", "group_size", "max_new_tokens", "temperature", "eos_token_id"))
-def generate(
-    model: LanguageModel,
+class DecodeOutput(NamedTuple):
+    tokens: jax.Array  # (B,)
+    log_probs: jax.Array  # (B,)
+    mask: jax.Array  # (B,)
+
+
+class Generation(NamedTuple):
+    tokens: jax.Array  # (B, C) Full transcript, including inserted results.
+    log_probs: jax.Array  # (B, C) Zero at tool results/padding.
+    mask: jax.Array  # (B, C) Model-generated tokens only.
+    key: jax.Array  # () PRNG key.
+
+
+@partial(jax.jit, static_argnames=("model", "group_size"))
+def prefill_generation(
+    model: Gemma3LM,
     params: Parameters,
-    prompts: jax.Array,
-    lengths: jax.Array,
-    key: jax.Array,
+    prompts: jax.Array,  # (N, P)
+    lengths: jax.Array,  # (N,)
+    group_size: int,
+) -> tuple[Gemma3Carry, jax.Array]:  # carry leaves: (B, ...), logits: (B, V); B=N*group_size
+    carry, logits = model.prefill(params, prompts, lengths)  # logits: (N, P, V)
+    logits = jnp.repeat(logits[jnp.arange(prompts.shape[0]), lengths - 1], group_size, axis=0)  # (B, V)
+
+    def repeat_carry(value: jax.Array) -> jax.Array:  # (N, ...) -> (B, ...)
+        return jnp.repeat(value, group_size, axis=0)  # (B, ...)
+
+    carry = jax.tree.map(repeat_carry, carry)  # leaves: (B, ...)
+    return carry, logits  # logits: (B, V)
+
+
+@partial(jax.jit, static_argnames=("model", "group_size", "max_new_tokens", "temperature", "stop_token_ids"))
+def generate(
+    model: Gemma3LM,
+    params: Parameters,
+    prompts: jax.Array,  # (N, P)
+    lengths: jax.Array,  # (N,)
+    key: jax.Array,  # ()
     *,
     group_size: int,
     max_new_tokens: int,
     temperature: float,
-    eos_token_id: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    stop_token_ids: tuple[int, ...],
+) -> Generation:
     """Prefill unique prompts once; independently sample each repeated model state."""
-    if isinstance(model, Gemma3LM):
-        if prompts.shape[1] + max_new_tokens > model.cache_length:
-            raise ValueError("Prompt + completion budget exceeds Gemma cache length")
-        carry, logits = model.prefill(params, prompts, lengths)
-    else:
-        carry, logits = model.apply({"params": params}, prompts, lengths)
-    logits = jnp.repeat(logits[jnp.arange(prompts.shape[0]), lengths - 1], group_size, axis=0)
-
-    def repeat_carry(x: jax.Array) -> jax.Array:
-        return jnp.repeat(x, group_size, axis=0)
-
-    carry = jax.tree.map(repeat_carry, carry)
+    if prompts.shape[1] + max_new_tokens > model.cache_length:
+        raise ValueError("Prompt + completion budget exceeds Gemma cache length")
+    carry, logits = prefill_generation(model, params, prompts, lengths, group_size)  # logits: (B, V)
     batch_size = prompts.shape[0] * group_size
 
     def step(previous: DecodeCarry, _: None) -> tuple[DecodeCarry, DecodeOutput]:
-        carry, logits, active, key = previous
-        key, sample_key = jax.random.split(key)
-        tokens = jax.random.categorical(sample_key, logits / temperature).astype(jnp.int32)
-        tokens = jnp.where(active, tokens, 0)
-        log_probs = policy_log_probs(logits[:, None], tokens[:, None], temperature)[:, 0]
-        output = (tokens, jnp.where(active, log_probs, 0.0), active)
-        active = active & (tokens != eos_token_id)
-        if isinstance(model, Gemma3LM):
-            carry, logits = model.step(params, tokens, active, carry)
-        else:
-            carry, logits = model.apply({"params": params}, tokens, active, carry, method=model.step)
-        return (carry, logits, active, key), output
+        carry, logits, active, key = previous  # logits: (B, V); active: (B,); key: ()
+        result = decode_step(
+            model,
+            params,
+            carry,
+            logits,
+            jnp.full((batch_size,), -1, jnp.int32),
+            active,
+            key,
+            temperature,
+            stop_token_ids,
+        )
+        output = DecodeOutput(tokens=result.tokens, log_probs=result.log_probs, mask=active)
+        active = active & ~jnp.isin(result.tokens, jnp.asarray(stop_token_ids))  # (B,)
+        return DecodeCarry(cache=result.carry, logits=result.logits, active=active, key=result.key), output
 
     (_, _, _, key), (tokens, log_probs, mask) = jax.lax.scan(
         step,
-        (carry, logits, jnp.ones(batch_size, jnp.bool_), key),
+        DecodeCarry(cache=carry, logits=logits, active=jnp.ones(batch_size, jnp.bool_), key=key),
         None,
         length=max_new_tokens,
     )
-    tokens, log_probs, mask = tokens.T, log_probs.T, mask.T
-    return tokens, log_probs, mask, key
+    tokens, log_probs, mask = jax.tree.map(jnp.transpose, (tokens, log_probs, mask))  # (B, C) each
+    return Generation(tokens=tokens, log_probs=log_probs, mask=mask, key=key)
+
+
+class DecodeStep(NamedTuple):
+    carry: Gemma3Carry  # leaves: (B, ...)
+    logits: jax.Array  # (B, V)
+    tokens: jax.Array  # (B,)
+    log_probs: jax.Array  # (B,)
+    key: jax.Array  # ()
+
+
+@partial(jax.jit, static_argnames=("model", "temperature", "stop_token_ids"))
+def decode_step(
+    model: Gemma3LM,
+    params: Parameters,
+    carry: Gemma3Carry,  # leaves: (B, ...)
+    logits: jax.Array,  # (B, V)
+    forced: jax.Array,  # (B,) Tool-result IDs; -1 requests sampling.
+    active: jax.Array,  # (B,)
+    key: jax.Array,  # ()
+    temperature: float,
+    stop_token_ids: tuple[int, ...],
+) -> DecodeStep:
+    key, sample_key = jax.random.split(key)  # (), ()
+    sampled = gm.text.RandomSampling(temperature=temperature).get_next_tokens(logits, sample_key)  # (B,)
+    tokens = jnp.where(active, jnp.where(forced >= 0, forced, sampled), 0)  # (B,)
+    log_probs = policy_log_probs(logits[:, None], tokens[:, None], temperature)[:, 0]  # (B,)
+    log_probs = jnp.where(active & (forced < 0), log_probs, 0.0)  # (B,)
+    active = active & ~jnp.isin(tokens, jnp.asarray(stop_token_ids))  # (B,)
+    carry, logits = model.step(params, tokens, active, carry)  # logits: (B, V)
+    return DecodeStep(carry=carry, logits=logits, tokens=tokens, log_probs=log_probs, key=key)
+
+
+def generate_with_calculator(
+    model: Gemma3LM,
+    params: Parameters,
+    prompts: jax.Array,  # (N, P)
+    lengths: jax.Array,  # (N,)
+    key: jax.Array,  # ()
+    *,
+    tokenizer: Tokenizer,
+    group_size: int,
+    max_new_tokens: int,
+    temperature: float,
+    max_calls: int,
+) -> Generation:
+    """Decode with a KV cache, pausing for host-side arithmetic at complete calculator tags."""
+    if prompts.shape[1] + max_new_tokens > model.cache_length:
+        raise ValueError("Prompt + completion budget exceeds Gemma cache length")
+    carry, logits = prefill_generation(model, params, prompts, lengths, group_size)  # logits: (B, V)
+    batch_size = prompts.shape[0] * group_size
+    tokens = jnp.zeros((batch_size, max_new_tokens), jnp.int32)  # (B, C)
+    log_probs = jnp.zeros_like(tokens, dtype=jnp.float32)  # (B, C)
+    mask = jnp.zeros_like(tokens, dtype=jnp.bool_)  # (B, C)
+    active = [True] * batch_size
+    pending: list[deque[int]] = [deque() for _ in active]
+    segments: list[list[int]] = [[] for _ in active]
+    calls = [0] * batch_size
+    for position in range(max_new_tokens):
+        forced = jnp.asarray([queue.popleft() if queue else -1 for queue in pending], jnp.int32)  # (B,)
+        sampled = jnp.asarray(active) & (forced < 0)  # (B,)
+        step = decode_step(
+            model, params, carry, logits, forced, jnp.asarray(active), key, temperature, tokenizer.stop_ids()
+        )
+        carry, logits, key = step.carry, step.logits, step.key  # logits: (B, V); key: ()
+        tokens = tokens.at[:, position].set(step.tokens)  # (B, C)
+        log_probs = log_probs.at[:, position].set(step.log_probs)  # (B, C)
+        mask = mask.at[:, position].set(sampled)  # (B, C)
+        host_tokens, host_sampled = jax.device_get((step.tokens, sampled))  # (B,), (B,)
+        for row, (token, is_sampled) in enumerate(zip(host_tokens, host_sampled, strict=True)):
+            if not is_sampled:
+                continue
+            if token in tokenizer.stop_ids():
+                active[row] = False
+                continue
+            segments[row].append(int(token))
+            match = re.search(r"<calculator>(.*?)</calculator>", tokenizer.decode(segments[row]), re.DOTALL)
+            if match is None:
+                continue
+            result = calculate(match[1]) if calls[row] < max_calls else "Error: calculator call limit reached"
+            calls[row] += 1
+            result_ids = tokenizer.encode(f"\n<result>{result}</result>\n", out_type=int, add_bos=False, add_eos=False)
+            # Insert only complete results, leaving at least one slot for the model to continue.
+            if len(result_ids) >= max_new_tokens - position - 1:
+                active[row] = False
+                continue
+            pending[row].extend(result_ids)
+            segments[row].clear()
+        if not any(active):
+            break
+    return Generation(tokens=tokens, log_probs=log_probs, mask=mask, key=key)
+
+
+def transcript_mask(mask: jax.Array) -> jax.Array:  # (B, C) -> (B, C)
+    """Include tool results before the last model token, excluding trailing padding."""
+    positions = jnp.arange(mask.shape[1])[None, :]  # (1, C)
+    last = jnp.max(jnp.where(mask, positions, -1), axis=1, keepdims=True)  # (B, 1)
+    return positions <= last  # (B, C)
 
 
 @partial(jax.jit, static_argnames=("model", "temperature"))
 def completion_log_probs(
-    model: LanguageModel,
+    model: Gemma3LM,
     params: Parameters,
     batch: GRPOBatch,
     temperature: float,
-) -> jax.Array:
+) -> jax.Array:  # (B, C)
     """Pack prompt+completion without padding gaps; backpropagate through the prompt."""
     b, p = batch.prompts.shape
     c = batch.completions.shape[1]
-    positions = jnp.arange(p + c - 1)[None, :]
-    completion_positions = positions - batch.prompt_lengths[:, None]
-    prompts = jnp.take_along_axis(batch.prompts, jnp.minimum(positions, p - 1), axis=1)
-    completions = jnp.take_along_axis(batch.completions, jnp.clip(completion_positions, 0, c - 1), axis=1)
-    tokens = jnp.where(completion_positions < 0, prompts, completions)
-    lengths = batch.prompt_lengths + batch.mask.sum(axis=1, dtype=jnp.int32) - 1
+    positions = jnp.arange(p + c - 1)[None, :]  # (1, P+C-1)
+    completion_positions = positions - batch.prompt_lengths[:, None]  # (B, P+C-1)
+    prompts = jnp.take_along_axis(batch.prompts, jnp.minimum(positions, p - 1), axis=1)  # (B, P+C-1)
+    completions = jnp.take_along_axis(batch.completions, jnp.clip(completion_positions, 0, c - 1), axis=1)  # (B, P+C-1)
+    tokens = jnp.where(completion_positions < 0, prompts, completions)  # (B, P+C-1)
+    lengths = batch.prompt_lengths + transcript_mask(batch.mask).sum(axis=1, dtype=jnp.int32) - 1  # (B,)
     # Rematerialize model activations during backward instead of retaining every layer.
-    _, logits = jax.checkpoint(model.apply)({"params": params}, tokens, lengths)
-    indices = batch.prompt_lengths[:, None] - 1 + jnp.arange(c)[None, :]
-    logits = logits[jnp.arange(b)[:, None], indices]
-    result = policy_log_probs(logits, batch.completions, temperature)
-    return jnp.where(batch.mask, result, 0.0)
+    _, logits = jax.checkpoint(model.apply)({"params": params}, tokens, lengths)  # (B, P+C-1, V)
+    indices = batch.prompt_lengths[:, None] - 1 + jnp.arange(c)[None, :]  # (B, C)
+    logits = logits[jnp.arange(b)[:, None], indices]  # (B, C, V)
+    result = policy_log_probs(logits, batch.completions, temperature)  # (B, C)
+    return jnp.where(batch.mask, result, 0.0)  # (B, C)
 
 
 def objective(log_probs: jax.Array, batch: GRPOBatch, clip_coef: float, beta: float) -> tuple[jax.Array, Metrics]:
@@ -349,7 +486,7 @@ def objective(log_probs: jax.Array, batch: GRPOBatch, clip_coef: float, beta: fl
     return loss, metrics
 
 
-def create_state(model: LanguageModel, params: Parameters, config: Config) -> TrainState:
+def create_state(model: Gemma3LM, params: Parameters, config: Config) -> TrainState:
     return TrainState.create(
         apply_fn=model.apply,
         params=jax.device_put(params),
@@ -360,7 +497,7 @@ def create_state(model: LanguageModel, params: Parameters, config: Config) -> Tr
 @partial(jax.jit, static_argnames=("model", "temperature", "clip_coef", "beta"))
 def update(
     state: TrainState,
-    model: LanguageModel,
+    model: Gemma3LM,
     batch: GRPOBatch,
     *,
     temperature: float,
@@ -389,7 +526,7 @@ def score_completions(
         answer = extract_answer(text)
         if answer is not None:
             score = dataset.score_answer(answer=answer, entry=entries[i // group_size])
-            if not math.isfinite(score) or not 0 <= score <= 1:
+            if not 0 <= score <= 1:
                 raise ValueError(f"Task scorer returned invalid reward: {score}")
             rewards[i] = score
     return jnp.asarray(rewards)
@@ -409,7 +546,7 @@ def apply_duration_penalty(
 
 def collect_rollout(
     state: TrainState,
-    model: LanguageModel,
+    model: Gemma3LM,
     ref_params: Parameters,
     dataset: ProceduralDataset,
     tokenizer: Tokenizer,
@@ -418,24 +555,40 @@ def collect_rollout(
     config: Config,
 ) -> tuple[GRPOBatch, dict[str, float], str, jax.Array]:
     entries = [dataset[iteration * config.num_tasks + i] for i in range(config.num_tasks)]
-    prompts, lengths = encode_prompts(entries, tokenizer, config.max_prompt_tokens, config.prompt_examples)
+    prompts, lengths = encode_prompts(
+        entries, tokenizer, config.max_prompt_tokens, config.prompt_examples, config.calculator_max_calls
+    )  # (N, P), (N,)
     generation_start = monotonic()
-    tokens, log_probs, mask, key = generate(
-        model,
-        state.params,
-        prompts,
-        lengths,
-        key,
-        group_size=config.group_size,
-        max_new_tokens=config.max_new_tokens,
-        temperature=config.temperature,
-        eos_token_id=tokenizer.eos_id(),
-    )
-    host_tokens, host_mask = jax.device_get((tokens, mask))
+    if config.calculator_max_calls:
+        tokens, log_probs, mask, key = generate_with_calculator(
+            model,
+            state.params,
+            prompts,
+            lengths,
+            key,
+            tokenizer=tokenizer,
+            group_size=config.group_size,
+            max_new_tokens=config.max_new_tokens,
+            temperature=config.temperature,
+            max_calls=config.calculator_max_calls,
+        )  # (B, C), (B, C), (B, C), ()
+    else:
+        tokens, log_probs, mask, key = generate(
+            model,
+            state.params,
+            prompts,
+            lengths,
+            key,
+            group_size=config.group_size,
+            max_new_tokens=config.max_new_tokens,
+            temperature=config.temperature,
+            stop_token_ids=tokenizer.stop_ids(),
+        )  # (B, C), (B, C), (B, C), ()
+    host_tokens, host_mask = jax.device_get((tokens, transcript_mask(mask)))  # (B, C), (B, C)
     generation_seconds = monotonic() - generation_start
     decoding_start = monotonic()
     texts = [
-        tokenizer.decode(ids[valid & (ids != tokenizer.eos_id())].tolist())
+        tokenizer.decode(ids[valid & ~np.isin(ids, tokenizer.stop_ids())].tolist())
         for ids, valid in zip(host_tokens, host_mask, strict=True)
     ]
     decoding_seconds = monotonic() - decoding_start
@@ -446,13 +599,13 @@ def collect_rollout(
     rewards, duration_penalties = apply_duration_penalty(task_rewards, mask, config.duration_penalty_coef)
     grouped = rewards.reshape(config.num_tasks, config.group_size)
     batch = GRPOBatch(
-        jnp.repeat(prompts, config.group_size, axis=0),
-        jnp.repeat(lengths, config.group_size),
-        tokens,
-        mask,
-        log_probs,
-        jnp.zeros_like(log_probs),
-        group_advantages(grouped).reshape(-1),
+        prompts=jnp.repeat(prompts, config.group_size, axis=0),  # (B, P)
+        prompt_lengths=jnp.repeat(lengths, config.group_size),  # (B,)
+        completions=tokens,  # (B, C)
+        mask=mask,  # (B, C)
+        old_log_probs=log_probs,  # (B, C)
+        ref_log_probs=jnp.zeros_like(log_probs),  # (B, C)
+        advantages=group_advantages(grouped).reshape(-1),  # (B,)
     )
     if config.beta:
         # Bound reference replay memory to the same batch size as optimization.
@@ -468,7 +621,9 @@ def collect_rollout(
         "charts/success_rate": float((task_rewards == 1).mean()),
         "charts/informative_group_fraction": float((jnp.ptp(grouped, axis=1) > 0).mean()),
         "charts/completion_length_mean": float(mask.sum(axis=1).mean()),
-        "charts/truncation_rate": float((~jnp.any(mask & (tokens == tokenizer.eos_id()), axis=1)).mean()),
+        "charts/truncation_rate": float(
+            (~jnp.any(mask & jnp.isin(tokens, jnp.asarray(tokenizer.stop_ids())), axis=1)).mean()
+        ),
     }
     processing_seconds = monotonic() - processing_start
     diagnostics.update(
@@ -485,35 +640,151 @@ def collect_rollout(
     # Stable sorting preserves sampling order for ties; only the displayed group changes.
     indices = np.argsort(-group_rewards, kind="stable")[:count]
     samples = format_group_samples(
-        build_prompt(entries[0]["question"], config.prompt_examples),
+        build_prompt(entries[0]["question"], config.prompt_examples, config.calculator_max_calls),
         [texts[index] for index in indices],
         group_rewards[indices].tolist(),
     )
     return batch, diagnostics, samples, key
 
 
-def save_training_checkpoint(
-    run_dir: str,
+class TrainStepResult(NamedTuple):
+    state: TrainState  # Parameter/optimizer pytrees; scalar step.
+    key: jax.Array  # () typed PRNG key
+    metrics: list[Metrics]  # One dict of scalar arrays per minibatch update.
+    diagnostics: dict[str, float]
+    samples: str
+
+
+def train_step(
     state: TrainState,
-    key: jax.Array,
+    model: Gemma3LM,
+    ref_params: Parameters,  # Model parameter pytree.
+    dataset: ProceduralDataset,
+    tokenizer: Tokenizer,
+    key: jax.Array,  # () typed PRNG key
+    iteration: int,
+    config: Config,
+    *,
+    log_startup: bool = False,
+) -> TrainStepResult:
+    """Collect and score one rollout, then dispatch its minibatch updates without waiting."""
+    if log_startup:
+        print("[startup] Collecting first rollout; generation may trigger JAX compilation", flush=True)
+    batch, diagnostics, samples, key = collect_rollout(
+        state, model, ref_params, dataset, tokenizer, key, iteration, config
+    )  # batch leaves: (B, ...); key: (); B = num_tasks * group_size
+    if log_startup:
+        print("[startup] First rollout collected; starting optimization (may trigger JAX compilation)", flush=True)
+    metrics: list[Metrics] = []  # Scalar leaves per update.
+    batch_size = config.num_tasks * config.group_size
+    update_start = monotonic()
+    for _ in range(config.update_epochs):
+        key, shuffle_key = jax.random.split(key)  # each () typed PRNG key
+        indices = jax.random.permutation(shuffle_key, batch_size).reshape(config.num_minibatches, -1)  # (M, B/M)
+        for minibatch_indices in indices:  # (B/M,)
+            minibatch = jax.tree.map(partial(jnp.take, indices=minibatch_indices, axis=0), batch)  # leaves: (B/M, ...)
+            state, metric = update(
+                state,
+                model,
+                minibatch,
+                temperature=config.temperature,
+                clip_coef=config.clip_coef,
+                beta=config.beta,
+            )  # metric leaves: ()
+            metrics.append(metric)
+    diagnostics["time/update_dispatch_seconds"] = monotonic() - update_start
+    diagnostics["time/jax_seconds"] += diagnostics["time/update_dispatch_seconds"]
+    return TrainStepResult(state=state, key=key, metrics=metrics, diagnostics=diagnostics, samples=samples)
+
+
+class TrainingProgress(NamedTuple):
+    state: TrainState  # Model/optimizer pytree; step: ().
+    key: jax.Array  # () typed PRNG key
+    iteration: int
+    prompts_seen: int
+
+
+def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
+    directory = f"{run_dir.rstrip('/')}/checkpoints"
+    if not directory.startswith("gs://"):
+        directory = str(Path(directory).resolve())
+    return ocp.CheckpointManager(
+        directory,
+        item_handlers={"state": ocp.StandardCheckpointHandler(), "metadata": ocp.JsonCheckpointHandler()},
+        options=ocp.CheckpointManagerOptions(max_to_keep=2),
+    )
+
+
+def save_training_checkpoint(
+    manager: ocp.CheckpointManager,
+    state: TrainState,
+    key: jax.Array,  # () typed PRNG key
     iteration: int,
     config: Config,
     *,
     prompts_seen: int,
 ) -> None:
-    payload = {
-        "version": 1,
-        "state": serialization.to_state_dict(state),
-        "iteration": iteration,
-        "prompts_seen": prompts_seen,
-        "key": np.asarray(jax.random.key_data(key)),
-        "key_impl": str(jax.random.key_impl(key)),
-        "config": asdict(config),  # Provenance only; compatibility is determined by the saved state.
-    }
-    write_bytes(f"{run_dir}/checkpoint.msgpack", serialization.msgpack_serialize(payload))
+    manager.save(
+        iteration,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardSave(
+                {"train_state": serialization.to_state_dict(state), "key": jax.random.key_data(key)}
+            ),
+            metadata=ocp.args.JsonSave(
+                {
+                    "version": 1,
+                    "iteration": iteration,
+                    "prompts_seen": prompts_seen,
+                    "key_impl": str(jax.random.key_impl(key)),
+                    "config": asdict(config),  # Provenance only.
+                }
+            ),
+        ),
+        force=True,
+    )
+    manager.wait_until_finished()
 
 
-def restore_training_checkpoint(data: bytes, state: TrainState) -> tuple[TrainState, jax.Array, int, int]:
+def restore_training_checkpoint(manager: ocp.CheckpointManager, state: TrainState) -> TrainingProgress | None:
+    """Restore the latest checkpoint using the current model/optimizer functions."""
+    iteration = manager.latest_step()
+    if iteration is None:
+        return None
+    metadata = manager.restore(iteration, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
+    if metadata["version"] != 1:
+        raise ValueError("Unsupported reasoning GRPO checkpoint version")
+    if type(metadata["iteration"]) is not int or metadata["iteration"] != iteration or iteration < 0:
+        raise ValueError("Invalid checkpoint iteration")
+    prompts_seen = metadata["prompts_seen"]
+    if type(prompts_seen) is not int or prompts_seen < 0:
+        raise ValueError("Invalid checkpoint prompts_seen")
+    target = serialization.to_state_dict(state)
+    saved = manager.metadata(iteration).item_metadata["state"].tree["train_state"]
+    try:
+        # A restore target can hide extra keys or cast stored dtypes; check metadata first.
+        chex.assert_trees_all_equal_shapes_and_dtypes(
+            (target["params"], target["opt_state"]), (saved["params"], saved["opt_state"])
+        )
+    except (AssertionError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(
+            "Checkpoint model/optimizer structure, shapes, or dtypes are incompatible with the current state"
+        ) from error
+    key = jax.random.key(0, impl=metadata["key_impl"])  # () typed PRNG key
+    restored = manager.restore(
+        iteration,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardRestore({"train_state": target, "key": jax.random.key_data(key)})
+        ),
+    ).state
+    return TrainingProgress(
+        state=serialization.from_state_dict(state, restored["train_state"]),
+        key=jax.random.wrap_key_data(restored["key"], impl=metadata["key_impl"]),  # () typed PRNG key
+        iteration=iteration,
+        prompts_seen=prompts_seen,
+    )
+
+
+def restore_legacy_training_checkpoint(data: bytes, state: TrainState) -> TrainingProgress:
     """Restore compatible state while retaining the current model/optimizer functions."""
     payload = serialization.msgpack_restore(data)
     if payload["version"] != 1:
@@ -543,8 +814,8 @@ def restore_training_checkpoint(data: bytes, state: TrainState) -> tuple[TrainSt
         prompts_seen = iteration * num_tasks
     if type(prompts_seen) is not int or prompts_seen < 0:
         raise ValueError("Invalid checkpoint prompts_seen")
-    key = jax.random.wrap_key_data(jnp.asarray(payload["key"]), impl=payload["key_impl"])
-    return restored, key, iteration, prompts_seen
+    key = jax.random.wrap_key_data(jnp.asarray(payload["key"]), impl=payload["key_impl"])  # () typed PRNG key
+    return TrainingProgress(state=restored, key=key, iteration=iteration, prompts_seen=prompts_seen)
 
 
 def train(config: Config) -> TrainState:
@@ -565,27 +836,15 @@ def train(config: Config) -> TrainState:
         size=config.total_updates * config.num_tasks,
         **config.task_config,
     )
-    tokenizer_source = config.tokenizer or (
-        "Gemma 3 default" if config.model_type == "gemma3" else "cached TinyLlama default"
-    )
-    log_init(f"Loading tokenizer: {tokenizer_source}")
-    tokenizer = (
-        Gemma3Tokenizer(config.tokenizer)
-        if config.model_type == "gemma3"
-        else load_tokenizer(Path(config.tokenizer) if config.tokenizer is not None else None)
-    )
+    log_init(f"Loading tokenizer: {config.tokenizer or 'Gemma 3 default'}")
+    tokenizer = Gemma3Tokenizer(config.tokenizer)
     log_init(f"Tokenizer ready: vocabulary size {tokenizer.vocab_size():,}")
-    log_init(f"Loading pretrained checkpoint: {config.checkpoint} (backend={config.backend}, dtype={config.dtype})")
-    if config.model_type == "gemma3":
-        model, variables = load_gemma3_checkpoint(
-            config.checkpoint,
-            cache_length=config.max_prompt_tokens + config.max_new_tokens,
-            dtype=config.dtype,
-        )
-    else:
-        model, variables = load_checkpoint(
-            Path(config.checkpoint), dtype=jnp.dtype(config.dtype), backend=config.backend
-        )
+    log_init(f"Loading pretrained checkpoint: {config.checkpoint} (dtype={config.dtype})")
+    model, variables = load_gemma3_checkpoint(
+        config.checkpoint,
+        cache_length=config.max_prompt_tokens + config.max_new_tokens,
+        dtype=config.dtype,
+    )
     parameter_count = sum(leaf.size for leaf in jax.tree.leaves(variables["params"]))
     log_init(f"Pretrained checkpoint loaded: {parameter_count:,} parameters")
     if tokenizer.vocab_size() != model.vocab_size:
@@ -602,125 +861,113 @@ def train(config: Config) -> TrainState:
     del variables
     config = replace(config, run_id=config.run_id or f"grpo_reasoning_{datetime.now(UTC):%Y%m%d-%H%M%S-%f}")
     run_dir = f"{config.log_dir.rstrip('/')}/{config.run_id}"
-    log_init(f"Checking for saved training state: {run_dir}/checkpoint.msgpack (reading if present)")
-    saved = read_optional(f"{run_dir}/checkpoint.msgpack")
-    key, start_iteration, prompts_seen = jax.random.key(config.seed), 0, 0
-    if saved is not None:
-        log_init(f"Training checkpoint read ({len(saved) / 1_000_000:.1f} MB); restoring model, optimizer, and RNG")
-        state, key, start_iteration, prompts_seen = restore_training_checkpoint(saved, state)
-        print(
-            f"Restored {run_dir}/checkpoint.msgpack at rollout {start_iteration}, optimizer step {int(state.step)}",
-            flush=True,
-        )
-    else:
-        log_init("No training checkpoint found; starting from pretrained weights")
-    log_init(f"Writing run configuration: {run_dir}/config.yaml")
-    write_bytes(f"{run_dir}/config.yaml", yaml.safe_dump(asdict(config)).encode())
-    last_checkpoint = monotonic()
-    batch_size = config.num_tasks * config.group_size
-    first_log_iteration = (start_iteration // config.log_interval + 1) * config.log_interval
-    print(f"Run: {run_dir}; devices: {devices}; starting at rollout {start_iteration}", flush=True)
-    log_init(f"Opening TensorBoard writer: {run_dir}")
-    with SummaryWriter(logdir=run_dir, purge_step=prompts_seen + 1 if saved else None) as writer:
-        writer.add_text("config", f"```yaml\n{yaml.safe_dump(asdict(config))}```", prompts_seen)
-        log_init("Initialization complete")
-        window_timings: dict[str, float] = {}
-        window_rollouts = 0
-        window_start = monotonic()
-        for iteration in range(start_iteration, config.total_updates):
-            if iteration == start_iteration:
-                print("[startup] Collecting first rollout; generation may trigger JAX compilation", flush=True)
-            batch, diagnostics, samples, key = collect_rollout(
-                state,
-                model,
-                ref_params,
-                dataset,
-                tokenizer,
-                key,
-                iteration,
-                config,
-            )
-            if iteration == start_iteration:
-                print(
-                    "[startup] First rollout collected; starting optimization (may trigger JAX compilation)", flush=True
+    log_init(f"Checking for saved training state: {run_dir}/checkpoints")
+    with closing(checkpoint_manager(run_dir)) as manager:
+        saved = restore_training_checkpoint(manager, state)
+        if saved is None:
+            legacy = read_optional(f"{run_dir}/checkpoint.msgpack")
+            if legacy is not None:
+                saved = restore_legacy_training_checkpoint(legacy, state)
+            del legacy
+        key = jax.random.key(config.seed)  # () typed PRNG key
+        start_iteration, prompts_seen = 0, 0
+        if saved is not None:
+            state, key, start_iteration, prompts_seen = saved
+            log_init(f"Restored training checkpoint at rollout {start_iteration}, optimizer step {int(state.step)}")
+        else:
+            log_init("No training checkpoint found; starting from pretrained weights")
+        log_init(f"Writing run configuration: {run_dir}/config.yaml")
+        write_bytes(f"{run_dir}/config.yaml", yaml.safe_dump(asdict(config)).encode())
+        last_checkpoint = monotonic()
+        first_log_iteration = (start_iteration // config.log_interval + 1) * config.log_interval
+        log_init(f"Opening MLflow logger: {config.run_id}")
+        with MLflowLogger(experiment="grpo_reasoning", run_name=config.run_id, resume=True) as writer:
+            del saved
+            print(f"Run: {run_dir}; devices: {devices}; starting at rollout {start_iteration}", flush=True)
+            print(f"MLflow run: {writer.run_id}", flush=True)
+            writer.log_text(yaml.safe_dump(asdict(config)), f"config/{prompts_seen}.yaml")
+            writer.log_params(asdict(config))
+            writer.log_text(str(devices), f"devices/{prompts_seen}.txt")
+            writer.log_metrics({"model/params_millions": parameter_count / 1_000_000}, prompts_seen)
+            writer.log_text(str(parameter_count), f"model/parameter_count/{prompts_seen}.txt")
+            log_init("Initialization complete")
+            window_timings: dict[str, float] = {}
+            window_rollouts = 0
+            window_start = monotonic()
+            for iteration in range(start_iteration, config.total_updates):
+                result = train_step(
+                    state,
+                    model,
+                    ref_params,
+                    dataset,
+                    tokenizer,
+                    key,
+                    iteration,
+                    config,
+                    log_startup=iteration == start_iteration,
                 )
-            metrics: list[Metrics] = []
-            update_start = monotonic()
-            for _ in range(config.update_epochs):
-                key, shuffle_key = jax.random.split(key)
-                for indices in np.split(
-                    np.asarray(jax.random.permutation(shuffle_key, batch_size)), config.num_minibatches
-                ):
-                    minibatch = GRPOBatch(*(x[indices] for x in batch))
-                    state, metric = update(
-                        state,
-                        model,
-                        minibatch,
-                        temperature=config.temperature,
-                        clip_coef=config.clip_coef,
-                        beta=config.beta,
+                state, key = result.state, result.key  # key: () typed PRNG key
+                metrics = result.metrics  # Scalar leaves per update.
+                diagnostics, samples = result.diagnostics, result.samples
+                window_rollouts += 1
+                for name, value in diagnostics.items():
+                    if name.startswith("time/"):
+                        window_timings[name] = window_timings.get(name, 0.0) + value
+                completed = iteration + 1
+                prompts_seen += config.num_tasks
+                summary = f"rollout_batches={completed} reward={diagnostics['charts/reward_mean']:.3f}"
+                log_interval_reached = completed % config.log_interval == 0 or completed == config.total_updates
+                if log_interval_reached:
+                    # Updates stay asynchronous inside the window. Charge the final
+                    # outstanding work here; generation already waits for CPU scoring.
+                    wait_start = monotonic()
+                    jax.block_until_ready((state, metrics))
+                    wait_seconds = monotonic() - wait_start
+                    window_timings["time/jax_wait_seconds"] = wait_seconds
+                    window_timings["time/jax_seconds"] += wait_seconds
+                    window_timings["time/window_seconds"] = monotonic() - window_start
+                    window_timings["time/iteration_seconds"] = window_timings["time/window_seconds"] / window_rollouts
+                    means = {name: float(np.mean([m[name] for m in jax.device_get(metrics)])) for name in metrics[0]}
+                    writer.log_metrics(
+                        {
+                            **diagnostics,
+                            **means,
+                            **window_timings,
+                            "time/window_rollouts": window_rollouts,
+                        },
+                        prompts_seen,
                     )
-                    metrics.append(metric)
-            diagnostics["time/update_dispatch_seconds"] = monotonic() - update_start
-            diagnostics["time/jax_seconds"] += diagnostics["time/update_dispatch_seconds"]
-            window_rollouts += 1
-            for name, value in diagnostics.items():
-                if name.startswith("time/"):
-                    window_timings[name] = window_timings.get(name, 0.0) + value
-            completed = iteration + 1
-            prompts_seen += config.num_tasks
-            summary = f"rollout_batches={completed} reward={diagnostics['charts/reward_mean']:.3f}"
-            log_interval_reached = completed % config.log_interval == 0 or completed == config.total_updates
-            if log_interval_reached:
-                # Updates stay asynchronous inside the window. Charge the final
-                # outstanding work here; generation already waits for CPU scoring.
-                wait_start = monotonic()
-                jax.block_until_ready((state, metrics))
-                wait_seconds = monotonic() - wait_start
-                window_timings["time/jax_wait_seconds"] = wait_seconds
-                window_timings["time/jax_seconds"] += wait_seconds
-                window_timings["time/window_seconds"] = monotonic() - window_start
-                window_timings["time/iteration_seconds"] = window_timings["time/window_seconds"] / window_rollouts
-                means = {name: float(np.mean([m[name] for m in jax.device_get(metrics)])) for name in metrics[0]}
-                for name, value in {
-                    **diagnostics,
-                    **means,
-                    **window_timings,
-                    "time/window_rollouts": window_rollouts,
-                }.items():
-                    writer.add_scalar(name, value, prompts_seen)
-                writer.add_text("samples/completions", samples, prompts_seen)
-                writer.flush()
-                summary += (
-                    f" loss={means['losses/total']:.4f} window_rollouts={window_rollouts}"
-                    f" jax={window_timings['time/jax_seconds']:.3f}s"
-                    f" scoring={window_timings['time/scoring_seconds']:.3f}s"
-                    f" decode={window_timings['time/decoding_seconds']:.3f}s"
-                    f" window={window_timings['time/window_seconds']:.3f}s"
-                )
-                window_timings = {}
-                window_rollouts = 0
-                window_start = monotonic()
-            if completed <= first_log_iteration or log_interval_reached:
-                print(summary, flush=True)
-            if monotonic() - last_checkpoint >= config.checkpoint_interval_seconds or completed == config.total_updates:
-                save_training_checkpoint(run_dir, state, key, completed, config, prompts_seen=prompts_seen)
-                last_checkpoint = monotonic()
-                print(f"Saved {run_dir}/checkpoint.msgpack at rollout {completed}", flush=True)
-    # Export in the source model format; inference exports are local-only.
-    if not run_dir.startswith("gs://"):
-        export = Path(run_dir) / f"model-{max(start_iteration, config.total_updates)}"
-        if not export.exists():
-            if isinstance(model, Gemma3LM):
-                save_gemma3_checkpoint(export, jax.device_get(state.params))
-            else:
-                save_checkpoint(export, model, jax.device_get(state.params), {"task": config.task})
+                    writer.log_text(samples, f"samples/completions/{prompts_seen}.md")
+                    summary += (
+                        f" loss={means['losses/total']:.4f} window_rollouts={window_rollouts}"
+                        f" jax={window_timings['time/jax_seconds']:.3f}s"
+                        f" scoring={window_timings['time/scoring_seconds']:.3f}s"
+                        f" decode={window_timings['time/decoding_seconds']:.3f}s"
+                        f" window={window_timings['time/window_seconds']:.3f}s"
+                    )
+                    window_timings = {}
+                    window_rollouts = 0
+                    window_start = monotonic()
+                if completed <= first_log_iteration or log_interval_reached:
+                    print(summary, flush=True)
+                if (
+                    monotonic() - last_checkpoint >= config.checkpoint_interval_seconds
+                    or completed == config.total_updates
+                ):
+                    save_training_checkpoint(manager, state, key, completed, config, prompts_seen=prompts_seen)
+                    last_checkpoint = monotonic()
+                    print(f"Saved {run_dir}/checkpoints at rollout {completed}", flush=True)
+            # Export in the source model format; inference exports are local-only.
+            if not run_dir.startswith("gs://"):
+                export = Path(run_dir) / f"model-{max(start_iteration, config.total_updates)}"
+                if not export.exists():
+                    save_gemma3_checkpoint(export, jax.device_get(state.params))
     return state
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/grpo_reasoning.yaml", help="Path to YAML config")
+    parser.add_argument("--config", default="configs/grpo_reasoning/gemma3.yaml", help="Path to YAML config")
     args = parser.parse_args()
     print(f"[init] Loading configuration: {args.config}", flush=True)
     train(load_config(args.config))

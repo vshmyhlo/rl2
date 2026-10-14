@@ -32,9 +32,9 @@ max_grad_norm: 0.5
 ckpt_dir: /runs/mappo/${run_id}
 run_id: mappo_${path_name:${env.id}}_${path_name:${env.map_name}}_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
-# Video, checkpoint, and eval: every 20% of training, rounded up; also run on completion.
+# Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
 log_interval: 10
-video_interval: 122
+video_interval: 61
 video_max_frames: 900
 video_fps: 5
 checkpoint_interval: 122

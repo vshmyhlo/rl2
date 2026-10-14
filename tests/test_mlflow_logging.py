@@ -118,6 +118,14 @@ def test_metrics_artifacts_and_resume(client: MlflowClient) -> None:
         assert fresh.run_id != run_id
 
 
+def test_resume_run_left_running(client: MlflowClient) -> None:
+    logger = MLflowLogger(experiment="ppo", run_name="interrupted-before-checkpoint", resume=True)
+    assert client.get_run(logger.run_id).info.status == "RUNNING"
+    with MLflowLogger(experiment="ppo", run_name="interrupted-before-checkpoint", resume=True) as resumed:
+        assert resumed.run_id == logger.run_id
+    assert client.get_run(logger.run_id).info.status == "FINISHED"
+
+
 def test_experiment_id_and_run_name(client: MlflowClient, monkeypatch: pytest.MonkeyPatch) -> None:
     experiment = client.get_experiment_by_name("logging-tests")
     assert experiment is not None

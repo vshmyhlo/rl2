@@ -35,10 +35,11 @@ ckpt_dir: runs/ppo/${run_id}
 run_id: ppo_${path_name:${env.id}}_${env.task}_seed${seed}
 checkpoint_interval: 489
 log_interval: 10
-# Enable video/evaluation with an available OpenGL backend (e.g. MUJOCO_GL=egl).
-video_interval: 0
+# Video/evaluation require an available OpenGL backend (e.g. MUJOCO_GL=egl).
+# Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
+video_interval: 245
 video_max_frames: 150
 video_fps: 50.0
-eval_interval: 0
+eval_interval: 489
 eval_episodes: 10
 eval_seed: 10000

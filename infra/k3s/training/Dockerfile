@@ -1,10 +1,12 @@
 FROM python:3.12-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential git ffmpeg libgl1 libglib2.0-0 libgomp1 \
+    build-essential git ffmpeg libegl1 libgl1 libopengl0 libglib2.0-0 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=ghcr.io/astral-sh/uv:0.12.21 /uv /usr/local/bin/uv
 WORKDIR /app
 ENV UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never PYTHONUNBUFFERED=1
+# Request host rendering drivers at container creation, before uv loads nvida.env.
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
 # Keep the large dependency layer independent of source and documentation edits.
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \

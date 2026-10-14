@@ -35,7 +35,7 @@ log_every: 10 # Print training metrics every N updates
 log_flush_secs: 30 # Background TensorBoard flush interval; also flush after progress reports and videos
 checkpoint_dir: gs://cohere-dev/vlad/rl2_cp/wm # Same run name as log_dir; latest Orbax <update>/ checkpoint and config.json
 checkpoint_every: 500 # Optimizer updates, plus the final checkpoint of each run
-video_every_steps: 100000 # Online-only collected transitions between videos; 0 disables online videos
+video_every_steps: 5000000 # Every 10% of online training transitions; 0 disables online videos
 video_prefill_frames: 10 # Shared real context before the real/posterior/prior comparison
 video_num_steps: 64 # Recorded future transitions compared side by side; needs 74 same-episode frames total
 video_fps: 15 # Matches 60 Hz emulator / action repeat 4

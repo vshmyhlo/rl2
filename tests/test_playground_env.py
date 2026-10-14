@@ -77,6 +77,7 @@ def test_invalid_settings(settings: dict[str, object], match: str) -> None:
     "env_id,encoder,match",
     [
         ("MuJoCo-Playground", "rgb", "requires model.encoder.type: mlp"),
+        ("Brax", "rgb", "requires model.encoder.type: mlp"),
         ("Breakout-MinAtar", "mlp", "mlp encoder requires"),
     ],
 )

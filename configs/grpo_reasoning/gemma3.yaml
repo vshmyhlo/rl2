@@ -1,8 +1,6 @@
-# uv run --extra cuda12 --extra gemma3 python -m rl2.train_grpo_reasoning --config configs/grpo_reasoning_gemma3.yaml
-model_type: gemma3
-checkpoint: gs://gemma-data/checkpoints/gemma3-270m-pt # Or a local native Gemma/Orbax checkpoint
+# uv run python -m rl2.train_grpo_reasoning --config configs/grpo_reasoning/gemma3.yaml
+checkpoint: gs://gemma-data/checkpoints/gemma3-270m-it # Instruction-tuned; or a local native Gemma/Orbax checkpoint
 tokenizer: null # Official Gemma 3 tokenizer; or a local/gs:// SentencePiece .model file
-backend: jax # Gemma uses JAX attention on CPU/GPU; triton is GDN2-only
 dtype: bfloat16
 
 task: basic_arithmetic
@@ -18,11 +16,13 @@ task_config:
 prompt_examples:
   - question: Calculate 2 + 3.
     completion: |-
-      2 + 3 = 5.
+      <calculator>2 + 3</calculator>
+      <result>5</result>
       <answer>5</answer>
   - question: Calculate 0 + 7.
     completion: |-
-      0 + 7 = 7.
+      <calculator>0 + 7</calculator>
+      <result>7</result>
       <answer>7</answer>
 seed: 1
 total_updates: 1000
@@ -31,8 +31,10 @@ num_tasks: 1
 group_size: 4
 num_minibatches: 4
 update_epochs: 1
-max_prompt_tokens: 128
-max_new_tokens: 64
+max_prompt_tokens: 256
+# Total transcript budget: model tokens plus inserted calculator results.
+max_new_tokens: 128
+calculator_max_calls: 2 # Set to 0 to disable calculator access.
 temperature: 1.0
 learning_rate: 1.0e-6
 clip_coef: 0.2
@@ -40,7 +42,7 @@ beta: 0.0
 duration_penalty_coef: 0.1
 max_grad_norm: 1.0
 log_dir: runs
-run_id: gemma3_270m_official_arithmetic
+run_id: gemma3_270m_calculator_arithmetic
 log_interval: 10
 log_completion_count: 4
 checkpoint_interval_seconds: 600

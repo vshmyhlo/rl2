@@ -1,7 +1,8 @@
-from dataclasses import replace
+from contextlib import closing
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, call
 
 import jax
 import jax.numpy as jnp
@@ -9,17 +10,15 @@ import numpy as np
 import pytest
 import reasoning_gym
 from flax import serialization
+from gemma_helpers import tiny_gemma_model
 
 from rl2 import train_grpo_reasoning as grpo
-from rl2.gdn2 import GatedDeltaNet2Config, GatedDeltaNet2LM
-from rl2.gdn2.checkpoints import Parameters, load_checkpoint, save_checkpoint
+from rl2.gemma3 import Gemma3LM, Parameters
 
 
 @pytest.fixture(scope="module")
-def tiny_model() -> tuple[GatedDeltaNet2LM, Parameters]:
-    model = GatedDeltaNet2LM(GatedDeltaNet2Config(hidden_size=2, head_dim=2, num_heads=1, conv_size=2), 1, 3, 5)
-    variables = model.init(jax.random.key(1), jnp.array([[1, 3]], jnp.int32), jnp.array([2], jnp.int32))
-    return model, variables["params"]
+def tiny_model() -> tuple[Gemma3LM, Parameters]:
+    return tiny_gemma_model()
 
 
 def make_batch() -> grpo.GRPOBatch:
@@ -34,12 +33,14 @@ def make_batch() -> grpo.GRPOBatch:
     )
 
 
-def test_cached_sampling_matches_packed_replay_and_eos(tiny_model: tuple[GatedDeltaNet2LM, Parameters]) -> None:
+def test_cached_sampling_matches_packed_replay_and_eos(tiny_model: tuple[Gemma3LM, Parameters]) -> None:
     model, params = tiny_model
     batch = make_batch()
     key = jax.random.key(8)
     args = {"group_size": 2, "max_new_tokens": 3, "temperature": 0.7}
-    tokens, _, _, _ = grpo.generate(model, params, batch.prompts, batch.prompt_lengths, key, eos_token_id=-1, **args)
+    tokens, _, _, _ = grpo.generate(
+        model, params, batch.prompts, batch.prompt_lengths, key, stop_token_ids=(-1,), **args
+    )
     eos = int(tokens[0, 0])
     tokens, old, mask, next_key = grpo.generate(
         model,
@@ -47,7 +48,7 @@ def test_cached_sampling_matches_packed_replay_and_eos(tiny_model: tuple[GatedDe
         batch.prompts,
         batch.prompt_lengths,
         key,
-        eos_token_id=eos,
+        stop_token_ids=(eos,),
         **args,
     )
     assert mask[0].tolist() == [True, False, False]
@@ -64,14 +65,14 @@ def test_cached_sampling_matches_packed_replay_and_eos(tiny_model: tuple[GatedDe
     )
     replay = grpo.completion_log_probs(model, params, repeated, 0.7)
     np.testing.assert_allclose(replay, old, atol=2e-6)
-    again = grpo.generate(model, params, batch.prompts, batch.prompt_lengths, key, eos_token_id=eos, **args)
+    again = grpo.generate(model, params, batch.prompts, batch.prompt_lengths, key, stop_token_ids=(eos,), **args)
     for actual, expected in zip(again[:3], (tokens, old, mask), strict=True):
         np.testing.assert_array_equal(actual, expected)
     np.testing.assert_array_equal(jax.random.key_data(again[3]), jax.random.key_data(next_key))
     assert not np.array_equal(jax.random.key_data(key), jax.random.key_data(next_key))
 
 
-def test_replay_matches_independent_unpadded_sequences(tiny_model: tuple[GatedDeltaNet2LM, Parameters]) -> None:
+def test_replay_matches_independent_unpadded_sequences(tiny_model: tuple[Gemma3LM, Parameters]) -> None:
     model, params = tiny_model
     batch = make_batch()
     actual = grpo.completion_log_probs(model, params, batch, 0.7)
@@ -114,7 +115,7 @@ def test_group_advantages_and_clipped_sequence_weighting() -> None:
 
 
 def test_update_and_resumable_checkpoint(
-    tiny_model: tuple[GatedDeltaNet2LM, Parameters],
+    tiny_model: tuple[Gemma3LM, Parameters],
     tmp_path: Path,
 ) -> None:
     model, params = tiny_model
@@ -143,10 +144,16 @@ def test_update_and_resumable_checkpoint(
         not np.array_equal(a, b)
         for a, b in zip(jax.tree.leaves(state.params), jax.tree.leaves(updated.params), strict=True)
     )
-    key = jax.random.key(42)
-    grpo.save_training_checkpoint(str(tmp_path), updated, key, 3, config, prompts_seen=3)
-    data = (tmp_path / "checkpoint.msgpack").read_bytes()
-    restored, restored_key, iteration, prompts_seen = grpo.restore_training_checkpoint(data, state)
+    key = jax.random.key(42)  # () typed PRNG key
+    with closing(grpo.checkpoint_manager(str(tmp_path))) as manager:
+        assert grpo.restore_training_checkpoint(manager, state) is None
+        grpo.save_training_checkpoint(manager, updated, key, 3, config, prompts_seen=3)
+    with closing(grpo.checkpoint_manager(str(tmp_path))) as manager:
+        progress = grpo.restore_training_checkpoint(manager, state)
+        assert progress is not None
+        restored, restored_key, iteration, prompts_seen = progress
+        metadata = manager.restore(3, args=grpo.ocp.args.Composite(metadata=grpo.ocp.args.JsonRestore())).metadata
+        assert metadata["config"] == asdict(config)
     assert iteration == 3 and prompts_seen == 3
     for a, b in zip(jax.tree.leaves(updated), jax.tree.leaves(restored), strict=True):
         np.testing.assert_array_equal(a, b)
@@ -156,14 +163,6 @@ def test_update_and_resumable_checkpoint(
     next_restored, _ = grpo.update(restored, model, batch, temperature=1.0, clip_coef=0.2, beta=0.01)
     for a, b in zip(jax.tree.leaves(next_state), jax.tree.leaves(next_restored), strict=True):
         np.testing.assert_array_equal(a, b)
-    payload = serialization.msgpack_restore(data)
-    payload["version"] = 999
-    with pytest.raises(ValueError, match="version"):
-        grpo.restore_training_checkpoint(serialization.msgpack_serialize(payload), state)
-    save_checkpoint(tmp_path / "export", model, jax.device_get(updated.params), {})
-    _, loaded = load_checkpoint(tmp_path / "export")
-    for a, b in zip(jax.tree.leaves(updated.params), jax.tree.leaves(loaded["params"]), strict=True):
-        np.testing.assert_array_equal(a, b)
 
 
 def test_resume_uses_current_learning_rate_and_accepts_legacy_config(tmp_path: Path) -> None:
@@ -172,28 +171,40 @@ def test_resume_uses_current_learning_rate_and_accepts_legacy_config(tmp_path: P
     state = grpo.create_state(model, {"weight": jnp.array([1.0, 2.0], jnp.float32)}, config)
     grads = {"weight": jnp.array([0.2, -0.1], jnp.float32)}
     state = state.apply_gradients(grads=grads)
-    key = jax.random.key(7)
-    grpo.save_training_checkpoint(str(tmp_path), state, key, 12, config, prompts_seen=24)
-    payload = serialization.msgpack_restore((tmp_path / "checkpoint.msgpack").read_bytes())
+    key = jax.random.key(7)  # () typed PRNG key
+    with closing(grpo.checkpoint_manager(str(tmp_path))) as manager:
+        grpo.save_training_checkpoint(manager, state, key, 12, config, prompts_seen=31)
+    payload = {
+        "version": 1,
+        "state": serialization.to_state_dict(state),
+        "key": np.asarray(jax.random.key_data(key)),  # (2,) raw PRNG words
+        "key_impl": str(jax.random.key_impl(key)),
+        "iteration": 12,
+    }
     # Older checkpoints stored only a subset of the configuration.
     payload["config"] = {"temperature": 1.0, "learning_rate": 0.001, "num_tasks": 2}
-    payload.pop("prompts_seen")
     new_config = replace(config, learning_rate=0.002, temperature=0.5, num_tasks=4, group_size=8)
     template = grpo.create_state(model, {"weight": jnp.zeros(2, jnp.float32)}, new_config)
-    restored, restored_key, iteration, prompts_seen = grpo.restore_training_checkpoint(
+    restored, restored_key, iteration, prompts_seen = grpo.restore_legacy_training_checkpoint(
         serialization.msgpack_serialize(payload),
         template,
     )
     assert iteration == 12 and int(restored.step) == 1 and prompts_seen == 24
     # Explicit cumulative counts take precedence after task batch sizes have changed.
     payload["prompts_seen"] = 31
-    assert grpo.restore_training_checkpoint(serialization.msgpack_serialize(payload), template)[3] == 31
+    assert grpo.restore_legacy_training_checkpoint(serialization.msgpack_serialize(payload), template)[3] == 31
     payload["prompts_seen"] = -1
     with pytest.raises(ValueError, match="prompts_seen"):
-        grpo.restore_training_checkpoint(serialization.msgpack_serialize(payload), template)
+        grpo.restore_legacy_training_checkpoint(serialization.msgpack_serialize(payload), template)
     np.testing.assert_array_equal(jax.random.key_data(restored_key), jax.random.key_data(key))
     for actual, expected in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
         np.testing.assert_array_equal(actual, expected)
+    with closing(grpo.checkpoint_manager(str(tmp_path))) as manager:
+        progress = grpo.restore_training_checkpoint(manager, template)
+        assert progress is not None
+        restored = progress.state
+        assert progress.prompts_seen == 31
+        np.testing.assert_array_equal(jax.random.key_data(progress.key), jax.random.key_data(key))
     old_next = state.apply_gradients(grads=grads)
     new_next = restored.apply_gradients(grads=grads)
     # The saved Adam history is retained, but doubling the configured LR doubles the next update.
@@ -208,18 +219,48 @@ def test_resume_uses_current_learning_rate_and_accepts_legacy_config(tmp_path: P
 def test_resume_rejects_incompatible_state(mismatch: str, tmp_path: Path) -> None:
     config = grpo.Config()
     state = grpo.create_state(Mock(), {"weight": jnp.ones(2, jnp.float32)}, config)
-    grpo.save_training_checkpoint(str(tmp_path), state, jax.random.key(1), 0, config, prompts_seen=0)
-    payload = serialization.msgpack_restore((tmp_path / "checkpoint.msgpack").read_bytes())
+    incompatible = state
     if mismatch == "shape":
-        payload["state"]["params"]["weight"] = np.ones(3, np.float32)
+        incompatible = state.replace(params={"weight": jnp.ones(3, jnp.float32)})  # weight: (3,)
     elif mismatch == "dtype":
-        payload["state"]["params"]["weight"] = np.ones(2, np.float16)
+        incompatible = state.replace(params={"weight": jnp.ones(2, jnp.float16)})  # weight: (2,)
     elif mismatch == "extra_parameter":
-        payload["state"]["params"]["extra"] = np.ones(2, np.float32)
+        incompatible = state.replace(params={**state.params, "extra": jnp.ones(2, jnp.float32)})  # extra: (2,)
     else:
-        payload["state"]["opt_state"] = {}
-    with pytest.raises(ValueError, match="model/optimizer.*incompatible"):
-        grpo.restore_training_checkpoint(serialization.msgpack_serialize(payload), state)
+        incompatible = state.replace(opt_state={})
+    with closing(grpo.checkpoint_manager(str(tmp_path))) as manager:
+        grpo.save_training_checkpoint(manager, incompatible, jax.random.key(1), 0, config, prompts_seen=0)
+        with pytest.raises(ValueError, match="model/optimizer.*incompatible"):
+            grpo.restore_training_checkpoint(manager, state)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [("version", 999, "version"), ("iteration", 2, "iteration"), ("prompts_seen", -1, "prompts_seen")],
+)
+def test_resume_rejects_invalid_metadata(field: str, value: int, error: str) -> None:
+    metadata = {"version": 1, "iteration": 1, "prompts_seen": 2, field: value}
+    manager = Mock(spec=grpo.ocp.CheckpointManager)
+    manager.latest_step.return_value = 1
+    manager.restore.return_value.metadata = metadata
+    with pytest.raises(ValueError, match=error):
+        grpo.restore_training_checkpoint(manager, Mock(spec=grpo.TrainState))
+
+
+def test_checkpoint_retention_and_rng_implementation(tmp_path: Path) -> None:
+    config = grpo.Config()
+    state = grpo.create_state(Mock(), {"weight": jnp.ones(2, jnp.float32)}, config)  # weight: (2,)
+    key = jax.random.key(7, impl="rbg")  # () typed PRNG key, four raw words
+    with closing(grpo.checkpoint_manager(str(tmp_path))) as manager:
+        for iteration in range(3):
+            grpo.save_training_checkpoint(manager, state, key, iteration, config, prompts_seen=iteration * 2)
+        assert manager.all_steps() == [1, 2]
+        progress = grpo.restore_training_checkpoint(manager, state)
+        assert progress is not None
+        assert progress.iteration == 2 and progress.prompts_seen == 4
+        assert progress.key.shape == ()
+        assert jax.random.key_impl(progress.key) == jax.random.key_impl(key)
+        np.testing.assert_array_equal(jax.random.key_data(progress.key), jax.random.key_data(key))
 
 
 class FakeTokenizer:
@@ -229,8 +270,11 @@ class FakeTokenizer:
     def eos_id(self) -> int:
         return 2
 
+    def stop_ids(self) -> tuple[int, ...]:
+        return (self.eos_id(),)
+
     def vocab_size(self) -> int:
-        return 5
+        return 8
 
     def encode(self, text: str, *, out_type: type[int], add_bos: bool, add_eos: bool) -> list[int]:
         assert "<answer>" in text and "Question:" in text
@@ -248,13 +292,13 @@ def test_prompts_and_real_reasoning_gym_rewards() -> None:
     tokenizer = Mock(wraps=FakeTokenizer())
     tokens, lengths = grpo.encode_prompts(entries, tokenizer, 3)
     prompt = tokenizer.encode.call_args_list[0].args[0]
-    assert prompt.startswith("Answer only the last question.\nGive brief reasoning,")
+    assert prompt.startswith("<start_of_turn>user\nAnswer only the last question.\nGive brief reasoning,")
     assert "Finish immediately after </answer>." in prompt
     assert "Question: How many legs are there in total if you have " in prompt
     assert "Your task is to count" not in prompt
     assert "Now, how many" not in prompt
     assert "\n\n\n" not in prompt
-    assert prompt.endswith("?\n\nAnswer:")
+    assert prompt.endswith("?\n\nAnswer:<end_of_turn>\n<start_of_turn>model\n")
     np.testing.assert_array_equal(tokens, [[1, 3, 0], [1, 3, 0]])
     np.testing.assert_array_equal(lengths, [2, 2])
     with pytest.raises(ValueError, match="Increase max_prompt_tokens"):
@@ -278,7 +322,9 @@ def test_prompt_examples_precede_question_without_leaking_target_answer() -> Non
     grpo.encode_prompts([entry], tokenizer, 3, examples)
     prompt = tokenizer.encode.call_args.args[0]
     assert "Question: How many legs do two dogs have?\n\nAnswer: 2 * 4 = 8.\n<answer>8</answer>" in prompt
-    assert prompt.endswith("Question: How many legs do three spiders have?\n\nAnswer:")
+    assert prompt.endswith(
+        "Question: How many legs do three spiders have?\n\nAnswer:<end_of_turn>\n<start_of_turn>model\n"
+    )
     assert "24" not in prompt
     assert "\n\n\n" not in prompt
     # Demonstration answers cannot earn reward for an empty generated completion.
@@ -290,7 +336,7 @@ def test_prompt_examples_precede_question_without_leaking_target_answer() -> Non
 def test_prompt_preserves_other_tasks_internal_layout() -> None:
     question = "  A B\nC   D\n\nExplain how to cross this grid."
     prompt = grpo.build_prompt(question + "\n\n")
-    assert prompt.endswith(f"Question: {question}\n\nAnswer:")
+    assert prompt.endswith(f"Question: {question}\n\nAnswer:<end_of_turn>\n<start_of_turn>model\n")
 
 
 def test_format_group_samples_preserves_literal_multiline_text() -> None:
@@ -390,7 +436,7 @@ def test_duration_penalty_rewards_shorter_completions_and_ignores_padding() -> N
 
 
 def test_collect_rollout_grouping_and_reference(
-    tiny_model: tuple[GatedDeltaNet2LM, Parameters],
+    tiny_model: tuple[Gemma3LM, Parameters],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model, params = tiny_model
@@ -476,15 +522,14 @@ def test_config_validation(overrides: dict[str, Any], match: str) -> None:
 
 
 def test_yaml_config(tmp_path: Path) -> None:
-    config = grpo.load_config("configs/grpo_reasoning.yaml")
+    config = grpo.load_config("configs/grpo_reasoning/gemma3.yaml")
     assert config.task == "basic_arithmetic"
     assert config.duration_penalty_coef == 0.1
-    assert config.group_size == 8 and config.total_updates == 100000
+    assert config.group_size == 4 and config.total_updates == 1000
     assert config.task_config["min_terms"] == 2
-    assert config.task_config["max_terms"] == 3
+    assert config.task_config["max_terms"] == 2
     dataset = reasoning_gym.create_dataset(config.task, seed=config.seed, size=5, **config.task_config)
-    # These indices exercise both term-count boundaries with the configured seed.
-    for index, num_terms in ((0, 2), (4, 3)):
+    for index, num_terms in ((0, 2),):
         entry = dataset[index]
         parts = entry["metadata"]["expression"].split()
         operands = [int(value) for value in parts[::2]]
@@ -531,26 +576,81 @@ def test_initialization_reports_stage_before_checkpoint_load_failure(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(grpo.reasoning_gym, "create_dataset", Mock())
-    monkeypatch.setattr(grpo, "load_tokenizer", Mock(return_value=FakeTokenizer()))
-    monkeypatch.setattr(grpo, "load_checkpoint", Mock(side_effect=OSError("checkpoint unavailable")))
+    monkeypatch.setattr(grpo, "Gemma3Tokenizer", Mock(return_value=FakeTokenizer()))
+    monkeypatch.setattr(grpo, "load_gemma3_checkpoint", Mock(side_effect=OSError("checkpoint unavailable")))
     with pytest.raises(OSError, match="checkpoint unavailable"):
         grpo.train(grpo.Config(checkpoint="missing-checkpoint"))
     output = capsys.readouterr().out
     assert "[init +" in output
     assert "Initializing JAX devices" in output
-    assert "Loading pretrained checkpoint: missing-checkpoint (backend=jax, dtype=float32)" in output
+    assert "Loading pretrained checkpoint: missing-checkpoint (dtype=float32)" in output
     assert "Pretrained checkpoint loaded" not in output
     assert "Initialization complete" not in output
 
 
+@pytest.mark.parametrize(
+    "num_minibatches", [pytest.param(1, id="full-batch"), pytest.param(2, id="singleton-minibatches")]
+)
+def test_train_step(
+    tiny_model: tuple[Gemma3LM, Parameters],
+    monkeypatch: pytest.MonkeyPatch,
+    num_minibatches: int,
+) -> None:
+    model, params = tiny_model  # params: model parameter pytree
+    config = grpo.Config(num_tasks=1, group_size=2, num_minibatches=num_minibatches, update_epochs=2)
+    state = grpo.create_state(model, params, config)
+    batch = make_batch()  # leaves: (B=2, ...)
+    key, rollout_key = jax.random.split(jax.random.key(0))  # each () typed PRNG key
+    dataset = Mock(spec=grpo.ProceduralDataset)
+    tokenizer = FakeTokenizer()
+    collect = Mock(return_value=(batch, {"charts/reward_mean": 0.5, "time/jax_seconds": 1.0}, "preview", rollout_key))
+    monkeypatch.setattr(grpo, "collect_rollout", collect)
+    monkeypatch.setattr(grpo, "monotonic", Mock(side_effect=[10.0, 10.25]))
+    seen: list[int] = []
+
+    def update(
+        state: grpo.TrainState,
+        model: Gemma3LM,
+        minibatch: grpo.GRPOBatch,  # leaves: (B/M, ...)
+        *,
+        temperature: float,
+        clip_coef: float,
+        beta: float,
+    ) -> tuple[grpo.TrainState, grpo.Metrics]:
+        assert (temperature, clip_coef, beta) == (config.temperature, config.clip_coef, config.beta)
+        row_ids = minibatch.prompts[:, 1] - 3  # (B/M,); distinguish the two source rows
+        seen.extend(row_ids.tolist())
+        for actual, original in zip(minibatch, batch, strict=True):  # (B/M, ...), (B, ...)
+            assert actual.shape == (2 // num_minibatches, *original.shape[1:])
+            np.testing.assert_array_equal(actual, original[row_ids])
+        step = state.step + 1  # ()
+        return state.replace(step=step), {"losses/total": jnp.asarray(step, dtype=jnp.float32)}  # scalar metric
+
+    monkeypatch.setattr(grpo, "update", update)
+    result = grpo.train_step(state, model, params, dataset, tokenizer, key, 3, config)
+    collect.assert_called_once_with(state, model, params, dataset, tokenizer, key, 3, config)
+    assert int(result.state.step) == 2 * num_minibatches
+    assert sorted(seen[:2]) == sorted(seen[2:]) == [0, 1]
+    assert len(result.metrics) == 2 * num_minibatches
+    assert all(metric["losses/total"].shape == () for metric in result.metrics)
+    assert [float(metric["losses/total"]) for metric in result.metrics] == list(range(1, 2 * num_minibatches + 1))
+    expected_key = jax.random.split(jax.random.split(rollout_key)[0])[0]  # () typed PRNG key
+    assert result.key.shape == ()
+    np.testing.assert_array_equal(jax.random.key_data(result.key), jax.random.key_data(expected_key))
+    assert result.diagnostics == {
+        "charts/reward_mean": 0.5,
+        "time/jax_seconds": 1.25,
+        "time/update_dispatch_seconds": 0.25,
+    }
+    assert result.samples == "preview"
+
+
 def test_training_loop_resume_and_logging_with_mocked_learning(
-    tiny_model: tuple[GatedDeltaNet2LM, Parameters],
+    tiny_model: tuple[Gemma3LM, Parameters],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from unittest.mock import MagicMock
-
     model, params = tiny_model
     config = grpo.Config(
         log_dir=str(tmp_path),
@@ -563,12 +663,15 @@ def test_training_loop_resume_and_logging_with_mocked_learning(
         update_epochs=2,
         beta=0,
     )
-    monkeypatch.setattr(grpo, "load_checkpoint", Mock(return_value=(model, {"params": params})))
-    monkeypatch.setattr(grpo, "load_tokenizer", Mock(return_value=FakeTokenizer()))
+    monkeypatch.setattr(grpo, "load_gemma3_checkpoint", Mock(return_value=(model, {"params": params})))
+    monkeypatch.setattr(grpo, "Gemma3Tokenizer", Mock(return_value=FakeTokenizer()))
     export = Mock()
-    monkeypatch.setattr(grpo, "save_checkpoint", export)
-    writer = MagicMock()
-    monkeypatch.setattr(grpo, "SummaryWriter", Mock(return_value=writer))
+    monkeypatch.setattr(grpo, "save_gemma3_checkpoint", export)
+    writer = MagicMock(spec=grpo.MLflowLogger)
+    writer.run_id = "mlflow-test"
+    writer.__enter__.return_value = writer
+    logger = Mock(return_value=writer)
+    monkeypatch.setattr(grpo, "MLflowLogger", logger)
     iterations: list[int] = []
     minibatch_sizes: list[int] = []
     now = [0.0]
@@ -586,14 +689,14 @@ def test_training_loop_resume_and_logging_with_mocked_learning(
 
     def collect(
         state: grpo.TrainState,
-        model: GatedDeltaNet2LM,
+        model: Gemma3LM,
         ref_params: Parameters,
         dataset: grpo.ProceduralDataset,
         tokenizer: grpo.Tokenizer,
-        key: jax.Array,
+        key: jax.Array,  # () typed PRNG key
         iteration: int,
         config: grpo.Config,
-    ) -> tuple[grpo.GRPOBatch, dict[str, float], str, jax.Array]:
+    ) -> tuple[grpo.GRPOBatch, dict[str, float], str, jax.Array]:  # key: ()
         assert ref_params == {}
         assert len(dataset) == config.total_updates * config.num_tasks
         if interrupt[0] and iteration == 5:
@@ -611,12 +714,14 @@ def test_training_loop_resume_and_logging_with_mocked_learning(
             "time/scoring_seconds": 0.125,
             "time/decoding_seconds": 0.25,
         }
-        batch = grpo.GRPOBatch(*(jnp.repeat(x, config.num_tasks, axis=0) for x in make_batch()))
-        return batch, diagnostics, "group preview", jax.random.split(key)[0]
+        batch = grpo.GRPOBatch(
+            *(jnp.repeat(x, config.num_tasks, axis=0) for x in make_batch())
+        )  # leaves: (2 * num_tasks, ...)
+        return batch, diagnostics, "group preview", jax.random.split(key)[0]  # key: ()
 
     def update(
         state: grpo.TrainState,
-        model: GatedDeltaNet2LM,
+        model: Gemma3LM,
         batch: grpo.GRPOBatch,
         *,
         temperature: float,
@@ -624,12 +729,20 @@ def test_training_loop_resume_and_logging_with_mocked_learning(
         beta: float,
     ) -> tuple[grpo.TrainState, grpo.Metrics]:
         minibatch_sizes.append(batch.prompts.shape[0])
-        return state.replace(step=state.step + 1), {"losses/total": jnp.array(0.0, jnp.float32)}
+        return state.replace(step=state.step + 1), {"losses/total": jnp.array(0.0, jnp.float32)}  # scalar metric
 
     monkeypatch.setattr(grpo, "collect_rollout", collect)
     monkeypatch.setattr(grpo, "update", update)
     with pytest.raises(RuntimeError, match="simulated interruption"):
         grpo.train(config)
+    logger.assert_called_once_with(experiment="grpo_reasoning", run_name="test", resume=True)
+    assert writer.__exit__.call_args.args[0] is RuntimeError
+    writer.log_params.assert_called_once_with(asdict(config))
+    writer.log_text.assert_any_call(grpo.yaml.safe_dump(asdict(config)), "config/0.yaml")
+    writer.log_text.assert_any_call(str(jax.devices()), "devices/0.txt")
+    parameter_count = sum(leaf.size for leaf in jax.tree.leaves(params))
+    writer.log_text.assert_any_call(str(parameter_count), "model/parameter_count/0.txt")
+    writer.log_metrics.assert_any_call({"model/params_millions": parameter_count / 1_000_000}, 0)
     initial_stdout = capsys.readouterr().out
     assert "No training checkpoint found; starting from pretrained weights" in initial_stdout
     stages = [
@@ -639,7 +752,7 @@ def test_training_loop_resume_and_logging_with_mocked_learning(
         "Model and optimizer ready",
         "Checking for saved training state:",
         "Writing run configuration:",
-        "Opening TensorBoard writer:",
+        "Opening MLflow logger:",
         "Initialization complete",
         "Collecting first rollout",
         "First rollout collected; starting optimization",
@@ -654,8 +767,9 @@ def test_training_loop_resume_and_logging_with_mocked_learning(
     ]
     # No save at 599 seconds; save at 600; no second save at 1199.
     assert [call.args[3] for call in save.call_args_list] == [4]
-    path = tmp_path / "test/checkpoint.msgpack"
-    assert serialization.msgpack_restore(path.read_bytes())["iteration"] == 4
+    path = tmp_path / "test"
+    with closing(grpo.checkpoint_manager(str(path))) as manager:
+        assert manager.latest_step() == 4
     export.assert_not_called()
     interrupt[0] = False
     resumed = grpo.train(
@@ -670,8 +784,7 @@ def test_training_loop_resume_and_logging_with_mocked_learning(
         )
     )
     resumed_stdout = capsys.readouterr().out
-    assert "Training checkpoint read" in resumed_stdout
-    assert "restoring model, optimizer, and RNG" in resumed_stdout
+    assert "Restored training checkpoint" in resumed_stdout
     assert "at rollout 4, optimizer step 16" in resumed_stdout
     assert "No training checkpoint found" not in resumed_stdout
     assert [line.split()[0] for line in resumed_stdout.splitlines() if line.startswith("rollout_batches=")] == [
@@ -684,14 +797,25 @@ def test_training_loop_resume_and_logging_with_mocked_learning(
     np.testing.assert_array_equal(*rollout_keys)
     # Final save happens even though fewer than 600 seconds elapsed since restart.
     assert [call.args[3] for call in save.call_args_list] == [4, 8]
-    assert serialization.msgpack_restore(path.read_bytes())["iteration"] == 8
-    assert grpo.SummaryWriter.call_args.kwargs["purge_step"] == 5
+    with closing(grpo.checkpoint_manager(str(path))) as manager:
+        assert manager.latest_step() == 8
+        metadata = manager.restore(8, args=grpo.ocp.args.Composite(metadata=grpo.ocp.args.JsonRestore())).metadata
+    assert logger.call_args_list == [
+        call(experiment="grpo_reasoning", run_name="test", resume=True),
+        call(experiment="grpo_reasoning", run_name="test", resume=True),
+    ]
+    writer.__exit__.assert_called_with(None, None, None)
+    resumed_config = writer.log_params.call_args.args[0]
+    assert resumed_config["num_tasks"] == 2
+    writer.log_text.assert_any_call(grpo.yaml.safe_dump(resumed_config), "config/4.yaml")
     assert export.call_args.args[0] == tmp_path / "test/model-8"
-    assert set(export.call_args.args[2]) == set(params)
-    scalars = writer.__enter__.return_value.add_scalar.call_args_list
-    assert {call.args[2] for call in scalars} == {3, 8, 12}
-    assert serialization.msgpack_restore(path.read_bytes())["prompts_seen"] == 12
-    writer.__enter__.return_value.add_text.assert_any_call("samples/completions", "group preview", 12)
+    assert set(export.call_args.args[1]) == set(params)
+    scalars = [call for call in writer.log_metrics.call_args_list if "time/window_rollouts" in call.args[0]]
+    assert [call.args[1] for call in scalars] == [3, 8, 12]
+    assert metadata["prompts_seen"] == 12
+    assert [call for call in writer.log_text.call_args_list if call.args[1].startswith("samples/")] == [
+        call("group preview", f"samples/completions/{step}.md") for step in (3, 8, 12)
+    ]
 
     # Only interval/final windows synchronize pending updates, including partial windows after resume.
     update_syncs = [
@@ -700,9 +824,9 @@ def test_training_loop_resume_and_logging_with_mocked_learning(
         if isinstance(call.args[0], tuple) and isinstance(call.args[0][0], grpo.TrainState)
     ]
     assert len(update_syncs) == 3
-    assert [call.args[1] for call in scalars if call.args[0] == "time/window_rollouts"] == [3, 2, 2]
-    assert [call.args[1] for call in scalars if call.args[0] == "time/jax_seconds"] == [4.5, 3.0, 3.0]
-    assert [call.args[1] for call in scalars if call.args[0] == "time/scoring_seconds"] == [0.375, 0.25, 0.25]
+    assert [call.args[0]["time/window_rollouts"] for call in scalars] == [3, 2, 2]
+    assert [call.args[0]["time/jax_seconds"] for call in scalars] == [4.5, 3.0, 3.0]
+    assert [call.args[0]["time/scoring_seconds"] for call in scalars] == [0.375, 0.25, 0.25]
     assert "window_rollouts=3 jax=4.500s scoring=0.375s" in initial_stdout
     assert "window_rollouts=2 jax=3.000s scoring=0.250s" in resumed_stdout
     assert " loss=" not in next(line for line in initial_stdout.splitlines() if line.startswith("rollout_batches=1 "))

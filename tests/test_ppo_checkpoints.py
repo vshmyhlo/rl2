@@ -311,6 +311,7 @@ def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> 
     else:
         manager.close.assert_called_once_with()
     if failure in ("logging", "writer_close"):
+        make_writer.assert_called_once_with(experiment="ppo", run_name=config.run_id, resume=True)
         writer.__exit__.assert_called_once()
     else:
         writer.__exit__.assert_not_called()

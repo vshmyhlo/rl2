@@ -149,6 +149,7 @@ from pydantic.dataclasses import dataclass
 from rl2.actions import ActionSpace, BetaPolicy, CategoricalPolicy, DiscreteSpace, Policy, TruncatedGaussianPolicy
 from rl2.configuration import load_settings
 from rl2.envs.base import BaseEnv
+from rl2.envs.brax_env import BraxConfig, BraxEnv
 from rl2.envs.craftax_env import CraftaxConfig, CraftaxEnv
 from rl2.envs.gymnax_env import GymnaxConfig, GymnaxEnv
 from rl2.envs.jaxtari_env import JAXtariConfig, JAXtariEnv
@@ -340,7 +341,7 @@ class ModelConfig:
 class Config:
     model: ModelConfig
     env: Annotated[
-        GymnaxConfig | KinetixConfig | XMiniGridConfig | CraftaxConfig | PlaygroundConfig | JAXtariConfig,
+        GymnaxConfig | KinetixConfig | XMiniGridConfig | CraftaxConfig | PlaygroundConfig | JAXtariConfig | BraxConfig,
         Field(discriminator="id"),
     ]
     seed: int
@@ -383,14 +384,18 @@ class Config:
         if isinstance(self.env, JAXtariConfig) and self.model.encoder.type != "rgb":
             raise ValueError("JAXtari requires model.encoder.type: rgb")
         symbolic_craftax = isinstance(self.env, CraftaxConfig) and "Symbolic" in self.env.env_id
-        if self.model.encoder.type == "mlp" and self.env.id != "MuJoCo-Playground" and not symbolic_craftax:
-            raise ValueError("mlp encoder requires MuJoCo-Playground or symbolic Craftax")
+        if (
+            self.model.encoder.type == "mlp"
+            and self.env.id not in ("MuJoCo-Playground", "Brax")
+            and not symbolic_craftax
+        ):
+            raise ValueError("mlp encoder requires MuJoCo-Playground, Brax or symbolic Craftax")
         if isinstance(self.env, CraftaxConfig):
             encoder = "mlp" if symbolic_craftax else "rgb"
             if self.model.encoder.type != encoder:
                 raise ValueError(f"{self.env.env_id} requires model.encoder.type: {encoder}")
-        if self.env.id == "MuJoCo-Playground" and self.model.encoder.type != "mlp":
-            raise ValueError("MuJoCo-Playground requires model.encoder.type: mlp")
+        if self.env.id in ("MuJoCo-Playground", "Brax") and self.model.encoder.type != "mlp":
+            raise ValueError(f"{self.env.id} requires model.encoder.type: mlp")
         if self.model.encoder.type == "kinetix" and self.env.id != "Kinetix":
             raise ValueError("kinetix encoder requires env.id: Kinetix")
         if self.env.id == "Kinetix" and self.model.encoder.type != "kinetix":
@@ -407,6 +412,8 @@ class Config:
 
 
 def make_env(config: Config) -> PPOEnv:
+    if isinstance(config.env, BraxConfig):
+        return BraxEnv(config.env)
     if isinstance(config.env, JAXtariConfig):
         return JAXtariEnv(config.env)
     if isinstance(config.env, PlaygroundConfig):
@@ -1169,7 +1176,7 @@ def train(config: Config) -> TrainState:
             reset_keys = jax.random.split(jax.random.fold_in(key, start_rollout_index), config.num_envs)  # (B,) keys
             obs, env_state = jax.vmap(envs.reset, in_axes=(0, None))(reset_keys, envs.params)  # (B,*O); leaves: (B,...)
         initial_step_count = start_rollout_index * batch_size
-        writer = MLflowLogger(experiment="ppo", run_name=config.run_id, resume=progress is not None)
+        writer = MLflowLogger(experiment="ppo", run_name=config.run_id, resume=True)
         resources.enter_context(writer)
         if progress is not None:
             print(f"Resumed run {config.run_id} at step {initial_step_count}", flush=True)

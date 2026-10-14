@@ -37,10 +37,10 @@ max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
 run_id: ppo_${path_name:${env.id}}_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
-# Video, checkpoint, and eval: every 20% of training, rounded up; also run on completion.
+# Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
 checkpoint_interval: 1953 # Iterations between checkpoints; also save on completion
 log_interval: 60 # Iterations between progress logs; also log on completion
-video_interval: 1953 # Iterations between recordings; 0 disables recording
+video_interval: 977 # Iterations between recordings; 0 disables recording
 video_fps: 40.0 # Video playback frames per second
 eval_interval: 1953 # Iterations between evaluations; 0 disables
 eval_episodes: 10 # Full games per evaluation, after the rollout update; training pauses during evaluation

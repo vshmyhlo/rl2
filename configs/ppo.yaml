@@ -27,9 +27,10 @@ max_grad_norm: 0.5
 ckpt_dir: gs://cohere-dev/vlad/rl2/${run_id}
 run_id: ppo # TensorBoard run directory; change this for a new run
 # All intervals count completed PPO iterations (one rollout and its updates).
-video_interval: 600 # Iterations between recordings; 0 disables recording
+# Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
+video_interval: 245 # Iterations between recordings; 0 disables recording
 video_max_frames: 900 # Maximum recorded frames, including the initial observation
 video_fps: 40.0 # Video playback frames per second
-eval_interval: 0 # Set a positive interval to evaluate on fixed Gymnax seeds
-eval_episodes: 100 # Inactive while eval_interval is 0
-eval_seed: 10000 # Inactive while eval_interval is 0; separate from training RNG
+eval_interval: 489 # Iterations between evaluations on fixed Gymnax seeds
+eval_episodes: 100 # Full games per evaluation
+eval_seed: 10000 # Fixed evaluation seed set, separate from training RNG

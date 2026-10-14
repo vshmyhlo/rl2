@@ -125,12 +125,15 @@ Upstream inventory checked 2026-10-14; variants grouped. rl2 support varies.
 
         ```bash
         uv run python -m rl2.envs.playground_assets
-        uv run ppo --config configs/ppo/mujoco_playground/manipulation/panda_pick_cube.yaml
+        uv run --env-file nvida.env ppo --config configs/ppo/mujoco_playground/manipulation/panda_pick_cube.yaml
         ```
 
         Setup caches pinned Panda XML/meshes in the installed package.
-        Video/evaluation default off; enabling requires intervals and OpenGL
-        (e.g. `MUJOCO_GL=egl` on headless GPUs). Hyperparameters are untuned.
+        Video/evaluation run every 489 iterations. The NVIDIA preset selects
+        headless EGL rendering. The training image includes EGL libraries and
+        requests NVIDIA graphics drivers; rebuild it to apply rendering changes.
+        Outside the container, install `libegl1 libgl1 libopengl0` (Debian/Ubuntu)
+        and the NVIDIA driver's OpenGL/EGL libraries. Hyperparameters are untuned.
       - **Observation:** float32 `(66,)`, unnormalized, in order:
         - Positions (16): arm angles (7), fingers (2), cube XYZ + quaternion (7).
         - Velocities (15): robot joints (9), cube (6).

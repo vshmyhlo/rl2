@@ -38,7 +38,8 @@ ckpt_dir: /runs/mappo/${run_id}
 run_id: mappo_${env.id}_${env.game}_${env.num_agents}agents_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
 log_interval: 10
-video_interval: 244
+# Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
+video_interval: 122
 video_max_frames: 900
 video_fps: 10
 checkpoint_interval: 244

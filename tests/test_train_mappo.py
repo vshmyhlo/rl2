@@ -482,3 +482,20 @@ def test_training_resume_wiring_and_environment_step_logging(
     assert save.call_args.args[1].rollout_count == 2
     writer.__exit__.assert_called_once()
     manager.close.assert_called_once()
+
+
+def test_mlflow_resume_without_checkpoint(config: ppo.Config) -> None:
+    model = Mock()
+    model.init.return_value = {"params": {}}
+    with (
+        patch.object(ppo, "configure_compilation_cache"),
+        patch.object(ppo, "make_env", return_value=ScriptedSMAX()),
+        patch.object(ppo, "checkpoint_manager"),
+        patch.object(ppo, "ActorCritic", return_value=model),
+        patch.object(ppo.TrainState, "create"),
+        patch.object(ppo, "restore_checkpoint", return_value=None),
+        patch.object(ppo, "MLflowLogger", side_effect=RuntimeError("stop before training")) as logger,
+        pytest.raises(RuntimeError, match="stop before training"),
+    ):
+        ppo.train(config)
+    logger.assert_called_once_with(experiment="mappo", run_name=config.run_id, resume=True)

@@ -112,13 +112,23 @@ def _linear_init(key: jax.Array, shape: tuple[int, ...], dtype: jax.typing.DType
     return nn.initializers.variance_scaling(2**-5, "fan_avg", "uniform")(key, shape, dtype)
 
 
-def _rate_init(key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
-    return jnp.log(jax.random.uniform(key, shape, dtype=jnp.float32, minval=1.0, maxval=16.0))
+def _rate_init(
+    key: jax.Array,  # ()
+    shape: tuple[int, ...],
+    dtype: jax.typing.DTypeLike | None = None,
+) -> jax.Array:
+    return jnp.log(jax.random.uniform(key, shape, dtype=dtype or jnp.float32, minval=1.0, maxval=16.0))  # (*shape,)
 
 
-def _dt_init(key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
-    dt = jnp.exp(jax.random.uniform(key, shape, dtype=jnp.float32, minval=math.log(0.001), maxval=math.log(0.1)))
-    return dt + jnp.log(-jnp.expm1(-dt))
+def _dt_init(
+    key: jax.Array,  # ()
+    shape: tuple[int, ...],
+    dtype: jax.typing.DTypeLike | None = None,
+) -> jax.Array:
+    dt = jnp.exp(
+        jax.random.uniform(key, shape, dtype=dtype or jnp.float32, minval=math.log(0.001), maxval=math.log(0.1))
+    )  # (*shape,)
+    return dt + jnp.log(-jnp.expm1(-dt))  # (*shape,)
 
 
 def _sequence_mask(x: jax.Array, x_len: jax.Array, hidden_size: int) -> jax.Array:
@@ -180,9 +190,15 @@ class GatedDeltaNet2(nn.Module, ARSequenceModel[GatedDeltaNet2Carry]):
         biases: list[jax.Array] = []
         if c.use_short_conv:
             # PyTorch Conv1d initialization, with [oldest,...,current] taps.
-            def conv_init(key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+            def conv_init(
+                key: jax.Array,  # ()
+                shape: tuple[int, ...],
+                dtype: jax.typing.DTypeLike | None = None,
+            ) -> jax.Array:
                 bound = 1 / math.sqrt(c.conv_size)
-                return jax.random.uniform(key, shape, dtype=jnp.float32, minval=-bound, maxval=bound)
+                return jax.random.uniform(
+                    key, shape, dtype=dtype or jnp.float32, minval=-bound, maxval=bound
+                )  # (*shape,)
 
             for name, width in (("q", key_width), ("k", key_width), ("v", value_width)):
                 kernels.append(self.param(f"{name}_conv_kernel", conv_init, (c.conv_size, width)))

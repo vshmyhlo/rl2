@@ -41,3 +41,20 @@ def test_load_settings_resolves_defaults_and_generated_run_id(tmp_path: Path, en
     assert isinstance(config["batch_size"], int)
     assert config["run_id"].startswith("ALE_Boxing-v5_seed7_")
     assert config["log_dir"] == f"logs/{config['run_id']}"
+
+
+def test_progress_logging_presets() -> None:
+    configs = Path(__file__).resolve().parents[1] / "configs"
+    paths = [
+        configs / "ppo.yaml",
+        *sorted((configs / "ppo").rglob("*.yaml")),
+        *sorted((configs / "mappo").rglob("*.yaml")),
+    ]
+    for path in paths:
+        config = load_settings(path)
+        rollouts = config["total_steps"] // (config["num_envs"] * config["num_steps"])
+        assert config["video_interval"] == (rollouts + 9) // 10, path
+        assert config["eval_interval"] == (rollouts + 4) // 5, path
+
+    config = load_settings(configs / "wm_atari.yaml")
+    assert config["video_every_steps"] == config["total_steps"] // 10

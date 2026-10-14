@@ -39,7 +39,8 @@ run_id: ppo_${path_name:${env.id}}_${env.game}_seed${seed}
 # Intervals count rollout/update iterations; also run on completion.
 checkpoint_interval: 1953
 log_interval: 60
-video_interval: 1953
+# Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
+video_interval: 977
 video_max_frames: 1800
 video_fps: 60.0
 eval_interval: 1953
