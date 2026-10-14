@@ -1,0 +1,47 @@
+# STORM: 4 agents, 8x8 board, prisoners dilemma payoffs.
+# Run: uv run mappo --config configs/mappo/jaxmarl/storm/advanced.yaml
+env:
+  id: storm_np
+  game: prisoners_dilemma
+  num_agents: 4
+  grid_size: 8
+  num_coins: 6 # Per type
+  max_steps: 256
+  freeze_penalty: 5
+seed: 1
+total_steps: 20_000_000 # Environment transitions; each contains num_agents observations
+num_envs: 64
+num_steps: 128
+num_minibatches: 4
+update_epochs: 4
+model:
+  encoder:
+    type: mlp
+    embedding_size: 128
+  recurrent:
+    hidden_size: 128
+    num_layers: 1
+    intermediate_size: 0
+bf16: false
+learning_rate: 0.0003
+anneal_lr: true
+lr_decay: linear
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: null
+entropy_coef: 0.01
+entropy_decay: constant
+value_coef: 1.0
+max_grad_norm: 0.5
+ckpt_dir: /runs/mappo/${run_id}
+run_id: mappo_${env.id}_${env.game}_${env.num_agents}agents_seed${seed}
+# All intervals count completed PPO iterations (one rollout and its updates).
+log_interval: 10
+video_interval: 489
+video_max_frames: 900
+video_fps: 10
+checkpoint_interval: 489
+eval_interval: 489
+eval_episodes: 10
+eval_seed: 10000

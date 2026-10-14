@@ -151,6 +151,7 @@ from rl2.configuration import load_settings
 from rl2.envs.base import BaseEnv
 from rl2.envs.craftax_env import CraftaxConfig, CraftaxEnv
 from rl2.envs.gymnax_env import GymnaxConfig, GymnaxEnv
+from rl2.envs.jaxtari_env import JAXtariConfig, JAXtariEnv
 from rl2.envs.kinetix_env import KinetixConfig, KinetixEnv
 from rl2.envs.playground_env import PlaygroundConfig, PlaygroundEnv
 from rl2.envs.xminigrid_env import XMiniGridConfig, XMiniGridEnv
@@ -339,7 +340,8 @@ class ModelConfig:
 class Config:
     model: ModelConfig
     env: Annotated[
-        GymnaxConfig | KinetixConfig | XMiniGridConfig | CraftaxConfig | PlaygroundConfig, Field(discriminator="id")
+        GymnaxConfig | KinetixConfig | XMiniGridConfig | CraftaxConfig | PlaygroundConfig | JAXtariConfig,
+        Field(discriminator="id"),
     ]
     seed: int
     total_steps: int
@@ -378,6 +380,8 @@ class Config:
 
     @model_validator(mode="after")
     def validate_rollout(self) -> Self:
+        if isinstance(self.env, JAXtariConfig) and self.model.encoder.type != "rgb":
+            raise ValueError("JAXtari requires model.encoder.type: rgb")
         symbolic_craftax = isinstance(self.env, CraftaxConfig) and "Symbolic" in self.env.env_id
         if self.model.encoder.type == "mlp" and self.env.id != "MuJoCo-Playground" and not symbolic_craftax:
             raise ValueError("mlp encoder requires MuJoCo-Playground or symbolic Craftax")
@@ -403,6 +407,8 @@ class Config:
 
 
 def make_env(config: Config) -> PPOEnv:
+    if isinstance(config.env, JAXtariConfig):
+        return JAXtariEnv(config.env)
     if isinstance(config.env, PlaygroundConfig):
         return PlaygroundEnv(config.env)
     if isinstance(config.env, KinetixConfig):

@@ -37,7 +37,25 @@ Upstream inventory checked 2026-10-14; variants grouped. rl2 support varies.
   - Overcooked and OvercookedV2: cooperative cooking.
   - SMAX: StarCraft-style combat; heuristic/learned enemies.
   - Hanabi: cooperative hidden-information card game.
-  - STORM: two-/multi-player spatial matrix games.
+  - STORM: two-/multi-player spatial matrix games (`storm`, `storm_2p`, `storm_np`).
+    - rl2's [adapter](src/rl2/envs/storm_env.py): `storm_np`, shared MLP/LSTM IPPO.
+      Collect red/blue coins, then zap another coin holder to play a matrix game.
+    - [Basic](configs/mappo/jaxmarl/storm/basic.yaml): two agents, 6×6 board,
+      cooperative payoffs, 128 steps. [Advanced](configs/mappo/jaxmarl/storm/advanced.yaml):
+      four agents, 8×8 board, Prisoner's Dilemma, 256 steps. Both: six coins/type,
+      randomized placement, five-step interaction freeze followed by respawn.
+    - Observation: egocentric symbolic `(5, 5, 14)` grid → float32 `(350,)` per
+      agent; objects, self/others, orientation, pickup readiness, inventory and freeze features.
+    - Actions: `Discrete(8)` — turn left/right, forward, stay, zap forward/ahead/right/left
+      (IDs 0–7). All-valid masks; frozen agents stay. Arrays: obs `(N, 350)`, actions `(N,)`.
+    - Reward: zero except interactions; coin proportions `p`, `q` give `pᵀ M_i q`.
+      Rows/columns are red/blue: basic gives both `M = [[3,1],[1,0]]`;
+      advanced gives `(3,3)` for red/red, `(0,5)` red/blue, `(5,0)` blue/red, `(1,1)` blue/blue.
+      Payoffs sum over accepted partners; the adapter fixes upstream reward overwrites.
+      Individual rewards train each agent; logged return sums their mean.
+    - One round/episode, truncated at `max_steps` with final-state bootstrapping;
+      memory persists across interactions. Run either preset with
+      `uv run mappo --config configs/mappo/jaxmarl/storm/basic.yaml` (or `advanced.yaml`).
   - Coin Game: resource collection/social dilemmas.
   - Switch Riddle: communication puzzle.
   - JaxNav: multi-robot navigation/collision avoidance.
@@ -196,6 +214,14 @@ Upstream inventory checked 2026-10-14; variants grouped. rl2 support varies.
   - Locomotion: HalfCheetah, Hopper, Swimmer, Walker variants.
 
 - [JAXtari](https://github.com/k4ntz/JAXtari) — Atari reimplementations ([game status list](https://github.com/k4ntz/JAXtari/blob/master/games_covered.md)).
+  - [Breakout PPO preset](configs/ppo/jaxtari/breakout.yaml): native uint8 RGB
+    `(210, 160, 3)`, CNN + LSTM; one frame per action. `Discrete(4)`:
+    0 no-op, 1 fire, 2 right, 3 left. FIRE starts each ball; life loss continues
+    the episode. Reward is raw score gain (1/4/7 per brick row tier).
+    Ends at zero lives, cleared bricks, or 108,000 steps (timeout bootstrapped).
+    Install sprites once with `uv run python -m jaxtari.install_sprites`
+    (decline ROM ownership to use alternative sprites), then run
+    `uv run ppo --config configs/ppo/jaxtari/breakout.yaml`.
   - Atari57 (close to originals): Alien, Amidar, Asterix, Asteroids,
     Atlantis, Bank Heist, Beam Rider, Berzerk, Boxing, Breakout, Centipede,
     Chopper Command, Enduro, Fishing Derby, Freeway, Frostbite, Gopher,

@@ -9,6 +9,9 @@ ENV UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never PYTHONUNBUFFERED=1
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project
+# Bundle Panda assets so Playground can start without runtime downloads.
+RUN --mount=type=bind,source=src/rl2/envs/playground_assets.py,target=/tmp/playground_assets.py \
+    /app/.venv/bin/python /tmp/playground_assets.py
 # Install editable metadata without copying source into an intermediate layer.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=README.md,target=/app/README.md \

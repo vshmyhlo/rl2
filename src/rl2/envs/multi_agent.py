@@ -1,4 +1,4 @@
-"""Shared interface and transitions for cooperative multi-agent environments."""
+"""Shared interface and transitions for multi-agent environments."""
 
 from abc import ABC, abstractmethod
 from typing import NamedTuple
@@ -30,7 +30,7 @@ class MultiAgentStep[State](NamedTuple):
 
 
 class BaseMultiAgentEnv[State](ABC):
-    """Explicit state and RNGs, discrete actions, and same-step team autoreset.
+    """Explicit state and RNGs, discrete actions, and same-step environment autoreset.
 
     Actions and observations retain native values; agent dictionaries are packed
     in a fixed order. Masks expose native availability, or all actions when absent.
@@ -56,7 +56,7 @@ class BaseMultiAgentEnv[State](ABC):
         state: State,  # leaves: (...)
         actions: jax.Array,  # (N,) integer action IDs
     ) -> MultiAgentStep[State]:
-        """Advance and autoreset the team when terminated or truncated."""
+        """Advance and autoreset the environment when terminated or truncated."""
 
     @abstractmethod
     def memory_resets(

@@ -1,4 +1,4 @@
-"""Recurrent parameter-sharing IPPO for SMAX, JaxNav, and cooperative MPE tasks.
+"""Recurrent parameter-sharing IPPO for SMAX, JaxNav, MPE, and STORM.
 
 The actor and critic share an encoder and LSTM, with separate policy and value
 heads and parameters shared across agents. Both use only local observations.
@@ -160,6 +160,7 @@ from rl2.envs.jaxnav_env import JaxNavConfig, JaxNavEnv
 from rl2.envs.mpe_env import MPEConfig, MPEEnv
 from rl2.envs.multi_agent import AgentObservation, BaseMultiAgentEnv
 from rl2.envs.smax_env import SMAXConfig, SMAXEnv
+from rl2.envs.storm_env import STORMConfig, STORMEnv
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.mlflow_logging import MLflowLogger
@@ -313,7 +314,7 @@ class ModelConfig:
 @dataclass(frozen=True, config=ConfigDict(extra="forbid", strict=True))
 class Config:
     model: ModelConfig
-    env: Annotated[SMAXConfig | JaxNavConfig | MPEConfig, Field(discriminator="id")]
+    env: Annotated[SMAXConfig | JaxNavConfig | MPEConfig | STORMConfig, Field(discriminator="id")]
     seed: int
     total_steps: int
     num_envs: Annotated[int, Field(gt=0)]
@@ -362,8 +363,10 @@ def make_env(config: Config) -> PPOEnv:
         env = SMAXEnv(config.env)
     elif isinstance(config.env, JaxNavConfig):
         env = JaxNavEnv(config.env)
-    else:
+    elif isinstance(config.env, MPEConfig):
         env = MPEEnv(config.env)
+    else:
+        env = STORMEnv(config.env)
     if config.num_envs * env.num_agents % config.num_minibatches:
         raise ValueError("num_envs * num_agents must be divisible by num_minibatches to preserve sequences")
     return env

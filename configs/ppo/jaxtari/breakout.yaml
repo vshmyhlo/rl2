@@ -1,0 +1,47 @@
+# Native JAXtari Breakout frames; recurrent policy learns when to FIRE.
+# Setup sprites once: uv run python -m jaxtari.install_sprites
+env:
+  id: JAXtari
+  game: breakout
+  max_steps: 108_000 # Single-frame actions, at most 30 simulated minutes at 60 Hz
+seed: 1
+total_steps: 10_000_000
+num_envs: 8
+num_steps: 128
+num_minibatches: 4
+update_epochs: 4
+model:
+  encoder:
+    type: rgb
+    stages:
+      - { channels: 32, blocks: 1, resize_factor: 0.25 }
+      - { channels: 64, blocks: 1, resize_factor: 0.5 }
+      - { channels: 128, blocks: 1, resize_factor: 0.5 }
+      - { channels: 128, blocks: 1, resize_factor: 0.5 }
+    embedding_size: 256
+  recurrent:
+    type: lstm
+    hidden_size: 256
+bf16: true
+learning_rate: 0.00025
+anneal_lr: true
+lr_decay: linear
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: 0.01
+entropy_coef: 0.01
+entropy_decay: constant
+value_coef: 0.5
+max_grad_norm: 0.5
+ckpt_dir: /runs/ppo/${run_id}
+run_id: ppo_${path_name:${env.id}}_${env.game}_seed${seed}
+# Intervals count rollout/update iterations; also run on completion.
+checkpoint_interval: 1953
+log_interval: 60
+video_interval: 1953
+video_max_frames: 1800
+video_fps: 60.0
+eval_interval: 1953
+eval_episodes: 10
+eval_seed: 10000

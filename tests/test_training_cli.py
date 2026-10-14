@@ -13,10 +13,13 @@ from rl2 import ppo, train_mappo
         (ppo, "configs/ppo/kinetix.yaml"),
         (ppo, "configs/ppo/xminigrid.yaml"),
         (ppo, "configs/ppo/minatar/breakout.yaml"),
+        (ppo, "configs/ppo/jaxtari/breakout.yaml"),
         (train_mappo, "configs/mappo/jaxnav.yaml"),
         (train_mappo, "configs/mappo/smax.yaml"),
+        (train_mappo, "configs/mappo/jaxmarl/storm/basic.yaml"),
+        (train_mappo, "configs/mappo/jaxmarl/storm/advanced.yaml"),
     ],
-    ids=["craftax", "kinetix", "xminigrid", "breakout", "jaxnav", "smax"],
+    ids=["craftax", "kinetix", "xminigrid", "breakout", "jaxtari", "jaxnav", "smax", "storm-basic", "storm-advanced"],
 )
 def test_cli_shared_run_directory(trainer: ModuleType, config_path: str, monkeypatch: pytest.MonkeyPatch) -> None:
     config = trainer.load_config(config_path)

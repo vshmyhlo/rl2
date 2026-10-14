@@ -22,6 +22,7 @@ dependencies = [
     "jax[cuda12]>=0.11.2,<0.12; sys_platform == 'linux'",
     "jax-triton>=0.4.1,<0.5; sys_platform == 'linux'",
     "jaxmarl==0.2.0",
+    "jaxtari==0.2.0",
     "kauldron>=1.4.4,<2",
     "kinetix-env==3.0.2",
     "mctx>=0.0.6,<0.1",
@@ -47,7 +48,6 @@ dependencies = [
     "tfp-nightly>=0.26.0.dev0,<0.27",
     "tokamax>=0.0.15; sys_platform == 'linux'",
     "xminigrid==0.9.3",
-    "jaxtari==0.2.0",
 ]
 
 [project.scripts]

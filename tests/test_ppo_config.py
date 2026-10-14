@@ -236,6 +236,7 @@ def test_optional_environments_reject_invalid_settings(name: str, settings: dict
     "filename,config_class,constructor_name",
     [
         ("minatar/breakout", ppo.GymnaxConfig, "GymnaxEnv"),
+        ("jaxtari/breakout", ppo.JAXtariConfig, "JAXtariEnv"),
         ("kinetix", KinetixConfig, "KinetixEnv"),
         ("xminigrid", XMiniGridConfig, "XMiniGridEnv"),
         ("craftax/craftax", CraftaxConfig, "CraftaxEnv"),
