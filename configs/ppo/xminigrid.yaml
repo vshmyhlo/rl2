@@ -37,11 +37,12 @@ max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
 run_id: ppo_${path_name:${env_id}}_${path_name:${xminigrid.env_id}}_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
+# Video, checkpoint, and eval: every 20% of training, rounded up; also run on completion.
 log_interval: 10
-video_interval: 100
+video_interval: 489
 video_max_frames: 900
 video_fps: 10.0
-checkpoint_interval: 200
-eval_interval: 200
+checkpoint_interval: 489
+eval_interval: 489
 eval_episodes: 10
 eval_seed: 10000

@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from rl2.ppo import load_config
 
 
-@pytest.mark.parametrize("filename,video_interval", [("ppo.yaml", 600), ("ppo/minatar/breakout.yaml", 60)])
+@pytest.mark.parametrize("filename,video_interval", [("ppo.yaml", 600), ("ppo/minatar/breakout.yaml", 1953)])
 def test_native_ppo_configs(filename: str, video_interval: int) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "configs" / filename)
     assert config.env_id == "Breakout-MinAtar"

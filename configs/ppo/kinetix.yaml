@@ -38,11 +38,12 @@ max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
 run_id: ppo_${path_name:${env_id}}_${path_name:${kinetix.levels.0}}_${model.continuous_policy}_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
-checkpoint_interval: 200
+# Video, checkpoint, and eval: every 20% of training, rounded up; also run on completion.
+checkpoint_interval: 489
 log_interval: 10
-video_interval: 100
+video_interval: 489
 video_max_frames: 900
 video_fps: 30.0 # 60 Hz physics / frame_skip 2
-eval_interval: 200
+eval_interval: 489
 eval_episodes: 10
 eval_seed: 10000
