@@ -112,8 +112,8 @@ def test_load_default_config() -> None:
     path = Path(__file__).resolve().parents[1] / "configs/alphazero_chess.yaml"
     config = load_config(path, Config)
     assert config.env_id == "chess"
-    assert config.run_id == "alphazero_chess"
-    assert config.ckpt_dir == "gs://cohere-dev/vlad/rl2/alphazero/alphazero_chess"
+    assert config.run_id == "alphazero_chess_seed0"
+    assert config.ckpt_dir == "/runs/alphazero/alphazero_chess_seed0"
 
 
 @pytest.mark.parametrize(

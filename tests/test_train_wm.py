@@ -482,7 +482,7 @@ def test_main_uses_default_atari_config(monkeypatch: pytest.MonkeyPatch) -> None
     assert len(calls) == 1
     config = calls[0]
     assert config.run_id is not None
-    assert config.ckpt_dir == f"gs://cohere-dev/vlad/rl2_cp/wm/{config.run_id}"
+    assert config.ckpt_dir == f"/runs/wm/{config.run_id}"
     assert config.num_envs == 8 and config.vector_env == "async" and config.bf16
     schedule = train_wm.learning_rate_schedule(config)
     assert float(schedule(1000)) < float(schedule(0))

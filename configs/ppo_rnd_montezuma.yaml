@@ -26,8 +26,8 @@ target_kl: 0.01 # null disables KL early stopping
 entropy_coef: 0.001 # RND provides directed exploration; reference entropy weight
 value_coef: 0.5
 max_grad_norm: 0.5
-ckpt_dir: gs://cohere-dev/vlad/rl2/${run_id}
-run_id: ppo_rnd_montezuma # MLflow run name; change this for a new run
+ckpt_dir: /runs/ppo_rnd/${run_id}
+run_id: ppo_rnd_${path_name:${env_id}}_seed${seed}
 checkpoint_interval_seconds: 600 # Save at rollout boundaries, plus the final checkpoint
 video_every_episodes: 1000 # Reduce recording overhead during a long run; 0 disables recording
 video_max_frames: 1800 # Bound recording memory and training pauses; 120 seconds at action repeat 4

@@ -22,9 +22,9 @@ target_kl: 0.02 # Old-policy KL early stopping; null disables
 entropy_coef: 0.01
 # AST constructor/value masking is always enabled, including node/depth/source budgets.
 max_grad_norm: 0.5
-ckpt_dir: gs://cohere-dev/vlad/rl2/karel_ast_grpo/${run_id}
-run_id: v4 # Reuse to resume; change for a new run, or null for a timestamped run
-checkpoint_interval_seconds: 300 # Save to ckpt_dir on GCS every 5 minutes (at rollout boundaries), plus final
+ckpt_dir: /runs/karel_ast_grpo/${run_id}
+run_id: karel_ast_grpo_${env.height}x${env.width}_seed${seed}
+checkpoint_interval_seconds: 300 # Save to ckpt_dir every 5 minutes (at rollout boundaries), plus final
 log_interval: 10 # MLflow metrics and stdout every 20 completed rollouts
 log_program_interval: 10 # Samples on logging iterations divisible by this interval; rotate through task groups
 log_program_count: 8 # Compare first 8 samples from the same group; 0 disables

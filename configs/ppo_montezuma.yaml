@@ -25,8 +25,8 @@ target_kl: 0.01 # null disables KL early stopping
 entropy_coef: 0.01
 value_coef: 0.5
 max_grad_norm: 0.5
-ckpt_dir: gs://cohere-dev/vlad/rl2/${run_id}
-run_id: ppo_montezuma # MLflow run name; change this for a new run
+ckpt_dir: /runs/ppo/${run_id}
+run_id: ppo_${path_name:${env_id}}_${model.type}_seed${seed}
 video_interval_seconds: 600 # Wall-clock seconds between recordings; 0 disables recording
 video_max_frames: null # Record the full episode, until termination or truncation
 video_speed: 4.0 # Playback multiplier: 1.0 normal, 2.0 double speed

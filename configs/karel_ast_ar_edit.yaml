@@ -22,8 +22,8 @@ clip_coef: 0.2 # Per decoder decision, including location selection and STOP
 target_kl: 0.02
 entropy_coef: 0.01
 max_grad_norm: 1.0
-ckpt_dir: gs://cohere-dev/vlad/rl2/karel_ast_ar_edit/${run_id}
-run_id: delta_conv_all_steps_v6 # Every-token image encoder; use a fresh run, incompatible with older encoders
+ckpt_dir: /runs/karel_ast_ar_edit/${run_id}
+run_id: karel_ast_ar_edit_${env.height}x${env.width}_delta_conv_all_steps_v6_seed${seed}
 checkpoint_interval_seconds: 300
 log_interval: 10
 log_program_interval: 10

@@ -31,7 +31,8 @@ bf16: true # BF16 compute; parameters, recurrent state, and losses remain float3
 learning_rate: 0.0001 # Initial Adam rate; cosine decay over the planned optimizer updates
 max_grad_norm: 1.0
 log_every: 10 # Print training metrics every N updates
-ckpt_dir: gs://cohere-dev/vlad/rl2_cp/wm/${run_id}
+ckpt_dir: /runs/wm/${run_id}
+run_id: wm_${path_name:${env_id}}_${model}_seed${seed}
 checkpoint_every: 500 # Optimizer updates, plus the final checkpoint of each run
 video_every_steps: 5000000 # Every 10% of online training transitions; 0 disables online videos
 video_prefill_frames: 10 # Shared real context before the real/posterior/prior comparison

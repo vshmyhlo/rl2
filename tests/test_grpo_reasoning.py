@@ -647,7 +647,7 @@ def test_yaml_config(tmp_path: Path) -> None:
         assert dataset.score_answer(entry["answer"], entry) == 1.0
     assert config.prompt_examples == []
     assert config.run_id is not None
-    assert config.ckpt_dir == f"runs/grpo_reasoning/{config.run_id}"
+    assert config.ckpt_dir == f"/runs/grpo_reasoning/{config.run_id}"
     assert config.checkpoint_interval_seconds == 600
     path = tmp_path / "config.yaml"
     path.write_text("group_size: 2\nnum_minibatches: 1\ntask_config:\n  max_animals: 3\n")

@@ -32,7 +32,7 @@ entropy_coef: 0.001
 entropy_decay: cosine
 value_coef: 0.5
 max_grad_norm: 0.5
-ckpt_dir: runs/ppo/${run_id}
+ckpt_dir: /runs/ppo/${run_id}
 run_id: ppo_${path_name:${env.id}}_${env.task}_${env.backend}_seed${seed}
 checkpoint_interval: 489
 log_interval: 10

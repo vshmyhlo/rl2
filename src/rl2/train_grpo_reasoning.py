@@ -713,7 +713,7 @@ def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
     return ocp.CheckpointManager(
         directory,
         item_handlers={"state": ocp.StandardCheckpointHandler(), "metadata": ocp.JsonCheckpointHandler()},
-        options=ocp.CheckpointManagerOptions(max_to_keep=2, enable_async_checkpointing=False),
+        options=ocp.CheckpointManagerOptions(max_to_keep=2),
     )
 
 
