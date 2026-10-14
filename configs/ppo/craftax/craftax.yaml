@@ -1,6 +1,6 @@
 env:
   id: Craftax
-  env_id: Craftax-Pixels-v1 # Or Craftax-Classic-Pixels-v1
+  env_id: Craftax-Symbolic-v1 # Or Craftax-Classic-Symbolic-v1
   max_steps: null # Native episode limit
 seed: 1
 total_steps: 10_000_000
@@ -10,12 +10,9 @@ num_minibatches: 4
 update_epochs: 4
 model:
   encoder:
-    type: rgb
-    stages:
-      - { channels: 32, blocks: 1, resize_factor: 0.5 }
-      - { channels: 64, blocks: 1, resize_factor: 0.5 }
-      - { channels: 128, blocks: 1, resize_factor: 0.5 }
-      - { channels: 128, blocks: 1, resize_factor: 0.5 }
+    type: mlp
+    hidden_size: 256
+    embedding_size: 256
   recurrent:
     type: lstm
     hidden_size: 256

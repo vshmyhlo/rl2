@@ -445,30 +445,10 @@ def restore_checkpoint(
     if rollout_count is None:
         return None
     metadata = manager.restore(rollout_count, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
-    if metadata["version"] != 2 or metadata.get("algorithm") != f"{config.env.id.lower()}_ippo":
+    if metadata["version"] != 2:
         raise ValueError("Unsupported PPO checkpoint version; the shared encoder/LSTM requires a new run directory")
     if metadata["iteration"] != rollout_count or rollout_count < 0 or metadata["completed_episodes"] < 0:
         raise ValueError("Invalid PPO checkpoint progress")
-    saved_config = metadata["config"]
-    saved_env = saved_config.get("env")
-    if saved_env is None:
-        # Checkpoints predating the tagged environment config store separate settings.
-        env_id = saved_config["env_id"]
-        env_key = {"SMAX": "smax", "JaxNav": "jaxnav"}.get(env_id, "mpe")
-        saved_env = {"id": env_id, **saved_config.get(env_key, {})}
-    if saved_env["id"] != config.env.id:
-        raise ValueError("Cannot resume PPO with a different environment; use a new run directory")
-    if "model" in saved_config and ModelConfig(**saved_config["model"]) != config.model:
-        raise ValueError("Cannot resume PPO with different model settings; use a new run directory")
-    if type(config.env)(**saved_env) != config.env:
-        raise ValueError("Cannot resume PPO with different environment settings; use a new run directory")
-    # Progress and schedules count rollouts, so each must still represent the same number of steps.
-    if (
-        "num_envs" in saved_config
-        and "num_steps" in saved_config
-        and saved_config["num_envs"] * saved_config["num_steps"] != config.num_envs * config.num_steps
-    ):
-        raise ValueError("Cannot resume PPO with a different num_envs * num_steps; use a new run directory")
     for field in ("training_return_sum", "training_length_sum"):
         if metadata.get(field) is None:
             raise ValueError(f"PPO checkpoint requires {field}; use a new run directory")

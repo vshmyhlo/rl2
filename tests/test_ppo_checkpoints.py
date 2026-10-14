@@ -444,5 +444,3 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         assert checkpoint.episode_length_sum == 2**31
         # Restoring these totals must also avoid narrowing them to device scalars.
         ppo.train(config)
-
-

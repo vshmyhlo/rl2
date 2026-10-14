@@ -9,7 +9,7 @@ from rl2 import ppo, train_mappo
 @pytest.mark.parametrize(
     ("trainer", "config_path"),
     [
-        (ppo, "configs/ppo/craftax.yaml"),
+        (ppo, "configs/ppo/craftax/craftax.yaml"),
         (ppo, "configs/ppo/kinetix.yaml"),
         (ppo, "configs/ppo/xminigrid.yaml"),
         (ppo, "configs/ppo/minatar/breakout.yaml"),

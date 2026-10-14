@@ -378,8 +378,13 @@ class Config:
 
     @model_validator(mode="after")
     def validate_rollout(self) -> Self:
-        if self.model.encoder.type == "mlp" and self.env.id != "MuJoCo-Playground":
-            raise ValueError("mlp encoder requires env.id: MuJoCo-Playground")
+        symbolic_craftax = isinstance(self.env, CraftaxConfig) and "Symbolic" in self.env.env_id
+        if self.model.encoder.type == "mlp" and self.env.id != "MuJoCo-Playground" and not symbolic_craftax:
+            raise ValueError("mlp encoder requires MuJoCo-Playground or symbolic Craftax")
+        if isinstance(self.env, CraftaxConfig):
+            encoder = "mlp" if symbolic_craftax else "rgb"
+            if self.model.encoder.type != encoder:
+                raise ValueError(f"{self.env.env_id} requires model.encoder.type: {encoder}")
         if self.env.id == "MuJoCo-Playground" and self.model.encoder.type != "mlp":
             raise ValueError("MuJoCo-Playground requires model.encoder.type: mlp")
         if self.model.encoder.type == "kinetix" and self.env.id != "Kinetix":
@@ -488,31 +493,6 @@ def restore_checkpoint(
         raise ValueError("Unsupported PPO checkpoint version")
     if metadata["iteration"] != rollout_count or rollout_count < 0 or metadata["completed_episodes"] < 0:
         raise ValueError("Invalid PPO checkpoint progress")
-    saved_config = metadata["config"]
-    saved_env = saved_config.get("env")
-    if saved_env is None:
-        # Checkpoints predating the tagged environment config store separate settings.
-        env_id = saved_config.get("env_id", config.env.id)
-        env_key = {
-            "Kinetix": "kinetix",
-            "XLand-MiniGrid": "xminigrid",
-            "Craftax": "craftax",
-            "MuJoCo-Playground": "playground",
-        }.get(env_id)
-        saved_env = {"id": env_id, **saved_config.get(env_key, {})}
-    if saved_env["id"] != config.env.id:
-        raise ValueError("Cannot resume PPO with a different environment; use a new run directory")
-    if "model" in saved_config and ModelConfig(**saved_config["model"]) != config.model:
-        raise ValueError("Cannot resume PPO with different model settings; use a new run directory")
-    if type(config.env)(**saved_env) != config.env:
-        raise ValueError("Cannot resume PPO with different environment settings; use a new run directory")
-    # Progress and schedules count rollouts, so each must still represent the same number of steps.
-    if (
-        "num_envs" in saved_config
-        and "num_steps" in saved_config
-        and saved_config["num_envs"] * saved_config["num_steps"] != config.num_envs * config.num_steps
-    ):
-        raise ValueError("Cannot resume PPO with a different num_envs * num_steps; use a new run directory")
     for field in ("training_return_sum", "training_length_sum"):
         if metadata.get(field) is None:
             raise ValueError(f"PPO checkpoint requires {field}; use a new run directory")

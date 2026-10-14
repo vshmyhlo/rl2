@@ -146,8 +146,38 @@ Upstream inventory checked 2026-10-14; variants grouped. rl2 support varies.
 
 - [Craftax](https://github.com/MichaelTMatthews/Craftax) — survival/crafting ([factory](https://github.com/MichaelTMatthews/Craftax/blob/main/craftax/craftax_env.py)).
   - Craftax: `Craftax-Symbolic-v1` and `Craftax-Pixels-v1`.
+    - **Symbolic:** `(8268,)`; flattened 9×11 tile/item/entity/light features
+      plus 51 inventory, equipment, player-state, and status values.
+    - **Pixels:** `(130, 110, 3)`; 9×11 local tiles plus inventory/status HUD.
+    - **Actions:** `Discrete(43)`; Classic controls plus rest, stairs, diamond
+      tools, armour, arrows, spells, torches, potions, books, enchanting, attributes.
+    - **Achievements:** 67; first unlock pays 1/3/5/8 by difficulty
+      ([weights](https://github.com/MichaelTMatthews/Craftax/blob/main/craftax/craftax/constants.py)).
+    - **Episode:** death or defeating the necromancer; default timeout 100,000 steps.
   - Craftax Classic (Crafter-style): `Craftax-Classic-Symbolic-v1`
     and `Craftax-Classic-Pixels-v1`.
+    - **Symbolic:** `(1345,)`; flattened 7×9 tile/entity features plus 22
+      inventory, vitals, facing, light, and sleep values.
+    - **Pixels:** `(63, 63, 3)`; 7×9 local tiles plus inventory/status HUD.
+    - **Actions:** `Discrete(17)` — 0: no-op; 1–4: left/right/up/down;
+      5: interact (mine/attack/eat/drink); 6: sleep; 7–10: place stone/table/furnace/plant;
+      11–13: craft wood/stone/iron pickaxe; 14–16: craft corresponding swords.
+      Full Craftax shares IDs 0–16.
+    - **Achievements:** 22; +1 per first unlock (collecting, crafting, combat, survival).
+    - **Episode:** death/lava; default timeout 10,000 steps.
+  - **rl2:** [PPO preset](configs/ppo/craftax/craftax.yaml), symbolic MLP + LSTM;
+    `uv run ppo --config configs/ppo/craftax/craftax.yaml`. Set `env.env_id` to either
+    symbolic variant; pixels require `model.encoder.type: rgb`. Videos remain RGB.
+    Details above use Craftax 1.6.1.
+  - **Arrays:** float32 symbolic `(B, F)` with native feature scaling, or RGB
+    `(B, H, W, 3)` in `[0, 1]`; both player-centered. Int32 actions `(B,)`,
+    no action mask; unmet prerequisites prevent the effect while the world advances.
+  - **Reward:** `r = sum(new achievement weights) + 0.1 * (health_after - health_before)`;
+    unlocks pay once per episode, healing rewards and damage penalizes.
+    Logged return sums raw rewards ([logic](https://github.com/MichaelTMatthews/Craftax/blob/main/craftax/craftax/game_logic.py)).
+  - **Reset:** new procedural world per episode. `env.max_steps: null` uses native
+    limits; set an integer to override. Autoreset preserves final observations
+    for timeout bootstrapping.
 
 - [Navix](https://github.com/epignatelli/navix) — MiniGrid tasks ([environment modules](https://github.com/epignatelli/navix/blob/main/navix/environments/__init__.py)).
   - Navigation: Empty rooms, FourRooms, MultiRoom, Crossings, LavaGap,

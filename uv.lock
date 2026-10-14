@@ -2609,6 +2609,32 @@ wheels = [
 ]
 
 [[package]]
+name = "jaxtari"
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "absl-py" },
+    { name = "ale-py" },
+    { name = "chex" },
+    { name = "flax" },
+    { name = "gymnasium" },
+    { name = "gymnax" },
+    { name = "jax" },
+    { name = "ml-dtypes" },
+    { name = "numpy" },
+    { name = "opt-einsum" },
+    { name = "platformdirs" },
+    { name = "requests" },
+    { name = "scipy" },
+    { name = "toolz" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/99/f9/10285c28e229d5efabacc6221ff730326e6d78ff3988c0c0c0d906a12582/jaxtari-0.2.0.tar.gz", hash = "sha256:83541dcfaa8ecdb3db5631cfa6f636992d64825af999eb786c8f0e322f5903a0", size = 1430251, upload-time = "2026-10-08T15:01:11.151Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/01/00/e20e950013cd1dd76800464de16cf64419e7cf07220dea7ffb2855894567/jaxtari-0.2.0-py3-none-any.whl", hash = "sha256:90b60fb76c86246805fe992a84c3e2f028c28489732a7c17cbaed32f87e17976", size = 1547801, upload-time = "2026-10-08T15:01:08.108Z" },
+]
+
+[[package]]
 name = "jaxtyping"
 version = "0.3.11"
 source = { registry = "https://pypi.org/simple" }
@@ -5610,6 +5636,7 @@ dependencies = [
     { name = "jax", extra = ["cuda12"], marker = "sys_platform == 'linux'" },
     { name = "jax-triton", marker = "sys_platform == 'linux'" },
     { name = "jaxmarl" },
+    { name = "jaxtari" },
     { name = "kauldron" },
     { name = "kinetix-env" },
     { name = "mctx" },
@@ -5653,6 +5680,7 @@ requires-dist = [
     { name = "jax", extras = ["cuda12"], marker = "sys_platform == 'linux'", specifier = ">=0.11.2,<0.12" },
     { name = "jax-triton", marker = "sys_platform == 'linux'", specifier = ">=0.4.1,<0.5" },
     { name = "jaxmarl", specifier = "==0.2.0" },
+    { name = "jaxtari", specifier = "==0.2.0" },
     { name = "kauldron", specifier = ">=1.4.4,<2" },
     { name = "kinetix-env", specifier = "==3.0.2" },
     { name = "mctx", specifier = ">=0.0.6,<0.1" },
