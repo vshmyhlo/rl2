@@ -33,7 +33,7 @@ entropy_coef: 0.01
 entropy_decay: constant
 value_coef: 2.0 # Paper c1=1 on squared error; trainer multiplies 0.5 * squared error
 max_grad_norm: 0.5
-log_dir: gs://cohere-dev/vlad/rl2/ppo/${run_id}
+ckpt_dir: /runs/ppo/${run_id}
 run_id: ppo_${path_name:${env_id}}_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
 checkpoint_interval: 200 # Iterations between checkpoints; also save on completion

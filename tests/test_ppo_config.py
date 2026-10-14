@@ -29,7 +29,7 @@ def test_load_config_returns_fully_resolved_config(config_path: Path, run_id: st
     settings.update(
         env_id="Breakout-MinAtar",
         seed=7,
-        log_dir="logs/${run_id}/${path_name:${env_id}}",
+        ckpt_dir="logs/${run_id}/${path_name:${env_id}}",
         num_minibatches="${num_envs}",
     )
     if run_id == "missing":
@@ -46,23 +46,23 @@ def test_load_config_returns_fully_resolved_config(config_path: Path, run_id: st
         assert config.run_id == run_id
     else:
         assert config.run_id.startswith("Breakout-MinAtar_seed7_")
-    assert config.log_dir == f"logs/{config.run_id}/Breakout-MinAtar"
+    assert config.ckpt_dir == f"logs/{config.run_id}/Breakout-MinAtar"
     assert config.num_minibatches == config.num_envs
 
 
 @pytest.mark.parametrize(
-    "log_dir,error,match",
+    "ckpt_dir,error,match",
     [
         ("logs/${unknown}", OmegaConfBaseException, "unknown"),
-        ("${seed}", ValidationError, "log_dir"),
+        ("${seed}", ValidationError, "ckpt_dir"),
     ],
     ids=["invalid-interpolation", "resolved-value-fails-validation"],
 )
 def test_load_config_rejects_invalid_settings(
-    config_path: Path, log_dir: str, error: type[Exception], match: str
+    config_path: Path, ckpt_dir: str, error: type[Exception], match: str
 ) -> None:
     settings = yaml.safe_load(config_path.read_text())
-    settings["log_dir"] = log_dir
+    settings["ckpt_dir"] = ckpt_dir
     config_path.write_text(yaml.safe_dump(settings))
 
     with pytest.raises(error, match=match):

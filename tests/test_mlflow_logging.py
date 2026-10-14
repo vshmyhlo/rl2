@@ -30,9 +30,9 @@ def client(tracking_uri: str, monkeypatch: pytest.MonkeyPatch) -> MlflowClient:
     return MlflowClient()
 
 
-def test_metrics_artifacts_and_resume(client: MlflowClient, tmp_path: Path) -> None:
+def test_metrics_artifacts_and_resume(client: MlflowClient) -> None:
     # Resuming a pre-MLflow checkpoint must also create a run when none exists.
-    with MLflowLogger(experiment="ppo", run_name="training", run_dir=str(tmp_path), resume=True) as logger:
+    with MLflowLogger(experiment="ppo", run_name="training", resume=True) as logger:
         run_id = logger.run_id
         assert client.get_run(run_id).info.status == "RUNNING"
         assert client.get_run(run_id).info.run_name == "training"
@@ -60,7 +60,7 @@ def test_metrics_artifacts_and_resume(client: MlflowClient, tmp_path: Path) -> N
 
     with (
         pytest.raises(RuntimeError, match="interrupted"),
-        MLflowLogger(experiment="ppo", run_name="training", run_dir=str(tmp_path), resume=True) as resumed,
+        MLflowLogger(experiment="ppo", run_name="training", resume=True) as resumed,
     ):
         assert resumed.run_id == run_id
         assert client.get_run(run_id).info.status == "RUNNING"
@@ -71,26 +71,37 @@ def test_metrics_artifacts_and_resume(client: MlflowClient, tmp_path: Path) -> N
         (2.5, 4),
         (3.5, 8),
     ]
-    with MLflowLogger(experiment="ppo", run_name="training", run_dir=str(tmp_path), resume=True) as resumed:
+    with MLflowLogger(experiment="ppo", run_name="training", resume=True) as resumed:
         assert resumed.run_id == run_id
     assert client.get_run(run_id).info.status == "FINISHED"
-    with MLflowLogger(experiment="ppo", run_name="training", run_dir=str(tmp_path), resume=False) as fresh:
+    with MLflowLogger(experiment="ppo", run_name="training", resume=False) as fresh:
         assert fresh.run_id != run_id
 
 
-def test_experiment_id_and_cloud_run_directory(client: MlflowClient, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_experiment_id_and_run_name(client: MlflowClient, monkeypatch: pytest.MonkeyPatch) -> None:
     experiment = client.get_experiment_by_name("logging-tests")
     assert experiment is not None
     monkeypatch.setenv("MLFLOW_EXPERIMENT_ID", experiment.experiment_id)
     monkeypatch.setenv("MLFLOW_EXPERIMENT_NAME", "ignored")
-    directory = "gs://bucket/run's-directory"
-    with MLflowLogger(experiment="mappo", run_name=None, run_dir=directory, resume=False) as logger:
+    name = "run's-name"
+    with MLflowLogger(experiment="mappo", run_name=name, resume=False) as logger:
         run_id = logger.run_id
-        assert client.get_run(run_id).data.tags["rl2.run_dir"] == directory
-    with MLflowLogger(experiment="mappo", run_name=None, run_dir=directory + "/", resume=True) as resumed:
+        assert client.get_run(run_id).info.run_name == name
+        assert "rl2.run_dir" not in client.get_run(run_id).data.tags
+    with MLflowLogger(experiment="mappo", run_name=name, resume=True) as resumed:
         assert resumed.run_id == run_id
-    with MLflowLogger(experiment="ppo", run_name=None, run_dir=directory, resume=True) as separate:
+    with MLflowLogger(experiment="ppo", run_name=name, resume=True) as separate:
         assert separate.run_id != run_id
+
+    with MLflowLogger(experiment="mappo", run_name="another-name", resume=True) as separate:
+        assert separate.run_id != run_id
+
+
+def test_unnamed_runs_are_not_resumed(client: MlflowClient) -> None:
+    with MLflowLogger(experiment="ppo", run_name=None, resume=False) as logger:
+        run_id = logger.run_id
+    with MLflowLogger(experiment="ppo", run_name=None, resume=True) as fresh:
+        assert fresh.run_id != run_id
 
 
 def test_default_experiment_and_artifact_failure(
@@ -101,7 +112,7 @@ def test_default_experiment_and_artifact_failure(
     monkeypatch.chdir(tmp_path)
     with (
         pytest.raises(RuntimeError, match="upload"),
-        MLflowLogger(experiment="ppo", run_name=None, run_dir=str(tmp_path), resume=False) as logger,
+        MLflowLogger(experiment="ppo", run_name=None, resume=False) as logger,
         patch.object(logger.client, "log_artifact", side_effect=RuntimeError("upload")) as upload,
     ):
         frames = [np.zeros((2, 2, 3), dtype=np.uint8)]  # entries: (H=2, W=2, C=3)
@@ -115,7 +126,7 @@ def test_default_experiment_and_artifact_failure(
 def test_experiment_selection_does_not_leak(client: MlflowClient, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MLFLOW_EXPERIMENT_NAME")
     for name in ("ppo", "mappo"):
-        with MLflowLogger(experiment=name, run_name=None, run_dir="gs://bucket/run", resume=False) as logger:
+        with MLflowLogger(experiment=name, run_name=None, resume=False) as logger:
             experiment = client.get_experiment(client.get_run(logger.run_id).info.experiment_id)
             assert experiment.name == name
 
@@ -137,9 +148,9 @@ def test_experiment_creation_race(client: MlflowClient, monkeypatch: pytest.Monk
     ):
         if error_code == "INTERNAL_ERROR":
             with pytest.raises(MlflowException, match="creation failed"):
-                MLflowLogger(experiment="ppo", run_name=None, run_dir="gs://bucket/run", resume=False)
+                MLflowLogger(experiment="ppo", run_name=None, resume=False)
         else:
-            with MLflowLogger(experiment="ppo", run_name=None, run_dir="gs://bucket/run", resume=False) as logger:
+            with MLflowLogger(experiment="ppo", run_name=None, resume=False) as logger:
                 experiment = client.get_experiment(client.get_run(logger.run_id).info.experiment_id)
                 assert experiment.name == name
 
@@ -148,10 +159,8 @@ def test_experiment_creation_race(client: MlflowClient, monkeypatch: pytest.Monk
     ("frame_count", "fps"),
     [pytest.param(31, 30, id="last-frame-rounding"), pytest.param(1, 49, id="single-frame-rounding")],
 )
-def test_video_preserves_frames_at_artifact_root(
-    client: MlflowClient, tmp_path: Path, frame_count: int, fps: float
-) -> None:
-    with MLflowLogger(experiment="ppo", run_name=None, run_dir=str(tmp_path), resume=False) as logger:
+def test_video_preserves_frames_at_artifact_root(client: MlflowClient, frame_count: int, fps: float) -> None:
+    with MLflowLogger(experiment="ppo", run_name=None, resume=False) as logger:
         frames = [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(frame_count)]  # each (H=2, W=2, C=3)
         frames[-1][:] = 255
         logger.log_video(frames, "gameplay.mp4", fps=fps)
@@ -178,15 +187,15 @@ def test_video_preserves_frames_at_artifact_root(
 )
 def test_invalid_video(frame_count: int, fps: float, message: str) -> None:
     with patch("rl2.mlflow_logging.MlflowClient"):
-        logger = MLflowLogger(experiment="ppo", run_name=None, run_dir="unused", resume=False)
+        logger = MLflowLogger(experiment="ppo", run_name=None, resume=False)
     frames = [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(frame_count)]  # each (H=2, W=2, C=3)
     with pytest.raises(ValueError, match=message):
         logger.log_video(frames, "gameplay.mp4", fps=fps)
 
 
-def test_termination_failure_preserves_training_error(client: MlflowClient, tmp_path: Path) -> None:
+def test_termination_failure_preserves_training_error(client: MlflowClient) -> None:
     error = ValueError("training failed")
-    logger = MLflowLogger(experiment="ppo", run_name=None, run_dir=str(tmp_path), resume=False)
+    logger = MLflowLogger(experiment="ppo", run_name=None, resume=False)
     with (
         pytest.raises(ValueError, match="training failed") as raised,
         patch.object(logger.client, "set_terminated", side_effect=RuntimeError("tracking unavailable")),
@@ -197,8 +206,8 @@ def test_termination_failure_preserves_training_error(client: MlflowClient, tmp_
     assert any("tracking unavailable" in note for note in error.__notes__)
 
 
-def test_termination_failure_after_success_propagates(client: MlflowClient, tmp_path: Path) -> None:
-    logger = MLflowLogger(experiment="ppo", run_name=None, run_dir=str(tmp_path), resume=False)
+def test_termination_failure_after_success_propagates(client: MlflowClient) -> None:
+    logger = MLflowLogger(experiment="ppo", run_name=None, resume=False)
     with (
         pytest.raises(RuntimeError, match="tracking unavailable"),
         patch.object(logger.client, "set_terminated", side_effect=RuntimeError("tracking unavailable")),

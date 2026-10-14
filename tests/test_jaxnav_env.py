@@ -98,11 +98,11 @@ def test_jaxnav_config_matches_smax_and_validates(monkeypatch: pytest.MonkeyPatc
     config = ppo.load_config(root / "jaxnav.yaml")
     reference = ppo.load_config(root / "smax.yaml")
     for name in asdict(reference):
-        if name not in {"env_id", "jaxnav", "run_id", "log_dir"}:
+        if name not in {"env_id", "jaxnav", "run_id", "ckpt_dir"}:
             assert getattr(config, name) == getattr(reference, name)
     assert config.env_id == "JaxNav" and hash(config)
     assert config.run_id == "ippo_JaxNav_4agents_11x11"
-    assert config.log_dir == f"gs://cohere-dev/vlad/rl2/mappo/{config.run_id}"
+    assert config.ckpt_dir == f"gs://cohere-dev/vlad/rl2/mappo/{config.run_id}"
     assert isinstance(ppo.make_env(config), JaxNavEnv)
     with pytest.raises(ValidationError, match="jaxnav settings"):
         replace(config, env_id="SMAX", jaxnav=replace(config.jaxnav, num_agents=2))

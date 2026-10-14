@@ -71,10 +71,16 @@ def job_manifest(args: argparse.Namespace, name: str, image: str) -> dict[str, A
                                 },
                                 "limits": {"memory": f"{args.memory_gib}Gi", "nvidia.com/gpu": "1"},
                             },
-                            "volumeMounts": [{"name": "shm", "mountPath": "/dev/shm"}],
+                            "volumeMounts": [
+                                {"name": "shm", "mountPath": "/dev/shm"},
+                                {"name": "runs", "mountPath": "/runs"},
+                            ],
                         }
                     ],
-                    "volumes": [{"name": "shm", "emptyDir": {"medium": "Memory", "sizeLimit": "2Gi"}}],
+                    "volumes": [
+                        {"name": "shm", "emptyDir": {"medium": "Memory", "sizeLimit": "2Gi"}},
+                        {"name": "runs", "persistentVolumeClaim": {"claimName": "training-runs"}},
+                    ],
                 },
             },
         },
@@ -90,6 +96,7 @@ def submit(args: argparse.Namespace) -> str:
     # Fail before building if the queue, priority, or Job specification is invalid.
     subprocess.run([*kubectl, "-n", "training", "get", "localqueue", "gpu"], check=True)
     subprocess.run([*kubectl, "get", "workloadpriorityclass", f"train-{args.prio}"], check=True)
+    subprocess.run([*kubectl, "-n", "training", "get", "pvc", "training-runs"], check=True)
     subprocess.run([*kubectl, "create", "--dry-run=server", "-f", "-"], input=manifest, text=True, check=True)
     print(f"Building {image} from {ROOT}", flush=True)
     subprocess.run(

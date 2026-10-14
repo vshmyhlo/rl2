@@ -28,6 +28,9 @@ def test_default_gpu_job() -> None:
     assert container["workingDir"] == "/app"
     assert container["resources"]["requests"] == {"cpu": "4", "memory": "16Gi", "nvidia.com/gpu": "1"}
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "1"
+    run_mount = next(mount for mount in container["volumeMounts"] if mount["mountPath"] == "/runs")
+    run_volume = next(volume for volume in pod["volumes"] if volume["name"] == run_mount["name"])
+    assert run_volume["persistentVolumeClaim"]["claimName"] == "training-runs"
 
 
 @pytest.mark.parametrize(
@@ -84,7 +87,7 @@ def test_build_and_submit_preserves_command(monkeypatch: pytest.MonkeyPatch, tmp
     assert all(not call.kwargs.get("shell", False) for call in calls)
 
 
-@pytest.mark.parametrize("failed_step", [pytest.param(1, id="preflight"), pytest.param(4, id="build")])
+@pytest.mark.parametrize("failed_step", [pytest.param(3, id="missing-storage"), pytest.param(5, id="build")])
 def test_failure_does_not_submit(failed_step: int) -> None:
     args = submit.parse_args(["--", "true"])
     failure = subprocess.CalledProcessError(returncode=1, cmd="failed-step")

@@ -345,7 +345,14 @@ def test_training_resume_wiring_and_environment_step_logging(
     monkeypatch.setattr(ppo, "save_checkpoint", save)
 
     def restore(manager: Any, state: TrainState, config: ppo.Config) -> ppo.TrainingProgress:
-        return ppo.TrainingProgress(state, jax.random.key(7), 1, 1, 3.0, 2)
+        return ppo.TrainingProgress(
+            train_state=state.replace(step=5),
+            key=jax.random.key(7),  # ()
+            rollout_count=1,
+            episode_count=1,
+            episode_return_sum=3.0,
+            episode_length_sum=2,
+        )
 
     def train_step(
         runner: ppo.RolloutCarry,
@@ -362,7 +369,12 @@ def test_training_resume_wiring_and_environment_step_logging(
         np.testing.assert_array_equal(runner.episode_starts, True)
         np.testing.assert_array_equal(runner.episode_returns, 0)
         metrics = jax.tree.map(lambda x: x + 1, metrics)  # scalar leaves
-        return ppo.TrainStepResult(state, runner, key, metrics)
+        return ppo.TrainStepResult(
+            train_state=state.replace(step=state.step + 1),
+            rollout_carry=runner,
+            key=key,  # ()
+            metrics=metrics,
+        )
 
     monkeypatch.setattr(ppo, "restore_checkpoint", restore)
     monkeypatch.setattr(ppo, "train_step_donated", train_step)
@@ -374,6 +386,8 @@ def test_training_resume_wiring_and_environment_step_logging(
     assert scalars["charts/total_environment_steps"] == (8.0, 8)
     assert scalars["charts/total_observations"] == (16.0, 8)
     assert scalars["charts/total_episodes"] == (2.0, 8)
+    assert scalars["charts/total_iterations"] == (2.0, 8)
+    assert scalars["charts/total_updates"] == (6.0, 8)
     assert scalars["charts/training_progress"] == (1.0, 8)
     assert scalars["time/checkpoint_seconds"] == (2.5, 8)
     assert save.call_args.args[1].rollout_count == 2

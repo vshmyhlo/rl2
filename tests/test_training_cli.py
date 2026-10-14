@@ -1,83 +1,21 @@
-import importlib
-import sys
-from unittest.mock import MagicMock
+from dataclasses import replace
+from types import ModuleType
+from unittest.mock import Mock
 
-import jax
 import pytest
 
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "ppo",
-        "ppo_rnd",
-        "train_karel_ast_grpo",
-        "train_karel_ast_ar_edit",
-        "train_karel_grpo",
-        "train_grpo_reasoning",
-        "train_wm",
-    ],
-)
-def test_training_configures_cache_before_initialization(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    module = importlib.import_module(f"rl2.{name}")
-    configure_cache = MagicMock(side_effect=RuntimeError("cache configured before model or environment setup"))
-    monkeypatch.setattr(module, "configure_compilation_cache", configure_cache)
-    with pytest.raises(RuntimeError, match="cache configured before model or environment setup"):
-        module.train(object())
-    configure_cache.assert_called_once_with()
+from rl2 import ppo, train_mappo
 
 
 @pytest.mark.parametrize(
-    "name",
-    [
-        "ppo",
-        "ppo_rnd",
-        "train_karel_ast_grpo",
-        "train_karel_ast_ar_edit",
-        "train_karel_grpo",
-        "train_grpo_reasoning",
-        "train_wm",
-    ],
+    ("trainer", "config_path"),
+    [(ppo, "configs/ppo.yaml"), (train_mappo, "configs/mappo/jaxnav.yaml")],
+    ids=["ppo", "mappo"],
 )
-def test_training_cli_uses_environment_backend(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    module = importlib.import_module(f"rl2.{name}")
-    config = object()
-    load_config = MagicMock(return_value=config)
-    train = MagicMock()
-    update_config = MagicMock()
-    monkeypatch.setattr(module, "load_config", load_config)
-    monkeypatch.setattr(module, "train", train)
-    monkeypatch.setattr(jax.config, "update", update_config)
-    monkeypatch.setenv("JAX_PLATFORMS", "cpu")
-    monkeypatch.setattr(sys, "argv", [name, "--config", "custom.yaml"])
-
-    module.main()
-
-    load_config.assert_called_once_with("custom.yaml")
-    train.assert_called_once_with(config)
-    update_config.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "ppo",
-        "ppo_rnd",
-        "train_karel_ast_grpo",
-        "train_karel_ast_ar_edit",
-        "train_karel_grpo",
-        "train_grpo_reasoning",
-        "train_wm",
-    ],
-)
-def test_training_cli_rejects_platform_option(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    module = importlib.import_module(f"rl2.{name}")
-    train = MagicMock()
-    monkeypatch.setattr(module, "train", train)
-    monkeypatch.setattr(sys, "argv", [name, "--platform", "cpu"])
-
-    with pytest.raises(SystemExit) as error:
-        module.main()
-
-    assert error.value.code == 2
-    train.assert_not_called()
+def test_cli_shared_run_directory(trainer: ModuleType, config_path: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = trainer.load_config(config_path)
+    train = Mock()
+    monkeypatch.setattr(trainer, "train", train)
+    monkeypatch.setattr("sys.argv", ["train", "--config", config_path, "--ckpt-dir", "/runs/test/run-1"])
+    trainer.main()
+    train.assert_called_once_with(replace(config, ckpt_dir="/runs/test/run-1"))

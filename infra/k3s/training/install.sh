@@ -25,3 +25,4 @@ systemctl daemon-reload
 systemctl enable rl2-buildkit
 systemctl restart rl2-buildkit
 k3s kubectl apply -f "$training_dir/priorities.yaml"
+k3s kubectl apply -f "$training_dir/storage.yaml"

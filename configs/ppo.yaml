@@ -23,7 +23,7 @@ entropy_coef: 0.01
 entropy_decay: constant # Keep the exploration bonus throughout training
 value_coef: 0.5
 max_grad_norm: 0.5
-log_dir: gs://cohere-dev/vlad/rl2/${run_id}
+ckpt_dir: gs://cohere-dev/vlad/rl2/${run_id}
 run_id: ppo # TensorBoard run directory; change this for a new run
 # All intervals count completed PPO iterations (one rollout and its updates).
 video_interval: 600 # Iterations between recordings; 0 disables recording

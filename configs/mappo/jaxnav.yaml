@@ -31,7 +31,7 @@ entropy_coef: 0.01
 entropy_decay: constant
 value_coef: 1.0
 max_grad_norm: 0.5
-log_dir: gs://cohere-dev/vlad/rl2/mappo/${run_id}
+ckpt_dir: /runs/mappo/${run_id}
 run_id: mappo_${path_name:${env_id}}_${jaxnav.num_agents}agents_${jaxnav.map_size}x${jaxnav.map_size}_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
 log_interval: 10

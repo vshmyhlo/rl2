@@ -69,7 +69,7 @@ with (
 def config(tmp_path: Path) -> ppo.Config:
     return replace(
         ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml"),
-        log_dir=str(tmp_path),
+        ckpt_dir=str(tmp_path),
         run_id="resume-test",
         num_envs=1,
         num_steps=1,
@@ -93,7 +93,7 @@ def state() -> TrainState:
 
 
 def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Config, state: TrainState) -> None:
-    directory = f"{config.log_dir}/{config.run_id}"
+    directory = f"{config.ckpt_dir}/{config.run_id}"
     progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 8, 12.5, 40)
     with ppo.checkpoint_manager(directory) as manager:
         assert ppo.restore_checkpoint(manager, state, config) is None
@@ -133,7 +133,7 @@ def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Confi
         ppo.save_checkpoint(manager, progress._replace(rollout_count=3), config)
         manager.wait_until_finished()
         assert manager.all_steps() == [2, 3]
-    with ppo.checkpoint_manager(f"{config.log_dir}/different-run") as manager:
+    with ppo.checkpoint_manager(f"{config.ckpt_dir}/different-run") as manager:
         assert ppo.restore_checkpoint(manager, fresh, config) is None
 
 
@@ -333,10 +333,9 @@ def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> 
 
 
 def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config) -> None:
-    run_dir = f"{config.log_dir}/{config.run_id}/Breakout-MinAtar"
-    path = Path(config.log_dir) / "config.yaml"
+    path = Path(config.ckpt_dir) / "config.yaml"
     settings = asdict(config)
-    settings.update(env_id="Breakout-MinAtar", log_dir=config.log_dir + "/${run_id}/${path_name:${env_id}}")
+    settings.update(env_id="Breakout-MinAtar", ckpt_dir=config.ckpt_dir + "/${run_id}/${path_name:${env_id}}")
     path.write_text(ppo.yaml.safe_dump(settings))
     config = ppo.load_config(path)
     assert config.checkpoint_interval == 600
@@ -434,7 +433,7 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         assert iterations == [0, 1, 2, 3]
         assert int(resumed.step) == 4
         np.testing.assert_allclose(learning_rates, [ppo.learning_rate_schedule(config)(i) for i in range(4)])
-        writer.assert_called_once_with(experiment="ppo", run_name=config.run_id, run_dir=run_dir, resume=True)
+        writer.assert_called_once_with(experiment="ppo", run_name=config.run_id, resume=True)
         logged = metric_history(writer.return_value)
         assert logged["charts/total_episodes"] == [(3.0, 3), (4.0, 4)]
         assert logged["charts/total_observations"][-1] == (4.0, 4)

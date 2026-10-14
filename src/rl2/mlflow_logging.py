@@ -19,7 +19,7 @@ from numpy.typing import NDArray
 
 
 class MLflowLogger:
-    def __init__(self, *, experiment: str, run_name: str | None, run_dir: str, resume: bool) -> None:
+    def __init__(self, *, experiment: str, run_name: str | None, resume: bool) -> None:
         self.client = MlflowClient()
         experiment_id = os.environ.get("MLFLOW_EXPERIMENT_ID")
         # Resolve through the client without changing MLflow's global experiment or environment.
@@ -39,9 +39,8 @@ class MLflowLogger:
                     experiment_id = selected.experiment_id
             else:
                 experiment_id = selected.experiment_id
-        directory = run_dir.rstrip("/") if "://" in run_dir else str(Path(run_dir).resolve())
-        # Hash the directory so arbitrary paths never become search-filter syntax.
-        key = sha256(f"{experiment}:{directory}".encode()).hexdigest()
+        # Hash the name so arbitrary names never become search-filter syntax.
+        key = sha256(f"{experiment}:{run_name}".encode()).hexdigest()
         runs = (
             self.client.search_runs(
                 [experiment_id],
@@ -49,7 +48,7 @@ class MLflowLogger:
                 order_by=["attributes.start_time DESC"],
                 max_results=1,
             )
-            if resume
+            if resume and run_name is not None
             else []
         )
         if runs:
@@ -59,7 +58,7 @@ class MLflowLogger:
             self.run_id = self.client.create_run(
                 experiment_id,
                 run_name=run_name,
-                tags={"rl2.run_key": key, "rl2.run_dir": directory, "rl2.trainer": experiment},
+                tags={"rl2.run_key": key, "rl2.trainer": experiment},
             ).info.run_id
 
     def __enter__(self) -> Self:

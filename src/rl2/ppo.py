@@ -39,6 +39,8 @@ Progress scalars computed over the logging window:
 
 Progress scalars computed across all training:
     charts/training_progress: Fraction of planned rollout iterations completed, from 0 to 1.
+    charts/total_iterations: Cumulative completed rollouts, including resumed training.
+    charts/total_updates: Cumulative accepted optimizer updates, including resumed training.
     charts/total_episodes: Cumulative completed training episodes.
     charts/total_observations: Cumulative training observations across all environments.
     charts/total_return_mean: Mean raw return over all completed training episodes.
@@ -339,7 +341,7 @@ class Config:
     entropy_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)]
     value_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)]
     max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)]
-    log_dir: str
+    ckpt_dir: str
     video_fps: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     bf16: bool = True
     video_max_frames: Annotated[int, Field(gt=0)] | None = 900
@@ -1096,8 +1098,7 @@ def train(config: Config) -> TrainState:
         configure_compilation_cache()
         batch_size = config.num_envs * config.num_steps
         envs = make_env(config)
-        run_dir = config.log_dir
-        manager = resources.enter_context(closing(checkpoint_manager(run_dir)))
+        manager = resources.enter_context(closing(checkpoint_manager(config.ckpt_dir)))
         key, init_key, reset_key = jax.random.split(jax.random.key(config.seed), 3)  # each () typed PRNG key
         reset_keys = jax.random.split(reset_key, config.num_envs)  # (B,) typed PRNG keys
         obs, env_state = jax.vmap(envs.reset, in_axes=(0, None))(reset_keys, envs.params)  # (B,*O); leaves: (B,...)
@@ -1136,7 +1137,7 @@ def train(config: Config) -> TrainState:
             obs, env_state = jax.vmap(envs.reset, in_axes=(0, None))(reset_keys, envs.params)  # (B,*O); leaves: (B,...)
             print(f"Resumed run {config.run_id} at step {start_rollout_index * batch_size}", flush=True)
         initial_step_count = start_rollout_index * batch_size
-        writer = MLflowLogger(experiment="ppo", run_name=config.run_id, run_dir=run_dir, resume=progress is not None)
+        writer = MLflowLogger(experiment="ppo", run_name=config.run_id, resume=progress is not None)
         resources.enter_context(writer)
         writer.log_text(yaml.safe_dump(asdict(config)), f"config/{initial_step_count}.yaml")
         print(f"Run ID: {config.run_id}\nMLflow run: {writer.run_id}", flush=True)
@@ -1222,6 +1223,8 @@ def train(config: Config) -> TrainState:
                     "charts/entropy_coef": entropy_coef,
                     "charts/total_episodes": episode_count,
                     "charts/total_observations": step_count,
+                    "charts/total_iterations": rollout_count,
+                    "charts/total_updates": int(train_state.step),
                     "charts/training_progress": rollout_count / planned_rollout_count,
                     "charts/episodes": window_episode_count,
                     "time/elapsed_seconds": elapsed_seconds,

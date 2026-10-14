@@ -25,7 +25,7 @@ target_kl: 0.01 # null disables KL early stopping
 entropy_coef: 0.01
 value_coef: 0.5
 max_grad_norm: 0.5
-log_dir: gs://cohere-dev/vlad/rl2/${run_id}
+ckpt_dir: gs://cohere-dev/vlad/rl2/${run_id}
 run_id: ppo_montezuma # TensorBoard run directory; change this for a new run
 video_interval_seconds: 600 # Wall-clock seconds between recordings; 0 disables recording
 video_max_frames: null # Record the full episode, until termination or truncation

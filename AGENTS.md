@@ -1,5 +1,6 @@
 # Development guidelines
 
+- Do not store secrets (including API keys, tokens, or passwords) in `nvida.env`. Supply secrets at runtime through environment variables or a secret manager.
 - Prefer concise, minimalistic code with straightforward control flow and clear names. Avoid unnecessary abstractions, indirection, boilerplate, and speculative generality. Keep the implementation as small as practical while preserving readability, correctness, and the required typing, shape documentation, and test coverage.
 - Prefer standard-library functionality and well-maintained libraries over implementing equivalent functionality from scratch when they fit the task and project constraints. Reuse existing project dependencies where possible.
 - Keep comments and docstrings concise and minimal. Explain non-obvious intent or constraints without restating the code or overexplaining. Preserve required shape documentation.
@@ -14,6 +15,7 @@
 - Add inline shape comments for array-valued properties, variables, function arguments, and return values in new or modified Python code (for example, `# (B, A)`). Place comments alongside declarations, assignments, parameters, and return expressions as appropriate, including array-valued fields within structured returns. Use consistent dimension names, explain non-obvious dimensions, and keep comments accurate when shapes change.
 - In docstrings, start each array argument or return value description with its shape, before its dtype or explanatory text (for example, `actions: (B,) int32 action IDs` and `prior_logits: (B, A) float32 masked policy logits`). Apply this to array-valued fields within structured returns as well.
 - Treat type annotations as the source of truth for internal Python APIs. Rely on static typing rather than adding defensive runtime checks or tests for values excluded by the declared types (for example, checking for `None` when an argument is annotated as `jax.Array`). Validate untyped external input at system boundaries. Keep runtime validation for constraints annotations cannot express, including dtypes, value ranges, and relationships between arguments; cover internal array shape contracts with tests as described below.
+- Do not add `isfinite` checks on floats (for example, `math.isfinite`, `numpy.isfinite`, or `jax.numpy.isfinite`).
 - Ensure focused pytest coverage of array shape contracts, including expected output shapes and relevant input shape variations and boundary cases.
 - Run `uv run ruff format <changed-python-files>` on Python files you change before finishing. Follow the Ruff configuration in `pyproject.toml` and avoid formatting unrelated files.
 - Use pytest for tests: write pytest test functions and run targeted checks with `uv run pytest <test-path>` or specific test node IDs.

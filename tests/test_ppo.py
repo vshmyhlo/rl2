@@ -550,7 +550,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         clock = (30.0, 60.0, 80.0)[iteration]
         loss = next(losses)
         kl = 0.02 if iteration == 1 else 0.0
-        return state, ppo.MinibatchMetrics(
+        return state.replace(step=state.step + int(iteration != 1)), ppo.MinibatchMetrics(
             policy_loss=jnp.asarray(loss),  # ()
             value_loss=jnp.asarray(loss * 2),  # ()
             entropy_loss=jnp.asarray(-config.entropy_coef * (1.0, 0.75, 0.25)[iteration] * loss * 3),  # ()
@@ -617,6 +617,8 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         "charts/total_episode_length_mean": [(2.0, 2), (2.0, 3)],
         "charts/total_episodes": [(1.0, 2), (1.0, 3)],
         "charts/total_observations": [(2.0, 2), (3.0, 3)],
+        "charts/total_iterations": [(2.0, 2), (3.0, 3)],
+        "charts/total_updates": [(2.0, 2), (4.0, 3)],
         "charts/training_progress": [(2 / 3, 2), (1.0, 3)],
         "time/elapsed_seconds": [(60.0, 2), (80.0, 3)],
     }.items():

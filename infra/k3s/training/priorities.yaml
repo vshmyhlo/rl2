@@ -10,4 +10,4 @@ kind: WorkloadPriorityClass
 metadata:
   name: train-high
 value: 100
-description: Run before waiting low-priority training jobs; no running-job preemption.
+description: Preempt lower-priority training jobs when GPU queue quota is full.

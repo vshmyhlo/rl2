@@ -20,6 +20,8 @@ spec:
     matchLabels:
       kubernetes.io/metadata.name: training
   queueingStrategy: BestEffortFIFO
+  preemption:
+    withinClusterQueue: LowerPriority
   resourceGroups:
     - coveredResources: [cpu, memory, nvidia.com/gpu]
       flavors:
