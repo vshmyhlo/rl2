@@ -12,6 +12,7 @@ import optax
 import pytest
 import yaml
 from flax.training.train_state import TrainState
+from omegaconf import OmegaConf
 from ppo_helpers import env_step, metric_history
 from pydantic import ValidationError
 
@@ -27,6 +28,7 @@ from rl2.ppo import (
     train,
     update,
 )
+from rl2.sweeps import load_sweep
 
 
 def small_model_config() -> ppo.ModelConfig:
@@ -34,6 +36,26 @@ def small_model_config() -> ppo.ModelConfig:
         encoder=ppo.RGBEncoderConfig(stages=(ConvStage(4, blocks=1),), embedding_size=8),
         recurrent=ppo.LSTMConfig(hidden_size=8, num_layers=2, intermediate_size=8),
     )
+
+
+def test_sweep_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = Path(__file__).resolve().parents[1]
+    sweep = load_sweep(path=root / "configs/sweeps/foragax_square_wave.yaml", root=root)
+    assert len(sweep.trials) == 18
+    trial = sweep.trials[0]
+    path = tmp_path / "trial.yaml"
+    OmegaConf.save(trial, path)
+    assert OmegaConf.to_container(OmegaConf.load(path), resolve=False)["ckpt_dir"] == "/runs/ppo/${run_id}"
+    config = load_config(path, Config)
+    assert (config.seed, config.learning_rate, config.env.period) == (1, 0.0001, 512)
+    assert config.run_id == trial.run_id
+    assert config.ckpt_dir == f"/runs/ppo/{trial.run_id}"
+    assert load_config(path, Config) == config
+    train = Mock()
+    monkeypatch.setattr(ppo, "train", train)
+    monkeypatch.setattr("sys.argv", ["ppo", "--config", str(path)])
+    ppo.main()
+    train.assert_called_once_with(config)
 
 
 @pytest.mark.parametrize(
@@ -980,6 +1002,7 @@ def test_flat_model_settings_are_rejected(field: str) -> None:
 
 def test_default_model_config(tmp_path: Path) -> None:
     settings = yaml.safe_load((Path(__file__).resolve().parents[1] / "configs/ppo.yaml").read_text())
+    settings["run_id"] = "model_defaults"  # The preset name references model fields replaced below.
     settings["model"] = {"encoder": {"type": "rgb"}}
     path = tmp_path / "ppo.yaml"
     path.write_text(yaml.safe_dump(settings))

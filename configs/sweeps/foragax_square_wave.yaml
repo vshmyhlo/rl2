@@ -1,0 +1,6 @@
+name: foragax_square_wave
+config: configs/ppo/foragax/square_wave_two_biome.yaml
+parameters:
+  learning_rate: [0.0001, 0.00025, 0.001]
+  seed: [1, 2, 3]
+  env.period: [512, 1024]

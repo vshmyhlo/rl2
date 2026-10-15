@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from omegaconf import OmegaConf
 
 submit = SimpleNamespace(**runpy.run_path(str(Path(__file__).resolve().parents[1] / "submit.py")))
 
@@ -87,13 +88,13 @@ def test_build_and_submit_preserves_command(monkeypatch: pytest.MonkeyPatch, tmp
         ]
     )
     with patch("subprocess.run") as run:
-        name = submit.submit(args)
+        names = submit.submit(args)
     calls = run.call_args_list
     build = next(call for call in calls if "buildctl" in call.args[0])
     assert f"context={submit.ROOT}" in build.args[0]
     created = json.loads(calls[-1].kwargs["input"])
     assert calls[-1].args[0][-2:] == [submit.IMAGE_MANAGER, "submit"]
-    assert created["metadata"]["name"] == name
+    assert [created["metadata"]["name"]] == names
     assert created["metadata"]["labels"]["kueue.x-k8s.io/priority-class"] == "train-high"
     container = created["spec"]["template"]["spec"]["containers"][0]
     assert container["command"] == ["uv", "run", "python", "train.py", "--label", "a b; $$(touch /tmp/unused)"]
@@ -106,6 +107,108 @@ def test_build_and_submit_preserves_command(monkeypatch: pytest.MonkeyPatch, tmp
     timer_check = next(call for call in calls if "systemctl" in call.args[0])
     assert calls.index(timer_check) < calls.index(build)
     assert all(not call.kwargs.get("shell", False) for call in calls)
+
+
+def test_sweep_builds_once_and_resumes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setitem(submit.submit.__globals__, "ROOT", tmp_path)
+    (tmp_path / "base.yaml").write_text("seed: 1\nckpt_dir: /runs/ppo/${run_id}\n")
+    path = tmp_path / "sweep.yaml"
+    path.write_text("name: seeds\nconfig: base.yaml\nckpt_dir: /runs/sweep/${run_id}\nparameters: {seed: [1, 2]}\n")
+    args = submit.parse_args(["--sweep", str(path), "--", "uv", "run", "ppo"])
+    snapshots = []
+
+    def capture_build(command: list[str], **kwargs: object) -> None:
+        if "buildctl" in command:
+            snapshots.extend(OmegaConf.load(path) for path in tmp_path.glob(".rl2-sweep-*/*.yaml"))
+
+    identities = []
+    for _ in range(2):
+        with patch("subprocess.run", side_effect=capture_build) as run:
+            names = submit.submit(args)
+        calls = run.call_args_list
+        builds = [c for c in calls if "buildctl" in c.args[0]]
+        assert len(builds) == 1
+        submissions = [c for c in calls if submit.IMAGE_MANAGER in c.args[0]]
+        jobs = [json.loads(c.kwargs["input"]) for c in submissions]
+        assert names == [job["metadata"]["name"] for job in jobs]
+        assert len(jobs) == 2
+        identities.append([job["metadata"]["annotations"]["rl2.local/run-id"] for job in jobs])
+        assert len({job["spec"]["template"]["spec"]["containers"][0]["image"] for job in jobs}) == 1
+        previews = [c for c in calls if "--dry-run=server" in c.args[0]]
+        assert [c.kwargs["input"] for c in previews] == [c.kwargs["input"] for c in submissions]
+        assert all(calls.index(c) < calls.index(builds[0]) for c in previews)
+        for job in jobs:
+            assert job["metadata"]["labels"]["rl2.local/sweep"] == "seeds"
+            command = job["spec"]["template"]["spec"]["containers"][0]["command"]
+            assert command[:4] == ["uv", "run", "ppo", "--config"]
+            assert not (tmp_path / command[-1]).exists()
+    assert identities[0] == identities[1]
+    assert {trial.seed for trial in snapshots} == {1, 2}
+    assert all(trial.ckpt_dir == f"/runs/sweep/{trial.run_id}" for trial in snapshots)
+    assert all(
+        OmegaConf.to_container(trial, resolve=False)["ckpt_dir"] == "/runs/sweep/${run_id}" for trial in snapshots
+    )
+    records = list(tmp_path.glob("runs/sweeps/seeds/*.json"))
+    assert len(records) == 2
+    assert set(json.loads(records[0].read_text())["configs"]) == set(identities[0])
+
+
+def test_sweep_dry_run_has_no_side_effects(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    base = tmp_path / "base.yaml"
+    base.write_text("seed: 1\n")
+    path = tmp_path / "sweep.yaml"
+    path.write_text(f"config: {base}\nparameters: {{seed: [1, 2]}}\n")
+    args = submit.parse_args(["--dry-run", "--sweep", str(path), "--", "uv", "run", "ppo"])
+    with patch("subprocess.run") as run:
+        assert submit.submit(args) == []
+    run.assert_not_called()
+    preview = json.loads(capsys.readouterr().out)
+    assert len(preview["trials"]) == 2
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["base.yaml", "sweep.yaml"]
+
+
+@pytest.mark.parametrize("config_args", [["--config", "base.yaml"], ["--config=base.yaml"]])
+def test_sweep_rejects_command_config(config_args: list[str]) -> None:
+    with pytest.raises(SystemExit):
+        submit.parse_args(["--sweep", "sweep.yaml", "--", "ppo", *config_args])
+
+
+@pytest.mark.parametrize("stage", ["validation", "submission"])
+def test_sweep_failure_preserves_record_and_cleans_configs(
+    stage: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(submit.submit.__globals__, "ROOT", tmp_path)
+    (tmp_path / "base.yaml").write_text("seed: 1\n")
+    path = tmp_path / "sweep.yaml"
+    path.write_text("config: base.yaml\nparameters: {seed: [1, 2, 3]}\n")
+    args = submit.parse_args(["--sweep", str(path), "--", "ppo"])
+    attempts = 0
+
+    def fail_second_job(command: list[str], **kwargs: object) -> None:
+        nonlocal attempts
+        if "--dry-run=server" in command if stage == "validation" else submit.IMAGE_MANAGER in command:
+            attempts += 1
+            if attempts == 2:
+                raise subprocess.CalledProcessError(returncode=1, cmd=command)
+
+    with patch("subprocess.run", side_effect=fail_second_job) as run, pytest.raises(subprocess.CalledProcessError):
+        submit.submit(args)
+    assert attempts == 2
+    assert not list(tmp_path.glob(".rl2-sweep-*"))
+    records = list(tmp_path.glob("runs/sweeps/sweep/*.json"))
+    assert len(records) == 1
+    assert len(json.loads(records[0].read_text())["configs"]) == 3
+    if stage == "validation":
+        assert not any("buildctl" in c.args[0] or submit.IMAGE_MANAGER in c.args[0] for c in run.call_args_list)
+
+
+def test_main_reports_malformed_sweep(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = tmp_path / "broken.yaml"
+    path.write_text("parameters: [\n")
+    with patch("sys.argv", ["submit.py", "--sweep", str(path), "--", "ppo"]), patch("subprocess.run") as run:
+        assert submit.main() == 1
+    run.assert_not_called()
+    assert "Submission failed:" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

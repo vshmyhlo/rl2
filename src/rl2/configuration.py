@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import MISSING, asdict, fields, is_dataclass
-from datetime import UTC, datetime
+from hashlib import sha256
 from io import StringIO
 from pathlib import Path
 from typing import cast
@@ -17,7 +17,7 @@ from rl2.utils import read_bytes
 @dataclass(frozen=True, kw_only=True, config=ConfigDict(extra="forbid", strict=True))
 class BaseConfig:
     run_id: str | None = None
-    ckpt_dir: str = "runs"  # Full run directory, including local or gs:// paths.
+    ckpt_dir: str = "runs/${run_id}"  # Full run directory, including local or gs:// paths.
 
     @field_validator("run_id")
     @classmethod
@@ -42,6 +42,16 @@ def path_name(value: str) -> str:
 OmegaConf.register_resolver("path_name", path_name)
 
 
+def config_digest(settings: DictConfig) -> str:
+    """Hash resolved settings independently of run identity and output location."""
+    identity = settings.copy()
+    identity.run_id = "run"
+    identity.ckpt_dir = "runs"
+    values = cast(dict[str, object], OmegaConf.to_container(identity, resolve=True, throw_on_missing=True))
+    del values["run_id"], values["ckpt_dir"]
+    return sha256(json.dumps(values, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+
+
 def load_config[T: BaseConfig](path: str | Path, config_type: type[T]) -> T:
     """Load local or gs:// YAML, merge schema defaults, resolve, and validate."""
     settings = OmegaConf.load(StringIO(read_bytes(str(path)).decode()))
@@ -54,7 +64,7 @@ def load_config[T: BaseConfig](path: str | Path, config_type: type[T]) -> T:
             defaults[field.name] = asdict(value) if is_dataclass(value) else value
     settings = cast(DictConfig, OmegaConf.merge(defaults, settings))
     if settings.get("run_id") is None:
-        settings.run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+        settings.run_id = f"run_{config_digest(settings)}"
     values = OmegaConf.to_container(settings, resolve=True, throw_on_missing=True)
     # JSON validation accepts YAML lists/objects for strict tuples and nested dataclasses.
     return TypeAdapter(config_type).validate_json(json.dumps(values))

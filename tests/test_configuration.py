@@ -57,7 +57,58 @@ def test_load_config_resolves_schema_defaults(tmp_path: Path) -> None:
     assert config.batch_size == 3
     assert type(config.batch_size) is int
     assert config.run_id is not None
-    assert config.ckpt_dir == "runs"
+    assert config.ckpt_dir == f"runs/{config.run_id}"
+
+
+def test_generated_identity_resumes_and_tracks_config_changes(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("required_count: 2\nbatch_size: ${iterations}\n")
+    original = load_config(path, ExampleConfig)
+    assert load_config(path, ExampleConfig) == original
+    path.write_text("batch_size: 3\nrequired_count: 2\nckpt_dir: elsewhere/${run_id}\n")
+    equivalent = load_config(path, ExampleConfig)
+    assert equivalent.run_id == original.run_id
+    assert equivalent.ckpt_dir == f"elsewhere/{original.run_id}"
+    path.write_text("required_count: 2\nbatch_size: 2\n")
+    changed = load_config(path, ExampleConfig)
+    assert changed.run_id != original.run_id
+    assert changed.ckpt_dir != original.ckpt_dir
+
+
+@pytest.mark.parametrize(
+    "directory,expected",
+    [
+        ("/runs", "/runs"),
+        ("checkpoints/custom/", "checkpoints/custom/"),
+        ("gs://bucket/checkpoints", "gs://bucket/checkpoints"),
+        ("/", "/"),
+        ("/runs/prefix_${run_id}/checkpoints", "/runs/prefix_{run_id}/checkpoints"),
+    ],
+    ids=["absolute", "relative-trailing-slash", "cloud", "root", "embedded-id"],
+)
+def test_generated_identity_preserves_checkpoint_directory(tmp_path: Path, directory: str, expected: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(f"required_count: 1\nckpt_dir: {directory}\n")
+    config = load_config(path, ExampleConfig)
+    assert config.ckpt_dir == expected.format(run_id=config.run_id)
+    assert load_config(path, ExampleConfig) == config
+
+
+@pytest.mark.parametrize("directory", ["null", "''"], ids=["null", "empty"])
+def test_generated_identity_rejects_invalid_directory(tmp_path: Path, directory: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(f"ckpt_dir: {directory}\n")
+    with pytest.raises(ValidationError, match="ckpt_dir"):
+        load_config(path, BaseConfig)
+
+
+def test_explicit_identity_is_preserved_on_resubmission(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("required_count: 2\nrun_id: existing\nckpt_dir: runs/${run_id}\n")
+    original = load_config(path, ExampleConfig)
+    assert load_config(path, ExampleConfig) == original
+    assert original.run_id == "existing"
+    assert original.ckpt_dir == "runs/existing"
 
 
 def test_load_remote_config(monkeypatch: pytest.MonkeyPatch) -> None:
