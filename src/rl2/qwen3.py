@@ -4,15 +4,17 @@ import argparse
 import json
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import tokamax
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from tokenizers import Tokenizer
 
 type Parameters = dict[str, jax.Array]
+type AttentionBackend = Literal["xla", "tokamax", "cudnn"]
 # B: batch, T: input tokens, S: key slots, C: cache capacity, L: layers,
 # D: hidden size, H: head dimension, N: query heads, K: KV heads, V: vocabulary.
 
@@ -116,14 +118,57 @@ def _rope(x: jax.Array, positions: jax.Array, theta: float) -> jax.Array:  # (B,
     return x * jnp.cos(angles).astype(x.dtype) + rotated * jnp.sin(angles).astype(x.dtype)  # (B, T, heads, H)
 
 
+def _attention(
+    query: jax.Array,  # (B, T, N, H)
+    key: jax.Array,  # (B, S, K, H)
+    value: jax.Array,  # (B, S, K, H)
+    mask: jax.Array,  # (B, 1, T, S)
+    backend: AttentionBackend,
+) -> jax.Array:
+    if backend == "xla":
+        return jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")  # (B, T, N, H)
+
+    width = query.shape[1]
+    # Avoid empty fused softmaxes; preserve XLA's mean-value output for fully masked queries.
+    visible = jnp.any(mask, axis=-1)  # (B, 1, T)
+    empty = jnp.repeat(value.mean(axis=1), query.shape[2] // key.shape[2], axis=1)  # (B, N, H)
+    mask = mask | ~visible[..., None]  # (B, 1, T, S)
+    # Masked cuDNN backward requires even query and key lengths.
+    if backend == "cudnn" and width % 2:
+        query = jnp.pad(query, ((0, 0), (0, 1), (0, 0), (0, 0)))  # (B, T+1, N, H)
+        mask = jnp.concatenate((mask, mask[:, :, -1:]), axis=2)  # (B, 1, T+1, S)
+    if backend == "cudnn" and key.shape[1] % 2:
+
+        def pad(projected: jax.Array) -> jax.Array:  # (B, S, K, H)
+            return jnp.pad(projected, ((0, 0), (0, 1), (0, 0), (0, 0)))  # (B, S+1, K, H)
+
+        key, value = jax.tree.map(pad, (key, value))  # Each (B, S+1, K, H).
+        mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 0), (0, 1)))  # (B, 1, padded T, S+1)
+    if backend == "tokamax":
+        attended = tokamax.dot_product_attention(
+            query, key, value, mask=mask, scale=query.shape[-1] ** -0.5
+        )  # (B, T, N, H)
+    else:
+        attended = jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="cudnn")[
+            :, :width
+        ]  # (B, T, N, H)
+    return jnp.where(visible[:, 0, :, None, None], attended, empty[:, None])  # (B, T, N, H)
+
+
 @dataclass(frozen=True)
 class Qwen3LM:
     config: Qwen3Config = Qwen3Config()
     dtype: str = "bfloat16"
+    attention_backend: AttentionBackend = "xla"
 
     def __post_init__(self) -> None:
         if self.dtype not in ("float32", "bfloat16"):
             raise ValueError("dtype must be float32 or bfloat16")
+        if self.attention_backend == "cudnn":
+            if self.dtype != "bfloat16":
+                raise ValueError("cuDNN attention requires dtype=bfloat16")
+            if self.config.head_dim % 8:
+                raise ValueError("cuDNN attention requires head_dim divisible by 8")
 
     def init_cache(self, batch_size: int, capacity: int) -> Qwen3Cache:
         if batch_size <= 0 or not 0 < capacity <= self.config.max_position_embeddings:
@@ -214,7 +259,7 @@ class Qwen3LM:
                 )  # Each (B, C, K, H).
                 keys.append(key)
                 values.append(value)
-            attended = jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")  # (B, T, N, H)
+            attended = _attention(query, key, value, mask, self.attention_backend)  # (B, T, N, H)
             x = x + linear(attended.reshape(batch, width, -1), prefix + "self_attn.o_proj")  # (B, T, D)
             normalized = _rms_norm(
                 x, params[prefix + "post_attention_layernorm.weight"], config.rms_norm_eps
@@ -258,11 +303,12 @@ def load_qwen3_checkpoint(
     *,
     revision: str | None = None,
     dtype: str = "bfloat16",
+    attention_backend: AttentionBackend = "xla",
 ) -> tuple[Qwen3LM, Parameters]:
     """Load local or Hub safetensors directly into JAX, without PyTorch."""
     directory = checkpoint_directory(source, revision)
     config = Qwen3Config.from_dict(json.loads((directory / "config.json").read_text()))
-    model = Qwen3LM(config=config, dtype=dtype)
+    model = Qwen3LM(config=config, dtype=dtype, attention_backend=attention_backend)
     shapes = config.parameter_shapes()
     params: Parameters = {}
     files = sorted(directory.glob("*.safetensors"))
@@ -344,9 +390,10 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="bfloat16")
+    parser.add_argument("--attention-backend", choices=("xla", "tokamax", "cudnn"), default="xla")
     args = parser.parse_args()
     directory = checkpoint_directory(args.model, args.revision)
-    model, params = load_qwen3_checkpoint(str(directory), dtype=args.dtype)
+    model, params = load_qwen3_checkpoint(str(directory), dtype=args.dtype, attention_backend=args.attention_backend)
     tokenizer = Tokenizer.from_file(str(directory / "tokenizer.json"))
     # Official single-user chat template with enable_thinking=False.
     prompt = (

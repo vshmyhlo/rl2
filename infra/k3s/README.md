@@ -323,6 +323,55 @@ one-GPU Job to `training/gpu`:
 ./submit.py --prio low -- uv run python path/to/train.py
 ```
 
+The submitter uses the project's installed Python environment through `uv run
+--no-sync`; run it from the repository root after installing dependencies.
+
+To submit a parameter grid, define a sweep YAML:
+
+```yaml
+name: foragax_square_wave
+config: configs/ppo/foragax/square_wave_two_biome.yaml
+ckpt_dir: /runs/ppo/${run_id}
+parameters:
+  learning_rate: [0.0001, 0.00025, 0.001]
+  seed: [1, 2, 3]
+  env.period: [512, 1024]
+```
+
+`config` is relative to the repository root. `name` defaults to the sweep file's
+stem. Parameter keys use dotted paths, and each list supplies one grid axis.
+Duplicate configurations produce only one trial. Preview this 18-trial example,
+then submit it by removing `--dry-run`:
+
+```bash
+./submit.py --dry-run --sweep configs/sweeps/foragax_square_wave.yaml -- uv run ppo
+./submit.py --sweep configs/sweeps/foragax_square_wave.yaml -- uv run ppo
+```
+
+Omit `--config` from the training command: the submitter supplies a generated
+config for each trial. It builds one image for the entire sweep, validates every
+Job manifest before building, and queues separate one-GPU Jobs. The current
+queue admits one GPU Job at a time. `--dry-run` only expands the plan; it does
+not contact Kubernetes or validate the trainer's configuration schema.
+
+Sweep run IDs are `<name>_<hash>` of the resolved, supplied training settings,
+excluding `run_id` and `ckpt_dir`. Repeating a submission resumes those runs;
+reordering or extending the grid preserves existing trial IDs. Changing a trial's
+settings changes its hash. Sweep IDs replace the base config's `run_id`.
+Optional `ckpt_dir` overrides the base config's path; if both omit it, sweeps use
+`/runs/${run_id}`. Generated YAML preserves interpolation for the trainer to resolve.
+Paths are used exactly as configured; include `${run_id}` for separate trial directories.
+Regular runs keep explicit IDs, or derive stable IDs when none is supplied.
+Resumption uses the latest saved checkpoint, or starts training if none exists.
+
+Submission records under `runs/sweeps/<name>/` contain the generated configs and
+Job manifests, including attempted jobs if submission fails partway through.
+Already queued jobs remain queued on failure. Inspect a sweep with:
+
+```bash
+sudo k3s kubectl -n training get jobs -l rl2.local/sweep=foragax_square_wave
+```
+
 One-time host setup (installs BuildKit `v0.34.0`, enables the root
 `rl2-buildkit` service and image-pin cleanup timer, creates two Kueue priority
 classes, and provisions run storage; rerun to update an existing installation):

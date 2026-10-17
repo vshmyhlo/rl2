@@ -1,15 +1,17 @@
 import json
 from dataclasses import asdict, replace
 from pathlib import Path
+from typing import Literal
 from unittest.mock import Mock
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tokamax
 from safetensors.flax import save_file
 
-from rl2.qwen3 import Parameters, Qwen3Config, Qwen3LM, generate_tokens, load_qwen3_checkpoint, main
+from rl2.qwen3 import AttentionBackend, Parameters, Qwen3Config, Qwen3LM, generate_tokens, load_qwen3_checkpoint, main
 
 
 @pytest.fixture(scope="module")
@@ -69,9 +71,17 @@ def test_huggingface_gradient(model: Qwen3LM, params: Parameters, reference: dic
     np.testing.assert_allclose(gradient["model.embed_tokens.weight"], reference["embedding_grad"], atol=2e-6, rtol=2e-5)
 
 
-@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-def test_cache_padding_and_causality(model: Qwen3LM, params: Parameters, dtype: str) -> None:
-    model = replace(model, dtype=dtype)
+@pytest.mark.parametrize(
+    "dtype,backend",
+    [("float32", "xla"), ("bfloat16", "xla"), ("bfloat16", "tokamax")],
+)
+def test_cache_padding_and_causality(
+    model: Qwen3LM,
+    params: Parameters,
+    dtype: str,
+    backend: AttentionBackend,
+) -> None:
+    model = replace(model, dtype=dtype, attention_backend=backend)
     forward = jax.jit(model)
     tokens = jnp.array([[0, 1, 4], [3, 2, 0]], jnp.int32)  # (B=2, T=3)
     mask = jnp.array([[False, True, True], [True, True, False]])  # (B, T), left/right padding.
@@ -92,7 +102,7 @@ def test_cache_padding_and_causality(model: Qwen3LM, params: Parameters, dtype: 
     assert int(decoded.cache.index) == 5
     np.testing.assert_array_equal(decoded.cache.lengths, [4, 4])
     packed = jnp.array([[1, 4, 7, 8], [3, 2, 6, 5]], jnp.int32)  # (B, T=4)
-    expected = forward(params, packed).logits  # (B, T, V=13)
+    expected = jax.jit(replace(model, attention_backend="xla"))(params, packed).logits  # (B, T, V=13)
     tolerance = 0.02 if dtype == "bfloat16" else 2e-6
     np.testing.assert_allclose(decoded.logits, expected[:, 2:], atol=tolerance, rtol=tolerance)
     np.testing.assert_allclose(prefill.logits[0, 1:], expected[0, :2], atol=tolerance, rtol=tolerance)
@@ -106,6 +116,102 @@ def test_cache_padding_and_causality(model: Qwen3LM, params: Parameters, dtype: 
     np.testing.assert_allclose(changed[:, :-1], expected[:, :-1], atol=tolerance, rtol=tolerance)
 
 
+def test_tokamax_masked_gradients(
+    model: Qwen3LM,
+    params: Parameters,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attention = Mock(wraps=tokamax.dot_product_attention)
+    monkeypatch.setattr(tokamax, "dot_product_attention", attention)
+    tokens = jnp.array([[0, 0, 0], [0, 1, 4]], jnp.int32)  # (B=2, T=3)
+    mask = jnp.array([[False, False, False], [False, True, True]])  # (B, T)
+
+    def loss(weights: Parameters, lm: Qwen3LM) -> tuple[jax.Array, jax.Array]:
+        logits = lm(weights, tokens, attention_mask=mask).logits  # (B, T, V=13)
+        return jnp.square(logits).mean(), logits  # (), (B, T, V)
+
+    evaluate = jax.jit(jax.value_and_grad(loss, has_aux=True), static_argnums=1)
+    (expected_loss, expected), expected_grad = evaluate(params, model)  # (), (B, T, V), parameter shapes.
+    (actual_loss, actual), actual_grad = evaluate(params, replace(model, attention_backend="tokamax"))
+    assert attention.called
+    assert actual.shape == expected.shape == (2, 3, 13)
+    np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-5)
+    np.testing.assert_allclose(actual_loss, expected_loss, atol=2e-6, rtol=2e-5)
+    for name in params:
+        assert actual_grad[name].shape == params[name].shape
+        np.testing.assert_allclose(actual_grad[name], expected_grad[name], atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize("real_cudnn", [False, True], ids=["cpu-routing", "gpu"])
+def test_cudnn_attention(model: Qwen3LM, monkeypatch: pytest.MonkeyPatch, real_cudnn: bool) -> None:
+    if real_cudnn and not any("NVIDIA" in device.device_kind for device in jax.devices()):
+        pytest.skip("Requires an NVIDIA GPU with cuDNN")
+    config = replace(model.config, head_dim=128 if real_cudnn else 8, num_hidden_layers=1)
+    model = replace(model, config=config, dtype="bfloat16")
+    rng = np.random.default_rng(7)
+    params = {
+        name: jnp.asarray(rng.normal(0, 0.2, shape), jnp.float32) + (1 if "norm" in name else 0)
+        for name, shape in config.parameter_shapes().items()
+    }  # Each parameter has its configured shape.
+    original_attention = jax.nn.dot_product_attention
+    calls: list[tuple[int, int]] = []
+
+    def attention(
+        query: jax.Array,  # (B, T, N, H)
+        key: jax.Array,  # (B, S, K, H)
+        value: jax.Array,  # (B, S, K, H)
+        *,
+        mask: jax.Array,  # (B, 1, T, S)
+        implementation: Literal["xla", "cudnn"],
+    ) -> jax.Array:
+        if implementation == "cudnn":
+            assert query.dtype == key.dtype == value.dtype == jnp.bfloat16
+            assert query.shape[1] % 2 == key.shape[1] % 2 == 0
+            assert mask.shape == (query.shape[0], 1, query.shape[1], key.shape[1])
+            calls.append((query.shape[1], key.shape[1]))
+            if not real_cudnn:
+                implementation = "xla"
+        return original_attention(query, key, value, mask=mask, implementation=implementation)  # (B, T, N, H)
+
+    monkeypatch.setattr(jax.nn, "dot_product_attention", attention)
+    fused = replace(model, attention_backend="cudnn")
+    tokens = jnp.array([[0, 1, 4], [3, 2, 0]], jnp.int32)  # (B=2, T=3)
+    mask = jnp.array([[False, True, True], [True, True, False]])  # (B, T)
+    cache = model.init_cache(batch_size=2, capacity=5)
+    actual = jax.jit(fused)(params, tokens, attention_mask=mask, cache=cache)
+    expected = jax.jit(model)(params, tokens, attention_mask=mask, cache=cache)
+    assert actual.logits.shape == (2, 3, 13)
+    assert actual.cache is not None
+    assert actual.cache.key.shape == actual.cache.value.shape == (1, 2, 5, 2, config.head_dim)
+    assert int(actual.cache.index) == 3
+    np.testing.assert_allclose(actual.logits, expected.logits, atol=0.02, rtol=0.02)
+    next_tokens = jnp.array([[7], [6]], jnp.int32)  # (B, T=1)
+    actual = jax.jit(fused)(params, next_tokens, cache=actual.cache)
+    expected = jax.jit(model)(params, next_tokens, cache=expected.cache)
+    assert actual.logits.shape == (2, 1, 13)
+    np.testing.assert_allclose(actual.logits, expected.logits, atol=0.02, rtol=0.02)
+
+    def loss(weights: Parameters, lm: Qwen3LM) -> tuple[jax.Array, jax.Array]:
+        logits = lm(weights, tokens, attention_mask=mask.at[0].set(False)).logits  # (B, T, V=13)
+        return jnp.square(logits).mean(), logits  # (), (B, T, V)
+
+    evaluate = jax.jit(jax.value_and_grad(loss, has_aux=True), static_argnums=1)
+    (_, actual_logits), actual_grad = evaluate(params, fused)  # (B, T, V), parameter shapes.
+    (_, expected_logits), expected_grad = evaluate(params, model)  # (B, T, V), parameter shapes.
+    np.testing.assert_allclose(actual_logits, expected_logits, atol=0.02, rtol=0.02)
+    for name, weight in params.items():  # Each weight has its configured shape.
+        assert actual_grad[name].shape == weight.shape
+        np.testing.assert_allclose(actual_grad[name], expected_grad[name], atol=0.02, rtol=0.04)
+    assert set(calls) == {(4, 6), (2, 6), (4, 4)}  # Prefill, single-token decode, uncached gradients.
+
+
+def test_cudnn_validation(model: Qwen3LM) -> None:
+    with pytest.raises(ValueError, match="bfloat16"):
+        replace(model, attention_backend="cudnn")
+    with pytest.raises(ValueError, match="head_dim divisible by 8"):
+        replace(model, dtype="bfloat16", attention_backend="cudnn")
+
+
 def test_checkpoint_loading(model: Qwen3LM, params: Parameters, tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3", **asdict(model.config)}))
     names = sorted(params)
@@ -115,8 +221,9 @@ def test_checkpoint_loading(model: Qwen3LM, params: Parameters, tmp_path: Path) 
     tail["lm_head.weight"] = params["model.embed_tokens.weight"]  # (V=13, D=8)
     path = tmp_path / "model-00002-of-00002.safetensors"
     save_file(tail, path)
-    loaded_model, loaded = load_qwen3_checkpoint(str(tmp_path), dtype="bfloat16")
+    loaded_model, loaded = load_qwen3_checkpoint(str(tmp_path), dtype="bfloat16", attention_backend="tokamax")
     assert loaded_model.config == model.config
+    assert loaded_model.attention_backend == "tokamax"
     assert loaded.keys() == params.keys()
     for name in params:
         assert loaded[name].dtype == jnp.bfloat16
@@ -192,19 +299,26 @@ def test_capacity_validation(model: Qwen3LM, params: Parameters) -> None:
         model(params, jnp.zeros((1, 0), jnp.int32))
 
 
+@pytest.mark.parametrize("backend", ["tokamax", "cudnn"])
 def test_cli(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: Qwen3LM, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    model: Qwen3LM,
+    capsys: pytest.CaptureFixture[str],
+    backend: AttentionBackend,
 ) -> None:
     tokenizer = Mock()
     tokenizer.encode.return_value.ids = [1, 4]
     tokenizer.decode.return_value = "Hello"
     generate = Mock(return_value=[7, 2])
-    monkeypatch.setattr("sys.argv", ["qwen3", "--prompt", "Hi"])
+    monkeypatch.setattr("sys.argv", ["qwen3", "--prompt", "Hi", "--attention-backend", backend])
     monkeypatch.setattr("rl2.qwen3.checkpoint_directory", Mock(return_value=tmp_path))
-    monkeypatch.setattr("rl2.qwen3.load_qwen3_checkpoint", Mock(return_value=(model, {})))
+    load = Mock(return_value=(model, {}))
+    monkeypatch.setattr("rl2.qwen3.load_qwen3_checkpoint", load)
     monkeypatch.setattr("rl2.qwen3.Tokenizer", Mock(from_file=Mock(return_value=tokenizer)))
     monkeypatch.setattr("rl2.qwen3.generate_tokens", generate)
     main()
+    load.assert_called_once_with(str(tmp_path), dtype="bfloat16", attention_backend=backend)
     tokenizer.encode.assert_called_once_with(
         "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
         add_special_tokens=False,
