@@ -1,4 +1,5 @@
 import json
+import runpy
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Literal
@@ -7,8 +8,12 @@ from unittest.mock import Mock
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 import tokamax
+from flax import linen as nn
+from flax import serialization
+from flax.training.train_state import TrainState
 from safetensors.flax import save_file
 
 from rl2.qwen3 import AttentionBackend, Parameters, Qwen3Config, Qwen3LM, generate_tokens, load_qwen3_checkpoint, main
@@ -23,6 +28,7 @@ def reference() -> dict[str, jax.Array]:
 
 @pytest.fixture(scope="module")
 def model() -> Qwen3LM:
+    assert not jax.config.jax_disable_jit, "Qwen3 tests require JIT"
     return Qwen3LM(
         config=Qwen3Config(
             vocab_size=13,
@@ -50,9 +56,11 @@ def test_huggingface_logits(
     reference: dict[str, jax.Array],
     tied: bool,
 ) -> None:
-    model = replace(model, config=replace(model.config, tie_word_embeddings=tied))
+    model = model.clone(config=replace(model.config, tie_word_embeddings=tied))
     params = {name: reference[name] for name in model.config.parameter_shapes()}
-    output = jax.jit(model)(params, reference["tokens"], position_ids=reference["positions"])
+    template = jax.eval_shape(model.init, jax.random.key(0), reference["tokens"])["params"]
+    assert jax.tree.map(jnp.shape, template) == model.config.parameter_shapes()
+    output = jax.jit(model.apply)({"params": params}, reference["tokens"], position_ids=reference["positions"])
     assert output.logits.shape == (2, 3, 13)
     assert output.logits.dtype == jnp.float32
     assert output.cache is None
@@ -63,12 +71,53 @@ def test_huggingface_logits(
 
 def test_huggingface_gradient(model: Qwen3LM, params: Parameters, reference: dict[str, jax.Array]) -> None:
     def loss(weights: Parameters) -> jax.Array:
-        output = model(weights, reference["tokens"], position_ids=reference["positions"])
+        output = model.apply({"params": weights}, reference["tokens"], position_ids=reference["positions"])
         return jnp.square(output.logits).mean()  # ()
 
     gradient = jax.jit(jax.grad(loss))(params)
     assert jax.tree.map(jnp.shape, gradient) == jax.tree.map(jnp.shape, params)
     np.testing.assert_allclose(gradient["model.embed_tokens.weight"], reference["embedding_grad"], atol=2e-6, rtol=2e-5)
+    state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.sgd(0.01))
+    updated = state.apply_gradients(grads=gradient)
+    assert int(updated.step) == 1
+    evaluate_loss = jax.jit(loss)
+    assert float(evaluate_loss(updated.params)) < float(evaluate_loss(state.params))
+
+
+def test_trailing_logits(model: Qwen3LM, params: Parameters, reference: dict[str, jax.Array]) -> None:
+    forward = jax.jit(model.apply, static_argnames=("logits_to_keep",))
+    output = forward(
+        {"params": params},
+        reference["tokens"],
+        position_ids=reference["positions"],
+        logits_to_keep=1,
+        cache=model.init_cache(batch_size=2, capacity=3),
+    )
+    assert output.logits.shape == (2, 1, 13)
+    np.testing.assert_allclose(output.logits, reference["tied_logits"][:, -1:], atol=2e-6, rtol=2e-5)
+    assert output.cache is not None
+    assert int(output.cache.index) == 3
+    assert output.cache.key.shape == (2, 2, 3, 2, 4)
+    for invalid in (-1, 4):
+        with pytest.raises(ValueError, match="logits_to_keep"):
+            forward({"params": params}, reference["tokens"], logits_to_keep=invalid)
+
+
+def test_flax_initialization_composition_and_serialization(model: Qwen3LM) -> None:
+    wrapped = nn.Sequential([model.clone(dtype="bfloat16")])
+    tokens = jnp.array([[1, 4, 7], [3, 2, 6]], jnp.int32)  # (B=2, T=3)
+    variables = wrapped.init(jax.random.key(0), tokens)
+    params = variables["params"]["layers_0"]
+    assert jax.tree.map(jnp.shape, params) == model.config.parameter_shapes()
+    assert all(weight.dtype == jnp.float32 for weight in params.values())
+    for name, weight in params.items():  # Shape from parameter_shapes().
+        if "norm" in name:
+            np.testing.assert_array_equal(weight, 1)
+    restored = serialization.from_bytes(variables, serialization.to_bytes(variables))
+    output = jax.jit(wrapped.apply)(restored, tokens)
+    assert output.logits.shape == (2, 3, 13)
+    assert output.logits.dtype == jnp.float32
+    np.testing.assert_array_equal(output.logits, jax.jit(wrapped.apply)(variables, tokens).logits)
 
 
 @pytest.mark.parametrize(
@@ -81,12 +130,12 @@ def test_cache_padding_and_causality(
     dtype: str,
     backend: AttentionBackend,
 ) -> None:
-    model = replace(model, dtype=dtype, attention_backend=backend)
-    forward = jax.jit(model)
+    model = model.clone(dtype=dtype, attention_backend=backend)
+    forward = jax.jit(model.apply)
     tokens = jnp.array([[0, 1, 4], [3, 2, 0]], jnp.int32)  # (B=2, T=3)
     mask = jnp.array([[False, True, True], [True, True, False]])  # (B, T), left/right padding.
     cache = model.init_cache(batch_size=2, capacity=5)
-    prefill = forward(params, tokens, attention_mask=mask, cache=cache)
+    prefill = forward({"params": params}, tokens, attention_mask=mask, cache=cache)
     assert prefill.cache is not None
     assert prefill.cache.key.shape == prefill.cache.value.shape == (2, 2, 5, 2, 4)
     assert prefill.cache.key.dtype == jnp.dtype(dtype)
@@ -97,22 +146,22 @@ def test_cache_padding_and_causality(
     np.testing.assert_array_equal(prefill.cache.lengths, [2, 2])
     np.testing.assert_array_equal(prefill.cache.valid[:, :3], mask)
     extra = jnp.array([[7, 8], [6, 5]], jnp.int32)  # (B, T=2)
-    decoded = forward(params, extra, cache=prefill.cache)
+    decoded = forward({"params": params}, extra, cache=prefill.cache)
     assert decoded.cache is not None
     assert int(decoded.cache.index) == 5
     np.testing.assert_array_equal(decoded.cache.lengths, [4, 4])
     packed = jnp.array([[1, 4, 7, 8], [3, 2, 6, 5]], jnp.int32)  # (B, T=4)
-    expected = jax.jit(replace(model, attention_backend="xla"))(params, packed).logits  # (B, T, V=13)
+    expected = jax.jit(model.clone(attention_backend="xla").apply)({"params": params}, packed).logits  # (B, T, V=13)
     tolerance = 0.02 if dtype == "bfloat16" else 2e-6
     np.testing.assert_allclose(decoded.logits, expected[:, 2:], atol=tolerance, rtol=tolerance)
     np.testing.assert_allclose(prefill.logits[0, 1:], expected[0, :2], atol=tolerance, rtol=tolerance)
     np.testing.assert_allclose(prefill.logits[1, :2], expected[1, :2], atol=tolerance, rtol=tolerance)
     # Single-token decoding has the same result as a multi-token cached chunk.
-    first = forward(params, extra[:, :1], cache=prefill.cache)
-    last = forward(params, extra[:, 1:], cache=first.cache)
+    first = forward({"params": params}, extra[:, :1], cache=prefill.cache)
+    last = forward({"params": params}, extra[:, 1:], cache=first.cache)
     assert last.logits.shape == (2, 1, 13)
     np.testing.assert_allclose(last.logits, decoded.logits[:, -1:], atol=tolerance, rtol=tolerance)
-    changed = forward(params, packed.at[:, -1].set(0)).logits  # (B, T, V)
+    changed = forward({"params": params}, packed.at[:, -1].set(0)).logits  # (B, T, V)
     np.testing.assert_allclose(changed[:, :-1], expected[:, :-1], atol=tolerance, rtol=tolerance)
 
 
@@ -127,12 +176,12 @@ def test_tokamax_masked_gradients(
     mask = jnp.array([[False, False, False], [False, True, True]])  # (B, T)
 
     def loss(weights: Parameters, lm: Qwen3LM) -> tuple[jax.Array, jax.Array]:
-        logits = lm(weights, tokens, attention_mask=mask).logits  # (B, T, V=13)
+        logits = lm.apply({"params": weights}, tokens, attention_mask=mask).logits  # (B, T, V=13)
         return jnp.square(logits).mean(), logits  # (), (B, T, V)
 
     evaluate = jax.jit(jax.value_and_grad(loss, has_aux=True), static_argnums=1)
     (expected_loss, expected), expected_grad = evaluate(params, model)  # (), (B, T, V), parameter shapes.
-    (actual_loss, actual), actual_grad = evaluate(params, replace(model, attention_backend="tokamax"))
+    (actual_loss, actual), actual_grad = evaluate(params, model.clone(attention_backend="tokamax"))
     assert attention.called
     assert actual.shape == expected.shape == (2, 3, 13)
     np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-5)
@@ -147,7 +196,7 @@ def test_cudnn_attention(model: Qwen3LM, monkeypatch: pytest.MonkeyPatch, real_c
     if real_cudnn and not any("NVIDIA" in device.device_kind for device in jax.devices()):
         pytest.skip("Requires an NVIDIA GPU with cuDNN")
     config = replace(model.config, head_dim=128 if real_cudnn else 8, num_hidden_layers=1)
-    model = replace(model, config=config, dtype="bfloat16")
+    model = model.clone(config=config, dtype="bfloat16")
     rng = np.random.default_rng(7)
     params = {
         name: jnp.asarray(rng.normal(0, 0.2, shape), jnp.float32) + (1 if "norm" in name else 0)
@@ -174,25 +223,25 @@ def test_cudnn_attention(model: Qwen3LM, monkeypatch: pytest.MonkeyPatch, real_c
         return original_attention(query, key, value, mask=mask, implementation=implementation)  # (B, T, N, H)
 
     monkeypatch.setattr(jax.nn, "dot_product_attention", attention)
-    fused = replace(model, attention_backend="cudnn")
+    fused = model.clone(attention_backend="cudnn")
     tokens = jnp.array([[0, 1, 4], [3, 2, 0]], jnp.int32)  # (B=2, T=3)
     mask = jnp.array([[False, True, True], [True, True, False]])  # (B, T)
     cache = model.init_cache(batch_size=2, capacity=5)
-    actual = jax.jit(fused)(params, tokens, attention_mask=mask, cache=cache)
-    expected = jax.jit(model)(params, tokens, attention_mask=mask, cache=cache)
+    actual = jax.jit(fused.apply)({"params": params}, tokens, attention_mask=mask, cache=cache)
+    expected = jax.jit(model.apply)({"params": params}, tokens, attention_mask=mask, cache=cache)
     assert actual.logits.shape == (2, 3, 13)
     assert actual.cache is not None
     assert actual.cache.key.shape == actual.cache.value.shape == (1, 2, 5, 2, config.head_dim)
     assert int(actual.cache.index) == 3
     np.testing.assert_allclose(actual.logits, expected.logits, atol=0.02, rtol=0.02)
     next_tokens = jnp.array([[7], [6]], jnp.int32)  # (B, T=1)
-    actual = jax.jit(fused)(params, next_tokens, cache=actual.cache)
-    expected = jax.jit(model)(params, next_tokens, cache=expected.cache)
+    actual = jax.jit(fused.apply)({"params": params}, next_tokens, cache=actual.cache)
+    expected = jax.jit(model.apply)({"params": params}, next_tokens, cache=expected.cache)
     assert actual.logits.shape == (2, 1, 13)
     np.testing.assert_allclose(actual.logits, expected.logits, atol=0.02, rtol=0.02)
 
     def loss(weights: Parameters, lm: Qwen3LM) -> tuple[jax.Array, jax.Array]:
-        logits = lm(weights, tokens, attention_mask=mask.at[0].set(False)).logits  # (B, T, V=13)
+        logits = lm.apply({"params": weights}, tokens, attention_mask=mask.at[0].set(False)).logits  # (B, T, V=13)
         return jnp.square(logits).mean(), logits  # (), (B, T, V)
 
     evaluate = jax.jit(jax.value_and_grad(loss, has_aux=True), static_argnums=1)
@@ -207,9 +256,9 @@ def test_cudnn_attention(model: Qwen3LM, monkeypatch: pytest.MonkeyPatch, real_c
 
 def test_cudnn_validation(model: Qwen3LM) -> None:
     with pytest.raises(ValueError, match="bfloat16"):
-        replace(model, attention_backend="cudnn")
+        model.clone(attention_backend="cudnn")
     with pytest.raises(ValueError, match="head_dim divisible by 8"):
-        replace(model, dtype="bfloat16", attention_backend="cudnn")
+        model.clone(dtype="bfloat16", attention_backend="cudnn")
 
 
 def test_checkpoint_loading(model: Qwen3LM, params: Parameters, tmp_path: Path) -> None:
@@ -221,13 +270,19 @@ def test_checkpoint_loading(model: Qwen3LM, params: Parameters, tmp_path: Path) 
     tail["lm_head.weight"] = params["model.embed_tokens.weight"]  # (V=13, D=8)
     path = tmp_path / "model-00002-of-00002.safetensors"
     save_file(tail, path)
-    loaded_model, loaded = load_qwen3_checkpoint(str(tmp_path), dtype="bfloat16", attention_backend="tokamax")
+    loaded_model, variables = load_qwen3_checkpoint(str(tmp_path), dtype="bfloat16", attention_backend="tokamax")
+    loaded = variables["params"]
     assert loaded_model.config == model.config
     assert loaded_model.attention_backend == "tokamax"
     assert loaded.keys() == params.keys()
     for name in params:
         assert loaded[name].dtype == jnp.bfloat16
         np.testing.assert_array_equal(loaded[name], params[name].astype(jnp.bfloat16))
+    tokens = jnp.array([[1, 4, 7], [3, 2, 6]], jnp.int32)  # (B=2, T=3)
+    output = jax.jit(loaded_model.apply)(variables, tokens)
+    expected = jax.jit(model.clone(dtype="bfloat16").apply)({"params": params}, tokens).logits  # (B, T, V=13)
+    assert output.logits.shape == (2, 3, 13)
+    np.testing.assert_allclose(output.logits, expected, atol=0.02, rtol=0.02)
     tail["model.norm.weight"] = jnp.ones((3,), jnp.float32)  # Wrong hidden size.
     save_file(tail, path)
     with pytest.raises(ValueError, match="Invalid shape or dtype"):
@@ -256,6 +311,7 @@ def test_checkpoint_loading(model: Qwen3LM, params: Parameters, tmp_path: Path) 
         ({"hidden_size": 0}, "positive"),
         ({"rms_norm_eps": 0}, "positive"),
         ({"eos_token_id": -1}, "vocabulary"),
+        ({"initializer_range": 0}, "positive"),
     ],
 )
 def test_config_validation(change: dict[str, object], match: str) -> None:
@@ -265,13 +321,13 @@ def test_config_validation(change: dict[str, object], match: str) -> None:
 
 def test_generation(model: Qwen3LM, params: Parameters) -> None:
     # A zero output head makes greedy decoding choose token zero deterministically.
-    model = replace(model, config=replace(model.config, tie_word_embeddings=False, eos_token_id=0))
+    model = model.clone(config=replace(model.config, tie_word_embeddings=False, eos_token_id=0))
     params = {**params, "lm_head.weight": jnp.zeros((13, 8), jnp.float32)}
-    assert generate_tokens(model, params, [1, 4], max_new_tokens=3, temperature=0.7, top_k=1) == [0]
-    model = replace(model, config=replace(model.config, eos_token_id=2))
-    assert generate_tokens(model, params, [1, 4], max_new_tokens=3, temperature=0, top_k=0) == [0, 0, 0]
-    assert generate_tokens(model, params, [1], max_new_tokens=0, top_k=0) == []
-    sampled = generate_tokens(model, params, [1, 4], max_new_tokens=1, temperature=0.7, top_k=0)
+    assert generate_tokens(model, {"params": params}, [1, 4], max_new_tokens=3, temperature=0.7, top_k=1) == [0]
+    model = model.clone(config=replace(model.config, eos_token_id=2))
+    assert generate_tokens(model, {"params": params}, [1, 4], max_new_tokens=3, temperature=0, top_k=0) == [0, 0, 0]
+    assert generate_tokens(model, {"params": params}, [1], max_new_tokens=0, top_k=0) == []
+    sampled = generate_tokens(model, {"params": params}, [1, 4], max_new_tokens=1, temperature=0.7, top_k=0)
     assert len(sampled) == 1 and 0 <= sampled[0] < model.config.vocab_size
 
 
@@ -296,32 +352,94 @@ def test_capacity_validation(model: Qwen3LM, params: Parameters) -> None:
     with pytest.raises(ValueError, match="capacity"):
         model.init_cache(batch_size=1, capacity=17)
     with pytest.raises(ValueError, match="Input width"):
-        model(params, jnp.zeros((1, 0), jnp.int32))
+        model.apply({"params": params}, jnp.zeros((1, 0), jnp.int32))
 
 
-@pytest.mark.parametrize("backend", ["tokamax", "cudnn"])
+@pytest.mark.parametrize("backend,script", [("tokamax", False), ("cudnn", False), ("xla", True)])
 def test_cli(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     model: Qwen3LM,
     capsys: pytest.CaptureFixture[str],
     backend: AttentionBackend,
+    script: bool,
 ) -> None:
     tokenizer = Mock()
     tokenizer.encode.return_value.ids = [1, 4]
     tokenizer.decode.return_value = "Hello"
     generate = Mock(return_value=[7, 2])
-    monkeypatch.setattr("sys.argv", ["qwen3", "--prompt", "Hi", "--attention-backend", backend])
-    monkeypatch.setattr("rl2.qwen3.checkpoint_directory", Mock(return_value=tmp_path))
-    load = Mock(return_value=(model, {}))
+    arguments = ["qwen3", "--prompt", "Hi", "--attention-backend", backend]
+    if script:
+        arguments += [
+            "--raw",
+            "--model",
+            "local-model",
+            "--revision",
+            "pinned",
+            "--dtype",
+            "float32",
+            "--max-new-tokens",
+            "8",
+            "--temperature",
+            "0",
+            "--top-k",
+            "0",
+            "--seed",
+            "7",
+        ]
+    monkeypatch.setattr("sys.argv", arguments)
+    directory = Mock(return_value=tmp_path)
+    monkeypatch.setattr("rl2.qwen3.checkpoint_directory", directory)
+    variables = {"params": {}}
+    load = Mock(return_value=(model, variables))
     monkeypatch.setattr("rl2.qwen3.load_qwen3_checkpoint", load)
     monkeypatch.setattr("rl2.qwen3.Tokenizer", Mock(from_file=Mock(return_value=tokenizer)))
     monkeypatch.setattr("rl2.qwen3.generate_tokens", generate)
-    main()
-    load.assert_called_once_with(str(tmp_path), dtype="bfloat16", attention_backend=backend)
+    if script:
+        runpy.run_path(str(Path(__file__).parents[1] / "scripts" / "infer_qwen3.py"), run_name="__main__")
+    else:
+        main()
+    directory.assert_called_once_with("local-model" if script else "Qwen/Qwen3-0.6B", "pinned" if script else None)
+    load.assert_called_once_with(str(tmp_path), dtype="float32" if script else "bfloat16", attention_backend=backend)
     tokenizer.encode.assert_called_once_with(
-        "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        "Hi" if script else "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
         add_special_tokens=False,
     )
-    assert generate.call_args.args[2] == [1, 4]
+    generate.assert_called_once_with(
+        model,
+        variables,
+        [1, 4],
+        max_new_tokens=8 if script else 128,
+        temperature=0 if script else 0.7,
+        top_k=0 if script else 20,
+        seed=7 if script else 0,
+    )
+    tokenizer.decode.assert_called_once_with([7, 2], skip_special_tokens=True)
     assert capsys.readouterr().out == "Hello\n"
+
+
+@pytest.mark.parametrize(
+    "arguments,match",
+    [
+        (["--max-new-tokens", "-1"], "nonnegative"),
+        (["--temperature", "-1"], "nonnegative"),
+        (["--top-k", "-1"], "nonnegative"),
+        (["--seed", str(2**32)], "uint32"),
+        (["--attention-backend", "cudnn", "--dtype", "float32"], "requires --dtype bfloat16"),
+        (["--raw", "--prompt", ""], "nonempty"),
+    ],
+)
+def test_cli_invalid_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    arguments: list[str],
+    match: str,
+) -> None:
+    directory = Mock()
+    monkeypatch.setattr("rl2.qwen3.checkpoint_directory", directory)
+    monkeypatch.setattr("sys.argv", ["qwen3", "--prompt", "Hi", *arguments])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2
+    assert match in capsys.readouterr().err
+    directory.assert_not_called()

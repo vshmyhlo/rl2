@@ -1,4 +1,4 @@
-"""Qwen3 dense causal language model in JAX, with Hugging Face weight names."""
+"""Flax Linen Qwen3 causal language model, with Hugging Face weight names."""
 
 import argparse
 import json
@@ -9,11 +9,13 @@ from typing import Any, Literal, NamedTuple
 import jax
 import jax.numpy as jnp
 import tokamax
+from flax import linen as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from tokenizers import Tokenizer
 
 type Parameters = dict[str, jax.Array]
+type Variables = dict[str, Parameters]
 type AttentionBackend = Literal["xla", "tokamax", "cudnn"]
 # B: batch, T: input tokens, S: key slots, C: cache capacity, L: layers,
 # D: hidden size, H: head dimension, N: query heads, K: KV heads, V: vocabulary.
@@ -33,6 +35,7 @@ class Qwen3Config:
     max_position_embeddings: int = 40960
     tie_word_embeddings: bool = True
     eos_token_id: int = 151645
+    initializer_range: float = 0.02
 
     def __post_init__(self) -> None:
         dimensions = (
@@ -53,6 +56,8 @@ class Qwen3Config:
             raise ValueError("rms_norm_eps and rope_theta must be positive")
         if not 0 <= self.eos_token_id < self.vocab_size:
             raise ValueError("eos_token_id must be in the vocabulary")
+        if not self.initializer_range > 0:
+            raise ValueError("initializer_range must be positive")
 
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> "Qwen3Config":
@@ -100,7 +105,7 @@ class Qwen3Cache(NamedTuple):
 
 
 class Qwen3Output(NamedTuple):
-    logits: jax.Array  # (B, T, V) float32
+    logits: jax.Array  # (B, U, V) float32; U is the retained input width.
     cache: Qwen3Cache | None
 
 
@@ -126,7 +131,8 @@ def _attention(
     backend: AttentionBackend,
 ) -> jax.Array:
     if backend == "xla":
-        return jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")  # (B, T, N, H)
+        with jax.default_matmul_precision("highest"):
+            return jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")  # (B, T, N, H)
 
     width = query.shape[1]
     # Avoid empty fused softmaxes; preserve XLA's mean-value output for fully masked queries.
@@ -145,9 +151,17 @@ def _attention(
         key, value = jax.tree.map(pad, (key, value))  # Each (B, S+1, K, H).
         mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 0), (0, 1)))  # (B, 1, padded T, S+1)
     if backend == "tokamax":
+        head_dim = query.shape[-1]
+        # Triton's tensor-core dot needs at least 16 contraction elements.
+        if head_dim < 16:
+
+            def pad_head(projected: jax.Array) -> jax.Array:  # (B, T/S, N/K, H)
+                return jnp.pad(projected, ((0, 0), (0, 0), (0, 0), (0, 16 - head_dim)))  # (B, T/S, N/K, 16)
+
+            query, key, value = jax.tree.map(pad_head, (query, key, value))
         attended = tokamax.dot_product_attention(
-            query, key, value, mask=mask, scale=query.shape[-1] ** -0.5
-        )  # (B, T, N, H)
+            query, key, value, mask=mask, scale=head_dim**-0.5, precision=jax.lax.Precision.HIGHEST
+        )[..., :head_dim]  # (B, T, N, H)
     else:
         attended = jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="cudnn")[
             :, :width
@@ -155,13 +169,16 @@ def _attention(
     return jnp.where(visible[:, 0, :, None, None], attended, empty[:, None])  # (B, T, N, H)
 
 
-@dataclass(frozen=True)
-class Qwen3LM:
+class Qwen3LM(nn.Module):
+    """Linen module with flat Hugging Face parameter names and explicit KV cache."""
+
     config: Qwen3Config = Qwen3Config()
     dtype: str = "bfloat16"
+    param_dtype: jax.typing.DTypeLike = jnp.float32
     attention_backend: AttentionBackend = "xla"
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if self.dtype not in ("float32", "bfloat16"):
             raise ValueError("dtype must be float32 or bfloat16")
         if self.attention_backend == "cudnn":
@@ -170,6 +187,7 @@ class Qwen3LM:
             if self.config.head_dim % 8:
                 raise ValueError("cuDNN attention requires head_dim divisible by 8")
 
+    @nn.nowrap
     def init_cache(self, batch_size: int, capacity: int) -> Qwen3Cache:
         if batch_size <= 0 or not 0 < capacity <= self.config.max_position_embeddings:
             raise ValueError("Cache batch size must be positive and capacity must fit the model context")
@@ -188,26 +206,39 @@ class Qwen3LM:
             index=jnp.array(0, jnp.int32),  # ()
         )
 
+    @nn.compact
     def __call__(
         self,
-        params: Parameters,
         tokens: jax.Array,  # (B, T)
         attention_mask: jax.Array | None = None,  # (B, T)
         position_ids: jax.Array | None = None,  # (B, T)
         cache: Qwen3Cache | None = None,
+        logits_to_keep: int = 0,
     ) -> Qwen3Output:
         """Return logits and optional updated cache; compatible with jit and grad.
 
         tokens: (B, T) integer token IDs.
         attention_mask: (B, T) valid input tokens, including during cached calls.
         position_ids: (B, T) RoPE positions; defaults to cumulative non-padding positions.
+        logits_to_keep: Static trailing output width; zero returns all input logits.
         Cache calls append T physical slots; total appended width must fit capacity.
         """
         config = self.config
         batch, width = tokens.shape
+        if not 0 <= logits_to_keep <= width:
+            raise ValueError("logits_to_keep must be between zero and the input width")
         capacity = config.max_position_embeddings if cache is None else cache.valid.shape[1]
         if not 0 < width <= capacity:
             raise ValueError("Input width must be positive and fit the context/cache capacity")
+        params = {
+            name: self.param(
+                name,
+                nn.initializers.ones_init() if "norm" in name else nn.initializers.normal(config.initializer_range),
+                shape,
+                self.param_dtype,
+            )
+            for name, shape in config.parameter_shapes().items()
+        }  # Each leaf has its shape from parameter_shapes().
         if attention_mask is None:
             attention_mask = jnp.ones(tokens.shape, jnp.bool_)  # (B, T)
         attention_mask = attention_mask.astype(jnp.bool_)  # (B, T)
@@ -223,8 +254,6 @@ class Qwen3LM:
             & (jnp.arange(valid.shape[1])[None, :] <= offset + jnp.arange(width)[:, None])[None, None, :, :]
         )  # (B, 1, T, S)
         x = params["model.embed_tokens.weight"][tokens].astype(self.dtype)  # (B, T, D)
-        keys: list[jax.Array] = []  # Each (B, C, K, H).
-        values: list[jax.Array] = []  # Each (B, C, K, H).
 
         def linear(inputs: jax.Array, name: str) -> jax.Array:  # (..., in)
             return jnp.matmul(
@@ -237,8 +266,8 @@ class Qwen3LM:
         def rotate(projected: jax.Array) -> jax.Array:  # (B, T, N/K, H)
             return _rope(projected, position_ids, config.rope_theta)  # (B, T, N/K, H)
 
-        def update(old: jax.Array, new: jax.Array) -> jax.Array:  # (B, C, K, H), (B, T, K, H)
-            return jax.lax.dynamic_update_slice(old, new, (0, offset, 0, 0))  # (B, C, K, H)
+        def update(old: jax.Array, new: jax.Array) -> jax.Array:  # (L, B, C, K, H), (B, T, K, H)
+            return jax.lax.dynamic_update_slice(old, new[None], (layer, 0, offset, 0, 0))  # (L, B, C, K, H)
 
         for layer in range(config.num_hidden_layers):
             prefix = f"model.layers.{layer}."
@@ -252,13 +281,13 @@ class Qwen3LM:
             key = _rms_norm(key, params[prefix + "self_attn.k_norm.weight"], config.rms_norm_eps)  # (B, T, K, H)
             query, key = jax.tree.map(rotate, (query, key))  # (B, T, N/K, H)
             if cache is not None:
-                key, value = jax.tree.map(
+                updated_key, updated_value = jax.tree.map(
                     update,
-                    (cache.key[layer], cache.value[layer]),
+                    (cache.key, cache.value),
                     (key, value),
-                )  # Each (B, C, K, H).
-                keys.append(key)
-                values.append(value)
+                )  # Each (L, B, C, K, H).
+                cache = cache._replace(key=updated_key, value=updated_value)
+                key, value = cache.key[layer], cache.value[layer]  # Each (B, C, K, H).
             attended = _attention(query, key, value, mask, self.attention_backend)  # (B, T, N, H)
             x = x + linear(attended.reshape(batch, width, -1), prefix + "self_attn.o_proj")  # (B, T, D)
             normalized = _rms_norm(
@@ -270,14 +299,9 @@ class Qwen3LM:
             x = x + linear(hidden, prefix + "mlp.down_proj")  # (B, T, D)
         x = _rms_norm(x, params["model.norm.weight"], config.rms_norm_eps)  # (B, T, D)
         head = "model.embed_tokens" if config.tie_word_embeddings else "lm_head"
-        logits = linear(x, head).astype(jnp.float32)  # (B, T, V)
+        logits = linear(x[:, -logits_to_keep:], head).astype(jnp.float32)  # (B, U, V)
         if cache is not None:
-            stacked_key, stacked_value = jax.tree.map(
-                jnp.stack, (keys, values), is_leaf=lambda item: isinstance(item, list)
-            )  # Each (L, B, C, K, H).
-            cache = Qwen3Cache(
-                key=stacked_key,
-                value=stacked_value,
+            cache = cache._replace(
                 valid=valid,
                 lengths=lengths + attention_mask.sum(axis=1, dtype=jnp.int32),  # (B,)
                 index=offset + width,  # ()
@@ -304,11 +328,11 @@ def load_qwen3_checkpoint(
     revision: str | None = None,
     dtype: str = "bfloat16",
     attention_backend: AttentionBackend = "xla",
-) -> tuple[Qwen3LM, Parameters]:
-    """Load local or Hub safetensors directly into JAX, without PyTorch."""
+) -> tuple[Qwen3LM, Variables]:
+    """Return a Linen module and variables loaded directly from HF safetensors."""
     directory = checkpoint_directory(source, revision)
     config = Qwen3Config.from_dict(json.loads((directory / "config.json").read_text()))
-    model = Qwen3LM(config=config, dtype=dtype, attention_backend=attention_backend)
+    model = Qwen3LM(config=config, dtype=dtype, param_dtype=jnp.dtype(dtype), attention_backend=attention_backend)
     shapes = config.parameter_shapes()
     params: Parameters = {}
     files = sorted(directory.glob("*.safetensors"))
@@ -329,12 +353,12 @@ def load_qwen3_checkpoint(
                 params[name] = weight.astype(dtype)  # Same shape as checkpoint tensor.
     if missing := shapes.keys() - params.keys():
         raise ValueError(f"Missing checkpoint weights: {sorted(missing)}")
-    return model, params
+    return model, {"params": params}
 
 
 def generate_tokens(
     model: Qwen3LM,
-    params: Parameters,
+    variables: Variables,
     prompt_ids: list[int],
     *,
     max_new_tokens: int = 128,
@@ -354,8 +378,8 @@ def generate_tokens(
     if max_new_tokens == 0:
         return []
     cache = model.init_cache(batch_size=1, capacity=len(prompt_ids) + max_new_tokens)
-    forward = jax.jit(model)
-    output = forward(params, jnp.array([prompt_ids], jnp.int32), cache=cache)
+    forward = jax.jit(model.apply, static_argnames=("logits_to_keep",), donate_argnames=("cache",))
+    output = forward(variables, jnp.array([prompt_ids], jnp.int32), cache=cache, logits_to_keep=1)
 
     @jax.jit
     def sample(logits: jax.Array, key: jax.Array) -> jax.Array:  # (V,), ()
@@ -375,25 +399,39 @@ def generate_tokens(
         generated.append(token)
         if token == model.config.eos_token_id or index + 1 == max_new_tokens:
             break
-        output = forward(params, jnp.array([[token]], jnp.int32), cache=output.cache)
+        output = forward(variables, jnp.array([[token]], jnp.int32), cache=output.cache, logits_to_keep=1)
     return generated
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
-    parser.add_argument("--revision")
-    parser.add_argument("--prompt", required=True)
+    parser = argparse.ArgumentParser(description="Run Qwen3 text generation with JAX/Flax and a JIT-compiled KV cache.")
+    parser.add_argument(
+        "--model", default="Qwen/Qwen3-0.6B", help="Hugging Face model ID or local checkpoint directory"
+    )
+    parser.add_argument("--revision", help="Hugging Face checkpoint revision or commit")
+    parser.add_argument("--prompt", required=True, help="User message, or literal model input with --raw")
     parser.add_argument("--raw", action="store_true", help="Use a raw completion prompt instead of single-turn chat")
-    parser.add_argument("--max-new-tokens", type=int, default=128)
-    parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--max-new-tokens", type=int, default=128, help="Maximum completion length (default: 128)")
+    parser.add_argument(
+        "--temperature", type=float, default=0.7, help="Sampling temperature; 0 selects greedy decoding"
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=20, help="Sample from the top k tokens; 0 uses the full vocabulary"
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="bfloat16")
     parser.add_argument("--attention-backend", choices=("xla", "tokamax", "cudnn"), default="xla")
     args = parser.parse_args()
+    if args.max_new_tokens < 0 or not args.temperature >= 0 or args.top_k < 0:
+        parser.error("--max-new-tokens, --temperature, and --top-k must be nonnegative")
+    if not 0 <= args.seed < 2**32:
+        parser.error("--seed must fit uint32")
+    if args.attention_backend == "cudnn" and args.dtype != "bfloat16":
+        parser.error("--attention-backend cudnn requires --dtype bfloat16")
+    if args.raw and not args.prompt:
+        parser.error("--raw requires a nonempty --prompt")
     directory = checkpoint_directory(args.model, args.revision)
-    model, params = load_qwen3_checkpoint(str(directory), dtype=args.dtype, attention_backend=args.attention_backend)
+    model, variables = load_qwen3_checkpoint(str(directory), dtype=args.dtype, attention_backend=args.attention_backend)
     tokenizer = Tokenizer.from_file(str(directory / "tokenizer.json"))
     # Official single-user chat template with enable_thinking=False.
     prompt = (
@@ -404,7 +442,7 @@ def main() -> None:
     ids = tokenizer.encode(prompt, add_special_tokens=False).ids
     generated = generate_tokens(
         model,
-        params,
+        variables,
         ids,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
