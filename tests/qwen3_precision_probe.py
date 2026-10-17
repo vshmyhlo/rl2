@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
+    parser.add_argument("--attention-backend", choices=("xla", "tokamax", "cudnn"), default="xla")
     args = parser.parse_args()
     assert jax.default_backend() == ("gpu" if args.device == "cuda" else "cpu")
     torch.set_num_threads(4)
@@ -50,7 +51,9 @@ def main() -> None:
                 stack.callback(module.register_forward_hook(hook).remove)
         reference(torch.tensor([ids], device=args.device), use_cache=False)
 
-    model, variables = qwen3.load_qwen3_checkpoint(str(args.checkpoint), dtype=args.dtype)
+    model, variables = qwen3.load_qwen3_checkpoint(
+        str(args.checkpoint), dtype=args.dtype, attention_backend=args.attention_backend
+    )
     original = qwen3._rms_norm
     captured: list[tuple[jax.Array, jax.Array]] = []  # Each pair (..., D/H), populated during tracing only.
 
@@ -67,15 +70,29 @@ def main() -> None:
     with patch.object(qwen3, "_rms_norm", capture):
         actual = jax.jit(forward)(variables, jnp.asarray([ids], jnp.int32))
         jax.block_until_ready(actual)
+    isolated_norm = jax.jit(original)
+    isolated = [
+        isolated_norm(
+            jnp.asarray(inputs, dtype=args.dtype),  # (B, T, D) or (B, T, N/K, H).
+            variables["params"][name + ".weight"],  # (D/H,).
+            model.config.rms_norm_eps,
+        )
+        for name, (inputs, _) in zip(names, expected, strict=True)
+    ]  # Each output has its corresponding normalization input shape.
+    jax.block_until_ready(isolated)
     results = {
         "platform": jax.default_backend(),
         "dtype": args.dtype,
+        "backend": args.attention_backend,
         "boundaries": {
             name: {
-                kind: _errors(np.asarray(value, dtype=np.float32), target, atol=0.01)
-                for kind, value, target in zip(("input", "output"), values, targets, strict=True)
+                **{
+                    kind: _errors(np.asarray(value, dtype=np.float32), target, atol=0.01)
+                    for kind, value, target in zip(("input", "output"), values, targets, strict=True)
+                },
+                "isolated_output": _errors(np.asarray(local, dtype=np.float32), targets[1], atol=0.01),
             }
-            for name, values, targets in zip(names, actual, expected, strict=True)
+            for name, values, targets, local in zip(names, actual, expected, isolated, strict=True)
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

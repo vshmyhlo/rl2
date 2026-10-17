@@ -23,6 +23,7 @@ from rl2.qwen3 import (
     Parameters,
     Qwen3Config,
     Qwen3LM,
+    _silu,
     generate_tokens,
     load_qwen3_checkpoint,
     main,
@@ -92,6 +93,21 @@ def test_huggingface_gradient(model: Qwen3LM, params: Parameters, reference: dic
     assert int(updated.step) == 1
     evaluate_loss = jax.jit(loss)
     assert float(evaluate_loss(updated.params)) < float(evaluate_loss(state.params))
+
+
+def test_bfloat16_silu_opmath() -> None:
+    # Real first-layer activation; CUDA PyTorch 2.9.1 SiLU and its sum gradient.
+    inputs = jnp.array([[0.40625]], jnp.bfloat16)  # (B=1, D=1).
+
+    def loss(x: jax.Array) -> tuple[jax.Array, jax.Array]:  # (B, D).
+        output = _silu(x)  # (B, D).
+        return output.astype(jnp.float32).sum(), output  # (), (B, D).
+
+    (_, output), gradient = jax.jit(jax.value_and_grad(loss, has_aux=True))(inputs)
+    assert output.shape == gradient.shape == inputs.shape
+    assert output.dtype == gradient.dtype == jnp.bfloat16
+    np.testing.assert_array_equal(output, [[0.244140625]])
+    np.testing.assert_array_equal(gradient, [[0.69921875]])
 
 
 def test_trailing_logits(model: Qwen3LM, params: Parameters, reference: dict[str, jax.Array]) -> None:
@@ -193,6 +209,7 @@ def test_tokamax_masked_gradients(
     (expected_loss, expected), expected_grad = evaluate(params, model)  # (), (B, T, V), parameter shapes.
     (actual_loss, actual), actual_grad = evaluate(params, model.clone(attention_backend="tokamax"))
     assert attention.called
+    assert attention.call_args.kwargs["implementation"] == "triton"
     assert actual.shape == expected.shape == (2, 3, 13)
     np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-5)
     np.testing.assert_allclose(actual_loss, expected_loss, atol=2e-6, rtol=2e-5)
@@ -385,6 +402,7 @@ def test_hlo_audit(
     assert report["executed"] and report["mode"] == mode
     assert set(report["collectives"]) <= ({"all-reduce"} if mode != "forward" else set())
     assert report["median_seconds"] > 0
+    assert report["compile_seconds"] > 0
     assert report["tokens_per_second"] == pytest.approx(3 / report["median_seconds"])
     assert next(tmp_path.glob("*.stablehlo.mlir")).stat().st_size > 0
     assert next(tmp_path.glob("*.hlo.txt")).stat().st_size > 0

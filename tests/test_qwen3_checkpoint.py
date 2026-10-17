@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from safetensors import safe_open
 
 from rl2.qwen3 import AttentionBackend, Qwen3LM, Variables, load_qwen3_checkpoint
 
@@ -51,16 +52,25 @@ def _errors(
     assert actual.shape == expected.shape
     actual, expected = actual.astype(np.float64), expected.astype(np.float64)  # Each (..., V).
     difference = np.abs(actual - expected)  # (..., V)
+    relative = difference / np.maximum(np.abs(expected), 1e-3)  # (..., V)
     rms = float(np.sqrt(np.square(difference).mean()))
+    reference_rms = float(np.sqrt(np.square(expected).mean()))
+    percentiles = np.percentile(difference, (50, 95, 99))  # (3,).
     return {
+        "elements": actual.size,
+        "nan_count": int(np.isnan(actual).sum() + np.isnan(expected).sum()),
+        "inf_count": int(np.isinf(actual).sum() + np.isinf(expected).sum()),
+        "actual_nonzero": int(np.count_nonzero(actual)),
+        "reference_rms": reference_rms,
         "max_abs": float(difference.max()),
         "mean_abs": float(difference.mean()),
         "rms": rms,
-        "relative_rms": rms / max(float(np.sqrt(np.square(expected).mean())), 1e-3),
-        "max_relative": float((difference / np.maximum(np.abs(expected), 1e-3)).max()),
-        "p50_abs": float(np.percentile(difference, 50)),
-        "p95_abs": float(np.percentile(difference, 95)),
-        "p99_abs": float(np.percentile(difference, 99)),
+        "relative_rms": rms / max(reference_rms, 1e-3),
+        "max_relative": float(relative.max()),
+        "mean_relative": float(relative.mean()),
+        "p50_abs": float(percentiles[0]),
+        "p95_abs": float(percentiles[1]),
+        "p99_abs": float(percentiles[2]),
         "fraction_outside_tolerance": float(np.mean(difference > atol + rtol * np.abs(expected))),
         "argmax_agreement": float(np.mean(actual.argmax(axis=-1) == expected.argmax(axis=-1))),
     }
@@ -78,6 +88,8 @@ def test_error_metrics() -> None:
     assert errors["p50_abs"] <= errors["p95_abs"] <= errors["p99_abs"] <= errors["max_abs"]
     assert errors["fraction_outside_tolerance"] == 0.5
     assert errors["argmax_agreement"] == 1
+    assert errors["mean_relative"] == pytest.approx(0.75)
+    assert errors["nan_count"] == errors["inf_count"] == 0
 
 
 def _reference_path(directory: Path, dtype: str, *, gradients: bool = False) -> Path:
@@ -204,6 +216,7 @@ def test_real_checkpoint(
     assert all(generation_matches), "Greedy continuations differ; see saved parity report"
     assert all(results[f"{side}_decode_history_matches"] for side in ("left", "right"))
     for errors in measurements:
+        assert errors["nan_count"] == errors["inf_count"] == 0
         # BF16 bounds reflect eager-vs-fused rounding; see docs/qwen3.md.
         assert errors["max_abs"] < (0.0002 if dtype == "float32" else 1.5)
         assert errors["mean_abs"] < (0.00002 if dtype == "float32" else 0.2)
@@ -211,7 +224,8 @@ def test_real_checkpoint(
 
 
 @pytest.mark.parametrize(
-    "dtype,backend", [("float32", "xla"), ("bfloat16", "xla"), ("bfloat16", "tokamax"), ("bfloat16", "cudnn")]
+    "dtype,backend",
+    [("float32", "xla"), ("float32", "tokamax"), ("bfloat16", "xla"), ("bfloat16", "tokamax"), ("bfloat16", "cudnn")],
 )
 def test_real_checkpoint_gradients(
     checkpoint: tuple[Qwen3LM, Variables], audit_directory: Path, dtype: str, backend: AttentionBackend
@@ -224,15 +238,14 @@ def test_real_checkpoint_gradients(
     model, master = checkpoint
     model = model.clone(dtype=dtype, attention_backend=backend)
     params = jax.tree.map(lambda weight: weight.astype(dtype), master["params"])  # Parameter shapes.
-    selected = {name: params[name] for name in reference if name.startswith("model.")}
-    frozen = {name: weight for name, weight in params.items() if name not in selected}
+    assert {name for name in reference if name.endswith(".weight")} == params.keys()
     tokens = jnp.asarray(reference["tokens"], jnp.int32)  # (B=1, T=24)
 
-    def loss(trainable: dict[str, jax.Array], fixed: dict[str, jax.Array], ids: jax.Array) -> jax.Array:  # (B, T)
-        logits = model.apply({"params": {**fixed, **trainable}}, ids).logits  # (B, T, V)
+    def loss(weights: dict[str, jax.Array], ids: jax.Array) -> jax.Array:  # (B, T)
+        logits = model.apply({"params": weights}, ids).logits  # (B, T, V)
         return optax.softmax_cross_entropy_with_integer_labels(logits[:, :-1], ids[:, 1:]).mean()  # ()
 
-    value, gradients = jax.jit(jax.value_and_grad(loss))(selected, frozen, tokens)  # (), parameter shapes.
+    value, gradients = jax.jit(jax.value_and_grad(loss))(params, tokens)  # (), parameter shapes.
     jax.block_until_ready(gradients)
     errors = {
         name: _errors(np.asarray(grad.astype(jnp.float32)), reference[name], atol=1e-4 if dtype == "float32" else 0.01)
@@ -245,6 +258,20 @@ def test_real_checkpoint_gradients(
         "loss": float(value),
         "torch_loss": float(reference["loss"]),
         "gradients": errors,
+        "parameter_count": len(gradients),
+        "global_rms": float(
+            np.sqrt(
+                sum(item["rms"] ** 2 * item["elements"] for item in errors.values())
+                / sum(item["elements"] for item in errors.values())
+            )
+        ),
+        "global_relative_rms": float(
+            np.sqrt(
+                sum(item["rms"] ** 2 * item["elements"] for item in errors.values())
+                / max(sum(item["reference_rms"] ** 2 * item["elements"] for item in errors.values()), 1e-6)
+            )
+        ),
+        "worst_relative_rms": sorted(errors, key=lambda name: errors[name]["relative_rms"], reverse=True)[:10],
     }
     (audit_directory / f"jax-grad-{dtype}-{backend}.json").write_text(json.dumps(results, indent=2) + "\n")
     print(json.dumps(results, indent=2))
@@ -253,7 +280,62 @@ def test_real_checkpoint_gradients(
     for name, grad in gradients.items():
         assert grad.shape == reference[name].shape
         assert grad.dtype == jnp.dtype(dtype)
-        assert errors[name]["relative_rms"] < (1e-4 if dtype == "float32" else 0.1)
+        assert errors[name]["nan_count"] == errors[name]["inf_count"] == 0
+        assert errors[name]["actual_nonzero"] > 0, name
+        assert errors[name]["relative_rms"] < (1e-4 if dtype == "float32" else 0.1), name
+
+
+def test_real_checkpoint_mapping(checkpoint_source: Path) -> None:
+    model, variables = load_qwen3_checkpoint(str(checkpoint_source))
+    params = variables["params"]
+    seen: set[str] = set()
+    for path in sorted(checkpoint_source.glob("*.safetensors")):
+        with safe_open(path, framework="flax") as archive:
+            for name in archive.keys():  # noqa: SIM118 -- safe_open is not iterable.
+                mapped = (
+                    "model.embed_tokens.weight"
+                    if name == "lm_head.weight" and model.config.tie_word_embeddings
+                    else name
+                )
+                expected = archive.get_tensor(name)  # Checkpoint parameter shape.
+                assert params[mapped].dtype == expected.dtype
+                assert params[mapped].shape == expected.shape
+                assert bool(jnp.array_equal(params[mapped], expected)), name
+                seen.add(mapped)
+    assert seen == params.keys() == model.config.parameter_shapes().keys()
+
+
+@pytest.mark.parametrize(
+    "dtype,backend",
+    [("float32", "xla"), ("bfloat16", "xla"), ("bfloat16", "tokamax"), ("bfloat16", "cudnn")],
+)
+def test_real_checkpoint_intermediates(
+    checkpoint_source: Path, audit_directory: Path, dtype: str, backend: AttentionBackend
+) -> None:
+    output = audit_directory / f"boundaries-{dtype}-{backend}.json"
+    subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).with_name("qwen3_precision_probe.py")),
+            "--checkpoint",
+            str(checkpoint_source),
+            "--output",
+            str(output),
+            "--dtype",
+            dtype,
+            "--attention-backend",
+            backend,
+        ],
+        env={**os.environ, "PYTHONPATH": os.environ.get("QWEN3_TORCH_PYTHONPATH", ""), "USE_TF": "0"},
+        check=True,
+        timeout=300,
+    )
+    results = json.loads(output.read_text())
+    assert results["platform"] == "gpu"
+    for name, boundary in results["boundaries"].items():
+        for errors in boundary.values():
+            assert errors["nan_count"] == errors["inf_count"] == 0, name
+            assert errors["relative_rms"] < (1e-4 if dtype == "float32" else 0.1), name
 
 
 def test_real_inference_script(checkpoint_source: Path) -> None:

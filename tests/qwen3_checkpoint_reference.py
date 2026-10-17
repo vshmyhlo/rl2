@@ -23,7 +23,7 @@ def main() -> None:
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), required=True)
     parser.add_argument("--attention-backend", choices=("eager", "sdpa"), default="eager")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-    parser.add_argument("--gradients", action="store_true", help="Compare representative gradients instead of decoding")
+    parser.add_argument("--gradients", action="store_true", help="Compare every parameter gradient instead of decoding")
     args = parser.parse_args()
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("Real checkpoint reference requires CUDA")
@@ -45,13 +45,7 @@ def main() -> None:
     width = max(map(len, encoded))
     arrays: dict[str, np.ndarray] = {}
     if args.gradients:
-        names = (
-            "model.norm.weight",
-            "model.layers.0.self_attn.q_norm.weight",
-            f"model.layers.{model.config.num_hidden_layers - 1}.mlp.down_proj.weight",
-        )
-        for name, parameter in model.named_parameters():
-            parameter.requires_grad_(name in names)
+        model.train()  # This checkpoint has zero attention dropout.
         ids = torch.tensor([encoded[0]], device=args.device, dtype=torch.long)  # (B=1, T=24)
         logits = model(ids, use_cache=False).logits  # (B, T, V)
         loss = torch.nn.functional.cross_entropy(
@@ -61,8 +55,8 @@ def main() -> None:
         arrays["tokens"] = ids.cpu().numpy()  # (B, T)
         arrays["loss"] = loss.detach().float().cpu().numpy()  # ()
         for name, parameter in model.named_parameters():
-            if name in names:
-                arrays[name] = parameter.grad.float().cpu().numpy()  # Parameter shape.
+            assert parameter.grad is not None, f"Missing gradient: {name}"
+            arrays[name] = parameter.grad.float().cpu().numpy()  # Parameter shape.
     with torch.inference_mode():
         for side in () if args.gradients else ("left", "right"):
             ids = np.full((2, width), 151643, np.int32)  # (B=2, T)
@@ -117,11 +111,13 @@ def main() -> None:
         "torch_attention": args.attention_backend,
         "device": torch.cuda.get_device_name() if args.device == "cuda" else "cpu",
         "gradients": args.gradients,
+        "gradient_parameters": len(list(model.named_parameters())) if args.gradients else 0,
         "cuda": torch.version.cuda,
         "cudnn": torch.backends.cudnn.version(),
         "autocast": False,
         "logits_dtype": str(logits.dtype) if args.gradients else str(output.logits.dtype),
         "tf32": False,
+        "bf16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
         "checkpoint": str(args.checkpoint.resolve()),
         "prompts": list(PROMPTS),
         "formatted_prompts": texts,

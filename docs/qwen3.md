@@ -28,10 +28,25 @@ Only the decoded completion is printed to stdout. The first call includes JIT
 compilation; subsequent token steps reuse the compiled decode function.
 Run `uv run python scripts/infer_qwen3.py --help` for all options.
 
+For a two-turn thinking and tool-calling example, run:
+
+```bash
+uv run python scripts/infer_qwen3.py --demo
+```
+
+The demo asks for `17 * 23`, then asks to multiply that result by `3`. It prints
+thinking, calls a local `multiply` tool, and feeds the result back for an answer.
+It uses Qwen3's [chat/tool format](https://huggingface.co/Qwen/Qwen3-0.6B/blob/main/tokenizer_config.json),
+retaining thinking within each tool round and removing it from earlier user turns.
+Each response re-prefills the conversation; `--max-new-tokens` defaults to 1024
+per response. Truncated responses and more than four tool rounds stop the demo.
+Use `--demo --help` for model, attention, and sampling options.
+
 Select Tokamax attention with `--attention-backend tokamax`, or pass
 `attention_backend="tokamax"` to `load_qwen3_checkpoint` or `Qwen3LM`.
-Tokamax automatically selects an available kernel and supports full forward passes,
-cached decoding, and gradients. The default backend remains `xla`.
+Tokamax explicitly uses its Triton GPU kernel for full forward passes, cached
+decoding, and gradients. Unsupported configurations fail without falling back
+to XLA. The default backend remains `xla`.
 
 Use `--attention-backend cudnn` (Python: `attention_backend="cudnn"`) for JAX's
 built-in cuDNN attention on a compatible NVIDIA GPU. This backend requires
@@ -102,10 +117,10 @@ Transformers installed, run `python tests/qwen3_reference.py`.
 
 ## GPU translation review
 
-See [the extended parity report](jax_torch_parity.md) for the subsequent strict
-checkpoint checks, gradient diagnostics, benchmarks, and backward HLO inspection.
-That run had no GPU access and found CPU numerical discrepancies; the GPU results
-below are earlier measurements, not a fresh certification of the expanded suite.
+See [the current audit](jax_torch_parity.md) for fresh GPU checkpoint checks,
+full parameter-gradient comparisons, benchmarks, and backward HLO inspection.
+The measurements below describe the earlier implementation review and explain
+the existing numerical tolerances; current results are in the linked reports.
 
 Reviewed on 2026-10-17 using an NVIDIA A100-SXM4-40GB. **37 focused unit tests
 and 6 real-checkpoint integration tests passed on GPU with JIT enabled.**

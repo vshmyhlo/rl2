@@ -115,6 +115,11 @@ def _rms_norm(x: jax.Array, weight: jax.Array, eps: float) -> jax.Array:  # (...
     return normalized.astype(x.dtype) * weight.astype(x.dtype)  # (..., D)
 
 
+def _silu(x: jax.Array) -> jax.Array:  # (..., D)
+    # Match PyTorch's FP32 internal arithmetic, including its BF16 backward pass.
+    return jax.nn.silu(x.astype(jnp.float32)).astype(x.dtype)  # (..., D)
+
+
 def _rope(x: jax.Array, positions: jax.Array, theta: float) -> jax.Array:  # (B, T, heads, H), (B, T)
     frequencies = theta ** (-jnp.arange(0, x.shape[-1], 2, dtype=jnp.float32) / x.shape[-1])  # (H/2,)
     angles = positions[..., None].astype(jnp.float32) * frequencies  # (B, T, H/2)
@@ -160,7 +165,13 @@ def _attention(
 
             query, key, value = jax.tree.map(pad_head, (query, key, value))
         attended = tokamax.dot_product_attention(
-            query, key, value, mask=mask, scale=head_dim**-0.5, precision=jax.lax.Precision.HIGHEST
+            query,
+            key,
+            value,
+            mask=mask,
+            scale=head_dim**-0.5,
+            precision=jax.lax.Precision.HIGHEST,
+            implementation="triton",
         )[..., :head_dim]  # (B, T, N, H)
     else:
         attended = jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="cudnn")[
@@ -293,7 +304,7 @@ class Qwen3LM(nn.Module):
             normalized = _rms_norm(
                 x, params[prefix + "post_attention_layernorm.weight"], config.rms_norm_eps
             )  # (B, T, D)
-            hidden = jax.nn.silu(linear(normalized, prefix + "mlp.gate_proj")) * linear(
+            hidden = _silu(linear(normalized, prefix + "mlp.gate_proj")) * linear(
                 normalized, prefix + "mlp.up_proj"
             )  # (B, T, intermediate_size)
             x = x + linear(hidden, prefix + "mlp.down_proj")  # (B, T, D)

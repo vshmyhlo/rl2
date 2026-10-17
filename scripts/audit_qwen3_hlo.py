@@ -95,12 +95,14 @@ def main() -> None:
         return value, updated  # (), parameter shapes; one functional SGD step.
 
     computation = {"forward": forward, "backward": jax.value_and_grad(loss), "train": train}[args.mode]
+    compile_start = perf_counter()
     lowered = jax.jit(
         computation,
         in_shardings=(replicated, batched, batched),
         out_shardings=output_sharding if args.mode == "forward" else (replicated, replicated),
     ).lower(variables, tokens, mask)
     compiled = lowered.compile()
+    compile_seconds = perf_counter() - compile_start
     args.output.mkdir(parents=True, exist_ok=True)
     stem = f"{args.platform}-{args.mode}-{args.dtype}-{args.attention_backend}-{args.sharding}-dp{args.devices}-t{args.length}-keep{args.logits_to_keep}"
     (args.output / f"{stem}.stablehlo.mlir").write_text(str(lowered.compiler_ir()))
@@ -122,6 +124,7 @@ def main() -> None:
         "executed": False,
         "device": devices[0].device_kind,
         "compile_only": compile_only,
+        "compile_seconds": compile_seconds,
         "devices": args.devices,
         "batch": args.batch,
         "length": args.length,
