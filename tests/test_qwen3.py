@@ -15,8 +15,18 @@ from flax import linen as nn
 from flax import serialization
 from flax.training.train_state import TrainState
 from safetensors.flax import save_file
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
 
-from rl2.qwen3 import AttentionBackend, Parameters, Qwen3Config, Qwen3LM, generate_tokens, load_qwen3_checkpoint, main
+from rl2.qwen3 import (
+    AttentionBackend,
+    Parameters,
+    Qwen3Config,
+    Qwen3LM,
+    generate_tokens,
+    load_qwen3_checkpoint,
+    main,
+)
 
 
 @pytest.fixture(scope="module")
@@ -270,7 +280,12 @@ def test_checkpoint_loading(model: Qwen3LM, params: Parameters, tmp_path: Path) 
     tail["lm_head.weight"] = params["model.embed_tokens.weight"]  # (V=13, D=8)
     path = tmp_path / "model-00002-of-00002.safetensors"
     save_file(tail, path)
+    locations = {name: "model-00001-of-00002.safetensors" if i < 8 else path.name for i, name in enumerate(names)}
+    locations["lm_head.weight"] = path.name
+    index = tmp_path / "model.safetensors.index.json"
+    index.write_text(json.dumps({"weight_map": locations}))
     loaded_model, variables = load_qwen3_checkpoint(str(tmp_path), dtype="bfloat16", attention_backend="tokamax")
+    index.unlink()  # Subsequent cases exercise unindexed checkpoint errors.
     loaded = variables["params"]
     assert loaded_model.config == model.config
     assert loaded_model.attention_backend == "tokamax"
@@ -295,6 +310,102 @@ def test_checkpoint_loading(model: Qwen3LM, params: Parameters, tmp_path: Path) 
     save_file(tail, path)
     with pytest.raises(ValueError, match="Unexpected or duplicate"):
         load_qwen3_checkpoint(str(tmp_path))
+
+
+@pytest.mark.parametrize("case", ["shape", "integer", "dtype", "values", "duplicate", "index"])
+def test_checkpoint_strict_coverage(model: Qwen3LM, params: Parameters, tmp_path: Path, case: str) -> None:
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3", **asdict(model.config)}))
+    weights = dict(params)  # Configured parameter shapes.
+    head = params["model.embed_tokens.weight"]  # (V=13, D=8)
+    match = "Tied lm_head.weight"
+    if case == "shape":
+        head = head[:1]  # (1, D)
+        match = "Invalid shape or dtype"
+    elif case == "integer":
+        head = head.astype(jnp.int32)  # (V, D)
+        match = "Invalid shape or dtype"
+    elif case == "dtype":
+        head = head.astype(jnp.bfloat16)  # (V, D)
+    elif case == "values":
+        # A mismatch hidden by the requested BF16 conversion must still fail.
+        head = head.at[0, 0].set(jnp.nextafter(head[0, 0], jnp.float32(1)))  # (V, D)
+        np.testing.assert_array_equal(
+            head.astype(jnp.bfloat16), params["model.embed_tokens.weight"].astype(jnp.bfloat16)
+        )
+    elif case == "duplicate":
+        save_file({"lm_head.weight": head}, tmp_path / "extra.safetensors")
+        match = "Unexpected or duplicate"
+    elif case == "index":
+        index = {name: "model.safetensors" for name in (*weights, "lm_head.weight")}
+        index["model.norm.weight"] = "wrong-shard.safetensors"
+        (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": index}))
+        match = "Checkpoint index"
+    weights["lm_head.weight"] = head  # (V, D), except the invalid shape case.
+    save_file(weights, tmp_path / "model.safetensors")
+    with pytest.raises(ValueError, match=match):
+        load_qwen3_checkpoint(str(tmp_path))
+
+
+@pytest.mark.parametrize("mode", ["forward", "backward", "train"])
+def test_hlo_audit(
+    model: Qwen3LM, params: Parameters, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3", **asdict(model.config)}))
+    save_file(params, tmp_path / "model.safetensors")
+    Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")).save(str(tmp_path / "tokenizer.json"))
+    script = Path(__file__).parents[1] / "scripts" / "audit_qwen3_hlo.py"
+    platform = jax.default_backend()
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            str(script),
+            "--checkpoint",
+            str(tmp_path),
+            "--output",
+            str(tmp_path),
+            "--platform",
+            platform,
+            "--devices",
+            "1",
+            "--batch",
+            "1",
+            "--length",
+            "3",
+            "--mode",
+            mode,
+            "--execute",
+            "--warmup",
+            "1",
+            "--runs",
+            "1",
+        ],
+    )
+    runpy.run_path(str(script), run_name="__main__")
+    report = json.loads(next(tmp_path.glob(f"{platform}-*.json")).read_text())
+    assert report["executed"] and report["mode"] == mode
+    assert set(report["collectives"]) <= ({"all-reduce"} if mode != "forward" else set())
+    assert report["median_seconds"] > 0
+    assert report["tokens_per_second"] == pytest.approx(3 / report["median_seconds"])
+    assert next(tmp_path.glob("*.stablehlo.mlir")).stat().st_size > 0
+    assert next(tmp_path.glob("*.hlo.txt")).stat().st_size > 0
+
+
+@pytest.mark.parametrize(
+    "arguments,match",
+    [
+        (["--mode", "backward", "--length", "1"], "at least two tokens"),
+        (["--mode", "train", "--logits-to-keep", "1"], "require all logits"),
+        (["--runs", "0"], "must be positive"),
+    ],
+)
+def test_hlo_audit_validation(
+    arguments: list[str], match: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    script = Path(__file__).parents[1] / "scripts" / "audit_qwen3_hlo.py"
+    monkeypatch.setattr("sys.argv", [str(script), "--checkpoint", ".", "--output", ".", *arguments])
+    with pytest.raises(SystemExit, match="2"):
+        runpy.run_path(str(script), run_name="__main__")
+    assert match in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

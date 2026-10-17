@@ -334,15 +334,16 @@ def load_qwen3_checkpoint(
     config = Qwen3Config.from_dict(json.loads((directory / "config.json").read_text()))
     model = Qwen3LM(config=config, dtype=dtype, param_dtype=jnp.dtype(dtype), attention_backend=attention_backend)
     shapes = config.parameter_shapes()
+    if config.tie_word_embeddings:
+        shapes["lm_head.weight"] = shapes["model.embed_tokens.weight"]
     params: Parameters = {}
+    locations: dict[str, str] = {}
     files = sorted(directory.glob("*.safetensors"))
     if not files:
         raise FileNotFoundError(f"No safetensors weights in {directory}")
     for file in files:
         with safe_open(file, framework="flax") as tensors:
             for name in tensors.keys():  # noqa: SIM118 -- safe_open is not iterable.
-                if config.tie_word_embeddings and name == "lm_head.weight":
-                    continue
                 if name not in shapes or name in params:
                     raise ValueError(f"Unexpected or duplicate checkpoint weight: {name}")
                 weight = tensors.get_tensor(name)  # Shape from parameter_shapes().
@@ -350,9 +351,21 @@ def load_qwen3_checkpoint(
                     raise ValueError(
                         f"Invalid shape or dtype for {name}: {weight.shape}, {weight.dtype}; expected {shapes[name]}"
                     )
-                params[name] = weight.astype(dtype)  # Same shape as checkpoint tensor.
+                params[name] = weight  # Same shape and dtype as checkpoint tensor.
+                locations[name] = file.name
+    index = directory / "model.safetensors.index.json"
+    if index.exists() and json.loads(index.read_text()).get("weight_map") != locations:
+        raise ValueError("Checkpoint index does not match stored weight locations")
+    if config.tie_word_embeddings:
+        del shapes["lm_head.weight"]
     if missing := shapes.keys() - params.keys():
         raise ValueError(f"Missing checkpoint weights: {sorted(missing)}")
+    if config.tie_word_embeddings and "lm_head.weight" in params:
+        head = params.pop("lm_head.weight")  # (V, D)
+        embedding = params["model.embed_tokens.weight"]  # (V, D)
+        if head.dtype != embedding.dtype or not bool(jnp.array_equal(head, embedding)):
+            raise ValueError("Tied lm_head.weight must equal model.embed_tokens.weight in storage dtype")
+    params = jax.tree.map(lambda weight: weight.astype(dtype), params)  # Checkpoint parameter shapes.
     return model, {"params": params}
 
 

@@ -22,8 +22,10 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), required=True)
     parser.add_argument("--attention-backend", choices=("eager", "sdpa"), default="eager")
+    parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument("--gradients", action="store_true", help="Compare representative gradients instead of decoding")
     args = parser.parse_args()
-    if not torch.cuda.is_available():
+    if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("Real checkpoint reference requires CUDA")
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -34,7 +36,7 @@ def main() -> None:
             attn_implementation=args.attention_backend,
             local_files_only=True,
         )
-        .to("cuda")
+        .to(args.device)
         .eval()
     )
     tokenizer = Tokenizer.from_file(str(args.checkpoint / "tokenizer.json"))
@@ -42,8 +44,27 @@ def main() -> None:
     encoded = [tokenizer.encode(text, add_special_tokens=False).ids for text in texts]
     width = max(map(len, encoded))
     arrays: dict[str, np.ndarray] = {}
+    if args.gradients:
+        names = (
+            "model.norm.weight",
+            "model.layers.0.self_attn.q_norm.weight",
+            f"model.layers.{model.config.num_hidden_layers - 1}.mlp.down_proj.weight",
+        )
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name in names)
+        ids = torch.tensor([encoded[0]], device=args.device, dtype=torch.long)  # (B=1, T=24)
+        logits = model(ids, use_cache=False).logits  # (B, T, V)
+        loss = torch.nn.functional.cross_entropy(
+            logits[:, :-1].float().reshape(-1, logits.shape[-1]), ids[:, 1:].reshape(-1)
+        )  # ()
+        loss.backward()
+        arrays["tokens"] = ids.cpu().numpy()  # (B, T)
+        arrays["loss"] = loss.detach().float().cpu().numpy()  # ()
+        for name, parameter in model.named_parameters():
+            if name in names:
+                arrays[name] = parameter.grad.float().cpu().numpy()  # Parameter shape.
     with torch.inference_mode():
-        for side in ("left", "right"):
+        for side in () if args.gradients else ("left", "right"):
             ids = np.full((2, width), 151643, np.int32)  # (B=2, T)
             valid = np.zeros_like(ids, dtype=np.bool_)  # (B, T)
             for row, sequence in enumerate(encoded):
@@ -51,21 +72,23 @@ def main() -> None:
                 ids[row, start : start + len(sequence)] = sequence
                 valid[row, start : start + len(sequence)] = True
             positions = np.maximum(valid.cumsum(axis=1) - 1, 0).astype(np.int32)  # (B, T)
-            tokens = torch.tensor(ids, device="cuda", dtype=torch.long)  # (B, T)
-            mask = torch.tensor(valid, device="cuda")  # (B, T)
-            pos = torch.tensor(positions, device="cuda", dtype=torch.long)  # (B, T)
+            tokens = torch.tensor(ids, device=args.device, dtype=torch.long)  # (B, T)
+            mask = torch.tensor(valid, device=args.device)  # (B, T)
+            pos = torch.tensor(positions, device=args.device, dtype=torch.long)  # (B, T)
             output = model(tokens, attention_mask=mask, position_ids=pos, use_cache=True)
             arrays[f"{side}_tokens"] = ids  # (B, T)
             arrays[f"{side}_mask"] = valid  # (B, T)
             arrays[f"{side}_positions"] = positions  # (B, T)
             arrays[f"{side}_logits"] = output.logits.float().cpu().numpy()  # (B, T, V)
             lengths = mask.sum(dim=1)  # (B,)
-            last = (mask * torch.arange(width, device="cuda")).max(dim=1).values  # (B,)
-            scores = output.logits[torch.arange(2, device="cuda"), last]  # (B, V)
+            last = (mask * torch.arange(width, device=args.device)).max(dim=1).values  # (B,)
+            scores = output.logits[torch.arange(2, device=args.device), last]  # (B, V)
             for step in range(3):
                 next_ids = scores.argmax(dim=-1, keepdim=True)  # (B, 1)
                 arrays[f"{side}_step_{step}_tokens"] = next_ids.cpu().numpy()  # (B, 1)
-                mask = torch.cat((mask, torch.ones((2, 1), device="cuda", dtype=torch.bool)), dim=1)  # (B, T+step+1)
+                mask = torch.cat(
+                    (mask, torch.ones((2, 1), device=args.device, dtype=torch.bool)), dim=1
+                )  # (B, T+step+1)
                 output = model(
                     next_ids,
                     attention_mask=mask,
@@ -78,7 +101,7 @@ def main() -> None:
             if side == "left":
                 generated = model.generate(
                     tokens,
-                    attention_mask=torch.tensor(valid, device="cuda"),
+                    attention_mask=torch.tensor(valid, device=args.device),
                     max_new_tokens=8,
                     do_sample=False,
                     pad_token_id=151643,
@@ -92,15 +115,23 @@ def main() -> None:
         "transformers": transformers.__version__,
         "dtype": args.dtype,
         "torch_attention": args.attention_backend,
-        "device": torch.cuda.get_device_name(),
+        "device": torch.cuda.get_device_name() if args.device == "cuda" else "cpu",
+        "gradients": args.gradients,
+        "cuda": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version(),
+        "autocast": False,
+        "logits_dtype": str(logits.dtype) if args.gradients else str(output.logits.dtype),
         "tf32": False,
         "checkpoint": str(args.checkpoint.resolve()),
         "prompts": list(PROMPTS),
         "formatted_prompts": texts,
         "token_lengths": list(map(len, encoded)),
-        "generated": arrays["generated"].tolist(),
-        "generated_text": [tokenizer.decode(row.tolist(), skip_special_tokens=True) for row in arrays["generated"]],
     }
+    if "generated" in arrays:
+        metadata["generated"] = arrays["generated"].tolist()
+        metadata["generated_text"] = [
+            tokenizer.decode(row.tolist(), skip_special_tokens=True) for row in arrays["generated"]
+        ]
     args.output.with_suffix(".json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(json.dumps(metadata, indent=2))
 

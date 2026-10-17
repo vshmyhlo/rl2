@@ -5,16 +5,19 @@ import json
 import re
 from collections import Counter
 from pathlib import Path
+from time import perf_counter
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 from jax.experimental import topologies
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jaxlib import xla_client
+from tokenizers import Tokenizer
 
-from rl2.qwen3 import Qwen3Config, Qwen3LM, Variables
+from rl2.qwen3 import Qwen3Config, Qwen3LM, Variables, load_qwen3_checkpoint
 
 
 def main() -> None:
@@ -28,11 +31,24 @@ def main() -> None:
     parser.add_argument("--length", type=int, default=128)
     parser.add_argument("--logits-to-keep", type=int, default=0)
     parser.add_argument("--sharding", choices=("manual", "auto"), default="manual")
+    parser.add_argument("--mode", choices=("forward", "backward", "train"), default="forward")
+    parser.add_argument("--platform", choices=("gpu", "cpu"), default="gpu")
+    parser.add_argument("--execute", action="store_true", help="Load real weights and benchmark synchronized execution")
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--runs", type=int, default=5)
     args = parser.parse_args()
     if args.devices < 1 or args.batch < 1 or args.batch % args.devices:
         parser.error("batch must be a positive multiple of devices")
-    devices = jax.devices("gpu")
+    if args.length < 1 or args.warmup < 1 or args.runs < 1:
+        parser.error("length, warmup, and runs must be positive")
+    if args.mode != "forward" and args.length < 2:
+        parser.error("backward/train require at least two tokens")
+    if args.mode != "forward" and args.logits_to_keep:
+        parser.error("backward/train require all logits for next-token loss")
+    devices = jax.devices(args.platform)
     compile_only = len(devices) < args.devices
+    if compile_only and (args.platform == "cpu" or args.execute):
+        parser.error("Requested execution requires enough physical devices")
     if compile_only:
         target = xla_client.get_topology_for_devices(devices).target_config
         devices = topologies.get_topology_desc(
@@ -66,14 +82,27 @@ def main() -> None:
             out_specs=P("data", None, None),
             check_vma=False,  # Tokamax 0.0.15 Pallas outputs lack manual-axis annotations.
         )
+
+    def loss(weights: Variables, ids: jax.Array, valid: jax.Array) -> jax.Array:  # (B, T), (B, T)
+        logits = forward(weights, ids, valid)[:, :-1]  # (B, T-1, V)
+        losses = optax.softmax_cross_entropy_with_integer_labels(logits, ids[:, 1:])  # (B, T-1)
+        selected = valid[:, :-1] & valid[:, 1:]  # (B, T-1)
+        return jnp.sum(losses * selected) / jnp.maximum(selected.sum(), 1)  # ()
+
+    def train(weights: Variables, ids: jax.Array, valid: jax.Array) -> tuple[jax.Array, Variables]:  # (B, T), (B, T)
+        value, gradients = jax.value_and_grad(loss)(weights, ids, valid)  # (), parameter shapes.
+        updated = jax.tree.map(lambda weight, grad: weight - 1e-3 * grad, weights, gradients)
+        return value, updated  # (), parameter shapes; one functional SGD step.
+
+    computation = {"forward": forward, "backward": jax.value_and_grad(loss), "train": train}[args.mode]
     lowered = jax.jit(
-        forward,
+        computation,
         in_shardings=(replicated, batched, batched),
-        out_shardings=output_sharding,
+        out_shardings=output_sharding if args.mode == "forward" else (replicated, replicated),
     ).lower(variables, tokens, mask)
     compiled = lowered.compile()
     args.output.mkdir(parents=True, exist_ok=True)
-    stem = f"{args.dtype}-{args.attention_backend}-{args.sharding}-dp{args.devices}-t{args.length}-keep{args.logits_to_keep}"
+    stem = f"{args.platform}-{args.mode}-{args.dtype}-{args.attention_backend}-{args.sharding}-dp{args.devices}-t{args.length}-keep{args.logits_to_keep}"
     (args.output / f"{stem}.stablehlo.mlir").write_text(str(lowered.compiler_ir()))
     hlo = compiled.as_text()
     (args.output / f"{stem}.hlo.txt").write_text(hlo)
@@ -88,6 +117,9 @@ def main() -> None:
     memory = compiled.memory_analysis()
     report = {
         "jax": jax.__version__,
+        "platform": args.platform,
+        "mode": args.mode,
+        "executed": False,
         "device": devices[0].device_kind,
         "compile_only": compile_only,
         "devices": args.devices,
@@ -110,9 +142,39 @@ def main() -> None:
             )
         },
     }
+    if args.execute:
+        _, weights = load_qwen3_checkpoint(
+            str(args.checkpoint), dtype=args.dtype, attention_backend=args.attention_backend
+        )
+        tokenizer = Tokenizer.from_file(str(args.checkpoint / "tokenizer.json"))
+        prompt = "Explain reinforcement learning in one sentence."
+        encoded = tokenizer.encode(prompt, add_special_tokens=False).ids
+        ids = jnp.tile(jnp.asarray(encoded, jnp.int32), (args.batch, (args.length + len(encoded) - 1) // len(encoded)))[
+            :, : args.length
+        ]  # (B, T), repeated real text for the requested benchmark length.
+        weights = jax.device_put(weights, replicated)
+        ids = jax.device_put(ids, batched)  # (B, T)
+        valid = jax.device_put(jnp.ones(ids.shape, jnp.bool_), batched)  # (B, T)
+        for _ in range(args.warmup):
+            jax.block_until_ready(compiled(weights, ids, valid))
+        durations: list[float] = []
+        for _ in range(args.runs):
+            start = perf_counter()
+            jax.block_until_ready(compiled(weights, ids, valid))
+            durations.append(perf_counter() - start)
+        median = float(np.median(durations))
+        report.update(
+            executed=True,
+            median_seconds=median,
+            tokens_per_second=args.batch * args.length / median,
+            samples_seconds=durations,
+            prompt=prompt,
+            warmup=args.warmup,
+            device_memory_stats=[device.memory_stats() for device in jax.devices(args.platform)[: args.devices]],
+        )
     (args.output / f"{stem}.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
-    if collectives:
+    if collectives and args.mode == "forward":
         raise RuntimeError(f"Unexpected communication in replicated-weight DP forward: {collectives}")
     if re.search(r"host.callback|host_callback|xla_python|pure_callback|io_callback", hlo):
         raise RuntimeError("Unexpected host callback in model HLO")

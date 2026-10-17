@@ -102,6 +102,11 @@ Transformers installed, run `python tests/qwen3_reference.py`.
 
 ## GPU translation review
 
+See [the extended parity report](jax_torch_parity.md) for the subsequent strict
+checkpoint checks, gradient diagnostics, benchmarks, and backward HLO inspection.
+That run had no GPU access and found CPU numerical discrepancies; the GPU results
+below are earlier measurements, not a fresh certification of the expanded suite.
+
 Reviewed on 2026-10-17 using an NVIDIA A100-SXM4-40GB. **37 focused unit tests
 and 6 real-checkpoint integration tests passed on GPU with JIT enabled.**
 Generated token IDs match PyTorch on the tested prompts across all supported
