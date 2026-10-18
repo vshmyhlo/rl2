@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "vshmyhlo", email = "vlad@cohere.com" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.15"
 dependencies = [
     "ale-py>=0.11,<0.12",
     "brax==0.14.2",
@@ -51,7 +51,7 @@ dependencies = [
     "tokamax>=0.0.15; sys_platform == 'linux'",
     "tokenizers>=0.22,<0.24",
     "xminigrid==0.9.3",
-    "verifiers>=0.1.8.post1",
+    "verifiers>=0.4.0,<0.5",
     "datasets>=4",
     "jaxrobotarium",
     "robotarium-python-simulator",
@@ -86,6 +86,20 @@ line-length = 120
 # Kauldron also requests desktop OpenCV; both variants install the same cv2 files.
 # Use the explicit headless dependency above for server-side Atari preprocessing.
 exclude-dependencies = ["opencv-python"]
+
+# Verifiers' renderers need Pillow 12; retain MoviePy's other bounds.
+[[tool.uv.dependency-metadata]]
+name = "moviepy"
+version = "2.2.1"
+requires-dist = [
+    "decorator>=4.0.2,<6.0",
+    "imageio>=2.5,<3.0",
+    "imageio-ffmpeg>=0.2.0",
+    "numpy>=1.25.0",
+    "proglog<=1.0.0",
+    "python-dotenv>=0.10",
+    "pillow>=9.2.0,<13",
+]
 
 # Relax Kinetix's JAX/MoviePy constraints and use Jax2D's current jnp.clip API.
 # Its environment API is tested against rl2's versions; its training scripts are unused.

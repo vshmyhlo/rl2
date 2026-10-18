@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,12 +42,32 @@ class Run:
 
 
 @contextmanager
-def process(command: list[str], log_path: Path) -> Iterator[subprocess.Popen]:
+def process(command: list[str], log_path: Path) -> Iterator[subprocess.Popen[str]]:
     print(f"Starting {log_path.stem}; log: {log_path}", flush=True)
     with (
-        log_path.open("a") as log,
-        subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True) as child,
+        log_path.open("a", encoding="utf-8", buffering=1) as log,
+        ThreadPoolExecutor(max_workers=1) as output,
+        subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            start_new_session=True,
+        ) as child,
     ):
+
+        def stream() -> None:
+            assert child.stdout is not None
+            for line in child.stdout:
+                log.write(line)
+                log.flush()
+                print(f"[{log_path.stem}] {line.removesuffix('\n')}", flush=True)
+
+        # Drain concurrently so a long-running server cannot fill its output pipe.
+        streaming = output.submit(stream)
         try:
             yield child
         finally:
@@ -60,6 +81,7 @@ def process(command: list[str], log_path: Path) -> Iterator[subprocess.Popen]:
             with suppress(ProcessLookupError):
                 os.killpg(child.pid, signal.SIGKILL)
             child.wait()
+            streaming.result()
 
 
 class VLLMServer:
@@ -166,6 +188,7 @@ def run_job(run_dir: Path, port: int, smoke: bool, startup_timeout: int) -> None
             address="local",
             num_cpus=2,
             include_dashboard=False,
+            log_to_driver=True,
             object_store_memory=128 * 1024**2,
             runtime_env={
                 "env_vars": {

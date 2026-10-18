@@ -1,5 +1,6 @@
 # Development guidelines
 
+- When the user asks to inspect logs for a job ID, look up the Kubernetes Job and read its pod/container logs. Start in the `training` namespace using `sudo k3s kubectl`; if the Job is not found, search across namespaces. Inspect failed/retried pods and previous container logs when relevant, and use Job/Pod status and events if logs are unavailable. See `infra/k3s/README.md` for cluster access details.
 - Do not store secrets (including API keys, tokens, or passwords) in `nvida.env`. Supply secrets at runtime through environment variables or a secret manager.
 - Prefer concise, minimalistic code with straightforward control flow and clear names. Avoid unnecessary abstractions, indirection, boilerplate, and speculative generality. Keep the implementation as small as practical while preserving readability, correctness, and the required typing, shape documentation, and test coverage.
 - Prefer standard-library functionality and well-maintained libraries over implementing equivalent functionality from scratch when they fit the task and project constraints. Reuse existing project dependencies where possible.
