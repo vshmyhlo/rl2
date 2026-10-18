@@ -14,7 +14,7 @@ from urllib.request import urlopen
 from huggingface_hub import snapshot_download
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parents[1]
+ROOT = HERE.parents[2]
 MODEL = "Qwen/Qwen3-0.6B"
 REVISION = "c1899de289a04d12100db370d81485cdf75e47ca"
 REGISTRY_NAME = f"{MODEL}-FC"
@@ -63,7 +63,7 @@ def evaluation_command(action: str, checkpoint: Path, smoke: bool) -> list[str]:
     command = [
         sys.executable,
         "-m",
-        "rl2.bfcl_qwen",
+        "rl2.bfcl.qwen",
         action,
         "--model",
         REGISTRY_NAME,
@@ -110,8 +110,8 @@ def protocol(checkpoint: Path, port: int, smoke: bool) -> dict:
             str(path.name): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in (
                 ROOT / "uv.lock",
-                HERE / "bfcl.py",
-                HERE / "bfcl_qwen.py",
+                HERE / "runner.py",
+                HERE / "qwen.py",
                 checkpoint / "config.json",
                 checkpoint / "tokenizer_config.json",
                 checkpoint / "generation_config.json",

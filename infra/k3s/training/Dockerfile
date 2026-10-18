@@ -23,3 +23,5 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY . .
 # Preserve the built environment when a command uses uv run.
 ENV UV_NO_SYNC=1 UV_ENV_FILE=/app/nvida.env PATH="/app/.venv/bin:$PATH"
+# Ray workers share the installed image environment, including optional extras.
+ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0

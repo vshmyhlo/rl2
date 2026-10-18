@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from rl2 import bfcl as runner
+from rl2.bfcl import runner
 
 
 def test_manifest_refuses_mixed_runs(tmp_path: Path) -> None:
@@ -26,6 +26,14 @@ def test_evaluation_scope(smoke: bool) -> None:
     categories = command[command.index("--test-category") + 1]
     assert categories == (",".join(runner.SMOKE_IDS) if smoke else "single_turn,multi_turn")
     assert command[command.index("--model") + 1] == "Qwen/Qwen3-0.6B-FC"
+    assert command[2] == "rl2.bfcl.qwen"
+
+
+def test_package_entrypoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    invoke = Mock()
+    monkeypatch.setattr(runner, "main", invoke)
+    runpy.run_module("rl2.bfcl", run_name="__main__")
+    invoke.assert_called_once()
 
 
 def test_generate_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -54,7 +62,10 @@ def test_generate_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
     assert invoke.call_args.kwargs["check"]
     assert invoke.call_args.kwargs["env"]["BFCL_PROJECT_ROOT"] == str(tmp_path / "run")
     assert json.loads((tmp_path / "run" / "test_case_ids_to_generate.json").read_text()) == runner.SMOKE_IDS
-    assert json.loads((tmp_path / "run" / "protocol.json").read_text())["thinking"] is True
+    manifest = json.loads((tmp_path / "run" / "protocol.json").read_text())
+    assert manifest["thinking"] is True
+    assert {"runner.py", "qwen.py", "uv.lock"} <= manifest["sha256"].keys()
+    assert runner.ROOT == Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize(
@@ -97,7 +108,7 @@ def test_server_sampler_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_official_handler_registration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("BFCL_PROJECT_ROOT", str(tmp_path))
     pytest.importorskip("bfcl_eval")
-    module = runpy.run_module("rl2.bfcl_qwen")
+    module = runpy.run_module("rl2.bfcl.qwen")
     configs = module["MODEL_CONFIG_MAPPING"]
     small = configs["Qwen/Qwen3-0.6B-FC"]
     original = configs["Qwen/Qwen3-8B-FC"]

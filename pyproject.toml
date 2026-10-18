@@ -61,6 +61,7 @@ dependencies = [
 
 [project.optional-dependencies]
 bfcl = [
+    "ray>=2.50,<3; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
     "bfcl-eval==2025.12.17; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
     "vllm==0.27.0; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
     "transformers>=5.5.3,<5.6; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
@@ -72,7 +73,7 @@ mappo = "rl2.train_mappo:main"
 ppo = "rl2.ppo:main"
 ppo_rnd = "rl2.ppo_rnd:main"
 rl2-reasoning = "rl2.reasoning_cli:main"
-rl2-bfcl = "rl2.bfcl:main"
+rl2-bfcl = "rl2.bfcl.runner:main"
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
