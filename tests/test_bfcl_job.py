@@ -15,7 +15,7 @@ import pytest
 from rl2 import bfcl_job as job
 
 
-@pytest.mark.parametrize("failure", [None, "download", "ready", "generate", "server", "cancel", "evaluate"])
+@pytest.mark.parametrize("failure", [None, "generate", "server", "cancel", "evaluate"])
 def test_job_lifecycle(failure: str | None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     events = []
     commands = {}
@@ -33,38 +33,27 @@ def test_job_lifecycle(failure: str | None, monkeypatch: pytest.MonkeyPatch, tmp
         finally:
             events.append(f"stop:{stage}")
 
-    def ready(server: Mock, port: int, timeout: int) -> None:
-        events.append("ready")
-        if failure == "ready":
-            raise TimeoutError("startup")
-
-    def wait(child: Mock, server: Mock | None = None) -> None:
+    def wait(child: Mock, port: int | None = None) -> None:
         if failure == "cancel" and child.stage == "generate":
             job.terminate(signal.SIGTERM, None)
         if failure == "server" and child.stage == "generate":
-            assert server is not None
+            assert port == 1053
             raise RuntimeError("server died")
         if failure == child.stage:
             raise subprocess.CalledProcessError(returncode=1, cmd=child.args)
 
-    monkeypatch.delenv("HF_HOME", raising=False)
+    monkeypatch.setenv("HF_HOME", "/shared/model-cache")
     monkeypatch.setattr(job, "process", fake_process)
-    monkeypatch.setattr(job, "wait_ready", ready)
     monkeypatch.setattr(job, "wait_success", wait)
     run_dir = tmp_path / "run"
     if failure:
         with pytest.raises((TimeoutError, RuntimeError, subprocess.CalledProcessError, SystemExit)):
-            job.run_job(run_dir, port=1053, smoke=True, startup_timeout=30)
+            job.run_job(run_dir, port=1053, smoke=True)
     else:
-        job.run_job(run_dir, port=1053, smoke=True, startup_timeout=30)
+        job.run_job(run_dir, port=1053, smoke=True)
         assert events == [
-            "start:download",
-            "stop:download",
-            "start:serve",
-            "ready",
             "start:generate",
             "stop:generate",
-            "stop:serve",
             "start:evaluate",
             "stop:evaluate",
         ]
@@ -72,7 +61,8 @@ def test_job_lifecycle(failure: str | None, monkeypatch: pytest.MonkeyPatch, tmp
         assert commands["evaluate"][4:] == commands["generate"][4:]
     assert all(f"stop:{stage}" in events for stage in commands)
     assert ("evaluate" in commands) == (failure in (None, "evaluate"))
-    assert all(env["HF_HOME"] == str(tmp_path / ".huggingface") for env in environments)
+    assert set(commands) <= {"generate", "evaluate"}
+    assert all(env["HF_HOME"] == "/shared/model-cache" for env in environments)
     # The run lock is released on both success and failure.
     with (run_dir / ".job.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -84,41 +74,38 @@ def test_concurrent_run_rejected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     with (tmp_path / ".job.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         with pytest.raises(BlockingIOError):
-            job.run_job(tmp_path, port=1053, smoke=False, startup_timeout=30)
+            job.run_job(tmp_path, port=1053, smoke=False)
     launch.assert_not_called()
 
 
-def test_readiness_retries_until_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generation_tolerates_temporary_server_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     request = Mock(side_effect=[URLError("not listening"), io.BytesIO(b"ok")])
     monkeypatch.setattr(job, "urlopen", request)
-    monkeypatch.setattr(job.time, "sleep", Mock())
-    job.wait_ready(Mock(poll=Mock(return_value=None)), port=1053, timeout=30)
+    monkeypatch.setattr(job.time, "monotonic", Mock(side_effect=[0, 5, 10]))
+    waiting = subprocess.TimeoutExpired(cmd="generate", timeout=5)
+    job.wait_success(Mock(wait=Mock(side_effect=[waiting, waiting, 0])), port=1053)
     assert request.call_count == 2
 
 
-@pytest.mark.parametrize("exited", [False, True], ids=["startup-timeout", "server-exited"])
-def test_readiness_failure(exited: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generation_detects_server_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     request = Mock(side_effect=URLError("not listening"))
     monkeypatch.setattr(job, "urlopen", request)
-    monkeypatch.setattr(job.time, "sleep", Mock())
-    monkeypatch.setattr(job.time, "monotonic", Mock(side_effect=[0, 0, 2]))
-    server = Mock(poll=Mock(return_value=1 if exited else None), returncode=1)
-    with pytest.raises(RuntimeError if exited else TimeoutError):
-        job.wait_ready(server, port=1053, timeout=1)
-
-
-def test_generation_detects_server_failure() -> None:
-    child = Mock(wait=Mock(side_effect=subprocess.TimeoutExpired(cmd="generate", timeout=0.5)))
-    server = Mock(poll=Mock(side_effect=[None, 1]), returncode=1)
+    monkeypatch.setattr(job.time, "monotonic", Mock(side_effect=[0, 5, 30]))
+    child = Mock(wait=Mock(side_effect=subprocess.TimeoutExpired(cmd="generate", timeout=5)))
     with pytest.raises(RuntimeError, match="during generation"):
-        job.wait_success(child, server)
-    child.wait.assert_called_once()
+        job.wait_success(child, port=1053)
+    assert child.wait.call_count == 2
 
 
-def test_scoring_failure_propagates() -> None:
+def test_scoring_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = Mock()
+    monkeypatch.setattr(job, "urlopen", request)
     with pytest.raises(subprocess.CalledProcessError) as error:
-        job.wait_success(Mock(wait=Mock(return_value=7), args=["evaluate"]))
+        job.wait_success(
+            Mock(wait=Mock(side_effect=[subprocess.TimeoutExpired(cmd="evaluate", timeout=5), 7]), args=["evaluate"])
+        )
     assert error.value.returncode == 7
+    request.assert_not_called()
 
 
 def test_process_cleanup_on_cancellation(tmp_path: Path) -> None:
