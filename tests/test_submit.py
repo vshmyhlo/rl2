@@ -1,7 +1,6 @@
 import json
 import os
 import runpy
-import shlex
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -228,15 +227,29 @@ def test_failure_does_not_submit(failed_step: int) -> None:
     assert not any(submit.IMAGE_MANAGER in c.args[0] for c in run.call_args_list)
 
 
-def test_dockerfile_dependency_sync(tmp_path: Path) -> None:
+@pytest.mark.parametrize("extra", ["", "bfcl"], ids=["training", "bfcl"])
+def test_dockerfile_dependency_sync(extra: str, tmp_path: Path) -> None:
     dockerfile = (submit.ROOT / "infra/k3s/training/Dockerfile").read_text()
     command = next(line.strip() for line in dockerfile.splitlines() if line.strip().startswith("uv sync "))
     result = subprocess.run(
-        [*shlex.split(command), "--dry-run", "--offline"],
+        ["sh", "-c", command + " --dry-run --offline"],
         cwd=submit.ROOT,
-        env={**os.environ, "UV_CACHE_DIR": str(tmp_path / "uv-cache")},
+        env={**os.environ, "UV_CACHE_DIR": str(tmp_path / "uv-cache"), "UV_EXTRA": extra},
         check=False,
         capture_output=True,
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_bfcl_job_build_and_submit() -> None:
+    command = ["python", "-m", "rl2.bfcl_job", "--run-dir", "/runs/bfcl/qwen3", "--smoke"]
+    args = submit.parse_args(["--extra", "bfcl", "--memory-gib", "32", "--", *command])
+    with patch("subprocess.run") as run:
+        submit.submit(args)
+    build = next(call for call in run.call_args_list if "buildctl" in call.args[0])
+    assert "build-arg:UV_EXTRA=bfcl" in build.args[0]
+    manifest = json.loads(run.call_args.kwargs["input"])
+    container = manifest["spec"]["template"]["spec"]["containers"][0]
+    assert container["command"] == command
+    assert container["resources"]["limits"] == {"memory": "32Gi", "nvidia.com/gpu": "1"}

@@ -54,6 +54,12 @@ built-in cuDNN attention on a compatible NVIDIA GPU. This backend requires
 with the defaults. Odd sequence/cache lengths are padded internally for cuDNN
 gradients, without changing cache capacity or returned shapes.
 
+## BFCL evaluation
+
+For tool-use evaluation of the Hugging Face checkpoint with vLLM, see the
+[pinned BFCL V4 workflow](bfcl.md). It includes a GPU smoke check
+and full single-turn/multi-turn evaluation through `rl2-bfcl`.
+
 ## Python API
 
 ```python

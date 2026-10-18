@@ -27,6 +27,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--prio", choices=("low", "high"), default="low")
     parser.add_argument("--cpus", type=int, choices=range(1, 11), default=4, metavar="1..10")
     parser.add_argument("--memory-gib", type=int, choices=range(1, 65), default=16, metavar="1..64")
+    parser.add_argument("--extra", choices=("bfcl",), help="Include an optional dependency group in the image")
     parser.add_argument("--sweep", type=Path, help="Sweep YAML; omit --config from COMMAND")
     parser.add_argument("--dry-run", action="store_true", help="Print the submission plan without building or queuing")
     if "--" not in argv:
@@ -106,7 +107,15 @@ def submit(args: argparse.Namespace) -> list[str]:
     configs = {trial.run_id: OmegaConf.to_container(trial, resolve=False) for trial in sweep.trials} if sweep else {}
     if args.dry_run:
         print(
-            json.dumps({"command": args.command, "sweep": sweep.name if sweep else None, "trials": configs}, indent=2)
+            json.dumps(
+                {
+                    "command": args.command,
+                    "extra": args.extra,
+                    "sweep": sweep.name if sweep else None,
+                    "trials": configs,
+                },
+                indent=2,
+            )
         )
         return []
     # The image retains these files after the temporary host directory is removed.
@@ -159,6 +168,7 @@ def submit_jobs(args: argparse.Namespace, manifests: list[dict[str, Any]], image
             f"dockerfile={ROOT}",
             "--opt",
             "filename=infra/k3s/training/Dockerfile",
+            *(["--opt", f"build-arg:UV_EXTRA={args.extra}"] if args.extra else []),
             "--output",
             f"type=image,name={image},unpack=true",
             "--progress",

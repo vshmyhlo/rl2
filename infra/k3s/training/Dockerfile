@@ -9,8 +9,9 @@ ENV UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never PYTHONUNBUFFERED=1
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
 # Keep the large dependency layer independent of source and documentation edits.
 COPY pyproject.toml uv.lock ./
+ARG UV_EXTRA=""
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev --no-install-project
+    uv sync --locked --no-dev --no-install-project ${UV_EXTRA:+--extra=$UV_EXTRA}
 # Bundle Panda assets so Playground can start without runtime downloads.
 RUN --mount=type=bind,source=src/rl2/envs/playground_assets.py,target=/tmp/playground_assets.py \
     /app/.venv/bin/python /tmp/playground_assets.py
@@ -18,7 +19,7 @@ RUN --mount=type=bind,source=src/rl2/envs/playground_assets.py,target=/tmp/playg
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=README.md,target=/app/README.md \
     --mount=type=bind,source=src,target=/app/src \
-    uv sync --locked --no-dev
+    uv sync --locked --no-dev ${UV_EXTRA:+--extra=$UV_EXTRA}
 COPY . .
 # Preserve the built environment when a command uses uv run.
 ENV UV_NO_SYNC=1 UV_ENV_FILE=/app/nvida.env PATH="/app/.venv/bin:$PATH"
