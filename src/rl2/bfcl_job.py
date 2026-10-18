@@ -1,4 +1,4 @@
-"""Generate and score BFCL results against the Pod's vLLM sidecar."""
+"""Run download, serving, generation, and scoring in one GPU Job container."""
 
 import argparse
 import fcntl
@@ -37,37 +37,48 @@ def process(command: list[str], log_path: Path, env: dict[str, str]) -> Iterator
             child.wait()
 
 
-def wait_success(child: subprocess.Popen, port: int | None = None) -> None:
-    healthy_at = time.monotonic()
-    while True:
+def wait_ready(server: subprocess.Popen, port: int, timeout: int) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if server.poll() is not None:
+            raise RuntimeError(f"vLLM exited with code {server.returncode}; see serve.log")
         try:
-            code = child.wait(timeout=5)
+            with urlopen(f"http://127.0.0.1:{port}/health", timeout=2):
+                return
+        except (URLError, TimeoutError, ConnectionError):
+            time.sleep(0.5)
+    raise TimeoutError(f"vLLM was not ready within {timeout}s; see serve.log")
+
+
+def wait_success(child: subprocess.Popen, server: subprocess.Popen | None = None) -> None:
+    while True:
+        if server is not None and server.poll() is not None:
+            raise RuntimeError(f"vLLM exited during generation with code {server.returncode}; see serve.log")
+        try:
+            code = child.wait(timeout=0.5)
         except subprocess.TimeoutExpired:
-            if port is not None:
-                try:
-                    with urlopen(f"http://127.0.0.1:{port}/health", timeout=2):
-                        healthy_at = time.monotonic()
-                except (URLError, TimeoutError, ConnectionError) as error:
-                    if time.monotonic() - healthy_at >= 30:
-                        raise RuntimeError(
-                            "vLLM unavailable for 30s during generation; inspect the vllm container logs"
-                        ) from error
             continue
         if code != 0:
             raise subprocess.CalledProcessError(returncode=code, cmd=child.args)
         return
 
 
-def run_job(run_dir: Path, port: int, smoke: bool) -> None:
+def run_job(run_dir: Path, port: int, smoke: bool, startup_timeout: int) -> None:
     run_dir = run_dir.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    env.setdefault("HF_HOME", str(run_dir.parent / ".huggingface"))
     command = [sys.executable, "-m", "rl2.bfcl"]
     options = ["--run-dir", str(run_dir), "--port", str(port), *(["--smoke"] if smoke else [])]
     with (run_dir / ".job.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        with process([*command, "generate", *options], run_dir / "generate.log", env) as generation:
-            wait_success(generation, port)
+        with process([*command, "download"], run_dir / "download.log", env) as download:
+            wait_success(download)
+        with process([*command, "serve", "--port", str(port)], run_dir / "serve.log", env) as server:
+            wait_ready(server, port, startup_timeout)
+            with process([*command, "generate", *options], run_dir / "generate.log", env) as generation:
+                wait_success(generation, server)
+        print("vLLM stopped; starting scoring", flush=True)
         with process([*command, "evaluate", *options], run_dir / "evaluate.log", env) as evaluation:
             wait_success(evaluation)
     print(f"BFCL evaluation complete: {run_dir / 'score'}", flush=True)
@@ -84,12 +95,13 @@ def main() -> None:
     )
     parser.add_argument("--port", type=int, default=1053)
     parser.add_argument("--smoke", action="store_true", help="Run only four fixed pipeline checks")
+    parser.add_argument("--startup-timeout", type=int, default=900, help="Seconds to wait for vLLM readiness")
     args = parser.parse_args()
-    if not 1 <= args.port <= 65535:
-        parser.error("--port must be 1..65535")
+    if not 1 <= args.port <= 65535 or args.startup_timeout <= 0:
+        parser.error("--port must be 1..65535 and --startup-timeout must be positive")
     previous = {sig: signal.signal(sig, terminate) for sig in (signal.SIGTERM, signal.SIGINT)}
     try:
-        run_job(args.run_dir, args.port, args.smoke)
+        run_job(args.run_dir, args.port, args.smoke, args.startup_timeout)
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
         print(f"BFCL job failed: {error}; logs: {args.run_dir}", file=sys.stderr, flush=True)
         raise SystemExit(1) from error

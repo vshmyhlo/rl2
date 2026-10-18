@@ -46,8 +46,6 @@ def test_default_gpu_job() -> None:
         pytest.param(["--cpus", "11", "--", "true"], id="cpu-over-quota"),
         pytest.param(["--memory-gib", "65", "--", "true"], id="memory-over-quota"),
         pytest.param(["--extra", "jaxmarl", "--", "true"], id="obsolete-extra-option"),
-        pytest.param(["--vllm-sidecar", "--cpus", "1", "--", "true"], id="sidecar-cpu-budget"),
-        pytest.param(["--vllm-sidecar", "--memory-gib", "7", "--", "true"], id="sidecar-memory-budget"),
     ],
 )
 def test_invalid_arguments(argv: list[str]) -> None:
@@ -246,7 +244,7 @@ def test_dockerfile_dependency_sync(extra: str, tmp_path: Path) -> None:
 
 def test_bfcl_job_build_and_submit() -> None:
     command = ["python", "-m", "rl2.bfcl_job", "--run-dir", "/runs/bfcl/qwen3", "--smoke"]
-    args = submit.parse_args(["--vllm-sidecar", "--memory-gib", "32", "--", *command])
+    args = submit.parse_args(["--extra", "bfcl", "--memory-gib", "32", "--", *command])
     with patch("subprocess.run") as run:
         submit.submit(args)
     build = next(call for call in run.call_args_list if "buildctl" in call.args[0])
@@ -255,37 +253,17 @@ def test_bfcl_job_build_and_submit() -> None:
     pod = manifest["spec"]["template"]["spec"]
     container = pod["containers"][0]
     assert container["command"] == command
-    assert container["name"] == "bfcl"
-    assert container["resources"] == {"requests": {"cpu": "1", "memory": "4Gi"}, "limits": {"memory": "4Gi"}}
-    (sidecar,) = pod["initContainers"]
-    assert sidecar["restartPolicy"] == "Always"
-    assert pod["restartPolicy"] == "Never"
-    assert sidecar["image"] == container["image"]
-    assert sidecar["volumeMounts"] == container["volumeMounts"]
-    assert sidecar["resources"]["requests"] == {"cpu": "3", "memory": "28Gi", "nvidia.com/gpu": "1"}
-    assert sidecar["resources"]["limits"] == {"memory": "28Gi", "nvidia.com/gpu": "1"}
-    main_env = {item["name"]: item["value"] for item in container["env"]}
-    sidecar_env = {item["name"]: item["value"] for item in sidecar["env"]}
-    assert main_env["HF_HOME"] == sidecar_env["HF_HOME"] == "/runs/bfcl/.huggingface"
-    assert main_env["NVIDIA_VISIBLE_DEVICES"] == "void"
-    assert "NVIDIA_VISIBLE_DEVICES" not in sidecar_env
-    assert sidecar["command"] == ["sh", "-ec", "python -m rl2.bfcl download\nexec python -m rl2.bfcl serve"]
-    probe = sidecar["startupProbe"]
-    assert "http://127.0.0.1:1053/health" in probe["exec"]["command"][-1]
-    assert probe["failureThreshold"] * probe["periodSeconds"] == 900
+    assert len(pod["containers"]) == 1
+    assert "initContainers" not in pod
+    assert container["resources"]["requests"] == {"cpu": "4", "memory": "32Gi", "nvidia.com/gpu": "1"}
+    assert container["resources"]["limits"] == {"memory": "32Gi", "nvidia.com/gpu": "1"}
 
 
-def test_sidecar_preview_does_not_submit(capsys: pytest.CaptureFixture[str]) -> None:
-    args = submit.parse_args(["--dry-run", "--vllm-sidecar", "--", "python", "-m", "rl2.bfcl_job"])
+def test_bfcl_preview_does_not_submit(capsys: pytest.CaptureFixture[str]) -> None:
+    args = submit.parse_args(["--dry-run", "--extra", "bfcl", "--", "python", "-m", "rl2.bfcl_job"])
     with patch("subprocess.run") as run:
         submit.submit(args)
     run.assert_not_called()
     preview = json.loads(capsys.readouterr().out)
     assert preview["extra"] == "bfcl"
-    assert preview["job"]["spec"]["template"]["spec"]["initContainers"][0]["name"] == "vllm"
-
-
-def test_bfcl_extra_alone_does_not_add_sidecar() -> None:
-    args = submit.parse_args(["--extra", "bfcl", "--", "python", "-m", "rl2.bfcl", "evaluate"])
-    pod = submit.job_manifest(args, "test", "image")["spec"]["template"]["spec"]
-    assert "initContainers" not in pod
+    assert preview["command"] == args.command

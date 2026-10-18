@@ -28,11 +28,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--cpus", type=int, choices=range(1, 11), default=4, metavar="1..10")
     parser.add_argument("--memory-gib", type=int, choices=range(1, 65), default=16, metavar="1..64")
     parser.add_argument("--extra", choices=("bfcl",), help="Include an optional dependency group in the image")
-    parser.add_argument(
-        "--vllm-sidecar",
-        action="store_true",
-        help="Serve the pinned BFCL model in a native sidecar; includes --extra bfcl",
-    )
     parser.add_argument("--sweep", type=Path, help="Sweep YAML; omit --config from COMMAND")
     parser.add_argument("--dry-run", action="store_true", help="Print the submission plan without building or queuing")
     if "--" not in argv:
@@ -45,10 +40,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("provide a command after --")
     if args.sweep and any(arg == "--config" or arg.startswith("--config=") for arg in args.command):
         parser.error("--sweep supplies --config; omit it from COMMAND")
-    if args.vllm_sidecar:
-        args.extra = "bfcl"
-        if args.cpus < 2 or args.memory_gib < 8:
-            parser.error("--vllm-sidecar requires at least 2 CPUs and 8 GiB total memory")
     return args
 
 
@@ -108,54 +99,7 @@ def job_manifest(args: argparse.Namespace, name: str, image: str) -> dict[str, A
             },
         },
     }
-    if args.vllm_sidecar:
-        add_vllm_sidecar(manifest["spec"]["template"]["spec"], args)
     return manifest
-
-
-def add_vllm_sidecar(pod: dict[str, Any], args: argparse.Namespace) -> None:
-    main = pod["containers"][0]
-    main["name"] = "bfcl"
-    main["env"].extend(
-        [
-            {"name": "HF_HOME", "value": "/runs/bfcl/.huggingface"},
-            {"name": "NVIDIA_VISIBLE_DEVICES", "value": "void"},
-        ]
-    )
-    main["resources"] = {
-        "requests": {"cpu": "1", "memory": "4Gi"},
-        "limits": {"memory": "4Gi"},
-    }
-    # An exec probe reaches the loopback-only server; HTTP probes target the Pod IP.
-    probe = {
-        "exec": {
-            "command": [
-                "python",
-                "-c",
-                "from urllib.request import urlopen; urlopen('http://127.0.0.1:1053/health', timeout=2).close()",
-            ]
-        },
-        "periodSeconds": 5,
-        "timeoutSeconds": 5,
-    }
-    pod["initContainers"] = [
-        {
-            "name": "vllm",
-            "image": main["image"],
-            "imagePullPolicy": main["imagePullPolicy"],
-            "workingDir": "/app",
-            "restartPolicy": "Always",
-            "command": ["sh", "-ec", "python -m rl2.bfcl download\nexec python -m rl2.bfcl serve"],
-            "env": [{"name": "HF_HOME", "value": "/runs/bfcl/.huggingface"}],
-            "startupProbe": {**probe, "failureThreshold": 180},
-            "readinessProbe": {**probe, "failureThreshold": 3},
-            "resources": {
-                "requests": {"cpu": str(args.cpus - 1), "memory": f"{args.memory_gib - 4}Gi", "nvidia.com/gpu": "1"},
-                "limits": {"memory": f"{args.memory_gib - 4}Gi", "nvidia.com/gpu": "1"},
-            },
-            "volumeMounts": main["volumeMounts"],
-        }
-    ]
 
 
 def submit(args: argparse.Namespace) -> list[str]:
@@ -170,7 +114,6 @@ def submit(args: argparse.Namespace) -> list[str]:
                     "extra": args.extra,
                     "sweep": sweep.name if sweep else None,
                     "trials": configs,
-                    "job": job_manifest(args, "preview", image) if args.vllm_sidecar else None,
                 },
                 indent=2,
             )
@@ -243,8 +186,6 @@ def submit_jobs(args: argparse.Namespace, manifests: list[dict[str, Any]], image
         print(f"Queued {name} (priority={args.prio}, GPU=1)" + (f" run_id={run_id}" if run_id else ""), flush=True)
         print(f"Status: sudo k3s kubectl -n training get job {name}")
         print(f"Logs:   sudo k3s kubectl -n training logs -f job/{name}")
-        if args.vllm_sidecar:
-            print(f"vLLM:   sudo k3s kubectl -n training logs -f job/{name} -c vllm")
     return names
 
 
