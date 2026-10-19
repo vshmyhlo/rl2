@@ -25,6 +25,7 @@ IMAGE_MANAGER = "/usr/local/lib/rl2/image_pins.py"
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, usage="%(prog)s [options] -- COMMAND [ARG ...]")
     parser.add_argument("--prio", choices=("low", "high"), default="low")
+    parser.add_argument("--gpus", type=int, choices=range(1, 3), default=1, help="GPUs per job (default: 1)")
     parser.add_argument("--cpus", type=int, choices=range(1, 11), default=4, metavar="1..10")
     parser.add_argument("--memory-gib", type=int, choices=range(1, 65), default=16, metavar="1..64")
     parser.add_argument("--extra", choices=("bfcl",), help="Include an optional dependency group in the image")
@@ -81,9 +82,9 @@ def job_manifest(args: argparse.Namespace, name: str, image: str) -> dict[str, A
                                 "requests": {
                                     "cpu": str(args.cpus),
                                     "memory": f"{args.memory_gib}Gi",
-                                    "nvidia.com/gpu": "1",
+                                    "nvidia.com/gpu": str(args.gpus),
                                 },
-                                "limits": {"memory": f"{args.memory_gib}Gi", "nvidia.com/gpu": "1"},
+                                "limits": {"memory": f"{args.memory_gib}Gi", "nvidia.com/gpu": str(args.gpus)},
                             },
                             "volumeMounts": [
                                 {"name": "shm", "mountPath": "/dev/shm"},
@@ -112,6 +113,7 @@ def submit(args: argparse.Namespace) -> list[str]:
                 {
                     "command": args.command,
                     "extra": args.extra,
+                    "gpus": args.gpus,
                     "sweep": sweep.name if sweep else None,
                     "trials": configs,
                 },
@@ -183,7 +185,10 @@ def submit_jobs(args: argparse.Namespace, manifests: list[dict[str, Any]], image
         name = manifest["metadata"]["name"]
         names.append(name)
         run_id = manifest["metadata"].get("annotations", {}).get("rl2.local/run-id")
-        print(f"Queued {name} (priority={args.prio}, GPU=1)" + (f" run_id={run_id}" if run_id else ""), flush=True)
+        print(
+            f"Queued {name} (priority={args.prio}, GPU={args.gpus})" + (f" run_id={run_id}" if run_id else ""),
+            flush=True,
+        )
         print(f"Status: sudo k3s kubectl -n training get job {name}")
         print(f"Logs:   sudo k3s kubectl -n training logs -f job/{name}")
     return names

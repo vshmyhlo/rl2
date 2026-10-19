@@ -4,6 +4,8 @@ import random
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import URLError
@@ -48,7 +50,7 @@ async def score_group(task: AdditionTask, traces: list[vf.Trace]) -> RolloutGrou
     async with asyncio.timeout(30):
         for trace in traces:
             await task.score(trace)
-    # The actor owns no GPU; convert to Python scalars at the Ray message boundary.
+    # Keep reward arithmetic on CPU so vLLM has the actor GPU to itself.
     with jax.default_device(jax.devices("cpu")[0]):
         rewards = jnp.asarray([trace.reward for trace in traces], dtype=jnp.float32)  # (G,)
         advantages = group_advantages(rewards)  # (G,)
@@ -82,9 +84,11 @@ def create_environment() -> vf.Agent:
     )
 
 
-def serve_vllm() -> None:
+@contextmanager
+def serve_vllm() -> Iterator[None]:
     logger.info("Starting vLLM server for %s", MODEL)
-    subprocess.run(
+    # Inherit the GPU assigned to this actor through CUDA_VISIBLE_DEVICES.
+    with subprocess.Popen(
         [
             sys.executable,
             "-m",
@@ -99,8 +103,15 @@ def serve_vllm() -> None:
             "--tool-call-parser",
             "hermes",
         ],
-        check=True,
-    )
+    ) as server:
+        try:
+            yield
+        finally:
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
     logger.info("vLLM server exited")
 
 
@@ -126,7 +137,7 @@ class Batcher:
         logger.debug("Batcher received batch request (batching not implemented)")
 
 
-@ray.remote
+@ray.remote(num_gpus=1)
 class Learner:
     def __init__(self, batcher: ActorHandle) -> None:
         self.batcher = batcher
@@ -151,7 +162,7 @@ class Learner:
         time.sleep(1)
 
 
-@ray.remote
+@ray.remote(num_gpus=1)
 class Actor:
     def __init__(self, batcher: ActorHandle, group_size: int = 4) -> None:
         if group_size < 2:
@@ -171,15 +182,15 @@ class Actor:
         ]
 
     def start(self) -> None:
-        logger.info("Starting actor and submitting vLLM server task")
-        self.server = ray.remote(num_gpus=1, max_retries=0)(serve_vllm).remote()
-        wait_for_server()
-        logger.info("Starting actor rollout loop")
-        while True:
-            example = self.fetch_next_prompt()
-            group = self.collect_group(example)
-            logger.debug("Submitting rollout group to batcher")
-            ray.get(self.batcher.submit_group.remote(group))
+        logger.info("Starting actor and vLLM on its assigned GPU")
+        with serve_vllm():
+            wait_for_server()
+            logger.info("Starting actor rollout loop")
+            while True:
+                example = self.fetch_next_prompt()
+                group = self.collect_group(example)
+                logger.debug("Submitting rollout group to batcher")
+                ray.get(self.batcher.submit_group.remote(group))
 
     def fetch_next_prompt(self) -> AdditionTask:
         task = random.choice(self.tasks)

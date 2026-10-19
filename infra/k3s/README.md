@@ -1,6 +1,6 @@
 # Local k3s development cluster
 
-One server/worker on `vlad-dev-gpu-1`, using its single A100 40 GB GPU.
+One server/worker on `vlad-dev-gpu-1`, using its two NVIDIA GPUs.
 K3s bundles containerd and kubectl; Docker is not required. Traefik and
 ServiceLB are disabled. CoreDNS, metrics-server, and local-path storage retain
 their defaults. The admin kubeconfig is root-only and Secrets are encrypted at rest.
@@ -142,7 +142,7 @@ See the [Headlamp installation guide](https://headlamp.dev/docs/latest/installat
 
 MLflow 3.17.1 runs in namespace `mlflow`, with SQLite metadata at
 `/mlflow/mlflow.db` and artifacts at `/mlflow/artifacts` on the `mlflow-data`
-PVC. One replica and one server worker are sufficient for this single-GPU
+PVC. One replica and one server worker are sufficient for this local
 setup. Updates use `Recreate` to avoid overlapping server instances. The
 server requests 100m CPU and 512 MiB RAM, has a 2 GiB RAM limit, and uses no GPU.
 
@@ -250,14 +250,14 @@ See [NVIDIA DCGM Exporter documentation](https://docs.nvidia.com/datacenter/dcgm
 ## GPU jobs with Kueue
 
 Kueue `0.20.1` manages labeled Kubernetes batch Jobs in the `training`
-namespace. NVIDIA's device plugin `0.20.1` advertises the A100 as one
+namespace. NVIDIA's device plugin `0.20.1` advertises two units of
 `nvidia.com/gpu`; GPU sharing and MIG are not enabled.
 
-The `gpu` LocalQueue maps to the `gpu` ClusterQueue, with quota for one GPU,
+The `gpu` LocalQueue maps to the `gpu` ClusterQueue, with quota for two GPUs,
 10 CPUs, and 64 GiB RAM on `vlad-dev-gpu-1`. This leaves resources for cluster
 services. `BestEffortFIFO` admits eligible Jobs in queue order within a
 priority level, allowing a Job that fits to bypass one that cannot fit.
-Each Job requesting one GPU gets exclusive Kubernetes allocation. With
+Each Job gets exclusive Kubernetes allocation of its requested GPUs. With
 `withinClusterQueue: LowerPriority`, a higher-priority Job can evict a running
 lower-priority Job; otherwise waiting Jobs remain suspended without a Pod.
 
@@ -315,12 +315,23 @@ needed. See [Kueue's quick start](https://kueue.sigs.k8s.io/docs/getting-started
 ### Build and queue training jobs
 
 Run `submit.py` on this k3s host to build the current working tree and submit a
-one-GPU Job to `training/gpu`:
+GPU Job to `training/gpu` (one GPU by default):
 
 ```bash
 ./submit.py --prio high -- uv run mappo --config configs/mappo/jaxnav.yaml
 ./submit.py --prio low -- uv run ppo --config configs/ppo/kinetix.yaml
 ./submit.py --prio low -- uv run python path/to/train.py
+./submit.py --gpus 2 -- uv run python path/to/multi_gpu_train.py
+```
+
+`--gpus` accepts `1` or `2` per Job, including each trial in a sweep. The NVIDIA
+device plugin and runtime expose only the allocated GPUs inside the container;
+leave `NVIDIA_VISIBLE_DEVICES` and `CUDA_VISIBLE_DEVICES` to the runtime and trainer.
+The training command must itself support multiple GPUs to use both.
+After upgrading from one GPU, apply the updated queue quota:
+
+```bash
+sudo k3s kubectl apply -f infra/k3s/kueue/queues.yaml
 ```
 
 The submitter uses the project's installed Python environment through `uv run
@@ -362,8 +373,9 @@ then submit it by removing `--dry-run`:
 
 Omit `--config` from the training command: the submitter supplies a generated
 config for each trial. It builds one image for the entire sweep, validates every
-Job manifest before building, and queues separate one-GPU Jobs. The current
-queue admits one GPU Job at a time. `--dry-run` only expands the plan; it does
+Job manifest before building, and queues separate Jobs with `--gpus` GPUs each.
+The queue admits up to two one-GPU Jobs or one two-GPU Job at a time, subject to
+the shared CPU and memory quotas. `--dry-run` only expands the plan; it does
 not contact Kubernetes or validate the trainer's configuration schema.
 
 Sweep run IDs are `<name>_<hash>` of the resolved, supplied training settings,
@@ -424,7 +436,7 @@ The non-secret `nvida.env` configuration is included in the image and loaded by
 put credentials in `nvida.env`; supply secrets at runtime. Resubmit after changing
 this file so the job uses a newly built image.
 
-Defaults are `--prio low --cpus 4 --memory-gib 16`. High priority moves ahead of
+Defaults are `--prio low --gpus 1 --cpus 4 --memory-gib 16`. High priority moves ahead of
 waiting low-priority Jobs and preempts running low-priority Jobs when quota is
 full. Kueue suspends the low-priority Job and deletes its Pod, then readmits the
 same Job with a new Pod when higher-priority work finishes. Equal-priority Jobs
@@ -451,7 +463,8 @@ Outputs outside `/runs` are ephemeral unless written to external storage.
 Builds and images consume host disk; inspect cache usage with
 `sudo buildctl --addr unix:///run/rl2-buildkit/buildkitd.sock du`.
 
-To check preemption on an idle queue (creates and cleans up two short GPU Jobs):
+To check GPU visibility and preemption on an idle queue (creates and cleans up
+two short Jobs; the low-priority Job requests the full GPU quota):
 
 ```bash
 RL2_K3S_TESTS=1 uv run pytest infra/k3s/tests/test_preemption.py -q -s

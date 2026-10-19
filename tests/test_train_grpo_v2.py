@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 from urllib.error import URLError
 
 import httpx
@@ -20,8 +20,8 @@ from rl2 import train_grpo_v2 as training
 from rl2.addition_env import AdditionTools
 
 
-@pytest.mark.parametrize("fails", [False, True], ids=["launch", "server-failure"])
-def test_serve_vllm(fails: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("failure", [None, "launch", "rollout", "shutdown"])
+def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
     command = [
         sys.executable,
         "-m",
@@ -36,16 +36,35 @@ def test_serve_vllm(fails: bool, monkeypatch: pytest.MonkeyPatch) -> None:
         "--tool-call-parser",
         "hermes",
     ]
-    run = Mock(side_effect=subprocess.CalledProcessError(returncode=1, cmd=command) if fails else None)
-    monkeypatch.setattr(training.subprocess, "run", run)
+    server = MagicMock()
+    server.__enter__.return_value = server
+    launch = Mock(return_value=server, side_effect=OSError("launch failed") if failure == "launch" else None)
+    monkeypatch.setattr(training.subprocess, "Popen", launch)
+    if failure == "shutdown":
+        server.wait.side_effect = subprocess.TimeoutExpired(cmd=command, timeout=10)
 
-    if fails:
-        with pytest.raises(subprocess.CalledProcessError):
-            training.serve_vllm()
+    if failure in {"launch", "rollout"}:
+        with pytest.raises(OSError if failure == "launch" else RuntimeError), training.serve_vllm():
+            raise RuntimeError("rollout failed")
     else:
-        training.serve_vllm()
+        with training.serve_vllm():
+            server.terminate.assert_not_called()
 
-    run.assert_called_once_with(command, check=True)
+    # No env override: vLLM inherits Ray's CUDA_VISIBLE_DEVICES assignment.
+    launch.assert_called_once_with(command)
+    if failure == "launch":
+        server.terminate.assert_not_called()
+    else:
+        server.terminate.assert_called_once_with()
+        server.wait.assert_called_once_with(timeout=10)
+        server.__exit__.assert_called_once()
+        assert server.kill.call_count == (1 if failure == "shutdown" else 0)
+
+
+def test_actor_and_learner_each_reserve_one_gpu() -> None:
+    assert training.Actor._default_options["num_gpus"] == 1
+    assert training.Learner._default_options["num_gpus"] == 1
+    assert training.Batcher._default_options.get("num_gpus", 0) == 0
 
 
 def test_wait_for_server_retries_until_ready(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -145,10 +164,14 @@ def test_actor_submits_only_complete_groups(failure: str | None, actor: Any, mon
     monkeypatch.setattr(training.ray, "remote", remote)
     monkeypatch.setattr(training.ray, "get", Mock())
 
+    server = MagicMock()
+    serve = Mock(return_value=server)
+    monkeypatch.setattr(training, "serve_vllm", serve)
+
     def check_server_started() -> None:
-        remote.assert_called_once_with(num_gpus=1, max_retries=0)
-        remote.return_value.assert_called_once_with(training.serve_vllm)
-        remote.return_value.return_value.remote.assert_called_once_with()
+        serve.assert_called_once_with()
+        server.__enter__.assert_called_once_with()
+        remote.assert_not_called()
 
     monkeypatch.setattr(training, "wait_for_server", Mock(side_effect=check_server_started))
     actor.fetch_next_prompt = Mock(side_effect=[task, StopIteration])
@@ -160,6 +183,7 @@ def test_actor_submits_only_complete_groups(failure: str | None, actor: Any, mon
     assert all(sample.data == task.data and sample.scoring_deferred for sample in seen)
     assert not task.scoring_deferred
     env.__aexit__.assert_awaited_once()
+    server.__exit__.assert_called_once()
     submit = actor.batcher.submit_group.remote
     if failure:
         submit.assert_not_called()

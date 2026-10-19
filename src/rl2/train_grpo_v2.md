@@ -17,7 +17,7 @@ The prototype uses `verifiers==0.4.0` and its `verifiers.v1` API. Five local add
 
 The actor samples four independent rollouts of the same task concurrently (`group_size=4` on `Actor`, minimum 2), then scores the completed group. Each rollout receives `(reward - group_mean) / (group_std + 1e-4)`, using population standard deviation. Equal-reward groups have zero advantages. The entire group, including traces, rewards, advantages, and stop conditions, goes to the batcher in one submission; generation or scoring failures prevent submission.
 
-Run with `uv run --extra bfcl python -m rl2.train_grpo_v2` on a GPU host. The first rollout provisions the harness's Python dependencies using uv. No external dataset or paid inference service is needed.
+Run with `uv run --extra bfcl python -m rl2.train_grpo_v2` on a host with two visible GPUs. Ray reserves one GPU for `Actor` (inherited by its vLLM subprocess) and the other for `Learner`; the batcher runs on CPU. The first rollout provisions the harness's Python dependencies using uv. No external dataset or paid inference service is needed.
 
 This uses `EvalClientConfig` against vLLM's chat endpoint: traces contain messages, tool calls, and token usage, but **not training token IDs or log-probabilities**. Those require Verifiers' `TrainClientConfig` and its `/inference/v1/generate` backend. Batching, optimization, and weight publishing remain placeholders.
 

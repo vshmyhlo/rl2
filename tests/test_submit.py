@@ -28,6 +28,8 @@ def test_default_gpu_job() -> None:
     assert container["workingDir"] == "/app"
     env = {entry["name"]: entry["value"] for entry in container["env"]}
     assert env["JAX_PLATFORMS"] == "cuda,cpu"
+    assert "NVIDIA_VISIBLE_DEVICES" not in env  # The device plugin supplies the allocated GPU IDs.
+    assert "CUDA_VISIBLE_DEVICES" not in env
     assert set(env["NVIDIA_DRIVER_CAPABILITIES"].split(",")) >= {"compute", "utility", "graphics"}
     assert container["resources"]["requests"] == {"cpu": "4", "memory": "16Gi", "nvidia.com/gpu": "1"}
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "1"
@@ -44,6 +46,9 @@ def test_default_gpu_job() -> None:
         pytest.param(["--prio", "urgent", "--", "true"], id="unknown-priority"),
         pytest.param(["--cpus", "0", "--", "true"], id="zero-cpus"),
         pytest.param(["--cpus", "11", "--", "true"], id="cpu-over-quota"),
+        pytest.param(["--gpus", "0", "--", "true"], id="zero-gpus"),
+        pytest.param(["--gpus", "3", "--", "true"], id="gpu-over-quota"),
+        pytest.param(["--gpus", "1.5", "--", "true"], id="fractional-gpus"),
         pytest.param(["--memory-gib", "65", "--", "true"], id="memory-over-quota"),
         pytest.param(["--extra", "jaxmarl", "--", "true"], id="obsolete-extra-option"),
     ],
@@ -70,7 +75,9 @@ def test_command_escapes_kubernetes_expansion(argument: str, escaped: str) -> No
     assert args.command == ["sh", "-c", argument]
 
 
-def test_build_and_submit_preserves_command(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_build_and_submit_preserves_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     # Invocation directory must not change which repository is built.
     monkeypatch.chdir(tmp_path)
     command = ["uv", "run", "python", "train.py", "--label", "a b; $(touch /tmp/unused)"]
@@ -78,6 +85,8 @@ def test_build_and_submit_preserves_command(monkeypatch: pytest.MonkeyPatch, tmp
         [
             "--prio",
             "high",
+            "--gpus",
+            "2",
             "--cpus",
             "10",
             "--memory-gib",
@@ -99,6 +108,9 @@ def test_build_and_submit_preserves_command(monkeypatch: pytest.MonkeyPatch, tmp
     assert container["command"] == ["uv", "run", "python", "train.py", "--label", "a b; $$(touch /tmp/unused)"]
     assert container["resources"]["requests"]["cpu"] == "10"
     assert container["resources"]["limits"]["memory"] == "64Gi"
+    assert container["resources"]["requests"]["nvidia.com/gpu"] == "2"
+    assert container["resources"]["limits"]["nvidia.com/gpu"] == "2"
+    assert "priority=high, GPU=2" in capsys.readouterr().out
     assert f"type=image,name={container['image']},unpack=true" in build.args[0]
     preview = next(call for call in calls if "--dry-run=server" in call.args[0])
     assert preview.kwargs["input"] == calls[-1].kwargs["input"]
@@ -157,12 +169,13 @@ def test_sweep_dry_run_has_no_side_effects(tmp_path: Path, capsys: pytest.Captur
     base.write_text("seed: 1\n")
     path = tmp_path / "sweep.yaml"
     path.write_text(f"config: {base}\nparameters: {{seed: [1, 2]}}\n")
-    args = submit.parse_args(["--dry-run", "--sweep", str(path), "--", "uv", "run", "ppo"])
+    args = submit.parse_args(["--dry-run", "--gpus", "2", "--sweep", str(path), "--", "uv", "run", "ppo"])
     with patch("subprocess.run") as run:
         assert submit.submit(args) == []
     run.assert_not_called()
     preview = json.loads(capsys.readouterr().out)
     assert len(preview["trials"]) == 2
+    assert preview["gpus"] == 2
     assert sorted(p.name for p in tmp_path.iterdir()) == ["base.yaml", "sweep.yaml"]
 
 

@@ -59,6 +59,13 @@ def test_high_preempts_low_and_low_returns() -> None:
     if queue["status"].get("reservingWorkloads", 0) or queue["status"].get("pendingWorkloads", 0):
         pytest.skip("GPU queue is busy")
     assert queue["spec"]["preemption"]["withinClusterQueue"] == "LowerPriority"
+    gpu_quota = next(
+        int(resource["nominalQuota"])
+        for group in queue["spec"]["resourceGroups"]
+        for flavor in group["flavors"]
+        for resource in flavor["resources"]
+        if resource["name"] == "nvidia.com/gpu"
+    )
     names = {priority: f"preemption-check-{priority}-{uuid4().hex[:8]}" for priority in ("low", "high")}
     created: list[str] = []
     try:
@@ -67,6 +74,8 @@ def test_high_preempts_low_and_low_returns() -> None:
                 [
                     "--prio",
                     priority,
+                    "--gpus",
+                    str(gpu_quota if priority == "low" else 1),
                     "--",
                     "sh",
                     "-ec",
@@ -96,7 +105,7 @@ def test_high_preempts_low_and_low_returns() -> None:
         workloads = json.loads(kubectl("get", "workloads", "-o", "json"))["items"]
         low_workload = next(w for w in workloads if any(r["name"] == low for r in w["metadata"]["ownerReferences"]))
         assert any(c["type"] == "Preempted" and c["status"] == "True" for c in low_workload["status"]["conditions"])
-        assert "A100" in kubectl("logs", f"job/{high}")
+        assert sum(line.startswith("GPU ") for line in kubectl("logs", f"job/{high}").splitlines()) == 1
         print("High job running; low job suspended and preempted", flush=True)
 
         kubectl("exec", f"job/{high}", "--", "touch", "/tmp/release")
@@ -106,7 +115,7 @@ def test_high_preempts_low_and_low_returns() -> None:
         assert not get("job", low)["spec"]["suspend"]
         kubectl("exec", f"job/{low}", "--", "touch", "/tmp/release")
         wait_for(lambda: complete(low), "low job complete")
-        assert "A100" in kubectl("logs", f"job/{low}")
+        assert sum(line.startswith("GPU ") for line in kubectl("logs", f"job/{low}").splitlines()) == gpu_quota
         print("High completed; same low Job restarted in a new Pod and completed", flush=True)
     finally:
         for name in reversed(created):
