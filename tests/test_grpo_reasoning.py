@@ -438,7 +438,7 @@ def test_zero_shot_reward_shaping_reaches_rollout_advantages(monkeypatch: pytest
     assert diagnostics["charts/format_rate"] == 0.5
     assert diagnostics["charts/formatted_success_rate"] == 0.25
     assert diagnostics["charts/reward_mean"] == pytest.approx(0.5)
-    assert diagnostics["charts/informative_group_fraction"] == 1
+    assert diagnostics["charts/degenerate_group_ratio"] == 0.0
     rewards = jnp.array([[0.9, 1.0, 0.1, 0.0]], jnp.float32)  # (N, G)
     assert batch.advantages.shape == (4,)
     np.testing.assert_allclose(batch.advantages, grpo.group_advantages(rewards)[0])
@@ -704,7 +704,7 @@ def test_collect_rollout_grouping_and_reference(
     assert diagnostics["charts/task_reward_mean"] == 0.5
     assert diagnostics["charts/success_rate"] == 0.5
     assert diagnostics["charts/duration_penalty_mean"] > 0
-    assert diagnostics["charts/informative_group_fraction"] == 1.0
+    assert diagnostics["charts/degenerate_group_ratio"] == 0.0
     np.testing.assert_allclose(batch.advantages, [1, -1], atol=3e-4)
     assert jax.random.key_data(key).shape == (2,)
     # Disabling KL must bypass the reference model entirely.

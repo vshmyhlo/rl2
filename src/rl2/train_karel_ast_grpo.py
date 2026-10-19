@@ -347,7 +347,7 @@ def collect_rollout(
         **{f"charts/reward_{name}_mean": float(values.mean()) for name, values in reward_components.items()},
         "charts/success_rate": float(successes.mean()),
         "charts/group_success_rate": float(successes.reshape((config.num_tasks, config.group_size)).any(axis=1).mean()),
-        "charts/informative_group_fraction": float((np.ptp(grouped_rewards, axis=1) > 0).mean()),
+        "charts/degenerate_group_ratio": float((np.ptp(grouped_rewards, axis=1) == 0).mean()),
         "charts/episode_length_mean": float(mask.sum(axis=(0, 2)).mean()),
         "charts/generation_rounds_mean": float(mask.any(axis=-1).sum(axis=0).mean()),
         "charts/program_token_length_mean": float(source_lengths.mean()),
@@ -735,7 +735,7 @@ def train(config: Config) -> TrainState:
                     f"trajectory={diagnostics['charts/reward_trajectory_mean']:.3f} "
                     f"length_penalty={diagnostics['charts/reward_length_mean']:.4f} "
                     f"execution_penalty={diagnostics['charts/reward_execution_mean']:.4f} "
-                    f"informative_groups={diagnostics['charts/informative_group_fraction']:.3f} "
+                    f"degenerate_group_ratio={diagnostics['charts/degenerate_group_ratio']:.3f} "
                     f"policy={policy_loss:.3f} entropy={entropy:.3f} kl={approx_kl:.4f} "
                     f"updates={updates_done} early_stop={early_stop}",
                     flush=True,

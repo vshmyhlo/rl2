@@ -633,7 +633,7 @@ def collect_rollout(
         "charts/success_rate": float((task_rewards == 1).mean()),
         "charts/format_rate": float(scores.format.mean()),
         "charts/formatted_success_rate": float(((task_rewards == 1) & (scores.format == 1)).mean()),
-        "charts/informative_group_fraction": float((jnp.ptp(grouped, axis=1) > 0).mean()),
+        "charts/degenerate_group_ratio": float((jnp.ptp(grouped, axis=1) == 0).mean()),
         "charts/completion_length_mean": float(mask.sum(axis=1).mean()),
         "charts/truncation_rate": float(
             (~jnp.any(mask & jnp.isin(tokens, jnp.asarray(tokenizer.stop_ids())), axis=1)).mean()

@@ -172,6 +172,7 @@ def test_rollout_pairs_masks_replay_and_exact_environment_rewards(
     config: Config, state: TrainState, rollout: tuple
 ) -> None:
     batch, rewards, diagnostics, _ = rollout
+    assert diagnostics["charts/degenerate_group_ratio"] == float(len(set(rewards)) == 1)
     np.testing.assert_array_equal(batch.initial[0], batch.initial[1])
     np.testing.assert_array_equal(batch.target[0], batch.target[1])
     np.testing.assert_array_equal(batch.mask, batch.actions != 0)

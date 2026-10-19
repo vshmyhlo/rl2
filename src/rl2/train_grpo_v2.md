@@ -13,6 +13,18 @@ Start with Prime Intellect's Environments Hub and Verifiers. The project already
 
 ## Starting point
 
+### ToolRL RLLA-4K
+
+Run `uv run python -m rl2.train_grpo_v2 --config configs/grpo_v2/toolrl.yaml` with the same two-GPU setup described below. The preset selects `taskset: toolrl` and downloads the official 3,920-row training Parquet, pinned to revision `8cee13ec0ca72f0461da372a93a6fd8140dbb840`. Set `dataset_file` to a local Parquet path for offline use. The upstream 80-row test file is excluded from training; this trainer does not yet run held-out evaluation.
+
+`toolrl_env.py` supplies a Verifiers taskset, task rewards, and a custom Qwen3 renderer. Each rollout generates one response (`max_turns: 1`, up to 1,024 tokens), conditioned on the dataset's system instructions and conversation history. Tool descriptions remain in the prompt; generated calls are graded as text without execution. The renderer preserves `<think>`, `<tool_call>`, and `<response>` tags, including malformed output, while retaining exact sampled tokens and log-probabilities for GRPO. Reference answers are grading data only.
+
+Rewards follow ToolRL's default [reward design](https://github.com/qiancheng0/ToolRL/blob/8cee13ec0ca72f0461da372a93a6fd8140dbb840/verl/utils/reward_score/rlla.py): format earns 0–1, and tool names, parameter keys, and values earn partial correctness credit scaled to −3–3. Invalid generated calls earn −3 correctness; invalid reference calls fail dataset loading. Response-only examples earn format reward only, without grading response semantics. Length bonuses and reward schedules are not enabled.
+
+The [ToolRL dataset](https://github.com/qiancheng0/ToolRL#-dataset) combines ToolACE, Hammer-Masked, and xLAM. This integration retains its original output format; it does not convert calls to Qwen3's native `arguments` schema or implement an interactive tool environment.
+
+### Addition and shared training pipeline
+
 The prototype uses `verifiers==0.4.0` and its `verifiers.v1` API. `AdditionTaskset.load()` supplies five local addition tasks; it and the MCP `add` tool live in `addition_env.py`. The actor uses the documented `vf.make_agent(vf.AgentConfig(...))` factory and `agent.run(task)` interface. The actor owns vLLM and runs Verifiers' `null` chat harness in local subprocesses for up to three model turns. An exact final integer answer earns 1, otherwise 0.
 
 The actor samples four independent rollouts of the same task concurrently (`group_size=4` per request, minimum 2), then scores the completed group. Each rollout receives `(reward - group_mean) / (group_std + 1e-4)`, using population standard deviation. Equal-reward groups have zero advantages. The learner requests a batch with configured `num_groups` and `group_size` (defaults: 1 and 4). The async batcher awaits `num_groups` calls to `Actor.fetch_next_group(group_size=...)` together and returns their results in request order. The actor uses async methods so groups overlap while awaiting model and tool responses, following [Ray’s async actor pattern](https://docs.ray.io/en/latest/ray-core/actors/async_api.html). vLLM stays running between requests. Each group contains: shared task ID/prompt plus each rollout's training sequence, reward, advantage, final answer, turn/token counts, duration, and stop condition. Full Verifiers traces are discarded after scoring; generation or scoring failures propagate to the learner.

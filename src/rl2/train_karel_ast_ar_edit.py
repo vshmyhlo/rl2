@@ -533,7 +533,7 @@ def collect_rollout(
         "charts/seed_score_mean": float(seed_scores.mean()),
         "charts/success_rate": float(successes.mean()),
         "charts/group_success_rate": float(successes.reshape(config.num_tasks, config.group_size).any(axis=1).mean()),
-        "charts/reward_diverse_group_fraction": float((np.ptp(grouped, axis=1) > 0).mean()),
+        "charts/degenerate_group_ratio": float((np.ptp(grouped, axis=1) == 0).mean()),
         "charts/edits_mean": float(completed_edits.mean()),
         "charts/sequence_budget_exhausted_rate": float(budget_exhausted.mean()),
         "charts/sequence_length_mean": float(sequence_lengths.mean()),
@@ -873,7 +873,7 @@ def train(config: Config) -> TrainState:
                     f"length_penalty={diagnostics['charts/reward_length_mean']:.4f} "
                     f"depth_penalty={diagnostics['charts/reward_depth_mean']:.4f} "
                     f"execution_penalty={diagnostics['charts/reward_execution_mean']:.4f} "
-                    f"reward_diverse_groups={diagnostics['charts/reward_diverse_group_fraction']:.3f} "
+                    f"degenerate_group_ratio={diagnostics['charts/degenerate_group_ratio']:.3f} "
                     f"decisions_mean={diagnostics['charts/decisions_mean']:.3f} "
                     f"sequence_length_mean={diagnostics['charts/sequence_length_mean']:.3f} "
                     f"program_node_count_mean={diagnostics['charts/program_node_count_mean']:.3f} "

@@ -2,10 +2,12 @@ import asyncio
 import io
 import json
 import pickle
+import runpy
 import subprocess
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
+from statistics import mean, pstdev
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock
 from urllib.error import URLError
@@ -19,6 +21,7 @@ import renderers.base as renderer_base
 import verifiers.v1 as vf
 import yaml
 from pydantic import ValidationError
+from ray import cloudpickle
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 from verifiers.v1.clients import base as client_base
@@ -28,6 +31,7 @@ from verifiers.v1.trace import AgentInfo, TraceTask
 
 from rl2 import train_grpo_v2 as training
 from rl2.addition_env import AdditionTaskset, AdditionTools
+from rl2.toolrl_env import ToolCall, ToolRLData, ToolRLTask
 
 
 def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -65,9 +69,11 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
         {"microbatch_size": 0},
         {"microbatch_size": 3},
         {"update_epochs": 0},
+        {"taskset": "unknown"},
+        {"taskset": "toolrl", "max_turns": 2},
     ],
 )
-def test_config_rejects_invalid_settings(settings: dict[str, int | float]) -> None:
+def test_config_rejects_invalid_settings(settings: dict[str, int | float | str]) -> None:
     with pytest.raises(ValidationError):
         training.Config(**settings)
 
@@ -80,6 +86,24 @@ def test_agent_uses_config() -> None:
     assert agent.config.sampling.max_tokens == 16
     assert agent.config.sampling.temperature == 0.7
     assert agent.config.max_turns == 2
+
+
+def test_toolrl_preset_and_actor(monkeypatch: pytest.MonkeyPatch) -> None:
+    preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/toolrl.yaml"
+    config = training.load_config(preset, training.Config)
+    assert config.taskset == "toolrl"
+    assert config.max_turns == 1
+    assert config.max_tokens == 1024
+    assert config.run_id == "grpo_v2_toolrl_Qwen_Qwen3-0.6B_seed1"
+    assert pickle.loads(pickle.dumps(config)) == config
+    tasks = Mock(return_value=[Mock()])
+    monkeypatch.setattr(training, "ToolRLTaskset", tasks)
+    monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
+    monkeypatch.setattr(training, "wait_for_server", Mock())
+    actor = training.Actor.__ray_metadata__.modified_class(config=config)
+    assert actor.tasks == tasks.return_value
+    assert tasks.call_args.kwargs["config"].data_file == config.dataset_file
+    actor.__ray_shutdown__()
 
 
 @pytest.mark.parametrize("temperature", [0.01, 2.0])
@@ -141,6 +165,15 @@ def test_actor_and_learner_each_reserve_one_gpu() -> None:
     assert training.Actor._default_options["num_gpus"] == 1
     assert training.Learner._default_options["num_gpus"] == 1
     assert training.Batcher._default_options.get("num_gpus", 0) == 0
+
+
+def test_script_actor_serialization() -> None:
+    # A script's definitions must travel by value to workers with a different entrypoint.
+    namespace = runpy.run_path(training.__file__)
+    for name in ("Learner", "Actor", "Batcher"):
+        actor_class = namespace[name].__ray_metadata__.modified_class
+        restored = cloudpickle.loads(cloudpickle.dumps(actor_class))
+        assert restored.__name__ == name
 
 
 def test_wait_for_server_retries_until_ready(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -331,8 +364,23 @@ def learner(monkeypatch: pytest.MonkeyPatch) -> Any:
     return learner
 
 
-@pytest.mark.parametrize("fails", [False, True])
-def test_learner_logs_rollouts(fails: bool, learner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("fails", "group_rewards", "degenerate_ratio"),
+    [
+        pytest.param(False, ((0.0, 0.0), (1.0, 1.0)), 1.0, id="all-degenerate"),
+        pytest.param(False, ((0.0, 0.0), (0.0, 1.0)), 0.5, id="mixed"),
+        pytest.param(False, ((0.0, 1.0), (1.0, 0.0)), 0.0, id="none-degenerate"),
+        pytest.param(True, ((0.0, 0.0), (1.0, 1.0)), 1.0, id="failure"),
+    ],
+)
+def test_learner_logs_rollouts(
+    fails: bool,
+    group_rewards: tuple[tuple[float, float], tuple[float, float]],
+    degenerate_ratio: float,
+    learner: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     sequence = training.TrainingSequence(
         token_ids=np.array([1], dtype=np.int32),  # (T=1,)
         loss_mask=np.array([True]),  # (T=1,)
@@ -350,13 +398,19 @@ def test_learner_logs_rollouts(fails: bool, learner: Any, monkeypatch: pytest.Mo
         stop_condition="agent_completed",
     )
     batch = [
-        training.RolloutGroup(task_id="0", prompt="first", rollouts=[rollout, rollout]),
+        training.RolloutGroup(
+            task_id="0", prompt="first", rollouts=[replace(rollout, reward=reward) for reward in group_rewards[0]]
+        ),
         training.RolloutGroup(
             task_id="1",
             prompt="second",
-            rollouts=[replace(rollout, reward=1.0, num_turns=3, num_output_tokens=6, rollout_seconds=1.5)] * 2,
+            rollouts=[
+                replace(rollout, reward=reward, num_turns=3, num_output_tokens=6, rollout_seconds=1.5)
+                for reward in group_rewards[1]
+            ],
         ),
     ]
+    rewards = [reward for group in group_rewards for reward in group]
     learner.config = replace(learner.config, num_groups=2, group_size=2, total_iterations=None if fails else 2)
     writer = MagicMock()
     writer.__enter__.return_value = writer
@@ -418,10 +472,11 @@ def test_learner_logs_rollouts(fails: bool, learner: Any, monkeypatch: pytest.Mo
     assert calls[1].args[0] == {
         **transfer_metrics,
         "losses/policy": -0.25,
-        "charts/reward_mean": 0.5,
-        "charts/reward_std": 0.5,
+        "charts/reward_mean": mean(rewards),
+        "charts/reward_std": pstdev(rewards),
         "charts/reward_min": 0.0,
         "charts/reward_max": 1.0,
+        "charts/degenerate_group_ratio": degenerate_ratio,
         "charts/turns_mean": 2.0,
         "charts/input_tokens_mean": 4.0,
         "charts/output_tokens_mean": 4.0,
@@ -441,6 +496,8 @@ def test_learner_logs_rollouts(fails: bool, learner: Any, monkeypatch: pytest.Mo
     if not fails:
         assert calls[2].kwargs == {"step": 2}
         assert calls[2].args[0]["charts/total_rollouts"] == 8
+        assert calls[2].args[0]["charts/degenerate_group_ratio"] == degenerate_ratio
+    assert f"degenerate_group_ratio={degenerate_ratio:.3f}" in capsys.readouterr().out
     writer.__exit__.assert_called_once()
     assert writer.__exit__.call_args.args[0] is (RuntimeError if fails else None)
 
@@ -566,7 +623,7 @@ def test_weight_update_waits_for_groups_and_blocks_new_rollouts(actor: Any, monk
     finish_update = asyncio.Event()
     events: list[str] = []
 
-    async def collect(task: training.AdditionTask, group_size: int) -> training.RolloutGroup:
+    async def collect(task: vf.Task, group_size: int) -> training.RolloutGroup:
         events.append("group")
         if events.count("group") == 2:
             groups_started.set()
@@ -723,9 +780,9 @@ def test_actor_returns_only_complete_groups(failure: str | None, actor: Any, mon
         traces[1].nodes = []
     env = AsyncMock()
     env.__aenter__.return_value = env
-    seen: list[training.AdditionTask] = []
+    seen: list[vf.Task] = []
 
-    async def run(sample: training.AdditionTask) -> vf.Trace:
+    async def run(sample: vf.Task) -> vf.Trace:
         index = len(seen)
         seen.append(sample)
         # Finish out of order to check reward/trace/advantage alignment.
@@ -852,7 +909,7 @@ def test_batcher_collects_groups_concurrently(
     env = AsyncMock()
     env.__aenter__.return_value = env
 
-    async def run(task: training.AdditionTask) -> vf.Trace:
+    async def run(task: vf.Task) -> vf.Trace:
         nonlocal started
         started += 1
         if started == 4:
@@ -886,7 +943,7 @@ def test_group_cancels_pending_rollouts(actor: Any, monkeypatch: pytest.MonkeyPa
     cancelled: list[bool] = []
     count = 0
 
-    async def run(task: training.AdditionTask) -> vf.Trace:
+    async def run(task: vf.Task) -> vf.Trace:
         nonlocal count
         count += 1
         if count == 1:
@@ -1042,3 +1099,66 @@ def test_verifiers_tool_rollout(
     prompt = tokenizer.decode(requests[0]["token_ids"])
     assert '"name": "add"' in prompt
     assert prompt.endswith("<think>\n\n</think>\n\n")
+
+
+def test_verifiers_toolrl_rollout(
+    actor: Any, local_harness: None, tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    actor.config = training.Config(taskset="toolrl", max_turns=1)
+    answer = '<think>Use add.</think>\n<tool_call>\n{"name":"add","parameters":{"a":17,"b":25}}\n</tool_call>'
+    task = ToolRLTask(
+        data=ToolRLData(
+            id="toolrl-test",
+            prompt="Add 17 and 25",
+            system_prompt="Predict the add call as text.",
+            answer=answer,
+            expected_calls=[ToolCall(name="add", parameters={"a": 17, "b": 25})],
+        ),
+        config=vf.TaskConfig(),
+    )
+    # A truncated second completion must receive a low reward, not abort the batch.
+    completions = [answer, '<think>Use add.</think>\n<tool_call>\n{"name":']
+    sampled = [tokenizer.encode(text + "<|im_end|>") for text in completions]  # Each (C,).
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(status_code=200, json={"data": [{"id": training.MODEL, "max_model_len": 8192}]})
+        ids = sampled[len(requests)]  # (C,)
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            status_code=200,
+            json={
+                "request_id": f"toolrl-{len(requests)}",
+                "choices": [
+                    {
+                        "index": 0,
+                        "token_ids": ids,
+                        "finish_reason": "stop",
+                        "logprobs": {"content": [{"token": f"token_id:{token}", "logprob": -0.2} for token in ids]},
+                    }
+                ],
+            },
+        )
+
+    def build_client(config: vf.TrainClientConfig) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(respond))
+
+    monkeypatch.setattr(client_base, "build_async_httpx", build_client)
+    group = asyncio.run(actor.collect_group(task, group_size=2))
+    assert len(requests) == 2  # No tool execution or follow-up model request.
+    by_completion = {rollout.completion: rollout for rollout in group.rollouts}
+    assert by_completion[answer].reward == 4.0
+    assert by_completion[completions[1]].reward == -3.0
+    assert by_completion[answer].advantage == pytest.approx(1.0, abs=1e-4)
+    assert by_completion[completions[1]].advantage == pytest.approx(-1.0, abs=1e-4)
+    for text, ids in zip(completions, sampled, strict=True):
+        rollout = by_completion[text]
+        assert rollout.num_turns == 1
+        sequence = rollout.sequence
+        assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
+        np.testing.assert_array_equal(sequence.token_ids[sequence.loss_mask], ids)
+        np.testing.assert_allclose(sequence.old_log_probs, np.where(sequence.loss_mask, -0.2, 0.0))
+    prompt = tokenizer.decode(requests[0]["token_ids"])
+    assert prompt.endswith("<|im_start|>assistant\n")
+    assert answer not in prompt

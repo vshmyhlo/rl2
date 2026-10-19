@@ -11,7 +11,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from functools import partial
 from statistics import mean, pstdev
-from typing import Annotated, Any, NamedTuple
+from typing import Annotated, Any, Literal, NamedTuple
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -29,14 +29,16 @@ from numpy.typing import NDArray
 from pydantic import Field
 from pydantic.dataclasses import dataclass as config_dataclass
 from ray.actor import ActorHandle
+from renderers.configs import CustomRendererConfig
 from verifiers.v1.configs.agent import TimeoutConfig
 from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
 from vllm.utils.network_utils import get_open_port
 
-from rl2.addition_env import AdditionTask, AdditionTaskset
+from rl2.addition_env import AdditionTaskset
 from rl2.configuration import BaseConfig, load_config
 from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import Parameters, Qwen3LM, load_qwen3_checkpoint
+from rl2.toolrl_env import TOOLRL_TRAIN_FILE, ToolRLTaskset, ToolRLTasksetConfig
 from rl2.utils import group_advantages
 
 logger = logging.getLogger(__name__)
@@ -48,6 +50,8 @@ WEIGHT_BUFFER_BYTES = 64 * 1024**2
 @config_dataclass(frozen=True)
 class Config(BaseConfig):
     model: str = MODEL
+    taskset: Literal["addition", "toolrl"] = "addition"
+    dataset_file: str = TOOLRL_TRAIN_FILE
     seed: Annotated[int, Field(ge=0)] = 1
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4
@@ -64,6 +68,8 @@ class Config(BaseConfig):
     def __post_init__(self) -> None:
         if self.num_groups * self.group_size % self.microbatch_size:
             raise ValueError("microbatch_size must divide num_groups * group_size")
+        if self.taskset == "toolrl" and self.max_turns != 1:
+            raise ValueError("ToolRL requires max_turns=1; tool calls are graded without execution")
 
 
 DEFAULT_CONFIG = Config()
@@ -125,7 +131,8 @@ class GRPOBatch(NamedTuple):
     advantages: jax.Array  # (B,) Normalized within each rollout group.
 
 
-type Metrics = dict[str, jax.Array]  # Scalar leaves.
+# Use a value alias so Ray can serialize script-defined actors without importing __main__.Metrics.
+Metrics = dict[str, jax.Array]  # Scalar leaves.
 
 
 def prepare_batch(groups: list[RolloutGroup], context_length: int) -> GRPOBatch:
@@ -261,14 +268,14 @@ def training_sequence(trace: vf.Trace) -> TrainingSequence:
     )
 
 
-async def score_group(task: AdditionTask, traces: list[vf.Trace]) -> RolloutGroup:
+async def score_group(task: vf.Task, traces: list[vf.Trace]) -> RolloutGroup:
     logger.debug("Scoring %s rollouts for task %s", len(traces), task.data.id)
     if len(traces) < 2:
         raise ValueError("A rollout group needs at least two traces")
     for trace in traces:
         if not trace.ok:
             raise RuntimeError(f"Rollout failed: {trace.stop_condition}: {trace.errors}")
-    # Addition rewards need only the completed trace, so score after all rollouts finish.
+    # These tasks can be graded from the completed trace without a live runtime.
     async with asyncio.timeout(30):
         for trace in traces:
             await task.score(trace)
@@ -304,13 +311,18 @@ def create_agent(config: Config = DEFAULT_CONFIG) -> vf.Agent:
             harness=vf.HarnessConfig(id="null"),
             runtime=vf.SubprocessConfig(),
             client=vf.TrainClientConfig(
-                base_url=f"{SERVER_URL}/v1", api_key_var="VLLM_API_KEY", renderer_model_name=config.model
+                base_url=f"{SERVER_URL}/v1",
+                api_key_var="VLLM_API_KEY",
+                renderer_model_name=config.model,
+                renderer=CustomRendererConfig(import_path="rl2.toolrl_env.ToolRLRenderer")
+                if config.taskset == "toolrl"
+                else None,
             ),
             sampling=vf.SamplingConfig(
                 max_tokens=config.max_tokens,
                 temperature=config.temperature,
                 top_p=1.0,
-                chat_template_kwargs={"enable_thinking": False},
+                chat_template_kwargs={"enable_thinking": config.taskset == "toolrl"},
             ),
             max_turns=config.max_turns,
             timeout=TimeoutConfig(setup=120, rollout=120, finalize=30, scoring=30),
@@ -475,6 +487,10 @@ class Learner:
                     "charts/reward_std": pstdev(rewards),
                     "charts/reward_min": min(rewards),
                     "charts/reward_max": max(rewards),
+                    "charts/degenerate_group_ratio": mean(
+                        all(rollout.reward == group.rollouts[0].reward for rollout in group.rollouts)
+                        for group in batch.groups
+                    ),
                     "charts/turns_mean": mean(rollout.num_turns for rollout in rollouts),
                     "charts/input_tokens_mean": mean(rollout.num_input_tokens for rollout in rollouts),
                     "charts/output_tokens_mean": mean(rollout.num_output_tokens for rollout in rollouts),
@@ -493,6 +509,7 @@ class Learner:
                 }
                 print(
                     f"iteration={iteration} reward={scalars['charts/reward_mean']:.3f} "
+                    f"degenerate_group_ratio={scalars['charts/degenerate_group_ratio']:.3f} "
                     f"batch={scalars['time/batch_seconds']:.2f}s "
                     f"group_transfer_mean={scalars['time/actor_to_batcher_seconds_mean']:.6f}s "
                     f"batch_transfer={scalars['time/batcher_to_learner_seconds']:.6f}s "
@@ -523,6 +540,7 @@ class Learner:
     def publish_weights(self) -> None:
         started = time.monotonic()
         params = jax.tree.map(lambda value: value.astype(jnp.bfloat16), self.state.params)  # HF parameter shapes.
+        # vLLM packs weights on separate CUDA streams without waiting on the DLPack consumer stream.
         jax.block_until_ready(params)
         weights = jax.tree.map(torch.from_dlpack, params)  # GPU views; HF parameter shapes.
         buffer_bytes = max(WEIGHT_BUFFER_BYTES, max(weight.nbytes for weight in weights.values()))
@@ -558,7 +576,6 @@ class Learner:
             )
             history.append(metrics)
         metrics = jax.tree.map(lambda *values: jnp.stack(values).mean(), *history)  # Scalar leaves.
-        jax.block_until_ready(self.state)
         return {name: float(value) for name, value in metrics.items()}
 
 
@@ -571,7 +588,11 @@ class Actor:
         self._weights_condition = asyncio.Condition()
         self._active_groups = 0
         self._weights_valid = True
-        self.tasks = list(AdditionTaskset(config=vf.TasksetConfig()))
+        self.tasks = list(
+            ToolRLTaskset(config=ToolRLTasksetConfig(data_file=config.dataset_file))
+            if config.taskset == "toolrl"
+            else AdditionTaskset(config=vf.TasksetConfig())
+        )
         logger.info("Starting actor and vLLM on its assigned GPU")
         with self._server as resources:
             server = resources.enter_context(serve_vllm(model=config.model))
@@ -623,7 +644,7 @@ class Actor:
             self._weights_valid = True
             logger.info("Learner weights applied; generation resumed")
 
-    async def collect_group(self, task: AdditionTask, group_size: int) -> RolloutGroup:
+    async def collect_group(self, task: vf.Task, group_size: int) -> RolloutGroup:
         if group_size < 2:
             raise ValueError("group_size must be at least 2")
         started = time.monotonic()

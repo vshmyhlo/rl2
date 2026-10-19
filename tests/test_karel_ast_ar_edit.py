@@ -365,7 +365,7 @@ def test_advantages_use_final_scores_without_delta_roundoff(
         collected = edit.collect_rollout(state, envs, np.random.default_rng(4), rollout.key, config)
     expected = np.asarray([-improvement / 2, improvement / 2]) / (improvement / 2 + 1e-8)
     np.testing.assert_allclose(collected.batch.advantages, expected, atol=1e-7)
-    assert collected.diagnostics["charts/reward_diverse_group_fraction"] == float(improvement > 0)
+    assert collected.diagnostics["charts/degenerate_group_ratio"] == float(improvement == 0)
 
 
 def test_stop_is_a_real_decision(config: edit.Config, state: TrainState) -> None:
