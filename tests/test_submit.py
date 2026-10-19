@@ -31,8 +31,8 @@ def test_default_gpu_job() -> None:
     assert "NVIDIA_VISIBLE_DEVICES" not in env  # The device plugin supplies the allocated GPU IDs.
     assert "CUDA_VISIBLE_DEVICES" not in env
     assert set(env["NVIDIA_DRIVER_CAPABILITIES"].split(",")) >= {"compute", "utility", "graphics"}
-    assert container["resources"]["requests"] == {"cpu": "4", "memory": "16Gi", "nvidia.com/gpu": "1"}
-    assert container["resources"]["limits"]["nvidia.com/gpu"] == "1"
+    assert container["resources"]["requests"] == {"cpu": "4", "memory": "32Gi", "nvidia.com/gpu": "1"}
+    assert container["resources"]["limits"] == {"memory": "32Gi", "nvidia.com/gpu": "1"}
     run_mount = next(mount for mount in container["volumeMounts"] if mount["mountPath"] == "/runs")
     run_volume = next(volume for volume in pod["volumes"] if volume["name"] == run_mount["name"])
     assert run_volume["persistentVolumeClaim"]["claimName"] == "training-runs"

@@ -27,7 +27,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--prio", choices=("low", "high"), default="low")
     parser.add_argument("--gpus", type=int, choices=range(1, 3), default=1, help="GPUs per job (default: 1)")
     parser.add_argument("--cpus", type=int, choices=range(1, 11), default=4, metavar="1..10")
-    parser.add_argument("--memory-gib", type=int, choices=range(1, 65), default=16, metavar="1..64")
+    parser.add_argument("--memory-gib", type=int, choices=range(1, 65), default=32, metavar="1..64")
     parser.add_argument("--extra", choices=("bfcl",), help="Include an optional dependency group in the image")
     parser.add_argument("--sweep", type=Path, help="Sweep YAML; omit --config from COMMAND")
     parser.add_argument("--dry-run", action="store_true", help="Print the submission plan without building or queuing")

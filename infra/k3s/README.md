@@ -457,7 +457,7 @@ The non-secret `nvida.env` configuration is included in the image and loaded by
 put credentials in `nvida.env`; supply secrets at runtime. Resubmit after changing
 this file so the job uses a newly built image.
 
-Defaults are `--prio low --gpus 1 --cpus 4 --memory-gib 16`. High priority moves ahead of
+Defaults are `--prio low --gpus 1 --cpus 4 --memory-gib 32`. High priority moves ahead of
 waiting low-priority Jobs and preempts running low-priority Jobs when quota is
 full. Kueue suspends the low-priority Job and deletes its Pod, then readmits the
 same Job with a new Pod when higher-priority work finishes. Equal-priority Jobs
