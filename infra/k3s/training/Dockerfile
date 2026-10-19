@@ -12,6 +12,11 @@ COPY pyproject.toml uv.lock ./
 ARG UV_EXTRA=""
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project ${UV_EXTRA:+--extra=$UV_EXTRA}
+# FlashInfer expects a conventional toolkit layout; CUDA wheels use nvidia/cu13.
+ENV CUDA_HOME=/app/.venv/lib/python3.12/site-packages/nvidia/cu13
+RUN test -x "$CUDA_HOME/bin/nvcc" \
+    && ln -s lib "$CUDA_HOME/lib64" \
+    && ln -s libcudart.so.13 "$CUDA_HOME/lib/libcudart.so"
 # Bundle Panda assets so Playground can start without runtime downloads.
 RUN --mount=type=bind,source=src/rl2/envs/playground_assets.py,target=/tmp/playground_assets.py \
     /app/.venv/bin/python /tmp/playground_assets.py
@@ -22,6 +27,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev ${UV_EXTRA:+--extra=$UV_EXTRA}
 COPY . .
 # Preserve the built environment when a command uses uv run.
-ENV UV_NO_SYNC=1 UV_ENV_FILE=/app/nvida.env PATH="/app/.venv/bin:$PATH"
+ENV UV_NO_SYNC=1 UV_ENV_FILE=/app/nvida.env PATH="/app/.venv/bin:${CUDA_HOME}/bin:$PATH"
 # Ray workers share the installed image environment, including optional extras.
 ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 RAY_DEDUP_LOGS=0

@@ -131,7 +131,7 @@ def create_agent() -> vf.Agent:
 
 
 @contextmanager
-def serve_vllm() -> Iterator[None]:
+def serve_vllm() -> Iterator[subprocess.Popen[bytes]]:
     logger.info("Starting vLLM server for %s", MODEL)
     # Inherit the GPU assigned to this actor through CUDA_VISIBLE_DEVICES.
     with subprocess.Popen(
@@ -148,7 +148,7 @@ def serve_vllm() -> Iterator[None]:
         ],
     ) as server:
         try:
-            yield
+            yield server
         finally:
             logger.info("Stopping vLLM server: pid=%s", server.pid)
             server.terminate()
@@ -160,10 +160,12 @@ def serve_vllm() -> Iterator[None]:
     logger.info("vLLM server exited")
 
 
-def wait_for_server(timeout: float = 600) -> None:
+def wait_for_server(server: subprocess.Popen[bytes], timeout: float = 600) -> None:
     logger.info("Waiting for vLLM at %s", SERVER_URL)
     deadline = time.monotonic() + timeout
     while (remaining := deadline - time.monotonic()) > 0:
+        if (returncode := server.poll()) is not None:
+            raise RuntimeError(f"vLLM exited with code {returncode} before becoming ready; see server logs above")
         try:
             with urlopen(f"{SERVER_URL}/health", timeout=min(5, remaining)):
                 logger.info("vLLM is ready")
@@ -230,8 +232,8 @@ class Actor:
         self.tasks = list(AdditionTaskset(config=vf.TasksetConfig()))
         logger.info("Starting actor and vLLM on its assigned GPU")
         with ExitStack() as resources:
-            resources.enter_context(serve_vllm())
-            wait_for_server()
+            server = resources.enter_context(serve_vllm())
+            wait_for_server(server)
             self._server = resources.pop_all()
         logger.info("Actor ready for rollout requests: tasks=%s", len(self.tasks))
 

@@ -50,7 +50,8 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
         with pytest.raises(OSError if failure == "launch" else RuntimeError), training.serve_vllm():
             raise RuntimeError("rollout failed")
     else:
-        with training.serve_vllm():
+        with training.serve_vllm() as process:
+            assert process is server
             server.terminate.assert_not_called()
 
     # No env override: vLLM inherits Ray's CUDA_VISIBLE_DEVICES assignment.
@@ -76,7 +77,7 @@ def test_wait_for_server_retries_until_ready(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(training, "urlopen", request)
     monkeypatch.setattr(training.time, "sleep", Mock())
 
-    training.wait_for_server()
+    training.wait_for_server(Mock(poll=Mock(return_value=None)))
 
     assert request.call_count == 2
     request.assert_called_with(f"{training.SERVER_URL}/health", timeout=5)
@@ -89,7 +90,22 @@ def test_wait_for_server_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(training.time, "sleep", Mock())
 
     with pytest.raises(TimeoutError, match="vLLM was not ready"):
-        training.wait_for_server(timeout=2)
+        training.wait_for_server(Mock(poll=Mock(return_value=None)), timeout=2)
+
+
+@pytest.mark.parametrize("returncode", [1, 0, -9], ids=["error", "early-exit", "killed"])
+def test_wait_for_server_detects_exit(returncode: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    server = Mock(poll=Mock(side_effect=[None, returncode]))
+    request = Mock(side_effect=URLError("connection refused"))
+    monkeypatch.setattr(training, "urlopen", request)
+    sleep = Mock()
+    monkeypatch.setattr(training.time, "sleep", sleep)
+
+    with pytest.raises(RuntimeError, match=f"vLLM exited with code {returncode}"):
+        training.wait_for_server(server)
+
+    request.assert_called_once()
+    sleep.assert_called_once()
 
 
 @pytest.fixture
@@ -124,7 +140,7 @@ def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPa
         server.__exit__.assert_not_called()
         actor.__ray_shutdown__()
     serve.assert_called_once_with()
-    ready.assert_called_once_with()
+    ready.assert_called_once_with(server.__enter__.return_value)
     server.__enter__.assert_called_once()
     server.__exit__.assert_called_once()
 
