@@ -95,11 +95,16 @@ Visit <http://localhost:8080>. If your browser runs on another machine, forward
 port 8080 through your IDE's Ports panel or SSH. The service is ClusterIP only;
 there is no ingress or public endpoint.
 
-Generate a one-hour login token in another terminal and paste it into Headlamp:
+Generate a 30-day login token in another terminal and paste it into Headlamp:
 
 ```bash
-sudo k3s kubectl -n headlamp create token headlamp-viewer --duration=1h
+sudo k3s kubectl -n headlamp create token headlamp-viewer --duration=720h
 ```
+
+The chart passes `-session-ttl=2592000` through `config.extraArgs` (30 days),
+matching the token lifetime. After upgrading, log out and paste a new token once;
+existing tokens and browser cookies keep their old expiry. Use the same browser
+hostname each time (`localhost` and `127.0.0.1` have separate cookies).
 
 The login account has Kubernetes's built-in `view` role across namespaces, plus
 `get`, `list`, and `watch` access to nodes through `headlamp-node-viewer` (the
@@ -122,7 +127,8 @@ Job, and choose **Delete**. Delete the Job to cancel it and remove it from the
 queue; evicting its Pod can cause a replacement to start. Saved `/runs`
 checkpoints remain. Refresh Headlamp after changing permissions.
 
-Verify the login account's permissions without deleting or evicting workloads:
+Verify login persistence and permissions with the localhost port-forward running,
+without deleting or evicting workloads:
 
 ```bash
 RL2_K3S_TESTS=1 uv run pytest infra/k3s/tests/test_headlamp_access.py -q

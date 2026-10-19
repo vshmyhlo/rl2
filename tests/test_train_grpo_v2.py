@@ -54,7 +54,8 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
         {"total_iterations": 0},
         {"max_tokens": 0},
         {"max_turns": 0},
-        {"temperature": 0.0},
+        {"temperature": 0.001},
+        {"temperature": 2.1},
         {"seed": -1},
         {"group_size": 2.5},
         {"unknown_option": 1},
@@ -79,6 +80,11 @@ def test_agent_uses_config() -> None:
     assert agent.config.sampling.max_tokens == 16
     assert agent.config.sampling.temperature == 0.7
     assert agent.config.max_turns == 2
+
+
+@pytest.mark.parametrize("temperature", [0.01, 2.0])
+def test_sampling_temperature_bounds(temperature: float) -> None:
+    assert training.Config(temperature=temperature).temperature == temperature
 
 
 @pytest.mark.parametrize("failure", [None, "launch", "rollout", "shutdown"])
@@ -204,7 +210,7 @@ def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPa
         actor.collect_group = AsyncMock(return_value=group)
         monkeypatch.setattr(training.random, "choice", Mock(return_value=actor.tasks[0]))
         for _ in range(2):
-            assert asyncio.run(actor.fetch_next_group(group_size=2)) is group
+            assert asyncio.run(actor.fetch_next_group(group_size=2)).value is group
         actor.collect_group.assert_awaited_with(actor.tasks[0], group_size=2)
         assert actor.collect_group.await_count == 2
         server.__exit__.assert_not_called()
@@ -221,8 +227,9 @@ def test_learner_pulls_groups_through_batcher(
 ) -> None:
     actor = Mock()
     groups = [training.RolloutGroup(task_id=str(i), prompt="test", rollouts=[]) for i in range(num_groups)]
+    results = [training.Transfer(value=group, ready_at=training.time.monotonic()) for group in groups]
     actor.fetch_next_group.remote = AsyncMock(
-        side_effect=[groups[0], RuntimeError("rollout failed")] if fails else groups
+        side_effect=[results[0], RuntimeError("rollout failed")] if fails else results
     )
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor)
     batcher_handle = Mock()
@@ -238,7 +245,9 @@ def test_learner_pulls_groups_through_batcher(
         with pytest.raises(RuntimeError, match="rollout failed"):
             learner.fetch_next_batch(num_groups=num_groups, group_size=3)
     else:
-        assert learner.fetch_next_batch(num_groups=num_groups, group_size=3) == groups
+        batch = learner.fetch_next_batch(num_groups=num_groups, group_size=3)
+        assert batch.groups == groups
+        assert batch.transfer_metrics["data/batch_array_bytes"] == 0
     batcher_handle.fetch_next_batch.remote.assert_called_once_with(num_groups=num_groups, group_size=3)
     assert actor.fetch_next_group.remote.call_count == num_groups
     assert all(call.kwargs == {"group_size": 3} for call in actor.fetch_next_group.remote.call_args_list)
@@ -250,6 +259,59 @@ def test_batch_requires_groups() -> None:
     with pytest.raises(ValueError, match="num_groups"):
         asyncio.run(batcher.fetch_next_batch(num_groups=0, group_size=2))
     actor.fetch_next_group.remote.assert_not_called()
+
+
+def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
+    learner: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    clock = Mock(return_value=0.0)
+    monkeypatch.setattr(training, "time", Mock(monotonic=clock))
+    caplog.set_level("INFO", logger=training.__name__)
+    groups = [training.RolloutGroup(task_id=str(i), prompt="test", rollouts=[]) for i in range(2)]
+    fast_ready = asyncio.Event()
+    requested = 0
+
+    async def fetch_group(group_size: int) -> training.Transfer[training.RolloutGroup]:
+        nonlocal requested
+        assert group_size == 2
+        index = requested
+        requested += 1
+        if index == 0:
+            await fast_ready.wait()
+            ready_at, received_at = 50.0, 50.5
+        else:
+            ready_at, received_at = 10.0, 10.25
+            fast_ready.set()
+        result = training.Transfer(value=groups[index], ready_at=ready_at)
+        # Account for the full return path, including serialization/deserialization.
+        result = pickle.loads(pickle.dumps(result))
+        clock.return_value = received_at
+        return result
+
+    actor = Mock()
+    actor.fetch_next_group.remote.side_effect = fetch_group
+    batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor)
+    learner.batcher.fetch_next_batch.remote.side_effect = batcher.fetch_next_batch
+
+    def get(pending: Any) -> training.Transfer[training.RolloutBatch]:
+        result = asyncio.run(pending)
+        assert result.ready_at == 50.5
+        result = pickle.loads(pickle.dumps(result))
+        clock.return_value = 51.25
+        return result
+
+    monkeypatch.setattr(training.ray, "get", get)
+    batch = learner.fetch_next_batch(num_groups=2, group_size=2)
+    assert batch.groups == groups  # Preserve request order despite out-of-order completion.
+    assert batch.transfer_metrics == {
+        "time/actor_to_batcher_seconds_mean": 0.375,
+        "time/actor_to_batcher_seconds_max": 0.5,
+        "time/batcher_to_learner_seconds": 0.75,
+        "data/batch_array_bytes": 0,
+    }
+    assert "Actor -> Batcher: task=1 seconds=0.250000" in caplog.text
+    assert "Actor -> Batcher: task=0 seconds=0.500000" in caplog.text
+    assert "Batcher -> Learner: groups=2 seconds=0.750000" in caplog.text
 
 
 @pytest.fixture
@@ -310,7 +372,15 @@ def test_learner_logs_rollouts(fails: bool, learner: Any, monkeypatch: pytest.Mo
     steps.initialize = Mock(wraps=learner.initialize_weight_transfer)
     learner.initialize_weight_transfer = steps.initialize
     learner.fetch_next_batch = steps.fetch
-    learner.fetch_next_batch.side_effect = [batch, RuntimeError("done") if fails else batch]
+    transfer_metrics = {
+        "time/actor_to_batcher_seconds_mean": 0.25,
+        "time/actor_to_batcher_seconds_max": 0.3,
+        "time/batcher_to_learner_seconds": 0.125,
+        "data/batch_array_bytes": sum(training.rollout_array_bytes(group) for group in batch),
+    }
+    assert transfer_metrics["data/batch_array_bytes"] == 36  # Four sequences, each int32 + bool + float32.
+    received = training.RolloutBatch(groups=batch, transfer_metrics=transfer_metrics)
+    learner.fetch_next_batch.side_effect = [received, RuntimeError("done") if fails else received]
     learner.publish_weights = steps.publish
 
     def optimize(groups: list[training.RolloutGroup]) -> dict[str, float]:
@@ -346,6 +416,7 @@ def test_learner_logs_rollouts(fails: bool, learner: Any, monkeypatch: pytest.Mo
     assert calls[0].args[0] == {"model/params_millions": 9 / 1_000_000, "time/setup_seconds": 1}
     assert calls[1].kwargs == {"step": 1}
     assert calls[1].args[0] == {
+        **transfer_metrics,
         "losses/policy": -0.25,
         "charts/reward_mean": 0.5,
         "charts/reward_std": 0.5,
@@ -668,7 +739,8 @@ def test_actor_returns_only_complete_groups(failure: str | None, actor: Any, mon
         with pytest.raises(RuntimeError if failure == "rollout" else ValueError):
             asyncio.run(actor.fetch_next_group(group_size=2))
     else:
-        group = asyncio.run(actor.fetch_next_group(group_size=2))
+        result = asyncio.run(actor.fetch_next_group(group_size=2))
+        group = result.value
     assert len(seen) == 2
     assert seen[0] is not seen[1] and all(sample is not task for sample in seen)
     assert all(sample.data == task.data and sample.scoring_deferred for sample in seen)
@@ -681,7 +753,7 @@ def test_actor_returns_only_complete_groups(failure: str | None, actor: Any, mon
         assert group.prompt == task.data.prompt_text
         assert [rollout.completion for rollout in group.rollouts] == ["42", "41"]
         np.testing.assert_array_equal([rollout.sequence.token_ids for rollout in group.rollouts], [[42], [41]])
-        np.testing.assert_equal(asdict(pickle.loads(pickle.dumps(group))), asdict(group))
+        np.testing.assert_equal(asdict(pickle.loads(pickle.dumps(result))), asdict(result))
 
 
 @pytest.fixture
@@ -796,11 +868,11 @@ def test_batcher_collects_groups_concurrently(
     handle.fetch_next_group.remote.side_effect = actor.fetch_next_group
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=handle)
 
-    async def collect() -> list[training.RolloutGroup]:
+    async def collect() -> training.Transfer[training.RolloutBatch]:
         async with asyncio.timeout(5):
             return await batcher.fetch_next_batch(num_groups=2, group_size=2)
 
-    groups = asyncio.run(collect())
+    groups = asyncio.run(collect()).value.groups
     assert started == 4
     assert [group.task_id for group in groups] == [task.data.id for task in actor.tasks[:2]]
     assert [len(group.rollouts) for group in groups] == [2, 2]

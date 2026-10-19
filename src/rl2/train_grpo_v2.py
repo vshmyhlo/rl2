@@ -54,7 +54,7 @@ class Config(BaseConfig):
     total_iterations: Annotated[int | None, Field(ge=1)] = None
     max_tokens: Annotated[int, Field(ge=1)] = 512
     max_turns: Annotated[int, Field(ge=1)] = 3
-    temperature: Annotated[float, Field(gt=0)] = 1.0
+    temperature: Annotated[float, Field(ge=0.01, le=2.0)] = 1.0  # vLLM clamps smaller positive values to 0.01.
     learning_rate: Annotated[float, Field(gt=0)] = 1e-6
     clip_coef: Annotated[float, Field(gt=0, lt=1)] = 0.2
     max_grad_norm: Annotated[float, Field(gt=0)] = 1.0
@@ -94,6 +94,27 @@ class RolloutGroup:
     task_id: str | None  # Source task ID shared by the group; None if the task has no ID.
     prompt: str  # Shared task prompt for sample logging.
     rollouts: list[Rollout]  # Independent attempts at the same task, in sampling order, scored as one group.
+
+
+@dataclass(frozen=True)
+class Transfer[T]:
+    value: T
+    ready_at: float  # Same-node monotonic timestamp immediately before Ray serializes the return value.
+
+
+@dataclass(frozen=True)
+class RolloutBatch:
+    groups: list[RolloutGroup]
+    transfer_metrics: dict[str, float | int]
+
+
+def rollout_array_bytes(group: RolloutGroup) -> int:
+    """Logical sequence-array bytes, excluding text/metadata and Ray serialization overhead."""
+    return sum(
+        array.nbytes
+        for rollout in group.rollouts
+        for array in (rollout.sequence.token_ids, rollout.sequence.loss_mask, rollout.sequence.old_log_probs)
+    )
 
 
 class GRPOBatch(NamedTuple):
@@ -358,16 +379,36 @@ class Batcher:
     def __init__(self, actor: ActorHandle) -> None:
         self.actor = actor
 
-    async def fetch_next_batch(self, num_groups: int, group_size: int) -> list[RolloutGroup]:
+    async def fetch_next_batch(self, num_groups: int, group_size: int) -> Transfer[RolloutBatch]:
         if num_groups < 1:
             raise ValueError("num_groups must be at least 1")
         started = time.monotonic()
         logger.info("Fetching batch: num_groups=%s group_size=%s", num_groups, group_size)
-        batch = await asyncio.gather(
-            *(self.actor.fetch_next_group.remote(group_size=group_size) for _ in range(num_groups))
+
+        async def fetch_group() -> tuple[RolloutGroup, float]:
+            result = await self.actor.fetch_next_group.remote(group_size=group_size)
+            received_at = time.monotonic()
+            seconds = received_at - result.ready_at
+            logger.info(
+                "Ray transfer Actor -> Batcher: task=%s seconds=%.6f array_bytes=%s",
+                result.value.task_id,
+                seconds,
+                rollout_array_bytes(result.value),
+            )
+            return result.value, seconds
+
+        # Timestamp each arrival before gather waits for any slower groups.
+        results = await asyncio.gather(*(fetch_group() for _ in range(num_groups)))
+        batch = RolloutBatch(
+            groups=[group for group, _ in results],
+            transfer_metrics={
+                "time/actor_to_batcher_seconds_mean": mean(seconds for _, seconds in results),
+                "time/actor_to_batcher_seconds_max": max(seconds for _, seconds in results),
+                "data/batch_array_bytes": sum(rollout_array_bytes(group) for group, _ in results),
+            },
         )
-        logger.info("Batch ready: groups=%s elapsed=%.2fs", len(batch), time.monotonic() - started)
-        return batch
+        logger.info("Batch ready: groups=%s elapsed=%.2fs", len(batch.groups), time.monotonic() - started)
+        return Transfer(value=batch, ready_at=time.monotonic())
 
 
 @ray.remote(num_gpus=1)
@@ -419,16 +460,17 @@ class Learner:
                 started = time.monotonic()
                 batch = self.fetch_next_batch(num_groups=self.config.num_groups, group_size=self.config.group_size)
                 fetched = time.monotonic()
-                update_metrics = self.optimize(batch)
+                update_metrics = self.optimize(batch.groups)
                 optimized = time.monotonic()
                 self.publish_weights()
                 now = time.monotonic()
-                rollouts = [rollout for group in batch for rollout in group.rollouts]
+                rollouts = [rollout for group in batch.groups for rollout in group.rollouts]
                 rewards = [rollout.reward for rollout in rollouts]
                 total_rollouts += len(rollouts)
                 seconds = max(now - started, 1e-9)
                 scalars = {
                     **update_metrics,
+                    **batch.transfer_metrics,
                     "charts/reward_mean": mean(rewards),
                     "charts/reward_std": pstdev(rewards),
                     "charts/reward_min": min(rewards),
@@ -452,6 +494,8 @@ class Learner:
                 print(
                     f"iteration={iteration} reward={scalars['charts/reward_mean']:.3f} "
                     f"batch={scalars['time/batch_seconds']:.2f}s "
+                    f"group_transfer_mean={scalars['time/actor_to_batcher_seconds_mean']:.6f}s "
+                    f"batch_transfer={scalars['time/batcher_to_learner_seconds']:.6f}s "
                     f"loss={scalars['losses/policy']:.4f} update={scalars['time/update_seconds']:.2f}s "
                     f"weights={scalars['time/weight_transfer_seconds']:.2f}s "
                     f"elapsed={scalars['time/elapsed_seconds']:.2f}s",
@@ -459,11 +503,22 @@ class Learner:
                 )
                 writer.log_metrics(scalars, step=iteration)
 
-    def fetch_next_batch(self, num_groups: int, group_size: int) -> list[RolloutGroup]:
+    def fetch_next_batch(self, num_groups: int, group_size: int) -> RolloutBatch:
         logger.debug("Requesting batch: num_groups=%s group_size=%s", num_groups, group_size)
-        batch = ray.get(self.batcher.fetch_next_batch.remote(num_groups=num_groups, group_size=group_size))
-        logger.debug("Learner received %s groups", len(batch))
-        return batch
+        result = ray.get(self.batcher.fetch_next_batch.remote(num_groups=num_groups, group_size=group_size))
+        received_at = time.monotonic()
+        seconds = received_at - result.ready_at
+        batch = result.value
+        logger.info(
+            "Ray transfer Batcher -> Learner: groups=%s seconds=%.6f array_bytes=%s",
+            len(batch.groups),
+            seconds,
+            batch.transfer_metrics["data/batch_array_bytes"],
+        )
+        return RolloutBatch(
+            groups=batch.groups,
+            transfer_metrics={**batch.transfer_metrics, "time/batcher_to_learner_seconds": seconds},
+        )
 
     def publish_weights(self) -> None:
         started = time.monotonic()
@@ -529,7 +584,7 @@ class Actor:
         self._server.close()
         logger.info("Actor resources released")
 
-    async def fetch_next_group(self, group_size: int) -> RolloutGroup:
+    async def fetch_next_group(self, group_size: int) -> Transfer[RolloutGroup]:
         async with self._weights_condition:
             if not self._weights_valid:
                 raise RuntimeError("Cannot generate after a failed weight update")
@@ -537,11 +592,12 @@ class Actor:
         try:
             task = random.choice(self.tasks)
             logger.debug("Selected task %s: %r", task.data.id, task.data.prompt)
-            return await self.collect_group(task, group_size=group_size)
+            group = await self.collect_group(task, group_size=group_size)
         finally:
             async with self._weights_condition:
                 self._active_groups -= 1
                 self._weights_condition.notify_all()
+        return Transfer(value=group, ready_at=time.monotonic())
 
     async def initialize_weight_transfer(self, init_info: dict[str, Any]) -> None:
         async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:

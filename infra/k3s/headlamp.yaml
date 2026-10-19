@@ -15,6 +15,9 @@ spec:
   targetNamespace: headlamp
   valuesContent: |-
     fullnameOverride: headlamp
+    config:
+      # Override via extraArgs: this chart renders large sessionTTL integers in scientific notation.
+      extraArgs: ["-session-ttl=2592000"] # 30 days; match the login token duration.
     initContainers:
       - name: install-kueue-plugin
         image: busybox:1.37.0
