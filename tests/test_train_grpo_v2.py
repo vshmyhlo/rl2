@@ -11,8 +11,12 @@ from urllib.error import URLError
 
 import httpx
 import pytest
+import renderers.base as renderer_base
 import verifiers.v1 as vf
-from verifiers.v1.clients import eval as eval_client
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
+from verifiers.v1.clients import base as client_base
+from verifiers.v1.clients.train import ElasticRendererPool
 from verifiers.v1.runtimes import subprocess as subprocess_runtime
 from verifiers.v1.trace import AgentInfo, TraceTask
 
@@ -32,9 +36,6 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
         "127.0.0.1",
         "--port",
         "8000",
-        "--enable-auto-tool-choice",
-        "--tool-call-parser",
-        "hermes",
     ]
     server = MagicMock()
     server.__enter__.return_value = server
@@ -112,6 +113,8 @@ def test_environment_examples(actor: Any) -> None:
     assert config.harness.id == "null"
     assert config.runtime.type == "subprocess"
     assert config.client.base_url == f"{training.SERVER_URL}/v1"
+    assert isinstance(config.client, vf.TrainClientConfig)
+    assert config.client.renderer_model_name == training.MODEL
     assert config.max_turns == 3
 
 
@@ -141,7 +144,7 @@ def test_group_requires_multiple_rollouts(size: int) -> None:
         training.Actor.__ray_metadata__.modified_class(batcher=Mock(), group_size=size)
 
 
-@pytest.mark.parametrize("failure", [None, "rollout", "score"])
+@pytest.mark.parametrize("failure", [None, "rollout", "score", "tokens"])
 def test_actor_submits_only_complete_groups(failure: str | None, actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     task = actor.tasks[0]
     traces = [
@@ -149,6 +152,15 @@ def test_actor_submits_only_complete_groups(failure: str | None, actor: Any, mon
             task=TraceTask(type="AdditionTask", data=task.data),
             agent=AgentInfo(config=training.create_agent().config),
             root_reply=reply,
+            nodes=[
+                vf.MessageNode(
+                    message=vf.AssistantMessage(content=reply),
+                    sampled=True,
+                    token_ids=[42 if reply == "42" else 41],
+                    mask=[True],
+                    logprobs=[-0.2],
+                )
+            ],
             ok=True,
             stop_condition="agent_completed",
         )
@@ -158,6 +170,8 @@ def test_actor_submits_only_complete_groups(failure: str | None, actor: Any, mon
         traces[1].ok = False
     if failure == "score":
         monkeypatch.setattr(task, "score", AsyncMock(side_effect=ValueError("scoring failed")))
+    if failure == "tokens":
+        traces[1].nodes = []
     env = AsyncMock()
     env.__aenter__.return_value = env
     seen: list[training.AdditionTask] = []
@@ -187,7 +201,7 @@ def test_actor_submits_only_complete_groups(failure: str | None, actor: Any, mon
 
     monkeypatch.setattr(training, "wait_for_server", Mock(side_effect=check_server_started))
     actor.fetch_next_prompt = Mock(side_effect=[task, StopIteration])
-    error = {None: StopIteration, "rollout": RuntimeError, "score": ValueError}[failure]
+    error = {None: StopIteration, "rollout": RuntimeError, "score": ValueError, "tokens": ValueError}[failure]
     with pytest.raises(error):
         actor.start()
     assert len(seen) == actor.group_size
@@ -207,13 +221,13 @@ def test_actor_submits_only_complete_groups(failure: str | None, actor: Any, mon
         assert [rollout.advantage for rollout in group.rollouts] == pytest.approx([1.0, -1.0], abs=3e-4)
         assert group.prompt == task.data.prompt_text
         assert [rollout.completion for rollout in group.rollouts] == ["42", "41"]
-        assert all(rollout.sequences == [] for rollout in group.rollouts)
+        assert [rollout.sequence.token_ids for rollout in group.rollouts] == [[42], [41]]
         assert pickle.loads(pickle.dumps(group)) == group
 
 
-@pytest.mark.parametrize("branched", [False, True], ids=["multi-turn", "shared-prefix"])
-def test_training_sequences_preserve_tokens_and_mask_context(branched: bool, actor: Any) -> None:
-    trace = vf.Trace(
+@pytest.fixture
+def token_trace(actor: Any) -> vf.Trace:
+    return vf.Trace(
         task=TraceTask(type="AdditionTask", data=actor.tasks[0].data),
         agent=AgentInfo(config=training.create_agent().config),
         nodes=[
@@ -242,7 +256,33 @@ def test_training_sequences_preserve_tokens_and_mask_context(branched: bool, act
             ),
         ],
     )
-    if branched:
+
+
+def test_training_sequence_preserves_tokens_and_masks_context(token_trace: vf.Trace) -> None:
+    sequence = training.training_sequence(token_trace)
+    assert sequence.token_ids == [10, 20, 30, 40, 41]
+    assert sequence.loss_mask == [False, True, False, True, True]
+    assert sequence.old_log_probs == [0.0, -0.2, 0.0, -0.4, -0.5]
+    assert len(sequence.token_ids) == len(sequence.loss_mask) == len(sequence.old_log_probs)
+    assert pickle.loads(pickle.dumps(sequence)) == sequence
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("empty", "exactly one"),
+        ("branched", "exactly one"),
+        ("no-tokens", "no trainable tokens"),
+        ("mask-length", "equal lengths"),
+        ("missing-logprobs", "log-probability"),
+        ("missing-turn-tokens", "Sampled messages"),
+    ],
+)
+def test_training_sequence_rejects_invalid_tokens(failure: str, message: str, token_trace: vf.Trace) -> None:
+    trace = token_trace
+    if failure == "empty":
+        trace.nodes = []
+    elif failure == "branched":
         trace.nodes.append(
             vf.MessageNode(
                 parent=1,
@@ -254,20 +294,17 @@ def test_training_sequences_preserve_tokens_and_mask_context(branched: bool, act
             )
         )
 
-    sequences = training.training_sequences(trace)
-
-    assert len(sequences) == (2 if branched else 1)
-    assert sequences[0].token_ids == [10, 20, 30, 40, 41]
-    assert sequences[0].loss_mask == [False, True, False, True, True]
-    assert sequences[0].old_log_probs == [0.0, -0.2, 0.0, -0.4, -0.5]
-    if branched:
-        assert sequences[1].token_ids == [10, 20, 50]
-        assert sequences[1].loss_mask == [False, False, True]
-        assert sequences[1].old_log_probs == [0.0, -0.2, -0.6]
-    for sequence in sequences:
-        assert len(sequence.token_ids) == len(sequence.loss_mask) == len(sequence.old_log_probs)
-    assert sum(sum(sequence.loss_mask) for sequence in sequences) == (4 if branched else 3)
-    assert pickle.loads(pickle.dumps(sequences)) == sequences
+    elif failure == "no-tokens":
+        for node in trace.nodes:
+            node.token_ids, node.mask, node.logprobs = [], [], []
+    elif failure == "mask-length":
+        trace.nodes[-1].mask = [True]
+    elif failure == "missing-logprobs":
+        trace.nodes[-1].logprobs = []
+    elif failure == "missing-turn-tokens":
+        trace.nodes[-1].token_ids, trace.nodes[-1].mask, trace.nodes[-1].logprobs = [], [], []
+    with pytest.raises(ValueError, match=message):
+        training.training_sequence(trace)
 
 
 def test_group_cancels_pending_rollouts(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -315,49 +352,81 @@ def local_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subprocess_runtime.SubprocessRuntime, "prepare_uv_script", prepare_script)
 
 
+@pytest.fixture
+def tokenizer(monkeypatch: pytest.MonkeyPatch) -> PreTrainedTokenizerFast:
+    # Exercise the real Qwen3 renderer without downloading a model tokenizer.
+    backend = Tokenizer(
+        models.BPE(vocab={c: i for i, c in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))}, merges=[])
+    )
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+    backend.decoder = decoders.ByteLevel()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        name_or_path=training.MODEL,
+        eos_token="<|im_end|>",
+        additional_special_tokens=[
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
+            "<think>",
+            "</think>",
+        ],
+    )
+    monkeypatch.setattr(renderer_base, "load_tokenizer", Mock(return_value=tokenizer))
+    monkeypatch.setattr(ElasticRendererPool, "_renderers", {})
+    monkeypatch.setattr(ElasticRendererPool, "_locks", {})
+    return tokenizer
+
+
 @pytest.mark.parametrize("mode", ["success", "tool-error", "provider-error"])
-def test_verifiers_tool_rollout(mode: str, actor: Any, local_harness: None, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_verifiers_tool_rollout(
+    mode: str, actor: Any, local_harness: None, tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch
+) -> None:
     requests: list[dict[str, Any]] = []
+    arguments = '{"a":17}' if mode == "tool-error" else '{"a":17,"b":25}'
+    tool_text = '<tool_call>\n{"name":"add","arguments":' + arguments + "}\n</tool_call><|im_end|>"
+    tool_ids = tokenizer.encode(tool_text)  # (C_tool,)
+    answer_ids = tokenizer.encode("42<|im_end|>")  # (C_answer,)
 
     def respond(request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == f"{training.SERVER_URL}/v1/chat/completions"
+        if request.url.path == "/v1/models":
+            return httpx.Response(status_code=200, json={"data": [{"id": training.MODEL, "max_model_len": 8192}]})
+        assert str(request.url) == f"{training.SERVER_URL}/inference/v1/generate"
         payload = json.loads(request.content)
         requests.append(payload)
         if mode == "provider-error":
             return httpx.Response(status_code=400, json={"error": {"message": "invalid model"}})
-        tool_call = not any(message["role"] == "tool" for message in payload["messages"]) or mode == "tool-error"
-        delta: dict[str, Any] = {"role": "assistant", "content": None if tool_call else "42"}
-        if tool_call:
-            delta["tool_calls"] = [
-                {
-                    "index": 0,
-                    "id": f"call_{len(requests)}",
-                    "type": "function",
-                    "function": {"name": "add", "arguments": '{"a":17}' if mode == "tool-error" else '{"a":17,"b":25}'},
-                }
-            ]
-        chunk = {
-            "id": f"completion-{len(requests)}",
-            "created": 0,
-            "object": "chat.completion.chunk",
-            "model": training.MODEL,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": "tool_calls" if tool_call else "stop"}],
-            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
-        }
+        prompt = tokenizer.decode(payload["token_ids"])
+        completion_ids = tool_ids if "<tool_response>" not in prompt or mode == "tool-error" else answer_ids  # (C,)
         return httpx.Response(
             status_code=200,
-            content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
-            headers={"content-type": "text/event-stream"},
+            json={
+                "request_id": f"completion-{len(requests)}",
+                "choices": [
+                    {
+                        "index": 0,
+                        "token_ids": completion_ids,
+                        "finish_reason": "stop",
+                        "logprobs": {
+                            "content": [{"token": f"token_id:{token}", "logprob": -0.2} for token in completion_ids]
+                        },
+                    }
+                ],
+            },
         )
 
     clients: list[httpx.AsyncClient] = []
 
-    def build_client(config: vf.EvalClientConfig) -> httpx.AsyncClient:
+    def build_client(config: vf.TrainClientConfig) -> httpx.AsyncClient:
         client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
         clients.append(client)
         return client
 
-    monkeypatch.setattr(eval_client, "build_async_httpx", build_client)
+    monkeypatch.setattr(client_base, "build_async_httpx", build_client)
     if mode == "provider-error":
         with pytest.raises(RuntimeError, match="Rollout failed"):
             actor.collect_group(actor.tasks[0])
@@ -365,27 +434,40 @@ def test_verifiers_tool_rollout(mode: str, actor: Any, local_harness: None, monk
         group = actor.collect_group(actor.tasks[0])
         assert len(group.rollouts) == actor.group_size
         assert len(requests) == actor.group_size * (2 if mode == "success" else 3)
+        expected_samples = tool_ids + answer_ids if mode == "success" else tool_ids * 3  # (S,)
         for rollout in group.rollouts:
             assert rollout.num_turns == (2 if mode == "success" else 3)
-            assert rollout.num_input_tokens == 2
-            assert rollout.num_output_tokens == rollout.num_turns
+            assert rollout.num_output_tokens == len(expected_samples)
             assert rollout.rollout_seconds > 0
             assert rollout.reward == (1.0 if mode == "success" else 0.0)
             assert rollout.advantage == 0.0
-            assert rollout.sequences == []  # EvalClient supplies usage, but no training tokens.
+            sequence = rollout.sequence
+            assert len(sequence.token_ids) == len(sequence.loss_mask) == len(sequence.old_log_probs)
+            assert rollout.num_input_tokens == len(sequence.token_ids) - sum(sequence.loss_mask)
+            assert [
+                token for token, train in zip(sequence.token_ids, sequence.loss_mask, strict=True) if train
+            ] == expected_samples
+            assert sequence.old_log_probs == [-0.2 if train else 0.0 for train in sequence.loss_mask]
             if mode == "success":
                 assert rollout.completion == "42"
                 assert rollout.stop_condition == "agent_completed"
             else:
                 assert rollout.stop_condition == "max_turns"
-        tool_messages = [
-            message for request in requests for message in request["messages"] if message["role"] == "tool"
-        ]
-        assert tool_messages
-        assert all(("42" if mode == "success" else "b") in message["content"] for message in tool_messages)
+        prompts = [tokenizer.decode(request["token_ids"]) for request in requests]
+        if mode == "success":
+            assert any("<tool_response>\n42" in prompt for prompt in prompts)
+        else:
+            observations = [
+                prompt.split("<tool_response>\n", 1)[1] for prompt in prompts if "<tool_response>\n" in prompt
+            ]
+            assert observations and all(
+                "required" in observation.lower() and "b" in observation for observation in observations
+            )
         assert pickle.loads(pickle.dumps(group)) == group
     assert clients and all(client.is_closed for client in clients)
     assert requests[0]["model"] == training.MODEL
-    assert requests[0]["max_tokens"] == 512
-    assert requests[0]["chat_template_kwargs"] == {"enable_thinking": False}
-    assert requests[0]["tools"][0]["function"]["name"] == "add"
+    assert requests[0]["sampling_params"]["max_tokens"] == 512
+    assert requests[0]["sampling_params"]["logprobs"] == 1
+    prompt = tokenizer.decode(requests[0]["token_ids"])
+    assert '"name": "add"' in prompt
+    assert prompt.endswith("<think>\n\n</think>\n\n")

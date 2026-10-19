@@ -29,13 +29,13 @@ SERVER_URL = "http://127.0.0.1:8000"
 @dataclass(frozen=True)
 class TrainingSequence:
     token_ids: list[int]  # (T,) Exact context and generated tokens in one sequence.
-    loss_mask: list[bool]  # (T,) Train on sampled tokens only; exclude prompts, tools, and repeated prefixes.
+    loss_mask: list[bool]  # (T,) Train on sampled tokens only; exclude prompts and tool results.
     old_log_probs: list[float]  # (T,) Sampling-policy log-probabilities; ignored where loss_mask is False.
 
 
 @dataclass(frozen=True)
 class Rollout:
-    sequences: list[TrainingSequence]  # Training inputs; empty when the backend supplies no token data.
+    sequence: TrainingSequence  # One complete token sequence spanning all model and tool turns.
     reward: float  # Total task reward before group normalization.
     advantage: float  # (reward - group mean) / (population std + 1e-4).
     completion: str  # Final assistant text for sample logging.
@@ -53,21 +53,26 @@ class RolloutGroup:
     rollouts: list[Rollout]  # Independent attempts at the same task, in sampling order, scored as one group.
 
 
-def training_sequences(trace: vf.Trace) -> list[TrainingSequence]:
-    sequences: list[TrainingSequence] = []
-    seen: set[int] = set()
-    for branch in trace.branches:
-        token_ids = branch.token_ids  # (T,)
-        if not branch.trainable or not token_ids:
-            continue
-        loss_mask: list[bool] = []  # (T,)
-        for node in branch.nodes:
-            # Shared prefixes remain context, but contribute to the loss only once.
-            loss_mask.extend([False] * len(node.mask) if id(node) in seen else node.mask)
-            seen.add(id(node))
-        if any(loss_mask):
-            sequences.append(TrainingSequence(token_ids=token_ids, loss_mask=loss_mask, old_log_probs=branch.logprobs))
-    return sequences
+def training_sequence(trace: vf.Trace) -> TrainingSequence:
+    branches = trace.branches
+    if len(branches) != 1:
+        raise ValueError(f"Expected exactly one training sequence, got {len(branches)} branches")
+    branch = branches[0]
+    if not branch.trainable or not any(branch.sampled_mask):
+        raise ValueError("Rollout has no trainable tokens")
+    for node in branch.nodes:
+        if len(node.token_ids) != len(node.mask):
+            raise ValueError("Token IDs and loss mask must have equal lengths")
+        if node.sampled and not any(node.mask):
+            raise ValueError("Sampled messages must contain training tokens")
+        # Verifiers otherwise fills missing log-probabilities with zeros.
+        if len(node.logprobs) != sum(node.mask):
+            raise ValueError("Each sampled token must have a log-probability")
+    return TrainingSequence(
+        token_ids=branch.token_ids,  # (T,)
+        loss_mask=branch.sampled_mask,  # (T,)
+        old_log_probs=branch.logprobs,  # (T,)
+    )
 
 
 async def score_group(task: AdditionTask, traces: list[vf.Trace]) -> RolloutGroup:
@@ -89,7 +94,7 @@ async def score_group(task: AdditionTask, traces: list[vf.Trace]) -> RolloutGrou
         prompt=task.data.prompt_text,
         rollouts=[
             Rollout(
-                sequences=training_sequences(trace),
+                sequence=training_sequence(trace),
                 reward=trace.reward,
                 advantage=advantage,
                 completion=trace.last_reply,
@@ -110,7 +115,9 @@ def create_agent() -> vf.Agent:
             model=MODEL,
             harness=vf.HarnessConfig(id="null"),
             runtime=vf.SubprocessConfig(),
-            client=vf.EvalClientConfig(base_url=f"{SERVER_URL}/v1", api_key_var="VLLM_API_KEY"),
+            client=vf.TrainClientConfig(
+                base_url=f"{SERVER_URL}/v1", api_key_var="VLLM_API_KEY", renderer_model_name=MODEL
+            ),
             sampling=vf.SamplingConfig(
                 max_tokens=512, temperature=1.0, chat_template_kwargs={"enable_thinking": False}
             ),
@@ -135,9 +142,6 @@ def serve_vllm() -> Iterator[None]:
             "127.0.0.1",
             "--port",
             "8000",
-            "--enable-auto-tool-choice",
-            "--tool-call-parser",
-            "hermes",
         ],
     ) as server:
         try:
