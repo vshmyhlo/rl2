@@ -105,13 +105,13 @@ The login account has Kubernetes's built-in `view` role across namespaces, plus
 `get`, `list`, and `watch` access to nodes through `headlamp-node-viewer` (the
 built-in `view` role excludes nodes) and Kueue resources through
 `headlamp-kueue-viewer`. It can inspect nodes, workloads, queues, and logs.
-The training installer also grants deletion of Jobs in `training`; other writes
-and access to Secrets remain disallowed. Some cluster administration views are
+The training installer also grants Job deletion and Pod eviction in `training`;
+other writes and access to Secrets remain disallowed. Some cluster administration views are
 unavailable. The Headlamp pod uses a
 separate service account without a cluster role binding. Tokens are generated
 on demand and are not stored in this repository. Generate another after expiry.
 
-To enable Job deletion on an existing cluster, after creating the `training` namespace:
+To enable Job deletion and Pod eviction on an existing cluster, after creating the `training` namespace:
 
 ```bash
 sudo k3s kubectl apply -f infra/k3s/training/headlamp-access.yaml
@@ -121,6 +121,12 @@ In Headlamp, open **Workloads → Jobs**, select namespace **training**, open th
 Job, and choose **Delete**. Delete the Job to cancel it and remove it from the
 queue; evicting its Pod can cause a replacement to start. Saved `/runs`
 checkpoints remain. Refresh Headlamp after changing permissions.
+
+Verify the login account's permissions without deleting or evicting workloads:
+
+```bash
+RL2_K3S_TESTS=1 uv run pytest infra/k3s/tests/test_headlamp_access.py -q
+```
 
 Open **Kueue → Workloads** for admission status, priority, requests, and queue
 conditions. **Kueue → LocalQueues → training/gpu** and **ClusterQueues → gpu**

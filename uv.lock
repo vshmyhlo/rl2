@@ -3,14 +3,14 @@ revision = 3
 requires-python = ">=3.12, <3.15"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and sys_platform == 'linux'",
     "python_full_version >= '3.14' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'linux'",
     "python_full_version == '3.13.*' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'linux'",
     "python_full_version < '3.13' and sys_platform == 'win32'",
     "python_full_version < '3.13' and sys_platform == 'emscripten'",
     "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
@@ -7560,20 +7560,20 @@ dependencies = [
     { name = "ruff" },
     { name = "safetensors" },
     { name = "sentencepiece" },
+    { name = "soundfile", marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "tfp-nightly" },
     { name = "tokamax", marker = "sys_platform == 'linux'" },
     { name = "tokenizers", version = "0.22.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
     { name = "tokenizers", version = "0.23.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+    { name = "transformers", version = "5.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "verifiers" },
+    { name = "vllm", marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "xminigrid" },
 ]
 
 [package.optional-dependencies]
 bfcl = [
     { name = "bfcl-eval", marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "soundfile", marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "transformers", version = "5.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "vllm", marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 
 [package.metadata]
@@ -7624,13 +7624,13 @@ requires-dist = [
     { name = "ruff", specifier = ">=0.16.9" },
     { name = "safetensors", specifier = ">=0.8,<0.9" },
     { name = "sentencepiece", specifier = ">=0.2,<0.3" },
-    { name = "soundfile", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'bfcl'", specifier = ">=0.13,<0.14" },
+    { name = "soundfile", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=0.13,<0.14" },
     { name = "tfp-nightly", specifier = ">=0.26.0.dev0,<0.27" },
     { name = "tokamax", marker = "sys_platform == 'linux'", specifier = ">=0.0.15" },
     { name = "tokenizers", specifier = ">=0.22,<0.24" },
-    { name = "transformers", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'bfcl'", specifier = ">=5.5.3,<5.6" },
+    { name = "transformers", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=5.5.3,<5.6" },
     { name = "verifiers", specifier = ">=0.4.0,<0.5" },
-    { name = "vllm", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'bfcl'", specifier = "==0.27.0" },
+    { name = "vllm", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.27.0" },
     { name = "xminigrid", specifier = "==0.9.3" },
 ]
 provides-extras = ["bfcl"]

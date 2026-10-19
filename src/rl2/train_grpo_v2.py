@@ -77,6 +77,7 @@ def training_sequence(trace: vf.Trace) -> TrainingSequence:
 
 
 async def score_group(task: AdditionTask, traces: list[vf.Trace]) -> RolloutGroup:
+    logger.debug("Scoring %s rollouts for task %s", len(traces), task.data.id)
     if len(traces) < 2:
         raise ValueError("A rollout group needs at least two traces")
     for trace in traces:
@@ -111,6 +112,7 @@ async def score_group(task: AdditionTask, traces: list[vf.Trace]) -> RolloutGrou
 
 
 def create_agent() -> vf.Agent:
+    logger.debug("Creating Verifiers agent: model=%s endpoint=%s", MODEL, SERVER_URL)
     return vf.make_agent(
         config=vf.AgentConfig(
             model=MODEL,
@@ -148,10 +150,12 @@ def serve_vllm() -> Iterator[None]:
         try:
             yield
         finally:
+            logger.info("Stopping vLLM server: pid=%s", server.pid)
             server.terminate()
             try:
                 server.wait(timeout=10)
             except subprocess.TimeoutExpired:
+                logger.warning("vLLM did not stop within 10s; killing pid=%s", server.pid)
                 server.kill()
     logger.info("vLLM server exited")
 
@@ -164,8 +168,10 @@ def wait_for_server(timeout: float = 600) -> None:
             with urlopen(f"{SERVER_URL}/health", timeout=min(5, remaining)):
                 logger.info("vLLM is ready")
                 return
-        except (URLError, TimeoutError):
+        except (URLError, TimeoutError) as error:
+            logger.debug("vLLM health check failed: %s", error)
             time.sleep(min(1, max(0, deadline - time.monotonic())))
+    logger.error("vLLM readiness timed out after %ss at %s", timeout, SERVER_URL)
     raise TimeoutError(f"vLLM was not ready within {timeout}s at {SERVER_URL}")
 
 
@@ -177,10 +183,13 @@ class Batcher:
     async def fetch_next_batch(self, num_groups: int, group_size: int) -> list[RolloutGroup]:
         if num_groups < 1:
             raise ValueError("num_groups must be at least 1")
-        logger.debug("Fetching %s groups of %s rollouts from actor", num_groups, group_size)
-        return await asyncio.gather(
+        started = time.monotonic()
+        logger.info("Fetching batch: num_groups=%s group_size=%s", num_groups, group_size)
+        batch = await asyncio.gather(
             *(self.actor.fetch_next_group.remote(group_size=group_size) for _ in range(num_groups))
         )
+        logger.info("Batch ready: groups=%s elapsed=%.2fs", len(batch), time.monotonic() - started)
+        return batch
 
 
 @ray.remote(num_gpus=1)
@@ -190,14 +199,21 @@ class Learner:
 
     def start(self) -> None:
         logger.info("Starting learner training loop")
+        iteration = 0
         while True:
+            iteration += 1
+            started = time.monotonic()
+            logger.info("Starting learner iteration %s", iteration)
             batch = self.fetch_next_batch(num_groups=1, group_size=4)
             self.optimize(batch)
             self.publish_weights()
+            logger.info("Learner iteration %s complete: elapsed=%.2fs", iteration, time.monotonic() - started)
 
     def fetch_next_batch(self, num_groups: int, group_size: int) -> list[RolloutGroup]:
-        logger.debug("Fetching next batch from batcher")
-        return ray.get(self.batcher.fetch_next_batch.remote(num_groups=num_groups, group_size=group_size))
+        logger.debug("Requesting batch: num_groups=%s group_size=%s", num_groups, group_size)
+        batch = ray.get(self.batcher.fetch_next_batch.remote(num_groups=num_groups, group_size=group_size))
+        logger.debug("Learner received %s groups", len(batch))
+        return batch
 
     def optimize(self, batch: list[RolloutGroup]) -> None:
         logger.debug("Optimizing batch (placeholder)")
@@ -217,10 +233,12 @@ class Actor:
             resources.enter_context(serve_vllm())
             wait_for_server()
             self._server = resources.pop_all()
-        logger.info("Actor ready for rollout requests")
+        logger.info("Actor ready for rollout requests: tasks=%s", len(self.tasks))
 
     def __ray_shutdown__(self) -> None:
+        logger.info("Shutting down actor")
         self._server.close()
+        logger.info("Actor resources released")
 
     async def fetch_next_group(self, group_size: int) -> RolloutGroup:
         task = random.choice(self.tasks)
@@ -230,14 +248,25 @@ class Actor:
     async def collect_group(self, task: AdditionTask, group_size: int) -> RolloutGroup:
         if group_size < 2:
             raise ValueError("group_size must be at least 2")
-        logger.debug("Collecting %s rollouts for task %s", group_size, task.data.id)
-
-        async with create_agent() as agent, asyncio.TaskGroup() as pending:
-            runs = [pending.create_task(agent.run(task.defer_scoring())) for _ in range(group_size)]
-        group = await score_group(task, [run.result() for run in runs])
+        started = time.monotonic()
+        logger.info("Collecting group: task=%s group_size=%s", task.data.id, group_size)
+        try:
+            async with create_agent() as agent, asyncio.TaskGroup() as pending:
+                runs = [pending.create_task(agent.run(task.defer_scoring())) for _ in range(group_size)]
+            group = await score_group(task, [run.result() for run in runs])
+        except Exception:
+            logger.exception(
+                "Group failed: task=%s group_size=%s elapsed=%.2fs",
+                task.data.id,
+                group_size,
+                time.monotonic() - started,
+            )
+            raise
         logger.info(
-            "Collected group: task=%s rewards=%s advantages=%s",
+            "Collected group: task=%s elapsed=%.2fs output_tokens=%s rewards=%s advantages=%s",
             task.data.id,
+            time.monotonic() - started,
+            sum(rollout.num_output_tokens for rollout in group.rollouts),
             [rollout.reward for rollout in group.rollouts],
             [rollout.advantage for rollout in group.rollouts],
         )
@@ -255,7 +284,9 @@ def main() -> None:
             logger.info("Starting learner")
             ray.get(learner.start.remote())
         finally:
+            logger.info("Requesting graceful actor termination")
             ray.wait([actor.__ray_terminate__.remote()])
+            logger.info("Actor termination finished")
 
 
 if __name__ == "__main__":
