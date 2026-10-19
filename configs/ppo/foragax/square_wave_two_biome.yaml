@@ -1,0 +1,49 @@
+# Local symbolic color grid, CNN + LSTM; four reward cycles per episode.
+env:
+  id: Foragax
+  env_id: ForagaxSquareWaveTwoBiome-v11
+  observation_type: color # Symbolic one-hot color channels
+  aperture_size: 9
+  period: 1024 # Full reward cycle; native default is 500_000
+  reward_delay: 0
+  max_steps: 4096 # PPO truncation resets the world and reward clock
+seed: 1
+total_steps: 10_000_000
+num_envs: 32
+num_steps: 128
+num_minibatches: 4
+update_epochs: 4
+model:
+  encoder:
+    type: rgb
+    stages:
+      - { channels: 32, blocks: 1, resize_factor: 1.0 }
+      - { channels: 64, blocks: 1, resize_factor: 1.0 }
+    embedding_size: 128
+  recurrent:
+    type: lstm
+    hidden_size: 128
+bf16: false
+learning_rate: 0.00025
+anneal_lr: true
+lr_decay: linear
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: 0.01
+entropy_coef: 0.01
+entropy_decay: constant
+value_coef: 0.5
+max_grad_norm: 0.5
+ckpt_dir: /runs/ppo/${run_id}
+run_id: ppo_${path_name:${env.id}}_${path_name:${env.env_id}}_seed${seed}
+# All intervals count completed PPO iterations (one rollout and its updates).
+# Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
+checkpoint_interval: 489
+log_interval: 60
+video_interval: 245
+video_max_frames: 900
+video_fps: 15.0
+eval_interval: 489
+eval_episodes: 10
+eval_seed: 10000

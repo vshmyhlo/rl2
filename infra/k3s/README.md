@@ -326,6 +326,18 @@ one-GPU Job to `training/gpu`:
 The submitter uses the project's installed Python environment through `uv run
 --no-sync`; run it from the repository root after installing dependencies.
 
+For [BFCL evaluation](../../docs/bfcl.md#kubernetes-job), include its dependencies
+with `--extra bfcl` and run the launcher in a single container:
+
+```bash
+./submit.py --extra bfcl --memory-gib 32 -- \
+  python -m rl2.bfcl.job --run-dir /runs/bfcl/qwen3-0.6b
+```
+
+The launcher starts vLLM, waits for readiness, generates responses, stops vLLM,
+and scores the results. Logs and results persist under `/runs`. Add `--smoke`
+after the run directory for a four-case check in a separate directory.
+
 To submit a parameter grid, define a sweep YAML:
 
 ```yaml
@@ -482,43 +494,6 @@ The volume binds on first use. Verify persistence using two small CPU-only Pods:
 ```bash
 RL2_K3S_TESTS=1 uv run pytest infra/k3s/tests/test_storage.py -q
 ```
-
-### Submit jobs with kjobs
-
-[kjobs](https://github.com/kubernetes-sigs/kjob) `v0.1.0` provides the
-`kubectl kjob` CLI and cluster-side templates. Install on this Linux amd64 host:
-
-```bash
-curl -fsSL https://github.com/kubernetes-sigs/kjob/releases/download/v0.1.0/kubectl-kjob-linux-amd64.tar.gz -o /tmp/rl2-kjob.tar.gz
-printf '%s\n' '34fd7e04cacfd49dd361453819ab460101ddef98f94b5fb4a76430ccb1e3a92a  /tmp/rl2-kjob.tar.gz' | sha256sum --check
-mkdir -p /tmp/rl2-kjob-bin
-tar -xzf /tmp/rl2-kjob.tar.gz -C /tmp/rl2-kjob-bin ./kubectl-kjob
-sudo install -m 0755 /tmp/rl2-kjob-bin/kubectl-kjob /usr/local/bin/kubectl-kjob
-sudo k3s kubectl apply --server-side -f https://github.com/kubernetes-sigs/kjob/releases/download/v0.1.0/manifests.yaml
-sudo k3s kubectl wait --for=condition=Established crd/applicationprofiles.kjobctl.x-k8s.io crd/jobtemplates.kjobctl.x-k8s.io --timeout=60s
-sudo k3s kubectl apply -f infra/k3s/kjobs/gpu-profile.yaml
-```
-
-The `gpu-smoke` profile requests one GPU and uses the NVIDIA runtime. Submit:
-
-```bash
-sudo kubectl kjob create job --kubeconfig /etc/rancher/k3s/k3s.yaml \
-  -n training --profile gpu-smoke --localqueue gpu \
-  --skip-localqueue-validation --cmd 'nvidia-smi'
-sudo kubectl kjob list job --kubeconfig /etc/rancher/k3s/k3s.yaml -n training
-sudo k3s kubectl -n training logs job/<generated-job-name>
-```
-
-Add `--dry-run=server -o yaml` to preview a submission. The explicit kubeconfig
-is needed because this plugin does not inherit k3s's default config path.
-`--skip-localqueue-validation` skips kjobs v0.1.0's lookup through the retired
-Kueue `v1beta1` API; the queue label and Kueue admission still apply. Specify the
-existing `gpu` queue; an incorrect name leaves the Job suspended.
-
-This profile uses a CUDA base image for smoke checks, with a 120-second runtime
-limit and ten-minute cleanup. For training, create a profile with your training
-image, command, resource requests, and runtime limit. It already supplies the
-internal `MLFLOW_TRACKING_URI`; kjobs does not upload local code or dependencies.
 
 ### Kueue UI
 

@@ -3,7 +3,7 @@ env:
   id: Craftax
   env_id: Craftax-Symbolic-v1 # Or Craftax-Classic-Symbolic-v1
   max_steps: null # Native episode limit
-seed: 1
+seed: 2
 total_steps: 10_000_000
 num_envs: 32
 num_steps: 128

@@ -1,0 +1,51 @@
+# Shared MLP/LSTM IPPO: carry material from the center/right zones to the left depot.
+env:
+  id: JaxRobotarium_material_transport
+  robots: # Waypoint distance (m), material capacity per pickup
+    - {step_size: 0.45, capacity: 5}
+    - {step_size: 0.45, capacity: 5}
+    - {step_size: 0.15, capacity: 15}
+    - {step_size: 0.15, capacity: 15}
+  zone1_load: 50
+  zone2_load: 50
+  max_steps: 100
+  update_frequency: 30 # 30 × 0.033 s simulator steps per policy action
+  collision_avoidance: true # Native robust barrier controller
+seed: 1
+total_steps: 5_000_000 # Environment transitions; each contains one observation per robot
+num_envs: 32
+num_steps: 128
+num_minibatches: 4 # Divides num_envs * num_agents; keep recurrent sequences intact
+update_epochs: 4
+model:
+  encoder:
+    type: mlp
+    embedding_size: 128
+  recurrent:
+    hidden_size: 128
+    num_layers: 1
+    intermediate_size: 0
+bf16: false
+learning_rate: 0.0003
+anneal_lr: true
+lr_decay: linear
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: null
+entropy_coef: 0.01
+entropy_decay: constant
+value_coef: 1.0
+max_grad_norm: 0.5
+ckpt_dir: /runs/mappo/${run_id}
+run_id: mappo_${path_name:${env.id}}_seed${seed}
+# All intervals count completed PPO iterations (one rollout and its updates).
+# Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
+log_interval: 10
+video_interval: 123
+video_max_frames: 101
+video_fps: 10
+checkpoint_interval: 245
+eval_interval: 245
+eval_episodes: 10
+eval_seed: 10000
