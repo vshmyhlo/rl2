@@ -15,5 +15,6 @@ clip_coef: 0.2
 max_grad_norm: 1.0
 microbatch_size: 4
 update_epochs: 1
+weight_update_pause_mode: wait # wait, abort, or keep in-flight vLLM requests
 run_id: grpo_v2_toolrl_${path_name:${model}}_seed${seed}
 ckpt_dir: /runs/grpo_v2/${run_id} # Reserved; checkpointing is not implemented yet

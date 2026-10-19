@@ -8,7 +8,7 @@ import sys
 from dataclasses import asdict, replace
 from pathlib import Path
 from statistics import mean, pstdev
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, Mock
 from urllib.error import URLError
 
@@ -29,6 +29,7 @@ from verifiers.v1.clients.train import ElasticRendererPool
 from verifiers.v1.runtimes import subprocess as subprocess_runtime
 from verifiers.v1.trace import AgentInfo, TraceTask
 
+from rl2 import codegym_env
 from rl2 import train_grpo_v2 as training
 from rl2.addition_env import AdditionTaskset, AdditionTools
 from rl2.toolrl_env import ToolCall, ToolRLData, ToolRLRenderer, ToolRLTask
@@ -38,11 +39,13 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     defaults = training.Config()
     assert defaults.microbatch_size == 4
     assert defaults.update_epochs == 1
+    assert defaults.weight_update_pause_mode == "wait"
     preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/addition.yaml"
     config = training.load_config(preset, training.Config)
     assert config.run_id == "grpo_v2_addition_Qwen_Qwen3-0.6B_seed1"
     assert config.ckpt_dir == f"/runs/grpo_v2/{config.run_id}"
     assert config.total_iterations is None
+    assert config.weight_update_pause_mode == "wait"
     assert asdict(config.taskset) == {"id": "addition"}
     assert "dataset_file" not in asdict(config)
     path = tmp_path / "config.yaml"
@@ -74,6 +77,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
         {"microbatch_size": 0},
         {"microbatch_size": 3},
         {"update_epochs": 0},
+        {"weight_update_pause_mode": "unknown"},
         {"taskset": "unknown"},
         {"taskset": training.ToolRLConfig(), "max_turns": 2},
     ],
@@ -142,6 +146,31 @@ def test_toolrl_preset_and_actor(monkeypatch: pytest.MonkeyPatch) -> None:
     assert actor.tasks == tasks.return_value
     assert tasks.call_args.kwargs["config"].data_file == config.taskset.dataset_file
     actor.__ray_shutdown__()
+
+
+def test_codegym_preset_and_actor(monkeypatch: pytest.MonkeyPatch) -> None:
+    preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/codegym.yaml"
+    config = training.load_config(preset, training.Config)
+    assert isinstance(config.taskset, training.CodeGymConfig)
+    assert config.taskset.dataset_file == training.CODEGYM_TRAIN_FILE
+    assert config.taskset.manager_url == "http://codegym:8000"
+    assert config.max_turns == 32
+    assert config.run_id == f"grpo_v2_codegym_Qwen_Qwen3-0.6B_seed{config.seed}"
+    assert pickle.loads(pickle.dumps(config)) == config
+    tasks = Mock(return_value=[Mock()])
+    monkeypatch.setattr(training, "CodeGymTaskset", tasks)
+    monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
+    monkeypatch.setattr(training, "wait_for_server", Mock())
+    actor = training.Actor.__ray_metadata__.modified_class(config=config)
+    assert actor.tasks == tasks.return_value
+    assert tasks.call_args.kwargs["config"].data_file == config.taskset.dataset_file
+    actor.__ray_shutdown__()
+
+
+@pytest.mark.parametrize("url", ["", "codegym:8000", "file:///tmp/codegym"])
+def test_codegym_invalid_manager_url(url: str) -> None:
+    with pytest.raises(ValidationError, match="HTTP"):
+        training.CodeGymConfig(manager_url=url)
 
 
 @pytest.mark.parametrize("temperature", [0.01, 2.0])
@@ -481,8 +510,15 @@ def test_learner_logs_rollouts(
             task_id="1",
             prompt="second",
             rollouts=[
-                replace(rollout, reward=reward, num_turns=3, num_output_tokens=6, rollout_seconds=1.5)
-                for reward in group_rewards[1]
+                replace(
+                    rollout,
+                    reward=reward,
+                    num_turns=3,
+                    num_output_tokens=6,
+                    rollout_seconds=1.5,
+                    stop_condition=condition,
+                )
+                for reward, condition in zip(group_rewards[1], ("max_turns", None), strict=True)
             ],
         ),
     ]
@@ -513,7 +549,14 @@ def test_learner_logs_rollouts(
     assert transfer_metrics["data/batch_array_bytes"] == 36  # Four sequences, each int32 + bool + float32.
     prepared = Mock(spec=training.GRPOBatch)
     received = training.RolloutBatch(groups=batch, training_batch=prepared, transfer_metrics=transfer_metrics)
-    learner.fetch_next_batch.side_effect = [received, RuntimeError("done") if fails else received]
+    next_batch = replace(
+        received,
+        groups=[
+            replace(group, rollouts=[replace(rollout, stop_condition="codegym_done") for rollout in group.rollouts])
+            for group in batch
+        ],
+    )
+    learner.fetch_next_batch.side_effect = [received, RuntimeError("done") if fails else next_batch]
     learner.publish_weights = steps.publish
 
     def optimize(batch: training.GRPOBatch) -> dict[str, float]:
@@ -556,6 +599,9 @@ def test_learner_logs_rollouts(
         "charts/reward_min": 0.0,
         "charts/reward_max": 1.0,
         "charts/degenerate_group_fraction": degenerate_fraction,
+        "charts/stop_condition_fraction/agent_completed": 0.5,
+        "charts/stop_condition_fraction/max_turns": 0.25,
+        "charts/stop_condition_fraction/unspecified": 0.25,
         "charts/turns_mean": 2.0,
         "charts/input_tokens_mean": 4.0,
         "charts/output_tokens_mean": 4.0,
@@ -576,6 +622,12 @@ def test_learner_logs_rollouts(
         assert calls[2].kwargs == {"step": 2}
         assert calls[2].args[0]["charts/total_rollouts"] == 8
         assert calls[2].args[0]["charts/degenerate_group_fraction"] == degenerate_fraction
+        assert {key: value for key, value in calls[2].args[0].items() if "stop_condition_fraction/" in key} == {
+            "charts/stop_condition_fraction/agent_completed": 0.0,
+            "charts/stop_condition_fraction/max_turns": 0.0,
+            "charts/stop_condition_fraction/unspecified": 0.0,
+            "charts/stop_condition_fraction/codegym_done": 1.0,
+        }
     assert "Run ID: None; MLflow run: mlflow-run" in caplog.messages
     assert (
         f"iteration=1 reward={mean(rewards):.3f} degenerate_group_fraction={degenerate_fraction:.3f} "
@@ -725,8 +777,17 @@ def test_learner_republishes_unchanged_parameters(
         np.testing.assert_array_equal(value, initial[name])
 
 
-@pytest.mark.parametrize("failure_path", [None, "/update_weights", "/finish_weight_update"])
-def test_actor_weight_update_lifecycle(failure_path: str | None, actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("pause_mode", "failure_path"),
+    [("wait", None), ("abort", None), ("keep", None), ("wait", "/update_weights"), ("wait", "/finish_weight_update")],
+)
+def test_actor_weight_update_lifecycle(
+    pause_mode: Literal["wait", "abort", "keep"],
+    failure_path: str | None,
+    actor: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor.config = replace(actor.config, weight_update_pause_mode=pause_mode)
     requests: list[httpx.Request] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -743,11 +804,14 @@ def test_actor_weight_update_lifecycle(failure_path: str | None, actor: Any, mon
             asyncio.run(actor.fetch_next_group(group_size=2))
     else:
         asyncio.run(actor.update_weights(update_info))
+        actor.collect_group = AsyncMock(return_value=Mock(spec=training.RolloutGroup))
+        result = asyncio.run(actor.fetch_next_group(group_size=2))
+        assert result.value is actor.collect_group.return_value
     paths = ["/pause", "/start_weight_update", "/update_weights", "/finish_weight_update", "/resume"]
     expected = paths if failure_path is None else paths[: paths.index(failure_path) + 1]
     assert [request.url.path for request in requests] == expected
     assert all(request.method == "POST" for request in requests)
-    assert dict(requests[0].url.params) == {"mode": "wait", "clear_cache": "true"}
+    assert dict(requests[0].url.params) == {"mode": pause_mode, "clear_cache": "true"}
     assert json.loads(requests[2].content) == {"update_info": update_info}
     assert client.is_closed
 
@@ -764,51 +828,6 @@ def test_actor_initializes_weight_receiver(actor: Any, monkeypatch: pytest.Monke
     monkeypatch.setattr(training.httpx, "AsyncClient", Mock(return_value=client))
     asyncio.run(actor.initialize_weight_transfer(init_info))
     assert client.is_closed
-
-
-def test_weight_update_waits_for_groups_and_blocks_new_rollouts(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    groups_started = asyncio.Event()
-    finish_groups = asyncio.Event()
-    updating = asyncio.Event()
-    finish_update = asyncio.Event()
-    events: list[str] = []
-
-    async def collect(task: vf.Task, group_size: int) -> training.RolloutGroup:
-        events.append("group")
-        if events.count("group") == 2:
-            groups_started.set()
-        await finish_groups.wait()
-        return training.RolloutGroup(task_id=task.data.id, prompt="test", rollouts=[])
-
-    async def respond(request: httpx.Request) -> httpx.Response:
-        events.append(request.url.path)
-        if request.url.path == "/update_weights":
-            updating.set()
-            await finish_update.wait()
-        return httpx.Response(status_code=200)
-
-    actor.collect_group = collect
-    client = httpx.AsyncClient(base_url=training.SERVER_URL, transport=httpx.MockTransport(respond))
-    monkeypatch.setattr(training.httpx, "AsyncClient", Mock(return_value=client))
-
-    async def exercise() -> None:
-        async with asyncio.timeout(5), asyncio.TaskGroup() as pending:
-            for _ in range(2):
-                pending.create_task(actor.fetch_next_group(group_size=2))
-            await groups_started.wait()
-            pending.create_task(actor.update_weights({"names": []}))
-            await asyncio.sleep(0)
-            assert events == ["group", "group"]
-            finish_groups.set()
-            await updating.wait()
-            next_group = pending.create_task(actor.fetch_next_group(group_size=2))
-            await asyncio.sleep(0)
-            assert not next_group.done() and events.count("group") == 2
-            finish_update.set()
-        assert events[-2:] == ["/resume", "group"]
-        assert actor._active_groups == 0
-
-    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("fails", [False, True])
@@ -1326,3 +1345,137 @@ def test_verifiers_toolrl_rollout(
     prompt = tokenizer.decode(requests[0]["token_ids"])
     assert prompt.endswith("<|im_start|>assistant\n")
     assert answer not in prompt
+
+
+@pytest.mark.parametrize("mode", ["success", "invalid-action", "task-limit", "agent-limit", "step-error"])
+def test_verifiers_codegym_rollout(
+    mode: str, actor: Any, local_harness: None, tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    actor.config = training.Config(
+        taskset=training.CodeGymConfig(manager_url="http://codegym:8000"),
+        max_turns=1 if mode == "agent-limit" else 3,
+    )
+    task = codegym_env.CodeGymTask(
+        data=codegym_env.CodeGymData(
+            id="codegym-test",
+            prompt=[vf.UserMessage(content="Use Observe then Done to add the values.")],
+            ability='codegym_v1@Example__SumEnv@{"values":[1,2]}',
+            max_steps=1 if mode == "task-limit" else 3,
+        ),
+        config=vf.TaskConfig(),
+    )
+    first_text = (
+        "not a function call"
+        if mode == "invalid-action"
+        else '<|FunctionCallBegin|>[{"name":"Observe","parameters":{}}]<|FunctionCallEnd|>'
+    )
+    final_text = '<|FunctionCallBegin|>[{"name":"Done","parameters":{"answer":3}}]<|FunctionCallEnd|>'
+    first_ids, final_ids = [
+        tokenizer.encode(text + "<|im_end|>") for text in [first_text, final_text]
+    ]  # (C_first,), (C_final,)
+    sessions: dict[str, dict[str, Any]] = {}
+    allocated: list[str] = []
+    released: list[str] = []
+    stopped: list[str] = []
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": training.MODEL, "max_model_len": 8192}]})
+        if path == "/inference/v1/generate":
+            payload = json.loads(request.content)
+            requests.append(payload)
+            prompt = tokenizer.decode(payload["token_ids"])
+            later = "Observed values" in prompt or "Invalid function call" in prompt
+            ids = final_ids if later else first_ids  # (C,)
+            assert "Initial state" in prompt
+            return httpx.Response(
+                200,
+                json={
+                    "request_id": f"codegym-{len(requests)}",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "token_ids": ids,
+                            "finish_reason": "stop",
+                            "logprobs": {"content": [{"token": f"token_id:{token}", "logprob": -0.2} for token in ids]},
+                        }
+                    ],
+                },
+            )
+        if path == "/get_instance":
+            uid = str(len(allocated))
+            allocated.append(uid)
+            return httpx.Response(200, json={"uid": uid, "port": 10000 + int(uid)})
+        if path == "/release_instance":
+            uid = request.url.params["uid"]
+            assert uid in stopped
+            released.append(uid)
+            return httpx.Response(200, json={})
+        payload = json.loads(request.content) if request.method == "POST" else dict(request.url.params)
+        session_id = payload["session_id"]
+        if path == "/start":
+            assert session_id not in sessions
+            sessions[session_id] = {"done": False, "steps": [], "uid": str(request.url.port - 10000)}
+            return httpx.Response(200, json={"observation": "Initial state"})
+        session = sessions[session_id]
+        if path == "/step":
+            action = json.loads(payload["action"])
+            session["steps"].append(action["name"])
+            session["done"] = action["name"] == "Done"
+            return httpx.Response(
+                500 if mode == "step-error" else 200, json={"status": True, "observation": "Observed values: [1, 2]"}
+            )
+        if path == "/is_done":
+            return httpx.Response(200, json={"done": session["done"]})
+        if path == "/reward":
+            # Distinct rewards exercise per-rollout state and within-group normalization.
+            reward = 2 if session["done"] and session["uid"] == "0" else 0
+            return httpx.Response(200, json={"reward": reward})
+        assert path == "/stop"
+        stopped.append(session["uid"])
+        return httpx.Response(200, json={})
+
+    class MockClient(httpx.AsyncClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(transport=httpx.MockTransport(respond), **kwargs)
+
+    def build_client(config: vf.TrainClientConfig) -> httpx.AsyncClient:
+        return MockClient()
+
+    monkeypatch.setattr(codegym_env.httpx, "AsyncClient", MockClient)
+    monkeypatch.setattr(client_base, "build_async_httpx", build_client)
+    if mode == "step-error":
+        with pytest.raises(ExceptionGroup) as caught:
+            asyncio.run(actor.collect_group(task, group_size=2))
+        assert all(isinstance(error, httpx.HTTPStatusError) for error in caught.value.exceptions)
+    else:
+        group = asyncio.run(actor.collect_group(task, group_size=2))
+        limited = mode in {"task-limit", "agent-limit"}
+        expected_ids = first_ids if limited else first_ids + final_ids  # (S,)
+        assert len(requests) == 2 * (1 if limited else 2)
+        assert sorted(rollout.reward for rollout in group.rollouts) == ([0, 0] if limited else [0, 1])
+        assert sorted(rollout.advantage for rollout in group.rollouts) == pytest.approx(
+            [0, 0] if limited else [-1, 1], abs=3e-4
+        )
+        for rollout in group.rollouts:
+            assert rollout.num_turns == (1 if limited else 2)
+            assert rollout.stop_condition == (
+                "codegym_max_steps"
+                if mode == "task-limit"
+                else "max_turns"
+                if mode == "agent-limit"
+                else "codegym_done"
+            )
+            sequence = rollout.sequence
+            assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
+            assert sequence.token_ids.ndim == 1
+            np.testing.assert_array_equal(sequence.token_ids[sequence.loss_mask], expected_ids)
+            np.testing.assert_allclose(sequence.old_log_probs, np.where(sequence.loss_mask, -0.2, 0))
+        for session in sessions.values():
+            assert session["steps"] == (
+                ["Observe"] if limited else ["Done"] if mode == "invalid-action" else ["Observe", "Done"]
+            )
+    assert len(sessions) == 2
+    assert sorted(released) == sorted(stopped) == allocated

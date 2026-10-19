@@ -20,6 +20,7 @@ Rollout batch scalars:
     charts/reward_min: Minimum raw rollout reward.
     charts/reward_max: Maximum raw rollout reward.
     charts/degenerate_group_fraction: Fraction of groups with identical rewards and zero advantages.
+    charts/stop_condition_fraction/<label>: Fraction of batch rollouts with each stop condition; None is unspecified.
     charts/turns_mean: Mean model responses per rollout, including tool calls.
     charts/input_tokens_mean: Mean newly fed input tokens per rollout; a lower bound if context is rewritten.
     charts/output_tokens_mean: Mean sampled tokens per rollout across all model calls.
@@ -58,6 +59,7 @@ import random
 import subprocess
 import sys
 import time
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
@@ -89,6 +91,7 @@ from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsA
 from vllm.utils.network_utils import get_open_port
 
 from rl2.addition_env import AdditionTaskset
+from rl2.codegym_env import CODEGYM_TRAIN_FILE, CodeGymTask, CodeGymTaskset, CodeGymTasksetConfig
 from rl2.configuration import BaseConfig, load_config
 from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import Parameters, Qwen3LM, load_qwen3_checkpoint
@@ -112,10 +115,22 @@ class ToolRLConfig:
     dataset_file: str = TOOLRL_TRAIN_FILE
 
 
+@config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class CodeGymConfig:
+    manager_url: str
+    id: Literal["codegym"] = "codegym"
+    dataset_file: str = CODEGYM_TRAIN_FILE
+
+    def __post_init__(self) -> None:
+        url = httpx.URL(self.manager_url)
+        if url.scheme not in {"http", "https"} or not url.host:
+            raise ValueError("CodeGym manager_url must be an HTTP(S) URL")
+
+
 @config_dataclass(frozen=True)
 class Config(BaseConfig):
     model: str = MODEL
-    taskset: Annotated[AdditionConfig | ToolRLConfig, Field(discriminator="id")] = AdditionConfig()
+    taskset: Annotated[AdditionConfig | ToolRLConfig | CodeGymConfig, Field(discriminator="id")] = AdditionConfig()
     seed: Annotated[int, Field(ge=0)] = 1
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4
@@ -128,6 +143,7 @@ class Config(BaseConfig):
     max_grad_norm: Annotated[float, Field(gt=0)] = 1.0
     microbatch_size: Annotated[int, Field(ge=1)] = 4
     update_epochs: Annotated[int, Field(ge=1)] = 1
+    weight_update_pause_mode: Literal["wait", "abort", "keep"] = "wait"
 
     def __post_init__(self) -> None:
         if self.num_groups * self.group_size % self.microbatch_size:
@@ -572,6 +588,7 @@ class Learner:
             logger.info("Starting GRPO training loop")
             iteration = 0
             total_rollouts = 0
+            stop_conditions: set[str] = set()
             while self.config.total_iterations is None or iteration < self.config.total_iterations:
                 iteration += 1
                 started = time.monotonic()
@@ -583,11 +600,20 @@ class Learner:
                 now = time.monotonic()
                 rollouts = [rollout for group in batch.groups for rollout in group.rollouts]
                 rewards = [rollout.reward for rollout in rollouts]
+                stop_counts = Counter(
+                    rollout.stop_condition if rollout.stop_condition is not None else "unspecified"
+                    for rollout in rollouts
+                )
+                stop_conditions.update(stop_counts)
                 total_rollouts += len(rollouts)
                 seconds = max(now - started, 1e-9)
                 scalars = {
                     **update_metrics,
                     **batch.transfer_metrics,
+                    **{
+                        f"charts/stop_condition_fraction/{condition}": stop_counts[condition] / len(rollouts)
+                        for condition in sorted(stop_conditions)
+                    },
                     "charts/reward_mean": mean(rewards),
                     "charts/reward_std": pstdev(rewards),
                     "charts/reward_min": min(rewards),
@@ -703,14 +729,13 @@ class Actor:
         self.config = config
         random.seed(config.seed)
         self._server = ExitStack()
-        self._weights_condition = asyncio.Condition()
-        self._active_groups = 0
         self._weights_valid = True
-        self.tasks = list(
-            ToolRLTaskset(config=ToolRLTasksetConfig(data_file=config.taskset.dataset_file))
-            if config.taskset.id == "toolrl"
-            else AdditionTaskset(config=vf.TasksetConfig())
-        )
+        if config.taskset.id == "codegym":
+            self.tasks = list(CodeGymTaskset(config=CodeGymTasksetConfig(data_file=config.taskset.dataset_file)))
+        elif config.taskset.id == "toolrl":
+            self.tasks = list(ToolRLTaskset(config=ToolRLTasksetConfig(data_file=config.taskset.dataset_file)))
+        else:
+            self.tasks = list(AdditionTaskset(config=vf.TasksetConfig()))
         logger.info("Starting actor and vLLM on its assigned GPU")
         with self._server as resources:
             server = resources.enter_context(serve_vllm(model=config.model))
@@ -724,18 +749,11 @@ class Actor:
         logger.info("Actor resources released")
 
     async def fetch_next_group(self, group_size: int) -> Transfer[RolloutGroup]:
-        async with self._weights_condition:
-            if not self._weights_valid:
-                raise RuntimeError("Cannot generate after a failed weight update")
-            self._active_groups += 1
-        try:
-            task = random.choice(self.tasks)
-            logger.debug("Selected task %s: %r", task.data.id, task.data.prompt)
-            group = await self.collect_group(task, group_size=group_size)
-        finally:
-            async with self._weights_condition:
-                self._active_groups -= 1
-                self._weights_condition.notify_all()
+        if not self._weights_valid:
+            raise RuntimeError("Cannot generate during or after a failed weight update")
+        task = random.choice(self.tasks)
+        logger.debug("Selected task %s: %r", task.data.id, task.data.prompt)
+        group = await self.collect_group(task, group_size=group_size)
         return Transfer(value=group, ready_at=time.monotonic())
 
     async def initialize_weight_transfer(self, init_info: dict[str, Any]) -> None:
@@ -744,23 +762,23 @@ class Actor:
             response.raise_for_status()
 
     async def update_weights(self, update_info: dict[str, Any]) -> None:
-        async with self._weights_condition:
-            await self._weights_condition.wait_for(lambda: self._active_groups == 0)
-            self._weights_valid = False
-            logger.info("Receiving learner weights: tensors=%s", len(update_info["names"]))
-            async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:
-                response = await client.post("/pause", params={"mode": "wait", "clear_cache": "true"})
-                response.raise_for_status()
-                response = await client.post("/start_weight_update")
-                response.raise_for_status()
-                response = await client.post("/update_weights", json={"update_info": update_info})
-                response.raise_for_status()
-                response = await client.post("/finish_weight_update")
-                response.raise_for_status()
-                response = await client.post("/resume")
-                response.raise_for_status()
-            self._weights_valid = True
-            logger.info("Learner weights applied; generation resumed")
+        self._weights_valid = False
+        logger.info("Receiving learner weights: tensors=%s", len(update_info["names"]))
+        async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:
+            response = await client.post(
+                "/pause", params={"mode": self.config.weight_update_pause_mode, "clear_cache": "true"}
+            )
+            response.raise_for_status()
+            response = await client.post("/start_weight_update")
+            response.raise_for_status()
+            response = await client.post("/update_weights", json={"update_info": update_info})
+            response.raise_for_status()
+            response = await client.post("/finish_weight_update")
+            response.raise_for_status()
+            response = await client.post("/resume")
+            response.raise_for_status()
+        self._weights_valid = True
+        logger.info("Learner weights applied; generation resumed")
 
     async def collect_group(self, task: vf.Task, group_size: int) -> RolloutGroup:
         if group_size < 2:
@@ -769,7 +787,12 @@ class Actor:
         logger.info("Collecting group: task=%s group_size=%s", task.data.id, group_size)
         try:
             async with create_agent(self.config) as agent, asyncio.TaskGroup() as pending:
-                runs = [pending.create_task(agent.run(task.defer_scoring())) for _ in range(group_size)]
+                if isinstance(task, CodeGymTask) and self.config.taskset.id == "codegym":
+                    runs = [
+                        pending.create_task(task.run(agent, self.config.taskset.manager_url)) for _ in range(group_size)
+                    ]
+                else:
+                    runs = [pending.create_task(agent.run(task.defer_scoring())) for _ in range(group_size)]
             group = await score_group(task, [run.result() for run in runs])
         except Exception:
             logger.exception(

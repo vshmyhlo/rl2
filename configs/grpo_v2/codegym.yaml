@@ -1,0 +1,22 @@
+model: Qwen/Qwen3-0.6B
+taskset:
+  id: codegym
+  # Set this to the CodeGym manager host; vLLM uses port 8000 on the trainer host.
+  manager_url: http://codegym:8000
+  # Upstream example tasks. Replace with your generated JSONL or Parquet training file.
+  dataset_file: https://raw.githubusercontent.com/StigLidu/CodeGym/e85a439761ae2df813d5997a81bbd9f9e2ed27b7/example/training_instance.jsonl
+seed: 3
+num_groups: 4
+group_size: 8
+total_iterations: null
+max_tokens: 512
+max_turns: 32
+temperature: 1.0
+learning_rate: 0.000001
+clip_coef: 0.2
+max_grad_norm: 1.0
+microbatch_size: 4
+update_epochs: 1
+weight_update_pause_mode: wait # wait, abort, or keep in-flight vLLM requests
+run_id: grpo_v2_codegym_${path_name:${model}}_seed${seed}
+ckpt_dir: /runs/grpo_v2/${run_id} # Reserved; checkpointing is not implemented yet
