@@ -66,6 +66,23 @@ def explained_variance(
     return jnp.where(variance > 0, 1 - jnp.var(returns - values) / variance, jnp.nan)  # ()
 
 
+def group_advantages(
+    rewards: jax.Array,  # (*B, G)
+) -> jax.Array:  # (*B, G)
+    """Normalize rewards over G rollouts; B denotes optional batch dimensions.
+
+    Args:
+        rewards: (*B, G) rewards, with at least two rollouts per group.
+
+    Returns:
+        (*B, G) advantages normalized independently within each group.
+    """
+    if rewards.shape[-1] < 2:
+        raise ValueError("A rollout group needs at least two rewards")
+    centered = rewards - rewards.mean(axis=-1, keepdims=True)  # (*B, G)
+    return centered / (rewards.std(axis=-1, keepdims=True) + 1e-4)  # (*B, G)
+
+
 def read_bytes(path: str) -> bytes:
     if path.startswith("gs://"):
         return gcsfs.GCSFileSystem().cat_file(path)

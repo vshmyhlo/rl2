@@ -72,7 +72,7 @@ def test_wait_for_server_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def actor(monkeypatch: pytest.MonkeyPatch) -> Any:
-    actor = training.Actor.__ray_metadata__.modified_class(batcher=Mock())
+    actor = training.Actor.__ray_metadata__.modified_class(batcher=Mock(), group_size=2)
     monkeypatch.setattr(training.random, "choice", Mock(return_value=actor.tasks[0]))
     return actor
 
@@ -104,12 +104,42 @@ def test_correct_answer(reply: str, reward: float, actor: Any) -> None:
     assert asyncio.run(task.correct_answer(trace)) == reward
 
 
-@pytest.mark.parametrize("fails", [False, True], ids=["submit", "failed-rollout"])
-def test_actor_submits_only_completed_rollouts(fails: bool, actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("size", [0, 1])
+def test_group_requires_multiple_rollouts(size: int) -> None:
+    with pytest.raises(ValueError, match="group_size"):
+        training.Actor.__ray_metadata__.modified_class(batcher=Mock(), group_size=size)
+
+
+@pytest.mark.parametrize("failure", [None, "rollout", "score"])
+def test_actor_submits_only_complete_groups(failure: str | None, actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    task = actor.tasks[0]
+    traces = [
+        vf.Trace(
+            task=TraceTask(type="AdditionTask", data=task.data),
+            agent=AgentInfo(config=training.create_environment().config),
+            root_reply=reply,
+            ok=True,
+            stop_condition="agent_completed",
+        )
+        for reply in ["42", "41"]
+    ]
+    if failure == "rollout":
+        traces[1].ok = False
+    if failure == "score":
+        monkeypatch.setattr(task, "score", AsyncMock(side_effect=ValueError("scoring failed")))
     env = AsyncMock()
     env.__aenter__.return_value = env
-    env.run.return_value = Mock(ok=not fails, reward=1.0, stop_condition="done", errors=[])
-    env.run.return_value.to_record.return_value = {"task": {"data": {"id": "0"}}}
+    seen: list[training.AdditionTask] = []
+
+    async def run(sample: training.AdditionTask) -> vf.Trace:
+        index = len(seen)
+        seen.append(sample)
+        # Finish out of order to check reward/trace/advantage alignment.
+        if index == 0:
+            await asyncio.sleep(0)
+        return traces[index]
+
+    env.run.side_effect = run
     monkeypatch.setattr(training, "create_environment", Mock(return_value=env))
     remote = Mock()
     monkeypatch.setattr(training.ray, "remote", remote)
@@ -121,21 +151,53 @@ def test_actor_submits_only_completed_rollouts(fails: bool, actor: Any, monkeypa
         remote.return_value.return_value.remote.assert_called_once_with()
 
     monkeypatch.setattr(training, "wait_for_server", Mock(side_effect=check_server_started))
-    task = actor.tasks[0]
     actor.fetch_next_prompt = Mock(side_effect=[task, StopIteration])
-    with pytest.raises(RuntimeError if fails else StopIteration):
+    error = {None: StopIteration, "rollout": RuntimeError, "score": ValueError}[failure]
+    with pytest.raises(error):
         actor.start()
-    env.run.assert_awaited_once_with(task)
+    assert len(seen) == actor.group_size
+    assert seen[0] is not seen[1] and all(sample is not task for sample in seen)
+    assert all(sample.data == task.data and sample.scoring_deferred for sample in seen)
+    assert not task.scoring_deferred
     env.__aexit__.assert_awaited_once()
-    submit = actor.batcher.submit_rollout.remote
-    if fails:
+    submit = actor.batcher.submit_group.remote
+    if failure:
         submit.assert_not_called()
     else:
         submit.assert_called_once()
-        rollout = submit.call_args.args[0]
-        assert rollout.reward == 1.0
-        assert rollout.trace["task"]["data"]["id"] == "0"
-        assert pickle.loads(pickle.dumps(rollout)) == rollout
+        group = submit.call_args.args[0]
+        assert group.task_id == task.data.id
+        assert [rollout.reward for rollout in group.rollouts] == [1.0, 0.0]
+        assert [rollout.advantage for rollout in group.rollouts] == pytest.approx([1.0, -1.0], abs=3e-4)
+        assert [rollout.trace["id"] for rollout in group.rollouts] == [trace.id for trace in traces]
+        assert pickle.loads(pickle.dumps(group)) == group
+
+
+def test_group_cancels_pending_rollouts(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = AsyncMock()
+    env.__aenter__.return_value = env
+    started = asyncio.Event()
+    cancelled: list[bool] = []
+    count = 0
+
+    async def run(task: training.AdditionTask) -> vf.Trace:
+        nonlocal count
+        count += 1
+        if count == 1:
+            await started.wait()
+            raise ValueError("generation failed")
+        started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.append(True)
+
+    env.run.side_effect = run
+    monkeypatch.setattr(training, "create_environment", Mock(return_value=env))
+    with pytest.raises(ExceptionGroup, match="TaskGroup"):
+        actor.collect_group(actor.tasks[0])
+    assert cancelled == [True]
+    env.__aexit__.assert_awaited_once()
 
 
 @pytest.fixture
@@ -166,7 +228,7 @@ def test_verifiers_tool_rollout(mode: str, actor: Any, local_harness: None, monk
         requests.append(payload)
         if mode == "provider-error":
             return httpx.Response(status_code=400, json={"error": {"message": "invalid model"}})
-        tool_call = len(requests) == 1 or mode == "tool-error"
+        tool_call = not any(message["role"] == "tool" for message in payload["messages"]) or mode == "tool-error"
         delta: dict[str, Any] = {"role": "assistant", "content": None if tool_call else "42"}
         if tool_call:
             delta["tool_calls"] = [
@@ -191,26 +253,37 @@ def test_verifiers_tool_rollout(mode: str, actor: Any, local_harness: None, monk
             headers={"content-type": "text/event-stream"},
         )
 
-    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
-    monkeypatch.setattr(eval_client, "build_async_httpx", Mock(return_value=client))
+    clients: list[httpx.AsyncClient] = []
+
+    def build_client(config: vf.EvalClientConfig) -> httpx.AsyncClient:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(eval_client, "build_async_httpx", build_client)
     if mode == "provider-error":
         with pytest.raises(RuntimeError, match="Rollout failed"):
-            actor.collect_rollout(actor.tasks[0])
+            actor.collect_group(actor.tasks[0])
     else:
-        rollout = actor.collect_rollout(actor.tasks[0])
-        trace = vf.WireTrace.model_validate(rollout.trace)
-        assert len(trace.calls) == len(requests) == (2 if mode == "success" else 3)
-        assert trace.task.data.answer == 42
-        assert trace.reward == rollout.reward == (1.0 if mode == "success" else 0.0)
-        assert trace.tool_messages
-        if mode == "success":
-            assert "42" in trace.tool_messages[0].content
-            assert trace.last_reply == "42"
-        else:
-            assert "b" in trace.tool_messages[0].content
-            assert trace.stop_condition == "max_turns"
-        assert pickle.loads(pickle.dumps(rollout)) == rollout
-    assert client.is_closed
+        group = actor.collect_group(actor.tasks[0])
+        assert len(group.rollouts) == actor.group_size
+        assert len(requests) == actor.group_size * (2 if mode == "success" else 3)
+        for rollout in group.rollouts:
+            trace = vf.WireTrace.model_validate(rollout.trace)
+            assert len(trace.calls) == (2 if mode == "success" else 3)
+            assert trace.task.data.answer == 42
+            assert trace.reward == rollout.reward == (1.0 if mode == "success" else 0.0)
+            assert rollout.advantage == 0.0
+            assert trace.tool_messages
+            if mode == "success":
+                assert "42" in trace.tool_messages[0].content
+                assert trace.last_reply == "42"
+            else:
+                assert "b" in trace.tool_messages[0].content
+                assert trace.stop_condition == "max_turns"
+        assert len({rollout.trace["id"] for rollout in group.rollouts}) == actor.group_size
+        assert pickle.loads(pickle.dumps(group)) == group
+    assert clients and all(client.is_closed for client in clients)
     assert requests[0]["model"] == training.MODEL
     assert requests[0]["max_tokens"] == 512
     assert requests[0]["chat_template_kwargs"] == {"enable_thinking": False}

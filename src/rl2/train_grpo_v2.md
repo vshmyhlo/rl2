@@ -13,7 +13,9 @@ Start with Prime Intellect's Environments Hub and Verifiers. The project already
 
 ## Starting point
 
-The prototype uses `verifiers==0.4.0` and its `verifiers.v1` API. Five local addition tasks and an MCP `add` tool live in `addition_env.py`. The actor owns vLLM and runs Verifiers' `null` chat harness in local subprocesses for up to three model turns. An exact final integer answer earns 1, otherwise 0. Successful traces, rewards, and stop conditions go to the batcher; infrastructure failures raise.
+The prototype uses `verifiers==0.4.0` and its `verifiers.v1` API. Five local addition tasks and an MCP `add` tool live in `addition_env.py`. The actor owns vLLM and runs Verifiers' `null` chat harness in local subprocesses for up to three model turns. An exact final integer answer earns 1, otherwise 0.
+
+The actor samples four independent rollouts of the same task concurrently (`group_size=4` on `Actor`, minimum 2), then scores the completed group. Each rollout receives `(reward - group_mean) / (group_std + 1e-4)`, using population standard deviation. Equal-reward groups have zero advantages. The entire group, including traces, rewards, advantages, and stop conditions, goes to the batcher in one submission; generation or scoring failures prevent submission.
 
 Run with `uv run --extra bfcl python -m rl2.train_grpo_v2` on a GPU host. The first rollout provisions the harness's Python dependencies using uv. No external dataset or paid inference service is needed.
 
@@ -23,6 +25,6 @@ For Qwen3-0.6B, defer AppWorld and long browser workflows until basic tool calli
 
 For GRPO, select environments that can reset the same task into independent copies and produce multiple trajectories with meaningful reward differences. Check rollout cost, termination rules, and available training splits.
 
-Verifiers owns the conversation/tool loop inside `Actor.collect_rollout()`, while retaining the Ray actors, batcher, and learner. The [Verifiers v1 overview](https://docs.primeintellect.ai/verifiers/v1/overview#trace) describes traces and token/log-probability capture with prime-rl; the [prime-rl training guide](https://docs.primeintellect.ai/prime-rl/training) covers training runs.
+Verifiers owns the conversation/tool loop inside `Actor.collect_group()`, while retaining the Ray actors, batcher, and learner. The [Verifiers v1 overview](https://docs.primeintellect.ai/verifiers/v1/overview#trace) describes traces and token/log-probability capture with prime-rl; the [prime-rl training guide](https://docs.primeintellect.ai/prime-rl/training) covers training runs.
 
 These docs target the installed `verifiers.v1` API. The old `/verifiers/environments` and `/verifiers/training` pages return 404.

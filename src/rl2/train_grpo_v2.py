@@ -9,12 +9,15 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
 
+import jax
+import jax.numpy as jnp
 import ray
 import verifiers.v1 as vf
 from ray.actor import ActorHandle
 from verifiers.v1.configs.agent import TimeoutConfig
 
 from rl2.addition_env import AdditionData, AdditionTask
+from rl2.utils import group_advantages
 
 logger = logging.getLogger(__name__)
 MODEL = "Qwen/Qwen3-0.6B"
@@ -25,7 +28,42 @@ SERVER_URL = "http://127.0.0.1:8000"
 class Rollout:
     trace: dict[str, Any]
     reward: float
+    advantage: float
     stop_condition: str | None
+
+
+@dataclass(frozen=True)
+class RolloutGroup:
+    task_id: str | None
+    rollouts: list[Rollout]
+
+
+async def score_group(task: AdditionTask, traces: list[vf.Trace]) -> RolloutGroup:
+    if len(traces) < 2:
+        raise ValueError("A rollout group needs at least two traces")
+    for trace in traces:
+        if not trace.ok:
+            raise RuntimeError(f"Rollout failed: {trace.stop_condition}: {trace.errors}")
+    # Addition rewards need only the completed trace, so score after all rollouts finish.
+    async with asyncio.timeout(30):
+        for trace in traces:
+            await task.score(trace)
+    # The actor owns no GPU; convert to Python scalars at the Ray message boundary.
+    with jax.default_device(jax.devices("cpu")[0]):
+        rewards = jnp.asarray([trace.reward for trace in traces], dtype=jnp.float32)  # (G,)
+        advantages = group_advantages(rewards)  # (G,)
+    return RolloutGroup(
+        task_id=task.data.id,
+        rollouts=[
+            Rollout(
+                trace=trace.to_record(float_decimals=None),
+                reward=trace.reward,
+                advantage=advantage,
+                stop_condition=trace.stop_condition,
+            )
+            for trace, advantage in zip(traces, advantages.tolist(), strict=True)
+        ],
+    )
 
 
 def create_environment() -> vf.Agent:
@@ -81,8 +119,8 @@ def wait_for_server(timeout: float = 600) -> None:
 
 @ray.remote
 class Batcher:
-    def submit_rollout(self, rollout: Rollout) -> None:
-        logger.debug("Batcher received rollout (buffering not implemented)")
+    def submit_group(self, group: RolloutGroup) -> None:
+        logger.debug("Batcher received group of %s rollouts (buffering not implemented)", len(group.rollouts))
 
     def fetch_next_batch(self) -> Any:
         logger.debug("Batcher received batch request (batching not implemented)")
@@ -115,8 +153,11 @@ class Learner:
 
 @ray.remote
 class Actor:
-    def __init__(self, batcher: ActorHandle) -> None:
+    def __init__(self, batcher: ActorHandle, group_size: int = 4) -> None:
+        if group_size < 2:
+            raise ValueError("group_size must be at least 2")
         self.batcher = batcher
+        self.group_size = group_size
         self.tasks = [
             AdditionTask(
                 data=AdditionData(
@@ -136,29 +177,29 @@ class Actor:
         logger.info("Starting actor rollout loop")
         while True:
             example = self.fetch_next_prompt()
-            rollout = self.collect_rollout(example)
-            logger.debug("Submitting rollout to batcher")
-            ray.get(self.batcher.submit_rollout.remote(rollout))
+            group = self.collect_group(example)
+            logger.debug("Submitting rollout group to batcher")
+            ray.get(self.batcher.submit_group.remote(group))
 
     def fetch_next_prompt(self) -> AdditionTask:
         task = random.choice(self.tasks)
         logger.debug("Selected task %s: %r", task.data.id, task.data.prompt)
         return task
 
-    def collect_rollout(self, task: AdditionTask) -> Rollout:
-        logger.debug("Collecting rollout for task %s", task.data.id)
+    def collect_group(self, task: AdditionTask) -> RolloutGroup:
+        logger.debug("Collecting %s rollouts for task %s", self.group_size, task.data.id)
 
-        async def collect() -> Rollout:
-            async with create_environment() as env:
-                trace = await env.run(task)
-            if not trace.ok:
-                raise RuntimeError(f"Rollout failed: {trace.stop_condition}: {trace.errors}")
-            logger.info("Collected rollout: task=%s reward=%s", task.data.id, trace.reward)
-            return Rollout(
-                trace=trace.to_record(float_decimals=None),
-                reward=trace.reward,
-                stop_condition=trace.stop_condition,
+        async def collect() -> RolloutGroup:
+            async with create_environment() as env, asyncio.TaskGroup() as pending:
+                runs = [pending.create_task(env.run(task.defer_scoring())) for _ in range(self.group_size)]
+            group = await score_group(task, [run.result() for run in runs])
+            logger.info(
+                "Collected group: task=%s rewards=%s advantages=%s",
+                task.data.id,
+                [rollout.reward for rollout in group.rollouts],
+                [rollout.advantage for rollout in group.rollouts],
             )
+            return group
 
         return asyncio.run(collect())
 

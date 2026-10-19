@@ -37,6 +37,41 @@ def test_explained_variance(shape: tuple[int, ...]) -> None:
     assert np.isnan(utils.explained_variance(returns, jnp.ones_like(returns)))
 
 
+@pytest.mark.parametrize(
+    ("rewards", "expected"),
+    [
+        ([0.0, 1.0], [-1.0, 1.0]),
+        ([1.0, 1.0], [0.0, 0.0]),
+        ([0.0, 0.0, 0.0, 1.0], [-1 / 3**0.5] * 3 + [3**0.5]),
+    ],
+    ids=["mixed", "equal", "imbalanced"],
+)
+def test_group_advantages(rewards: list[float], expected: list[float]) -> None:
+    values = jnp.asarray(rewards, dtype=jnp.float32)  # (G,)
+    advantages = jax.jit(utils.group_advantages)(values)  # (G,)
+    assert advantages.shape == values.shape
+    assert advantages.dtype == jnp.float32
+    assert advantages.tolist() == pytest.approx(expected, abs=5e-4)
+    assert float(advantages.mean()) == pytest.approx(0.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("shape", [(0,), (2, 1)], ids=["empty", "singleton-groups"])
+def test_group_advantages_requires_multiple_rewards(shape: tuple[int, ...]) -> None:
+    rewards = jnp.zeros(shape, dtype=jnp.float32)  # (*B, G)
+    with pytest.raises(ValueError, match="two rewards"):
+        utils.group_advantages(rewards)
+
+
+def test_group_advantages_keeps_batch_rows_independent() -> None:
+    rewards = jnp.array([[0, 1], [10, 10], [4, 2]], dtype=jnp.float32)  # (B=3, G=2)
+    advantages = jax.jit(utils.group_advantages)(rewards)  # (B=3, G=2)
+    assert advantages.shape == rewards.shape
+    np.testing.assert_allclose(advantages, [[-1, 1], [0, 0], [1, -1]], atol=3e-4)
+    single_group = jax.jit(utils.group_advantages)(rewards[:1])  # (B=1, G=2)
+    assert single_group.shape == (1, 2)
+    np.testing.assert_allclose(single_group, advantages[:1])
+
+
 def test_checkpoint_io_preserves_previous_file_and_propagates_storage_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -42,7 +42,7 @@ from rl2.gemma3 import (
 )
 from rl2.jax_cache import configure_compilation_cache
 from rl2.mlflow_logging import MLflowLogger
-from rl2.utils import read_optional, write_bytes
+from rl2.utils import group_advantages, read_optional, write_bytes
 
 type Entry = dict[str, Any]
 type Metrics = dict[str, jax.Array]
@@ -116,12 +116,6 @@ class GRPOBatch(NamedTuple):
     old_log_probs: jax.Array  # [B,C], sampled behavior policy.
     ref_log_probs: jax.Array  # [B,C], frozen initial policy (unused when beta=0).
     advantages: jax.Array  # [B], normalized before shuffling/minibatching.
-
-
-def group_advantages(rewards: jax.Array) -> jax.Array:
-    centered = rewards - rewards.mean(axis=1, keepdims=True)
-    result = centered / (rewards.std(axis=1, keepdims=True) + 1e-4)
-    return result
 
 
 def policy_log_probs(logits: jax.Array, tokens: jax.Array, temperature: float) -> jax.Array:
