@@ -174,9 +174,13 @@ class Batcher:
     def __init__(self, actor: ActorHandle) -> None:
         self.actor = actor
 
-    def fetch_next_batch(self) -> RolloutGroup:
-        logger.debug("Fetching rollout group from actor (one group per batch)")
-        return ray.get(self.actor.fetch_next_group.remote())
+    async def fetch_next_batch(self, num_groups: int, group_size: int) -> list[RolloutGroup]:
+        if num_groups < 1:
+            raise ValueError("num_groups must be at least 1")
+        logger.debug("Fetching %s groups of %s rollouts from actor", num_groups, group_size)
+        return await asyncio.gather(
+            *(self.actor.fetch_next_group.remote(group_size=group_size) for _ in range(num_groups))
+        )
 
 
 @ray.remote(num_gpus=1)
@@ -187,15 +191,15 @@ class Learner:
     def start(self) -> None:
         logger.info("Starting learner training loop")
         while True:
-            batch = self.fetch_next_batch()
+            batch = self.fetch_next_batch(num_groups=1, group_size=4)
             self.optimize(batch)
             self.publish_weights()
 
-    def fetch_next_batch(self) -> RolloutGroup:
+    def fetch_next_batch(self, num_groups: int, group_size: int) -> list[RolloutGroup]:
         logger.debug("Fetching next batch from batcher")
-        return ray.get(self.batcher.fetch_next_batch.remote())
+        return ray.get(self.batcher.fetch_next_batch.remote(num_groups=num_groups, group_size=group_size))
 
-    def optimize(self, batch: RolloutGroup) -> None:
+    def optimize(self, batch: list[RolloutGroup]) -> None:
         logger.debug("Optimizing batch (placeholder)")
         time.sleep(1)
 
@@ -206,10 +210,7 @@ class Learner:
 
 @ray.remote(num_gpus=1)
 class Actor:
-    def __init__(self, group_size: int = 4) -> None:
-        if group_size < 2:
-            raise ValueError("group_size must be at least 2")
-        self.group_size = group_size
+    def __init__(self) -> None:
         self.tasks = list(AdditionTaskset(config=vf.TasksetConfig()))
         logger.info("Starting actor and vLLM on its assigned GPU")
         with ExitStack() as resources:
@@ -221,30 +222,26 @@ class Actor:
     def __ray_shutdown__(self) -> None:
         self._server.close()
 
-    def fetch_next_group(self) -> RolloutGroup:
-        return self.collect_group(self.fetch_next_prompt())
-
-    def fetch_next_prompt(self) -> AdditionTask:
+    async def fetch_next_group(self, group_size: int) -> RolloutGroup:
         task = random.choice(self.tasks)
         logger.debug("Selected task %s: %r", task.data.id, task.data.prompt)
-        return task
+        return await self.collect_group(task, group_size=group_size)
 
-    def collect_group(self, task: AdditionTask) -> RolloutGroup:
-        logger.debug("Collecting %s rollouts for task %s", self.group_size, task.data.id)
+    async def collect_group(self, task: AdditionTask, group_size: int) -> RolloutGroup:
+        if group_size < 2:
+            raise ValueError("group_size must be at least 2")
+        logger.debug("Collecting %s rollouts for task %s", group_size, task.data.id)
 
-        async def collect() -> RolloutGroup:
-            async with create_agent() as agent, asyncio.TaskGroup() as pending:
-                runs = [pending.create_task(agent.run(task.defer_scoring())) for _ in range(self.group_size)]
-            group = await score_group(task, [run.result() for run in runs])
-            logger.info(
-                "Collected group: task=%s rewards=%s advantages=%s",
-                task.data.id,
-                [rollout.reward for rollout in group.rollouts],
-                [rollout.advantage for rollout in group.rollouts],
-            )
-            return group
-
-        return asyncio.run(collect())
+        async with create_agent() as agent, asyncio.TaskGroup() as pending:
+            runs = [pending.create_task(agent.run(task.defer_scoring())) for _ in range(group_size)]
+        group = await score_group(task, [run.result() for run in runs])
+        logger.info(
+            "Collected group: task=%s rewards=%s advantages=%s",
+            task.data.id,
+            [rollout.reward for rollout in group.rollouts],
+            [rollout.advantage for rollout in group.rollouts],
+        )
+        return group
 
 
 def main() -> None:

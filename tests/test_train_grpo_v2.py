@@ -96,7 +96,7 @@ def test_wait_for_server_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
 def actor(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
     monkeypatch.setattr(training, "wait_for_server", Mock())
-    actor = training.Actor.__ray_metadata__.modified_class(group_size=2)
+    actor = training.Actor.__ray_metadata__.modified_class()
     monkeypatch.setattr(training.random, "choice", Mock(return_value=actor.tasks[0]))
     return actor
 
@@ -112,15 +112,15 @@ def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPa
 
     if startup_fails:
         with pytest.raises(TimeoutError, match="not ready"):
-            training.Actor.__ray_metadata__.modified_class(group_size=2)
+            training.Actor.__ray_metadata__.modified_class()
     else:
-        actor = training.Actor.__ray_metadata__.modified_class(group_size=2)
-        actor.collect_group = Mock(return_value=group)
+        actor = training.Actor.__ray_metadata__.modified_class()
+        actor.collect_group = AsyncMock(return_value=group)
         monkeypatch.setattr(training.random, "choice", Mock(return_value=actor.tasks[0]))
         for _ in range(2):
-            assert actor.fetch_next_group() is group
-        actor.collect_group.assert_called_with(actor.tasks[0])
-        assert actor.collect_group.call_count == 2
+            assert asyncio.run(actor.fetch_next_group(group_size=2)) is group
+        actor.collect_group.assert_awaited_with(actor.tasks[0], group_size=2)
+        assert actor.collect_group.await_count == 2
         server.__exit__.assert_not_called()
         actor.__ray_shutdown__()
     serve.assert_called_once_with()
@@ -129,29 +129,52 @@ def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPa
     server.__exit__.assert_called_once()
 
 
-@pytest.mark.parametrize("fails", [False, True])
-def test_learner_pulls_group_through_batcher(fails: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(("num_groups", "fails"), [(1, False), (2, False), (2, True)])
+def test_learner_pulls_groups_through_batcher(num_groups: int, fails: bool, monkeypatch: pytest.MonkeyPatch) -> None:
     actor = Mock()
-    group = training.RolloutGroup(task_id="0", prompt="test", rollouts=[])
-    actor.fetch_next_group.remote.side_effect = RuntimeError("rollout failed") if fails else None
-    actor.fetch_next_group.remote.return_value = group
+    groups = [training.RolloutGroup(task_id=str(i), prompt="test", rollouts=[]) for i in range(num_groups)]
+    actor.fetch_next_group.remote = AsyncMock(
+        side_effect=[groups[0], RuntimeError("rollout failed")] if fails else groups
+    )
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor)
     batcher_handle = Mock()
     batcher_handle.fetch_next_batch.remote.side_effect = batcher.fetch_next_batch
     learner = training.Learner.__ray_metadata__.modified_class(batcher=batcher_handle)
 
     def get(result: Any) -> Any:
-        return result
+        return asyncio.run(result)
 
     monkeypatch.setattr(training.ray, "get", get)
 
     if fails:
         with pytest.raises(RuntimeError, match="rollout failed"):
-            learner.fetch_next_batch()
+            learner.fetch_next_batch(num_groups=num_groups, group_size=3)
     else:
-        assert learner.fetch_next_batch() is group
-    batcher_handle.fetch_next_batch.remote.assert_called_once_with()
-    actor.fetch_next_group.remote.assert_called_once_with()
+        assert learner.fetch_next_batch(num_groups=num_groups, group_size=3) == groups
+    batcher_handle.fetch_next_batch.remote.assert_called_once_with(num_groups=num_groups, group_size=3)
+    assert actor.fetch_next_group.remote.call_count == num_groups
+    assert all(call.kwargs == {"group_size": 3} for call in actor.fetch_next_group.remote.call_args_list)
+
+
+def test_batch_requires_groups() -> None:
+    actor = Mock()
+    batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor)
+    with pytest.raises(ValueError, match="num_groups"):
+        asyncio.run(batcher.fetch_next_batch(num_groups=0, group_size=2))
+    actor.fetch_next_group.remote.assert_not_called()
+
+
+def test_learner_requests_batch_dimensions() -> None:
+    learner = training.Learner.__ray_metadata__.modified_class(batcher=Mock())
+    batch = [training.RolloutGroup(task_id="0", prompt="test", rollouts=[])]
+    learner.fetch_next_batch = Mock(side_effect=[batch, RuntimeError("done")])
+    learner.optimize = Mock()
+    learner.publish_weights = Mock()
+    with pytest.raises(RuntimeError, match="done"):
+        learner.start()
+    learner.fetch_next_batch.assert_called_with(num_groups=1, group_size=4)
+    learner.optimize.assert_called_once_with(batch)
+    learner.publish_weights.assert_called_once_with()
 
 
 @pytest.mark.parametrize("fails", [False, True])
@@ -195,7 +218,7 @@ def test_environment_examples(actor: Any) -> None:
     assert len(actor.tasks) == 5
     assert [task.data.idx for task in actor.tasks] == list(range(5))
     assert [task.data.answer for task in actor.tasks] == [42, 21, 9, 3, 43]
-    task = actor.fetch_next_prompt()
+    task = actor.tasks[0]
     assert task.data.id == "0"
     assert task.data.prompt == "What is 17 + 25?"
     tools = task.toolsets(task.config)
@@ -233,9 +256,9 @@ def test_correct_answer(reply: str, reward: float, actor: Any) -> None:
 
 
 @pytest.mark.parametrize("size", [0, 1])
-def test_group_requires_multiple_rollouts(size: int) -> None:
+def test_group_requires_multiple_rollouts(size: int, actor: Any) -> None:
     with pytest.raises(ValueError, match="group_size"):
-        training.Actor.__ray_metadata__.modified_class(group_size=size)
+        asyncio.run(actor.fetch_next_group(group_size=size))
 
 
 @pytest.mark.parametrize("failure", [None, "rollout", "score", "tokens"])
@@ -282,10 +305,10 @@ def test_actor_returns_only_complete_groups(failure: str | None, actor: Any, mon
     monkeypatch.setattr(training, "create_agent", Mock(return_value=env))
     if failure:
         with pytest.raises(RuntimeError if failure == "rollout" else ValueError):
-            actor.fetch_next_group()
+            asyncio.run(actor.fetch_next_group(group_size=2))
     else:
-        group = actor.fetch_next_group()
-    assert len(seen) == actor.group_size
+        group = asyncio.run(actor.fetch_next_group(group_size=2))
+    assert len(seen) == 2
     assert seen[0] is not seen[1] and all(sample is not task for sample in seen)
     assert all(sample.data == task.data and sample.scoring_deferred for sample in seen)
     assert not task.scoring_deferred
@@ -388,6 +411,41 @@ def test_training_sequence_rejects_invalid_tokens(failure: str, message: str, to
         training.training_sequence(trace)
 
 
+def test_batcher_collects_groups_concurrently(
+    actor: Any, token_trace: vf.Trace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    all_started = asyncio.Event()
+    started = 0
+    env = AsyncMock()
+    env.__aenter__.return_value = env
+
+    async def run(task: training.AdditionTask) -> vf.Trace:
+        nonlocal started
+        started += 1
+        if started == 4:
+            all_started.set()
+        # A serialized actor would wait forever for the second group's rollouts.
+        await all_started.wait()
+        return token_trace.model_copy(deep=True, update={"ok": True})
+
+    env.run.side_effect = run
+    monkeypatch.setattr(training, "create_agent", Mock(return_value=env))
+    monkeypatch.setattr(training.random, "choice", Mock(side_effect=actor.tasks[:2]))
+    handle = Mock()
+    handle.fetch_next_group.remote.side_effect = actor.fetch_next_group
+    batcher = training.Batcher.__ray_metadata__.modified_class(actor=handle)
+
+    async def collect() -> list[training.RolloutGroup]:
+        async with asyncio.timeout(5):
+            return await batcher.fetch_next_batch(num_groups=2, group_size=2)
+
+    groups = asyncio.run(collect())
+    assert started == 4
+    assert [group.task_id for group in groups] == [task.data.id for task in actor.tasks[:2]]
+    assert [len(group.rollouts) for group in groups] == [2, 2]
+    assert env.__aexit__.await_count == 2
+
+
 def test_group_cancels_pending_rollouts(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     env = AsyncMock()
     env.__aenter__.return_value = env
@@ -410,7 +468,7 @@ def test_group_cancels_pending_rollouts(actor: Any, monkeypatch: pytest.MonkeyPa
     env.run.side_effect = run
     monkeypatch.setattr(training, "create_agent", Mock(return_value=env))
     with pytest.raises(ExceptionGroup, match="TaskGroup"):
-        actor.collect_group(actor.tasks[0])
+        asyncio.run(actor.collect_group(actor.tasks[0], group_size=2))
     assert cancelled == [True]
     env.__aexit__.assert_awaited_once()
 
@@ -510,11 +568,11 @@ def test_verifiers_tool_rollout(
     monkeypatch.setattr(client_base, "build_async_httpx", build_client)
     if mode == "provider-error":
         with pytest.raises(RuntimeError, match="Rollout failed"):
-            actor.collect_group(actor.tasks[0])
+            asyncio.run(actor.collect_group(actor.tasks[0], group_size=2))
     else:
-        group = actor.collect_group(actor.tasks[0])
-        assert len(group.rollouts) == actor.group_size
-        assert len(requests) == actor.group_size * (2 if mode == "success" else 3)
+        group = asyncio.run(actor.collect_group(actor.tasks[0], group_size=2))
+        assert len(group.rollouts) == 2
+        assert len(requests) == 2 * (2 if mode == "success" else 3)
         expected_samples = tool_ids + answer_ids if mode == "success" else tool_ids * 3  # (S,)
         for rollout in group.rollouts:
             assert rollout.num_turns == (2 if mode == "success" else 3)
