@@ -164,32 +164,76 @@ def test_toolrl_preset_and_actor(monkeypatch: pytest.MonkeyPatch) -> None:
     actor.__ray_shutdown__()
 
 
-def test_codegym_preset_and_actor(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("mode", ["local", "remote", "vllm-failure"])
+def test_codegym_preset_and_actor(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
     preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/codegym.yaml"
     config = training.load_config(preset, training.Config)
     assert isinstance(config.taskset, training.CodeGymConfig)
     assert config.taskset.dataset_file == training.CODEGYM_TRAIN_FILE
-    assert config.taskset.manager_url == "http://codegym:8000"
+    assert config.taskset.manager_url == "http://127.0.0.1:8001"
+    assert config.taskset.server == training.CodeGymServerConfig(root="/runs/codegym", workers=40)
     assert config.max_turns == 32
     assert config.update_epochs == 1
     assert config.minibatches_per_epoch == 4
     assert config.grad_accum_steps == 1
     assert config.run_id == f"grpo_v2_codegym_Qwen_Qwen3-0.6B_seed{config.seed}"
     assert pickle.loads(pickle.dumps(config)) == config
+    if mode == "remote":
+        config = replace(config, taskset=replace(config.taskset, server=None, manager_url="http://codegym:8000"))
     tasks = Mock(return_value=[Mock()])
+    server = MagicMock()
+    launch = Mock(return_value=server)
+    monkeypatch.setattr(training, "serve_codegym", launch)
     monkeypatch.setattr(training, "CodeGymTaskset", tasks)
     monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
-    monkeypatch.setattr(training, "wait_for_server", Mock())
+    monkeypatch.setattr(
+        training, "wait_for_server", Mock(side_effect=RuntimeError("vLLM failed") if mode == "vllm-failure" else None)
+    )
+    if mode == "vllm-failure":
+        with pytest.raises(RuntimeError, match="vLLM failed"):
+            training.Actor.__ray_metadata__.modified_class(config=config)
+        server.__exit__.assert_called_once()
+        return
     actor = training.Actor.__ray_metadata__.modified_class(config=config)
     assert actor.tasks == tasks.return_value
     assert tasks.call_args.kwargs["config"].data_file == config.taskset.dataset_file
     actor.__ray_shutdown__()
+    if mode == "local":
+        launch.assert_called_once_with(config.taskset.server, config.taskset.manager_url)
+        server.__exit__.assert_called_once()
+    else:
+        launch.assert_not_called()
 
 
 @pytest.mark.parametrize("url", ["", "codegym:8000", "file:///tmp/codegym"])
 def test_codegym_invalid_manager_url(url: str) -> None:
     with pytest.raises(ValidationError, match="HTTP"):
         training.CodeGymConfig(manager_url=url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://codegym:8001",
+        "http://127.0.0.1:8000",
+        "http://127.0.0.1:0",
+        "http://127.0.0.1:65536",
+        "https://127.0.0.1:8001",
+        "http://127.0.0.1:8001/proxy",
+    ],
+)
+def test_local_codegym_invalid_url(url: str) -> None:
+    with pytest.raises(ValidationError, match="Local CodeGym"):
+        training.CodeGymConfig(manager_url=url, server=training.CodeGymServerConfig(root="/server"))
+
+
+def test_local_codegym_worker_capacity() -> None:
+    taskset = training.CodeGymConfig(
+        manager_url="http://127.0.0.1:8001", server=training.CodeGymServerConfig(root="/server", workers=4)
+    )
+    assert training.Config(taskset=taskset, group_size=4).taskset == taskset
+    with pytest.raises(ValidationError, match="concurrent rollouts"):
+        training.Config(taskset=taskset, num_groups=2, group_size=4)
 
 
 @pytest.mark.parametrize("temperature", [0.01, 2.0])
@@ -417,7 +461,10 @@ def test_learner_pulls_groups_through_batcher(
             learner.fetch_next_batch(num_groups=num_groups, group_size=3)
     else:
         batch = learner.fetch_next_batch(num_groups=num_groups, group_size=3)
-        assert batch.groups == groups
+        assert not hasattr(batch, "groups")
+        assert batch.stop_counts == {"agent_completed": num_groups * 3}
+        assert batch.num_output_tokens == num_groups * 3
+        assert batch.examples.count("Final assistant output:") == 3
         assert batch.training_batch.token_ids.shape == (num_groups * 3, 8)
         np.testing.assert_array_equal(batch.training_batch.advantages, 0.5)
     batcher_handle.fetch_next_batch.remote.assert_called_once_with(
@@ -441,7 +488,10 @@ def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
     clock = Mock(return_value=0.0)
     monkeypatch.setattr(training, "time", Mock(monotonic=clock))
     caplog.set_level("INFO", logger=training.__name__)
-    groups = [training.RolloutGroup(task_id=str(i), prompt="test", rollouts=[rollout] * 2) for i in range(2)]
+    groups = [
+        training.RolloutGroup(task_id=str(i), prompt="test", rollouts=[replace(rollout, advantage=float(i))] * 2)
+        for i in range(2)
+    ]
     fast_ready = asyncio.Event()
     requested = 0
 
@@ -485,9 +535,9 @@ def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
     monkeypatch.setattr(training.ray, "get", get)
     batch = learner.fetch_next_batch(num_groups=2, group_size=2)
     # Preserve request order despite out-of-order completion and serialization.
-    jax.tree.map(
-        np.testing.assert_array_equal, [asdict(group) for group in batch.groups], [asdict(group) for group in groups]
-    )
+    np.testing.assert_array_equal(batch.training_batch.advantages, [0.0, 0.0, 1.0, 1.0])
+    assert "Example 1 | task=0" in batch.examples
+    assert "Example 3 | task=1" in batch.examples
     assert batch.training_batch.token_ids.shape == (4, 8)
     assert batch.transfer_metrics == {
         "time/batcher/fetch_rollout_seconds": 50.5,
@@ -599,13 +649,15 @@ def test_learner_logs_rollouts(
         "time/learner/batcher_to_learner_seconds": 0.125,
     }
     prepared = Mock(spec=training.GRPOBatch)
-    received = training.RolloutBatch(groups=batch, training_batch=prepared, transfer_metrics=transfer_metrics)
-    next_batch = replace(
-        received,
+    prepared.token_ids = Mock(shape=(4, 8))  # (B=4, T=8)
+    received = training.build_rollout_batch(groups=batch, training_batch=prepared, transfer_metrics=transfer_metrics)
+    next_batch = training.build_rollout_batch(
         groups=[
             replace(group, rollouts=[replace(rollout, stop_condition="codegym_done") for rollout in group.rollouts])
             for group in batch
         ],
+        training_batch=prepared,
+        transfer_metrics=transfer_metrics,
     )
     learner.fetch_next_batch.side_effect = [received, RuntimeError("done") if fails else next_batch]
     learner.publish_weights = steps.publish
@@ -728,10 +780,12 @@ def test_learner_logs_examples_every_ten_steps(
     learner.initialize_weight_transfer = Mock()
     learner.publish_weights = Mock()
     learner.optimize = Mock(return_value={"losses/policy": 0.0})
+    prepared = Mock(spec=training.GRPOBatch)
+    prepared.token_ids = Mock(shape=(4, 8))  # (B=4, T=8)
     learner.fetch_next_batch = Mock(
-        return_value=training.RolloutBatch(
+        return_value=training.build_rollout_batch(
             groups=groups,
-            training_batch=Mock(spec=training.GRPOBatch),
+            training_batch=prepared,
             transfer_metrics={
                 "time/batcher/actor_to_batcher_seconds": 0.0,
                 "time/learner/batcher_to_learner_seconds": 0.0,
@@ -1158,10 +1212,11 @@ def test_batcher_collects_groups_concurrently(
         async with asyncio.timeout(5):
             return await batcher.fetch_next_batch(num_groups=2, group_size=2, context_length=16)
 
-    groups = asyncio.run(collect()).value.groups
+    batch = asyncio.run(collect()).value
     assert started == 4
-    assert [group.task_id for group in groups] == [task.data.id for task in actor.tasks[:2]]
-    assert [len(group.rollouts) for group in groups] == [2, 2]
+    assert f"Example 1 | task={actor.tasks[0].data.id}" in batch.examples
+    assert f"Example 3 | task={actor.tasks[1].data.id}" in batch.examples
+    assert batch.training_batch.token_ids.shape == (4, 16)
     assert env.__aexit__.await_count == 2
 
 

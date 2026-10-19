@@ -27,11 +27,30 @@ The [ToolRL dataset](https://github.com/qiancheng0/ToolRL#-dataset) combines Too
 
 ### CodeGym
 
-Run `uv run python -m rl2.train_grpo_v2 --config configs/grpo_v2/codegym.yaml` after setting `taskset.manager_url` to a running [CodeGym environment manager](https://github.com/StigLidu/CodeGym/blob/e85a439761ae2df813d5997a81bbd9f9e2ed27b7/online_server/README.md). The preset loads all 80,130 rows of the `task_en_instruction_en_env` subset’s `train` split from [VanishD/CodeGym](https://huggingface.co/datasets/VanishD/CodeGym), the community reproduction linked by the upstream repository. The file pattern selects all four training shards at revision `85286359a342f7a288aea74273772b69b9b784c2`; it does not mix in the Chinese-language subsets or environment-code tables. Set `taskset.dataset_file` to a JSONL/JSON or Parquet path or glob to override it. Rows need `prompt` messages and `ability: codegym_v1@environment_name@JSON_config`; optional `plugin_call_max_round` caps each task's turns.
+The preset starts a [CodeGym environment manager](https://github.com/StigLidu/CodeGym/blob/e85a439761ae2df813d5997a81bbd9f9e2ed27b7/online_server/README.md) inside the Ray actor's process tree, alongside vLLM. Prepare the server once, then train with two GPUs:
 
-On the environment-server host, install upstream `online_server/requirements.txt`, place matching environment modules in `online_server/online_server/envs/codegym_v1/`, and run `python env_instance_manager.py --workers 40` from upstream's **`online_server/online_server/`** directory so workers can import `env_server`. For this preset, export the matching `envs_en` subset from `VanishD/CodeGym` at the same dataset revision: save each row’s `env_code` as `{source}__{env_name}.py` in that directory. The repository’s example environment modules cover only the example tasks. The trainer needs access to both the manager's port 8000 and the allocated worker ports on the same host (upstream allocates from port 10000). Use a separate host or network namespace: the trainer already runs vLLM on local port 8000. Allocate more workers than `num_groups * group_size` (32 in this preset), plus any other concurrent clients.
+```bash
+uv run python -m rl2.codegym_setup --root /runs/codegym
+uv run python -m rl2.train_grpo_v2 --config configs/grpo_v2/codegym.yaml
+```
+
+Use a writable directory and set `taskset.server.root` to the same path. Setup downloads the three upstream server modules, requirements, and license at revision `e85a439761ae2df813d5997a81bbd9f9e2ed27b7`; no Git clone is needed. It changes the worker bind address to IPv4 loopback, installs server dependencies plus Gymnasium/NumPy in `<root>/.venv`, and exports the matching `envs_en` dataset as `envs/codegym_v1/{source}__{env_name}.py`. A completion marker skips repeated setup at the same revisions. Setup needs network access; actor startup uses the prepared files. Keep the prepared directory at its original path because its virtual environment contains absolute paths.
+
+For k3s, prepare it on the shared `/runs` volume before training in the same job (later jobs reuse it):
+
+```bash
+./submit.py --gpus 2 -- sh -c 'uv run python -m rl2.codegym_setup --root /runs/codegym && uv run python -m rl2.train_grpo_v2 --config configs/grpo_v2/codegym.yaml'
+```
+
+The manager binds `127.0.0.1:8001`; vLLM uses port 8000. `server.workers: 40` covers the preset's 32 concurrent rollouts. Startup waits for every worker, with `server.startup_timeout: 120` seconds by default. Shutdown and startup failures terminate the manager's process group, including workers. Upstream worker logs are under `<root>/logs/`. Worker ports are allocated from 10000 and are not published outside the training pod.
+
+For an external server, omit `taskset.server` (or set it to `null`) and set `taskset.manager_url` to its HTTP(S) endpoint. The client must reach both the manager and its allocated worker ports on the same hostname.
+
+The preset loads all 80,130 rows of the `task_en_instruction_en_env` subset’s `train` split from [VanishD/CodeGym](https://huggingface.co/datasets/VanishD/CodeGym), the community reproduction linked by upstream. Both tasks and environment code use revision `85286359a342f7a288aea74273772b69b9b784c2`. The task file pattern selects all four English training shards. Set `taskset.dataset_file` to a JSONL/JSON or Parquet path or glob to override it, and provide matching environment modules. Rows need `prompt` messages and `ability: codegym_v1@environment_name@JSON_config`; optional `plugin_call_max_round` caps each task's turns.
 
 `codegym_env.py` preserves the dataset's `<|FunctionCallBegin|>[{"name": ..., "parameters": {...}}]<|FunctionCallEnd|>` format. Each rollout leases an independent worker, starts the task, feeds back observations, and ends when `/is_done` reports completion or a turn limit is reached. Invalid calls receive feedback and consume a turn. Server failures abort the group; they are not scored as incorrect answers. Sessions are stopped before workers are released, including on errors or cancellation.
+
+Environment code is exported unchanged. The pinned dataset contains a syntax error in `Codeforces_5537_I__MinPathCostEnv.py`; tasks referencing it will fail during environment loading.
 
 Reward matches the upstream client: 1 for a positive environment reward, otherwise 0. The task's `answer` and `reward_model` fields are unused. Verifiers' `agent.interaction()` captures the complete conversation; only sampled assistant tokens contribute to the loss. The preset allows 32 model turns with 512 tokens per turn, subject to the existing agent timeout and model context limit. CodeGym's code and dataset use [CC BY-NC 4.0](https://github.com/StigLidu/CodeGym/blob/e85a439761ae2df813d5997a81bbd9f9e2ed27b7/LICENSE).
 

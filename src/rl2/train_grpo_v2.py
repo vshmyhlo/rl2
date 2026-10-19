@@ -65,7 +65,7 @@ import time
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import partial
 from itertools import islice
 from statistics import mean, pstdev
@@ -102,6 +102,7 @@ from rl2.benchmark_env import (
     load_benchmark_tasks,
 )
 from rl2.codegym_env import CODEGYM_TRAIN_FILE, CodeGymTask, CodeGymTaskset, CodeGymTasksetConfig
+from rl2.codegym_server import CodeGymServerConfig, serve_codegym
 from rl2.configuration import BaseConfig, load_config
 from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import Parameters, Qwen3LM, load_qwen3_checkpoint
@@ -130,11 +131,26 @@ class CodeGymConfig:
     manager_url: str
     id: Literal["codegym"] = "codegym"
     dataset_file: str = CODEGYM_TRAIN_FILE
+    server: CodeGymServerConfig | None = None
 
     def __post_init__(self) -> None:
         url = httpx.URL(self.manager_url)
         if url.scheme not in {"http", "https"} or not url.host:
             raise ValueError("CodeGym manager_url must be an HTTP(S) URL")
+        if self.server is not None and (
+            url.scheme != "http"
+            or url.host != "127.0.0.1"
+            or url.port is None
+            or not 1 <= url.port <= 65535
+            or url.port == 8000
+            or url.path != "/"
+            or url.query
+            or url.fragment
+            or url.userinfo
+        ):
+            raise ValueError(
+                "Local CodeGym manager_url must be http://127.0.0.1:<port> with a port other than vLLM's 8000"
+            )
 
 
 @config_dataclass(frozen=True)
@@ -169,6 +185,12 @@ class Config(BaseConfig):
     def __post_init__(self) -> None:
         if self.num_groups * self.group_size % (self.minibatches_per_epoch * self.grad_accum_steps):
             raise ValueError("minibatches_per_epoch * grad_accum_steps must divide num_groups * group_size")
+        if (
+            isinstance(self.taskset, CodeGymConfig)
+            and self.taskset.server is not None
+            and self.taskset.server.workers < self.num_groups * self.group_size
+        ):
+            raise ValueError("CodeGym server.workers must cover num_groups * group_size concurrent rollouts")
         if self.taskset.id == "toolrl" and self.max_turns != 1:
             raise ValueError("ToolRL requires max_turns=1; tool calls are graded without execution")
 
@@ -209,9 +231,9 @@ class Transfer[T]:
     ready_at: float  # Same-node monotonic timestamp immediately before Ray serializes the return value.
 
 
-def format_rollout_examples(groups: list[RolloutGroup], step: int) -> str:
+def format_rollout_examples(groups: list[RolloutGroup]) -> str:
     """Format up to three final replies from the batch in sampling order."""
-    sections = [f"Rollout examples | step {step}"]
+    sections: list[str] = []
     examples = islice(((group, rollout) for group in groups for rollout in group.rollouts), 3)
     for index, (group, rollout) in enumerate(examples, start=1):
         sections.append(
@@ -239,9 +261,44 @@ class GRPOBatch(NamedTuple):
 
 @dataclass(frozen=True)
 class RolloutBatch:
-    groups: list[RolloutGroup]
     training_batch: GRPOBatch  # Leaves: (B, T), except advantages: (B,).
+    rollout_metrics: dict[str, float]
+    stop_counts: dict[str, int]
+    num_output_tokens: int
+    examples: str
     transfer_metrics: dict[str, float | int]
+
+
+def build_rollout_batch(
+    groups: list[RolloutGroup],
+    training_batch: GRPOBatch,  # Leaves: (B, T), except advantages: (B,).
+    transfer_metrics: dict[str, float | int],
+) -> RolloutBatch:
+    """Keep only training arrays and the summaries used by learner logging."""
+    rollouts = [rollout for group in groups for rollout in group.rollouts]
+    rewards = [rollout.reward for rollout in rollouts]
+    return RolloutBatch(
+        training_batch=training_batch,
+        rollout_metrics={
+            "charts/reward_mean": mean(rewards),
+            "charts/reward_std": pstdev(rewards),
+            "charts/reward_min": min(rewards),
+            "charts/reward_max": max(rewards),
+            "charts/degenerate_group_fraction": mean(
+                all(rollout.reward == group.rollouts[0].reward for rollout in group.rollouts) for group in groups
+            ),
+            "charts/turns_mean": mean(rollout.num_turns for rollout in rollouts),
+            "charts/input_tokens_mean": mean(rollout.num_input_tokens for rollout in rollouts),
+            "charts/output_tokens_mean": mean(rollout.num_output_tokens for rollout in rollouts),
+            "time/actor/rollout_seconds": mean(rollout.rollout_seconds for rollout in rollouts),
+        },
+        stop_counts=Counter(
+            rollout.stop_condition if rollout.stop_condition is not None else "unspecified" for rollout in rollouts
+        ),
+        num_output_tokens=sum(rollout.num_output_tokens for rollout in rollouts),
+        examples=format_rollout_examples(groups),
+        transfer_metrics=transfer_metrics,
+    )
 
 
 # Use a value alias so Ray can serialize script-defined actors without importing __main__.Metrics.
@@ -555,7 +612,7 @@ class Batcher:
         groups = [group for group, _ in results]
         training_batch = self.prepare_batch(groups, context_length=context_length)  # (B, T), (B,) leaves.
         prepared = time.monotonic()
-        batch = RolloutBatch(
+        batch = build_rollout_batch(
             groups=groups,
             training_batch=training_batch,
             transfer_metrics={
@@ -564,7 +621,7 @@ class Batcher:
                 "time/batcher/actor_to_batcher_seconds": mean(seconds for _, seconds in results),
             },
         )
-        logger.info("Batch ready: groups=%s elapsed=%.2fs", len(batch.groups), time.monotonic() - started)
+        logger.info("Batch ready: groups=%s elapsed=%.2fs", num_groups, time.monotonic() - started)
         return Transfer(value=batch, ready_at=time.monotonic())
 
 
@@ -632,41 +689,26 @@ class Learner:
                 optimized = time.monotonic()
                 self.publish_weights()
                 now = time.monotonic()
-                rollouts = [rollout for group in batch.groups for rollout in group.rollouts]
-                rewards = [rollout.reward for rollout in rollouts]
-                stop_counts = Counter(
-                    rollout.stop_condition if rollout.stop_condition is not None else "unspecified"
-                    for rollout in rollouts
-                )
-                stop_conditions.update(stop_counts)
-                total_rollouts += len(rollouts)
+                num_rollouts = batch.training_batch.token_ids.shape[0]
+                stop_conditions.update(batch.stop_counts)
+                total_rollouts += num_rollouts
                 seconds = max(now - started, 1e-9)
                 scalars = {
                     **update_metrics,
                     **batch.transfer_metrics,
+                    **batch.rollout_metrics,
                     **{
-                        f"charts/stop_condition_fraction/{condition}": stop_counts[condition] / len(rollouts)
+                        f"charts/stop_condition_fraction/{condition}": batch.stop_counts.get(condition, 0)
+                        / num_rollouts
                         for condition in sorted(stop_conditions)
                     },
-                    "charts/reward_mean": mean(rewards),
-                    "charts/reward_std": pstdev(rewards),
-                    "charts/reward_min": min(rewards),
-                    "charts/reward_max": max(rewards),
-                    "charts/degenerate_group_fraction": mean(
-                        all(rollout.reward == group.rollouts[0].reward for rollout in group.rollouts)
-                        for group in batch.groups
-                    ),
-                    "charts/turns_mean": mean(rollout.num_turns for rollout in rollouts),
-                    "charts/input_tokens_mean": mean(rollout.num_input_tokens for rollout in rollouts),
-                    "charts/output_tokens_mean": mean(rollout.num_output_tokens for rollout in rollouts),
                     "charts/total_iterations": iteration,
                     "charts/total_updates": int(self.state.step),
                     "charts/learning_rate": self.config.learning_rate,
                     "charts/total_rollouts": total_rollouts,
                     "time/learner/iterations_per_second": 1 / seconds,
-                    "time/learner/rollouts_per_second": len(rollouts) / seconds,
-                    "time/learner/output_tokens_per_second": sum(r.num_output_tokens for r in rollouts) / seconds,
-                    "time/actor/rollout_seconds": mean(rollout.rollout_seconds for rollout in rollouts),
+                    "time/learner/rollouts_per_second": num_rollouts / seconds,
+                    "time/learner/output_tokens_per_second": batch.num_output_tokens / seconds,
                     "time/learner/batch_fetch_seconds": fetched - started,
                     "time/learner/update_seconds": optimized - fetched,
                     "time/learner/weight_transfer_seconds": now - optimized,
@@ -686,7 +728,7 @@ class Learner:
                     scalars["time/learner/weight_transfer_seconds"],
                 )
                 if iteration % 10 == 0:
-                    examples = format_rollout_examples(batch.groups, step=iteration)
+                    examples = f"Rollout examples | step {iteration}\n\n{batch.examples}"
                     logger.info("\n%s", examples)
                     writer.log_text(examples, f"examples/{iteration}.txt")
                 writer.log_metrics(scalars, step=iteration)
@@ -705,12 +747,11 @@ class Learner:
         batch = result.value
         logger.info(
             "Ray transfer Batcher -> Learner: groups=%s seconds=%.6f",
-            len(batch.groups),
+            num_groups,
             seconds,
         )
-        return RolloutBatch(
-            groups=batch.groups,
-            training_batch=batch.training_batch,
+        return replace(
+            batch,
             transfer_metrics={**batch.transfer_metrics, "time/learner/batcher_to_learner_seconds": seconds},
         )
 
@@ -786,6 +827,8 @@ class Actor:
             self.tasks = list(AdditionTaskset(config=vf.TasksetConfig()))
         logger.info("Starting actor and vLLM on its assigned GPU")
         with self._server as resources:
+            if isinstance(config.taskset, CodeGymConfig) and config.taskset.server is not None:
+                resources.enter_context(serve_codegym(config.taskset.server, config.taskset.manager_url))
             server = resources.enter_context(serve_vllm(model=config.model))
             wait_for_server(server)
             self._server = resources.pop_all()
