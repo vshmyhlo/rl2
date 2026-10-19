@@ -1,13 +1,15 @@
 {
   "uid": "gpu-overview",
-  "title": "A100 GPU monitoring",
-  "description": "Live NVIDIA GPU telemetry. Refreshes every 15 seconds; up to seven days of history.",
+  "title": "A100 GPU and host monitoring",
+  "description": "Live NVIDIA GPU, host CPU, and RAM telemetry. Refreshes every 15 seconds; up to seven days of history.",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "editable": false,
   "tags": [
     "GPU",
-    "NVIDIA"
+    "NVIDIA",
+    "CPU",
+    "RAM"
   ],
   "timezone": "browser",
   "refresh": "15s",
@@ -177,6 +179,180 @@
       }
     },
     {
+      "id": 11,
+      "title": "Host CPU utilization",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 12,
+        "h": 5
+      },
+      "targets": [
+        {
+          "expr": "100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area"
+      },
+      "description": "Non-idle CPU time averaged across all logical CPUs."
+    },
+    {
+      "id": 12,
+      "title": "Host RAM utilization",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 5,
+        "w": 12,
+        "h": 5
+      },
+      "targets": [
+        {
+          "expr": "100 * (1 - node_memory_MemAvailable_bytes{job=\"node\"} / node_memory_MemTotal_bytes{job=\"node\"})",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area"
+      },
+      "description": "Percentage of total RAM unavailable for new allocations."
+    },
+    {
+      "id": 13,
+      "title": "Host CPU usage history",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "description": "Non-idle CPU time averaged across all logical CPUs."
+    },
+    {
+      "id": 14,
+      "title": "Host RAM usage",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 10,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "node_memory_MemTotal_bytes{job=\"node\"} - node_memory_MemAvailable_bytes{job=\"node\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}} used"
+        },
+        {
+          "expr": "node_memory_MemTotal_bytes{job=\"node\"}",
+          "refId": "B",
+          "legendFormat": "{{instance}} total"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "description": "Used RAM is total minus available memory, excluding reclaimable cache."
+    },
+    {
       "id": 5,
       "title": "GPU and memory bandwidth utilization",
       "type": "timeseries",
@@ -186,7 +362,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 5,
+        "y": 18,
         "w": 12,
         "h": 8
       },
@@ -232,7 +408,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 5,
+        "y": 18,
         "w": 12,
         "h": 8
       },
@@ -278,7 +454,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 13,
+        "y": 26,
         "w": 12,
         "h": 8
       },
@@ -324,7 +500,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 13,
+        "y": 26,
         "w": 12,
         "h": 8
       },
@@ -365,7 +541,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 21,
+        "y": 34,
         "w": 12,
         "h": 8
       },
@@ -411,7 +587,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 21,
+        "y": 34,
         "w": 12,
         "h": 8
       },

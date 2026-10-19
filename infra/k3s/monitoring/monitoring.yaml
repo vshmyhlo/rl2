@@ -64,7 +64,24 @@ spec:
     kube-state-metrics:
       enabled: false
     prometheus-node-exporter:
-      enabled: false
+      enabled: true
+      fullnameOverride: node-exporter
+      nodeSelector:
+        kubernetes.io/hostname: vlad-dev-gpu-1
+      hostNetwork: false
+      hostPID: false
+      hostRootFsMount:
+        enabled: false
+      extraArgs:
+        - --collector.disable-defaults
+        - --collector.cpu
+        - --collector.meminfo
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          memory: 128Mi
     prometheus-pushgateway:
       enabled: false
     server:
@@ -106,6 +123,11 @@ spec:
       - job_name: nvidia-gpu
         static_configs:
           - targets: [dcgm-exporter.monitoring.svc.cluster.local:9400]
+      - job_name: node
+        static_configs:
+          - targets: [node-exporter.monitoring.svc.cluster.local:9100]
+            labels:
+              instance: vlad-dev-gpu-1
 ---
 apiVersion: helm.cattle.io/v1
 kind: HelmChart

@@ -3,7 +3,7 @@ taskset:
   id: toolrl
   # Official train split, pinned to an upstream revision. A local Parquet path also works.
   dataset_file: https://raw.githubusercontent.com/qiancheng0/ToolRL/8cee13ec0ca72f0461da372a93a6fd8140dbb840/dataset/rlla_4k/train.parquet
-seed: 3
+seed: 4
 num_groups: 4
 group_size: 8
 total_iterations: null
@@ -13,8 +13,9 @@ temperature: 1.0
 learning_rate: 0.000001
 clip_coef: 0.2
 max_grad_norm: 1.0
-microbatch_size: 4
 update_epochs: 1
+minibatches_per_epoch: 1
+grad_accum_steps: 8
 weight_update_pause_mode: wait # wait, abort, or keep in-flight vLLM requests
 run_id: grpo_v2_toolrl_${path_name:${model}}_seed${seed}
 ckpt_dir: /runs/grpo_v2/${run_id} # Reserved; checkpointing is not implemented yet

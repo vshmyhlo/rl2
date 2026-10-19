@@ -208,18 +208,22 @@ data; no W&B server is running.
 
 See [MLflow tracking server documentation](https://mlflow.org/docs/latest/self-hosting/architecture/tracking-server/).
 
-## GPU monitoring
+## GPU and host monitoring
 
 Grafana shows the A100's utilization, memory bandwidth utilization, used/total
-VRAM, temperatures, power draw, SM/memory clocks, and uncorrectable ECC errors. NVIDIA
-DCGM Exporter collects every 10 seconds; Prometheus scrapes every 15 seconds
+VRAM, temperatures, power draw, SM/memory clocks, and uncorrectable ECC errors.
+Node Exporter adds host CPU utilization and RAM utilization/used/total history.
+CPU usage averages non-idle time across logical CPUs; used RAM is total minus
+available memory, excluding reclaimable cache. NVIDIA DCGM Exporter collects
+every 10 seconds; Prometheus scrapes both exporters every 15 seconds
 and retains up to seven days or 4 GB of metrics, whichever limit is reached
 first. Grafana and Prometheus have separate persistent volumes.
 
 ```bash
 sudo k3s kubectl apply -k infra/k3s/monitoring
-sudo k3s kubectl -n monitoring wait --for=create daemonset/dcgm-exporter deployment/gpu-prometheus deployment/gpu-grafana --timeout=180s
+sudo k3s kubectl -n monitoring wait --for=create daemonset/dcgm-exporter daemonset/node-exporter deployment/gpu-prometheus deployment/gpu-grafana --timeout=180s
 sudo k3s kubectl -n monitoring rollout status daemonset/dcgm-exporter --timeout=180s
+sudo k3s kubectl -n monitoring rollout status daemonset/node-exporter --timeout=180s
 sudo k3s kubectl -n monitoring rollout status deployment/gpu-prometheus --timeout=180s
 sudo k3s kubectl -n monitoring rollout status deployment/gpu-grafana --timeout=180s
 sudo k3s kubectl -n monitoring port-forward --address=127.0.0.1 service/gpu-grafana 8082:80
@@ -250,6 +254,9 @@ The exporter reads the kubelet's pod-resource socket for GPU assignment labels;
 those labels identify GPU assignments for training Pods scheduled through the
 NVIDIA device plugin. It uses the existing NVIDIA runtime and basic DCGM counters
 without additional Linux capabilities.
+Node Exporter collects only CPU and memory metrics from the host's read-only
+`/proc` and `/sys` mounts, without host networking or a root filesystem mount.
+Its static scrape target is pinned to `vlad-dev-gpu-1`, matching its node selector.
 
 ```bash
 sudo k3s kubectl -n monitoring get pods,pvc

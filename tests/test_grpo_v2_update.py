@@ -190,8 +190,8 @@ def test_token_log_probs_shift_temperature_and_padding(state: TrainState, batch:
 def test_accumulated_update_matches_full_batch_and_improves_policy(
     state: TrainState, batch: training.GRPOBatch
 ) -> None:
-    accumulated, metrics = training.update(state, batch, microbatch_size=1, temperature=0.7, clip_coef=0.2)
-    full, full_metrics = training.update(state, batch, microbatch_size=2, temperature=0.7, clip_coef=0.2)
+    accumulated, metrics = training.update(state, batch, grad_accum_steps=2, temperature=0.7, clip_coef=0.2)
+    full, full_metrics = training.update(state, batch, grad_accum_steps=1, temperature=0.7, clip_coef=0.2)
     assert int(accumulated.step) == int(full.step) == 1
     for actual, expected in zip(jax.tree.leaves(accumulated), jax.tree.leaves(full), strict=True):
         assert actual.shape == expected.shape
@@ -212,26 +212,76 @@ def test_update_logs_only_new_traces(
 ) -> None:
     # A unique callable isolates this test's JIT cache without clearing other tests' entries.
     state = state.replace(apply_fn=partial(state.apply_fn))
-    trace = partial(training.update.lower, state, microbatch_size=1, temperature=0.7, clip_coef=0.2)
+    trace = partial(training.update.lower, state, grad_accum_steps=2, temperature=0.7, clip_coef=0.2)
     caplog.set_level(logging.INFO, logger=training.__name__)
     trace(batch)
     trace(batch)
-    assert caplog.messages == ["JIT trace update: batch_shape=(2, 8) microbatch_size=1 temperature=0.7 clip_coef=0.2"]
+    assert caplog.messages == ["JIT trace update: batch_shape=(2, 8) grad_accum_steps=2 temperature=0.7 clip_coef=0.2"]
     caplog.clear()
     shorter = jax.tree.map(lambda value: value[:, :5] if value.ndim == 2 else value, batch)  # (B, 5), (B,).
     trace(shorter)
     trace(batch)
-    assert caplog.messages == ["JIT trace update: batch_shape=(2, 5) microbatch_size=1 temperature=0.7 clip_coef=0.2"]
+    assert caplog.messages == ["JIT trace update: batch_shape=(2, 5) grad_accum_steps=2 temperature=0.7 clip_coef=0.2"]
 
 
 def test_zero_advantages_leave_fresh_optimizer_parameters_unchanged(
     state: TrainState, batch: training.GRPOBatch
 ) -> None:
     batch = batch._replace(advantages=jnp.zeros_like(batch.advantages))
-    updated, metrics = training.update(state, batch, microbatch_size=1, temperature=0.7, clip_coef=0.2)
+    updated, metrics = training.update(state, batch, grad_accum_steps=2, temperature=0.7, clip_coef=0.2)
     assert float(metrics["policy/grad_norm"]) == float(metrics["losses/policy"]) == 0.0
     for name in state.params:
         np.testing.assert_array_equal(updated.params[name], state.params[name])
+
+
+@pytest.mark.parametrize("grad_accum_steps", [0, 3], ids=["nonpositive", "indivisible"])
+def test_update_rejects_invalid_accumulation(
+    state: TrainState, batch: training.GRPOBatch, grad_accum_steps: int
+) -> None:
+    with pytest.raises(ValueError, match="grad_accum_steps must be positive and divide the minibatch size"):
+        training.update.lower(state, batch, grad_accum_steps=grad_accum_steps, temperature=0.7, clip_coef=0.2)
+
+
+@pytest.mark.parametrize("epochs,minibatches", [(1, 1), (2, 2)], ids=["default", "multiple-updates"])
+def test_learner_averages_all_update_metrics(
+    state: TrainState,
+    batch: training.GRPOBatch,
+    monkeypatch: pytest.MonkeyPatch,
+    epochs: int,
+    minibatches: int,
+) -> None:
+    learner = training.Learner.__ray_metadata__.modified_class(
+        batcher=Mock(),
+        actor=Mock(),
+        config=training.Config(group_size=2, update_epochs=epochs, minibatches_per_epoch=minibatches),
+    )
+    learner.mesh = Mesh(devices=np.array([jax.devices()[0]]), axis_names=("batch",))
+    learner.state = state
+
+    def update(
+        current: TrainState, minibatch: training.GRPOBatch, **kwargs: Any
+    ) -> tuple[TrainState, training.Metrics]:
+        assert minibatch.token_ids.shape == (2 // minibatches, 8)
+        assert minibatch.advantages.shape == (2 // minibatches,)
+        assert kwargs["grad_accum_steps"] == 1
+        return current.replace(step=current.step + 1), {"losses/policy": jnp.asarray(current.step)}  # () metric.
+
+    monkeypatch.setattr(training, "update", update)
+    metrics = learner.optimize(batch)
+    steps = epochs * minibatches
+    assert int(learner.state.step) == steps
+    assert metrics == {"losses/policy": (steps - 1) / 2}
+
+
+def test_learner_rejects_indivisible_rollout_batch(state: TrainState, batch: training.GRPOBatch) -> None:
+    learner = training.Learner.__ray_metadata__.modified_class(
+        batcher=Mock(), actor=Mock(), config=training.Config(group_size=6, minibatches_per_epoch=3)
+    )
+    learner.mesh = Mesh(devices=np.array([jax.devices()[0]]), axis_names=("batch",))
+    learner.state = state
+    with pytest.raises(ValueError, match="minibatches_per_epoch must divide the rollout batch size"):
+        learner.optimize(batch)
+    assert int(learner.state.step) == 0
 
 
 def test_learner_optimizes_and_publishes_updated_bf16_weights(
@@ -244,26 +294,32 @@ def test_learner_optimizes_and_publishes_updated_bf16_weights(
     learner = training.Learner.__ray_metadata__.modified_class(
         batcher=Mock(),
         actor=Mock(),
-        config=training.Config(temperature=0.7, microbatch_size=2, update_epochs=2),
+        config=training.Config(temperature=0.7, grad_accum_steps=2, minibatches_per_epoch=2, update_epochs=2),
     )
     learner.model = model.clone(dtype="bfloat16", param_dtype=jnp.bfloat16)
     learner.mesh = Mesh(devices=np.array([jax.devices()[0]]), axis_names=("batch",))
     learner.state = training.create_state(learner.model, state.params, training.Config(learning_rate=0.01))
     learner._transfer_group = Mock()
-    batch = batcher.prepare_batch(groups, context_length=8)
+    groups = groups + [replace(groups[0], rollouts=list(reversed(groups[0].rollouts)))]
+    batch = batcher.prepare_batch(groups, context_length=8)  # (B=4, T=8), (B,) leaves.
     old = training.token_log_probs(learner.state, learner.state.params, batch, temperature=0.7)  # (B, T-1)
-    assert old.shape == (2, 7)
+    assert old.shape == (4, 7)
     assert old.dtype == jnp.float32
     batch = batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))
     update = Mock(wraps=training.update)
     monkeypatch.setattr(training, "update", update)
     metrics = learner.optimize(batch)
-    placed_batch = update.call_args.args[1]  # (B=2, T=8), (B,) leaves.
-    for placed, original in zip(placed_batch, batch, strict=True):
-        assert placed.shape == original.shape
-        assert placed.sharding == NamedSharding(learner.mesh, PartitionSpec("batch"))
-        np.testing.assert_array_equal(placed, original)
-    assert int(learner.state.step) == 2
+    assert update.call_count == 4
+    for index, call in enumerate(update.call_args_list):
+        assert int(call.args[0].step) == index
+        assert call.kwargs["grad_accum_steps"] == 2
+        placed_batch = call.args[1]  # (B/N=2, T=8), (B/N,) leaves.
+        start = (index % 2) * 2
+        for placed, original in zip(placed_batch, batch, strict=True):
+            assert placed.shape == (2, *original.shape[1:])
+            assert placed.sharding == NamedSharding(learner.mesh, PartitionSpec("batch"))
+            np.testing.assert_array_equal(placed, original[start : start + 2])
+    assert int(learner.state.step) == 4
     assert metrics["policy/grad_norm"] > 0
     assert all(isinstance(value, float) for value in metrics.values())
     for name, value in learner.state.params.items():  # HF parameter shapes.

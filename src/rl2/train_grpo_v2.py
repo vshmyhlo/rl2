@@ -8,7 +8,7 @@ Startup scalars (step 0):
     model/params_millions: Model parameter count in millions.
     time/learner/setup_seconds: Model loading, optimizer setup, NCCL initialization, and initial weight publication wall time.
 
-Optimization scalars (averaged over update epochs):
+Optimization scalars (averaged over minibatches and update epochs):
     losses/policy: Clipped GRPO policy loss.
     policy/approx_kl: Mean exp(log_ratio) - 1 - log_ratio, where log_ratio is learner minus sampling log-probability.
     policy/clip_fraction: Fraction of sampled-token probability ratios outside the clip range.
@@ -30,7 +30,7 @@ absent from a later batch.
 
 Training progress and settings:
     charts/total_iterations: Cumulative completed training iterations.
-    charts/total_updates: Cumulative optimizer updates; update_epochs updates per iteration.
+    charts/total_updates: Cumulative optimizer updates; update_epochs * minibatches_per_epoch per iteration.
     charts/total_rollouts: Cumulative rollouts used for training.
     charts/learning_rate: Configured optimizer learning rate.
 
@@ -143,8 +143,9 @@ class Config(BaseConfig):
     learning_rate: Annotated[float, Field(gt=0)] = 1e-6
     clip_coef: Annotated[float, Field(gt=0, lt=1)] = 0.2
     max_grad_norm: Annotated[float, Field(gt=0)] = 1.0
-    microbatch_size: Annotated[int, Field(ge=1)] = 4
     update_epochs: Annotated[int, Field(ge=1)] = 1
+    minibatches_per_epoch: Annotated[int, Field(ge=1)] = 1
+    grad_accum_steps: Annotated[int, Field(ge=1)] = 1
     gradient_checkpointing: bool = True
     # In-flight vLLM requests during weight updates (individual requests, not multi-turn rollout groups):
     # wait: finish requests before applying weights (default).
@@ -153,8 +154,8 @@ class Config(BaseConfig):
     weight_update_pause_mode: Literal["wait", "abort", "keep"] = "wait"
 
     def __post_init__(self) -> None:
-        if self.num_groups * self.group_size % self.microbatch_size:
-            raise ValueError("microbatch_size must divide num_groups * group_size")
+        if self.num_groups * self.group_size % (self.minibatches_per_epoch * self.grad_accum_steps):
+            raise ValueError("minibatches_per_epoch * grad_accum_steps must divide num_groups * group_size")
         if self.taskset.id == "toolrl" and self.max_turns != 1:
             raise ValueError("ToolRL requires max_turns=1; tool calls are graded without execution")
 
@@ -276,29 +277,29 @@ def create_state(model: Qwen3LM, params: Parameters, config: Config) -> TrainSta
     )
 
 
-@partial(jax.jit, static_argnames=("microbatch_size", "temperature", "clip_coef"))
+@partial(jax.jit, static_argnames=("grad_accum_steps", "temperature", "clip_coef"))
 def update(
     state: TrainState,
-    batch: GRPOBatch,
+    batch: GRPOBatch,  # One optimizer minibatch: (B, T), (B,) leaves.
     *,
-    microbatch_size: int,
+    grad_accum_steps: int,
     temperature: float,
     clip_coef: float,
 ) -> tuple[TrainState, Metrics]:
-    if batch.token_ids.shape[0] % microbatch_size:
-        raise ValueError("microbatch_size must divide the rollout batch size")
+    if grad_accum_steps < 1 or batch.token_ids.shape[0] % grad_accum_steps:
+        raise ValueError("grad_accum_steps must be positive and divide the minibatch size")
     # Python logging runs on tracing, not on cached executions.
     logger.info(
-        "JIT trace update: batch_shape=%s microbatch_size=%s temperature=%s clip_coef=%s",
+        "JIT trace update: batch_shape=%s grad_accum_steps=%s temperature=%s clip_coef=%s",
         batch.token_ids.shape,
-        microbatch_size,
+        grad_accum_steps,
         temperature,
         clip_coef,
     )
-    count = batch.token_ids.shape[0] // microbatch_size
+    microbatch_size = batch.token_ids.shape[0] // grad_accum_steps
     microbatches = jax.tree.map(
-        lambda value: value.reshape(count, microbatch_size, *value.shape[1:]), batch
-    )  # (M, B/M, T); advantages: (M, B/M).
+        lambda value: value.reshape(grad_accum_steps, microbatch_size, *value.shape[1:]), batch
+    )  # (A, B/A, T); advantages: (A, B/A). A = grad_accum_steps.
 
     def accumulate(grads: Parameters, microbatch: GRPOBatch) -> tuple[Parameters, Metrics]:
         def loss_fn(params: Parameters) -> tuple[jax.Array, Metrics]:  # (), scalar metric leaves
@@ -309,8 +310,8 @@ def update(
 
     gradients, metrics = jax.lax.scan(
         accumulate, jax.tree.map(jnp.zeros_like, state.params), microbatches
-    )  # HF parameter shapes; metric leaves: (M,).
-    gradients = jax.tree.map(lambda value: value / count, gradients)  # HF parameter shapes.
+    )  # HF parameter shapes; metric leaves: (A,).
+    gradients = jax.tree.map(lambda value: value / grad_accum_steps, gradients)  # HF parameter shapes.
     metrics = jax.tree.map(jnp.mean, metrics)  # Scalar leaves.
     metrics["policy/grad_norm"] = optax.global_norm(gradients)  # () Before clipping.
     return state.apply_gradients(grads=gradients), metrics
@@ -721,16 +722,23 @@ class Learner:
 
     def optimize(self, batch: GRPOBatch) -> dict[str, float]:  # Batch leaves: (B, T), (B,).
         batch = jax.device_put(batch, NamedSharding(self.mesh, PartitionSpec("batch")))  # (B, T), (B,) leaves.
+        if batch.token_ids.shape[0] % self.config.minibatches_per_epoch:
+            raise ValueError("minibatches_per_epoch must divide the rollout batch size")
+        minibatch_size = batch.token_ids.shape[0] // self.config.minibatches_per_epoch
         history: list[Metrics] = []
         for _ in range(self.config.update_epochs):
-            self.state, metrics = update(
-                self.state,
-                batch,
-                microbatch_size=self.config.microbatch_size,
-                temperature=self.config.temperature,
-                clip_coef=self.config.clip_coef,
-            )
-            history.append(metrics)
+            for start in range(0, batch.token_ids.shape[0], minibatch_size):
+                minibatch = jax.tree.map(
+                    lambda value, start=start: value[start : start + minibatch_size], batch
+                )  # (B/N, T), (B/N,) leaves; N = minibatches_per_epoch.
+                self.state, metrics = update(
+                    self.state,
+                    minibatch,
+                    grad_accum_steps=self.config.grad_accum_steps,
+                    temperature=self.config.temperature,
+                    clip_coef=self.config.clip_coef,
+                )
+                history.append(metrics)
         metrics = jax.tree.map(lambda *values: jnp.stack(values).mean(), *history)  # Scalar leaves.
         return {name: float(value) for name, value in metrics.items()}
 
