@@ -4,12 +4,14 @@ import json
 import pickle
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock
 from urllib.error import URLError
 
 import httpx
+import numpy as np
 import pytest
 import renderers.base as renderer_base
 import verifiers.v1 as vf
@@ -92,9 +94,101 @@ def test_wait_for_server_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def actor(monkeypatch: pytest.MonkeyPatch) -> Any:
-    actor = training.Actor.__ray_metadata__.modified_class(batcher=Mock(), group_size=2)
+    monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
+    monkeypatch.setattr(training, "wait_for_server", Mock())
+    actor = training.Actor.__ray_metadata__.modified_class(group_size=2)
     monkeypatch.setattr(training.random, "choice", Mock(return_value=actor.tasks[0]))
     return actor
+
+
+@pytest.mark.parametrize("startup_fails", [False, True])
+def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    server = MagicMock()
+    serve = Mock(return_value=server)
+    monkeypatch.setattr(training, "serve_vllm", serve)
+    ready = Mock(side_effect=TimeoutError("not ready") if startup_fails else None)
+    monkeypatch.setattr(training, "wait_for_server", ready)
+    group = training.RolloutGroup(task_id="0", prompt="test", rollouts=[])
+
+    if startup_fails:
+        with pytest.raises(TimeoutError, match="not ready"):
+            training.Actor.__ray_metadata__.modified_class(group_size=2)
+    else:
+        actor = training.Actor.__ray_metadata__.modified_class(group_size=2)
+        actor.collect_group = Mock(return_value=group)
+        monkeypatch.setattr(training.random, "choice", Mock(return_value=actor.tasks[0]))
+        for _ in range(2):
+            assert actor.fetch_next_group() is group
+        actor.collect_group.assert_called_with(actor.tasks[0])
+        assert actor.collect_group.call_count == 2
+        server.__exit__.assert_not_called()
+        actor.__ray_shutdown__()
+    serve.assert_called_once_with()
+    ready.assert_called_once_with()
+    server.__enter__.assert_called_once()
+    server.__exit__.assert_called_once()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_learner_pulls_group_through_batcher(fails: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    actor = Mock()
+    group = training.RolloutGroup(task_id="0", prompt="test", rollouts=[])
+    actor.fetch_next_group.remote.side_effect = RuntimeError("rollout failed") if fails else None
+    actor.fetch_next_group.remote.return_value = group
+    batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor)
+    batcher_handle = Mock()
+    batcher_handle.fetch_next_batch.remote.side_effect = batcher.fetch_next_batch
+    learner = training.Learner.__ray_metadata__.modified_class(batcher=batcher_handle)
+
+    def get(result: Any) -> Any:
+        return result
+
+    monkeypatch.setattr(training.ray, "get", get)
+
+    if fails:
+        with pytest.raises(RuntimeError, match="rollout failed"):
+            learner.fetch_next_batch()
+    else:
+        assert learner.fetch_next_batch() is group
+    batcher_handle.fetch_next_batch.remote.assert_called_once_with()
+    actor.fetch_next_group.remote.assert_called_once_with()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_main_gracefully_terminates_actor(fails: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    actor, batcher, learner = Mock(), Mock(), Mock()
+    actor.__ray_terminate__ = Mock()
+    monkeypatch.setattr(training, "Actor", Mock(remote=Mock(return_value=actor)))
+    monkeypatch.setattr(training, "Batcher", Mock(remote=Mock(return_value=batcher)))
+    monkeypatch.setattr(training, "Learner", Mock(remote=Mock(return_value=learner)))
+    monkeypatch.setattr(training.ray, "init", MagicMock())
+    get = Mock()
+    monkeypatch.setattr(training.ray, "get", get)
+    wait = Mock()
+    monkeypatch.setattr(training.ray, "wait", wait)
+
+    def start_learner() -> Any:
+        training.Actor.remote.assert_called_once_with()
+        if fails:
+            raise RuntimeError("training failed")
+        return learner.start.remote.return_value
+
+    learner.start.remote.side_effect = start_learner
+    if fails:
+        with pytest.raises(RuntimeError, match="training failed"):
+            training.main()
+    else:
+        training.main()
+    training.Actor.remote.assert_called_once_with()
+    training.Batcher.remote.assert_called_once_with(actor=actor)
+    training.Learner.remote.assert_called_once_with(batcher=batcher)
+    actor.start.remote.assert_not_called()
+    actor.__ray_terminate__.remote.assert_called_once_with()
+    wait.assert_called_once_with([actor.__ray_terminate__.remote.return_value])
+    if fails:
+        get.assert_not_called()
+    else:
+        get.assert_called_once_with(learner.start.remote.return_value)
 
 
 def test_environment_examples(actor: Any) -> None:
@@ -141,11 +235,11 @@ def test_correct_answer(reply: str, reward: float, actor: Any) -> None:
 @pytest.mark.parametrize("size", [0, 1])
 def test_group_requires_multiple_rollouts(size: int) -> None:
     with pytest.raises(ValueError, match="group_size"):
-        training.Actor.__ray_metadata__.modified_class(batcher=Mock(), group_size=size)
+        training.Actor.__ray_metadata__.modified_class(group_size=size)
 
 
 @pytest.mark.parametrize("failure", [None, "rollout", "score", "tokens"])
-def test_actor_submits_only_complete_groups(failure: str | None, actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_actor_returns_only_complete_groups(failure: str | None, actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     task = actor.tasks[0]
     traces = [
         vf.Trace(
@@ -186,43 +280,24 @@ def test_actor_submits_only_complete_groups(failure: str | None, actor: Any, mon
 
     env.run.side_effect = run
     monkeypatch.setattr(training, "create_agent", Mock(return_value=env))
-    remote = Mock()
-    monkeypatch.setattr(training.ray, "remote", remote)
-    monkeypatch.setattr(training.ray, "get", Mock())
-
-    server = MagicMock()
-    serve = Mock(return_value=server)
-    monkeypatch.setattr(training, "serve_vllm", serve)
-
-    def check_server_started() -> None:
-        serve.assert_called_once_with()
-        server.__enter__.assert_called_once_with()
-        remote.assert_not_called()
-
-    monkeypatch.setattr(training, "wait_for_server", Mock(side_effect=check_server_started))
-    actor.fetch_next_prompt = Mock(side_effect=[task, StopIteration])
-    error = {None: StopIteration, "rollout": RuntimeError, "score": ValueError, "tokens": ValueError}[failure]
-    with pytest.raises(error):
-        actor.start()
+    if failure:
+        with pytest.raises(RuntimeError if failure == "rollout" else ValueError):
+            actor.fetch_next_group()
+    else:
+        group = actor.fetch_next_group()
     assert len(seen) == actor.group_size
     assert seen[0] is not seen[1] and all(sample is not task for sample in seen)
     assert all(sample.data == task.data and sample.scoring_deferred for sample in seen)
     assert not task.scoring_deferred
     env.__aexit__.assert_awaited_once()
-    server.__exit__.assert_called_once()
-    submit = actor.batcher.submit_group.remote
-    if failure:
-        submit.assert_not_called()
-    else:
-        submit.assert_called_once()
-        group = submit.call_args.args[0]
+    if not failure:
         assert group.task_id == task.data.id
         assert [rollout.reward for rollout in group.rollouts] == [1.0, 0.0]
         assert [rollout.advantage for rollout in group.rollouts] == pytest.approx([1.0, -1.0], abs=3e-4)
         assert group.prompt == task.data.prompt_text
         assert [rollout.completion for rollout in group.rollouts] == ["42", "41"]
-        assert [rollout.sequence.token_ids for rollout in group.rollouts] == [[42], [41]]
-        assert pickle.loads(pickle.dumps(group)) == group
+        np.testing.assert_array_equal([rollout.sequence.token_ids for rollout in group.rollouts], [[42], [41]])
+        np.testing.assert_equal(asdict(pickle.loads(pickle.dumps(group))), asdict(group))
 
 
 @pytest.fixture
@@ -258,13 +333,19 @@ def token_trace(actor: Any) -> vf.Trace:
     )
 
 
-def test_training_sequence_preserves_tokens_and_masks_context(token_trace: vf.Trace) -> None:
+@pytest.mark.parametrize("turns", [1, 2], ids=["single-turn", "multi-turn"])
+def test_training_sequence_preserves_tokens_and_masks_context(token_trace: vf.Trace, turns: int) -> None:
+    token_trace.nodes = token_trace.nodes[: 2 * turns]
+    length = 2 if turns == 1 else 5
     sequence = training.training_sequence(token_trace)
-    assert sequence.token_ids == [10, 20, 30, 40, 41]
-    assert sequence.loss_mask == [False, True, False, True, True]
-    assert sequence.old_log_probs == [0.0, -0.2, 0.0, -0.4, -0.5]
-    assert len(sequence.token_ids) == len(sequence.loss_mask) == len(sequence.old_log_probs)
-    assert pickle.loads(pickle.dumps(sequence)) == sequence
+    np.testing.assert_array_equal(sequence.token_ids, [10, 20, 30, 40, 41][:length])
+    np.testing.assert_array_equal(sequence.loss_mask, [False, True, False, True, True][:length])
+    np.testing.assert_allclose(sequence.old_log_probs, [0.0, -0.2, 0.0, -0.4, -0.5][:length])
+    assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape == (length,)
+    assert sequence.token_ids.dtype == np.int32
+    assert sequence.loss_mask.dtype == np.bool_
+    assert sequence.old_log_probs.dtype == np.float32
+    np.testing.assert_equal(asdict(pickle.loads(pickle.dumps(sequence))), asdict(sequence))
 
 
 @pytest.mark.parametrize(
@@ -442,12 +523,10 @@ def test_verifiers_tool_rollout(
             assert rollout.reward == (1.0 if mode == "success" else 0.0)
             assert rollout.advantage == 0.0
             sequence = rollout.sequence
-            assert len(sequence.token_ids) == len(sequence.loss_mask) == len(sequence.old_log_probs)
-            assert rollout.num_input_tokens == len(sequence.token_ids) - sum(sequence.loss_mask)
-            assert [
-                token for token, train in zip(sequence.token_ids, sequence.loss_mask, strict=True) if train
-            ] == expected_samples
-            assert sequence.old_log_probs == [-0.2 if train else 0.0 for train in sequence.loss_mask]
+            assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
+            assert rollout.num_input_tokens == len(sequence.token_ids) - sequence.loss_mask.sum()
+            np.testing.assert_array_equal(sequence.token_ids[sequence.loss_mask], expected_samples)
+            np.testing.assert_allclose(sequence.old_log_probs, np.where(sequence.loss_mask, -0.2, 0.0))
             if mode == "success":
                 assert rollout.completion == "42"
                 assert rollout.stop_condition == "agent_completed"
@@ -463,7 +542,7 @@ def test_verifiers_tool_rollout(
             assert observations and all(
                 "required" in observation.lower() and "b" in observation for observation in observations
             )
-        assert pickle.loads(pickle.dumps(group)) == group
+        np.testing.assert_equal(asdict(pickle.loads(pickle.dumps(group))), asdict(group))
     assert clients and all(client.is_closed for client in clients)
     assert requests[0]["model"] == training.MODEL
     assert requests[0]["sampling_params"]["max_tokens"] == 512

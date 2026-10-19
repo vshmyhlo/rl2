@@ -5,16 +5,17 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import ray
 import verifiers.v1 as vf
+from numpy.typing import NDArray
 from ray.actor import ActorHandle
 from verifiers.v1.configs.agent import TimeoutConfig
 
@@ -28,9 +29,9 @@ SERVER_URL = "http://127.0.0.1:8000"
 
 @dataclass(frozen=True)
 class TrainingSequence:
-    token_ids: list[int]  # (T,) Exact context and generated tokens in one sequence.
-    loss_mask: list[bool]  # (T,) Train on sampled tokens only; exclude prompts and tool results.
-    old_log_probs: list[float]  # (T,) Sampling-policy log-probabilities; ignored where loss_mask is False.
+    token_ids: NDArray[np.int32]  # (T,) Exact context and generated tokens in one sequence.
+    loss_mask: NDArray[np.bool_]  # (T,) Train on sampled tokens only; exclude prompts and tool results.
+    old_log_probs: NDArray[np.float32]  # (T,) Sampling-policy log-probabilities; ignored where loss_mask is False.
 
 
 @dataclass(frozen=True)
@@ -69,9 +70,9 @@ def training_sequence(trace: vf.Trace) -> TrainingSequence:
         if len(node.logprobs) != sum(node.mask):
             raise ValueError("Each sampled token must have a log-probability")
     return TrainingSequence(
-        token_ids=branch.token_ids,  # (T,)
-        loss_mask=branch.sampled_mask,  # (T,)
-        old_log_probs=branch.logprobs,  # (T,)
+        token_ids=np.asarray(branch.token_ids, dtype=np.int32),  # (T,)
+        loss_mask=np.asarray(branch.sampled_mask, dtype=np.bool_),  # (T,)
+        old_log_probs=np.asarray(branch.logprobs, dtype=np.float32),  # (T,)
     )
 
 
@@ -170,11 +171,12 @@ def wait_for_server(timeout: float = 600) -> None:
 
 @ray.remote
 class Batcher:
-    def submit_group(self, group: RolloutGroup) -> None:
-        logger.debug("Batcher received group of %s rollouts (buffering not implemented)", len(group.rollouts))
+    def __init__(self, actor: ActorHandle) -> None:
+        self.actor = actor
 
-    def fetch_next_batch(self) -> Any:
-        logger.debug("Batcher received batch request (batching not implemented)")
+    def fetch_next_batch(self) -> RolloutGroup:
+        logger.debug("Fetching rollout group from actor (one group per batch)")
+        return ray.get(self.actor.fetch_next_group.remote())
 
 
 @ray.remote(num_gpus=1)
@@ -189,11 +191,11 @@ class Learner:
             self.optimize(batch)
             self.publish_weights()
 
-    def fetch_next_batch(self) -> Any:
+    def fetch_next_batch(self) -> RolloutGroup:
         logger.debug("Fetching next batch from batcher")
         return ray.get(self.batcher.fetch_next_batch.remote())
 
-    def optimize(self, batch: Any) -> None:
+    def optimize(self, batch: RolloutGroup) -> None:
         logger.debug("Optimizing batch (placeholder)")
         time.sleep(1)
 
@@ -204,23 +206,23 @@ class Learner:
 
 @ray.remote(num_gpus=1)
 class Actor:
-    def __init__(self, batcher: ActorHandle, group_size: int = 4) -> None:
+    def __init__(self, group_size: int = 4) -> None:
         if group_size < 2:
             raise ValueError("group_size must be at least 2")
-        self.batcher = batcher
         self.group_size = group_size
         self.tasks = list(AdditionTaskset(config=vf.TasksetConfig()))
-
-    def start(self) -> None:
         logger.info("Starting actor and vLLM on its assigned GPU")
-        with serve_vllm():
+        with ExitStack() as resources:
+            resources.enter_context(serve_vllm())
             wait_for_server()
-            logger.info("Starting actor rollout loop")
-            while True:
-                example = self.fetch_next_prompt()
-                group = self.collect_group(example)
-                logger.debug("Submitting rollout group to batcher")
-                ray.get(self.batcher.submit_group.remote(group))
+            self._server = resources.pop_all()
+        logger.info("Actor ready for rollout requests")
+
+    def __ray_shutdown__(self) -> None:
+        self._server.close()
+
+    def fetch_next_group(self) -> RolloutGroup:
+        return self.collect_group(self.fetch_next_prompt())
 
     def fetch_next_prompt(self) -> AdditionTask:
         task = random.choice(self.tasks)
@@ -249,11 +251,14 @@ def main() -> None:
     # The HTTP endpoint is shared over loopback by workers on this node.
     with ray.init(address="local", logging_config=ray.LoggingConfig(log_level="INFO")):
         logger.info("Creating batcher, learner, and actor")
-        batcher = Batcher.remote()
+        actor = Actor.remote()
+        batcher = Batcher.remote(actor=actor)
         learner = Learner.remote(batcher=batcher)
-        actor = Actor.remote(batcher=batcher)
-        logger.info("Starting learner and actor")
-        ray.get([learner.start.remote(), actor.start.remote()])
+        try:
+            logger.info("Starting learner")
+            ray.get(learner.start.remote())
+        finally:
+            ray.wait([actor.__ray_terminate__.remote()])
 
 
 if __name__ == "__main__":
