@@ -7553,6 +7553,7 @@ dependencies = [
     { name = "pyopengl" },
     { name = "pytest" },
     { name = "pyyaml" },
+    { name = "ray", marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "reasoning-gym" },
     { name = "rlax" },
     { name = "robotarium-python-simulator" },
@@ -7570,7 +7571,6 @@ dependencies = [
 [package.optional-dependencies]
 bfcl = [
     { name = "bfcl-eval", marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "ray", marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "soundfile", marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "transformers", version = "5.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "vllm", marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -7617,7 +7617,7 @@ requires-dist = [
     { name = "pyopengl", specifier = ">=3.1.10,<4" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pyyaml", specifier = ">=6,<7" },
-    { name = "ray", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'bfcl'", specifier = ">=2.50,<3" },
+    { name = "ray", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=2.50,<3" },
     { name = "reasoning-gym", specifier = ">=0.1.25" },
     { name = "rlax", specifier = ">=0.1.8,<0.2" },
     { name = "robotarium-python-simulator", url = "https://github.com/shalin-jain/robotarium_python_simulator/archive/117043719147e8ab04a6332ae4abe9ce8511a762.tar.gz" },

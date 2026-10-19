@@ -42,6 +42,7 @@ dependencies = [
     "pyopengl>=3.1.10,<4",
     "pytest>=9.1.1",
     "pyyaml>=6,<7",
+    "ray>=2.50,<3; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
     "reasoning-gym>=0.1.25",
     "rlax>=0.1.8,<0.2",
     "ruff>=0.16.9",
@@ -61,7 +62,6 @@ dependencies = [
 
 [project.optional-dependencies]
 bfcl = [
-    "ray>=2.50,<3; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
     "bfcl-eval==2025.12.17; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
     "vllm==0.27.0; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
     "transformers>=5.5.3,<5.6; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",

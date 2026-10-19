@@ -24,5 +24,21 @@ class AdditionTask(vf.Task[AdditionData]):
         return float(trace.last_reply.strip() == str(self.data.answer))
 
 
+class AdditionTaskset(vf.Taskset[AdditionTask, vf.TasksetConfig]):
+    def load(self) -> list[AdditionTask]:
+        return [
+            AdditionTask(
+                data=AdditionData(
+                    id=str(index),
+                    prompt=f"What is {a} + {b}?",
+                    answer=a + b,
+                    system_prompt="Use the add tool, then reply with only the resulting integer.",
+                ),
+                config=self.config.task,
+            )
+            for index, (a, b) in enumerate([(17, 25), (8, 13), (0, 9), (-4, 7), (31, 12)])
+        ]
+
+
 if __name__ == "__main__":
     AdditionTools.run()

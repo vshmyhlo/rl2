@@ -18,7 +18,7 @@ import verifiers.v1 as vf
 from ray.actor import ActorHandle
 from verifiers.v1.configs.agent import TimeoutConfig
 
-from rl2.addition_env import AdditionData, AdditionTask
+from rl2.addition_env import AdditionTask, AdditionTaskset
 from rl2.utils import group_advantages
 
 logger = logging.getLogger(__name__)
@@ -27,17 +27,47 @@ SERVER_URL = "http://127.0.0.1:8000"
 
 
 @dataclass(frozen=True)
+class TrainingSequence:
+    token_ids: list[int]  # (T,) Exact context and generated tokens in one sequence.
+    loss_mask: list[bool]  # (T,) Train on sampled tokens only; exclude prompts, tools, and repeated prefixes.
+    old_log_probs: list[float]  # (T,) Sampling-policy log-probabilities; ignored where loss_mask is False.
+
+
+@dataclass(frozen=True)
 class Rollout:
-    trace: dict[str, Any]
-    reward: float
-    advantage: float
-    stop_condition: str | None
+    sequences: list[TrainingSequence]  # Training inputs; empty when the backend supplies no token data.
+    reward: float  # Total task reward before group normalization.
+    advantage: float  # (reward - group mean) / (population std + 1e-4).
+    completion: str  # Final assistant text for sample logging.
+    num_turns: int  # Number of model responses, including tool calls.
+    num_input_tokens: int  # Newly fed input tokens; a lower bound when context is rewritten.
+    num_output_tokens: int  # Total sampled tokens across model calls.
+    rollout_seconds: float  # Agent execution time, including model calls and tools.
+    stop_condition: str | None  # Verifiers termination reason; None if unspecified.
 
 
 @dataclass(frozen=True)
 class RolloutGroup:
-    task_id: str | None
-    rollouts: list[Rollout]
+    task_id: str | None  # Source task ID shared by the group; None if the task has no ID.
+    prompt: str  # Shared task prompt for sample logging.
+    rollouts: list[Rollout]  # Independent attempts at the same task, in sampling order, scored as one group.
+
+
+def training_sequences(trace: vf.Trace) -> list[TrainingSequence]:
+    sequences: list[TrainingSequence] = []
+    seen: set[int] = set()
+    for branch in trace.branches:
+        token_ids = branch.token_ids  # (T,)
+        if not branch.trainable or not token_ids:
+            continue
+        loss_mask: list[bool] = []  # (T,)
+        for node in branch.nodes:
+            # Shared prefixes remain context, but contribute to the loss only once.
+            loss_mask.extend([False] * len(node.mask) if id(node) in seen else node.mask)
+            seen.add(id(node))
+        if any(loss_mask):
+            sequences.append(TrainingSequence(token_ids=token_ids, loss_mask=loss_mask, old_log_probs=branch.logprobs))
+    return sequences
 
 
 async def score_group(task: AdditionTask, traces: list[vf.Trace]) -> RolloutGroup:
@@ -56,11 +86,17 @@ async def score_group(task: AdditionTask, traces: list[vf.Trace]) -> RolloutGrou
         advantages = group_advantages(rewards)  # (G,)
     return RolloutGroup(
         task_id=task.data.id,
+        prompt=task.data.prompt_text,
         rollouts=[
             Rollout(
-                trace=trace.to_record(float_decimals=None),
+                sequences=training_sequences(trace),
                 reward=trace.reward,
                 advantage=advantage,
+                completion=trace.last_reply,
+                num_turns=trace.num_turns,
+                num_input_tokens=trace.num_input_tokens,
+                num_output_tokens=trace.usage.completion_tokens if trace.usage is not None else 0,
+                rollout_seconds=trace.timing.agent.duration,
                 stop_condition=trace.stop_condition,
             )
             for trace, advantage in zip(traces, advantages.tolist(), strict=True)
@@ -68,8 +104,8 @@ async def score_group(task: AdditionTask, traces: list[vf.Trace]) -> RolloutGrou
     )
 
 
-def create_environment() -> vf.Agent:
-    return vf.Agent(
+def create_agent() -> vf.Agent:
+    return vf.make_agent(
         config=vf.AgentConfig(
             model=MODEL,
             harness=vf.HarnessConfig(id="null"),
@@ -169,17 +205,7 @@ class Actor:
             raise ValueError("group_size must be at least 2")
         self.batcher = batcher
         self.group_size = group_size
-        self.tasks = [
-            AdditionTask(
-                data=AdditionData(
-                    id=str(index),
-                    prompt=f"What is {a} + {b}?",
-                    answer=a + b,
-                    system_prompt="Use the add tool, then reply with only the resulting integer.",
-                )
-            )
-            for index, (a, b) in enumerate([(17, 25), (8, 13), (0, 9), (-4, 7), (31, 12)])
-        ]
+        self.tasks = list(AdditionTaskset(config=vf.TasksetConfig()))
 
     def start(self) -> None:
         logger.info("Starting actor and vLLM on its assigned GPU")
@@ -201,8 +227,8 @@ class Actor:
         logger.debug("Collecting %s rollouts for task %s", self.group_size, task.data.id)
 
         async def collect() -> RolloutGroup:
-            async with create_environment() as env, asyncio.TaskGroup() as pending:
-                runs = [pending.create_task(env.run(task.defer_scoring())) for _ in range(self.group_size)]
+            async with create_agent() as agent, asyncio.TaskGroup() as pending:
+                runs = [pending.create_task(agent.run(task.defer_scoring())) for _ in range(self.group_size)]
             group = await score_group(task, [run.result() for run in runs])
             logger.info(
                 "Collected group: task=%s rewards=%s advantages=%s",

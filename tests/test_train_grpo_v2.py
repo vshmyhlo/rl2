@@ -17,7 +17,7 @@ from verifiers.v1.runtimes import subprocess as subprocess_runtime
 from verifiers.v1.trace import AgentInfo, TraceTask
 
 from rl2 import train_grpo_v2 as training
-from rl2.addition_env import AdditionTools
+from rl2.addition_env import AdditionTaskset, AdditionTools
 
 
 @pytest.mark.parametrize("failure", [None, "launch", "rollout", "shutdown"])
@@ -98,6 +98,7 @@ def actor(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 def test_environment_examples(actor: Any) -> None:
     assert len(actor.tasks) == 5
+    assert [task.data.idx for task in actor.tasks] == list(range(5))
     assert [task.data.answer for task in actor.tasks] == [42, 21, 9, 3, 43]
     task = actor.fetch_next_prompt()
     assert task.data.id == "0"
@@ -105,11 +106,22 @@ def test_environment_examples(actor: Any) -> None:
     tools = task.toolsets(task.config)
     assert isinstance(tools[0], AdditionTools)
     assert asyncio.run(tools[0].add(a=17, b=25)) == 42
-    config = training.create_environment().config
+    agent = training.create_agent()
+    assert agent.harness.SUPPORTS_MCP
+    config = agent.config
     assert config.harness.id == "null"
     assert config.runtime.type == "subprocess"
     assert config.client.base_url == f"{training.SERVER_URL}/v1"
     assert config.max_turns == 3
+
+
+def test_taskset_applies_config_and_prompt_override(tmp_path: Path) -> None:
+    prompt = tmp_path / "system.txt"
+    prompt.write_text("Use the addition tool.")
+    config = vf.TasksetConfig(system_prompt=prompt)
+    tasks = list(AdditionTaskset(config=config))
+    assert all(task.config is config.task for task in tasks)
+    assert all(task.data.system_prompt == "Use the addition tool." for task in tasks)
 
 
 @pytest.mark.parametrize(("reply", "reward"), [(" 42\n", 1.0), ("41", 0.0), ("", 0.0)])
@@ -117,7 +129,7 @@ def test_correct_answer(reply: str, reward: float, actor: Any) -> None:
     task = actor.tasks[0]
     trace = vf.Trace(
         task=TraceTask(type="AdditionTask", data=task.data),
-        agent=AgentInfo(config=training.create_environment().config),
+        agent=AgentInfo(config=training.create_agent().config),
         root_reply=reply,
     )
     assert asyncio.run(task.correct_answer(trace)) == reward
@@ -135,7 +147,7 @@ def test_actor_submits_only_complete_groups(failure: str | None, actor: Any, mon
     traces = [
         vf.Trace(
             task=TraceTask(type="AdditionTask", data=task.data),
-            agent=AgentInfo(config=training.create_environment().config),
+            agent=AgentInfo(config=training.create_agent().config),
             root_reply=reply,
             ok=True,
             stop_condition="agent_completed",
@@ -159,7 +171,7 @@ def test_actor_submits_only_complete_groups(failure: str | None, actor: Any, mon
         return traces[index]
 
     env.run.side_effect = run
-    monkeypatch.setattr(training, "create_environment", Mock(return_value=env))
+    monkeypatch.setattr(training, "create_agent", Mock(return_value=env))
     remote = Mock()
     monkeypatch.setattr(training.ray, "remote", remote)
     monkeypatch.setattr(training.ray, "get", Mock())
@@ -193,8 +205,69 @@ def test_actor_submits_only_complete_groups(failure: str | None, actor: Any, mon
         assert group.task_id == task.data.id
         assert [rollout.reward for rollout in group.rollouts] == [1.0, 0.0]
         assert [rollout.advantage for rollout in group.rollouts] == pytest.approx([1.0, -1.0], abs=3e-4)
-        assert [rollout.trace["id"] for rollout in group.rollouts] == [trace.id for trace in traces]
+        assert group.prompt == task.data.prompt_text
+        assert [rollout.completion for rollout in group.rollouts] == ["42", "41"]
+        assert all(rollout.sequences == [] for rollout in group.rollouts)
         assert pickle.loads(pickle.dumps(group)) == group
+
+
+@pytest.mark.parametrize("branched", [False, True], ids=["multi-turn", "shared-prefix"])
+def test_training_sequences_preserve_tokens_and_mask_context(branched: bool, actor: Any) -> None:
+    trace = vf.Trace(
+        task=TraceTask(type="AdditionTask", data=actor.tasks[0].data),
+        agent=AgentInfo(config=training.create_agent().config),
+        nodes=[
+            vf.MessageNode(message=vf.UserMessage(content="question"), token_ids=[10], mask=[False]),
+            vf.MessageNode(
+                parent=0,
+                message=vf.AssistantMessage(content="tool call"),
+                sampled=True,
+                token_ids=[20],
+                mask=[True],
+                logprobs=[-0.2],
+            ),
+            vf.MessageNode(
+                parent=1,
+                message=vf.ToolMessage(content="42", tool_call_id="call_add"),
+                token_ids=[30],
+                mask=[False],
+            ),
+            vf.MessageNode(
+                parent=2,
+                message=vf.AssistantMessage(content="42"),
+                sampled=True,
+                token_ids=[40, 41],
+                mask=[True, True],
+                logprobs=[-0.4, -0.5],
+            ),
+        ],
+    )
+    if branched:
+        trace.nodes.append(
+            vf.MessageNode(
+                parent=1,
+                message=vf.AssistantMessage(content="alternative"),
+                sampled=True,
+                token_ids=[50],
+                mask=[True],
+                logprobs=[-0.6],
+            )
+        )
+
+    sequences = training.training_sequences(trace)
+
+    assert len(sequences) == (2 if branched else 1)
+    assert sequences[0].token_ids == [10, 20, 30, 40, 41]
+    assert sequences[0].loss_mask == [False, True, False, True, True]
+    assert sequences[0].old_log_probs == [0.0, -0.2, 0.0, -0.4, -0.5]
+    if branched:
+        assert sequences[1].token_ids == [10, 20, 50]
+        assert sequences[1].loss_mask == [False, False, True]
+        assert sequences[1].old_log_probs == [0.0, -0.2, -0.6]
+    for sequence in sequences:
+        assert len(sequence.token_ids) == len(sequence.loss_mask) == len(sequence.old_log_probs)
+    assert sum(sum(sequence.loss_mask) for sequence in sequences) == (4 if branched else 3)
+    assert pickle.loads(pickle.dumps(sequences)) == sequences
 
 
 def test_group_cancels_pending_rollouts(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -217,7 +290,7 @@ def test_group_cancels_pending_rollouts(actor: Any, monkeypatch: pytest.MonkeyPa
             cancelled.append(True)
 
     env.run.side_effect = run
-    monkeypatch.setattr(training, "create_environment", Mock(return_value=env))
+    monkeypatch.setattr(training, "create_agent", Mock(return_value=env))
     with pytest.raises(ExceptionGroup, match="TaskGroup"):
         actor.collect_group(actor.tasks[0])
     assert cancelled == [True]
@@ -293,19 +366,23 @@ def test_verifiers_tool_rollout(mode: str, actor: Any, local_harness: None, monk
         assert len(group.rollouts) == actor.group_size
         assert len(requests) == actor.group_size * (2 if mode == "success" else 3)
         for rollout in group.rollouts:
-            trace = vf.WireTrace.model_validate(rollout.trace)
-            assert len(trace.calls) == (2 if mode == "success" else 3)
-            assert trace.task.data.answer == 42
-            assert trace.reward == rollout.reward == (1.0 if mode == "success" else 0.0)
+            assert rollout.num_turns == (2 if mode == "success" else 3)
+            assert rollout.num_input_tokens == 2
+            assert rollout.num_output_tokens == rollout.num_turns
+            assert rollout.rollout_seconds > 0
+            assert rollout.reward == (1.0 if mode == "success" else 0.0)
             assert rollout.advantage == 0.0
-            assert trace.tool_messages
+            assert rollout.sequences == []  # EvalClient supplies usage, but no training tokens.
             if mode == "success":
-                assert "42" in trace.tool_messages[0].content
-                assert trace.last_reply == "42"
+                assert rollout.completion == "42"
+                assert rollout.stop_condition == "agent_completed"
             else:
-                assert "b" in trace.tool_messages[0].content
-                assert trace.stop_condition == "max_turns"
-        assert len({rollout.trace["id"] for rollout in group.rollouts}) == actor.group_size
+                assert rollout.stop_condition == "max_turns"
+        tool_messages = [
+            message for request in requests for message in request["messages"] if message["role"] == "tool"
+        ]
+        assert tool_messages
+        assert all(("42" if mode == "success" else "b") in message["content"] for message in tool_messages)
         assert pickle.loads(pickle.dumps(group)) == group
     assert clients and all(client.is_closed for client in clients)
     assert requests[0]["model"] == training.MODEL
