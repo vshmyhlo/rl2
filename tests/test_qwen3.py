@@ -254,6 +254,7 @@ def test_tokamax_masked_gradients(
     (actual_loss, actual), actual_grad = evaluate(params, model.clone(attention_backend="tokamax"))
     assert attention.called
     assert attention.call_args.kwargs["implementation"] == "triton"
+    assert attention.call_args.kwargs["is_causal"]
     assert actual.shape == expected.shape == (2, 3, 13)
     np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-5)
     np.testing.assert_allclose(actual_loss, expected_loss, atol=2e-6, rtol=2e-5)

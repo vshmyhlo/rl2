@@ -136,7 +136,9 @@ def _attention(
     value: jax.Array,  # (B, S, K, H)
     mask: jax.Array,  # (B, 1, T, S)
     backend: AttentionBackend,
-) -> jax.Array:
+    *,
+    is_causal: bool,
+) -> jax.Array:  # (B, T, N, H)
     if backend == "xla":
         with jax.default_matmul_precision("highest"):
             return jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")  # (B, T, N, H)
@@ -171,6 +173,7 @@ def _attention(
             key,
             value,
             mask=mask,
+            is_causal=is_causal,
             scale=head_dim**-0.5,
             precision=jax.lax.Precision.HIGHEST,
             implementation="triton",
@@ -300,7 +303,10 @@ class Qwen3LM(nn.Module):
             if layer_cache is not None:
                 layer_cache = jax.tree.map(update, layer_cache, (key, value))  # Each (B, C, K, H).
                 key, value = layer_cache  # Each (B, C, K, H).
-            attended = _attention(query, key, value, mask, self.attention_backend)  # (B, T, N, H)
+            # Tell Triton to skip future key blocks during uncached training/prefill.
+            attended = _attention(
+                query, key, value, mask, self.attention_backend, is_causal=cache is None
+            )  # (B, T, N, H)
             x = x + linear(attended.reshape(batch, width, -1), weights["self_attn.o_proj.weight"])  # (B, T, D)
             normalized = _rms_norm(x, weights["post_attention_layernorm.weight"], config.rms_norm_eps)  # (B, T, D)
             hidden = _silu(linear(normalized, weights["mlp.gate_proj.weight"])) * linear(

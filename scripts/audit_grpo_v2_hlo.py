@@ -23,7 +23,7 @@ def main() -> None:
     parser.add_argument("--model-config", type=Path, required=True)
     parser.add_argument("--length", type=int, required=True, help="Padded transcript width, including the first token")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--donate-state", action="store_true", help="Compare compilation with state buffer donation")
+    parser.add_argument("--donate-state", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
     config = load_config(args.config, Config)
     model_config = Qwen3Config.from_dict(json.loads(args.model_config.read_text()))
@@ -55,10 +55,8 @@ def main() -> None:
         advantages=jax.ShapeDtypeStruct((batch_size,), jnp.float32, sharding=batched),  # (B,)
     )
     computation = update
-    if args.donate_state:
-        computation = jax.jit(
-            update.__wrapped__, static_argnames=("grad_accum_steps", "temperature", "clip_coef"), donate_argnums=(0,)
-        )
+    if not args.donate_state:
+        computation = jax.jit(update.__wrapped__, static_argnames=("grad_accum_steps", "temperature", "clip_coef"))
     started = perf_counter()
     lowered = computation.lower(
         state,

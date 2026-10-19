@@ -1,6 +1,7 @@
 import asyncio
 import io
 import json
+import os
 import pickle
 import runpy
 import subprocess
@@ -249,6 +250,39 @@ def test_actor_and_learner_each_reserve_one_gpu() -> None:
     assert training.Actor._default_options["num_gpus"] == 1
     assert training.Learner._default_options["num_gpus"] == 1
     assert training.Batcher._default_options.get("num_gpus", 0) == 0
+
+
+def test_rollout_workers_keep_deserialized_arrays_on_cpu() -> None:
+    actor_env = training.Actor._default_options.get("runtime_env", {}).get("env_vars", {})
+    batcher_env = training.Batcher._default_options.get("runtime_env", {}).get("env_vars", {})
+    assert actor_env == batcher_env == {"JAX_PLATFORMS": "cpu"}
+    # Start fresh: backend selection must precede imports and Ray deserialization.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import os
+import pickle
+import jax
+import jax.numpy as jnp
+
+with jax.default_device(jax.devices("cpu")[0]):
+    payload = pickle.dumps(jnp.asarray([1, 2], dtype=jnp.int32))  # (2,)
+restored = pickle.loads(payload)  # (2,)
+assert restored.device.platform == "cpu"
+assert restored.shape == (2,) and restored.tolist() == [1, 2]
+assert {device.platform for device in jax.devices()} == {"cpu"}
+assert os.environ["CUDA_VISIBLE_DEVICES"] == "0"
+""",
+        ],
+        env={**os.environ, "JAX_PLATFORMS": "cuda,cpu", "CUDA_VISIBLE_DEVICES": "0", **batcher_env},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_script_actor_serialization() -> None:

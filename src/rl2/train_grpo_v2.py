@@ -243,7 +243,9 @@ def token_log_probs(
         {"params": params}, batch.token_ids[:, :-1], attention_mask=batch.attention_mask[:, :-1]
     ).logits  # (B, T-1, V)
     logits = logits.astype(jnp.float32) / temperature  # (B, T-1, V)
-    selected = jnp.take_along_axis(logits, batch.token_ids[:, 1:, None], axis=-1)[..., 0]  # (B, T-1)
+    # Fuse selection's backward pass with softmax instead of scattering into a full FP32 vocabulary buffer.
+    targets = jax.nn.one_hot(batch.token_ids[:, 1:], logits.shape[-1], dtype=jnp.bool_)  # (B, T-1, V)
+    selected = jnp.where(targets, logits, 0).sum(axis=-1)  # (B, T-1)
     return selected - jax.nn.logsumexp(logits, axis=-1)  # (B, T-1)
 
 
@@ -277,7 +279,7 @@ def create_state(model: Qwen3LM, params: Parameters, config: Config) -> TrainSta
     ).replace(step=jnp.asarray(0, dtype=jnp.int32))  # () Match the device counter returned by update.
 
 
-@partial(jax.jit, static_argnames=("grad_accum_steps", "temperature", "clip_coef"))
+@partial(jax.jit, static_argnames=("grad_accum_steps", "temperature", "clip_coef"), donate_argnums=(0,))
 def update(
     state: TrainState,
     batch: GRPOBatch,  # One optimizer minibatch: (B, T), (B,) leaves.
@@ -286,6 +288,7 @@ def update(
     temperature: float,
     clip_coef: float,
 ) -> tuple[TrainState, Metrics]:
+    """Consume state buffers and return the updated state and scalar metrics."""
     if grad_accum_steps < 1 or batch.token_ids.shape[0] % grad_accum_steps:
         raise ValueError("grad_accum_steps must be positive and divide the minibatch size")
     # Python logging runs on tracing, not on cached executions.
@@ -458,7 +461,8 @@ def wait_for_server(server: subprocess.Popen[bytes], timeout: float = 600) -> No
     raise TimeoutError(f"vLLM was not ready within {timeout}s at {SERVER_URL}")
 
 
-@ray.remote
+# Ray leaves GPUs visible to CPU workers; JAX unpickles arrays onto its default device.
+@ray.remote(runtime_env={"env_vars": {"JAX_PLATFORMS": "cpu"}})
 class Batcher:
     def __init__(self, actor: ActorHandle) -> None:
         self.actor = actor
@@ -748,7 +752,8 @@ class Learner:
         return {name: float(value) for name, value in metrics.items()}
 
 
-@ray.remote(num_gpus=1)
+# Restrict JAX before import/backend initialization; vLLM still uses the assigned CUDA device.
+@ray.remote(num_gpus=1, runtime_env={"env_vars": {"JAX_PLATFORMS": "cpu"}})
 class Actor:
     def __init__(self, config: Config = DEFAULT_CONFIG) -> None:
         self.config = config

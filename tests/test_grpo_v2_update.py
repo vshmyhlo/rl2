@@ -13,7 +13,7 @@ from flax.training.train_state import TrainState
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from rl2 import train_grpo_v2 as training
-from rl2.qwen3 import Qwen3Config, Qwen3LM
+from rl2.qwen3 import Parameters, Qwen3Config, Qwen3LM, Qwen3Output, Variables
 
 
 def rollout(tokens: list[int], mask: list[bool], advantage: float) -> training.Rollout:
@@ -187,11 +187,45 @@ def test_token_log_probs_shift_temperature_and_padding(state: TrainState, batch:
     np.testing.assert_allclose(changed[batch.loss_mask[:, 1:]], log_probs[batch.loss_mask[:, 1:]], atol=1e-6)
 
 
+def test_token_log_probs_gradients_match_gather(state: TrainState, batch: training.GRPOBatch) -> None:
+    def apply_fn(
+        variables: Variables,
+        tokens: jax.Array,  # (B, T-1)
+        *,
+        attention_mask: jax.Array,  # (B, T-1)
+    ) -> Qwen3Output:
+        return Qwen3Output(logits=variables["params"]["logits"], cache=None)  # (B, T-1, V)
+
+    state = state.replace(apply_fn=apply_fn)
+    batch = batch._replace(token_ids=batch.token_ids.at[:, 1].set(jnp.array([0, 7])))  # (B=2, T=8)
+    params = {"logits": jnp.arange(112, dtype=jnp.float32).reshape(2, 7, 8) / 10}  # (B, T-1, V=8)
+
+    def selected_loss(weights: Parameters) -> jax.Array:  # Logits: (B, T-1, V).
+        log_probs = training.token_log_probs(state, weights, batch, temperature=0.7)  # (B, T-1)
+        return jnp.where(batch.loss_mask[:, 1:], log_probs, 0).sum()  # ()
+
+    def reference_loss(weights: Parameters) -> jax.Array:  # Logits: (B, T-1, V).
+        log_probs = jax.nn.log_softmax(weights["logits"] / 0.7)  # (B, T-1, V)
+        selected = jnp.take_along_axis(log_probs, batch.token_ids[:, 1:, None], axis=-1)[..., 0]  # (B, T-1)
+        return jnp.where(batch.loss_mask[:, 1:], selected, 0).sum()  # ()
+
+    actual = jax.value_and_grad(selected_loss)(params)  # (), (B, T-1, V) gradient leaf.
+    expected = jax.value_and_grad(reference_loss)(params)  # (), (B, T-1, V) gradient leaf.
+    for value, reference in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        assert value.shape == reference.shape
+        np.testing.assert_allclose(value, reference, atol=2e-6)
+    np.testing.assert_array_equal(actual[1]["logits"][~batch.loss_mask[:, 1:]], 0)
+
+
 def test_accumulated_update_matches_full_batch_and_improves_policy(
     state: TrainState, batch: training.GRPOBatch
 ) -> None:
-    accumulated, metrics = training.update(state, batch, grad_accum_steps=2, temperature=0.7, clip_coef=0.2)
-    full, full_metrics = training.update(state, batch, grad_accum_steps=1, temperature=0.7, clip_coef=0.2)
+    accumulated, metrics = training.update(
+        jax.tree.map(jnp.copy, state), batch, grad_accum_steps=2, temperature=0.7, clip_coef=0.2
+    )
+    full, full_metrics = training.update(
+        jax.tree.map(jnp.copy, state), batch, grad_accum_steps=1, temperature=0.7, clip_coef=0.2
+    )
     assert int(accumulated.step) == int(full.step) == 1
     for actual, expected in zip(jax.tree.leaves(accumulated), jax.tree.leaves(full), strict=True):
         assert actual.shape == expected.shape
@@ -230,7 +264,9 @@ def test_zero_advantages_leave_fresh_optimizer_parameters_unchanged(
     state: TrainState, batch: training.GRPOBatch
 ) -> None:
     batch = batch._replace(advantages=jnp.zeros_like(batch.advantages))
-    updated, metrics = training.update(state, batch, grad_accum_steps=2, temperature=0.7, clip_coef=0.2)
+    updated, metrics = training.update(
+        jax.tree.map(jnp.copy, state), batch, grad_accum_steps=2, temperature=0.7, clip_coef=0.2
+    )
     assert float(metrics["policy/grad_norm"]) == float(metrics["losses/policy"]) == 0.0
     for name in state.params:
         np.testing.assert_array_equal(updated.params[name], state.params[name])
@@ -323,7 +359,9 @@ def test_learner_optimizes_and_publishes_updated_bf16_weights(
     )
     learner.model = model.clone(dtype="bfloat16", param_dtype=jnp.bfloat16)
     learner.mesh = Mesh(devices=np.array([jax.devices()[0]]), axis_names=("batch",))
-    learner.state = training.create_state(learner.model, state.params, training.Config(learning_rate=0.01))
+    learner.state = training.create_state(
+        learner.model, jax.tree.map(jnp.copy, state.params), training.Config(learning_rate=0.01)
+    )
     learner._transfer_group = Mock()
     groups = groups + [replace(groups[0], rollouts=list(reversed(groups[0].rollouts)))]
     batch = batcher.prepare_batch(groups, context_length=8)  # (B=4, T=8), (B,) leaves.
@@ -331,7 +369,16 @@ def test_learner_optimizes_and_publishes_updated_bf16_weights(
     assert old.shape == (4, 7)
     assert old.dtype == jnp.float32
     batch = batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))
-    update = Mock(wraps=training.update)
+    actual_update = training.update
+    steps: list[int] = []
+
+    def record_update(
+        current: TrainState, minibatch: training.GRPOBatch, **kwargs: Any
+    ) -> tuple[TrainState, training.Metrics]:
+        steps.append(int(current.step))
+        return actual_update(current, minibatch, **kwargs)
+
+    update = Mock(wraps=record_update)
     monkeypatch.setattr(training, "update", update)
     permutations = [jnp.array([2, 0, 3, 1]), jnp.array([1, 3, 0, 2])]  # Each: (B,).
     permutation = Mock(side_effect=permutations)
@@ -339,8 +386,9 @@ def test_learner_optimizes_and_publishes_updated_bf16_weights(
     metrics = learner.optimize(batch)
     assert update.call_count == 4
     assert permutation.call_count == 2
+    assert steps == [0, 1, 2, 3]
     for index, call in enumerate(update.call_args_list):
-        assert int(call.args[0].step) == index
+        assert call.args[0].params["model.embed_tokens.weight"].is_deleted()
         assert call.kwargs["grad_accum_steps"] == 2
         placed_batch = call.args[1]  # (B/N=2, T=8), (B/N,) leaves.
         start = (index % 2) * 2
