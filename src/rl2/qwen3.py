@@ -187,6 +187,7 @@ class Qwen3LM(nn.Module):
     dtype: str = "bfloat16"
     param_dtype: jax.typing.DTypeLike = jnp.float32
     attention_backend: AttentionBackend = "xla"
+    gradient_checkpointing: bool = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -277,10 +278,14 @@ class Qwen3LM(nn.Module):
         def rotate(projected: jax.Array) -> jax.Array:  # (B, T, N/K, H)
             return _rope(projected, position_ids, config.rope_theta)  # (B, T, N/K, H)
 
-        def update(old: jax.Array, new: jax.Array) -> jax.Array:  # (L, B, C, K, H), (B, T, K, H)
-            return jax.lax.dynamic_update_slice(old, new[None], (layer, 0, offset, 0, 0))  # (L, B, C, K, H)
+        def decoder_layer(
+            x: jax.Array,  # (B, T, D)
+            cache: Qwen3Cache | None,
+            layer: int,
+        ) -> tuple[jax.Array, Qwen3Cache | None]:
+            def update(old: jax.Array, new: jax.Array) -> jax.Array:  # (L, B, C, K, H), (B, T, K, H)
+                return jax.lax.dynamic_update_slice(old, new[None], (layer, 0, offset, 0, 0))  # (L, B, C, K, H)
 
-        for layer in range(config.num_hidden_layers):
             prefix = f"model.layers.{layer}."
             normalized = _rms_norm(x, params[prefix + "input_layernorm.weight"], config.rms_norm_eps)  # (B, T, D)
             query, key, value = jax.tree.map(
@@ -308,6 +313,13 @@ class Qwen3LM(nn.Module):
                 normalized, prefix + "mlp.up_proj"
             )  # (B, T, intermediate_size)
             x = x + linear(hidden, prefix + "mlp.down_proj")  # (B, T, D)
+            return x, cache  # (B, T, D), optional KV cache.
+
+        # Recompute layer activations during backward; cached decoding needs no rematerialization.
+        if self.gradient_checkpointing and cache is None:
+            decoder_layer = jax.checkpoint(decoder_layer, static_argnums=(2,))
+        for layer in range(config.num_hidden_layers):
+            x, cache = decoder_layer(x, cache, layer)  # (B, T, D), optional KV cache.
         x = _rms_norm(x, params["model.norm.weight"], config.rms_norm_eps)  # (B, T, D)
         head = "model.embed_tokens" if config.tie_word_embeddings else "lm_head"
         logits = linear(x[:, -logits_to_keep:], head).astype(jnp.float32)  # (B, U, V)
@@ -339,11 +351,18 @@ def load_qwen3_checkpoint(
     revision: str | None = None,
     dtype: str = "bfloat16",
     attention_backend: AttentionBackend = "xla",
+    gradient_checkpointing: bool = True,
 ) -> tuple[Qwen3LM, Variables]:
     """Return a Linen module and variables loaded directly from HF safetensors."""
     directory = checkpoint_directory(source, revision)
     config = Qwen3Config.from_dict(json.loads((directory / "config.json").read_text()))
-    model = Qwen3LM(config=config, dtype=dtype, param_dtype=jnp.dtype(dtype), attention_backend=attention_backend)
+    model = Qwen3LM(
+        config=config,
+        dtype=dtype,
+        param_dtype=jnp.dtype(dtype),
+        attention_backend=attention_backend,
+        gradient_checkpointing=gradient_checkpointing,
+    )
     shapes = config.parameter_shapes()
     if config.tie_word_embeddings:
         shapes["lm_head.weight"] = shapes["model.embed_tokens.weight"]

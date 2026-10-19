@@ -39,22 +39,28 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     defaults = training.Config()
     assert defaults.microbatch_size == 4
     assert defaults.update_epochs == 1
+    assert defaults.gradient_checkpointing
     assert defaults.weight_update_pause_mode == "wait"
     preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/addition.yaml"
     config = training.load_config(preset, training.Config)
     assert config.run_id == "grpo_v2_addition_Qwen_Qwen3-0.6B_seed1"
     assert config.ckpt_dir == f"/runs/grpo_v2/{config.run_id}"
     assert config.total_iterations is None
+    assert config.gradient_checkpointing
     assert config.weight_update_pause_mode == "wait"
     assert asdict(config.taskset) == {"id": "addition"}
     assert "dataset_file" not in asdict(config)
     path = tmp_path / "config.yaml"
-    path.write_text(yaml.safe_dump(asdict(config) | {"max_tokens": "${group_size}", "total_iterations": 1}))
+    path.write_text(
+        yaml.safe_dump(
+            asdict(config) | {"max_tokens": "${group_size}", "total_iterations": 1, "gradient_checkpointing": False}
+        )
+    )
     train = Mock()
     monkeypatch.setattr(training, "train", train)
     monkeypatch.setattr(sys, "argv", ["train_grpo_v2", "--config", str(path)])
     training.main()
-    train.assert_called_once_with(replace(config, max_tokens=4, total_iterations=1))
+    train.assert_called_once_with(replace(config, max_tokens=4, total_iterations=1, gradient_checkpointing=False))
     assert pickle.loads(pickle.dumps(config)) == config
 
 
@@ -366,9 +372,9 @@ def test_learner_pulls_groups_through_batcher(
     else:
         batch = learner.fetch_next_batch(num_groups=num_groups, group_size=3)
         assert batch.groups == groups
-        assert batch.training_batch.token_ids.shape == (num_groups * 3, 2)
+        assert batch.training_batch.token_ids.shape == (num_groups * 3, 8)
         np.testing.assert_array_equal(batch.training_batch.advantages, 0.5)
-        assert batch.transfer_metrics["data/batch_array_bytes"] == num_groups * 3 * 42
+        assert batch.transfer_metrics["data/batch_array_bytes"] == num_groups * 3 * 102
     batcher_handle.fetch_next_batch.remote.assert_called_once_with(
         num_groups=num_groups, group_size=3, context_length=8
     )
@@ -435,13 +441,13 @@ def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
     batch = learner.fetch_next_batch(num_groups=2, group_size=2)
     # Preserve request order despite out-of-order completion and serialization.
     np.testing.assert_equal([asdict(group) for group in batch.groups], [asdict(group) for group in groups])
-    assert batch.training_batch.token_ids.shape == (4, 2)
+    assert batch.training_batch.token_ids.shape == (4, 8)
     assert batch.transfer_metrics == {
         "time/batcher/fetch_rollout_seconds": 50.5,
         "time/batcher/prepare_batch_seconds": 2.0,
         "time/batcher/actor_to_batcher_seconds": 0.375,
         "time/learner/batcher_to_learner_seconds": 0.75,
-        "data/batch_array_bytes": 168,
+        "data/batch_array_bytes": 408,
     }
     assert "Actor -> Batcher: task=1 seconds=0.250000" in caplog.text
     assert "Actor -> Batcher: task=0 seconds=0.500000" in caplog.text
@@ -460,7 +466,7 @@ def learner(monkeypatch: pytest.MonkeyPatch) -> Any:
     loader = Mock(return_value=(model, {"params": params}))
     monkeypatch.setattr(training, "load_qwen3_checkpoint", loader)
     monkeypatch.setattr(training.jax, "devices", Mock(return_value=[device]))
-    config = training.Config(model="Qwen/custom")
+    config = training.Config(model="Qwen/custom", gradient_checkpointing=False)
     learner = training.Learner.__ray_metadata__.modified_class(batcher=Mock(), actor=Mock(), config=config)
     learner.model = model
     loader.assert_not_called()
@@ -576,9 +582,17 @@ def test_learner_logs_rollouts(
             learner.start()
     else:
         learner.start()
-    training.load_qwen3_checkpoint.assert_called_once_with(learner.config.model, dtype="bfloat16")
+    training.load_qwen3_checkpoint.assert_called_once_with(
+        learner.config.model,
+        dtype="bfloat16",
+        attention_backend="tokamax",
+        gradient_checkpointing=learner.config.gradient_checkpointing,
+    )
     assert learner.model is training.load_qwen3_checkpoint.return_value[0]
-    assert all(value.device == jax.devices("cpu")[0] for value in learner.state.params.values())
+    assert learner.mesh.axis_names == ("batch",)
+    for value in learner.state.params.values():  # Model parameter shapes.
+        assert value.sharding == training.NamedSharding(learner.mesh, training.PartitionSpec())
+        assert value.devices() == {jax.devices("cpu")[0]}
     assert all(value.dtype == jnp.float32 for value in learner.state.params.values())
     learner.fetch_next_batch.assert_called_with(num_groups=2, group_size=2)
     expected = ["initialize", "publish", "fetch", "optimize", "publish", "fetch"]

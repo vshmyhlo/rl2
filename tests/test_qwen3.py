@@ -95,6 +95,35 @@ def test_huggingface_gradient(model: Qwen3LM, params: Parameters, reference: dic
     assert float(evaluate_loss(updated.params)) < float(evaluate_loss(state.params))
 
 
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_gradient_checkpointing(model: Qwen3LM, params: Parameters, dtype: str) -> None:
+    assert model.gradient_checkpointing
+    model = model.clone(dtype=dtype)
+    plain = model.clone(gradient_checkpointing=False)
+    tokens = jnp.array([[0, 0, 0], [0, 1, 4]], jnp.int32)  # (B=2, T=3)
+    mask = jnp.array([[False, False, False], [False, True, True]])  # (B, T)
+
+    def loss(weights: Parameters, lm: Qwen3LM) -> tuple[jax.Array, jax.Array]:
+        logits = lm.apply({"params": weights}, tokens, attention_mask=mask).logits  # (B, T, V=13)
+        return jnp.square(logits).mean(), logits  # (), (B, T, V)
+
+    evaluate = jax.jit(jax.value_and_grad(loss, has_aux=True), static_argnums=1)
+    (actual_loss, actual), actual_grad = evaluate(params, model)  # (), (B, T, V), parameter shapes.
+    (expected_loss, expected), expected_grad = evaluate(params, plain)  # (), (B, T, V), parameter shapes.
+    tolerance = 0.02 if dtype == "bfloat16" else 2e-6
+    assert actual.shape == expected.shape == (2, 3, 13)
+    np.testing.assert_allclose(actual, expected, atol=tolerance, rtol=tolerance)
+    np.testing.assert_allclose(actual_loss, expected_loss, atol=tolerance, rtol=tolerance)
+    assert jax.tree.map(jnp.shape, actual_grad) == model.config.parameter_shapes()
+    for name in params:
+        np.testing.assert_allclose(actual_grad[name], expected_grad[name], atol=tolerance, rtol=tolerance)
+
+    # Verify that the switch actually inserts one rematerialization boundary per layer.
+    trace = jax.make_jaxpr(loss, static_argnums=1)
+    for lm, count in ((model, model.config.num_hidden_layers), (plain, 0)):
+        assert sum(eqn.primitive.name == "remat2" for eqn in trace(params, lm).jaxpr.eqns) == count
+
+
 def test_bfloat16_silu_opmath() -> None:
     # Real first-layer activation; CUDA PyTorch 2.9.1 SiLU and its sum gradient.
     inputs = jnp.array([[0.40625]], jnp.bfloat16)  # (B=1, D=1).
@@ -301,11 +330,14 @@ def test_checkpoint_loading(model: Qwen3LM, params: Parameters, tmp_path: Path) 
     locations["lm_head.weight"] = path.name
     index = tmp_path / "model.safetensors.index.json"
     index.write_text(json.dumps({"weight_map": locations}))
-    loaded_model, variables = load_qwen3_checkpoint(str(tmp_path), dtype="bfloat16", attention_backend="tokamax")
+    loaded_model, variables = load_qwen3_checkpoint(
+        str(tmp_path), dtype="bfloat16", attention_backend="tokamax", gradient_checkpointing=False
+    )
     index.unlink()  # Subsequent cases exercise unindexed checkpoint errors.
     loaded = variables["params"]
     assert loaded_model.config == model.config
     assert loaded_model.attention_backend == "tokamax"
+    assert not loaded_model.gradient_checkpointing
     assert loaded.keys() == params.keys()
     for name in params:
         assert loaded[name].dtype == jnp.bfloat16

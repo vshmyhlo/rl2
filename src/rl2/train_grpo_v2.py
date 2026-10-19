@@ -1,15 +1,16 @@
 """GRPO training with a JAX learner, vLLM rollouts, and Ray actors.
 
 MLflow's metric step counts completed training iterations: one rollout batch,
-its optimizer updates, and publication of the updated weights.
+its optimizer updates, and publication of the updated weights. All metrics below
+are logged every iteration except the startup scalars.
 
 Startup scalars (step 0):
     model/params_millions: Model parameter count in millions.
-    time/learner/setup_seconds: Learner setup wall time, including the initial weight transfer.
+    time/learner/setup_seconds: Model loading, optimizer setup, NCCL initialization, and initial weight publication wall time.
 
 Optimization scalars (averaged over update epochs):
     losses/policy: Clipped GRPO policy loss.
-    policy/approx_kl: Approximate KL divergence from the sampling policy.
+    policy/approx_kl: Mean exp(log_ratio) - 1 - log_ratio, where log_ratio is learner minus sampling log-probability.
     policy/clip_fraction: Fraction of sampled-token probability ratios outside the clip range.
     policy/grad_norm: Global gradient norm after microbatch averaging, before clipping.
 Loss, KL, and clip fraction average sampled tokens within each rollout, then rollouts.
@@ -20,15 +21,18 @@ Rollout batch scalars:
     charts/reward_min: Minimum raw rollout reward.
     charts/reward_max: Maximum raw rollout reward.
     charts/degenerate_group_fraction: Fraction of groups with identical rewards and zero advantages.
-    charts/stop_condition_fraction/<label>: Fraction of batch rollouts with each stop condition; None is unspecified.
+    charts/stop_condition_fraction/<label>: Fraction of batch rollouts with each stop condition; None maps to unspecified.
     charts/turns_mean: Mean model responses per rollout, including tool calls.
     charts/input_tokens_mean: Mean newly fed input tokens per rollout; a lower bound if context is rewritten.
     charts/output_tokens_mean: Mean sampled tokens per rollout across all model calls.
-    data/batch_array_bytes: Sequence-array bytes, excluding text, metadata, and serialization overhead.
+    data/batch_array_bytes: Logical bytes of rollout sequence arrays plus prepared training arrays, including padding.
+Stop-condition labels are added as observed; previously seen labels log zero when
+absent from a later batch. Array bytes exclude text, metadata, and Ray overhead;
+they do not measure allocated memory or imply copies.
 
 Training progress and settings:
     charts/total_iterations: Cumulative completed training iterations.
-    charts/total_updates: Cumulative optimizer updates.
+    charts/total_updates: Cumulative optimizer updates; update_epochs updates per iteration.
     charts/total_rollouts: Cumulative rollouts used for training.
     charts/learning_rate: Configured optimizer learning rate.
 
@@ -45,9 +49,10 @@ Timing and throughput (logged every iteration):
     time/learner/iteration_seconds: Batch fetching, optimization, and weight publication wall time.
     time/batcher/actor_to_batcher_seconds: Mean group transfer latency from actor return to batcher receipt.
     time/learner/batcher_to_learner_seconds: Batch transfer latency from batcher return to learner receipt.
-Ray transfer latencies include serialization and scheduling. Iteration timing and
-throughput exclude that iteration's metric logging. Cumulative counters start at
-zero for each training session.
+Ray transfer latencies include serialization, transport, deserialization, and
+scheduling, using a shared single-node monotonic clock. Timing intervals overlap
+and should not be summed. Iteration timing and throughput exclude that iteration's
+metric and example logging. Cumulative counters start at zero for each training session.
 Output-token counts use reported completion usage, counting zero when usage is unavailable.
 """
 
@@ -81,6 +86,7 @@ import torch
 import verifiers.v1 as vf
 import yaml
 from flax.training.train_state import TrainState
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from numpy.typing import NDArray
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass as config_dataclass
@@ -143,6 +149,11 @@ class Config(BaseConfig):
     max_grad_norm: Annotated[float, Field(gt=0)] = 1.0
     microbatch_size: Annotated[int, Field(ge=1)] = 4
     update_epochs: Annotated[int, Field(ge=1)] = 1
+    gradient_checkpointing: bool = True
+    # In-flight vLLM requests during weight updates (individual requests, not multi-turn rollout groups):
+    # wait: finish requests before applying weights (default).
+    # abort: cancel requests before applying weights.
+    # keep: freeze requests, then resume them after applying weights.
     weight_update_pause_mode: Literal["wait", "abort", "keep"] = "wait"
 
     def __post_init__(self) -> None:
@@ -288,6 +299,14 @@ def update(
 ) -> tuple[TrainState, Metrics]:
     if batch.token_ids.shape[0] % microbatch_size:
         raise ValueError("microbatch_size must divide the rollout batch size")
+    # Python logging runs on tracing, not on cached executions.
+    logger.info(
+        "JIT trace update: batch_shape=%s microbatch_size=%s temperature=%s clip_coef=%s",
+        batch.token_ids.shape,
+        microbatch_size,
+        temperature,
+        clip_coef,
+    )
     count = batch.token_ids.shape[0] // microbatch_size
     microbatches = jax.tree.map(
         lambda value: value.reshape(count, microbatch_size, *value.shape[1:]), batch
@@ -458,7 +477,7 @@ class Batcher:
         """Flatten rollout groups in order and right-pad their transcripts into CPU JAX arrays.
 
         B is the total rollout count; T is the longest transcript length rounded up
-        to a power of two, capped at context_length. Padding is zero/False, and
+        to a multiple of 128, capped at context_length. Padding is zero/False, and
         transcripts are never truncated. Existing rollout advantages are preserved.
 
         Returns:
@@ -478,7 +497,7 @@ class Batcher:
         length = max(len(rollout.sequence.token_ids) for rollout in rollouts)
         if length > context_length:
             raise ValueError(f"Rollout length {length} exceeds model context length {context_length}")
-        width = min(1 << (length - 1).bit_length(), context_length)
+        width = min((length + 127) // 128 * 128, context_length)
         shape = (len(rollouts), width)
         # Stage variable-length host transcripts before conversion to CPU arrays.
         tokens = np.zeros(shape, dtype=np.int32)  # (B, T)
@@ -571,9 +590,19 @@ class Learner:
             start = time.monotonic()
             logger.info("Loading learner model %s on its assigned GPU", self.config.model)
             device = jax.devices("gpu")[0]
+            self.mesh = Mesh(devices=np.array([device]), axis_names=("batch",))
             with jax.default_device(device):
-                self.model, variables = load_qwen3_checkpoint(self.config.model, dtype="bfloat16")
-                self.state = create_state(self.model, jax.device_put(variables["params"], device), self.config)
+                self.model, variables = load_qwen3_checkpoint(
+                    self.config.model,
+                    dtype="bfloat16",
+                    attention_backend="tokamax",
+                    gradient_checkpointing=self.config.gradient_checkpointing,
+                )
+                self.state = create_state(
+                    self.model,
+                    jax.device_put(variables["params"], NamedSharding(self.mesh, PartitionSpec())),
+                    self.config,
+                )
             del variables
             logger.info("Learner loaded %s parameter tensors", len(self.state.params))
             self.initialize_weight_transfer(resources=resources)
@@ -708,7 +737,7 @@ class Learner:
         logger.info("Weights published: elapsed=%.2fs", time.monotonic() - started)
 
     def optimize(self, batch: GRPOBatch) -> dict[str, float]:  # Batch leaves: (B, T), (B,).
-        batch = jax.device_put(batch, jax.tree.leaves(self.state.params)[0].device)  # (B, T), (B,) leaves.
+        batch = jax.device_put(batch, NamedSharding(self.mesh, PartitionSpec("batch")))  # (B, T), (B,) leaves.
         history: list[Metrics] = []
         for _ in range(self.config.update_epochs):
             self.state, metrics = update(

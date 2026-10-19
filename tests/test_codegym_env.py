@@ -72,6 +72,33 @@ def test_load_dataset(suffix: str, tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert task.config == config.task
 
 
+def test_default_loads_full_train_subset(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = {"prompt": [{"role": "user", "content": "Solve"}], "ability": ABILITY}
+    load = Mock(return_value=[row])
+    monkeypatch.setattr(env, "load_dataset", load)
+    tasks = list(env.CodeGymTaskset(config=env.CodeGymTasksetConfig()))
+    load.assert_called_once_with(
+        "parquet",
+        data_files={
+            "train": "hf://datasets/VanishD/CodeGym@85286359a342f7a288aea74273772b69b9b784c2/"
+            "task_en_instruction_en_env/train-*.parquet"
+        },
+        split="train",
+    )
+    assert tasks[0].data.ability == ABILITY
+
+
+def test_load_all_training_shards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(datasets_config, "HF_DATASETS_CACHE", tmp_path / "cache")
+    for name in ["train-00000", "train-00001", "test-00000"]:
+        Dataset.from_list([{"prompt": [{"role": "user", "content": name}], "ability": ABILITY}]).to_parquet(
+            tmp_path / f"{name}.parquet"
+        )
+    tasks = list(env.CodeGymTaskset(config=env.CodeGymTasksetConfig(data_file=str(tmp_path / "train-*.parquet"))))
+    assert [task.data.prompt_text for task in tasks] == ["train-00000", "train-00001"]
+    assert [task.data.id for task in tasks] == ["0", "1"]
+
+
 @pytest.mark.parametrize(
     "update",
     [

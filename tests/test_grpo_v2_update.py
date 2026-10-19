@@ -1,4 +1,6 @@
+import logging
 from dataclasses import replace
+from functools import partial
 from typing import Any
 from unittest.mock import Mock
 
@@ -8,6 +10,7 @@ import numpy as np
 import optax
 import pytest
 from flax.training.train_state import TrainState
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from rl2 import train_grpo_v2 as training
 from rl2.qwen3 import Qwen3Config, Qwen3LM
@@ -50,7 +53,7 @@ def groups() -> list[training.RolloutGroup]:
     ]
 
 
-@pytest.mark.parametrize("context_length,width", [(8, 8), (5, 5)], ids=["bucketed", "context-boundary"])
+@pytest.mark.parametrize("context_length,width", [(512, 128), (5, 5)], ids=["bucketed", "context-boundary"])
 def test_prepare_batch(batcher: Any, groups: list[training.RolloutGroup], context_length: int, width: int) -> None:
     batch = batcher.prepare_batch(groups, context_length=context_length)
     assert batch.token_ids.shape == batch.attention_mask.shape == batch.loss_mask.shape == (2, width)
@@ -68,6 +71,24 @@ def test_prepare_batch(batcher: Any, groups: list[training.RolloutGroup], contex
     np.testing.assert_array_equal(batch.advantages, [1.0, -1.0])
     assert not np.asarray(batch.attention_mask[1, 3:]).any()
     assert not np.asarray(batch.loss_mask[1, 3:]).any()
+    np.testing.assert_array_equal(batch.token_ids[1, 3:], 0)
+    np.testing.assert_array_equal(batch.old_log_probs[1, 3:], 0)
+
+
+@pytest.mark.parametrize(
+    "length,context_length,width",
+    [(256, 512, 256), (257, 512, 384), (257, 300, 300)],
+    ids=["exact-bucket", "next-bucket", "context-cap"],
+)
+def test_prepare_batch_bucket_boundaries(batcher: Any, length: int, context_length: int, width: int) -> None:
+    sample = rollout([1] * length, [False] + [True] * (length - 1), 1.0)
+    groups = [training.RolloutGroup(task_id="0", prompt="test", rollouts=[sample])]
+    batch = batcher.prepare_batch(groups, context_length=context_length)  # (B=1, T=width), (B,) leaves.
+    assert all(array.shape == (1, width) for array in batch[:-1])
+    assert batch.advantages.shape == (1,)
+    assert int(batch.attention_mask.sum()) == length
+    assert int(batch.loss_mask.sum()) == length - 1
+    np.testing.assert_array_equal(batch.token_ids[0, :length], sample.sequence.token_ids)
 
 
 def test_prepare_minimal_sequences_and_multiple_groups(batcher: Any) -> None:
@@ -76,7 +97,7 @@ def test_prepare_minimal_sequences_and_multiple_groups(batcher: Any) -> None:
         for i, advantage in enumerate([0.0, 1.0])
     ]
     batch = batcher.prepare_batch(groups, context_length=8)
-    assert batch.token_ids.shape == (2, 2)
+    assert batch.token_ids.shape == (2, 8)
     np.testing.assert_array_equal(batch.advantages, [0.0, 1.0])
 
 
@@ -186,6 +207,23 @@ def test_accumulated_update_matches_full_batch_and_improves_policy(
     assert any(not np.array_equal(state.params[name], value) for name, value in accumulated.params.items())
 
 
+def test_update_logs_only_new_traces(
+    state: TrainState, batch: training.GRPOBatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A unique callable isolates this test's JIT cache without clearing other tests' entries.
+    state = state.replace(apply_fn=partial(state.apply_fn))
+    trace = partial(training.update.lower, state, microbatch_size=1, temperature=0.7, clip_coef=0.2)
+    caplog.set_level(logging.INFO, logger=training.__name__)
+    trace(batch)
+    trace(batch)
+    assert caplog.messages == ["JIT trace update: batch_shape=(2, 8) microbatch_size=1 temperature=0.7 clip_coef=0.2"]
+    caplog.clear()
+    shorter = jax.tree.map(lambda value: value[:, :5] if value.ndim == 2 else value, batch)  # (B, 5), (B,).
+    trace(shorter)
+    trace(batch)
+    assert caplog.messages == ["JIT trace update: batch_shape=(2, 5) microbatch_size=1 temperature=0.7 clip_coef=0.2"]
+
+
 def test_zero_advantages_leave_fresh_optimizer_parameters_unchanged(
     state: TrainState, batch: training.GRPOBatch
 ) -> None:
@@ -209,12 +247,20 @@ def test_learner_optimizes_and_publishes_updated_bf16_weights(
         config=training.Config(temperature=0.7, microbatch_size=2, update_epochs=2),
     )
     learner.model = model.clone(dtype="bfloat16", param_dtype=jnp.bfloat16)
+    learner.mesh = Mesh(devices=np.array([jax.devices()[0]]), axis_names=("batch",))
     learner.state = training.create_state(learner.model, state.params, training.Config(learning_rate=0.01))
     learner._transfer_group = Mock()
     batch = batcher.prepare_batch(groups, context_length=8)
     old = training.token_log_probs(learner.state, learner.state.params, batch, temperature=0.7)  # (B, T-1)
     batch = batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))
+    update = Mock(wraps=training.update)
+    monkeypatch.setattr(training, "update", update)
     metrics = learner.optimize(batch)
+    placed_batch = update.call_args.args[1]  # (B=2, T=8), (B,) leaves.
+    for placed, original in zip(placed_batch, batch, strict=True):
+        assert placed.shape == original.shape
+        assert placed.sharding == NamedSharding(learner.mesh, PartitionSpec("batch"))
+        np.testing.assert_array_equal(placed, original)
     assert int(learner.state.step) == 2
     assert metrics["policy/grad_norm"] > 0
     assert all(isinstance(value, float) for value in metrics.values())
@@ -225,7 +271,7 @@ def test_learner_optimizes_and_publishes_updated_bf16_weights(
         for name, value in learner.state.params.items():
             assert str(weights[name].dtype) == "torch.bfloat16"
             np.testing.assert_array_equal(
-                weights[name].float().numpy(), np.asarray(value.astype(jnp.bfloat16), dtype=np.float32)
+                weights[name].float().cpu().numpy(), np.asarray(value.astype(jnp.bfloat16), dtype=np.float32)
             )
 
     monkeypatch.setattr(training.NCCLWeightTransferEngine, "trainer_send_weights", send)

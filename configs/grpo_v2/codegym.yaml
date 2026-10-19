@@ -3,8 +3,8 @@ taskset:
   id: codegym
   # Set this to the CodeGym manager host; vLLM uses port 8000 on the trainer host.
   manager_url: http://codegym:8000
-  # Upstream example tasks. Replace with your generated JSONL or Parquet training file.
-  dataset_file: https://raw.githubusercontent.com/StigLidu/CodeGym/e85a439761ae2df813d5997a81bbd9f9e2ed27b7/example/training_instance.jsonl
+  # Full English-task/English-environment train split (80,130 rows across all four shards).
+  dataset_file: hf://datasets/VanishD/CodeGym@85286359a342f7a288aea74273772b69b9b784c2/task_en_instruction_en_env/train-*.parquet
 seed: 3
 num_groups: 4
 group_size: 8

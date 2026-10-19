@@ -13,8 +13,7 @@ from datasets import load_dataset
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, model_validator
 
 CODEGYM_TRAIN_FILE = (
-    "https://raw.githubusercontent.com/StigLidu/CodeGym/"
-    "e85a439761ae2df813d5997a81bbd9f9e2ed27b7/example/training_instance.jsonl"
+    "hf://datasets/VanishD/CodeGym@85286359a342f7a288aea74273772b69b9b784c2/task_en_instruction_en_env/train-*.parquet"
 )
 
 
