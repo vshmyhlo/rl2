@@ -55,6 +55,20 @@ def test_group_advantages(rewards: list[float], expected: list[float]) -> None:
     assert float(advantages.mean()) == pytest.approx(0.0, abs=1e-6)
 
 
+@pytest.mark.parametrize("batched", [False, True], ids=["single-group", "mixed-batch"])
+def test_group_advantages_fractional_ties_are_exactly_zero(batched: bool) -> None:
+    rewards = jnp.array([[0.7] * 8, [0.0, 1.0] * 4], dtype=jnp.float32)  # (B=2, G=8)
+    if not batched:
+        rewards = rewards[0]  # (G,)
+    for normalize in (utils.group_advantages, jax.jit(utils.group_advantages)):
+        advantages = normalize(rewards)  # (B, G) or (G,)
+        assert advantages.shape == rewards.shape
+        assert advantages.dtype == jnp.float32
+        np.testing.assert_array_equal(advantages[0] if batched else advantages, 0.0)
+        if batched:
+            np.testing.assert_allclose(advantages[1], [-1.0, 1.0] * 4, atol=3e-4)
+
+
 @pytest.mark.parametrize("shape", [(0,), (2, 1)], ids=["empty", "singleton-groups"])
 def test_group_advantages_requires_multiple_rewards(shape: tuple[int, ...]) -> None:
     rewards = jnp.zeros(shape, dtype=jnp.float32)  # (*B, G)

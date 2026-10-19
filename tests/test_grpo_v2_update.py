@@ -212,15 +212,17 @@ def test_update_logs_only_new_traces(
 ) -> None:
     # A unique callable isolates this test's JIT cache without clearing other tests' entries.
     state = state.replace(apply_fn=partial(state.apply_fn))
-    trace = partial(training.update.lower, state, grad_accum_steps=2, temperature=0.7, clip_coef=0.2)
+    trace = partial(training.update.lower, grad_accum_steps=2, temperature=0.7, clip_coef=0.2)
     caplog.set_level(logging.INFO, logger=training.__name__)
-    trace(batch)
-    trace(batch)
+    trace(state, batch)
+    trace(state, batch)
+    # The device scalar returned by the first update must reuse the initial trace.
+    trace(state.replace(step=jnp.asarray(1, dtype=jnp.int32)), batch)
     assert caplog.messages == ["JIT trace update: batch_shape=(2, 8) grad_accum_steps=2 temperature=0.7 clip_coef=0.2"]
     caplog.clear()
     shorter = jax.tree.map(lambda value: value[:, :5] if value.ndim == 2 else value, batch)  # (B, 5), (B,).
-    trace(shorter)
-    trace(batch)
+    trace(state, shorter)
+    trace(state, batch)
     assert caplog.messages == ["JIT trace update: batch_shape=(2, 5) grad_accum_steps=2 temperature=0.7 clip_coef=0.2"]
 
 
@@ -242,7 +244,9 @@ def test_update_rejects_invalid_accumulation(
         training.update.lower(state, batch, grad_accum_steps=grad_accum_steps, temperature=0.7, clip_coef=0.2)
 
 
-@pytest.mark.parametrize("epochs,minibatches", [(1, 4), (2, 2)], ids=["default", "multiple-epochs"])
+@pytest.mark.parametrize(
+    "epochs,minibatches", [(1, 1), (1, 4), (2, 2)], ids=["single-minibatch", "default", "multiple-epochs"]
+)
 def test_learner_shuffles_each_epoch_and_averages_metrics(
     state: TrainState,
     batch: training.GRPOBatch,

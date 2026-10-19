@@ -80,7 +80,9 @@ def group_advantages(
     if rewards.shape[-1] < 2:
         raise ValueError("A rollout group needs at least two rewards")
     centered = rewards - rewards.mean(axis=-1, keepdims=True)  # (*B, G)
-    return centered / (rewards.std(axis=-1, keepdims=True) + 1e-4)  # (*B, G)
+    # Equal fractional rewards can round to a different mean in float32.
+    tied = jnp.all(rewards == rewards[..., :1], axis=-1, keepdims=True)  # (*B, 1)
+    return jnp.where(tied, 0.0, centered / (rewards.std(axis=-1, keepdims=True) + 1e-4))  # (*B, G)
 
 
 def read_bytes(path: str) -> bytes:

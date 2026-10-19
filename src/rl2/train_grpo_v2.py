@@ -274,7 +274,7 @@ def create_state(model: Qwen3LM, params: Parameters, config: Config) -> TrainSta
         apply_fn=model.apply,
         params=jax.tree.map(lambda value: value.astype(jnp.float32), params),  # HF parameter shapes.
         tx=optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adam(config.learning_rate)),
-    )
+    ).replace(step=jnp.asarray(0, dtype=jnp.int32))  # () Match the device counter returned by update.
 
 
 @partial(jax.jit, static_argnames=("grad_accum_steps", "temperature", "clip_coef"))
