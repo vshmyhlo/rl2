@@ -31,7 +31,7 @@ from verifiers.v1.trace import AgentInfo, TraceTask
 
 from rl2 import train_grpo_v2 as training
 from rl2.addition_env import AdditionTaskset, AdditionTools
-from rl2.toolrl_env import ToolCall, ToolRLData, ToolRLTask
+from rl2.toolrl_env import ToolCall, ToolRLData, ToolRLRenderer, ToolRLTask
 
 
 def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -254,12 +254,31 @@ def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPa
     server.__exit__.assert_called_once()
 
 
+@pytest.fixture
+def rollout() -> training.Rollout:
+    return training.Rollout(
+        sequence=training.TrainingSequence(
+            token_ids=np.array([1, 2], dtype=np.int32),  # (T=2,)
+            loss_mask=np.array([False, True]),  # (T=2,)
+            old_log_probs=np.array([0.0, -0.2], dtype=np.float32),  # (T=2,)
+        ),
+        reward=1.0,
+        advantage=0.5,
+        completion="2",
+        num_turns=1,
+        num_input_tokens=1,
+        num_output_tokens=1,
+        rollout_seconds=0.1,
+        stop_condition="agent_completed",
+    )
+
+
 @pytest.mark.parametrize(("num_groups", "fails"), [(1, False), (2, False), (2, True)])
 def test_learner_pulls_groups_through_batcher(
-    num_groups: int, fails: bool, learner: Any, monkeypatch: pytest.MonkeyPatch
+    num_groups: int, fails: bool, learner: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     actor = Mock()
-    groups = [training.RolloutGroup(task_id=str(i), prompt="test", rollouts=[]) for i in range(num_groups)]
+    groups = [training.RolloutGroup(task_id=str(i), prompt="test", rollouts=[rollout] * 3) for i in range(num_groups)]
     results = [training.Transfer(value=group, ready_at=training.time.monotonic()) for group in groups]
     actor.fetch_next_group.remote = AsyncMock(
         side_effect=[results[0], RuntimeError("rollout failed")] if fails else results
@@ -280,8 +299,12 @@ def test_learner_pulls_groups_through_batcher(
     else:
         batch = learner.fetch_next_batch(num_groups=num_groups, group_size=3)
         assert batch.groups == groups
-        assert batch.transfer_metrics["data/batch_array_bytes"] == 0
-    batcher_handle.fetch_next_batch.remote.assert_called_once_with(num_groups=num_groups, group_size=3)
+        assert batch.training_batch.token_ids.shape == (num_groups * 3, 2)
+        np.testing.assert_array_equal(batch.training_batch.advantages, 0.5)
+        assert batch.transfer_metrics["data/batch_array_bytes"] == num_groups * 3 * 42
+    batcher_handle.fetch_next_batch.remote.assert_called_once_with(
+        num_groups=num_groups, group_size=3, context_length=8
+    )
     assert actor.fetch_next_group.remote.call_count == num_groups
     assert all(call.kwargs == {"group_size": 3} for call in actor.fetch_next_group.remote.call_args_list)
 
@@ -290,17 +313,17 @@ def test_batch_requires_groups() -> None:
     actor = Mock()
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor)
     with pytest.raises(ValueError, match="num_groups"):
-        asyncio.run(batcher.fetch_next_batch(num_groups=0, group_size=2))
+        asyncio.run(batcher.fetch_next_batch(num_groups=0, group_size=2, context_length=8))
     actor.fetch_next_group.remote.assert_not_called()
 
 
 def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
-    learner: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    learner: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     clock = Mock(return_value=0.0)
     monkeypatch.setattr(training, "time", Mock(monotonic=clock))
     caplog.set_level("INFO", logger=training.__name__)
-    groups = [training.RolloutGroup(task_id=str(i), prompt="test", rollouts=[]) for i in range(2)]
+    groups = [training.RolloutGroup(task_id=str(i), prompt="test", rollouts=[rollout] * 2) for i in range(2)]
     fast_ready = asyncio.Event()
     requested = 0
 
@@ -325,22 +348,33 @@ def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
     actor.fetch_next_group.remote.side_effect = fetch_group
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor)
     learner.batcher.fetch_next_batch.remote.side_effect = batcher.fetch_next_batch
+    prepare_batch = batcher.prepare_batch
+
+    def prepare(groups: list[training.RolloutGroup], context_length: int) -> training.GRPOBatch:
+        batch = prepare_batch(groups, context_length=context_length)  # (B, T), (B,) leaves.
+        clock.return_value += 2.0
+        return batch  # (B, T), (B,) leaves.
+
+    monkeypatch.setattr(batcher, "prepare_batch", prepare)
 
     def get(pending: Any) -> training.Transfer[training.RolloutBatch]:
         result = asyncio.run(pending)
-        assert result.ready_at == 50.5
+        assert result.ready_at == 52.5
         result = pickle.loads(pickle.dumps(result))
-        clock.return_value = 51.25
+        clock.return_value = 53.25
         return result
 
     monkeypatch.setattr(training.ray, "get", get)
     batch = learner.fetch_next_batch(num_groups=2, group_size=2)
-    assert batch.groups == groups  # Preserve request order despite out-of-order completion.
+    # Preserve request order despite out-of-order completion and serialization.
+    np.testing.assert_equal([asdict(group) for group in batch.groups], [asdict(group) for group in groups])
+    assert batch.training_batch.token_ids.shape == (4, 2)
     assert batch.transfer_metrics == {
-        "time/actor_to_batcher_seconds_mean": 0.375,
-        "time/actor_to_batcher_seconds_max": 0.5,
-        "time/batcher_to_learner_seconds": 0.75,
-        "data/batch_array_bytes": 0,
+        "time/batcher/fetch_rollout_seconds": 50.5,
+        "time/batcher/prepare_batch_seconds": 2.0,
+        "time/batcher/actor_to_batcher_seconds": 0.375,
+        "time/learner/batcher_to_learner_seconds": 0.75,
+        "data/batch_array_bytes": 168,
     }
     assert "Actor -> Batcher: task=1 seconds=0.250000" in caplog.text
     assert "Actor -> Batcher: task=0 seconds=0.500000" in caplog.text
@@ -354,11 +388,14 @@ def learner(monkeypatch: pytest.MonkeyPatch) -> Any:
         "model.norm.weight": jnp.ones(3, dtype=jnp.bfloat16),  # (D,)
         "model.embed_tokens.weight": jnp.arange(6, dtype=jnp.bfloat16).reshape(2, 3),  # (V, D)
     }
-    loader = Mock(return_value=(Mock(), {"params": params}))
+    model = Mock()
+    model.config.max_position_embeddings = 8
+    loader = Mock(return_value=(model, {"params": params}))
     monkeypatch.setattr(training, "load_qwen3_checkpoint", loader)
     monkeypatch.setattr(training.jax, "devices", Mock(return_value=[device]))
     config = training.Config(model="Qwen/custom")
     learner = training.Learner.__ray_metadata__.modified_class(batcher=Mock(), actor=Mock(), config=config)
+    learner.model = model
     loader.assert_not_called()
     assert not hasattr(learner, "state")
     return learner
@@ -379,8 +416,9 @@ def test_learner_logs_rollouts(
     degenerate_fraction: float,
     learner: Any,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level("INFO", logger=training.__name__)
     sequence = training.TrainingSequence(
         token_ids=np.array([1], dtype=np.int32),  # (T=1,)
         loss_mask=np.array([True]),  # (T=1,)
@@ -413,6 +451,7 @@ def test_learner_logs_rollouts(
     rewards = [reward for group in group_rewards for reward in group]
     learner.config = replace(learner.config, num_groups=2, group_size=2, total_iterations=None if fails else 2)
     writer = MagicMock()
+    writer.run_id = "mlflow-run"
     writer.__enter__.return_value = writer
     factory = Mock(return_value=writer)
     monkeypatch.setattr(training, "MLflowLogger", factory)
@@ -427,18 +466,20 @@ def test_learner_logs_rollouts(
     learner.initialize_weight_transfer = steps.initialize
     learner.fetch_next_batch = steps.fetch
     transfer_metrics = {
-        "time/actor_to_batcher_seconds_mean": 0.25,
-        "time/actor_to_batcher_seconds_max": 0.3,
-        "time/batcher_to_learner_seconds": 0.125,
+        "time/batcher/fetch_rollout_seconds": 0.5,
+        "time/batcher/prepare_batch_seconds": 0.25,
+        "time/batcher/actor_to_batcher_seconds": 0.25,
+        "time/learner/batcher_to_learner_seconds": 0.125,
         "data/batch_array_bytes": sum(training.rollout_array_bytes(group) for group in batch),
     }
     assert transfer_metrics["data/batch_array_bytes"] == 36  # Four sequences, each int32 + bool + float32.
-    received = training.RolloutBatch(groups=batch, transfer_metrics=transfer_metrics)
+    prepared = Mock(spec=training.GRPOBatch)
+    received = training.RolloutBatch(groups=batch, training_batch=prepared, transfer_metrics=transfer_metrics)
     learner.fetch_next_batch.side_effect = [received, RuntimeError("done") if fails else received]
     learner.publish_weights = steps.publish
 
-    def optimize(groups: list[training.RolloutGroup]) -> dict[str, float]:
-        assert groups is batch
+    def optimize(batch: training.GRPOBatch) -> dict[str, float]:
+        assert batch is prepared
         learner.state = learner.state.replace(step=learner.state.step + 1)
         return {"losses/policy": -0.25}
 
@@ -467,7 +508,7 @@ def test_learner_logs_rollouts(
     calls = writer.log_metrics.call_args_list
     assert len(calls) == (2 if fails else 3)
     assert calls[0].kwargs == {"step": 0}
-    assert calls[0].args[0] == {"model/params_millions": 9 / 1_000_000, "time/setup_seconds": 1}
+    assert calls[0].args[0] == {"model/params_millions": 9 / 1_000_000, "time/learner/setup_seconds": 1}
     assert calls[1].kwargs == {"step": 1}
     assert calls[1].args[0] == {
         **transfer_metrics,
@@ -484,22 +525,93 @@ def test_learner_logs_rollouts(
         "charts/total_updates": 1,
         "charts/learning_rate": learner.config.learning_rate,
         "charts/total_rollouts": 4,
-        "time/rollouts_per_second": 4 / 3,
-        "time/output_tokens_per_second": 16 / 3,
-        "time/rollout_seconds_mean": 1.0,
-        "time/batch_seconds": 1.0,
-        "time/update_seconds": 1.0,
-        "time/weight_transfer_seconds": 1.0,
-        "time/iteration_seconds": 3.0,
-        "time/elapsed_seconds": 5.0,
+        "time/learner/iterations_per_second": 1 / 3,
+        "time/learner/rollouts_per_second": 4 / 3,
+        "time/learner/output_tokens_per_second": 16 / 3,
+        "time/actor/rollout_seconds": 1.0,
+        "time/learner/batch_seconds": 1.0,
+        "time/learner/update_seconds": 1.0,
+        "time/learner/weight_transfer_seconds": 1.0,
+        "time/learner/iteration_seconds": 3.0,
     }
     if not fails:
         assert calls[2].kwargs == {"step": 2}
         assert calls[2].args[0]["charts/total_rollouts"] == 8
         assert calls[2].args[0]["charts/degenerate_group_fraction"] == degenerate_fraction
-    assert f"degenerate_group_fraction={degenerate_fraction:.3f}" in capsys.readouterr().out
+    assert "Run ID: None; MLflow run: mlflow-run" in caplog.messages
+    assert (
+        f"iteration=1 reward={mean(rewards):.3f} degenerate_group_fraction={degenerate_fraction:.3f} "
+        "batch=1.00s group_transfer=0.250000s batch_transfer=0.125000s "
+        "loss=-0.2500 update=1.00s weights=1.00s"
+    ) in caplog.messages
     writer.__exit__.assert_called_once()
     assert writer.__exit__.call_args.args[0] is (RuntimeError if fails else None)
+
+
+def test_learner_logs_examples_every_ten_steps(
+    learner: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger=training.__name__)
+    rollout = training.Rollout(
+        sequence=training.TrainingSequence(
+            token_ids=np.array([1, 2], dtype=np.int32),  # (T=2,)
+            loss_mask=np.array([False, True]),  # (T=2,)
+            old_log_probs=np.array([0.0, -0.2], dtype=np.float32),  # (T=2,)
+        ),
+        reward=1.0,
+        advantage=0.5,
+        completion='<think>Use add.</think>\n<tool_call>{"name": "add"}</tool_call>',
+        num_turns=1,
+        num_input_tokens=1,
+        num_output_tokens=1,
+        rollout_seconds=0.1,
+        stop_condition="max_turns",
+    )
+    groups = [
+        training.RolloutGroup(task_id="task-1", prompt="Add:\n1 + 2", rollouts=[rollout, rollout]),
+        training.RolloutGroup(
+            task_id=None,
+            prompt="Another prompt",
+            rollouts=[replace(rollout, completion="", stop_condition=None), replace(rollout, completion="omitted")],
+        ),
+    ]
+    learner.config = replace(learner.config, num_groups=2, group_size=2, total_iterations=21)
+    learner.initialize_weight_transfer = Mock()
+    learner.publish_weights = Mock()
+    learner.optimize = Mock(return_value={"losses/policy": 0.0})
+    learner.fetch_next_batch = Mock(
+        return_value=training.RolloutBatch(
+            groups=groups,
+            training_batch=Mock(spec=training.GRPOBatch),
+            transfer_metrics={
+                "time/batcher/actor_to_batcher_seconds": 0.0,
+                "time/learner/batcher_to_learner_seconds": 0.0,
+            },
+        )
+    )
+    writer = MagicMock()
+    writer.__enter__.return_value = writer
+    monkeypatch.setattr(training, "MLflowLogger", Mock(return_value=writer))
+
+    learner.start()
+
+    artifacts = writer.log_text.call_args_list[1:]  # Skip the config artifact.
+    assert [call.args[1] for call in artifacts] == ["examples/10.txt", "examples/20.txt"]
+    messages = [message for message in caplog.messages if "Rollout examples | step" in message]
+    assert len(messages) == 2
+    for step, call, message in zip((10, 20), artifacts, messages, strict=True):
+        text = call.args[0]
+        assert message == f"\n{text}"
+        assert text.startswith(f"Rollout examples | step {step}\n\n{'=' * 72}\n")
+        assert "Example 1 | task=task-1 | reward=1.000 | advantage=0.500" in text
+        assert "Turns: 1 | Output tokens: 1 | Stop: max_turns" in text
+        assert "Prompt:\n    Add:\n    1 + 2" in text
+        assert (
+            'Final assistant output:\n    <think>Use add.</think>\n    <tool_call>{"name": "add"}</tool_call>'
+        ) in text
+        assert "Example 3 | task=None" in text
+        assert "Final assistant output:\n    (empty)" in text
+        assert "Example 4" not in text and "omitted" not in text
 
 
 @pytest.mark.parametrize("failure", ["receiver", "publish"])
@@ -927,7 +1039,7 @@ def test_batcher_collects_groups_concurrently(
 
     async def collect() -> training.Transfer[training.RolloutBatch]:
         async with asyncio.timeout(5):
-            return await batcher.fetch_next_batch(num_groups=2, group_size=2)
+            return await batcher.fetch_next_batch(num_groups=2, group_size=2, context_length=16)
 
     groups = asyncio.run(collect()).value.groups
     assert started == 4
@@ -1099,6 +1211,20 @@ def test_verifiers_tool_rollout(
     prompt = tokenizer.decode(requests[0]["token_ids"])
     assert '"name": "add"' in prompt
     assert prompt.endswith("<think>\n\n</think>\n\n")
+
+
+def test_toolrl_renderer_preserves_text(tokenizer: PreTrainedTokenizerFast) -> None:
+    tokenizer.clean_up_tokenization_spaces = True
+    renderer = ToolRLRenderer(tokenizer)
+    text = '<think>Plan .</think>\n<tool_call>\n{"name":"say","parameters":{"text":"Hello ."}}\n</tool_call>'
+    tokens = tokenizer.encode(text + "<|im_end|>")  # (T,)
+    assert tokenizer.decode(tokens).startswith("<think>Plan.</think>")
+    parsed = renderer.parse_response(tokens)
+    assert parsed.content == text
+    assert parsed.tool_calls == []
+    assert parsed.reasoning_content is None
+    unfinished = "<think>Still thinking ."
+    assert renderer.parse_response(tokenizer.encode(unfinished)).content == unfinished
 
 
 def test_verifiers_toolrl_rollout(

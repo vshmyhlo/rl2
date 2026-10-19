@@ -32,6 +32,11 @@ def rollout(tokens: list[int], mask: list[bool], advantage: float) -> training.R
 
 
 @pytest.fixture
+def batcher() -> Any:
+    return training.Batcher.__ray_metadata__.modified_class(actor=Mock())
+
+
+@pytest.fixture
 def groups() -> list[training.RolloutGroup]:
     return [
         training.RolloutGroup(
@@ -46,11 +51,12 @@ def groups() -> list[training.RolloutGroup]:
 
 
 @pytest.mark.parametrize("context_length,width", [(8, 8), (5, 5)], ids=["bucketed", "context-boundary"])
-def test_prepare_batch(groups: list[training.RolloutGroup], context_length: int, width: int) -> None:
-    batch = training.prepare_batch(groups, context_length=context_length)
+def test_prepare_batch(batcher: Any, groups: list[training.RolloutGroup], context_length: int, width: int) -> None:
+    batch = batcher.prepare_batch(groups, context_length=context_length)
     assert batch.token_ids.shape == batch.attention_mask.shape == batch.loss_mask.shape == (2, width)
     assert batch.old_log_probs.shape == (2, width)
     assert batch.advantages.shape == (2,)
+    assert all(array.device.platform == "cpu" for array in batch)
     assert batch.token_ids.dtype == jnp.int32
     assert batch.attention_mask.dtype == batch.loss_mask.dtype == jnp.bool_
     assert batch.old_log_probs.dtype == batch.advantages.dtype == jnp.float32
@@ -64,18 +70,20 @@ def test_prepare_batch(groups: list[training.RolloutGroup], context_length: int,
     assert not np.asarray(batch.loss_mask[1, 3:]).any()
 
 
-def test_prepare_minimal_sequences_and_multiple_groups() -> None:
+def test_prepare_minimal_sequences_and_multiple_groups(batcher: Any) -> None:
     groups = [
         training.RolloutGroup(task_id=str(i), prompt="test", rollouts=[rollout([1, 2], [False, True], advantage)])
         for i, advantage in enumerate([0.0, 1.0])
     ]
-    batch = training.prepare_batch(groups, context_length=8)
+    batch = batcher.prepare_batch(groups, context_length=8)
     assert batch.token_ids.shape == (2, 2)
     np.testing.assert_array_equal(batch.advantages, [0.0, 1.0])
 
 
 @pytest.mark.parametrize("failure", ["empty", "overlong", "no-context", "no-samples", "single-token"])
-def test_prepare_batch_rejects_unusable_sequences(failure: str, groups: list[training.RolloutGroup]) -> None:
+def test_prepare_batch_rejects_unusable_sequences(
+    batcher: Any, failure: str, groups: list[training.RolloutGroup]
+) -> None:
     if failure == "empty":
         groups = []
     elif failure in {"no-context", "no-samples", "single-token"}:
@@ -86,7 +94,7 @@ def test_prepare_batch_rejects_unusable_sequences(failure: str, groups: list[tra
         }[failure]
         groups = [replace(groups[0], rollouts=[sample])]
     with pytest.raises(ValueError):
-        training.prepare_batch(groups, context_length=4 if failure == "overlong" else 8)
+        batcher.prepare_batch(groups, context_length=4 if failure == "overlong" else 8)
 
 
 def test_objective_clipping_masking_and_sequence_weighting() -> None:
@@ -140,8 +148,8 @@ def state(model: Qwen3LM) -> TrainState:
 
 
 @pytest.fixture
-def batch(groups: list[training.RolloutGroup], state: TrainState) -> training.GRPOBatch:
-    batch = training.prepare_batch(groups, context_length=8)
+def batch(batcher: Any, groups: list[training.RolloutGroup], state: TrainState) -> training.GRPOBatch:
+    batch = batcher.prepare_batch(groups, context_length=8)
     old = training.token_log_probs(state, state.params, batch, temperature=0.7)  # (B=2, T-1=7)
     return batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))
 
@@ -189,6 +197,7 @@ def test_zero_advantages_leave_fresh_optimizer_parameters_unchanged(
 
 
 def test_learner_optimizes_and_publishes_updated_bf16_weights(
+    batcher: Any,
     model: Qwen3LM,
     state: TrainState,
     groups: list[training.RolloutGroup],
@@ -202,12 +211,10 @@ def test_learner_optimizes_and_publishes_updated_bf16_weights(
     learner.model = model.clone(dtype="bfloat16", param_dtype=jnp.bfloat16)
     learner.state = training.create_state(learner.model, state.params, training.Config(learning_rate=0.01))
     learner._transfer_group = Mock()
-    batch = training.prepare_batch(groups, context_length=8)
+    batch = batcher.prepare_batch(groups, context_length=8)
     old = training.token_log_probs(learner.state, learner.state.params, batch, temperature=0.7)  # (B, T-1)
     batch = batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))
-    for index, sample in enumerate(groups[0].rollouts):
-        sample.sequence.old_log_probs[:] = np.asarray(batch.old_log_probs[index, : len(sample.sequence.token_ids)])
-    metrics = learner.optimize(groups)
+    metrics = learner.optimize(batch)
     assert int(learner.state.step) == 2
     assert metrics["policy/grad_norm"] > 0
     assert all(isinstance(value, float) for value in metrics.values())

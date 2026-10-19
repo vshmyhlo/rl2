@@ -5,7 +5,7 @@ from collections.abc import Iterable
 
 import verifiers.v1 as vf
 from datasets import load_dataset
-from pydantic import BaseModel, ConfigDict, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from renderers.base import ParsedResponse, ToolSpec
 from renderers.configs import Qwen3RendererConfig
 from renderers.qwen3 import Qwen3Renderer
@@ -32,7 +32,11 @@ class ToolRLRenderer(Qwen3Renderer):
         stop_ids = self.get_stop_token_ids()
         while end and token_ids[end - 1] in stop_ids:
             end -= 1
-        return ParsedResponse(content=self._tokenizer.decode(token_ids[:end], skip_special_tokens=False))
+        return ParsedResponse(
+            content=self._tokenizer.decode(
+                token_ids[:end], skip_special_tokens=False, clean_up_tokenization_spaces=False
+            )
+        )
 
 
 class ToolCall(BaseModel):
@@ -46,7 +50,10 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
     match = re.search(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
     if match is None:
         raise ValueError("Missing tool_call block")
-    return [ToolCall.model_validate(json.loads(line)) for line in match.group(1).strip().split("\n")]
+    try:
+        return [ToolCall.model_validate(json.loads(line)) for line in match.group(1).strip().split("\n")]
+    except RecursionError as error:
+        raise ValueError("Tool calls exceed the JSON nesting limit") from error
 
 
 def format_reward(completion: str, answer: str) -> float:
@@ -117,7 +124,7 @@ class RewardReference(BaseModel):
 
 
 class ToolRLRow(BaseModel):
-    prompt: vf.Messages
+    prompt: vf.Messages = Field(min_length=1)
     reward_model: RewardReference
 
 
@@ -135,6 +142,8 @@ class ToolRLTaskset(vf.Taskset[ToolRLTask, ToolRLTasksetConfig]):
                 parsed = ToolRLRow.model_validate(row)
                 answer = parsed.reward_model.ground_truth
                 calls = parse_tool_calls(answer) if "<tool_call>" in answer else []
+                if not format_reward(answer, answer):
+                    raise ValueError("Reference response does not follow ToolRL's output format")
             except ValueError as error:
                 raise ValueError(f"Invalid ToolRL row {index}: {error}") from error
             yield ToolRLTask(

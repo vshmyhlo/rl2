@@ -42,6 +42,15 @@ def test_tool_correctness(prediction: str, score: float) -> None:
     assert env.tool_correctness(f"<tool_call>\n{prediction}\n</tool_call>", expected) == score
 
 
+def test_deeply_nested_json_is_a_bad_completion() -> None:
+    depth = 10_000  # Exceed the JSON decoder's C-stack limit, not just Pydantic's validation depth.
+    text = '<tool_call>\n{"name":"add","parameters":{"a":' + "[" * depth + "0" + "]" * depth + "}}\n</tool_call>"
+    expected = [env.ToolCall(name="add", parameters={"a": 1})]
+    assert env.tool_correctness(text, expected) == -3.0
+    with pytest.raises(ValueError, match="nesting"):
+        env.parse_tool_calls(text)
+
+
 def test_multiple_calls_match_without_reusing_predictions() -> None:
     calls = [{"name": "add", "parameters": {"a": a}} for a in [1, 2]]
     answer = completion(calls)
@@ -114,7 +123,26 @@ def test_load_parquet_and_score(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert trace.reward == 1.0  # Upstream does not grade response-only semantics.
 
 
-@pytest.mark.parametrize("rows", [[], [{"prompt": [], "reward_model": {"ground_truth": "<tool_call>bad</tool_call>"}}]])
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],
+        [
+            {
+                "prompt": [{"role": "user", "content": "Call add"}],
+                "reward_model": {"ground_truth": "<tool_call>bad</tool_call>"},
+            }
+        ],
+        [{"prompt": [], "reward_model": {"ground_truth": "<think>Plan.</think>\n<response>Done.</response>"}}],
+        [
+            {
+                "prompt": [{"role": "user", "content": "Ask for details"}],
+                "reward_model": {"ground_truth": "<think>Plan.</think>\n<response>Unclosed"},
+            }
+        ],
+    ],
+    ids=["empty-dataset", "invalid-reference-json", "empty-prompt", "incomplete-reference"],
+)
 def test_invalid_dataset(rows: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(env, "load_dataset", Mock(return_value=rows))
     with pytest.raises(ValueError, match="empty|Invalid ToolRL row 0"):

@@ -3,8 +3,8 @@ taskset: toolrl
 # Official train split, pinned to an upstream revision. A local Parquet path also works.
 dataset_file: https://raw.githubusercontent.com/qiancheng0/ToolRL/8cee13ec0ca72f0461da372a93a6fd8140dbb840/dataset/rlla_4k/train.parquet
 seed: 1
-num_groups: 1
-group_size: 4
+num_groups: 4
+group_size: 8
 total_iterations: null
 max_tokens: 1024
 max_turns: 1

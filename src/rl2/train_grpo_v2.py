@@ -1,3 +1,55 @@
+"""GRPO training with a JAX learner, vLLM rollouts, and Ray actors.
+
+MLflow's metric step counts completed training iterations: one rollout batch,
+its optimizer updates, and publication of the updated weights.
+
+Startup scalars (step 0):
+    model/params_millions: Model parameter count in millions.
+    time/learner/setup_seconds: Learner setup wall time, including the initial weight transfer.
+
+Optimization scalars (averaged over update epochs):
+    losses/policy: Clipped GRPO policy loss.
+    policy/approx_kl: Approximate KL divergence from the sampling policy.
+    policy/clip_fraction: Fraction of sampled-token probability ratios outside the clip range.
+    policy/grad_norm: Global gradient norm after microbatch averaging, before clipping.
+Loss, KL, and clip fraction average sampled tokens within each rollout, then rollouts.
+
+Rollout batch scalars:
+    charts/reward_mean: Mean raw rollout reward.
+    charts/reward_std: Population standard deviation of raw rollout rewards.
+    charts/reward_min: Minimum raw rollout reward.
+    charts/reward_max: Maximum raw rollout reward.
+    charts/degenerate_group_fraction: Fraction of groups with identical rewards and zero advantages.
+    charts/turns_mean: Mean model responses per rollout, including tool calls.
+    charts/input_tokens_mean: Mean newly fed input tokens per rollout; a lower bound if context is rewritten.
+    charts/output_tokens_mean: Mean sampled tokens per rollout across all model calls.
+    data/batch_array_bytes: Sequence-array bytes, excluding text, metadata, and serialization overhead.
+
+Training progress and settings:
+    charts/total_iterations: Cumulative completed training iterations.
+    charts/total_updates: Cumulative optimizer updates.
+    charts/total_rollouts: Cumulative rollouts used for training.
+    charts/learning_rate: Configured optimizer learning rate.
+
+Timing and throughput (logged every iteration):
+    time/learner/iterations_per_second: Reciprocal of iteration wall time.
+    time/learner/rollouts_per_second: Batch rollout count divided by iteration wall time.
+    time/learner/output_tokens_per_second: Batch sampled-token count divided by iteration wall time.
+    time/actor/rollout_seconds: Mean agent execution time per rollout, including model calls and tools.
+    time/batcher/fetch_rollout_seconds: Wall time fetching all rollout groups, including actor return transfers.
+    time/batcher/prepare_batch_seconds: Wall time preparing and materializing the CPU training arrays.
+    time/learner/batch_seconds: Wall time fetching the rollout batch, including generation, scoring, and Ray transfers.
+    time/learner/update_seconds: Device transfer and optimizer update wall time.
+    time/learner/weight_transfer_seconds: Wall time publishing updated learner weights to vLLM.
+    time/learner/iteration_seconds: Batch fetching, optimization, and weight publication wall time.
+    time/batcher/actor_to_batcher_seconds: Mean group transfer latency from actor return to batcher receipt.
+    time/learner/batcher_to_learner_seconds: Batch transfer latency from batcher return to learner receipt.
+Ray transfer latencies include serialization and scheduling. Iteration timing and
+throughput exclude that iteration's metric logging. Cumulative counters start at
+zero for each training session.
+Output-token counts use reported completion usage, counting zero when usage is unavailable.
+"""
+
 import argparse
 import asyncio
 import logging
@@ -10,7 +62,9 @@ from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from functools import partial
+from itertools import islice
 from statistics import mean, pstdev
+from textwrap import indent
 from typing import Annotated, Any, Literal, NamedTuple
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -108,10 +162,21 @@ class Transfer[T]:
     ready_at: float  # Same-node monotonic timestamp immediately before Ray serializes the return value.
 
 
-@dataclass(frozen=True)
-class RolloutBatch:
-    groups: list[RolloutGroup]
-    transfer_metrics: dict[str, float | int]
+def format_rollout_examples(groups: list[RolloutGroup], step: int) -> str:
+    """Format up to three final replies from the batch in sampling order."""
+    sections = [f"Rollout examples | step {step}"]
+    examples = islice(((group, rollout) for group in groups for rollout in group.rollouts), 3)
+    for index, (group, rollout) in enumerate(examples, start=1):
+        sections.append(
+            f"{'=' * 72}\n"
+            f"Example {index} | task={group.task_id} | reward={rollout.reward:.3f} | "
+            f"advantage={rollout.advantage:.3f}\n"
+            f"Turns: {rollout.num_turns} | Output tokens: {rollout.num_output_tokens} | "
+            f"Stop: {rollout.stop_condition}\n\n"
+            f"Prompt:\n{indent(group.prompt or '(empty)', '    ')}\n\n"
+            f"Final assistant output:\n{indent(rollout.completion or '(empty)', '    ')}"
+        )
+    return "\n\n".join(sections)
 
 
 def rollout_array_bytes(group: RolloutGroup) -> int:
@@ -131,43 +196,15 @@ class GRPOBatch(NamedTuple):
     advantages: jax.Array  # (B,) Normalized within each rollout group.
 
 
+@dataclass(frozen=True)
+class RolloutBatch:
+    groups: list[RolloutGroup]
+    training_batch: GRPOBatch  # Leaves: (B, T), except advantages: (B,).
+    transfer_metrics: dict[str, float | int]
+
+
 # Use a value alias so Ray can serialize script-defined actors without importing __main__.Metrics.
 Metrics = dict[str, jax.Array]  # Scalar leaves.
-
-
-def prepare_batch(groups: list[RolloutGroup], context_length: int) -> GRPOBatch:
-    rollouts = [rollout for group in groups for rollout in group.rollouts]
-    if not rollouts:
-        raise ValueError("A training batch must contain rollouts")
-    length = max(len(rollout.sequence.token_ids) for rollout in rollouts)
-    if length > context_length:
-        raise ValueError(f"Rollout length {length} exceeds model context length {context_length}")
-    width = min(1 << (length - 1).bit_length(), context_length)
-    shape = (len(rollouts), width)
-    # Stage variable-length host transcripts before a single device transfer.
-    tokens = np.zeros(shape, dtype=np.int32)  # (B, T)
-    attention_mask, loss_mask = (np.zeros(shape, dtype=np.bool_) for _ in range(2))  # Each (B, T).
-    old_log_probs = np.zeros(shape, dtype=np.float32)  # (B, T)
-    for index, rollout in enumerate(rollouts):
-        sequence = rollout.sequence
-        length = len(sequence.token_ids)
-        if length < 2 or sequence.loss_mask[0] or not sequence.loss_mask[1:].any():
-            raise ValueError("Each rollout needs context followed by at least one sampled token")
-        tokens[index, :length] = sequence.token_ids
-        attention_mask[index, :length] = True
-        loss_mask[index, :length] = sequence.loss_mask
-        old_log_probs[index, :length] = sequence.old_log_probs
-    arrays = jax.tree.map(
-        jnp.asarray,
-        {
-            "token_ids": tokens,  # (B, T)
-            "attention_mask": attention_mask,  # (B, T)
-            "loss_mask": loss_mask,  # (B, T)
-            "old_log_probs": old_log_probs,  # (B, T)
-            "advantages": np.asarray([rollout.advantage for rollout in rollouts], dtype=np.float32),  # (B,)
-        },
-    )
-    return GRPOBatch(**arrays)
 
 
 def token_log_probs(
@@ -391,7 +428,58 @@ class Batcher:
     def __init__(self, actor: ActorHandle) -> None:
         self.actor = actor
 
-    async def fetch_next_batch(self, num_groups: int, group_size: int) -> Transfer[RolloutBatch]:
+    def prepare_batch(self, groups: list[RolloutGroup], context_length: int) -> GRPOBatch:
+        """Flatten rollout groups in order and right-pad their transcripts into CPU JAX arrays.
+
+        B is the total rollout count; T is the longest transcript length rounded up
+        to a power of two, capped at context_length. Padding is zero/False, and
+        transcripts are never truncated. Existing rollout advantages are preserved.
+
+        Returns:
+            GRPOBatch with token_ids: (B, T) int32 complete transcripts;
+            attention_mask: (B, T) bool non-padding positions;
+            loss_mask: (B, T) bool sampled-token positions;
+            old_log_probs: (B, T) float32 sampling-policy log-probabilities;
+            advantages: (B,) float32 per-rollout advantages.
+
+        Raises:
+            ValueError: If there are no rollouts, a transcript exceeds context_length,
+                or a transcript lacks an initial context token followed by a sampled token.
+        """
+        rollouts = [rollout for group in groups for rollout in group.rollouts]
+        if not rollouts:
+            raise ValueError("A training batch must contain rollouts")
+        length = max(len(rollout.sequence.token_ids) for rollout in rollouts)
+        if length > context_length:
+            raise ValueError(f"Rollout length {length} exceeds model context length {context_length}")
+        width = min(1 << (length - 1).bit_length(), context_length)
+        shape = (len(rollouts), width)
+        # Stage variable-length host transcripts before conversion to CPU arrays.
+        tokens = np.zeros(shape, dtype=np.int32)  # (B, T)
+        attention_mask, loss_mask = (np.zeros(shape, dtype=np.bool_) for _ in range(2))  # Each (B, T).
+        old_log_probs = np.zeros(shape, dtype=np.float32)  # (B, T)
+        for index, rollout in enumerate(rollouts):
+            sequence = rollout.sequence
+            length = len(sequence.token_ids)
+            if length < 2 or sequence.loss_mask[0] or not sequence.loss_mask[1:].any():
+                raise ValueError("Each rollout needs context followed by at least one sampled token")
+            tokens[index, :length] = sequence.token_ids
+            attention_mask[index, :length] = True
+            loss_mask[index, :length] = sequence.loss_mask
+            old_log_probs[index, :length] = sequence.old_log_probs
+        arrays = jax.tree.map(  # (B, T), (B,) leaves.
+            lambda value: jax.device_put(value, jax.devices("cpu")[0]),
+            {
+                "token_ids": tokens,  # (B, T)
+                "attention_mask": attention_mask,  # (B, T)
+                "loss_mask": loss_mask,  # (B, T)
+                "old_log_probs": old_log_probs,  # (B, T)
+                "advantages": np.asarray([rollout.advantage for rollout in rollouts], dtype=np.float32),  # (B,)
+            },
+        )
+        return GRPOBatch(**arrays)  # (B, T), (B,) leaves.
+
+    async def fetch_next_batch(self, num_groups: int, group_size: int, context_length: int) -> Transfer[RolloutBatch]:
         if num_groups < 1:
             raise ValueError("num_groups must be at least 1")
         started = time.monotonic()
@@ -411,12 +499,20 @@ class Batcher:
 
         # Timestamp each arrival before gather waits for any slower groups.
         results = await asyncio.gather(*(fetch_group() for _ in range(num_groups)))
+        fetched = time.monotonic()
+        groups = [group for group, _ in results]
+        training_batch = self.prepare_batch(groups, context_length=context_length)  # (B, T), (B,) leaves.
+        jax.block_until_ready(training_batch)
+        prepared = time.monotonic()
         batch = RolloutBatch(
-            groups=[group for group, _ in results],
+            groups=groups,
+            training_batch=training_batch,
             transfer_metrics={
-                "time/actor_to_batcher_seconds_mean": mean(seconds for _, seconds in results),
-                "time/actor_to_batcher_seconds_max": max(seconds for _, seconds in results),
-                "data/batch_array_bytes": sum(rollout_array_bytes(group) for group, _ in results),
+                "time/batcher/fetch_rollout_seconds": fetched - started,
+                "time/batcher/prepare_batch_seconds": prepared - fetched,
+                "time/batcher/actor_to_batcher_seconds": mean(seconds for _, seconds in results),
+                "data/batch_array_bytes": sum(rollout_array_bytes(group) for group in groups)
+                + sum(array.nbytes for array in training_batch),
             },
         )
         logger.info("Batch ready: groups=%s elapsed=%.2fs", len(batch.groups), time.monotonic() - started)
@@ -446,7 +542,7 @@ class Learner:
         ):
             writer.log_params(asdict(self.config))
             writer.log_text(yaml.safe_dump(asdict(self.config)), "config/0.yaml")
-            print(f"Run ID: {self.config.run_id}\nMLflow run: {writer.run_id}", flush=True)
+            logger.info("Run ID: %s; MLflow run: %s", self.config.run_id, writer.run_id)
             start = time.monotonic()
             logger.info("Loading learner model %s on its assigned GPU", self.config.model)
             device = jax.devices("gpu")[0]
@@ -460,7 +556,7 @@ class Learner:
             writer.log_metrics(
                 {
                     "model/params_millions": sum(p.size for p in jax.tree.leaves(self.state.params)) / 1_000_000,
-                    "time/setup_seconds": time.monotonic() - start,
+                    "time/learner/setup_seconds": time.monotonic() - start,
                 },
                 step=0,
             )
@@ -472,7 +568,7 @@ class Learner:
                 started = time.monotonic()
                 batch = self.fetch_next_batch(num_groups=self.config.num_groups, group_size=self.config.group_size)
                 fetched = time.monotonic()
-                update_metrics = self.optimize(batch.groups)
+                update_metrics = self.optimize(batch.training_batch)
                 optimized = time.monotonic()
                 self.publish_weights()
                 now = time.monotonic()
@@ -498,31 +594,43 @@ class Learner:
                     "charts/total_updates": int(self.state.step),
                     "charts/learning_rate": self.config.learning_rate,
                     "charts/total_rollouts": total_rollouts,
-                    "time/rollouts_per_second": len(rollouts) / seconds,
-                    "time/output_tokens_per_second": sum(r.num_output_tokens for r in rollouts) / seconds,
-                    "time/rollout_seconds_mean": mean(rollout.rollout_seconds for rollout in rollouts),
-                    "time/batch_seconds": fetched - started,
-                    "time/update_seconds": optimized - fetched,
-                    "time/weight_transfer_seconds": now - optimized,
-                    "time/iteration_seconds": now - started,
-                    "time/elapsed_seconds": now - start,
+                    "time/learner/iterations_per_second": 1 / seconds,
+                    "time/learner/rollouts_per_second": len(rollouts) / seconds,
+                    "time/learner/output_tokens_per_second": sum(r.num_output_tokens for r in rollouts) / seconds,
+                    "time/actor/rollout_seconds": mean(rollout.rollout_seconds for rollout in rollouts),
+                    "time/learner/batch_seconds": fetched - started,
+                    "time/learner/update_seconds": optimized - fetched,
+                    "time/learner/weight_transfer_seconds": now - optimized,
+                    "time/learner/iteration_seconds": now - started,
                 }
-                print(
-                    f"iteration={iteration} reward={scalars['charts/reward_mean']:.3f} "
-                    f"degenerate_group_fraction={scalars['charts/degenerate_group_fraction']:.3f} "
-                    f"batch={scalars['time/batch_seconds']:.2f}s "
-                    f"group_transfer_mean={scalars['time/actor_to_batcher_seconds_mean']:.6f}s "
-                    f"batch_transfer={scalars['time/batcher_to_learner_seconds']:.6f}s "
-                    f"loss={scalars['losses/policy']:.4f} update={scalars['time/update_seconds']:.2f}s "
-                    f"weights={scalars['time/weight_transfer_seconds']:.2f}s "
-                    f"elapsed={scalars['time/elapsed_seconds']:.2f}s",
-                    flush=True,
+                logger.info(
+                    "iteration=%s reward=%.3f degenerate_group_fraction=%.3f batch=%.2fs "
+                    "group_transfer=%.6fs batch_transfer=%.6fs loss=%.4f update=%.2fs weights=%.2fs",
+                    iteration,
+                    scalars["charts/reward_mean"],
+                    scalars["charts/degenerate_group_fraction"],
+                    scalars["time/learner/batch_seconds"],
+                    scalars["time/batcher/actor_to_batcher_seconds"],
+                    scalars["time/learner/batcher_to_learner_seconds"],
+                    scalars["losses/policy"],
+                    scalars["time/learner/update_seconds"],
+                    scalars["time/learner/weight_transfer_seconds"],
                 )
+                if iteration % 10 == 0:
+                    examples = format_rollout_examples(batch.groups, step=iteration)
+                    logger.info("\n%s", examples)
+                    writer.log_text(examples, f"examples/{iteration}.txt")
                 writer.log_metrics(scalars, step=iteration)
 
     def fetch_next_batch(self, num_groups: int, group_size: int) -> RolloutBatch:
         logger.debug("Requesting batch: num_groups=%s group_size=%s", num_groups, group_size)
-        result = ray.get(self.batcher.fetch_next_batch.remote(num_groups=num_groups, group_size=group_size))
+        result = ray.get(
+            self.batcher.fetch_next_batch.remote(
+                num_groups=num_groups,
+                group_size=group_size,
+                context_length=self.model.config.max_position_embeddings,
+            )
+        )
         received_at = time.monotonic()
         seconds = received_at - result.ready_at
         batch = result.value
@@ -534,7 +642,8 @@ class Learner:
         )
         return RolloutBatch(
             groups=batch.groups,
-            transfer_metrics={**batch.transfer_metrics, "time/batcher_to_learner_seconds": seconds},
+            training_batch=batch.training_batch,
+            transfer_metrics={**batch.transfer_metrics, "time/learner/batcher_to_learner_seconds": seconds},
         )
 
     def publish_weights(self) -> None:
@@ -563,8 +672,8 @@ class Learner:
         ray.get(pending)
         logger.info("Weights published: elapsed=%.2fs", time.monotonic() - started)
 
-    def optimize(self, groups: list[RolloutGroup]) -> dict[str, float]:
-        batch = prepare_batch(groups, context_length=self.model.config.max_position_embeddings)
+    def optimize(self, batch: GRPOBatch) -> dict[str, float]:  # Batch leaves: (B, T), (B,).
+        batch = jax.device_put(batch, jax.tree.leaves(self.state.params)[0].device)  # (B, T), (B,) leaves.
         history: list[Metrics] = []
         for _ in range(self.config.update_epochs):
             self.state, metrics = update(
