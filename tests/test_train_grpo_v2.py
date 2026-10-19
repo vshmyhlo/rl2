@@ -127,8 +127,11 @@ def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPa
     group = training.RolloutGroup(task_id="0", prompt="test", rollouts=[])
 
     if startup_fails:
+        actor_class = training.Actor.__ray_metadata__.modified_class
+        actor = actor_class.__new__(actor_class)
         with pytest.raises(TimeoutError, match="not ready"):
-            training.Actor.__ray_metadata__.modified_class()
+            actor.__init__()
+        actor.__ray_shutdown__()
     else:
         actor = training.Actor.__ray_metadata__.modified_class()
         actor.collect_group = AsyncMock(return_value=group)

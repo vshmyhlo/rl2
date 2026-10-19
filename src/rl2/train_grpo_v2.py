@@ -229,9 +229,10 @@ class Learner:
 @ray.remote(num_gpus=1)
 class Actor:
     def __init__(self) -> None:
+        self._server = ExitStack()
         self.tasks = list(AdditionTaskset(config=vf.TasksetConfig()))
         logger.info("Starting actor and vLLM on its assigned GPU")
-        with ExitStack() as resources:
+        with self._server as resources:
             server = resources.enter_context(serve_vllm())
             wait_for_server(server)
             self._server = resources.pop_all()

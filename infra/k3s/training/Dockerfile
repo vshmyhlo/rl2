@@ -17,6 +17,9 @@ ENV CUDA_HOME=/app/.venv/lib/python3.12/site-packages/nvidia/cu13
 RUN test -x "$CUDA_HOME/bin/nvcc" \
     && ln -s lib "$CUDA_HOME/lib64" \
     && ln -s libcudart.so.13 "$CUDA_HOME/lib/libcudart.so"
+RUN printf '#include <cuda_runtime.h>\nstatic_assert(CUDART_VERSION / 10 == __CUDACC_VER_MAJOR__ * 100 + __CUDACC_VER_MINOR__);\n' \
+    | "$CUDA_HOME/bin/nvcc" -x cu -c -o /tmp/cuda-check.o - \
+    && rm /tmp/cuda-check.o
 # Bundle Panda assets so Playground can start without runtime downloads.
 RUN --mount=type=bind,source=src/rl2/envs/playground_assets.py,target=/tmp/playground_assets.py \
     /app/.venv/bin/python /tmp/playground_assets.py

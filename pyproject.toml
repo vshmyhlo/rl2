@@ -12,6 +12,9 @@ dependencies = [
     "brax==0.14.2",
     "chex>=0.1.90,<0.2",
     "craftax==1.6.1",
+    # Match the CUDA 13.0 runtime used by torch/vLLM, including JIT compilation.
+    "cuda-toolkit[cccl,nvcc]==13.0.3.0; sys_platform == 'linux'",
+    "cuda-python>=13.0.3,<13.1; sys_platform == 'linux'",
     "distrax>=0.1.9,<0.2",
     "flax>=0.12.10,<0.13",
     "gcsfs",
@@ -21,7 +24,7 @@ dependencies = [
     "gymnax>=0.0.9,<0.1",
     "huggingface-hub>=1,<2",
     "jax>=0.11.2,<0.12",
-    "jax[cuda12]>=0.11.2,<0.12; sys_platform == 'linux'",
+    "jax[cuda13]>=0.11.2,<0.12; sys_platform == 'linux'",
     "jax-triton>=0.4.1,<0.5; sys_platform == 'linux'",
     "jaxmarl==0.2.0",
     "jaxtari==0.2.0",
@@ -52,10 +55,12 @@ dependencies = [
     "tfp-nightly>=0.26.0.dev0,<0.27",
     "tokamax>=0.0.15; sys_platform == 'linux'",
     "tokenizers>=0.22,<0.24",
+    # Keep this pair together: vLLM wheels are built against a specific PyTorch.
+    "torch==2.13.0; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
+    "vllm==0.27.0; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
     "transformers>=5.5.3,<5.6; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
     "xminigrid==0.9.3",
     "verifiers>=0.4.0,<0.5",
-    "vllm==0.27.0; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
     "datasets>=4",
     "jaxrobotarium",
     "robotarium-python-simulator",
@@ -86,6 +91,8 @@ line-length = 120
 # Kauldron also requests desktop OpenCV; both variants install the same cv2 files.
 # Use the explicit headless dependency above for server-side Atari preprocessing.
 exclude-dependencies = ["opencv-python"]
+# The toolkit leaves the JIT linker's minor version open.
+constraint-dependencies = ["nvidia-nvjitlink<13.1"]
 
 # Verifiers' renderers need Pillow 12; retain MoviePy's other bounds.
 [[tool.uv.dependency-metadata]]

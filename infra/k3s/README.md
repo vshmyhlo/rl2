@@ -414,9 +414,11 @@ BuildKit uses a root-only Unix socket and k3s's containerd image store. Each
 submission gets a unique local image tag; no registry is needed. Source edits
 and untracked files are included, subject to `.dockerignore`, which excludes
 virtual environments, generated outputs, and common credential paths. Dependency
-layers are cached using `uv.lock`; CUDA12 and the environment packages are
-regular project dependencies. Inside the image, `uv run` uses the
-built environment without syncing dependencies again.
+layers are cached using `uv.lock`. JAX and PyTorch/vLLM share CUDA 13.0;
+`cuda-toolkit[cccl,nvcc]` pins matching compiler, headers, and runtime packages.
+The image exposes that toolkit through `CUDA_HOME` and checks compiler/header
+compatibility during the build. Inside the image, `uv run` uses the built
+environment without syncing dependencies again.
 
 Before creating a Job, the submitter pins its image in containerd so kubelet
 cleanup cannot remove it while queued or preempted. The `rl2-image-pins.timer`
