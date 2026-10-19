@@ -93,6 +93,14 @@ from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsA
 from vllm.utils.network_utils import get_open_port
 
 from rl2.addition_env import AdditionTaskset
+from rl2.benchmark_env import (
+    ALFWorldConfig,
+    AppWorldConfig,
+    BenchmarkTask,
+    Tau2Config,
+    WebShopConfig,
+    load_benchmark_tasks,
+)
 from rl2.codegym_env import CODEGYM_TRAIN_FILE, CodeGymTask, CodeGymTaskset, CodeGymTasksetConfig
 from rl2.configuration import BaseConfig, load_config
 from rl2.mlflow_logging import MLflowLogger
@@ -132,13 +140,18 @@ class CodeGymConfig:
 @config_dataclass(frozen=True)
 class Config(BaseConfig):
     model: str = MODEL
-    taskset: Annotated[AdditionConfig | ToolRLConfig | CodeGymConfig, Field(discriminator="id")] = AdditionConfig()
+    taskset: Annotated[
+        AdditionConfig | ToolRLConfig | CodeGymConfig | WebShopConfig | ALFWorldConfig | Tau2Config | AppWorldConfig,
+        Field(discriminator="id"),
+    ] = AdditionConfig()
     seed: Annotated[int, Field(ge=0)] = 1
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4
     total_iterations: Annotated[int | None, Field(ge=1)] = None
     max_tokens: Annotated[int, Field(ge=1)] = 512
     max_turns: Annotated[int, Field(ge=1)] = 3
+    rollout_timeout: Annotated[float, Field(gt=0)] = 120
+    environment_timeout: Annotated[float, Field(gt=0)] = 600
     temperature: Annotated[float, Field(ge=0.01, le=2.0)] = 1.0  # vLLM clamps smaller positive values to 0.01.
     learning_rate: Annotated[float, Field(gt=0)] = 1e-6
     clip_coef: Annotated[float, Field(gt=0, lt=1)] = 0.2
@@ -219,6 +232,9 @@ class GRPOBatch(NamedTuple):
     loss_mask: jax.Array  # (B, T) True only for sampled tokens.
     old_log_probs: jax.Array  # (B, T) Temperature-scaled sampling-policy log-probabilities.
     advantages: jax.Array  # (B,) Normalized within each rollout group.
+
+
+# ---
 
 
 @dataclass(frozen=True)
@@ -400,7 +416,7 @@ def create_agent(config: Config = DEFAULT_CONFIG) -> vf.Agent:
                 chat_template_kwargs={"enable_thinking": config.taskset.id == "toolrl"},
             ),
             max_turns=config.max_turns,
-            timeout=TimeoutConfig(setup=120, rollout=120, finalize=30, scoring=30),
+            timeout=TimeoutConfig(setup=120, rollout=config.rollout_timeout, finalize=30, scoring=30),
         )
     )
 
@@ -760,7 +776,9 @@ class Actor:
         random.seed(config.seed)
         self._server = ExitStack()
         self._weights_valid = True
-        if config.taskset.id == "codegym":
+        if isinstance(config.taskset, (WebShopConfig, ALFWorldConfig, Tau2Config, AppWorldConfig)):
+            self.tasks = load_benchmark_tasks(config.taskset, config.max_turns, config.environment_timeout)
+        elif config.taskset.id == "codegym":
             self.tasks = list(CodeGymTaskset(config=CodeGymTasksetConfig(data_file=config.taskset.dataset_file)))
         elif config.taskset.id == "toolrl":
             self.tasks = list(ToolRLTaskset(config=ToolRLTasksetConfig(data_file=config.taskset.dataset_file)))
@@ -817,7 +835,21 @@ class Actor:
         logger.info("Collecting group: task=%s group_size=%s", task.data.id, group_size)
         try:
             async with create_agent(self.config) as agent, asyncio.TaskGroup() as pending:
-                if isinstance(task, CodeGymTask) and self.config.taskset.id == "codegym":
+                if isinstance(task, BenchmarkTask) and isinstance(
+                    self.config.taskset, (WebShopConfig, ALFWorldConfig, Tau2Config, AppWorldConfig)
+                ):
+                    runs = [
+                        pending.create_task(
+                            task.run(
+                                agent,
+                                self.config.taskset,
+                                self.config.max_turns,
+                                self.config.environment_timeout,
+                            )
+                        )
+                        for _ in range(group_size)
+                    ]
+                elif isinstance(task, CodeGymTask) and self.config.taskset.id == "codegym":
                     runs = [
                         pending.create_task(task.run(agent, self.config.taskset.manager_url)) for _ in range(group_size)
                     ]

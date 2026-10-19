@@ -30,7 +30,7 @@ from verifiers.v1.clients.train import ElasticRendererPool
 from verifiers.v1.runtimes import subprocess as subprocess_runtime
 from verifiers.v1.trace import AgentInfo, TraceTask
 
-from rl2 import codegym_env
+from rl2 import benchmark_env, codegym_env
 from rl2 import train_grpo_v2 as training
 from rl2.addition_env import AdditionTaskset, AdditionTools
 from rl2.toolrl_env import ToolCall, ToolRLData, ToolRLRenderer, ToolRLTask
@@ -132,13 +132,14 @@ def test_taskset_config_rejects_invalid_yaml(settings: dict[str, object], error:
 
 
 def test_agent_uses_config() -> None:
-    config = training.Config(model="Qwen/custom", max_tokens=16, max_turns=2, temperature=0.7)
+    config = training.Config(model="Qwen/custom", max_tokens=16, max_turns=2, temperature=0.7, rollout_timeout=300)
     agent = training.create_agent(config)
     assert agent.config.model == config.model
     assert agent.config.client.renderer_model_name == config.model
     assert agent.config.sampling.max_tokens == 16
     assert agent.config.sampling.temperature == 0.7
     assert agent.config.max_turns == 2
+    assert agent.config.timeout.rollout == 300
 
 
 def test_toolrl_preset_and_actor(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1538,3 +1539,116 @@ def test_verifiers_codegym_rollout(
             )
     assert len(sessions) == 2
     assert sorted(released) == sorted(stopped) == allocated
+
+
+@pytest.mark.parametrize("name", ["webshop", "alfworld", "tau2", "appworld"])
+def test_benchmark_preset_and_actor(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    preset = Path(__file__).resolve().parents[1] / f"configs/grpo_v2/{name}.yaml"
+    config = training.load_config(preset, training.Config)
+    assert config.taskset.id == name
+    assert config.max_turns == 50
+    assert config.rollout_timeout == 1200
+    assert config.environment_timeout == 600
+    assert pickle.loads(pickle.dumps(config)) == config
+    tasks = Mock(return_value=[Mock()])
+    monkeypatch.setattr(training, "load_benchmark_tasks", tasks)
+    monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
+    monkeypatch.setattr(training, "wait_for_server", Mock())
+    actor = training.Actor.__ray_metadata__.modified_class(config=config)
+    assert actor.tasks == tasks.return_value
+    tasks.assert_called_once_with(config.taskset, config.max_turns, config.environment_timeout)
+    actor.__ray_shutdown__()
+
+
+@pytest.mark.parametrize("domains", [(), ("retail", "retail")])
+def test_tau2_domain_validation(domains: tuple[str, ...]) -> None:
+    with pytest.raises(ValueError, match="nonempty and unique"):
+        training.Tau2Config(python="python", user_llm="user", domains=domains)
+
+
+@pytest.mark.parametrize("mode", ["done", "turn-limit", "worker-error"])
+def test_verifiers_benchmark_rollout(
+    mode: str,
+    actor: Any,
+    local_harness: None,
+    tokenizer: PreTrainedTokenizerFast,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor.config = training.Config(
+        taskset=training.AppWorldConfig(python=sys.executable, root=str(tmp_path)),
+        max_turns=1 if mode == "turn-limit" else 3,
+    )
+    task = benchmark_env.BenchmarkTask(
+        data=benchmark_env.BenchmarkData(id="appworld:test", task_id="test", prompt="test")
+    )
+    script = tmp_path / "benchmark.py"
+    script.write_text("""import json
+import os
+import sys
+from pathlib import Path
+steps = 0
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["op"] == "reset":
+        assert request["task_id"] == "test"
+        result = {"observation": "Initial state"}
+    elif request["op"] == "step":
+        if sys.argv[1] == "worker-error":
+            raise RuntimeError("failed worker")
+        steps += 1
+        result = {"observation": "Observed state", "done": steps == 2}
+    else:
+        result = float(steps == 2)
+    print("RL2_BENCHMARK " + json.dumps(result), flush=True)
+Path(os.environ["APPWORLD_ROOT"], str(os.getpid()) + ".closed").write_text(str(steps))
+""")
+    monkeypatch.setattr(benchmark_env, "worker_command", Mock(return_value=[sys.executable, str(script), mode]))
+    requests: list[dict[str, Any]] = []
+    ids = tokenizer.encode("action<|im_end|>")  # (C,)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": training.MODEL, "max_model_len": 8192}]})
+        payload = json.loads(request.content)
+        requests.append(payload)
+        assert "Initial state" in tokenizer.decode(payload["token_ids"])
+        return httpx.Response(
+            200,
+            json={
+                "request_id": f"benchmark-{len(requests)}",
+                "choices": [
+                    {
+                        "index": 0,
+                        "token_ids": ids,
+                        "finish_reason": "stop",
+                        "logprobs": {
+                            "content": [{"token": f"token_id:{token}", "logprob": -0.2} for token in ids],
+                        },
+                    }
+                ],
+            },
+        )
+
+    def build_client(config: vf.TrainClientConfig) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(respond))
+
+    monkeypatch.setattr(client_base, "build_async_httpx", build_client)
+    if mode == "worker-error":
+        with pytest.raises(ExceptionGroup):
+            asyncio.run(actor.collect_group(task, group_size=2))
+        return
+    group = asyncio.run(actor.collect_group(task, group_size=2))
+    turns = 1 if mode == "turn-limit" else 2
+    assert len(requests) == 2 * turns
+    for rollout in group.rollouts:
+        assert rollout.num_turns == turns
+        assert rollout.reward == (0 if mode == "turn-limit" else 1)
+        assert rollout.stop_condition == ("appworld_max_steps" if mode == "turn-limit" else "appworld_done")
+        sequence = rollout.sequence
+        assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
+        np.testing.assert_array_equal(sequence.token_ids[sequence.loss_mask], ids * turns)
+        np.testing.assert_allclose(sequence.old_log_probs, np.where(sequence.loss_mask, -0.2, 0))
+    closed = list(tmp_path.glob("*.closed"))
+    assert len(closed) == 2
+    assert all(path.read_text() == str(turns) for path in closed)

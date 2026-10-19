@@ -1,0 +1,15 @@
+model: Qwen/Qwen3-0.6B
+taskset:
+  id: tau2
+  python: /opt/tau2/bin/python
+  user_llm: gpt-4.1
+  domains: [retail, airline, telecom]
+seed: 3
+num_groups: 1
+group_size: 4
+max_tokens: 1024
+max_turns: 50
+rollout_timeout: 1200
+environment_timeout: 600
+run_id: grpo_v2_tau2_${path_name:${model}}_seed${seed}
+ckpt_dir: /runs/grpo_v2/${run_id} # Reserved; checkpointing is not implemented.
