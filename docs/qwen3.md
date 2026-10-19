@@ -88,6 +88,10 @@ copy of the model. Fresh initialization uses float32 parameters by default;
 weights use the requested `dtype`. For float32 master parameters with bfloat16
 computation, load with `dtype="float32"` then use `model.clone(dtype="bfloat16")`.
 The module supports `jax.grad`, Flax `TrainState`, composition, and serialization.
+Layers run through `jax.lax.scan` by default, including cached decoding, while
+preserving the flat parameter layout. Pass `scan_layers=False` to `Qwen3LM` or
+`load_qwen3_checkpoint` to unroll layers instead. Scanning also works with the
+default per-layer gradient checkpointing.
 `attention_mask` is a `(B, T)` validity mask for the current input chunk. Default
 RoPE positions count non-padding tokens; supply `(B, T)` `position_ids` to override.
 Cached calls append the whole physical chunk, including padding. Direct callers

@@ -98,8 +98,9 @@ def test_huggingface_gradient(model: Qwen3LM, params: Parameters, reference: dic
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 def test_gradient_checkpointing(model: Qwen3LM, params: Parameters, dtype: str) -> None:
     assert model.gradient_checkpointing
+    assert model.scan_layers
     model = model.clone(dtype=dtype)
-    plain = model.clone(gradient_checkpointing=False)
+    plain = model.clone(gradient_checkpointing=False, scan_layers=False)
     tokens = jnp.array([[0, 0, 0], [0, 1, 4]], jnp.int32)  # (B=2, T=3)
     mask = jnp.array([[False, False, False], [False, True, True]])  # (B, T)
 
@@ -108,20 +109,28 @@ def test_gradient_checkpointing(model: Qwen3LM, params: Parameters, dtype: str) 
         return jnp.square(logits).mean(), logits  # (), (B, T, V)
 
     evaluate = jax.jit(jax.value_and_grad(loss, has_aux=True), static_argnums=1)
-    (actual_loss, actual), actual_grad = evaluate(params, model)  # (), (B, T, V), parameter shapes.
     (expected_loss, expected), expected_grad = evaluate(params, plain)  # (), (B, T, V), parameter shapes.
     tolerance = 0.02 if dtype == "bfloat16" else 2e-6
-    assert actual.shape == expected.shape == (2, 3, 13)
-    np.testing.assert_allclose(actual, expected, atol=tolerance, rtol=tolerance)
-    np.testing.assert_allclose(actual_loss, expected_loss, atol=tolerance, rtol=tolerance)
-    assert jax.tree.map(jnp.shape, actual_grad) == model.config.parameter_shapes()
-    for name in params:
-        np.testing.assert_allclose(actual_grad[name], expected_grad[name], atol=tolerance, rtol=tolerance)
-
-    # Verify that the switch actually inserts one rematerialization boundary per layer.
     trace = jax.make_jaxpr(loss, static_argnums=1)
-    for lm, count in ((model, model.config.num_hidden_layers), (plain, 0)):
-        assert sum(eqn.primitive.name == "remat2" for eqn in trace(params, lm).jaxpr.eqns) == count
+    # Check scan/rematerialization independently and together against the unrolled baseline.
+    for lm in (model, model.clone(gradient_checkpointing=False), model.clone(scan_layers=False), plain):
+        if lm != plain:
+            (actual_loss, actual), actual_grad = evaluate(params, lm)  # (), (B, T, V), parameter shapes.
+            assert actual.shape == expected.shape == (2, 3, 13)
+            np.testing.assert_allclose(actual, expected, atol=tolerance, rtol=tolerance)
+            np.testing.assert_allclose(actual_loss, expected_loss, atol=tolerance, rtol=tolerance)
+            assert jax.tree.map(jnp.shape, actual_grad) == model.config.parameter_shapes()
+            for name in params:
+                np.testing.assert_allclose(actual_grad[name], expected_grad[name], atol=tolerance, rtol=tolerance)
+
+        equations = trace(params, lm).jaxpr.eqns
+        scans = [eqn for eqn in equations if eqn.primitive.name == "scan"]
+        assert len(scans) == int(lm.scan_layers)
+        if lm.scan_layers:
+            assert scans[0].params["length"] == model.config.num_hidden_layers
+            equations = scans[0].params["jaxpr"].jaxpr.eqns
+        count = (1 if lm.scan_layers else model.config.num_hidden_layers) if lm.gradient_checkpointing else 0
+        assert sum(eqn.primitive.name == "remat2" for eqn in equations) == count
 
 
 def test_bfloat16_silu_opmath() -> None:
@@ -206,8 +215,14 @@ def test_cache_padding_and_causality(
     assert int(decoded.cache.index) == 5
     np.testing.assert_array_equal(decoded.cache.lengths, [4, 4])
     packed = jnp.array([[1, 4, 7, 8], [3, 2, 6, 5]], jnp.int32)  # (B, T=4)
-    expected = jax.jit(model.clone(attention_backend="xla").apply)({"params": params}, packed).logits  # (B, T, V=13)
+    unrolled = jax.jit(model.clone(attention_backend="xla", scan_layers=False).apply)
+    expected = unrolled({"params": params}, packed).logits  # (B, T, V=13)
     tolerance = 0.02 if dtype == "bfloat16" else 2e-6
+    expected_cached = unrolled({"params": params}, extra, cache=prefill.cache)
+    assert expected_cached.cache is not None
+    for actual_leaf, expected_leaf in zip(decoded.cache, expected_cached.cache, strict=True):
+        assert actual_leaf.shape == expected_leaf.shape
+        np.testing.assert_allclose(actual_leaf, expected_leaf, atol=tolerance, rtol=tolerance)
     np.testing.assert_allclose(decoded.logits, expected[:, 2:], atol=tolerance, rtol=tolerance)
     np.testing.assert_allclose(prefill.logits[0, 1:], expected[0, :2], atol=tolerance, rtol=tolerance)
     np.testing.assert_allclose(prefill.logits[1, :2], expected[1, :2], atol=tolerance, rtol=tolerance)
@@ -331,13 +346,14 @@ def test_checkpoint_loading(model: Qwen3LM, params: Parameters, tmp_path: Path) 
     index = tmp_path / "model.safetensors.index.json"
     index.write_text(json.dumps({"weight_map": locations}))
     loaded_model, variables = load_qwen3_checkpoint(
-        str(tmp_path), dtype="bfloat16", attention_backend="tokamax", gradient_checkpointing=False
+        str(tmp_path), dtype="bfloat16", attention_backend="tokamax", gradient_checkpointing=False, scan_layers=False
     )
     index.unlink()  # Subsequent cases exercise unindexed checkpoint errors.
     loaded = variables["params"]
     assert loaded_model.config == model.config
     assert loaded_model.attention_backend == "tokamax"
     assert not loaded_model.gradient_checkpointing
+    assert not loaded_model.scan_layers
     assert loaded.keys() == params.keys()
     for name in params:
         assert loaded[name].dtype == jnp.bfloat16

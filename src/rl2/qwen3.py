@@ -16,6 +16,8 @@ from tokenizers import Tokenizer
 
 type Parameters = dict[str, jax.Array]
 type Variables = dict[str, Parameters]
+type LayerKV = tuple[jax.Array, jax.Array]  # Each (B, C, K, H).
+type LayerInputs = tuple[Parameters, LayerKV | None]
 type AttentionBackend = Literal["xla", "tokamax", "cudnn"]
 # B: batch, T: input tokens, S: key slots, C: cache capacity, L: layers,
 # D: hidden size, H: head dimension, N: query heads, K: KV heads, V: vocabulary.
@@ -188,6 +190,7 @@ class Qwen3LM(nn.Module):
     param_dtype: jax.typing.DTypeLike = jnp.float32
     attention_backend: AttentionBackend = "xla"
     gradient_checkpointing: bool = True
+    scan_layers: bool = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -267,62 +270,72 @@ class Qwen3LM(nn.Module):
         )  # (B, 1, T, S)
         x = params["model.embed_tokens.weight"][tokens].astype(self.dtype)  # (B, T, D)
 
-        def linear(inputs: jax.Array, name: str) -> jax.Array:  # (..., in)
-            return jnp.matmul(
-                inputs, params[name + ".weight"].astype(self.dtype).T, precision=jax.lax.Precision.HIGHEST
-            )  # (..., out)
+        def linear(inputs: jax.Array, weight: jax.Array) -> jax.Array:  # (..., in), (out, in)
+            return jnp.matmul(inputs, weight.astype(self.dtype).T, precision=jax.lax.Precision.HIGHEST)  # (..., out)
 
-        def project(inputs: jax.Array, name: str) -> jax.Array:  # (B, T, D)
-            return linear(inputs, name).reshape(batch, width, -1, config.head_dim)  # (B, T, N/K, H)
+        def project(inputs: jax.Array, weight: jax.Array) -> jax.Array:  # (B, T, D), (N/K*H, D)
+            return linear(inputs, weight).reshape(batch, width, -1, config.head_dim)  # (B, T, N/K, H)
 
         def rotate(projected: jax.Array) -> jax.Array:  # (B, T, N/K, H)
             return _rope(projected, position_ids, config.rope_theta)  # (B, T, N/K, H)
 
         def decoder_layer(
             x: jax.Array,  # (B, T, D)
-            cache: Qwen3Cache | None,
-            layer: int,
-        ) -> tuple[jax.Array, Qwen3Cache | None]:
-            def update(old: jax.Array, new: jax.Array) -> jax.Array:  # (L, B, C, K, H), (B, T, K, H)
-                return jax.lax.dynamic_update_slice(old, new[None], (layer, 0, offset, 0, 0))  # (L, B, C, K, H)
+            inputs: LayerInputs,  # Per-layer parameter shapes and optional (B, C, K, H) KV leaves.
+        ) -> tuple[jax.Array, LayerKV | None]:
+            weights, layer_cache = inputs
 
-            prefix = f"model.layers.{layer}."
-            normalized = _rms_norm(x, params[prefix + "input_layernorm.weight"], config.rms_norm_eps)  # (B, T, D)
+            def update(old: jax.Array, new: jax.Array) -> jax.Array:  # (B, C, K, H), (B, T, K, H)
+                return jax.lax.dynamic_update_slice(old, new, (0, offset, 0, 0))  # (B, C, K, H)
+
+            normalized = _rms_norm(x, weights["input_layernorm.weight"], config.rms_norm_eps)  # (B, T, D)
             query, key, value = jax.tree.map(
                 project,
                 (normalized,) * 3,
-                tuple(prefix + f"self_attn.{name}_proj" for name in ("q", "k", "v")),
+                tuple(weights[f"self_attn.{name}_proj.weight"] for name in ("q", "k", "v")),
             )  # (B, T, N, H), (B, T, K, H), (B, T, K, H).
-            query = _rms_norm(query, params[prefix + "self_attn.q_norm.weight"], config.rms_norm_eps)  # (B, T, N, H)
-            key = _rms_norm(key, params[prefix + "self_attn.k_norm.weight"], config.rms_norm_eps)  # (B, T, K, H)
+            query = _rms_norm(query, weights["self_attn.q_norm.weight"], config.rms_norm_eps)  # (B, T, N, H)
+            key = _rms_norm(key, weights["self_attn.k_norm.weight"], config.rms_norm_eps)  # (B, T, K, H)
             query, key = jax.tree.map(rotate, (query, key))  # (B, T, N/K, H)
-            if cache is not None:
-                updated_key, updated_value = jax.tree.map(
-                    update,
-                    (cache.key, cache.value),
-                    (key, value),
-                )  # Each (L, B, C, K, H).
-                cache = cache._replace(key=updated_key, value=updated_value)
-                key, value = cache.key[layer], cache.value[layer]  # Each (B, C, K, H).
+            if layer_cache is not None:
+                layer_cache = jax.tree.map(update, layer_cache, (key, value))  # Each (B, C, K, H).
+                key, value = layer_cache  # Each (B, C, K, H).
             attended = _attention(query, key, value, mask, self.attention_backend)  # (B, T, N, H)
-            x = x + linear(attended.reshape(batch, width, -1), prefix + "self_attn.o_proj")  # (B, T, D)
-            normalized = _rms_norm(
-                x, params[prefix + "post_attention_layernorm.weight"], config.rms_norm_eps
-            )  # (B, T, D)
-            hidden = _silu(linear(normalized, prefix + "mlp.gate_proj")) * linear(
-                normalized, prefix + "mlp.up_proj"
+            x = x + linear(attended.reshape(batch, width, -1), weights["self_attn.o_proj.weight"])  # (B, T, D)
+            normalized = _rms_norm(x, weights["post_attention_layernorm.weight"], config.rms_norm_eps)  # (B, T, D)
+            hidden = _silu(linear(normalized, weights["mlp.gate_proj.weight"])) * linear(
+                normalized, weights["mlp.up_proj.weight"]
             )  # (B, T, intermediate_size)
-            x = x + linear(hidden, prefix + "mlp.down_proj")  # (B, T, D)
-            return x, cache  # (B, T, D), optional KV cache.
+            x = x + linear(hidden, weights["mlp.down_proj.weight"])  # (B, T, D)
+            return x, layer_cache  # (B, T, D), optional (B, C, K, H) KV leaves.
 
+        layers = [
+            {
+                name.removeprefix(f"model.layers.{layer}."): weight
+                for name, weight in params.items()
+                if name.startswith(f"model.layers.{layer}.")
+            }
+            for layer in range(config.num_hidden_layers)
+        ]  # Per-layer parameter shapes, without a layer axis.
         # Recompute layer activations during backward; cached decoding needs no rematerialization.
         if self.gradient_checkpointing and cache is None:
-            decoder_layer = jax.checkpoint(decoder_layer, static_argnums=(2,))
-        for layer in range(config.num_hidden_layers):
-            x, cache = decoder_layer(x, cache, layer)  # (B, T, D), optional KV cache.
+            decoder_layer = jax.checkpoint(decoder_layer)
+        if self.scan_layers:
+            stacked = jax.tree.map(lambda *weights: jnp.stack(weights), *layers)  # (L, *parameter shape) leaves.
+            kv = None if cache is None else (cache.key, cache.value)  # Optional (L, B, C, K, H) leaves.
+            x, kv = jax.lax.scan(decoder_layer, x, (stacked, kv))  # (B, T, D), optional (L, B, C, K, H) leaves.
+        else:
+            updated = []
+            for layer, weights in enumerate(layers):
+                layer_cache = None if cache is None else (cache.key[layer], cache.value[layer])  # (B, C, K, H) leaves.
+                x, layer_cache = decoder_layer(x, (weights, layer_cache))  # (B, T, D), optional (B, C, K, H) leaves.
+                updated.append(layer_cache)
+            kv = jax.tree.map(lambda *values: jnp.stack(values), *updated)  # Optional (L, B, C, K, H) leaves.
+        if cache is not None:
+            cache = cache._replace(key=kv[0], value=kv[1])
         x = _rms_norm(x, params["model.norm.weight"], config.rms_norm_eps)  # (B, T, D)
         head = "model.embed_tokens" if config.tie_word_embeddings else "lm_head"
-        logits = linear(x[:, -logits_to_keep:], head).astype(jnp.float32)  # (B, U, V)
+        logits = linear(x[:, -logits_to_keep:], params[head + ".weight"]).astype(jnp.float32)  # (B, U, V)
         if cache is not None:
             cache = cache._replace(
                 valid=valid,
@@ -352,6 +365,7 @@ def load_qwen3_checkpoint(
     dtype: str = "bfloat16",
     attention_backend: AttentionBackend = "xla",
     gradient_checkpointing: bool = True,
+    scan_layers: bool = True,
 ) -> tuple[Qwen3LM, Variables]:
     """Return a Linen module and variables loaded directly from HF safetensors."""
     directory = checkpoint_directory(source, revision)
@@ -362,6 +376,7 @@ def load_qwen3_checkpoint(
         param_dtype=jnp.dtype(dtype),
         attention_backend=attention_backend,
         gradient_checkpointing=gradient_checkpointing,
+        scan_layers=scan_layers,
     )
     shapes = config.parameter_shapes()
     if config.tie_word_embeddings:

@@ -19,9 +19,9 @@ from rl2.qwen3 import Qwen3Config, Qwen3LM
 def rollout(tokens: list[int], mask: list[bool], advantage: float) -> training.Rollout:
     return training.Rollout(
         sequence=training.TrainingSequence(
-            token_ids=np.asarray(tokens, dtype=np.int32),  # (T,)
-            loss_mask=np.asarray(mask, dtype=np.bool_),  # (T,)
-            old_log_probs=np.zeros(len(tokens), dtype=np.float32),  # (T,)
+            token_ids=jnp.asarray(tokens, dtype=jnp.int32),  # (T,)
+            loss_mask=jnp.asarray(mask, dtype=jnp.bool_),  # (T,)
+            old_log_probs=jnp.zeros(len(tokens), dtype=jnp.float32),  # (T,)
         ),
         reward=float(advantage > 0),
         advantage=advantage,
@@ -252,6 +252,8 @@ def test_learner_optimizes_and_publishes_updated_bf16_weights(
     learner._transfer_group = Mock()
     batch = batcher.prepare_batch(groups, context_length=8)
     old = training.token_log_probs(learner.state, learner.state.params, batch, temperature=0.7)  # (B, T-1)
+    assert old.shape == (2, 7)
+    assert old.dtype == jnp.float32
     batch = batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))
     update = Mock(wraps=training.update)
     monkeypatch.setattr(training, "update", update)
@@ -264,6 +266,14 @@ def test_learner_optimizes_and_publishes_updated_bf16_weights(
     assert int(learner.state.step) == 2
     assert metrics["policy/grad_norm"] > 0
     assert all(isinstance(value, float) for value in metrics.values())
+    for name, value in learner.state.params.items():  # HF parameter shapes.
+        assert value.shape == state.params[name].shape
+        assert value.dtype == jnp.float32
+    adam = learner.state.opt_state[1][0]
+    for moments in (adam.mu, adam.nu):  # HF parameter shapes.
+        for name, value in moments.items():
+            assert value.shape == learner.state.params[name].shape
+            assert value.dtype == jnp.float32
     assert optax.global_norm(jax.tree.map(jnp.subtract, learner.state.params, state.params)) > 0
 
     def send(iterator: Any, trainer_args: training.NCCLTrainerSendWeightsArgs) -> None:

@@ -25,10 +25,8 @@ Rollout batch scalars:
     charts/turns_mean: Mean model responses per rollout, including tool calls.
     charts/input_tokens_mean: Mean newly fed input tokens per rollout; a lower bound if context is rewritten.
     charts/output_tokens_mean: Mean sampled tokens per rollout across all model calls.
-    data/batch_array_bytes: Logical bytes of rollout sequence arrays plus prepared training arrays, including padding.
 Stop-condition labels are added as observed; previously seen labels log zero when
-absent from a later batch. Array bytes exclude text, metadata, and Ray overhead;
-they do not measure allocated memory or imply copies.
+absent from a later batch.
 
 Training progress and settings:
     charts/total_iterations: Cumulative completed training iterations.
@@ -79,7 +77,6 @@ from urllib.request import urlopen
 import httpx
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 import ray
 import torch
@@ -87,7 +84,6 @@ import verifiers.v1 as vf
 import yaml
 from flax.training.train_state import TrainState
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from numpy.typing import NDArray
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass as config_dataclass
 from ray.actor import ActorHandle
@@ -168,9 +164,9 @@ DEFAULT_CONFIG = Config()
 
 @dataclass(frozen=True)
 class TrainingSequence:
-    token_ids: NDArray[np.int32]  # (T,) Exact context and generated tokens in one sequence.
-    loss_mask: NDArray[np.bool_]  # (T,) Train on sampled tokens only; exclude prompts and tool results.
-    old_log_probs: NDArray[np.float32]  # (T,) Sampling-policy log-probabilities; ignored where loss_mask is False.
+    token_ids: jax.Array  # (T,) int32 exact context and generated tokens in one sequence.
+    loss_mask: jax.Array  # (T,) bool train on sampled tokens only; exclude prompts and tool results.
+    old_log_probs: jax.Array  # (T,) float32 sampling-policy log-probabilities; ignored where loss_mask is False.
 
 
 @dataclass(frozen=True)
@@ -214,15 +210,6 @@ def format_rollout_examples(groups: list[RolloutGroup], step: int) -> str:
             f"Final assistant output:\n{indent(rollout.completion or '(empty)', '    ')}"
         )
     return "\n\n".join(sections)
-
-
-def rollout_array_bytes(group: RolloutGroup) -> int:
-    """Logical sequence-array bytes, excluding text/metadata and Ray serialization overhead."""
-    return sum(
-        array.nbytes
-        for rollout in group.rollouts
-        for array in (rollout.sequence.token_ids, rollout.sequence.loss_mask, rollout.sequence.old_log_probs)
-    )
 
 
 class GRPOBatch(NamedTuple):
@@ -281,6 +268,7 @@ def objective(
 
 
 def create_state(model: Qwen3LM, params: Parameters, config: Config) -> TrainState:
+    """Keep FP32 master weights and Adam state; the model controls compute dtype."""
     return TrainState.create(
         apply_fn=model.apply,
         params=jax.tree.map(lambda value: value.astype(jnp.float32), params),  # HF parameter shapes.
@@ -343,11 +331,12 @@ def training_sequence(trace: vf.Trace) -> TrainingSequence:
         # Verifiers otherwise fills missing log-probabilities with zeros.
         if len(node.logprobs) != sum(node.mask):
             raise ValueError("Each sampled token must have a log-probability")
-    return TrainingSequence(
-        token_ids=np.asarray(branch.token_ids, dtype=np.int32),  # (T,)
-        loss_mask=np.asarray(branch.sampled_mask, dtype=np.bool_),  # (T,)
-        old_log_probs=np.asarray(branch.logprobs, dtype=np.float32),  # (T,)
-    )
+    with jax.default_device(jax.devices("cpu")[0]):
+        return TrainingSequence(
+            token_ids=jnp.asarray(branch.token_ids, dtype=jnp.int32),  # (T,)
+            loss_mask=jnp.asarray(branch.sampled_mask, dtype=jnp.bool_),  # (T,)
+            old_log_probs=jnp.asarray(branch.logprobs, dtype=jnp.float32),  # (T,)
+        )
 
 
 async def score_group(task: vf.Task, traces: list[vf.Trace]) -> RolloutGroup:
@@ -498,31 +487,29 @@ class Batcher:
         if length > context_length:
             raise ValueError(f"Rollout length {length} exceeds model context length {context_length}")
         width = min((length + 127) // 128 * 128, context_length)
-        shape = (len(rollouts), width)
-        # Stage variable-length host transcripts before conversion to CPU arrays.
-        tokens = np.zeros(shape, dtype=np.int32)  # (B, T)
-        attention_mask, loss_mask = (np.zeros(shape, dtype=np.bool_) for _ in range(2))  # Each (B, T).
-        old_log_probs = np.zeros(shape, dtype=np.float32)  # (B, T)
-        for index, rollout in enumerate(rollouts):
-            sequence = rollout.sequence
-            length = len(sequence.token_ids)
-            if length < 2 or sequence.loss_mask[0] or not sequence.loss_mask[1:].any():
-                raise ValueError("Each rollout needs context followed by at least one sampled token")
-            tokens[index, :length] = sequence.token_ids
-            attention_mask[index, :length] = True
-            loss_mask[index, :length] = sequence.loss_mask
-            old_log_probs[index, :length] = sequence.old_log_probs
-        arrays = jax.tree.map(  # (B, T), (B,) leaves.
-            lambda value: jax.device_put(value, jax.devices("cpu")[0]),
-            {
-                "token_ids": tokens,  # (B, T)
-                "attention_mask": attention_mask,  # (B, T)
-                "loss_mask": loss_mask,  # (B, T)
-                "old_log_probs": old_log_probs,  # (B, T)
-                "advantages": np.asarray([rollout.advantage for rollout in rollouts], dtype=np.float32),  # (B,)
-            },
-        )
-        return GRPOBatch(**arrays)  # (B, T), (B,) leaves.
+        with jax.default_device(jax.devices("cpu")[0]):
+            padded: list[dict[str, jax.Array]] = []  # (T,) leaves per rollout.
+            for rollout in rollouts:
+                sequence = rollout.sequence
+                length = len(sequence.token_ids)
+                if length < 2 or sequence.loss_mask[0] or not sequence.loss_mask[1:].any():
+                    raise ValueError("Each rollout needs context followed by at least one sampled token")
+                padded.append(
+                    jax.tree.map(
+                        partial(jnp.pad, pad_width=(0, width - length)),
+                        {
+                            "token_ids": sequence.token_ids,  # (L,) unpadded transcript length.
+                            "attention_mask": jnp.ones(length, dtype=jnp.bool_),  # (L,)
+                            "loss_mask": sequence.loss_mask,  # (L,)
+                            "old_log_probs": sequence.old_log_probs,  # (L,)
+                        },
+                    )
+                )
+            arrays = jax.tree.map(lambda *values: jnp.stack(values), *padded)  # (B, T) leaves.
+            return GRPOBatch(
+                **arrays,
+                advantages=jnp.asarray([rollout.advantage for rollout in rollouts], dtype=jnp.float32),  # (B,)
+            )  # (B, T), (B,) leaves.
 
     async def fetch_next_batch(self, num_groups: int, group_size: int, context_length: int) -> Transfer[RolloutBatch]:
         if num_groups < 1:
@@ -535,10 +522,9 @@ class Batcher:
             received_at = time.monotonic()
             seconds = received_at - result.ready_at
             logger.info(
-                "Ray transfer Actor -> Batcher: task=%s seconds=%.6f array_bytes=%s",
+                "Ray transfer Actor -> Batcher: task=%s seconds=%.6f",
                 result.value.task_id,
                 seconds,
-                rollout_array_bytes(result.value),
             )
             return result.value, seconds
 
@@ -555,8 +541,6 @@ class Batcher:
                 "time/batcher/fetch_rollout_seconds": fetched - started,
                 "time/batcher/prepare_batch_seconds": prepared - fetched,
                 "time/batcher/actor_to_batcher_seconds": mean(seconds for _, seconds in results),
-                "data/batch_array_bytes": sum(rollout_array_bytes(group) for group in groups)
-                + sum(array.nbytes for array in training_batch),
             },
         )
         logger.info("Batch ready: groups=%s elapsed=%.2fs", len(batch.groups), time.monotonic() - started)
@@ -590,7 +574,7 @@ class Learner:
             start = time.monotonic()
             logger.info("Loading learner model %s on its assigned GPU", self.config.model)
             device = jax.devices("gpu")[0]
-            self.mesh = Mesh(devices=np.array([device]), axis_names=("batch",))
+            self.mesh = Mesh(devices=[device], axis_names=("batch",))
             with jax.default_device(device):
                 self.model, variables = load_qwen3_checkpoint(
                     self.config.model,
@@ -699,10 +683,9 @@ class Learner:
         seconds = received_at - result.ready_at
         batch = result.value
         logger.info(
-            "Ray transfer Batcher -> Learner: groups=%s seconds=%.6f array_bytes=%s",
+            "Ray transfer Batcher -> Learner: groups=%s seconds=%.6f",
             len(batch.groups),
             seconds,
-            batch.transfer_metrics["data/batch_array_bytes"],
         )
         return RolloutBatch(
             groups=batch.groups,

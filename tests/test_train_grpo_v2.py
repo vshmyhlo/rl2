@@ -331,9 +331,9 @@ def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPa
 def rollout() -> training.Rollout:
     return training.Rollout(
         sequence=training.TrainingSequence(
-            token_ids=np.array([1, 2], dtype=np.int32),  # (T=2,)
-            loss_mask=np.array([False, True]),  # (T=2,)
-            old_log_probs=np.array([0.0, -0.2], dtype=np.float32),  # (T=2,)
+            token_ids=jnp.array([1, 2], dtype=jnp.int32),  # (T=2,)
+            loss_mask=jnp.array([False, True]),  # (T=2,)
+            old_log_probs=jnp.array([0.0, -0.2], dtype=jnp.float32),  # (T=2,)
         ),
         reward=1.0,
         advantage=0.5,
@@ -374,7 +374,6 @@ def test_learner_pulls_groups_through_batcher(
         assert batch.groups == groups
         assert batch.training_batch.token_ids.shape == (num_groups * 3, 8)
         np.testing.assert_array_equal(batch.training_batch.advantages, 0.5)
-        assert batch.transfer_metrics["data/batch_array_bytes"] == num_groups * 3 * 102
     batcher_handle.fetch_next_batch.remote.assert_called_once_with(
         num_groups=num_groups, group_size=3, context_length=8
     )
@@ -440,18 +439,20 @@ def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
     monkeypatch.setattr(training.ray, "get", get)
     batch = learner.fetch_next_batch(num_groups=2, group_size=2)
     # Preserve request order despite out-of-order completion and serialization.
-    np.testing.assert_equal([asdict(group) for group in batch.groups], [asdict(group) for group in groups])
+    jax.tree.map(
+        np.testing.assert_array_equal, [asdict(group) for group in batch.groups], [asdict(group) for group in groups]
+    )
     assert batch.training_batch.token_ids.shape == (4, 8)
     assert batch.transfer_metrics == {
         "time/batcher/fetch_rollout_seconds": 50.5,
         "time/batcher/prepare_batch_seconds": 2.0,
         "time/batcher/actor_to_batcher_seconds": 0.375,
         "time/learner/batcher_to_learner_seconds": 0.75,
-        "data/batch_array_bytes": 408,
     }
     assert "Actor -> Batcher: task=1 seconds=0.250000" in caplog.text
     assert "Actor -> Batcher: task=0 seconds=0.500000" in caplog.text
     assert "Batcher -> Learner: groups=2 seconds=0.750000" in caplog.text
+    assert "array_bytes" not in caplog.text
 
 
 @pytest.fixture
@@ -493,9 +494,9 @@ def test_learner_logs_rollouts(
 ) -> None:
     caplog.set_level("INFO", logger=training.__name__)
     sequence = training.TrainingSequence(
-        token_ids=np.array([1], dtype=np.int32),  # (T=1,)
-        loss_mask=np.array([True]),  # (T=1,)
-        old_log_probs=np.array([-0.2], dtype=np.float32),  # (T=1,)
+        token_ids=jnp.array([1], dtype=jnp.int32),  # (T=1,)
+        loss_mask=jnp.array([True]),  # (T=1,)
+        old_log_probs=jnp.array([-0.2], dtype=jnp.float32),  # (T=1,)
     )
     rollout = training.Rollout(
         sequence=sequence,
@@ -550,9 +551,7 @@ def test_learner_logs_rollouts(
         "time/batcher/prepare_batch_seconds": 0.25,
         "time/batcher/actor_to_batcher_seconds": 0.25,
         "time/learner/batcher_to_learner_seconds": 0.125,
-        "data/batch_array_bytes": sum(training.rollout_array_bytes(group) for group in batch),
     }
-    assert transfer_metrics["data/batch_array_bytes"] == 36  # Four sequences, each int32 + bool + float32.
     prepared = Mock(spec=training.GRPOBatch)
     received = training.RolloutBatch(groups=batch, training_batch=prepared, transfer_metrics=transfer_metrics)
     next_batch = replace(
@@ -658,9 +657,9 @@ def test_learner_logs_examples_every_ten_steps(
     caplog.set_level("INFO", logger=training.__name__)
     rollout = training.Rollout(
         sequence=training.TrainingSequence(
-            token_ids=np.array([1, 2], dtype=np.int32),  # (T=2,)
-            loss_mask=np.array([False, True]),  # (T=2,)
-            old_log_probs=np.array([0.0, -0.2], dtype=np.float32),  # (T=2,)
+            token_ids=jnp.array([1, 2], dtype=jnp.int32),  # (T=2,)
+            loss_mask=jnp.array([False, True]),  # (T=2,)
+            old_log_probs=jnp.array([0.0, -0.2], dtype=jnp.float32),  # (T=2,)
         ),
         reward=1.0,
         advantage=0.5,
@@ -993,7 +992,7 @@ def test_actor_returns_only_complete_groups(failure: str | None, actor: Any, mon
         assert group.prompt == task.data.prompt_text
         assert [rollout.completion for rollout in group.rollouts] == ["42", "41"]
         np.testing.assert_array_equal([rollout.sequence.token_ids for rollout in group.rollouts], [[42], [41]])
-        np.testing.assert_equal(asdict(pickle.loads(pickle.dumps(result))), asdict(result))
+        jax.tree.map(np.testing.assert_array_equal, asdict(pickle.loads(pickle.dumps(result))), asdict(result))
 
 
 @pytest.fixture
@@ -1038,10 +1037,11 @@ def test_training_sequence_preserves_tokens_and_masks_context(token_trace: vf.Tr
     np.testing.assert_array_equal(sequence.loss_mask, [False, True, False, True, True][:length])
     np.testing.assert_allclose(sequence.old_log_probs, [0.0, -0.2, 0.0, -0.4, -0.5][:length])
     assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape == (length,)
-    assert sequence.token_ids.dtype == np.int32
-    assert sequence.loss_mask.dtype == np.bool_
-    assert sequence.old_log_probs.dtype == np.float32
-    np.testing.assert_equal(asdict(pickle.loads(pickle.dumps(sequence))), asdict(sequence))
+    assert all(isinstance(value, jax.Array) and value.device.platform == "cpu" for value in asdict(sequence).values())
+    assert sequence.token_ids.dtype == jnp.int32
+    assert sequence.loss_mask.dtype == jnp.bool_
+    assert sequence.old_log_probs.dtype == jnp.float32
+    jax.tree.map(np.testing.assert_array_equal, asdict(pickle.loads(pickle.dumps(sequence))), asdict(sequence))
 
 
 @pytest.mark.parametrize(
@@ -1273,7 +1273,7 @@ def test_verifiers_tool_rollout(
             assert observations and all(
                 "required" in observation.lower() and "b" in observation for observation in observations
             )
-        np.testing.assert_equal(asdict(pickle.loads(pickle.dumps(group))), asdict(group))
+        jax.tree.map(np.testing.assert_array_equal, asdict(pickle.loads(pickle.dumps(group))), asdict(group))
     assert clients and all(client.is_closed for client in clients)
     assert requests[0]["model"] == training.MODEL
     assert requests[0]["sampling_params"]["max_tokens"] == 512
