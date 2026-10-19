@@ -172,6 +172,7 @@ def test_preset_checkpoint_directories(trainer: ModuleType, preset: str, root: s
 def test_all_presets_share_run_naming_convention() -> None:
     root = Path(__file__).resolve().parents[1] / "configs"
     families = (
+        "grpo_v2",
         "grpo_reasoning",
         "karel_ast_ar_edit",
         "karel_ast_grpo",
@@ -184,6 +185,8 @@ def test_all_presets_share_run_naming_convention() -> None:
     )
     run_ids: set[str] = set()
     for path in sorted(root.rglob("*.yaml")):
+        if path.is_relative_to(root / "sweeps"):
+            continue
         family = next(name for name in families if str(path.relative_to(root)).startswith(name))
         settings = OmegaConf.load(path)
         run_id = settings.run_id

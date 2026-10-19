@@ -4,17 +4,21 @@ import json
 import pickle
 import subprocess
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock
 from urllib.error import URLError
 
 import httpx
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 import renderers.base as renderer_base
 import verifiers.v1 as vf
+import yaml
+from pydantic import ValidationError
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 from verifiers.v1.clients import base as client_base
@@ -24,6 +28,57 @@ from verifiers.v1.trace import AgentInfo, TraceTask
 
 from rl2 import train_grpo_v2 as training
 from rl2.addition_env import AdditionTaskset, AdditionTools
+
+
+def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/addition.yaml"
+    config = training.load_config(preset, training.Config)
+    assert config.run_id == "grpo_v2_addition_Qwen_Qwen3-0.6B_seed1"
+    assert config.ckpt_dir == f"/runs/grpo_v2/{config.run_id}"
+    assert config.total_iterations is None
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(asdict(config) | {"max_tokens": "${group_size}", "total_iterations": 1}))
+    train = Mock()
+    monkeypatch.setattr(training, "train", train)
+    monkeypatch.setattr(sys, "argv", ["train_grpo_v2", "--config", str(path)])
+    training.main()
+    train.assert_called_once_with(replace(config, max_tokens=4, total_iterations=1))
+    assert pickle.loads(pickle.dumps(config)) == config
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"num_groups": 0},
+        {"group_size": 1},
+        {"total_iterations": 0},
+        {"max_tokens": 0},
+        {"max_turns": 0},
+        {"temperature": 0.0},
+        {"seed": -1},
+        {"group_size": 2.5},
+        {"unknown_option": 1},
+        {"learning_rate": 0.0},
+        {"clip_coef": 1.0},
+        {"max_grad_norm": 0.0},
+        {"microbatch_size": 0},
+        {"microbatch_size": 3},
+        {"update_epochs": 0},
+    ],
+)
+def test_config_rejects_invalid_settings(settings: dict[str, int | float]) -> None:
+    with pytest.raises(ValidationError):
+        training.Config(**settings)
+
+
+def test_agent_uses_config() -> None:
+    config = training.Config(model="Qwen/custom", max_tokens=16, max_turns=2, temperature=0.7)
+    agent = training.create_agent(config)
+    assert agent.config.model == config.model
+    assert agent.config.client.renderer_model_name == config.model
+    assert agent.config.sampling.max_tokens == 16
+    assert agent.config.sampling.temperature == 0.7
+    assert agent.config.max_turns == 2
 
 
 @pytest.mark.parametrize("failure", [None, "launch", "rollout", "shutdown"])
@@ -38,11 +93,20 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
         "127.0.0.1",
         "--port",
         "8000",
+        "--dtype",
+        "bfloat16",
+        "--generation-config",
+        "vllm",
+        "--logprobs-mode",
+        "processed_logprobs",
+        "--weight-transfer-config",
+        '{"backend":"nccl"}',
     ]
     server = MagicMock()
     server.__enter__.return_value = server
     launch = Mock(return_value=server, side_effect=OSError("launch failed") if failure == "launch" else None)
     monkeypatch.setattr(training.subprocess, "Popen", launch)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
     if failure == "shutdown":
         server.wait.side_effect = subprocess.TimeoutExpired(cmd=command, timeout=10)
 
@@ -54,8 +118,10 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
             assert process is server
             server.terminate.assert_not_called()
 
-    # No env override: vLLM inherits Ray's CUDA_VISIBLE_DEVICES assignment.
-    launch.assert_called_once_with(command)
+    launch.assert_called_once()
+    assert launch.call_args.args == (command,)
+    assert launch.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+    assert launch.call_args.kwargs["env"]["VLLM_SERVER_DEV_MODE"] == "1"
     if failure == "launch":
         server.terminate.assert_not_called()
     else:
@@ -119,6 +185,7 @@ def actor(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 @pytest.mark.parametrize("startup_fails", [False, True])
 def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = training.Config(model="Qwen/custom")
     server = MagicMock()
     serve = Mock(return_value=server)
     monkeypatch.setattr(training, "serve_vllm", serve)
@@ -130,10 +197,10 @@ def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPa
         actor_class = training.Actor.__ray_metadata__.modified_class
         actor = actor_class.__new__(actor_class)
         with pytest.raises(TimeoutError, match="not ready"):
-            actor.__init__()
+            actor.__init__(config=config)
         actor.__ray_shutdown__()
     else:
-        actor = training.Actor.__ray_metadata__.modified_class()
+        actor = training.Actor.__ray_metadata__.modified_class(config=config)
         actor.collect_group = AsyncMock(return_value=group)
         monkeypatch.setattr(training.random, "choice", Mock(return_value=actor.tasks[0]))
         for _ in range(2):
@@ -142,14 +209,16 @@ def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPa
         assert actor.collect_group.await_count == 2
         server.__exit__.assert_not_called()
         actor.__ray_shutdown__()
-    serve.assert_called_once_with()
+    serve.assert_called_once_with(model=config.model)
     ready.assert_called_once_with(server.__enter__.return_value)
     server.__enter__.assert_called_once()
     server.__exit__.assert_called_once()
 
 
 @pytest.mark.parametrize(("num_groups", "fails"), [(1, False), (2, False), (2, True)])
-def test_learner_pulls_groups_through_batcher(num_groups: int, fails: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_learner_pulls_groups_through_batcher(
+    num_groups: int, fails: bool, learner: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     actor = Mock()
     groups = [training.RolloutGroup(task_id=str(i), prompt="test", rollouts=[]) for i in range(num_groups)]
     actor.fetch_next_group.remote = AsyncMock(
@@ -158,7 +227,7 @@ def test_learner_pulls_groups_through_batcher(num_groups: int, fails: bool, monk
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor)
     batcher_handle = Mock()
     batcher_handle.fetch_next_batch.remote.side_effect = batcher.fetch_next_batch
-    learner = training.Learner.__ray_metadata__.modified_class(batcher=batcher_handle)
+    learner.batcher = batcher_handle
 
     def get(result: Any) -> Any:
         return asyncio.run(result)
@@ -183,23 +252,293 @@ def test_batch_requires_groups() -> None:
     actor.fetch_next_group.remote.assert_not_called()
 
 
-def test_learner_requests_batch_dimensions() -> None:
-    learner = training.Learner.__ray_metadata__.modified_class(batcher=Mock())
-    batch = [training.RolloutGroup(task_id="0", prompt="test", rollouts=[])]
-    learner.fetch_next_batch = Mock(side_effect=[batch, RuntimeError("done")])
-    learner.optimize = Mock()
-    learner.publish_weights = Mock()
-    with pytest.raises(RuntimeError, match="done"):
-        learner.start()
-    learner.fetch_next_batch.assert_called_with(num_groups=1, group_size=4)
-    learner.optimize.assert_called_once_with(batch)
-    learner.publish_weights.assert_called_once_with()
+@pytest.fixture
+def learner(monkeypatch: pytest.MonkeyPatch) -> Any:
+    device = jax.devices("cpu")[0]
+    params = {
+        "model.norm.weight": jnp.ones(3, dtype=jnp.bfloat16),  # (D,)
+        "model.embed_tokens.weight": jnp.arange(6, dtype=jnp.bfloat16).reshape(2, 3),  # (V, D)
+    }
+    loader = Mock(return_value=(Mock(), {"params": params}))
+    monkeypatch.setattr(training, "load_qwen3_checkpoint", loader)
+    monkeypatch.setattr(training.jax, "devices", Mock(return_value=[device]))
+    config = training.Config(model="Qwen/custom")
+    learner = training.Learner.__ray_metadata__.modified_class(batcher=Mock(), actor=Mock(), config=config)
+    loader.assert_not_called()
+    assert not hasattr(learner, "state")
+    return learner
 
 
 @pytest.mark.parametrize("fails", [False, True])
-def test_main_gracefully_terminates_actor(fails: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_learner_logs_rollouts(fails: bool, learner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    sequence = training.TrainingSequence(
+        token_ids=np.array([1], dtype=np.int32),  # (T=1,)
+        loss_mask=np.array([True]),  # (T=1,)
+        old_log_probs=np.array([-0.2], dtype=np.float32),  # (T=1,)
+    )
+    rollout = training.Rollout(
+        sequence=sequence,
+        reward=0.0,
+        advantage=-1.0,
+        completion="wrong",
+        num_turns=1,
+        num_input_tokens=4,
+        num_output_tokens=2,
+        rollout_seconds=0.5,
+        stop_condition="agent_completed",
+    )
+    batch = [
+        training.RolloutGroup(task_id="0", prompt="first", rollouts=[rollout, rollout]),
+        training.RolloutGroup(
+            task_id="1",
+            prompt="second",
+            rollouts=[replace(rollout, reward=1.0, num_turns=3, num_output_tokens=6, rollout_seconds=1.5)] * 2,
+        ),
+    ]
+    learner.config = replace(learner.config, num_groups=2, group_size=2, total_iterations=None if fails else 2)
+    writer = MagicMock()
+    writer.__enter__.return_value = writer
+    factory = Mock(return_value=writer)
+    monkeypatch.setattr(training, "MLflowLogger", factory)
+    # Isolate this clock from logging and other users of the time module.
+    monkeypatch.setattr(training, "time", Mock(monotonic=Mock(side_effect=range(20))))
+    group = Mock()
+    monkeypatch.setattr(training, "get_open_port", Mock(return_value=12345))
+    monkeypatch.setattr(training.NCCLWeightTransferEngine, "trainer_init", Mock(return_value=group))
+    monkeypatch.setattr(training.ray, "get", Mock())
+    steps = Mock()
+    steps.initialize = Mock(wraps=learner.initialize_weight_transfer)
+    learner.initialize_weight_transfer = steps.initialize
+    learner.fetch_next_batch = steps.fetch
+    learner.fetch_next_batch.side_effect = [batch, RuntimeError("done") if fails else batch]
+    learner.publish_weights = steps.publish
+
+    def optimize(groups: list[training.RolloutGroup]) -> dict[str, float]:
+        assert groups is batch
+        learner.state = learner.state.replace(step=learner.state.step + 1)
+        return {"losses/policy": -0.25}
+
+    steps.optimize.side_effect = optimize
+    learner.optimize = steps.optimize
+
+    def exit_writer(*args: object) -> None:
+        group.destroy.assert_called_once_with()
+
+    writer.__exit__.side_effect = exit_writer
+    if fails:
+        with pytest.raises(RuntimeError, match="done"):
+            learner.start()
+    else:
+        learner.start()
+    training.load_qwen3_checkpoint.assert_called_once_with(learner.config.model, dtype="bfloat16")
+    assert learner.model is training.load_qwen3_checkpoint.return_value[0]
+    assert all(value.device == jax.devices("cpu")[0] for value in learner.state.params.values())
+    assert all(value.dtype == jnp.float32 for value in learner.state.params.values())
+    learner.fetch_next_batch.assert_called_with(num_groups=2, group_size=2)
+    expected = ["initialize", "publish", "fetch", "optimize", "publish", "fetch"]
+    assert [call[0] for call in steps.mock_calls] == expected + ([] if fails else ["optimize", "publish"])
+    factory.assert_called_once_with(experiment="grpo_v2", run_name=None)
+    writer.log_params.assert_called_once_with(asdict(learner.config))
+    assert yaml.safe_load(writer.log_text.call_args.args[0]) == asdict(learner.config)
+    calls = writer.log_metrics.call_args_list
+    assert len(calls) == (2 if fails else 3)
+    assert calls[0].kwargs == {"step": 0}
+    assert calls[0].args[0] == {"model/params_millions": 9 / 1_000_000, "time/setup_seconds": 1}
+    assert calls[1].kwargs == {"step": 1}
+    assert calls[1].args[0] == {
+        "losses/policy": -0.25,
+        "charts/reward_mean": 0.5,
+        "charts/reward_std": 0.5,
+        "charts/reward_min": 0.0,
+        "charts/reward_max": 1.0,
+        "charts/turns_mean": 2.0,
+        "charts/input_tokens_mean": 4.0,
+        "charts/output_tokens_mean": 4.0,
+        "charts/total_iterations": 1,
+        "charts/total_updates": 1,
+        "charts/learning_rate": learner.config.learning_rate,
+        "charts/total_rollouts": 4,
+        "charts/rollouts_per_second": 4 / 3,
+        "charts/output_tokens_per_second": 16 / 3,
+        "time/rollout_seconds_mean": 1.0,
+        "time/batch_seconds": 1.0,
+        "time/update_seconds": 1.0,
+        "time/weight_transfer_seconds": 1.0,
+        "time/iteration_seconds": 3.0,
+        "time/elapsed_seconds": 5.0,
+    }
+    if not fails:
+        assert calls[2].kwargs == {"step": 2}
+        assert calls[2].args[0]["charts/total_rollouts"] == 8
+    writer.__exit__.assert_called_once()
+    assert writer.__exit__.call_args.args[0] is (RuntimeError if fails else None)
+
+
+@pytest.mark.parametrize("failure", ["receiver", "publish"])
+def test_learner_cleans_up_failed_start(failure: str, learner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    group = Mock()
+    monkeypatch.setattr(training, "get_open_port", Mock(return_value=12345))
+
+    def initialize(info: dict[str, Any]) -> Mock:
+        learner.actor.initialize_weight_transfer.remote.assert_called_once_with(info)
+        assert info == {"master_address": "127.0.0.1", "master_port": 12345, "rank_offset": 1, "world_size": 2}
+        return group
+
+    monkeypatch.setattr(training.NCCLWeightTransferEngine, "trainer_init", initialize)
+    get = Mock(side_effect=RuntimeError("receiver failed") if failure == "receiver" else None)
+    monkeypatch.setattr(training.ray, "get", get)
+    writer = MagicMock()
+    writer.__enter__.return_value = writer
+    monkeypatch.setattr(training, "MLflowLogger", Mock(return_value=writer))
+    learner.publish_weights = Mock(side_effect=RuntimeError("publish failed"))
+    with pytest.raises(RuntimeError, match=f"{failure} failed"):
+        learner.start()
+    get.assert_called_once_with(learner.actor.initialize_weight_transfer.remote.return_value)
+    group.destroy.assert_called_once_with()
+    assert learner.publish_weights.call_count == (failure == "publish")
+    writer.__exit__.assert_called_once()
+    assert writer.__exit__.call_args.args[0] is RuntimeError
+
+
+@pytest.mark.parametrize("buffer_bytes", [64 * 1024**2, 8], ids=["default-buffer", "oversized-embedding"])
+def test_learner_republishes_unchanged_parameters(
+    buffer_bytes: int, learner: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    learner.state = training.create_state(
+        training.load_qwen3_checkpoint.return_value[0],
+        training.load_qwen3_checkpoint.return_value[1]["params"],
+        learner.config,
+    )
+    monkeypatch.setattr(training, "WEIGHT_BUFFER_BYTES", buffer_bytes)
+    learner._transfer_group = Mock()
+    initial = jax.tree.map(np.asarray, learner.state.params)  # HF parameter shapes: (D,) and (V, D).
+    sends: list[dict[str, Any]] = []
+
+    def send(iterator: Any, trainer_args: training.NCCLTrainerSendWeightsArgs) -> None:
+        assert learner.actor.update_weights.remote.call_count == len(sends) + 1
+        weights = dict(iterator)  # HF parameter shapes.
+        info = learner.actor.update_weights.remote.call_args.args[0]
+        assert info["names"] == list(weights)
+        assert info["shapes"] == [list(weight.shape) for weight in weights.values()]
+        assert info["dtype_names"] == ["bfloat16", "bfloat16"]
+        assert info["packed"] and trainer_args.packed
+        assert info["packed_buffer_size_bytes"] == trainer_args.packed_buffer_size_bytes
+        assert trainer_args.packed_buffer_size_bytes == max(buffer_bytes, 12)
+        assert trainer_args.group is learner._transfer_group
+        for name, weight in weights.items():
+            assert tuple(weight.shape) == initial[name].shape
+            np.testing.assert_array_equal(weight.float().numpy(), initial[name].astype(np.float32))
+        sends.append(info)
+
+    monkeypatch.setattr(training.NCCLWeightTransferEngine, "trainer_send_weights", send)
+    synchronize = Mock()
+    monkeypatch.setattr(training.torch.cuda, "synchronize", synchronize)
+
+    def acknowledge(pending: Any) -> None:
+        assert pending is learner.actor.update_weights.remote.return_value
+        assert synchronize.call_count == len(sends)
+
+    monkeypatch.setattr(training.ray, "get", acknowledge)
+    learner.publish_weights()
+    learner.publish_weights()
+    assert len(sends) == 2
+    assert sends[0] == sends[1]
+    for name, value in learner.state.params.items():  # (D,) or (V, D)
+        np.testing.assert_array_equal(value, initial[name])
+
+
+@pytest.mark.parametrize("failure_path", [None, "/update_weights", "/finish_weight_update"])
+def test_actor_weight_update_lifecycle(failure_path: str | None, actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(status_code=500 if request.url.path == failure_path else 200)
+
+    client = httpx.AsyncClient(base_url=training.SERVER_URL, transport=httpx.MockTransport(respond))
+    monkeypatch.setattr(training.httpx, "AsyncClient", Mock(return_value=client))
+    update_info = {"names": ["model.norm.weight"]}
+    if failure_path:
+        with pytest.raises(httpx.HTTPStatusError):
+            asyncio.run(actor.update_weights(update_info))
+        with pytest.raises(RuntimeError, match="failed weight update"):
+            asyncio.run(actor.fetch_next_group(group_size=2))
+    else:
+        asyncio.run(actor.update_weights(update_info))
+    paths = ["/pause", "/start_weight_update", "/update_weights", "/finish_weight_update", "/resume"]
+    expected = paths if failure_path is None else paths[: paths.index(failure_path) + 1]
+    assert [request.url.path for request in requests] == expected
+    assert all(request.method == "POST" for request in requests)
+    assert dict(requests[0].url.params) == {"mode": "wait", "clear_cache": "true"}
+    assert json.loads(requests[2].content) == {"update_info": update_info}
+    assert client.is_closed
+
+
+def test_actor_initializes_weight_receiver(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    init_info = {"master_address": "127.0.0.1", "master_port": 12345, "rank_offset": 1, "world_size": 2}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/init_weight_transfer_engine"
+        assert json.loads(request.content) == {"init_info": init_info}
+        return httpx.Response(status_code=200)
+
+    client = httpx.AsyncClient(base_url=training.SERVER_URL, transport=httpx.MockTransport(respond))
+    monkeypatch.setattr(training.httpx, "AsyncClient", Mock(return_value=client))
+    asyncio.run(actor.initialize_weight_transfer(init_info))
+    assert client.is_closed
+
+
+def test_weight_update_waits_for_groups_and_blocks_new_rollouts(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    groups_started = asyncio.Event()
+    finish_groups = asyncio.Event()
+    updating = asyncio.Event()
+    finish_update = asyncio.Event()
+    events: list[str] = []
+
+    async def collect(task: training.AdditionTask, group_size: int) -> training.RolloutGroup:
+        events.append("group")
+        if events.count("group") == 2:
+            groups_started.set()
+        await finish_groups.wait()
+        return training.RolloutGroup(task_id=task.data.id, prompt="test", rollouts=[])
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        events.append(request.url.path)
+        if request.url.path == "/update_weights":
+            updating.set()
+            await finish_update.wait()
+        return httpx.Response(status_code=200)
+
+    actor.collect_group = collect
+    client = httpx.AsyncClient(base_url=training.SERVER_URL, transport=httpx.MockTransport(respond))
+    monkeypatch.setattr(training.httpx, "AsyncClient", Mock(return_value=client))
+
+    async def exercise() -> None:
+        async with asyncio.timeout(5), asyncio.TaskGroup() as pending:
+            for _ in range(2):
+                pending.create_task(actor.fetch_next_group(group_size=2))
+            await groups_started.wait()
+            pending.create_task(actor.update_weights({"names": []}))
+            await asyncio.sleep(0)
+            assert events == ["group", "group"]
+            finish_groups.set()
+            await updating.wait()
+            next_group = pending.create_task(actor.fetch_next_group(group_size=2))
+            await asyncio.sleep(0)
+            assert not next_group.done() and events.count("group") == 2
+            finish_update.set()
+        assert events[-2:] == ["/resume", "group"]
+        assert actor._active_groups == 0
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_train_gracefully_terminates_actor(fails: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = training.Config()
     actor, batcher, learner = Mock(), Mock(), Mock()
     actor.__ray_terminate__ = Mock()
+    learner.__ray_terminate__ = Mock()
     monkeypatch.setattr(training, "Actor", Mock(remote=Mock(return_value=actor)))
     monkeypatch.setattr(training, "Batcher", Mock(remote=Mock(return_value=batcher)))
     monkeypatch.setattr(training, "Learner", Mock(remote=Mock(return_value=learner)))
@@ -210,7 +549,7 @@ def test_main_gracefully_terminates_actor(fails: bool, monkeypatch: pytest.Monke
     monkeypatch.setattr(training.ray, "wait", wait)
 
     def start_learner() -> Any:
-        training.Actor.remote.assert_called_once_with()
+        training.Actor.remote.assert_called_once_with(config=config)
         if fails:
             raise RuntimeError("training failed")
         return learner.start.remote.return_value
@@ -218,15 +557,18 @@ def test_main_gracefully_terminates_actor(fails: bool, monkeypatch: pytest.Monke
     learner.start.remote.side_effect = start_learner
     if fails:
         with pytest.raises(RuntimeError, match="training failed"):
-            training.main()
+            training.train(config)
     else:
-        training.main()
-    training.Actor.remote.assert_called_once_with()
+        training.train(config)
+    training.Actor.remote.assert_called_once_with(config=config)
     training.Batcher.remote.assert_called_once_with(actor=actor)
-    training.Learner.remote.assert_called_once_with(batcher=batcher)
+    training.Learner.remote.assert_called_once_with(batcher=batcher, actor=actor, config=config)
     actor.start.remote.assert_not_called()
     actor.__ray_terminate__.remote.assert_called_once_with()
-    wait.assert_called_once_with([actor.__ray_terminate__.remote.return_value])
+    learner.__ray_terminate__.remote.assert_called_once_with()
+    wait.assert_called_once_with(
+        [learner.__ray_terminate__.remote.return_value, actor.__ray_terminate__.remote.return_value], num_returns=2
+    )
     if fails:
         get.assert_not_called()
     else:
@@ -623,6 +965,7 @@ def test_verifiers_tool_rollout(
     assert clients and all(client.is_closed for client in clients)
     assert requests[0]["model"] == training.MODEL
     assert requests[0]["sampling_params"]["max_tokens"] == 512
+    assert requests[0]["sampling_params"]["top_p"] == 1.0
     assert requests[0]["sampling_params"]["logprobs"] == 1
     prompt = tokenizer.decode(requests[0]["token_ids"])
     assert '"name": "add"' in prompt

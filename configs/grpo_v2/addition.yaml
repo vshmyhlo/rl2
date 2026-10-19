@@ -1,0 +1,15 @@
+model: Qwen/Qwen3-0.6B
+seed: 1 # Task sampling seed
+num_groups: 1
+group_size: 4
+total_iterations: null # Run until interrupted
+max_tokens: 512 # Per model response
+max_turns: 3
+temperature: 1.0
+learning_rate: 0.000001
+clip_coef: 0.2
+max_grad_norm: 1.0
+microbatch_size: 1 # Accumulate gradients across the rollout batch before each update
+update_epochs: 1
+run_id: grpo_v2_addition_${path_name:${model}}_seed${seed}
+ckpt_dir: /runs/grpo_v2/${run_id} # Reserved; checkpointing is not implemented yet
