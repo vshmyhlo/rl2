@@ -206,7 +206,7 @@ def test_learner_optimizes_and_publishes_updated_bf16_weights(
     learner = training.Learner.__ray_metadata__.modified_class(
         batcher=Mock(),
         actor=Mock(),
-        config=training.Config(temperature=0.7, update_epochs=2),
+        config=training.Config(temperature=0.7, microbatch_size=2, update_epochs=2),
     )
     learner.model = model.clone(dtype="bfloat16", param_dtype=jnp.bfloat16)
     learner.state = training.create_state(learner.model, state.params, training.Config(learning_rate=0.01))

@@ -37,8 +37,8 @@ Timing and throughput (logged every iteration):
     time/learner/output_tokens_per_second: Batch sampled-token count divided by iteration wall time.
     time/actor/rollout_seconds: Mean agent execution time per rollout, including model calls and tools.
     time/batcher/fetch_rollout_seconds: Wall time fetching all rollout groups, including actor return transfers.
-    time/batcher/prepare_batch_seconds: Wall time preparing and materializing the CPU training arrays.
-    time/learner/batch_seconds: Wall time fetching the rollout batch, including generation, scoring, and Ray transfers.
+    time/batcher/prepare_batch_seconds: Wall time preparing the CPU training arrays without explicit synchronization.
+    time/learner/batch_fetch_seconds: Wall time fetching the rollout batch, including generation, scoring, and Ray transfers.
     time/learner/update_seconds: Device transfer and optimizer update wall time.
     time/learner/weight_transfer_seconds: Wall time publishing updated learner weights to vLLM.
     time/learner/iteration_seconds: Batch fetching, optimization, and weight publication wall time.
@@ -80,7 +80,7 @@ import verifiers.v1 as vf
 import yaml
 from flax.training.train_state import TrainState
 from numpy.typing import NDArray
-from pydantic import Field
+from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass as config_dataclass
 from ray.actor import ActorHandle
 from renderers.configs import CustomRendererConfig
@@ -101,11 +101,21 @@ SERVER_URL = "http://127.0.0.1:8000"
 WEIGHT_BUFFER_BYTES = 64 * 1024**2
 
 
+@config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class AdditionConfig:
+    id: Literal["addition"] = "addition"
+
+
+@config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class ToolRLConfig:
+    id: Literal["toolrl"] = "toolrl"
+    dataset_file: str = TOOLRL_TRAIN_FILE
+
+
 @config_dataclass(frozen=True)
 class Config(BaseConfig):
     model: str = MODEL
-    taskset: Literal["addition", "toolrl"] = "addition"
-    dataset_file: str = TOOLRL_TRAIN_FILE
+    taskset: Annotated[AdditionConfig | ToolRLConfig, Field(discriminator="id")] = AdditionConfig()
     seed: Annotated[int, Field(ge=0)] = 1
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4
@@ -116,13 +126,13 @@ class Config(BaseConfig):
     learning_rate: Annotated[float, Field(gt=0)] = 1e-6
     clip_coef: Annotated[float, Field(gt=0, lt=1)] = 0.2
     max_grad_norm: Annotated[float, Field(gt=0)] = 1.0
-    microbatch_size: Annotated[int, Field(ge=1)] = 1
+    microbatch_size: Annotated[int, Field(ge=1)] = 4
     update_epochs: Annotated[int, Field(ge=1)] = 1
 
     def __post_init__(self) -> None:
         if self.num_groups * self.group_size % self.microbatch_size:
             raise ValueError("microbatch_size must divide num_groups * group_size")
-        if self.taskset == "toolrl" and self.max_turns != 1:
+        if self.taskset.id == "toolrl" and self.max_turns != 1:
             raise ValueError("ToolRL requires max_turns=1; tool calls are graded without execution")
 
 
@@ -352,14 +362,14 @@ def create_agent(config: Config = DEFAULT_CONFIG) -> vf.Agent:
                 api_key_var="VLLM_API_KEY",
                 renderer_model_name=config.model,
                 renderer=CustomRendererConfig(import_path="rl2.toolrl_env.ToolRLRenderer")
-                if config.taskset == "toolrl"
+                if config.taskset.id == "toolrl"
                 else None,
             ),
             sampling=vf.SamplingConfig(
                 max_tokens=config.max_tokens,
                 temperature=config.temperature,
                 top_p=1.0,
-                chat_template_kwargs={"enable_thinking": config.taskset == "toolrl"},
+                chat_template_kwargs={"enable_thinking": config.taskset.id == "toolrl"},
             ),
             max_turns=config.max_turns,
             timeout=TimeoutConfig(setup=120, rollout=120, finalize=30, scoring=30),
@@ -502,7 +512,6 @@ class Batcher:
         fetched = time.monotonic()
         groups = [group for group, _ in results]
         training_batch = self.prepare_batch(groups, context_length=context_length)  # (B, T), (B,) leaves.
-        jax.block_until_ready(training_batch)
         prepared = time.monotonic()
         batch = RolloutBatch(
             groups=groups,
@@ -598,7 +607,7 @@ class Learner:
                     "time/learner/rollouts_per_second": len(rollouts) / seconds,
                     "time/learner/output_tokens_per_second": sum(r.num_output_tokens for r in rollouts) / seconds,
                     "time/actor/rollout_seconds": mean(rollout.rollout_seconds for rollout in rollouts),
-                    "time/learner/batch_seconds": fetched - started,
+                    "time/learner/batch_fetch_seconds": fetched - started,
                     "time/learner/update_seconds": optimized - fetched,
                     "time/learner/weight_transfer_seconds": now - optimized,
                     "time/learner/iteration_seconds": now - started,
@@ -609,7 +618,7 @@ class Learner:
                     iteration,
                     scalars["charts/reward_mean"],
                     scalars["charts/degenerate_group_fraction"],
-                    scalars["time/learner/batch_seconds"],
+                    scalars["time/learner/batch_fetch_seconds"],
                     scalars["time/batcher/actor_to_batcher_seconds"],
                     scalars["time/learner/batcher_to_learner_seconds"],
                     scalars["losses/policy"],
@@ -698,8 +707,8 @@ class Actor:
         self._active_groups = 0
         self._weights_valid = True
         self.tasks = list(
-            ToolRLTaskset(config=ToolRLTasksetConfig(data_file=config.dataset_file))
-            if config.taskset == "toolrl"
+            ToolRLTaskset(config=ToolRLTasksetConfig(data_file=config.taskset.dataset_file))
+            if config.taskset.id == "toolrl"
             else AdditionTaskset(config=vf.TasksetConfig())
         )
         logger.info("Starting actor and vLLM on its assigned GPU")

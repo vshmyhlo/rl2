@@ -35,11 +35,16 @@ from rl2.toolrl_env import ToolCall, ToolRLData, ToolRLRenderer, ToolRLTask
 
 
 def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    defaults = training.Config()
+    assert defaults.microbatch_size == 4
+    assert defaults.update_epochs == 1
     preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/addition.yaml"
     config = training.load_config(preset, training.Config)
     assert config.run_id == "grpo_v2_addition_Qwen_Qwen3-0.6B_seed1"
     assert config.ckpt_dir == f"/runs/grpo_v2/{config.run_id}"
     assert config.total_iterations is None
+    assert asdict(config.taskset) == {"id": "addition"}
+    assert "dataset_file" not in asdict(config)
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(asdict(config) | {"max_tokens": "${group_size}", "total_iterations": 1}))
     train = Mock()
@@ -70,12 +75,42 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
         {"microbatch_size": 3},
         {"update_epochs": 0},
         {"taskset": "unknown"},
-        {"taskset": "toolrl", "max_turns": 2},
+        {"taskset": training.ToolRLConfig(), "max_turns": 2},
     ],
 )
-def test_config_rejects_invalid_settings(settings: dict[str, int | float | str]) -> None:
+def test_config_rejects_invalid_settings(settings: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         training.Config(**settings)
+
+
+@pytest.mark.parametrize("dataset", [None, "/data/train.parquet"], ids=["default", "local"])
+def test_toolrl_subconfig(dataset: str | None, tmp_path: Path) -> None:
+    taskset = {"id": "toolrl"}
+    if dataset is not None:
+        taskset["dataset_file"] = dataset
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({"taskset": taskset, "max_turns": 1}))
+    config = training.load_config(path, training.Config)
+    assert isinstance(config.taskset, training.ToolRLConfig)
+    assert config.taskset.dataset_file == (training.TOOLRL_TRAIN_FILE if dataset is None else dataset)
+    assert "dataset_file" not in asdict(config)
+
+
+@pytest.mark.parametrize(
+    ("settings", "error"),
+    [
+        ({"taskset": {"id": "unknown"}}, "union_tag_invalid"),
+        ({"taskset": {"id": "addition", "dataset_file": "train.parquet"}}, "unexpected_keyword_argument"),
+        ({"taskset": {"id": "toolrl", "unknown_option": True}, "max_turns": 1}, "unexpected_keyword_argument"),
+        ({"dataset_file": "train.parquet"}, "unexpected_keyword_argument"),
+    ],
+    ids=["unknown-tag", "addition-dataset", "unknown-toolrl-field", "top-level-dataset"],
+)
+def test_taskset_config_rejects_invalid_yaml(settings: dict[str, object], error: str, tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValidationError, match=error):
+        training.load_config(path, training.Config)
 
 
 def test_agent_uses_config() -> None:
@@ -91,10 +126,13 @@ def test_agent_uses_config() -> None:
 def test_toolrl_preset_and_actor(monkeypatch: pytest.MonkeyPatch) -> None:
     preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/toolrl.yaml"
     config = training.load_config(preset, training.Config)
-    assert config.taskset == "toolrl"
+    assert isinstance(config.taskset, training.ToolRLConfig)
+    assert config.taskset.dataset_file == training.TOOLRL_TRAIN_FILE
     assert config.max_turns == 1
     assert config.max_tokens == 1024
-    assert config.run_id == "grpo_v2_toolrl_Qwen_Qwen3-0.6B_seed1"
+    assert config.microbatch_size == training.DEFAULT_CONFIG.microbatch_size == 4
+    assert config.update_epochs == training.DEFAULT_CONFIG.update_epochs == 1
+    assert config.run_id == f"grpo_v2_toolrl_Qwen_Qwen3-0.6B_seed{config.seed}"
     assert pickle.loads(pickle.dumps(config)) == config
     tasks = Mock(return_value=[Mock()])
     monkeypatch.setattr(training, "ToolRLTaskset", tasks)
@@ -102,7 +140,7 @@ def test_toolrl_preset_and_actor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(training, "wait_for_server", Mock())
     actor = training.Actor.__ray_metadata__.modified_class(config=config)
     assert actor.tasks == tasks.return_value
-    assert tasks.call_args.kwargs["config"].data_file == config.dataset_file
+    assert tasks.call_args.kwargs["config"].data_file == config.taskset.dataset_file
     actor.__ray_shutdown__()
 
 
@@ -529,7 +567,7 @@ def test_learner_logs_rollouts(
         "time/learner/rollouts_per_second": 4 / 3,
         "time/learner/output_tokens_per_second": 16 / 3,
         "time/actor/rollout_seconds": 1.0,
-        "time/learner/batch_seconds": 1.0,
+        "time/learner/batch_fetch_seconds": 1.0,
         "time/learner/update_seconds": 1.0,
         "time/learner/weight_transfer_seconds": 1.0,
         "time/learner/iteration_seconds": 3.0,
@@ -1230,7 +1268,7 @@ def test_toolrl_renderer_preserves_text(tokenizer: PreTrainedTokenizerFast) -> N
 def test_verifiers_toolrl_rollout(
     actor: Any, local_harness: None, tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    actor.config = training.Config(taskset="toolrl", max_turns=1)
+    actor.config = training.Config(taskset=training.ToolRLConfig(), max_turns=1)
     answer = '<think>Use add.</think>\n<tool_call>\n{"name":"add","parameters":{"a":17,"b":25}}\n</tool_call>'
     task = ToolRLTask(
         data=ToolRLData(
