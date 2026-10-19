@@ -681,6 +681,10 @@ def test_training_loop_short_rollout_checkpoints_and_cleanup(
             assert int(save.call_args.args[0].step) == 2
             logged_steps = [call.args[1] for call in writer.log_metrics.call_args_list if "train/loss" in call.args[0]]
             assert logged_steps == [4, 6]
+            for call in writer.log_metrics.call_args_list:
+                if "train/loss" in call.args[0]:
+                    assert call.args[0]["time/steps_per_second"] > 0
+                    assert "charts/steps_per_second" not in call.args[0]
         factory.assert_called_once()
         assert factory.call_args.kwargs["d_model"] == config.d_model
         assert factory.call_args.kwargs["num_layers"] == config.num_layers

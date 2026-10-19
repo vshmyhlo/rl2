@@ -477,6 +477,9 @@ def test_training_resume_wiring_and_environment_step_logging(
     assert scalars["charts/total_updates"] == (6.0, 8)
     assert scalars["charts/training_progress"] == (1.0, 8)
     assert scalars["time/checkpoint_seconds"] == (2.5, 8)
+    for name in ("iterations", "environment_steps", "observations", "episodes"):
+        assert scalars[f"time/{name}_per_second"][0] > 0
+        assert f"charts/{name}_per_second" not in scalars
     save.assert_called_once()
     assert save.call_args.args[1].train_state is state
     assert save.call_args.args[1].rollout_count == 2

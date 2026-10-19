@@ -425,7 +425,7 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         assert logged["charts/training_progress"] == [(0.75, 3), (1.0, 4)]
         assert logged["charts/total_return_mean"] == [(1.0, 3), (1.0, 4)]
         assert logged["charts/total_episode_length_mean"] == [(1.0, 3), (1.0, 4)]
-        assert [value for value, _ in logged["charts/observations_per_second"]] == [1.0, 1.0]
+        assert [value for value, _ in logged["time/observations_per_second"]] == [1.0, 1.0]
         assert logged["time/elapsed_seconds"] == [(1.0, 3), (2.0, 4)]
         # An already completed run does not perform more updates or duplicate a save.
         ppo.train(config)

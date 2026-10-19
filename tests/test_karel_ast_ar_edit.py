@@ -277,6 +277,7 @@ def test_execution_feedback_and_restart(config: edit.Config) -> None:
 
 def test_rollout_replay_rewards_and_minibatches(config: edit.Config, state: TrainState, rollout: edit.Rollout) -> None:
     batch, rewards, diagnostics, _, programs = rollout
+    assert diagnostics["time/sampling_easy_seconds_mean"] >= 0
     assert all(isinstance(leaf, (np.ndarray, jax.Array)) for leaf in jax.tree.leaves(batch))
     logits = edit.mask_logits(predict(state, batch.event), batch.legal)
     np.testing.assert_allclose(edit.action_log_prob(logits, batch.actions), batch.old_log_probs, atol=2e-6)
@@ -365,7 +366,7 @@ def test_advantages_use_final_scores_without_delta_roundoff(
         collected = edit.collect_rollout(state, envs, np.random.default_rng(4), rollout.key, config)
     expected = np.asarray([-improvement / 2, improvement / 2]) / (improvement / 2 + 1e-8)
     np.testing.assert_allclose(collected.batch.advantages, expected, atol=1e-7)
-    assert collected.diagnostics["charts/degenerate_group_ratio"] == float(improvement == 0)
+    assert collected.diagnostics["charts/degenerate_group_fraction"] == float(improvement == 0)
 
 
 def test_stop_is_a_real_decision(config: edit.Config, state: TrainState) -> None:

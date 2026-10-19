@@ -70,7 +70,8 @@ def rollout(config: grpo.Config, state: TrainState) -> Rollout:
 
 def test_rollout_replay_and_environment_rewards(config: grpo.Config, state: TrainState, rollout: Rollout) -> None:
     batch, rewards, diagnostics, _ = rollout
-    assert diagnostics["charts/degenerate_group_ratio"] == float(len(set(rewards)) == 1)
+    assert diagnostics["time/sampling_easy_seconds_mean"] >= 0
+    assert diagnostics["charts/degenerate_group_fraction"] == float(len(set(rewards)) == 1)
     _, logits = state.apply_fn({"params": state.params}, batch.initial, batch.target, batch.actions[:-1])
     masked = mask_sequence_logits(logits, batch.actions, config.env.max_program_tokens)
     replay = grpo.action_log_prob(masked, batch.actions)

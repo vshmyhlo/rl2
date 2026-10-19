@@ -347,7 +347,7 @@ def collect_rollout(
         **{f"charts/reward_{name}_mean": float(values.mean()) for name, values in reward_components.items()},
         "charts/success_rate": float(successes.mean()),
         "charts/group_success_rate": float(successes.reshape((config.num_tasks, config.group_size)).any(axis=1).mean()),
-        "charts/degenerate_group_ratio": float((np.ptp(grouped_rewards, axis=1) == 0).mean()),
+        "charts/degenerate_group_fraction": float((np.ptp(grouped_rewards, axis=1) == 0).mean()),
         "charts/episode_length_mean": float(mask.sum(axis=(0, 2)).mean()),
         "charts/generation_rounds_mean": float(mask.any(axis=-1).sum(axis=0).mean()),
         "charts/program_token_length_mean": float(source_lengths.mean()),
@@ -363,7 +363,9 @@ def collect_rollout(
         diagnostics[f"sampling/{category}_fraction"] = len(selected) / config.num_tasks
         if selected:
             diagnostics[f"sampling/{category}_attempts_mean"] = float(np.mean([stats.attempts for stats in selected]))
-            diagnostics[f"sampling/{category}_seconds_mean"] = float(np.mean([stats.seconds for stats in selected]))
+            diagnostics[f"time/sampling_{category}_seconds_mean"] = float(
+                np.mean([stats.seconds for stats in selected])
+            )
             diagnostics[f"sampling/{category}_acceptance_rate"] = len(selected) / sum(
                 stats.attempts for stats in selected
             )
@@ -690,7 +692,7 @@ def train(config: Config) -> TrainState:
                             "charts/learning_rate": learning_rate,
                             "charts/updates_per_rollout": updates_done,
                             "charts/total_episodes": episodes,
-                            "charts/steps_per_second": (steps - start_steps) / (monotonic() - start),
+                            "time/steps_per_second": (steps - start_steps) / (monotonic() - start),
                             "time/rollout_seconds": rollout_seconds,
                             "time/optimization_seconds": monotonic() - optimization_start,
                         }.items()
@@ -735,7 +737,7 @@ def train(config: Config) -> TrainState:
                     f"trajectory={diagnostics['charts/reward_trajectory_mean']:.3f} "
                     f"length_penalty={diagnostics['charts/reward_length_mean']:.4f} "
                     f"execution_penalty={diagnostics['charts/reward_execution_mean']:.4f} "
-                    f"degenerate_group_ratio={diagnostics['charts/degenerate_group_ratio']:.3f} "
+                    f"degenerate_group_fraction={diagnostics['charts/degenerate_group_fraction']:.3f} "
                     f"policy={policy_loss:.3f} entropy={entropy:.3f} kl={approx_kl:.4f} "
                     f"updates={updates_done} early_stop={early_stop}",
                     flush=True,

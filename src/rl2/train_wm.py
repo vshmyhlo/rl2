@@ -656,7 +656,7 @@ def train(config: Config) -> str:
                     **{f"train/{name}": value for name, value in values.items()},
                     "rollout/mean_reward": float(batch.rewards.mean()),
                     "rollout/termination_rate": float(batch.terminated.mean()),
-                    "charts/steps_per_second": steps / (monotonic() - start),
+                    "time/steps_per_second": steps / (monotonic() - start),
                     "charts/learning_rate": learning_rate,
                 },
                 steps,

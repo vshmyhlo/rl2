@@ -365,7 +365,7 @@ def learner(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 
 @pytest.mark.parametrize(
-    ("fails", "group_rewards", "degenerate_ratio"),
+    ("fails", "group_rewards", "degenerate_fraction"),
     [
         pytest.param(False, ((0.0, 0.0), (1.0, 1.0)), 1.0, id="all-degenerate"),
         pytest.param(False, ((0.0, 0.0), (0.0, 1.0)), 0.5, id="mixed"),
@@ -376,7 +376,7 @@ def learner(monkeypatch: pytest.MonkeyPatch) -> Any:
 def test_learner_logs_rollouts(
     fails: bool,
     group_rewards: tuple[tuple[float, float], tuple[float, float]],
-    degenerate_ratio: float,
+    degenerate_fraction: float,
     learner: Any,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -476,7 +476,7 @@ def test_learner_logs_rollouts(
         "charts/reward_std": pstdev(rewards),
         "charts/reward_min": 0.0,
         "charts/reward_max": 1.0,
-        "charts/degenerate_group_ratio": degenerate_ratio,
+        "charts/degenerate_group_fraction": degenerate_fraction,
         "charts/turns_mean": 2.0,
         "charts/input_tokens_mean": 4.0,
         "charts/output_tokens_mean": 4.0,
@@ -484,8 +484,8 @@ def test_learner_logs_rollouts(
         "charts/total_updates": 1,
         "charts/learning_rate": learner.config.learning_rate,
         "charts/total_rollouts": 4,
-        "charts/rollouts_per_second": 4 / 3,
-        "charts/output_tokens_per_second": 16 / 3,
+        "time/rollouts_per_second": 4 / 3,
+        "time/output_tokens_per_second": 16 / 3,
         "time/rollout_seconds_mean": 1.0,
         "time/batch_seconds": 1.0,
         "time/update_seconds": 1.0,
@@ -496,8 +496,8 @@ def test_learner_logs_rollouts(
     if not fails:
         assert calls[2].kwargs == {"step": 2}
         assert calls[2].args[0]["charts/total_rollouts"] == 8
-        assert calls[2].args[0]["charts/degenerate_group_ratio"] == degenerate_ratio
-    assert f"degenerate_group_ratio={degenerate_ratio:.3f}" in capsys.readouterr().out
+        assert calls[2].args[0]["charts/degenerate_group_fraction"] == degenerate_fraction
+    assert f"degenerate_group_fraction={degenerate_fraction:.3f}" in capsys.readouterr().out
     writer.__exit__.assert_called_once()
     assert writer.__exit__.call_args.args[0] is (RuntimeError if fails else None)
 

@@ -97,7 +97,7 @@ def test_rollout_samples_task_and_distance_map_once_per_group(
     assert diagnostics["sampling/easy_acceptance_rate"] == pytest.approx(
         config.num_tasks / sum(item.attempts for item in stats)
     )
-    assert diagnostics["sampling/easy_seconds_mean"] >= 0
+    assert diagnostics["time/sampling_easy_seconds_mean"] >= 0
     seeds = np.random.default_rng(4).integers(0, 2**31, size=config.num_tasks)
     for group, seed in enumerate(seeds):
         expected = KarelProgramEnv(config.env).reset(seed=int(seed))
@@ -172,7 +172,7 @@ def test_rollout_pairs_masks_replay_and_exact_environment_rewards(
     config: Config, state: TrainState, rollout: tuple
 ) -> None:
     batch, rewards, diagnostics, _ = rollout
-    assert diagnostics["charts/degenerate_group_ratio"] == float(len(set(rewards)) == 1)
+    assert diagnostics["charts/degenerate_group_fraction"] == float(len(set(rewards)) == 1)
     np.testing.assert_array_equal(batch.initial[0], batch.initial[1])
     np.testing.assert_array_equal(batch.target[0], batch.target[1])
     np.testing.assert_array_equal(batch.mask, batch.actions != 0)

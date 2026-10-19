@@ -128,6 +128,9 @@ def test_training_reports_raw_completed_episode_scores(capsys: pytest.CaptureFix
         checkpoint_manager.save.assert_called_once()
 
     assert evaluate.call_count == 2
+    for call in writer.return_value.log_metrics.call_args_list:
+        assert call.args[0]["time/steps_per_second"] > 0
+        assert "charts/steps_per_second" not in call.args[0]
     for call, expected_returns, steps in zip(evaluate.call_args_list, [(3.0,), (3.0, 7.0)], [2, 4], strict=True):
         chex.assert_trees_all_equal(call.kwargs["initial_carry"], carry)
         scores = call.kwargs["training_scores"]

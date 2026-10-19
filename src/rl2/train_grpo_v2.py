@@ -487,7 +487,7 @@ class Learner:
                     "charts/reward_std": pstdev(rewards),
                     "charts/reward_min": min(rewards),
                     "charts/reward_max": max(rewards),
-                    "charts/degenerate_group_ratio": mean(
+                    "charts/degenerate_group_fraction": mean(
                         all(rollout.reward == group.rollouts[0].reward for rollout in group.rollouts)
                         for group in batch.groups
                     ),
@@ -498,8 +498,8 @@ class Learner:
                     "charts/total_updates": int(self.state.step),
                     "charts/learning_rate": self.config.learning_rate,
                     "charts/total_rollouts": total_rollouts,
-                    "charts/rollouts_per_second": len(rollouts) / seconds,
-                    "charts/output_tokens_per_second": sum(r.num_output_tokens for r in rollouts) / seconds,
+                    "time/rollouts_per_second": len(rollouts) / seconds,
+                    "time/output_tokens_per_second": sum(r.num_output_tokens for r in rollouts) / seconds,
                     "time/rollout_seconds_mean": mean(rollout.rollout_seconds for rollout in rollouts),
                     "time/batch_seconds": fetched - started,
                     "time/update_seconds": optimized - fetched,
@@ -509,7 +509,7 @@ class Learner:
                 }
                 print(
                     f"iteration={iteration} reward={scalars['charts/reward_mean']:.3f} "
-                    f"degenerate_group_ratio={scalars['charts/degenerate_group_ratio']:.3f} "
+                    f"degenerate_group_fraction={scalars['charts/degenerate_group_fraction']:.3f} "
                     f"batch={scalars['time/batch_seconds']:.2f}s "
                     f"group_transfer_mean={scalars['time/actor_to_batcher_seconds_mean']:.6f}s "
                     f"batch_transfer={scalars['time/batcher_to_learner_seconds']:.6f}s "

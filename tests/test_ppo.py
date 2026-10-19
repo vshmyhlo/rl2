@@ -614,7 +614,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     writer.log_params.assert_called_once_with(asdict(config))
     assert "time/window_seconds" not in logged
     assert "time/iteration_seconds" not in logged
-    assert "charts/steps_per_second" not in logged
+    assert "time/steps_per_second" not in logged
     assert not any("last_100" in tag for tag in logged)
     # Minibatch-weighted means: the rejected rollout contributes one sample, not two.
     for tag, expected in {
@@ -631,9 +631,9 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         "value/explained_variance": [(0.3, 2), (0.8, 3)],
         "charts/updates_per_rollout": [(1.0, 2), (2.0, 3)],
         "policy/early_stop": [(0.5, 2), (0.0, 3)],
-        "charts/iterations_per_second": [(2 / 60, 2), (1 / 20, 3)],
-        "charts/observations_per_second": [(2 / 60, 2), (1 / 20, 3)],
-        "charts/episodes_per_second": [(1 / 60, 2), (0.0, 3)],
+        "time/iterations_per_second": [(2 / 60, 2), (1 / 20, 3)],
+        "time/observations_per_second": [(2 / 60, 2), (1 / 20, 3)],
+        "time/episodes_per_second": [(1 / 60, 2), (0.0, 3)],
         "charts/episodes": [(1.0, 2), (0.0, 3)],
         "charts/return_mean": [(8.0, 2)],
         "charts/episode_length_mean": [(2.0, 2)],
@@ -870,9 +870,9 @@ def test_train_evaluates_final_policy(
         ("charts/total_return_mean", [(3.0, 2), (5.0, 4)]),
         ("charts/total_episode_length_mean", [(2.0, 2), (1.5, 4)]),
         ("time/elapsed_seconds", [(first_elapsed, 2), (final_elapsed, 4)]),
-        ("charts/iterations_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
-        ("charts/observations_per_second", [(2 / first_elapsed, 2), (2 / (final_elapsed - first_elapsed), 4)]),
-        ("charts/episodes_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
+        ("time/iterations_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
+        ("time/observations_per_second", [(2 / first_elapsed, 2), (2 / (final_elapsed - first_elapsed), 4)]),
+        ("time/episodes_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
     ):
         logged = metric_history(writer.return_value)[tag]
         assert logged == expected

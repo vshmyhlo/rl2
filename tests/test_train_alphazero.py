@@ -356,7 +356,7 @@ def test_mlflow_progress(
         assert [value for value, _ in metrics[tag]] == values
     assert "time/rollout_seconds" not in metrics
     assert "time/optimization_seconds" not in metrics
-    assert [value for value, _ in metrics["charts/SPS"]] == pytest.approx([5 / 30, 5 / 30, 3 / 5])
+    assert [value for value, _ in metrics["time/SPS"]] == pytest.approx([5 / 30, 5 / 30, 3 / 5])
     assert metrics["time/eta_seconds"][-1][0] == 0
     assert metrics["model/params_millions"][0][0] == pytest.approx(1e-6)
     artifacts = {call.args[1]: call.args[0] for call in writer.log_text.call_args_list}

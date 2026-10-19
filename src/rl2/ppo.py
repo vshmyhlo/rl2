@@ -30,9 +30,9 @@ Progress scalars computed over the logging window:
     policy/early_stop: Fraction of rollouts stopped early by the KL threshold.
     value/explained_variance: Rollout value predictions versus GAE returns.
     charts/updates_per_rollout: Mean number of accepted minibatch updates.
-    charts/iterations_per_second: Rollouts and their PPO updates per second.
-    charts/observations_per_second: Training observations per second across all environments.
-    charts/episodes_per_second: Completed training episodes per second.
+    time/iterations_per_second: Rollouts and their PPO updates per second.
+    time/observations_per_second: Training observations per second across all environments.
+    time/episodes_per_second: Completed training episodes per second.
     charts/episodes: Training episodes completed in the window.
     charts/return_mean: Mean raw return of episodes completed in the window.
     charts/episode_length_mean: Mean episode length in environment steps.
@@ -1280,9 +1280,9 @@ def train(config: Config) -> TrainState:
                     "policy/entropy": mean_metrics["entropy"],
                     "policy/approx_kl": mean_metrics["approx_kl"],
                     "policy/clip_fraction": mean_metrics["clip_fraction"],
-                    "charts/iterations_per_second": window_rollout_count / rate_seconds,
-                    "charts/observations_per_second": sps,
-                    "charts/episodes_per_second": window_episode_count / rate_seconds,
+                    "time/iterations_per_second": window_rollout_count / rate_seconds,
+                    "time/observations_per_second": sps,
+                    "time/episodes_per_second": window_episode_count / rate_seconds,
                     "charts/learning_rate": learning_rate,
                     "charts/entropy_coef": entropy_coef,
                     "charts/total_episodes": episode_count,
@@ -1308,8 +1308,8 @@ def train(config: Config) -> TrainState:
                     f"iteration={rollout_count} step={step_count} episodes={episode_count} return={episode_return_text} "
                     f"episode_length={episode_length_text} "
                     f"progress={scalars['charts/training_progress']:.3f} "
-                    f"iterations/s={scalars['charts/iterations_per_second']:.3f} "
-                    f"observations/s={sps:.3f} episodes/s={scalars['charts/episodes_per_second']:.3f} "
+                    f"iterations/s={scalars['time/iterations_per_second']:.3f} "
+                    f"observations/s={sps:.3f} episodes/s={scalars['time/episodes_per_second']:.3f} "
                     f"lr={learning_rate:.3g} "
                     f"policy={mean_metrics['policy_loss']:.3f} value={mean_metrics['value_loss']:.3f} "
                     f"entropy={mean_metrics['entropy']:.3f} kl={mean_metrics['approx_kl']:.4f} "

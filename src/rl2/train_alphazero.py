@@ -30,7 +30,7 @@ terminal padding. Each logging window contains complete training iterations:
 - charts/completed_games: Cumulative completed games, including move-limit draws and restored
   checkpoint progress.
 - charts/learning_rate: Configured constant optimizer learning rate.
-- charts/SPS: Window positions divided by window wall time, in positions/sec.
+- time/SPS: Window positions divided by window wall time, in positions/sec.
 - time/iteration_seconds: Sum of iteration wall times in the window, covering
   self-play and optimization; excludes logging, evaluation, and checkpoint saving.
 - time/window_seconds: Wall time since the previous window boundary, including
@@ -368,7 +368,7 @@ def train(config: Config) -> TrainState:
                     "charts/iteration": iteration + 1,
                     "charts/completed_games": completed_games,
                     "charts/learning_rate": config.learning_rate,
-                    "charts/SPS": window_rollout["positions"] / max(window_seconds, 1e-9),
+                    "time/SPS": window_rollout["positions"] / max(window_seconds, 1e-9),
                     "time/iteration_seconds": window_iteration_seconds,
                     "time/window_seconds": window_seconds,
                     "time/elapsed_seconds": elapsed_seconds,

@@ -782,7 +782,7 @@ def train(config: Config) -> TrainState:
                         "rnd/predictor_updates": int(predictor.step),
                         "value/intrinsic_explained_variance": explained_variance(values[..., 1], intrinsic_returns),
                         "policy/entropy": entropy,
-                        "charts/steps_per_second": sps,
+                        "time/steps_per_second": sps,
                         "time/rollout_seconds": rollout_seconds,
                         "time/rollout_env_seconds": env_seconds,
                         "time/rollout_model_seconds": model_seconds,
