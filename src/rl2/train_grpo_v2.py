@@ -144,7 +144,7 @@ class Config(BaseConfig):
     clip_coef: Annotated[float, Field(gt=0, lt=1)] = 0.2
     max_grad_norm: Annotated[float, Field(gt=0)] = 1.0
     update_epochs: Annotated[int, Field(ge=1)] = 1
-    minibatches_per_epoch: Annotated[int, Field(ge=1)] = 1
+    minibatches_per_epoch: Annotated[int, Field(ge=1)] = 4
     grad_accum_steps: Annotated[int, Field(ge=1)] = 1
     gradient_checkpointing: bool = True
     # In-flight vLLM requests during weight updates (individual requests, not multi-turn rollout groups):
@@ -727,9 +727,14 @@ class Learner:
         minibatch_size = batch.token_ids.shape[0] // self.config.minibatches_per_epoch
         history: list[Metrics] = []
         for _ in range(self.config.update_epochs):
+            key = jax.random.fold_in(jax.random.key(self.config.seed), self.state.step)  # () typed PRNG key.
+            permutation = jax.random.permutation(key, batch.token_ids.shape[0])  # (B,)
+            shuffled = jax.tree.map(
+                lambda value, permutation=permutation: value[permutation], batch
+            )  # (B, T), (B,) leaves.
             for start in range(0, batch.token_ids.shape[0], minibatch_size):
                 minibatch = jax.tree.map(
-                    lambda value, start=start: value[start : start + minibatch_size], batch
+                    lambda value, start=start: value[start : start + minibatch_size], shuffled
                 )  # (B/N, T), (B/N,) leaves; N = minibatches_per_epoch.
                 self.state, metrics = update(
                     self.state,

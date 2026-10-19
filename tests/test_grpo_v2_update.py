@@ -242,8 +242,8 @@ def test_update_rejects_invalid_accumulation(
         training.update.lower(state, batch, grad_accum_steps=grad_accum_steps, temperature=0.7, clip_coef=0.2)
 
 
-@pytest.mark.parametrize("epochs,minibatches", [(1, 1), (2, 2)], ids=["default", "multiple-updates"])
-def test_learner_averages_all_update_metrics(
+@pytest.mark.parametrize("epochs,minibatches", [(1, 4), (2, 2)], ids=["default", "multiple-epochs"])
+def test_learner_shuffles_each_epoch_and_averages_metrics(
     state: TrainState,
     batch: training.GRPOBatch,
     monkeypatch: pytest.MonkeyPatch,
@@ -253,17 +253,21 @@ def test_learner_averages_all_update_metrics(
     learner = training.Learner.__ray_metadata__.modified_class(
         batcher=Mock(),
         actor=Mock(),
-        config=training.Config(group_size=2, update_epochs=epochs, minibatches_per_epoch=minibatches),
+        config=training.Config(group_size=8, update_epochs=epochs, minibatches_per_epoch=minibatches),
     )
     learner.mesh = Mesh(devices=np.array([jax.devices()[0]]), axis_names=("batch",))
     learner.state = state
+    batch = jax.tree.map(lambda value: jnp.concatenate([value] * 4), batch)  # (B=8, T=8), (B,) leaves.
+    batch = batch._replace(advantages=jnp.arange(8, dtype=jnp.float32))  # (B,) unique rollout IDs.
+    observed: list[training.GRPOBatch] = []  # Minibatches: (B/N, T), (B/N,) leaves.
 
     def update(
         current: TrainState, minibatch: training.GRPOBatch, **kwargs: Any
     ) -> tuple[TrainState, training.Metrics]:
-        assert minibatch.token_ids.shape == (2 // minibatches, 8)
-        assert minibatch.advantages.shape == (2 // minibatches,)
+        assert minibatch.token_ids.shape == (8 // minibatches, 8)
+        assert minibatch.advantages.shape == (8 // minibatches,)
         assert kwargs["grad_accum_steps"] == 1
+        observed.append(minibatch)
         return current.replace(step=current.step + 1), {"losses/policy": jnp.asarray(current.step)}  # () metric.
 
     monkeypatch.setattr(training, "update", update)
@@ -271,6 +275,23 @@ def test_learner_averages_all_update_metrics(
     steps = epochs * minibatches
     assert int(learner.state.step) == steps
     assert metrics == {"losses/policy": (steps - 1) / 2}
+    learner.optimize(batch)
+    orders: list[np.ndarray] = []  # Each epoch: (B,).
+    for start in range(0, len(observed), minibatches):
+        epoch = jax.tree.map(
+            lambda *values: jnp.concatenate(values), *observed[start : start + minibatches]
+        )  # (B, T), (B,) leaves.
+        order = np.asarray(epoch.advantages, dtype=np.int32)  # (B,)
+        np.testing.assert_array_equal(np.sort(order), np.arange(8))
+        for actual, original in zip(epoch, batch, strict=True):
+            np.testing.assert_array_equal(actual, original[order])
+        orders.append(order)
+    assert all(not np.array_equal(orders[0], order) for order in orders[1:])
+    learner.state = state
+    observed.clear()
+    learner.optimize(batch)
+    replay = jnp.concatenate([minibatch.advantages for minibatch in observed])  # (epochs * B,)
+    np.testing.assert_array_equal(replay, np.concatenate(orders[:epochs]))
 
 
 def test_learner_rejects_indivisible_rollout_batch(state: TrainState, batch: training.GRPOBatch) -> None:
@@ -308,17 +329,22 @@ def test_learner_optimizes_and_publishes_updated_bf16_weights(
     batch = batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))
     update = Mock(wraps=training.update)
     monkeypatch.setattr(training, "update", update)
+    permutations = [jnp.array([2, 0, 3, 1]), jnp.array([1, 3, 0, 2])]  # Each: (B,).
+    permutation = Mock(side_effect=permutations)
+    monkeypatch.setattr(training.jax.random, "permutation", permutation)
     metrics = learner.optimize(batch)
     assert update.call_count == 4
+    assert permutation.call_count == 2
     for index, call in enumerate(update.call_args_list):
         assert int(call.args[0].step) == index
         assert call.kwargs["grad_accum_steps"] == 2
         placed_batch = call.args[1]  # (B/N=2, T=8), (B/N,) leaves.
         start = (index % 2) * 2
+        indices = permutations[index // 2][start : start + 2]  # (B/N,)
         for placed, original in zip(placed_batch, batch, strict=True):
             assert placed.shape == (2, *original.shape[1:])
             assert placed.sharding == NamedSharding(learner.mesh, PartitionSpec("batch"))
-            np.testing.assert_array_equal(placed, original[start : start + 2])
+            np.testing.assert_array_equal(placed, original[indices])
     assert int(learner.state.step) == 4
     assert metrics["policy/grad_norm"] > 0
     assert all(isinstance(value, float) for value in metrics.values())

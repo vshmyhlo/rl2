@@ -37,7 +37,7 @@ from rl2.toolrl_env import ToolCall, ToolRLData, ToolRLRenderer, ToolRLTask
 
 def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     defaults = training.Config()
-    assert defaults.minibatches_per_epoch == 1
+    assert defaults.minibatches_per_epoch == 4
     assert defaults.grad_accum_steps == 1
     assert defaults.update_epochs == 1
     assert defaults.gradient_checkpointing
@@ -47,8 +47,8 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert config.run_id == "grpo_v2_addition_Qwen_Qwen3-0.6B_seed1"
     assert config.ckpt_dir == f"/runs/grpo_v2/{config.run_id}"
     assert config.total_iterations is None
-    assert config.minibatches_per_epoch == 1
-    assert config.grad_accum_steps == 4
+    assert config.minibatches_per_epoch == 4
+    assert config.grad_accum_steps == 1
     assert config.gradient_checkpointing
     assert config.weight_update_pause_mode == "wait"
     assert asdict(config.taskset) == {"id": "addition"}
@@ -147,8 +147,8 @@ def test_toolrl_preset_and_actor(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.taskset.dataset_file == training.TOOLRL_TRAIN_FILE
     assert config.max_turns == 1
     assert config.max_tokens == 1024
-    assert config.minibatches_per_epoch == training.DEFAULT_CONFIG.minibatches_per_epoch == 1
-    assert config.grad_accum_steps == 8
+    assert config.minibatches_per_epoch == training.DEFAULT_CONFIG.minibatches_per_epoch == 4
+    assert config.grad_accum_steps == 1
     assert config.update_epochs == training.DEFAULT_CONFIG.update_epochs == 1
     assert config.run_id == f"grpo_v2_toolrl_Qwen_Qwen3-0.6B_seed{config.seed}"
     assert pickle.loads(pickle.dumps(config)) == config
@@ -169,6 +169,9 @@ def test_codegym_preset_and_actor(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.taskset.dataset_file == training.CODEGYM_TRAIN_FILE
     assert config.taskset.manager_url == "http://codegym:8000"
     assert config.max_turns == 32
+    assert config.update_epochs == 1
+    assert config.minibatches_per_epoch == 4
+    assert config.grad_accum_steps == 1
     assert config.run_id == f"grpo_v2_codegym_Qwen_Qwen3-0.6B_seed{config.seed}"
     assert pickle.loads(pickle.dumps(config)) == config
     tasks = Mock(return_value=[Mock()])
