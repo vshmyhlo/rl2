@@ -6,6 +6,7 @@
 - Prefer standard-library functionality and well-maintained libraries over implementing equivalent functionality from scratch when they fit the task and project constraints. Reuse existing project dependencies where possible.
 - Prefer context managers (`with` / `async with`) for resource cleanup over manual `try`/`except`/`finally` blocks with explicit `close()` calls. Use `contextlib.closing` or `contextlib.aclosing` when a resource lacks native context-manager support.
 - Prefer combining multiple context managers in a single parenthesized `with` / `async with` statement over nesting statements when their scopes align.
+- Prefer `asyncio.TaskGroup` for managing concurrent and nested asynchronous tasks.
 - Keep comments and docstrings concise and minimal. Explain non-obvious intent or constraints without restating the code or overexplaining. Preserve required shape documentation.
 - Prefer concise, minimalistic READMEs, Markdown files, and other documentation. Include essential context and actionable instructions; avoid repetition, boilerplate, and unnecessary detail.
 - Place all imports at the top of the module. Do not use lazy imports, imports inside functions or methods, or conditional imports (including `TYPE_CHECKING` guards and `try`/`except` import fallbacks).

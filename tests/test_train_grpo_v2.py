@@ -7,7 +7,7 @@ import runpy
 import subprocess
 import sys
 from collections.abc import Iterator
-from contextlib import ExitStack
+from contextlib import ExitStack, aclosing
 from dataclasses import asdict, replace
 from pathlib import Path
 from statistics import mean, pstdev
@@ -34,7 +34,8 @@ from transformers import PreTrainedTokenizerFast
 from verifiers.v1.clients import base as client_base
 from verifiers.v1.clients.train import ElasticRendererPool
 from verifiers.v1.runtimes import subprocess as subprocess_runtime
-from verifiers.v1.trace import AgentInfo, TraceTask
+from verifiers.v1.trace import AgentInfo, AgentSpan, Error, ModelCall, TimeSpan, TimeSplit, Timing, TraceTask
+from verifiers.v1.types import Usage
 
 from rl2 import benchmark_env, codegym_env
 from rl2 import train_grpo_v2 as training
@@ -63,7 +64,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert defaults.gradient_checkpointing
     assert not defaults.enable_ray_dashboard
     assert not defaults.enable_ray_timeline
-    assert not defaults.enable_tracing
+    assert defaults.enable_tracing
     assert defaults.weight_update_pause_mode == "wait"
     preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/addition.yaml"
     config = training.load_config(preset, training.Config)
@@ -86,7 +87,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
                 "gradient_checkpointing": False,
                 "enable_ray_dashboard": True,
                 "enable_ray_timeline": True,
-                "enable_tracing": True,
+                "enable_tracing": False,
                 "padding_multiple": 64,
             }
         )
@@ -103,11 +104,20 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
             gradient_checkpointing=False,
             enable_ray_dashboard=True,
             enable_ray_timeline=True,
-            enable_tracing=True,
+            enable_tracing=False,
             padding_multiple=64,
         )
     )
     assert pickle.loads(pickle.dumps(config)) == config
+
+
+def test_presets_use_telemetry_defaults() -> None:
+    presets = Path(__file__).resolve().parents[1] / "configs/grpo_v2"
+    for preset in sorted(presets.glob("*.yaml")):
+        config = training.load_config(preset, training.Config)
+        assert config.enable_tracing, preset.name
+        assert not config.enable_ray_dashboard, preset.name
+        assert not config.enable_ray_timeline, preset.name
 
 
 @pytest.mark.parametrize(
@@ -404,6 +414,100 @@ def actor(monkeypatch: pytest.MonkeyPatch) -> Any:
     return actor
 
 
+async def collect_and_close(actor: Any, task: vf.Task) -> training.RolloutGroup:
+    async with aclosing(actor):
+        return await actor.collect_group(task, group_size=2)
+
+
+def test_actor_reuses_agent(actor: Any, token_trace: vf.Trace, monkeypatch: pytest.MonkeyPatch) -> None:
+    agent = AsyncMock()
+    entering = asyncio.Event()
+    release = asyncio.Event()
+
+    async def enter(context: vf.Agent) -> Any:
+        entering.set()
+        await release.wait()
+        return agent
+
+    agent.__aenter__.side_effect = enter
+    agent.run.return_value = token_trace.model_copy(deep=True, update={"ok": True})
+    create = Mock(return_value=agent)
+    monkeypatch.setattr(training, "create_agent", create)
+
+    async def collect() -> None:
+        async with aclosing(actor), asyncio.timeout(5):
+            first = asyncio.create_task(actor.collect_group(actor.tasks[0], group_size=2))
+            await entering.wait()
+            second = asyncio.create_task(actor.collect_group(actor.tasks[1], group_size=2))
+            await asyncio.sleep(0)
+            create.assert_called_once_with(actor.config)
+            release.set()
+            groups = await asyncio.gather(first, second)
+            assert [group.task_id for group in groups] == [task.data.id for task in actor.tasks[:2]]
+            await actor.collect_group(actor.tasks[0], group_size=2)
+            agent.__aexit__.assert_not_awaited()
+        await actor.aclose()
+        with pytest.raises(RuntimeError, match="Actor is closed"):
+            await actor.collect_group(actor.tasks[0], group_size=2)
+
+    asyncio.run(collect())
+    create.assert_called_once_with(actor.config)
+    agent.__aenter__.assert_awaited_once()
+    agent.__aexit__.assert_awaited_once()
+    assert agent.run.await_count == 6
+
+
+def test_actor_retries_agent_startup(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    failed, agent = AsyncMock(), AsyncMock()
+    failed.__aenter__.side_effect = RuntimeError("startup failed")
+    agent.__aenter__.return_value = agent
+    create = Mock(side_effect=[failed, agent])
+    monkeypatch.setattr(training, "create_agent", create)
+
+    async def start() -> None:
+        async with aclosing(actor):
+            with pytest.raises(RuntimeError, match="startup failed"):
+                await actor._get_agent()
+            assert await actor._get_agent() is agent
+
+    asyncio.run(start())
+    assert create.call_count == 2
+    agent.__aexit__.assert_awaited_once()
+
+
+def test_actor_close_cancels_rollouts(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    agent = AsyncMock()
+    agent.__aenter__.return_value = agent
+    started = asyncio.Event()
+    active = 0
+
+    async def run(task: vf.Task) -> vf.Trace:
+        nonlocal active
+        active += 1
+        if active == 2:
+            started.set()
+        try:
+            return await asyncio.Future[vf.Trace]()
+        finally:
+            active -= 1
+            agent.__aexit__.assert_not_awaited()
+
+    agent.run.side_effect = run
+    monkeypatch.setattr(training, "create_agent", Mock(return_value=agent))
+
+    async def collect() -> None:
+        async with aclosing(actor), asyncio.timeout(5):
+            group = asyncio.create_task(actor.collect_group(actor.tasks[0], group_size=2))
+            await started.wait()
+            await actor.aclose()
+            with pytest.raises(asyncio.CancelledError):
+                await group
+
+    asyncio.run(collect())
+    assert active == 0
+    agent.__aexit__.assert_awaited_once()
+
+
 @pytest.mark.parametrize("startup_fails", [False, True])
 def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPatch) -> None:
     config = training.Config(model="Qwen/custom")
@@ -476,8 +580,11 @@ def test_learner_pulls_groups_through_batcher(
     monkeypatch.setattr(training.ray, "get", get)
 
     if fails:
-        with pytest.raises(RuntimeError, match="rollout failed"):
+        with pytest.raises(ExceptionGroup) as error:
             learner.fetch_next_batch(num_groups=num_groups, group_size=3)
+        assert len(error.value.exceptions) == 1
+        assert isinstance(error.value.exceptions[0], RuntimeError)
+        assert str(error.value.exceptions[0]) == "rollout failed"
     else:
         batch = learner.fetch_next_batch(num_groups=num_groups, group_size=3)
         assert not hasattr(batch, "groups")
@@ -499,6 +606,43 @@ def test_batch_requires_groups() -> None:
     with pytest.raises(ValueError, match="num_groups"):
         asyncio.run(batcher.fetch_next_batch(num_groups=0, group_size=2, context_length=8))
     actor.fetch_next_group.remote.assert_not_called()
+
+
+def test_batch_failure_cancels_pending_fetches() -> None:
+    started = asyncio.Event()
+    cleaned_up = asyncio.Event()
+    requested = 0
+
+    async def fetch_group(group_size: int) -> training.Transfer[training.RolloutGroup]:
+        nonlocal requested
+        requested += 1
+        if requested == 1:
+            await started.wait()
+            raise RuntimeError("rollout failed")
+        started.set()
+        try:
+            return await asyncio.Future[training.Transfer[training.RolloutGroup]]()
+        finally:
+            cleaned_up.set()
+
+    actor = Mock()
+    actor.fetch_next_group.remote.side_effect = fetch_group
+    batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor)
+    batcher.prepare_batch = Mock()
+
+    async def collect() -> None:
+        async with asyncio.timeout(5):
+            with pytest.raises(ExceptionGroup) as error:
+                await batcher.fetch_next_batch(num_groups=2, group_size=2, context_length=8)
+            assert len(error.value.exceptions) == 1
+            assert isinstance(error.value.exceptions[0], RuntimeError)
+            assert str(error.value.exceptions[0]) == "rollout failed"
+            # Cleanup must finish before control returns to the caller.
+            assert cleaned_up.is_set()
+
+    asyncio.run(collect())
+    assert requested == 2
+    batcher.prepare_batch.assert_not_called()
 
 
 def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
@@ -1020,6 +1164,7 @@ def test_actor_weight_update_lifecycle(
     failure_path: str | None,
     actor: Any,
     monkeypatch: pytest.MonkeyPatch,
+    spans: InMemorySpanExporter,
 ) -> None:
     actor.config = replace(actor.config, weight_update_pause_mode=pause_mode)
     requests: list[httpx.Request] = []
@@ -1048,9 +1193,24 @@ def test_actor_weight_update_lifecycle(
     assert dict(requests[0].url.params) == {"mode": pause_mode, "clear_cache": "true"}
     assert json.loads(requests[2].content) == {"update_info": update_info}
     assert client.is_closed
+    finished = spans.get_finished_spans()
+    parent = next(item for item in finished if item.name == "actor.update_weights")
+    phases = [item for item in finished if item.name.startswith("actor.update_weights.")]
+    expected_phases = ["pause", "start", "transfer", "finish", "resume"][: len(expected)]
+    assert [item.name for item in phases] == [f"actor.update_weights.{name}" for name in expected_phases]
+    assert all(item.parent.span_id == parent.context.span_id for item in phases)
+    assert phases[0].attributes["mode"] == pause_mode
+    assert phases[2].attributes["tensor_count"] == 1
+    for index, item in enumerate(phases):
+        assert item.status.status_code == (
+            otel_trace.StatusCode.ERROR if expected[index] == failure_path else otel_trace.StatusCode.UNSET
+        )
+    assert parent.status.status_code == (otel_trace.StatusCode.ERROR if failure_path else otel_trace.StatusCode.UNSET)
 
 
-def test_actor_initializes_weight_receiver(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_actor_initializes_weight_receiver(
+    actor: Any, monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
+) -> None:
     init_info = {"master_address": "127.0.0.1", "master_port": 12345, "rank_offset": 1, "world_size": 2}
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -1062,24 +1222,27 @@ def test_actor_initializes_weight_receiver(actor: Any, monkeypatch: pytest.Monke
     monkeypatch.setattr(training.httpx, "AsyncClient", Mock(return_value=client))
     asyncio.run(actor.initialize_weight_transfer(init_info))
     assert client.is_closed
+    assert [item.name for item in spans.get_finished_spans()] == ["actor.initialize_weight_transfer"]
 
 
 @pytest.mark.parametrize(
-    ("enable_dashboard", "enable_timeline", "enable_tracing", "fails"),
+    ("enable_dashboard", "enable_timeline", "enable_tracing", "fails", "close_fails"),
     [
-        (False, False, False, False),
-        (True, False, False, False),
-        (False, True, False, False),
-        (False, False, True, False),
-        (True, True, True, True),
+        (False, False, False, False, False),
+        (True, False, False, False, False),
+        (False, True, False, False, False),
+        (False, False, True, False, False),
+        (True, True, True, True, False),
+        (False, False, False, False, True),
     ],
-    ids=["disabled", "dashboard-only", "timeline-only", "tracing-only", "all-on-failure"],
+    ids=["disabled", "dashboard-only", "timeline-only", "tracing-only", "all-on-failure", "close-failure"],
 )
 def test_train_gracefully_terminates_actor(
     enable_dashboard: bool,
     enable_timeline: bool,
     enable_tracing: bool,
     fails: bool,
+    close_fails: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1117,7 +1280,14 @@ def test_train_gracefully_terminates_actor(
     monkeypatch.setattr(training.ray, "init", MagicMock(side_effect=initialize_ray))
     timeline = Mock(return_value=[{"name": "training"}])
     monkeypatch.setattr(training.ray, "timeline", timeline)
-    get = Mock()
+
+    def get_result(result: Any) -> None:
+        if result is actor.aclose.remote.return_value:
+            actor.__ray_terminate__.remote.assert_not_called()
+            if close_fails:
+                raise RuntimeError("agent cleanup failed")
+
+    get = Mock(side_effect=get_result)
     monkeypatch.setattr(training.ray, "get", get)
     wait = Mock()
     monkeypatch.setattr(training.ray, "wait", wait)
@@ -1136,8 +1306,8 @@ def test_train_gracefully_terminates_actor(
         return [{"name": "training"}]
 
     timeline.side_effect = export
-    if fails:
-        with pytest.raises(RuntimeError, match="training failed"):
+    if fails or close_fails:
+        with pytest.raises(RuntimeError, match="agent cleanup failed" if close_fails else "training failed"):
             training.train(config)
     else:
         training.train(config)
@@ -1161,6 +1331,7 @@ def test_train_gracefully_terminates_actor(
         assert not traces
         timeline.assert_not_called()
     actor.start.remote.assert_not_called()
+    actor.aclose.remote.assert_called_once_with()
     actor.__ray_terminate__.remote.assert_called_once_with()
     learner.__ray_terminate__.remote.assert_called_once_with()
     batcher.__ray_terminate__.remote.assert_called_once_with()
@@ -1174,9 +1345,12 @@ def test_train_gracefully_terminates_actor(
         num_returns=3,
     )
     if fails:
-        get.assert_not_called()
+        get.assert_called_once_with(actor.aclose.remote.return_value)
     else:
-        get.assert_called_once_with(learner.start.remote.return_value)
+        assert [call.args[0] for call in get.call_args_list] == [
+            learner.start.remote.return_value,
+            actor.aclose.remote.return_value,
+        ]
 
 
 def test_environment_examples(actor: Any) -> None:
@@ -1270,11 +1444,16 @@ def test_actor_returns_only_complete_groups(
 
     env.run.side_effect = run
     monkeypatch.setattr(training, "create_agent", Mock(return_value=env))
+
+    async def collect() -> training.Transfer[training.RolloutGroup]:
+        async with aclosing(actor):
+            return await actor.fetch_next_group(group_size=2)
+
     if failure:
         with pytest.raises(RuntimeError if failure == "rollout" else ValueError):
-            asyncio.run(actor.fetch_next_group(group_size=2))
+            asyncio.run(collect())
     else:
-        result = asyncio.run(actor.fetch_next_group(group_size=2))
+        result = asyncio.run(collect())
         group = result.value
     assert len(seen) == 2
     assert seen[0] is not seen[1] and all(sample is not task for sample in seen)
@@ -1331,6 +1510,63 @@ def token_trace(actor: Any) -> vf.Trace:
     )
 
 
+def test_record_rollout_spans(token_trace: vf.Trace, spans: InMemorySpanExporter) -> None:
+    token_trace.timing = Timing(
+        boot=TimeSpan(start=1, end=2),
+        setup=TimeSpan(start=2, end=3),
+        agent=AgentSpan(start=3, end=6, model=TimeSplit(duration=2), harness=TimeSplit(duration=1)),
+        finalize=TimeSpan(start=6, end=6),  # Keep completed zero-duration phases.
+        scoring=TimeSpan(start=6),  # Skip unfinished phases.
+    )
+    token_trace.calls = [
+        ModelCall(
+            model="test-model",
+            time=TimeSpan(start=3.25, end=4.25),
+            finish_reason="stop",
+            usage=Usage(prompt_tokens=10, completion_tokens=2, cached_input_tokens=3),
+        ),
+        ModelCall(
+            time=TimeSpan(start=4.5, end=5.5),
+            error=Error(type="ProviderError", message="failed"),
+        ),
+        ModelCall(),  # No recorded timestamps.
+        ModelCall(time=TimeSpan(start=5.5)),  # Request still in flight.
+    ]
+    with training.span("actor.rollout") as parent:
+        training.record_rollout_spans(token_trace)
+        assert otel_trace.get_current_span() is parent
+    finished = spans.get_finished_spans()
+    phases = {
+        item.name.removeprefix("actor.rollout."): item for item in finished[:-1] if item.name != "actor.rollout.model"
+    }
+    assert set(phases) == {"boot", "setup", "agent", "finalize"}
+    for name, start, end in (("boot", 1, 2), ("setup", 2, 3), ("agent", 3, 6), ("finalize", 6, 6)):
+        item = phases[name]
+        assert item.parent.span_id == parent.get_span_context().span_id
+        assert (item.start_time, item.end_time) == (start * 1_000_000_000, end * 1_000_000_000)
+    assert phases["agent"].attributes == {"model_seconds": 2, "harness_seconds": 1}
+    calls = [item for item in finished if item.name == "actor.rollout.model"]
+    assert len(calls) == 2
+    for item, call in zip(calls, token_trace.calls, strict=False):
+        assert item.parent.span_id == phases["agent"].context.span_id
+        assert item.context.trace_id == parent.get_span_context().trace_id
+        assert item.start_time == int(call.time.start * 1_000_000_000)
+        assert item.end_time == int(call.time.end * 1_000_000_000)
+    assert calls[0].attributes == {
+        "call_index": 0,
+        "model": "test-model",
+        "finish_reason": "stop",
+        "input_tokens": 13,
+        "output_tokens": 2,
+    }
+    assert calls[1].attributes["error.type"] == "ProviderError"
+    assert calls[1].status.status_code == otel_trace.StatusCode.ERROR
+    assert not otel_trace.get_current_span().get_span_context().is_valid
+    spans.clear()
+    training.record_rollout_spans(token_trace)
+    assert not spans.get_finished_spans()
+
+
 @pytest.mark.parametrize("turns", [1, 2], ids=["single-turn", "multi-turn"])
 def test_training_sequence_preserves_tokens_and_masks_context(token_trace: vf.Trace, turns: int) -> None:
     token_trace.nodes = token_trace.nodes[: 2 * turns]
@@ -1347,7 +1583,11 @@ def test_training_sequence_preserves_tokens_and_masks_context(token_trace: vf.Tr
     jax.tree.map(np.testing.assert_array_equal, asdict(pickle.loads(pickle.dumps(sequence))), asdict(sequence))
 
 
-@pytest.mark.parametrize("rewards", [[-1.0, 0.0, 2.0], [0.7] * 8], ids=["population-std", "fractional-ties"])
+@pytest.mark.parametrize(
+    "rewards",
+    [[-1.0, 0.0, 2.0], [0.7] * 8, [1.0, 1.0 + 1e-8]],
+    ids=["population-std", "fractional-ties", "differences-below-float32-precision"],
+)
 def test_score_group_normalizes_rewards(
     rewards: list[float], token_trace: vf.Trace, actor: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1371,6 +1611,7 @@ def test_score_group_normalizes_rewards(
         ("empty", "exactly one"),
         ("branched", "exactly one"),
         ("no-tokens", "no trainable tokens"),
+        ("untrainable-agent", "no trainable tokens"),
         ("mask-length", "equal lengths"),
         ("missing-logprobs", "log-probability"),
         ("missing-turn-tokens", "Sampled messages"),
@@ -1395,6 +1636,8 @@ def test_training_sequence_rejects_invalid_tokens(failure: str, message: str, to
     elif failure == "no-tokens":
         for node in trace.nodes:
             node.token_ids, node.mask, node.logprobs = [], [], []
+    elif failure == "untrainable-agent":
+        trace.agent.trainable = False
     elif failure == "mask-length":
         trace.nodes[-1].mask = [True]
     elif failure == "missing-logprobs":
@@ -1435,11 +1678,12 @@ def test_batcher_collects_groups_concurrently(
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=handle)
 
     async def collect() -> training.Transfer[training.RolloutBatch]:
-        with training.span("test.batch") as parent:
-            async with asyncio.timeout(5):
-                result = await batcher.fetch_next_batch(num_groups=2, group_size=2, context_length=16)
-            assert otel_trace.get_current_span() is parent
-            return result
+        async with aclosing(actor):
+            with training.span("test.batch") as parent:
+                async with asyncio.timeout(5):
+                    result = await batcher.fetch_next_batch(num_groups=2, group_size=2, context_length=16)
+                assert otel_trace.get_current_span() is parent
+                return result
 
     batch = asyncio.run(collect()).value
     assert started == 4
@@ -1447,7 +1691,8 @@ def test_batcher_collects_groups_concurrently(
     assert f"Example 3 | task={actor.tasks[1].data.id}" in batch.examples
     assert batch.training_batch.token_ids.shape == (4, 16)
     assert all(isinstance(value, np.ndarray) for value in batch.training_batch)
-    assert env.__aexit__.await_count == 2
+    env.__aenter__.assert_awaited_once()
+    env.__aexit__.assert_awaited_once()
     finished = spans.get_finished_spans()
     groups = {item.attributes["group_id"]: item for item in finished if item.name == "actor.collect_group"}
     rollouts = [item for item in finished if item.name == "actor.rollout"]
@@ -1487,12 +1732,13 @@ def test_group_cancels_pending_rollouts(
     monkeypatch.setattr(training, "create_agent", Mock(return_value=env))
 
     async def collect() -> None:
-        with training.span("test.parent") as parent:
-            try:
-                await actor.collect_group(actor.tasks[0], group_size=2)
-            except ExceptionGroup:
-                assert otel_trace.get_current_span() is parent
-                raise
+        async with aclosing(actor):
+            with training.span("test.parent") as parent:
+                try:
+                    await actor.collect_group(actor.tasks[0], group_size=2)
+                except ExceptionGroup:
+                    assert otel_trace.get_current_span() is parent
+                    raise
 
     with pytest.raises(ExceptionGroup, match="TaskGroup"):
         asyncio.run(collect())
@@ -1515,7 +1761,7 @@ def local_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         *,
         activate: bool = True,
     ) -> list[str]:
-        path = tmp_path / "harness.py"
+        path = tmp_path / f"{self.name}.py"
         path.write_bytes(script.encode() if isinstance(script, str) else script)
         return [sys.executable, str(path)]
 
@@ -1555,7 +1801,12 @@ def tokenizer(monkeypatch: pytest.MonkeyPatch) -> PreTrainedTokenizerFast:
 
 @pytest.mark.parametrize("mode", ["success", "tool-error", "provider-error"])
 def test_verifiers_tool_rollout(
-    mode: str, actor: Any, local_harness: None, tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch
+    mode: str,
+    actor: Any,
+    local_harness: None,
+    tokenizer: PreTrainedTokenizerFast,
+    monkeypatch: pytest.MonkeyPatch,
+    spans: InMemorySpanExporter,
 ) -> None:
     requests: list[dict[str, Any]] = []
     arguments = '{"a":17}' if mode == "tool-error" else '{"a":17,"b":25}'
@@ -1600,9 +1851,9 @@ def test_verifiers_tool_rollout(
     monkeypatch.setattr(client_base, "build_async_httpx", build_client)
     if mode == "provider-error":
         with pytest.raises(RuntimeError, match="Rollout failed"):
-            asyncio.run(actor.collect_group(actor.tasks[0], group_size=2))
+            asyncio.run(collect_and_close(actor, actor.tasks[0]))
     else:
-        group = asyncio.run(actor.collect_group(actor.tasks[0], group_size=2))
+        group = asyncio.run(collect_and_close(actor, actor.tasks[0]))
         assert len(group.rollouts) == 2
         assert len(requests) == 2 * (2 if mode == "success" else 3)
         expected_samples = tool_ids + answer_ids if mode == "success" else tool_ids * 3  # (S,)
@@ -1641,6 +1892,22 @@ def test_verifiers_tool_rollout(
     prompt = tokenizer.decode(requests[0]["token_ids"])
     assert '"name": "add"' in prompt
     assert prompt.endswith("<think>\n\n</think>\n\n")
+    finished = spans.get_finished_spans()
+    rollouts = [item for item in finished if item.name == "actor.rollout"]
+    agents = [item for item in finished if item.name == "actor.rollout.agent"]
+    calls = [item for item in finished if item.name == "actor.rollout.model"]
+    assert len(rollouts) == len(agents) == 2
+    assert {item.parent.span_id for item in agents} == {item.context.span_id for item in rollouts}
+    for agent in agents:
+        model_calls = [item for item in calls if item.parent.span_id == agent.context.span_id]
+        assert len(model_calls) == (1 if mode == "provider-error" else 2 if mode == "success" else 3)
+        assert [item.attributes["call_index"] for item in model_calls] == list(range(len(model_calls)))
+        for item in model_calls:
+            assert agent.start_time <= item.start_time <= item.end_time <= agent.end_time
+            assert item.context.trace_id == agent.context.trace_id
+            assert item.status.status_code == (
+                otel_trace.StatusCode.ERROR if mode == "provider-error" else otel_trace.StatusCode.UNSET
+            )
 
 
 def test_toolrl_renderer_preserves_text(tokenizer: PreTrainedTokenizerFast) -> None:
@@ -1680,7 +1947,7 @@ def test_verifiers_toolrl_rollout(
     def respond(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/models":
             return httpx.Response(status_code=200, json={"data": [{"id": training.MODEL, "max_model_len": 8192}]})
-        ids = sampled[len(requests)]  # (C,)
+        ids = sampled[len(requests) % len(sampled)]  # (C,)
         requests.append(json.loads(request.content))
         return httpx.Response(
             status_code=200,
@@ -1697,12 +1964,24 @@ def test_verifiers_toolrl_rollout(
             },
         )
 
+    clients: list[httpx.AsyncClient] = []
+
     def build_client(config: vf.TrainClientConfig) -> httpx.AsyncClient:
-        return httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        clients.append(client)
+        return client
 
     monkeypatch.setattr(client_base, "build_async_httpx", build_client)
-    group = asyncio.run(actor.collect_group(task, group_size=2))
-    assert len(requests) == 2  # No tool execution or follow-up model request.
+
+    async def collect() -> training.RolloutGroup:
+        async with aclosing(actor):
+            await actor.collect_group(task, group_size=2)
+            assert len(clients) == 1 and not clients[0].is_closed
+            return await actor.collect_group(task, group_size=2)
+
+    group = asyncio.run(collect())
+    assert len(clients) == 1 and clients[0].is_closed
+    assert len(requests) == 4  # Two groups, with no tool execution or follow-up model request.
     by_completion = {rollout.completion: rollout for rollout in group.rollouts}
     assert by_completion[answer].reward == 4.0
     assert by_completion[completions[1]].reward == -3.0
@@ -1821,10 +2100,10 @@ def test_verifiers_codegym_rollout(
     monkeypatch.setattr(client_base, "build_async_httpx", build_client)
     if mode == "step-error":
         with pytest.raises(ExceptionGroup) as caught:
-            asyncio.run(actor.collect_group(task, group_size=2))
+            asyncio.run(collect_and_close(actor, task))
         assert all(isinstance(error, httpx.HTTPStatusError) for error in caught.value.exceptions)
     else:
-        group = asyncio.run(actor.collect_group(task, group_size=2))
+        group = asyncio.run(collect_and_close(actor, task))
         limited = mode in {"task-limit", "agent-limit"}
         expected_ids = first_ids if limited else first_ids + final_ids  # (S,)
         assert len(requests) == 2 * (1 if limited else 2)
@@ -1949,9 +2228,9 @@ Path(os.environ["APPWORLD_ROOT"], str(os.getpid()) + ".closed").write_text(str(s
     monkeypatch.setattr(client_base, "build_async_httpx", build_client)
     if mode == "worker-error":
         with pytest.raises(ExceptionGroup):
-            asyncio.run(actor.collect_group(task, group_size=2))
+            asyncio.run(collect_and_close(actor, task))
         return
-    group = asyncio.run(actor.collect_group(task, group_size=2))
+    group = asyncio.run(collect_and_close(actor, task))
     turns = 1 if mode == "turn-limit" else 2
     assert len(requests) == 2 * turns
     for rollout in group.rollouts:

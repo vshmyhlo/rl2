@@ -77,7 +77,7 @@ Adapter tests use lightweight upstream fakes plus a real worker/Verifiers transc
 
 The prototype uses `verifiers==0.4.0` and its `verifiers.v1` API. `AdditionTaskset.load()` supplies five local addition tasks; it and the MCP `add` tool live in `addition_env.py`. The actor uses the documented `vf.make_agent(vf.AgentConfig(...))` factory and `agent.run(task)` interface. The actor owns vLLM and runs Verifiers' `null` chat harness in local subprocesses for up to three model turns. An exact final integer answer earns 1, otherwise 0.
 
-The actor samples four independent rollouts of the same task concurrently (`group_size=4` per request, minimum 2), then scores the completed group. Each rollout receives `(reward - group_mean) / (group_std + 1e-4)`, using population standard deviation. Equal-reward groups have zero advantages. The learner requests a batch with configured `num_groups` and `group_size` (defaults: 1 and 4). The async batcher awaits `num_groups` calls to `Actor.fetch_next_group(group_size=...)` together and prepares the training arrays on CPU in request order, using the model context limit supplied by the learner. The learner moves the prepared arrays onto its device before optimization. The actor uses async methods so groups overlap while awaiting model and tool responses, following [Ray’s async actor pattern](https://docs.ray.io/en/latest/ray-core/actors/async_api.html). vLLM stays running between requests. Each group contains: shared task ID/prompt plus each rollout's training sequence, reward, advantage, final answer, turn/token counts, duration, and stop condition. Full Verifiers traces are discarded after scoring; generation or scoring failures propagate to the learner.
+The actor samples four independent rollouts of the same task concurrently (`group_size=4` per request, minimum 2), then scores the completed group. Each rollout receives `(reward - group_mean) / (group_std + 1e-4)`, using population standard deviation. Equal-reward groups have zero advantages. The learner requests a batch with configured `num_groups` and `group_size` (defaults: 1 and 4). The async batcher awaits `num_groups` calls to `Actor.fetch_next_group(group_size=...)` together and prepares the training arrays on CPU in request order, using the model context limit supplied by the learner. The learner moves the prepared arrays onto its device before optimization. The actor uses async methods so groups overlap while awaiting model and tool responses, following [Ray’s async actor pattern](https://docs.ray.io/en/latest/ray-core/actors/async_api.html). vLLM stays running between requests. The actor enters one Verifiers agent on its first group and reuses it across concurrent groups, retaining separate rollout state. The trainer closes the agent asynchronously before terminating the actor. Each group contains: shared task ID/prompt plus each rollout's training sequence, reward, advantage, final answer, turn/token counts, duration, and stop condition. Full Verifiers traces are discarded after scoring; generation or scoring failures propagate to the learner.
 
 Run with `uv run python -m rl2.train_grpo_v2 --config configs/grpo_v2/addition.yaml` on a Linux x86_64 host with Python 3.12 and two visible GPUs. The main dependencies include the rollout stack. Ray reserves one GPU for `Actor` (inherited by its vLLM subprocess) and the other for `Learner`; the batcher runs on CPU. The first rollout provisions the harness's Python dependencies using uv. No external dataset or paid inference service is needed.
 
@@ -127,17 +127,17 @@ After the Pod exits, retrieve the file from the PVC's [host backing directory](.
 
 Worker tracks include actor calls, `batcher.prepare_batch`, and the learner's `fetch_batch`, `optimize`, `publish_weights`, and `checkpoint` phases with iteration metadata. These measure host-side intervals, not GPU kernels or subprocess internals. Custom spans use Ray's private profiling API. The trainer explicitly uses a positive event-reporting interval: setting `RAY_task_events_report_interval_ms=0` disables reporting in Ray 2.59 despite its outdated timeline docstring.
 
-OpenTelemetry tracing is disabled by default. Enable it in the training YAML:
+OpenTelemetry tracing is enabled by default. Disable it in the training YAML:
 
 ```yaml
-enable_tracing: true
+enable_tracing: false
 ```
 
 Tracing also requires `OTEL_EXPORTER_OTLP_ENDPOINT` or
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. `submit.py` supplies the cluster's
 Tempo gRPC endpoint and adds `k8s.job.name` to every span.
 `OTEL_SDK_DISABLED=true` overrides the config and disables tracing.
-For local runs, enable tracing in the config, forward Tempo's port 4317, and launch with:
+For local runs, forward Tempo's port 4317 and launch with:
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
@@ -150,8 +150,17 @@ Each iteration has a separate trace tagged with `run_id`, `iteration`, and `mode
 Spans cover Ray calls, batch preparation, rollout groups and individual rollouts,
 scoring, optimization, weight publication, logging, and checkpoints.
 Groups carry `group_id` and `task_id`; rollouts add `rollout_index` and
-`stop_condition`. These are host-side intervals, not GPU kernel timings or
-individual model/tool calls inside a rollout.
+`stop_condition`. Each returned rollout exports Verifiers' recorded timestamps
+as `actor.rollout.boot`, `.setup`, `.agent`, `.finalize`, and `.scoring` spans;
+individual `.model` requests nest under `.agent` and include token counts and
+provider errors. The agent span includes aggregate `model_seconds` and
+`harness_seconds` (including tools). These are host-side intervals, not GPU kernel
+timings; individual tool calls are not timed separately. Detail spans appear
+after the rollout returns, including failed traces, but are unavailable if the
+rollout raises or is cancelled before returning a trace.
+Weight receiver initialization has an `actor.initialize_weight_transfer` span.
+`actor.update_weights` contains `.pause`, `.start`, `.transfer`, `.finish`, and
+`.resume` spans for the vLLM requests, also recorded in the Ray timeline.
 
 Ray's startup hook configures an OTLP gRPC batch exporter in the driver and each
 worker. Ray propagates context across actor calls; child asyncio tasks inherit

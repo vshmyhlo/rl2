@@ -66,7 +66,7 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Iterator
-from contextlib import ExitStack, closing, contextmanager, nullcontext
+from contextlib import AsyncExitStack, ExitStack, closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
 from functools import partial
 from itertools import islice
@@ -91,6 +91,7 @@ import yaml
 from flax.training.train_state import TrainState
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from numpy.typing import NDArray
+from opentelemetry import trace as otel_trace
 from opentelemetry.trace import StatusCode
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass as config_dataclass
@@ -190,7 +191,7 @@ class Config(BaseConfig):
     gradient_checkpointing: bool = True
     enable_ray_dashboard: bool = False
     enable_ray_timeline: bool = False
-    enable_tracing: bool = False
+    enable_tracing: bool = True
     # In-flight vLLM requests during weight updates (individual requests, not multi-turn rollout groups):
     # wait: finish requests before applying weights (default).
     # abort: cancel requests before applying weights.
@@ -497,7 +498,7 @@ def training_sequence(trace: vf.Trace) -> TrainingSequence:
     if len(branches) != 1:
         raise ValueError(f"Expected exactly one training sequence, got {len(branches)} branches")
     branch = branches[0]
-    if not branch.trainable or not any(branch.sampled_mask):
+    if not trace.agent.trainable or not branch.trainable or not any(branch.sampled_mask):
         raise ValueError("Rollout has no trainable tokens")
     for node in branch.nodes:
         if len(node.token_ids) != len(node.mask):
@@ -525,11 +526,10 @@ async def score_group(task: vf.Task, traces: list[vf.Trace]) -> RolloutGroup:
     async with asyncio.timeout(30):
         for trace in traces:
             await task.score(trace)
-    rewards = np.asarray([trace.reward for trace in traces], dtype=np.float32)  # (G,)
-    # Equal fractional rewards can round to a different mean in float32.
-    advantages = (
-        np.zeros_like(rewards) if (rewards == rewards[0]).all() else (rewards - rewards.mean()) / (rewards.std() + 1e-4)
-    )  # (G,)
+    # Preserve reward differences before the training batch converts advantages to float32.
+    rewards = [trace.reward for trace in traces]
+    reward_mean, reward_std = mean(rewards), pstdev(rewards)
+    advantages = [(reward - reward_mean) / (reward_std + 1e-4) for reward in rewards]
     return RolloutGroup(
         task_id=task.data.id,
         prompt=task.data.prompt_text,
@@ -545,9 +545,55 @@ async def score_group(task: vf.Task, traces: list[vf.Trace]) -> RolloutGroup:
                 rollout_seconds=trace.timing.agent.duration,
                 stop_condition=trace.stop_condition,
             )
-            for trace, advantage in zip(traces, advantages.tolist(), strict=True)
+            for trace, advantage in zip(traces, advantages, strict=True)
         ],
     )
+
+
+def record_rollout_spans(trace: vf.Trace) -> None:
+    """Export Verifiers' recorded wall-clock intervals under the current rollout."""
+    if not otel_trace.get_current_span().is_recording():
+        return
+    tracer = otel_trace.get_tracer(__name__)
+    model_context = otel_trace.set_span_in_context(otel_trace.get_current_span())
+    for name, timing in (
+        ("boot", trace.timing.boot),
+        ("setup", trace.timing.setup),
+        ("agent", trace.timing.agent),
+        ("finalize", trace.timing.finalize),
+        ("scoring", trace.timing.scoring),
+    ):
+        if timing.start <= 0 or timing.end < timing.start:
+            continue
+        current = tracer.start_span(
+            f"actor.rollout.{name}",
+            start_time=int(timing.start * 1_000_000_000),
+        )
+        if name == "agent":
+            current.set_attribute("model_seconds", trace.timing.agent.model.duration)
+            current.set_attribute("harness_seconds", trace.timing.agent.harness.duration)
+            model_context = otel_trace.set_span_in_context(current)
+        current.end(end_time=int(timing.end * 1_000_000_000))
+    for index, call in enumerate(trace.calls):
+        if call.time.start <= 0 or call.time.end < call.time.start:
+            continue
+        current = tracer.start_span(
+            "actor.rollout.model",
+            context=model_context,
+            start_time=int(call.time.start * 1_000_000_000),
+            attributes={
+                "call_index": index,
+                "model": call.model or "unspecified",
+                "finish_reason": call.finish_reason or "unspecified",
+            },
+        )
+        if call.usage is not None:
+            current.set_attribute("input_tokens", call.usage.input_tokens)
+            current.set_attribute("output_tokens", call.usage.completion_tokens)
+        if call.error is not None:
+            current.set_attribute("error.type", call.error.type)
+            current.set_status(StatusCode.ERROR, call.error.type)
+        current.end(end_time=int(call.time.end * 1_000_000_000))
 
 
 def create_agent(config: Config = DEFAULT_CONFIG) -> vf.Agent:
@@ -703,8 +749,10 @@ class Batcher:
             )
             return result.value, seconds
 
-        # Timestamp each arrival before gather waits for any slower groups.
-        results = await asyncio.gather(*(fetch_group() for _ in range(num_groups)))
+        # Timestamp each arrival before waiting for slower groups.
+        async with asyncio.TaskGroup() as pending:
+            tasks = [pending.create_task(fetch_group()) for _ in range(num_groups)]
+        results = [task.result() for task in tasks]
         fetched = time.monotonic()
         groups = [group for group, _ in results]
         with profiling.profile("batcher.prepare_batch"), span("batcher.prepare_batch"):
@@ -972,6 +1020,11 @@ class Actor:
         self.config = config
         self.rng = random.Random(config.seed)
         self._server = ExitStack()
+        self._agent_resources = AsyncExitStack()
+        self._agent: vf.Agent | None = None
+        self._agent_lock = asyncio.Lock()
+        self._runs: set[asyncio.Task[vf.Trace]] = set()
+        self._closed = False
         self._weights_valid = True
         if isinstance(config.taskset, (WebShopConfig, ALFWorldConfig, Tau2Config, AppWorldConfig)):
             self.tasks = load_benchmark_tasks(config.taskset, config.max_turns, config.environment_timeout)
@@ -995,6 +1048,24 @@ class Actor:
         self._server.close()
         logger.info("Actor resources released")
 
+    async def _get_agent(self) -> vf.Agent:
+        async with self._agent_lock:
+            if self._closed:
+                raise RuntimeError("Actor is closed")
+            if self._agent is None:
+                self._agent = await self._agent_resources.enter_async_context(create_agent(self.config))
+            return self._agent
+
+    async def aclose(self) -> None:
+        # Ray's synchronous shutdown hook cannot await the agent's cleanup.
+        async with self._agent_lock, self._agent_resources:
+            self._closed = True
+            runs = list(self._runs)
+            for run in runs:
+                run.cancel()
+            # Drain tasks owned by collect_group's TaskGroup before closing agent resources.
+            await asyncio.gather(*runs, return_exceptions=True)
+
     def get_sampling_state(self) -> dict[str, Any]:
         version, state, gauss_next = self.rng.getstate()
         return {"version": version, "state": list(state), "gauss_next": gauss_next}
@@ -1011,27 +1082,39 @@ class Actor:
         return Transfer(value=group, ready_at=time.monotonic())
 
     async def initialize_weight_transfer(self, init_info: dict[str, Any]) -> None:
-        async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:
-            response = await client.post("/init_weight_transfer_engine", json={"init_info": init_info})
-            response.raise_for_status()
+        with profiling.profile("actor.initialize_weight_transfer"), span("actor.initialize_weight_transfer"):
+            async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:
+                response = await client.post("/init_weight_transfer_engine", json={"init_info": init_info})
+                response.raise_for_status()
 
     async def update_weights(self, update_info: dict[str, Any]) -> None:
         with profiling.profile("actor.update_weights"), span("actor.update_weights"):
             self._weights_valid = False
             logger.info("Receiving learner weights: tensors=%s", len(update_info["names"]))
             async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:
-                response = await client.post(
-                    "/pause", params={"mode": self.config.weight_update_pause_mode, "clear_cache": "true"}
-                )
-                response.raise_for_status()
-                response = await client.post("/start_weight_update")
-                response.raise_for_status()
-                response = await client.post("/update_weights", json={"update_info": update_info})
-                response.raise_for_status()
-                response = await client.post("/finish_weight_update")
-                response.raise_for_status()
-                response = await client.post("/resume")
-                response.raise_for_status()
+                with (
+                    profiling.profile("actor.update_weights.pause"),
+                    span("actor.update_weights.pause", {"mode": self.config.weight_update_pause_mode}),
+                ):
+                    response = await client.post(
+                        "/pause", params={"mode": self.config.weight_update_pause_mode, "clear_cache": "true"}
+                    )
+                    response.raise_for_status()
+                with profiling.profile("actor.update_weights.start"), span("actor.update_weights.start"):
+                    response = await client.post("/start_weight_update")
+                    response.raise_for_status()
+                with (
+                    profiling.profile("actor.update_weights.transfer"),
+                    span("actor.update_weights.transfer", {"tensor_count": len(update_info["names"])}),
+                ):
+                    response = await client.post("/update_weights", json={"update_info": update_info})
+                    response.raise_for_status()
+                with profiling.profile("actor.update_weights.finish"), span("actor.update_weights.finish"):
+                    response = await client.post("/finish_weight_update")
+                    response.raise_for_status()
+                with profiling.profile("actor.update_weights.resume"), span("actor.update_weights.resume"):
+                    response = await client.post("/resume")
+                    response.raise_for_status()
             self._weights_valid = True
             logger.info("Learner weights applied; generation resumed")
 
@@ -1046,7 +1129,8 @@ class Actor:
                 profiling.profile("actor.collect_group", extra_data=profile_data),
                 span("actor.collect_group", {**profile_data, "run_id": self.config.run_id or "unspecified"}),
             ):
-                async with create_agent(self.config) as agent, asyncio.TaskGroup() as pending:
+                agent = await self._get_agent()
+                async with asyncio.TaskGroup() as pending:
 
                     async def run_rollout(index: int) -> vf.Trace:
                         with (
@@ -1068,12 +1152,16 @@ class Actor:
                                 result = await task.run(agent, self.config.taskset.manager_url)
                             else:
                                 result = await agent.run(task.defer_scoring())
+                            record_rollout_spans(result)
                             rollout_span.set_attribute("stop_condition", result.stop_condition or "unspecified")
                             if not result.ok:
                                 rollout_span.set_status(StatusCode.ERROR, "Rollout failed")
                             return result
 
                     runs = [pending.create_task(run_rollout(index)) for index in range(group_size)]
+                    self._runs.update(runs)
+                    for run in runs:
+                        run.add_done_callback(self._runs.discard)
                 with profiling.profile("actor.score_group", extra_data=profile_data), span("actor.score_group"):
                     group = await score_group(task, [run.result() for run in runs])
         except Exception:
@@ -1127,12 +1215,15 @@ def train(config: Config) -> None:
             ray.get(learner.start.remote())
         finally:
             logger.info("Requesting graceful worker termination")
-            shutdown = [
-                learner.__ray_terminate__.remote(),
-                actor.__ray_terminate__.remote(),
-                batcher.__ray_terminate__.remote(),
-            ]
-            ray.wait(shutdown, num_returns=len(shutdown))
+            try:
+                ray.get(actor.aclose.remote())
+            finally:
+                shutdown = [
+                    learner.__ray_terminate__.remote(),
+                    actor.__ray_terminate__.remote(),
+                    batcher.__ray_terminate__.remote(),
+                ]
+                ray.wait(shutdown, num_returns=len(shutdown))
             logger.info("Worker termination finished")
 
 
