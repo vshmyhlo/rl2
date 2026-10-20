@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ray timeline</title>
+<style>
+  body { margin: 0; font: 14px system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid #ddd; }
+  #status { flex: 1; }
+  button { padding: 6px 12px; cursor: pointer; }
+  iframe { flex: 1; width: 100%; border: 0; }
+</style>
+<header>
+  <strong id="title">Ray timeline</strong>
+  <span id="status" role="status">Waiting for snapshot…</span>
+  <button id="refresh" type="button">Load latest</button>
+</header>
+<iframe id="viewer" title="Perfetto trace viewer" hidden></iframe>
+<script>
+  const origin = "https://ui.perfetto.dev";
+  const viewer = document.getElementById("viewer");
+  const status = document.getElementById("status");
+  const job = new URLSearchParams(location.search).get("job");
+  document.getElementById("refresh").onclick = () => location.reload();
+
+  function ready() {
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearInterval(ping);
+        clearTimeout(timeout);
+        window.removeEventListener("message", receive);
+      };
+      const receive = (event) => {
+        if (event.origin === origin && event.source === viewer.contentWindow && event.data === "PONG") {
+          cleanup();
+          resolve();
+        }
+      };
+      const ping = setInterval(() => viewer.contentWindow.postMessage("PING", origin), 200);
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error("Perfetto did not respond. Check your connection and click Load latest."));
+      }, 60000);
+      window.addEventListener("message", receive);
+    });
+  }
+
+  async function load() {
+    if (!job || !/^[A-Za-z0-9_-]+$/.test(job)) {
+      status.textContent = "Open a timeline link from the job submission output.";
+      return;
+    }
+    document.getElementById("title").textContent = job;
+    document.title = `${job} · Ray timeline`;
+    let response;
+    while (true) {
+      response = await fetch(`/traces/${encodeURIComponent(job)}.json`, {cache: "no-store"});
+      if (response.status !== 404) break;
+      status.textContent = "Waiting for the first snapshot. The job may be queued; snapshots save every minute.";
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+    if (!response.ok) throw new Error(`Could not load snapshot (HTTP ${response.status}). Click Load latest to retry.`);
+    const buffer = await response.arrayBuffer();
+    status.textContent = "Opening snapshot in Perfetto…";
+    const handshake = ready();
+    viewer.hidden = false;
+    viewer.src = origin;
+    await handshake;
+    viewer.contentWindow.postMessage({
+      perfetto: {buffer, title: job, url: location.href, downloadable: true}
+    }, origin, [buffer]);
+    const saved = response.headers.get("Last-Modified");
+    status.textContent = `Snapshot ${saved ? new Date(saved).toLocaleString() : "loaded"}. Load latest to refresh.`;
+  }
+  load().catch((error) => { status.textContent = error.message; });
+</script>
+</html>

@@ -93,9 +93,11 @@ Timeline collection is enabled automatically, including jobs launched with `subm
 ./submit.py --gpus 2 -- uv run python -m rl2.train_grpo_v2 --config configs/grpo_v2/codegym.yaml
 ```
 
-The driver logs the trace path and saves `<ckpt_dir>/profiles/ray-<unique-id>.json` every 60 seconds and before Ray shuts down, including when training raises an exception. Each launch gets a separate file. Local snapshots are replaced atomically; abrupt termination can lose events since the last successful export. Ray's event-retention limits still apply, so snapshots are not an unlimited history.
+The driver logs the trace path and saves a snapshot every 60 seconds and before Ray shuts down, including when training raises an exception. Local snapshots are replaced atomically; abrupt termination can lose events since the last successful export. Ray's event-retention limits still apply, so snapshots are not an unlimited history.
 
-The presets write under `/runs/grpo_v2/<run_id>/profiles/`, on the persistent `training-runs` volume in submitted jobs. For local runs, set `ckpt_dir` to a writable directory. Download the JSON and open it at [ui.perfetto.dev](https://ui.perfetto.dev/). While a Pod is running:
+`submit.py` sets `RL2_RAY_TIMELINE_PATH=/runs/ray-timelines/<job-name>.json` on the persistent volume and prints `http://localhost:8085/?job=<job-name>`. The driver logs the same URL from `RL2_RAY_TIMELINE_URL`. After the [shared viewer is installed](../../infra/k3s/README.md#shared-on-disk-checkpoints), forward port **8085** in your IDE or SSH and click that link. It waits for the first snapshot, then opens Perfetto; **Load latest** refreshes the trace. The link also works after the job finishes.
+
+Without the submission environment variables, local runs save `<ckpt_dir>/profiles/ray-<unique-id>.json`; set `ckpt_dir` to a writable directory. You can always download the JSON and open it at [ui.perfetto.dev](https://ui.perfetto.dev/). While a Pod is running:
 
 ```bash
 sudo k3s kubectl -n training cp <pod>:<logged-trace-path> ./ray-timeline.json -c train

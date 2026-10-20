@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ray-timelines
+  namespace: training
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ray-timelines
+  template:
+    metadata:
+      labels:
+        app: ray-timelines
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: viewer
+          image: python:3.12-slim-bookworm
+          command: [python, /viewer/server.py, --host, "0.0.0.0"]
+          ports:
+            - name: http
+              containerPort: 8085
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          volumeMounts:
+            - name: viewer
+              mountPath: /viewer
+              readOnly: true
+            - name: runs
+              mountPath: /runs
+              readOnly: true
+      volumes:
+        - name: viewer
+          configMap:
+            name: ray-timeline-viewer
+        - name: runs
+          persistentVolumeClaim:
+            claimName: training-runs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ray-timelines
+  namespace: training
+spec:
+  type: ClusterIP
+  selector:
+    app: ray-timelines
+  ports:
+    - name: http
+      port: 8085
+      targetPort: http

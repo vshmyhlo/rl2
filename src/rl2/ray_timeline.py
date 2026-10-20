@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from threading import Event, Thread
@@ -35,4 +36,6 @@ def record_timeline(path: str, interval: float = 60) -> Iterator[None]:
         resources.callback(thread.join)
         resources.callback(stopped.set)
         logger.info("Ray timeline: %s (updated every %ss and on exit)", path, interval)
+        if url := os.environ.get("RL2_RAY_TIMELINE_URL"):
+            logger.info("Open Ray timeline: %s", url)
         yield

@@ -76,6 +76,8 @@ def job_manifest(args: argparse.Namespace, name: str, image: str) -> dict[str, A
                             "env": [
                                 {"name": "MLFLOW_TRACKING_URI", "value": "http://mlflow.mlflow.svc.cluster.local:5000"},
                                 {"name": "JAX_PLATFORMS", "value": "cuda,cpu"},
+                                {"name": "RL2_RAY_TIMELINE_PATH", "value": f"/runs/ray-timelines/{name}.json"},
+                                {"name": "RL2_RAY_TIMELINE_URL", "value": f"http://localhost:8085/?job={name}"},
                                 {"name": "NVIDIA_DRIVER_CAPABILITIES", "value": "compute,utility,graphics"},
                             ],
                             "resources": {
@@ -191,6 +193,7 @@ def submit_jobs(args: argparse.Namespace, manifests: list[dict[str, Any]], image
         )
         print(f"Status: sudo k3s kubectl -n training get job {name}")
         print(f"Logs:   sudo k3s kubectl -n training logs -f job/{name}")
+        print(f"Ray timeline (when recorded): http://localhost:8085/?job={name}")
     return names
 
 

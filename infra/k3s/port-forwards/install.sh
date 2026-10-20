@@ -10,6 +10,9 @@ forward_tmp=$(mktemp -d)
 trap 'rm -rf -- "$forward_tmp"' EXIT
 units=()
 while read -r name namespace service ports; do
+  if [[ $# -gt 0 && " $* " != *" $name "* ]]; then
+    continue
+  fi
   unit="rl2-forward-$name.service"
   units+=("$unit")
   cat > "$forward_tmp/$unit" <<EOF
@@ -33,7 +36,13 @@ mlflow mlflow mlflow 8081:5000
 grafana monitoring gpu-grafana 8082:80
 kueue-frontend kueue-system kueue-kueueviz-frontend 8083:8080
 kueue-backend kueue-system kueue-kueueviz-backend 8084:8080
+ray-timelines training ray-timelines 8085:8085
 EOF
+
+if [[ ${#units[@]} -eq 0 ]]; then
+  echo "No matching port-forwards" >&2
+  exit 1
+fi
 
 systemd-analyze verify "$forward_tmp/"*.service
 # Unload temporary systemd-run units before installing their replacements.

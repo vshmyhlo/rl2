@@ -927,7 +927,9 @@ class Actor:
 
 
 def train(config: Config) -> None:
-    timeline_path = posixpath.join(config.ckpt_dir, "profiles", f"ray-{uuid4().hex}.json")
+    timeline_path = os.environ.get(
+        "RL2_RAY_TIMELINE_PATH", posixpath.join(config.ckpt_dir, "profiles", f"ray-{uuid4().hex}.json")
+    )
     # The HTTP endpoint is shared over loopback by workers on this node.
     with (
         ray.init(

@@ -46,14 +46,17 @@ def test_grpo_timeline_directory_is_persistent() -> None:
     job = submit.job_manifest(args=args, name="train-grpo", image="rl2.local/train:test")
     pod = job["spec"]["template"]["spec"]
     container = pod["containers"][0]
-    settings = OmegaConf.to_container(OmegaConf.load(submit.ROOT / preset), resolve=False)
+    env = {entry["name"]: entry["value"] for entry in container["env"]}
     mount = next(
-        mount for mount in container["volumeMounts"] if settings["ckpt_dir"].startswith(mount["mountPath"] + "/")
+        mount
+        for mount in container["volumeMounts"]
+        if env["RL2_RAY_TIMELINE_PATH"].startswith(mount["mountPath"] + "/")
     )
     volume = next(volume for volume in pod["volumes"] if volume["name"] == mount["name"])
     assert volume["persistentVolumeClaim"]["claimName"] == "training-runs"
     assert container["command"] == args.command
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "2"
+    assert env["RL2_RAY_TIMELINE_URL"] == "http://localhost:8085/?job=train-grpo"
 
 
 @pytest.mark.parametrize(
@@ -128,7 +131,9 @@ def test_build_and_submit_preserves_command(
     assert container["resources"]["limits"]["memory"] == "64Gi"
     assert container["resources"]["requests"]["nvidia.com/gpu"] == "2"
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "2"
-    assert "priority=high, GPU=2" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "priority=high, GPU=2" in output
+    assert f"Ray timeline (when recorded): http://localhost:8085/?job={names[0]}" in output
     assert f"type=image,name={container['image']},unpack=true" in build.args[0]
     preview = next(call for call in calls if "--dry-run=server" in call.args[0])
     assert preview.kwargs["input"] == calls[-1].kwargs["input"]

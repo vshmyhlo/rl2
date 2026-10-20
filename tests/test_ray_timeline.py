@@ -11,7 +11,11 @@ import pytest
 from rl2 import ray_timeline
 
 
-def test_periodic_and_final_snapshots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_periodic_and_final_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger=ray_timeline.__name__)
+    monkeypatch.setenv("RL2_RAY_TIMELINE_URL", "http://localhost:8085/?job=train-test")
     path = tmp_path / "profiles" / "ray.json"
     exported = Event()
     timeline = Mock(return_value=[{"name": "first"}])
@@ -30,6 +34,7 @@ def test_periodic_and_final_snapshots(tmp_path: Path, monkeypatch: pytest.Monkey
     assert json.loads(path.read_text()) == [{"name": "final"}]
     assert timeline.call_count >= 2
     assert list(path.parent.iterdir()) == [path]
+    assert "Open Ray timeline: http://localhost:8085/?job=train-test" in caplog.text
 
 
 @pytest.mark.parametrize("failure", ["query", "write"])

@@ -953,6 +953,9 @@ def test_actor_initializes_weight_receiver(actor: Any, monkeypatch: pytest.Monke
 @pytest.mark.parametrize("fails", [False, True])
 def test_train_gracefully_terminates_actor(fails: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = training.Config(ckpt_dir=str(tmp_path))
+    monkeypatch.delenv("RL2_RAY_TIMELINE_PATH", raising=False)
+    if fails:
+        monkeypatch.setenv("RL2_RAY_TIMELINE_PATH", str(tmp_path / "submitted" / "train-test.json"))
     actor, batcher, learner = Mock(), Mock(), Mock()
     actor.__ray_terminate__ = Mock()
     learner.__ray_terminate__ = Mock()
@@ -991,7 +994,7 @@ def test_train_gracefully_terminates_actor(fails: bool, tmp_path: Path, monkeypa
     options = training.ray.init.call_args.kwargs
     assert options["runtime_env"]["env_vars"]["RAY_PROFILING"] == "1"
     assert options["_system_config"] == {"enable_timeline": True, "task_events_report_interval_ms": 1000}
-    traces = list((tmp_path / "profiles").glob("ray-*.json"))
+    traces = list((tmp_path / "submitted").glob("*.json") if fails else (tmp_path / "profiles").glob("ray-*.json"))
     assert len(traces) == 1
     assert json.loads(traces[0].read_text()) == [{"name": "training"}]
     timeline.assert_called_once_with()
