@@ -8,6 +8,9 @@
   header { display: flex; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid #ddd; }
   #status { flex: 1; }
   button { padding: 6px 12px; cursor: pointer; }
+  form { margin: 48px auto; padding: 0 16px; width: min(480px, calc(100% - 32px)); }
+  label { display: block; margin-bottom: 8px; }
+  input { box-sizing: border-box; width: 100%; padding: 10px; margin-bottom: 12px; font: inherit; }
   iframe { flex: 1; width: 100%; border: 0; }
 </style>
 <header>
@@ -15,12 +18,25 @@
   <span id="status" role="status">Waiting for snapshot…</span>
   <button id="refresh" type="button">Load latest</button>
 </header>
+<form id="job-form" action="/" method="get" novalidate hidden>
+  <label for="job-id">Job ID</label>
+  <input id="job-id" name="job" placeholder="train-3af36a22fa6b4186" required
+    pattern="[A-Za-z0-9_\-]+" title="Use letters, numbers, underscores, or hyphens."
+    autocomplete="off" spellcheck="false">
+  <button type="submit">Open timeline</button>
+</form>
 <iframe id="viewer" title="Perfetto trace viewer" hidden></iframe>
 <script>
   const origin = "https://ui.perfetto.dev";
   const viewer = document.getElementById("viewer");
   const status = document.getElementById("status");
   const job = new URLSearchParams(location.search).get("job");
+  const form = document.getElementById("job-form");
+  const input = document.getElementById("job-id");
+  form.onsubmit = (event) => {
+    input.value = input.value.trim();
+    if (!form.reportValidity()) event.preventDefault();
+  };
   document.getElementById("refresh").onclick = () => location.reload();
 
   function ready() {
@@ -47,7 +63,11 @@
 
   async function load() {
     if (!job || !/^[A-Za-z0-9_-]+$/.test(job)) {
-      status.textContent = "Open a timeline link from the job submission output.";
+      status.textContent = "Paste a job ID to open its timeline.";
+      document.getElementById("refresh").hidden = true;
+      form.hidden = false;
+      input.value = job || "";
+      input.focus();
       return;
     }
     document.getElementById("title").textContent = job;

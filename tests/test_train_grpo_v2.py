@@ -41,6 +41,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert defaults.minibatches_per_epoch == 4
     assert defaults.grad_accum_steps == 1
     assert defaults.update_epochs == 1
+    assert defaults.checkpoint_interval == 100
     assert defaults.gradient_checkpointing
     assert defaults.weight_update_pause_mode == "wait"
     preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/addition.yaml"
@@ -74,6 +75,8 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
         {"num_groups": 0},
         {"group_size": 1},
         {"total_iterations": 0},
+        {"checkpoint_interval": 0},
+        {"checkpoint_interval": 1.5},
         {"max_tokens": 0},
         {"max_turns": 0},
         {"temperature": 0.001},
@@ -381,7 +384,7 @@ def actor(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
     monkeypatch.setattr(training, "wait_for_server", Mock())
     actor = training.Actor.__ray_metadata__.modified_class()
-    monkeypatch.setattr(training.random, "choice", Mock(return_value=actor.tasks[0]))
+    monkeypatch.setattr(actor.rng, "choice", Mock(return_value=actor.tasks[0]))
     return actor
 
 
@@ -404,7 +407,7 @@ def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPa
     else:
         actor = training.Actor.__ray_metadata__.modified_class(config=config)
         actor.collect_group = AsyncMock(return_value=group)
-        monkeypatch.setattr(training.random, "choice", Mock(return_value=actor.tasks[0]))
+        monkeypatch.setattr(actor.rng, "choice", Mock(return_value=actor.tasks[0]))
         for _ in range(2):
             assert asyncio.run(actor.fetch_next_group(group_size=2)).value is group
         actor.collect_group.assert_awaited_with(actor.tasks[0], group_size=2)
@@ -553,6 +556,10 @@ def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
 
 @pytest.fixture
 def learner(monkeypatch: pytest.MonkeyPatch) -> Any:
+    monkeypatch.setattr(training, "checkpoint_manager", Mock(return_value=Mock()))
+    monkeypatch.setattr(training, "restore_checkpoint", Mock(return_value=None))
+    monkeypatch.setattr(training, "save_checkpoint", Mock(return_value=0.5))
+    monkeypatch.setattr(training.ray, "get", Mock())
     device = jax.devices("cpu")[0]
     params = {
         "model.norm.weight": jnp.ones(3, dtype=jnp.bfloat16),  # (D,)
@@ -677,8 +684,11 @@ def test_learner_logs_rollouts(
     if fails:
         with pytest.raises(RuntimeError, match="done"):
             learner.start()
+        training.save_checkpoint.assert_not_called()
     else:
         learner.start()
+        assert training.save_checkpoint.call_args.args[1].iteration == 2
+    training.checkpoint_manager.return_value.close.assert_called_once_with()
     training.load_qwen3_checkpoint.assert_called_once_with(
         learner.config.model,
         dtype="bfloat16",
@@ -747,6 +757,84 @@ def test_learner_logs_rollouts(
     ) in caplog.messages
     writer.__exit__.assert_called_once()
     assert writer.__exit__.call_args.args[0] is (RuntimeError if fails else None)
+
+
+def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    learner.config = replace(learner.config, total_iterations=3, checkpoint_interval=2)
+    learner.initialize_weight_transfer = Mock()
+    published_steps: list[int] = []
+    saved: list[training.TrainingProgress] = []
+    writer = MagicMock()
+    writer.__enter__.return_value = writer
+    monkeypatch.setattr(training, "MLflowLogger", Mock(return_value=writer))
+    monkeypatch.setattr(training.ray, "get", lambda value: value)
+    learner.actor.get_sampling_state.remote.return_value = {"task_rng": "saved"}
+
+    def publish() -> None:
+        published_steps.append(int(learner.state.step))
+
+    def fetch(num_groups: int, group_size: int) -> training.RolloutBatch:
+        prepared = Mock(spec=training.GRPOBatch)
+        prepared.token_ids = Mock(shape=(num_groups * group_size, 8))  # (B, T=8)
+        return training.RolloutBatch(
+            training_batch=prepared,
+            rollout_metrics={"charts/reward_mean": 1.0, "charts/degenerate_group_fraction": 0.0},
+            stop_counts={"max_turns" if not saved else "agent_completed": num_groups * group_size},
+            num_output_tokens=4,
+            examples="",
+            transfer_metrics={
+                "time/batcher/actor_to_batcher_seconds": 0.0,
+                "time/learner/batcher_to_learner_seconds": 0.0,
+            },
+        )
+
+    def optimize(batch: training.GRPOBatch) -> dict[str, float]:
+        learner.state = learner.state.replace(
+            step=learner.state.step + learner.config.update_epochs * learner.config.minibatches_per_epoch
+        )
+        return {"losses/policy": 0.0}
+
+    def save(manager: Any, progress: training.TrainingProgress, config: training.Config) -> float:
+        assert published_steps[-1] == int(progress.train_state.step)
+        saved.append(progress)
+        return 0.5
+
+    learner.publish_weights = publish
+    learner.fetch_next_batch = Mock(side_effect=fetch)
+    learner.optimize = optimize
+    monkeypatch.setattr(training, "save_checkpoint", Mock(side_effect=save))
+    training.restore_checkpoint.side_effect = lambda *args: saved[-1] if saved else None
+    learner.start()
+    assert [progress.iteration for progress in saved] == [2, 3]
+    assert [progress.total_rollouts for progress in saved] == [8, 12]
+    assert published_steps == [0, 4, 8, 12]
+    learner.actor.set_sampling_state.remote.assert_not_called()
+    saved_key = jax.random.key_data(saved[-1].shuffle_key)  # (K,)
+
+    # New settings govern future work; restored totals are not recomputed from batch size.
+    learner.config = replace(learner.config, total_iterations=5, num_groups=2, update_epochs=2, seed=99)
+    learner.shuffle_key = jax.random.key(99)  # () simulate a restarted learner.
+    published_steps.clear()
+    writer.reset_mock()
+    learner.start()
+    assert [progress.iteration for progress in saved] == [2, 3, 4, 5]
+    assert [progress.total_rollouts for progress in saved] == [8, 12, 20, 28]
+    assert published_steps == [12, 20, 28]
+    learner.actor.set_sampling_state.remote.assert_called_once_with({"task_rng": "saved"})
+    np.testing.assert_array_equal(jax.random.key_data(learner.shuffle_key), saved_key)
+    writer.log_text.assert_called_once_with(yaml.safe_dump(asdict(learner.config)), "config/3.yaml")
+    assert [call.kwargs["step"] for call in writer.log_metrics.call_args_list] == [3, 4, 5]
+    metrics = writer.log_metrics.call_args.args[0]
+    assert metrics["charts/total_rollouts"] == 28
+    assert metrics["charts/total_updates"] == 28
+    assert metrics["charts/stop_condition_fraction/max_turns"] == 0
+    assert metrics["time/checkpoint_seconds"] == 0.5
+
+    # A run already at its cumulative target does not train or overwrite its checkpoint.
+    learner.fetch_next_batch.reset_mock()
+    learner.start()
+    learner.fetch_next_batch.assert_not_called()
+    assert len(saved) == 4
 
 
 def test_learner_logs_examples_every_ten_steps(
@@ -1228,7 +1316,7 @@ def test_batcher_collects_groups_concurrently(
 
     env.run.side_effect = run
     monkeypatch.setattr(training, "create_agent", Mock(return_value=env))
-    monkeypatch.setattr(training.random, "choice", Mock(side_effect=actor.tasks[:2]))
+    monkeypatch.setattr(actor.rng, "choice", Mock(side_effect=actor.tasks[:2]))
     handle = Mock()
     handle.fetch_next_group.remote.side_effect = actor.fetch_next_group
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=handle)

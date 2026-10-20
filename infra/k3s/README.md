@@ -58,8 +58,9 @@ Install localhost port-forwards that start at boot and retry after disconnects:
 sudo bash infra/k3s/port-forwards/install.sh
 ```
 
-This enables `rl2-forward-{headlamp,mlflow,grafana,kueue-frontend,kueue-backend}`
-systemd services on ports **8080–8084**, respectively. They bind only to
+This enables `rl2-forward-{headlamp,mlflow,grafana,kueue-frontend,kueue-backend,ray-timelines}`
+systemd services on ports **8080–8085**, respectively. Pass a service name to
+install only that forward, for example `ray-timelines`. They bind only to
 `127.0.0.1`. When browsing from another machine, also forward these ports through
 your IDE or SSH; Kueue needs both 8083 and 8084. Skip the manual port-forward
 commands below while these services are running. Rerun the installer to update.
@@ -265,6 +266,48 @@ sudo k3s kubectl -n monitoring logs deployment/gpu-prometheus -c prometheus-serv
 ```
 
 See [NVIDIA DCGM Exporter documentation](https://docs.nvidia.com/datacenter/dcgm/latest/installation/install-dcgm-exporter.html).
+
+## OpenTelemetry traces with Tempo
+
+The monitoring Kustomization also deploys Tempo `3.1.0` and provisions the
+**Tempo** data source in Grafana. It runs as one process with a `10Gi`
+local-path PVC and 48-hour trace retention. This is a single-node development
+setup; the PVC's requested size is not a hard disk quota.
+
+```bash
+sudo k3s kubectl apply -k infra/k3s/monitoring
+sudo k3s kubectl -n monitoring rollout status deployment/tempo --timeout=180s
+sudo k3s kubectl -n monitoring rollout status deployment/gpu-grafana --timeout=180s
+```
+
+Open [Grafana Explore](http://localhost:8082/explore), sign in as `admin`
+using the password command in [GPU and host monitoring](#gpu-and-host-monitoring),
+and select **Tempo**. Anonymous Viewer access does not grant Explore access.
+Choose **Search** to filter by service, span name, duration, or attributes,
+or use TraceQL `{}` to list traces in the selected time range. Open a trace
+to inspect its span waterfall, attributes, and errors.
+
+Applications inside k3s can export OTLP to:
+
+| Protocol | Endpoint |
+|---|---|
+| gRPC | `http://tempo.monitoring.svc.cluster.local:4317` |
+| HTTP/protobuf | `http://tempo.monitoring.svc.cluster.local:4318/v1/traces` |
+
+For an instrumented process on the host, forward the receiver:
+
+```bash
+sudo k3s kubectl -n monitoring port-forward --address=127.0.0.1 service/tempo 4317:4317 4318:4318
+```
+
+Use `http://127.0.0.1:4317` for gRPC or
+`http://127.0.0.1:4318/v1/traces` for HTTP traces. Tempo's query API is internal
+on port `3200`; Grafana proxies queries to it. No receiver is exposed publicly.
+Training instrumentation is not enabled by this deployment; the existing
+Ray timeline files are separate from OpenTelemetry traces.
+
+Configuration lives in `monitoring/tempo-config.yaml`; reapply the Kustomization
+to roll out changes. See [Tempo deployment documentation](https://grafana.com/docs/tempo/latest/set-up-for-tracing/setup-tempo/).
 
 ## GPU jobs with Kueue
 
@@ -515,6 +558,24 @@ checkpoint automatically. To change the directory, edit `ckpt_dir` in YAML.
 Files survive Pod replacement, preemption, and Job deletion. Do not delete the
 PVC: its storage class deletes the backing directory. This is shared storage on
 one machine, not a backup. Existing Jobs need resubmission to receive the mount.
+
+Submitted GRPO v2 jobs save Ray timeline snapshots to
+`/runs/ray-timelines/<job-name>.json` every minute and on exit.
+Both `submit.py` and the driver print a viewer link. Install the shared viewer once:
+
+```bash
+sudo bash infra/k3s/ray-timelines/install.sh
+```
+
+Forward **8085** through your IDE or SSH and open the printed
+`http://localhost:8085/?job=<job-name>` link. The page waits for the first snapshot,
+then opens it in Perfetto. Use **Load latest** to refresh. Links remain usable after
+job completion/deletion while their files remain on the PVC. The service mounts
+the PVC read-only, serves only the dedicated trace directory, and uses browser
+`postMessage` to load traces into Perfetto without public artifact uploads.
+Rerun the installer after changing the viewer. Existing jobs need resubmission
+to receive the path/link environment variables; the viewer does not enable
+profiling for trainers other than GRPO v2.
 
 Locate the backing directory on this host:
 

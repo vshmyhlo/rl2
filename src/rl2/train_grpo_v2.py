@@ -2,11 +2,11 @@
 
 MLflow's metric step counts completed training iterations: one rollout batch,
 its optimizer updates, and publication of the updated weights. All metrics below
-are logged every iteration except the startup scalars.
+are logged every iteration except startup scalars and checkpoint timing.
 
-Startup scalars (step 0):
+Startup scalars (at the restored iteration, or step 0 for a new run):
     model/params_millions: Model parameter count in millions.
-    time/learner/setup_seconds: Model loading, optimizer setup, NCCL initialization, and initial weight publication wall time.
+    time/learner/setup_seconds: Model/optimizer setup, checkpoint restore, NCCL initialization, and initial publication wall time.
 
 Optimization scalars (averaged over minibatches and update epochs):
     losses/policy: Clipped GRPO policy loss.
@@ -34,7 +34,7 @@ Training progress and settings:
     charts/total_rollouts: Cumulative rollouts used for training.
     charts/learning_rate: Configured optimizer learning rate.
 
-Timing and throughput (logged every iteration):
+Timing and throughput (logged every iteration unless noted):
     time/learner/iterations_per_second: Reciprocal of iteration wall time.
     time/learner/rollouts_per_second: Batch rollout count divided by iteration wall time.
     time/learner/output_tokens_per_second: Batch sampled-token count divided by iteration wall time.
@@ -45,12 +45,13 @@ Timing and throughput (logged every iteration):
     time/learner/update_seconds: Device transfer and optimizer update wall time.
     time/learner/weight_transfer_seconds: Wall time publishing updated learner weights to vLLM.
     time/learner/iteration_seconds: Batch fetching, optimization, and weight publication wall time.
+    time/checkpoint_seconds: Checkpoint save wall time, including completion of writes; logged on saves.
     time/batcher/actor_to_batcher_seconds: Mean group transfer latency from actor return to batcher receipt.
     time/learner/batcher_to_learner_seconds: Batch transfer latency from batcher return to learner receipt.
 Ray transfer latencies include serialization, transport, deserialization, and
 scheduling, using a shared single-node monotonic clock. Timing intervals overlap
 and should not be summed. Iteration timing and throughput exclude that iteration's
-metric and example logging. Cumulative counters start at zero for each training session.
+metric and example logging and checkpoint saves. Cumulative counters include resumed training.
 Output-token counts use reported completion usage, counting zero when usage is unavailable.
 """
 
@@ -65,10 +66,11 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import asdict, dataclass, replace
 from functools import partial
 from itertools import islice
+from pathlib import Path
 from statistics import mean, pstdev
 from textwrap import indent
 from typing import Annotated, Any, Literal, NamedTuple
@@ -80,6 +82,7 @@ import httpx
 import jax
 import jax.numpy as jnp
 import optax
+import orbax.checkpoint as ocp
 import ray
 import torch
 import verifiers.v1 as vf
@@ -168,6 +171,7 @@ class Config(BaseConfig):
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4
     total_iterations: Annotated[int | None, Field(ge=1)] = None
+    checkpoint_interval: Annotated[int, Field(gt=0)] = 100
     max_tokens: Annotated[int, Field(ge=1)] = 512
     max_turns: Annotated[int, Field(ge=1)] = 3
     rollout_timeout: Annotated[float, Field(gt=0)] = 120
@@ -200,6 +204,87 @@ class Config(BaseConfig):
 
 
 DEFAULT_CONFIG = Config()
+
+
+@dataclass(frozen=True)
+class TrainingProgress:
+    train_state: TrainState  # Parameter-shaped params and optimizer moments; () optimizer step.
+    shuffle_key: jax.Array  # () typed base PRNG key, folded with the optimizer step.
+    iteration: int
+    total_rollouts: int
+    sampling_state: dict[str, Any]
+    stop_conditions: tuple[str, ...]
+
+
+def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
+    directory = f"{run_dir.rstrip('/')}/checkpoints"
+    if not directory.startswith("gs://"):
+        directory = str(Path(directory).resolve())
+    return ocp.CheckpointManager(directory, options=ocp.CheckpointManagerOptions(max_to_keep=2))
+
+
+def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, config: Config) -> float:
+    """Save a completed iteration and wait for writes before reusing learner buffers."""
+    started = time.monotonic()
+    manager.save(
+        progress.iteration,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardSave(
+                {
+                    "train_state": progress.train_state,
+                    "shuffle_key": jax.random.key_data(progress.shuffle_key),  # (K,) raw PRNG words.
+                }
+            ),
+            metadata=ocp.args.JsonSave(
+                {
+                    "version": 1,
+                    "algorithm": "grpo_v2",
+                    "config": asdict(config),
+                    "iteration": progress.iteration,
+                    "total_rollouts": progress.total_rollouts,
+                    "sampling_state": progress.sampling_state,
+                    "stop_conditions": progress.stop_conditions,
+                }
+            ),
+        ),
+        force=True,
+    )
+    manager.wait_until_finished()
+    seconds = time.monotonic() - started
+    logger.info("Saved checkpoint at iteration %s in %.1fs", progress.iteration, seconds)
+    return seconds
+
+
+def restore_checkpoint(
+    manager: ocp.CheckpointManager, train_state: TrainState, config: Config
+) -> TrainingProgress | None:
+    iteration = manager.latest_step()
+    if iteration is None:
+        return None
+    metadata = manager.restore(iteration, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
+    if metadata["version"] != 1 or metadata["algorithm"] != "grpo_v2":
+        raise ValueError("Unsupported GRPO v2 checkpoint")
+    if metadata["iteration"] != iteration or iteration < 0 or metadata["total_rollouts"] < 0:
+        raise ValueError("Invalid GRPO v2 checkpoint progress")
+    restored = manager.restore(
+        iteration,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardRestore(
+                {
+                    "train_state": train_state,
+                    "shuffle_key": jax.random.key_data(jax.random.key(config.seed)),  # (K,)
+                }
+            )
+        ),
+    ).state
+    return TrainingProgress(
+        train_state=restored["train_state"],
+        shuffle_key=jax.random.wrap_key_data(restored["shuffle_key"]),  # ()
+        iteration=iteration,
+        total_rollouts=metadata["total_rollouts"],
+        sampling_state=metadata["sampling_state"],
+        stop_conditions=tuple(metadata["stop_conditions"]),
+    )
 
 
 @dataclass(frozen=True)
@@ -636,6 +721,7 @@ class Learner:
         self.config = config
         self.batcher = batcher
         self.actor = actor
+        self.shuffle_key = jax.random.key(config.seed)  # () typed base PRNG key.
 
     def initialize_weight_transfer(self, resources: ExitStack) -> None:
         init_info = {"master_address": "127.0.0.1", "master_port": get_open_port(), "rank_offset": 1, "world_size": 2}
@@ -651,8 +737,8 @@ class Learner:
             MLflowLogger(experiment="grpo_v2", run_name=self.config.run_id) as writer,
             ExitStack() as resources,
         ):
+            manager = resources.enter_context(closing(checkpoint_manager(self.config.ckpt_dir)))
             writer.log_params(asdict(self.config))
-            writer.log_text(yaml.safe_dump(asdict(self.config)), "config/0.yaml")
             logger.info("Run ID: %s; MLflow run: %s", self.config.run_id, writer.run_id)
             start = time.monotonic()
             logger.info("Loading learner model %s on its assigned GPU", self.config.model)
@@ -671,6 +757,19 @@ class Learner:
                     self.config,
                 )
             del variables
+            progress = restore_checkpoint(manager, self.state, self.config)
+            iteration = 0
+            total_rollouts = 0
+            stop_conditions: set[str] = set()
+            if progress is not None:
+                self.state = progress.train_state
+                self.shuffle_key = progress.shuffle_key  # ()
+                iteration = progress.iteration
+                total_rollouts = progress.total_rollouts
+                stop_conditions.update(progress.stop_conditions)
+                ray.get(self.actor.set_sampling_state.remote(progress.sampling_state))
+                logger.info("Resumed run %s at iteration %s", self.config.run_id, iteration)
+            writer.log_text(yaml.safe_dump(asdict(self.config)), f"config/{iteration}.yaml")
             logger.info("Learner loaded %s parameter tensors", len(self.state.params))
             self.initialize_weight_transfer(resources=resources)
             self.publish_weights()
@@ -679,12 +778,9 @@ class Learner:
                     "model/params_millions": sum(p.size for p in jax.tree.leaves(self.state.params)) / 1_000_000,
                     "time/learner/setup_seconds": time.monotonic() - start,
                 },
-                step=0,
+                step=iteration,
             )
             logger.info("Starting GRPO training loop")
-            iteration = 0
-            total_rollouts = 0
-            stop_conditions: set[str] = set()
             while self.config.total_iterations is None or iteration < self.config.total_iterations:
                 iteration += 1
                 started = time.monotonic()
@@ -736,10 +832,26 @@ class Learner:
                     scalars["time/learner/weight_transfer_seconds"],
                 )
                 if iteration % 10 == 0:
-                    examples = f"Rollout examples | step {iteration}\n\n{batch.examples}"
-                    logger.info("\n%s", examples)
-                    writer.log_text(examples, f"examples/{iteration}.txt")
-                writer.log_metrics(scalars, step=iteration)
+                    with profiling.profile("learner.log_examples", extra_data={"iteration": str(iteration)}):
+                        examples = f"Rollout examples | step {iteration}\n\n{batch.examples}"
+                        logger.info("\n%s", examples)
+                        writer.log_text(examples, f"examples/{iteration}.txt")
+                if iteration % self.config.checkpoint_interval == 0 or iteration == self.config.total_iterations:
+                    with profiling.profile("learner.checkpoint", extra_data={"iteration": str(iteration)}):
+                        scalars["time/checkpoint_seconds"] = save_checkpoint(
+                            manager,
+                            TrainingProgress(
+                                train_state=self.state,
+                                shuffle_key=self.shuffle_key,  # ()
+                                iteration=iteration,
+                                total_rollouts=total_rollouts,
+                                sampling_state=ray.get(self.actor.get_sampling_state.remote()),
+                                stop_conditions=tuple(sorted(stop_conditions)),
+                            ),
+                            self.config,
+                        )
+                with profiling.profile("learner.log_metrics", extra_data={"iteration": str(iteration)}):
+                    writer.log_metrics(scalars, step=iteration)
 
     def fetch_next_batch(self, num_groups: int, group_size: int) -> RolloutBatch:
         logger.debug("Requesting batch: num_groups=%s group_size=%s", num_groups, group_size)
@@ -796,7 +908,7 @@ class Learner:
         minibatch_size = batch.token_ids.shape[0] // self.config.minibatches_per_epoch
         history: list[Metrics] = []
         for _ in range(self.config.update_epochs):
-            key = jax.random.fold_in(jax.random.key(self.config.seed), self.state.step)  # () typed PRNG key.
+            key = jax.random.fold_in(self.shuffle_key, self.state.step)  # () typed PRNG key.
             permutation = jax.random.permutation(key, batch.token_ids.shape[0])  # (B,)
             shuffled = jax.tree.map(
                 lambda value, permutation=permutation: value[permutation], batch
@@ -822,7 +934,7 @@ class Learner:
 class Actor:
     def __init__(self, config: Config = DEFAULT_CONFIG) -> None:
         self.config = config
-        random.seed(config.seed)
+        self.rng = random.Random(config.seed)
         self._server = ExitStack()
         self._weights_valid = True
         if isinstance(config.taskset, (WebShopConfig, ALFWorldConfig, Tau2Config, AppWorldConfig)):
@@ -847,10 +959,17 @@ class Actor:
         self._server.close()
         logger.info("Actor resources released")
 
+    def get_sampling_state(self) -> dict[str, Any]:
+        version, state, gauss_next = self.rng.getstate()
+        return {"version": version, "state": list(state), "gauss_next": gauss_next}
+
+    def set_sampling_state(self, state: dict[str, Any]) -> None:
+        self.rng.setstate((state["version"], tuple(state["state"]), state["gauss_next"]))
+
     async def fetch_next_group(self, group_size: int) -> Transfer[RolloutGroup]:
         if not self._weights_valid:
             raise RuntimeError("Cannot generate during or after a failed weight update")
-        task = random.choice(self.tasks)
+        task = self.rng.choice(self.tasks)
         logger.debug("Selected task %s: %r", task.data.id, task.data.prompt)
         group = await self.collect_group(task, group_size=group_size)
         return Transfer(value=group, ready_at=time.monotonic())
@@ -861,52 +980,55 @@ class Actor:
             response.raise_for_status()
 
     async def update_weights(self, update_info: dict[str, Any]) -> None:
-        self._weights_valid = False
-        logger.info("Receiving learner weights: tensors=%s", len(update_info["names"]))
-        async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:
-            response = await client.post(
-                "/pause", params={"mode": self.config.weight_update_pause_mode, "clear_cache": "true"}
-            )
-            response.raise_for_status()
-            response = await client.post("/start_weight_update")
-            response.raise_for_status()
-            response = await client.post("/update_weights", json={"update_info": update_info})
-            response.raise_for_status()
-            response = await client.post("/finish_weight_update")
-            response.raise_for_status()
-            response = await client.post("/resume")
-            response.raise_for_status()
-        self._weights_valid = True
-        logger.info("Learner weights applied; generation resumed")
+        with profiling.profile("actor.update_weights"):
+            self._weights_valid = False
+            logger.info("Receiving learner weights: tensors=%s", len(update_info["names"]))
+            async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:
+                response = await client.post(
+                    "/pause", params={"mode": self.config.weight_update_pause_mode, "clear_cache": "true"}
+                )
+                response.raise_for_status()
+                response = await client.post("/start_weight_update")
+                response.raise_for_status()
+                response = await client.post("/update_weights", json={"update_info": update_info})
+                response.raise_for_status()
+                response = await client.post("/finish_weight_update")
+                response.raise_for_status()
+                response = await client.post("/resume")
+                response.raise_for_status()
+            self._weights_valid = True
+            logger.info("Learner weights applied; generation resumed")
 
     async def collect_group(self, task: vf.Task, group_size: int) -> RolloutGroup:
         if group_size < 2:
             raise ValueError("group_size must be at least 2")
+        profile_data = {"group_id": uuid4().hex, "task_id": str(task.data.id), "group_size": str(group_size)}
         started = time.monotonic()
         logger.info("Collecting group: task=%s group_size=%s", task.data.id, group_size)
         try:
-            async with create_agent(self.config) as agent, asyncio.TaskGroup() as pending:
-                if isinstance(task, BenchmarkTask) and isinstance(
-                    self.config.taskset, (WebShopConfig, ALFWorldConfig, Tau2Config, AppWorldConfig)
-                ):
-                    runs = [
-                        pending.create_task(
-                            task.run(
-                                agent,
-                                self.config.taskset,
-                                self.config.max_turns,
-                                self.config.environment_timeout,
-                            )
-                        )
-                        for _ in range(group_size)
-                    ]
-                elif isinstance(task, CodeGymTask) and self.config.taskset.id == "codegym":
-                    runs = [
-                        pending.create_task(task.run(agent, self.config.taskset.manager_url)) for _ in range(group_size)
-                    ]
-                else:
-                    runs = [pending.create_task(agent.run(task.defer_scoring())) for _ in range(group_size)]
-            group = await score_group(task, [run.result() for run in runs])
+            with profiling.profile("actor.collect_group", extra_data=profile_data):
+                async with create_agent(self.config) as agent, asyncio.TaskGroup() as pending:
+
+                    async def run_rollout(index: int) -> vf.Trace:
+                        with profiling.profile(
+                            "actor.rollout", extra_data={**profile_data, "rollout_index": str(index)}
+                        ):
+                            if isinstance(task, BenchmarkTask) and isinstance(
+                                self.config.taskset, (WebShopConfig, ALFWorldConfig, Tau2Config, AppWorldConfig)
+                            ):
+                                return await task.run(
+                                    agent,
+                                    self.config.taskset,
+                                    self.config.max_turns,
+                                    self.config.environment_timeout,
+                                )
+                            if isinstance(task, CodeGymTask) and self.config.taskset.id == "codegym":
+                                return await task.run(agent, self.config.taskset.manager_url)
+                            return await agent.run(task.defer_scoring())
+
+                    runs = [pending.create_task(run_rollout(index)) for index in range(group_size)]
+                with profiling.profile("actor.score_group", extra_data=profile_data):
+                    group = await score_group(task, [run.result() for run in runs])
         except Exception:
             logger.exception(
                 "Group failed: task=%s group_size=%s elapsed=%.2fs",
