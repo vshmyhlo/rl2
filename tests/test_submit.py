@@ -38,6 +38,24 @@ def test_default_gpu_job() -> None:
     assert run_volume["persistentVolumeClaim"]["claimName"] == "training-runs"
 
 
+def test_grpo_timeline_directory_is_persistent() -> None:
+    preset = "configs/grpo_v2/codegym.yaml"
+    args = submit.parse_args(
+        ["--gpus", "2", "--", "uv", "run", "python", "-m", "rl2.train_grpo_v2", "--config", preset]
+    )
+    job = submit.job_manifest(args=args, name="train-grpo", image="rl2.local/train:test")
+    pod = job["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    settings = OmegaConf.to_container(OmegaConf.load(submit.ROOT / preset), resolve=False)
+    mount = next(
+        mount for mount in container["volumeMounts"] if settings["ckpt_dir"].startswith(mount["mountPath"] + "/")
+    )
+    volume = next(volume for volume in pod["volumes"] if volume["name"] == mount["name"])
+    assert volume["persistentVolumeClaim"]["claimName"] == "training-runs"
+    assert container["command"] == args.command
+    assert container["resources"]["limits"]["nvidia.com/gpu"] == "2"
+
+
 @pytest.mark.parametrize(
     "argv",
     [

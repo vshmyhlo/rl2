@@ -58,6 +58,7 @@ import argparse
 import asyncio
 import logging
 import os
+import posixpath
 import random
 import subprocess
 import sys
@@ -73,6 +74,7 @@ from textwrap import indent
 from typing import Annotated, Any, Literal, NamedTuple
 from urllib.error import URLError
 from urllib.request import urlopen
+from uuid import uuid4
 
 import httpx
 import jax
@@ -86,6 +88,7 @@ from flax.training.train_state import TrainState
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass as config_dataclass
+from ray._private import profiling
 from ray.actor import ActorHandle
 from renderers.configs import CustomRendererConfig
 from verifiers.v1.configs.agent import TimeoutConfig
@@ -106,6 +109,7 @@ from rl2.codegym_server import CodeGymServerConfig, serve_codegym
 from rl2.configuration import BaseConfig, load_config
 from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import Parameters, Qwen3LM, load_qwen3_checkpoint
+from rl2.ray_timeline import record_timeline
 from rl2.toolrl_env import TOOLRL_TRAIN_FILE, ToolRLTaskset, ToolRLTasksetConfig
 from rl2.utils import group_advantages
 
@@ -610,7 +614,8 @@ class Batcher:
         results = await asyncio.gather(*(fetch_group() for _ in range(num_groups)))
         fetched = time.monotonic()
         groups = [group for group, _ in results]
-        training_batch = self.prepare_batch(groups, context_length=context_length)  # (B, T), (B,) leaves.
+        with profiling.profile("batcher.prepare_batch"):
+            training_batch = self.prepare_batch(groups, context_length=context_length)  # (B, T), (B,) leaves.
         prepared = time.monotonic()
         batch = build_rollout_batch(
             groups=groups,
@@ -683,11 +688,14 @@ class Learner:
             while self.config.total_iterations is None or iteration < self.config.total_iterations:
                 iteration += 1
                 started = time.monotonic()
-                batch = self.fetch_next_batch(num_groups=self.config.num_groups, group_size=self.config.group_size)
+                with profiling.profile("learner.fetch_batch", extra_data={"iteration": str(iteration)}):
+                    batch = self.fetch_next_batch(num_groups=self.config.num_groups, group_size=self.config.group_size)
                 fetched = time.monotonic()
-                update_metrics = self.optimize(batch.training_batch)
+                with profiling.profile("learner.optimize", extra_data={"iteration": str(iteration)}):
+                    update_metrics = self.optimize(batch.training_batch)
                 optimized = time.monotonic()
-                self.publish_weights()
+                with profiling.profile("learner.publish_weights", extra_data={"iteration": str(iteration)}):
+                    self.publish_weights()
                 now = time.monotonic()
                 num_rollouts = batch.training_batch.token_ids.shape[0]
                 stop_conditions.update(batch.stop_counts)
@@ -919,8 +927,18 @@ class Actor:
 
 
 def train(config: Config) -> None:
+    timeline_path = posixpath.join(config.ckpt_dir, "profiles", f"ray-{uuid4().hex}.json")
     # The HTTP endpoint is shared over loopback by workers on this node.
-    with ray.init(address="local", logging_config=ray.LoggingConfig(log_level="INFO")):
+    with (
+        ray.init(
+            address="local",
+            logging_config=ray.LoggingConfig(log_level="INFO"),
+            runtime_env={"env_vars": {"RAY_PROFILING": "1"}},
+            # Zero disables event reporting in Ray 2.59 despite the timeline docstring.
+            _system_config={"enable_timeline": True, "task_events_report_interval_ms": 1000},
+        ),
+        record_timeline(timeline_path),
+    ):
         logger.info("Creating batcher, learner, and actor")
         actor = Actor.remote(config=config)
         batcher = Batcher.remote(actor=actor)

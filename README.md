@@ -64,3 +64,17 @@ Solving sparse reward Atari environments, such as Montezuma’s Revenge.
 | [Kinetix](https://github.com/FLAIROx/Kinetix) | **(jax env)** JAX environments for RL on general 2D physics tasks. |
 | [JAXtari](https://github.com/k4ntz/JAXtari) | **(jax env)** GPU-accelerated Atari environments in JAX, with pixel and object observations and customizable game mechanics. |
 | [continual-foragax](https://pypi.org/project/continual-foragax/) | **(jax env)** JAX grid-world environments for continual learning, with customizable biomes, object placement, respawning, rewards, and multiple observation modalities. |
+
+## ray prof
+
+
+| Tool | What it answers |
+|---|---|
+| **Ray Timeline** | Which actor/task ran when? Where did calls overlap or wait? |
+| **py-spy** — available through Dashboard | Which Python functions consume CPU? Where is a worker stuck? Can include subprocesses. |
+| **Memray** — Dashboard integration | Where is CPU memory allocated? What causes growth or leaks? |
+| **Nsight Systems** | What happens across CPU processes, GPU kernels, memory copies, and NCCL transfers? |
+| **JAX profiler / XProf** | Why is the learner slow? Compilation, XLA operations, device execution, and GPU memory. |
+| **vLLM’s PyTorch profiler** | Where does inference time go inside vLLM workers? |
+| **OpenTelemetry tracing** | Which model request or environment step delays a rollout across service/process boundaries? |
+| **Prometheus + Grafana** | How do utilization, memory, throughput, and queue metrics change over a long run? |

@@ -753,6 +753,8 @@ def test_learner_logs_examples_every_ten_steps(
     learner: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level("INFO", logger=training.__name__)
+    profile = MagicMock()
+    monkeypatch.setattr(training.profiling, "profile", profile)
     rollout = training.Rollout(
         sequence=training.TrainingSequence(
             token_ids=jnp.array([1, 2], dtype=jnp.int32),  # (T=2,)
@@ -797,6 +799,11 @@ def test_learner_logs_examples_every_ten_steps(
     monkeypatch.setattr(training, "MLflowLogger", Mock(return_value=writer))
 
     learner.start()
+    for phase in ("learner.fetch_batch", "learner.optimize", "learner.publish_weights"):
+        assert any(
+            call.args == (phase,) and call.kwargs == {"extra_data": {"iteration": "21"}}
+            for call in profile.call_args_list
+        )
 
     artifacts = writer.log_text.call_args_list[1:]  # Skip the config artifact.
     assert [call.args[1] for call in artifacts] == ["examples/10.txt", "examples/20.txt"]
@@ -944,8 +951,8 @@ def test_actor_initializes_weight_receiver(actor: Any, monkeypatch: pytest.Monke
 
 
 @pytest.mark.parametrize("fails", [False, True])
-def test_train_gracefully_terminates_actor(fails: bool, monkeypatch: pytest.MonkeyPatch) -> None:
-    config = training.Config()
+def test_train_gracefully_terminates_actor(fails: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = training.Config(ckpt_dir=str(tmp_path))
     actor, batcher, learner = Mock(), Mock(), Mock()
     actor.__ray_terminate__ = Mock()
     learner.__ray_terminate__ = Mock()
@@ -953,6 +960,8 @@ def test_train_gracefully_terminates_actor(fails: bool, monkeypatch: pytest.Monk
     monkeypatch.setattr(training, "Batcher", Mock(remote=Mock(return_value=batcher)))
     monkeypatch.setattr(training, "Learner", Mock(remote=Mock(return_value=learner)))
     monkeypatch.setattr(training.ray, "init", MagicMock())
+    timeline = Mock(return_value=[{"name": "training"}])
+    monkeypatch.setattr(training.ray, "timeline", timeline)
     get = Mock()
     monkeypatch.setattr(training.ray, "get", get)
     wait = Mock()
@@ -965,6 +974,12 @@ def test_train_gracefully_terminates_actor(fails: bool, monkeypatch: pytest.Monk
         return learner.start.remote.return_value
 
     learner.start.remote.side_effect = start_learner
+
+    def export() -> list[dict[str, str]]:
+        assert training.ray.init.return_value.__exit__.call_count == 0
+        return [{"name": "training"}]
+
+    timeline.side_effect = export
     if fails:
         with pytest.raises(RuntimeError, match="training failed"):
             training.train(config)
@@ -973,6 +988,13 @@ def test_train_gracefully_terminates_actor(fails: bool, monkeypatch: pytest.Monk
     training.Actor.remote.assert_called_once_with(config=config)
     training.Batcher.remote.assert_called_once_with(actor=actor)
     training.Learner.remote.assert_called_once_with(batcher=batcher, actor=actor, config=config)
+    options = training.ray.init.call_args.kwargs
+    assert options["runtime_env"]["env_vars"]["RAY_PROFILING"] == "1"
+    assert options["_system_config"] == {"enable_timeline": True, "task_events_report_interval_ms": 1000}
+    traces = list((tmp_path / "profiles").glob("ray-*.json"))
+    assert len(traces) == 1
+    assert json.loads(traces[0].read_text()) == [{"name": "training"}]
+    timeline.assert_called_once_with()
     actor.start.remote.assert_not_called()
     actor.__ray_terminate__.remote.assert_called_once_with()
     learner.__ray_terminate__.remote.assert_called_once_with()

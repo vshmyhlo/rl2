@@ -83,7 +83,27 @@ Run with `uv run python -m rl2.train_grpo_v2 --config configs/grpo_v2/addition.y
 
 The actor and batcher set `JAX_PLATFORMS=cpu` through their Ray runtime environments before importing JAX. CPU array placement alone does not prevent CUDA initialization, and deserializing JAX arrays restores them onto the receiving worker's default device. This keeps those workers from reserving GPU memory needed by the learner and vLLM; vLLM retains its assigned CUDA device.
 
-The YAML config uses the same interpolation and validation as PPO/MAPPO. It controls the model, task sampling seed, batch dimensions, sampling limits, temperature, run ID, and optional `total_iterations` (`null` runs until interrupted). `ckpt_dir` is reserved; checkpointing is not implemented.
+The YAML config uses the same interpolation and validation as PPO/MAPPO. It controls the model, task sampling seed, batch dimensions, sampling limits, temperature, run ID, and optional `total_iterations` (`null` runs until interrupted). `ckpt_dir` stores profiling artifacts; checkpointing is not implemented.
+
+### Ray timeline
+
+Timeline collection is enabled automatically, including jobs launched with `submit.py`:
+
+```bash
+./submit.py --gpus 2 -- uv run python -m rl2.train_grpo_v2 --config configs/grpo_v2/codegym.yaml
+```
+
+The driver logs the trace path and saves `<ckpt_dir>/profiles/ray-<unique-id>.json` every 60 seconds and before Ray shuts down, including when training raises an exception. Each launch gets a separate file. Local snapshots are replaced atomically; abrupt termination can lose events since the last successful export. Ray's event-retention limits still apply, so snapshots are not an unlimited history.
+
+The presets write under `/runs/grpo_v2/<run_id>/profiles/`, on the persistent `training-runs` volume in submitted jobs. For local runs, set `ckpt_dir` to a writable directory. Download the JSON and open it at [ui.perfetto.dev](https://ui.perfetto.dev/). While a Pod is running:
+
+```bash
+sudo k3s kubectl -n training cp <pod>:<logged-trace-path> ./ray-timeline.json -c train
+```
+
+After the Pod exits, retrieve the file from the PVC's [host backing directory](../../infra/k3s/README.md#shared-on-disk-checkpoints); paths below `/runs/` are relative to that directory. Live `uv run ray timeline` export also works inside the running container.
+
+Worker tracks include actor calls, `batcher.prepare_batch`, and the learner's `fetch_batch`, `optimize`, and `publish_weights` phases with iteration metadata. These measure host-side intervals, not GPU kernels or subprocess internals. Custom spans use Ray's private profiling API. The trainer explicitly uses a positive event-reporting interval: setting `RAY_task_events_report_interval_ms=0` disables reporting in Ray 2.59 despite its outdated timeline docstring. Dashboard dependencies are not required.
 
 MLflow uses the shared `MLflowLogger`, experiment `grpo_v2`, and standard `MLFLOW_TRACKING_URI` / experiment environment variables. The [module docstring](train_grpo_v2.py) documents every metric key, its meaning, aggregation, and logging cadence. Model size and learner setup time are logged at step 0; all other metrics are logged after each completed iteration. Setup timing starts before learner model loading and includes NCCL initialization and initial weight publication. Iteration timing and throughput include collection, optimization, and weight transfer, excluding metric and example logging. Cumulative iteration, update, and rollout counters start at zero for each training session. Config parameters, resolved YAML, learner console output, and rollout examples every 10 iterations are also saved.
 

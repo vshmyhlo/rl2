@@ -11,4 +11,4 @@ max_turns: 50
 rollout_timeout: 1200
 environment_timeout: 600
 run_id: grpo_v2_appworld_${path_name:${model}}_seed${seed}
-ckpt_dir: /runs/grpo_v2/${run_id} # Reserved; checkpointing is not implemented.
+ckpt_dir: /runs/grpo_v2/${run_id} # Profiling artifacts; checkpointing is not implemented.
