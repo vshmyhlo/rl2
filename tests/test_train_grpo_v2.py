@@ -61,7 +61,9 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert defaults.checkpoint_interval == 100
     assert defaults.padding_multiple == 256
     assert defaults.gradient_checkpointing
+    assert not defaults.enable_ray_dashboard
     assert not defaults.enable_ray_timeline
+    assert not defaults.enable_tracing
     assert defaults.weight_update_pause_mode == "wait"
     preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/addition.yaml"
     config = training.load_config(preset, training.Config)
@@ -82,7 +84,9 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
                 "max_tokens": "${group_size}",
                 "total_iterations": 1,
                 "gradient_checkpointing": False,
+                "enable_ray_dashboard": True,
                 "enable_ray_timeline": True,
+                "enable_tracing": True,
                 "padding_multiple": 64,
             }
         )
@@ -97,7 +101,9 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
             max_tokens=4,
             total_iterations=1,
             gradient_checkpointing=False,
+            enable_ray_dashboard=True,
             enable_ray_timeline=True,
+            enable_tracing=True,
             padding_multiple=64,
         )
     )
@@ -1086,16 +1092,34 @@ def test_actor_initializes_weight_receiver(actor: Any, monkeypatch: pytest.Monke
 
 
 @pytest.mark.parametrize(
-    ("enable_timeline", "fails"),
-    [(False, False), (True, False), (True, True)],
-    ids=["timeline-disabled", "timeline-enabled", "timeline-on-failure"],
+    ("enable_dashboard", "enable_timeline", "enable_tracing", "fails"),
+    [
+        (False, False, False, False),
+        (True, False, False, False),
+        (False, True, False, False),
+        (False, False, True, False),
+        (True, True, True, True),
+    ],
+    ids=["disabled", "dashboard-only", "timeline-only", "tracing-only", "all-on-failure"],
 )
 def test_train_gracefully_terminates_actor(
-    enable_timeline: bool, fails: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    enable_dashboard: bool,
+    enable_timeline: bool,
+    enable_tracing: bool,
+    fails: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = training.Config(ckpt_dir=str(tmp_path), padding_multiple=64, enable_ray_timeline=enable_timeline)
+    config = training.Config(
+        ckpt_dir=str(tmp_path),
+        padding_multiple=64,
+        enable_ray_dashboard=enable_dashboard,
+        enable_ray_timeline=enable_timeline,
+        enable_tracing=enable_tracing,
+    )
     monkeypatch.delenv("RL2_RAY_TIMELINE_PATH", raising=False)
     monkeypatch.delenv("RL2_RAY_DASHBOARD_HOST", raising=False)
+    monkeypatch.setenv("RAY_AUTH_MODE", "token")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://tempo:4317")
     monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
     flush = Mock()
@@ -1120,6 +1144,7 @@ def test_train_gracefully_terminates_actor(
     monkeypatch.setattr(training.ray, "wait", wait)
 
     def start_learner() -> Any:
+        assert os.environ["RAY_AUTH_MODE"] == "disabled"
         training.Actor.remote.assert_called_once_with(config=config)
         if fails:
             raise RuntimeError("training failed")
@@ -1141,12 +1166,12 @@ def test_train_gracefully_terminates_actor(
     training.Batcher.remote.assert_called_once_with(actor=actor, config=config)
     training.Learner.remote.assert_called_once_with(batcher=batcher, actor=actor, config=config)
     options = training.ray.init.call_args.kwargs
-    assert options["include_dashboard"] is True
+    assert options["include_dashboard"] is enable_dashboard
     assert options["dashboard_host"] == ("0.0.0.0" if fails else "127.0.0.1")
     assert options["dashboard_port"] == 8265
     assert options["runtime_env"]["env_vars"] == ({"RAY_PROFILING": "1"} if enable_timeline else {})
     assert options["_system_config"] == {"enable_timeline": enable_timeline, "task_events_report_interval_ms": 1000}
-    assert options["_tracing_startup_hook"] == "rl2.tracing:setup_tracing"
+    assert options["_tracing_startup_hook"] == ("rl2.tracing:setup_tracing" if enable_tracing else None)
     traces = list(tmp_path.rglob("*.json"))
     if enable_timeline:
         assert len(traces) == 1

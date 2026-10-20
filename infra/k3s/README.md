@@ -303,7 +303,8 @@ sudo k3s kubectl -n monitoring port-forward --address=127.0.0.1 service/tempo 43
 Use `http://127.0.0.1:4317` for gRPC or
 `http://127.0.0.1:4318/v1/traces` for HTTP traces. Tempo's query API is internal
 on port `3200`; Grafana proxies queries to it. No receiver is exposed publicly.
-New GRPO v2 jobs submitted with `submit.py` export traces automatically.
+GRPO v2 jobs export traces when their config sets `enable_tracing: true`
+(disabled by default). `submit.py` supplies the Tempo endpoint automatically.
 See [GRPO tracing](../../src/rl2/train_grpo_v2.md) for local configuration.
 Ray timeline files remain separate from OpenTelemetry traces.
 
@@ -572,16 +573,15 @@ Forward only **8085** through your IDE or SSH. Dashboards are proxied at
 `/dashboard/<job-name>/`; no per-job port-forward is needed. The viewer's service
 account can list Jobs and Pods only in `training`. Dashboard targets are resolved
 from running Pods owned by those Jobs. Submitted GRPO v2 jobs bind Ray to the Pod
-network; dashboards stop when Ray exits.
+network; dashboards stop when Ray exits. Set `enable_ray_dashboard: true` in the
+training YAML to enable the dashboard (disabled by default).
 
-Ray 2.59 requires a login token by default. Expand **Dashboard login token** in the
-list for its retrieval command, also printed by `submit.py`. Paste the token into
-Ray's login dialog; cookies are scoped to each job. The viewer does not read tokens
-or execute commands in training Pods.
+GRPO v2 sets `RAY_AUTH_MODE=disabled` before starting Ray, so dashboards open without
+a login token. Existing jobs need resubmission for this change.
 
-Submitted GRPO v2 jobs save Ray timeline snapshots to
+With `enable_ray_timeline: true`, submitted GRPO v2 jobs save Ray timeline snapshots to
 `/runs/ray-timelines/<job-name>.json` every minute and on exit.
-Both `submit.py` and the driver print a viewer link when profiling is enabled.
+`submit.py` prints the timeline link; the driver logs it when profiling is enabled.
 
 Forward **8085** through your IDE or SSH and open the printed
 `http://localhost:8085/?job=<job-name>` link. The page waits for the first snapshot,

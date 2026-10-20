@@ -55,7 +55,13 @@ def groups() -> list[training.RolloutGroup]:
 
 @pytest.mark.parametrize("context_length,width", [(512, 256), (5, 5)], ids=["bucketed", "context-boundary"])
 def test_prepare_batch(batcher: Any, groups: list[training.RolloutGroup], context_length: int, width: int) -> None:
-    batch = batcher.prepare_batch(groups, context_length=context_length)
+    for index, sample in enumerate(groups[0].rollouts):
+        sequence = replace(
+            sample.sequence,
+            old_log_probs=-jnp.arange(len(sample.sequence.token_ids), dtype=jnp.float32) / 10,  # (L,)
+        )
+        groups[0].rollouts[index] = replace(sample, sequence=sequence)
+    batch = batcher.prepare_batch(groups, context_length=context_length)  # (B=2, T=width), (B,) leaves.
     assert batch.token_ids.shape == batch.attention_mask.shape == batch.loss_mask.shape == (2, width)
     assert batch.old_log_probs.shape == (2, width)
     assert batch.advantages.shape == (2,)
@@ -69,6 +75,9 @@ def test_prepare_batch(batcher: Any, groups: list[training.RolloutGroup], contex
     np.testing.assert_array_equal(batch.loss_mask[0, :5], [False, True, False, True, True])
     np.testing.assert_array_equal(batch.loss_mask.sum(axis=1), [3, 1])
     np.testing.assert_array_equal(batch.advantages, [1.0, -1.0])
+    for index, sample in enumerate(groups[0].rollouts):
+        length = len(sample.sequence.token_ids)
+        np.testing.assert_array_equal(batch.old_log_probs[index, :length], sample.sequence.old_log_probs)
     assert not np.asarray(batch.attention_mask[1, 3:]).any()
     assert not np.asarray(batch.loss_mask[1, 3:]).any()
     np.testing.assert_array_equal(batch.token_ids[1, 3:], 0)
@@ -96,25 +105,31 @@ def test_prepare_batch_bucket_boundaries(length: int, context_length: int, multi
 
 def test_prepare_minimal_sequences_and_multiple_groups(batcher: Any) -> None:
     groups = [
-        training.RolloutGroup(task_id=str(i), prompt="test", rollouts=[rollout([1, 2], [False, True], advantage)])
-        for i, advantage in enumerate([0.0, 1.0])
+        training.RolloutGroup(task_id="0", prompt="test", rollouts=[rollout([0, 2], [False, True], 0.0)]),
+        training.RolloutGroup(task_id="1", prompt="test", rollouts=[rollout([3, 4, 5], [False, True, True], 1.0)]),
     ]
-    batch = batcher.prepare_batch(groups, context_length=8)
+    batch = batcher.prepare_batch(groups, context_length=8)  # (B=2, T=8), (B,) leaves.
     assert batch.token_ids.shape == (2, 8)
+    np.testing.assert_array_equal(batch.token_ids[:, :3], [[0, 2, 0], [3, 4, 5]])
+    np.testing.assert_array_equal(batch.attention_mask[:, :3], [[True, True, False], [True, True, True]])
+    np.testing.assert_array_equal(batch.loss_mask[:, :3], [[False, True, False], [False, True, True]])
     np.testing.assert_array_equal(batch.advantages, [0.0, 1.0])
 
 
-@pytest.mark.parametrize("failure", ["empty", "overlong", "no-context", "no-samples", "single-token"])
+@pytest.mark.parametrize(
+    "failure", ["empty", "overlong", "no-context", "no-samples", "single-token", "empty-transcript"]
+)
 def test_prepare_batch_rejects_unusable_sequences(
     batcher: Any, failure: str, groups: list[training.RolloutGroup]
 ) -> None:
     if failure == "empty":
         groups = []
-    elif failure in {"no-context", "no-samples", "single-token"}:
+    elif failure in {"no-context", "no-samples", "single-token", "empty-transcript"}:
         sample = {
             "no-context": rollout([1, 2], [True, True], 1.0),
             "no-samples": rollout([1, 2], [False, False], 1.0),
             "single-token": rollout([1], [True], 1.0),
+            "empty-transcript": rollout([], [], 1.0),
         }[failure]
         groups = [replace(groups[0], rollouts=[sample])]
     with pytest.raises(ValueError):

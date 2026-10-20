@@ -140,9 +140,9 @@ def test_build_and_submit_preserves_command(
     output = capsys.readouterr().out
     assert "priority=high, GPU=2" in output
     assert "Training jobs: http://localhost:8085/" in output
-    assert f"Ray dashboard (while GRPO v2 is running): http://localhost:8085/dashboard/{names[0]}/" in output
+    assert f"Ray dashboard (when enabled): http://localhost:8085/dashboard/{names[0]}/" in output
     assert "port-forward" not in output
-    assert f"sudo k3s kubectl -n training exec job/{names[0]} -c train -- ray get-auth-token" in output
+    assert "Login token" not in output
     assert f"Ray timeline (when recorded): http://localhost:8085/?job={names[0]}" in output
     assert f"type=image,name={container['image']},unpack=true" in build.args[0]
     preview = next(call for call in calls if "--dry-run=server" in call.args[0])

@@ -87,19 +87,19 @@ The YAML config uses the same interpolation and validation as PPO/MAPPO. It cont
 
 ### Ray dashboard
 
-The dashboard starts automatically at <http://localhost:8265> for local runs. The project's `ray[default]` dependency includes the dashboard dependencies in submitted images.
+The dashboard is disabled by default. Enable it in the training YAML:
+
+```yaml
+enable_ray_dashboard: true
+```
+
+When enabled, local runs serve it at <http://localhost:8265>. The project's `ray[default]` dependency includes the dashboard dependencies in submitted images. This setting is independent of `enable_ray_timeline`.
 
 For `submit.py` jobs, open [Training jobs](http://localhost:8085/) and click **Ray dashboard** beside a running job. The list refreshes every 10 seconds and also shows queued jobs and timeline links. Install or update the [shared viewer](../../infra/k3s/README.md#shared-on-disk-checkpoints) once; forward only **8085** through your IDE or SSH when browsing remotely. Each dashboard opens at `/dashboard/<job-name>/`, so multiple jobs can be viewed without separate port-forwards.
 
 Submission sets `RL2_RAY_DASHBOARD_HOST=0.0.0.0` inside the Pod; local runs bind to loopback by default. The dashboard is available only while Ray is running.
 
-Ray 2.59 enables token authentication by default. Expand **Dashboard login token** in the jobs list, or use the command printed by `submit.py`, and enter its token in Ray's login dialog:
-
-```bash
-sudo k3s kubectl -n training exec job/<job-name> -c train -- ray get-auth-token
-```
-
-Logins are scoped to each job. For local runs, use `uv run ray get-auth-token`.
+The trainer sets `RAY_AUTH_MODE=disabled` before starting Ray, so dashboards open without a login token. Existing jobs need resubmission for this change.
 
 ### Ray timeline
 
@@ -125,11 +125,17 @@ After the Pod exits, retrieve the file from the PVC's [host backing directory](.
 
 Worker tracks include actor calls, `batcher.prepare_batch`, and the learner's `fetch_batch`, `optimize`, `publish_weights`, and `checkpoint` phases with iteration metadata. These measure host-side intervals, not GPU kernels or subprocess internals. Custom spans use Ray's private profiling API. The trainer explicitly uses a positive event-reporting interval: setting `RAY_task_events_report_interval_ms=0` disables reporting in Ray 2.59 despite its outdated timeline docstring.
 
-OpenTelemetry tracing is enabled when `OTEL_EXPORTER_OTLP_ENDPOINT` or
-`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set. `submit.py` supplies the cluster's
-Tempo gRPC endpoint and adds `k8s.job.name` to every span. New GRPO jobs therefore
-export automatically; set `OTEL_SDK_DISABLED=true` to disable tracing.
-For local runs, forward Tempo's port 4317 and launch with:
+OpenTelemetry tracing is disabled by default. Enable it in the training YAML:
+
+```yaml
+enable_tracing: true
+```
+
+Tracing also requires `OTEL_EXPORTER_OTLP_ENDPOINT` or
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. `submit.py` supplies the cluster's
+Tempo gRPC endpoint and adds `k8s.job.name` to every span.
+`OTEL_SDK_DISABLED=true` overrides the config and disables tracing.
+For local runs, enable tracing in the config, forward Tempo's port 4317, and launch with:
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \

@@ -81,6 +81,7 @@ from uuid import uuid4
 import httpx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import ray
@@ -187,7 +188,9 @@ class Config(BaseConfig):
     minibatches_per_epoch: Annotated[int, Field(ge=1)] = 4
     grad_accum_steps: Annotated[int, Field(ge=1)] = 1
     gradient_checkpointing: bool = True
+    enable_ray_dashboard: bool = False
     enable_ray_timeline: bool = False
+    enable_tracing: bool = False
     # In-flight vLLM requests during weight updates (individual requests, not multi-turn rollout groups):
     # wait: finish requests before applying weights (default).
     # abort: cancel requests before applying weights.
@@ -660,29 +663,32 @@ class Batcher:
             raise ValueError(f"Rollout length {length} exceeds model context length {context_length}")
         multiple = self.config.padding_multiple
         width = min((length + multiple - 1) // multiple * multiple, context_length)
-        with jax.default_device(jax.devices("cpu")[0]):
-            padded: list[dict[str, jax.Array]] = []  # (T,) leaves per rollout.
-            for rollout in rollouts:
-                sequence = rollout.sequence
-                length = len(sequence.token_ids)
-                if length < 2 or sequence.loss_mask[0] or not sequence.loss_mask[1:].any():
-                    raise ValueError("Each rollout needs context followed by at least one sampled token")
-                padded.append(
-                    jax.tree.map(
-                        partial(jnp.pad, pad_width=(0, width - length)),
-                        {
-                            "token_ids": sequence.token_ids,  # (L,) unpadded transcript length.
-                            "attention_mask": jnp.ones(length, dtype=jnp.bool_),  # (L,)
-                            "loss_mask": sequence.loss_mask,  # (L,)
-                            "old_log_probs": sequence.old_log_probs,  # (L,)
-                        },
-                    )
-                )
-            arrays = jax.tree.map(lambda *values: jnp.stack(values), *padded)  # (B, T) leaves.
-            return GRPOBatch(
-                **arrays,
-                advantages=jnp.asarray([rollout.advantage for rollout in rollouts], dtype=jnp.float32),  # (B,)
-            )  # (B, T), (B,) leaves.
+        shape = (len(rollouts), width)
+        # Host copies avoid compiling JAX padding and reductions for every transcript length.
+        arrays = {
+            "token_ids": np.zeros(shape, dtype=np.int32),  # (B, T)
+            "attention_mask": np.zeros(shape, dtype=np.bool_),  # (B, T)
+            "loss_mask": np.zeros(shape, dtype=np.bool_),  # (B, T)
+            "old_log_probs": np.zeros(shape, dtype=np.float32),  # (B, T)
+            "advantages": np.asarray([rollout.advantage for rollout in rollouts], dtype=np.float32),  # (B,)
+        }
+        for index, rollout in enumerate(rollouts):
+            sequence = jax.tree.map(
+                np.asarray,
+                {
+                    "token_ids": rollout.sequence.token_ids,  # (L,) unpadded transcript length.
+                    "loss_mask": rollout.sequence.loss_mask,  # (L,)
+                    "old_log_probs": rollout.sequence.old_log_probs,  # (L,)
+                },
+            )  # (L,) leaves.
+            length = len(sequence["token_ids"])
+            mask = sequence["loss_mask"]  # (L,)
+            if length < 2 or mask[0] or not mask[1:].any():
+                raise ValueError("Each rollout needs context followed by at least one sampled token")
+            for name, values in sequence.items():  # values: (L,)
+                arrays[name][index, :length] = values
+            arrays["attention_mask"][index, :length] = True
+        return GRPOBatch(**jax.device_put(arrays, jax.devices("cpu")[0]))  # (B, T), (B,) leaves.
 
     async def fetch_next_batch(self, num_groups: int, group_size: int, context_length: int) -> Transfer[RolloutBatch]:
         if num_groups < 1:
@@ -1092,6 +1098,7 @@ class Actor:
 
 
 def train(config: Config) -> None:
+    os.environ["RAY_AUTH_MODE"] = "disabled"
     timeline_path = os.environ.get(
         "RL2_RAY_TIMELINE_PATH", posixpath.join(config.ckpt_dir, "profiles", f"ray-{uuid4().hex}.json")
     )
@@ -1100,14 +1107,14 @@ def train(config: Config) -> None:
         ExitStack() as resources,
         ray.init(
             address="local",
-            include_dashboard=True,
+            include_dashboard=config.enable_ray_dashboard,
             dashboard_host=os.environ.get("RL2_RAY_DASHBOARD_HOST", "127.0.0.1"),
             dashboard_port=8265,
             logging_config=ray.LoggingConfig(log_level="INFO"),
             runtime_env={"env_vars": {"RAY_PROFILING": "1"} if config.enable_ray_timeline else {}},
             # Zero disables event reporting in Ray 2.59 despite the timeline docstring.
             _system_config={"enable_timeline": config.enable_ray_timeline, "task_events_report_interval_ms": 1000},
-            _tracing_startup_hook="rl2.tracing:setup_tracing" if tracing_enabled() else None,
+            _tracing_startup_hook="rl2.tracing:setup_tracing" if config.enable_tracing and tracing_enabled() else None,
         ),
         record_timeline(timeline_path) if config.enable_ray_timeline else nullcontext(),
     ):

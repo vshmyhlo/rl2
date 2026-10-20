@@ -19,8 +19,6 @@
   th, td { text-align: left; padding: 12px; border-bottom: 1px solid #ddd; vertical-align: top; }
   th { background: #f5f6f8; }
   td a { display: inline-block; margin-right: 16px; }
-  code { display: block; margin: 8px 0; overflow-wrap: anywhere; }
-  summary { cursor: pointer; }
   #empty { padding: 20px 0; }
 </style>
 <header>
@@ -65,7 +63,6 @@
       if (!response.ok) throw new Error(`Could not list jobs (HTTP ${response.status}). Retrying in 10 seconds.`);
       const jobs = await response.json();
       const rows = document.getElementById("job-rows");
-      const expanded = new Set([...rows.querySelectorAll("details[open]")].map((item) => item.dataset.job));
       rows.replaceChildren();
       for (const item of jobs) {
         const row = rows.insertRow();
@@ -85,19 +82,6 @@
         timeline.href = `/?job=${encodeURIComponent(item.name)}`;
         timeline.textContent = "Timeline";
         links.append(timeline);
-        if (item.status === "Running") {
-          const details = document.createElement("details");
-          details.dataset.job = item.name;
-          details.open = expanded.has(item.name);
-          const summary = document.createElement("summary");
-          summary.textContent = "Dashboard login token";
-          const command = document.createElement("code");
-          command.textContent = `sudo k3s kubectl -n training exec job/${item.name} -c train -- ray get-auth-token`;
-          const help = document.createElement("p");
-          help.textContent = "Run this command and paste the token into Ray’s login dialog. Each job has its own login.";
-          details.append(summary, help, command);
-          links.append(details);
-        }
       }
       document.getElementById("empty").hidden = jobs.length !== 0;
       status.textContent = `Updated ${new Date().toLocaleTimeString()}`;

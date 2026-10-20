@@ -201,8 +201,7 @@ def submit_jobs(args: argparse.Namespace, manifests: list[dict[str, Any]], image
         print(f"Status: sudo k3s kubectl -n training get job {name}")
         print(f"Logs:   sudo k3s kubectl -n training logs -f job/{name}")
         print("Training jobs: http://localhost:8085/")
-        print(f"Ray dashboard (while GRPO v2 is running): http://localhost:8085/dashboard/{name}/")
-        print(f"  Login token: sudo k3s kubectl -n training exec job/{name} -c train -- ray get-auth-token")
+        print(f"Ray dashboard (when enabled): http://localhost:8085/dashboard/{name}/")
         print(f"Ray timeline (when recorded): http://localhost:8085/?job={name}")
     return names
 

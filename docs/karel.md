@@ -340,8 +340,8 @@ Checkpoints using the former four-kind embedding cannot be resumed with this thr
 The sample run ID includes the grid size, `delta_conv_all_steps_v6`, and seed.
 In this trainer, `charts/reward_mean` reports total improvement,
 `charts/score_mean` reports final score, and `charts/seed_score_mean` reports
-the seed baseline. `charts/reward_diverse_group_fraction` measures group score
-diversity; equal-return groups produce zero policy advantages.
+the seed baseline. `charts/degenerate_group_fraction` measures the fraction of groups
+with equal final scores; these groups produce zero policy advantages.
 
 ## Logging and checkpoints
 
@@ -371,12 +371,12 @@ logs each reward contribution, including zeros on failures. Their sum equals
 `charts/reward_mean`. Runtime is a binary completion indicator;
 distance measures progress from the final or last valid execution state. `charts/success_rate` measures
 exact solutions, and `charts/group_success_rate` measures groups containing at
-least one solution. `charts/informative_group_fraction` measures groups with
-differing rewards. Syntax errors and generation truncations should be zero.
+least one solution. `charts/degenerate_group_fraction` measures the fraction of groups
+with identical rewards. Syntax errors and generation truncations should be zero.
 
 MLflow and stdout `step` count completed program episodes, including failed
 and truncated programs. Each rollout batch adds `num_tasks * group_size` steps;
-`iteration` counts rollout batches. `charts/steps_per_second` measures episodes
+`iteration` counts rollout batches. `time/steps_per_second` measures episodes
 per second. `charts/episode_length_mean` counts AST expansions, excluding PAD.
 `charts/generation_rounds_mean` counts encoding rounds per program, while
 `charts/program_token_length_mean` counts printed source tokens.
