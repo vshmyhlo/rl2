@@ -66,7 +66,7 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Iterator
-from contextlib import ExitStack, closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
 from functools import partial
 from itertools import islice
@@ -187,6 +187,7 @@ class Config(BaseConfig):
     minibatches_per_epoch: Annotated[int, Field(ge=1)] = 4
     grad_accum_steps: Annotated[int, Field(ge=1)] = 1
     gradient_checkpointing: bool = True
+    enable_ray_timeline: bool = False
     # In-flight vLLM requests during weight updates (individual requests, not multi-turn rollout groups):
     # wait: finish requests before applying weights (default).
     # abort: cancel requests before applying weights.
@@ -1103,12 +1104,12 @@ def train(config: Config) -> None:
             dashboard_host=os.environ.get("RL2_RAY_DASHBOARD_HOST", "127.0.0.1"),
             dashboard_port=8265,
             logging_config=ray.LoggingConfig(log_level="INFO"),
-            runtime_env={"env_vars": {"RAY_PROFILING": "1"}},
+            runtime_env={"env_vars": {"RAY_PROFILING": "1"} if config.enable_ray_timeline else {}},
             # Zero disables event reporting in Ray 2.59 despite the timeline docstring.
-            _system_config={"enable_timeline": True, "task_events_report_interval_ms": 1000},
+            _system_config={"enable_timeline": config.enable_ray_timeline, "task_events_report_interval_ms": 1000},
             _tracing_startup_hook="rl2.tracing:setup_tracing" if tracing_enabled() else None,
         ),
-        record_timeline(timeline_path),
+        record_timeline(timeline_path) if config.enable_ray_timeline else nullcontext(),
     ):
         resources.callback(flush_tracing)
         logger.info("Creating batcher, learner, and actor")

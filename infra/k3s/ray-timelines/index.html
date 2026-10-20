@@ -2,7 +2,7 @@
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ray timeline</title>
+<title>Training jobs</title>
 <style>
   body { margin: 0; font: 14px system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; }
   header { display: flex; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid #ddd; }
@@ -12,12 +12,32 @@
   label { display: block; margin-bottom: 8px; }
   input { box-sizing: border-box; width: 100%; padding: 10px; margin-bottom: 12px; font: inherit; }
   iframe { flex: 1; width: 100%; border: 0; }
+  a { color: #165cbd; }
+  main { padding: 24px 16px; overflow: auto; }
+  h1 { margin: 0 0 8px; font-size: 24px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+  th, td { text-align: left; padding: 12px; border-bottom: 1px solid #ddd; vertical-align: top; }
+  th { background: #f5f6f8; }
+  td a { display: inline-block; margin-right: 16px; }
+  code { display: block; margin: 8px 0; overflow-wrap: anywhere; }
+  summary { cursor: pointer; }
+  #empty { padding: 20px 0; }
 </style>
 <header>
+  <a href="/">All jobs</a>
   <strong id="title">Ray timeline</strong>
   <span id="status" role="status">Waiting for snapshot…</span>
   <button id="refresh" type="button">Load latest</button>
 </header>
+<main id="jobs" hidden>
+  <h1>Training jobs</h1>
+  <p>Running and queued jobs · refreshes every 10 seconds. Ray dashboards are available while Ray is running.</p>
+  <table>
+    <thead><tr><th>Job / run</th><th>Status</th><th>Created</th><th>Open</th></tr></thead>
+    <tbody id="job-rows"></tbody>
+  </table>
+  <p id="empty" hidden>No running or queued jobs.</p>
+</main>
 <form id="job-form" action="/" method="get" novalidate hidden>
   <label for="job-id">Job ID</label>
   <input id="job-id" name="job" placeholder="train-3af36a22fa6b4186" required
@@ -38,6 +58,55 @@
     if (!form.reportValidity()) event.preventDefault();
   };
   document.getElementById("refresh").onclick = () => location.reload();
+
+  async function loadJobs() {
+    try {
+      const response = await fetch("/api/jobs", {cache: "no-store"});
+      if (!response.ok) throw new Error(`Could not list jobs (HTTP ${response.status}). Retrying in 10 seconds.`);
+      const jobs = await response.json();
+      const rows = document.getElementById("job-rows");
+      const expanded = new Set([...rows.querySelectorAll("details[open]")].map((item) => item.dataset.job));
+      rows.replaceChildren();
+      for (const item of jobs) {
+        const row = rows.insertRow();
+        row.insertCell().textContent = item.name + (item.run_id ? ` / ${item.run_id}` : "");
+        row.insertCell().textContent = item.status;
+        row.insertCell().textContent = item.created ? new Date(item.created).toLocaleString() : "—";
+        const links = row.insertCell();
+        if (item.status === "Running") {
+          const dashboard = document.createElement("a");
+          dashboard.href = `/dashboard/${encodeURIComponent(item.name)}/`;
+          dashboard.textContent = "Ray dashboard ↗";
+          dashboard.target = "_blank";
+          dashboard.rel = "noopener";
+          links.append(dashboard);
+        }
+        const timeline = document.createElement("a");
+        timeline.href = `/?job=${encodeURIComponent(item.name)}`;
+        timeline.textContent = "Timeline";
+        links.append(timeline);
+        if (item.status === "Running") {
+          const details = document.createElement("details");
+          details.dataset.job = item.name;
+          details.open = expanded.has(item.name);
+          const summary = document.createElement("summary");
+          summary.textContent = "Dashboard login token";
+          const command = document.createElement("code");
+          command.textContent = `sudo k3s kubectl -n training exec job/${item.name} -c train -- ray get-auth-token`;
+          const help = document.createElement("p");
+          help.textContent = "Run this command and paste the token into Ray’s login dialog. Each job has its own login.";
+          details.append(summary, help, command);
+          links.append(details);
+        }
+      }
+      document.getElementById("empty").hidden = jobs.length !== 0;
+      status.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      setTimeout(loadJobs, 10000);
+    }
+  }
 
   function ready() {
     return new Promise((resolve, reject) => {
@@ -63,11 +132,13 @@
 
   async function load() {
     if (!job || !/^[A-Za-z0-9_-]+$/.test(job)) {
-      status.textContent = "Paste a job ID to open its timeline.";
-      document.getElementById("refresh").hidden = true;
+      document.getElementById("title").textContent = "Training jobs";
+      document.getElementById("refresh").textContent = "Refresh";
+      document.getElementById("jobs").hidden = false;
       form.hidden = false;
       input.value = job || "";
-      input.focus();
+      document.querySelector('label[for="job-id"]').textContent = "Open a saved timeline by job ID";
+      await loadJobs();
       return;
     }
     document.getElementById("title").textContent = job;

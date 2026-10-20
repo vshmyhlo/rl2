@@ -61,6 +61,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert defaults.checkpoint_interval == 100
     assert defaults.padding_multiple == 256
     assert defaults.gradient_checkpointing
+    assert not defaults.enable_ray_timeline
     assert defaults.weight_update_pause_mode == "wait"
     preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/addition.yaml"
     config = training.load_config(preset, training.Config)
@@ -81,6 +82,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
                 "max_tokens": "${group_size}",
                 "total_iterations": 1,
                 "gradient_checkpointing": False,
+                "enable_ray_timeline": True,
                 "padding_multiple": 64,
             }
         )
@@ -90,7 +92,14 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(sys, "argv", ["train_grpo_v2", "--config", str(path)])
     training.main()
     train.assert_called_once_with(
-        replace(config, max_tokens=4, total_iterations=1, gradient_checkpointing=False, padding_multiple=64)
+        replace(
+            config,
+            max_tokens=4,
+            total_iterations=1,
+            gradient_checkpointing=False,
+            enable_ray_timeline=True,
+            padding_multiple=64,
+        )
     )
     assert pickle.loads(pickle.dumps(config)) == config
 
@@ -1076,17 +1085,24 @@ def test_actor_initializes_weight_receiver(actor: Any, monkeypatch: pytest.Monke
     assert client.is_closed
 
 
-@pytest.mark.parametrize("fails", [False, True])
-def test_train_gracefully_terminates_actor(fails: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    config = training.Config(ckpt_dir=str(tmp_path), padding_multiple=64)
+@pytest.mark.parametrize(
+    ("enable_timeline", "fails"),
+    [(False, False), (True, False), (True, True)],
+    ids=["timeline-disabled", "timeline-enabled", "timeline-on-failure"],
+)
+def test_train_gracefully_terminates_actor(
+    enable_timeline: bool, fails: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = training.Config(ckpt_dir=str(tmp_path), padding_multiple=64, enable_ray_timeline=enable_timeline)
     monkeypatch.delenv("RL2_RAY_TIMELINE_PATH", raising=False)
     monkeypatch.delenv("RL2_RAY_DASHBOARD_HOST", raising=False)
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://tempo:4317")
     monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
     flush = Mock()
     monkeypatch.setattr(training, "flush_tracing", flush)
-    if fails:
+    if fails or not enable_timeline:
         monkeypatch.setenv("RL2_RAY_TIMELINE_PATH", str(tmp_path / "submitted" / "train-test.json"))
+    if fails:
         monkeypatch.setenv("RL2_RAY_DASHBOARD_HOST", "0.0.0.0")
     actor, batcher, learner = Mock(), Mock(), Mock()
     actor.__ray_terminate__ = Mock()
@@ -1128,13 +1144,18 @@ def test_train_gracefully_terminates_actor(fails: bool, tmp_path: Path, monkeypa
     assert options["include_dashboard"] is True
     assert options["dashboard_host"] == ("0.0.0.0" if fails else "127.0.0.1")
     assert options["dashboard_port"] == 8265
-    assert options["runtime_env"]["env_vars"]["RAY_PROFILING"] == "1"
-    assert options["_system_config"] == {"enable_timeline": True, "task_events_report_interval_ms": 1000}
+    assert options["runtime_env"]["env_vars"] == ({"RAY_PROFILING": "1"} if enable_timeline else {})
+    assert options["_system_config"] == {"enable_timeline": enable_timeline, "task_events_report_interval_ms": 1000}
     assert options["_tracing_startup_hook"] == "rl2.tracing:setup_tracing"
-    traces = list((tmp_path / "submitted").glob("*.json") if fails else (tmp_path / "profiles").glob("ray-*.json"))
-    assert len(traces) == 1
-    assert json.loads(traces[0].read_text()) == [{"name": "training"}]
-    timeline.assert_called_once_with()
+    traces = list(tmp_path.rglob("*.json"))
+    if enable_timeline:
+        assert len(traces) == 1
+        assert traces[0].parent == tmp_path / ("submitted" if fails else "profiles")
+        assert json.loads(traces[0].read_text()) == [{"name": "training"}]
+        timeline.assert_called_once_with()
+    else:
+        assert not traces
+        timeline.assert_not_called()
     actor.start.remote.assert_not_called()
     actor.__ray_terminate__.remote.assert_called_once_with()
     learner.__ray_terminate__.remote.assert_called_once_with()

@@ -231,7 +231,8 @@ sudo k3s kubectl -n monitoring port-forward --address=127.0.0.1 service/gpu-graf
 ```
 
 Open <http://localhost:8082/d/gpu-overview> and forward port 8082 in your IDE
-if needed. Anonymous access is read-only. The dashboard refreshes every
+if needed. Anonymous users have Editor access, including Explore, all data
+sources, and dashboard editing, without signing in. The dashboard refreshes every
 15 seconds; use its time picker to inspect earlier training runs. No GPU
 resource is reserved by the exporter, so the A100 remains available for training.
 
@@ -280,9 +281,8 @@ sudo k3s kubectl -n monitoring rollout status deployment/tempo --timeout=180s
 sudo k3s kubectl -n monitoring rollout status deployment/gpu-grafana --timeout=180s
 ```
 
-Open [Grafana Explore](http://localhost:8082/explore), sign in as `admin`
-using the password command in [GPU and host monitoring](#gpu-and-host-monitoring),
-and select **Tempo**. Anonymous Viewer access does not grant Explore access.
+Open [Grafana Explore](http://localhost:8082/explore) and select **Tempo**.
+No login is required.
 Choose **Search** to filter by service, span name, duration, or attributes,
 or use TraceQL `{}` to list traces in the selected time range. Open a trace
 to inspect its span waterfall, attributes, and errors.
@@ -303,8 +303,9 @@ sudo k3s kubectl -n monitoring port-forward --address=127.0.0.1 service/tempo 43
 Use `http://127.0.0.1:4317` for gRPC or
 `http://127.0.0.1:4318/v1/traces` for HTTP traces. Tempo's query API is internal
 on port `3200`; Grafana proxies queries to it. No receiver is exposed publicly.
-Training instrumentation is not enabled by this deployment; the existing
-Ray timeline files are separate from OpenTelemetry traces.
+New GRPO v2 jobs submitted with `submit.py` export traces automatically.
+See [GRPO tracing](../../src/rl2/train_grpo_v2.md) for local configuration.
+Ray timeline files remain separate from OpenTelemetry traces.
 
 Configuration lives in `monitoring/tempo-config.yaml`; reapply the Kustomization
 to roll out changes. See [Tempo deployment documentation](https://grafana.com/docs/tempo/latest/set-up-for-tracing/setup-tempo/).
@@ -559,13 +560,28 @@ Files survive Pod replacement, preemption, and Job deletion. Do not delete the
 PVC: its storage class deletes the backing directory. This is shared storage on
 one machine, not a backup. Existing Jobs need resubmission to receive the mount.
 
-Submitted GRPO v2 jobs save Ray timeline snapshots to
-`/runs/ray-timelines/<job-name>.json` every minute and on exit.
-Both `submit.py` and the driver print a viewer link. Install the shared viewer once:
+Open [Training jobs](http://localhost:8085/) to list running and queued jobs.
+The list refreshes every 10 seconds. Click **Ray dashboard** to open a running
+job's dashboard or **Timeline** to load its saved trace. Install or update the viewer:
 
 ```bash
 sudo bash infra/k3s/ray-timelines/install.sh
 ```
+
+Forward only **8085** through your IDE or SSH. Dashboards are proxied at
+`/dashboard/<job-name>/`; no per-job port-forward is needed. The viewer's service
+account can list Jobs and Pods only in `training`. Dashboard targets are resolved
+from running Pods owned by those Jobs. Submitted GRPO v2 jobs bind Ray to the Pod
+network; dashboards stop when Ray exits.
+
+Ray 2.59 requires a login token by default. Expand **Dashboard login token** in the
+list for its retrieval command, also printed by `submit.py`. Paste the token into
+Ray's login dialog; cookies are scoped to each job. The viewer does not read tokens
+or execute commands in training Pods.
+
+Submitted GRPO v2 jobs save Ray timeline snapshots to
+`/runs/ray-timelines/<job-name>.json` every minute and on exit.
+Both `submit.py` and the driver print a viewer link when profiling is enabled.
 
 Forward **8085** through your IDE or SSH and open the printed
 `http://localhost:8085/?job=<job-name>` link. The page waits for the first snapshot,

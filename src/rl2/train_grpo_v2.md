@@ -89,29 +89,27 @@ The YAML config uses the same interpolation and validation as PPO/MAPPO. It cont
 
 The dashboard starts automatically at <http://localhost:8265> for local runs. The project's `ray[default]` dependency includes the dashboard dependencies in submitted images.
 
-For `submit.py` jobs, run the printed command once the job's Pod is running:
+For `submit.py` jobs, open [Training jobs](http://localhost:8085/) and click **Ray dashboard** beside a running job. The list refreshes every 10 seconds and also shows queued jobs and timeline links. Install or update the [shared viewer](../../infra/k3s/README.md#shared-on-disk-checkpoints) once; forward only **8085** through your IDE or SSH when browsing remotely. Each dashboard opens at `/dashboard/<job-name>/`, so multiple jobs can be viewed without separate port-forwards.
 
-```bash
-sudo k3s kubectl -n training port-forward --address=127.0.0.1 job/<job-name> 8265:8265
-```
+Submission sets `RL2_RAY_DASHBOARD_HOST=0.0.0.0` inside the Pod; local runs bind to loopback by default. The dashboard is available only while Ray is running.
 
-Leave it running and open <http://localhost:8265>. Forward **8265** through your IDE or SSH when browsing from another machine. Submission sets `RL2_RAY_DASHBOARD_HOST=0.0.0.0` inside the Pod; local runs bind to loopback by default. The dashboard is available only while Ray is running. Existing jobs need resubmission. To view another job concurrently, use a different local port, such as `8266:8265`, and open that port.
-
-Ray 2.59 enables token authentication by default. Retrieve the token with the printed command and enter it on the dashboard's login page:
+Ray 2.59 enables token authentication by default. Expand **Dashboard login token** in the jobs list, or use the command printed by `submit.py`, and enter its token in Ray's login dialog:
 
 ```bash
 sudo k3s kubectl -n training exec job/<job-name> -c train -- ray get-auth-token
 ```
 
-For local runs, use `uv run ray get-auth-token`.
+Logins are scoped to each job. For local runs, use `uv run ray get-auth-token`.
 
 ### Ray timeline
 
-Timeline collection is enabled automatically, including jobs launched with `submit.py`:
+Timeline collection is disabled by default. Set this in the training YAML to enable profiling and snapshot exports, including jobs launched with `submit.py`:
 
-```bash
-./submit.py --gpus 2 -- uv run python -m rl2.train_grpo_v2 --config configs/grpo_v2/codegym.yaml
+```yaml
+enable_ray_timeline: true
 ```
+
+`submit.py` supplies the output path and viewer URL but does not enable collection; the training config controls it.
 
 The driver logs the trace path and saves a snapshot every 60 seconds and before Ray shuts down, including when training raises an exception. Local snapshots are replaced atomically; abrupt termination can lose events since the last successful export. Ray's event-retention limits still apply, so snapshots are not an unlimited history.
 
