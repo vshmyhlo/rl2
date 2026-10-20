@@ -73,9 +73,16 @@ def job_manifest(args: argparse.Namespace, name: str, image: str) -> dict[str, A
                             "workingDir": "/app",
                             # Kubelet expands dollar references even without a shell.
                             "command": [arg.replace("$", "$$") for arg in args.command],
+                            "ports": [{"name": "ray-dashboard", "containerPort": 8265}],
                             "env": [
                                 {"name": "MLFLOW_TRACKING_URI", "value": "http://mlflow.mlflow.svc.cluster.local:5000"},
+                                {
+                                    "name": "OTEL_EXPORTER_OTLP_ENDPOINT",
+                                    "value": "http://tempo.monitoring.svc.cluster.local:4317",
+                                },
+                                {"name": "OTEL_RESOURCE_ATTRIBUTES", "value": f"k8s.job.name={name}"},
                                 {"name": "JAX_PLATFORMS", "value": "cuda,cpu"},
+                                {"name": "RL2_RAY_DASHBOARD_HOST", "value": "0.0.0.0"},
                                 {"name": "RL2_RAY_TIMELINE_PATH", "value": f"/runs/ray-timelines/{name}.json"},
                                 {"name": "RL2_RAY_TIMELINE_URL", "value": f"http://localhost:8085/?job={name}"},
                                 {"name": "NVIDIA_DRIVER_CAPABILITIES", "value": "compute,utility,graphics"},
@@ -193,6 +200,9 @@ def submit_jobs(args: argparse.Namespace, manifests: list[dict[str, Any]], image
         )
         print(f"Status: sudo k3s kubectl -n training get job {name}")
         print(f"Logs:   sudo k3s kubectl -n training logs -f job/{name}")
+        print("Ray dashboard (while GRPO v2 is running): http://localhost:8265")
+        print(f"  sudo k3s kubectl -n training port-forward --address=127.0.0.1 job/{name} 8265:8265")
+        print(f"  Login token: sudo k3s kubectl -n training exec job/{name} -c train -- ray get-auth-token")
         print(f"Ray timeline (when recorded): http://localhost:8085/?job={name}")
     return names
 

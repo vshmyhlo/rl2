@@ -89,6 +89,7 @@ import verifiers.v1 as vf
 import yaml
 from flax.training.train_state import TrainState
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from opentelemetry.trace import StatusCode
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass as config_dataclass
 from ray._private import profiling
@@ -114,6 +115,7 @@ from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import Parameters, Qwen3LM, load_qwen3_checkpoint
 from rl2.ray_timeline import record_timeline
 from rl2.toolrl_env import TOOLRL_TRAIN_FILE, ToolRLTaskset, ToolRLTasksetConfig
+from rl2.tracing import flush_tracing, span, tracing_enabled
 from rl2.utils import group_advantages
 
 logger = logging.getLogger(__name__)
@@ -173,6 +175,7 @@ class Config(BaseConfig):
     total_iterations: Annotated[int | None, Field(ge=1)] = None
     checkpoint_interval: Annotated[int, Field(gt=0)] = 100
     max_tokens: Annotated[int, Field(ge=1)] = 512
+    padding_multiple: Annotated[int, Field(ge=1)] = 256
     max_turns: Annotated[int, Field(ge=1)] = 3
     rollout_timeout: Annotated[float, Field(gt=0)] = 120
     environment_timeout: Annotated[float, Field(gt=0)] = 600
@@ -626,14 +629,15 @@ def wait_for_server(server: subprocess.Popen[bytes], timeout: float = 600) -> No
 # Ray leaves GPUs visible to CPU workers; JAX unpickles arrays onto its default device.
 @ray.remote(runtime_env={"env_vars": {"JAX_PLATFORMS": "cpu"}})
 class Batcher:
-    def __init__(self, actor: ActorHandle) -> None:
+    def __init__(self, actor: ActorHandle, config: Config = DEFAULT_CONFIG) -> None:
         self.actor = actor
+        self.config = config
 
     def prepare_batch(self, groups: list[RolloutGroup], context_length: int) -> GRPOBatch:
         """Flatten rollout groups in order and right-pad their transcripts into CPU JAX arrays.
 
         B is the total rollout count; T is the longest transcript length rounded up
-        to a multiple of 128, capped at context_length. Padding is zero/False, and
+        to a multiple of config.padding_multiple, capped at context_length. Padding is zero/False, and
         transcripts are never truncated. Existing rollout advantages are preserved.
 
         Returns:
@@ -653,7 +657,8 @@ class Batcher:
         length = max(len(rollout.sequence.token_ids) for rollout in rollouts)
         if length > context_length:
             raise ValueError(f"Rollout length {length} exceeds model context length {context_length}")
-        width = min((length + 127) // 128 * 128, context_length)
+        multiple = self.config.padding_multiple
+        width = min((length + multiple - 1) // multiple * multiple, context_length)
         with jax.default_device(jax.devices("cpu")[0]):
             padded: list[dict[str, jax.Array]] = []  # (T,) leaves per rollout.
             for rollout in rollouts:
@@ -699,7 +704,7 @@ class Batcher:
         results = await asyncio.gather(*(fetch_group() for _ in range(num_groups)))
         fetched = time.monotonic()
         groups = [group for group, _ in results]
-        with profiling.profile("batcher.prepare_batch"):
+        with profiling.profile("batcher.prepare_batch"), span("batcher.prepare_batch"):
             training_batch = self.prepare_batch(groups, context_length=context_length)  # (B, T), (B,) leaves.
         prepared = time.monotonic()
         batch = build_rollout_batch(
@@ -783,75 +788,101 @@ class Learner:
             logger.info("Starting GRPO training loop")
             while self.config.total_iterations is None or iteration < self.config.total_iterations:
                 iteration += 1
-                started = time.monotonic()
-                with profiling.profile("learner.fetch_batch", extra_data={"iteration": str(iteration)}):
-                    batch = self.fetch_next_batch(num_groups=self.config.num_groups, group_size=self.config.group_size)
-                fetched = time.monotonic()
-                with profiling.profile("learner.optimize", extra_data={"iteration": str(iteration)}):
-                    update_metrics = self.optimize(batch.training_batch)
-                optimized = time.monotonic()
-                with profiling.profile("learner.publish_weights", extra_data={"iteration": str(iteration)}):
-                    self.publish_weights()
-                now = time.monotonic()
-                num_rollouts = batch.training_batch.token_ids.shape[0]
-                stop_conditions.update(batch.stop_counts)
-                total_rollouts += num_rollouts
-                seconds = max(now - started, 1e-9)
-                scalars = {
-                    **update_metrics,
-                    **batch.transfer_metrics,
-                    **batch.rollout_metrics,
-                    **{
-                        f"charts/stop_condition_fraction/{condition}": batch.stop_counts.get(condition, 0)
-                        / num_rollouts
-                        for condition in sorted(stop_conditions)
-                    },
-                    "charts/total_iterations": iteration,
-                    "charts/total_updates": int(self.state.step),
-                    "charts/learning_rate": self.config.learning_rate,
-                    "charts/total_rollouts": total_rollouts,
-                    "time/learner/iterations_per_second": 1 / seconds,
-                    "time/learner/rollouts_per_second": num_rollouts / seconds,
-                    "time/learner/output_tokens_per_second": batch.num_output_tokens / seconds,
-                    "time/learner/batch_fetch_seconds": fetched - started,
-                    "time/learner/update_seconds": optimized - fetched,
-                    "time/learner/weight_transfer_seconds": now - optimized,
-                    "time/learner/iteration_seconds": now - started,
-                }
-                logger.info(
-                    "iteration=%s reward=%.3f degenerate_group_fraction=%.3f batch=%.2fs "
-                    "group_transfer=%.6fs batch_transfer=%.6fs loss=%.4f update=%.2fs weights=%.2fs",
-                    iteration,
-                    scalars["charts/reward_mean"],
-                    scalars["charts/degenerate_group_fraction"],
-                    scalars["time/learner/batch_fetch_seconds"],
-                    scalars["time/batcher/actor_to_batcher_seconds"],
-                    scalars["time/learner/batcher_to_learner_seconds"],
-                    scalars["losses/policy"],
-                    scalars["time/learner/update_seconds"],
-                    scalars["time/learner/weight_transfer_seconds"],
-                )
-                if iteration % 10 == 0:
-                    with profiling.profile("learner.log_examples", extra_data={"iteration": str(iteration)}):
-                        examples = f"Rollout examples | step {iteration}\n\n{batch.examples}"
-                        logger.info("\n%s", examples)
-                        writer.log_text(examples, f"examples/{iteration}.txt")
-                if iteration % self.config.checkpoint_interval == 0 or iteration == self.config.total_iterations:
-                    with profiling.profile("learner.checkpoint", extra_data={"iteration": str(iteration)}):
-                        scalars["time/checkpoint_seconds"] = save_checkpoint(
-                            manager,
-                            TrainingProgress(
-                                train_state=self.state,
-                                shuffle_key=self.shuffle_key,  # ()
-                                iteration=iteration,
-                                total_rollouts=total_rollouts,
-                                sampling_state=ray.get(self.actor.get_sampling_state.remote()),
-                                stop_conditions=tuple(sorted(stop_conditions)),
-                            ),
-                            self.config,
+                # Each iteration is a separate trace, including its remote calls and child tasks.
+                with span(
+                    "train.iteration",
+                    {"run_id": self.config.run_id or writer.run_id, "iteration": iteration, "model": self.config.model},
+                    root=True,
+                ):
+                    started = time.monotonic()
+                    with (
+                        profiling.profile("learner.fetch_batch", extra_data={"iteration": str(iteration)}),
+                        span("learner.fetch_batch"),
+                    ):
+                        batch = self.fetch_next_batch(
+                            num_groups=self.config.num_groups, group_size=self.config.group_size
                         )
-                with profiling.profile("learner.log_metrics", extra_data={"iteration": str(iteration)}):
-                    writer.log_metrics(scalars, step=iteration)
+                    fetched = time.monotonic()
+                    with (
+                        profiling.profile("learner.optimize", extra_data={"iteration": str(iteration)}),
+                        span("learner.optimize"),
+                    ):
+                        update_metrics = self.optimize(batch.training_batch)
+                    optimized = time.monotonic()
+                    with (
+                        profiling.profile("learner.publish_weights", extra_data={"iteration": str(iteration)}),
+                        span("learner.publish_weights"),
+                    ):
+                        self.publish_weights()
+                    now = time.monotonic()
+                    num_rollouts = batch.training_batch.token_ids.shape[0]
+                    stop_conditions.update(batch.stop_counts)
+                    total_rollouts += num_rollouts
+                    seconds = max(now - started, 1e-9)
+                    scalars = {
+                        **update_metrics,
+                        **batch.transfer_metrics,
+                        **batch.rollout_metrics,
+                        **{
+                            f"charts/stop_condition_fraction/{condition}": batch.stop_counts.get(condition, 0)
+                            / num_rollouts
+                            for condition in sorted(stop_conditions)
+                        },
+                        "charts/total_iterations": iteration,
+                        "charts/total_updates": int(self.state.step),
+                        "charts/learning_rate": self.config.learning_rate,
+                        "charts/total_rollouts": total_rollouts,
+                        "time/learner/iterations_per_second": 1 / seconds,
+                        "time/learner/rollouts_per_second": num_rollouts / seconds,
+                        "time/learner/output_tokens_per_second": batch.num_output_tokens / seconds,
+                        "time/learner/batch_fetch_seconds": fetched - started,
+                        "time/learner/update_seconds": optimized - fetched,
+                        "time/learner/weight_transfer_seconds": now - optimized,
+                        "time/learner/iteration_seconds": now - started,
+                    }
+                    logger.info(
+                        "iteration=%s reward=%.3f degenerate_group_fraction=%.3f batch=%.2fs "
+                        "group_transfer=%.6fs batch_transfer=%.6fs loss=%.4f update=%.2fs weights=%.2fs",
+                        iteration,
+                        scalars["charts/reward_mean"],
+                        scalars["charts/degenerate_group_fraction"],
+                        scalars["time/learner/batch_fetch_seconds"],
+                        scalars["time/batcher/actor_to_batcher_seconds"],
+                        scalars["time/learner/batcher_to_learner_seconds"],
+                        scalars["losses/policy"],
+                        scalars["time/learner/update_seconds"],
+                        scalars["time/learner/weight_transfer_seconds"],
+                    )
+                    if iteration % 10 == 0:
+                        with (
+                            profiling.profile("learner.log_examples", extra_data={"iteration": str(iteration)}),
+                            span("learner.log_examples"),
+                        ):
+                            examples = f"Rollout examples | step {iteration}\n\n{batch.examples}"
+                            logger.info("\n%s", examples)
+                            writer.log_text(examples, f"examples/{iteration}.txt")
+                    if iteration % self.config.checkpoint_interval == 0 or iteration == self.config.total_iterations:
+                        with (
+                            profiling.profile("learner.checkpoint", extra_data={"iteration": str(iteration)}),
+                            span("learner.checkpoint"),
+                        ):
+                            scalars["time/checkpoint_seconds"] = save_checkpoint(
+                                manager,
+                                TrainingProgress(
+                                    train_state=self.state,
+                                    shuffle_key=self.shuffle_key,  # ()
+                                    iteration=iteration,
+                                    total_rollouts=total_rollouts,
+                                    sampling_state=ray.get(self.actor.get_sampling_state.remote()),
+                                    stop_conditions=tuple(sorted(stop_conditions)),
+                                ),
+                                self.config,
+                            )
+                    with (
+                        profiling.profile("learner.log_metrics", extra_data={"iteration": str(iteration)}),
+                        span("learner.log_metrics"),
+                    ):
+                        writer.log_metrics(scalars, step=iteration)
 
     def fetch_next_batch(self, num_groups: int, group_size: int) -> RolloutBatch:
         logger.debug("Requesting batch: num_groups=%s group_size=%s", num_groups, group_size)
@@ -980,7 +1011,7 @@ class Actor:
             response.raise_for_status()
 
     async def update_weights(self, update_info: dict[str, Any]) -> None:
-        with profiling.profile("actor.update_weights"):
+        with profiling.profile("actor.update_weights"), span("actor.update_weights"):
             self._weights_valid = False
             logger.info("Receiving learner weights: tensors=%s", len(update_info["names"]))
             async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:
@@ -1006,28 +1037,39 @@ class Actor:
         started = time.monotonic()
         logger.info("Collecting group: task=%s group_size=%s", task.data.id, group_size)
         try:
-            with profiling.profile("actor.collect_group", extra_data=profile_data):
+            with (
+                profiling.profile("actor.collect_group", extra_data=profile_data),
+                span("actor.collect_group", {**profile_data, "run_id": self.config.run_id or "unspecified"}),
+            ):
                 async with create_agent(self.config) as agent, asyncio.TaskGroup() as pending:
 
                     async def run_rollout(index: int) -> vf.Trace:
-                        with profiling.profile(
-                            "actor.rollout", extra_data={**profile_data, "rollout_index": str(index)}
+                        with (
+                            profiling.profile(
+                                "actor.rollout", extra_data={**profile_data, "rollout_index": str(index)}
+                            ),
+                            span("actor.rollout", {**profile_data, "rollout_index": index}) as rollout_span,
                         ):
                             if isinstance(task, BenchmarkTask) and isinstance(
                                 self.config.taskset, (WebShopConfig, ALFWorldConfig, Tau2Config, AppWorldConfig)
                             ):
-                                return await task.run(
+                                result = await task.run(
                                     agent,
                                     self.config.taskset,
                                     self.config.max_turns,
                                     self.config.environment_timeout,
                                 )
-                            if isinstance(task, CodeGymTask) and self.config.taskset.id == "codegym":
-                                return await task.run(agent, self.config.taskset.manager_url)
-                            return await agent.run(task.defer_scoring())
+                            elif isinstance(task, CodeGymTask) and self.config.taskset.id == "codegym":
+                                result = await task.run(agent, self.config.taskset.manager_url)
+                            else:
+                                result = await agent.run(task.defer_scoring())
+                            rollout_span.set_attribute("stop_condition", result.stop_condition or "unspecified")
+                            if not result.ok:
+                                rollout_span.set_status(StatusCode.ERROR, "Rollout failed")
+                            return result
 
                     runs = [pending.create_task(run_rollout(index)) for index in range(group_size)]
-                with profiling.profile("actor.score_group", extra_data=profile_data):
+                with profiling.profile("actor.score_group", extra_data=profile_data), span("actor.score_group"):
                     group = await score_group(task, [run.result() for run in runs])
         except Exception:
             logger.exception(
@@ -1054,27 +1096,37 @@ def train(config: Config) -> None:
     )
     # The HTTP endpoint is shared over loopback by workers on this node.
     with (
+        ExitStack() as resources,
         ray.init(
             address="local",
+            include_dashboard=True,
+            dashboard_host=os.environ.get("RL2_RAY_DASHBOARD_HOST", "127.0.0.1"),
+            dashboard_port=8265,
             logging_config=ray.LoggingConfig(log_level="INFO"),
             runtime_env={"env_vars": {"RAY_PROFILING": "1"}},
             # Zero disables event reporting in Ray 2.59 despite the timeline docstring.
             _system_config={"enable_timeline": True, "task_events_report_interval_ms": 1000},
+            _tracing_startup_hook="rl2.tracing:setup_tracing" if tracing_enabled() else None,
         ),
         record_timeline(timeline_path),
     ):
+        resources.callback(flush_tracing)
         logger.info("Creating batcher, learner, and actor")
         actor = Actor.remote(config=config)
-        batcher = Batcher.remote(actor=actor)
+        batcher = Batcher.remote(actor=actor, config=config)
         learner = Learner.remote(batcher=batcher, actor=actor, config=config)
         try:
             logger.info("Starting learner")
             ray.get(learner.start.remote())
         finally:
-            logger.info("Requesting graceful learner and actor termination")
-            shutdown = [learner.__ray_terminate__.remote(), actor.__ray_terminate__.remote()]
+            logger.info("Requesting graceful worker termination")
+            shutdown = [
+                learner.__ray_terminate__.remote(),
+                actor.__ray_terminate__.remote(),
+                batcher.__ray_terminate__.remote(),
+            ]
             ray.wait(shutdown, num_returns=len(shutdown))
-            logger.info("Learner and actor termination finished")
+            logger.info("Worker termination finished")
 
 
 def main() -> None:

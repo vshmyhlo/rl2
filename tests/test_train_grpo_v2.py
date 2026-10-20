@@ -6,6 +6,8 @@ import pickle
 import runpy
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import ExitStack
 from dataclasses import asdict, replace
 from pathlib import Path
 from statistics import mean, pstdev
@@ -21,6 +23,10 @@ import pytest
 import renderers.base as renderer_base
 import verifiers.v1 as vf
 import yaml
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import ValidationError
 from ray import cloudpickle
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
@@ -36,12 +42,24 @@ from rl2.addition_env import AdditionTaskset, AdditionTools
 from rl2.toolrl_env import ToolCall, ToolRLData, ToolRLRenderer, ToolRLTask
 
 
+@pytest.fixture
+def spans(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(shutdown_on_exit=False)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(otel_trace, "get_tracer", Mock(return_value=provider.get_tracer("test")))
+    with ExitStack() as resources:
+        resources.callback(provider.shutdown)
+        yield exporter
+
+
 def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     defaults = training.Config()
     assert defaults.minibatches_per_epoch == 4
     assert defaults.grad_accum_steps == 1
     assert defaults.update_epochs == 1
     assert defaults.checkpoint_interval == 100
+    assert defaults.padding_multiple == 256
     assert defaults.gradient_checkpointing
     assert defaults.weight_update_pause_mode == "wait"
     preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/addition.yaml"
@@ -58,14 +76,22 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     path = tmp_path / "config.yaml"
     path.write_text(
         yaml.safe_dump(
-            asdict(config) | {"max_tokens": "${group_size}", "total_iterations": 1, "gradient_checkpointing": False}
+            asdict(config)
+            | {
+                "max_tokens": "${group_size}",
+                "total_iterations": 1,
+                "gradient_checkpointing": False,
+                "padding_multiple": 64,
+            }
         )
     )
     train = Mock()
     monkeypatch.setattr(training, "train", train)
     monkeypatch.setattr(sys, "argv", ["train_grpo_v2", "--config", str(path)])
     training.main()
-    train.assert_called_once_with(replace(config, max_tokens=4, total_iterations=1, gradient_checkpointing=False))
+    train.assert_called_once_with(
+        replace(config, max_tokens=4, total_iterations=1, gradient_checkpointing=False, padding_multiple=64)
+    )
     assert pickle.loads(pickle.dumps(config)) == config
 
 
@@ -78,6 +104,8 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
         {"checkpoint_interval": 0},
         {"checkpoint_interval": 1.5},
         {"max_tokens": 0},
+        {"padding_multiple": 0},
+        {"padding_multiple": 1.5},
         {"max_turns": 0},
         {"temperature": 0.001},
         {"temperature": 2.1},
@@ -594,6 +622,7 @@ def test_learner_logs_rollouts(
     learner: Any,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    spans: InMemorySpanExporter,
 ) -> None:
     caplog.set_level("INFO", logger=training.__name__)
     sequence = training.TrainingSequence(
@@ -757,6 +786,15 @@ def test_learner_logs_rollouts(
     ) in caplog.messages
     writer.__exit__.assert_called_once()
     assert writer.__exit__.call_args.args[0] is (RuntimeError if fails else None)
+    iterations = [item for item in spans.get_finished_spans() if item.name == "train.iteration"]
+    assert len(iterations) == 2
+    assert iterations[0].context.trace_id != iterations[1].context.trace_id
+    assert all(item.parent is None for item in iterations)
+    assert [item.attributes["iteration"] for item in iterations] == [1, 2]
+    assert iterations[-1].status.status_code == (otel_trace.StatusCode.ERROR if fails else otel_trace.StatusCode.UNSET)
+    for item in spans.get_finished_spans():
+        if item.name.startswith("learner."):
+            assert item.parent.span_id in {iteration.context.span_id for iteration in iterations}
 
 
 def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1040,13 +1078,20 @@ def test_actor_initializes_weight_receiver(actor: Any, monkeypatch: pytest.Monke
 
 @pytest.mark.parametrize("fails", [False, True])
 def test_train_gracefully_terminates_actor(fails: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    config = training.Config(ckpt_dir=str(tmp_path))
+    config = training.Config(ckpt_dir=str(tmp_path), padding_multiple=64)
     monkeypatch.delenv("RL2_RAY_TIMELINE_PATH", raising=False)
+    monkeypatch.delenv("RL2_RAY_DASHBOARD_HOST", raising=False)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://tempo:4317")
+    monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
+    flush = Mock()
+    monkeypatch.setattr(training, "flush_tracing", flush)
     if fails:
         monkeypatch.setenv("RL2_RAY_TIMELINE_PATH", str(tmp_path / "submitted" / "train-test.json"))
+        monkeypatch.setenv("RL2_RAY_DASHBOARD_HOST", "0.0.0.0")
     actor, batcher, learner = Mock(), Mock(), Mock()
     actor.__ray_terminate__ = Mock()
     learner.__ray_terminate__ = Mock()
+    batcher.__ray_terminate__ = Mock()
     monkeypatch.setattr(training, "Actor", Mock(remote=Mock(return_value=actor)))
     monkeypatch.setattr(training, "Batcher", Mock(remote=Mock(return_value=batcher)))
     monkeypatch.setattr(training, "Learner", Mock(remote=Mock(return_value=learner)))
@@ -1077,11 +1122,15 @@ def test_train_gracefully_terminates_actor(fails: bool, tmp_path: Path, monkeypa
     else:
         training.train(config)
     training.Actor.remote.assert_called_once_with(config=config)
-    training.Batcher.remote.assert_called_once_with(actor=actor)
+    training.Batcher.remote.assert_called_once_with(actor=actor, config=config)
     training.Learner.remote.assert_called_once_with(batcher=batcher, actor=actor, config=config)
     options = training.ray.init.call_args.kwargs
+    assert options["include_dashboard"] is True
+    assert options["dashboard_host"] == ("0.0.0.0" if fails else "127.0.0.1")
+    assert options["dashboard_port"] == 8265
     assert options["runtime_env"]["env_vars"]["RAY_PROFILING"] == "1"
     assert options["_system_config"] == {"enable_timeline": True, "task_events_report_interval_ms": 1000}
+    assert options["_tracing_startup_hook"] == "rl2.tracing:setup_tracing"
     traces = list((tmp_path / "submitted").glob("*.json") if fails else (tmp_path / "profiles").glob("ray-*.json"))
     assert len(traces) == 1
     assert json.loads(traces[0].read_text()) == [{"name": "training"}]
@@ -1089,8 +1138,15 @@ def test_train_gracefully_terminates_actor(fails: bool, tmp_path: Path, monkeypa
     actor.start.remote.assert_not_called()
     actor.__ray_terminate__.remote.assert_called_once_with()
     learner.__ray_terminate__.remote.assert_called_once_with()
+    batcher.__ray_terminate__.remote.assert_called_once_with()
+    flush.assert_called_once_with()
     wait.assert_called_once_with(
-        [learner.__ray_terminate__.remote.return_value, actor.__ray_terminate__.remote.return_value], num_returns=2
+        [
+            learner.__ray_terminate__.remote.return_value,
+            actor.__ray_terminate__.remote.return_value,
+            batcher.__ray_terminate__.remote.return_value,
+        ],
+        num_returns=3,
     )
     if fails:
         get.assert_not_called()
@@ -1146,7 +1202,9 @@ def test_group_requires_multiple_rollouts(size: int, actor: Any) -> None:
 
 
 @pytest.mark.parametrize("failure", [None, "rollout", "score", "tokens"])
-def test_actor_returns_only_complete_groups(failure: str | None, actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_actor_returns_only_complete_groups(
+    failure: str | None, actor: Any, monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
+) -> None:
     task = actor.tasks[0]
     traces = [
         vf.Trace(
@@ -1198,6 +1256,13 @@ def test_actor_returns_only_complete_groups(failure: str | None, actor: Any, mon
     assert all(sample.data == task.data and sample.scoring_deferred for sample in seen)
     assert not task.scoring_deferred
     env.__aexit__.assert_awaited_once()
+    finished = spans.get_finished_spans()
+    parent = next(item for item in finished if item.name == "actor.collect_group")
+    rollouts = [item for item in finished if item.name == "actor.rollout"]
+    assert len(rollouts) == 2
+    assert all(item.parent.span_id == parent.context.span_id for item in rollouts)
+    assert parent.status.status_code == (otel_trace.StatusCode.ERROR if failure else otel_trace.StatusCode.UNSET)
+    assert sum(item.status.status_code == otel_trace.StatusCode.ERROR for item in rollouts) == (failure == "rollout")
     if not failure:
         assert group.task_id == task.data.id
         assert [rollout.reward for rollout in group.rollouts] == [1.0, 0.0]
@@ -1298,7 +1363,7 @@ def test_training_sequence_rejects_invalid_tokens(failure: str, message: str, to
 
 
 def test_batcher_collects_groups_concurrently(
-    actor: Any, token_trace: vf.Trace, monkeypatch: pytest.MonkeyPatch
+    actor: Any, token_trace: vf.Trace, monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
 ) -> None:
     all_started = asyncio.Event()
     started = 0
@@ -1307,11 +1372,13 @@ def test_batcher_collects_groups_concurrently(
 
     async def run(task: vf.Task) -> vf.Trace:
         nonlocal started
+        before = otel_trace.get_current_span().get_span_context()
         started += 1
         if started == 4:
             all_started.set()
         # A serialized actor would wait forever for the second group's rollouts.
         await all_started.wait()
+        assert otel_trace.get_current_span().get_span_context() == before
         return token_trace.model_copy(deep=True, update={"ok": True})
 
     env.run.side_effect = run
@@ -1322,8 +1389,11 @@ def test_batcher_collects_groups_concurrently(
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=handle)
 
     async def collect() -> training.Transfer[training.RolloutBatch]:
-        async with asyncio.timeout(5):
-            return await batcher.fetch_next_batch(num_groups=2, group_size=2, context_length=16)
+        with training.span("test.batch") as parent:
+            async with asyncio.timeout(5):
+                result = await batcher.fetch_next_batch(num_groups=2, group_size=2, context_length=16)
+            assert otel_trace.get_current_span() is parent
+            return result
 
     batch = asyncio.run(collect()).value
     assert started == 4
@@ -1331,9 +1401,23 @@ def test_batcher_collects_groups_concurrently(
     assert f"Example 3 | task={actor.tasks[1].data.id}" in batch.examples
     assert batch.training_batch.token_ids.shape == (4, 16)
     assert env.__aexit__.await_count == 2
+    finished = spans.get_finished_spans()
+    groups = {item.attributes["group_id"]: item for item in finished if item.name == "actor.collect_group"}
+    rollouts = [item for item in finished if item.name == "actor.rollout"]
+    root = next(item for item in finished if item.name == "test.batch")
+    assert len(groups) == 2 and len(rollouts) == 4
+    assert all(item.parent.span_id == root.context.span_id for item in groups.values())
+    assert len({item.context.span_id for item in rollouts}) == 4
+    for item in rollouts:
+        parent = groups[item.attributes["group_id"]]
+        assert item.parent.span_id == parent.context.span_id
+        assert item.context.trace_id == parent.context.trace_id
+    assert not otel_trace.get_current_span().get_span_context().is_valid
 
 
-def test_group_cancels_pending_rollouts(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_group_cancels_pending_rollouts(
+    actor: Any, monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
+) -> None:
     env = AsyncMock()
     env.__aenter__.return_value = env
     started = asyncio.Event()
@@ -1354,10 +1438,24 @@ def test_group_cancels_pending_rollouts(actor: Any, monkeypatch: pytest.MonkeyPa
 
     env.run.side_effect = run
     monkeypatch.setattr(training, "create_agent", Mock(return_value=env))
+
+    async def collect() -> None:
+        with training.span("test.parent") as parent:
+            try:
+                await actor.collect_group(actor.tasks[0], group_size=2)
+            except ExceptionGroup:
+                assert otel_trace.get_current_span() is parent
+                raise
+
     with pytest.raises(ExceptionGroup, match="TaskGroup"):
-        asyncio.run(actor.collect_group(actor.tasks[0], group_size=2))
+        asyncio.run(collect())
     assert cancelled == [True]
     env.__aexit__.assert_awaited_once()
+    finished = spans.get_finished_spans()
+    assert len(finished) == 4  # Both rollouts, their group, and the caller end.
+    assert all(item.status.status_code == otel_trace.StatusCode.ERROR for item in finished)
+    assert sum(item.attributes.get("cancelled", False) for item in finished) == 1
+    assert not otel_trace.get_current_span().get_span_context().is_valid
 
 
 @pytest.fixture

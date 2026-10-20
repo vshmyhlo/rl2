@@ -85,6 +85,26 @@ The actor and batcher set `JAX_PLATFORMS=cpu` through their Ray runtime environm
 
 The YAML config uses the same interpolation and validation as PPO/MAPPO. It controls the model, task sampling seed, batch dimensions, sampling limits, temperature, run ID, and optional `total_iterations` (`null` runs until interrupted). `ckpt_dir` stores profiling artifacts and Orbax checkpoints under `checkpoints/`. Checkpoints save every `checkpoint_interval` completed iterations (default 100) and at normal completion, retaining the latest two. Restarting with the same `ckpt_dir` automatically restores the latest checkpoint: model parameters, optimizer state and step, shuffle key, task sampling RNG, cumulative iteration/rollout counts, and observed stop-condition labels. Restored weights are published before collecting new rollouts. `total_iterations` is the cumulative target, so raising it extends a completed run; `null` runs until interrupted. Interrupted or failed iterations resume from the last completed checkpoint. Live environments and vLLM generation state restart fresh, so continuation is not bit-for-bit reproducible. The current config controls resumed training; saved config is informational. Use a new directory for incompatible model changes or a fresh run. Local and `gs://` checkpoint paths are supported.
 
+### Ray dashboard
+
+The dashboard starts automatically at <http://localhost:8265> for local runs. The project's `ray[default]` dependency includes the dashboard dependencies in submitted images.
+
+For `submit.py` jobs, run the printed command once the job's Pod is running:
+
+```bash
+sudo k3s kubectl -n training port-forward --address=127.0.0.1 job/<job-name> 8265:8265
+```
+
+Leave it running and open <http://localhost:8265>. Forward **8265** through your IDE or SSH when browsing from another machine. Submission sets `RL2_RAY_DASHBOARD_HOST=0.0.0.0` inside the Pod; local runs bind to loopback by default. The dashboard is available only while Ray is running. Existing jobs need resubmission. To view another job concurrently, use a different local port, such as `8266:8265`, and open that port.
+
+Ray 2.59 enables token authentication by default. Retrieve the token with the printed command and enter it on the dashboard's login page:
+
+```bash
+sudo k3s kubectl -n training exec job/<job-name> -c train -- ray get-auth-token
+```
+
+For local runs, use `uv run ray get-auth-token`.
+
 ### Ray timeline
 
 Timeline collection is enabled automatically, including jobs launched with `submit.py`:
@@ -105,7 +125,34 @@ sudo k3s kubectl -n training cp <pod>:<logged-trace-path> ./ray-timeline.json -c
 
 After the Pod exits, retrieve the file from the PVC's [host backing directory](../../infra/k3s/README.md#shared-on-disk-checkpoints); paths below `/runs/` are relative to that directory. Live `uv run ray timeline` export also works inside the running container.
 
-Worker tracks include actor calls, `batcher.prepare_batch`, and the learner's `fetch_batch`, `optimize`, `publish_weights`, and `checkpoint` phases with iteration metadata. These measure host-side intervals, not GPU kernels or subprocess internals. Custom spans use Ray's private profiling API. The trainer explicitly uses a positive event-reporting interval: setting `RAY_task_events_report_interval_ms=0` disables reporting in Ray 2.59 despite its outdated timeline docstring. Dashboard dependencies are not required.
+Worker tracks include actor calls, `batcher.prepare_batch`, and the learner's `fetch_batch`, `optimize`, `publish_weights`, and `checkpoint` phases with iteration metadata. These measure host-side intervals, not GPU kernels or subprocess internals. Custom spans use Ray's private profiling API. The trainer explicitly uses a positive event-reporting interval: setting `RAY_task_events_report_interval_ms=0` disables reporting in Ray 2.59 despite its outdated timeline docstring.
+
+OpenTelemetry tracing is enabled when `OTEL_EXPORTER_OTLP_ENDPOINT` or
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set. `submit.py` supplies the cluster's
+Tempo gRPC endpoint and adds `k8s.job.name` to every span. New GRPO jobs therefore
+export automatically; set `OTEL_SDK_DISABLED=true` to disable tracing.
+For local runs, forward Tempo's port 4317 and launch with:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
+  uv run python -m rl2.train_grpo_v2 --config configs/grpo_v2/addition.yaml
+```
+
+In [Grafana Explore](http://localhost:8082/explore), select **Tempo** and search
+`{ resource.service.name = "rl2" && name = "train.iteration" }`.
+Each iteration has a separate trace tagged with `run_id`, `iteration`, and `model`.
+Spans cover Ray calls, batch preparation, rollout groups and individual rollouts,
+scoring, optimization, weight publication, logging, and checkpoints.
+Groups carry `group_id` and `task_id`; rollouts add `rollout_index` and
+`stop_condition`. These are host-side intervals, not GPU kernel timings or
+individual model/tool calls inside a rollout.
+
+Ray's startup hook configures an OTLP gRPC batch exporter in the driver and each
+worker. Ray propagates context across actor calls; child asyncio tasks inherit
+the group context and open their own spans inside the task. Exceptions and
+cancellation end spans and restore the previous context. Graceful worker exit
+flushes queued spans; abrupt process termination can lose buffered spans.
+See [Tempo access instructions](../../infra/k3s/README.md#opentelemetry-traces-with-tempo).
 
 MLflow uses the shared `MLflowLogger`, experiment `grpo_v2`, and standard `MLFLOW_TRACKING_URI` / experiment environment variables. The [module docstring](train_grpo_v2.py) documents every metric key, its meaning, aggregation, and logging cadence. Model size and learner setup time are logged at the restored iteration (zero for a new run); iteration metrics are logged after each completed iteration, and `time/checkpoint_seconds` only on saves. Setup timing starts before learner model loading and includes checkpoint restoration, NCCL initialization, and initial weight publication. Iteration timing and throughput include collection, optimization, and weight transfer, excluding metric/example logging and checkpoint saves. Cumulative iteration, update, and rollout counters continue across restarts. Config parameters, resolved YAML at `config/<iteration>.yaml`, learner console output, and rollout examples every 10 iterations are also saved.
 
@@ -121,7 +168,7 @@ The learner loads BF16 Qwen3 weights through `qwen3.py`, keeps FP32 master param
 
 BF16 mixed-precision training is always enabled; no precision flag is needed. Model projections and activations use BF16, while master weights, gradient accumulation, Adam moments, log-probabilities, and the GRPO loss use FP32. Normalization and other sensitive model operations also use FP32 internally. Keeping master weights in FP32 preserves updates smaller than BF16 can represent. vLLM rollouts also use BF16.
 
-GRPO replays each complete transcript with causal next-token alignment. The loss is the clipped importance-ratio objective, averaged over sampled tokens within each rollout and then over rollouts; prompts, tool results, and padding have no direct loss. No reference-policy KL penalty is applied. Variable-length transcripts are right-padded to multiples of 128, capped at the model context length; overlong transcripts are rejected without truncation. Each new JIT trace of the training update logs its minibatch shape, gradient accumulation steps, temperature, and clipping coefficient; cached executions stay silent.
+GRPO replays each complete transcript with causal next-token alignment. The loss is the clipped importance-ratio objective, averaged over sampled tokens within each rollout and then over rollouts; prompts, tool results, and padding have no direct loss. No reference-policy KL penalty is applied. Variable-length transcripts are right-padded to multiples of `padding_multiple` (default: `256`; set to `1` to disable rounding), capped at the model context length; overlong transcripts are rejected without truncation. Each new JIT trace of the training update logs its minibatch shape, gradient accumulation steps, temperature, and clipping coefficient; cached executions stay silent.
 
 `gradient_checkpointing` defaults to `true`: the learner recomputes each decoder layer during backpropagation to reduce activation memory at the cost of extra computation. Set `gradient_checkpointing: false` in YAML to disable it. KV-cache decoding is unchanged.
 

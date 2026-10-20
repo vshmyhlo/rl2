@@ -28,6 +28,8 @@ def test_default_gpu_job() -> None:
     assert container["workingDir"] == "/app"
     env = {entry["name"]: entry["value"] for entry in container["env"]}
     assert env["JAX_PLATFORMS"] == "cuda,cpu"
+    assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://tempo.monitoring.svc.cluster.local:4317"
+    assert env["OTEL_RESOURCE_ATTRIBUTES"] == "k8s.job.name=train-test"
     assert "NVIDIA_VISIBLE_DEVICES" not in env  # The device plugin supplies the allocated GPU IDs.
     assert "CUDA_VISIBLE_DEVICES" not in env
     assert set(env["NVIDIA_DRIVER_CAPABILITIES"].split(",")) >= {"compute", "utility", "graphics"}
@@ -57,6 +59,8 @@ def test_grpo_timeline_directory_is_persistent() -> None:
     assert container["command"] == args.command
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "2"
     assert env["RL2_RAY_TIMELINE_URL"] == "http://localhost:8085/?job=train-grpo"
+    assert env["RL2_RAY_DASHBOARD_HOST"] == "0.0.0.0"
+    assert container["ports"] == [{"name": "ray-dashboard", "containerPort": 8265}]
 
 
 @pytest.mark.parametrize(
@@ -133,6 +137,9 @@ def test_build_and_submit_preserves_command(
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "2"
     output = capsys.readouterr().out
     assert "priority=high, GPU=2" in output
+    assert "Ray dashboard (while GRPO v2 is running): http://localhost:8265" in output
+    assert f"sudo k3s kubectl -n training port-forward --address=127.0.0.1 job/{names[0]} 8265:8265" in output
+    assert f"sudo k3s kubectl -n training exec job/{names[0]} -c train -- ray get-auth-token" in output
     assert f"Ray timeline (when recorded): http://localhost:8085/?job={names[0]}" in output
     assert f"type=image,name={container['image']},unpack=true" in build.args[0]
     preview = next(call for call in calls if "--dry-run=server" in call.args[0])

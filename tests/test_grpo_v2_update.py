@@ -53,7 +53,7 @@ def groups() -> list[training.RolloutGroup]:
     ]
 
 
-@pytest.mark.parametrize("context_length,width", [(512, 128), (5, 5)], ids=["bucketed", "context-boundary"])
+@pytest.mark.parametrize("context_length,width", [(512, 256), (5, 5)], ids=["bucketed", "context-boundary"])
 def test_prepare_batch(batcher: Any, groups: list[training.RolloutGroup], context_length: int, width: int) -> None:
     batch = batcher.prepare_batch(groups, context_length=context_length)
     assert batch.token_ids.shape == batch.attention_mask.shape == batch.loss_mask.shape == (2, width)
@@ -76,11 +76,14 @@ def test_prepare_batch(batcher: Any, groups: list[training.RolloutGroup], contex
 
 
 @pytest.mark.parametrize(
-    "length,context_length,width",
-    [(256, 512, 256), (257, 512, 384), (257, 300, 300)],
-    ids=["exact-bucket", "next-bucket", "context-cap"],
+    "length,context_length,multiple,width",
+    [(4, 16, 4, 4), (5, 16, 4, 8), (5, 6, 4, 6), (5, 16, 1, 5)],
+    ids=["exact-bucket", "next-bucket", "context-cap", "no-rounding"],
 )
-def test_prepare_batch_bucket_boundaries(batcher: Any, length: int, context_length: int, width: int) -> None:
+def test_prepare_batch_bucket_boundaries(length: int, context_length: int, multiple: int, width: int) -> None:
+    batcher = training.Batcher.__ray_metadata__.modified_class(
+        actor=Mock(), config=training.Config(padding_multiple=multiple)
+    )
     sample = rollout([1] * length, [False] + [True] * (length - 1), 1.0)
     groups = [training.RolloutGroup(task_id="0", prompt="test", rollouts=[sample])]
     batch = batcher.prepare_batch(groups, context_length=context_length)  # (B=1, T=width), (B,) leaves.
