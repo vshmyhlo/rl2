@@ -24,6 +24,7 @@
 <header>
   <a href="/">All jobs</a>
   <strong id="title">Ray timeline</strong>
+  <a id="tempo" target="_blank" rel="noopener" hidden>Tempo traces ↗</a>
   <span id="status" role="status">Waiting for snapshot…</span>
   <button id="refresh" type="button">Load latest</button>
 </header>
@@ -57,6 +58,27 @@
   };
   document.getElementById("refresh").onclick = () => location.reload();
 
+  function tempoUrl(jobName) {
+    const panes = {
+      tempo: {
+        datasource: "tempo",
+        queries: [{
+          refId: "A",
+          datasource: {type: "tempo", uid: "tempo"},
+          queryType: "traceql",
+          query: `{ resource.service.name = "rl2" && resource.k8s.job.name = ${JSON.stringify(jobName)} }`,
+          limit: 20,
+          tableType: "traces",
+          editorMode: "code",
+        }],
+        range: {from: "now-1h", to: "now"},
+        compact: false,
+      },
+    };
+    const params = new URLSearchParams({schemaVersion: "1", panes: JSON.stringify(panes), orgId: "1"});
+    return `http://localhost:8082/explore?${params}`;
+  }
+
   async function loadJobs() {
     try {
       const response = await fetch("/api/jobs", {cache: "no-store"});
@@ -82,6 +104,12 @@
         timeline.href = `/?job=${encodeURIComponent(item.name)}`;
         timeline.textContent = "Timeline";
         links.append(timeline);
+        const tempo = document.createElement("a");
+        tempo.href = tempoUrl(item.name);
+        tempo.textContent = "Tempo traces ↗";
+        tempo.target = "_blank";
+        tempo.rel = "noopener";
+        links.append(tempo);
       }
       document.getElementById("empty").hidden = jobs.length !== 0;
       status.textContent = `Updated ${new Date().toLocaleTimeString()}`;
@@ -127,6 +155,9 @@
     }
     document.getElementById("title").textContent = job;
     document.title = `${job} · Ray timeline`;
+    const tempo = document.getElementById("tempo");
+    tempo.href = tempoUrl(job);
+    tempo.hidden = false;
     let response;
     while (true) {
       response = await fetch(`/traces/${encodeURIComponent(job)}.json`, {cache: "no-store"});

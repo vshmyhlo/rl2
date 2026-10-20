@@ -26,6 +26,7 @@ def test_default_gpu_job() -> None:
     container = pod["containers"][0]
     assert container["imagePullPolicy"] == "Never"
     assert container["workingDir"] == "/app"
+    assert container["securityContext"] == {"capabilities": {"add": ["SYS_PTRACE"]}}
     env = {entry["name"]: entry["value"] for entry in container["env"]}
     assert env["JAX_PLATFORMS"] == "cuda,cpu"
     assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://tempo.monitoring.svc.cluster.local:4317"

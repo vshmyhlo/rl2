@@ -74,6 +74,7 @@ def job_manifest(args: argparse.Namespace, name: str, image: str) -> dict[str, A
                             # Kubelet expands dollar references even without a shell.
                             "command": [arg.replace("$", "$$") for arg in args.command],
                             "ports": [{"name": "ray-dashboard", "containerPort": 8265}],
+                            "securityContext": {"capabilities": {"add": ["SYS_PTRACE"]}},
                             "env": [
                                 {"name": "MLFLOW_TRACKING_URI", "value": "http://mlflow.mlflow.svc.cluster.local:5000"},
                                 {

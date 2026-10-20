@@ -343,37 +343,10 @@ def test_actor_and_learner_each_reserve_one_gpu() -> None:
     assert training.Batcher._default_options.get("num_gpus", 0) == 0
 
 
-def test_rollout_workers_keep_deserialized_arrays_on_cpu() -> None:
+def test_rollout_workers_restrict_accidental_jax_gpu_use() -> None:
     actor_env = training.Actor._default_options.get("runtime_env", {}).get("env_vars", {})
     batcher_env = training.Batcher._default_options.get("runtime_env", {}).get("env_vars", {})
     assert actor_env == batcher_env == {"JAX_PLATFORMS": "cpu"}
-    # Start fresh: backend selection must precede imports and Ray deserialization.
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            """
-import os
-import pickle
-import jax
-import jax.numpy as jnp
-
-with jax.default_device(jax.devices("cpu")[0]):
-    payload = pickle.dumps(jnp.asarray([1, 2], dtype=jnp.int32))  # (2,)
-restored = pickle.loads(payload)  # (2,)
-assert restored.device.platform == "cpu"
-assert restored.shape == (2,) and restored.tolist() == [1, 2]
-assert {device.platform for device in jax.devices()} == {"cpu"}
-assert os.environ["CUDA_VISIBLE_DEVICES"] == "0"
-""",
-        ],
-        env={**os.environ, "JAX_PLATFORMS": "cuda,cpu", "CUDA_VISIBLE_DEVICES": "0", **batcher_env},
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
-    assert result.returncode == 0, result.stderr
 
 
 def test_script_actor_serialization() -> None:
@@ -467,9 +440,9 @@ def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPa
 def rollout() -> training.Rollout:
     return training.Rollout(
         sequence=training.TrainingSequence(
-            token_ids=jnp.array([1, 2], dtype=jnp.int32),  # (T=2,)
-            loss_mask=jnp.array([False, True]),  # (T=2,)
-            old_log_probs=jnp.array([0.0, -0.2], dtype=jnp.float32),  # (T=2,)
+            token_ids=np.array([1, 2], dtype=np.int32),  # (T=2,)
+            loss_mask=np.array([False, True]),  # (T=2,)
+            old_log_probs=np.array([0.0, -0.2], dtype=np.float32),  # (T=2,)
         ),
         reward=1.0,
         advantage=0.5,
@@ -564,7 +537,7 @@ def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
     learner.batcher.fetch_next_batch.remote.side_effect = batcher.fetch_next_batch
     prepare_batch = batcher.prepare_batch
 
-    def prepare(groups: list[training.RolloutGroup], context_length: int) -> training.GRPOBatch:
+    def prepare(groups: list[training.RolloutGroup], context_length: int) -> training.GRPOBatch[np.ndarray]:
         batch = prepare_batch(groups, context_length=context_length)  # (B, T), (B,) leaves.
         clock.return_value += 2.0
         return batch  # (B, T), (B,) leaves.
@@ -641,9 +614,9 @@ def test_learner_logs_rollouts(
 ) -> None:
     caplog.set_level("INFO", logger=training.__name__)
     sequence = training.TrainingSequence(
-        token_ids=jnp.array([1], dtype=jnp.int32),  # (T=1,)
-        loss_mask=jnp.array([True]),  # (T=1,)
-        old_log_probs=jnp.array([-0.2], dtype=jnp.float32),  # (T=1,)
+        token_ids=np.array([1], dtype=np.int32),  # (T=1,)
+        loss_mask=np.array([True]),  # (T=1,)
+        old_log_probs=np.array([-0.2], dtype=np.float32),  # (T=1,)
     )
     rollout = training.Rollout(
         sequence=sequence,
@@ -713,7 +686,7 @@ def test_learner_logs_rollouts(
     learner.fetch_next_batch.side_effect = [received, RuntimeError("done") if fails else next_batch]
     learner.publish_weights = steps.publish
 
-    def optimize(batch: training.GRPOBatch) -> dict[str, float]:
+    def optimize(batch: training.GRPOBatch[np.ndarray]) -> dict[str, float]:
         assert batch is prepared
         learner.state = learner.state.replace(step=learner.state.step + 1)
         return {"losses/policy": -0.25}
@@ -841,7 +814,7 @@ def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.Monke
             },
         )
 
-    def optimize(batch: training.GRPOBatch) -> dict[str, float]:
+    def optimize(batch: training.GRPOBatch[np.ndarray]) -> dict[str, float]:
         learner.state = learner.state.replace(
             step=learner.state.step + learner.config.update_epochs * learner.config.minibatches_per_epoch
         )
@@ -898,9 +871,9 @@ def test_learner_logs_examples_every_ten_steps(
     monkeypatch.setattr(training.profiling, "profile", profile)
     rollout = training.Rollout(
         sequence=training.TrainingSequence(
-            token_ids=jnp.array([1, 2], dtype=jnp.int32),  # (T=2,)
-            loss_mask=jnp.array([False, True]),  # (T=2,)
-            old_log_probs=jnp.array([0.0, -0.2], dtype=jnp.float32),  # (T=2,)
+            token_ids=np.array([1, 2], dtype=np.int32),  # (T=2,)
+            loss_mask=np.array([False, True]),  # (T=2,)
+            old_log_probs=np.array([0.0, -0.2], dtype=np.float32),  # (T=2,)
         ),
         reward=1.0,
         advantage=0.5,
@@ -1120,6 +1093,7 @@ def test_train_gracefully_terminates_actor(
     monkeypatch.delenv("RL2_RAY_TIMELINE_PATH", raising=False)
     monkeypatch.delenv("RL2_RAY_DASHBOARD_HOST", raising=False)
     monkeypatch.setenv("RAY_AUTH_MODE", "token")
+    monkeypatch.setenv("RAY_DASHBOARD_ENABLE_PROFILING", "0" if enable_dashboard else "1")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://tempo:4317")
     monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
     flush = Mock()
@@ -1135,7 +1109,12 @@ def test_train_gracefully_terminates_actor(
     monkeypatch.setattr(training, "Actor", Mock(remote=Mock(return_value=actor)))
     monkeypatch.setattr(training, "Batcher", Mock(remote=Mock(return_value=batcher)))
     monkeypatch.setattr(training, "Learner", Mock(remote=Mock(return_value=learner)))
-    monkeypatch.setattr(training.ray, "init", MagicMock())
+
+    def initialize_ray(**kwargs: Any) -> MagicMock:
+        assert os.environ["RAY_DASHBOARD_ENABLE_PROFILING"] == ("1" if enable_dashboard else "0")
+        return training.ray.init.return_value
+
+    monkeypatch.setattr(training.ray, "init", MagicMock(side_effect=initialize_ray))
     timeline = Mock(return_value=[{"name": "training"}])
     monkeypatch.setattr(training.ray, "timeline", timeline)
     get = Mock()
@@ -1361,11 +1340,29 @@ def test_training_sequence_preserves_tokens_and_masks_context(token_trace: vf.Tr
     np.testing.assert_array_equal(sequence.loss_mask, [False, True, False, True, True][:length])
     np.testing.assert_allclose(sequence.old_log_probs, [0.0, -0.2, 0.0, -0.4, -0.5][:length])
     assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape == (length,)
-    assert all(isinstance(value, jax.Array) and value.device.platform == "cpu" for value in asdict(sequence).values())
-    assert sequence.token_ids.dtype == jnp.int32
-    assert sequence.loss_mask.dtype == jnp.bool_
-    assert sequence.old_log_probs.dtype == jnp.float32
+    assert all(isinstance(value, np.ndarray) for value in asdict(sequence).values())
+    assert sequence.token_ids.dtype == np.int32
+    assert sequence.loss_mask.dtype == np.bool_
+    assert sequence.old_log_probs.dtype == np.float32
     jax.tree.map(np.testing.assert_array_equal, asdict(pickle.loads(pickle.dumps(sequence))), asdict(sequence))
+
+
+@pytest.mark.parametrize("rewards", [[-1.0, 0.0, 2.0], [0.7] * 8], ids=["population-std", "fractional-ties"])
+def test_score_group_normalizes_rewards(
+    rewards: list[float], token_trace: vf.Trace, actor: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = actor.tasks[0]
+    monkeypatch.setattr(task, "score", AsyncMock())
+    traces = [token_trace.model_copy(deep=True, update={"ok": True}) for _ in rewards]
+    for trace, reward in zip(traces, rewards, strict=True):
+        trace.record_reward("test", reward)
+    group = asyncio.run(training.score_group(task, traces))
+    expected = [(reward - mean(rewards)) / (pstdev(rewards) + 1e-4) for reward in rewards]
+    assert len(group.rollouts) == len(rewards)
+    assert [rollout.reward for rollout in group.rollouts] == rewards
+    assert [rollout.advantage for rollout in group.rollouts] == pytest.approx(expected, rel=1e-6, abs=1e-7)
+    if len(set(rewards)) == 1:
+        assert all(rollout.advantage == 0.0 for rollout in group.rollouts)
 
 
 @pytest.mark.parametrize(
@@ -1411,6 +1408,9 @@ def test_training_sequence_rejects_invalid_tokens(failure: str, message: str, to
 def test_batcher_collects_groups_concurrently(
     actor: Any, token_trace: vf.Trace, monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
 ) -> None:
+    # Actor scoring, transcript construction, and batching must work without JAX.
+    monkeypatch.setattr(training, "jax", Mock(spec=[]))
+    monkeypatch.setattr(training, "jnp", Mock(spec=[]))
     all_started = asyncio.Event()
     started = 0
     env = AsyncMock()
@@ -1446,6 +1446,7 @@ def test_batcher_collects_groups_concurrently(
     assert f"Example 1 | task={actor.tasks[0].data.id}" in batch.examples
     assert f"Example 3 | task={actor.tasks[1].data.id}" in batch.examples
     assert batch.training_batch.token_ids.shape == (4, 16)
+    assert all(isinstance(value, np.ndarray) for value in batch.training_batch)
     assert env.__aexit__.await_count == 2
     finished = spans.get_finished_spans()
     groups = {item.attributes["group_id"]: item for item in finished if item.name == "actor.collect_group"}

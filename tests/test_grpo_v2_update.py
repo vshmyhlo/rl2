@@ -1,4 +1,5 @@
 import logging
+import pickle
 from dataclasses import replace
 from functools import partial
 from typing import Any
@@ -19,9 +20,9 @@ from rl2.qwen3 import Parameters, Qwen3Config, Qwen3LM, Qwen3Output, Variables
 def rollout(tokens: list[int], mask: list[bool], advantage: float) -> training.Rollout:
     return training.Rollout(
         sequence=training.TrainingSequence(
-            token_ids=jnp.asarray(tokens, dtype=jnp.int32),  # (T,)
-            loss_mask=jnp.asarray(mask, dtype=jnp.bool_),  # (T,)
-            old_log_probs=jnp.zeros(len(tokens), dtype=jnp.float32),  # (T,)
+            token_ids=np.asarray(tokens, dtype=np.int32),  # (T,)
+            loss_mask=np.asarray(mask, dtype=np.bool_),  # (T,)
+            old_log_probs=np.zeros(len(tokens), dtype=np.float32),  # (T,)
         ),
         reward=float(advantage > 0),
         advantage=advantage,
@@ -58,17 +59,21 @@ def test_prepare_batch(batcher: Any, groups: list[training.RolloutGroup], contex
     for index, sample in enumerate(groups[0].rollouts):
         sequence = replace(
             sample.sequence,
-            old_log_probs=-jnp.arange(len(sample.sequence.token_ids), dtype=jnp.float32) / 10,  # (L,)
+            old_log_probs=-np.arange(len(sample.sequence.token_ids), dtype=np.float32) / 10,  # (L,)
         )
         groups[0].rollouts[index] = replace(sample, sequence=sequence)
     batch = batcher.prepare_batch(groups, context_length=context_length)  # (B=2, T=width), (B,) leaves.
     assert batch.token_ids.shape == batch.attention_mask.shape == batch.loss_mask.shape == (2, width)
     assert batch.old_log_probs.shape == (2, width)
     assert batch.advantages.shape == (2,)
-    assert all(array.device.platform == "cpu" for array in batch)
-    assert batch.token_ids.dtype == jnp.int32
-    assert batch.attention_mask.dtype == batch.loss_mask.dtype == jnp.bool_
-    assert batch.old_log_probs.dtype == batch.advantages.dtype == jnp.float32
+    assert all(isinstance(array, np.ndarray) for array in batch)
+    assert batch.token_ids.dtype == np.int32
+    assert batch.attention_mask.dtype == batch.loss_mask.dtype == np.bool_
+    assert batch.old_log_probs.dtype == batch.advantages.dtype == np.float32
+    restored = pickle.loads(pickle.dumps(batch))  # (B, T), (B,) leaves.
+    for original, value in zip(batch, restored, strict=True):
+        assert isinstance(value, np.ndarray)
+        np.testing.assert_array_equal(value, original)
     np.testing.assert_array_equal(batch.token_ids[0, :5], [1, 2, 3, 4, 5])
     np.testing.assert_array_equal(batch.token_ids[1, :3], [1, 2, 6])
     np.testing.assert_array_equal(batch.attention_mask.sum(axis=1), [5, 3])
@@ -187,8 +192,8 @@ def state(model: Qwen3LM) -> TrainState:
 
 
 @pytest.fixture
-def batch(batcher: Any, groups: list[training.RolloutGroup], state: TrainState) -> training.GRPOBatch:
-    batch = batcher.prepare_batch(groups, context_length=8)
+def batch(batcher: Any, groups: list[training.RolloutGroup], state: TrainState) -> training.GRPOBatch[jax.Array]:
+    batch = jax.device_put(batcher.prepare_batch(groups, context_length=8))  # (B, T), (B,) leaves.
     old = training.token_log_probs(state, state.params, batch, temperature=0.7)  # (B=2, T-1=7)
     return batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))
 
@@ -329,11 +334,12 @@ def test_learner_shuffles_each_epoch_and_averages_metrics(
         return current.replace(step=current.step + 1), {"losses/policy": jnp.asarray(current.step)}  # () metric.
 
     monkeypatch.setattr(training, "update", update)
-    metrics = learner.optimize(batch)
+    host_batch = jax.tree.map(np.asarray, batch)  # (B, T), (B,) leaves.
+    metrics = learner.optimize(host_batch)
     steps = epochs * minibatches
     assert int(learner.state.step) == steps
     assert metrics == {"losses/policy": (steps - 1) / 2}
-    learner.optimize(batch)
+    learner.optimize(host_batch)
     orders: list[np.ndarray] = []  # Each epoch: (B,).
     for start in range(0, len(observed), minibatches):
         epoch = jax.tree.map(
@@ -347,7 +353,7 @@ def test_learner_shuffles_each_epoch_and_averages_metrics(
     assert all(not np.array_equal(orders[0], order) for order in orders[1:])
     learner.state = state
     observed.clear()
-    learner.optimize(batch)
+    learner.optimize(host_batch)
     replay = jnp.concatenate([minibatch.advantages for minibatch in observed])  # (epochs * B,)
     np.testing.assert_array_equal(replay, np.concatenate(orders[:epochs]))
 
@@ -359,7 +365,7 @@ def test_learner_rejects_indivisible_rollout_batch(state: TrainState, batch: tra
     learner.mesh = Mesh(devices=np.array([jax.devices()[0]]), axis_names=("batch",))
     learner.state = state
     with pytest.raises(ValueError, match="minibatches_per_epoch must divide the rollout batch size"):
-        learner.optimize(batch)
+        learner.optimize(jax.tree.map(np.asarray, batch))
     assert int(learner.state.step) == 0
 
 
@@ -383,10 +389,13 @@ def test_learner_optimizes_and_publishes_updated_bf16_weights(
     learner._transfer_group = Mock()
     groups = groups + [replace(groups[0], rollouts=list(reversed(groups[0].rollouts)))]
     batch = batcher.prepare_batch(groups, context_length=8)  # (B=4, T=8), (B,) leaves.
-    old = training.token_log_probs(learner.state, learner.state.params, batch, temperature=0.7)  # (B, T-1)
+    old = training.token_log_probs(
+        learner.state, learner.state.params, jax.device_put(batch), temperature=0.7
+    )  # (B, T-1)
     assert old.shape == (4, 7)
     assert old.dtype == jnp.float32
-    batch = batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))
+    batch = batch._replace(old_log_probs=np.pad(np.asarray(old), ((0, 0), (1, 0))))  # (B, T), (B,) leaves.
+    assert all(isinstance(value, np.ndarray) for value in batch)
     actual_update = training.update
     steps: list[int] = []
 

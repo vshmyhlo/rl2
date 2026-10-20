@@ -563,13 +563,15 @@ one machine, not a backup. Existing Jobs need resubmission to receive the mount.
 
 Open [Training jobs](http://localhost:8085/) to list running and queued jobs.
 The list refreshes every 10 seconds. Click **Ray dashboard** to open a running
-job's dashboard or **Timeline** to load its saved trace. Install or update the viewer:
+job's dashboard, **Timeline** to load its saved trace, or **Tempo traces** to search
+Grafana for that job's `rl2` traces over the last hour. Tempo links also appear in
+the timeline view and require Grafana port **8082** forwarded. Install or update the viewer:
 
 ```bash
 sudo bash infra/k3s/ray-timelines/install.sh
 ```
 
-Forward only **8085** through your IDE or SSH. Dashboards are proxied at
+Forward **8085** through your IDE or SSH for timelines and Ray dashboards. Dashboards are proxied at
 `/dashboard/<job-name>/`; no per-job port-forward is needed. The viewer's service
 account can list Jobs and Pods only in `training`. Dashboard targets are resolved
 from running Pods owned by those Jobs. Submitted GRPO v2 jobs bind Ray to the Pod

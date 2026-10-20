@@ -90,6 +90,7 @@ import verifiers.v1 as vf
 import yaml
 from flax.training.train_state import TrainState
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from numpy.typing import NDArray
 from opentelemetry.trace import StatusCode
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass as config_dataclass
@@ -117,7 +118,6 @@ from rl2.qwen3 import Parameters, Qwen3LM, load_qwen3_checkpoint
 from rl2.ray_timeline import record_timeline
 from rl2.toolrl_env import TOOLRL_TRAIN_FILE, ToolRLTaskset, ToolRLTasksetConfig
 from rl2.tracing import flush_tracing, span, tracing_enabled
-from rl2.utils import group_advantages
 
 logger = logging.getLogger(__name__)
 MODEL = "Qwen/Qwen3-0.6B"
@@ -296,9 +296,9 @@ def restore_checkpoint(
 
 @dataclass(frozen=True)
 class TrainingSequence:
-    token_ids: jax.Array  # (T,) int32 exact context and generated tokens in one sequence.
-    loss_mask: jax.Array  # (T,) bool train on sampled tokens only; exclude prompts and tool results.
-    old_log_probs: jax.Array  # (T,) float32 sampling-policy log-probabilities; ignored where loss_mask is False.
+    token_ids: NDArray[np.int32]  # (T,) exact context and generated tokens in one sequence.
+    loss_mask: NDArray[np.bool_]  # (T,) train on sampled tokens only; exclude prompts and tool results.
+    old_log_probs: NDArray[np.float32]  # (T,) sampling-policy log-probabilities; ignored where loss_mask is False.
 
 
 @dataclass(frozen=True)
@@ -344,12 +344,12 @@ def format_rollout_examples(groups: list[RolloutGroup]) -> str:
     return "\n\n".join(sections)
 
 
-class GRPOBatch(NamedTuple):
-    token_ids: jax.Array  # (B, T) Right-padded complete transcripts.
-    attention_mask: jax.Array  # (B, T) True for context and sampled tokens, excluding padding.
-    loss_mask: jax.Array  # (B, T) True only for sampled tokens.
-    old_log_probs: jax.Array  # (B, T) Temperature-scaled sampling-policy log-probabilities.
-    advantages: jax.Array  # (B,) Normalized within each rollout group.
+class GRPOBatch[Array: np.ndarray | jax.Array](NamedTuple):
+    token_ids: Array  # (B, T) int32 right-padded complete transcripts.
+    attention_mask: Array  # (B, T) bool context and sampled tokens, excluding padding.
+    loss_mask: Array  # (B, T) bool sampled tokens only.
+    old_log_probs: Array  # (B, T) float32 temperature-scaled sampling-policy log-probabilities.
+    advantages: Array  # (B,) float32 normalized within each rollout group.
 
 
 # ---
@@ -357,7 +357,7 @@ class GRPOBatch(NamedTuple):
 
 @dataclass(frozen=True)
 class RolloutBatch:
-    training_batch: GRPOBatch  # Leaves: (B, T), except advantages: (B,).
+    training_batch: GRPOBatch[np.ndarray]  # Leaves: (B, T), except advantages: (B,).
     rollout_metrics: dict[str, float]
     stop_counts: dict[str, int]
     num_output_tokens: int
@@ -367,7 +367,7 @@ class RolloutBatch:
 
 def build_rollout_batch(
     groups: list[RolloutGroup],
-    training_batch: GRPOBatch,  # Leaves: (B, T), except advantages: (B,).
+    training_batch: GRPOBatch[np.ndarray],  # Leaves: (B, T), except advantages: (B,).
     transfer_metrics: dict[str, float | int],
 ) -> RolloutBatch:
     """Keep only training arrays and the summaries used by learner logging."""
@@ -404,7 +404,7 @@ Metrics = dict[str, jax.Array]  # Scalar leaves.
 def token_log_probs(
     state: TrainState,
     params: Parameters,  # HF parameter shapes.
-    batch: GRPOBatch,
+    batch: GRPOBatch[jax.Array],  # (B, T), (B,) leaves.
     temperature: float,
 ) -> jax.Array:  # (B, T-1)
     """(B, T-1) log-probabilities for tokens at positions 1 through T-1."""
@@ -420,7 +420,7 @@ def token_log_probs(
 
 def objective(
     log_probs: jax.Array,  # (B, T-1)
-    batch: GRPOBatch,
+    batch: GRPOBatch[jax.Array],  # (B, T), (B,) leaves.
     clip_coef: float,
 ) -> tuple[jax.Array, Metrics]:  # (), scalar metric leaves
     mask = batch.loss_mask[:, 1:]  # (B, T-1)
@@ -451,7 +451,7 @@ def create_state(model: Qwen3LM, params: Parameters, config: Config) -> TrainSta
 @partial(jax.jit, static_argnames=("grad_accum_steps", "temperature", "clip_coef"), donate_argnums=(0,))
 def update(
     state: TrainState,
-    batch: GRPOBatch,  # One optimizer minibatch: (B, T), (B,) leaves.
+    batch: GRPOBatch[jax.Array],  # One optimizer minibatch: (B, T), (B,) leaves.
     *,
     grad_accum_steps: int,
     temperature: float,
@@ -473,7 +473,10 @@ def update(
         lambda value: value.reshape(grad_accum_steps, microbatch_size, *value.shape[1:]), batch
     )  # (A, B/A, T); advantages: (A, B/A). A = grad_accum_steps.
 
-    def accumulate(grads: Parameters, microbatch: GRPOBatch) -> tuple[Parameters, Metrics]:
+    def accumulate(
+        grads: Parameters,
+        microbatch: GRPOBatch[jax.Array],  # (B/A, T), (B/A,) leaves.
+    ) -> tuple[Parameters, Metrics]:
         def loss_fn(params: Parameters) -> tuple[jax.Array, Metrics]:  # (), scalar metric leaves
             return objective(token_log_probs(state, params, microbatch, temperature), microbatch, clip_coef)
 
@@ -504,12 +507,11 @@ def training_sequence(trace: vf.Trace) -> TrainingSequence:
         # Verifiers otherwise fills missing log-probabilities with zeros.
         if len(node.logprobs) != sum(node.mask):
             raise ValueError("Each sampled token must have a log-probability")
-    with jax.default_device(jax.devices("cpu")[0]):
-        return TrainingSequence(
-            token_ids=jnp.asarray(branch.token_ids, dtype=jnp.int32),  # (T,)
-            loss_mask=jnp.asarray(branch.sampled_mask, dtype=jnp.bool_),  # (T,)
-            old_log_probs=jnp.asarray(branch.logprobs, dtype=jnp.float32),  # (T,)
-        )
+    return TrainingSequence(
+        token_ids=np.asarray(branch.token_ids, dtype=np.int32),  # (T,)
+        loss_mask=np.asarray(branch.sampled_mask, dtype=np.bool_),  # (T,)
+        old_log_probs=np.asarray(branch.logprobs, dtype=np.float32),  # (T,)
+    )
 
 
 async def score_group(task: vf.Task, traces: list[vf.Trace]) -> RolloutGroup:
@@ -523,10 +525,11 @@ async def score_group(task: vf.Task, traces: list[vf.Trace]) -> RolloutGroup:
     async with asyncio.timeout(30):
         for trace in traces:
             await task.score(trace)
-    # Keep reward arithmetic on CPU so vLLM has the actor GPU to itself.
-    with jax.default_device(jax.devices("cpu")[0]):
-        rewards = jnp.asarray([trace.reward for trace in traces], dtype=jnp.float32)  # (G,)
-        advantages = group_advantages(rewards)  # (G,)
+    rewards = np.asarray([trace.reward for trace in traces], dtype=np.float32)  # (G,)
+    # Equal fractional rewards can round to a different mean in float32.
+    advantages = (
+        np.zeros_like(rewards) if (rewards == rewards[0]).all() else (rewards - rewards.mean()) / (rewards.std() + 1e-4)
+    )  # (G,)
     return RolloutGroup(
         task_id=task.data.id,
         prompt=task.data.prompt_text,
@@ -630,15 +633,15 @@ def wait_for_server(server: subprocess.Popen[bytes], timeout: float = 600) -> No
     raise TimeoutError(f"vLLM was not ready within {timeout}s at {SERVER_URL}")
 
 
-# Ray leaves GPUs visible to CPU workers; JAX unpickles arrays onto its default device.
+# Shared imports must not initialize CUDA in rollout workers.
 @ray.remote(runtime_env={"env_vars": {"JAX_PLATFORMS": "cpu"}})
 class Batcher:
     def __init__(self, actor: ActorHandle, config: Config = DEFAULT_CONFIG) -> None:
         self.actor = actor
         self.config = config
 
-    def prepare_batch(self, groups: list[RolloutGroup], context_length: int) -> GRPOBatch:
-        """Flatten rollout groups in order and right-pad their transcripts into CPU JAX arrays.
+    def prepare_batch(self, groups: list[RolloutGroup], context_length: int) -> GRPOBatch[np.ndarray]:
+        """Flatten rollout groups in order and right-pad their transcripts into NumPy arrays.
 
         B is the total rollout count; T is the longest transcript length rounded up
         to a multiple of config.padding_multiple, capped at context_length. Padding is zero/False, and
@@ -673,22 +676,15 @@ class Batcher:
             "advantages": np.asarray([rollout.advantage for rollout in rollouts], dtype=np.float32),  # (B,)
         }
         for index, rollout in enumerate(rollouts):
-            sequence = jax.tree.map(
-                np.asarray,
-                {
-                    "token_ids": rollout.sequence.token_ids,  # (L,) unpadded transcript length.
-                    "loss_mask": rollout.sequence.loss_mask,  # (L,)
-                    "old_log_probs": rollout.sequence.old_log_probs,  # (L,)
-                },
-            )  # (L,) leaves.
-            length = len(sequence["token_ids"])
-            mask = sequence["loss_mask"]  # (L,)
+            sequence = rollout.sequence
+            length = len(sequence.token_ids)
+            mask = sequence.loss_mask  # (L,) unpadded transcript length.
             if length < 2 or mask[0] or not mask[1:].any():
                 raise ValueError("Each rollout needs context followed by at least one sampled token")
-            for name, values in sequence.items():  # values: (L,)
-                arrays[name][index, :length] = values
+            for name in ("token_ids", "loss_mask", "old_log_probs"):
+                arrays[name][index, :length] = getattr(sequence, name)  # (L,)
             arrays["attention_mask"][index, :length] = True
-        return GRPOBatch(**jax.device_put(arrays, jax.devices("cpu")[0]))  # (B, T), (B,) leaves.
+        return GRPOBatch(**arrays)  # (B, T), (B,) leaves.
 
     async def fetch_next_batch(self, num_groups: int, group_size: int, context_length: int) -> Transfer[RolloutBatch]:
         if num_groups < 1:
@@ -939,8 +935,10 @@ class Learner:
         ray.get(pending)
         logger.info("Weights published: elapsed=%.2fs", time.monotonic() - started)
 
-    def optimize(self, batch: GRPOBatch) -> dict[str, float]:  # Batch leaves: (B, T), (B,).
-        batch = jax.device_put(batch, NamedSharding(self.mesh, PartitionSpec("batch")))  # (B, T), (B,) leaves.
+    def optimize(self, batch: GRPOBatch[np.ndarray]) -> dict[str, float]:  # Batch leaves: (B, T), (B,).
+        device_batch: GRPOBatch[jax.Array] = jax.device_put(
+            batch, NamedSharding(self.mesh, PartitionSpec("batch"))
+        )  # (B, T), (B,) leaves.
         if batch.token_ids.shape[0] % self.config.minibatches_per_epoch:
             raise ValueError("minibatches_per_epoch must divide the rollout batch size")
         minibatch_size = batch.token_ids.shape[0] // self.config.minibatches_per_epoch
@@ -949,7 +947,7 @@ class Learner:
             key = jax.random.fold_in(self.shuffle_key, self.state.step)  # () typed PRNG key.
             permutation = jax.random.permutation(key, batch.token_ids.shape[0])  # (B,)
             shuffled = jax.tree.map(
-                lambda value, permutation=permutation: value[permutation], batch
+                lambda value, permutation=permutation: value[permutation], device_batch
             )  # (B, T), (B,) leaves.
             for start in range(0, batch.token_ids.shape[0], minibatch_size):
                 minibatch = jax.tree.map(
@@ -1099,6 +1097,7 @@ class Actor:
 
 def train(config: Config) -> None:
     os.environ["RAY_AUTH_MODE"] = "disabled"
+    os.environ["RAY_DASHBOARD_ENABLE_PROFILING"] = "1" if config.enable_ray_dashboard else "0"
     timeline_path = os.environ.get(
         "RL2_RAY_TIMELINE_PATH", posixpath.join(config.ckpt_dir, "profiles", f"ray-{uuid4().hex}.json")
     )
