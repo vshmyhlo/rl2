@@ -1,11 +1,8 @@
 import asyncio
-import io
 import json
-import os
-import sys
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -131,8 +128,12 @@ def test_dataset_path_is_independent_of_working_directory(
 
 @pytest.mark.parametrize("ids", [["a", "b"], [], ["a", "a"], [""]], ids=["valid", "empty", "duplicate", "empty-id"])
 def test_task_discovery(ids: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
-    process = Mock(return_value=Mock(stdout=json.dumps(ids)))
-    monkeypatch.setattr(env.subprocess, "run", process)
+    discover = Mock()
+    get = Mock(return_value=ids)
+    cancel = Mock()
+    monkeypatch.setattr(env, "discover_games_remote", discover)
+    monkeypatch.setattr(env.ray, "get", get)
+    monkeypatch.setattr(env.ray, "cancel", cancel)
     config = env.ALFWorldConfig(config_file="config.yaml")
     if ids == ["a", "b"]:
         tasks = env.load_alfworld_tasks(config, max_steps=3, timeout=10)
@@ -141,66 +142,104 @@ def test_task_discovery(ids: list[str], monkeypatch: pytest.MonkeyPatch) -> None
     else:
         with pytest.raises(ValueError, match="nonempty and unique"):
             env.load_alfworld_tasks(config, max_steps=3, timeout=10)
-    assert process.call_args.kwargs["timeout"] == 10
-    assert process.call_args.args[0][-2:] == ["3", "--list"]
+    discover.remote.assert_called_once_with(str(Path("config.yaml").resolve()), 3)
+    get.assert_called_once_with(discover.remote.return_value, timeout=10)
+    cancel.assert_called_once_with(discover.remote.return_value, force=True)
 
 
-def test_worker_protocol(monkeypatch: pytest.MonkeyPatch) -> None:
-    output = io.StringIO()
+def test_task_discovery_timeout_cancels_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    discover = Mock()
+    cancel = Mock()
+    monkeypatch.setattr(env, "discover_games_remote", discover)
+    monkeypatch.setattr(env.ray, "get", Mock(side_effect=env.ray.exceptions.GetTimeoutError))
+    monkeypatch.setattr(env.ray, "cancel", cancel)
+    with pytest.raises(env.ray.exceptions.GetTimeoutError):
+        env.load_alfworld_tasks(env.ALFWorldConfig(config_file="config.yaml"), max_steps=2, timeout=1)
+    cancel.assert_called_once_with(discover.remote.return_value, force=True)
+
+
+def test_worker_reset_step_and_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
     environment = Mock()
     environment.reset.return_value = env.EpisodeResult(observation="Goal", reward=0.0, done=False)
     environment.step.return_value = env.EpisodeResult(observation="Success", reward=1.0, done=True)
     environment.commands = ["look"]
     constructor = Mock(return_value=environment)
     monkeypatch.setattr(env, "ALFWorld", constructor)
-    monkeypatch.setattr(sys, "argv", ["worker", "config.yaml", "2", "train/a"])
-    monkeypatch.setattr(
-        sys, "stdin", io.StringIO('null\n{"name":"look","arguments":{}}\n{"name":"look","arguments":{}}\n')
+    worker = env.ALFWorldWorker.__ray_metadata__.modified_class(
+        task=env.ALFWorldTask(id="train/a", config_file="config.yaml"), max_steps=2
     )
-    monkeypatch.setattr(sys, "stdout", output)
-    env.main()
+    with closing(worker):
+        rewards = [worker.reset().reward]
+        rewards.extend(worker.step(env.ToolCall(name="look", arguments={})).reward for _ in range(2))
     constructor.assert_called_once_with(config_file="config.yaml", max_steps=2, task_id="train/a")
-    assert [json.loads(line)["reward"] for line in output.getvalue().splitlines()] == [0.0, 0.0, 1.0]
+    assert rewards == [0.0, 0.0, 1.0]
     environment.step.assert_called_once_with("look")
     environment.close.assert_called_once()
 
 
-@pytest.mark.parametrize("mode", ["normal", "crash", "timeout", "cancel"])
-def test_session_process_cleanup(mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    worker = tmp_path / "worker.py"
-    worker.write_text("""import json
-import sys
-import time
-mode = sys.argv[-1]
-for line in sys.stdin:
-    if mode == "crash":
-        raise RuntimeError("worker failed")
-    print(json.dumps({"observation": "ready", "reward": 0.0, "done": False}), flush=True)
-    if mode in {"timeout", "cancel"}:
-        time.sleep(60)
-""")
-    monkeypatch.setattr(env, "worker_command", Mock(return_value=[sys.executable, str(worker)]))
+@pytest.mark.parametrize("mode", ["normal", "crash", "reset_timeout", "step_timeout", "cancel", "close_error"])
+def test_session_actor_cleanup(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    actor = Mock()
+    worker = Mock(remote=Mock(return_value=actor))
+    kill = Mock()
+    monkeypatch.setattr(env, "ALFWorldWorker", worker)
+    monkeypatch.setattr(env.ray, "kill", kill)
     task = env.ALFWorldTask(id=mode, config_file="unused")
-    session = env.ALFWorldSession(task=task, max_steps=2, timeout=0.1 if mode == "timeout" else 5)
 
     async def run() -> None:
-        async with session:
-            result = await session.request()
-            assert result.observation == "ready"
-            if mode == "timeout":
-                await session.request(env.ToolCall(name="look", arguments={}))
-            if mode == "cancel":
-                raise asyncio.CancelledError
+        async def reset() -> env.EpisodeResult:
+            if mode == "crash":
+                raise RuntimeError("worker failed")
+            if mode == "reset_timeout":
+                await asyncio.Future()
+            return env.EpisodeResult(observation="ready", reward=0.0, done=False)
 
-    error = {"crash": RuntimeError, "timeout": TimeoutError, "cancel": asyncio.CancelledError}.get(mode)
+        async def step(action: env.ToolCall) -> env.EpisodeResult:
+            assert action == env.ToolCall(name="look", arguments={})
+            if mode in {"step_timeout", "cancel"}:
+                if mode == "cancel":
+                    asyncio.get_running_loop().call_soon(current.cancel)
+                await asyncio.Future()
+            return env.EpisodeResult(observation="stepped", reward=1.0, done=True)
+
+        async def close() -> None:
+            if mode == "close_error":
+                raise RuntimeError("close failed")
+
+        current = asyncio.current_task()
+        assert current is not None
+        actor.reset.remote = AsyncMock(side_effect=reset)
+        actor.step.remote = AsyncMock(side_effect=step)
+        actor.close.remote = AsyncMock(side_effect=close)
+        async with task.init_env(max_steps=2, timeout=0.01 if mode.endswith("timeout") else 5) as session:
+            result = await session.reset()
+            assert result.observation == "ready"
+            result = await session.step(env.ToolCall(name="look", arguments={}))
+            assert result == env.EpisodeResult(observation="stepped", reward=1.0, done=True)
+
+    error = {
+        "crash": RuntimeError,
+        "reset_timeout": TimeoutError,
+        "step_timeout": TimeoutError,
+        "cancel": asyncio.CancelledError,
+        "close_error": RuntimeError,
+    }.get(mode)
     if error:
         with pytest.raises(error):
             asyncio.run(run())
     else:
         asyncio.run(run())
-    assert session.process.returncode is not None
-    with pytest.raises(ProcessLookupError):
-        os.killpg(session.process.pid, 0)
+    worker.remote.assert_called_once_with(task=task, max_steps=2)
+    actor.reset.remote.assert_awaited_once_with()
+    if mode in {"crash", "reset_timeout"}:
+        actor.step.remote.assert_not_called()
+    else:
+        actor.step.remote.assert_awaited_once_with(env.ToolCall(name="look", arguments={}))
+    kill.assert_called_once_with(actor)
+    if mode in {"normal", "close_error"}:
+        actor.close.remote.assert_awaited_once_with()
+    else:
+        actor.close.remote.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -275,3 +314,14 @@ def test_tool_step_budget() -> None:
     environment.step.assert_called_once_with("look")
     tools.reset()
     assert not tools.call(env.ToolCall(name="look", arguments={})).done
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [("unknown", {}), ("take", {"object": "mug 1"}), ("look", {"extra": "x"}), ("use", {"object": 1})],
+    ids=["unknown", "missing-argument", "extra-argument", "argument-type"],
+)
+def test_invalid_action_does_not_reach_worker(name: str, arguments: dict[str, object]) -> None:
+    session = env.ALFWorldSession(task=env.ALFWorldTask(id="a", config_file="config.yaml"), max_steps=2, timeout=1)
+    with pytest.raises(env.ToolCallError):
+        asyncio.run(session.step(env.ToolCall(name=name, arguments=arguments)))

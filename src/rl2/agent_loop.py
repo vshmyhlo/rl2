@@ -1,4 +1,4 @@
-"""Append-only Qwen3 rollouts for ALFWorld training."""
+"""Append-only Qwen3 rollouts for tool-calling tasks."""
 
 import asyncio
 import json
@@ -13,22 +13,40 @@ from numpy.typing import NDArray
 from pydantic import TypeAdapter
 from transformers import PreTrainedTokenizerBase
 
-from rl2.alfworld_env import ALFWorldSession, ALFWorldTask, ToolCall, tool_schemas
+from rl2.agent_task import Task, ToolCall, ToolCallError
 from rl2.tracing import span
 
-SYSTEM_PROMPT = "Use one action tool per turn. Use the exact object and location names, including IDs."
-TASK_PROMPT = "Call look to read your goal and surroundings, then use the action tools to complete the task."
+
+def completion_text(text: str) -> str:
+    # Strip leading reasoning, without interpreting tags inside tool arguments.
+    marker = re.search(r"<think>|</think>|<tool_call>", text)
+    if marker is not None and marker.group() != "<tool_call>":
+        text = text[marker.end() :]
+        if marker.group() == "<think>":
+            _, separator, text = text.partition("</think>")
+            if not separator:
+                return ""
+    return text.removesuffix("<|im_end|>").removesuffix("<|endoftext|>").strip()
 
 
 def parse_tool_calls(text: str) -> list[ToolCall]:
-    # Thinking may contain hypothetical calls; only dispatch the final assistant output.
-    text = text.split("</think>")[-1]
-    if "<think>" in text:
-        return []
-    blocks = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", text, flags=re.DOTALL)
-    if len(blocks) != text.count("<tool_call>") or len(blocks) != text.count("</tool_call>"):
-        raise ValueError("Tool calls must use complete <tool_call>...</tool_call> blocks")
-    return [ToolCall.model_validate_json(block) for block in blocks]
+    text = completion_text(text)
+    calls: list[ToolCall] = []
+    decoder = json.JSONDecoder()
+    while match := re.search(r"</?tool_call>", text):
+        if match.group() != "<tool_call>":
+            raise ValueError("Tool calls must use complete <tool_call>...</tool_call> blocks")
+        text = text[match.end() :].lstrip()
+        try:
+            value, end = decoder.raw_decode(text)
+        except RecursionError as error:
+            raise ValueError("Tool calls exceed the JSON nesting limit") from error
+        text = text[end:].lstrip()
+        if not text.startswith("</tool_call>"):
+            raise ValueError("Tool calls must use complete <tool_call>...</tool_call> blocks")
+        calls.append(ToolCall.model_validate(value))
+        text = text[len("</tool_call>") :]
+    return calls
 
 
 @dataclass(frozen=True)
@@ -54,16 +72,19 @@ class Rollout:
 
 def completion_tokens(choice: dict[str, Any]) -> tuple[list[int], list[float]]:
     """Validate the token/log-probability alignment at the vLLM boundary."""
-    ids = TypeAdapter(list[int]).validate_python(choice["token_ids"], strict=True)
-    entries = choice["logprobs"]["content"]
-    if not ids or len(entries) != len(ids):
-        raise ValueError("Each sampled token must have a log-probability")
-    for token_id, entry in zip(ids, entries, strict=True):
-        if token_id < 0 or entry["token"] != f"token_id:{token_id}":
-            raise ValueError("Sampled token and log-probability IDs differ")
-    log_probs = TypeAdapter(list[float]).validate_python([entry["logprob"] for entry in entries], strict=True)
-    # vLLM uses -9999 when sampling evidence is unavailable.
-    if any(value <= -9999.0 or value > 0 for value in log_probs):
+    try:
+        ids = TypeAdapter(list[int]).validate_python(choice["token_ids"], strict=True)
+        entries = TypeAdapter(list[dict[str, Any]]).validate_python(choice["logprobs"]["content"], strict=True)
+        if not ids or len(entries) != len(ids):
+            raise ValueError("Each sampled token must have a log-probability")
+        for token_id, entry in zip(ids, entries, strict=True):
+            if token_id < 0 or entry["token"] != f"token_id:{token_id}":
+                raise ValueError("Sampled token and log-probability IDs differ")
+        log_probs = TypeAdapter(list[float]).validate_python([entry["logprob"] for entry in entries], strict=True)
+    except (KeyError, TypeError) as error:
+        raise ValueError("Missing token/log-probability data") from error
+    # vLLM 0.27 uses token_id:N strings and clips unavailable/very low logprobs to -9999.
+    if any(not -9999.0 < value <= 0 for value in log_probs):
         raise ValueError("Missing or invalid sampling log-probability")
     return ids, log_probs
 
@@ -80,18 +101,18 @@ class Agent:
     rollout_timeout: float
     environment_timeout: float
 
-    async def run(self, task: ALFWorldTask) -> Rollout:
+    async def run(self, task: Task) -> Rollout:
         started = time.monotonic()
         async with (
             asyncio.timeout(self.rollout_timeout),
-            ALFWorldSession(task=task, max_steps=self.max_turns, timeout=self.environment_timeout) as environment,
+            task.init_env(max_steps=self.max_turns, timeout=self.environment_timeout) as environment,
         ):
             with span("actor.rollout.reset"):
-                result = await environment.request()
+                result = await environment.reset()
             token_ids = await asyncio.to_thread(
                 self.tokenizer.apply_chat_template,
-                [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": TASK_PROMPT}],
-                tools=tool_schemas(),
+                [{"role": "system", "content": task.system_prompt}, {"role": "user", "content": task.prompt}],
+                tools=task.tools,
                 tokenize=True,
                 return_dict=False,
                 add_generation_prompt=True,
@@ -105,7 +126,7 @@ class Agent:
             pending: list[str] = []
             for _ in range(self.max_turns):
                 if result.done:
-                    stop_condition = "alfworld_done"
+                    stop_condition = f"{task.name}_done"
                     break
                 remaining = self.context_length - len(token_ids)
                 if remaining <= 0:
@@ -146,7 +167,7 @@ class Agent:
                 text = await asyncio.to_thread(
                     self.tokenizer.decode, ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
                 )
-                completion = text.split("</think>")[-1].removesuffix("<|im_end|>").removesuffix("<|endoftext|>").strip()
+                completion = completion_text(text)
                 if choice["finish_reason"] == "length":
                     stop_condition = "context_length" if len(token_ids) == self.context_length else "max_tokens"
                     break
@@ -161,12 +182,16 @@ class Agent:
                         break
                     for call in calls:
                         with span("actor.rollout.step", {"tool": call.name}):
-                            result = await environment.request(call)
+                            try:
+                                result = await environment.step(call)
+                            except ToolCallError as error:
+                                pending.append(json.dumps({"error": str(error)}))
+                                continue
                         pending.append(json.dumps(asdict(result)))
                         if result.done:
                             break
                 if result.done:
-                    stop_condition = "alfworld_done"
+                    stop_condition = f"{task.name}_done"
                     break
                 if num_turns == self.max_turns:
                     break

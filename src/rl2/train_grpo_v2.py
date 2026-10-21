@@ -92,16 +92,17 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from pydantic import Field
 from pydantic.dataclasses import dataclass as config_dataclass
 from ray.actor import ActorHandle
+from transformers import AutoTokenizer
 from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
 from vllm.utils.network_utils import get_open_port
 
-from rl2.agent_loop import SYSTEM_PROMPT, Agent, Rollout, TrainingSequence
+from rl2.agent_loop import Agent, Rollout, TrainingSequence
+from rl2.agent_task import Task
 from rl2.alfworld_env import ALFWorldConfig, ALFWorldTask, load_alfworld_tasks
 from rl2.configuration import BaseConfig, load_config
 from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import Parameters, Qwen3LM, load_qwen3_checkpoint
 from rl2.ray_timeline import record_timeline
-from rl2.rollout_tokenizer import rollout_tokenizer
 from rl2.tracing import flush_tracing, span, tracing_enabled
 
 logger = logging.getLogger(__name__)
@@ -409,14 +410,14 @@ def update(
     return state.apply_gradients(grads=gradients), metrics
 
 
-def score_group(task: ALFWorldTask, rollouts: list[Rollout]) -> RolloutGroup:
+def score_group(task: Task, rollouts: list[Rollout]) -> RolloutGroup:
     if len(rollouts) < 2:
         raise ValueError("A rollout group needs at least two rollouts")
     rewards = [rollout.reward for rollout in rollouts]
     reward_mean, reward_std = mean(rewards), pstdev(rewards)
     return RolloutGroup(
-        task_id=f"alfworld:{task.id}",
-        prompt=SYSTEM_PROMPT,
+        task_id=f"{task.name}:{task.id}",
+        prompt=task.prompt,
         rollouts=[
             replace(rollout, advantage=(rollout.reward - reward_mean) / (reward_std + 1e-4)) for rollout in rollouts
         ],
@@ -425,7 +426,7 @@ def score_group(task: ALFWorldTask, rollouts: list[Rollout]) -> RolloutGroup:
 
 @asynccontextmanager
 async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]:
-    tokenizer = await asyncio.to_thread(rollout_tokenizer, config.model)
+    tokenizer = await asyncio.to_thread(AutoTokenizer.from_pretrained, config.model)
     async with httpx.AsyncClient(base_url=SERVER_URL, timeout=config.rollout_timeout) as client:
         response = await client.get("/v1/models")
         response.raise_for_status()
@@ -828,7 +829,9 @@ class Actor:
         self._runs: set[asyncio.Task[Rollout]] = set()
         self._closed = False
         self._weights_valid = True
-        self.tasks = load_alfworld_tasks(config.taskset, config.max_turns, config.environment_timeout)
+        self.tasks: list[ALFWorldTask] = load_alfworld_tasks(
+            config.taskset, config.max_turns, config.environment_timeout
+        )
         logger.info("Starting actor and vLLM on its assigned GPU")
         with self._server as resources:
             server = resources.enter_context(serve_vllm(model=config.model))
@@ -905,7 +908,7 @@ class Actor:
             self._weights_valid = True
             logger.info("Learner weights applied; generation resumed")
 
-    async def collect_group(self, task: ALFWorldTask, group_size: int) -> RolloutGroup:
+    async def collect_group(self, task: Task, group_size: int) -> RolloutGroup:
         if group_size < 2:
             raise ValueError("group_size must be at least 2")
         span_data = {"group_id": uuid4().hex, "task_id": str(task.id), "group_size": str(group_size)}
@@ -964,7 +967,11 @@ def train(config: Config) -> None:
             logging_config=ray.LoggingConfig(log_level="INFO"),
             runtime_env={"env_vars": {"RAY_PROFILING": "1"} if config.enable_ray_timeline else {}},
             # Zero disables event reporting in Ray 2.59 despite the timeline docstring.
-            _system_config={"enable_timeline": config.enable_ray_timeline, "task_events_report_interval_ms": 1000},
+            _system_config={
+                "enable_timeline": config.enable_ray_timeline,
+                "task_events_report_interval_ms": 1000,
+                "kill_child_processes_on_worker_exit_with_raylet_subreaper": True,
+            },
             _tracing_startup_hook="rl2.tracing:setup_tracing" if config.enable_tracing and tracing_enabled() else None,
         ),
         record_timeline(timeline_path) if config.enable_ray_timeline else nullcontext(),

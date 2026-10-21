@@ -1211,7 +1211,11 @@ def test_train_gracefully_terminates_actor(
     assert options["dashboard_host"] == ("0.0.0.0" if fails else "127.0.0.1")
     assert options["dashboard_port"] == 8265
     assert options["runtime_env"]["env_vars"] == ({"RAY_PROFILING": "1"} if enable_timeline else {})
-    assert options["_system_config"] == {"enable_timeline": enable_timeline, "task_events_report_interval_ms": 1000}
+    assert options["_system_config"] == {
+        "enable_timeline": enable_timeline,
+        "task_events_report_interval_ms": 1000,
+        "kill_child_processes_on_worker_exit_with_raylet_subreaper": True,
+    }
     assert options["_tracing_startup_hook"] == ("rl2.tracing:setup_tracing" if enable_tracing else None)
     traces = list(tmp_path.rglob("*.json"))
     if enable_timeline:
@@ -1262,6 +1266,8 @@ def test_score_group_normalizes_rewards(
     task = actor.tasks[0]
     rollouts = [replace(rollout, reward=reward) for reward in rewards]
     group = training.score_group(task, rollouts)
+    assert group.task_id == f"{task.name}:{task.id}"
+    assert group.prompt == task.prompt
     expected = [(reward - mean(rewards)) / (pstdev(rewards) + 1e-4) for reward in rewards]
     assert len(group.rollouts) == len(rewards)
     assert [rollout.reward for rollout in group.rollouts] == rewards
@@ -1378,7 +1384,7 @@ def test_create_agent_config_and_cleanup(fails: bool, monkeypatch: pytest.Monkey
     config = training.Config(model="Qwen/custom", max_tokens=16, max_turns=2, temperature=0.7, rollout_timeout=300)
     tokenizer = Mock()
     load = Mock(return_value=tokenizer)
-    monkeypatch.setattr(training, "rollout_tokenizer", load)
+    monkeypatch.setattr(training.AutoTokenizer, "from_pretrained", load)
 
     def respond(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/models"

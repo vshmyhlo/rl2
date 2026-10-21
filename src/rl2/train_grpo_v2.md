@@ -22,7 +22,13 @@ The batcher runs on CPU. The actor and batcher use NumPy arrays and keep
 
 ## Interaction
 
-Each rollout owns one ALFWorld process and follows this loop:
+Tasks and environments inherit the `Task` and `Environment` abstract base classes in `agent_task.py`.
+A task supplies its prompts, tool schemas, and an async `init_env()` context
+manager. Environments expose async `reset()` and `step(action)` methods.
+`ALFWorldTask.init_env()` owns worker startup and cleanup; ALFWorld
+validates its own tool arguments. The agent loop has no ALFWorld imports.
+
+Each rollout owns one ALFWorld Ray actor, reserving one CPU, and follows this loop:
 
 1. Reset the selected game and give the model the action-tool schemas and instruction to call `look`.
 2. Sample a response through vLLM's `/inference/v1/generate` endpoint.
@@ -41,7 +47,7 @@ the episode ends. Malformed calls receive tool-error feedback without changing
 the game. A response without tool calls ends the episode. There are no MCP
 servers, renderer pools, or Verifiers objects in this path. The tokenizer and
 HTTP client are shared across concurrent rollouts; episode state is independent.
-Environment I/O is asynchronous and tokenization runs in threads.
+Environment calls await Ray object references; tokenization runs in threads.
 
 The transcript is append-only, using Qwen3 message boundaries. Sampled history,
 including thinking and end-of-turn tokens, is never re-tokenized. Every sampled
@@ -58,8 +64,10 @@ truncating existing tokens. Episodes with no sampled tokens fail the group.
 `rollout_timeout` bounds the whole episode; `environment_timeout` bounds task
 discovery and each reset/step request. HTTP failures, malformed sampling data,
 worker errors, and timeouts abort the group and cancel its other rollouts.
-Workers and their children are terminated during cleanup. There are no retries
-or fallback rewards for infrastructure failures.
+Environments close normally on success; errors and cancellations terminate their
+actors immediately. Training enables Ray's Linux subreaper to clean up TextWorld
+child processes even after a forced termination. There are no retries or fallback
+rewards for infrastructure failures.
 
 ## Training and resuming
 

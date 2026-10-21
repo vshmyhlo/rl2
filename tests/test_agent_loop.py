@@ -1,7 +1,9 @@
 import asyncio
 import json
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from dataclasses import replace
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -11,6 +13,8 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
 from rl2 import agent_loop as loop
+from rl2 import alfworld_env
+from rl2.agent_task import Environment, Task, ToolSchema
 from rl2.alfworld_env import ALFWorldTask, EpisodeResult, ToolCall, tool_schemas
 
 
@@ -38,12 +42,22 @@ def tokenizer() -> PreTrainedTokenizerFast:
 def environment(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     session = AsyncMock()
     session.__aenter__.return_value = session
-    session.request.side_effect = [
-        EpisodeResult(observation="Goal: put mug on desk. Admissible commands: look", reward=0.0, done=False),
-        EpisodeResult(observation="At shelf. Admissible commands: put mug 1 in/on desk 1", reward=0.0, done=False),
-        EpisodeResult(observation="Task complete", reward=1.0, done=True),
-    ]
-    monkeypatch.setattr(loop, "ALFWorldSession", Mock(return_value=session))
+    results = iter(
+        [
+            EpisodeResult(observation="At shelf. Admissible commands: put mug 1 in/on desk 1", reward=0.0, done=False),
+            EpisodeResult(observation="Task complete", reward=1.0, done=True),
+        ]
+    )
+
+    async def step(action: ToolCall) -> EpisodeResult:
+        alfworld_env.validate_tool_call(action)
+        return next(results)
+
+    session.reset.return_value = EpisodeResult(
+        observation="Goal: put mug on desk. Admissible commands: look", reward=0.0, done=False
+    )
+    session.step.side_effect = step
+    monkeypatch.setattr(alfworld_env, "ALFWorldSession", Mock(return_value=session))
     return session
 
 
@@ -109,13 +123,13 @@ def test_multiturn_exact_training_sequence(tokenizer: PreTrainedTokenizerFast, e
     np.testing.assert_array_equal(sequence.token_ids, expected_ids)
     np.testing.assert_array_equal(sequence.loss_mask, mask)
     np.testing.assert_array_equal(sequence.old_log_probs, np.where(mask, -0.25, 0.0))
-    assert [call.args for call in environment.request.await_args_list] == [
-        (),
+    environment.reset.assert_awaited_once_with()
+    assert [call.args for call in environment.step.await_args_list] == [
         (ToolCall(name="look", arguments={}),),
         (ToolCall(name="move", arguments={"object": "mug 1", "location": "desk 1"}),),
     ]
     initial_text = tokenizer.decode(first["token_ids"])
-    assert loop.TASK_PROMPT in initial_text
+    assert ALFWorldTask.prompt in initial_text
     assert '"name": "move"' in initial_text and '"name": "inventory"' in initial_text
     tool_context = tokenizer.decode(second["token_ids"][len(prefix) :])
     assert tool_context.startswith("\n<|im_start|>user\n<tool_response>\n")
@@ -161,14 +175,10 @@ def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, envir
     async def run() -> loop.Rollout:
         async with httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(respond)) as client:
             agent = make_agent(tokenizer, client)
-            initial = environment.request.side_effect
-            # Reset the iterator after reading the initial observation for the boundary calculation.
-            results = list(initial)
-            environment.request.side_effect = results
             prompt = tokenizer.apply_chat_template(
                 [
-                    {"role": "system", "content": loop.SYSTEM_PROMPT},
-                    {"role": "user", "content": loop.TASK_PROMPT},
+                    {"role": "system", "content": ALFWorldTask.system_prompt},
+                    {"role": "user", "content": ALFWorldTask.prompt},
                 ],
                 tools=tool_schemas(),
                 tokenize=True,
@@ -192,7 +202,7 @@ def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, envir
         rollout = asyncio.run(run())
         assert rollout.stop_condition == ("context_length" if boundary.startswith("context") else boundary)
         assert len(requests) == 1
-        assert environment.request.await_count == (1 if boundary in {"max_tokens", "context_generation"} else 2)
+        assert environment.step.await_count == (0 if boundary in {"max_tokens", "context_generation"} else 1)
         assert rollout.num_turns == 1
         if boundary == "context_generation":
             assert requests[0]["sampling_params"]["max_tokens"] == 1
@@ -247,21 +257,21 @@ def test_failures_cleanup(failure: str, tokenizer: PreTrainedTokenizerFast, envi
     with pytest.raises(error):
         asyncio.run(run())
     environment.__aexit__.assert_awaited_once()
-    assert environment.request.await_count == 1
+    environment.reset.assert_awaited_once_with()
+    environment.step.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
     "text",
     [
-        '<tool_call>{"name":"unknown","arguments":{}}</tool_call>',
-        '<tool_call>{"name":"take","arguments":{"object":"mug 1"}}</tool_call>',
-        '<tool_call>{"name":"look","arguments":{"extra":"x"}}</tool_call>',
-        '<tool_call>{"name":"use","arguments":{"object":1}}</tool_call>',
         '<tool_call>{"name":"look","arguments":"{}"}</tool_call>',
         "<tool_call>not json</tool_call>",
         '<tool_call>{"name":"look","arguments":{}}',
+        "</tool_call>",
+        '<tool_call>{"name":"look","arguments":{}} {"name":"look","arguments":{}}</tool_call>',
+        '<tool_call><tool_call>{"name":"look","arguments":{}}</tool_call></tool_call>',
     ],
-    ids=["unknown", "missing-argument", "extra-argument", "argument-type", "arguments-type", "json", "unclosed"],
+    ids=["arguments-type", "json", "unclosed", "unopened", "multiple-objects", "nested-blocks"],
 )
 def test_invalid_tool_calls(text: str) -> None:
     with pytest.raises(ValueError):
@@ -275,6 +285,82 @@ def test_tool_calls_ignore_thinking() -> None:
     assert loop.parse_tool_calls(f"<think>{call}</think>{call}") == [ToolCall(name="look", arguments={})]
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("<think>unfinished", ""),
+        ("<think>\n\n</think>\n\nFinished<|im_end|>", "Finished"),
+        ("Reasoning without opening tag</think>Finished<|im_end|>", "Finished"),
+        ("Finished<|endoftext|>", "Finished"),
+    ],
+    ids=["unfinished-thinking", "disabled-thinking", "implicit-thinking", "endoftext"],
+)
+def test_completion_text(text: str, expected: str) -> None:
+    assert loop.completion_text(text) == expected
+
+
+def test_tool_calls_preserve_json_strings() -> None:
+    calls = [
+        ToolCall(name="write", arguments={"text": '<tool_call></tool_call><think></think> "雪"', "nested": [1, None]}),
+        ToolCall(name="look", arguments={}),
+    ]
+    text = "\n".join(
+        f"<tool_call>\n{json.dumps(call.model_dump(), ensure_ascii=False, indent=2)}\n</tool_call>" for call in calls
+    )
+    assert loop.parse_tool_calls(text + "<|im_end|>") == calls
+
+
+def test_completion_tokens_preserve_qwen_tokens() -> None:
+    ids = [151667, 198, 151668, 151657, 151658, 151645]
+    probabilities = [-0.1, -0.2, -0.3, -0.4, -0.5, 0.0]
+    choice = {
+        "token_ids": ids,
+        "logprobs": {
+            "content": [
+                {"token": f"token_id:{token}", "logprob": probability, "top_logprobs": []}
+                for token, probability in zip(ids, probabilities, strict=True)
+            ]
+        },
+    }
+    assert loop.completion_tokens(choice) == (ids, probabilities)
+
+
+@pytest.mark.parametrize(
+    "logprob",
+    [-9999.0, 0.1, float("nan"), None, "-0.25"],
+    ids=["clipped", "positive", "nan", "missing", "string"],
+)
+def test_completion_tokens_invalid_probability(logprob: Any) -> None:
+    with pytest.raises(ValueError):
+        loop.completion_tokens(
+            {"token_ids": [151645], "logprobs": {"content": [{"token": "token_id:151645", "logprob": logprob}]}}
+        )
+
+
+@pytest.mark.parametrize("logprobs", [None, {}, {"content": None}, {"content": [{}]}])
+def test_completion_tokens_missing_evidence(logprobs: Any) -> None:
+    with pytest.raises(ValueError):
+        loop.completion_tokens({"token_ids": [151645], "logprobs": logprobs})
+
+
+def test_completion_preserves_literal_thinking_tags(tokenizer: PreTrainedTokenizerFast, environment: AsyncMock) -> None:
+    answer = '<tool_call>{"name":"use","arguments":{"object":"<think></think>"}}</tool_call>'
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=response_for(tokenizer, "<think>Act.</think>" + answer + "<|im_end|>"))
+
+    async def run() -> loop.Rollout:
+        async with httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(respond)) as client:
+            return await replace(make_agent(tokenizer, client), max_turns=1).run(
+                ALFWorldTask(id="a", config_file="config.yaml")
+            )
+
+    rollout = asyncio.run(run())
+    assert rollout.completion == answer
+    environment.step.assert_awaited_with(ToolCall(name="use", arguments={"object": "<think></think>"}))
+    assert '"error"' not in rollout.interaction
+
+
 @pytest.mark.parametrize("mode", ["text", "invalid", "multiple", "terminal"])
 def test_tool_dispatch(mode: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock) -> None:
     look = '<tool_call>{"name":"look","arguments":{}}</tool_call>'
@@ -286,10 +372,7 @@ def test_tool_dispatch(mode: str, tokenizer: PreTrainedTokenizerFast, environmen
         "terminal": [look + inventory],
     }[mode]
     if mode == "terminal":
-        environment.request.side_effect = [
-            EpisodeResult(observation="Goal", reward=0.0, done=False),
-            EpisodeResult(observation="Won", reward=1.0, done=True),
-        ]
+        environment.step.side_effect = [EpisodeResult(observation="Won", reward=1.0, done=True)]
     requests: list[dict[str, Any]] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -304,11 +387,91 @@ def test_tool_dispatch(mode: str, tokenizer: PreTrainedTokenizerFast, environmen
 
     rollout = asyncio.run(run())
     assert rollout.stop_condition == ("alfworld_done" if mode in {"multiple", "terminal"} else "agent_completed")
-    assert environment.request.await_count == {"text": 1, "invalid": 1, "multiple": 3, "terminal": 2}[mode]
+    environment.reset.assert_awaited_once_with()
+    assert environment.step.await_count == {"text": 0, "invalid": 1, "multiple": 2, "terminal": 1}[mode]
     if mode == "invalid":
         assert "<tool_response>" in tokenizer.decode(requests[1]["token_ids"])
         assert "Unknown ALFWorld tool" in rollout.interaction
     if mode == "multiple":
-        assert [call.args[0].name for call in environment.request.await_args_list[1:]] == ["look", "inventory"]
+        assert [call.args[0].name for call in environment.step.await_args_list] == ["look", "inventory"]
         assert '"observation": "At shelf.' in rollout.interaction
         assert '"observation": "Task complete"' in rollout.interaction
+
+
+@pytest.mark.parametrize("mode", ["success", "setup_error", "step_error", "cancel"])
+def test_generic_task_environment_lifetime(mode: str, tokenizer: PreTrainedTokenizerFast) -> None:
+    events: list[str] = []
+    stepping = asyncio.Event()
+
+    class ExampleEnvironment(Environment):
+        async def reset(self) -> EpisodeResult:
+            return EpisodeResult(observation="Ready", reward=0.0, done=False)
+
+        async def step(self, action: ToolCall) -> EpisodeResult:
+            assert action.name == "count" and action.arguments == {"amount": 2}
+            stepping.set()
+            if mode == "step_error":
+                raise RuntimeError("Environment failed")
+            if mode == "cancel":
+                await asyncio.Future()
+            return EpisodeResult(observation="Counted two", reward=0.5, done=True)
+
+    class ExampleTask(Task):
+        id = "one"
+        name = "example"
+        system_prompt = "Count using tools."
+        prompt = "Count two."
+        tools: ClassVar[list[ToolSchema]] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "count",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"amount": {"type": "integer"}},
+                        "required": ["amount"],
+                    },
+                },
+            }
+        ]
+
+        @asynccontextmanager
+        async def init_env(self, *, max_steps: int, timeout: float) -> AsyncGenerator[Environment]:
+            assert max_steps == 3 and timeout == 2
+            events.append("enter")
+            try:
+                if mode == "setup_error":
+                    raise RuntimeError("Setup failed")
+                yield ExampleEnvironment()
+            finally:
+                events.append("exit")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        prompt = tokenizer.decode(json.loads(request.content)["token_ids"])
+        assert "Count using tools." in prompt and "Count two." in prompt
+        assert '"name": "count"' in prompt and "alfworld" not in prompt
+        return httpx.Response(
+            200,
+            json=response_for(
+                tokenizer,
+                '<tool_call>{"name":"count","arguments":{"amount":2}}</tool_call><|im_end|>',
+            ),
+        )
+
+    async def run() -> loop.Rollout:
+        async with httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(respond)) as client:
+            task: Task = ExampleTask()
+            running = asyncio.create_task(make_agent(tokenizer, client).run(task))
+            if mode == "cancel":
+                await stepping.wait()
+                running.cancel()
+            return await running
+
+    if mode == "success":
+        result = asyncio.run(run())
+        assert result.reward == 0.5 and result.stop_condition == "example_done"
+        assert "Counted two" in result.interaction
+    else:
+        with pytest.raises(asyncio.CancelledError if mode == "cancel" else RuntimeError):
+            asyncio.run(run())
+    assert events == ["enter", "exit"]

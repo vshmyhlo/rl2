@@ -1,22 +1,21 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import os
-import signal
-import subprocess
-import sys
-from contextlib import ExitStack, closing, redirect_stdout, suppress
-from dataclasses import asdict, dataclass, replace
+from collections.abc import AsyncGenerator
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager
+from dataclasses import dataclass, replace
 from os.path import expandvars
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal, Self
+from typing import Any, ClassVar, Literal, Self
 
+import ray
 import yaml
 from alfworld.agents.environment.alfred_tw_env import AlfredTWEnv
-from pydantic import BaseModel, ConfigDict, TypeAdapter, model_validator
+from pydantic import ConfigDict, TypeAdapter, ValidationError
 from pydantic.dataclasses import dataclass as config_dataclass
+
+from rl2.agent_task import EpisodeResult, ToolCall, ToolCallError, ToolSchema
 
 
 @config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -44,11 +43,7 @@ def discover_games(config_file: str, max_steps: int) -> list[str]:
     return sorted(AlfredTWEnv(config, train_eval="train").game_files)
 
 
-@dataclass(frozen=True)
-class EpisodeResult:
-    observation: str
-    reward: float
-    done: bool
+discover_games_remote = ray.remote(max_retries=0)(discover_games)
 
 
 class ALFWorld:
@@ -165,7 +160,7 @@ ACTION_TOOLS = {
 }
 
 
-def tool_schemas() -> list[dict[str, Any]]:
+def tool_schemas() -> list[ToolSchema]:
     return [
         {
             "type": "function",
@@ -184,19 +179,16 @@ def tool_schemas() -> list[dict[str, Any]]:
     ]
 
 
-class ToolCall(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    name: str
-    arguments: dict[str, str]
-
-    @model_validator(mode="after")
-    def validate_action(self) -> Self:
-        if self.name not in ACTION_TOOLS:
-            raise ValueError(f"Unknown ALFWorld tool: {self.name}")
-        parameters = ACTION_TOOLS[self.name].parameters
-        if self.arguments.keys() != set(parameters):
-            raise ValueError(f"{self.name} requires exactly these arguments: {', '.join(parameters) or '(none)'}")
-        return self
+def validate_tool_call(call: ToolCall) -> None:
+    if call.name not in ACTION_TOOLS:
+        raise ToolCallError(f"Unknown ALFWorld tool: {call.name}")
+    parameters = ACTION_TOOLS[call.name].parameters
+    if call.arguments.keys() != set(parameters):
+        raise ToolCallError(f"{call.name} requires exactly these arguments: {', '.join(parameters) or '(none)'}")
+    try:
+        TypeAdapter(dict[str, str]).validate_python(call.arguments, strict=True)
+    except ValidationError as error:
+        raise ToolCallError(str(error)) from error
 
 
 class ALFWorldTools:
@@ -230,53 +222,68 @@ class ALFWorldTools:
 class ALFWorldTask:
     id: str
     config_file: str
+    name: ClassVar[str] = "alfworld"
+    system_prompt: ClassVar[str] = (
+        "Use one action tool per turn. Use the exact object and location names, including IDs."
+    )
+    prompt: ClassVar[str] = (
+        "Call look to read your goal and surroundings, then use the action tools to complete the task."
+    )
 
+    @property
+    def tools(self) -> list[ToolSchema]:
+        return tool_schemas()
 
-def worker_command(config_file: str, max_steps: int) -> list[str]:
-    return [sys.executable, "-m", "rl2.alfworld_env", config_file, str(max_steps)]
+    @asynccontextmanager
+    async def init_env(self, *, max_steps: int, timeout: float) -> AsyncGenerator[ALFWorldSession]:
+        async with ALFWorldSession(task=self, max_steps=max_steps, timeout=timeout) as environment:
+            yield environment
 
 
 def load_alfworld_tasks(config: ALFWorldConfig, max_steps: int, timeout: float) -> list[ALFWorldTask]:
     config_file = str(Path(config.config_file).expanduser().resolve())
-    result = subprocess.run(
-        [*worker_command(config_file, max_steps), "--list"],
-        stdout=subprocess.PIPE,
-        text=True,
-        check=True,
-        timeout=timeout,
-    )
-    ids = TypeAdapter(list[str]).validate_json(result.stdout)
+    with ExitStack() as resources:
+        pending = discover_games_remote.remote(config_file, max_steps)
+        resources.callback(ray.cancel, pending, force=True)
+        ids = ray.get(pending, timeout=timeout)
     if not ids or any(not task_id for task_id in ids) or len(ids) != len(set(ids)):
         raise ValueError("ALFWorld training task IDs must be nonempty and unique")
     return [ALFWorldTask(id=task_id, config_file=config_file) for task_id in ids]
 
 
+@ray.remote(num_cpus=1)
+class ALFWorldWorker:
+    def __init__(self, task: ALFWorldTask, max_steps: int) -> None:
+        self.environment = ALFWorld(config_file=task.config_file, max_steps=max_steps, task_id=task.id)
+        self.tools = ALFWorldTools(environment=self.environment, max_steps=max_steps)
+
+    def request(self, action: ToolCall | None = None) -> EpisodeResult:
+        return self.tools.reset() if action is None else self.tools.call(action)
+
+    def close(self) -> None:
+        self.environment.close()
+
+    def __ray_shutdown__(self) -> None:
+        self.close()
+
+
 class ALFWorldSession:
-    """One isolated TextWorld process per rollout, with cancellable async I/O."""
+    """One Ray actor per rollout, with asynchronous requests and bounded cleanup."""
 
     def __init__(self, task: ALFWorldTask, max_steps: int, timeout: float) -> None:
-        self.command = [*worker_command(task.config_file, max_steps), task.id]
+        self.task = task
+        self.max_steps = max_steps
         self.timeout = timeout
 
     async def __aenter__(self) -> Self:
-        self.process = await asyncio.create_subprocess_exec(
-            *self.command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            start_new_session=True,
-            limit=16 * 1024 * 1024,
-        )
+        self.actor = ALFWorldWorker.remote(task=self.task, max_steps=self.max_steps)
         return self
 
     async def request(self, action: ToolCall | None = None) -> EpisodeResult:
-        assert self.process.stdin is not None and self.process.stdout is not None
+        if action is not None:
+            validate_tool_call(action)
         async with asyncio.timeout(self.timeout):
-            self.process.stdin.write(((action.model_dump_json() if action is not None else "null") + "\n").encode())
-            await self.process.stdin.drain()
-            line = await self.process.stdout.readline()
-            if not line:
-                raise RuntimeError("ALFWorld worker exited without a response; see its stderr")
-            return TypeAdapter(EpisodeResult).validate_json(line)
+            return await self.actor.request.remote(action)
 
     async def __aexit__(
         self,
@@ -284,36 +291,8 @@ class ALFWorldSession:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        assert self.process.stdin is not None
-        self.process.stdin.close()
-        if exc_type is not None:
-            with suppress(ProcessLookupError):
-                os.killpg(self.process.pid, signal.SIGKILL)
-        try:
-            await asyncio.wait_for(self.process.wait(), timeout=5)
-        finally:
-            # TextWorld may own children; also reap them after a crash or timeout.
-            with suppress(ProcessLookupError):
-                os.killpg(self.process.pid, signal.SIGKILL)
-            await self.process.wait()
-        if exc_type is None and self.process.returncode != 0:
-            raise RuntimeError(f"ALFWorld worker failed (exit {self.process.returncode})")
-
-
-def main() -> None:
-    config_file, max_steps, task_id = sys.argv[1:]
-    output = sys.stdout
-    with redirect_stdout(sys.stderr):
-        if task_id == "--list":
-            print(json.dumps(discover_games(config_file, int(max_steps))), file=output, flush=True)
-            return
-        with closing(ALFWorld(config_file=config_file, max_steps=int(max_steps), task_id=task_id)) as environment:
-            tools = ALFWorldTools(environment=environment, max_steps=int(max_steps))
-            for line in sys.stdin:
-                action = TypeAdapter(ToolCall | None).validate_json(line)
-                result = tools.reset() if action is None else tools.call(action)
-                print(json.dumps(asdict(result)), file=output, flush=True)
-
-
-if __name__ == "__main__":
-    main()
+        async with AsyncExitStack() as resources:
+            resources.push_async_callback(asyncio.to_thread, ray.kill, self.actor)
+            if exc_type is None:
+                async with asyncio.timeout(5):
+                    await self.actor.close.remote()
