@@ -195,8 +195,16 @@ def test_agent_uses_config() -> None:
     assert agent.config.client.renderer_model_name == config.model
     assert agent.config.sampling.max_tokens == 16
     assert agent.config.sampling.temperature == 0.7
+    assert agent.config.sampling.chat_template_kwargs == {"enable_thinking": True}
     assert agent.config.max_turns == 2
     assert agent.config.timeout.rollout == 300
+
+
+def test_alfworld_agent_allows_thinking() -> None:
+    config = training.Config(taskset=training.ALFWorldConfig(config_file="/data/base_config.yaml"))
+    agent = training.create_agent(config)
+    assert agent.config.sampling.chat_template_kwargs == {"enable_thinking": True}
+    assert agent.config.client.renderer is None
 
 
 def test_toolrl_preset_and_actor(monkeypatch: pytest.MonkeyPatch) -> None:

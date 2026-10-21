@@ -1,11 +1,14 @@
 import asyncio
 import json
-from contextlib import closing
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from mcp.server.lowlevel import Server
 from mcp.server.mcpserver import MCPServer
 
 from rl2 import alfworld_env as env
@@ -13,9 +16,9 @@ from rl2 import alfworld_env as env
 
 def test_training_games_and_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "config.yaml"
-    path.write_text(json.dumps({"dataset": {}, "env": {}, "general": {}, "rl": {"training": {}}}))
+    path.write_text(json.dumps({"dataset": {"data_path": "games"}, "env": {}, "general": {}, "rl": {"training": {}}}))
     upstream = Mock()
-    upstream.reset.return_value = (["Put apple on table"], {"admissible_commands": [["look"]]})
+    upstream.reset.return_value = (["Put apple on table"], {"admissible_commands": [["look"]], "won": [False]})
     upstream.step.return_value = (["Done"], [0], [True], {"admissible_commands": [[]], "won": [True]})
     loader = Mock(game_files=["train/b", "train/a"])
     loader.init_env.return_value = upstream
@@ -38,7 +41,43 @@ def test_training_games_and_environment(tmp_path: Path, monkeypatch: pytest.Monk
         assert environment.step(" look \n")["done"]
         upstream.step.assert_called_once_with(["look"])
         assert environment.score() == 1.0
-    upstream.close.assert_called_once()
+        upstream.reset.return_value = (["Already done"], {"admissible_commands": [[]], "won": [True]})
+        assert environment.reset("train/a") == {
+            "observation": "Already done\nAdmissible commands: ",
+            "reward": 1.0,
+            "done": True,
+        }
+        assert environment.score() == 1.0
+    assert upstream.close.call_count == 2
+
+
+@pytest.mark.parametrize("path_kind", ["relative", "environment"])
+def test_dataset_path_is_independent_of_working_directory(
+    path_kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    game_dir = tmp_path / "games" / "train-a"
+    game_dir.mkdir(parents=True)
+    (game_dir / "traj_data.json").write_text(json.dumps({"task_type": "pick_and_place_simple"}))
+    game_file = game_dir / "game.tw-pddl"
+    game_file.write_text(json.dumps({"solvable": True}))
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    config_file = config_dir / "alfworld.yaml"
+    monkeypatch.setenv("RL2_TEST_DATA", str(tmp_path / "games"))
+    config_file.write_text(
+        json.dumps(
+            {
+                "dataset": {"data_path": "../games" if path_kind == "relative" else "$RL2_TEST_DATA"},
+                "env": {"goal_desc_human_anns_prob": 0},
+                "general": {},
+                "rl": {"training": {}},
+            }
+        )
+    )
+    for directory in (config_dir, tmp_path):
+        monkeypatch.chdir(directory)
+        with closing(env.ALFWorld(config_file=str(config_file), max_steps=2)) as environment:
+            assert environment.task_ids() == [str(game_file)]
 
 
 @pytest.fixture
@@ -171,3 +210,43 @@ def test_tool_schemas(task: env.ALFWorldTask) -> None:
     }
     assert set(tools["take"].input_schema["required"]) == {"object", "location"}
     assert tools["take"].input_schema["properties"]["object"]["type"] == "string"
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_mcp_lifespan_preserves_context_and_closes_environment(cancel: bool, environment: Mock) -> None:
+    events: list[str] = []
+
+    def close() -> None:
+        events.append("close")
+
+    environment.close.side_effect = close
+
+    @asynccontextmanager
+    async def existing_lifespan(server: Server) -> AsyncIterator[dict[str, Any]]:
+        try:
+            events.append("start")
+            yield {"resource": "existing"}
+        finally:
+            events.append("stop")
+
+    async def run() -> None:
+        tools = env.ALFWorldTools(config=env.ALFWorldToolsConfig(config_file="config.yaml", max_steps=2))
+        async with tools._exit_stack:
+            await tools.setup_task(env.ALFWorldData(task_id="train/a"))
+            server = MCPServer("alfworld")
+            server._lowlevel_server.lifespan = existing_lifespan
+            tools.register(server)
+            if cancel:
+                with pytest.raises(asyncio.CancelledError):
+                    async with server._lowlevel_server.lifespan(server._lowlevel_server) as state:
+                        assert state == {"resource": "existing"}
+                        raise asyncio.CancelledError
+            else:
+                async with server._lowlevel_server.lifespan(server._lowlevel_server) as state:
+                    assert state == {"resource": "existing"}
+            # Cleanup must happen during MCP shutdown, before the outer Verifiers stack exits.
+            environment.close.assert_called_once()
+        environment.close.assert_called_once()
+
+    asyncio.run(run())
+    assert events == ["start", "stop", "close"]

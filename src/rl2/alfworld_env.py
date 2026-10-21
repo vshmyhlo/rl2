@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import ExitStack, asynccontextmanager, closing
+from os.path import expandvars
 from pathlib import Path
 from typing import Any, Literal
 
@@ -22,7 +23,11 @@ class ALFWorldConfig:
 
 class ALFWorld:
     def __init__(self, config_file: str, max_steps: int) -> None:
-        self.config = yaml.safe_load(Path(config_file).read_text())
+        config_path = Path(config_file).expanduser().resolve()
+        self.config = yaml.safe_load(config_path.read_text())
+        data_path = Path(expandvars(self.config["dataset"]["data_path"])).expanduser()
+        # Tool servers run in temporary directories; anchor dataset paths to the config.
+        self.config["dataset"]["data_path"] = str((config_path.parent / data_path).resolve())
         self.config["dataset"]["num_train_games"] = -1
         self.config["env"].update(task_types=[1, 2, 3, 4, 5, 6], domain_randomization=False)
         # DQN mode omits expert demonstrations from observations.
@@ -39,7 +44,7 @@ class ALFWorld:
     def observe(self, observation: str, info: dict[str, Any], done: bool = False) -> dict[str, Any]:
         self.commands = info["admissible_commands"][0]
         return {
-            "observation": observation + "\nAdmissible commands: " + ", ".join(info["admissible_commands"][0]),
+            "observation": observation + "\nAdmissible commands: " + ", ".join(self.commands),
             "reward": self.reward,
             "done": done,
         }
@@ -53,8 +58,8 @@ class ALFWorld:
         self.env = self.loader.init_env(batch_size=1)
         self.resources.callback(self.env.close)
         observations, info = self.env.reset()
-        self.reward = 0.0
-        return self.observe(observations[0], info)
+        self.reward = float(info["won"][0])
+        return self.observe(observations[0], info, done=bool(info["won"][0]))
 
     def step(self, action: str) -> dict[str, Any]:
         observations, _, dones, info = self.env.step([action.strip()])
@@ -87,13 +92,15 @@ class ALFWorldTools(vf.Toolset[ALFWorldToolsConfig, ALFWorldState]):
 
     def register(self, mcp: MCPServer) -> None:
         super().register(mcp)
-        mcp._lowlevel_server.lifespan = self.lifespan
+        original_lifespan = mcp._lowlevel_server.lifespan
 
-    @asynccontextmanager
-    async def lifespan(self, server: Server) -> AsyncIterator[dict[str, Any]]:
-        # Close during HTTP shutdown, before Uvicorn re-raises the termination signal.
-        async with self._exit_stack:
-            yield {}
+        @asynccontextmanager
+        async def lifespan(server: Server) -> AsyncIterator[dict[str, Any]]:
+            # Close during HTTP shutdown, before Uvicorn re-raises the termination signal.
+            async with self._exit_stack, original_lifespan(server) as state:
+                yield state
+
+        mcp._lowlevel_server.lifespan = lifespan
 
     async def setup_task(self, task: ALFWorldData) -> None:
         self.environment = self._exit_stack.enter_context(
@@ -210,7 +217,7 @@ def load_alfworld_tasks(config: ALFWorldConfig, max_steps: int) -> list[ALFWorld
     if not ids or len(ids) != len(set(ids)):
         raise ValueError("ALFWorld training task IDs must be nonempty and unique")
     task_config = ALFWorldTaskConfig(
-        tools=ALFWorldToolsConfig(config_file=str(Path(config.config_file).resolve()), max_steps=max_steps)
+        tools=ALFWorldToolsConfig(config_file=str(Path(config.config_file).expanduser().resolve()), max_steps=max_steps)
     )
     return [
         ALFWorldTask(

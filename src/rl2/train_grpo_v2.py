@@ -614,7 +614,7 @@ def create_agent(config: Config = DEFAULT_CONFIG) -> vf.Agent:
                 max_tokens=config.max_tokens,
                 temperature=config.temperature,
                 top_p=1.0,
-                chat_template_kwargs={"enable_thinking": config.taskset.id == "toolrl"},
+                chat_template_kwargs={"enable_thinking": True},
             ),
             max_turns=config.max_turns,
             timeout=TimeoutConfig(setup=120, rollout=config.rollout_timeout, finalize=30, scoring=30),
