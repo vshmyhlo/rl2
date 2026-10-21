@@ -27,6 +27,7 @@ def rollout(tokens: list[int], mask: list[bool], advantage: float) -> training.R
         reward=float(advantage > 0),
         advantage=advantage,
         completion="",
+        interaction="",
         num_turns=1,
         num_input_tokens=len(tokens) - sum(mask),
         num_output_tokens=sum(mask),

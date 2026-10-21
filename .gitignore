@@ -14,3 +14,6 @@ runs/
 /cluster-runs
 mlruns/
 mlflow.db*
+
+# Downloaded ALFWorld dataset; keep base_config.yaml tracked.
+/data/alfworld/json_2.1.1/

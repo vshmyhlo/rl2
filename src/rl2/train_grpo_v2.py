@@ -68,7 +68,7 @@ from collections import Counter
 from collections.abc import Iterator
 from contextlib import AsyncExitStack, ExitStack, closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
-from functools import partial
+from functools import lru_cache, partial
 from itertools import islice
 from pathlib import Path
 from statistics import mean, pstdev
@@ -96,6 +96,7 @@ from opentelemetry.trace import StatusCode
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass as config_dataclass
 from ray.actor import ActorHandle
+from renderers.base import Tokenizer, load_tokenizer
 from renderers.configs import CustomRendererConfig
 from verifiers.v1.configs.agent import TimeoutConfig
 from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
@@ -307,6 +308,7 @@ class Rollout:
     reward: float  # Total task reward before group normalization.
     advantage: float  # (reward - group mean) / (population std + 1e-4).
     completion: str  # Final assistant text for sample logging.
+    interaction: str  # Recorded token text, plus messages not yet tokenized by the model client.
     num_turns: int  # Number of model responses, including tool calls.
     num_input_tokens: int  # Newly fed input tokens; a lower bound when context is rewritten.
     num_output_tokens: int  # Total sampled tokens across model calls.
@@ -328,7 +330,7 @@ class Transfer[T]:
 
 
 def format_rollout_examples(groups: list[RolloutGroup]) -> str:
-    """Format up to three final replies from the batch in sampling order."""
+    """Format up to three complete interactions from the batch in sampling order."""
     sections: list[str] = []
     examples = islice(((group, rollout) for group in groups for rollout in group.rollouts), 3)
     for index, (group, rollout) in enumerate(examples, start=1):
@@ -339,7 +341,8 @@ def format_rollout_examples(groups: list[RolloutGroup]) -> str:
             f"Turns: {rollout.num_turns} | Output tokens: {rollout.num_output_tokens} | "
             f"Stop: {rollout.stop_condition}\n\n"
             f"Prompt:\n{indent(group.prompt or '(empty)', '    ')}\n\n"
-            f"Final assistant output:\n{indent(rollout.completion or '(empty)', '    ')}"
+            f"Full interaction (special tokens preserved):\n{rollout.interaction or '(empty)'}\n\n"
+            f"Token IDs:\n{rollout.sequence.token_ids.tolist()}"
         )
     return "\n\n".join(sections)
 
@@ -514,6 +517,21 @@ def training_sequence(trace: vf.Trace) -> TrainingSequence:
     )
 
 
+@lru_cache(maxsize=1)
+def rollout_tokenizer(model: str) -> Tokenizer:
+    return load_tokenizer(model)
+
+
+def format_interaction(trace: vf.Trace) -> str:
+    tokenizer = rollout_tokenizer(trace.agent.config.model)
+    text = tokenizer.decode(trace.branches[0].token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+    # Terminal tool results may never be sent to the model and therefore have no tokens.
+    pending = [node.message.model_dump_json(exclude_none=True) for node in trace.nodes if not node.token_ids]
+    if pending:
+        text += "\n\nMessages without model tokens:\n" + "\n".join(pending)
+    return text
+
+
 async def score_group(task: vf.Task, traces: list[vf.Trace]) -> RolloutGroup:
     logger.debug("Scoring %s rollouts for task %s", len(traces), task.data.id)
     if len(traces) < 2:
@@ -538,6 +556,7 @@ async def score_group(task: vf.Task, traces: list[vf.Trace]) -> RolloutGroup:
                 reward=trace.reward,
                 advantage=advantage,
                 completion=trace.last_reply,
+                interaction=await asyncio.to_thread(format_interaction, trace),
                 num_turns=trace.num_turns,
                 num_input_tokens=trace.num_input_tokens,
                 num_output_tokens=trace.usage.completion_tokens if trace.usage is not None else 0,

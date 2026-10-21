@@ -415,7 +415,7 @@ def test_wait_for_server_detects_exit(returncode: int, monkeypatch: pytest.Monke
 
 
 @pytest.fixture
-def actor(monkeypatch: pytest.MonkeyPatch) -> Any:
+def actor(monkeypatch: pytest.MonkeyPatch, tokenizer: PreTrainedTokenizerFast) -> Any:
     monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
     monkeypatch.setattr(training, "wait_for_server", Mock())
     actor = training.Actor.__ray_metadata__.modified_class()
@@ -560,6 +560,7 @@ def rollout() -> training.Rollout:
         reward=1.0,
         advantage=0.5,
         completion="2",
+        interaction="2",
         num_turns=1,
         num_input_tokens=1,
         num_output_tokens=1,
@@ -776,6 +777,7 @@ def test_learner_logs_rollouts(
         reward=0.0,
         advantage=-1.0,
         completion="wrong",
+        interaction="wrong",
         num_turns=1,
         num_input_tokens=4,
         num_output_tokens=2,
@@ -1029,6 +1031,7 @@ def test_learner_logs_examples_every_ten_steps(
         reward=1.0,
         advantage=0.5,
         completion='<think>Use add.</think>\n<tool_call>{"name": "add"}</tool_call>',
+        interaction='<|im_start|>assistant\n<think>Use add.</think>\n<tool_call>{"name": "add"}</tool_call><|im_end|>',
         num_turns=1,
         num_input_tokens=1,
         num_output_tokens=1,
@@ -1040,7 +1043,7 @@ def test_learner_logs_examples_every_ten_steps(
         training.RolloutGroup(
             task_id=None,
             prompt="Another prompt",
-            rollouts=[replace(rollout, completion="", stop_condition=None), replace(rollout, completion="omitted")],
+            rollouts=[replace(rollout, interaction="", stop_condition=None), replace(rollout, interaction="omitted")],
         ),
     ]
     learner.config = replace(learner.config, num_groups=2, group_size=2, total_iterations=21)
@@ -1077,10 +1080,13 @@ def test_learner_logs_examples_every_ten_steps(
         assert "Turns: 1 | Output tokens: 1 | Stop: max_turns" in text
         assert "Prompt:\n    Add:\n    1 + 2" in text
         assert (
-            'Final assistant output:\n    <think>Use add.</think>\n    <tool_call>{"name": "add"}</tool_call>'
+            "Full interaction (special tokens preserved):\n<|im_start|>assistant\n"
+            '<think>Use add.</think>\n<tool_call>{"name": "add"}</tool_call><|im_end|>'
         ) in text
         assert "Example 3 | task=None" in text
-        assert "Final assistant output:\n    (empty)" in text
+        assert "Full interaction (special tokens preserved):\n(empty)" in text
+        assert text.count("reward=1.000") == 3
+        assert text.count("Token IDs:\n[1, 2]") == 3
         assert "Example 4" not in text and "omitted" not in text
 
 
@@ -1585,6 +1591,16 @@ def test_training_sequence_preserves_tokens_and_masks_context(token_trace: vf.Tr
     jax.tree.map(np.testing.assert_array_equal, asdict(pickle.loads(pickle.dumps(sequence))), asdict(sequence))
 
 
+def test_format_interaction_includes_untokenized_results(
+    token_trace: vf.Trace, tokenizer: PreTrainedTokenizerFast
+) -> None:
+    result = vf.ToolMessage(content="Terminal result", tool_call_id="last_call")
+    token_trace.nodes.append(vf.MessageNode(parent=len(token_trace.nodes) - 1, message=result))
+    text = training.format_interaction(token_trace)
+    tokens = tokenizer.decode([10, 20, 30, 40, 41], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+    assert text == tokens + "\n\nMessages without model tokens:\n" + result.model_dump_json(exclude_none=True)
+
+
 @pytest.mark.parametrize(
     "rewards",
     [[-1.0, 0.0, 2.0], [0.7] * 8, [1.0, 1.0 + 1e-8]],
@@ -1796,6 +1812,7 @@ def tokenizer(monkeypatch: pytest.MonkeyPatch) -> PreTrainedTokenizerFast:
         ],
     )
     monkeypatch.setattr(renderer_base, "load_tokenizer", Mock(return_value=tokenizer))
+    monkeypatch.setattr(training, "rollout_tokenizer", Mock(return_value=tokenizer))
     monkeypatch.setattr(ElasticRendererPool, "_renderers", {})
     monkeypatch.setattr(ElasticRendererPool, "_locks", {})
     return tokenizer
@@ -1893,7 +1910,7 @@ def test_verifiers_tool_rollout(
     assert requests[0]["sampling_params"]["logprobs"] == 1
     prompt = tokenizer.decode(requests[0]["token_ids"])
     assert '"name": "add"' in prompt
-    assert prompt.endswith("<think>\n\n</think>\n\n")
+    assert prompt.endswith("<|im_start|>assistant\n")
     finished = spans.get_finished_spans()
     rollouts = [item for item in finished if item.name == "actor.rollout"]
     agents = [item for item in finished if item.name == "actor.rollout.agent"]
@@ -2296,7 +2313,9 @@ if __name__ == "__main__":
     monkeypatch.setattr(alfworld_env.ALFWorldTask, "toolsets", classmethod(toolsets))
     actor.config = training.Config(taskset=training.ALFWorldConfig(config_file=str(tmp_path)), max_turns=5)
     task = alfworld_env.ALFWorldTask(
-        data=alfworld_env.ALFWorldData(id="alfworld:train/a", task_id="train/a", prompt="Start with look."),
+        data=alfworld_env.ALFWorldData(
+            id="alfworld:train/a", task_id="train/a", prompt="Start with look.", system_prompt="Use action tools."
+        ),
         config=alfworld_env.ALFWorldTaskConfig(
             tools=alfworld_env.ALFWorldToolsConfig(config_file=str(tmp_path), max_steps=3)
         ),
@@ -2319,7 +2338,9 @@ if __name__ == "__main__":
             if "At shelf" not in prompt
             else {"name": "move", "arguments": {"object": "mug 1", "location": "desk 1"}}
         )
-        ids = tokenizer.encode(f"<tool_call>\n{json.dumps(call)}\n</tool_call><|im_end|>")  # (C,)
+        ids = tokenizer.encode(
+            f"<think>Plan.  \n</think>\n<tool_call>\n{json.dumps(call)}\n</tool_call><|im_end|>"
+        )  # (C,)
         samples.append(ids)
         return httpx.Response(
             200,
@@ -2347,7 +2368,19 @@ if __name__ == "__main__":
         assert rollout.num_turns == 3
         assert rollout.reward == 1.0
         assert rollout.stop_condition == "alfworld_done"
+        interaction = rollout.interaction
+        assert "<|im_start|>system\nUse action tools." in interaction
+        assert "<|im_start|>user\nStart with look.<|im_end|>" in interaction
+        assert interaction.count("<think>Plan.  \n</think>") == 3
+        assert '<tool_call>\n{"name": "look", "arguments": {}}\n</tool_call><|im_end|>' in interaction
+        assert '<tool_call>\n{"name": "go_to", "arguments": {"location": "shelf 1"}}' in interaction
+        assert '<tool_call>\n{"name": "move", "arguments": {"object": "mug 1", "location": "desk 1"}}' in interaction
+        assert "<tool_response>" in interaction and "Goal: put the carried mug on the desk" in interaction
+        assert "At shelf" in interaction
         sequence = rollout.sequence
+        assert interaction == tokenizer.decode(
+            sequence.token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+        )
         assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
         assert sequence.loss_mask.sum() == sum(len(ids) for ids in samples) // 2
         np.testing.assert_allclose(sequence.old_log_probs, np.where(sequence.loss_mask, -0.2, 0))

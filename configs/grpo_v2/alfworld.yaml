@@ -1,8 +1,7 @@
 model: Qwen/Qwen3-0.6B
 taskset:
   id: alfworld
-  python: /opt/alfworld/bin/python
-  config_file: /opt/alfworld/base_config.yaml
+  config_file: data/alfworld/base_config.yaml
 seed: 3
 num_groups: 1
 group_size: 4

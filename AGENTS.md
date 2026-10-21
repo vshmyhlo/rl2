@@ -7,6 +7,7 @@
 - Prefer context managers (`with` / `async with`) for resource cleanup over manual `try`/`except`/`finally` blocks with explicit `close()` calls. Use `contextlib.closing` or `contextlib.aclosing` when a resource lacks native context-manager support.
 - Prefer combining multiple context managers in a single parenthesized `with` / `async with` statement over nesting statements when their scopes align.
 - Prefer `asyncio.TaskGroup` for managing concurrent and nested asynchronous tasks.
+- Keep blocking calls off the event loop in async code, including calls made by synchronous helpers. Prefer async APIs for I/O, subprocesses, and waiting; use `asyncio.to_thread` for unavoidable blocking I/O when thread safety permits, and a process executor for substantial CPU-bound Python work. Declaring a function `async` or creating a task does not make synchronous work nonblocking. Account for thread safety, cancellation, and resource cleanup when offloading work.
 - Keep comments and docstrings concise and minimal. Explain non-obvious intent or constraints without restating the code or overexplaining. Preserve required shape documentation.
 - Prefer concise, minimalistic READMEs, Markdown files, and other documentation. Include essential context and actionable instructions; avoid repetition, boilerplate, and unnecessary detail.
 - Place all imports at the top of the module. Do not use lazy imports, imports inside functions or methods, or conditional imports (including `TYPE_CHECKING` guards and `try`/`except` import fallbacks).
