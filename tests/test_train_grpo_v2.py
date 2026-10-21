@@ -30,6 +30,7 @@ from pydantic import ValidationError
 from ray import cloudpickle
 
 from rl2 import train_grpo_v2 as training
+from rl2.agent_task import Task
 
 
 @pytest.fixture
@@ -301,6 +302,9 @@ def task_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def actor(monkeypatch: pytest.MonkeyPatch) -> Any:
+    monkeypatch.setattr(
+        training.ALFWorldTask, "init_env", Mock(side_effect=AssertionError("Agent owns environment setup"))
+    )
     monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
     monkeypatch.setattr(training, "wait_for_server", Mock())
     actor = training.Actor.__ray_metadata__.modified_class()
@@ -311,6 +315,22 @@ def actor(monkeypatch: pytest.MonkeyPatch) -> Any:
 async def collect_and_close(actor: Any, task: training.ALFWorldTask) -> training.RolloutGroup:
     async with aclosing(actor):
         return await actor.collect_group(task, group_size=2)
+
+
+def test_actor_fetch_next_task(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert asyncio.run(actor.fetch_next_task()) is actor.tasks[0]
+    actor.rng.choice.assert_called_once_with(actor.tasks)
+
+    fetch = AsyncMock(return_value=actor.tasks[1])
+    collect = AsyncMock(return_value=Mock(spec=training.RolloutGroup))
+    monkeypatch.setattr(actor, "fetch_next_task", fetch)
+    monkeypatch.setattr(actor, "collect_group", collect)
+
+    result = asyncio.run(actor.fetch_next_group(group_size=2))
+
+    fetch.assert_awaited_once_with()
+    collect.assert_awaited_once_with(actor.tasks[1], group_size=2)
+    assert result.value is collect.return_value
 
 
 def test_actor_reuses_agent(actor: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -338,6 +358,7 @@ def test_actor_reuses_agent(actor: Any, rollout: training.Rollout, monkeypatch: 
             release.set()
             groups = await asyncio.gather(first, second)
             assert [group.task_id for group in groups] == [f"alfworld:{task.id}" for task in actor.tasks[:2]]
+            assert all(group.prompt == "Environment prompt" for group in groups)
             await actor.collect_group(actor.tasks[0], group_size=2)
             agent.__aexit__.assert_not_awaited()
         await actor.aclose()
@@ -349,6 +370,9 @@ def test_actor_reuses_agent(actor: Any, rollout: training.Rollout, monkeypatch: 
     agent.__aenter__.assert_awaited_once()
     agent.__aexit__.assert_awaited_once()
     assert agent.run.await_count == 6
+    assert [call.args[0] for call in agent.run.await_args_list].count(actor.tasks[0]) == 4
+    assert [call.args[0] for call in agent.run.await_args_list].count(actor.tasks[1]) == 2
+    training.ALFWorldTask.init_env.assert_not_called()
 
 
 def test_actor_retries_agent_startup(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -375,7 +399,7 @@ def test_actor_close_cancels_rollouts(actor: Any, monkeypatch: pytest.MonkeyPatc
     started = asyncio.Event()
     active = 0
 
-    async def run(task: training.ALFWorldTask) -> training.Rollout:
+    async def run(task: Task) -> training.Rollout:
         nonlocal active
         active += 1
         if active == 2:
@@ -468,6 +492,7 @@ def test_actor_close_releases_server_after_agent(
 @pytest.fixture
 def rollout() -> training.Rollout:
     return training.Rollout(
+        prompt="Environment prompt",
         sequence=training.TrainingSequence(
             token_ids=np.array([1, 2], dtype=np.int32),  # (T=2,)
             loss_mask=np.array([False, True]),  # (T=2,)
@@ -689,6 +714,7 @@ def test_learner_logs_rollouts(
         old_log_probs=np.array([-0.2], dtype=np.float32),  # (T=1,)
     )
     rollout = training.Rollout(
+        prompt="Environment prompt",
         sequence=sequence,
         reward=0.0,
         advantage=-1.0,
@@ -939,6 +965,7 @@ def test_learner_logs_examples_every_ten_steps(
 ) -> None:
     caplog.set_level("INFO", logger=training.__name__)
     rollout = training.Rollout(
+        prompt="Environment prompt",
         sequence=training.TrainingSequence(
             token_ids=np.array([1, 2], dtype=np.int32),  # (T=2,)
             loss_mask=np.array([False, True]),  # (T=2,)
@@ -1302,7 +1329,7 @@ def test_score_group_normalizes_rewards(
     rollouts = [replace(rollout, reward=reward) for reward in rewards]
     group = training.score_group(task, rollouts)
     assert group.task_id == f"{task.name}:{task.id}"
-    assert group.prompt == task.prompt
+    assert group.prompt == "Environment prompt"
     expected = [(reward - mean(rewards)) / (pstdev(rewards) + 1e-4) for reward in rewards]
     assert len(group.rollouts) == len(rewards)
     assert [rollout.reward for rollout in group.rollouts] == rewards
@@ -1322,7 +1349,7 @@ def test_batcher_collects_groups_concurrently(
     env = AsyncMock()
     env.__aenter__.return_value = env
 
-    async def run(task: training.ALFWorldTask) -> training.Rollout:
+    async def run(task: Task) -> training.Rollout:
         nonlocal started
         before = otel_trace.get_current_span().get_span_context()
         started += 1
@@ -1379,7 +1406,7 @@ def test_group_cancels_pending_rollouts(
     cancelled: list[bool] = []
     count = 0
 
-    async def run(task: training.ALFWorldTask) -> training.Rollout:
+    async def run(task: Task) -> training.Rollout:
         nonlocal count
         count += 1
         if count == 1:

@@ -19,6 +19,7 @@ from rl2.qwen3 import Parameters, Qwen3Config, Qwen3LM, Qwen3Output, Variables
 
 def rollout(tokens: list[int], mask: list[bool], advantage: float) -> training.Rollout:
     return training.Rollout(
+        prompt="Environment prompt",
         sequence=training.TrainingSequence(
             token_ids=np.asarray(tokens, dtype=np.int32),  # (T,)
             loss_mask=np.asarray(mask, dtype=np.bool_),  # (T,)

@@ -4,7 +4,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -19,7 +19,7 @@ from transformers import PreTrainedTokenizerFast
 from rl2 import agent_loop as loop
 from rl2 import alfworld_env
 from rl2.agent_task import Environment, Task, ToolSchema
-from rl2.alfworld_env import ALFWorldTask, EpisodeResult, ToolCall, tool_schemas
+from rl2.alfworld_env import StepResult, ToolCall, tool_schemas
 
 
 @pytest.fixture
@@ -39,26 +39,38 @@ def tokenizer() -> PreTrainedTokenizerFast:
 
 
 @pytest.fixture
-def environment(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+def environment() -> AsyncMock:
     session = AsyncMock()
     session.__aenter__.return_value = session
     results = iter(
         [
-            EpisodeResult(observation="At shelf. Admissible commands: put mug 1 in/on desk 1", reward=0.0, done=False),
-            EpisodeResult(observation="Task complete", reward=1.0, done=True),
+            StepResult(observation="At shelf. Admissible commands: put mug 1 in/on desk 1", reward=0.0, done=False),
+            StepResult(observation="Task complete", reward=1.0, done=True),
         ]
     )
 
-    async def step(action: ToolCall) -> EpisodeResult:
+    async def step(action: ToolCall, *, timeout: float | None = None) -> StepResult:
         alfworld_env.validate_tool_call(action)
         return next(results)
 
-    session.reset.return_value = EpisodeResult(
-        observation="Goal: put mug on desk. Admissible commands: look", reward=0.0, done=False
+    session.reset.return_value = StepResult(
+        observation="Goal: put mug on desk. Admissible commands: look",
+        reward=0.0,
+        done=False,
     )
     session.step.side_effect = step
-    monkeypatch.setattr(alfworld_env, "ALFWorldSession", Mock(return_value=session))
     return session
+
+
+@pytest.fixture
+def task(environment: AsyncMock) -> Task:
+    return Mock(
+        spec=Task,
+        system_prompt="Use one action tool per turn.",
+        prompt="Call look to read your goal and surroundings.",
+        tools=tool_schemas(),
+        init_env=Mock(return_value=environment),
+    )
 
 
 def response_for(tokenizer: PreTrainedTokenizerFast, text: str, finish_reason: str = "stop") -> dict[str, Any]:
@@ -102,11 +114,12 @@ def make_agent(tokenizer: PreTrainedTokenizerFast, client: AsyncOpenAI) -> loop.
         max_turns=3,
         temperature=0.7,
         rollout_timeout=10,
-        environment_timeout=2,
     )
 
 
-def test_multiturn_exact_training_sequence(tokenizer: PreTrainedTokenizerFast, environment: AsyncMock) -> None:
+def test_multiturn_exact_training_sequence(
+    tokenizer: PreTrainedTokenizerFast, environment: AsyncMock, task: Task
+) -> None:
     replies = [
         '<think>inspect</think>\n<tool_call>{"name":"look","arguments":{}}</tool_call><|im_end|>',
         '<tool_call>{"name":"move","arguments":{"object":"mug 1","location":"desk 1"}}</tool_call><|im_end|>',
@@ -121,7 +134,7 @@ def test_multiturn_exact_training_sequence(tokenizer: PreTrainedTokenizerFast, e
 
     async def run() -> loop.Rollout:
         async with make_client(respond) as client:
-            return await make_agent(tokenizer, client).run(ALFWorldTask(id="a", config_file="config.yaml"))
+            return await replace(make_agent(tokenizer, client), environment_timeout=2).run(task)
 
     rollout = asyncio.run(run())
     first, second = requests
@@ -143,13 +156,16 @@ def test_multiturn_exact_training_sequence(tokenizer: PreTrainedTokenizerFast, e
     np.testing.assert_array_equal(sequence.token_ids, expected_ids)
     np.testing.assert_array_equal(sequence.loss_mask, mask)
     np.testing.assert_array_equal(sequence.old_log_probs, np.where(mask, -0.25, 0.0))
-    environment.reset.assert_awaited_once_with()
+    environment.reset.assert_awaited_once_with(timeout=2)
+    assert [call.kwargs for call in environment.step.await_args_list] == [{"timeout": 2}, {"timeout": 2}]
     assert [call.args for call in environment.step.await_args_list] == [
         (ToolCall(name="look", arguments={}),),
         (ToolCall(name="move", arguments={"object": "mug 1", "location": "desk 1"}),),
     ]
     initial_text = tokenizer.decode(first["prompt"])
-    assert ALFWorldTask.prompt in initial_text
+    assert task.prompt in initial_text
+    assert task.system_prompt in initial_text
+    assert rollout.prompt == task.prompt
     assert '"name": "move"' in initial_text and '"name": "inventory"' in initial_text
     tool_context = tokenizer.decode(second["prompt"][len(prefix) :])
     assert tool_context.startswith("\n<|im_start|>user\n<tool_response>\n")
@@ -173,10 +189,13 @@ def test_multiturn_exact_training_sequence(tokenizer: PreTrainedTokenizerFast, e
         "return_token_ids": True,
         "return_tokens_as_token_ids": True,
     }
+    environment.__aenter__.assert_awaited_once()
     environment.__aexit__.assert_awaited_once()
 
 
-def test_total_token_budget_across_turns(tokenizer: PreTrainedTokenizerFast, environment: AsyncMock) -> None:
+def test_total_token_budget_across_turns(
+    tokenizer: PreTrainedTokenizerFast, environment: AsyncMock, task: Task
+) -> None:
     requests: list[dict[str, Any]] = []
     token_limit = 8191  # Below the model context length.
 
@@ -193,9 +212,7 @@ def test_total_token_budget_across_turns(tokenizer: PreTrainedTokenizerFast, env
 
     async def run() -> loop.Rollout:
         async with make_client(respond) as client:
-            return await replace(make_agent(tokenizer, client), max_tokens=token_limit).run(
-                ALFWorldTask(id="a", config_file="config.yaml")
-            )
+            return await replace(make_agent(tokenizer, client), max_tokens=token_limit).run(task)
 
     rollout = asyncio.run(run())
     sequence = rollout.sequence
@@ -220,7 +237,7 @@ def test_total_token_budget_across_turns(tokenizer: PreTrainedTokenizerFast, env
         "prompt_overlong",
     ],
 )
-def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock) -> None:
+def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock, task: Task) -> None:
     requests = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -241,8 +258,8 @@ def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, envir
             agent = make_agent(tokenizer, client)
             prompt = tokenizer.apply_chat_template(
                 [
-                    {"role": "system", "content": ALFWorldTask.system_prompt},
-                    {"role": "user", "content": ALFWorldTask.prompt},
+                    {"role": "system", "content": task.system_prompt},
+                    {"role": "user", "content": task.prompt},
                 ],
                 tools=tool_schemas(),
                 tokenize=True,
@@ -259,7 +276,7 @@ def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, envir
             else:
                 room = {"context_generation": 1, "context_observation": 100, "no_room": 0}[boundary]
                 agent = replace(agent, context_length=len(prompt) + room)
-            return await agent.run(ALFWorldTask(id="a", config_file="config.yaml"))
+            return await agent.run(task)
 
     if boundary in {"no_room", "prompt_full", "prompt_overlong"}:
         with pytest.raises(ValueError, match="Initial prompt.*must leave room"):
@@ -280,13 +297,16 @@ def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, envir
         if boundary in {"max_tokens", "context_generation"}:
             assert requests[0]["max_tokens"] == 1
         assert len(rollout.sequence.token_ids) <= 8192
+    environment.__aenter__.assert_awaited_once()
     environment.__aexit__.assert_awaited_once()
 
 
 @pytest.mark.parametrize(
     "failure", ["http", "empty", "logprobs", "alignment", "missing_probability", "abort", "timeout", "cancel"]
 )
-def test_failures_cleanup(failure: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock) -> None:
+def test_failures_close_environment(
+    failure: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock, task: Task
+) -> None:
     entered = asyncio.Event()
     requests = 0
 
@@ -319,11 +339,11 @@ def test_failures_cleanup(failure: str, tokenizer: PreTrainedTokenizerFast, envi
             agent = make_agent(tokenizer, client)
             if failure == "timeout":
                 agent = replace(agent, rollout_timeout=0.05)
-            task = asyncio.create_task(agent.run(ALFWorldTask(id="a", config_file="config.yaml")))
+            running = asyncio.create_task(agent.run(task))
             if failure == "cancel":
                 await entered.wait()
-                task.cancel()
-            await task
+                running.cancel()
+            await running
 
     error = {
         "http": APIStatusError,
@@ -336,8 +356,12 @@ def test_failures_cleanup(failure: str, tokenizer: PreTrainedTokenizerFast, envi
     # The rollout timeout also covers prompt tokenization before the first request.
     if failure != "timeout":
         assert requests == 1
+    environment.__aenter__.assert_awaited_once()
     environment.__aexit__.assert_awaited_once()
-    environment.reset.assert_awaited_once_with()
+    assert issubclass(
+        environment.__aexit__.await_args.args[0], asyncio.CancelledError if failure == "timeout" else error
+    )
+    environment.reset.assert_awaited_once_with(timeout=None)
     environment.step.assert_not_awaited()
 
 
@@ -405,17 +429,19 @@ def test_tool_calls_preserve_json_strings() -> None:
 
 
 @pytest.mark.parametrize("ending", ["<|im_end|>", "<|endoftext|>", ""], ids=["im-end", "endoftext", "omitted-stop"])
-def test_tool_response_renderer(ending: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock) -> None:
+def test_tool_response_renderer(
+    ending: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock, task: Task
+) -> None:
     calls = [ToolCall(name="look", arguments={}), ToolCall(name="inventory", arguments={})]
     results = [
-        EpisodeResult(observation="A shelf", reward=0.0, done=False),
-        EpisodeResult(observation="A mug", reward=0.0, done=False),
+        StepResult(observation="A shelf", reward=0.0, done=False),
+        StepResult(observation="A mug", reward=0.0, done=False),
     ]
     environment.step.side_effect = results
     assistant = {"role": "assistant", "content": "", "reasoning_content": "Inspect.", "tool_calls": calls}
     messages = [
-        {"role": "system", "content": ALFWorldTask.system_prompt},
-        {"role": "user", "content": ALFWorldTask.prompt},
+        {"role": "system", "content": task.system_prompt},
+        {"role": "user", "content": task.prompt},
     ]
     initial = tokenizer.apply_chat_template(
         messages, tools=tool_schemas(), tokenize=False, add_generation_prompt=True, enable_thinking=True
@@ -430,7 +456,7 @@ def test_tool_response_renderer(ending: str, tokenizer: PreTrainedTokenizerFast,
 
     async def run() -> loop.Rollout:
         async with make_client(respond) as client:
-            return await make_agent(tokenizer, client).run(ALFWorldTask(id="a", config_file="config.yaml"))
+            return await make_agent(tokenizer, client).run(task)
 
     rollout = asyncio.run(run())
     tool_messages = [{"role": "tool", "content": json.dumps(asdict(result))} for result in results]
@@ -499,7 +525,9 @@ def test_completion_tokens_invalid_ids(ids: Any) -> None:
         )
 
 
-def test_completion_preserves_literal_thinking_tags(tokenizer: PreTrainedTokenizerFast, environment: AsyncMock) -> None:
+def test_completion_preserves_literal_thinking_tags(
+    tokenizer: PreTrainedTokenizerFast, environment: AsyncMock, task: Task
+) -> None:
     answer = '<tool_call>{"name":"use","arguments":{"object":"<think></think>"}}</tool_call>'
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -507,18 +535,16 @@ def test_completion_preserves_literal_thinking_tags(tokenizer: PreTrainedTokeniz
 
     async def run() -> loop.Rollout:
         async with make_client(respond) as client:
-            return await replace(make_agent(tokenizer, client), max_turns=1).run(
-                ALFWorldTask(id="a", config_file="config.yaml")
-            )
+            return await replace(make_agent(tokenizer, client), max_turns=1).run(task)
 
     rollout = asyncio.run(run())
     assert rollout.completion == answer
-    environment.step.assert_awaited_with(ToolCall(name="use", arguments={"object": "<think></think>"}))
+    environment.step.assert_awaited_with(ToolCall(name="use", arguments={"object": "<think></think>"}), timeout=None)
     assert '"error"' not in rollout.interaction
 
 
 @pytest.mark.parametrize("mode", ["text", "invalid", "malformed", "multiple", "terminal"])
-def test_tool_dispatch(mode: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock) -> None:
+def test_tool_dispatch(mode: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock, task: Task) -> None:
     look = '<tool_call>{"name":"look","arguments":{}}</tool_call>'
     inventory = '<tool_call>{"name":"inventory","arguments":{}}</tool_call>'
     replies = {
@@ -529,7 +555,7 @@ def test_tool_dispatch(mode: str, tokenizer: PreTrainedTokenizerFast, environmen
         "terminal": [look + inventory],
     }[mode]
     if mode == "terminal":
-        environment.step.side_effect = [EpisodeResult(observation="Won", reward=1.0, done=True)]
+        environment.step.side_effect = [StepResult(observation="Won", reward=1.0, done=True)]
     requests: list[dict[str, Any]] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -538,11 +564,11 @@ def test_tool_dispatch(mode: str, tokenizer: PreTrainedTokenizerFast, environmen
 
     async def run() -> loop.Rollout:
         async with make_client(respond) as client:
-            return await make_agent(tokenizer, client).run(ALFWorldTask(id="a", config_file="config.yaml"))
+            return await make_agent(tokenizer, client).run(task)
 
     rollout = asyncio.run(run())
     assert rollout.stop_condition == ("environment_done" if mode in {"multiple", "terminal"} else "agent_completed")
-    environment.reset.assert_awaited_once_with()
+    environment.reset.assert_awaited_once_with(timeout=None)
     assert environment.step.await_count == {"text": 0, "invalid": 1, "malformed": 0, "multiple": 2, "terminal": 1}[mode]
     if mode == "invalid":
         assert "<tool_response>" in tokenizer.decode(requests[1]["prompt"])
@@ -555,50 +581,54 @@ def test_tool_dispatch(mode: str, tokenizer: PreTrainedTokenizerFast, environmen
         assert '"observation": "Task complete"' in rollout.interaction
 
 
-@pytest.mark.parametrize("mode", ["success", "setup_error", "step_error", "cancel"])
+@pytest.mark.parametrize("mode", ["success", "setup_error", "setup_timeout", "step_error", "cancel"])
 def test_generic_task_environment_lifetime(mode: str, tokenizer: PreTrainedTokenizerFast) -> None:
     events: list[str] = []
     stepping = asyncio.Event()
 
     class ExampleEnvironment(Environment):
-        async def reset(self) -> EpisodeResult:
-            return EpisodeResult(observation="Ready", reward=0.0, done=False)
+        async def reset(self, *, timeout: float | None = None) -> StepResult:
+            return StepResult(observation="Ready", reward=0.0, done=False)
 
-        async def step(self, action: ToolCall) -> EpisodeResult:
+        async def step(self, action: ToolCall, *, timeout: float | None = None) -> StepResult:
             assert action.name == "count" and action.arguments == {"amount": 2}
             stepping.set()
             if mode == "step_error":
                 raise RuntimeError("Environment failed")
             if mode == "cancel":
                 await asyncio.Future()
-            return EpisodeResult(observation="Counted two", reward=0.5, done=True)
+            return StepResult(observation="Counted two", reward=0.5, done=True)
 
     class ExampleTask(Task):
         id = "one"
         name = "example"
         system_prompt = "Count using tools."
         prompt = "Count two."
-        tools: ClassVar[list[ToolSchema]] = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "count",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"amount": {"type": "integer"}},
-                        "required": ["amount"],
+
+        @property
+        def tools(self) -> list[ToolSchema]:
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "count",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"amount": {"type": "integer"}},
+                            "required": ["amount"],
+                        },
                     },
-                },
-            }
-        ]
+                }
+            ]
 
         @asynccontextmanager
-        async def init_env(self, *, max_steps: int, timeout: float) -> AsyncGenerator[Environment]:
-            assert max_steps == 3 and timeout == 2
+        async def init_env(self) -> AsyncGenerator[Environment]:
             events.append("enter")
             try:
                 if mode == "setup_error":
                     raise RuntimeError("Setup failed")
+                if mode == "setup_timeout":
+                    await asyncio.Future()
                 yield ExampleEnvironment()
             finally:
                 events.append("exit")
@@ -616,9 +646,12 @@ def test_generic_task_environment_lifetime(mode: str, tokenizer: PreTrainedToken
         )
 
     async def run() -> loop.Rollout:
+        task: Task = ExampleTask()
         async with make_client(respond) as client:
-            task: Task = ExampleTask()
-            running = asyncio.create_task(make_agent(tokenizer, client).run(task))
+            agent = make_agent(tokenizer, client)
+            if mode == "setup_timeout":
+                agent = replace(agent, rollout_timeout=0.01)
+            running = asyncio.create_task(agent.run(task))
             if mode == "cancel":
                 await stepping.wait()
                 running.cancel()
@@ -628,7 +661,9 @@ def test_generic_task_environment_lifetime(mode: str, tokenizer: PreTrainedToken
         result = asyncio.run(run())
         assert result.reward == 0.5 and result.stop_condition == "environment_done"
         assert "Counted two" in result.interaction
+        assert result.prompt == "Count two."
     else:
-        with pytest.raises(asyncio.CancelledError if mode == "cancel" else RuntimeError):
+        error = {"cancel": asyncio.CancelledError, "setup_timeout": TimeoutError}.get(mode, RuntimeError)
+        with pytest.raises(error):
             asyncio.run(run())
     assert events == ["enter", "exit"]

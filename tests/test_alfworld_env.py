@@ -18,7 +18,7 @@ def config_file(tmp_path: Path) -> Path:
                 "dataset": {"data_path": "games"},
                 "env": {"goal_desc_human_anns_prob": 0},
                 "general": {},
-                "rl": {"training": {}},
+                "rl": {"training": {"max_nb_steps_per_episode": 1}},
             }
         )
     )
@@ -42,14 +42,14 @@ def test_episode_reset_step_and_cleanup(config_file: Path, monkeypatch: pytest.M
     loader.init_env.return_value = upstream
     constructor = Mock(return_value=loader)
     monkeypatch.setattr(env, "AlfredTWEnv", constructor)
-    with closing(env.ALFWorld(config_file=str(config_file), max_steps=3, task_id=str(game))) as environment:
+    with closing(env.ALFWorld(config_file=str(config_file), task_id=str(game))) as environment:
         settings = constructor.call_args.args[0]
         assert constructor.call_args.kwargs == {"train_eval": "train"}
         assert settings["dataset"]["data_path"] == str(game.parent)
         assert settings["dataset"]["num_train_games"] == -1
         assert settings["env"]["task_types"] == [1, 2, 3, 4, 5, 6]
         assert settings["general"]["training_method"] == "dqn"
-        assert settings["rl"]["training"]["max_nb_steps_per_episode"] == 3
+        assert settings["rl"]["training"]["max_nb_steps_per_episode"] is None
         initial = environment.reset()
         assert "look" in initial.observation
         assert environment.commands == ["look"]
@@ -59,7 +59,7 @@ def test_episode_reset_step_and_cleanup(config_file: Path, monkeypatch: pytest.M
         assert result.done and result.reward == 1.0
         upstream.step.assert_called_once_with(["look"])
         upstream.reset.return_value = (["Already done"], {"admissible_commands": [[]], "won": [True]})
-        assert environment.reset() == env.EpisodeResult(
+        assert environment.reset() == env.StepResult(
             observation="Already done\nAdmissible commands: ", reward=1.0, done=True
         )
         upstream.reset.side_effect = RuntimeError("reset failed")
@@ -72,11 +72,11 @@ def test_episode_loads_only_selected_game(config_file: Path, monkeypatch: pytest
     root = config_file.parent / "games"
     first = write_game(root / "train-a")
     second = write_game(root / "train-b")
-    assert env.discover_games(str(config_file), max_steps=2) == [str(first), str(second)]
+    assert env.discover_games(str(config_file)) == [str(first), str(second)]
     # Loading the selected episode must not read a sibling's metadata again.
     (second.parent / "traj_data.json").write_text("invalid JSON")
     monkeypatch.chdir(config_file.parent.parent)
-    with closing(env.ALFWorld(config_file=str(config_file), max_steps=2, task_id=str(first))) as environment:
+    with closing(env.ALFWorld(config_file=str(config_file), task_id=str(first))) as environment:
         assert environment.loader.game_files == [str(first)]
         assert environment.loader.num_games == 1
 
@@ -99,7 +99,7 @@ def test_episode_rejects_invalid_game(reason: str, config_file: Path) -> None:
         if reason == "wrong-file":
             game = game.parent / "traj_data.json"
     with pytest.raises(ValueError, match="training"):
-        env.ALFWorld(config_file=str(config_file), max_steps=2, task_id=str(game))
+        env.ALFWorld(config_file=str(config_file), task_id=str(game))
 
 
 @pytest.mark.parametrize("path_kind", ["relative", "environment"])
@@ -117,13 +117,13 @@ def test_dataset_path_is_independent_of_working_directory(
                 "dataset": {"data_path": "../games" if path_kind == "relative" else "$RL2_TEST_DATA"},
                 "env": {"goal_desc_human_anns_prob": 0},
                 "general": {},
-                "rl": {"training": {}},
+                "rl": {"training": {"max_nb_steps_per_episode": 1}},
             }
         )
     )
     for directory in (config_dir, tmp_path):
         monkeypatch.chdir(directory)
-        assert env.discover_games(str(config_file), max_steps=2) == [str(game_file)]
+        assert env.discover_games(str(config_file)) == [str(game_file)]
 
 
 @pytest.mark.parametrize("ids", [["a", "b"], [], ["a", "a"], [""]], ids=["valid", "empty", "duplicate", "empty-id"])
@@ -136,13 +136,13 @@ def test_task_discovery(ids: list[str], monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(env.ray, "cancel", cancel)
     config = env.ALFWorldConfig(config_file="config.yaml")
     if ids == ["a", "b"]:
-        tasks = env.load_alfworld_tasks(config, max_steps=3, timeout=10)
+        tasks = env.load_alfworld_tasks(config, timeout=10)
         assert [task.id for task in tasks] == ids
         assert all(task.config_file == str(Path("config.yaml").resolve()) for task in tasks)
     else:
         with pytest.raises(ValueError, match="nonempty and unique"):
-            env.load_alfworld_tasks(config, max_steps=3, timeout=10)
-    discover.remote.assert_called_once_with(str(Path("config.yaml").resolve()), 3)
+            env.load_alfworld_tasks(config, timeout=10)
+    discover.remote.assert_called_once_with(str(Path("config.yaml").resolve()))
     get.assert_called_once_with(discover.remote.return_value, timeout=10)
     cancel.assert_called_once_with(discover.remote.return_value, force=True)
 
@@ -154,24 +154,24 @@ def test_task_discovery_timeout_cancels_work(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(env.ray, "get", Mock(side_effect=env.ray.exceptions.GetTimeoutError))
     monkeypatch.setattr(env.ray, "cancel", cancel)
     with pytest.raises(env.ray.exceptions.GetTimeoutError):
-        env.load_alfworld_tasks(env.ALFWorldConfig(config_file="config.yaml"), max_steps=2, timeout=1)
+        env.load_alfworld_tasks(env.ALFWorldConfig(config_file="config.yaml"), timeout=1)
     cancel.assert_called_once_with(discover.remote.return_value, force=True)
 
 
 def test_worker_reset_step_and_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
     environment = Mock()
-    environment.reset.return_value = env.EpisodeResult(observation="Goal", reward=0.0, done=False)
-    environment.step.return_value = env.EpisodeResult(observation="Success", reward=1.0, done=True)
+    environment.reset.return_value = env.StepResult(observation="Goal", reward=0.0, done=False)
+    environment.step.return_value = env.StepResult(observation="Success", reward=1.0, done=True)
     environment.commands = ["look"]
     constructor = Mock(return_value=environment)
     monkeypatch.setattr(env, "ALFWorld", constructor)
     worker = env.ALFWorldWorker.__ray_metadata__.modified_class(
-        task=env.ALFWorldTask(id="train/a", config_file="config.yaml"), max_steps=2
+        task=env.ALFWorldTask(id="train/a", config_file="config.yaml")
     )
     with closing(worker):
         rewards = [worker.reset().reward]
         rewards.extend(worker.step(env.ToolCall(name="look", arguments={})).reward for _ in range(2))
-    constructor.assert_called_once_with(config_file="config.yaml", max_steps=2, task_id="train/a")
+    constructor.assert_called_once_with(config_file="config.yaml", task_id="train/a")
     assert rewards == [0.0, 0.0, 1.0]
     environment.step.assert_called_once_with("look")
     environment.close.assert_called_once()
@@ -185,12 +185,12 @@ def test_session_startup_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     task = env.ALFWorldTask(id="a", config_file="unused")
 
     async def run() -> None:
-        async with task.init_env(max_steps=2, timeout=5):
+        async with task.init_env():
             pytest.fail("Failed startup entered the session")
 
     with pytest.raises(RuntimeError, match="actor creation failed"):
         asyncio.run(run())
-    worker.remote.assert_called_once_with(task=task, max_steps=2)
+    worker.remote.assert_called_once_with(task=task)
     kill.assert_not_called()
 
 
@@ -205,12 +205,12 @@ def test_session_pending_result_keeps_loop_responsive(method: str, monkeypatch: 
         loop = asyncio.get_running_loop()
         started = asyncio.Event()
         result = loop.create_future()
-        result.set_result(env.EpisodeResult(observation="ready", reward=0.0, done=False))
+        result.set_result(env.StepResult(observation="ready", reward=0.0, done=False))
         pending = loop.create_future()
         for name in ("reset", "step", "close"):
             getattr(actor, name).remote = Mock(return_value=result)
 
-        def submit(*args: object) -> asyncio.Future[env.EpisodeResult]:
+        def submit(*args: object) -> asyncio.Future[env.StepResult]:
             started.set()
             return pending
 
@@ -218,8 +218,13 @@ def test_session_pending_result_keeps_loop_responsive(method: str, monkeypatch: 
         task = env.ALFWorldTask(id="a", config_file="unused")
 
         async def use_session() -> None:
-            async with task.init_env(max_steps=2, timeout=5) as session:
-                assert (await session.reset()).observation == "ready"
+            async with task.init_env() as session:
+                initial = await session.reset()
+                assert initial.observation == "ready"
+                assert initial.reward == 0.0 and not initial.done
+                assert task.system_prompt.startswith("Use one action tool per turn.")
+                assert task.prompt.startswith("Call look to read your goal and surroundings")
+                assert task.tools == env.tool_schemas()
                 await session.step(env.ToolCall(name="look", arguments={}))
 
         async with asyncio.TaskGroup() as group:
@@ -241,20 +246,20 @@ def test_session_actor_cleanup(mode: str, monkeypatch: pytest.MonkeyPatch) -> No
     task = env.ALFWorldTask(id=mode, config_file="unused")
 
     async def run() -> None:
-        async def reset() -> env.EpisodeResult:
+        async def reset() -> env.StepResult:
             if mode == "crash":
                 raise RuntimeError("worker failed")
             if mode == "reset_timeout":
                 await asyncio.Future()
-            return env.EpisodeResult(observation="ready", reward=0.0, done=False)
+            return env.StepResult(observation="ready", reward=0.0, done=False)
 
-        async def step(action: env.ToolCall) -> env.EpisodeResult:
+        async def step(action: env.ToolCall) -> env.StepResult:
             assert action == env.ToolCall(name="look", arguments={})
             if mode in {"step_timeout", "cancel"}:
                 if mode == "cancel":
                     asyncio.get_running_loop().call_soon(current.cancel)
                 await asyncio.Future()
-            return env.EpisodeResult(observation="stepped", reward=1.0, done=True)
+            return env.StepResult(observation="stepped", reward=1.0, done=True)
 
         async def close() -> None:
             if mode == "close_error":
@@ -265,11 +270,13 @@ def test_session_actor_cleanup(mode: str, monkeypatch: pytest.MonkeyPatch) -> No
         actor.reset.remote = AsyncMock(side_effect=reset)
         actor.step.remote = AsyncMock(side_effect=step)
         actor.close.remote = AsyncMock(side_effect=close)
-        async with task.init_env(max_steps=2, timeout=0.01 if mode.endswith("timeout") else 5) as session:
-            result = await session.reset()
+        async with task.init_env() as session:
+            result = await session.reset(timeout=0 if mode == "reset_timeout" else None)
             assert result.observation == "ready"
-            result = await session.step(env.ToolCall(name="look", arguments={}))
-            assert result == env.EpisodeResult(observation="stepped", reward=1.0, done=True)
+            result = await session.step(
+                env.ToolCall(name="look", arguments={}), timeout=0 if mode == "step_timeout" else None
+            )
+            assert result == env.StepResult(observation="stepped", reward=1.0, done=True)
 
     error = {
         "crash": RuntimeError,
@@ -283,7 +290,7 @@ def test_session_actor_cleanup(mode: str, monkeypatch: pytest.MonkeyPatch) -> No
             asyncio.run(run())
     else:
         asyncio.run(run())
-    worker.remote.assert_called_once_with(task=task, max_steps=2)
+    worker.remote.assert_called_once_with(task=task)
     actor.reset.remote.assert_awaited_once_with()
     if mode in {"crash", "reset_timeout"}:
         actor.step.remote.assert_not_called()
@@ -315,10 +322,10 @@ def test_session_actor_cleanup(mode: str, monkeypatch: pytest.MonkeyPatch) -> No
 )
 def test_tool_commands(name: str, arguments: dict[str, str], command: str) -> None:
     environment = Mock(commands=[])
-    initial = env.EpisodeResult(observation="Goal", reward=0.0, done=False)
+    initial = env.StepResult(observation="Goal", reward=0.0, done=False)
     environment.reset.return_value = initial
     environment.step.return_value = initial
-    tools = env.ALFWorldTools(environment=environment, max_steps=2)
+    tools = env.ALFWorldTools(environment=environment)
     assert tools.reset() == initial
     assert tools.call(env.ToolCall(name="look", arguments={})) == initial
     environment.step.assert_not_called()
@@ -346,9 +353,9 @@ def test_tool_commands(name: str, arguments: dict[str, str], command: str) -> No
 @pytest.mark.parametrize("command", ["put mug 1 in/on desk 1", "put mug 1 into desk 1", "put mug 1 in desk 1"])
 def test_placement_aliases_and_terminal_state(command: str) -> None:
     environment = Mock(commands=[command])
-    environment.reset.return_value = env.EpisodeResult(observation="Goal", reward=0.0, done=False)
-    environment.step.return_value = env.EpisodeResult(observation="Done", reward=1.0, done=True)
-    tools = env.ALFWorldTools(environment=environment, max_steps=2)
+    environment.reset.return_value = env.StepResult(observation="Goal", reward=0.0, done=False)
+    environment.step.return_value = env.StepResult(observation="Done", reward=1.0, done=True)
+    tools = env.ALFWorldTools(environment=environment)
     tools.reset()
     result = tools.call(env.ToolCall(name="move", arguments={"object": "mug 1", "location": "desk 1"}))
     assert result.done and result.reward == 1.0
@@ -356,16 +363,17 @@ def test_placement_aliases_and_terminal_state(command: str) -> None:
     environment.step.assert_called_once_with(command)
 
 
-def test_tool_step_budget() -> None:
+def test_tools_do_not_limit_steps() -> None:
     environment = Mock(commands=["look"])
-    initial = env.EpisodeResult(observation="Goal", reward=0.0, done=False)
+    initial = env.StepResult(observation="Goal", reward=0.0, done=False)
     environment.reset.return_value = environment.step.return_value = initial
-    tools = env.ALFWorldTools(environment=environment, max_steps=1)
+    tools = env.ALFWorldTools(environment=environment)
     tools.reset()
     assert not tools.call(env.ToolCall(name="look", arguments={})).done
-    assert tools.call(env.ToolCall(name="look", arguments={})).done
-    assert tools.call(env.ToolCall(name="look", arguments={})).done
-    environment.step.assert_called_once_with("look")
+    for _ in range(3):
+        assert tools.call(env.ToolCall(name="look", arguments={})) == initial
+    assert environment.step.call_count == 3
+    environment.step.assert_called_with("look")
     tools.reset()
     assert not tools.call(env.ToolCall(name="look", arguments={})).done
 
@@ -376,6 +384,6 @@ def test_tool_step_budget() -> None:
     ids=["unknown", "missing-argument", "extra-argument", "argument-type"],
 )
 def test_invalid_action_does_not_reach_worker(name: str, arguments: dict[str, object]) -> None:
-    session = env.ALFWorldSession(task=env.ALFWorldTask(id="a", config_file="config.yaml"), max_steps=2, timeout=1)
+    session = env.ALFWorldSession(task=env.ALFWorldTask(id="a", config_file="config.yaml"))
     with pytest.raises(env.ToolCallError):
         asyncio.run(session.step(env.ToolCall(name=name, arguments=arguments)))
