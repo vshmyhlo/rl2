@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
+from typing import cast
 
 
 @dataclass
@@ -19,30 +20,36 @@ async def prefetch[T](source: AsyncIterator[T], n: int) -> AsyncGenerator[T]:
         raise ValueError("n must be at least 1")
 
     queue: asyncio.Queue[T | _End] = asyncio.Queue(maxsize=n)
+    end = _End()
     closing = False
 
     async def produce() -> None:
         try:
             while True:
                 item = await anext(source)
+                # The source may handle cancellation by returning one last item.
+                if closing:
+                    return
                 await queue.put(item)
         except StopAsyncIteration:
-            await queue.put(_End())
+            pass
         except BaseException as error:
             if closing:
                 raise
             # Deliver failures on consumption, without interrupting the consumer's work.
-            await queue.put(_End(error=error))
+            end.error = error
+        if not closing:
+            await queue.put(end)
 
     producer = asyncio.create_task(produce())
     try:
         while True:
             item = await queue.get()
-            if isinstance(item, _End):
-                if item.error is not None:
-                    raise item.error
+            if item is end:
+                if end.error is not None:
+                    raise end.error
                 return
-            yield item
+            yield cast(T, item)
     finally:
         closing = True
         producer.cancel()

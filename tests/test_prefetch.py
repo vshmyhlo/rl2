@@ -4,10 +4,10 @@ from contextlib import aclosing
 
 import pytest
 
-from rl2.prefetch import prefetch
+from rl2.prefetch import _End, prefetch
 
 
-@pytest.mark.parametrize("values", [[], [None, ValueError("data"), 1]], ids=["empty", "ordered-values"])
+@pytest.mark.parametrize("values", [[], [None, ValueError("data"), _End(), 1]], ids=["empty", "ordered-values"])
 def test_prefetch_values(values: list[object]) -> None:
     async def source() -> AsyncGenerator[object]:
         for value in values:
@@ -95,6 +95,33 @@ def test_prefetch_close_cancels_inflight_read() -> None:
                 assert await anext(buffered) == 1
                 await reading.wait()
             assert stopped.is_set()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("yield_on_cancel", [False, True], ids=["stop", "final-item"])
+def test_prefetch_close_when_source_handles_cancellation(yield_on_cancel: bool) -> None:
+    async def run() -> None:
+        reading = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def source() -> AsyncGenerator[int]:
+            yield 1
+            yield 2
+            reading.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                if yield_on_cancel:
+                    yield 3
+                    pytest.fail("Source must not be read again during shutdown")
+
+        async with asyncio.timeout(5), aclosing(source()) as items:
+            async with aclosing(prefetch(items, n=1)) as buffered:
+                assert await anext(buffered) == 1
+                await reading.wait()
+            assert cancelled.is_set()
 
     asyncio.run(run())
 
