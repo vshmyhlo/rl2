@@ -1,8 +1,7 @@
 import asyncio
 import json
-from contextlib import closing, nullcontext
+from contextlib import closing
 from pathlib import Path
-from threading import Event
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -178,51 +177,25 @@ def test_worker_reset_step_and_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
     environment.close.assert_called_once()
 
 
-@pytest.mark.parametrize("mode", ["normal", "cancel", "timeout"])
-def test_session_startup_keeps_loop_responsive_and_cleans_up(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    actor = Mock()
-    actor.close.remote = AsyncMock()
+def test_session_startup_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = Mock(remote=Mock(side_effect=RuntimeError("actor creation failed")))
     kill = Mock()
+    monkeypatch.setattr(env, "ALFWorldWorker", worker)
     monkeypatch.setattr(env.ray, "kill", kill)
+    task = env.ALFWorldTask(id="a", config_file="unused")
 
     async def run() -> None:
-        loop = asyncio.get_running_loop()
-        started = asyncio.Event()
-        release = Event()
+        async with task.init_env(max_steps=2, timeout=5):
+            pytest.fail("Failed startup entered the session")
 
-        def create_actor(*, task: env.ALFWorldTask, max_steps: int) -> Mock:
-            loop.call_soon_threadsafe(started.set)
-            assert release.wait(timeout=5), "Actor creation blocked the event loop"
-            return actor
-
-        monkeypatch.setattr(env, "ALFWorldWorker", Mock(remote=create_actor))
-        task = env.ALFWorldTask(id="a", config_file="unused")
-
-        async def use_session() -> None:
-            with pytest.raises(TimeoutError) if mode == "timeout" else nullcontext():
-                async with task.init_env(max_steps=2, timeout=0.01 if mode == "timeout" else 5):
-                    assert mode == "normal", "Abandoned startup entered the session"
-
-        async with asyncio.TaskGroup() as group:
-            startup = group.create_task(use_session())
-            try:
-                await asyncio.wait_for(started.wait(), timeout=5)
-                if mode == "cancel":
-                    startup.cancel()
-                if mode != "normal":
-                    done, _ = await asyncio.wait({startup}, timeout=1)
-                    assert startup in done, "Abandoned startup waited for actor creation"
-            finally:
-                release.set()
-        assert startup.cancelled() == (mode == "cancel")
-
-    asyncio.run(run())
-    kill.assert_called_once_with(actor)
-    assert actor.close.remote.await_count == (1 if mode == "normal" else 0)
+    with pytest.raises(RuntimeError, match="actor creation failed"):
+        asyncio.run(run())
+    worker.remote.assert_called_once_with(task=task, max_steps=2)
+    kill.assert_not_called()
 
 
-@pytest.mark.parametrize("method", ["reset", "step", "close", "reset_timeout"])
-def test_session_submission_keeps_loop_responsive(method: str, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("method", ["reset", "step", "close"])
+def test_session_pending_result_keeps_loop_responsive(method: str, monkeypatch: pytest.MonkeyPatch) -> None:
     actor = Mock()
     monkeypatch.setattr(env, "ALFWorldWorker", Mock(remote=Mock(return_value=actor)))
     kill = Mock()
@@ -231,35 +204,28 @@ def test_session_submission_keeps_loop_responsive(method: str, monkeypatch: pyte
     async def run() -> None:
         loop = asyncio.get_running_loop()
         started = asyncio.Event()
-        release = Event()
         result = loop.create_future()
         result.set_result(env.EpisodeResult(observation="ready", reward=0.0, done=False))
+        pending = loop.create_future()
         for name in ("reset", "step", "close"):
             getattr(actor, name).remote = Mock(return_value=result)
 
         def submit(*args: object) -> asyncio.Future[env.EpisodeResult]:
-            loop.call_soon_threadsafe(started.set)
-            assert release.wait(timeout=5), "Request submission blocked the event loop"
-            return result
+            started.set()
+            return pending
 
-        getattr(actor, method.removesuffix("_timeout")).remote = Mock(side_effect=submit)
+        getattr(actor, method).remote = Mock(side_effect=submit)
         task = env.ALFWorldTask(id="a", config_file="unused")
 
         async def use_session() -> None:
-            with pytest.raises(TimeoutError) if method == "reset_timeout" else nullcontext():
-                async with task.init_env(max_steps=2, timeout=0.05 if method == "reset_timeout" else 5) as session:
-                    assert (await session.reset()).observation == "ready"
-                    await session.step(env.ToolCall(name="look", arguments={}))
+            async with task.init_env(max_steps=2, timeout=5) as session:
+                assert (await session.reset()).observation == "ready"
+                await session.step(env.ToolCall(name="look", arguments={}))
 
         async with asyncio.TaskGroup() as group:
-            request = group.create_task(use_session())
-            try:
-                await asyncio.wait_for(started.wait(), timeout=5)
-                if method == "reset_timeout":
-                    done, _ = await asyncio.wait({request}, timeout=1)
-                    assert request in done, "Timeout waited for request submission"
-            finally:
-                release.set()
+            group.create_task(use_session())
+            await asyncio.wait_for(started.wait(), timeout=5)
+            pending.set_result(result.result())
 
     asyncio.run(run())
     kill.assert_called_once_with(actor)

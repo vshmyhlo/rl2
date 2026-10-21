@@ -14,6 +14,7 @@ import yaml
 from alfworld.agents.environment.alfred_tw_env import AlfredTWEnv
 from pydantic import ConfigDict, TypeAdapter, ValidationError
 from pydantic.dataclasses import dataclass as config_dataclass
+from ray.actor import ActorHandle
 
 from rl2.agent_task import Environment, EpisodeResult, Task, ToolCall, ToolCallError, ToolSchema
 
@@ -279,7 +280,7 @@ class ALFWorldSession(Environment):
         self.timeout = timeout
 
     async def __aenter__(self) -> Self:
-        self.actor = ALFWorldWorker.remote(task=self.task, max_steps=self.max_steps)
+        self.actor: ActorHandle = ALFWorldWorker.remote(task=self.task, max_steps=self.max_steps)
         return self
 
     async def reset(self) -> EpisodeResult:

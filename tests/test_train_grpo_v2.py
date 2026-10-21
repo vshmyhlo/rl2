@@ -417,7 +417,7 @@ def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPa
         actor = actor_class.__new__(actor_class)
         with pytest.raises(TimeoutError, match="not ready"):
             actor.__init__(config=config)
-        actor.__ray_shutdown__()
+        asyncio.run(actor.aclose())
     else:
         actor = training.Actor.__ray_metadata__.modified_class(config=config)
         actor.collect_group = AsyncMock(return_value=group)
@@ -427,11 +427,42 @@ def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPa
         actor.collect_group.assert_awaited_with(actor.tasks[0], group_size=2)
         assert actor.collect_group.await_count == 2
         server.__exit__.assert_not_called()
-        actor.__ray_shutdown__()
+        asyncio.run(actor.aclose())
+        asyncio.run(actor.aclose())
     serve.assert_called_once_with(model=config.model)
     ready.assert_called_once_with(server.__enter__.return_value)
     server.__enter__.assert_called_once()
     server.__exit__.assert_called_once()
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_actor_close_releases_server_after_agent(
+    cleanup_fails: bool, actor: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = AsyncMock()
+    agent.__aenter__.return_value = agent
+    if cleanup_fails:
+        agent.__aexit__.side_effect = RuntimeError("agent cleanup failed")
+    monkeypatch.setattr(training, "create_agent", Mock(return_value=agent))
+
+    def close_server() -> None:
+        agent.__aexit__.assert_awaited_once()
+
+    close = Mock(side_effect=close_server)
+    actor._server.callback(close)
+
+    async def run() -> None:
+        await actor._get_agent()
+        if cleanup_fails:
+            with pytest.raises(RuntimeError, match="agent cleanup failed"):
+                await actor.aclose()
+        else:
+            await actor.aclose()
+        close.assert_called_once_with()
+        await actor.aclose()
+
+    asyncio.run(run())
+    close.assert_called_once_with()
 
 
 @pytest.fixture

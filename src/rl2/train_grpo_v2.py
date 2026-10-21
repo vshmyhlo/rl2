@@ -65,7 +65,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Generator
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
 from functools import partial
@@ -449,7 +449,7 @@ async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]
 
 
 @contextmanager
-def serve_vllm(model: str = MODEL) -> Iterator[subprocess.Popen[bytes]]:
+def serve_vllm(model: str = MODEL) -> Generator[subprocess.Popen[bytes]]:
     logger.info("Starting vLLM server for %s", model)
     # Inherit the GPU assigned to this actor through CUDA_VISIBLE_DEVICES.
     with subprocess.Popen(
@@ -843,11 +843,6 @@ class Actor:
             self._server = resources.pop_all()
         logger.info("Actor ready for rollout requests: tasks=%s", len(self.tasks))
 
-    def __ray_shutdown__(self) -> None:
-        logger.info("Shutting down actor")
-        self._server.close()
-        logger.info("Actor resources released")
-
     async def _get_agent(self) -> Agent:
         async with self._agent_lock:
             if self._closed:
@@ -857,8 +852,9 @@ class Actor:
             return self._agent
 
     async def aclose(self) -> None:
-        # Ray's synchronous shutdown hook cannot await the agent's cleanup.
-        async with self._agent_lock, self._agent_resources:
+        async with self._agent_lock, AsyncExitStack() as resources, self._agent_resources:
+            # Ray termination does not call a user-defined shutdown hook.
+            resources.push_async_callback(asyncio.to_thread, self._server.close)
             self._closed = True
             runs = list(self._runs)
             for run in runs:

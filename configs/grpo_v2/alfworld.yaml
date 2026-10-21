@@ -2,9 +2,9 @@ model: Qwen/Qwen3-0.6B
 taskset:
   id: alfworld
   config_file: data/alfworld/base_config.yaml
-seed: 3
-num_groups: 1
-group_size: 4
+seed: 4
+num_groups: 4
+group_size: 8
 max_tokens: 1024
 max_turns: 50
 rollout_timeout: 1200
