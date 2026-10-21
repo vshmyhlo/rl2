@@ -95,7 +95,6 @@ from opentelemetry import trace as otel_trace
 from opentelemetry.trace import StatusCode
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass as config_dataclass
-from ray._private import profiling
 from ray.actor import ActorHandle
 from renderers.configs import CustomRendererConfig
 from verifiers.v1.configs.agent import TimeoutConfig
@@ -103,8 +102,8 @@ from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsA
 from vllm.utils.network_utils import get_open_port
 
 from rl2.addition_env import AdditionTaskset
+from rl2.alfworld_env import ALFWorldConfig, load_alfworld_tasks
 from rl2.benchmark_env import (
-    ALFWorldConfig,
     AppWorldConfig,
     BenchmarkTask,
     Tau2Config,
@@ -755,7 +754,7 @@ class Batcher:
         results = [task.result() for task in tasks]
         fetched = time.monotonic()
         groups = [group for group, _ in results]
-        with profiling.profile("batcher.prepare_batch"), span("batcher.prepare_batch"):
+        with span("batcher.prepare_batch"):
             training_batch = self.prepare_batch(groups, context_length=context_length)  # (B, T), (B,) leaves.
         prepared = time.monotonic()
         batch = build_rollout_batch(
@@ -846,24 +845,15 @@ class Learner:
                     root=True,
                 ):
                     started = time.monotonic()
-                    with (
-                        profiling.profile("learner.fetch_batch", extra_data={"iteration": str(iteration)}),
-                        span("learner.fetch_batch"),
-                    ):
+                    with span("learner.fetch_batch"):
                         batch = self.fetch_next_batch(
                             num_groups=self.config.num_groups, group_size=self.config.group_size
                         )
                     fetched = time.monotonic()
-                    with (
-                        profiling.profile("learner.optimize", extra_data={"iteration": str(iteration)}),
-                        span("learner.optimize"),
-                    ):
+                    with span("learner.optimize"):
                         update_metrics = self.optimize(batch.training_batch)
                     optimized = time.monotonic()
-                    with (
-                        profiling.profile("learner.publish_weights", extra_data={"iteration": str(iteration)}),
-                        span("learner.publish_weights"),
-                    ):
+                    with span("learner.publish_weights"):
                         self.publish_weights()
                     now = time.monotonic()
                     num_rollouts = batch.training_batch.token_ids.shape[0]
@@ -905,18 +895,12 @@ class Learner:
                         scalars["time/learner/weight_transfer_seconds"],
                     )
                     if iteration % 10 == 0:
-                        with (
-                            profiling.profile("learner.log_examples", extra_data={"iteration": str(iteration)}),
-                            span("learner.log_examples"),
-                        ):
+                        with span("learner.log_examples"):
                             examples = f"Rollout examples | step {iteration}\n\n{batch.examples}"
                             logger.info("\n%s", examples)
                             writer.log_text(examples, f"examples/{iteration}.txt")
                     if iteration % self.config.checkpoint_interval == 0 or iteration == self.config.total_iterations:
-                        with (
-                            profiling.profile("learner.checkpoint", extra_data={"iteration": str(iteration)}),
-                            span("learner.checkpoint"),
-                        ):
+                        with span("learner.checkpoint"):
                             scalars["time/checkpoint_seconds"] = save_checkpoint(
                                 manager,
                                 TrainingProgress(
@@ -929,10 +913,7 @@ class Learner:
                                 ),
                                 self.config,
                             )
-                    with (
-                        profiling.profile("learner.log_metrics", extra_data={"iteration": str(iteration)}),
-                        span("learner.log_metrics"),
-                    ):
+                    with span("learner.log_metrics"):
                         writer.log_metrics(scalars, step=iteration)
 
     def fetch_next_batch(self, num_groups: int, group_size: int) -> RolloutBatch:
@@ -1026,8 +1007,10 @@ class Actor:
         self._runs: set[asyncio.Task[vf.Trace]] = set()
         self._closed = False
         self._weights_valid = True
-        if isinstance(config.taskset, (WebShopConfig, ALFWorldConfig, Tau2Config, AppWorldConfig)):
+        if isinstance(config.taskset, (WebShopConfig, Tau2Config, AppWorldConfig)):
             self.tasks = load_benchmark_tasks(config.taskset, config.max_turns, config.environment_timeout)
+        elif isinstance(config.taskset, ALFWorldConfig):
+            self.tasks = load_alfworld_tasks(config.taskset, config.max_turns)
         elif config.taskset.id == "codegym":
             self.tasks = list(CodeGymTaskset(config=CodeGymTasksetConfig(data_file=config.taskset.dataset_file)))
         elif config.taskset.id == "toolrl":
@@ -1082,37 +1065,31 @@ class Actor:
         return Transfer(value=group, ready_at=time.monotonic())
 
     async def initialize_weight_transfer(self, init_info: dict[str, Any]) -> None:
-        with profiling.profile("actor.initialize_weight_transfer"), span("actor.initialize_weight_transfer"):
+        with span("actor.initialize_weight_transfer"):
             async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:
                 response = await client.post("/init_weight_transfer_engine", json={"init_info": init_info})
                 response.raise_for_status()
 
     async def update_weights(self, update_info: dict[str, Any]) -> None:
-        with profiling.profile("actor.update_weights"), span("actor.update_weights"):
+        with span("actor.update_weights"):
             self._weights_valid = False
             logger.info("Receiving learner weights: tensors=%s", len(update_info["names"]))
             async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:
-                with (
-                    profiling.profile("actor.update_weights.pause"),
-                    span("actor.update_weights.pause", {"mode": self.config.weight_update_pause_mode}),
-                ):
+                with span("actor.update_weights.pause", {"mode": self.config.weight_update_pause_mode}):
                     response = await client.post(
                         "/pause", params={"mode": self.config.weight_update_pause_mode, "clear_cache": "true"}
                     )
                     response.raise_for_status()
-                with profiling.profile("actor.update_weights.start"), span("actor.update_weights.start"):
+                with span("actor.update_weights.start"):
                     response = await client.post("/start_weight_update")
                     response.raise_for_status()
-                with (
-                    profiling.profile("actor.update_weights.transfer"),
-                    span("actor.update_weights.transfer", {"tensor_count": len(update_info["names"])}),
-                ):
+                with span("actor.update_weights.transfer", {"tensor_count": len(update_info["names"])}):
                     response = await client.post("/update_weights", json={"update_info": update_info})
                     response.raise_for_status()
-                with profiling.profile("actor.update_weights.finish"), span("actor.update_weights.finish"):
+                with span("actor.update_weights.finish"):
                     response = await client.post("/finish_weight_update")
                     response.raise_for_status()
-                with profiling.profile("actor.update_weights.resume"), span("actor.update_weights.resume"):
+                with span("actor.update_weights.resume"):
                     response = await client.post("/resume")
                     response.raise_for_status()
             self._weights_valid = True
@@ -1121,26 +1098,18 @@ class Actor:
     async def collect_group(self, task: vf.Task, group_size: int) -> RolloutGroup:
         if group_size < 2:
             raise ValueError("group_size must be at least 2")
-        profile_data = {"group_id": uuid4().hex, "task_id": str(task.data.id), "group_size": str(group_size)}
+        span_data = {"group_id": uuid4().hex, "task_id": str(task.data.id), "group_size": str(group_size)}
         started = time.monotonic()
         logger.info("Collecting group: task=%s group_size=%s", task.data.id, group_size)
         try:
-            with (
-                profiling.profile("actor.collect_group", extra_data=profile_data),
-                span("actor.collect_group", {**profile_data, "run_id": self.config.run_id or "unspecified"}),
-            ):
+            with span("actor.collect_group", {**span_data, "run_id": self.config.run_id or "unspecified"}):
                 agent = await self._get_agent()
                 async with asyncio.TaskGroup() as pending:
 
                     async def run_rollout(index: int) -> vf.Trace:
-                        with (
-                            profiling.profile(
-                                "actor.rollout", extra_data={**profile_data, "rollout_index": str(index)}
-                            ),
-                            span("actor.rollout", {**profile_data, "rollout_index": index}) as rollout_span,
-                        ):
+                        with span("actor.rollout", {**span_data, "rollout_index": index}) as rollout_span:
                             if isinstance(task, BenchmarkTask) and isinstance(
-                                self.config.taskset, (WebShopConfig, ALFWorldConfig, Tau2Config, AppWorldConfig)
+                                self.config.taskset, (WebShopConfig, Tau2Config, AppWorldConfig)
                             ):
                                 result = await task.run(
                                     agent,
@@ -1162,7 +1131,7 @@ class Actor:
                     self._runs.update(runs)
                     for run in runs:
                         run.add_done_callback(self._runs.discard)
-                with profiling.profile("actor.score_group", extra_data=profile_data), span("actor.score_group"):
+                with span("actor.score_group"):
                     group = await score_group(task, [run.result() for run in runs])
         except Exception:
             logger.exception(

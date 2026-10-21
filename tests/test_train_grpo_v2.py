@@ -9,6 +9,7 @@ import sys
 from collections.abc import Iterator
 from contextlib import ExitStack, aclosing
 from dataclasses import asdict, replace
+from importlib import import_module
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Any, Literal
@@ -37,7 +38,7 @@ from verifiers.v1.runtimes import subprocess as subprocess_runtime
 from verifiers.v1.trace import AgentInfo, AgentSpan, Error, ModelCall, TimeSpan, TimeSplit, Timing, TraceTask
 from verifiers.v1.types import Usage
 
-from rl2 import benchmark_env, codegym_env
+from rl2 import alfworld_env, benchmark_env, codegym_env
 from rl2 import train_grpo_v2 as training
 from rl2.addition_env import AdditionTaskset, AdditionTools
 from rl2.toolrl_env import ToolCall, ToolRLData, ToolRLRenderer, ToolRLTask
@@ -1011,8 +1012,6 @@ def test_learner_logs_examples_every_ten_steps(
     learner: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level("INFO", logger=training.__name__)
-    profile = MagicMock()
-    monkeypatch.setattr(training.profiling, "profile", profile)
     rollout = training.Rollout(
         sequence=training.TrainingSequence(
             token_ids=np.array([1, 2], dtype=np.int32),  # (T=2,)
@@ -1057,11 +1056,6 @@ def test_learner_logs_examples_every_ten_steps(
     monkeypatch.setattr(training, "MLflowLogger", Mock(return_value=writer))
 
     learner.start()
-    for phase in ("learner.fetch_batch", "learner.optimize", "learner.publish_weights"):
-        assert any(
-            call.args == (phase,) and call.kwargs == {"extra_data": {"iteration": "21"}}
-            for call in profile.call_args_list
-        )
 
     artifacts = writer.log_text.call_args_list[1:]  # Skip the config artifact.
     assert [call.args[1] for call in artifacts] == ["examples/10.txt", "examples/20.txt"]
@@ -2143,12 +2137,15 @@ def test_benchmark_preset_and_actor(name: str, monkeypatch: pytest.MonkeyPatch) 
     assert config.environment_timeout == 600
     assert pickle.loads(pickle.dumps(config)) == config
     tasks = Mock(return_value=[Mock()])
-    monkeypatch.setattr(training, "load_benchmark_tasks", tasks)
+    monkeypatch.setattr(training, "load_alfworld_tasks" if name == "alfworld" else "load_benchmark_tasks", tasks)
     monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
     monkeypatch.setattr(training, "wait_for_server", Mock())
     actor = training.Actor.__ray_metadata__.modified_class(config=config)
     assert actor.tasks == tasks.return_value
-    tasks.assert_called_once_with(config.taskset, config.max_turns, config.environment_timeout)
+    if name == "alfworld":
+        tasks.assert_called_once_with(config.taskset, config.max_turns)
+    else:
+        tasks.assert_called_once_with(config.taskset, config.max_turns, config.environment_timeout)
     actor.__ray_shutdown__()
 
 
@@ -2167,10 +2164,8 @@ def test_verifiers_benchmark_rollout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    actor.config = training.Config(
-        taskset=training.AppWorldConfig(python=sys.executable, root=str(tmp_path)),
-        max_turns=1 if mode == "turn-limit" else 3,
-    )
+    config = training.AppWorldConfig(python=sys.executable, root=str(tmp_path))
+    actor.config = training.Config(taskset=config, max_turns=1 if mode == "turn-limit" else 3)
     task = benchmark_env.BenchmarkTask(
         data=benchmark_env.BenchmarkData(id="appworld:test", task_id="test", prompt="test")
     )
@@ -2236,7 +2231,7 @@ Path(os.environ["APPWORLD_ROOT"], str(os.getpid()) + ".closed").write_text(str(s
     for rollout in group.rollouts:
         assert rollout.num_turns == turns
         assert rollout.reward == (0 if mode == "turn-limit" else 1)
-        assert rollout.stop_condition == ("appworld_max_steps" if mode == "turn-limit" else "appworld_done")
+        assert rollout.stop_condition == (f"{config.id}_max_steps" if mode == "turn-limit" else f"{config.id}_done")
         sequence = rollout.sequence
         assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
         np.testing.assert_array_equal(sequence.token_ids[sequence.loss_mask], ids * turns)
@@ -2244,3 +2239,110 @@ Path(os.environ["APPWORLD_ROOT"], str(os.getpid()) + ".closed").write_text(str(s
     closed = list(tmp_path.glob("*.closed"))
     assert len(closed) == 2
     assert all(path.read_text() == str(turns) for path in closed)
+
+
+def test_verifiers_alfworld_tools(
+    actor: Any,
+    local_harness: None,
+    tokenizer: PreTrainedTokenizerFast,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Keep the real tool server, renderer, state synchronization and agent loop.
+    module_path = tmp_path / "fake_alfworld_tools.py"
+    module_path.write_text("""import os
+from pathlib import Path
+from typing import Any
+from rl2 import alfworld_env
+
+class Environment:
+    def __init__(self, config_file: str, max_steps: int) -> None:
+        self.output = Path(config_file)
+        self.commands = ["go to shelf 1", "move mug 1 to desk 1"]
+        self.actions: list[str] = []
+    def reset(self, task_id: str) -> dict[str, Any]:
+        assert task_id == "train/a"
+        return {"observation": "Goal: put the carried mug on the desk", "done": False, "reward": 0.0}
+    def step(self, action: str) -> dict[str, Any]:
+        self.actions.append(action)
+        done = len(self.actions) == 2
+        return {"observation": "Done" if done else "At shelf", "done": done, "reward": float(done)}
+    def close(self) -> None:
+        (self.output / f"{os.getpid()}.closed").write_text("\\n".join(self.actions))
+
+class Tools(alfworld_env.ALFWorldTools):
+    async def setup_task(self, task: alfworld_env.ALFWorldData) -> None:
+        alfworld_env.ALFWorld = Environment
+        await super().setup_task(task)
+
+if __name__ == "__main__":
+    Tools.run()
+""")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(tmp_path), os.environ.get("PYTHONPATH", "")]))
+    tools_module = import_module("fake_alfworld_tools")
+
+    def toolsets(cls: type, config: alfworld_env.ALFWorldTaskConfig) -> list[vf.Toolset]:
+        return [tools_module.Tools(config=config.tools)]
+
+    monkeypatch.setattr(alfworld_env.ALFWorldTask, "toolsets", classmethod(toolsets))
+    actor.config = training.Config(taskset=training.ALFWorldConfig(config_file=str(tmp_path)), max_turns=5)
+    task = alfworld_env.ALFWorldTask(
+        data=alfworld_env.ALFWorldData(id="alfworld:train/a", task_id="train/a", prompt="Start with look."),
+        config=alfworld_env.ALFWorldTaskConfig(
+            tools=alfworld_env.ALFWorldToolsConfig(config_file=str(tmp_path), max_steps=3)
+        ),
+    )
+    requests: list[dict[str, Any]] = []
+    samples: list[list[int]] = []  # Per-call sampled token IDs: (C_i,).
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": training.MODEL, "max_model_len": 8192}]})
+        payload = json.loads(request.content)
+        requests.append(payload)
+        prompt = tokenizer.decode(payload["token_ids"])
+        assert '"name": "take"' in prompt
+        assert '"name": "go_to"' in prompt
+        call = (
+            {"name": "look", "arguments": {}}
+            if "Goal: put" not in prompt
+            else {"name": "go_to", "arguments": {"location": "shelf 1"}}
+            if "At shelf" not in prompt
+            else {"name": "move", "arguments": {"object": "mug 1", "location": "desk 1"}}
+        )
+        ids = tokenizer.encode(f"<tool_call>\n{json.dumps(call)}\n</tool_call><|im_end|>")  # (C,)
+        samples.append(ids)
+        return httpx.Response(
+            200,
+            json={
+                "request_id": f"alfworld-{len(requests)}",
+                "choices": [
+                    {
+                        "index": 0,
+                        "token_ids": ids,
+                        "finish_reason": "stop",
+                        "logprobs": {"content": [{"token": f"token_id:{token}", "logprob": -0.2} for token in ids]},
+                    }
+                ],
+            },
+        )
+
+    def build_client(config: vf.TrainClientConfig) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(respond))
+
+    monkeypatch.setattr(client_base, "build_async_httpx", build_client)
+    group = asyncio.run(collect_and_close(actor, task))
+    assert len(requests) == 6
+    assert len(group.rollouts) == 2
+    for rollout in group.rollouts:
+        assert rollout.num_turns == 3
+        assert rollout.reward == 1.0
+        assert rollout.stop_condition == "alfworld_done"
+        sequence = rollout.sequence
+        assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
+        assert sequence.loss_mask.sum() == sum(len(ids) for ids in samples) // 2
+        np.testing.assert_allclose(sequence.old_log_probs, np.where(sequence.loss_mask, -0.2, 0))
+    closed = list(tmp_path.glob("*.closed"))
+    assert len(closed) == 2
+    assert all(path.read_text() == "go to shelf 1\nmove mug 1 to desk 1" for path in closed)

@@ -25,13 +25,6 @@ class WebShopConfig:
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
-class ALFWorldConfig:
-    python: str
-    config_file: str
-    id: Literal["alfworld"] = "alfworld"
-
-
-@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class Tau2Config:
     python: str
     user_llm: str
@@ -50,7 +43,7 @@ class AppWorldConfig:
     id: Literal["appworld"] = "appworld"
 
 
-BenchmarkConfig = WebShopConfig | ALFWorldConfig | Tau2Config | AppWorldConfig
+BenchmarkConfig = WebShopConfig | Tau2Config | AppWorldConfig
 
 
 class Observation(BaseModel):
@@ -111,7 +104,7 @@ class BenchmarkSession:
         try:
             await asyncio.wait_for(self.process.wait(), timeout=5)
         except TimeoutError:
-            # Include TextWorld and other children spawned by the benchmark.
+            # Include children spawned by the benchmark.
             os.killpg(self.process.pid, signal.SIGKILL)
             await self.process.wait()
         if exc_type is None and self.process.returncode != 0:

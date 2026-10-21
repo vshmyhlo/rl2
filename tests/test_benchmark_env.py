@@ -65,35 +65,6 @@ def test_webshop_full_split(monkeypatch: pytest.MonkeyPatch) -> None:
         assert prices[0] == prices[1]
 
 
-def test_alfworld_all_training_games(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    config = tmp_path / "alfworld.json"
-    config.write_text(json.dumps({"dataset": {"num_train_games": 1}, "env": {}, "general": {}, "rl": {"training": {}}}))
-    upstream = Mock()
-    upstream.reset.return_value = (["Put apple on table"], {"admissible_commands": [["look"]]})
-    upstream.step.return_value = (["Done"], [0], [True], {"admissible_commands": [[]], "won": [True]})
-    loader = Mock(game_files=["train/b", "train/a"])
-    loader.init_env.return_value = upstream
-    constructor = Mock(return_value=loader)
-    module = load_worker(
-        "alfworld", {"alfworld.agents.environment.alfred_tw_env": {"AlfredTWEnv": constructor}}, monkeypatch
-    )
-    with closing(module["ALFWorld"]({"config_file": str(config), "max_steps": 3})) as worker:
-        assert worker.task_ids() == ["train/a", "train/b"]
-        settings = constructor.call_args.args[0]
-        assert constructor.call_args.kwargs == {"train_eval": "train"}
-        assert settings["dataset"]["num_train_games"] == -1
-        assert settings["env"]["task_types"] == [1, 2, 3, 4, 5, 6]
-        assert settings["general"]["training_method"] == "dqn"
-        assert settings["rl"]["training"]["max_nb_steps_per_episode"] == 3
-        with pytest.raises(ValueError, match="training split"):
-            worker.reset("dev/a")
-        assert "look" in worker.reset("train/b")["observation"]
-        assert loader.game_files == ["train/b"]
-        assert worker.step("look")["done"]
-        assert worker.score() == 1.0
-    upstream.close.assert_called_once()
-
-
 def test_appworld_train_execution_and_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
     world = MagicMock()
     world.__enter__.return_value = world
