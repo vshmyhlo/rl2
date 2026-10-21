@@ -5,6 +5,7 @@ import json
 import re
 import time
 from dataclasses import asdict, dataclass
+from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -15,6 +16,10 @@ from transformers import PreTrainedTokenizerBase
 
 from rl2.agent_task import Task, ToolCall, ToolCallError
 from rl2.tracing import span
+
+StopCondition = Literal[
+    "agent_completed", "environment_done", "max_turns", "max_tokens", "context_length", "unspecified"
+]
 
 
 def completion_text(text: str) -> str:
@@ -71,7 +76,7 @@ class Rollout:
     num_input_tokens: int
     num_output_tokens: int
     rollout_seconds: float
-    stop_condition: str | None
+    stop_condition: StopCondition
 
 
 def completion_tokens(choice: CompletionChoice) -> tuple[list[int], list[float]]:
@@ -98,7 +103,7 @@ class Agent:
     tokenizer: PreTrainedTokenizerBase
     model: str
     context_length: int
-    max_tokens: int
+    max_tokens: int  # Total transcript budget, including context and sampled tokens.
     max_turns: int
     temperature: float
     rollout_timeout: float
@@ -106,6 +111,8 @@ class Agent:
 
     async def run(self, task: Task) -> Rollout:
         started = time.monotonic()
+        token_limit = min(self.max_tokens, self.context_length)
+        limit_condition: StopCondition = "max_tokens" if self.max_tokens < self.context_length else "context_length"
         async with (
             asyncio.timeout(self.rollout_timeout),
             task.init_env(max_steps=self.max_turns, timeout=self.environment_timeout) as environment,
@@ -121,25 +128,30 @@ class Agent:
                 add_generation_prompt=True,
                 enable_thinking=True,
             )
+            if len(token_ids) >= token_limit:
+                raise ValueError(
+                    f"Initial prompt has {len(token_ids)} tokens; {limit_condition}={token_limit} "
+                    "must leave room for at least one sampled token"
+                )
             loss_mask = [False] * len(token_ids)
             log_probs = [0.0] * len(token_ids)
             num_turns = 0
             completion = ""
-            stop_condition = "max_turns"
+            stop_condition: StopCondition = "max_turns"
             pending: list[str] = []
             for _ in range(self.max_turns):
                 if result.done:
-                    stop_condition = f"{task.name}_done"
+                    stop_condition = "environment_done"
                     break
-                remaining = self.context_length - len(token_ids)
+                remaining = token_limit - len(token_ids)
                 if remaining <= 0:
-                    stop_condition = "context_length"
+                    stop_condition = limit_condition
                     break
                 with span("actor.rollout.model", {"input_tokens": len(token_ids)}) as model_span:
                     response = await self.client.completions.create(
                         model=self.model,
                         prompt=token_ids,
-                        max_tokens=min(self.max_tokens, remaining),
+                        max_tokens=remaining,
                         temperature=self.temperature,
                         top_p=1.0,
                         logprobs=0,
@@ -157,7 +169,7 @@ class Agent:
                         raise ValueError("Expected one completion per model request")
                     choice = choices[0]
                     ids, sampled_log_probs = completion_tokens(choice)
-                    if len(ids) > min(self.max_tokens, remaining):
+                    if len(ids) > remaining:
                         raise ValueError("Completion exceeds the requested token budget")
                     if choice.finish_reason not in {"stop", "length"}:
                         raise RuntimeError(f"Generation failed: {choice.finish_reason}")
@@ -171,7 +183,7 @@ class Agent:
                 )
                 completion = completion_text(text)
                 if choice.finish_reason == "length":
-                    stop_condition = "context_length" if len(token_ids) == self.context_length else "max_tokens"
+                    stop_condition = limit_condition
                     break
                 pending = []
                 try:
@@ -193,7 +205,7 @@ class Agent:
                         if result.done:
                             break
                 if result.done:
-                    stop_condition = f"{task.name}_done"
+                    stop_condition = "environment_done"
                     break
                 if num_turns == self.max_turns:
                     break
@@ -203,8 +215,8 @@ class Agent:
                     f"\n<|im_start|>user\n{responses}<|im_end|>\n<|im_start|>assistant\n"
                 )
                 context = await asyncio.to_thread(self.tokenizer.encode, suffix, add_special_tokens=False)
-                if len(token_ids) + len(context) >= self.context_length:
-                    stop_condition = "context_length"
+                if len(token_ids) + len(context) >= token_limit:
+                    stop_condition = limit_condition
                     break
                 token_ids.extend(context)
                 loss_mask.extend([False] * len(context))

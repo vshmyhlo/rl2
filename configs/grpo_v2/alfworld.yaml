@@ -5,7 +5,7 @@ taskset:
 seed: 4
 num_groups: 4
 group_size: 8
-max_tokens: 1024
+max_tokens: 4096 # Total transcript tokens, including system, prompt, and tools.
 max_turns: 50
 rollout_timeout: 1200
 environment_timeout: 600

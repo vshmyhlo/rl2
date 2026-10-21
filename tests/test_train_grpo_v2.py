@@ -57,7 +57,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert defaults.weight_update_pause_mode == "wait"
     preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/alfworld.yaml"
     config = training.load_config(preset, training.Config)
-    assert config.run_id == "grpo_v2_alfworld_Qwen_Qwen3-0.6B_seed3"
+    assert config.run_id == f"grpo_v2_alfworld_Qwen_Qwen3-0.6B_seed{config.seed}"
     assert config.ckpt_dir == f"/runs/grpo_v2/{config.run_id}"
     assert config.total_iterations is None
     assert config.minibatches_per_epoch == 4
@@ -88,7 +88,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     train.assert_called_once_with(
         replace(
             config,
-            max_tokens=4,
+            max_tokens=config.group_size,
             total_iterations=1,
             gradient_checkpointing=False,
             enable_ray_dashboard=True,
@@ -716,7 +716,7 @@ def test_learner_logs_rollouts(
                     rollout_seconds=1.5,
                     stop_condition=condition,
                 )
-                for reward, condition in zip(group_rewards[1], ("max_turns", None), strict=True)
+                for reward, condition in zip(group_rewards[1], ("max_turns", "unspecified"), strict=True)
             ],
         ),
     ]
@@ -748,7 +748,7 @@ def test_learner_logs_rollouts(
     received = training.build_rollout_batch(groups=batch, training_batch=prepared, transfer_metrics=transfer_metrics)
     next_batch = training.build_rollout_batch(
         groups=[
-            replace(group, rollouts=[replace(rollout, stop_condition="codegym_done") for rollout in group.rollouts])
+            replace(group, rollouts=[replace(rollout, stop_condition="environment_done") for rollout in group.rollouts])
             for group in batch
         ],
         training_batch=prepared,
@@ -835,7 +835,7 @@ def test_learner_logs_rollouts(
             "charts/stop_condition_fraction/agent_completed": 0.0,
             "charts/stop_condition_fraction/max_turns": 0.0,
             "charts/stop_condition_fraction/unspecified": 0.0,
-            "charts/stop_condition_fraction/codegym_done": 1.0,
+            "charts/stop_condition_fraction/environment_done": 1.0,
         }
     assert "Run ID: None; MLflow run: mlflow-run" in caplog.messages
     assert (
@@ -959,7 +959,10 @@ def test_learner_logs_examples_every_ten_steps(
         training.RolloutGroup(
             task_id=None,
             prompt="Another prompt",
-            rollouts=[replace(rollout, interaction="", stop_condition=None), replace(rollout, interaction="omitted")],
+            rollouts=[
+                replace(rollout, interaction="", stop_condition="unspecified"),
+                replace(rollout, interaction="omitted"),
+            ],
         ),
     ]
     learner.config = replace(learner.config, num_groups=2, group_size=2, total_iterations=21)

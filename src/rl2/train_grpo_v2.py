@@ -21,7 +21,7 @@ Rollout batch scalars:
     charts/reward_min: Minimum raw rollout reward.
     charts/reward_max: Maximum raw rollout reward.
     charts/degenerate_group_fraction: Fraction of groups with identical rewards and zero advantages.
-    charts/stop_condition_fraction/<label>: Fraction of batch rollouts with each stop condition; None maps to unspecified.
+    charts/stop_condition_fraction/<label>: Fraction of batch rollouts with each StopCondition.
     charts/turns_mean: Mean model responses per rollout.
     charts/input_tokens_mean: Mean context tokens appended per rollout, excluding sampled tokens.
     charts/output_tokens_mean: Mean sampled tokens per rollout across all model calls.
@@ -97,7 +97,7 @@ from transformers import AutoTokenizer
 from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
 from vllm.utils.network_utils import get_open_port
 
-from rl2.agent_loop import Agent, Rollout, TrainingSequence
+from rl2.agent_loop import Agent, Rollout, StopCondition, TrainingSequence
 from rl2.agent_task import Task
 from rl2.alfworld_env import ALFWorldConfig, ALFWorldTask, load_alfworld_tasks
 from rl2.configuration import BaseConfig, load_config
@@ -121,7 +121,7 @@ class Config(BaseConfig):
     group_size: Annotated[int, Field(ge=2)] = 4
     total_iterations: Annotated[int | None, Field(ge=1)] = None
     checkpoint_interval: Annotated[int, Field(gt=0)] = 100
-    max_tokens: Annotated[int, Field(ge=1)] = 512
+    max_tokens: Annotated[int, Field(ge=1)] = 512  # Total transcript tokens, including system, prompt, and tools.
     padding_multiple: Annotated[int, Field(ge=1)] = 256
     max_turns: Annotated[int, Field(ge=1)] = 3
     rollout_timeout: Annotated[float, Field(gt=0)] = 120
@@ -158,7 +158,7 @@ class TrainingProgress:
     iteration: int
     total_rollouts: int
     sampling_state: dict[str, Any]
-    stop_conditions: tuple[str, ...]
+    stop_conditions: tuple[StopCondition, ...]
 
 
 def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
@@ -211,6 +211,11 @@ def restore_checkpoint(
         raise ValueError("Unsupported GRPO v2 checkpoint")
     if metadata["iteration"] != iteration or iteration < 0 or metadata["total_rollouts"] < 0:
         raise ValueError("Invalid GRPO v2 checkpoint progress")
+    saved_conditions = TypeAdapter(list[str]).validate_python(metadata["stop_conditions"])
+    # Older checkpoints used task-specific completion labels, such as alfworld_done.
+    stop_conditions = TypeAdapter(tuple[StopCondition, ...]).validate_python(
+        ["environment_done" if condition.endswith("_done") else condition for condition in saved_conditions]
+    )
     restored = manager.restore(
         iteration,
         args=ocp.args.Composite(
@@ -228,7 +233,7 @@ def restore_checkpoint(
         iteration=iteration,
         total_rollouts=metadata["total_rollouts"],
         sampling_state=metadata["sampling_state"],
-        stop_conditions=tuple(metadata["stop_conditions"]),
+        stop_conditions=stop_conditions,
     )
 
 
@@ -278,7 +283,7 @@ class GRPOBatch[Array: np.ndarray | jax.Array](NamedTuple):
 class RolloutBatch:
     training_batch: GRPOBatch[np.ndarray]  # Leaves: (B, T), except advantages: (B,).
     rollout_metrics: dict[str, float]
-    stop_counts: dict[str, int]
+    stop_counts: dict[StopCondition, int]
     num_output_tokens: int
     examples: str
     transfer_metrics: dict[str, float | int]
@@ -307,9 +312,7 @@ def build_rollout_batch(
             "charts/output_tokens_mean": mean(rollout.num_output_tokens for rollout in rollouts),
             "time/actor/rollout_seconds": mean(rollout.rollout_seconds for rollout in rollouts),
         },
-        stop_counts=Counter(
-            rollout.stop_condition if rollout.stop_condition is not None else "unspecified" for rollout in rollouts
-        ),
+        stop_counts=Counter(rollout.stop_condition for rollout in rollouts),
         num_output_tokens=sum(rollout.num_output_tokens for rollout in rollouts),
         examples=format_rollout_examples(groups),
         transfer_metrics=transfer_metrics,
@@ -515,8 +518,8 @@ class Batcher:
         """Flatten rollout groups in order and right-pad their transcripts into NumPy arrays.
 
         B is the total rollout count; T is the longest transcript length rounded up
-        to a multiple of config.padding_multiple, capped at context_length. Padding is zero/False, and
-        transcripts are never truncated. Existing rollout advantages are preserved.
+        to a multiple of config.padding_multiple, capped at min(config.max_tokens, context_length).
+        Padding is zero/False; transcripts and rollout advantages are preserved.
 
         Returns:
             GRPOBatch with token_ids: (B, T) int32 complete transcripts;
@@ -526,17 +529,18 @@ class Batcher:
             advantages: (B,) float32 per-rollout advantages.
 
         Raises:
-            ValueError: If there are no rollouts, a transcript exceeds context_length,
+            ValueError: If there are no rollouts, a transcript exceeds the token budget,
                 or a transcript lacks an initial context token followed by a sampled token.
         """
         rollouts = [rollout for group in groups for rollout in group.rollouts]
         if not rollouts:
             raise ValueError("A training batch must contain rollouts")
         length = max(len(rollout.sequence.token_ids) for rollout in rollouts)
-        if length > context_length:
-            raise ValueError(f"Rollout length {length} exceeds model context length {context_length}")
+        token_limit = min(self.config.max_tokens, context_length)
+        if length > token_limit:
+            raise ValueError(f"Rollout length {length} exceeds token budget {token_limit}")
         multiple = self.config.padding_multiple
-        width = min((length + multiple - 1) // multiple * multiple, context_length)
+        width = min((length + multiple - 1) // multiple * multiple, token_limit)
         shape = (len(rollouts), width)
         # Host copies avoid compiling JAX padding and reductions for every transcript length.
         arrays = {
@@ -641,7 +645,7 @@ class Learner:
             progress = restore_checkpoint(manager, self.state, self.config)
             iteration = 0
             total_rollouts = 0
-            stop_conditions: set[str] = set()
+            stop_conditions: set[StopCondition] = set()
             if progress is not None:
                 self.state = progress.train_state
                 self.shuffle_key = progress.shuffle_key  # ()
@@ -922,7 +926,7 @@ class Actor:
                     async def run_rollout(index: int) -> Rollout:
                         with span("actor.rollout", {**span_data, "rollout_index": index}) as rollout_span:
                             result = await agent.run(task)
-                            rollout_span.set_attribute("stop_condition", result.stop_condition or "unspecified")
+                            rollout_span.set_attribute("stop_condition", result.stop_condition)
                             return result
 
                     runs = [pending.create_task(run_rollout(index)) for index in range(group_size)]

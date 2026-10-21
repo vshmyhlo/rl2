@@ -98,7 +98,7 @@ def make_agent(tokenizer: PreTrainedTokenizerFast, client: AsyncOpenAI) -> loop.
         tokenizer=tokenizer,
         model="Qwen/test",
         context_length=8192,
-        max_tokens=128,
+        max_tokens=8192,
         max_turns=3,
         temperature=0.7,
         rollout_timeout=10,
@@ -127,6 +127,8 @@ def test_multiturn_exact_training_sequence(tokenizer: PreTrainedTokenizerFast, e
     first, second = requests
     sampled = [tokenizer.encode(reply, add_special_tokens=False) for reply in replies]
     prefix = first["prompt"] + sampled[0]
+    assert second["max_tokens"] == 8192 - len(second["prompt"])
+    assert second["max_tokens"] < first["max_tokens"]
     assert second["prompt"][: len(prefix)] == prefix
     assert "<think>inspect</think>" in tokenizer.decode(second["prompt"])
     expected_ids = second["prompt"] + sampled[1]
@@ -153,14 +155,14 @@ def test_multiturn_exact_training_sequence(tokenizer: PreTrainedTokenizerFast, e
     assert tool_context.startswith("\n<|im_start|>user\n<tool_response>\n")
     assert tool_context.endswith("\n</tool_response><|im_end|>\n<|im_start|>assistant\n")
     assert '"reward": 0.0' in tokenizer.decode(second["prompt"])
-    assert rollout.reward == 1 and rollout.stop_condition == "alfworld_done"
+    assert rollout.reward == 1 and rollout.stop_condition == "environment_done"
     assert rollout.num_turns == 2
     assert rollout.num_output_tokens == sum(map(len, sampled))
     assert rollout.num_input_tokens == len(expected_ids) - rollout.num_output_tokens
     assert rollout.completion == replies[-1].removesuffix("<|im_end|>")
     assert "Task complete" in rollout.interaction
     assert {key: value for key, value in first.items() if key not in {"model", "prompt"}} == {
-        "max_tokens": 128,
+        "max_tokens": 8192 - len(first["prompt"]),
         "temperature": 0.7,
         "top_p": 1.0,
         "top_k": -1,
@@ -174,8 +176,49 @@ def test_multiturn_exact_training_sequence(tokenizer: PreTrainedTokenizerFast, e
     environment.__aexit__.assert_awaited_once()
 
 
+def test_total_token_budget_across_turns(tokenizer: PreTrainedTokenizerFast, environment: AsyncMock) -> None:
+    requests: list[dict[str, Any]] = []
+    token_limit = 8191  # Below the model context length.
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        assert body["max_tokens"] == token_limit - len(body["prompt"])
+        text = (
+            '<tool_call>{"name":"look","arguments":{}}</tool_call><|im_end|>'
+            if len(requests) == 1
+            else "x" * body["max_tokens"]
+        )
+        return httpx.Response(200, json=response_for(tokenizer, text, "stop" if len(requests) == 1 else "length"))
+
+    async def run() -> loop.Rollout:
+        async with make_client(respond) as client:
+            return await replace(make_agent(tokenizer, client), max_tokens=token_limit).run(
+                ALFWorldTask(id="a", config_file="config.yaml")
+            )
+
+    rollout = asyncio.run(run())
+    sequence = rollout.sequence
+    assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape == (token_limit,)
+    assert rollout.num_input_tokens + rollout.num_output_tokens == token_limit
+    assert rollout.stop_condition == "max_tokens"
+    assert len(requests) == rollout.num_turns == 2
+    assert requests[1]["max_tokens"] < requests[0]["max_tokens"]
+    environment.step.assert_awaited_once()
+
+
 @pytest.mark.parametrize(
-    "boundary", ["max_turns", "max_tokens", "context_generation", "context_observation", "no_room"]
+    "boundary",
+    [
+        "max_turns",
+        "max_tokens",
+        "max_observation",
+        "context_generation",
+        "context_observation",
+        "no_room",
+        "prompt_full",
+        "prompt_overlong",
+    ],
 )
 def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock) -> None:
     requests = []
@@ -209,23 +252,32 @@ def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, envir
             if boundary == "max_turns":
                 agent = replace(agent, max_turns=1)
             elif boundary == "max_tokens":
-                agent = replace(agent, max_tokens=1)
+                agent = replace(agent, max_tokens=len(prompt) + 1)
+            elif boundary in {"max_observation", "prompt_full", "prompt_overlong"}:
+                room = {"max_observation": 100, "prompt_full": 0, "prompt_overlong": -1}[boundary]
+                agent = replace(agent, max_tokens=len(prompt) + room)
             else:
                 room = {"context_generation": 1, "context_observation": 100, "no_room": 0}[boundary]
                 agent = replace(agent, context_length=len(prompt) + room)
             return await agent.run(ALFWorldTask(id="a", config_file="config.yaml"))
 
-    if boundary == "no_room":
-        with pytest.raises(ValueError, match="no trainable tokens"):
+    if boundary in {"no_room", "prompt_full", "prompt_overlong"}:
+        with pytest.raises(ValueError, match="Initial prompt.*must leave room"):
             asyncio.run(run())
         assert not requests
     else:
         rollout = asyncio.run(run())
-        assert rollout.stop_condition == ("context_length" if boundary.startswith("context") else boundary)
+        assert rollout.stop_condition == (
+            "context_length"
+            if boundary.startswith("context")
+            else "max_tokens"
+            if boundary == "max_observation"
+            else boundary
+        )
         assert len(requests) == 1
         assert environment.step.await_count == (0 if boundary in {"max_tokens", "context_generation"} else 1)
         assert rollout.num_turns == 1
-        if boundary == "context_generation":
+        if boundary in {"max_tokens", "context_generation"}:
             assert requests[0]["max_tokens"] == 1
         assert len(rollout.sequence.token_ids) <= 8192
     environment.__aexit__.assert_awaited_once()
@@ -281,7 +333,9 @@ def test_failures_cleanup(failure: str, tokenizer: PreTrainedTokenizerFast, envi
     }.get(failure, ValueError)
     with pytest.raises(error):
         asyncio.run(run())
-    assert requests == 1
+    # The rollout timeout also covers prompt tokenization before the first request.
+    if failure != "timeout":
+        assert requests == 1
     environment.__aexit__.assert_awaited_once()
     environment.reset.assert_awaited_once_with()
     environment.step.assert_not_awaited()
@@ -376,9 +430,7 @@ def test_tool_response_renderer(ending: str, tokenizer: PreTrainedTokenizerFast,
 
     async def run() -> loop.Rollout:
         async with make_client(respond) as client:
-            return await replace(make_agent(tokenizer, client), max_tokens=256).run(
-                ALFWorldTask(id="a", config_file="config.yaml")
-            )
+            return await make_agent(tokenizer, client).run(ALFWorldTask(id="a", config_file="config.yaml"))
 
     rollout = asyncio.run(run())
     tool_messages = [{"role": "tool", "content": json.dumps(asdict(result))} for result in results]
@@ -486,12 +538,10 @@ def test_tool_dispatch(mode: str, tokenizer: PreTrainedTokenizerFast, environmen
 
     async def run() -> loop.Rollout:
         async with make_client(respond) as client:
-            return await replace(make_agent(tokenizer, client), max_tokens=256).run(
-                ALFWorldTask(id="a", config_file="config.yaml")
-            )
+            return await make_agent(tokenizer, client).run(ALFWorldTask(id="a", config_file="config.yaml"))
 
     rollout = asyncio.run(run())
-    assert rollout.stop_condition == ("alfworld_done" if mode in {"multiple", "terminal"} else "agent_completed")
+    assert rollout.stop_condition == ("environment_done" if mode in {"multiple", "terminal"} else "agent_completed")
     environment.reset.assert_awaited_once_with()
     assert environment.step.await_count == {"text": 0, "invalid": 1, "malformed": 0, "multiple": 2, "terminal": 1}[mode]
     if mode == "invalid":
@@ -576,7 +626,7 @@ def test_generic_task_environment_lifetime(mode: str, tokenizer: PreTrainedToken
 
     if mode == "success":
         result = asyncio.run(run())
-        assert result.reward == 0.5 and result.stop_condition == "example_done"
+        assert result.reward == 0.5 and result.stop_condition == "environment_done"
         assert "Counted two" in result.interaction
     else:
         with pytest.raises(asyncio.CancelledError if mode == "cancel" else RuntimeError):

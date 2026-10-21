@@ -35,7 +35,14 @@ def progress() -> training.TrainingProgress:
         iteration=2,
         total_rollouts=2**31 + 4,
         sampling_state=actor.get_sampling_state(),
-        stop_conditions=("max_turns",),
+        stop_conditions=(
+            "agent_completed",
+            "environment_done",
+            "max_turns",
+            "max_tokens",
+            "context_length",
+            "unspecified",
+        ),
     )
 
 
@@ -60,7 +67,7 @@ def test_checkpoint_roundtrip_and_retention(tmp_path: Path, progress: training.T
         assert restored is not None
         assert restored.iteration == 2
         assert restored.total_rollouts == 2**31 + 4
-        assert restored.stop_conditions == ("max_turns",)
+        assert restored.stop_conditions == progress.stop_conditions
         assert restored.sampling_state == progress.sampling_state
         assert restored.shuffle_key.shape == ()
         assert restored.train_state.params["weight"].shape == (2,)
@@ -100,6 +107,34 @@ def test_actor_sampling_state_resumes_task_sequence(progress: training.TrainingP
     for _ in range(8):
         asyncio.run(actor.fetch_next_group(group_size=2))
     assert actor.collect_group.call_args_list == expected
+
+
+@pytest.mark.parametrize("condition", ["alfworld_done", "unknown", None], ids=["legacy", "unknown", "null"])
+def test_checkpoint_stop_conditions(progress: training.TrainingProgress, condition: str | None) -> None:
+    manager = Mock()
+    config = training.Config()
+    training.save_checkpoint(manager, progress, config)
+    metadata = manager.save.call_args.kwargs["args"].metadata.item | {
+        "stop_conditions": ["max_tokens", condition, "unspecified"]
+    }
+    manager.latest_step.return_value = progress.iteration
+    manager.restore.side_effect = [
+        SimpleNamespace(metadata=metadata),
+        SimpleNamespace(
+            state={
+                "train_state": progress.train_state,
+                "shuffle_key": jax.random.key_data(progress.shuffle_key),  # (K,)
+            }
+        ),
+    ]
+    if condition == "alfworld_done":
+        restored = training.restore_checkpoint(manager, progress.train_state, config)
+        assert restored is not None
+        assert restored.stop_conditions == ("max_tokens", "environment_done", "unspecified")
+    else:
+        with pytest.raises(ValueError):
+            training.restore_checkpoint(manager, progress.train_state, config)
+        manager.restore.assert_called_once()
 
 
 @pytest.mark.parametrize(

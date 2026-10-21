@@ -91,13 +91,15 @@ def test_prepare_batch(batcher: Any, groups: list[training.RolloutGroup], contex
 
 
 @pytest.mark.parametrize(
-    "length,context_length,multiple,width",
-    [(4, 16, 4, 4), (5, 16, 4, 8), (5, 6, 4, 6), (5, 16, 1, 5)],
-    ids=["exact-bucket", "next-bucket", "context-cap", "no-rounding"],
+    "length,context_length,max_tokens,multiple,width",
+    [(4, 16, 16, 4, 4), (5, 16, 16, 4, 8), (5, 6, 16, 4, 6), (5, 16, 6, 4, 6), (5, 16, 5, 4, 5), (5, 16, 16, 1, 5)],
+    ids=["exact-bucket", "next-bucket", "context-cap", "token-cap", "exact-token-cap", "no-rounding"],
 )
-def test_prepare_batch_bucket_boundaries(length: int, context_length: int, multiple: int, width: int) -> None:
+def test_prepare_batch_bucket_boundaries(
+    length: int, context_length: int, max_tokens: int, multiple: int, width: int
+) -> None:
     batcher = training.Batcher.__ray_metadata__.modified_class(
-        actor=Mock(), config=training.Config(padding_multiple=multiple)
+        actor=Mock(), config=training.Config(padding_multiple=multiple, max_tokens=max_tokens)
     )
     sample = rollout([1] * length, [False] + [True] * (length - 1), 1.0)
     groups = [training.RolloutGroup(task_id="0", prompt="test", rollouts=[sample])]
@@ -123,11 +125,13 @@ def test_prepare_minimal_sequences_and_multiple_groups(batcher: Any) -> None:
 
 
 @pytest.mark.parametrize(
-    "failure", ["empty", "overlong", "no-context", "no-samples", "single-token", "empty-transcript"]
+    "failure", ["empty", "overlong", "over-budget", "no-context", "no-samples", "single-token", "empty-transcript"]
 )
 def test_prepare_batch_rejects_unusable_sequences(
     batcher: Any, failure: str, groups: list[training.RolloutGroup]
 ) -> None:
+    if failure == "over-budget":
+        batcher.config = training.Config(max_tokens=4)
     if failure == "empty":
         groups = []
     elif failure in {"no-context", "no-samples", "single-token", "empty-transcript"}:
