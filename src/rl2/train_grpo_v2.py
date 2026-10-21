@@ -89,7 +89,8 @@ import torch
 import yaml
 from flax.training.train_state import TrainState
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from pydantic import Field
+from openai import AsyncOpenAI
+from pydantic import Field, TypeAdapter
 from pydantic.dataclasses import dataclass as config_dataclass
 from ray.actor import ActorHandle
 from transformers import AutoTokenizer
@@ -427,15 +428,18 @@ def score_group(task: Task, rollouts: list[Rollout]) -> RolloutGroup:
 @asynccontextmanager
 async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]:
     tokenizer = await asyncio.to_thread(AutoTokenizer.from_pretrained, config.model)
-    async with httpx.AsyncClient(base_url=SERVER_URL, timeout=config.rollout_timeout) as client:
-        response = await client.get("/v1/models")
-        response.raise_for_status()
-        model = next(model for model in response.json()["data"] if model["id"] == config.model)
+    async with AsyncOpenAI(
+        base_url=f"{SERVER_URL}/v1", api_key="EMPTY", timeout=config.rollout_timeout, max_retries=0
+    ) as client:
+        models = await client.models.list()
+        model = next(model for model in models.data if model.id == config.model)
         yield Agent(
             client=client,
             tokenizer=tokenizer,
             model=config.model,
-            context_length=model["max_model_len"],
+            context_length=TypeAdapter(int).validate_python(
+                (model.model_extra or {}).get("max_model_len"), strict=True
+            ),
             max_tokens=config.max_tokens,
             max_turns=config.max_turns,
             temperature=config.temperature,

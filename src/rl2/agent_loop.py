@@ -5,11 +5,11 @@ import json
 import re
 import time
 from dataclasses import asdict, dataclass
-from typing import Any
 
-import httpx
 import numpy as np
 from numpy.typing import NDArray
+from openai import AsyncOpenAI
+from openai.types import CompletionChoice
 from pydantic import TypeAdapter
 from transformers import PreTrainedTokenizerBase
 
@@ -19,8 +19,9 @@ from rl2.tracing import span
 
 def completion_text(text: str) -> str:
     # Strip leading reasoning, without interpreting tags inside tool arguments.
+    text = text.strip()
     marker = re.search(r"<think>|</think>|<tool_call>", text)
-    if marker is not None and marker.group() != "<tool_call>":
+    if marker is not None and (marker.group() == "</think>" or text.startswith("<think>")):
         text = text[marker.end() :]
         if marker.group() == "<think>":
             _, separator, text = text.partition("</think>")
@@ -30,9 +31,12 @@ def completion_text(text: str) -> str:
 
 
 def parse_tool_calls(text: str) -> list[ToolCall]:
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"Invalid JSON constant: {value}")
+
     text = completion_text(text)
     calls: list[ToolCall] = []
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(parse_constant=reject_constant)
     while match := re.search(r"</?tool_call>", text):
         if match.group() != "<tool_call>":
             raise ValueError("Tool calls must use complete <tool_call>...</tool_call> blocks")
@@ -70,19 +74,18 @@ class Rollout:
     stop_condition: str | None
 
 
-def completion_tokens(choice: dict[str, Any]) -> tuple[list[int], list[float]]:
+def completion_tokens(choice: CompletionChoice) -> tuple[list[int], list[float]]:
     """Validate the token/log-probability alignment at the vLLM boundary."""
-    try:
-        ids = TypeAdapter(list[int]).validate_python(choice["token_ids"], strict=True)
-        entries = TypeAdapter(list[dict[str, Any]]).validate_python(choice["logprobs"]["content"], strict=True)
-        if not ids or len(entries) != len(ids):
-            raise ValueError("Each sampled token must have a log-probability")
-        for token_id, entry in zip(ids, entries, strict=True):
-            if token_id < 0 or entry["token"] != f"token_id:{token_id}":
-                raise ValueError("Sampled token and log-probability IDs differ")
-        log_probs = TypeAdapter(list[float]).validate_python([entry["logprob"] for entry in entries], strict=True)
-    except (KeyError, TypeError) as error:
-        raise ValueError("Missing token/log-probability data") from error
+    ids = TypeAdapter(list[int]).validate_python((choice.model_extra or {}).get("token_ids"), strict=True)
+    if choice.logprobs is None:
+        raise ValueError("Missing token/log-probability data")
+    tokens = TypeAdapter(list[str]).validate_python(choice.logprobs.tokens, strict=True)
+    log_probs = TypeAdapter(list[float]).validate_python(choice.logprobs.token_logprobs, strict=True)
+    if not ids or len(tokens) != len(ids) or len(log_probs) != len(ids):
+        raise ValueError("Each sampled token must have a log-probability")
+    for token_id, token in zip(ids, tokens, strict=True):
+        if token_id < 0 or token != f"token_id:{token_id}":
+            raise ValueError("Sampled token and log-probability IDs differ")
     # vLLM 0.27 uses token_id:N strings and clips unavailable/very low logprobs to -9999.
     if any(not -9999.0 < value <= 0 for value in log_probs):
         raise ValueError("Missing or invalid sampling log-probability")
@@ -91,7 +94,7 @@ def completion_tokens(choice: dict[str, Any]) -> tuple[list[int], list[float]]:
 
 @dataclass(frozen=True)
 class Agent:
-    client: httpx.AsyncClient
+    client: AsyncOpenAI
     tokenizer: PreTrainedTokenizerBase
     model: str
     context_length: int
@@ -133,32 +136,31 @@ class Agent:
                     stop_condition = "context_length"
                     break
                 with span("actor.rollout.model", {"input_tokens": len(token_ids)}) as model_span:
-                    response = await self.client.post(
-                        "/inference/v1/generate",
-                        json={
-                            "model": self.model,
-                            "token_ids": token_ids,
-                            "sampling_params": {
-                                "max_tokens": min(self.max_tokens, remaining),
-                                "temperature": self.temperature,
-                                "top_p": 1.0,
-                                "top_k": -1,
-                                "logprobs": 0,
-                                "stop_token_ids": [self.tokenizer.eos_token_id],
-                                "skip_special_tokens": False,
-                            },
+                    response = await self.client.completions.create(
+                        model=self.model,
+                        prompt=token_ids,
+                        max_tokens=min(self.max_tokens, remaining),
+                        temperature=self.temperature,
+                        top_p=1.0,
+                        logprobs=0,
+                        extra_body={
+                            "top_k": -1,
+                            "stop_token_ids": self.tokenizer.convert_tokens_to_ids(["<|im_end|>", "<|endoftext|>"]),
+                            "skip_special_tokens": False,
+                            "add_special_tokens": False,
+                            "return_token_ids": True,
+                            "return_tokens_as_token_ids": True,
                         },
                     )
-                    response.raise_for_status()
-                    choices = response.json()["choices"]
+                    choices = response.choices
                     if len(choices) != 1:
                         raise ValueError("Expected one completion per model request")
                     choice = choices[0]
                     ids, sampled_log_probs = completion_tokens(choice)
                     if len(ids) > min(self.max_tokens, remaining):
                         raise ValueError("Completion exceeds the requested token budget")
-                    if choice["finish_reason"] not in {"stop", "length"}:
-                        raise RuntimeError(f"Generation failed: {choice['finish_reason']}")
+                    if choice.finish_reason not in {"stop", "length"}:
+                        raise RuntimeError(f"Generation failed: {choice.finish_reason}")
                     model_span.set_attribute("output_tokens", len(ids))
                 token_ids.extend(ids)
                 loss_mask.extend([True] * len(ids))
@@ -168,7 +170,7 @@ class Agent:
                     self.tokenizer.decode, ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
                 )
                 completion = completion_text(text)
-                if choice["finish_reason"] == "length":
+                if choice.finish_reason == "length":
                     stop_condition = "context_length" if len(token_ids) == self.context_length else "max_tokens"
                     break
                 pending = []

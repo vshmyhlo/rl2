@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import yaml
+from openai import APIStatusError, AsyncOpenAI
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -1388,10 +1389,24 @@ def test_create_agent_config_and_cleanup(fails: bool, monkeypatch: pytest.Monkey
 
     def respond(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/models"
-        return httpx.Response(500 if fails else 200, json={"data": [{"id": config.model, "max_model_len": 4096}]})
+        return httpx.Response(
+            500 if fails else 200,
+            json={
+                "object": "list",
+                "data": [
+                    {"id": config.model, "object": "model", "created": 0, "owned_by": "vllm", "max_model_len": 4096}
+                ],
+            },
+        )
 
-    client = httpx.AsyncClient(base_url=training.SERVER_URL, transport=httpx.MockTransport(respond))
-    monkeypatch.setattr(training.httpx, "AsyncClient", Mock(return_value=client))
+    client = AsyncOpenAI(
+        base_url=f"{training.SERVER_URL}/v1",
+        api_key="EMPTY",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+    )
+    factory = Mock(return_value=client)
+    monkeypatch.setattr(training, "AsyncOpenAI", factory)
 
     async def run() -> None:
         async with training.create_agent(config) as agent:
@@ -1403,9 +1418,12 @@ def test_create_agent_config_and_cleanup(fails: bool, monkeypatch: pytest.Monkey
             assert agent.environment_timeout == config.environment_timeout
 
     if fails:
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(APIStatusError):
             asyncio.run(run())
     else:
         asyncio.run(run())
     load.assert_called_once_with(config.model)
-    assert client.is_closed
+    factory.assert_called_once_with(
+        base_url=f"{training.SERVER_URL}/v1", api_key="EMPTY", timeout=config.rollout_timeout, max_retries=0
+    )
+    assert client.is_closed()

@@ -31,7 +31,7 @@ validates its own tool arguments. The agent loop has no ALFWorld imports.
 Each rollout owns one ALFWorld Ray actor, reserving one CPU, and follows this loop:
 
 1. Reset the selected game and give the model the action-tool schemas and instruction to call `look`.
-2. Sample a response through vLLM's `/inference/v1/generate` endpoint.
+2. Sample a response through `AsyncOpenAI.completions.create()` against vLLM's `/v1/completions` endpoint.
 3. Parse Qwen3 `<tool_call>` JSON blocks and dispatch the calls to the ALFWorld worker.
 4. Append JSON results in `<tool_response>` blocks and repeat until done or a limit is reached.
 
@@ -46,7 +46,7 @@ instructed to use one tool per turn; multiple calls execute sequentially until
 the episode ends. Malformed calls receive tool-error feedback without changing
 the game. A response without tool calls ends the episode. There are no MCP
 servers, renderer pools, or Verifiers objects in this path. The tokenizer and
-HTTP client are shared across concurrent rollouts; episode state is independent.
+SDK client are shared across concurrent rollouts; episode state is independent.
 Environment calls await Ray object references; tokenization runs in threads.
 
 The transcript is append-only, using Qwen3 message boundaries. Sampled history,
@@ -66,7 +66,7 @@ discovery and each reset/step request. HTTP failures, malformed sampling data,
 worker errors, and timeouts abort the group and cancel its other rollouts.
 Environments close normally on success; errors and cancellations terminate their
 actors immediately. Training enables Ray's Linux subreaper to clean up TextWorld
-child processes even after a forced termination. There are no retries or fallback
+child processes even after a forced termination. SDK retries are disabled; there are no fallback
 rewards for infrastructure failures.
 
 ## Training and resuming

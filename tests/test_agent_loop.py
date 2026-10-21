@@ -1,14 +1,18 @@
 import asyncio
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
+from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, Mock
 
 import httpx
 import numpy as np
 import pytest
+from openai import APIStatusError, AsyncOpenAI
+from openai.types import CompletionChoice
+from openai.types.completion_choice import Logprobs
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
@@ -29,12 +33,8 @@ def tokenizer() -> PreTrainedTokenizerFast:
         tokenizer_object=backend,
         eos_token="<|im_end|>",
         additional_special_tokens=["<|im_start|>", "<|endoftext|>"],
-        chat_template=(
-            "{% if tools %}{{ tools | tojson }}{% endif %}"
-            "{% for message in messages %}"
-            "{{ '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n' }}"
-            "{% endfor %}{{ '<|im_start|>assistant\n' if add_generation_prompt else '' }}"
-        ),
+        # Qwen/Qwen3-0.6B tokenizer_config.json, revision c1899de289a04d12100db370d81485cdf75e47ca.
+        chat_template=(Path(__file__).parent / "data/qwen3_chat_template.jinja").read_text(),
     )
 
 
@@ -64,17 +64,35 @@ def environment(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 def response_for(tokenizer: PreTrainedTokenizerFast, text: str, finish_reason: str = "stop") -> dict[str, Any]:
     ids = tokenizer.encode(text, add_special_tokens=False)
     return {
+        "id": "completion-test",
+        "object": "text_completion",
+        "created": 0,
+        "model": "Qwen/test",
         "choices": [
             {
+                "index": 0,
+                "text": text,
                 "token_ids": ids,
-                "logprobs": {"content": [{"token": f"token_id:{token}", "logprob": -0.25} for token in ids]},
+                "logprobs": {
+                    "tokens": [f"token_id:{token}" for token in ids],
+                    "token_logprobs": [-0.25] * len(ids),
+                },
                 "finish_reason": finish_reason,
             }
         ],
     }
 
 
-def make_agent(tokenizer: PreTrainedTokenizerFast, client: httpx.AsyncClient) -> loop.Agent:
+def make_client(respond: Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]]) -> AsyncOpenAI:
+    return AsyncOpenAI(
+        base_url="http://test/v1",
+        api_key="EMPTY",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+    )
+
+
+def make_agent(tokenizer: PreTrainedTokenizerFast, client: AsyncOpenAI) -> loop.Agent:
     return loop.Agent(
         client=client,
         tokenizer=tokenizer,
@@ -96,25 +114,25 @@ def test_multiturn_exact_training_sequence(tokenizer: PreTrainedTokenizerFast, e
     requests: list[dict[str, Any]] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/inference/v1/generate"
+        assert request.url.path == "/v1/completions"
         body = json.loads(request.content)
         requests.append(body)
         return httpx.Response(200, json=response_for(tokenizer, replies[len(requests) - 1]))
 
     async def run() -> loop.Rollout:
-        async with httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(respond)) as client:
+        async with make_client(respond) as client:
             return await make_agent(tokenizer, client).run(ALFWorldTask(id="a", config_file="config.yaml"))
 
     rollout = asyncio.run(run())
     first, second = requests
     sampled = [tokenizer.encode(reply, add_special_tokens=False) for reply in replies]
-    prefix = first["token_ids"] + sampled[0]
-    assert second["token_ids"][: len(prefix)] == prefix
-    assert "<think>inspect</think>" in tokenizer.decode(second["token_ids"])
-    expected_ids = second["token_ids"] + sampled[1]
+    prefix = first["prompt"] + sampled[0]
+    assert second["prompt"][: len(prefix)] == prefix
+    assert "<think>inspect</think>" in tokenizer.decode(second["prompt"])
+    expected_ids = second["prompt"] + sampled[1]
     mask = np.zeros(len(expected_ids), dtype=np.bool_)  # (T,)
-    mask[len(first["token_ids"]) : len(prefix)] = True
-    mask[len(second["token_ids"]) :] = True
+    mask[len(first["prompt"]) : len(prefix)] = True
+    mask[len(second["prompt"]) :] = True
     sequence = rollout.sequence
     assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape == (len(expected_ids),)
     assert sequence.token_ids.dtype == np.int32
@@ -128,27 +146,30 @@ def test_multiturn_exact_training_sequence(tokenizer: PreTrainedTokenizerFast, e
         (ToolCall(name="look", arguments={}),),
         (ToolCall(name="move", arguments={"object": "mug 1", "location": "desk 1"}),),
     ]
-    initial_text = tokenizer.decode(first["token_ids"])
+    initial_text = tokenizer.decode(first["prompt"])
     assert ALFWorldTask.prompt in initial_text
     assert '"name": "move"' in initial_text and '"name": "inventory"' in initial_text
-    tool_context = tokenizer.decode(second["token_ids"][len(prefix) :])
+    tool_context = tokenizer.decode(second["prompt"][len(prefix) :])
     assert tool_context.startswith("\n<|im_start|>user\n<tool_response>\n")
     assert tool_context.endswith("\n</tool_response><|im_end|>\n<|im_start|>assistant\n")
-    assert '"reward": 0.0' in tokenizer.decode(second["token_ids"])
+    assert '"reward": 0.0' in tokenizer.decode(second["prompt"])
     assert rollout.reward == 1 and rollout.stop_condition == "alfworld_done"
     assert rollout.num_turns == 2
     assert rollout.num_output_tokens == sum(map(len, sampled))
     assert rollout.num_input_tokens == len(expected_ids) - rollout.num_output_tokens
     assert rollout.completion == replies[-1].removesuffix("<|im_end|>")
     assert "Task complete" in rollout.interaction
-    assert first["sampling_params"] == {
+    assert {key: value for key, value in first.items() if key not in {"model", "prompt"}} == {
         "max_tokens": 128,
         "temperature": 0.7,
         "top_p": 1.0,
         "top_k": -1,
         "logprobs": 0,
-        "stop_token_ids": [tokenizer.eos_token_id],
+        "stop_token_ids": tokenizer.convert_tokens_to_ids(["<|im_end|>", "<|endoftext|>"]),
         "skip_special_tokens": False,
+        "add_special_tokens": False,
+        "return_token_ids": True,
+        "return_tokens_as_token_ids": True,
     }
     environment.__aexit__.assert_awaited_once()
 
@@ -173,7 +194,7 @@ def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, envir
         )
 
     async def run() -> loop.Rollout:
-        async with httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(respond)) as client:
+        async with make_client(respond) as client:
             agent = make_agent(tokenizer, client)
             prompt = tokenizer.apply_chat_template(
                 [
@@ -205,7 +226,7 @@ def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, envir
         assert environment.step.await_count == (0 if boundary in {"max_tokens", "context_generation"} else 1)
         assert rollout.num_turns == 1
         if boundary == "context_generation":
-            assert requests[0]["sampling_params"]["max_tokens"] == 1
+            assert requests[0]["max_tokens"] == 1
         assert len(rollout.sequence.token_ids) <= 8192
     environment.__aexit__.assert_awaited_once()
 
@@ -215,8 +236,11 @@ def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, envir
 )
 def test_failures_cleanup(failure: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock) -> None:
     entered = asyncio.Event()
+    requests = 0
 
     async def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
         entered.set()
         if failure in {"timeout", "cancel"}:
             await asyncio.Future()
@@ -226,19 +250,20 @@ def test_failures_cleanup(failure: str, tokenizer: PreTrainedTokenizerFast, envi
         choice = data["choices"][0]
         if failure == "empty":
             choice["token_ids"] = []
-            choice["logprobs"]["content"] = []
+            choice["logprobs"]["tokens"] = []
+            choice["logprobs"]["token_logprobs"] = []
         elif failure == "logprobs":
-            choice["logprobs"]["content"].pop()
+            choice["logprobs"]["token_logprobs"].pop()
         elif failure == "alignment":
-            choice["logprobs"]["content"][0]["token"] = "token_id:999"
+            choice["logprobs"]["tokens"][0] = "token_id:999"
         elif failure == "missing_probability":
-            choice["logprobs"]["content"][0]["logprob"] = -9999.0
+            choice["logprobs"]["token_logprobs"][0] = -9999.0
         elif failure == "abort":
             choice["finish_reason"] = "abort"
         return httpx.Response(200, json=data)
 
     async def run() -> None:
-        async with httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(respond)) as client:
+        async with make_client(respond) as client:
             agent = make_agent(tokenizer, client)
             if failure == "timeout":
                 agent = replace(agent, rollout_timeout=0.05)
@@ -249,13 +274,14 @@ def test_failures_cleanup(failure: str, tokenizer: PreTrainedTokenizerFast, envi
             await task
 
     error = {
-        "http": httpx.HTTPStatusError,
+        "http": APIStatusError,
         "abort": RuntimeError,
         "timeout": TimeoutError,
         "cancel": asyncio.CancelledError,
     }.get(failure, ValueError)
     with pytest.raises(error):
         asyncio.run(run())
+    assert requests == 1
     environment.__aexit__.assert_awaited_once()
     environment.reset.assert_awaited_once_with()
     environment.step.assert_not_awaited()
@@ -285,6 +311,11 @@ def test_tool_calls_ignore_thinking() -> None:
     assert loop.parse_tool_calls(f"<think>{call}</think>{call}") == [ToolCall(name="look", arguments={})]
 
 
+def test_tool_calls_reject_non_json_constants() -> None:
+    with pytest.raises(ValueError, match="Invalid JSON constant"):
+        loop.parse_tool_calls('<tool_call>{"name":"count","arguments":{"amount":NaN}}</tool_call>')
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
@@ -292,8 +323,17 @@ def test_tool_calls_ignore_thinking() -> None:
         ("<think>\n\n</think>\n\nFinished<|im_end|>", "Finished"),
         ("Reasoning without opening tag</think>Finished<|im_end|>", "Finished"),
         ("Finished<|endoftext|>", "Finished"),
+        ("Finished<|im_end|>\n", "Finished"),
+        ("Use <think> and </think> tags.", "Use <think> and </think> tags."),
     ],
-    ids=["unfinished-thinking", "disabled-thinking", "implicit-thinking", "endoftext"],
+    ids=[
+        "unfinished-thinking",
+        "disabled-thinking",
+        "implicit-thinking",
+        "endoftext",
+        "trailing-space",
+        "literal-tags",
+    ],
 )
 def test_completion_text(text: str, expected: str) -> None:
     assert loop.completion_text(text) == expected
@@ -310,37 +350,101 @@ def test_tool_calls_preserve_json_strings() -> None:
     assert loop.parse_tool_calls(text + "<|im_end|>") == calls
 
 
+@pytest.mark.parametrize("ending", ["<|im_end|>", "<|endoftext|>", ""], ids=["im-end", "endoftext", "omitted-stop"])
+def test_tool_response_renderer(ending: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock) -> None:
+    calls = [ToolCall(name="look", arguments={}), ToolCall(name="inventory", arguments={})]
+    results = [
+        EpisodeResult(observation="A shelf", reward=0.0, done=False),
+        EpisodeResult(observation="A mug", reward=0.0, done=False),
+    ]
+    environment.step.side_effect = results
+    assistant = {"role": "assistant", "content": "", "reasoning_content": "Inspect.", "tool_calls": calls}
+    messages = [
+        {"role": "system", "content": ALFWorldTask.system_prompt},
+        {"role": "user", "content": ALFWorldTask.prompt},
+    ]
+    initial = tokenizer.apply_chat_template(
+        messages, tools=tool_schemas(), tokenize=False, add_generation_prompt=True, enable_thinking=True
+    )
+    rendered = tokenizer.apply_chat_template(messages + [assistant], tools=tool_schemas(), tokenize=False)
+    reply = rendered[len(initial) :].removesuffix("<|im_end|>\n") + ending
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=response_for(tokenizer, reply if len(requests) == 1 else "Finished<|im_end|>"))
+
+    async def run() -> loop.Rollout:
+        async with make_client(respond) as client:
+            return await replace(make_agent(tokenizer, client), max_tokens=256).run(
+                ALFWorldTask(id="a", config_file="config.yaml")
+            )
+
+    rollout = asyncio.run(run())
+    tool_messages = [{"role": "tool", "content": json.dumps(asdict(result))} for result in results]
+    expected = tokenizer.apply_chat_template(
+        messages + [assistant] + tool_messages,
+        tools=tool_schemas(),
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=True,
+    )
+    if ending == "<|endoftext|>":
+        # Preserve the sampled alternative EOS before inserting the chat boundary.
+        expected = expected.replace(rendered, rendered.removesuffix("<|im_end|>\n") + ending + "<|im_end|>\n", 1)
+    assert tokenizer.decode(requests[1]["prompt"]) == expected
+    assert loop.parse_tool_calls(reply) == calls
+    assert rollout.stop_condition == "agent_completed"
+    sampled = tokenizer.encode(reply, add_special_tokens=False)
+    start = len(requests[0]["prompt"])
+    np.testing.assert_array_equal(rollout.sequence.token_ids[start : start + len(sampled)], sampled)
+    assert rollout.sequence.loss_mask[start : start + len(sampled)].all()
+    assert not rollout.sequence.loss_mask[start + len(sampled) : len(requests[1]["prompt"])].any()
+
+
 def test_completion_tokens_preserve_qwen_tokens() -> None:
     ids = [151667, 198, 151668, 151657, 151658, 151645]
     probabilities = [-0.1, -0.2, -0.3, -0.4, -0.5, 0.0]
-    choice = {
-        "token_ids": ids,
-        "logprobs": {
-            "content": [
-                {"token": f"token_id:{token}", "logprob": probability, "top_logprobs": []}
-                for token, probability in zip(ids, probabilities, strict=True)
-            ]
-        },
-    }
+    choice = CompletionChoice.model_construct(
+        token_ids=ids,
+        logprobs=Logprobs(tokens=[f"token_id:{token}" for token in ids], token_logprobs=probabilities),
+    )
     assert loop.completion_tokens(choice) == (ids, probabilities)
 
 
 @pytest.mark.parametrize(
     "logprob",
-    [-9999.0, 0.1, float("nan"), None, "-0.25"],
-    ids=["clipped", "positive", "nan", "missing", "string"],
+    [-9999.0, 0.1, float("nan"), None, "invalid"],
+    ids=["clipped", "positive", "nan", "missing", "nonnumeric"],
 )
 def test_completion_tokens_invalid_probability(logprob: Any) -> None:
     with pytest.raises(ValueError):
         loop.completion_tokens(
-            {"token_ids": [151645], "logprobs": {"content": [{"token": "token_id:151645", "logprob": logprob}]}}
+            CompletionChoice.model_construct(
+                token_ids=[151645],
+                logprobs=Logprobs.model_construct(tokens=["token_id:151645"], token_logprobs=[logprob]),
+            )
         )
 
 
-@pytest.mark.parametrize("logprobs", [None, {}, {"content": None}, {"content": [{}]}])
+@pytest.mark.parametrize("logprobs", [None, {}, {"tokens": ["token_id:151645"]}, {"token_logprobs": [-0.25]}])
 def test_completion_tokens_missing_evidence(logprobs: Any) -> None:
     with pytest.raises(ValueError):
-        loop.completion_tokens({"token_ids": [151645], "logprobs": logprobs})
+        loop.completion_tokens(
+            CompletionChoice.model_construct(
+                token_ids=[151645], logprobs=None if logprobs is None else Logprobs.model_construct(**logprobs)
+            )
+        )
+
+
+@pytest.mark.parametrize("ids", [None, [-1], ["151645"]], ids=["missing", "negative", "string"])
+def test_completion_tokens_invalid_ids(ids: Any) -> None:
+    with pytest.raises(ValueError):
+        loop.completion_tokens(
+            CompletionChoice.model_construct(
+                token_ids=ids, logprobs=Logprobs(tokens=["token_id:151645"], token_logprobs=[-0.25])
+            )
+        )
 
 
 def test_completion_preserves_literal_thinking_tags(tokenizer: PreTrainedTokenizerFast, environment: AsyncMock) -> None:
@@ -350,7 +454,7 @@ def test_completion_preserves_literal_thinking_tags(tokenizer: PreTrainedTokeniz
         return httpx.Response(200, json=response_for(tokenizer, "<think>Act.</think>" + answer + "<|im_end|>"))
 
     async def run() -> loop.Rollout:
-        async with httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(respond)) as client:
+        async with make_client(respond) as client:
             return await replace(make_agent(tokenizer, client), max_turns=1).run(
                 ALFWorldTask(id="a", config_file="config.yaml")
             )
@@ -361,13 +465,14 @@ def test_completion_preserves_literal_thinking_tags(tokenizer: PreTrainedTokeniz
     assert '"error"' not in rollout.interaction
 
 
-@pytest.mark.parametrize("mode", ["text", "invalid", "multiple", "terminal"])
+@pytest.mark.parametrize("mode", ["text", "invalid", "malformed", "multiple", "terminal"])
 def test_tool_dispatch(mode: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock) -> None:
     look = '<tool_call>{"name":"look","arguments":{}}</tool_call>'
     inventory = '<tool_call>{"name":"inventory","arguments":{}}</tool_call>'
     replies = {
         "text": ["look"],
         "invalid": ['<tool_call>{"name":"unknown","arguments":{}}</tool_call>', "Finished"],
+        "malformed": [look + "<tool_call>invalid</tool_call>", "Finished"],
         "multiple": [look + inventory],
         "terminal": [look + inventory],
     }[mode]
@@ -380,7 +485,7 @@ def test_tool_dispatch(mode: str, tokenizer: PreTrainedTokenizerFast, environmen
         return httpx.Response(200, json=response_for(tokenizer, replies[len(requests) - 1] + "<|im_end|>"))
 
     async def run() -> loop.Rollout:
-        async with httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(respond)) as client:
+        async with make_client(respond) as client:
             return await replace(make_agent(tokenizer, client), max_tokens=256).run(
                 ALFWorldTask(id="a", config_file="config.yaml")
             )
@@ -388,10 +493,12 @@ def test_tool_dispatch(mode: str, tokenizer: PreTrainedTokenizerFast, environmen
     rollout = asyncio.run(run())
     assert rollout.stop_condition == ("alfworld_done" if mode in {"multiple", "terminal"} else "agent_completed")
     environment.reset.assert_awaited_once_with()
-    assert environment.step.await_count == {"text": 0, "invalid": 1, "multiple": 2, "terminal": 1}[mode]
+    assert environment.step.await_count == {"text": 0, "invalid": 1, "malformed": 0, "multiple": 2, "terminal": 1}[mode]
     if mode == "invalid":
-        assert "<tool_response>" in tokenizer.decode(requests[1]["token_ids"])
+        assert "<tool_response>" in tokenizer.decode(requests[1]["prompt"])
         assert "Unknown ALFWorld tool" in rollout.interaction
+    if mode == "malformed":
+        assert '<tool_response>\n{"error":' in tokenizer.decode(requests[1]["prompt"])
     if mode == "multiple":
         assert [call.args[0].name for call in environment.step.await_args_list] == ["look", "inventory"]
         assert '"observation": "At shelf.' in rollout.interaction
@@ -447,7 +554,7 @@ def test_generic_task_environment_lifetime(mode: str, tokenizer: PreTrainedToken
                 events.append("exit")
 
     def respond(request: httpx.Request) -> httpx.Response:
-        prompt = tokenizer.decode(json.loads(request.content)["token_ids"])
+        prompt = tokenizer.decode(json.loads(request.content)["prompt"])
         assert "Count using tools." in prompt and "Count two." in prompt
         assert '"name": "count"' in prompt and "alfworld" not in prompt
         return httpx.Response(
@@ -459,7 +566,7 @@ def test_generic_task_environment_lifetime(mode: str, tokenizer: PreTrainedToken
         )
 
     async def run() -> loop.Rollout:
-        async with httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(respond)) as client:
+        async with make_client(respond) as client:
             task: Task = ExampleTask()
             running = asyncio.create_task(make_agent(tokenizer, client).run(task))
             if mode == "cancel":

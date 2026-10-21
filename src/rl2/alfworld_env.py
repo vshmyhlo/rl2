@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from os.path import expandvars
 from pathlib import Path
 from types import TracebackType
@@ -15,7 +15,7 @@ from alfworld.agents.environment.alfred_tw_env import AlfredTWEnv
 from pydantic import ConfigDict, TypeAdapter, ValidationError
 from pydantic.dataclasses import dataclass as config_dataclass
 
-from rl2.agent_task import EpisodeResult, ToolCall, ToolCallError, ToolSchema
+from rl2.agent_task import Environment, EpisodeResult, Task, ToolCall, ToolCallError, ToolSchema
 
 
 @config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -218,9 +218,9 @@ class ALFWorldTools:
         return self.current
 
 
-@dataclass(frozen=True)
-class ALFWorldTask:
-    id: str
+@dataclass(frozen=True, slots=True)
+class ALFWorldTask(Task):
+    id: str = field()  # A required slot overrides the abstract property.
     config_file: str
     name: ClassVar[str] = "alfworld"
     system_prompt: ClassVar[str] = (
@@ -257,8 +257,11 @@ class ALFWorldWorker:
         self.environment = ALFWorld(config_file=task.config_file, max_steps=max_steps, task_id=task.id)
         self.tools = ALFWorldTools(environment=self.environment, max_steps=max_steps)
 
-    def request(self, action: ToolCall | None = None) -> EpisodeResult:
-        return self.tools.reset() if action is None else self.tools.call(action)
+    def reset(self) -> EpisodeResult:
+        return self.tools.reset()
+
+    def step(self, action: ToolCall) -> EpisodeResult:
+        return self.tools.call(action)
 
     def close(self) -> None:
         self.environment.close()
@@ -267,7 +270,7 @@ class ALFWorldWorker:
         self.close()
 
 
-class ALFWorldSession:
+class ALFWorldSession(Environment):
     """One Ray actor per rollout, with asynchronous requests and bounded cleanup."""
 
     def __init__(self, task: ALFWorldTask, max_steps: int, timeout: float) -> None:
@@ -279,11 +282,14 @@ class ALFWorldSession:
         self.actor = ALFWorldWorker.remote(task=self.task, max_steps=self.max_steps)
         return self
 
-    async def request(self, action: ToolCall | None = None) -> EpisodeResult:
-        if action is not None:
-            validate_tool_call(action)
+    async def reset(self) -> EpisodeResult:
         async with asyncio.timeout(self.timeout):
-            return await self.actor.request.remote(action)
+            return await self.actor.reset.remote()
+
+    async def step(self, action: ToolCall) -> EpisodeResult:
+        validate_tool_call(action)
+        async with asyncio.timeout(self.timeout):
+            return await self.actor.step.remote(action)
 
     async def __aexit__(
         self,
