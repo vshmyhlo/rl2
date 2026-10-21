@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import ExitStack, asynccontextmanager, closing
+from dataclasses import asdict, dataclass, replace
 from os.path import expandvars
 from pathlib import Path
 from typing import Any, Literal
@@ -12,62 +13,74 @@ from alfworld.agents.environment.alfred_tw_env import AlfredTWEnv
 from mcp.server.lowlevel import Server
 from mcp.server.mcpserver import MCPServer
 from pydantic import ConfigDict, Field
-from pydantic.dataclasses import dataclass
+from pydantic.dataclasses import dataclass as config_dataclass
 
 
-@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+@config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class ALFWorldConfig:
     config_file: str
     id: Literal["alfworld"] = "alfworld"
 
 
+def load_environment_config(config_file: str, max_steps: int) -> dict[str, Any]:
+    config_path = Path(config_file).expanduser().resolve()
+    config = yaml.safe_load(config_path.read_text())
+    data_path = Path(expandvars(config["dataset"]["data_path"])).expanduser()
+    # Tool servers run in temporary directories; anchor dataset paths to the config.
+    config["dataset"]["data_path"] = str((config_path.parent / data_path).resolve())
+    config["dataset"]["num_train_games"] = -1
+    config["env"].update(task_types=[1, 2, 3, 4, 5, 6], domain_randomization=False)
+    # DQN mode omits expert demonstrations from observations.
+    config["general"]["training_method"] = "dqn"
+    config["rl"]["training"]["max_nb_steps_per_episode"] = max_steps
+    return config
+
+
+def discover_games(config_file: str, max_steps: int) -> list[str]:
+    config = load_environment_config(config_file, max_steps)
+    return sorted(AlfredTWEnv(config, train_eval="train").game_files)
+
+
+@dataclass(frozen=True)
+class EpisodeResult:
+    observation: str
+    reward: float
+    done: bool
+
+
 class ALFWorld:
-    def __init__(self, config_file: str, max_steps: int) -> None:
-        config_path = Path(config_file).expanduser().resolve()
-        self.config = yaml.safe_load(config_path.read_text())
-        data_path = Path(expandvars(self.config["dataset"]["data_path"])).expanduser()
-        # Tool servers run in temporary directories; anchor dataset paths to the config.
-        self.config["dataset"]["data_path"] = str((config_path.parent / data_path).resolve())
-        self.config["dataset"]["num_train_games"] = -1
-        self.config["env"].update(task_types=[1, 2, 3, 4, 5, 6], domain_randomization=False)
-        # DQN mode omits expert demonstrations from observations.
-        self.config["general"]["training_method"] = "dqn"
-        self.config["rl"]["training"]["max_nb_steps_per_episode"] = max_steps
-        self.loader = AlfredTWEnv(self.config, train_eval="train")
-        self.games = sorted(self.loader.game_files)
-        self.resources = ExitStack()
-        self.reward = 0.0
-
-    def task_ids(self) -> list[str]:
-        return self.games
-
-    def observe(self, observation: str, info: dict[str, Any], done: bool = False) -> dict[str, Any]:
-        self.commands = info["admissible_commands"][0]
-        return {
-            "observation": observation + "\nAdmissible commands: " + ", ".join(self.commands),
-            "reward": self.reward,
-            "done": done,
-        }
-
-    def reset(self, task_id: str) -> dict[str, Any]:
-        if task_id not in self.games:
+    def __init__(self, config_file: str, max_steps: int, task_id: str) -> None:
+        config = load_environment_config(config_file, max_steps)
+        game = Path(task_id).resolve()
+        if not game.is_relative_to(config["dataset"]["data_path"]):
             raise ValueError("ALFWorld task is outside the training split")
-        self.resources.close()
-        self.loader.game_files = [task_id]
+        # Keep upstream validation, but scan only this episode's directory.
+        config["dataset"]["data_path"] = str(game.parent)
+        self.loader = AlfredTWEnv(config, train_eval="train")
+        if str(game) not in self.loader.game_files:
+            raise ValueError("ALFWorld task is not an eligible training game")
+        self.loader.game_files = [str(game)]
         self.loader.num_games = 1
+        self.resources = ExitStack()
+
+    def observe(self, observation: str, info: dict[str, Any], done: bool = False) -> EpisodeResult:
+        self.commands = info["admissible_commands"][0]
+        return EpisodeResult(
+            observation=observation + "\nAdmissible commands: " + ", ".join(self.commands),
+            reward=float(info["won"][0]),
+            done=done or bool(info["won"][0]),
+        )
+
+    def reset(self) -> EpisodeResult:
+        self.resources.close()
         self.env = self.loader.init_env(batch_size=1)
         self.resources.callback(self.env.close)
         observations, info = self.env.reset()
-        self.reward = float(info["won"][0])
-        return self.observe(observations[0], info, done=bool(info["won"][0]))
+        return self.observe(observations[0], info)
 
-    def step(self, action: str) -> dict[str, Any]:
+    def step(self, action: str) -> EpisodeResult:
         observations, _, dones, info = self.env.step([action.strip()])
-        self.reward = float(info["won"][0])
         return self.observe(observations[0], info, bool(dones[0]))
-
-    def score(self) -> float:
-        return self.reward
 
     def close(self) -> None:
         self.resources.close()
@@ -104,24 +117,27 @@ class ALFWorldTools(vf.Toolset[ALFWorldToolsConfig, ALFWorldState]):
 
     async def setup_task(self, task: ALFWorldData) -> None:
         self.environment = self._exit_stack.enter_context(
-            closing(ALFWorld(config_file=self.config.config_file, max_steps=self.config.max_steps))
+            closing(
+                ALFWorld(config_file=self.config.config_file, max_steps=self.config.max_steps, task_id=task.task_id)
+            )
         )
-        self.current = self.environment.reset(task.task_id)
+        self.current = self.environment.reset()
         self.started = False
         self.steps = 0
 
     def result(self) -> dict[str, Any]:
-        self.state.done = self.current["done"]
-        self.state.reward = self.current["reward"]
-        return self.current
+        self.state.done = self.current.done
+        self.state.reward = self.current.reward
+        return asdict(self.current)
 
     def step(self, command: str, *aliases: str) -> dict[str, Any]:
-        if not self.current["done"]:
+        if not self.current.done:
             self.started = True
             command = next((value for value in (command, *aliases) if value in self.environment.commands), command)
             self.current = self.environment.step(command)
             self.steps += 1
-            self.current["done"] |= self.steps >= self.config.max_steps
+            if self.steps >= self.config.max_steps:
+                self.current = replace(self.current, done=True)
         return self.result()
 
     @vf.tool
@@ -212,8 +228,7 @@ class ALFWorldTask(vf.Task[ALFWorldData, ALFWorldState, ALFWorldTaskConfig]):
 
 
 def load_alfworld_tasks(config: ALFWorldConfig, max_steps: int) -> list[ALFWorldTask]:
-    with closing(ALFWorld(config_file=config.config_file, max_steps=max_steps)) as environment:
-        ids = environment.task_ids()
+    ids = discover_games(config_file=config.config_file, max_steps=max_steps)
     if not ids or len(ids) != len(set(ids)):
         raise ValueError("ALFWorld training task IDs must be nonempty and unique")
     task_config = ALFWorldTaskConfig(

@@ -14,52 +14,104 @@ from mcp.server.mcpserver import MCPServer
 from rl2 import alfworld_env as env
 
 
-def test_training_games_and_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.fixture
+def config_file(tmp_path: Path) -> Path:
     path = tmp_path / "config.yaml"
-    path.write_text(json.dumps({"dataset": {"data_path": "games"}, "env": {}, "general": {}, "rl": {"training": {}}}))
+    path.write_text(
+        json.dumps(
+            {
+                "dataset": {"data_path": "games"},
+                "env": {"goal_desc_human_anns_prob": 0},
+                "general": {},
+                "rl": {"training": {}},
+            }
+        )
+    )
+    return path
+
+
+def write_game(directory: Path, *, solvable: bool = True, task_type: str = "pick_and_place_simple") -> Path:
+    directory.mkdir(parents=True)
+    (directory / "traj_data.json").write_text(json.dumps({"task_type": task_type}))
+    game = directory / "game.tw-pddl"
+    game.write_text(json.dumps({"solvable": solvable}))
+    return game
+
+
+def test_episode_reset_step_and_cleanup(config_file: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    game = config_file.parent / "games" / "train-a" / "game.tw-pddl"
     upstream = Mock()
     upstream.reset.return_value = (["Put apple on table"], {"admissible_commands": [["look"]], "won": [False]})
     upstream.step.return_value = (["Done"], [0], [True], {"admissible_commands": [[]], "won": [True]})
-    loader = Mock(game_files=["train/b", "train/a"])
+    loader = Mock(game_files=[str(game)])
     loader.init_env.return_value = upstream
     constructor = Mock(return_value=loader)
     monkeypatch.setattr(env, "AlfredTWEnv", constructor)
-    with closing(env.ALFWorld(config_file=str(path), max_steps=3)) as environment:
-        assert environment.task_ids() == ["train/a", "train/b"]
+    with closing(env.ALFWorld(config_file=str(config_file), max_steps=3, task_id=str(game))) as environment:
         settings = constructor.call_args.args[0]
         assert constructor.call_args.kwargs == {"train_eval": "train"}
+        assert settings["dataset"]["data_path"] == str(game.parent)
         assert settings["dataset"]["num_train_games"] == -1
         assert settings["env"]["task_types"] == [1, 2, 3, 4, 5, 6]
         assert settings["general"]["training_method"] == "dqn"
         assert settings["rl"]["training"]["max_nb_steps_per_episode"] == 3
-        with pytest.raises(ValueError, match="training split"):
-            environment.reset("dev/a")
-        assert "look" in environment.reset("train/b")["observation"]
+        initial = environment.reset()
+        assert "look" in initial.observation
         assert environment.commands == ["look"]
-        assert loader.game_files == ["train/b"]
-        assert environment.score() == 0.0
-        assert environment.step(" look \n")["done"]
+        assert initial.reward == 0.0 and not initial.done
+        loader.init_env.assert_called_once_with(batch_size=1)
+        result = environment.step(" look ")
+        assert result.done and result.reward == 1.0
         upstream.step.assert_called_once_with(["look"])
-        assert environment.score() == 1.0
         upstream.reset.return_value = (["Already done"], {"admissible_commands": [[]], "won": [True]})
-        assert environment.reset("train/a") == {
-            "observation": "Already done\nAdmissible commands: ",
-            "reward": 1.0,
-            "done": True,
-        }
-        assert environment.score() == 1.0
-    assert upstream.close.call_count == 2
+        assert environment.reset() == env.EpisodeResult(
+            observation="Already done\nAdmissible commands: ", reward=1.0, done=True
+        )
+        upstream.reset.side_effect = RuntimeError("reset failed")
+        with pytest.raises(RuntimeError, match="reset failed"):
+            environment.reset()
+    assert upstream.close.call_count == 3
+
+
+def test_episode_loads_only_selected_game(config_file: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = config_file.parent / "games"
+    first = write_game(root / "train-a")
+    second = write_game(root / "train-b")
+    assert env.discover_games(str(config_file), max_steps=2) == [str(first), str(second)]
+    # Loading the selected episode must not read a sibling's metadata again.
+    (second.parent / "traj_data.json").write_text("invalid JSON")
+    monkeypatch.chdir(config_file.parent.parent)
+    with closing(env.ALFWorld(config_file=str(config_file), max_steps=2, task_id=str(first))) as environment:
+        assert environment.loader.game_files == [str(first)]
+        assert environment.loader.num_games == 1
+
+
+@pytest.mark.parametrize("reason", ["outside-root", "symlink", "unsolvable", "unsupported", "wrong-file"])
+def test_episode_rejects_invalid_game(reason: str, config_file: Path) -> None:
+    root = config_file.parent / "games"
+    if reason in {"outside-root", "symlink"}:
+        game = write_game(config_file.parent / "other-split")
+        if reason == "symlink":
+            root.mkdir()
+            (root / "linked").symlink_to(game.parent, target_is_directory=True)
+            game = root / "linked" / game.name
+    else:
+        game = write_game(
+            root / "train-a",
+            solvable=reason != "unsolvable",
+            task_type="unsupported" if reason == "unsupported" else "pick_and_place_simple",
+        )
+        if reason == "wrong-file":
+            game = game.parent / "traj_data.json"
+    with pytest.raises(ValueError, match="training"):
+        env.ALFWorld(config_file=str(config_file), max_steps=2, task_id=str(game))
 
 
 @pytest.mark.parametrize("path_kind", ["relative", "environment"])
 def test_dataset_path_is_independent_of_working_directory(
     path_kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    game_dir = tmp_path / "games" / "train-a"
-    game_dir.mkdir(parents=True)
-    (game_dir / "traj_data.json").write_text(json.dumps({"task_type": "pick_and_place_simple"}))
-    game_file = game_dir / "game.tw-pddl"
-    game_file.write_text(json.dumps({"solvable": True}))
+    game_file = write_game(tmp_path / "games" / "train-a")
     config_dir = tmp_path / "configs"
     config_dir.mkdir()
     config_file = config_dir / "alfworld.yaml"
@@ -76,22 +128,21 @@ def test_dataset_path_is_independent_of_working_directory(
     )
     for directory in (config_dir, tmp_path):
         monkeypatch.chdir(directory)
-        with closing(env.ALFWorld(config_file=str(config_file), max_steps=2)) as environment:
-            assert environment.task_ids() == [str(game_file)]
+        assert env.discover_games(str(config_file), max_steps=2) == [str(game_file)]
 
 
 @pytest.fixture
 def environment(monkeypatch: pytest.MonkeyPatch) -> Mock:
     environment = Mock(commands=[])
-    environment.reset.return_value = {"observation": "Put mug on desk", "reward": 0.0, "done": False}
-    environment.step.return_value = {"observation": "Moved", "reward": 0.0, "done": False}
+    environment.reset.return_value = env.EpisodeResult(observation="Put mug on desk", reward=0.0, done=False)
+    environment.step.return_value = env.EpisodeResult(observation="Moved", reward=0.0, done=False)
     monkeypatch.setattr(env, "ALFWorld", Mock(return_value=environment))
     return environment
 
 
 @pytest.fixture
-def task(environment: Mock) -> env.ALFWorldTask:
-    environment.task_ids.return_value = ["train/a"]
+def task(monkeypatch: pytest.MonkeyPatch) -> env.ALFWorldTask:
+    monkeypatch.setattr(env, "discover_games", Mock(return_value=["train/a"]))
     return env.load_alfworld_tasks(env.ALFWorldConfig(config_file="config.yaml"), max_steps=2)[0]
 
 
@@ -101,16 +152,15 @@ def test_manifest(task: env.ALFWorldTask, environment: Mock) -> None:
     assert "look" in task.data.prompt
     assert task.config.tools.max_steps == 2
     assert Path(task.config.tools.config_file).is_absolute()
-    environment.close.assert_called_once()
+    environment.close.assert_not_called()
     environment.reset.assert_not_called()
 
 
 @pytest.mark.parametrize("ids", [[], ["a", "a"]])
-def test_invalid_manifest(ids: list[str], environment: Mock) -> None:
-    environment.task_ids.return_value = ids
+def test_invalid_manifest(ids: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(env, "discover_games", Mock(return_value=ids))
     with pytest.raises(ValueError, match="nonempty and unique"):
         env.load_alfworld_tasks(env.ALFWorldConfig(config_file="config.yaml"), max_steps=2)
-    environment.close.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -159,11 +209,13 @@ def test_placement_grammar(command: str, environment: Mock) -> None:
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("mode", ["success", "limit", "reset-error", "step-error", "cancel"])
+@pytest.mark.parametrize("mode", ["success", "already-done", "limit", "reset-error", "step-error", "cancel"])
 def test_lifecycle_and_stop(mode: str, task: env.ALFWorldTask, environment: Mock) -> None:
     environment.reset_mock()
     if mode == "success":
-        environment.step.return_value = {"observation": "Done", "reward": 1.0, "done": True}
+        environment.step.return_value = env.EpisodeResult(observation="Done", reward=1.0, done=True)
+    elif mode == "already-done":
+        environment.reset.return_value = env.EpisodeResult(observation="Done", reward=1.0, done=True)
     elif mode in ("reset-error", "step-error"):
         getattr(environment, mode.removesuffix("-error")).side_effect = RuntimeError("failed")
 
@@ -177,7 +229,11 @@ def test_lifecycle_and_stop(mode: str, task: env.ALFWorldTask, environment: Mock
             if mode == "limit":
                 tools.go_to(location="desk 1")
             assert task.alfworld_done(SimpleNamespace(state=tools.state))
-            assert await task.alfworld_reward(SimpleNamespace(state=tools.state)) == (1.0 if mode == "success" else 0.0)
+            assert await task.alfworld_reward(SimpleNamespace(state=tools.state)) == (
+                1.0 if mode in {"success", "already-done"} else 0.0
+            )
+            if mode == "already-done":
+                environment.step.assert_not_called()
             count = environment.step.call_count
             tools.go_to(location="shelf 1")
             assert environment.step.call_count == count

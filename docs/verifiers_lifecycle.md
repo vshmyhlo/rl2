@@ -1,24 +1,23 @@
 # Verifiers agent lifecycle
 
-Reference for this repository's installed Verifiers 0.4.0 implementation, inspected
-on 2026-10-21. The execution examples assume our `null` harness and subprocess
-runtime. Other harnesses can interpret assistant output differently.
+Reference for Verifiers 0.4.0, inspected on 2026-10-21. The model/tool loop below
+describes the `null` harness with a renderer-backed training client. Other harnesses
+and clients can handle model requests and assistant output differently.
 
 ## Objects and ownership
 
 | Object | Responsibility |
 | --- | --- |
-| `vf.Task` | Episode description, configuration, toolset factory, lifecycle hooks, stop rules, and scoring. It is already an instance, not a live ALFWorld environment. |
+| `vf.Task` | Episode description, configuration, toolset factory, lifecycle hooks, stop rules, and scoring. Passed to the agent as an instance. |
 | `vf.Agent` | Model, renderer, sampling, harness, runtime policy, and limits. Can run independent rollouts of the same task. |
 | `Rollout` | One execution: trace, runtime, tool servers, harness session, and cleanup. |
-| `ALFWorldTools` | Owns one live environment and exposes its actions as tools. |
+| `vf.Toolset` | Defines MCP tools and server lifecycle hooks, including task-specific initialization. |
 | `Trace` | Recorded conversation, calls, synchronized state, rewards, timing, and completion status. |
 | `Interaction` | Caller-facing handle for sending user turns into an open rollout. |
 
-`task.toolsets(config)` constructs toolset definitions; `setup_task(task)` creates
-the live ALFWorld environment in its tool-server process. Verifiers also calls
-`toolsets()` during configuration validation, so environment creation belongs in
-`setup_task()`, not in the toolset factory.
+`task.toolsets(config)` constructs toolset definitions; server `setup_task(task_data)`
+initializes task-specific resources. Verifiers also calls `toolsets()` during
+configuration validation, so the factory should not allocate live resources.
 
 ## `agent.run(task)`: complete lifecycle
 
@@ -41,8 +40,7 @@ Agent.run(task)
           │   │       ├─ _setup_task_from_channel(...)
           │   │       │   ├─ fetch/deserialise task data from /task
           │   │       │   └─ await server.setup_task(task_data)
-          │   │       │       └─ ALFWorldTools: construct ALFWorld, init_env, reset
-          │   │       ├─ register tools and lifespan
+          │   │       ├─ register tools
           │   │       └─ serve MCP requests over HTTP
           │   ├─ runtime.prepare_execution(...)
           │   └─ harness.session(...): prepare conversation session
@@ -52,7 +50,6 @@ Agent.run(task)
           └─ await Rollout.close()
               ├─ close harness session
               ├─ close tool servers and interception
-              │   └─ ALFWorldTools lifespan closes its environment
               ├─ task.finalize(trace, runtime), if eligible
               ├─ task.score(...) and harness.score(...), if eligible
               ├─ mark trace completed and record timing/status
@@ -61,8 +58,11 @@ Agent.run(task)
               └─ return Trace
 ```
 
-Task `setup()` and tool-server `setup_task()` are different hooks. Our ALFWorld task
-uses the default no-op task setup; its toolset creates the environment.
+Task `setup(trace, runtime)` and tool-server `setup_task(task_data)` are different
+hooks; both default to no-ops. The diagram shows newly launched task-scoped servers.
+`serve_tools()` can also connect to configured endpoints or borrow shared servers
+whose lifetime is managed by their owner.
+
 Finalization and scoring normally run for successful or stopped rollouts, including
 partial trajectories, but are skipped when the run has already failed. Tools are
 already shut down at that point; the runtime remains available until final cleanup.
@@ -84,18 +84,14 @@ flowchart TD
 ```
 
 For the `null` harness, an assistant response without tool calls ends the segment.
-One segment can contain many model generations and tool calls. It is not one model
-generation, one environment action, or one `interaction.turn()` user message.
+One segment can contain many model generations and tool calls. Each
+`interaction.turn()` runs one segment, rather than necessarily one model generation.
 Limits and task stop rules can prevent further execution before a text answer.
-
-In ALFWorld, the first `look()` returns the initial observation without stepping.
-Action tools update `done` and `reward` in synchronized trace state;
-`alfworld_done` stops the rollout when that state says the episode is finished.
 
 ## `agent.interaction(task)`: caller-driven exchange
 
 This uses the same `Rollout.open()` and `Rollout.close()` paths, but keeps the
-runtime, environment, and conversation alive between segments.
+runtime, tool servers, and conversation alive between segments.
 
 ```text
 async with agent.interaction(task) as interaction:
@@ -105,7 +101,7 @@ async with agent.interaction(task) as interaction:
   │   └─ Rollout.step() → model/tool loop → Segment
   │
   ├─ caller inspects the result and decides the next user message
-  │   environment remains alive; no new setup/reset
+  │   runtime and tool servers remain alive; setup does not repeat
   │
   ├─ await interaction.turn("next input")
   │   └─ Rollout.step(user_messages) → resumed model/tool loop → Segment
@@ -137,31 +133,30 @@ they do not reset for each caller message.
 | Initial setup | Once per attempt | Once on context entry |
 | Text-only answer | Ends the segment, then closes the rollout | Ends the segment and returns control to the caller |
 | Additional user turns | No caller-driven continuation | Caller supplies them with `turn(message)` |
-| Environment between segments | Rollout closes after its segment | Preserved until context exit or explicit close |
+| Resources between segments | Rollout closes after its segment | Preserved until context exit or explicit close |
 | Result | Completed `Trace` | `Segment` per turn; completed trace after close |
 | Automatic retries | Configured retryable failures; no retry into a borrowed runtime | No automatic whole-exchange retries |
 
-## Our trainer and ALFWorld
+## Deferred scoring
 
-The trainer calls `agent.run(task.defer_scoring())` for ALFWorld. The deferred task
-is a deep copy that skips task rewards, metrics, and judges during normal close.
-Environment setup, stop rules, finalization, and harness scoring still run.
+`task.defer_scoring()` returns a deep copy that skips task rewards, metrics, and
+judges during normal close. Setup, stop rules, finalization, and harness scoring
+still run. The caller can later score the completed trace using the original task.
+Scoring after runtime teardown requires a scorer that can operate without that
+live runtime.
 
-After the group's rollouts finish, `score_group()` checks that their traces did not
-fail, calls the original `task.score(trace)` on each, and computes advantages.
-ALFWorld scoring reads `trace.state.reward`; it does not need a live environment.
+## Tool execution and state
 
-Each rollout currently gets its own task-scoped tool-server subprocess and
-`init_env(batch_size=1)` environment. There is no shared environment pool. Tools
-are ordinary synchronous functions: Verifiers awaits state synchronization but
-invokes the tool directly, so construction, reset, and stepping block that server's
-event loop. The actor awaits HTTP results asynchronously, allowing other rollouts
-to proceed. Declaring those functions `async` alone would not offload their work.
+`ServerBase._with_state()` wraps tool calls with state synchronization when the
+toolset declares a custom state class: pull state, invoke the tool, then push
+changed state. The wrapper calls synchronous functions directly and awaits their
+return value only if it is awaitable. It does not automatically offload synchronous
+work to a thread; blocking code blocks the tool server's event loop.
 
-With the current Qwen3 model, the default renderer parses tool calls for execution.
-Thinking is enabled: the generation prefix ends at the assistant header, without
-prefilling an empty thinking section. ToolRL instead uses our custom response parser
-to preserve output tags as text for grading; its proposed calls are not executed.
+The `null` harness executes calls from a model response sequentially. State updates
+replace the whole state, so concurrent writes through other callers can overwrite
+one another. Resource placement and lifetime depend on runtime and toolset
+configuration; shared servers need not be created anew for each rollout.
 
 ## Failure and cancellation
 
@@ -171,13 +166,10 @@ to preserve output tags as text for grading; its proposed calls are not executed
   exceptions inside the context mark the rollout failed and propagate.
 - Cancellation uses `Rollout.abort()` to release the harness session, servers, and
   owned runtime without task finalization or scoring. `run()` shields abort cleanup.
-- The ALFWorld lifespan wrapper places environment cleanup inside HTTP shutdown
-  and preserves MCP's original lifespan. It also covers partial environment setup
-  through the toolset's exit stack.
 
 ## Source map
 
-Local dependency links require the project's Python 3.12 `.venv`; method names are
+Local dependency links assume a Python 3.12 `.venv`; method names are
 the lookup points if dependency layout changes.
 
 | Source | Methods to inspect |
@@ -188,5 +180,3 @@ the lookup points if dependency layout changes.
 | [mcp/launch.py](../.venv/lib/python3.12/site-packages/verifiers/v1/mcp/launch.py) | `serve_tools`, `serve` |
 | [mcp/server.py](../.venv/lib/python3.12/site-packages/verifiers/v1/mcp/server.py) | `ServerBase._serve`, `_setup_task_from_channel`, `_with_state` |
 | [harnesses/utils/core.py](../.venv/lib/python3.12/site-packages/verifiers/v1/harnesses/utils/core.py) | `run_chat_loop` |
-| [alfworld_env.py](../src/rl2/alfworld_env.py) | `ALFWorldTools.setup_task`, `register`, action tools; `ALFWorldTask` stop/reward hooks |
-| [train_grpo_v2.py](../src/rl2/train_grpo_v2.py) | `create_agent`, rollout collection, `score_group` |

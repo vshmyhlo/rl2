@@ -371,10 +371,21 @@ def test_rollout_workers_restrict_accidental_jax_gpu_use() -> None:
 def test_script_actor_serialization() -> None:
     # A script's definitions must travel by value to workers with a different entrypoint.
     namespace = runpy.run_path(training.__file__)
-    for name in ("Learner", "Actor", "Batcher"):
-        actor_class = namespace[name].__ray_metadata__.modified_class
-        restored = cloudpickle.loads(cloudpickle.dumps(actor_class))
-        assert restored.__name__ == name
+    actors = {name: namespace[name].__ray_metadata__.modified_class for name in ("Learner", "Actor", "Batcher")}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys\n"
+            "from ray import cloudpickle\n"
+            "actors = cloudpickle.loads(sys.stdin.buffer.read())\n"
+            "assert all(actor.__name__ == name for name, actor in actors.items())\n",
+        ],
+        input=cloudpickle.dumps(actors),
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr.decode()
 
 
 def test_wait_for_server_retries_until_ready(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1607,7 +1618,11 @@ def test_format_interaction_includes_untokenized_results(
     ids=["population-std", "fractional-ties", "differences-below-float32-precision"],
 )
 def test_score_group_normalizes_rewards(
-    rewards: list[float], token_trace: vf.Trace, actor: Any, monkeypatch: pytest.MonkeyPatch
+    rewards: list[float],
+    token_trace: vf.Trace,
+    actor: Any,
+    tokenizer: PreTrainedTokenizerFast,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     task = actor.tasks[0]
     monkeypatch.setattr(task, "score", AsyncMock())
@@ -2281,17 +2296,17 @@ from typing import Any
 from rl2 import alfworld_env
 
 class Environment:
-    def __init__(self, config_file: str, max_steps: int) -> None:
+    def __init__(self, config_file: str, max_steps: int, task_id: str) -> None:
+        assert task_id == "train/a"
         self.output = Path(config_file)
         self.commands = ["go to shelf 1", "move mug 1 to desk 1"]
         self.actions: list[str] = []
-    def reset(self, task_id: str) -> dict[str, Any]:
-        assert task_id == "train/a"
-        return {"observation": "Goal: put the carried mug on the desk", "done": False, "reward": 0.0}
-    def step(self, action: str) -> dict[str, Any]:
+    def reset(self) -> alfworld_env.EpisodeResult:
+        return alfworld_env.EpisodeResult(observation="Goal: put the carried mug on the desk", done=False, reward=0.0)
+    def step(self, action: str) -> alfworld_env.EpisodeResult:
         self.actions.append(action)
         done = len(self.actions) == 2
-        return {"observation": "Done" if done else "At shelf", "done": done, "reward": float(done)}
+        return alfworld_env.EpisodeResult(observation="Done" if done else "At shelf", done=done, reward=float(done))
     def close(self) -> None:
         (self.output / f"{os.getpid()}.closed").write_text("\\n".join(self.actions))
 

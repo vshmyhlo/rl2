@@ -68,7 +68,7 @@ from collections import Counter
 from collections.abc import Iterator
 from contextlib import AsyncExitStack, ExitStack, closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
-from functools import lru_cache, partial
+from functools import partial
 from itertools import islice
 from pathlib import Path
 from statistics import mean, pstdev
@@ -96,7 +96,6 @@ from opentelemetry.trace import StatusCode
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass as config_dataclass
 from ray.actor import ActorHandle
-from renderers.base import Tokenizer, load_tokenizer
 from renderers.configs import CustomRendererConfig
 from verifiers.v1.configs.agent import TimeoutConfig
 from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
@@ -117,6 +116,7 @@ from rl2.configuration import BaseConfig, load_config
 from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import Parameters, Qwen3LM, load_qwen3_checkpoint
 from rl2.ray_timeline import record_timeline
+from rl2.rollout_tokenizer import rollout_tokenizer
 from rl2.toolrl_env import TOOLRL_TRAIN_FILE, ToolRLTaskset, ToolRLTasksetConfig
 from rl2.tracing import flush_tracing, span, tracing_enabled
 
@@ -515,11 +515,6 @@ def training_sequence(trace: vf.Trace) -> TrainingSequence:
         loss_mask=np.asarray(branch.sampled_mask, dtype=np.bool_),  # (T,)
         old_log_probs=np.asarray(branch.logprobs, dtype=np.float32),  # (T,)
     )
-
-
-@lru_cache(maxsize=1)
-def rollout_tokenizer(model: str) -> Tokenizer:
-    return load_tokenizer(model)
 
 
 def format_interaction(trace: vf.Trace) -> str:

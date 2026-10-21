@@ -529,6 +529,16 @@ Outputs outside `/runs` are ephemeral unless written to external storage.
 Builds and images consume host disk; inspect cache usage with
 `sudo buildctl --addr unix:///run/rl2-buildkit/buildkitd.sock du`.
 
+Remove all unused build cache (including dependency download caches and frontend
+references) without deleting container images or Jobs:
+
+```bash
+sudo bash infra/k3s/training/cleanup-build-cache.sh
+```
+
+The script forwards `buildctl prune` options; add `--keep-duration 24h` to retain
+recent cache. Subsequent builds may take longer while rebuilding pruned layers.
+
 To check GPU visibility and preemption on an idle queue (creates and cleans up
 two short Jobs; the low-priority Job requests the full GPU quota):
 
