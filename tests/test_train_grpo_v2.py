@@ -9,7 +9,6 @@ import sys
 from collections.abc import Iterator
 from contextlib import ExitStack, aclosing
 from dataclasses import asdict, replace
-from importlib import import_module
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Any, Literal
@@ -21,8 +20,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import renderers.base as renderer_base
-import verifiers.v1 as vf
 import yaml
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
@@ -30,18 +27,8 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import ValidationError
 from ray import cloudpickle
-from tokenizers import Tokenizer, decoders, models, pre_tokenizers
-from transformers import PreTrainedTokenizerFast
-from verifiers.v1.clients import base as client_base
-from verifiers.v1.clients.train import ElasticRendererPool
-from verifiers.v1.runtimes import subprocess as subprocess_runtime
-from verifiers.v1.trace import AgentInfo, AgentSpan, Error, ModelCall, TimeSpan, TimeSplit, Timing, TraceTask
-from verifiers.v1.types import Usage
 
-from rl2 import alfworld_env, benchmark_env, codegym_env
 from rl2 import train_grpo_v2 as training
-from rl2.addition_env import AdditionTaskset, AdditionTools
-from rl2.toolrl_env import ToolCall, ToolRLData, ToolRLRenderer, ToolRLTask
 
 
 @pytest.fixture
@@ -67,16 +54,16 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert not defaults.enable_ray_timeline
     assert defaults.enable_tracing
     assert defaults.weight_update_pause_mode == "wait"
-    preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/addition.yaml"
+    preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/alfworld.yaml"
     config = training.load_config(preset, training.Config)
-    assert config.run_id == "grpo_v2_addition_Qwen_Qwen3-0.6B_seed1"
+    assert config.run_id == "grpo_v2_alfworld_Qwen_Qwen3-0.6B_seed3"
     assert config.ckpt_dir == f"/runs/grpo_v2/{config.run_id}"
     assert config.total_iterations is None
     assert config.minibatches_per_epoch == 4
     assert config.grad_accum_steps == 1
     assert config.gradient_checkpointing
     assert config.weight_update_pause_mode == "wait"
-    assert asdict(config.taskset) == {"id": "addition"}
+    assert asdict(config.taskset) == {"id": "alfworld", "config_file": "data/alfworld/base_config.yaml"}
     assert "dataset_file" not in asdict(config)
     path = tmp_path / "config.yaml"
     path.write_text(
@@ -114,7 +101,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_presets_use_telemetry_defaults() -> None:
     presets = Path(__file__).resolve().parents[1] / "configs/grpo_v2"
-    for preset in sorted(presets.glob("*.yaml")):
+    for preset in sorted(presets.glob("alfworld.yaml")):
         config = training.load_config(preset, training.Config)
         assert config.enable_tracing, preset.name
         assert not config.enable_ray_dashboard, preset.name
@@ -150,7 +137,6 @@ def test_presets_use_telemetry_defaults() -> None:
         {"update_epochs": 0},
         {"weight_update_pause_mode": "unknown"},
         {"taskset": "unknown"},
-        {"taskset": training.ToolRLConfig(), "max_turns": 2},
     ],
 )
 def test_config_rejects_invalid_settings(settings: dict[str, object]) -> None:
@@ -158,147 +144,20 @@ def test_config_rejects_invalid_settings(settings: dict[str, object]) -> None:
         training.Config(**settings)
 
 
-@pytest.mark.parametrize("dataset", [None, "/data/train.parquet"], ids=["default", "local"])
-def test_toolrl_subconfig(dataset: str | None, tmp_path: Path) -> None:
-    taskset = {"id": "toolrl"}
-    if dataset is not None:
-        taskset["dataset_file"] = dataset
-    path = tmp_path / "config.yaml"
-    path.write_text(yaml.safe_dump({"taskset": taskset, "max_turns": 1}))
-    config = training.load_config(path, training.Config)
-    assert isinstance(config.taskset, training.ToolRLConfig)
-    assert config.taskset.dataset_file == (training.TOOLRL_TRAIN_FILE if dataset is None else dataset)
-    assert "dataset_file" not in asdict(config)
-
-
 @pytest.mark.parametrize(
     ("settings", "error"),
     [
-        ({"taskset": {"id": "unknown"}}, "union_tag_invalid"),
-        ({"taskset": {"id": "addition", "dataset_file": "train.parquet"}}, "unexpected_keyword_argument"),
-        ({"taskset": {"id": "toolrl", "unknown_option": True}, "max_turns": 1}, "unexpected_keyword_argument"),
+        ({"taskset": {"id": "addition", "config_file": "config.yaml"}}, "literal_error"),
+        ({"taskset": {"id": "alfworld", "config_file": None}}, "string_type"),
+        ({"taskset": {"id": "alfworld", "config_file": "config.yaml", "unknown": True}}, "unexpected_keyword_argument"),
         ({"dataset_file": "train.parquet"}, "unexpected_keyword_argument"),
     ],
-    ids=["unknown-tag", "addition-dataset", "unknown-toolrl-field", "top-level-dataset"],
 )
 def test_taskset_config_rejects_invalid_yaml(settings: dict[str, object], error: str, tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match=error):
         training.load_config(path, training.Config)
-
-
-def test_agent_uses_config() -> None:
-    config = training.Config(model="Qwen/custom", max_tokens=16, max_turns=2, temperature=0.7, rollout_timeout=300)
-    agent = training.create_agent(config)
-    assert agent.config.model == config.model
-    assert agent.config.client.renderer_model_name == config.model
-    assert agent.config.sampling.max_tokens == 16
-    assert agent.config.sampling.temperature == 0.7
-    assert agent.config.sampling.chat_template_kwargs == {"enable_thinking": True}
-    assert agent.config.max_turns == 2
-    assert agent.config.timeout.rollout == 300
-
-
-def test_alfworld_agent_allows_thinking() -> None:
-    config = training.Config(taskset=training.ALFWorldConfig(config_file="/data/base_config.yaml"))
-    agent = training.create_agent(config)
-    assert agent.config.sampling.chat_template_kwargs == {"enable_thinking": True}
-    assert agent.config.client.renderer is None
-
-
-def test_toolrl_preset_and_actor(monkeypatch: pytest.MonkeyPatch) -> None:
-    preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/toolrl.yaml"
-    config = training.load_config(preset, training.Config)
-    assert isinstance(config.taskset, training.ToolRLConfig)
-    assert config.taskset.dataset_file == training.TOOLRL_TRAIN_FILE
-    assert config.max_turns == 1
-    assert config.max_tokens == 1024
-    assert config.minibatches_per_epoch == training.DEFAULT_CONFIG.minibatches_per_epoch == 4
-    assert config.grad_accum_steps == 1
-    assert config.update_epochs == training.DEFAULT_CONFIG.update_epochs == 1
-    assert config.run_id == f"grpo_v2_toolrl_Qwen_Qwen3-0.6B_seed{config.seed}"
-    assert pickle.loads(pickle.dumps(config)) == config
-    tasks = Mock(return_value=[Mock()])
-    monkeypatch.setattr(training, "ToolRLTaskset", tasks)
-    monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
-    monkeypatch.setattr(training, "wait_for_server", Mock())
-    actor = training.Actor.__ray_metadata__.modified_class(config=config)
-    assert actor.tasks == tasks.return_value
-    assert tasks.call_args.kwargs["config"].data_file == config.taskset.dataset_file
-    actor.__ray_shutdown__()
-
-
-@pytest.mark.parametrize("mode", ["local", "remote", "vllm-failure"])
-def test_codegym_preset_and_actor(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/codegym.yaml"
-    config = training.load_config(preset, training.Config)
-    assert isinstance(config.taskset, training.CodeGymConfig)
-    assert config.taskset.dataset_file == training.CODEGYM_TRAIN_FILE
-    assert config.taskset.manager_url == "http://127.0.0.1:8001"
-    assert config.taskset.server == training.CodeGymServerConfig(root="/runs/codegym", workers=40)
-    assert config.max_turns == 32
-    assert config.update_epochs == 1
-    assert config.minibatches_per_epoch == 4
-    assert config.grad_accum_steps == 1
-    assert config.run_id == f"grpo_v2_codegym_Qwen_Qwen3-0.6B_seed{config.seed}"
-    assert pickle.loads(pickle.dumps(config)) == config
-    if mode == "remote":
-        config = replace(config, taskset=replace(config.taskset, server=None, manager_url="http://codegym:8000"))
-    tasks = Mock(return_value=[Mock()])
-    server = MagicMock()
-    launch = Mock(return_value=server)
-    monkeypatch.setattr(training, "serve_codegym", launch)
-    monkeypatch.setattr(training, "CodeGymTaskset", tasks)
-    monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
-    monkeypatch.setattr(
-        training, "wait_for_server", Mock(side_effect=RuntimeError("vLLM failed") if mode == "vllm-failure" else None)
-    )
-    if mode == "vllm-failure":
-        with pytest.raises(RuntimeError, match="vLLM failed"):
-            training.Actor.__ray_metadata__.modified_class(config=config)
-        server.__exit__.assert_called_once()
-        return
-    actor = training.Actor.__ray_metadata__.modified_class(config=config)
-    assert actor.tasks == tasks.return_value
-    assert tasks.call_args.kwargs["config"].data_file == config.taskset.dataset_file
-    actor.__ray_shutdown__()
-    if mode == "local":
-        launch.assert_called_once_with(config.taskset.server, config.taskset.manager_url)
-        server.__exit__.assert_called_once()
-    else:
-        launch.assert_not_called()
-
-
-@pytest.mark.parametrize("url", ["", "codegym:8000", "file:///tmp/codegym"])
-def test_codegym_invalid_manager_url(url: str) -> None:
-    with pytest.raises(ValidationError, match="HTTP"):
-        training.CodeGymConfig(manager_url=url)
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "http://codegym:8001",
-        "http://127.0.0.1:8000",
-        "http://127.0.0.1:0",
-        "http://127.0.0.1:65536",
-        "https://127.0.0.1:8001",
-        "http://127.0.0.1:8001/proxy",
-    ],
-)
-def test_local_codegym_invalid_url(url: str) -> None:
-    with pytest.raises(ValidationError, match="Local CodeGym"):
-        training.CodeGymConfig(manager_url=url, server=training.CodeGymServerConfig(root="/server"))
-
-
-def test_local_codegym_worker_capacity() -> None:
-    taskset = training.CodeGymConfig(
-        manager_url="http://127.0.0.1:8001", server=training.CodeGymServerConfig(root="/server", workers=4)
-    )
-    assert training.Config(taskset=taskset, group_size=4).taskset == taskset
-    with pytest.raises(ValidationError, match="concurrent rollouts"):
-        training.Config(taskset=taskset, num_groups=2, group_size=4)
 
 
 @pytest.mark.parametrize("temperature", [0.01, 2.0])
@@ -376,13 +235,16 @@ def test_script_actor_serialization() -> None:
         [
             sys.executable,
             "-c",
-            "import sys\n"
-            "from ray import cloudpickle\n"
-            "actors = cloudpickle.loads(sys.stdin.buffer.read())\n"
-            "assert all(actor.__name__ == name for name, actor in actors.items())\n",
+            (
+                "import sys\n"
+                "from ray import cloudpickle\n"
+                "actors = cloudpickle.loads(sys.stdin.buffer.read())\n"
+                "assert all(actor.__name__ == name for name, actor in actors.items())\n"
+            ),
         ],
         input=cloudpickle.dumps(actors),
         capture_output=True,
+        check=False,
         timeout=60,
     )
     assert result.returncode == 0, result.stderr.decode()
@@ -425,8 +287,19 @@ def test_wait_for_server_detects_exit(returncode: int, monkeypatch: pytest.Monke
     sleep.assert_called_once()
 
 
+@pytest.fixture(autouse=True)
+def task_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        training,
+        "load_alfworld_tasks",
+        Mock(
+            return_value=[training.ALFWorldTask(id=f"train/{index}", config_file="config.yaml") for index in range(2)]
+        ),
+    )
+
+
 @pytest.fixture
-def actor(monkeypatch: pytest.MonkeyPatch, tokenizer: PreTrainedTokenizerFast) -> Any:
+def actor(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
     monkeypatch.setattr(training, "wait_for_server", Mock())
     actor = training.Actor.__ray_metadata__.modified_class()
@@ -434,23 +307,23 @@ def actor(monkeypatch: pytest.MonkeyPatch, tokenizer: PreTrainedTokenizerFast) -
     return actor
 
 
-async def collect_and_close(actor: Any, task: vf.Task) -> training.RolloutGroup:
+async def collect_and_close(actor: Any, task: training.ALFWorldTask) -> training.RolloutGroup:
     async with aclosing(actor):
         return await actor.collect_group(task, group_size=2)
 
 
-def test_actor_reuses_agent(actor: Any, token_trace: vf.Trace, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_actor_reuses_agent(actor: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch) -> None:
     agent = AsyncMock()
     entering = asyncio.Event()
     release = asyncio.Event()
 
-    async def enter(context: vf.Agent) -> Any:
+    async def enter(context: training.Agent) -> Any:
         entering.set()
         await release.wait()
         return agent
 
     agent.__aenter__.side_effect = enter
-    agent.run.return_value = token_trace.model_copy(deep=True, update={"ok": True})
+    agent.run.return_value = rollout
     create = Mock(return_value=agent)
     monkeypatch.setattr(training, "create_agent", create)
 
@@ -463,7 +336,7 @@ def test_actor_reuses_agent(actor: Any, token_trace: vf.Trace, monkeypatch: pyte
             create.assert_called_once_with(actor.config)
             release.set()
             groups = await asyncio.gather(first, second)
-            assert [group.task_id for group in groups] == [task.data.id for task in actor.tasks[:2]]
+            assert [group.task_id for group in groups] == [f"alfworld:{task.id}" for task in actor.tasks[:2]]
             await actor.collect_group(actor.tasks[0], group_size=2)
             agent.__aexit__.assert_not_awaited()
         await actor.aclose()
@@ -501,13 +374,13 @@ def test_actor_close_cancels_rollouts(actor: Any, monkeypatch: pytest.MonkeyPatc
     started = asyncio.Event()
     active = 0
 
-    async def run(task: vf.Task) -> vf.Trace:
+    async def run(task: training.ALFWorldTask) -> training.Rollout:
         nonlocal active
         active += 1
         if active == 2:
             started.set()
         try:
-            return await asyncio.Future[vf.Trace]()
+            return await asyncio.Future[training.Rollout]()
         finally:
             active -= 1
             agent.__aexit__.assert_not_awaited()
@@ -611,7 +484,7 @@ def test_learner_pulls_groups_through_batcher(
         assert not hasattr(batch, "groups")
         assert batch.stop_counts == {"agent_completed": num_groups * 3}
         assert batch.num_output_tokens == num_groups * 3
-        assert batch.examples.count("Final assistant output:") == 3
+        assert batch.examples.count("Full interaction (special tokens preserved):") == 3
         assert batch.training_batch.token_ids.shape == (num_groups * 3, 8)
         np.testing.assert_array_equal(batch.training_batch.advantages, 0.5)
     batcher_handle.fetch_next_batch.remote.assert_called_once_with(
@@ -1372,244 +1245,10 @@ def test_train_gracefully_terminates_actor(
         ]
 
 
-def test_environment_examples(actor: Any) -> None:
-    assert len(actor.tasks) == 5
-    assert [task.data.idx for task in actor.tasks] == list(range(5))
-    assert [task.data.answer for task in actor.tasks] == [42, 21, 9, 3, 43]
-    task = actor.tasks[0]
-    assert task.data.id == "0"
-    assert task.data.prompt == "What is 17 + 25?"
-    tools = task.toolsets(task.config)
-    assert isinstance(tools[0], AdditionTools)
-    assert asyncio.run(tools[0].add(a=17, b=25)) == 42
-    agent = training.create_agent()
-    assert agent.harness.SUPPORTS_MCP
-    config = agent.config
-    assert config.harness.id == "null"
-    assert config.runtime.type == "subprocess"
-    assert config.client.base_url == f"{training.SERVER_URL}/v1"
-    assert isinstance(config.client, vf.TrainClientConfig)
-    assert config.client.renderer_model_name == training.MODEL
-    assert config.max_turns == 3
-
-
-def test_taskset_applies_config_and_prompt_override(tmp_path: Path) -> None:
-    prompt = tmp_path / "system.txt"
-    prompt.write_text("Use the addition tool.")
-    config = vf.TasksetConfig(system_prompt=prompt)
-    tasks = list(AdditionTaskset(config=config))
-    assert all(task.config is config.task for task in tasks)
-    assert all(task.data.system_prompt == "Use the addition tool." for task in tasks)
-
-
-@pytest.mark.parametrize(("reply", "reward"), [(" 42\n", 1.0), ("41", 0.0), ("", 0.0)])
-def test_correct_answer(reply: str, reward: float, actor: Any) -> None:
-    task = actor.tasks[0]
-    trace = vf.Trace(
-        task=TraceTask(type="AdditionTask", data=task.data),
-        agent=AgentInfo(config=training.create_agent().config),
-        root_reply=reply,
-    )
-    assert asyncio.run(task.correct_answer(trace)) == reward
-
-
 @pytest.mark.parametrize("size", [0, 1])
 def test_group_requires_multiple_rollouts(size: int, actor: Any) -> None:
     with pytest.raises(ValueError, match="group_size"):
         asyncio.run(actor.fetch_next_group(group_size=size))
-
-
-@pytest.mark.parametrize("failure", [None, "rollout", "score", "tokens"])
-def test_actor_returns_only_complete_groups(
-    failure: str | None, actor: Any, monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
-) -> None:
-    task = actor.tasks[0]
-    traces = [
-        vf.Trace(
-            task=TraceTask(type="AdditionTask", data=task.data),
-            agent=AgentInfo(config=training.create_agent().config),
-            root_reply=reply,
-            nodes=[
-                vf.MessageNode(
-                    message=vf.AssistantMessage(content=reply),
-                    sampled=True,
-                    token_ids=[42 if reply == "42" else 41],
-                    mask=[True],
-                    logprobs=[-0.2],
-                )
-            ],
-            ok=True,
-            stop_condition="agent_completed",
-        )
-        for reply in ["42", "41"]
-    ]
-    if failure == "rollout":
-        traces[1].ok = False
-    if failure == "score":
-        monkeypatch.setattr(task, "score", AsyncMock(side_effect=ValueError("scoring failed")))
-    if failure == "tokens":
-        traces[1].nodes = []
-    env = AsyncMock()
-    env.__aenter__.return_value = env
-    seen: list[vf.Task] = []
-
-    async def run(sample: vf.Task) -> vf.Trace:
-        index = len(seen)
-        seen.append(sample)
-        # Finish out of order to check reward/trace/advantage alignment.
-        if index == 0:
-            await asyncio.sleep(0)
-        return traces[index]
-
-    env.run.side_effect = run
-    monkeypatch.setattr(training, "create_agent", Mock(return_value=env))
-
-    async def collect() -> training.Transfer[training.RolloutGroup]:
-        async with aclosing(actor):
-            return await actor.fetch_next_group(group_size=2)
-
-    if failure:
-        with pytest.raises(RuntimeError if failure == "rollout" else ValueError):
-            asyncio.run(collect())
-    else:
-        result = asyncio.run(collect())
-        group = result.value
-    assert len(seen) == 2
-    assert seen[0] is not seen[1] and all(sample is not task for sample in seen)
-    assert all(sample.data == task.data and sample.scoring_deferred for sample in seen)
-    assert not task.scoring_deferred
-    env.__aexit__.assert_awaited_once()
-    finished = spans.get_finished_spans()
-    parent = next(item for item in finished if item.name == "actor.collect_group")
-    rollouts = [item for item in finished if item.name == "actor.rollout"]
-    assert len(rollouts) == 2
-    assert all(item.parent.span_id == parent.context.span_id for item in rollouts)
-    assert parent.status.status_code == (otel_trace.StatusCode.ERROR if failure else otel_trace.StatusCode.UNSET)
-    assert sum(item.status.status_code == otel_trace.StatusCode.ERROR for item in rollouts) == (failure == "rollout")
-    if not failure:
-        assert group.task_id == task.data.id
-        assert [rollout.reward for rollout in group.rollouts] == [1.0, 0.0]
-        assert [rollout.advantage for rollout in group.rollouts] == pytest.approx([1.0, -1.0], abs=3e-4)
-        assert group.prompt == task.data.prompt_text
-        assert [rollout.completion for rollout in group.rollouts] == ["42", "41"]
-        np.testing.assert_array_equal([rollout.sequence.token_ids for rollout in group.rollouts], [[42], [41]])
-        jax.tree.map(np.testing.assert_array_equal, asdict(pickle.loads(pickle.dumps(result))), asdict(result))
-
-
-@pytest.fixture
-def token_trace(actor: Any) -> vf.Trace:
-    return vf.Trace(
-        task=TraceTask(type="AdditionTask", data=actor.tasks[0].data),
-        agent=AgentInfo(config=training.create_agent().config),
-        nodes=[
-            vf.MessageNode(message=vf.UserMessage(content="question"), token_ids=[10], mask=[False]),
-            vf.MessageNode(
-                parent=0,
-                message=vf.AssistantMessage(content="tool call"),
-                sampled=True,
-                token_ids=[20],
-                mask=[True],
-                logprobs=[-0.2],
-            ),
-            vf.MessageNode(
-                parent=1,
-                message=vf.ToolMessage(content="42", tool_call_id="call_add"),
-                token_ids=[30],
-                mask=[False],
-            ),
-            vf.MessageNode(
-                parent=2,
-                message=vf.AssistantMessage(content="42"),
-                sampled=True,
-                token_ids=[40, 41],
-                mask=[True, True],
-                logprobs=[-0.4, -0.5],
-            ),
-        ],
-    )
-
-
-def test_record_rollout_spans(token_trace: vf.Trace, spans: InMemorySpanExporter) -> None:
-    token_trace.timing = Timing(
-        boot=TimeSpan(start=1, end=2),
-        setup=TimeSpan(start=2, end=3),
-        agent=AgentSpan(start=3, end=6, model=TimeSplit(duration=2), harness=TimeSplit(duration=1)),
-        finalize=TimeSpan(start=6, end=6),  # Keep completed zero-duration phases.
-        scoring=TimeSpan(start=6),  # Skip unfinished phases.
-    )
-    token_trace.calls = [
-        ModelCall(
-            model="test-model",
-            time=TimeSpan(start=3.25, end=4.25),
-            finish_reason="stop",
-            usage=Usage(prompt_tokens=10, completion_tokens=2, cached_input_tokens=3),
-        ),
-        ModelCall(
-            time=TimeSpan(start=4.5, end=5.5),
-            error=Error(type="ProviderError", message="failed"),
-        ),
-        ModelCall(),  # No recorded timestamps.
-        ModelCall(time=TimeSpan(start=5.5)),  # Request still in flight.
-    ]
-    with training.span("actor.rollout") as parent:
-        training.record_rollout_spans(token_trace)
-        assert otel_trace.get_current_span() is parent
-    finished = spans.get_finished_spans()
-    phases = {
-        item.name.removeprefix("actor.rollout."): item for item in finished[:-1] if item.name != "actor.rollout.model"
-    }
-    assert set(phases) == {"boot", "setup", "agent", "finalize"}
-    for name, start, end in (("boot", 1, 2), ("setup", 2, 3), ("agent", 3, 6), ("finalize", 6, 6)):
-        item = phases[name]
-        assert item.parent.span_id == parent.get_span_context().span_id
-        assert (item.start_time, item.end_time) == (start * 1_000_000_000, end * 1_000_000_000)
-    assert phases["agent"].attributes == {"model_seconds": 2, "harness_seconds": 1}
-    calls = [item for item in finished if item.name == "actor.rollout.model"]
-    assert len(calls) == 2
-    for item, call in zip(calls, token_trace.calls, strict=False):
-        assert item.parent.span_id == phases["agent"].context.span_id
-        assert item.context.trace_id == parent.get_span_context().trace_id
-        assert item.start_time == int(call.time.start * 1_000_000_000)
-        assert item.end_time == int(call.time.end * 1_000_000_000)
-    assert calls[0].attributes == {
-        "call_index": 0,
-        "model": "test-model",
-        "finish_reason": "stop",
-        "input_tokens": 13,
-        "output_tokens": 2,
-    }
-    assert calls[1].attributes["error.type"] == "ProviderError"
-    assert calls[1].status.status_code == otel_trace.StatusCode.ERROR
-    assert not otel_trace.get_current_span().get_span_context().is_valid
-    spans.clear()
-    training.record_rollout_spans(token_trace)
-    assert not spans.get_finished_spans()
-
-
-@pytest.mark.parametrize("turns", [1, 2], ids=["single-turn", "multi-turn"])
-def test_training_sequence_preserves_tokens_and_masks_context(token_trace: vf.Trace, turns: int) -> None:
-    token_trace.nodes = token_trace.nodes[: 2 * turns]
-    length = 2 if turns == 1 else 5
-    sequence = training.training_sequence(token_trace)
-    np.testing.assert_array_equal(sequence.token_ids, [10, 20, 30, 40, 41][:length])
-    np.testing.assert_array_equal(sequence.loss_mask, [False, True, False, True, True][:length])
-    np.testing.assert_allclose(sequence.old_log_probs, [0.0, -0.2, 0.0, -0.4, -0.5][:length])
-    assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape == (length,)
-    assert all(isinstance(value, np.ndarray) for value in asdict(sequence).values())
-    assert sequence.token_ids.dtype == np.int32
-    assert sequence.loss_mask.dtype == np.bool_
-    assert sequence.old_log_probs.dtype == np.float32
-    jax.tree.map(np.testing.assert_array_equal, asdict(pickle.loads(pickle.dumps(sequence))), asdict(sequence))
-
-
-def test_format_interaction_includes_untokenized_results(
-    token_trace: vf.Trace, tokenizer: PreTrainedTokenizerFast
-) -> None:
-    result = vf.ToolMessage(content="Terminal result", tool_call_id="last_call")
-    token_trace.nodes.append(vf.MessageNode(parent=len(token_trace.nodes) - 1, message=result))
-    text = training.format_interaction(token_trace)
-    tokens = tokenizer.decode([10, 20, 30, 40, 41], skip_special_tokens=False, clean_up_tokenization_spaces=False)
-    assert text == tokens + "\n\nMessages without model tokens:\n" + result.model_dump_json(exclude_none=True)
 
 
 @pytest.mark.parametrize(
@@ -1618,18 +1257,11 @@ def test_format_interaction_includes_untokenized_results(
     ids=["population-std", "fractional-ties", "differences-below-float32-precision"],
 )
 def test_score_group_normalizes_rewards(
-    rewards: list[float],
-    token_trace: vf.Trace,
-    actor: Any,
-    tokenizer: PreTrainedTokenizerFast,
-    monkeypatch: pytest.MonkeyPatch,
+    rewards: list[float], rollout: training.Rollout, actor: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     task = actor.tasks[0]
-    monkeypatch.setattr(task, "score", AsyncMock())
-    traces = [token_trace.model_copy(deep=True, update={"ok": True}) for _ in rewards]
-    for trace, reward in zip(traces, rewards, strict=True):
-        trace.record_reward("test", reward)
-    group = asyncio.run(training.score_group(task, traces))
+    rollouts = [replace(rollout, reward=reward) for reward in rewards]
+    group = training.score_group(task, rollouts)
     expected = [(reward - mean(rewards)) / (pstdev(rewards) + 1e-4) for reward in rewards]
     assert len(group.rollouts) == len(rewards)
     assert [rollout.reward for rollout in group.rollouts] == rewards
@@ -1638,51 +1270,8 @@ def test_score_group_normalizes_rewards(
         assert all(rollout.advantage == 0.0 for rollout in group.rollouts)
 
 
-@pytest.mark.parametrize(
-    ("failure", "message"),
-    [
-        ("empty", "exactly one"),
-        ("branched", "exactly one"),
-        ("no-tokens", "no trainable tokens"),
-        ("untrainable-agent", "no trainable tokens"),
-        ("mask-length", "equal lengths"),
-        ("missing-logprobs", "log-probability"),
-        ("missing-turn-tokens", "Sampled messages"),
-    ],
-)
-def test_training_sequence_rejects_invalid_tokens(failure: str, message: str, token_trace: vf.Trace) -> None:
-    trace = token_trace
-    if failure == "empty":
-        trace.nodes = []
-    elif failure == "branched":
-        trace.nodes.append(
-            vf.MessageNode(
-                parent=1,
-                message=vf.AssistantMessage(content="alternative"),
-                sampled=True,
-                token_ids=[50],
-                mask=[True],
-                logprobs=[-0.6],
-            )
-        )
-
-    elif failure == "no-tokens":
-        for node in trace.nodes:
-            node.token_ids, node.mask, node.logprobs = [], [], []
-    elif failure == "untrainable-agent":
-        trace.agent.trainable = False
-    elif failure == "mask-length":
-        trace.nodes[-1].mask = [True]
-    elif failure == "missing-logprobs":
-        trace.nodes[-1].logprobs = []
-    elif failure == "missing-turn-tokens":
-        trace.nodes[-1].token_ids, trace.nodes[-1].mask, trace.nodes[-1].logprobs = [], [], []
-    with pytest.raises(ValueError, match=message):
-        training.training_sequence(trace)
-
-
 def test_batcher_collects_groups_concurrently(
-    actor: Any, token_trace: vf.Trace, monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
+    actor: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
 ) -> None:
     # Actor scoring, transcript construction, and batching must work without JAX.
     monkeypatch.setattr(training, "jax", Mock(spec=[]))
@@ -1692,7 +1281,7 @@ def test_batcher_collects_groups_concurrently(
     env = AsyncMock()
     env.__aenter__.return_value = env
 
-    async def run(task: vf.Task) -> vf.Trace:
+    async def run(task: training.ALFWorldTask) -> training.Rollout:
         nonlocal started
         before = otel_trace.get_current_span().get_span_context()
         started += 1
@@ -1701,7 +1290,7 @@ def test_batcher_collects_groups_concurrently(
         # A serialized actor would wait forever for the second group's rollouts.
         await all_started.wait()
         assert otel_trace.get_current_span().get_span_context() == before
-        return token_trace.model_copy(deep=True, update={"ok": True})
+        return rollout
 
     env.run.side_effect = run
     monkeypatch.setattr(training, "create_agent", Mock(return_value=env))
@@ -1720,8 +1309,8 @@ def test_batcher_collects_groups_concurrently(
 
     batch = asyncio.run(collect()).value
     assert started == 4
-    assert f"Example 1 | task={actor.tasks[0].data.id}" in batch.examples
-    assert f"Example 3 | task={actor.tasks[1].data.id}" in batch.examples
+    assert f"Example 1 | task=alfworld:{actor.tasks[0].id}" in batch.examples
+    assert f"Example 3 | task=alfworld:{actor.tasks[1].id}" in batch.examples
     assert batch.training_batch.token_ids.shape == (4, 16)
     assert all(isinstance(value, np.ndarray) for value in batch.training_batch)
     env.__aenter__.assert_awaited_once()
@@ -1749,7 +1338,7 @@ def test_group_cancels_pending_rollouts(
     cancelled: list[bool] = []
     count = 0
 
-    async def run(task: vf.Task) -> vf.Trace:
+    async def run(task: training.ALFWorldTask) -> training.Rollout:
         nonlocal count
         count += 1
         if count == 1:
@@ -1784,621 +1373,33 @@ def test_group_cancels_pending_rollouts(
     assert not otel_trace.get_current_span().get_span_context().is_valid
 
 
-@pytest.fixture
-def local_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # Use installed dependencies instead of provisioning a uv environment in tests.
-    async def prepare_script(
-        self: subprocess_runtime.SubprocessRuntime,
-        script: str | bytes,
-        env: dict[str, str] | None = None,
-        *,
-        activate: bool = True,
-    ) -> list[str]:
-        path = tmp_path / f"{self.name}.py"
-        path.write_bytes(script.encode() if isinstance(script, str) else script)
-        return [sys.executable, str(path)]
-
-    monkeypatch.setattr(subprocess_runtime, "CACHE_DIR", tmp_path)
-    monkeypatch.setattr(subprocess_runtime.SubprocessRuntime, "prepare_uv_script", prepare_script)
-
-
-@pytest.fixture
-def tokenizer(monkeypatch: pytest.MonkeyPatch) -> PreTrainedTokenizerFast:
-    # Exercise the real Qwen3 renderer without downloading a model tokenizer.
-    backend = Tokenizer(
-        models.BPE(vocab={c: i for i, c in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))}, merges=[])
-    )
-    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
-    backend.decoder = decoders.ByteLevel()
-    tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=backend,
-        name_or_path=training.MODEL,
-        eos_token="<|im_end|>",
-        additional_special_tokens=[
-            "<|im_start|>",
-            "<|im_end|>",
-            "<|endoftext|>",
-            "<tool_call>",
-            "</tool_call>",
-            "<tool_response>",
-            "</tool_response>",
-            "<think>",
-            "</think>",
-        ],
-    )
-    monkeypatch.setattr(renderer_base, "load_tokenizer", Mock(return_value=tokenizer))
-    monkeypatch.setattr(training, "rollout_tokenizer", Mock(return_value=tokenizer))
-    monkeypatch.setattr(ElasticRendererPool, "_renderers", {})
-    monkeypatch.setattr(ElasticRendererPool, "_locks", {})
-    return tokenizer
-
-
-@pytest.mark.parametrize("mode", ["success", "tool-error", "provider-error"])
-def test_verifiers_tool_rollout(
-    mode: str,
-    actor: Any,
-    local_harness: None,
-    tokenizer: PreTrainedTokenizerFast,
-    monkeypatch: pytest.MonkeyPatch,
-    spans: InMemorySpanExporter,
-) -> None:
-    requests: list[dict[str, Any]] = []
-    arguments = '{"a":17}' if mode == "tool-error" else '{"a":17,"b":25}'
-    tool_text = '<tool_call>\n{"name":"add","arguments":' + arguments + "}\n</tool_call><|im_end|>"
-    tool_ids = tokenizer.encode(tool_text)  # (C_tool,)
-    answer_ids = tokenizer.encode("42<|im_end|>")  # (C_answer,)
+@pytest.mark.parametrize("fails", [False, True])
+def test_create_agent_config_and_cleanup(fails: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = training.Config(model="Qwen/custom", max_tokens=16, max_turns=2, temperature=0.7, rollout_timeout=300)
+    tokenizer = Mock()
+    load = Mock(return_value=tokenizer)
+    monkeypatch.setattr(training, "rollout_tokenizer", load)
 
     def respond(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/models":
-            return httpx.Response(status_code=200, json={"data": [{"id": training.MODEL, "max_model_len": 8192}]})
-        assert str(request.url) == f"{training.SERVER_URL}/inference/v1/generate"
-        payload = json.loads(request.content)
-        requests.append(payload)
-        if mode == "provider-error":
-            return httpx.Response(status_code=400, json={"error": {"message": "invalid model"}})
-        prompt = tokenizer.decode(payload["token_ids"])
-        completion_ids = tool_ids if "<tool_response>" not in prompt or mode == "tool-error" else answer_ids  # (C,)
-        return httpx.Response(
-            status_code=200,
-            json={
-                "request_id": f"completion-{len(requests)}",
-                "choices": [
-                    {
-                        "index": 0,
-                        "token_ids": completion_ids,
-                        "finish_reason": "stop",
-                        "logprobs": {
-                            "content": [{"token": f"token_id:{token}", "logprob": -0.2} for token in completion_ids]
-                        },
-                    }
-                ],
-            },
-        )
+        assert request.url.path == "/v1/models"
+        return httpx.Response(500 if fails else 200, json={"data": [{"id": config.model, "max_model_len": 4096}]})
 
-    clients: list[httpx.AsyncClient] = []
+    client = httpx.AsyncClient(base_url=training.SERVER_URL, transport=httpx.MockTransport(respond))
+    monkeypatch.setattr(training.httpx, "AsyncClient", Mock(return_value=client))
 
-    def build_client(config: vf.TrainClientConfig) -> httpx.AsyncClient:
-        client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
-        clients.append(client)
-        return client
+    async def run() -> None:
+        async with training.create_agent(config) as agent:
+            assert agent.tokenizer is tokenizer and agent.client is client
+            assert agent.model == config.model
+            assert agent.context_length == 4096
+            assert agent.max_tokens == 16 and agent.max_turns == 2
+            assert agent.temperature == 0.7 and agent.rollout_timeout == 300
+            assert agent.environment_timeout == config.environment_timeout
 
-    monkeypatch.setattr(client_base, "build_async_httpx", build_client)
-    if mode == "provider-error":
-        with pytest.raises(RuntimeError, match="Rollout failed"):
-            asyncio.run(collect_and_close(actor, actor.tasks[0]))
+    if fails:
+        with pytest.raises(httpx.HTTPStatusError):
+            asyncio.run(run())
     else:
-        group = asyncio.run(collect_and_close(actor, actor.tasks[0]))
-        assert len(group.rollouts) == 2
-        assert len(requests) == 2 * (2 if mode == "success" else 3)
-        expected_samples = tool_ids + answer_ids if mode == "success" else tool_ids * 3  # (S,)
-        for rollout in group.rollouts:
-            assert rollout.num_turns == (2 if mode == "success" else 3)
-            assert rollout.num_output_tokens == len(expected_samples)
-            assert rollout.rollout_seconds > 0
-            assert rollout.reward == (1.0 if mode == "success" else 0.0)
-            assert rollout.advantage == 0.0
-            sequence = rollout.sequence
-            assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
-            assert rollout.num_input_tokens == len(sequence.token_ids) - sequence.loss_mask.sum()
-            np.testing.assert_array_equal(sequence.token_ids[sequence.loss_mask], expected_samples)
-            np.testing.assert_allclose(sequence.old_log_probs, np.where(sequence.loss_mask, -0.2, 0.0))
-            if mode == "success":
-                assert rollout.completion == "42"
-                assert rollout.stop_condition == "agent_completed"
-            else:
-                assert rollout.stop_condition == "max_turns"
-        prompts = [tokenizer.decode(request["token_ids"]) for request in requests]
-        if mode == "success":
-            assert any("<tool_response>\n42" in prompt for prompt in prompts)
-        else:
-            observations = [
-                prompt.split("<tool_response>\n", 1)[1] for prompt in prompts if "<tool_response>\n" in prompt
-            ]
-            assert observations and all(
-                "required" in observation.lower() and "b" in observation for observation in observations
-            )
-        jax.tree.map(np.testing.assert_array_equal, asdict(pickle.loads(pickle.dumps(group))), asdict(group))
-    assert clients and all(client.is_closed for client in clients)
-    assert requests[0]["model"] == training.MODEL
-    assert requests[0]["sampling_params"]["max_tokens"] == 512
-    assert requests[0]["sampling_params"]["top_p"] == 1.0
-    assert requests[0]["sampling_params"]["logprobs"] == 1
-    prompt = tokenizer.decode(requests[0]["token_ids"])
-    assert '"name": "add"' in prompt
-    assert prompt.endswith("<|im_start|>assistant\n")
-    finished = spans.get_finished_spans()
-    rollouts = [item for item in finished if item.name == "actor.rollout"]
-    agents = [item for item in finished if item.name == "actor.rollout.agent"]
-    calls = [item for item in finished if item.name == "actor.rollout.model"]
-    assert len(rollouts) == len(agents) == 2
-    assert {item.parent.span_id for item in agents} == {item.context.span_id for item in rollouts}
-    for agent in agents:
-        model_calls = [item for item in calls if item.parent.span_id == agent.context.span_id]
-        assert len(model_calls) == (1 if mode == "provider-error" else 2 if mode == "success" else 3)
-        assert [item.attributes["call_index"] for item in model_calls] == list(range(len(model_calls)))
-        for item in model_calls:
-            assert agent.start_time <= item.start_time <= item.end_time <= agent.end_time
-            assert item.context.trace_id == agent.context.trace_id
-            assert item.status.status_code == (
-                otel_trace.StatusCode.ERROR if mode == "provider-error" else otel_trace.StatusCode.UNSET
-            )
-
-
-def test_toolrl_renderer_preserves_text(tokenizer: PreTrainedTokenizerFast) -> None:
-    tokenizer.clean_up_tokenization_spaces = True
-    renderer = ToolRLRenderer(tokenizer)
-    text = '<think>Plan .</think>\n<tool_call>\n{"name":"say","parameters":{"text":"Hello ."}}\n</tool_call>'
-    tokens = tokenizer.encode(text + "<|im_end|>")  # (T,)
-    assert tokenizer.decode(tokens).startswith("<think>Plan.</think>")
-    parsed = renderer.parse_response(tokens)
-    assert parsed.content == text
-    assert parsed.tool_calls == []
-    assert parsed.reasoning_content is None
-    unfinished = "<think>Still thinking ."
-    assert renderer.parse_response(tokenizer.encode(unfinished)).content == unfinished
-
-
-def test_verifiers_toolrl_rollout(
-    actor: Any, local_harness: None, tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    actor.config = training.Config(taskset=training.ToolRLConfig(), max_turns=1)
-    answer = '<think>Use add.</think>\n<tool_call>\n{"name":"add","parameters":{"a":17,"b":25}}\n</tool_call>'
-    task = ToolRLTask(
-        data=ToolRLData(
-            id="toolrl-test",
-            prompt="Add 17 and 25",
-            system_prompt="Predict the add call as text.",
-            answer=answer,
-            expected_calls=[ToolCall(name="add", parameters={"a": 17, "b": 25})],
-        ),
-        config=vf.TaskConfig(),
-    )
-    # A truncated second completion must receive a low reward, not abort the batch.
-    completions = [answer, '<think>Use add.</think>\n<tool_call>\n{"name":']
-    sampled = [tokenizer.encode(text + "<|im_end|>") for text in completions]  # Each (C,).
-    requests: list[dict[str, Any]] = []
-
-    def respond(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/models":
-            return httpx.Response(status_code=200, json={"data": [{"id": training.MODEL, "max_model_len": 8192}]})
-        ids = sampled[len(requests) % len(sampled)]  # (C,)
-        requests.append(json.loads(request.content))
-        return httpx.Response(
-            status_code=200,
-            json={
-                "request_id": f"toolrl-{len(requests)}",
-                "choices": [
-                    {
-                        "index": 0,
-                        "token_ids": ids,
-                        "finish_reason": "stop",
-                        "logprobs": {"content": [{"token": f"token_id:{token}", "logprob": -0.2} for token in ids]},
-                    }
-                ],
-            },
-        )
-
-    clients: list[httpx.AsyncClient] = []
-
-    def build_client(config: vf.TrainClientConfig) -> httpx.AsyncClient:
-        client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
-        clients.append(client)
-        return client
-
-    monkeypatch.setattr(client_base, "build_async_httpx", build_client)
-
-    async def collect() -> training.RolloutGroup:
-        async with aclosing(actor):
-            await actor.collect_group(task, group_size=2)
-            assert len(clients) == 1 and not clients[0].is_closed
-            return await actor.collect_group(task, group_size=2)
-
-    group = asyncio.run(collect())
-    assert len(clients) == 1 and clients[0].is_closed
-    assert len(requests) == 4  # Two groups, with no tool execution or follow-up model request.
-    by_completion = {rollout.completion: rollout for rollout in group.rollouts}
-    assert by_completion[answer].reward == 4.0
-    assert by_completion[completions[1]].reward == -3.0
-    assert by_completion[answer].advantage == pytest.approx(1.0, abs=1e-4)
-    assert by_completion[completions[1]].advantage == pytest.approx(-1.0, abs=1e-4)
-    for text, ids in zip(completions, sampled, strict=True):
-        rollout = by_completion[text]
-        assert rollout.num_turns == 1
-        sequence = rollout.sequence
-        assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
-        np.testing.assert_array_equal(sequence.token_ids[sequence.loss_mask], ids)
-        np.testing.assert_allclose(sequence.old_log_probs, np.where(sequence.loss_mask, -0.2, 0.0))
-    prompt = tokenizer.decode(requests[0]["token_ids"])
-    assert prompt.endswith("<|im_start|>assistant\n")
-    assert answer not in prompt
-
-
-@pytest.mark.parametrize("mode", ["success", "invalid-action", "task-limit", "agent-limit", "step-error"])
-def test_verifiers_codegym_rollout(
-    mode: str, actor: Any, local_harness: None, tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    actor.config = training.Config(
-        taskset=training.CodeGymConfig(manager_url="http://codegym:8000"),
-        max_turns=1 if mode == "agent-limit" else 3,
-    )
-    task = codegym_env.CodeGymTask(
-        data=codegym_env.CodeGymData(
-            id="codegym-test",
-            prompt=[vf.UserMessage(content="Use Observe then Done to add the values.")],
-            ability='codegym_v1@Example__SumEnv@{"values":[1,2]}',
-            max_steps=1 if mode == "task-limit" else 3,
-        ),
-        config=vf.TaskConfig(),
-    )
-    first_text = (
-        "not a function call"
-        if mode == "invalid-action"
-        else '<|FunctionCallBegin|>[{"name":"Observe","parameters":{}}]<|FunctionCallEnd|>'
-    )
-    final_text = '<|FunctionCallBegin|>[{"name":"Done","parameters":{"answer":3}}]<|FunctionCallEnd|>'
-    first_ids, final_ids = [
-        tokenizer.encode(text + "<|im_end|>") for text in [first_text, final_text]
-    ]  # (C_first,), (C_final,)
-    sessions: dict[str, dict[str, Any]] = {}
-    allocated: list[str] = []
-    released: list[str] = []
-    stopped: list[str] = []
-    requests: list[dict[str, Any]] = []
-
-    def respond(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path == "/v1/models":
-            return httpx.Response(200, json={"data": [{"id": training.MODEL, "max_model_len": 8192}]})
-        if path == "/inference/v1/generate":
-            payload = json.loads(request.content)
-            requests.append(payload)
-            prompt = tokenizer.decode(payload["token_ids"])
-            later = "Observed values" in prompt or "Invalid function call" in prompt
-            ids = final_ids if later else first_ids  # (C,)
-            assert "Initial state" in prompt
-            return httpx.Response(
-                200,
-                json={
-                    "request_id": f"codegym-{len(requests)}",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "token_ids": ids,
-                            "finish_reason": "stop",
-                            "logprobs": {"content": [{"token": f"token_id:{token}", "logprob": -0.2} for token in ids]},
-                        }
-                    ],
-                },
-            )
-        if path == "/get_instance":
-            uid = str(len(allocated))
-            allocated.append(uid)
-            return httpx.Response(200, json={"uid": uid, "port": 10000 + int(uid)})
-        if path == "/release_instance":
-            uid = request.url.params["uid"]
-            assert uid in stopped
-            released.append(uid)
-            return httpx.Response(200, json={})
-        payload = json.loads(request.content) if request.method == "POST" else dict(request.url.params)
-        session_id = payload["session_id"]
-        if path == "/start":
-            assert session_id not in sessions
-            sessions[session_id] = {"done": False, "steps": [], "uid": str(request.url.port - 10000)}
-            return httpx.Response(200, json={"observation": "Initial state"})
-        session = sessions[session_id]
-        if path == "/step":
-            action = json.loads(payload["action"])
-            session["steps"].append(action["name"])
-            session["done"] = action["name"] == "Done"
-            return httpx.Response(
-                500 if mode == "step-error" else 200, json={"status": True, "observation": "Observed values: [1, 2]"}
-            )
-        if path == "/is_done":
-            return httpx.Response(200, json={"done": session["done"]})
-        if path == "/reward":
-            # Distinct rewards exercise per-rollout state and within-group normalization.
-            reward = 2 if session["done"] and session["uid"] == "0" else 0
-            return httpx.Response(200, json={"reward": reward})
-        assert path == "/stop"
-        stopped.append(session["uid"])
-        return httpx.Response(200, json={})
-
-    class MockClient(httpx.AsyncClient):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(transport=httpx.MockTransport(respond), **kwargs)
-
-    def build_client(config: vf.TrainClientConfig) -> httpx.AsyncClient:
-        return MockClient()
-
-    monkeypatch.setattr(codegym_env.httpx, "AsyncClient", MockClient)
-    monkeypatch.setattr(client_base, "build_async_httpx", build_client)
-    if mode == "step-error":
-        with pytest.raises(ExceptionGroup) as caught:
-            asyncio.run(collect_and_close(actor, task))
-        assert all(isinstance(error, httpx.HTTPStatusError) for error in caught.value.exceptions)
-    else:
-        group = asyncio.run(collect_and_close(actor, task))
-        limited = mode in {"task-limit", "agent-limit"}
-        expected_ids = first_ids if limited else first_ids + final_ids  # (S,)
-        assert len(requests) == 2 * (1 if limited else 2)
-        assert sorted(rollout.reward for rollout in group.rollouts) == ([0, 0] if limited else [0, 1])
-        assert sorted(rollout.advantage for rollout in group.rollouts) == pytest.approx(
-            [0, 0] if limited else [-1, 1], abs=3e-4
-        )
-        for rollout in group.rollouts:
-            assert rollout.num_turns == (1 if limited else 2)
-            assert rollout.stop_condition == (
-                "codegym_max_steps"
-                if mode == "task-limit"
-                else "max_turns"
-                if mode == "agent-limit"
-                else "codegym_done"
-            )
-            sequence = rollout.sequence
-            assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
-            assert sequence.token_ids.ndim == 1
-            np.testing.assert_array_equal(sequence.token_ids[sequence.loss_mask], expected_ids)
-            np.testing.assert_allclose(sequence.old_log_probs, np.where(sequence.loss_mask, -0.2, 0))
-        for session in sessions.values():
-            assert session["steps"] == (
-                ["Observe"] if limited else ["Done"] if mode == "invalid-action" else ["Observe", "Done"]
-            )
-    assert len(sessions) == 2
-    assert sorted(released) == sorted(stopped) == allocated
-
-
-@pytest.mark.parametrize("name", ["webshop", "alfworld", "tau2", "appworld"])
-def test_benchmark_preset_and_actor(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    preset = Path(__file__).resolve().parents[1] / f"configs/grpo_v2/{name}.yaml"
-    config = training.load_config(preset, training.Config)
-    assert config.taskset.id == name
-    assert config.max_turns == 50
-    assert config.rollout_timeout == 1200
-    assert config.environment_timeout == 600
-    assert pickle.loads(pickle.dumps(config)) == config
-    tasks = Mock(return_value=[Mock()])
-    monkeypatch.setattr(training, "load_alfworld_tasks" if name == "alfworld" else "load_benchmark_tasks", tasks)
-    monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
-    monkeypatch.setattr(training, "wait_for_server", Mock())
-    actor = training.Actor.__ray_metadata__.modified_class(config=config)
-    assert actor.tasks == tasks.return_value
-    if name == "alfworld":
-        tasks.assert_called_once_with(config.taskset, config.max_turns)
-    else:
-        tasks.assert_called_once_with(config.taskset, config.max_turns, config.environment_timeout)
-    actor.__ray_shutdown__()
-
-
-@pytest.mark.parametrize("domains", [(), ("retail", "retail")])
-def test_tau2_domain_validation(domains: tuple[str, ...]) -> None:
-    with pytest.raises(ValueError, match="nonempty and unique"):
-        training.Tau2Config(python="python", user_llm="user", domains=domains)
-
-
-@pytest.mark.parametrize("mode", ["done", "turn-limit", "worker-error"])
-def test_verifiers_benchmark_rollout(
-    mode: str,
-    actor: Any,
-    local_harness: None,
-    tokenizer: PreTrainedTokenizerFast,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = training.AppWorldConfig(python=sys.executable, root=str(tmp_path))
-    actor.config = training.Config(taskset=config, max_turns=1 if mode == "turn-limit" else 3)
-    task = benchmark_env.BenchmarkTask(
-        data=benchmark_env.BenchmarkData(id="appworld:test", task_id="test", prompt="test")
-    )
-    script = tmp_path / "benchmark.py"
-    script.write_text("""import json
-import os
-import sys
-from pathlib import Path
-steps = 0
-for line in sys.stdin:
-    request = json.loads(line)
-    if request["op"] == "reset":
-        assert request["task_id"] == "test"
-        result = {"observation": "Initial state"}
-    elif request["op"] == "step":
-        if sys.argv[1] == "worker-error":
-            raise RuntimeError("failed worker")
-        steps += 1
-        result = {"observation": "Observed state", "done": steps == 2}
-    else:
-        result = float(steps == 2)
-    print("RL2_BENCHMARK " + json.dumps(result), flush=True)
-Path(os.environ["APPWORLD_ROOT"], str(os.getpid()) + ".closed").write_text(str(steps))
-""")
-    monkeypatch.setattr(benchmark_env, "worker_command", Mock(return_value=[sys.executable, str(script), mode]))
-    requests: list[dict[str, Any]] = []
-    ids = tokenizer.encode("action<|im_end|>")  # (C,)
-
-    def respond(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/models":
-            return httpx.Response(200, json={"data": [{"id": training.MODEL, "max_model_len": 8192}]})
-        payload = json.loads(request.content)
-        requests.append(payload)
-        assert "Initial state" in tokenizer.decode(payload["token_ids"])
-        return httpx.Response(
-            200,
-            json={
-                "request_id": f"benchmark-{len(requests)}",
-                "choices": [
-                    {
-                        "index": 0,
-                        "token_ids": ids,
-                        "finish_reason": "stop",
-                        "logprobs": {
-                            "content": [{"token": f"token_id:{token}", "logprob": -0.2} for token in ids],
-                        },
-                    }
-                ],
-            },
-        )
-
-    def build_client(config: vf.TrainClientConfig) -> httpx.AsyncClient:
-        return httpx.AsyncClient(transport=httpx.MockTransport(respond))
-
-    monkeypatch.setattr(client_base, "build_async_httpx", build_client)
-    if mode == "worker-error":
-        with pytest.raises(ExceptionGroup):
-            asyncio.run(collect_and_close(actor, task))
-        return
-    group = asyncio.run(collect_and_close(actor, task))
-    turns = 1 if mode == "turn-limit" else 2
-    assert len(requests) == 2 * turns
-    for rollout in group.rollouts:
-        assert rollout.num_turns == turns
-        assert rollout.reward == (0 if mode == "turn-limit" else 1)
-        assert rollout.stop_condition == (f"{config.id}_max_steps" if mode == "turn-limit" else f"{config.id}_done")
-        sequence = rollout.sequence
-        assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
-        np.testing.assert_array_equal(sequence.token_ids[sequence.loss_mask], ids * turns)
-        np.testing.assert_allclose(sequence.old_log_probs, np.where(sequence.loss_mask, -0.2, 0))
-    closed = list(tmp_path.glob("*.closed"))
-    assert len(closed) == 2
-    assert all(path.read_text() == str(turns) for path in closed)
-
-
-def test_verifiers_alfworld_tools(
-    actor: Any,
-    local_harness: None,
-    tokenizer: PreTrainedTokenizerFast,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Keep the real tool server, renderer, state synchronization and agent loop.
-    module_path = tmp_path / "fake_alfworld_tools.py"
-    module_path.write_text("""import os
-from pathlib import Path
-from typing import Any
-from rl2 import alfworld_env
-
-class Environment:
-    def __init__(self, config_file: str, max_steps: int, task_id: str) -> None:
-        assert task_id == "train/a"
-        self.output = Path(config_file)
-        self.commands = ["go to shelf 1", "move mug 1 to desk 1"]
-        self.actions: list[str] = []
-    def reset(self) -> alfworld_env.EpisodeResult:
-        return alfworld_env.EpisodeResult(observation="Goal: put the carried mug on the desk", done=False, reward=0.0)
-    def step(self, action: str) -> alfworld_env.EpisodeResult:
-        self.actions.append(action)
-        done = len(self.actions) == 2
-        return alfworld_env.EpisodeResult(observation="Done" if done else "At shelf", done=done, reward=float(done))
-    def close(self) -> None:
-        (self.output / f"{os.getpid()}.closed").write_text("\\n".join(self.actions))
-
-class Tools(alfworld_env.ALFWorldTools):
-    async def setup_task(self, task: alfworld_env.ALFWorldData) -> None:
-        alfworld_env.ALFWorld = Environment
-        await super().setup_task(task)
-
-if __name__ == "__main__":
-    Tools.run()
-""")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(tmp_path), os.environ.get("PYTHONPATH", "")]))
-    tools_module = import_module("fake_alfworld_tools")
-
-    def toolsets(cls: type, config: alfworld_env.ALFWorldTaskConfig) -> list[vf.Toolset]:
-        return [tools_module.Tools(config=config.tools)]
-
-    monkeypatch.setattr(alfworld_env.ALFWorldTask, "toolsets", classmethod(toolsets))
-    actor.config = training.Config(taskset=training.ALFWorldConfig(config_file=str(tmp_path)), max_turns=5)
-    task = alfworld_env.ALFWorldTask(
-        data=alfworld_env.ALFWorldData(
-            id="alfworld:train/a", task_id="train/a", prompt="Start with look.", system_prompt="Use action tools."
-        ),
-        config=alfworld_env.ALFWorldTaskConfig(
-            tools=alfworld_env.ALFWorldToolsConfig(config_file=str(tmp_path), max_steps=3)
-        ),
-    )
-    requests: list[dict[str, Any]] = []
-    samples: list[list[int]] = []  # Per-call sampled token IDs: (C_i,).
-
-    def respond(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/models":
-            return httpx.Response(200, json={"data": [{"id": training.MODEL, "max_model_len": 8192}]})
-        payload = json.loads(request.content)
-        requests.append(payload)
-        prompt = tokenizer.decode(payload["token_ids"])
-        assert '"name": "take"' in prompt
-        assert '"name": "go_to"' in prompt
-        call = (
-            {"name": "look", "arguments": {}}
-            if "Goal: put" not in prompt
-            else {"name": "go_to", "arguments": {"location": "shelf 1"}}
-            if "At shelf" not in prompt
-            else {"name": "move", "arguments": {"object": "mug 1", "location": "desk 1"}}
-        )
-        ids = tokenizer.encode(
-            f"<think>Plan.  \n</think>\n<tool_call>\n{json.dumps(call)}\n</tool_call><|im_end|>"
-        )  # (C,)
-        samples.append(ids)
-        return httpx.Response(
-            200,
-            json={
-                "request_id": f"alfworld-{len(requests)}",
-                "choices": [
-                    {
-                        "index": 0,
-                        "token_ids": ids,
-                        "finish_reason": "stop",
-                        "logprobs": {"content": [{"token": f"token_id:{token}", "logprob": -0.2} for token in ids]},
-                    }
-                ],
-            },
-        )
-
-    def build_client(config: vf.TrainClientConfig) -> httpx.AsyncClient:
-        return httpx.AsyncClient(transport=httpx.MockTransport(respond))
-
-    monkeypatch.setattr(client_base, "build_async_httpx", build_client)
-    group = asyncio.run(collect_and_close(actor, task))
-    assert len(requests) == 6
-    assert len(group.rollouts) == 2
-    for rollout in group.rollouts:
-        assert rollout.num_turns == 3
-        assert rollout.reward == 1.0
-        assert rollout.stop_condition == "alfworld_done"
-        interaction = rollout.interaction
-        assert "<|im_start|>system\nUse action tools." in interaction
-        assert "<|im_start|>user\nStart with look.<|im_end|>" in interaction
-        assert interaction.count("<think>Plan.  \n</think>") == 3
-        assert '<tool_call>\n{"name": "look", "arguments": {}}\n</tool_call><|im_end|>' in interaction
-        assert '<tool_call>\n{"name": "go_to", "arguments": {"location": "shelf 1"}}' in interaction
-        assert '<tool_call>\n{"name": "move", "arguments": {"object": "mug 1", "location": "desk 1"}}' in interaction
-        assert "<tool_response>" in interaction and "Goal: put the carried mug on the desk" in interaction
-        assert "At shelf" in interaction
-        sequence = rollout.sequence
-        assert interaction == tokenizer.decode(
-            sequence.token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
-        )
-        assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
-        assert sequence.loss_mask.sum() == sum(len(ids) for ids in samples) // 2
-        np.testing.assert_allclose(sequence.old_log_probs, np.where(sequence.loss_mask, -0.2, 0))
-    closed = list(tmp_path.glob("*.closed"))
-    assert len(closed) == 2
-    assert all(path.read_text() == "go to shelf 1\nmove mug 1 to desk 1" for path in closed)
+        asyncio.run(run())
+    load.assert_called_once_with(config.model)
+    assert client.is_closed

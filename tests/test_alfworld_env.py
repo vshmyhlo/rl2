@@ -1,15 +1,13 @@
 import asyncio
+import io
 import json
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, closing
+import os
+import sys
+from contextlib import closing
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
 from unittest.mock import Mock
 
 import pytest
-from mcp.server.lowlevel import Server
-from mcp.server.mcpserver import MCPServer
 
 from rl2 import alfworld_env as env
 
@@ -131,126 +129,110 @@ def test_dataset_path_is_independent_of_working_directory(
         assert env.discover_games(str(config_file), max_steps=2) == [str(game_file)]
 
 
-@pytest.fixture
-def environment(monkeypatch: pytest.MonkeyPatch) -> Mock:
-    environment = Mock(commands=[])
-    environment.reset.return_value = env.EpisodeResult(observation="Put mug on desk", reward=0.0, done=False)
-    environment.step.return_value = env.EpisodeResult(observation="Moved", reward=0.0, done=False)
-    monkeypatch.setattr(env, "ALFWorld", Mock(return_value=environment))
-    return environment
+@pytest.mark.parametrize("ids", [["a", "b"], [], ["a", "a"], [""]], ids=["valid", "empty", "duplicate", "empty-id"])
+def test_task_discovery(ids: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    process = Mock(return_value=Mock(stdout=json.dumps(ids)))
+    monkeypatch.setattr(env.subprocess, "run", process)
+    config = env.ALFWorldConfig(config_file="config.yaml")
+    if ids == ["a", "b"]:
+        tasks = env.load_alfworld_tasks(config, max_steps=3, timeout=10)
+        assert [task.id for task in tasks] == ids
+        assert all(task.config_file == str(Path("config.yaml").resolve()) for task in tasks)
+    else:
+        with pytest.raises(ValueError, match="nonempty and unique"):
+            env.load_alfworld_tasks(config, max_steps=3, timeout=10)
+    assert process.call_args.kwargs["timeout"] == 10
+    assert process.call_args.args[0][-2:] == ["3", "--list"]
 
 
-@pytest.fixture
-def task(monkeypatch: pytest.MonkeyPatch) -> env.ALFWorldTask:
-    monkeypatch.setattr(env, "discover_games", Mock(return_value=["train/a"]))
-    return env.load_alfworld_tasks(env.ALFWorldConfig(config_file="config.yaml"), max_steps=2)[0]
-
-
-def test_manifest(task: env.ALFWorldTask, environment: Mock) -> None:
-    assert task.data.id == "alfworld:train/a"
-    assert task.data.task_id == "train/a"
-    assert "look" in task.data.prompt
-    assert task.config.tools.max_steps == 2
-    assert Path(task.config.tools.config_file).is_absolute()
-    environment.close.assert_not_called()
-    environment.reset.assert_not_called()
-
-
-@pytest.mark.parametrize("ids", [[], ["a", "a"]])
-def test_invalid_manifest(ids: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(env, "discover_games", Mock(return_value=ids))
-    with pytest.raises(ValueError, match="nonempty and unique"):
-        env.load_alfworld_tasks(env.ALFWorldConfig(config_file="config.yaml"), max_steps=2)
-
-
-@pytest.mark.parametrize(
-    "name,arguments,command",
-    [
-        ("go_to", {"location": "shelf 1"}, "go to shelf 1"),
-        ("take", {"object": "mug 1", "location": "shelf 1"}, "take mug 1 from shelf 1"),
-        ("move", {"object": "mug 1", "location": "desk 1"}, "move mug 1 to desk 1"),
-        ("open_container", {"container": "cabinet 1"}, "open cabinet 1"),
-        ("close_container", {"container": "cabinet 1"}, "close cabinet 1"),
-        ("clean", {"object": "mug 1", "location": "sinkbasin 1"}, "clean mug 1 with sinkbasin 1"),
-        ("heat", {"object": "mug 1", "location": "microwave 1"}, "heat mug 1 with microwave 1"),
-        ("cool", {"object": "mug 1", "location": "fridge 1"}, "cool mug 1 with fridge 1"),
-        ("use", {"object": "desklamp 1"}, "use desklamp 1"),
-        ("examine", {"target": "mug 1"}, "examine mug 1"),
-        ("inventory", {}, "inventory"),
-        ("look", {}, "look"),
-    ],
-)
-def test_tool_commands(name: str, arguments: dict[str, str], command: str, environment: Mock) -> None:
-    async def run() -> None:
-        tools = env.ALFWorldTools(config=env.ALFWorldToolsConfig(config_file="config.yaml", max_steps=2))
-        async with tools._exit_stack:
-            await tools.setup_task(env.ALFWorldData(task_id="train/a"))
-            assert tools.look()["observation"] == "Put mug on desk"
-            environment.step.assert_not_called()
-            result = getattr(tools, name)(**arguments)
-            assert result["observation"] == "Moved"
-            environment.step.assert_called_once_with(command)
-
-    asyncio.run(run())
+def test_worker_protocol(monkeypatch: pytest.MonkeyPatch) -> None:
+    output = io.StringIO()
+    environment = Mock()
+    environment.reset.return_value = env.EpisodeResult(observation="Goal", reward=0.0, done=False)
+    environment.step.return_value = env.EpisodeResult(observation="Success", reward=1.0, done=True)
+    environment.commands = ["look"]
+    constructor = Mock(return_value=environment)
+    monkeypatch.setattr(env, "ALFWorld", constructor)
+    monkeypatch.setattr(sys, "argv", ["worker", "config.yaml", "2", "train/a"])
+    monkeypatch.setattr(
+        sys, "stdin", io.StringIO('null\n{"name":"look","arguments":{}}\n{"name":"look","arguments":{}}\n')
+    )
+    monkeypatch.setattr(sys, "stdout", output)
+    env.main()
+    constructor.assert_called_once_with(config_file="config.yaml", max_steps=2, task_id="train/a")
+    assert [json.loads(line)["reward"] for line in output.getvalue().splitlines()] == [0.0, 0.0, 1.0]
+    environment.step.assert_called_once_with("look")
     environment.close.assert_called_once()
 
 
-@pytest.mark.parametrize("command", ["put mug 1 in/on desk 1", "put mug 1 into desk 1", "put mug 1 in desk 1"])
-def test_placement_grammar(command: str, environment: Mock) -> None:
-    environment.commands = [command]
+@pytest.mark.parametrize("mode", ["normal", "crash", "timeout", "cancel"])
+def test_session_process_cleanup(mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = tmp_path / "worker.py"
+    worker.write_text("""import json
+import sys
+import time
+mode = sys.argv[-1]
+for line in sys.stdin:
+    if mode == "crash":
+        raise RuntimeError("worker failed")
+    print(json.dumps({"observation": "ready", "reward": 0.0, "done": False}), flush=True)
+    if mode in {"timeout", "cancel"}:
+        time.sleep(60)
+""")
+    monkeypatch.setattr(env, "worker_command", Mock(return_value=[sys.executable, str(worker)]))
+    task = env.ALFWorldTask(id=mode, config_file="unused")
+    session = env.ALFWorldSession(task=task, max_steps=2, timeout=0.1 if mode == "timeout" else 5)
 
     async def run() -> None:
-        tools = env.ALFWorldTools(config=env.ALFWorldToolsConfig(config_file="config.yaml", max_steps=2))
-        async with tools._exit_stack:
-            await tools.setup_task(env.ALFWorldData(task_id="train/a"))
-            tools.move(object="mug 1", location="desk 1")
-            environment.step.assert_called_once_with(command)
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("mode", ["success", "already-done", "limit", "reset-error", "step-error", "cancel"])
-def test_lifecycle_and_stop(mode: str, task: env.ALFWorldTask, environment: Mock) -> None:
-    environment.reset_mock()
-    if mode == "success":
-        environment.step.return_value = env.EpisodeResult(observation="Done", reward=1.0, done=True)
-    elif mode == "already-done":
-        environment.reset.return_value = env.EpisodeResult(observation="Done", reward=1.0, done=True)
-    elif mode in ("reset-error", "step-error"):
-        getattr(environment, mode.removesuffix("-error")).side_effect = RuntimeError("failed")
-
-    async def run() -> None:
-        tools = task.toolsets(task.config)[0]
-        async with tools._exit_stack:
-            await tools.setup_task(task.data)
-            tools.go_to(location="shelf 1")
+        async with session:
+            result = await session.request()
+            assert result.observation == "ready"
+            if mode == "timeout":
+                await session.request(env.ToolCall(name="look", arguments={}))
             if mode == "cancel":
                 raise asyncio.CancelledError
-            if mode == "limit":
-                tools.go_to(location="desk 1")
-            assert task.alfworld_done(SimpleNamespace(state=tools.state))
-            assert await task.alfworld_reward(SimpleNamespace(state=tools.state)) == (
-                1.0 if mode in {"success", "already-done"} else 0.0
-            )
-            if mode == "already-done":
-                environment.step.assert_not_called()
-            count = environment.step.call_count
-            tools.go_to(location="shelf 1")
-            assert environment.step.call_count == count
 
-    if mode in ("reset-error", "step-error", "cancel"):
-        with pytest.raises(asyncio.CancelledError if mode == "cancel" else RuntimeError):
+    error = {"crash": RuntimeError, "timeout": TimeoutError, "cancel": asyncio.CancelledError}.get(mode)
+    if error:
+        with pytest.raises(error):
             asyncio.run(run())
     else:
         asyncio.run(run())
-    environment.close.assert_called_once()
+    assert session.process.returncode is not None
+    with pytest.raises(ProcessLookupError):
+        os.killpg(session.process.pid, 0)
 
 
-def test_tool_schemas(task: env.ALFWorldTask) -> None:
-    server = MCPServer("alfworld")
-    task.toolsets(task.config)[0].register(server)
-    tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
-    assert set(tools) == {
+@pytest.mark.parametrize(
+    ("name", "arguments", "command"),
+    [
+        ("look", {}, "look"),
+        ("go_to", {"location": "shelf 1"}, "go to shelf 1"),
+        ("take", {"object": "mug 1", "location": "shelf 1"}, "take mug 1 from shelf 1"),
+        ("move", {"object": "mug 1", "location": "desk 1"}, "move mug 1 to desk 1"),
+        ("open_container", {"container": "fridge 1"}, "open fridge 1"),
+        ("close_container", {"container": "fridge 1"}, "close fridge 1"),
+        ("clean", {"object": "mug 1", "location": "sinkbasin 1"}, "clean mug 1 with sinkbasin 1"),
+        ("heat", {"object": "mug 1", "location": "microwave 1"}, "heat mug 1 with microwave 1"),
+        ("cool", {"object": "mug 1", "location": "fridge 1"}, "cool mug 1 with fridge 1"),
+        ("use", {"object": "lamp 1"}, "use lamp 1"),
+        ("examine", {"target": "mug 1"}, "examine mug 1"),
+        ("inventory", {}, "inventory"),
+    ],
+)
+def test_tool_commands(name: str, arguments: dict[str, str], command: str) -> None:
+    environment = Mock(commands=[])
+    initial = env.EpisodeResult(observation="Goal", reward=0.0, done=False)
+    environment.reset.return_value = initial
+    environment.step.return_value = initial
+    tools = env.ALFWorldTools(environment=environment, max_steps=2)
+    assert tools.reset() == initial
+    assert tools.call(env.ToolCall(name="look", arguments={})) == initial
+    environment.step.assert_not_called()
+    tools.call(env.ToolCall(name=name, arguments=arguments))
+    environment.step.assert_called_once_with(command)
+    schemas = {schema["function"]["name"]: schema["function"] for schema in env.tool_schemas()}
+    assert set(schemas) == {
         "look",
         "go_to",
         "take",
@@ -264,45 +246,32 @@ def test_tool_schemas(task: env.ALFWorldTask) -> None:
         "examine",
         "inventory",
     }
-    assert set(tools["take"].input_schema["required"]) == {"object", "location"}
-    assert tools["take"].input_schema["properties"]["object"]["type"] == "string"
+    assert set(schemas[name]["parameters"]["required"]) == set(arguments)
+    assert schemas[name]["parameters"]["properties"] == {key: {"type": "string"} for key in arguments}
 
 
-@pytest.mark.parametrize("cancel", [False, True])
-def test_mcp_lifespan_preserves_context_and_closes_environment(cancel: bool, environment: Mock) -> None:
-    events: list[str] = []
+@pytest.mark.parametrize("command", ["put mug 1 in/on desk 1", "put mug 1 into desk 1", "put mug 1 in desk 1"])
+def test_placement_aliases_and_terminal_state(command: str) -> None:
+    environment = Mock(commands=[command])
+    environment.reset.return_value = env.EpisodeResult(observation="Goal", reward=0.0, done=False)
+    environment.step.return_value = env.EpisodeResult(observation="Done", reward=1.0, done=True)
+    tools = env.ALFWorldTools(environment=environment, max_steps=2)
+    tools.reset()
+    result = tools.call(env.ToolCall(name="move", arguments={"object": "mug 1", "location": "desk 1"}))
+    assert result.done and result.reward == 1.0
+    assert tools.call(env.ToolCall(name="look", arguments={})) == result
+    environment.step.assert_called_once_with(command)
 
-    def close() -> None:
-        events.append("close")
 
-    environment.close.side_effect = close
-
-    @asynccontextmanager
-    async def existing_lifespan(server: Server) -> AsyncIterator[dict[str, Any]]:
-        try:
-            events.append("start")
-            yield {"resource": "existing"}
-        finally:
-            events.append("stop")
-
-    async def run() -> None:
-        tools = env.ALFWorldTools(config=env.ALFWorldToolsConfig(config_file="config.yaml", max_steps=2))
-        async with tools._exit_stack:
-            await tools.setup_task(env.ALFWorldData(task_id="train/a"))
-            server = MCPServer("alfworld")
-            server._lowlevel_server.lifespan = existing_lifespan
-            tools.register(server)
-            if cancel:
-                with pytest.raises(asyncio.CancelledError):
-                    async with server._lowlevel_server.lifespan(server._lowlevel_server) as state:
-                        assert state == {"resource": "existing"}
-                        raise asyncio.CancelledError
-            else:
-                async with server._lowlevel_server.lifespan(server._lowlevel_server) as state:
-                    assert state == {"resource": "existing"}
-            # Cleanup must happen during MCP shutdown, before the outer Verifiers stack exits.
-            environment.close.assert_called_once()
-        environment.close.assert_called_once()
-
-    asyncio.run(run())
-    assert events == ["start", "stop", "close"]
+def test_tool_step_budget() -> None:
+    environment = Mock(commands=["look"])
+    initial = env.EpisodeResult(observation="Goal", reward=0.0, done=False)
+    environment.reset.return_value = environment.step.return_value = initial
+    tools = env.ALFWorldTools(environment=environment, max_steps=1)
+    tools.reset()
+    assert not tools.call(env.ToolCall(name="look", arguments={})).done
+    assert tools.call(env.ToolCall(name="look", arguments={})).done
+    assert tools.call(env.ToolCall(name="look", arguments={})).done
+    environment.step.assert_called_once_with("look")
+    tools.reset()
+    assert not tools.call(env.ToolCall(name="look", arguments={})).done

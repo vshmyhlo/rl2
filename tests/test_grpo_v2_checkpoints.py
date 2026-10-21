@@ -88,7 +88,7 @@ def test_actor_sampling_state_resumes_task_sequence(progress: training.TrainingP
     actor_class = training.Actor.__ray_metadata__.modified_class
     actor = actor_class.__new__(actor_class)
     actor.rng = random.Random(99)
-    actor.tasks = [SimpleNamespace(data=SimpleNamespace(id=str(i), prompt="task")) for i in range(5)]
+    actor.tasks = [training.ALFWorldTask(id=str(i), config_file="config.yaml") for i in range(5)]
     actor._weights_valid = True
     actor.collect_group = AsyncMock(return_value=Mock(spec=training.RolloutGroup))
     actor.set_sampling_state(json.loads(json.dumps(progress.sampling_state)))

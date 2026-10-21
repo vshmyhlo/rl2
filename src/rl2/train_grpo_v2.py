@@ -22,8 +22,8 @@ Rollout batch scalars:
     charts/reward_max: Maximum raw rollout reward.
     charts/degenerate_group_fraction: Fraction of groups with identical rewards and zero advantages.
     charts/stop_condition_fraction/<label>: Fraction of batch rollouts with each stop condition; None maps to unspecified.
-    charts/turns_mean: Mean model responses per rollout, including tool calls.
-    charts/input_tokens_mean: Mean newly fed input tokens per rollout; a lower bound if context is rewritten.
+    charts/turns_mean: Mean model responses per rollout.
+    charts/input_tokens_mean: Mean context tokens appended per rollout, excluding sampled tokens.
     charts/output_tokens_mean: Mean sampled tokens per rollout across all model calls.
 Stop-condition labels are added as observed; previously seen labels log zero when
 absent from a later batch.
@@ -38,7 +38,7 @@ Timing and throughput (logged every iteration unless noted):
     time/learner/iterations_per_second: Reciprocal of iteration wall time.
     time/learner/rollouts_per_second: Batch rollout count divided by iteration wall time.
     time/learner/output_tokens_per_second: Batch sampled-token count divided by iteration wall time.
-    time/actor/rollout_seconds: Mean agent execution time per rollout, including model calls and tools.
+    time/actor/rollout_seconds: Mean agent execution time per rollout, including model calls and environment steps.
     time/batcher/fetch_rollout_seconds: Wall time fetching all rollout groups, including actor return transfers.
     time/batcher/prepare_batch_seconds: Wall time preparing the CPU training arrays without explicit synchronization.
     time/learner/batch_fetch_seconds: Wall time fetching the rollout batch, including generation, scoring, and Ray transfers.
@@ -52,7 +52,7 @@ Ray transfer latencies include serialization, transport, deserialization, and
 scheduling, using a shared single-node monotonic clock. Timing intervals overlap
 and should not be summed. Iteration timing and throughput exclude that iteration's
 metric and example logging and checkpoint saves. Cumulative counters include resumed training.
-Output-token counts use reported completion usage, counting zero when usage is unavailable.
+Output-token counts include every sampled token, including thinking and end-of-turn tokens.
 """
 
 import argparse
@@ -65,8 +65,8 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Iterator
-from contextlib import AsyncExitStack, ExitStack, closing, contextmanager, nullcontext
+from collections.abc import AsyncGenerator, Iterator
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
 from functools import partial
 from itertools import islice
@@ -86,38 +86,22 @@ import optax
 import orbax.checkpoint as ocp
 import ray
 import torch
-import verifiers.v1 as vf
 import yaml
 from flax.training.train_state import TrainState
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from numpy.typing import NDArray
-from opentelemetry import trace as otel_trace
-from opentelemetry.trace import StatusCode
-from pydantic import ConfigDict, Field
+from pydantic import Field
 from pydantic.dataclasses import dataclass as config_dataclass
 from ray.actor import ActorHandle
-from renderers.configs import CustomRendererConfig
-from verifiers.v1.configs.agent import TimeoutConfig
 from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
 from vllm.utils.network_utils import get_open_port
 
-from rl2.addition_env import AdditionTaskset
-from rl2.alfworld_env import ALFWorldConfig, load_alfworld_tasks
-from rl2.benchmark_env import (
-    AppWorldConfig,
-    BenchmarkTask,
-    Tau2Config,
-    WebShopConfig,
-    load_benchmark_tasks,
-)
-from rl2.codegym_env import CODEGYM_TRAIN_FILE, CodeGymTask, CodeGymTaskset, CodeGymTasksetConfig
-from rl2.codegym_server import CodeGymServerConfig, serve_codegym
+from rl2.agent_loop import SYSTEM_PROMPT, Agent, Rollout, TrainingSequence
+from rl2.alfworld_env import ALFWorldConfig, ALFWorldTask, load_alfworld_tasks
 from rl2.configuration import BaseConfig, load_config
 from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import Parameters, Qwen3LM, load_qwen3_checkpoint
 from rl2.ray_timeline import record_timeline
 from rl2.rollout_tokenizer import rollout_tokenizer
-from rl2.toolrl_env import TOOLRL_TRAIN_FILE, ToolRLTaskset, ToolRLTasksetConfig
 from rl2.tracing import flush_tracing, span, tracing_enabled
 
 logger = logging.getLogger(__name__)
@@ -126,51 +110,10 @@ SERVER_URL = "http://127.0.0.1:8000"
 WEIGHT_BUFFER_BYTES = 64 * 1024**2
 
 
-@config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
-class AdditionConfig:
-    id: Literal["addition"] = "addition"
-
-
-@config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
-class ToolRLConfig:
-    id: Literal["toolrl"] = "toolrl"
-    dataset_file: str = TOOLRL_TRAIN_FILE
-
-
-@config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
-class CodeGymConfig:
-    manager_url: str
-    id: Literal["codegym"] = "codegym"
-    dataset_file: str = CODEGYM_TRAIN_FILE
-    server: CodeGymServerConfig | None = None
-
-    def __post_init__(self) -> None:
-        url = httpx.URL(self.manager_url)
-        if url.scheme not in {"http", "https"} or not url.host:
-            raise ValueError("CodeGym manager_url must be an HTTP(S) URL")
-        if self.server is not None and (
-            url.scheme != "http"
-            or url.host != "127.0.0.1"
-            or url.port is None
-            or not 1 <= url.port <= 65535
-            or url.port == 8000
-            or url.path != "/"
-            or url.query
-            or url.fragment
-            or url.userinfo
-        ):
-            raise ValueError(
-                "Local CodeGym manager_url must be http://127.0.0.1:<port> with a port other than vLLM's 8000"
-            )
-
-
 @config_dataclass(frozen=True)
 class Config(BaseConfig):
     model: str = MODEL
-    taskset: Annotated[
-        AdditionConfig | ToolRLConfig | CodeGymConfig | WebShopConfig | ALFWorldConfig | Tau2Config | AppWorldConfig,
-        Field(discriminator="id"),
-    ] = AdditionConfig()
+    taskset: ALFWorldConfig = ALFWorldConfig(config_file="data/alfworld/base_config.yaml")
     seed: Annotated[int, Field(ge=0)] = 1
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4
@@ -201,14 +144,6 @@ class Config(BaseConfig):
     def __post_init__(self) -> None:
         if self.num_groups * self.group_size % (self.minibatches_per_epoch * self.grad_accum_steps):
             raise ValueError("minibatches_per_epoch * grad_accum_steps must divide num_groups * group_size")
-        if (
-            isinstance(self.taskset, CodeGymConfig)
-            and self.taskset.server is not None
-            and self.taskset.server.workers < self.num_groups * self.group_size
-        ):
-            raise ValueError("CodeGym server.workers must cover num_groups * group_size concurrent rollouts")
-        if self.taskset.id == "toolrl" and self.max_turns != 1:
-            raise ValueError("ToolRL requires max_turns=1; tool calls are graded without execution")
 
 
 DEFAULT_CONFIG = Config()
@@ -293,27 +228,6 @@ def restore_checkpoint(
         sampling_state=metadata["sampling_state"],
         stop_conditions=tuple(metadata["stop_conditions"]),
     )
-
-
-@dataclass(frozen=True)
-class TrainingSequence:
-    token_ids: NDArray[np.int32]  # (T,) exact context and generated tokens in one sequence.
-    loss_mask: NDArray[np.bool_]  # (T,) train on sampled tokens only; exclude prompts and tool results.
-    old_log_probs: NDArray[np.float32]  # (T,) sampling-policy log-probabilities; ignored where loss_mask is False.
-
-
-@dataclass(frozen=True)
-class Rollout:
-    sequence: TrainingSequence  # One complete token sequence spanning all model and tool turns.
-    reward: float  # Total task reward before group normalization.
-    advantage: float  # (reward - group mean) / (population std + 1e-4).
-    completion: str  # Final assistant text for sample logging.
-    interaction: str  # Recorded token text, plus messages not yet tokenized by the model client.
-    num_turns: int  # Number of model responses, including tool calls.
-    num_input_tokens: int  # Newly fed input tokens; a lower bound when context is rewritten.
-    num_output_tokens: int  # Total sampled tokens across model calls.
-    rollout_seconds: float  # Agent execution time, including model calls and tools.
-    stop_condition: str | None  # Verifiers termination reason; None if unspecified.
 
 
 @dataclass(frozen=True)
@@ -495,145 +409,38 @@ def update(
     return state.apply_gradients(grads=gradients), metrics
 
 
-def training_sequence(trace: vf.Trace) -> TrainingSequence:
-    branches = trace.branches
-    if len(branches) != 1:
-        raise ValueError(f"Expected exactly one training sequence, got {len(branches)} branches")
-    branch = branches[0]
-    if not trace.agent.trainable or not branch.trainable or not any(branch.sampled_mask):
-        raise ValueError("Rollout has no trainable tokens")
-    for node in branch.nodes:
-        if len(node.token_ids) != len(node.mask):
-            raise ValueError("Token IDs and loss mask must have equal lengths")
-        if node.sampled and not any(node.mask):
-            raise ValueError("Sampled messages must contain training tokens")
-        # Verifiers otherwise fills missing log-probabilities with zeros.
-        if len(node.logprobs) != sum(node.mask):
-            raise ValueError("Each sampled token must have a log-probability")
-    return TrainingSequence(
-        token_ids=np.asarray(branch.token_ids, dtype=np.int32),  # (T,)
-        loss_mask=np.asarray(branch.sampled_mask, dtype=np.bool_),  # (T,)
-        old_log_probs=np.asarray(branch.logprobs, dtype=np.float32),  # (T,)
-    )
-
-
-def format_interaction(trace: vf.Trace) -> str:
-    tokenizer = rollout_tokenizer(trace.agent.config.model)
-    text = tokenizer.decode(trace.branches[0].token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
-    # Terminal tool results may never be sent to the model and therefore have no tokens.
-    pending = [node.message.model_dump_json(exclude_none=True) for node in trace.nodes if not node.token_ids]
-    if pending:
-        text += "\n\nMessages without model tokens:\n" + "\n".join(pending)
-    return text
-
-
-async def score_group(task: vf.Task, traces: list[vf.Trace]) -> RolloutGroup:
-    logger.debug("Scoring %s rollouts for task %s", len(traces), task.data.id)
-    if len(traces) < 2:
-        raise ValueError("A rollout group needs at least two traces")
-    for trace in traces:
-        if not trace.ok:
-            raise RuntimeError(f"Rollout failed: {trace.stop_condition}: {trace.errors}")
-    # These tasks can be graded from the completed trace without a live runtime.
-    async with asyncio.timeout(30):
-        for trace in traces:
-            await task.score(trace)
-    # Preserve reward differences before the training batch converts advantages to float32.
-    rewards = [trace.reward for trace in traces]
+def score_group(task: ALFWorldTask, rollouts: list[Rollout]) -> RolloutGroup:
+    if len(rollouts) < 2:
+        raise ValueError("A rollout group needs at least two rollouts")
+    rewards = [rollout.reward for rollout in rollouts]
     reward_mean, reward_std = mean(rewards), pstdev(rewards)
-    advantages = [(reward - reward_mean) / (reward_std + 1e-4) for reward in rewards]
     return RolloutGroup(
-        task_id=task.data.id,
-        prompt=task.data.prompt_text,
+        task_id=f"alfworld:{task.id}",
+        prompt=SYSTEM_PROMPT,
         rollouts=[
-            Rollout(
-                sequence=training_sequence(trace),
-                reward=trace.reward,
-                advantage=advantage,
-                completion=trace.last_reply,
-                interaction=await asyncio.to_thread(format_interaction, trace),
-                num_turns=trace.num_turns,
-                num_input_tokens=trace.num_input_tokens,
-                num_output_tokens=trace.usage.completion_tokens if trace.usage is not None else 0,
-                rollout_seconds=trace.timing.agent.duration,
-                stop_condition=trace.stop_condition,
-            )
-            for trace, advantage in zip(traces, advantages, strict=True)
+            replace(rollout, advantage=(rollout.reward - reward_mean) / (reward_std + 1e-4)) for rollout in rollouts
         ],
     )
 
 
-def record_rollout_spans(trace: vf.Trace) -> None:
-    """Export Verifiers' recorded wall-clock intervals under the current rollout."""
-    if not otel_trace.get_current_span().is_recording():
-        return
-    tracer = otel_trace.get_tracer(__name__)
-    model_context = otel_trace.set_span_in_context(otel_trace.get_current_span())
-    for name, timing in (
-        ("boot", trace.timing.boot),
-        ("setup", trace.timing.setup),
-        ("agent", trace.timing.agent),
-        ("finalize", trace.timing.finalize),
-        ("scoring", trace.timing.scoring),
-    ):
-        if timing.start <= 0 or timing.end < timing.start:
-            continue
-        current = tracer.start_span(
-            f"actor.rollout.{name}",
-            start_time=int(timing.start * 1_000_000_000),
-        )
-        if name == "agent":
-            current.set_attribute("model_seconds", trace.timing.agent.model.duration)
-            current.set_attribute("harness_seconds", trace.timing.agent.harness.duration)
-            model_context = otel_trace.set_span_in_context(current)
-        current.end(end_time=int(timing.end * 1_000_000_000))
-    for index, call in enumerate(trace.calls):
-        if call.time.start <= 0 or call.time.end < call.time.start:
-            continue
-        current = tracer.start_span(
-            "actor.rollout.model",
-            context=model_context,
-            start_time=int(call.time.start * 1_000_000_000),
-            attributes={
-                "call_index": index,
-                "model": call.model or "unspecified",
-                "finish_reason": call.finish_reason or "unspecified",
-            },
-        )
-        if call.usage is not None:
-            current.set_attribute("input_tokens", call.usage.input_tokens)
-            current.set_attribute("output_tokens", call.usage.completion_tokens)
-        if call.error is not None:
-            current.set_attribute("error.type", call.error.type)
-            current.set_status(StatusCode.ERROR, call.error.type)
-        current.end(end_time=int(call.time.end * 1_000_000_000))
-
-
-def create_agent(config: Config = DEFAULT_CONFIG) -> vf.Agent:
-    logger.debug("Creating Verifiers agent: model=%s endpoint=%s", config.model, SERVER_URL)
-    return vf.make_agent(
-        config=vf.AgentConfig(
+@asynccontextmanager
+async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]:
+    tokenizer = await asyncio.to_thread(rollout_tokenizer, config.model)
+    async with httpx.AsyncClient(base_url=SERVER_URL, timeout=config.rollout_timeout) as client:
+        response = await client.get("/v1/models")
+        response.raise_for_status()
+        model = next(model for model in response.json()["data"] if model["id"] == config.model)
+        yield Agent(
+            client=client,
+            tokenizer=tokenizer,
             model=config.model,
-            harness=vf.HarnessConfig(id="null"),
-            runtime=vf.SubprocessConfig(),
-            client=vf.TrainClientConfig(
-                base_url=f"{SERVER_URL}/v1",
-                api_key_var="VLLM_API_KEY",
-                renderer_model_name=config.model,
-                renderer=CustomRendererConfig(import_path="rl2.toolrl_env.ToolRLRenderer")
-                if config.taskset.id == "toolrl"
-                else None,
-            ),
-            sampling=vf.SamplingConfig(
-                max_tokens=config.max_tokens,
-                temperature=config.temperature,
-                top_p=1.0,
-                chat_template_kwargs={"enable_thinking": True},
-            ),
+            context_length=model["max_model_len"],
+            max_tokens=config.max_tokens,
             max_turns=config.max_turns,
-            timeout=TimeoutConfig(setup=120, rollout=config.rollout_timeout, finalize=30, scoring=30),
+            temperature=config.temperature,
+            rollout_timeout=config.rollout_timeout,
+            environment_timeout=config.environment_timeout,
         )
-    )
 
 
 @contextmanager
@@ -735,7 +542,7 @@ class Batcher:
             "advantages": np.asarray([rollout.advantage for rollout in rollouts], dtype=np.float32),  # (B,)
         }
         for index, rollout in enumerate(rollouts):
-            sequence = rollout.sequence
+            sequence: TrainingSequence = rollout.sequence
             length = len(sequence.token_ids)
             mask = sequence.loss_mask  # (L,) unpadded transcript length.
             if length < 2 or mask[0] or not mask[1:].any():
@@ -1016,25 +823,14 @@ class Actor:
         self.rng = random.Random(config.seed)
         self._server = ExitStack()
         self._agent_resources = AsyncExitStack()
-        self._agent: vf.Agent | None = None
+        self._agent: Agent | None = None
         self._agent_lock = asyncio.Lock()
-        self._runs: set[asyncio.Task[vf.Trace]] = set()
+        self._runs: set[asyncio.Task[Rollout]] = set()
         self._closed = False
         self._weights_valid = True
-        if isinstance(config.taskset, (WebShopConfig, Tau2Config, AppWorldConfig)):
-            self.tasks = load_benchmark_tasks(config.taskset, config.max_turns, config.environment_timeout)
-        elif isinstance(config.taskset, ALFWorldConfig):
-            self.tasks = load_alfworld_tasks(config.taskset, config.max_turns)
-        elif config.taskset.id == "codegym":
-            self.tasks = list(CodeGymTaskset(config=CodeGymTasksetConfig(data_file=config.taskset.dataset_file)))
-        elif config.taskset.id == "toolrl":
-            self.tasks = list(ToolRLTaskset(config=ToolRLTasksetConfig(data_file=config.taskset.dataset_file)))
-        else:
-            self.tasks = list(AdditionTaskset(config=vf.TasksetConfig()))
+        self.tasks = load_alfworld_tasks(config.taskset, config.max_turns, config.environment_timeout)
         logger.info("Starting actor and vLLM on its assigned GPU")
         with self._server as resources:
-            if isinstance(config.taskset, CodeGymConfig) and config.taskset.server is not None:
-                resources.enter_context(serve_codegym(config.taskset.server, config.taskset.manager_url))
             server = resources.enter_context(serve_vllm(model=config.model))
             wait_for_server(server)
             self._server = resources.pop_all()
@@ -1045,7 +841,7 @@ class Actor:
         self._server.close()
         logger.info("Actor resources released")
 
-    async def _get_agent(self) -> vf.Agent:
+    async def _get_agent(self) -> Agent:
         async with self._agent_lock:
             if self._closed:
                 raise RuntimeError("Actor is closed")
@@ -1074,7 +870,7 @@ class Actor:
         if not self._weights_valid:
             raise RuntimeError("Cannot generate during or after a failed weight update")
         task = self.rng.choice(self.tasks)
-        logger.debug("Selected task %s: %r", task.data.id, task.data.prompt)
+        logger.debug("Selected task %s", task.id)
         group = await self.collect_group(task, group_size=group_size)
         return Transfer(value=group, ready_at=time.monotonic())
 
@@ -1109,36 +905,21 @@ class Actor:
             self._weights_valid = True
             logger.info("Learner weights applied; generation resumed")
 
-    async def collect_group(self, task: vf.Task, group_size: int) -> RolloutGroup:
+    async def collect_group(self, task: ALFWorldTask, group_size: int) -> RolloutGroup:
         if group_size < 2:
             raise ValueError("group_size must be at least 2")
-        span_data = {"group_id": uuid4().hex, "task_id": str(task.data.id), "group_size": str(group_size)}
+        span_data = {"group_id": uuid4().hex, "task_id": str(task.id), "group_size": str(group_size)}
         started = time.monotonic()
-        logger.info("Collecting group: task=%s group_size=%s", task.data.id, group_size)
+        logger.info("Collecting group: task=%s group_size=%s", task.id, group_size)
         try:
             with span("actor.collect_group", {**span_data, "run_id": self.config.run_id or "unspecified"}):
                 agent = await self._get_agent()
                 async with asyncio.TaskGroup() as pending:
 
-                    async def run_rollout(index: int) -> vf.Trace:
+                    async def run_rollout(index: int) -> Rollout:
                         with span("actor.rollout", {**span_data, "rollout_index": index}) as rollout_span:
-                            if isinstance(task, BenchmarkTask) and isinstance(
-                                self.config.taskset, (WebShopConfig, Tau2Config, AppWorldConfig)
-                            ):
-                                result = await task.run(
-                                    agent,
-                                    self.config.taskset,
-                                    self.config.max_turns,
-                                    self.config.environment_timeout,
-                                )
-                            elif isinstance(task, CodeGymTask) and self.config.taskset.id == "codegym":
-                                result = await task.run(agent, self.config.taskset.manager_url)
-                            else:
-                                result = await agent.run(task.defer_scoring())
-                            record_rollout_spans(result)
+                            result = await agent.run(task)
                             rollout_span.set_attribute("stop_condition", result.stop_condition or "unspecified")
-                            if not result.ok:
-                                rollout_span.set_status(StatusCode.ERROR, "Rollout failed")
                             return result
 
                     runs = [pending.create_task(run_rollout(index)) for index in range(group_size)]
@@ -1146,18 +927,18 @@ class Actor:
                     for run in runs:
                         run.add_done_callback(self._runs.discard)
                 with span("actor.score_group"):
-                    group = await score_group(task, [run.result() for run in runs])
+                    group = score_group(task, [run.result() for run in runs])
         except Exception:
             logger.exception(
                 "Group failed: task=%s group_size=%s elapsed=%.2fs",
-                task.data.id,
+                task.id,
                 group_size,
                 time.monotonic() - started,
             )
             raise
         logger.info(
             "Collected group: task=%s elapsed=%.2fs output_tokens=%s rewards=%s advantages=%s",
-            task.data.id,
+            task.id,
             time.monotonic() - started,
             sum(rollout.num_output_tokens for rollout in group.rollouts),
             [rollout.reward for rollout in group.rollouts],
