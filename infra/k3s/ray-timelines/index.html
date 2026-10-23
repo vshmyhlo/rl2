@@ -24,6 +24,7 @@
 <header>
   <a href="/">All jobs</a>
   <strong id="title">Ray timeline</strong>
+  <a id="metrics" target="_blank" rel="noopener" hidden>Job metrics ↗</a>
   <a id="tempo" target="_blank" rel="noopener" hidden>Tempo traces ↗</a>
   <span id="status" role="status">Waiting for snapshot…</span>
   <button id="refresh" type="button">Load latest</button>
@@ -79,6 +80,17 @@
     return `http://localhost:8082/explore?${params}`;
   }
 
+  function metricsUrl(jobName, created) {
+    const start = Date.parse(created);
+    const params = new URLSearchParams({
+      "var-namespace": "training",
+      "var-job_name": jobName,
+      from: Number.isNaN(start) ? "now-7d" : String(start - 60000),
+      to: "now",
+    });
+    return `http://localhost:8082/d/training-job?${params}`;
+  }
+
   async function loadJobs() {
     try {
       const response = await fetch("/api/jobs", {cache: "no-store"});
@@ -104,6 +116,12 @@
         timeline.href = `/?job=${encodeURIComponent(item.name)}`;
         timeline.textContent = "Timeline";
         links.append(timeline);
+        const metrics = document.createElement("a");
+        metrics.href = metricsUrl(item.name, item.created);
+        metrics.textContent = "Job metrics ↗";
+        metrics.target = "_blank";
+        metrics.rel = "noopener";
+        links.append(metrics);
         const tempo = document.createElement("a");
         tempo.href = tempoUrl(item.name);
         tempo.textContent = "Tempo traces ↗";
@@ -155,6 +173,9 @@
     }
     document.getElementById("title").textContent = job;
     document.title = `${job} · Ray timeline`;
+    const metrics = document.getElementById("metrics");
+    metrics.href = metricsUrl(job);
+    metrics.hidden = false;
     const tempo = document.getElementById("tempo");
     tempo.href = tempoUrl(job);
     tempo.hidden = false;

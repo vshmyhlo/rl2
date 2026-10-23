@@ -130,11 +130,8 @@ def test_appworld_preset_and_actor_task_discovery(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(training, "wait_for_server", Mock())
     actor = training.Actor.__ray_metadata__.modified_class(config)
 
-    async def run() -> None:
-        async with aclosing(actor):
-            assert await actor.fetch_next_task() is task
-
-    asyncio.run(run())
+    with actor._server:
+        assert asyncio.run(actor.fetch_next_task()) is task
     load_tasks.assert_called_once_with(config.taskset, config.environment_timeout)
 
 

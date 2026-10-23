@@ -209,7 +209,7 @@ data; no W&B server is running.
 
 See [MLflow tracking server documentation](https://mlflow.org/docs/latest/self-hosting/architecture/tracking-server/).
 
-## GPU and host monitoring
+## GPU, host, and job monitoring
 
 Grafana shows the A100's utilization, memory bandwidth utilization, used/total
 VRAM, temperatures, power draw, SM/memory clocks, and uncorrectable ECC errors.
@@ -227,6 +227,7 @@ sudo k3s kubectl -n monitoring rollout status daemonset/dcgm-exporter --timeout=
 sudo k3s kubectl -n monitoring rollout status daemonset/node-exporter --timeout=180s
 sudo k3s kubectl -n monitoring rollout status deployment/gpu-prometheus --timeout=180s
 sudo k3s kubectl -n monitoring rollout status deployment/gpu-grafana --timeout=180s
+sudo k3s kubectl -n monitoring rollout status deployment/training-kube-state-metrics --timeout=180s
 sudo k3s kubectl -n monitoring port-forward --address=127.0.0.1 service/gpu-grafana 8082:80
 ```
 
@@ -243,8 +244,8 @@ need to edit Grafana settings. Username: `admin`; retrieve the password with:
 sudo k3s kubectl -n monitoring get secret gpu-grafana -o jsonpath='{.data.admin-password}' | base64 --decode
 ```
 
-The dashboard is provisioned from `monitoring/gpu-dashboard.json`. Edit that
-file and reapply the Kustomization to change it. All services use ClusterIP;
+Dashboards are provisioned from `monitoring/{gpu,job}-dashboard.json`. Edit those
+files and reapply the Kustomization to change them. All services use ClusterIP;
 the localhost port-forward provides browser access. Chart versions are pinned
 in `monitoring/monitoring.yaml` and k3s's Helm controller manages installation.
 
@@ -259,6 +260,24 @@ without additional Linux capabilities.
 Node Exporter collects only CPU and memory metrics from the host's read-only
 `/proc` and `/sys` mounts, without host networking or a root filesystem mount.
 Its static scrape target is pinned to `vlad-dev-gpu-1`, matching its node selector.
+
+Open [Training job resources](http://localhost:8082/d/training-job) and select a
+Job to see CPU cores used/requested/limited, RAM working set/RSS/requests/limits,
+CPU throttling, network traffic, disk I/O, container restarts, Pod phases, and
+assigned-GPU utilization/VRAM. Collection is automatic for Jobs in `training`,
+including `submit.py` jobs; no trainer flags or resubmission are needed.
+Prometheus scrapes kubelet cAdvisor through the authenticated API server proxy
+and kube-state-metrics every 15 seconds. The latter can list/watch only training
+Pods; Prometheus can GET the proxy for `vlad-dev-gpu-1` only. Only selected
+container metrics from `training` are stored.
+
+Queries join Pod ownership at each historical timestamp, so retries and deleted
+Pods remain visible within retention. Select a time range covering the run to
+find completed/deleted jobs. Metrics begin after installation and are retained
+for up to seven days or 4 GB together with host/GPU metrics; there is no backfill.
+Queued Jobs have no usage, very short runs may fall between scrapes, and rates
+need at least two samples. Disk counters depend on kubelet support. Assigned-GPU
+panels show device telemetry while assigned, not per-process GPU usage.
 
 ```bash
 sudo k3s kubectl -n monitoring get pods,pvc
@@ -573,9 +592,11 @@ one machine, not a backup. Existing Jobs need resubmission to receive the mount.
 
 Open [Training jobs](http://localhost:8085/) to list running and queued jobs.
 The list refreshes every 10 seconds. Click **Ray dashboard** to open a running
-job's dashboard, **Timeline** to load its saved trace, or **Tempo traces** to search
-Grafana for that job's `rl2` traces over the last hour. Tempo links also appear in
-the timeline view and require Grafana port **8082** forwarded. Install or update the viewer:
+job's dashboard, **Timeline** to load its saved trace, **Job metrics** for its
+Grafana resource history since creation, or **Tempo traces** to search its `rl2`
+traces over the last hour. Grafana links also appear in the timeline view;
+the metrics link there covers the last seven days, even without a saved snapshot.
+Forward Grafana port **8082** as well. Install or update the viewer:
 
 ```bash
 sudo bash infra/k3s/ray-timelines/install.sh

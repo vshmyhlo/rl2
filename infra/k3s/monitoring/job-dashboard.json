@@ -1,0 +1,538 @@
+{
+  "uid": "training-job",
+  "title": "Training job resources",
+  "description": "Per-job CPU, RAM, network, disk and assigned-GPU history. Select a time range covering the run, including for deleted Jobs. Samples start when monitoring is installed; retention is up to seven days or 4 GB. Queued Jobs have no usage until a Pod starts.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "tags": [
+    "training",
+    "CPU",
+    "RAM",
+    "GPU"
+  ],
+  "timezone": "browser",
+  "refresh": "15s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "type": "constant",
+        "query": "training",
+        "hide": 2,
+        "current": {
+          "text": "training",
+          "value": "training"
+        }
+      },
+      {
+        "name": "job_name",
+        "label": "Job",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "gpu-prometheus"
+        },
+        "query": {
+          "query": "label_values(kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\"}, owner_name)",
+          "refId": "JobVariable"
+        },
+        "definition": "label_values(kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\"}, owner_name)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false,
+        "options": [],
+        "current": {}
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "GPU and host overview",
+      "type": "link",
+      "url": "/d/gpu-overview",
+      "keepTime": true
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "CPU usage",
+      "description": "CPU cores used across all job containers. One core equals one CPU-second per second. Requests and limits include only pending/running Pods.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum((rate(container_cpu_usage_seconds_total{job=\"training-cadvisor\",namespace=\"$namespace\",container!=\"\",container!=\"POD\"}[$__rate_interval])) * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"})))",
+          "refId": "A",
+          "legendFormat": "Used",
+          "range": true
+        },
+        {
+          "expr": "sum((kube_pod_container_resource_requests{job=\"training-pods\",namespace=\"$namespace\",resource=\"cpu\"} and on (namespace, pod) (kube_pod_status_phase{job=\"training-pods\",namespace=\"$namespace\",phase=~\"Pending|Running\"} == 1)) * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"})))",
+          "refId": "B",
+          "legendFormat": "Requested",
+          "range": true
+        },
+        {
+          "expr": "sum((kube_pod_container_resource_limits{job=\"training-pods\",namespace=\"$namespace\",resource=\"cpu\"} and on (namespace, pod) (kube_pod_status_phase{job=\"training-pods\",namespace=\"$namespace\",phase=~\"Pending|Running\"} == 1)) * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"})))",
+          "refId": "C",
+          "legendFormat": "Limit",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cores",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "RAM usage",
+      "description": "Working set includes recently used cache; RSS is resident anonymous memory. Requests and limits include only pending/running Pods.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum((container_memory_working_set_bytes{job=\"training-cadvisor\",namespace=\"$namespace\",container!=\"\",container!=\"POD\"}) * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"})))",
+          "refId": "A",
+          "legendFormat": "Working set",
+          "range": true
+        },
+        {
+          "expr": "sum((container_memory_rss{job=\"training-cadvisor\",namespace=\"$namespace\",container!=\"\",container!=\"POD\"}) * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"})))",
+          "refId": "B",
+          "legendFormat": "RSS",
+          "range": true
+        },
+        {
+          "expr": "sum((kube_pod_container_resource_requests{job=\"training-pods\",namespace=\"$namespace\",resource=\"memory\"} and on (namespace, pod) (kube_pod_status_phase{job=\"training-pods\",namespace=\"$namespace\",phase=~\"Pending|Running\"} == 1)) * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"})))",
+          "refId": "C",
+          "legendFormat": "Requested",
+          "range": true
+        },
+        {
+          "expr": "sum((kube_pod_container_resource_limits{job=\"training-pods\",namespace=\"$namespace\",resource=\"memory\"} and on (namespace, pod) (kube_pod_status_phase{job=\"training-pods\",namespace=\"$namespace\",phase=~\"Pending|Running\"} == 1)) * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"})))",
+          "refId": "D",
+          "legendFormat": "Limit",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "CPU throttling",
+      "description": "Percentage of CPU quota enforcement periods throttled. Empty when no CPU quota is configured.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "100 * sum((rate(container_cpu_cfs_throttled_periods_total{job=\"training-cadvisor\",namespace=\"$namespace\",container!=\"\",container!=\"POD\"}[$__rate_interval])) * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"}))) / sum((rate(container_cpu_cfs_periods_total{job=\"training-cadvisor\",namespace=\"$namespace\",container!=\"\",container!=\"POD\"}[$__rate_interval])) * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"})))",
+          "refId": "A",
+          "legendFormat": "Throttled periods",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Network traffic",
+      "description": "Pod network traffic, excluding loopback. Network counters belong to the Pod sandbox, not individual application containers.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum((max by (namespace, pod, interface) (rate(container_network_receive_bytes_total{job=\"training-cadvisor\",namespace=\"$namespace\",interface!=\"lo\"}[$__rate_interval]))) * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"})))",
+          "refId": "A",
+          "legendFormat": "Received",
+          "range": true
+        },
+        {
+          "expr": "sum((max by (namespace, pod, interface) (rate(container_network_transmit_bytes_total{job=\"training-cadvisor\",namespace=\"$namespace\",interface!=\"lo\"}[$__rate_interval]))) * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"})))",
+          "refId": "B",
+          "legendFormat": "Sent",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Disk I/O",
+      "description": "Container filesystem read/write throughput where exposed by the kubelet. This is not persistent-volume capacity or total dataset size.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum((rate(container_fs_reads_bytes_total{job=\"training-cadvisor\",namespace=\"$namespace\",container!=\"\",container!=\"POD\"}[$__rate_interval])) * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"})))",
+          "refId": "A",
+          "legendFormat": "Read",
+          "range": true
+        },
+        {
+          "expr": "sum((rate(container_fs_writes_bytes_total{job=\"training-cadvisor\",namespace=\"$namespace\",container!=\"\",container!=\"POD\"}[$__rate_interval])) * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"})))",
+          "refId": "B",
+          "legendFormat": "Written",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Container restarts",
+      "description": "Restarts within each Pod. Pod replacements have separate series; their histories remain available in the selected time range.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (pod) (kube_pod_container_status_restarts_total{job=\"training-pods\",namespace=\"$namespace\"} * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"})))",
+          "refId": "A",
+          "legendFormat": "{{pod}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Assigned GPU utilization",
+      "description": "Physical GPU utilization while assigned to this job by the NVIDIA device plugin. This is device telemetry, not per-process attribution.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "max by (UUID, gpu) (DCGM_FI_DEV_GPU_UTIL{job=\"nvidia-gpu\",namespace=\"$namespace\",pod!=\"\"} * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"})))",
+          "refId": "A",
+          "legendFormat": "GPU {{gpu}} \u00b7 {{UUID}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Assigned GPU memory",
+      "description": "Physical framebuffer memory used on GPUs assigned to this job. CPU-only jobs have no GPU series.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "max by (UUID, gpu) (DCGM_FI_DEV_FB_USED{job=\"nvidia-gpu\",namespace=\"$namespace\",pod!=\"\"} * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"}))) * 1024 * 1024",
+          "refId": "A",
+          "legendFormat": "GPU {{gpu}} \u00b7 {{UUID}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Pod phases",
+      "description": "Number of job Pods in each phase, including retries that have not yet been deleted.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (phase) (kube_pod_status_phase{job=\"training-pods\",namespace=\"$namespace\"} * on (namespace, pod) group_left() (max by (namespace, pod) (kube_pod_owner{job=\"training-pods\",namespace=\"$namespace\",owner_kind=\"Job\",owner_is_controller=\"true\",owner_name=\"$job_name\"})))",
+          "refId": "A",
+          "legendFormat": "{{phase}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    }
+  ]
+}

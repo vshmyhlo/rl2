@@ -108,6 +108,129 @@ def test_dashboard_host_cpu_and_ram() -> None:
     )
 
 
+def test_job_dashboard_isolates_jobs_and_tracks_replaced_pods() -> None:
+    dashboard = json.loads((Path(__file__).parents[1] / "monitoring/job-dashboard.json").read_text())
+    inputs: list[dict[str, str]] = []
+
+    def series(metric: str, labels: str, values: str) -> None:
+        inputs.append({"series": f"{metric}{{{labels}}}", "values": values})
+
+    for pod, namespace, owner_kind, owner_name in [
+        ("old", "training", "Job", "train-test"),
+        ("new", "training", "Job", "train-test"),
+        ("other", "training", "Job", "train-other"),
+        ("new", "other", "Job", "train-test"),
+        ("viewer", "training", "ReplicaSet", "train-test"),
+    ]:
+        labels = f'namespace="{namespace}",pod="{pod}"'
+        owner_values = "1 1 1 stale _" if pod == "old" else "_ _ 1 1 1"
+        series(
+            "kube_pod_owner",
+            f'{labels},job="training-pods",owner_kind="{owner_kind}",owner_name="{owner_name}",owner_is_controller="true"',
+            owner_values,
+        )
+        # Duplicate exporter series must not multiply usage or cause a many-to-many join.
+        if pod == "old":
+            series(
+                "kube_pod_owner",
+                f'{labels},job="training-pods",owner_kind="Job",owner_name="train-test",owner_is_controller="true",instance="duplicate"',
+                owner_values,
+            )
+        for phase, values in [
+            ("Running", "1 1 0 stale _" if pod == "old" else "0 0 1 1 1"),
+            ("Failed", "0 0 1 stale _" if pod == "old" else "0+0x4"),
+        ]:
+            series("kube_pod_status_phase", f'{labels},job="training-pods",phase="{phase}"', values)
+        for container, cores, memory, requested, throttled, periods in [
+            (
+                "train",
+                2 if pod == "old" else 4,
+                100 if pod == "old" else 200,
+                4 if pod == "old" else 8,
+                5 if pod == "old" else 2,
+                10 if pod == "old" else 20,
+            ),
+            ("sidecar", 1, 50, 1, 0, 10),
+            ("", 100, 10000, 0, 0, 0),
+            ("POD", 100, 10000, 0, 0, 0),
+        ]:
+            if container == "sidecar" and pod != "old":
+                continue
+            cadvisor = f'{labels},job="training-cadvisor",container="{container}"'
+            for metric, increment in [
+                ("container_cpu_usage_seconds_total", cores * 60),
+                ("container_cpu_cfs_throttled_periods_total", throttled * 60),
+                ("container_cpu_cfs_periods_total", periods * 60),
+                ("container_fs_reads_bytes_total", cores * 30 * 60),
+                ("container_fs_writes_bytes_total", cores * 60 * 60),
+            ]:
+                series(metric, cadvisor, f"0+{increment}x4")
+            series("container_memory_working_set_bytes", cadvisor, f"{memory}+0x4")
+            series("container_memory_rss", cadvisor, f"{memory // 2}+0x4")
+            if container not in {"", "POD"}:
+                kube = f'{labels},job="training-pods",container="{container}"'
+                for kind, scale in [("requests", 1), ("limits", 2)]:
+                    for resource, multiplier in [("cpu", 1), ("memory", 100)]:
+                        series(
+                            f"kube_pod_container_resource_{kind}",
+                            f'{kube},resource="{resource}"',
+                            f"{requested * scale * multiplier}+0x4",
+                        )
+                series("kube_pod_container_status_restarts_total", kube, "1+0x4" if pod == "old" else "0+0x4")
+        for direction, speed in [("receive", 120 if pod == "old" else 240), ("transmit", 60 if pod == "old" else 180)]:
+            for interface in ["eth0", "lo"]:
+                for container in ["", "POD"]:
+                    series(
+                        f"container_network_{direction}_bytes_total",
+                        f'{labels},job="training-cadvisor",interface="{interface}",container="{container}"',
+                        f"0+{speed * 60}x4",
+                    )
+        gpu = "0" if pod == "old" else "1"
+        for metric in ["DCGM_FI_DEV_GPU_UTIL", "DCGM_FI_DEV_FB_USED"]:
+            series(metric, f'{labels},job="nvidia-gpu",UUID="GPU-{gpu}",gpu="{gpu}"', "40+0x4")
+    expected = {
+        "CPU usage": [7, 8, 16],
+        "RAM usage": [350, 175, 800, 1600],
+        "CPU throttling": [17.5],
+        "Network traffic": [360, 240],
+        "Disk I/O": [210, 420],
+        "Container restarts": [{'{pod="old"}': 2, '{pod="new"}': 0}],
+        "Assigned GPU utilization": [{'{UUID="GPU-0",gpu="0"}': 40, '{UUID="GPU-1",gpu="1"}': 40}],
+        "Assigned GPU memory": [{'{UUID="GPU-0",gpu="0"}': 40 * 1024**2, '{UUID="GPU-1",gpu="1"}': 40 * 1024**2}],
+        "Pod phases": [{'{phase="Failed"}': 1, '{phase="Running"}': 1}],
+    }
+    checks = []
+    for panel in dashboard["panels"]:
+        for target, value in zip(panel["targets"], expected[panel["title"]], strict=True):
+            expression = (
+                target["expr"]
+                .replace("$namespace", "training")
+                .replace("$job_name", "train-test")
+                .replace("$__rate_interval", "2m")
+            )
+            samples = value if isinstance(value, dict) else {"{}": value}
+            checks.append(
+                {
+                    "expr": expression,
+                    "eval_time": "2m",
+                    "exp_samples": [{"labels": labels, "value": sample} for labels, sample in samples.items()],
+                }
+            )
+            # A selected Job with no Pods must not display unrelated usage or fake zeroes.
+            checks.append(
+                {
+                    "expr": expression.replace('owner_name="train-test"', 'owner_name="queued"'),
+                    "eval_time": "2m",
+                    "exp_samples": [],
+                }
+            )
+            if panel["title"] == "CPU usage" and target["refId"] == "A":
+                checks.append({"expr": expression, "eval_time": "4m", "exp_samples": [{"labels": "{}", "value": 4}]})
+    _check_promql(
+        {"evaluation_interval": "1m", "tests": [{"interval": "1m", "input_series": inputs, "promql_expr_test": checks}]}
+    )
+
+
 def _check_promql(suite: dict[str, Any]) -> None:
     result = subprocess.run(
         [

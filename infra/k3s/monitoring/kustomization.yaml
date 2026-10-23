@@ -12,5 +12,6 @@ configMapGenerator:
     namespace: monitoring
     files:
       - gpu-dashboard.json
+      - job-dashboard.json
     options:
       disableNameSuffixHash: true

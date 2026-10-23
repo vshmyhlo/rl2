@@ -3,6 +3,11 @@ kind: Namespace
 metadata:
   name: monitoring
 ---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: training
+---
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
 metadata:
@@ -62,7 +67,24 @@ spec:
     alertmanager:
       enabled: false
     kube-state-metrics:
-      enabled: false
+      enabled: true
+      fullnameOverride: training-kube-state-metrics
+      rbac:
+        create: false
+      collectors: [pods]
+      namespaces: [training]
+      metricAllowlist:
+        - kube_pod_owner
+        - kube_pod_container_resource_requests
+        - kube_pod_container_resource_limits
+        - kube_pod_container_status_restarts_total
+        - kube_pod_status_phase
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          memory: 128Mi
     prometheus-node-exporter:
       enabled: true
       fullnameOverride: node-exporter
@@ -86,7 +108,7 @@ spec:
       enabled: false
     server:
       fullnameOverride: gpu-prometheus
-      automountServiceAccountToken: false
+      automountServiceAccountToken: true
       retention: 7d
       retentionSize: 4GB
       persistentVolume:
@@ -128,6 +150,25 @@ spec:
           - targets: [node-exporter.monitoring.svc.cluster.local:9100]
             labels:
               instance: vlad-dev-gpu-1
+      - job_name: training-pods
+        static_configs:
+          - targets: [training-kube-state-metrics.monitoring.svc.cluster.local:8080]
+      - job_name: training-cadvisor
+        scheme: https
+        metrics_path: /api/v1/nodes/vlad-dev-gpu-1/proxy/metrics/cadvisor
+        authorization:
+          credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        static_configs:
+          - targets: [kubernetes.default.svc:443]
+        metric_relabel_configs:
+          - source_labels: [namespace]
+            regex: training
+            action: keep
+          - source_labels: [__name__]
+            regex: container_(cpu_usage_seconds_total|cpu_cfs_periods_total|cpu_cfs_throttled_periods_total|memory_working_set_bytes|memory_rss|network_receive_bytes_total|network_transmit_bytes_total|fs_reads_bytes_total|fs_writes_bytes_total)
+            action: keep
 ---
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
@@ -198,3 +239,50 @@ spec:
               path: /var/lib/grafana/dashboards/gpu
     dashboardsConfigMaps:
       gpu: gpu-dashboard
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: training-cadvisor-reader
+rules:
+  - apiGroups: [""]
+    resources: [nodes/proxy]
+    resourceNames: [vlad-dev-gpu-1]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: training-cadvisor-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: training-cadvisor-reader
+subjects:
+  - kind: ServiceAccount
+    name: gpu-prometheus
+    namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: training-metrics-reader
+  namespace: training
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: training-metrics-reader
+  namespace: training
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: training-metrics-reader
+subjects:
+  - kind: ServiceAccount
+    name: training-kube-state-metrics
+    namespace: monitoring
