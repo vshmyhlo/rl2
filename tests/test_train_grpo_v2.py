@@ -118,6 +118,26 @@ def test_presets_use_telemetry_defaults() -> None:
         assert not config.enable_ray_timeline, preset.name
 
 
+def test_appworld_preset_and_actor_task_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/appworld.yaml"
+    config = training.load_config(preset, training.Config)
+    assert config.taskset == training.AppWorldConfig(python="/opt/appworld/bin/python", root="/data/appworld")
+    assert pickle.loads(pickle.dumps(config)) == config
+    task = Mock(spec=training.Task)
+    load_tasks = Mock(return_value=[task])
+    monkeypatch.setattr(training, "load_appworld_tasks", load_tasks)
+    monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
+    monkeypatch.setattr(training, "wait_for_server", Mock())
+    actor = training.Actor.__ray_metadata__.modified_class(config)
+
+    async def run() -> None:
+        async with aclosing(actor):
+            assert await actor.fetch_next_task() is task
+
+    asyncio.run(run())
+    load_tasks.assert_called_once_with(config.taskset, config.environment_timeout)
+
+
 @pytest.mark.parametrize(
     "settings",
     [
@@ -557,7 +577,7 @@ def test_learner_pulls_groups_through_batcher(
         assert not hasattr(batch, "groups")
         assert batch.stop_counts == {"agent_completed": num_groups * 3}
         assert batch.num_output_tokens == num_groups * 3
-        assert batch.examples.count("Full token sequence (special tokens preserved):") == 3
+        assert batch.examples.count("Full token sequence (special tokens preserved):") == num_groups * 3
         assert batch.training_batch.token_ids.shape == (num_groups * 3, 8)
         np.testing.assert_array_equal(batch.training_batch.advantages, 0.5)
     batcher_handle.fetch_next_batch.remote.assert_called_once_with(
@@ -675,10 +695,7 @@ def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
         "time/batcher/actor_to_batcher_seconds": 0.375,
         "time/learner/batcher_to_learner_seconds": 0.75,
     }
-    assert "Actor -> Batcher: task=1 seconds=0.250000" in caplog.text
-    assert "Actor -> Batcher: task=0 seconds=0.500000" in caplog.text
-    assert "Batcher -> Learner: groups=2 seconds=0.750000" in caplog.text
-    assert "array_bytes" not in caplog.text
+    assert not [record for record in caplog.records if record.name == training.__name__]
 
 
 @pytest.fixture
@@ -1005,22 +1022,25 @@ def test_learner_logs_examples_every_ten_steps(
         stop_condition="max_turns",
     )
     groups = [
-        training.RolloutGroup(task_id="task-1", prompt="Add:\n1 + 2", rollouts=[rollout, rollout]),
+        training.RolloutGroup(task_id="task-1", prompt="Add:\n1 + 2", rollouts=[rollout] * 5),
         training.RolloutGroup(
             task_id=None,
             prompt="Another prompt",
             rollouts=[
                 replace(rollout, interaction="", stop_condition="unspecified"),
+                rollout,
+                rollout,
+                replace(rollout, interaction="omitted"),
                 replace(rollout, interaction="omitted"),
             ],
         ),
     ]
-    learner.config = replace(learner.config, num_groups=2, group_size=2, total_iterations=21)
+    learner.config = replace(learner.config, num_groups=2, group_size=5, minibatches_per_epoch=1, total_iterations=21)
     learner.initialize_weight_transfer = Mock()
     learner.publish_weights = Mock()
     learner.optimize = Mock(return_value={"losses/policy": 0.0})
     prepared = Mock(spec=training.GRPOBatch)
-    prepared.token_ids = Mock(shape=(4, 8))  # (B=4, T=8)
+    prepared.token_ids = Mock(shape=(10, 8))  # (B=10, T=8)
     learner.fetch_next_batch = Mock(
         return_value=training.build_rollout_batch(
             groups=groups,
@@ -1040,10 +1060,10 @@ def test_learner_logs_examples_every_ten_steps(
     artifacts = writer.log_text.call_args_list[1:]  # Skip the config artifact.
     assert [call.args[1] for call in artifacts] == ["examples/10.txt", "examples/20.txt"]
     messages = [message for message in caplog.messages if "Rollout examples | step" in message]
-    assert len(messages) == 2
-    for step, call, message in zip((10, 20), artifacts, messages, strict=True):
+    assert not messages
+    assert len([message for message in caplog.messages if message.startswith("iteration=")]) == 21
+    for step, call in zip((10, 20), artifacts, strict=True):
         text = call.args[0]
-        assert message == f"\n{text}"
         assert text.startswith(f"Rollout examples | step {step}\n\n{'=' * 72}\n")
         assert "Example 1 | task=task-1 | reward=1.000 | advantage=0.500" in text
         assert "Turns: 1 | Output tokens: 1 | Stop: max_turns" in text
@@ -1055,11 +1075,12 @@ def test_learner_logs_examples_every_ten_steps(
             "<|im_start|>assistant\n"
             '<think>Use add.</think>\n<tool_call>{"name": "add"}</tool_call><|im_end|>'
         ) in text
-        assert "Example 3 | task=None" in text
+        assert "Example 6 | task=None" in text
+        assert "Example 8 | task=None" in text
         assert "Full token sequence (special tokens preserved):\n(empty)" in text
-        assert text.count("reward=1.000") == 3
+        assert text.count("reward=1.000") == 8
         assert "Token IDs:" not in text
-        assert "Example 4" not in text and "omitted" not in text
+        assert "Example 9" not in text and "omitted" not in text
 
 
 @pytest.mark.parametrize("failure", ["receiver", "publish"])

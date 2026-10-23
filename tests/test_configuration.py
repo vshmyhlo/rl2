@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError, asdict
 from pathlib import Path
+from typing import Literal
 from unittest.mock import Mock
 
 import pytest
@@ -17,6 +18,38 @@ class ExampleConfig(BaseConfig):
     env_id: str = "ALE/Boxing-v5"
     iterations: int = 3
     batch_size: int = 1
+
+
+@dataclass(frozen=True)
+class FirstTaskConfig:
+    path: str
+    id: Literal["first"] = "first"
+
+
+@dataclass(frozen=True)
+class SecondTaskConfig:
+    root: str
+    id: Literal["second"] = "second"
+
+
+@dataclass(frozen=True)
+class TaskConfig(BaseConfig):
+    task: FirstTaskConfig | SecondTaskConfig = FirstTaskConfig(path="default-path")
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected"),
+    [
+        ("task: {id: first}", FirstTaskConfig(path="default-path")),
+        ("task: {path: custom}", FirstTaskConfig(path="custom")),
+        ("task: {id: second, root: data}", SecondTaskConfig(root="data")),
+    ],
+    ids=["same-variant", "implicit-variant", "different-variant"],
+)
+def test_nested_variant_defaults(tmp_path: Path, contents: str, expected: FirstTaskConfig | SecondTaskConfig) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(contents)
+    assert load_config(path, TaskConfig).task == expected
 
 
 @pytest.mark.parametrize(

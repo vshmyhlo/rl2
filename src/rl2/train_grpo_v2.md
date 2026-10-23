@@ -1,14 +1,24 @@
-# ALFWorld GRPO
+# Tool-calling GRPO
 
 `train_grpo_v2.py` trains Qwen3 with a JAX learner, a vLLM inference server,
-and a small custom ALFWorld interaction loop. V2 currently accepts only
-`taskset.id: alfworld`; the older environment presets are unsupported.
+and a small custom tool-calling interaction loop. V2 accepts
+`taskset.id: alfworld` or `appworld`; the other environment presets are unsupported.
 
 Prepare the official ALFWorld training data with `alfworld-download`, set
 `ALFWORLD_DATA`, and point `taskset.config_file` at a configuration whose
 `dataset.data_path` selects the training split. Relative dataset paths resolve
 against that configuration file. All six task types and every eligible solvable
 training game are loaded; expert observations are disabled.
+
+For [AppWorld](https://github.com/StonyBrookNLP/appworld), install `appworld` in a separate Python environment, then run
+`appworld install` and `APPWORLD_ROOT=/data/appworld appworld download data` there.
+Set `taskset.python` to that environment's Python executable and `taskset.root`
+to the data root in `configs/grpo_v2/appworld.yaml`, and use that preset below.
+The adapter loads the official training split and exposes `execute(code=...)`.
+Each rollout owns a subprocess and temporary output directory. Python variables
+persist between calls; API discovery and task completion use the preloaded `apis`
+object. Completion awards `float(world.evaluate().success)` once; earlier steps
+and rollouts that stop without completion receive zero reward.
 
 Run on Linux x86_64 with Python 3.12 and two visible GPUs:
 
@@ -53,7 +63,8 @@ the episode ends. Malformed calls receive tool-error feedback without changing
 the game. A response without tool calls ends the episode. There are no MCP
 servers, renderer pools, or Verifiers objects in this path. The tokenizer and
 SDK client are shared across concurrent rollouts; episode state is independent.
-Environment calls await Ray object references; tokenization runs in threads.
+ALFWorld calls await Ray object references; AppWorld uses asynchronous subprocess
+I/O. Tokenization runs in threads.
 
 The transcript is append-only, using Qwen3 message boundaries. Sampled history,
 including thinking and end-of-turn tokens, is never re-tokenized. Every sampled
@@ -63,7 +74,7 @@ full token sequence from the beginning, preserving system instructions, tool
 schemas, observations, thinking, and special tokens. Tool results that were
 never appended to the model context are excluded.
 
-Reward is ALFWorld's `won` value. Stops are `alfworld_done`, `max_turns`,
+ALFWorld reward is its `won` value. Stops are `environment_done`, `max_turns`,
 `max_tokens`, `context_length`, or `agent_completed`. A truncated model response
 is retained for training but its tool calls are not executed. The next generation budget is capped
 by remaining context; observations that cannot fit end the rollout without
@@ -72,8 +83,9 @@ truncating existing tokens. Episodes with no sampled tokens fail the group.
 `rollout_timeout` bounds the whole episode; `environment_timeout` bounds task
 discovery and each reset/step request. HTTP failures, malformed sampling data,
 worker errors, and timeouts abort the group and cancel its other rollouts.
-Environments close normally on success; errors and cancellations terminate their
-actors immediately. Training enables Ray's Linux subreaper to clean up TextWorld
+Environments close normally on success; errors and cancellations terminate ALFWorld
+actors immediately. AppWorld workers receive EOF and have five seconds to close
+before their process group is killed. Training enables Ray's Linux subreaper to clean up TextWorld
 child processes even after a forced termination. SDK retries are disabled; there are no fallback
 rewards for infrastructure failures.
 

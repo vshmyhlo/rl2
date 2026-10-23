@@ -99,6 +99,7 @@ from vllm.utils.network_utils import get_open_port
 from rl2.agent_loop import Agent, Rollout, StopCondition, TrainingSequence
 from rl2.agent_task import Task
 from rl2.alfworld_env import ALFWorldConfig, ALFWorldTask, load_alfworld_tasks
+from rl2.appworld_env import AppWorldConfig, AppWorldTask, load_appworld_tasks
 from rl2.configuration import BaseConfig, load_config
 from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import AttentionBackend, Parameters, Qwen3LM, load_qwen3_checkpoint
@@ -114,7 +115,7 @@ WEIGHT_BUFFER_BYTES = 64 * 1024**2
 @config_dataclass(frozen=True)
 class Config(BaseConfig):
     model: str = MODEL
-    taskset: ALFWorldConfig = ALFWorldConfig(config_file="data/alfworld/base_config.yaml")
+    taskset: ALFWorldConfig | AppWorldConfig = ALFWorldConfig(config_file="data/alfworld/base_config.yaml")
     seed: Annotated[int, Field(ge=0)] = 1
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4
@@ -252,9 +253,9 @@ class Transfer[T]:
 
 
 def format_rollout_examples(groups: list[RolloutGroup]) -> str:
-    """Format up to three full decoded token sequences in sampling order."""
+    """Format up to eight full decoded token sequences in sampling order."""
     sections: list[str] = []
-    examples = islice(((group, rollout) for group in groups for rollout in group.rollouts), 3)
+    examples = islice(((group, rollout) for group in groups for rollout in group.rollouts), 8)
     for index, (group, rollout) in enumerate(examples, start=1):
         sections.append(
             f"{'=' * 72}\n"
@@ -564,17 +565,11 @@ class Batcher:
         if num_groups < 1:
             raise ValueError("num_groups must be at least 1")
         started = time.monotonic()
-        logger.info("Fetching batch: num_groups=%s group_size=%s", num_groups, group_size)
 
         async def fetch_group() -> tuple[RolloutGroup, float]:
             result = await self.actor.fetch_next_group.remote(group_size=group_size)
             received_at = time.monotonic()
             seconds = received_at - result.ready_at
-            logger.info(
-                "Ray transfer Actor -> Batcher: task=%s seconds=%.6f",
-                result.value.task_id,
-                seconds,
-            )
             return result.value, seconds
 
         # Timestamp each arrival before waiting for slower groups.
@@ -595,7 +590,6 @@ class Batcher:
                 "time/batcher/actor_to_batcher_seconds": mean(seconds for _, seconds in results),
             },
         )
-        logger.info("Batch ready: groups=%s elapsed=%.2fs", num_groups, time.monotonic() - started)
         return Transfer(value=batch, ready_at=time.monotonic())
 
 
@@ -727,7 +721,6 @@ class Learner:
                     if iteration % 10 == 0:
                         with span("learner.log_examples"):
                             examples = f"Rollout examples | step {iteration}\n\n{batch.examples}"
-                            logger.info("\n%s", examples)
                             writer.log_text(examples, f"examples/{iteration}.txt")
                     if iteration % self.config.checkpoint_interval == 0 or iteration == self.config.total_iterations:
                         with span("learner.checkpoint"):
@@ -747,7 +740,6 @@ class Learner:
                         writer.log_metrics(scalars, step=iteration)
 
     def fetch_next_batch(self, num_groups: int, group_size: int) -> RolloutBatch:
-        logger.debug("Requesting batch: num_groups=%s group_size=%s", num_groups, group_size)
         result = ray.get(
             self.batcher.fetch_next_batch.remote(
                 num_groups=num_groups,
@@ -758,18 +750,12 @@ class Learner:
         received_at = time.monotonic()
         seconds = received_at - result.ready_at
         batch = result.value
-        logger.info(
-            "Ray transfer Batcher -> Learner: groups=%s seconds=%.6f",
-            num_groups,
-            seconds,
-        )
         return replace(
             batch,
             transfer_metrics={**batch.transfer_metrics, "time/learner/batcher_to_learner_seconds": seconds},
         )
 
     def publish_weights(self) -> None:
-        started = time.monotonic()
         params = jax.tree.map(lambda value: value.astype(jnp.bfloat16), self.state.params)  # HF parameter shapes.
         # vLLM packs weights on separate CUDA streams without waiting on the DLPack consumer stream.
         jax.block_until_ready(params)
@@ -782,7 +768,6 @@ class Learner:
             "packed": True,
             "packed_buffer_size_bytes": buffer_bytes,
         }
-        logger.info("Publishing %s parameter tensors via NCCL", len(weights))
         pending = self.actor.update_weights.remote(update_info)
         NCCLWeightTransferEngine.trainer_send_weights(
             iterator=iter(weights.items()),
@@ -792,7 +777,6 @@ class Learner:
         )
         torch.cuda.synchronize()
         ray.get(pending)
-        logger.info("Weights published: elapsed=%.2fs", time.monotonic() - started)
 
     def optimize(self, batch: GRPOBatch[np.ndarray]) -> dict[str, float]:  # Batch leaves: (B, T), (B,).
         device_batch: GRPOBatch[jax.Array] = jax.device_put(
@@ -837,7 +821,11 @@ class Actor:
         self._runs: set[asyncio.Task[Rollout]] = set()
         self._closed = False
         self._weights_valid = True
-        self.tasks: list[ALFWorldTask] = load_alfworld_tasks(config.taskset, config.environment_timeout)
+        self.tasks: list[ALFWorldTask] | list[AppWorldTask] = (
+            load_appworld_tasks(config.taskset, config.environment_timeout)
+            if isinstance(config.taskset, AppWorldConfig)
+            else load_alfworld_tasks(config.taskset, config.environment_timeout)
+        )
         logger.info("Starting actor and vLLM on its assigned GPU")
         with self._server as resources:
             server = resources.enter_context(serve_vllm(model=config.model))
@@ -872,9 +860,7 @@ class Actor:
         self.rng.setstate((state["version"], tuple(state["state"]), state["gauss_next"]))
 
     async def fetch_next_task(self) -> Task:
-        task = self.rng.choice(self.tasks)
-        logger.debug("Selected task %s", task.id)
-        return task
+        return self.rng.choice(self.tasks)
 
     async def fetch_next_group(self, group_size: int) -> Transfer[RolloutGroup]:
         if not self._weights_valid:
@@ -892,7 +878,6 @@ class Actor:
     async def update_weights(self, update_info: dict[str, Any]) -> None:
         with span("actor.update_weights"):
             self._weights_valid = False
-            logger.info("Receiving learner weights: tensors=%s", len(update_info["names"]))
             async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:
                 with span("actor.update_weights.pause", {"mode": self.config.weight_update_pause_mode}):
                     response = await client.post(
@@ -912,14 +897,12 @@ class Actor:
                     response = await client.post("/resume")
                     response.raise_for_status()
             self._weights_valid = True
-            logger.info("Learner weights applied; generation resumed")
 
     async def collect_group(self, task: Task, group_size: int) -> RolloutGroup:
         if group_size < 2:
             raise ValueError("group_size must be at least 2")
         span_data = {"group_id": uuid4().hex, "task_id": str(task.id), "group_size": str(group_size)}
         started = time.monotonic()
-        logger.info("Collecting group: task=%s group_size=%s", task.id, group_size)
         try:
             with span("actor.collect_group", {**span_data, "run_id": self.config.run_id or "unspecified"}):
                 agent = await self._get_agent()
@@ -946,14 +929,6 @@ class Actor:
                 time.monotonic() - started,
             )
             raise
-        logger.info(
-            "Collected group: task=%s elapsed=%.2fs output_tokens=%s rewards=%s advantages=%s",
-            task.id,
-            time.monotonic() - started,
-            sum(rollout.num_output_tokens for rollout in group.rollouts),
-            [rollout.reward for rollout in group.rollouts],
-            [rollout.advantage for rollout in group.rollouts],
-        )
         return group
 
 

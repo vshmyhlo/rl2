@@ -67,7 +67,7 @@ def worker_environment(config: BenchmarkConfig) -> dict[str, str]:
 
 
 class BenchmarkSession:
-    def __init__(self, command: list[str], timeout: float, env: dict[str, str]) -> None:
+    def __init__(self, command: list[str], timeout: float | None, env: dict[str, str]) -> None:
         self.command = command
         self.timeout = timeout
         self.env = env

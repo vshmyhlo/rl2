@@ -93,6 +93,35 @@ def test_appworld_train_execution_and_cleanup(monkeypatch: pytest.MonkeyPatch) -
     world.__exit__.assert_called_once()
 
 
+@pytest.mark.parametrize("success", [False, True], ids=["failure", "success"])
+def test_appworld_tool_rewards_and_terminal_guard(success: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    world = MagicMock()
+    world.__enter__.return_value = world
+    world.task = SimpleNamespace(supervisor={}, datetime="2026-01-01", instruction="Buy milk")
+    world.task_completed.side_effect = [False, False, True]
+    world.execute.side_effect = ["Traceback: invalid code", "Finished"]
+    world.evaluate.return_value.success = success
+    module = load_worker(
+        "appworld",
+        {"appworld": {"AppWorld": Mock(return_value=world), "load_task_ids": Mock(return_value=["a"])}},
+        monkeypatch,
+    )
+    with closing(module["AppWorldEnvironment"]({"max_steps": sys.maxsize, "tool_calls": True})) as worker:
+        assert not worker.reset("a")["done"]
+        assert worker.step("bad code") == {"observation": "Traceback: invalid code", "reward": 0.0, "done": False}
+        world.evaluate.assert_not_called()
+        assert worker.step("apis.supervisor.complete_task()") == {
+            "observation": "Finished",
+            "reward": float(success),
+            "done": True,
+        }
+        with pytest.raises(RuntimeError, match="episode finished"):
+            worker.step("apis.supervisor.complete_task()")
+        assert world.execute.call_count == 2
+        world.evaluate.assert_called_once()
+    world.__exit__.assert_called_once()
+
+
 def test_tau2_train_domains_reward_and_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     upstream = Mock()
     upstream._simulation_done.is_set.return_value = False
