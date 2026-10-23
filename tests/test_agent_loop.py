@@ -335,7 +335,8 @@ def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, envir
 
 
 @pytest.mark.parametrize(
-    "failure", ["http", "empty", "logprobs", "alignment", "missing_probability", "abort", "timeout", "cancel"]
+    "failure",
+    ["http", "empty", "logprobs", "alignment", "missing_probability", "abort", "abort_empty", "timeout", "cancel"],
 )
 def test_failures_close_environment(
     failure: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock, task: Task
@@ -353,7 +354,7 @@ def test_failures_close_environment(
             return httpx.Response(500)
         data = response_for(tokenizer, "look<|im_end|>")
         choice = data["choices"][0]
-        if failure == "empty":
+        if failure in {"empty", "abort_empty"}:
             choice["token_ids"] = []
             choice["logprobs"]["tokens"] = []
             choice["logprobs"]["token_logprobs"] = []
@@ -363,7 +364,7 @@ def test_failures_close_environment(
             choice["logprobs"]["tokens"][0] = "token_id:999"
         elif failure == "missing_probability":
             choice["logprobs"]["token_logprobs"][0] = -9999.0
-        elif failure == "abort":
+        if failure in {"abort", "abort_empty"}:
             choice["finish_reason"] = "abort"
         return httpx.Response(200, json=data)
 
@@ -381,6 +382,7 @@ def test_failures_close_environment(
     error = {
         "http": APIStatusError,
         "abort": RuntimeError,
+        "abort_empty": RuntimeError,
         "timeout": TimeoutError,
         "cancel": asyncio.CancelledError,
     }.get(failure, ValueError)
@@ -459,10 +461,21 @@ def test_tool_calls_preserve_json_strings() -> None:
     assert loop.parse_tool_calls(text + "<|im_end|>") == calls
 
 
-@pytest.mark.parametrize("ending", ["<|im_end|>", "<|endoftext|>", ""], ids=["im-end", "endoftext", "omitted-stop"])
+@pytest.mark.parametrize(
+    ("ending", "eos_token"),
+    [
+        ("<|im_end|>", "<|im_end|>"),
+        ("<|endoftext|>", "<|im_end|>"),
+        ("", "<|im_end|>"),
+        ("<|im_end|>", "<|endoftext|>"),
+        ("<|endoftext|>", "<|endoftext|>"),
+    ],
+    ids=["im-end", "endoftext", "omitted-stop", "im-end-with-alternate-eos", "endoftext-with-alternate-eos"],
+)
 def test_tool_response_renderer(
-    ending: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock, task: Task
+    ending: str, eos_token: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock, task: Task
 ) -> None:
+    tokenizer.eos_token = eos_token
     calls = [ToolCall(name="look", arguments={}), ToolCall(name="inventory", arguments={})]
     results = [
         StepResult(observation="A shelf", reward=0.0, done=False),

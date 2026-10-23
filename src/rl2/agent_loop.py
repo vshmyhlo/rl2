@@ -168,11 +168,11 @@ class Agent:
                     if len(choices) != 1:
                         raise ValueError("Expected one completion per model request")
                     choice = choices[0]
+                    if choice.finish_reason not in {"stop", "length"}:
+                        raise RuntimeError(f"Generation failed: {choice.finish_reason}")
                     ids, sampled_log_probs = completion_tokens(choice)
                     if len(ids) > remaining:
                         raise ValueError("Completion exceeds the requested token budget")
-                    if choice.finish_reason not in {"stop", "length"}:
-                        raise RuntimeError(f"Generation failed: {choice.finish_reason}")
                     model_span.set_attribute("output_tokens", len(ids))
                 token_ids.extend(ids)
                 loss_mask.extend([True] * len(ids))
@@ -213,7 +213,8 @@ class Agent:
                     break
                 # Qwen3 groups tool results in one user message; sampled history stays untouched.
                 responses = "\n".join(f"<tool_response>\n{content}\n</tool_response>" for content in pending)
-                suffix = ("" if ids[-1] == self.tokenizer.eos_token_id else "<|im_end|>") + (
+                im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+                suffix = ("" if ids[-1] == im_end_id else "<|im_end|>") + (
                     f"\n<|im_start|>user\n{responses}<|im_end|>\n<|im_start|>assistant\n"
                 )
                 context = await asyncio.to_thread(self.tokenizer.encode, suffix, add_special_tokens=False)

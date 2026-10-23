@@ -6,6 +6,7 @@
 - Prefer standard-library functionality and well-maintained libraries over implementing equivalent functionality from scratch when they fit the task and project constraints. Reuse existing project dependencies where possible.
 - Prefer organizing Python modules into folders and subfolders by feature or responsibility over a flat list of scripts. Keep related modules together and avoid unnecessary nesting.
 - Prefer context managers (`with` / `async with`) for resource cleanup over manual `try`/`except`/`finally` blocks with explicit `close()` calls. Use `contextlib.closing` or `contextlib.aclosing` when a resource lacks native context-manager support.
+- With `ExitStack` or `AsyncExitStack`, prefer `resource = stack.enter_context(closing(...))` or `resource = await stack.enter_async_context(aclosing(...))` over separately assigning the resource and registering its close method as a callback. Enter native context managers directly when available.
 - Prefer combining multiple context managers in a single parenthesized `with` / `async with` statement over nesting statements when their scopes align.
 - Prefer `Generator[T]` return annotations for functions decorated with `@contextlib.contextmanager` and `AsyncGenerator[T]` for functions decorated with `@contextlib.asynccontextmanager`, rather than `Iterator[T]` and `AsyncIterator[T]`. Import these types from `collections.abc`.
 - Prefer `asyncio.TaskGroup` for managing concurrent and nested asynchronous tasks.
