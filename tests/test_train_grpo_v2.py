@@ -175,7 +175,7 @@ def test_config_rejects_invalid_settings(settings: dict[str, object]) -> None:
 @pytest.mark.parametrize(
     ("settings", "error"),
     [
-        ({"taskset": {"id": "addition", "config_file": "config.yaml"}}, "literal_error"),
+        ({"taskset": {"id": "addition", "config_file": "config.yaml"}}, "union_tag_invalid"),
         ({"taskset": {"id": "alfworld", "config_file": None}}, "string_type"),
         ({"taskset": {"id": "alfworld", "config_file": "config.yaml", "unknown": True}}, "unexpected_keyword_argument"),
         ({"dataset_file": "train.parquet"}, "unexpected_keyword_argument"),
@@ -184,8 +184,15 @@ def test_config_rejects_invalid_settings(settings: dict[str, object]) -> None:
 def test_taskset_config_rejects_invalid_yaml(settings: dict[str, object], error: str, tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(settings))
-    with pytest.raises(ValidationError, match=error):
+    with pytest.raises(ValidationError, match=error) as raised:
         training.load_config(path, training.Config)
+    assert len(raised.value.errors()) == 1
+
+
+def test_explicit_taskset_requires_discriminator() -> None:
+    with pytest.raises(ValidationError) as raised:
+        training.Config(taskset={"config_file": "config.yaml"})
+    assert [(error["loc"], error["type"]) for error in raised.value.errors()] == [(("taskset",), "union_tag_not_found")]
 
 
 @pytest.mark.parametrize("temperature", [0.01, 2.0])

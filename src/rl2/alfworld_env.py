@@ -18,6 +18,31 @@ from ray.actor import ActorHandle
 
 from rl2.agent_task import Environment, ResetResult, StepResult, Task, ToolCall, ToolCallError, ToolSchema
 
+SYSTEM_PROMPT = """You control an agent in an ALFWorld household environment. Complete the task by acting.
+Use exactly one action tool per turn, then wait for the observation. Keep reasoning brief.
+Always close </think> before writing a complete <tool_call> JSON block outside reasoning.
+Every response must include an action; keep acting until the environment ends the episode.
+
+Explore to discover objects. The initial room description lists locations, not their contents.
+Use go_to to visit a location and reveal its contents; open closed containers with open_container.
+An unseen object needs to be searched for. An empty inventory or a look response saying
+"nothing" does not mean the task object is absent from the room. Check unvisited locations.
+Track your location, carried object, and searched locations from actual observations.
+
+Choose an action supported by the latest Admissible commands and call its corresponding tool.
+Copy exact names and numeric IDs from observations or commands; never invent objects or locations.
+For a listed 'go to shelf 1', call:
+<tool_call>{"name": "go_to", "arguments": {"location": "shelf 1"}}</tool_call>
+Navigate before interacting. 'Nothing happens' means the action failed; check the current
+commands and change your action instead of assuming success or repeating the failed action.
+
+For placement tasks, find and take the object, then go to the destination and use move.
+For clean/heat/cool tasks, carry the object to the sinkbasin/microwave/fridge and use
+clean/heat/cool before placing it. For two-object tasks, deliver two distinct objects.
+To 'examine X with a lamp', take X, find the lamp, and use the lamp while carrying X.
+The lamp supplies light; the task is not to pick up or examine the lamp.
+"""
+
 
 @config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class ALFWorldConfig:
@@ -95,17 +120,17 @@ class ActionTool:
 
 ACTION_TOOLS = {
     "look": ActionTool(
-        description="Look around your current location.",
+        description="Look at your current surroundings; use go_to to search other locations.",
         parameters=(),
         commands=("look",),
     ),
     "go_to": ActionTool(
-        description="Go to a named location, such as 'shelf 1'.",
+        description="Visit a location such as 'shelf 1' and observe its contents or whether it is closed.",
         parameters=("location",),
         commands=("go to {location}",),
     ),
     "take": ActionTool(
-        description="Take an object from a location. Include numeric IDs in both names.",
+        description="Pick up a visible object at your current location. Include numeric IDs in both names.",
         parameters=("object", "location"),
         commands=("take {object} from {location}",),
     ),
@@ -145,12 +170,12 @@ ACTION_TOOLS = {
         commands=("cool {object} with {location}",),
     ),
     "use": ActionTool(
-        description="Toggle a named device, such as a lamp.",
+        description="Toggle a nearby device. For lamp tasks, use the lamp while carrying the target object.",
         parameters=("object",),
         commands=("use {object}",),
     ),
     "examine": ActionTool(
-        description="Examine a named object or location.",
+        description="Inspect an accessible object or location. Lamp tasks require use on the lamp instead.",
         parameters=("target",),
         commands=("examine {target}",),
     ),
@@ -203,8 +228,12 @@ class ALFWorldTools:
         assert not initial.done, "ALFWorld reset must allow at least one step"
         return ResetResult(
             tools=tool_schemas(),
-            system_prompt="Use one action tool per turn. Use the exact object and location names, including IDs.",
-            prompt=initial.observation,
+            system_prompt=SYSTEM_PROMPT,
+            prompt=(
+                f"Task and starting observation:\n{initial.observation}\n\n"
+                "Start with one action from the admissible commands. "
+                "If the target is not visible, visit a location to search for it."
+            ),
         )
 
     def call(self, call: ToolCall) -> StepResult:

@@ -36,29 +36,21 @@ def test_requires_encoder(config_path: Path, field: str) -> None:
     assert error.value.errors()[0]["type"] == "missing"
 
 
-@pytest.mark.parametrize("run_id", ["explicit-run", None, "missing"])
-def test_load_config_returns_fully_resolved_config(config_path: Path, run_id: str | None) -> None:
+def test_load_config_returns_fully_resolved_config(config_path: Path) -> None:
     settings = yaml.safe_load(config_path.read_text())
     settings.update(
         env={"id": "Breakout-MinAtar"},
         seed=7,
         ckpt_dir="logs/${run_id}/${path_name:${env.id}}",
         num_minibatches="${num_envs}",
+        run_id="explicit-run",
     )
-    if run_id == "missing":
-        settings.pop("run_id")
-    else:
-        settings["run_id"] = run_id
     config_path.write_text(yaml.safe_dump(settings))
 
     config = load_config(config_path, Config)
 
     assert isinstance(config, Config)
-    assert config.run_id is not None
-    if run_id == "explicit-run":
-        assert config.run_id == run_id
-    else:
-        assert config.run_id[0:8].isdigit()
+    assert config.run_id == "explicit-run"
     assert config.ckpt_dir == f"logs/{config.run_id}/Breakout-MinAtar"
     assert config.num_minibatches == config.num_envs
 

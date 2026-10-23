@@ -1,11 +1,11 @@
 from dataclasses import FrozenInstanceError, asdict
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from unittest.mock import Mock
 
 import pytest
-from omegaconf.errors import OmegaConfBaseException
-from pydantic import ValidationError
+from omegaconf.errors import InterpolationKeyError, OmegaConfBaseException
+from pydantic import Field, ValidationError
 from pydantic.dataclasses import dataclass
 
 from rl2 import configuration
@@ -34,22 +34,34 @@ class SecondTaskConfig:
 
 @dataclass(frozen=True)
 class TaskConfig(BaseConfig):
-    task: FirstTaskConfig | SecondTaskConfig = FirstTaskConfig(path="default-path")
+    task: Annotated[FirstTaskConfig | SecondTaskConfig, Field(discriminator="id")] = FirstTaskConfig(
+        path="default-path"
+    )
 
 
 @pytest.mark.parametrize(
     ("contents", "expected"),
     [
-        ("task: {id: first}", FirstTaskConfig(path="default-path")),
-        ("task: {path: custom}", FirstTaskConfig(path="custom")),
+        ("{}", FirstTaskConfig(path="default-path")),
+        ("task: {id: first, path: custom}", FirstTaskConfig(path="custom")),
         ("task: {id: second, root: data}", SecondTaskConfig(root="data")),
     ],
-    ids=["same-variant", "implicit-variant", "different-variant"],
+    ids=["omitted", "same-variant", "different-variant"],
 )
 def test_nested_variant_defaults(tmp_path: Path, contents: str, expected: FirstTaskConfig | SecondTaskConfig) -> None:
     path = tmp_path / "config.yaml"
     path.write_text(contents)
     assert load_config(path, TaskConfig).task == expected
+
+
+def test_nested_variant_does_not_inherit_default_instance_fields(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("task: {id: first}")
+    with pytest.raises(ValidationError) as raised:
+        load_config(path, TaskConfig)
+    assert [(error["loc"], error["type"]) for error in raised.value.errors()] == [
+        (("task", "first", "path"), "missing")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -64,7 +76,7 @@ def test_nested_variant_defaults(tmp_path: Path, contents: str, expected: FirstT
 )
 def test_config_interpolation(tmp_path: Path, template: str, expected: str) -> None:
     path = tmp_path / "config.yaml"
-    path.write_text(f"required_count: 1\nrun_id: run\nckpt_dir: {template}\n")
+    path.write_text(f"required_count: 1\nenv_id: ALE/Boxing-v5\nrun_id: run\nckpt_dir: {template}\n")
     config = load_config(path, ExampleConfig)
     assert config.ckpt_dir == expected
     assert config.env_id == "ALE/Boxing-v5"
@@ -82,26 +94,43 @@ def test_config_rejects_invalid_interpolation(tmp_path: Path, template: str) -> 
         load_config(path, BaseConfig)
 
 
-def test_load_config_resolves_schema_defaults(tmp_path: Path) -> None:
+def test_load_config_applies_schema_defaults_after_resolving_yaml(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
-    path.write_text("required_count: 2\nbatch_size: ${iterations}\n")
+    path.write_text("required_count: 2\nbatch_size: ${required_count}\n")
     config = load_config(path, ExampleConfig)
     assert config.required_count == 2
-    assert config.batch_size == 3
+    assert config.batch_size == 2
+    assert config.iterations == 3
     assert type(config.batch_size) is int
     assert config.run_id is not None
     assert config.ckpt_dir == f"runs/{config.run_id}"
 
 
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "required_count: 2\nbatch_size: ${iterations}\n",
+        "required_count: 2\nckpt_dir: runs/${run_id}\n",
+        "run_id: ${ckpt_dir}\n",
+    ],
+    ids=["schema-default", "generated-run-id", "default-checkpoint-dir"],
+)
+def test_interpolation_requires_values_in_yaml(contents: str, tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(contents)
+    with pytest.raises(InterpolationKeyError):
+        load_config(path, ExampleConfig)
+
+
 def test_generated_identity_resumes_and_tracks_config_changes(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
-    path.write_text("required_count: 2\nbatch_size: ${iterations}\n")
+    path.write_text("required_count: 2\niterations: 3\nbatch_size: ${iterations}\n")
     original = load_config(path, ExampleConfig)
     assert load_config(path, ExampleConfig) == original
-    path.write_text("batch_size: 3\nrequired_count: 2\nckpt_dir: elsewhere/${run_id}\n")
+    path.write_text("batch_size: 3\nrequired_count: 2\nckpt_dir: elsewhere\n")
     equivalent = load_config(path, ExampleConfig)
     assert equivalent.run_id == original.run_id
-    assert equivalent.ckpt_dir == f"elsewhere/{original.run_id}"
+    assert equivalent.ckpt_dir == "elsewhere"
     path.write_text("required_count: 2\nbatch_size: 2\n")
     changed = load_config(path, ExampleConfig)
     assert changed.run_id != original.run_id
@@ -115,9 +144,8 @@ def test_generated_identity_resumes_and_tracks_config_changes(tmp_path: Path) ->
         ("checkpoints/custom/", "checkpoints/custom/"),
         ("gs://bucket/checkpoints", "gs://bucket/checkpoints"),
         ("/", "/"),
-        ("/runs/prefix_${run_id}/checkpoints", "/runs/prefix_{run_id}/checkpoints"),
     ],
-    ids=["absolute", "relative-trailing-slash", "cloud", "root", "embedded-id"],
+    ids=["absolute", "relative-trailing-slash", "cloud", "root"],
 )
 def test_generated_identity_preserves_checkpoint_directory(tmp_path: Path, directory: str, expected: str) -> None:
     path = tmp_path / "config.yaml"
@@ -145,7 +173,7 @@ def test_explicit_identity_is_preserved_on_resubmission(tmp_path: Path) -> None:
 
 
 def test_load_remote_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    read = Mock(return_value=b"run_id: null\nckpt_dir: gs://bucket/${run_id}\n")
+    read = Mock(return_value=b"run_id: remote\nckpt_dir: gs://bucket/${run_id}\n")
     monkeypatch.setattr(configuration, "read_bytes", read)
     config = load_config("gs://bucket/config.yaml", BaseConfig)
     read.assert_called_once_with("gs://bucket/config.yaml")

@@ -1,11 +1,10 @@
 """Shared training configuration and OmegaConf YAML interpolation."""
 
 import json
-from dataclasses import MISSING, asdict, fields, is_dataclass
+from dataclasses import asdict, replace
 from hashlib import sha256
 from io import StringIO
 from pathlib import Path
-from typing import cast
 
 from omegaconf import DictConfig, OmegaConf
 from pydantic import ConfigDict, TypeAdapter, field_validator
@@ -17,7 +16,7 @@ from rl2.utils import read_bytes
 @dataclass(frozen=True, kw_only=True, config=ConfigDict(extra="forbid", strict=True))
 class BaseConfig:
     run_id: str | None = None
-    ckpt_dir: str = "runs/${run_id}"  # Full run directory, including local or gs:// paths.
+    ckpt_dir: str = "runs"  # Full run directory, including local or gs:// paths.
 
     @field_validator("run_id")
     @classmethod
@@ -42,29 +41,24 @@ def path_name(value: str) -> str:
 OmegaConf.register_resolver("path_name", path_name)
 
 
-def config_digest(settings: DictConfig) -> str:
-    """Hash resolved settings independently of run identity and output location."""
-    identity = settings.copy()
-    identity.run_id = "run"
-    identity.ckpt_dir = "runs"
-    values = cast(dict[str, object], OmegaConf.to_container(identity, resolve=True, throw_on_missing=True))
+def config_digest(config: BaseConfig) -> str:
+    """Hash validated settings independently of run identity and output location."""
+    values = asdict(config)
     del values["run_id"], values["ckpt_dir"]
     return sha256(json.dumps(values, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
 
 
 def load_config[T: BaseConfig](path: str | Path, config_type: type[T]) -> T:
-    """Load local or gs:// YAML, merge schema defaults, resolve, and validate."""
+    """Resolve references within local or gs:// YAML, then validate and apply defaults."""
     settings = OmegaConf.load(StringIO(read_bytes(str(path)).decode()))
     if not isinstance(settings, DictConfig):
         raise TypeError("The YAML config must contain a mapping of training settings")
-    defaults = {}
-    for field in fields(config_type):
-        value = field.default_factory() if field.default_factory is not MISSING else field.default
-        if value is not MISSING:
-            defaults[field.name] = asdict(value) if is_dataclass(value) else value
-    settings = cast(DictConfig, OmegaConf.merge(defaults, settings))
-    if settings.get("run_id") is None:
-        settings.run_id = f"run_{config_digest(settings)}"
     values = OmegaConf.to_container(settings, resolve=True, throw_on_missing=True)
     # JSON validation accepts YAML lists/objects for strict tuples and nested dataclasses.
-    return TypeAdapter(config_type).validate_json(json.dumps(values))
+    config = TypeAdapter(config_type).validate_json(json.dumps(values))
+    run_id = config.run_id if config.run_id is not None else f"run_{config_digest(config)}"
+    return replace(
+        config,
+        run_id=run_id,
+        ckpt_dir=config.ckpt_dir if "ckpt_dir" in settings else f"runs/{run_id}",
+    )

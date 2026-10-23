@@ -115,7 +115,9 @@ WEIGHT_BUFFER_BYTES = 64 * 1024**2
 @config_dataclass(frozen=True)
 class Config(BaseConfig):
     model: str = MODEL
-    taskset: ALFWorldConfig | AppWorldConfig = ALFWorldConfig(config_file="data/alfworld/base_config.yaml")
+    taskset: Annotated[ALFWorldConfig | AppWorldConfig, Field(discriminator="id")] = ALFWorldConfig(
+        config_file="data/alfworld/base_config.yaml"
+    )
     seed: Annotated[int, Field(ge=0)] = 1
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4

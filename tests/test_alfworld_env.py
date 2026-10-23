@@ -160,7 +160,8 @@ def test_task_discovery_timeout_cancels_work(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_worker_reset_step_and_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
     environment = Mock()
-    environment.reset.return_value = env.StepResult(observation="Goal", reward=0.0, done=False)
+    observation = "Your task is to: examine the box with the desklamp.\nAdmissible commands: go to drawer 1, look"
+    environment.reset.return_value = env.StepResult(observation=observation, reward=0.0, done=False)
     environment.step.return_value = env.StepResult(observation="Success", reward=1.0, done=True)
     environment.commands = ["look"]
     constructor = Mock(return_value=environment)
@@ -170,9 +171,13 @@ def test_worker_reset_step_and_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     with closing(worker):
         initial = worker.reset()
-        assert initial.prompt == "Goal"
+        assert initial.prompt == (
+            f"Task and starting observation:\n{observation}\n\n"
+            "Start with one action from the admissible commands. "
+            "If the target is not visible, visit a location to search for it."
+        )
         assert initial.tools == env.tool_schemas()
-        assert initial.system_prompt.startswith("Use one action tool per turn.")
+        assert initial.system_prompt == env.SYSTEM_PROMPT
         result = worker.step(env.ToolCall(name="look", arguments={}))
     constructor.assert_called_once_with(config_file="config.yaml", task_id="train/a")
     assert result == env.StepResult(observation="Success", reward=1.0, done=True)
@@ -347,7 +352,7 @@ def test_tool_commands(name: str, arguments: dict[str, str], command: str) -> No
     environment.step.return_value = initial
     tools = env.ALFWorldTools(environment=environment)
     reset = tools.reset()
-    assert reset.prompt == initial.observation
+    assert initial.observation in reset.prompt
     tools.call(env.ToolCall(name=name, arguments=arguments))
     environment.step.assert_called_once_with(command)
     schemas = {schema["function"]["name"]: schema["function"] for schema in env.tool_schemas()}
