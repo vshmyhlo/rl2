@@ -102,7 +102,7 @@ from rl2.agent_task import Task
 from rl2.alfworld_env import ALFWorldConfig, ALFWorldTask, load_alfworld_tasks
 from rl2.configuration import BaseConfig, load_config
 from rl2.mlflow_logging import MLflowLogger
-from rl2.qwen3 import Parameters, Qwen3LM, load_qwen3_checkpoint
+from rl2.qwen3 import AttentionBackend, Parameters, Qwen3LM, load_qwen3_checkpoint
 from rl2.ray_timeline import record_timeline
 from rl2.tracing import flush_tracing, span, tracing_enabled
 
@@ -133,6 +133,8 @@ class Config(BaseConfig):
     update_epochs: Annotated[int, Field(ge=1)] = 1
     minibatches_per_epoch: Annotated[int, Field(ge=1)] = 4
     grad_accum_steps: Annotated[int, Field(ge=1)] = 1
+    attention_backend: AttentionBackend = "tokamax"
+    scan_layers: bool = True
     gradient_checkpointing: bool = True
     enable_ray_dashboard: bool = False
     enable_ray_timeline: bool = False
@@ -633,7 +635,8 @@ class Learner:
                 self.model, variables = load_qwen3_checkpoint(
                     self.config.model,
                     dtype="bfloat16",
-                    attention_backend="tokamax",
+                    attention_backend=self.config.attention_backend,
+                    scan_layers=self.config.scan_layers,
                     gradient_checkpointing=self.config.gradient_checkpointing,
                 )
                 self.state = create_state(

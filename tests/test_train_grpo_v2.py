@@ -51,6 +51,8 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert defaults.update_epochs == 1
     assert defaults.checkpoint_interval == 100
     assert defaults.padding_multiple == 256
+    assert defaults.attention_backend == "tokamax"
+    assert defaults.scan_layers
     assert defaults.gradient_checkpointing
     assert not defaults.enable_ray_dashboard
     assert not defaults.enable_ray_timeline
@@ -63,6 +65,8 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert config.total_iterations is None
     assert config.minibatches_per_epoch == 4
     assert config.grad_accum_steps == 1
+    assert config.attention_backend == "tokamax"
+    assert config.scan_layers
     assert config.gradient_checkpointing
     assert config.weight_update_pause_mode == "wait"
     assert asdict(config.taskset) == {"id": "alfworld", "config_file": "data/alfworld/base_config.yaml"}
@@ -74,6 +78,8 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
             | {
                 "max_tokens": "${group_size}",
                 "total_iterations": 1,
+                "attention_backend": "xla",
+                "scan_layers": False,
                 "gradient_checkpointing": False,
                 "enable_ray_dashboard": True,
                 "enable_ray_timeline": True,
@@ -91,6 +97,8 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
             config,
             max_tokens=config.group_size,
             total_iterations=1,
+            attention_backend="xla",
+            scan_layers=False,
             gradient_checkpointing=False,
             enable_ray_dashboard=True,
             enable_ray_timeline=True,
@@ -137,6 +145,7 @@ def test_presets_use_telemetry_defaults() -> None:
         {"grad_accum_steps": 3},
         {"minibatches_per_epoch": 2, "grad_accum_steps": 4},
         {"update_epochs": 0},
+        {"attention_backend": "unknown"},
         {"weight_update_pause_mode": "unknown"},
         {"taskset": "unknown"},
     ],
@@ -688,7 +697,9 @@ def learner(monkeypatch: pytest.MonkeyPatch) -> Any:
     loader = Mock(return_value=(model, {"params": params}))
     monkeypatch.setattr(training, "load_qwen3_checkpoint", loader)
     monkeypatch.setattr(training.jax, "devices", Mock(return_value=[device]))
-    config = training.Config(model="Qwen/custom", gradient_checkpointing=False)
+    config = training.Config(
+        model="Qwen/custom", attention_backend="xla", scan_layers=False, gradient_checkpointing=False
+    )
     learner = training.Learner.__ray_metadata__.modified_class(batcher=Mock(), actor=Mock(), config=config)
     learner.model = model
     loader.assert_not_called()
@@ -813,7 +824,8 @@ def test_learner_logs_rollouts(
     training.load_qwen3_checkpoint.assert_called_once_with(
         learner.config.model,
         dtype="bfloat16",
-        attention_backend="tokamax",
+        attention_backend=learner.config.attention_backend,
+        scan_layers=learner.config.scan_layers,
         gradient_checkpointing=learner.config.gradient_checkpointing,
     )
     assert learner.model is training.load_qwen3_checkpoint.return_value[0]

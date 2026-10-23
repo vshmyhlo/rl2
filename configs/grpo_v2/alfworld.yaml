@@ -1,9 +1,12 @@
 model: Qwen/Qwen3-0.6B
+attention_backend: tokamax
+scan_layers: true
+gradient_checkpointing: true
 taskset:
   id: alfworld
   config_file: data/alfworld/base_config.yaml
-seed: 4
-num_groups: 4
+seed: 5
+num_groups: 2
 group_size: 8
 max_tokens: 4096 # Total transcript tokens, including system, prompt, and tools.
 max_turns: 50

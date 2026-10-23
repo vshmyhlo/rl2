@@ -85,8 +85,9 @@ capped at the model context length. Oversized transcripts are rejected.
 GRPO uses a clipped importance-ratio objective, averaged over sampled tokens
 within each rollout and then across rollouts. There is no reference-policy KL
 penalty. Model computation uses BF16; master parameters, optimizer state,
-gradients, log probabilities, and loss use FP32. Gradient checkpointing defaults
-to enabled. Temperature is restricted to `[0.01, 2.0]`; vLLM returns
+gradients, log probabilities, and loss use FP32. Learner `attention_backend`
+accepts `tokamax` (default), `xla`, or `cudnn`; `scan_layers` and
+`gradient_checkpointing` default to true. Temperature is restricted to `[0.01, 2.0]`; vLLM returns
 `processed_logprobs` with neutral top-p/top-k sampling, matching the learner.
 
 Each iteration makes `update_epochs` passes with `minibatches_per_epoch` optimizer
