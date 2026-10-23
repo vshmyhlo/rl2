@@ -19,6 +19,7 @@ type Variables = dict[str, Parameters]
 type LayerKV = tuple[jax.Array, jax.Array]  # Each (B, C, K, H).
 type LayerInputs = tuple[Parameters, LayerKV | None]
 type AttentionBackend = Literal["xla", "tokamax", "cudnn"]
+DEFAULT_ATTENTION_BACKEND: AttentionBackend = "tokamax"
 # B: batch, T: input tokens, S: key slots, C: cache capacity, L: layers,
 # D: hidden size, H: head dimension, N: query heads, K: KV heads, V: vocabulary.
 
@@ -111,10 +112,18 @@ class Qwen3Output(NamedTuple):
     cache: Qwen3Cache | None
 
 
+def _compute_cast(x: jax.Array, dtype: jax.typing.DTypeLike) -> jax.Array:  # (...) -> (...)
+    # XLA can erase BF16 cast roundtrips; preserve rounding of stored serving values.
+    if jnp.dtype(dtype) == jnp.bfloat16:
+        x = jax.lax.reduce_precision(x.astype(jnp.float32), exponent_bits=8, mantissa_bits=7)  # (...)
+    return x.astype(dtype)  # (...)
+
+
 def _rms_norm(x: jax.Array, weight: jax.Array, eps: float) -> jax.Array:  # (..., D), (D,)
     normalized = x.astype(jnp.float32)  # (..., D)
     normalized *= jax.lax.rsqrt(jnp.mean(jnp.square(normalized), axis=-1, keepdims=True) + eps)  # (..., D)
-    return normalized.astype(x.dtype) * weight.astype(x.dtype)  # (..., D)
+    # Compiled vLLM fuses the normalization but reads a stored BF16 parameter.
+    return (normalized * _compute_cast(weight, x.dtype).astype(jnp.float32)).astype(x.dtype)  # (..., D)
 
 
 def _silu(x: jax.Array) -> jax.Array:  # (..., D)
@@ -126,8 +135,13 @@ def _rope(x: jax.Array, positions: jax.Array, theta: float) -> jax.Array:  # (B,
     frequencies = theta ** (-jnp.arange(0, x.shape[-1], 2, dtype=jnp.float32) / x.shape[-1])  # (H/2,)
     angles = positions[..., None].astype(jnp.float32) * frequencies  # (B, T, H/2)
     angles = jnp.concatenate((angles, angles), axis=-1)[:, :, None, :]  # (B, T, 1, H)
+    dtype = x.dtype
+    x = x.astype(jnp.float32)  # (B, T, heads, H)
     rotated = jnp.concatenate((-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), axis=-1)  # (B, T, heads, H)
-    return x * jnp.cos(angles).astype(x.dtype) + rotated * jnp.sin(angles).astype(x.dtype)  # (B, T, heads, H)
+    cosine, sine = jax.tree.map(
+        lambda value: _compute_cast(value, dtype).astype(jnp.float32), (jnp.cos(angles), jnp.sin(angles))
+    )  # Each (B, T, 1, H), matching vLLM's stored trigonometric cache.
+    return _compute_cast(x * cosine + rotated * sine, dtype)  # (B, T, heads, H)
 
 
 def _attention(
@@ -191,7 +205,7 @@ class Qwen3LM(nn.Module):
     config: Qwen3Config = Qwen3Config()
     dtype: str = "bfloat16"
     param_dtype: jax.typing.DTypeLike = jnp.float32
-    attention_backend: AttentionBackend = "xla"
+    attention_backend: AttentionBackend = DEFAULT_ATTENTION_BACKEND
     gradient_checkpointing: bool = True
     scan_layers: bool = True
 
@@ -369,7 +383,7 @@ def load_qwen3_checkpoint(
     *,
     revision: str | None = None,
     dtype: str = "bfloat16",
-    attention_backend: AttentionBackend = "xla",
+    attention_backend: AttentionBackend = DEFAULT_ATTENTION_BACKEND,
     gradient_checkpointing: bool = True,
     scan_layers: bool = True,
 ) -> tuple[Qwen3LM, Variables]:
@@ -484,7 +498,7 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="bfloat16")
-    parser.add_argument("--attention-backend", choices=("xla", "tokamax", "cudnn"), default="xla")
+    parser.add_argument("--attention-backend", choices=("xla", "tokamax", "cudnn"), default=DEFAULT_ATTENTION_BACKEND)
     args = parser.parse_args()
     if args.max_new_tokens < 0 or not args.temperature >= 0 or args.top_k < 0:
         parser.error("--max-new-tokens, --temperature, and --top-k must be nonnegative")

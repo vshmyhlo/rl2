@@ -53,6 +53,7 @@ def model() -> Qwen3LM:
             max_position_embeddings=16,
         ),
         dtype="float32",
+        attention_backend="xla",
     )
 
 
@@ -146,6 +147,21 @@ def test_bfloat16_silu_opmath() -> None:
     assert output.dtype == gradient.dtype == jnp.bfloat16
     np.testing.assert_array_equal(output, [[0.244140625]])
     np.testing.assert_array_equal(gradient, [[0.69921875]])
+
+
+def test_bfloat16_master_weights_match_published_weights(model: Qwen3LM, params: Parameters) -> None:
+    model = model.clone(dtype="bfloat16")
+    master = {
+        name: weight * jnp.linspace(0.803, 1.207, weight.shape[-1]) if "norm" in name else weight
+        for name, weight in params.items()
+    }  # HF parameter shapes; norm scales are deliberately between BF16 values.
+    published = jax.tree.map(lambda value: value.astype(jnp.bfloat16).astype(jnp.float32), master)
+    tokens = jnp.array([[1, 4, 2], [0, 1, 4]], jnp.int32)  # (B=2, T=3)
+    forward = jax.jit(model.apply)
+    actual = forward({"params": master}, tokens).logits  # (B, T, V=13)
+    expected = forward({"params": published}, tokens).logits  # (B, T, V=13)
+    assert actual.shape == expected.shape == (2, 3, 13)
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_trailing_logits(model: Qwen3LM, params: Parameters, reference: dict[str, jax.Array]) -> None:
@@ -346,9 +362,7 @@ def test_checkpoint_loading(model: Qwen3LM, params: Parameters, tmp_path: Path) 
     locations["lm_head.weight"] = path.name
     index = tmp_path / "model.safetensors.index.json"
     index.write_text(json.dumps({"weight_map": locations}))
-    loaded_model, variables = load_qwen3_checkpoint(
-        str(tmp_path), dtype="bfloat16", attention_backend="tokamax", gradient_checkpointing=False, scan_layers=False
-    )
+    loaded_model, variables = load_qwen3_checkpoint(str(tmp_path), gradient_checkpointing=False, scan_layers=False)
     index.unlink()  # Subsequent cases exercise unindexed checkpoint errors.
     loaded = variables["params"]
     assert loaded_model.config == model.config
@@ -546,7 +560,9 @@ def test_cli(
     tokenizer.encode.return_value.ids = [1, 4]
     tokenizer.decode.return_value = "Hello"
     generate = Mock(return_value=[7, 2])
-    arguments = ["qwen3", "--prompt", "Hi", "--attention-backend", backend]
+    arguments = ["qwen3", "--prompt", "Hi"]
+    if backend != "tokamax":
+        arguments += ["--attention-backend", backend]
     if script:
         arguments += [
             "--raw",

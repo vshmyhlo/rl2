@@ -68,6 +68,7 @@ def run_demo() -> None:
 def test_demo(demo: SimpleNamespace, capsys: pytest.CaptureFixture[str]) -> None:
     run_demo()
     demo.load.assert_called_once()
+    assert demo.load.call_args.kwargs == {"dtype": "bfloat16", "attention_backend": "tokamax"}
     prompts = [call.args[0] for call in demo.tokenizer.encode.call_args_list]
     assert len(prompts) == 4
     assert all(prompt.endswith("<|im_start|>assistant\n") for prompt in prompts)

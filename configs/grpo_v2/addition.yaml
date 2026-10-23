@@ -3,7 +3,7 @@ seed: 1 # Task sampling seed
 num_groups: 1
 group_size: 4
 total_iterations: null # Run until interrupted
-max_tokens: 512 # Per model response
+max_tokens: 512 # Total transcript tokens, including system, prompt, and tools.
 max_turns: 3
 temperature: 1.0
 learning_rate: 0.000001

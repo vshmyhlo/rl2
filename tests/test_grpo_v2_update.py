@@ -187,6 +187,7 @@ def model() -> Qwen3LM:
             max_position_embeddings=8,
         ),
         dtype="float32",
+        attention_backend="xla",
     )
 
 

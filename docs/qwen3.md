@@ -42,11 +42,11 @@ Each response re-prefills the conversation; `--max-new-tokens` defaults to 1024
 per response. Truncated responses and more than four tool rounds stop the demo.
 Use `--demo --help` for model, attention, and sampling options.
 
-Select Tokamax attention with `--attention-backend tokamax`, or pass
-`attention_backend="tokamax"` to `load_qwen3_checkpoint` or `Qwen3LM`.
-Tokamax explicitly uses its Triton GPU kernel for full forward passes, cached
-decoding, and gradients. Unsupported configurations fail without falling back
-to XLA. The default backend remains `xla`.
+Qwen3, its checkpoint loader and CLIs, and GRPO v2 default to BF16 computation
+with Tokamax attention. Tokamax explicitly uses its Triton GPU kernel for full
+forward passes, cached decoding, and gradients. Unsupported configurations fail without falling back
+to XLA. Select `--attention-backend xla` (Python: `attention_backend="xla"`)
+for CPU use or the portable reference implementation.
 
 Use `--attention-backend cudnn` (Python: `attention_backend="cudnn"`) for JAX's
 built-in cuDNN attention on a compatible NVIDIA GPU. This backend requires
@@ -124,6 +124,97 @@ uv run pytest tests/test_qwen3.py
 The checked-in tiny reference fixture comes from Hugging Face Transformers 4.57.1
 with eager attention. To regenerate it in an environment with CPU PyTorch and
 Transformers installed, run `python tests/qwen3_reference.py`.
+
+### BF16 parity with the GRPO v2 vLLM server
+
+`tests/test_qwen3_vllm.py` uses two GPUs and the actual `serve_vllm`,
+`Learner.publish_weights`, and `Actor.update_weights` methods. Only Ray scheduling
+is replaced with local threads. Weights travel through DLPack and packed NCCL;
+the server runs its normal compiled BF16 inference and processed log probabilities.
+Context length, concurrency, and memory allocation are reduced for the test.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 QWEN3_VLLM_DEVICE=1 \
+QWEN3_VLLM_TESTS=1 \
+QWEN3_CHECKPOINT=/path/to/local/Qwen3-0.6B/snapshot \
+QWEN3_VLLM_REPORT_DIR=/tmp/qwen3-vllm \
+uv run --env-file nvida.env pytest --confcutdir=tests tests/test_qwen3_vllm.py -q -s
+```
+
+The checkpoint must already exist locally. Without `QWEN3_CHECKPOINT`, only the
+small tied/untied models and operation tests run. Without `QWEN3_VLLM_TESTS=1`,
+the suite skips. On hosts configured for an unavailable NCCL network plugin,
+select `NCCL_NET=Socket` for this local test. TorchInductor needs a C++ compiler;
+set `CXX` to its installed executable if necessary.
+
+Coverage includes FP32 master weights rounded to BF16, two successive publications,
+prefix-cache invalidation, unequal prompt lengths, two-turn transcripts with masked
+user messages, batched generation, temperatures 1.0/0.7, and training's shifted
+`token_log_probs`. Transcripts use the actual `Batcher.prepare_batch`, with the
+production 256-token padding multiple for the checkpoint. Small models compare
+every vocabulary probability; the real checkpoint compares sampled tokens and
+the top ten alternatives. The same rollout
+is replayed through JAX XLA/cuDNN and Tokamax Triton/cuDNN/XLA/chunked-XLA.
+Tokamax Mosaic is included on SM90/SM100; A100 does not support it.
+
+Reports retain package versions, server logs, exact rollout IDs/masks/probabilities,
+per-backend errors, sampled GRPO approximate KL, and false clipping at a 0.2 clip
+coefficient. A vLLM full-transcript replay measures its own prefill/decode variation.
+`QWEN3_VLLM_EAGER=1` is available for diagnosis; the default tests compiled serving.
+Reports also record optimization level, matmul precision, and relevant runtime
+settings. The environment preset disables automatic NCCL profiler loading: the host's profiler
+aborted when a second weight-transfer communicator initialized. Profiling can be
+enabled explicitly with `NCCL_PROFILER_PLUGIN` when needed.
+
+The operation tests compile vLLM's native normalization, SwiGLU, and RoPE operations,
+including fused Q/K normalization plus rotation. They caught erased BF16 rounding
+of the stored RoPE sine/cosine cache and a premature rounding path through BF16
+rotation slicing. JAX now rounds stored serving values explicitly and widens before
+rotation. Forcing rounding at every activation boundary instead matches eager CUDA
+kernels, whose arithmetic differs from production TorchInductor fusion.
+
+The real-checkpoint regression bounds are 0.35 maximum / 0.03 mean sampled log-probability
+error, 0.10 maximum / 0.0025 mean alternative-token probability error, sampled
+approximate KL below 0.0025, and false clipping at most 5%. Tokamax/Triton, the
+training default, additionally requires **zero false clipping** on these rollouts.
+Small-model limits are tighter. These are bounded BF16 agreement checks: kernel
+reduction order and prefill/decode shapes still change rounding. All raw errors remain in the report,
+including log-probability errors for very unlikely alternatives.
+
+On A100 with Qwen3-0.6B revision `c1899de289a04d12100db370d81485cdf75e47ca`,
+JAX 0.11.2, vLLM 0.27.0, Torch 2.13.0+cu130, and Tokamax 0.0.15, the
+production-padding checks found alternative-token probability differences up to
+0.086. A provisional 0.065 bound failed; the 0.10 bound above records this
+remaining limitation rather than claiming close agreement for every candidate.
+The workload has 128 sampled tokens across two publications and two temperatures;
+passing it does not establish parity for arbitrary rollout lengths or checkpoints.
+
+The final preset run on 2026-10-23 passed all eight integration/operation tests.
+The table gives the worst result across the four rollout batches:
+
+| Attention implementation | Max sampled log-probability error | Max batch mean error | False clipping |
+| --- | ---: | ---: | ---: |
+| XLA / Tokamax XLA | 0.189 | 0.0259 | 0% |
+| cuDNN / Tokamax cuDNN | 0.293 | 0.0287 | 3.125% |
+| Tokamax Triton | 0.189 | 0.0248 | 0% |
+| Tokamax chunked XLA | 0.194 | 0.0191 | 0% |
+
+Tokamax/Triton's largest alternative-token probability error was 0.073 and its
+sampled approximate KL peaked at 0.00129. vLLM's own full-transcript replay
+had up to 0.201 sampled log-probability error relative to its generation scores.
+All five compiled-operation comparisons were exact for the tested inputs;
+the 88 Qwen3 and GRPO update regression tests also passed on GPU.
+
+Environment experiments loaded `nvida.env`, including `JAX_OPTIMIZATION_LEVEL=O1`,
+90% preallocation, and the persistent compilation/autotuning caches. Fixed-rollout
+replays and compiled HLO inspection showed sensitivity to GEMM selection and
+fusion. Disabling `--xla_gpu_enable_triton_gemm` reduced the largest candidate
+probability error in the integration run from 0.073 to 0.063, but increased
+chunked-XLA's worst mean sampled log-probability error from 0.019 to 0.031, failing
+its bound. It is not enabled in the preset. Independent vLLM server runs also
+varied, so these integration differences cannot all be attributed to `O1`.
+The model explicitly requests highest matmul precision; the preset's commented
+TF32 option is not a BF16 parity fix.
 
 ## GPU translation review
 

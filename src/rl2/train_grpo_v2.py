@@ -102,7 +102,7 @@ from rl2.alfworld_env import ALFWorldConfig, ALFWorldTask, load_alfworld_tasks
 from rl2.appworld_env import AppWorldConfig, AppWorldTask, load_appworld_tasks
 from rl2.configuration import BaseConfig, load_config
 from rl2.mlflow_logging import MLflowLogger
-from rl2.qwen3 import AttentionBackend, Parameters, Qwen3LM, load_qwen3_checkpoint
+from rl2.qwen3 import DEFAULT_ATTENTION_BACKEND, AttentionBackend, Parameters, Qwen3LM, load_qwen3_checkpoint
 from rl2.ray_timeline import record_timeline
 from rl2.tracing import flush_tracing, span, tracing_enabled
 
@@ -121,6 +121,7 @@ class Config(BaseConfig):
     seed: Annotated[int, Field(ge=0)] = 1
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4
+    drop_degenerate_groups: bool = False
     total_iterations: Annotated[int | None, Field(ge=1)] = None
     checkpoint_interval: Annotated[int, Field(gt=0)] = 100
     max_tokens: Annotated[int, Field(ge=1)] = 512  # Total transcript tokens, including system, prompt, and tools.
@@ -135,7 +136,7 @@ class Config(BaseConfig):
     update_epochs: Annotated[int, Field(ge=1)] = 1
     minibatches_per_epoch: Annotated[int, Field(ge=1)] = 4
     grad_accum_steps: Annotated[int, Field(ge=1)] = 1
-    attention_backend: AttentionBackend = "tokamax"
+    attention_backend: AttentionBackend = DEFAULT_ATTENTION_BACKEND
     scan_layers: bool = True
     gradient_checkpointing: bool = True
     enable_ray_dashboard: bool = False
@@ -247,6 +248,10 @@ class RolloutGroup:
     prompt: str  # Shared task prompt.
     rollouts: list[Rollout]  # Independent attempts at the same task, in sampling order, scored as one group.
 
+    @property
+    def is_degenerate(self) -> bool:
+        return all(rollout.reward == self.rollouts[0].reward for rollout in self.rollouts)
+
 
 @dataclass(frozen=True)
 class Transfer[T]:
@@ -306,9 +311,7 @@ def build_rollout_batch(
             "charts/reward_std": pstdev(rewards),
             "charts/reward_min": min(rewards),
             "charts/reward_max": max(rewards),
-            "charts/degenerate_group_fraction": mean(
-                all(rollout.reward == group.rollouts[0].reward for rollout in group.rollouts) for group in groups
-            ),
+            "charts/degenerate_group_fraction": mean(group.is_degenerate for group in groups),
             "charts/turns_mean": mean(rollout.num_turns for rollout in rollouts),
             "charts/input_tokens_mean": mean(rollout.num_input_tokens for rollout in rollouts),
             "charts/output_tokens_mean": mean(rollout.num_output_tokens for rollout in rollouts),
@@ -434,7 +437,7 @@ def score_group(task: Task, rollouts: list[Rollout]) -> RolloutGroup:
 async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]:
     tokenizer = await asyncio.to_thread(AutoTokenizer.from_pretrained, config.model)
     async with AsyncOpenAI(
-        base_url=f"{SERVER_URL}/v1", api_key="EMPTY", timeout=config.rollout_timeout, max_retries=0
+        base_url=f"{SERVER_URL}/v1", api_key="EMPTY", timeout=config.rollout_timeout, max_retries=3
     ) as client:
         models = await client.models.list()
         model = next(model for model in models.data if model.id == config.model)
@@ -569,10 +572,12 @@ class Batcher:
         started = time.monotonic()
 
         async def fetch_group() -> tuple[RolloutGroup, float]:
-            result = await self.actor.fetch_next_group.remote(group_size=group_size)
-            received_at = time.monotonic()
-            seconds = received_at - result.ready_at
-            return result.value, seconds
+            while True:
+                result = await self.actor.fetch_next_group.remote(group_size=group_size)
+                received_at = time.monotonic()
+                seconds = received_at - result.ready_at
+                if not self.config.drop_degenerate_groups or not result.value.is_degenerate:
+                    return result.value, seconds
 
         # Timestamp each arrival before waiting for slower groups.
         async with asyncio.TaskGroup() as pending:

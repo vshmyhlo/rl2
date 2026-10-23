@@ -30,7 +30,7 @@ def checkpoint_source() -> Path:
 
 @pytest.fixture(scope="module")
 def checkpoint(checkpoint_source: Path) -> tuple[Qwen3LM, Variables]:
-    return load_qwen3_checkpoint(str(checkpoint_source), dtype="float32")
+    return load_qwen3_checkpoint(str(checkpoint_source), dtype="float32", attention_backend="xla")
 
 
 @pytest.fixture(scope="module")

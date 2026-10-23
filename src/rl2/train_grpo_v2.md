@@ -94,7 +94,11 @@ rewards for infrastructure failures.
 The actor samples `group_size` independent attempts at the same task. Advantages
 are `(reward - group_mean) / (population_std + 1e-4)`; equal-reward groups have
 zero advantages. The batcher gathers `num_groups` concurrently and preserves
-request order. It pads complete transcripts to `padding_multiple` (default 256),
+request order. Set `drop_degenerate_groups: true` (default false) to discard
+equal-reward groups and sample replacement tasks until all `num_groups` slots
+contain non-degenerate groups. There is no retry limit; collection can continue
+indefinitely if every group is degenerate. Batch metrics describe retained groups.
+It pads complete transcripts to `padding_multiple` (default 256),
 capped at the model context length. Oversized transcripts are rejected.
 
 GRPO uses a clipped importance-ratio objective, averaged over sampled tokens
@@ -102,7 +106,9 @@ within each rollout and then across rollouts. There is no reference-policy KL
 penalty. Model computation uses BF16; master parameters, optimizer state,
 gradients, log probabilities, and loss use FP32. Learner `attention_backend`
 accepts `tokamax` (default), `xla`, or `cudnn`; `scan_layers` and
-`gradient_checkpointing` default to true. Temperature is restricted to `[0.01, 2.0]`; vLLM returns
+`gradient_checkpointing` default to true. These defaults match the standalone
+Qwen3 model and the [BF16 publication parity suite](../../docs/qwen3.md#bf16-parity-with-the-grpo-v2-vllm-server).
+Temperature is restricted to `[0.01, 2.0]`; vLLM returns
 `processed_logprobs` with neutral top-p/top-k sampling, matching the learner.
 
 Each iteration makes `update_epochs` passes with `minibatches_per_epoch` optimizer

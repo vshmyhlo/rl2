@@ -44,14 +44,24 @@ def spans(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
         yield exporter
 
 
+def test_numerical_presets() -> None:
+    defaults = training.Config()
+    for preset in (Path(__file__).resolve().parents[1] / "configs/grpo_v2").glob("*.yaml"):
+        values = yaml.safe_load(preset.read_text())
+        for name in ("attention_backend", "padding_multiple", "scan_layers", "gradient_checkpointing"):
+            assert values[name] == getattr(defaults, name), (preset.name, name)
+
+
 def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     defaults = training.Config()
     assert defaults.minibatches_per_epoch == 4
     assert defaults.grad_accum_steps == 1
+    assert not defaults.drop_degenerate_groups
     assert defaults.update_epochs == 1
     assert defaults.checkpoint_interval == 100
     assert defaults.padding_multiple == 256
-    assert defaults.attention_backend == "tokamax"
+    assert defaults.attention_backend == training.Qwen3LM().attention_backend == "tokamax"
+    assert training.Qwen3LM().dtype == "bfloat16"
     assert defaults.scan_layers
     assert defaults.gradient_checkpointing
     assert not defaults.enable_ray_dashboard
@@ -60,7 +70,10 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert defaults.weight_update_pause_mode == "wait"
     preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/alfworld.yaml"
     config = training.load_config(preset, training.Config)
-    assert config.run_id == f"grpo_v2_alfworld_Qwen_Qwen3-0.6B_seed{config.seed}"
+    assert config.drop_degenerate_groups
+    assert config.run_id == (
+        f"grpo_v2_alfworld_Qwen_Qwen3-0.6B_seed{config.seed}_drop_degenerate_groups{config.drop_degenerate_groups}"
+    )
     assert config.ckpt_dir == f"/runs/grpo_v2/{config.run_id}"
     assert config.total_iterations is None
     assert config.minibatches_per_epoch == 4
@@ -85,6 +98,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
                 "enable_ray_timeline": True,
                 "enable_tracing": False,
                 "padding_multiple": 64,
+                "drop_degenerate_groups": False,
             }
         )
     )
@@ -104,6 +118,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
             enable_ray_timeline=True,
             enable_tracing=False,
             padding_multiple=64,
+            drop_degenerate_groups=False,
         )
     )
     assert pickle.loads(pickle.dumps(config)) == config
@@ -591,6 +606,38 @@ def test_learner_pulls_groups_through_batcher(
     assert all(call.kwargs == {"group_size": 3} for call in actor.fetch_next_group.remote.call_args_list)
 
 
+@pytest.mark.parametrize("drop_degenerate_groups", [False, True])
+def test_batch_refills_degenerate_groups(drop_degenerate_groups: bool, rollout: training.Rollout) -> None:
+    groups = [
+        training.score_group(Mock(id=str(index)), [replace(rollout, reward=reward) for reward in rewards])
+        for index, rewards in enumerate(((0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0)))
+    ]
+    actor = Mock()
+    actor.fetch_next_group.remote = AsyncMock(
+        side_effect=[training.Transfer(value=group, ready_at=training.time.monotonic()) for group in groups]
+    )
+    batcher = training.Batcher.__ray_metadata__.modified_class(
+        actor=actor, config=training.Config(drop_degenerate_groups=drop_degenerate_groups)
+    )
+
+    result = asyncio.run(batcher.fetch_next_batch(num_groups=2, group_size=2, context_length=8))
+
+    batch = result.value
+    expected_groups = groups[2:] if drop_degenerate_groups else groups[:2]
+    assert actor.fetch_next_group.remote.await_count == (4 if drop_degenerate_groups else 2)
+    assert all(call.kwargs == {"group_size": 2} for call in actor.fetch_next_group.remote.call_args_list)
+    assert batch.training_batch.token_ids.shape == (4, 8)
+    assert batch.training_batch.advantages.shape == (4,)
+    np.testing.assert_allclose(
+        batch.training_batch.advantages,
+        [rollout.advantage for group in expected_groups for rollout in group.rollouts],
+    )
+    assert batch.examples == training.format_rollout_examples(expected_groups)
+    assert batch.rollout_metrics["charts/degenerate_group_fraction"] == (0.0 if drop_degenerate_groups else 1.0)
+    assert batch.num_output_tokens == 4
+    assert batch.stop_counts == {"agent_completed": 4}
+
+
 def test_batch_requires_groups() -> None:
     actor = Mock()
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor)
@@ -599,7 +646,8 @@ def test_batch_requires_groups() -> None:
     actor.fetch_next_group.remote.assert_not_called()
 
 
-def test_batch_failure_cancels_pending_fetches() -> None:
+@pytest.mark.parametrize("drop_degenerate_groups", [False, True])
+def test_batch_failure_cancels_pending_fetches(drop_degenerate_groups: bool, rollout: training.Rollout) -> None:
     started = asyncio.Event()
     cleaned_up = asyncio.Event()
     requested = 0
@@ -607,7 +655,12 @@ def test_batch_failure_cancels_pending_fetches() -> None:
     async def fetch_group(group_size: int) -> training.Transfer[training.RolloutGroup]:
         nonlocal requested
         requested += 1
-        if requested == 1:
+        if drop_degenerate_groups and requested == 1:
+            return training.Transfer(
+                value=training.RolloutGroup(task_id="degenerate", prompt="test", rollouts=[rollout] * 2),
+                ready_at=training.time.monotonic(),
+            )
+        if requested == 1 + drop_degenerate_groups:
             await started.wait()
             raise RuntimeError("rollout failed")
         started.set()
@@ -618,7 +671,9 @@ def test_batch_failure_cancels_pending_fetches() -> None:
 
     actor = Mock()
     actor.fetch_next_group.remote.side_effect = fetch_group
-    batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor)
+    batcher = training.Batcher.__ray_metadata__.modified_class(
+        actor=actor, config=training.Config(drop_degenerate_groups=drop_degenerate_groups)
+    )
     batcher.prepare_batch = Mock()
 
     async def collect() -> None:
@@ -632,7 +687,7 @@ def test_batch_failure_cancels_pending_fetches() -> None:
             assert cleaned_up.is_set()
 
     asyncio.run(collect())
-    assert requested == 2
+    assert requested == 2 + drop_degenerate_groups
     batcher.prepare_batch.assert_not_called()
 
 
@@ -1536,6 +1591,6 @@ def test_create_agent_config_and_cleanup(fails: bool, monkeypatch: pytest.Monkey
         asyncio.run(run())
     load.assert_called_once_with(config.model)
     factory.assert_called_once_with(
-        base_url=f"{training.SERVER_URL}/v1", api_key="EMPTY", timeout=config.rollout_timeout, max_retries=0
+        base_url=f"{training.SERVER_URL}/v1", api_key="EMPTY", timeout=config.rollout_timeout, max_retries=3
     )
     assert client.is_closed()
