@@ -30,7 +30,8 @@ The environment’s async `reset()` returns a `ResetResult` containing `tools`,
 and at least one valid step available. The prompt includes the initial observation.
 Its async `step(action)` returns a `StepResult` containing the observation, per-step
 reward, and done flag. The rollout return sums all step rewards, including both
-intermediate and terminal rewards.
+intermediate and terminal rewards. Tool responses contain only the observation
+text; rewards and done flags remain internal to the rollout loop.
 `ALFWorldTask.init_env()` owns worker startup and cleanup; ALFWorld
 validates its own tool arguments. The agent loop has no ALFWorld imports.
 
@@ -39,7 +40,7 @@ Each rollout owns one ALFWorld Ray actor, reserving one CPU, and follows this lo
 1. Reset the selected game and give the model the action-tool schemas, instructions, goal, starting observation, and admissible commands.
 2. Sample a response through `AsyncOpenAI.completions.create()` against vLLM's `/v1/completions` endpoint.
 3. Parse Qwen3 `<tool_call>` JSON blocks and dispatch the calls to the ALFWorld worker.
-4. Append JSON results in `<tool_response>` blocks and repeat until done or a limit is reached.
+4. Append observation text in `<tool_response>` blocks and repeat until done or a limit is reached.
 
 The tools match the original ALFWorld interface: `look`, `go_to`, `take`, `move`,
 `open_container`, `close_container`, `clean`, `heat`, `cool`, `use`, `examine`, and
@@ -57,8 +58,10 @@ Environment calls await Ray object references; tokenization runs in threads.
 The transcript is append-only, using Qwen3 message boundaries. Sampled history,
 including thinking and end-of-turn tokens, is never re-tokenized. Every sampled
 token has its original log probability and a true loss mask. Prompts,
-observations, and inserted boundaries have a false mask. Final tool results
-appear in example logs even when they were never sent back to the model.
+observations, and inserted boundaries have a false mask. Example logs decode the
+full token sequence from the beginning, preserving system instructions, tool
+schemas, observations, thinking, and special tokens. Tool results that were
+never appended to the model context are excluded.
 
 Reward is ALFWorld's `won` value. Stops are `alfworld_done`, `max_turns`,
 `max_tokens`, `context_length`, or `agent_completed`. A truncated model response

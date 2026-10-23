@@ -557,7 +557,7 @@ def test_learner_pulls_groups_through_batcher(
         assert not hasattr(batch, "groups")
         assert batch.stop_counts == {"agent_completed": num_groups * 3}
         assert batch.num_output_tokens == num_groups * 3
-        assert batch.examples.count("Full interaction (special tokens preserved):") == 3
+        assert batch.examples.count("Full token sequence (special tokens preserved):") == 3
         assert batch.training_batch.token_ids.shape == (num_groups * 3, 8)
         np.testing.assert_array_equal(batch.training_batch.advantages, 0.5)
     batcher_handle.fetch_next_batch.remote.assert_called_once_with(
@@ -993,7 +993,11 @@ def test_learner_logs_examples_every_ten_steps(
         reward=1.0,
         advantage=0.5,
         completion='<think>Use add.</think>\n<tool_call>{"name": "add"}</tool_call>',
-        interaction='<|im_start|>assistant\n<think>Use add.</think>\n<tool_call>{"name": "add"}</tool_call><|im_end|>',
+        interaction=(
+            "<|im_start|>system\nUse tools.<|im_end|>\n"
+            "<|im_start|>user\nAdd:\n1 + 2<|im_end|>\n"
+            '<|im_start|>assistant\n<think>Use add.</think>\n<tool_call>{"name": "add"}</tool_call><|im_end|>'
+        ),
         num_turns=1,
         num_input_tokens=1,
         num_output_tokens=1,
@@ -1043,15 +1047,18 @@ def test_learner_logs_examples_every_ten_steps(
         assert text.startswith(f"Rollout examples | step {step}\n\n{'=' * 72}\n")
         assert "Example 1 | task=task-1 | reward=1.000 | advantage=0.500" in text
         assert "Turns: 1 | Output tokens: 1 | Stop: max_turns" in text
-        assert "Prompt:\n    Add:\n    1 + 2" in text
+        assert "Prompt:" not in text
         assert (
-            "Full interaction (special tokens preserved):\n<|im_start|>assistant\n"
+            "Full token sequence (special tokens preserved):\n"
+            "<|im_start|>system\nUse tools.<|im_end|>\n"
+            "<|im_start|>user\nAdd:\n1 + 2<|im_end|>\n"
+            "<|im_start|>assistant\n"
             '<think>Use add.</think>\n<tool_call>{"name": "add"}</tool_call><|im_end|>'
         ) in text
         assert "Example 3 | task=None" in text
-        assert "Full interaction (special tokens preserved):\n(empty)" in text
+        assert "Full token sequence (special tokens preserved):\n(empty)" in text
         assert text.count("reward=1.000") == 3
-        assert text.count("Token IDs:\n[1, 2]") == 3
+        assert "Token IDs:" not in text
         assert "Example 4" not in text and "omitted" not in text
 
 

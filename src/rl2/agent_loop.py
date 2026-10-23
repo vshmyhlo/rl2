@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
@@ -72,7 +72,7 @@ class Rollout:
     reward: float
     advantage: float
     completion: str
-    interaction: str
+    interaction: str  # Full decoded sequence.token_ids, with special tokens preserved.
     num_turns: int
     num_input_tokens: int
     num_output_tokens: int
@@ -203,7 +203,7 @@ class Agent:
                                 continue
                         reward += result.reward
                         done = result.done
-                        pending.append(json.dumps(asdict(result)))
+                        pending.append(result.observation)
                         if done:
                             break
                 if done:
@@ -230,8 +230,6 @@ class Agent:
             interaction = await asyncio.to_thread(
                 self.tokenizer.decode, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
             )
-            if pending:
-                interaction += "\n\nTool results without model tokens:\n" + "\n".join(pending)
             return Rollout(
                 sequence=TrainingSequence(
                     token_ids=np.asarray(token_ids, dtype=np.int32),  # (T,)

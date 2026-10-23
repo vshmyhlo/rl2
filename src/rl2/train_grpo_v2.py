@@ -72,7 +72,6 @@ from functools import partial
 from itertools import islice
 from pathlib import Path
 from statistics import mean, pstdev
-from textwrap import indent
 from typing import Annotated, Any, Literal, NamedTuple
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -242,7 +241,7 @@ def restore_checkpoint(
 @dataclass(frozen=True)
 class RolloutGroup:
     task_id: str | None  # Source task ID shared by the group; None if the task has no ID.
-    prompt: str  # Shared task prompt for sample logging.
+    prompt: str  # Shared task prompt.
     rollouts: list[Rollout]  # Independent attempts at the same task, in sampling order, scored as one group.
 
 
@@ -253,7 +252,7 @@ class Transfer[T]:
 
 
 def format_rollout_examples(groups: list[RolloutGroup]) -> str:
-    """Format up to three complete interactions from the batch in sampling order."""
+    """Format up to three full decoded token sequences in sampling order."""
     sections: list[str] = []
     examples = islice(((group, rollout) for group in groups for rollout in group.rollouts), 3)
     for index, (group, rollout) in enumerate(examples, start=1):
@@ -263,9 +262,7 @@ def format_rollout_examples(groups: list[RolloutGroup]) -> str:
             f"advantage={rollout.advantage:.3f}\n"
             f"Turns: {rollout.num_turns} | Output tokens: {rollout.num_output_tokens} | "
             f"Stop: {rollout.stop_condition}\n\n"
-            f"Prompt:\n{indent(group.prompt or '(empty)', '    ')}\n\n"
-            f"Full interaction (special tokens preserved):\n{rollout.interaction or '(empty)'}\n\n"
-            f"Token IDs:\n{rollout.sequence.token_ids.tolist()}"
+            f"Full token sequence (special tokens preserved):\n{rollout.interaction or '(empty)'}"
         )
     return "\n\n".join(sections)
 

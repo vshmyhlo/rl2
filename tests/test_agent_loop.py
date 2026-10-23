@@ -2,7 +2,7 @@ import asyncio
 import json
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -171,13 +171,19 @@ def test_multiturn_exact_training_sequence(
     tool_context = tokenizer.decode(second["prompt"][len(prefix) :])
     assert tool_context.startswith("\n<|im_start|>user\n<tool_response>\n")
     assert tool_context.endswith("\n</tool_response><|im_end|>\n<|im_start|>assistant\n")
-    assert '"reward": -0.25' in tokenizer.decode(second["prompt"])
+    assert tool_context == (
+        "\n<|im_start|>user\n<tool_response>\nAt shelf\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+    )
     assert rollout.reward == 0.75 and rollout.stop_condition == "environment_done"
     assert rollout.num_turns == 2
     assert rollout.num_output_tokens == sum(map(len, sampled))
     assert rollout.num_input_tokens == len(expected_ids) - rollout.num_output_tokens
     assert rollout.completion == replies[-1].removesuffix("<|im_end|>")
-    assert "Task complete" in rollout.interaction
+    assert rollout.interaction == tokenizer.decode(
+        expected_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+    )
+    assert rollout.interaction.startswith("<|im_start|>system\n" + environment.reset.return_value.system_prompt)
+    assert "Task complete" not in rollout.interaction
     assert {key: value for key, value in first.items() if key not in {"model", "prompt"}} == {
         "max_tokens": 8192 - len(first["prompt"]),
         "temperature": 0.7,
@@ -221,9 +227,10 @@ def test_return_sums_steps_within_turn(
     assert rollout.reward == 0.25
     assert rollout.stop_condition == ("environment_done" if terminal else "max_turns")
     assert environment.step.await_count == 3
-    assert "Invalid action" in rollout.interaction
-    assert '"reward": 0.5' in rollout.interaction
-    assert '"reward": -0.25' in rollout.interaction
+    assert rollout.interaction.endswith(reply)
+    assert "Invalid action" not in rollout.interaction
+    assert '"reward": 0.5' not in rollout.interaction
+    assert '"reward": -0.25' not in rollout.interaction
 
 
 def test_total_token_budget_across_turns(
@@ -330,6 +337,9 @@ def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, envir
         if boundary in {"max_tokens", "context_generation"}:
             assert requests[0]["max_tokens"] == 1
         assert len(rollout.sequence.token_ids) <= 8192
+        assert rollout.interaction == tokenizer.decode(
+            rollout.sequence.token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+        )
     environment.__aenter__.assert_awaited_once()
     environment.__aexit__.assert_awaited_once()
 
@@ -478,7 +488,7 @@ def test_tool_response_renderer(
     tokenizer.eos_token = eos_token
     calls = [ToolCall(name="look", arguments={}), ToolCall(name="inventory", arguments={})]
     results = [
-        StepResult(observation="A shelf", reward=0.0, done=False),
+        StepResult(observation='A shelf\nWith a "mug" and a café sign.', reward=0.0, done=False),
         StepResult(observation="A mug", reward=0.0, done=False),
     ]
     environment.step.side_effect = results
@@ -503,7 +513,7 @@ def test_tool_response_renderer(
             return await make_agent(tokenizer, client).run(env=env)
 
     rollout = asyncio.run(run())
-    tool_messages = [{"role": "tool", "content": json.dumps(asdict(result))} for result in results]
+    tool_messages = [{"role": "tool", "content": result.observation} for result in results]
     expected = tokenizer.apply_chat_template(
         messages + [assistant] + tool_messages,
         tools=tool_schemas(),
@@ -622,8 +632,8 @@ def test_tool_dispatch(mode: str, tokenizer: PreTrainedTokenizerFast, environmen
         assert '<tool_response>\n{"error":' in tokenizer.decode(requests[1]["prompt"])
     if mode == "multiple":
         assert [call.args[0].name for call in environment.step.await_args_list] == ["look", "inventory"]
-        assert '"observation": "At shelf.' in rollout.interaction
-        assert '"observation": "Task complete"' in rollout.interaction
+        assert "At shelf." not in rollout.interaction
+        assert "Task complete" not in rollout.interaction
 
 
 @pytest.mark.parametrize("mode", ["success", "setup_error", "setup_timeout", "step_error", "cancel"])
@@ -703,7 +713,7 @@ def test_generic_task_environment_lifetime(mode: str, tokenizer: PreTrainedToken
     if mode == "success":
         result = asyncio.run(run())
         assert result.reward == 0.5 and result.stop_condition == "environment_done"
-        assert "Counted two" in result.interaction
+        assert "Counted two" not in result.interaction
         assert result.prompt == "Count two."
     else:
         error = {"cancel": asyncio.CancelledError, "setup_timeout": TimeoutError}.get(mode, RuntimeError)
