@@ -1,4 +1,11 @@
-"""Task and environment contracts for the tool-calling agent loop."""
+"""Task and environment contracts for the tool-calling agent loop.
+
+Reset starts an active episode with no reward and at least one valid step available.
+Adapters must assert that upstream reset rewards are absent or zero and terminal
+flags are absent or false. Rewards and termination are reported only by step().
+Each step reports its own reward; the episode return is the sum of step rewards,
+whether rewards arrive throughout the episode or only at termination.
+"""
 
 from abc import ABC, abstractmethod
 from contextlib import AbstractAsyncContextManager
@@ -42,18 +49,27 @@ class ToolCallError(ValueError):
 
 
 @dataclass(frozen=True)
-class EpisodeResult:
+class StepResult:
+    """Outcome of one step; reward is for this step, not a cumulative score."""
+
     observation: str
     reward: float
     done: bool
 
 
+@dataclass(frozen=True)
+class ResetResult:
+    tools: list[ToolSchema]
+    system_prompt: str
+    prompt: str
+
+
 class Environment(ABC):
     @abstractmethod
-    async def reset(self) -> EpisodeResult: ...
+    async def reset(self, *, timeout: float | None = None) -> ResetResult: ...
 
     @abstractmethod
-    async def step(self, action: ToolCall) -> EpisodeResult: ...
+    async def step(self, action: ToolCall, *, timeout: float | None = None) -> StepResult: ...
 
 
 class Task(ABC):
@@ -65,17 +81,5 @@ class Task(ABC):
     @abstractmethod
     def name(self) -> str: ...
 
-    @property
     @abstractmethod
-    def system_prompt(self) -> str: ...
-
-    @property
-    @abstractmethod
-    def prompt(self) -> str: ...
-
-    @property
-    @abstractmethod
-    def tools(self) -> list[ToolSchema]: ...
-
-    @abstractmethod
-    def init_env(self, *, max_steps: int, timeout: float) -> AbstractAsyncContextManager[Environment]: ...
+    def init_env(self) -> AbstractAsyncContextManager[Environment]: ...

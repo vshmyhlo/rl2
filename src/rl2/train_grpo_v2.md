@@ -23,22 +23,27 @@ The batcher runs on CPU. The actor and batcher use NumPy arrays and keep
 ## Interaction
 
 Tasks and environments inherit the `Task` and `Environment` abstract base classes in `agent_task.py`.
-A task supplies its prompts, tool schemas, and an async `init_env()` context
-manager. Environments expose async `reset()` and `step(action)` methods.
+A task supplies its identity and an async `init_env()` context manager. The training
+caller opens the environment within the rollout timeout and passes it to `Agent.run(env)`.
+The environment’s async `reset()` returns a `ResetResult` containing `tools`,
+`system_prompt`, and `prompt`. Reset must start an active episode with no reward
+and at least one valid step available. The prompt includes the initial observation.
+Its async `step(action)` returns a `StepResult` containing the observation, per-step
+reward, and done flag. The rollout return sums all step rewards, including both
+intermediate and terminal rewards.
 `ALFWorldTask.init_env()` owns worker startup and cleanup; ALFWorld
 validates its own tool arguments. The agent loop has no ALFWorld imports.
 
 Each rollout owns one ALFWorld Ray actor, reserving one CPU, and follows this loop:
 
-1. Reset the selected game and give the model the action-tool schemas and instruction to call `look`.
+1. Reset the selected game and give the model the action-tool schemas, instructions, goal, starting observation, and admissible commands.
 2. Sample a response through `AsyncOpenAI.completions.create()` against vLLM's `/v1/completions` endpoint.
 3. Parse Qwen3 `<tool_call>` JSON blocks and dispatch the calls to the ALFWorld worker.
 4. Append JSON results in `<tool_response>` blocks and repeat until done or a limit is reached.
 
 The tools match the original ALFWorld interface: `look`, `go_to`, `take`, `move`,
 `open_container`, `close_container`, `clean`, `heat`, `cool`, `use`, `examine`, and
-`inventory`. The first `look` returns the goal, starting observation, and admissible
-commands without advancing the game; later calls execute `look`. `move` selects
+`inventory`. Every `look` executes the game command. `move` selects
 the supported placement grammar from the current admissible commands.
 
 Thinking is enabled, and tool calls inside thinking are ignored. The model is

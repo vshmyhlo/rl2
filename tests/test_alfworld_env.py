@@ -169,12 +169,29 @@ def test_worker_reset_step_and_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
         task=env.ALFWorldTask(id="train/a", config_file="config.yaml")
     )
     with closing(worker):
-        rewards = [worker.reset().reward]
-        rewards.extend(worker.step(env.ToolCall(name="look", arguments={})).reward for _ in range(2))
+        initial = worker.reset()
+        assert initial.prompt == "Goal"
+        assert initial.tools == env.tool_schemas()
+        assert initial.system_prompt.startswith("Use one action tool per turn.")
+        result = worker.step(env.ToolCall(name="look", arguments={}))
     constructor.assert_called_once_with(config_file="config.yaml", task_id="train/a")
-    assert rewards == [0.0, 0.0, 1.0]
+    assert result == env.StepResult(observation="Success", reward=1.0, done=True)
     environment.step.assert_called_once_with("look")
     environment.close.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("reward", "done", "message"),
+    [(1.0, False, "must not award a reward"), (0.0, True, "must allow at least one step")],
+    ids=["reward-on-reset", "terminal-reset"],
+)
+def test_reset_rejects_reward_or_terminal_state(reward: float, done: bool, message: str) -> None:
+    environment = Mock()
+    environment.reset.return_value = env.StepResult(observation="Goal", reward=reward, done=done)
+    tools = env.ALFWorldTools(environment=environment)
+    with pytest.raises(AssertionError, match=message):
+        tools.reset()
+    environment.step.assert_not_called()
 
 
 def test_session_startup_failure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -204,13 +221,18 @@ def test_session_pending_result_keeps_loop_responsive(method: str, monkeypatch: 
     async def run() -> None:
         loop = asyncio.get_running_loop()
         started = asyncio.Event()
-        result = loop.create_future()
-        result.set_result(env.StepResult(observation="ready", reward=0.0, done=False))
+        results = {
+            "reset": env.ResetResult(tools=env.tool_schemas(), system_prompt="Use tools.", prompt="ready"),
+            "step": env.StepResult(observation="stepped", reward=0.0, done=False),
+            "close": None,
+        }
         pending = loop.create_future()
-        for name in ("reset", "step", "close"):
+        for name, value in results.items():
+            result = loop.create_future()
+            result.set_result(value)
             getattr(actor, name).remote = Mock(return_value=result)
 
-        def submit(*args: object) -> asyncio.Future[env.StepResult]:
+        def submit(*args: object) -> asyncio.Future[env.ResetResult | env.StepResult | None]:
             started.set()
             return pending
 
@@ -220,17 +242,15 @@ def test_session_pending_result_keeps_loop_responsive(method: str, monkeypatch: 
         async def use_session() -> None:
             async with task.init_env() as session:
                 initial = await session.reset()
-                assert initial.observation == "ready"
-                assert initial.reward == 0.0 and not initial.done
-                assert task.system_prompt.startswith("Use one action tool per turn.")
-                assert task.prompt.startswith("Call look to read your goal and surroundings")
-                assert task.tools == env.tool_schemas()
+                assert initial.prompt == "ready"
+                assert initial.system_prompt == "Use tools."
+                assert initial.tools == env.tool_schemas()
                 await session.step(env.ToolCall(name="look", arguments={}))
 
         async with asyncio.TaskGroup() as group:
             group.create_task(use_session())
             await asyncio.wait_for(started.wait(), timeout=5)
-            pending.set_result(result.result())
+            pending.set_result(results[method])
 
     asyncio.run(run())
     kill.assert_called_once_with(actor)
@@ -246,12 +266,12 @@ def test_session_actor_cleanup(mode: str, monkeypatch: pytest.MonkeyPatch) -> No
     task = env.ALFWorldTask(id=mode, config_file="unused")
 
     async def run() -> None:
-        async def reset() -> env.StepResult:
+        async def reset() -> env.ResetResult:
             if mode == "crash":
                 raise RuntimeError("worker failed")
             if mode == "reset_timeout":
                 await asyncio.Future()
-            return env.StepResult(observation="ready", reward=0.0, done=False)
+            return env.ResetResult(tools=env.tool_schemas(), system_prompt="Use tools.", prompt="ready")
 
         async def step(action: env.ToolCall) -> env.StepResult:
             assert action == env.ToolCall(name="look", arguments={})
@@ -271,8 +291,8 @@ def test_session_actor_cleanup(mode: str, monkeypatch: pytest.MonkeyPatch) -> No
         actor.step.remote = AsyncMock(side_effect=step)
         actor.close.remote = AsyncMock(side_effect=close)
         async with task.init_env() as session:
-            result = await session.reset(timeout=0 if mode == "reset_timeout" else None)
-            assert result.observation == "ready"
+            initial = await session.reset(timeout=0 if mode == "reset_timeout" else None)
+            assert initial.prompt == "ready"
             result = await session.step(
                 env.ToolCall(name="look", arguments={}), timeout=0 if mode == "step_timeout" else None
             )
@@ -326,9 +346,8 @@ def test_tool_commands(name: str, arguments: dict[str, str], command: str) -> No
     environment.reset.return_value = initial
     environment.step.return_value = initial
     tools = env.ALFWorldTools(environment=environment)
-    assert tools.reset() == initial
-    assert tools.call(env.ToolCall(name="look", arguments={})) == initial
-    environment.step.assert_not_called()
+    reset = tools.reset()
+    assert reset.prompt == initial.observation
     tools.call(env.ToolCall(name=name, arguments=arguments))
     environment.step.assert_called_once_with(command)
     schemas = {schema["function"]["name"]: schema["function"] for schema in env.tool_schemas()}
@@ -351,7 +370,7 @@ def test_tool_commands(name: str, arguments: dict[str, str], command: str) -> No
 
 
 @pytest.mark.parametrize("command", ["put mug 1 in/on desk 1", "put mug 1 into desk 1", "put mug 1 in desk 1"])
-def test_placement_aliases_and_terminal_state(command: str) -> None:
+def test_placement_aliases(command: str) -> None:
     environment = Mock(commands=[command])
     environment.reset.return_value = env.StepResult(observation="Goal", reward=0.0, done=False)
     environment.step.return_value = env.StepResult(observation="Done", reward=1.0, done=True)
@@ -359,8 +378,20 @@ def test_placement_aliases_and_terminal_state(command: str) -> None:
     tools.reset()
     result = tools.call(env.ToolCall(name="move", arguments={"object": "mug 1", "location": "desk 1"}))
     assert result.done and result.reward == 1.0
-    assert tools.call(env.ToolCall(name="look", arguments={})) == result
     environment.step.assert_called_once_with(command)
+
+
+def test_tool_calls_do_not_replay_terminal_result() -> None:
+    environment = Mock(commands=["look"])
+    environment.reset.return_value = env.StepResult(observation="Goal", reward=0.0, done=False)
+    terminal = env.StepResult(observation="Done", reward=1.0, done=True)
+    environment.step.side_effect = [terminal, RuntimeError("Episode finished")]
+    tools = env.ALFWorldTools(environment=environment)
+    tools.reset()
+    assert tools.call(env.ToolCall(name="look", arguments={})) == terminal
+    with pytest.raises(RuntimeError, match="Episode finished"):
+        tools.call(env.ToolCall(name="look", arguments={}))
+    assert environment.step.call_count == 2
 
 
 def test_tools_do_not_limit_steps() -> None:
@@ -372,7 +403,7 @@ def test_tools_do_not_limit_steps() -> None:
     assert not tools.call(env.ToolCall(name="look", arguments={})).done
     for _ in range(3):
         assert tools.call(env.ToolCall(name="look", arguments={})) == initial
-    assert environment.step.call_count == 3
+    assert environment.step.call_count == 4
     environment.step.assert_called_with("look")
     tools.reset()
     assert not tools.call(env.ToolCall(name="look", arguments={})).done

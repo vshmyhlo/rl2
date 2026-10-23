@@ -421,7 +421,7 @@ def score_group(task: Task, rollouts: list[Rollout]) -> RolloutGroup:
     reward_mean, reward_std = mean(rewards), pstdev(rewards)
     return RolloutGroup(
         task_id=f"{task.name}:{task.id}",
-        prompt=task.prompt,
+        prompt=rollouts[0].prompt,
         rollouts=[
             replace(rollout, advantage=(rollout.reward - reward_mean) / (reward_std + 1e-4)) for rollout in rollouts
         ],
@@ -837,9 +837,7 @@ class Actor:
         self._runs: set[asyncio.Task[Rollout]] = set()
         self._closed = False
         self._weights_valid = True
-        self.tasks: list[ALFWorldTask] = load_alfworld_tasks(
-            config.taskset, config.max_turns, config.environment_timeout
-        )
+        self.tasks: list[ALFWorldTask] = load_alfworld_tasks(config.taskset, config.environment_timeout)
         logger.info("Starting actor and vLLM on its assigned GPU")
         with self._server as resources:
             server = resources.enter_context(serve_vllm(model=config.model))
@@ -873,11 +871,15 @@ class Actor:
     def set_sampling_state(self, state: dict[str, Any]) -> None:
         self.rng.setstate((state["version"], tuple(state["state"]), state["gauss_next"]))
 
+    async def fetch_next_task(self) -> Task:
+        task = self.rng.choice(self.tasks)
+        logger.debug("Selected task %s", task.id)
+        return task
+
     async def fetch_next_group(self, group_size: int) -> Transfer[RolloutGroup]:
         if not self._weights_valid:
             raise RuntimeError("Cannot generate during or after a failed weight update")
-        task = self.rng.choice(self.tasks)
-        logger.debug("Selected task %s", task.id)
+        task = await self.fetch_next_task()
         group = await self.collect_group(task, group_size=group_size)
         return Transfer(value=group, ready_at=time.monotonic())
 
@@ -925,7 +927,8 @@ class Actor:
 
                     async def run_rollout(index: int) -> Rollout:
                         with span("actor.rollout", {**span_data, "rollout_index": index}) as rollout_span:
-                            result = await agent.run(task)
+                            async with asyncio.timeout(self.config.rollout_timeout), task.init_env() as env:
+                                result = await agent.run(env=env)
                             rollout_span.set_attribute("stop_condition", result.stop_condition)
                             return result
 

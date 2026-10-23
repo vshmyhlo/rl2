@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
-from contextlib import AsyncExitStack, ExitStack, asynccontextmanager
-from dataclasses import dataclass, field, replace
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, closing
+from dataclasses import dataclass, field
 from os.path import expandvars
 from pathlib import Path
 from types import TracebackType
@@ -16,7 +16,7 @@ from pydantic import ConfigDict, TypeAdapter, ValidationError
 from pydantic.dataclasses import dataclass as config_dataclass
 from ray.actor import ActorHandle
 
-from rl2.agent_task import Environment, EpisodeResult, Task, ToolCall, ToolCallError, ToolSchema
+from rl2.agent_task import Environment, ResetResult, StepResult, Task, ToolCall, ToolCallError, ToolSchema
 
 
 @config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -25,7 +25,7 @@ class ALFWorldConfig:
     id: Literal["alfworld"] = "alfworld"
 
 
-def load_environment_config(config_file: str, max_steps: int) -> dict[str, Any]:
+def load_environment_config(config_file: str) -> dict[str, Any]:
     config_path = Path(config_file).expanduser().resolve()
     config = yaml.safe_load(config_path.read_text())
     data_path = Path(expandvars(config["dataset"]["data_path"])).expanduser()
@@ -35,12 +35,13 @@ def load_environment_config(config_file: str, max_steps: int) -> dict[str, Any]:
     config["env"].update(task_types=[1, 2, 3, 4, 5, 6], domain_randomization=False)
     # DQN mode omits expert demonstrations from observations.
     config["general"]["training_method"] = "dqn"
-    config["rl"]["training"]["max_nb_steps_per_episode"] = max_steps
+    # The agent loop owns the rollout budget.
+    config["rl"]["training"]["max_nb_steps_per_episode"] = None
     return config
 
 
-def discover_games(config_file: str, max_steps: int) -> list[str]:
-    config = load_environment_config(config_file, max_steps)
+def discover_games(config_file: str) -> list[str]:
+    config = load_environment_config(config_file)
     return sorted(AlfredTWEnv(config, train_eval="train").game_files)
 
 
@@ -48,8 +49,8 @@ discover_games_remote = ray.remote(max_retries=0)(discover_games)
 
 
 class ALFWorld:
-    def __init__(self, config_file: str, max_steps: int, task_id: str) -> None:
-        config = load_environment_config(config_file, max_steps)
+    def __init__(self, config_file: str, task_id: str) -> None:
+        config = load_environment_config(config_file)
         game = Path(task_id).resolve()
         if not game.is_relative_to(config["dataset"]["data_path"]):
             raise ValueError("ALFWorld task is outside the training split")
@@ -62,22 +63,22 @@ class ALFWorld:
         self.loader.num_games = 1
         self.resources = ExitStack()
 
-    def observe(self, observation: str, info: dict[str, Any], done: bool = False) -> EpisodeResult:
+    def observe(self, observation: str, info: dict[str, Any], done: bool = False) -> StepResult:
         self.commands = info["admissible_commands"][0]
-        return EpisodeResult(
+        won = bool(info["won"][0])
+        return StepResult(
             observation=observation + "\nAdmissible commands: " + ", ".join(self.commands),
-            reward=float(info["won"][0]),
-            done=done or bool(info["won"][0]),
+            reward=float(won),
+            done=done or won,
         )
 
-    def reset(self) -> EpisodeResult:
+    def reset(self) -> StepResult:
         self.resources.close()
-        self.env = self.loader.init_env(batch_size=1)
-        self.resources.callback(self.env.close)
+        self.env = self.resources.enter_context(closing(self.loader.init_env(batch_size=1)))
         observations, info = self.env.reset()
         return self.observe(observations[0], info)
 
-    def step(self, action: str) -> EpisodeResult:
+    def step(self, action: str) -> StepResult:
         observations, _, dones, info = self.env.step([action.strip()])
         return self.observe(observations[0], info, bool(dones[0]))
 
@@ -94,7 +95,7 @@ class ActionTool:
 
 ACTION_TOOLS = {
     "look": ActionTool(
-        description="Read the goal and starting observation first; later, look around your current location.",
+        description="Look around your current location.",
         parameters=(),
         commands=("look",),
     ),
@@ -193,30 +194,23 @@ def validate_tool_call(call: ToolCall) -> None:
 
 
 class ALFWorldTools:
-    def __init__(self, environment: ALFWorld, max_steps: int) -> None:
+    def __init__(self, environment: ALFWorld) -> None:
         self.environment = environment
-        self.max_steps = max_steps
 
-    def reset(self) -> EpisodeResult:
-        self.current = self.environment.reset()
-        self.started = False
-        self.steps = 0
-        return self.current
+    def reset(self) -> ResetResult:
+        initial = self.environment.reset()
+        assert initial.reward == 0.0, "ALFWorld reset must not award a reward"
+        assert not initial.done, "ALFWorld reset must allow at least one step"
+        return ResetResult(
+            tools=tool_schemas(),
+            system_prompt="Use one action tool per turn. Use the exact object and location names, including IDs.",
+            prompt=initial.observation,
+        )
 
-    def call(self, call: ToolCall) -> EpisodeResult:
-        if self.current.done:
-            return self.current
-        if call.name == "look" and not self.started:
-            self.started = True
-            return self.current
-        self.started = True
+    def call(self, call: ToolCall) -> StepResult:
         commands = [command.format(**call.arguments) for command in ACTION_TOOLS[call.name].commands]
         command = next((command for command in commands if command in self.environment.commands), commands[0])
-        self.current = self.environment.step(command)
-        self.steps += 1
-        if self.steps >= self.max_steps:
-            self.current = replace(self.current, done=True)
-        return self.current
+        return self.environment.step(command)
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,27 +218,17 @@ class ALFWorldTask(Task):
     id: str = field()  # A required slot overrides the abstract property.
     config_file: str
     name: ClassVar[str] = "alfworld"
-    system_prompt: ClassVar[str] = (
-        "Use one action tool per turn. Use the exact object and location names, including IDs."
-    )
-    prompt: ClassVar[str] = (
-        "Call look to read your goal and surroundings, then use the action tools to complete the task."
-    )
-
-    @property
-    def tools(self) -> list[ToolSchema]:
-        return tool_schemas()
 
     @asynccontextmanager
-    async def init_env(self, *, max_steps: int, timeout: float) -> AsyncGenerator[ALFWorldSession]:
-        async with ALFWorldSession(task=self, max_steps=max_steps, timeout=timeout) as environment:
+    async def init_env(self) -> AsyncGenerator[ALFWorldSession]:
+        async with ALFWorldSession(task=self) as environment:
             yield environment
 
 
-def load_alfworld_tasks(config: ALFWorldConfig, max_steps: int, timeout: float) -> list[ALFWorldTask]:
+def load_alfworld_tasks(config: ALFWorldConfig, timeout: float) -> list[ALFWorldTask]:
     config_file = str(Path(config.config_file).expanduser().resolve())
     with ExitStack() as resources:
-        pending = discover_games_remote.remote(config_file, max_steps)
+        pending = discover_games_remote.remote(config_file)
         resources.callback(ray.cancel, pending, force=True)
         ids = ray.get(pending, timeout=timeout)
     if not ids or any(not task_id for task_id in ids) or len(ids) != len(set(ids)):
@@ -254,14 +238,14 @@ def load_alfworld_tasks(config: ALFWorldConfig, max_steps: int, timeout: float) 
 
 @ray.remote(num_cpus=1)
 class ALFWorldWorker:
-    def __init__(self, task: ALFWorldTask, max_steps: int) -> None:
-        self.environment = ALFWorld(config_file=task.config_file, max_steps=max_steps, task_id=task.id)
-        self.tools = ALFWorldTools(environment=self.environment, max_steps=max_steps)
+    def __init__(self, task: ALFWorldTask) -> None:
+        self.environment = ALFWorld(config_file=task.config_file, task_id=task.id)
+        self.tools = ALFWorldTools(environment=self.environment)
 
-    def reset(self) -> EpisodeResult:
+    def reset(self) -> ResetResult:
         return self.tools.reset()
 
-    def step(self, action: ToolCall) -> EpisodeResult:
+    def step(self, action: ToolCall) -> StepResult:
         return self.tools.call(action)
 
     def close(self) -> None:
@@ -274,22 +258,20 @@ class ALFWorldWorker:
 class ALFWorldSession(Environment):
     """One Ray actor per rollout, with asynchronous requests and bounded cleanup."""
 
-    def __init__(self, task: ALFWorldTask, max_steps: int, timeout: float) -> None:
+    def __init__(self, task: ALFWorldTask) -> None:
         self.task = task
-        self.max_steps = max_steps
-        self.timeout = timeout
 
     async def __aenter__(self) -> Self:
-        self.actor: ActorHandle = ALFWorldWorker.remote(task=self.task, max_steps=self.max_steps)
+        self.actor: ActorHandle = ALFWorldWorker.remote(task=self.task)
         return self
 
-    async def reset(self) -> EpisodeResult:
-        async with asyncio.timeout(self.timeout):
+    async def reset(self, *, timeout: float | None = None) -> ResetResult:
+        async with asyncio.timeout(timeout):
             return await self.actor.reset.remote()
 
-    async def step(self, action: ToolCall) -> EpisodeResult:
+    async def step(self, action: ToolCall, *, timeout: float | None = None) -> StepResult:
         validate_tool_call(action)
-        async with asyncio.timeout(self.timeout):
+        async with asyncio.timeout(timeout):
             return await self.actor.step.remote(action)
 
     async def __aexit__(

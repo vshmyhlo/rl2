@@ -14,7 +14,7 @@ from openai.types import CompletionChoice
 from pydantic import TypeAdapter
 from transformers import PreTrainedTokenizerBase
 
-from rl2.agent_task import Task, ToolCall, ToolCallError
+from rl2.agent_task import Environment, ToolCall, ToolCallError
 from rl2.tracing import span
 
 StopCondition = Literal[
@@ -68,6 +68,7 @@ class TrainingSequence:
 @dataclass(frozen=True)
 class Rollout:
     sequence: TrainingSequence
+    prompt: str
     reward: float
     advantage: float
     completion: str
@@ -107,22 +108,24 @@ class Agent:
     max_turns: int
     temperature: float
     rollout_timeout: float
-    environment_timeout: float
+    environment_timeout: float | None = None
 
-    async def run(self, task: Task) -> Rollout:
+    async def run(self, env: Environment) -> Rollout:
         started = time.monotonic()
         token_limit = min(self.max_tokens, self.context_length)
         limit_condition: StopCondition = "max_tokens" if self.max_tokens < self.context_length else "context_length"
-        async with (
-            asyncio.timeout(self.rollout_timeout),
-            task.init_env(max_steps=self.max_turns, timeout=self.environment_timeout) as environment,
-        ):
+        async with asyncio.timeout(self.rollout_timeout):
             with span("actor.rollout.reset"):
-                result = await environment.reset()
+                initial = await env.reset(timeout=self.environment_timeout)
+            reward = 0.0
+            done = False
             token_ids = await asyncio.to_thread(
                 self.tokenizer.apply_chat_template,
-                [{"role": "system", "content": task.system_prompt}, {"role": "user", "content": task.prompt}],
-                tools=task.tools,
+                [
+                    {"role": "system", "content": initial.system_prompt},
+                    {"role": "user", "content": initial.prompt},
+                ],
+                tools=initial.tools,
                 tokenize=True,
                 return_dict=False,
                 add_generation_prompt=True,
@@ -140,9 +143,6 @@ class Agent:
             stop_condition: StopCondition = "max_turns"
             pending: list[str] = []
             for _ in range(self.max_turns):
-                if result.done:
-                    stop_condition = "environment_done"
-                    break
                 remaining = token_limit - len(token_ids)
                 if remaining <= 0:
                     stop_condition = limit_condition
@@ -197,14 +197,16 @@ class Agent:
                     for call in calls:
                         with span("actor.rollout.step", {"tool": call.name}):
                             try:
-                                result = await environment.step(call)
+                                result = await env.step(call, timeout=self.environment_timeout)
                             except ToolCallError as error:
                                 pending.append(json.dumps({"error": str(error)}))
                                 continue
+                        reward += result.reward
+                        done = result.done
                         pending.append(json.dumps(asdict(result)))
-                        if result.done:
+                        if done:
                             break
-                if result.done:
+                if done:
                     stop_condition = "environment_done"
                     break
                 if num_turns == self.max_turns:
@@ -235,7 +237,8 @@ class Agent:
                     loss_mask=np.asarray(loss_mask, dtype=np.bool_),  # (T,)
                     old_log_probs=np.asarray(log_probs, dtype=np.float32),  # (T,)
                 ),
-                reward=result.reward,
+                prompt=initial.prompt,
+                reward=reward,
                 advantage=0.0,
                 completion=completion,
                 interaction=interaction,

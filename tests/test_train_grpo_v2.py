@@ -30,7 +30,7 @@ from pydantic import ValidationError
 from ray import cloudpickle
 
 from rl2 import train_grpo_v2 as training
-from rl2.agent_task import Task
+from rl2.agent_task import Environment
 
 
 @pytest.fixture
@@ -302,9 +302,12 @@ def task_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def actor(monkeypatch: pytest.MonkeyPatch) -> Any:
-    monkeypatch.setattr(
-        training.ALFWorldTask, "init_env", Mock(side_effect=AssertionError("Agent owns environment setup"))
-    )
+    def init_env() -> AsyncMock:
+        environment = AsyncMock()
+        environment.__aenter__.return_value = environment
+        return environment
+
+    monkeypatch.setattr(training.ALFWorldTask, "init_env", Mock(side_effect=init_env))
     monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
     monkeypatch.setattr(training, "wait_for_server", Mock())
     actor = training.Actor.__ray_metadata__.modified_class()
@@ -370,9 +373,13 @@ def test_actor_reuses_agent(actor: Any, rollout: training.Rollout, monkeypatch: 
     agent.__aenter__.assert_awaited_once()
     agent.__aexit__.assert_awaited_once()
     assert agent.run.await_count == 6
-    assert [call.args[0] for call in agent.run.await_args_list].count(actor.tasks[0]) == 4
-    assert [call.args[0] for call in agent.run.await_args_list].count(actor.tasks[1]) == 2
-    training.ALFWorldTask.init_env.assert_not_called()
+    assert training.ALFWorldTask.init_env.call_count == 6
+    environments = [call.kwargs["env"] for call in agent.run.await_args_list]
+    assert len({id(env) for env in environments}) == 6
+    for call, env in zip(agent.run.await_args_list, environments, strict=True):
+        assert call.kwargs == {"env": env}
+        env.__aenter__.assert_awaited_once()
+        env.__aexit__.assert_awaited_once()
 
 
 def test_actor_retries_agent_startup(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -399,7 +406,7 @@ def test_actor_close_cancels_rollouts(actor: Any, monkeypatch: pytest.MonkeyPatc
     started = asyncio.Event()
     active = 0
 
-    async def run(task: Task) -> training.Rollout:
+    async def run(env: Environment) -> training.Rollout:
         nonlocal active
         active += 1
         if active == 2:
@@ -1349,7 +1356,7 @@ def test_batcher_collects_groups_concurrently(
     env = AsyncMock()
     env.__aenter__.return_value = env
 
-    async def run(task: Task) -> training.Rollout:
+    async def run(env: Environment) -> training.Rollout:
         nonlocal started
         before = otel_trace.get_current_span().get_span_context()
         started += 1
@@ -1406,7 +1413,7 @@ def test_group_cancels_pending_rollouts(
     cancelled: list[bool] = []
     count = 0
 
-    async def run(task: Task) -> training.Rollout:
+    async def run(env: Environment) -> training.Rollout:
         nonlocal count
         count += 1
         if count == 1:
