@@ -97,6 +97,7 @@ def test_actor_sampling_state_resumes_task_sequence(progress: training.TrainingP
     actor.rng = random.Random(99)
     actor.tasks = [training.ALFWorldTask(id=str(i), config_file="config.yaml") for i in range(5)]
     actor._weights_valid = True
+    actor._weight_lock = asyncio.Lock()
     actor.collect_group = AsyncMock(return_value=Mock(spec=training.RolloutGroup))
     actor.set_sampling_state(json.loads(json.dumps(progress.sampling_state)))
     for _ in range(8):

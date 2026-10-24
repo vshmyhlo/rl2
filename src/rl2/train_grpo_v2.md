@@ -91,14 +91,21 @@ rewards for infrastructure failures.
 
 ## Training and resuming
 
-The actor samples `group_size` independent attempts at the same task. Advantages
-are `(reward - group_mean) / (population_std + 1e-4)`; equal-reward groups have
-zero advantages. The batcher gathers `num_groups` concurrently and preserves
-request order. Set `drop_degenerate_groups: true` (default false) to discard
-equal-reward groups and sample replacement tasks until all `num_groups` slots
+The actor samples `group_size` independent attempts at the same task. Set
+`length_penalty_coef` (default `0.0`, nonnegative) to subtract a reward cost per
+sampled token across all turns, including thinking and end-of-turn tokens:
+`training_reward = reward - length_penalty_coef * num_output_tokens`.
+Advantages are `(training_reward - group_mean) / (population_std + 1e-4)`;
+groups with equal adjusted rewards have zero advantages. The batcher gathers
+`num_groups` concurrently and preserves request order. Set
+`drop_degenerate_groups: true` (default false) to discard groups with equal
+adjusted rewards and sample replacement tasks until all `num_groups` slots
 contain non-degenerate groups. There is no retry limit; collection can continue
 indefinitely if every group is degenerate. Batch metrics describe retained groups.
-It pads complete transcripts to `padding_multiple` (default 256),
+`charts/reward_*` reports raw task rewards; `charts/training_reward_*` reports
+adjusted rewards. Within groups with equal task rewards, normalization can amplify even
+a small length penalty into substantial advantages favoring shorter rollouts.
+The batcher pads complete transcripts to `padding_multiple` (default 256),
 capped at the model context length. Oversized transcripts are rejected.
 
 GRPO uses a clipped importance-ratio objective, averaged over sampled tokens

@@ -20,7 +20,11 @@ Rollout batch scalars:
     charts/reward_std: Population standard deviation of raw rollout rewards.
     charts/reward_min: Minimum raw rollout reward.
     charts/reward_max: Maximum raw rollout reward.
-    charts/degenerate_group_fraction: Fraction of groups with identical rewards and zero advantages.
+    charts/training_reward_mean: Mean rollout reward after the length penalty.
+    charts/training_reward_std: Population standard deviation of adjusted rollout rewards.
+    charts/training_reward_min: Minimum adjusted rollout reward.
+    charts/training_reward_max: Maximum adjusted rollout reward.
+    charts/degenerate_group_fraction: Fraction of groups with identical adjusted rewards and zero advantages.
     charts/stop_condition_fraction/<label>: Fraction of batch rollouts with each StopCondition.
     charts/turns_mean: Mean model responses per rollout.
     charts/input_tokens_mean: Mean context tokens appended per rollout, excluding sampled tokens.
@@ -122,6 +126,7 @@ class Config(BaseConfig):
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4
     drop_degenerate_groups: bool = False
+    length_penalty_coef: Annotated[float, Field(ge=0)] = 0.0  # Reward cost per sampled token across all turns.
     total_iterations: Annotated[int | None, Field(ge=1)] = None
     checkpoint_interval: Annotated[int, Field(gt=0)] = 100
     max_tokens: Annotated[int, Field(ge=1)] = 512  # Total transcript tokens, including system, prompt, and tools.
@@ -245,12 +250,17 @@ def restore_checkpoint(
 @dataclass(frozen=True)
 class RolloutGroup:
     task_id: str | None  # Source task ID shared by the group; None if the task has no ID.
-    prompt: str  # Shared task prompt.
     rollouts: list[Rollout]  # Independent attempts at the same task, in sampling order, scored as one group.
+    length_penalty_coef: float = 0.0
+
+    @property
+    def training_rewards(self) -> list[float]:
+        return [rollout.reward - self.length_penalty_coef * rollout.num_output_tokens for rollout in self.rollouts]
 
     @property
     def is_degenerate(self) -> bool:
-        return all(rollout.reward == self.rollouts[0].reward for rollout in self.rollouts)
+        rewards = self.training_rewards
+        return all(reward == rewards[0] for reward in rewards)
 
 
 @dataclass(frozen=True)
@@ -304,6 +314,7 @@ def build_rollout_batch(
     """Keep only training arrays and the summaries used by learner logging."""
     rollouts = [rollout for group in groups for rollout in group.rollouts]
     rewards = [rollout.reward for rollout in rollouts]
+    training_rewards = [reward for group in groups for reward in group.training_rewards]
     return RolloutBatch(
         training_batch=training_batch,
         rollout_metrics={
@@ -311,6 +322,10 @@ def build_rollout_batch(
             "charts/reward_std": pstdev(rewards),
             "charts/reward_min": min(rewards),
             "charts/reward_max": max(rewards),
+            "charts/training_reward_mean": mean(training_rewards),
+            "charts/training_reward_std": pstdev(training_rewards),
+            "charts/training_reward_min": min(training_rewards),
+            "charts/training_reward_max": max(training_rewards),
             "charts/degenerate_group_fraction": mean(group.is_degenerate for group in groups),
             "charts/turns_mean": mean(rollout.num_turns for rollout in rollouts),
             "charts/input_tokens_mean": mean(rollout.num_input_tokens for rollout in rollouts),
@@ -419,16 +434,21 @@ def update(
     return state.apply_gradients(grads=gradients), metrics
 
 
-def score_group(task: Task, rollouts: list[Rollout]) -> RolloutGroup:
+def score_group(task: Task, rollouts: list[Rollout], length_penalty_coef: float = 0.0) -> RolloutGroup:
     if len(rollouts) < 2:
         raise ValueError("A rollout group needs at least two rollouts")
-    rewards = [rollout.reward for rollout in rollouts]
-    reward_mean, reward_std = mean(rewards), pstdev(rewards)
-    return RolloutGroup(
+    group = RolloutGroup(
         task_id=f"{task.name}:{task.id}",
-        prompt=rollouts[0].prompt,
+        rollouts=rollouts,
+        length_penalty_coef=length_penalty_coef,
+    )
+    rewards = group.training_rewards
+    reward_mean, reward_std = mean(rewards), pstdev(rewards)
+    return replace(
+        group,
         rollouts=[
-            replace(rollout, advantage=(rollout.reward - reward_mean) / (reward_std + 1e-4)) for rollout in rollouts
+            replace(rollout, advantage=(reward - reward_mean) / (reward_std + 1e-4))
+            for rollout, reward in zip(rollouts, rewards, strict=True)
         ],
     )
 
@@ -927,7 +947,9 @@ class Actor:
                     for run in runs:
                         run.add_done_callback(self._runs.discard)
                 with span("actor.score_group"):
-                    group = score_group(task, [run.result() for run in runs])
+                    group = score_group(
+                        task, [run.result() for run in runs], length_penalty_coef=self.config.length_penalty_coef
+                    )
         except Exception:
             logger.exception(
                 "Group failed: task=%s group_size=%s elapsed=%.2fs",

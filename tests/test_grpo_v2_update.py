@@ -47,7 +47,6 @@ def groups() -> list[training.RolloutGroup]:
     return [
         training.RolloutGroup(
             task_id="0",
-            prompt="test",
             rollouts=[
                 rollout([1, 2, 3, 4, 5], [False, True, False, True, True], 1.0),
                 rollout([1, 2, 6], [False, False, True], -1.0),
@@ -103,7 +102,7 @@ def test_prepare_batch_bucket_boundaries(
         actor=Mock(), config=training.Config(padding_multiple=multiple, max_tokens=max_tokens)
     )
     sample = rollout([1] * length, [False] + [True] * (length - 1), 1.0)
-    groups = [training.RolloutGroup(task_id="0", prompt="test", rollouts=[sample])]
+    groups = [training.RolloutGroup(task_id="0", rollouts=[sample])]
     batch = batcher.prepare_batch(groups, context_length=context_length)  # (B=1, T=width), (B,) leaves.
     assert all(array.shape == (1, width) for array in batch[:-1])
     assert batch.advantages.shape == (1,)
@@ -114,8 +113,8 @@ def test_prepare_batch_bucket_boundaries(
 
 def test_prepare_minimal_sequences_and_multiple_groups(batcher: Any) -> None:
     groups = [
-        training.RolloutGroup(task_id="0", prompt="test", rollouts=[rollout([0, 2], [False, True], 0.0)]),
-        training.RolloutGroup(task_id="1", prompt="test", rollouts=[rollout([3, 4, 5], [False, True, True], 1.0)]),
+        training.RolloutGroup(task_id="0", rollouts=[rollout([0, 2], [False, True], 0.0)]),
+        training.RolloutGroup(task_id="1", rollouts=[rollout([3, 4, 5], [False, True, True], 1.0)]),
     ]
     batch = batcher.prepare_batch(groups, context_length=8)  # (B=2, T=8), (B,) leaves.
     assert batch.token_ids.shape == (2, 8)
