@@ -291,8 +291,6 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
         pool = stack.enter_context(ThreadPoolExecutor(max_workers=1))
         actor = object.__new__(training.Actor.__ray_metadata__.modified_class)
         actor.config = training.Config()
-        actor._weight_lock = asyncio.Lock()
-        actor._weights_valid = True
         stack.enter_context(patch.object(training, "SERVER_URL", url))
 
         def initialize(info: dict[str, Any]) -> Future[None]:
@@ -324,6 +322,7 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
 
 def test_published_rollout_parity(engine: Engine) -> None:
     model, master = engine.model, engine.params
+    tokens_per_turn = 32 if engine.real else 8
     forwards = {backend: model.clone(attention_backend=backend).apply for backend in ("xla", "cudnn")}
     implementations = ["triton", "cudnn", "xla", "xla_chunked"]
     capability = torch.cuda.get_device_capability()
@@ -362,9 +361,11 @@ def test_published_rollout_parity(engine: Engine) -> None:
         if engine.context_length > 256:
             # Exercise late RoPE positions and the final training padding bucket.
             context = tokenizer.encode("The room contains a table, a chair, and a wooden cabinet. ").ids
-            prefix_length = engine.context_length - 128 - len(prompts[-1])
+            reserved = max(128, 2 * tokens_per_turn + len(observation) + 1)
+            prefix_length = engine.context_length - reserved - len(prompts[-1])
             prompts[-1] = (context * (prefix_length // len(context) + 1))[:prefix_length] + prompts[-1]
     reports: list[dict[str, Any]] = []
+    optimizer_reports: list[dict[str, float]] = []
     previous: dict[str, float] | None = None
     model_id = engine.client.models.list().data[0].id
     # A visible update makes stale prefix-cache entries observable even in the tiny models.
@@ -402,7 +403,7 @@ def test_published_rollout_parity(engine: Engine) -> None:
                 result = engine.client.completions.create(
                     model=model_id,
                     prompt=sequences,
-                    max_tokens=8,
+                    max_tokens=tokens_per_turn,
                     temperature=temperature,
                     top_p=1,
                     logprobs=10 if engine.real else model.config.vocab_size,
@@ -413,7 +414,7 @@ def test_published_rollout_parity(engine: Engine) -> None:
                 for choice in result.choices:
                     row = choice.index
                     ids, log_probs = completion_tokens(choice)
-                    assert len(ids) == 8
+                    assert len(ids) == tokens_per_turn
                     assert choice.logprobs is not None and choice.logprobs.top_logprobs is not None
                     for offset, alternatives in enumerate(choice.logprobs.top_logprobs):
                         if engine.real:
@@ -538,10 +539,14 @@ def test_published_rollout_parity(engine: Engine) -> None:
                     candidate_log_probs=np.asarray(distribution[indices]),  # (candidate count,)
                 )
                 _, metrics = training.objective(actual, batch, clip_coef=0.2)
+                ratios = jnp.exp(selected - jnp.asarray(expected))  # (sampled tokens,)
                 report = {
                     "version": version,
                     "temperature": temperature,
                     "backend": backend,
+                    "sampled_tokens": selected.size,
+                    "ratio_min": float(ratios.min()),
+                    "ratio_max": float(ratios.max()),
                     **errors(selected, expected),
                     "candidates": errors(distribution[indices], expected_candidates),
                     "candidate_probs": errors(jnp.exp(distribution[indices]), np.exp(expected_candidates)),
@@ -564,12 +569,11 @@ def test_published_rollout_parity(engine: Engine) -> None:
             clip_coef=0.2,
         )
         optimizer_report = {name: float(value) for name, value in update_metrics.items()}
+        optimizer_reports.append(optimizer_report)
         (engine.directory / f"optimizer-v{version}.json").write_text(json.dumps(optimizer_report, indent=2))
         print({"optimizer": optimizer_report}, flush=True)
         assert int(state.step) == version + 1
         assert optimizer_report["policy/grad_norm"] > 0
-        assert optimizer_report["policy/approx_kl"] < (0.0025 if engine.real else 0.0001)
-        assert optimizer_report["policy/clip_fraction"] == 0
         for report in reports:
             if (
                 report["backend"] == "tokamax-triton"
@@ -586,6 +590,10 @@ def test_published_rollout_parity(engine: Engine) -> None:
             not np.array_equal(np.asarray(published[name]), np.asarray(value.astype(jnp.bfloat16)))
             for name, value in state.params.items()
         ), "The optimizer update must change the published BF16 policy"
+    # Preserve both publications' diagnostics even when the initial policy fails parity.
+    for report in optimizer_reports:
+        assert report["policy/approx_kl"] < (0.0025 if engine.real else 0.0001), report
+        assert report["policy/clip_fraction"] == 0, report
     checked = [report for report in reports if report["backend"] != "vllm-replay"]
     # BF16 kernels differ even between vLLM prefill and decode. Bound both individual
     # outliers and aggregate policy drift; near-zero alternative probabilities need absolute probability bounds.

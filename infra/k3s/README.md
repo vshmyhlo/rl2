@@ -291,7 +291,7 @@ See [NVIDIA DCGM Exporter documentation](https://docs.nvidia.com/datacenter/dcgm
 
 The monitoring Kustomization also deploys Tempo `3.1.0` and provisions the
 **Tempo** data source in Grafana. It runs as one process with a `10Gi`
-local-path PVC and 48-hour trace retention. This is a single-node development
+local-path PVC and 14-day trace retention. This is a single-node development
 setup; the PVC's requested size is not a hard disk quota.
 
 ```bash

@@ -127,6 +127,10 @@ Transformers installed, run `python tests/qwen3_reference.py`.
 
 ### Parity with the GRPO v2 vLLM server
 
+**BF16 parity is not certified.** The 2026-10-25 revalidation below extends real
+rollouts from eight to 32 tokens per turn and exposes an unchanged-policy ratio
+outside the GRPO clipping range. The earlier passing audit covered shorter decodes.
+
 The learner keeps FP32 master weights and publishes BF16 weights through DLPack
 and packed NCCL. Both models use BF16 transformer computation and **FP32 output
 logits**. `serve_vllm` sets `--hf-overrides '{"head_dtype":"float32"}'`; a separately
@@ -220,12 +224,71 @@ false clipping on some short rollouts. The five operation checks include vLLM's
 actual CUDA-generated RoPE cache at early and near-4,096 positions. Rare CUDA/XLA
 trigonometric cache rounding differences remain, including cancellation near zero.
 
-Final default-configuration validation passed: 90 GPU model/GRPO regression tests,
+The 2026-10-24 default-configuration validation passed: 90 GPU model/GRPO regression tests,
 eight vLLM parity checks with the real 4,096-token case, a separate real 256-token
 case, and four server-command checks. Ruff formatting/checks passed. Raw final
 reports are under `/tmp/qwen3-vllm-final-256` and `/tmp/qwen3-vllm-final-4096` on
 the test host; the rejected batch-invariant trial is under
 `/tmp/qwen3-vllm-invariant-matched-4096`.
+
+#### Longer-decode revalidation (2026-10-25)
+
+The same checkpoint, two A100s, package versions, and `nvida.env` reproduce the
+earlier eight-token results. Extending each real-checkpoint turn to 32 tokens
+exposes a failure at 4,096-token padding. Each temperature/publication now checks
+128 sampled tokens. The acceptance thresholds are unchanged.
+The batch contains two synthetic chat transcripts, not full ALFWorld episodes;
+other prompts, batch sizes, and longer continuations remain unvalidated.
+
+| Publication / temperature | Max sampled log-probability error | Mean error | Approximate KL | Clip fraction |
+| --- | ---: | ---: | ---: | ---: |
+| Initial / 1.0 (ALFWorld default) | 0.143965 | 0.017781 | 0.0004913 | 0% |
+| Initial / 0.7 | 0.267176 | 0.015147 | 0.0006741 | 0.78125% |
+| Updated / 1.0 | 0.123319 | 0.007020 | 0.0001864 | 0% |
+| Updated / 0.7 | 0.205088 | 0.005865 | 0.0002510 | 0% |
+
+The updated publication follows one Adam step at the audit learning rate `1e-4`.
+Its temperature-0.7 maximum also exceeds the existing 0.20 error limit, although
+its ratios remain inside the clipping range. Temperature 1.0 passes the sampled
+bounds for both publications; that is not a guarantee for other rollouts.
+
+At temperature 0.7, the first token of the second turn in the long transcript
+(zero-based position 4,021, `An`) has log probability −0.557769 in vLLM and
+−0.824945 in JAX. The unchanged-policy ratio is **0.765538**, outside `[0.8, 1.2]`.
+One of 128 sampled tokens crosses the clipping boundary; whether the loss clips
+that token also depends on its advantage sign. The largest candidate-probability
+error is 0.134226. A small average KL therefore does not certify every token ratio.
+
+The optimizer reproduces the JAX forward's loss, KL, and clip fraction, and all
+published weight hashes match. The five compiled-operation tests pass, including
+exact RMSNorm and residual RMSNorm outputs on their test inputs. This rules out
+weight-transfer corruption in the audited case; it does not establish exact
+agreement of whole-model BF16 execution.
+
+On the saved failing history, JAX's score changes to −0.635941 with an unpadded
+single-prefix evaluation retaining one logit. vLLM's own full-transcript replay
+at temperature 1.0 differs from its generation scores by up to 0.158666 across
+the two publications. Aggregate values vary between runs; the failing token and
+its 0.267176 discrepancy reproduced in both expanded runs.
+These controls expose execution-shape and prefill/decode sensitivity. Padding JAX
+to 4,096 instead of 4,095 query positions, substituting vLLM's CUDA RoPE table,
+and switching Tokamax's attention exponential to base two each leave out-of-range
+ratios; the latter two increase their frequency. None was adopted as a fix.
+
+A temporary full-FP32 control exhausted GPU memory during JAX CUDA-graph
+instantiation before a comparison completed. It does not establish FP32 parity.
+Production BF16 computation and the ALFWorld configuration remain unchanged.
+The expanded opt-in regression remains failing, not skipped or marked `xfail`;
+it saves both publications' diagnostics before enforcing the numerical bounds.
+Final targeted results: two tiny-model integrations pass and the real-checkpoint
+integration fails; separately, all five operation checks and four server-command
+checks pass. Ruff formatting/checks pass. No full suite or end-to-end training
+was run, and the expanded 256-token real-checkpoint case was not rerun.
+
+Artifacts: `/tmp/rl2-parity-current-4096` (eight-token baseline),
+`/tmp/rl2-parity-extended-4096` (first failing case),
+`/tmp/rl2-parity-final-4096` (both publications), and
+`/tmp/rl2-parity-ablation.json` (fixed-history trials). These are local audit files.
 
 #### Other Tokamax operations
 

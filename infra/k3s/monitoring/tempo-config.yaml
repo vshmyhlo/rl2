@@ -17,7 +17,7 @@ backend_scheduler:
   provider:
     compaction:
       compaction:
-        block_retention: 48h
+        block_retention: 336h
 storage:
   trace:
     backend: local

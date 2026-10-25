@@ -116,6 +116,10 @@ optimizer state, gradients, log probabilities, and loss use FP32. Learner
 `attention_backend` accepts `tokamax` (default), `xla`, or `cudnn`; `scan_layers` and
 `gradient_checkpointing` default to true. These defaults match the standalone
 Qwen3 model and the [publication parity suite](../../docs/qwen3.md#parity-with-the-grpo-v2-vllm-server).
+BF16 parity is approximate: the expanded 4,096-token audit found unchanged-policy
+ratios outside the clipping range at temperature 0.7. See the
+[measured limits](../../docs/qwen3.md#longer-decode-revalidation-2026-10-25);
+passing a short rollout or observing small average KL does not certify all token ratios.
 Temperature is restricted to `[0.01, 2.0]`; vLLM returns
 `processed_logprobs` with neutral top-p/top-k sampling, matching the learner.
 
@@ -129,8 +133,10 @@ batch contains `num_groups` rollout groups. Prefetched rollouts can use older
 weights, and multi-turn rollouts can span weight updates. Set it to 0 to collect
 each batch after publishing the latest weights.
 `weight_update_pause_mode` accepts `wait` (default), `abort`, or `keep`, operating
-on individual generation requests. New groups wait for weight publication;
-in-flight groups follow the selected pause mode.
+on individual generation requests. Groups can start during publication; vLLM
+queues new generation requests until resume and handles in-flight requests
+according to the selected pause mode. Update failures propagate to the learner
+and trigger training cleanup.
 
 `ckpt_dir/checkpoints` stores Orbax checkpoints every `checkpoint_interval`
 iterations and at normal completion, retaining the latest two.

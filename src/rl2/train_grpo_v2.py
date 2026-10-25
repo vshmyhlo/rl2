@@ -1,5 +1,9 @@
 """GRPO training with a JAX learner, vLLM rollouts, and Ray actors.
 
+Rollout generation needs no explicit lock around weight publication: vLLM's
+pause/resume mechanism queues new requests and handles in-flight requests
+according to weight_update_pause_mode.
+
 MLflow's metric step counts completed training iterations: one rollout batch,
 its optimizer updates, and publication of the updated weights. All metrics below
 are logged every iteration except startup scalars and checkpoint timing.
@@ -51,7 +55,7 @@ Timing and throughput (logged every iteration unless noted):
     time/learner/iteration_seconds: Batch fetching, optimization, and weight publication wall time.
     time/checkpoint_seconds: Checkpoint save wall time, including completion of writes; logged on saves.
     time/batcher/actor_to_batcher_seconds: Mean group transfer latency from actor return to batcher receipt.
-    time/learner/batcher_to_learner_seconds: Batch transfer latency from batcher return to learner receipt.
+    time/learner/batcher_to_learner_seconds: Time from batcher return to learner receipt, including prefetch buffering.
 Ray transfer latencies include serialization, transport, deserialization, and
 scheduling, using a shared single-node monotonic clock. Timing intervals overlap
 and should not be summed. Iteration timing and throughput exclude that iteration's
@@ -68,7 +72,7 @@ import random
 import subprocess
 import sys
 import time
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import AsyncGenerator, Generator
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
@@ -125,6 +129,7 @@ class Config(BaseConfig):
     seed: Annotated[int, Field(ge=0)] = 1
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4
+    prefetch_batches: Annotated[int, Field(ge=0)] = 1  # Batches generated ahead of the learner; 0 disables prefetch.
     drop_degenerate_groups: bool = False
     length_penalty_coef: Annotated[float, Field(ge=0)] = 0.0  # Reward cost per sampled token across all turns.
     total_iterations: Annotated[int | None, Field(ge=1)] = None
@@ -310,6 +315,8 @@ def build_rollout_batch(
     groups: list[RolloutGroup],
     training_batch: GRPOBatch[np.ndarray],  # Leaves: (B, T), except advantages: (B,).
     transfer_metrics: dict[str, float | int],
+    *,
+    include_examples: bool = False,
 ) -> RolloutBatch:
     """Keep only training arrays and the summaries used by learner logging."""
     rollouts = [rollout for group in groups for rollout in group.rollouts]
@@ -334,7 +341,7 @@ def build_rollout_batch(
         },
         stop_counts=Counter(rollout.stop_condition for rollout in rollouts),
         num_output_tokens=sum(rollout.num_output_tokens for rollout in rollouts),
-        examples=format_rollout_examples(groups),
+        examples=format_rollout_examples(groups) if include_examples else "",
         transfer_metrics=transfer_metrics,
     )
 
@@ -370,9 +377,9 @@ def objective(
     def average(values: jax.Array) -> jax.Array:  # (B, T-1) -> ()
         return (jnp.where(mask, values, 0).sum(axis=1) / jnp.maximum(mask.sum(axis=1), 1)).mean()  # ()
 
-    log_ratio = jnp.where(mask, log_probs - jax.lax.stop_gradient(batch.old_log_probs[:, 1:]), 0)  # (B, T-1)
+    log_ratio = jnp.where(mask, log_probs - batch.old_log_probs[:, 1:], 0)  # (B, T-1)
     ratio = jnp.exp(log_ratio)  # (B, T-1)
-    advantages = jax.lax.stop_gradient(batch.advantages[:, None])  # (B, 1)
+    advantages = batch.advantages[:, None]  # (B, 1)
     loss = -average(jnp.minimum(ratio * advantages, jnp.clip(ratio, 1 - clip_coef, 1 + clip_coef) * advantages))  # ()
     return loss, {
         "losses/policy": loss,  # ()
@@ -493,6 +500,8 @@ def serve_vllm(model: str = MODEL) -> Generator[subprocess.Popen[bytes]]:
             "8000",
             "--dtype",
             "bfloat16",
+            "--hf-overrides",
+            '{"head_dtype":"float32"}',
             "--generation-config",
             "vllm",
             "--logprobs-mode",
@@ -586,7 +595,9 @@ class Batcher:
             arrays["attention_mask"][index, :length] = True
         return GRPOBatch(**arrays)  # (B, T), (B,) leaves.
 
-    async def fetch_next_batch(self, num_groups: int, group_size: int, context_length: int) -> Transfer[RolloutBatch]:
+    async def fetch_next_batch(
+        self, num_groups: int, group_size: int, context_length: int, *, include_examples: bool = False
+    ) -> Transfer[RolloutBatch]:
         if num_groups < 1:
             raise ValueError("num_groups must be at least 1")
         started = time.monotonic()
@@ -611,6 +622,7 @@ class Batcher:
         batch = build_rollout_batch(
             groups=groups,
             training_batch=training_batch,
+            include_examples=include_examples,
             transfer_metrics={
                 "time/batcher/fetch_rollout_seconds": fetched - started,
                 "time/batcher/prepare_batch_seconds": prepared - fetched,
@@ -627,6 +639,7 @@ class Learner:
         self.batcher = batcher
         self.actor = actor
         self.shuffle_key = jax.random.key(config.seed)  # () typed base PRNG key.
+        self._pending_batches: deque[ray.ObjectRef] = deque()
 
     def initialize_weight_transfer(self, resources: ExitStack) -> None:
         init_info = {"master_address": "127.0.0.1", "master_port": get_open_port(), "rank_offset": 1, "world_size": 2}
@@ -678,6 +691,7 @@ class Learner:
             writer.log_text(yaml.safe_dump(asdict(self.config)), f"config/{iteration}.yaml")
             logger.info("Learner loaded %s parameter tensors", len(self.state.params))
             self.initialize_weight_transfer(resources=resources)
+            resources.callback(self.cancel_pending_batches)
             self.publish_weights()
             writer.log_metrics(
                 {
@@ -689,6 +703,15 @@ class Learner:
             logger.info("Starting GRPO training loop")
             while self.config.total_iterations is None or iteration < self.config.total_iterations:
                 iteration += 1
+                checkpoint_due = (
+                    iteration % self.config.checkpoint_interval == 0 or iteration == self.config.total_iterations
+                )
+                prefetch_batches = min(
+                    self.config.prefetch_batches,
+                    (-iteration) % self.config.checkpoint_interval,
+                )
+                if self.config.total_iterations is not None:
+                    prefetch_batches = min(prefetch_batches, self.config.total_iterations - iteration)
                 # Each iteration is a separate trace, including its remote calls and child tasks.
                 with span(
                     "train.iteration",
@@ -698,7 +721,10 @@ class Learner:
                     started = time.monotonic()
                     with span("learner.fetch_batch"):
                         batch = self.fetch_next_batch(
-                            num_groups=self.config.num_groups, group_size=self.config.group_size
+                            num_groups=self.config.num_groups,
+                            group_size=self.config.group_size,
+                            iteration=iteration,
+                            prefetch_batches=prefetch_batches,
                         )
                     fetched = time.monotonic()
                     with span("learner.optimize"):
@@ -749,7 +775,7 @@ class Learner:
                         with span("learner.log_examples"):
                             examples = f"Rollout examples | step {iteration}\n\n{batch.examples}"
                             writer.log_text(examples, f"examples/{iteration}.txt")
-                    if iteration % self.config.checkpoint_interval == 0 or iteration == self.config.total_iterations:
+                    if checkpoint_due:
                         with span("learner.checkpoint"):
                             scalars["time/checkpoint_seconds"] = save_checkpoint(
                                 manager,
@@ -766,14 +792,24 @@ class Learner:
                     with span("learner.log_metrics"):
                         writer.log_metrics(scalars, step=iteration)
 
-    def fetch_next_batch(self, num_groups: int, group_size: int) -> RolloutBatch:
-        result = ray.get(
-            self.batcher.fetch_next_batch.remote(
-                num_groups=num_groups,
-                group_size=group_size,
-                context_length=self.model.config.max_position_embeddings,
+    def cancel_pending_batches(self) -> None:
+        while self._pending_batches:
+            ray.cancel(self._pending_batches.popleft(), recursive=True)
+
+    def fetch_next_batch(
+        self, num_groups: int, group_size: int, *, iteration: int, prefetch_batches: int = 0
+    ) -> RolloutBatch:
+        while len(self._pending_batches) < prefetch_batches + 1:
+            self._pending_batches.append(
+                self.batcher.fetch_next_batch.remote(
+                    num_groups=num_groups,
+                    group_size=group_size,
+                    context_length=self.model.config.max_position_embeddings,
+                    include_examples=(iteration + len(self._pending_batches)) % 10 == 0,
+                )
             )
-        )
+        result = ray.get(self._pending_batches[0])
+        self._pending_batches.popleft()
         received_at = time.monotonic()
         seconds = received_at - result.ready_at
         batch = result.value
@@ -847,7 +883,6 @@ class Actor:
         self._agent_lock = asyncio.Lock()
         self._runs: set[asyncio.Task[Rollout]] = set()
         self._closed = False
-        self._weights_valid = True
         self.tasks: list[ALFWorldTask] | list[AppWorldTask] = (
             load_appworld_tasks(config.taskset, config.environment_timeout)
             if isinstance(config.taskset, AppWorldConfig)
@@ -886,13 +921,8 @@ class Actor:
     def set_sampling_state(self, state: dict[str, Any]) -> None:
         self.rng.setstate((state["version"], tuple(state["state"]), state["gauss_next"]))
 
-    async def fetch_next_task(self) -> Task:
-        return self.rng.choice(self.tasks)
-
     async def fetch_next_group(self, group_size: int) -> Transfer[RolloutGroup]:
-        if not self._weights_valid:
-            raise RuntimeError("Cannot generate during or after a failed weight update")
-        task = await self.fetch_next_task()
+        task = self.rng.choice(self.tasks)
         group = await self.collect_group(task, group_size=group_size)
         return Transfer(value=group, ready_at=time.monotonic())
 
@@ -904,7 +934,6 @@ class Actor:
 
     async def update_weights(self, update_info: dict[str, Any]) -> None:
         with span("actor.update_weights"):
-            self._weights_valid = False
             async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:
                 with span("actor.update_weights.pause", {"mode": self.config.weight_update_pause_mode}):
                     response = await client.post(
@@ -923,7 +952,6 @@ class Actor:
                 with span("actor.update_weights.resume"):
                     response = await client.post("/resume")
                     response.raise_for_status()
-            self._weights_valid = True
 
     async def collect_group(self, task: Task, group_size: int) -> RolloutGroup:
         if group_size < 2:
