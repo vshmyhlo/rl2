@@ -246,9 +246,12 @@ def test_token_log_probs_gradients_match_gather(state: TrainState, batch: traini
     np.testing.assert_array_equal(actual[1]["logits"][~batch.loss_mask[:, 1:]], 0)
 
 
+@pytest.mark.parametrize("mixed", [False, True], ids=["nonzero", "zero-first-microbatch"])
 def test_accumulated_update_matches_full_batch_and_improves_policy(
-    state: TrainState, batch: training.GRPOBatch
+    state: TrainState, batch: training.GRPOBatch[jax.Array], mixed: bool
 ) -> None:
+    if mixed:
+        batch = batch._replace(advantages=batch.advantages.at[0].set(0))  # (B, T), (B,) leaves.
     accumulated, metrics = training.update(
         jax.tree.map(jnp.copy, state), batch, grad_accum_steps=2, temperature=0.7, clip_coef=0.2
     )
@@ -262,6 +265,7 @@ def test_accumulated_update_matches_full_batch_and_improves_policy(
     assert all(value.dtype == jnp.float32 for value in accumulated.params.values())
     assert all(value.shape == () for value in metrics.values())
     assert float(metrics["policy/grad_norm"]) > 0.1  # Exercise gradient clipping.
+    assert float(metrics["policy/skipped_update"]) == 0.0
     for name in metrics:
         np.testing.assert_allclose(metrics[name], full_metrics[name], atol=1e-6)
     after = training.token_log_probs(accumulated, accumulated.params, batch, temperature=0.7)  # (B, T-1)
@@ -289,16 +293,28 @@ def test_update_logs_only_new_traces(
     assert caplog.messages == ["JIT trace update: batch_shape=(2, 5) grad_accum_steps=2 temperature=0.7 clip_coef=0.2"]
 
 
-def test_zero_advantages_leave_fresh_optimizer_parameters_unchanged(
-    state: TrainState, batch: training.GRPOBatch
+@pytest.mark.parametrize("has_momentum", [False, True], ids=["fresh", "with-momentum"])
+def test_zero_advantages_preserve_optimizer_state(
+    state: TrainState, batch: training.GRPOBatch[jax.Array], has_momentum: bool
 ) -> None:
-    batch = batch._replace(advantages=jnp.zeros_like(batch.advantages))
+    if has_momentum:
+        state = state.apply_gradients(grads=jax.tree.map(jnp.ones_like, state.params))
+    batch = batch._replace(advantages=jnp.zeros_like(batch.advantages))  # (B, T), (B,) leaves.
     updated, metrics = training.update(
         jax.tree.map(jnp.copy, state), batch, grad_accum_steps=2, temperature=0.7, clip_coef=0.2
     )
     assert float(metrics["policy/grad_norm"]) == float(metrics["losses/policy"]) == 0.0
-    for name in state.params:
-        np.testing.assert_array_equal(updated.params[name], state.params[name])
+    assert all(value.shape == () for value in metrics.values())
+    assert {name: float(value) for name, value in metrics.items()} == {
+        "losses/policy": 0.0,
+        "policy/approx_kl": 0.0,
+        "policy/clip_fraction": 0.0,
+        "policy/grad_norm": 0.0,
+        "policy/skipped_update": 1.0,
+    }
+    for actual, expected in zip(jax.tree.leaves(updated), jax.tree.leaves(state), strict=True):
+        assert actual.shape == expected.shape
+        np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize("grad_accum_steps", [0, 3], ids=["nonpositive", "indivisible"])

@@ -1017,6 +1017,9 @@ def test_learner_logs_rollouts(
         "charts/training_reward_max": 1.0,
         "charts/degenerate_group_fraction": degenerate_fraction,
         "charts/stop_condition_fraction/agent_completed": 0.5,
+        "charts/stop_condition_fraction/environment_done": 0.0,
+        "charts/stop_condition_fraction/max_tokens": 0.0,
+        "charts/stop_condition_fraction/context_length": 0.0,
         "charts/stop_condition_fraction/max_turns": 0.25,
         "charts/stop_condition_fraction/unspecified": 0.25,
         "charts/turns_mean": 2.0,
@@ -1041,6 +1044,8 @@ def test_learner_logs_rollouts(
         assert calls[2].args[0]["charts/degenerate_group_fraction"] == degenerate_fraction
         assert {key: value for key, value in calls[2].args[0].items() if "stop_condition_fraction/" in key} == {
             "charts/stop_condition_fraction/agent_completed": 0.0,
+            "charts/stop_condition_fraction/max_tokens": 0.0,
+            "charts/stop_condition_fraction/context_length": 0.0,
             "charts/stop_condition_fraction/max_turns": 0.0,
             "charts/stop_condition_fraction/unspecified": 0.0,
             "charts/stop_condition_fraction/environment_done": 1.0,

@@ -17,7 +17,9 @@ Optimization scalars (averaged over minibatches and update epochs):
     policy/approx_kl: Mean exp(log_ratio) - 1 - log_ratio, where log_ratio is learner minus sampling log-probability.
     policy/clip_fraction: Fraction of sampled-token probability ratios outside the clip range.
     policy/grad_norm: Global gradient norm after microbatch averaging, before clipping.
+    policy/skipped_update: Fraction of optimizer minibatches skipped because all advantages are zero.
 Loss, KL, and clip fraction average sampled tokens within each rollout, then rollouts.
+Skipped minibatches contribute zero to loss, KL, clip fraction, and gradient norm metrics.
 
 Rollout batch scalars:
     charts/reward_mean: Mean raw rollout reward.
@@ -38,7 +40,7 @@ absent from a later batch.
 
 Training progress and settings:
     charts/total_iterations: Cumulative completed training iterations.
-    charts/total_updates: Cumulative optimizer updates; update_epochs * minibatches_per_epoch per iteration.
+    charts/total_updates: Cumulative optimizer updates, excluding skipped minibatches.
     charts/total_rollouts: Cumulative rollouts used for training.
     charts/learning_rate: Configured optimizer learning rate.
 
@@ -80,7 +82,7 @@ from functools import partial
 from itertools import islice
 from pathlib import Path
 from statistics import mean, pstdev
-from typing import Annotated, Any, Literal, NamedTuple
+from typing import Annotated, Any, Literal, NamedTuple, get_args
 from urllib.error import URLError
 from urllib.request import urlopen
 from uuid import uuid4
@@ -173,7 +175,6 @@ class TrainingProgress:
     iteration: int
     total_rollouts: int
     sampling_state: dict[str, Any]
-    stop_conditions: tuple[StopCondition, ...]
 
 
 def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
@@ -203,7 +204,6 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
                     "iteration": progress.iteration,
                     "total_rollouts": progress.total_rollouts,
                     "sampling_state": progress.sampling_state,
-                    "stop_conditions": progress.stop_conditions,
                 }
             ),
         ),
@@ -226,11 +226,6 @@ def restore_checkpoint(
         raise ValueError("Unsupported GRPO v2 checkpoint")
     if metadata["iteration"] != iteration or iteration < 0 or metadata["total_rollouts"] < 0:
         raise ValueError("Invalid GRPO v2 checkpoint progress")
-    saved_conditions = TypeAdapter(list[str]).validate_python(metadata["stop_conditions"])
-    # Older checkpoints used task-specific completion labels, such as alfworld_done.
-    stop_conditions = TypeAdapter(tuple[StopCondition, ...]).validate_python(
-        ["environment_done" if condition.endswith("_done") else condition for condition in saved_conditions]
-    )
     restored = manager.restore(
         iteration,
         args=ocp.args.Composite(
@@ -248,7 +243,6 @@ def restore_checkpoint(
         iteration=iteration,
         total_rollouts=metadata["total_rollouts"],
         sampling_state=metadata["sampling_state"],
-        stop_conditions=stop_conditions,
     )
 
 
@@ -406,7 +400,7 @@ def update(
     temperature: float,
     clip_coef: float,
 ) -> tuple[TrainState, Metrics]:
-    """Consume state buffers and return the updated state and scalar metrics."""
+    """Consume state buffers, skipping computation and optimizer updates when all advantages are zero."""
     if grad_accum_steps < 1 or batch.token_ids.shape[0] % grad_accum_steps:
         raise ValueError("grad_accum_steps must be positive and divide the minibatch size")
     # Python logging runs on tracing, not on cached executions.
@@ -417,28 +411,42 @@ def update(
         temperature,
         clip_coef,
     )
-    microbatch_size = batch.token_ids.shape[0] // grad_accum_steps
-    microbatches = jax.tree.map(
-        lambda value: value.reshape(grad_accum_steps, microbatch_size, *value.shape[1:]), batch
-    )  # (A, B/A, T); advantages: (A, B/A). A = grad_accum_steps.
 
-    def accumulate(
-        grads: Parameters,
-        microbatch: GRPOBatch[jax.Array],  # (B/A, T), (B/A,) leaves.
-    ) -> tuple[Parameters, Metrics]:
-        def loss_fn(params: Parameters) -> tuple[jax.Array, Metrics]:  # (), scalar metric leaves
-            return objective(token_log_probs(state, params, microbatch, temperature), microbatch, clip_coef)
+    def apply_update() -> tuple[TrainState, Metrics]:
+        microbatch_size = batch.token_ids.shape[0] // grad_accum_steps
+        microbatches = jax.tree.map(
+            lambda value: value.reshape(grad_accum_steps, microbatch_size, *value.shape[1:]), batch
+        )  # (A, B/A, T); advantages: (A, B/A). A = grad_accum_steps.
 
-        (_, metrics), gradient = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-        return jax.tree.map(jnp.add, grads, gradient), metrics  # HF parameter shapes; scalar metrics.
+        def accumulate(
+            grads: Parameters,
+            microbatch: GRPOBatch[jax.Array],  # (B/A, T), (B/A,) leaves.
+        ) -> tuple[Parameters, Metrics]:
+            def loss_fn(params: Parameters) -> tuple[jax.Array, Metrics]:  # (), scalar metric leaves
+                return objective(token_log_probs(state, params, microbatch, temperature), microbatch, clip_coef)
 
-    gradients, metrics = jax.lax.scan(
-        accumulate, jax.tree.map(jnp.zeros_like, state.params), microbatches
-    )  # HF parameter shapes; metric leaves: (A,).
-    gradients = jax.tree.map(lambda value: value / grad_accum_steps, gradients)  # HF parameter shapes.
-    metrics = jax.tree.map(jnp.mean, metrics)  # Scalar leaves.
-    metrics["policy/grad_norm"] = optax.global_norm(gradients)  # () Before clipping.
-    return state.apply_gradients(grads=gradients), metrics
+            (_, metrics), gradient = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+            return jax.tree.map(jnp.add, grads, gradient), metrics  # HF parameter shapes; scalar metrics.
+
+        gradients, metrics = jax.lax.scan(
+            accumulate, jax.tree.map(jnp.zeros_like, state.params), microbatches
+        )  # HF parameter shapes; metric leaves: (A,).
+        gradients = jax.tree.map(lambda value: value / grad_accum_steps, gradients)  # HF parameter shapes.
+        metrics = jax.tree.map(jnp.mean, metrics)  # Scalar leaves.
+        metrics["policy/grad_norm"] = optax.global_norm(gradients)  # () Before clipping.
+        metrics["policy/skipped_update"] = jnp.asarray(0.0, dtype=jnp.float32)  # ()
+        return state.apply_gradients(grads=gradients), metrics
+
+    def skip_update() -> tuple[TrainState, Metrics]:
+        return state, {
+            "losses/policy": jnp.asarray(0.0, dtype=jnp.float32),  # ()
+            "policy/approx_kl": jnp.asarray(0.0, dtype=jnp.float32),  # () Not evaluated.
+            "policy/clip_fraction": jnp.asarray(0.0, dtype=jnp.float32),  # () Not evaluated.
+            "policy/grad_norm": jnp.asarray(0.0, dtype=jnp.float32),  # ()
+            "policy/skipped_update": jnp.asarray(1.0, dtype=jnp.float32),  # ()
+        }
+
+    return jax.lax.cond(jnp.any(batch.advantages != 0), apply_update, skip_update)
 
 
 def score_group(task: Task, rollouts: list[Rollout], length_penalty_coef: float = 0.0) -> RolloutGroup:
@@ -679,13 +687,11 @@ class Learner:
             progress = restore_checkpoint(manager, self.state, self.config)
             iteration = 0
             total_rollouts = 0
-            stop_conditions: set[StopCondition] = set()
             if progress is not None:
                 self.state = progress.train_state
                 self.shuffle_key = progress.shuffle_key  # ()
                 iteration = progress.iteration
                 total_rollouts = progress.total_rollouts
-                stop_conditions.update(progress.stop_conditions)
                 ray.get(self.actor.set_sampling_state.remote(progress.sampling_state))
                 logger.info("Resumed run %s at iteration %s", self.config.run_id, iteration)
             writer.log_text(yaml.safe_dump(asdict(self.config)), f"config/{iteration}.yaml")
@@ -734,7 +740,6 @@ class Learner:
                         self.publish_weights()
                     now = time.monotonic()
                     num_rollouts = batch.training_batch.token_ids.shape[0]
-                    stop_conditions.update(batch.stop_counts)
                     total_rollouts += num_rollouts
                     seconds = max(now - started, 1e-9)
                     scalars = {
@@ -744,7 +749,7 @@ class Learner:
                         **{
                             f"charts/stop_condition_fraction/{condition}": batch.stop_counts.get(condition, 0)
                             / num_rollouts
-                            for condition in sorted(stop_conditions)
+                            for condition in get_args(StopCondition)
                         },
                         "charts/total_iterations": iteration,
                         "charts/total_updates": int(self.state.step),
@@ -785,7 +790,6 @@ class Learner:
                                     iteration=iteration,
                                     total_rollouts=total_rollouts,
                                     sampling_state=ray.get(self.actor.get_sampling_state.remote()),
-                                    stop_conditions=tuple(sorted(stop_conditions)),
                                 ),
                                 self.config,
                             )

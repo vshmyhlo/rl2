@@ -124,7 +124,10 @@ Temperature is restricted to `[0.01, 2.0]`; vLLM returns
 `processed_logprobs` with neutral top-p/top-k sampling, matching the learner.
 
 Each iteration makes `update_epochs` passes with `minibatches_per_epoch` optimizer
-updates per pass. `grad_accum_steps` splits each minibatch into microbatches.
+minibatches per pass. `grad_accum_steps` splits each minibatch into microbatches.
+Minibatches with all-zero advantages skip forward/backward computation and preserve
+parameters, Adam state, and the optimizer step. `policy/skipped_update` reports the
+skipped fraction; skipped minibatches contribute zero to the other optimization metrics.
 `minibatches_per_epoch * grad_accum_steps` must divide `num_groups * group_size`.
 Shuffling uses the saved seed and optimizer step. Initial and updated weights
 are published through vLLM's NCCL weight-transfer backend. `prefetch_batches: N`
