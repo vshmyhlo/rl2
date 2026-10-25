@@ -18,6 +18,7 @@ type Parameters = dict[str, jax.Array]
 type Variables = dict[str, Parameters]
 type LayerKV = tuple[jax.Array, jax.Array]  # Each (B, C, K, H).
 type LayerInputs = tuple[Parameters, LayerKV | None]
+type ResidualState = tuple[jax.Array, jax.Array]  # Each (B, T, D): branch output and stored residual.
 type AttentionBackend = Literal["xla", "tokamax", "cudnn"]
 DEFAULT_ATTENTION_BACKEND: AttentionBackend = "tokamax"
 # B: batch, T: input tokens, S: key slots, C: cache capacity, L: layers,
@@ -129,6 +130,15 @@ def _rms_norm(x: jax.Array, weight: jax.Array, eps: float) -> jax.Array:  # (...
 def _silu(x: jax.Array) -> jax.Array:  # (..., D)
     # Match PyTorch's FP32 internal arithmetic, including its BF16 backward pass.
     return jax.nn.silu(x.astype(jnp.float32)).astype(x.dtype)  # (..., D)
+
+
+def _add_rms_norm(
+    x: jax.Array, residual: jax.Array, weight: jax.Array, eps: float
+) -> tuple[jax.Array, jax.Array]:  # (..., D), (..., D), (D) -> two (..., D)
+    summed = x.astype(jnp.float32) + residual.astype(jnp.float32)  # (..., D)
+    # vLLM normalizes the unrounded sum, but stores a BF16 residual for the next branch.
+    normalized = _rms_norm(summed, _compute_cast(weight, x.dtype), eps).astype(x.dtype)  # (..., D)
+    return normalized, _compute_cast(summed, x.dtype)  # Each (..., D).
 
 
 def _rope(x: jax.Array, positions: jax.Array, theta: float) -> jax.Array:  # (B, T, heads, H), (B, T)
@@ -285,10 +295,15 @@ class Qwen3LM(nn.Module):
             valid[:, None, None, :]
             & (jnp.arange(valid.shape[1])[None, :] <= offset + jnp.arange(width)[:, None])[None, None, :, :]
         )  # (B, 1, T, S)
-        x = params["model.embed_tokens.weight"][tokens].astype(self.dtype)  # (B, T, D)
+        x = _compute_cast(params["model.embed_tokens.weight"][tokens], self.dtype)  # (B, T, D)
+        residual = jnp.zeros_like(x)  # (B, T, D)
 
         def linear(inputs: jax.Array, weight: jax.Array) -> jax.Array:  # (..., in), (out, in)
-            return jnp.matmul(inputs, weight.astype(self.dtype).T, precision=jax.lax.Precision.HIGHEST)  # (..., out)
+            return jnp.matmul(
+                _compute_cast(inputs, self.dtype),
+                _compute_cast(weight, self.dtype).T,
+                precision=jax.lax.Precision.HIGHEST,
+            )  # (..., out)
 
         def project(inputs: jax.Array, weight: jax.Array) -> jax.Array:  # (B, T, D), (N/K*H, D)
             return linear(inputs, weight).reshape(batch, width, -1, config.head_dim)  # (B, T, N/K, H)
@@ -297,15 +312,18 @@ class Qwen3LM(nn.Module):
             return _rope(projected, position_ids, config.rope_theta)  # (B, T, N/K, H)
 
         def decoder_layer(
-            x: jax.Array,  # (B, T, D)
+            state: ResidualState,  # Two (B, T, D) arrays.
             inputs: LayerInputs,  # Per-layer parameter shapes and optional (B, C, K, H) KV leaves.
-        ) -> tuple[jax.Array, LayerKV | None]:
+        ) -> tuple[ResidualState, LayerKV | None]:
+            x, residual = state  # Each (B, T, D).
             weights, layer_cache = inputs
 
             def update(old: jax.Array, new: jax.Array) -> jax.Array:  # (B, C, K, H), (B, T, K, H)
                 return jax.lax.dynamic_update_slice(old, new, (0, offset, 0, 0))  # (B, C, K, H)
 
-            normalized = _rms_norm(x, weights["input_layernorm.weight"], config.rms_norm_eps)  # (B, T, D)
+            normalized, residual = _add_rms_norm(
+                x, residual, weights["input_layernorm.weight"], config.rms_norm_eps
+            )  # Each (B, T, D).
             query, key, value = jax.tree.map(
                 project,
                 (normalized,) * 3,
@@ -321,13 +339,15 @@ class Qwen3LM(nn.Module):
             attended = _attention(
                 query, key, value, mask, self.attention_backend, is_causal=cache is None
             )  # (B, T, N, H)
-            x = x + linear(attended.reshape(batch, width, -1), weights["self_attn.o_proj.weight"])  # (B, T, D)
-            normalized = _rms_norm(x, weights["post_attention_layernorm.weight"], config.rms_norm_eps)  # (B, T, D)
+            x = linear(attended.reshape(batch, width, -1), weights["self_attn.o_proj.weight"])  # (B, T, D)
+            normalized, residual = _add_rms_norm(
+                x, residual, weights["post_attention_layernorm.weight"], config.rms_norm_eps
+            )  # Each (B, T, D).
             hidden = _silu(linear(normalized, weights["mlp.gate_proj.weight"])) * linear(
                 normalized, weights["mlp.up_proj.weight"]
             )  # (B, T, intermediate_size)
-            x = x + linear(hidden, weights["mlp.down_proj.weight"])  # (B, T, D)
-            return x, layer_cache  # (B, T, D), optional (B, C, K, H) KV leaves.
+            x = linear(hidden, weights["mlp.down_proj.weight"])  # (B, T, D)
+            return (x, residual), layer_cache  # Two (B, T, D) arrays; optional (B, C, K, H) KV leaves.
 
         layers = [
             {
@@ -343,19 +363,29 @@ class Qwen3LM(nn.Module):
         if self.scan_layers:
             stacked = jax.tree.map(lambda *weights: jnp.stack(weights), *layers)  # (L, *parameter shape) leaves.
             kv = None if cache is None else (cache.key, cache.value)  # Optional (L, B, C, K, H) leaves.
-            x, kv = jax.lax.scan(decoder_layer, x, (stacked, kv))  # (B, T, D), optional (L, B, C, K, H) leaves.
+            (x, residual), kv = jax.lax.scan(
+                decoder_layer, (x, residual), (stacked, kv)
+            )  # Two (B, T, D) arrays; optional (L, B, C, K, H) leaves.
         else:
             updated = []
             for layer, weights in enumerate(layers):
                 layer_cache = None if cache is None else (cache.key[layer], cache.value[layer])  # (B, C, K, H) leaves.
-                x, layer_cache = decoder_layer(x, (weights, layer_cache))  # (B, T, D), optional (B, C, K, H) leaves.
+                (x, residual), layer_cache = decoder_layer(
+                    (x, residual), (weights, layer_cache)
+                )  # Two (B, T, D) arrays; optional (B, C, K, H) leaves.
                 updated.append(layer_cache)
             kv = jax.tree.map(lambda *values: jnp.stack(values), *updated)  # Optional (L, B, C, K, H) leaves.
         if cache is not None:
             cache = cache._replace(key=kv[0], value=kv[1])
-        x = _rms_norm(x, params["model.norm.weight"], config.rms_norm_eps)  # (B, T, D)
+        x, _ = _add_rms_norm(x, residual, params["model.norm.weight"], config.rms_norm_eps)  # Each (B, T, D).
         head = "model.embed_tokens" if config.tie_word_embeddings else "lm_head"
-        logits = linear(x[:, -logits_to_keep:], params[head + ".weight"]).astype(jnp.float32)  # (B, U, V)
+        # Keep the FP32 accumulator: BF16 logits amplify small hidden-state differences at softmax.
+        logits = jnp.matmul(
+            _compute_cast(x[:, -logits_to_keep:], self.dtype),
+            _compute_cast(params[head + ".weight"], self.dtype).T,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )  # (B, U, V)
         if cache is not None:
             cache = cache._replace(
                 valid=valid,

@@ -23,6 +23,8 @@ from rl2.qwen3 import (
     Parameters,
     Qwen3Config,
     Qwen3LM,
+    _add_rms_norm,
+    _rms_norm,
     _silu,
     generate_tokens,
     load_qwen3_checkpoint,
@@ -149,6 +151,18 @@ def test_bfloat16_silu_opmath() -> None:
     np.testing.assert_array_equal(gradient, [[0.69921875]])
 
 
+def test_bfloat16_residual_normalization() -> None:
+    x = jnp.array([[1, 2, 3, 4]], jnp.bfloat16)  # (B=1, D=4)
+    residual = jnp.array([[0.00390625, -0.0078125, 0.0078125, -0.015625]], jnp.bfloat16)  # (B, D)
+    weight = jnp.array([0.8, 0.9, 1.1, 1.2], jnp.bfloat16)  # (D,)
+    normalized, stored = jax.jit(_add_rms_norm)(x, residual, weight, 1e-6)  # Each (B, D).
+    assert normalized.shape == stored.shape == (1, 4)
+    assert normalized.dtype == stored.dtype == jnp.bfloat16
+    # vLLM 0.27 compiled native fused_add_rms_norm: normalize before rounding the sum.
+    np.testing.assert_array_equal(normalized, [[0.294921875, 0.65625, 1.2109375, 1.75]])
+    np.testing.assert_array_equal(stored, [[1.0, 1.9921875, 3.0, 3.984375]])
+
+
 def test_bfloat16_master_weights_match_published_weights(model: Qwen3LM, params: Parameters) -> None:
     model = model.clone(dtype="bfloat16")
     master = {
@@ -157,11 +171,39 @@ def test_bfloat16_master_weights_match_published_weights(model: Qwen3LM, params:
     }  # HF parameter shapes; norm scales are deliberately between BF16 values.
     published = jax.tree.map(lambda value: value.astype(jnp.bfloat16).astype(jnp.float32), master)
     tokens = jnp.array([[1, 4, 2], [0, 1, 4]], jnp.int32)  # (B=2, T=3)
-    forward = jax.jit(model.apply)
-    actual = forward({"params": master}, tokens).logits  # (B, T, V=13)
-    expected = forward({"params": published}, tokens).logits  # (B, T, V=13)
+
+    def loss(weights: Parameters) -> tuple[jax.Array, jax.Array]:
+        logits = model.apply({"params": weights}, tokens).logits  # (B, T, V=13)
+        return jnp.square(logits).mean(), logits  # (), (B, T, V)
+
+    evaluate = jax.jit(jax.value_and_grad(loss, has_aux=True))
+    (_, actual), actual_grad = evaluate(master)  # (B, T, V), HF parameter shapes.
+    (_, expected), expected_grad = evaluate(published)  # (B, T, V), HF parameter shapes.
     assert actual.shape == expected.shape == (2, 3, 13)
     np.testing.assert_array_equal(actual, expected)
+    assert jax.tree.map(jnp.shape, actual_grad) == model.config.parameter_shapes()
+    for name in master:
+        np.testing.assert_array_equal(actual_grad[name], expected_grad[name])
+
+
+def test_bfloat16_logits_retain_float32_accumulation(model: Qwen3LM, params: Parameters) -> None:
+    model = model.clone(dtype="bfloat16")
+    # Zero branches leave the embeddings as the residual through every decoder layer.
+    params = {
+        name: value if "norm" in name or "embed_tokens" in name else jnp.zeros_like(value)
+        for name, value in params.items()
+    }  # HF parameter shapes.
+    tokens = jnp.array([[1, 4, 2], [0, 1, 4]], jnp.int32)  # (B=2, T=3)
+    embedding = params["model.embed_tokens.weight"].astype(jnp.bfloat16)  # (V=13, D=8)
+    hidden = jax.jit(_rms_norm)(embedding[tokens], params["model.norm.weight"], model.config.rms_norm_eps)  # (B, T, D)
+    expected = jnp.matmul(
+        hidden.astype(jnp.float32), embedding.astype(jnp.float32).T, precision=jax.lax.Precision.HIGHEST
+    )  # (B, T, V)
+    actual = jax.jit(model.apply)({"params": params}, tokens).logits  # (B, T, V)
+    assert actual.shape == (2, 3, 13)
+    assert actual.dtype == jnp.float32
+    np.testing.assert_allclose(actual, expected, atol=1e-7, rtol=1e-6)
+    assert not np.array_equal(actual, expected.astype(jnp.bfloat16).astype(jnp.float32))
 
 
 def test_trailing_logits(model: Qwen3LM, params: Parameters, reference: dict[str, jax.Array]) -> None:

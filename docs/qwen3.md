@@ -125,96 +125,132 @@ The checked-in tiny reference fixture comes from Hugging Face Transformers 4.57.
 with eager attention. To regenerate it in an environment with CPU PyTorch and
 Transformers installed, run `python tests/qwen3_reference.py`.
 
-### BF16 parity with the GRPO v2 vLLM server
+### Parity with the GRPO v2 vLLM server
 
-`tests/test_qwen3_vllm.py` uses two GPUs and the actual `serve_vllm`,
-`Learner.publish_weights`, and `Actor.update_weights` methods. Only Ray scheduling
-is replaced with local threads. Weights travel through DLPack and packed NCCL;
-the server runs its normal compiled BF16 inference and processed log probabilities.
-Context length, concurrency, and memory allocation are reduced for the test.
+The learner keeps FP32 master weights and publishes BF16 weights through DLPack
+and packed NCCL. Both models use BF16 transformer computation and **FP32 output
+logits**. `serve_vllm` sets `--hf-overrides '{"head_dtype":"float32"}'`; a separately
+launched vLLM server needs the same override.
+
+Three numerical boundaries are explicit in `qwen3.py`:
+
+- GEMM inputs and weights round to BF16 even inside the differentiated graph.
+  Ordinary cast roundtrips could disappear in backward: identical forward outputs
+  previously hid gradients that depended on unpublished FP32 weight bits. The GPU
+  regression now requires identical logits and parameter gradients for FP32 masters
+  and their BF16-rounded copies, while retaining FP32 optimizer state.
+- Decoder layers carry the branch output and residual separately. Like vLLM's fused
+  residual RMSNorm, normalization reads their FP32 sum while the residual is stored
+  in BF16. This applies across the layer scan and at the final normalization.
+- The output projection keeps its FP32 accumulator instead of rounding logits to
+  BF16 before softmax. Weight storage and transfer remain BF16, including tied heads.
+
+`tests/test_qwen3_vllm.py` exercises the actual `serve_vllm`, `publish_weights`,
+`Actor.update_weights`, `Batcher.prepare_batch`, `token_log_probs`, and `update`.
+Only Ray scheduling is replaced with local threads. A read-only test worker hashes
+all loaded parameters, including packed QKV and gate/up projections; the test checks
+byte equality and complete coverage of the exported HF parameters after each
+publication. The second publication contains a real Adam update (test learning rate
+`1e-4`, chosen to make stale prefix caches observable). Both publications are
+checked inside an optimizer update, including the updated FP32 masters.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 QWEN3_VLLM_DEVICE=1 \
-QWEN3_VLLM_TESTS=1 \
-QWEN3_CHECKPOINT=/path/to/local/Qwen3-0.6B/snapshot \
+QWEN3_VLLM_TESTS=1 QWEN3_CHECKPOINT=/path/to/local/Qwen3-0.6B/snapshot \
 QWEN3_VLLM_REPORT_DIR=/tmp/qwen3-vllm \
 uv run --env-file nvida.env pytest --confcutdir=tests tests/test_qwen3_vllm.py -q -s
 ```
 
-The checkpoint must already exist locally. Without `QWEN3_CHECKPOINT`, only the
-small tied/untied models and operation tests run. Without `QWEN3_VLLM_TESTS=1`,
-the suite skips. On hosts configured for an unavailable NCCL network plugin,
-select `NCCL_NET=Socket` for this local test. TorchInductor needs a C++ compiler;
-set `CXX` to its installed executable if necessary.
+For the ALFWorld token budget, add `QWEN3_VLLM_CONTEXT_LENGTH=4096` and
+`QWEN3_VLLM_BACKENDS=tokamax-triton`. The real-checkpoint case then places one prompt
+near the context limit and pads the training batch to 4,096 tokens. Select
+`-k checkpoint` to run only that model. Context length must be a multiple of 256.
+The default context is 256; without `QWEN3_CHECKPOINT`, only tiny tied/untied models
+and operation comparisons run. Without `QWEN3_VLLM_TESTS=1`, all GPU integration
+cases skip. On this host, use `NCCL_NET=Socket CXX=/usr/bin/g++-12`.
 
-Coverage includes FP32 master weights rounded to BF16, two successive publications,
-prefix-cache invalidation, unequal prompt lengths, two-turn transcripts with masked
-user messages, batched generation, temperatures 1.0/0.7, and training's shifted
-`token_log_probs`. Transcripts use the actual `Batcher.prepare_batch`, with the
-production 256-token padding multiple for the checkpoint. Small models compare
-every vocabulary probability; the real checkpoint compares sampled tokens and
-the top ten alternatives. The same rollout
-is replayed through JAX XLA/cuDNN and Tokamax Triton/cuDNN/XLA/chunked-XLA.
-Tokamax Mosaic is included on SM90/SM100; A100 does not support it.
+Reports include exact tokens, masks, sampled and candidate log probabilities,
+per-backend JAX scores, loaded-weight hashes, optimizer metrics, versions, and
+runtime settings. Coverage includes unequal prompts, two turns with masked context,
+temperatures 1.0/0.7, prefix-cache invalidation, and a genuine optimizer update.
+The differentiated update must reproduce the production forward's loss, KL, and
+clip fraction. A full-transcript vLLM replay measures its own prefill/decode drift.
 
-Reports retain package versions, server logs, exact rollout IDs/masks/probabilities,
-per-backend errors, sampled GRPO approximate KL, and false clipping at a 0.2 clip
-coefficient. A vLLM full-transcript replay measures its own prefill/decode variation.
-`QWEN3_VLLM_EAGER=1` is available for diagnosis; the default tests compiled serving.
-Reports also record optimization level, matmul precision, and relevant runtime
-settings. The environment preset disables automatic NCCL profiler loading: the host's profiler
-aborted when a second weight-transfer communicator initialized. Profiling can be
-enabled explicitly with `NCCL_PROFILER_PLUGIN` when needed.
+The 2026-10-24 measurements use two A100 40 GB GPUs, Qwen3-0.6B revision
+`c1899de289a04d12100db370d81485cdf75e47ca`, JAX 0.11.2, vLLM 0.27.0,
+Torch 2.13.0+cu130, Tokamax 0.0.15, and `nvida.env` including optimization level O1.
+For the unchanged initial checkpoint, worst results across the two temperatures
+(64 sampled tokens) were:
 
-The operation tests compile vLLM's native normalization, SwiGLU, and RoPE operations,
-including fused Q/K normalization plus rotation. They caught erased BF16 rounding
-of the stored RoPE sine/cosine cache and a premature rounding path through BF16
-rotation slicing. JAX now rounds stored serving values explicitly and widens before
-rotation. Forcing rounding at every activation boundary instead matches eager CUDA
-kernels, whose arithmetic differs from production TorchInductor fusion.
+| Setup | Max sampled log-probability error | Max batch mean error | Sampled approximate KL | False clipping |
+| --- | ---: | ---: | ---: | ---: |
+| Original, 256-token padding | 0.1892 | 0.01980 | 0.001132 | 0% |
+| FP32 logits + separate residuals, 256 | 0.0756 | 0.01087 | 0.000295 | 0% |
+| FP32 logits + separate residuals, 4,096 | 0.1676 | 0.02512 | 0.001266 | 0% |
 
-The real-checkpoint regression bounds are 0.35 maximum / 0.03 mean sampled log-probability
-error, 0.10 maximum / 0.0025 mean alternative-token probability error, sampled
-approximate KL below 0.0025, and false clipping at most 5%. Tokamax/Triton, the
-training default, additionally requires **zero false clipping** on these rollouts.
-Small-model limits are tighter. These are bounded BF16 agreement checks: kernel
-reduction order and prefill/decode shapes still change rounding. All raw errors remain in the report,
-including log-probability errors for very unlikely alternatives.
+Changing output precision can change sampled sequences. In a controlled ablation
+on the same saved FP32-logit rollout tokens, adding the separate residual carry
+reduced maximum error from 0.1182 to 0.0756. Changing residuals alone with BF16 logits
+did not consistently improve agreement. At 4,096 tokens, vLLM's own replay differed
+from its generation scores by up to 0.1233. This is bounded numerical agreement,
+not bitwise inference parity or a guarantee for arbitrary checkpoints and workloads.
+After the Adam update, the 4,096-token maximum error was 0.1258, approximate KL
+was 0.000626, and false clipping remained zero. Both publications matched all 226
+loaded parameter hashes, and their optimizer loss/KL/clipping matched the standalone
+JAX forward. The master-weight regression's maximum embedding-gradient difference
+fell from 0.003174 to exactly zero; all parameter gradients now match their
+BF16-rounded-master counterparts exactly in that regression.
 
-On A100 with Qwen3-0.6B revision `c1899de289a04d12100db370d81485cdf75e47ca`,
-JAX 0.11.2, vLLM 0.27.0, Torch 2.13.0+cu130, and Tokamax 0.0.15, the
-production-padding checks found alternative-token probability differences up to
-0.086. A provisional 0.065 bound failed; the 0.10 bound above records this
-remaining limitation rather than claiming close agreement for every candidate.
-The workload has 128 sampled tokens across two publications and two temperatures;
-passing it does not establish parity for arbitrary rollout lengths or checkpoints.
+Packing QKV and gate/up GEMMs to match vLLM's projection shapes produced identical
+scores to the separate JAX projections on fixed 256- and 4,096-token rollouts, so
+that change was not adopted.
 
-The final preset run on 2026-10-23 passed all eight integration/operation tests.
-The table gives the worst result across the four rollout batches:
+`VLLM_BATCH_INVARIANT=1` made vLLM self-replay exact for both publications, but
+the updated-policy JAX comparison reached 0.2116 maximum error and 3.125% false
+clipping, failing the optimizer parity assertion. It remains disabled. This trial
+also required matching vLLM's NCCL overrides on the learner via the installed
+`override_envs_for_invariance()` helper; the flag alone stalled both endpoints
+in the communicator's warm-up all-reduce.
 
-| Attention implementation | Max sampled log-probability error | Max batch mean error | False clipping |
-| --- | ---: | ---: | ---: |
-| XLA / Tokamax XLA | 0.189 | 0.0259 | 0% |
-| cuDNN / Tokamax cuDNN | 0.293 | 0.0287 | 3.125% |
-| Tokamax Triton | 0.189 | 0.0248 | 0% |
-| Tokamax chunked XLA | 0.194 | 0.0191 | 0% |
+Production Tokamax tests require zero false clipping, sampled maximum/mean errors
+below 0.12/0.015 at 256 tokens and 0.20/0.03 at longer contexts, approximate KL below
+0.0006/0.002 respectively, and candidate-probability maximum/mean errors below
+0.06/0.002. Other attention backends retain diagnostic bounds; cuDNN still produced
+false clipping on some short rollouts. The five operation checks include vLLM's
+actual CUDA-generated RoPE cache at early and near-4,096 positions. Rare CUDA/XLA
+trigonometric cache rounding differences remain, including cancellation near zero.
 
-Tokamax/Triton's largest alternative-token probability error was 0.073 and its
-sampled approximate KL peaked at 0.00129. vLLM's own full-transcript replay
-had up to 0.201 sampled log-probability error relative to its generation scores.
-All five compiled-operation comparisons were exact for the tested inputs;
-the 88 Qwen3 and GRPO update regression tests also passed on GPU.
+Final default-configuration validation passed: 90 GPU model/GRPO regression tests,
+eight vLLM parity checks with the real 4,096-token case, a separate real 256-token
+case, and four server-command checks. Ruff formatting/checks passed. Raw final
+reports are under `/tmp/qwen3-vllm-final-256` and `/tmp/qwen3-vllm-final-4096` on
+the test host; the rejected batch-invariant trial is under
+`/tmp/qwen3-vllm-invariant-matched-4096`.
 
-Environment experiments loaded `nvida.env`, including `JAX_OPTIMIZATION_LEVEL=O1`,
-90% preallocation, and the persistent compilation/autotuning caches. Fixed-rollout
-replays and compiled HLO inspection showed sensitivity to GEMM selection and
-fusion. Disabling `--xla_gpu_enable_triton_gemm` reduced the largest candidate
-probability error in the integration run from 0.073 to 0.063, but increased
-chunked-XLA's worst mean sampled log-probability error from 0.019 to 0.031, failing
-its bound. It is not enabled in the preset. Independent vLLM server runs also
-varied, so these integration differences cannot all be attributed to `O1`.
-The model explicitly requests highest matmul precision; the preset's commented
-TF32 option is not a BF16 parity fix.
+#### Other Tokamax operations
+
+The [supported-operations list](https://github.com/openxla/tokamax/blob/main/docs/supported_ops.md)
+was checked against the installed 0.0.15 implementation. On identical real-checkpoint
+rollout tokens, replacing RMSNorm with `tokamax.layer_norm(subtract_mean=False,
+implementation="triton")` did not improve the current 0.0756 maximum sampled error:
+
+| Normalization replacement | Maximum sampled log-probability error |
+| --- | ---: |
+| Triton RMSNorm at all norms | 0.1621 |
+| Triton RMSNorm with FP32 inputs | 0.1281 |
+| Triton RMSNorm only at residual norms | 0.1361 |
+
+`gated_linear_unit(implementation="xla")` matched the isolated compiled vLLM
+SwiGLU reference and preserved its forward result during differentiation, but
+provided no numerical improvement. The installed Triton GLU failed compilation
+with a tuple-stride error. Mosaic requires 64-row tiles; after padding to a supported
+shape, its forward output changed by up to 0.0078125 when differentiated because
+that path uses a different forward implementation. CuTeDSL rejected A100. These
+alternatives were not adopted.
+`linear_softmax_cross_entropy_loss` was also inspected: this version rejects
+explicit precision selection, and its BF16 reference computes BF16 logits/softmax,
+which would undo the FP32-logit correction. No additional Tokamax operation or
+unvalidated environment tuning was enabled.
 
 ## GPU translation review
 

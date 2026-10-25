@@ -2,16 +2,20 @@ model: Qwen/Qwen3-0.6B
 attention_backend: tokamax
 scan_layers: true
 gradient_checkpointing: true
+padding_multiple: 256
 taskset:
   id: alfworld
   config_file: data/alfworld/base_config.yaml
-seed: 6
+seed: 1
 num_groups: 2
 group_size: 8
+prefetch_batches: 0
+drop_degenerate_groups: false
+length_penalty_coef: 0.0 # Subtract 0.1 reward per 1,000 sampled tokens.
 max_tokens: 4096 # Total transcript tokens, including system, prompt, and tools.
 max_turns: 50
 rollout_timeout: 1200
 environment_timeout: 600
-run_id: grpo_v2_alfworld_${path_name:${model}}_seed${seed}
+run_id: grpo_v2_alfworld_${path_name:${model}}_s${seed}_ddg${drop_degenerate_groups}_pf${prefetch_batches}
 ckpt_dir: /runs/grpo_v2/${run_id} # Checkpoints and profiling artifacts.
 checkpoint_interval: 10

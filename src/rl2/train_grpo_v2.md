@@ -110,11 +110,12 @@ capped at the model context length. Oversized transcripts are rejected.
 
 GRPO uses a clipped importance-ratio objective, averaged over sampled tokens
 within each rollout and then across rollouts. There is no reference-policy KL
-penalty. Model computation uses BF16; master parameters, optimizer state,
-gradients, log probabilities, and loss use FP32. Learner `attention_backend`
-accepts `tokamax` (default), `xla`, or `cudnn`; `scan_layers` and
+penalty. Transformer computation and published weights use BF16; the output
+projection accumulates FP32 logits in both JAX and vLLM. Master parameters,
+optimizer state, gradients, log probabilities, and loss use FP32. Learner
+`attention_backend` accepts `tokamax` (default), `xla`, or `cudnn`; `scan_layers` and
 `gradient_checkpointing` default to true. These defaults match the standalone
-Qwen3 model and the [BF16 publication parity suite](../../docs/qwen3.md#bf16-parity-with-the-grpo-v2-vllm-server).
+Qwen3 model and the [publication parity suite](../../docs/qwen3.md#parity-with-the-grpo-v2-vllm-server).
 Temperature is restricted to `[0.01, 2.0]`; vLLM returns
 `processed_logprobs` with neutral top-p/top-k sampling, matching the learner.
 
@@ -122,13 +123,20 @@ Each iteration makes `update_epochs` passes with `minibatches_per_epoch` optimiz
 updates per pass. `grad_accum_steps` splits each minibatch into microbatches.
 `minibatches_per_epoch * grad_accum_steps` must divide `num_groups * group_size`.
 Shuffling uses the saved seed and optimizer step. Initial and updated weights
-are published through vLLM's NCCL weight-transfer backend. Collection and updates
-do not overlap. `weight_update_pause_mode` accepts `wait` (default), `abort`, or
-`keep`, operating on individual generation requests.
+are published through vLLM's NCCL weight-transfer backend. `prefetch_batches: N`
+(default 1) generates up to N batches ahead while the learner optimizes; each
+batch contains `num_groups` rollout groups. Prefetched rollouts can use older
+weights, and multi-turn rollouts can span weight updates. Set it to 0 to collect
+each batch after publishing the latest weights.
+`weight_update_pause_mode` accepts `wait` (default), `abort`, or `keep`, operating
+on individual generation requests. New groups wait for weight publication;
+in-flight groups follow the selected pause mode.
 
 `ckpt_dir/checkpoints` stores Orbax checkpoints every `checkpoint_interval`
-iterations and at normal completion, retaining the latest two. Restarting with
-the same directory restores parameters, optimizer state, shuffle key, task RNG,
+iterations and at normal completion, retaining the latest two.
+Prefetching drains on checkpoint iterations so the saved task RNG does not
+skip unconsumed batches. Restarting with the same directory restores parameters,
+optimizer state, shuffle key, task RNG,
 progress counters, and observed stop labels. `total_iterations` is a cumulative
 target; `null` runs until interrupted. Environments restart fresh, so resumption
 is not bit-for-bit reproducible. Use a new directory for a fresh experiment or

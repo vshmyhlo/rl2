@@ -239,6 +239,8 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
         "8000",
         "--dtype",
         "bfloat16",
+        "--hf-overrides",
+        '{"head_dtype":"float32"}',
         "--generation-config",
         "vllm",
         "--logprobs-mode",

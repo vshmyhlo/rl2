@@ -1,6 +1,7 @@
 """Opt-in CUDA/NCCL parity: QWEN3_VLLM_TESTS=1; optionally QWEN3_CHECKPOINT=/local/snapshot."""
 
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -26,6 +27,7 @@ from safetensors.flax import save_file
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.ir.ops.layernorm import fused_add_rms_norm, rms_norm
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
@@ -66,27 +68,36 @@ def test_compiled_operations(operation: str) -> None:
         )  # (B, T, N, H)
         actual = jax.jit(qwen3._rms_norm)(x, weight, 1e-6)  # (B, T, N, H)
     elif operation == "residual_norm":
-        expected, _ = torch.compile(fused_add_rms_norm.impls["native"].impl_fn)(
+        expected, residual = torch.compile(fused_add_rms_norm.impls["native"].impl_fn)(
             torch_array(x), torch_array(other), torch_array(weight), 1e-6
         )  # Each (B, T, N, H).
-        actual = jax.jit(lambda a, b, w: qwen3._rms_norm(a + b, w, 1e-6))(x, other, weight)  # (B, T, N, H)
+        actual, actual_residual = jax.jit(qwen3._add_rms_norm)(x, other, weight, 1e-6)  # Each (B, T, N, H).
+        np.testing.assert_array_equal(actual_residual.astype(jnp.float32), residual.float().cpu().numpy())
     elif operation == "swiglu":
         expected = torch.compile(SiluAndMul.forward_native)(
             torch.cat((torch_array(x), torch_array(other)), dim=-1)
         )  # (B, T, N, H)
         actual = jax.jit(lambda a, b: qwen3._silu(a) * b)(x, other)  # (B, T, N, H)
     else:
-        positions = jnp.arange(34).reshape(2, 17)  # (B, T)
-        angles = jnp.arange(34)[:, None] * 1e6 ** (-jnp.arange(0, 128, 2, dtype=jnp.float32) / 128)  # (B*T, H/2)
-        cache = jnp.concatenate((jnp.cos(angles), jnp.sin(angles)), axis=-1).astype(jnp.bfloat16)  # (B*T, H)
+        positions = jnp.concatenate((jnp.arange(17), jnp.arange(4079, 4096))).reshape(2, 17)  # (B, T)
+        with torch.device("cuda"), set_current_vllm_config(VllmConfig()):
+            rope = RotaryEmbedding(
+                head_size=128,
+                rotary_dim=128,
+                max_position_embeddings=4096,
+                base=1e6,
+                is_neox_style=True,
+                dtype=torch.bfloat16,
+            )
+        cache = rope.cos_sin_cache  # (C=4096, H), computed by vLLM rather than JAX.
 
         def reference(
-            values: torch.Tensor, scales: torch.Tensor, trig: torch.Tensor
-        ) -> torch.Tensor:  # (B, T, N, H), (H,), (B*T, H)
+            values: torch.Tensor, scales: torch.Tensor, trig: torch.Tensor, positions: torch.Tensor
+        ) -> torch.Tensor:  # (B, T, N, H), (H,), (C, H), (B*T,)
             if operation == "qk_norm_rope":
                 values = rms_norm.impls["native"].impl_fn(values, scales, 1e-6)  # (B, T, N, H)
             rotated, _ = RotaryEmbedding.forward_static(
-                torch.arange(34, device=values.device), values.reshape(34, 512), None, 128, 128, trig, True
+                positions, values.reshape(34, 512), None, 128, 128, trig, True
             )  # (B*T, N*H), None.
             return rotated.reshape(values.shape)  # (B, T, N, H)
 
@@ -97,14 +108,18 @@ def test_compiled_operations(operation: str) -> None:
                 values = qwen3._rms_norm(values, scales, 1e-6)  # (B, T, N, H)
             return qwen3._rope(values, positions, 1e6)  # (B, T, N, H)
 
-        expected = torch.compile(reference)(torch_array(x), torch_array(weight), torch_array(cache))  # (B, T, N, H)
+        expected = torch.compile(reference)(
+            torch_array(x), torch_array(weight), cache, torch_array(positions.reshape(-1))
+        )  # (B, T, N, H)
         actual = jax.jit(forward)(x, weight, positions)  # (B, T, N, H)
     expected_array = expected.float().cpu().numpy()  # (B, T, N, H)
     print(operation, errors(actual, expected_array))
     assert actual.shape == expected_array.shape == x.shape
-    # Reduction/exp implementations can differ at an occasional BF16 rounding tie.
+    # CUDA and XLA trig caches can differ at BF16 rounding ties; rotation can cancel near zero.
     assert np.mean(np.asarray(actual, dtype=np.float32) != expected_array) < 0.001
-    np.testing.assert_allclose(actual.astype(jnp.float32), expected_array, atol=0.0001, rtol=0.008)
+    np.testing.assert_allclose(
+        actual.astype(jnp.float32), expected_array, atol=0.0005 if "rope" in operation else 0.0001, rtol=0.008
+    )
 
 
 @dataclass
@@ -113,8 +128,10 @@ class Engine:
     params: qwen3.Parameters  # HF parameter shapes.
     learner: Any
     client: OpenAI
+    http: httpx.Client
     directory: Path
     real: bool
+    context_length: int
 
 
 def attention_forward(model: qwen3.Qwen3LM, implementation: str) -> Callable[..., qwen3.Qwen3Output]:
@@ -144,6 +161,9 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
         directory = Path(destination) / request.param
         directory.mkdir(parents=True, exist_ok=True)
     real = request.param == "checkpoint"
+    context_length = int(os.environ.get("QWEN3_VLLM_CONTEXT_LENGTH", "256"))
+    if context_length < 256 or context_length % training.Config().padding_multiple:
+        raise ValueError("QWEN3_VLLM_CONTEXT_LENGTH must be a positive multiple of the training padding (256)")
     if real:
         source = Path(os.environ["QWEN3_CHECKPOINT"]).resolve()
         model, variables = qwen3.load_qwen3_checkpoint(str(source), dtype="float32")
@@ -159,7 +179,7 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
             num_attention_heads=4,
             num_key_value_heads=2,
             head_dim=32,
-            max_position_embeddings=256,
+            max_position_embeddings=context_length,
             eos_token_id=2,
             tie_word_embeddings=request.param == "tied",
         )
@@ -191,8 +211,11 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
                 "tokamax": package_version("tokamax"),
                 "device": jax.devices()[0].device_kind,
                 "dtype": "bfloat16",
+                "logits_dtype": "float32",
                 "master_dtype": "float32",
+                "learning_rate": 1e-4,
                 "padding_multiple": training.Config().padding_multiple if real else 1,
+                "context_length": context_length,
                 "eager": os.environ.get("QWEN3_VLLM_EAGER") == "1",
                 "optimization_level": jax.config.jax_optimization_level,
                 "matmul_precision": jax.config.jax_default_matmul_precision,
@@ -207,6 +230,8 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
                         "NVIDIA_TF32_OVERRIDE",
                         "NCCL_NET",
                         "NCCL_PROFILER_PLUGIN",
+                        "VLLM_BATCH_INVARIANT",
+                        "QWEN3_VLLM_BACKENDS",
                     )
                 },
             },
@@ -219,8 +244,10 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
         command = list(command)
         command[command.index("--port") + 1] = str(port)
         command += [
+            "--worker-extension-cls",
+            "qwen3_vllm_worker.ParityWorker",
             "--max-model-len",
-            "256",
+            str(context_length),
             "--max-num-seqs",
             "4",
             "--gpu-memory-utilization",
@@ -236,6 +263,7 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
                 **env,
                 "CUDA_VISIBLE_DEVICES": os.environ.get("QWEN3_VLLM_DEVICE", "1"),
                 "JAX_PLATFORMS": "cpu",  # Actor's production Ray runtime environment.
+                "PYTHONPATH": os.pathsep.join((str(Path(__file__).parent.resolve()), env.get("PYTHONPATH", ""))),
             },
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -263,6 +291,8 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
         pool = stack.enter_context(ThreadPoolExecutor(max_workers=1))
         actor = object.__new__(training.Actor.__ray_metadata__.modified_class)
         actor.config = training.Config()
+        actor._weight_lock = asyncio.Lock()
+        actor._weights_valid = True
         stack.enter_context(patch.object(training, "SERVER_URL", url))
 
         def initialize(info: dict[str, Any]) -> Future[None]:
@@ -281,7 +311,14 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
         learner.initialize_weight_transfer(stack)
         client = stack.enter_context(OpenAI(base_url=f"{url}/v1", api_key="unused"))
         yield Engine(
-            model=model, params=variables["params"], learner=learner, client=client, directory=directory, real=real
+            model=model,
+            params=variables["params"],
+            learner=learner,
+            client=client,
+            http=http,
+            directory=directory,
+            real=real,
+            context_length=context_length,
         )
 
 
@@ -300,6 +337,10 @@ def test_published_rollout_parity(engine: Engine) -> None:
             for implementation in implementations
         }
     )
+    if selection := os.environ.get("QWEN3_VLLM_BACKENDS"):
+        selected_backends = selection.split(",")
+        assert set(selected_backends) <= forwards.keys(), f"Unknown backend in {selection}"
+        forwards = {name: forwards[name] for name in selected_backends}
     prompts = [[1], [1, 5, 9, 12, 17, 23, 31]]
     observation = [3, 6, 4]
     if engine.real:
@@ -318,18 +359,40 @@ def test_published_rollout_parity(engine: Engine) -> None:
             "<|im_end|>\n<|im_start|>user\nPlease continue with one more detail.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
             add_special_tokens=False,
         ).ids
+        if engine.context_length > 256:
+            # Exercise late RoPE positions and the final training padding bucket.
+            context = tokenizer.encode("The room contains a table, a chair, and a wooden cabinet. ").ids
+            prefix_length = engine.context_length - 128 - len(prompts[-1])
+            prompts[-1] = (context * (prefix_length // len(context) + 1))[:prefix_length] + prompts[-1]
     reports: list[dict[str, Any]] = []
     previous: dict[str, float] | None = None
     model_id = engine.client.models.list().data[0].id
-    state = training.create_state(model, master, training.Config())
+    # A visible update makes stale prefix-cache entries observable even in the tiny models.
+    state = training.create_state(model, jax.tree.map(jnp.copy, master), training.Config(learning_rate=1e-4))
     for version in range(2):
-        params = {
-            name: value + version * (0.01 if "norm" in name else 0.0001) * jnp.sin(jnp.arange(value.shape[-1]))
-            for name, value in master.items()
-        }  # HF parameter shapes; FP32 updates must be rounded identically on both sides.
-        state = state.replace(params=params)
+        params = state.params  # HF parameter shapes; version 1 contains a real Adam update.
         engine.learner.state = state
         engine.learner.publish_weights()
+        response = engine.http.post("/collective_rpc", json={"method": "weight_digests"})
+        response.raise_for_status()
+        loaded_digests = response.json()["results"][0]
+        expected_digests: dict[str, str] = {}
+        covered: set[str] = set()
+        for name in loaded_digests:
+            if ".qkv_proj." in name:
+                names = [name.replace(".qkv_proj.", f".{part}_proj.") for part in ("q", "k", "v")]
+            elif ".gate_up_proj." in name:
+                names = [name.replace(".gate_up_proj.", f".{part}_proj.") for part in ("gate", "up")]
+            else:
+                names = [name]
+            covered.update(names)
+            digest = hashlib.sha256()
+            for source_name in names:
+                digest.update(np.asarray(params[source_name].astype(jnp.bfloat16)).tobytes())
+            expected_digests[name] = digest.hexdigest()
+        assert covered == params.keys(), "Every exported parameter must be present in vLLM"
+        assert loaded_digests == expected_digests, "Published BF16 weights differ from vLLM's loaded parameters"
+        (engine.directory / f"weights-v{version}.json").write_text(json.dumps(loaded_digests, indent=2))
         for temperature in (1.0, 0.7):
             sequences = [list(prompt) for prompt in prompts]
             masks = [[False] * len(prompt) for prompt in prompts]
@@ -398,18 +461,21 @@ def test_published_rollout_parity(engine: Engine) -> None:
                 for ids, mask, scores in zip(sequences, masks, sampled, strict=True)
             ]
             batcher = object.__new__(training.Batcher.__ray_metadata__.modified_class)
-            batcher.config = training.Config() if engine.real else training.Config(padding_multiple=1)
+            batcher.config = training.Config(
+                max_tokens=engine.context_length,
+                padding_multiple=training.Config().padding_multiple if engine.real else 1,
+            )
             batch = jax.tree.map(
                 jnp.asarray,
                 batcher.prepare_batch(
                     [training.RolloutGroup(task_id="parity", rollouts=rollouts)],
-                    context_length=model.config.max_position_embeddings,
+                    context_length=engine.context_length,
                 ),
             )  # (B, T) leaves, except advantages: (B,).
             tokens, attention, loss_mask, old = batch[:4]  # Each (B, T).
             width = tokens.shape[1]
             if engine.real:
-                assert width == training.Config().padding_multiple
+                assert width == engine.context_length
             expected = np.asarray(old[:, 1:][loss_mask[:, 1:]])  # (sampled tokens,)
             indices = tuple(
                 jnp.asarray(index) for index in zip(*candidates, strict=True)
@@ -466,6 +532,11 @@ def test_published_rollout_parity(engine: Engine) -> None:
                     {"params": params}, tokens[:, :-1], attention_mask=attention[:, :-1]
                 ).logits  # (B, T-1, V)
                 distribution = jax.nn.log_softmax(logits / temperature, axis=-1)  # (B, T-1, V)
+                np.savez(
+                    engine.directory / f"jax-v{version}-t{temperature}-{backend}.npz",
+                    log_probs=np.asarray(actual),  # (B, T-1)
+                    candidate_log_probs=np.asarray(distribution[indices]),  # (candidate count,)
+                )
                 _, metrics = training.objective(actual, batch, clip_coef=0.2)
                 report = {
                     "version": version,
@@ -476,10 +547,45 @@ def test_published_rollout_parity(engine: Engine) -> None:
                     "candidate_probs": errors(jnp.exp(distribution[indices]), np.exp(expected_candidates)),
                     "approx_kl": float(metrics["policy/approx_kl"]),
                     "clip_fraction": float(metrics["policy/clip_fraction"]),
+                    "policy_loss": float(metrics["losses/policy"]),
                 }
                 reports.append(report)
                 print(report, flush=True)
                 (engine.directory / "parity.json").write_text(json.dumps(reports, indent=2))
+                del logits, distribution  # Release vocabulary-sized buffers before the optimizer audit.
+        # Exercise the exact differentiated/rematerialized training graph, whose
+        # BF16 fusion can differ from a standalone inference forward.
+        published = jax.tree.map(lambda value: value.astype(jnp.bfloat16), params)  # HF parameter shapes.
+        state, update_metrics = training.update(
+            state,
+            batch,
+            grad_accum_steps=1,
+            temperature=temperature,
+            clip_coef=0.2,
+        )
+        optimizer_report = {name: float(value) for name, value in update_metrics.items()}
+        (engine.directory / f"optimizer-v{version}.json").write_text(json.dumps(optimizer_report, indent=2))
+        print({"optimizer": optimizer_report}, flush=True)
+        assert int(state.step) == version + 1
+        assert optimizer_report["policy/grad_norm"] > 0
+        assert optimizer_report["policy/approx_kl"] < (0.0025 if engine.real else 0.0001)
+        assert optimizer_report["policy/clip_fraction"] == 0
+        for report in reports:
+            if (
+                report["backend"] == "tokamax-triton"
+                and report["temperature"] == temperature
+                and report["version"] == version
+            ):
+                for metric, key in (
+                    ("policy/approx_kl", "approx_kl"),
+                    ("policy/clip_fraction", "clip_fraction"),
+                    ("losses/policy", "policy_loss"),
+                ):
+                    np.testing.assert_allclose(optimizer_report[metric], report[key], rtol=1e-4, atol=1e-7)
+        assert any(
+            not np.array_equal(np.asarray(published[name]), np.asarray(value.astype(jnp.bfloat16)))
+            for name, value in state.params.items()
+        ), "The optimizer update must change the published BF16 policy"
     checked = [report for report in reports if report["backend"] != "vllm-replay"]
     # BF16 kernels differ even between vLLM prefill and decode. Bound both individual
     # outliers and aggregate policy drift; near-zero alternative probabilities need absolute probability bounds.
@@ -492,5 +598,12 @@ def test_published_rollout_parity(engine: Engine) -> None:
         assert report["clip_fraction"] <= (0.05 if engine.real else 0), report
         if report["backend"] == "tokamax-triton":
             assert report["clip_fraction"] == 0, report
+            if engine.real:
+                long_context = engine.context_length > 256
+                assert report["max_abs"] < (0.2 if long_context else 0.12), report
+                assert report["mean_abs"] < (0.03 if long_context else 0.015), report
+                assert report["approx_kl"] < (0.002 if long_context else 0.0006), report
+                assert report["candidate_probs"]["max_abs"] < 0.06, report
+                assert report["candidate_probs"]["mean_abs"] < 0.002, report
         if not engine.real:
             assert report["candidates"]["max_abs"] < 0.025, report
