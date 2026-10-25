@@ -24,6 +24,7 @@ from rl2.qwen3 import (
     Qwen3Config,
     Qwen3LM,
     _add_rms_norm,
+    _linear,
     _rms_norm,
     _silu,
     generate_tokens,
@@ -161,6 +162,43 @@ def test_bfloat16_residual_normalization() -> None:
     # vLLM 0.27 compiled native fused_add_rms_norm: normalize before rounding the sum.
     np.testing.assert_array_equal(normalized, [[0.294921875, 0.65625, 1.2109375, 1.75]])
     np.testing.assert_array_equal(stored, [[1.0, 1.9921875, 3.0, 3.984375]])
+
+
+def test_bfloat16_projection_accumulates_in_float32() -> None:
+    if jax.default_backend() != "gpu":
+        pytest.skip("Regression for shape-dependent CUDA GEMM selection")
+    row = jax.random.normal(jax.random.key(1), (2048,)).astype(jnp.bfloat16)  # (I,)
+    weight = (0.01 * jax.random.normal(jax.random.key(2), (1024, 2048))).astype(jnp.bfloat16)  # (O, I)
+    # This row count selects a less accurate cuBLAS algorithm with Precision.HIGHEST.
+    inputs = jnp.tile(row, (4021, 1))  # (M, I)
+    expected = jnp.matmul(
+        row.astype(jnp.float32), weight.astype(jnp.float32).T, precision=jax.lax.Precision.HIGHEST
+    ).astype(jnp.bfloat16)  # (O,)
+    actual = jax.jit(_linear, static_argnames="dtype")(inputs, weight, "bfloat16")  # (M, O)
+    assert actual.shape == (4021, 1024)
+    assert actual.dtype == jnp.bfloat16
+    # Allow rare FP32 reduction-order rounding ties, not BF16 partial-sum errors.
+    error = jnp.abs(actual[0].astype(jnp.float32) - expected.astype(jnp.float32))  # (O,)
+    assert float(error.mean()) < 1e-5
+    assert float(jnp.mean(error != 0)) < 0.005
+    np.testing.assert_array_equal(actual[0], actual[-1])
+
+
+def test_bfloat16_projection_preserves_float32_output_gradients() -> None:
+    inputs = jnp.array([[0.25, 0.5]], jnp.float32)  # (B=1, I=2)
+    weight = jnp.array([[1.0, 2.0], [1.0, 2.0]], jnp.float32)  # (O=2, I)
+    cotangent = jnp.array([[0.200001, -0.2]], jnp.float32)  # (B, O)
+
+    def loss(values: jax.Array) -> tuple[jax.Array, jax.Array]:  # (B, I) -> (), (B, O)
+        output = _linear(values, weight, "bfloat16", output_dtype=jnp.float32)  # (B, O)
+        return jnp.sum(output * cotangent), output  # (), (B, O)
+
+    (_, output), gradient = jax.jit(jax.value_and_grad(loss, has_aux=True))(inputs)  # (), (B, O), (B, I)
+    assert output.shape == gradient.shape == (1, 2)
+    assert output.dtype == gradient.dtype == jnp.float32
+    expected = (cotangent @ weight).astype(jnp.bfloat16).astype(jnp.float32)  # (B, I)
+    # Truncating the FP32 head cotangent to BF16 would cancel this gradient to zero.
+    np.testing.assert_array_equal(gradient, expected)
 
 
 def test_bfloat16_master_weights_match_published_weights(model: Qwen3LM, params: Parameters) -> None:

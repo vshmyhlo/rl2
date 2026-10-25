@@ -233,6 +233,9 @@ the test host; the rejected batch-invariant trial is under
 
 #### Longer-decode revalidation (2026-10-25)
 
+See [the latest investigation](../qwen3_vllm_parity.md) for the projection
+accumulation fix and remaining attention differences.
+
 The same checkpoint, two A100s, package versions, and `nvida.env` reproduce the
 earlier eight-token results. Extending each real-checkpoint turn to 32 tokens
 exposes a failure at 4,096-token padding. Each temperature/publication now checks

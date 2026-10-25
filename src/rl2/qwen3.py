@@ -120,6 +120,29 @@ def _compute_cast(x: jax.Array, dtype: jax.typing.DTypeLike) -> jax.Array:  # (.
     return x.astype(dtype)  # (...)
 
 
+def _linear(
+    inputs: jax.Array,  # (..., I)
+    weight: jax.Array,  # (O, I)
+    dtype: jax.typing.DTypeLike,
+    *,
+    output_dtype: jax.typing.DTypeLike | None = None,
+) -> jax.Array:  # (..., O)
+    # HIGHEST alone permits shape-dependent BF16 partial reductions in CUDA GEMMs.
+    # Keep FP32 outputs on HIGHEST to preserve FP32 cotangents during backward.
+    result_dtype = jnp.dtype(dtype if output_dtype is None else output_dtype)
+    precision = (
+        jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+        if jnp.dtype(dtype) == result_dtype == jnp.bfloat16
+        else jax.lax.Precision.HIGHEST
+    )
+    return jnp.matmul(
+        _compute_cast(inputs, dtype),
+        _compute_cast(weight, dtype).T,
+        precision=precision,
+        preferred_element_type=output_dtype,
+    )  # (..., O)
+
+
 def _rms_norm(x: jax.Array, weight: jax.Array, eps: float) -> jax.Array:  # (..., D), (D,)
     normalized = x.astype(jnp.float32)  # (..., D)
     normalized *= jax.lax.rsqrt(jnp.mean(jnp.square(normalized), axis=-1, keepdims=True) + eps)  # (..., D)
@@ -298,15 +321,8 @@ class Qwen3LM(nn.Module):
         x = _compute_cast(params["model.embed_tokens.weight"][tokens], self.dtype)  # (B, T, D)
         residual = jnp.zeros_like(x)  # (B, T, D)
 
-        def linear(inputs: jax.Array, weight: jax.Array) -> jax.Array:  # (..., in), (out, in)
-            return jnp.matmul(
-                _compute_cast(inputs, self.dtype),
-                _compute_cast(weight, self.dtype).T,
-                precision=jax.lax.Precision.HIGHEST,
-            )  # (..., out)
-
         def project(inputs: jax.Array, weight: jax.Array) -> jax.Array:  # (B, T, D), (N/K*H, D)
-            return linear(inputs, weight).reshape(batch, width, -1, config.head_dim)  # (B, T, N/K, H)
+            return _linear(inputs, weight, self.dtype).reshape(batch, width, -1, config.head_dim)  # (B, T, N/K, H)
 
         def rotate(projected: jax.Array) -> jax.Array:  # (B, T, N/K, H)
             return _rope(projected, position_ids, config.rope_theta)  # (B, T, N/K, H)
@@ -339,14 +355,14 @@ class Qwen3LM(nn.Module):
             attended = _attention(
                 query, key, value, mask, self.attention_backend, is_causal=cache is None
             )  # (B, T, N, H)
-            x = linear(attended.reshape(batch, width, -1), weights["self_attn.o_proj.weight"])  # (B, T, D)
+            x = _linear(attended.reshape(batch, width, -1), weights["self_attn.o_proj.weight"], self.dtype)  # (B, T, D)
             normalized, residual = _add_rms_norm(
                 x, residual, weights["post_attention_layernorm.weight"], config.rms_norm_eps
             )  # Each (B, T, D).
-            hidden = _silu(linear(normalized, weights["mlp.gate_proj.weight"])) * linear(
-                normalized, weights["mlp.up_proj.weight"]
+            hidden = _silu(_linear(normalized, weights["mlp.gate_proj.weight"], self.dtype)) * _linear(
+                normalized, weights["mlp.up_proj.weight"], self.dtype
             )  # (B, T, intermediate_size)
-            x = linear(hidden, weights["mlp.down_proj.weight"])  # (B, T, D)
+            x = _linear(hidden, weights["mlp.down_proj.weight"], self.dtype)  # (B, T, D)
             return (x, residual), layer_cache  # Two (B, T, D) arrays; optional (B, C, K, H) KV leaves.
 
         layers = [
@@ -380,11 +396,11 @@ class Qwen3LM(nn.Module):
         x, _ = _add_rms_norm(x, residual, params["model.norm.weight"], config.rms_norm_eps)  # Each (B, T, D).
         head = "model.embed_tokens" if config.tie_word_embeddings else "lm_head"
         # Keep the FP32 accumulator: BF16 logits amplify small hidden-state differences at softmax.
-        logits = jnp.matmul(
-            _compute_cast(x[:, -logits_to_keep:], self.dtype),
-            _compute_cast(params[head + ".weight"], self.dtype).T,
-            precision=jax.lax.Precision.HIGHEST,
-            preferred_element_type=jnp.float32,
+        logits = _linear(
+            x[:, -logits_to_keep:],
+            params[head + ".weight"],
+            self.dtype,
+            output_dtype=jnp.float32,
         )  # (B, U, V)
         if cache is not None:
             cache = cache._replace(
