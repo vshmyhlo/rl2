@@ -18,7 +18,12 @@ from rl2.agent_task import Environment, ToolCall, ToolCallError
 from rl2.tracing import span
 
 StopCondition = Literal[
-    "agent_completed", "environment_done", "max_turns", "max_tokens", "context_length", "unspecified"
+    "agent_completed",  # The model finished a response without tool calls.
+    "environment_done",  # A tool step reported that the environment episode ended.
+    "max_turns",  # The rollout reached its maximum number of model responses.
+    "max_tokens",  # The total transcript token budget prevented further generation.
+    "context_length",  # The model context window prevented further generation (wins ties with max_tokens).
+    "unspecified",  # No stop reason was recorded.
 ]
 
 

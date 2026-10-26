@@ -131,6 +131,13 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert pickle.loads(pickle.dumps(config)) == config
 
 
+def test_example_log_interval_config(tmp_path: Path) -> None:
+    assert training.Config().example_log_interval == 10
+    path = tmp_path / "config.yaml"
+    path.write_text("example_log_interval: 1\n")
+    assert training.load_config(path, training.Config).example_log_interval == 1
+
+
 def test_presets_use_telemetry_defaults() -> None:
     presets = Path(__file__).resolve().parents[1] / "configs/grpo_v2"
     for preset in sorted(presets.glob("alfworld.yaml")):
@@ -167,6 +174,8 @@ def test_appworld_preset_and_actor_task_discovery(monkeypatch: pytest.MonkeyPatc
         {"total_iterations": 0},
         {"checkpoint_interval": 0},
         {"checkpoint_interval": 1.5},
+        {"example_log_interval": 0},
+        {"example_log_interval": 1.5},
         {"max_tokens": 0},
         {"padding_multiple": 0},
         {"padding_multiple": 1.5},
@@ -1148,7 +1157,7 @@ def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.Monke
     assert len(saved) == 4
 
 
-def test_learner_logs_examples_every_ten_steps(
+def test_learner_logs_examples_at_configured_interval(
     learner: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level("INFO", logger=training.__name__)
@@ -1187,7 +1196,13 @@ def test_learner_logs_examples_every_ten_steps(
         ),
     ]
     learner.config = replace(
-        learner.config, num_groups=2, group_size=5, minibatches_per_epoch=1, total_iterations=21, prefetch_batches=3
+        learner.config,
+        num_groups=2,
+        group_size=5,
+        minibatches_per_epoch=1,
+        total_iterations=7,
+        prefetch_batches=3,
+        example_log_interval=3,
     )
     learner.initialize_weight_transfer = Mock()
     learner.publish_weights = Mock()
@@ -1221,13 +1236,13 @@ def test_learner_logs_examples_every_ten_steps(
         index
         for index, call in enumerate(learner.batcher.fetch_next_batch.remote.call_args_list, start=1)
         if call.kwargs["include_examples"]
-    ] == [10, 20]
+    ] == [3, 6]
     artifacts = writer.log_text.call_args_list[1:]  # Skip the config artifact.
-    assert [call.args[1] for call in artifacts] == ["examples/10.txt", "examples/20.txt"]
+    assert [call.args[1] for call in artifacts] == ["examples/3.txt", "examples/6.txt"]
     messages = [message for message in caplog.messages if "Rollout examples | step" in message]
     assert not messages
-    assert len([message for message in caplog.messages if message.startswith("iteration=")]) == 21
-    for step, call in zip((10, 20), artifacts, strict=True):
+    assert len([message for message in caplog.messages if message.startswith("iteration=")]) == 7
+    for step, call in zip((3, 6), artifacts, strict=True):
         text = call.args[0]
         assert text.startswith(f"Rollout examples | step {step}\n\n{'=' * 72}\n")
         assert "Example 1 | task=task-1 | reward=1.000 | advantage=0.500" in text
@@ -1593,10 +1608,11 @@ def test_score_group_normalizes_rewards(
     [
         pytest.param([1.0, 1.0], 0.0, [1.0, 1.0], id="disabled"),
         pytest.param([1.0, 1.0], 0.25, [0.75, 0.25], id="equal-successes"),
-        pytest.param([0.0, 0.0], 0.25, [-0.25, -0.75], id="equal-failures"),
-        pytest.param([0.0, 1.0], 0.25, [-0.25, 0.25], id="task-reward-outweighs-length"),
-        pytest.param([0.0, 1.0], 0.5, [-0.5, -0.5], id="adjusted-tie"),
-        pytest.param([0.0, 1.0], 1.0, [-1.0, -2.0], id="length-outweighs-task-reward"),
+        pytest.param([0.0, 0.0], 0.25, [0.0, 0.0], id="zero-rewards-unpenalized"),
+        pytest.param([-1.0, -1.0], 0.25, [-1.25, -1.75], id="negative-rewards-penalized"),
+        pytest.param([0.0, 1.0], 0.25, [0.0, 0.25], id="task-reward-outweighs-length"),
+        pytest.param([0.0, 0.75], 0.25, [0.0, 0.0], id="adjusted-tie"),
+        pytest.param([0.0, 1.0], 1.0, [0.0, -2.0], id="length-outweighs-task-reward"),
     ],
 )
 def test_score_group_length_penalty(

@@ -93,8 +93,10 @@ rewards for infrastructure failures.
 
 The actor samples `group_size` independent attempts at the same task. Set
 `length_penalty_coef` (default `0.0`, nonnegative) to subtract a reward cost per
-sampled token across all turns, including thinking and end-of-turn tokens:
+sampled token across all turns, including thinking and end-of-turn tokens, only
+when the environment reward is nonzero:
 `training_reward = reward - length_penalty_coef * num_output_tokens`.
+Zero environment rewards remain zero regardless of rollout length.
 Advantages are `(training_reward - group_mean) / (population_std + 1e-4)`;
 groups with equal adjusted rewards have zero advantages. The batcher gathers
 `num_groups` concurrently and preserves request order. Set
@@ -103,7 +105,7 @@ adjusted rewards and sample replacement tasks until all `num_groups` slots
 contain non-degenerate groups. There is no retry limit; collection can continue
 indefinitely if every group is degenerate. Batch metrics describe retained groups.
 `charts/reward_*` reports raw task rewards; `charts/training_reward_*` reports
-adjusted rewards. Within groups with equal task rewards, normalization can amplify even
+adjusted rewards. Within groups with equal nonzero task rewards, normalization can amplify even
 a small length penalty into substantial advantages favoring shorter rollouts.
 The batcher pads complete transcripts to `padding_multiple` (default 256),
 capped at the model context length. Oversized transcripts are rejected.
@@ -155,8 +157,9 @@ incompatible model changes. Local and `gs://` paths are supported.
 
 MLflow uses experiment `grpo_v2` and the standard tracking environment variables.
 The [module docstring](train_grpo_v2.py) defines metric names and aggregation.
-Every ten iterations it saves full token transcripts, final observations,
-rewards, and advantages. Stop fractions include zero for previously seen labels
+Every `example_log_interval` iterations (default 10, positive integer), it saves
+full token transcripts, final observations, rewards, and advantages.
+Stop fractions include zero for previously seen labels
 absent from the current batch.
 
 `enable_tracing` defaults to true and requires an OTLP endpoint. `submit.py`

@@ -133,9 +133,10 @@ class Config(BaseConfig):
     group_size: Annotated[int, Field(ge=2)] = 4
     prefetch_batches: Annotated[int, Field(ge=0)] = 1  # Batches generated ahead of the learner; 0 disables prefetch.
     drop_degenerate_groups: bool = False
-    length_penalty_coef: Annotated[float, Field(ge=0)] = 0.0  # Reward cost per sampled token across all turns.
+    length_penalty_coef: Annotated[float, Field(ge=0)] = 0.0  # Per-token cost for nonzero environment rewards.
     total_iterations: Annotated[int | None, Field(ge=1)] = None
     checkpoint_interval: Annotated[int, Field(gt=0)] = 100
+    example_log_interval: Annotated[int, Field(gt=0)] = 10
     max_tokens: Annotated[int, Field(ge=1)] = 512  # Total transcript tokens, including system, prompt, and tools.
     padding_multiple: Annotated[int, Field(ge=1)] = 256
     max_turns: Annotated[int, Field(ge=1)] = 3
@@ -254,7 +255,10 @@ class RolloutGroup:
 
     @property
     def training_rewards(self) -> list[float]:
-        return [rollout.reward - self.length_penalty_coef * rollout.num_output_tokens for rollout in self.rollouts]
+        return [
+            rollout.reward - self.length_penalty_coef * rollout.num_output_tokens if rollout.reward != 0 else 0.0
+            for rollout in self.rollouts
+        ]
 
     @property
     def is_degenerate(self) -> bool:
@@ -776,7 +780,7 @@ class Learner:
                         scalars["time/learner/update_seconds"],
                         scalars["time/learner/weight_transfer_seconds"],
                     )
-                    if iteration % 10 == 0:
+                    if iteration % self.config.example_log_interval == 0:
                         with span("learner.log_examples"):
                             examples = f"Rollout examples | step {iteration}\n\n{batch.examples}"
                             writer.log_text(examples, f"examples/{iteration}.txt")
@@ -809,7 +813,7 @@ class Learner:
                     num_groups=num_groups,
                     group_size=group_size,
                     context_length=self.model.config.max_position_embeddings,
-                    include_examples=(iteration + len(self._pending_batches)) % 10 == 0,
+                    include_examples=(iteration + len(self._pending_batches)) % self.config.example_log_interval == 0,
                 )
             )
         result = ray.get(self._pending_batches[0])

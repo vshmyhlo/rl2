@@ -558,6 +558,20 @@ sudo bash infra/k3s/training/cleanup-build-cache.sh
 The script forwards `buildctl prune` options; add `--keep-duration 24h` to retain
 recent cache. Subsequent builds may take longer while rebuilding pruned layers.
 
+To also remove incomplete `*.orbax-checkpoint-tmp` directories on the training
+volume and the invoking user's Hugging Face download caches:
+
+```bash
+bash infra/k3s/training/cleanup-disk.sh          # Preview only
+bash infra/k3s/training/cleanup-disk.sh --apply
+```
+
+Stop local training/downloads and new job submissions first. The script refuses
+cleanup while training Job pods are nonterminal; this check does not lock out
+new writers. Completed checkpoints and Hugging Face tokens are preserved.
+`HF_HOME` overrides the default Hugging Face cache location. Downloads and build
+cache will be recreated when needed.
+
 To check GPU visibility and preemption on an idle queue (creates and cleans up
 two short Jobs; the low-priority Job requests the full GPU quota):
 
