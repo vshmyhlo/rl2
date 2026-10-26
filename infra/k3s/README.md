@@ -244,7 +244,7 @@ need to edit Grafana settings. Username: `admin`; retrieve the password with:
 sudo k3s kubectl -n monitoring get secret gpu-grafana -o jsonpath='{.data.admin-password}' | base64 --decode
 ```
 
-Dashboards are provisioned from `monitoring/{gpu,job}-dashboard.json`. Edit those
+Dashboards are provisioned from `monitoring/*-dashboard.json`. Edit those
 files and reapply the Kustomization to change them. All services use ClusterIP;
 the localhost port-forward provides browser access. Chart versions are pinned
 in `monitoring/monitoring.yaml` and k3s's Helm controller manages installation.
@@ -268,7 +268,8 @@ assigned-GPU utilization/VRAM. Collection is automatic for Jobs in `training`,
 including `submit.py` jobs; no trainer flags or resubmission are needed.
 Prometheus scrapes kubelet cAdvisor through the authenticated API server proxy
 and kube-state-metrics every 15 seconds. The latter can list/watch only training
-Pods; Prometheus can GET the proxy for `vlad-dev-gpu-1` only. Only selected
+Pods; Prometheus can also list/watch training Pods and GET the proxy for
+`vlad-dev-gpu-1` only. Only selected
 container metrics from `training` are stored.
 
 Queries join Pod ownership at each historical timestamp, so retries and deleted
@@ -278,6 +279,25 @@ for up to seven days or 4 GB together with host/GPU metrics; there is no backfil
 Queued Jobs have no usage, very short runs may fall between scrapes, and rates
 need at least two samples. Disk counters depend on kubelet support. Assigned-GPU
 panels show device telemetry while assigned, not per-process GPU usage.
+
+Open [vLLM performance](http://localhost:8082/d/training-vllm-performance) or
+[vLLM queries](http://localhost:8082/d/training-vllm-query), then select a Job
+and optionally a model. Both are also linked from **Training job resources**,
+preserving the selected Job and time range. These adapt the official
+[vLLM dashboards](https://docs.vllm.ai/en/stable/examples/observability/dashboards/)
+from [v0.27.0](https://github.com/vllm-project/vllm/tree/v0.27.0/examples/observability/dashboards/grafana)
+(Apache-2.0), covering request rates, token throughput, token sizes, E2E latency,
+time to first token, and inter-token latency.
+
+Prometheus discovers running Job Pods in `training` with a container port named
+`vllm` and scrapes `/metrics` every 15 seconds. It stores only `vllm:*` metrics,
+with namespace, Job, and Pod labels attached at scrape time. `submit.py` declares
+port 8000 and sets `RL2_VLLM_HOST=0.0.0.0`; GRPO v2 uses that bind address while
+local runs default to loopback. The vLLM API is reachable on the Pod network;
+no host port or public Service is added. Resubmit existing GRPO v2 jobs to pick
+up these changes. Custom launchers must bind to the Pod network and declare
+their metrics port as `vllm`. Jobs without a vLLM server have no vLLM data and
+their scrape target stays down. Historical samples share the retention above.
 
 ```bash
 sudo k3s kubectl -n monitoring get pods,pvc

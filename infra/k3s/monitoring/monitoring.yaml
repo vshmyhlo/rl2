@@ -153,6 +153,31 @@ spec:
       - job_name: training-pods
         static_configs:
           - targets: [training-kube-state-metrics.monitoring.svc.cluster.local:8080]
+      - job_name: training-vllm
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [training]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_controller_kind]
+            regex: Job
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_phase]
+            regex: Running
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            regex: vllm
+            action: keep
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_controller_name]
+            target_label: job_name
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            regex: vllm:.*
+            action: keep
       - job_name: training-cadvisor
         scheme: https
         metrics_path: /api/v1/nodes/vlad-dev-gpu-1/proxy/metrics/cadvisor
@@ -285,4 +310,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: training-kube-state-metrics
+    namespace: monitoring
+  - kind: ServiceAccount
+    name: gpu-prometheus
     namespace: monitoring

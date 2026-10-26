@@ -64,6 +64,8 @@ def test_prepare_batch(batcher: Any, groups: list[training.RolloutGroup], contex
         )
         groups[0].rollouts[index] = replace(sample, sequence=sequence)
     batch = batcher.prepare_batch(groups, context_length=context_length)  # (B=2, T=width), (B,) leaves.
+    result = training.build_rollout_batch(groups=groups, training_batch=batch, transfer_metrics={})
+    assert result.rollout_metrics["batcher/token_utilization_fraction"] == pytest.approx(8 / (2 * width))
     assert batch.token_ids.shape == batch.attention_mask.shape == batch.loss_mask.shape == (2, width)
     assert batch.old_log_probs.shape == (2, width)
     assert batch.advantages.shape == (2,)
@@ -104,6 +106,8 @@ def test_prepare_batch_bucket_boundaries(
     sample = rollout([1] * length, [False] + [True] * (length - 1), 1.0)
     groups = [training.RolloutGroup(task_id="0", rollouts=[sample])]
     batch = batcher.prepare_batch(groups, context_length=context_length)  # (B=1, T=width), (B,) leaves.
+    result = training.build_rollout_batch(groups=groups, training_batch=batch, transfer_metrics={})
+    assert result.rollout_metrics["batcher/token_utilization_fraction"] == pytest.approx(length / width)
     assert all(array.shape == (1, width) for array in batch[:-1])
     assert batch.advantages.shape == (1,)
     assert int(batch.attention_mask.sum()) == length
@@ -117,6 +121,8 @@ def test_prepare_minimal_sequences_and_multiple_groups(batcher: Any) -> None:
         training.RolloutGroup(task_id="1", rollouts=[rollout([3, 4, 5], [False, True, True], 1.0)]),
     ]
     batch = batcher.prepare_batch(groups, context_length=8)  # (B=2, T=8), (B,) leaves.
+    result = training.build_rollout_batch(groups=groups, training_batch=batch, transfer_metrics={})
+    assert result.rollout_metrics["batcher/token_utilization_fraction"] == 5 / 16
     assert batch.token_ids.shape == (2, 8)
     np.testing.assert_array_equal(batch.token_ids[:, :3], [[0, 2, 0], [3, 4, 5]])
     np.testing.assert_array_equal(batch.attention_mask[:, :3], [[True, True, False], [True, True, True]])
@@ -164,7 +170,7 @@ def test_objective_clipping_masking_and_sequence_weighting() -> None:
     loss, metrics = training.objective(log_probs, batch, clip_coef=0.2)
     assert loss.shape == () and all(value.shape == () for value in metrics.values())
     assert float(loss) == pytest.approx(-0.2)
-    assert float(metrics["policy/clip_fraction"]) == 1.0
+    assert float(metrics["train/clip_fraction"]) == 1.0
     np.testing.assert_array_equal(jax.grad(loss_fn)(log_probs), 0)
     adverse = jnp.array([[jnp.log(0.5) - 0.7, 1000, 1000], [jnp.log(1.5) - 0.7] * 2 + [1000]])  # (B, T-1)
     assert float(loss_fn(adverse)) == pytest.approx(0.5)
@@ -264,13 +270,13 @@ def test_accumulated_update_matches_full_batch_and_improves_policy(
         np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-5)
     assert all(value.dtype == jnp.float32 for value in accumulated.params.values())
     assert all(value.shape == () for value in metrics.values())
-    assert float(metrics["policy/grad_norm"]) > 0.1  # Exercise gradient clipping.
-    assert float(metrics["policy/skipped_update"]) == 0.0
+    assert float(metrics["train/gradient_norm"]) > 0.1  # Exercise gradient clipping.
+    assert float(metrics["train/skipped_update_fraction"]) == 0.0
     for name in metrics:
         np.testing.assert_allclose(metrics[name], full_metrics[name], atol=1e-6)
     after = training.token_log_probs(accumulated, accumulated.params, batch, temperature=0.7)  # (B, T-1)
     loss, _ = training.objective(after, batch, clip_coef=0.2)
-    assert float(loss) < float(metrics["losses/policy"])
+    assert float(loss) < float(metrics["train/policy_loss"])
     assert any(not np.array_equal(state.params[name], value) for name, value in accumulated.params.items())
 
 
@@ -303,14 +309,14 @@ def test_zero_advantages_preserve_optimizer_state(
     updated, metrics = training.update(
         jax.tree.map(jnp.copy, state), batch, grad_accum_steps=2, temperature=0.7, clip_coef=0.2
     )
-    assert float(metrics["policy/grad_norm"]) == float(metrics["losses/policy"]) == 0.0
+    assert float(metrics["train/gradient_norm"]) == float(metrics["train/policy_loss"]) == 0.0
     assert all(value.shape == () for value in metrics.values())
     assert {name: float(value) for name, value in metrics.items()} == {
-        "losses/policy": 0.0,
-        "policy/approx_kl": 0.0,
-        "policy/clip_fraction": 0.0,
-        "policy/grad_norm": 0.0,
-        "policy/skipped_update": 1.0,
+        "train/policy_loss": 0.0,
+        "train/approx_kl": 0.0,
+        "train/clip_fraction": 0.0,
+        "train/gradient_norm": 0.0,
+        "train/skipped_update_fraction": 1.0,
     }
     for actual, expected in zip(jax.tree.leaves(updated), jax.tree.leaves(state), strict=True):
         assert actual.shape == expected.shape
@@ -353,14 +359,14 @@ def test_learner_shuffles_each_epoch_and_averages_metrics(
         assert minibatch.advantages.shape == (8 // minibatches,)
         assert kwargs["grad_accum_steps"] == 1
         observed.append(minibatch)
-        return current.replace(step=current.step + 1), {"losses/policy": jnp.asarray(current.step)}  # () metric.
+        return current.replace(step=current.step + 1), {"train/policy_loss": jnp.asarray(current.step)}  # () metric.
 
     monkeypatch.setattr(training, "update", update)
     host_batch = jax.tree.map(np.asarray, batch)  # (B, T), (B,) leaves.
     metrics = learner.optimize(host_batch)
     steps = epochs * minibatches
     assert int(learner.state.step) == steps
-    assert metrics == {"losses/policy": (steps - 1) / 2}
+    assert metrics == {"train/policy_loss": (steps - 1) / 2}
     learner.optimize(host_batch)
     orders: list[np.ndarray] = []  # Each epoch: (B,).
     for start in range(0, len(observed), minibatches):
@@ -447,7 +453,7 @@ def test_learner_optimizes_and_publishes_updated_bf16_weights(
             assert placed.sharding == NamedSharding(learner.mesh, PartitionSpec("batch"))
             np.testing.assert_array_equal(placed, original[indices])
     assert int(learner.state.step) == 4
-    assert metrics["policy/grad_norm"] > 0
+    assert metrics["train/gradient_norm"] > 0
     assert all(isinstance(value, float) for value in metrics.values())
     for name, value in learner.state.params.items():  # HF parameter shapes.
         assert value.shape == state.params[name].shape

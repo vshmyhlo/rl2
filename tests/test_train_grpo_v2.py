@@ -234,8 +234,11 @@ def test_sampling_temperature_bounds(temperature: float) -> None:
     assert training.Config(temperature=temperature).temperature == temperature
 
 
-@pytest.mark.parametrize("failure", [None, "launch", "rollout", "shutdown"])
+@pytest.mark.parametrize("failure", [None, "launch", "rollout", "shutdown", "pod-network"])
 def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RL2_VLLM_HOST", raising=False)
+    if failure == "pod-network":
+        monkeypatch.setenv("RL2_VLLM_HOST", "0.0.0.0")
     command = [
         sys.executable,
         "-m",
@@ -243,7 +246,7 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
         "--model",
         "Qwen/Qwen3-0.6B",
         "--host",
-        "127.0.0.1",
+        "0.0.0.0" if failure == "pod-network" else "127.0.0.1",
         "--port",
         "8000",
         "--dtype",
@@ -654,7 +657,7 @@ def test_learner_prefetches_bounded_batches(
     )
     batch = training.build_rollout_batch(
         groups=[training.RolloutGroup(task_id="0", rollouts=[rollout] * 2)],
-        training_batch=Mock(spec=training.GRPOBatch),
+        training_batch=Mock(spec=training.GRPOBatch, attention_mask=np.ones((2, 2), dtype=np.bool_)),  # (B, T)
         transfer_metrics={},
     )
     results = [
@@ -693,7 +696,7 @@ def test_learner_cancels_prefetch_on_update_failure(
     learner.publish_weights = Mock()
     batch = training.build_rollout_batch(
         groups=[training.RolloutGroup(task_id="0", rollouts=[rollout] * 4)],
-        training_batch=Mock(spec=training.GRPOBatch),
+        training_batch=Mock(spec=training.GRPOBatch, attention_mask=np.ones((4, 2), dtype=np.bool_)),  # (B, T)
         transfer_metrics={},
     )
     first = training.Transfer(value=batch, ready_at=0.0)
@@ -744,7 +747,7 @@ def test_batch_refills_degenerate_groups(drop_degenerate_groups: bool, rollout: 
         [rollout.advantage for group in expected_groups for rollout in group.rollouts],
     )
     assert batch.examples == training.format_rollout_examples(expected_groups)
-    assert batch.rollout_metrics["charts/degenerate_group_fraction"] == (0.0 if drop_degenerate_groups else 1.0)
+    assert batch.rollout_metrics["rollout/degenerate_group_fraction"] == (0.0 if drop_degenerate_groups else 1.0)
     assert batch.num_output_tokens == 4
     assert batch.stop_counts == {"agent_completed": 4}
 
@@ -859,10 +862,10 @@ def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
     assert "Example 3 | task=1" in batch.examples
     assert batch.training_batch.token_ids.shape == (4, 8)
     assert batch.transfer_metrics == {
-        "time/batcher/fetch_rollout_seconds": 50.5,
-        "time/batcher/prepare_batch_seconds": 2.0,
-        "time/batcher/actor_to_batcher_seconds": 0.375,
-        "time/learner/batcher_to_learner_seconds": 0.75,
+        "batcher/fetch_rollout_seconds": 50.5,
+        "batcher/prepare_batch_seconds": 2.0,
+        "batcher/actor_transfer_seconds_mean": 0.375,
+        "learner/batcher_transfer_seconds": 0.75,
     }
     assert not [record for record in caplog.records if record.name == training.__name__]
 
@@ -969,13 +972,14 @@ def test_learner_logs_rollouts(
     learner.initialize_weight_transfer = steps.initialize
     learner.fetch_next_batch = steps.fetch
     transfer_metrics = {
-        "time/batcher/fetch_rollout_seconds": 0.5,
-        "time/batcher/prepare_batch_seconds": 0.25,
-        "time/batcher/actor_to_batcher_seconds": 0.25,
-        "time/learner/batcher_to_learner_seconds": 0.125,
+        "batcher/fetch_rollout_seconds": 0.5,
+        "batcher/prepare_batch_seconds": 0.25,
+        "batcher/actor_transfer_seconds_mean": 0.25,
+        "learner/batcher_transfer_seconds": 0.125,
     }
     prepared = Mock(spec=training.GRPOBatch)
     prepared.token_ids = Mock(shape=(4, 8))  # (B=4, T=8)
+    prepared.attention_mask = np.tile([True, True, False, False, False, False, False, False], (4, 1))  # (B=4, T=8)
     received = training.build_rollout_batch(groups=batch, training_batch=prepared, transfer_metrics=transfer_metrics)
     next_batch = training.build_rollout_batch(
         groups=[
@@ -991,7 +995,7 @@ def test_learner_logs_rollouts(
     def optimize(batch: training.GRPOBatch[np.ndarray]) -> dict[str, float]:
         assert batch is prepared
         learner.state = learner.state.replace(step=learner.state.step + 1)
-        return {"losses/policy": -0.25}
+        return {"train/policy_loss": -0.25}
 
     steps.optimize.side_effect = optimize
     learner.optimize = steps.optimize
@@ -1030,53 +1034,54 @@ def test_learner_logs_rollouts(
     calls = writer.log_metrics.call_args_list
     assert len(calls) == (2 if fails else 3)
     assert calls[0].kwargs == {"step": 0}
-    assert calls[0].args[0] == {"model/params_millions": 9 / 1_000_000, "time/learner/setup_seconds": 1}
+    assert calls[0].args[0] == {"model/parameters_millions": 9 / 1_000_000, "learner/setup_seconds": 1}
     assert calls[1].kwargs == {"step": 1}
     assert calls[1].args[0] == {
         **transfer_metrics,
-        "losses/policy": -0.25,
-        "charts/reward_mean": mean(rewards),
-        "charts/reward_std": pstdev(rewards),
-        "charts/reward_min": 0.0,
-        "charts/reward_max": 1.0,
-        "charts/training_reward_mean": mean(rewards),
-        "charts/training_reward_std": pstdev(rewards),
-        "charts/training_reward_min": 0.0,
-        "charts/training_reward_max": 1.0,
-        "charts/degenerate_group_fraction": degenerate_fraction,
-        "charts/stop_condition_fraction/agent_completed": 0.5,
-        "charts/stop_condition_fraction/environment_done": 0.0,
-        "charts/stop_condition_fraction/max_tokens": 0.0,
-        "charts/stop_condition_fraction/context_length": 0.0,
-        "charts/stop_condition_fraction/max_turns": 0.25,
-        "charts/stop_condition_fraction/unspecified": 0.25,
-        "charts/turns_mean": 2.0,
-        "charts/input_tokens_mean": 4.0,
-        "charts/output_tokens_mean": 4.0,
-        "charts/total_iterations": 1,
-        "charts/total_updates": 1,
-        "charts/learning_rate": learner.config.learning_rate,
-        "charts/total_rollouts": 4,
-        "time/learner/iterations_per_second": 1 / 3,
-        "time/learner/rollouts_per_second": 4 / 3,
-        "time/learner/output_tokens_per_second": 16 / 3,
-        "time/actor/rollout_seconds": 1.0,
-        "time/learner/batch_fetch_seconds": 1.0,
-        "time/learner/update_seconds": 1.0,
-        "time/learner/weight_transfer_seconds": 1.0,
-        "time/learner/iteration_seconds": 3.0,
+        "train/policy_loss": -0.25,
+        "rollout/reward_mean": mean(rewards),
+        "rollout/reward_std": pstdev(rewards),
+        "rollout/reward_min": 0.0,
+        "rollout/reward_max": 1.0,
+        "rollout/adjusted_reward_mean": mean(rewards),
+        "rollout/adjusted_reward_std": pstdev(rewards),
+        "rollout/adjusted_reward_min": 0.0,
+        "rollout/adjusted_reward_max": 1.0,
+        "rollout/degenerate_group_fraction": degenerate_fraction,
+        "rollout/stop_fraction/agent_completed": 0.5,
+        "rollout/stop_fraction/environment_done": 0.0,
+        "rollout/stop_fraction/max_tokens": 0.0,
+        "rollout/stop_fraction/context_length": 0.0,
+        "rollout/stop_fraction/max_turns": 0.25,
+        "rollout/stop_fraction/unspecified": 0.25,
+        "rollout/turns_mean": 2.0,
+        "rollout/input_tokens_mean": 4.0,
+        "rollout/output_tokens_mean": 4.0,
+        "batcher/token_utilization_fraction": 0.25,
+        "train/iterations_total": 1,
+        "train/updates_total": 1,
+        "train/learning_rate": learner.config.learning_rate,
+        "train/rollouts_total": 4,
+        "learner/iterations_per_second": 1 / 3,
+        "learner/rollouts_per_second": 4 / 3,
+        "learner/output_tokens_per_second": 16 / 3,
+        "actor/rollout_seconds_mean": 1.0,
+        "learner/batch_fetch_seconds": 1.0,
+        "learner/update_seconds": 1.0,
+        "learner/weight_transfer_seconds": 1.0,
+        "learner/iteration_seconds": 3.0,
     }
     if not fails:
         assert calls[2].kwargs == {"step": 2}
-        assert calls[2].args[0]["charts/total_rollouts"] == 8
-        assert calls[2].args[0]["charts/degenerate_group_fraction"] == degenerate_fraction
-        assert {key: value for key, value in calls[2].args[0].items() if "stop_condition_fraction/" in key} == {
-            "charts/stop_condition_fraction/agent_completed": 0.0,
-            "charts/stop_condition_fraction/max_tokens": 0.0,
-            "charts/stop_condition_fraction/context_length": 0.0,
-            "charts/stop_condition_fraction/max_turns": 0.0,
-            "charts/stop_condition_fraction/unspecified": 0.0,
-            "charts/stop_condition_fraction/environment_done": 1.0,
+        assert calls[2].args[0]["train/rollouts_total"] == 8
+        assert calls[2].args[0]["rollout/degenerate_group_fraction"] == degenerate_fraction
+        assert {key: value for key, value in calls[2].args[0].items() if "stop_fraction/" in key} == {
+            "rollout/stop_fraction/agent_completed": 0.0,
+            "rollout/stop_fraction/max_tokens": 0.0,
+            "rollout/stop_fraction/context_length": 0.0,
+            "rollout/stop_fraction/max_turns": 0.0,
+            "rollout/stop_fraction/unspecified": 0.0,
+            "rollout/stop_fraction/environment_done": 1.0,
         }
     assert "Run ID: None; MLflow run: mlflow-run" in caplog.messages
     assert (
@@ -1116,13 +1121,13 @@ def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.Monke
         prepared.token_ids = Mock(shape=(num_groups * group_size, 8))  # (B, T=8)
         return training.RolloutBatch(
             training_batch=prepared,
-            rollout_metrics={"charts/reward_mean": 1.0, "charts/degenerate_group_fraction": 0.0},
+            rollout_metrics={"rollout/reward_mean": 1.0, "rollout/degenerate_group_fraction": 0.0},
             stop_counts={"max_turns" if not saved else "agent_completed": num_groups * group_size},
             num_output_tokens=4,
             examples="",
             transfer_metrics={
-                "time/batcher/actor_to_batcher_seconds": 0.0,
-                "time/learner/batcher_to_learner_seconds": 0.0,
+                "batcher/actor_transfer_seconds_mean": 0.0,
+                "learner/batcher_transfer_seconds": 0.0,
             },
         )
 
@@ -1130,7 +1135,7 @@ def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.Monke
         learner.state = learner.state.replace(
             step=learner.state.step + learner.config.update_epochs * learner.config.minibatches_per_epoch
         )
-        return {"losses/policy": 0.0}
+        return {"train/policy_loss": 0.0}
 
     def save(manager: Any, progress: training.TrainingProgress, config: training.Config) -> float:
         assert published_steps[-1] == int(progress.train_state.step)
@@ -1164,10 +1169,10 @@ def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.Monke
     writer.log_text.assert_called_once_with(yaml.safe_dump(asdict(learner.config)), "config/3.yaml")
     assert [call.kwargs["step"] for call in writer.log_metrics.call_args_list] == [3, 4, 5]
     metrics = writer.log_metrics.call_args.args[0]
-    assert metrics["charts/total_rollouts"] == 28
-    assert metrics["charts/total_updates"] == 28
-    assert metrics["charts/stop_condition_fraction/max_turns"] == 0
-    assert metrics["time/checkpoint_seconds"] == 0.5
+    assert metrics["train/rollouts_total"] == 28
+    assert metrics["train/updates_total"] == 28
+    assert metrics["rollout/stop_fraction/max_turns"] == 0
+    assert metrics["checkpoint/save_seconds"] == 0.5
 
     # A run already at its cumulative target does not train or overwrite its checkpoint.
     learner.fetch_next_batch.reset_mock()
@@ -1225,9 +1230,10 @@ def test_learner_logs_examples_at_configured_interval(
     )
     learner.initialize_weight_transfer = Mock()
     learner.publish_weights = Mock()
-    learner.optimize = Mock(return_value={"losses/policy": 0.0})
+    learner.optimize = Mock(return_value={"train/policy_loss": 0.0})
     prepared = Mock(spec=training.GRPOBatch)
     prepared.token_ids = Mock(shape=(10, 8))  # (B=10, T=8)
+    prepared.attention_mask = np.ones((10, 8), dtype=np.bool_)  # (B=10, T=8)
     format_examples = Mock(wraps=training.format_rollout_examples)
     monkeypatch.setattr(training, "format_rollout_examples", format_examples)
 
@@ -1237,7 +1243,7 @@ def test_learner_logs_examples_at_configured_interval(
         batch = training.build_rollout_batch(
             groups=groups,
             training_batch=prepared,
-            transfer_metrics={"time/batcher/actor_to_batcher_seconds": 0.0},
+            transfer_metrics={"batcher/actor_transfer_seconds_mean": 0.0},
             include_examples=include_examples,
         )
         return training.Transfer(value=batch, ready_at=training.time.monotonic())
@@ -1680,10 +1686,10 @@ def test_length_penalty_actor_batcher_integration(
     assert handle.fetch_next_group.remote.call_count == 1
     assert batch.training_batch.advantages.shape == (2,)
     np.testing.assert_allclose(batch.training_batch.advantages, [0.125 / 0.1251, -0.125 / 0.1251])
-    assert batch.rollout_metrics["charts/degenerate_group_fraction"] == 0.0
+    assert batch.rollout_metrics["rollout/degenerate_group_fraction"] == 0.0
     for suffix, raw, adjusted in (("mean", 1.0, 0.625), ("std", 0.0, 0.125), ("min", 1.0, 0.5), ("max", 1.0, 0.75)):
-        assert batch.rollout_metrics[f"charts/reward_{suffix}"] == raw
-        assert batch.rollout_metrics[f"charts/training_reward_{suffix}"] == adjusted
+        assert batch.rollout_metrics[f"rollout/reward_{suffix}"] == raw
+        assert batch.rollout_metrics[f"rollout/adjusted_reward_{suffix}"] == adjusted
 
 
 def test_batcher_collects_groups_concurrently(

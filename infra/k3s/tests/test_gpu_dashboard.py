@@ -231,6 +231,68 @@ def test_job_dashboard_isolates_jobs_and_tracks_replaced_pods() -> None:
     )
 
 
+def test_vllm_dashboards_isolate_jobs_and_combine_replacement_pods() -> None:
+    root = Path(__file__).parents[1] / "monitoring"
+    dashboards = [json.loads((root / f"vllm-{name}-dashboard.json").read_text()) for name in ["performance", "query"]]
+    expressions = {
+        target["expr"]
+        for dashboard in dashboards
+        for panel in dashboard["panels"]
+        for target in panel.get("targets", [])
+    }
+    metrics = set(re.findall(r"vllm:\w+", " ".join(expressions)))
+    inputs = []
+    for namespace, job, pod in [
+        ("training", "selected", "old"),
+        ("training", "selected", "replacement"),
+        ("training", "other", "unrelated"),
+        ("other", "selected", "unrelated"),
+    ]:
+        labels = f'job="training-vllm",namespace="{namespace}",job_name="{job}",pod="{pod}",model_name="model"'
+        for metric in metrics:
+            if metric.endswith("_bucket"):
+                for boundary, increment in [("1", 60), ("4", 120), ("+Inf", 120)]:
+                    inputs.append({"series": f'{metric}{{{labels},le="{boundary}"}}', "values": f"0+{increment}x4"})
+            else:
+                increment = 360 if metric.endswith("_sum") else 120
+                inputs.append({"series": f"{metric}{{{labels}}}", "values": f"0+{increment}x4"})
+
+    def render(expression: str, job: str) -> str:
+        return (
+            expression.replace("$namespace", "training")
+            .replace("$job_name", job)
+            .replace("$model_name", "model")
+            .replace("$__rate_interval", "2m")
+            .replace("$__range", "2m")
+        )
+
+    checks = [
+        {"expr": render(expression, "absent"), "eval_time": "4m", "exp_samples": []}
+        for expression in sorted(expressions)
+    ]
+    expected = {
+        "E2E Latency over Time": [3],
+        "TTFT Over Time": [3],
+        "E2E Latency (P50)": [1],
+        "E2E Latency (P99)": [3.94],
+        "TPS (Tokens Per Second) Over Time": [4, 4, 12],
+    }
+    for panel in dashboards[0]["panels"]:
+        if panel["title"] not in expected:
+            continue
+        for target, value in zip(panel["targets"], expected[panel["title"]], strict=True):
+            checks.append(
+                {
+                    "expr": render(target["expr"], "selected"),
+                    "eval_time": "4m",
+                    "exp_samples": [{"labels": "{}", "value": value}],
+                }
+            )
+    _check_promql(
+        {"evaluation_interval": "1m", "tests": [{"interval": "1m", "input_series": inputs, "promql_expr_test": checks}]}
+    )
+
+
 def _check_promql(suite: dict[str, Any]) -> None:
     result = subprocess.run(
         [

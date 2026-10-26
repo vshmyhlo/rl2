@@ -104,7 +104,7 @@ groups with equal adjusted rewards have zero advantages. The batcher gathers
 adjusted rewards and sample replacement tasks until all `num_groups` slots
 contain non-degenerate groups. There is no retry limit; collection can continue
 indefinitely if every group is degenerate. Batch metrics describe retained groups.
-`charts/reward_*` reports raw task rewards; `charts/training_reward_*` reports
+`rollout/reward_*` reports raw task rewards; `rollout/adjusted_reward_*` reports
 adjusted rewards. Within groups with equal nonzero task rewards, normalization can amplify even
 a small length penalty into substantial advantages favoring shorter rollouts.
 The batcher pads complete transcripts to `padding_multiple` (default 256),
@@ -128,7 +128,7 @@ Temperature is restricted to `[0.01, 2.0]`; vLLM returns
 Each iteration makes `update_epochs` passes with `minibatches_per_epoch` optimizer
 minibatches per pass. `grad_accum_steps` splits each minibatch into microbatches.
 Minibatches with all-zero advantages skip forward/backward computation and preserve
-parameters, Adam state, and the optimizer step. `policy/skipped_update` reports the
+parameters, Adam state, and the optimizer step. `train/skipped_update_fraction` reports the
 skipped fraction; skipped minibatches contribute zero to the other optimization metrics.
 `minibatches_per_epoch * grad_accum_steps` must divide `num_groups * group_size`.
 Shuffling uses the saved seed and optimizer step. Initial and updated weights
@@ -166,7 +166,7 @@ absent from the current batch.
 supplies the cluster's Tempo endpoint. Spans cover iterations, rollout groups,
 episodes, environment reset/step calls, model requests, batching, updates,
 weight transfer, logging, and checkpoints. Model spans count full request input
-tokens; `charts/input_tokens_mean` counts context tokens appended per episode.
+tokens; `rollout/input_tokens_mean` counts context tokens appended per episode.
 See [cluster tracing access](../../infra/k3s/README.md#opentelemetry-traces-with-tempo).
 
 `enable_ray_dashboard` and `enable_ray_timeline` default to false. Enable them

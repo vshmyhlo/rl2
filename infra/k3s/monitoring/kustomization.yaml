@@ -13,5 +13,7 @@ configMapGenerator:
     files:
       - gpu-dashboard.json
       - job-dashboard.json
+      - vllm-performance-dashboard.json
+      - vllm-query-dashboard.json
     options:
       disableNameSuffixHash: true

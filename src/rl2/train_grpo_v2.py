@@ -9,55 +9,56 @@ its optimizer updates, and publication of the updated weights. All metrics below
 are logged every iteration except startup scalars and checkpoint timing.
 
 Startup scalars (at the restored iteration, or step 0 for a new run):
-    model/params_millions: Model parameter count in millions.
-    time/learner/setup_seconds: Model/optimizer setup, checkpoint restore, NCCL initialization, and initial publication wall time.
+    model/parameters_millions: Model parameter count in millions.
+    learner/setup_seconds: Model/optimizer setup, checkpoint restore, NCCL initialization, and initial publication wall time.
 
 Optimization scalars (averaged over minibatches and update epochs):
-    losses/policy: Clipped GRPO policy loss.
-    policy/approx_kl: Mean exp(log_ratio) - 1 - log_ratio, where log_ratio is learner minus sampling log-probability.
-    policy/clip_fraction: Fraction of sampled-token probability ratios outside the clip range.
-    policy/grad_norm: Global gradient norm after microbatch averaging, before clipping.
-    policy/skipped_update: Fraction of optimizer minibatches skipped because all advantages are zero.
+    train/policy_loss: Clipped GRPO policy loss.
+    train/approx_kl: Mean exp(log_ratio) - 1 - log_ratio, where log_ratio is learner minus sampling log-probability.
+    train/clip_fraction: Fraction of sampled-token probability ratios outside the clip range.
+    train/gradient_norm: Global gradient norm after microbatch averaging, before clipping.
+    train/skipped_update_fraction: Fraction of optimizer minibatches skipped because all advantages are zero.
 Loss, KL, and clip fraction average sampled tokens within each rollout, then rollouts.
 Skipped minibatches contribute zero to loss, KL, clip fraction, and gradient norm metrics.
 
 Rollout batch scalars:
-    charts/reward_mean: Mean raw rollout reward.
-    charts/reward_std: Population standard deviation of raw rollout rewards.
-    charts/reward_min: Minimum raw rollout reward.
-    charts/reward_max: Maximum raw rollout reward.
-    charts/training_reward_mean: Mean rollout reward after the length penalty.
-    charts/training_reward_std: Population standard deviation of adjusted rollout rewards.
-    charts/training_reward_min: Minimum adjusted rollout reward.
-    charts/training_reward_max: Maximum adjusted rollout reward.
-    charts/degenerate_group_fraction: Fraction of groups with identical adjusted rewards and zero advantages.
-    charts/stop_condition_fraction/<label>: Fraction of batch rollouts with each StopCondition.
-    charts/turns_mean: Mean model responses per rollout.
-    charts/input_tokens_mean: Mean context tokens appended per rollout, excluding sampled tokens.
-    charts/output_tokens_mean: Mean sampled tokens per rollout across all model calls.
+    rollout/reward_mean: Mean raw rollout reward.
+    rollout/reward_std: Population standard deviation of raw rollout rewards.
+    rollout/reward_min: Minimum raw rollout reward.
+    rollout/reward_max: Maximum raw rollout reward.
+    rollout/adjusted_reward_mean: Mean rollout reward after the length penalty.
+    rollout/adjusted_reward_std: Population standard deviation of adjusted rollout rewards.
+    rollout/adjusted_reward_min: Minimum adjusted rollout reward.
+    rollout/adjusted_reward_max: Maximum adjusted rollout reward.
+    rollout/degenerate_group_fraction: Fraction of groups with identical adjusted rewards and zero advantages.
+    rollout/stop_fraction/<label>: Fraction of batch rollouts with each StopCondition.
+    rollout/turns_mean: Mean model responses per rollout.
+    rollout/input_tokens_mean: Mean context tokens appended per rollout, excluding sampled tokens.
+    rollout/output_tokens_mean: Mean sampled tokens per rollout across all model calls.
+    batcher/token_utilization_fraction: Non-padding transcript tokens divided by batch size times padded sequence length.
 Stop-condition labels are added as observed; previously seen labels log zero when
 absent from a later batch.
 
 Training progress and settings:
-    charts/total_iterations: Cumulative completed training iterations.
-    charts/total_updates: Cumulative optimizer updates, excluding skipped minibatches.
-    charts/total_rollouts: Cumulative rollouts used for training.
-    charts/learning_rate: Configured optimizer learning rate.
+    train/iterations_total: Cumulative completed training iterations.
+    train/updates_total: Cumulative optimizer updates, excluding skipped minibatches.
+    train/rollouts_total: Cumulative rollouts used for training.
+    train/learning_rate: Configured optimizer learning rate.
 
 Timing and throughput (logged every iteration unless noted):
-    time/learner/iterations_per_second: Reciprocal of iteration wall time.
-    time/learner/rollouts_per_second: Batch rollout count divided by iteration wall time.
-    time/learner/output_tokens_per_second: Batch sampled-token count divided by iteration wall time.
-    time/actor/rollout_seconds: Mean agent execution time per rollout, including model calls and environment steps.
-    time/batcher/fetch_rollout_seconds: Wall time fetching all rollout groups, including actor return transfers.
-    time/batcher/prepare_batch_seconds: Wall time preparing the CPU training arrays without explicit synchronization.
-    time/learner/batch_fetch_seconds: Wall time fetching the rollout batch, including generation, scoring, and Ray transfers.
-    time/learner/update_seconds: Device transfer and optimizer update wall time.
-    time/learner/weight_transfer_seconds: Wall time publishing updated learner weights to vLLM.
-    time/learner/iteration_seconds: Batch fetching, optimization, and weight publication wall time.
-    time/checkpoint_seconds: Checkpoint save wall time, including completion of writes; logged on saves.
-    time/batcher/actor_to_batcher_seconds: Mean group transfer latency from actor return to batcher receipt.
-    time/learner/batcher_to_learner_seconds: Time from batcher return to learner receipt, including prefetch buffering.
+    learner/iterations_per_second: Reciprocal of iteration wall time.
+    learner/rollouts_per_second: Batch rollout count divided by iteration wall time.
+    learner/output_tokens_per_second: Batch sampled-token count divided by iteration wall time.
+    actor/rollout_seconds_mean: Mean agent execution time per rollout, including model calls and environment steps.
+    batcher/fetch_rollout_seconds: Wall time fetching all rollout groups, including actor return transfers.
+    batcher/prepare_batch_seconds: Wall time preparing the CPU training arrays without explicit synchronization.
+    learner/batch_fetch_seconds: Wall time fetching the rollout batch, including generation, scoring, and Ray transfers.
+    learner/update_seconds: Device transfer and optimizer update wall time.
+    learner/weight_transfer_seconds: Wall time publishing updated learner weights to vLLM.
+    learner/iteration_seconds: Batch fetching, optimization, and weight publication wall time.
+    checkpoint/save_seconds: Checkpoint save wall time, including completion of writes; logged on saves.
+    batcher/actor_transfer_seconds_mean: Mean group transfer latency from actor return to batcher receipt.
+    learner/batcher_transfer_seconds: Time from batcher return to learner receipt, including prefetch buffering.
 Ray transfer latencies include serialization, transport, deserialization, and
 scheduling, using a shared single-node monotonic clock. Timing intervals overlap
 and should not be summed. Iteration timing and throughput exclude that iteration's
@@ -323,19 +324,20 @@ def build_rollout_batch(
     return RolloutBatch(
         training_batch=training_batch,
         rollout_metrics={
-            "charts/reward_mean": mean(rewards),
-            "charts/reward_std": pstdev(rewards),
-            "charts/reward_min": min(rewards),
-            "charts/reward_max": max(rewards),
-            "charts/training_reward_mean": mean(training_rewards),
-            "charts/training_reward_std": pstdev(training_rewards),
-            "charts/training_reward_min": min(training_rewards),
-            "charts/training_reward_max": max(training_rewards),
-            "charts/degenerate_group_fraction": mean(group.is_degenerate for group in groups),
-            "charts/turns_mean": mean(rollout.num_turns for rollout in rollouts),
-            "charts/input_tokens_mean": mean(rollout.num_input_tokens for rollout in rollouts),
-            "charts/output_tokens_mean": mean(rollout.num_output_tokens for rollout in rollouts),
-            "time/actor/rollout_seconds": mean(rollout.rollout_seconds for rollout in rollouts),
+            "rollout/reward_mean": mean(rewards),
+            "rollout/reward_std": pstdev(rewards),
+            "rollout/reward_min": min(rewards),
+            "rollout/reward_max": max(rewards),
+            "rollout/adjusted_reward_mean": mean(training_rewards),
+            "rollout/adjusted_reward_std": pstdev(training_rewards),
+            "rollout/adjusted_reward_min": min(training_rewards),
+            "rollout/adjusted_reward_max": max(training_rewards),
+            "rollout/degenerate_group_fraction": mean(group.is_degenerate for group in groups),
+            "rollout/turns_mean": mean(rollout.num_turns for rollout in rollouts),
+            "rollout/input_tokens_mean": mean(rollout.num_input_tokens for rollout in rollouts),
+            "rollout/output_tokens_mean": mean(rollout.num_output_tokens for rollout in rollouts),
+            "batcher/token_utilization_fraction": float(training_batch.attention_mask.mean()),
+            "actor/rollout_seconds_mean": mean(rollout.rollout_seconds for rollout in rollouts),
         },
         stop_counts=Counter(rollout.stop_condition for rollout in rollouts),
         num_output_tokens=sum(rollout.num_output_tokens for rollout in rollouts),
@@ -380,9 +382,9 @@ def objective(
     advantages = batch.advantages[:, None]  # (B, 1)
     loss = -average(jnp.minimum(ratio * advantages, jnp.clip(ratio, 1 - clip_coef, 1 + clip_coef) * advantages))  # ()
     return loss, {
-        "losses/policy": loss,  # ()
-        "policy/approx_kl": average(jnp.expm1(log_ratio) - log_ratio),  # ()
-        "policy/clip_fraction": average((jnp.abs(ratio - 1) > clip_coef).astype(jnp.float32)),  # ()
+        "train/policy_loss": loss,  # ()
+        "train/approx_kl": average(jnp.expm1(log_ratio) - log_ratio),  # ()
+        "train/clip_fraction": average((jnp.abs(ratio - 1) > clip_coef).astype(jnp.float32)),  # ()
     }
 
 
@@ -437,17 +439,17 @@ def update(
         )  # HF parameter shapes; metric leaves: (A,).
         gradients = jax.tree.map(lambda value: value / grad_accum_steps, gradients)  # HF parameter shapes.
         metrics = jax.tree.map(jnp.mean, metrics)  # Scalar leaves.
-        metrics["policy/grad_norm"] = optax.global_norm(gradients)  # () Before clipping.
-        metrics["policy/skipped_update"] = jnp.asarray(0.0, dtype=jnp.float32)  # ()
+        metrics["train/gradient_norm"] = optax.global_norm(gradients)  # () Before clipping.
+        metrics["train/skipped_update_fraction"] = jnp.asarray(0.0, dtype=jnp.float32)  # ()
         return state.apply_gradients(grads=gradients), metrics
 
     def skip_update() -> tuple[TrainState, Metrics]:
         return state, {
-            "losses/policy": jnp.asarray(0.0, dtype=jnp.float32),  # ()
-            "policy/approx_kl": jnp.asarray(0.0, dtype=jnp.float32),  # () Not evaluated.
-            "policy/clip_fraction": jnp.asarray(0.0, dtype=jnp.float32),  # () Not evaluated.
-            "policy/grad_norm": jnp.asarray(0.0, dtype=jnp.float32),  # ()
-            "policy/skipped_update": jnp.asarray(1.0, dtype=jnp.float32),  # ()
+            "train/policy_loss": jnp.asarray(0.0, dtype=jnp.float32),  # ()
+            "train/approx_kl": jnp.asarray(0.0, dtype=jnp.float32),  # () Not evaluated.
+            "train/clip_fraction": jnp.asarray(0.0, dtype=jnp.float32),  # () Not evaluated.
+            "train/gradient_norm": jnp.asarray(0.0, dtype=jnp.float32),  # ()
+            "train/skipped_update_fraction": jnp.asarray(1.0, dtype=jnp.float32),  # ()
         }
 
     return jax.lax.cond(jnp.any(batch.advantages != 0), apply_update, skip_update)
@@ -507,7 +509,7 @@ def serve_vllm(model: str = MODEL) -> Generator[subprocess.Popen[bytes]]:
             "--model",
             model,
             "--host",
-            "127.0.0.1",
+            os.environ.get("RL2_VLLM_HOST", "127.0.0.1"),
             "--port",
             "8000",
             "--dtype",
@@ -636,9 +638,9 @@ class Batcher:
             training_batch=training_batch,
             include_examples=include_examples,
             transfer_metrics={
-                "time/batcher/fetch_rollout_seconds": fetched - started,
-                "time/batcher/prepare_batch_seconds": prepared - fetched,
-                "time/batcher/actor_to_batcher_seconds": mean(seconds for _, seconds in results),
+                "batcher/fetch_rollout_seconds": fetched - started,
+                "batcher/prepare_batch_seconds": prepared - fetched,
+                "batcher/actor_transfer_seconds_mean": mean(seconds for _, seconds in results),
             },
         )
         return Transfer(value=batch, ready_at=time.monotonic())
@@ -705,8 +707,8 @@ class Learner:
             self.publish_weights()
             writer.log_metrics(
                 {
-                    "model/params_millions": sum(p.size for p in jax.tree.leaves(self.state.params)) / 1_000_000,
-                    "time/learner/setup_seconds": time.monotonic() - start,
+                    "model/parameters_millions": sum(p.size for p in jax.tree.leaves(self.state.params)) / 1_000_000,
+                    "learner/setup_seconds": time.monotonic() - start,
                 },
                 step=iteration,
             )
@@ -744,34 +746,33 @@ class Learner:
                         **batch.transfer_metrics,
                         **batch.rollout_metrics,
                         **{
-                            f"charts/stop_condition_fraction/{condition}": batch.stop_counts.get(condition, 0)
-                            / num_rollouts
+                            f"rollout/stop_fraction/{condition}": batch.stop_counts.get(condition, 0) / num_rollouts
                             for condition in get_args(StopCondition)
                         },
-                        "charts/total_iterations": iteration,
-                        "charts/total_updates": int(self.state.step),
-                        "charts/learning_rate": self.config.learning_rate,
-                        "charts/total_rollouts": total_rollouts,
-                        "time/learner/iterations_per_second": 1 / seconds,
-                        "time/learner/rollouts_per_second": num_rollouts / seconds,
-                        "time/learner/output_tokens_per_second": batch.num_output_tokens / seconds,
-                        "time/learner/batch_fetch_seconds": fetched - started,
-                        "time/learner/update_seconds": optimized - fetched,
-                        "time/learner/weight_transfer_seconds": now - optimized,
-                        "time/learner/iteration_seconds": now - started,
+                        "train/iterations_total": iteration,
+                        "train/updates_total": int(self.state.step),
+                        "train/learning_rate": self.config.learning_rate,
+                        "train/rollouts_total": total_rollouts,
+                        "learner/iterations_per_second": 1 / seconds,
+                        "learner/rollouts_per_second": num_rollouts / seconds,
+                        "learner/output_tokens_per_second": batch.num_output_tokens / seconds,
+                        "learner/batch_fetch_seconds": fetched - started,
+                        "learner/update_seconds": optimized - fetched,
+                        "learner/weight_transfer_seconds": now - optimized,
+                        "learner/iteration_seconds": now - started,
                     }
                     logger.info(
                         "iteration=%s reward=%.3f degenerate_group_fraction=%.3f batch=%.2fs "
                         "group_transfer=%.6fs batch_transfer=%.6fs loss=%.4f update=%.2fs weights=%.2fs",
                         iteration,
-                        scalars["charts/reward_mean"],
-                        scalars["charts/degenerate_group_fraction"],
-                        scalars["time/learner/batch_fetch_seconds"],
-                        scalars["time/batcher/actor_to_batcher_seconds"],
-                        scalars["time/learner/batcher_to_learner_seconds"],
-                        scalars["losses/policy"],
-                        scalars["time/learner/update_seconds"],
-                        scalars["time/learner/weight_transfer_seconds"],
+                        scalars["rollout/reward_mean"],
+                        scalars["rollout/degenerate_group_fraction"],
+                        scalars["learner/batch_fetch_seconds"],
+                        scalars["batcher/actor_transfer_seconds_mean"],
+                        scalars["learner/batcher_transfer_seconds"],
+                        scalars["train/policy_loss"],
+                        scalars["learner/update_seconds"],
+                        scalars["learner/weight_transfer_seconds"],
                     )
                     if iteration % self.config.example_log_interval == 0:
                         with span("learner.log_examples"):
@@ -779,7 +780,7 @@ class Learner:
                             writer.log_text(examples, f"examples/{iteration}.txt")
                     if checkpoint_due:
                         with span("learner.checkpoint"):
-                            scalars["time/checkpoint_seconds"] = save_checkpoint(
+                            scalars["checkpoint/save_seconds"] = save_checkpoint(
                                 manager,
                                 TrainingProgress(
                                     train_state=self.state,
@@ -817,7 +818,7 @@ class Learner:
         batch = result.value
         return replace(
             batch,
-            transfer_metrics={**batch.transfer_metrics, "time/learner/batcher_to_learner_seconds": seconds},
+            transfer_metrics={**batch.transfer_metrics, "learner/batcher_transfer_seconds": seconds},
         )
 
     def publish_weights(self) -> None:

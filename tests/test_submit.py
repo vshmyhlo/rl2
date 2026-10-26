@@ -63,7 +63,11 @@ def test_grpo_timeline_directory_is_persistent() -> None:
     assert "RAY_PROFILING" not in env
     assert "RAY_enable_timeline" not in env
     assert env["RL2_RAY_DASHBOARD_HOST"] == "0.0.0.0"
-    assert container["ports"] == [{"name": "ray-dashboard", "containerPort": 8265}]
+    assert env["RL2_VLLM_HOST"] == "0.0.0.0"
+    assert container["ports"] == [
+        {"name": "ray-dashboard", "containerPort": 8265},
+        {"name": "vllm", "containerPort": 8000},
+    ]
 
 
 @pytest.mark.parametrize(

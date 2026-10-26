@@ -57,6 +57,20 @@
       "type": "link",
       "url": "/d/gpu-overview",
       "keepTime": true
+    },
+    {
+      "title": "vLLM performance",
+      "type": "link",
+      "url": "/d/training-vllm-performance",
+      "keepTime": true,
+      "includeVars": true
+    },
+    {
+      "title": "vLLM queries",
+      "type": "link",
+      "url": "/d/training-vllm-query",
+      "keepTime": true,
+      "includeVars": true
     }
   ],
   "panels": [
