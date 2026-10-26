@@ -568,9 +568,22 @@ bash infra/k3s/training/cleanup-disk.sh --apply
 
 Stop local training/downloads and new job submissions first. The script refuses
 cleanup while training Job pods are nonterminal; this check does not lock out
-new writers. Completed checkpoints and Hugging Face tokens are preserved.
+new writers. By default, completed checkpoints and Hugging Face tokens are preserved.
 `HF_HOME` overrides the default Hugging Face cache location. Downloads and build
 cache will be recreated when needed.
+
+Optionally remove whole GRPO v2 runs, including completed checkpoints, after
+**7 days without modifications**:
+
+```bash
+bash infra/k3s/training/cleanup-disk.sh --run-retention-days 7
+bash infra/k3s/training/cleanup-disk.sh --run-retention-days 7 --apply
+```
+
+The age is configurable and uses the newest file or directory modification time
+within each run under `/runs/grpo_v2`. Run deletion is disabled without the flag.
+Queued or suspended training Jobs also block this cleanup because they may need
+checkpoints to resume. This runs only when invoked; it does not install a schedule.
 
 To check GPU visibility and preemption on an idle queue (creates and cleans up
 two short Jobs; the low-priority Job requests the full GPU quota):

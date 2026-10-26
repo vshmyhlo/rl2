@@ -2,20 +2,28 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: bash infra/k3s/training/cleanup-disk.sh [--dry-run | --apply]"
+  echo "Usage: bash infra/k3s/training/cleanup-disk.sh [--dry-run | --apply] [--run-retention-days DAYS]"
   echo "Defaults to --dry-run. Stop local training/downloads and job submissions before --apply."
+  echo "Run deletion is opt-in: --run-retention-days 7 removes GRPO v2 runs inactive for over 7 days."
 }
 
-mode=${1:---dry-run}
-if [[ $# -gt 1 ]]; then
-  usage >&2
-  exit 1
-fi
-case "$mode" in
-  --dry-run|--apply) ;;
-  -h|--help) usage; exit 0 ;;
-  *) usage >&2; exit 1 ;;
-esac
+mode=--dry-run
+retention_days=
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run|--apply) mode=$1; shift ;;
+    --run-retention-days)
+      if [[ ! ${2:-} =~ ^[1-9][0-9]*$ ]]; then
+        echo "--run-retention-days requires a positive integer" >&2
+        exit 1
+      fi
+      retention_days=$2
+      shift 2
+      ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 1 ;;
+  esac
+done
 
 privileged=()
 if [[ $EUID -ne 0 ]]; then
@@ -51,11 +59,49 @@ if [[ -n $active_pods ]]; then
   exit 1
 fi
 
+if [[ -n $retention_days ]]; then
+  cutoff=$(date -u -d "$retention_days days ago" '+%Y-%m-%dT%H:%M:%S.%NZ')
+  # Queued and suspended Jobs may still need their saved checkpoints to resume.
+  unfinished_jobs=$("${privileged[@]}" k3s kubectl -n training get jobs -o json | python3 -c '
+import json
+import sys
+
+for job in json.load(sys.stdin)["items"]:
+    if not any(c["type"] in ("Complete", "Failed") and c["status"] == "True"
+               for c in job.get("status", {}).get("conditions", [])):
+        print(job["metadata"]["name"])
+')
+  if [[ -n $unfinished_jobs ]]; then
+    printf 'Unfinished training Jobs exist; run retention refused:\n%s\n' "$unfinished_jobs" >&2
+    exit 1
+  fi
+fi
+
 printf 'Mode: %s\nUnused BuildKit cache:\n' "$mode"
 if [[ $mode == --apply ]]; then
   "${privileged[@]}" bash "$training_dir/cleanup-build-cache.sh"
 else
   "${privileged[@]}" buildctl --addr unix:///run/rl2-buildkit/buildkitd.sock du
+fi
+
+# Check age before partial-checkpoint deletion changes directory timestamps.
+if [[ -n $retention_days ]] && "${privileged[@]}" test -d "$runs/grpo_v2"; then
+  echo "GRPO v2 runs with no modifications since $cutoff (including completed checkpoints):"
+  "${privileged[@]}" find "$runs/grpo_v2" -mindepth 1 -maxdepth 1 -type d -exec bash -c '
+    set -euo pipefail
+    cutoff=$1
+    mode=$2
+    shift 2
+    for run in "$@"; do
+      recent=$(find "$run" -xdev -newermt "$cutoff" -print -quit)
+      if [[ -z $recent ]]; then
+        du -sh -- "$run"
+        if [[ $mode == --apply ]]; then
+          rm -rf --one-file-system -- "$run"
+        fi
+      fi
+    done
+  ' bash "$cutoff" "$mode" '{}' +
 fi
 
 echo "Incomplete checkpoints under $runs:"

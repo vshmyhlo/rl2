@@ -144,7 +144,7 @@ according to the selected pause mode. Update failures propagate to the learner
 and trigger training cleanup.
 
 `ckpt_dir/checkpoints` stores Orbax checkpoints every `checkpoint_interval`
-iterations and at normal completion, retaining the latest two.
+iterations and at normal completion, retaining only the latest checkpoint.
 Prefetching drains on checkpoint iterations so the saved task RNG does not
 skip unconsumed batches. Restarting with the same directory restores parameters,
 optimizer state, shuffle key, task RNG,

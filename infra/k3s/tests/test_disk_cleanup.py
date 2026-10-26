@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -33,6 +34,7 @@ if [[ ${KUBE_FAIL:-0} == 1 ]]; then exit 9; fi
 case " $* " in
   *" get pvc "*) echo pvc-test ;;
   *" get pv "*) echo "$RUNS_PATH" ;;
+  *" get jobs "*) printf '%s' "$JOBS_JSON" ;;
   *" get pods "*)
     [[ " $* " == *"status.phase!=Succeeded,status.phase!=Failed"* ]] || exit 8
     printf '%s' "${ACTIVE_PODS:-}"
@@ -50,6 +52,7 @@ esac
     monkeypatch.setenv("HF_HOME", str(hf_home))
     monkeypatch.setenv("RUNS_PATH", str(runs))
     monkeypatch.setenv("BUILD_LOG", str(tmp_path / "build.log"))
+    monkeypatch.setenv("JOBS_JSON", json.dumps({"items": []}))
     for name in ("SUDO_USER", "ACTIVE_PODS", "KUBE_FAIL", "BUILD_EXIT"):
         monkeypatch.delenv(name, raising=False)
 
@@ -80,6 +83,75 @@ def test_cleanup_defaults_to_preview(tmp_path: Path, cleanup_env: None) -> None:
     assert "20.orbax-checkpoint-tmp" in result.stdout
     assert before == sorted(path for path in tmp_path.rglob("*") if path.name != "build.log")
     assert (tmp_path / "build.log").read_text().strip().endswith(" du")
+
+
+@pytest.mark.parametrize("mode", ["disabled", "preview", "apply"])
+def test_run_retention(tmp_path: Path, cleanup_env: None, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    cutoff = 1_700_000_000
+    runs = tmp_path / "pvc-test_training_training-runs"
+    for name in ("old run", "recent-file", "recent-directory"):
+        checkpoint = runs / "grpo_v2" / name / "checkpoints" / "10"
+        checkpoint.mkdir(parents=True)
+        (checkpoint / "weights").write_text("checkpoint")
+    other = runs / "grpo_reasoning" / "old run"
+    other.mkdir(parents=True)
+    (other / "weights").write_text("keep")
+    (runs / "grpo_v2" / "linked-run").symlink_to(other, target_is_directory=True)
+    for path in runs.rglob("*"):
+        os.utime(path, (cutoff - 1, cutoff - 1), follow_symlinks=False)
+    for path in (
+        runs / "grpo_v2" / "recent-file" / "checkpoints" / "10" / "weights",
+        runs / "grpo_v2" / "recent-directory" / "checkpoints" / "10",
+    ):
+        os.utime(path, (cutoff + 1, cutoff + 1))
+    date = tmp_path / "bin" / "date"
+    date.write_text('#!/usr/bin/env bash\n[[ "$*" == *"7 days ago"* ]] || exit 8\necho 2023-11-14T22:13:20Z\n')
+    date.chmod(0o755)
+    monkeypatch.setenv(
+        "JOBS_JSON",
+        json.dumps(
+            {
+                "items": [
+                    {"status": {"conditions": [{"type": status, "status": "True"}]}}
+                    for status in ("Complete", "Failed")
+                ]
+            }
+        ),
+    )
+    args = [] if mode == "disabled" else ["--run-retention-days", "7"]
+    if mode != "preview":
+        args.append("--apply")
+    result = run_cleanup(*args)
+    assert result.returncode == 0, result.stderr
+    assert (runs / "grpo_v2" / "old run").exists() == (mode != "apply")
+    assert (str(runs / "grpo_v2" / "old run") in result.stdout) == (mode != "disabled")
+    assert (runs / "grpo_v2" / "recent-file" / "checkpoints" / "10" / "weights").exists()
+    assert (runs / "grpo_v2" / "recent-directory" / "checkpoints" / "10" / "weights").exists()
+    assert (runs / "grpo_v2" / "linked-run").is_symlink()
+    assert (other / "weights").read_text() == "keep"
+
+
+def test_retention_refuses_queued_jobs(tmp_path: Path, cleanup_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "JOBS_JSON", json.dumps({"items": [{"metadata": {"name": "queued-job"}, "spec": {"suspend": True}}]})
+    )
+    before = sorted(tmp_path.rglob("*"))
+    result = run_cleanup("--apply", "--run-retention-days", "7")
+    assert result.returncode != 0
+    assert "queued-job" in result.stderr
+    assert sorted(tmp_path.rglob("*")) == before
+
+
+@pytest.mark.parametrize("value", [None, "0", "-1", "1.5", "oops"])
+def test_retention_rejects_invalid_age(tmp_path: Path, cleanup_env: None, value: str | None) -> None:
+    before = sorted(tmp_path.rglob("*"))
+    args = ["--apply", "--run-retention-days"]
+    if value is not None:
+        args.append(value)
+    result = run_cleanup(*args)
+    assert result.returncode != 0
+    assert "positive integer" in result.stderr
+    assert sorted(tmp_path.rglob("*")) == before
 
 
 @pytest.mark.parametrize(

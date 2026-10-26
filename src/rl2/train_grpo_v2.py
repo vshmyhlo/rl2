@@ -182,7 +182,7 @@ def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
     directory = f"{run_dir.rstrip('/')}/checkpoints"
     if not directory.startswith("gs://"):
         directory = str(Path(directory).resolve())
-    return ocp.CheckpointManager(directory, options=ocp.CheckpointManagerOptions(max_to_keep=2))
+    return ocp.CheckpointManager(directory, options=ocp.CheckpointManagerOptions(max_to_keep=1))
 
 
 def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, config: Config) -> float:
@@ -716,12 +716,6 @@ class Learner:
                 checkpoint_due = (
                     iteration % self.config.checkpoint_interval == 0 or iteration == self.config.total_iterations
                 )
-                prefetch_batches = min(
-                    self.config.prefetch_batches,
-                    (-iteration) % self.config.checkpoint_interval,
-                )
-                if self.config.total_iterations is not None:
-                    prefetch_batches = min(prefetch_batches, self.config.total_iterations - iteration)
                 # Each iteration is a separate trace, including its remote calls and child tasks.
                 with span(
                     "train.iteration",
@@ -734,7 +728,6 @@ class Learner:
                             num_groups=self.config.num_groups,
                             group_size=self.config.group_size,
                             iteration=iteration,
-                            prefetch_batches=prefetch_batches,
                         )
                     fetched = time.monotonic()
                     with span("learner.optimize"):
@@ -804,9 +797,10 @@ class Learner:
         while self._pending_batches:
             ray.cancel(self._pending_batches.popleft(), recursive=True)
 
-    def fetch_next_batch(
-        self, num_groups: int, group_size: int, *, iteration: int, prefetch_batches: int = 0
-    ) -> RolloutBatch:
+    def fetch_next_batch(self, num_groups: int, group_size: int, *, iteration: int) -> RolloutBatch:
+        prefetch_batches = min(self.config.prefetch_batches, (-iteration) % self.config.checkpoint_interval)
+        if self.config.total_iterations is not None:
+            prefetch_batches = min(prefetch_batches, self.config.total_iterations - iteration)
         while len(self._pending_batches) < prefetch_batches + 1:
             self._pending_batches.append(
                 self.batcher.fetch_next_batch.remote(

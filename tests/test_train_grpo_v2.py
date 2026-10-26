@@ -633,10 +633,25 @@ def test_learner_pulls_groups_through_batcher(
     assert all(call.kwargs == {"group_size": 3} for call in actor.fetch_next_group.remote.call_args_list)
 
 
-@pytest.mark.parametrize("prefetch_batches", [0, 3], ids=["disabled", "multiple-batches"])
+@pytest.mark.parametrize(
+    ("prefetch_batches", "checkpoint_interval", "total_iterations"),
+    [(0, 100, 9), (3, 100, 12), (3, 12, None)],
+    ids=["disabled", "final-iteration", "checkpoint"],
+)
 def test_learner_prefetches_bounded_batches(
-    prefetch_batches: int, learner: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch
+    learner: Any,
+    prefetch_batches: int,
+    checkpoint_interval: int,
+    total_iterations: int | None,
+    rollout: training.Rollout,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    learner.config = replace(
+        learner.config,
+        prefetch_batches=prefetch_batches,
+        checkpoint_interval=checkpoint_interval,
+        total_iterations=total_iterations,
+    )
     batch = training.build_rollout_batch(
         groups=[training.RolloutGroup(task_id="0", rollouts=[rollout] * 2)],
         training_batch=Mock(spec=training.GRPOBatch),
@@ -652,11 +667,11 @@ def test_learner_prefetches_bounded_batches(
     cancel = Mock()
     monkeypatch.setattr(training.ray, "cancel", cancel)
 
-    first = learner.fetch_next_batch(num_groups=1, group_size=2, iteration=8, prefetch_batches=prefetch_batches)
+    first = learner.fetch_next_batch(num_groups=1, group_size=2, iteration=8)
     assert first.examples == "0"
     assert submit.call_count == prefetch_batches + 1
     get.assert_called_once_with(results[0])
-    second = learner.fetch_next_batch(num_groups=1, group_size=2, iteration=9, prefetch_batches=prefetch_batches)
+    second = learner.fetch_next_batch(num_groups=1, group_size=2, iteration=9)
     assert second.examples == "1"
     assert submit.call_count == prefetch_batches + 2
     for index in range(2, len(results)):
@@ -869,7 +884,11 @@ def learner(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(training, "load_qwen3_checkpoint", loader)
     monkeypatch.setattr(training.jax, "devices", Mock(return_value=[device]))
     config = training.Config(
-        model="Qwen/custom", attention_backend="xla", scan_layers=False, gradient_checkpointing=False
+        model="Qwen/custom",
+        attention_backend="xla",
+        scan_layers=False,
+        gradient_checkpointing=False,
+        prefetch_batches=0,
     )
     learner = training.Learner.__ray_metadata__.modified_class(batcher=Mock(), actor=Mock(), config=config)
     learner.model = model
@@ -1002,7 +1021,7 @@ def test_learner_logs_rollouts(
         assert value.sharding == training.NamedSharding(learner.mesh, training.PartitionSpec())
         assert value.devices() == {jax.devices("cpu")[0]}
     assert all(value.dtype == jnp.float32 for value in learner.state.params.values())
-    learner.fetch_next_batch.assert_called_with(num_groups=2, group_size=2, iteration=2, prefetch_batches=int(fails))
+    learner.fetch_next_batch.assert_called_with(num_groups=2, group_size=2, iteration=2)
     expected = ["initialize", "publish", "fetch", "optimize", "publish", "fetch"]
     assert [call[0] for call in steps.mock_calls] == expected + ([] if fails else ["optimize", "publish"])
     factory.assert_called_once_with(experiment="grpo_v2", run_name=None)
@@ -1092,7 +1111,7 @@ def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.Monke
     def publish() -> None:
         published_steps.append(int(learner.state.step))
 
-    def fetch(num_groups: int, group_size: int, *, iteration: int, prefetch_batches: int) -> training.RolloutBatch:
+    def fetch(num_groups: int, group_size: int, *, iteration: int) -> training.RolloutBatch:
         prepared = Mock(spec=training.GRPOBatch)
         prepared.token_ids = Mock(shape=(num_groups * group_size, 8))  # (B, T=8)
         return training.RolloutBatch(
@@ -1124,7 +1143,7 @@ def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.Monke
     monkeypatch.setattr(training, "save_checkpoint", Mock(side_effect=save))
     training.restore_checkpoint.side_effect = lambda *args: saved[-1] if saved else None
     learner.start()
-    assert [call.kwargs["prefetch_batches"] for call in learner.fetch_next_batch.call_args_list] == [1, 0, 0]
+    assert [call.kwargs["iteration"] for call in learner.fetch_next_batch.call_args_list] == [1, 2, 3]
     assert [progress.iteration for progress in saved] == [2, 3]
     assert [progress.total_rollouts for progress in saved] == [8, 12]
     assert published_steps == [0, 4, 8, 12]

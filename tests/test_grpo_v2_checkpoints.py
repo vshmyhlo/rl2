@@ -48,6 +48,8 @@ def test_checkpoint_roundtrip_and_retention(tmp_path: Path, progress: training.T
         assert training.restore_checkpoint(manager, fresh, config) is None
         training.save_checkpoint(manager, replace(progress, iteration=1), config)
         training.save_checkpoint(manager, progress, config)
+        assert manager.all_steps() == [2]
+        assert not (tmp_path / "checkpoints" / "1").exists()
     with training.checkpoint_manager(config.ckpt_dir) as manager:
         metadata = manager.restore(
             2, args=training.ocp.args.Composite(metadata=training.ocp.args.JsonRestore())
@@ -78,7 +80,8 @@ def test_checkpoint_roundtrip_and_retention(tmp_path: Path, progress: training.T
         actual = restored.train_state.apply_gradients(grads=gradients)
         chex.assert_trees_all_equal((actual.params, actual.opt_state), (expected.params, expected.opt_state))
         training.save_checkpoint(manager, replace(restored, iteration=3), config)
-        assert manager.all_steps() == [2, 3]
+        assert manager.all_steps() == [3]
+        assert not (tmp_path / "checkpoints" / "2").exists()
     with training.checkpoint_manager(str(tmp_path / "new-run")) as manager:
         assert training.restore_checkpoint(manager, fresh, config) is None
 
