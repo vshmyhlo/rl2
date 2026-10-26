@@ -5,7 +5,8 @@
 <title>Training jobs</title>
 <style>
   body { margin: 0; font: 14px system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; }
-  header { display: flex; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid #ddd; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid #ddd; }
+  #metrics { display: flex; flex-wrap: wrap; gap: 16px; }
   #status { flex: 1; }
   button { padding: 6px 12px; cursor: pointer; }
   form { margin: 48px auto; padding: 0 16px; width: min(480px, calc(100% - 32px)); }
@@ -24,7 +25,7 @@
 <header>
   <a href="/">All jobs</a>
   <strong id="title">Ray timeline</strong>
-  <a id="metrics" target="_blank" rel="noopener" hidden>Job metrics ↗</a>
+  <span id="metrics"></span>
   <a id="tempo" target="_blank" rel="noopener" hidden>Tempo traces ↗</a>
   <span id="status" role="status">Waiting for snapshot…</span>
   <button id="refresh" type="button">Load latest</button>
@@ -80,7 +81,7 @@
     return `http://localhost:8082/explore?${params}`;
   }
 
-  function metricsUrl(jobName, created) {
+  function metricsUrl(jobName, created, dashboard) {
     const start = Date.parse(created);
     const params = new URLSearchParams({
       "var-namespace": "training",
@@ -88,7 +89,22 @@
       from: Number.isNaN(start) ? "now-7d" : String(start - 60000),
       to: "now",
     });
-    return `http://localhost:8082/d/training-job?${params}`;
+    return `http://localhost:8082/d/${dashboard}?${params}`;
+  }
+
+  function addMetricsLinks(container, jobName, created) {
+    for (const [dashboard, title] of [
+      ["training-job", "Job metrics"],
+      ["training-vllm-performance", "vLLM performance"],
+      ["training-vllm-query", "vLLM queries"],
+    ]) {
+      const link = document.createElement("a");
+      link.href = metricsUrl(jobName, created, dashboard);
+      link.textContent = `${title} ↗`;
+      link.target = "_blank";
+      link.rel = "noopener";
+      container.append(link);
+    }
   }
 
   async function loadJobs() {
@@ -116,12 +132,7 @@
         timeline.href = `/?job=${encodeURIComponent(item.name)}`;
         timeline.textContent = "Timeline";
         links.append(timeline);
-        const metrics = document.createElement("a");
-        metrics.href = metricsUrl(item.name, item.created);
-        metrics.textContent = "Job metrics ↗";
-        metrics.target = "_blank";
-        metrics.rel = "noopener";
-        links.append(metrics);
+        addMetricsLinks(links, item.name, item.created);
         const tempo = document.createElement("a");
         tempo.href = tempoUrl(item.name);
         tempo.textContent = "Tempo traces ↗";
@@ -173,9 +184,7 @@
     }
     document.getElementById("title").textContent = job;
     document.title = `${job} · Ray timeline`;
-    const metrics = document.getElementById("metrics");
-    metrics.href = metricsUrl(job);
-    metrics.hidden = false;
+    addMetricsLinks(document.getElementById("metrics"), job);
     const tempo = document.getElementById("tempo");
     tempo.href = tempoUrl(job);
     tempo.hidden = false;

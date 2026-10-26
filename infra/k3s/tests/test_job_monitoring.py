@@ -40,7 +40,7 @@ def test_job_dashboard_metrics_are_collected_and_provisioned() -> None:
     mounted = charts["gpu-grafana"]["dashboardsConfigMaps"]["gpu"]
     assert "job-dashboard.json" in configmaps[mounted]["files"]
     page = (ROOT / "ray-timelines/index.html").read_text()
-    assert f"/d/{dashboard['uid']}?" in page
+    assert f'"{dashboard["uid"]}"' in page
     variables = {item["name"] for item in dashboard["templating"]["list"]}
     assert set(re.findall(r'"var-([^"]+)"', page)) <= variables
 

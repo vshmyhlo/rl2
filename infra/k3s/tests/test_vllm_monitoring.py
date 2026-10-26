@@ -36,10 +36,12 @@ def test_vllm_discovery_and_dashboard_provisioning() -> None:
     mounted = charts["gpu-grafana"]["dashboardsConfigMaps"]["gpu"]
     configmap = next(item for item in kustomization["configMapGenerator"] if item["name"] == mounted)
     resources = json.loads((ROOT / "monitoring/job-dashboard.json").read_text())
+    page = (ROOT / "ray-timelines/index.html").read_text()
     for name in ["performance", "query"]:
         filename = f"vllm-{name}-dashboard.json"
         assert filename in configmap["files"]
         dashboard: dict[str, Any] = json.loads((ROOT / "monitoring" / filename).read_text())
+        assert f'"{dashboard["uid"]}"' in page
         assert any(link["url"] == f"/d/{dashboard['uid']}" and link["includeVars"] for link in resources["links"])
         variables = {item["name"]: item for item in dashboard["templating"]["list"]}
         assert variables["job_name"]["refresh"] == 2

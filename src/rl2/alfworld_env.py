@@ -265,7 +265,7 @@ def load_alfworld_tasks(config: ALFWorldConfig, timeout: float) -> list[ALFWorld
     return [ALFWorldTask(id=task_id, config_file=config_file) for task_id in ids]
 
 
-@ray.remote(num_cpus=1)
+@ray.remote
 class ALFWorldWorker:
     def __init__(self, task: ALFWorldTask) -> None:
         self.environment = ALFWorld(config_file=task.config_file, task_id=task.id)

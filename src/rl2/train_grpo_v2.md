@@ -45,7 +45,7 @@ text; rewards and done flags remain internal to the rollout loop.
 `ALFWorldTask.init_env()` owns worker startup and cleanup; ALFWorld
 validates its own tool arguments. The agent loop has no ALFWorld imports.
 
-Each rollout owns one ALFWorld Ray actor, reserving one CPU, and follows this loop:
+Each rollout owns one ALFWorld Ray actor using Ray's default CPU scheduling and follows this loop:
 
 1. Reset the selected game and give the model the action-tool schemas, instructions, goal, starting observation, and admissible commands.
 2. Sample a response through `AsyncOpenAI.completions.create()` against vLLM's `/v1/completions` endpoint.
