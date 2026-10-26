@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import subprocess
+from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
 from types import TracebackType
@@ -101,12 +102,11 @@ class BenchmarkSession:
     ) -> None:
         assert self.process.stdin is not None
         self.process.stdin.close()
-        try:
-            await asyncio.wait_for(self.process.wait(), timeout=5)
-        except TimeoutError:
-            # Include children spawned by the benchmark.
-            os.killpg(self.process.pid, signal.SIGKILL)
-            await self.process.wait()
+        if exc_type is not None:
+            # Interrupted requests may leave the worker and its children busy.
+            with suppress(ProcessLookupError):
+                os.killpg(self.process.pid, signal.SIGKILL)
+        await self.process.wait()
         if exc_type is None and self.process.returncode != 0:
             raise RuntimeError(f"Benchmark worker failed during cleanup (exit {self.process.returncode})")
 

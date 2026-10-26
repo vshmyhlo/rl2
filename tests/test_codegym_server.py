@@ -63,16 +63,14 @@ def test_server_requires_setup(tmp_path: Path) -> None:
         pytest.fail("Unprepared server started")
 
 
-@pytest.mark.parametrize("state", ["hung", "exited"])
-def test_cleanup_escalates_and_tolerates_exited_process(state: str, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("state", ["running", "exited"])
+def test_cleanup_waits_and_tolerates_exited_process(state: str, monkeypatch: pytest.MonkeyPatch) -> None:
     process = Mock(pid=123)
-    if state == "hung":
-        process.wait.side_effect = [subprocess.TimeoutExpired(cmd="codegym", timeout=5), 0]
     kill = Mock(side_effect=ProcessLookupError if state == "exited" else None)
     monkeypatch.setattr(server.os, "killpg", kill)
     server.stop_server(process)
     assert kill.call_count == 2
-    assert process.wait.call_count == 2
+    assert process.wait.call_args_list == [(), ()]
 
 
 def test_readiness_waits_for_every_worker(monkeypatch: pytest.MonkeyPatch) -> None:

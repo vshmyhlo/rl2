@@ -133,6 +133,8 @@ def test_session_cleanup(failure: str | None, monkeypatch: pytest.MonkeyPatch) -
     def respond(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         paths.append(path)
+        expected_timeout = None if path in {"/stop", "/release_instance"} else 120
+        assert all(value == expected_timeout for value in request.extensions["timeout"].values())
         if path == "/get_instance":
             assert request.url.port == 8000
             return httpx.Response(200, json={"uid": "worker-1", "port": 10000})

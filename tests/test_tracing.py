@@ -2,6 +2,7 @@ import asyncio
 import os
 import subprocess
 import sys
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from tempfile import TemporaryDirectory
@@ -19,6 +20,8 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2_grpc import (
     TraceServiceServicer,
     add_TraceServiceServicer_to_server,
 )
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from ray.actor import ActorHandle
 
@@ -32,6 +35,7 @@ from rl2 import tracing
         ("OTEL_EXPORTER_OTLP_ENDPOINT", "", True),
         ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "", True),
         ("OTEL_EXPORTER_OTLP_ENDPOINT", "true", False),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", " TrUe ", False),
     ],
 )
 def test_tracing_enabled(endpoint: str | None, disabled: str, enabled: bool, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -41,13 +45,70 @@ def test_tracing_enabled(endpoint: str | None, disabled: str, enabled: bool, mon
     if endpoint:
         monkeypatch.setenv(endpoint, "http://tempo:4317")
     assert tracing.tracing_enabled() is enabled
+    if not enabled:
+        factory = Mock()
+        monkeypatch.setattr(tracing, "_processor", None)
+        monkeypatch.setattr(tracing, "OTLPSpanExporter", factory)
+        tracing.setup_tracing()
+        tracing.flush_tracing()
+        factory.assert_not_called()
+
+
+@pytest.fixture
+def span_exporter(monkeypatch: pytest.MonkeyPatch) -> Generator[InMemorySpanExporter]:
+    monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
+    monkeypatch.setenv("OTEL_TRACES_SAMPLER", "always_on")
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    with ExitStack() as resources:
+        resources.callback(provider.shutdown)
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        monkeypatch.setattr(trace, "get_tracer", Mock(return_value=provider.get_tracer("test")))
+        yield exporter
+
+
+def test_span_parenting_and_context_restoration(span_exporter: InMemorySpanExporter) -> None:
+    previous = trace.get_current_span()
+    with tracing.span("parent") as parent:
+        with tracing.span("child", {"label": "child"}) as child:
+            assert trace.get_current_span() is child
+        assert trace.get_current_span() is parent
+        with tracing.span("root", root=True) as root:
+            assert trace.get_current_span() is root
+        assert trace.get_current_span() is parent
+    assert trace.get_current_span() is previous
+    spans = {item.name: item for item in span_exporter.get_finished_spans()}
+    assert spans["child"].parent == parent.get_span_context()
+    assert spans["child"].attributes == {"label": "child"}
+    assert spans["root"].parent is None
+    assert root.get_span_context().trace_id != parent.get_span_context().trace_id
+    assert all(item.status.status_code is trace.StatusCode.UNSET for item in spans.values())
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+def test_span_records_errors_and_restores_context(
+    error_type: type[BaseException], span_exporter: InMemorySpanExporter
+) -> None:
+    previous = trace.get_current_span()
+    error = error_type("stopped")
+    with pytest.raises(error_type) as caught, tracing.span("failed"):
+        raise error
+    assert caught.value is error
+    assert trace.get_current_span() is previous
+    (exported,) = span_exporter.get_finished_spans()
+    assert exported.status.status_code is trace.StatusCode.ERROR
+    if error_type is asyncio.CancelledError:
+        assert exported.attributes["cancelled"] is True
+        assert exported.status.description == "Cancelled"
+    else:
+        assert exported.events[0].attributes["exception.type"] == "RuntimeError"
 
 
 def test_setup_once_and_flush(monkeypatch: pytest.MonkeyPatch) -> None:
     exporter = InMemorySpanExporter()
     factory = Mock(return_value=exporter)
     install = Mock()
-    monkeypatch.setattr(tracing, "_provider", None)
+    monkeypatch.setattr(tracing, "_processor", None)
     monkeypatch.setattr(tracing, "OTLPSpanExporter", factory)
     monkeypatch.setattr(trace, "set_tracer_provider", install)
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://tempo:4317")

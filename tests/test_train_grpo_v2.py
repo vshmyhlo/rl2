@@ -234,7 +234,7 @@ def test_sampling_temperature_bounds(temperature: float) -> None:
     assert training.Config(temperature=temperature).temperature == temperature
 
 
-@pytest.mark.parametrize("failure", [None, "launch", "rollout", "shutdown", "pod-network"])
+@pytest.mark.parametrize("failure", [None, "launch", "rollout", "pod-network"])
 def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("RL2_VLLM_HOST", raising=False)
     if failure == "pod-network":
@@ -265,8 +265,6 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
     launch = Mock(return_value=server, side_effect=OSError("launch failed") if failure == "launch" else None)
     monkeypatch.setattr(training.subprocess, "Popen", launch)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
-    if failure == "shutdown":
-        server.wait.side_effect = subprocess.TimeoutExpired(cmd=command, timeout=10)
 
     if failure in {"launch", "rollout"}:
         with pytest.raises(OSError if failure == "launch" else RuntimeError), training.serve_vllm():
@@ -284,9 +282,9 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
         server.terminate.assert_not_called()
     else:
         server.terminate.assert_called_once_with()
-        server.wait.assert_called_once_with(timeout=10)
+        server.wait.assert_called_once_with()
         server.__exit__.assert_called_once()
-        assert server.kill.call_count == (1 if failure == "shutdown" else 0)
+        server.kill.assert_not_called()
 
 
 def test_actor_and_learner_each_reserve_one_gpu() -> None:
@@ -1751,6 +1749,69 @@ def test_batcher_collects_groups_concurrently(
         assert item.parent.span_id == parent.context.span_id
         assert item.context.trace_id == parent.context.trace_id
     assert not otel_trace.get_current_span().get_span_context().is_valid
+
+
+def test_rollout_deadline_excludes_cleanup(
+    actor: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = AsyncMock()
+    agent.__aenter__.return_value = agent
+    agent.run.return_value = rollout
+    monkeypatch.setattr(training, "create_agent", Mock(return_value=agent))
+    environment = AsyncMock()
+    task = Mock(init_env=Mock(return_value=environment))
+
+    async def collect() -> training.RolloutGroup:
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        monkeypatch.setattr(loop, "time", lambda: now)
+        closing = 0
+        both_closing = asyncio.Event()
+
+        async def close(*args: Any) -> None:
+            nonlocal closing, now
+            closing += 1
+            if closing == 2:
+                both_closing.set()
+            await both_closing.wait()
+            now += actor.config.rollout_timeout + 1
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        environment.__aexit__.side_effect = close
+        async with aclosing(actor):
+            return await actor.collect_group(task, group_size=2)
+
+    group = asyncio.run(collect())
+    assert len(group.rollouts) == 2
+    assert environment.__aexit__.await_count == 2
+
+
+@pytest.mark.parametrize("phase", ["setup", "rollout"])
+def test_rollout_deadline_still_limits_work(actor: Any, monkeypatch: pytest.MonkeyPatch, phase: str) -> None:
+    actor.config = replace(actor.config, rollout_timeout=0.001)
+    agent = AsyncMock()
+    agent.__aenter__.return_value = agent
+    monkeypatch.setattr(training, "create_agent", Mock(return_value=agent))
+    environment = AsyncMock()
+    task = Mock(init_env=Mock(return_value=environment))
+
+    async def block(*args: Any, **kwargs: Any) -> None:
+        await asyncio.Future()
+
+    if phase == "setup":
+        environment.__aenter__.side_effect = block
+    else:
+        agent.run.side_effect = block
+
+    async def collect() -> None:
+        async with aclosing(actor):
+            await actor.collect_group(task, group_size=2)
+
+    with pytest.raises(ExceptionGroup) as raised:
+        asyncio.run(collect())
+    assert all(isinstance(error, TimeoutError) for error in raised.value.exceptions)
+    assert environment.__aexit__.await_count == (0 if phase == "setup" else 2)
 
 
 def test_group_cancels_pending_rollouts(

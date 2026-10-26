@@ -8,7 +8,7 @@ from contextlib import closing
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 
@@ -186,6 +186,35 @@ def test_invalid_task_manifest(manifest: list[str], monkeypatch: pytest.MonkeyPa
     )
     with pytest.raises(ValueError):
         env.load_benchmark_tasks(env.AppWorldConfig(python=sys.executable, root="/apps"), max_steps=2, timeout=30)
+
+
+def test_cleanup_waits_past_former_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = Mock(returncode=None)
+    monkeypatch.setattr(env.asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+    kill = Mock()
+    monkeypatch.setattr(env.os, "killpg", kill)
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        monkeypatch.setattr(loop, "time", lambda: now)
+
+        async def wait() -> int:
+            nonlocal now
+            now += 6
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            process.returncode = 0
+            return 0
+
+        process.wait = AsyncMock(side_effect=wait)
+        async with env.BenchmarkSession(command=["worker"], timeout=None, env={}):
+            pass
+
+    asyncio.run(run())
+    process.stdin.close.assert_called_once_with()
+    assert process.returncode == 0
+    kill.assert_not_called()
 
 
 @pytest.mark.parametrize("mode", ["normal", "crash", "timeout", "cancel", "cleanup-error"])

@@ -530,11 +530,7 @@ def serve_vllm(model: str = MODEL) -> Generator[subprocess.Popen[bytes]]:
         finally:
             logger.info("Stopping vLLM server: pid=%s", server.pid)
             server.terminate()
-            try:
-                server.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                logger.warning("vLLM did not stop within 10s; killing pid=%s", server.pid)
-                server.kill()
+            server.wait()
     logger.info("vLLM server exited")
 
 
@@ -968,8 +964,10 @@ class Actor:
 
                     async def run_rollout(index: int) -> Rollout:
                         with span("actor.rollout", {**span_data, "rollout_index": index}) as rollout_span:
-                            async with asyncio.timeout(self.config.rollout_timeout), task.init_env() as env:
-                                result = await agent.run(env=env)
+                            async with AsyncExitStack() as resources:
+                                async with asyncio.timeout(self.config.rollout_timeout):
+                                    env = await resources.enter_async_context(task.init_env())
+                                    result = await agent.run(env=env)
                             rollout_span.set_attribute("stop_condition", result.stop_condition)
                             return result
 

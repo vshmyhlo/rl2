@@ -136,6 +136,7 @@ def test_startup_timeout_stops_actor(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     ):
         pytest.fail("Server was not ready")
     actor.stop.remote.assert_called_once()
+    job.ray.get.assert_called_with(actor.stop.remote.return_value)
     kill.assert_called_once_with(actor)
 
 
@@ -149,6 +150,7 @@ def test_actor_startup_waits_for_scheduling(monkeypatch: pytest.MonkeyPatch, tmp
         assert server is actor
     actor.ready.remote.assert_called_once()
     actor.stop.remote.assert_called_once()
+    job.ray.get.assert_called_with(actor.stop.remote.return_value)
 
 
 def test_server_failure_cancels_generation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -159,6 +161,7 @@ def test_server_failure_cancels_generation(monkeypatch: pytest.MonkeyPatch) -> N
     with pytest.raises(RuntimeError, match="server died"):
         job.wait_task(task, server)
     cancel.assert_called_once_with(task, force=False)
+    job.ray.get.assert_called_with(task)
 
 
 def test_process_cleanup_on_cancellation(tmp_path: Path) -> None:

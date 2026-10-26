@@ -261,6 +261,32 @@ def test_session_pending_result_keeps_loop_responsive(method: str, monkeypatch: 
     kill.assert_called_once_with(actor)
 
 
+def test_cleanup_waits_past_former_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    actor = Mock()
+    monkeypatch.setattr(env, "ALFWorldWorker", Mock(remote=Mock(return_value=actor)))
+    kill = Mock()
+    monkeypatch.setattr(env.ray, "kill", kill)
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        monkeypatch.setattr(loop, "time", lambda: now)
+
+        async def close() -> None:
+            nonlocal now
+            now += 6
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        actor.close.remote = AsyncMock(side_effect=close)
+        async with env.ALFWorldTask(id="task", config_file="config.yaml").init_env():
+            pass
+
+    asyncio.run(run())
+    actor.close.remote.assert_awaited_once_with()
+    kill.assert_called_once_with(actor)
+
+
 @pytest.mark.parametrize("mode", ["normal", "crash", "reset_timeout", "step_timeout", "cancel", "close_error"])
 def test_session_actor_cleanup(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
     actor = Mock()

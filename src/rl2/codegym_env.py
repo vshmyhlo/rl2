@@ -1,6 +1,6 @@
 import json
 import re
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncGenerator, Iterable
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Self
@@ -65,18 +65,20 @@ class CodeGymSession:
 
 
 @asynccontextmanager
-async def codegym_session(manager_url: str, ability: str) -> AsyncIterator[CodeGymSession]:
+async def codegym_session(manager_url: str, ability: str) -> AsyncGenerator[CodeGymSession]:
     async with AsyncExitStack() as resources:
         manager = await resources.enter_async_context(httpx.AsyncClient(base_url=manager_url, timeout=120))
         instance = await request_json(manager, "GET", "/get_instance")
         resources.push_async_callback(
-            request_json, manager, "GET", "/release_instance", params={"uid": instance["uid"]}
+            request_json, manager, "GET", "/release_instance", params={"uid": instance["uid"]}, timeout=None
         )
         worker_url = httpx.URL(manager_url).copy_with(port=int(instance["port"]))
         worker = await resources.enter_async_context(httpx.AsyncClient(base_url=worker_url, timeout=120))
         session_id = str(uuid4())
         # Stop before releasing the worker, including when /start fails partway through.
-        resources.push_async_callback(request_json, worker, "POST", "/stop", json={"session_id": session_id})
+        resources.push_async_callback(
+            request_json, worker, "POST", "/stop", json={"session_id": session_id}, timeout=None
+        )
         env_name, env_str = ability.split("@", 1)
         started = await request_json(
             worker, "POST", "/start", json={"session_id": session_id, "env_name": env_name, "env_str": env_str}

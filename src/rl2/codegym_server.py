@@ -25,9 +25,7 @@ def stop_server(process: subprocess.Popen[bytes]) -> None:
     with suppress(ProcessLookupError):
         os.killpg(process.pid, signal.SIGTERM)
     try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
+        process.wait()
     finally:
         # The manager may exit before its workers or step subprocesses do.
         with suppress(ProcessLookupError):

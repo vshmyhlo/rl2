@@ -7,7 +7,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
@@ -42,7 +42,7 @@ class Run:
 
 
 @contextmanager
-def process(command: list[str], log_path: Path) -> Iterator[subprocess.Popen[str]]:
+def process(command: list[str], log_path: Path) -> Generator[subprocess.Popen[str]]:
     print(f"Starting {log_path.stem}; log: {log_path}", flush=True)
     with (
         log_path.open("a", encoding="utf-8", buffering=1) as log,
@@ -74,10 +74,7 @@ def process(command: list[str], log_path: Path) -> Iterator[subprocess.Popen[str
             # Stop the entire subprocess tree, including vLLM workers.
             with suppress(ProcessLookupError):
                 os.killpg(child.pid, signal.SIGTERM)
-            try:
-                child.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                pass
+            child.wait()
             with suppress(ProcessLookupError):
                 os.killpg(child.pid, signal.SIGKILL)
             child.wait()
@@ -149,12 +146,12 @@ def wait_task(task: ray.ObjectRef, server: ActorHandle | None = None) -> None:
         # Cooperative cancellation lets the task close its subprocess group.
         ray.cancel(task, force=False)
         with suppress(RayError):
-            ray.get(task, timeout=15)
+            ray.get(task)
         raise
 
 
 @contextmanager
-def serving(run: Run, startup_timeout: int) -> Iterator[ActorHandle]:
+def serving(run: Run, startup_timeout: int) -> Generator[ActorHandle]:
     server = ServerActor.remote(run)
     try:
         deadline = time.monotonic() + startup_timeout
@@ -173,7 +170,7 @@ def serving(run: Run, startup_timeout: int) -> Iterator[ActorHandle]:
         yield server
     finally:
         try:
-            ray.get(server.stop.remote(), timeout=15)
+            ray.get(server.stop.remote())
         finally:
             ray.kill(server)
 

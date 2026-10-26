@@ -285,7 +285,7 @@ class ALFWorldWorker:
 
 
 class ALFWorldSession(Environment):
-    """One Ray actor per rollout, with asynchronous requests and bounded cleanup."""
+    """One Ray actor per rollout, with asynchronous requests and cleanup."""
 
     def __init__(self, task: ALFWorldTask) -> None:
         self.task = task
@@ -312,5 +312,4 @@ class ALFWorldSession(Environment):
         async with AsyncExitStack() as resources:
             resources.push_async_callback(asyncio.to_thread, ray.kill, self.actor)
             if exc_type is None:
-                async with asyncio.timeout(5):
-                    await self.actor.close.remote()
+                await self.actor.close.remote()
