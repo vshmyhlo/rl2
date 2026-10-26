@@ -47,6 +47,11 @@ def test_vllm_discovery_and_dashboard_provisioning() -> None:
         assert variables["job_name"]["refresh"] == 2
         assert not variables["job_name"]["multi"] and not variables["job_name"]["includeAll"]
         assert 'job_name="$job_name"' in variables["model_name"]["query"]["query"]
+        panels = {panel["title"]: panel for panel in dashboard["panels"]}
+        for title in ["Prefix cache hit rate", "KV cache utilization"]:
+            defaults = panels[title]["fieldConfig"]["defaults"]
+            assert defaults["unit"] == "percentunit"
+            assert defaults["min"] == 0 and defaults["max"] == 1
         for panel in dashboard["panels"]:
             if panel["type"] == "row":
                 continue

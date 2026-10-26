@@ -287,7 +287,9 @@ preserving the selected Job and time range. These adapt the official
 [vLLM dashboards](https://docs.vllm.ai/en/stable/examples/observability/dashboards/)
 from [v0.27.0](https://github.com/vllm-project/vllm/tree/v0.27.0/examples/observability/dashboards/grafana)
 (Apache-2.0), covering request rates, token throughput, token sizes, E2E latency,
-time to first token, and inter-token latency.
+time to first token, and inter-token latency. Both dashboards also show prefix
+cache hit rate (weighted by queried tokens) and KV cache utilization per Pod
+and engine. The hit-rate graph has gaps when no cache queries occur.
 
 Prometheus discovers running Job Pods in `training` with a container port named
 `vllm` and scrapes `/metrics` every 15 seconds. It stores only `vllm:*` metrics,

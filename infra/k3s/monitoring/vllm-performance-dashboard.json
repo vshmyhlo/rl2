@@ -1346,6 +1346,117 @@
       ],
       "title": "TPS (Tokens Per Second) Over Time",
       "type": "timeseries"
+    },
+    {
+      "id": 21,
+      "title": "KV cache",
+      "type": "row",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 22,
+      "title": "Prefix cache hit rate",
+      "description": "Fraction of queried tokens served from the prefix cache, weighted by token volume across selected models and engines. Gaps indicate no cache queries in the rate window.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 37,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(vllm:prefix_cache_hits_total{job=\"training-vllm\",namespace=\"$namespace\",job_name=\"$job_name\",model_name=~\"$model_name\"}[$__rate_interval])) / (sum(rate(vllm:prefix_cache_queries_total{job=\"training-vllm\",namespace=\"$namespace\",job_name=\"$job_name\",model_name=~\"$model_name\"}[$__rate_interval])) > 0)",
+          "legendFormat": "Hit rate",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "title": "KV cache utilization",
+      "description": "Fraction of KV cache capacity in use, shown separately for each Pod, engine, and model.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 37,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (pod, engine, model_name) (vllm:kv_cache_usage_perc{job=\"training-vllm\",namespace=\"$namespace\",job_name=\"$job_name\",model_name=~\"$model_name\"})",
+          "legendFormat": "{{pod}} / engine {{engine}} / {{model_name}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     }
   ],
   "preload": false,
@@ -1419,7 +1530,7 @@
   "timezone": "browser",
   "uid": "training-vllm-performance",
   "title": "Training job vLLM performance",
-  "version": 1,
+  "version": 2,
   "weekStart": "",
   "refresh": "15s",
   "description": "Adapted from vLLM v0.27.0 examples/observability/dashboards/grafana/performance_statistics.json (Apache-2.0). Metrics are scoped to the selected Kubernetes Job, including replacement Pods. Select a time range covering the run."

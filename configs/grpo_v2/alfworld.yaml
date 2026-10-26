@@ -9,9 +9,9 @@ taskset:
 seed: 1
 num_groups: 8
 group_size: 8
-minibatches_per_epoch: 4 # Optimizer updates per epoch, excluding skipped minibatches.
-grad_accum_steps: 8
-prefetch_batches: 0
+minibatches_per_epoch: 1 # Optimizer updates per epoch, excluding skipped minibatches.
+grad_accum_steps: 16
+prefetch_batches: 2
 drop_degenerate_groups: false
 length_penalty_coef: 0.0001 # Subtract 0.1 per 1,000 sampled tokens when environment reward is nonzero.
 max_tokens: 4096 # Total transcript tokens, including system, prompt, and tools.
@@ -20,5 +20,5 @@ rollout_timeout: 1200
 environment_timeout: 600
 run_id: grpo_v2_alfworld_${path_name:${model}}_s${seed}_ng${num_groups}_gs${group_size}_mb${minibatches_per_epoch}_ddg${drop_degenerate_groups}_pf${prefetch_batches}_lp${length_penalty_coef}
 ckpt_dir: /runs/grpo_v2/${run_id} # Checkpoints and profiling artifacts.
-checkpoint_interval: 100
-example_log_interval: 100
+checkpoint_interval: 50
+example_log_interval: 50

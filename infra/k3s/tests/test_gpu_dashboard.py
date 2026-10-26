@@ -293,6 +293,68 @@ def test_vllm_dashboards_isolate_jobs_and_combine_replacement_pods() -> None:
     )
 
 
+def test_vllm_cache_panels_weight_tokens_and_preserve_engine_usage() -> None:
+    root = Path(__file__).parents[1] / "monitoring"
+    expressions: dict[str, str] = {}
+    for name in ["performance", "query"]:
+        dashboard = json.loads((root / f"vllm-{name}-dashboard.json").read_text())
+        for panel in dashboard["panels"]:
+            if panel["title"] in {"Prefix cache hit rate", "KV cache utilization"}:
+                expression = panel["targets"][0]["expr"]
+                if panel["title"] in expressions:
+                    assert expressions[panel["title"]] == expression
+                expressions[panel["title"]] = expression
+    inputs = []
+    for namespace, job, model in [
+        ("training", "selected", "model"),
+        ("training", "other", "model"),
+        ("other", "selected", "model"),
+        ("training", "selected", "other-model"),
+    ]:
+        for engine, hits, queries, usage in [
+            # Counter reset at minute 3; both engines stop querying after minute 4.
+            ("0", "0 60 120 60 120 120 120", "0 120 240 120 240 240 240", "0.25"),
+            ("1", "0+0x6", "0 360 720 1080 1440 1440 1440", "0.75"),
+        ]:
+            labels = (
+                f'job="training-vllm",namespace="{namespace}",job_name="{job}",'
+                f'pod="pod-{engine}",engine="{engine}",model_name="{model}"'
+            )
+            for metric, values in [
+                ("prefix_cache_hits_total", hits),
+                ("prefix_cache_queries_total", queries),
+                ("kv_cache_usage_perc", f"{usage}+0x6"),
+            ]:
+                inputs.append({"series": f"vllm:{metric}{{{labels}}}", "values": values})
+    checks = []
+    for title, expression in expressions.items():
+        expression = (
+            expression.replace("$namespace", "training")
+            .replace("$job_name", "selected")
+            .replace("$model_name", "model")
+            .replace("$__rate_interval", "2m")
+        )
+        samples = (
+            [{"labels": "{}", "value": 0.125}]
+            if title == "Prefix cache hit rate"
+            else [
+                {"labels": '{pod="pod-0",engine="0",model_name="model"}', "value": 0.25},
+                {"labels": '{pod="pod-1",engine="1",model_name="model"}', "value": 0.75},
+            ]
+        )
+        for minute in [3, 4, 6]:
+            checks.append(
+                {
+                    "expr": expression,
+                    "eval_time": f"{minute}m",
+                    "exp_samples": [] if minute == 6 and title == "Prefix cache hit rate" else samples,
+                }
+            )
+    _check_promql(
+        {"evaluation_interval": "1m", "tests": [{"interval": "1m", "input_series": inputs, "promql_expr_test": checks}]}
+    )
+
+
 def _check_promql(suite: dict[str, Any]) -> None:
     result = subprocess.run(
         [
