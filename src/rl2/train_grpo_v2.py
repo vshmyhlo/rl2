@@ -100,8 +100,6 @@ import optax
 import orbax.checkpoint as ocp
 import ray
 import yaml
-from flax import struct
-from flax.training.train_state import TrainState
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from openai import AsyncOpenAI
 from pydantic import Field, TypeAdapter
@@ -116,6 +114,7 @@ from rl2.agent_task import Task
 from rl2.alfworld_env import ALFWorldConfig, ALFWorldTask, load_alfworld_tasks
 from rl2.appworld_env import AppWorldConfig, AppWorldTask, load_appworld_tasks
 from rl2.configuration import BaseConfig, load_config
+from rl2.grpo_v2.state import LoRATrainState
 from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import (
     DEFAULT_ATTENTION_BACKEND,
@@ -197,12 +196,6 @@ class Config(BaseConfig):
 
 
 DEFAULT_CONFIG = Config()
-
-
-class LoRATrainState(TrainState):
-    params: LoRAParameters  # Trainable (R, I) and (O, R) leaves.
-    base_params: Parameters  # Frozen HF parameter shapes.
-    lora_scale: float = struct.field(pytree_node=False)
 
 
 @dataclass(frozen=True)
@@ -590,7 +583,7 @@ def serve_vllm(model: str = MODEL, lora_rank: int = DEFAULT_CONFIG.lora_rank) ->
             [
                 sys.executable,
                 "-m",
-                "rl2.vllm.server",
+                "rl2.vllm_support.server",
                 "--model",
                 model,
                 "--host",
@@ -891,7 +884,7 @@ class Learner:
                     num_groups=self.config.num_groups,
                     group_size=self.config.group_size,
                     context_length=self.model.config.max_position_embeddings,
-                    include_examples=(iteration + len(self._pending_batches)) % self.config.example_log_interval == 0,
+                    include_examples=True,
                 )
             )
         ready, pending = ray.wait(self._pending_batches, num_returns=1)

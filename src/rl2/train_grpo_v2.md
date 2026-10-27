@@ -170,8 +170,9 @@ queues new generation requests until resume and handles in-flight requests
 according to the selected pause mode. The actor awaits `/pause` with cache clearing,
 reloads the adapter, then calls `/resume`. Reload failures leave generation paused,
 propagate to the learner, and trigger training cleanup.
-`keep` retains KV caches computed with older weights: an in-flight request can mix
-old cached states with new adapter weights. vLLM ignores cache clearing in this mode.
+With vLLM 0.32, `keep` also honors `clear_cache=true`: running requests are
+requeued and their KV state is recomputed after resume. Tokens within one request
+can still be sampled under different adapter versions.
 Use `wait` for a consistent adapter version within each generation request; a
 multi-turn rollout can still span updates.
 
@@ -199,7 +200,9 @@ need a new image and resubmission to pick up logging changes.
 MLflow uses experiment `grpo_v2` and the standard tracking environment variables.
 The [module docstring](train_grpo_v2.py) defines metric names and aggregation.
 Every `example_log_interval` iterations (default 10, positive integer), it saves
-full token transcripts, final observations, rewards, and advantages.
+full token transcripts, final observations, rewards, and advantages. Every batch
+carries up to eight examples so logs match the consumed batch even when prefetches
+finish out of order.
 Stop fractions include all `StopCondition` labels, with zero for absent labels.
 `rollout/total_tokens_mean` is the mean full transcript length in the learner
 batch, counting context and sampled tokens and excluding padding, before the

@@ -1,4 +1,7 @@
 import asyncio
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -6,7 +9,17 @@ from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
 from vllm.lora.request import LoRARequest
 
-from rl2.vllm import server
+from rl2.vllm_support import server
+
+
+def test_vllm_import_from_training_script_directory() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", "from vllm.config.lora import MaxLoRARanks"],
+        cwd=Path(__file__).resolve().parents[1] / "src/rl2",
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_reload_flag_only_reaches_explicit_engine_updates() -> None:

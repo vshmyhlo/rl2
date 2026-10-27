@@ -289,7 +289,7 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
     command = [
         sys.executable,
         "-m",
-        "rl2.vllm.server",
+        "rl2.vllm_support.server",
         "--model",
         "Qwen/Qwen3-0.6B",
         "--host",
@@ -391,12 +391,33 @@ def test_script_actor_serialization() -> None:
             "-c",
             (
                 "import sys\n"
+                "from types import SimpleNamespace\n"
+                "import jax\n"
+                "import jax.numpy as jnp\n"
+                "import numpy as np\n"
                 "from ray import cloudpickle\n"
                 "actors = cloudpickle.loads(sys.stdin.buffer.read())\n"
                 "assert all(actor.__name__ == name for name, actor in actors.items())\n"
+                "create_state = actors['Learner'].start.__wrapped__.__globals__['create_state']\n"
+                "config = create_state.__annotations__['config'](lora_rank=1, lora_alpha=3)\n"
+                "name = 'model.layers.0.self_attn.q_proj.weight'\n"
+                "params = {name: jnp.ones((2, 3), dtype=jnp.bfloat16)}  # (O=2, I=3)\n"
+                "state = create_state(SimpleNamespace(apply=None), params, config)\n"
+                "mesh = jax.sharding.Mesh(jax.devices()[:1], ('batch',))\n"
+                "sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())\n"
+                "placed = jax.device_put(state, sharding)\n"
+                "restored = jax.jit(lambda value: value)(placed)\n"
+                "assert restored.lora_scale == 3\n"
+                "assert restored.base_params[name].shape == (2, 3)\n"
+                "assert restored.params[name].a.shape == (1, 3)\n"
+                "assert restored.params[name].b.shape == (2, 1)\n"
+                "for actual, expected in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):\n"
+                "    assert actual.shape == expected.shape\n"
+                "    np.testing.assert_array_equal(actual, expected)\n"
             ),
         ],
         input=cloudpickle.dumps(actors),
+        env=os.environ | {"JAX_PLATFORMS": "cpu"},
         capture_output=True,
         check=False,
         timeout=60,
@@ -702,16 +723,12 @@ def test_learner_pulls_groups_through_batcher(
         assert not hasattr(batch, "groups")
         assert batch.stop_counts == {"agent_completed": num_groups * 3}
         assert batch.num_output_tokens == num_groups * 3
-        if iteration == 10:
-            assert batch.examples.count("Full token sequence (special tokens preserved):") == num_groups * 3
-            format_examples.assert_called_once()
-        else:
-            assert batch.examples == ""
-            format_examples.assert_not_called()
+        assert batch.examples.count("Full token sequence (special tokens preserved):") == num_groups * 3
+        format_examples.assert_called_once()
         assert batch.training_batch.token_ids.shape == (num_groups * 3, 8)
         np.testing.assert_array_equal(batch.training_batch.advantages, 0.5)
     batcher_handle.fetch_next_batch.remote.assert_called_once_with(
-        num_groups=num_groups, group_size=3, context_length=8, include_examples=iteration == 10
+        num_groups=num_groups, group_size=3, context_length=8, include_examples=True
     )
     assert actor.fetch_next_group.remote.call_count == num_groups
     assert all(call.kwargs == {"group_size": 3} for call in actor.fetch_next_group.remote.call_args_list)
@@ -779,9 +796,7 @@ def test_learner_prefetches_bounded_batches(
     for index in range(2, len(results)):
         assert learner.fetch_next_batch(iteration=8 + index).examples == str(order[index])
     assert submit.call_count == len(results)
-    assert [call.kwargs["include_examples"] for call in submit.call_args_list] == [
-        8 + index == 10 for index in range(len(results))
-    ]
+    assert all(call.kwargs["include_examples"] for call in submit.call_args_list)
     assert [call.args[0] for call in get.call_args_list] == ready_results
     pending = results.copy()
     pending.remove(ready_results[0])
@@ -1369,21 +1384,34 @@ def test_learner_logs_examples_at_configured_interval(
     prepared = Mock(spec=training.GRPOBatch)
     prepared.token_ids = Mock(shape=(10, 8))  # (B=10, T=8)
     prepared.attention_mask = np.ones((10, 8), dtype=np.bool_)  # (B=10, T=8)
-    format_examples = Mock(wraps=training.format_rollout_examples)
-    monkeypatch.setattr(training, "format_rollout_examples", format_examples)
+    submitted: list[training.Transfer[training.RolloutBatch]] = []
 
     def fetch(
         num_groups: int, group_size: int, context_length: int, *, include_examples: bool
     ) -> training.Transfer[training.RolloutBatch]:
         batch = training.build_rollout_batch(
-            groups=groups,
+            groups=[replace(groups[0], task_id=f"batch-{len(submitted) + 1}"), groups[1]],
             training_batch=prepared,
             transfer_metrics={"batcher/actor_transfer_seconds_mean": 0.0},
             include_examples=include_examples,
         )
-        return training.Transfer(value=batch, ready_at=training.time.monotonic())
+        result = training.Transfer(value=batch, ready_at=training.time.monotonic())
+        submitted.append(result)
+        return result
+
+    # Logging steps 3 and 6 consume submissions 2 and 5, neither originally scheduled for examples.
+    completion_order = iter((3, 0, 1, 2, 6, 4, 5))
+
+    def wait(
+        refs: list[training.Transfer[training.RolloutBatch]], *, num_returns: int
+    ) -> tuple[list[training.Transfer[training.RolloutBatch]], list[training.Transfer[training.RolloutBatch]]]:
+        assert num_returns == 1
+        result = submitted[next(completion_order)]
+        assert any(ref is result for ref in refs)
+        return [result], [ref for ref in refs if ref is not result]
 
     learner.batcher.fetch_next_batch.remote.side_effect = fetch
+    monkeypatch.setattr(training.ray, "wait", wait)
     monkeypatch.setattr(training.ray, "get", lambda value: value)
     writer = MagicMock()
     writer.__enter__.return_value = writer
@@ -1391,12 +1419,6 @@ def test_learner_logs_examples_at_configured_interval(
 
     learner.start()
 
-    assert format_examples.call_count == 2
-    assert [
-        index
-        for index, call in enumerate(learner.batcher.fetch_next_batch.remote.call_args_list, start=1)
-        if call.kwargs["include_examples"]
-    ] == [3, 6]
     artifacts = writer.log_text.call_args_list[1:]  # Skip the config artifact.
     assert [call.args[1] for call in artifacts] == ["examples/3.txt", "examples/6.txt"]
     messages = [message for message in caplog.messages if "Rollout examples | step" in message]
@@ -1405,7 +1427,7 @@ def test_learner_logs_examples_at_configured_interval(
     for step, call in zip((3, 6), artifacts, strict=True):
         text = call.args[0]
         assert text.startswith(f"Rollout examples | step {step}\n\n{'=' * 72}\n")
-        assert "Example 1 | task=task-1 | reward=1.000 | advantage=0.500" in text
+        assert f"Example 1 | task=batch-{step - 1} | reward=1.000 | advantage=0.500" in text
         assert "Turns: 1 | Output tokens: 1 | Stop: max_turns" in text
         assert "Prompt:" not in text
         assert (
