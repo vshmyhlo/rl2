@@ -102,7 +102,8 @@ def test_lora_model_projection_wiring_and_gradients(scan: bool, remat: bool) -> 
     zeros = {
         name: factor._replace(b=jnp.zeros_like(factor.b)) for name, factor in adapters.items()
     }  # (O, R) B factors.
-    np.testing.assert_array_equal(native(zeros)[1], model.apply({"params": params}, tokens).logits)
+    # GPU fusion can change FP32 rounding by one ULP even with a zero delta.
+    np.testing.assert_allclose(native(zeros)[1], model.apply({"params": params}, tokens).logits, atol=1e-8, rtol=2e-7)
     first = model.apply(
         {"params": params}, tokens[:, :2], cache=model.init_cache(1, 4), lora=adapters, lora_scale=scale
     )

@@ -128,17 +128,17 @@ head stay frozen. Both JAX and vLLM compute separate base and LoRA branches.
 The FP32 factors are cast to BF16; alpha/r is folded into BF16 B and rounded again.
 The shrink result and expanded delta each round to BF16 before the delta is added
 to the BF16 base output. JAX keeps these rounding boundaries in the gradient graph.
-FP32 master factors and Adam moments remain trainable; base weights remain BF16.
+Only the FP32 master factors receive gradients; Adam moments stay FP32 and base weights stay BF16.
 Ranks from 1 through 512 are accepted, with vLLM capacity rounded up as needed.
-GPU log-probability parity still needs validation across the two backends.
+The native-LoRA GPU audit passes tiny models but exceeds full-model parity tolerances.
 Optimizer state, gradients, log probabilities, and loss use FP32. Learner
 `attention_backend` accepts `tokamax` (default), `xla`, or `cudnn`; `scan_layers` and
 `gradient_checkpointing` default to true. These defaults match the standalone
 Qwen3 model and the [publication parity suite](../../docs/qwen3.md#parity-with-the-grpo-v2-vllm-server).
-BF16 parity is approximate: the expanded 4,096-token audit found unchanged-policy
-ratios outside the clipping range at temperature 0.7. See the
-[measured limits](../../docs/qwen3.md#longer-decode-revalidation-2026-10-25);
-passing a short rollout or observing small average KL does not certify all token ratios.
+BF16 parity is approximate: the real Qwen3-0.6B native-LoRA test reaches 0.179 maximum
+log-probability error at 256 tokens, above its 0.12 limit. See the
+[measured limits](../../docs/qwen3.md#native-lora-audit-2026-10-27);
+zero false clipping on these samples does not certify longer production contexts.
 Temperature is restricted to `[0.01, 2.0]`; vLLM returns
 `processed_logprobs` with neutral top-p/top-k sampling, matching the learner.
 
@@ -156,9 +156,9 @@ BF16, and replaces the `training-policy` adapter through `/v1/load_lora_adapter`
 with `load_inplace: true`. Rollout requests select that adapter; the base model is
 loaded once. A small server wrapper clears vLLM 0.32's persistent `load_inplace`
 flag after a successful load, preventing repeated adapter reads during decoding.
-The initial adapter is published before any rollouts. Previous files are removed
-after a successful replacement, and all temporary files are removed
-when the learner exits. This requires learner and server to share a local filesystem.
+The initial adapter is published before any rollouts. Each publication removes its
+temporary directory after the blocking weight update returns, including on failure.
+The single adapter stays in vLLM memory. Learner and server must share a local filesystem.
 `prefetch_batches: N`
 (default 1) generates up to N batches ahead while the learner optimizes; each
 batch contains `num_groups` rollout groups. Prefetched rollouts can use older

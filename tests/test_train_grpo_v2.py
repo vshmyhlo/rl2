@@ -796,7 +796,6 @@ def test_learner_cancels_prefetch_on_update_failure(
     learner: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     learner.config = replace(learner.config, total_iterations=4, prefetch_batches=3)
-    learner.initialize_publication = Mock()
     learner.publish_weights = Mock()
     batch = training.build_rollout_batch(
         groups=[training.RolloutGroup(task_id="0", rollouts=[rollout] * 4)],
@@ -1024,12 +1023,12 @@ def test_learner_initializes_replicated_state(learner: Any, monkeypatch: pytest.
         assert jax.sharding.get_mesh() == learner.mesh
         return training.load_qwen3_checkpoint.return_value
 
-    def initialize(resources: ExitStack) -> None:
+    def publish() -> None:
         assert jax.sharding.get_mesh() == learner.mesh
         raise RuntimeError("initialized")
 
     training.load_qwen3_checkpoint.side_effect = load
-    learner.initialize_publication = initialize
+    learner.publish_weights = publish
     with pytest.raises(RuntimeError, match="initialized"):
         learner.start()
     assert jax.sharding.get_mesh() == previous_mesh
@@ -1104,8 +1103,6 @@ def test_learner_logs_rollouts(
     monkeypatch.setattr(training, "time", Mock(monotonic=Mock(side_effect=range(20))))
     monkeypatch.setattr(training.ray, "get", Mock())
     steps = Mock()
-    steps.initialize = Mock(wraps=learner.initialize_publication)
-    learner.initialize_publication = steps.initialize
     learner.fetch_next_batch = steps.fetch
     transfer_metrics = {
         "batcher/fetch_rollout_seconds": 0.5,
@@ -1137,10 +1134,6 @@ def test_learner_logs_rollouts(
     steps.optimize.side_effect = optimize
     learner.optimize = steps.optimize
 
-    def exit_writer(*args: object) -> None:
-        assert not learner._adapter_directory.exists()
-
-    writer.__exit__.side_effect = exit_writer
     if fails:
         with pytest.raises(RuntimeError, match="done"):
             learner.start()
@@ -1163,7 +1156,7 @@ def test_learner_logs_rollouts(
         assert value.devices() == {jax.devices("cpu")[0]}
     assert all(value.dtype == jnp.float32 for value in jax.tree.leaves(learner.state.params))
     learner.fetch_next_batch.assert_called_with(iteration=2)
-    expected = ["initialize", "publish", "fetch", "optimize", "publish", "fetch"]
+    expected = ["publish", "fetch", "optimize", "publish", "fetch"]
     assert [call[0] for call in steps.mock_calls] == expected + ([] if fails else ["optimize", "publish"])
     factory.assert_called_once_with(experiment="grpo_v2", run_name=None)
     writer.log_params.assert_called_once_with(asdict(learner.config))
@@ -1247,7 +1240,6 @@ def test_learner_logs_rollouts(
 
 def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     learner.config = replace(learner.config, total_iterations=3, checkpoint_interval=2, prefetch_batches=4)
-    learner.initialize_publication = Mock()
     published_steps: list[int] = []
     saved: list[training.TrainingProgress] = []
     writer = MagicMock()
@@ -1372,7 +1364,6 @@ def test_learner_logs_examples_at_configured_interval(
         prefetch_batches=3,
         example_log_interval=3,
     )
-    learner.initialize_publication = Mock()
     learner.publish_weights = Mock()
     learner.optimize = Mock(return_value={"train/policy_loss": 0.0})
     prepared = Mock(spec=training.GRPOBatch)
@@ -1438,18 +1429,16 @@ def test_learner_cleans_up_failed_start(learner: Any, monkeypatch: pytest.Monkey
     monkeypatch.setattr(training, "MLflowLogger", Mock(return_value=writer))
 
     def fail() -> None:
-        (learner._adapter_directory / "partial").write_text("unfinished adapter")
         raise RuntimeError("publish failed")
 
     learner.publish_weights = fail
     with pytest.raises(RuntimeError, match="publish failed"):
         learner.start()
-    assert not learner._adapter_directory.exists()
     writer.__exit__.assert_called_once()
     assert writer.__exit__.call_args.args[0] is RuntimeError
 
 
-def test_learner_publishes_only_adapters_and_replaces_files(learner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_learner_publishes_only_adapters_and_cleans_files(learner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     learner.state = training.create_state(
         training.load_qwen3_checkpoint.return_value[0],
         training.load_qwen3_checkpoint.return_value[1]["params"],
@@ -1476,27 +1465,20 @@ def test_learner_publishes_only_adapters_and_replaces_files(learner: Any, monkey
         helper = PEFTHelper.from_dict(config)
         assert helper.r == learner.config.lora_rank
         assert helper.lora_alpha == learner.config.lora_alpha
-        if snapshots:
-            assert snapshots[-1].exists()  # Retain the previous files until vLLM acknowledges.
+        assert all(not path.exists() for path in snapshots)
         snapshots.append(directory)
         return Mock()
 
     learner.actor.update_weights.remote.side_effect = receive
-    with ExitStack() as resources:
-        learner.initialize_publication(resources)
+    learner.publish_weights()
+    assert not snapshots[-1].exists()
+    learner.state = learner.state.apply_gradients(grads=jax.tree.map(jnp.ones_like, learner.state.params))
+    learner.publish_weights()
+    assert not snapshots[-1].exists()
+    monkeypatch.setattr(training.ray, "get", Mock(side_effect=RuntimeError("reload failed")))
+    with pytest.raises(RuntimeError, match="reload failed"):
         learner.publish_weights()
-        first = snapshots[-1]
-        learner.state = learner.state.apply_gradients(grads=jax.tree.map(jnp.ones_like, learner.state.params))
-        learner.publish_weights()
-        assert not first.exists()
-        assert snapshots[-1].is_dir()
-        assert learner._published_adapter == snapshots[-1]
-        monkeypatch.setattr(training.ray, "get", Mock(side_effect=RuntimeError("reload failed")))
-        with pytest.raises(RuntimeError, match="reload failed"):
-            learner.publish_weights()
-        assert learner._published_adapter == snapshots[-2]
-        assert snapshots[-2].exists()
-    assert not learner._adapter_directory.exists()
+    assert all(not path.exists() for path in snapshots)
 
 
 @pytest.mark.parametrize(

@@ -146,10 +146,12 @@ def attention_forward(model: qwen3.Qwen3LM, implementation: str) -> Callable[...
         variables: qwen3.Variables,
         tokens: jax.Array,  # (B, T)
         attention_mask: jax.Array,  # (B, T)
+        lora: qwen3.LoRAParameters,  # (R, I), (O, R) adapter factors.
+        lora_scale: float,
     ) -> qwen3.Qwen3Output:
         # Each closure gets its own JIT trace; the implementation cannot leak through JIT caches.
         with patch.object(qwen3.tokamax, "dot_product_attention", attention):
-            return model.apply(variables, tokens, attention_mask=attention_mask)
+            return model.apply(variables, tokens, attention_mask=attention_mask, lora=lora, lora_scale=lora_scale)
 
     return forward
 
@@ -305,7 +307,6 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
         learner.config = training.Config(model=str(source))
         learner.actor = SimpleNamespace(update_weights=SimpleNamespace(remote=receive))
         stack.enter_context(patch.object(training.ray, "get", resolve))
-        learner.initialize_publication(stack)
         stack.enter_context(jax.set_mesh(Mesh(devices=jax.devices(), axis_names=("batch",))))
         client = stack.enter_context(OpenAI(base_url=f"{url}/v1", api_key="unused"))
         yield Engine(

@@ -127,18 +127,17 @@ Transformers installed, run `python tests/qwen3_reference.py`.
 
 ### Parity with the GRPO v2 vLLM server
 
-**BF16 parity is not certified.** The 2026-10-25 revalidation below extends real
-rollouts from eight to 32 tokens per turn and exposes an unchanged-policy ratio
-outside the GRPO clipping range. The earlier passing audit covered shorter decodes.
+**BF16 parity is not certified.** The native-LoRA audit below passes tiny models
+but exceeds the existing full-model log-probability tolerances. The historical
+merged-weight audit also found false clipping on longer decodes.
 
 The learner now keeps frozen base weights and FP32 LoRA factors, publishing only
 PEFT adapter files through vLLM's runtime reload API. Both sides now use separate
 BF16 base and LoRA branches. JAX follows vLLM 0.32's factor casting, B scaling,
 shrink rounding, and expand-before-add rounding, including inside the gradient graph.
-CPU tests cover these boundaries and all projection gradients. The historical
-merged-weight measurements below do not certify this native-LoRA path; rerun the
-GPU publication suite before claiming rollout log-probability parity. Both models use BF16
-transformer computation and **FP32 output logits**. `serve_vllm` sets `--hf-overrides '{"head_dtype":"float32"}'`; a separately
+CPU and A100 tests cover these boundaries and all projection gradients. Both models
+use BF16 transformer computation and **FP32 output logits**.
+`serve_vllm` sets `--hf-overrides '{"head_dtype":"float32"}'`; a separately
 launched vLLM server needs the same override.
 
 Three numerical boundaries are explicit in `qwen3.py`:
@@ -170,7 +169,7 @@ QWEN3_VLLM_REPORT_DIR=/tmp/qwen3-vllm \
 uv run --env-file nvida.env pytest --confcutdir=tests tests/test_qwen3_vllm.py -q -s
 ```
 
-For the ALFWorld token budget, add `QWEN3_VLLM_CONTEXT_LENGTH=4096` and
+For a longer-context check, add `QWEN3_VLLM_CONTEXT_LENGTH=4096` and
 `QWEN3_VLLM_BACKENDS=tokamax-triton`. The real-checkpoint case then places one prompt
 near the context limit and pads the training batch to 4,096 tokens. Select
 `-k checkpoint` to run only that model. Context length must be a multiple of 256.
@@ -184,6 +183,40 @@ runtime settings. Coverage includes unequal prompts, two turns with masked conte
 temperatures 1.0/0.7, prefix-cache invalidation, and a genuine optimizer update.
 The differentiated update must reproduce the production forward's loss, KL, and
 clip fraction. A full-transcript vLLM replay measures its own prefill/decode drift.
+
+#### Native-LoRA audit (2026-10-27)
+
+With vLLM 0.32.0 on two A100 40 GB GPUs, tied and untied tiny models passed
+publication before and after a real optimizer update. Maximum sampled log-probability
+error was 0.00358, with zero false clipping. Frozen base hashes, adapter replacement,
+prefix-cache invalidation in `wait` mode, and generation after temporary adapter
+files were deleted all passed.
+
+The real Qwen3-0.6B checkpoint at revision
+`c1899de289a04d12100db370d81485cdf75e47ca` used Tokamax Triton, 256-token contexts,
+two turns of up to 32 sampled tokens, and temperatures 1.0/0.7. Worst results across
+temperatures were:
+
+| Publication | Sampled max / mean absolute log-probability error | Approximate KL | False clipping |
+| --- | --- | --- | --- |
+| Initial | 0.17888 / 0.01945 | 0.000752 | 0% |
+| After optimizer update | 0.14142 / 0.01684 | 0.000484 | 0% |
+
+Both publications exceed the 0.12 maximum-error and 0.015 mean-error limits;
+the initial publication also exceeds the 0.0006 KL limit. vLLM's own prefill replay
+differs from its decode scores by up to 0.09921. The full-model test fails, and this
+run does not validate the configured 32,768-token context. Artifacts are under
+`/tmp/rl2-lora-review-gpu-v3` on the test host.
+
+A `VLLM_BATCH_INVARIANT=1` control made vLLM self-replay exact, but JAX/vLLM
+maximum error still reached 0.17444 and the same parity test failed. It remains
+disabled; reports are under `/tmp/rl2-lora-review-invariant`.
+
+The five compiled vLLM operation comparisons, native-LoRA rounding/gradient checks,
+and Tokamax cache/masking checks passed on GPU. The optional cuDNN cached-attention
+test fails with `No valid execution plans built`, including when run alone.
+
+#### Historical merged-weight audits
 
 The 2026-10-24 measurements use two A100 40 GB GPUs, Qwen3-0.6B revision
 `c1899de289a04d12100db370d81485cdf75e47ca`, JAX 0.11.2, vLLM 0.27.0,

@@ -75,7 +75,6 @@ import logging
 import os
 import posixpath
 import random
-import shutil
 import subprocess
 import sys
 import time
@@ -748,11 +747,6 @@ class Learner:
         self.shuffle_key = jax.random.key(config.seed)  # () typed base PRNG key.
         self._pending_batches: list[ray.ObjectRef] = []
 
-    def initialize_publication(self, resources: ExitStack) -> None:
-        # Learner and vLLM share the local filesystem in this single-node trainer.
-        self._adapter_directory = Path(resources.enter_context(TemporaryDirectory(prefix="rl2-lora-")))
-        self._published_adapter: Path | None = None
-
     def start(self) -> None:
         self.mesh = Mesh(devices=jax.devices("gpu"), axis_names=("batch",))
         with (
@@ -793,7 +787,6 @@ class Learner:
                 len(self.state.base_params),
                 len(self.state.params),
             )
-            self.initialize_publication(resources=resources)
             resources.callback(self.cancel_pending_batches)
             self.publish_weights()
             writer.log_metrics(
@@ -912,8 +905,6 @@ class Learner:
         )
 
     def publish_weights(self) -> None:
-        directory = self._adapter_directory / uuid4().hex
-        directory.mkdir()
         adapters = jax.tree.map(
             lambda value: np.asarray(value.addressable_shards[0].data, dtype=np.float32), self.state.params
         )  # Host (R, I) and (O, R) leaves, copied from one replica.
@@ -922,28 +913,27 @@ class Learner:
             for name, adapter in adapters.items()
             for factor, value in (("A", adapter.a), ("B", adapter.b))
         }  # PEFT (R, I) and (O, R) leaves.
-        save_file(weights, directory / "adapter_model.safetensors")
-        (directory / "adapter_config.json").write_text(
-            json.dumps(
-                {
-                    "peft_type": "LORA",
-                    "task_type": "CAUSAL_LM",
-                    "base_model_name_or_path": self.config.model,
-                    "r": self.config.lora_rank,
-                    "lora_alpha": self.config.lora_alpha,
-                    "target_modules": sorted({name.split(".")[-2] for name in adapters}),
-                    "bias": "none",
-                    "lora_dropout": 0.0,
-                    "inference_mode": True,
-                    "use_rslora": False,
-                }
+        # vLLM retains this single adapter in memory after the synchronous load.
+        with TemporaryDirectory(prefix="rl2-lora-") as temporary_directory:
+            directory = Path(temporary_directory)
+            save_file(weights, directory / "adapter_model.safetensors")
+            (directory / "adapter_config.json").write_text(
+                json.dumps(
+                    {
+                        "peft_type": "LORA",
+                        "task_type": "CAUSAL_LM",
+                        "base_model_name_or_path": self.config.model,
+                        "r": self.config.lora_rank,
+                        "lora_alpha": self.config.lora_alpha,
+                        "target_modules": sorted({name.split(".")[-2] for name in adapters}),
+                        "bias": "none",
+                        "lora_dropout": 0.0,
+                        "inference_mode": True,
+                        "use_rslora": False,
+                    }
+                )
             )
-        )
-        ray.get(self.actor.update_weights.remote(str(directory)))
-        previous = self._published_adapter
-        self._published_adapter = directory
-        if previous is not None:
-            shutil.rmtree(previous)
+            ray.get(self.actor.update_weights.remote(str(directory)))
 
     def optimize(self, batch: GRPOBatch[np.ndarray]) -> dict[str, float]:  # Batch leaves: (B, T), (B,).
         if batch.token_ids.shape[0] % self.config.minibatches_per_epoch:

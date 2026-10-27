@@ -1,7 +1,6 @@
 import logging
 import pickle
 from collections.abc import Generator
-from contextlib import ExitStack
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -652,7 +651,17 @@ def test_learner_optimizes_and_publishes_updated_adapters(
 
     learner.actor.update_weights.remote.side_effect = receive
     monkeypatch.setattr(training.ray, "get", Mock())
-    with ExitStack() as resources:
-        learner.initialize_publication(resources)
-        learner.publish_weights()
+    learner.publish_weights()
     learner.actor.update_weights.remote.assert_called_once()
+    assert not Path(learner.actor.update_weights.remote.call_args.args[0]).exists()
+
+    def fail_load(result: Any) -> None:
+        path = Path(learner.actor.update_weights.remote.call_args.args[0])
+        assert (path / "adapter_config.json").is_file()
+        assert (path / "adapter_model.safetensors").is_file()
+        raise RuntimeError("Adapter load failed")
+
+    monkeypatch.setattr(training.ray, "get", fail_load)
+    with pytest.raises(RuntimeError, match="Adapter load failed"):
+        learner.publish_weights()
+    assert not Path(learner.actor.update_weights.remote.call_args.args[0]).exists()
