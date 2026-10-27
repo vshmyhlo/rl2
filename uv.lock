@@ -10,7 +10,8 @@ resolution-markers = [
     "python_full_version == '3.13.*' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux'",
     "python_full_version < '3.13' and sys_platform == 'win32'",
     "python_full_version < '3.13' and sys_platform == 'emscripten'",
     "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
@@ -23,7 +24,7 @@ excludes = ["opencv-python"]
 [[manifest.dependency-metadata]]
 name = "bfcl-eval"
 version = "2025.12.17"
-requires-dist = ["requests", "tqdm", "numpy>=2,<3", "pandas", "pathlib", "huggingface-hub", "pydantic>=2.8.2", "python-dotenv>=1.0.1", "tree-sitter==0.21.3", "tree-sitter-java==0.21.0", "tree-sitter-javascript==0.21.4", "openai>=1.86.0", "mistralai==1.7.0", "anthropic>=0.75.0", "cohere==5.18.0", "typer>=0.12.5", "tabulate>=0.9.0", "datamodel-code-generator==0.25.7", "google-genai>=1.52.0", "qwen-agent", "mpmath==1.3.0", "tenacity>=8.5.0", "writer-sdk>=2.1.0", "overrides", "boto3", "beautifulsoup4", "html2text", "rank-bm25==0.2.2", "google-search-results", "sentence-transformers>=2.7.0", "faiss-cpu==1.11.0", "networkx==3.3", "filelock==3.20.0", "vllm==0.8.5 ; extra == 'oss-eval-vllm'", "sglang[all] ; extra == 'oss-eval-sglang'", "wandb==0.18.5 ; extra == 'wandb'"]
+requires-dist = ["requests", "tqdm", "numpy>=2,<3", "pandas", "pathlib", "huggingface-hub", "pydantic>=2.8.2", "python-dotenv>=1.0.1", "tree-sitter==0.21.3", "tree-sitter-java==0.21.0", "tree-sitter-javascript==0.21.4", "openai>=1.86.0", "mistralai==1.7.0", "anthropic>=0.75.0", "cohere==5.18.0", "typer>=0.12.5", "tabulate>=0.9.0", "datamodel-code-generator==0.25.7", "google-genai>=1.52.0", "qwen-agent", "mpmath==1.3.0", "tenacity>=8.5.0", "writer-sdk>=2.1.0", "overrides", "boto3", "beautifulsoup4", "html2text", "rank-bm25==0.2.2", "google-search-results", "sentence-transformers>=2.7.0", "faiss-cpu==1.11.0", "networkx==3.3", "filelock>=3.20.3,<3.21", "vllm==0.8.5 ; extra == 'oss-eval-vllm'", "sglang[all] ; extra == 'oss-eval-sglang'", "wandb==0.18.5 ; extra == 'wandb'"]
 
 [[manifest.dependency-metadata]]
 name = "kinetix-env"
@@ -523,7 +524,7 @@ dependencies = [
     { name = "cohere" },
     { name = "datamodel-code-generator" },
     { name = "faiss-cpu" },
-    { name = "filelock", version = "3.20.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "filelock", version = "3.20.4", source = { registry = "https://pypi.org/simple" } },
     { name = "google-genai" },
     { name = "google-search-results" },
     { name = "html2text" },
@@ -997,7 +998,8 @@ dependencies = [
     { name = "google-auth" },
     { name = "googleapis-common-protos" },
     { name = "grpcio" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
     { name = "requests" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/8e/92/8a593c8ca143ce78d2564c3dc73ec55610ddf8d6e04555dd5e5b9d8e3bc8/cloud_sql_python_connector-1.22.0.tar.gz", hash = "sha256:17cab0a669558963abd0121378216ae2b8ee88d11de718072f2ab4b68a97a183", size = 48109, upload-time = "2026-08-18T20:56:28.541Z" }
@@ -1056,7 +1058,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-core" },
     { name = "requests" },
-    { name = "tokenizers", version = "0.22.2", source = { registry = "https://pypi.org/simple" } },
+    { name = "tokenizers" },
     { name = "types-requests" },
     { name = "typing-extensions" },
 ]
@@ -1100,7 +1102,7 @@ dependencies = [
     { name = "loguru" },
     { name = "pydantic" },
     { name = "torch" },
-    { name = "transformers", version = "5.5.4", source = { registry = "https://pypi.org/simple" } },
+    { name = "transformers", version = "5.19.0", source = { registry = "https://pypi.org/simple" } },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/2c/9e/d7f18bd9a0354088abc11a0c1f2c7698f7c49e5a709faedf6a46e388f693/compressed_tensors-0.17.0.tar.gz", hash = "sha256:15c20d06bdbcf35b51fc99fd125e7b9be1e1855567c33b7a46dfac26ad6fb126", size = 257091, upload-time = "2026-06-03T16:49:17.208Z" }
 wheels = [
@@ -1527,15 +1529,47 @@ wheels = [
 name = "databricks-sdk"
 version = "0.152.0"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'linux'",
+    "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'emscripten'",
+    "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+]
 dependencies = [
     { name = "google-auth" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
     { name = "requests" },
     { name = "urllib3" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a7/9b/f10a9320d02c394ffc035af92139368b3dbe01f6cc9df66b4f76a6220a11/databricks_sdk-0.152.0.tar.gz", hash = "sha256:471661106b4d6ca4a2a1bfea04f72cccc49aa89bafad6094b373f7885ab1f457", size = 1144735, upload-time = "2026-10-13T04:42:56.839Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/46/7e/fa7bbc3e131a494e58fd38654d2d4760c4e974c26c3c56b3e300ddf48e17/databricks_sdk-0.152.0-py3-none-any.whl", hash = "sha256:e216880c6b35ac251c1637c4f13e9ba0d2703c27b11fe985dc565add4b2b7eba", size = 1089006, upload-time = "2026-10-13T04:42:55.055Z" },
+]
+
+[[package]]
+name = "databricks-sdk"
+version = "0.156.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'",
+]
+dependencies = [
+    { name = "google-auth" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "requests" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c7/ae/d2ecf557009dfcb6788fcdcb911426f61541c9d80d32220aaf642f18328d/databricks_sdk-0.156.0.tar.gz", hash = "sha256:d6b04f07b052654d4897f69f6ad6c7c7b4df224a72a6deeee2517fbb429a33a9", size = 1169958, upload-time = "2026-10-22T04:33:34.699Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d2/c1/631160994379b7baa4605c2a4ffa6bca374b3ef73213e43b2dfcbd6c2bb9/databricks_sdk-0.156.0-py3-none-any.whl", hash = "sha256:1aa5e0cabfc5626a886c9fa42bc1ce14a6166e8167ef34026dcc41f3c99e2a5a", size = 1112276, upload-time = "2026-10-22T04:33:33.024Z" },
 ]
 
 [[package]]
@@ -1564,7 +1598,8 @@ version = "5.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "dill" },
-    { name = "filelock", version = "3.20.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "filelock", version = "3.20.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' and sys_platform == 'linux'" },
+    { name = "filelock", version = "3.20.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and sys_platform == 'linux'" },
     { name = "filelock", version = "4.0.12", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "fsspec", extra = ["http"] },
     { name = "huggingface-hub" },
@@ -1925,7 +1960,8 @@ source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'linux'",
     "python_full_version == '3.13.*' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux'",
 ]
 dependencies = [
     { name = "annotated-doc" },
@@ -2147,11 +2183,23 @@ source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'linux'",
     "python_full_version == '3.13.*' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and sys_platform == 'linux'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/58/46/0028a82567109b5ef6e4d2a1f04a583fb513e6cf9527fcdd09afd817deeb/filelock-3.20.0.tar.gz", hash = "sha256:711e943b4ec6be42e1d4e6690b48dc175c822967466bb31c0c293f34334c13f4", size = 18922, upload-time = "2025-10-08T18:03:50.056Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/76/91/7216b27286936c16f5b4d0c530087e4a54eead683e6b0b73dd0c64844af6/filelock-3.20.0-py3-none-any.whl", hash = "sha256:339b4732ffda5cd79b13f4e2711a31b0365ce445d95d243bb996273d072546a2", size = 16054, upload-time = "2025-10-08T18:03:48.35Z" },
+]
+
+[[package]]
+name = "filelock"
+version = "3.20.4"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux'",
+]
+sdist = { url = "https://files.pythonhosted.org/packages/db/81/cfe075b6ce057ce595c61d52a0bd6452f425f923b6c02ecee6c0c8d6e5a7/filelock-3.20.4.tar.gz", hash = "sha256:92b98bb6be1a4e6c1b00f8aedae011c6e2d367c195000a049daa34f554af3d94", size = 31347, upload-time = "2026-02-12T15:31:04.971Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5b/30/076a6014a380889df7d2cd7d486dd457a3e2ad341223f540304727bb7437/filelock-3.20.4-py3-none-any.whl", hash = "sha256:3334d8af34a55fbebfceeee137220e844799d75650d2d6140e4a9ed536e5f7f5", size = 21379, upload-time = "2026-02-12T15:31:03.793Z" },
 ]
 
 [[package]]
@@ -2188,7 +2236,7 @@ wheels = [
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.16.post3"
+version = "0.7.0.post1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -2196,6 +2244,7 @@ dependencies = [
     { name = "cuda-python" },
     { name = "cuda-tile" },
     { name = "einops" },
+    { name = "nccl-extensions" },
     { name = "nccl4py" },
     { name = "ninja" },
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" } },
@@ -2208,9 +2257,9 @@ dependencies = [
     { name = "torch" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c2/46/17045cb47b7b93fcb4e5303e398e6b129b86239930ac0875942a83d8b962/flashinfer_python-0.6.16.post3.tar.gz", hash = "sha256:9b146cfcc1454c80f3f99444db48013b3eadaeb32f2a399bd76c9471ecb72f04", size = 11076656, upload-time = "2026-08-08T01:14:16.408Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/14/b0/2f27f2645056b0e671b3bcf8a934e73ed89ca5c5df9ebe651f21c0d218e2/flashinfer_python-0.7.0.post1.tar.gz", hash = "sha256:2e67b38a9af1d4eedff96f7f5d79c6a4d9f0f97cb4a30f71e4ffd717f1ad9af4", size = 26061698, upload-time = "2026-09-29T23:34:14.797Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9d/dc/5367cb601fc9190cc75b4c141f5f7e9a224d1c26a1e983151823e02a25b3/flashinfer_python-0.6.16.post3-py3-none-any.whl", hash = "sha256:caf686b9b079abe1c9d65ab505698bd325e8072de40afd822f2c74f2ac3bc601", size = 15836034, upload-time = "2026-08-08T01:14:13.709Z" },
+    { url = "https://files.pythonhosted.org/packages/00/7d/16237087a2af99086ef4ae9808dff9b24f0a4db4cfd673233836821a32e0/flashinfer_python-0.7.0.post1-py3-none-any.whl", hash = "sha256:c7adf826568d61fc1b7d3aadd4cae387a35a138bfc08e2deca2f34ecfa280716", size = 33659854, upload-time = "2026-09-29T23:34:11.137Z" },
 ]
 
 [[package]]
@@ -2539,7 +2588,8 @@ dependencies = [
     { name = "googleapis-common-protos" },
     { name = "opentelemetry-api" },
     { name = "proto-plus" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
     { name = "requests" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/23/f7/0fb8c3618c783ad49da1aaf97f93a4bb9e4ed522135516b44d129a7f85bb/google_api_core-2.40.0.tar.gz", hash = "sha256:ebee7d1b138b5362beecec260e6e8988ac97346562c7382ccb6f0ad8435c599f", size = 258617, upload-time = "2026-09-29T19:25:54.611Z" }
@@ -2620,6 +2670,20 @@ wheels = [
 name = "google-cloud-aiplatform"
 version = "2.4.0"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'linux'",
+    "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'emscripten'",
+    "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+]
 dependencies = [
     { name = "certifi" },
     { name = "docstring-parser" },
@@ -2631,13 +2695,40 @@ dependencies = [
     { name = "google-genai" },
     { name = "packaging" },
     { name = "proto-plus" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
     { name = "pydantic" },
     { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/7f/02/f8b5e99a8028ed3c295a109300e84e33aa91a32eb9d0a5d9da9c139abfcb/google_cloud_aiplatform-2.4.0.tar.gz", hash = "sha256:41ef8ef68cbda2b2107cb562105fdd57249b386d06be11113efe3986f146b292", size = 11357300, upload-time = "2026-10-07T00:32:24.073Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7e/9d/aee458f3ac09865b9e7226d08e5147759928d22ca8472b58c6a72c897274/google_cloud_aiplatform-2.4.0-py2.py3-none-any.whl", hash = "sha256:d4062b71182a2ca89a9837d2fd8bfa3481ff4c77ea5cb203a016a3442482d951", size = 9473731, upload-time = "2026-10-07T00:32:19.82Z" },
+]
+
+[[package]]
+name = "google-cloud-aiplatform"
+version = "2.6.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'",
+]
+dependencies = [
+    { name = "certifi" },
+    { name = "docstring-parser" },
+    { name = "google-api-core", extra = ["grpc"] },
+    { name = "google-auth" },
+    { name = "google-cloud-bigquery" },
+    { name = "google-cloud-resource-manager" },
+    { name = "google-cloud-storage" },
+    { name = "google-genai" },
+    { name = "packaging" },
+    { name = "proto-plus" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "pydantic" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/bd/7c/22d0273b1d2a7b17d8129f7b40671fbde3df40695072fa920e32cf9e106a/google_cloud_aiplatform-2.6.0.tar.gz", hash = "sha256:dbb3441a9b850d0cc310e25f17323d9bb5a6c38bc68faa1062abc5d033f50cfd", size = 11224108, upload-time = "2026-10-20T22:53:07.045Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d0/e2/8a96ce0474359a28a304e1c099745d305634d55bfcb6f3fdc6a3efdfb8e6/google_cloud_aiplatform-2.6.0-py2.py3-none-any.whl", hash = "sha256:b54a0a2881b6a4311e86f39cc5e2f652c2242c117a2d03fad839810bb2882e1e", size = 9390344, upload-time = "2026-10-20T22:53:02.601Z" },
 ]
 
 [[package]]
@@ -2681,7 +2772,8 @@ dependencies = [
     { name = "grpc-google-iam-v1" },
     { name = "grpcio" },
     { name = "proto-plus" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/f4/1f/a2f23d2c2c0a34dab2e689d11ac4f20d77ac51c4832953beece2bc39e48a/google_cloud_resource_manager-1.19.0.tar.gz", hash = "sha256:68e5d28ed9091ab1adf04a77876b09d553e97a440fba78163f6ce2b5fe5f2558", size = 446420, upload-time = "2026-10-01T18:17:54.309Z" }
 wheels = [
@@ -2715,7 +2807,8 @@ dependencies = [
     { name = "grpc-google-iam-v1" },
     { name = "grpcio" },
     { name = "proto-plus" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b0/b1/95f5bd878537dffa80c96d67d4a87b4bd273630e1e52f84a40602206448c/google_cloud_storage_control-1.15.0.tar.gz", hash = "sha256:e3d50276f0aed0c33ebcf3c6221e933889e042df70a56886ddffe59c66889183", size = 160209, upload-time = "2026-09-03T22:31:17.533Z" }
 wheels = [
@@ -2804,7 +2897,8 @@ name = "googleapis-common-protos"
 version = "1.75.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/8d/2b/6ce81972d5c8cab9705fddce3153be63222d9e12fd96f8baba5038a744dd/googleapis_common_protos-1.75.5.tar.gz", hash = "sha256:c7a866fc34ed29a3b10af627a4b9b1dc2433313ca6e959f0ae4feb132047ed72", size = 156513, upload-time = "2026-09-29T19:26:14.863Z" }
 wheels = [
@@ -2828,7 +2922,8 @@ dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "portpicker" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1f/20/59fb32fd6aadc40e0dbde586a62903646ad778413c78280ea8d1e18e73de/grain-0.2.18-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:1bcff4c0ec71cee0b8c26076e3b60d83897cd7586b8f182291969743fd79a7b9", size = 554329, upload-time = "2026-06-17T20:57:47.422Z" },
@@ -2870,7 +2965,8 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "googleapis-common-protos", extra = ["grpc"] },
     { name = "grpcio" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/d2/d0/fa5bdd5f3f421bb68dc6dc162e9caaf942897ca41ce7255b524723c80f0b/grpc_google_iam_v1-0.14.5.tar.gz", hash = "sha256:07fd3a9fafb586588e771831fbfc8f6597050181d0c3b45e039d18b8fdc1aab5", size = 23736, upload-time = "2026-08-06T06:24:54.489Z" }
 wheels = [
@@ -2925,7 +3021,8 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "googleapis-common-protos" },
     { name = "grpcio" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/52/45/f80309cdb6a7dbf8f65e2082dd2ddc9797ba7180516a73c54d966ba632c4/grpcio_status-1.84.0.tar.gz", hash = "sha256:5caf28ba7184b81f618b5f7f094859fd2541bf429d2189bbbcd715c9c2cdcee2", size = 14015, upload-time = "2026-09-14T07:10:29.402Z" }
 wheels = [
@@ -3159,7 +3256,8 @@ version = "1.33.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
-    { name = "filelock", version = "3.20.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "filelock", version = "3.20.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' and sys_platform == 'linux'" },
+    { name = "filelock", version = "3.20.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and sys_platform == 'linux'" },
     { name = "filelock", version = "4.0.12", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "fsspec" },
     { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'" },
@@ -3185,23 +3283,21 @@ wheels = [
 
 [[package]]
 name = "humming-kernels"
-version = "0.1.10"
+version = "0.1.17"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cuda-bindings" },
     { name = "jinja2" },
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" } },
-    { name = "nvidia-ml-py" },
-    { name = "pyelftools" },
     { name = "safetensors" },
     { name = "tabulate" },
     { name = "torch" },
     { name = "tqdm" },
     { name = "triton" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/51/4f/6977a31451c3f7aa1deaa76506d6cdeb74ef418ad8bcba2e98f7510b26ec/humming_kernels-0.1.10.tar.gz", hash = "sha256:da3e46fb9fc9eba2a9327c2e8135ead68e390c955acd7449f97ee7c71666c8b1", size = 220110, upload-time = "2026-07-02T10:22:57.687Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/60/52/b3958f17315854ca781909f39392e6b40d45965820912cd610191597bd92/humming_kernels-0.1.17.tar.gz", hash = "sha256:a2565bf03b8b2ca07086db00a949c0c92727ea675e4d3037f9337192a840225a", size = 403057, upload-time = "2026-10-14T17:07:29.566Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/63/ba/869bc24591d2b4fb0d8da821528072971052a934af077a11f77a0f2b3e79/humming_kernels-0.1.10-py3-none-any.whl", hash = "sha256:4ded0998ff085afeddde70baf93f97c2929969ec3d4a63a52cfec5072bc972b4", size = 184889, upload-time = "2026-07-02T10:22:56.031Z" },
+    { url = "https://files.pythonhosted.org/packages/da/fa/c4e367ca51b2611faf88ac9ee1abe5e9ee6d4d174bbabdb54481c65f7e2e/humming_kernels-0.1.17-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:e418b5482dabd71f64622893bdbb8bf27eb30379c443b92d32af48825d9ad64c", size = 504747, upload-time = "2026-10-14T17:07:28.196Z" },
 ]
 
 [package.optional-dependencies]
@@ -3316,6 +3412,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/72/34/14ca021ce8e5dfedc35312d08ba8bf51fdd999c576889fc2c24cb97f4f10/iniconfig-2.3.0.tar.gz", hash = "sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730", size = 20503, upload-time = "2025-10-18T21:55:43.219Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", size = 7484, upload-time = "2025-10-18T21:55:41.639Z" },
+]
+
+[[package]]
+name = "instanttensor"
+version = "0.2.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ca/a1/95d0d4cee908ab0bd8e56b44cdb19e678081c54de52d280b0b3c9f7e4c43/instanttensor-0.2.2.tar.gz", hash = "sha256:aca07c1afe4fde23dcbfb53044e2bef50dad4c0af054317acc669a1c8dc2b325", size = 613106, upload-time = "2026-10-13T15:06:59.034Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/59/12/0a4b55402ec7f45f223d4cab19c8d6d39f5242d386f4f421e30c34dd8900/instanttensor-0.2.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:382954f2329fc085ff298ce0205a06ce0fc8c67a704fc032613931a5ae9018d5", size = 6522862, upload-time = "2026-10-13T15:06:07.285Z" },
+    { url = "https://files.pythonhosted.org/packages/54/45/0ade43f9fa2ae52bcdb7c1dad7ae190919f4e1a97a2f88dc6131ac00fb37/instanttensor-0.2.2-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0474ae1f12bccbd01fabaeffab483870d9be644dc5c52d8b746ee1806dbc02fe", size = 6525208, upload-time = "2026-10-13T15:06:22.177Z" },
+    { url = "https://files.pythonhosted.org/packages/65/2e/7bf9604ed24f24a254c20754c0ded92c416242ab1f24628d614a41f548f1/instanttensor-0.2.2-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0ccf832e544dcd13aac8da280ce70ad1b2bfede4fc00a7e7e3e6f963e3dd7eb4", size = 6520762, upload-time = "2026-10-13T15:06:56.812Z" },
 ]
 
 [[package]]
@@ -3935,7 +4045,8 @@ dependencies = [
     { name = "tqdm" },
     { name = "typeguard" },
     { name = "typing-extensions" },
-    { name = "xmanager" },
+    { name = "xmanager", version = "0.8.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
+    { name = "xmanager", version = "0.8.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/25/99/455b3f8d810f9dd5f014c9d7a9d0df095ca48c379fa81c784416844ac349/kauldron-1.4.4.tar.gz", hash = "sha256:4abf92cb7714a3f023849864c78f8a14f321a0638d2aef366b8a3ac694728e5b", size = 396139, upload-time = "2026-06-10T13:35:49.595Z" }
 wheels = [
@@ -4121,7 +4232,8 @@ source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'linux'",
     "python_full_version == '3.13.*' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/af/60/bc7622aefb2aee1c0b4ba23c1446d3e30225c8770b38d7aedbfb65ca9d5a/lark-1.2.2.tar.gz", hash = "sha256:ca807d0162cd16cef15a8feecb862d7319e7a09bdb13aef927968e45040fed80", size = 252132, upload-time = "2024-08-13T19:49:00.652Z" }
 wheels = [
@@ -4694,7 +4806,8 @@ dependencies = [
     { name = "cachetools" },
     { name = "click" },
     { name = "cloudpickle" },
-    { name = "databricks-sdk" },
+    { name = "databricks-sdk", version = "0.152.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "databricks-sdk", version = "0.156.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
     { name = "fastapi", version = "0.136.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
     { name = "fastapi", version = "0.143.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "gitpython" },
@@ -4703,7 +4816,8 @@ dependencies = [
     { name = "opentelemetry-proto" },
     { name = "opentelemetry-sdk" },
     { name = "packaging" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
     { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
@@ -5090,6 +5204,24 @@ wheels = [
 ]
 
 [[package]]
+name = "nccl-extensions"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cuda-core" },
+    { name = "cuda-pathfinder" },
+    { name = "nccl4py" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" } },
+    { name = "packaging" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f3/3c/b043c1f8ca2766d48e30e9cc5a0d65d51aef77e3a8d18dbbaa95fd5386e2/nccl_extensions-0.1.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:54d46bee108f0bc18cdc35dbe17bba6452d6a38a270fa5e8ccde03267460fa87", size = 22589285, upload-time = "2026-09-02T15:38:53.213Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/66/0f0a3fe84ffdf6ddfb13c01a036ea370519204820cc8c53303f479c43a09/nccl_extensions-0.1.0-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3328dc1cfeed0ddf37caac00be8c49b3e4f727dce0e7980f8831696165619a4f", size = 22564580, upload-time = "2026-09-02T15:39:32.862Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/3d/2af7630a67b2c2d96e4ad520a3a04957e92b66dbc0c886520aa96b7b5c57/nccl_extensions-0.1.0-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:28f2513696bd03453857db32a5f6144631f874efb23b5fede4c6218e6026d6b1", size = 22531955, upload-time = "2026-09-02T15:40:20.373Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/af/3a54416ac5e5ec08254195216e9708b8e91371d436e5c5459348400fdb98/nccl_extensions-0.1.0-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:647f28b3a7a7d5c5c40cc7db544ed7ff362ac091b28e806de93c6215d2af45fe", size = 22546859, upload-time = "2026-09-02T15:41:02.116Z" },
+]
+
+[[package]]
 name = "nccl4py"
 version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -5122,7 +5254,8 @@ source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'linux'",
     "python_full_version == '3.13.*' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/04/e6/b164f94c869d6b2c605b5128b7b0cfe912795a87fc90e78533920001f3ec/networkx-3.3.tar.gz", hash = "sha256:0c127d8b2f4865f59ae9cb8aafcd60b5c70f3241ebd66f7defad7c4ab90126c9", size = 2126579, upload-time = "2024-04-06T12:59:47.137Z" }
 wheels = [
@@ -5202,7 +5335,8 @@ source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'linux'",
     "python_full_version == '3.13.*' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/76/65/21b3bc86aac7b8f2862db1e808f1ea22b028e30a225a34a5ede9bf8678f2/numpy-2.3.5.tar.gz", hash = "sha256:784db1dcdab56bf0517743e746dfb0f885fc68d948aba86eeec2cba234bdf1c0", size = 20584950, upload-time = "2025-11-16T22:52:42.067Z" }
 wheels = [
@@ -5328,14 +5462,6 @@ wheels = [
 ]
 
 [[package]]
-name = "nvidia-cuda-nvdisasm"
-version = "13.4.92"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/59/ea/b83b98288fd3d37b16c0da8846987d9c8719e9ff49ab974c1988d9e63f5a/nvidia_cuda_nvdisasm-13.4.92-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:f35a5b6ddb64b6758c22c0b078c5b6ff6d54f7c240cd74bf131ab5bf13b6c3fe", size = 5203296, upload-time = "2026-09-16T20:38:39.558Z" },
-]
-
-[[package]]
 name = "nvidia-cuda-nvrtc"
 version = "13.0.88"
 source = { registry = "https://pypi.org/simple" }
@@ -5367,13 +5493,17 @@ wheels = [
 
 [[package]]
 name = "nvidia-cudnn-frontend"
-version = "1.28.0"
+version = "1.32.0"
 source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "apache-tvm-ffi" },
+    { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
+]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fd/0d/b6670b5d2d193322e0765d01889998df11d7f57522f210dc808b456530d9/nvidia_cudnn_frontend-1.28.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:335c916be758a8d5533104e04fc4a15f9c30a419b103ecd2b6fd0d23e1d532e4", size = 5677342, upload-time = "2026-09-02T06:07:31.949Z" },
-    { url = "https://files.pythonhosted.org/packages/3d/1a/51fa7f3d4fd8377d7acdf99e92d33a38be83979897360ca36b6f3521e92d/nvidia_cudnn_frontend-1.28.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:26cd299d202e832a1d562510d6844dc7c6f256cb1b4f0f29d5b2fa0b34f05e98", size = 5677523, upload-time = "2026-09-02T06:08:37.287Z" },
-    { url = "https://files.pythonhosted.org/packages/e5/31/f6e3c1983cae0da1759c7bb6a57f4b2208b042a24b7ccaad775dd14601e0/nvidia_cudnn_frontend-1.28.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:56c596054d7ff929ba95ae560bcf1f41d4f0113a9f8b693401c0d508262a4717", size = 5679104, upload-time = "2026-09-02T06:09:44.703Z" },
-    { url = "https://files.pythonhosted.org/packages/a5/29/742fd93110343da4451eb4d1a713f6291bbb4e80e7b91fae91c826cc150c/nvidia_cudnn_frontend-1.28.0-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:04b209c40cf5295ea6141be8c74c2e65449b619a0911ceb2ae27cd914124d376", size = 5680701, upload-time = "2026-09-02T06:10:55.184Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/1d/d30c756cfbb9bef18d99face13fd1af5629f56e2a477a6648d95c6c45141/nvidia_cudnn_frontend-1.32.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8b354a8e550c083eb247f1eb39a7d69a4a269075f5a01e4fcbd2531680b17239", size = 11619860, upload-time = "2026-10-27T03:12:17.613Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/c5/a7dc72ba46652b0e6e42501c7be4787c96ee08530bdfe074894db1d9461a/nvidia_cudnn_frontend-1.32.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:93a4c74fc1df77144fafd5aa9e88c4a5ac36412c363860829a0b2e864c6d577d", size = 11619915, upload-time = "2026-10-27T03:14:17.872Z" },
+    { url = "https://files.pythonhosted.org/packages/56/40/9de49a85c97317afa0cf2634d9487cedf67bdfb759d88c2ad14dd4322d8c/nvidia_cudnn_frontend-1.32.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4b206c8c3dd173dc29921f179fc599afa5dac187eb9163c54551679740534a81", size = 11620408, upload-time = "2026-10-27T03:16:14.906Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/77/3dfd81f4046289bc9b593e0d13a2e1e6fa5ece3b745e0cd85da49a7981eb/nvidia_cudnn_frontend-1.32.0-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f5e94ac16ad30395cedc6850dfef4fef2f55cfa17695b5f744003cb5ba3c626d", size = 11621458, upload-time = "2026-10-27T03:18:47.11Z" },
 ]
 
 [[package]]
@@ -5440,14 +5570,14 @@ wheels = [
 
 [[package]]
 name = "nvidia-cutlass-dsl"
-version = "4.6.0"
+version = "4.8.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "nvidia-cutlass-dsl-libs-base" },
     { name = "nvidia-cutlass-dsl-libs-cu12" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8b/1c/fbddb760a0228df87a9e9d1e60b76ecbe6e18035f5853efe0b4563651b2b/nvidia_cutlass_dsl-4.6.0-py3-none-any.whl", hash = "sha256:e3e0e4d8df20d82c8401fa013f4d82021f41daa5fca3d24b55d4a677f2308ca8", size = 10459, upload-time = "2026-07-02T03:23:18.43Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/f4/e96f452f7975dd2fd4d2a4af88c63205431dad7efbe63aff6e3a4b1ada17/nvidia_cutlass_dsl-4.8.0-py3-none-any.whl", hash = "sha256:24f996e0e5fa88c8b417f4893e615af135bdfdfdbdbed7e239faf36a88df711b", size = 10493, upload-time = "2026-09-21T03:44:08.278Z" },
 ]
 
 [package.optional-dependencies]
@@ -5457,74 +5587,70 @@ cu13 = [
 
 [[package]]
 name = "nvidia-cutlass-dsl-libs-base"
-version = "4.6.0"
+version = "4.8.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-python" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" } },
-    { name = "nvidia-cuda-nvdisasm" },
+    { name = "cuda-bindings" },
     { name = "nvidia-cutlass-dsl-libs-core" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_version < '0'" },
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ce/38/e91f66739d2f8711d1a2457e68cd86d6fbae307ce66ce270a405d4dc6dc7/nvidia_cutlass_dsl_libs_base-4.6.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:e41cd5db4de4b535c30ae9ca4412b957800a62560019ae91fa51cf3ea89bf254", size = 2824817, upload-time = "2026-07-02T03:25:53.814Z" },
-    { url = "https://files.pythonhosted.org/packages/7f/67/6c21b2d140bbd1ad94a2e22a0e2881457f9e363bdff1b35898a2d7d25aa2/nvidia_cutlass_dsl_libs_base-4.6.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:7f27357b87c5c797344cca073f1dcf00232aef427daf161adb3cd87b043e37c9", size = 2824911, upload-time = "2026-07-02T03:26:25.033Z" },
-    { url = "https://files.pythonhosted.org/packages/81/f3/72b53467741043e45a2d776485753b37bca6a3466d9964a75aaccccd82db/nvidia_cutlass_dsl_libs_base-4.6.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:777e03b7e1d85085196eaa1512cbc13b7a552ed8b5755e3893e547ca84eaacb7", size = 2824936, upload-time = "2026-07-02T03:27:07.387Z" },
-    { url = "https://files.pythonhosted.org/packages/bd/4e/69dc9f38b3c9d4ba93e1a71c8b02a29ac1e88f20c57d6b85e2d3e80778bd/nvidia_cutlass_dsl_libs_base-4.6.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:163ed08ea2bbe206e96661ff064e31ece3955e077ed8dd3fb206271333db1610", size = 2837583, upload-time = "2026-07-02T03:27:51.38Z" },
+    { url = "https://files.pythonhosted.org/packages/12/1c/2f7a13626af1edfefb5ad69234d47e3b212064a42ad2e6db59351b5ae002/nvidia_cutlass_dsl_libs_base-4.8.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:5bdc80989b0fbbac3d58960057e74e2ce8676fafa76b852d9422b9c4b9b74bdd", size = 3050530, upload-time = "2026-09-21T03:23:37.86Z" },
+    { url = "https://files.pythonhosted.org/packages/74/a0/876b645cfa98137a1db319b549cc36b416d006ac352eaba5f2b2e292cf65/nvidia_cutlass_dsl_libs_base-4.8.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:5e36773748f5a8061afe999264f1c3dccc5ff18ec9548a9c769d8e72632c8b00", size = 3050412, upload-time = "2026-09-21T03:24:53.919Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/d2/22980e2fded6fb7232b027fe1afb1a93a4b999cba293deeaf188f007e48e/nvidia_cutlass_dsl_libs_base-4.8.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:728abf1bc065fa950ad4f4506928300d7e32f3148312b93f83f3f2e8f756329a", size = 3050483, upload-time = "2026-09-21T03:26:03.194Z" },
+    { url = "https://files.pythonhosted.org/packages/e8/f2/f1d639c23bf4cb6f1ea483431e6a0ab6aa46bbd6e3b6a17a11ae87a6f713/nvidia_cutlass_dsl_libs_base-4.8.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:0c9759725b5e3967606bcaa8f28d7218729fed5f90cbb73fdac96802802f1408", size = 3063843, upload-time = "2026-09-21T03:26:58.966Z" },
 ]
 
 [[package]]
 name = "nvidia-cutlass-dsl-libs-core"
-version = "4.6.0"
+version = "4.8.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-python" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" } },
-    { name = "nvidia-cuda-nvdisasm" },
-    { name = "protobuf" },
+    { name = "cuda-bindings" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_version < '0'" },
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/84/94/e4e2404ac06a477096ccf8127bf5d391510d36cafb4be86c8c15b4873b0d/nvidia_cutlass_dsl_libs_core-4.6.0-py3-none-any.whl", hash = "sha256:f9ea6d313a03cb11fa177da32e8747ad0cac51358850810f36aa6c4736192c27", size = 767713, upload-time = "2026-07-02T03:23:39.876Z" },
+    { url = "https://files.pythonhosted.org/packages/85/66/d05f0ae372b80fc757e59d5211d93483c6ff721f574cb68cad84ceb87157/nvidia_cutlass_dsl_libs_core-4.8.0-py3-none-any.whl", hash = "sha256:b32716d2ed10c185cdbbb6b5c6fca26a3113a60e6e2fe4e2f0cb15966422b621", size = 1634056, upload-time = "2026-09-21T03:20:12.741Z" },
 ]
 
 [[package]]
 name = "nvidia-cutlass-dsl-libs-cu12"
-version = "4.6.0"
+version = "4.8.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-python" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" } },
-    { name = "nvidia-cuda-nvdisasm" },
+    { name = "cuda-bindings" },
     { name = "nvidia-cutlass-dsl-libs-base" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_version < '0'" },
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bf/64/f3f8962a9b91dd9368b90e23b2ac81614d6e9df72b55365ec0c216c3f8f9/nvidia_cutlass_dsl_libs_cu12-4.6.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:abc341ff0fce40ed0bdadf160f6afac07fb9d01768d4daebd1628c330b3e4210", size = 88436835, upload-time = "2026-07-02T03:30:13.676Z" },
-    { url = "https://files.pythonhosted.org/packages/07/c1/2521ce3d3f46731d0563bf7e5e0fa6b6ea42c31bcb6763cf4bde16d7b3ce/nvidia_cutlass_dsl_libs_cu12-4.6.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:22028842dd9c6064a3de7756b301650be77ddebf6f2acd5336bfbcd05aaf4c02", size = 88437265, upload-time = "2026-07-02T03:31:07.225Z" },
-    { url = "https://files.pythonhosted.org/packages/68/e1/aef0960124c15d7b615e6b0fbd382a6b9650cd4bfb0a1a9eaf2c112fb511/nvidia_cutlass_dsl_libs_cu12-4.6.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:18f2aa81d5eeeadcde520b07ce369dc947abf3e29d6655ace9bdedcafb57ac8b", size = 88437698, upload-time = "2026-07-02T03:31:54.343Z" },
-    { url = "https://files.pythonhosted.org/packages/17/c3/425b2d64c1da0a1a6017e98d3d2aa69145bf77cf3a095aaa45e065abb4ba/nvidia_cutlass_dsl_libs_cu12-4.6.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:e8dabef7651ce49aa9659f4500a8b43c73325ac08ca1d88d75f383ae8711664d", size = 88455596, upload-time = "2026-07-02T03:32:38.656Z" },
+    { url = "https://files.pythonhosted.org/packages/13/a0/fdde64cc231f52a716107bf1a1246db9dde8cb11b28278b8d9c05f7c87bd/nvidia_cutlass_dsl_libs_cu12-4.8.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:2374cfdff635ceaf7e2c5bd17b4beb410830420a4fd65b12b7f24b5d5cbb9d4c", size = 91698149, upload-time = "2026-09-21T03:30:50.832Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/7a/fc227e590fb9aff5d542e970011a55bb9c6a4eb3165fd64e8f4b2de631a5/nvidia_cutlass_dsl_libs_cu12-4.8.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:a06ea6a42c921ec66b190f14849e152a95a45f28819214488b9b0aa34168da33", size = 91698043, upload-time = "2026-09-21T03:32:04.819Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/a6/87c26f561a784631ef26a606549c26b72ca13d40886462ee8b89abceb072/nvidia_cutlass_dsl_libs_cu12-4.8.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:889918c32fe6cad047ae718343fedb374a9c4275903b4ab2d8f42e811a6a0dac", size = 91698171, upload-time = "2026-09-21T03:33:11.342Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/21/242fbcd98c5355589c878fd41bb3c94cb1ed62bd5e67a63f6fae93375990/nvidia_cutlass_dsl_libs_cu12-4.8.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:54125669fc51e70ce97e85554ae089cc745c4b2b8d740750b315e5777304ea6c", size = 91698894, upload-time = "2026-09-21T03:34:27.435Z" },
 ]
 
 [[package]]
 name = "nvidia-cutlass-dsl-libs-cu13"
-version = "4.6.0"
+version = "4.8.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-python" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" } },
-    { name = "nvidia-cuda-nvdisasm" },
+    { name = "cuda-bindings" },
     { name = "nvidia-cutlass-dsl-libs-base" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_version < '0'" },
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b1/0f/bd8b25e6307764a7bfefa519241d6e417f3ba1c75ce548aa76b712a4fd15/nvidia_cutlass_dsl_libs_cu13-4.6.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:4799fabc4bd1f7825ff00101ae0054c5cfb6769aefd6d9694f6da8c0f07e12c3", size = 88026053, upload-time = "2026-07-02T03:34:59.316Z" },
-    { url = "https://files.pythonhosted.org/packages/59/1d/e39c5b41e5ca59d5a0809fdfb9ac548430ed957a5e806ad85a77d132c15a/nvidia_cutlass_dsl_libs_cu13-4.6.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:c3fd95c840748879ece42b7ecc9585205e4228ebde55c04ecbce48d2987d905a", size = 88026053, upload-time = "2026-07-02T03:35:48.41Z" },
-    { url = "https://files.pythonhosted.org/packages/1e/0e/97edc0011dd226a6ac1359b45469493dcc7c1e6a7627952869f2368da013/nvidia_cutlass_dsl_libs_cu13-4.6.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:dfd781fdbed40dd0196ae2ff3747e9039d4f40a4e2e2ee26079c7660ed3ff954", size = 88026622, upload-time = "2026-07-02T03:36:56.109Z" },
-    { url = "https://files.pythonhosted.org/packages/9b/20/4647d20440aee9f7a0f0c80210bea5b197543d27d1d6a6d1fb70b8273fb1/nvidia_cutlass_dsl_libs_cu13-4.6.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:604ad20b8a741f2df582386e2c912778aefb47fd878a240714a01d4b0e7f0103", size = 88040486, upload-time = "2026-07-02T03:37:58.191Z" },
+    { url = "https://files.pythonhosted.org/packages/df/75/6c52c58fc0fdab223feb9162886736390a6f902183d24df1508ac620a69d/nvidia_cutlass_dsl_libs_cu13-4.8.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:463cd7f0c452ffeeecb530a15aeb1b10cbbd2c8da6c5aa2fecf65f836258a732", size = 91950801, upload-time = "2026-09-21T03:38:58.38Z" },
+    { url = "https://files.pythonhosted.org/packages/9e/49/333deaacb1e7cd7f897d15a575eaab45e98338ea2346ca30edcac938da7c/nvidia_cutlass_dsl_libs_cu13-4.8.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:41378cfa94ef3e74084d5157064ea807a92096123d378697a2d58bdbd582240a", size = 91952018, upload-time = "2026-09-21T03:40:11.246Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/ea/d1205eb6f6aa5b2c1437f0953873c81907f1a18d9409b38226c7819b0c15/nvidia_cutlass_dsl_libs_cu13-4.8.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:09d17524a55f40df411616a771b7537be8ee056612681abc705424eebb30ba8e", size = 91951440, upload-time = "2026-09-21T03:41:40.56Z" },
+    { url = "https://files.pythonhosted.org/packages/76/9a/8c0cf995e2949ccfcffbab7f667407011eef384b5812e56d0e3541992763/nvidia_cutlass_dsl_libs_cu13-4.8.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:4bd241512a43bb936e34a76fafe9b13f8c282f0fa6041e2cc5fcb6cab47f5097", size = 91961820, upload-time = "2026-09-21T03:42:44.376Z" },
 ]
 
 [[package]]
@@ -5834,7 +5960,8 @@ name = "opentelemetry-proto"
 version = "1.45.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/72/28/67c38cfb7e2bdfdd0cde7dcdd0424aed0291fbd64aa4ea3e7e913734711a/opentelemetry_proto-1.45.0.tar.gz", hash = "sha256:96ee414f24bc3f61ea8e17dc56b4348d4049d73db3eb17c6b3edf75b5b403300", size = 46489, upload-time = "2026-09-25T12:32:41.409Z" }
 wheels = [
@@ -5993,7 +6120,8 @@ dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "prometheus-client" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
     { name = "psutil" },
     { name = "pyyaml" },
     { name = "simplejson" },
@@ -6004,6 +6132,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c6/80/238ddc4bfb0e52f5ad9d8d893510f732ca9e9df29d58fde4347be5f4ae1b/orbax_checkpoint-0.12.6.tar.gz", hash = "sha256:cdf6a9d03f6c7758089332d2d2ae19434840932da54c9e37b6ef0b96f890a5c1", size = 759615, upload-time = "2026-09-26T00:01:01.279Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/45/a2/09c4dd13641d51a3825c15e8e5486d57322634f975831f8cf0e122793c35/orbax_checkpoint-0.12.6-py3-none-any.whl", hash = "sha256:dc512dded6472c0fe0ccde2806f4f8d3026f9bedbbcbfa1ef364f324b13712f0", size = 1386919, upload-time = "2026-09-26T00:00:59.485Z" },
+]
+
+[[package]]
+name = "oss-harmony"
+version = "0.0.11"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/43/88/ca56e5b17df4763bbb552c7be3abe432b51db3c51f6327a3848b88ad7c08/oss_harmony-0.0.11.tar.gz", hash = "sha256:ccad467b71d61490df1f2204b7a064990833338615ac135536c5b3a8e2d03a15", size = 2198780, upload-time = "2026-05-13T20:49:11.767Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/89/68/001d7429a692b2db0c03bd49b756f834716b64afc0bbbece96824e8f0af8/oss_harmony-0.0.11-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d877c6b526cdbdf55068bae8f05c60398e929c9e296c7f69a1d533339708be80", size = 3567858, upload-time = "2026-05-13T20:48:57.904Z" },
+    { url = "https://files.pythonhosted.org/packages/48/9a/ad24d20ea1e8b3167744f5d357d48a116086258ca58540986a0896781864/oss_harmony-0.0.11-cp38-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:0d1545203973abb3002dcc6c5cffd14ca4a376b655c14ce190c78eb6aaf5f6fd", size = 3807882, upload-time = "2026-05-13T20:49:09.767Z" },
 ]
 
 [[package]]
@@ -6340,7 +6481,8 @@ dependencies = [
     { name = "certifi" },
     { name = "connectrpc" },
     { name = "httpx" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
     { name = "pydantic" },
     { name = "pyqwest" },
     { name = "tenacity" },
@@ -6514,7 +6656,8 @@ name = "proto-plus"
 version = "1.29.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/46/70/783e33ffbb4466cc154a94f79b869b92a451e2bd45605054e68ff68b7af6/proto_plus-1.29.0.tar.gz", hash = "sha256:cfb4e62ad7e13dd18f346cabbda00cab39930d36a05791fd81ddb074d6ee884f", size = 58592, upload-time = "2026-09-29T19:26:15.963Z" }
 wheels = [
@@ -6525,6 +6668,20 @@ wheels = [
 name = "protobuf"
 version = "6.33.6"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'linux'",
+    "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'emscripten'",
+    "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+]
 sdist = { url = "https://files.pythonhosted.org/packages/66/70/e908e9c5e52ef7c3a6c7902c9dfbb34c7e29c25d2f81ade3856445fd5c94/protobuf-6.33.6.tar.gz", hash = "sha256:a6768d25248312c297558af96a9f9c929e8c4cee0659cb07e780731095f38135", size = 444531, upload-time = "2026-03-18T19:05:00.988Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fc/9f/2f509339e89cfa6f6a4c4ff50438db9ca488dec341f7e454adad60150b00/protobuf-6.33.6-cp310-abi3-win32.whl", hash = "sha256:7d29d9b65f8afef196f8334e80d6bc1d5d4adedb449971fefd3723824e6e77d3", size = 425739, upload-time = "2026-03-18T19:04:48.373Z" },
@@ -6534,6 +6691,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/9b/ca/25afc144934014700c52e05103c2421997482d561f3101ff352e1292fb81/protobuf-6.33.6-cp39-abi3-manylinux2014_s390x.whl", hash = "sha256:c96c37eec15086b79762ed265d59ab204dabc53056e3443e702d2681f4b39ce3", size = 339381, upload-time = "2026-03-18T19:04:54.616Z" },
     { url = "https://files.pythonhosted.org/packages/16/92/d1e32e3e0d894fe00b15ce28ad4944ab692713f2e7f0a99787405e43533a/protobuf-6.33.6-cp39-abi3-manylinux2014_x86_64.whl", hash = "sha256:e9db7e292e0ab79dd108d7f1a94fe31601ce1ee3f7b79e0692043423020b0593", size = 323436, upload-time = "2026-03-18T19:04:55.768Z" },
     { url = "https://files.pythonhosted.org/packages/c4/72/02445137af02769918a93807b2b7890047c32bfb9f90371cbc12688819eb/protobuf-6.33.6-py3-none-any.whl", hash = "sha256:77179e006c476e69bf8e8ce866640091ec42e1beb80b213c3900006ecfba6901", size = 170656, upload-time = "2026-03-18T19:04:59.826Z" },
+]
+
+[[package]]
+name = "protobuf"
+version = "7.36.1"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'",
+]
+sdist = { url = "https://files.pythonhosted.org/packages/86/73/f66c748df06e7fe24e658eddd600d19c4b40bad836c97ce2d0ad9851fb6b/protobuf-7.36.1.tar.gz", hash = "sha256:d0f6470f0ce2b84e3feaea2d4b816378b37ba4d4aa08a274305373de93e2d524", size = 512499, upload-time = "2026-08-31T22:40:04.667Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fe/51/1bdbd612fa3c51e42ea6f45d05e84dc748ddcd2663e1aa1e89a00a33facd/protobuf-7.36.1-cp310-abi3-manylinux2014_s390x.whl", hash = "sha256:39c518c05586c016d7874ff6079ee115bcec1ea5fbb1d177fbf7867ef4c67e44", size = 357229, upload-time = "2026-08-31T22:39:59.198Z" },
+    { url = "https://files.pythonhosted.org/packages/39/ca/c47f91d3cab175b01fd8c4f0d80fdf8613be876cc616e66ad281a59c5ddf/protobuf-7.36.1-py3-none-any.whl", hash = "sha256:7d951e46b3f963d6c264c367c437921de9d5aedd9c3f9612b9077736b4e3ad5c", size = 179813, upload-time = "2026-08-31T22:40:03.54Z" },
 ]
 
 [[package]]
@@ -7034,15 +7204,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pyelftools"
-version = "0.33"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/a3/11/767522582afab1b884d277de0e6e011640cb9d7292a38694b4b1a1df1ae8/pyelftools-0.33.tar.gz", hash = "sha256:660d82dcbeb8e83d1702bd97f223f761625da06111c0cc988eac6b8ab0c1b61f", size = 15068655, upload-time = "2026-05-29T12:56:22.553Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/46/2a/f9697576603dae937727827505a6126a066affb227034e77e6f9068910da/pyelftools-0.33-py3-none-any.whl", hash = "sha256:f215ad5f47d3f1373a21496a6c9e0707c622840d0622f23ff7ce08678b020036", size = 201178, upload-time = "2026-05-29T12:56:20.587Z" },
-]
-
-[[package]]
 name = "pyfiglet"
 version = "1.0.2"
 source = { registry = "https://pypi.org/simple" }
@@ -7425,7 +7586,7 @@ wheels = [
 
 [[package]]
 name = "quack-kernels"
-version = "0.6.1"
+version = "0.6.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -7434,9 +7595,9 @@ dependencies = [
     { name = "torch" },
     { name = "torch-c-dlpack-ext" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/01/17/890875f88f4d7da28faec9e6cf0a0cc565715b01474e50501fafc5bc71b4/quack_kernels-0.6.1.tar.gz", hash = "sha256:a694f89c91d137478de523c0227365a331ac9cb66790cfb08baa3dbfaafc71e7", size = 387353, upload-time = "2026-07-05T11:50:19.807Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5f/18/6c2a20d00dff254f154fb3b951f4e5a0377a60122c17385e5f08d5f5b5e1/quack_kernels-0.6.5.tar.gz", hash = "sha256:dd9405a4a6fa35fc3a5a18fe35b46a14b0bf7e3ad9fe2451903e355047ac471d", size = 846876, upload-time = "2026-09-11T05:08:20.621Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2b/65/a38a30a6ac96a757363a5be9d09cef799640bb143a64ba5a2f4d400d95d9/quack_kernels-0.6.1-py3-none-any.whl", hash = "sha256:266705ea82117e9b1c8a9e44d68a458519f2498d966c0efffd6812120c3995ad", size = 358439, upload-time = "2026-07-05T11:50:18.502Z" },
+    { url = "https://files.pythonhosted.org/packages/73/d8/f5e56c38b286308d115a171e3c5c44f24e9d03980c3cfd22588df40261fa/quack_kernels-0.6.5-py3-none-any.whl", hash = "sha256:df1ddd31366c82eb9692fe087c671209189dcbde53c909c81a865d4ee66b158d", size = 729615, upload-time = "2026-09-11T05:08:19.306Z" },
 ]
 
 [[package]]
@@ -7496,11 +7657,12 @@ version = "2.59.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
-    { name = "filelock", version = "3.20.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "filelock", version = "3.20.4", source = { registry = "https://pypi.org/simple" } },
     { name = "jsonschema" },
     { name = "msgpack" },
     { name = "packaging" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_version < '0'" },
     { name = "pyyaml" },
     { name = "requests" },
 ]
@@ -7657,8 +7819,8 @@ wheels = [
 [package.optional-dependencies]
 multimodal = [
     { name = "pillow" },
-    { name = "transformers", version = "5.5.4", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "transformers", version = "5.20.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+    { name = "transformers", version = "5.19.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and sys_platform == 'linux'" },
+    { name = "transformers", version = "5.20.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or sys_platform != 'linux'" },
 ]
 
 [[package]]
@@ -7807,10 +7969,9 @@ dependencies = [
     { name = "soundfile", marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "tfp-nightly" },
     { name = "tokamax", marker = "sys_platform == 'linux'" },
-    { name = "tokenizers", version = "0.22.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
-    { name = "tokenizers", version = "0.23.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+    { name = "tokenizers" },
     { name = "torch", marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "transformers", version = "5.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "transformers", version = "5.19.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "verifiers" },
     { name = "vllm", marker = "python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "xminigrid" },
@@ -7880,11 +8041,11 @@ requires-dist = [
     { name = "soundfile", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=0.13,<0.14" },
     { name = "tfp-nightly", specifier = ">=0.26.0.dev0,<0.27" },
     { name = "tokamax", marker = "sys_platform == 'linux'", specifier = ">=0.0.15" },
-    { name = "tokenizers", specifier = ">=0.22,<0.24" },
+    { name = "tokenizers", specifier = ">=0.23.2,<0.24" },
     { name = "torch", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==2.13.0" },
-    { name = "transformers", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=5.5.3,<5.6" },
+    { name = "transformers", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=5.16.1,<5.20" },
     { name = "verifiers", specifier = ">=0.4.0,<0.5" },
-    { name = "vllm", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.27.0" },
+    { name = "vllm", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.32.0" },
     { name = "xminigrid", specifier = "==0.9.3" },
 ]
 provides-extras = ["bfcl"]
@@ -8258,10 +8419,10 @@ dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" } },
     { name = "scikit-learn" },
     { name = "scipy" },
-    { name = "tokenizers", version = "0.22.2", source = { registry = "https://pypi.org/simple" } },
+    { name = "tokenizers" },
     { name = "torch" },
     { name = "tqdm" },
-    { name = "transformers", version = "5.5.4", source = { registry = "https://pypi.org/simple" } },
+    { name = "transformers", version = "5.19.0", source = { registry = "https://pypi.org/simple" } },
     { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c4/a1/53ae87971817e2d8370f8e79b843a881be33ab339502d71c5f82ac31f7af/sentence_transformers-6.1.0.tar.gz", hash = "sha256:299025df51550dc1a38f05be27a9b0bf881c4e5e70542b3b7757d05e00aa3868", size = 576566, upload-time = "2026-09-18T10:44:24.279Z" }
@@ -8348,7 +8509,8 @@ source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'linux'",
     "python_full_version == '3.13.*' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/76/95/faf61eb8363f26aa7e1d762267a8d602a1b26d4f3a1e758e92cb3cb8b054/setuptools-80.10.2.tar.gz", hash = "sha256:8b0e9d10c784bf7d262c4e5ec5d4ec94127ce206e8738f29a437945fbc219b70", size = 1200343, upload-time = "2026-01-25T22:38:17.252Z" }
 wheels = [
@@ -8799,7 +8961,8 @@ dependencies = [
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "packaging" },
     { name = "pillow" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
     { name = "setuptools", version = "80.10.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
     { name = "setuptools", version = "84.0.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "tensorboard-data-server" },
@@ -8827,7 +8990,8 @@ dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "packaging" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/48/a9/fc520ea91ab1f3ba51cbf3fe24f2b6364ed3b49046969e0868d46d6da372/tensorboardx-2.6.5.tar.gz", hash = "sha256:ca176db3997ee8c07d2eb77381225956a3fd1c10c91beafab1f17069adc47017", size = 4770195, upload-time = "2026-04-03T15:40:23.803Z" }
 wheels = [
@@ -8853,7 +9017,8 @@ dependencies = [
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "opt-einsum" },
     { name = "packaging" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
     { name = "requests" },
     { name = "setuptools", version = "80.10.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
     { name = "setuptools", version = "84.0.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
@@ -8882,7 +9047,8 @@ dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "promise" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
     { name = "psutil" },
     { name = "pyarrow" },
     { name = "requests" },
@@ -8905,7 +9071,8 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "absl-py" },
     { name = "googleapis-common-protos" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/85/8c/f82ce771571deed4c69d2b053038385fb7ff7cdca4762cc8f7114b95b4f3/tensorflow_metadata-1.21.0.tar.gz", hash = "sha256:2108ed8ea40df9ac4f7c506a62e9ecf5dcd40678b3308dcee2ec9e0e59d60609", size = 24577, upload-time = "2026-06-09T06:52:43.894Z" }
 wheels = [
@@ -9155,45 +9322,8 @@ wheels = [
 
 [[package]]
 name = "tokenizers"
-version = "0.22.2"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and sys_platform == 'linux'",
-]
-dependencies = [
-    { name = "huggingface-hub" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/73/6f/f80cfef4a312e1fb34baf7d85c72d4411afde10978d4657f8cdd811d3ccc/tokenizers-0.22.2.tar.gz", hash = "sha256:473b83b915e547aa366d1eee11806deaf419e17be16310ac0a14077f1e28f917", size = 372115, upload-time = "2026-01-05T10:45:15.988Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d6/84/7990e799f1309a8b87af6b948f31edaa12a3ed22d11b352eaf4f4b2e5753/tokenizers-0.22.2-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:2249487018adec45d6e3554c71d46eb39fa8ea67156c640f7513eb26f318cec7", size = 3290736, upload-time = "2026-01-05T10:40:32.165Z" },
-    { url = "https://files.pythonhosted.org/packages/78/59/09d0d9ba94dcd5f4f1368d4858d24546b4bdc0231c2354aa31d6199f0399/tokenizers-0.22.2-cp39-abi3-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:25b85325d0815e86e0bac263506dd114578953b7b53d7de09a6485e4a160a7dd", size = 3168835, upload-time = "2026-01-05T10:40:38.847Z" },
-    { url = "https://files.pythonhosted.org/packages/47/50/b3ebb4243e7160bda8d34b731e54dd8ab8b133e50775872e7a434e524c28/tokenizers-0.22.2-cp39-abi3-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:bfb88f22a209ff7b40a576d5324bf8286b519d7358663db21d6246fb17eea2d5", size = 3521673, upload-time = "2026-01-05T10:40:56.614Z" },
-    { url = "https://files.pythonhosted.org/packages/e0/fa/89f4cb9e08df770b57adb96f8cbb7e22695a4cb6c2bd5f0c4f0ebcf33b66/tokenizers-0.22.2-cp39-abi3-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:1c774b1276f71e1ef716e5486f21e76333464f47bece56bbd554485982a9e03e", size = 3724818, upload-time = "2026-01-05T10:40:44.507Z" },
-    { url = "https://files.pythonhosted.org/packages/64/04/ca2363f0bfbe3b3d36e95bf67e56a4c88c8e3362b658e616d1ac185d47f2/tokenizers-0.22.2-cp39-abi3-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:df6c4265b289083bf710dff49bc51ef252f9d5be33a45ee2bed151114a56207b", size = 3379195, upload-time = "2026-01-05T10:40:51.139Z" },
-    { url = "https://files.pythonhosted.org/packages/2e/76/932be4b50ef6ccedf9d3c6639b056a967a86258c6d9200643f01269211ca/tokenizers-0.22.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:369cc9fc8cc10cb24143873a0d95438bb8ee257bb80c71989e3ee290e8d72c67", size = 3274982, upload-time = "2026-01-05T10:40:58.331Z" },
-    { url = "https://files.pythonhosted.org/packages/1d/28/5f9f5a4cc211b69e89420980e483831bcc29dade307955cc9dc858a40f01/tokenizers-0.22.2-cp39-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:29c30b83d8dcd061078b05ae0cb94d3c710555fbb44861139f9f83dcca3dc3e4", size = 9478245, upload-time = "2026-01-05T10:41:04.053Z" },
-    { url = "https://files.pythonhosted.org/packages/6c/fb/66e2da4704d6aadebf8cb39f1d6d1957df667ab24cff2326b77cda0dcb85/tokenizers-0.22.2-cp39-abi3-musllinux_1_2_armv7l.whl", hash = "sha256:37ae80a28c1d3265bb1f22464c856bd23c02a05bb211e56d0c5301a435be6c1a", size = 9560069, upload-time = "2026-01-05T10:45:10.673Z" },
-    { url = "https://files.pythonhosted.org/packages/16/04/fed398b05caa87ce9b1a1bb5166645e38196081b225059a6edaff6440fac/tokenizers-0.22.2-cp39-abi3-musllinux_1_2_i686.whl", hash = "sha256:791135ee325f2336f498590eb2f11dc5c295232f288e75c99a36c5dbce63088a", size = 9899263, upload-time = "2026-01-05T10:45:12.559Z" },
-    { url = "https://files.pythonhosted.org/packages/05/a1/d62dfe7376beaaf1394917e0f8e93ee5f67fea8fcf4107501db35996586b/tokenizers-0.22.2-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:38337540fbbddff8e999d59970f3c6f35a82de10053206a7562f1ea02d046fa5", size = 10033429, upload-time = "2026-01-05T10:45:14.333Z" },
-]
-
-[[package]]
-name = "tokenizers"
 version = "0.23.2"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and sys_platform == 'emscripten'",
-    "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
-]
 dependencies = [
     { name = "huggingface-hub" },
 ]
@@ -9201,6 +9331,17 @@ sdist = { url = "https://files.pythonhosted.org/packages/18/1e/bc6587c5ab643b2e1
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4d/ed/8a443528baa6fac8dfe8c3b75b038c63ac92bb539bcabe311e227c718173/tokenizers-0.23.2-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:85a9a357a3764aecc904ee76bdaf8cf1ad8e5a67a1b929a487c4a39b49ed0e90", size = 3148852, upload-time = "2026-09-03T08:55:30.874Z" },
     { url = "https://files.pythonhosted.org/packages/67/49/22da045a91732384d3a3771816bf188dc5a1f702c32e635afa7c679c0bef/tokenizers-0.23.2-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:986670e43691469dcee610ea0f846f91a8f84e91fc6f7a48d4c064414c0ec2bf", size = 3101593, upload-time = "2026-09-03T08:55:28.587Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/4d/8f569ed49372a3ed8e57099bd515055fd48d7c95912c4307cda6973c2168/tokenizers-0.23.2-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:a37039b5dfc4af84eb3ef0a92f4307e28936c8f9adccba2629d36f652e9bf7a2", size = 3516830, upload-time = "2026-09-03T08:55:14.741Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/de/e2f14c8919d5bf51874051d00d6c7b7e0e8bde6c6a2dbeddda7f642896ff/tokenizers-0.23.2-cp310-abi3-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:7b7e37ba198f24150f523e1242e83c4970de4a525480586be5dcc24d9add32c5", size = 3407975, upload-time = "2026-09-03T08:55:16.842Z" },
+    { url = "https://files.pythonhosted.org/packages/c5/bd/93c69152d02ef06ce47aed8b2bf4952dcf733c935a62791873932b2934d9/tokenizers-0.23.2-cp310-abi3-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:43e4f2071e3cc8d5d86421c874aebc82659bb51a68bcdef5a0da75ee89511ccb", size = 3748165, upload-time = "2026-09-03T08:55:24.769Z" },
+    { url = "https://files.pythonhosted.org/packages/2d/b7/56b84b80bc96942bba8eb23751a9e8a1fce4faaf4390425e7083f721c98c/tokenizers-0.23.2-cp310-abi3-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:325fee2e0418a9dc6c9ecf736a5f5f0db7875183ace9549ae339da76f7a1fbb7", size = 4024165, upload-time = "2026-09-03T08:55:18.806Z" },
+    { url = "https://files.pythonhosted.org/packages/9b/8a/0175e216f005c2fe08238292663aa41e4c802b216e71047a69a0e9fc6fa3/tokenizers-0.23.2-cp310-abi3-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:950d7c9426fa72406a0ffeacdbc0bb9985f5db20eb8b263f29c79aaf83105703", size = 3591899, upload-time = "2026-09-03T08:55:22.752Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/ca/ca6b93c7820df123b2662a9469e8facc826ccc94e98fdd0d615f6431e73a/tokenizers-0.23.2-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:41c2f84d172449b4dadb9cdc508e3e364076613c35b16e76ecfe47a60d1e3305", size = 3386843, upload-time = "2026-09-03T08:55:26.584Z" },
+    { url = "https://files.pythonhosted.org/packages/e9/a4/4f9106d317b14a80aefea9f0e3a8d07ef25f856a7607eb7f5ab894281fcb/tokenizers-0.23.2-cp310-abi3-manylinux_2_31_riscv64.whl", hash = "sha256:12f0835dc2ee694746a76adf7b1567d4346a4a502ebe93fb1f5f80ea49799b78", size = 3577314, upload-time = "2026-09-03T08:55:20.825Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/6a/1552b70fb0d9ab074fd3fc961435d01364e79c9058481822c3af6e8d402c/tokenizers-0.23.2-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:eb2f9c8a24da020ea8c11a01a19c1c2547912d92121ae4a01cfbca46125dee40", size = 9967367, upload-time = "2026-09-03T08:55:33.188Z" },
+    { url = "https://files.pythonhosted.org/packages/06/01/3ccb3a956c7528b2507b8a9714155c4baf86af593039db6ea375dd0c96c3/tokenizers-0.23.2-cp310-abi3-musllinux_1_2_armv7l.whl", hash = "sha256:f486f402f6f9abee5bb032553736813af0c710a86b2e0ca592634c55cea1f835", size = 9811886, upload-time = "2026-09-03T08:55:35.642Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/73/7038e612d48bda1599457f712f6bd3854eae1a9dc9c13aa47f835349db48/tokenizers-0.23.2-cp310-abi3-musllinux_1_2_i686.whl", hash = "sha256:bef235815a067b2648caf6dcc7a71091b0b0fff9ee8057f6451eb9335fae52ef", size = 10146224, upload-time = "2026-09-03T08:55:38.391Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/d8/8e9e4e0b287a338d8f88976729628c9d22e8a54cfaf9777018a7f7cb58a0/tokenizers-0.23.2-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:5c56bda1511921587789163e524d196ed8284174ac23abd7685d5ea8da6c4718", size = 10256304, upload-time = "2026-09-03T08:55:40.977Z" },
     { url = "https://files.pythonhosted.org/packages/f3/1f/c79a01f671a49728ebb0b61f7ff9ea45663b66cab40bc0858e9859b25c16/tokenizers-0.23.2-cp310-abi3-win32.whl", hash = "sha256:debf978920d93ba9c219bd67cc4bbfaf912c9039e41e7a28b91ec15e3728c95a", size = 2592809, upload-time = "2026-09-03T08:55:48.02Z" },
     { url = "https://files.pythonhosted.org/packages/db/f7/0a69ac6b82dbccf3f71add938a161c497952749294b8dd6dfe03a819dc40/tokenizers-0.23.2-cp310-abi3-win_amd64.whl", hash = "sha256:2e96f5699d5249c9c64aa8412e044f727aae3a4098cf830f9901ec1afc361cde", size = 2863236, upload-time = "2026-09-03T08:55:46.193Z" },
     { url = "https://files.pythonhosted.org/packages/d7/b0/dee84cb44175be1b4c35bd2f770727494e78f0bb38e571a623ade94dbebb/tokenizers-0.23.2-cp310-abi3-win_arm64.whl", hash = "sha256:e49c394456dd9985787fec76132438ba3fb8911f857b1bf3d40119f9292d41aa", size = 2729352, upload-time = "2026-09-03T08:55:44.345Z" },
@@ -9208,7 +9349,7 @@ wheels = [
 
 [[package]]
 name = "tokenspeed-mla"
-version = "0.1.8"
+version = "0.2.15"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -9217,7 +9358,7 @@ dependencies = [
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/27/df/0037ade72b165ac97859040919e006aa3d80cb8cc3a79420fb6c03eb16a0/tokenspeed_mla-0.1.8-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:6a7526d7327746893f8c20d24aa63ba5b8a123d0dfd6e66388e13b768b6452c6", size = 755827, upload-time = "2026-06-24T03:36:29.96Z" },
+    { url = "https://files.pythonhosted.org/packages/14/56/495ed0feea7c332e02bbf23fa565aee3a176fe463c81ff7cc85afc01817e/tokenspeed_mla-0.2.15-py3-none-any.whl", hash = "sha256:7b4d8bfe92e1ad984e94db262671ef33ce2ecfe0a44f79c5ea1c2816d8397a1f", size = 151477, upload-time = "2026-09-28T19:49:06.103Z" },
 ]
 
 [[package]]
@@ -9307,7 +9448,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cuda-bindings" },
     { name = "cuda-toolkit", extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"] },
-    { name = "filelock", version = "3.20.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "filelock", version = "3.20.4", source = { registry = "https://pypi.org/simple" } },
     { name = "fsspec" },
     { name = "jinja2" },
     { name = "networkx", version = "3.3", source = { registry = "https://pypi.org/simple" } },
@@ -9403,12 +9544,11 @@ wheels = [
 
 [[package]]
 name = "transformers"
-version = "5.5.4"
+version = "5.19.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.14' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux'",
 ]
 dependencies = [
     { name = "huggingface-hub" },
@@ -9417,13 +9557,13 @@ dependencies = [
     { name = "pyyaml" },
     { name = "regex" },
     { name = "safetensors" },
-    { name = "tokenizers", version = "0.22.2", source = { registry = "https://pypi.org/simple" } },
+    { name = "tokenizers" },
     { name = "tqdm" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a5/1e/1e244ab2ab50a863e6b52cc55761910567fa532b69a6740f6e99c5fdbd98/transformers-5.5.4.tar.gz", hash = "sha256:2e67cadba81fc7608cc07c4dd54f524820bc3d95b1cabd0ef3db7733c4f8b82e", size = 8227649, upload-time = "2026-04-13T16:55:55.181Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/65/4c/70012ed0795235fb6bd7806fafd4a1842f03e49ebbfa3bb9580e451948ce/transformers-5.19.0.tar.gz", hash = "sha256:87f38dd25e4521151b97e94520ac457f44a0ae8a8358a5b112daff6c64a822d6", size = 10032022, upload-time = "2026-10-06T16:39:00.229Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/29/fb/162a66789c65e5afa3b051309240c26bf37fbc8fea285b4546ae747995a2/transformers-5.5.4-py3-none-any.whl", hash = "sha256:0bd6281b82966fe5a7a16f553ea517a9db1dee6284d7cb224dfd88fc0dd1c167", size = 10236696, upload-time = "2026-04-13T16:55:51.497Z" },
+    { url = "https://files.pythonhosted.org/packages/b9/59/1e7f1212c215c73690ae6cab4678efe1555ff985953e145d88cc212859b0/transformers-5.19.0-py3-none-any.whl", hash = "sha256:afcd2dd5f603ed28c1e1fcb00a338ccbb4ef5f878ed289635df8b58187afb518", size = 12599123, upload-time = "2026-10-06T16:38:56.794Z" },
 ]
 
 [[package]]
@@ -9431,9 +9571,11 @@ name = "transformers"
 version = "5.20.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'linux'",
     "python_full_version >= '3.14' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'linux'",
     "python_full_version == '3.13.*' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
@@ -9443,12 +9585,13 @@ resolution-markers = [
 ]
 dependencies = [
     { name = "huggingface-hub" },
-    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" } },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "packaging" },
     { name = "pyyaml" },
     { name = "regex" },
     { name = "safetensors" },
-    { name = "tokenizers", version = "0.23.2", source = { registry = "https://pypi.org/simple" } },
+    { name = "tokenizers" },
     { name = "tqdm" },
     { name = "typer" },
 ]
@@ -9729,7 +9872,7 @@ version = "20.35.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "distlib" },
-    { name = "filelock", version = "3.20.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "filelock", version = "3.20.4", source = { registry = "https://pypi.org/simple" } },
     { name = "platformdirs" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/20/28/e6f1a6f655d620846bd9df527390ecc26b3805a0c5989048c210e22c5ca9/virtualenv-20.35.4.tar.gz", hash = "sha256:643d3914d73d3eeb0c552cbb12d7e82adf0e504dbf86a3182f8771a153a1971c", size = 6028799, upload-time = "2025-10-29T06:57:40.511Z" }
@@ -9739,7 +9882,7 @@ wheels = [
 
 [[package]]
 name = "vllm"
-version = "0.27.0"
+version = "0.32.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -9754,10 +9897,12 @@ dependencies = [
     { name = "einops" },
     { name = "fastapi", version = "0.136.3", source = { registry = "https://pypi.org/simple" }, extra = ["standard"] },
     { name = "fastsafetensors" },
-    { name = "filelock", version = "3.20.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "filelock", version = "3.20.4", source = { registry = "https://pypi.org/simple" } },
     { name = "flashinfer-python" },
+    { name = "huggingface-hub" },
     { name = "humming-kernels", extra = ["cu13"] },
     { name = "ijson" },
+    { name = "instanttensor" },
     { name = "jsonschema" },
     { name = "lark", version = "1.2.2", source = { registry = "https://pypi.org/simple" } },
     { name = "llguidance" },
@@ -9773,18 +9918,19 @@ dependencies = [
     { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
     { name = "nvtx" },
     { name = "openai" },
-    { name = "openai-harmony" },
     { name = "opencv-python-headless" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp" },
     { name = "opentelemetry-sdk" },
     { name = "opentelemetry-semantic-conventions-ai" },
+    { name = "oss-harmony" },
     { name = "outlines-core" },
     { name = "partial-json-parser" },
     { name = "pillow" },
     { name = "prometheus-client" },
     { name = "prometheus-fastapi-instrumentator" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_version < '0'" },
     { name = "psutil" },
     { name = "py-cpuinfo" },
     { name = "pybase64" },
@@ -9804,21 +9950,21 @@ dependencies = [
     { name = "starlette" },
     { name = "tiktoken" },
     { name = "tilelang" },
-    { name = "tokenizers", version = "0.22.2", source = { registry = "https://pypi.org/simple" } },
+    { name = "tokenizers" },
     { name = "tokenspeed-mla" },
     { name = "torch" },
     { name = "torchaudio" },
     { name = "torchcodec" },
     { name = "torchvision" },
     { name = "tqdm" },
-    { name = "transformers", version = "5.5.4", source = { registry = "https://pypi.org/simple" } },
+    { name = "transformers", version = "5.19.0", source = { registry = "https://pypi.org/simple" } },
     { name = "typing-extensions" },
     { name = "watchfiles" },
     { name = "xgrammar" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a3/9e/13023995f41eb21778de44aa7b1ef5e99578a64327b9cbfb812cabfde203/vllm-0.27.0.tar.gz", hash = "sha256:862671641625d6cfb7aaab98a5386126738b59ca50e5d01ca539a4e32f63ffcb", size = 39253011, upload-time = "2026-08-10T21:31:22.603Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d5/df/5471312c76e335eaa2b8333e87ea39f0d37bfe24f10a582620e34ff12e33/vllm-0.32.0.tar.gz", hash = "sha256:d2c957d5eee3d0985012151315ddc62cbe0cd368fc96a5fc3510438d9dddf2ad", size = 44549956, upload-time = "2026-10-18T10:04:07.069Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/df/8a/2147c8227501b76829950857a839bebfe7f3f736704649c98bdec3d219f8/vllm-0.27.0-cp38-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:02d8265e71bab1cf50f93026211c9a75562a7f0a72b3a32ec5e0e8bcdd62ec75", size = 312887666, upload-time = "2026-08-10T21:31:00.232Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/0d/0b15fda9a56ac485ebb607e466f0e3386c8c115bafeced6514298bd325b5/vllm-0.32.0-cp38-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:5e2ecdc5b0baf72921c288486417ca82778456a448e4fe60b62ee43c0dfc8611", size = 326518482, upload-time = "2026-10-18T10:03:52.559Z" },
 ]
 
 [[package]]
@@ -9841,7 +9987,8 @@ dependencies = [
     { name = "opentelemetry-sdk" },
     { name = "packaging" },
     { name = "platformdirs" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x' or sys_platform != 'linux'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'" },
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "requests" },
@@ -10182,7 +10329,7 @@ dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" } },
     { name = "pydantic" },
     { name = "torch" },
-    { name = "transformers", version = "5.5.4", source = { registry = "https://pypi.org/simple" } },
+    { name = "transformers", version = "5.19.0", source = { registry = "https://pypi.org/simple" } },
     { name = "triton" },
     { name = "typing-extensions" },
 ]
@@ -10196,8 +10343,55 @@ wheels = [
 
 [[package]]
 name = "xmanager"
+version = "0.8.1"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'linux'",
+]
+dependencies = [
+    { name = "absl-py" },
+    { name = "alembic" },
+    { name = "async-generator" },
+    { name = "attrs" },
+    { name = "cloud-sql-python-connector" },
+    { name = "docker" },
+    { name = "etils", extra = ["epath"] },
+    { name = "google-api-core" },
+    { name = "google-api-python-client" },
+    { name = "google-auth" },
+    { name = "google-cloud-aiplatform", version = "2.6.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "google-cloud-storage" },
+    { name = "humanize" },
+    { name = "immutabledict" },
+    { name = "kubernetes" },
+    { name = "pyyaml" },
+    { name = "sqlalchemy" },
+    { name = "sqlparse" },
+    { name = "termcolor" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/22/2f/35fa113ffca778390e18118633aca38062ecb2326fb1f925531490eb9b01/xmanager-0.8.1.tar.gz", hash = "sha256:386f39983f53935a5d69f221529691ae6b37a63386a225ec1b335aadcdfed963", size = 245160, upload-time = "2026-09-17T14:21:19.751Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bc/7a/9a235f26ad84b079d488435e32e65d1bd978ece9de1f7d3ddcbbafcbf9c0/xmanager-0.8.1-py3-none-any.whl", hash = "sha256:fb824cf938480460393e2349f1d7701f18f8e66efac940b9732b3d6cd135d124", size = 340153, upload-time = "2026-09-17T14:21:18.375Z" },
+]
+
+[[package]]
+name = "xmanager"
 version = "0.8.2"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'linux'",
+    "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'linux'",
+    "python_full_version < '3.13' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'emscripten'",
+    "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+]
 dependencies = [
     { name = "absl-py" },
     { name = "alembic" },
@@ -10210,14 +10404,14 @@ dependencies = [
     { name = "google-api-core" },
     { name = "google-api-python-client" },
     { name = "google-auth" },
-    { name = "google-cloud-aiplatform" },
+    { name = "google-cloud-aiplatform", version = "2.4.0", source = { registry = "https://pypi.org/simple" } },
     { name = "google-cloud-storage" },
     { name = "googleapis-common-protos" },
     { name = "grpcio" },
     { name = "humanize" },
     { name = "immutabledict" },
     { name = "kubernetes" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
     { name = "psutil" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
@@ -10264,7 +10458,8 @@ dependencies = [
     { name = "gcsfs" },
     { name = "google-cloud-storage" },
     { name = "gviz-api" },
-    { name = "protobuf" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or platform_machine != 's390x'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and platform_machine == 's390x'" },
     { name = "setuptools", version = "80.10.2", source = { registry = "https://pypi.org/simple" } },
     { name = "six" },
     { name = "urllib3" },

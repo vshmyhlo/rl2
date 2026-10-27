@@ -1,4 +1,4 @@
-"""GRPO training with a JAX learner, vLLM rollouts, and Ray actors.
+"""LoRA-only GRPO training with a JAX learner, vLLM rollouts, and Ray actors.
 
 Rollout generation needs no explicit lock around weight publication: vLLM's
 pause/resume mechanism queues new requests and handles in-flight requests
@@ -9,14 +9,15 @@ its optimizer updates, and publication of the updated weights. All metrics below
 are logged every iteration except startup scalars and checkpoint timing.
 
 Startup scalars (at the restored iteration, or step 0 for a new run):
-    model/parameters_millions: Model parameter count in millions.
-    learner/setup_seconds: Model/optimizer setup, checkpoint restore, NCCL initialization, and initial publication wall time.
+    model/parameters_billions: Model parameter count in billions.
+    model/trainable_parameters_billions: LoRA parameter count in billions.
+    learner/setup_seconds: Model/optimizer setup, checkpoint restore, and initial adapter publication wall time.
 
 Optimization scalars (averaged over minibatches and update epochs):
     train/policy_loss: Clipped GRPO policy loss.
     train/approx_kl: Mean exp(log_ratio) - 1 - log_ratio, where log_ratio is learner minus sampling log-probability.
     train/clip_fraction: Fraction of sampled-token probability ratios outside the clip range.
-    train/gradient_norm: Global gradient norm after microbatch averaging, before clipping.
+    train/gradient_norm: Global LoRA gradient norm after microbatch averaging, before clipping.
     train/skipped_update_fraction: Fraction of optimizer minibatches skipped because all advantages are zero.
 Loss, KL, and clip fraction average sampled tokens within each rollout, then rollouts.
 Skipped minibatches contribute zero to loss, KL, clip fraction, and gradient norm metrics.
@@ -35,9 +36,10 @@ Rollout batch scalars:
     rollout/turns_mean: Mean model responses per rollout.
     rollout/input_tokens_mean: Mean context tokens appended per rollout, excluding sampled tokens.
     rollout/output_tokens_mean: Mean sampled tokens per rollout across all model calls.
+    rollout/total_tokens_mean: Mean full transcript tokens per learner batch row, including context and sampled tokens, excluding padding.
     batcher/token_utilization_fraction: Non-padding transcript tokens divided by batch size times padded sequence length.
-Stop-condition labels are added as observed; previously seen labels log zero when
-absent from a later batch.
+    batcher/padded_sequence_tokens: Padded sequence width chosen during batch construction, before the next-token shift.
+All StopCondition labels are logged each iteration, including zero for absent labels.
 
 Training progress and settings:
     train/iterations_total: Cumulative completed training iterations.
@@ -54,7 +56,7 @@ Timing and throughput (logged every iteration unless noted):
     batcher/prepare_batch_seconds: Wall time preparing the CPU training arrays without explicit synchronization.
     learner/batch_fetch_seconds: Wall time fetching the rollout batch, including generation, scoring, and Ray transfers.
     learner/update_seconds: Device transfer and optimizer update wall time.
-    learner/weight_transfer_seconds: Wall time publishing updated learner weights to vLLM.
+    learner/weight_transfer_seconds: Wall time exporting and reloading LoRA adapters in vLLM.
     learner/iteration_seconds: Batch fetching, optimization, and weight publication wall time.
     checkpoint/save_seconds: Checkpoint save wall time, including completion of writes; logged on saves.
     batcher/actor_transfer_seconds_mean: Mean group transfer latency from actor return to batcher receipt.
@@ -68,14 +70,16 @@ Output-token counts include every sampled token, including thinking and end-of-t
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import posixpath
 import random
+import shutil
 import subprocess
 import sys
 import time
-from collections import Counter, deque
+from collections import Counter
 from collections.abc import AsyncGenerator, Generator
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
@@ -83,6 +87,7 @@ from functools import partial
 from itertools import islice
 from pathlib import Path
 from statistics import mean, pstdev
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Annotated, Any, Literal, NamedTuple, get_args
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -95,17 +100,17 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import ray
-import torch
 import yaml
+from flax import struct
 from flax.training.train_state import TrainState
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from openai import AsyncOpenAI
 from pydantic import Field, TypeAdapter
 from pydantic.dataclasses import dataclass as config_dataclass
 from ray.actor import ActorHandle
+from safetensors.numpy import save_file
 from transformers import AutoTokenizer
-from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
-from vllm.utils.network_utils import get_open_port
+from vllm.config.lora import MaxLoRARanks
 
 from rl2.agent_loop import Agent, Rollout, StopCondition, TrainingSequence
 from rl2.agent_task import Task
@@ -117,10 +122,22 @@ from rl2.qwen3 import DEFAULT_ATTENTION_BACKEND, AttentionBackend, Parameters, Q
 from rl2.ray_timeline import record_timeline
 from rl2.tracing import flush_tracing, span, tracing_enabled
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("rl2.train_grpo_v2")
+BLOCKED_LOGGERS = ("vllm", "httpx", "httpcore")
+VLLM_LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {"console": {"format": "%(asctime)s %(levelname)s %(name)s: %(message)s"}},
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "console", "level": "INFO"},
+        "discard": {"class": "logging.NullHandler"},
+    },
+    "root": {"handlers": ["console"], "level": "INFO"},
+    "loggers": {name: {"handlers": ["discard"], "propagate": False} for name in BLOCKED_LOGGERS},
+}
 MODEL = "Qwen/Qwen3-0.6B"
 SERVER_URL = "http://127.0.0.1:8000"
-WEIGHT_BUFFER_BYTES = 64 * 1024**2
+LORA_NAME = "training-policy"
 
 
 @config_dataclass(frozen=True)
@@ -130,6 +147,7 @@ class Config(BaseConfig):
         config_file="data/alfworld/base_config.yaml"
     )
     seed: Annotated[int, Field(ge=0)] = 1
+    learner_gpus: Annotated[int, Field(ge=1)] = 1
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4
     prefetch_batches: Annotated[int, Field(ge=0)] = 1  # Batches generated ahead of the learner; 0 disables prefetch.
@@ -144,7 +162,9 @@ class Config(BaseConfig):
     rollout_timeout: Annotated[float, Field(gt=0)] = 120
     environment_timeout: Annotated[float, Field(gt=0)] = 600
     temperature: Annotated[float, Field(ge=0.01, le=2.0)] = 1.0  # vLLM clamps smaller positive values to 0.01.
-    learning_rate: Annotated[float, Field(gt=0)] = 1e-6
+    learning_rate: Annotated[float, Field(gt=0)] = 1e-5
+    lora_rank: Annotated[int, Field(ge=1)] = 16
+    lora_alpha: Annotated[float, Field(gt=0)] = 32.0
     clip_coef: Annotated[float, Field(gt=0, lt=1)] = 0.2
     max_grad_norm: Annotated[float, Field(gt=0)] = 1.0
     update_epochs: Annotated[int, Field(ge=1)] = 1
@@ -165,14 +185,41 @@ class Config(BaseConfig):
     def __post_init__(self) -> None:
         if self.num_groups * self.group_size % (self.minibatches_per_epoch * self.grad_accum_steps):
             raise ValueError("minibatches_per_epoch * grad_accum_steps must divide num_groups * group_size")
+        if self.num_groups * self.group_size % (self.minibatches_per_epoch * self.grad_accum_steps * self.learner_gpus):
+            raise ValueError("learner_gpus must divide the microbatch size")
 
 
 DEFAULT_CONFIG = Config()
 
 
+class LoRAWeights(NamedTuple):
+    a: jax.Array  # (R, I)
+    b: jax.Array  # (O, R)
+
+
+# Value aliases remain serializable when Ray loads this module as a script.
+LoRAParameters = dict[str, LoRAWeights]
+
+
+class LoRATrainState(TrainState):
+    params: LoRAParameters  # Trainable (R, I) and (O, R) leaves.
+    base_params: Parameters  # Frozen HF parameter shapes.
+    lora_scale: float = struct.field(pytree_node=False)
+
+    def merged_params(self, adapters: LoRAParameters | None = None) -> Parameters:
+        """Return HF-shaped weights shared by learner computation and publication."""
+        adapters = self.params if adapters is None else adapters
+        params = dict(self.base_params)
+        for name, adapter in adapters.items():
+            params[name] = self.base_params[name].astype(jnp.float32) + self.lora_scale * jnp.matmul(
+                adapter.b, adapter.a, precision=jax.lax.Precision.HIGHEST
+            )  # (O, I)
+        return params
+
+
 @dataclass(frozen=True)
 class TrainingProgress:
-    train_state: TrainState  # Parameter-shaped params and optimizer moments; () optimizer step.
+    train_state: LoRATrainState  # Frozen base weights, LoRA factors/moments; () optimizer step.
     shuffle_key: jax.Array  # () typed base PRNG key, folded with the optimizer step.
     iteration: int
     total_rollouts: int
@@ -200,7 +247,7 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
             ),
             metadata=ocp.args.JsonSave(
                 {
-                    "version": 1,
+                    "version": 2,
                     "algorithm": "grpo_v2",
                     "config": asdict(config),
                     "iteration": progress.iteration,
@@ -218,14 +265,17 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
 
 
 def restore_checkpoint(
-    manager: ocp.CheckpointManager, train_state: TrainState, config: Config
+    manager: ocp.CheckpointManager, train_state: LoRATrainState, config: Config
 ) -> TrainingProgress | None:
     iteration = manager.latest_step()
     if iteration is None:
         return None
     metadata = manager.restore(iteration, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
-    if metadata["version"] != 1 or metadata["algorithm"] != "grpo_v2":
-        raise ValueError("Unsupported GRPO v2 checkpoint")
+    if metadata["version"] != 2 or metadata["algorithm"] != "grpo_v2":
+        raise ValueError("Unsupported GRPO v2 checkpoint; LoRA training requires a new checkpoint directory")
+    for name in ("model", "lora_rank", "lora_alpha"):
+        if metadata["config"].get(name) != getattr(config, name):
+            raise ValueError(f"GRPO v2 checkpoint {name} does not match the current configuration")
     if metadata["iteration"] != iteration or iteration < 0 or metadata["total_rollouts"] < 0:
         raise ValueError("Invalid GRPO v2 checkpoint progress")
     restored = manager.restore(
@@ -234,7 +284,9 @@ def restore_checkpoint(
             state=ocp.args.StandardRestore(
                 {
                     "train_state": train_state,
-                    "shuffle_key": jax.random.key_data(jax.random.key(config.seed)),  # (K,)
+                    "shuffle_key": jax.device_put(
+                        jax.random.key_data(jax.random.key(config.seed)), train_state.step.sharding
+                    ),  # (K,)
                 }
             )
         ),
@@ -297,9 +349,6 @@ class GRPOBatch[Array: np.ndarray | jax.Array](NamedTuple):
     advantages: Array  # (B,) float32 normalized within each rollout group.
 
 
-# ---
-
-
 @dataclass(frozen=True)
 class RolloutBatch:
     training_batch: GRPOBatch[np.ndarray]  # Leaves: (B, T), except advantages: (B,).
@@ -336,7 +385,9 @@ def build_rollout_batch(
             "rollout/turns_mean": mean(rollout.num_turns for rollout in rollouts),
             "rollout/input_tokens_mean": mean(rollout.num_input_tokens for rollout in rollouts),
             "rollout/output_tokens_mean": mean(rollout.num_output_tokens for rollout in rollouts),
+            "rollout/total_tokens_mean": float(training_batch.attention_mask.sum(axis=1).mean()),
             "batcher/token_utilization_fraction": float(training_batch.attention_mask.mean()),
+            "batcher/padded_sequence_tokens": float(training_batch.attention_mask.shape[1]),
             "actor/rollout_seconds_mean": mean(rollout.rollout_seconds for rollout in rollouts),
         },
         stop_counts=Counter(rollout.stop_condition for rollout in rollouts),
@@ -388,27 +439,55 @@ def objective(
     }
 
 
-def create_state(model: Qwen3LM, params: Parameters, config: Config) -> TrainState:
-    """Keep FP32 master weights and Adam state; the model controls compute dtype."""
-    return TrainState.create(
+def create_state(
+    model: Qwen3LM,
+    params: Parameters,  # Frozen HF parameter shapes.
+    config: Config,
+) -> LoRATrainState:
+    """Freeze base weights and optimize FP32 LoRA factors on attention and MLP projections."""
+    adapters: LoRAParameters = {}  # (R, I) and (O, R) leaves.
+    key = jax.random.key(config.seed)  # ()
+    for name, weight in sorted(params.items()):  # HF parameter shapes.
+        if not (name.startswith("model.layers.") and name.endswith("_proj.weight")):
+            continue
+        key, adapter_key = jax.random.split(key)  # Each ().
+        output_size, input_size = weight.shape
+        adapters[name] = LoRAWeights(
+            a=jax.random.uniform(
+                adapter_key, (config.lora_rank, input_size), minval=-(input_size**-0.5), maxval=input_size**-0.5
+            ),  # (R, I)
+            b=jnp.zeros((output_size, config.lora_rank), dtype=jnp.float32),  # (O, R)
+        )
+    if not adapters:
+        raise ValueError("No attention or MLP projection weights found for LoRA")
+    return LoRATrainState.create(
         apply_fn=model.apply,
-        params=jax.tree.map(lambda value: value.astype(jnp.float32), params),  # HF parameter shapes.
+        params=adapters,
+        base_params=params,
+        lora_scale=config.lora_alpha / config.lora_rank,
         tx=optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adam(config.learning_rate)),
     ).replace(step=jnp.asarray(0, dtype=jnp.int32))  # () Match the device counter returned by update.
 
 
-@partial(jax.jit, static_argnames=("grad_accum_steps", "temperature", "clip_coef"), donate_argnums=(0,))
+@partial(
+    jax.jit,
+    static_argnames=("grad_accum_steps", "temperature", "clip_coef"),
+    in_shardings=(PartitionSpec(), PartitionSpec("batch")),
+    out_shardings=PartitionSpec(),
+    donate_argnums=(0,),
+)
 def update(
-    state: TrainState,
+    state: LoRATrainState,
     batch: GRPOBatch[jax.Array],  # One optimizer minibatch: (B, T), (B,) leaves.
-    *,
     grad_accum_steps: int,
     temperature: float,
     clip_coef: float,
-) -> tuple[TrainState, Metrics]:
-    """Consume state buffers, skipping computation and optimizer updates when all advantages are zero."""
+) -> tuple[LoRATrainState, Metrics]:
+    """Consume state buffers, skipping zero-advantage updates; requires a `batch` mesh context and positional args."""
     if grad_accum_steps < 1 or batch.token_ids.shape[0] % grad_accum_steps:
         raise ValueError("grad_accum_steps must be positive and divide the minibatch size")
+    if batch.token_ids.shape[0] % (grad_accum_steps * jax.sharding.get_abstract_mesh().shape["batch"]):
+        raise ValueError("learner device count must divide the microbatch size")
     # Python logging runs on tracing, not on cached executions.
     logger.info(
         "JIT trace update: batch_shape=%s grad_accum_steps=%s temperature=%s clip_coef=%s",
@@ -418,32 +497,38 @@ def update(
         clip_coef,
     )
 
-    def apply_update() -> tuple[TrainState, Metrics]:
+    def apply_update() -> tuple[LoRATrainState, Metrics]:
         microbatch_size = batch.token_ids.shape[0] // grad_accum_steps
         microbatches = jax.tree.map(
             lambda value: value.reshape(grad_accum_steps, microbatch_size, *value.shape[1:]), batch
         )  # (A, B/A, T); advantages: (A, B/A). A = grad_accum_steps.
+        microbatches = jax.lax.with_sharding_constraint(
+            microbatches, PartitionSpec(None, "batch")
+        )  # (A, B/A, T), (A, B/A); shard examples within each microbatch.
 
         def accumulate(
-            grads: Parameters,
+            grads: LoRAParameters,  # (R, I) and (O, R) leaves.
             microbatch: GRPOBatch[jax.Array],  # (B/A, T), (B/A,) leaves.
-        ) -> tuple[Parameters, Metrics]:
-            def loss_fn(params: Parameters) -> tuple[jax.Array, Metrics]:  # (), scalar metric leaves
-                return objective(token_log_probs(state, params, microbatch, temperature), microbatch, clip_coef)
+        ) -> tuple[LoRAParameters, Metrics]:
+            def loss_fn(params: LoRAParameters) -> tuple[jax.Array, Metrics]:  # LoRA leaves -> (), scalar metrics.
+                return objective(
+                    token_log_probs(state, state.merged_params(params), microbatch, temperature), microbatch, clip_coef
+                )
 
             (_, metrics), gradient = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-            return jax.tree.map(jnp.add, grads, gradient), metrics  # HF parameter shapes; scalar metrics.
+            return jax.tree.map(jnp.add, grads, gradient), metrics  # LoRA factor shapes; scalar metrics.
 
         gradients, metrics = jax.lax.scan(
             accumulate, jax.tree.map(jnp.zeros_like, state.params), microbatches
-        )  # HF parameter shapes; metric leaves: (A,).
-        gradients = jax.tree.map(lambda value: value / grad_accum_steps, gradients)  # HF parameter shapes.
+        )  # LoRA factor shapes; metric leaves: (A,).
+        gradients = jax.tree.map(lambda value: value / grad_accum_steps, gradients)  # LoRA factor shapes.
+        gradients = jax.lax.with_sharding_constraint(gradients, PartitionSpec())  # LoRA factor shapes.
         metrics = jax.tree.map(jnp.mean, metrics)  # Scalar leaves.
         metrics["train/gradient_norm"] = optax.global_norm(gradients)  # () Before clipping.
         metrics["train/skipped_update_fraction"] = jnp.asarray(0.0, dtype=jnp.float32)  # ()
         return state.apply_gradients(grads=gradients), metrics
 
-    def skip_update() -> tuple[TrainState, Metrics]:
+    def skip_update() -> tuple[LoRATrainState, Metrics]:
         return state, {
             "train/policy_loss": jnp.asarray(0.0, dtype=jnp.float32),  # ()
             "train/approx_kl": jnp.asarray(0.0, dtype=jnp.float32),  # () Not evaluated.
@@ -485,7 +570,7 @@ async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]
         yield Agent(
             client=client,
             tokenizer=tokenizer,
-            model=config.model,
+            model=LORA_NAME,
             context_length=TypeAdapter(int).validate_python(
                 (model.model_extra or {}).get("max_model_len"), strict=True
             ),
@@ -498,39 +583,56 @@ async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]
 
 
 @contextmanager
-def serve_vllm(model: str = MODEL) -> Generator[subprocess.Popen[bytes]]:
+def serve_vllm(model: str = MODEL, lora_rank: int = DEFAULT_CONFIG.lora_rank) -> Generator[subprocess.Popen[bytes]]:
+    max_lora_rank = next((rank for rank in get_args(MaxLoRARanks) if rank >= lora_rank), None)
+    if max_lora_rank is None:
+        raise ValueError(f"vLLM supports LoRA ranks up to {max(get_args(MaxLoRARanks))}")
     logger.info("Starting vLLM server for %s", model)
     # Inherit the GPU assigned to this actor through CUDA_VISIBLE_DEVICES.
-    with subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "vllm.entrypoints.openai.api_server",
-            "--model",
-            model,
-            "--host",
-            os.environ.get("RL2_VLLM_HOST", "127.0.0.1"),
-            "--port",
-            "8000",
-            "--dtype",
-            "bfloat16",
-            "--hf-overrides",
-            '{"head_dtype":"float32"}',
-            "--generation-config",
-            "vllm",
-            "--logprobs-mode",
-            "processed_logprobs",
-            "--weight-transfer-config",
-            '{"backend":"nccl"}',
-        ],
-        env={**os.environ, "VLLM_SERVER_DEV_MODE": "1"},
-    ) as server:
-        try:
-            yield server
-        finally:
-            logger.info("Stopping vLLM server: pid=%s", server.pid)
-            server.terminate()
-            server.wait()
+    with NamedTemporaryFile(mode="w", suffix=".json") as logging_file:
+        json.dump(VLLM_LOGGING_CONFIG, logging_file)
+        logging_file.flush()
+        with subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "rl2.vllm.server",
+                "--model",
+                model,
+                "--host",
+                os.environ.get("RL2_VLLM_HOST", "127.0.0.1"),
+                "--port",
+                "8000",
+                "--dtype",
+                "bfloat16",
+                "--hf-overrides",
+                '{"head_dtype":"float32"}',
+                "--generation-config",
+                "vllm",
+                "--logprobs-mode",
+                "processed_logprobs",
+                "--enable-lora",
+                "--max-lora-rank",
+                str(max_lora_rank),
+                "--lora-dtype",
+                "bfloat16",
+                "--disable-uvicorn-access-log",
+                "--uvicorn-log-level",
+                "warning",
+            ],
+            env={
+                **os.environ,
+                "VLLM_SERVER_DEV_MODE": "1",
+                "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
+                "VLLM_CONFIGURE_LOGGING": "1",
+                "VLLM_LOGGING_CONFIG_PATH": logging_file.name,
+            },
+        ) as server:
+            try:
+                yield server
+            finally:
+                logger.info("Stopping vLLM server: pid=%s", server.pid)
+                server.terminate()
     logger.info("vLLM server exited")
 
 
@@ -587,23 +689,24 @@ class Batcher:
         width = min((length + multiple - 1) // multiple * multiple, token_limit)
         shape = (len(rollouts), width)
         # Host copies avoid compiling JAX padding and reductions for every transcript length.
-        arrays = {
-            "token_ids": np.zeros(shape, dtype=np.int32),  # (B, T)
-            "attention_mask": np.zeros(shape, dtype=np.bool_),  # (B, T)
-            "loss_mask": np.zeros(shape, dtype=np.bool_),  # (B, T)
-            "old_log_probs": np.zeros(shape, dtype=np.float32),  # (B, T)
-            "advantages": np.asarray([rollout.advantage for rollout in rollouts], dtype=np.float32),  # (B,)
-        }
+        batch = GRPOBatch(
+            token_ids=np.zeros(shape, dtype=np.int32),  # (B, T)
+            attention_mask=np.zeros(shape, dtype=np.bool_),  # (B, T)
+            loss_mask=np.zeros(shape, dtype=np.bool_),  # (B, T)
+            old_log_probs=np.zeros(shape, dtype=np.float32),  # (B, T)
+            advantages=np.asarray([rollout.advantage for rollout in rollouts], dtype=np.float32),  # (B,)
+        )
         for index, rollout in enumerate(rollouts):
             sequence: TrainingSequence = rollout.sequence
             length = len(sequence.token_ids)
             mask = sequence.loss_mask  # (L,) unpadded transcript length.
             if length < 2 or mask[0] or not mask[1:].any():
                 raise ValueError("Each rollout needs context followed by at least one sampled token")
-            for name in ("token_ids", "loss_mask", "old_log_probs"):
-                arrays[name][index, :length] = getattr(sequence, name)  # (L,)
-            arrays["attention_mask"][index, :length] = True
-        return GRPOBatch(**arrays)  # (B, T), (B,) leaves.
+            batch.token_ids[index, :length] = sequence.token_ids  # (L,)
+            batch.loss_mask[index, :length] = sequence.loss_mask  # (L,)
+            batch.old_log_probs[index, :length] = sequence.old_log_probs  # (L,)
+            batch.attention_mask[index, :length] = True  # (L,)
+        return batch  # (B, T), (B,) leaves.
 
     async def fetch_next_batch(
         self, num_groups: int, group_size: int, context_length: int, *, include_examples: bool = False
@@ -615,8 +718,7 @@ class Batcher:
         async def fetch_group() -> tuple[RolloutGroup, float]:
             while True:
                 result = await self.actor.fetch_next_group.remote(group_size=group_size)
-                received_at = time.monotonic()
-                seconds = received_at - result.ready_at
+                seconds = time.monotonic() - result.ready_at
                 if not self.config.drop_degenerate_groups or not result.value.is_degenerate:
                     return result.value, seconds
 
@@ -649,19 +751,17 @@ class Learner:
         self.batcher = batcher
         self.actor = actor
         self.shuffle_key = jax.random.key(config.seed)  # () typed base PRNG key.
-        self._pending_batches: deque[ray.ObjectRef] = deque()
+        self._pending_batches: list[ray.ObjectRef] = []
 
-    def initialize_weight_transfer(self, resources: ExitStack) -> None:
-        init_info = {"master_address": "127.0.0.1", "master_port": get_open_port(), "rank_offset": 1, "world_size": 2}
-        logger.info("Initializing learner/vLLM NCCL weight transfer")
-        pending = self.actor.initialize_weight_transfer.remote(init_info)
-        self._transfer_group = NCCLWeightTransferEngine.trainer_init(init_info)
-        resources.callback(self._transfer_group.destroy)
-        ray.get(pending)
-        logger.info("NCCL weight transfer ready")
+    def initialize_publication(self, resources: ExitStack) -> None:
+        # Learner and vLLM share the local filesystem in this single-node trainer.
+        self._adapter_directory = Path(resources.enter_context(TemporaryDirectory(prefix="rl2-lora-")))
+        self._published_adapter: Path | None = None
 
     def start(self) -> None:
+        self.mesh = Mesh(devices=jax.devices("gpu"), axis_names=("batch",))
         with (
+            jax.set_mesh(self.mesh),
             MLflowLogger(experiment="grpo_v2", run_name=self.config.run_id) as writer,
             ExitStack() as resources,
         ):
@@ -669,22 +769,18 @@ class Learner:
             writer.log_params(asdict(self.config))
             logger.info("Run ID: %s; MLflow run: %s", self.config.run_id, writer.run_id)
             start = time.monotonic()
-            logger.info("Loading learner model %s on its assigned GPU", self.config.model)
-            device = jax.devices("gpu")[0]
-            self.mesh = Mesh(devices=[device], axis_names=("batch",))
-            with jax.default_device(device):
-                self.model, variables = load_qwen3_checkpoint(
-                    self.config.model,
-                    dtype="bfloat16",
-                    attention_backend=self.config.attention_backend,
-                    scan_layers=self.config.scan_layers,
-                    gradient_checkpointing=self.config.gradient_checkpointing,
-                )
-                self.state = create_state(
-                    self.model,
-                    jax.device_put(variables["params"], NamedSharding(self.mesh, PartitionSpec())),
-                    self.config,
-                )
+            logger.info("Loading learner model %s on %s assigned GPUs", self.config.model, self.config.learner_gpus)
+            self.model, variables = load_qwen3_checkpoint(
+                self.config.model,
+                dtype="bfloat16",
+                attention_backend=self.config.attention_backend,
+                scan_layers=self.config.scan_layers,
+                gradient_checkpointing=self.config.gradient_checkpointing,
+            )
+            self.state = jax.device_put(
+                create_state(self.model, variables["params"], self.config),
+                NamedSharding(self.mesh, PartitionSpec()),
+            )
             del variables
             progress = restore_checkpoint(manager, self.state, self.config)
             iteration = 0
@@ -697,13 +793,20 @@ class Learner:
                 ray.get(self.actor.set_sampling_state.remote(progress.sampling_state))
                 logger.info("Resumed run %s at iteration %s", self.config.run_id, iteration)
             writer.log_text(yaml.safe_dump(asdict(self.config)), f"config/{iteration}.yaml")
-            logger.info("Learner loaded %s parameter tensors", len(self.state.params))
-            self.initialize_weight_transfer(resources=resources)
+            logger.info(
+                "Learner loaded %s base tensors and %s LoRA adapters",
+                len(self.state.base_params),
+                len(self.state.params),
+            )
+            self.initialize_publication(resources=resources)
             resources.callback(self.cancel_pending_batches)
             self.publish_weights()
             writer.log_metrics(
                 {
-                    "model/parameters_millions": sum(p.size for p in jax.tree.leaves(self.state.params)) / 1_000_000,
+                    "model/parameters_billions": sum(p.size for p in jax.tree.leaves(self.state.base_params))
+                    / 1_000_000_000,
+                    "model/trainable_parameters_billions": sum(p.size for p in jax.tree.leaves(self.state.params))
+                    / 1_000_000_000,
                     "learner/setup_seconds": time.monotonic() - start,
                 },
                 step=iteration,
@@ -722,11 +825,7 @@ class Learner:
                 ):
                     started = time.monotonic()
                     with span("learner.fetch_batch"):
-                        batch = self.fetch_next_batch(
-                            num_groups=self.config.num_groups,
-                            group_size=self.config.group_size,
-                            iteration=iteration,
-                        )
+                        batch = self.fetch_next_batch(iteration=iteration)
                     fetched = time.monotonic()
                     with span("learner.optimize"):
                         update_metrics = self.optimize(batch.training_batch)
@@ -792,25 +891,25 @@ class Learner:
 
     def cancel_pending_batches(self) -> None:
         while self._pending_batches:
-            ray.cancel(self._pending_batches.popleft(), recursive=True)
+            ray.cancel(self._pending_batches.pop(0), recursive=True)
 
-    def fetch_next_batch(self, num_groups: int, group_size: int, *, iteration: int) -> RolloutBatch:
+    def fetch_next_batch(self, *, iteration: int) -> RolloutBatch:
         prefetch_batches = min(self.config.prefetch_batches, (-iteration) % self.config.checkpoint_interval)
         if self.config.total_iterations is not None:
             prefetch_batches = min(prefetch_batches, self.config.total_iterations - iteration)
         while len(self._pending_batches) < prefetch_batches + 1:
             self._pending_batches.append(
                 self.batcher.fetch_next_batch.remote(
-                    num_groups=num_groups,
-                    group_size=group_size,
+                    num_groups=self.config.num_groups,
+                    group_size=self.config.group_size,
                     context_length=self.model.config.max_position_embeddings,
                     include_examples=(iteration + len(self._pending_batches)) % self.config.example_log_interval == 0,
                 )
             )
-        result = ray.get(self._pending_batches[0])
-        self._pending_batches.popleft()
-        received_at = time.monotonic()
-        seconds = received_at - result.ready_at
+        ready, pending = ray.wait(self._pending_batches, num_returns=1)
+        result = ray.get(ready[0])
+        self._pending_batches = pending
+        seconds = time.monotonic() - result.ready_at
         batch = result.value
         return replace(
             batch,
@@ -818,35 +917,47 @@ class Learner:
         )
 
     def publish_weights(self) -> None:
-        params = jax.tree.map(lambda value: value.astype(jnp.bfloat16), self.state.params)  # HF parameter shapes.
-        # vLLM packs weights on separate CUDA streams without waiting on the DLPack consumer stream.
-        jax.block_until_ready(params)
-        weights = jax.tree.map(torch.from_dlpack, params)  # GPU views; HF parameter shapes.
-        buffer_bytes = max(WEIGHT_BUFFER_BYTES, max(weight.nbytes for weight in weights.values()))
-        update_info = {
-            "names": list(weights),
-            "dtype_names": [str(weight.dtype).removeprefix("torch.") for weight in weights.values()],
-            "shapes": [list(weight.shape) for weight in weights.values()],
-            "packed": True,
-            "packed_buffer_size_bytes": buffer_bytes,
-        }
-        pending = self.actor.update_weights.remote(update_info)
-        NCCLWeightTransferEngine.trainer_send_weights(
-            iterator=iter(weights.items()),
-            trainer_args=NCCLTrainerSendWeightsArgs(
-                group=self._transfer_group, packed=True, packed_buffer_size_bytes=buffer_bytes
-            ),
+        directory = self._adapter_directory / uuid4().hex
+        directory.mkdir()
+        adapters = jax.tree.map(
+            lambda value: np.asarray(value.addressable_shards[0].data, dtype=np.float32), self.state.params
+        )  # Host (R, I) and (O, R) leaves, copied from one replica.
+        weights = {
+            f"base_model.model.{name.removesuffix('.weight')}.lora_{factor}.weight": value
+            for name, adapter in adapters.items()
+            for factor, value in (("A", adapter.a), ("B", adapter.b))
+        }  # PEFT (R, I) and (O, R) leaves.
+        save_file(weights, directory / "adapter_model.safetensors")
+        (directory / "adapter_config.json").write_text(
+            json.dumps(
+                {
+                    "peft_type": "LORA",
+                    "task_type": "CAUSAL_LM",
+                    "base_model_name_or_path": self.config.model,
+                    "r": self.config.lora_rank,
+                    "lora_alpha": self.config.lora_alpha,
+                    "target_modules": sorted({name.split(".")[-2] for name in adapters}),
+                    "bias": "none",
+                    "lora_dropout": 0.0,
+                    "inference_mode": True,
+                    "use_rslora": False,
+                }
+            )
         )
-        torch.cuda.synchronize()
-        ray.get(pending)
+        ray.get(self.actor.update_weights.remote(str(directory)))
+        previous = self._published_adapter
+        self._published_adapter = directory
+        if previous is not None:
+            shutil.rmtree(previous)
 
     def optimize(self, batch: GRPOBatch[np.ndarray]) -> dict[str, float]:  # Batch leaves: (B, T), (B,).
-        device_batch: GRPOBatch[jax.Array] = jax.device_put(
-            batch, NamedSharding(self.mesh, PartitionSpec("batch"))
-        )  # (B, T), (B,) leaves.
         if batch.token_ids.shape[0] % self.config.minibatches_per_epoch:
             raise ValueError("minibatches_per_epoch must divide the rollout batch size")
         minibatch_size = batch.token_ids.shape[0] // self.config.minibatches_per_epoch
+        if minibatch_size % (self.config.grad_accum_steps * self.mesh.size):
+            raise ValueError("grad_accum_steps * learner device count must divide the minibatch size")
+        batched = NamedSharding(self.mesh, PartitionSpec("batch"))
+        device_batch: GRPOBatch[jax.Array] = jax.device_put(batch, batched)  # (B, T), (B,) leaves.
         history: list[Metrics] = []
         for _ in range(self.config.update_epochs):
             key = jax.random.fold_in(self.shuffle_key, self.state.step)  # () typed PRNG key.
@@ -858,12 +969,13 @@ class Learner:
                 minibatch = jax.tree.map(
                     lambda value, start=start: value[start : start + minibatch_size], shuffled
                 )  # (B/N, T), (B/N,) leaves; N = minibatches_per_epoch.
+                minibatch = jax.device_put(minibatch, batched)  # (B/N, T), (B/N,) leaves.
                 self.state, metrics = update(
                     self.state,
                     minibatch,
-                    grad_accum_steps=self.config.grad_accum_steps,
-                    temperature=self.config.temperature,
-                    clip_coef=self.config.clip_coef,
+                    self.config.grad_accum_steps,
+                    self.config.temperature,
+                    self.config.clip_coef,
                 )
                 history.append(metrics)
         metrics = jax.tree.map(lambda *values: jnp.stack(values).mean(), *history)  # Scalar leaves.
@@ -889,7 +1001,7 @@ class Actor:
         )
         logger.info("Starting actor and vLLM on its assigned GPU")
         with self._server as resources:
-            server = resources.enter_context(serve_vllm(model=config.model))
+            server = resources.enter_context(serve_vllm(model=config.model, lora_rank=config.lora_rank))
             wait_for_server(server)
             self._server = resources.pop_all()
         logger.info("Actor ready for rollout requests: tasks=%s", len(self.tasks))
@@ -925,13 +1037,7 @@ class Actor:
         group = await self.collect_group(task, group_size=group_size)
         return Transfer(value=group, ready_at=time.monotonic())
 
-    async def initialize_weight_transfer(self, init_info: dict[str, Any]) -> None:
-        with span("actor.initialize_weight_transfer"):
-            async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:
-                response = await client.post("/init_weight_transfer_engine", json={"init_info": init_info})
-                response.raise_for_status()
-
-    async def update_weights(self, update_info: dict[str, Any]) -> None:
+    async def update_weights(self, adapter_path: str) -> None:
         with span("actor.update_weights"):
             async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:
                 with span("actor.update_weights.pause", {"mode": self.config.weight_update_pause_mode}):
@@ -939,14 +1045,11 @@ class Actor:
                         "/pause", params={"mode": self.config.weight_update_pause_mode, "clear_cache": "true"}
                     )
                     response.raise_for_status()
-                with span("actor.update_weights.start"):
-                    response = await client.post("/start_weight_update")
-                    response.raise_for_status()
-                with span("actor.update_weights.transfer", {"tensor_count": len(update_info["names"])}):
-                    response = await client.post("/update_weights", json={"update_info": update_info})
-                    response.raise_for_status()
-                with span("actor.update_weights.finish"):
-                    response = await client.post("/finish_weight_update")
+                with span("actor.update_weights.load_adapter"):
+                    response = await client.post(
+                        "/v1/load_lora_adapter",
+                        json={"lora_name": LORA_NAME, "lora_path": adapter_path, "load_inplace": True},
+                    )
                     response.raise_for_status()
                 with span("actor.update_weights.resume"):
                     response = await client.post("/resume")
@@ -991,6 +1094,14 @@ class Actor:
 
 
 def train(config: Config) -> None:
+    # A local hook serializes by value without importing the trainer in environment workers.
+    def setup_logging() -> None:
+        for name in BLOCKED_LOGGERS:
+            blocked_logger = logging.getLogger(name)
+            blocked_logger.handlers = [logging.NullHandler()]
+            blocked_logger.propagate = False
+
+    setup_logging()
     os.environ["RAY_AUTH_MODE"] = "disabled"
     os.environ["RAY_DASHBOARD_ENABLE_PROFILING"] = "1" if config.enable_ray_dashboard else "0"
     timeline_path = os.environ.get(
@@ -1005,7 +1116,14 @@ def train(config: Config) -> None:
             dashboard_host=os.environ.get("RL2_RAY_DASHBOARD_HOST", "127.0.0.1"),
             dashboard_port=8265,
             logging_config=ray.LoggingConfig(log_level="INFO"),
-            runtime_env={"env_vars": {"RAY_PROFILING": "1"} if config.enable_ray_timeline else {}},
+            runtime_env={
+                "env_vars": {
+                    # Keep later vLLM imports from replacing the blacklist in workers.
+                    "VLLM_CONFIGURE_LOGGING": "0",
+                    **({"RAY_PROFILING": "1"} if config.enable_ray_timeline else {}),
+                },
+                "worker_process_setup_hook": setup_logging,
+            },
             # Zero disables event reporting in Ray 2.59 despite the timeline docstring.
             _system_config={
                 "enable_timeline": config.enable_ray_timeline,
@@ -1020,7 +1138,7 @@ def train(config: Config) -> None:
         logger.info("Creating batcher, learner, and actor")
         actor = Actor.remote(config=config)
         batcher = Batcher.remote(actor=actor, config=config)
-        learner = Learner.remote(batcher=batcher, actor=actor, config=config)
+        learner = Learner.options(num_gpus=config.learner_gpus).remote(batcher=batcher, actor=actor, config=config)
         try:
             logger.info("Starting learner")
             ray.get(learner.start.remote())

@@ -86,10 +86,10 @@ launchers cannot share a run directory.
 
 - **Evaluator:** `bfcl-eval==2025.12.17`, the version specified by the
   [official leaderboard](https://gorilla.cs.berkeley.edu/leaderboard.html).
-  Serving uses **vLLM 0.27.0** and **Transformers 5.5.4** for compatibility
-  with the project's Hugging Face Hub and Triton dependencies. The root
-  `uv.lock` pins all versions. BFCL's NumPy 1.26 constraint is overridden
-  to use the project's NumPy 2. This preserves benchmark logic but is not
+  Serving uses **vLLM 0.32.0** and **Transformers 5.19.0** with Torch 2.13.0.
+  The root `uv.lock` pins all versions. BFCL's NumPy 1.26 constraint is overridden
+  to use the project's NumPy 2, and its filelock pin permits 3.20 patch releases
+  required by vLLM. This preserves benchmark logic but is not
   an exact reproduction of the leaderboard's serving environment.
 - **Model:** `Qwen/Qwen3-0.6B` at
   `c1899de289a04d12100db370d81485cdf75e47ca`, BF16, no quantization,

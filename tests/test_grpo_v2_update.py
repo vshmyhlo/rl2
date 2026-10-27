@@ -1,7 +1,10 @@
 import logging
 import pickle
+from collections.abc import Generator
+from contextlib import ExitStack
 from dataclasses import replace
 from functools import partial
+from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
@@ -10,11 +13,17 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from flax.training.train_state import TrainState
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from safetensors.numpy import load_file
 
 from rl2 import train_grpo_v2 as training
 from rl2.qwen3 import Parameters, Qwen3Config, Qwen3LM, Qwen3Output, Variables
+
+
+@pytest.fixture
+def mesh_context() -> Generator[None]:
+    with jax.set_mesh(Mesh(devices=jax.devices()[:1], axis_names=("batch",))):
+        yield
 
 
 def rollout(tokens: list[int], mask: list[bool], advantage: float) -> training.Rollout:
@@ -66,6 +75,8 @@ def test_prepare_batch(batcher: Any, groups: list[training.RolloutGroup], contex
     batch = batcher.prepare_batch(groups, context_length=context_length)  # (B=2, T=width), (B,) leaves.
     result = training.build_rollout_batch(groups=groups, training_batch=batch, transfer_metrics={})
     assert result.rollout_metrics["batcher/token_utilization_fraction"] == pytest.approx(8 / (2 * width))
+    assert result.rollout_metrics["rollout/total_tokens_mean"] == 4.0
+    assert result.rollout_metrics["batcher/padded_sequence_tokens"] == width
     assert batch.token_ids.shape == batch.attention_mask.shape == batch.loss_mask.shape == (2, width)
     assert batch.old_log_probs.shape == (2, width)
     assert batch.advantages.shape == (2,)
@@ -108,6 +119,7 @@ def test_prepare_batch_bucket_boundaries(
     batch = batcher.prepare_batch(groups, context_length=context_length)  # (B=1, T=width), (B,) leaves.
     result = training.build_rollout_batch(groups=groups, training_batch=batch, transfer_metrics={})
     assert result.rollout_metrics["batcher/token_utilization_fraction"] == pytest.approx(length / width)
+    assert result.rollout_metrics["batcher/padded_sequence_tokens"] == width
     assert all(array.shape == (1, width) for array in batch[:-1])
     assert batch.advantages.shape == (1,)
     assert int(batch.attention_mask.sum()) == length
@@ -123,6 +135,7 @@ def test_prepare_minimal_sequences_and_multiple_groups(batcher: Any) -> None:
     batch = batcher.prepare_batch(groups, context_length=8)  # (B=2, T=8), (B,) leaves.
     result = training.build_rollout_batch(groups=groups, training_batch=batch, transfer_metrics={})
     assert result.rollout_metrics["batcher/token_utilization_fraction"] == 5 / 16
+    assert result.rollout_metrics["rollout/total_tokens_mean"] == 2.5
     assert batch.token_ids.shape == (2, 8)
     np.testing.assert_array_equal(batch.token_ids[:, :3], [[0, 2, 0], [3, 4, 5]])
     np.testing.assert_array_equal(batch.attention_mask[:, :3], [[True, True, False], [True, True, True]])
@@ -197,32 +210,38 @@ def model() -> Qwen3LM:
 
 
 @pytest.fixture(scope="module")
-def state(model: Qwen3LM) -> TrainState:
+def state(model: Qwen3LM) -> training.LoRATrainState:
     params = model.init(jax.random.key(0), jnp.ones((1, 7), dtype=jnp.int32))["params"]  # HF parameter shapes.
     params = jax.tree.map(lambda value: value.astype(jnp.bfloat16), params)  # Emulate checkpoint storage.
-    return training.create_state(model, params, training.Config(learning_rate=0.01, max_grad_norm=0.1))
+    return training.create_state(
+        model, params, training.Config(learning_rate=0.01, max_grad_norm=0.1, lora_rank=2, lora_alpha=4)
+    )
 
 
 @pytest.fixture
-def batch(batcher: Any, groups: list[training.RolloutGroup], state: TrainState) -> training.GRPOBatch[jax.Array]:
+def batch(
+    batcher: Any, groups: list[training.RolloutGroup], state: training.LoRATrainState
+) -> training.GRPOBatch[jax.Array]:
     batch = jax.device_put(batcher.prepare_batch(groups, context_length=8))  # (B, T), (B,) leaves.
-    old = training.token_log_probs(state, state.params, batch, temperature=0.7)  # (B=2, T-1=7)
+    old = training.token_log_probs(state, state.merged_params(), batch, temperature=0.7)  # (B=2, T-1=7)
     return batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))
 
 
-def test_token_log_probs_shift_temperature_and_padding(state: TrainState, batch: training.GRPOBatch) -> None:
-    log_probs = training.token_log_probs(state, state.params, batch, temperature=0.7)  # (B, T-1)
+def test_token_log_probs_shift_temperature_and_padding(
+    state: training.LoRATrainState, batch: training.GRPOBatch
+) -> None:
+    log_probs = training.token_log_probs(state, state.merged_params(), batch, temperature=0.7)  # (B, T-1)
     assert log_probs.shape == (2, 7)
-    logits = state.apply_fn({"params": state.params}, batch.token_ids).logits  # (B, T, V)
+    logits = state.apply_fn({"params": state.merged_params()}, batch.token_ids).logits  # (B, T, V)
     expected = jax.nn.log_softmax(logits / 0.7)  # (B, T, V)
     np.testing.assert_allclose(log_probs[0, [0, 2, 3]], expected[0, [0, 2, 3], [2, 4, 5]], atol=1e-6)
     np.testing.assert_allclose(log_probs[1, 1], expected[1, 1, 6], atol=1e-6)
     padded = batch._replace(token_ids=jnp.where(batch.attention_mask, batch.token_ids, 7))
-    changed = training.token_log_probs(state, state.params, padded, temperature=0.7)  # (B, T-1)
+    changed = training.token_log_probs(state, state.merged_params(), padded, temperature=0.7)  # (B, T-1)
     np.testing.assert_allclose(changed[batch.loss_mask[:, 1:]], log_probs[batch.loss_mask[:, 1:]], atol=1e-6)
 
 
-def test_token_log_probs_gradients_match_gather(state: TrainState, batch: training.GRPOBatch) -> None:
+def test_token_log_probs_gradients_match_gather(state: training.LoRATrainState, batch: training.GRPOBatch) -> None:
     def apply_fn(
         variables: Variables,
         tokens: jax.Array,  # (B, T-1)
@@ -252,40 +271,110 @@ def test_token_log_probs_gradients_match_gather(state: TrainState, batch: traini
     np.testing.assert_array_equal(actual[1]["logits"][~batch.loss_mask[:, 1:]], 0)
 
 
+def test_lora_initialization_and_optimizer_shapes(state: training.LoRATrainState) -> None:
+    assert set(state.params) == {
+        f"model.layers.0.{projection}.weight"
+        for projection in (
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        )
+    }
+    merged = state.merged_params()  # HF parameter shapes.
+    for name, weight in state.base_params.items():  # HF parameter shapes.
+        np.testing.assert_array_equal(merged[name], weight)
+        assert weight.dtype == jnp.bfloat16
+    adam = state.opt_state[1][0]
+    for tree in (state.params, adam.mu, adam.nu):  # LoRA factor shapes.
+        assert set(tree) == set(state.params)
+        for name, adapter in tree.items():
+            output_size, input_size = state.base_params[name].shape
+            assert adapter.a.shape == (2, input_size)
+            assert adapter.b.shape == (output_size, 2)
+            assert adapter.a.dtype == adapter.b.dtype == jnp.float32
+            np.testing.assert_array_equal(adapter.b, 0)
+    assert sum(value.size for value in jax.tree.leaves(state.params)) < sum(
+        value.size for value in jax.tree.leaves(state.base_params)
+    )
+
+
+def test_lora_rank_one_merge_and_seed() -> None:
+    name = "model.layers.0.self_attn.q_proj.weight"
+    params = {name: jnp.ones((2, 3), dtype=jnp.bfloat16)}  # (O=2, I=3)
+    config = training.Config(lora_rank=1, lora_alpha=3)
+    state = training.create_state(Mock(), params, config)
+    repeated = training.create_state(Mock(), params, config)
+    np.testing.assert_array_equal(state.params[name].a, repeated.params[name].a)
+    changed_seed = training.create_state(Mock(), params, replace(config, seed=2))
+    assert not np.array_equal(state.params[name].a, changed_seed.params[name].a)
+    adapters = {
+        name: training.LoRAWeights(a=jnp.array([[1.0, 2.0, 3.0]]), b=jnp.array([[2.0], [4.0]])),
+    }  # (R=1, I=3), (O=2, R=1)
+    merged = jax.jit(state.merged_params)(adapters)  # (O, I) leaves.
+    assert merged[name].shape == (2, 3)
+    np.testing.assert_array_equal(merged[name], [[7.0, 13.0, 19.0], [13.0, 25.0, 37.0]])
+    np.testing.assert_array_equal(state.base_params[name], 1)
+
+
+@pytest.mark.parametrize("setting", [{"lora_rank": 0}, {"lora_alpha": 0}])
+def test_lora_config_rejects_nonpositive_settings(setting: dict[str, int]) -> None:
+    with pytest.raises(ValueError, match="lora_"):
+        training.Config(**setting)
+
+
+def test_lora_requires_projection_weights() -> None:
+    with pytest.raises(ValueError, match="No attention or MLP projection"):
+        training.create_state(Mock(), {"model.norm.weight": jnp.ones(3)}, training.Config())  # (D=3,)
+
+
 @pytest.mark.parametrize("mixed", [False, True], ids=["nonzero", "zero-first-microbatch"])
+@pytest.mark.usefixtures("mesh_context")
 def test_accumulated_update_matches_full_batch_and_improves_policy(
-    state: TrainState, batch: training.GRPOBatch[jax.Array], mixed: bool
+    state: training.LoRATrainState, batch: training.GRPOBatch[jax.Array], mixed: bool
 ) -> None:
     if mixed:
         batch = batch._replace(advantages=batch.advantages.at[0].set(0))  # (B, T), (B,) leaves.
-    accumulated, metrics = training.update(
-        jax.tree.map(jnp.copy, state), batch, grad_accum_steps=2, temperature=0.7, clip_coef=0.2
-    )
-    full, full_metrics = training.update(
-        jax.tree.map(jnp.copy, state), batch, grad_accum_steps=1, temperature=0.7, clip_coef=0.2
-    )
+    accumulated, metrics = training.update(jax.tree.map(jnp.copy, state), batch, 2, 0.7, 0.2)
+    full, full_metrics = training.update(jax.tree.map(jnp.copy, state), batch, 1, 0.7, 0.2)
     assert int(accumulated.step) == int(full.step) == 1
     for actual, expected in zip(jax.tree.leaves(accumulated), jax.tree.leaves(full), strict=True):
         assert actual.shape == expected.shape
         np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-5)
-    assert all(value.dtype == jnp.float32 for value in accumulated.params.values())
+    assert all(value.dtype == jnp.float32 for value in jax.tree.leaves(accumulated.params))
     assert all(value.shape == () for value in metrics.values())
     assert float(metrics["train/gradient_norm"]) > 0.1  # Exercise gradient clipping.
     assert float(metrics["train/skipped_update_fraction"]) == 0.0
     for name in metrics:
         np.testing.assert_allclose(metrics[name], full_metrics[name], atol=1e-6)
-    after = training.token_log_probs(accumulated, accumulated.params, batch, temperature=0.7)  # (B, T-1)
+    after = training.token_log_probs(accumulated, accumulated.merged_params(), batch, temperature=0.7)  # (B, T-1)
     loss, _ = training.objective(after, batch, clip_coef=0.2)
     assert float(loss) < float(metrics["train/policy_loss"])
-    assert any(not np.array_equal(state.params[name], value) for name, value in accumulated.params.items())
+    assert any(
+        not np.array_equal(before, after)
+        for before, after in zip(jax.tree.leaves(state.params), jax.tree.leaves(accumulated.params), strict=True)
+    )
+    for name, value in accumulated.base_params.items():  # HF parameter shapes.
+        np.testing.assert_array_equal(value, state.base_params[name])
 
 
+@pytest.mark.usefixtures("mesh_context")
 def test_update_logs_only_new_traces(
-    state: TrainState, batch: training.GRPOBatch, caplog: pytest.LogCaptureFixture
+    state: training.LoRATrainState, batch: training.GRPOBatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     # A unique callable isolates this test's JIT cache without clearing other tests' entries.
-    state = state.replace(apply_fn=partial(state.apply_fn))
-    trace = partial(training.update.lower, grad_accum_steps=2, temperature=0.7, clip_coef=0.2)
+    state = jax.device_put(state.replace(apply_fn=partial(state.apply_fn)), PartitionSpec())
+    batch = jax.device_put(batch, PartitionSpec("batch"))  # (B, T), (B,) leaves.
+
+    def trace(
+        current: training.LoRATrainState,
+        minibatch: training.GRPOBatch[jax.Array],  # (B, T), (B,) leaves.
+    ) -> jax.stages.Lowered:
+        return training.update.lower(current, minibatch, 2, 0.7, 0.2)
+
     caplog.set_level(logging.INFO, logger=training.__name__)
     trace(state, batch)
     trace(state, batch)
@@ -300,15 +389,14 @@ def test_update_logs_only_new_traces(
 
 
 @pytest.mark.parametrize("has_momentum", [False, True], ids=["fresh", "with-momentum"])
+@pytest.mark.usefixtures("mesh_context")
 def test_zero_advantages_preserve_optimizer_state(
-    state: TrainState, batch: training.GRPOBatch[jax.Array], has_momentum: bool
+    state: training.LoRATrainState, batch: training.GRPOBatch[jax.Array], has_momentum: bool
 ) -> None:
     if has_momentum:
         state = state.apply_gradients(grads=jax.tree.map(jnp.ones_like, state.params))
     batch = batch._replace(advantages=jnp.zeros_like(batch.advantages))  # (B, T), (B,) leaves.
-    updated, metrics = training.update(
-        jax.tree.map(jnp.copy, state), batch, grad_accum_steps=2, temperature=0.7, clip_coef=0.2
-    )
+    updated, metrics = training.update(jax.tree.map(jnp.copy, state), batch, 2, 0.7, 0.2)
     assert float(metrics["train/gradient_norm"]) == float(metrics["train/policy_loss"]) == 0.0
     assert all(value.shape == () for value in metrics.values())
     assert {name: float(value) for name, value in metrics.items()} == {
@@ -324,18 +412,74 @@ def test_zero_advantages_preserve_optimizer_state(
 
 
 @pytest.mark.parametrize("grad_accum_steps", [0, 3], ids=["nonpositive", "indivisible"])
+@pytest.mark.usefixtures("mesh_context")
 def test_update_rejects_invalid_accumulation(
-    state: TrainState, batch: training.GRPOBatch, grad_accum_steps: int
+    state: training.LoRATrainState, batch: training.GRPOBatch, grad_accum_steps: int
 ) -> None:
     with pytest.raises(ValueError, match="grad_accum_steps must be positive and divide the minibatch size"):
-        training.update.lower(state, batch, grad_accum_steps=grad_accum_steps, temperature=0.7, clip_coef=0.2)
+        training.update.lower(state, batch, grad_accum_steps, 0.7, 0.2)
+
+
+@pytest.mark.parametrize("skip", [False, True], ids=["zero-advantage-replica", "all-zero"])
+@pytest.mark.usefixtures("mesh_context")
+def test_data_parallel_update_matches_single_device(
+    state: training.LoRATrainState, batch: training.GRPOBatch[jax.Array], skip: bool
+) -> None:
+    if len(jax.devices()) < 2:
+        pytest.skip("Requires two devices; use JAX_NUM_CPU_DEVICES=2 on CPU")
+    mesh = Mesh(devices=jax.devices()[:2], axis_names=("batch",))
+    replicated = NamedSharding(mesh, PartitionSpec())
+    batch = jax.tree.map(lambda value: jnp.concatenate([value, value]), batch)  # (B=4, T=8), (B,).
+    batch = batch._replace(
+        advantages=jnp.array([0.0, 0.0 if skip else -1.0, 0.0, 0.0 if skip else 1.0])  # (B=4,)
+    )
+    expected, expected_metrics = training.update(jax.tree.map(jnp.copy, state), batch, 2, 0.7, 0.2)
+    with jax.set_mesh(mesh):
+        actual, metrics = training.update(
+            jax.device_put(jax.tree.map(jnp.copy, state), replicated),
+            jax.device_put(batch, NamedSharding(mesh, PartitionSpec("batch"))),
+            2,
+            0.7,
+            0.2,
+        )
+    for result, reference in zip(
+        jax.tree.leaves((actual, metrics)), jax.tree.leaves((expected, expected_metrics)), strict=True
+    ):
+        assert result.shape == reference.shape
+        assert result.sharding.is_fully_replicated
+        assert result.devices() == set(mesh.devices.flat)
+        for shard in result.addressable_shards:
+            np.testing.assert_allclose(shard.data, reference, atol=2e-6, rtol=2e-5)
+
+
+def test_data_parallel_update_rejects_indivisible_microbatch(
+    state: training.LoRATrainState, batch: training.GRPOBatch[jax.Array]
+) -> None:
+    if len(jax.devices()) < 2:
+        pytest.skip("Requires two devices; use JAX_NUM_CPU_DEVICES=2 on CPU")
+    mesh = Mesh(devices=jax.devices()[:2], axis_names=("batch",))
+    with (
+        jax.set_mesh(mesh),
+        pytest.raises(ValueError, match="learner device count must divide the microbatch size"),
+    ):
+        training.update.lower(state, batch, 2, 0.7, 0.2)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [{"learner_gpus": 0}, {"learner_gpus": 2}, {"learner_gpus": 2, "minibatches_per_epoch": 2, "grad_accum_steps": 2}],
+    ids=["nonpositive", "small-microbatch", "accumulated-small-microbatch"],
+)
+def test_data_parallel_config_rejects_invalid_settings(settings: dict[str, int]) -> None:
+    with pytest.raises(ValueError, match="learner_gpus"):
+        training.Config(**settings)
 
 
 @pytest.mark.parametrize(
     "epochs,minibatches", [(1, 1), (1, 4), (2, 2)], ids=["single-minibatch", "default", "multiple-epochs"]
 )
 def test_learner_shuffles_each_epoch_and_averages_metrics(
-    state: TrainState,
+    state: training.LoRATrainState,
     batch: training.GRPOBatch,
     monkeypatch: pytest.MonkeyPatch,
     epochs: int,
@@ -353,21 +497,28 @@ def test_learner_shuffles_each_epoch_and_averages_metrics(
     observed: list[training.GRPOBatch] = []  # Minibatches: (B/N, T), (B/N,) leaves.
 
     def update(
-        current: TrainState, minibatch: training.GRPOBatch, **kwargs: Any
-    ) -> tuple[TrainState, training.Metrics]:
+        current: training.LoRATrainState,
+        minibatch: training.GRPOBatch,  # (B/N, T), (B/N,) leaves.
+        grad_accum_steps: int,
+        temperature: float,
+        clip_coef: float,
+    ) -> tuple[training.LoRATrainState, training.Metrics]:
         assert minibatch.token_ids.shape == (8 // minibatches, 8)
         assert minibatch.advantages.shape == (8 // minibatches,)
-        assert kwargs["grad_accum_steps"] == 1
+        assert grad_accum_steps == 1
+        assert jax.sharding.get_mesh() == learner.mesh
         observed.append(minibatch)
         return current.replace(step=current.step + 1), {"train/policy_loss": jnp.asarray(current.step)}  # () metric.
 
     monkeypatch.setattr(training, "update", update)
     host_batch = jax.tree.map(np.asarray, batch)  # (B, T), (B,) leaves.
-    metrics = learner.optimize(host_batch)
+    with jax.set_mesh(learner.mesh):
+        metrics = learner.optimize(host_batch)
     steps = epochs * minibatches
     assert int(learner.state.step) == steps
     assert metrics == {"train/policy_loss": (steps - 1) / 2}
-    learner.optimize(host_batch)
+    with jax.set_mesh(learner.mesh):
+        learner.optimize(host_batch)
     orders: list[np.ndarray] = []  # Each epoch: (B,).
     for start in range(0, len(observed), minibatches):
         epoch = jax.tree.map(
@@ -381,12 +532,13 @@ def test_learner_shuffles_each_epoch_and_averages_metrics(
     assert all(not np.array_equal(orders[0], order) for order in orders[1:])
     learner.state = state
     observed.clear()
-    learner.optimize(host_batch)
+    with jax.set_mesh(learner.mesh):
+        learner.optimize(host_batch)
     replay = jnp.concatenate([minibatch.advantages for minibatch in observed])  # (epochs * B,)
     np.testing.assert_array_equal(replay, np.concatenate(orders[:epochs]))
 
 
-def test_learner_rejects_indivisible_rollout_batch(state: TrainState, batch: training.GRPOBatch) -> None:
+def test_learner_rejects_indivisible_rollout_batch(state: training.LoRATrainState, batch: training.GRPOBatch) -> None:
     learner = training.Learner.__ray_metadata__.modified_class(
         batcher=Mock(), actor=Mock(), config=training.Config(group_size=6, minibatches_per_epoch=3)
     )
@@ -397,28 +549,30 @@ def test_learner_rejects_indivisible_rollout_batch(state: TrainState, batch: tra
     assert int(learner.state.step) == 0
 
 
-def test_learner_optimizes_and_publishes_updated_bf16_weights(
+def test_learner_optimizes_and_publishes_updated_adapters(
     batcher: Any,
     model: Qwen3LM,
-    state: TrainState,
+    state: training.LoRATrainState,
     groups: list[training.RolloutGroup],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     learner = training.Learner.__ray_metadata__.modified_class(
         batcher=Mock(),
         actor=Mock(),
-        config=training.Config(temperature=0.7, grad_accum_steps=2, minibatches_per_epoch=2, update_epochs=2),
+        config=training.Config(temperature=0.7, minibatches_per_epoch=2, update_epochs=2, lora_rank=2, lora_alpha=4),
     )
     learner.model = model.clone(dtype="bfloat16", param_dtype=jnp.bfloat16)
-    learner.mesh = Mesh(devices=np.array([jax.devices()[0]]), axis_names=("batch",))
+    learner.mesh = Mesh(devices=jax.devices()[:2], axis_names=("batch",))
     learner.state = training.create_state(
-        learner.model, jax.tree.map(jnp.copy, state.params), training.Config(learning_rate=0.01)
+        learner.model,
+        jax.tree.map(jnp.copy, state.base_params),
+        training.Config(learning_rate=0.01, lora_rank=2, lora_alpha=4),
     )
-    learner._transfer_group = Mock()
+    learner.state = jax.device_put(learner.state, NamedSharding(learner.mesh, PartitionSpec()))
     groups = groups + [replace(groups[0], rollouts=list(reversed(groups[0].rollouts)))]
     batch = batcher.prepare_batch(groups, context_length=8)  # (B=4, T=8), (B,) leaves.
     old = training.token_log_probs(
-        learner.state, learner.state.params, jax.device_put(batch), temperature=0.7
+        learner.state, learner.state.merged_params(), jax.device_put(batch), temperature=0.7
     )  # (B, T-1)
     assert old.shape == (4, 7)
     assert old.dtype == jnp.float32
@@ -428,23 +582,28 @@ def test_learner_optimizes_and_publishes_updated_bf16_weights(
     steps: list[int] = []
 
     def record_update(
-        current: TrainState, minibatch: training.GRPOBatch, **kwargs: Any
-    ) -> tuple[TrainState, training.Metrics]:
+        current: training.LoRATrainState,
+        minibatch: training.GRPOBatch,  # (B/N, T), (B/N,) leaves.
+        grad_accum_steps: int,
+        temperature: float,
+        clip_coef: float,
+    ) -> tuple[training.LoRATrainState, training.Metrics]:
         steps.append(int(current.step))
-        return actual_update(current, minibatch, **kwargs)
+        return actual_update(current, minibatch, grad_accum_steps, temperature, clip_coef)
 
     update = Mock(wraps=record_update)
     monkeypatch.setattr(training, "update", update)
     permutations = [jnp.array([2, 0, 3, 1]), jnp.array([1, 3, 0, 2])]  # Each: (B,).
     permutation = Mock(side_effect=permutations)
     monkeypatch.setattr(training.jax.random, "permutation", permutation)
-    metrics = learner.optimize(batch)
+    with jax.set_mesh(learner.mesh):
+        metrics = learner.optimize(batch)
     assert update.call_count == 4
     assert permutation.call_count == 2
     assert steps == [0, 1, 2, 3]
     for index, call in enumerate(update.call_args_list):
-        assert call.args[0].params["model.embed_tokens.weight"].is_deleted()
-        assert call.kwargs["grad_accum_steps"] == 2
+        assert jax.tree.leaves(call.args[0].params)[0].is_deleted()
+        assert call.args[2] == 1
         placed_batch = call.args[1]  # (B/N=2, T=8), (B/N,) leaves.
         start = (index % 2) * 2
         indices = permutations[index // 2][start : start + 2]  # (B/N,)
@@ -455,25 +614,29 @@ def test_learner_optimizes_and_publishes_updated_bf16_weights(
     assert int(learner.state.step) == 4
     assert metrics["train/gradient_norm"] > 0
     assert all(isinstance(value, float) for value in metrics.values())
-    for name, value in learner.state.params.items():  # HF parameter shapes.
-        assert value.shape == state.params[name].shape
-        assert value.dtype == jnp.float32
+    for value in jax.tree.leaves(learner.state):  # HF/LoRA parameter shapes and scalar optimizer counters.
+        assert value.sharding.is_fully_replicated
+        assert value.devices() == set(learner.mesh.devices.flat)
     adam = learner.state.opt_state[1][0]
-    for moments in (adam.mu, adam.nu):  # HF parameter shapes.
-        for name, value in moments.items():
-            assert value.shape == learner.state.params[name].shape
+    for tree in (learner.state.params, adam.mu, adam.nu):  # LoRA factor shapes.
+        for value, initial in zip(jax.tree.leaves(tree), jax.tree.leaves(state.params), strict=True):
+            assert value.shape == initial.shape
             assert value.dtype == jnp.float32
+    for name, value in learner.state.base_params.items():  # HF parameter shapes.
+        np.testing.assert_array_equal(value, state.base_params[name])
     assert optax.global_norm(jax.tree.map(jnp.subtract, learner.state.params, state.params)) > 0
 
-    def send(iterator: Any, trainer_args: training.NCCLTrainerSendWeightsArgs) -> None:
-        weights = dict(iterator)  # HF parameter shapes.
-        for name, value in learner.state.params.items():
-            assert str(weights[name].dtype) == "torch.bfloat16"
-            np.testing.assert_array_equal(
-                weights[name].float().cpu().numpy(), np.asarray(value.astype(jnp.bfloat16), dtype=np.float32)
-            )
+    def receive(path: str) -> None:
+        weights = load_file(Path(path) / "adapter_model.safetensors")  # (R, I) and (O, R) leaves.
+        assert len(weights) == 2 * len(learner.state.params)
+        for name, adapter in learner.state.params.items():
+            for factor, value in (("A", adapter.a), ("B", adapter.b)):  # (R, I) or (O, R)
+                key = f"base_model.model.{name.removesuffix('.weight')}.lora_{factor}.weight"
+                np.testing.assert_array_equal(weights[key], np.asarray(value))
 
-    monkeypatch.setattr(training.NCCLWeightTransferEngine, "trainer_send_weights", send)
-    monkeypatch.setattr(training.torch.cuda, "synchronize", Mock())
+    learner.actor.update_weights.remote.side_effect = receive
     monkeypatch.setattr(training.ray, "get", Mock())
-    learner.publish_weights()
+    with ExitStack() as resources:
+        learner.initialize_publication(resources)
+        learner.publish_weights()
+    learner.actor.update_weights.remote.assert_called_once()

@@ -13,6 +13,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import pytest
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from rl2 import train_grpo_v2 as training
 
@@ -21,10 +22,10 @@ from rl2 import train_grpo_v2 as training
 def progress() -> training.TrainingProgress:
     state = training.create_state(
         Mock(),
-        {"weight": jnp.array([1.0, -1.0], dtype=jnp.float32)},  # (D=2,)
+        {"model.layers.0.self_attn.q_proj.weight": jnp.array([[1.0, -1.0]], dtype=jnp.bfloat16)},  # (O=1, I=2)
         training.Config(),
     )
-    state = state.apply_gradients(grads={"weight": jnp.array([0.5, -0.25])})  # (D=2,)
+    state = state.apply_gradients(grads=jax.tree.map(jnp.ones_like, state.params))
     actor_class = training.Actor.__ray_metadata__.modified_class
     actor = actor_class.__new__(actor_class)
     actor.rng = random.Random(3)
@@ -42,8 +43,10 @@ def test_checkpoint_roundtrip_and_retention(tmp_path: Path, progress: training.T
     config = training.Config(ckpt_dir=str(tmp_path), run_id="resume-test")
     state = progress.train_state
     fresh = training.create_state(
-        Mock(), jax.tree.map(jnp.zeros_like, state.params), replace(config, learning_rate=1e-4)
+        Mock(), jax.tree.map(jnp.zeros_like, state.base_params), replace(config, learning_rate=1e-4)
     )
+    mesh = Mesh(devices=jax.devices()[:2], axis_names=("batch",))
+    fresh = jax.device_put(fresh, NamedSharding(mesh, PartitionSpec()))
     with training.checkpoint_manager(config.ckpt_dir) as manager:
         assert training.restore_checkpoint(manager, fresh, config) is None
         training.save_checkpoint(manager, replace(progress, iteration=1), config)
@@ -64,18 +67,23 @@ def test_checkpoint_roundtrip_and_retention(tmp_path: Path, progress: training.T
         assert restored.total_rollouts == 2**31 + 4
         assert restored.sampling_state == progress.sampling_state
         assert restored.shuffle_key.shape == ()
-        assert restored.train_state.params["weight"].shape == (2,)
+        assert restored.train_state.params["model.layers.0.self_attn.q_proj.weight"].a.shape == (16, 2)
+        chex.assert_trees_all_equal(restored.train_state.base_params, state.base_params)
+        assert restored.train_state.lora_scale == state.lora_scale
         chex.assert_trees_all_equal(
             (restored.train_state.params, restored.train_state.opt_state, restored.train_state.step),
             (state.params, state.opt_state, state.step),
         )
         assert restored.train_state.apply_fn == fresh.apply_fn
         assert restored.train_state.tx is fresh.tx
+        for value in jax.tree.leaves(restored.train_state):  # HF/LoRA parameter shapes and scalar optimizer counters.
+            assert value.sharding.is_fully_replicated
+            assert value.devices() == set(mesh.devices.flat)
         chex.assert_trees_all_equal(
             jax.random.permutation(jax.random.fold_in(restored.shuffle_key, restored.train_state.step), 8),
             jax.random.permutation(jax.random.fold_in(progress.shuffle_key, state.step), 8),
         )
-        gradients = {"weight": jnp.array([-0.1, 0.2])}  # (D=2,)
+        gradients = jax.tree.map(lambda value: jnp.full_like(value, -0.1), state.params)  # LoRA factor shapes.
         expected = state.replace(tx=fresh.tx).apply_gradients(grads=gradients)
         actual = restored.train_state.apply_gradients(grads=gradients)
         chex.assert_trees_all_equal((actual.params, actual.opt_state), (expected.params, expected.opt_state))
@@ -129,7 +137,7 @@ def test_checkpoint_ignores_legacy_stop_conditions(progress: training.TrainingPr
 @pytest.mark.parametrize(
     "damage",
     [
-        {"version": 2},
+        {"version": 1},
         {"algorithm": "ppo"},
         {"iteration": 3},
         {"total_rollouts": -1},
@@ -144,6 +152,21 @@ def test_invalid_checkpoint_metadata(progress: training.TrainingProgress, damage
     manager.restore.return_value = SimpleNamespace(metadata=metadata)
     with pytest.raises(ValueError, match="checkpoint"):
         training.restore_checkpoint(manager, progress.train_state, config)
+    manager.restore.assert_called_once()
+
+
+@pytest.mark.parametrize("change", [{"model": "other"}, {"lora_rank": 8}, {"lora_alpha": 16.0}])
+def test_checkpoint_rejects_incompatible_lora_config(
+    progress: training.TrainingProgress, change: dict[str, Any]
+) -> None:
+    manager = Mock()
+    config = training.Config()
+    training.save_checkpoint(manager, progress, config)
+    metadata = manager.save.call_args.kwargs["args"].metadata.item
+    manager.latest_step.return_value = progress.iteration
+    manager.restore.return_value = SimpleNamespace(metadata=metadata)
+    with pytest.raises(ValueError, match="checkpoint .* does not match"):
+        training.restore_checkpoint(manager, progress.train_state, replace(config, **change))
     manager.restore.assert_called_once()
 
 

@@ -56,15 +56,21 @@ def main() -> None:
     )
     computation = update
     if not args.donate_state:
-        computation = jax.jit(update.__wrapped__, static_argnames=("grad_accum_steps", "temperature", "clip_coef"))
+        computation = jax.jit(
+            update.__wrapped__,
+            static_argnames=("grad_accum_steps", "temperature", "clip_coef"),
+            in_shardings=(PartitionSpec(), PartitionSpec("batch")),
+            out_shardings=PartitionSpec(),
+        )
     started = perf_counter()
-    lowered = computation.lower(
-        state,
-        batch,
-        grad_accum_steps=config.grad_accum_steps,
-        temperature=config.temperature,
-        clip_coef=config.clip_coef,
-    )
+    with jax.set_mesh(mesh):
+        lowered = computation.lower(
+            state,
+            batch,
+            config.grad_accum_steps,
+            config.temperature,
+            config.clip_coef,
+        )
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "update.stablehlo.mlir").write_text(str(lowered.compiler_ir()))
     compiled = lowered.compile()

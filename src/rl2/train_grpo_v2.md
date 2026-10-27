@@ -1,6 +1,6 @@
 # Tool-calling GRPO
 
-`train_grpo_v2.py` trains Qwen3 with a JAX learner, a vLLM inference server,
+`train_grpo_v2.py` trains Qwen3 LoRA adapters with a JAX learner, a vLLM inference server,
 and a small custom tool-calling interaction loop. V2 accepts
 `taskset.id: alfworld` or `appworld`; the other environment presets are unsupported.
 
@@ -26,9 +26,15 @@ Run on Linux x86_64 with Python 3.12 and two visible GPUs:
 uv run python -m rl2.train_grpo_v2 --config configs/grpo_v2/alfworld.yaml
 ```
 
-Ray reserves one GPU for the actor's vLLM server and one for the learner.
+Ray reserves one GPU for the actor's vLLM server and `learner_gpus` GPUs for the
+learner (default 1). Multi-GPU training uses fully replicated data parallelism:
+base weights, LoRA factors, and optimizer state are replicated on every learner
+GPU; each microbatch is split across those GPUs, with gradients averaged globally.
+The JIT update declares input/output `PartitionSpec`s and runs inside the learner's
+`jax.set_mesh` context; direct callers must also provide a mesh context with a `batch` axis.
+Set `learner_gpus` in the YAML and expose at least `learner_gpus + 1` GPUs.
 The batcher runs on CPU. The actor and batcher use NumPy arrays and keep
-`JAX_PLATFORMS=cpu`; only the learner places training arrays on its GPU.
+`JAX_PLATFORMS=cpu`; only the learner places training arrays on its GPUs.
 
 ## Interaction
 
@@ -86,8 +92,8 @@ worker errors, and timeouts abort the group and cancel its other rollouts.
 Environments close normally on success; errors and cancellations terminate ALFWorld
 actors immediately. AppWorld workers receive EOF and have five seconds to close
 before their process group is killed. Training enables Ray's Linux subreaper to clean up TextWorld
-child processes even after a forced termination. SDK retries are disabled; there are no fallback
-rewards for infrastructure failures.
+child processes even after a forced termination. The SDK retries transient HTTP failures
+up to three times; there are no fallback rewards for infrastructure failures.
 
 ## Training and resuming
 
@@ -112,9 +118,16 @@ capped at the model context length. Oversized transcripts are rejected.
 
 GRPO uses a clipped importance-ratio objective, averaged over sampled tokens
 within each rollout and then across rollouts. There is no reference-policy KL
-penalty. Transformer computation and published weights use BF16; the output
-projection accumulates FP32 logits in both JAX and vLLM. Master parameters,
-optimizer state, gradients, log probabilities, and loss use FP32. Learner
+penalty. Transformer computation uses BF16; the output
+projection accumulates FP32 logits in both JAX and vLLM. Base weights are frozen;
+only FP32 LoRA factors on every attention and MLP projection are optimized.
+`lora_rank` defaults to 16 and `lora_alpha` to 32; the weight delta is
+`(lora_alpha / lora_rank) * B @ A`. A is randomly initialized and B starts at zero,
+so training starts from the base policy. Embeddings, normalization, and the output
+head stay frozen. The learner merges adapters for forward computation; vLLM applies
+native LoRA adapters. These paths can differ numerically, so native-LoRA
+log-probability parity must be validated with the GPU publication suite.
+Optimizer state, gradients, log probabilities, and loss use FP32. Learner
 `attention_backend` accepts `tokamax` (default), `xla`, or `cudnn`; `scan_layers` and
 `gradient_checkpointing` default to true. These defaults match the standalone
 Qwen3 model and the [publication parity suite](../../docs/qwen3.md#parity-with-the-grpo-v2-vllm-server).
@@ -131,8 +144,18 @@ Minibatches with all-zero advantages skip forward/backward computation and prese
 parameters, Adam state, and the optimizer step. `train/skipped_update_fraction` reports the
 skipped fraction; skipped minibatches contribute zero to the other optimization metrics.
 `minibatches_per_epoch * grad_accum_steps` must divide `num_groups * group_size`.
-Shuffling uses the saved seed and optimizer step. Initial and updated weights
-are published through vLLM's NCCL weight-transfer backend. `prefetch_batches: N`
+The resulting microbatch size must also be divisible by `learner_gpus`.
+Shuffling uses the saved seed and optimizer step. Publication copies only FP32 LoRA
+factors from one replica into PEFT safetensors and configuration files in a temporary
+local directory shared with vLLM. vLLM starts with LoRA enabled, casts adapters to
+BF16, and replaces the `training-policy` adapter through `/v1/load_lora_adapter`
+with `load_inplace: true`. Rollout requests select that adapter; the base model is
+loaded once. A small server wrapper clears vLLM 0.32's persistent `load_inplace`
+flag after a successful load, preventing repeated adapter reads during decoding.
+The initial adapter is published before any rollouts. Previous files are removed
+after a successful replacement, and all temporary files are removed
+when the learner exits. This requires learner and server to share a local filesystem.
+`prefetch_batches: N`
 (default 1) generates up to N batches ahead while the learner optimizes; each
 batch contains `num_groups` rollout groups. Prefetched rollouts can use older
 weights, and multi-turn rollouts can span weight updates. Set it to 0 to collect
@@ -140,27 +163,41 @@ each batch after publishing the latest weights.
 `weight_update_pause_mode` accepts `wait` (default), `abort`, or `keep`, operating
 on individual generation requests. Groups can start during publication; vLLM
 queues new generation requests until resume and handles in-flight requests
-according to the selected pause mode. Update failures propagate to the learner
-and trigger training cleanup.
+according to the selected pause mode. The actor awaits `/pause` with cache clearing,
+reloads the adapter, then calls `/resume`. Reload failures leave generation paused,
+propagate to the learner, and trigger training cleanup.
 
 `ckpt_dir/checkpoints` stores Orbax checkpoints every `checkpoint_interval`
 iterations and at normal completion, retaining only the latest checkpoint.
 Prefetching drains on checkpoint iterations so the saved task RNG does not
-skip unconsumed batches. Restarting with the same directory restores parameters,
-optimizer state, shuffle key, task RNG,
-progress counters, and observed stop labels. `total_iterations` is a cumulative
+skip unconsumed batches. Restarting with the same directory restores frozen base weights, LoRA factors,
+optimizer state, shuffle key, task RNG, and progress counters. `total_iterations` is a cumulative
 target; `null` runs until interrupted. Environments restart fresh, so resumption
 is not bit-for-bit reproducible. Use a new directory for a fresh experiment or
-incompatible model changes. Local and `gs://` paths are supported.
+incompatible model changes. LoRA checkpoints require matching `model`, `lora_rank`,
+and `lora_alpha`; older full-parameter checkpoints cannot be resumed.
+Local and `gs://` paths are supported.
 
 ## Logging and profiling
+
+Console logging defaults to INFO, with `vllm`, `httpx`, and `httpcore` loggers
+and their descendants blocked at every level. The driver and workers use Ray's
+logging handlers and formatting. The vLLM subprocess uses the same blacklist
+with its own logging configuration. vLLM access logs are disabled; Prometheus
+metrics remain available. Other libraries' logs remain visible.
+Direct prints and native-library output are not filtered. Existing cluster jobs
+need a new image and resubmission to pick up logging changes.
 
 MLflow uses experiment `grpo_v2` and the standard tracking environment variables.
 The [module docstring](train_grpo_v2.py) defines metric names and aggregation.
 Every `example_log_interval` iterations (default 10, positive integer), it saves
 full token transcripts, final observations, rewards, and advantages.
-Stop fractions include zero for previously seen labels
-absent from the current batch.
+Stop fractions include all `StopCondition` labels, with zero for absent labels.
+`rollout/total_tokens_mean` is the mean full transcript length in the learner
+batch, counting context and sampled tokens and excluding padding, before the
+next-token shift.
+`batcher/padded_sequence_tokens` records the padded batch width; the learner's
+forward pass uses one fewer position for next-token prediction.
 
 `enable_tracing` defaults to true and requires an OTLP endpoint. `submit.py`
 supplies the cluster's Tempo endpoint. Spans cover iterations, rollout groups,
@@ -176,5 +213,3 @@ your IDE. Local dashboards use port 8265. Timelines are saved every 60 seconds
 and at graceful shutdown, under `ckpt_dir/profiles` unless overridden by
 `RL2_RAY_TIMELINE_PATH`. These traces measure host-side intervals, not GPU kernels.
 
-On hosts inheriting an unusable gIB NCCL plugin, launch with
-`NCCL_NET=Socket NCCL_NET_PLUGIN=none` for this single-node setup.

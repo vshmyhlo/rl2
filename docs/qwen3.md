@@ -131,9 +131,11 @@ Transformers installed, run `python tests/qwen3_reference.py`.
 rollouts from eight to 32 tokens per turn and exposes an unchanged-policy ratio
 outside the GRPO clipping range. The earlier passing audit covered shorter decodes.
 
-The learner keeps FP32 master weights and publishes BF16 weights through DLPack
-and packed NCCL. Both models use BF16 transformer computation and **FP32 output
-logits**. `serve_vllm` sets `--hf-overrides '{"head_dtype":"float32"}'`; a separately
+The learner now keeps frozen base weights and FP32 LoRA factors, publishing only
+PEFT adapter files through vLLM's runtime reload API. vLLM uses native BF16 LoRA;
+the learner still merges adapters for forward computation. The historical merged-weight
+measurements below do not certify this native-LoRA path. Both models use BF16
+transformer computation and **FP32 output logits**. `serve_vllm` sets `--hf-overrides '{"head_dtype":"float32"}'`; a separately
 launched vLLM server needs the same override.
 
 Three numerical boundaries are explicit in `qwen3.py`:
@@ -147,16 +149,16 @@ Three numerical boundaries are explicit in `qwen3.py`:
   residual RMSNorm, normalization reads their FP32 sum while the residual is stored
   in BF16. This applies across the layer scan and at the final normalization.
 - The output projection keeps its FP32 accumulator instead of rounding logits to
-  BF16 before softmax. Weight storage and transfer remain BF16, including tied heads.
+  BF16 before softmax. Base-weight storage remains BF16, including tied heads.
 
 `tests/test_qwen3_vllm.py` exercises the actual `serve_vllm`, `publish_weights`,
 `Actor.update_weights`, `Batcher.prepare_batch`, `token_log_probs`, and `update`.
 Only Ray scheduling is replaced with local threads. A read-only test worker hashes
 all loaded parameters, including packed QKV and gate/up projections; the test checks
-byte equality and complete coverage of the exported HF parameters after each
-publication. The second publication contains a real Adam update (test learning rate
+byte equality and complete coverage of the frozen base parameters after each
+adapter publication. The second publication contains a real Adam update (test learning rate
 `1e-4`, chosen to make stale prefix caches observable). Both publications are
-checked inside an optimizer update, including the updated FP32 masters.
+checked inside an optimizer update, including the updated FP32 LoRA factors.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 QWEN3_VLLM_DEVICE=1 \

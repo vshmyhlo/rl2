@@ -1,4 +1,4 @@
-"""Opt-in CUDA/NCCL parity: QWEN3_VLLM_TESTS=1; optionally QWEN3_CHECKPOINT=/local/snapshot."""
+"""Opt-in CUDA LoRA publication parity: QWEN3_VLLM_TESTS=1; optionally QWEN3_CHECKPOINT=/local/snapshot."""
 
 import asyncio
 import hashlib
@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from jax.sharding import Mesh
 from openai import OpenAI
 from safetensors.flax import save_file
 from tokenizers import Tokenizer
@@ -293,20 +294,16 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
         actor.config = training.Config()
         stack.enter_context(patch.object(training, "SERVER_URL", url))
 
-        def initialize(info: dict[str, Any]) -> Future[None]:
-            return pool.submit(asyncio.run, actor.initialize_weight_transfer(info))
-
-        def receive(info: dict[str, Any]) -> Future[None]:
-            return pool.submit(asyncio.run, actor.update_weights(info))
+        def receive(adapter_path: str) -> Future[None]:
+            return pool.submit(asyncio.run, actor.update_weights(adapter_path))
 
         learner_cls = training.Learner.__ray_metadata__.modified_class
         learner = object.__new__(learner_cls)
-        learner.actor = SimpleNamespace(
-            initialize_weight_transfer=SimpleNamespace(remote=initialize),
-            update_weights=SimpleNamespace(remote=receive),
-        )
+        learner.config = training.Config(model=str(source))
+        learner.actor = SimpleNamespace(update_weights=SimpleNamespace(remote=receive))
         stack.enter_context(patch.object(training.ray, "get", resolve))
-        learner.initialize_weight_transfer(stack)
+        learner.initialize_publication(stack)
+        stack.enter_context(jax.set_mesh(Mesh(devices=jax.devices(), axis_names=("batch",))))
         client = stack.enter_context(OpenAI(base_url=f"{url}/v1", api_key="unused"))
         yield Engine(
             model=model,
@@ -367,11 +364,11 @@ def test_published_rollout_parity(engine: Engine) -> None:
     reports: list[dict[str, Any]] = []
     optimizer_reports: list[dict[str, float]] = []
     previous: dict[str, float] | None = None
-    model_id = engine.client.models.list().data[0].id
+    model_id = training.LORA_NAME
     # A visible update makes stale prefix-cache entries observable even in the tiny models.
     state = training.create_state(model, jax.tree.map(jnp.copy, master), training.Config(learning_rate=1e-4))
     for version in range(2):
-        params = state.params  # HF parameter shapes; version 1 contains a real Adam update.
+        params = state.merged_params()  # HF parameter shapes; version 1 contains a real LoRA update.
         engine.learner.state = state
         engine.learner.publish_weights()
         response = engine.http.post("/collective_rpc", json={"method": "weight_digests"})
@@ -389,11 +386,11 @@ def test_published_rollout_parity(engine: Engine) -> None:
             covered.update(names)
             digest = hashlib.sha256()
             for source_name in names:
-                digest.update(np.asarray(params[source_name].astype(jnp.bfloat16)).tobytes())
+                digest.update(np.asarray(master[source_name].astype(jnp.bfloat16)).tobytes())
             expected_digests[name] = digest.hexdigest()
-        assert covered == params.keys(), "Every exported parameter must be present in vLLM"
-        assert loaded_digests == expected_digests, "Published BF16 weights differ from vLLM's loaded parameters"
-        (engine.directory / f"weights-v{version}.json").write_text(json.dumps(loaded_digests, indent=2))
+        assert covered == master.keys(), "Every base parameter must be present in vLLM"
+        assert loaded_digests == expected_digests, "LoRA publication must preserve the original base weights"
+        (engine.directory / f"base-weights-v{version}.json").write_text(json.dumps(loaded_digests, indent=2))
         for temperature in (1.0, 0.7):
             sequences = [list(prompt) for prompt in prompts]
             masks = [[False] * len(prompt) for prompt in prompts]
@@ -550,9 +547,9 @@ def test_published_rollout_parity(engine: Engine) -> None:
                     **errors(selected, expected),
                     "candidates": errors(distribution[indices], expected_candidates),
                     "candidate_probs": errors(jnp.exp(distribution[indices]), np.exp(expected_candidates)),
-                    "approx_kl": float(metrics["policy/approx_kl"]),
-                    "clip_fraction": float(metrics["policy/clip_fraction"]),
-                    "policy_loss": float(metrics["losses/policy"]),
+                    "approx_kl": float(metrics["train/approx_kl"]),
+                    "clip_fraction": float(metrics["train/clip_fraction"]),
+                    "policy_loss": float(metrics["train/policy_loss"]),
                 }
                 reports.append(report)
                 print(report, flush=True)
@@ -560,20 +557,21 @@ def test_published_rollout_parity(engine: Engine) -> None:
                 del logits, distribution  # Release vocabulary-sized buffers before the optimizer audit.
         # Exercise the exact differentiated/rematerialized training graph, whose
         # BF16 fusion can differ from a standalone inference forward.
-        published = jax.tree.map(lambda value: value.astype(jnp.bfloat16), params)  # HF parameter shapes.
-        state, update_metrics = training.update(
-            state,
-            batch,
-            grad_accum_steps=1,
-            temperature=temperature,
-            clip_coef=0.2,
-        )
+        published = jax.tree.map(lambda value: jnp.array(value, dtype=jnp.bfloat16, copy=True), params)  # HF shapes.
+        with jax.set_mesh(training.Mesh(devices=jax.devices(), axis_names=("batch",))):
+            state, update_metrics = training.update(
+                state,
+                batch,
+                1,
+                temperature,
+                0.2,
+            )
         optimizer_report = {name: float(value) for name, value in update_metrics.items()}
         optimizer_reports.append(optimizer_report)
         (engine.directory / f"optimizer-v{version}.json").write_text(json.dumps(optimizer_report, indent=2))
         print({"optimizer": optimizer_report}, flush=True)
         assert int(state.step) == version + 1
-        assert optimizer_report["policy/grad_norm"] > 0
+        assert optimizer_report["train/gradient_norm"] > 0
         for report in reports:
             if (
                 report["backend"] == "tokamax-triton"
@@ -581,19 +579,19 @@ def test_published_rollout_parity(engine: Engine) -> None:
                 and report["version"] == version
             ):
                 for metric, key in (
-                    ("policy/approx_kl", "approx_kl"),
-                    ("policy/clip_fraction", "clip_fraction"),
-                    ("losses/policy", "policy_loss"),
+                    ("train/approx_kl", "approx_kl"),
+                    ("train/clip_fraction", "clip_fraction"),
+                    ("train/policy_loss", "policy_loss"),
                 ):
                     np.testing.assert_allclose(optimizer_report[metric], report[key], rtol=1e-4, atol=1e-7)
         assert any(
             not np.array_equal(np.asarray(published[name]), np.asarray(value.astype(jnp.bfloat16)))
-            for name, value in state.params.items()
-        ), "The optimizer update must change the published BF16 policy"
+            for name, value in state.merged_params().items()
+        ), "The adapter update must change the merged BF16 policy"
     # Preserve both publications' diagnostics even when the initial policy fails parity.
     for report in optimizer_reports:
-        assert report["policy/approx_kl"] < (0.0025 if engine.real else 0.0001), report
-        assert report["policy/clip_fraction"] == 0, report
+        assert report["train/approx_kl"] < (0.0025 if engine.real else 0.0001), report
+        assert report["train/clip_fraction"] == 0, report
     checked = [report for report in reports if report["backend"] != "vllm-replay"]
     # BF16 kernels differ even between vLLM prefill and decode. Bound both individual
     # outliers and aggregate policy drift; near-zero alternative probabilities need absolute probability bounds.

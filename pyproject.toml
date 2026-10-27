@@ -60,11 +60,11 @@ dependencies = [
     "soundfile>=0.13,<0.14; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
     "tfp-nightly>=0.26.0.dev0,<0.27",
     "tokamax>=0.0.15; sys_platform == 'linux'",
-    "tokenizers>=0.22,<0.24",
+    "tokenizers>=0.23.2,<0.24",
     # Keep this pair together: vLLM wheels are built against a specific PyTorch.
     "torch==2.13.0; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
-    "vllm==0.27.0; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
-    "transformers>=5.5.3,<5.6; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
+    "vllm==0.32.0; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
+    "transformers>=5.16.1,<5.20; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
     "xminigrid==0.9.3",
     "verifiers>=0.4.0,<0.5",
     "datasets>=4",
@@ -152,7 +152,7 @@ robotarium-python-simulator = { url = "https://github.com/shalin-jain/robotarium
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
-# Relax only BFCL's NumPy pin; retain other packages' compatibility bounds.
+# Relax BFCL's NumPy pin and allow filelock patch releases required by vLLM.
 [[tool.uv.dependency-metadata]]
 name = "bfcl-eval"
 version = "2025.12.17"
@@ -189,7 +189,7 @@ requires-dist = [
     "sentence-transformers>=2.7.0",
     "faiss-cpu==1.11.0",
     "networkx==3.3",
-    "filelock==3.20.0",
+    "filelock>=3.20.3,<3.21",
     "vllm==0.8.5; extra == \"oss-eval-vllm\"",
     "sglang[all]; extra == \"oss-eval-sglang\"",
     "wandb==0.18.5; extra == \"wandb\"",
