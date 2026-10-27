@@ -37,11 +37,12 @@ def main() -> None:
         config=model_config,
         dtype="bfloat16",
         param_dtype=jnp.bfloat16,
-        attention_backend="tokamax",
+        attention_backend=config.attention_backend,
         gradient_checkpointing=config.gradient_checkpointing,
+        scan_layers=config.scan_layers,
     )
     params = {
-        name: jax.ShapeDtypeStruct(shape, jnp.float32) for name, shape in model_config.parameter_shapes().items()
+        name: jax.ShapeDtypeStruct(shape, jnp.bfloat16) for name, shape in model_config.parameter_shapes().items()
     }  # HF parameter shapes; abstract inputs never allocate model weights.
     state = jax.eval_shape(lambda weights: create_state(model, weights, config), params)
     state = jax.tree.map(lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=replicated), state)

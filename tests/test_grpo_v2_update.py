@@ -17,7 +17,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from safetensors.numpy import load_file
 
 from rl2 import train_grpo_v2 as training
-from rl2.qwen3 import Parameters, Qwen3Config, Qwen3LM, Qwen3Output, Variables
+from rl2.qwen3 import Qwen3Config, Qwen3LM, Qwen3Output, Variables
 
 
 @pytest.fixture
@@ -223,21 +223,23 @@ def batch(
     batcher: Any, groups: list[training.RolloutGroup], state: training.LoRATrainState
 ) -> training.GRPOBatch[jax.Array]:
     batch = jax.device_put(batcher.prepare_batch(groups, context_length=8))  # (B, T), (B,) leaves.
-    old = training.token_log_probs(state, state.merged_params(), batch, temperature=0.7)  # (B=2, T-1=7)
+    old = training.token_log_probs(state, state.params, batch, temperature=0.7)  # (B=2, T-1=7)
     return batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))
 
 
 def test_token_log_probs_shift_temperature_and_padding(
     state: training.LoRATrainState, batch: training.GRPOBatch
 ) -> None:
-    log_probs = training.token_log_probs(state, state.merged_params(), batch, temperature=0.7)  # (B, T-1)
+    log_probs = training.token_log_probs(state, state.params, batch, temperature=0.7)  # (B, T-1)
     assert log_probs.shape == (2, 7)
-    logits = state.apply_fn({"params": state.merged_params()}, batch.token_ids).logits  # (B, T, V)
+    logits = state.apply_fn(
+        {"params": state.base_params}, batch.token_ids, lora=state.params, lora_scale=state.lora_scale
+    ).logits  # (B, T, V)
     expected = jax.nn.log_softmax(logits / 0.7)  # (B, T, V)
     np.testing.assert_allclose(log_probs[0, [0, 2, 3]], expected[0, [0, 2, 3], [2, 4, 5]], atol=1e-6)
     np.testing.assert_allclose(log_probs[1, 1], expected[1, 1, 6], atol=1e-6)
     padded = batch._replace(token_ids=jnp.where(batch.attention_mask, batch.token_ids, 7))
-    changed = training.token_log_probs(state, state.merged_params(), padded, temperature=0.7)  # (B, T-1)
+    changed = training.token_log_probs(state, state.params, padded, temperature=0.7)  # (B, T-1)
     np.testing.assert_allclose(changed[batch.loss_mask[:, 1:]], log_probs[batch.loss_mask[:, 1:]], atol=1e-6)
 
 
@@ -247,19 +249,26 @@ def test_token_log_probs_gradients_match_gather(state: training.LoRATrainState, 
         tokens: jax.Array,  # (B, T-1)
         *,
         attention_mask: jax.Array,  # (B, T-1)
+        lora: training.LoRAParameters,  # Fake logits in the A factor: (B, T-1, V).
+        lora_scale: float,
     ) -> Qwen3Output:
-        return Qwen3Output(logits=variables["params"]["logits"], cache=None)  # (B, T-1, V)
+        return Qwen3Output(logits=lora["logits"].a, cache=None)  # (B, T-1, V)
 
     state = state.replace(apply_fn=apply_fn)
     batch = batch._replace(token_ids=batch.token_ids.at[:, 1].set(jnp.array([0, 7])))  # (B=2, T=8)
-    params = {"logits": jnp.arange(112, dtype=jnp.float32).reshape(2, 7, 8) / 10}  # (B, T-1, V=8)
+    params = {
+        "logits": training.LoRAWeights(
+            a=jnp.arange(112, dtype=jnp.float32).reshape(2, 7, 8) / 10,  # (B, T-1, V=8) fake logits.
+            b=jnp.zeros((1,), dtype=jnp.float32),  # (1,) unused factor.
+        )
+    }
 
-    def selected_loss(weights: Parameters) -> jax.Array:  # Logits: (B, T-1, V).
+    def selected_loss(weights: training.LoRAParameters) -> jax.Array:  # Logits: (B, T-1, V).
         log_probs = training.token_log_probs(state, weights, batch, temperature=0.7)  # (B, T-1)
         return jnp.where(batch.loss_mask[:, 1:], log_probs, 0).sum()  # ()
 
-    def reference_loss(weights: Parameters) -> jax.Array:  # Logits: (B, T-1, V).
-        log_probs = jax.nn.log_softmax(weights["logits"] / 0.7)  # (B, T-1, V)
+    def reference_loss(weights: training.LoRAParameters) -> jax.Array:  # Logits: (B, T-1, V).
+        log_probs = jax.nn.log_softmax(weights["logits"].a / 0.7)  # (B, T-1, V)
         selected = jnp.take_along_axis(log_probs, batch.token_ids[:, 1:, None], axis=-1)[..., 0]  # (B, T-1)
         return jnp.where(batch.loss_mask[:, 1:], selected, 0).sum()  # ()
 
@@ -268,7 +277,7 @@ def test_token_log_probs_gradients_match_gather(state: training.LoRATrainState, 
     for value, reference in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         assert value.shape == reference.shape
         np.testing.assert_allclose(value, reference, atol=2e-6)
-    np.testing.assert_array_equal(actual[1]["logits"][~batch.loss_mask[:, 1:]], 0)
+    np.testing.assert_array_equal(actual[1]["logits"].a[~batch.loss_mask[:, 1:]], 0)
 
 
 def test_lora_initialization_and_optimizer_shapes(state: training.LoRATrainState) -> None:
@@ -284,9 +293,7 @@ def test_lora_initialization_and_optimizer_shapes(state: training.LoRATrainState
             "mlp.down_proj",
         )
     }
-    merged = state.merged_params()  # HF parameter shapes.
-    for name, weight in state.base_params.items():  # HF parameter shapes.
-        np.testing.assert_array_equal(merged[name], weight)
+    for weight in state.base_params.values():  # HF parameter shapes.
         assert weight.dtype == jnp.bfloat16
     adam = state.opt_state[1][0]
     for tree in (state.params, adam.mu, adam.nu):  # LoRA factor shapes.
@@ -302,7 +309,19 @@ def test_lora_initialization_and_optimizer_shapes(state: training.LoRATrainState
     )
 
 
-def test_lora_rank_one_merge_and_seed() -> None:
+def test_lora_initialization_keeps_fp32_with_x64_enabled() -> None:
+    name = "model.layers.0.self_attn.q_proj.weight"
+    with jax.enable_x64():
+        state = training.create_state(
+            Mock(), {name: jnp.ones((2, 3), dtype=jnp.bfloat16)}, training.Config(lora_rank=1)
+        )  # Base (O=2, I=3); A (1, I), B (O, 1).
+    assert state.step.dtype == jnp.int32
+    assert state.base_params[name].dtype == jnp.bfloat16
+    for tree in (state.params, state.opt_state[1][0].mu, state.opt_state[1][0].nu):
+        assert all(value.dtype == jnp.float32 for value in jax.tree.leaves(tree))
+
+
+def test_lora_rank_one_and_seed() -> None:
     name = "model.layers.0.self_attn.q_proj.weight"
     params = {name: jnp.ones((2, 3), dtype=jnp.bfloat16)}  # (O=2, I=3)
     config = training.Config(lora_rank=1, lora_alpha=3)
@@ -311,17 +330,14 @@ def test_lora_rank_one_merge_and_seed() -> None:
     np.testing.assert_array_equal(state.params[name].a, repeated.params[name].a)
     changed_seed = training.create_state(Mock(), params, replace(config, seed=2))
     assert not np.array_equal(state.params[name].a, changed_seed.params[name].a)
-    adapters = {
-        name: training.LoRAWeights(a=jnp.array([[1.0, 2.0, 3.0]]), b=jnp.array([[2.0], [4.0]])),
-    }  # (R=1, I=3), (O=2, R=1)
-    merged = jax.jit(state.merged_params)(adapters)  # (O, I) leaves.
-    assert merged[name].shape == (2, 3)
-    np.testing.assert_array_equal(merged[name], [[7.0, 13.0, 19.0], [13.0, 25.0, 37.0]])
+    assert state.params[name].a.shape == (1, 3)
+    assert state.params[name].b.shape == (2, 1)
+    assert state.lora_scale == 3
     np.testing.assert_array_equal(state.base_params[name], 1)
 
 
-@pytest.mark.parametrize("setting", [{"lora_rank": 0}, {"lora_alpha": 0}])
-def test_lora_config_rejects_nonpositive_settings(setting: dict[str, int]) -> None:
+@pytest.mark.parametrize("setting", [{"lora_rank": 0}, {"lora_rank": 513}, {"lora_alpha": 0}])
+def test_lora_config_rejects_invalid_settings(setting: dict[str, int]) -> None:
     with pytest.raises(ValueError, match="lora_"):
         training.Config(**setting)
 
@@ -350,7 +366,7 @@ def test_accumulated_update_matches_full_batch_and_improves_policy(
     assert float(metrics["train/skipped_update_fraction"]) == 0.0
     for name in metrics:
         np.testing.assert_allclose(metrics[name], full_metrics[name], atol=1e-6)
-    after = training.token_log_probs(accumulated, accumulated.merged_params(), batch, temperature=0.7)  # (B, T-1)
+    after = training.token_log_probs(accumulated, accumulated.params, batch, temperature=0.7)  # (B, T-1)
     loss, _ = training.objective(after, batch, clip_coef=0.2)
     assert float(loss) < float(metrics["train/policy_loss"])
     assert any(
@@ -572,7 +588,7 @@ def test_learner_optimizes_and_publishes_updated_adapters(
     groups = groups + [replace(groups[0], rollouts=list(reversed(groups[0].rollouts)))]
     batch = batcher.prepare_batch(groups, context_length=8)  # (B=4, T=8), (B,) leaves.
     old = training.token_log_probs(
-        learner.state, learner.state.merged_params(), jax.device_put(batch), temperature=0.7
+        learner.state, learner.state.params, jax.device_put(batch), temperature=0.7
     )  # (B, T-1)
     assert old.shape == (4, 7)
     assert old.dtype == jnp.float32

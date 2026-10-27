@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import time
 from collections.abc import Callable, Generator
@@ -167,8 +168,7 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
         raise ValueError("QWEN3_VLLM_CONTEXT_LENGTH must be a positive multiple of the training padding (256)")
     if real:
         source = Path(os.environ["QWEN3_CHECKPOINT"]).resolve()
-        model, variables = qwen3.load_qwen3_checkpoint(str(source), dtype="float32")
-        model = model.clone(dtype="bfloat16")
+        model, variables = qwen3.load_qwen3_checkpoint(str(source), dtype="bfloat16")
     else:
         source = directory / "model"
         source.mkdir(exist_ok=True)
@@ -199,7 +199,10 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
         )
         tokenizer = Tokenizer(WordLevel({f"t{i}": i for i in range(config.vocab_size)}, unk_token="t0"))
         PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="t0", eos_token="t2").save_pretrained(source)
-    port = training.get_open_port()
+    variables = jax.tree.map(lambda value: value.astype(jnp.bfloat16), variables)  # Frozen HF parameter shapes.
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
     url = f"http://127.0.0.1:{port}"
     popen = subprocess.Popen
     (directory / "metadata.json").write_text(
@@ -368,7 +371,7 @@ def test_published_rollout_parity(engine: Engine) -> None:
     # A visible update makes stale prefix-cache entries observable even in the tiny models.
     state = training.create_state(model, jax.tree.map(jnp.copy, master), training.Config(learning_rate=1e-4))
     for version in range(2):
-        params = state.merged_params()  # HF parameter shapes; version 1 contains a real LoRA update.
+        params = state.params  # FP32 adapter factors; version 1 contains a real LoRA update.
         engine.learner.state = state
         engine.learner.publish_weights()
         response = engine.http.post("/collective_rpc", json={"method": "weight_digests"})
@@ -527,7 +530,11 @@ def test_published_rollout_parity(engine: Engine) -> None:
                 assert actual.shape == (len(sequences), width - 1)
                 selected = actual[loss_mask[:, 1:]]  # (sampled tokens,)
                 logits = jax.jit(forward)(
-                    {"params": params}, tokens[:, :-1], attention_mask=attention[:, :-1]
+                    {"params": state.base_params},
+                    tokens[:, :-1],
+                    attention_mask=attention[:, :-1],
+                    lora=params,
+                    lora_scale=state.lora_scale,
                 ).logits  # (B, T-1, V)
                 distribution = jax.nn.log_softmax(logits / temperature, axis=-1)  # (B, T-1, V)
                 np.savez(
@@ -557,7 +564,9 @@ def test_published_rollout_parity(engine: Engine) -> None:
                 del logits, distribution  # Release vocabulary-sized buffers before the optimizer audit.
         # Exercise the exact differentiated/rematerialized training graph, whose
         # BF16 fusion can differ from a standalone inference forward.
-        published = jax.tree.map(lambda value: jnp.array(value, dtype=jnp.bfloat16, copy=True), params)  # HF shapes.
+        published = jax.tree.map(
+            lambda value: np.asarray(value).copy(), params
+        )  # Host (R, I), (O, R) factors survive donated state buffers.
         with jax.set_mesh(training.Mesh(devices=jax.devices(), axis_names=("batch",))):
             state, update_metrics = training.update(
                 state,
@@ -585,9 +594,9 @@ def test_published_rollout_parity(engine: Engine) -> None:
                 ):
                     np.testing.assert_allclose(optimizer_report[metric], report[key], rtol=1e-4, atol=1e-7)
         assert any(
-            not np.array_equal(np.asarray(published[name]), np.asarray(value.astype(jnp.bfloat16)))
-            for name, value in state.merged_params().items()
-        ), "The adapter update must change the merged BF16 policy"
+            not np.array_equal(before, np.asarray(after))
+            for before, after in zip(jax.tree.leaves(published), jax.tree.leaves(state.params), strict=True)
+        ), "The optimizer must update the adapter factors"
     # Preserve both publications' diagnostics even when the initial policy fails parity.
     for report in optimizer_reports:
         assert report["train/approx_kl"] < (0.0025 if engine.real else 0.0001), report

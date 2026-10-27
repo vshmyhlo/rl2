@@ -580,8 +580,9 @@ sudo bash infra/k3s/training/cleanup-build-cache.sh
 The script forwards `buildctl prune` options; add `--keep-duration 24h` to retain
 recent cache. Subsequent builds may take longer while rebuilding pruned layers.
 
-To also remove incomplete `*.orbax-checkpoint-tmp` directories on the training
-volume and the invoking user's Hugging Face download caches:
+To also prune unused Kubernetes images, remove incomplete
+`*.orbax-checkpoint-tmp` directories on the training volume, and clear the invoking
+user's Hugging Face download caches:
 
 ```bash
 bash infra/k3s/training/cleanup-disk.sh          # Preview only
@@ -593,6 +594,12 @@ cleanup while training Job pods are nonterminal; this check does not lock out
 new writers. By default, completed checkpoints and Hugging Face tokens are preserved.
 `HF_HOME` overrides the default Hugging Face cache location. Downloads and build
 cache will be recreated when needed.
+
+Apply refreshes training image pins through `rl2-image-pins.service`, then runs
+`k3s crictl rmi --prune`. Images referenced by containers or pinned for unfinished
+Jobs remain; containerd reclaims unreferenced image content and snapshots.
+Dry-run lists the image inventory and current pins, not an exact deletion list.
+This does not remove Jobs, containers, or persistent volumes.
 
 Optionally remove whole GRPO v2 runs, including completed checkpoints, after
 **7 days without modifications**:

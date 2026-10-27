@@ -17,12 +17,25 @@ from tokenizers import Tokenizer
 type Parameters = dict[str, jax.Array]
 type Variables = dict[str, Parameters]
 type LayerKV = tuple[jax.Array, jax.Array]  # Each (B, C, K, H).
-type LayerInputs = tuple[Parameters, LayerKV | None]
 type ResidualState = tuple[jax.Array, jax.Array]  # Each (B, T, D): branch output and stored residual.
 type AttentionBackend = Literal["xla", "tokamax", "cudnn"]
 DEFAULT_ATTENTION_BACKEND: AttentionBackend = "tokamax"
 # B: batch, T: input tokens, S: key slots, C: cache capacity, L: layers,
 # D: hidden size, H: head dimension, N: query heads, K: KV heads, V: vocabulary.
+
+
+class LoRAWeights(NamedTuple):
+    a: jax.Array  # (R, I) FP32 master weights.
+    b: jax.Array  # (O, R) FP32 master weights.
+
+
+LoRAParameters = dict[str, LoRAWeights]
+
+
+class LayerInputs(NamedTuple):
+    weights: Parameters  # Per-layer HF parameter shapes.
+    adapters: LoRAParameters  # (R, I), (O, R) leaves.
+    cache: LayerKV | None  # Optional pair of (B, C, K, H) arrays.
 
 
 @dataclass(frozen=True)
@@ -126,6 +139,8 @@ def _linear(
     dtype: jax.typing.DTypeLike,
     *,
     output_dtype: jax.typing.DTypeLike | None = None,
+    adapter: LoRAWeights | None = None,  # (R, I), (O, R).
+    lora_scale: float = 1.0,
 ) -> jax.Array:  # (..., O)
     # HIGHEST alone permits shape-dependent BF16 partial reductions in CUDA GEMMs.
     # Keep FP32 outputs on HIGHEST to preserve FP32 cotangents during backward.
@@ -135,11 +150,21 @@ def _linear(
         if jnp.dtype(dtype) == result_dtype == jnp.bfloat16
         else jax.lax.Precision.HIGHEST
     )
-    return jnp.matmul(
+    output = jnp.matmul(
         _compute_cast(inputs, dtype),
         _compute_cast(weight, dtype).T,
         precision=precision,
         preferred_element_type=output_dtype,
+    )  # (..., O)
+    if adapter is None:
+        return output  # (..., O)
+    # vLLM casts factors before folding alpha/r into B, then rounds B again.
+    scaled_b = _compute_cast(_compute_cast(adapter.b, dtype).astype(jnp.float32) * lora_scale, dtype)  # (O, R)
+    hidden = _linear(inputs, adapter.a, dtype)  # (..., R); shrink buffer rounds before expand.
+    delta = _linear(hidden, scaled_b, dtype)  # (..., O); expand rounds before adding the base output.
+    return _compute_cast(
+        _compute_cast(output, result_dtype).astype(jnp.float32) + _compute_cast(delta, dtype).astype(jnp.float32),
+        result_dtype,
     )  # (..., O)
 
 
@@ -279,6 +304,8 @@ class Qwen3LM(nn.Module):
         position_ids: jax.Array | None = None,  # (B, T)
         cache: Qwen3Cache | None = None,
         logits_to_keep: int = 0,
+        lora: LoRAParameters | None = None,  # (R, I), (O, R) leaves keyed by full HF projection names.
+        lora_scale: float = 1.0,
     ) -> Qwen3Output:
         """Return logits and optional updated cache; compatible with jit and grad.
 
@@ -286,6 +313,8 @@ class Qwen3LM(nn.Module):
         attention_mask: (B, T) valid input tokens, including during cached calls.
         position_ids: (B, T) RoPE positions; defaults to cumulative non-padding positions.
         logits_to_keep: Static trailing output width; zero returns all input logits.
+        lora: (R, I), (O, R) factors per projection; scanned layers require matching adapter structures.
+        lora_scale: Alpha divided by rank, folded into the compute-dtype B factors.
         Cache calls append T physical slots; total appended width must fit capacity.
         """
         config = self.config
@@ -321,9 +350,6 @@ class Qwen3LM(nn.Module):
         x = _compute_cast(params["model.embed_tokens.weight"][tokens], self.dtype)  # (B, T, D)
         residual = jnp.zeros_like(x)  # (B, T, D)
 
-        def project(inputs: jax.Array, weight: jax.Array) -> jax.Array:  # (B, T, D), (N/K*H, D)
-            return _linear(inputs, weight, self.dtype).reshape(batch, width, -1, config.head_dim)  # (B, T, N/K, H)
-
         def rotate(projected: jax.Array) -> jax.Array:  # (B, T, N/K, H)
             return _rope(projected, position_ids, config.rope_theta)  # (B, T, N/K, H)
 
@@ -332,7 +358,17 @@ class Qwen3LM(nn.Module):
             inputs: LayerInputs,  # Per-layer parameter shapes and optional (B, C, K, H) KV leaves.
         ) -> tuple[ResidualState, LayerKV | None]:
             x, residual = state  # Each (B, T, D).
-            weights, layer_cache = inputs
+            weights, adapters, layer_cache = inputs
+
+            def linear(values: jax.Array, name: str) -> jax.Array:  # (B, T, I) -> (B, T, O)
+                return _linear(
+                    values, weights[name], self.dtype, adapter=adapters.get(name), lora_scale=lora_scale
+                )  # (B, T, O)
+
+            def project(name: str) -> jax.Array:  # (B, T, N/K, H)
+                return linear(normalized, f"self_attn.{name}_proj.weight").reshape(
+                    batch, width, -1, config.head_dim
+                )  # (B, T, N/K, H)
 
             def update(old: jax.Array, new: jax.Array) -> jax.Array:  # (B, C, K, H), (B, T, K, H)
                 return jax.lax.dynamic_update_slice(old, new, (0, offset, 0, 0))  # (B, C, K, H)
@@ -340,11 +376,7 @@ class Qwen3LM(nn.Module):
             normalized, residual = _add_rms_norm(
                 x, residual, weights["input_layernorm.weight"], config.rms_norm_eps
             )  # Each (B, T, D).
-            query, key, value = jax.tree.map(
-                project,
-                (normalized,) * 3,
-                tuple(weights[f"self_attn.{name}_proj.weight"] for name in ("q", "k", "v")),
-            )  # (B, T, N, H), (B, T, K, H), (B, T, K, H).
+            query, key, value = jax.tree.map(project, ("q", "k", "v"))  # (B, T, N, H), (B, T, K, H), (B, T, K, H).
             query = _rms_norm(query, weights["self_attn.q_norm.weight"], config.rms_norm_eps)  # (B, T, N, H)
             key = _rms_norm(key, weights["self_attn.k_norm.weight"], config.rms_norm_eps)  # (B, T, K, H)
             query, key = jax.tree.map(rotate, (query, key))  # (B, T, N/K, H)
@@ -355,39 +387,45 @@ class Qwen3LM(nn.Module):
             attended = _attention(
                 query, key, value, mask, self.attention_backend, is_causal=cache is None
             )  # (B, T, N, H)
-            x = _linear(attended.reshape(batch, width, -1), weights["self_attn.o_proj.weight"], self.dtype)  # (B, T, D)
+            x = linear(attended.reshape(batch, width, -1), "self_attn.o_proj.weight")  # (B, T, D)
             normalized, residual = _add_rms_norm(
                 x, residual, weights["post_attention_layernorm.weight"], config.rms_norm_eps
             )  # Each (B, T, D).
-            hidden = _silu(_linear(normalized, weights["mlp.gate_proj.weight"], self.dtype)) * _linear(
-                normalized, weights["mlp.up_proj.weight"], self.dtype
+            hidden = _silu(linear(normalized, "mlp.gate_proj.weight")) * linear(
+                normalized, "mlp.up_proj.weight"
             )  # (B, T, intermediate_size)
-            x = _linear(hidden, weights["mlp.down_proj.weight"], self.dtype)  # (B, T, D)
+            x = linear(hidden, "mlp.down_proj.weight")  # (B, T, D)
             return (x, residual), layer_cache  # Two (B, T, D) arrays; optional (B, C, K, H) KV leaves.
 
         layers = [
-            {
-                name.removeprefix(f"model.layers.{layer}."): weight
-                for name, weight in params.items()
-                if name.startswith(f"model.layers.{layer}.")
-            }
+            LayerInputs(
+                weights={
+                    name.removeprefix(f"model.layers.{layer}."): weight
+                    for name, weight in params.items()
+                    if name.startswith(f"model.layers.{layer}.")
+                },
+                adapters={
+                    name.removeprefix(f"model.layers.{layer}."): adapter
+                    for name, adapter in (lora or {}).items()
+                    if name.startswith(f"model.layers.{layer}.")
+                },
+                cache=None if cache is None else (cache.key[layer], cache.value[layer]),  # (B, C, K, H) leaves.
+            )
             for layer in range(config.num_hidden_layers)
-        ]  # Per-layer parameter shapes, without a layer axis.
+        ]  # Per-layer parameter, adapter, and optional cache shapes, without a layer axis.
         # Recompute layer activations during backward; cached decoding needs no rematerialization.
         if self.gradient_checkpointing and cache is None:
             decoder_layer = jax.checkpoint(decoder_layer)
         if self.scan_layers:
             stacked = jax.tree.map(lambda *weights: jnp.stack(weights), *layers)  # (L, *parameter shape) leaves.
-            kv = None if cache is None else (cache.key, cache.value)  # Optional (L, B, C, K, H) leaves.
             (x, residual), kv = jax.lax.scan(
-                decoder_layer, (x, residual), (stacked, kv)
+                decoder_layer, (x, residual), stacked
             )  # Two (B, T, D) arrays; optional (L, B, C, K, H) leaves.
         else:
             updated = []
-            for layer, weights in enumerate(layers):
-                layer_cache = None if cache is None else (cache.key[layer], cache.value[layer])  # (B, C, K, H) leaves.
+            for layer in layers:
                 (x, residual), layer_cache = decoder_layer(
-                    (x, residual), (weights, layer_cache)
+                    (x, residual), layer
                 )  # Two (B, T, D) arrays; optional (B, C, K, H) leaves.
                 updated.append(layer_cache)
             kv = jax.tree.map(lambda *values: jnp.stack(values), *updated)  # Optional (L, B, C, K, H) leaves.

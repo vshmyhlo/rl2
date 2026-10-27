@@ -4,6 +4,7 @@ set -euo pipefail
 usage() {
   echo "Usage: bash infra/k3s/training/cleanup-disk.sh [--dry-run | --apply] [--run-retention-days DAYS]"
   echo "Defaults to --dry-run. Stop local training/downloads and job submissions before --apply."
+  echo "Removes unused BuildKit cache and unpinned, unused Kubernetes images."
   echo "Run deletion is opt-in: --run-retention-days 7 removes GRPO v2 runs inactive for over 7 days."
 }
 
@@ -82,6 +83,15 @@ if [[ $mode == --apply ]]; then
   "${privileged[@]}" bash "$training_dir/cleanup-build-cache.sh"
 else
   "${privileged[@]}" buildctl --addr unix:///run/rl2-buildkit/buildkitd.sock du
+fi
+
+if [[ $mode == --apply ]]; then
+  echo "Refreshing training image pins and removing unused Kubernetes images:"
+  "${privileged[@]}" systemctl start rl2-image-pins.service
+  "${privileged[@]}" k3s crictl rmi --prune
+else
+  echo "Kubernetes image inventory (apply refreshes Job pins, then prunes unused, unpinned images):"
+  "${privileged[@]}" k3s crictl images --pinned
 fi
 
 # Check age before partial-checkpoint deletion changes directory timestamps.

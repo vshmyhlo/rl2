@@ -132,9 +132,12 @@ rollouts from eight to 32 tokens per turn and exposes an unchanged-policy ratio
 outside the GRPO clipping range. The earlier passing audit covered shorter decodes.
 
 The learner now keeps frozen base weights and FP32 LoRA factors, publishing only
-PEFT adapter files through vLLM's runtime reload API. vLLM uses native BF16 LoRA;
-the learner still merges adapters for forward computation. The historical merged-weight
-measurements below do not certify this native-LoRA path. Both models use BF16
+PEFT adapter files through vLLM's runtime reload API. Both sides now use separate
+BF16 base and LoRA branches. JAX follows vLLM 0.32's factor casting, B scaling,
+shrink rounding, and expand-before-add rounding, including inside the gradient graph.
+CPU tests cover these boundaries and all projection gradients. The historical
+merged-weight measurements below do not certify this native-LoRA path; rerun the
+GPU publication suite before claiming rollout log-probability parity. Both models use BF16
 transformer computation and **FP32 output logits**. `serve_vllm` sets `--hf-overrides '{"head_dtype":"float32"}'`; a separately
 launched vLLM server needs the same override.
 

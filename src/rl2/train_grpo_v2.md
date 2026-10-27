@@ -124,9 +124,13 @@ only FP32 LoRA factors on every attention and MLP projection are optimized.
 `lora_rank` defaults to 16 and `lora_alpha` to 32; the weight delta is
 `(lora_alpha / lora_rank) * B @ A`. A is randomly initialized and B starts at zero,
 so training starts from the base policy. Embeddings, normalization, and the output
-head stay frozen. The learner merges adapters for forward computation; vLLM applies
-native LoRA adapters. These paths can differ numerically, so native-LoRA
-log-probability parity must be validated with the GPU publication suite.
+head stay frozen. Both JAX and vLLM compute separate base and LoRA branches.
+The FP32 factors are cast to BF16; alpha/r is folded into BF16 B and rounded again.
+The shrink result and expanded delta each round to BF16 before the delta is added
+to the BF16 base output. JAX keeps these rounding boundaries in the gradient graph.
+FP32 master factors and Adam moments remain trainable; base weights remain BF16.
+Ranks from 1 through 512 are accepted, with vLLM capacity rounded up as needed.
+GPU log-probability parity still needs validation across the two backends.
 Optimizer state, gradients, log probabilities, and loss use FP32. Learner
 `attention_backend` accepts `tokamax` (default), `xla`, or `cudnn`; `scan_layers` and
 `gradient_checkpointing` default to true. These defaults match the standalone
@@ -166,6 +170,10 @@ queues new generation requests until resume and handles in-flight requests
 according to the selected pause mode. The actor awaits `/pause` with cache clearing,
 reloads the adapter, then calls `/resume`. Reload failures leave generation paused,
 propagate to the learner, and trigger training cleanup.
+`keep` retains KV caches computed with older weights: an in-flight request can mix
+old cached states with new adapter weights. vLLM ignores cache clearing in this mode.
+Use `wait` for a consistent adapter version within each generation request; a
+multi-turn rollout can still span updates.
 
 `ckpt_dir/checkpoints` stores Orbax checkpoints every `checkpoint_interval`
 iterations and at normal completion, retaining only the latest checkpoint.

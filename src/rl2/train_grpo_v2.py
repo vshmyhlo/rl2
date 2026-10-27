@@ -118,7 +118,15 @@ from rl2.alfworld_env import ALFWorldConfig, ALFWorldTask, load_alfworld_tasks
 from rl2.appworld_env import AppWorldConfig, AppWorldTask, load_appworld_tasks
 from rl2.configuration import BaseConfig, load_config
 from rl2.mlflow_logging import MLflowLogger
-from rl2.qwen3 import DEFAULT_ATTENTION_BACKEND, AttentionBackend, Parameters, Qwen3LM, load_qwen3_checkpoint
+from rl2.qwen3 import (
+    DEFAULT_ATTENTION_BACKEND,
+    AttentionBackend,
+    LoRAParameters,
+    LoRAWeights,
+    Parameters,
+    Qwen3LM,
+    load_qwen3_checkpoint,
+)
 from rl2.ray_timeline import record_timeline
 from rl2.tracing import flush_tracing, span, tracing_enabled
 
@@ -163,7 +171,7 @@ class Config(BaseConfig):
     environment_timeout: Annotated[float, Field(gt=0)] = 600
     temperature: Annotated[float, Field(ge=0.01, le=2.0)] = 1.0  # vLLM clamps smaller positive values to 0.01.
     learning_rate: Annotated[float, Field(gt=0)] = 1e-5
-    lora_rank: Annotated[int, Field(ge=1)] = 16
+    lora_rank: Annotated[int, Field(ge=1, le=512)] = 16
     lora_alpha: Annotated[float, Field(gt=0)] = 32.0
     clip_coef: Annotated[float, Field(gt=0, lt=1)] = 0.2
     max_grad_norm: Annotated[float, Field(gt=0)] = 1.0
@@ -192,29 +200,10 @@ class Config(BaseConfig):
 DEFAULT_CONFIG = Config()
 
 
-class LoRAWeights(NamedTuple):
-    a: jax.Array  # (R, I)
-    b: jax.Array  # (O, R)
-
-
-# Value aliases remain serializable when Ray loads this module as a script.
-LoRAParameters = dict[str, LoRAWeights]
-
-
 class LoRATrainState(TrainState):
     params: LoRAParameters  # Trainable (R, I) and (O, R) leaves.
     base_params: Parameters  # Frozen HF parameter shapes.
     lora_scale: float = struct.field(pytree_node=False)
-
-    def merged_params(self, adapters: LoRAParameters | None = None) -> Parameters:
-        """Return HF-shaped weights shared by learner computation and publication."""
-        adapters = self.params if adapters is None else adapters
-        params = dict(self.base_params)
-        for name, adapter in adapters.items():
-            params[name] = self.base_params[name].astype(jnp.float32) + self.lora_scale * jnp.matmul(
-                adapter.b, adapter.a, precision=jax.lax.Precision.HIGHEST
-            )  # (O, I)
-        return params
 
 
 @dataclass(frozen=True)
@@ -402,14 +391,18 @@ Metrics = dict[str, jax.Array]  # Scalar leaves.
 
 
 def token_log_probs(
-    state: TrainState,
-    params: Parameters,  # HF parameter shapes.
+    state: LoRATrainState,
+    params: LoRAParameters,  # (R, I), (O, R) adapter factors.
     batch: GRPOBatch[jax.Array],  # (B, T), (B,) leaves.
     temperature: float,
 ) -> jax.Array:  # (B, T-1)
     """(B, T-1) log-probabilities for tokens at positions 1 through T-1."""
     logits = state.apply_fn(
-        {"params": params}, batch.token_ids[:, :-1], attention_mask=batch.attention_mask[:, :-1]
+        {"params": state.base_params},
+        batch.token_ids[:, :-1],
+        attention_mask=batch.attention_mask[:, :-1],
+        lora=params,
+        lora_scale=state.lora_scale,
     ).logits  # (B, T-1, V)
     logits = logits.astype(jnp.float32) / temperature  # (B, T-1, V)
     # Fuse selection's backward pass with softmax instead of scattering into a full FP32 vocabulary buffer.
@@ -454,7 +447,11 @@ def create_state(
         output_size, input_size = weight.shape
         adapters[name] = LoRAWeights(
             a=jax.random.uniform(
-                adapter_key, (config.lora_rank, input_size), minval=-(input_size**-0.5), maxval=input_size**-0.5
+                adapter_key,
+                (config.lora_rank, input_size),
+                dtype=jnp.float32,
+                minval=-(input_size**-0.5),
+                maxval=input_size**-0.5,
             ),  # (R, I)
             b=jnp.zeros((output_size, config.lora_rank), dtype=jnp.float32),  # (O, R)
         )
@@ -511,9 +508,7 @@ def update(
             microbatch: GRPOBatch[jax.Array],  # (B/A, T), (B/A,) leaves.
         ) -> tuple[LoRAParameters, Metrics]:
             def loss_fn(params: LoRAParameters) -> tuple[jax.Array, Metrics]:  # LoRA leaves -> (), scalar metrics.
-                return objective(
-                    token_log_probs(state, state.merged_params(params), microbatch, temperature), microbatch, clip_coef
-                )
+                return objective(token_log_probs(state, params, microbatch, temperature), microbatch, clip_coef)
 
             (_, metrics), gradient = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
             return jax.tree.map(jnp.add, grads, gradient), metrics  # LoRA factor shapes; scalar metrics.

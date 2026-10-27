@@ -290,6 +290,8 @@ def test_cache_padding_and_causality(
     dtype: str,
     backend: AttentionBackend,
 ) -> None:
+    if backend == "tokamax" and jax.default_backend() != "gpu":
+        pytest.skip("Tokamax Triton attention requires a GPU")
     model = model.clone(dtype=dtype, attention_backend=backend)
     forward = jax.jit(model.apply)
     tokens = jnp.array([[0, 1, 4], [3, 2, 0]], jnp.int32)  # (B=2, T=3)
@@ -336,6 +338,8 @@ def test_tokamax_masked_gradients(
     params: Parameters,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if jax.default_backend() != "gpu":
+        pytest.skip("Tokamax Triton attention requires a GPU")
     attention = Mock(wraps=tokamax.dot_product_attention)
     monkeypatch.setattr(tokamax, "dot_product_attention", attention)
     tokens = jnp.array([[0, 0, 0], [0, 1, 4]], jnp.int32)  # (B=2, T=3)
@@ -454,7 +458,7 @@ def test_checkpoint_loading(model: Qwen3LM, params: Parameters, tmp_path: Path) 
         assert loaded[name].dtype == jnp.bfloat16
         np.testing.assert_array_equal(loaded[name], params[name].astype(jnp.bfloat16))
     tokens = jnp.array([[1, 4, 7], [3, 2, 6]], jnp.int32)  # (B=2, T=3)
-    output = jax.jit(loaded_model.apply)(variables, tokens)
+    output = jax.jit(loaded_model.clone(attention_backend="xla").apply)(variables, tokens)
     expected = jax.jit(model.clone(dtype="bfloat16").apply)({"params": params}, tokens).logits  # (B, T, V=13)
     assert output.logits.shape == (2, 3, 13)
     np.testing.assert_allclose(output.logits, expected, atol=0.02, rtol=0.02)

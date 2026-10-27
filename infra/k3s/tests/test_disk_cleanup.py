@@ -32,6 +32,12 @@ def cleanup_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         "k3s": """
 if [[ ${KUBE_FAIL:-0} == 1 ]]; then exit 9; fi
 case " $* " in
+  *" crictl images --pinned "*) echo 'image inventory'; echo 'images --pinned' >> "$IMAGE_LOG" ;;
+  *" crictl rmi --prune "*)
+    [[ $(cat "$IMAGE_LOG") == 'start rl2-image-pins.service' ]] || exit 8
+    echo 'rmi --prune' >> "$IMAGE_LOG"
+    exit "${PRUNE_EXIT:-0}"
+    ;;
   *" get pvc "*) echo pvc-test ;;
   *" get pv "*) echo "$RUNS_PATH" ;;
   *" get jobs "*) printf '%s' "$JOBS_JSON" ;;
@@ -43,6 +49,7 @@ case " $* " in
 esac
 """,
         "buildctl": 'echo "$*" >> "$BUILD_LOG"; exit "${BUILD_EXIT:-0}"',
+        "systemctl": 'echo "$*" > "$IMAGE_LOG"; exit "${PIN_EXIT:-0}"',
     }
     for name, body in commands.items():
         command = bin_dir / name
@@ -52,8 +59,9 @@ esac
     monkeypatch.setenv("HF_HOME", str(hf_home))
     monkeypatch.setenv("RUNS_PATH", str(runs))
     monkeypatch.setenv("BUILD_LOG", str(tmp_path / "build.log"))
+    monkeypatch.setenv("IMAGE_LOG", str(tmp_path / "image.log"))
     monkeypatch.setenv("JOBS_JSON", json.dumps({"items": []}))
-    for name in ("SUDO_USER", "ACTIVE_PODS", "KUBE_FAIL", "BUILD_EXIT"):
+    for name in ("SUDO_USER", "ACTIVE_PODS", "KUBE_FAIL", "BUILD_EXIT", "PIN_EXIT", "PRUNE_EXIT"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -72,6 +80,7 @@ def test_cleanup_apply(tmp_path: Path, cleanup_env: None) -> None:
     assert (runs / "external").is_symlink()
     assert sorted(path.name for path in (tmp_path / "huggingface").iterdir()) == ["stored_tokens", "token"]
     assert (tmp_path / "build.log").read_text().strip().endswith("prune --all")
+    assert (tmp_path / "image.log").read_text().splitlines() == ["start rl2-image-pins.service", "rmi --prune"]
     # Repeating cleanup with no remaining cache or partial checkpoints is harmless.
     assert run_cleanup("--apply").returncode == 0
 
@@ -81,8 +90,10 @@ def test_cleanup_defaults_to_preview(tmp_path: Path, cleanup_env: None) -> None:
     result = run_cleanup()
     assert result.returncode == 0, result.stderr
     assert "20.orbax-checkpoint-tmp" in result.stdout
-    assert before == sorted(path for path in tmp_path.rglob("*") if path.name != "build.log")
+    assert before == sorted(path for path in tmp_path.rglob("*") if path.name not in {"build.log", "image.log"})
     assert (tmp_path / "build.log").read_text().strip().endswith(" du")
+    assert (tmp_path / "image.log").read_text().splitlines() == ["images --pinned"]
+    assert "image inventory" in result.stdout
 
 
 @pytest.mark.parametrize("mode", ["disabled", "preview", "apply"])
@@ -161,8 +172,17 @@ def test_retention_rejects_invalid_age(tmp_path: Path, cleanup_env: None, value:
         ("KUBE_FAIL", "1"),
         ("RUNS_PATH", "/"),
         ("BUILD_EXIT", "7"),
+        ("PIN_EXIT", "7"),
+        ("PRUNE_EXIT", "7"),
     ],
-    ids=["active-training", "cluster-unavailable", "invalid-volume", "buildkit-failure"],
+    ids=[
+        "active-training",
+        "cluster-unavailable",
+        "invalid-volume",
+        "buildkit-failure",
+        "pin-failure",
+        "prune-failure",
+    ],
 )
 def test_cleanup_failure_preserves_files(
     tmp_path: Path, cleanup_env: None, monkeypatch: pytest.MonkeyPatch, variable: str, value: str
@@ -171,4 +191,6 @@ def test_cleanup_failure_preserves_files(
     monkeypatch.setenv(variable, value)
     result = run_cleanup("--apply")
     assert result.returncode != 0
-    assert before == sorted(path for path in tmp_path.rglob("*") if path.name != "build.log")
+    assert before == sorted(path for path in tmp_path.rglob("*") if path.name not in {"build.log", "image.log"})
+    if variable == "PIN_EXIT":
+        assert (tmp_path / "image.log").read_text().splitlines() == ["start rl2-image-pins.service"]
