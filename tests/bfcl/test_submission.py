@@ -22,7 +22,7 @@ def test_bfcl_job_build_and_submit() -> None:
     assert container["command"] == command
     assert len(pod["containers"]) == 1
     assert "initContainers" not in pod
-    assert container["resources"]["requests"] == {"cpu": "4", "memory": "32Gi", "nvidia.com/gpu": "1"}
+    assert container["resources"]["requests"] == {"cpu": "10", "memory": "32Gi", "nvidia.com/gpu": "1"}
     assert container["resources"]["limits"] == {"memory": "32Gi", "nvidia.com/gpu": "1"}
 
 

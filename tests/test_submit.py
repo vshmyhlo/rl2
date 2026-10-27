@@ -34,7 +34,7 @@ def test_default_gpu_job() -> None:
     assert "NVIDIA_VISIBLE_DEVICES" not in env  # The device plugin supplies the allocated GPU IDs.
     assert "CUDA_VISIBLE_DEVICES" not in env
     assert set(env["NVIDIA_DRIVER_CAPABILITIES"].split(",")) >= {"compute", "utility", "graphics"}
-    assert container["resources"]["requests"] == {"cpu": "4", "memory": "32Gi", "nvidia.com/gpu": "1"}
+    assert container["resources"]["requests"] == {"cpu": "10", "memory": "32Gi", "nvidia.com/gpu": "1"}
     assert container["resources"]["limits"] == {"memory": "32Gi", "nvidia.com/gpu": "1"}
     run_mount = next(mount for mount in container["volumeMounts"] if mount["mountPath"] == "/runs")
     run_volume = next(volume for volume in pod["volumes"] if volume["name"] == run_mount["name"])
@@ -120,7 +120,7 @@ def test_build_and_submit_preserves_command(
             "--gpus",
             "2",
             "--cpus",
-            "10",
+            "4",
             "--memory-gib",
             "64",
             "--",
@@ -138,7 +138,7 @@ def test_build_and_submit_preserves_command(
     assert created["metadata"]["labels"]["kueue.x-k8s.io/priority-class"] == "train-high"
     container = created["spec"]["template"]["spec"]["containers"][0]
     assert container["command"] == ["uv", "run", "python", "train.py", "--label", "a b; $$(touch /tmp/unused)"]
-    assert container["resources"]["requests"]["cpu"] == "10"
+    assert container["resources"]["requests"]["cpu"] == "4"
     assert container["resources"]["limits"]["memory"] == "64Gi"
     assert container["resources"]["requests"]["nvidia.com/gpu"] == "2"
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "2"

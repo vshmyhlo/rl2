@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
-from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, closing
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, closing, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
+from os import devnull
 from os.path import expandvars
 from pathlib import Path
 from types import TracebackType
@@ -65,9 +66,15 @@ def load_environment_config(config_file: str) -> dict[str, Any]:
     return config
 
 
+def create_game_loader(config: dict[str, Any]) -> AlfredTWEnv:
+    # Upstream prints and tqdm bypass logging; construction runs in a synchronous Ray worker.
+    with open(devnull, "w") as output, redirect_stdout(output), redirect_stderr(output):
+        return AlfredTWEnv(config, train_eval="train")
+
+
 def discover_games(config_file: str) -> list[str]:
     config = load_environment_config(config_file)
-    return sorted(AlfredTWEnv(config, train_eval="train").game_files)
+    return sorted(create_game_loader(config).game_files)
 
 
 discover_games_remote = ray.remote(max_retries=0)(discover_games)
@@ -81,7 +88,7 @@ class ALFWorld:
             raise ValueError("ALFWorld task is outside the training split")
         # Keep upstream validation, but scan only this episode's directory.
         config["dataset"]["data_path"] = str(game.parent)
-        self.loader = AlfredTWEnv(config, train_eval="train")
+        self.loader = create_game_loader(config)
         if str(game) not in self.loader.game_files:
             raise ValueError("ALFWorld task is not an eligible training game")
         self.loader.game_files = [str(game)]

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -68,17 +69,42 @@ def test_episode_reset_step_and_cleanup(config_file: Path, monkeypatch: pytest.M
     assert upstream.close.call_count == 3
 
 
-def test_episode_loads_only_selected_game(config_file: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_episode_loads_only_selected_game(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     root = config_file.parent / "games"
     first = write_game(root / "train-a")
     second = write_game(root / "train-b")
     assert env.discover_games(str(config_file)) == [str(first), str(second)]
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
     # Loading the selected episode must not read a sibling's metadata again.
     (second.parent / "traj_data.json").write_text("invalid JSON")
     monkeypatch.chdir(config_file.parent.parent)
     with closing(env.ALFWorld(config_file=str(config_file), task_id=str(first))) as environment:
         assert environment.loader.game_files == [str(first)]
         assert environment.loader.num_games == 1
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+    print("training progress")
+    print("training diagnostic", file=sys.stderr)
+    captured = capsys.readouterr()
+    assert captured.out == "training progress\n"
+    assert captured.err == "training diagnostic\n"
+
+
+def test_discovery_failure_restores_output(config_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    game = write_game(config_file.parent / "games" / "train-a")
+    (game.parent / "traj_data.json").write_text("invalid JSON")
+    with pytest.raises(json.JSONDecodeError):
+        env.discover_games(str(config_file))
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+    print("training progress")
+    print("training diagnostic", file=sys.stderr)
+    captured = capsys.readouterr()
+    assert captured.out == "training progress\n"
+    assert captured.err == "training diagnostic\n"
 
 
 @pytest.mark.parametrize("reason", ["outside-root", "symlink", "unsolvable", "unsupported", "wrong-file"])

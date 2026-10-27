@@ -898,9 +898,10 @@ class Learner:
         )
 
     def publish_weights(self) -> None:
+        host_params = jax.device_get(self.state.params)  # Host (R, I) and (O, R) leaves.
         adapters = jax.tree.map(
-            lambda value: np.asarray(value.addressable_shards[0].data, dtype=np.float32), self.state.params
-        )  # Host (R, I) and (O, R) leaves, copied from one replica.
+            lambda value: np.asarray(value, dtype=np.float32), host_params
+        )  # Host (R, I) and (O, R) leaves.
         weights = {
             f"base_model.model.{name.removesuffix('.weight')}.lora_{factor}.weight": value
             for name, adapter in adapters.items()
