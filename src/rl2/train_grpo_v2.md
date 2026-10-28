@@ -157,7 +157,7 @@ with `load_inplace: true`. Rollout requests select that adapter; the base model 
 loaded once. A small server wrapper clears vLLM 0.32's persistent `load_inplace`
 flag after a successful load, preventing repeated adapter reads during decoding.
 The initial adapter is published before any rollouts. Later publications occur only
-when the optimizer step advances; iterations with all minibatches skipped report zero
+when the optimizer step advances; iterations with all minibatches skipped omit
 `learner/weight_transfer_seconds`. Each publication removes its
 temporary directory after the blocking weight update returns, including on failure.
 The single adapter stays in vLLM memory. Learner and server must share a local filesystem.
@@ -192,8 +192,9 @@ Local and `gs://` paths are supported.
 
 ## Logging and profiling
 
-Console logging defaults to INFO. The driver and workers use Ray's logging
-handlers and formatting; vLLM uses its default logging configuration with HTTP
+Console logging defaults to INFO. The driver and workers use standard Python logging
+with timestamp, severity, source location, and message, omitting Ray IDs
+and other metadata. vLLM uses its default logging configuration with HTTP
 access logs disabled. The rollout actor sets HTTPX logging to WARNING to suppress routine
 HTTP request messages while retaining warnings and errors. ALFWorld loader
 initialization output is suppressed on success and replayed on failure; output

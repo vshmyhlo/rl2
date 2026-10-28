@@ -1221,8 +1221,12 @@ def test_learner_logs_rollouts(
 
 
 def test_learner_skips_publication_without_updates(
-    learner: Any, monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
+    learner: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    spans: InMemorySpanExporter,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level("INFO", logger=training.__name__)
     learner.config = replace(learner.config, total_iterations=3)
     writer = MagicMock()
     writer.__enter__.return_value = writer
@@ -1259,7 +1263,11 @@ def test_learner_skips_publication_without_updates(
     assert [values["train/updates_total"] for values in metrics] == [0, 1, 1]
     assert [values["train/iterations_total"] for values in metrics] == [1, 2, 3]
     assert [values["train/rollouts_total"] for values in metrics] == [4, 8, 12]
-    assert [values["learner/weight_transfer_seconds"] for values in metrics] == [0.0, 1.0, 0.0]
+    assert "learner/weight_transfer_seconds" not in metrics[0]
+    assert metrics[1]["learner/weight_transfer_seconds"] == 1.0
+    assert "learner/weight_transfer_seconds" not in metrics[2]
+    messages = [message for message in caplog.messages if message.startswith("iteration=")]
+    assert ["weights=" in message for message in messages] == [False, True, False]
     assert len([item for item in spans.get_finished_spans() if item.name == "learner.publish_weights"]) == 1
     progress = training.save_checkpoint.call_args.args[1]
     assert progress.iteration == 3
@@ -1607,6 +1615,41 @@ def test_actor_prefetch_during_weight_update(
     assert client.is_closed
 
 
+def test_console_logging_omits_ray_metadata(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for name in ("", "ray"):
+        log = logging.getLogger(name)
+        monkeypatch.setattr(log, "handlers", [logging.StreamHandler()] if name else [])
+        monkeypatch.setattr(log, "level", logging.INFO)
+        monkeypatch.setattr(log, "propagate", False)
+    training.configure_console_logging()
+    metadata = {
+        "job_id": "job",
+        "worker_id": "worker",
+        "node_id": "node",
+        "actor_id": "actor",
+        "task_id": "task",
+        "task_name": "Learner.start",
+        "task_func_name": "train_grpo_v2.Learner.start",
+        "timestamp_ns": 123,
+    }
+    for name in ("rl2.train_grpo_v2", "ray"):
+        log = logging.getLogger(name)
+        log.info("iteration=%s reward=0.188", 107, extra=metadata)
+        try:
+            raise RuntimeError("training failed")
+        except RuntimeError:
+            log.exception("Learner failed", extra=metadata)
+    output = capsys.readouterr().err
+    assert output.count(" -- iteration=107 reward=0.188\n") == 2
+    assert "INFO test_train_grpo_v2.py:" in output
+    assert output.count(" -- Learner failed\nTraceback (most recent call last):") == 2
+    assert output.count("RuntimeError: training failed") == 2
+    for key in metadata:
+        assert f"{key}=" not in output
+
+
 @pytest.mark.parametrize(
     ("enable_dashboard", "enable_timeline", "enable_tracing", "fails", "close_fails"),
     [
@@ -1634,6 +1677,8 @@ def test_train_gracefully_terminates_actor(
         monkeypatch.setattr(log, "handlers", list(log.handlers))
         monkeypatch.setattr(log, "level", log.level)
         monkeypatch.setattr(log, "propagate", log.propagate)
+        for handler in log.handlers:
+            monkeypatch.setattr(handler, "formatter", handler.formatter)
     config = training.Config(
         ckpt_dir=str(tmp_path),
         padding_multiple=64,
@@ -1665,7 +1710,6 @@ def test_train_gracefully_terminates_actor(
 
     def initialize_ray(**kwargs: Any) -> MagicMock:
         assert os.environ["RAY_DASHBOARD_ENABLE_PROFILING"] == ("1" if enable_dashboard else "0")
-        kwargs["logging_config"]._apply()
         return training.ray.init.return_value
 
     monkeypatch.setattr(training.ray, "init", MagicMock(side_effect=initialize_ray))
@@ -1710,8 +1754,12 @@ def test_train_gracefully_terminates_actor(
     assert options["include_dashboard"] is enable_dashboard
     assert options["dashboard_host"] == ("0.0.0.0" if fails else "127.0.0.1")
     assert options["dashboard_port"] == 8265
-    assert options["logging_config"].log_level == "INFO"
-    assert options["runtime_env"] == {"env_vars": {"RAY_PROFILING": "1"} if enable_timeline else {}}
+    assert "logging_config" not in options
+    assert logging.getLogger().level == logging.INFO
+    assert options["runtime_env"] == {
+        "env_vars": {"RAY_PROFILING": "1"} if enable_timeline else {},
+        "worker_process_setup_hook": training.configure_console_logging,
+    }
     for name in ("vllm", "httpx", "httpcore", "openai._base_client"):
         log = logging.getLogger(name)
         monkeypatch.setattr(log, "level", logging.DEBUG)
@@ -1722,7 +1770,7 @@ def test_train_gracefully_terminates_actor(
         assert f"{name} diagnostic" in output
         assert f"{name}.child diagnostic" in output
     assert "Creating batcher, learner, and actor" in output
-    assert "timestamp_ns=" in output
+    assert "timestamp_ns=" not in output
     assert options["_system_config"] == {
         "enable_timeline": enable_timeline,
         "task_events_report_interval_ms": 1000,

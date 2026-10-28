@@ -6,7 +6,7 @@ according to weight_update_pause_mode.
 
 MLflow's metric step counts completed training iterations: one rollout batch,
 its optimizer updates, and publication of the updated weights. All metrics below
-are logged every iteration except startup scalars and checkpoint timing.
+are logged every iteration except startup scalars, weight-transfer timing, and checkpoint timing.
 
 Startup scalars (at the restored iteration, or step 0 for a new run):
     model/parameters_billions: Model parameter count in billions.
@@ -56,7 +56,7 @@ Timing and throughput (logged every iteration unless noted):
     batcher/prepare_batch_seconds: Wall time preparing the CPU training arrays without explicit synchronization.
     learner/batch_fetch_seconds: Wall time fetching the rollout batch, including generation, scoring, and Ray transfers.
     learner/update_seconds: Device transfer and optimizer update wall time.
-    learner/weight_transfer_seconds: Wall time exporting and reloading LoRA adapters in vLLM; zero if no updates occurred.
+    learner/weight_transfer_seconds: Wall time exporting and reloading LoRA adapters in vLLM; logged only on publication.
     learner/iteration_seconds: Batch fetching, optimization, and weight publication wall time.
     checkpoint/save_seconds: Checkpoint save wall time, including completion of writes; logged on saves.
     batcher/actor_transfer_seconds_mean: Mean group transfer latency from actor return to batcher receipt.
@@ -820,12 +820,13 @@ class Learner:
                         "learner/output_tokens_per_second": batch.num_output_tokens / seconds,
                         "learner/batch_fetch_seconds": fetched - started,
                         "learner/update_seconds": optimized - fetched,
-                        "learner/weight_transfer_seconds": now - optimized if weights_updated else 0.0,
                         "learner/iteration_seconds": now - started,
                     }
+                    if weights_updated:
+                        scalars["learner/weight_transfer_seconds"] = now - optimized
                     logger.info(
                         "iteration=%s reward=%.3f degenerate_group_fraction=%.3f batch=%.2fs "
-                        "group_transfer=%.6fs batch_transfer=%.6fs loss=%.4f update=%.2fs weights=%.2fs",
+                        "group_transfer=%.6fs batch_transfer=%.6fs loss=%.4f update=%.2fs%s",
                         iteration,
                         scalars["rollout/reward_mean"],
                         scalars["rollout/degenerate_group_fraction"],
@@ -834,7 +835,7 @@ class Learner:
                         scalars["learner/batcher_transfer_seconds"],
                         scalars["train/policy_loss"],
                         scalars["learner/update_seconds"],
-                        scalars["learner/weight_transfer_seconds"],
+                        f" weights={scalars['learner/weight_transfer_seconds']:.2f}s" if weights_updated else "",
                     )
                     if iteration % self.config.example_log_interval == 0:
                         with span("learner.log_examples"):
@@ -1058,7 +1059,15 @@ class Actor:
         return group
 
 
+def configure_console_logging() -> None:
+    log_format = "%(asctime)s\t%(levelname)s %(filename)s:%(lineno)d -- %(message)s"
+    logging.basicConfig(level=logging.INFO, format=log_format, force=True)
+    for handler in logging.getLogger("ray").handlers:
+        handler.setFormatter(logging.Formatter(log_format))
+
+
 def train(config: Config) -> None:
+    configure_console_logging()
     os.environ["RAY_AUTH_MODE"] = "disabled"
     os.environ["RAY_DASHBOARD_ENABLE_PROFILING"] = "1" if config.enable_ray_dashboard else "0"
     timeline_path = os.environ.get(
@@ -1072,9 +1081,9 @@ def train(config: Config) -> None:
             include_dashboard=config.enable_ray_dashboard,
             dashboard_host=os.environ.get("RL2_RAY_DASHBOARD_HOST", "127.0.0.1"),
             dashboard_port=8265,
-            logging_config=ray.LoggingConfig(log_level="INFO"),
             runtime_env={
                 "env_vars": {"RAY_PROFILING": "1"} if config.enable_ray_timeline else {},
+                "worker_process_setup_hook": configure_console_logging,
             },
             # Zero disables event reporting in Ray 2.59 despite the timeline docstring.
             _system_config={
