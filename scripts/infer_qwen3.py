@@ -14,7 +14,13 @@ from typing import Literal
 
 from tokenizers import Tokenizer
 
-from rl2.qwen3 import DEFAULT_ATTENTION_BACKEND, checkpoint_directory, generate_tokens, load_qwen3_checkpoint
+from rl2.qwen3 import (
+    ATTENTION_BACKENDS,
+    DEFAULT_ATTENTION_BACKEND,
+    checkpoint_directory,
+    generate_tokens,
+    load_qwen3_checkpoint,
+)
 from rl2.qwen3 import main as single_turn_main
 
 TOOL = {
@@ -94,7 +100,7 @@ def main() -> None:
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--revision")
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="bfloat16")
-    parser.add_argument("--attention-backend", choices=("xla", "tokamax", "cudnn"), default=DEFAULT_ATTENTION_BACKEND)
+    parser.add_argument("--attention-backend", choices=ATTENTION_BACKENDS, default=DEFAULT_ATTENTION_BACKEND)
     parser.add_argument("--max-new-tokens", type=int, default=1024, help="Token budget per assistant response")
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top-k", type=int, default=20)

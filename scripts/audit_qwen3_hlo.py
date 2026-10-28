@@ -17,14 +17,14 @@ from jax.sharding import PartitionSpec as P
 from jaxlib import xla_client
 from tokenizers import Tokenizer
 
-from rl2.qwen3 import Qwen3Config, Qwen3LM, Variables, load_qwen3_checkpoint
+from rl2.qwen3 import ATTENTION_BACKENDS, Qwen3Config, Qwen3LM, Variables, load_qwen3_checkpoint
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--attention-backend", choices=("xla", "tokamax", "cudnn"), default="xla")
+    parser.add_argument("--attention-backend", choices=ATTENTION_BACKENDS, default="xla")
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="bfloat16")
     parser.add_argument("--devices", type=int, default=2)
     parser.add_argument("--batch", type=int, default=2)

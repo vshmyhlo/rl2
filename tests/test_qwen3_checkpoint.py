@@ -225,7 +225,13 @@ def test_real_checkpoint(
 
 @pytest.mark.parametrize(
     "dtype,backend",
-    [("float32", "xla"), ("float32", "tokamax"), ("bfloat16", "xla"), ("bfloat16", "tokamax"), ("bfloat16", "cudnn")],
+    [
+        ("float32", "xla"),
+        ("float32", "tokamax"),
+        ("bfloat16", "xla"),
+        ("bfloat16", "tokamax"),
+        ("bfloat16", "cudnn"),
+    ],
 )
 def test_real_checkpoint_gradients(
     checkpoint: tuple[Qwen3LM, Variables], audit_directory: Path, dtype: str, backend: AttentionBackend

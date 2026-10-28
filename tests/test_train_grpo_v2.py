@@ -34,6 +34,7 @@ from ray import cloudpickle
 from rl2 import train_grpo_v2 as training
 from rl2.agent_task import Environment
 from rl2.alfworld_env import ALFWorldTask
+from rl2.qwen3 import ATTENTION_BACKENDS, AttentionBackend
 
 
 @pytest.fixture
@@ -55,6 +56,11 @@ def test_numerical_presets() -> None:
             assert values[name] == getattr(defaults, name), (preset.name, name)
         expected_backend = defaults.attention_backend if preset.name == "alfworld.yaml" else "tokamax"
         assert values["attention_backend"] == expected_backend, preset.name
+
+
+@pytest.mark.parametrize("backend", ATTENTION_BACKENDS)
+def test_attention_backend_config(backend: AttentionBackend) -> None:
+    assert training.Config(attention_backend=backend).attention_backend == backend
 
 
 def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -83,7 +89,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert config.prefetch_batches == 1
     assert config.temperature == defaults.temperature == 1.0
     assert config.run_id == (
-        f"grpo_v2_alfworld_Qwen_Qwen3-0.6B_{config.finetuning_mode}_s{config.seed}"
+        f"grpo_v2_alfworld_Qwen_Qwen3-0.6B_{config.finetuning_mode}_{config.attention_backend}_s{config.seed}"
         f"_ng{config.num_groups}_gs{config.group_size}"
         f"_mb{config.minibatches_per_epoch}_ddg{config.drop_degenerate_groups}_pf{config.prefetch_batches}"
         f"_lp{config.length_penalty_coef}"

@@ -4,7 +4,7 @@ import argparse
 import json
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal, NamedTuple, get_args
 
 import jax
 import jax.numpy as jnp
@@ -19,6 +19,7 @@ type Variables = dict[str, Parameters]
 type LayerKV = tuple[jax.Array, jax.Array]  # Each (B, C, K, H).
 type ResidualState = tuple[jax.Array, jax.Array]  # Each (B, T, D): branch output and stored residual.
 type AttentionBackend = Literal["xla", "tokamax", "cudnn"]
+ATTENTION_BACKENDS: tuple[AttentionBackend, ...] = get_args(AttentionBackend.__value__)
 DEFAULT_ATTENTION_BACKEND: AttentionBackend = "tokamax"
 # B: batch, T: input tokens, S: key slots, C: cache capacity, L: layers,
 # D: hidden size, H: head dimension, N: query heads, K: KV heads, V: vocabulary.
@@ -609,7 +610,7 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="bfloat16")
-    parser.add_argument("--attention-backend", choices=("xla", "tokamax", "cudnn"), default=DEFAULT_ATTENTION_BACKEND)
+    parser.add_argument("--attention-backend", choices=ATTENTION_BACKENDS, default=DEFAULT_ATTENTION_BACKEND)
     args = parser.parse_args()
     if args.max_new_tokens < 0 or not args.temperature >= 0 or args.top_k < 0:
         parser.error("--max-new-tokens, --temperature, and --top-k must be nonnegative")

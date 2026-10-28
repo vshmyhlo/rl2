@@ -19,6 +19,7 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 
 from rl2.qwen3 import (
+    ATTENTION_BACKENDS,
     AttentionBackend,
     Parameters,
     Qwen3Config,
@@ -384,7 +385,8 @@ def test_cudnn_attention(model: Qwen3LM, monkeypatch: pytest.MonkeyPatch, real_c
         *,
         mask: jax.Array,  # (B, 1, T, S)
         implementation: Literal["xla", "cudnn"],
-    ) -> jax.Array:
+        **kwargs: object,
+    ) -> jax.Array:  # (B, T, N, H)
         if implementation == "cudnn":
             assert query.dtype == key.dtype == value.dtype == jnp.bfloat16
             assert query.shape[1] % 2 == key.shape[1] % 2 == 0
@@ -392,7 +394,7 @@ def test_cudnn_attention(model: Qwen3LM, monkeypatch: pytest.MonkeyPatch, real_c
             calls.append((query.shape[1], key.shape[1]))
             if not real_cudnn:
                 implementation = "xla"
-        return original_attention(query, key, value, mask=mask, implementation=implementation)  # (B, T, N, H)
+        return original_attention(query, key, value, mask=mask, implementation=implementation, **kwargs)  # (B, T, N, H)
 
     monkeypatch.setattr(jax.nn, "dot_product_attention", attention)
     fused = model.clone(attention_backend="cudnn")
@@ -645,7 +647,7 @@ def test_capacity_validation(model: Qwen3LM, params: Parameters) -> None:
         model.apply({"params": params}, jnp.zeros((1, 0), jnp.int32))
 
 
-@pytest.mark.parametrize("backend,script", [("tokamax", False), ("cudnn", False), ("xla", True)])
+@pytest.mark.parametrize("backend,script", [(backend, backend == "xla") for backend in ATTENTION_BACKENDS])
 def test_cli(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

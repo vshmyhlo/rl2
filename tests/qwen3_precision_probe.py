@@ -23,7 +23,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
-    parser.add_argument("--attention-backend", choices=("xla", "tokamax", "cudnn"), default="xla")
+    parser.add_argument("--attention-backend", choices=qwen3.ATTENTION_BACKENDS, default="xla")
     args = parser.parse_args()
     assert jax.default_backend() == ("gpu" if args.device == "cuda" else "cpu")
     torch.set_num_threads(4)
