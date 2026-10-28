@@ -56,7 +56,7 @@ Timing and throughput (logged every iteration unless noted):
     batcher/prepare_batch_seconds: Wall time preparing the CPU training arrays without explicit synchronization.
     learner/batch_fetch_seconds: Wall time fetching the rollout batch, including generation, scoring, and Ray transfers.
     learner/update_seconds: Device transfer and optimizer update wall time.
-    learner/weight_transfer_seconds: Wall time exporting and reloading LoRA adapters in vLLM.
+    learner/weight_transfer_seconds: Wall time exporting and reloading LoRA adapters in vLLM; zero if no updates occurred.
     learner/iteration_seconds: Batch fetching, optimization, and weight publication wall time.
     checkpoint/save_seconds: Checkpoint save wall time, including completion of writes; logged on saves.
     batcher/actor_transfer_seconds_mean: Mean group transfer latency from actor return to batcher receipt.
@@ -86,7 +86,7 @@ from functools import partial
 from itertools import islice
 from pathlib import Path
 from statistics import mean, pstdev
-from tempfile import NamedTemporaryFile, TemporaryDirectory
+from tempfile import TemporaryDirectory
 from typing import Annotated, Any, Literal, NamedTuple, get_args
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -129,18 +129,6 @@ from rl2.ray_timeline import record_timeline
 from rl2.tracing import flush_tracing, span, tracing_enabled
 
 logger = logging.getLogger("rl2.train_grpo_v2")
-BLOCKED_LOGGERS = ("vllm", "httpx", "httpcore")
-VLLM_LOGGING_CONFIG = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {"console": {"format": "%(asctime)s %(levelname)s %(name)s: %(message)s"}},
-    "handlers": {
-        "console": {"class": "logging.StreamHandler", "formatter": "console", "level": "INFO"},
-        "discard": {"class": "logging.NullHandler"},
-    },
-    "root": {"handlers": ["console"], "level": "INFO"},
-    "loggers": {name: {"handlers": ["discard"], "propagate": False} for name in BLOCKED_LOGGERS},
-}
 MODEL = "Qwen/Qwen3-0.6B"
 SERVER_URL = "http://127.0.0.1:8000"
 LORA_NAME = "training-policy"
@@ -576,50 +564,43 @@ def serve_vllm(model: str = MODEL, lora_rank: int = DEFAULT_CONFIG.lora_rank) ->
         raise ValueError(f"vLLM supports LoRA ranks up to {max(get_args(MaxLoRARanks))}")
     logger.info("Starting vLLM server for %s", model)
     # Inherit the GPU assigned to this actor through CUDA_VISIBLE_DEVICES.
-    with NamedTemporaryFile(mode="w", suffix=".json") as logging_file:
-        json.dump(VLLM_LOGGING_CONFIG, logging_file)
-        logging_file.flush()
-        with subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "rl2.vllm_support.server",
-                "--model",
-                model,
-                "--host",
-                os.environ.get("RL2_VLLM_HOST", "127.0.0.1"),
-                "--port",
-                "8000",
-                "--dtype",
-                "bfloat16",
-                "--hf-overrides",
-                '{"head_dtype":"float32"}',
-                "--generation-config",
-                "vllm",
-                "--logprobs-mode",
-                "processed_logprobs",
-                "--enable-lora",
-                "--max-lora-rank",
-                str(max_lora_rank),
-                "--lora-dtype",
-                "bfloat16",
-                "--disable-uvicorn-access-log",
-                "--uvicorn-log-level",
-                "warning",
-            ],
-            env={
-                **os.environ,
-                "VLLM_SERVER_DEV_MODE": "1",
-                "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
-                "VLLM_CONFIGURE_LOGGING": "1",
-                "VLLM_LOGGING_CONFIG_PATH": logging_file.name,
-            },
-        ) as server:
-            try:
-                yield server
-            finally:
-                logger.info("Stopping vLLM server: pid=%s", server.pid)
-                server.terminate()
+    with subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "rl2.vllm_support.server",
+            "--model",
+            model,
+            "--host",
+            os.environ.get("RL2_VLLM_HOST", "127.0.0.1"),
+            "--port",
+            "8000",
+            "--disable-uvicorn-access-log",
+            "--dtype",
+            "bfloat16",
+            "--hf-overrides",
+            '{"head_dtype":"float32"}',
+            "--generation-config",
+            "vllm",
+            "--logprobs-mode",
+            "processed_logprobs",
+            "--enable-lora",
+            "--max-lora-rank",
+            str(max_lora_rank),
+            "--lora-dtype",
+            "bfloat16",
+        ],
+        env={
+            **os.environ,
+            "VLLM_SERVER_DEV_MODE": "1",
+            "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
+        },
+    ) as server:
+        try:
+            yield server
+        finally:
+            logger.info("Stopping vLLM server: pid=%s", server.pid)
+            server.terminate()
     logger.info("vLLM server exited")
 
 
@@ -782,6 +763,7 @@ class Learner:
             )
             resources.callback(self.cancel_pending_batches)
             self.publish_weights()
+            total_updates = int(self.state.step)
             writer.log_metrics(
                 {
                     "model/parameters_billions": sum(p.size for p in jax.tree.leaves(self.state.base_params))
@@ -810,9 +792,13 @@ class Learner:
                     fetched = time.monotonic()
                     with span("learner.optimize"):
                         update_metrics = self.optimize(batch.training_batch)
+                    updated_step = int(self.state.step)
+                    weights_updated = updated_step != total_updates
+                    total_updates = updated_step
                     optimized = time.monotonic()
-                    with span("learner.publish_weights"):
-                        self.publish_weights()
+                    if weights_updated:
+                        with span("learner.publish_weights"):
+                            self.publish_weights()
                     now = time.monotonic()
                     num_rollouts = batch.training_batch.token_ids.shape[0]
                     total_rollouts += num_rollouts
@@ -826,7 +812,7 @@ class Learner:
                             for condition in get_args(StopCondition)
                         },
                         "train/iterations_total": iteration,
-                        "train/updates_total": int(self.state.step),
+                        "train/updates_total": total_updates,
                         "train/learning_rate": self.config.learning_rate,
                         "train/rollouts_total": total_rollouts,
                         "learner/iterations_per_second": 1 / seconds,
@@ -834,7 +820,7 @@ class Learner:
                         "learner/output_tokens_per_second": batch.num_output_tokens / seconds,
                         "learner/batch_fetch_seconds": fetched - started,
                         "learner/update_seconds": optimized - fetched,
-                        "learner/weight_transfer_seconds": now - optimized,
+                        "learner/weight_transfer_seconds": now - optimized if weights_updated else 0.0,
                         "learner/iteration_seconds": now - started,
                     }
                     logger.info(
@@ -887,9 +873,8 @@ class Learner:
                     include_examples=True,
                 )
             )
-        ready, pending = ray.wait(self._pending_batches, num_returns=1)
-        result = ray.get(ready[0])
-        self._pending_batches = pending
+        result = ray.get(self._pending_batches[0])
+        self._pending_batches.pop(0)
         seconds = time.monotonic() - result.ready_at
         batch = result.value
         return replace(
@@ -965,6 +950,7 @@ class Learner:
 @ray.remote(num_gpus=1, runtime_env={"env_vars": {"JAX_PLATFORMS": "cpu"}})
 class Actor:
     def __init__(self, config: Config = DEFAULT_CONFIG) -> None:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
         self.config = config
         self.rng = random.Random(config.seed)
         self._server = ExitStack()
@@ -1073,14 +1059,6 @@ class Actor:
 
 
 def train(config: Config) -> None:
-    # A local hook serializes by value without importing the trainer in environment workers.
-    def setup_logging() -> None:
-        for name in BLOCKED_LOGGERS:
-            blocked_logger = logging.getLogger(name)
-            blocked_logger.handlers = [logging.NullHandler()]
-            blocked_logger.propagate = False
-
-    setup_logging()
     os.environ["RAY_AUTH_MODE"] = "disabled"
     os.environ["RAY_DASHBOARD_ENABLE_PROFILING"] = "1" if config.enable_ray_dashboard else "0"
     timeline_path = os.environ.get(
@@ -1096,12 +1074,7 @@ def train(config: Config) -> None:
             dashboard_port=8265,
             logging_config=ray.LoggingConfig(log_level="INFO"),
             runtime_env={
-                "env_vars": {
-                    # Keep later vLLM imports from replacing the blacklist in workers.
-                    "VLLM_CONFIGURE_LOGGING": "0",
-                    **({"RAY_PROFILING": "1"} if config.enable_ray_timeline else {}),
-                },
-                "worker_process_setup_hook": setup_logging,
+                "env_vars": {"RAY_PROFILING": "1"} if config.enable_ray_timeline else {},
             },
             # Zero disables event reporting in Ray 2.59 despite the timeline docstring.
             _system_config={

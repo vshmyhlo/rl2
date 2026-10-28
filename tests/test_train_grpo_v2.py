@@ -36,50 +36,6 @@ from rl2 import train_grpo_v2 as training
 from rl2.agent_task import Environment
 
 
-def test_vllm_console_logging() -> None:
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import json, logging, logging.config, sys\n"
-                "logging.getLogger('vllm').addHandler(logging.StreamHandler())\n"
-                "logging.getLogger('vllm').propagate = False\n"
-                "logging.config.dictConfig(json.loads(sys.argv[1]))\n"
-                "logging.config.dictConfig(json.loads(sys.argv[1]))\n"
-                "logging.getLogger('rl2.train_grpo_v2').info('training progress')\n"
-                "logging.getLogger('httpx').info('request noise')\n"
-                "logging.getLogger('orbax.checkpoint').info('checkpoint progress')\n"
-                "logging.getLogger('ray').info('ray progress')\n"
-                "logging.getLogger('vllm').info('vllm noise')\n"
-                "logging.getLogger('httpx').warning('httpx warning noise')\n"
-                "logging.getLogger('httpcore.connection').error('httpcore error noise')\n"
-                "logging.getLogger('vllm.engine').critical('vllm critical noise')\n"
-                "logging.getLogger('other_library').warning('library warning')\n"
-                "logging.getLogger('ray').error('worker failure')\n"
-                "logging.getLogger('vllm').warning('server warning noise')\n"
-                "try:\n"
-                "    raise RuntimeError('rollout failed')\n"
-                "except RuntimeError:\n"
-                "    logging.getLogger('rl2.train_grpo_v2').exception('training failure')\n"
-            ),
-            json.dumps(training.VLLM_LOGGING_CONFIG),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert result.stderr.count("training progress") == 1
-    assert "noise" not in result.stderr
-    assert "checkpoint progress" in result.stderr
-    assert "ray progress" in result.stderr
-    assert "library warning" in result.stderr
-    assert "worker failure" in result.stderr
-    assert "training failure" in result.stderr
-    assert "Traceback (most recent call last)" in result.stderr
-    assert "RuntimeError: rollout failed" in result.stderr
-
-
 @pytest.fixture
 def spans(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
     exporter = InMemorySpanExporter()
@@ -296,6 +252,7 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
         "0.0.0.0" if failure == "pod-network" else "127.0.0.1",
         "--port",
         "8000",
+        "--disable-uvicorn-access-log",
         "--dtype",
         "bfloat16",
         "--hf-overrides",
@@ -309,9 +266,6 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
         "16",
         "--lora-dtype",
         "bfloat16",
-        "--disable-uvicorn-access-log",
-        "--uvicorn-log-level",
-        "warning",
     ]
     server = MagicMock()
     server.__enter__.return_value = server
@@ -322,7 +276,6 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
     server.__exit__.side_effect = exit_server
 
     def start_server(command: list[str], *, env: dict[str, str]) -> MagicMock:
-        assert json.loads(Path(env["VLLM_LOGGING_CONFIG_PATH"]).read_text()) == training.VLLM_LOGGING_CONFIG
         if failure == "launch":
             raise OSError("launch failed")
         return server
@@ -344,8 +297,11 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
     assert launch.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"] == "1"
     assert launch.call_args.kwargs["env"]["VLLM_SERVER_DEV_MODE"] == "1"
     assert launch.call_args.kwargs["env"]["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] == "True"
-    assert launch.call_args.kwargs["env"]["VLLM_CONFIGURE_LOGGING"] == "1"
-    assert not Path(launch.call_args.kwargs["env"]["VLLM_LOGGING_CONFIG_PATH"]).exists()
+    assert launch.call_args.kwargs["env"] == {
+        **os.environ,
+        "VLLM_SERVER_DEV_MODE": "1",
+        "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
+    }
     if failure == "launch":
         server.terminate.assert_not_called()
     else:
@@ -471,6 +427,32 @@ def task_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
             return_value=[training.ALFWorldTask(id=f"train/{index}", config_file="config.yaml") for index in range(2)]
         ),
     )
+
+
+@pytest.fixture(autouse=True)
+def httpx_logging(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(logging.getLogger("httpx"), "level", logging.INFO)
+
+
+def test_actor_suppresses_http_request_logs(actor: Any, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code=200)
+
+    async def request() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            response = await client.post(f"{training.SERVER_URL}/v1/completions")
+            assert response.status_code == 200
+
+    asyncio.run(request())
+    logging.getLogger("httpx").warning("HTTP warning")
+    logging.getLogger("httpx").error("HTTP error")
+    training.logger.info("Training progress")
+    assert "HTTP Request:" not in caplog.text
+    assert "HTTP warning" in caplog.text
+    assert "HTTP error" in caplog.text
+    assert "Training progress" in caplog.text
 
 
 @pytest.fixture
@@ -739,7 +721,7 @@ def test_learner_pulls_groups_through_batcher(
     [(0, 100, 9), (3, 100, 12), (3, 12, None)],
     ids=["disabled", "final-iteration", "checkpoint"],
 )
-def test_learner_prefetches_bounded_batches(
+def test_learner_prefetches_bounded_batches_in_order(
     learner: Any,
     prefetch_batches: int,
     checkpoint_interval: int,
@@ -766,17 +748,11 @@ def test_learner_prefetches_bounded_batches(
     ]
     submit = learner.batcher.fetch_next_batch.remote
     submit.side_effect = results
-    order = list(range(len(results)))
-    if prefetch_batches:
-        # The last submitted batch becomes ready before the oldest pending batch.
-        order.insert(0, order.pop(prefetch_batches))
-    ready_results = [results[index] for index in order]
-    ready = iter(ready_results)
 
     def wait_next(refs: list[Any], *, num_returns: int) -> tuple[list[Any], list[Any]]:
         assert num_returns == 1
-        result = next(ready)
-        return [result], [ref for ref in refs if ref is not result]
+        # Later submissions are ready first, but must not overtake the oldest.
+        return refs[-1:], refs[:-1]
 
     wait = Mock(side_effect=wait_next)
     monkeypatch.setattr(training.ray, "wait", wait)
@@ -786,23 +762,18 @@ def test_learner_prefetches_bounded_batches(
     monkeypatch.setattr(training.ray, "cancel", cancel)
 
     first = learner.fetch_next_batch(iteration=8)
-    assert first.examples == str(order[0])
+    assert first.examples == "0"
     assert submit.call_count == prefetch_batches + 1
-    get.assert_called_once_with(ready_results[0])
-    wait.assert_called_once_with(results[: prefetch_batches + 1], num_returns=1)
+    get.assert_called_once_with(results[0])
     second = learner.fetch_next_batch(iteration=9)
-    assert second.examples == str(order[1])
+    assert second.examples == "1"
     assert submit.call_count == prefetch_batches + 2
     for index in range(2, len(results)):
-        assert learner.fetch_next_batch(iteration=8 + index).examples == str(order[index])
+        assert learner.fetch_next_batch(iteration=8 + index).examples == str(index)
     assert submit.call_count == len(results)
     assert all(call.kwargs["include_examples"] for call in submit.call_args_list)
-    assert [call.args[0] for call in get.call_args_list] == ready_results
-    pending = results.copy()
-    pending.remove(ready_results[0])
-    for call, result in zip(wait.call_args_list[1:], ready_results[1:], strict=True):
-        assert call.args[0] == pending
-        pending.remove(result)
+    assert [call.args[0] for call in get.call_args_list] == results
+    wait.assert_not_called()
     learner.cancel_pending_batches()
     cancel.assert_not_called()
 
@@ -996,10 +967,6 @@ def learner(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(training, "save_checkpoint", Mock(return_value=0.5))
     monkeypatch.setattr(training.ray, "get", Mock())
 
-    def wait(refs: list[Any], *, num_returns: int) -> tuple[list[Any], list[Any]]:
-        return refs[:num_returns], refs[num_returns:]
-
-    monkeypatch.setattr(training.ray, "wait", wait)
     device = jax.devices("cpu")[0]
     params = {
         "model.layers.0.self_attn.q_proj.weight": jnp.ones((2, 3), dtype=jnp.bfloat16),  # (O, I)
@@ -1253,6 +1220,52 @@ def test_learner_logs_rollouts(
             assert item.parent.span_id in {iteration.context.span_id for iteration in iterations}
 
 
+def test_learner_skips_publication_without_updates(
+    learner: Any, monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
+) -> None:
+    learner.config = replace(learner.config, total_iterations=3)
+    writer = MagicMock()
+    writer.__enter__.return_value = writer
+    monkeypatch.setattr(training, "MLflowLogger", Mock(return_value=writer))
+    monkeypatch.setattr(training, "time", Mock(monotonic=Mock(side_effect=range(20))))
+    prepared = Mock(spec=training.GRPOBatch)
+    prepared.token_ids = Mock(shape=(4, 2))  # (B=4, T=2)
+    learner.fetch_next_batch = Mock(
+        return_value=training.RolloutBatch(
+            training_batch=prepared,
+            rollout_metrics={"rollout/reward_mean": 0.0, "rollout/degenerate_group_fraction": 1.0},
+            stop_counts={},
+            num_output_tokens=4,
+            examples="",
+            transfer_metrics={"batcher/actor_transfer_seconds_mean": 0.0, "learner/batcher_transfer_seconds": 0.0},
+        )
+    )
+    increments = iter((0, 1, 0))  # All skipped, partially skipped, then all skipped at a nonzero step.
+    published_steps: list[int] = []
+
+    def optimize(batch: training.GRPOBatch[np.ndarray]) -> dict[str, float]:  # (B, T), (B,) leaves.
+        learner.state = learner.state.replace(step=learner.state.step + next(increments))
+        return {"train/policy_loss": 0.0}
+
+    def publish() -> None:
+        published_steps.append(int(learner.state.step))
+
+    learner.optimize = optimize
+    learner.publish_weights = publish
+    learner.start()
+
+    assert published_steps == [0, 1]
+    metrics = [call.args[0] for call in writer.log_metrics.call_args_list[1:]]
+    assert [values["train/updates_total"] for values in metrics] == [0, 1, 1]
+    assert [values["train/iterations_total"] for values in metrics] == [1, 2, 3]
+    assert [values["train/rollouts_total"] for values in metrics] == [4, 8, 12]
+    assert [values["learner/weight_transfer_seconds"] for values in metrics] == [0.0, 1.0, 0.0]
+    assert len([item for item in spans.get_finished_spans() if item.name == "learner.publish_weights"]) == 1
+    progress = training.save_checkpoint.call_args.args[1]
+    assert progress.iteration == 3
+    assert int(progress.train_state.step) == 1
+
+
 def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     learner.config = replace(learner.config, total_iterations=3, checkpoint_interval=2, prefetch_batches=4)
     published_steps: list[int] = []
@@ -1399,19 +1412,7 @@ def test_learner_logs_examples_at_configured_interval(
         submitted.append(result)
         return result
 
-    # Logging steps 3 and 6 consume submissions 2 and 5, neither originally scheduled for examples.
-    completion_order = iter((3, 0, 1, 2, 6, 4, 5))
-
-    def wait(
-        refs: list[training.Transfer[training.RolloutBatch]], *, num_returns: int
-    ) -> tuple[list[training.Transfer[training.RolloutBatch]], list[training.Transfer[training.RolloutBatch]]]:
-        assert num_returns == 1
-        result = submitted[next(completion_order)]
-        assert any(ref is result for ref in refs)
-        return [result], [ref for ref in refs if ref is not result]
-
     learner.batcher.fetch_next_batch.remote.side_effect = fetch
-    monkeypatch.setattr(training.ray, "wait", wait)
     monkeypatch.setattr(training.ray, "get", lambda value: value)
     writer = MagicMock()
     writer.__enter__.return_value = writer
@@ -1427,7 +1428,7 @@ def test_learner_logs_examples_at_configured_interval(
     for step, call in zip((3, 6), artifacts, strict=True):
         text = call.args[0]
         assert text.startswith(f"Rollout examples | step {step}\n\n{'=' * 72}\n")
-        assert f"Example 1 | task=batch-{step - 1} | reward=1.000 | advantage=0.500" in text
+        assert f"Example 1 | task=batch-{step} | reward=1.000 | advantage=0.500" in text
         assert "Turns: 1 | Output tokens: 1 | Stop: max_turns" in text
         assert "Prompt:" not in text
         assert (
@@ -1628,7 +1629,7 @@ def test_train_gracefully_terminates_actor(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    for name in ("", "ray", *training.BLOCKED_LOGGERS):
+    for name in ("", "ray", "openai._base_client", "vllm", "httpx", "httpcore"):
         log = logging.getLogger(name)
         monkeypatch.setattr(log, "handlers", list(log.handlers))
         monkeypatch.setattr(log, "level", log.level)
@@ -1710,25 +1711,16 @@ def test_train_gracefully_terminates_actor(
     assert options["dashboard_host"] == ("0.0.0.0" if fails else "127.0.0.1")
     assert options["dashboard_port"] == 8265
     assert options["logging_config"].log_level == "INFO"
-    assert options["runtime_env"]["env_vars"] == {
-        "VLLM_CONFIGURE_LOGGING": "0",
-        **({"RAY_PROFILING": "1"} if enable_timeline else {}),
-    }
-    handlers = list(logging.getLogger().handlers)
-    ray_handlers = list(logging.getLogger("ray").handlers)
-    worker_setup = cloudpickle.loads(cloudpickle.dumps(options["runtime_env"]["worker_process_setup_hook"]))
-    worker_setup()
-    assert logging.getLogger().handlers == handlers
-    assert logging.getLogger("ray").handlers == ray_handlers
-    for name in training.BLOCKED_LOGGERS:
-        logging.getLogger(name).error("blacklisted parent")
-        logging.getLogger(f"{name}.child").critical("blacklisted child")
-    logging.getLogger("ray").info("ray progress")
-    logging.getLogger("other_library").info("library progress")
+    assert options["runtime_env"] == {"env_vars": {"RAY_PROFILING": "1"} if enable_timeline else {}}
+    for name in ("vllm", "httpx", "httpcore", "openai._base_client"):
+        log = logging.getLogger(name)
+        monkeypatch.setattr(log, "level", logging.DEBUG)
+        for source in (log, logging.getLogger(f"{name}.child")):
+            source.warning("%s diagnostic", source.name)
     output = capsys.readouterr().err
-    assert "blacklisted" not in output
-    assert "ray progress" in output
-    assert "library progress" in output
+    for name in ("vllm", "httpx", "httpcore", "openai._base_client"):
+        assert f"{name} diagnostic" in output
+        assert f"{name}.child diagnostic" in output
     assert "Creating batcher, learner, and actor" in output
     assert "timestamp_ns=" in output
     assert options["_system_config"] == {

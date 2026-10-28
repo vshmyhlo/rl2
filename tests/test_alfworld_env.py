@@ -77,7 +77,8 @@ def test_episode_loads_only_selected_game(
     second = write_game(root / "train-b")
     assert env.discover_games(str(config_file)) == [str(first), str(second)]
     captured = capsys.readouterr()
-    assert captured.out == captured.err == ""
+    assert not captured.out
+    assert not captured.err
     # Loading the selected episode must not read a sibling's metadata again.
     (second.parent / "traj_data.json").write_text("invalid JSON")
     monkeypatch.chdir(config_file.parent.parent)
@@ -85,7 +86,8 @@ def test_episode_loads_only_selected_game(
         assert environment.loader.game_files == [str(first)]
         assert environment.loader.num_games == 1
     captured = capsys.readouterr()
-    assert captured.out == captured.err == ""
+    assert not captured.out
+    assert not captured.err
     print("training progress")
     print("training diagnostic", file=sys.stderr)
     captured = capsys.readouterr()
@@ -93,13 +95,14 @@ def test_episode_loads_only_selected_game(
     assert captured.err == "training diagnostic\n"
 
 
-def test_discovery_failure_restores_output(config_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_discovery_failure_preserves_output(config_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
     game = write_game(config_file.parent / "games" / "train-a")
     (game.parent / "traj_data.json").write_text("invalid JSON")
     with pytest.raises(json.JSONDecodeError):
         env.discover_games(str(config_file))
     captured = capsys.readouterr()
-    assert captured.out == captured.err == ""
+    assert "Initializing AlfredTWEnv" in captured.out
+    assert captured.err
     print("training progress")
     print("training diagnostic", file=sys.stderr)
     captured = capsys.readouterr()

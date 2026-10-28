@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, closing, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
-from os import devnull
+from io import StringIO
 from os.path import expandvars
 from pathlib import Path
 from types import TracebackType
@@ -67,9 +68,15 @@ def load_environment_config(config_file: str) -> dict[str, Any]:
 
 
 def create_game_loader(config: dict[str, Any]) -> AlfredTWEnv:
-    # Upstream prints and tqdm bypass logging; construction runs in a synchronous Ray worker.
-    with open(devnull, "w") as output, redirect_stdout(output), redirect_stderr(output):
-        return AlfredTWEnv(config, train_eval="train")
+    # Initialization runs synchronously in a dedicated Ray worker.
+    with StringIO() as output, StringIO() as errors:
+        try:
+            with redirect_stdout(output), redirect_stderr(errors):
+                return AlfredTWEnv(config, train_eval="train")
+        except Exception:
+            print(output.getvalue(), end="", file=sys.stdout)
+            print(errors.getvalue(), end="", file=sys.stderr)
+            raise
 
 
 def discover_games(config_file: str) -> list[str]:

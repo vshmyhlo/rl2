@@ -156,12 +156,15 @@ BF16, and replaces the `training-policy` adapter through `/v1/load_lora_adapter`
 with `load_inplace: true`. Rollout requests select that adapter; the base model is
 loaded once. A small server wrapper clears vLLM 0.32's persistent `load_inplace`
 flag after a successful load, preventing repeated adapter reads during decoding.
-The initial adapter is published before any rollouts. Each publication removes its
+The initial adapter is published before any rollouts. Later publications occur only
+when the optimizer step advances; iterations with all minibatches skipped report zero
+`learner/weight_transfer_seconds`. Each publication removes its
 temporary directory after the blocking weight update returns, including on failure.
 The single adapter stays in vLLM memory. Learner and server must share a local filesystem.
 `prefetch_batches: N`
 (default 1) generates up to N batches ahead while the learner optimizes; each
-batch contains `num_groups` rollout groups. Prefetched rollouts can use older
+batch contains `num_groups` rollout groups. The learner consumes batches in
+submission order, waiting for the oldest pending batch. Prefetched rollouts can use older
 weights, and multi-turn rollouts can span weight updates. Set it to 0 to collect
 each batch after publishing the latest weights.
 `weight_update_pause_mode` accepts `wait` (default), `abort`, or `keep`, operating
@@ -189,13 +192,13 @@ Local and `gs://` paths are supported.
 
 ## Logging and profiling
 
-Console logging defaults to INFO, with `vllm`, `httpx`, and `httpcore` loggers
-and their descendants blocked at every level. The driver and workers use Ray's
-logging handlers and formatting. The vLLM subprocess uses the same blacklist
-with its own logging configuration. vLLM access logs are disabled; Prometheus
-metrics remain available. Other libraries' logs remain visible.
-Direct prints and native-library output are not filtered. Existing cluster jobs
-need a new image and resubmission to pick up logging changes.
+Console logging defaults to INFO. The driver and workers use Ray's logging
+handlers and formatting; vLLM uses its default logging configuration with HTTP
+access logs disabled. The rollout actor sets HTTPX logging to WARNING to suppress routine
+HTTP request messages while retaining warnings and errors. ALFWorld loader
+initialization output is suppressed on success and replayed on failure; output
+from environment steps remains enabled. Existing cluster jobs need a new image and
+resubmission to pick up logging changes.
 
 MLflow uses experiment `grpo_v2` and the standard tracking environment variables.
 The [module docstring](train_grpo_v2.py) defines metric names and aggregation.
