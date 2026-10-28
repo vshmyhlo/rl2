@@ -181,7 +181,8 @@ Each iteration makes `update_epochs` passes with `minibatches_per_epoch` optimiz
 minibatches per pass. `grad_accum_steps` splits each minibatch into microbatches.
 Minibatches with all-zero advantages skip forward/backward computation and preserve
 parameters, Adam state, and the optimizer step. `train/skipped_update_fraction` reports the
-skipped fraction; skipped minibatches contribute zero to the other optimization metrics.
+skipped fraction. Skipped minibatches contribute zero to policy loss and gradient norm.
+KL and clip fraction average only evaluated minibatches and are omitted when all updates are skipped.
 `minibatches_per_epoch * grad_accum_steps` must divide `num_groups * group_size`.
 The resulting microbatch size must also be divisible by `learner_gpus`.
 Shuffling uses the saved seed and optimizer step. The learner selects a context-managed
@@ -207,6 +208,7 @@ is awaited before the learner can reuse buffers. FP32 master weights stay in the
 learner and checkpoints. The NCCL group is closed when the learner exits.
 To check repeated NCCL publication on two GPUs, run
 `QWEN3_VLLM_TESTS=1 CUDA_VISIBLE_DEVICES=0 QWEN3_VLLM_DEVICE=1 uv run pytest tests/test_qwen3_vllm.py -k nccl_full_weight_publication`.
+The learner waits for the actor and vLLM to become ready before initializing its publisher.
 The initial weights are published before any rollouts. Later publications occur only
 when the optimizer step advances; iterations with all minibatches skipped omit
 `learner/weight_transfer_seconds`. Each LoRA publication removes its
@@ -219,7 +221,7 @@ Positive `prefetch_batches: N` generates up to N batches ahead while the learner
 batch contains `num_groups` rollout groups. The learner consumes batches in
 submission order, waiting for the oldest pending batch. Prefetched rollouts can use older
 weights, and multi-turn rollouts can span weight updates.
-`weight_update_pause_mode` accepts `wait` (default), `abort`, or `keep`, operating
+`weight_update_pause_mode` accepts `wait` (default) or `keep`, operating
 on individual generation requests. Groups can start during publication; vLLM
 queues new generation requests until resume and handles in-flight requests
 according to the selected pause mode. Publication awaits `/pause` with cache clearing,

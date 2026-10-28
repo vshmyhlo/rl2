@@ -2,6 +2,7 @@ import json
 from collections.abc import Generator
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
+from threading import Event
 from typing import Any, Literal
 from unittest.mock import Mock
 
@@ -38,7 +39,6 @@ def spans(monkeypatch: pytest.MonkeyPatch) -> Generator[InMemorySpanExporter]:
     "pause_mode,failure_path",
     [
         ("wait", None),
-        ("abort", None),
         ("keep", None),
         ("wait", "/pause"),
         ("wait", "/v1/load_lora_adapter"),
@@ -47,7 +47,7 @@ def spans(monkeypatch: pytest.MonkeyPatch) -> Generator[InMemorySpanExporter]:
     ],
 )
 def test_lora_publication(
-    pause_mode: Literal["wait", "abort", "keep"],
+    pause_mode: Literal["wait", "keep"],
     failure_path: str | None,
     monkeypatch: pytest.MonkeyPatch,
     spans: InMemorySpanExporter,
@@ -133,6 +133,7 @@ def test_lora_publication(
     assert all(request.method == "POST" for request in requests)
     assert all(not directory.exists() for directory in directories)
     assert client.is_closed
+
     factory.assert_called_once_with(base_url="http://vllm", timeout=600)
     finished = spans.get_finished_spans()
     parents = [item for item in finished if item.name == "learner.publish_weights"]
@@ -182,13 +183,26 @@ def test_weight_source_rejects_sharded_parameters_before_transfer() -> None:
 
 
 @pytest.mark.parametrize(
-    "pause_mode,failure",
-    [("wait", None), ("abort", None), ("keep", None), ("wait", "pause"), ("wait", "transfer"), ("wait", "resume")],
+    "pause_mode,failure,shutdown_failure",
+    [
+        ("wait", None, False),
+        ("keep", None, False),
+        ("wait", "pause", False),
+        ("wait", "transfer", False),
+        ("wait", "resume", False),
+        pytest.param("wait", "transfer", True, id="preserve-transfer-error"),
+        pytest.param("wait", None, True, id="propagate-shutdown-error"),
+    ],
 )
 def test_publisher_lifecycle(
-    pause_mode: Literal["wait", "abort", "keep"], failure: str | None, monkeypatch: pytest.MonkeyPatch
+    pause_mode: Literal["wait", "keep"],
+    failure: str | None,
+    shutdown_failure: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
+    transfer_error = RuntimeError("transfer failed")
+    shutdown_error = ConnectionError("worker shutdown failed")
 
     def respond(request: httpx.Request) -> httpx.Response:
         phase = request.url.path.removeprefix("/")
@@ -204,34 +218,42 @@ def test_publisher_lifecycle(
     monkeypatch.setattr(transfer.torch.cuda, "device", device)
     monkeypatch.setattr(transfer, "get_open_port", Mock(return_value=12345))
     sync_client = Mock()
-    sync_client.shutdown_weight_transfer_engine.side_effect = lambda: events.append("worker_shutdown")
+
+    def shutdown_worker() -> None:
+        events.append("worker_shutdown")
+        if shutdown_failure:
+            raise shutdown_error
+
+    sync_client.shutdown_weight_transfer_engine.side_effect = shutdown_worker
     sync_factory = Mock(return_value=sync_client)
     monkeypatch.setattr(transfer, "HTTPVLLMWeightSyncClient", sync_factory)
-    engine = Mock()
-    engine.shutdown.side_effect = lambda: events.append("trainer_shutdown")
+    communicator = Mock()
+    communicator.destroy.side_effect = lambda: events.append("trainer_shutdown")
 
     def send() -> None:
         events.append("transfer")
         if failure == "transfer":
-            raise RuntimeError("transfer failed")
+            raise transfer_error
 
-    engine.send_weights.side_effect = send
+    monkeypatch.setattr(transfer.NCCLTrainerWeightTransferEngine, "send_weights", Mock(side_effect=send))
+    engine_factory = Mock(wraps=transfer.NCCLTrainerWeightTransferEngine)
+    monkeypatch.setattr(transfer, "NCCLTrainerWeightTransferEngine", engine_factory)
     params = {"weight": jnp.ones((2, 3), dtype=jnp.float32)}  # (O=2, I=3)
 
-    def initialize(info: transfer.NCCLTrainerInitInfo, *, client: Any, source: transfer.JAXWeightSource) -> Mock:
+    def initialize(info: transfer.NCCLTrainerInitInfo) -> Mock:
         events.append("init")
-        assert client is sync_client
-        assert source.get_params() is params
         assert info.master_address == "127.0.0.1" and info.master_port == 12345
         assert info.rank == 0 and info.world_size == 2
         assert info.packed and info.packed_buffer_size_bytes == 64 * 1024 * 1024 and info.packed_num_buffers == 2
-        return engine
+        return communicator
 
     initialize_mock = Mock(side_effect=initialize)
-    monkeypatch.setattr(transfer.NCCLTrainerWeightTransferEngine, "trainer_init", initialize_mock)
-    expected_error = RuntimeError if failure == "transfer" else httpx.HTTPStatusError
+    monkeypatch.setattr(transfer.nccl_common, "trainer_init", initialize_mock)
+    expected_error = (
+        RuntimeError if failure == "transfer" else ConnectionError if shutdown_failure else httpx.HTTPStatusError
+    )
     with (
-        pytest.raises(expected_error) if failure else nullcontext(),
+        pytest.raises(expected_error) if failure or shutdown_failure else nullcontext() as caught,
         transfer.full_weight_publisher(
             lambda: params, server_url="http://vllm", device_index=1, pause_mode=pause_mode
         ) as publish,
@@ -243,8 +265,81 @@ def test_publisher_lifecycle(
         expected = expected[: expected.index(failure) + 1]
     else:
         expected += ["pause", "transfer", "resume"]
-    assert events == expected + ["worker_shutdown", "trainer_shutdown"]
+    assert events == expected + ["trainer_shutdown", "worker_shutdown"]
+    if failure == "transfer":
+        assert caught.value is transfer_error
+        if shutdown_failure:
+            assert any("worker shutdown failed" in note for note in caught.value.__notes__)
+    elif shutdown_failure:
+        assert caught.value is shutdown_error
     initialize_mock.assert_called_once()
+    engine_factory.assert_called_once()
+    assert engine_factory.call_args.kwargs["client"] is sync_client
+    assert engine_factory.call_args.kwargs["source"].get_params() is params
+    assert engine_factory.call_args.kwargs["packed"]
+    assert engine_factory.call_args.kwargs["packed_buffer_size_bytes"] == 64 * 1024 * 1024
+    assert engine_factory.call_args.kwargs["packed_num_buffers"] == 2
+    sync_client.init_weight_transfer_engine.assert_called_once_with(
+        {
+            "master_address": "127.0.0.1",
+            "master_port": 12345,
+            "rank_offset": 1,
+            "world_size": 2,
+            "packed": True,
+            "packed_buffer_size_bytes": 64 * 1024 * 1024,
+            "packed_num_buffers": 2,
+        }
+    )
     device.assert_called_once_with(1)
     sync_factory.assert_called_once_with(base_url="http://vllm", timeout=600)
+    assert client.is_closed
+
+
+@pytest.mark.parametrize("failure", ["trainer", "worker"])
+def test_publisher_cleans_up_failed_initialization(failure: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+    initialized = Event()
+    worker_started = Event()
+    worker_finished = Event()
+    initialization_error = RuntimeError(f"{failure} initialization failed")
+    client = httpx.Client(base_url="http://vllm")
+    monkeypatch.setattr(transfer.httpx, "Client", Mock(return_value=client))
+    monkeypatch.setattr(transfer.torch.cuda, "device", Mock(return_value=nullcontext()))
+    monkeypatch.setattr(transfer, "get_open_port", Mock(return_value=12345))
+    communicator = Mock()
+    communicator.destroy.side_effect = lambda: events.append("trainer_shutdown")
+
+    def initialize_trainer(info: transfer.NCCLTrainerInitInfo) -> Mock:
+        assert worker_started.wait(timeout=5)
+        if failure == "trainer":
+            raise initialization_error
+        initialized.set()
+        return communicator
+
+    def initialize_worker(info: dict[str, Any]) -> None:
+        worker_started.set()
+        assert initialized.wait(timeout=5)
+        worker_finished.set()
+        if failure == "worker":
+            raise initialization_error
+
+    def shutdown_worker() -> None:
+        events.append("worker_shutdown")
+        initialized.set()  # Release a worker still waiting for the failed local rendezvous.
+        raise ConnectionError("worker shutdown failed")
+
+    sync_client = Mock()
+    sync_client.init_weight_transfer_engine.side_effect = initialize_worker
+    sync_client.shutdown_weight_transfer_engine.side_effect = shutdown_worker
+    monkeypatch.setattr(transfer, "HTTPVLLMWeightSyncClient", Mock(return_value=sync_client))
+    monkeypatch.setattr(transfer.nccl_common, "trainer_init", initialize_trainer)
+    with (
+        pytest.raises(RuntimeError) as caught,
+        transfer.full_weight_publisher(dict, server_url="http://vllm", device_index=0, pause_mode="wait"),
+    ):
+        pytest.fail("Initialization should fail before yielding the publisher")
+    assert caught.value is initialization_error
+    assert worker_finished.wait(timeout=5)
+    assert events == (["trainer_shutdown", "worker_shutdown"] if failure == "worker" else ["worker_shutdown"])
+    assert any("worker shutdown failed" in note for note in caught.value.__notes__)
     assert client.is_closed

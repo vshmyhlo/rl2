@@ -90,10 +90,28 @@ copy of the model. Fresh initialization uses float32 parameters by default;
 weights use the requested `dtype`. For float32 master parameters with bfloat16
 computation, load with `dtype="float32"` then use `model.clone(dtype="bfloat16")`.
 The module supports `jax.grad`, Flax `TrainState`, composition, and serialization.
+Full-parameter training differentiates `variables["params"]`, including norms,
+embeddings, and the separate output head when present. Keep optimizer parameters
+in FP32 for BF16 computation; loading directly in BF16 does not create FP32 master weights.
+
+For LoRA training, pass `lora={name: LoRAWeights(a=..., b=...)}` and
+`lora_scale=alpha / rank` to `model.apply`. Targets are full HF names of decoder
+attention/MLP projections, with FP32 factors shaped `(R, I)` and `(O, R)` for a
+base weight shaped `(O, I)`. Unsupported targets and invalid factor shapes raise
+`ValueError`. Initialize A randomly and B to zero, then differentiate and optimize
+only the adapter dictionary, keeping base parameters outside the differentiated
+arguments. Supplying `lora` alone does not freeze the base weights. Embedding/head
+adapters, LoRA dropout, and DoRA are not implemented. BF16 adapters use separate
+shrink/expand operations; merging them into base weights changes rounding.
+
 Layers run through `jax.lax.scan` by default, including cached decoding, while
 preserving the flat parameter layout. Pass `scan_layers=False` to `Qwen3LM` or
 `load_qwen3_checkpoint` to unroll layers instead. Scanning also works with the
 default per-layer gradient checkpointing.
+Scanned LoRA layers must have identical target names (after removing layer prefixes)
+and factor shapes. Use `scan_layers=False` for adapters on selected layers or
+different ranks across layers. GRPO v2's `finetuning_mode: full` and `lora` paths
+manage the corresponding FP32 optimizer parameters automatically.
 `attention_mask` is a `(B, T)` validity mask for the current input chunk. Default
 RoPE positions count non-padding tokens; supply `(B, T)` `position_ids` to override.
 Cached calls append the whole physical chunk, including padding. Direct callers
@@ -115,7 +133,7 @@ alone introduces unnecessary attention all-gathers with this Tokamax version.
 Supported scope: dense, bias-free, full-attention Qwen3 with standard RoPE and
 SiLU, including tied or separate output embeddings. Scaled RoPE, sliding attention,
 MoE, and quantized checkpoints are unsupported.
-This module is standalone; it does not add a GRPO trainer configuration.
+See [GRPO v2](../src/rl2/train_grpo_v2.md) for the training integration.
 
 ## Tests
 

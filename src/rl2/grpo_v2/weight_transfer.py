@@ -2,10 +2,12 @@
 
 import json
 from collections.abc import Callable, Generator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import TracebackType
 from typing import Literal
 
 import httpx
@@ -13,9 +15,14 @@ import jax
 import numpy as np
 import torch
 from safetensors.numpy import save_file
+from vllm.distributed.weight_transfer import nccl_common
 from vllm.distributed.weight_transfer.base import ParamMeta, WeightSource
 from vllm.distributed.weight_transfer.clients import HTTPVLLMWeightSyncClient
-from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerInitInfo, NCCLTrainerWeightTransferEngine
+from vllm.distributed.weight_transfer.nccl_engine import (
+    NCCLTrainerInitInfo,
+    NCCLTrainerWeightTransferEngine,
+    NCCLWeightTransferInitInfo,
+)
 from vllm.utils.network_utils import get_open_port
 
 from rl2.qwen3 import LoRAParameters, Parameters
@@ -23,7 +30,7 @@ from rl2.tracing import span
 
 
 @contextmanager
-def paused_generation(client: httpx.Client, pause_mode: Literal["wait", "abort", "keep"]) -> Generator[None]:
+def paused_generation(client: httpx.Client, pause_mode: Literal["wait", "keep"]) -> Generator[None]:
     with span("learner.publish_weights.pause", {"mode": pause_mode}):
         response = client.post("/pause", params={"mode": pause_mode, "clear_cache": "true"})
         response.raise_for_status()
@@ -43,7 +50,7 @@ def lora_weight_publisher(
     adapter_name: str,
     lora_rank: int,
     lora_alpha: float,
-    pause_mode: Literal["wait", "abort", "keep"],
+    pause_mode: Literal["wait", "keep"],
 ) -> Generator[Callable[[], None]]:
     """Export the current adapters and retain their files until vLLM finishes loading."""
     with httpx.Client(base_url=server_url, timeout=600) as client:
@@ -113,7 +120,7 @@ def full_weight_publisher(
     *,
     server_url: str,
     device_index: int,
-    pause_mode: Literal["wait", "abort", "keep"],
+    pause_mode: Literal["wait", "keep"],
 ) -> Generator[Callable[[], None]]:
     """Keep one NCCL group alive across publications; HTTP carries only metadata."""
     with (
@@ -122,21 +129,56 @@ def full_weight_publisher(
         ExitStack() as resources,
     ):
         sync_client = HTTPVLLMWeightSyncClient(base_url=server_url, timeout=600)
-        engine = NCCLTrainerWeightTransferEngine.trainer_init(
-            NCCLTrainerInitInfo(
-                master_address="127.0.0.1",
-                master_port=get_open_port(),
-                world_size=2,  # One learner replica and the single vLLM worker.
-                rank=0,
-                packed=True,
-                packed_buffer_size_bytes=64 * 1024 * 1024,
-                packed_num_buffers=2,
-            ),
+        info = NCCLTrainerInitInfo(
+            master_address="127.0.0.1",
+            master_port=get_open_port(),
+            world_size=2,  # One learner replica and the single vLLM worker.
+            rank=0,
+            packed=True,
+            packed_buffer_size_bytes=64 * 1024 * 1024,
+            packed_num_buffers=2,
+        )
+        engine = NCCLTrainerWeightTransferEngine(
             client=sync_client,
             source=JAXWeightSource(get_params=get_params),
+            packed=info.packed,
+            packed_buffer_size_bytes=info.packed_buffer_size_bytes,
+            packed_num_buffers=info.packed_num_buffers,
         )
+
+        def shutdown_worker(
+            _exc_type: type[BaseException] | None, error: BaseException | None, _traceback: TracebackType | None
+        ) -> None:
+            try:
+                sync_client.shutdown_weight_transfer_engine()
+            except Exception as shutdown_error:
+                if error is None:
+                    raise
+                error.add_note(f"Worker weight-transfer shutdown failed: {shutdown_error!r}")
+
+        resources.push(shutdown_worker)
+        # Abort locally first so a worker blocked receiving weights can service shutdown.
         resources.callback(engine.shutdown)
-        resources.callback(sync_client.shutdown_weight_transfer_engine)
+
+        # Own the engine before rendezvous so partial initialization is cleaned up.
+        worker_info = NCCLWeightTransferInitInfo(
+            master_address=info.master_address,
+            master_port=info.master_port,
+            rank_offset=1,
+            world_size=info.world_size,
+            packed=info.packed,
+            packed_buffer_size_bytes=info.packed_buffer_size_bytes,
+            packed_num_buffers=info.packed_num_buffers,
+        )
+        with ExitStack() as pending:
+            executor = ThreadPoolExecutor(max_workers=1)
+            # A failed local rendezvous must reach cleanup before waiting on the worker.
+            pending.callback(executor.shutdown, wait=False)
+            future = executor.submit(
+                sync_client.init_weight_transfer_engine, nccl_common.worker_init_payload(worker_info)
+            )
+            engine.model_update_group = nccl_common.trainer_init(info)
+            future.result()
 
         def publish() -> None:
             with (

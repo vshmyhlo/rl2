@@ -395,9 +395,11 @@ def test_lora_requires_projection_weights() -> None:
 
 
 @pytest.mark.usefixtures("mesh_context")
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 def test_full_weight_update(
-    model: Qwen3LM, state: training.LoRATrainState, batch: training.GRPOBatch[jax.Array]
+    model: Qwen3LM, state: training.LoRATrainState, batch: training.GRPOBatch[jax.Array], dtype: str
 ) -> None:
+    model = model.clone(dtype=dtype)
     full = training.create_state(
         model, state.base_params, training.Config(finetuning_mode="full", learning_rate=0.01, max_grad_norm=0.1)
     )
@@ -410,7 +412,11 @@ def test_full_weight_update(
             assert value.dtype == jnp.float32
     old = training.token_log_probs(full, full.params, batch, temperature=0.7)  # (B=2, T-1=7)
     assert old.shape == (2, 7)
-    np.testing.assert_allclose(old, batch.old_log_probs[:, 1:], atol=1e-6)
+    expected = training.token_log_probs(
+        state.replace(apply_fn=model.apply), state.params, batch, temperature=0.7
+    )  # (B, T-1)
+    np.testing.assert_allclose(old, expected, atol=1e-6)
+    batch = batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))  # (B, T)
     updated, metrics = training.update(jax.tree.map(jnp.copy, full), batch, 2, 0.7, 0.2)
     assert int(updated.step) == 1
     assert float(metrics["train/gradient_norm"]) > 0
@@ -606,7 +612,12 @@ def test_learner_shuffles_each_epoch_and_averages_metrics(
         assert grad_accum_steps == 1
         assert jax.sharding.get_mesh() == learner.mesh
         observed.append(minibatch)
-        return current.replace(step=current.step + 1), {"train/policy_loss": jnp.asarray(current.step)}  # () metric.
+        return current.replace(step=current.step + 1), {
+            "train/policy_loss": jnp.asarray(current.step),  # ()
+            "train/skipped_update_fraction": jnp.asarray(0.0),  # ()
+            "train/approx_kl": jnp.asarray(0.0),  # ()
+            "train/clip_fraction": jnp.asarray(0.0),  # ()
+        }
 
     monkeypatch.setattr(training, "update", update)
     host_batch = jax.tree.map(np.asarray, batch)  # (B, T), (B,) leaves.
@@ -614,7 +625,12 @@ def test_learner_shuffles_each_epoch_and_averages_metrics(
         metrics = learner.optimize(host_batch)
     steps = epochs * minibatches
     assert int(learner.state.step) == steps
-    assert metrics == {"train/policy_loss": (steps - 1) / 2}
+    assert metrics == {
+        "train/policy_loss": (steps - 1) / 2,
+        "train/skipped_update_fraction": 0.0,
+        "train/approx_kl": 0.0,
+        "train/clip_fraction": 0.0,
+    }
     with jax.set_mesh(learner.mesh):
         learner.optimize(host_batch)
     orders: list[np.ndarray] = []  # Each epoch: (B,).
@@ -634,6 +650,62 @@ def test_learner_shuffles_each_epoch_and_averages_metrics(
         learner.optimize(host_batch)
     replay = jnp.concatenate([minibatch.advantages for minibatch in observed])  # (epochs * B,)
     np.testing.assert_array_equal(replay, np.concatenate(orders[:epochs]))
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param([None, None], id="all-skipped"),
+        pytest.param([None, 0.0], id="measured-zero"),
+        pytest.param([0.2, None, 0.4, None], id="mixed"),
+    ],
+)
+def test_learner_omits_unevaluated_policy_metrics(values: list[float | None], monkeypatch: pytest.MonkeyPatch) -> None:
+    learner = training.Learner.__ray_metadata__.modified_class(
+        batcher=Mock(), actor=Mock(), config=training.Config(minibatches_per_epoch=2, update_epochs=len(values) // 2)
+    )
+    learner.mesh = Mesh(devices=jax.devices()[:1], axis_names=("batch",))
+    learner.state = training.TrainState.create(
+        apply_fn=Mock(), params={"weight": jnp.zeros(())}, tx=optax.sgd(0.1)
+    )  # () parameter and optimizer step.
+    batch = training.GRPOBatch(
+        token_ids=np.ones((4, 2), dtype=np.int32),  # (B=4, T=2)
+        attention_mask=np.ones((4, 2), dtype=np.bool_),  # (B, T)
+        loss_mask=np.tile([False, True], (4, 1)),  # (B, T)
+        old_log_probs=np.zeros((4, 2), dtype=np.float32),  # (B, T)
+        advantages=np.ones(4, dtype=np.float32),  # (B,)
+    )
+    pending = iter(values)
+
+    def update(
+        current: training.TrainState,
+        minibatch: training.GRPOBatch[jax.Array],  # (B/2, T), (B/2,) leaves.
+        grad_accum_steps: int,
+        temperature: float,
+        clip_coef: float,
+    ) -> tuple[training.TrainState, training.Metrics]:
+        value = next(pending)
+        measured = 0.0 if value is None else value
+        return current.replace(step=current.step + (value is not None)), {
+            "train/policy_loss": jnp.asarray(-measured),  # ()
+            "train/gradient_norm": jnp.asarray(measured),  # ()
+            "train/approx_kl": jnp.asarray(measured),  # ()
+            "train/clip_fraction": jnp.asarray(measured),  # ()
+            "train/skipped_update_fraction": jnp.asarray(float(value is None)),  # ()
+        }
+
+    monkeypatch.setattr(training, "update", update)
+    with jax.set_mesh(learner.mesh):
+        metrics = learner.optimize(batch)
+    evaluated = [value for value in values if value is not None]
+    assert metrics["train/skipped_update_fraction"] == 1 - len(evaluated) / len(values)
+    assert metrics["train/policy_loss"] == pytest.approx(-sum(evaluated) / len(values))
+    assert metrics["train/gradient_norm"] == pytest.approx(sum(evaluated) / len(values))
+    for name in ("train/approx_kl", "train/clip_fraction"):
+        if evaluated:
+            assert metrics[name] == pytest.approx(sum(evaluated) / len(evaluated))
+        else:
+            assert name not in metrics
 
 
 def test_learner_rejects_indivisible_rollout_batch(state: training.LoRATrainState, batch: training.GRPOBatch) -> None:

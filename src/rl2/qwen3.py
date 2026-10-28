@@ -325,7 +325,7 @@ class Qwen3LM(nn.Module):
         attention_mask: (B, T) valid input tokens, including during cached calls.
         position_ids: (B, T) RoPE positions; defaults to cumulative non-padding positions.
         logits_to_keep: Static trailing output width; zero returns all input logits.
-        lora: (R, I), (O, R) factors per projection; scanned layers require matching adapter structures.
+        lora: (R, I), (O, R) factors for decoder projections only; scanned layers require matching structures.
         lora_scale: Alpha divided by rank, folded into the compute-dtype B factors.
         Cache calls append T physical slots; total appended width must fit capacity.
         """
@@ -336,6 +336,21 @@ class Qwen3LM(nn.Module):
         capacity = config.max_position_embeddings if cache is None else cache.valid.shape[1]
         if not 0 < width <= capacity:
             raise ValueError("Input width must be positive and fit the context/cache capacity")
+        shapes = config.parameter_shapes()
+        for name, adapter in (lora or {}).items():
+            if name not in shapes or not name.endswith("_proj.weight"):
+                raise ValueError(f"Unsupported LoRA target: {name}; expected a decoder attention or MLP projection")
+            output_size, input_size = shapes[name]
+            if (
+                adapter.a.ndim != 2
+                or adapter.a.shape[0] <= 0
+                or adapter.a.shape[1] != input_size
+                or adapter.b.shape != (output_size, adapter.a.shape[0])
+            ):
+                raise ValueError(
+                    f"Invalid LoRA factor shapes for {name}: {adapter.a.shape}, {adapter.b.shape}; "
+                    f"expected (R, {input_size}), ({output_size}, R) with R > 0"
+                )
         params = {
             name: self.param(
                 name,
@@ -343,7 +358,7 @@ class Qwen3LM(nn.Module):
                 shape,
                 self.param_dtype,
             )
-            for name, shape in config.parameter_shapes().items()
+            for name, shape in shapes.items()
         }  # Each leaf has its shape from parameter_shapes().
         if attention_mask is None:
             attention_mask = jnp.ones(tokens.shape, jnp.bool_)  # (B, T)

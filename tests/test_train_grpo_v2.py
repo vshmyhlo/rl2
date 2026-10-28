@@ -193,7 +193,8 @@ def test_reasoning_gym_preset_cli_and_actor_task_stream(monkeypatch: pytest.Monk
     reference = training.load_config(preset.with_name("alfworld.yaml"), training.Config)
     assert config.attention_backend == "tokamax"
     assert config.prefetch_batches == 1
-    task_specific = {"taskset", "run_id", "ckpt_dir", "attention_backend", "prefetch_batches"}
+    assert config.finetuning_mode == "lora"
+    task_specific = {"taskset", "run_id", "ckpt_dir", "attention_backend", "prefetch_batches", "finetuning_mode"}
     assert {name: value for name, value in asdict(config).items() if name not in task_specific} == {
         name: value for name, value in asdict(reference).items() if name not in task_specific
     }
@@ -268,6 +269,7 @@ def test_reasoning_gym_preset_cli_and_actor_task_stream(monkeypatch: pytest.Monk
         {"update_epochs": 0},
         {"attention_backend": "unknown"},
         {"weight_update_pause_mode": "unknown"},
+        pytest.param({"weight_update_pause_mode": "abort"}, id="removed-abort-mode"),
         {"taskset": "unknown"},
     ],
 )
@@ -684,6 +686,7 @@ def test_actor_server_lifetime(
         asyncio.run(actor.aclose())
     else:
         actor = training.Actor.__ray_metadata__.modified_class(config=config)
+        assert actor.ready() is None
         actor.collect_group = AsyncMock(return_value=group)
         monkeypatch.setattr(actor.rng, "choice", Mock(return_value=task_discovery[0]))
         for _ in range(2):
@@ -1104,6 +1107,34 @@ def test_learner_initializes_replicated_state(learner: Any, monkeypatch: pytest.
     for value in jax.tree.leaves(learner.state):  # HF/LoRA parameter shapes and scalar optimizer counters.
         assert value.sharding.is_fully_replicated
         assert value.devices() == set(devices)
+
+
+@pytest.mark.parametrize("mode", ["lora", "full"])
+def test_learner_waits_for_actor_before_publisher_setup(
+    learner: Any, monkeypatch: pytest.MonkeyPatch, mode: Literal["lora", "full"]
+) -> None:
+    learner.config = replace(learner.config, finetuning_mode=mode)
+    monkeypatch.setattr(training, "MLflowLogger", MagicMock())
+
+    def enter(_context: MagicMock) -> None:
+        learner.actor.ready.remote.assert_called_once_with()
+        training.ray.get.assert_called_once_with(learner.actor.ready.remote.return_value)
+        raise RuntimeError("publisher reached")
+
+    publisher = getattr(training, f"{mode}_weight_publisher")
+    publisher.return_value.__enter__.side_effect = enter
+    with pytest.raises(RuntimeError, match="publisher reached"):
+        learner.start()
+
+
+def test_learner_propagates_actor_startup_failure(learner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(training, "MLflowLogger", MagicMock())
+    monkeypatch.setattr(training.ray, "cancel", Mock())
+    training.ray.get.side_effect = RuntimeError("actor startup failed")
+    with pytest.raises(RuntimeError, match="actor startup failed"):
+        learner.start()
+    training.lora_weight_publisher.assert_not_called()
+    training.full_weight_publisher.assert_not_called()
 
 
 @pytest.mark.parametrize(

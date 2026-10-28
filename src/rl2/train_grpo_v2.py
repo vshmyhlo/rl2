@@ -6,7 +6,8 @@ according to weight_update_pause_mode.
 
 MLflow's metric step counts completed training iterations: one rollout batch,
 its optimizer updates, and publication of the updated weights. All metrics below
-are logged every iteration except startup scalars, weight-transfer timing, and checkpoint timing.
+are logged every iteration except startup scalars, weight-transfer timing, checkpoint timing,
+and unevaluated policy diagnostics.
 
 Startup scalars (at the restored iteration, or step 0 for a new run):
     model/parameters_billions: Model parameter count in billions.
@@ -20,7 +21,8 @@ Optimization scalars (averaged over minibatches and update epochs):
     train/gradient_norm: Global trainable-parameter gradient norm after microbatch averaging, before clipping.
     train/skipped_update_fraction: Fraction of optimizer minibatches skipped because all advantages are zero.
 Loss, KL, and clip fraction average sampled tokens within each rollout, then rollouts.
-Skipped minibatches contribute zero to loss, KL, clip fraction, and gradient norm metrics.
+Skipped minibatches contribute zero to loss and gradient norm metrics.
+KL and clip fraction average only evaluated minibatches and are omitted when all updates are skipped.
 
 Rollout batch scalars:
     rollout/reward_mean: Mean raw rollout reward.
@@ -171,9 +173,8 @@ class Config(BaseConfig):
     enable_tracing: bool = True
     # In-flight vLLM requests during weight updates (individual requests, not multi-turn rollout groups):
     # wait: finish requests before applying weights (default).
-    # abort: cancel requests before applying weights.
     # keep: freeze requests, then resume them after applying weights.
-    weight_update_pause_mode: Literal["wait", "abort", "keep"] = "wait"
+    weight_update_pause_mode: Literal["wait", "keep"] = "wait"
 
     def __post_init__(self) -> None:
         if self.num_groups * self.group_size % (self.minibatches_per_epoch * self.grad_accum_steps):
@@ -521,6 +522,7 @@ def update(
         return state.apply_gradients(grads=gradients), metrics
 
     def skip_update() -> tuple[TrainState, Metrics]:
+        # Fixed JIT output structure; optimize excludes unevaluated KL and clip fraction from logging.
         return state, {
             "train/policy_loss": jnp.asarray(0.0, dtype=jnp.float32),  # ()
             "train/approx_kl": jnp.asarray(0.0, dtype=jnp.float32),  # () Not evaluated.
@@ -779,6 +781,7 @@ class Learner:
                 len(self.state.params),
                 self.config.finetuning_mode,
             )
+            ray.get(self.actor.ready.remote())
             if self.config.finetuning_mode == "full":
                 self._publish_weights = resources.enter_context(
                     full_weight_publisher(
@@ -957,8 +960,16 @@ class Learner:
                     self.config.clip_coef,
                 )
                 history.append(metrics)
-        metrics = jax.tree.map(lambda *values: jnp.stack(values).mean(), *history)  # Scalar leaves.
-        return {name: float(value) for name, value in metrics.items()}
+        metrics = jax.tree.map(lambda *values: jnp.stack(values).sum(), *history)  # Scalar leaves.
+        totals = {name: float(value) for name, value in metrics.items()}
+        scalars = {name: value / len(history) for name, value in totals.items()}
+        evaluated = len(history) - totals["train/skipped_update_fraction"]
+        for name in ("train/approx_kl", "train/clip_fraction"):
+            if evaluated:
+                scalars[name] = totals[name] / evaluated
+            else:
+                del scalars[name]
+        return scalars
 
 
 # Restrict JAX before import/backend initialization; vLLM still uses the assigned CUDA device.
@@ -989,6 +1000,9 @@ class Actor:
             wait_for_server(server)
             self._server = resources.pop_all()
         logger.info("Actor ready for rollout requests: taskset=%s", config.taskset.id)
+
+    def ready(self) -> None:
+        """Awaiting this method waits for construction, including vLLM readiness."""
 
     async def _get_agent(self) -> Agent:
         async with self._agent_lock:
