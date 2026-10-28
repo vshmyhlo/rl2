@@ -2,7 +2,7 @@
 
 `train_grpo_v2.py` trains Qwen3 LoRA adapters with a JAX learner, a vLLM inference server,
 and a small custom tool-calling interaction loop. V2 accepts
-`taskset.id: alfworld` or `appworld`; the other environment presets are unsupported.
+`taskset.id: alfworld`, `appworld`, or `reasoning_gym`; the other environment presets are unsupported.
 
 Prepare the official ALFWorld training data with `alfworld-download`, set
 `ALFWORLD_DATA`, and point `taskset.config_file` at a configuration whose
@@ -25,6 +25,26 @@ Run on Linux x86_64 with Python 3.12 and two visible GPUs:
 ```bash
 uv run python -m rl2.train_grpo_v2 --config configs/grpo_v2/alfworld.yaml
 ```
+
+For [Reasoning Gym](https://github.com/open-thought/reasoning-gym), use
+`--config configs/grpo_v2/reasoning_gym.yaml`; no separate installation is needed.
+Set `taskset.task` to a registered dataset name and `taskset.task_config` to its
+difficulty parameters. Tasks stream indefinitely without an in-memory task list:
+each group samples a 32-bit dataset seed and generates one puzzle on demand.
+Every attempt in a group receives the same question. The top-level `seed`
+determines the stream, and the checkpointed task RNG restores its continuation.
+Repeated puzzles are possible. There is no `taskset.size`; `task_config` cannot
+override `seed` or `size`. ALFWorld and AppWorld still sample their finite catalogs.
+For weighted mixtures, use `task: composite` and put a list of
+`{name: leg_counting, weight: 1, config: {}}` entries in `task_config.datasets`.
+
+The model calls `submit_answer(answer=...)` with a string in the question's
+requested format. One valid submission ends the episode and receives the
+dataset's native `score_answer` reward, including partial credit. Plain text
+without a tool call and truncated responses receive zero reward. The preset
+matches ALFWorld's training settings, including up to 50 turns for recovery from malformed calls. Each
+rollout owns a Ray worker for CPU-bound generation and scoring; timeouts and
+cancellation terminate it. Keep task settings and seed unchanged when resuming.
 
 Ray reserves one GPU for the actor's vLLM server and `learner_gpus` GPUs for the
 learner (default 1). Multi-GPU training uses fully replicated data parallelism:

@@ -10,10 +10,10 @@ taskset:
   id: alfworld
   config_file: data/alfworld/base_config.yaml
 seed: 1
-num_groups: 8
+num_groups: 2
 group_size: 8
 minibatches_per_epoch: 1 # Optimizer updates per epoch, excluding skipped minibatches.
-grad_accum_steps: 32
+grad_accum_steps: 8
 prefetch_batches: 1
 weight_update_pause_mode: wait
 drop_degenerate_groups: false

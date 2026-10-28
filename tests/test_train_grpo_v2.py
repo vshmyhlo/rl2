@@ -167,6 +167,55 @@ def test_appworld_preset_and_actor_task_discovery(monkeypatch: pytest.MonkeyPatc
     load_tasks.assert_called_once_with(config.taskset, config.environment_timeout)
 
 
+def test_reasoning_gym_preset_cli_and_actor_task_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/reasoning_gym.yaml"
+    config = training.load_config(preset, training.Config)
+    assert config.taskset == training.ReasoningGymConfig(
+        task="leg_counting", task_config={"min_animals": 1, "max_animals": 5}
+    )
+    assert pickle.loads(pickle.dumps(config)) == config
+    reference = training.load_config(preset.with_name("alfworld.yaml"), training.Config)
+    task_specific = {"taskset", "run_id", "ckpt_dir"}
+    assert {name: value for name, value in asdict(config).items() if name not in task_specific} == {
+        name: value for name, value in asdict(reference).items() if name not in task_specific
+    }
+    train = Mock()
+    monkeypatch.setattr(training, "train", train)
+    monkeypatch.setattr(sys, "argv", ["train_grpo_v2", "--config", str(preset)])
+    training.main()
+    train.assert_called_once_with(config)
+
+    monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
+    monkeypatch.setattr(training, "wait_for_server", Mock())
+    actor_class = training.Actor.__ray_metadata__.modified_class
+    actor = actor_class(config)
+    restored = actor_class(config)
+    actor.collect_group = AsyncMock(return_value=Mock(spec=training.RolloutGroup))
+    restored.collect_group = AsyncMock(return_value=Mock(spec=training.RolloutGroup))
+
+    async def fetch_groups(instance: Any) -> None:
+        async with asyncio.TaskGroup() as pending:
+            for _ in range(3):
+                pending.create_task(instance.fetch_next_group(group_size=2))
+
+    with actor._server, restored._server:
+        assert iter(actor.tasks) is actor.tasks
+        asyncio.run(actor.fetch_next_group(group_size=2))
+        first = actor.collect_group.call_args.args[0]
+        state = json.loads(json.dumps(actor.get_sampling_state()))
+        actor.collect_group.reset_mock()
+        asyncio.run(fetch_groups(actor))
+        expected = actor.collect_group.call_args_list
+        tasks = [call.args[0] for call in expected]
+        assert len({first.id, *(task.id for task in tasks)}) == 4
+        assert all(task.config == config.taskset for task in tasks)
+        assert all(call.kwargs == {"group_size": 2} for call in expected)
+        restored.set_sampling_state(state)
+        asyncio.run(fetch_groups(restored))
+        assert restored.collect_group.call_args_list == expected
+        assert restored.get_sampling_state() == actor.get_sampling_state()
+
+
 @pytest.mark.parametrize(
     "settings",
     [

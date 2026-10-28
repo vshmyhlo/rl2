@@ -1,0 +1,31 @@
+model: Qwen/Qwen3-0.6B
+learning_rate: 1e-5
+lora_rank: 16
+lora_alpha: 32
+attention_backend: tokamax
+scan_layers: true
+gradient_checkpointing: true
+padding_multiple: 256
+taskset:
+  id: reasoning_gym
+  task: leg_counting
+  task_config:
+    min_animals: 1
+    max_animals: 5
+seed: 1
+num_groups: 2
+group_size: 8
+minibatches_per_epoch: 1 # Optimizer updates per epoch, excluding skipped minibatches.
+grad_accum_steps: 8
+prefetch_batches: 1
+weight_update_pause_mode: wait
+drop_degenerate_groups: false
+length_penalty_coef: 0.0001 # Subtract 0.1 per 1,000 sampled tokens when environment reward is nonzero.
+max_tokens: 8192 # Total transcript tokens, including system, prompt, and tools.
+max_turns: 50
+rollout_timeout: 1200
+environment_timeout: 600
+run_id: grpo_v2_reasoning_gym_${taskset.task}_${path_name:${model}}_s${seed}_ng${num_groups}_gs${group_size}_mb${minibatches_per_epoch}_ddg${drop_degenerate_groups}_pf${prefetch_batches}_lp${length_penalty_coef}
+ckpt_dir: /runs/grpo_v2/${run_id} # Checkpoints and profiling artifacts.
+checkpoint_interval: 50
+example_log_interval: 50

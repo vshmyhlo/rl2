@@ -114,6 +114,7 @@ from rl2.agent_task import Task
 from rl2.alfworld_env import ALFWorldConfig, ALFWorldTask, load_alfworld_tasks
 from rl2.appworld_env import AppWorldConfig, AppWorldTask, load_appworld_tasks
 from rl2.configuration import BaseConfig, load_config
+from rl2.grpo_v2.reasoning_gym import ReasoningGymConfig, ReasoningGymTask, stream_reasoning_gym_tasks
 from rl2.grpo_v2.state import LoRATrainState
 from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import (
@@ -137,8 +138,8 @@ LORA_NAME = "training-policy"
 @config_dataclass(frozen=True)
 class Config(BaseConfig):
     model: str = MODEL
-    taskset: Annotated[ALFWorldConfig | AppWorldConfig, Field(discriminator="id")] = ALFWorldConfig(
-        config_file="data/alfworld/base_config.yaml"
+    taskset: Annotated[ALFWorldConfig | AppWorldConfig | ReasoningGymConfig, Field(discriminator="id")] = (
+        ALFWorldConfig(config_file="data/alfworld/base_config.yaml")
     )
     seed: Annotated[int, Field(ge=0)] = 1
     learner_gpus: Annotated[int, Field(ge=1)] = 1
@@ -960,17 +961,19 @@ class Actor:
         self._agent_lock = asyncio.Lock()
         self._runs: set[asyncio.Task[Rollout]] = set()
         self._closed = False
-        self.tasks: list[ALFWorldTask] | list[AppWorldTask] = (
-            load_appworld_tasks(config.taskset, config.environment_timeout)
-            if isinstance(config.taskset, AppWorldConfig)
-            else load_alfworld_tasks(config.taskset, config.environment_timeout)
-        )
+        self.tasks: list[ALFWorldTask] | list[AppWorldTask] | Generator[ReasoningGymTask]
+        if isinstance(config.taskset, ReasoningGymConfig):
+            self.tasks = stream_reasoning_gym_tasks(config.taskset, self.rng)
+        elif isinstance(config.taskset, AppWorldConfig):
+            self.tasks = load_appworld_tasks(config.taskset, config.environment_timeout)
+        else:
+            self.tasks = load_alfworld_tasks(config.taskset, config.environment_timeout)
         logger.info("Starting actor and vLLM on its assigned GPU")
         with self._server as resources:
             server = resources.enter_context(serve_vllm(model=config.model, lora_rank=config.lora_rank))
             wait_for_server(server)
             self._server = resources.pop_all()
-        logger.info("Actor ready for rollout requests: tasks=%s", len(self.tasks))
+        logger.info("Actor ready for rollout requests: taskset=%s", config.taskset.id)
 
     async def _get_agent(self) -> Agent:
         async with self._agent_lock:
@@ -999,7 +1002,7 @@ class Actor:
         self.rng.setstate((state["version"], tuple(state["state"]), state["gauss_next"]))
 
     async def fetch_next_group(self, group_size: int) -> Transfer[RolloutGroup]:
-        task = self.rng.choice(self.tasks)
+        task = self.rng.choice(self.tasks) if isinstance(self.tasks, list) else next(self.tasks)
         group = await self.collect_group(task, group_size=group_size)
         return Transfer(value=group, ready_at=time.monotonic())
 

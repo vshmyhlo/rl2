@@ -20,6 +20,7 @@ from rl2 import agent_loop as loop
 from rl2 import alfworld_env
 from rl2.agent_task import Environment, ResetResult, Task, ToolSchema
 from rl2.alfworld_env import StepResult, ToolCall, tool_schemas
+from rl2.grpo_v2 import reasoning_gym
 
 
 @pytest.fixture
@@ -112,6 +113,44 @@ def make_agent(tokenizer: PreTrainedTokenizerFast, client: AsyncOpenAI) -> loop.
         temperature=0.7,
         rollout_timeout=10,
     )
+
+
+@pytest.mark.parametrize("mode", ["submitted", "plain_text", "truncated"])
+def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch) -> None:
+    task = reasoning_gym.ReasoningGymTask(config=reasoning_gym.ReasoningGymConfig(), seed=1)
+    worker = reasoning_gym.ReasoningGymWorker.__ray_metadata__.modified_class(task=task)
+    answer = reasoning_gym.create_dataset(task.config, task.seed)[0]["answer"]
+    actor = Mock()
+    actor.reset.remote = AsyncMock(side_effect=worker.reset)
+    actor.step.remote = AsyncMock(side_effect=worker.step)
+    monkeypatch.setattr(reasoning_gym.ReasoningGymWorker, "remote", Mock(return_value=actor))
+    monkeypatch.setattr(reasoning_gym.ray, "kill", Mock())
+    call = json.dumps({"name": "submit_answer", "arguments": {"answer": answer}})
+    text = answer if mode == "plain_text" else f"<think>solve</think><tool_call>{call}</tool_call><|im_end|>"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json=response_for(tokenizer, text, finish_reason="length" if mode == "truncated" else "stop")
+        )
+
+    async def run() -> loop.Rollout:
+        async with make_client(respond) as client, task.init_env() as session:
+            return await replace(make_agent(tokenizer, client), max_turns=1).run(env=session)
+
+    rollout = asyncio.run(run())
+    assert rollout.num_turns == 1
+    assert rollout.reward == (1.0 if mode == "submitted" else 0.0)
+    assert (
+        rollout.stop_condition
+        == {"submitted": "environment_done", "plain_text": "agent_completed", "truncated": "context_length"}[mode]
+    )
+    if mode == "submitted":
+        actor.step.remote.assert_awaited_once_with(answer)
+    else:
+        actor.step.remote.assert_not_called()
+    sequence = rollout.sequence
+    assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
+    assert sequence.loss_mask.sum() == len(tokenizer.encode(text, add_special_tokens=False))
 
 
 def test_multiturn_exact_training_sequence(
