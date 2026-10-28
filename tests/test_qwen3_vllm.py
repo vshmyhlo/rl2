@@ -1,6 +1,5 @@
-"""Opt-in CUDA LoRA publication parity: QWEN3_VLLM_TESTS=1; optionally QWEN3_CHECKPOINT=/local/snapshot."""
+"""Opt-in CUDA weight publication checks: QWEN3_VLLM_TESTS=1; optionally QWEN3_CHECKPOINT=/local/snapshot."""
 
-import asyncio
 import hashlib
 import json
 import os
@@ -8,12 +7,10 @@ import socket
 import subprocess
 import time
 from collections.abc import Callable, Generator
-from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from importlib.metadata import version as package_version
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -185,15 +182,14 @@ def attention_forward(model: qwen3.Qwen3LM, implementation: str) -> Callable[...
     return forward
 
 
-@pytest.fixture(
-    scope="module", params=["tied", "untied", *(["checkpoint"] if os.environ.get("QWEN3_CHECKPOINT") else [])]
-)
+@pytest.fixture(scope="module")
 def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory) -> Generator[Engine]:
     directory = tmp_path_factory.mktemp(f"vllm-{request.param}")
     if destination := os.environ.get("QWEN3_VLLM_REPORT_DIR"):
         directory = Path(destination) / request.param
         directory.mkdir(parents=True, exist_ok=True)
     real = request.param == "checkpoint"
+    finetuning_mode = "full" if request.param == "full" else "lora"
     learner_backend = TypeAdapter(qwen3.AttentionBackend).validate_python(
         os.environ.get("QWEN3_VLLM_LEARNER_BACKEND", training.DEFAULT_CONFIG.attention_backend)
     )
@@ -308,13 +304,12 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
             stderr=subprocess.STDOUT,
         )
 
-    def resolve(pending: Future[None]) -> None:
-        pending.result(timeout=120)
-
     with ExitStack() as stack:
         log = stack.enter_context((directory / "server.log").open("wb"))
         with patch.object(training.subprocess, "Popen", launch):
-            server = stack.enter_context(training.serve_vllm(str(source)))
+            server = stack.enter_context(
+                training.serve_vllm(str(source), lora_rank=None if finetuning_mode == "full" else 16)
+            )
         http = stack.enter_context(httpx.Client(base_url=url, timeout=120))
         deadline = time.monotonic() + 300
         while time.monotonic() < deadline:
@@ -327,19 +322,23 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
             time.sleep(1)
         else:
             pytest.fail(f"vLLM startup timeout: {directory / 'server.log'}")
-        pool = stack.enter_context(ThreadPoolExecutor(max_workers=1))
-        actor = object.__new__(training.Actor.__ray_metadata__.modified_class)
-        actor.config = training.Config()
         stack.enter_context(patch.object(training, "SERVER_URL", url))
-
-        def receive(adapter_path: str) -> Future[None]:
-            return pool.submit(asyncio.run, actor.update_weights(adapter_path))
 
         learner_cls = training.Learner.__ray_metadata__.modified_class
         learner = object.__new__(learner_cls)
-        learner.config = training.Config(model=str(source))
-        learner.actor = SimpleNamespace(update_weights=SimpleNamespace(remote=receive))
-        stack.enter_context(patch.object(training.ray, "get", resolve))
+        learner.config = training.Config(model=str(source), finetuning_mode=finetuning_mode)
+        if finetuning_mode == "lora":
+            learner._publish_weights = stack.enter_context(
+                training.lora_weight_publisher(
+                    lambda: learner.state.params,
+                    server_url=url,
+                    model=learner.config.model,
+                    adapter_name=training.LORA_NAME,
+                    lora_rank=learner.config.lora_rank,
+                    lora_alpha=learner.config.lora_alpha,
+                    pause_mode=learner.config.weight_update_pause_mode,
+                )
+            )
         stack.enter_context(jax.set_mesh(Mesh(devices=jax.devices(), axis_names=("batch",))))
         client = stack.enter_context(OpenAI(base_url=f"{url}/v1", api_key="unused"))
         yield Engine(
@@ -354,6 +353,65 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
         )
 
 
+def assert_published_weights(engine: Engine, params: qwen3.Parameters) -> dict[str, str]:  # HF parameter shapes.
+    response = engine.http.post("/collective_rpc", json={"method": "weight_digests"})
+    response.raise_for_status()
+    loaded_digests = response.json()["results"][0]
+    expected_digests: dict[str, str] = {}
+    covered: set[str] = set()
+    for name in loaded_digests:
+        if ".qkv_proj." in name:
+            names = [name.replace(".qkv_proj.", f".{part}_proj.") for part in ("q", "k", "v")]
+        elif ".gate_up_proj." in name:
+            names = [name.replace(".gate_up_proj.", f".{part}_proj.") for part in ("gate", "up")]
+        else:
+            names = [name]
+        covered.update(names)
+        digest = hashlib.sha256()
+        for source_name in names:
+            digest.update(np.asarray(params[source_name].astype(jnp.bfloat16)).tobytes())
+        expected_digests[name] = digest.hexdigest()
+    assert covered == params.keys(), "Every base parameter must be present in vLLM"
+    assert loaded_digests == expected_digests, "Published weights must match the BF16 learner weights"
+    return loaded_digests
+
+
+@pytest.mark.parametrize("engine", ["full"], indirect=True)
+def test_nccl_full_weight_publication(engine: Engine) -> None:
+    learner = engine.learner
+    learner.state = training.create_state(engine.model, engine.params, learner.config)
+    previous: dict[str, float] | None = None
+    with training.full_weight_publisher(
+        lambda: learner.state.params,
+        server_url=str(engine.http.base_url),
+        device_index=jax.devices()[0].local_hardware_id,
+        pause_mode="wait",
+    ) as publish:
+        learner._publish_weights = publish
+        for version in range(2):
+            if version:
+                learner.state = learner.state.replace(
+                    params=jax.tree.map(lambda value: value + 0.05, learner.state.params)  # HF parameter shapes.
+                )
+            learner.publish_weights()
+            assert_published_weights(engine, learner.state.params)
+            response = engine.client.completions.create(
+                model=learner.config.model,
+                prompt=[1, 5, 9],
+                max_tokens=1,
+                temperature=0,
+                logprobs=engine.model.config.vocab_size,
+                extra_body={"return_tokens_as_token_ids": True, "ignore_eos": True},
+            )
+            scores = response.choices[0].logprobs.top_logprobs[0]
+            if previous is not None:
+                assert max(abs(scores[name] - previous[name]) for name in scores) > 1e-4
+            previous = scores
+
+
+@pytest.mark.parametrize(
+    "engine", ["tied", "untied", *(["checkpoint"] if os.environ.get("QWEN3_CHECKPOINT") else [])], indirect=True
+)
 def test_published_rollout_parity(engine: Engine) -> None:
     model, master = engine.model, engine.params
     learner_backend = "tokamax-triton" if model.attention_backend == "tokamax" else model.attention_backend
@@ -410,25 +468,7 @@ def test_published_rollout_parity(engine: Engine) -> None:
         params = state.params  # FP32 adapter factors; version 1 contains a real LoRA update.
         engine.learner.state = state
         engine.learner.publish_weights()
-        response = engine.http.post("/collective_rpc", json={"method": "weight_digests"})
-        response.raise_for_status()
-        loaded_digests = response.json()["results"][0]
-        expected_digests: dict[str, str] = {}
-        covered: set[str] = set()
-        for name in loaded_digests:
-            if ".qkv_proj." in name:
-                names = [name.replace(".qkv_proj.", f".{part}_proj.") for part in ("q", "k", "v")]
-            elif ".gate_up_proj." in name:
-                names = [name.replace(".gate_up_proj.", f".{part}_proj.") for part in ("gate", "up")]
-            else:
-                names = [name]
-            covered.update(names)
-            digest = hashlib.sha256()
-            for source_name in names:
-                digest.update(np.asarray(master[source_name].astype(jnp.bfloat16)).tobytes())
-            expected_digests[name] = digest.hexdigest()
-        assert covered == master.keys(), "Every base parameter must be present in vLLM"
-        assert loaded_digests == expected_digests, "LoRA publication must preserve the original base weights"
+        loaded_digests = assert_published_weights(engine, master)
         (engine.directory / f"base-weights-v{version}.json").write_text(json.dumps(loaded_digests, indent=2))
         for temperature in (1.0, 0.7):
             sequences = [list(prompt) for prompt in prompts]

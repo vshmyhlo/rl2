@@ -1,4 +1,4 @@
-"""LoRA-only GRPO training with a JAX learner, vLLM rollouts, and Ray actors.
+"""GRPO training with a JAX learner, vLLM rollouts, and Ray actors.
 
 Rollout generation needs no explicit lock around weight publication: vLLM's
 pause/resume mechanism queues new requests and handles in-flight requests
@@ -10,14 +10,14 @@ are logged every iteration except startup scalars, weight-transfer timing, and c
 
 Startup scalars (at the restored iteration, or step 0 for a new run):
     model/parameters_billions: Model parameter count in billions.
-    model/trainable_parameters_billions: LoRA parameter count in billions.
-    learner/setup_seconds: Model/optimizer setup, checkpoint restore, and initial adapter publication wall time.
+    model/trainable_parameters_billions: Trainable parameter count in billions.
+    learner/setup_seconds: Model/optimizer setup, checkpoint restore, and initial weight publication wall time.
 
 Optimization scalars (averaged over minibatches and update epochs):
     train/policy_loss: Clipped GRPO policy loss.
     train/approx_kl: Mean exp(log_ratio) - 1 - log_ratio, where log_ratio is learner minus sampling log-probability.
     train/clip_fraction: Fraction of sampled-token probability ratios outside the clip range.
-    train/gradient_norm: Global LoRA gradient norm after microbatch averaging, before clipping.
+    train/gradient_norm: Global trainable-parameter gradient norm after microbatch averaging, before clipping.
     train/skipped_update_fraction: Fraction of optimizer minibatches skipped because all advantages are zero.
 Loss, KL, and clip fraction average sampled tokens within each rollout, then rollouts.
 Skipped minibatches contribute zero to loss, KL, clip fraction, and gradient norm metrics.
@@ -56,7 +56,7 @@ Timing and throughput (logged every iteration unless noted):
     batcher/prepare_batch_seconds: Wall time preparing the CPU training arrays without explicit synchronization.
     learner/batch_fetch_seconds: Wall time fetching the rollout batch, including generation, scoring, and Ray transfers.
     learner/update_seconds: Device transfer and optimizer update wall time.
-    learner/weight_transfer_seconds: Wall time exporting and reloading LoRA adapters in vLLM; logged only on publication.
+    learner/weight_transfer_seconds: Wall time publishing weights to vLLM; logged only on publication.
     learner/iteration_seconds: Batch fetching, optimization, and weight publication wall time.
     checkpoint/save_seconds: Checkpoint save wall time, including completion of writes; logged on saves.
     batcher/actor_transfer_seconds_mean: Mean group transfer latency from actor return to batcher receipt.
@@ -70,7 +70,6 @@ Output-token counts include every sampled token, including thinking and end-of-t
 
 import argparse
 import asyncio
-import json
 import logging
 import os
 import posixpath
@@ -86,13 +85,11 @@ from functools import partial
 from itertools import islice
 from pathlib import Path
 from statistics import mean, pstdev
-from tempfile import TemporaryDirectory
-from typing import Annotated, Any, Literal, NamedTuple, get_args
+from typing import Annotated, Any, Literal, NamedTuple, cast, get_args
 from urllib.error import URLError
 from urllib.request import urlopen
 from uuid import uuid4
 
-import httpx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -100,12 +97,12 @@ import optax
 import orbax.checkpoint as ocp
 import ray
 import yaml
+from flax.training.train_state import TrainState
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from openai import AsyncOpenAI
 from pydantic import Field, TypeAdapter
 from pydantic.dataclasses import dataclass as config_dataclass
 from ray.actor import ActorHandle
-from safetensors.numpy import save_file
 from transformers import AutoTokenizer
 from vllm.config.lora import MaxLoRARanks
 
@@ -116,6 +113,7 @@ from rl2.appworld_env import AppWorldConfig, stream_appworld_tasks
 from rl2.configuration import BaseConfig, load_config
 from rl2.grpo_v2.reasoning_gym import ReasoningGymConfig, stream_reasoning_gym_tasks
 from rl2.grpo_v2.state import LoRATrainState
+from rl2.grpo_v2.weight_transfer import full_weight_publisher, lora_weight_publisher
 from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import (
     AttentionBackend,
@@ -157,6 +155,7 @@ class Config(BaseConfig):
     environment_timeout: Annotated[float, Field(gt=0)] = 600
     temperature: Annotated[float, Field(ge=0.01, le=2.0)] = 1.0  # vLLM clamps smaller positive values to 0.01.
     learning_rate: Annotated[float, Field(gt=0)] = 1e-5
+    finetuning_mode: Literal["lora", "full"] = "lora"
     lora_rank: Annotated[int, Field(ge=1, le=512)] = 16
     lora_alpha: Annotated[float, Field(gt=0)] = 32.0
     clip_coef: Annotated[float, Field(gt=0, lt=1)] = 0.2
@@ -188,7 +187,7 @@ DEFAULT_CONFIG = Config()
 
 @dataclass(frozen=True)
 class TrainingProgress:
-    train_state: LoRATrainState  # Frozen base weights, LoRA factors/moments; () optimizer step.
+    train_state: TrainState  # Trainable parameter/moment shapes; () optimizer step.
     shuffle_key: jax.Array  # () typed base PRNG key, folded with the optimizer step.
     iteration: int
     total_rollouts: int
@@ -234,15 +233,18 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
 
 
 def restore_checkpoint(
-    manager: ocp.CheckpointManager, train_state: LoRATrainState, config: Config
+    manager: ocp.CheckpointManager, train_state: TrainState, config: Config
 ) -> TrainingProgress | None:
     iteration = manager.latest_step()
     if iteration is None:
         return None
     metadata = manager.restore(iteration, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
     if metadata["version"] != 2 or metadata["algorithm"] != "grpo_v2":
-        raise ValueError("Unsupported GRPO v2 checkpoint; LoRA training requires a new checkpoint directory")
-    for name in ("model", "lora_rank", "lora_alpha"):
+        raise ValueError("Unsupported GRPO v2 checkpoint; use a new checkpoint directory")
+    # Version 2 checkpoints predating this option contain LoRA states.
+    if metadata["config"].get("finetuning_mode", "lora") != config.finetuning_mode:
+        raise ValueError("GRPO v2 checkpoint finetuning_mode does not match the current configuration")
+    for name in ("model", "lora_rank", "lora_alpha") if config.finetuning_mode == "lora" else ("model",):
         if metadata["config"].get(name) != getattr(config, name):
             raise ValueError(f"GRPO v2 checkpoint {name} does not match the current configuration")
     if metadata["iteration"] != iteration or iteration < 0 or metadata["total_rollouts"] < 0:
@@ -368,22 +370,30 @@ def build_rollout_batch(
 
 # Use a value alias so Ray can serialize script-defined actors without importing __main__.Metrics.
 Metrics = dict[str, jax.Array]  # Scalar leaves.
+TrainParameters = Parameters | LoRAParameters  # HF parameter shapes or (R, I), (O, R) factors.
 
 
 def token_log_probs(
-    state: LoRATrainState,
-    params: LoRAParameters,  # (R, I), (O, R) adapter factors.
+    state: TrainState,
+    params: TrainParameters,  # HF parameter shapes or (R, I), (O, R) factors.
     batch: GRPOBatch[jax.Array],  # (B, T), (B,) leaves.
     temperature: float,
 ) -> jax.Array:  # (B, T-1)
     """(B, T-1) log-probabilities for tokens at positions 1 through T-1."""
-    logits = state.apply_fn(
-        {"params": state.base_params},
-        batch.token_ids[:, :-1],
-        attention_mask=batch.attention_mask[:, :-1],
-        lora=params,
-        lora_scale=state.lora_scale,
-    ).logits  # (B, T-1, V)
+    if isinstance(state, LoRATrainState):
+        logits = state.apply_fn(
+            {"params": state.base_params},
+            batch.token_ids[:, :-1],
+            attention_mask=batch.attention_mask[:, :-1],
+            lora=cast(LoRAParameters, params),
+            lora_scale=state.lora_scale,
+        ).logits  # (B, T-1, V)
+    else:
+        logits = state.apply_fn(
+            {"params": cast(Parameters, params)},
+            batch.token_ids[:, :-1],
+            attention_mask=batch.attention_mask[:, :-1],
+        ).logits  # (B, T-1, V)
     logits = logits.astype(jnp.float32) / temperature  # (B, T-1, V)
     log_probs = jax.nn.log_softmax(logits, axis=-1)  # (B, T-1, V); stable shifted arithmetic, as in vLLM.
     # Fuse selection's backward pass with softmax instead of scattering into a full FP32 vocabulary buffer.
@@ -414,10 +424,17 @@ def objective(
 
 def create_state(
     model: Qwen3LM,
-    params: Parameters,  # Frozen HF parameter shapes.
+    params: Parameters,  # HF parameter shapes.
     config: Config,
-) -> LoRATrainState:
-    """Freeze base weights and optimize FP32 LoRA factors on attention and MLP projections."""
+) -> TrainState:
+    """Optimize FP32 full weights or LoRA factors on attention and MLP projections."""
+    optimizer = optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adam(config.learning_rate))
+    if config.finetuning_mode == "full":
+        return TrainState.create(
+            apply_fn=model.apply,
+            params=jax.tree.map(lambda value: value.astype(jnp.float32), params),  # HF parameter shapes.
+            tx=optimizer,
+        ).replace(step=jnp.asarray(0, dtype=jnp.int32))  # ()
     adapters: LoRAParameters = {}  # (R, I) and (O, R) leaves.
     key = jax.random.key(config.seed)  # ()
     for name, weight in sorted(params.items()):  # HF parameter shapes.
@@ -442,7 +459,7 @@ def create_state(
         params=adapters,
         base_params=params,
         lora_scale=config.lora_alpha / config.lora_rank,
-        tx=optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adam(config.learning_rate)),
+        tx=optimizer,
     ).replace(step=jnp.asarray(0, dtype=jnp.int32))  # () Match the device counter returned by update.
 
 
@@ -454,12 +471,12 @@ def create_state(
     donate_argnums=(0,),
 )
 def update(
-    state: LoRATrainState,
+    state: TrainState,
     batch: GRPOBatch[jax.Array],  # One optimizer minibatch: (B, T), (B,) leaves.
     grad_accum_steps: int,
     temperature: float,
     clip_coef: float,
-) -> tuple[LoRATrainState, Metrics]:
+) -> tuple[TrainState, Metrics]:
     """Consume state buffers, skipping zero-advantage updates; requires a `batch` mesh context and positional args."""
     if grad_accum_steps < 1 or batch.token_ids.shape[0] % grad_accum_steps:
         raise ValueError("grad_accum_steps must be positive and divide the minibatch size")
@@ -474,7 +491,7 @@ def update(
         clip_coef,
     )
 
-    def apply_update() -> tuple[LoRATrainState, Metrics]:
+    def apply_update() -> tuple[TrainState, Metrics]:
         microbatch_size = batch.token_ids.shape[0] // grad_accum_steps
         microbatches = jax.tree.map(
             lambda value: value.reshape(grad_accum_steps, microbatch_size, *value.shape[1:]), batch
@@ -484,26 +501,26 @@ def update(
         )  # (A, B/A, T), (A, B/A); shard examples within each microbatch.
 
         def accumulate(
-            grads: LoRAParameters,  # (R, I) and (O, R) leaves.
+            grads: TrainParameters,  # HF parameter shapes or (R, I), (O, R) factors.
             microbatch: GRPOBatch[jax.Array],  # (B/A, T), (B/A,) leaves.
-        ) -> tuple[LoRAParameters, Metrics]:
-            def loss_fn(params: LoRAParameters) -> tuple[jax.Array, Metrics]:  # LoRA leaves -> (), scalar metrics.
+        ) -> tuple[TrainParameters, Metrics]:
+            def loss_fn(params: TrainParameters) -> tuple[jax.Array, Metrics]:  # Parameter leaves -> (), scalars.
                 return objective(token_log_probs(state, params, microbatch, temperature), microbatch, clip_coef)
 
             (_, metrics), gradient = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-            return jax.tree.map(jnp.add, grads, gradient), metrics  # LoRA factor shapes; scalar metrics.
+            return jax.tree.map(jnp.add, grads, gradient), metrics  # Parameter shapes; scalar metrics.
 
         gradients, metrics = jax.lax.scan(
             accumulate, jax.tree.map(jnp.zeros_like, state.params), microbatches
-        )  # LoRA factor shapes; metric leaves: (A,).
-        gradients = jax.tree.map(lambda value: value / grad_accum_steps, gradients)  # LoRA factor shapes.
-        gradients = jax.lax.with_sharding_constraint(gradients, PartitionSpec())  # LoRA factor shapes.
+        )  # Parameter shapes; metric leaves: (A,).
+        gradients = jax.tree.map(lambda value: value / grad_accum_steps, gradients)  # Parameter shapes.
+        gradients = jax.lax.with_sharding_constraint(gradients, PartitionSpec())  # Parameter shapes.
         metrics = jax.tree.map(jnp.mean, metrics)  # Scalar leaves.
         metrics["train/gradient_norm"] = optax.global_norm(gradients)  # () Before clipping.
         metrics["train/skipped_update_fraction"] = jnp.asarray(0.0, dtype=jnp.float32)  # ()
         return state.apply_gradients(grads=gradients), metrics
 
-    def skip_update() -> tuple[LoRATrainState, Metrics]:
+    def skip_update() -> tuple[TrainState, Metrics]:
         return state, {
             "train/policy_loss": jnp.asarray(0.0, dtype=jnp.float32),  # ()
             "train/approx_kl": jnp.asarray(0.0, dtype=jnp.float32),  # () Not evaluated.
@@ -545,7 +562,7 @@ async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]
         yield Agent(
             client=client,
             tokenizer=tokenizer,
-            model=LORA_NAME,
+            model=LORA_NAME if config.finetuning_mode == "lora" else config.model,
             context_length=TypeAdapter(int).validate_python(
                 (model.model_extra or {}).get("max_model_len"), strict=True
             ),
@@ -558,10 +575,15 @@ async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]
 
 
 @contextmanager
-def serve_vllm(model: str = MODEL, lora_rank: int = DEFAULT_CONFIG.lora_rank) -> Generator[subprocess.Popen[bytes]]:
-    max_lora_rank = next((rank for rank in get_args(MaxLoRARanks) if rank >= lora_rank), None)
-    if max_lora_rank is None:
-        raise ValueError(f"vLLM supports LoRA ranks up to {max(get_args(MaxLoRARanks))}")
+def serve_vllm(
+    model: str = MODEL, lora_rank: int | None = DEFAULT_CONFIG.lora_rank
+) -> Generator[subprocess.Popen[bytes]]:
+    weight_args = ["--weight-transfer-config", '{"backend":"nccl"}']
+    if lora_rank is not None:
+        max_lora_rank = next((rank for rank in get_args(MaxLoRARanks) if rank >= lora_rank), None)
+        if max_lora_rank is None:
+            raise ValueError(f"vLLM supports LoRA ranks up to {max(get_args(MaxLoRARanks))}")
+        weight_args = ["--enable-lora", "--max-lora-rank", str(max_lora_rank), "--lora-dtype", "bfloat16"]
     logger.info("Starting vLLM server for %s", model)
     # Inherit the GPU assigned to this actor through CUDA_VISIBLE_DEVICES.
     with subprocess.Popen(
@@ -584,11 +606,7 @@ def serve_vllm(model: str = MODEL, lora_rank: int = DEFAULT_CONFIG.lora_rank) ->
             "vllm",
             "--logprobs-mode",
             "processed_logprobs",
-            "--enable-lora",
-            "--max-lora-rank",
-            str(max_lora_rank),
-            "--lora-dtype",
-            "bfloat16",
+            *weight_args,
         ],
         env={
             **os.environ,
@@ -757,16 +775,42 @@ class Learner:
                 logger.info("Resumed run %s at iteration %s", self.config.run_id, iteration)
             writer.log_text(yaml.safe_dump(asdict(self.config)), f"config/{iteration}.yaml")
             logger.info(
-                "Learner loaded %s base tensors and %s LoRA adapters",
-                len(self.state.base_params),
+                "Learner loaded %s trainable tensors in %s mode",
                 len(self.state.params),
+                self.config.finetuning_mode,
             )
+            if self.config.finetuning_mode == "full":
+                self._publish_weights = resources.enter_context(
+                    full_weight_publisher(
+                        lambda: self.state.params,
+                        server_url=SERVER_URL,
+                        device_index=self.mesh.devices.flat[0].local_hardware_id,
+                        pause_mode=self.config.weight_update_pause_mode,
+                    )
+                )
+            else:
+                self._publish_weights = resources.enter_context(
+                    lora_weight_publisher(
+                        lambda: self.state.params,
+                        server_url=SERVER_URL,
+                        model=self.config.model,
+                        adapter_name=LORA_NAME,
+                        lora_rank=self.config.lora_rank,
+                        lora_alpha=self.config.lora_alpha,
+                        pause_mode=self.config.weight_update_pause_mode,
+                    )
+                )
             resources.callback(self.cancel_pending_batches)
             self.publish_weights()
             total_updates = int(self.state.step)
             writer.log_metrics(
                 {
-                    "model/parameters_billions": sum(p.size for p in jax.tree.leaves(self.state.base_params))
+                    "model/parameters_billions": sum(
+                        p.size
+                        for p in jax.tree.leaves(
+                            self.state.base_params if isinstance(self.state, LoRATrainState) else self.state.params
+                        )
+                    )
                     / 1_000_000_000,
                     "model/trainable_parameters_billions": sum(p.size for p in jax.tree.leaves(self.state.params))
                     / 1_000_000_000,
@@ -797,8 +841,7 @@ class Learner:
                     total_updates = updated_step
                     optimized = time.monotonic()
                     if weights_updated:
-                        with span("learner.publish_weights"):
-                            self.publish_weights()
+                        self.publish_weights()
                     now = time.monotonic()
                     num_rollouts = batch.training_batch.token_ids.shape[0]
                     total_rollouts += num_rollouts
@@ -884,36 +927,7 @@ class Learner:
         )
 
     def publish_weights(self) -> None:
-        host_params = jax.device_get(self.state.params)  # Host (R, I) and (O, R) leaves.
-        adapters = jax.tree.map(
-            lambda value: np.asarray(value, dtype=np.float32), host_params
-        )  # Host (R, I) and (O, R) leaves.
-        weights = {
-            f"base_model.model.{name.removesuffix('.weight')}.lora_{factor}.weight": value
-            for name, adapter in adapters.items()
-            for factor, value in (("A", adapter.a), ("B", adapter.b))
-        }  # PEFT (R, I) and (O, R) leaves.
-        # vLLM retains this single adapter in memory after the synchronous load.
-        with TemporaryDirectory(prefix="rl2-lora-") as temporary_directory:
-            directory = Path(temporary_directory)
-            save_file(weights, directory / "adapter_model.safetensors")
-            (directory / "adapter_config.json").write_text(
-                json.dumps(
-                    {
-                        "peft_type": "LORA",
-                        "task_type": "CAUSAL_LM",
-                        "base_model_name_or_path": self.config.model,
-                        "r": self.config.lora_rank,
-                        "lora_alpha": self.config.lora_alpha,
-                        "target_modules": sorted({name.split(".")[-2] for name in adapters}),
-                        "bias": "none",
-                        "lora_dropout": 0.0,
-                        "inference_mode": True,
-                        "use_rslora": False,
-                    }
-                )
-            )
-            ray.get(self.actor.update_weights.remote(str(directory)))
+        self._publish_weights()
 
     def optimize(self, batch: GRPOBatch[np.ndarray]) -> dict[str, float]:  # Batch leaves: (B, T), (B,).
         if batch.token_ids.shape[0] % self.config.minibatches_per_epoch:
@@ -969,7 +983,9 @@ class Actor:
             self.tasks = stream_alfworld_tasks(config.taskset, self.rng, config.environment_timeout)
         logger.info("Starting actor and vLLM on its assigned GPU")
         with self._server as resources:
-            server = resources.enter_context(serve_vllm(model=config.model, lora_rank=config.lora_rank))
+            server = resources.enter_context(
+                serve_vllm(model=config.model, lora_rank=config.lora_rank if config.finetuning_mode == "lora" else None)
+            )
             wait_for_server(server)
             self._server = resources.pop_all()
         logger.info("Actor ready for rollout requests: taskset=%s", config.taskset.id)
@@ -1004,24 +1020,6 @@ class Actor:
         task = next(self.tasks)
         group = await self.collect_group(task, group_size=group_size)
         return Transfer(value=group, ready_at=time.monotonic())
-
-    async def update_weights(self, adapter_path: str) -> None:
-        with span("actor.update_weights"):
-            async with httpx.AsyncClient(base_url=SERVER_URL, timeout=600) as client:
-                with span("actor.update_weights.pause", {"mode": self.config.weight_update_pause_mode}):
-                    response = await client.post(
-                        "/pause", params={"mode": self.config.weight_update_pause_mode, "clear_cache": "true"}
-                    )
-                    response.raise_for_status()
-                with span("actor.update_weights.load_adapter"):
-                    response = await client.post(
-                        "/v1/load_lora_adapter",
-                        json={"lora_name": LORA_NAME, "lora_path": adapter_path, "load_inplace": True},
-                    )
-                    response.raise_for_status()
-                with span("actor.update_weights.resume"):
-                    response = await client.post("/resume")
-                    response.raise_for_status()
 
     async def collect_group(self, task: Task, group_size: int) -> RolloutGroup:
         if group_size < 2:

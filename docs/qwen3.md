@@ -159,8 +159,8 @@ Three numerical boundaries are explicit in `qwen3.py`:
   BF16 before softmax. Base-weight storage remains BF16, including tied heads.
 
 `tests/test_qwen3_vllm.py` exercises the actual `serve_vllm`, `publish_weights`,
-`Actor.update_weights`, `Batcher.prepare_batch`, `token_log_probs`, and `update`.
-Only Ray scheduling is replaced with local threads. A read-only test worker hashes
+`lora_weight_publisher`, `Batcher.prepare_batch`, `token_log_probs`, and `update`.
+The learner is invoked directly without Ray scheduling. A read-only test worker hashes
 all loaded parameters, including packed QKV and gate/up projections; the test checks
 byte equality and complete coverage of the frozen base parameters after each
 adapter publication. The second publication contains a real Adam update (test learning rate

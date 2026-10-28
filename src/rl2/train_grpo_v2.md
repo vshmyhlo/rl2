@@ -1,6 +1,6 @@
 # Tool-calling GRPO
 
-`train_grpo_v2.py` trains Qwen3 LoRA adapters with a JAX learner, a vLLM inference server,
+`train_grpo_v2.py` finetunes Qwen3 with a JAX learner, a vLLM inference server,
 and a small custom tool-calling interaction loop. V2 accepts
 `taskset.id: alfworld`, `appworld`, or `reasoning_gym`; the other environment presets are unsupported.
 
@@ -145,8 +145,13 @@ capped at the model context length. Oversized transcripts are rejected.
 
 GRPO uses a clipped importance-ratio objective, averaged over sampled tokens
 within each rollout and then across rollouts. There is no reference-policy KL
-penalty. Transformer computation uses BF16; the output
-projection accumulates FP32 logits in both JAX and vLLM. Base weights are frozen;
+penalty. Set `finetuning_mode: full` to optimize all model weights, including
+embeddings, normalization, and the output head, with FP32 master weights and Adam
+moments. This uses substantially more GPU memory than LoRA. Tied embeddings and
+output heads remain shared. `lora_rank` and `lora_alpha` apply only in LoRA mode.
+Transformer computation uses BF16; the output
+projection accumulates FP32 logits in both JAX and vLLM. In the default
+`finetuning_mode: lora`, base weights are frozen;
 only FP32 LoRA factors on every attention and MLP projection are optimized.
 `lora_rank` defaults to 16 and `lora_alpha` to 32; the weight delta is
 `(lora_alpha / lora_rank) * B @ A`. A is randomly initialized and B starts at zero,
@@ -179,18 +184,35 @@ parameters, Adam state, and the optimizer step. `train/skipped_update_fraction` 
 skipped fraction; skipped minibatches contribute zero to the other optimization metrics.
 `minibatches_per_epoch * grad_accum_steps` must divide `num_groups * group_size`.
 The resulting microbatch size must also be divisible by `learner_gpus`.
-Shuffling uses the saved seed and optimizer step. Publication copies only FP32 LoRA
+Shuffling uses the saved seed and optimizer step. The learner selects a context-managed
+publisher from `grpo_v2/weight_transfer.py` at startup. Both modes expose the same
+callable, read the current parameters on every call, and own their HTTP and transfer
+resources. Publication runs in the learner; the actor handles rollouts.
+In LoRA mode, publication copies only FP32 LoRA
 factors from one replica into PEFT safetensors and configuration files in a temporary
 local directory shared with vLLM. vLLM starts with LoRA enabled, casts adapters to
 BF16, and replaces the `training-policy` adapter through `/v1/load_lora_adapter`
 with `load_inplace: true`. Rollout requests select that adapter; the base model is
 loaded once. A small server wrapper clears vLLM 0.32's persistent `load_inplace`
 flag after a successful load, preventing repeated adapter reads during decoding.
-The initial adapter is published before any rollouts. Later publications occur only
+In full mode, vLLM starts with its NCCL weight-transfer backend and requests select
+the base model name. A persistent two-rank NCCL group connects the first learner
+GPU to the single vLLM worker. Each publication reads the current JAX replica
+through DLPack and casts weights to BF16 on the GPU, including the output head.
+vLLM's trainer engine streams packed GPU buffers over NCCL; HTTP carries only
+parameter names, shapes, dtypes, and transfer control. There are no host weight
+copies or temporary weight files. Packing uses two buffers with a 64 MiB flush
+threshold; a chunk can exceed that threshold by one tensor. Transfer completion
+is awaited before the learner can reuse buffers. FP32 master weights stay in the
+learner and checkpoints. The NCCL group is closed when the learner exits.
+To check repeated NCCL publication on two GPUs, run
+`QWEN3_VLLM_TESTS=1 CUDA_VISIBLE_DEVICES=0 QWEN3_VLLM_DEVICE=1 uv run pytest tests/test_qwen3_vllm.py -k nccl_full_weight_publication`.
+The initial weights are published before any rollouts. Later publications occur only
 when the optimizer step advances; iterations with all minibatches skipped omit
-`learner/weight_transfer_seconds`. Each publication removes its
+`learner/weight_transfer_seconds`. Each LoRA publication removes its
 temporary directory after the blocking weight update returns, including on failure.
-The single adapter stays in vLLM memory. Learner and server must share a local filesystem.
+The loaded weights stay in vLLM memory. This trainer runs on one host; LoRA also
+requires a shared local filesystem.
 `prefetch_batches: 0` (default) collects each batch after publishing the latest
 weights, avoiding stale prefetched policies and weight changes within a rollout.
 Positive `prefetch_batches: N` generates up to N batches ahead while the learner optimizes; each
@@ -200,24 +222,28 @@ weights, and multi-turn rollouts can span weight updates.
 `weight_update_pause_mode` accepts `wait` (default), `abort`, or `keep`, operating
 on individual generation requests. Groups can start during publication; vLLM
 queues new generation requests until resume and handles in-flight requests
-according to the selected pause mode. The actor awaits `/pause` with cache clearing,
-reloads the adapter, then calls `/resume`. Reload failures leave generation paused,
+according to the selected pause mode. Publication awaits `/pause` with cache clearing,
+updates the weights, then calls `/resume`. Full mode uses vLLM's
+`/start_weight_update`, `/update_weights`, and `/finish_weight_update` lifecycle.
+Transfer failures leave generation paused,
 propagate to the learner, and trigger training cleanup.
 With vLLM 0.32, `keep` also honors `clear_cache=true`: running requests are
 requeued and their KV state is recomputed after resume. Tokens within one request
-can still be sampled under different adapter versions.
-Use `wait` for a consistent adapter version within each generation request; a
+can still be sampled under different weight versions.
+Use `wait` for a consistent weight version within each generation request; a
 multi-turn rollout can still span updates.
 
 `ckpt_dir/checkpoints` stores Orbax checkpoints every `checkpoint_interval`
 iterations and at normal completion, retaining only the latest checkpoint.
 Prefetching drains on checkpoint iterations so the saved task RNG does not
-skip unconsumed batches. Restarting with the same directory restores frozen base weights, LoRA factors,
+skip unconsumed batches. Restarting with the same directory restores model weights (including LoRA factors in LoRA mode),
 optimizer state, shuffle key, task RNG, and progress counters. `total_iterations` is a cumulative
 target; `null` runs until interrupted. Environments restart fresh, so resumption
 is not bit-for-bit reproducible. Use a new directory for a fresh experiment or
-incompatible model changes. LoRA checkpoints require matching `model`, `lora_rank`,
-and `lora_alpha`; older full-parameter checkpoints cannot be resumed.
+incompatible model changes. Checkpoints require matching `model` and `finetuning_mode`;
+LoRA also requires matching `lora_rank` and `lora_alpha`. Existing version 2
+checkpoints without `finetuning_mode` are treated as LoRA. Legacy version 1
+checkpoints cannot be resumed. Use a new `ckpt_dir` when switching modes.
 Local and `gs://` paths are supported.
 
 ## Logging and profiling

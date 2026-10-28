@@ -1,3 +1,4 @@
+import json
 import logging
 import pickle
 from collections.abc import Generator
@@ -7,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
+import httpx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -392,6 +394,41 @@ def test_lora_requires_projection_weights() -> None:
         training.create_state(Mock(), {"model.norm.weight": jnp.ones(3)}, training.Config())  # (D=3,)
 
 
+@pytest.mark.usefixtures("mesh_context")
+def test_full_weight_update(
+    model: Qwen3LM, state: training.LoRATrainState, batch: training.GRPOBatch[jax.Array]
+) -> None:
+    full = training.create_state(
+        model, state.base_params, training.Config(finetuning_mode="full", learning_rate=0.01, max_grad_norm=0.1)
+    )
+    assert not isinstance(full, training.LoRATrainState)
+    assert full.step.shape == () and full.step.dtype == jnp.int32
+    for tree in (full.params, full.opt_state[1][0].mu, full.opt_state[1][0].nu):  # HF parameter shapes.
+        assert tree.keys() == state.base_params.keys()
+        for name, value in tree.items():
+            assert value.shape == state.base_params[name].shape
+            assert value.dtype == jnp.float32
+    old = training.token_log_probs(full, full.params, batch, temperature=0.7)  # (B=2, T-1=7)
+    assert old.shape == (2, 7)
+    np.testing.assert_allclose(old, batch.old_log_probs[:, 1:], atol=1e-6)
+    updated, metrics = training.update(jax.tree.map(jnp.copy, full), batch, 2, 0.7, 0.2)
+    assert int(updated.step) == 1
+    assert float(metrics["train/gradient_norm"]) > 0
+    assert all(value.shape == () for value in metrics.values())
+    for name, value in updated.params.items():  # HF parameter shapes.
+        assert value.dtype == jnp.float32
+        assert value.shape == full.params[name].shape
+        assert not np.array_equal(value, full.params[name]), name
+    after = training.token_log_probs(updated, updated.params, batch, temperature=0.7)  # (B, T-1)
+    assert float(training.objective(after, batch, clip_coef=0.2)[0]) < float(metrics["train/policy_loss"])
+    skipped, metrics = training.update(
+        jax.tree.map(jnp.copy, updated), batch._replace(advantages=jnp.zeros_like(batch.advantages)), 2, 0.7, 0.2
+    )
+    assert float(metrics["train/skipped_update_fraction"]) == 1
+    for actual, expected in zip(jax.tree.leaves(skipped), jax.tree.leaves(updated), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+
+
 @pytest.mark.parametrize("mixed", [False, True], ids=["nonzero", "zero-first-microbatch"])
 @pytest.mark.usefixtures("mesh_context")
 def test_accumulated_update_matches_full_batch_and_improves_policy(
@@ -687,27 +724,32 @@ def test_learner_optimizes_and_publishes_updated_adapters(
         np.testing.assert_array_equal(value, state.base_params[name])
     assert optax.global_norm(jax.tree.map(jnp.subtract, learner.state.params, state.params)) > 0
 
-    def receive(path: str) -> None:
-        weights = load_file(Path(path) / "adapter_model.safetensors")  # (R, I) and (O, R) leaves.
-        assert len(weights) == 2 * len(learner.state.params)
-        for name, adapter in learner.state.params.items():
-            for factor, value in (("A", adapter.a), ("B", adapter.b)):  # (R, I) or (O, R)
-                key = f"base_model.model.{name.removesuffix('.weight')}.lora_{factor}.weight"
-                np.testing.assert_array_equal(weights[key], np.asarray(value))
+    directories: list[Path] = []
 
-    learner.actor.update_weights.remote.side_effect = receive
-    monkeypatch.setattr(training.ray, "get", Mock())
-    learner.publish_weights()
-    learner.actor.update_weights.remote.assert_called_once()
-    assert not Path(learner.actor.update_weights.remote.call_args.args[0]).exists()
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/load_lora_adapter":
+            directory = Path(json.loads(request.content)["lora_path"])
+            directories.append(directory)
+            weights = load_file(directory / "adapter_model.safetensors")  # (R, I) and (O, R) leaves.
+            assert len(weights) == 2 * len(learner.state.params)
+            for name, adapter in learner.state.params.items():
+                for factor, value in (("A", adapter.a), ("B", adapter.b)):  # (R, I) or (O, R)
+                    key = f"base_model.model.{name.removesuffix('.weight')}.lora_{factor}.weight"
+                    np.testing.assert_array_equal(weights[key], np.asarray(value))
+        return httpx.Response(status_code=200)
 
-    def fail_load(result: Any) -> None:
-        path = Path(learner.actor.update_weights.remote.call_args.args[0])
-        assert (path / "adapter_config.json").is_file()
-        assert (path / "adapter_model.safetensors").is_file()
-        raise RuntimeError("Adapter load failed")
-
-    monkeypatch.setattr(training.ray, "get", fail_load)
-    with pytest.raises(RuntimeError, match="Adapter load failed"):
+    client = httpx.Client(base_url=training.SERVER_URL, transport=httpx.MockTransport(respond))
+    monkeypatch.setattr(httpx, "Client", Mock(return_value=client))
+    with training.lora_weight_publisher(
+        lambda: learner.state.params,
+        server_url=training.SERVER_URL,
+        model=learner.config.model,
+        adapter_name=training.LORA_NAME,
+        lora_rank=learner.config.lora_rank,
+        lora_alpha=learner.config.lora_alpha,
+        pause_mode=learner.config.weight_update_pause_mode,
+    ) as publish:
+        learner._publish_weights = publish
         learner.publish_weights()
-    assert not Path(learner.actor.update_weights.remote.call_args.args[0]).exists()
+    assert len(directories) == 1 and not directories[0].exists()
+    assert client.is_closed
