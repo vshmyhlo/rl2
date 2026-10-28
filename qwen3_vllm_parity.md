@@ -1,75 +1,106 @@
 # Qwen3 / vLLM numerical parity
 
-Audit: 2026-10-25. **BF16 parity is not established:** unchanged weights can
-push importance ratios beyond GRPO's clipping bounds.
+Audit: 2026-10-28. **BF16 parity is not established.** Identical published
+weights still produce some ratios outside GRPO's `[0.8, 1.2]` clipping range.
+The regression remains failing; its thresholds have not been relaxed.
 
-## Setup
+## Fixes in this review
 
-- Two A100 40 GB GPUs; Qwen3-0.6B, revision `c1899de289a04d12100db370d81485cdf75e47ca`.
-- JAX 0.11.2, vLLM 0.27.0, PyTorch 2.13.0+cu130, Tokamax 0.0.15.
-- Loaded `nvida.env` (the repository's spelling): CUDA, optimization `O1`,
-  90% memory preallocation, default XLA flags. No FP32 model switch.
-- BF16 projections/attention, FP32 logits; Tokamax Triton versus compiled vLLM
-  FlashAttention. Two unequal prompts, two turns, 32 generated tokens per turn,
-  context 4096, temperatures 1.0 and 0.7, before/after an optimizer update.
+- Honor modern Hugging Face `rope_parameters.rope_theta`; previously JAX silently
+  used the top-level/default theta. Reject unsupported scaled, partial, or
+  per-layer RoPE instead of silently evaluating a different model.
+- Construct static RoPE powers accurately before FP32 rounding and reciprocation.
+  XLA's previous constant-folded power introduced frequency error that grew with
+  position. Across the full 40,960-position BF16 cache, mean absolute error against
+  vLLM CUDA fell from `2.20206e-5` to `3.64508e-7` (60×). The existing sampled
+  RoPE and QK-normalization/RoPE operation comparisons now match exactly.
+- Use FP32 `log_softmax` before token selection, matching vLLM's shifted arithmetic.
+  Selecting a logit and subtracting `logsumexp` lost precision with large common
+  offsets. A compiled value-and-gradient regression fails before this fix.
+- Let the publication audit select its actual learner backend through
+  `QWEN3_VLLM_LEARNER_BACKEND`. Previously alternative forward backends were
+  compared while optimizer checks always used Tokamax. Require that the selected
+  backend's forward metrics agree with its differentiated training graph.
 
-## Confirmed fix
+The existing BF16 projection accumulation and native LoRA rounding are retained.
+Frozen base-weight hashes match vLLM after both publications; temperature scaling,
+exact token IDs, neutral top-k/top-p, and processed sampling log-probabilities agree.
 
-`Precision.HIGHEST` did not enforce FP32 accumulation for BF16 projections.
-Identical rows produced different results when changing the GEMM row count.
-`qwen3.py` now explicitly requests `BF16_BF16_F32` for BF16 outputs. The FP32
-head retains its original arithmetic, including FP32 backward cotangents.
+## Real-checkpoint results
 
-The CUDA regression's mean absolute error against a BF16-rounded FP32 reference
-fell from `3.88e-4` to `3.82e-6`. It fails before the fix and passes afterward.
-Regression coverage also checks that FP32 head cotangents are not rounded to BF16.
+Two A100 40 GB GPUs; Qwen3-0.6B from `/tmp/rl2-review-qwen3`; JAX 0.11.2,
+vLLM 0.32.0, PyTorch 2.13.0+cu130, Tokamax 0.0.15. BF16 transformer/LoRA,
+FP32 logits, XLA optimization O1, 90% learner memory reservation. Two unequal
+prompts, two turns, 32 tokens per turn, padded context 4,096. Each row compares
+128 sampled tokens against the same published adapter; “updated” follows a real
+Adam step and adapter reload. Separate backend runs have different updated policies.
 
-## Final audit
+| Learner | Publication / temperature | Max log-probability error | Mean error | Ratio range | Outside clip range |
+| --- | --- | ---: | ---: | --- | ---: |
+| Tokamax | Initial / 1.0 | 0.215575 | 0.021594 | 0.83679–1.24058 | 1/128 |
+| Tokamax | Initial / 0.7 | 0.228113 | 0.012725 | 0.79603–1.15022 | 1/128 |
+| Tokamax | Updated / 1.0 | 0.104729 | 0.014350 | 0.93805–1.11041 | 0/128 |
+| Tokamax | Updated / 0.7 | 0.080618 | 0.006955 | 0.92255–1.07671 | 0/128 |
+| cuDNN | Initial / 1.0 | 0.130131 | 0.016960 | 0.87798–1.10586 | 0/128 |
+| cuDNN | Initial / 0.7 | 0.153815 | 0.012387 | 0.85743–1.09332 | 0/128 |
+| cuDNN | Updated / 1.0 | 0.190114 | 0.015136 | 0.87815–1.20939 | 1/128 |
+| cuDNN | Updated / 0.7 | 0.119212 | 0.007909 | 0.88762–1.11729 | 0/128 |
 
-Each row compares 128 sampled tokens against the same published weights.
+Both full-checkpoint audits fail: Tokamax has unchanged-policy false clipping;
+cuDNN also exceeds the candidate-probability limit (`0.06709` versus `0.06`).
+Both optimizer graphs agree with their corresponding standalone forward metrics.
+vLLM's own prefill replay differs from its generation scores by up to `0.15681`.
 
-| Publication / temperature | Max log-probability error | Mean error | Ratio range | Outside [0.8, 1.2] |
-| --- | ---: | ---: | --- | ---: |
-| Initial / 1.0 | 0.143965 | 0.017781 | 0.86592–1.08355 | 0/128 |
-| Initial / 0.7 | 0.267176 | 0.015147 | 0.76554–1.12398 | 1/128 |
-| Updated / 1.0 | 0.106094 | 0.008871 | 0.89934–1.09567 | 0/128 |
-| Updated / 0.7 | 0.187259 | 0.006902 | 0.94581–1.20594 | 1/128 |
+A controlled replay of identical initial tokens compared old/new RoPE with
+Tokamax, cuDNN, and XLA attention. No backend eliminated out-of-range ratios
+across the full audit. More accurate RoPE reduces local error but does not
+monotonically reduce every final-token error: Tokamax's temperature-1 maximum
+fell from `0.239763` to `0.215575`, while its temperature-0.7 maximum rose from
+`0.173155` to `0.228113`. A subsequent stability-focused defaults update selects
+cuDNN for GRPO v2 and ALFWorld because its worst sampled-token error was lower,
+and disables rollout prefetching to avoid policy staleness. This does not resolve
+the parity failures above; the standalone Qwen3 default remains Tokamax.
+The updated environment sets JAX matmul precision to `highest` and disables TF32.
+A tiny uncached CUDA GRPO update and FP32-head gradient check pass with these
+settings. The existing small cached-attention cuDNN test fails to build an
+execution plan even with both new precision settings removed; that path is not
+used by the learner. Configuration/prefetch checks pass (52). The full-checkpoint
+audit has not been repeated with the new environment settings.
 
-**15 focused checks pass; the real-checkpoint audit fails its zero-clipping
-assertion.** Published BF16 weight hashes match, and the optimizer reproduces
-standalone JAX loss/KL/clipping. Temperature 1.0 passes the sampled bounds;
-these synthetic transcripts do not establish parity for full ALFWorld episodes.
+Attention remains a known arithmetic mismatch: Tokamax 0.0.15 rounds scaled
+queries to BF16 before QK multiplication; vLLM FlashAttention scales FP32 scores.
+Reduction order, online softmax, and prefill/decode execution also differ. Earlier
+score-scaling experiments did not consistently improve whole-model parity.
+Disabling PyTorch BF16 reduced-precision reductions made no difference in this
+review's representative Qwen3 projection-shape probe.
 
-## Remaining mismatch
+## Validation and reproduction
 
-At the captured first-layer token, input normalization and Q projection match
-exactly. Attention is the first observed cross-framework divergence: Tokamax
-rounds scaled queries to BF16 before the dot product;
-[FlashAttention](https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/src/softmax.h)
-scales FP32 scores. Softmax/reduction order and prefill/decode kernels also differ.
-
-Moving scaling after the dot improves that token's first-layer attention mean
-error from `5.71e-5` to `1.17e-5`, but the saved rollout's worst log-probability
-error rises to `0.30151`, with 2/128 ratios outside the bounds. cuDNN reaches
-`0.29812`, with 1/128 outside. Neither attention experiment is applied.
-
-The original failing token has vLLM log-probability `-0.55777` versus JAX
-`-0.82495`: ratio `0.76554`, despite identical weights. The projection fix does
-not eliminate this full-batch outlier. Matching attention arithmetic and validating
-both prefill and decode remain necessary before claiming parity.
-
-Whether an out-of-range ratio clips the loss also depends on the advantage sign.
-vLLM's own prefill replay differs from generation by up to `0.13527` log-probability.
-
-## Reproduce
-
-Set `QWEN3_CHECKPOINT` to the local checkpoint directory, then run:
+CPU model/LoRA tests pass (63 passed, 4 GPU-only skips); focused configuration and
+checkpoint checks pass (25). The optimizer suite had 41 passing checks and 3
+multi-device skips before the final log-softmax implementation; the 6 affected
+log-probability/update/learner checks pass with the final code. Sixteen focused CUDA
+operation/model checks pass, including the new full-context RoPE regression.
+Both tiny-model CUDA publication tests pass (tied and untied heads), including
+adapter reloads and optimizer updates. Ruff formatting and lint checks pass.
+The new configuration, RoPE, and log-probability regressions failed before their
+respective fixes. An initial real-checkpoint attempt without the documented O1
+settings exhausted memory during optimization; both O1 audits completed.
+No full test suite or environment training was run.
 
 ```sh
-CUDA_VISIBLE_DEVICES=0 QWEN3_VLLM_DEVICE=1 QWEN3_VLLM_TESTS=1 \
-QWEN3_VLLM_CONTEXT_LENGTH=4096 QWEN3_VLLM_BACKENDS=tokamax-triton \
+CUDA_VISIBLE_DEVICES=0 QWEN3_VLLM_DEVICE=1 JAX_PLATFORMS=cuda \
+JAX_OPTIMIZATION_LEVEL=O1 XLA_PYTHON_CLIENT_PREALLOCATE=true XLA_CLIENT_MEM_FRACTION=0.90 \
+QWEN3_VLLM_TESTS=1 QWEN3_CHECKPOINT=/path/to/checkpoint QWEN3_VLLM_CONTEXT_LENGTH=4096 \
+QWEN3_VLLM_BACKENDS=tokamax-triton QWEN3_VLLM_LEARNER_BACKEND=tokamax \
 QWEN3_VLLM_REPORT_DIR=/tmp/qwen3-parity NCCL_NET=Socket CXX=/usr/bin/g++-12 \
-uv run --env-file nvida.env pytest --confcutdir=tests tests/test_qwen3_vllm.py -k checkpoint -q -s
+uv run pytest --confcutdir=tests tests/test_qwen3_vllm.py -k checkpoint -q -s
 ```
 
-Final artifacts on the test host: `/tmp/rl2-parity-final-accumulation/checkpoint/`.
+For cuDNN, set both backend variables to `cudnn`. Local artifacts:
+`/tmp/rl2-parity-review-fixed/checkpoint/`, `/tmp/rl2-parity-review-cudnn/checkpoint/`,
+`/tmp/rl2-parity-review-tiny/`, `/tmp/rl2-parity-review-replay.json`, and
+`/tmp/rl2-parity-review-kernels.log`.
+These synthetic transcripts do not certify arbitrary prompts, longer contexts,
+other hardware, or training stability. Numerical error must not be hidden by
+replacing the actor's sampling log-probabilities with learner scores.

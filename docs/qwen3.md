@@ -42,8 +42,10 @@ Each response re-prefills the conversation; `--max-new-tokens` defaults to 1024
 per response. Truncated responses and more than four tool rounds stop the demo.
 Use `--demo --help` for model, attention, and sampling options.
 
-Qwen3, its checkpoint loader and CLIs, and GRPO v2 default to BF16 computation
-with Tokamax attention. Tokamax explicitly uses its Triton GPU kernel for full
+Qwen3, its checkpoint loader and CLIs default to BF16 computation with Tokamax
+attention. GRPO v2 and its ALFWorld preset use BF16 with cuDNN, prioritizing the
+lower worst-case sampled-token error measured in the vLLM audit; parity remains
+uncertified. Tokamax explicitly uses its Triton GPU kernel for full
 forward passes, cached decoding, and gradients. Unsupported configurations fail without falling back
 to XLA. Select `--attention-backend xla` (Python: `attention_backend="xla"`)
 for CPU use or the portable reference implementation.
@@ -130,6 +132,9 @@ Transformers installed, run `python tests/qwen3_reference.py`.
 **BF16 parity is not certified.** The native-LoRA audit below passes tiny models
 but exceeds the existing full-model log-probability tolerances. The historical
 merged-weight audit also found false clipping on longer decodes.
+The [2026-10-28 audit](../qwen3_vllm_parity.md) includes corrected RoPE frequency
+construction, modern `rope_parameters` parsing, stable learner log-softmax, and
+both Tokamax and cuDNN optimizer comparisons. Both full-checkpoint audits still fail.
 
 The learner now keeps frozen base weights and FP32 LoRA factors, publishing only
 PEFT adapter files through vLLM's runtime reload API. Both sides now use separate

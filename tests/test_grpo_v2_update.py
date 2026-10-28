@@ -242,7 +242,10 @@ def test_token_log_probs_shift_temperature_and_padding(
     np.testing.assert_allclose(changed[batch.loss_mask[:, 1:]], log_probs[batch.loss_mask[:, 1:]], atol=1e-6)
 
 
-def test_token_log_probs_gradients_match_gather(state: training.LoRATrainState, batch: training.GRPOBatch) -> None:
+@pytest.mark.parametrize("offset", [0.0, 10000.0], ids=["ordinary", "large-common-offset"])
+def test_token_log_probs_gradients_match_gather(
+    state: training.LoRATrainState, batch: training.GRPOBatch, offset: float
+) -> None:
     def apply_fn(
         variables: Variables,
         tokens: jax.Array,  # (B, T-1)
@@ -257,7 +260,7 @@ def test_token_log_probs_gradients_match_gather(state: training.LoRATrainState, 
     batch = batch._replace(token_ids=batch.token_ids.at[:, 1].set(jnp.array([0, 7])))  # (B=2, T=8)
     params = {
         "logits": training.LoRAWeights(
-            a=jnp.arange(112, dtype=jnp.float32).reshape(2, 7, 8) / 10,  # (B, T-1, V=8) fake logits.
+            a=jnp.arange(112, dtype=jnp.float32).reshape(2, 7, 8) / 10 + offset,  # (B, T-1, V=8) fake logits.
             b=jnp.zeros((1,), dtype=jnp.float32),  # (1,) unused factor.
         )
     }
@@ -271,12 +274,55 @@ def test_token_log_probs_gradients_match_gather(state: training.LoRATrainState, 
         selected = jnp.take_along_axis(log_probs, batch.token_ids[:, 1:, None], axis=-1)[..., 0]  # (B, T-1)
         return jnp.where(batch.loss_mask[:, 1:], selected, 0).sum()  # ()
 
-    actual = jax.value_and_grad(selected_loss)(params)  # (), (B, T-1, V) gradient leaf.
-    expected = jax.value_and_grad(reference_loss)(params)  # (), (B, T-1, V) gradient leaf.
+    actual = jax.jit(jax.value_and_grad(selected_loss))(params)  # (), (B, T-1, V) gradient leaf.
+    expected = jax.jit(jax.value_and_grad(reference_loss))(params)  # (), (B, T-1, V) gradient leaf.
     for value, reference in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         assert value.shape == reference.shape
         np.testing.assert_allclose(value, reference, atol=2e-6)
     np.testing.assert_array_equal(actual[1]["logits"].a[~batch.loss_mask[:, 1:]], 0)
+
+
+def test_default_attention_optimizer_on_cuda(mesh_context: None) -> None:
+    if not any("NVIDIA" in device.device_kind for device in jax.devices()):
+        pytest.skip("Requires an NVIDIA GPU with cuDNN")
+    config = training.Config(group_size=2, minibatches_per_epoch=1, lora_rank=1, lora_alpha=2)
+    model = Qwen3LM(
+        config=Qwen3Config(
+            vocab_size=8,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=128,
+            max_position_embeddings=16,
+            eos_token_id=7,
+        ),
+        param_dtype=jnp.bfloat16,
+        attention_backend=config.attention_backend,
+        scan_layers=config.scan_layers,
+        gradient_checkpointing=config.gradient_checkpointing,
+    )
+    tokens = jnp.arange(32, dtype=jnp.int32).reshape(2, 16) % 8  # (B=2, T=16)
+    state = training.create_state(model, model.init(jax.random.key(0), tokens[:, :-1])["params"], config)
+    batch = training.GRPOBatch(
+        token_ids=tokens,  # (B, T)
+        attention_mask=jnp.ones_like(tokens, dtype=jnp.bool_),  # (B, T)
+        loss_mask=jnp.ones_like(tokens, dtype=jnp.bool_),  # (B, T)
+        old_log_probs=jnp.zeros_like(tokens, dtype=jnp.float32),  # (B, T)
+        advantages=jnp.array([1.0, -0.5]),  # (B,)
+    )
+    old = jax.jit(training.token_log_probs, static_argnames="temperature")(
+        state, state.params, batch, temperature=config.temperature
+    )  # (B, T-1)
+    assert old.shape == (2, 15)
+    assert old.dtype == jnp.float32
+    batch = batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))  # (B, T)
+    state, metrics = training.update(state, batch, config.grad_accum_steps, config.temperature, config.clip_coef)
+    assert int(state.step) == 1
+    assert float(metrics["train/clip_fraction"]) == 0
+    assert float(metrics["train/gradient_norm"]) > 0
+    assert any(bool(jnp.any(adapter.b != 0)) for adapter in state.params.values())
 
 
 def test_lora_initialization_and_optimizer_shapes(state: training.LoRATrainState) -> None:

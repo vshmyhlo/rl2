@@ -25,6 +25,7 @@ import pytest
 import torch
 from jax.sharding import Mesh
 from openai import OpenAI
+from pydantic import TypeAdapter
 from safetensors.flax import save_file
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -124,6 +125,34 @@ def test_compiled_operations(operation: str) -> None:
     )
 
 
+def test_rope_cache_matches_vllm_at_full_context() -> None:
+    width, head_dim = 40960, 128
+    positions = jnp.arange(width, dtype=jnp.int32)[None, :]  # (B=1, T)
+    # Rotating [1, 0] exposes the stored cosine and sine without cancellation.
+    values = jnp.broadcast_to(
+        jnp.concatenate((jnp.ones(head_dim // 2), jnp.zeros(head_dim // 2))).astype(jnp.bfloat16),
+        (1, width, 1, head_dim),
+    )  # (B, T, N=1, H)
+    with torch.device("cuda"), set_current_vllm_config(VllmConfig()):
+        rope = RotaryEmbedding(
+            head_size=head_dim,
+            rotary_dim=head_dim,
+            max_position_embeddings=width,
+            base=1e6,
+            is_neox_style=True,
+            dtype=torch.bfloat16,
+        )
+    expected = rope.cos_sin_cache.float().cpu().numpy()  # (T, H)
+    actual = jax.jit(qwen3._rope, static_argnames="theta")(values, positions, 1e6)  # (B, T, N, H)
+    assert actual.shape == (1, width, 1, head_dim)
+    assert actual.dtype == jnp.bfloat16
+    report = errors(actual[0, :, 0], expected)
+    print("full-context RoPE cache", report)
+    # Allow rare CUDA/XLA trigonometric rounding ties, but not frequency drift.
+    assert report["mean_abs"] < 1e-6
+    assert report["max_abs"] <= 0.00390625
+
+
 @dataclass
 class Engine:
     model: qwen3.Qwen3LM
@@ -165,12 +194,15 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
         directory = Path(destination) / request.param
         directory.mkdir(parents=True, exist_ok=True)
     real = request.param == "checkpoint"
+    learner_backend = TypeAdapter(qwen3.AttentionBackend).validate_python(
+        os.environ.get("QWEN3_VLLM_LEARNER_BACKEND", training.DEFAULT_CONFIG.attention_backend)
+    )
     context_length = int(os.environ.get("QWEN3_VLLM_CONTEXT_LENGTH", "256"))
     if context_length < 256 or context_length % training.Config().padding_multiple:
         raise ValueError("QWEN3_VLLM_CONTEXT_LENGTH must be a positive multiple of the training padding (256)")
     if real:
         source = Path(os.environ["QWEN3_CHECKPOINT"]).resolve()
-        model, variables = qwen3.load_qwen3_checkpoint(str(source), dtype="bfloat16")
+        model, variables = qwen3.load_qwen3_checkpoint(str(source), dtype="bfloat16", attention_backend=learner_backend)
     else:
         source = directory / "model"
         source.mkdir(exist_ok=True)
@@ -186,7 +218,7 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
             eos_token_id=2,
             tie_word_embeddings=request.param == "tied",
         )
-        model = qwen3.Qwen3LM(config=config)
+        model = qwen3.Qwen3LM(config=config, attention_backend=learner_backend)
         variables = model.init(jax.random.key(42), jnp.ones((1, 2), jnp.int32))
         # Trained norm scales expose rounding differences hidden by unit initialization.
         variables["params"] = {
@@ -218,6 +250,7 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
                 "device": jax.devices()[0].device_kind,
                 "dtype": "bfloat16",
                 "logits_dtype": "float32",
+                "learner_attention_backend": learner_backend,
                 "master_dtype": "float32",
                 "learning_rate": 1e-4,
                 "padding_multiple": training.Config().padding_multiple if real else 1,
@@ -323,6 +356,7 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
 
 def test_published_rollout_parity(engine: Engine) -> None:
     model, master = engine.model, engine.params
+    learner_backend = "tokamax-triton" if model.attention_backend == "tokamax" else model.attention_backend
     tokens_per_turn = 32 if engine.real else 8
     forwards = {backend: model.clone(attention_backend=backend).apply for backend in ("xla", "cudnn")}
     implementations = ["triton", "cudnn", "xla", "xla_chunked"]
@@ -340,6 +374,7 @@ def test_published_rollout_parity(engine: Engine) -> None:
     if selection := os.environ.get("QWEN3_VLLM_BACKENDS"):
         selected_backends = selection.split(",")
         assert set(selected_backends) <= forwards.keys(), f"Unknown backend in {selection}"
+        assert learner_backend in selected_backends, "The differentiated learner backend must also be audited"
         forwards = {name: forwards[name] for name in selected_backends}
     prompts = [[1], [1, 5, 9, 12, 17, 23, 31]]
     observation = [3, 6, 4]
@@ -584,7 +619,7 @@ def test_published_rollout_parity(engine: Engine) -> None:
         assert optimizer_report["train/gradient_norm"] > 0
         for report in reports:
             if (
-                report["backend"] == "tokamax-triton"
+                report["backend"] == learner_backend
                 and report["temperature"] == temperature
                 and report["version"] == version
             ):
@@ -612,7 +647,7 @@ def test_published_rollout_parity(engine: Engine) -> None:
         assert report["candidate_probs"]["mean_abs"] < (0.0025 if engine.real else 0.0001), report
         assert report["approx_kl"] < (0.0025 if engine.real else 0.0001), report
         assert report["clip_fraction"] <= (0.05 if engine.real else 0), report
-        if report["backend"] == "tokamax-triton":
+        if report["backend"] == learner_backend:
             assert report["clip_fraction"] == 0, report
             if engine.real:
                 long_context = engine.context_length > 256

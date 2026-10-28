@@ -53,21 +53,23 @@ def test_numerical_presets() -> None:
     defaults = training.Config()
     for preset in (Path(__file__).resolve().parents[1] / "configs/grpo_v2").glob("*.yaml"):
         values = yaml.safe_load(preset.read_text())
-        for name in ("attention_backend", "padding_multiple", "scan_layers", "gradient_checkpointing"):
+        for name in ("padding_multiple", "scan_layers", "gradient_checkpointing"):
             assert values[name] == getattr(defaults, name), (preset.name, name)
+        expected_backend = defaults.attention_backend if preset.name == "alfworld.yaml" else "tokamax"
+        assert values["attention_backend"] == expected_backend, preset.name
 
 
 def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     defaults = training.Config()
     assert defaults.minibatches_per_epoch == 4
     assert defaults.grad_accum_steps == 1
-    assert defaults.prefetch_batches == 1
+    assert defaults.prefetch_batches == 0
     assert not defaults.drop_degenerate_groups
     assert defaults.length_penalty_coef == 0.0
     assert defaults.update_epochs == 1
     assert defaults.checkpoint_interval == 100
     assert defaults.padding_multiple == 256
-    assert defaults.attention_backend == training.Qwen3LM().attention_backend == "tokamax"
+    assert defaults.attention_backend == "cudnn"
     assert training.Qwen3LM().dtype == "bfloat16"
     assert defaults.scan_layers
     assert defaults.gradient_checkpointing
@@ -77,16 +79,19 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert defaults.weight_update_pause_mode == "wait"
     preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/alfworld.yaml"
     config = training.load_config(preset, training.Config)
-    assert config.drop_degenerate_groups
-    assert config.prefetch_batches == 4
+    assert not config.drop_degenerate_groups
+    assert config.prefetch_batches == 0
+    assert config.temperature == defaults.temperature == 1.0
     assert config.run_id == (
-        f"grpo_v2_alfworld_Qwen_Qwen3-0.6B_s{config.seed}_ddg{config.drop_degenerate_groups}_pf{config.prefetch_batches}"
+        f"grpo_v2_alfworld_Qwen_Qwen3-0.6B_s{config.seed}_ng{config.num_groups}_gs{config.group_size}"
+        f"_mb{config.minibatches_per_epoch}_ddg{config.drop_degenerate_groups}_pf{config.prefetch_batches}"
+        f"_lp{config.length_penalty_coef}"
     )
     assert config.ckpt_dir == f"/runs/grpo_v2/{config.run_id}"
     assert config.total_iterations is None
-    assert config.minibatches_per_epoch == 4
-    assert config.grad_accum_steps == 1
-    assert config.attention_backend == "tokamax"
+    assert config.minibatches_per_epoch == 1
+    assert config.grad_accum_steps == 8
+    assert config.attention_backend == defaults.attention_backend
     assert config.scan_layers
     assert config.gradient_checkpointing
     assert config.weight_update_pause_mode == "wait"
@@ -179,7 +184,9 @@ def test_reasoning_gym_preset_cli_and_actor_task_stream(monkeypatch: pytest.Monk
     )
     assert pickle.loads(pickle.dumps(config)) == config
     reference = training.load_config(preset.with_name("alfworld.yaml"), training.Config)
-    task_specific = {"taskset", "run_id", "ckpt_dir"}
+    assert config.attention_backend == "tokamax"
+    assert config.prefetch_batches == 1
+    task_specific = {"taskset", "run_id", "ckpt_dir", "attention_backend", "prefetch_batches"}
     assert {name: value for name, value in asdict(config).items() if name not in task_specific} == {
         name: value for name, value in asdict(reference).items() if name not in task_specific
     }

@@ -578,6 +578,9 @@ def test_hlo_audit_validation(
     [
         ({"model_type": "qwen3_moe"}, "dense Qwen3"),
         ({"rope_scaling": {"rope_type": "yarn"}}, "Scaled RoPE"),
+        ({"rope_parameters": {"rope_type": "yarn", "rope_theta": 10000.0}}, "Scaled RoPE"),
+        ({"rope_parameters": {"partial_rotary_factor": 0.5}}, "full-head RoPE"),
+        ({"rope_parameters": {"full_attention": {"rope_theta": 10000.0}}}, "global full-head RoPE"),
         ({"use_sliding_window": True}, "sliding-window"),
         ({"attention_bias": True}, "bias-free"),
         ({"hidden_act": "gelu"}, "SiLU"),
@@ -593,6 +596,17 @@ def test_hlo_audit_validation(
 def test_config_validation(change: dict[str, object], match: str) -> None:
     with pytest.raises(ValueError, match=match):
         Qwen3Config.from_dict({"model_type": "qwen3", **change})
+
+
+def test_config_reads_modern_rope_theta() -> None:
+    config = Qwen3Config.from_dict(
+        {
+            "model_type": "qwen3",
+            "rope_theta": 1_000_000.0,
+            "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0},
+        }
+    )
+    assert config.rope_theta == 10000.0
 
 
 def test_generation(model: Qwen3LM, params: Parameters) -> None:

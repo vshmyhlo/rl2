@@ -118,7 +118,6 @@ from rl2.grpo_v2.reasoning_gym import ReasoningGymConfig, stream_reasoning_gym_t
 from rl2.grpo_v2.state import LoRATrainState
 from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import (
-    DEFAULT_ATTENTION_BACKEND,
     AttentionBackend,
     LoRAParameters,
     LoRAWeights,
@@ -145,7 +144,7 @@ class Config(BaseConfig):
     learner_gpus: Annotated[int, Field(ge=1)] = 1
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4
-    prefetch_batches: Annotated[int, Field(ge=0)] = 1  # Batches generated ahead of the learner; 0 disables prefetch.
+    prefetch_batches: Annotated[int, Field(ge=0)] = 0  # Positive values trade policy staleness for overlap.
     drop_degenerate_groups: bool = False
     length_penalty_coef: Annotated[float, Field(ge=0)] = 0.0  # Per-token cost for nonzero environment rewards.
     total_iterations: Annotated[int | None, Field(ge=1)] = None
@@ -165,7 +164,7 @@ class Config(BaseConfig):
     update_epochs: Annotated[int, Field(ge=1)] = 1
     minibatches_per_epoch: Annotated[int, Field(ge=1)] = 4
     grad_accum_steps: Annotated[int, Field(ge=1)] = 1
-    attention_backend: AttentionBackend = DEFAULT_ATTENTION_BACKEND
+    attention_backend: AttentionBackend = "cudnn"  # Lower worst-case sampled-token error in the A100 vLLM audit.
     scan_layers: bool = True
     gradient_checkpointing: bool = True
     enable_ray_dashboard: bool = False
@@ -386,10 +385,10 @@ def token_log_probs(
         lora_scale=state.lora_scale,
     ).logits  # (B, T-1, V)
     logits = logits.astype(jnp.float32) / temperature  # (B, T-1, V)
+    log_probs = jax.nn.log_softmax(logits, axis=-1)  # (B, T-1, V); stable shifted arithmetic, as in vLLM.
     # Fuse selection's backward pass with softmax instead of scattering into a full FP32 vocabulary buffer.
     targets = jax.nn.one_hot(batch.token_ids[:, 1:], logits.shape[-1], dtype=jnp.bool_)  # (B, T-1, V)
-    selected = jnp.where(targets, logits, 0).sum(axis=-1)  # (B, T-1)
-    return selected - jax.nn.logsumexp(logits, axis=-1)  # (B, T-1)
+    return jnp.where(targets, log_probs, 0).sum(axis=-1)  # (B, T-1)
 
 
 def objective(

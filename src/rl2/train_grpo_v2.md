@@ -48,7 +48,8 @@ The model calls `submit_answer(answer=...)` with a string in the question's
 requested format. One valid submission ends the episode and receives the
 dataset's native `score_answer` reward, including partial credit. Plain text
 without a tool call and truncated responses receive zero reward. The preset
-matches ALFWorld's training settings, including up to 50 turns for recovery from malformed calls. Each
+shares ALFWorld's task budgets, including up to 50 turns for recovery from malformed calls,
+but retains Tokamax and one prefetched batch. Each
 rollout owns a Ray worker for CPU-bound generation and scoring; timeouts and
 cancellation terminate it. Keep task settings and seed unchanged when resuming.
 
@@ -158,13 +159,16 @@ Only the FP32 master factors receive gradients; Adam moments stay FP32 and base 
 Ranks from 1 through 512 are accepted, with vLLM capacity rounded up as needed.
 The native-LoRA GPU audit passes tiny models but exceeds full-model parity tolerances.
 Optimizer state, gradients, log probabilities, and loss use FP32. Learner
-`attention_backend` accepts `tokamax` (default), `xla`, or `cudnn`; `scan_layers` and
-`gradient_checkpointing` default to true. These defaults match the standalone
-Qwen3 model and the [publication parity suite](../../docs/qwen3.md#parity-with-the-grpo-v2-vllm-server).
-BF16 parity is approximate: the real Qwen3-0.6B native-LoRA test reaches 0.179 maximum
-log-probability error at 256 tokens, above its 0.12 limit. See the
-[measured limits](../../docs/qwen3.md#native-lora-audit-2026-10-27);
-zero false clipping on these samples does not certify longer production contexts.
+`attention_backend` defaults to `cudnn`, which had lower worst-case sampled-token
+error in the A100 vLLM audit; `tokamax` and `xla` remain available. `scan_layers`
+and `gradient_checkpointing` default to true. `nvida.env` selects O1, 90% GPU memory
+preallocation, full FP32 matmul precision, and disables TF32. BF16 model computation
+and FP32 logits remain enabled. See the
+[publication parity suite](../../docs/qwen3.md#parity-with-the-grpo-v2-vllm-server).
+The [current audit](../../qwen3_vllm_parity.md) still finds out-of-range ratios
+with unchanged weights at 4,096 tokens, for both Tokamax and cuDNN. Corrected RoPE
+frequencies and FP32 log-softmax reduce specific discrepancies but do not certify
+training parity. Preserve the actor's sampling scores as the importance-ratio denominator.
 Temperature is restricted to `[0.01, 2.0]`; vLLM returns
 `processed_logprobs` with neutral top-p/top-k sampling, matching the learner.
 
@@ -187,12 +191,12 @@ when the optimizer step advances; iterations with all minibatches skipped omit
 `learner/weight_transfer_seconds`. Each publication removes its
 temporary directory after the blocking weight update returns, including on failure.
 The single adapter stays in vLLM memory. Learner and server must share a local filesystem.
-`prefetch_batches: N`
-(default 1) generates up to N batches ahead while the learner optimizes; each
+`prefetch_batches: 0` (default) collects each batch after publishing the latest
+weights, avoiding stale prefetched policies and weight changes within a rollout.
+Positive `prefetch_batches: N` generates up to N batches ahead while the learner optimizes; each
 batch contains `num_groups` rollout groups. The learner consumes batches in
 submission order, waiting for the oldest pending batch. Prefetched rollouts can use older
-weights, and multi-turn rollouts can span weight updates. Set it to 0 to collect
-each batch after publishing the latest weights.
+weights, and multi-turn rollouts can span weight updates.
 `weight_update_pause_mode` accepts `wait` (default), `abort`, or `keep`, operating
 on individual generation requests. Groups can start during publication; vLLM
 queues new generation requests until resume and handles in-flight requests

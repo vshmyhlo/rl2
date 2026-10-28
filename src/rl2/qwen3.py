@@ -82,11 +82,21 @@ class Qwen3Config:
             raise ValueError("Expected a dense Qwen3 checkpoint")
         if values.get("hidden_act", "silu") != "silu" or values.get("attention_bias", False):
             raise ValueError("Only SiLU and bias-free Qwen3 are supported")
-        if values.get("rope_scaling") is not None or values.get("use_sliding_window", False):
+        rope = values.get("rope_parameters") or {}
+        if (
+            values.get("rope_scaling") is not None
+            or rope.get("rope_type", rope.get("type", "default")) != "default"
+            or values.get("use_sliding_window", False)
+        ):
             raise ValueError("Scaled RoPE and sliding-window attention are not supported")
+        if "full_attention" in rope or rope.get("partial_rotary_factor", values.get("partial_rotary_factor", 1)) != 1:
+            raise ValueError("Only global full-head RoPE parameters are supported")
         if any(kind != "full_attention" for kind in values.get("layer_types", [])):
             raise ValueError("Only full-attention layers are supported")
-        return cls(**{field.name: values[field.name] for field in fields(cls) if field.name in values})
+        config = {field.name: values[field.name] for field in fields(cls) if field.name in values}
+        if "rope_theta" in rope:
+            config["rope_theta"] = rope["rope_theta"]
+        return cls(**config)
 
     def parameter_shapes(self) -> dict[str, tuple[int, ...]]:
         d, h = self.hidden_size, self.head_dim
@@ -190,7 +200,9 @@ def _add_rms_norm(
 
 
 def _rope(x: jax.Array, positions: jax.Array, theta: float) -> jax.Array:  # (B, T, heads, H), (B, T)
-    frequencies = theta ** (-jnp.arange(0, x.shape[-1], 2, dtype=jnp.float32) / x.shape[-1])  # (H/2,)
+    # Compute static powers accurately before FP32 rounding; XLA's folded pow drifts at long positions.
+    powers = jnp.asarray([theta ** (index / x.shape[-1]) for index in range(0, x.shape[-1], 2)], jnp.float32)  # (H/2,)
+    frequencies = 1.0 / powers  # (H/2,), matching vLLM's FP32 reciprocal of the positive powers.
     angles = positions[..., None].astype(jnp.float32) * frequencies  # (B, T, H/2)
     angles = jnp.concatenate((angles, angles), axis=-1)[:, :, None, :]  # (B, T, 1, H)
     dtype = x.dtype
