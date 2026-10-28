@@ -1,5 +1,6 @@
 """vLLM server with one-shot adapter reloads for the pinned vLLM 0.32 release."""
 
+import logging
 import runpy
 
 from vllm.entrypoints.openai.models import serving
@@ -19,6 +20,11 @@ class ReloadOnceServingModels(serving.OpenAIServingModels):
 
 
 def main() -> None:
+    def keep_stat_diagnostics(record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.WARNING
+
+    # A filter survives vLLM's logging setup without disabling Prometheus metrics.
+    logging.getLogger("vllm.v1.metrics.loggers").addFilter(keep_stat_diagnostics)
     serving.OpenAIServingModels = ReloadOnceServingModels
     runpy.run_module("vllm.entrypoints.launchers.api_server.entry", run_name="__main__")
 

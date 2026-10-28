@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,9 +15,25 @@ def test_task_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     config = env.AppWorldConfig(python=sys.executable, root="/data/appworld")
     run = Mock(return_value=SimpleNamespace(stdout='startup noise\nRL2_BENCHMARK ["a", "b"]\n'))
     monkeypatch.setattr(env.subprocess, "run", run)
-    tasks = env.load_appworld_tasks(config, timeout=10)
-    assert [task.id for task in tasks] == ["a", "b"]
+    rng = random.Random(42)
+    initial_state = rng.getstate()
+    constructor = Mock(wraps=env.AppWorldTask)
+    monkeypatch.setattr(env, "AppWorldTask", constructor)
+    stream = env.stream_appworld_tasks(config, rng=rng, timeout=10)
+    assert iter(stream) is stream
+    constructor.assert_not_called()
+    assert rng.getstate() == initial_state
+    tasks = [next(stream) for _ in range(5)]
+    reference = random.Random(42)
+    assert [task.id for task in tasks] == [reference.choice(["a", "b"]) for _ in tasks]
+    assert rng.getstate() == reference.getstate()
+    assert constructor.call_count == len(tasks)
     assert all(task.name == "appworld" and task.config == config for task in tasks)
+    state = rng.getstate()
+    continuation = [next(stream) for _ in range(3)]
+    rng.setstate(state)
+    assert [next(stream) for _ in range(3)] == continuation
+    run.assert_called_once()
     command = run.call_args.args[0]
     assert command[:2] == [
         sys.executable,
@@ -44,7 +61,9 @@ def test_task_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_invalid_task_discovery(output: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(env.subprocess, "run", Mock(return_value=SimpleNamespace(stdout=output)))
     with pytest.raises(ValueError):
-        env.load_appworld_tasks(env.AppWorldConfig(python=sys.executable, root="/apps"), timeout=10)
+        env.stream_appworld_tasks(
+            env.AppWorldConfig(python=sys.executable, root="/apps"), rng=random.Random(1), timeout=10
+        )
 
 
 @pytest.mark.parametrize(
@@ -126,7 +145,9 @@ class AppWorld:
 """)
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))
     config = env.AppWorldConfig(python=sys.executable, root="test-root")
-    (task,) = env.load_appworld_tasks(config, timeout=10)
+    stream = env.stream_appworld_tasks(config, rng=random.Random(1), timeout=10)
+    task = next(stream)
+    assert next(stream) == task
 
     async def run() -> None:
         async with task.init_env() as first, task.init_env() as second:

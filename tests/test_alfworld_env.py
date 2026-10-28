@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import sys
 from contextlib import closing
 from pathlib import Path
@@ -155,7 +156,9 @@ def test_dataset_path_is_independent_of_working_directory(
         assert env.discover_games(str(config_file)) == [str(game_file)]
 
 
-@pytest.mark.parametrize("ids", [["a", "b"], [], ["a", "a"], [""]], ids=["valid", "empty", "duplicate", "empty-id"])
+@pytest.mark.parametrize(
+    "ids", [["a", "b"], ["a"], [], ["a", "a"], [""]], ids=["valid", "single", "empty", "duplicate", "empty-id"]
+)
 def test_task_discovery(ids: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
     discover = Mock()
     get = Mock(return_value=ids)
@@ -164,13 +167,28 @@ def test_task_discovery(ids: list[str], monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(env.ray, "get", get)
     monkeypatch.setattr(env.ray, "cancel", cancel)
     config = env.ALFWorldConfig(config_file="config.yaml")
-    if ids == ["a", "b"]:
-        tasks = env.load_alfworld_tasks(config, timeout=10)
-        assert [task.id for task in tasks] == ids
+    rng = random.Random(42)
+    initial_state = rng.getstate()
+    constructor = Mock(wraps=env.ALFWorldTask)
+    monkeypatch.setattr(env, "ALFWorldTask", constructor)
+    if ids in (["a", "b"], ["a"]):
+        stream = env.stream_alfworld_tasks(config, rng=rng, timeout=10)
+        assert iter(stream) is stream
+        constructor.assert_not_called()
+        assert rng.getstate() == initial_state
+        tasks = [next(stream) for _ in range(5)]
+        reference = random.Random(42)
+        assert [task.id for task in tasks] == [reference.choice(ids) for _ in tasks]
+        assert rng.getstate() == reference.getstate()
+        assert constructor.call_count == len(tasks)
         assert all(task.config_file == str(Path("config.yaml").resolve()) for task in tasks)
+        state = rng.getstate()
+        continuation = [next(stream) for _ in range(3)]
+        rng.setstate(state)
+        assert [next(stream) for _ in range(3)] == continuation
     else:
         with pytest.raises(ValueError, match="nonempty and unique"):
-            env.load_alfworld_tasks(config, timeout=10)
+            env.stream_alfworld_tasks(config, rng=rng, timeout=10)
     discover.remote.assert_called_once_with(str(Path("config.yaml").resolve()))
     get.assert_called_once_with(discover.remote.return_value, timeout=10)
     cancel.assert_called_once_with(discover.remote.return_value, force=True)
@@ -183,7 +201,7 @@ def test_task_discovery_timeout_cancels_work(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(env.ray, "get", Mock(side_effect=env.ray.exceptions.GetTimeoutError))
     monkeypatch.setattr(env.ray, "cancel", cancel)
     with pytest.raises(env.ray.exceptions.GetTimeoutError):
-        env.load_alfworld_tasks(env.ALFWorldConfig(config_file="config.yaml"), timeout=1)
+        env.stream_alfworld_tasks(env.ALFWorldConfig(config_file="config.yaml"), rng=random.Random(1), timeout=1)
     cancel.assert_called_once_with(discover.remote.return_value, force=True)
 
 

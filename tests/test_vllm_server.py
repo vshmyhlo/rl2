@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -55,15 +56,29 @@ def test_reload_flag_only_reaches_explicit_engine_updates() -> None:
     assert updates == [("/tmp/first", True), ("/tmp/second", True)]
 
 
-def test_server_installs_reload_workaround_before_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_server_configures_logging_and_reload_before_launch(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     monkeypatch.setattr(server.serving, "OpenAIServingModels", server.serving.OpenAIServingModels)
+    stats_logger = logging.getLogger("vllm.v1.metrics.loggers")
+    monkeypatch.setattr(stats_logger, "filters", [])
+    monkeypatch.setattr(stats_logger, "handlers", [caplog.handler])
+    caplog.set_level(logging.INFO, logger=stats_logger.name)
 
     def launch(module: str, *, run_name: str) -> None:
         assert module == "vllm.entrypoints.launchers.api_server.entry"
         assert run_name == "__main__"
         assert server.serving.OpenAIServingModels is server.ReloadOnceServingModels
+        # vLLM reapplies logger levels during startup.
+        stats_logger.setLevel(logging.INFO)
+        stats_logger.info("Avg prompt throughput: 100 tokens/s")
+        stats_logger.warning("Statistics warning")
+        stats_logger.error("Statistics error")
 
     run_module = Mock(side_effect=launch)
     monkeypatch.setattr(server.runpy, "run_module", run_module)
     server.main()
     run_module.assert_called_once()
+    assert "Avg prompt throughput" not in caplog.text
+    assert "Statistics warning" in caplog.text
+    assert "Statistics error" in caplog.text

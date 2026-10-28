@@ -4,10 +4,11 @@ import json
 import logging
 import os
 import pickle
+import random
 import runpy
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from contextlib import ExitStack, aclosing
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -34,6 +35,7 @@ from vllm.lora.peft_helper import PEFTHelper
 
 from rl2 import train_grpo_v2 as training
 from rl2.agent_task import Environment
+from rl2.alfworld_env import ALFWorldTask
 
 
 @pytest.fixture
@@ -150,21 +152,23 @@ def test_presets_use_telemetry_defaults() -> None:
         assert not config.enable_ray_timeline, preset.name
 
 
-def test_appworld_preset_and_actor_task_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_appworld_preset_and_actor_task_stream(monkeypatch: pytest.MonkeyPatch) -> None:
     preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/appworld.yaml"
     config = training.load_config(preset, training.Config)
     assert config.taskset == training.AppWorldConfig(python="/opt/appworld/bin/python", root="/data/appworld")
     assert pickle.loads(pickle.dumps(config)) == config
     task = Mock(spec=training.Task)
-    load_tasks = Mock(return_value=[task])
-    monkeypatch.setattr(training, "load_appworld_tasks", load_tasks)
+    stream = iter([task])
+    stream_tasks = Mock(return_value=stream)
+    monkeypatch.setattr(training, "stream_appworld_tasks", stream_tasks)
     monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
     monkeypatch.setattr(training, "wait_for_server", Mock())
     actor = training.Actor.__ray_metadata__.modified_class(config)
 
     with actor._server:
-        assert actor.tasks == [task]
-    load_tasks.assert_called_once_with(config.taskset, config.environment_timeout)
+        assert actor.tasks is stream
+        assert next(actor.tasks) is task
+    stream_tasks.assert_called_once_with(config.taskset, actor.rng, config.environment_timeout)
 
 
 def test_reasoning_gym_preset_cli_and_actor_task_stream(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -468,14 +472,15 @@ def test_wait_for_server_detects_exit(returncode: int, monkeypatch: pytest.Monke
 
 
 @pytest.fixture(autouse=True)
-def task_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        training,
-        "load_alfworld_tasks",
-        Mock(
-            return_value=[training.ALFWorldTask(id=f"train/{index}", config_file="config.yaml") for index in range(2)]
-        ),
-    )
+def task_discovery(monkeypatch: pytest.MonkeyPatch) -> list[ALFWorldTask]:
+    tasks = [ALFWorldTask(id=f"train/{index}", config_file="config.yaml") for index in range(2)]
+
+    def stream(config: training.ALFWorldConfig, rng: random.Random, timeout: float) -> Generator[ALFWorldTask]:
+        while True:
+            yield rng.choice(tasks)
+
+    monkeypatch.setattr(training, "stream_alfworld_tasks", Mock(side_effect=stream))
+    return tasks
 
 
 @pytest.fixture(autouse=True)
@@ -505,37 +510,44 @@ def test_actor_suppresses_http_request_logs(actor: Any, caplog: pytest.LogCaptur
 
 
 @pytest.fixture
-def actor(monkeypatch: pytest.MonkeyPatch) -> Any:
+def actor(monkeypatch: pytest.MonkeyPatch, task_discovery: list[ALFWorldTask]) -> Any:
     def init_env() -> AsyncMock:
         environment = AsyncMock()
         environment.__aenter__.return_value = environment
         return environment
 
-    monkeypatch.setattr(training.ALFWorldTask, "init_env", Mock(side_effect=init_env))
+    monkeypatch.setattr(ALFWorldTask, "init_env", Mock(side_effect=init_env))
     monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
     monkeypatch.setattr(training, "wait_for_server", Mock())
     actor = training.Actor.__ray_metadata__.modified_class()
-    monkeypatch.setattr(actor.rng, "choice", Mock(return_value=actor.tasks[0]))
+    monkeypatch.setattr(actor.rng, "choice", Mock(return_value=task_discovery[0]))
     return actor
 
 
-async def collect_and_close(actor: Any, task: training.ALFWorldTask) -> training.RolloutGroup:
+async def collect_and_close(actor: Any, task: ALFWorldTask) -> training.RolloutGroup:
     async with aclosing(actor):
         return await actor.collect_group(task, group_size=2)
 
 
-def test_actor_fetch_next_group(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_actor_fetch_next_group(
+    actor: Any, monkeypatch: pytest.MonkeyPatch, task_discovery: list[ALFWorldTask]
+) -> None:
     collect = AsyncMock(return_value=Mock(spec=training.RolloutGroup))
     monkeypatch.setattr(actor, "collect_group", collect)
 
     result = asyncio.run(actor.fetch_next_group(group_size=2))
 
-    actor.rng.choice.assert_called_once_with(actor.tasks)
-    collect.assert_awaited_once_with(actor.tasks[0], group_size=2)
+    training.stream_alfworld_tasks.assert_called_once_with(
+        actor.config.taskset, actor.rng, actor.config.environment_timeout
+    )
+    actor.rng.choice.assert_called_once_with(task_discovery)
+    collect.assert_awaited_once_with(task_discovery[0], group_size=2)
     assert result.value is collect.return_value
 
 
-def test_actor_reuses_agent(actor: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_actor_reuses_agent(
+    actor: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch, task_discovery: list[ALFWorldTask]
+) -> None:
     agent = AsyncMock()
     entering = asyncio.Event()
     release = asyncio.Event()
@@ -552,26 +564,26 @@ def test_actor_reuses_agent(actor: Any, rollout: training.Rollout, monkeypatch: 
 
     async def collect() -> None:
         async with aclosing(actor), asyncio.timeout(5):
-            first = asyncio.create_task(actor.collect_group(actor.tasks[0], group_size=2))
+            first = asyncio.create_task(actor.collect_group(task_discovery[0], group_size=2))
             await entering.wait()
-            second = asyncio.create_task(actor.collect_group(actor.tasks[1], group_size=2))
+            second = asyncio.create_task(actor.collect_group(task_discovery[1], group_size=2))
             await asyncio.sleep(0)
             create.assert_called_once_with(actor.config)
             release.set()
             groups = await asyncio.gather(first, second)
-            assert [group.task_id for group in groups] == [f"alfworld:{task.id}" for task in actor.tasks[:2]]
-            await actor.collect_group(actor.tasks[0], group_size=2)
+            assert [group.task_id for group in groups] == [f"alfworld:{task.id}" for task in task_discovery[:2]]
+            await actor.collect_group(task_discovery[0], group_size=2)
             agent.__aexit__.assert_not_awaited()
         await actor.aclose()
         with pytest.raises(RuntimeError, match="Actor is closed"):
-            await actor.collect_group(actor.tasks[0], group_size=2)
+            await actor.collect_group(task_discovery[0], group_size=2)
 
     asyncio.run(collect())
     create.assert_called_once_with(actor.config)
     agent.__aenter__.assert_awaited_once()
     agent.__aexit__.assert_awaited_once()
     assert agent.run.await_count == 6
-    assert training.ALFWorldTask.init_env.call_count == 6
+    assert ALFWorldTask.init_env.call_count == 6
     environments = [call.kwargs["env"] for call in agent.run.await_args_list]
     assert len({id(env) for env in environments}) == 6
     for call, env in zip(agent.run.await_args_list, environments, strict=True):
@@ -598,7 +610,9 @@ def test_actor_retries_agent_startup(actor: Any, monkeypatch: pytest.MonkeyPatch
     agent.__aexit__.assert_awaited_once()
 
 
-def test_actor_close_cancels_rollouts(actor: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_actor_close_cancels_rollouts(
+    actor: Any, monkeypatch: pytest.MonkeyPatch, task_discovery: list[ALFWorldTask]
+) -> None:
     agent = AsyncMock()
     agent.__aenter__.return_value = agent
     started = asyncio.Event()
@@ -620,7 +634,7 @@ def test_actor_close_cancels_rollouts(actor: Any, monkeypatch: pytest.MonkeyPatc
 
     async def collect() -> None:
         async with aclosing(actor), asyncio.timeout(5):
-            group = asyncio.create_task(actor.collect_group(actor.tasks[0], group_size=2))
+            group = asyncio.create_task(actor.collect_group(task_discovery[0], group_size=2))
             await started.wait()
             await actor.aclose()
             with pytest.raises(asyncio.CancelledError):
@@ -632,7 +646,9 @@ def test_actor_close_cancels_rollouts(actor: Any, monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.parametrize("startup_fails", [False, True])
-def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_actor_server_lifetime(
+    startup_fails: bool, monkeypatch: pytest.MonkeyPatch, task_discovery: list[ALFWorldTask]
+) -> None:
     config = training.Config(model="Qwen/custom")
     server = MagicMock()
     serve = Mock(return_value=server)
@@ -650,10 +666,10 @@ def test_actor_server_lifetime(startup_fails: bool, monkeypatch: pytest.MonkeyPa
     else:
         actor = training.Actor.__ray_metadata__.modified_class(config=config)
         actor.collect_group = AsyncMock(return_value=group)
-        monkeypatch.setattr(actor.rng, "choice", Mock(return_value=actor.tasks[0]))
+        monkeypatch.setattr(actor.rng, "choice", Mock(return_value=task_discovery[0]))
         for _ in range(2):
             assert asyncio.run(actor.fetch_next_group(group_size=2)).value is group
-        actor.collect_group.assert_awaited_with(actor.tasks[0], group_size=2)
+        actor.collect_group.assert_awaited_with(task_discovery[0], group_size=2)
         assert actor.collect_group.await_count == 2
         server.__exit__.assert_not_called()
         asyncio.run(actor.aclose())
@@ -1625,7 +1641,10 @@ def test_actor_weight_update_lifecycle(
 
 @pytest.mark.parametrize("failure", [None, "http", "cancel"])
 def test_actor_prefetch_during_weight_update(
-    failure: Literal["http", "cancel"] | None, actor: Any, monkeypatch: pytest.MonkeyPatch
+    failure: Literal["http", "cancel"] | None,
+    actor: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    task_discovery: list[ALFWorldTask],
 ) -> None:
     updating = asyncio.Event()
     release = asyncio.Event()
@@ -1646,7 +1665,7 @@ def test_actor_prefetch_during_weight_update(
             update = asyncio.create_task(actor.update_weights("/tmp/adapter-version"))
             await updating.wait()
             assert (await actor.fetch_next_group(group_size=2)).value is actor.collect_group.return_value
-            actor.collect_group.assert_awaited_once_with(actor.tasks[0], group_size=2)
+            actor.collect_group.assert_awaited_once_with(task_discovery[0], group_size=2)
             release.set()
             if failure == "cancel":
                 update.cancel()
@@ -1870,9 +1889,9 @@ def test_group_requires_multiple_rollouts(size: int, actor: Any) -> None:
     ids=["population-std", "fractional-ties", "differences-below-float32-precision"],
 )
 def test_score_group_normalizes_rewards(
-    rewards: list[float], rollout: training.Rollout, actor: Any, monkeypatch: pytest.MonkeyPatch
+    rewards: list[float], rollout: training.Rollout, task_discovery: list[ALFWorldTask]
 ) -> None:
-    task = actor.tasks[0]
+    task = task_discovery[0]
     rollouts = [replace(rollout, reward=reward) for reward in rewards]
     group = training.score_group(task, rollouts)
     assert group.task_id == f"{task.name}:{task.id}"
@@ -1949,7 +1968,11 @@ def test_length_penalty_actor_batcher_integration(
 
 
 def test_batcher_collects_groups_concurrently(
-    actor: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
+    actor: Any,
+    rollout: training.Rollout,
+    monkeypatch: pytest.MonkeyPatch,
+    spans: InMemorySpanExporter,
+    task_discovery: list[ALFWorldTask],
 ) -> None:
     # Actor scoring, transcript construction, and batching must work without JAX.
     monkeypatch.setattr(training, "jax", Mock(spec=[]))
@@ -1972,7 +1995,7 @@ def test_batcher_collects_groups_concurrently(
 
     env.run.side_effect = run
     monkeypatch.setattr(training, "create_agent", Mock(return_value=env))
-    monkeypatch.setattr(actor.rng, "choice", Mock(side_effect=actor.tasks[:2]))
+    monkeypatch.setattr(actor.rng, "choice", Mock(side_effect=task_discovery[:2]))
     handle = Mock()
     handle.fetch_next_group.remote.side_effect = actor.fetch_next_group
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=handle)
@@ -1989,8 +2012,8 @@ def test_batcher_collects_groups_concurrently(
 
     batch = asyncio.run(collect()).value
     assert started == 4
-    assert f"Example 1 | task=alfworld:{actor.tasks[0].id}" in batch.examples
-    assert f"Example 3 | task=alfworld:{actor.tasks[1].id}" in batch.examples
+    assert f"Example 1 | task=alfworld:{task_discovery[0].id}" in batch.examples
+    assert f"Example 3 | task=alfworld:{task_discovery[1].id}" in batch.examples
     assert batch.training_batch.token_ids.shape == (4, 16)
     assert all(isinstance(value, np.ndarray) for value in batch.training_batch)
     env.__aenter__.assert_awaited_once()
@@ -2073,7 +2096,7 @@ def test_rollout_deadline_still_limits_work(actor: Any, monkeypatch: pytest.Monk
 
 
 def test_group_cancels_pending_rollouts(
-    actor: Any, monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter
+    actor: Any, monkeypatch: pytest.MonkeyPatch, spans: InMemorySpanExporter, task_discovery: list[ALFWorldTask]
 ) -> None:
     env = AsyncMock()
     env.__aenter__.return_value = env
@@ -2100,7 +2123,7 @@ def test_group_cancels_pending_rollouts(
         async with aclosing(actor):
             with training.span("test.parent") as parent:
                 try:
-                    await actor.collect_group(actor.tasks[0], group_size=2)
+                    await actor.collect_group(task_discovery[0], group_size=2)
                 except ExceptionGroup:
                     assert otel_trace.get_current_span() is parent
                     raise

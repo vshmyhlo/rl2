@@ -6,10 +6,11 @@ import asyncio
 import json
 import subprocess
 import sys
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from random import Random
 from typing import Annotated, ClassVar
 
 from pydantic import Field, TypeAdapter, ValidationError
@@ -66,7 +67,8 @@ class AppWorldTask(Task):
             yield environment
 
 
-def load_appworld_tasks(config: AppWorldConfig, timeout: float) -> list[AppWorldTask]:
+def stream_appworld_tasks(config: AppWorldConfig, rng: Random, timeout: float) -> Generator[AppWorldTask]:
+    """Discover IDs at startup, then sample tasks with replacement on demand."""
     result = subprocess.run(
         [*worker_command(config), "--list"],
         stdout=subprocess.PIPE,
@@ -81,7 +83,12 @@ def load_appworld_tasks(config: AppWorldConfig, timeout: float) -> list[AppWorld
     ids = TypeAdapter(list[Annotated[str, Field(min_length=1)]]).validate_json(lines[0])
     if not ids or len(ids) != len(set(ids)):
         raise ValueError("AppWorld training task IDs must be nonempty and unique")
-    return [AppWorldTask(id=task_id, config=config) for task_id in ids]
+
+    def stream() -> Generator[AppWorldTask]:
+        while True:
+            yield AppWorldTask(id=rng.choice(ids), config=config)
+
+    return stream()
 
 
 class AppWorldSession(BenchmarkSession, Environment):

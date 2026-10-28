@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, closing, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from io import StringIO
 from os.path import expandvars
 from pathlib import Path
+from random import Random
 from types import TracebackType
 from typing import Any, ClassVar, Literal, Self
 
@@ -268,7 +269,8 @@ class ALFWorldTask(Task):
             yield environment
 
 
-def load_alfworld_tasks(config: ALFWorldConfig, timeout: float) -> list[ALFWorldTask]:
+def stream_alfworld_tasks(config: ALFWorldConfig, rng: Random, timeout: float) -> Generator[ALFWorldTask]:
+    """Discover IDs at startup, then sample tasks with replacement on demand."""
     config_file = str(Path(config.config_file).expanduser().resolve())
     with ExitStack() as resources:
         pending = discover_games_remote.remote(config_file)
@@ -276,7 +278,12 @@ def load_alfworld_tasks(config: ALFWorldConfig, timeout: float) -> list[ALFWorld
         ids = ray.get(pending, timeout=timeout)
     if not ids or any(not task_id for task_id in ids) or len(ids) != len(set(ids)):
         raise ValueError("ALFWorld training task IDs must be nonempty and unique")
-    return [ALFWorldTask(id=task_id, config_file=config_file) for task_id in ids]
+
+    def stream() -> Generator[ALFWorldTask]:
+        while True:
+            yield ALFWorldTask(id=rng.choice(ids), config_file=config_file)
+
+    return stream()
 
 
 @ray.remote

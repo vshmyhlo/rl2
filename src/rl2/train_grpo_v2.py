@@ -111,10 +111,10 @@ from vllm.config.lora import MaxLoRARanks
 
 from rl2.agent_loop import Agent, Rollout, StopCondition, TrainingSequence
 from rl2.agent_task import Task
-from rl2.alfworld_env import ALFWorldConfig, ALFWorldTask, load_alfworld_tasks
-from rl2.appworld_env import AppWorldConfig, AppWorldTask, load_appworld_tasks
+from rl2.alfworld_env import ALFWorldConfig, stream_alfworld_tasks
+from rl2.appworld_env import AppWorldConfig, stream_appworld_tasks
 from rl2.configuration import BaseConfig, load_config
-from rl2.grpo_v2.reasoning_gym import ReasoningGymConfig, ReasoningGymTask, stream_reasoning_gym_tasks
+from rl2.grpo_v2.reasoning_gym import ReasoningGymConfig, stream_reasoning_gym_tasks
 from rl2.grpo_v2.state import LoRATrainState
 from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import (
@@ -961,13 +961,13 @@ class Actor:
         self._agent_lock = asyncio.Lock()
         self._runs: set[asyncio.Task[Rollout]] = set()
         self._closed = False
-        self.tasks: list[ALFWorldTask] | list[AppWorldTask] | Generator[ReasoningGymTask]
+        self.tasks: Generator[Task]
         if isinstance(config.taskset, ReasoningGymConfig):
             self.tasks = stream_reasoning_gym_tasks(config.taskset, self.rng)
         elif isinstance(config.taskset, AppWorldConfig):
-            self.tasks = load_appworld_tasks(config.taskset, config.environment_timeout)
+            self.tasks = stream_appworld_tasks(config.taskset, self.rng, config.environment_timeout)
         else:
-            self.tasks = load_alfworld_tasks(config.taskset, config.environment_timeout)
+            self.tasks = stream_alfworld_tasks(config.taskset, self.rng, config.environment_timeout)
         logger.info("Starting actor and vLLM on its assigned GPU")
         with self._server as resources:
             server = resources.enter_context(serve_vllm(model=config.model, lora_rank=config.lora_rank))
@@ -1002,7 +1002,7 @@ class Actor:
         self.rng.setstate((state["version"], tuple(state["state"]), state["gauss_next"]))
 
     async def fetch_next_group(self, group_size: int) -> Transfer[RolloutGroup]:
-        task = self.rng.choice(self.tasks) if isinstance(self.tasks, list) else next(self.tasks)
+        task = next(self.tasks)
         group = await self.collect_group(task, group_size=group_size)
         return Transfer(value=group, ready_at=time.monotonic())
 

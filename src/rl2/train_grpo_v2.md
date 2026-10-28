@@ -8,13 +8,13 @@ Prepare the official ALFWorld training data with `alfworld-download`, set
 `ALFWORLD_DATA`, and point `taskset.config_file` at a configuration whose
 `dataset.data_path` selects the training split. Relative dataset paths resolve
 against that configuration file. All six task types and every eligible solvable
-training game are loaded; expert observations are disabled.
+training game IDs are discovered at startup; expert observations are disabled.
 
 For [AppWorld](https://github.com/StonyBrookNLP/appworld), install `appworld` in a separate Python environment, then run
 `appworld install` and `APPWORLD_ROOT=/data/appworld appworld download data` there.
 Set `taskset.python` to that environment's Python executable and `taskset.root`
 to the data root in `configs/grpo_v2/appworld.yaml`, and use that preset below.
-The adapter loads the official training split and exposes `execute(code=...)`.
+The adapter discovers IDs from the official training split and exposes `execute(code=...)`.
 Each rollout owns a subprocess and temporary output directory. Python variables
 persist between calls; API discovery and task completion use the preloaded `apis`
 object. Completion awards `float(world.evaluate().success)` once; earlier steps
@@ -29,14 +29,20 @@ uv run python -m rl2.train_grpo_v2 --config configs/grpo_v2/alfworld.yaml
 For [Reasoning Gym](https://github.com/open-thought/reasoning-gym), use
 `--config configs/grpo_v2/reasoning_gym.yaml`; no separate installation is needed.
 Set `taskset.task` to a registered dataset name and `taskset.task_config` to its
-difficulty parameters. Tasks stream indefinitely without an in-memory task list:
-each group samples a 32-bit dataset seed and generates one puzzle on demand.
+difficulty parameters. Each group samples a 32-bit dataset seed and generates one puzzle on demand.
 Every attempt in a group receives the same question. The top-level `seed`
 determines the stream, and the checkpointed task RNG restores its continuation.
 Repeated puzzles are possible. There is no `taskset.size`; `task_config` cannot
-override `seed` or `size`. ALFWorld and AppWorld still sample their finite catalogs.
+override `seed` or `size`.
 For weighted mixtures, use `task: composite` and put a list of
 `{name: leg_counting, weight: 1, config: {}}` entries in `task_config.datasets`.
+
+All tasksets provide an indefinite stream, creating one task per requested group.
+ALFWorld and AppWorld retain their discovered ID catalogs and sample uniformly
+with replacement; task objects and environments are created on demand.
+Task discovery completes during actor startup, outside the async rollout loop.
+The checkpointed task RNG restores each stream's continuation; keep the task
+configuration and finite catalogs unchanged when resuming.
 
 The model calls `submit_answer(answer=...)` with a string in the question's
 requested format. One valid submission ends the episode and receives the
@@ -214,8 +220,9 @@ Local and `gs://` paths are supported.
 
 Console logging defaults to INFO. The driver and workers use standard Python logging
 with timestamp, severity, source location, and message, omitting Ray IDs
-and other metadata. vLLM uses its default logging configuration with HTTP
-access logs disabled. The rollout actor sets HTTPX logging to WARNING to suppress routine
+and other metadata. vLLM HTTP access logs and periodic statistics INFO messages
+are suppressed; Prometheus metrics, warnings, and errors remain enabled.
+The rollout actor sets HTTPX logging to WARNING to suppress routine
 HTTP request messages while retaining warnings and errors. ALFWorld loader
 initialization output is suppressed on success and replayed on failure; output
 from environment steps remains enabled. Existing cluster jobs need a new image and
