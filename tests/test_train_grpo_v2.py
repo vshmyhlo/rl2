@@ -56,9 +56,15 @@ def test_attention_backend_config(backend: AttentionBackend) -> None:
 def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     defaults = training.Config()
     assert defaults.finetuning_mode == "lora"
+    assert defaults.learning_rate == 1e-6
+    assert defaults.weight_decay == 0.0
+    assert defaults.adamw_kwargs["weight_decay"] == 0.0
+    assert defaults.adamw_batch_size_scale == 1.0
     assert defaults.minibatches_per_epoch == 4
     assert defaults.grad_accum_steps == 1
     assert defaults.prefetch_batches == 0
+    assert defaults.prefetch_mode == "next_in_order"
+    assert defaults.parameter_sync_step == 1
     assert not defaults.drop_degenerate_groups
     assert defaults.length_penalty_coef == 0.0
     assert defaults.update_epochs == 1
@@ -93,7 +99,11 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
                 "length_penalty_coef": 0.01,
                 "rollout_is_threshold": 3.0,
                 "prefetch_batches": 3,
+                "prefetch_mode": "next_ready",
+                "parameter_sync_step": 4,
                 "finetuning_mode": "full",
+                "weight_decay": 0.05,
+                "adamw_batch_size_scale": 0.5,
             }
         )
     )
@@ -117,10 +127,59 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
             length_penalty_coef=0.01,
             rollout_is_threshold=3.0,
             prefetch_batches=3,
+            prefetch_mode="next_ready",
+            parameter_sync_step=4,
             finetuning_mode="full",
+            weight_decay=0.05,
+            adamw_batch_size_scale=0.5,
         )
     )
     assert pickle.loads(pickle.dumps(config)) == config
+
+
+@pytest.mark.parametrize(
+    "batch_size_scale,expected",
+    [
+        (1.0, {"learning_rate": 1e-6, "b1": 0.9, "b2": 0.999, "eps": 1e-8, "weight_decay": 0.01}),
+        (
+            0.5,
+            {
+                "learning_rate": 7.071067811865476e-7,
+                "b1": 0.95,
+                "b2": 0.9995,
+                "eps": 1.414213562373095e-8,
+                "weight_decay": 0.007071067811865476,
+            },
+        ),
+        (
+            2.0,
+            {
+                "learning_rate": 1.4142135623730952e-6,
+                "b1": 0.8,
+                "b2": 0.998,
+                "eps": 7.071067811865475e-9,
+                "weight_decay": 0.014142135623730952,
+            },
+        ),
+        (
+            10.0,
+            {
+                "learning_rate": 3.16227766016838e-6,
+                "b1": 0.0,
+                "b2": 0.99,
+                "eps": 3.162277660168379e-9,
+                "weight_decay": 0.0316227766016838,
+            },
+        ),
+    ],
+    ids=["identity", "smaller-batch", "larger-batch", "zero-beta1-boundary"],
+)
+def test_adamw_scaling(batch_size_scale: float, expected: dict[str, float]) -> None:
+    config = training.Config(adamw_batch_size_scale=batch_size_scale, weight_decay=0.01)
+    assert config.adamw_kwargs == pytest.approx(expected)
+    assert config.learning_rate == 1e-6
+    assert config.weight_decay == 0.01
+    assert (config.num_groups, config.group_size, config.minibatches_per_epoch, config.grad_accum_steps) == (1, 4, 4, 1)
 
 
 def test_example_log_interval_config(tmp_path: Path) -> None:
@@ -200,6 +259,9 @@ def test_reasoning_gym_cli_and_actor_task_stream(tmp_path: Path, monkeypatch: py
         {"group_size": 1},
         {"prefetch_batches": -1},
         {"prefetch_batches": 1.5},
+        {"prefetch_mode": "invalid"},
+        {"parameter_sync_step": 0},
+        {"parameter_sync_step": 1.5},
         {"total_iterations": 0},
         {"checkpoint_interval": 0},
         {"checkpoint_interval": 1.5},
@@ -215,6 +277,10 @@ def test_reasoning_gym_cli_and_actor_task_stream(tmp_path: Path, monkeypatch: py
         {"group_size": 2.5},
         {"unknown_option": 1},
         {"learning_rate": 0.0},
+        {"weight_decay": -0.01},
+        {"adamw_batch_size_scale": 0.0},
+        {"adamw_batch_size_scale": -0.5},
+        {"adamw_batch_size_scale": 10.01},
         {"length_penalty_coef": -0.01},
         {"clip_coef": 1.0},
         {"rollout_is_threshold": 0.0},
@@ -519,7 +585,7 @@ def test_actor_fetch_next_group(
     )
     actor.rng.choice.assert_called_once_with(task_discovery)
     collect.assert_awaited_once_with(task_discovery[0], group_size=2)
-    assert result.value is collect.return_value
+    assert result is collect.return_value
 
 
 def test_actor_reuses_agent(
@@ -649,7 +715,7 @@ def test_actor_server_lifetime(
         actor.collect_group = AsyncMock(return_value=group)
         monkeypatch.setattr(actor.rng, "choice", Mock(return_value=task_discovery[0]))
         for _ in range(2):
-            assert asyncio.run(actor.fetch_next_group(group_size=2)).value is group
+            assert asyncio.run(actor.fetch_next_group(group_size=2)) is group
         actor.collect_group.assert_awaited_with(task_discovery[0], group_size=2)
         assert actor.collect_group.await_count == 2
         server.__exit__.assert_not_called()
@@ -724,9 +790,8 @@ def test_learner_pulls_groups_through_batcher(
     actor = Mock()
     learner.config = replace(learner.config, num_groups=num_groups, group_size=3, minibatches_per_epoch=1)
     groups = [training.RolloutGroup(task_id=str(i), rollouts=[rollout] * 3) for i in range(num_groups)]
-    results = [training.Transfer(value=group, ready_at=training.time.monotonic()) for group in groups]
     actor.fetch_next_group.remote = AsyncMock(
-        side_effect=[results[0], RuntimeError("rollout failed")] if fails else results
+        side_effect=[groups[0], RuntimeError("rollout failed")] if fails else groups
     )
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor)
     batcher_handle = Mock()
@@ -763,15 +828,24 @@ def test_learner_pulls_groups_through_batcher(
 
 
 @pytest.mark.parametrize(
-    ("prefetch_batches", "checkpoint_interval", "total_iterations"),
-    [(0, 100, 9), (3, 100, 12), (3, 12, None)],
-    ids=["disabled", "final-iteration", "checkpoint"],
+    ("prefetch_batches", "checkpoint_interval", "total_iterations", "prefetch_mode", "expected_order"),
+    [
+        (0, 100, 9, "next_in_order", [0, 1]),
+        (3, 100, 12, "next_in_order", [0, 1, 2, 3, 4]),
+        (3, 12, None, "next_in_order", [0, 1, 2, 3, 4]),
+        (0, 100, 9, "next_ready", [0, 1]),
+        (3, 100, 12, "next_ready", [3, 4, 2, 1, 0]),
+        (3, 12, None, "next_ready", [3, 4, 2, 1, 0]),
+    ],
+    ids=["ordered-disabled", "ordered-end", "ordered-checkpoint", "ready-disabled", "ready-end", "ready-checkpoint"],
 )
-def test_learner_prefetches_bounded_batches_in_order(
+def test_learner_prefetches_bounded_batches(
     learner: Any,
     prefetch_batches: int,
     checkpoint_interval: int,
     total_iterations: int | None,
+    prefetch_mode: Literal["next_ready", "next_in_order"],
+    expected_order: list[int],
     rollout: training.Rollout,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -781,23 +855,22 @@ def test_learner_prefetches_bounded_batches_in_order(
         group_size=2,
         minibatches_per_epoch=1,
         prefetch_batches=prefetch_batches,
+        prefetch_mode=prefetch_mode,
         checkpoint_interval=checkpoint_interval,
         total_iterations=total_iterations,
     )
     batch = training.build_rollout_batch(
         groups=[training.RolloutGroup(task_id="0", rollouts=[rollout] * 2)],
         training_batch=Mock(spec=training.GRPOBatch, attention_mask=np.ones((2, 2), dtype=np.bool_)),  # (B, T)
-        transfer_metrics={},
+        timing_metrics={},
     )
-    results = [
-        training.Transfer(value=replace(batch, examples=str(i)), ready_at=0.0) for i in range(prefetch_batches + 2)
-    ]
+    results = [replace(batch, examples=str(i)) for i in range(prefetch_batches + 2)]
     submit = learner.batcher.fetch_next_batch.remote
     submit.side_effect = results
 
     def wait_next(refs: list[Any], *, num_returns: int) -> tuple[list[Any], list[Any]]:
         assert num_returns == 1
-        # Later submissions are ready first, but must not overtake the oldest.
+        # Simulate later submissions completing before the oldest.
         return refs[-1:], refs[:-1]
 
     wait = Mock(side_effect=wait_next)
@@ -808,18 +881,21 @@ def test_learner_prefetches_bounded_batches_in_order(
     monkeypatch.setattr(training.ray, "cancel", cancel)
 
     first = learner.fetch_next_batch(iteration=8)
-    assert first.examples == "0"
+    assert first.examples == str(expected_order[0])
     assert submit.call_count == prefetch_batches + 1
-    get.assert_called_once_with(results[0])
+    get.assert_called_once_with(results[expected_order[0]])
     second = learner.fetch_next_batch(iteration=9)
-    assert second.examples == "1"
+    assert second.examples == str(expected_order[1])
     assert submit.call_count == prefetch_batches + 2
     for index in range(2, len(results)):
-        assert learner.fetch_next_batch(iteration=8 + index).examples == str(index)
+        assert learner.fetch_next_batch(iteration=8 + index).examples == str(expected_order[index])
     assert submit.call_count == len(results)
     assert all(call.kwargs["include_examples"] for call in submit.call_args_list)
-    assert [call.args[0] for call in get.call_args_list] == results
-    wait.assert_not_called()
+    assert [call.args[0] for call in get.call_args_list] == [results[index] for index in expected_order]
+    if prefetch_mode == "next_ready":
+        assert wait.call_count == len(results)
+    else:
+        wait.assert_not_called()
     learner.cancel_pending_batches()
     cancel.assert_not_called()
 
@@ -832,11 +908,10 @@ def test_learner_cancels_prefetch_on_update_failure(
     batch = training.build_rollout_batch(
         groups=[training.RolloutGroup(task_id="0", rollouts=[rollout] * 4)],
         training_batch=Mock(spec=training.GRPOBatch, attention_mask=np.ones((4, 2), dtype=np.bool_)),  # (B, T)
-        transfer_metrics={},
+        timing_metrics={},
     )
-    first = training.Transfer(value=batch, ready_at=0.0)
     pending = [Mock() for _ in range(3)]
-    learner.batcher.fetch_next_batch.remote.side_effect = [first, *pending]
+    learner.batcher.fetch_next_batch.remote.side_effect = [batch, *pending]
     monkeypatch.setattr(training.ray, "get", lambda value: value)
     cancel = Mock()
     monkeypatch.setattr(training.ray, "cancel", cancel)
@@ -855,6 +930,26 @@ def test_learner_cancels_prefetch_on_update_failure(
     assert cancel.call_count == len(pending)
 
 
+def test_learner_next_ready_batch_failure_preserves_pending_for_cleanup(
+    learner: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    learner.config = replace(learner.config, prefetch_batches=2, prefetch_mode="next_ready")
+    pending = [Mock() for _ in range(3)]
+    learner.batcher.fetch_next_batch.remote.side_effect = pending
+    monkeypatch.setattr(training.ray, "wait", Mock(return_value=([pending[-1]], pending[:-1])))
+    get = Mock(side_effect=RuntimeError("batch failed"))
+    monkeypatch.setattr(training.ray, "get", get)
+    cancel = Mock()
+    monkeypatch.setattr(training.ray, "cancel", cancel)
+
+    with pytest.raises(RuntimeError, match="batch failed"):
+        learner.fetch_next_batch(iteration=1)
+    get.assert_called_once_with(pending[-1])
+    learner.cancel_pending_batches()
+    assert [call.args[0] for call in cancel.call_args_list] == pending
+    assert all(call.kwargs == {"recursive": True} for call in cancel.call_args_list)
+
+
 @pytest.mark.parametrize("drop_degenerate_groups", [False, True])
 def test_batch_refills_degenerate_groups(drop_degenerate_groups: bool, rollout: training.Rollout) -> None:
     groups = [
@@ -862,16 +957,13 @@ def test_batch_refills_degenerate_groups(drop_degenerate_groups: bool, rollout: 
         for index, rewards in enumerate(((0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0)))
     ]
     actor = Mock()
-    actor.fetch_next_group.remote = AsyncMock(
-        side_effect=[training.Transfer(value=group, ready_at=training.time.monotonic()) for group in groups]
-    )
+    actor.fetch_next_group.remote = AsyncMock(side_effect=groups)
     batcher = training.Batcher.__ray_metadata__.modified_class(
         actor=actor, config=training.Config(drop_degenerate_groups=drop_degenerate_groups)
     )
 
-    result = asyncio.run(batcher.fetch_next_batch(num_groups=2, group_size=2, context_length=8, include_examples=True))
+    batch = asyncio.run(batcher.fetch_next_batch(num_groups=2, group_size=2, context_length=8, include_examples=True))
 
-    batch = result.value
     expected_groups = groups[2:] if drop_degenerate_groups else groups[:2]
     assert actor.fetch_next_group.remote.await_count == (4 if drop_degenerate_groups else 2)
     assert all(call.kwargs == {"group_size": 2} for call in actor.fetch_next_group.remote.call_args_list)
@@ -901,20 +993,17 @@ def test_batch_failure_cancels_pending_fetches(drop_degenerate_groups: bool, rol
     cleaned_up = asyncio.Event()
     requested = 0
 
-    async def fetch_group(group_size: int) -> training.Transfer[training.RolloutGroup]:
+    async def fetch_group(group_size: int) -> training.RolloutGroup:
         nonlocal requested
         requested += 1
         if drop_degenerate_groups and requested == 1:
-            return training.Transfer(
-                value=training.RolloutGroup(task_id="degenerate", rollouts=[rollout] * 2),
-                ready_at=training.time.monotonic(),
-            )
+            return training.RolloutGroup(task_id="degenerate", rollouts=[rollout] * 2)
         if requested == 1 + drop_degenerate_groups:
             await started.wait()
             raise RuntimeError("rollout failed")
         started.set()
         try:
-            return await asyncio.Future[training.Transfer[training.RolloutGroup]]()
+            return await asyncio.Future[training.RolloutGroup]()
         finally:
             cleaned_up.set()
 
@@ -940,7 +1029,7 @@ def test_batch_failure_cancels_pending_fetches(drop_degenerate_groups: bool, rol
     batcher.prepare_batch.assert_not_called()
 
 
-def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
+def test_batch_timings_and_order_survive_serialization(
     learner: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     learner.config = replace(learner.config, num_groups=2, group_size=2)
@@ -953,20 +1042,18 @@ def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
     fast_ready = asyncio.Event()
     requested = 0
 
-    async def fetch_group(group_size: int) -> training.Transfer[training.RolloutGroup]:
+    async def fetch_group(group_size: int) -> training.RolloutGroup:
         nonlocal requested
         assert group_size == 2
         index = requested
         requested += 1
         if index == 0:
             await fast_ready.wait()
-            ready_at, received_at = 50.0, 50.5
+            received_at = 50.5
         else:
-            ready_at, received_at = 10.0, 10.25
+            received_at = 10.25
             fast_ready.set()
-        result = training.Transfer(value=groups[index], ready_at=ready_at)
-        # Account for the full return path, including serialization/deserialization.
-        result = pickle.loads(pickle.dumps(result))
+        result = pickle.loads(pickle.dumps(groups[index]))
         clock.return_value = received_at
         return result
 
@@ -983,9 +1070,8 @@ def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
 
     monkeypatch.setattr(batcher, "prepare_batch", prepare)
 
-    def get(pending: Any) -> training.Transfer[training.RolloutBatch]:
+    def get(pending: Any) -> training.RolloutBatch:
         result = asyncio.run(pending)
-        assert result.ready_at == 52.5
         result = pickle.loads(pickle.dumps(result))
         clock.return_value = 53.25
         return result
@@ -997,11 +1083,9 @@ def test_ray_transfer_timings_exclude_generation_and_slow_group_wait(
     assert "Example 1 | task=0" in batch.examples
     assert "Example 3 | task=1" in batch.examples
     assert batch.training_batch.token_ids.shape == (4, 8)
-    assert batch.transfer_metrics == {
+    assert batch.timing_metrics == {
         "batcher/fetch_rollout_seconds": 50.5,
         "batcher/prepare_batch_seconds": 2.0,
-        "batcher/actor_transfer_seconds_mean": 0.375,
-        "learner/batcher_transfer_seconds": 0.75,
     }
     assert not [record for record in caplog.records if record.name == training.__name__]
 
@@ -1116,7 +1200,7 @@ def test_learner_logs_rollouts(
     caplog: pytest.LogCaptureFixture,
     spans: InMemorySpanExporter,
 ) -> None:
-    learner.config = replace(learner.config, finetuning_mode=mode)
+    learner.config = replace(learner.config, finetuning_mode=mode, adamw_batch_size_scale=4.0)
     caplog.set_level("INFO", logger=training.__name__)
     sequence = training.TrainingSequence(
         token_ids=np.array([1], dtype=np.int32),  # (T=1,)
@@ -1165,23 +1249,21 @@ def test_learner_logs_rollouts(
     monkeypatch.setattr(training.ray, "get", Mock())
     steps = Mock()
     learner.fetch_next_batch = steps.fetch
-    transfer_metrics = {
+    timing_metrics = {
         "batcher/fetch_rollout_seconds": 0.5,
         "batcher/prepare_batch_seconds": 0.25,
-        "batcher/actor_transfer_seconds_mean": 0.25,
-        "learner/batcher_transfer_seconds": 0.125,
     }
     prepared = Mock(spec=training.GRPOBatch)
     prepared.token_ids = Mock(shape=(4, 8))  # (B=4, T=8)
     prepared.attention_mask = np.tile([True, True, False, False, False, False, False, False], (4, 1))  # (B=4, T=8)
-    received = training.build_rollout_batch(groups=batch, training_batch=prepared, transfer_metrics=transfer_metrics)
+    received = training.build_rollout_batch(groups=batch, training_batch=prepared, timing_metrics=timing_metrics)
     next_batch = training.build_rollout_batch(
         groups=[
             replace(group, rollouts=[replace(rollout, stop_condition="environment_done") for rollout in group.rollouts])
             for group in batch
         ],
         training_batch=prepared,
-        transfer_metrics=transfer_metrics,
+        timing_metrics=timing_metrics,
     )
     learner.fetch_next_batch.side_effect = [received, RuntimeError("done") if fails else next_batch]
     learner.publish_weights = steps.publish
@@ -1257,7 +1339,7 @@ def test_learner_logs_rollouts(
     }
     assert calls[1].kwargs == {"step": 1}
     assert calls[1].args[0] == {
-        **transfer_metrics,
+        **timing_metrics,
         "train/policy_loss": -0.25,
         "rollout/reward_mean": mean(rewards),
         "rollout/reward_std": pstdev(rewards),
@@ -1282,7 +1364,7 @@ def test_learner_logs_rollouts(
         "batcher/padded_sequence_tokens": 8.0,
         "train/iterations_total": 1,
         "train/updates_total": 1,
-        "train/learning_rate": learner.config.learning_rate,
+        "train/learning_rate": learner.config.learning_rate * 2,
         "train/rollouts_total": 4,
         "learner/iterations_per_second": 1 / 3,
         "learner/rollouts_per_second": 4 / 3,
@@ -1308,7 +1390,7 @@ def test_learner_logs_rollouts(
     assert "Run ID: None; MLflow run: mlflow-run" in caplog.messages
     assert (
         f"iteration=1 reward={mean(rewards):.3f} degenerate_group_fraction={degenerate_fraction:.3f} "
-        "batch=1.00s group_transfer=0.250000s batch_transfer=0.125000s "
+        "batch=1.00s "
         "loss=-0.2500 update=1.00s weights=1.00s"
     ) in caplog.messages
     writer.__exit__.assert_called_once()
@@ -1344,7 +1426,7 @@ def test_learner_skips_publication_without_updates(
             stop_counts={},
             num_output_tokens=4,
             examples="",
-            transfer_metrics={"batcher/actor_transfer_seconds_mean": 0.0, "learner/batcher_transfer_seconds": 0.0},
+            timing_metrics={},
         )
     )
     increments = iter((0, 1, 0))  # All skipped, partially skipped, then all skipped at a nonzero step.
@@ -1376,6 +1458,68 @@ def test_learner_skips_publication_without_updates(
     assert int(progress.train_state.step) == 1
 
 
+def test_learner_parameter_sync_cadence(learner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    learner.config = replace(
+        learner.config, parameter_sync_step=3, update_epochs=2, total_iterations=7, checkpoint_interval=2
+    )
+    writer = MagicMock()
+    writer.__enter__.return_value = writer
+    monkeypatch.setattr(training, "MLflowLogger", Mock(return_value=writer))
+    monkeypatch.setattr(training, "time", Mock(monotonic=Mock(side_effect=range(100))))
+    prepared = Mock(spec=training.GRPOBatch)
+    prepared.token_ids = Mock(shape=(4, 2))  # (B=4, T=2)
+    learner.fetch_next_batch = Mock(
+        return_value=training.RolloutBatch(
+            training_batch=prepared,
+            rollout_metrics={"rollout/reward_mean": 1.0, "rollout/degenerate_group_fraction": 0.0},
+            stop_counts={},
+            num_output_tokens=4,
+            examples="",
+            timing_metrics={},
+        )
+    )
+    increments = iter([8, 1, 0, 0, 0, 0, 2, 8, 8, 8])
+    published_steps: list[int] = []
+
+    def optimize(batch: training.GRPOBatch[np.ndarray]) -> dict[str, float]:  # (B, T), (B,) leaves.
+        learner.state = learner.state.replace(step=learner.state.step + next(increments))
+        return {"train/policy_loss": 0.0}
+
+    def publish() -> None:
+        published_steps.append(int(learner.state.step))
+
+    learner.optimize = optimize
+    learner.publish_weights = publish
+    learner.start()
+    # Batch 3 publishes earlier updates despite being skipped; batch 6 has no new weights.
+    assert published_steps == [0, 9]
+    metrics = [call.args[0] for call in writer.log_metrics.call_args_list[1:]]
+    assert [values["train/updates_total"] for values in metrics] == [8, 9, 9, 9, 9, 9, 11]
+    assert [values.get("learner/weight_transfer_seconds") for values in metrics] == [
+        None,
+        None,
+        1.0,
+        None,
+        None,
+        None,
+        None,
+    ]
+    progress = training.save_checkpoint.call_args.args[1]
+    assert int(progress.train_state.step) == 11
+    assert [call.args[1].iteration for call in training.save_checkpoint.call_args_list] == [2, 4, 6, 7]
+
+    # Resume publishes immediately; scheduled publication stays on cumulative batch 9.
+    training.restore_checkpoint.return_value = progress
+    learner.config = replace(learner.config, total_iterations=10)
+    published_steps.clear()
+    writer.reset_mock()
+    learner.start()
+    assert published_steps == [11, 27]
+    calls = writer.log_metrics.call_args_list[1:]
+    assert [call.kwargs["step"] for call in calls] == [8, 9, 10]
+    assert [call.args[0].get("learner/weight_transfer_seconds") for call in calls] == [None, 1.0, None]
+
+
 def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     learner.config = replace(learner.config, total_iterations=3, checkpoint_interval=2, prefetch_batches=4)
     published_steps: list[int] = []
@@ -1399,10 +1543,7 @@ def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.Monke
             stop_counts={"max_turns" if not saved else "agent_completed": num_rollouts},
             num_output_tokens=4,
             examples="",
-            transfer_metrics={
-                "batcher/actor_transfer_seconds_mean": 0.0,
-                "learner/batcher_transfer_seconds": 0.0,
-            },
+            timing_metrics={},
         )
 
     def optimize(batch: training.GRPOBatch[np.ndarray]) -> dict[str, float]:
@@ -1446,7 +1587,7 @@ def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.Monke
     assert metrics["train/rollouts_total"] == 28
     assert metrics["train/updates_total"] == 28
     assert metrics["rollout/stop_fraction/max_turns"] == 0
-    assert metrics["checkpoint/save_seconds"] == 0.5
+    assert metrics["checkpoint/save_blocking_seconds"] == 0.5
 
     # A run already at its cumulative target does not train or overwrite its checkpoint.
     learner.fetch_next_batch.reset_mock()
@@ -1507,20 +1648,19 @@ def test_learner_logs_examples_at_configured_interval(
     prepared = Mock(spec=training.GRPOBatch)
     prepared.token_ids = Mock(shape=(10, 8))  # (B=10, T=8)
     prepared.attention_mask = np.ones((10, 8), dtype=np.bool_)  # (B=10, T=8)
-    submitted: list[training.Transfer[training.RolloutBatch]] = []
+    submitted: list[training.RolloutBatch] = []
 
     def fetch(
         num_groups: int, group_size: int, context_length: int, *, include_examples: bool
-    ) -> training.Transfer[training.RolloutBatch]:
+    ) -> training.RolloutBatch:
         batch = training.build_rollout_batch(
             groups=[replace(groups[0], task_id=f"batch-{len(submitted) + 1}"), groups[1]],
             training_batch=prepared,
-            transfer_metrics={"batcher/actor_transfer_seconds_mean": 0.0},
+            timing_metrics={},
             include_examples=include_examples,
         )
-        result = training.Transfer(value=batch, ready_at=training.time.monotonic())
-        submitted.append(result)
-        return result
+        submitted.append(batch)
+        return batch
 
     learner.batcher.fetch_next_batch.remote.side_effect = fetch
     monkeypatch.setattr(training.ray, "get", lambda value: value)
@@ -1853,7 +1993,7 @@ def test_length_penalty_actor_batcher_integration(
 
     async def collect() -> training.RolloutBatch:
         async with aclosing(actor):
-            return (await batcher.fetch_next_batch(num_groups=1, group_size=2, context_length=8)).value
+            return await batcher.fetch_next_batch(num_groups=1, group_size=2, context_length=8)
 
     batch = asyncio.run(collect())
     assert handle.fetch_next_group.remote.call_count == 1
@@ -1898,7 +2038,7 @@ def test_batcher_collects_groups_concurrently(
     handle.fetch_next_group.remote.side_effect = actor.fetch_next_group
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=handle)
 
-    async def collect() -> training.Transfer[training.RolloutBatch]:
+    async def collect() -> training.RolloutBatch:
         async with aclosing(actor):
             with training.span("test.batch") as parent:
                 async with asyncio.timeout(5):
@@ -1908,7 +2048,7 @@ def test_batcher_collects_groups_concurrently(
                 assert otel_trace.get_current_span() is parent
                 return result
 
-    batch = asyncio.run(collect()).value
+    batch = asyncio.run(collect())
     assert started == 4
     assert f"Example 1 | task=alfworld:{task_discovery[0].id}" in batch.examples
     assert f"Example 3 | task=alfworld:{task_discovery[1].id}" in batch.examples

@@ -5,7 +5,7 @@ from collections.abc import Generator
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import Mock
 
 import httpx
@@ -74,7 +74,7 @@ def test_prepare_batch(batcher: Any, groups: list[training.RolloutGroup], contex
         )
         groups[0].rollouts[index] = replace(sample, sequence=sequence)
     batch = batcher.prepare_batch(groups, context_length=context_length)  # (B=2, T=width), (B,) leaves.
-    result = training.build_rollout_batch(groups=groups, training_batch=batch, transfer_metrics={})
+    result = training.build_rollout_batch(groups=groups, training_batch=batch, timing_metrics={})
     assert result.rollout_metrics["batcher/token_utilization_fraction"] == pytest.approx(8 / (2 * width))
     assert result.rollout_metrics["rollout/total_tokens_mean"] == 4.0
     assert result.rollout_metrics["batcher/padded_sequence_tokens"] == width
@@ -118,7 +118,7 @@ def test_prepare_batch_bucket_boundaries(
     sample = rollout([1] * length, [False] + [True] * (length - 1), 1.0)
     groups = [training.RolloutGroup(task_id="0", rollouts=[sample])]
     batch = batcher.prepare_batch(groups, context_length=context_length)  # (B=1, T=width), (B,) leaves.
-    result = training.build_rollout_batch(groups=groups, training_batch=batch, transfer_metrics={})
+    result = training.build_rollout_batch(groups=groups, training_batch=batch, timing_metrics={})
     assert result.rollout_metrics["batcher/token_utilization_fraction"] == pytest.approx(length / width)
     assert result.rollout_metrics["batcher/padded_sequence_tokens"] == width
     assert all(array.shape == (1, width) for array in batch[:-1])
@@ -134,7 +134,7 @@ def test_prepare_minimal_sequences_and_multiple_groups(batcher: Any) -> None:
         training.RolloutGroup(task_id="1", rollouts=[rollout([3, 4, 5], [False, True, True], 1.0)]),
     ]
     batch = batcher.prepare_batch(groups, context_length=8)  # (B=2, T=8), (B,) leaves.
-    result = training.build_rollout_batch(groups=groups, training_batch=batch, transfer_metrics={})
+    result = training.build_rollout_batch(groups=groups, training_batch=batch, timing_metrics={})
     assert result.rollout_metrics["batcher/token_utilization_fraction"] == 5 / 16
     assert result.rollout_metrics["rollout/total_tokens_mean"] == 2.5
     assert batch.token_ids.shape == (2, 8)
@@ -412,6 +412,38 @@ def test_default_attention_optimizer_on_cuda(mesh_context: None) -> None:
     assert float(metrics["train/rollout_log_prob_error_mean"]) == pytest.approx(float(jnp.log(1.5)), abs=1e-6)
     assert float(metrics["train/gradient_norm"]) > 0
     assert any(bool(jnp.any(adapter.b != 0)) for adapter in state.params.values())
+
+
+@pytest.mark.parametrize(
+    "mode,weight_decay",
+    [("full", 0.05), ("lora", 0.05), ("full", 0.0)],
+    ids=["full", "lora", "disabled"],
+)
+def test_optimizer_weight_decay(model: Qwen3LM, mode: Literal["lora", "full"], weight_decay: float) -> None:
+    config = training.Config(finetuning_mode=mode, learning_rate=0.1, weight_decay=weight_decay, lora_rank=1)
+    params = {"model.layers.0.self_attn.q_proj.weight": jnp.ones((2, 2), dtype=jnp.float32)}  # (O=2, I=2)
+    state = training.create_state(model, params, config)
+    grads = jax.tree.map(jnp.zeros_like, state.params)  # Full: (O, I); LoRA: (R, I), (O, R).
+    updated = state.apply_gradients(grads=grads)
+    for before, after in zip(jax.tree.leaves(state.params), jax.tree.leaves(updated.params), strict=True):
+        assert after.shape == before.shape
+        np.testing.assert_allclose(after, before * (1 - config.learning_rate * weight_decay), rtol=1e-6)
+
+
+def test_scaled_optimizer_updates() -> None:
+    config = training.Config(finetuning_mode="full", learning_rate=0.1, weight_decay=0.05, adamw_batch_size_scale=4.0)
+    params = {"weight": jnp.ones(2, dtype=jnp.float32)}  # (D=2,)
+    state = training.create_state(Mock(), params, config)
+    reference = optax.adamw(learning_rate=0.2, b1=0.6, b2=0.996, eps=5e-9, weight_decay=0.1)
+    reference_state = reference.init(params)
+    for gradient in ([1e-8, -2e-8], [-3e-8, 1e-8]):
+        grads = {"weight": jnp.asarray(gradient, dtype=jnp.float32)}  # (D,)
+        state = state.apply_gradients(grads=grads)
+        updates, reference_state = reference.update(grads, reference_state, params)  # (D,) updates; optimizer state.
+        params = optax.apply_updates(params, updates)  # (D,)
+        assert state.params["weight"].shape == (2,)
+        np.testing.assert_allclose(state.params["weight"], params["weight"], rtol=1e-6)
+    assert training.Config(adamw_batch_size_scale=4.0, weight_decay=0.0).adamw_kwargs["weight_decay"] == 0.0
 
 
 def test_lora_initialization_and_optimizer_shapes(state: training.LoRATrainState) -> None:

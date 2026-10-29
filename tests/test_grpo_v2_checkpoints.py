@@ -3,9 +3,12 @@
 import asyncio
 import json
 import random
+from contextlib import ExitStack
 from dataclasses import asdict, replace
+from functools import partial
 from itertools import repeat
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -53,9 +56,9 @@ def test_checkpoint_roundtrip_and_retention(tmp_path: Path, progress: training.T
         assert training.restore_checkpoint(manager, fresh, config) is None
         training.save_checkpoint(manager, replace(progress, iteration=1), config)
         training.save_checkpoint(manager, progress, config)
+    with training.checkpoint_manager(config.ckpt_dir) as manager:
         assert manager.all_steps() == [2]
         assert not (tmp_path / "checkpoints" / "1").exists()
-    with training.checkpoint_manager(config.ckpt_dir) as manager:
         metadata = manager.restore(
             2, args=training.ocp.args.Composite(metadata=training.ocp.args.JsonRestore())
         ).metadata
@@ -90,6 +93,7 @@ def test_checkpoint_roundtrip_and_retention(tmp_path: Path, progress: training.T
         actual = restored.train_state.apply_gradients(grads=gradients)
         chex.assert_trees_all_equal((actual.params, actual.opt_state), (expected.params, expected.opt_state))
         training.save_checkpoint(manager, replace(restored, iteration=3), config)
+        manager.wait_until_finished()
         assert manager.all_steps() == [3]
         assert not (tmp_path / "checkpoints" / "2").exists()
     with training.checkpoint_manager(str(tmp_path / "new-run")) as manager:
@@ -180,35 +184,63 @@ def test_full_weight_checkpoint(tmp_path: Path, progress: training.TrainingProgr
     config = training.Config(finetuning_mode="full", ckpt_dir=str(tmp_path))
     state = training.create_state(Mock(), progress.train_state.base_params, config)
     updated = state.apply_gradients(grads=jax.tree.map(jnp.ones_like, state.params))
+    expected = jax.tree.map(jnp.copy, updated)  # Parameter/moment shapes; () optimizer step.
+
+    @partial(jax.jit, donate_argnums=(0,))
+    def update(state: training.TrainState) -> training.TrainState:
+        return state.apply_gradients(grads=jax.tree.map(jnp.ones_like, state.params))
+
     with training.checkpoint_manager(config.ckpt_dir) as manager:
         training.save_checkpoint(manager, replace(progress, train_state=updated), config)
+        advanced = update(updated)
+        assert int(advanced.step) == int(expected.step) + 1
+        manager.wait_until_finished()
         restored = training.restore_checkpoint(manager, state, replace(config, lora_rank=1, lora_alpha=1))
         assert restored is not None
         assert type(restored.train_state) is training.TrainState
         chex.assert_trees_all_equal(
             (restored.train_state.params, restored.train_state.opt_state, restored.train_state.step),
-            (updated.params, updated.opt_state, updated.step),
+            (expected.params, expected.opt_state, expected.step),
         )
         with pytest.raises(ValueError, match="checkpoint finetuning_mode does not match"):
             training.restore_checkpoint(manager, progress.train_state, replace(config, finetuning_mode="lora"))
 
 
-def test_checkpoint_waits_for_writes_and_propagates_failure(
+def test_checkpoint_dispatches_without_waiting_and_propagates_failure(
     progress: training.TrainingProgress, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock = Mock(monotonic=Mock(side_effect=[1.0, 6.0, 7.0]))
     monkeypatch.setattr(training, "time", clock)
     manager = Mock()
 
-    def wait() -> None:
-        assert clock.monotonic.call_count == 1
-
-    manager.wait_until_finished.side_effect = wait
     assert training.save_checkpoint(manager, progress, training.Config()) == 5.0
     assert manager.save.call_args.kwargs["force"]
-    manager.wait_until_finished.side_effect = OSError("write failed")
+    manager.wait_until_finished.assert_not_called()
+    manager.save.side_effect = OSError("write failed")
     with pytest.raises(OSError, match="write failed"):
         training.save_checkpoint(manager, progress, training.Config())
+
+
+def test_async_checkpoint_failure_propagates_on_close(tmp_path: Path, progress: training.TrainingProgress) -> None:
+    release = Event()
+
+    def fail_finalize() -> None:
+        assert release.wait(timeout=10), "save did not return while finalization was pending"
+        raise OSError("background save failed")
+
+    with pytest.raises(OSError, match="background save failed"), ExitStack() as resources:
+        manager = resources.enter_context(
+            training.ocp.CheckpointManager(
+                str(tmp_path),
+                options=training.ocp.CheckpointManagerOptions(
+                    enable_async_checkpointing=True,
+                    async_options=training.ocp.AsyncOptions(post_finalization_callback=fail_finalize),
+                ),
+            )
+        )
+        resources.callback(release.set)
+        training.save_checkpoint(manager, progress, training.Config())
+        assert manager.is_saving_in_progress()
 
 
 def test_checkpoint_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -217,5 +249,6 @@ def test_checkpoint_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.chdir(tmp_path)
     training.checkpoint_manager("gs://bucket/run/")
     assert manager.call_args.args[0] == "gs://bucket/run/checkpoints"
+    assert manager.call_args.kwargs["options"].enable_async_checkpointing
     training.checkpoint_manager("runs/run/")
     assert manager.call_args.args[0] == str(tmp_path / "runs/run/checkpoints")

@@ -167,6 +167,25 @@ Separate `train/rollout_log_prob_error_mean`, `train/rollout_importance_weight_m
 and `train/rollout_importance_weight_clipped_fraction` expose the anchor/rollout
 gap and applied correction. All policy diagnostics exclude skipped minibatches.
 
+Both finetuning modes use AdamW with reference defaults `learning_rate: 1e-6`,
+Optax's `beta1: 0.9`, `beta2: 0.999`, and `eps: 1e-8`, and `weight_decay: 0.0`
+(disabled). Set `weight_decay` in the YAML to any nonnegative value.
+When enabled, decay applies to all trainable parameters, including LoRA factors in LoRA mode.
+
+`adamw_batch_size_scale: 1.0` leaves AdamW unchanged. Set this factor (`k`) to the
+new/reference optimizer batch-size ratio (for example, `0.5` or `2.0`) to scale
+learning rate and weight decay by
+`sqrt(k)`, use `beta1 = 1 - 0.1*k` and `beta2 = 1 - 0.001*k`, and divide epsilon
+(`1e-8`) by `sqrt(k)`. `learning_rate` and `weight_decay` remain reference values;
+`train/learning_rate` reports the effective scaled rate. Require `0 < k <= 10`
+to keep beta1 nonnegative; `adamw_batch_size_scale: 10` disables first-moment smoothing.
+This is an approximate scaling rule; weight-decay scaling assumes equal numbers
+of processed rollouts across runs.
+
+`adamw_batch_size_scale` only scales the optimizer. Configure the actual batch separately:
+`num_groups * group_size / minibatches_per_epoch` rollouts per update.
+Changing only `grad_accum_steps` does not change that batch size.
+
 Set `finetuning_mode: full` to optimize all model weights, including
 embeddings, normalization, and the output head, with FP32 master weights and Adam
 moments. This uses substantially more GPU memory than LoRA. Tied embeddings and
@@ -231,17 +250,29 @@ learner and checkpoints. The NCCL group is closed when the learner exits.
 To check repeated NCCL publication on two GPUs, run
 `QWEN3_VLLM_TESTS=1 CUDA_VISIBLE_DEVICES=0 QWEN3_VLLM_DEVICE=1 uv run pytest tests/test_qwen3_vllm.py -k nccl_full_weight_publication`.
 The learner waits for the actor and vLLM to become ready before initializing its publisher.
-The initial weights are published before any rollouts. Later publications occur only
-when the optimizer step advances; iterations with all minibatches skipped omit
-`learner/weight_transfer_seconds`. Each LoRA publication removes its
+The initial weights are published before any rollouts. `parameter_sync_step: 1`
+(default) publishes after each training batch; `4` publishes every fourth batch,
+regardless of PPO minibatch count or update epochs. All completed batches count,
+including batches with skipped updates. Scheduled publication runs only if the
+optimizer step has advanced since the last publication. The cumulative iteration
+count preserves the schedule across restarts. Startup and resume also publish
+immediately. Checkpoints and training completion do not force an extra publication
+before the interval ends.
+`learner/weight_transfer_seconds` is omitted when no publication runs;
+`learner/update_seconds` excludes publication time.
+Each LoRA publication removes its
 temporary directory after the blocking weight update returns, including on failure.
 The loaded weights stay in vLLM memory. This trainer runs on one host; LoRA also
 requires a shared local filesystem.
-`prefetch_batches: 0` (default) collects each batch after publishing the latest
-weights, avoiding stale prefetched policies and weight changes within a rollout.
+`prefetch_batches: 0` (default) collects each batch without overlapping training,
+avoiding weight changes within a rollout. With `parameter_sync_step: 1`, each
+batch uses the latest learner weights; longer sync intervals can retain older weights.
 Positive `prefetch_batches: N` generates up to N batches ahead while the learner optimizes; each
-batch contains `num_groups` rollout groups. The learner consumes batches in
-submission order, waiting for the oldest pending batch. Prefetched rollouts can use older
+batch contains `num_groups` rollout groups. `prefetch_mode: next_in_order` (default)
+consumes batches in submission order, waiting for the oldest pending batch.
+Set `prefetch_mode: next_ready` to consume whichever pending batch is ready first,
+allowing faster batches to overtake slower ones. Both modes retain the same prefetch
+limits and drain pending batches before checkpoints and training completion. Prefetched rollouts can use older
 weights, and multi-turn rollouts can span weight updates.
 `weight_update_pause_mode` accepts `wait` (default) or `keep`, operating
 on individual generation requests. Groups can start during publication; vLLM
@@ -259,6 +290,11 @@ multi-turn rollout can still span updates.
 
 `ckpt_dir/checkpoints` stores Orbax checkpoints every `checkpoint_interval`
 iterations and at normal completion, retaining only the latest checkpoint.
+Orbax stages the arrays before returning, then writes asynchronously while training
+continues. A subsequent save waits for any previous save, and shutdown waits for
+outstanding writes and propagates save failures. `checkpoint/save_blocking_seconds`
+measures save dispatch, including staging and any previous-save wait, excluding
+the new checkpoint's background writes.
 Prefetching drains on checkpoint iterations so the saved task RNG does not
 skip unconsumed batches. Restarting with the same directory restores model weights (including LoRA factors in LoRA mode),
 optimizer state, shuffle key, task RNG, and progress counters. `total_iterations` is a cumulative

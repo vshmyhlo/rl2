@@ -5,7 +5,7 @@ pause/resume mechanism queues new requests and handles in-flight requests
 according to weight_update_pause_mode.
 
 MLflow's metric step counts completed training iterations: one rollout batch,
-its optimizer updates, and publication of the updated weights. All metrics below
+its optimizer updates, and any scheduled weight publications. All metrics below
 are logged every iteration except startup scalars, weight-transfer timing, checkpoint timing,
 and unevaluated policy diagnostics.
 
@@ -50,7 +50,7 @@ Training progress and settings:
     train/iterations_total: Cumulative completed training iterations.
     train/updates_total: Cumulative optimizer updates, excluding skipped minibatches.
     train/rollouts_total: Cumulative rollouts used for training.
-    train/learning_rate: Configured optimizer learning rate.
+    train/learning_rate: Effective optimizer learning rate after AdamW batch-size scaling.
 
 Timing and throughput (logged every iteration unless noted):
     learner/iterations_per_second: Reciprocal of iteration wall time.
@@ -60,15 +60,12 @@ Timing and throughput (logged every iteration unless noted):
     batcher/fetch_rollout_seconds: Wall time fetching all rollout groups, including actor return transfers.
     batcher/prepare_batch_seconds: Wall time preparing the CPU training arrays without explicit synchronization.
     learner/batch_fetch_seconds: Wall time fetching the rollout batch, including generation, scoring, and Ray transfers.
-    learner/update_seconds: Device transfer and optimizer update wall time.
+    learner/update_seconds: Device transfer and optimizer update wall time, excluding weight publication.
     learner/weight_transfer_seconds: Wall time publishing weights to vLLM; logged only on publication.
     learner/iteration_seconds: Batch fetching, optimization, and weight publication wall time.
-    checkpoint/save_seconds: Checkpoint save wall time, including completion of writes; logged on saves.
-    batcher/actor_transfer_seconds_mean: Mean group transfer latency from actor return to batcher receipt.
-    learner/batcher_transfer_seconds: Time from batcher return to learner receipt, including prefetch buffering.
-Ray transfer latencies include serialization, transport, deserialization, and
-scheduling, using a shared single-node monotonic clock. Timing intervals overlap
-and should not be summed. Iteration timing and throughput exclude that iteration's
+    checkpoint/save_blocking_seconds: Blocking save dispatch wall time, including staging and any previous-save wait;
+        excludes background writes for this checkpoint; logged on saves.
+Timing intervals overlap and should not be summed. Iteration timing and throughput exclude that iteration's
 metric and example logging and checkpoint saves. Cumulative counters include resumed training.
 Output-token counts include every sampled token, including thinking and end-of-turn tokens.
 """
@@ -148,6 +145,8 @@ class Config(BaseConfig):
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4
     prefetch_batches: Annotated[int, Field(ge=0)] = 0  # Positive values trade policy staleness for overlap.
+    prefetch_mode: Literal["next_ready", "next_in_order"] = "next_in_order"
+    parameter_sync_step: Annotated[int, Field(ge=1)] = 1  # Completed training batches between weight publications.
     drop_degenerate_groups: bool = False
     length_penalty_coef: Annotated[float, Field(ge=0)] = 0.0  # Per-token cost for nonzero environment rewards.
     total_iterations: Annotated[int | None, Field(ge=1)] = None
@@ -159,7 +158,10 @@ class Config(BaseConfig):
     rollout_timeout: Annotated[float, Field(gt=0)] = 120
     environment_timeout: Annotated[float, Field(gt=0)] = 600
     temperature: Annotated[float, Field(ge=0.01, le=2.0)] = 1.0  # vLLM clamps smaller positive values to 0.01.
-    learning_rate: Annotated[float, Field(gt=0)] = 1e-5
+    learning_rate: Annotated[float, Field(gt=0)] = 1e-6
+    weight_decay: Annotated[float, Field(ge=0)] = 0.0
+    # New/reference optimizer batch-size ratio; configure batch dimensions separately.
+    adamw_batch_size_scale: Annotated[float, Field(gt=0, le=10)] = 1.0
     finetuning_mode: Literal["lora", "full"] = "lora"
     lora_rank: Annotated[int, Field(ge=1, le=512)] = 16
     lora_alpha: Annotated[float, Field(gt=0)] = 32.0
@@ -186,6 +188,18 @@ class Config(BaseConfig):
         if self.num_groups * self.group_size % (self.minibatches_per_epoch * self.grad_accum_steps * self.learner_gpus):
             raise ValueError("learner_gpus must divide the microbatch size")
 
+    @property
+    def adamw_kwargs(self) -> dict[str, float]:
+        """Scale reference hyperparameters by the configured batch-size ratio."""
+        scale = self.adamw_batch_size_scale**0.5
+        return {
+            "learning_rate": self.learning_rate * scale,
+            "b1": 1 - self.adamw_batch_size_scale * 0.1,
+            "b2": 1 - self.adamw_batch_size_scale * 0.001,
+            "eps": 1e-8 / scale,
+            "weight_decay": self.weight_decay * scale,
+        }
+
 
 DEFAULT_CONFIG = Config()
 
@@ -200,14 +214,17 @@ class TrainingProgress:
 
 
 def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
+    """Manage checkpoints under the run directory, retaining only the latest."""
     directory = f"{run_dir.rstrip('/')}/checkpoints"
     if not directory.startswith("gs://"):
         directory = str(Path(directory).resolve())
-    return ocp.CheckpointManager(directory, options=ocp.CheckpointManagerOptions(max_to_keep=1))
+    return ocp.CheckpointManager(
+        directory, options=ocp.CheckpointManagerOptions(max_to_keep=1, enable_async_checkpointing=True)
+    )
 
 
 def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, config: Config) -> float:
-    """Save a completed iteration and wait for writes before reusing learner buffers."""
+    """Stage a completed iteration for background writing before reusing learner buffers."""
     started = time.monotonic()
     manager.save(
         progress.iteration,
@@ -231,15 +248,15 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
         ),
         force=True,
     )
-    manager.wait_until_finished()
     seconds = time.monotonic() - started
-    logger.info("Saved checkpoint at iteration %s in %.1fs", progress.iteration, seconds)
+    logger.info("Dispatched async checkpoint at iteration %s in %.1fs", progress.iteration, seconds)
     return seconds
 
 
 def restore_checkpoint(
     manager: ocp.CheckpointManager, train_state: TrainState, config: Config
 ) -> TrainingProgress | None:
+    """Restore the latest compatible checkpoint, or return None if none exists."""
     iteration = manager.latest_step()
     if iteration is None:
         return None
@@ -284,6 +301,7 @@ class RolloutGroup:
 
     @property
     def training_rewards(self) -> list[float]:
+        """Apply the output-length penalty only to nonzero rewards."""
         return [
             rollout.reward - self.length_penalty_coef * rollout.num_output_tokens if rollout.reward != 0 else 0.0
             for rollout in self.rollouts
@@ -291,14 +309,9 @@ class RolloutGroup:
 
     @property
     def is_degenerate(self) -> bool:
+        """Whether all adjusted rewards are equal, yielding zero group advantages."""
         rewards = self.training_rewards
         return all(reward == rewards[0] for reward in rewards)
-
-
-@dataclass(frozen=True)
-class Transfer[T]:
-    value: T
-    ready_at: float  # Same-node monotonic timestamp immediately before Ray serializes the return value.
 
 
 def format_rollout_examples(groups: list[RolloutGroup]) -> str:
@@ -332,13 +345,13 @@ class RolloutBatch:
     stop_counts: dict[StopCondition, int]
     num_output_tokens: int
     examples: str
-    transfer_metrics: dict[str, float | int]
+    timing_metrics: dict[str, float | int]
 
 
 def build_rollout_batch(
     groups: list[RolloutGroup],
     training_batch: GRPOBatch[np.ndarray],  # Leaves: (B, T), except advantages: (B,).
-    transfer_metrics: dict[str, float | int],
+    timing_metrics: dict[str, float | int],
     *,
     include_examples: bool = False,
 ) -> RolloutBatch:
@@ -369,7 +382,7 @@ def build_rollout_batch(
         stop_counts=Counter(rollout.stop_condition for rollout in rollouts),
         num_output_tokens=sum(rollout.num_output_tokens for rollout in rollouts),
         examples=format_rollout_examples(groups) if include_examples else "",
-        transfer_metrics=transfer_metrics,
+        timing_metrics=timing_metrics,
     )
 
 
@@ -425,7 +438,10 @@ def compute_anchor_log_probs(
     microbatch_size: int,
     temperature: float,
 ) -> jax.Array:  # (B, T-1)
-    """(B, T-1) frozen learner scores, using the optimizer's microbatch shape."""
+    """(B, T-1) detached learner scores to reuse across all updates of this batch.
+
+    Use the optimizer's microbatch shape; skip scoring if all advantages are zero.
+    """
     size, width = batch.token_ids.shape
     if microbatch_size < 1 or size % microbatch_size:
         raise ValueError("microbatch_size must be positive and divide the rollout batch size")
@@ -461,6 +477,11 @@ def objective(
     clip_coef: float,
     rollout_is_threshold: float = 2.0,
 ) -> tuple[jax.Array, Metrics]:  # (), scalar metric leaves
+    """Compute PPO loss against frozen anchors with detached rollout correction.
+
+    Upper-truncate anchor/rollout importance weights before applying them to the
+    clipped surrogate. Average sampled tokens per rollout, then average rollouts.
+    """
     mask = batch.loss_mask[:, 1:]  # (B, T-1)
     anchor_log_probs = jax.lax.stop_gradient(anchor_log_probs)  # (B, T-1)
 
@@ -495,7 +516,10 @@ def create_state(
     config: Config,
 ) -> TrainState:
     """Optimize FP32 full weights or LoRA factors on attention and MLP projections."""
-    optimizer = optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adamw(config.learning_rate))
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(config.max_grad_norm),
+        optax.adamw(**config.adamw_kwargs),
+    )
     if config.finetuning_mode == "full":
         return TrainState.create(
             apply_fn=model.apply,
@@ -546,7 +570,11 @@ def update(
     clip_coef: float,
     rollout_is_threshold: float = 2.0,
 ) -> tuple[TrainState, Metrics]:
-    """Consume state buffers, skipping zero-advantage updates; requires a `batch` mesh context and positional args."""
+    """Accumulate microbatch gradients and apply one optimizer step.
+
+    Donates state buffers; skips the step if all advantages are zero. Requires a
+    `batch` mesh context and positional arguments for the sharded JIT inputs.
+    """
     if grad_accum_steps < 1 or batch.token_ids.shape[0] % grad_accum_steps:
         raise ValueError("grad_accum_steps must be positive and divide the minibatch size")
     if batch.token_ids.shape[0] % (grad_accum_steps * jax.sharding.get_abstract_mesh().shape["batch"]):
@@ -610,6 +638,7 @@ def update(
 
 
 def score_group(task: Task, rollouts: list[Rollout], length_penalty_coef: float = 0.0) -> RolloutGroup:
+    """Assign advantages from adjusted rewards using the group's population standard deviation."""
     if len(rollouts) < 2:
         raise ValueError("A rollout group needs at least two rollouts")
     group = RolloutGroup(
@@ -630,6 +659,7 @@ def score_group(task: Task, rollouts: list[Rollout], length_penalty_coef: float 
 
 @asynccontextmanager
 async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]:
+    """Yield an agent configured from vLLM's context limit and close its client on exit."""
     tokenizer = await asyncio.to_thread(AutoTokenizer.from_pretrained, config.model)
     async with AsyncOpenAI(
         base_url=f"{SERVER_URL}/v1", api_key="EMPTY", timeout=config.rollout_timeout, max_retries=3
@@ -655,6 +685,7 @@ async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]
 def serve_vllm(
     model: str = MODEL, lora_rank: int | None = DEFAULT_CONFIG.lora_rank
 ) -> Generator[subprocess.Popen[bytes]]:
+    """Manage vLLM's process lifetime; lora_rank=None enables full-weight transfer."""
     weight_args = ["--weight-transfer-config", '{"backend":"nccl"}']
     if lora_rank is not None:
         max_lora_rank = next((rank for rank in get_args(MaxLoRARanks) if rank >= lora_rank), None)
@@ -700,6 +731,7 @@ def serve_vllm(
 
 
 def wait_for_server(server: subprocess.Popen[bytes], timeout: float = 600) -> None:
+    """Block until vLLM is healthy, raising if it exits or the timeout expires."""
     logger.info("Waiting for vLLM at %s", SERVER_URL)
     deadline = time.monotonic() + timeout
     while (remaining := deadline - time.monotonic()) > 0:
@@ -773,38 +805,34 @@ class Batcher:
 
     async def fetch_next_batch(
         self, num_groups: int, group_size: int, context_length: int, *, include_examples: bool = False
-    ) -> Transfer[RolloutBatch]:
+    ) -> RolloutBatch:
+        """Fetch groups concurrently, retry degenerates if configured, and pack a training batch."""
         if num_groups < 1:
             raise ValueError("num_groups must be at least 1")
         started = time.monotonic()
 
-        async def fetch_group() -> tuple[RolloutGroup, float]:
+        async def fetch_group() -> RolloutGroup:
             while True:
-                result = await self.actor.fetch_next_group.remote(group_size=group_size)
-                seconds = time.monotonic() - result.ready_at
-                if not self.config.drop_degenerate_groups or not result.value.is_degenerate:
-                    return result.value, seconds
+                group = await self.actor.fetch_next_group.remote(group_size=group_size)
+                if not self.config.drop_degenerate_groups or not group.is_degenerate:
+                    return group
 
-        # Timestamp each arrival before waiting for slower groups.
         async with asyncio.TaskGroup() as pending:
             tasks = [pending.create_task(fetch_group()) for _ in range(num_groups)]
-        results = [task.result() for task in tasks]
+        groups = [task.result() for task in tasks]
         fetched = time.monotonic()
-        groups = [group for group, _ in results]
         with span("batcher.prepare_batch"):
             training_batch = self.prepare_batch(groups, context_length=context_length)  # (B, T), (B,) leaves.
         prepared = time.monotonic()
-        batch = build_rollout_batch(
+        return build_rollout_batch(
             groups=groups,
             training_batch=training_batch,
             include_examples=include_examples,
-            transfer_metrics={
+            timing_metrics={
                 "batcher/fetch_rollout_seconds": fetched - started,
                 "batcher/prepare_batch_seconds": prepared - fetched,
-                "batcher/actor_transfer_seconds_mean": mean(seconds for _, seconds in results),
             },
         )
-        return Transfer(value=batch, ready_at=time.monotonic())
 
 
 @ray.remote(num_gpus=1)
@@ -817,6 +845,7 @@ class Learner:
         self._pending_batches: list[ray.ObjectRef] = []
 
     def start(self) -> None:
+        """Initialize or restore training, then run updates, weight publication, and periodic checkpoints."""
         self.mesh = Mesh(devices=jax.devices("gpu"), axis_names=("batch",))
         with (
             jax.set_mesh(self.mesh),
@@ -881,6 +910,7 @@ class Learner:
             resources.callback(self.cancel_pending_batches)
             self.publish_weights()
             total_updates = int(self.state.step)
+            published_step = total_updates
             writer.log_metrics(
                 {
                     "model/parameters_billions": sum(
@@ -914,19 +944,20 @@ class Learner:
                     fetched = time.monotonic()
                     with span("learner.optimize"):
                         update_metrics = self.optimize(batch.training_batch)
-                    updated_step = int(self.state.step)
-                    weights_updated = updated_step != total_updates
-                    total_updates = updated_step
+                    total_updates = int(self.state.step)
                     optimized = time.monotonic()
-                    if weights_updated:
+                    sync_due = iteration % self.config.parameter_sync_step == 0
+                    publish = sync_due and total_updates != published_step
+                    if publish:
                         self.publish_weights()
+                        published_step = total_updates
                     now = time.monotonic()
                     num_rollouts = batch.training_batch.token_ids.shape[0]
                     total_rollouts += num_rollouts
                     seconds = max(now - started, 1e-9)
                     scalars = {
                         **update_metrics,
-                        **batch.transfer_metrics,
+                        **batch.timing_metrics,
                         **batch.rollout_metrics,
                         **{
                             f"rollout/stop_fraction/{condition}": batch.stop_counts.get(condition, 0) / num_rollouts
@@ -934,7 +965,7 @@ class Learner:
                         },
                         "train/iterations_total": iteration,
                         "train/updates_total": total_updates,
-                        "train/learning_rate": self.config.learning_rate,
+                        "train/learning_rate": self.config.adamw_kwargs["learning_rate"],
                         "train/rollouts_total": total_rollouts,
                         "learner/iterations_per_second": 1 / seconds,
                         "learner/rollouts_per_second": num_rollouts / seconds,
@@ -943,20 +974,17 @@ class Learner:
                         "learner/update_seconds": optimized - fetched,
                         "learner/iteration_seconds": now - started,
                     }
-                    if weights_updated:
+                    if publish:
                         scalars["learner/weight_transfer_seconds"] = now - optimized
                     logger.info(
-                        "iteration=%s reward=%.3f degenerate_group_fraction=%.3f batch=%.2fs "
-                        "group_transfer=%.6fs batch_transfer=%.6fs loss=%.4f update=%.2fs%s",
+                        "iteration=%s reward=%.3f degenerate_group_fraction=%.3f batch=%.2fs loss=%.4f update=%.2fs%s",
                         iteration,
                         scalars["rollout/reward_mean"],
                         scalars["rollout/degenerate_group_fraction"],
                         scalars["learner/batch_fetch_seconds"],
-                        scalars["batcher/actor_transfer_seconds_mean"],
-                        scalars["learner/batcher_transfer_seconds"],
                         scalars["train/policy_loss"],
                         scalars["learner/update_seconds"],
-                        f" weights={scalars['learner/weight_transfer_seconds']:.2f}s" if weights_updated else "",
+                        f" weights={scalars['learner/weight_transfer_seconds']:.2f}s" if publish else "",
                     )
                     if iteration % self.config.example_log_interval == 0:
                         with span("learner.log_examples"):
@@ -964,7 +992,7 @@ class Learner:
                             writer.log_text(examples, f"examples/{iteration}.txt")
                     if checkpoint_due:
                         with span("learner.checkpoint"):
-                            scalars["checkpoint/save_seconds"] = save_checkpoint(
+                            scalars["checkpoint/save_blocking_seconds"] = save_checkpoint(
                                 manager,
                                 TrainingProgress(
                                     train_state=self.state,
@@ -979,10 +1007,12 @@ class Learner:
                         writer.log_metrics(scalars, step=iteration)
 
     def cancel_pending_batches(self) -> None:
+        """Cancel queued batches and their dependent rollout tasks during shutdown."""
         while self._pending_batches:
             ray.cancel(self._pending_batches.pop(0), recursive=True)
 
     def fetch_next_batch(self, *, iteration: int) -> RolloutBatch:
+        """Consume the next batch, limiting prefetch to the next checkpoint or training end."""
         prefetch_batches = min(self.config.prefetch_batches, (-iteration) % self.config.checkpoint_interval)
         if self.config.total_iterations is not None:
             prefetch_batches = min(prefetch_batches, self.config.total_iterations - iteration)
@@ -995,19 +1025,23 @@ class Learner:
                     include_examples=True,
                 )
             )
-        result = ray.get(self._pending_batches[0])
-        self._pending_batches.pop(0)
-        seconds = time.monotonic() - result.ready_at
-        batch = result.value
-        return replace(
-            batch,
-            transfer_metrics={**batch.transfer_metrics, "learner/batcher_transfer_seconds": seconds},
-        )
+        if self.config.prefetch_mode == "next_ready":
+            ready, _ = ray.wait(self._pending_batches, num_returns=1)
+            next_batch = ready[0]
+        else:
+            next_batch = self._pending_batches[0]
+        result = ray.get(next_batch)
+        self._pending_batches.remove(next_batch)
+        return result
 
     def publish_weights(self) -> None:
         self._publish_weights()
 
     def optimize(self, batch: GRPOBatch[np.ndarray]) -> dict[str, float]:  # Batch leaves: (B, T), (B,).
+        """Freeze anchors once, then update shuffled minibatches across all epochs.
+
+        Return mean update metrics, excluding skipped updates from policy diagnostics.
+        """
         if batch.token_ids.shape[0] % self.config.minibatches_per_epoch:
             raise ValueError("minibatches_per_epoch must divide the rollout batch size")
         minibatch_size = batch.token_ids.shape[0] // self.config.minibatches_per_epoch
@@ -1085,6 +1119,7 @@ class Actor:
         """Awaiting this method waits for construction, including vLLM readiness."""
 
     async def _get_agent(self) -> Agent:
+        """Create the shared agent once, serializing initialization with actor shutdown."""
         async with self._agent_lock:
             if self._closed:
                 raise RuntimeError("Actor is closed")
@@ -1093,6 +1128,7 @@ class Actor:
             return self._agent
 
     async def aclose(self) -> None:
+        """Cancel and drain active rollouts before closing the agent and vLLM server."""
         async with self._agent_lock, AsyncExitStack() as resources, self._agent_resources:
             # Ray termination does not call a user-defined shutdown hook.
             resources.push_async_callback(asyncio.to_thread, self._server.close)
@@ -1104,18 +1140,19 @@ class Actor:
             await asyncio.gather(*runs, return_exceptions=True)
 
     def get_sampling_state(self) -> dict[str, Any]:
+        """Return the task sampler's RNG state in a JSON-compatible form for checkpointing."""
         version, state, gauss_next = self.rng.getstate()
         return {"version": version, "state": list(state), "gauss_next": gauss_next}
 
     def set_sampling_state(self, state: dict[str, Any]) -> None:
         self.rng.setstate((state["version"], tuple(state["state"]), state["gauss_next"]))
 
-    async def fetch_next_group(self, group_size: int) -> Transfer[RolloutGroup]:
+    async def fetch_next_group(self, group_size: int) -> RolloutGroup:
         task = next(self.tasks)
-        group = await self.collect_group(task, group_size=group_size)
-        return Transfer(value=group, ready_at=time.monotonic())
+        return await self.collect_group(task, group_size=group_size)
 
     async def collect_group(self, task: Task, group_size: int) -> RolloutGroup:
+        """Run independent attempts in fresh environments, then assign group-normalized advantages."""
         if group_size < 2:
             raise ValueError("group_size must be at least 2")
         span_data = {"group_id": uuid4().hex, "task_id": str(task.id), "group_size": str(group_size)}
@@ -1161,6 +1198,7 @@ def configure_console_logging() -> None:
 
 
 def train(config: Config) -> None:
+    """Run actor, batcher, and learner on local Ray, shutting down workers on exit."""
     configure_console_logging()
     os.environ["RAY_AUTH_MODE"] = "disabled"
     os.environ["RAY_DASHBOARD_ENABLE_PROFILING"] = "1" if config.enable_ray_dashboard else "0"
