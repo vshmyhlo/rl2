@@ -18,9 +18,9 @@ taskset:
   config_file: data/alfworld/base_config.yaml
 seed: 1
 
-num_groups: 1 # verl data.train_batch_size (task groups).
+num_groups: 4 # verl data.train_batch_size (task groups).
 group_size: 8 # verl rollout.n; 128 rollouts per batch.
-grad_accum_steps: 4 # 2 per update
+grad_accum_steps: 16 # 2 per update
 
 update_epochs: 1
 minibatches_per_epoch: 1 # One optimizer update per epoch, using all 128 rollouts.

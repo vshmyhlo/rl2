@@ -57,7 +57,7 @@ Timing and throughput (logged every iteration unless noted):
     learner/rollouts_per_second: Batch rollout count divided by iteration wall time.
     learner/output_tokens_per_second: Batch sampled-token count divided by iteration wall time.
     actor/rollout_seconds_mean: Mean agent execution time per rollout, including model calls and environment steps.
-    batcher/fetch_rollout_seconds: Wall time fetching all rollout groups, including actor return transfers.
+    batcher/fetch_rollout_seconds: Wall time waiting for this batch's groups, including actor return transfers; excludes prior prefetch time.
     batcher/prepare_batch_seconds: Wall time preparing the CPU training arrays without explicit synchronization.
     learner/batch_fetch_seconds: Wall time fetching the rollout batch, including generation, scoring, and Ray transfers.
     learner/update_seconds: Device transfer and optimizer update wall time, excluding weight publication.
@@ -754,6 +754,7 @@ class Batcher:
     def __init__(self, actor: ActorHandle, config: Config = DEFAULT_CONFIG) -> None:
         self.actor = actor
         self.config = config
+        self._pending_groups: list[asyncio.Task[RolloutGroup]] = []
 
     def prepare_batch(self, groups: list[RolloutGroup], context_length: int) -> GRPOBatch[np.ndarray]:
         """Flatten rollout groups in order and right-pad their transcripts into NumPy arrays.
@@ -803,36 +804,71 @@ class Batcher:
             batch.attention_mask[index, :length] = True  # (L,)
         return batch  # (B, T), (B,) leaves.
 
+    async def _fetch_group(self, group_size: int) -> RolloutGroup:
+        """Fill one pool slot, replacing degenerate groups when configured."""
+        while True:
+            pending = self.actor.fetch_next_group.remote(group_size=group_size)
+            try:
+                group = await pending
+            except asyncio.CancelledError:
+                ray.cancel(pending, recursive=True)
+                raise
+            if not self.config.drop_degenerate_groups or not group.is_degenerate:
+                return group
+
+    async def cancel_pending_groups(self) -> None:
+        """Cancel prefetched groups and their dependent rollout tasks."""
+        for task in self._pending_groups:
+            task.cancel()
+        await asyncio.gather(*self._pending_groups, return_exceptions=True)
+        self._pending_groups.clear()
+
     async def fetch_next_batch(
-        self, num_groups: int, group_size: int, context_length: int, *, include_examples: bool = False
+        self,
+        num_groups: int,
+        group_size: int,
+        context_length: int,
+        *,
+        iteration: int = 1,
+        include_examples: bool = False,
     ) -> RolloutBatch:
-        """Fetch groups concurrently, retry degenerates if configured, and pack a training batch."""
+        """Consume groups from a bounded pool, draining it at checkpoints and training end."""
         if num_groups < 1:
             raise ValueError("num_groups must be at least 1")
         started = time.monotonic()
-
-        async def fetch_group() -> RolloutGroup:
-            while True:
-                group = await self.actor.fetch_next_group.remote(group_size=group_size)
-                if not self.config.drop_degenerate_groups or not group.is_degenerate:
-                    return group
-
-        async with asyncio.TaskGroup() as pending:
-            tasks = [pending.create_task(fetch_group()) for _ in range(num_groups)]
-        groups = [task.result() for task in tasks]
-        fetched = time.monotonic()
-        with span("batcher.prepare_batch"):
-            training_batch = self.prepare_batch(groups, context_length=context_length)  # (B, T), (B,) leaves.
-        prepared = time.monotonic()
-        return build_rollout_batch(
-            groups=groups,
-            training_batch=training_batch,
-            include_examples=include_examples,
-            timing_metrics={
-                "batcher/fetch_rollout_seconds": fetched - started,
-                "batcher/prepare_batch_seconds": prepared - fetched,
-            },
-        )
+        prefetch_batches = min(self.config.prefetch_batches, (-iteration) % self.config.checkpoint_interval)
+        if self.config.total_iterations is not None:
+            prefetch_batches = min(prefetch_batches, self.config.total_iterations - iteration)
+        try:
+            while len(self._pending_groups) < (prefetch_batches + 1) * num_groups:
+                # These tasks remain live between learner requests.
+                task = asyncio.create_task(self._fetch_group(group_size))
+                self._pending_groups.append(task)
+            groups = []
+            for _ in range(num_groups):
+                if self.config.prefetch_mode == "next_ready":
+                    ready, _ = await asyncio.wait(self._pending_groups, return_when=asyncio.FIRST_COMPLETED)
+                    task = next(iter(ready))
+                else:
+                    task = self._pending_groups[0]
+                groups.append(await task)
+                self._pending_groups.remove(task)
+            fetched = time.monotonic()
+            with span("batcher.prepare_batch"):
+                training_batch = self.prepare_batch(groups, context_length=context_length)  # (B, T), (B,) leaves.
+            prepared = time.monotonic()
+            return build_rollout_batch(
+                groups=groups,
+                training_batch=training_batch,
+                include_examples=include_examples,
+                timing_metrics={
+                    "batcher/fetch_rollout_seconds": fetched - started,
+                    "batcher/prepare_batch_seconds": prepared - fetched,
+                },
+            )
+        except BaseException:
+            await self.cancel_pending_groups()
+            raise
 
 
 @ray.remote(num_gpus=1)
@@ -842,7 +878,6 @@ class Learner:
         self.batcher = batcher
         self.actor = actor
         self.shuffle_key = jax.random.key(config.seed)  # () typed base PRNG key.
-        self._pending_batches: list[ray.ObjectRef] = []
 
     def start(self) -> None:
         """Initialize or restore training, then run updates, weight publication, and periodic checkpoints."""
@@ -907,7 +942,7 @@ class Learner:
                         pause_mode=self.config.weight_update_pause_mode,
                     )
                 )
-            resources.callback(self.cancel_pending_batches)
+            resources.callback(self.cancel_pending_groups)
             self.publish_weights()
             total_updates = int(self.state.step)
             published_step = total_updates
@@ -1006,33 +1041,21 @@ class Learner:
                     with span("learner.log_metrics"):
                         writer.log_metrics(scalars, step=iteration)
 
-    def cancel_pending_batches(self) -> None:
-        """Cancel queued batches and their dependent rollout tasks during shutdown."""
-        while self._pending_batches:
-            ray.cancel(self._pending_batches.pop(0), recursive=True)
+    def cancel_pending_groups(self) -> None:
+        """Drain the batcher's rollout cancellation before shutting down training."""
+        ray.get(self.batcher.cancel_pending_groups.remote())
 
     def fetch_next_batch(self, *, iteration: int) -> RolloutBatch:
-        """Consume the next batch, limiting prefetch to the next checkpoint or training end."""
-        prefetch_batches = min(self.config.prefetch_batches, (-iteration) % self.config.checkpoint_interval)
-        if self.config.total_iterations is not None:
-            prefetch_batches = min(prefetch_batches, self.config.total_iterations - iteration)
-        while len(self._pending_batches) < prefetch_batches + 1:
-            self._pending_batches.append(
-                self.batcher.fetch_next_batch.remote(
-                    num_groups=self.config.num_groups,
-                    group_size=self.config.group_size,
-                    context_length=self.model.config.max_position_embeddings,
-                    include_examples=True,
-                )
+        """Fetch one batch assembled from the batcher's pending rollout groups."""
+        return ray.get(
+            self.batcher.fetch_next_batch.remote(
+                num_groups=self.config.num_groups,
+                group_size=self.config.group_size,
+                context_length=self.model.config.max_position_embeddings,
+                iteration=iteration,
+                include_examples=True,
             )
-        if self.config.prefetch_mode == "next_ready":
-            ready, _ = ray.wait(self._pending_batches, num_returns=1)
-            next_batch = ready[0]
-        else:
-            next_batch = self._pending_batches[0]
-        result = ray.get(next_batch)
-        self._pending_batches.remove(next_batch)
-        return result
+        )
 
     def publish_weights(self) -> None:
         self._publish_weights()
@@ -1160,7 +1183,7 @@ class Actor:
         try:
             with span("actor.collect_group", {**span_data, "run_id": self.config.run_id or "unspecified"}):
                 agent = await self._get_agent()
-                async with asyncio.TaskGroup() as pending:
+                async with asyncio.TaskGroup() as tg:
 
                     async def run_rollout(index: int) -> Rollout:
                         with span("actor.rollout", {**span_data, "rollout_index": index}) as rollout_span:
@@ -1171,13 +1194,13 @@ class Actor:
                             rollout_span.set_attribute("stop_condition", result.stop_condition)
                             return result
 
-                    runs = [pending.create_task(run_rollout(index)) for index in range(group_size)]
+                    runs = [tg.create_task(run_rollout(index)) for index in range(group_size)]
                     self._runs.update(runs)
                     for run in runs:
                         run.add_done_callback(self._runs.discard)
                 with span("actor.score_group"):
                     group = score_group(
-                        task, [run.result() for run in runs], length_penalty_coef=self.config.length_penalty_coef
+                        task, [await run for run in runs], length_penalty_coef=self.config.length_penalty_coef
                     )
         except Exception:
             logger.exception(

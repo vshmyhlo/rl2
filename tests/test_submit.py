@@ -36,6 +36,9 @@ def test_default_gpu_job() -> None:
     assert set(env["NVIDIA_DRIVER_CAPABILITIES"].split(",")) >= {"compute", "utility", "graphics"}
     assert container["resources"]["requests"] == {"cpu": "10", "memory": "32Gi", "nvidia.com/gpu": "1"}
     assert container["resources"]["limits"] == {"memory": "32Gi", "nvidia.com/gpu": "1"}
+    shm_mount = next(mount for mount in container["volumeMounts"] if mount["mountPath"] == "/dev/shm")
+    shm_volume = next(volume for volume in pod["volumes"] if volume["name"] == shm_mount["name"])
+    assert shm_volume["emptyDir"] == {"medium": "Memory", "sizeLimit": "16Gi"}
     run_mount = next(mount for mount in container["volumeMounts"] if mount["mountPath"] == "/runs")
     run_volume = next(volume for volume in pod["volumes"] if volume["name"] == run_mount["name"])
     assert run_volume["persistentVolumeClaim"]["claimName"] == "training-runs"

@@ -267,12 +267,16 @@ requires a shared local filesystem.
 `prefetch_batches: 0` (default) collects each batch without overlapping training,
 avoiding weight changes within a rollout. With `parameter_sync_step: 1`, each
 batch uses the latest learner weights; longer sync intervals can retain older weights.
-Positive `prefetch_batches: N` generates up to N batches ahead while the learner optimizes; each
-batch contains `num_groups` rollout groups. `prefetch_mode: next_in_order` (default)
-consumes batches in submission order, waiting for the oldest pending batch.
-Set `prefetch_mode: next_ready` to consume whichever pending batch is ready first,
-allowing faster batches to overtake slower ones. Both modes retain the same prefetch
-limits and drain pending batches before checkpoints and training completion. Prefetched rollouts can use older
+Positive `prefetch_batches: N` lets the batcher maintain a pool of up to
+`(N + 1) * num_groups` pending rollout groups, including the current batch.
+Each learner request consumes `num_groups` groups and leaves up to N batches' worth
+running or ready while the learner optimizes. `prefetch_mode: next_in_order` (default)
+selects groups in submission order. Set `prefetch_mode: next_ready` to assemble each
+batch from ready groups across the pool, without waiting for slower groups submitted
+alongside them. When multiple groups are ready, their selection order is unspecified.
+Groups stay intact, and degenerate groups are
+replaced within their pool slots when filtering is enabled. Both modes drain the
+pool before checkpoints and training completion. Prefetched rollouts can use older
 weights, and multi-turn rollouts can span weight updates.
 `weight_update_pause_mode` accepts `wait` (default) or `keep`, operating
 on individual generation requests. Groups can start during publication; vLLM

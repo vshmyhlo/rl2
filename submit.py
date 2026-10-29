@@ -107,7 +107,7 @@ def job_manifest(args: argparse.Namespace, name: str, image: str) -> dict[str, A
                         }
                     ],
                     "volumes": [
-                        {"name": "shm", "emptyDir": {"medium": "Memory", "sizeLimit": "2Gi"}},
+                        {"name": "shm", "emptyDir": {"medium": "Memory", "sizeLimit": "16Gi"}},
                         {"name": "runs", "persistentVolumeClaim": {"claimName": "training-runs"}},
                     ],
                 },
