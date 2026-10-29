@@ -196,7 +196,9 @@ def test_rollout_correction_retains_gradients_and_detaches_reference_scores() ->
         token_ids=jnp.zeros((2, 4), dtype=jnp.int32),  # (B=2, T=4)
         attention_mask=jnp.ones((2, 4), dtype=jnp.bool_),  # (B, T)
         loss_mask=jnp.array([[False, True, True, False], [False, True, False, False]]),  # (B, T)
-        old_log_probs=jnp.array([[0, -2 - jnp.log(1.5), -2 - jnp.log(4.0), -1000], [0, -2 - jnp.log(0.5), -1000, -1000]]),  # (B, T)
+        old_log_probs=jnp.array(
+            [[0, -2 - jnp.log(1.5), -2 - jnp.log(4.0), -1000], [0, -2 - jnp.log(0.5), -1000, -1000]]
+        ),  # (B, T)
         advantages=jnp.array([1.0, -1.0]),  # (B,)
     )
     anchor = jnp.full((2, 3), -2.0)  # (B, T-1)
@@ -241,6 +243,13 @@ def test_rollout_correction_bounds_extreme_ratios() -> None:
     assert gradient.shape == (1, 3)
     np.testing.assert_allclose(gradient, -jnp.array([[3, jnp.exp(-20.0), 2]]) / 3, rtol=1e-6)
     assert float(metrics["train/rollout_importance_weight_clipped_fraction"]) == pytest.approx(1 / 3)
+
+    # Large optimizer drift must not overflow either the surrogate or its backward pass.
+    (drifted_loss, _), drifted_gradient = jax.jit(jax.value_and_grad(loss, has_aux=True))(
+        anchor + jnp.array([[100, -100, 0]])  # (B, T-1)
+    )
+    assert float(drifted_loss) == pytest.approx(-5.6 / 3)
+    np.testing.assert_allclose(drifted_gradient, [[0, 0, -2 / 3]], atol=1e-6)
 
 
 @pytest.mark.parametrize("microbatch_size", [1, 2], ids=["accumulated", "whole-batch"])
@@ -390,17 +399,17 @@ def test_default_attention_optimizer_on_cuda(mesh_context: None) -> None:
         old_log_probs=jnp.zeros_like(tokens, dtype=jnp.float32),  # (B, T)
         advantages=jnp.array([1.0, -0.5]),  # (B,)
     )
-    old = jax.jit(training.token_log_probs, static_argnames="temperature")(
-        state, state.params, batch, temperature=config.temperature
-    )  # (B, T-1)
-    assert old.shape == (2, 15)
-    assert old.dtype == jnp.float32
-    batch = batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))  # (B, T)
+    anchors = training.compute_anchor_log_probs(state, batch, 2, config.temperature)  # (B, T-1)
+    assert anchors.shape == (2, 15)
+    assert anchors.dtype == jnp.float32
+    batch = batch._replace(old_log_probs=jnp.pad(anchors - jnp.log(1.5), ((0, 0), (1, 0))))  # (B, T)
     state, metrics = training.update(
-        state, batch, batch.old_log_probs[:, 1:], config.grad_accum_steps, config.temperature, config.clip_coef
+        state, batch, anchors, config.grad_accum_steps, config.temperature, config.clip_coef
     )
     assert int(state.step) == 1
     assert float(metrics["train/clip_fraction"]) == 0
+    assert float(metrics["train/rollout_importance_weight_mean"]) == pytest.approx(1.5, abs=1e-6)
+    assert float(metrics["train/rollout_log_prob_error_mean"]) == pytest.approx(float(jnp.log(1.5)), abs=1e-6)
     assert float(metrics["train/gradient_norm"]) > 0
     assert any(bool(jnp.any(adapter.b != 0)) for adapter in state.params.values())
 
@@ -656,6 +665,11 @@ def test_data_parallel_update_rejects_indivisible_microbatch(
         pytest.raises(ValueError, match="learner device count must divide the microbatch size"),
     ):
         training.update.lower(state, batch, batch.old_log_probs[:, 1:], 2, 0.7, 0.2)
+    with (
+        jax.set_mesh(mesh),
+        pytest.raises(ValueError, match="learner device count must divide the microbatch size"),
+    ):
+        training.compute_anchor_log_probs.lower(state, batch, 1, 0.7)
 
 
 @pytest.mark.parametrize(
@@ -825,7 +839,14 @@ def test_learner_optimizes_and_publishes_updated_adapters(
     learner = training.Learner.__ray_metadata__.modified_class(
         batcher=Mock(),
         actor=Mock(),
-        config=training.Config(temperature=0.7, minibatches_per_epoch=2, update_epochs=2, lora_rank=2, lora_alpha=4),
+        config=training.Config(
+            temperature=0.7,
+            minibatches_per_epoch=2,
+            update_epochs=2,
+            lora_rank=2,
+            lora_alpha=4,
+            rollout_is_threshold=1.25,
+        ),
     )
     learner.model = model.clone(dtype="bfloat16", param_dtype=jnp.bfloat16)
     learner.mesh = Mesh(devices=jax.devices()[:2], axis_names=("batch",))
@@ -844,6 +865,22 @@ def test_learner_optimizes_and_publishes_updated_adapters(
     assert old.dtype == jnp.float32
     batch = batch._replace(old_log_probs=np.pad(np.asarray(old), ((0, 0), (1, 0))))  # (B, T), (B,) leaves.
     assert all(isinstance(value, np.ndarray) for value in batch)
+    actual_anchor_scores = training.compute_anchor_log_probs
+    anchors: list[jax.Array] = []  # Each (B, T-1), one snapshot per rollout batch.
+
+    def anchor_scores(
+        current: training.LoRATrainState,
+        batch: training.GRPOBatch[jax.Array],  # (B, T), (B,) leaves.
+        microbatch_size: int,
+        temperature: float,
+    ) -> jax.Array:  # (B, T-1)
+        assert int(current.step) == 0
+        assert microbatch_size == 2
+        scores = actual_anchor_scores(current, batch, microbatch_size, temperature)  # (B, T-1)
+        anchors.append(scores)
+        return scores  # (B, T-1)
+
+    monkeypatch.setattr(training, "compute_anchor_log_probs", anchor_scores)
     actual_update = training.update
     steps: list[int] = []
 
@@ -869,11 +906,15 @@ def test_learner_optimizes_and_publishes_updated_adapters(
     with jax.set_mesh(learner.mesh):
         metrics = learner.optimize(batch)
     assert update.call_count == 4
+    assert len(anchors) == 1
+    assert anchors[0].shape == (4, 7)
+    np.testing.assert_allclose(anchors[0], old, atol=2e-3, rtol=2e-3)
     assert permutation.call_count == 2
     assert steps == [0, 1, 2, 3]
     for index, call in enumerate(update.call_args_list):
         assert jax.tree.leaves(call.args[0].params)[0].is_deleted()
         assert call.args[3] == 1
+        assert call.args[6] == 1.25
         placed_batch = call.args[1]  # (B/N=2, T=8), (B/N,) leaves.
         start = (index % 2) * 2
         indices = permutations[index // 2][start : start + 2]  # (B/N,)
@@ -881,7 +922,7 @@ def test_learner_optimizes_and_publishes_updated_adapters(
             assert placed.shape == (2, *original.shape[1:])
             assert placed.sharding == NamedSharding(learner.mesh, PartitionSpec("batch"))
             np.testing.assert_array_equal(placed, original[indices])
-        np.testing.assert_allclose(call.args[2], old[indices], atol=2e-3, rtol=2e-3)
+        np.testing.assert_array_equal(call.args[2], anchors[0][indices])
     assert int(learner.state.step) == 4
     assert metrics["train/gradient_norm"] > 0
     assert all(isinstance(value, float) for value in metrics.values())

@@ -218,7 +218,6 @@ def test_reasoning_gym_cli_and_actor_task_stream(tmp_path: Path, monkeypatch: py
         {"length_penalty_coef": -0.01},
         {"clip_coef": 1.0},
         {"rollout_is_threshold": 0.0},
-        {"rollout_is_threshold": -1.0},
         {"max_grad_norm": 0.0},
         {"minibatches_per_epoch": 0},
         {"minibatches_per_epoch": 3},

@@ -15,14 +15,17 @@ Startup scalars (at the restored iteration, or step 0 for a new run):
     learner/setup_seconds: Model/optimizer setup, checkpoint restore, and initial weight publication wall time.
 
 Optimization scalars (averaged over minibatches and update epochs):
-    train/policy_loss: Clipped GRPO policy loss.
-    train/approx_kl: Mean exp(log_ratio) - 1 - log_ratio, where log_ratio is learner minus sampling log-probability.
-    train/clip_fraction: Fraction of sampled-token probability ratios outside the clip range.
+    train/policy_loss: GRPO policy loss with decoupled PPO clipping and truncated rollout importance weights.
+    train/approx_kl: Mean exp(log_ratio) - 1 - log_ratio, where log_ratio is current minus frozen pre-update learner log-probability, bounded to [-20, 20].
+    train/clip_fraction: Fraction of current/anchor sampled-token probability ratios outside the PPO clip range.
+    train/rollout_log_prob_error_mean: Mean absolute frozen learner minus rollout log-probability difference.
+    train/rollout_importance_weight_mean: Mean applied token importance weight after safety bounding and truncation.
+    train/rollout_importance_weight_clipped_fraction: Fraction of safety-bounded token weights above rollout_is_threshold.
     train/gradient_norm: Global trainable-parameter gradient norm after microbatch averaging, before clipping.
     train/skipped_update_fraction: Fraction of optimizer minibatches skipped because all advantages are zero.
-Loss, KL, and clip fraction average sampled tokens within each rollout, then rollouts.
+Loss and policy diagnostics average sampled tokens within each rollout, then rollouts; weights do not change denominators.
 Skipped minibatches contribute zero to loss and gradient norm metrics.
-KL and clip fraction average only evaluated minibatches and are omitted when all updates are skipped.
+Policy diagnostics average only evaluated minibatches and are omitted when all updates are skipped.
 
 Rollout batch scalars:
     rollout/reward_mean: Mean raw rollout reward.
@@ -433,7 +436,9 @@ def compute_anchor_log_probs(
         microbatches = jax.tree.map(
             lambda value: value.reshape(size // microbatch_size, microbatch_size, *value.shape[1:]), batch
         )  # (M, B/M, T), (M, B/M); M = number of microbatches.
-        microbatches = jax.lax.with_sharding_constraint(microbatches, PartitionSpec(None, "batch"))
+        microbatches = jax.lax.with_sharding_constraint(
+            microbatches, PartitionSpec(None, "batch")
+        )  # (M, B/M, T), (M, B/M).
 
         def score(microbatch: GRPOBatch[jax.Array]) -> jax.Array:  # (B/M, T), (B/M,) -> (B/M, T-1)
             return token_log_probs(state, state.params, microbatch, temperature)  # (B/M, T-1)
@@ -442,9 +447,10 @@ def compute_anchor_log_probs(
         return scores.reshape(size, width - 1)  # (B, T-1)
 
     # No policy diagnostics are logged for an entirely skipped rollout batch.
-    scores = jax.lax.cond(
-        jnp.any(batch.advantages != 0), evaluate, lambda: jnp.zeros((size, width - 1), jnp.float32)
-    )  # (B, T-1)
+    def skip() -> jax.Array:  # (B, T-1)
+        return jnp.zeros((size, width - 1), jnp.float32)  # (B, T-1), unused by skipped updates.
+
+    scores = jax.lax.cond(jnp.any(batch.advantages != 0), evaluate, skip)  # (B, T-1)
     return jax.lax.stop_gradient(scores)  # (B, T-1)
 
 
@@ -465,7 +471,7 @@ def objective(
     # verl's token-TIS: bound exponentiation, upper-truncate, and detach; no batch normalization or rejection.
     raw_weights = jnp.exp(jnp.clip(rollout_log_ratio, -20, 20))  # (B, T-1)
     weights = jax.lax.stop_gradient(jnp.where(mask, jnp.minimum(raw_weights, rollout_is_threshold), 0))  # (B, T-1)
-    log_ratio = jnp.where(mask, log_probs - anchor_log_probs, 0)  # (B, T-1)
+    log_ratio = jnp.clip(jnp.where(mask, log_probs - anchor_log_probs, 0), -20, 20)  # (B, T-1), verl safety bound.
     ratio = jnp.exp(log_ratio)  # (B, T-1)
     advantages = batch.advantages[:, None]  # (B, 1)
     loss = -average(
@@ -558,10 +564,10 @@ def update(
         microbatch_size = batch.token_ids.shape[0] // grad_accum_steps
         microbatches = jax.tree.map(
             lambda value: value.reshape(grad_accum_steps, microbatch_size, *value.shape[1:]), (batch, anchor_log_probs)
-        )  # (A, B/A, T); advantages: (A, B/A). A = grad_accum_steps.
+        )  # Batch (A, B/A, T), (A, B/A); anchors (A, B/A, T-1). A = grad_accum_steps.
         microbatches = jax.lax.with_sharding_constraint(
             microbatches, PartitionSpec(None, "batch")
-        )  # (A, B/A, T), (A, B/A); shard examples within each microbatch.
+        )  # Batch (A, B/A, T), (A, B/A); anchors (A, B/A, T-1); shard examples within each microbatch.
 
         def accumulate(
             grads: TrainParameters,  # HF parameter shapes or (R, I), (O, R) factors.
@@ -592,7 +598,7 @@ def update(
         return state.apply_gradients(grads=gradients), metrics
 
     def skip_update() -> tuple[TrainState, Metrics]:
-        # Fixed JIT output structure; optimize excludes unevaluated KL and clip fraction from logging.
+        # Fixed JIT output structure; optimize excludes unevaluated policy diagnostics from logging.
         return state, {
             "train/policy_loss": jnp.asarray(0.0, dtype=jnp.float32),  # ()
             **{name: jnp.asarray(0.0, dtype=jnp.float32) for name in POLICY_DIAGNOSTICS},  # () Not evaluated.
@@ -1022,7 +1028,7 @@ class Learner:
             for start in range(0, batch.token_ids.shape[0], minibatch_size):
                 minibatch = jax.tree.map(
                     lambda value, start=start: value[start : start + minibatch_size], shuffled
-                )  # (B/N, T), (B/N,) leaves; N = minibatches_per_epoch.
+                )  # Batch (B/N, T), (B/N,); anchors (B/N, T-1); N = minibatches_per_epoch.
                 minibatch, minibatch_anchors = jax.device_put(minibatch, batched)  # Batch leaves; (B/N, T-1).
                 self.state, metrics = update(
                     self.state,

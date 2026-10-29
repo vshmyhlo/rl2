@@ -143,9 +143,31 @@ a small length penalty into substantial advantages favoring shorter rollouts.
 The batcher pads complete transcripts to `padding_multiple` (default 256),
 capped at the model context length. Oversized transcripts are rejected.
 
-GRPO uses a clipped importance-ratio objective, averaged over sampled tokens
-within each rollout and then across rollouts. There is no reference-policy KL
-penalty. Set `finetuning_mode: full` to optimize all model weights, including
+GRPO uses [verl-style decoupled token-TIS](https://verl.readthedocs.io/en/latest/algo/rollout_corr.html#decoupled-mode-with-token-level-importance-sampling-decoupled-token-is),
+averaged over sampled tokens within each rollout and then across rollouts.
+Before optimizing each batch, the learner scores its transcripts once using the
+optimizer's microbatch shape and temperature. These anchor scores stay fixed
+across all minibatches and epochs; the original vLLM sampling scores are retained.
+For each sampled token:
+
+- PPO ratio: `r = exp(clip(current_logp - anchor_logp, -20, 20))`.
+- Detached correction: `w = min(exp(clip(anchor_logp - rollout_logp, -20, 20)), rollout_is_threshold)`.
+- Loss: `-w * min(r * advantage, clip(r, 1 - clip_coef, 1 + clip_coef) * advantage)`.
+
+`rollout_is_threshold` defaults to `2.0` and must be positive. Correction weights
+are zero on context/padding tokens, are not batch-normalized, and do not change
+loss denominators. There is no rejection sampling or reference-policy KL penalty.
+Token-level correction and truncation trade bias for lower variance; they do not
+establish numerical parity or exactly correct the trajectory distribution.
+The anchor pass adds a forward evaluation; entirely zero-advantage batches skip
+its execution. With one optimizer update, the PPO ratio starts near one but
+retains gradients; rollout correction still weights those gradients.
+`train/approx_kl` and `train/clip_fraction` measure current-versus-anchor drift.
+Separate `train/rollout_log_prob_error_mean`, `train/rollout_importance_weight_mean`,
+and `train/rollout_importance_weight_clipped_fraction` expose the anchor/rollout
+gap and applied correction. All policy diagnostics exclude skipped minibatches.
+
+Set `finetuning_mode: full` to optimize all model weights, including
 embeddings, normalization, and the output head, with FP32 master weights and Adam
 moments. This uses substantially more GPU memory than LoRA. Tied embeddings and
 output heads remain shared. `lora_rank` and `lora_alpha` apply only in LoRA mode.
@@ -173,7 +195,7 @@ and FP32 logits remain enabled. See the
 The [current audit](../../qwen3_vllm_parity.md) still finds out-of-range ratios
 with unchanged weights at 4,096 tokens, for both Tokamax and cuDNN. Corrected RoPE
 frequencies and FP32 log-softmax reduce specific discrepancies but do not certify
-training parity. Preserve the actor's sampling scores as the importance-ratio denominator.
+training parity. Preserve the actor's sampling scores as the rollout-correction denominator.
 Temperature is restricted to `[0.01, 2.0]`; vLLM returns
 `processed_logprobs` with neutral top-p/top-k sampling, matching the learner.
 
@@ -182,7 +204,7 @@ minibatches per pass. `grad_accum_steps` splits each minibatch into microbatches
 Minibatches with all-zero advantages skip forward/backward computation and preserve
 parameters, Adam state, and the optimizer step. `train/skipped_update_fraction` reports the
 skipped fraction. Skipped minibatches contribute zero to policy loss and gradient norm.
-KL and clip fraction average only evaluated minibatches and are omitted when all updates are skipped.
+Policy diagnostics average only evaluated minibatches and are omitted when all updates are skipped.
 `minibatches_per_epoch * grad_accum_steps` must divide `num_groups * group_size`.
 The resulting microbatch size must also be divisible by `learner_gpus`.
 Shuffling uses the saved seed and optimizer step. The learner selects a context-managed

@@ -147,6 +147,12 @@ Transformers installed, run `python tests/qwen3_reference.py`.
 
 ### Parity with the GRPO v2 vLLM server
 
+GRPO now uses frozen learner anchors and truncated rollout importance weights;
+see [the training objective](../src/rl2/train_grpo_v2.md#training-and-resuming).
+Its optimizer KL/clip metrics measure current-versus-anchor drift. The publication
+audit still checks raw JAX/vLLM ratios separately, so correction cannot hide a
+numerical parity failure.
+
 **BF16 parity is not certified.** The native-LoRA audit below passes tiny models
 but exceeds the existing full-model log-probability tolerances. The historical
 merged-weight audit also found false clipping on longer decodes.
