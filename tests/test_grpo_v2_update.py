@@ -191,6 +191,19 @@ def test_objective_clipping_masking_and_sequence_weighting() -> None:
     np.testing.assert_allclose(jax.grad(loss_fn)(adverse), [[-0.25, 0, 0], [0.375, 0.375, 0]], atol=1e-6)
 
 
+def test_clip_fraction_excludes_clip_boundaries() -> None:
+    batch = training.GRPOBatch(
+        token_ids=jnp.zeros((1, 5), dtype=jnp.int32),  # (B=1, T=5)
+        attention_mask=jnp.ones((1, 5), dtype=jnp.bool_),  # (B, T)
+        loss_mask=jnp.array([[False, True, True, True, True]]),  # (B, T)
+        old_log_probs=jnp.zeros((1, 5)),  # (B, T)
+        advantages=jnp.ones(1),  # (B,)
+    )
+    log_probs = jnp.log(jnp.array([[0.8, 1.2, 0.79, 1.21]]))  # (B, T-1)
+    _, metrics = training.objective(log_probs, batch, batch.old_log_probs[:, 1:], clip_coef=0.2)
+    assert float(metrics["train/clip_fraction"]) == 0.5
+
+
 def test_rollout_correction_retains_gradients_and_detaches_reference_scores() -> None:
     batch = training.GRPOBatch(
         token_ids=jnp.zeros((2, 4), dtype=jnp.int32),  # (B=2, T=4)

@@ -32,7 +32,7 @@ Rollout batch scalars:
     rollout/reward_std: Population standard deviation of raw rollout rewards.
     rollout/reward_min: Minimum raw rollout reward.
     rollout/reward_max: Maximum raw rollout reward.
-    rollout/adjusted_reward_mean: Mean rollout reward after the length penalty.
+    rollout/adjusted_reward_mean: Mean rollout reward after length and max-tokens penalties.
     rollout/adjusted_reward_std: Population standard deviation of adjusted rollout rewards.
     rollout/adjusted_reward_min: Minimum adjusted rollout reward.
     rollout/adjusted_reward_max: Maximum adjusted rollout reward.
@@ -127,6 +127,7 @@ from rl2.qwen3 import (
 )
 from rl2.ray_timeline import record_timeline
 from rl2.tracing import flush_tracing, span, tracing_enabled
+from rl2.vllm_support.retry_logging import add_retry_cause
 
 logger = logging.getLogger("rl2.train_grpo_v2")
 MODEL = "Qwen/Qwen3-0.6B"
@@ -149,6 +150,7 @@ class Config(BaseConfig):
     parameter_sync_step: Annotated[int, Field(ge=1)] = 1  # Completed training batches between weight publications.
     drop_degenerate_groups: bool = False
     length_penalty_coef: Annotated[float, Field(ge=0)] = 0.0  # Per-token cost for nonzero environment rewards.
+    max_tokens_penalty: Annotated[float, Field(ge=0)] = 0.0  # Flat cost for stopping at max_tokens.
     total_iterations: Annotated[int | None, Field(ge=1)] = None
     checkpoint_interval: Annotated[int, Field(gt=0)] = 100
     example_log_interval: Annotated[int, Field(gt=0)] = 10
@@ -298,12 +300,14 @@ class RolloutGroup:
     task_id: str | None  # Source task ID shared by the group; None if the task has no ID.
     rollouts: list[Rollout]  # Independent attempts at the same task, in sampling order, scored as one group.
     length_penalty_coef: float = 0.0
+    max_tokens_penalty: float = 0.0
 
     @property
     def training_rewards(self) -> list[float]:
-        """Apply the output-length penalty only to nonzero rewards."""
+        """Apply length costs to nonzero rewards and token-limit costs to any reward."""
         return [
-            rollout.reward - self.length_penalty_coef * rollout.num_output_tokens if rollout.reward != 0 else 0.0
+            (rollout.reward - self.length_penalty_coef * rollout.num_output_tokens if rollout.reward != 0 else 0.0)
+            - (self.max_tokens_penalty if rollout.stop_condition == "max_tokens" else 0.0)
             for rollout in self.rollouts
         ]
 
@@ -501,7 +505,7 @@ def objective(
     return loss, {
         "train/policy_loss": loss,  # ()
         "train/approx_kl": average(jnp.expm1(log_ratio) - log_ratio),  # ()
-        "train/clip_fraction": average((jnp.abs(ratio - 1) > clip_coef).astype(jnp.float32)),  # ()
+        "train/clip_fraction": average(((ratio < 1 - clip_coef) | (ratio > 1 + clip_coef)).astype(jnp.float32)),  # ()
         "train/rollout_log_prob_error_mean": average(jnp.abs(rollout_log_ratio)),  # ()
         "train/rollout_importance_weight_mean": average(weights),  # ()
         "train/rollout_importance_weight_clipped_fraction": average(
@@ -637,7 +641,9 @@ def update(
     return jax.lax.cond(jnp.any(batch.advantages != 0), apply_update, skip_update)
 
 
-def score_group(task: Task, rollouts: list[Rollout], length_penalty_coef: float = 0.0) -> RolloutGroup:
+def score_group(
+    task: Task, rollouts: list[Rollout], length_penalty_coef: float = 0.0, max_tokens_penalty: float = 0.0
+) -> RolloutGroup:
     """Assign advantages from adjusted rewards using the group's population standard deviation."""
     if len(rollouts) < 2:
         raise ValueError("A rollout group needs at least two rollouts")
@@ -645,6 +651,7 @@ def score_group(task: Task, rollouts: list[Rollout], length_penalty_coef: float 
         task_id=f"{task.name}:{task.id}",
         rollouts=rollouts,
         length_penalty_coef=length_penalty_coef,
+        max_tokens_penalty=max_tokens_penalty,
     )
     rewards = group.training_rewards
     reward_mean, reward_std = mean(rewards), pstdev(rewards)
@@ -714,12 +721,23 @@ def serve_vllm(
             "vllm",
             "--logprobs-mode",
             "processed_logprobs",
+            "--max-model-len",  # Cap each request's combined prompt and output length.
+            "8192",
+            "--max-num-seqs",  # Limit sequences processed in one scheduler iteration.
+            "128",
+            "--max-num-batched-tokens",  # Budget prefill and decode tokens per scheduler iteration.
+            "8192",
+            "--gpu-memory-utilization",  # Budget 90% of GPU memory for this vLLM instance.
+            "0.90",
+            "--enable-prefix-caching",  # Reuse cached KV state for shared transcript prefixes.
+            "--enable-chunked-prefill",  # Split long prefills to interleave them with decoding.
             *weight_args,
         ],
         env={
             **os.environ,
             "VLLM_SERVER_DEV_MODE": "1",
             "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
+            "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": "30",
         },
     ) as server:
         try:
@@ -727,6 +745,11 @@ def serve_vllm(
         finally:
             logger.info("Stopping vLLM server: pid=%s", server.pid)
             server.terminate()
+            try:
+                server.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                logger.warning("vLLM did not stop within 30s; killing pid=%s", server.pid)
+                server.kill()
     logger.info("vLLM server exited")
 
 
@@ -804,7 +827,7 @@ class Batcher:
             batch.attention_mask[index, :length] = True  # (L,)
         return batch  # (B, T), (B,) leaves.
 
-    async def _fetch_group(self, group_size: int) -> RolloutGroup:
+    async def _collect_group(self, group_size: int) -> RolloutGroup:
         """Fill one pool slot, replacing degenerate groups when configured."""
         while True:
             pending = self.actor.fetch_next_group.remote(group_size=group_size)
@@ -815,6 +838,21 @@ class Batcher:
                 raise
             if not self.config.drop_degenerate_groups or not group.is_degenerate:
                 return group
+
+    async def _fetch_group(self, group_size: int, target_pending: int) -> RolloutGroup:
+        """Fill the pool to its target and consume the next group."""
+        while len(self._pending_groups) < target_pending:
+            # These tasks remain live between learner requests.
+            task = asyncio.create_task(self._collect_group(group_size=group_size))
+            self._pending_groups.append(task)
+        if self.config.prefetch_mode == "next_ready":
+            ready, _ = await asyncio.wait(self._pending_groups, return_when=asyncio.FIRST_COMPLETED)
+            task = next(iter(ready))
+        else:
+            task = self._pending_groups[0]
+        group = await task
+        self._pending_groups.remove(task)
+        return group
 
     async def cancel_pending_groups(self) -> None:
         """Cancel prefetched groups and their dependent rollout tasks."""
@@ -832,30 +870,24 @@ class Batcher:
         iteration: int = 1,
         include_examples: bool = False,
     ) -> RolloutBatch:
-        """Consume groups from a bounded pool, draining it at checkpoints and training end."""
+        """Consume groups from a bounded pool, draining it at checkpoint intervals."""
         if num_groups < 1:
             raise ValueError("num_groups must be at least 1")
         started = time.monotonic()
         prefetch_batches = min(self.config.prefetch_batches, (-iteration) % self.config.checkpoint_interval)
-        if self.config.total_iterations is not None:
-            prefetch_batches = min(prefetch_batches, self.config.total_iterations - iteration)
         try:
-            while len(self._pending_groups) < (prefetch_batches + 1) * num_groups:
-                # These tasks remain live between learner requests.
-                task = asyncio.create_task(self._fetch_group(group_size))
-                self._pending_groups.append(task)
-            groups = []
-            for _ in range(num_groups):
-                if self.config.prefetch_mode == "next_ready":
-                    ready, _ = await asyncio.wait(self._pending_groups, return_when=asyncio.FIRST_COMPLETED)
-                    task = next(iter(ready))
-                else:
-                    task = self._pending_groups[0]
-                groups.append(await task)
-                self._pending_groups.remove(task)
+            groups = [
+                await self._fetch_group(
+                    group_size=group_size,
+                    target_pending=prefetch_batches * num_groups + remaining,
+                )
+                for remaining in range(num_groups, 0, -1)
+            ]
             fetched = time.monotonic()
             with span("batcher.prepare_batch"):
-                training_batch = self.prepare_batch(groups, context_length=context_length)  # (B, T), (B,) leaves.
+                training_batch = await asyncio.to_thread(
+                    self.prepare_batch, groups, context_length=context_length
+                )  # (B, T), (B,) leaves.
             prepared = time.monotonic()
             return build_rollout_batch(
                 groups=groups,
@@ -1053,7 +1085,7 @@ class Learner:
                 group_size=self.config.group_size,
                 context_length=self.model.config.max_position_embeddings,
                 iteration=iteration,
-                include_examples=True,
+                include_examples=iteration % self.config.example_log_interval == 0,
             )
         )
 
@@ -1187,10 +1219,9 @@ class Actor:
 
                     async def run_rollout(index: int) -> Rollout:
                         with span("actor.rollout", {**span_data, "rollout_index": index}) as rollout_span:
-                            async with AsyncExitStack() as resources:
-                                async with asyncio.timeout(self.config.rollout_timeout):
-                                    env = await resources.enter_async_context(task.init_env())
-                                    result = await agent.run(env=env)
+                            async with AsyncExitStack() as resources, asyncio.timeout(self.config.rollout_timeout):
+                                env = await resources.enter_async_context(task.init_env())
+                                result = await agent.run(env=env)
                             rollout_span.set_attribute("stop_condition", result.stop_condition)
                             return result
 
@@ -1200,7 +1231,10 @@ class Actor:
                         run.add_done_callback(self._runs.discard)
                 with span("actor.score_group"):
                     group = score_group(
-                        task, [await run for run in runs], length_penalty_coef=self.config.length_penalty_coef
+                        task,
+                        [run.result() for run in runs],
+                        length_penalty_coef=self.config.length_penalty_coef,
+                        max_tokens_penalty=self.config.max_tokens_penalty,
                     )
         except Exception:
             logger.exception(
@@ -1216,6 +1250,7 @@ class Actor:
 def configure_console_logging() -> None:
     log_format = "%(asctime)s\t%(levelname)s %(filename)s:%(lineno)d -- %(message)s"
     logging.basicConfig(level=logging.INFO, format=log_format, force=True)
+    logging.getLogger("openai._base_client").addFilter(add_retry_cause)
     for handler in logging.getLogger("ray").handlers:
         handler.setFormatter(logging.Formatter(log_format))
 

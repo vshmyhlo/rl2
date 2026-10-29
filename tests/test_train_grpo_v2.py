@@ -8,6 +8,7 @@ import random
 import runpy
 import subprocess
 import sys
+import threading
 from collections.abc import Generator, Iterator
 from contextlib import ExitStack, aclosing
 from dataclasses import asdict, replace
@@ -67,6 +68,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert defaults.parameter_sync_step == 1
     assert not defaults.drop_degenerate_groups
     assert defaults.length_penalty_coef == 0.0
+    assert defaults.max_tokens_penalty == 0.0
     assert defaults.update_epochs == 1
     assert defaults.checkpoint_interval == 100
     assert defaults.padding_multiple == 256
@@ -97,6 +99,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
                 "padding_multiple": 64,
                 "drop_degenerate_groups": False,
                 "length_penalty_coef": 0.01,
+                "max_tokens_penalty": 0.1,
                 "rollout_is_threshold": 3.0,
                 "prefetch_batches": 3,
                 "prefetch_mode": "next_ready",
@@ -125,6 +128,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
             padding_multiple=64,
             drop_degenerate_groups=False,
             length_penalty_coef=0.01,
+            max_tokens_penalty=0.1,
             rollout_is_threshold=3.0,
             prefetch_batches=3,
             prefetch_mode="next_ready",
@@ -282,6 +286,7 @@ def test_reasoning_gym_cli_and_actor_task_stream(tmp_path: Path, monkeypatch: py
         {"adamw_batch_size_scale": -0.5},
         {"adamw_batch_size_scale": 10.01},
         {"length_penalty_coef": -0.01},
+        {"max_tokens_penalty": -0.1},
         {"clip_coef": 1.0},
         {"rollout_is_threshold": 0.0},
         {"max_grad_norm": 0.0},
@@ -355,6 +360,16 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
         "vllm",
         "--logprobs-mode",
         "processed_logprobs",
+        "--max-model-len",
+        "8192",
+        "--max-num-seqs",
+        "128",
+        "--max-num-batched-tokens",
+        "8192",
+        "--gpu-memory-utilization",
+        "0.90",
+        "--enable-prefix-caching",
+        "--enable-chunked-prefill",
         "--enable-lora",
         "--max-lora-rank",
         "16",
@@ -397,6 +412,7 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
         **os.environ,
         "VLLM_SERVER_DEV_MODE": "1",
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
+        "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": "30",
     }
     if failure == "launch":
         server.terminate.assert_not_called()
@@ -404,6 +420,21 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
         server.terminate.assert_called_once_with()
         server.__exit__.assert_called_once()
         server.kill.assert_not_called()
+
+
+def test_serve_vllm_kills_unresponsive_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = MagicMock()
+    server.__enter__.return_value = server
+    server.wait.side_effect = subprocess.TimeoutExpired(cmd="vllm", timeout=30)
+    monkeypatch.setattr(training.subprocess, "Popen", Mock(return_value=server))
+
+    with training.serve_vllm():
+        pass
+
+    server.terminate.assert_called_once_with()
+    server.wait.assert_called_once_with(timeout=30)
+    server.kill.assert_called_once_with()
+    server.__exit__.assert_called_once()
 
 
 @pytest.mark.parametrize(("rank", "maximum"), [(17, 32), (512, 512), (513, None)])
@@ -804,6 +835,7 @@ def test_learner_pulls_groups_through_batcher(
     monkeypatch.setattr(training.ray, "get", get)
     format_examples = Mock(wraps=training.format_rollout_examples)
     monkeypatch.setattr(training, "format_rollout_examples", format_examples)
+    include_examples = iteration % learner.config.example_log_interval == 0
 
     if fails:
         with pytest.raises(RuntimeError, match="rollout failed"):
@@ -813,12 +845,16 @@ def test_learner_pulls_groups_through_batcher(
         assert not hasattr(batch, "groups")
         assert batch.stop_counts == {"agent_completed": num_groups * 3}
         assert batch.num_output_tokens == num_groups * 3
-        assert batch.examples.count("Full token sequence (special tokens preserved):") == num_groups * 3
-        format_examples.assert_called_once()
+        if include_examples:
+            assert batch.examples.count("Full token sequence (special tokens preserved):") == num_groups * 3
+            format_examples.assert_called_once()
+        else:
+            assert batch.examples == ""
+            format_examples.assert_not_called()
         assert batch.training_batch.token_ids.shape == (num_groups * 3, 8)
         np.testing.assert_array_equal(batch.training_batch.advantages, 0.5)
     batcher_handle.fetch_next_batch.remote.assert_called_once_with(
-        num_groups=num_groups, group_size=3, context_length=8, iteration=iteration, include_examples=True
+        num_groups=num_groups, group_size=3, context_length=8, iteration=iteration, include_examples=include_examples
     )
     assert actor.fetch_next_group.remote.call_count == num_groups
     assert all(call.kwargs == {"group_size": 3} for call in actor.fetch_next_group.remote.call_args_list)
@@ -828,7 +864,7 @@ def test_learner_pulls_groups_through_batcher(
     ("prefetch_batches", "checkpoint_interval", "total_iterations", "expected_requests"),
     [
         (0, 100, 9, [2, 4]),
-        (3, 100, 12, [8, 10, 10, 10, 10]),
+        (3, 100, 12, [8, 10, 12, 14, 16]),
         (3, 12, None, [8, 10, 10, 10, 10]),
     ],
     ids=["disabled", "training-end", "checkpoint"],
@@ -861,8 +897,9 @@ def test_batcher_prefetches_bounded_groups(
                 # Let newly scheduled groups start while the learner processes the batch.
                 await asyncio.sleep(0)
                 assert actor.fetch_next_group.remote.call_count == requests
-            assert not batcher._pending_groups
+            assert len(batcher._pending_groups) == expected_requests[-1] - 2 * len(expected_requests)
             await batcher.cancel_pending_groups()
+            assert not batcher._pending_groups
 
     asyncio.run(collect())
 
@@ -892,7 +929,7 @@ def test_batcher_selects_groups_across_batch_boundaries(
         actor.fetch_next_group.remote.side_effect = fetch
         batcher = training.Batcher.__ray_metadata__.modified_class(
             actor=actor,
-            config=training.Config(prefetch_batches=1, prefetch_mode=prefetch_mode, total_iterations=2),
+            config=training.Config(prefetch_batches=1, prefetch_mode=prefetch_mode, checkpoint_interval=2),
         )
         async with asyncio.timeout(5), asyncio.TaskGroup() as tg:
             first = tg.create_task(
@@ -957,7 +994,7 @@ def test_learner_cancels_prefetch_on_update_failure(
 
     def optimize(batch: training.GRPOBatch[np.ndarray]) -> dict[str, float]:
         learner.batcher.fetch_next_batch.remote.assert_called_once_with(
-            num_groups=1, group_size=4, context_length=8, iteration=1, include_examples=True
+            num_groups=1, group_size=4, context_length=8, iteration=1, include_examples=False
         )
         raise RuntimeError("update failed")
 
@@ -1141,8 +1178,10 @@ def test_batch_timings_and_order_survive_serialization(
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor)
     learner.batcher.fetch_next_batch.remote.side_effect = batcher.fetch_next_batch
     prepare_batch = batcher.prepare_batch
+    event_loop_thread = threading.get_ident()
 
     def prepare(groups: list[training.RolloutGroup], context_length: int) -> training.GRPOBatch[np.ndarray]:
+        assert threading.get_ident() != event_loop_thread
         batch = prepare_batch(groups, context_length=context_length)  # (B, T), (B,) leaves.
         clock.return_value += 2.0
         return batch  # (B, T), (B,) leaves.
@@ -1754,6 +1793,7 @@ def test_learner_logs_examples_at_configured_interval(
     messages = [message for message in caplog.messages if "Rollout examples | step" in message]
     assert not messages
     assert len([message for message in caplog.messages if message.startswith("iteration=")]) == 7
+    assert [bool(batch.examples) for batch in submitted] == [False, False, True, False, False, True, False]
     for step, call in zip((3, 6), artifacts, strict=True):
         text = call.args[0]
         assert text.startswith(f"Rollout examples | step {step}\n\n{'=' * 72}\n")
@@ -1803,12 +1843,15 @@ def test_learner_delegates_publication(learner: Any) -> None:
 def test_console_logging_omits_ray_metadata(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    sdk_logger = logging.getLogger("openai._base_client")
+    monkeypatch.setattr(sdk_logger, "filters", [])
     for name in ("", "ray"):
         log = logging.getLogger(name)
         monkeypatch.setattr(log, "handlers", [logging.StreamHandler()] if name else [])
         monkeypatch.setattr(log, "level", logging.INFO)
         monkeypatch.setattr(log, "propagate", False)
     training.configure_console_logging()
+    assert training.add_retry_cause in sdk_logger.filters
     metadata = {
         "job_id": "job",
         "worker_id": "worker",
@@ -1859,6 +1902,7 @@ def test_train_gracefully_terminates_actor(
 ) -> None:
     for name in ("", "ray", "openai._base_client", "vllm", "httpx", "httpcore"):
         log = logging.getLogger(name)
+        monkeypatch.setattr(log, "filters", list(log.filters))
         monkeypatch.setattr(log, "handlers", list(log.handlers))
         monkeypatch.setattr(log, "level", log.level)
         monkeypatch.setattr(log, "propagate", log.propagate)
@@ -2049,13 +2093,44 @@ def test_score_group_length_penalty(
     assert group.is_degenerate == (expected[0] == expected[1])
 
 
-def test_length_penalty_actor_batcher_integration(
+@pytest.mark.parametrize(
+    ("stop_condition", "reward", "penalty", "expected"),
+    [
+        pytest.param("max_tokens", 0.0, 0.1, -0.1, id="zero-reward"),
+        pytest.param("max_tokens", 1.0, 0.1, 0.65, id="combined-penalties"),
+        pytest.param("max_tokens", 0.0, 0.0, 0.0, id="disabled"),
+        pytest.param("environment_done", 0.0, 0.1, 0.0, id="environment-done"),
+        pytest.param("agent_completed", 0.0, 0.1, 0.0, id="agent-completed"),
+        pytest.param("max_turns", 0.0, 0.1, 0.0, id="max-turns"),
+        pytest.param("context_length", 0.0, 0.1, 0.0, id="context-length"),
+    ],
+)
+def test_score_group_max_tokens_penalty(
+    stop_condition: training.StopCondition,
+    reward: float,
+    penalty: float,
+    expected: float,
+    rollout: training.Rollout,
+) -> None:
+    samples = [replace(rollout, reward=reward, stop_condition=stop_condition), replace(rollout, reward=0.0)]
+    group = training.score_group(Mock(id="task"), samples, length_penalty_coef=0.25, max_tokens_penalty=penalty)
+    expected_rewards = [expected, 0.0]
+    assert group.training_rewards == pytest.approx(expected_rewards)
+    assert [sample.reward for sample in group.rollouts] == [reward, 0.0]
+    assert [sample.advantage for sample in group.rollouts] == pytest.approx(
+        [(value - mean(expected_rewards)) / (pstdev(expected_rewards) + 1e-4) for value in expected_rewards]
+    )
+    assert group.is_degenerate == (expected == 0.0)
+
+
+def test_reward_penalties_actor_batcher_integration(
     actor: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    actor.config = replace(actor.config, length_penalty_coef=0.25, drop_degenerate_groups=True)
+    actor.config = replace(actor.config, length_penalty_coef=0.25, max_tokens_penalty=0.1, drop_degenerate_groups=True)
     longer = replace(
         rollout,
         num_output_tokens=2,
+        stop_condition="max_tokens",
         sequence=training.TrainingSequence(
             token_ids=np.array([1, 2, 3], dtype=np.int32),  # (T=3,)
             loss_mask=np.array([False, True, True]),  # (T=3,)
@@ -2077,9 +2152,9 @@ def test_length_penalty_actor_batcher_integration(
     batch = asyncio.run(collect())
     assert handle.fetch_next_group.remote.call_count == 1
     assert batch.training_batch.advantages.shape == (2,)
-    np.testing.assert_allclose(batch.training_batch.advantages, [0.125 / 0.1251, -0.125 / 0.1251])
+    np.testing.assert_allclose(batch.training_batch.advantages, [0.175 / 0.1751, -0.175 / 0.1751])
     assert batch.rollout_metrics["rollout/degenerate_group_fraction"] == 0.0
-    for suffix, raw, adjusted in (("mean", 1.0, 0.625), ("std", 0.0, 0.125), ("min", 1.0, 0.5), ("max", 1.0, 0.75)):
+    for suffix, raw, adjusted in (("mean", 1.0, 0.575), ("std", 0.0, 0.175), ("min", 1.0, 0.4), ("max", 1.0, 0.75)):
         assert batch.rollout_metrics[f"rollout/reward_{suffix}"] == raw
         assert batch.rollout_metrics[f"rollout/adjusted_reward_{suffix}"] == adjusted
 

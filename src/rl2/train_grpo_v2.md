@@ -63,6 +63,15 @@ Set `learner_gpus` in the YAML and expose at least `learner_gpus + 1` GPUs.
 The batcher runs on CPU. The actor and batcher use NumPy arrays and keep
 `JAX_PLATFORMS=cpu`; only the learner places training arrays on its GPUs.
 
+The vLLM server uses an 8192-token context limit, at most 128 sequences and 8192
+prefill/decode tokens per scheduler iteration, and a 90% GPU memory budget.
+Prefix caching reuses shared transcript prefixes; chunked prefill interleaves
+long prompt processing with decoding. These settings are fixed in `serve_vllm()`;
+the agent also respects the configured `max_tokens` transcript budget.
+The server keeps idle HTTP connections alive for 30 seconds, longer than the client's
+5-second expiry. Retry messages include the exception type and HTTP status when available;
+request payloads are not logged. Request timeouts still use `rollout_timeout`.
+
 ## Interaction
 
 Tasks and environments inherit the `Task` and `Environment` abstract base classes in `agent_task.py`.
@@ -129,7 +138,10 @@ The actor samples `group_size` independent attempts at the same task. Set
 sampled token across all turns, including thinking and end-of-turn tokens, only
 when the environment reward is nonzero:
 `training_reward = reward - length_penalty_coef * num_output_tokens`.
-Zero environment rewards remain zero regardless of rollout length.
+Zero environment rewards receive no length penalty. Set `max_tokens_penalty`
+(default `0.0`, nonnegative) to additionally subtract a flat cost when the stop
+condition is `max_tokens`, including from zero rewards. Other stop conditions,
+including `context_length`, receive no such penalty. The ALFWorld preset uses `0.1`.
 Advantages are `(training_reward - group_mean) / (population_std + 1e-4)`;
 groups with equal adjusted rewards have zero advantages. The batcher gathers
 `num_groups` concurrently and preserves request order. Set
@@ -276,7 +288,8 @@ batch from ready groups across the pool, without waiting for slower groups submi
 alongside them. When multiple groups are ready, their selection order is unspecified.
 Groups stay intact, and degenerate groups are
 replaced within their pool slots when filtering is enabled. Both modes drain the
-pool before checkpoints and training completion. Prefetched rollouts can use older
+pool at checkpoint intervals. Prefetching can extend beyond `total_iterations`;
+unused groups are canceled during shutdown. Prefetched rollouts can use older
 weights, and multi-turn rollouts can span weight updates.
 `weight_update_pause_mode` accepts `wait` (default) or `keep`, operating
 on individual generation requests. Groups can start during publication; vLLM
@@ -299,8 +312,9 @@ continues. A subsequent save waits for any previous save, and shutdown waits for
 outstanding writes and propagates save failures. `checkpoint/save_blocking_seconds`
 measures save dispatch, including staging and any previous-save wait, excluding
 the new checkpoint's background writes.
-Prefetching drains on checkpoint iterations so the saved task RNG does not
-skip unconsumed batches. Restarting with the same directory restores model weights (including LoRA factors in LoRA mode),
+Prefetching drains at checkpoint intervals so the saved task RNG does not
+skip unconsumed batches. A final checkpoint outside that interval can include RNG
+advancement from unused prefetched groups. Restarting with the same directory restores model weights (including LoRA factors in LoRA mode),
 optimizer state, shuffle key, task RNG, and progress counters. `total_iterations` is a cumulative
 target; `null` runs until interrupted. Environments restart fresh, so resumption
 is not bit-for-bit reproducible. Use a new directory for a fresh experiment or
@@ -325,9 +339,9 @@ resubmission to pick up logging changes.
 MLflow uses experiment `grpo_v2` and the standard tracking environment variables.
 The [module docstring](train_grpo_v2.py) defines metric names and aggregation.
 Every `example_log_interval` iterations (default 10, positive integer), it saves
-full token transcripts, final observations, rewards, and advantages. Every batch
-carries up to eight examples so logs match the consumed batch even when prefetches
-finish out of order.
+full token transcripts, final observations, rewards, and advantages. The batcher
+formats up to eight examples only for iterations that log them, using the consumed
+groups even when prefetches finish out of order.
 Stop fractions include all `StopCondition` labels, with zero for absent labels.
 `rollout/total_tokens_mean` is the mean full transcript length in the learner
 batch, counting context and sampled tokens and excluding padding, before the
