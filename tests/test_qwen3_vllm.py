@@ -618,7 +618,9 @@ def test_published_rollout_parity(engine: Engine) -> None:
                     log_probs=np.asarray(actual),  # (B, T-1)
                     candidate_log_probs=np.asarray(distribution[indices]),  # (candidate count,)
                 )
-                _, metrics = training.objective(actual, batch, clip_coef=0.2)
+                # Preserve the raw JAX/vLLM parity checks independently of corrected optimization.
+                _, metrics = training.objective(actual, batch, old[:, 1:], clip_coef=0.2)
+                _, optimization = training.objective(actual, batch, actual, clip_coef=0.2)
                 ratios = jnp.exp(selected - jnp.asarray(expected))  # (sampled tokens,)
                 report = {
                     "version": version,
@@ -633,6 +635,7 @@ def test_published_rollout_parity(engine: Engine) -> None:
                     "approx_kl": float(metrics["train/approx_kl"]),
                     "clip_fraction": float(metrics["train/clip_fraction"]),
                     "policy_loss": float(metrics["train/policy_loss"]),
+                    "optimization": {name: float(value) for name, value in optimization.items()},
                 }
                 reports.append(report)
                 print(report, flush=True)
@@ -644,9 +647,11 @@ def test_published_rollout_parity(engine: Engine) -> None:
             lambda value: np.asarray(value).copy(), params
         )  # Host (R, I), (O, R) factors survive donated state buffers.
         with jax.set_mesh(training.Mesh(devices=jax.devices(), axis_names=("batch",))):
+            anchors = training.compute_anchor_log_probs(state, batch, batch.token_ids.shape[0], temperature)  # (B, T-1)
             state, update_metrics = training.update(
                 state,
                 batch,
+                anchors,
                 1,
                 temperature,
                 0.2,
@@ -663,12 +668,10 @@ def test_published_rollout_parity(engine: Engine) -> None:
                 and report["temperature"] == temperature
                 and report["version"] == version
             ):
-                for metric, key in (
-                    ("train/approx_kl", "approx_kl"),
-                    ("train/clip_fraction", "clip_fraction"),
-                    ("train/policy_loss", "policy_loss"),
-                ):
-                    np.testing.assert_allclose(optimizer_report[metric], report[key], rtol=1e-4, atol=1e-7)
+                for metric in ("train/policy_loss", *training.POLICY_DIAGNOSTICS):
+                    np.testing.assert_allclose(
+                        optimizer_report[metric], report["optimization"][metric], rtol=1e-4, atol=1e-7
+                    )
         assert any(
             not np.array_equal(before, np.asarray(after))
             for before, after in zip(jax.tree.leaves(published), jax.tree.leaves(state.params), strict=True)

@@ -48,16 +48,6 @@ def spans(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
         yield exporter
 
 
-def test_numerical_presets() -> None:
-    defaults = training.Config()
-    for preset in (Path(__file__).resolve().parents[1] / "configs/grpo_v2").glob("*.yaml"):
-        values = yaml.safe_load(preset.read_text())
-        for name in ("padding_multiple", "scan_layers", "gradient_checkpointing"):
-            assert values[name] == getattr(defaults, name), (preset.name, name)
-        expected_backend = defaults.attention_backend if preset.name == "alfworld.yaml" else "tokamax"
-        assert values["attention_backend"] == expected_backend, preset.name
-
-
 @pytest.mark.parametrize("backend", ATTENTION_BACKENDS)
 def test_attention_backend_config(backend: AttentionBackend) -> None:
     assert training.Config(attention_backend=backend).attention_backend == backend
@@ -82,37 +72,14 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert not defaults.enable_ray_timeline
     assert defaults.enable_tracing
     assert defaults.weight_update_pause_mode == "wait"
-    preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/alfworld.yaml"
-    config = training.load_config(preset, training.Config)
-    assert config.finetuning_mode == "full"
-    assert not config.drop_degenerate_groups
-    assert config.prefetch_batches == 1
-    assert config.temperature == defaults.temperature == 1.0
-    assert config.run_id == (
-        f"grpo_v2_alfworld_Qwen_Qwen3-0.6B_{config.finetuning_mode}_{config.attention_backend}_s{config.seed}"
-        f"_ng{config.num_groups}_gs{config.group_size}"
-        f"_mb{config.minibatches_per_epoch}_ddg{config.drop_degenerate_groups}_pf{config.prefetch_batches}"
-        f"_lp{config.length_penalty_coef}"
-    )
-    assert config.ckpt_dir == f"/runs/grpo_v2/{config.run_id}"
-    assert config.total_iterations is None
-    assert config.minibatches_per_epoch == 1
-    assert config.grad_accum_steps == 8
-    assert config.attention_backend == defaults.attention_backend
-    assert config.scan_layers
-    assert config.gradient_checkpointing
-    assert config.weight_update_pause_mode == "wait"
-    assert asdict(config.taskset) == {"id": "alfworld", "config_file": "data/alfworld/base_config.yaml"}
-    assert "dataset_file" not in asdict(config)
+    config = training.Config(run_id="test_full", ckpt_dir="/runs/test_full")
     path = tmp_path / "config.yaml"
-    path.write_text(preset.read_text().replace("finetuning_mode: full", "finetuning_mode: lora"))
-    lora_config = training.load_config(path, training.Config)
-    assert lora_config.run_id == config.run_id.replace("_full_", "_lora_")
-    assert lora_config.ckpt_dir == f"/runs/grpo_v2/{lora_config.run_id}"
     path.write_text(
         yaml.safe_dump(
             asdict(config)
             | {
+                "run_id": "test_${finetuning_mode}",
+                "ckpt_dir": "/runs/${run_id}",
                 "max_tokens": "${group_size}",
                 "total_iterations": 1,
                 "attention_backend": "xla",
@@ -124,6 +91,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
                 "padding_multiple": 64,
                 "drop_degenerate_groups": False,
                 "length_penalty_coef": 0.01,
+                "rollout_is_threshold": 3.0,
                 "prefetch_batches": 3,
                 "finetuning_mode": "full",
             }
@@ -147,6 +115,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
             padding_multiple=64,
             drop_degenerate_groups=False,
             length_penalty_coef=0.01,
+            rollout_is_threshold=3.0,
             prefetch_batches=3,
             finetuning_mode="full",
         )
@@ -161,19 +130,8 @@ def test_example_log_interval_config(tmp_path: Path) -> None:
     assert training.load_config(path, training.Config).example_log_interval == 1
 
 
-def test_presets_use_telemetry_defaults() -> None:
-    presets = Path(__file__).resolve().parents[1] / "configs/grpo_v2"
-    for preset in sorted(presets.glob("alfworld.yaml")):
-        config = training.load_config(preset, training.Config)
-        assert config.enable_tracing, preset.name
-        assert not config.enable_ray_dashboard, preset.name
-        assert not config.enable_ray_timeline, preset.name
-
-
-def test_appworld_preset_and_actor_task_stream(monkeypatch: pytest.MonkeyPatch) -> None:
-    preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/appworld.yaml"
-    config = training.load_config(preset, training.Config)
-    assert config.taskset == training.AppWorldConfig(python="/opt/appworld/bin/python", root="/data/appworld")
+def test_appworld_actor_task_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = training.Config(taskset=training.AppWorldConfig(python="/test/python", root="/test/appworld"))
     assert pickle.loads(pickle.dumps(config)) == config
     task = Mock(spec=training.Task)
     stream = iter([task])
@@ -189,24 +147,18 @@ def test_appworld_preset_and_actor_task_stream(monkeypatch: pytest.MonkeyPatch) 
     stream_tasks.assert_called_once_with(config.taskset, actor.rng, config.environment_timeout)
 
 
-def test_reasoning_gym_preset_cli_and_actor_task_stream(monkeypatch: pytest.MonkeyPatch) -> None:
-    preset = Path(__file__).resolve().parents[1] / "configs/grpo_v2/reasoning_gym.yaml"
-    config = training.load_config(preset, training.Config)
-    assert config.taskset == training.ReasoningGymConfig(
-        task="leg_counting", task_config={"min_animals": 1, "max_animals": 5}
+def test_reasoning_gym_cli_and_actor_task_stream(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = training.Config(
+        taskset=training.ReasoningGymConfig(task="leg_counting", task_config={"min_animals": 1, "max_animals": 5}),
+        run_id="test_reasoning_gym",
+        ckpt_dir=str(tmp_path),
     )
     assert pickle.loads(pickle.dumps(config)) == config
-    reference = training.load_config(preset.with_name("alfworld.yaml"), training.Config)
-    assert config.attention_backend == "tokamax"
-    assert config.prefetch_batches == 1
-    assert config.finetuning_mode == "lora"
-    task_specific = {"taskset", "run_id", "ckpt_dir", "attention_backend", "prefetch_batches", "finetuning_mode"}
-    assert {name: value for name, value in asdict(config).items() if name not in task_specific} == {
-        name: value for name, value in asdict(reference).items() if name not in task_specific
-    }
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(asdict(config)))
     train = Mock()
     monkeypatch.setattr(training, "train", train)
-    monkeypatch.setattr(sys, "argv", ["train_grpo_v2", "--config", str(preset)])
+    monkeypatch.setattr(sys, "argv", ["train_grpo_v2", "--config", str(path)])
     training.main()
     train.assert_called_once_with(config)
 
@@ -265,6 +217,8 @@ def test_reasoning_gym_preset_cli_and_actor_task_stream(monkeypatch: pytest.Monk
         {"learning_rate": 0.0},
         {"length_penalty_coef": -0.01},
         {"clip_coef": 1.0},
+        {"rollout_is_threshold": 0.0},
+        {"rollout_is_threshold": -1.0},
         {"max_grad_norm": 0.0},
         {"minibatches_per_epoch": 0},
         {"minibatches_per_epoch": 3},

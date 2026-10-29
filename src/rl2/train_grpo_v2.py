@@ -161,6 +161,7 @@ class Config(BaseConfig):
     lora_rank: Annotated[int, Field(ge=1, le=512)] = 16
     lora_alpha: Annotated[float, Field(gt=0)] = 32.0
     clip_coef: Annotated[float, Field(gt=0, lt=1)] = 0.2
+    rollout_is_threshold: Annotated[float, Field(gt=0)] = 2.0  # verl token-level truncated importance sampling.
     max_grad_norm: Annotated[float, Field(gt=0)] = 1.0
     update_epochs: Annotated[int, Field(ge=1)] = 1
     minibatches_per_epoch: Annotated[int, Field(ge=1)] = 4
@@ -372,6 +373,13 @@ def build_rollout_batch(
 # Use a value alias so Ray can serialize script-defined actors without importing __main__.Metrics.
 Metrics = dict[str, jax.Array]  # Scalar leaves.
 TrainParameters = Parameters | LoRAParameters  # HF parameter shapes or (R, I), (O, R) factors.
+POLICY_DIAGNOSTICS = (
+    "train/approx_kl",
+    "train/clip_fraction",
+    "train/rollout_log_prob_error_mean",
+    "train/rollout_importance_weight_mean",
+    "train/rollout_importance_weight_clipped_fraction",
+)
 
 
 def token_log_probs(
@@ -402,24 +410,76 @@ def token_log_probs(
     return jnp.where(targets, log_probs, 0).sum(axis=-1)  # (B, T-1)
 
 
+@partial(
+    jax.jit,
+    static_argnames=("microbatch_size", "temperature"),
+    in_shardings=(PartitionSpec(), PartitionSpec("batch")),
+    out_shardings=PartitionSpec("batch"),
+)
+def compute_anchor_log_probs(
+    state: TrainState,
+    batch: GRPOBatch[jax.Array],  # (B, T), (B,) leaves.
+    microbatch_size: int,
+    temperature: float,
+) -> jax.Array:  # (B, T-1)
+    """(B, T-1) frozen learner scores, using the optimizer's microbatch shape."""
+    size, width = batch.token_ids.shape
+    if microbatch_size < 1 or size % microbatch_size:
+        raise ValueError("microbatch_size must be positive and divide the rollout batch size")
+    if microbatch_size % jax.sharding.get_abstract_mesh().shape["batch"]:
+        raise ValueError("learner device count must divide the microbatch size")
+
+    def evaluate() -> jax.Array:  # (B, T-1)
+        microbatches = jax.tree.map(
+            lambda value: value.reshape(size // microbatch_size, microbatch_size, *value.shape[1:]), batch
+        )  # (M, B/M, T), (M, B/M); M = number of microbatches.
+        microbatches = jax.lax.with_sharding_constraint(microbatches, PartitionSpec(None, "batch"))
+
+        def score(microbatch: GRPOBatch[jax.Array]) -> jax.Array:  # (B/M, T), (B/M,) -> (B/M, T-1)
+            return token_log_probs(state, state.params, microbatch, temperature)  # (B/M, T-1)
+
+        scores = jax.lax.map(score, microbatches)  # (M, B/M, T-1)
+        return scores.reshape(size, width - 1)  # (B, T-1)
+
+    # No policy diagnostics are logged for an entirely skipped rollout batch.
+    scores = jax.lax.cond(
+        jnp.any(batch.advantages != 0), evaluate, lambda: jnp.zeros((size, width - 1), jnp.float32)
+    )  # (B, T-1)
+    return jax.lax.stop_gradient(scores)  # (B, T-1)
+
+
 def objective(
     log_probs: jax.Array,  # (B, T-1)
-    batch: GRPOBatch[jax.Array],  # (B, T), (B,) leaves.
+    batch: GRPOBatch[jax.Array],  # (B, T), (B,) leaves; old_log_probs retains the rollout scores.
+    anchor_log_probs: jax.Array,  # (B, T-1) learner scores frozen before all batch updates.
     clip_coef: float,
+    rollout_is_threshold: float = 2.0,
 ) -> tuple[jax.Array, Metrics]:  # (), scalar metric leaves
     mask = batch.loss_mask[:, 1:]  # (B, T-1)
+    anchor_log_probs = jax.lax.stop_gradient(anchor_log_probs)  # (B, T-1)
 
     def average(values: jax.Array) -> jax.Array:  # (B, T-1) -> ()
         return (jnp.where(mask, values, 0).sum(axis=1) / jnp.maximum(mask.sum(axis=1), 1)).mean()  # ()
 
-    log_ratio = jnp.where(mask, log_probs - batch.old_log_probs[:, 1:], 0)  # (B, T-1)
+    rollout_log_ratio = jnp.where(mask, anchor_log_probs - batch.old_log_probs[:, 1:], 0)  # (B, T-1)
+    # verl's token-TIS: bound exponentiation, upper-truncate, and detach; no batch normalization or rejection.
+    raw_weights = jnp.exp(jnp.clip(rollout_log_ratio, -20, 20))  # (B, T-1)
+    weights = jax.lax.stop_gradient(jnp.where(mask, jnp.minimum(raw_weights, rollout_is_threshold), 0))  # (B, T-1)
+    log_ratio = jnp.where(mask, log_probs - anchor_log_probs, 0)  # (B, T-1)
     ratio = jnp.exp(log_ratio)  # (B, T-1)
     advantages = batch.advantages[:, None]  # (B, 1)
-    loss = -average(jnp.minimum(ratio * advantages, jnp.clip(ratio, 1 - clip_coef, 1 + clip_coef) * advantages))  # ()
+    loss = -average(
+        weights * jnp.minimum(ratio * advantages, jnp.clip(ratio, 1 - clip_coef, 1 + clip_coef) * advantages)
+    )  # ()
     return loss, {
         "train/policy_loss": loss,  # ()
         "train/approx_kl": average(jnp.expm1(log_ratio) - log_ratio),  # ()
         "train/clip_fraction": average((jnp.abs(ratio - 1) > clip_coef).astype(jnp.float32)),  # ()
+        "train/rollout_log_prob_error_mean": average(jnp.abs(rollout_log_ratio)),  # ()
+        "train/rollout_importance_weight_mean": average(weights),  # ()
+        "train/rollout_importance_weight_clipped_fraction": average(
+            (raw_weights > rollout_is_threshold).astype(jnp.float32)
+        ),  # ()
     }
 
 
@@ -429,7 +489,7 @@ def create_state(
     config: Config,
 ) -> TrainState:
     """Optimize FP32 full weights or LoRA factors on attention and MLP projections."""
-    optimizer = optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adam(config.learning_rate))
+    optimizer = optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adamw(config.learning_rate))
     if config.finetuning_mode == "full":
         return TrainState.create(
             apply_fn=model.apply,
@@ -466,17 +526,19 @@ def create_state(
 
 @partial(
     jax.jit,
-    static_argnames=("grad_accum_steps", "temperature", "clip_coef"),
-    in_shardings=(PartitionSpec(), PartitionSpec("batch")),
+    static_argnames=("grad_accum_steps", "temperature", "clip_coef", "rollout_is_threshold"),
+    in_shardings=(PartitionSpec(), PartitionSpec("batch"), PartitionSpec("batch")),
     out_shardings=PartitionSpec(),
     donate_argnums=(0,),
 )
 def update(
     state: TrainState,
     batch: GRPOBatch[jax.Array],  # One optimizer minibatch: (B, T), (B,) leaves.
+    anchor_log_probs: jax.Array,  # (B, T-1) frozen learner scores aligned with batch rows.
     grad_accum_steps: int,
     temperature: float,
     clip_coef: float,
+    rollout_is_threshold: float = 2.0,
 ) -> tuple[TrainState, Metrics]:
     """Consume state buffers, skipping zero-advantage updates; requires a `batch` mesh context and positional args."""
     if grad_accum_steps < 1 or batch.token_ids.shape[0] % grad_accum_steps:
@@ -495,7 +557,7 @@ def update(
     def apply_update() -> tuple[TrainState, Metrics]:
         microbatch_size = batch.token_ids.shape[0] // grad_accum_steps
         microbatches = jax.tree.map(
-            lambda value: value.reshape(grad_accum_steps, microbatch_size, *value.shape[1:]), batch
+            lambda value: value.reshape(grad_accum_steps, microbatch_size, *value.shape[1:]), (batch, anchor_log_probs)
         )  # (A, B/A, T); advantages: (A, B/A). A = grad_accum_steps.
         microbatches = jax.lax.with_sharding_constraint(
             microbatches, PartitionSpec(None, "batch")
@@ -503,10 +565,18 @@ def update(
 
         def accumulate(
             grads: TrainParameters,  # HF parameter shapes or (R, I), (O, R) factors.
-            microbatch: GRPOBatch[jax.Array],  # (B/A, T), (B/A,) leaves.
+            inputs: tuple[GRPOBatch[jax.Array], jax.Array],  # Batch (B/A, T), (B/A,); anchors (B/A, T-1).
         ) -> tuple[TrainParameters, Metrics]:
+            microbatch, anchors = inputs  # Batch (B/A, T), (B/A,); anchors (B/A, T-1).
+
             def loss_fn(params: TrainParameters) -> tuple[jax.Array, Metrics]:  # Parameter leaves -> (), scalars.
-                return objective(token_log_probs(state, params, microbatch, temperature), microbatch, clip_coef)
+                return objective(
+                    token_log_probs(state, params, microbatch, temperature),
+                    microbatch,
+                    anchors,
+                    clip_coef,
+                    rollout_is_threshold,
+                )
 
             (_, metrics), gradient = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
             return jax.tree.map(jnp.add, grads, gradient), metrics  # Parameter shapes; scalar metrics.
@@ -525,8 +595,7 @@ def update(
         # Fixed JIT output structure; optimize excludes unevaluated KL and clip fraction from logging.
         return state, {
             "train/policy_loss": jnp.asarray(0.0, dtype=jnp.float32),  # ()
-            "train/approx_kl": jnp.asarray(0.0, dtype=jnp.float32),  # () Not evaluated.
-            "train/clip_fraction": jnp.asarray(0.0, dtype=jnp.float32),  # () Not evaluated.
+            **{name: jnp.asarray(0.0, dtype=jnp.float32) for name in POLICY_DIAGNOSTICS},  # () Not evaluated.
             "train/gradient_norm": jnp.asarray(0.0, dtype=jnp.float32),  # ()
             "train/skipped_update_fraction": jnp.asarray(1.0, dtype=jnp.float32),  # ()
         }
@@ -940,31 +1009,36 @@ class Learner:
             raise ValueError("grad_accum_steps * learner device count must divide the minibatch size")
         batched = NamedSharding(self.mesh, PartitionSpec("batch"))
         device_batch: GRPOBatch[jax.Array] = jax.device_put(batch, batched)  # (B, T), (B,) leaves.
+        anchors = compute_anchor_log_probs(
+            self.state, device_batch, minibatch_size // self.config.grad_accum_steps, self.config.temperature
+        )  # (B, T-1), computed before any donated optimizer state is changed.
         history: list[Metrics] = []
         for _ in range(self.config.update_epochs):
             key = jax.random.fold_in(self.shuffle_key, self.state.step)  # () typed PRNG key.
             permutation = jax.random.permutation(key, batch.token_ids.shape[0])  # (B,)
             shuffled = jax.tree.map(
-                lambda value, permutation=permutation: value[permutation], device_batch
-            )  # (B, T), (B,) leaves.
+                lambda value, permutation=permutation: value[permutation], (device_batch, anchors)
+            )  # Batch (B, T), (B,); frozen anchors (B, T-1).
             for start in range(0, batch.token_ids.shape[0], minibatch_size):
                 minibatch = jax.tree.map(
                     lambda value, start=start: value[start : start + minibatch_size], shuffled
                 )  # (B/N, T), (B/N,) leaves; N = minibatches_per_epoch.
-                minibatch = jax.device_put(minibatch, batched)  # (B/N, T), (B/N,) leaves.
+                minibatch, minibatch_anchors = jax.device_put(minibatch, batched)  # Batch leaves; (B/N, T-1).
                 self.state, metrics = update(
                     self.state,
                     minibatch,
+                    minibatch_anchors,
                     self.config.grad_accum_steps,
                     self.config.temperature,
                     self.config.clip_coef,
+                    self.config.rollout_is_threshold,
                 )
                 history.append(metrics)
         metrics = jax.tree.map(lambda *values: jnp.stack(values).sum(), *history)  # Scalar leaves.
         totals = {name: float(value) for name, value in metrics.items()}
         scalars = {name: value / len(history) for name, value in totals.items()}
         evaluated = len(history) - totals["train/skipped_update_fraction"]
-        for name in ("train/approx_kl", "train/clip_fraction"):
+        for name in POLICY_DIAGNOSTICS:
             if evaluated:
                 scalars[name] = totals[name] / evaluated
             else:

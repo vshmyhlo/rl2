@@ -59,8 +59,8 @@ def main() -> None:
     if not args.donate_state:
         computation = jax.jit(
             update.__wrapped__,
-            static_argnames=("grad_accum_steps", "temperature", "clip_coef"),
-            in_shardings=(PartitionSpec(), PartitionSpec("batch")),
+            static_argnames=("grad_accum_steps", "temperature", "clip_coef", "rollout_is_threshold"),
+            in_shardings=(PartitionSpec(), PartitionSpec("batch"), PartitionSpec("batch")),
             out_shardings=PartitionSpec(),
         )
     started = perf_counter()
@@ -68,9 +68,11 @@ def main() -> None:
         lowered = computation.lower(
             state,
             batch,
+            jax.ShapeDtypeStruct((batch_size, args.length - 1), jnp.float32, sharding=batched),  # (B, T-1) anchors.
             config.grad_accum_steps,
             config.temperature,
             config.clip_coef,
+            config.rollout_is_threshold,
         )
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "update.stablehlo.mlir").write_text(str(lowered.compiler_ir()))

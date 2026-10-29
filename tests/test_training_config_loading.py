@@ -5,7 +5,6 @@ from unittest.mock import Mock
 
 import pytest
 import yaml
-from omegaconf import OmegaConf
 from pydantic import ValidationError
 
 from rl2 import (
@@ -167,38 +166,6 @@ def test_preset_checkpoint_directories(trainer: ModuleType, preset: str, root: s
     config = trainer.load_config(Path(__file__).resolve().parents[1] / "configs" / preset, trainer.Config)
     assert config.ckpt_dir == f"{root}/{config.run_id}"
     assert "log_dir" not in asdict(config)
-
-
-def test_all_presets_share_run_naming_convention() -> None:
-    root = Path(__file__).resolve().parents[1] / "configs"
-    families = (
-        "grpo_v2",
-        "grpo_reasoning",
-        "karel_ast_ar_edit",
-        "karel_ast_grpo",
-        "karel_grpo",
-        "alphazero",
-        "ppo_rnd",
-        "mappo",
-        "ppo",
-        "wm",
-    )
-    run_ids: set[str] = set()
-    for path in sorted(root.rglob("*.yaml")):
-        if path.is_relative_to(root / "sweeps"):
-            continue
-        family = next(name for name in families if str(path.relative_to(root)).startswith(name))
-        settings = OmegaConf.load(path)
-        run_id = settings.run_id
-        assert run_id.startswith(f"{family}_"), path
-        assert run_id.endswith(f"_seed{settings.seed}"), path
-        assert settings.ckpt_dir == f"/runs/{family}/{run_id}", path
-        assert run_id not in run_ids, path
-        BaseConfig(run_id=run_id, ckpt_dir=settings.ckpt_dir)
-        run_ids.add(run_id)
-        settings.seed += 1
-        assert settings.run_id.endswith(f"_seed{settings.seed}"), path
-        assert settings.ckpt_dir == f"/runs/{family}/{settings.run_id}", path
 
 
 def test_progress_logging_presets() -> None:

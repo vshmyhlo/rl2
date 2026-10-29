@@ -178,10 +178,10 @@ def test_objective_clipping_masking_and_sequence_weighting() -> None:
     batch = batch._replace(old_log_probs=jnp.where(batch.loss_mask, batch.old_log_probs, -1000))
 
     def loss_fn(log_probs: jax.Array) -> jax.Array:  # (B, T-1) -> ()
-        return training.objective(log_probs, batch, clip_coef=0.2)[0]
+        return training.objective(log_probs, batch, batch.old_log_probs[:, 1:], clip_coef=0.2)[0]
 
     log_probs = jnp.array([[jnp.log(1.5) - 0.7, 1000, 1000], [jnp.log(0.5) - 0.7] * 2 + [1000]])  # (B, T-1)
-    loss, metrics = training.objective(log_probs, batch, clip_coef=0.2)
+    loss, metrics = training.objective(log_probs, batch, batch.old_log_probs[:, 1:], clip_coef=0.2)
     assert loss.shape == () and all(value.shape == () for value in metrics.values())
     assert float(loss) == pytest.approx(-0.2)
     assert float(metrics["train/clip_fraction"]) == 1.0
@@ -189,6 +189,82 @@ def test_objective_clipping_masking_and_sequence_weighting() -> None:
     adverse = jnp.array([[jnp.log(0.5) - 0.7, 1000, 1000], [jnp.log(1.5) - 0.7] * 2 + [1000]])  # (B, T-1)
     assert float(loss_fn(adverse)) == pytest.approx(0.5)
     np.testing.assert_allclose(jax.grad(loss_fn)(adverse), [[-0.25, 0, 0], [0.375, 0.375, 0]], atol=1e-6)
+
+
+def test_rollout_correction_retains_gradients_and_detaches_reference_scores() -> None:
+    batch = training.GRPOBatch(
+        token_ids=jnp.zeros((2, 4), dtype=jnp.int32),  # (B=2, T=4)
+        attention_mask=jnp.ones((2, 4), dtype=jnp.bool_),  # (B, T)
+        loss_mask=jnp.array([[False, True, True, False], [False, True, False, False]]),  # (B, T)
+        old_log_probs=jnp.array([[0, -2 - jnp.log(1.5), -2 - jnp.log(4.0), -1000], [0, -2 - jnp.log(0.5), -1000, -1000]]),  # (B, T)
+        advantages=jnp.array([1.0, -1.0]),  # (B,)
+    )
+    anchor = jnp.full((2, 3), -2.0)  # (B, T-1)
+    current = jnp.where(batch.loss_mask[:, 1:], anchor, 1000)  # (B, T-1)
+
+    def loss(
+        current: jax.Array, anchor: jax.Array, rollout: jax.Array
+    ) -> tuple[jax.Array, training.Metrics]:  # (B, T-1), (B, T-1), (B, T) -> (), scalar leaves.
+        return training.objective(current, batch._replace(old_log_probs=rollout), anchor, clip_coef=0.2)
+
+    (value, metrics), gradients = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True))(
+        current, anchor, batch.old_log_probs
+    )  # (), scalar metrics; (B, T-1), (B, T-1), (B, T) gradients.
+    assert float(value) == pytest.approx(-0.625)
+    assert float(metrics["train/clip_fraction"]) == float(metrics["train/approx_kl"]) == 0
+    assert float(metrics["train/rollout_importance_weight_mean"]) == pytest.approx(1.125)
+    assert float(metrics["train/rollout_importance_weight_clipped_fraction"]) == 0.25
+    assert float(metrics["train/rollout_log_prob_error_mean"]) > 0
+    assert gradients[0].shape == gradients[1].shape == (2, 3)
+    assert gradients[2].shape == (2, 4)
+    # The former actor-anchored clipping suppressed all three sampled-token gradients.
+    np.testing.assert_allclose(gradients[0], [[-0.375, -0.5, 0], [0.25, 0, 0]], atol=1e-6)
+    np.testing.assert_array_equal(gradients[1], 0)
+    np.testing.assert_array_equal(gradients[2], 0)
+
+
+def test_rollout_correction_bounds_extreme_ratios() -> None:
+    batch = training.GRPOBatch(
+        token_ids=jnp.zeros((1, 4), dtype=jnp.int32),  # (B=1, T=4)
+        attention_mask=jnp.ones((1, 4), dtype=jnp.bool_),  # (B, T)
+        loss_mask=jnp.array([[False, True, True, True]]),  # (B, T)
+        old_log_probs=jnp.array([[0, -102, -2, -2 - jnp.log(2.0)]]),  # (B, T)
+        advantages=jnp.ones((1,)),  # (B,)
+    )
+    anchor = jnp.array([[-2, -102, -2]], dtype=jnp.float32)  # (B, T-1), log-ratios 100, -100, log(2).
+
+    def loss(scores: jax.Array) -> tuple[jax.Array, training.Metrics]:  # (B, T-1) -> (), scalar leaves.
+        return training.objective(scores, batch, anchor, clip_coef=0.2, rollout_is_threshold=3.0)
+
+    (value, metrics), gradient = jax.jit(jax.value_and_grad(loss, has_aux=True))(anchor)
+    assert float(value) == pytest.approx(-5 / 3)
+    assert gradient.shape == (1, 3)
+    np.testing.assert_allclose(gradient, -jnp.array([[3, jnp.exp(-20.0), 2]]) / 3, rtol=1e-6)
+    assert float(metrics["train/rollout_importance_weight_clipped_fraction"]) == pytest.approx(1 / 3)
+
+
+@pytest.mark.parametrize("microbatch_size", [1, 2], ids=["accumulated", "whole-batch"])
+@pytest.mark.usefixtures("mesh_context")
+def test_anchor_scores_match_microbatched_policy(
+    state: training.LoRATrainState, batch: training.GRPOBatch[jax.Array], microbatch_size: int
+) -> None:
+    scores = training.compute_anchor_log_probs(state, batch, microbatch_size, 0.7)  # (B=2, T-1=7)
+    assert scores.shape == (2, 7) and scores.dtype == jnp.float32
+    assert scores.sharding.spec == PartitionSpec("batch")
+    np.testing.assert_allclose(scores, batch.old_log_probs[:, 1:], atol=1e-6)
+    skipped = training.compute_anchor_log_probs(
+        state, batch._replace(advantages=jnp.zeros_like(batch.advantages)), microbatch_size, 0.7
+    )  # (B, T-1)
+    np.testing.assert_array_equal(skipped, 0)
+
+
+@pytest.mark.parametrize("microbatch_size", [0, 3], ids=["nonpositive", "indivisible"])
+@pytest.mark.usefixtures("mesh_context")
+def test_anchor_scores_reject_invalid_microbatches(
+    state: training.LoRATrainState, batch: training.GRPOBatch[jax.Array], microbatch_size: int
+) -> None:
+    with pytest.raises(ValueError, match="microbatch_size must be positive and divide"):
+        training.compute_anchor_log_probs.lower(state, batch, microbatch_size, 0.7)
 
 
 @pytest.fixture(scope="module")
@@ -320,7 +396,9 @@ def test_default_attention_optimizer_on_cuda(mesh_context: None) -> None:
     assert old.shape == (2, 15)
     assert old.dtype == jnp.float32
     batch = batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))  # (B, T)
-    state, metrics = training.update(state, batch, config.grad_accum_steps, config.temperature, config.clip_coef)
+    state, metrics = training.update(
+        state, batch, batch.old_log_probs[:, 1:], config.grad_accum_steps, config.temperature, config.clip_coef
+    )
     assert int(state.step) == 1
     assert float(metrics["train/clip_fraction"]) == 0
     assert float(metrics["train/gradient_norm"]) > 0
@@ -417,7 +495,7 @@ def test_full_weight_update(
     )  # (B, T-1)
     np.testing.assert_allclose(old, expected, atol=1e-6)
     batch = batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))  # (B, T)
-    updated, metrics = training.update(jax.tree.map(jnp.copy, full), batch, 2, 0.7, 0.2)
+    updated, metrics = training.update(jax.tree.map(jnp.copy, full), batch, batch.old_log_probs[:, 1:], 2, 0.7, 0.2)
     assert int(updated.step) == 1
     assert float(metrics["train/gradient_norm"]) > 0
     assert all(value.shape == () for value in metrics.values())
@@ -426,9 +504,16 @@ def test_full_weight_update(
         assert value.shape == full.params[name].shape
         assert not np.array_equal(value, full.params[name]), name
     after = training.token_log_probs(updated, updated.params, batch, temperature=0.7)  # (B, T-1)
-    assert float(training.objective(after, batch, clip_coef=0.2)[0]) < float(metrics["train/policy_loss"])
+    assert float(training.objective(after, batch, batch.old_log_probs[:, 1:], clip_coef=0.2)[0]) < float(
+        metrics["train/policy_loss"]
+    )
     skipped, metrics = training.update(
-        jax.tree.map(jnp.copy, updated), batch._replace(advantages=jnp.zeros_like(batch.advantages)), 2, 0.7, 0.2
+        jax.tree.map(jnp.copy, updated),
+        batch._replace(advantages=jnp.zeros_like(batch.advantages)),
+        batch._replace(advantages=jnp.zeros_like(batch.advantages)).old_log_probs[:, 1:],
+        2,
+        0.7,
+        0.2,
     )
     assert float(metrics["train/skipped_update_fraction"]) == 1
     for actual, expected in zip(jax.tree.leaves(skipped), jax.tree.leaves(updated), strict=True):
@@ -442,8 +527,10 @@ def test_accumulated_update_matches_full_batch_and_improves_policy(
 ) -> None:
     if mixed:
         batch = batch._replace(advantages=batch.advantages.at[0].set(0))  # (B, T), (B,) leaves.
-    accumulated, metrics = training.update(jax.tree.map(jnp.copy, state), batch, 2, 0.7, 0.2)
-    full, full_metrics = training.update(jax.tree.map(jnp.copy, state), batch, 1, 0.7, 0.2)
+    accumulated, metrics = training.update(
+        jax.tree.map(jnp.copy, state), batch, batch.old_log_probs[:, 1:], 2, 0.7, 0.2
+    )
+    full, full_metrics = training.update(jax.tree.map(jnp.copy, state), batch, batch.old_log_probs[:, 1:], 1, 0.7, 0.2)
     assert int(accumulated.step) == int(full.step) == 1
     for actual, expected in zip(jax.tree.leaves(accumulated), jax.tree.leaves(full), strict=True):
         assert actual.shape == expected.shape
@@ -455,7 +542,7 @@ def test_accumulated_update_matches_full_batch_and_improves_policy(
     for name in metrics:
         np.testing.assert_allclose(metrics[name], full_metrics[name], atol=1e-6)
     after = training.token_log_probs(accumulated, accumulated.params, batch, temperature=0.7)  # (B, T-1)
-    loss, _ = training.objective(after, batch, clip_coef=0.2)
+    loss, _ = training.objective(after, batch, batch.old_log_probs[:, 1:], clip_coef=0.2)
     assert float(loss) < float(metrics["train/policy_loss"])
     assert any(
         not np.array_equal(before, after)
@@ -477,7 +564,7 @@ def test_update_logs_only_new_traces(
         current: training.LoRATrainState,
         minibatch: training.GRPOBatch[jax.Array],  # (B, T), (B,) leaves.
     ) -> jax.stages.Lowered:
-        return training.update.lower(current, minibatch, 2, 0.7, 0.2)
+        return training.update.lower(current, minibatch, minibatch.old_log_probs[:, 1:], 2, 0.7, 0.2)
 
     caplog.set_level(logging.INFO, logger=training.__name__)
     trace(state, batch)
@@ -500,13 +587,12 @@ def test_zero_advantages_preserve_optimizer_state(
     if has_momentum:
         state = state.apply_gradients(grads=jax.tree.map(jnp.ones_like, state.params))
     batch = batch._replace(advantages=jnp.zeros_like(batch.advantages))  # (B, T), (B,) leaves.
-    updated, metrics = training.update(jax.tree.map(jnp.copy, state), batch, 2, 0.7, 0.2)
+    updated, metrics = training.update(jax.tree.map(jnp.copy, state), batch, batch.old_log_probs[:, 1:], 2, 0.7, 0.2)
     assert float(metrics["train/gradient_norm"]) == float(metrics["train/policy_loss"]) == 0.0
     assert all(value.shape == () for value in metrics.values())
     assert {name: float(value) for name, value in metrics.items()} == {
         "train/policy_loss": 0.0,
-        "train/approx_kl": 0.0,
-        "train/clip_fraction": 0.0,
+        **{name: 0.0 for name in training.POLICY_DIAGNOSTICS},
         "train/gradient_norm": 0.0,
         "train/skipped_update_fraction": 1.0,
     }
@@ -521,7 +607,7 @@ def test_update_rejects_invalid_accumulation(
     state: training.LoRATrainState, batch: training.GRPOBatch, grad_accum_steps: int
 ) -> None:
     with pytest.raises(ValueError, match="grad_accum_steps must be positive and divide the minibatch size"):
-        training.update.lower(state, batch, grad_accum_steps, 0.7, 0.2)
+        training.update.lower(state, batch, batch.old_log_probs[:, 1:], grad_accum_steps, 0.7, 0.2)
 
 
 @pytest.mark.parametrize("skip", [False, True], ids=["zero-advantage-replica", "all-zero"])
@@ -537,11 +623,14 @@ def test_data_parallel_update_matches_single_device(
     batch = batch._replace(
         advantages=jnp.array([0.0, 0.0 if skip else -1.0, 0.0, 0.0 if skip else 1.0])  # (B=4,)
     )
-    expected, expected_metrics = training.update(jax.tree.map(jnp.copy, state), batch, 2, 0.7, 0.2)
+    expected, expected_metrics = training.update(
+        jax.tree.map(jnp.copy, state), batch, batch.old_log_probs[:, 1:], 2, 0.7, 0.2
+    )
     with jax.set_mesh(mesh):
         actual, metrics = training.update(
             jax.device_put(jax.tree.map(jnp.copy, state), replicated),
             jax.device_put(batch, NamedSharding(mesh, PartitionSpec("batch"))),
+            jax.device_put(batch, NamedSharding(mesh, PartitionSpec("batch"))).old_log_probs[:, 1:],
             2,
             0.7,
             0.2,
@@ -566,7 +655,7 @@ def test_data_parallel_update_rejects_indivisible_microbatch(
         jax.set_mesh(mesh),
         pytest.raises(ValueError, match="learner device count must divide the microbatch size"),
     ):
-        training.update.lower(state, batch, 2, 0.7, 0.2)
+        training.update.lower(state, batch, batch.old_log_probs[:, 1:], 2, 0.7, 0.2)
 
 
 @pytest.mark.parametrize(
@@ -603,9 +692,11 @@ def test_learner_shuffles_each_epoch_and_averages_metrics(
     def update(
         current: training.LoRATrainState,
         minibatch: training.GRPOBatch,  # (B/N, T), (B/N,) leaves.
+        anchor_log_probs: jax.Array,  # (B/N, T-1) frozen scores.
         grad_accum_steps: int,
         temperature: float,
         clip_coef: float,
+        rollout_is_threshold: float,
     ) -> tuple[training.LoRATrainState, training.Metrics]:
         assert minibatch.token_ids.shape == (8 // minibatches, 8)
         assert minibatch.advantages.shape == (8 // minibatches,)
@@ -615,10 +706,12 @@ def test_learner_shuffles_each_epoch_and_averages_metrics(
         return current.replace(step=current.step + 1), {
             "train/policy_loss": jnp.asarray(current.step),  # ()
             "train/skipped_update_fraction": jnp.asarray(0.0),  # ()
-            "train/approx_kl": jnp.asarray(0.0),  # ()
-            "train/clip_fraction": jnp.asarray(0.0),  # ()
+            **{name: jnp.asarray(0.0) for name in training.POLICY_DIAGNOSTICS},  # ()
         }
 
+    monkeypatch.setattr(
+        training, "compute_anchor_log_probs", Mock(return_value=jnp.asarray(batch.old_log_probs[:, 1:]))
+    )
     monkeypatch.setattr(training, "update", update)
     host_batch = jax.tree.map(np.asarray, batch)  # (B, T), (B,) leaves.
     with jax.set_mesh(learner.mesh):
@@ -628,8 +721,7 @@ def test_learner_shuffles_each_epoch_and_averages_metrics(
     assert metrics == {
         "train/policy_loss": (steps - 1) / 2,
         "train/skipped_update_fraction": 0.0,
-        "train/approx_kl": 0.0,
-        "train/clip_fraction": 0.0,
+        **{name: 0.0 for name in training.POLICY_DIAGNOSTICS},
     }
     with jax.set_mesh(learner.mesh):
         learner.optimize(host_batch)
@@ -680,20 +772,24 @@ def test_learner_omits_unevaluated_policy_metrics(values: list[float | None], mo
     def update(
         current: training.TrainState,
         minibatch: training.GRPOBatch[jax.Array],  # (B/2, T), (B/2,) leaves.
+        anchor_log_probs: jax.Array,  # (B/N, T-1) frozen scores.
         grad_accum_steps: int,
         temperature: float,
         clip_coef: float,
+        rollout_is_threshold: float,
     ) -> tuple[training.TrainState, training.Metrics]:
         value = next(pending)
         measured = 0.0 if value is None else value
         return current.replace(step=current.step + (value is not None)), {
             "train/policy_loss": jnp.asarray(-measured),  # ()
             "train/gradient_norm": jnp.asarray(measured),  # ()
-            "train/approx_kl": jnp.asarray(measured),  # ()
-            "train/clip_fraction": jnp.asarray(measured),  # ()
+            **{name: jnp.asarray(measured) for name in training.POLICY_DIAGNOSTICS},  # ()
             "train/skipped_update_fraction": jnp.asarray(float(value is None)),  # ()
         }
 
+    monkeypatch.setattr(
+        training, "compute_anchor_log_probs", Mock(return_value=jnp.asarray(batch.old_log_probs[:, 1:]))
+    )
     monkeypatch.setattr(training, "update", update)
     with jax.set_mesh(learner.mesh):
         metrics = learner.optimize(batch)
@@ -701,7 +797,7 @@ def test_learner_omits_unevaluated_policy_metrics(values: list[float | None], mo
     assert metrics["train/skipped_update_fraction"] == 1 - len(evaluated) / len(values)
     assert metrics["train/policy_loss"] == pytest.approx(-sum(evaluated) / len(values))
     assert metrics["train/gradient_norm"] == pytest.approx(sum(evaluated) / len(values))
-    for name in ("train/approx_kl", "train/clip_fraction"):
+    for name in training.POLICY_DIAGNOSTICS:
         if evaluated:
             assert metrics[name] == pytest.approx(sum(evaluated) / len(evaluated))
         else:
@@ -754,12 +850,16 @@ def test_learner_optimizes_and_publishes_updated_adapters(
     def record_update(
         current: training.LoRATrainState,
         minibatch: training.GRPOBatch,  # (B/N, T), (B/N,) leaves.
+        anchor_log_probs: jax.Array,  # (B/N, T-1) frozen scores.
         grad_accum_steps: int,
         temperature: float,
         clip_coef: float,
+        rollout_is_threshold: float,
     ) -> tuple[training.LoRATrainState, training.Metrics]:
         steps.append(int(current.step))
-        return actual_update(current, minibatch, grad_accum_steps, temperature, clip_coef)
+        return actual_update(
+            current, minibatch, anchor_log_probs, grad_accum_steps, temperature, clip_coef, rollout_is_threshold
+        )
 
     update = Mock(wraps=record_update)
     monkeypatch.setattr(training, "update", update)
@@ -773,7 +873,7 @@ def test_learner_optimizes_and_publishes_updated_adapters(
     assert steps == [0, 1, 2, 3]
     for index, call in enumerate(update.call_args_list):
         assert jax.tree.leaves(call.args[0].params)[0].is_deleted()
-        assert call.args[2] == 1
+        assert call.args[3] == 1
         placed_batch = call.args[1]  # (B/N=2, T=8), (B/N,) leaves.
         start = (index % 2) * 2
         indices = permutations[index // 2][start : start + 2]  # (B/N,)
@@ -781,6 +881,7 @@ def test_learner_optimizes_and_publishes_updated_adapters(
             assert placed.shape == (2, *original.shape[1:])
             assert placed.sharding == NamedSharding(learner.mesh, PartitionSpec("batch"))
             np.testing.assert_array_equal(placed, original[indices])
+        np.testing.assert_allclose(call.args[2], old[indices], atol=2e-3, rtol=2e-3)
     assert int(learner.state.step) == 4
     assert metrics["train/gradient_norm"] > 0
     assert all(isinstance(value, float) for value in metrics.values())
