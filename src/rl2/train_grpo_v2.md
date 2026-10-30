@@ -1,17 +1,20 @@
 # Tool-calling GRPO
 
 `train_grpo_v2.py` finetunes Qwen3 with a JAX learner, a vLLM inference server,
-and a small custom tool-calling interaction loop. Each `tasksets` entry contains
+and a small custom tool-calling interaction loop. `tasksets` is a mapping keyed by
+unique, nonblank taskset identifiers. Each entry contains
 a relative `weight` (default 1) and a `taskset` with `id: alfworld`, `appworld`, or
 `reasoning_gym`; the other environment presets are unsupported. For example:
 
 ```yaml
 tasksets:
-  - weight: 3
+  household:
+    weight: 3
     taskset:
       id: alfworld
       config_file: data/alfworld/base_config.yaml
-  - weight: 1
+  easy_leg_counting:
+    weight: 1
     taskset:
       id: reasoning_gym
       task: leg_counting
@@ -25,8 +28,10 @@ then sample one task from it. All attempts in the group use that task. Weights
 apply to groups, independently of catalog sizes; batches need not match the exact
 proportions. Weights must be nonnegative and finite, with at least one positive
 weight. Zero-weight entries are neither initialized nor sampled. Entries can
-repeat an environment ID with different settings. Replace the old top-level
-`taskset` mapping with a one-entry `tasksets` list for single-taskset runs.
+repeat an environment ID with different settings under distinct keys. The keys
+identify configured tasksets; nested `taskset.id` selects the environment type.
+Replace each item in an old `tasksets` list with a named mapping entry. For a
+single-taskset run, use a one-entry mapping. YAML duplicate keys are rejected.
 The `taskset.*` settings below refer to the nested mapping within each entry.
 
 Prepare the official ALFWorld training data with `alfworld-download`, set
@@ -67,8 +72,9 @@ ALFWorld and AppWorld retain their discovered ID catalogs and sample uniformly
 with replacement; task objects and environments are created on demand.
 Task discovery completes during actor startup, outside the async rollout loop.
 The checkpointed task RNG restores both weighted selection and each stream's
-continuation; keep taskset order, weights, settings, and finite catalogs unchanged
-when resuming. A single active taskset preserves its original sampling sequence.
+continuation; keep taskset identifiers, weights, settings, and finite catalogs
+unchanged when resuming. Sampling orders entries by identifier, so YAML key order
+does not affect the sequence. A single active taskset preserves its original sampling sequence.
 
 The model calls `submit_answer(answer=...)` with a string in the question's
 requested format. One valid submission ends the episode and receives the
@@ -393,6 +399,13 @@ resubmission to pick up logging changes.
 
 MLflow uses experiment `grpo_v2` and the standard tracking environment variables.
 The [module docstring](train_grpo_v2.py) defines metric names and aggregation.
+Per-taskset metrics append the configured `tasksets` key as a categorical suffix:
+`rollout/reward_mean/leg_counting`, for example. Use lowercase `snake_case` keys.
+Each value averages raw rewards over that taskset's retained rollouts in the
+consumed batch, before the length penalty, without reweighting by sampling weights.
+Discarded groups and replaced attempts are excluded. Tasksets absent from a batch
+are omitted; measured zero rewards are logged. `rollout/reward_mean` remains the
+mean over all retained rollouts in the batch.
 Every `example_log_interval` iterations (default 10, positive integer), it saves
 full token transcripts, final observations, rewards, and advantages. The batcher
 formats up to eight examples only for iterations that log them, using the consumed

@@ -545,7 +545,7 @@ def test_published_rollout_parity(engine: Engine) -> None:
             batch = jax.tree.map(
                 jnp.asarray,
                 batcher.prepare_batch(
-                    [training.RolloutGroup(task_id="parity", rollouts=rollouts)],
+                    [training.RolloutGroup(task_id="parity", rollouts=rollouts, taskset_id="test")],
                     context_length=engine.context_length,
                 ),
             )  # (B, T) leaves, except advantages: (B,).

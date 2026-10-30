@@ -7,7 +7,7 @@ according to weight_update_pause_mode.
 MLflow's metric step counts completed training iterations: one rollout batch,
 its optimizer updates, and any scheduled weight publications. All metrics below
 are logged every iteration except startup scalars, weight-transfer timing, checkpoint timing,
-and unevaluated policy diagnostics.
+unevaluated policy diagnostics, and taskset metrics absent from the batch.
 
 Startup scalars (at the restored iteration, or step 0 for a new run):
     model/parameters_billions: Model parameter count in billions.
@@ -29,6 +29,7 @@ Policy diagnostics average only evaluated minibatches and are omitted when all u
 
 Rollout batch scalars:
     rollout/reward_mean: Mean raw rollout reward.
+    rollout/reward_mean/<taskset_id>: Mean raw reward over retained batch rollouts from that configured taskset key; omitted if absent.
     rollout/reward_std: Population standard deviation of raw rollout rewards.
     rollout/reward_min: Minimum raw rollout reward.
     rollout/reward_max: Maximum raw rollout reward.
@@ -80,10 +81,10 @@ import random
 import subprocess
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import AsyncGenerator, Generator
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, closing, contextmanager, nullcontext
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from itertools import islice
 from pathlib import Path
@@ -148,11 +149,16 @@ class WeightedTasksetConfig:
     weight: Annotated[float, Field(ge=0, lt=float("inf"))] = 1.0
 
 
+TasksetConfigs = dict[Annotated[str, Field(pattern=r"\S")], WeightedTasksetConfig]
+
+
 @config_dataclass(frozen=True)
 class Config(BaseConfig):
     model: str = MODEL
-    tasksets: Annotated[tuple[WeightedTasksetConfig, ...], Field(min_length=1)] = (
-        WeightedTasksetConfig(taskset=ALFWorldConfig(config_file="data/alfworld/base_config.yaml")),
+    tasksets: Annotated[TasksetConfigs, Field(min_length=1)] = field(
+        default_factory=lambda: {
+            "alfworld": WeightedTasksetConfig(taskset=ALFWorldConfig(config_file="data/alfworld/base_config.yaml"))
+        }
     )
     seed: Annotated[int, Field(ge=0)] = 1
     learner_gpus: Annotated[int, Field(ge=1)] = 1
@@ -199,7 +205,7 @@ class Config(BaseConfig):
     weight_update_pause_mode: Literal["wait", "keep"] = "wait"
 
     def __post_init__(self) -> None:
-        if not any(entry.weight > 0 for entry in self.tasksets):
+        if not any(entry.weight > 0 for entry in self.tasksets.values()):
             raise ValueError("tasksets must contain at least one positive weight")
         if self.num_groups * self.group_size % (self.minibatches_per_epoch * self.grad_accum_steps):
             raise ValueError("minibatches_per_epoch * grad_accum_steps must divide num_groups * group_size")
@@ -313,7 +319,8 @@ def restore_checkpoint(
 
 @dataclass(frozen=True)
 class RolloutGroup:
-    task_id: str | None  # Source task ID shared by the group; None if the task has no ID.
+    task_id: str  # Source task ID shared by the group.
+    taskset_id: str  # Configured tasksets key.
     rollouts: list[Rollout]  # Independent attempts at the same task, in sampling order, scored as one group.
     length_penalty: LengthPenaltyConfig = DEFAULT_CONFIG.length_penalty
 
@@ -392,10 +399,14 @@ def build_rollout_batch(
     rollouts = [rollout for group in groups for rollout in group.rollouts]
     rewards = [rollout.reward for rollout in rollouts]
     training_rewards = [reward for group in groups for reward in group.training_rewards]
+    rewards_by_taskset: dict[str, list[float]] = defaultdict(list)
+    for group in groups:
+        rewards_by_taskset[group.taskset_id].extend(rollout.reward for rollout in group.rollouts)
     return RolloutBatch(
         training_batch=training_batch,
         rollout_metrics={
             "rollout/reward_mean": mean(rewards),
+            **{f"rollout/reward_mean/{name}": mean(values) for name, values in rewards_by_taskset.items()},
             "rollout/reward_std": pstdev(rewards),
             "rollout/reward_min": min(rewards),
             "rollout/reward_max": max(rewards),
@@ -675,6 +686,7 @@ def score_group(
     task: Task,
     rollouts: list[Rollout],
     *,
+    taskset_id: str,
     length_penalty: LengthPenaltyConfig = DEFAULT_CONFIG.length_penalty,
 ) -> RolloutGroup:
     """Mean-center adjusted rewards without rescaling the length cost."""
@@ -684,6 +696,7 @@ def score_group(
         task_id=f"{task.name}:{task.id}",
         rollouts=rollouts,
         length_penalty=length_penalty,
+        taskset_id=taskset_id,
     )
     rewards = group.training_rewards
     reward_mean = mean(rewards)
@@ -1178,28 +1191,34 @@ class Learner:
         return scalars
 
 
-def stream_tasks(tasksets: tuple[WeightedTasksetConfig, ...], rng: random.Random, timeout: float) -> Generator[Task]:
+class SampledTask(NamedTuple):
+    taskset_id: str
+    task: Task
+
+
+def stream_tasks(tasksets: TasksetConfigs, rng: random.Random, timeout: float) -> Generator[SampledTask]:
     """Discover active tasksets at startup, then choose one by relative weight per group."""
-    streams: list[Generator[Task]] = []
+    streams: dict[str, Generator[Task]] = {}
     weights: list[float] = []
-    max_weight = max(entry.weight for entry in tasksets)
-    for entry in tasksets:
+    max_weight = max(entry.weight for entry in tasksets.values())
+    # Keep sampling reproducible when YAML serialization reorders mapping keys.
+    for name, entry in sorted(tasksets.items()):
         if entry.weight == 0:
             continue
         taskset = entry.taskset
         if isinstance(taskset, ReasoningGymConfig):
-            streams.append(stream_reasoning_gym_tasks(taskset, rng))
+            streams[name] = stream_reasoning_gym_tasks(taskset, rng)
         elif isinstance(taskset, AppWorldConfig):
-            streams.append(stream_appworld_tasks(taskset, rng, timeout))
+            streams[name] = stream_appworld_tasks(taskset, rng, timeout)
         else:
-            streams.append(stream_alfworld_tasks(taskset, rng, timeout))
+            streams[name] = stream_alfworld_tasks(taskset, rng, timeout)
         weights.append(entry.weight / max_weight)
-    if len(streams) == 1:
-        return streams[0]
+    names = list(streams)
 
-    def stream() -> Generator[Task]:
+    def stream() -> Generator[SampledTask]:
         while True:
-            yield next(rng.choices(streams, weights=weights, k=1)[0])
+            name = names[0] if len(names) == 1 else rng.choices(names, weights=weights, k=1)[0]
+            yield SampledTask(taskset_id=name, task=next(streams[name]))
 
     return stream()
 
@@ -1227,7 +1246,7 @@ class Actor:
             self._server = resources.pop_all()
         logger.info(
             "Actor ready for rollout requests: tasksets=%s",
-            [(entry.taskset.id, entry.weight) for entry in config.tasksets],
+            [(name, entry.weight) for name, entry in config.tasksets.items()],
         )
 
     def ready(self) -> None:
@@ -1263,10 +1282,10 @@ class Actor:
         self.rng.setstate((state["version"], tuple(state["state"]), state["gauss_next"]))
 
     async def fetch_next_group(self, group_size: int) -> RolloutGroup:
-        task = next(self.tasks)
-        return await self.collect_group(task, group_size=group_size)
+        sampled = next(self.tasks)
+        return await self.collect_group(sampled.task, group_size=group_size, taskset_id=sampled.taskset_id)
 
-    async def collect_group(self, task: Task, group_size: int) -> RolloutGroup:
+    async def collect_group(self, task: Task, group_size: int, *, taskset_id: str) -> RolloutGroup:
         """Collect a fixed-size group, optionally replacing its oldest attempts until rewards differ."""
         if group_size < 2:
             raise ValueError("group_size must be at least 2")
@@ -1300,6 +1319,7 @@ class Actor:
                             task,
                             rollouts,
                             length_penalty=self.config.length_penalty,
+                            taskset_id=taskset_id,
                         )
                     if (
                         not self.config.continual_group_filling

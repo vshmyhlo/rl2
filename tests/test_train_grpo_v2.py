@@ -35,6 +35,7 @@ from ray import cloudpickle
 from rl2 import train_grpo_v2 as training
 from rl2.agent_task import Environment
 from rl2.alfworld_env import ALFWorldTask
+from rl2.grpo_v2.reasoning_gym import create_dataset
 from rl2.qwen3 import ATTENTION_BACKENDS, AttentionBackend
 
 
@@ -198,11 +199,11 @@ def test_example_log_interval_config(tmp_path: Path) -> None:
 
 def test_appworld_actor_task_stream(monkeypatch: pytest.MonkeyPatch) -> None:
     config = training.Config(
-        tasksets=(
-            training.WeightedTasksetConfig(
+        tasksets={
+            "appworld": training.WeightedTasksetConfig(
                 taskset=training.AppWorldConfig(python="/test/python", root="/test/appworld")
             ),
-        )
+        }
     )
     assert pickle.loads(pickle.dumps(config)) == config
     task = Mock(spec=training.Task)
@@ -214,27 +215,26 @@ def test_appworld_actor_task_stream(monkeypatch: pytest.MonkeyPatch) -> None:
     actor = training.Actor.__ray_metadata__.modified_class(config)
 
     with actor._server:
-        assert actor.tasks is stream
-        assert next(actor.tasks) is task
-    stream_tasks.assert_called_once_with(config.tasksets[0].taskset, actor.rng, config.environment_timeout)
+        assert next(actor.tasks) == training.SampledTask(taskset_id="appworld", task=task)
+    stream_tasks.assert_called_once_with(config.tasksets["appworld"].taskset, actor.rng, config.environment_timeout)
 
 
 def test_reasoning_gym_cli_and_actor_task_stream(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = training.Config(
-        tasksets=(
-            training.WeightedTasksetConfig(
+        tasksets={
+            "easy": training.WeightedTasksetConfig(
                 taskset=training.ReasoningGymConfig(
                     task="leg_counting", task_config={"min_animals": 1, "max_animals": 5}
                 ),
                 weight=1.0,
             ),
-            training.WeightedTasksetConfig(
+            "hard": training.WeightedTasksetConfig(
                 taskset=training.ReasoningGymConfig(
                     task="leg_counting", task_config={"min_animals": 6, "max_animals": 8}
                 ),
                 weight=3.0,
             ),
-        ),
+        },
         run_id="test_reasoning_gym",
         ckpt_dir=str(tmp_path),
     )
@@ -251,7 +251,7 @@ def test_reasoning_gym_cli_and_actor_task_stream(tmp_path: Path, monkeypatch: py
     monkeypatch.setattr(training, "wait_for_server", Mock())
     actor_class = training.Actor.__ray_metadata__.modified_class
     actor = actor_class(config)
-    restored = actor_class(config)
+    restored = actor_class(replace(config, tasksets=dict(reversed(config.tasksets.items()))))
     actor.collect_group = AsyncMock(return_value=Mock(spec=training.RolloutGroup))
     restored.collect_group = AsyncMock(return_value=Mock(spec=training.RolloutGroup))
 
@@ -270,9 +270,16 @@ def test_reasoning_gym_cli_and_actor_task_stream(tmp_path: Path, monkeypatch: py
         expected = actor.collect_group.call_args_list
         tasks = [call.args[0] for call in expected]
         assert len({first.id, *(task.id for task in tasks)}) == 9
-        assert all(task.config in [entry.taskset for entry in config.tasksets] for task in tasks)
+        assert all(task.config in [entry.taskset for entry in config.tasksets.values()] for task in tasks)
         assert {task.config.task_config["min_animals"] for task in tasks} == {1, 6}
-        assert all(call.kwargs == {"group_size": 2} for call in expected)
+        assert all(
+            call.kwargs
+            == {
+                "group_size": 2,
+                "taskset_id": "easy" if call.args[0].config.task_config["min_animals"] == 1 else "hard",
+            }
+            for call in expected
+        )
         restored.set_sampling_state(state)
         asyncio.run(fetch_groups(restored))
         assert restored.collect_group.call_args_list == expected
@@ -336,14 +343,16 @@ def test_config_rejects_invalid_settings(settings: dict[str, object]) -> None:
 @pytest.mark.parametrize(
     ("settings", "error"),
     [
-        ({"tasksets": [{"taskset": {"id": "addition", "config_file": "config.yaml"}}]}, "union_tag_invalid"),
-        ({"tasksets": [{"taskset": {"id": "alfworld", "config_file": None}}]}, "string_type"),
+        ({"tasksets": {"example": {"taskset": {"id": "addition", "config_file": "config.yaml"}}}}, "union_tag_invalid"),
+        ({"tasksets": {"example": {"taskset": {"id": "alfworld", "config_file": None}}}}, "string_type"),
         (
-            {"tasksets": [{"taskset": {"id": "alfworld", "config_file": "config.yaml", "unknown": True}}]},
+            {"tasksets": {"example": {"taskset": {"id": "alfworld", "config_file": "config.yaml", "unknown": True}}}},
             "unexpected_keyword_argument",
         ),
-        ({"tasksets": []}, "too_short"),
-        ({"tasksets": [{"taskset": {"id": "reasoning_gym"}, "weight": 0}]}, "positive weight"),
+        ({"tasksets": {}}, "too_short"),
+        ({"tasksets": [{"taskset": {"id": "reasoning_gym"}}]}, "dict_type"),
+        ({"tasksets": {" ": {"taskset": {"id": "reasoning_gym"}}}}, "string_pattern_mismatch"),
+        ({"tasksets": {"example": {"taskset": {"id": "reasoning_gym"}, "weight": 0}}}, "positive weight"),
         ({"taskset": {"id": "alfworld", "config_file": "config.yaml"}}, "unexpected_keyword_argument"),
         ({"dataset_file": "train.parquet"}, "unexpected_keyword_argument"),
     ],
@@ -353,6 +362,24 @@ def test_taskset_config_rejects_invalid_yaml(settings: dict[str, object], error:
     path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match=error):
         training.load_config(path, training.Config)
+
+
+def test_duplicate_taskset_identifiers_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "tasksets:\n"
+        "  easy:\n    taskset: {id: reasoning_gym, task: leg_counting}\n"
+        "  easy:\n    taskset: {id: reasoning_gym, task: basic_arithmetic}\n"
+    )
+    with pytest.raises(yaml.constructor.ConstructorError, match="duplicate key"):
+        training.load_config(path, training.Config)
+
+
+def test_default_taskset_mapping_is_not_shared() -> None:
+    first = training.Config()
+    second = training.Config()
+    first.tasksets.clear()
+    assert list(second.tasksets) == ["alfworld"]
 
 
 def test_explicit_taskset_requires_discriminator() -> None:
@@ -372,44 +399,80 @@ def test_taskset_presets(name: str) -> None:
     path = Path(__file__).parents[1] / "configs" / "grpo_v2" / f"{name}.yaml"
     config = training.load_config(path, training.Config)
     assert len(config.tasksets) == 1
-    assert config.tasksets[0].taskset.id == name
-    assert config.tasksets[0].weight == 1.0
+    key = "leg_counting" if name == "reasoning_gym" else name
+    assert list(config.tasksets) == [key]
+    assert config.tasksets[key].taskset.id == name
+    assert config.tasksets[key].weight == 1.0
     if name == "reasoning_gym":
         assert "reasoning_gym_leg_counting_" in config.run_id
 
 
+def test_mix_preset_accepts_native_reasoning_rewards() -> None:
+    path = Path(__file__).parents[1] / "configs/grpo_v2/mix.yaml"
+    config = training.load_config(path, training.Config)
+    assert config.tasksets["alfworld"].taskset.id == "alfworld"
+    assert all(entry.weight == 1.0 for entry in config.tasksets.values())
+    tasks = [
+        entry.taskset for entry in config.tasksets.values() if isinstance(entry.taskset, training.ReasoningGymConfig)
+    ]
+    assert {task.task for task in tasks} == {"basic_arithmetic", "leg_counting", "letter_counting", "number_sorting"}
+    rewards: list[float] = []
+    for task in tasks:
+        dataset = create_dataset(task, seed=config.seed)
+        entry = dataset[0]
+        assert entry["question"]
+        assert dataset.score_answer(answer=entry["answer"], entry=entry) == 1.0
+        rewards.append(dataset.score_answer(answer=f"The answer is {entry['answer']}", entry=entry))
+    assert any(0 < reward < 1 for reward in rewards)
+    group = training.RolloutGroup(
+        task_id="test-task",
+        rollouts=[Mock(spec=training.Rollout, reward=reward) for reward in rewards],
+        length_penalty=config.length_penalty,
+        taskset_id="test",
+    )
+    assert group.training_rewards == rewards
+
+
 def test_weighted_task_stream(monkeypatch: pytest.MonkeyPatch, task_discovery: list[ALFWorldTask]) -> None:
     config = training.Config(
-        tasksets=(
-            training.WeightedTasksetConfig(taskset=training.ALFWorldConfig(config_file="config.yaml"), weight=1.0),
-            training.WeightedTasksetConfig(taskset=training.ReasoningGymConfig(), weight=3.0),
-            training.WeightedTasksetConfig(
+        tasksets={
+            "household": training.WeightedTasksetConfig(
+                taskset=training.ALFWorldConfig(config_file="config.yaml"), weight=1.0
+            ),
+            "legs": training.WeightedTasksetConfig(taskset=training.ReasoningGymConfig(), weight=3.0),
+            "apps": training.WeightedTasksetConfig(
                 taskset=training.AppWorldConfig(python="/test/python", root="/test/appworld"), weight=0.0
             ),
-        )
+        }
     )
     rng = random.Random(1)
     monkeypatch.setattr(rng, "random", Mock(side_effect=[0.0, 0.249, 0.25, 0.999]))
     appworld_stream = Mock(side_effect=AssertionError("Disabled taskset must not be initialized"))
     monkeypatch.setattr(training, "stream_appworld_tasks", appworld_stream)
     tasks = training.stream_tasks(config.tasksets, rng, config.environment_timeout)
-    training.stream_alfworld_tasks.assert_called_once_with(config.tasksets[0].taskset, rng, config.environment_timeout)
-    assert next(tasks) in task_discovery
-    assert next(tasks) in task_discovery
-    assert next(tasks).config == config.tasksets[1].taskset
-    assert next(tasks).config == config.tasksets[1].taskset
+    training.stream_alfworld_tasks.assert_called_once_with(
+        config.tasksets["household"].taskset, rng, config.environment_timeout
+    )
+    for _ in range(2):
+        sampled = next(tasks)
+        assert sampled.taskset_id == "household" and sampled.task in task_discovery
+    for _ in range(2):
+        sampled = next(tasks)
+        assert sampled.taskset_id == "legs" and sampled.task.config == config.tasksets["legs"].taskset
     appworld_stream.assert_not_called()
 
 
 def test_weighted_task_stream_large_weights() -> None:
     config = training.Config(
-        tasksets=(
-            training.WeightedTasksetConfig(taskset=training.ReasoningGymConfig(), weight=1e308),
-            training.WeightedTasksetConfig(taskset=training.ReasoningGymConfig(task="basic_arithmetic"), weight=1e308),
-        )
+        tasksets={
+            "legs": training.WeightedTasksetConfig(taskset=training.ReasoningGymConfig(), weight=1e308),
+            "arithmetic": training.WeightedTasksetConfig(
+                taskset=training.ReasoningGymConfig(task="basic_arithmetic"), weight=1e308
+            ),
+        }
     )
     tasks = training.stream_tasks(config.tasksets, random.Random(1), config.environment_timeout)
-    assert {next(tasks).config.task for _ in range(8)} == {"leg_counting", "basic_arithmetic"}
+    assert {next(tasks).task.config.task for _ in range(8)} == {"leg_counting", "basic_arithmetic"}
 
 
 @pytest.mark.parametrize("temperature", [0.01, 2.0])
@@ -681,7 +744,7 @@ def actor(monkeypatch: pytest.MonkeyPatch, task_discovery: list[ALFWorldTask]) -
 
 async def collect_and_close(actor: Any, task: ALFWorldTask) -> training.RolloutGroup:
     async with aclosing(actor):
-        return await actor.collect_group(task, group_size=2)
+        return await actor.collect_group(task, group_size=2, taskset_id="alfworld")
 
 
 def test_actor_fetch_next_group(
@@ -693,10 +756,10 @@ def test_actor_fetch_next_group(
     result = asyncio.run(actor.fetch_next_group(group_size=2))
 
     training.stream_alfworld_tasks.assert_called_once_with(
-        actor.config.tasksets[0].taskset, actor.rng, actor.config.environment_timeout
+        actor.config.tasksets["alfworld"].taskset, actor.rng, actor.config.environment_timeout
     )
     actor.rng.choice.assert_called_once_with(task_discovery)
-    collect.assert_awaited_once_with(task_discovery[0], group_size=2)
+    collect.assert_awaited_once_with(task_discovery[0], group_size=2, taskset_id="alfworld")
     assert result is collect.return_value
 
 
@@ -719,19 +782,19 @@ def test_actor_reuses_agent(
 
     async def collect() -> None:
         async with aclosing(actor), asyncio.timeout(5):
-            first = asyncio.create_task(actor.collect_group(task_discovery[0], group_size=2))
+            first = asyncio.create_task(actor.collect_group(task_discovery[0], group_size=2, taskset_id="alfworld"))
             await entering.wait()
-            second = asyncio.create_task(actor.collect_group(task_discovery[1], group_size=2))
+            second = asyncio.create_task(actor.collect_group(task_discovery[1], group_size=2, taskset_id="alfworld"))
             await asyncio.sleep(0)
             create.assert_called_once_with(actor.config)
             release.set()
             groups = await asyncio.gather(first, second)
             assert [group.task_id for group in groups] == [f"alfworld:{task.id}" for task in task_discovery[:2]]
-            await actor.collect_group(task_discovery[0], group_size=2)
+            await actor.collect_group(task_discovery[0], group_size=2, taskset_id="alfworld")
             agent.__aexit__.assert_not_awaited()
         await actor.aclose()
         with pytest.raises(RuntimeError, match="Actor is closed"):
-            await actor.collect_group(task_discovery[0], group_size=2)
+            await actor.collect_group(task_discovery[0], group_size=2, taskset_id="alfworld")
 
     asyncio.run(collect())
     create.assert_called_once_with(actor.config)
@@ -797,7 +860,7 @@ def test_actor_close_cancels_rollouts(
 
     async def collect() -> None:
         async with aclosing(actor), asyncio.timeout(5):
-            group = asyncio.create_task(actor.collect_group(task_discovery[0], group_size=2))
+            group = asyncio.create_task(actor.collect_group(task_discovery[0], group_size=2, taskset_id="alfworld"))
             await started.wait()
             await actor.aclose()
             with pytest.raises(asyncio.CancelledError):
@@ -821,7 +884,7 @@ def test_actor_server_lifetime(
     monkeypatch.setattr(training, "serve_vllm", serve)
     ready = Mock(side_effect=TimeoutError("not ready") if startup_fails else None)
     monkeypatch.setattr(training, "wait_for_server", ready)
-    group = training.RolloutGroup(task_id="0", rollouts=[])
+    group = training.RolloutGroup(task_id="0", rollouts=[], taskset_id="test")
 
     if startup_fails:
         actor_class = training.Actor.__ray_metadata__.modified_class
@@ -836,7 +899,7 @@ def test_actor_server_lifetime(
         monkeypatch.setattr(actor.rng, "choice", Mock(return_value=task_discovery[0]))
         for _ in range(2):
             assert asyncio.run(actor.fetch_next_group(group_size=2)) is group
-        actor.collect_group.assert_awaited_with(task_discovery[0], group_size=2)
+        actor.collect_group.assert_awaited_with(task_discovery[0], group_size=2, taskset_id="alfworld")
         assert actor.collect_group.await_count == 2
         server.__exit__.assert_not_called()
         asyncio.run(actor.aclose())
@@ -909,7 +972,9 @@ def test_learner_pulls_groups_through_batcher(
 ) -> None:
     actor = Mock()
     learner.config = replace(learner.config, num_groups=num_groups, group_size=3, minibatches_per_epoch=1)
-    groups = [training.RolloutGroup(task_id=str(i), rollouts=[rollout] * 3) for i in range(num_groups)]
+    groups = [
+        training.RolloutGroup(task_id=str(i), rollouts=[rollout] * 3, taskset_id="test") for i in range(num_groups)
+    ]
     actor.fetch_next_group.remote = AsyncMock(
         side_effect=[groups[0], RuntimeError("rollout failed")] if fails else groups
     )
@@ -966,7 +1031,9 @@ def test_batcher_prefetches_bounded_groups(
     rollout: training.Rollout,
 ) -> None:
     actor = Mock()
-    actor.fetch_next_group.remote = AsyncMock(return_value=training.RolloutGroup(task_id="0", rollouts=[rollout] * 2))
+    actor.fetch_next_group.remote = AsyncMock(
+        return_value=training.RolloutGroup(task_id="0", rollouts=[rollout] * 2, taskset_id="test")
+    )
     batcher = training.Batcher.__ray_metadata__.modified_class(
         actor=actor,
         config=training.Config(
@@ -998,7 +1065,9 @@ def test_batcher_selects_groups_across_batch_boundaries(
     prefetch_mode: Literal["next_ready", "next_in_order"], rollout: training.Rollout
 ) -> None:
     groups = [
-        training.RolloutGroup(task_id=str(index), rollouts=[replace(rollout, advantage=float(index))] * 2)
+        training.RolloutGroup(
+            task_id=str(index), rollouts=[replace(rollout, advantage=float(index))] * 2, taskset_id="test"
+        )
         for index in range(4)
     ]
 
@@ -1073,7 +1142,7 @@ def test_learner_cancels_prefetch_on_update_failure(
     learner.config = replace(learner.config, total_iterations=4, prefetch_batches=3)
     learner.publish_weights = Mock()
     batch = training.build_rollout_batch(
-        groups=[training.RolloutGroup(task_id="0", rollouts=[rollout] * 4)],
+        groups=[training.RolloutGroup(task_id="0", rollouts=[rollout] * 4, taskset_id="test")],
         training_batch=Mock(spec=training.GRPOBatch, attention_mask=np.ones((4, 2), dtype=np.bool_)),  # (B, T)
         timing_metrics={},
     )
@@ -1104,7 +1173,7 @@ def test_batcher_cancels_prefetched_groups(
 
     async def collect() -> None:
         pending = [asyncio.Future[training.RolloutGroup]() for _ in range(4)]
-        pending[0].set_result(training.RolloutGroup(task_id="0", rollouts=[rollout] * 2))
+        pending[0].set_result(training.RolloutGroup(task_id="0", rollouts=[rollout] * 2, taskset_id="test"))
         actor = Mock()
         actor.fetch_next_group.remote.side_effect = pending
         batcher = training.Batcher.__ray_metadata__.modified_class(
@@ -1136,7 +1205,7 @@ def test_batcher_next_ready_failure_cancels_pool(
         if failure_stage == "group":
             pending[-1].set_exception(error)
         else:
-            pending[-1].set_result(training.RolloutGroup(task_id="3", rollouts=[rollout] * 2))
+            pending[-1].set_result(training.RolloutGroup(task_id="3", rollouts=[rollout] * 2, taskset_id="test"))
         actor = Mock()
         actor.fetch_next_group.remote.side_effect = pending
         batcher = training.Batcher.__ray_metadata__.modified_class(
@@ -1158,7 +1227,11 @@ def test_batcher_next_ready_failure_cancels_pool(
 @pytest.mark.parametrize("drop_degenerate_groups", [False, True])
 def test_batch_refills_degenerate_groups(drop_degenerate_groups: bool, rollout: training.Rollout) -> None:
     groups = [
-        training.score_group(Mock(id=str(index)), [replace(rollout, reward=reward) for reward in rewards])
+        training.score_group(
+            Mock(id=str(index)),
+            [replace(rollout, reward=reward) for reward in rewards],
+            taskset_id="degenerate" if index < 2 else "retained",
+        )
         for index, rewards in enumerate(((0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0)))
     ]
     actor = Mock()
@@ -1181,13 +1254,16 @@ def test_batch_refills_degenerate_groups(drop_degenerate_groups: bool, rollout: 
     assert batch.examples == training.format_rollout_examples(expected_groups)
     assert batch.rollout_metrics["rollout/degenerate_group_fraction"] == (0.0 if drop_degenerate_groups else 1.0)
     assert batch.rollout_metrics["batcher/skipped_groups"] == (2 if drop_degenerate_groups else 0)
+    assert {
+        name: value for name, value in batch.rollout_metrics.items() if name.startswith("rollout/reward_mean/")
+    } == {f"rollout/reward_mean/{'retained' if drop_degenerate_groups else 'degenerate'}": 0.5}
     assert batch.num_output_tokens == 4
     assert batch.stop_counts == {"agent_completed": 4}
 
 
 def test_batch_skipped_groups_follow_prefetched_groups(rollout: training.Rollout) -> None:
-    retained = training.score_group(Mock(id="retained"), [rollout, replace(rollout, reward=0.0)])
-    skipped = training.score_group(Mock(id="skipped"), [rollout] * 2)
+    retained = training.score_group(Mock(id="retained"), [rollout, replace(rollout, reward=0.0)], taskset_id="alfworld")
+    skipped = training.score_group(Mock(id="skipped"), [rollout] * 2, taskset_id="alfworld")
     actor = Mock()
     actor.fetch_next_group.remote = AsyncMock(side_effect=[retained, skipped, skipped, retained])
     batcher = training.Batcher.__ray_metadata__.modified_class(
@@ -1229,7 +1305,7 @@ def test_batch_failure_cancels_pending_fetches(
         nonlocal requested
         requested += 1
         if drop_degenerate_groups and requested == 1:
-            return training.RolloutGroup(task_id="degenerate", rollouts=[rollout] * 2)
+            return training.RolloutGroup(task_id="degenerate", rollouts=[rollout] * 2, taskset_id="test")
         if requested == 1 + drop_degenerate_groups:
             await started.wait()
             raise RuntimeError("rollout failed")
@@ -1258,6 +1334,29 @@ def test_batch_failure_cancels_pending_fetches(
     batcher.prepare_batch.assert_not_called()
 
 
+def test_batch_taskset_reward_means(rollout: training.Rollout) -> None:
+    penalty = training.LengthPenaltyConfig(reference_tokens=1, penalty=0.5)
+    groups = [
+        training.RolloutGroup(
+            task_id="same_environment:same_task",
+            taskset_id=taskset_id,
+            rollouts=[replace(rollout, reward=reward)] * count,
+            length_penalty=penalty,
+        )
+        for taskset_id, reward, count in (("easy", 1.0, 2), ("easy", 0.0, 4), ("hard", 0.0, 2))
+    ]
+    groups = pickle.loads(pickle.dumps(groups))
+    batcher = training.Batcher.__ray_metadata__.modified_class(actor=Mock())
+    prepared = batcher.prepare_batch(groups, context_length=8)  # (B=8, T=8), (B=8,) leaves.
+    assert prepared.token_ids.shape == (8, 8)
+    batch = training.build_rollout_batch(groups=groups, training_batch=prepared, timing_metrics={})
+    assert {
+        name: value for name, value in batch.rollout_metrics.items() if name.startswith("rollout/reward_mean/")
+    } == {"rollout/reward_mean/easy": pytest.approx(1 / 3), "rollout/reward_mean/hard": 0.0}
+    assert batch.rollout_metrics["rollout/reward_mean"] == 0.25
+    assert batch.rollout_metrics["rollout/adjusted_reward_mean"] == 0.125
+
+
 def test_batch_timings_and_order_survive_serialization(
     learner: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1266,7 +1365,12 @@ def test_batch_timings_and_order_survive_serialization(
     monkeypatch.setattr(training, "time", Mock(monotonic=clock))
     caplog.set_level("INFO", logger=training.__name__)
     groups = [
-        training.RolloutGroup(task_id=str(i), rollouts=[replace(rollout, advantage=float(i))] * 2) for i in range(2)
+        training.RolloutGroup(
+            task_id=str(i),
+            taskset_id=f"source_{i}",
+            rollouts=[replace(rollout, advantage=float(i), reward=float(i))] * 2,
+        )
+        for i in range(2)
     ]
     fast_ready = asyncio.Event()
     requested = 0
@@ -1314,6 +1418,8 @@ def test_batch_timings_and_order_survive_serialization(
     assert "Example 1 | task=0" in batch.examples
     assert "Example 3 | task=1" in batch.examples
     assert batch.training_batch.token_ids.shape == (4, 8)
+    assert batch.rollout_metrics["rollout/reward_mean/source_0"] == 0.0
+    assert batch.rollout_metrics["rollout/reward_mean/source_1"] == 1.0
     assert batch.timing_metrics == {
         "batcher/fetch_rollout_seconds": 50.5,
         "batcher/prepare_batch_seconds": 2.0,
@@ -1452,9 +1558,12 @@ def test_learner_logs_rollouts(
         stop_condition="agent_completed",
     )
     batch = [
-        training.RolloutGroup(task_id="0", rollouts=[replace(rollout, reward=reward) for reward in group_rewards[0]]),
+        training.RolloutGroup(
+            task_id="0", taskset_id="easy", rollouts=[replace(rollout, reward=reward) for reward in group_rewards[0]]
+        ),
         training.RolloutGroup(
             task_id="1",
+            taskset_id="hard",
             rollouts=[
                 replace(
                     rollout,
@@ -1562,7 +1671,6 @@ def test_learner_logs_rollouts(
     factory.assert_called_once_with(experiment="grpo_v2", run_name=None)
     writer.log_params.assert_called_once_with(asdict(learner.config))
     expected_config = asdict(learner.config)
-    expected_config["tasksets"] = list(expected_config["tasksets"])
     assert yaml.safe_load(writer.log_text.call_args.args[0]) == expected_config
     calls = writer.log_metrics.call_args_list
     assert len(calls) == (2 if fails else 3)
@@ -1577,6 +1685,8 @@ def test_learner_logs_rollouts(
         **timing_metrics,
         "train/policy_loss": -0.25,
         "rollout/reward_mean": mean(rewards),
+        "rollout/reward_mean/easy": mean(group_rewards[0]),
+        "rollout/reward_mean/hard": mean(group_rewards[1]),
         "rollout/reward_std": pstdev(rewards),
         "rollout/reward_min": 0.0,
         "rollout/reward_max": 1.0,
@@ -1871,9 +1981,9 @@ def test_learner_logs_examples_at_configured_interval(
         stop_condition="max_turns",
     )
     groups = [
-        training.RolloutGroup(task_id="task-1", rollouts=[rollout] * 5),
+        training.RolloutGroup(task_id="task-1", rollouts=[rollout] * 5, taskset_id="test"),
         training.RolloutGroup(
-            task_id=None,
+            task_id="task-2",
             rollouts=[
                 replace(rollout, interaction="", stop_condition="unspecified"),
                 rollout,
@@ -1881,6 +1991,7 @@ def test_learner_logs_examples_at_configured_interval(
                 replace(rollout, interaction="omitted"),
                 replace(rollout, interaction="omitted"),
             ],
+            taskset_id="test",
         ),
     ]
     learner.config = replace(
@@ -1938,8 +2049,8 @@ def test_learner_logs_examples_at_configured_interval(
             "<|im_start|>assistant\n"
             '<think>Use add.</think>\n<tool_call>{"name": "add"}</tool_call><|im_end|>'
         ) in text
-        assert "Example 6 | task=None" in text
-        assert "Example 8 | task=None" in text
+        assert "Example 6 | task=task-2" in text
+        assert "Example 8 | task=task-2" in text
         assert "Full token sequence (special tokens preserved):\n(empty)" in text
         assert text.count("reward=1.000") == 8
         assert "Token IDs:" not in text
@@ -2208,7 +2319,7 @@ def test_continual_group_filling(
             return await actor.fetch_next_group(group_size=2)
 
     group = asyncio.run(collect())
-    assert group == training.score_group(task_discovery[0], samples[-2:])
+    assert group == training.score_group(task_discovery[0], samples[-2:], taskset_id="alfworld")
     assert len(group.rollouts) == 2
     assert agent.run.await_count == len(samples)
     actor.rng.choice.assert_called_once_with(task_discovery)
@@ -2232,7 +2343,7 @@ def test_score_group_centers_rewards(
 ) -> None:
     task = task_discovery[0]
     rollouts = [replace(rollout, reward=reward) for reward in rewards]
-    group = training.score_group(task, rollouts)
+    group = training.score_group(task, rollouts, taskset_id="alfworld")
     assert group.task_id == f"{task.name}:{task.id}"
     expected = [reward - mean(rewards) for reward in rewards]
     assert len(group.rollouts) == len(rewards)
@@ -2262,7 +2373,7 @@ def test_score_group_length_penalty_generated_tokens(rollout: training.Rollout) 
     expected = [1.0, 0.9875, 0.95, 0.9, 0.9]
     samples = [replace(rollout, num_input_tokens=100, num_output_tokens=length) for length in lengths]
     penalty = training.LengthPenaltyConfig(reference_tokens=8192, penalty=0.1)
-    group = training.score_group(Mock(id="task"), samples, length_penalty=penalty)
+    group = training.score_group(Mock(id="task"), samples, length_penalty=penalty, taskset_id="alfworld")
     assert group.training_rewards == pytest.approx(expected)
     assert [sample.reward for sample in group.rollouts] == [1.0] * len(lengths)
     assert [sample.advantage for sample in samples] == [rollout.advantage] * len(lengths)
@@ -2274,6 +2385,7 @@ def test_score_group_length_penalty_generated_tokens(rollout: training.Rollout) 
         Mock(id="task"),
         [replace(sample, num_input_tokens=10000) for sample in samples],
         length_penalty=penalty,
+        taskset_id="alfworld",
     )
     assert more_context.training_rewards == group.training_rewards
     assert [sample.advantage for sample in more_context.rollouts] == [sample.advantage for sample in group.rollouts]
@@ -2282,10 +2394,16 @@ def test_score_group_length_penalty_generated_tokens(rollout: training.Rollout) 
 def test_score_group_length_penalty_preserves_coefficient(rollout: training.Rollout) -> None:
     samples = [replace(rollout, num_output_tokens=length) for length in (1, 2)]
     group = training.score_group(
-        Mock(id="task"), samples, length_penalty=training.LengthPenaltyConfig(reference_tokens=2, penalty=0.1)
+        Mock(id="task"),
+        samples,
+        length_penalty=training.LengthPenaltyConfig(reference_tokens=2, penalty=0.1),
+        taskset_id="alfworld",
     )
     weaker = training.score_group(
-        Mock(id="task"), samples, length_penalty=training.LengthPenaltyConfig(reference_tokens=2, penalty=0.01)
+        Mock(id="task"),
+        samples,
+        length_penalty=training.LengthPenaltyConfig(reference_tokens=2, penalty=0.01),
+        taskset_id="alfworld",
     )
     assert [sample.advantage for sample in group.rollouts] == pytest.approx([0.025, -0.025])
     assert [sample.advantage for sample in weaker.rollouts] == pytest.approx([0.0025, -0.0025])
@@ -2293,7 +2411,9 @@ def test_score_group_length_penalty_preserves_coefficient(rollout: training.Roll
 
 def test_score_group_length_penalty_mixed_outcomes(rollout: training.Rollout) -> None:
     samples = [replace(rollout, num_output_tokens=8192), replace(rollout, reward=0.0, num_output_tokens=1)]
-    group = training.score_group(Mock(id="task"), samples, length_penalty=training.LengthPenaltyConfig(penalty=0.05))
+    group = training.score_group(
+        Mock(id="task"), samples, length_penalty=training.LengthPenaltyConfig(penalty=0.05), taskset_id="alfworld"
+    )
     assert group.training_rewards == pytest.approx([0.95, 0.0])
     assert [sample.advantage for sample in group.rollouts] == pytest.approx([0.475, -0.475])
 
@@ -2310,7 +2430,10 @@ def test_score_group_length_penalty_neutral_groups(reward: float, penalty: float
         )
     ]
     group = training.score_group(
-        Mock(id="task"), samples, length_penalty=training.LengthPenaltyConfig(reference_tokens=4, penalty=penalty)
+        Mock(id="task"),
+        samples,
+        length_penalty=training.LengthPenaltyConfig(reference_tokens=4, penalty=penalty),
+        taskset_id="alfworld",
     )
     assert group.training_rewards == [reward] * len(samples)
     assert all(sample.advantage == 0.0 for sample in group.rollouts)
@@ -2324,6 +2447,7 @@ def test_length_penalty_requires_binary_rewards(reward: float, rollout: training
             Mock(id="task"),
             [rollout, replace(rollout, reward=reward)],
             length_penalty=training.LengthPenaltyConfig(penalty=0.05),
+            taskset_id="alfworld",
         )
 
 
@@ -2471,7 +2595,7 @@ def test_rollout_deadline_excludes_cleanup(
 
         environment.__aexit__.side_effect = close
         async with aclosing(actor):
-            return await actor.collect_group(task, group_size=2)
+            return await actor.collect_group(task, group_size=2, taskset_id="alfworld")
 
     group = asyncio.run(collect())
     assert len(group.rollouts) == 2
@@ -2497,7 +2621,7 @@ def test_rollout_deadline_still_limits_work(actor: Any, monkeypatch: pytest.Monk
 
     async def collect() -> None:
         async with aclosing(actor):
-            await actor.collect_group(task, group_size=2)
+            await actor.collect_group(task, group_size=2, taskset_id="alfworld")
 
     with pytest.raises(ExceptionGroup) as raised:
         asyncio.run(collect())
@@ -2533,7 +2657,7 @@ def test_group_cancels_pending_rollouts(
         async with aclosing(actor):
             with training.span("test.parent") as parent:
                 try:
-                    await actor.collect_group(task_discovery[0], group_size=2)
+                    await actor.collect_group(task_discovery[0], group_size=2, taskset_id="alfworld")
                 except ExceptionGroup:
                     assert otel_trace.get_current_span() is parent
                     raise
