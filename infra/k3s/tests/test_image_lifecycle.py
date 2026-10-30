@@ -51,7 +51,7 @@ def test_image_pinned_while_queued_and_released_after_completion(tmp_path: Path)
         "--local",
         f"dockerfile={tmp_path}",
         "--output",
-        f"type=image,name={image},unpack=true",
+        f"type=image,name={image},unpack=true,compression=zstd,compression-level=1,oci-mediatypes=true",
     )
     manifest = {
         "apiVersion": "batch/v1",

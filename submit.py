@@ -187,7 +187,7 @@ def submit_jobs(args: argparse.Namespace, manifests: list[dict[str, Any]], image
             "filename=infra/k3s/training/Dockerfile",
             *(["--opt", f"build-arg:UV_EXTRA={args.extra}"] if args.extra else []),
             "--output",
-            f"type=image,name={image},unpack=true",
+            f"type=image,name={image},unpack=true,compression=zstd,compression-level=1,oci-mediatypes=true",
             "--progress",
             "plain",
         ],

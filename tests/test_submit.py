@@ -152,7 +152,10 @@ def test_build_and_submit_preserves_command(
     assert "port-forward" not in output
     assert "Login token" not in output
     assert f"Ray timeline (when recorded): http://localhost:8085/?job={names[0]}" in output
-    assert f"type=image,name={container['image']},unpack=true" in build.args[0]
+    assert (
+        f"type=image,name={container['image']},unpack=true,compression=zstd,compression-level=1,oci-mediatypes=true"
+        in build.args[0]
+    )
     preview = next(call for call in calls if "--dry-run=server" in call.args[0])
     assert preview.kwargs["input"] == calls[-1].kwargs["input"]
     assert calls.index(preview) < calls.index(build) < len(calls) - 1

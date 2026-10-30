@@ -13,5 +13,5 @@ root = "/var/lib/rl2-buildkit"
   networkMode = "host"
   max-parallelism = 2
   reservedSpace = "10GB"
-  maxUsedSpace = "30GB"
+  maxUsedSpace = "64GB"
   minFreeSpace = "20GB"
