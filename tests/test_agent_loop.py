@@ -272,8 +272,9 @@ def test_return_sums_steps_within_turn(
     assert '"reward": -0.25' not in rollout.interaction
 
 
+@pytest.mark.parametrize("extra_tokens", [-1, 0, 1], ids=["below-limit", "at-limit", "over-limit"])
 def test_total_token_budget_across_turns(
-    tokenizer: PreTrainedTokenizerFast, environment: AsyncMock, task: Task
+    extra_tokens: int, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock, task: Task
 ) -> None:
     requests: list[dict[str, Any]] = []
     token_limit = 8191  # Below the model context length.
@@ -285,7 +286,7 @@ def test_total_token_budget_across_turns(
         text = (
             '<tool_call>{"name":"look","arguments":{}}</tool_call><|im_end|>'
             if len(requests) == 1
-            else "x" * body["max_tokens"]
+            else "x" * (body["max_tokens"] + extra_tokens)
         )
         return httpx.Response(200, json=response_for(tokenizer, text, "stop" if len(requests) == 1 else "length"))
 
@@ -293,10 +294,16 @@ def test_total_token_budget_across_turns(
         async with make_client(respond) as client, task.init_env() as env:
             return await replace(make_agent(tokenizer, client), max_tokens=token_limit).run(env=env)
 
+    if extra_tokens > 0:
+        with pytest.raises(ValueError, match="Completion exceeds the requested token budget"):
+            asyncio.run(run())
+        return
+
     rollout = asyncio.run(run())
     sequence = rollout.sequence
-    assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape == (token_limit,)
-    assert rollout.num_input_tokens + rollout.num_output_tokens == token_limit
+    expected_length = token_limit + extra_tokens
+    assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape == (expected_length,)
+    assert rollout.num_input_tokens + rollout.num_output_tokens == expected_length
     assert rollout.stop_condition == "max_tokens"
     assert len(requests) == rollout.num_turns == 2
     assert requests[1]["max_tokens"] < requests[0]["max_tokens"]

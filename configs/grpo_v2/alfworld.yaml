@@ -13,9 +13,11 @@ attention_backend: tokamax
 scan_layers: true
 gradient_checkpointing: true
 padding_multiple: 512
-taskset:
-  id: alfworld
-  config_file: data/alfworld/base_config.yaml
+tasksets:
+  - weight: 1.0
+    taskset:
+      id: alfworld
+      config_file: data/alfworld/base_config.yaml
 seed: 1
 
 num_groups: 4 # verl data.train_batch_size (task groups).
@@ -32,13 +34,14 @@ parameter_sync_step: 4 # Publish every fourth training batch if weights have cha
 # verl's off-policy threshold/drop strategy and minibatch streaming are unsupported.
 weight_update_pause_mode: wait
 drop_degenerate_groups: false
-length_penalty_coef: 0.0001 # Subtract 0.1 per 1,000 sampled tokens when environment reward is nonzero.
-max_tokens_penalty: 0.1 # Subtract from any reward when the rollout stops at max_tokens.
+length_penalty:
+  reference_tokens: 8192 # Generated-token scale, independent of the transcript budget.
+  penalty: 0.05 # Success-only cost; requires binary rewards when enabled.
 max_tokens: 8192 # Total transcript tokens, including system, prompt, and tools.
 max_turns: 50
 rollout_timeout: 1200
 environment_timeout: 600
-run_id: grpo_v2_alfworld_${path_name:${model}}_${finetuning_mode}_${attention_backend}_s${seed}_lr${learning_rate}_adamw_scale${adamw_batch_size_scale}_ng${num_groups}_gs${group_size}_mb${minibatches_per_epoch}_ddg${drop_degenerate_groups}_pf${prefetch_batches}_${prefetch_mode}_ps${parameter_sync_step}_lp${length_penalty_coef}
+run_id: grpo_v2_alfworld_${path_name:${model}}_${finetuning_mode}_${attention_backend}_s${seed}_lr${learning_rate}_adamw_scale${adamw_batch_size_scale}_ng${num_groups}_gs${group_size}_mb${minibatches_per_epoch}_ddg${drop_degenerate_groups}_pf${prefetch_batches}_${prefetch_mode}_ps${parameter_sync_step}_success_lp${length_penalty.reference_tokens}_${length_penalty.penalty}
 ckpt_dir: /runs/grpo_v2/${run_id} # Checkpoints and profiling artifacts.
 checkpoint_interval: 50
 example_log_interval: 50

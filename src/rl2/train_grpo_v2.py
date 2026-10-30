@@ -32,7 +32,7 @@ Rollout batch scalars:
     rollout/reward_std: Population standard deviation of raw rollout rewards.
     rollout/reward_min: Minimum raw rollout reward.
     rollout/reward_max: Maximum raw rollout reward.
-    rollout/adjusted_reward_mean: Mean rollout reward after length and max-tokens penalties.
+    rollout/adjusted_reward_mean: Mean rollout reward after the success-only generated-token cost.
     rollout/adjusted_reward_std: Population standard deviation of adjusted rollout rewards.
     rollout/adjusted_reward_min: Minimum adjusted rollout reward.
     rollout/adjusted_reward_max: Maximum adjusted rollout reward.
@@ -102,7 +102,7 @@ import yaml
 from flax.training.train_state import TrainState
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from openai import AsyncOpenAI
-from pydantic import Field, TypeAdapter
+from pydantic import ConfigDict, Field, TypeAdapter
 from pydantic.dataclasses import dataclass as config_dataclass
 from ray.actor import ActorHandle
 from transformers import AutoTokenizer
@@ -135,11 +135,23 @@ SERVER_URL = "http://127.0.0.1:8000"
 LORA_NAME = "training-policy"
 
 
+@config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class LengthPenaltyConfig:
+    reference_tokens: Annotated[int, Field(gt=0)] = 8192
+    penalty: Annotated[float, Field(ge=0, lt=1)] = 0.0
+
+
+@config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class WeightedTasksetConfig:
+    taskset: Annotated[ALFWorldConfig | AppWorldConfig | ReasoningGymConfig, Field(discriminator="id")]
+    weight: Annotated[float, Field(ge=0, lt=float("inf"))] = 1.0
+
+
 @config_dataclass(frozen=True)
 class Config(BaseConfig):
     model: str = MODEL
-    taskset: Annotated[ALFWorldConfig | AppWorldConfig | ReasoningGymConfig, Field(discriminator="id")] = (
-        ALFWorldConfig(config_file="data/alfworld/base_config.yaml")
+    tasksets: Annotated[tuple[WeightedTasksetConfig, ...], Field(min_length=1)] = (
+        WeightedTasksetConfig(taskset=ALFWorldConfig(config_file="data/alfworld/base_config.yaml")),
     )
     seed: Annotated[int, Field(ge=0)] = 1
     learner_gpus: Annotated[int, Field(ge=1)] = 1
@@ -149,8 +161,9 @@ class Config(BaseConfig):
     prefetch_mode: Literal["next_ready", "next_in_order"] = "next_in_order"
     parameter_sync_step: Annotated[int, Field(ge=1)] = 1  # Completed training batches between weight publications.
     drop_degenerate_groups: bool = False
-    length_penalty_coef: Annotated[float, Field(ge=0)] = 0.0  # Per-token cost for nonzero environment rewards.
-    max_tokens_penalty: Annotated[float, Field(ge=0)] = 0.0  # Flat cost for stopping at max_tokens.
+    continual_group_filling: bool = False
+    max_resampling_attempts: Annotated[int, Field(ge=0)] = 100
+    length_penalty: LengthPenaltyConfig = LengthPenaltyConfig()
     total_iterations: Annotated[int | None, Field(ge=1)] = None
     checkpoint_interval: Annotated[int, Field(gt=0)] = 100
     example_log_interval: Annotated[int, Field(gt=0)] = 10
@@ -185,6 +198,8 @@ class Config(BaseConfig):
     weight_update_pause_mode: Literal["wait", "keep"] = "wait"
 
     def __post_init__(self) -> None:
+        if not any(entry.weight > 0 for entry in self.tasksets):
+            raise ValueError("tasksets must contain at least one positive weight")
         if self.num_groups * self.group_size % (self.minibatches_per_epoch * self.grad_accum_steps):
             raise ValueError("minibatches_per_epoch * grad_accum_steps must divide num_groups * group_size")
         if self.num_groups * self.group_size % (self.minibatches_per_epoch * self.grad_accum_steps * self.learner_gpus):
@@ -299,15 +314,22 @@ def restore_checkpoint(
 class RolloutGroup:
     task_id: str | None  # Source task ID shared by the group; None if the task has no ID.
     rollouts: list[Rollout]  # Independent attempts at the same task, in sampling order, scored as one group.
-    length_penalty_coef: float = 0.0
-    max_tokens_penalty: float = 0.0
+    length_penalty: LengthPenaltyConfig = DEFAULT_CONFIG.length_penalty
 
     @property
     def training_rewards(self) -> list[float]:
-        """Apply length costs to nonzero rewards and token-limit costs to any reward."""
+        """Charge successful binary-reward rollouts for generated tokens only."""
+        if self.length_penalty.penalty == 0:
+            return [rollout.reward for rollout in self.rollouts]
+        if any(rollout.reward not in (0.0, 1.0) for rollout in self.rollouts):
+            raise ValueError("Enabled length penalty requires binary rewards (0 or 1)")
         return [
-            (rollout.reward - self.length_penalty_coef * rollout.num_output_tokens if rollout.reward != 0 else 0.0)
-            - (self.max_tokens_penalty if rollout.stop_condition == "max_tokens" else 0.0)
+            rollout.reward
+            * (
+                1.0
+                - self.length_penalty.penalty
+                * min(rollout.num_output_tokens / self.length_penalty.reference_tokens, 1.0)
+            )
             for rollout in self.rollouts
         ]
 
@@ -339,7 +361,7 @@ class GRPOBatch[Array: np.ndarray | jax.Array](NamedTuple):
     attention_mask: Array  # (B, T) bool context and sampled tokens, excluding padding.
     loss_mask: Array  # (B, T) bool sampled tokens only.
     old_log_probs: Array  # (B, T) float32 temperature-scaled sampling-policy log-probabilities.
-    advantages: Array  # (B,) float32 normalized within each rollout group.
+    advantages: Array  # (B,) float32 mean-centered adjusted rewards within each rollout group.
 
 
 @dataclass(frozen=True)
@@ -642,24 +664,25 @@ def update(
 
 
 def score_group(
-    task: Task, rollouts: list[Rollout], length_penalty_coef: float = 0.0, max_tokens_penalty: float = 0.0
+    task: Task,
+    rollouts: list[Rollout],
+    *,
+    length_penalty: LengthPenaltyConfig = DEFAULT_CONFIG.length_penalty,
 ) -> RolloutGroup:
-    """Assign advantages from adjusted rewards using the group's population standard deviation."""
+    """Mean-center adjusted rewards without rescaling the length cost."""
     if len(rollouts) < 2:
         raise ValueError("A rollout group needs at least two rollouts")
     group = RolloutGroup(
         task_id=f"{task.name}:{task.id}",
         rollouts=rollouts,
-        length_penalty_coef=length_penalty_coef,
-        max_tokens_penalty=max_tokens_penalty,
+        length_penalty=length_penalty,
     )
     rewards = group.training_rewards
-    reward_mean, reward_std = mean(rewards), pstdev(rewards)
+    reward_mean = mean(rewards)
     return replace(
         group,
         rollouts=[
-            replace(rollout, advantage=(reward - reward_mean) / (reward_std + 1e-4))
-            for rollout, reward in zip(rollouts, rewards, strict=True)
+            replace(rollout, advantage=reward - reward_mean) for rollout, reward in zip(rollouts, rewards, strict=True)
         ],
     )
 
@@ -721,16 +744,16 @@ def serve_vllm(
             "vllm",
             "--logprobs-mode",
             "processed_logprobs",
-            "--max-model-len",  # Cap each request's combined prompt and output length.
-            "8192",
-            "--max-num-seqs",  # Limit sequences processed in one scheduler iteration.
-            "128",
-            "--max-num-batched-tokens",  # Budget prefill and decode tokens per scheduler iteration.
-            "8192",
-            "--gpu-memory-utilization",  # Budget 90% of GPU memory for this vLLM instance.
-            "0.90",
-            "--enable-prefix-caching",  # Reuse cached KV state for shared transcript prefixes.
-            "--enable-chunked-prefill",  # Split long prefills to interleave them with decoding.
+            # "--max-model-len",  # Cap each request's combined prompt and output length.
+            # "8192",
+            # "--max-num-seqs",  # Limit sequences processed in one scheduler iteration.
+            # "128",
+            # "--max-num-batched-tokens",  # Budget prefill and decode tokens per scheduler iteration.
+            # "8192",
+            # "--gpu-memory-utilization",  # Budget 90% of GPU memory for this vLLM instance.
+            # "0.90",
+            # "--enable-prefix-caching",  # Reuse cached KV state for shared transcript prefixes.
+            # "--enable-chunked-prefill",  # Split long prefills to interleave them with decoding.
             *weight_args,
         ],
         env={
@@ -1141,6 +1164,32 @@ class Learner:
         return scalars
 
 
+def stream_tasks(tasksets: tuple[WeightedTasksetConfig, ...], rng: random.Random, timeout: float) -> Generator[Task]:
+    """Discover active tasksets at startup, then choose one by relative weight per group."""
+    streams: list[Generator[Task]] = []
+    weights: list[float] = []
+    max_weight = max(entry.weight for entry in tasksets)
+    for entry in tasksets:
+        if entry.weight == 0:
+            continue
+        taskset = entry.taskset
+        if isinstance(taskset, ReasoningGymConfig):
+            streams.append(stream_reasoning_gym_tasks(taskset, rng))
+        elif isinstance(taskset, AppWorldConfig):
+            streams.append(stream_appworld_tasks(taskset, rng, timeout))
+        else:
+            streams.append(stream_alfworld_tasks(taskset, rng, timeout))
+        weights.append(entry.weight / max_weight)
+    if len(streams) == 1:
+        return streams[0]
+
+    def stream() -> Generator[Task]:
+        while True:
+            yield next(rng.choices(streams, weights=weights, k=1)[0])
+
+    return stream()
+
+
 # Restrict JAX before import/backend initialization; vLLM still uses the assigned CUDA device.
 @ray.remote(num_gpus=1, runtime_env={"env_vars": {"JAX_PLATFORMS": "cpu"}})
 class Actor:
@@ -1154,13 +1203,7 @@ class Actor:
         self._agent_lock = asyncio.Lock()
         self._runs: set[asyncio.Task[Rollout]] = set()
         self._closed = False
-        self.tasks: Generator[Task]
-        if isinstance(config.taskset, ReasoningGymConfig):
-            self.tasks = stream_reasoning_gym_tasks(config.taskset, self.rng)
-        elif isinstance(config.taskset, AppWorldConfig):
-            self.tasks = stream_appworld_tasks(config.taskset, self.rng, config.environment_timeout)
-        else:
-            self.tasks = stream_alfworld_tasks(config.taskset, self.rng, config.environment_timeout)
+        self.tasks = stream_tasks(config.tasksets, self.rng, config.environment_timeout)
         logger.info("Starting actor and vLLM on its assigned GPU")
         with self._server as resources:
             server = resources.enter_context(
@@ -1168,7 +1211,10 @@ class Actor:
             )
             wait_for_server(server)
             self._server = resources.pop_all()
-        logger.info("Actor ready for rollout requests: taskset=%s", config.taskset.id)
+        logger.info(
+            "Actor ready for rollout requests: tasksets=%s",
+            [(entry.taskset.id, entry.weight) for entry in config.tasksets],
+        )
 
     def ready(self) -> None:
         """Awaiting this method waits for construction, including vLLM readiness."""
@@ -1207,7 +1253,7 @@ class Actor:
         return await self.collect_group(task, group_size=group_size)
 
     async def collect_group(self, task: Task, group_size: int) -> RolloutGroup:
-        """Run independent attempts in fresh environments, then assign group-normalized advantages."""
+        """Collect a fixed-size group, optionally replacing its oldest attempts until rewards differ."""
         if group_size < 2:
             raise ValueError("group_size must be at least 2")
         span_data = {"group_id": uuid4().hex, "task_id": str(task.id), "group_size": str(group_size)}
@@ -1215,27 +1261,39 @@ class Actor:
         try:
             with span("actor.collect_group", {**span_data, "run_id": self.config.run_id or "unspecified"}):
                 agent = await self._get_agent()
-                async with asyncio.TaskGroup() as tg:
 
-                    async def run_rollout(index: int) -> Rollout:
-                        with span("actor.rollout", {**span_data, "rollout_index": index}) as rollout_span:
-                            async with AsyncExitStack() as resources, asyncio.timeout(self.config.rollout_timeout):
-                                env = await resources.enter_async_context(task.init_env())
-                                result = await agent.run(env=env)
-                            rollout_span.set_attribute("stop_condition", result.stop_condition)
-                            return result
+                async def run_rollout(index: int) -> Rollout:
+                    with span("actor.rollout", {**span_data, "rollout_index": index}) as rollout_span:
+                        async with AsyncExitStack() as resources, asyncio.timeout(self.config.rollout_timeout):
+                            env = await resources.enter_async_context(task.init_env())
+                            result = await agent.run(env=env)
+                        rollout_span.set_attribute("stop_condition", result.stop_condition)
+                        return result
 
-                    runs = [tg.create_task(run_rollout(index)) for index in range(group_size)]
-                    self._runs.update(runs)
-                    for run in runs:
-                        run.add_done_callback(self._runs.discard)
-                with span("actor.score_group"):
-                    group = score_group(
-                        task,
-                        [run.result() for run in runs],
-                        length_penalty_coef=self.config.length_penalty_coef,
-                        max_tokens_penalty=self.config.max_tokens_penalty,
-                    )
+                rollouts: list[Rollout] = []
+                next_index = 0
+                attempts = group_size
+                while True:
+                    async with asyncio.TaskGroup() as tg:
+                        runs = [tg.create_task(run_rollout(next_index + offset)) for offset in range(attempts)]
+                        self._runs.update(runs)
+                        for run in runs:
+                            run.add_done_callback(self._runs.discard)
+                    next_index += attempts
+                    rollouts = (rollouts + [run.result() for run in runs])[-group_size:]
+                    with span("actor.score_group"):
+                        group = score_group(
+                            task,
+                            rollouts,
+                            length_penalty=self.config.length_penalty,
+                        )
+                    if (
+                        not self.config.continual_group_filling
+                        or not group.is_degenerate
+                        or next_index - group_size >= self.config.max_resampling_attempts
+                    ):
+                        break
+                    attempts = 1
         except Exception:
             logger.exception(
                 "Group failed: task=%s group_size=%s elapsed=%.2fs",

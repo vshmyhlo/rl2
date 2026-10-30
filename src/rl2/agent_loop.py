@@ -235,6 +235,8 @@ class Agent:
             interaction = await asyncio.to_thread(
                 self.tokenizer.decode, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
             )
+            if len(token_ids) > self.max_tokens:
+                raise ValueError(f"Rollout has {len(token_ids)} tokens; exceeds max_tokens={self.max_tokens}")
             return Rollout(
                 sequence=TrainingSequence(
                     token_ids=np.asarray(token_ids, dtype=np.int32),  # (T,)

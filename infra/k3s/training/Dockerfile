@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.19
 FROM python:3.12-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential git ffmpeg libegl1 libgl1 libopengl0 libglib2.0-0 libgomp1 \
@@ -23,12 +24,14 @@ RUN printf '#include <cuda_runtime.h>\nstatic_assert(CUDART_VERSION / 10 == __CU
 # Bundle Panda assets so Playground can start without runtime downloads.
 RUN --mount=type=bind,source=src/rl2/envs/playground_assets.py,target=/tmp/playground_assets.py \
     /app/.venv/bin/python /tmp/playground_assets.py
+# Keep local datasets out of the layer rebuilt for each source edit.
+COPY data/ ./data/
 # Install editable metadata without copying source into an intermediate layer.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=README.md,target=/app/README.md \
     --mount=type=bind,source=src,target=/app/src \
     uv sync --locked --no-dev ${UV_EXTRA:+--extra=$UV_EXTRA}
-COPY . .
+COPY --exclude=data . .
 # Preserve the built environment when a command uses uv run.
 ENV UV_NO_SYNC=1 UV_ENV_FILE=/app/nvida.env PATH="/app/.venv/bin:${CUDA_HOME}/bin:$PATH"
 # Ray workers share the installed image environment, including optional extras.

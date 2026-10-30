@@ -513,7 +513,11 @@ BuildKit uses a root-only Unix socket and k3s's containerd image store. Each
 submission gets a unique local image tag; no registry is needed. Source edits
 and untracked files are included, subject to `.dockerignore`, which excludes
 virtual environments, generated outputs, and common credential paths. Dependency
-layers are cached using `uv.lock`. JAX and PyTorch/vLLM share CUDA 13.0;
+layers are cached using `pyproject.toml`, `uv.lock`, and the selected extra.
+Local `data/` files (including downloaded ALFWorld games) occupy a separate layer
+before the editable install and source copy, so source edits do not repack datasets.
+Keep generated sweep configs (`.rl2-sweep-*`) in the context; submitted jobs use them.
+JAX and PyTorch/vLLM share CUDA 13.0;
 `cuda-toolkit[cccl,nvcc]` pins matching compiler, headers, and runtime packages.
 The image exposes that toolkit through `CUDA_HOME` and checks compiler/header
 compatibility during the build. Inside the image, `uv run` uses the built

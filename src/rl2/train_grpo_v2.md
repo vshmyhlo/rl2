@@ -1,8 +1,33 @@
 # Tool-calling GRPO
 
 `train_grpo_v2.py` finetunes Qwen3 with a JAX learner, a vLLM inference server,
-and a small custom tool-calling interaction loop. V2 accepts
-`taskset.id: alfworld`, `appworld`, or `reasoning_gym`; the other environment presets are unsupported.
+and a small custom tool-calling interaction loop. Each `tasksets` entry contains
+a relative `weight` (default 1) and a `taskset` with `id: alfworld`, `appworld`, or
+`reasoning_gym`; the other environment presets are unsupported. For example:
+
+```yaml
+tasksets:
+  - weight: 3
+    taskset:
+      id: alfworld
+      config_file: data/alfworld/base_config.yaml
+  - weight: 1
+    taskset:
+      id: reasoning_gym
+      task: leg_counting
+      task_config:
+        min_animals: 1
+        max_animals: 5
+```
+
+For every requested group, select an entry with probability `weight / sum(weights)`,
+then sample one task from it. All attempts in the group use that task. Weights
+apply to groups, independently of catalog sizes; batches need not match the exact
+proportions. Weights must be nonnegative and finite, with at least one positive
+weight. Zero-weight entries are neither initialized nor sampled. Entries can
+repeat an environment ID with different settings. Replace the old top-level
+`taskset` mapping with a one-entry `tasksets` list for single-taskset runs.
+The `taskset.*` settings below refer to the nested mapping within each entry.
 
 Prepare the official ALFWorld training data with `alfworld-download`, set
 `ALFWORLD_DATA`, and point `taskset.config_file` at a configuration whose
@@ -34,15 +59,16 @@ Every attempt in a group receives the same question. The top-level `seed`
 determines the stream, and the checkpointed task RNG restores its continuation.
 Repeated puzzles are possible. There is no `taskset.size`; `task_config` cannot
 override `seed` or `size`.
-For weighted mixtures, use `task: composite` and put a list of
+Reasoning Gym also supports internal mixtures: use `task: composite` and put a list of
 `{name: leg_counting, weight: 1, config: {}}` entries in `task_config.datasets`.
 
 All tasksets provide an indefinite stream, creating one task per requested group.
 ALFWorld and AppWorld retain their discovered ID catalogs and sample uniformly
 with replacement; task objects and environments are created on demand.
 Task discovery completes during actor startup, outside the async rollout loop.
-The checkpointed task RNG restores each stream's continuation; keep the task
-configuration and finite catalogs unchanged when resuming.
+The checkpointed task RNG restores both weighted selection and each stream's
+continuation; keep taskset order, weights, settings, and finite catalogs unchanged
+when resuming. A single active taskset preserves its original sampling sequence.
 
 The model calls `submit_answer(answer=...)` with a string in the question's
 requested format. One valid submission ends the episode and receives the
@@ -133,25 +159,52 @@ up to three times; there are no fallback rewards for infrastructure failures.
 
 ## Training and resuming
 
-The actor samples `group_size` independent attempts at the same task. Set
-`length_penalty_coef` (default `0.0`, nonnegative) to subtract a reward cost per
-sampled token across all turns, including thinking and end-of-turn tokens, only
-when the environment reward is nonzero:
-`training_reward = reward - length_penalty_coef * num_output_tokens`.
-Zero environment rewards receive no length penalty. Set `max_tokens_penalty`
-(default `0.0`, nonnegative) to additionally subtract a flat cost when the stop
-condition is `max_tokens`, including from zero rewards. Other stop conditions,
-including `context_length`, receive no such penalty. The ALFWorld preset uses `0.1`.
-Advantages are `(training_reward - group_mean) / (population_std + 1e-4)`;
-groups with equal adjusted rewards have zero advantages. The batcher gathers
+The actor samples `group_size` independent attempts at the same task.
+`length_penalty` charges successful rollouts for generated tokens across all turns,
+including thinking and tool-call text, excluding prompts and observations:
+
+```yaml
+length_penalty:
+  reference_tokens: 8192
+  penalty: 0.05
+```
+
+When enabled, rewards must be binary (`0` for failure, `1` for success); other
+rewards raise an error. Training reward is
+`reward * (1 - penalty * min(num_output_tokens / reference_tokens, 1))`.
+Failures remain zero; every success remains positive. The cost starts with the
+first generated token and caps at `penalty`. `reference_tokens` is a positive
+fixed scale, independent of `max_tokens`; `penalty` must be in `[0, 1)`.
+Defaults are 8192 and 0 (disabled). ALFWorld enables 0.05; Reasoning Gym leaves
+it disabled because its scoring supports partial credit. Disabled penalties
+preserve arbitrary task rewards. There is no warmup schedule.
+
+Advantages are `training_reward - group_mean`, with no standard-deviation scaling,
+even when the penalty is disabled. This preserves the penalty coefficient's
+strength in all-success groups; all-failure groups have zero advantages.
+The previous `start_fraction` / `end_fraction` transcript ramp is removed.
+This also changes advantage scale from earlier runs; use a new run directory
+and compare against a no-penalty baseline with the same mean-centering.
+Policy-loss reduction remains a mean over sampled tokens per rollout, then
+across rollouts. Monitor raw success and successful-rollout lengths together.
+
+Groups with equal adjusted rewards have zero advantages. The batcher gathers
 `num_groups` concurrently and preserves request order. Set
 `drop_degenerate_groups: true` (default false) to discard groups with equal
 adjusted rewards and sample replacement tasks until all `num_groups` slots
 contain non-degenerate groups. There is no retry limit; collection can continue
 indefinitely if every group is degenerate. Batch metrics describe retained groups.
+Set `continual_group_filling: true` (default false) to keep sampling the same task
+until its group has different adjusted rewards. After the initial parallel
+`group_size` attempts, each additional attempt replaces the oldest sample;
+advantages are recomputed over the newest `group_size` samples.
+`max_resampling_attempts: 100` limits additional samples after the initial group
+(nonnegative; `0` disables retries). At the limit, the latest group is returned
+even if still degenerate. When both options are enabled, the batcher's
+`drop_degenerate_groups` filter discards such groups and samples replacement tasks.
+Metrics and training include only retained samples.
 `rollout/reward_*` reports raw task rewards; `rollout/adjusted_reward_*` reports
-adjusted rewards. Within groups with equal nonzero task rewards, normalization can amplify even
-a small length penalty into substantial advantages favoring shorter rollouts.
+adjusted rewards.
 The batcher pads complete transcripts to `padding_multiple` (default 256),
 capped at the model context length. Oversized transcripts are rejected.
 
