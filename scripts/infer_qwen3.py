@@ -1,14 +1,10 @@
-"""Generate text or run a two-turn thinking/tool example with Qwen3 in JAX.
+"""Chat interactively with Qwen3 in JAX.
 
-uv run python scripts/infer_qwen3.py --demo
-uv run python scripts/infer_qwen3.py --prompt 'Hello' --temperature 0
-Use --demo --help for example options; --help lists the single-turn options.
+uv run python scripts/infer_qwen3.py --temperature 0
+Type /exit or press Ctrl+D to quit.
 """
 
 import argparse
-import json
-import re
-import sys
 from dataclasses import dataclass
 from typing import Literal
 
@@ -21,82 +17,34 @@ from rl2.qwen3 import (
     generate_tokens,
     load_qwen3_checkpoint,
 )
-from rl2.qwen3 import main as single_turn_main
 
-TOOL = {
-    "type": "function",
-    "function": {
-        "name": "multiply",
-        "description": "Multiply two integers.",
-        "parameters": {
-            "type": "object",
-            "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
-            "required": ["a", "b"],
-            "additionalProperties": False,
-        },
-    },
-}
 SYSTEM = (
-    "Use multiply for every calculation. Keep your reasoning brief.\n\n"
-    f"# Tools\n<tools>\n{json.dumps(TOOL)}\n</tools>\n\n"
-    'To use a tool, emit <tool_call>{"name": "multiply", "arguments": {"a": 2, "b": 3}}</tool_call> '
-    "with the appropriate arguments. Wait for the tool response before answering."
+    "You are a helpful, knowledgeable assistant. Give clear, accurate answers and ask for clarification when needed."
 )
-USER_TURNS = ("What is 17 times 23? Use the tool.", "Now multiply that result by 3, using the tool again.")
 
 
 @dataclass
 class Message:
-    role: Literal["system", "user", "assistant", "tool"]
+    role: Literal["system", "user", "assistant"]
     content: str
 
 
 def format_prompt(messages: list[Message]) -> str:
-    """Format this example's Qwen3 chat, retaining thinking only in the current turn."""
-    last_user = max(index for index, message in enumerate(messages) if message.role == "user")
+    """Format Qwen3 chat history, omitting reasoning from previous responses."""
     parts: list[str] = []
-    for index, message in enumerate(messages):
+    for message in messages:
         content = message.content
-        if message.role == "assistant" and index < last_user:
+        if message.role == "assistant":
             content = content.rsplit("</think>", 1)[-1].lstrip("\n")
-        role = "user" if message.role == "tool" else message.role
-        parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+            if "<think>" in content:
+                content = ""  # Omit unfinished reasoning from a truncated response.
+        parts.append(f"<|im_start|>{message.role}\n{content}<|im_end|>\n")
     # Leaving the assistant prefix open enables thinking.
     return "".join(parts) + "<|im_start|>assistant\n"
 
 
-def tool_responses(completion: str) -> str:
-    """Execute multiply calls outside thinking and return Qwen3 tool-response blocks."""
-    content = completion.rsplit("</think>", 1)[-1]
-    if "<think>" in content:
-        raise ValueError("Assistant did not finish thinking")
-    calls = re.findall(r"<tool_call>(.*?)</tool_call>", content, flags=re.DOTALL)
-    if content.count("<tool_call>") != len(calls) or content.count("</tool_call>") != len(calls):
-        raise ValueError("Incomplete tool call")
-    responses: list[str] = []
-    for payload in calls:
-        call = json.loads(payload)
-        if not isinstance(call, dict) or call.get("name") != "multiply":
-            raise ValueError("Only the multiply tool is supported")
-        arguments = call.get("arguments")
-        if (
-            not isinstance(arguments, dict)
-            or arguments.keys() != {"a", "b"}
-            or any(type(value) is not int for value in arguments.values())
-        ):
-            raise ValueError("multiply requires integer arguments a and b")
-        result = arguments["a"] * arguments["b"]
-        responses.append(f"<tool_response>\n{json.dumps({'result': result})}\n</tool_response>")
-    return "\n".join(responses)
-
-
 def main() -> None:
-    if "--demo" not in sys.argv[1:]:
-        single_turn_main()
-        return
-
-    parser = argparse.ArgumentParser(description="Two user turns with Qwen3 thinking and a local multiply tool.")
-    parser.add_argument("--demo", action="store_true", help="Run the thinking/tool example")
+    parser = argparse.ArgumentParser(description="Chat interactively with Qwen3 in JAX/Flax.")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--revision")
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="bfloat16")
@@ -118,11 +66,15 @@ def main() -> None:
     tokenizer = Tokenizer.from_file(str(directory / "tokenizer.json"))
     messages = [Message(role="system", content=SYSTEM)]
     response_index = 0
-    for user in USER_TURNS:
-        print(f"User: {user}", flush=True)
-        messages.append(Message(role="user", content=user))
-        for step in range(5):
-            # Re-prefill the conversation each time to keep the example simple.
+    print("Chat ready. Type /exit or press Ctrl+D to quit.", flush=True)
+    try:
+        while True:
+            user = input("You: ").strip()
+            if user == "/exit":
+                break
+            if not user:
+                continue
+            messages.append(Message(role="user", content=user))
             ids = tokenizer.encode(format_prompt(messages), add_special_tokens=False).ids
             generated = generate_tokens(
                 model,
@@ -137,15 +89,10 @@ def main() -> None:
             completion = tokenizer.decode(generated, skip_special_tokens=True)
             print(f"Assistant: {completion}", flush=True)
             if not generated or generated[-1] != model.config.eos_token_id:
-                raise RuntimeError("Assistant response was truncated; increase --max-new-tokens")
+                print("[Response reached the token limit; increase --max-new-tokens for longer answers.]", flush=True)
             messages.append(Message(role="assistant", content=completion))
-            response = tool_responses(completion)
-            if not response:
-                break
-            if step == 4:
-                raise RuntimeError("Exceeded four tool rounds in one user turn")
-            print(f"Tool: {response}", flush=True)
-            messages.append(Message(role="tool", content=response))
+    except (EOFError, KeyboardInterrupt):
+        print()
 
 
 if __name__ == "__main__":

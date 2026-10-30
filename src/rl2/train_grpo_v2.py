@@ -44,6 +44,7 @@ Rollout batch scalars:
     rollout/total_tokens_mean: Mean full transcript tokens per learner batch row, including context and sampled tokens, excluding padding.
     batcher/token_utilization_fraction: Non-padding transcript tokens divided by batch size times padded sequence length.
     batcher/padded_sequence_tokens: Padded sequence width chosen during batch construction, before the next-token shift.
+    batcher/skipped_groups: Groups discarded by drop_degenerate_groups while filling this batch, including prefetch.
 All StopCondition labels are logged each iteration, including zero for absent labels.
 
 Training progress and settings:
@@ -374,12 +375,18 @@ class RolloutBatch:
     timing_metrics: dict[str, float | int]
 
 
+class CollectedGroup(NamedTuple):
+    group: RolloutGroup
+    skipped_groups: int
+
+
 def build_rollout_batch(
     groups: list[RolloutGroup],
     training_batch: GRPOBatch[np.ndarray],  # Leaves: (B, T), except advantages: (B,).
     timing_metrics: dict[str, float | int],
     *,
     include_examples: bool = False,
+    skipped_groups: int = 0,
 ) -> RolloutBatch:
     """Keep only training arrays and the summaries used by learner logging."""
     rollouts = [rollout for group in groups for rollout in group.rollouts]
@@ -403,6 +410,7 @@ def build_rollout_batch(
             "rollout/total_tokens_mean": float(training_batch.attention_mask.sum(axis=1).mean()),
             "batcher/token_utilization_fraction": float(training_batch.attention_mask.mean()),
             "batcher/padded_sequence_tokens": float(training_batch.attention_mask.shape[1]),
+            "batcher/skipped_groups": skipped_groups,
             "actor/rollout_seconds_mean": mean(rollout.rollout_seconds for rollout in rollouts),
         },
         stop_counts=Counter(rollout.stop_condition for rollout in rollouts),
@@ -800,7 +808,7 @@ class Batcher:
     def __init__(self, actor: ActorHandle, config: Config = DEFAULT_CONFIG) -> None:
         self.actor = actor
         self.config = config
-        self._pending_groups: list[asyncio.Task[RolloutGroup]] = []
+        self._pending_groups: list[asyncio.Task[CollectedGroup]] = []
 
     def prepare_batch(self, groups: list[RolloutGroup], context_length: int) -> GRPOBatch[np.ndarray]:
         """Flatten rollout groups in order and right-pad their transcripts into NumPy arrays.
@@ -850,8 +858,9 @@ class Batcher:
             batch.attention_mask[index, :length] = True  # (L,)
         return batch  # (B, T), (B,) leaves.
 
-    async def _collect_group(self, group_size: int) -> RolloutGroup:
+    async def _collect_group(self, group_size: int) -> CollectedGroup:
         """Fill one pool slot, replacing degenerate groups when configured."""
+        skipped_groups = 0
         while True:
             pending = self.actor.fetch_next_group.remote(group_size=group_size)
             try:
@@ -860,9 +869,10 @@ class Batcher:
                 ray.cancel(pending, recursive=True)
                 raise
             if not self.config.drop_degenerate_groups or not group.is_degenerate:
-                return group
+                return CollectedGroup(group=group, skipped_groups=skipped_groups)
+            skipped_groups += 1
 
-    async def _fetch_group(self, group_size: int, target_pending: int) -> RolloutGroup:
+    async def _fetch_group(self, group_size: int, target_pending: int) -> CollectedGroup:
         """Fill the pool to its target and consume the next group."""
         while len(self._pending_groups) < target_pending:
             # These tasks remain live between learner requests.
@@ -899,13 +909,14 @@ class Batcher:
         started = time.monotonic()
         prefetch_batches = min(self.config.prefetch_batches, (-iteration) % self.config.checkpoint_interval)
         try:
-            groups = [
+            collected = [
                 await self._fetch_group(
                     group_size=group_size,
                     target_pending=prefetch_batches * num_groups + remaining,
                 )
                 for remaining in range(num_groups, 0, -1)
             ]
+            groups = [item.group for item in collected]
             fetched = time.monotonic()
             with span("batcher.prepare_batch"):
                 training_batch = await asyncio.to_thread(
@@ -916,6 +927,7 @@ class Batcher:
                 groups=groups,
                 training_batch=training_batch,
                 include_examples=include_examples,
+                skipped_groups=sum(item.skipped_groups for item in collected),
                 timing_metrics={
                     "batcher/fetch_rollout_seconds": fetched - started,
                     "batcher/prepare_batch_seconds": prepared - fetched,
@@ -1067,10 +1079,12 @@ class Learner:
                     if publish:
                         scalars["learner/weight_transfer_seconds"] = now - optimized
                     logger.info(
-                        "iteration=%s reward=%.3f degenerate_group_fraction=%.3f batch=%.2fs loss=%.4f update=%.2fs%s",
+                        "iteration=%s reward=%.3f degenerate_group_fraction=%.3f skipped_groups=%d "
+                        "batch=%.2fs loss=%.4f update=%.2fs%s",
                         iteration,
                         scalars["rollout/reward_mean"],
                         scalars["rollout/degenerate_group_fraction"],
+                        scalars["batcher/skipped_groups"],
                         scalars["learner/batch_fetch_seconds"],
                         scalars["train/policy_loss"],
                         scalars["learner/update_seconds"],

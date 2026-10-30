@@ -1180,8 +1180,32 @@ def test_batch_refills_degenerate_groups(drop_degenerate_groups: bool, rollout: 
     )
     assert batch.examples == training.format_rollout_examples(expected_groups)
     assert batch.rollout_metrics["rollout/degenerate_group_fraction"] == (0.0 if drop_degenerate_groups else 1.0)
+    assert batch.rollout_metrics["batcher/skipped_groups"] == (2 if drop_degenerate_groups else 0)
     assert batch.num_output_tokens == 4
     assert batch.stop_counts == {"agent_completed": 4}
+
+
+def test_batch_skipped_groups_follow_prefetched_groups(rollout: training.Rollout) -> None:
+    retained = training.score_group(Mock(id="retained"), [rollout, replace(rollout, reward=0.0)])
+    skipped = training.score_group(Mock(id="skipped"), [rollout] * 2)
+    actor = Mock()
+    actor.fetch_next_group.remote = AsyncMock(side_effect=[retained, skipped, skipped, retained])
+    batcher = training.Batcher.__ray_metadata__.modified_class(
+        actor=actor,
+        config=training.Config(drop_degenerate_groups=True, prefetch_batches=1, checkpoint_interval=2),
+    )
+
+    async def collect() -> None:
+        async with asyncio.timeout(5):
+            first = await batcher.fetch_next_batch(num_groups=1, group_size=2, context_length=8)
+            await asyncio.sleep(0)
+            assert actor.fetch_next_group.remote.await_count == 4
+            assert first.rollout_metrics["batcher/skipped_groups"] == 0
+            second = await batcher.fetch_next_batch(num_groups=1, group_size=2, context_length=8, iteration=2)
+            assert second.rollout_metrics["batcher/skipped_groups"] == 2
+            assert not batcher._pending_groups
+
+    asyncio.run(collect())
 
 
 def test_batch_requires_groups() -> None:
@@ -1463,7 +1487,9 @@ def test_learner_logs_rollouts(
     prepared = Mock(spec=training.GRPOBatch)
     prepared.token_ids = Mock(shape=(4, 8))  # (B=4, T=8)
     prepared.attention_mask = np.tile([True, True, False, False, False, False, False, False], (4, 1))  # (B=4, T=8)
-    received = training.build_rollout_batch(groups=batch, training_batch=prepared, timing_metrics=timing_metrics)
+    received = training.build_rollout_batch(
+        groups=batch, training_batch=prepared, timing_metrics=timing_metrics, skipped_groups=3
+    )
     next_batch = training.build_rollout_batch(
         groups=[
             replace(group, rollouts=[replace(rollout, stop_condition="environment_done") for rollout in group.rollouts])
@@ -1571,6 +1597,7 @@ def test_learner_logs_rollouts(
         "rollout/total_tokens_mean": 2.0,
         "batcher/token_utilization_fraction": 0.25,
         "batcher/padded_sequence_tokens": 8.0,
+        "batcher/skipped_groups": 3,
         "train/iterations_total": 1,
         "train/updates_total": 1,
         "train/learning_rate": learner.config.learning_rate * 2,
@@ -1588,6 +1615,7 @@ def test_learner_logs_rollouts(
         assert calls[2].kwargs == {"step": 2}
         assert calls[2].args[0]["train/rollouts_total"] == 8
         assert calls[2].args[0]["rollout/degenerate_group_fraction"] == degenerate_fraction
+        assert calls[2].args[0]["batcher/skipped_groups"] == 0
         assert {key: value for key, value in calls[2].args[0].items() if "stop_fraction/" in key} == {
             "rollout/stop_fraction/agent_completed": 0.0,
             "rollout/stop_fraction/max_tokens": 0.0,
@@ -1599,7 +1627,7 @@ def test_learner_logs_rollouts(
     assert "Run ID: None; MLflow run: mlflow-run" in caplog.messages
     assert (
         f"iteration=1 reward={mean(rewards):.3f} degenerate_group_fraction={degenerate_fraction:.3f} "
-        "batch=1.00s "
+        "skipped_groups=3 batch=1.00s "
         "loss=-0.2500 update=1.00s weights=1.00s"
     ) in caplog.messages
     writer.__exit__.assert_called_once()
@@ -1631,7 +1659,11 @@ def test_learner_skips_publication_without_updates(
     learner.fetch_next_batch = Mock(
         return_value=training.RolloutBatch(
             training_batch=prepared,
-            rollout_metrics={"rollout/reward_mean": 0.0, "rollout/degenerate_group_fraction": 1.0},
+            rollout_metrics={
+                "rollout/reward_mean": 0.0,
+                "rollout/degenerate_group_fraction": 1.0,
+                "batcher/skipped_groups": 0,
+            },
             stop_counts={},
             num_output_tokens=4,
             examples="",
@@ -1680,7 +1712,11 @@ def test_learner_parameter_sync_cadence(learner: Any, monkeypatch: pytest.Monkey
     learner.fetch_next_batch = Mock(
         return_value=training.RolloutBatch(
             training_batch=prepared,
-            rollout_metrics={"rollout/reward_mean": 1.0, "rollout/degenerate_group_fraction": 0.0},
+            rollout_metrics={
+                "rollout/reward_mean": 1.0,
+                "rollout/degenerate_group_fraction": 0.0,
+                "batcher/skipped_groups": 0,
+            },
             stop_counts={},
             num_output_tokens=4,
             examples="",
@@ -1748,7 +1784,11 @@ def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.Monke
         prepared.token_ids = Mock(shape=(num_rollouts, 8))  # (B, T=8)
         return training.RolloutBatch(
             training_batch=prepared,
-            rollout_metrics={"rollout/reward_mean": 1.0, "rollout/degenerate_group_fraction": 0.0},
+            rollout_metrics={
+                "rollout/reward_mean": 1.0,
+                "rollout/degenerate_group_fraction": 0.0,
+                "batcher/skipped_groups": 0,
+            },
             stop_counts={"max_turns" if not saved else "agent_completed": num_rollouts},
             num_output_tokens=4,
             examples="",

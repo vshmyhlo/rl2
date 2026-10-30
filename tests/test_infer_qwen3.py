@@ -8,48 +8,13 @@ import pytest
 from rl2 import qwen3
 
 example = SimpleNamespace(**runpy.run_path(str(Path(__file__).parents[1] / "scripts" / "infer_qwen3.py")))
-CALL = '<tool_call>{"name": "multiply", "arguments": {"a": 17, "b": 23}}</tool_call>'
-
-
-def test_tool_responses() -> None:
-    assert example.tool_responses("<think>Ignore <tool_call>draft</tool_call></think>\nDone.") == ""
-    assert example.tool_responses(f"<think>Use the tool.</think>\n{CALL}\n{CALL}") == (
-        '<tool_response>\n{"result": 391}\n</tool_response>\n<tool_response>\n{"result": 391}\n</tool_response>'
-    )
-
-
-@pytest.mark.parametrize(
-    "completion,match",
-    [
-        ("<think>unfinished", "finish thinking"),
-        ("<tool_call>{", "Incomplete"),
-        ("</tool_call>", "Incomplete"),
-        ("<tool_call>invalid json</tool_call>", "Expecting value"),
-        ("<tool_call>[]</tool_call>", "Only the multiply"),
-        (CALL.replace('"multiply"', '"unknown"'), "Only the multiply"),
-        (CALL.replace('"a": 17, ', ""), "integer arguments"),
-        (CALL.replace('"a": 17', '"a": true'), "integer arguments"),
-        (CALL.replace('"a": 17', '"a": "17"'), "integer arguments"),
-    ],
-)
-def test_invalid_tool_responses(completion: str, match: str) -> None:
-    with pytest.raises(ValueError, match=match):
-        example.tool_responses(completion)
 
 
 @pytest.fixture
-def demo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
+def chat(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
     tokenizer = Mock()
     tokenizer.encode.return_value.ids = [1, 4]
-    tokenizer.decode.side_effect = [
-        f"<think>First calculation.</think>\n{CALL}",
-        "<think>Read first result.</think>\n391",
-        (
-            "<think>Follow-up calculation.</think>\n"
-            '<tool_call>{"name": "multiply", "arguments": {"a": 391, "b": 3}}</tool_call>'
-        ),
-        "<think>Read second result.</think>\n1173",
-    ]
+    tokenizer.decode.side_effect = ["<think>Consider the greeting.</think>\nHello!", "How can I help?"]
     model = SimpleNamespace(config=SimpleNamespace(eos_token_id=2))
     generate = Mock(return_value=[7, 2])
     load = Mock(return_value=(model, {}))
@@ -57,51 +22,62 @@ def demo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
     monkeypatch.setattr(qwen3, "load_qwen3_checkpoint", load)
     monkeypatch.setattr("tokenizers.Tokenizer", Mock(from_file=Mock(return_value=tokenizer)))
     monkeypatch.setattr(qwen3, "generate_tokens", generate)
-    monkeypatch.setattr("sys.argv", ["infer_qwen3", "--demo", "--seed", "7", "--max-new-tokens", "64"])
-    return SimpleNamespace(tokenizer=tokenizer, generate=generate, load=load)
+    monkeypatch.setattr("sys.argv", ["infer_qwen3", "--seed", str(2**32 - 1), "--max-new-tokens", "64"])
+    user_input = Mock(side_effect=["Hi", "   ", "Can you help?", "/exit"])
+    monkeypatch.setattr("builtins.input", user_input)
+    return SimpleNamespace(tokenizer=tokenizer, generate=generate, load=load, user_input=user_input)
 
 
-def run_demo() -> None:
+def run_chat() -> None:
     runpy.run_path(str(Path(__file__).parents[1] / "scripts" / "infer_qwen3.py"), run_name="__main__")
 
 
-def test_demo(demo: SimpleNamespace, capsys: pytest.CaptureFixture[str]) -> None:
-    run_demo()
-    demo.load.assert_called_once()
-    assert demo.load.call_args.kwargs == {"dtype": "bfloat16", "attention_backend": "tokamax"}
-    prompts = [call.args[0] for call in demo.tokenizer.encode.call_args_list]
-    assert len(prompts) == 4
-    assert all(prompt.endswith("<|im_start|>assistant\n") for prompt in prompts)
-    assert "<tools>" in prompts[0] and '"name": "multiply"' in prompts[0]
-    assert "<think>First calculation.</think>" in prompts[1]
-    assert '<|im_start|>user\n<tool_response>\n{"result": 391}\n</tool_response><|im_end|>' in prompts[1]
-    assert "First calculation." not in prompts[2] and "Read first result." not in prompts[2]
-    assert f"<|im_start|>assistant\n{CALL}<|im_end|>" in prompts[2]
-    assert "<|im_start|>assistant\n391<|im_end|>" in prompts[2]
-    assert "Now multiply that result by 3" in prompts[2]
-    assert "<think>Follow-up calculation.</think>" in prompts[3]
-    assert '{"result": 1173}' in prompts[3]
-    assert [call.kwargs["seed"] for call in demo.generate.call_args_list] == [7, 8, 9, 10]
-    assert all(call.kwargs["max_new_tokens"] == 64 for call in demo.generate.call_args_list)
+def test_interactive_chat(chat: SimpleNamespace, capsys: pytest.CaptureFixture[str]) -> None:
+    run_chat()
+    chat.load.assert_called_once()
+    assert chat.load.call_args.kwargs == {"dtype": "bfloat16", "attention_backend": "tokamax"}
+    prompts = [call.args[0] for call in chat.tokenizer.encode.call_args_list]
+    assert len(prompts) == 2
+    assert prompts[0] == (
+        f"<|im_start|>system\n{example.SYSTEM}<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+    )
+    assert "helpful" in example.SYSTEM and "<tools>" not in example.SYSTEM
+    assert prompts[1] == (
+        prompts[0] + "Hello!<|im_end|>\n<|im_start|>user\nCan you help?<|im_end|>\n<|im_start|>assistant\n"
+    )
+    assert [call.kwargs["seed"] for call in chat.generate.call_args_list] == [2**32 - 1, 0]
+    assert all(call.kwargs["max_new_tokens"] == 64 for call in chat.generate.call_args_list)
     output = capsys.readouterr().out
-    assert output.count("User: ") == 2 and output.count("Tool: ") == 2
-    assert "<think>Read second result.</think>\n1173" in output
+    assert "Assistant: <think>Consider the greeting.</think>\nHello!" in output
+    assert "Assistant: How can I help?" in output
+    assert "token limit" not in output
 
 
-def test_demo_truncation(demo: SimpleNamespace, capsys: pytest.CaptureFixture[str]) -> None:
-    demo.generate.return_value = [7]
-    with pytest.raises(RuntimeError, match="truncated"):
-        run_demo()
-    demo.generate.assert_called_once()
-    assert "Tool:" not in capsys.readouterr().out
+def test_chat_truncation_continues(chat: SimpleNamespace, capsys: pytest.CaptureFixture[str]) -> None:
+    chat.generate.side_effect = [[7], [7, 2]]
+    chat.tokenizer.decode.side_effect = ["<think>Unfinished reasoning", "Hello!"]
+    run_chat()
+    assert chat.generate.call_count == 2
+    second_prompt = chat.tokenizer.encode.call_args_list[1].args[0]
+    assert "Unfinished reasoning" not in second_prompt
+    assert "<|im_start|>user\nCan you help?<|im_end|>" in second_prompt
+    output = capsys.readouterr().out
+    assert output.count("token limit") == 1
+    assert "Assistant: Hello!" in output
 
 
-def test_demo_tool_round_limit(demo: SimpleNamespace) -> None:
-    demo.tokenizer.decode.side_effect = None
-    demo.tokenizer.decode.return_value = CALL
-    with pytest.raises(RuntimeError, match="four tool rounds"):
-        run_demo()
-    assert demo.generate.call_count == 5
+@pytest.mark.parametrize("stop", ["/exit", EOFError, KeyboardInterrupt], ids=["exit", "eof", "interrupt"])
+def test_chat_exit(chat: SimpleNamespace, stop: str | type[BaseException]) -> None:
+    chat.user_input.side_effect = [stop]
+    run_chat()
+    chat.generate.assert_not_called()
+
+
+def test_chat_interrupt_generation(chat: SimpleNamespace) -> None:
+    chat.generate.side_effect = KeyboardInterrupt
+    run_chat()
+    chat.generate.assert_called_once()
+    chat.tokenizer.decode.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -114,8 +90,8 @@ def test_demo_tool_round_limit(demo: SimpleNamespace) -> None:
         ["--attention-backend", "cudnn", "--dtype", "float32"],
     ],
 )
-def test_demo_invalid_arguments(demo: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, arguments: list[str]) -> None:
-    monkeypatch.setattr("sys.argv", ["infer_qwen3", "--demo", *arguments])
+def test_chat_invalid_arguments(chat: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, arguments: list[str]) -> None:
+    monkeypatch.setattr("sys.argv", ["infer_qwen3", *arguments])
     with pytest.raises(SystemExit, match="2"):
-        run_demo()
-    demo.load.assert_not_called()
+        run_chat()
+    chat.load.assert_not_called()

@@ -647,14 +647,14 @@ def test_capacity_validation(model: Qwen3LM, params: Parameters) -> None:
         model.apply({"params": params}, jnp.zeros((1, 0), jnp.int32))
 
 
-@pytest.mark.parametrize("backend,script", [(backend, backend == "xla") for backend in ATTENTION_BACKENDS])
+@pytest.mark.parametrize("backend,raw", [(backend, backend == "xla") for backend in ATTENTION_BACKENDS])
 def test_cli(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     model: Qwen3LM,
     capsys: pytest.CaptureFixture[str],
     backend: AttentionBackend,
-    script: bool,
+    raw: bool,
 ) -> None:
     tokenizer = Mock()
     tokenizer.encode.return_value.ids = [1, 4]
@@ -663,7 +663,7 @@ def test_cli(
     arguments = ["qwen3", "--prompt", "Hi"]
     if backend != "tokamax":
         arguments += ["--attention-backend", backend]
-    if script:
+    if raw:
         arguments += [
             "--raw",
             "--model",
@@ -689,24 +689,21 @@ def test_cli(
     monkeypatch.setattr("rl2.qwen3.load_qwen3_checkpoint", load)
     monkeypatch.setattr("rl2.qwen3.Tokenizer", Mock(from_file=Mock(return_value=tokenizer)))
     monkeypatch.setattr("rl2.qwen3.generate_tokens", generate)
-    if script:
-        runpy.run_path(str(Path(__file__).parents[1] / "scripts" / "infer_qwen3.py"), run_name="__main__")
-    else:
-        main()
-    directory.assert_called_once_with("local-model" if script else "Qwen/Qwen3-0.6B", "pinned" if script else None)
-    load.assert_called_once_with(str(tmp_path), dtype="float32" if script else "bfloat16", attention_backend=backend)
+    main()
+    directory.assert_called_once_with("local-model" if raw else "Qwen/Qwen3-0.6B", "pinned" if raw else None)
+    load.assert_called_once_with(str(tmp_path), dtype="float32" if raw else "bfloat16", attention_backend=backend)
     tokenizer.encode.assert_called_once_with(
-        "Hi" if script else "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        "Hi" if raw else "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
         add_special_tokens=False,
     )
     generate.assert_called_once_with(
         model,
         variables,
         [1, 4],
-        max_new_tokens=8 if script else 128,
-        temperature=0 if script else 0.7,
-        top_k=0 if script else 20,
-        seed=7 if script else 0,
+        max_new_tokens=8 if raw else 128,
+        temperature=0 if raw else 0.7,
+        top_k=0 if raw else 20,
+        seed=7 if raw else 0,
     )
     tokenizer.decode.assert_called_once_with([7, 2], skip_special_tokens=True)
     assert capsys.readouterr().out == "Hello\n"

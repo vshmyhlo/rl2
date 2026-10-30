@@ -358,14 +358,14 @@ def test_real_inference_script(checkpoint_source: Path) -> None:
             "--temperature",
             "0",
             "--max-new-tokens",
-            "8",
-            "--prompt",
-            "What is the capital of France? Answer in one word.",
+            "32",
         ],
         env={**os.environ, "JAX_PLATFORMS": "cuda", "XLA_PYTHON_CLIENT_PREALLOCATE": "false"},
+        input="What is the capital of France? Answer in one word. /no_think\n/exit\n",
         capture_output=True,
         text=True,
         check=True,
         timeout=180,
     )
-    assert result.stdout == "Paris\n"  # Same completion as PyTorch generate, stopping at EOS.
+    assert "Assistant:" in result.stdout and "Paris" in result.stdout
+    assert "token limit" not in result.stdout
