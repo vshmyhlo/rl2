@@ -16,6 +16,23 @@ from pydantic import BaseModel, ConfigDict
 from rl2.sandbox.gvisor import PythonResult
 
 
+class PythonExecutionError(RuntimeError):
+    """The interpreter or its protocol failed; the sandbox has been closed."""
+
+
+class PythonExecutionTimeout(PythonExecutionError, TimeoutError):
+    """The execution deadline expired; the sandbox has been closed."""
+
+
+def validate_python_code(code: str) -> None:
+    try:
+        size = len(code.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise ValueError("code must contain valid UTF-8 text") from error
+    if size > 16384 or "\0" in code:
+        raise ValueError("code must be at most 16384 UTF-8 bytes and contain no NUL characters")
+
+
 class _Response(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     id: int
@@ -52,8 +69,9 @@ class PythonSession:
 
     Requires kubectl credentials in the trusted caller and a RuntimeClass backed
     by runsc with network=none. Startup, calls, and cleanup have separate deadlines.
-    Exceptions in submitted Python return exit_code=1; transport failures, timeout,
-    or cancellation close the session. Concurrent calls are serialized.
+    Exceptions in submitted Python return exit_code=1. Execution failures raise
+    PythonExecutionError after closing the session; cancellation also closes it.
+    Concurrent calls are serialized. Startup and cleanup errors propagate unchanged.
     """
 
     def __init__(
@@ -207,8 +225,7 @@ class PythonSession:
         A call timeout starts after acquiring the session's execution lock.
         Ordinary Python exceptions preserve state, including assignments before the error.
         """
-        if len(code.encode()) > 16384 or "\0" in code:
-            raise ValueError("code must be at most 16384 UTF-8 bytes and contain no NUL characters")
+        validate_python_code(code)
         deadline = self.execution_timeout if timeout is None else timeout
         if not 0 < deadline <= 3600:
             raise ValueError("timeout must be in (0, 3600] seconds")
@@ -224,15 +241,19 @@ class PythonSession:
                     await self._process.stdin.drain()
                     line = await self._process.stdout.readline()
                     if not line:
-                        raise RuntimeError("Python sandbox exited without a response")
+                        raise PythonExecutionError("Python sandbox exited without a response")
                     response = _Response.model_validate_json(line)
                     if response.id != self._request_id or len(response.output.encode()) > self.max_output_bytes * 3:
-                        raise RuntimeError("Invalid Python sandbox response")
+                        raise PythonExecutionError("Invalid Python sandbox response")
                     return PythonResult(
                         output=response.output, exit_code=response.exit_code, output_truncated=response.output_truncated
                     )
-            except BaseException:
+            except BaseException as error:
                 await self._close()
+                if isinstance(error, TimeoutError):
+                    raise PythonExecutionTimeout("Python execution timed out") from error
+                if isinstance(error, (ValueError, ConnectionError)):
+                    raise PythonExecutionError("Python sandbox connection or response failed") from error
                 raise
 
     async def _cleanup(self) -> None:

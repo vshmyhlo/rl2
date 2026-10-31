@@ -20,6 +20,10 @@ state; successful calls return zero. Timeout, cancellation of an executing call,
 process exit, or invalid protocol closes the session. Calls are serialized;
 their execution deadline starts after acquiring the session lock. `aclose()` is
 also available and is idempotent.
+Execution failures raise `PythonExecutionError`; execution deadlines raise its
+subclass `PythonExecutionTimeout` (also a `TimeoutError`). Startup, cleanup,
+and cancellation errors propagate separately so callers cannot mistake failed
+pod deletion for a normal execution failure.
 
 ## Prerequisites
 

@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from rl2.grpo_v2 import reasoning_gym as env
 from rl2.sandbox.gvisor import PythonResult
+from rl2.sandbox.kubernetes import PythonExecutionTimeout
 
 
 def test_task_stream_is_lazy(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -164,6 +165,7 @@ def test_composite_cannot_override_sampling(settings: dict[str, object]) -> None
         ("python", {"code": 42}),
         ("python", {"code": "é" * 8193}),
         ("python", {"code": "\0"}),
+        ("python", {"code": "\ud800"}),
     ],
     ids=[
         "unknown",
@@ -178,6 +180,7 @@ def test_composite_cannot_override_sampling(settings: dict[str, object]) -> None
         "code-type",
         "code-byte-limit",
         "code-nul",
+        "code-utf8",
     ],
 )
 def test_invalid_tool_call_does_not_reach_worker(name: str, arguments: dict[str, object]) -> None:
@@ -309,7 +312,9 @@ def test_python_tool_reuses_sandbox_and_reset_isolates_episodes(monkeypatch: pyt
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("mode", ["failure", "timeout", "cancel", "startup_failure"])
+@pytest.mark.parametrize(
+    "mode", ["failure", "timeout", "cancel", "startup_failure", "execution_failure", "execution_timeout"]
+)
 def test_python_tool_cleanup_on_error(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
     actor = Mock()
     actor.reset.remote = AsyncMock(return_value=env.ResetResult(tools=[], system_prompt="", prompt="question"))
@@ -331,13 +336,20 @@ def test_python_tool_cleanup_on_error(mode: str, monkeypatch: pytest.MonkeyPatch
             "failure": ValueError("invalid sandbox response"),
             "timeout": pending,
             "cancel": asyncio.CancelledError,
+            "execution_failure": env.PythonExecutionError("sandbox exited"),
+            "execution_timeout": PythonExecutionTimeout("Python execution timed out"),
         }[mode]
 
     async def run() -> None:
         task = env.ReasoningGymTask(config=env.ReasoningGymConfig(), seed=1)
         async with task.init_env() as session:
             await session.reset()
-            await session.step(env.ToolCall(name="python", arguments={"code": "print(42)"}), timeout=0.01)
+            action = env.ToolCall(name="python", arguments={"code": "print(42)"})
+            result = await session.step(action, timeout=0.01)
+            assert result.done and result.reward == 0
+            assert "error" in json.loads(result.observation)
+            with pytest.raises(RuntimeError, match="Reset"):
+                await session.step(action)
 
     errors = {
         "failure": ValueError,
@@ -345,9 +357,12 @@ def test_python_tool_cleanup_on_error(mode: str, monkeypatch: pytest.MonkeyPatch
         "cancel": asyncio.CancelledError,
         "startup_failure": RuntimeError,
     }
-    with pytest.raises(errors[mode]) as error:
+    if mode in {"execution_failure", "execution_timeout"}:
         asyncio.run(run())
-    assert not isinstance(error.value, env.ToolCallError)
+    else:
+        with pytest.raises(errors[mode]) as error:
+            asyncio.run(run())
+        assert not isinstance(error.value, env.ToolCallError)
     if mode == "startup_failure":
         sandbox.__aexit__.assert_not_awaited()  # PythonSession cleans up its own failed startup.
     else:

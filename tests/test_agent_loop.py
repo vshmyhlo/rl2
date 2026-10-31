@@ -116,7 +116,7 @@ def make_agent(tokenizer: PreTrainedTokenizerFast, client: AsyncOpenAI) -> loop.
     )
 
 
-@pytest.mark.parametrize("mode", ["submitted", "calculator", "python", "plain_text", "truncated"])
+@pytest.mark.parametrize("mode", ["submitted", "calculator", "python", "python_failure", "plain_text", "truncated"])
 def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch) -> None:
     task = reasoning_gym.ReasoningGymTask(config=reasoning_gym.ReasoningGymConfig(), seed=1)
     worker = reasoning_gym.ReasoningGymWorker.__ray_metadata__.modified_class(task=task)
@@ -129,6 +129,8 @@ def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, mo
     sandbox = AsyncMock(spec=reasoning_gym.PythonSession)
     sandbox.__aenter__.return_value = sandbox
     sandbox.execute.return_value = PythonResult(output=f"{answer}\n", exit_code=0, output_truncated=False)
+    if mode == "python_failure":
+        sandbox.execute.side_effect = reasoning_gym.PythonExecutionError("sandbox exited")
     python_constructor = Mock(return_value=sandbox)
     monkeypatch.setattr(reasoning_gym, "PythonSession", python_constructor)
     submission = ToolCall(name="submit_answer", arguments={"answer": answer})
@@ -138,9 +140,11 @@ def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, mo
     replies = [text]
     if mode == "calculator":
         replies.insert(0, f"<think>calculate</think><tool_call>{calculation.model_dump_json()}</tool_call><|im_end|>")
-    elif mode == "python":
+    elif mode in {"python", "python_failure"}:
         code = ToolCall(name="python", arguments={"code": f"print({answer})"})
         replies.insert(0, f"<think>compute</think><tool_call>{code.model_dump_json()}</tool_call><|im_end|>")
+        if mode == "python_failure":
+            replies.pop()
     requests: list[dict[str, Any]] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -165,6 +169,7 @@ def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, mo
             "submitted": "environment_done",
             "calculator": "environment_done",
             "python": "environment_done",
+            "python_failure": "environment_done",
             "plain_text": "agent_completed",
             "truncated": "context_length",
         }[mode]
@@ -182,7 +187,10 @@ def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, mo
         assert f"<tool_response>\n{output}\n</tool_response>" in tokenizer.decode(requests[1]["prompt"])
     else:
         actor.step.remote.assert_not_called()
-    if mode != "python":
+    if mode == "python_failure":
+        sandbox.execute.assert_awaited_once()
+        sandbox.__aexit__.assert_awaited_once()
+    if mode not in {"python", "python_failure"}:
         python_constructor.assert_not_called()
     sequence = rollout.sequence
     assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape

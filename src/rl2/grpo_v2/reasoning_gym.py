@@ -20,7 +20,7 @@ from reasoning_gym.dataset import ProceduralDataset
 
 from rl2.agent_task import Environment, ResetResult, StepResult, Task, ToolCall, ToolCallError, ToolSchema
 from rl2.calculator import calculate
-from rl2.sandbox.kubernetes import PythonSession
+from rl2.sandbox.kubernetes import PythonExecutionError, PythonSession, validate_python_code
 
 
 @config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -117,9 +117,10 @@ def validate_tool_call(call: ToolCall) -> None:
     except ValidationError as error:
         raise ToolCallError(str(error)) from error
     if call.name == "python":
-        code = call.arguments["code"]
-        if len(code.encode()) > 16384 or "\0" in code:
-            raise ToolCallError("code must be at most 16384 UTF-8 bytes and contain no NUL characters")
+        try:
+            validate_python_code(call.arguments["code"])
+        except ValueError as error:
+            raise ToolCallError(str(error)) from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,7 +215,11 @@ class ReasoningGymSession(Environment):
                     self._python = await self._resources.enter_async_context(
                         PythonSession(namespace=self.config.python_namespace, kubectl=self.config.python_kubectl)
                     )
-                result = await self._python.execute(action.arguments["code"])
+                try:
+                    result = await self._python.execute(action.arguments["code"])
+                except PythonExecutionError as error:
+                    self._done = True
+                    return StepResult(observation=json.dumps({"error": str(error)}), reward=0.0, done=True)
                 return StepResult(observation=json.dumps(asdict(result)), reward=0.0, done=False)
             step = await self.actor.step.remote(action)
             self._done = step.done

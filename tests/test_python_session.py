@@ -99,6 +99,25 @@ def test_output_capture_and_limit_reset(commands: AsyncMock) -> None:
     asyncio.run(run())
 
 
+def test_user_namespace_is_main_module(commands: AsyncMock) -> None:
+    async def run() -> None:
+        async with sandbox.PythonSession() as session:
+            result = await session.execute(
+                "import pickle\n"
+                "from dataclasses import dataclass\n"
+                "@dataclass\n"
+                "class Point:\n"
+                "    x: int\n"
+                "print(pickle.loads(pickle.dumps(Point(42))).x)"
+            )
+            assert result.exit_code == 0, result.output
+            assert result.output == "42\n"
+            result = await session.execute("import __main__; print(__main__.Point is Point)")
+            assert result.output == "True\n"
+
+    asyncio.run(run())
+
+
 def test_concurrent_calls_are_serialized(commands: AsyncMock) -> None:
     async def run() -> None:
         async with sandbox.PythonSession() as session:
@@ -124,10 +143,10 @@ def test_interrupted_execution_closes_session(mode: str, commands: AsyncMock) ->
                     with pytest.raises(asyncio.CancelledError):
                         await task
             elif mode == "timeout":
-                with pytest.raises(TimeoutError):
+                with pytest.raises(sandbox.PythonExecutionTimeout):
                     await session.execute("while True: pass", timeout=0.02)
             else:
-                with pytest.raises(RuntimeError, match="exited without a response"):
+                with pytest.raises(sandbox.PythonExecutionError, match="exited without a response"):
                     await session.execute("import os; os._exit(0)")
             with pytest.raises(RuntimeError, match="not active"):
                 await session.execute("print(42)")
@@ -142,6 +161,8 @@ def test_invalid_code_does_not_break_session(commands: AsyncMock) -> None:
             for code in ("é" * 8193, "\0"):
                 with pytest.raises(ValueError, match="16384"):
                     await session.execute(code)
+            with pytest.raises(ValueError, match="UTF-8"):
+                await session.execute("\ud800")
             with pytest.raises(ValueError, match="timeout"):
                 await session.execute("pass", timeout=0)
             assert (await session.execute("#" + "x" * 16383)).exit_code == 0
@@ -162,7 +183,8 @@ def test_startup_failure_attempts_cleanup(operation: str, commands: AsyncMock) -
     assert commands.call_args.args[0] == "delete"
 
 
-def test_cleanup_failure_is_reported(commands: AsyncMock) -> None:
+@pytest.mark.parametrize("during_execution", [False, True], ids=["normal-exit", "execution-timeout"])
+def test_cleanup_failure_is_reported(during_execution: bool, commands: AsyncMock) -> None:
     async def command(*arguments: str, payload: bytes = b"") -> None:
         if arguments[0] == "delete":
             raise RuntimeError("delete failed")
@@ -170,9 +192,13 @@ def test_cleanup_failure_is_reported(commands: AsyncMock) -> None:
     commands.side_effect = command
 
     async def run() -> None:
-        with pytest.raises(RuntimeError, match="delete failed"):
+        with pytest.raises(RuntimeError, match="delete failed") as error:
             async with sandbox.PythonSession() as session:
-                assert (await session.execute("pass")).exit_code == 0
+                if during_execution:
+                    await session.execute("while True: pass", timeout=0.02)
+                else:
+                    assert (await session.execute("pass")).exit_code == 0
+        assert not isinstance(error.value, sandbox.PythonExecutionError)
 
     asyncio.run(run())
 
@@ -265,7 +291,7 @@ def test_corrupt_protocol_closes_session(response: bytes, commands: AsyncMock, m
             reader = session._process.stdout
             original = reader.readline
             monkeypatch.setattr(reader, "readline", AsyncMock(return_value=response))
-            with pytest.raises((ValueError, RuntimeError)):
+            with pytest.raises(sandbox.PythonExecutionError):
                 await session.execute("pass")
             monkeypatch.setattr(reader, "readline", original)
             with pytest.raises(RuntimeError, match="not active"):
@@ -274,21 +300,54 @@ def test_corrupt_protocol_closes_session(response: bytes, commands: AsyncMock, m
     asyncio.run(run())
 
 
+def test_disconnected_writer_closes_session(commands: AsyncMock, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        async with sandbox.PythonSession() as session:
+            assert session._process is not None and session._process.stdin is not None
+            monkeypatch.setattr(session._process.stdin, "drain", AsyncMock(side_effect=ConnectionResetError))
+            with pytest.raises(sandbox.PythonExecutionError, match="connection or response"):
+                await session.execute("pass")
+            with pytest.raises(RuntimeError, match="not active"):
+                await session.execute("pass")
+
+    asyncio.run(run())
+    assert [call.args[0] for call in commands.call_args_list].count("delete") == 1
+
+
 @pytest.mark.skipif(
     os.environ.get("RL2_TEST_K3S_SANDBOX") != "1", reason="requires offline runsc RuntimeClass and sandbox namespace"
 )
-def test_live_k3s_session() -> None:
+@pytest.mark.parametrize("ending", ["timeout", "exit"])
+def test_live_k3s_session(ending: str) -> None:
     async def run() -> None:
         async with sandbox.PythonSession(kubectl=("sudo", "-n", "k3s", "kubectl")) as session:
             assert (await session.execute("value = 40")).exit_code == 0
             assert (await session.execute("print(value + 2)")).output == "42\n"
             result = await session.execute(
-                "import os, socket\n"
+                "import errno, os, resource, socket\n"
                 "assert os.getuid() == 65534\n"
                 "assert all(name == 'lo' for _, name in socket.if_nameindex())\n"
                 "assert not os.path.exists('/var/run/secrets/kubernetes.io/serviceaccount/token')\n"
-                "open('/tmp/example', 'w').write('temporary')"
+                "assert resource.getrlimit(resource.RLIMIT_NPROC) == (32, 32)\n"
+                "assert resource.getrlimit(resource.RLIMIT_NOFILE) == (64, 64)\n"
+                "try:\n"
+                "    open('/rl2-write-probe', 'w').close()\n"
+                "except OSError as error:\n"
+                "    assert error.errno in (errno.EROFS, errno.EACCES)\n"
+                "else:\n"
+                "    raise AssertionError('root filesystem is writable')\n"
+                "with socket.socket() as connection:\n"
+                "    connection.settimeout(0.2)\n"
+                "    assert connection.connect_ex(('192.0.2.1', 9)) != 0\n"
+                "with open('/tmp/example', 'w') as output:\n"
+                "    output.write('temporary')"
             )
             assert result.exit_code == 0, result.output
+            if ending == "timeout":
+                with pytest.raises(sandbox.PythonExecutionTimeout):
+                    await session.execute("while True: pass", timeout=0.2)
+            else:
+                with pytest.raises(sandbox.PythonExecutionError, match="exited without a response"):
+                    await session.execute("os._exit(0)")
 
     asyncio.run(run())

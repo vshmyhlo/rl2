@@ -86,7 +86,9 @@ output. Observations are JSON with `output` (stdout/stderr), `exit_code`, and
 `output_truncated`. Python exceptions return exit code 1 with zero reward and preserve
 state. Successful calls also receive zero reward. Each execution has a 5-second limit;
 startup has a separate 90-second limit, and the environment/rollout deadlines still apply.
-Timeouts or transport failures stop the rollout. Reset and rollout exit delete the sandbox,
+Execution timeouts, interpreter exit, or invalid responses end that rollout with zero
+reward; startup and cleanup failures still propagate as infrastructure errors.
+Reset and rollout exit delete the sandbox,
 including when generation ends without submitting an answer.
 
 Python requires the [sandbox prerequisites](sandbox/README.md#prerequisites), including

@@ -10,7 +10,8 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import Thread
-from typing import Any, BinaryIO
+from types import ModuleType
+from typing import BinaryIO
 
 
 @dataclass
@@ -56,7 +57,9 @@ def main() -> None:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
     resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
-    namespace: dict[str, Any] = {"__name__": "__main__"}
+    module = ModuleType("__main__")
+    sys.modules["__main__"] = module
+    namespace = module.__dict__
     with os.fdopen(os.dup(0), "r") as requests, open(os.devnull, "rb") as null:
         os.dup2(null.fileno(), 0)
         print(json.dumps({"ready": True}), flush=True)
