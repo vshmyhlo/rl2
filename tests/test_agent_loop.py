@@ -115,7 +115,7 @@ def make_agent(tokenizer: PreTrainedTokenizerFast, client: AsyncOpenAI) -> loop.
     )
 
 
-@pytest.mark.parametrize("mode", ["submitted", "plain_text", "truncated"])
+@pytest.mark.parametrize("mode", ["submitted", "calculator", "plain_text", "truncated"])
 def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch) -> None:
     task = reasoning_gym.ReasoningGymTask(config=reasoning_gym.ReasoningGymConfig(), seed=1)
     worker = reasoning_gym.ReasoningGymWorker.__ray_metadata__.modified_class(task=task)
@@ -125,32 +125,50 @@ def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, mo
     actor.step.remote = AsyncMock(side_effect=worker.step)
     monkeypatch.setattr(reasoning_gym.ReasoningGymWorker, "remote", Mock(return_value=actor))
     monkeypatch.setattr(reasoning_gym.ray, "kill", Mock())
-    call = json.dumps({"name": "submit_answer", "arguments": {"answer": answer}})
+    submission = ToolCall(name="submit_answer", arguments={"answer": answer})
+    call = submission.model_dump_json()
     text = answer if mode == "plain_text" else f"<think>solve</think><tool_call>{call}</tool_call><|im_end|>"
+    calculation = ToolCall(name="calculator", arguments={"expression": f"{answer} + 0"})
+    replies = [text]
+    if mode == "calculator":
+        replies.insert(0, f"<think>calculate</think><tool_call>{calculation.model_dump_json()}</tool_call><|im_end|>")
+    requests: list[dict[str, Any]] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
         return httpx.Response(
-            200, json=response_for(tokenizer, text, finish_reason="length" if mode == "truncated" else "stop")
+            200,
+            json=response_for(
+                tokenizer, replies[len(requests) - 1], finish_reason="length" if mode == "truncated" else "stop"
+            ),
         )
 
     async def run() -> loop.Rollout:
         async with make_client(respond) as client, task.init_env() as session:
-            return await replace(make_agent(tokenizer, client), max_turns=1).run(env=session)
+            return await replace(make_agent(tokenizer, client), max_turns=len(replies)).run(env=session)
 
     rollout = asyncio.run(run())
-    assert rollout.num_turns == 1
-    assert rollout.reward == (1.0 if mode == "submitted" else 0.0)
+    assert rollout.num_turns == len(replies)
+    assert rollout.reward == (1.0 if mode in {"submitted", "calculator"} else 0.0)
     assert (
         rollout.stop_condition
-        == {"submitted": "environment_done", "plain_text": "agent_completed", "truncated": "context_length"}[mode]
+        == {
+            "submitted": "environment_done",
+            "calculator": "environment_done",
+            "plain_text": "agent_completed",
+            "truncated": "context_length",
+        }[mode]
     )
     if mode == "submitted":
-        actor.step.remote.assert_awaited_once_with(answer)
+        actor.step.remote.assert_awaited_once_with(submission)
+    elif mode == "calculator":
+        assert [call.args[0] for call in actor.step.remote.await_args_list] == [calculation, submission]
+        assert f"<tool_response>\n{answer}\n</tool_response>" in tokenizer.decode(requests[1]["prompt"])
     else:
         actor.step.remote.assert_not_called()
     sequence = rollout.sequence
     assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
-    assert sequence.loss_mask.sum() == len(tokenizer.encode(text, add_special_tokens=False))
+    assert sequence.loss_mask.sum() == sum(len(tokenizer.encode(reply, add_special_tokens=False)) for reply in replies)
 
 
 def test_multiturn_exact_training_sequence(

@@ -12,7 +12,7 @@ lora_alpha: 32
 attention_backend: tokamax
 scan_layers: true
 gradient_checkpointing: true
-padding_multiple: 512
+padding_multiple: 1024
 tasksets:
   alfworld:
     weight: 1.0
@@ -62,11 +62,71 @@ tasksets:
         max_decimals: 0
         min_value: 0
         max_value: 20
+  gcd:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: gcd
+      task_config:
+        min_numbers: 2
+        max_numbers: 2
+        min_value: 2
+        max_value: 30
+  lcm:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: lcm
+      task_config:
+        min_numbers: 2
+        max_numbers: 2
+        min_value: 2
+        max_value: 12
+  count_primes:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: count_primes
+      task_config:
+        min_n: 1
+        max_n: 30
+  number_filtering:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: number_filtering
+      task_config:
+        min_numbers: 3
+        max_numbers: 5
+        min_decimals: 0
+        max_decimals: 0
+        min_value: 0
+        max_value: 20
+  word_sorting:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: word_sorting
+      task_config:
+        min_words: 3
+        max_words: 5
+        min_word_length: 3
+        max_word_length: 6
+  caesar_cipher:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: caesar_cipher
+      task_config:
+        min_words: 3
+        max_words: 5
+        min_rotation: 1
+        max_rotation: 3
 seed: 1
 
 num_groups: 4 # verl data.train_batch_size (task groups).
 group_size: 8 # verl rollout.n; 128 rollouts per batch.
-grad_accum_steps: 16 # 2 per update
+grad_accum_steps: 32 # 2 per update
 
 update_epochs: 1
 minibatches_per_epoch: 1 # One optimizer update per epoch, using all 128 rollouts.

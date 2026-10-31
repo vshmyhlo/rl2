@@ -60,22 +60,58 @@ def test_real_dataset_rewards_and_independent_episodes() -> None:
     worker_class = env.ReasoningGymWorker.__ray_metadata__.modified_class
     first = worker_class(task=task)
     second = worker_class(task=task)
+    submission = env.ToolCall(name="submit_answer", arguments={"answer": entry["answer"]})
     with pytest.raises(RuntimeError, match="Reset"):
-        first.step(entry["answer"])
+        first.step(submission)
     initial = first.reset()
     assert initial == second.reset()
     assert initial.prompt == entry["question"]
     assert initial.tools == env.tool_schemas()
     assert "submit_answer" in initial.system_prompt
-    assert first.step(entry["answer"]) == env.StepResult(observation="Answer submitted.", reward=1.0, done=True)
-    assert second.step("wrong") == env.StepResult(observation="Answer submitted.", reward=0.0, done=True)
+    assert first.step(submission) == env.StepResult(observation="Answer submitted.", reward=1.0, done=True)
+    assert second.step(env.ToolCall(name="submit_answer", arguments={"answer": "wrong"})) == env.StepResult(
+        observation="Answer submitted.", reward=0.0, done=True
+    )
     with pytest.raises(RuntimeError, match="Reset"):
-        first.step(entry["answer"])
+        first.step(submission)
     assert first.reset() == initial
     answer = f"The answer is {entry['answer']}"
-    result = first.step(answer)
+    result = first.step(env.ToolCall(name="submit_answer", arguments={"answer": answer}))
     assert result.done and 0 < result.reward < 1
     assert result.reward == dataset.score_answer(answer=answer, entry=entry)
+
+
+def test_calculator_feedback_and_episode_lifecycle() -> None:
+    task = env.ReasoningGymTask(config=env.ReasoningGymConfig(), seed=1)
+    worker = env.ReasoningGymWorker.__ray_metadata__.modified_class(task=task)
+    calculation = env.ToolCall(name="calculator", arguments={"expression": "12 * (3 + 4)"})
+    with pytest.raises(RuntimeError, match="Reset"):
+        worker.step(calculation)
+    initial = worker.reset()
+    schemas = {tool["function"]["name"]: tool["function"] for tool in initial.tools}
+    assert set(schemas) == {"calculator", "submit_answer"}
+    assert schemas["calculator"]["parameters"] == {
+        "type": "object",
+        "properties": {"expression": {"type": "string", "description": "Arithmetic expression to evaluate."}},
+        "required": ["expression"],
+        "additionalProperties": False,
+    }
+    assert "calculator" in initial.system_prompt
+    scorer = Mock(wraps=worker.dataset.score_answer)
+    worker.dataset.score_answer = scorer
+    for expression in ("1 / 0", "__import__('os').getcwd()"):
+        result = worker.step(env.ToolCall(name="calculator", arguments={"expression": expression}))
+        assert result.observation.startswith("Error:")
+        assert result.reward == 0.0 and not result.done
+    assert worker.step(calculation) == env.StepResult(observation="84", reward=0.0, done=False)
+    scorer.assert_not_called()
+    submission = env.ToolCall(name="submit_answer", arguments={"answer": worker.entry["answer"]})
+    assert worker.step(submission) == env.StepResult(observation="Answer submitted.", reward=1.0, done=True)
+    scorer.assert_called_once_with(answer=submission.arguments["answer"], entry=worker.entry)
+    with pytest.raises(RuntimeError, match="Reset"):
+        worker.step(calculation)
+    worker.reset()
+    assert worker.step(calculation).observation == "84"
 
 
 def test_composite_dataset_native_scoring() -> None:
@@ -88,8 +124,18 @@ def test_composite_dataset_native_scoring() -> None:
     entry = dataset[0]
     worker = env.ReasoningGymWorker.__ray_metadata__.modified_class(task=task)
     assert worker.reset().prompt == entry["question"]
-    assert worker.step(entry["answer"]).reward == 1.0
+    assert worker.step(env.ToolCall(name="submit_answer", arguments={"answer": entry["answer"]})).reward == 1.0
     assert isinstance(config.task_config["datasets"][0], dict)
+
+
+@pytest.mark.parametrize("settings", [{"seed": None}, {"size": 10}], ids=["random-seed", "size"])
+def test_composite_cannot_override_sampling(settings: dict[str, object]) -> None:
+    config = env.ReasoningGymConfig(
+        task="composite",
+        task_config={"datasets": [{"name": "leg_counting", "weight": 1, "config": settings}]},
+    )
+    with pytest.raises(ValueError, match="cannot override seed or size"):
+        env.create_dataset(config, seed=1)
 
 
 @pytest.mark.parametrize(
@@ -99,10 +145,21 @@ def test_composite_dataset_native_scoring() -> None:
         ("submit_answer", {}),
         ("submit_answer", {"answer": "42", "extra": True}),
         ("submit_answer", {"answer": 42}),
+        ("calculator", {}),
+        ("calculator", {"expression": "1 + 1", "answer": "2"}),
+        ("calculator", {"expression": 42}),
     ],
-    ids=["unknown", "missing-argument", "extra-argument", "argument-type"],
+    ids=[
+        "unknown",
+        "missing-answer",
+        "extra-answer",
+        "answer-type",
+        "missing-expression",
+        "extra-expression",
+        "expression-type",
+    ],
 )
-def test_invalid_submission_does_not_reach_worker(name: str, arguments: dict[str, object]) -> None:
+def test_invalid_tool_call_does_not_reach_worker(name: str, arguments: dict[str, object]) -> None:
     actor = Mock()
     session = env.ReasoningGymSession(actor=actor)
     with pytest.raises(env.ToolCallError):
@@ -124,7 +181,7 @@ def test_session_worker_cleanup(mode: str, monkeypatch: pytest.MonkeyPatch) -> N
     elif mode == "cancel":
         actor.step.remote.side_effect = asyncio.CancelledError
 
-    async def pending(*answers: str) -> None:
+    async def pending(*actions: env.ToolCall) -> None:
         await asyncio.Future()
 
     if mode == "reset_timeout":
@@ -152,7 +209,7 @@ def test_session_worker_cleanup(mode: str, monkeypatch: pytest.MonkeyPatch) -> N
     }
     if mode == "normal":
         asyncio.run(run())
-        actor.step.remote.assert_awaited_once_with("42")
+        actor.step.remote.assert_awaited_once_with(env.ToolCall(name="submit_answer", arguments={"answer": "42"}))
     else:
         with pytest.raises(errors[mode]):
             asyncio.run(run())

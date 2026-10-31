@@ -63,7 +63,7 @@ difficulty parameters. Each group samples a 32-bit dataset seed and generates on
 Every attempt in a group receives the same question. The top-level `seed`
 determines the stream, and the checkpointed task RNG restores its continuation.
 Repeated puzzles are possible. There is no `taskset.size`; `task_config` cannot
-override `seed` or `size`.
+override `seed` or `size`, including in composite child configs.
 Reasoning Gym also supports internal mixtures: use `task: composite` and put a list of
 `{name: leg_counting, weight: 1, config: {}}` entries in `task_config.datasets`.
 
@@ -76,13 +76,17 @@ continuation; keep taskset identifiers, weights, settings, and finite catalogs
 unchanged when resuming. Sampling orders entries by identifier, so YAML key order
 does not affect the sequence. A single active taskset preserves its original sampling sequence.
 
+For Reasoning Gym, the model may call `calculator(expression=...)` before submitting.
+It accepts numbers, parentheses, and `+ - * / // % **`, using the bounded evaluator
+in `calculator.py`. Results and arithmetic errors return as observations with zero
+reward and leave the episode active. Calculator calls use the existing rollout budgets.
 The model calls `submit_answer(answer=...)` with a string in the question's
 requested format. One valid submission ends the episode and receives the
 dataset's native `score_answer` reward, including partial credit. Plain text
 without a tool call and truncated responses receive zero reward. The preset
-shares ALFWorld's task budgets, including up to 50 turns for recovery from malformed calls,
+shares ALFWorld's task budgets, including up to 50 turns for calculator use and recovery from malformed calls,
 but retains Tokamax and one prefetched batch. Each
-rollout owns a Ray worker for CPU-bound generation and scoring; timeouts and
+rollout owns a Ray worker for CPU-bound generation, calculation, and scoring; timeouts and
 cancellation terminate it. Keep task settings and seed unchanged when resuming.
 
 Ray reserves one GPU for the actor's vLLM server and `learner_gpus` GPUs for the

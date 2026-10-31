@@ -18,6 +18,7 @@ from reasoning_gym.composite import DatasetSpec
 from reasoning_gym.dataset import ProceduralDataset
 
 from rl2.agent_task import Environment, ResetResult, StepResult, Task, ToolCall, ToolCallError, ToolSchema
+from rl2.calculator import calculate
 
 
 @config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -34,12 +35,35 @@ class ReasoningGymConfig:
 def create_dataset(config: ReasoningGymConfig, seed: int) -> ProceduralDataset:
     settings = dict(config.task_config)
     if config.task == "composite" and "datasets" in settings:
-        settings["datasets"] = TypeAdapter(list[DatasetSpec]).validate_python(settings["datasets"])
+        datasets = TypeAdapter(list[DatasetSpec]).validate_python(settings["datasets"])
+        for dataset in datasets:
+            if {"seed", "size"} & dataset.config.keys():
+                raise ValueError(f"Composite dataset {dataset.name!r} config cannot override seed or size")
+        settings["datasets"] = datasets
     return reasoning_gym.create_dataset(config.task, seed=seed, size=1, **settings)
 
 
 def tool_schemas() -> list[ToolSchema]:
     return [
+        {
+            "type": "function",
+            "function": {
+                "name": "calculator",
+                "description": (
+                    "Evaluate arithmetic using numbers, parentheses, and + - * / // % ** only. "
+                    "Expressions are limited to 256 characters, exponent magnitudes to 100, "
+                    "and intermediate/result magnitudes to 1e100. Returns a result or error without ending the episode."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "expression": {"type": "string", "description": "Arithmetic expression to evaluate."}
+                    },
+                    "required": ["expression"],
+                    "additionalProperties": False,
+                },
+            },
+        },
         {
             "type": "function",
             "function": {
@@ -54,15 +78,16 @@ def tool_schemas() -> list[ToolSchema]:
                     "additionalProperties": False,
                 },
             },
-        }
+        },
     ]
 
 
 def validate_tool_call(call: ToolCall) -> None:
-    if call.name != "submit_answer":
+    if call.name not in {"calculator", "submit_answer"}:
         raise ToolCallError(f"Unknown Reasoning Gym tool: {call.name}")
-    if call.arguments.keys() != {"answer"}:
-        raise ToolCallError("submit_answer requires exactly one argument: answer")
+    argument = "expression" if call.name == "calculator" else "answer"
+    if call.arguments.keys() != {argument}:
+        raise ToolCallError(f"{call.name} requires exactly one argument: {argument}")
     try:
         TypeAdapter(dict[str, str]).validate_python(call.arguments, strict=True)
     except ValidationError as error:
@@ -106,17 +131,20 @@ class ReasoningGymWorker:
         return ResetResult(
             tools=tool_schemas(),
             system_prompt=(
-                "Solve the reasoning problem. Close </think> before calling submit_answer exactly once "
+                "Solve the reasoning problem. You may use calculator for arithmetic before submitting your answer. "
+                "Close </think> before each tool call. Call submit_answer exactly once "
                 "with your final answer as a string in the format requested by the question. "
                 "Put reasoning outside the answer argument. Use a complete <tool_call> JSON block."
             ),
             prompt=self.entry["question"],
         )
 
-    def step(self, answer: str) -> StepResult:
+    def step(self, action: ToolCall) -> StepResult:
         if self.done:
-            raise RuntimeError("Reset the episode before submitting an answer")
-        reward = float(self.dataset.score_answer(answer=answer, entry=self.entry))
+            raise RuntimeError("Reset the episode before calling a tool")
+        if action.name == "calculator":
+            return StepResult(observation=calculate(action.arguments["expression"]), reward=0.0, done=False)
+        reward = float(self.dataset.score_answer(answer=action.arguments["answer"], entry=self.entry))
         self.done = True
         return StepResult(observation="Answer submitted.", reward=reward, done=True)
 
@@ -132,4 +160,4 @@ class ReasoningGymSession(Environment):
     async def step(self, action: ToolCall, *, timeout: float | None = None) -> StepResult:
         validate_tool_call(action)
         async with asyncio.timeout(timeout):
-            return await self.actor.step.remote(action.arguments["answer"])
+            return await self.actor.step.remote(action)

@@ -415,7 +415,18 @@ def test_mix_preset_accepts_native_reasoning_rewards() -> None:
     tasks = [
         entry.taskset for entry in config.tasksets.values() if isinstance(entry.taskset, training.ReasoningGymConfig)
     ]
-    assert {task.task for task in tasks} == {"basic_arithmetic", "leg_counting", "letter_counting", "number_sorting"}
+    assert {task.task for task in tasks} == {
+        "basic_arithmetic",
+        "leg_counting",
+        "letter_counting",
+        "number_sorting",
+        "gcd",
+        "lcm",
+        "count_primes",
+        "number_filtering",
+        "word_sorting",
+        "caesar_cipher",
+    }
     rewards: list[float] = []
     for task in tasks:
         dataset = create_dataset(task, seed=config.seed)
