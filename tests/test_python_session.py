@@ -177,6 +177,26 @@ def test_cleanup_failure_is_reported(commands: AsyncMock) -> None:
     asyncio.run(run())
 
 
+def test_pod_is_deleted_before_exec_transport_closes(commands: AsyncMock) -> None:
+    session = sandbox.PythonSession()
+
+    async def command(*arguments: str, payload: bytes = b"") -> None:
+        if arguments[0] == "delete":
+            assert session._process is not None
+            assert session._process.returncode is None
+
+    commands.side_effect = command
+
+    async def run() -> None:
+        async with session:
+            assert (await session.execute("print(42)")).output == "42\n"
+        assert session._process is not None and session._process.returncode is not None
+        await session.aclose()
+
+    asyncio.run(run())
+    assert [call.args[0] for call in commands.call_args_list].count("delete") == 1
+
+
 def test_cancelled_startup_attempts_cleanup(commands: AsyncMock) -> None:
     creating = asyncio.Event()
 

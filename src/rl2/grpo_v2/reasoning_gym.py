@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator, Generator
-from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass, field
+from contextlib import AsyncExitStack, aclosing, asynccontextmanager
+from dataclasses import asdict, dataclass, field
 from random import Random
 from typing import Annotated, Any, ClassVar, Literal
 
@@ -19,6 +20,7 @@ from reasoning_gym.dataset import ProceduralDataset
 
 from rl2.agent_task import Environment, ResetResult, StepResult, Task, ToolCall, ToolCallError, ToolSchema
 from rl2.calculator import calculate
+from rl2.sandbox.kubernetes import PythonSession
 
 
 @config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -26,6 +28,8 @@ class ReasoningGymConfig:
     id: Literal["reasoning_gym"] = "reasoning_gym"
     task: Annotated[str, Field(min_length=1)] = "leg_counting"
     task_config: dict[str, Any] = field(default_factory=dict)
+    python_namespace: Annotated[str, Field(min_length=1)] = "sandbox"
+    python_kubectl: Annotated[tuple[Annotated[str, Field(min_length=1)], ...], Field(min_length=1)] = ("kubectl",)
 
     def __post_init__(self) -> None:
         if {"seed", "size"} & self.task_config.keys():
@@ -67,6 +71,25 @@ def tool_schemas() -> list[ToolSchema]:
         {
             "type": "function",
             "function": {
+                "name": "python",
+                "description": (
+                    "Execute Python statements in an isolated, network-disabled sandbox. Variables, imports, "
+                    "and files persist between calls in this episode. Use print() to return values. "
+                    "Returns JSON with output (stdout/stderr), exit_code (0 for success, 1 for a Python exception), "
+                    "and output_truncated. Exceptions preserve state. Calls have a 5-second execution limit; "
+                    "a timeout ends the rollout. Code and output are limited to 16384 bytes each."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"code": {"type": "string", "description": "Python statements to execute."}},
+                    "required": ["code"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "submit_answer",
                 "description": "Submit your final answer once. This ends the episode.",
                 "parameters": {
@@ -83,15 +106,20 @@ def tool_schemas() -> list[ToolSchema]:
 
 
 def validate_tool_call(call: ToolCall) -> None:
-    if call.name not in {"calculator", "submit_answer"}:
+    arguments = {"calculator": "expression", "python": "code", "submit_answer": "answer"}
+    if call.name not in arguments:
         raise ToolCallError(f"Unknown Reasoning Gym tool: {call.name}")
-    argument = "expression" if call.name == "calculator" else "answer"
+    argument = arguments[call.name]
     if call.arguments.keys() != {argument}:
         raise ToolCallError(f"{call.name} requires exactly one argument: {argument}")
     try:
         TypeAdapter(dict[str, str]).validate_python(call.arguments, strict=True)
     except ValidationError as error:
         raise ToolCallError(str(error)) from error
+    if call.name == "python":
+        code = call.arguments["code"]
+        if len(code.encode()) > 16384 or "\0" in code:
+            raise ToolCallError("code must be at most 16384 UTF-8 bytes and contain no NUL characters")
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +137,10 @@ class ReasoningGymTask(Task):
         async with AsyncExitStack() as resources:
             actor = ReasoningGymWorker.remote(task=self)
             resources.push_async_callback(asyncio.to_thread, ray.kill, actor)
-            yield ReasoningGymSession(actor=actor)
+            session = await resources.enter_async_context(
+                aclosing(ReasoningGymSession(actor=actor, config=self.config))
+            )
+            yield session
 
 
 def stream_reasoning_gym_tasks(config: ReasoningGymConfig, rng: Random) -> Generator[ReasoningGymTask]:
@@ -131,7 +162,9 @@ class ReasoningGymWorker:
         return ResetResult(
             tools=tool_schemas(),
             system_prompt=(
-                "Solve the reasoning problem. You may use calculator for arithmetic before submitting your answer. "
+                "Solve the reasoning problem. You may use calculator for arithmetic and python for computation "
+                "before submitting your answer. Python variables persist across calls in this episode; "
+                "use print() to display results. Python has no network access. "
                 "Close </think> before each tool call. Call submit_answer exactly once "
                 "with your final answer as a string in the format requested by the question. "
                 "Put reasoning outside the answer argument. Use a complete <tool_call> JSON block."
@@ -144,20 +177,45 @@ class ReasoningGymWorker:
             raise RuntimeError("Reset the episode before calling a tool")
         if action.name == "calculator":
             return StepResult(observation=calculate(action.arguments["expression"]), reward=0.0, done=False)
+        if action.name != "submit_answer":
+            raise ToolCallError(f"Unsupported scoring worker tool: {action.name}")
         reward = float(self.dataset.score_answer(answer=action.arguments["answer"], entry=self.entry))
         self.done = True
         return StepResult(observation="Answer submitted.", reward=reward, done=True)
 
 
 class ReasoningGymSession(Environment):
-    def __init__(self, actor: ActorHandle) -> None:
+    def __init__(self, actor: ActorHandle, config: ReasoningGymConfig) -> None:
         self.actor = actor
+        self.config = config
+        self._resources = AsyncExitStack()
+        self._python: PythonSession | None = None
+        self._done = True
+
+    async def aclose(self) -> None:
+        self._done = True
+        await self._resources.aclose()
+        self._python = None
 
     async def reset(self, *, timeout: float | None = None) -> ResetResult:
+        await self.aclose()
         async with asyncio.timeout(timeout):
-            return await self.actor.reset.remote()
+            result = await self.actor.reset.remote()
+            self._done = False
+            return result
 
     async def step(self, action: ToolCall, *, timeout: float | None = None) -> StepResult:
         validate_tool_call(action)
+        if self._done:
+            raise RuntimeError("Reset the episode before calling a tool")
         async with asyncio.timeout(timeout):
-            return await self.actor.step.remote(action)
+            if action.name == "python":
+                if self._python is None:
+                    self._python = await self._resources.enter_async_context(
+                        PythonSession(namespace=self.config.python_namespace, kubectl=self.config.python_kubectl)
+                    )
+                result = await self._python.execute(action.arguments["code"])
+                return StepResult(observation=json.dumps(asdict(result)), reward=0.0, done=False)
+            step = await self.actor.step.remote(action)
+            self._done = step.done
+            return step

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import pickle
 import random
 from unittest.mock import AsyncMock, Mock
@@ -7,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from rl2.grpo_v2 import reasoning_gym as env
+from rl2.sandbox.gvisor import PythonResult
 
 
 def test_task_stream_is_lazy(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -28,7 +30,16 @@ def test_task_stream_is_lazy(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.parametrize(
     "settings",
-    [{"size": 10000}, {"task": ""}, {"task_config": {"seed": 1}}, {"task_config": {"size": 1}}, {"unknown": True}],
+    [
+        {"size": 10000},
+        {"task": ""},
+        {"task_config": {"seed": 1}},
+        {"task_config": {"size": 1}},
+        {"unknown": True},
+        {"python_namespace": ""},
+        {"python_kubectl": []},
+        {"python_kubectl": [""]},
+    ],
 )
 def test_invalid_config(settings: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
@@ -89,7 +100,7 @@ def test_calculator_feedback_and_episode_lifecycle() -> None:
         worker.step(calculation)
     initial = worker.reset()
     schemas = {tool["function"]["name"]: tool["function"] for tool in initial.tools}
-    assert set(schemas) == {"calculator", "submit_answer"}
+    assert set(schemas) == {"calculator", "python", "submit_answer"}
     assert schemas["calculator"]["parameters"] == {
         "type": "object",
         "properties": {"expression": {"type": "string", "description": "Arithmetic expression to evaluate."}},
@@ -148,6 +159,11 @@ def test_composite_cannot_override_sampling(settings: dict[str, object]) -> None
         ("calculator", {}),
         ("calculator", {"expression": "1 + 1", "answer": "2"}),
         ("calculator", {"expression": 42}),
+        ("python", {}),
+        ("python", {"code": "print(42)", "extra": True}),
+        ("python", {"code": 42}),
+        ("python", {"code": "é" * 8193}),
+        ("python", {"code": "\0"}),
     ],
     ids=[
         "unknown",
@@ -157,11 +173,16 @@ def test_composite_cannot_override_sampling(settings: dict[str, object]) -> None
         "missing-expression",
         "extra-expression",
         "expression-type",
+        "missing-code",
+        "extra-code",
+        "code-type",
+        "code-byte-limit",
+        "code-nul",
     ],
 )
 def test_invalid_tool_call_does_not_reach_worker(name: str, arguments: dict[str, object]) -> None:
     actor = Mock()
-    session = env.ReasoningGymSession(actor=actor)
+    session = env.ReasoningGymSession(actor=actor, config=env.ReasoningGymConfig())
     with pytest.raises(env.ToolCallError):
         asyncio.run(session.step(env.ToolCall(name=name, arguments=arguments)))
     actor.step.remote.assert_not_called()
@@ -215,3 +236,125 @@ def test_session_worker_cleanup(mode: str, monkeypatch: pytest.MonkeyPatch) -> N
             asyncio.run(run())
     constructor.assert_called_once_with(task=task)
     kill.assert_called_once_with(actor)
+
+
+def test_python_tool_reuses_sandbox_and_reset_isolates_episodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = env.ReasoningGymConfig(python_namespace="sandbox-test", python_kubectl=("sudo", "-n", "k3s", "kubectl"))
+    task = env.ReasoningGymTask(config=config, seed=1)
+    worker = env.ReasoningGymWorker.__ray_metadata__.modified_class(task=task)
+    actor = Mock()
+    actor.reset.remote = AsyncMock(side_effect=worker.reset)
+    actor.step.remote = AsyncMock(side_effect=worker.step)
+    monkeypatch.setattr(env.ReasoningGymWorker, "remote", Mock(return_value=actor))
+    monkeypatch.setattr(env.ray, "kill", Mock())
+    first, second = AsyncMock(spec=env.PythonSession), AsyncMock(spec=env.PythonSession)
+    first.__aenter__.return_value = first
+    second.__aenter__.return_value = second
+    first.execute.side_effect = [
+        PythonResult(output="", exit_code=0, output_truncated=False),
+        PythonResult(output="ValueError: example\n", exit_code=1, output_truncated=False),
+        PythonResult(output="42\n", exit_code=0, output_truncated=True),
+    ]
+    second.execute.return_value = PythonResult(output="NameError: x\n", exit_code=1, output_truncated=False)
+    constructor = Mock(side_effect=[first, second])
+    monkeypatch.setattr(env, "PythonSession", constructor)
+
+    async def run() -> None:
+        async with task.init_env() as session:
+            code = env.ToolCall(name="python", arguments={"code": "x = 40"})
+            with pytest.raises(RuntimeError, match="Reset"):
+                await session.step(code)
+            initial = await session.reset()
+            schema = next(tool["function"] for tool in initial.tools if tool["function"]["name"] == "python")
+            assert schema["parameters"] == {
+                "type": "object",
+                "properties": {"code": {"type": "string", "description": "Python statements to execute."}},
+                "required": ["code"],
+                "additionalProperties": False,
+            }
+            assert "python" in initial.system_prompt
+            await session.step(env.ToolCall(name="calculator", arguments={"expression": "6 * 7"}))
+            constructor.assert_not_called()
+            for source, output, exit_code, truncated in [
+                ("x = 40", "", 0, False),
+                ("raise ValueError('example')", "ValueError: example\n", 1, False),
+                ("print(x + 2)", "42\n", 0, True),
+            ]:
+                result = await session.step(env.ToolCall(name="python", arguments={"code": source}))
+                assert result.reward == 0.0 and not result.done
+                assert json.loads(result.observation) == {
+                    "output": output,
+                    "exit_code": exit_code,
+                    "output_truncated": truncated,
+                }
+            constructor.assert_called_once_with(namespace="sandbox-test", kubectl=config.python_kubectl)
+            assert [call.args[0] for call in first.execute.await_args_list] == [
+                "x = 40",
+                "raise ValueError('example')",
+                "print(x + 2)",
+            ]
+            assert actor.step.remote.await_count == 1  # Only the calculator reaches the scoring worker.
+            submission = env.ToolCall(name="submit_answer", arguments={"answer": worker.entry["answer"]})
+            assert (await session.step(submission)).reward == 1.0
+            with pytest.raises(RuntimeError, match="Reset"):
+                await session.step(code)
+            await session.reset()
+            first.__aexit__.assert_awaited_once()
+            result = await session.step(env.ToolCall(name="python", arguments={"code": "print(x)"}))
+            assert json.loads(result.observation)["exit_code"] == 1
+            second.execute.assert_awaited_once_with("print(x)")
+        assert constructor.call_count == 2
+        second.__aexit__.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["failure", "timeout", "cancel", "startup_failure"])
+def test_python_tool_cleanup_on_error(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    actor = Mock()
+    actor.reset.remote = AsyncMock(return_value=env.ResetResult(tools=[], system_prompt="", prompt="question"))
+    monkeypatch.setattr(env.ReasoningGymWorker, "remote", Mock(return_value=actor))
+    kill = Mock()
+    monkeypatch.setattr(env.ray, "kill", kill)
+    sandbox = AsyncMock(spec=env.PythonSession)
+    sandbox.__aenter__.return_value = sandbox
+    constructor = Mock(return_value=sandbox)
+    monkeypatch.setattr(env, "PythonSession", constructor)
+
+    async def pending(code: str) -> None:
+        await asyncio.Future()
+
+    if mode == "startup_failure":
+        sandbox.__aenter__.side_effect = RuntimeError("startup failed")
+    else:
+        sandbox.execute.side_effect = {
+            "failure": ValueError("invalid sandbox response"),
+            "timeout": pending,
+            "cancel": asyncio.CancelledError,
+        }[mode]
+
+    async def run() -> None:
+        task = env.ReasoningGymTask(config=env.ReasoningGymConfig(), seed=1)
+        async with task.init_env() as session:
+            await session.reset()
+            await session.step(env.ToolCall(name="python", arguments={"code": "print(42)"}), timeout=0.01)
+
+    errors = {
+        "failure": ValueError,
+        "timeout": TimeoutError,
+        "cancel": asyncio.CancelledError,
+        "startup_failure": RuntimeError,
+    }
+    with pytest.raises(errors[mode]) as error:
+        asyncio.run(run())
+    assert not isinstance(error.value, env.ToolCallError)
+    if mode == "startup_failure":
+        sandbox.__aexit__.assert_not_awaited()  # PythonSession cleans up its own failed startup.
+    else:
+        sandbox.__aexit__.assert_awaited_once()
+    actor.step.remote.assert_not_called()
+    kill.assert_called_once_with(actor)
+
+
+def test_python_code_limit_accepts_boundary() -> None:
+    env.validate_tool_call(env.ToolCall(name="python", arguments={"code": "é" * 8192}))

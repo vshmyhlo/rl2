@@ -88,6 +88,7 @@ class PythonSession:
         self._resources = AsyncExitStack()
         self._lock = asyncio.Lock()
         self._state = "new"
+        self._pod_pending = False
         self._request_id = 0
         self._process: asyncio.subprocess.Process | None = None
 
@@ -162,10 +163,10 @@ class PythonSession:
             if self._state != "new":
                 raise RuntimeError("PythonSession can only be entered once")
             self._state = "starting"
-            self._resources.push_async_callback(self._delete_pod)
             try:
                 async with asyncio.timeout(self.startup_timeout):
                     source = await asyncio.to_thread(Path(__file__).with_name("_python_worker.py").read_text)
+                    self._pod_pending = True
                     await self._command("create", "-f", "-", payload=json.dumps(self._manifest()).encode())
                     await self._command(
                         "wait", "--for=condition=Ready", f"pod/{self.pod_name}", f"--timeout={self.startup_timeout}s"
@@ -234,10 +235,17 @@ class PythonSession:
                 await self._close()
                 raise
 
+    async def _cleanup(self) -> None:
+        async with self._resources:
+            # End remote execution before closing wrappers such as sudo that own its pipes.
+            if self._pod_pending:
+                await self._delete_pod()
+                self._pod_pending = False
+
     async def _close(self) -> None:
         self._state = "closed"
         # Keep cleanup alive if the owner is cancelled while awaiting it.
-        task = asyncio.create_task(self._resources.aclose())
+        task = asyncio.create_task(self._cleanup())
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:

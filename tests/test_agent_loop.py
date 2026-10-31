@@ -21,6 +21,7 @@ from rl2 import alfworld_env
 from rl2.agent_task import Environment, ResetResult, Task, ToolSchema
 from rl2.alfworld_env import StepResult, ToolCall, tool_schemas
 from rl2.grpo_v2 import reasoning_gym
+from rl2.sandbox.gvisor import PythonResult
 
 
 @pytest.fixture
@@ -115,7 +116,7 @@ def make_agent(tokenizer: PreTrainedTokenizerFast, client: AsyncOpenAI) -> loop.
     )
 
 
-@pytest.mark.parametrize("mode", ["submitted", "calculator", "plain_text", "truncated"])
+@pytest.mark.parametrize("mode", ["submitted", "calculator", "python", "plain_text", "truncated"])
 def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch) -> None:
     task = reasoning_gym.ReasoningGymTask(config=reasoning_gym.ReasoningGymConfig(), seed=1)
     worker = reasoning_gym.ReasoningGymWorker.__ray_metadata__.modified_class(task=task)
@@ -125,6 +126,11 @@ def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, mo
     actor.step.remote = AsyncMock(side_effect=worker.step)
     monkeypatch.setattr(reasoning_gym.ReasoningGymWorker, "remote", Mock(return_value=actor))
     monkeypatch.setattr(reasoning_gym.ray, "kill", Mock())
+    sandbox = AsyncMock(spec=reasoning_gym.PythonSession)
+    sandbox.__aenter__.return_value = sandbox
+    sandbox.execute.return_value = PythonResult(output=f"{answer}\n", exit_code=0, output_truncated=False)
+    python_constructor = Mock(return_value=sandbox)
+    monkeypatch.setattr(reasoning_gym, "PythonSession", python_constructor)
     submission = ToolCall(name="submit_answer", arguments={"answer": answer})
     call = submission.model_dump_json()
     text = answer if mode == "plain_text" else f"<think>solve</think><tool_call>{call}</tool_call><|im_end|>"
@@ -132,6 +138,9 @@ def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, mo
     replies = [text]
     if mode == "calculator":
         replies.insert(0, f"<think>calculate</think><tool_call>{calculation.model_dump_json()}</tool_call><|im_end|>")
+    elif mode == "python":
+        code = ToolCall(name="python", arguments={"code": f"print({answer})"})
+        replies.insert(0, f"<think>compute</think><tool_call>{code.model_dump_json()}</tool_call><|im_end|>")
     requests: list[dict[str, Any]] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -149,12 +158,13 @@ def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, mo
 
     rollout = asyncio.run(run())
     assert rollout.num_turns == len(replies)
-    assert rollout.reward == (1.0 if mode in {"submitted", "calculator"} else 0.0)
+    assert rollout.reward == (1.0 if mode in {"submitted", "calculator", "python"} else 0.0)
     assert (
         rollout.stop_condition
         == {
             "submitted": "environment_done",
             "calculator": "environment_done",
+            "python": "environment_done",
             "plain_text": "agent_completed",
             "truncated": "context_length",
         }[mode]
@@ -164,8 +174,16 @@ def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, mo
     elif mode == "calculator":
         assert [call.args[0] for call in actor.step.remote.await_args_list] == [calculation, submission]
         assert f"<tool_response>\n{answer}\n</tool_response>" in tokenizer.decode(requests[1]["prompt"])
+    elif mode == "python":
+        actor.step.remote.assert_awaited_once_with(submission)
+        sandbox.execute.assert_awaited_once_with(f"print({answer})")
+        sandbox.__aexit__.assert_awaited_once()
+        output = json.dumps({"output": f"{answer}\n", "exit_code": 0, "output_truncated": False})
+        assert f"<tool_response>\n{output}\n</tool_response>" in tokenizer.decode(requests[1]["prompt"])
     else:
         actor.step.remote.assert_not_called()
+    if mode != "python":
+        python_constructor.assert_not_called()
     sequence = rollout.sequence
     assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
     assert sequence.loss_mask.sum() == sum(len(tokenizer.encode(reply, add_special_tokens=False)) for reply in replies)

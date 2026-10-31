@@ -224,7 +224,10 @@ def test_reasoning_gym_cli_and_actor_task_stream(tmp_path: Path, monkeypatch: py
         tasksets={
             "easy": training.WeightedTasksetConfig(
                 taskset=training.ReasoningGymConfig(
-                    task="leg_counting", task_config={"min_animals": 1, "max_animals": 5}
+                    task="leg_counting",
+                    task_config={"min_animals": 1, "max_animals": 5},
+                    python_namespace="sandbox-test",
+                    python_kubectl=("sudo", "-n", "k3s", "kubectl"),
                 ),
                 weight=1.0,
             ),
@@ -1011,7 +1014,7 @@ def test_learner_pulls_groups_through_batcher(
         assert batch.stop_counts == {"agent_completed": num_groups * 3}
         assert batch.num_output_tokens == num_groups * 3
         if include_examples:
-            assert batch.examples.count("Full token sequence (special tokens preserved):") == num_groups * 3
+            assert batch.examples.count("Full token sequence (special tokens preserved):") == 1
             format_examples.assert_called_once()
         else:
             assert batch.examples == ""
@@ -1119,7 +1122,8 @@ def test_batcher_selects_groups_across_batch_boundaries(
                 assert sorted(first_indices) == [1, 3]
             else:
                 assert first_indices == [0, 1]
-            assert first_batch.examples == training.format_rollout_examples([groups[i] for i in first_indices])
+            assert f"Example 1 | task={first_indices[-1]} |" in first_batch.examples
+            assert first_batch.examples.count("Full token sequence") == 1
             np.testing.assert_array_equal(first_batch.training_batch.advantages, np.repeat(first_indices, 2))
             assert first_batch.training_batch.token_ids.shape == (4, 8)
 
@@ -1138,7 +1142,8 @@ def test_batcher_selects_groups_across_batch_boundaries(
                 assert sorted(second_indices) == [0, 2]
             else:
                 assert second_indices == [2, 3]
-            assert second_batch.examples == training.format_rollout_examples([groups[i] for i in second_indices])
+            assert f"Example 1 | task={second_indices[-1]} |" in second_batch.examples
+            assert second_batch.examples.count("Full token sequence") == 1
             np.testing.assert_array_equal(second_batch.training_batch.advantages, np.repeat(second_indices, 2))
             assert actor.fetch_next_group.remote.call_count == 4
             assert not batcher._pending_groups
@@ -1262,7 +1267,8 @@ def test_batch_refills_degenerate_groups(drop_degenerate_groups: bool, rollout: 
         batch.training_batch.advantages,
         [rollout.advantage for group in expected_groups for rollout in group.rollouts],
     )
-    assert batch.examples == training.format_rollout_examples(expected_groups)
+    assert f"Example 1 | task={expected_groups[-1].task_id} |" in batch.examples
+    assert batch.examples.count("Full token sequence") == 1
     assert batch.rollout_metrics["rollout/degenerate_group_fraction"] == (0.0 if drop_degenerate_groups else 1.0)
     assert batch.rollout_metrics["batcher/skipped_groups"] == (2 if drop_degenerate_groups else 0)
     assert {
@@ -1427,7 +1433,7 @@ def test_batch_timings_and_order_survive_serialization(
     # Preserve request order despite out-of-order completion and serialization.
     np.testing.assert_array_equal(batch.training_batch.advantages, [0.0, 0.0, 1.0, 1.0])
     assert "Example 1 | task=0" in batch.examples
-    assert "Example 3 | task=1" in batch.examples
+    assert "Example 2 | task=1" in batch.examples
     assert batch.training_batch.token_ids.shape == (4, 8)
     assert batch.rollout_metrics["rollout/reward_mean/source_0"] == 0.0
     assert batch.rollout_metrics["rollout/reward_mean/source_1"] == 1.0
@@ -1966,6 +1972,22 @@ def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.Monke
     assert len(saved) == 4
 
 
+def test_batcher_logs_every_taskset(rollout: training.Rollout) -> None:
+    groups = [
+        training.RolloutGroup(task_id="shared-id", taskset_id=f"source_{index}", rollouts=[rollout] * 2)
+        for index in range(9)
+    ]
+    actor = Mock()
+    actor.fetch_next_group.remote = AsyncMock(side_effect=groups)
+    batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor)
+
+    batch = asyncio.run(batcher.fetch_next_batch(num_groups=9, group_size=2, context_length=8, include_examples=True))
+
+    assert batch.examples.count("Full token sequence") == 9
+    for index in range(9):
+        assert batch.examples.count(f"taskset=source_{index}\n") == 1
+
+
 def test_learner_logs_examples_at_configured_interval(
     learner: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1992,43 +2014,51 @@ def test_learner_logs_examples_at_configured_interval(
         stop_condition="max_turns",
     )
     groups = [
-        training.RolloutGroup(task_id="task-1", rollouts=[rollout] * 5, taskset_id="test"),
+        training.RolloutGroup(
+            task_id="task-1", rollouts=[replace(rollout, interaction="omitted"), rollout], taskset_id="common"
+        ),
         training.RolloutGroup(
             task_id="task-2",
-            rollouts=[
-                replace(rollout, interaction="", stop_condition="unspecified"),
-                rollout,
-                rollout,
-                replace(rollout, interaction="omitted"),
-                replace(rollout, interaction="omitted"),
-            ],
-            taskset_id="test",
+            rollouts=[rollout, replace(rollout, interaction="", stop_condition="unspecified")],
+            taskset_id="rare",
         ),
     ]
     learner.config = replace(
         learner.config,
         num_groups=2,
-        group_size=5,
+        group_size=2,
         minibatches_per_epoch=1,
         total_iterations=7,
-        prefetch_batches=3,
+        prefetch_batches=0,
         example_log_interval=3,
     )
     learner.publish_weights = Mock()
     learner.optimize = Mock(return_value={"train/policy_loss": 0.0})
-    prepared = Mock(spec=training.GRPOBatch)
-    prepared.token_ids = Mock(shape=(10, 8))  # (B=10, T=8)
-    prepared.attention_mask = np.ones((10, 8), dtype=np.bool_)  # (B=10, T=8)
+    actor = Mock()
+    actor.fetch_next_group.remote = AsyncMock(
+        side_effect=[
+            group
+            for step in range(1, 8)
+            for group in (
+                replace(groups[0], task_id=f"old-{step}"),
+                replace(groups[1] if step == 1 else groups[0], task_id=f"batch-{step}"),
+            )
+        ]
+    )
+    batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor, config=learner.config)
     submitted: list[training.RolloutBatch] = []
 
     def fetch(
         num_groups: int, group_size: int, context_length: int, *, iteration: int, include_examples: bool
     ) -> training.RolloutBatch:
-        batch = training.build_rollout_batch(
-            groups=[replace(groups[0], task_id=f"batch-{len(submitted) + 1}"), groups[1]],
-            training_batch=prepared,
-            timing_metrics={},
-            include_examples=include_examples,
+        batch = asyncio.run(
+            batcher.fetch_next_batch(
+                num_groups=num_groups,
+                group_size=group_size,
+                context_length=context_length,
+                iteration=iteration,
+                include_examples=include_examples,
+            )
         )
         submitted.append(batch)
         return batch
@@ -2060,12 +2090,13 @@ def test_learner_logs_examples_at_configured_interval(
             "<|im_start|>assistant\n"
             '<think>Use add.</think>\n<tool_call>{"name": "add"}</tool_call><|im_end|>'
         ) in text
-        assert "Example 6 | task=task-2" in text
-        assert "Example 8 | task=task-2" in text
+        assert "Example 2 | task=batch-1" in text
+        assert text.count("taskset=common") == 1
+        assert text.count("taskset=rare") == 1
         assert "Full token sequence (special tokens preserved):\n(empty)" in text
-        assert text.count("reward=1.000") == 8
+        assert text.count("reward=1.000") == 2
         assert "Token IDs:" not in text
-        assert "Example 9" not in text and "omitted" not in text
+        assert "Example 3" not in text and "omitted" not in text
 
 
 def test_learner_cleans_up_failed_start(learner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2557,8 +2588,8 @@ def test_batcher_collects_groups_concurrently(
 
     batch = asyncio.run(collect())
     assert started == 4
-    assert f"Example 1 | task=alfworld:{task_discovery[0].id}" in batch.examples
-    assert f"Example 3 | task=alfworld:{task_discovery[1].id}" in batch.examples
+    assert f"Example 1 | task=alfworld:{task_discovery[1].id}" in batch.examples
+    assert batch.examples.count("Full token sequence") == 1
     assert batch.training_batch.token_ids.shape == (4, 16)
     assert all(isinstance(value, np.ndarray) for value in batch.training_batch)
     env.__aenter__.assert_awaited_once()

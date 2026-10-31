@@ -86,7 +86,6 @@ from collections.abc import AsyncGenerator, Generator
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
-from itertools import islice
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Annotated, Any, Literal, NamedTuple, cast, get_args
@@ -349,14 +348,14 @@ class RolloutGroup:
 
 
 def format_rollout_examples(groups: list[RolloutGroup]) -> str:
-    """Format up to eight full decoded token sequences in sampling order."""
+    """Format full decoded token sequences in sampling order."""
     sections: list[str] = []
-    examples = islice(((group, rollout) for group in groups for rollout in group.rollouts), 8)
+    examples = ((group, rollout) for group in groups for rollout in group.rollouts)
     for index, (group, rollout) in enumerate(examples, start=1):
         sections.append(
             f"{'=' * 72}\n"
             f"Example {index} | task={group.task_id} | reward={rollout.reward:.3f} | "
-            f"advantage={rollout.advantage:.3f}\n"
+            f"advantage={rollout.advantage:.3f} | taskset={group.taskset_id}\n"
             f"Turns: {rollout.num_turns} | Output tokens: {rollout.num_output_tokens} | "
             f"Stop: {rollout.stop_condition}\n\n"
             f"Full token sequence (special tokens preserved):\n{rollout.interaction or '(empty)'}"
@@ -394,14 +393,18 @@ def build_rollout_batch(
     *,
     include_examples: bool = False,
     skipped_groups: int = 0,
+    latest_examples: dict[str, RolloutGroup] | None = None,
 ) -> RolloutBatch:
-    """Keep only training arrays and the summaries used by learner logging."""
+    """Summarize the batch and refresh the optional per-taskset example cache."""
+    if latest_examples is None:
+        latest_examples = {}
     rollouts = [rollout for group in groups for rollout in group.rollouts]
     rewards = [rollout.reward for rollout in rollouts]
     training_rewards = [reward for group in groups for reward in group.training_rewards]
     rewards_by_taskset: dict[str, list[float]] = defaultdict(list)
     for group in groups:
         rewards_by_taskset[group.taskset_id].extend(rollout.reward for rollout in group.rollouts)
+        latest_examples[group.taskset_id] = replace(group, rollouts=group.rollouts[-1:])
     return RolloutBatch(
         training_batch=training_batch,
         rollout_metrics={
@@ -426,7 +429,7 @@ def build_rollout_batch(
         },
         stop_counts=Counter(rollout.stop_condition for rollout in rollouts),
         num_output_tokens=sum(rollout.num_output_tokens for rollout in rollouts),
-        examples=format_rollout_examples(groups) if include_examples else "",
+        examples=format_rollout_examples(list(latest_examples.values())) if include_examples else "",
         timing_metrics=timing_metrics,
     )
 
@@ -822,6 +825,7 @@ class Batcher:
         self.actor = actor
         self.config = config
         self._pending_groups: list[asyncio.Task[CollectedGroup]] = []
+        self._latest_examples: dict[str, RolloutGroup] = {}
 
     def prepare_batch(self, groups: list[RolloutGroup], context_length: int) -> GRPOBatch[np.ndarray]:
         """Flatten rollout groups in order and right-pad their transcripts into NumPy arrays.
@@ -940,6 +944,7 @@ class Batcher:
                 groups=groups,
                 training_batch=training_batch,
                 include_examples=include_examples,
+                latest_examples=self._latest_examples,
                 skipped_groups=sum(item.skipped_groups for item in collected),
                 timing_metrics={
                     "batcher/fetch_rollout_seconds": fetched - started,

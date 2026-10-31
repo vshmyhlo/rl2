@@ -57,7 +57,7 @@ uv run python -m rl2.train_grpo_v2 --config configs/grpo_v2/alfworld.yaml
 ```
 
 For [Reasoning Gym](https://github.com/open-thought/reasoning-gym), use
-`--config configs/grpo_v2/reasoning_gym.yaml`; no separate installation is needed.
+`--config configs/grpo_v2/reasoning_gym.yaml`; the datasets need no separate installation.
 Set `taskset.task` to a registered dataset name and `taskset.task_config` to its
 difficulty parameters. Each group samples a 32-bit dataset seed and generates one puzzle on demand.
 Every attempt in a group receives the same question. The top-level `seed`
@@ -80,11 +80,29 @@ For Reasoning Gym, the model may call `calculator(expression=...)` before submit
 It accepts numbers, parentheses, and `+ - * / // % **`, using the bounded evaluator
 in `calculator.py`. Results and arithmetic errors return as observations with zero
 reward and leave the episode active. Calculator calls use the existing rollout budgets.
+The `python(code=...)` tool lazily creates one network-disabled gVisor pod and persistent
+interpreter per rollout. Variables and files persist across calls; use `print()` for
+output. Observations are JSON with `output` (stdout/stderr), `exit_code`, and
+`output_truncated`. Python exceptions return exit code 1 with zero reward and preserve
+state. Successful calls also receive zero reward. Each execution has a 5-second limit;
+startup has a separate 90-second limit, and the environment/rollout deadlines still apply.
+Timeouts or transport failures stop the rollout. Reset and rollout exit delete the sandbox,
+including when generation ends without submitting an answer.
+
+Python requires the [sandbox prerequisites](sandbox/README.md#prerequisites), including
+`kubectl` and Kubernetes credentials in the rollout caller. Taskset fields
+`python_namespace` (default `sandbox`) and `python_kubectl` (default `[kubectl]`)
+configure access. For training launched directly on the k3s host, use
+`python_kubectl: [sudo, -n, k3s, kubectl]`. Inside training pods, provide `kubectl`
+and a service account with the documented permissions in the sandbox namespace;
+the current training image and submission manifest do not provide these automatically.
+Credentials stay in the trusted caller, never in the Python sandbox.
+
 The model calls `submit_answer(answer=...)` with a string in the question's
 requested format. One valid submission ends the episode and receives the
 dataset's native `score_answer` reward, including partial credit. Plain text
 without a tool call and truncated responses receive zero reward. The preset
-shares ALFWorld's task budgets, including up to 50 turns for calculator use and recovery from malformed calls,
+shares ALFWorld's task budgets, including up to 50 turns for tool use and recovery from malformed calls,
 but retains Tokamax and one prefetched batch. Each
 rollout owns a Ray worker for CPU-bound generation, calculation, and scoring; timeouts and
 cancellation terminate it. Keep task settings and seed unchanged when resuming.
@@ -412,8 +430,11 @@ are omitted; measured zero rewards are logged. `rollout/reward_mean` remains the
 mean over all retained rollouts in the batch.
 Every `example_log_interval` iterations (default 10, positive integer), it saves
 full token transcripts, final observations, rewards, and advantages. The batcher
-formats up to eight examples only for iterations that log them, using the consumed
-groups even when prefetches finish out of order.
+keeps the last rollout in sampling order from the latest consumed group for each
+configured taskset name, including across logging intervals. At each interval it
+formats one example per taskset seen so far, labeled with its taskset name and
+task ID. Unconsumed prefetched groups and discarded groups are excluded. This
+example cache starts empty when training restarts.
 Stop fractions include all `StopCondition` labels, with zero for absent labels.
 `rollout/total_tokens_mean` is the mean full transcript length in the learner
 batch, counting context and sampled tokens and excluding padding, before the
