@@ -56,7 +56,8 @@ def tool_schemas() -> list[ToolSchema]:
                 "description": (
                     "Evaluate arithmetic using numbers, parentheses, and + - * / // % ** only. "
                     "Expressions are limited to 256 characters, exponent magnitudes to 100, "
-                    "and intermediate/result magnitudes to 1e100. Returns a result or error without ending the episode."
+                    "and intermediate/result magnitudes to 1e100. Returns plain text: a number on success or "
+                    "'Error: ...' on failure, without ending the episode. Floating-point arithmetic is approximate."
                 ),
                 "parameters": {
                     "type": "object",
@@ -75,9 +76,12 @@ def tool_schemas() -> list[ToolSchema]:
                 "description": (
                     "Execute Python statements in an isolated, network-disabled sandbox. Variables, imports, "
                     "and files persist between calls in this episode. Use print() to return values. "
-                    "Returns JSON with output (stdout/stderr), exit_code (0 for success, 1 for a Python exception), "
-                    "and output_truncated. Exceptions preserve state. Calls have a 5-second execution limit; "
-                    "a timeout ends the rollout. Code and output are limited to 16384 bytes each."
+                    "Returns JSON with output (combined stdout/stderr; empty if no output was captured), "
+                    "exit_code (0 for success, 1 for a Python exception), and output_truncated "
+                    "(true if output was cut off). Python exceptions preserve state and do not end the episode. "
+                    "Calls have a 5-second execution limit. A timeout or sandbox execution failure returns "
+                    "JSON with an error field and ends the episode. Code and captured output are limited to "
+                    "16384 bytes each before JSON encoding."
                 ),
                 "parameters": {
                     "type": "object",

@@ -578,6 +578,7 @@ def test_hlo_audit_validation(
         ({"rope_parameters": {"full_attention": {"rope_theta": 10000.0}}}, "global full-head RoPE"),
         ({"use_sliding_window": True}, "sliding-window"),
         ({"attention_bias": True}, "bias-free"),
+        ({"attention_dropout": 0.1}, "attention_dropout must be zero"),
         ({"hidden_act": "gelu"}, "SiLU"),
         ({"layer_types": ["sliding_attention"]}, "full-attention"),
         ({"num_key_value_heads": 3}, "divisible"),
@@ -591,6 +592,11 @@ def test_hlo_audit_validation(
 def test_config_validation(change: dict[str, object], match: str) -> None:
     with pytest.raises(ValueError, match=match):
         Qwen3Config.from_dict({"model_type": "qwen3", **change})
+
+
+@pytest.mark.parametrize("values", [{}, {"attention_dropout": 0.0}], ids=["default", "explicit-zero"])
+def test_config_accepts_disabled_attention_dropout(values: dict[str, float]) -> None:
+    assert Qwen3Config.from_dict({"model_type": "qwen3", **values}) == Qwen3Config()
 
 
 def test_config_reads_modern_rope_theta() -> None:

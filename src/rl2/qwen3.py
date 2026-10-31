@@ -83,6 +83,8 @@ class Qwen3Config:
             raise ValueError("Expected a dense Qwen3 checkpoint")
         if values.get("hidden_act", "silu") != "silu" or values.get("attention_bias", False):
             raise ValueError("Only SiLU and bias-free Qwen3 are supported")
+        if values.get("attention_dropout", 0.0) != 0.0:
+            raise ValueError("attention_dropout must be zero; attention dropout is not supported")
         rope = values.get("rope_parameters") or {}
         if (
             values.get("rope_scaling") is not None

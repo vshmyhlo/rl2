@@ -253,10 +253,13 @@ def test_python_tool_reuses_sandbox_and_reset_isolates_episodes(monkeypatch: pyt
     first, second = AsyncMock(spec=env.PythonSession), AsyncMock(spec=env.PythonSession)
     first.__aenter__.return_value = first
     second.__aenter__.return_value = second
+    special_output = '"café"\\path\t\x00😀\n'
+    special_source = f"print({special_output!r}, end='')"
     first.execute.side_effect = [
         PythonResult(output="", exit_code=0, output_truncated=False),
         PythonResult(output="ValueError: example\n", exit_code=1, output_truncated=False),
         PythonResult(output="42\n", exit_code=0, output_truncated=True),
+        PythonResult(output=special_output, exit_code=0, output_truncated=False),
     ]
     second.execute.return_value = PythonResult(output="NameError: x\n", exit_code=1, output_truncated=False)
     constructor = Mock(side_effect=[first, second])
@@ -282,6 +285,7 @@ def test_python_tool_reuses_sandbox_and_reset_isolates_episodes(monkeypatch: pyt
                 ("x = 40", "", 0, False),
                 ("raise ValueError('example')", "ValueError: example\n", 1, False),
                 ("print(x + 2)", "42\n", 0, True),
+                (special_source, special_output, 0, False),
             ]:
                 result = await session.step(env.ToolCall(name="python", arguments={"code": source}))
                 assert result.reward == 0.0 and not result.done
@@ -295,6 +299,7 @@ def test_python_tool_reuses_sandbox_and_reset_isolates_episodes(monkeypatch: pyt
                 "x = 40",
                 "raise ValueError('example')",
                 "print(x + 2)",
+                special_source,
             ]
             assert actor.step.remote.await_count == 1  # Only the calculator reaches the scoring worker.
             submission = env.ToolCall(name="submit_answer", arguments={"answer": worker.entry["answer"]})
@@ -347,7 +352,9 @@ def test_python_tool_cleanup_on_error(mode: str, monkeypatch: pytest.MonkeyPatch
             action = env.ToolCall(name="python", arguments={"code": "print(42)"})
             result = await session.step(action, timeout=0.01)
             assert result.done and result.reward == 0
-            assert "error" in json.loads(result.observation)
+            assert json.loads(result.observation) == {
+                "error": "Python execution timed out" if mode == "execution_timeout" else "sandbox exited"
+            }
             with pytest.raises(RuntimeError, match="Reset"):
                 await session.step(action)
 

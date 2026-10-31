@@ -41,6 +41,6 @@ def calculate(expression: str) -> str:
         if sum(1 for _ in ast.walk(tree)) > 64:
             raise ValueError("expression is too complex")
         result = evaluate(tree.body)
-        return str(result) if isinstance(result, int) else format(result, ".15g")
+        return str(result).removesuffix(".0")
     except (SyntaxError, ValueError, ArithmeticError) as error:
         return f"Error: {error.msg if isinstance(error, SyntaxError) else error}"

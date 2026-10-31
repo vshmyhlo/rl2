@@ -4,9 +4,11 @@ import os
 import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+import uvloop
 
 from rl2.sandbox import _python_worker as worker
 from rl2.sandbox import kubernetes as sandbox
@@ -276,6 +278,33 @@ def test_kubectl_command_transport(exit_code: int) -> None:
 
 
 @pytest.mark.parametrize(
+    ("payload", "exit_code"),
+    [(b"", 0), (b"", 7), (b"payload", 7)],
+    ids=["completed-delete", "failed-delete", "rejected-create"],
+)
+def test_kubectl_exits_before_stdin_write(payload: bytes, exit_code: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    create_process = asyncio.create_subprocess_exec
+
+    async def exited_process(*args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        process = await create_process(*args, **kwargs)
+        await process.wait()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", exited_process)
+    code = f"import sys; print('client diagnostic', file=sys.stderr); sys.exit({exit_code})"
+    session = sandbox.PythonSession(kubectl=(sys.executable, "-c", code))
+
+    async def run() -> None:
+        if exit_code:
+            with pytest.raises(RuntimeError, match="kubectl test failed: client diagnostic"):
+                await session._command("test", payload=payload)
+        else:
+            await session._command("test")
+
+    asyncio.run(run(), loop_factory=uvloop.new_event_loop)
+
+
+@pytest.mark.parametrize(
     "response",
     [
         b"not json\n",
@@ -300,24 +329,29 @@ def test_corrupt_protocol_closes_session(response: bytes, commands: AsyncMock, m
     asyncio.run(run())
 
 
-def test_disconnected_writer_closes_session(commands: AsyncMock, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("mode", ["connection-reset", "closed-transport"])
+def test_disconnected_writer_closes_session(mode: str, commands: AsyncMock, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         async with sandbox.PythonSession() as session:
             assert session._process is not None and session._process.stdin is not None
-            monkeypatch.setattr(session._process.stdin, "drain", AsyncMock(side_effect=ConnectionResetError))
-            with pytest.raises(sandbox.PythonExecutionError, match="connection or response"):
+            if mode == "closed-transport":
+                session._process.kill()
+                await session._process.wait()
+            else:
+                monkeypatch.setattr(session._process.stdin, "drain", AsyncMock(side_effect=ConnectionResetError))
+            with pytest.raises(sandbox.PythonExecutionError, match="connection"):
                 await session.execute("pass")
             with pytest.raises(RuntimeError, match="not active"):
                 await session.execute("pass")
 
-    asyncio.run(run())
+    asyncio.run(run(), loop_factory=uvloop.new_event_loop)
     assert [call.args[0] for call in commands.call_args_list].count("delete") == 1
 
 
 @pytest.mark.skipif(
     os.environ.get("RL2_TEST_K3S_SANDBOX") != "1", reason="requires offline runsc RuntimeClass and sandbox namespace"
 )
-@pytest.mark.parametrize("ending", ["timeout", "exit"])
+@pytest.mark.parametrize("ending", ["normal", "timeout", "exit"])
 def test_live_k3s_session(ending: str) -> None:
     async def run() -> None:
         async with sandbox.PythonSession(kubectl=("sudo", "-n", "k3s", "kubectl")) as session:
@@ -346,8 +380,8 @@ def test_live_k3s_session(ending: str) -> None:
             if ending == "timeout":
                 with pytest.raises(sandbox.PythonExecutionTimeout):
                     await session.execute("while True: pass", timeout=0.2)
-            else:
+            elif ending == "exit":
                 with pytest.raises(sandbox.PythonExecutionError, match="exited without a response"):
                     await session.execute("os._exit(0)")
 
-    asyncio.run(run())
+    asyncio.run(run(), loop_factory=uvloop.new_event_loop)

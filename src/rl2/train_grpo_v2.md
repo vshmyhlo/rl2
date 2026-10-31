@@ -78,8 +78,10 @@ does not affect the sequence. A single active taskset preserves its original sam
 
 For Reasoning Gym, the model may call `calculator(expression=...)` before submitting.
 It accepts numbers, parentheses, and `+ - * / // % **`, using the bounded evaluator
-in `calculator.py`. Results and arithmetic errors return as observations with zero
-reward and leave the episode active. Calculator calls use the existing rollout budgets.
+in `calculator.py`. Observations are plain text: a number on success or `Error: ...`
+on failure, with zero reward and the episode left active. Float results preserve
+the evaluated value's precision; floating-point arithmetic remains approximate.
+Calculator calls use the existing rollout budgets.
 The `python(code=...)` tool lazily creates one network-disabled gVisor pod and persistent
 interpreter per rollout. Variables and files persist across calls; use `print()` for
 output. Observations are JSON with `output` (stdout/stderr), `exit_code`, and
@@ -87,7 +89,8 @@ output. Observations are JSON with `output` (stdout/stderr), `exit_code`, and
 state. Successful calls also receive zero reward. Each execution has a 5-second limit;
 startup has a separate 90-second limit, and the environment/rollout deadlines still apply.
 Execution timeouts, interpreter exit, or invalid responses end that rollout with zero
-reward; startup and cleanup failures still propagate as infrastructure errors.
+reward and a JSON `{"error": "..."}` observation; startup and cleanup failures still
+propagate as infrastructure errors.
 Reset and rollout exit delete the sandbox,
 including when generation ends without submitting an answer.
 

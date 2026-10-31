@@ -133,6 +133,8 @@ alone introduces unnecessary attention all-gathers with this Tokamax version.
 Supported scope: dense, bias-free, full-attention Qwen3 with standard RoPE and
 SiLU, including tied or separate output embeddings. Scaled RoPE, sliding attention,
 MoE, and quantized checkpoints are unsupported.
+Attention dropout is disabled; omitted or zero `attention_dropout` is accepted,
+and nonzero values are rejected.
 See [GRPO v2](../src/rl2/train_grpo_v2.md) for the training integration.
 
 ## Tests

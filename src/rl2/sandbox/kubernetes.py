@@ -42,10 +42,12 @@ class _Response(BaseModel):
 
 
 @asynccontextmanager
-async def _process(command: tuple[str, ...], *, limit: int) -> AsyncGenerator[asyncio.subprocess.Process]:
+async def _process(
+    command: tuple[str, ...], *, limit: int, stdin: int = asyncio.subprocess.PIPE
+) -> AsyncGenerator[asyncio.subprocess.Process]:
     process = await asyncio.create_subprocess_exec(
         *command,
-        stdin=asyncio.subprocess.PIPE,
+        stdin=stdin,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         limit=limit,
@@ -153,11 +155,17 @@ class PythonSession:
         }
 
     async def _command(self, *arguments: str, payload: bytes = b"") -> None:
-        async with _process((*self.kubectl, *arguments), limit=16384) as process:
-            assert process.stdin is not None and process.stdout is not None
-            process.stdin.write(payload)
-            await process.stdin.drain()
-            process.stdin.close()
+        stdin = asyncio.subprocess.PIPE if payload else asyncio.subprocess.DEVNULL
+        async with _process((*self.kubectl, *arguments), limit=16384, stdin=stdin) as process:
+            assert process.stdout is not None
+            if payload:
+                assert process.stdin is not None
+                # A client may reject the command before reading its input.
+                if not process.stdin.is_closing():
+                    with suppress(BrokenPipeError, ConnectionResetError):
+                        process.stdin.write(payload)
+                        await process.stdin.drain()
+                process.stdin.close()
             output = bytearray()
             while chunk := await process.stdout.read(4096):
                 output.extend(chunk[: 16384 - len(output)])
@@ -237,6 +245,8 @@ class PythonSession:
                 async with asyncio.timeout(deadline):
                     self._request_id += 1
                     request = json.dumps({"id": self._request_id, "code": code}).encode() + b"\n"
+                    if self._process.stdin.is_closing():
+                        raise PythonExecutionError("Python sandbox connection closed")
                     self._process.stdin.write(request)
                     await self._process.stdin.drain()
                     line = await self._process.stdout.readline()
