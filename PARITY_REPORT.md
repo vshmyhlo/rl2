@@ -30,7 +30,8 @@ head width 128, vocabulary 151936, tied embeddings, split-half RoPE and Q/K RMSN
 Primary precision is BF16 checkpoint storage and computation. RMSNorm statistics,
 RoPE angles, softmax and next-token loss use FP32; normalization casts back before
 weight multiplication. JAX widens BF16 vocabulary logits to FP32 at its public API.
-Torch autocast and TF32 are disabled; JAX matmuls request highest precision.
+This audit disabled Torch autocast and TF32 and requested highest JAX matmul
+precision. Current JAX operations use backend defaults; those overrides were removed.
 Torch permits reduced-precision BF16 GEMM reductions by default. SiLU now uses
 FP32 internal arithmetic, matching PyTorch, then returns the activation dtype.
 FP32 rows are separate diagnostics. Forward uses evaluation mode; backward uses

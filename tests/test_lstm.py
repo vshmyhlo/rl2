@@ -71,7 +71,6 @@ def test_bf16_lstm_accepts_weakly_typed_float32_carry() -> None:
     ],
     ids=["fresh", "continued", "bf16", "stack-no-mlp", "stack-continued", "stack-bf16"],
 )
-@jax.default_matmul_precision("highest")
 def test_lstm_sequence_step_chunks_and_resets(
     dtype: jax.typing.DTypeLike, supplied_carry: bool, num_layers: int, intermediate_size: int
 ) -> None:
@@ -136,7 +135,6 @@ def test_lstm_gradients_follow_history_but_stop_at_episode_reset(stacked: bool) 
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
-@jax.default_matmul_precision("highest")
 def test_batched_projection_gradients_match_original_cell(dtype: jax.typing.DTypeLike) -> None:
     model = LSTM(4, dtype=dtype)
     x = jax.random.normal(jax.random.key(0), (4, 2, 3)).astype(dtype)  # (T, B, I)

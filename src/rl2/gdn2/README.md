@@ -226,11 +226,9 @@ outputs. Decoding can also be differentiated, using the chunked backward.
 
 The kernels retain float32 internal activations and state, including when dense
 projections use bfloat16. Float32 matrix products use `tf32x3`, rather than
-single-pass TF32. JAX's dense projections still follow its matrix-precision
-setting. For strict float32 comparisons, set
-`JAX_DEFAULT_MATMUL_PRECISION=highest` before launching Python (or use
-`jax.default_matmul_precision("highest")` around tracing). The real 370M
-checkpoint matched the portable backend within `1.3e-5` on logits for a
+single-pass TF32. JAX's dense projections use backend defaults. In a historical
+comparison with highest matmul precision, the real 370M checkpoint matched
+the portable backend within `1.3e-5` on logits for a
 65-token prefill plus matching greedy predictions and three cached decoding
 steps on the A100. With JAX's default matrix precision, the same prefill had
 maximum logit difference `0.008`, with all greedy predictions matching.

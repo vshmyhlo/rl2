@@ -306,8 +306,8 @@ Optimizer state, gradients, log probabilities, and loss use FP32. Learner
 `attention_backend` defaults to `cudnn`, which had lower worst-case sampled-token
 error in the A100 vLLM audit; `tokamax` and `xla` remain available. `scan_layers`
 and `gradient_checkpointing` default to true. `nvida.env` selects O1, 90% GPU memory
-preallocation, full FP32 matmul precision, and disables TF32. BF16 model computation
-and FP32 logits remain enabled. See the
+preallocation, and leaves matmul precision at backend defaults. BF16 model
+computation and FP32 logits remain enabled. See the
 [publication parity suite](../../docs/qwen3.md#parity-with-the-grpo-v2-vllm-server).
 The [current audit](../../qwen3_vllm_parity.md) still finds out-of-range ratios
 with unchanged weights at 4,096 tokens, for both Tokamax and cuDNN. Corrected RoPE

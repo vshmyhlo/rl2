@@ -60,7 +60,9 @@ fell from `0.239763` to `0.215575`, while its temperature-0.7 maximum rose from
 cuDNN for GRPO v2 and ALFWorld because its worst sampled-token error was lower,
 and disables rollout prefetching to avoid policy staleness. This does not resolve
 the parity failures above; the standalone Qwen3 default remains Tokamax.
-The updated environment sets JAX matmul precision to `highest` and disables TF32.
+At the time of this audit, the environment set JAX matmul precision to `highest`
+and disabled TF32. Those overrides have since been removed; current operations
+use backend defaults.
 A tiny uncached CUDA GRPO update and FP32-head gradient check pass with these
 settings. The existing small cached-attention cuDNN test fails to build an
 execution plan even with both new precision settings removed; that path is not

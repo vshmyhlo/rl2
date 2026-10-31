@@ -322,9 +322,7 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
     )
 
 
-@jax.default_matmul_precision("highest")
 def test_recurrent_sequences_match_steps_and_reset_only_finished_env() -> None:
-    # Test sequence/reset semantics in float32, without GPU TF32 approximation.
     model = ActorCritic(
         ppo.DiscreteSpace(3),
         replace(small_model_config(), encoder=ppo.RGBEncoderConfig(stages=(ConvStage(4, blocks=1),), embedding_size=6)),

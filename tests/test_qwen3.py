@@ -165,24 +165,19 @@ def test_bfloat16_residual_normalization() -> None:
     np.testing.assert_array_equal(stored, [[1.0, 1.9921875, 3.0, 3.984375]])
 
 
-def test_bfloat16_projection_accumulates_in_float32() -> None:
-    if jax.default_backend() != "gpu":
-        pytest.skip("Regression for shape-dependent CUDA GEMM selection")
-    row = jax.random.normal(jax.random.key(1), (2048,)).astype(jnp.bfloat16)  # (I,)
-    weight = (0.01 * jax.random.normal(jax.random.key(2), (1024, 2048))).astype(jnp.bfloat16)  # (O, I)
-    # This row count selects a less accurate cuBLAS algorithm with Precision.HIGHEST.
-    inputs = jnp.tile(row, (4021, 1))  # (M, I)
-    expected = jnp.matmul(
-        row.astype(jnp.float32), weight.astype(jnp.float32).T, precision=jax.lax.Precision.HIGHEST
-    ).astype(jnp.bfloat16)  # (O,)
-    actual = jax.jit(_linear, static_argnames="dtype")(inputs, weight, "bfloat16")  # (M, O)
-    assert actual.shape == (4021, 1024)
-    assert actual.dtype == jnp.bfloat16
-    # Allow rare FP32 reduction-order rounding ties, not BF16 partial-sum errors.
-    error = jnp.abs(actual[0].astype(jnp.float32) - expected.astype(jnp.float32))  # (O,)
-    assert float(error.mean()) < 1e-5
-    assert float(jnp.mean(error != 0)) < 0.005
-    np.testing.assert_array_equal(actual[0], actual[-1])
+@pytest.mark.parametrize(
+    "dtype,shape",
+    [("float32", (2, 2)), ("bfloat16", (1, 2, 2))],
+    ids=["fp32-matrix", "bf16-batched"],
+)
+def test_projection_shape_and_compute_dtype(dtype: str, shape: tuple[int, ...]) -> None:
+    inputs = jnp.array([[0.25, 0.5], [1.0, -0.25]], jnp.float32).reshape(shape)  # (..., I=2)
+    weight = jnp.array([[1.0, 2.0], [-1.0, 0.5], [0.25, -0.5]], jnp.float32)  # (O=3, I)
+    expected = jnp.array([[1.25, 0.0, -0.1875], [0.5, -1.125, 0.375]]).reshape((*shape[:-1], 3))  # (..., O)
+    actual = jax.jit(_linear, static_argnames="dtype")(inputs, weight, dtype)  # (..., O)
+    assert actual.shape == (*shape[:-1], 3)
+    assert actual.dtype == jnp.dtype(dtype)
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_bfloat16_projection_preserves_float32_output_gradients() -> None:
@@ -235,9 +230,7 @@ def test_bfloat16_logits_retain_float32_accumulation(model: Qwen3LM, params: Par
     tokens = jnp.array([[1, 4, 2], [0, 1, 4]], jnp.int32)  # (B=2, T=3)
     embedding = params["model.embed_tokens.weight"].astype(jnp.bfloat16)  # (V=13, D=8)
     hidden = jax.jit(_rms_norm)(embedding[tokens], params["model.norm.weight"], model.config.rms_norm_eps)  # (B, T, D)
-    expected = jnp.matmul(
-        hidden.astype(jnp.float32), embedding.astype(jnp.float32).T, precision=jax.lax.Precision.HIGHEST
-    )  # (B, T, V)
+    expected = jnp.matmul(hidden.astype(jnp.float32), embedding.astype(jnp.float32).T)  # (B, T, V)
     actual = jax.jit(model.apply)({"params": params}, tokens).logits  # (B, T, V)
     assert actual.shape == (2, 3, 13)
     assert actual.dtype == jnp.float32

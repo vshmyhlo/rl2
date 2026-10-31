@@ -461,9 +461,10 @@ Per-padding/per-step errors and reference metadata are emitted as JSON by pytest
 
 ### Corrections and efficiency findings
 
-1. **FP32 attention precision:** explicitly request highest precision in XLA and
-   Tokamax. Before this fix, XLA's real-checkpoint maximum error was `0.039366`;
-   it is now `0.000068665`. Linear projections already requested highest precision.
+1. **FP32 attention precision:** the audit requested highest precision in XLA,
+   Tokamax, and linear projections, reducing XLA's real-checkpoint maximum error
+   from `0.039366` to `0.000068665`. These overrides have since been removed;
+   current operations use backend defaults, so those measurements are historical.
 2. **Tokamax small-head GPU bug:** tensor-core attention with head width 4/8
    produced large errors (tiny-model logit error up to `0.5`), hidden by CPU tests.
    Padding heads below 16 with zeros, retaining the original scale and trimming

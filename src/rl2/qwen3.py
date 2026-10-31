@@ -153,18 +153,10 @@ def _linear(
     adapter: LoRAWeights | None = None,  # (R, I), (O, R).
     lora_scale: float = 1.0,
 ) -> jax.Array:  # (..., O)
-    # HIGHEST alone permits shape-dependent BF16 partial reductions in CUDA GEMMs.
-    # Keep FP32 outputs on HIGHEST to preserve FP32 cotangents during backward.
     result_dtype = jnp.dtype(dtype if output_dtype is None else output_dtype)
-    precision = (
-        jax.lax.DotAlgorithmPreset.BF16_BF16_F32
-        if jnp.dtype(dtype) == result_dtype == jnp.bfloat16
-        else jax.lax.Precision.HIGHEST
-    )
     output = jnp.matmul(
         _compute_cast(inputs, dtype),
         _compute_cast(weight, dtype).T,
-        precision=precision,
         preferred_element_type=output_dtype,
     )  # (..., O)
     if adapter is None:
@@ -225,8 +217,7 @@ def _attention(
     is_causal: bool,
 ) -> jax.Array:  # (B, T, N, H)
     if backend == "xla":
-        with jax.default_matmul_precision("highest"):
-            return jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")  # (B, T, N, H)
+        return jax.nn.dot_product_attention(query, key, value, mask=mask, implementation="xla")  # (B, T, N, H)
 
     width = query.shape[1]
     # Avoid empty fused softmaxes; preserve XLA's mean-value output for fully masked queries.
@@ -260,7 +251,6 @@ def _attention(
             mask=mask,
             is_causal=is_causal,
             scale=head_dim**-0.5,
-            precision=jax.lax.Precision.HIGHEST,
             implementation="triton",
         )[..., :head_dim]  # (B, T, N, H)
     else:
