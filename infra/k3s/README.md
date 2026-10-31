@@ -429,6 +429,19 @@ GPU Job to `training/gpu` (one GPU by default):
 ./submit.py --gpus 2 -- uv run python path/to/multi_gpu_train.py
 ```
 
+For Reasoning Gym's Python tool, configure the offline runsc runtime as described in
+[sandbox prerequisites](../../src/rl2/sandbox/README.md#prerequisites), then use:
+
+```bash
+sudo k3s kubectl apply -f infra/k3s/training/python-sandbox.yaml
+./submit.py --python-sandbox --gpus 2 --memory-gib 64 -- \
+  uv run python src/rl2/train_grpo_v2.py --config configs/grpo_v2/mix.yaml
+```
+
+The training image includes `kubectl`. `--python-sandbox` opts into a service account
+with pod management and exec permissions only in `sandbox`; other jobs receive no
+service-account token. Sandbox pods themselves never mount these credentials.
+
 `--gpus` accepts `1` or `2` per Job, including each trial in a sweep. The NVIDIA
 device plugin and runtime expose only the allocated GPUs inside the container;
 leave `NVIDIA_VISIBLE_DEVICES` and `CUDA_VISIBLE_DEVICES` to the runtime and trainer.

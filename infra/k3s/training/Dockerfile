@@ -31,6 +31,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=README.md,target=/app/README.md \
     --mount=type=bind,source=src,target=/app/src \
     uv sync --locked --no-dev ${UV_EXTRA:+--extra=$UV_EXTRA}
+COPY --from=registry.k8s.io/kubectl:v1.36.5 /bin/kubectl /usr/local/bin/kubectl
+RUN kubectl version --client
 COPY --exclude=data . .
 # Preserve the built environment when a command uses uv run.
 ENV UV_NO_SYNC=1 UV_ENV_FILE=/app/nvida.env PATH="/app/.venv/bin:${CUDA_HOME}/bin:$PATH"

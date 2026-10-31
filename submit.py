@@ -29,6 +29,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--cpus", type=int, choices=range(1, 11), default=10, metavar="1..10")
     parser.add_argument("--memory-gib", type=int, choices=range(1, 65), default=32, metavar="1..64")
     parser.add_argument("--extra", choices=("bfcl",), help="Include an optional dependency group in the image")
+    parser.add_argument(
+        "--python-sandbox", action="store_true", help="Allow this job to manage offline Python sandbox pods"
+    )
     parser.add_argument("--sweep", type=Path, help="Sweep YAML; omit --config from COMMAND")
     parser.add_argument("--dry-run", action="store_true", help="Print the submission plan without building or queuing")
     if "--" not in argv:
@@ -114,6 +117,10 @@ def job_manifest(args: argparse.Namespace, name: str, image: str) -> dict[str, A
             },
         },
     }
+    if args.python_sandbox:
+        pod = manifest["spec"]["template"]["spec"]
+        pod["serviceAccountName"] = "python-sandbox"
+        pod["automountServiceAccountToken"] = True
     return manifest
 
 
@@ -128,6 +135,7 @@ def submit(args: argparse.Namespace) -> list[str]:
                     "command": args.command,
                     "extra": args.extra,
                     "gpus": args.gpus,
+                    "python_sandbox": args.python_sandbox,
                     "sweep": sweep.name if sweep else None,
                     "trials": configs,
                 },
@@ -166,6 +174,9 @@ def submit_jobs(args: argparse.Namespace, manifests: list[dict[str, Any]], image
     subprocess.run([*kubectl, "-n", "training", "get", "localqueue", "gpu"], check=True)
     subprocess.run([*kubectl, "get", "workloadpriorityclass", f"train-{args.prio}"], check=True)
     subprocess.run([*kubectl, "-n", "training", "get", "pvc", "training-runs"], check=True)
+    if args.python_sandbox:
+        subprocess.run([*kubectl, "-n", "training", "get", "serviceaccount", "python-sandbox"], check=True)
+        subprocess.run([*kubectl, "get", "runtimeclass", "runsc-no-network"], check=True)
     for payload in payloads:
         subprocess.run([*kubectl, "create", "--dry-run=server", "-f", "-"], input=payload, text=True, check=True)
     subprocess.run([*privilege, "systemctl", "is-active", "--quiet", "rl2-image-pins.timer"], check=True)

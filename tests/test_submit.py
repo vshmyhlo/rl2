@@ -23,6 +23,8 @@ def test_default_gpu_job() -> None:
     assert job["spec"]["backoffLimit"] == 0
     pod = job["spec"]["template"]["spec"]
     assert pod["runtimeClassName"] == "nvidia"
+    assert pod["automountServiceAccountToken"] is False
+    assert "serviceAccountName" not in pod
     container = pod["containers"][0]
     assert container["imagePullPolicy"] == "Never"
     assert container["workingDir"] == "/app"
@@ -71,6 +73,19 @@ def test_grpo_timeline_directory_is_persistent() -> None:
         {"name": "ray-dashboard", "containerPort": 8265},
         {"name": "vllm", "containerPort": 8000},
     ]
+
+
+def test_python_sandbox_access_is_opt_in() -> None:
+    args = submit.parse_args(["--python-sandbox", "--", "python", "train.py"])
+    with patch("subprocess.run") as run:
+        submit.submit(args)
+    calls = run.call_args_list
+    pod = json.loads(calls[-1].kwargs["input"])["spec"]["template"]["spec"]
+    assert pod["serviceAccountName"] == "python-sandbox"
+    assert pod["automountServiceAccountToken"] is True
+    build_index = next(index for index, call in enumerate(calls) if "buildctl" in call.args[0])
+    assert any(call.args[0][-3:] == ["get", "serviceaccount", "python-sandbox"] for call in calls[:build_index])
+    assert any(call.args[0][-3:] == ["get", "runtimeclass", "runsc-no-network"] for call in calls[:build_index])
 
 
 @pytest.mark.parametrize(

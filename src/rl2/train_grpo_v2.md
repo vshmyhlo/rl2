@@ -95,9 +95,10 @@ Python requires the [sandbox prerequisites](sandbox/README.md#prerequisites), in
 `kubectl` and Kubernetes credentials in the rollout caller. Taskset fields
 `python_namespace` (default `sandbox`) and `python_kubectl` (default `[kubectl]`)
 configure access. For training launched directly on the k3s host, use
-`python_kubectl: [sudo, -n, k3s, kubectl]`. Inside training pods, provide `kubectl`
-and a service account with the documented permissions in the sandbox namespace;
-the current training image and submission manifest do not provide these automatically.
+`python_kubectl: [sudo, -n, k3s, kubectl]`. For cluster training, the image includes
+`kubectl`; submit with `--python-sandbox` to mount the dedicated service-account token.
+Apply `infra/k3s/training/python-sandbox.yaml` once to grant pod management and exec
+access only in `sandbox`. The node still needs the offline runsc runtime configured.
 Credentials stay in the trusted caller, never in the Python sandbox.
 
 The model calls `submit_answer(answer=...)` with a string in the question's

@@ -429,6 +429,9 @@ def test_mix_preset_accepts_native_reasoning_rewards() -> None:
         "number_filtering",
         "word_sorting",
         "caesar_cipher",
+        "rotate_matrix",
+        "base_conversion",
+        "shortest_path",
     }
     rewards: list[float] = []
     for task in tasks:

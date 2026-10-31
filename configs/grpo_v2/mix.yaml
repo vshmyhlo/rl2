@@ -13,6 +13,7 @@ attention_backend: tokamax
 scan_layers: true
 gradient_checkpointing: true
 padding_multiple: 1024
+# Moderate computation tasks for calculator/Python; bounded inputs fit the transcript budget.
 tasksets:
   alfworld:
     weight: 1.0
@@ -25,43 +26,43 @@ tasksets:
       id: reasoning_gym
       task: basic_arithmetic
       task_config:
-        min_terms: 2
-        max_terms: 3
-        min_digits: 1
-        max_digits: 1
-        operators: ["+", "-"]
-        allow_parentheses: false
-        allow_negation: false
+        min_terms: 4
+        max_terms: 8
+        min_digits: 2
+        max_digits: 4
+        operators: ["+", "-", "*", "/"]
+        allow_parentheses: true
+        allow_negation: true
   leg_counting:
     weight: 1.0
     taskset:
       id: reasoning_gym
       task: leg_counting
       task_config:
-        min_animals: 1
-        max_animals: 3
-        min_instances: 1
-        max_instances: 3
+        min_animals: 4
+        max_animals: 8
+        min_instances: 5
+        max_instances: 50
   letter_counting:
     weight: 1.0
     taskset:
       id: reasoning_gym
       task: letter_counting
       task_config:
-        min_words: 1
-        max_words: 3
+        min_words: 12
+        max_words: 30
   number_sorting:
     weight: 1.0
     taskset:
       id: reasoning_gym
       task: number_sorting
       task_config:
-        min_numbers: 3
-        max_numbers: 5
+        min_numbers: 12
+        max_numbers: 24
         min_decimals: 0
-        max_decimals: 0
-        min_value: 0
-        max_value: 20
+        max_decimals: 3
+        min_value: -1000
+        max_value: 1000
   gcd:
     weight: 1.0
     taskset:
@@ -69,9 +70,9 @@ tasksets:
       task: gcd
       task_config:
         min_numbers: 2
-        max_numbers: 2
-        min_value: 2
-        max_value: 30
+        max_numbers: 3
+        min_value: 100
+        max_value: 100000
   lcm:
     weight: 1.0
     taskset:
@@ -79,49 +80,80 @@ tasksets:
       task: lcm
       task_config:
         min_numbers: 2
-        max_numbers: 2
-        min_value: 2
-        max_value: 12
+        max_numbers: 4
+        min_value: 10
+        max_value: 500
   count_primes:
     weight: 1.0
     taskset:
       id: reasoning_gym
       task: count_primes
       task_config:
-        min_n: 1
-        max_n: 30
+        min_n: 100
+        max_n: 10000
   number_filtering:
     weight: 1.0
     taskset:
       id: reasoning_gym
       task: number_filtering
       task_config:
-        min_numbers: 3
-        max_numbers: 5
+        min_numbers: 12
+        max_numbers: 24
         min_decimals: 0
-        max_decimals: 0
-        min_value: 0
-        max_value: 20
+        max_decimals: 3
+        min_value: -1000
+        max_value: 1000
   word_sorting:
     weight: 1.0
     taskset:
       id: reasoning_gym
       task: word_sorting
       task_config:
-        min_words: 3
-        max_words: 5
+        min_words: 12
+        max_words: 24
         min_word_length: 3
-        max_word_length: 6
+        max_word_length: 12
   caesar_cipher:
     weight: 1.0
     taskset:
       id: reasoning_gym
       task: caesar_cipher
       task_config:
-        min_words: 3
-        max_words: 5
+        min_words: 10
+        max_words: 25
         min_rotation: 1
-        max_rotation: 3
+        max_rotation: 25
+  rotate_matrix:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: rotate_matrix
+      task_config:
+        min_n: 4
+        max_n: 8
+        min_rotations: 1
+        max_rotations: 3
+  base_conversion:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: base_conversion
+      task_config:
+        min_base: 2
+        max_base: 16
+        min_value: 1000
+        max_value: 1000000
+  shortest_path:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: shortest_path
+      task_config:
+        min_rows: 6
+        max_rows: 10
+        min_cols: 6
+        max_cols: 10
+        p_blocked: 0.2
 seed: 1
 
 num_groups: 4 # verl data.train_batch_size (task groups).
