@@ -3,8 +3,8 @@
 `train_grpo_v2.py` finetunes Qwen3 with a JAX learner, a vLLM inference server,
 and a small custom tool-calling interaction loop. `tasksets` is a mapping keyed by
 unique, nonblank taskset identifiers. Each entry contains
-a relative `weight` (default 1) and a `taskset` with `id: alfworld`, `appworld`, or
-`reasoning_gym`; the other environment presets are unsupported. For example:
+a relative `weight` (default 1) and a `taskset` with `id: alfworld`, `appworld`,
+`codegym`, or `reasoning_gym`; the other environment presets are unsupported. For example:
 
 ```yaml
 tasksets:
@@ -50,6 +50,30 @@ persist between calls; API discovery and task completion use the preloaded `apis
 object. Completion awards `float(world.evaluate().success)` once; earlier steps
 and rollouts that stop without completion receive zero reward.
 
+For [CodeGym](https://github.com/StigLidu/CodeGym), deploy the
+[cluster server](../../infra/k3s/codegym/README.md), then use
+`configs/grpo_v2/codegym.yaml`. `taskset.manager_url` addresses the upstream
+HTTP manager; its allocated worker ports must be reachable on the same host.
+The preset uses the internal cluster DNS name and all four pinned English
+training shards. `taskset.dataset_file` also accepts local JSONL or Parquet files.
+Rows must contain system function documentation followed by a user message
+with a `Question:` section, an `ability` specification, and optionally
+`plugin_call_max_round` (default 256).
+
+The model uses `call_function(name, parameters)` with a JSON object for arguments.
+The adapter retains function documentation and the question, replacing upstream
+formatting instructions with the current Qwen tool interface. Each attempt
+owns an independent server session; reset and rollout exit stop it and release
+the worker. Server failures propagate as infrastructure errors. CodeGym's
+binary score is `float(upstream_reward > 0)`; step rewards are changes in that
+score, so a persistent success is counted once. Episodes stop when the server
+finishes or the row's call limit is reached, subject to the agent's turn, token,
+and timeout budgets. No final-text answer grading is performed.
+
+The preset allows 8192 transcript tokens and 32 concurrent episodes without
+prefetching, fitting the deployed 40-worker pool. Size the pool for concurrent
+episodes across all jobs before increasing prefetching or batch sizes.
+
 Run on Linux x86_64 with Python 3.12 and two visible GPUs:
 
 ```bash
@@ -70,6 +94,7 @@ Reasoning Gym also supports internal mixtures: use `task: composite` and put a l
 All tasksets provide an indefinite stream, creating one task per requested group.
 ALFWorld and AppWorld retain their discovered ID catalogs and sample uniformly
 with replacement; task objects and environments are created on demand.
+CodeGym samples uniformly from its loaded task rows with replacement.
 Task discovery completes during actor startup, outside the async rollout loop.
 The checkpointed task RNG restores both weighted selection and each stream's
 continuation; keep taskset identifiers, weights, settings, and finite catalogs

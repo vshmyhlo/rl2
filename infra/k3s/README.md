@@ -209,6 +209,13 @@ data; no W&B server is running.
 
 See [MLflow tracking server documentation](https://mlflow.org/docs/latest/self-hosting/architecture/tracking-server/).
 
+## CodeGym environment server
+
+Deploy the CPU-only CodeGym manager and workers using
+[these instructions](codegym/README.md). Training pods connect to
+`http://codegym.codegym.svc.cluster.local:8000`; the server runs separately
+from GPU training jobs. Use `configs/grpo_v2/codegym.yaml` for GRPO v2.
+
 ## GPU, host, and job monitoring
 
 Grafana shows the A100's utilization, memory bandwidth utilization, used/total

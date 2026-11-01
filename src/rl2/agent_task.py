@@ -16,8 +16,9 @@ from pydantic import BaseModel, ConfigDict
 
 
 class ToolParameter(TypedDict):
-    type: Literal["string", "integer", "number", "boolean"]
+    type: Literal["string", "integer", "number", "boolean", "object"]
     description: NotRequired[str]
+    additionalProperties: NotRequired[bool]
 
 
 class ToolParameters(TypedDict):

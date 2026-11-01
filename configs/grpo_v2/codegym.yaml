@@ -1,18 +1,25 @@
 model: Qwen/Qwen3-0.6B
-taskset:
-  id: codegym
-  manager_url: http://127.0.0.1:8001 # vLLM uses port 8000.
-  server:
-    root: /runs/codegym # Prepare with: uv run python -m rl2.codegym_setup
-    workers: 40
-  # Full English-task/English-environment train split (80,130 rows across all four shards).
-  dataset_file: hf://datasets/VanishD/CodeGym@85286359a342f7a288aea74273772b69b9b784c2/task_en_instruction_en_env/train-*.parquet
+attention_backend: tokamax
+scan_layers: true
+gradient_checkpointing: true
+padding_multiple: 256
+tasksets:
+  codegym:
+    weight: 1.0
+    taskset:
+      id: codegym
+      manager_url: http://codegym.codegym.svc.cluster.local:8000
+      # Full English-task/English-environment train split (80,130 rows across all four shards).
+      dataset_file: hf://datasets/VanishD/CodeGym@85286359a342f7a288aea74273772b69b9b784c2/task_en_instruction_en_env/train-*.parquet
 seed: 3
 num_groups: 4
 group_size: 8
 total_iterations: null
-max_tokens: 512
+prefetch_batches: 0 # 32 concurrent episodes fit the cluster server's 40 workers.
+max_tokens: 8192 # Total transcript budget, including function documentation and observations.
 max_turns: 32
+rollout_timeout: 1200
+environment_timeout: 120
 temperature: 1.0
 learning_rate: 0.000001
 clip_coef: 0.2
@@ -20,6 +27,6 @@ max_grad_norm: 1.0
 update_epochs: 1
 minibatches_per_epoch: 4
 grad_accum_steps: 1
-weight_update_pause_mode: wait # wait, abort, or keep in-flight vLLM requests
+weight_update_pause_mode: wait # wait or keep in-flight vLLM requests
 run_id: grpo_v2_codegym_${path_name:${model}}_seed${seed}
-ckpt_dir: /runs/grpo_v2/${run_id} # Profiling artifacts; checkpointing is not implemented.
+ckpt_dir: /runs/grpo_v2/${run_id} # Checkpoints and profiling artifacts.

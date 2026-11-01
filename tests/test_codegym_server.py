@@ -2,6 +2,7 @@ import io
 import os
 import runpy
 import signal
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest.mock import MagicMock, Mock
 
 import httpx
 import pytest
+from fastapi import HTTPException
 
 from rl2 import codegym_server as server
 from rl2 import codegym_setup as setup
@@ -106,7 +108,8 @@ def test_readiness_failures(failure: str, monkeypatch: pytest.MonkeyPatch) -> No
     assert client.is_closed
 
 
-def test_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("host", ["127.0.0.1", "0.0.0.0"])
+def test_launcher(host: str, monkeypatch: pytest.MonkeyPatch) -> None:
     app = MagicMock()
     app.get.return_value = lambda function: function
     upstream = SimpleNamespace(
@@ -115,11 +118,22 @@ def test_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
     uvicorn = SimpleNamespace(run=Mock())
     monkeypatch.setitem(sys.modules, "env_instance_manager", upstream)
     monkeypatch.setitem(sys.modules, "uvicorn", uvicorn)
-    monkeypatch.setattr(sys, "argv", ["codegym_launcher", "--port", "8001", "--workers", "2"])
+    monkeypatch.setattr(sys, "argv", ["codegym_launcher", "--port", "8001", "--workers", "1", "--host", host])
     namespace = runpy.run_path(str(Path(server.__file__).with_name("codegym_launcher.py")), run_name="__main__")
-    assert app.state.workers == 2
-    uvicorn.run.assert_called_once_with(app, host="127.0.0.1", port=8001, access_log=False)
+    assert app.state.workers == 1
+    uvicorn.run.assert_called_once_with(app, host=host, port=8001, access_log=False)
     assert namespace["health"]() == {"pid": os.getpid(), "ports": [10000]}
+    connect = Mock(return_value=MagicMock())
+    monkeypatch.setattr(socket, "create_connection", connect)
+    assert namespace["ready"]() == {"workers": 1}
+    connect.assert_called_once_with(("127.0.0.1", 10000), timeout=1)
+    connect.side_effect = OSError()
+    with pytest.raises(HTTPException) as raised:
+        namespace["ready"]()
+    assert raised.value.status_code == 503
+    app.state.workers = 2
+    with pytest.raises(HTTPException, match="Workers are starting"):
+        namespace["ready"]()
 
 
 @pytest.mark.parametrize("failure", [None, "filename", "empty", "install"])
@@ -159,3 +173,38 @@ def test_setup(failure: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPa
     setup.prepare_codegym(tmp_path)
     assert len(downloads) == 5
     assert run.call_count == 2
+    setup.prepare_codegym(tmp_path, worker_host="0.0.0.0")
+    assert (tmp_path / "env_instance_manager.py").read_text() == 'ARGS = ["--host", "0.0.0.0"]'
+    assert len(downloads) == 10
+
+
+def test_setup_repairs_upstream_fstrings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    code = 'result = f"First column: [{self.dp[i][0] for i in range(self.n)}]"'
+    with pytest.raises(SyntaxError):
+        compile(code, "upstream.py", "exec")
+    monkeypatch.setattr(setup, "urlopen", Mock(side_effect=lambda *args, **kwargs: io.BytesIO(b"upstream")))
+    monkeypatch.setattr(setup.subprocess, "run", Mock())
+    monkeypatch.setattr(
+        setup,
+        "load_dataset",
+        Mock(return_value=[{"source": "Codeforces_5537_I", "env_name": "MinPathCostEnv", "env_code": code}]),
+    )
+    setup.prepare_codegym(tmp_path)
+    namespace = runpy.run_path(
+        str(tmp_path / "envs/codegym_v1/Codeforces_5537_I__MinPathCostEnv.py"),
+        init_globals={"self": SimpleNamespace(dp=[[1], [2]], n=2)},
+    )
+    assert namespace["result"] == "First column: [1, 2]"
+
+
+def test_setup_rejects_invalid_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(setup, "urlopen", Mock(side_effect=lambda *args, **kwargs: io.BytesIO(b"upstream")))
+    monkeypatch.setattr(setup.subprocess, "run", Mock())
+    monkeypatch.setattr(
+        setup,
+        "load_dataset",
+        Mock(return_value=[{"source": "Example", "env_name": "BrokenEnv", "env_code": "def broken("}]),
+    )
+    with pytest.raises(SyntaxError):
+        setup.prepare_codegym(tmp_path)
+    assert not (tmp_path / ".ready").exists()

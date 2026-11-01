@@ -399,7 +399,7 @@ def test_taskset_weight_rejects_invalid_values(weight: float) -> None:
         training.WeightedTasksetConfig(taskset=training.ReasoningGymConfig(), weight=weight)
 
 
-@pytest.mark.parametrize("name", ["alfworld", "appworld", "reasoning_gym"])
+@pytest.mark.parametrize("name", ["alfworld", "appworld", "reasoning_gym", "codegym"])
 def test_taskset_presets(name: str) -> None:
     path = Path(__file__).parents[1] / "configs" / "grpo_v2" / f"{name}.yaml"
     config = training.load_config(path, training.Config)
@@ -410,6 +410,17 @@ def test_taskset_presets(name: str) -> None:
     assert config.tasksets[key].weight == 1.0
     if name == "reasoning_gym":
         assert "reasoning_gym_leg_counting_" in config.run_id
+
+
+def test_codegym_task_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = training.CodeGymConfig()
+    task = Mock(spec=training.Task)
+    load = Mock(return_value=iter([task]))
+    monkeypatch.setattr(training, "stream_codegym_tasks", load)
+    rng = random.Random(3)
+    stream = training.stream_tasks({"codegym": training.WeightedTasksetConfig(taskset=config)}, rng, timeout=120)
+    assert next(stream) == training.SampledTask(taskset_id="codegym", task=task)
+    load.assert_called_once_with(config, rng)
 
 
 def test_mix_preset_accepts_native_reasoning_rewards() -> None:

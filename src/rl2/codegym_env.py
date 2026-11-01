@@ -1,34 +1,65 @@
-import json
-import re
-from collections.abc import AsyncGenerator, Iterable
+"""CodeGym tasks backed by the upstream HTTP manager and environment workers."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncGenerator, Generator
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass
-from typing import Any, Self
+from dataclasses import dataclass, field
+from random import Random
+from typing import Annotated, Any, ClassVar, Literal, Self
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
-import verifiers.v1 as vf
 from datasets import load_dataset
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError, model_validator
+from pydantic.dataclasses import dataclass as config_dataclass
+
+from rl2.agent_task import Environment, ResetResult, StepResult, Task, ToolCall, ToolCallError, ToolSchema
 
 CODEGYM_TRAIN_FILE = (
     "hf://datasets/VanishD/CodeGym@85286359a342f7a288aea74273772b69b9b784c2/task_en_instruction_en_env/train-*.parquet"
 )
+MANAGER_URL = "http://codegym.codegym.svc.cluster.local:8000"
+
+
+@config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class CodeGymConfig:
+    id: Literal["codegym"] = "codegym"
+    manager_url: Annotated[str, Field(pattern=r"^https?://", min_length=1)] = MANAGER_URL
+    dataset_file: Annotated[str, Field(min_length=1)] = CODEGYM_TRAIN_FILE
+    step_timeout: Annotated[float, Field(ge=3)] = 10
+
+
+class SystemMessage(BaseModel):
+    role: Literal["system"]
+    content: str = Field(min_length=1)
+
+
+class UserMessage(BaseModel):
+    role: Literal["user"]
+    content: str = Field(min_length=1)
 
 
 class CodeGymRow(BaseModel):
-    prompt: vf.Messages = Field(min_length=1)
+    prompt: tuple[SystemMessage, UserMessage]
     ability: str
     plugin_call_max_round: int = Field(default=256, ge=1)
 
     @model_validator(mode="after")
-    def validate_ability(self) -> Self:
+    def validate_task(self) -> Self:
         parts = self.ability.split("@", 2)
         if len(parts) != 3 or parts[0] != "codegym_v1" or not parts[1]:
             raise ValueError("Expected codegym_v1@environment_name@JSON_config ability")
         TypeAdapter(dict[str, JsonValue]).validate_json(parts[2])
+        if not self.prompt[1].content.partition("Question:")[2].strip():
+            raise ValueError("Expected a nonempty question after Question:")
         return self
+
+    @property
+    def question(self) -> str:
+        return self.prompt[1].content.partition("Question:")[2].strip()
 
 
 class CodeGymAction(BaseModel):
@@ -38,17 +69,41 @@ class CodeGymAction(BaseModel):
     parameters: dict[str, JsonValue]
 
 
-def parse_action(reply: str) -> str:
-    blocks = re.findall(r"<\|FunctionCallBegin\|>(.*?)<\|FunctionCallEnd\|>", reply, re.DOTALL)
-    if len(blocks) != 1:
-        raise ValueError("Return exactly one <|FunctionCallBegin|> JSON list <|FunctionCallEnd|> block")
-    try:
-        calls = json.loads(blocks[0])
-        if not isinstance(calls, list) or len(calls) != 1:
-            raise ValueError("Call exactly one function per step")
-        return CodeGymAction.model_validate(calls[0]).model_dump_json()
-    except RecursionError as error:
-        raise ValueError("Function call exceeds the JSON nesting limit") from error
+class Observation(BaseModel):
+    observation: str
+
+
+class Done(BaseModel):
+    done: bool
+
+
+class Reward(BaseModel):
+    reward: float
+
+
+def tool_schemas() -> list[ToolSchema]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "call_function",
+                "description": "Call one of the CodeGym functions documented in the system prompt.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Exact function name, including capitalization."},
+                        "parameters": {
+                            "type": "object",
+                            "description": "Function arguments as a JSON object; use {} for no arguments.",
+                            "additionalProperties": True,
+                        },
+                    },
+                    "required": ["name", "parameters"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
 
 
 async def request_json(client: httpx.AsyncClient, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
@@ -70,85 +125,119 @@ async def codegym_session(manager_url: str, ability: str) -> AsyncGenerator[Code
         manager = await resources.enter_async_context(httpx.AsyncClient(base_url=manager_url, timeout=120))
         instance = await request_json(manager, "GET", "/get_instance")
         resources.push_async_callback(
-            request_json, manager, "GET", "/release_instance", params={"uid": instance["uid"]}, timeout=None
+            request_json, manager, "GET", "/release_instance", params={"uid": instance["uid"]}, timeout=10
         )
         worker_url = httpx.URL(manager_url).copy_with(port=int(instance["port"]))
         worker = await resources.enter_async_context(httpx.AsyncClient(base_url=worker_url, timeout=120))
         session_id = str(uuid4())
         # Stop before releasing the worker, including when /start fails partway through.
         resources.push_async_callback(
-            request_json, worker, "POST", "/stop", json={"session_id": session_id}, timeout=None
+            request_json, worker, "POST", "/stop", json={"session_id": session_id}, timeout=10
         )
         env_name, env_str = ability.split("@", 1)
-        started = await request_json(
-            worker, "POST", "/start", json={"session_id": session_id, "env_name": env_name, "env_str": env_str}
+        started = Observation.model_validate(
+            await request_json(
+                worker, "POST", "/start", json={"session_id": session_id, "env_name": env_name, "env_str": env_str}
+            )
         )
-        yield CodeGymSession(client=worker, session_id=session_id, observation=started["observation"])
+        yield CodeGymSession(client=worker, session_id=session_id, observation=started.observation)
 
 
-class CodeGymData(vf.TaskData):
-    prompt: vf.Messages
-    ability: str
-    max_steps: int
+@dataclass(frozen=True, slots=True)
+class CodeGymTask(Task):
+    id: str = field()
+    config: CodeGymConfig
+    row: CodeGymRow
+    name: ClassVar[str] = "codegym"
+
+    @asynccontextmanager
+    async def init_env(self) -> AsyncGenerator[CodeGymEnvironment]:
+        async with AsyncExitStack() as resources:
+            yield CodeGymEnvironment(task=self, resources=resources)
 
 
-class CodeGymTask(vf.Task[CodeGymData]):
-    async def run(self, agent: vf.Agent, manager_url: str) -> vf.Trace:
-        async with codegym_session(manager_url, self.data.ability) as session:
-            # Open the original messages plus the server's initial observation as one prompt.
-            prompt = [*self.data.prompt, vf.UserMessage(content=session.observation)]
-            task = self.with_data(prompt=prompt).defer_scoring()
-            async with agent.interaction(task) as interaction:
-                segment = await interaction.turn()
-                for _ in range(self.data.max_steps):
-                    if segment.terminated:
-                        break
-                    try:
-                        action = parse_action(segment.last_reply)
-                    except ValueError as error:
-                        observation = f"Invalid function call: {error}"
-                    else:
-                        result = await request_json(
-                            session.client,
-                            "POST",
-                            "/step",
-                            json={"session_id": session.session_id, "action": action, "timeout": 10},
-                        )
-                        observation = result["observation"]
-                        done = await request_json(
-                            session.client, "GET", "/is_done", params={"session_id": session.session_id}
-                        )
-                        if done["done"]:
-                            interaction.trace.stop("codegym_done")
-                            break
-                    if interaction.trace.num_turns >= self.data.max_steps:
-                        interaction.trace.stop("codegym_max_steps")
-                        break
-                    segment = await interaction.turn(observation)
-                result = await request_json(session.client, "GET", "/reward", params={"session_id": session.session_id})
-                # Match upstream OnlineGymEnv.reward: positive environment reward means success.
-                interaction.trace.record_reward("codegym_reward", float(result["reward"] > 0))
-            return interaction.trace
+class CodeGymEnvironment(Environment):
+    def __init__(self, task: CodeGymTask, resources: AsyncExitStack) -> None:
+        self.task = task
+        self.resources = resources
+        self.session: CodeGymSession
+        self.steps = 0
+        self.score = 0.0
+
+    async def status(self) -> tuple[bool, float]:
+        params = {"session_id": self.session.session_id}
+        done = Done.model_validate(await request_json(self.session.client, "GET", "/is_done", params=params))
+        reward = Reward.model_validate(await request_json(self.session.client, "GET", "/reward", params=params))
+        return done.done, reward.reward
+
+    async def reset(self, *, timeout: float | None = None) -> ResetResult:
+        async with asyncio.timeout(timeout):
+            await self.resources.aclose()
+            self.session = await self.resources.enter_async_context(
+                codegym_session(self.task.config.manager_url, self.task.row.ability)
+            )
+            done, raw_reward = await self.status()
+        assert not done, "CodeGym reset must allow at least one step"
+        assert raw_reward == 0.0, "CodeGym reset must not award a reward"
+        self.steps = 0
+        self.score = 0.0
+        return ResetResult(
+            tools=tool_schemas(),
+            system_prompt=(
+                "Solve the task using the documented CodeGym functions. Use call_function once per turn, "
+                "passing the function name and a parameters object. Wait for each result before continuing. "
+                "Submit your answer through the documented completion function.\n\n" + self.task.row.prompt[0].content
+            ),
+            prompt=f"{self.task.row.question}\n\nInitial observation:\n{self.session.observation}",
+        )
+
+    async def step(self, action: ToolCall, *, timeout: float | None = None) -> StepResult:
+        if action.name != "call_function":
+            raise ToolCallError(f"Unknown CodeGym tool: {action.name}")
+        try:
+            call = CodeGymAction.model_validate(action.arguments)
+        except ValidationError as error:
+            raise ToolCallError(str(error)) from error
+        async with asyncio.timeout(timeout):
+            result = Observation.model_validate(
+                await request_json(
+                    self.session.client,
+                    "POST",
+                    "/step",
+                    json={
+                        "session_id": self.session.session_id,
+                        "action": call.model_dump_json(),
+                        "timeout": self.task.config.step_timeout,
+                    },
+                )
+            )
+            done, raw_reward = await self.status()
+        self.steps += 1
+        # Match upstream binary episode success without repeatedly adding its cumulative score.
+        score = float(raw_reward > 0)
+        reward = score - self.score
+        self.score = score
+        return StepResult(
+            observation=result.observation,
+            reward=reward,
+            done=done or self.steps >= self.task.row.plugin_call_max_round,
+        )
 
 
-class CodeGymTasksetConfig(vf.TasksetConfig):
-    data_file: str = CODEGYM_TRAIN_FILE
+def stream_codegym_tasks(config: CodeGymConfig, rng: Random) -> Generator[CodeGymTask]:
+    """Load the catalog at startup; sample rows uniformly with replacement per group."""
+    file_type = "parquet" if urlsplit(config.dataset_file).path.endswith(".parquet") else "json"
+    dataset = load_dataset(file_type, data_files={"train": config.dataset_file}, split="train")
+    if not len(dataset):
+        raise ValueError("CodeGym dataset is empty")
 
-
-class CodeGymTaskset(vf.Taskset[CodeGymTask, CodeGymTasksetConfig]):
-    def load(self) -> Iterable[CodeGymTask]:
-        file_type = "parquet" if urlsplit(self.config.data_file).path.endswith(".parquet") else "json"
-        dataset = load_dataset(file_type, data_files={"train": self.config.data_file}, split="train")
-        if not len(dataset):
-            raise ValueError("CodeGym dataset is empty")
-        for index, row in enumerate(dataset):
+    def stream() -> Generator[CodeGymTask]:
+        while True:
+            index = rng.randrange(len(dataset))
             try:
-                parsed = CodeGymRow.model_validate(row)
+                row = CodeGymRow.model_validate(dataset[index])
             except ValueError as error:
                 raise ValueError(f"Invalid CodeGym row {index}: {error}") from error
-            yield CodeGymTask(
-                data=CodeGymData(
-                    id=str(index), prompt=parsed.prompt, ability=parsed.ability, max_steps=parsed.plugin_call_max_round
-                ),
-                config=self.config.task,
-            )
+            yield CodeGymTask(id=str(index), config=config, row=row)
+
+    return stream()

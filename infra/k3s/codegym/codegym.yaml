@@ -1,0 +1,122 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: codegym
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codegym
+  namespace: codegym
+spec:
+  replicas: 1 # Manager allocations and worker ports belong to this one pod.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: codegym
+  template:
+    metadata:
+      labels:
+        app: codegym
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: codegym
+          image: rl2.local/codegym:3
+          imagePullPolicy: Never
+          args: [--host, 0.0.0.0, --port, "8000", --workers, "40"]
+          ports:
+            - name: manager
+              containerPort: 8000
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: manager
+            timeoutSeconds: 5
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: manager
+            timeoutSeconds: 5
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: manager
+            timeoutSeconds: 5
+            periodSeconds: 30
+            failureThreshold: 5
+          volumeMounts:
+            - name: logs
+              mountPath: /opt/codegym/logs
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: logs
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codegym
+  namespace: codegym
+spec:
+  clusterIP: None # DNS resolves the pod, including its allocated worker ports.
+  selector:
+    app: codegym
+  ports:
+    - name: manager
+      port: 8000
+      targetPort: manager
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: codegym
+  namespace: codegym
+spec:
+  podSelector:
+    matchLabels:
+      app: codegym
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: training
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegym
+      ports:
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 10000
+          endPort: 10039
+  egress: []

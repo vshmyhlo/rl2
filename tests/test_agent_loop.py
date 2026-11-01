@@ -17,7 +17,7 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
 from rl2 import agent_loop as loop
-from rl2 import alfworld_env
+from rl2 import alfworld_env, codegym_env
 from rl2.agent_task import Environment, ResetResult, Task, ToolSchema
 from rl2.alfworld_env import StepResult, ToolCall, tool_schemas
 from rl2.grpo_v2 import reasoning_gym
@@ -114,6 +114,59 @@ def make_agent(tokenizer: PreTrainedTokenizerFast, client: AsyncOpenAI) -> loop.
         temperature=0.7,
         rollout_timeout=10,
     )
+
+
+def test_codegym_rollout(tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch) -> None:
+    task = codegym_env.CodeGymTask(
+        id="0",
+        config=codegym_env.CodeGymConfig(),
+        row=codegym_env.CodeGymRow.model_validate(
+            {
+                "ability": "codegym_v1@Example__SumEnv@{}",
+                "prompt": [
+                    {"role": "system", "content": "Function: Done(answer: int) submits the sum."},
+                    {"role": "user", "content": "Old format: <|FunctionCallBegin|>\nQuestion: Add 1 and 2."},
+                ],
+            }
+        ),
+    )
+    finished = False
+
+    def backend(request: httpx.Request) -> httpx.Response:
+        nonlocal finished
+        if request.url.path == "/step":
+            payload = json.loads(request.content)
+            assert json.loads(payload["action"]) == {"name": "Done", "parameters": {"answer": 3}}
+            finished = True
+            return httpx.Response(200, json={"observation": "Correct"})
+        return httpx.Response(200, json={"done": finished, "reward": float(finished)})
+
+    @asynccontextmanager
+    async def session(manager_url: str, ability: str) -> AsyncGenerator[codegym_env.CodeGymSession]:
+        async with httpx.AsyncClient(base_url=manager_url, transport=httpx.MockTransport(backend)) as client:
+            yield codegym_env.CodeGymSession(client=client, session_id="test", observation="Ready")
+
+    monkeypatch.setattr(codegym_env, "codegym_session", session)
+    reply = (
+        '<tool_call>{"name":"call_function","arguments":'
+        '{"name":"Done","parameters":{"answer":3}}}</tool_call><|im_end|>'
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        prompt = tokenizer.decode(json.loads(request.content)["prompt"])
+        assert '"additionalProperties": true' in prompt
+        assert "Add 1 and 2" in prompt and "FunctionCallBegin" not in prompt
+        return httpx.Response(200, json=response_for(tokenizer, reply))
+
+    async def run() -> loop.Rollout:
+        async with make_client(respond) as client, task.init_env() as environment:
+            return await make_agent(tokenizer, client).run(env=environment)
+
+    rollout = asyncio.run(run())
+    assert rollout.reward == 1 and rollout.stop_condition == "environment_done"
+    sequence = rollout.sequence
+    assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
+    assert sequence.loss_mask.sum() == len(tokenizer.encode(reply, add_special_tokens=False))
 
 
 @pytest.mark.parametrize("mode", ["submitted", "calculator", "python", "python_failure", "plain_text", "truncated"])

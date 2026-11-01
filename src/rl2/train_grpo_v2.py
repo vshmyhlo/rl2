@@ -114,6 +114,7 @@ from rl2.agent_loop import Agent, Rollout, StopCondition, TrainingSequence
 from rl2.agent_task import Task
 from rl2.alfworld_env import ALFWorldConfig, stream_alfworld_tasks
 from rl2.appworld_env import AppWorldConfig, stream_appworld_tasks
+from rl2.codegym_env import CodeGymConfig, stream_codegym_tasks
 from rl2.configuration import BaseConfig, load_config
 from rl2.grpo_v2.reasoning_gym import ReasoningGymConfig, stream_reasoning_gym_tasks
 from rl2.grpo_v2.state import LoRATrainState
@@ -145,7 +146,7 @@ class LengthPenaltyConfig:
 
 @config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class WeightedTasksetConfig:
-    taskset: Annotated[ALFWorldConfig | AppWorldConfig | ReasoningGymConfig, Field(discriminator="id")]
+    taskset: Annotated[ALFWorldConfig | AppWorldConfig | CodeGymConfig | ReasoningGymConfig, Field(discriminator="id")]
     weight: Annotated[float, Field(ge=0, lt=float("inf"))] = 1.0
 
 
@@ -1216,6 +1217,8 @@ def stream_tasks(tasksets: TasksetConfigs, rng: random.Random, timeout: float) -
             streams[name] = stream_reasoning_gym_tasks(taskset, rng)
         elif isinstance(taskset, AppWorldConfig):
             streams[name] = stream_appworld_tasks(taskset, rng, timeout)
+        elif isinstance(taskset, CodeGymConfig):
+            streams[name] = stream_codegym_tasks(taskset, rng)
         else:
             streams[name] = stream_alfworld_tasks(taskset, rng, timeout)
         weights.append(entry.weight / max_weight)
