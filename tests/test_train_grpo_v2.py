@@ -432,6 +432,11 @@ def test_mix_preset_accepts_native_reasoning_rewards() -> None:
         "rotate_matrix",
         "base_conversion",
         "shortest_path",
+        "group_anagrams",
+        "fraction_simplification",
+        "largest_island",
+        "dice",
+        "bitwise_arithmetic",
     }
     rewards: list[float] = []
     for task in tasks:
@@ -443,11 +448,11 @@ def test_mix_preset_accepts_native_reasoning_rewards() -> None:
     assert any(0 < reward < 1 for reward in rewards)
     group = training.RolloutGroup(
         task_id="test-task",
-        rollouts=[Mock(spec=training.Rollout, reward=reward) for reward in rewards],
+        rollouts=[Mock(spec=training.Rollout, reward=reward, num_output_tokens=4096) for reward in rewards],
         length_penalty=config.length_penalty,
         taskset_id="test",
     )
-    assert group.training_rewards == rewards
+    assert group.training_rewards == pytest.approx([reward * 0.975 for reward in rewards])
 
 
 def test_weighted_task_stream(monkeypatch: pytest.MonkeyPatch, task_discovery: list[ALFWorldTask]) -> None:
@@ -2485,9 +2490,22 @@ def test_score_group_length_penalty_neutral_groups(reward: float, penalty: float
     assert group.is_degenerate
 
 
-@pytest.mark.parametrize("reward", [-1.0, 0.5, 2.0], ids=["negative", "partial-credit", "above-one"])
-def test_length_penalty_requires_binary_rewards(reward: float, rollout: training.Rollout) -> None:
-    with pytest.raises(ValueError, match="requires binary rewards"):
+def test_score_group_length_penalty_partial_credit(rollout: training.Rollout) -> None:
+    group = training.score_group(
+        Mock(id="task"),
+        [replace(rollout, reward=0.5, num_output_tokens=length) for length in (4096, 8192, 9000)],
+        length_penalty=training.LengthPenaltyConfig(penalty=0.05),
+        taskset_id="reasoning_gym",
+    )
+    assert group.training_rewards == pytest.approx([0.4875, 0.475, 0.475])
+    assert [sample.reward for sample in group.rollouts] == [0.5] * 3
+    assert [sample.advantage for sample in group.rollouts] == pytest.approx([1 / 120, -1 / 240, -1 / 240])
+    assert not group.is_degenerate
+
+
+@pytest.mark.parametrize("reward", [-1.0, 2.0], ids=["negative", "above-one"])
+def test_length_penalty_requires_unit_interval_rewards(reward: float, rollout: training.Rollout) -> None:
+    with pytest.raises(ValueError, match=r"requires rewards in \[0, 1\]"):
         training.score_group(
             Mock(id="task"),
             [rollout, replace(rollout, reward=reward)],
@@ -2496,7 +2514,7 @@ def test_length_penalty_requires_binary_rewards(reward: float, rollout: training
         )
 
 
-@pytest.mark.parametrize(("preset", "penalty"), [("alfworld", 0.05), ("reasoning_gym", 0.0)])
+@pytest.mark.parametrize(("preset", "penalty"), [("alfworld", 0.05), ("reasoning_gym", 0.0), ("mix", 0.05)])
 def test_length_penalty_presets(preset: str, penalty: float) -> None:
     path = Path(__file__).parents[1] / "configs" / "grpo_v2" / f"{preset}.yaml"
     config = training.load_config(path, training.Config)

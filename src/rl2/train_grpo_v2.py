@@ -33,7 +33,7 @@ Rollout batch scalars:
     rollout/reward_std: Population standard deviation of raw rollout rewards.
     rollout/reward_min: Minimum raw rollout reward.
     rollout/reward_max: Maximum raw rollout reward.
-    rollout/adjusted_reward_mean: Mean rollout reward after the success-only generated-token cost.
+    rollout/adjusted_reward_mean: Mean rollout reward after the reward-proportional generated-token cost.
     rollout/adjusted_reward_std: Population standard deviation of adjusted rollout rewards.
     rollout/adjusted_reward_min: Minimum adjusted rollout reward.
     rollout/adjusted_reward_max: Maximum adjusted rollout reward.
@@ -325,11 +325,11 @@ class RolloutGroup:
 
     @property
     def training_rewards(self) -> list[float]:
-        """Charge successful binary-reward rollouts for generated tokens only."""
+        """Reduce rewards in [0, 1] proportionally to generated tokens only."""
         if self.length_penalty.penalty == 0:
             return [rollout.reward for rollout in self.rollouts]
-        if any(rollout.reward not in (0.0, 1.0) for rollout in self.rollouts):
-            raise ValueError("Enabled length penalty requires binary rewards (0 or 1)")
+        if any(not 0.0 <= rollout.reward <= 1.0 for rollout in self.rollouts):
+            raise ValueError("Enabled length penalty requires rewards in [0, 1]")
         return [
             rollout.reward
             * (

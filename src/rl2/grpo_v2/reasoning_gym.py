@@ -167,12 +167,21 @@ class ReasoningGymWorker:
         return ResetResult(
             tools=tool_schemas(),
             system_prompt=(
-                "Solve the reasoning problem. You may use calculator for arithmetic and python for computation "
-                "before submitting your answer. Python variables persist across calls in this episode; "
-                "use print() to display results. Python has no network access. "
-                "Close </think> before each tool call. Call submit_answer exactly once "
-                "with your final answer as a string in the format requested by the question. "
-                "Put reasoning outside the answer argument. Use a complete <tool_call> JSON block."
+                "Solve the problem accurately and efficiently. You may use calculator for arithmetic and python "
+                "for computation. Keep reasoning brief.\n\n"
+                "Python variables persist across calls. Python has no network access. "
+                "Put the problem's input directly into your code; it is not available through "
+                "input(), sys.stdin, or pre-existing files. Use print() to display results.\n\n"
+                "Before executing code, check that it implements the requested operation and uses the exact input. "
+                "After execution, briefly check that the result satisfies the question. "
+                "Successful execution alone does not establish correctness.\n\n"
+                "If a tool reports an error, identify its cause and change the relevant code. "
+                "Do not repeat the same failed call or remove required computation just to make the code run. "
+                "If a result contradicts the problem, investigate before submitting. "
+                "Once the result is checked, submit without repeating the analysis.\n\n"
+                "Close </think> before each tool call and use a complete <tool_call> JSON block. "
+                "Call submit_answer exactly once, with your final answer as a string in the format requested. "
+                "Do not add explanations, extra brackets, or other wrappers inside the answer."
             ),
             prompt=self.entry["question"],
         )

@@ -154,6 +154,56 @@ tasksets:
         min_cols: 6
         max_cols: 10
         p_blocked: 0.2
+  group_anagrams:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: group_anagrams
+      task_config:
+        min_anagram_groups: 4
+        max_anagram_groups: 8
+        min_words_per_group: 2
+        max_words_per_group: 4
+  fraction_simplification:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: fraction_simplification
+      task_config:
+        min_value: 10
+        max_value: 1000
+        min_factor: 2
+        max_factor: 10
+        styles: ["plain"]
+  largest_island:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: largest_island
+      task_config:
+        min_rows: 6
+        max_rows: 10
+        min_cols: 6
+        max_cols: 10
+        min_num_islands: 2
+        max_num_islands: 5
+        min_island_size: 3
+        max_island_size: 12
+  dice:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: dice
+      task_config:
+        num_dice: 4
+        max_dice_size: 12
+  bitwise_arithmetic:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: bitwise_arithmetic
+      task_config:
+        difficulty: 2
 seed: 1
 
 num_groups: 4 # verl data.train_batch_size (task groups).
@@ -172,7 +222,7 @@ weight_update_pause_mode: wait
 drop_degenerate_groups: false
 length_penalty:
   reference_tokens: 8192 # Generated-token scale, independent of the transcript budget.
-  penalty: 0.0 # Disabled because Reasoning Gym tasks can award partial credit.
+  penalty: 0.05 # Up to a 5% reward reduction, including partial credit.
 max_tokens: 8192 # Total transcript tokens, including system, prompt, and tools.
 max_turns: 50
 rollout_timeout: 1200

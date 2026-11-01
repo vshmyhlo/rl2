@@ -194,7 +194,7 @@ up to three times; there are no fallback rewards for infrastructure failures.
 ## Training and resuming
 
 The actor samples `group_size` independent attempts at the same task.
-`length_penalty` charges successful rollouts for generated tokens across all turns,
+`length_penalty` proportionally reduces positive rewards for generated tokens across all turns,
 including thinking and tool-call text, excluding prompts and observations:
 
 ```yaml
@@ -203,14 +203,14 @@ length_penalty:
   penalty: 0.05
 ```
 
-When enabled, rewards must be binary (`0` for failure, `1` for success); other
+When enabled, rewards must be in `[0, 1]`, including partial credit; other
 rewards raise an error. Training reward is
 `reward * (1 - penalty * min(num_output_tokens / reference_tokens, 1))`.
-Failures remain zero; every success remains positive. The cost starts with the
-first generated token and caps at `penalty`. `reference_tokens` is a positive
+Zero rewards remain zero; positive rewards remain positive. The cost starts with the
+first generated token and caps at `reward * penalty`. `reference_tokens` is a positive
 fixed scale, independent of `max_tokens`; `penalty` must be in `[0, 1)`.
-Defaults are 8192 and 0 (disabled). ALFWorld enables 0.05; Reasoning Gym leaves
-it disabled because its scoring supports partial credit. Disabled penalties
+Defaults are 8192 and 0 (disabled). ALFWorld and the mixed-task preset enable 0.05;
+the standalone Reasoning Gym preset leaves it disabled. Disabled penalties
 preserve arbitrary task rewards. There is no warmup schedule.
 
 Advantages are `training_reward - group_mean`, with no standard-deviation scaling,
