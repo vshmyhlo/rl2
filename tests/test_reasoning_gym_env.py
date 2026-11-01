@@ -101,14 +101,10 @@ def test_calculator_feedback_and_episode_lifecycle() -> None:
         worker.step(calculation)
     initial = worker.reset()
     schemas = {tool["function"]["name"]: tool["function"] for tool in initial.tools}
-    assert set(schemas) == {"calculator", "python", "submit_answer"}
-    assert schemas["calculator"]["parameters"] == {
-        "type": "object",
-        "properties": {"expression": {"type": "string", "description": "Arithmetic expression to evaluate."}},
-        "required": ["expression"],
-        "additionalProperties": False,
-    }
-    assert "calculator" in initial.system_prompt
+    assert set(schemas) == {"python", "submit_answer"}
+    assert "calculator" not in initial.system_prompt
+    assert "import sympy" in schemas["python"]["description"]
+    assert "import z3" in schemas["python"]["description"]
     scorer = Mock(wraps=worker.dataset.score_answer)
     worker.dataset.score_answer = scorer
     for expression in ("1 / 0", "__import__('os').getcwd()"):

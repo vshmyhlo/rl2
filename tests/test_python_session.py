@@ -72,6 +72,7 @@ def test_persistent_state_errors_and_separate_sessions(commands: AsyncMock) -> N
     assert spec["activeDeadlineSeconds"] == 1800 and spec["restartPolicy"] == "Never"
     assert spec["securityContext"]["runAsNonRoot"]
     container = spec["containers"][0]
+    assert container["image"] == "rl2.local/python-sandbox:1"
     assert container["securityContext"] == {
         "allowPrivilegeEscalation": False,
         "readOnlyRootFilesystem": True,
@@ -357,6 +358,20 @@ def test_live_k3s_session(ending: str) -> None:
         async with sandbox.PythonSession(kubectl=("sudo", "-n", "k3s", "kubectl")) as session:
             assert (await session.execute("value = 40")).exit_code == 0
             assert (await session.execute("print(value + 2)")).output == "42\n"
+            if ending == "normal":
+                result = await session.execute(
+                    "import sympy, z3\n"
+                    "x = sympy.Symbol('x')\n"
+                    "assert sympy.solve(x**2 - 4, x) == [-2, 2]\n"
+                    "n = z3.Int('n')\n"
+                    "solver = z3.Solver()\n"
+                    "solver.add(n > 2, n < 4)\n"
+                    "assert solver.check() == z3.sat\n"
+                    "assert solver.model()[n].as_long() == 3\n"
+                    "print(sympy.__version__, z3.get_version_string())"
+                )
+                assert result.exit_code == 0, result.output
+                assert result.output == "1.14.0 4.15.4\n"
             result = await session.execute(
                 "import errno, os, resource, socket\n"
                 "assert os.getuid() == 65534\n"

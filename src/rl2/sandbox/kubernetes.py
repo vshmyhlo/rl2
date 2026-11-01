@@ -80,7 +80,7 @@ class PythonSession:
         self,
         *,
         namespace: str = "sandbox",
-        image: str = "python:3.12-slim-bookworm",
+        image: str = "rl2.local/python-sandbox:1",
         runtime_class: str = "runsc-no-network",
         kubectl: tuple[str, ...] = ("kubectl",),
         startup_timeout: float = 90,

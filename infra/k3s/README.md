@@ -429,7 +429,8 @@ GPU Job to `training/gpu` (one GPU by default):
 ./submit.py --gpus 2 -- uv run python path/to/multi_gpu_train.py
 ```
 
-For Reasoning Gym's Python tool, configure the offline runsc runtime as described in
+For Reasoning Gym's Python tool, build the package-equipped sandbox image and configure
+the offline runsc runtime as described in
 [sandbox prerequisites](../../src/rl2/sandbox/README.md#prerequisites), then use:
 
 ```bash

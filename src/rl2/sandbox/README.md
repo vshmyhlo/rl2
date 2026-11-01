@@ -36,9 +36,25 @@ pod deletion for a normal execution failure.
 - `kubectl` and credentials in the **trusted caller**, with namespaced
   create/get/list/watch/delete permissions on pods and create/get on pods/exec.
   For local k3s administration, pass `kubectl=("sudo", "-n", "k3s", "kubectl")`.
-- A trusted image containing `python` and `sleep`; default: `python:3.12-slim-bookworm`.
-  Preload it on the nodes for faster startup; pin a digest for reproducibility.
+- A trusted image containing `python` and `sleep`; default: `rl2.local/python-sandbox:1`.
+  It includes SymPy 1.14.0 (`import sympy`), Z3 4.15.4 (`import z3`), and mpmath 1.3.0.
+  Build and preload it on each sandbox node before running rollouts.
   Never use an image containing training data, credentials, or scoring code.
+
+Build into the local k3s image store using the project's BuildKit service, from the
+repository root:
+
+```bash
+sudo buildctl --addr unix:///run/rl2-buildkit/buildkitd.sock build \
+  --frontend dockerfile.v0 \
+  --local context=src/rl2/sandbox --local dockerfile=src/rl2/sandbox \
+  --output type=image,name=rl2.local/python-sandbox:1,unpack=true
+sudo k3s ctr -n k8s.io images label rl2.local/python-sandbox:1 io.cri-containerd.pinned=pinned
+```
+
+The image copies only the pinned package requirements. Package installation happens
+at build time; sessions remain offline. Use a new image tag when changing dependencies
+and update the `PythonSession` default and tool description together.
 
 No Docker daemon/socket is used. One persistent `kubectl exec` connection carries
 code and responses; the sandbox does not listen on a network port. The caller

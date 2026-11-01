@@ -49,26 +49,27 @@ def create_dataset(config: ReasoningGymConfig, seed: int) -> ProceduralDataset:
 
 def tool_schemas() -> list[ToolSchema]:
     return [
-        {
-            "type": "function",
-            "function": {
-                "name": "calculator",
-                "description": (
-                    "Evaluate arithmetic using numbers, parentheses, and + - * / // % ** only. "
-                    "Expressions are limited to 256 characters, exponent magnitudes to 100, "
-                    "and intermediate/result magnitudes to 1e100. Returns plain text: a number on success or "
-                    "'Error: ...' on failure, without ending the episode. Floating-point arithmetic is approximate."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "expression": {"type": "string", "description": "Arithmetic expression to evaluate."}
-                    },
-                    "required": ["expression"],
-                    "additionalProperties": False,
-                },
-            },
-        },
+        # Python handles arithmetic; keep the calculator schema disabled.
+        # {
+        #     "type": "function",
+        #     "function": {
+        #         "name": "calculator",
+        #         "description": (
+        #             "Evaluate arithmetic using numbers, parentheses, and + - * / // % ** only. "
+        #             "Expressions are limited to 256 characters, exponent magnitudes to 100, "
+        #             "and intermediate/result magnitudes to 1e100. Returns plain text: a number on success or "
+        #             "'Error: ...' on failure, without ending the episode. Floating-point arithmetic is approximate."
+        #         ),
+        #         "parameters": {
+        #             "type": "object",
+        #             "properties": {
+        #                 "expression": {"type": "string", "description": "Arithmetic expression to evaluate."}
+        #             },
+        #             "required": ["expression"],
+        #             "additionalProperties": False,
+        #         },
+        #     },
+        # },
         {
             "type": "function",
             "function": {
@@ -76,6 +77,9 @@ def tool_schemas() -> list[ToolSchema]:
                 "description": (
                     "Execute Python statements in an isolated, network-disabled sandbox. Variables, imports, "
                     "and files persist between calls in this episode. Use print() to return values. "
+                    "Includes the Python standard library, SymPy 1.14.0 (import sympy) for symbolic math "
+                    "and equation solving, and Z3 4.15.4 (import z3) for Boolean/integer constraints. "
+                    "Packages are preinstalled; no downloads or package installation are available. "
                     "Returns JSON with output (combined stdout/stderr; empty if no output was captured), "
                     "exit_code (0 for success, 1 for a Python exception), and output_truncated "
                     "(true if output was cut off). Python exceptions preserve state and do not end the episode. "
@@ -167,8 +171,8 @@ class ReasoningGymWorker:
         return ResetResult(
             tools=tool_schemas(),
             system_prompt=(
-                "Solve the problem accurately and efficiently. You may use calculator for arithmetic and python "
-                "for computation. Keep reasoning brief.\n\n"
+                "Solve the problem accurately and efficiently. You may use python for arithmetic, symbolic math, "
+                "constraint solving, and other computation. Keep reasoning brief.\n\n"
                 "Python variables persist across calls. Python has no network access. "
                 "Put the problem's input directly into your code; it is not available through "
                 "input(), sys.stdin, or pre-existing files. Use print() to display results.\n\n"

@@ -76,15 +76,13 @@ continuation; keep taskset identifiers, weights, settings, and finite catalogs
 unchanged when resuming. Sampling orders entries by identifier, so YAML key order
 does not affect the sequence. A single active taskset preserves its original sampling sequence.
 
-For Reasoning Gym, the model may call `calculator(expression=...)` before submitting.
-It accepts numbers, parentheses, and `+ - * / // % **`, using the bounded evaluator
-in `calculator.py`. Observations are plain text: a number on success or `Error: ...`
-on failure, with zero reward and the episode left active. Float results preserve
-the evaluated value's precision; floating-point arithmetic remains approximate.
-Calculator calls use the existing rollout budgets.
-The `python(code=...)` tool lazily creates one network-disabled gVisor pod and persistent
-interpreter per rollout. Variables and files persist across calls; use `print()` for
-output. Observations are JSON with `output` (stdout/stderr), `exit_code`, and
+For Reasoning Gym, the model sees `python(code=...)` and `submit_answer(answer=...)`.
+The calculator schema is disabled; Python handles arithmetic too.
+The Python tool lazily creates one network-disabled gVisor pod and persistent
+interpreter per rollout, with SymPy 1.14.0 (`import sympy`) for symbolic math and
+Z3 4.15.4 (`import z3`) for constraint solving preinstalled alongside the standard library.
+Variables and files persist across calls; use `print()` for output.
+Observations are JSON with `output` (stdout/stderr), `exit_code`, and
 `output_truncated`. Python exceptions return exit code 1 with zero reward and preserve
 state. Successful calls also receive zero reward. Each execution has a 5-second limit;
 startup has a separate 90-second limit, and the environment/rollout deadlines still apply.
@@ -95,7 +93,8 @@ Reset and rollout exit delete the sandbox,
 including when generation ends without submitting an answer.
 
 Python requires the [sandbox prerequisites](sandbox/README.md#prerequisites), including
-`kubectl` and Kubernetes credentials in the rollout caller. Taskset fields
+the built `rl2.local/python-sandbox:1` image on each sandbox node, `kubectl`, and
+Kubernetes credentials in the rollout caller. Taskset fields
 `python_namespace` (default `sandbox`) and `python_kubectl` (default `[kubectl]`)
 configure access. For training launched directly on the k3s host, use
 `python_kubectl: [sudo, -n, k3s, kubectl]`. For cluster training, the image includes
