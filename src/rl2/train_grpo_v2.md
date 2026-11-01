@@ -183,8 +183,12 @@ by remaining context; observations that cannot fit end the rollout without
 truncating existing tokens. Episodes with no sampled tokens fail the group.
 
 `rollout_timeout` bounds the whole episode; `environment_timeout` bounds task
-discovery and each reset/step request. HTTP failures, malformed sampling data,
-worker errors, and timeouts abort the group and cancel its other rollouts.
+discovery and each reset/step request. A Ray `ActorDiedError` restarts the affected
+episode in a fresh environment with the same task and seed, up to two retries
+within the original rollout deadline. Failed attempts are discarded, without
+fallback rewards. Actor constructor exceptions are not retried.
+Exhausted retries, other worker errors, HTTP failures,
+malformed sampling data, and timeouts abort the group and cancel its other rollouts.
 Environments close normally on success; errors and cancellations terminate ALFWorld
 actors immediately. AppWorld workers receive EOF and have five seconds to close
 before their process group is killed. Training enables Ray's Linux subreaper to clean up TextWorld

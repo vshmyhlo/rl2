@@ -106,6 +106,7 @@ from openai import AsyncOpenAI
 from pydantic import ConfigDict, Field, TypeAdapter
 from pydantic.dataclasses import dataclass as config_dataclass
 from ray.actor import ActorHandle
+from ray.exceptions import ActorDiedError
 from transformers import AutoTokenizer
 from vllm.config.lora import MaxLoRARanks
 
@@ -1302,9 +1303,23 @@ class Actor:
 
                 async def run_rollout(index: int) -> Rollout:
                     with span("actor.rollout", {**span_data, "rollout_index": index}) as rollout_span:
-                        async with AsyncExitStack() as resources, asyncio.timeout(self.config.rollout_timeout):
-                            env = await resources.enter_async_context(task.init_env())
-                            result = await agent.run(env=env)
+                        deadline = asyncio.get_running_loop().time() + self.config.rollout_timeout
+                        for attempt in range(3):
+                            try:
+                                async with AsyncExitStack() as resources, asyncio.timeout_at(deadline):
+                                    env = await resources.enter_async_context(task.init_env())
+                                    result = await agent.run(env=env)
+                                break
+                            except ActorDiedError as error:
+                                if error.actor_init_failed or attempt == 2:
+                                    raise
+                                logger.warning(
+                                    "Rollout worker died; restarting episode: task=%s rollout=%d retry=%d/2",
+                                    task.id,
+                                    index,
+                                    attempt + 1,
+                                    exc_info=True,
+                                )
                         rollout_span.set_attribute("stop_condition", result.stop_condition)
                         return result
 

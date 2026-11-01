@@ -204,6 +204,55 @@ tasksets:
       task: bitwise_arithmetic
       task_config:
         difficulty: 2
+  puzzle24:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: puzzle24
+      task_config:
+        min_value: 1
+        max_value: 10
+        operators: ["+", "-", "*", "/"]
+  mini_sudoku:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: mini_sudoku
+      task_config:
+        min_empty: 8
+        max_empty: 10
+  knights_knaves:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: knights_knaves
+      task_config:
+        n_people: 3
+        depth_constraint: 2
+        width_constraint: 2
+  course_schedule:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: course_schedule
+      task_config:
+        min_num_courses: 8
+        max_num_courses: 15
+        min_num_prerequisites: 1
+        max_num_prerequisites: 2
+        min_cycle_length: 3
+        max_cycle_length: 5
+        p_solvable: 0.5
+  game_of_life:
+    weight: 1.0
+    taskset:
+      id: reasoning_gym
+      task: game_of_life
+      task_config:
+        grid_size_x: 6
+        grid_size_y: 6
+        simulation_steps: 3
+        filled_cells: 15
 seed: 1
 
 num_groups: 4 # verl data.train_batch_size (task groups).

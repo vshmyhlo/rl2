@@ -31,11 +31,13 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import ValidationError
 from ray import cloudpickle
+from ray._private import ray_constants
+from ray.exceptions import RayTaskError
 
 from rl2 import train_grpo_v2 as training
-from rl2.agent_task import Environment
+from rl2.agent_task import Environment, Task
 from rl2.alfworld_env import ALFWorldTask
-from rl2.grpo_v2.reasoning_gym import create_dataset
+from rl2.grpo_v2.reasoning_gym import ReasoningGymConfig, ReasoningGymSession, ReasoningGymTask, create_dataset
 from rl2.qwen3 import ATTENTION_BACKENDS, AttentionBackend
 
 
@@ -437,6 +439,11 @@ def test_mix_preset_accepts_native_reasoning_rewards() -> None:
         "largest_island",
         "dice",
         "bitwise_arithmetic",
+        "puzzle24",
+        "mini_sudoku",
+        "knights_knaves",
+        "course_schedule",
+        "game_of_life",
     }
     rewards: list[float] = []
     for task in tasks:
@@ -764,7 +771,7 @@ def actor(monkeypatch: pytest.MonkeyPatch, task_discovery: list[ALFWorldTask]) -
     return actor
 
 
-async def collect_and_close(actor: Any, task: ALFWorldTask) -> training.RolloutGroup:
+async def collect_and_close(actor: Any, task: Task) -> training.RolloutGroup:
     async with aclosing(actor):
         return await actor.collect_group(task, group_size=2, taskset_id="alfworld")
 
@@ -2627,6 +2634,164 @@ def test_batcher_collects_groups_concurrently(
         assert item.parent.span_id == parent.context.span_id
         assert item.context.trace_id == parent.context.trace_id
     assert not otel_trace.get_current_span().get_span_context().is_valid
+
+
+@pytest.mark.parametrize("phase", ["setup", "rollout"])
+def test_rollout_recovers_from_worker_death(
+    actor: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    environments: list[AsyncMock] = []
+
+    def init_env() -> AsyncMock:
+        environment = AsyncMock()
+        environment.__aenter__.return_value = environment
+        if phase == "setup" and len(environments) < 2:
+            environment.__aenter__.side_effect = training.ActorDiedError()
+        environments.append(environment)
+        return environment
+
+    task = Mock(id="fixed-task/123", init_env=Mock(side_effect=init_env))
+    agent = AsyncMock()
+    agent.__aenter__.return_value = agent
+    agent.run.side_effect = (
+        [training.ActorDiedError(), training.ActorDiedError(), rollout, rollout]
+        if phase == "rollout"
+        else [rollout, rollout]
+    )
+    monkeypatch.setattr(training, "create_agent", Mock(return_value=agent))
+
+    group = asyncio.run(collect_and_close(actor, task))
+
+    assert len(group.rollouts) == 2
+    assert [item.reward for item in group.rollouts] == [rollout.reward, rollout.reward]
+    assert len(environments) == 4
+    assert len({id(item) for item in environments}) == 4
+    for index, environment in enumerate(environments):
+        environment.__aenter__.assert_awaited_once()
+        assert environment.__aexit__.await_count == (0 if phase == "setup" and index < 2 else 1)
+    assert not actor._runs
+
+
+def test_rollout_worker_retry_exhaustion(
+    actor: Any, monkeypatch: pytest.MonkeyPatch, task_discovery: list[ALFWorldTask]
+) -> None:
+    agent = AsyncMock()
+    agent.__aenter__.return_value = agent
+    environments: list[Environment] = []
+
+    async def run(env: Environment) -> training.Rollout:
+        environments.append(env)
+        if len(environments) <= 3:
+            raise training.ActorDiedError()
+        return await asyncio.Future[training.Rollout]()
+
+    agent.run.side_effect = run
+    monkeypatch.setattr(training, "create_agent", Mock(return_value=agent))
+    with pytest.raises(ExceptionGroup) as raised:
+        asyncio.run(collect_and_close(actor, task_discovery[0]))
+
+    assert len(raised.value.exceptions) == 1
+    assert isinstance(raised.value.exceptions[0], training.ActorDiedError)
+    assert len(environments) == 4  # Three failed attempts and the cancelled sibling.
+    for environment in environments:
+        environment.__aexit__.assert_awaited_once()
+    assert not actor._runs
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("invalid rollout"),
+        training.ActorDiedError(cause=RayTaskError("__init__", "constructor failed", ValueError("invalid config"))),
+    ],
+    ids=["application-error", "actor-constructor-error"],
+)
+def test_rollout_does_not_retry_application_errors(
+    actor: Any, monkeypatch: pytest.MonkeyPatch, task_discovery: list[ALFWorldTask], error: Exception
+) -> None:
+    agent = AsyncMock()
+    agent.__aenter__.return_value = agent
+    agent.run.side_effect = error
+    monkeypatch.setattr(training, "create_agent", Mock(return_value=agent))
+
+    with pytest.raises(ExceptionGroup) as raised:
+        asyncio.run(collect_and_close(actor, task_discovery[0]))
+
+    assert agent.run.await_count == 2  # One attempt per rollout.
+    assert all(item is error for item in raised.value.exceptions)
+
+
+def test_rollout_retries_share_original_deadline(
+    actor: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch, task_discovery: list[ALFWorldTask]
+) -> None:
+    agent = AsyncMock()
+    agent.__aenter__.return_value = agent
+    monkeypatch.setattr(training, "create_agent", Mock(return_value=agent))
+
+    async def collect() -> None:
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        monkeypatch.setattr(loop, "time", lambda: now)
+        attempts = 0
+
+        async def run(env: Environment) -> training.Rollout:
+            nonlocal now, attempts
+            attempts += 1
+            if attempts == 1:
+                now += actor.config.rollout_timeout * 0.6
+                raise training.ActorDiedError()
+            if attempts == 2:
+                now += actor.config.rollout_timeout * 0.6
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+            return rollout
+
+        agent.run.side_effect = run
+        await collect_and_close(actor, task_discovery[0])
+
+    with pytest.raises(ExceptionGroup) as raised:
+        asyncio.run(collect())
+    assert len(raised.value.exceptions) == 1
+    assert isinstance(raised.value.exceptions[0], TimeoutError)
+
+
+def test_rollout_recovers_after_real_ray_worker_killed(
+    actor: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Local workers use the existing environment without packaging the repository.
+    monkeypatch.setattr(ray_constants, "RAY_ENABLE_UV_RUN_RUNTIME_ENV", False)
+    actor.config = replace(actor.config, rollout_timeout=30)
+    task = ReasoningGymTask(config=ReasoningGymConfig(task_config={"min_animals": 1, "max_animals": 1}), seed=42)
+    agent = AsyncMock()
+    agent.__aenter__.return_value = agent
+    monkeypatch.setattr(training, "create_agent", Mock(return_value=agent))
+    sessions: list[ReasoningGymSession] = []
+    prompts: list[str] = []
+    killed = False
+
+    async def run(env: ReasoningGymSession) -> training.Rollout:
+        nonlocal killed
+        sessions.append(env)
+        initial = await env.reset()
+        prompts.append(initial.prompt)
+        if not killed:
+            killed = True
+            await asyncio.to_thread(training.ray.kill, env.actor)
+            await env.reset()  # Surface the actual ActorDiedError from the dead worker.
+            pytest.fail("Killed worker unexpectedly answered reset")
+        return rollout
+
+    agent.run.side_effect = run
+    with training.ray.init(
+        address="local", num_cpus=2, num_gpus=0, include_dashboard=False, object_store_memory=80 * 1024**2
+    ):
+        group = asyncio.run(collect_and_close(actor, task))
+
+    assert killed
+    assert len(sessions) == len({id(session) for session in sessions}) == 3
+    assert len(prompts) == 3 and len(set(prompts)) == 1
+    assert len(group.rollouts) == 2
+    assert [item.reward for item in group.rollouts] == [rollout.reward, rollout.reward]
 
 
 def test_rollout_deadline_excludes_cleanup(
