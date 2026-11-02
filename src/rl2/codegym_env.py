@@ -81,31 +81,6 @@ class Reward(BaseModel):
     reward: float
 
 
-def tool_schemas() -> list[ToolSchema]:
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "call_function",
-                "description": "Call one of the CodeGym functions documented in the system prompt.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "Exact function name, including capitalization."},
-                        "parameters": {
-                            "type": "object",
-                            "description": "Function arguments as a JSON object; use {} for no arguments.",
-                            "additionalProperties": True,
-                        },
-                    },
-                    "required": ["name", "parameters"],
-                    "additionalProperties": False,
-                },
-            },
-        }
-    ]
-
-
 async def request_json(client: httpx.AsyncClient, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
     response = await client.request(method, path, **kwargs)
     response.raise_for_status()
@@ -117,12 +92,18 @@ class CodeGymSession:
     client: httpx.AsyncClient
     session_id: str
     observation: str
+    tools: list[ToolSchema]
 
 
 @asynccontextmanager
 async def codegym_session(manager_url: str, ability: str) -> AsyncGenerator[CodeGymSession]:
     async with AsyncExitStack() as resources:
         manager = await resources.enter_async_context(httpx.AsyncClient(base_url=manager_url, timeout=120))
+        environment_name = ability.split("@", 2)[1]
+        response = await request_json(manager, "GET", f"/tools/{environment_name}")
+        tools = TypeAdapter(list[ToolSchema]).validate_python(response["tools"])
+        if not tools or len({tool["function"]["name"] for tool in tools}) != len(tools):
+            raise ValueError("CodeGym server returned empty or duplicate tool definitions")
         instance = await request_json(manager, "GET", "/get_instance")
         resources.push_async_callback(
             request_json, manager, "GET", "/release_instance", params={"uid": instance["uid"]}, timeout=10
@@ -140,7 +121,7 @@ async def codegym_session(manager_url: str, ability: str) -> AsyncGenerator[Code
                 worker, "POST", "/start", json={"session_id": session_id, "env_name": env_name, "env_str": env_str}
             )
         )
-        yield CodeGymSession(client=worker, session_id=session_id, observation=started.observation)
+        yield CodeGymSession(client=worker, session_id=session_id, observation=started.observation, tools=tools)
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,20 +163,27 @@ class CodeGymEnvironment(Environment):
         self.steps = 0
         self.score = 0.0
         return ResetResult(
-            tools=tool_schemas(),
+            tools=self.session.tools,
             system_prompt=(
-                "Solve the task using the documented CodeGym functions. Use call_function once per turn, "
-                "passing the function name and a parameters object. Wait for each result before continuing. "
-                "Submit your answer through the documented completion function.\n\n" + self.task.row.prompt[0].content
+                "Solve the task using the provided CodeGym tools. Call one function per turn and wait for its result. "
+                "Submit your answer through the documented completion function."
             ),
             prompt=f"{self.task.row.question}\n\nInitial observation:\n{self.session.observation}",
         )
 
     async def step(self, action: ToolCall, *, timeout: float | None = None) -> StepResult:
-        if action.name != "call_function":
+        functions = {tool["function"]["name"]: tool["function"] for tool in self.session.tools}
+        if action.name not in functions:
             raise ToolCallError(f"Unknown CodeGym tool: {action.name}")
+        parameters = functions[action.name]["parameters"]
+        missing = set(parameters["required"]) - action.arguments.keys()
+        extra = action.arguments.keys() - parameters["properties"].keys()
+        if missing or (extra and parameters.get("additionalProperties") is False):
+            raise ToolCallError(
+                f"Invalid arguments for {action.name}: missing={sorted(missing)}, extra={sorted(extra)}"
+            )
         try:
-            call = CodeGymAction.model_validate(action.arguments)
+            call = CodeGymAction(name=action.name, parameters=action.arguments)
         except ValidationError as error:
             raise ToolCallError(str(error)) from error
         async with asyncio.timeout(timeout):

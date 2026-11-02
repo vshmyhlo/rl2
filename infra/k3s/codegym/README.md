@@ -1,34 +1,38 @@
 # CodeGym environment server
 
-One CPU-only pod runs the pinned upstream manager and 40 workers. English
+One CPU-only pod runs the pinned upstream manager and 160 workers, with an
+8 GiB memory request and 16 GiB limit. English
 `envs_en` environments are downloaded at image build time; runtime needs no
 internet or credentials. The server has no GPU or service-account token.
 Preparation fixes two malformed display f-strings in the pinned dataset's
-`Codeforces_5537_I__MinPathCostEnv` and compile-checks every environment.
+`Codeforces_5537_I__MinPathCostEnv` and compile-checks every environment. It also generates public tool schemas
+from each environment’s `func_mapping`, dispatch code, signatures, and docstrings.
+`GET /tools/{environment_name}` serves those schemas to the training adapter;
+private helper methods are excluded, and unknown parameter types stay unrestricted.
+The individual-tool adapter requires an image built with this schema endpoint.
 
 From the repository root:
 
 ```bash
 sudo buildctl --addr unix:///run/rl2-buildkit/buildkitd.sock build \
   --frontend dockerfile.v0 --local context=. --local dockerfile=infra/k3s/codegym \
-  --output type=image,name=rl2.local/codegym:3,unpack=true
-sudo k3s ctr -n k8s.io images label rl2.local/codegym:3 io.cri-containerd.pinned=pinned
+  --output type=image,name=rl2.local/codegym:4,unpack=true
+sudo k3s ctr -n k8s.io images label rl2.local/codegym:4 io.cri-containerd.pinned=pinned
 sudo k3s kubectl apply -f infra/k3s/codegym/codegym.yaml
 sudo k3s kubectl -n codegym rollout status deployment/codegym --timeout=300s
 ```
 
 Training pods use `http://codegym.codegym.svc.cluster.local:8000`. This headless
 Service resolves to the single server pod; clients reach the manager on 8000
-and allocated workers on 10000–10039. Keep one replica: independent managers
+and allocated workers on 10000–10159. Keep one replica: independent managers
 cannot share allocations. NetworkPolicy permits ingress from `training` and
 `codegym` only and denies outbound connections. Deployment updates interrupt
 active episodes; use a new image tag for updates and deploy between runs.
 
 Worker count must cover all concurrent rollouts across jobs, including
-prefetched batches. The CodeGym preset matches `mix.yaml`: 32 rollouts per batch
-and four prefetched batches require up to 160 concurrent workers. Before using
-that preset, increase the deployed 40-worker pool and NetworkPolicy port range,
-or set `prefetch_batches: 0` to fit the existing pool.
+prefetched batches. The pool supports one `configs/grpo_v2/codegym.yaml` run:
+4 groups × 8 rollouts × (1 current + 4 prefetched batches) = 160 workers.
+Concurrent jobs need additional capacity or reduced rollout concurrency.
 
 ```bash
 sudo k3s kubectl -n codegym get pods

@@ -7,6 +7,8 @@ Each step reports its own reward; the episode return is the sum of step rewards,
 whether rewards arrive throughout the episode or only at termination.
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
@@ -15,10 +17,15 @@ from typing import Any, Literal, NotRequired, TypedDict
 from pydantic import BaseModel, ConfigDict
 
 
-class ToolParameter(TypedDict):
-    type: Literal["string", "integer", "number", "boolean", "object"]
-    description: NotRequired[str]
-    additionalProperties: NotRequired[bool]
+class ToolParameter(TypedDict, total=False):
+    type: Literal["string", "integer", "number", "boolean", "object", "array", "null"]
+    description: str
+    additionalProperties: bool | ToolParameter
+    items: ToolParameter
+    prefixItems: list[ToolParameter]
+    minItems: int
+    maxItems: int
+    anyOf: list[ToolParameter]
 
 
 class ToolParameters(TypedDict):

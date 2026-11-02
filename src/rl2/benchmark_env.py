@@ -19,13 +19,6 @@ PREFIX = "RL2_BENCHMARK "
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
-class WebShopConfig:
-    python: str
-    root: str
-    id: Literal["webshop"] = "webshop"
-
-
-@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class Tau2Config:
     python: str
     user_llm: str
@@ -44,7 +37,7 @@ class AppWorldConfig:
     id: Literal["appworld"] = "appworld"
 
 
-BenchmarkConfig = WebShopConfig | Tau2Config | AppWorldConfig
+BenchmarkConfig = Tau2Config | AppWorldConfig
 
 
 class Observation(BaseModel):
@@ -60,9 +53,7 @@ def worker_command(config: BenchmarkConfig, max_steps: int) -> list[str]:
 
 def worker_environment(config: BenchmarkConfig) -> dict[str, str]:
     env = dict(os.environ)
-    if isinstance(config, WebShopConfig):
-        env["PYTHONPATH"] = os.pathsep.join(filter(None, [config.root, env.get("PYTHONPATH", "")]))
-    elif isinstance(config, AppWorldConfig):
+    if isinstance(config, AppWorldConfig):
         env["APPWORLD_ROOT"] = config.root
     return env
 

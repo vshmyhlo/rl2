@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import random
 import runpy
 import sys
 from contextlib import closing
@@ -24,45 +23,6 @@ def load_worker(name: str, modules: dict[str, dict[str, Any]], monkeypatch: pyte
         module.__dict__.update(attributes)
         monkeypatch.setitem(sys.modules, module_name, module)
     return runpy.run_path(str(WORKERS / f"{name}_worker.py"))
-
-
-def test_webshop_full_split(monkeypatch: pytest.MonkeyPatch) -> None:
-    upstream = Mock()
-    upstream.server.goals = range(1503)
-    upstream.reset.return_value = ("Buy a hat", None)
-    upstream.get_available_actions.return_value = {"clickables": ["Buy Now"]}
-    upstream.step.return_value = ("Purchased", 0.75, True, None)
-    prices: list[float] = []
-
-    def create_environment(**kwargs: Any) -> Mock:
-        prices.append(random.random())
-        return upstream
-
-    constructor = Mock(side_effect=create_environment)
-    engine = SimpleNamespace()
-    module = load_worker(
-        "webshop",
-        {
-            "web_agent_site.engine": {"engine": engine},
-            "web_agent_site.envs": {"WebAgentTextEnv": constructor},
-        },
-        monkeypatch,
-    )
-    with closing(module["WebShop"]({"root": "/data/webshop"})) as worker:
-        assert worker.task_ids() == ["1500", "1501", "1502"]
-        assert constructor.call_args.kwargs["num_products"] is None
-        assert constructor.call_args.kwargs["human_goals"] is True
-        assert constructor.call_args.kwargs["file_path"] == "/data/webshop/data/items_shuffle.json"
-        assert engine.DEFAULT_ATTR_PATH == "/data/webshop/data/items_ins_v2.json"
-        with pytest.raises(ValueError, match="training split"):
-            worker.reset("1499")
-        assert "Buy a hat" in worker.reset("1502")["observation"]
-        upstream.reset.assert_called_once_with(session=1502)
-        assert worker.step("click[Buy Now]")["done"]
-        assert worker.score() == 0.75
-    upstream.close.assert_called_once()
-    with closing(module["WebShop"]({"root": "/data/webshop"})):
-        assert prices[0] == prices[1]
 
 
 def test_appworld_train_execution_and_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -167,16 +127,15 @@ def test_tau2_train_domains_reward_and_failures(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_task_manifest_and_worker_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = env.WebShopConfig(python=sys.executable, root="/data/webshop")
+    config = env.AppWorldConfig(python=sys.executable, root="/apps")
     run = Mock(return_value=SimpleNamespace(stdout='startup noise\nRL2_BENCHMARK ["1500", "1501"]\n'))
     monkeypatch.setattr(env.subprocess, "run", run)
     tasks = env.load_benchmark_tasks(config, max_steps=2, timeout=30)
     assert [task.data.task_id for task in tasks] == ["1500", "1501"]
-    assert [task.data.id for task in tasks] == ["webshop:1500", "webshop:1501"]
+    assert [task.data.id for task in tasks] == ["appworld:1500", "appworld:1501"]
     assert run.call_args.args[0][-1] == "--list"
-    assert run.call_args.kwargs["env"]["PYTHONPATH"].split(os.pathsep)[0] == "/data/webshop"
+    assert run.call_args.kwargs["env"]["APPWORLD_ROOT"] == "/apps"
     assert json.loads(run.call_args.args[0][-2])["max_steps"] == 2
-    assert env.worker_environment(env.AppWorldConfig(python=sys.executable, root="/apps"))["APPWORLD_ROOT"] == "/apps"
 
 
 @pytest.mark.parametrize("manifest", [[], ["duplicate", "duplicate"], [""]])

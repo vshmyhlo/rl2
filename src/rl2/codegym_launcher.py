@@ -3,10 +3,22 @@
 import argparse
 import os
 import socket
+from pathlib import Path
 
 import uvicorn
 from env_instance_manager import EnvInstanceManager, app
 from fastapi import HTTPException
+from fastapi.responses import FileResponse
+
+
+@app.get("/tools/{environment_name}")
+def tools(environment_name: str) -> FileResponse:
+    if Path(environment_name).name != environment_name or "\\" in environment_name:
+        raise HTTPException(status_code=404, detail="Unknown environment")
+    path = Path("tools") / f"{environment_name}.json"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Unknown environment")
+    return FileResponse(path, media_type="application/json")
 
 
 @app.get("/health")
@@ -20,6 +32,8 @@ def ready() -> dict[str, int]:
     if len(instances) != app.state.workers:
         raise HTTPException(status_code=503, detail="Workers are starting")
     for instance in instances:
+        if not instance.health_check():
+            raise HTTPException(status_code=503, detail="Worker process exited")
         try:
             # Upstream steps block the worker event loop; probe its listener without interrupting busy episodes.
             with socket.create_connection(("127.0.0.1", instance.port), timeout=1):
@@ -35,6 +49,10 @@ def main() -> None:
     parser.add_argument("--workers", type=int, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be positive")
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
     app.state.workers = args.workers
     uvicorn.run(app, host=args.host, port=args.port, access_log=False)
 

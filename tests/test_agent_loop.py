@@ -144,17 +144,33 @@ def test_codegym_rollout(tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest
     @asynccontextmanager
     async def session(manager_url: str, ability: str) -> AsyncGenerator[codegym_env.CodeGymSession]:
         async with httpx.AsyncClient(base_url=manager_url, transport=httpx.MockTransport(backend)) as client:
-            yield codegym_env.CodeGymSession(client=client, session_id="test", observation="Ready")
+            yield codegym_env.CodeGymSession(
+                client=client,
+                session_id="test",
+                observation="Ready",
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "Done",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"answer": {"type": "integer"}},
+                                "required": ["answer"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    }
+                ],
+            )
 
     monkeypatch.setattr(codegym_env, "codegym_session", session)
-    reply = (
-        '<tool_call>{"name":"call_function","arguments":'
-        '{"name":"Done","parameters":{"answer":3}}}</tool_call><|im_end|>'
-    )
+    reply = '<tool_call>{"name":"Done","arguments":{"answer":3}}</tool_call><|im_end|>'
 
     def respond(request: httpx.Request) -> httpx.Response:
         prompt = tokenizer.decode(json.loads(request.content)["prompt"])
-        assert '"additionalProperties": true' in prompt
+        assert '"name": "Done"' in prompt and '"type": "integer"' in prompt
+        assert "call_function" not in prompt
         assert "Add 1 and 2" in prompt and "FunctionCallBegin" not in prompt
         return httpx.Response(200, json=response_for(tokenizer, reply))
 

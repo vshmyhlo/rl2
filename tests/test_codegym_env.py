@@ -15,6 +15,9 @@ from datasets import config as datasets_config
 
 from rl2 import codegym_env as env
 from rl2.agent_task import ToolCall, ToolCallError
+from rl2.codegym.tools import extract_tools
+
+TOOLS = extract_tools((Path(__file__).parent / "fixtures/codegym.py").read_text(), "SumEnv")
 
 ABILITY = 'codegym_v1@Example__SumEnv@{"values": [1, 2], "label": "a@b"}'
 
@@ -36,7 +39,7 @@ def task(**updates: Any) -> env.CodeGymTask:
 
 
 def action(name: str, **parameters: Any) -> ToolCall:
-    return ToolCall(name="call_function", arguments={"name": name, "parameters": parameters})
+    return ToolCall(name=name, arguments=parameters)
 
 
 @dataclass
@@ -54,6 +57,8 @@ class FakeServer:
         self.paths.append(path)
         if path == self.failure:
             return httpx.Response(500, json={"detail": "backend failed"})
+        if path.startswith("/tools/"):
+            return httpx.Response(200, json={"tools": TOOLS})
         if path == "/get_instance":
             return httpx.Response(200, json={"uid": "worker", "port": 10000})
         if path == "/release_instance":
@@ -181,12 +186,12 @@ def test_episode_and_independent_attempts(server: FakeServer) -> None:
             initial = await first.reset()
             await second.reset()
             assert first.session.session_id != second.session.session_id
-            assert "Functions: Observe(), Done(answer)" in initial.system_prompt
+            assert "call_function" not in initial.system_prompt
             assert "Initial state" in initial.prompt
             assert "Add the values" in initial.prompt
             assert "FunctionCallBegin" not in initial.prompt + initial.system_prompt
             assert "Hidden reference" not in initial.prompt + initial.system_prompt
-            assert initial.tools[0]["function"]["name"] == "call_function"
+            assert initial.tools == TOOLS
             observed = await first.step(action("Observe", nested=[1, {"a": True}]))
             assert not observed.done and observed.reward == 0
             finished = await first.step(action("Done", answer=3))
@@ -238,10 +243,10 @@ def test_reset_contract(state: str, server: FakeServer) -> None:
     "call",
     [
         ToolCall(name="python", arguments={}),
-        ToolCall(name="call_function", arguments={"name": "Done", "parameters": []}),
-        ToolCall(name="call_function", arguments={"name": "Done", "parameters": {}, "extra": 1}),
+        ToolCall(name="Done", arguments={}),
+        ToolCall(name="Done", arguments={"answer": 3, "extra": 1}),
     ],
-    ids=["unknown-tool", "non-object-parameters", "extra-argument"],
+    ids=["unknown-tool", "missing-argument", "extra-argument"],
 )
 def test_invalid_tool_calls(call: ToolCall, server: FakeServer) -> None:
     async def run() -> None:
@@ -323,5 +328,49 @@ def test_live_cluster_episode(ability: str, answer: str | int) -> None:
             assert result.reward == 1 and result.done
             other = await second.step(action("Observe"), timeout=30)
             assert other.reward == 0 and not other.done
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("tools", [[], [TOOLS[0], TOOLS[0]]], ids=["empty", "duplicate"])
+def test_invalid_schemas_do_not_allocate_worker(
+    tools: list[dict], server: FakeServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(globals(), "TOOLS", tools)
+
+    async def run() -> None:
+        async with task().init_env() as environment:
+            with pytest.raises(ValueError, match="tool definitions"):
+                await environment.reset()
+
+    asyncio.run(run())
+    assert server.paths == ["/tools/Example__SumEnv"]
+    assert all(client.is_closed for client in server.clients)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("CODEGYM_MANAGER_URL"), reason="Set CODEGYM_MANAGER_URL for the live server test"
+)
+def test_live_serialized_and_array_arguments() -> None:
+    sampled = env.CodeGymTask(
+        id="expression",
+        config=env.CodeGymConfig(manager_url=os.environ["CODEGYM_MANAGER_URL"]),
+        row=env.CodeGymRow.model_validate(
+            row(ability='codegym_v1@Code_Contests_11321_I__ExpressionEvaluationEnv@{"expression":"1+2"}')
+        ),
+    )
+
+    async def run() -> None:
+        async with sampled.init_env() as environment:
+            reset = await environment.reset(timeout=30)
+            functions = {tool["function"]["name"]: tool["function"] for tool in reset.tools}
+            assert functions["GetTokenAtPosition"]["parameters"]["properties"]["tokens"]["type"] == "string"
+            assert functions["ApplyOperator"]["parameters"]["properties"]["values"]["type"] == "array"
+            token = await environment.step(action("GetTokenAtPosition", tokens='[1,"+",2]', position=0), timeout=30)
+            assert token.observation == "1" and not token.done
+            result = await environment.step(action("ApplyOperator", operator="+", values=[1, 2]), timeout=30)
+            assert result.observation == "3" and not result.done
+            done = await environment.step(action("Done", answer=3), timeout=30)
+            assert done.reward == 1 and done.done
 
     asyncio.run(run())

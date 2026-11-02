@@ -1,8 +1,13 @@
 model: Qwen/Qwen3-0.6B
-taskset:
-  id: webshop
-  python: /opt/webshop/bin/python
-  root: /opt/WebShop
+attention_backend: tokamax
+scan_layers: true
+gradient_checkpointing: true
+padding_multiple: 256
+tasksets:
+  webshop:
+    taskset:
+      id: webshop
+      root: /opt/WebShop
 seed: 3
 num_groups: 1
 group_size: 4
@@ -11,4 +16,4 @@ max_turns: 50
 rollout_timeout: 1200
 environment_timeout: 600
 run_id: grpo_v2_webshop_${path_name:${model}}_seed${seed}
-ckpt_dir: /runs/grpo_v2/${run_id} # Profiling artifacts; checkpointing is not implemented.
+ckpt_dir: /runs/grpo_v2/${run_id} # Checkpoints and profiling artifacts.

@@ -4,7 +4,7 @@
 and a small custom tool-calling interaction loop. `tasksets` is a mapping keyed by
 unique, nonblank taskset identifiers. Each entry contains
 a relative `weight` (default 1) and a `taskset` with `id: alfworld`, `appworld`,
-`codegym`, or `reasoning_gym`; the other environment presets are unsupported. For example:
+`codegym`, `reasoning_gym`, or `webshop`; the other environment presets are unsupported. For example:
 
 ```yaml
 tasksets:
@@ -40,6 +40,22 @@ Prepare the official ALFWorld training data with `alfworld-download`, set
 against that configuration file. All six task types and every eligible solvable
 training game IDs are discovered at startup; expert observations are disabled.
 
+For [WebShop](https://github.com/princeton-nlp/WebShop), use `configs/grpo_v2/webshop.yaml`
+and set `taskset.root` to the upstream checkout on each Ray node. Prepare the full
+product catalog, human instructions, and full search index using upstream's setup.
+Install its runtime dependencies (including Java for Pyserini and the spaCy model)
+in the same Python environment as Ray. Upstream's old pinned requirements are not
+a lockfile for this project's Python/dependency versions; use a compatible installation.
+There is no separate `taskset.python` executable. The actor adds the checkout to
+its `PYTHONPATH`; other tasksets do not import WebShop's optional dependencies.
+
+Each rollout owns one Ray actor wrapping the text Gym environment. The model uses
+`search(keywords=...)` and `click(value=...)`; observations include available actions.
+Task discovery uses all human goals after the 500 test and 1,000 development goals.
+Product prices and goal ordering use the upstream fixed seed, so attempts share the
+same task. Step rewards pass through unchanged; purchase terminates the episode,
+and subsequent steps cannot repeat its reward. Timeouts and cancellation kill the actor.
+
 For [AppWorld](https://github.com/StonyBrookNLP/appworld), install `appworld` in a separate Python environment, then run
 `appworld install` and `APPWORLD_ROOT=/data/appworld appworld download data` there.
 Set `taskset.python` to that environment's Python executable and `taskset.root`
@@ -60,9 +76,14 @@ Rows must contain system function documentation followed by a user message
 with a `Question:` section, an `ability` specification, and optionally
 `plugin_call_max_round` (default 256).
 
-The model uses `call_function(name, parameters)` with a JSON object for arguments.
-The adapter retains function documentation and the question, replacing upstream
-formatting instructions with the current Qwen tool interface. Each attempt
+The model calls individual functions such as `Observe()` and `Done(answer=...)`.
+The server generates their JSON schemas from the deployed Python source at image
+build time and serves them through `/tools/{environment_name}`. Only actions in
+`func_mapping` are exposed; dispatch code determines argument names and required
+fields, annotations provide types, and docstrings provide descriptions. Missing
+or unsupported types remain unrestricted. The adapter retains the question and
+uses these tool descriptions instead of the dataset’s textual function listing.
+Each attempt
 owns an independent server session; reset and rollout exit stop it and release
 the worker. Server failures propagate as infrastructure errors. CodeGym's
 binary score is `float(upstream_reward > 0)`; step rewards are changes in that
@@ -94,7 +115,7 @@ Reasoning Gym also supports internal mixtures: use `task: composite` and put a l
 `{name: leg_counting, weight: 1, config: {}}` entries in `task_config.datasets`.
 
 All tasksets provide an indefinite stream, creating one task per requested group.
-ALFWorld and AppWorld retain their discovered ID catalogs and sample uniformly
+ALFWorld, AppWorld, and WebShop retain their discovered ID catalogs and sample uniformly
 with replacement; task objects and environments are created on demand.
 CodeGym samples uniformly from its loaded task rows with replacement.
 Task discovery completes during actor startup, outside the async rollout loop.
@@ -191,7 +212,7 @@ the episode ends. Malformed calls receive tool-error feedback without changing
 the game. A response without tool calls ends the episode. There are no MCP
 servers, renderer pools, or Verifiers objects in this path. The tokenizer and
 SDK client are shared across concurrent rollouts; episode state is independent.
-ALFWorld calls await Ray object references; AppWorld uses asynchronous subprocess
+ALFWorld and WebShop calls await Ray object references; AppWorld uses asynchronous subprocess
 I/O. Tokenization runs in threads.
 
 The transcript is append-only, using Qwen3 message boundaries. Sampled history,
@@ -215,7 +236,7 @@ within the original rollout deadline. Failed attempts are discarded, without
 fallback rewards. Actor constructor exceptions are not retried.
 Exhausted retries, other worker errors, HTTP failures,
 malformed sampling data, and timeouts abort the group and cancel its other rollouts.
-Environments close normally on success; errors and cancellations terminate ALFWorld
+Environments close normally on success; errors and cancellations terminate ALFWorld and WebShop
 actors immediately. AppWorld workers receive EOF and have five seconds to close
 before their process group is killed. Training enables Ray's Linux subreaper to clean up TextWorld
 child processes even after a forced termination. The SDK retries transient HTTP failures

@@ -199,26 +199,30 @@ def test_example_log_interval_config(tmp_path: Path) -> None:
     assert training.load_config(path, training.Config).example_log_interval == 1
 
 
-def test_appworld_actor_task_stream(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = training.Config(
-        tasksets={
-            "appworld": training.WeightedTasksetConfig(
-                taskset=training.AppWorldConfig(python="/test/python", root="/test/appworld")
-            ),
-        }
-    )
+@pytest.mark.parametrize(
+    ("taskset", "stream_name"),
+    [
+        (training.AppWorldConfig(python="/test/python", root="/test/appworld"), "stream_appworld_tasks"),
+        (training.WebShopConfig(root="/test/webshop"), "stream_webshop_tasks"),
+    ],
+    ids=["appworld", "webshop"],
+)
+def test_external_actor_task_stream(
+    taskset: training.AppWorldConfig | training.WebShopConfig, stream_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = training.Config(tasksets={taskset.id: training.WeightedTasksetConfig(taskset=taskset)})
     assert pickle.loads(pickle.dumps(config)) == config
     task = Mock(spec=training.Task)
     stream = iter([task])
     stream_tasks = Mock(return_value=stream)
-    monkeypatch.setattr(training, "stream_appworld_tasks", stream_tasks)
+    monkeypatch.setattr(training, stream_name, stream_tasks)
     monkeypatch.setattr(training, "serve_vllm", Mock(return_value=MagicMock()))
     monkeypatch.setattr(training, "wait_for_server", Mock())
     actor = training.Actor.__ray_metadata__.modified_class(config)
 
     with actor._server:
-        assert next(actor.tasks) == training.SampledTask(taskset_id="appworld", task=task)
-    stream_tasks.assert_called_once_with(config.tasksets["appworld"].taskset, actor.rng, config.environment_timeout)
+        assert next(actor.tasks) == training.SampledTask(taskset_id=taskset.id, task=task)
+    stream_tasks.assert_called_once_with(taskset, actor.rng, config.environment_timeout)
 
 
 def test_reasoning_gym_cli_and_actor_task_stream(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -399,7 +403,7 @@ def test_taskset_weight_rejects_invalid_values(weight: float) -> None:
         training.WeightedTasksetConfig(taskset=training.ReasoningGymConfig(), weight=weight)
 
 
-@pytest.mark.parametrize("name", ["alfworld", "appworld", "reasoning_gym", "codegym"])
+@pytest.mark.parametrize("name", ["alfworld", "appworld", "reasoning_gym", "codegym", "webshop"])
 def test_taskset_presets(name: str) -> None:
     path = Path(__file__).parents[1] / "configs" / "grpo_v2" / f"{name}.yaml"
     config = training.load_config(path, training.Config)

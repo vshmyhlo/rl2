@@ -30,19 +30,19 @@ spec:
           type: RuntimeDefault
       containers:
         - name: codegym
-          image: rl2.local/codegym:3
+          image: rl2.local/codegym:4
           imagePullPolicy: Never
-          args: [--host, 0.0.0.0, --port, "8000", --workers, "40"]
+          args: [--host, 0.0.0.0, --port, "8000", --workers, "160"]
           ports:
             - name: manager
               containerPort: 8000
           resources:
             requests:
               cpu: "2"
-              memory: 2Gi
+              memory: 8Gi
             limits:
               cpu: "4"
-              memory: 8Gi
+              memory: 16Gi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -118,5 +118,5 @@ spec:
           port: 8000
         - protocol: TCP
           port: 10000
-          endPort: 10039
+          endPort: 10159
   egress: []

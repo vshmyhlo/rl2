@@ -131,6 +131,7 @@ from rl2.qwen3 import (
 from rl2.ray_timeline import record_timeline
 from rl2.tracing import flush_tracing, span, tracing_enabled
 from rl2.vllm_support.retry_logging import add_retry_cause
+from rl2.webshop_env import WebShopConfig, stream_webshop_tasks
 
 logger = logging.getLogger("rl2.train_grpo_v2")
 MODEL = "Qwen/Qwen3-0.6B"
@@ -146,7 +147,9 @@ class LengthPenaltyConfig:
 
 @config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class WeightedTasksetConfig:
-    taskset: Annotated[ALFWorldConfig | AppWorldConfig | CodeGymConfig | ReasoningGymConfig, Field(discriminator="id")]
+    taskset: Annotated[
+        ALFWorldConfig | AppWorldConfig | CodeGymConfig | ReasoningGymConfig | WebShopConfig, Field(discriminator="id")
+    ]
     weight: Annotated[float, Field(ge=0, lt=float("inf"))] = 1.0
 
 
@@ -1219,6 +1222,8 @@ def stream_tasks(tasksets: TasksetConfigs, rng: random.Random, timeout: float) -
             streams[name] = stream_appworld_tasks(taskset, rng, timeout)
         elif isinstance(taskset, CodeGymConfig):
             streams[name] = stream_codegym_tasks(taskset, rng)
+        elif isinstance(taskset, WebShopConfig):
+            streams[name] = stream_webshop_tasks(taskset, rng, timeout)
         else:
             streams[name] = stream_alfworld_tasks(taskset, rng, timeout)
         weights.append(entry.weight / max_weight)
