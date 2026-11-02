@@ -30,6 +30,7 @@ dependencies = [
     "jax-triton>=0.4.1,<0.5; sys_platform == 'linux'",
     "jaxmarl==0.2.0",
     "jaxtari==0.2.0",
+    "jsonschema>=4.26,<5",
     "kauldron>=1.4.4,<2",
     "kinetix-env==3.0.2",
     "mctx>=0.0.6,<0.1",

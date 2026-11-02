@@ -13,6 +13,8 @@ from uuid import uuid4
 
 import httpx
 from datasets import load_dataset
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError as SchemaValidationError
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError, model_validator
 from pydantic.dataclasses import dataclass as config_dataclass
 
@@ -186,14 +188,14 @@ class CodeGymEnvironment(Environment):
         if action.name not in functions:
             raise ToolCallError(f"Unknown CodeGym tool: {action.name}")
         parameters = functions[action.name]["parameters"]
-        missing = set(parameters["required"]) - action.arguments.keys()
-        extra = action.arguments.keys() - parameters["properties"].keys()
-        if missing or (extra and parameters.get("additionalProperties") is False):
-            raise ToolCallError(
-                f"Invalid arguments for {action.name}: missing={sorted(missing)}, extra={sorted(extra)}"
-            )
         try:
+            Draft202012Validator(parameters).validate(action.arguments)
             call = CodeGymAction(name=action.name, parameters=action.arguments)
+        except SchemaValidationError as error:
+            path = ".".join(str(part) for part in error.absolute_path) or "arguments"
+            raise ToolCallError(
+                f"Invalid {action.name} {path}: {error.message}. Correct the arguments and retry."
+            ) from error
         except ValidationError as error:
             raise ToolCallError(str(error)) from error
         async with asyncio.timeout(timeout):

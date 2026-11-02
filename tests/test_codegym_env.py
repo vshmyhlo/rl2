@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import pickle
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from random import Random
@@ -262,8 +263,11 @@ def test_reset_contract(state: str, server: FakeServer) -> None:
         ToolCall(name="python", arguments={}),
         ToolCall(name="Done", arguments={}),
         ToolCall(name="Done", arguments={"answer": 3, "extra": 1}),
+        ToolCall(name="Earn", arguments={"answer": "3"}),
+        ToolCall(name="Earn", arguments={"answer": True}),
+        ToolCall(name="Observe", arguments={"nested": {}}),
     ],
-    ids=["unknown-tool", "missing-argument", "extra-argument"],
+    ids=["unknown-tool", "missing-argument", "extra-argument", "wrong-type", "bool-not-integer", "object-not-array"],
 )
 def test_invalid_tool_calls(call: ToolCall, server: FakeServer) -> None:
     async def run() -> None:
@@ -272,9 +276,32 @@ def test_invalid_tool_calls(call: ToolCall, server: FakeServer) -> None:
             with pytest.raises(ToolCallError):
                 await environment.step(call)
             assert environment.steps == 0
+            assert environment.score == 0.0 and not environment.done
+            assert not server.actions
+            result = await environment.step(action("Done", answer=3))
+            assert result.reward == 1.0 and result.done
 
     asyncio.run(run())
-    assert not server.actions
+    assert server.actions == [{"name": "Done", "parameters": {"answer": 3}}]
+
+
+def test_nested_argument_format_error_is_recoverable(server: FakeServer, monkeypatch: pytest.MonkeyPatch) -> None:
+    tools = deepcopy(TOOLS)
+    tools[0]["function"]["parameters"]["properties"]["nested"]["items"] = {"type": "integer"}
+    monkeypatch.setattr(f"{__name__}.TOOLS", tools)
+
+    async def run() -> None:
+        async with task().init_env() as environment:
+            await environment.reset()
+            with pytest.raises(ToolCallError, match=r"Observe nested.0.*integer"):
+                await environment.step(action("Observe", nested=["bad"]))
+            assert not server.actions
+            assert environment.steps == 0 and not environment.done
+            result = await environment.step(action("Observe", nested=[1]))
+            assert result.observation == "Function result" and not result.done
+            assert environment.steps == 1
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("failure", ["/start", "/step", "/reward", "/stop", "cancel"])

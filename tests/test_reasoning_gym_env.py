@@ -103,6 +103,51 @@ def test_tool_schemas_match_supported_tools() -> None:
     env.validate_tool_call(env.ToolCall(name="submit_answer", arguments={"answer": "42"}))
 
 
+@pytest.mark.parametrize(
+    ("answer", "reward"),
+    [
+        pytest.param("[]", 0.0, id="empty-grid"),
+        pytest.param("[[0,0,0],[0,0,0],[0,0,0]]", 1.0, id="correct-grid"),
+        pytest.param("[[0,1],[],[0,0,0]]", 4 / 9, id="ragged-partial-credit"),
+    ],
+)
+def test_game_of_life_submission(answer: str, reward: float) -> None:
+    config = env.ReasoningGymConfig(
+        task="game_of_life", task_config={"grid_size_x": 3, "grid_size_y": 3, "filled_cells": 0}
+    )
+    task = env.ReasoningGymTask(config=config, seed=1)
+    worker = env.ReasoningGymWorker.__ray_metadata__.modified_class(task=task)
+    worker.reset()
+    submission = env.ToolCall(name="submit_answer", arguments={"answer": answer})
+    assert worker.step(submission) == env.StepResult(observation="Answer submitted.", reward=reward, done=True)
+    with pytest.raises(RuntimeError, match="Reset"):
+        worker.step(submission)
+
+
+@pytest.mark.parametrize("answer", ["{}", "[{}]", "not json"], ids=["object-grid", "object-row", "invalid-json"])
+def test_composite_game_of_life_format_error_is_recoverable(answer: str) -> None:
+    config = env.ReasoningGymConfig(
+        task="composite",
+        task_config={
+            "datasets": [
+                {
+                    "name": "game_of_life",
+                    "weight": 1,
+                    "config": {"grid_size_x": 3, "grid_size_y": 3, "filled_cells": 0},
+                }
+            ]
+        },
+    )
+    task = env.ReasoningGymTask(config=config, seed=1)
+    worker = env.ReasoningGymWorker.__ray_metadata__.modified_class(task=task)
+    worker.reset()
+    with pytest.raises(env.ToolCallError, match="JSON array of row arrays"):
+        worker.step(env.ToolCall(name="submit_answer", arguments={"answer": answer}))
+    assert not worker.done
+    result = worker.step(env.ToolCall(name="submit_answer", arguments={"answer": worker.entry["answer"]}))
+    assert result == env.StepResult(observation="Answer submitted.", reward=1.0, done=True)
+
+
 def test_composite_dataset_native_scoring() -> None:
     config = env.ReasoningGymConfig(
         task="composite",

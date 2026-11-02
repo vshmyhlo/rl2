@@ -2657,9 +2657,18 @@ def test_batcher_collects_groups_concurrently(
     assert not otel_trace.get_current_span().get_span_context().is_valid
 
 
-@pytest.mark.parametrize("phase", ["setup", "rollout"])
-def test_rollout_recovers_from_worker_death(
-    actor: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch, phase: str
+@pytest.mark.parametrize(
+    ("phase", "error"),
+    [
+        pytest.param("setup", training.ActorDiedError(), id="worker-setup"),
+        pytest.param("rollout", training.ActorDiedError(), id="worker-rollout"),
+        pytest.param("setup", httpx.ConnectError("connection refused"), id="http-setup"),
+        pytest.param("rollout", httpx.ReadError("connection lost"), id="http-read"),
+        pytest.param("rollout", httpx.RemoteProtocolError("server disconnected"), id="http-protocol"),
+    ],
+)
+def test_rollout_recovers_from_infrastructure_errors(
+    actor: Any, rollout: training.Rollout, monkeypatch: pytest.MonkeyPatch, phase: str, error: Exception
 ) -> None:
     environments: list[AsyncMock] = []
 
@@ -2667,18 +2676,14 @@ def test_rollout_recovers_from_worker_death(
         environment = AsyncMock()
         environment.__aenter__.return_value = environment
         if phase == "setup" and len(environments) < 2:
-            environment.__aenter__.side_effect = training.ActorDiedError()
+            environment.__aenter__.side_effect = error
         environments.append(environment)
         return environment
 
     task = Mock(id="fixed-task/123", init_env=Mock(side_effect=init_env))
     agent = AsyncMock()
     agent.__aenter__.return_value = agent
-    agent.run.side_effect = (
-        [training.ActorDiedError(), training.ActorDiedError(), rollout, rollout]
-        if phase == "rollout"
-        else [rollout, rollout]
-    )
+    agent.run.side_effect = [error, error, rollout, rollout] if phase == "rollout" else [rollout, rollout]
     monkeypatch.setattr(training, "create_agent", Mock(return_value=agent))
 
     group = asyncio.run(collect_and_close(actor, task))
@@ -2693,8 +2698,11 @@ def test_rollout_recovers_from_worker_death(
     assert not actor._runs
 
 
-def test_rollout_worker_retry_exhaustion(
-    actor: Any, monkeypatch: pytest.MonkeyPatch, task_discovery: list[ALFWorldTask]
+@pytest.mark.parametrize(
+    "error", [training.ActorDiedError(), httpx.ReadError("connection lost")], ids=["worker", "http-read"]
+)
+def test_rollout_retry_exhaustion(
+    actor: Any, monkeypatch: pytest.MonkeyPatch, task_discovery: list[ALFWorldTask], error: Exception
 ) -> None:
     agent = AsyncMock()
     agent.__aenter__.return_value = agent
@@ -2703,7 +2711,7 @@ def test_rollout_worker_retry_exhaustion(
     async def run(env: Environment) -> training.Rollout:
         environments.append(env)
         if len(environments) <= 3:
-            raise training.ActorDiedError()
+            raise error
         return await asyncio.Future[training.Rollout]()
 
     agent.run.side_effect = run
@@ -2712,7 +2720,7 @@ def test_rollout_worker_retry_exhaustion(
         asyncio.run(collect_and_close(actor, task_discovery[0]))
 
     assert len(raised.value.exceptions) == 1
-    assert isinstance(raised.value.exceptions[0], training.ActorDiedError)
+    assert raised.value.exceptions[0] is error
     assert len(environments) == 4  # Three failed attempts and the cancelled sibling.
     for environment in environments:
         environment.__aexit__.assert_awaited_once()
@@ -2724,8 +2732,13 @@ def test_rollout_worker_retry_exhaustion(
     [
         ValueError("invalid rollout"),
         training.ActorDiedError(cause=RayTaskError("__init__", "constructor failed", ValueError("invalid config"))),
+        httpx.ReadTimeout("step timed out"),
+        httpx.LocalProtocolError("invalid request"),
+        httpx.HTTPStatusError(
+            "bad request", request=httpx.Request("POST", "http://codegym/step"), response=httpx.Response(400)
+        ),
     ],
-    ids=["application-error", "actor-constructor-error"],
+    ids=["application-error", "actor-constructor-error", "http-timeout", "http-local-protocol", "http-status"],
 )
 def test_rollout_does_not_retry_application_errors(
     actor: Any, monkeypatch: pytest.MonkeyPatch, task_discovery: list[ALFWorldTask], error: Exception
@@ -2760,7 +2773,7 @@ def test_rollout_retries_share_original_deadline(
             attempts += 1
             if attempts == 1:
                 now += actor.config.rollout_timeout * 0.6
-                raise training.ActorDiedError()
+                raise httpx.ReadError("connection lost")
             if attempts == 2:
                 now += actor.config.rollout_timeout * 0.6
                 await asyncio.sleep(0)

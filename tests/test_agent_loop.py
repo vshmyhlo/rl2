@@ -1,5 +1,6 @@
 import asyncio
 import json
+import pickle
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -14,6 +15,7 @@ from openai import APIStatusError, AsyncOpenAI
 from openai.types import CompletionChoice
 from openai.types.completion_choice import Logprobs
 from pydantic import TypeAdapter
+from ray.exceptions import RayTaskError
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
@@ -219,14 +221,35 @@ def test_codegym_rollout(
     assert sequence.loss_mask.sum() == len(tokenizer.encode(output, add_special_tokens=False))
 
 
-@pytest.mark.parametrize("mode", ["submitted", "calculator", "python", "python_failure", "plain_text", "truncated"])
+@pytest.mark.parametrize(
+    "mode", ["submitted", "calculator", "python", "python_failure", "plain_text", "truncated", "format_error"]
+)
 def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch) -> None:
-    task = reasoning_gym.ReasoningGymTask(config=reasoning_gym.ReasoningGymConfig(), seed=1)
+    config = (
+        reasoning_gym.ReasoningGymConfig(
+            task="game_of_life", task_config={"grid_size_x": 3, "grid_size_y": 3, "filled_cells": 0}
+        )
+        if mode == "format_error"
+        else reasoning_gym.ReasoningGymConfig()
+    )
+    task = reasoning_gym.ReasoningGymTask(config=config, seed=1)
     worker = reasoning_gym.ReasoningGymWorker.__ray_metadata__.modified_class(task=task)
     answer = reasoning_gym.create_dataset(task.config, task.seed)[0]["answer"]
     actor = Mock()
     actor.reset.remote = AsyncMock(side_effect=worker.reset)
-    actor.step.remote = AsyncMock(side_effect=worker.step)
+
+    def step(action: ToolCall) -> StepResult:
+        try:
+            return worker.step(action)
+        except reasoning_gym.ToolCallError as error:
+            # Match the exception delivered when awaiting a failed Ray actor method.
+            raise RayTaskError(
+                function_name="ReasoningGymWorker.step",
+                traceback_str="Remote worker traceback",
+                cause=pickle.loads(pickle.dumps(error)),
+            ).as_instanceof_cause() from error
+
+    actor.step.remote = AsyncMock(side_effect=step)
     monkeypatch.setattr(reasoning_gym.ReasoningGymWorker, "remote", Mock(return_value=actor))
     monkeypatch.setattr(reasoning_gym.ray, "kill", Mock())
     sandbox = AsyncMock(spec=reasoning_gym.PythonSession)
@@ -243,6 +266,9 @@ def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, mo
     replies = [text]
     if mode == "calculator":
         replies.insert(0, f"<think>calculate</think><tool_call>{calculation.model_dump_json()}</tool_call><|im_end|>")
+    elif mode == "format_error":
+        malformed = ToolCall(name="submit_answer", arguments={"answer": "{}"})
+        replies.insert(0, f"<tool_call>{malformed.model_dump_json()}</tool_call><|im_end|>")
     elif mode in {"python", "python_failure"}:
         code = ToolCall(name="python", arguments={"code": f"print({answer})"})
         replies.insert(0, f"<think>compute</think><tool_call>{code.model_dump_json()}</tool_call><|im_end|>")
@@ -265,7 +291,7 @@ def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, mo
 
     rollout = asyncio.run(run())
     assert rollout.num_turns == len(replies)
-    assert rollout.reward == (1.0 if mode in {"submitted", "calculator", "python"} else 0.0)
+    assert rollout.reward == (1.0 if mode in {"submitted", "calculator", "python", "format_error"} else 0.0)
     assert (
         rollout.stop_condition
         == {
@@ -275,6 +301,7 @@ def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, mo
             "python_failure": "environment_done",
             "plain_text": "agent_completed",
             "truncated": "context_length",
+            "format_error": "environment_done",
         }[mode]
     )
     if mode == "submitted":
@@ -288,6 +315,13 @@ def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, mo
         sandbox.__aexit__.assert_awaited_once()
         output = json.dumps({"output": f"{answer}\n", "exit_code": 0, "output_truncated": False})
         assert f"<tool_response>\n{output}\n</tool_response>" in tokenizer.decode(requests[1]["prompt"])
+    elif mode == "format_error":
+        assert actor.step.remote.await_count == 2
+        feedback_prompt = tokenizer.decode(requests[1]["prompt"])
+        assert "Correct the format and submit again" in feedback_prompt
+        feedback = feedback_prompt.rsplit("<tool_response>", 1)[1].split("</tool_response>", 1)[0]
+        assert answer not in feedback
+        assert "Remote worker traceback" not in feedback
     else:
         actor.step.remote.assert_not_called()
     if mode == "python_failure":

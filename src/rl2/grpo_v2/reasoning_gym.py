@@ -77,7 +77,7 @@ def tool_schemas() -> list[ToolSchema]:
             "type": "function",
             "function": {
                 "name": "submit_answer",
-                "description": "Submit your final answer once. This ends the episode.",
+                "description": "Submit your final answer. Accepted submissions end the episode; fix format errors and retry.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -135,6 +135,14 @@ def stream_reasoning_gym_tasks(config: ReasoningGymConfig, rng: Random) -> Gener
         yield ReasoningGymTask(config=config, seed=rng.getrandbits(32))
 
 
+def _is_game_of_life_grid(answer: str) -> bool:
+    try:
+        rows = json.loads(answer)
+    except (json.JSONDecodeError, RecursionError):
+        return False
+    return isinstance(rows, list) and all(isinstance(row, list) for row in rows)
+
+
 @ray.remote
 class ReasoningGymWorker:
     def __init__(self, task: ReasoningGymTask) -> None:
@@ -163,7 +171,8 @@ class ReasoningGymWorker:
                 "Once the result is checked, submit without repeating the analysis.\n\n"
                 "Use exactly one tool call per turn and wait for its result. "
                 "Close </think> before each tool call and use a complete <tool_call> JSON block. "
-                "Call submit_answer exactly once, with your final answer as a string in the format requested. "
+                "Call submit_answer with your final answer as a string in the format requested. "
+                "If rejected for a format error, correct it and retry; an accepted submission ends the episode. "
                 "Do not add explanations, extra brackets, or other wrappers inside the answer."
             ),
             prompt=self.entry["question"],
@@ -175,7 +184,14 @@ class ReasoningGymWorker:
             raise RuntimeError("Reset the episode before calling a tool")
         if action.name != "submit_answer":
             raise ToolCallError(f"Unsupported scoring worker tool: {action.name}")
-        reward = float(self.dataset.score_answer(answer=action.arguments["answer"], entry=self.entry))
+        answer = action.arguments["answer"]
+        # The upstream Game of Life scorer can raise KeyError on JSON objects.
+        if self.entry["metadata"]["source_dataset"] == "game_of_life" and not _is_game_of_life_grid(answer):
+            raise ToolCallError(
+                "Invalid answer format: expected a JSON array of row arrays, for example [[0,1],[1,0]]. "
+                "Correct the format and submit again."
+            )
+        reward = float(self.dataset.score_answer(answer=answer, entry=self.entry))
         self.done = True
         return StepResult(observation="Answer submitted.", reward=reward, done=True)
 

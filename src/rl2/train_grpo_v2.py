@@ -93,6 +93,7 @@ from urllib.error import URLError
 from urllib.request import urlopen
 from uuid import uuid4
 
+import httpx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -1318,11 +1319,12 @@ class Actor:
                                     env = await resources.enter_async_context(task.init_env())
                                     result = await agent.run(env=env)
                                 break
-                            except ActorDiedError as error:
-                                if error.actor_init_failed or attempt == 2:
+                            except (ActorDiedError, httpx.NetworkError, httpx.RemoteProtocolError) as error:
+                                if attempt == 2 or (isinstance(error, ActorDiedError) and error.actor_init_failed):
                                     raise
                                 logger.warning(
-                                    "Rollout worker died; restarting episode: task=%s rollout=%d retry=%d/2",
+                                    "Rollout infrastructure failure (%s); restarting episode: task=%s rollout=%d retry=%d/2",
+                                    type(error).__name__,
                                     task.id,
                                     index,
                                     attempt + 1,

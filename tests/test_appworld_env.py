@@ -74,10 +74,16 @@ def test_invalid_task_discovery(output: str, monkeypatch: pytest.MonkeyPatch) ->
 def test_invalid_tool_call_does_not_reach_worker(name: str, arguments: dict[str, object]) -> None:
     task = env.AppWorldTask(id="a", config=env.AppWorldConfig(python=sys.executable, root="/apps"))
     session = env.AppWorldSession(task=task)
-    session.request = AsyncMock()
-    with pytest.raises(env.ToolCallError):
-        asyncio.run(session.step(env.ToolCall(name=name, arguments=arguments)))
-    session.request.assert_not_called()
+    session.request = AsyncMock(return_value={"observation": "ok", "reward": 0.0, "done": False})
+
+    async def run() -> None:
+        with pytest.raises(env.ToolCallError):
+            await session.step(env.ToolCall(name=name, arguments=arguments))
+        session.request.assert_not_called()
+        result = await session.step(env.ToolCall(name="execute", arguments={"code": "pass"}))
+        assert result == env.StepResult(observation="ok", reward=0.0, done=False)
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("initial", [{"reward": 1.0}, {"done": True}], ids=["reward", "terminal"])

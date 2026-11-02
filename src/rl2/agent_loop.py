@@ -209,7 +209,7 @@ class Agent:
                             try:
                                 result = await env.step(call, timeout=self.environment_timeout)
                             except ToolCallError as error:
-                                pending.append(json.dumps({"error": str(error)}))
+                                pending.append(json.dumps({"error": error.feedback}))
                                 continue
                         reward += result.reward
                         done = result.done

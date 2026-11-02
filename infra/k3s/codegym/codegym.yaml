@@ -30,7 +30,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: codegym
-          image: rl2.local/codegym:4
+          image: rl2.local/codegym:5
           imagePullPolicy: Never
           args: [--host, 0.0.0.0, --port, "8000", --workers, "160"]
           ports:

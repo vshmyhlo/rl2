@@ -125,8 +125,17 @@ def test_reset_rejects_inactive_episode(info: dict[str, Any], upstream: Upstream
 )
 def test_invalid_tool_does_not_reach_actor(name: str, arguments: dict[str, Any]) -> None:
     session = env.WebShopSession(task=env.WebShopTask(id="1500", config=env.WebShopConfig(root="/webshop")))
-    with pytest.raises(env.ToolCallError):
-        asyncio.run(session.step(env.ToolCall(name=name, arguments=arguments)))
+    result = env.StepResult(observation="Search results", reward=0.0, done=False)
+    session.actor = Mock()
+    session.actor.step.remote = AsyncMock(return_value=result)
+
+    async def run() -> None:
+        with pytest.raises(env.ToolCallError):
+            await session.step(env.ToolCall(name=name, arguments=arguments))
+        session.actor.step.remote.assert_not_called()
+        assert await session.step(env.ToolCall(name="search", arguments={"keywords": "shoes"})) == result
+
+    asyncio.run(run())
 
 
 def test_task_discovery_and_reproducible_sampling(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

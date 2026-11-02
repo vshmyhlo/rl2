@@ -153,7 +153,9 @@ Credentials stay in the trusted caller, never in the Python sandbox.
 
 The model calls `submit_answer(answer=...)` with a string in the question's
 requested format. One valid submission ends the episode and receives the
-dataset's native `score_answer` reward, including partial credit. Plain text
+dataset's native `score_answer` reward, including partial credit. Game of Life
+answers must decode to a JSON list of rows (lists); malformed structures return
+formatting feedback and allow resubmission. Incomplete grids retain native partial credit. Plain text
 without a tool call and truncated responses receive zero reward. The preset
 shares ALFWorld's task budgets, including up to 50 turns for tool use and recovery from malformed calls,
 but retains Tokamax and one prefetched batch. Each
@@ -194,8 +196,11 @@ reward, and done flag. The rollout return sums all step rewards, including both
 intermediate and terminal rewards. Tool responses contain only the observation
 text; rewards and done flags remain internal to the rollout loop.
 Each task’s `init_env()` owns environment startup and cleanup, including on errors
-and cancellation. Each adapter validates its exposed tools and raises `ToolCallError`
-for invalid calls without advancing the environment. Steps after termination require
+and cancellation. Following the contract in [agent_task.py](agent_task.py), each adapter
+returns formatting, parsing, and tool-schema errors as actionable `ToolCallError`
+feedback without advancing or terminating the environment. The model can correct
+and retry within its turn/token budget. Well-formed incorrect answers receive normal
+task scoring; infrastructure failures remain errors. Steps after termination require
 a reset. The agent loop contains no environment-specific dispatch.
 
 Each rollout owns one ALFWorld Ray actor using Ray's default CPU scheduling and follows this loop:
@@ -234,17 +239,19 @@ truncating existing tokens. Episodes with no sampled tokens fail the group.
 
 `rollout_timeout` bounds the whole episode; `environment_timeout` bounds Ray/subprocess
 task discovery and each reset/step request. CodeGym dataset loading uses the dataset
-library’s I/O timeouts during startup. A Ray `ActorDiedError` restarts the affected
-episode in a fresh environment with the same task and seed, up to two retries
-within the original rollout deadline. Failed attempts are discarded, without
-fallback rewards. Actor constructor exceptions are not retried.
-Exhausted retries, other worker errors, HTTP failures,
+library’s I/O timeouts during startup. A Ray `ActorDiedError` or HTTPX `NetworkError`
+(including CodeGym `ReadError`) or `RemoteProtocolError` restarts the affected episode
+in a fresh environment with the same task and seed, up to two retries within the
+original rollout deadline. Failed attempts are discarded, without fallback rewards.
+Individual environment steps are not replayed: the server may have already executed
+an action before the connection failed. Actor constructor exceptions are not retried.
+Exhausted retries, other worker errors, HTTP status errors,
 malformed sampling data, and timeouts abort the group and cancel its other rollouts.
 Environments close normally on success; errors and cancellations terminate ALFWorld and WebShop
 actors immediately. AppWorld workers receive EOF and are awaited on normal exit;
 errors and cancellations kill their process group before awaiting exit. Training enables Ray's Linux subreaper to clean up TextWorld
-child processes even after a forced termination. The SDK retries transient HTTP failures
-up to three times; there are no fallback rewards for infrastructure failures.
+child processes even after a forced termination. The OpenAI SDK retries transient vLLM HTTP
+failures up to three times; there are no fallback rewards for infrastructure failures.
 
 ## Training and resuming
 

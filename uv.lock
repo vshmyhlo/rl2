@@ -5593,7 +5593,6 @@ dependencies = [
     { name = "cuda-bindings" },
     { name = "nvidia-cutlass-dsl-libs-core" },
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
-    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_version < '0'" },
     { name = "typing-extensions" },
 ]
 wheels = [
@@ -5610,7 +5609,6 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cuda-bindings" },
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
-    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_version < '0'" },
     { name = "typing-extensions" },
 ]
 wheels = [
@@ -5625,7 +5623,6 @@ dependencies = [
     { name = "cuda-bindings" },
     { name = "nvidia-cutlass-dsl-libs-base" },
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
-    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_version < '0'" },
     { name = "typing-extensions" },
 ]
 wheels = [
@@ -5643,7 +5640,6 @@ dependencies = [
     { name = "cuda-bindings" },
     { name = "nvidia-cutlass-dsl-libs-base" },
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
-    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_version < '0'" },
     { name = "typing-extensions" },
 ]
 wheels = [
@@ -7662,7 +7658,6 @@ dependencies = [
     { name = "msgpack" },
     { name = "packaging" },
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
-    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_version < '0'" },
     { name = "pyyaml" },
     { name = "requests" },
 ]
@@ -7937,6 +7932,7 @@ dependencies = [
     { name = "jaxopt" },
     { name = "jaxrobotarium" },
     { name = "jaxtari" },
+    { name = "jsonschema" },
     { name = "kauldron" },
     { name = "kinetix-env" },
     { name = "mctx" },
@@ -8010,6 +8006,7 @@ requires-dist = [
     { name = "jaxopt", specifier = ">=0.8.5,<0.9" },
     { name = "jaxrobotarium", url = "https://github.com/GT-STAR-Lab/JaxRobotarium/archive/6200711f6fb98015579af3e7a534bcfb8bcb69af.tar.gz" },
     { name = "jaxtari", specifier = "==0.2.0" },
+    { name = "jsonschema", specifier = ">=4.26,<5" },
     { name = "kauldron", specifier = ">=1.4.4,<2" },
     { name = "kinetix-env", specifier = "==3.0.2" },
     { name = "mctx", specifier = ">=0.0.6,<0.1" },
@@ -9930,7 +9927,6 @@ dependencies = [
     { name = "prometheus-client" },
     { name = "prometheus-fastapi-instrumentator" },
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
-    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "python_version < '0'" },
     { name = "psutil" },
     { name = "py-cpuinfo" },
     { name = "pybase64" },

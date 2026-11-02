@@ -501,5 +501,14 @@ def test_tools_do_not_limit_steps() -> None:
 )
 def test_invalid_action_does_not_reach_worker(name: str, arguments: dict[str, object]) -> None:
     session = env.ALFWorldSession(task=env.ALFWorldTask(id="a", config_file="config.yaml"))
-    with pytest.raises(env.ToolCallError):
-        asyncio.run(session.step(env.ToolCall(name=name, arguments=arguments)))
+    result = env.StepResult(observation="Looked around", reward=0.0, done=False)
+    session.actor = Mock()
+    session.actor.step.remote = AsyncMock(return_value=result)
+
+    async def run() -> None:
+        with pytest.raises(env.ToolCallError):
+            await session.step(env.ToolCall(name=name, arguments=arguments))
+        session.actor.step.remote.assert_not_called()
+        assert await session.step(env.ToolCall(name="look", arguments={})) == result
+
+    asyncio.run(run())
