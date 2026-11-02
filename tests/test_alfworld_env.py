@@ -225,6 +225,7 @@ def test_worker_reset_step_and_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
         )
         assert initial.tools == env.tool_schemas()
         assert initial.system_prompt == env.SYSTEM_PROMPT
+        assert initial.single_tool_call
         result = worker.step(env.ToolCall(name="look", arguments={}))
     constructor.assert_called_once_with(config_file="config.yaml", task_id="train/a")
     assert result == env.StepResult(observation="Success", reward=1.0, done=True)
@@ -463,12 +464,18 @@ def test_tool_calls_do_not_replay_terminal_result() -> None:
     environment = Mock(commands=["look"])
     environment.reset.return_value = env.StepResult(observation="Goal", reward=0.0, done=False)
     terminal = env.StepResult(observation="Done", reward=1.0, done=True)
-    environment.step.side_effect = [terminal, RuntimeError("Episode finished")]
+    environment.step.return_value = terminal
     tools = env.ALFWorldTools(environment=environment)
+    with pytest.raises(RuntimeError, match="Reset"):
+        tools.call(env.ToolCall(name="look", arguments={}))
+    environment.step.assert_not_called()
     tools.reset()
     assert tools.call(env.ToolCall(name="look", arguments={})) == terminal
-    with pytest.raises(RuntimeError, match="Episode finished"):
+    with pytest.raises(RuntimeError, match="Reset"):
         tools.call(env.ToolCall(name="look", arguments={}))
+    assert environment.step.call_count == 1
+    tools.reset()
+    assert tools.call(env.ToolCall(name="look", arguments={})) == terminal
     assert environment.step.call_count == 2
 
 

@@ -19,7 +19,6 @@ from reasoning_gym.composite import DatasetSpec
 from reasoning_gym.dataset import ProceduralDataset
 
 from rl2.agent_task import Environment, ResetResult, StepResult, Task, ToolCall, ToolCallError, ToolSchema
-from rl2.calculator import calculate
 from rl2.sandbox.kubernetes import PythonExecutionError, PythonSession, validate_python_code
 
 
@@ -49,27 +48,6 @@ def create_dataset(config: ReasoningGymConfig, seed: int) -> ProceduralDataset:
 
 def tool_schemas() -> list[ToolSchema]:
     return [
-        # Python handles arithmetic; keep the calculator schema disabled.
-        # {
-        #     "type": "function",
-        #     "function": {
-        #         "name": "calculator",
-        #         "description": (
-        #             "Evaluate arithmetic using numbers, parentheses, and + - * / // % ** only. "
-        #             "Expressions are limited to 256 characters, exponent magnitudes to 100, "
-        #             "and intermediate/result magnitudes to 1e100. Returns plain text: a number on success or "
-        #             "'Error: ...' on failure, without ending the episode. Floating-point arithmetic is approximate."
-        #         ),
-        #         "parameters": {
-        #             "type": "object",
-        #             "properties": {
-        #                 "expression": {"type": "string", "description": "Arithmetic expression to evaluate."}
-        #             },
-        #             "required": ["expression"],
-        #             "additionalProperties": False,
-        #         },
-        #     },
-        # },
         {
             "type": "function",
             "function": {
@@ -114,7 +92,7 @@ def tool_schemas() -> list[ToolSchema]:
 
 
 def validate_tool_call(call: ToolCall) -> None:
-    arguments = {"calculator": "expression", "python": "code", "submit_answer": "answer"}
+    arguments = {"python": "code", "submit_answer": "answer"}
     if call.name not in arguments:
         raise ToolCallError(f"Unknown Reasoning Gym tool: {call.name}")
     argument = arguments[call.name]
@@ -183,18 +161,18 @@ class ReasoningGymWorker:
                 "Do not repeat the same failed call or remove required computation just to make the code run. "
                 "If a result contradicts the problem, investigate before submitting. "
                 "Once the result is checked, submit without repeating the analysis.\n\n"
+                "Use exactly one tool call per turn and wait for its result. "
                 "Close </think> before each tool call and use a complete <tool_call> JSON block. "
                 "Call submit_answer exactly once, with your final answer as a string in the format requested. "
                 "Do not add explanations, extra brackets, or other wrappers inside the answer."
             ),
             prompt=self.entry["question"],
+            single_tool_call=True,
         )
 
     def step(self, action: ToolCall) -> StepResult:
         if self.done:
             raise RuntimeError("Reset the episode before calling a tool")
-        if action.name == "calculator":
-            return StepResult(observation=calculate(action.arguments["expression"]), reward=0.0, done=False)
         if action.name != "submit_answer":
             raise ToolCallError(f"Unsupported scoring worker tool: {action.name}")
         reward = float(self.dataset.score_answer(answer=action.arguments["answer"], entry=self.entry))
@@ -216,8 +194,8 @@ class ReasoningGymSession(Environment):
         self._python = None
 
     async def reset(self, *, timeout: float | None = None) -> ResetResult:
-        await self.aclose()
         async with asyncio.timeout(timeout):
+            await self.aclose()
             result = await self.actor.reset.remote()
             self._done = False
             return result

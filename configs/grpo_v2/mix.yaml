@@ -15,6 +15,13 @@ gradient_checkpointing: true
 padding_multiple: 1024
 # Moderate computation tasks for calculator/Python; bounded inputs fit the transcript budget.
 tasksets:
+  codegym:
+    weight: 1.0
+    taskset:
+      id: codegym
+      manager_url: http://codegym.codegym.svc.cluster.local:8000
+      # Full English-task/English-environment train split (80,130 rows across all four shards).
+      dataset_file: hf://datasets/VanishD/CodeGym@85286359a342f7a288aea74273772b69b9b784c2/task_en_instruction_en_env/train-*.parquet
   alfworld:
     weight: 1.0
     taskset:

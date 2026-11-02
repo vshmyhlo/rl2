@@ -92,7 +92,7 @@ def stream_appworld_tasks(config: AppWorldConfig, rng: Random, timeout: float) -
 
 
 class AppWorldSession(BenchmarkSession, Environment):
-    """One subprocess per rollout, with asynchronous requests and bounded cleanup."""
+    """One subprocess per rollout, with asynchronous requests and cleanup."""
 
     def __init__(self, task: AppWorldTask) -> None:
         super().__init__(command=worker_command(task.config), timeout=None, env=worker_environment(task.config))
@@ -107,6 +107,7 @@ class AppWorldSession(BenchmarkSession, Environment):
             tools=tool_schemas(),
             system_prompt="Use the execute tool once per turn. Pass Python source in code without Markdown fences.",
             prompt=initial.observation,
+            single_tool_call=True,
         )
 
     async def step(self, action: ToolCall, *, timeout: float | None = None) -> StepResult:

@@ -2,7 +2,7 @@
 
 `train_grpo_v2.py` finetunes Qwen3 with a JAX learner, a vLLM inference server,
 and a small custom tool-calling interaction loop. `tasksets` is a mapping keyed by
-unique, nonblank taskset identifiers. Each entry contains
+unique, lowercase `snake_case` taskset identifiers (starting with a letter). Each entry contains
 a relative `weight` (default 1) and a `taskset` with `id: alfworld`, `appworld`,
 `codegym`, `reasoning_gym`, or `webshop`; the other environment presets are unsupported. For example:
 
@@ -125,7 +125,7 @@ unchanged when resuming. Sampling orders entries by identifier, so YAML key orde
 does not affect the sequence. A single active taskset preserves its original sampling sequence.
 
 For Reasoning Gym, the model sees `python(code=...)` and `submit_answer(answer=...)`.
-The calculator schema is disabled; Python handles arithmetic too.
+The calculator tool is disabled and rejected; Python handles arithmetic too.
 The Python tool lazily creates one network-disabled gVisor pod and persistent
 interpreter per rollout, with SymPy 1.14.0 (`import sympy`) for symbolic math and
 Z3 4.15.4 (`import z3`) for constraint solving preinstalled alongside the standard library.
@@ -157,7 +157,7 @@ dataset's native `score_answer` reward, including partial credit. Plain text
 without a tool call and truncated responses receive zero reward. The preset
 shares ALFWorld's task budgets, including up to 50 turns for tool use and recovery from malformed calls,
 but retains Tokamax and one prefetched batch. Each
-rollout owns a Ray worker for CPU-bound generation, calculation, and scoring; timeouts and
+rollout owns a Ray worker for CPU-bound generation and scoring; timeouts and
 cancellation terminate it. Keep task settings and seed unchanged when resuming.
 
 Ray reserves one GPU for the actor's vLLM server and `learner_gpus` GPUs for the
@@ -187,12 +187,16 @@ caller opens the environment within the rollout timeout and passes it to `Agent.
 The environment’s async `reset()` returns a `ResetResult` containing `tools`,
 `system_prompt`, and `prompt`. Reset must start an active episode with no reward
 and at least one valid step available. The prompt includes the initial observation.
+All five supported environments set `single_tool_call=True`: responses with multiple
+calls receive corrective feedback before any call executes.
 Its async `step(action)` returns a `StepResult` containing the observation, per-step
 reward, and done flag. The rollout return sums all step rewards, including both
 intermediate and terminal rewards. Tool responses contain only the observation
 text; rewards and done flags remain internal to the rollout loop.
-`ALFWorldTask.init_env()` owns worker startup and cleanup; ALFWorld
-validates its own tool arguments. The agent loop has no ALFWorld imports.
+Each task’s `init_env()` owns environment startup and cleanup, including on errors
+and cancellation. Each adapter validates its exposed tools and raises `ToolCallError`
+for invalid calls without advancing the environment. Steps after termination require
+a reset. The agent loop contains no environment-specific dispatch.
 
 Each rollout owns one ALFWorld Ray actor using Ray's default CPU scheduling and follows this loop:
 
@@ -207,13 +211,12 @@ The tools match the original ALFWorld interface: `look`, `go_to`, `take`, `move`
 the supported placement grammar from the current admissible commands.
 
 Thinking is enabled, and tool calls inside thinking are ignored. The model is
-instructed to use one tool per turn; multiple calls execute sequentially until
-the episode ends. Malformed calls receive tool-error feedback without changing
+required to use one tool per turn. Malformed calls receive tool-error feedback without changing
 the game. A response without tool calls ends the episode. There are no MCP
 servers, renderer pools, or Verifiers objects in this path. The tokenizer and
 SDK client are shared across concurrent rollouts; episode state is independent.
-ALFWorld and WebShop calls await Ray object references; AppWorld uses asynchronous subprocess
-I/O. Tokenization runs in threads.
+ALFWorld, WebShop, and Reasoning Gym scoring await Ray object references; AppWorld
+uses asynchronous subprocess I/O, and CodeGym uses asynchronous HTTP. Tokenization runs in threads.
 
 The transcript is append-only, using Qwen3 message boundaries. Sampled history,
 including thinking and end-of-turn tokens, is never re-tokenized. Every sampled
@@ -229,16 +232,17 @@ is retained for training but its tool calls are not executed. The next generatio
 by remaining context; observations that cannot fit end the rollout without
 truncating existing tokens. Episodes with no sampled tokens fail the group.
 
-`rollout_timeout` bounds the whole episode; `environment_timeout` bounds task
-discovery and each reset/step request. A Ray `ActorDiedError` restarts the affected
+`rollout_timeout` bounds the whole episode; `environment_timeout` bounds Ray/subprocess
+task discovery and each reset/step request. CodeGym dataset loading uses the dataset
+library’s I/O timeouts during startup. A Ray `ActorDiedError` restarts the affected
 episode in a fresh environment with the same task and seed, up to two retries
 within the original rollout deadline. Failed attempts are discarded, without
 fallback rewards. Actor constructor exceptions are not retried.
 Exhausted retries, other worker errors, HTTP failures,
 malformed sampling data, and timeouts abort the group and cancel its other rollouts.
 Environments close normally on success; errors and cancellations terminate ALFWorld and WebShop
-actors immediately. AppWorld workers receive EOF and have five seconds to close
-before their process group is killed. Training enables Ray's Linux subreaper to clean up TextWorld
+actors immediately. AppWorld workers receive EOF and are awaited on normal exit;
+errors and cancellations kill their process group before awaiting exit. Training enables Ray's Linux subreaper to clean up TextWorld
 child processes even after a forced termination. The SDK retries transient HTTP failures
 up to three times; there are no fallback rewards for infrastructure failures.
 

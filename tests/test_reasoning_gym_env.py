@@ -79,6 +79,7 @@ def test_real_dataset_rewards_and_independent_episodes() -> None:
     assert initial == second.reset()
     assert initial.prompt == entry["question"]
     assert initial.tools == env.tool_schemas()
+    assert initial.single_tool_call
     assert "submit_answer" in initial.system_prompt
     assert first.step(submission) == env.StepResult(observation="Answer submitted.", reward=1.0, done=True)
     assert second.step(env.ToolCall(name="submit_answer", arguments={"answer": "wrong"})) == env.StepResult(
@@ -93,33 +94,13 @@ def test_real_dataset_rewards_and_independent_episodes() -> None:
     assert result.reward == dataset.score_answer(answer=answer, entry=entry)
 
 
-def test_calculator_feedback_and_episode_lifecycle() -> None:
-    task = env.ReasoningGymTask(config=env.ReasoningGymConfig(), seed=1)
-    worker = env.ReasoningGymWorker.__ray_metadata__.modified_class(task=task)
-    calculation = env.ToolCall(name="calculator", arguments={"expression": "12 * (3 + 4)"})
-    with pytest.raises(RuntimeError, match="Reset"):
-        worker.step(calculation)
-    initial = worker.reset()
-    schemas = {tool["function"]["name"]: tool["function"] for tool in initial.tools}
+def test_tool_schemas_match_supported_tools() -> None:
+    schemas = {tool["function"]["name"]: tool["function"] for tool in env.tool_schemas()}
     assert set(schemas) == {"python", "submit_answer"}
-    assert "calculator" not in initial.system_prompt
     assert "import sympy" in schemas["python"]["description"]
     assert "import z3" in schemas["python"]["description"]
-    scorer = Mock(wraps=worker.dataset.score_answer)
-    worker.dataset.score_answer = scorer
-    for expression in ("1 / 0", "__import__('os').getcwd()"):
-        result = worker.step(env.ToolCall(name="calculator", arguments={"expression": expression}))
-        assert result.observation.startswith("Error:")
-        assert result.reward == 0.0 and not result.done
-    assert worker.step(calculation) == env.StepResult(observation="84", reward=0.0, done=False)
-    scorer.assert_not_called()
-    submission = env.ToolCall(name="submit_answer", arguments={"answer": worker.entry["answer"]})
-    assert worker.step(submission) == env.StepResult(observation="Answer submitted.", reward=1.0, done=True)
-    scorer.assert_called_once_with(answer=submission.arguments["answer"], entry=worker.entry)
-    with pytest.raises(RuntimeError, match="Reset"):
-        worker.step(calculation)
-    worker.reset()
-    assert worker.step(calculation).observation == "84"
+    env.validate_tool_call(env.ToolCall(name="python", arguments={"code": "print(42)"}))
+    env.validate_tool_call(env.ToolCall(name="submit_answer", arguments={"answer": "42"}))
 
 
 def test_composite_dataset_native_scoring() -> None:
@@ -153,9 +134,7 @@ def test_composite_cannot_override_sampling(settings: dict[str, object]) -> None
         ("submit_answer", {}),
         ("submit_answer", {"answer": "42", "extra": True}),
         ("submit_answer", {"answer": 42}),
-        ("calculator", {}),
-        ("calculator", {"expression": "1 + 1", "answer": "2"}),
-        ("calculator", {"expression": 42}),
+        ("calculator", {"expression": "1 + 1"}),
         ("python", {}),
         ("python", {"code": "print(42)", "extra": True}),
         ("python", {"code": 42}),
@@ -168,9 +147,7 @@ def test_composite_cannot_override_sampling(settings: dict[str, object]) -> None
         "missing-answer",
         "extra-answer",
         "answer-type",
-        "missing-expression",
-        "extra-expression",
-        "expression-type",
+        "disabled-calculator",
         "missing-code",
         "extra-code",
         "code-type",
@@ -275,7 +252,6 @@ def test_python_tool_reuses_sandbox_and_reset_isolates_episodes(monkeypatch: pyt
                 "additionalProperties": False,
             }
             assert "python" in initial.system_prompt
-            await session.step(env.ToolCall(name="calculator", arguments={"expression": "6 * 7"}))
             constructor.assert_not_called()
             for source, output, exit_code, truncated in [
                 ("x = 40", "", 0, False),
@@ -297,7 +273,7 @@ def test_python_tool_reuses_sandbox_and_reset_isolates_episodes(monkeypatch: pyt
                 "print(x + 2)",
                 special_source,
             ]
-            assert actor.step.remote.await_count == 1  # Only the calculator reaches the scoring worker.
+            actor.step.remote.assert_not_awaited()
             submission = env.ToolCall(name="submit_answer", arguments={"answer": worker.entry["answer"]})
             assert (await session.step(submission)).reward == 1.0
             with pytest.raises(RuntimeError, match="Reset"):
@@ -376,3 +352,21 @@ def test_python_tool_cleanup_on_error(mode: str, monkeypatch: pytest.MonkeyPatch
 
 def test_python_code_limit_accepts_boundary() -> None:
     env.validate_tool_call(env.ToolCall(name="python", arguments={"code": "é" * 8192}))
+
+
+def test_reset_timeout_includes_previous_sandbox_cleanup() -> None:
+    actor = Mock()
+    session = env.ReasoningGymSession(actor=actor, config=env.ReasoningGymConfig())
+
+    async def cleanup() -> None:
+        await asyncio.Future()
+
+    session.aclose = AsyncMock(side_effect=cleanup)
+
+    async def run() -> None:
+        with pytest.raises(TimeoutError):
+            await session.reset(timeout=0)
+
+    asyncio.run(run())
+    session.aclose.assert_awaited_once()
+    actor.reset.remote.assert_not_called()

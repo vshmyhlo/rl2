@@ -51,6 +51,7 @@ class FakeServer:
     failure: str = ""
     initial_reward: float = 0
     initial_done: bool = False
+    step_timeout: float = 10
 
     def respond(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -78,7 +79,8 @@ class FakeServer:
         if path == "/step":
             call = json.loads(body["action"])
             self.actions.append(call)
-            assert body["timeout"] == 10
+            assert body["timeout"] == self.step_timeout
+            assert request.extensions["timeout"]["read"] > self.step_timeout
             if call["name"] in {"Done", "Earn"}:
                 state["reward"] = 2 if call["parameters"].get("answer") == 3 else 0
                 state["done"] = call["name"] == "Done"
@@ -188,6 +190,12 @@ def test_episode_and_independent_attempts(server: FakeServer) -> None:
             assert first.session.session_id != second.session.session_id
             assert "call_function" not in initial.system_prompt
             assert "Initial state" in initial.prompt
+            assert initial.single_tool_call
+            assert (
+                "If the initial observation lacks the task data, use an available observation tool "
+                "to inspect the current instance before acting."
+            ) in initial.system_prompt
+            assert "illustrative, not the current instance" in initial.system_prompt
             assert "Add the values" in initial.prompt
             assert "FunctionCallBegin" not in initial.prompt + initial.system_prompt
             assert "Hidden reference" not in initial.prompt + initial.system_prompt
@@ -210,16 +218,25 @@ def test_episode_and_independent_attempts(server: FakeServer) -> None:
 def test_cumulative_reward_and_step_limit(server: FakeServer) -> None:
     async def run() -> None:
         async with task(plugin_call_max_round=2).init_env() as environment:
+            with pytest.raises(RuntimeError, match="Reset"):
+                await environment.step(action("Observe"))
+            assert not server.actions
             await environment.reset()
             first = await environment.step(action("Earn", answer=3))
             second = await environment.step(action("Observe"))
             assert first.reward == 1 and not first.done
             assert second.reward == 0 and second.done
+            with pytest.raises(RuntimeError, match="Reset"):
+                await environment.step(action("Observe"))
+            assert len(server.actions) == 2
             await environment.reset()
             assert len(server.sessions) == 1
             assert environment.score == 0 and environment.steps == 0
             failed = await environment.step(action("Done", answer=0))
             assert failed.done and failed.reward == 0
+            with pytest.raises(RuntimeError, match="Reset"):
+                await environment.step(action("Observe"))
+            assert len(server.actions) == 3
 
     asyncio.run(run())
     assert server.paths.count("/release_instance") == 2
@@ -372,5 +389,22 @@ def test_live_serialized_and_array_arguments() -> None:
             assert result.observation == "3" and not result.done
             done = await environment.step(action("Done", answer=3), timeout=30)
             assert done.reward == 1 and done.done
+
+    asyncio.run(run())
+
+
+def test_backend_step_timeout_fits_http_deadline(server: FakeServer) -> None:
+    server.step_timeout = 180
+    sampled = env.CodeGymTask(
+        id="slow-step",
+        config=env.CodeGymConfig(step_timeout=server.step_timeout),
+        row=env.CodeGymRow.model_validate(row()),
+    )
+
+    async def run() -> None:
+        async with sampled.init_env() as environment:
+            await environment.reset()
+            result = await environment.step(action("Observe"))
+            assert not result.done and result.reward == 0
 
     asyncio.run(run())

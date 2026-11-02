@@ -1,9 +1,38 @@
 """Extract public action schemas without importing or executing environment code."""
 
 import ast
+import re
 from typing import Any
 
 Schema = dict[str, Any]
+
+
+def tool_description(docstring: str) -> str:
+    lines: list[str] = []
+    example_indent: int | None = None
+    for line in docstring.splitlines():
+        indent = len(line) - len(line.lstrip())
+        if re.fullmatch(r"\s*(?:Example Output|Examples?):\s*", line):
+            example_indent = indent
+        elif example_indent is not None and (not line.strip() or indent > example_indent):
+            continue
+        else:
+            example_indent = None
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def parameter_schema(arg: ast.arg, docstring: str) -> Schema:
+    if arg.annotation is not None:
+        return annotation_schema(arg.annotation)
+    match = re.search(rf"(?m)^\s*{re.escape(arg.arg)}\s*\(([^)\n]+)\):", docstring)
+    if match is None:
+        return {}
+    try:
+        annotation = ast.parse(match[1], mode="eval").body
+    except SyntaxError:
+        return {}
+    return annotation_schema(annotation)
 
 
 def annotation_schema(node: ast.expr | None) -> Schema:
@@ -181,6 +210,7 @@ def extract_tools(code: str, class_name: str) -> list[Schema]:
     tools: list[Schema] = []
     for name, value in mapping.items():
         method = methods[name]
+        docstring = ast.get_docstring(method) or ""
         branch = branches.get(resolve(value))
         body = branch.body if branch is not None else fallback
         if not body:
@@ -195,7 +225,7 @@ def extract_tools(code: str, class_name: str) -> list[Schema]:
             if arg.arg != "self"
         }
         # Only annotate matching wire keys; renamed arguments remain unrestricted.
-        properties = {name: annotation_schema(args[name].annotation) if name in args else {} for name in reads}
+        properties = {name: parameter_schema(args[name], docstring) if name in args else {} for name in reads}
         for statement in body:
             for node in ast.walk(statement):
                 if (
@@ -213,7 +243,7 @@ def extract_tools(code: str, class_name: str) -> list[Schema]:
                 "type": "function",
                 "function": {
                     "name": name,
-                    "description": ast.get_docstring(method) or name,
+                    "description": tool_description(docstring) or name,
                     "parameters": {
                         "type": "object",
                         "properties": properties,

@@ -118,9 +118,14 @@ def test_setup(failure: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPa
     setup.prepare_codegym(tmp_path)
     assert len(downloads) == 5
     assert run.call_count == 2
+    marker = tmp_path / ".ready"
+    marker.write_text(marker.read_text().replace("tools-v2", "tools-v1"))
+    setup.prepare_codegym(tmp_path)
+    assert marker.read_text().startswith("tools-v2\n")
+    assert len(downloads) == 10
     setup.prepare_codegym(tmp_path, worker_host="0.0.0.0")
     assert (tmp_path / "env_instance_manager.py").read_text() == 'ARGS = ["--host", "0.0.0.0"]'
-    assert len(downloads) == 10
+    assert len(downloads) == 15
     tools_file.unlink()
     setup.prepare_codegym(tmp_path, worker_host="0.0.0.0")
     assert tools_file.is_file()

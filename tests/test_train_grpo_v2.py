@@ -384,6 +384,12 @@ def test_duplicate_taskset_identifiers_rejected(tmp_path: Path) -> None:
         training.load_config(path, training.Config)
 
 
+@pytest.mark.parametrize("name", ["Legs", "leg-counting", "legs/other", "leg counting", "1legs", "legs_", "a__b"])
+def test_taskset_identifiers_require_snake_case(name: str) -> None:
+    with pytest.raises(ValidationError, match="string_pattern_mismatch"):
+        training.Config(tasksets={name: training.WeightedTasksetConfig(taskset=training.ReasoningGymConfig())})
+
+
 def test_default_taskset_mapping_is_not_shared() -> None:
     first = training.Config()
     second = training.Config()

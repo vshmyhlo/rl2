@@ -5,6 +5,9 @@ Adapters must assert that upstream reset rewards are absent or zero and terminal
 flags are absent or false. Rewards and termination are reported only by step().
 Each step reports its own reward; the episode return is the sum of step rewards,
 whether rewards arrive throughout the episode or only at termination.
+After termination, reset is required before another step. Invalid model actions
+raise ToolCallError without advancing the environment. Each rollout owns its
+resources through Task.init_env(), including cleanup on errors and cancellation.
 """
 
 from __future__ import annotations
@@ -70,6 +73,7 @@ class ResetResult:
     tools: list[ToolSchema]
     system_prompt: str
     prompt: str
+    single_tool_call: bool = False
 
 
 class Environment(ABC):

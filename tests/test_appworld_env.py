@@ -157,6 +157,7 @@ class AppWorld:
                 assert "show_api_doc" in initial.prompt and "2026-01-01" in initial.prompt
                 assert "```python" not in initial.prompt
                 assert initial.tools == env.tool_schemas()
+                assert initial.single_tool_call
                 assert "execute" in initial.system_prompt
             action = env.ToolCall(name="execute", arguments={"code": 'print("``` inside Python")'})
             one = await first.step(action, timeout=10)

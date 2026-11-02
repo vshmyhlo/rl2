@@ -101,13 +101,14 @@ class WebShopTask(Task):
 
 
 def stream_webshop_tasks(config: WebShopConfig, rng: Random, timeout: float) -> Generator[WebShopTask]:
+    """Discover IDs at startup, then sample tasks with replacement on demand."""
     config = replace(config, root=str(Path(config.root).expanduser().resolve()))
     with ExitStack() as resources:
         pending = discover_tasks.options(runtime_env=worker_runtime_env(config)).remote(config.root)
         resources.callback(ray.cancel, pending, force=True)
         ids = ray.get(pending, timeout=timeout)
-    if not ids:
-        raise ValueError("WebShop training split is empty")
+    if not ids or any(not task_id for task_id in ids) or len(ids) != len(set(ids)):
+        raise ValueError("WebShop training task IDs must be nonempty and unique")
 
     def stream() -> Generator[WebShopTask]:
         while True:
@@ -137,6 +138,7 @@ class WebShopWorker:
                 "Keep reasoning brief and close </think> before a complete <tool_call> JSON block."
             ),
             prompt=observation,
+            single_tool_call=True,
         )
 
     def step(self, action: ToolCall) -> StepResult:

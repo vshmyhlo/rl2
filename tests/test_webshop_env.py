@@ -68,6 +68,7 @@ def test_worker_episode_and_full_split(upstream: Upstream) -> None:
         with pytest.raises(RuntimeError, match="Reset"):
             worker.step(env.ToolCall(name="click", arguments={"value": "Buy Now"}))
         initial = worker.reset()
+        assert initial.single_tool_call
         assert initial.prompt == 'Buy a hat\nAvailable actions: {"clickables": ["Buy Now"]}'
         schemas = {tool["function"]["name"]: tool["function"]["parameters"] for tool in initial.tools}
         assert set(schemas) == {"search", "click"}
@@ -151,12 +152,17 @@ def test_task_discovery_and_reproducible_sampling(monkeypatch: pytest.MonkeyPatc
     cancel.assert_called_once_with(discover.options.return_value.remote.return_value, force=True)
 
 
-@pytest.mark.parametrize("failure", ["empty", "timeout"])
+@pytest.mark.parametrize("failure", ["empty", "empty-id", "duplicate", "timeout"])
 def test_task_discovery_failure_cancels_pending_work(failure: str, monkeypatch: pytest.MonkeyPatch) -> None:
     discover = Mock()
     monkeypatch.setattr(env, "discover_tasks", discover)
     monkeypatch.setattr(
-        env.ray, "get", Mock(return_value=[], side_effect=TimeoutError if failure == "timeout" else None)
+        env.ray,
+        "get",
+        Mock(
+            return_value={"empty-id": [""], "duplicate": ["1500", "1500"]}.get(failure, []),
+            side_effect=TimeoutError if failure == "timeout" else None,
+        ),
     )
     cancel = Mock()
     monkeypatch.setattr(env.ray, "cancel", cancel)

@@ -22,7 +22,7 @@ def prepare_codegym(root: Path, *, worker_host: Literal["127.0.0.1", "0.0.0.0"] 
     root = root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     marker = root / ".ready"
-    version = f"tools-v1\n{worker_host}\n{SERVER_REVISION}\n{DATASET_REVISION}\n{' '.join(ENV_REQUIREMENTS)}\n"
+    version = f"tools-v2\n{worker_host}\n{SERVER_REVISION}\n{DATASET_REVISION}\n{' '.join(ENV_REQUIREMENTS)}\n"
     files = {
         "env_instance_manager.py": "online_server/online_server/env_instance_manager.py",
         "env_server.py": "online_server/online_server/env_server.py",

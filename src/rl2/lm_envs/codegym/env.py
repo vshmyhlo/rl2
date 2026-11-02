@@ -144,6 +144,7 @@ class CodeGymEnvironment(Environment):
         self.session: CodeGymSession
         self.steps = 0
         self.score = 0.0
+        self.done = True
 
     async def status(self) -> tuple[bool, float]:
         params = {"session_id": self.session.session_id}
@@ -152,6 +153,7 @@ class CodeGymEnvironment(Environment):
         return done.done, reward.reward
 
     async def reset(self, *, timeout: float | None = None) -> ResetResult:
+        self.done = True
         async with asyncio.timeout(timeout):
             await self.resources.aclose()
             self.session = await self.resources.enter_async_context(
@@ -162,16 +164,24 @@ class CodeGymEnvironment(Environment):
         assert raw_reward == 0.0, "CodeGym reset must not award a reward"
         self.steps = 0
         self.score = 0.0
+        self.done = False
         return ResetResult(
             tools=self.session.tools,
             system_prompt=(
                 "Solve the task using the provided CodeGym tools. Call one function per turn and wait for its result. "
+                "If the initial observation lacks the task data, use an available observation tool "
+                "to inspect the current instance before acting. "
+                "Examples in the question and tool descriptions are illustrative, not the current instance. "
+                "Use actual tool results rather than assuming their outputs. "
                 "Submit your answer through the documented completion function."
             ),
             prompt=f"{self.task.row.question}\n\nInitial observation:\n{self.session.observation}",
+            single_tool_call=True,
         )
 
     async def step(self, action: ToolCall, *, timeout: float | None = None) -> StepResult:
+        if self.done:
+            raise RuntimeError("Reset the episode before calling a tool")
         functions = {tool["function"]["name"]: tool["function"] for tool in self.session.tools}
         if action.name not in functions:
             raise ToolCallError(f"Unknown CodeGym tool: {action.name}")
@@ -192,6 +202,7 @@ class CodeGymEnvironment(Environment):
                     self.session.client,
                     "POST",
                     "/step",
+                    timeout=max(120, self.task.config.step_timeout + 10),
                     json={
                         "session_id": self.session.session_id,
                         "action": call.model_dump_json(),
@@ -205,10 +216,11 @@ class CodeGymEnvironment(Environment):
         score = float(raw_reward > 0)
         reward = score - self.score
         self.score = score
+        self.done = done or self.steps >= self.task.row.plugin_call_max_round
         return StepResult(
             observation=result.observation,
             reward=reward,
-            done=done or self.steps >= self.task.row.plugin_call_max_round,
+            done=self.done,
         )
 
 

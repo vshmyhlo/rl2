@@ -193,6 +193,11 @@ class Agent:
                 pending = []
                 try:
                     calls = parse_tool_calls(text)
+                    if initial.single_tool_call and len(calls) > 1:
+                        raise ToolCallError(
+                            "Call exactly one function per response and wait for its result. "
+                            "None of these calls were executed. Retry with a single tool call."
+                        )
                 except ValueError as error:
                     pending.append(json.dumps({"error": str(error)}))
                 else:

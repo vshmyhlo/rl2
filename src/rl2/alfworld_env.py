@@ -236,11 +236,14 @@ def validate_tool_call(call: ToolCall) -> None:
 class ALFWorldTools:
     def __init__(self, environment: ALFWorld) -> None:
         self.environment = environment
+        self.done = True
 
     def reset(self) -> ResetResult:
+        self.done = True
         initial = self.environment.reset()
         assert initial.reward == 0.0, "ALFWorld reset must not award a reward"
         assert not initial.done, "ALFWorld reset must allow at least one step"
+        self.done = False
         return ResetResult(
             tools=tool_schemas(),
             system_prompt=SYSTEM_PROMPT,
@@ -249,12 +252,17 @@ class ALFWorldTools:
                 "Start with one action from the admissible commands. "
                 "If the target is not visible, visit a location to search for it."
             ),
+            single_tool_call=True,
         )
 
     def call(self, call: ToolCall) -> StepResult:
+        if self.done:
+            raise RuntimeError("Reset the episode before calling a tool")
         commands = [command.format(**call.arguments) for command in ACTION_TOOLS[call.name].commands]
         command = next((command for command in commands if command in self.environment.commands), commands[0])
-        return self.environment.step(command)
+        result = self.environment.step(command)
+        self.done = result.done
+        return result
 
 
 @dataclass(frozen=True, slots=True)

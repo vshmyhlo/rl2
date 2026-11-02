@@ -7,17 +7,23 @@ internet or credentials. The server has no GPU or service-account token.
 Preparation fixes two malformed display f-strings in the pinned dataset's
 `Codeforces_5537_I__MinPathCostEnv` and compile-checks every environment. It also generates public tool schemas
 from each environment’s `func_mapping`, dispatch code, signatures, and docstrings.
-`GET /tools/{environment_name}` serves those schemas to the training adapter;
-private helper methods are excluded, and unknown parameter types stay unrestricted.
+`GET /tools/{environment_name}` serves those schemas to the training adapter.
+Private helper methods and example-output sections are excluded. Missing parameter
+annotations fall back to documented types for matching wire keys; unknown types stay unrestricted.
+Some upstream annotations disagree with their implementations; schemas preserve
+those hints, while the adapter validates names and argument keys, not value types.
 The individual-tool adapter requires an image built with this schema endpoint.
+The adapter requires one tool call per response and tells the model to inspect the
+current instance when the initial observation lacks task data. Multi-call responses
+are rejected without execution.
 
 From the repository root:
 
 ```bash
 sudo buildctl --addr unix:///run/rl2-buildkit/buildkitd.sock build \
   --frontend dockerfile.v0 --local context=. --local dockerfile=infra/k3s/codegym \
-  --output type=image,name=rl2.local/codegym:4,unpack=true
-sudo k3s ctr -n k8s.io images label rl2.local/codegym:4 io.cri-containerd.pinned=pinned
+  --output type=image,name=rl2.local/codegym:5,unpack=true
+sudo k3s ctr -n k8s.io images label rl2.local/codegym:5 io.cri-containerd.pinned=pinned
 sudo k3s kubectl apply -f infra/k3s/codegym/codegym.yaml
 sudo k3s kubectl -n codegym rollout status deployment/codegym --timeout=300s
 ```

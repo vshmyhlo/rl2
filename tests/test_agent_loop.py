@@ -13,6 +13,7 @@ import pytest
 from openai import APIStatusError, AsyncOpenAI
 from openai.types import CompletionChoice
 from openai.types.completion_choice import Logprobs
+from pydantic import TypeAdapter
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
@@ -22,6 +23,7 @@ from rl2.agent_task import Environment, ResetResult, Task, ToolSchema
 from rl2.alfworld_env import StepResult, ToolCall, tool_schemas
 from rl2.grpo_v2 import reasoning_gym
 from rl2.lm_envs.codegym import env as codegym_env
+from rl2.lm_envs.codegym.tools import extract_tools
 from rl2.sandbox.gvisor import PythonResult
 
 
@@ -117,7 +119,27 @@ def make_agent(tokenizer: PreTrainedTokenizerFast, client: AsyncOpenAI) -> loop.
     )
 
 
-def test_codegym_rollout(tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_codegym_schemas_survive_qwen_rendering(tokenizer: PreTrainedTokenizerFast) -> None:
+    source = (
+        (Path(__file__).parent / "fixtures/codegym.py")
+        .read_text()
+        .replace("nested: list", "nested: dict[str, list[tuple[int, str] | None]]")
+    )
+    generated = extract_tools(source, "SumEnv")
+    tools = TypeAdapter(list[ToolSchema]).validate_python(generated)
+    assert tools == generated
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Test the tools."}], tools=tools, tokenize=False, add_generation_prompt=True
+    )
+    block = rendered.split("\n<tools>\n", 1)[1].split("\n</tools>", 1)[0]
+    assert [json.loads(line) for line in block.splitlines()] == generated
+    assert tools[1]["function"]["parameters"]["properties"]["answer"] == {}
+
+
+@pytest.mark.parametrize("multiple_calls", [False, True], ids=["single-call", "reject-batch-before-execution"])
+def test_codegym_rollout(
+    multiple_calls: bool, tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest.MonkeyPatch
+) -> None:
     task = codegym_env.CodeGymTask(
         id="0",
         config=codegym_env.CodeGymConfig(),
@@ -167,12 +189,21 @@ def test_codegym_rollout(tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest
 
     monkeypatch.setattr(codegym_env, "codegym_session", session)
     reply = '<tool_call>{"name":"Done","arguments":{"answer":3}}</tool_call><|im_end|>'
+    rejected = reply.removesuffix("<|im_end|>") + reply
+    prompts: list[str] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
         prompt = tokenizer.decode(json.loads(request.content)["prompt"])
+        prompts.append(prompt)
         assert '"name": "Done"' in prompt and '"type": "integer"' in prompt
         assert "call_function" not in prompt
         assert "Add 1 and 2" in prompt and "FunctionCallBegin" not in prompt
+        assert not finished
+        if multiple_calls and len(prompts) == 1:
+            return httpx.Response(200, json=response_for(tokenizer, rejected))
+        if multiple_calls:
+            assert "None of these calls were executed" in prompt
+            assert "Retry with a single tool call" in prompt
         return httpx.Response(200, json=response_for(tokenizer, reply))
 
     async def run() -> loop.Rollout:
@@ -181,9 +212,11 @@ def test_codegym_rollout(tokenizer: PreTrainedTokenizerFast, monkeypatch: pytest
 
     rollout = asyncio.run(run())
     assert rollout.reward == 1 and rollout.stop_condition == "environment_done"
+    assert rollout.num_turns == len(prompts) == (2 if multiple_calls else 1)
     sequence = rollout.sequence
     assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape
-    assert sequence.loss_mask.sum() == len(tokenizer.encode(reply, add_special_tokens=False))
+    output = rejected + reply if multiple_calls else reply
+    assert sequence.loss_mask.sum() == len(tokenizer.encode(output, add_special_tokens=False))
 
 
 @pytest.mark.parametrize("mode", ["submitted", "calculator", "python", "python_failure", "plain_text", "truncated"])
@@ -247,8 +280,8 @@ def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, mo
     if mode == "submitted":
         actor.step.remote.assert_awaited_once_with(submission)
     elif mode == "calculator":
-        assert [call.args[0] for call in actor.step.remote.await_args_list] == [calculation, submission]
-        assert f"<tool_response>\n{answer}\n</tool_response>" in tokenizer.decode(requests[1]["prompt"])
+        actor.step.remote.assert_awaited_once_with(submission)
+        assert "Unknown Reasoning Gym tool: calculator" in tokenizer.decode(requests[1]["prompt"])
     elif mode == "python":
         actor.step.remote.assert_awaited_once_with(submission)
         sandbox.execute.assert_awaited_once_with(f"print({answer})")

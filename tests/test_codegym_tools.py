@@ -1,9 +1,10 @@
 import ast
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from rl2.lm_envs.codegym.tools import annotation_schema, extract_tools
+from rl2.lm_envs.codegym.tools import annotation_schema, extract_tools, tool_description
 
 SOURCE = (Path(__file__).parent / "fixtures/codegym.py").read_text()
 
@@ -95,3 +96,47 @@ def test_serialized_wire_value_overrides_method_annotation() -> None:
     parameters = extract_tools(source, "SumEnv")[-1]["function"]["parameters"]
     assert parameters["properties"]["answer"]["type"] == "string"
     assert parameters["required"] == ["answer"]
+
+
+@pytest.mark.parametrize(
+    ("documented_type", "expected"),
+    [
+        ("int", {"type": "integer"}),
+        ("list[int]", {"type": "array", "items": {"type": "integer"}}),
+        ("CustomType", {}),
+        ("list of integers", {}),
+    ],
+)
+def test_documented_parameter_type(documented_type: str, expected: dict[str, Any]) -> None:
+    source = SOURCE.replace(
+        "Submit the sum. answer (int): The proposed result.",
+        f"Submit the sum.\n\n        Args:\n            answer ({documented_type}): The proposed result.\n"
+        '\n        Example Output:\n            "Reference answer: 3, reward=1"\n        ',
+    )
+    tool = extract_tools(source, "SumEnv")[1]["function"]
+    assert tool["parameters"]["properties"]["answer"] == expected
+    assert "The proposed result" in tool["description"]
+    assert "Example Output" not in tool["description"]
+    assert "Reference answer" not in tool["description"]
+
+
+def test_annotation_and_wire_format_override_docstring() -> None:
+    source = SOURCE.replace(
+        "Award an intermediate reward.",
+        "Award an intermediate reward.\n\n        Args:\n            answer (str): The result.\n        ",
+    )
+    assert extract_tools(source, "SumEnv")[-1]["function"]["parameters"]["properties"]["answer"] == {"type": "integer"}
+    source = (
+        source.replace("answer: int", "answer")
+        .replace("answer (str)", "answer (int)")
+        .replace('self.Earn(params["answer"])', 'self.Earn(json.loads(params["answer"]))')
+    )
+    assert extract_tools(source, "SumEnv")[-1]["function"]["parameters"]["properties"]["answer"]["type"] == "string"
+
+
+def test_remove_examples_preserves_other_sections() -> None:
+    description = (
+        'Inspect the instance.\n\nExample Output:\n    "Reference answer: 3"\n\n'
+        "Returns:\n    str: Current state.\n\nExamples:\n    Observe()\n"
+    )
+    assert tool_description(description) == "Inspect the instance.\n\nReturns:\n    str: Current state."

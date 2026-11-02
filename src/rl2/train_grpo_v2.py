@@ -153,7 +153,7 @@ class WeightedTasksetConfig:
     weight: Annotated[float, Field(ge=0, lt=float("inf"))] = 1.0
 
 
-TasksetConfigs = dict[Annotated[str, Field(pattern=r"\S")], WeightedTasksetConfig]
+TasksetConfigs = dict[Annotated[str, Field(pattern=r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")], WeightedTasksetConfig]
 
 
 @config_dataclass(frozen=True)
