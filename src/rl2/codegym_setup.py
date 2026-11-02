@@ -14,11 +14,11 @@ DATASET_REVISION = "85286359a342f7a288aea74273772b69b9b784c2"
 ENV_REQUIREMENTS = ["gymnasium==1.3.0", "numpy==2.3.5"]
 
 
-def prepare_codegym(root: Path) -> None:
+def prepare_codegym(root: Path, *, worker_host: str = "127.0.0.1") -> None:
     root = root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     marker = root / ".ready"
-    version = f"ipv4-v1\n{SERVER_REVISION}\n{DATASET_REVISION}\n{' '.join(ENV_REQUIREMENTS)}\n"
+    version = f"ipv4-v3\n{worker_host}\n{SERVER_REVISION}\n{DATASET_REVISION}\n{' '.join(ENV_REQUIREMENTS)}\n"
     if marker.is_file() and marker.read_text() == version and (root / ".venv/bin/python").is_file():
         return
     marker.unlink(missing_ok=True)
@@ -33,9 +33,9 @@ def prepare_codegym(root: Path) -> None:
     for name, source in files.items():
         with urlopen(f"{base_url}/{source}", timeout=60) as response, (root / name).open("wb") as output:
             shutil.copyfileobj(response, output)
-    # Upstream workers bind IPv6-only; our local manager and client use IPv4.
+    # Bind workers to loopback locally or the pod network for cluster clients.
     manager = root / "env_instance_manager.py"
-    manager.write_text(manager.read_text().replace('"--host", "::"', '"--host", "127.0.0.1"'))
+    manager.write_text(manager.read_text().replace('"--host", "::"', f'"--host", "{worker_host}"'))
     subprocess.run(["uv", "venv", "--allow-existing", "--python", sys.executable, str(root / ".venv")], check=True)
     subprocess.run(
         [
@@ -57,7 +57,12 @@ def prepare_codegym(root: Path) -> None:
         name = f"{row['source']}__{row['env_name']}.py"
         if Path(name).name != name or "\\" in name:
             raise ValueError(f"Invalid CodeGym environment filename: {name!r}")
-        (destination / name).write_text(row["env_code"], encoding="utf-8")
+        code = row["env_code"]
+        if name == "Codeforces_5537_I__MinPathCostEnv.py":
+            # The pinned dataset has two invalid list-comprehension f-strings in this environment.
+            code = code.replace("[{self.dp[i][0] for i in range(self.n)}]", "{[self.dp[i][0] for i in range(self.n)]}")
+        compile(code, name, "exec")
+        (destination / name).write_text(code, encoding="utf-8")
     if not len(environments):
         raise ValueError("CodeGym environment dataset is empty")
     marker.write_text(version)
@@ -66,8 +71,9 @@ def prepare_codegym(root: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("/runs/codegym"))
+    parser.add_argument("--worker-host", choices=["127.0.0.1", "0.0.0.0"], default="127.0.0.1")
     args = parser.parse_args()
-    prepare_codegym(args.root)
+    prepare_codegym(args.root, worker_host=args.worker_host)
     print(f"CodeGym ready at {args.root.resolve()}")
 
 

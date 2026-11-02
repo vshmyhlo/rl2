@@ -70,9 +70,11 @@ score, so a persistent success is counted once. Episodes stop when the server
 finishes or the row's call limit is reached, subject to the agent's turn, token,
 and timeout budgets. No final-text answer grading is performed.
 
-The preset allows 8192 transcript tokens and 32 concurrent episodes without
-prefetching, fitting the deployed 40-worker pool. Size the pool for concurrent
-episodes across all jobs before increasing prefetching or batch sizes.
+The preset matches `mix.yaml` training settings, including full finetuning,
+8192 transcript tokens, 32 rollouts per batch, and four prefetched batches.
+It needs capacity for up to 160 concurrent episodes. Increase the deployed
+40-worker pool and its allowed worker ports before running this preset, or set
+`prefetch_batches: 0` to fit that pool. Account for other jobs sharing the server.
 
 Run on Linux x86_64 with Python 3.12 and two visible GPUs:
 

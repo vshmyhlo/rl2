@@ -25,8 +25,10 @@ cannot share allocations. NetworkPolicy permits ingress from `training` and
 active episodes; use a new image tag for updates and deploy between runs.
 
 Worker count must cover all concurrent rollouts across jobs, including
-prefetched batches. The CodeGym preset uses 32 concurrent rollouts without
-prefetching. Update both worker count and NetworkPolicy port range when scaling.
+prefetched batches. The CodeGym preset matches `mix.yaml`: 32 rollouts per batch
+and four prefetched batches require up to 160 concurrent workers. Before using
+that preset, increase the deployed 40-worker pool and NetworkPolicy port range,
+or set `prefetch_batches: 0` to fit the existing pool.
 
 ```bash
 sudo k3s kubectl -n codegym get pods
