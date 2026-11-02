@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 from fastapi import HTTPException
 
-from rl2 import codegym_setup as setup
+from rl2.lm_envs.codegym import setup
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "0.0.0.0"])
@@ -25,8 +25,10 @@ def test_launcher(host: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     uvicorn = SimpleNamespace(run=Mock())
     monkeypatch.setitem(sys.modules, "env_instance_manager", upstream)
     monkeypatch.setitem(sys.modules, "uvicorn", uvicorn)
-    monkeypatch.setattr(sys, "argv", ["codegym_launcher", "--port", "8001", "--workers", "1", "--host", host])
-    namespace = runpy.run_path(str(Path(setup.__file__).with_name("codegym_launcher.py")), run_name="__main__")
+    monkeypatch.setattr(
+        sys, "argv", ["rl2.lm_envs.codegym.launcher", "--port", "8001", "--workers", "1", "--host", host]
+    )
+    namespace = runpy.run_module("rl2.lm_envs.codegym.launcher", run_name="__main__")
     monkeypatch.chdir(tmp_path)
     (tmp_path / "tools").mkdir()
     tools_path = tmp_path / "tools/Example__SumEnv.json"
@@ -66,9 +68,9 @@ def test_launcher_rejects_invalid_arguments(arguments: list[str], monkeypatch: p
     uvicorn = SimpleNamespace(run=Mock())
     monkeypatch.setitem(sys.modules, "env_instance_manager", upstream)
     monkeypatch.setitem(sys.modules, "uvicorn", uvicorn)
-    monkeypatch.setattr(sys, "argv", ["codegym_launcher", "--port", "8000", "--workers", "1", *arguments])
+    monkeypatch.setattr(sys, "argv", ["rl2.lm_envs.codegym.launcher", "--port", "8000", "--workers", "1", *arguments])
     with pytest.raises(SystemExit) as raised:
-        runpy.run_path(str(Path(setup.__file__).with_name("codegym_launcher.py")), run_name="__main__")
+        runpy.run_module("rl2.lm_envs.codegym.launcher", run_name="__main__")
     assert raised.value.code == 2
     uvicorn.run.assert_not_called()
 

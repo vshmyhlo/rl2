@@ -17,10 +17,11 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
 from rl2 import agent_loop as loop
-from rl2 import alfworld_env, codegym_env
+from rl2 import alfworld_env
 from rl2.agent_task import Environment, ResetResult, Task, ToolSchema
 from rl2.alfworld_env import StepResult, ToolCall, tool_schemas
 from rl2.grpo_v2 import reasoning_gym
+from rl2.lm_envs.codegym import env as codegym_env
 from rl2.sandbox.gvisor import PythonResult
 
 

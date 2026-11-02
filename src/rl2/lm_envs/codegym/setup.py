@@ -11,7 +11,7 @@ from urllib.request import urlopen
 
 from datasets import load_dataset
 
-from rl2.codegym.tools import extract_tools
+from rl2.lm_envs.codegym.tools import extract_tools
 
 SERVER_REVISION = "e85a439761ae2df813d5997a81bbd9f9e2ed27b7"
 DATASET_REVISION = "85286359a342f7a288aea74273772b69b9b784c2"

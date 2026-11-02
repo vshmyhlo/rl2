@@ -13,9 +13,9 @@ import pytest
 from datasets import Dataset
 from datasets import config as datasets_config
 
-from rl2 import codegym_env as env
 from rl2.agent_task import ToolCall, ToolCallError
-from rl2.codegym.tools import extract_tools
+from rl2.lm_envs.codegym import env
+from rl2.lm_envs.codegym.tools import extract_tools
 
 TOOLS = extract_tools((Path(__file__).parent / "fixtures/codegym.py").read_text(), "SumEnv")
 

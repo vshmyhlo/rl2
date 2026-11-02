@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from rl2.codegym.tools import annotation_schema, extract_tools
+from rl2.lm_envs.codegym.tools import annotation_schema, extract_tools
 
 SOURCE = (Path(__file__).parent / "fixtures/codegym.py").read_text()
 

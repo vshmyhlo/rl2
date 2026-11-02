@@ -114,11 +114,11 @@ from rl2.agent_loop import Agent, Rollout, StopCondition, TrainingSequence
 from rl2.agent_task import Task
 from rl2.alfworld_env import ALFWorldConfig, stream_alfworld_tasks
 from rl2.appworld_env import AppWorldConfig, stream_appworld_tasks
-from rl2.codegym_env import CodeGymConfig, stream_codegym_tasks
 from rl2.configuration import BaseConfig, load_config
 from rl2.grpo_v2.reasoning_gym import ReasoningGymConfig, stream_reasoning_gym_tasks
 from rl2.grpo_v2.state import LoRATrainState
 from rl2.grpo_v2.weight_transfer import full_weight_publisher, lora_weight_publisher
+from rl2.lm_envs.codegym.env import CodeGymConfig, stream_codegym_tasks
 from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import (
     AttentionBackend,
