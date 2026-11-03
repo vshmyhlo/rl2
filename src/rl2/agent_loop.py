@@ -11,7 +11,7 @@ import httpx
 import numpy as np
 from numpy.typing import NDArray
 from openai import AsyncOpenAI
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
 
 from rl2.agent_task import Environment, ToolCall, ToolCallError
@@ -85,6 +85,10 @@ class CompletionChoice(BaseModel):
     finish_reason: str
 
 
+class CompletionResponse(BaseModel):
+    choices: list[CompletionChoice]
+
+
 @dataclass(frozen=True)
 class TrainingSequence:
     token_ids: NDArray[np.int32]  # (T,) exact context and generated tokens.
@@ -155,7 +159,6 @@ class Agent:
             with span("actor.rollout.reset"):
                 initial = await env.reset(timeout=self.environment_timeout)
             reward = 0.0
-            done = False
             token_ids = await asyncio.to_thread(
                 self.tokenizer.apply_chat_template,
                 [
@@ -179,12 +182,9 @@ class Agent:
             num_turns = 0
             completion = ""
             stop_condition: StopCondition = "max_turns"
-            pending: list[str] = []
+            stop_token_ids = self.tokenizer.convert_tokens_to_ids(["<|im_end|>", "<|endoftext|>"])
             for _ in range(self.max_turns):
                 remaining = token_limit - len(token_ids)
-                if remaining <= 0:
-                    stop_condition = limit_condition
-                    break
                 with span("actor.rollout.model", {"input_tokens": len(token_ids)}) as model_span:
                     response = await self.client.post(
                         str(self.client.base_url.copy_with(path="/inference/v1/generate")),
@@ -199,14 +199,12 @@ class Agent:
                                 "top_p": 1.0,
                                 "top_k": -1,
                                 "logprobs": 0,
-                                "stop_token_ids": self.tokenizer.convert_tokens_to_ids(["<|im_end|>", "<|endoftext|>"]),
+                                "stop_token_ids": stop_token_ids,
                                 "detokenize": False,
                             },
                         },
                     )
-                    choices = TypeAdapter(list[CompletionChoice]).validate_python(
-                        response.json().get("choices"), strict=True
-                    )
+                    choices = CompletionResponse.model_validate(response.json(), strict=True).choices
                     if len(choices) != 1:
                         raise ValueError("Expected one completion per model request")
                     choice = choices[0]
@@ -229,7 +227,8 @@ class Agent:
                 if choice.finish_reason == "length":
                     stop_condition = limit_condition
                     break
-                pending = []
+                pending: list[str] = []
+                done = False
                 try:
                     calls = parse_tool_calls(text)
                     if initial.single_tool_call and len(calls) > 1:
@@ -262,8 +261,7 @@ class Agent:
                     break
                 # Qwen3 groups tool results in one user message; sampled history stays untouched.
                 responses = "\n".join(f"<tool_response>\n{content}\n</tool_response>" for content in pending)
-                im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-                suffix = ("" if ids[-1] == im_end_id else "<|im_end|>") + (
+                suffix = ("" if ids[-1] == stop_token_ids[0] else "<|im_end|>") + (
                     f"\n<|im_start|>user\n{responses}<|im_end|>\n<|im_start|>assistant\n"
                 )
                 context = await asyncio.to_thread(self.tokenizer.encode, suffix, add_special_tokens=False)
@@ -274,14 +272,12 @@ class Agent:
                 loss_mask.extend([False] * len(context))
                 log_probs.extend([0.0] * len(context))
                 weight_versions.extend([-1] * len(context))
-                pending = []
-            if not any(loss_mask):
+            num_output_tokens = sum(loss_mask)
+            if num_output_tokens == 0:
                 raise ValueError("Rollout has no trainable tokens")
             interaction = await asyncio.to_thread(
                 self.tokenizer.decode, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
             )
-            if len(token_ids) > self.max_tokens:
-                raise ValueError(f"Rollout has {len(token_ids)} tokens; exceeds max_tokens={self.max_tokens}")
             return Rollout(
                 sequence=TrainingSequence(
                     token_ids=np.asarray(token_ids, dtype=np.int32),  # (T,)
@@ -295,8 +291,8 @@ class Agent:
                 completion=completion,
                 interaction=interaction,
                 num_turns=num_turns,
-                num_input_tokens=len(token_ids) - sum(loss_mask),
-                num_output_tokens=sum(loss_mask),
+                num_input_tokens=len(token_ids) - num_output_tokens,
+                num_output_tokens=num_output_tokens,
                 rollout_seconds=time.monotonic() - started,
                 stop_condition=stop_condition,
             )

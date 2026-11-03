@@ -594,6 +594,7 @@ def test_serve_vllm(failure: str | None, monkeypatch: pytest.MonkeyPatch) -> Non
         "--port",
         "8000",
         "--disable-uvicorn-access-log",
+        "--enable-scale-out",
         "--dtype",
         "bfloat16",
         "--hf-overrides",

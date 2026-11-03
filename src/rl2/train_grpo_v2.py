@@ -819,6 +819,7 @@ def serve_vllm(
             "--port",
             "8000",
             "--disable-uvicorn-access-log",
+            "--enable-scale-out",
             "--dtype",
             "bfloat16",
             "--hf-overrides",

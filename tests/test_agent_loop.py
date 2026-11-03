@@ -584,7 +584,20 @@ def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, envir
 
 @pytest.mark.parametrize(
     "failure",
-    ["http", "empty", "logprobs", "alignment", "missing_probability", "abort", "abort_empty", "timeout", "cancel"],
+    [
+        "http",
+        "response_type",
+        "missing_choices",
+        "multiple_choices",
+        "empty",
+        "logprobs",
+        "alignment",
+        "missing_probability",
+        "abort",
+        "abort_empty",
+        "timeout",
+        "cancel",
+    ],
 )
 def test_failures_close_environment(
     failure: str, tokenizer: PreTrainedTokenizerFast, environment: AsyncMock, task: Task
@@ -600,8 +613,14 @@ def test_failures_close_environment(
             await asyncio.Future()
         if failure == "http":
             return httpx.Response(500)
+        if failure == "response_type":
+            return httpx.Response(200, json=[])
+        if failure == "missing_choices":
+            return httpx.Response(200, json={})
         data = response_for(tokenizer, "look<|im_end|>")
         choice = data["choices"][0]
+        if failure == "multiple_choices":
+            data["choices"].append(choice.copy())
         if failure in {"empty", "abort_empty"}:
             choice["token_ids"] = []
             choice["logprobs"]["content"] = []

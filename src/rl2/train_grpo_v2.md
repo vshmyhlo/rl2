@@ -185,6 +185,7 @@ interleaves long prompt processing with decoding. The agent also respects the
 configured `max_tokens` transcript budget.
 The [A100 mix benchmark](../../docs/vllm_mix_benchmark_a100.md) records the
 serving settings selected for `configs/grpo_v2/mix.yaml` and their limitations.
+The server enables scale-out endpoints for the agent's `/inference/v1/generate` requests.
 The server keeps idle HTTP connections alive for 30 seconds, longer than the client's
 5-second expiry. Retry messages include the exception type and HTTP status when available;
 request payloads are not logged. Request timeouts still use `rollout_timeout`.
