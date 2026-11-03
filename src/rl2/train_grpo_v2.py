@@ -46,6 +46,8 @@ Rollout batch scalars:
     batcher/token_utilization_fraction: Non-padding transcript tokens divided by batch size times padded sequence length.
     batcher/padded_sequence_tokens: Padded sequence width chosen during batch construction, before the next-token shift.
     batcher/skipped_groups: Groups discarded by drop_degenerate_groups while filling this batch, including prefetch.
+    batcher/stale_groups: Groups discarded by max_staleness while filling this batch.
+    batcher/stale_rollouts: Rollouts discarded by max_staleness while filling this batch.
 All StopCondition labels are logged each iteration, including zero for absent labels.
 
 Training progress and settings:
@@ -157,9 +159,35 @@ class WeightedTasksetConfig:
 TasksetConfigs = dict[Annotated[str, Field(pattern=r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")], WeightedTasksetConfig]
 
 
+@config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class VLLMConfig:
+    """Optional serving overrides; omitted values use vLLM's defaults."""
+
+    max_model_len: Annotated[int | None, Field(ge=1)] = None
+    max_num_seqs: Annotated[int | None, Field(ge=1)] = None
+    max_num_batched_tokens: Annotated[int | None, Field(ge=1)] = None
+    gpu_memory_utilization: Annotated[float | None, Field(gt=0, le=1)] = None
+    enable_prefix_caching: bool | None = None
+    enable_chunked_prefill: bool | None = None
+    async_scheduling: bool | None = None
+
+
+@config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class LoRAConfig:
+    mode: Literal["lora"] = "lora"
+    rank: Annotated[int, Field(ge=1, le=512)] = 16
+    alpha: Annotated[float, Field(gt=0)] = 32.0
+
+
+@config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class FullFinetuningConfig:
+    mode: Literal["full"] = "full"
+
+
 @config_dataclass(frozen=True)
 class Config(BaseConfig):
     model: str = MODEL
+    vllm: VLLMConfig = VLLMConfig()
     tasksets: Annotated[TasksetConfigs, Field(min_length=1)] = field(
         default_factory=lambda: {
             "alfworld": WeightedTasksetConfig(taskset=ALFWorldConfig(config_file="data/alfworld/base_config.yaml"))
@@ -170,8 +198,8 @@ class Config(BaseConfig):
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4
     prefetch_batches: Annotated[int, Field(ge=0)] = 0  # Positive values trade policy staleness for overlap.
-    prefetch_mode: Literal["next_ready", "next_in_order"] = "next_in_order"
     parameter_sync_step: Annotated[int, Field(ge=1)] = 1  # Completed training batches between weight publications.
+    max_staleness: Annotated[int, Field(ge=0)] = 100  # Allowed weight publications since group submission.
     drop_degenerate_groups: bool = False
     continual_group_filling: bool = False
     max_resampling_attempts: Annotated[int, Field(ge=0)] = 100
@@ -189,9 +217,7 @@ class Config(BaseConfig):
     weight_decay: Annotated[float, Field(ge=0)] = 0.0
     # New/reference optimizer batch-size ratio; configure batch dimensions separately.
     adamw_batch_size_scale: Annotated[float, Field(gt=0, le=10)] = 1.0
-    finetuning_mode: Literal["lora", "full"] = "lora"
-    lora_rank: Annotated[int, Field(ge=1, le=512)] = 16
-    lora_alpha: Annotated[float, Field(gt=0)] = 32.0
+    finetuning: Annotated[LoRAConfig | FullFinetuningConfig, Field(discriminator="mode")] = LoRAConfig()
     clip_coef: Annotated[float, Field(gt=0, lt=1)] = 0.2
     rollout_is_threshold: Annotated[float, Field(gt=0)] = 2.0  # verl token-level truncated importance sampling.
     max_grad_norm: Annotated[float, Field(gt=0)] = 1.0
@@ -292,12 +318,17 @@ def restore_checkpoint(
     metadata = manager.restore(iteration, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
     if metadata["version"] != 2 or metadata["algorithm"] != "grpo_v2":
         raise ValueError("Unsupported GRPO v2 checkpoint; use a new checkpoint directory")
-    # Version 2 checkpoints predating this option contain LoRA states.
-    if metadata["config"].get("finetuning_mode", "lora") != config.finetuning_mode:
-        raise ValueError("GRPO v2 checkpoint finetuning_mode does not match the current configuration")
-    for name in ("model", "lora_rank", "lora_alpha") if config.finetuning_mode == "lora" else ("model",):
-        if metadata["config"].get(name) != getattr(config, name):
-            raise ValueError(f"GRPO v2 checkpoint {name} does not match the current configuration")
+    saved_config = metadata["config"]
+    saved_mode = saved_config.get("finetuning", saved_config.get("finetuning_mode", "lora"))
+    if isinstance(saved_mode, str):
+        # Older version 2 checkpoints stored LoRA settings at the top level.
+        saved_mode = {"mode": saved_mode}
+        if saved_mode["mode"] == "lora":
+            saved_mode |= {"rank": saved_config.get("lora_rank"), "alpha": saved_config.get("lora_alpha")}
+    if saved_mode != asdict(config.finetuning):
+        raise ValueError("GRPO v2 checkpoint finetuning does not match the current configuration")
+    if saved_config.get("model") != config.model:
+        raise ValueError("GRPO v2 checkpoint model does not match the current configuration")
     if metadata["iteration"] != iteration or iteration < 0 or metadata["total_rollouts"] < 0:
         raise ValueError("Invalid GRPO v2 checkpoint progress")
     restored = manager.restore(
@@ -390,6 +421,7 @@ class RolloutBatch:
 class CollectedGroup(NamedTuple):
     group: RolloutGroup
     skipped_groups: int
+    weight_version: int
 
 
 def build_rollout_batch(
@@ -399,6 +431,8 @@ def build_rollout_batch(
     *,
     include_examples: bool = False,
     skipped_groups: int = 0,
+    stale_groups: int = 0,
+    stale_rollouts: int = 0,
     latest_examples: dict[str, RolloutGroup] | None = None,
 ) -> RolloutBatch:
     """Summarize the batch and refresh the optional per-taskset example cache."""
@@ -431,6 +465,8 @@ def build_rollout_batch(
             "batcher/token_utilization_fraction": float(training_batch.attention_mask.mean()),
             "batcher/padded_sequence_tokens": float(training_batch.attention_mask.shape[1]),
             "batcher/skipped_groups": skipped_groups,
+            "batcher/stale_groups": stale_groups,
+            "batcher/stale_rollouts": stale_rollouts,
             "actor/rollout_seconds_mean": mean(rollout.rollout_seconds for rollout in rollouts),
         },
         stop_counts=Counter(rollout.stop_condition for rollout in rollouts),
@@ -574,7 +610,7 @@ def create_state(
         optax.clip_by_global_norm(config.max_grad_norm),
         optax.adamw(**config.adamw_kwargs),
     )
-    if config.finetuning_mode == "full":
+    if config.finetuning.mode == "full":
         return TrainState.create(
             apply_fn=model.apply,
             params=jax.tree.map(lambda value: value.astype(jnp.float32), params),  # HF parameter shapes.
@@ -590,12 +626,12 @@ def create_state(
         adapters[name] = LoRAWeights(
             a=jax.random.uniform(
                 adapter_key,
-                (config.lora_rank, input_size),
+                (config.finetuning.rank, input_size),
                 dtype=jnp.float32,
                 minval=-(input_size**-0.5),
                 maxval=input_size**-0.5,
             ),  # (R, I)
-            b=jnp.zeros((output_size, config.lora_rank), dtype=jnp.float32),  # (O, R)
+            b=jnp.zeros((output_size, config.finetuning.rank), dtype=jnp.float32),  # (O, R)
         )
     if not adapters:
         raise ValueError("No attention or MLP projection weights found for LoRA")
@@ -603,7 +639,7 @@ def create_state(
         apply_fn=model.apply,
         params=adapters,
         base_params=params,
-        lora_scale=config.lora_alpha / config.lora_rank,
+        lora_scale=config.finetuning.alpha / config.finetuning.rank,
         tx=optimizer,
     ).replace(step=jnp.asarray(0, dtype=jnp.int32))  # () Match the device counter returned by update.
 
@@ -729,7 +765,7 @@ async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]
         yield Agent(
             client=client,
             tokenizer=tokenizer,
-            model=LORA_NAME if config.finetuning_mode == "lora" else config.model,
+            model=LORA_NAME if config.finetuning.mode == "lora" else config.model,
             context_length=TypeAdapter(int).validate_python(
                 (model.model_extra or {}).get("max_model_len"), strict=True
             ),
@@ -743,7 +779,10 @@ async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]
 
 @contextmanager
 def serve_vllm(
-    model: str = MODEL, lora_rank: int | None = DEFAULT_CONFIG.lora_rank
+    model: str = MODEL,
+    lora_rank: int | None = LoRAConfig().rank,
+    *,
+    config: VLLMConfig = DEFAULT_CONFIG.vllm,
 ) -> Generator[subprocess.Popen[bytes]]:
     """Manage vLLM's process lifetime; lora_rank=None enables full-weight transfer."""
     weight_args = ["--weight-transfer-config", '{"backend":"nccl"}']
@@ -752,6 +791,15 @@ def serve_vllm(
         if max_lora_rank is None:
             raise ValueError(f"vLLM supports LoRA ranks up to {max(get_args(MaxLoRARanks))}")
         weight_args = ["--enable-lora", "--max-lora-rank", str(max_lora_rank), "--lora-dtype", "bfloat16"]
+    serving_args: list[str] = []
+    for name, value in asdict(config).items():
+        if value is None:
+            continue
+        flag = name.replace("_", "-")
+        if isinstance(value, bool):
+            serving_args.append(f"--{'' if value else 'no-'}{flag}")
+        else:
+            serving_args.extend([f"--{flag}", str(value)])
     logger.info("Starting vLLM server for %s", model)
     # Inherit the GPU assigned to this actor through CUDA_VISIBLE_DEVICES.
     with subprocess.Popen(
@@ -774,16 +822,7 @@ def serve_vllm(
             "vllm",
             "--logprobs-mode",
             "processed_logprobs",
-            # "--max-model-len",  # Cap each request's combined prompt and output length.
-            # "8192",
-            # "--max-num-seqs",  # Limit sequences processed in one scheduler iteration.
-            # "128",
-            # "--max-num-batched-tokens",  # Budget prefill and decode tokens per scheduler iteration.
-            # "8192",
-            # "--gpu-memory-utilization",  # Budget 90% of GPU memory for this vLLM instance.
-            # "0.90",
-            # "--enable-prefix-caching",  # Reuse cached KV state for shared transcript prefixes.
-            # "--enable-chunked-prefill",  # Split long prefills to interleave them with decoding.
+            *serving_args,
             *weight_args,
         ],
         env={
@@ -832,6 +871,7 @@ class Batcher:
         self.config = config
         self._pending_groups: list[asyncio.Task[CollectedGroup]] = []
         self._latest_examples: dict[str, RolloutGroup] = {}
+        self._weight_version = 0
 
     def prepare_batch(self, groups: list[RolloutGroup], context_length: int) -> GRPOBatch[np.ndarray]:
         """Flatten rollout groups in order and right-pad their transcripts into NumPy arrays.
@@ -885,6 +925,7 @@ class Batcher:
         """Fill one pool slot, replacing degenerate groups when configured."""
         skipped_groups = 0
         while True:
+            weight_version = self._weight_version
             pending = self.actor.fetch_next_group.remote(group_size=group_size)
             try:
                 group = await pending
@@ -892,22 +933,26 @@ class Batcher:
                 ray.cancel(pending, recursive=True)
                 raise
             if not self.config.drop_degenerate_groups or not group.is_degenerate:
-                return CollectedGroup(group=group, skipped_groups=skipped_groups)
+                return CollectedGroup(group=group, skipped_groups=skipped_groups, weight_version=weight_version)
             skipped_groups += 1
 
-    async def _fetch_group(self, group_size: int, target_pending: int) -> CollectedGroup:
-        """Fill the pool to its target and consume the next group."""
+    def _fill_pending_groups(self, group_size: int, target_pending: int) -> None:
         while len(self._pending_groups) < target_pending:
             # These tasks remain live between learner requests.
             task = asyncio.create_task(self._collect_group(group_size=group_size))
             self._pending_groups.append(task)
-        if self.config.prefetch_mode == "next_ready":
-            ready, _ = await asyncio.wait(self._pending_groups, return_when=asyncio.FIRST_COMPLETED)
-            task = next(iter(ready))
-        else:
-            task = self._pending_groups[0]
+
+    async def _fetch_group(self, *, group_size: int, pool_size: int, groups_until_drain: int) -> CollectedGroup:
+        """Pop the next ready group and immediately replenish within the drain limit."""
+        self._fill_pending_groups(group_size=group_size, target_pending=min(pool_size, groups_until_drain))
+        ready, _ = await asyncio.wait(self._pending_groups, return_when=asyncio.FIRST_COMPLETED)
+        task = next(task for task in self._pending_groups if task in ready)
         group = await task
         self._pending_groups.remove(task)
+        # Only retained groups reduce demand; stale groups still need replacements.
+        if self._weight_version - group.weight_version <= self.config.max_staleness:
+            groups_until_drain -= 1
+        self._fill_pending_groups(group_size=group_size, target_pending=min(pool_size, groups_until_drain))
         return group
 
     async def cancel_pending_groups(self) -> None:
@@ -924,22 +969,38 @@ class Batcher:
         context_length: int,
         *,
         iteration: int = 1,
+        weight_version: int = 0,
         include_examples: bool = False,
     ) -> RolloutBatch:
-        """Consume groups from a bounded pool, draining it at checkpoint intervals."""
+        """Consume groups from a bounded pool, draining it before periodic and final checkpoints."""
         if num_groups < 1:
             raise ValueError("num_groups must be at least 1")
+        self._weight_version = weight_version
         started = time.monotonic()
-        prefetch_batches = min(self.config.prefetch_batches, (-iteration) % self.config.checkpoint_interval)
+        batches_until_drain = (-iteration) % self.config.checkpoint_interval
+        if self.config.total_iterations is not None:
+            batches_until_drain = min(batches_until_drain, max(0, self.config.total_iterations - iteration))
+        if self.config.prefetch_batches == 0:
+            batches_until_drain = 0
+        groups_until_drain = (batches_until_drain + 1) * num_groups
+        pool_size = (self.config.prefetch_batches + 1) * num_groups
         try:
-            collected = [
-                await self._fetch_group(
+            groups: list[RolloutGroup] = []
+            skipped_groups = 0
+            stale_groups = 0
+            stale_rollouts = 0
+            while len(groups) < num_groups:
+                item = await self._fetch_group(
                     group_size=group_size,
-                    target_pending=prefetch_batches * num_groups + remaining,
+                    pool_size=pool_size,
+                    groups_until_drain=groups_until_drain - len(groups),
                 )
-                for remaining in range(num_groups, 0, -1)
-            ]
-            groups = [item.group for item in collected]
+                skipped_groups += item.skipped_groups
+                if weight_version - item.weight_version > self.config.max_staleness:
+                    stale_groups += 1
+                    stale_rollouts += len(item.group.rollouts)
+                else:
+                    groups.append(item.group)
             fetched = time.monotonic()
             with span("batcher.prepare_batch"):
                 training_batch = await asyncio.to_thread(
@@ -951,7 +1012,9 @@ class Batcher:
                 training_batch=training_batch,
                 include_examples=include_examples,
                 latest_examples=self._latest_examples,
-                skipped_groups=sum(item.skipped_groups for item in collected),
+                skipped_groups=skipped_groups,
+                stale_groups=stale_groups,
+                stale_rollouts=stale_rollouts,
                 timing_metrics={
                     "batcher/fetch_rollout_seconds": fetched - started,
                     "batcher/prepare_batch_seconds": prepared - fetched,
@@ -968,6 +1031,7 @@ class Learner:
         self.config = config
         self.batcher = batcher
         self.actor = actor
+        self.weight_version = 0
         self.shuffle_key = jax.random.key(config.seed)  # () typed base PRNG key.
 
     def start(self) -> None:
@@ -1009,10 +1073,10 @@ class Learner:
             logger.info(
                 "Learner loaded %s trainable tensors in %s mode",
                 len(self.state.params),
-                self.config.finetuning_mode,
+                self.config.finetuning.mode,
             )
             ray.get(self.actor.ready.remote())
-            if self.config.finetuning_mode == "full":
+            if self.config.finetuning.mode == "full":
                 self._publish_weights = resources.enter_context(
                     full_weight_publisher(
                         lambda: self.state.params,
@@ -1028,13 +1092,14 @@ class Learner:
                         server_url=SERVER_URL,
                         model=self.config.model,
                         adapter_name=LORA_NAME,
-                        lora_rank=self.config.lora_rank,
-                        lora_alpha=self.config.lora_alpha,
+                        lora_rank=self.config.finetuning.rank,
+                        lora_alpha=self.config.finetuning.alpha,
                         pause_mode=self.config.weight_update_pause_mode,
                     )
                 )
             resources.callback(self.cancel_pending_groups)
             self.publish_weights()
+            self.weight_version = 0
             total_updates = int(self.state.step)
             published_step = total_updates
             writer.log_metrics(
@@ -1076,6 +1141,7 @@ class Learner:
                     publish = sync_due and total_updates != published_step
                     if publish:
                         self.publish_weights()
+                        self.weight_version += 1
                         published_step = total_updates
                     now = time.monotonic()
                     num_rollouts = batch.training_batch.token_ids.shape[0]
@@ -1104,11 +1170,12 @@ class Learner:
                         scalars["learner/weight_transfer_seconds"] = now - optimized
                     logger.info(
                         "iteration=%s reward=%.3f degenerate_group_fraction=%.3f skipped_groups=%d "
-                        "batch=%.2fs loss=%.4f update=%.2fs%s",
+                        "stale_rollouts=%d batch=%.2fs loss=%.4f update=%.2fs%s",
                         iteration,
                         scalars["rollout/reward_mean"],
                         scalars["rollout/degenerate_group_fraction"],
                         scalars["batcher/skipped_groups"],
+                        scalars["batcher/stale_rollouts"],
                         scalars["learner/batch_fetch_seconds"],
                         scalars["train/policy_loss"],
                         scalars["learner/update_seconds"],
@@ -1146,6 +1213,7 @@ class Learner:
                 group_size=self.config.group_size,
                 context_length=self.model.config.max_position_embeddings,
                 iteration=iteration,
+                weight_version=self.weight_version,
                 include_examples=iteration % self.config.example_log_interval == 0,
             )
         )
@@ -1207,10 +1275,17 @@ class SampledTask(NamedTuple):
     task: Task
 
 
-def stream_tasks(tasksets: TasksetConfigs, rng: random.Random, timeout: float) -> Generator[SampledTask]:
-    """Discover active tasksets at startup, then choose one by relative weight per group."""
+def stream_tasks(
+    tasksets: TasksetConfigs,
+    rng: random.Random,
+    timeout: float,
+    *,
+    taskset_scores: dict[str, float] | None = None,
+) -> Generator[SampledTask]:
+    """Discover active tasksets, then select groups by smooth weighted round robin."""
     streams: dict[str, Generator[Task]] = {}
-    weights: list[float] = []
+    weights: dict[str, float] = {}
+    scores = {} if taskset_scores is None else taskset_scores
     max_weight = max(entry.weight for entry in tasksets.values())
     # Keep sampling reproducible when YAML serialization reorders mapping keys.
     for name, entry in sorted(tasksets.items()):
@@ -1227,12 +1302,16 @@ def stream_tasks(tasksets: TasksetConfigs, rng: random.Random, timeout: float) -
             streams[name] = stream_webshop_tasks(taskset, rng, timeout)
         else:
             streams[name] = stream_alfworld_tasks(taskset, rng, timeout)
-        weights.append(entry.weight / max_weight)
-    names = list(streams)
+        weights[name] = entry.weight / max_weight
+    total_weight = sum(weights.values())
+    weights = {name: weight / total_weight for name, weight in weights.items()}
 
     def stream() -> Generator[SampledTask]:
         while True:
-            name = names[0] if len(names) == 1 else rng.choices(names, weights=weights, k=1)[0]
+            for name, weight in weights.items():
+                scores[name] = scores.get(name, 0.0) + weight
+            name = max(weights, key=scores.__getitem__)
+            scores[name] -= 1.0
             yield SampledTask(taskset_id=name, task=next(streams[name]))
 
     return stream()
@@ -1245,17 +1324,24 @@ class Actor:
         logging.getLogger("httpx").setLevel(logging.WARNING)
         self.config = config
         self.rng = random.Random(config.seed)
+        self.taskset_scores: dict[str, float] = {}
         self._server = ExitStack()
         self._agent_resources = AsyncExitStack()
         self._agent: Agent | None = None
         self._agent_lock = asyncio.Lock()
         self._runs: set[asyncio.Task[Rollout]] = set()
         self._closed = False
-        self.tasks = stream_tasks(config.tasksets, self.rng, config.environment_timeout)
+        self.tasks = stream_tasks(
+            config.tasksets, self.rng, config.environment_timeout, taskset_scores=self.taskset_scores
+        )
         logger.info("Starting actor and vLLM on its assigned GPU")
         with self._server as resources:
             server = resources.enter_context(
-                serve_vllm(model=config.model, lora_rank=config.lora_rank if config.finetuning_mode == "lora" else None)
+                serve_vllm(
+                    model=config.model,
+                    lora_rank=config.finetuning.rank if config.finetuning.mode == "lora" else None,
+                    config=config.vllm,
+                )
             )
             wait_for_server(server)
             self._server = resources.pop_all()
@@ -1289,12 +1375,19 @@ class Actor:
             await asyncio.gather(*runs, return_exceptions=True)
 
     def get_sampling_state(self) -> dict[str, Any]:
-        """Return the task sampler's RNG state in a JSON-compatible form for checkpointing."""
+        """Return task RNG and round-robin scores as a JSON-compatible checkpoint snapshot."""
         version, state, gauss_next = self.rng.getstate()
-        return {"version": version, "state": list(state), "gauss_next": gauss_next}
+        return {
+            "version": version,
+            "state": list(state),
+            "gauss_next": gauss_next,
+            "taskset_scores": self.taskset_scores.copy(),
+        }
 
     def set_sampling_state(self, state: dict[str, Any]) -> None:
         self.rng.setstate((state["version"], tuple(state["state"]), state["gauss_next"]))
+        self.taskset_scores.clear()
+        self.taskset_scores.update(state.get("taskset_scores", {}))
 
     async def fetch_next_group(self, group_size: int) -> RolloutGroup:
         sampled = next(self.tasks)

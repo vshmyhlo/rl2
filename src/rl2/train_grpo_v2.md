@@ -23,10 +23,14 @@ tasksets:
         max_animals: 5
 ```
 
-For every requested group, select an entry with probability `weight / sum(weights)`,
-then sample one task from it. All attempts in the group use that task. Weights
-apply to groups, independently of catalog sizes; batches need not match the exact
-proportions. Weights must be nonnegative and finite, with at least one positive
+For every requested group, select an entry using deterministic smooth weighted
+round robin: add `weight / sum(weights)` to each entry's score, select the highest
+score (breaking ties by identifier), and subtract 1 from that score. Scores start
+at zero. Equal weights cycle through identifiers in sorted order; unequal weights
+spread selections according to their proportions. Then sample one task from the
+selected entry using the seeded task RNG. All attempts in the group use that task.
+Weights apply to requested groups, independently of catalog sizes; individual
+batches need not match the exact proportions. Weights must be nonnegative and finite, with at least one positive
 weight. Zero-weight entries are neither initialized nor sampled. Entries can
 repeat an environment ID with different settings under distinct keys. The keys
 identify configured tasksets; nested `taskset.id` selects the environment type.
@@ -119,8 +123,9 @@ ALFWorld, AppWorld, and WebShop retain their discovered ID catalogs and sample u
 with replacement; task objects and environments are created on demand.
 CodeGym samples uniformly from its loaded task rows with replacement.
 Task discovery completes during actor startup, outside the async rollout loop.
-The checkpointed task RNG restores both weighted selection and each stream's
-continuation; keep taskset identifiers, weights, settings, and finite catalogs
+Checkpoints save round-robin scores and the task RNG to restore taskset selection
+and each stream's continuation. Older checkpoints without scores start a fresh
+round-robin schedule. Keep taskset identifiers, weights, settings, and finite catalogs
 unchanged when resuming. Sampling orders entries by identifier, so YAML key order
 does not affect the sequence. A single active taskset preserves its original sampling sequence.
 
@@ -172,11 +177,14 @@ Set `learner_gpus` in the YAML and expose at least `learner_gpus + 1` GPUs.
 The batcher runs on CPU. The actor and batcher use NumPy arrays and keep
 `JAX_PLATFORMS=cpu`; only the learner places training arrays on its GPUs.
 
-The vLLM server uses an 8192-token context limit, at most 128 sequences and 8192
-prefill/decode tokens per scheduler iteration, and a 90% GPU memory budget.
-Prefix caching reuses shared transcript prefixes; chunked prefill interleaves
-long prompt processing with decoding. These settings are fixed in `serve_vllm()`;
-the agent also respects the configured `max_tokens` transcript budget.
+The optional `vllm` configuration accepts `max_model_len`, `max_num_seqs`,
+`max_num_batched_tokens`, `gpu_memory_utilization`, `enable_prefix_caching`,
+`enable_chunked_prefill`, and `async_scheduling`. Omitted values use vLLM's
+defaults. Prefix caching reuses shared transcript prefixes; chunked prefill
+interleaves long prompt processing with decoding. The agent also respects the
+configured `max_tokens` transcript budget.
+The [A100 mix benchmark](../../docs/vllm_mix_benchmark_a100.md) records the
+serving settings selected for `configs/grpo_v2/mix.yaml` and their limitations.
 The server keeps idle HTTP connections alive for 30 seconds, longer than the client's
 5-second expiry. Retry messages include the exception type and HTTP status when available;
 request payloads are not logged. Request timeouts still use `rollout_timeout`.
@@ -349,16 +357,16 @@ of processed rollouts across runs.
 `num_groups * group_size / minibatches_per_epoch` rollouts per update.
 Changing only `grad_accum_steps` does not change that batch size.
 
-Set `finetuning_mode: full` to optimize all model weights, including
+Set `finetuning: {mode: full}` to optimize all model weights, including
 embeddings, normalization, and the output head, with FP32 master weights and Adam
 moments. This uses substantially more GPU memory than LoRA. Tied embeddings and
-output heads remain shared. `lora_rank` and `lora_alpha` apply only in LoRA mode.
+output heads remain shared. The full variant rejects LoRA settings.
 Transformer computation uses BF16; the output
 projection accumulates FP32 logits in both JAX and vLLM. In the default
-`finetuning_mode: lora`, base weights are frozen;
+`finetuning: {mode: lora, rank: 16, alpha: 32}`, base weights are frozen;
 only FP32 LoRA factors on every attention and MLP projection are optimized.
-`lora_rank` defaults to 16 and `lora_alpha` to 32; the weight delta is
-`(lora_alpha / lora_rank) * B @ A`. A is randomly initialized and B starts at zero,
+`finetuning.rank` defaults to 16 and `finetuning.alpha` to 32; the weight delta is
+`(alpha / rank) * B @ A`. A is randomly initialized and B starts at zero,
 so training starts from the base policy. Embeddings, normalization, and the output
 head stay frozen. Both JAX and vLLM compute separate base and LoRA branches.
 The FP32 factors are cast to BF16; alpha/r is folded into BF16 B and rounded again.
@@ -430,18 +438,33 @@ requires a shared local filesystem.
 `prefetch_batches: 0` (default) collects each batch without overlapping training,
 avoiding weight changes within a rollout. With `parameter_sync_step: 1`, each
 batch uses the latest learner weights; longer sync intervals can retain older weights.
-Positive `prefetch_batches: N` lets the batcher maintain a pool of up to
-`(N + 1) * num_groups` pending rollout groups, including the current batch.
-Each learner request consumes `num_groups` groups and leaves up to N batches' worth
-running or ready while the learner optimizes. `prefetch_mode: next_in_order` (default)
-selects groups in submission order. Set `prefetch_mode: next_ready` to assemble each
-batch from ready groups across the pool, without waiting for slower groups submitted
-alongside them. When multiple groups are ready, their selection order is unspecified.
+Positive `prefetch_batches: N` maintains a fixed pool of `(N + 1) * num_groups`
+pending rollout groups. Every popped group, whether accepted or stale, immediately
+queues a replacement, including the last group of a batch. The full pool remains
+running or ready while the learner optimizes. Each batch uses ready groups across
+the pool, without waiting for slower groups submitted alongside them. When multiple
+groups are ready, ties are broken by submission order.
 Groups stay intact, and degenerate groups are
-replaced within their pool slots when filtering is enabled. Both modes drain the
-pool at checkpoint intervals. Prefetching can extend beyond `total_iterations`;
-unused groups are canceled during shutdown. Prefetched rollouts can use older
+replaced within their pool slots when filtering is enabled. The pool target is capped
+by the number of groups still needed through the next checkpoint or `total_iterations`,
+so it shrinks to zero at those boundaries. Final checkpoints therefore do
+not advance the task sampler past consumed groups. Prefetched rollouts can use older
 weights, and multi-turn rollouts can span weight updates.
+`max_staleness` is a nonnegative integer, defaulting to `100`. Whole groups are discarded
+when their age exceeds that many successful weight publications. `0` accepts only
+groups submitted under the current published weights; `null` is not accepted.
+Age is checked when consuming a group, including completed and in-flight prefetch,
+and stale groups are replaced until the batch is full. Versions advance only on
+successful publications, not optimizer steps or skipped syncs, so the limit is
+relative to vLLM's published weights even with `parameter_sync_step > 1`.
+The batcher tags each group at submission using the latest version received from
+the learner. This conservatively bounds age: queued or multi-turn groups may use
+newer weights, and groups submitted during publication can be discarded unnecessarily.
+Degenerate-group retries receive a new submission version. Version counting resets
+on resume, which starts with an empty rollout pool. `batcher/stale_groups` and
+`batcher/stale_rollouts` record discarded groups and rollouts per consumed batch,
+including measured zeros. The iteration log also reports `stale_rollouts`;
+`batcher/skipped_groups` continues to count only degenerate-group discards.
 `weight_update_pause_mode` accepts `wait` (default) or `keep`, operating
 on individual generation requests. Groups can start during publication; vLLM
 queues new generation requests until resume and handles in-flight requests
@@ -463,15 +486,15 @@ continues. A subsequent save waits for any previous save, and shutdown waits for
 outstanding writes and propagates save failures. `checkpoint/save_blocking_seconds`
 measures save dispatch, including staging and any previous-save wait, excluding
 the new checkpoint's background writes.
-Prefetching drains at checkpoint intervals so the saved task RNG does not
-skip unconsumed batches. A final checkpoint outside that interval can include RNG
-advancement from unused prefetched groups. Restarting with the same directory restores model weights (including LoRA factors in LoRA mode),
-optimizer state, shuffle key, task RNG, and progress counters. `total_iterations` is a cumulative
+Prefetching drains before periodic and final checkpoints so the saved sampling
+state does not skip unconsumed batches. Restarting with the same directory restores model weights (including LoRA factors in LoRA mode),
+optimizer state, shuffle key, task RNG, round-robin scores, and progress counters. `total_iterations` is a cumulative
 target; `null` runs until interrupted. Environments restart fresh, so resumption
 is not bit-for-bit reproducible. Use a new directory for a fresh experiment or
-incompatible model changes. Checkpoints require matching `model` and `finetuning_mode`;
-LoRA also requires matching `lora_rank` and `lora_alpha`. Existing version 2
-checkpoints without `finetuning_mode` are treated as LoRA. Legacy version 1
+incompatible model changes. Checkpoints require matching `model` and `finetuning`.
+This includes `rank` and `alpha` for LoRA. Existing version 2 checkpoints with
+a string `finetuning_mode` and top-level LoRA settings remain supported; those without
+`finetuning_mode` are treated as LoRA. Legacy version 1
 checkpoints cannot be resumed. Use a new `ckpt_dir` when switching modes.
 Local and `gs://` paths are supported.
 

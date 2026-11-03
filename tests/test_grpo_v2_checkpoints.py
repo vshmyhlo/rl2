@@ -6,7 +6,6 @@ import random
 from contextlib import ExitStack
 from dataclasses import asdict, replace
 from functools import partial
-from itertools import repeat
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -20,7 +19,6 @@ import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from rl2 import train_grpo_v2 as training
-from rl2.alfworld_env import ALFWorldTask
 
 
 @pytest.fixture
@@ -34,6 +32,7 @@ def progress() -> training.TrainingProgress:
     actor_class = training.Actor.__ray_metadata__.modified_class
     actor = actor_class.__new__(actor_class)
     actor.rng = random.Random(3)
+    actor.taskset_scores = {"legs": -0.25, "arithmetic": 0.25}
     actor.rng.choice(range(10))
     return training.TrainingProgress(
         train_state=state,
@@ -100,32 +99,52 @@ def test_checkpoint_roundtrip_and_retention(tmp_path: Path, progress: training.T
         assert training.restore_checkpoint(manager, fresh, config) is None
 
 
-def test_actor_sampling_state_resumes_task_sequence(progress: training.TrainingProgress) -> None:
+def test_actor_sampling_state_resumes_task_sequence() -> None:
     actor_class = training.Actor.__ray_metadata__.modified_class
     actor = actor_class.__new__(actor_class)
     actor.rng = random.Random(99)
-    tasks = [ALFWorldTask(id=str(i), config_file="config.yaml") for i in range(5)]
-    actor.tasks = (training.SampledTask(taskset_id="alfworld", task=actor.rng.choice(tasks)) for _ in repeat(None))
+    actor.taskset_scores = {}
+    tasksets = {
+        "legs": training.WeightedTasksetConfig(taskset=training.ReasoningGymConfig(), weight=3),
+        "arithmetic": training.WeightedTasksetConfig(
+            taskset=training.ReasoningGymConfig(task="basic_arithmetic"), weight=1
+        ),
+    }
+    actor.tasks = training.stream_tasks(tasksets, actor.rng, timeout=120, taskset_scores=actor.taskset_scores)
     actor.collect_group = AsyncMock(return_value=Mock(spec=training.RolloutGroup))
-    actor.set_sampling_state(json.loads(json.dumps(progress.sampling_state)))
-    for _ in range(8):
+    asyncio.run(actor.fetch_next_group(group_size=2))
+    saved = json.loads(json.dumps(actor.get_sampling_state()))
+    snapshot = actor.get_sampling_state()
+    actor.collect_group.reset_mock()
+    for _ in range(7):
         asyncio.run(actor.fetch_next_group(group_size=2))
     expected = actor.collect_group.call_args_list
-    actor.set_sampling_state(progress.sampling_state)
+    assert snapshot == saved
+    actor.rng.seed(123)
+    actor.tasks = training.stream_tasks(tasksets, actor.rng, timeout=120, taskset_scores=actor.taskset_scores)
+    actor.set_sampling_state(saved)
     actor.collect_group.reset_mock()
-    for _ in range(8):
+    for _ in range(7):
         asyncio.run(actor.fetch_next_group(group_size=2))
     assert actor.collect_group.call_args_list == expected
 
+    del saved["taskset_scores"]  # Legacy checkpoints restart the deterministic schedule.
+    actor.set_sampling_state(saved)
+    assert next(actor.tasks).taskset_id == "legs"
 
-def test_checkpoint_ignores_legacy_stop_conditions(progress: training.TrainingProgress) -> None:
+
+@pytest.mark.parametrize("mode", [None, "lora", "full"])
+def test_checkpoint_ignores_legacy_stop_conditions(progress: training.TrainingProgress, mode: str | None) -> None:
     manager = Mock()
-    config = training.Config()
+    config = training.Config(finetuning=training.FullFinetuningConfig() if mode == "full" else training.LoRAConfig())
     training.save_checkpoint(manager, progress, config)
     metadata = manager.save.call_args.kwargs["args"].metadata.item | {
         "stop_conditions": ["max_tokens", "alfworld_done", "unspecified"]
     }
-    del metadata["config"]["finetuning_mode"]  # Existing version 2 LoRA checkpoints lack this field.
+    del metadata["config"]["finetuning"]
+    metadata["config"] |= {"lora_rank": 16, "lora_alpha": 32.0}
+    if mode is not None:
+        metadata["config"]["finetuning_mode"] = mode
     manager.latest_step.return_value = progress.iteration
     manager.restore.side_effect = [
         SimpleNamespace(metadata=metadata),
@@ -164,7 +183,13 @@ def test_invalid_checkpoint_metadata(progress: training.TrainingProgress, damage
 
 
 @pytest.mark.parametrize(
-    "change", [{"model": "other"}, {"lora_rank": 8}, {"lora_alpha": 16.0}, {"finetuning_mode": "full"}]
+    "change",
+    [
+        {"model": "other"},
+        {"finetuning": training.LoRAConfig(rank=8)},
+        {"finetuning": training.LoRAConfig(alpha=16)},
+        {"finetuning": training.FullFinetuningConfig()},
+    ],
 )
 def test_checkpoint_rejects_incompatible_lora_config(
     progress: training.TrainingProgress, change: dict[str, Any]
@@ -181,7 +206,7 @@ def test_checkpoint_rejects_incompatible_lora_config(
 
 
 def test_full_weight_checkpoint(tmp_path: Path, progress: training.TrainingProgress) -> None:
-    config = training.Config(finetuning_mode="full", ckpt_dir=str(tmp_path))
+    config = training.Config(finetuning=training.FullFinetuningConfig(), ckpt_dir=str(tmp_path))
     state = training.create_state(Mock(), progress.train_state.base_params, config)
     updated = state.apply_gradients(grads=jax.tree.map(jnp.ones_like, state.params))
     expected = jax.tree.map(jnp.copy, updated)  # Parameter/moment shapes; () optimizer step.
@@ -195,15 +220,17 @@ def test_full_weight_checkpoint(tmp_path: Path, progress: training.TrainingProgr
         advanced = update(updated)
         assert int(advanced.step) == int(expected.step) + 1
         manager.wait_until_finished()
-        restored = training.restore_checkpoint(manager, state, replace(config, lora_rank=1, lora_alpha=1))
+        restored = training.restore_checkpoint(manager, state, config)
         assert restored is not None
         assert type(restored.train_state) is training.TrainState
         chex.assert_trees_all_equal(
             (restored.train_state.params, restored.train_state.opt_state, restored.train_state.step),
             (expected.params, expected.opt_state, expected.step),
         )
-        with pytest.raises(ValueError, match="checkpoint finetuning_mode does not match"):
-            training.restore_checkpoint(manager, progress.train_state, replace(config, finetuning_mode="lora"))
+        with pytest.raises(ValueError, match="checkpoint finetuning does not match"):
+            training.restore_checkpoint(
+                manager, progress.train_state, replace(config, finetuning=training.LoRAConfig())
+            )
 
 
 def test_checkpoint_dispatches_without_waiting_and_propagates_failure(

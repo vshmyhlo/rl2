@@ -314,7 +314,9 @@ def state(model: Qwen3LM) -> training.LoRATrainState:
     params = model.init(jax.random.key(0), jnp.ones((1, 7), dtype=jnp.int32))["params"]  # HF parameter shapes.
     params = jax.tree.map(lambda value: value.astype(jnp.bfloat16), params)  # Emulate checkpoint storage.
     return training.create_state(
-        model, params, training.Config(learning_rate=0.01, max_grad_norm=0.1, lora_rank=2, lora_alpha=4)
+        model,
+        params,
+        training.Config(learning_rate=0.01, max_grad_norm=0.1, finetuning=training.LoRAConfig(rank=2, alpha=4)),
     )
 
 
@@ -386,7 +388,7 @@ def test_token_log_probs_gradients_match_gather(
 def test_default_attention_optimizer_on_cuda(mesh_context: None) -> None:
     if not any("NVIDIA" in device.device_kind for device in jax.devices()):
         pytest.skip("Requires an NVIDIA GPU with cuDNN")
-    config = training.Config(group_size=2, minibatches_per_epoch=1, lora_rank=1, lora_alpha=2)
+    config = training.Config(group_size=2, minibatches_per_epoch=1, finetuning=training.LoRAConfig(rank=1, alpha=2))
     model = Qwen3LM(
         config=Qwen3Config(
             vocab_size=8,
@@ -434,7 +436,11 @@ def test_default_attention_optimizer_on_cuda(mesh_context: None) -> None:
     ids=["full", "lora", "disabled"],
 )
 def test_optimizer_weight_decay(model: Qwen3LM, mode: Literal["lora", "full"], weight_decay: float) -> None:
-    config = training.Config(finetuning_mode=mode, learning_rate=0.1, weight_decay=weight_decay, lora_rank=1)
+    config = training.Config(
+        finetuning=training.LoRAConfig(rank=1) if mode == "lora" else training.FullFinetuningConfig(),
+        learning_rate=0.1,
+        weight_decay=weight_decay,
+    )
     params = {"model.layers.0.self_attn.q_proj.weight": jnp.ones((2, 2), dtype=jnp.float32)}  # (O=2, I=2)
     state = training.create_state(model, params, config)
     grads = jax.tree.map(jnp.zeros_like, state.params)  # Full: (O, I); LoRA: (R, I), (O, R).
@@ -445,7 +451,12 @@ def test_optimizer_weight_decay(model: Qwen3LM, mode: Literal["lora", "full"], w
 
 
 def test_scaled_optimizer_updates() -> None:
-    config = training.Config(finetuning_mode="full", learning_rate=0.1, weight_decay=0.05, adamw_batch_size_scale=4.0)
+    config = training.Config(
+        finetuning=training.FullFinetuningConfig(),
+        learning_rate=0.1,
+        weight_decay=0.05,
+        adamw_batch_size_scale=4.0,
+    )
     params = {"weight": jnp.ones(2, dtype=jnp.float32)}  # (D=2,)
     state = training.create_state(Mock(), params, config)
     reference = optax.adamw(learning_rate=0.2, b1=0.6, b2=0.996, eps=5e-9, weight_decay=0.1)
@@ -493,7 +504,9 @@ def test_lora_initialization_keeps_fp32_with_x64_enabled() -> None:
     name = "model.layers.0.self_attn.q_proj.weight"
     with jax.enable_x64():
         state = training.create_state(
-            Mock(), {name: jnp.ones((2, 3), dtype=jnp.bfloat16)}, training.Config(lora_rank=1)
+            Mock(),
+            {name: jnp.ones((2, 3), dtype=jnp.bfloat16)},
+            training.Config(finetuning=training.LoRAConfig(rank=1)),
         )  # Base (O=2, I=3); A (1, I), B (O, 1).
     assert state.step.dtype == jnp.int32
     assert state.base_params[name].dtype == jnp.bfloat16
@@ -504,7 +517,7 @@ def test_lora_initialization_keeps_fp32_with_x64_enabled() -> None:
 def test_lora_rank_one_and_seed() -> None:
     name = "model.layers.0.self_attn.q_proj.weight"
     params = {name: jnp.ones((2, 3), dtype=jnp.bfloat16)}  # (O=2, I=3)
-    config = training.Config(lora_rank=1, lora_alpha=3)
+    config = training.Config(finetuning=training.LoRAConfig(rank=1, alpha=3))
     state = training.create_state(Mock(), params, config)
     repeated = training.create_state(Mock(), params, config)
     np.testing.assert_array_equal(state.params[name].a, repeated.params[name].a)
@@ -516,10 +529,10 @@ def test_lora_rank_one_and_seed() -> None:
     np.testing.assert_array_equal(state.base_params[name], 1)
 
 
-@pytest.mark.parametrize("setting", [{"lora_rank": 0}, {"lora_rank": 513}, {"lora_alpha": 0}])
+@pytest.mark.parametrize("setting", [{"rank": 0}, {"rank": 513}, {"alpha": 0}])
 def test_lora_config_rejects_invalid_settings(setting: dict[str, int]) -> None:
-    with pytest.raises(ValueError, match="lora_"):
-        training.Config(**setting)
+    with pytest.raises(ValueError, match=next(iter(setting))):
+        training.LoRAConfig(**setting)
 
 
 def test_lora_requires_projection_weights() -> None:
@@ -534,7 +547,9 @@ def test_full_weight_update(
 ) -> None:
     model = model.clone(dtype=dtype)
     full = training.create_state(
-        model, state.base_params, training.Config(finetuning_mode="full", learning_rate=0.01, max_grad_norm=0.1)
+        model,
+        state.base_params,
+        training.Config(finetuning=training.FullFinetuningConfig(), learning_rate=0.01, max_grad_norm=0.1),
     )
     assert not isinstance(full, training.LoRATrainState)
     assert full.step.shape == () and full.step.dtype == jnp.int32
@@ -889,8 +904,7 @@ def test_learner_optimizes_and_publishes_updated_adapters(
             temperature=0.7,
             minibatches_per_epoch=2,
             update_epochs=2,
-            lora_rank=2,
-            lora_alpha=4,
+            finetuning=training.LoRAConfig(rank=2, alpha=4),
             rollout_is_threshold=1.25,
         ),
     )
@@ -899,7 +913,7 @@ def test_learner_optimizes_and_publishes_updated_adapters(
     learner.state = training.create_state(
         learner.model,
         jax.tree.map(jnp.copy, state.base_params),
-        training.Config(learning_rate=0.01, lora_rank=2, lora_alpha=4),
+        training.Config(learning_rate=0.01, finetuning=training.LoRAConfig(rank=2, alpha=4)),
     )
     learner.state = jax.device_put(learner.state, NamedSharding(learner.mesh, PartitionSpec()))
     groups = groups + [replace(groups[0], rollouts=list(reversed(groups[0].rollouts)))]
@@ -1005,8 +1019,8 @@ def test_learner_optimizes_and_publishes_updated_adapters(
         server_url=training.SERVER_URL,
         model=learner.config.model,
         adapter_name=training.LORA_NAME,
-        lora_rank=learner.config.lora_rank,
-        lora_alpha=learner.config.lora_alpha,
+        lora_rank=learner.config.finetuning.rank,
+        lora_alpha=learner.config.finetuning.alpha,
         pause_mode=learner.config.weight_update_pause_mode,
     ) as publish:
         learner._publish_weights = publish

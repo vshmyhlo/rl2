@@ -110,7 +110,7 @@ preserving the flat parameter layout. Pass `scan_layers=False` to `Qwen3LM` or
 default per-layer gradient checkpointing.
 Scanned LoRA layers must have identical target names (after removing layer prefixes)
 and factor shapes. Use `scan_layers=False` for adapters on selected layers or
-different ranks across layers. GRPO v2's `finetuning_mode: full` and `lora` paths
+different ranks across layers. GRPO v2's `finetuning: {mode: full}` and `{mode: lora}` paths
 manage the corresponding FP32 optimizer parameters automatically.
 `attention_mask` is a `(B, T)` validity mask for the current input chunk. Default
 RoPE positions count non-padding tokens; supply `(B, T)` `position_ids` to override.

@@ -189,7 +189,7 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
         directory = Path(destination) / request.param
         directory.mkdir(parents=True, exist_ok=True)
     real = request.param == "checkpoint"
-    finetuning_mode = "full" if request.param == "full" else "lora"
+    finetuning = "full" if request.param == "full" else "lora"
     learner_backend = TypeAdapter(qwen3.AttentionBackend).validate_python(
         os.environ.get("QWEN3_VLLM_LEARNER_BACKEND", training.DEFAULT_CONFIG.attention_backend)
     )
@@ -308,7 +308,7 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
         log = stack.enter_context((directory / "server.log").open("wb"))
         with patch.object(training.subprocess, "Popen", launch):
             server = stack.enter_context(
-                training.serve_vllm(str(source), lora_rank=None if finetuning_mode == "full" else 16)
+                training.serve_vllm(str(source), lora_rank=None if finetuning == "full" else 16)
             )
         http = stack.enter_context(httpx.Client(base_url=url, timeout=120))
         deadline = time.monotonic() + 300
@@ -326,16 +326,19 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
 
         learner_cls = training.Learner.__ray_metadata__.modified_class
         learner = object.__new__(learner_cls)
-        learner.config = training.Config(model=str(source), finetuning_mode=finetuning_mode)
-        if finetuning_mode == "lora":
+        learner.config = training.Config(
+            model=str(source),
+            finetuning=training.LoRAConfig() if finetuning == "lora" else training.FullFinetuningConfig(),
+        )
+        if finetuning == "lora":
             learner._publish_weights = stack.enter_context(
                 training.lora_weight_publisher(
                     lambda: learner.state.params,
                     server_url=url,
                     model=learner.config.model,
                     adapter_name=training.LORA_NAME,
-                    lora_rank=learner.config.lora_rank,
-                    lora_alpha=learner.config.lora_alpha,
+                    lora_rank=learner.config.finetuning.rank,
+                    lora_alpha=learner.config.finetuning.alpha,
                     pause_mode=learner.config.weight_update_pause_mode,
                 )
             )
