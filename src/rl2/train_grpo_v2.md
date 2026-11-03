@@ -214,7 +214,7 @@ a reset. The agent loop contains no environment-specific dispatch.
 Each rollout owns one ALFWorld Ray actor using Ray's default CPU scheduling and follows this loop:
 
 1. Reset the selected game and give the model the action-tool schemas, instructions, goal, starting observation, and admissible commands.
-2. Sample a response through `AsyncOpenAI.completions.create()` against vLLM's `/v1/completions` endpoint.
+2. Sample token IDs, log-probabilities, and weight-version spans from vLLM's `/inference/v1/generate` endpoint using the shared async SDK client.
 3. Parse Qwen3 `<tool_call>` JSON blocks and dispatch the calls to the ALFWorld worker.
 4. Append observation text in `<tool_response>` blocks and repeat until done or a limit is reached.
 
@@ -289,8 +289,8 @@ strength in all-success groups; all-failure groups have zero advantages.
 The previous `start_fraction` / `end_fraction` transcript ramp is removed.
 This also changes advantage scale from earlier runs; use a new run directory
 and compare against a no-penalty baseline with the same mean-centering.
-Policy-loss reduction remains a mean over sampled tokens per rollout, then
-across rollouts. Monitor raw success and successful-rollout lengths together.
+Policy-loss reduction is a mean over unmasked sampled tokens per rollout, then
+across all rollouts; fully masked rollouts contribute zero. Monitor raw success and successful-rollout lengths together.
 
 Groups with equal adjusted rewards have zero advantages. The batcher gathers
 `num_groups` concurrently and preserves request order. Set
@@ -315,11 +315,11 @@ The batcher pads complete transcripts to `padding_multiple` (default 256),
 capped at the model context length. Oversized transcripts are rejected.
 
 GRPO uses [verl-style decoupled token-TIS](https://verl.readthedocs.io/en/latest/algo/rollout_corr.html#decoupled-mode-with-token-level-importance-sampling-decoupled-token-is),
-averaged over sampled tokens within each rollout and then across rollouts.
+averaged over unmasked sampled tokens within each rollout and then across all rollouts.
 Before optimizing each batch, the learner scores its transcripts once using the
 optimizer's microbatch shape and temperature. These anchor scores stay fixed
 across all minibatches and epochs; the original vLLM sampling scores are retained.
-For each sampled token:
+For each unmasked sampled token:
 
 - PPO ratio: `r = exp(clip(current_logp - anchor_logp, -20, 20))`.
 - Detached correction: `w = min(exp(clip(anchor_logp - rollout_logp, -20, 20)), rollout_is_threshold)`.
@@ -391,7 +391,7 @@ Temperature is restricted to `[0.01, 2.0]`; vLLM returns
 
 Each iteration makes `update_epochs` passes with `minibatches_per_epoch` optimizer
 minibatches per pass. `grad_accum_steps` splits each minibatch into microbatches.
-Minibatches with all-zero advantages skip forward/backward computation and preserve
+Minibatches with no unmasked sampled tokens carrying nonzero advantages skip forward/backward computation and preserve
 parameters, Adam state, and the optimizer step. `train/skipped_update_fraction` reports the
 skipped fraction. Skipped minibatches contribute zero to policy loss and gradient norm.
 Policy diagnostics average only evaluated minibatches and are omitted when all updates are skipped.
@@ -450,21 +450,27 @@ by the number of groups still needed through the next checkpoint or `total_itera
 so it shrinks to zero at those boundaries. Final checkpoints therefore do
 not advance the task sampler past consumed groups. Prefetched rollouts can use older
 weights, and multi-turn rollouts can span weight updates.
-`max_staleness` is a nonnegative integer, defaulting to `100`. Whole groups are discarded
-when their age exceeds that many successful weight publications. `0` accepts only
-groups submitted under the current published weights; `null` is not accepted.
-Age is checked when consuming a group, including completed and in-flight prefetch,
-and stale groups are replaced until the batch is full. Versions advance only on
-successful publications, not optimizer steps or skipped syncs, so the limit is
-relative to vLLM's published weights even with `parameter_sync_step > 1`.
-The batcher tags each group at submission using the latest version received from
-the learner. This conservatively bounds age: queued or multi-turn groups may use
-newer weights, and groups submitted during publication can be discarded unnecessarily.
-Degenerate-group retries receive a new submission version. Version counting resets
-on resume, which starts with an empty rollout pool. `batcher/stale_groups` and
-`batcher/stale_rollouts` record discarded groups and rollouts per consumed batch,
-including measured zeros. The iteration log also reports `stale_rollouts`;
-`batcher/skipped_groups` continues to count only degenerate-group discards.
+`max_staleness` is a nonnegative integer, defaulting to `100`. At batch consumption,
+only sampled tokens whose age exceeds this many successful weight publications
+are masked from the loss and policy diagnostics. `0` trains only tokens sampled
+under the current published weights; `null` is not accepted. All transcripts,
+group rewards, and advantages are retained, including fully masked rollouts.
+Stale tokens remain visible as context for later tokens. Fully stale batches are
+consumed normally and skip optimizer updates rather than resampling groups.
+
+The publisher labels weights through `/update_weight_version` after loading them
+and before `/resume`, starting at `"0"`. vLLM returns exact spans of generated tokens
+for each version. The agent expands them into `TrainingSequence.weight_versions`,
+an `int32` array aligned with the full transcript; context tokens use `-1`.
+Missing, invalid, or incomplete version metadata fails the rollout.
+Versions advance on successful publications, not optimizer steps or skipped syncs,
+and reset on resume with an empty rollout pool. This also handles versions that
+change within a completion under `keep` or between turns under `wait`.
+`batcher/stale_tokens` and `batcher/stale_token_fraction` report masked sampled-token
+counts and their fraction of all sampled tokens in the consumed batch, including
+measured zeros. These replace `batcher/stale_groups` and `batcher/stale_rollouts`.
+The iteration log reports `stale_tokens`; `batcher/skipped_groups` continues to
+count only degenerate-group discards.
 `weight_update_pause_mode` accepts `wait` (default) or `keep`, operating
 on individual generation requests. Groups can start during publication; vLLM
 queues new generation requests until resume and handles in-flight requests

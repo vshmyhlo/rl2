@@ -12,8 +12,6 @@ import httpx
 import numpy as np
 import pytest
 from openai import APIStatusError, AsyncOpenAI
-from openai.types import CompletionChoice
-from openai.types.completion_choice import Logprobs
 from pydantic import TypeAdapter
 from ray.exceptions import RayTaskError
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
@@ -90,10 +88,10 @@ def response_for(tokenizer: PreTrainedTokenizerFast, text: str, finish_reason: s
                 "text": text,
                 "token_ids": ids,
                 "logprobs": {
-                    "tokens": [f"token_id:{token}" for token in ids],
-                    "token_logprobs": [-0.25] * len(ids),
+                    "content": [{"token_id": token, "logprob": -0.25} for token in ids],
                 },
                 "finish_reason": finish_reason,
+                "weight_versions": [{"version": "0", "start": 0, "end": len(ids)}],
             }
         ],
     }
@@ -195,7 +193,7 @@ def test_codegym_rollout(
     prompts: list[str] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
-        prompt = tokenizer.decode(json.loads(request.content)["prompt"])
+        prompt = tokenizer.decode(json.loads(request.content)["token_ids"])
         prompts.append(prompt)
         assert '"name": "Done"' in prompt and '"type": "integer"' in prompt
         assert "call_function" not in prompt
@@ -308,16 +306,16 @@ def test_reasoning_gym_rollout(mode: str, tokenizer: PreTrainedTokenizerFast, mo
         actor.step.remote.assert_awaited_once_with(submission)
     elif mode == "calculator":
         actor.step.remote.assert_awaited_once_with(submission)
-        assert "Unknown Reasoning Gym tool: calculator" in tokenizer.decode(requests[1]["prompt"])
+        assert "Unknown Reasoning Gym tool: calculator" in tokenizer.decode(requests[1]["token_ids"])
     elif mode == "python":
         actor.step.remote.assert_awaited_once_with(submission)
         sandbox.execute.assert_awaited_once_with(f"print({answer})")
         sandbox.__aexit__.assert_awaited_once()
         output = json.dumps({"output": f"{answer}\n", "exit_code": 0, "output_truncated": False})
-        assert f"<tool_response>\n{output}\n</tool_response>" in tokenizer.decode(requests[1]["prompt"])
+        assert f"<tool_response>\n{output}\n</tool_response>" in tokenizer.decode(requests[1]["token_ids"])
     elif mode == "format_error":
         assert actor.step.remote.await_count == 2
-        feedback_prompt = tokenizer.decode(requests[1]["prompt"])
+        feedback_prompt = tokenizer.decode(requests[1]["token_ids"])
         assert "Correct the format and submit again" in feedback_prompt
         feedback = feedback_prompt.rsplit("<tool_response>", 1)[1].split("</tool_response>", 1)[0]
         assert answer not in feedback
@@ -348,10 +346,17 @@ def test_multiturn_exact_training_sequence(
     requests: list[dict[str, Any]] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/v1/completions"
+        assert request.url.path == "/inference/v1/generate"
         body = json.loads(request.content)
         requests.append(body)
-        return httpx.Response(200, json=response_for(tokenizer, replies[len(requests) - 1]))
+        data = response_for(tokenizer, replies[len(requests) - 1])
+        length = len(data["choices"][0]["token_ids"])
+        data["choices"][0]["weight_versions"] = (
+            [{"version": "2", "start": 0, "end": 1}, {"version": "3", "start": 1, "end": length}]
+            if len(requests) == 1
+            else [{"version": "4", "start": 0, "end": length}]
+        )
+        return httpx.Response(200, json=data)
 
     async def run() -> loop.Rollout:
         async with make_client(respond) as client, task.init_env() as env:
@@ -360,17 +365,24 @@ def test_multiturn_exact_training_sequence(
     rollout = asyncio.run(run())
     first, second = requests
     sampled = [tokenizer.encode(reply, add_special_tokens=False) for reply in replies]
-    prefix = first["prompt"] + sampled[0]
-    assert second["max_tokens"] == 8192 - len(second["prompt"])
-    assert second["max_tokens"] < first["max_tokens"]
-    assert second["prompt"][: len(prefix)] == prefix
-    assert "<think>inspect</think>" in tokenizer.decode(second["prompt"])
-    expected_ids = second["prompt"] + sampled[1]
+    prefix = first["token_ids"] + sampled[0]
+    assert second["sampling_params"]["max_tokens"] == 8192 - len(second["token_ids"])
+    assert second["sampling_params"]["max_tokens"] < first["sampling_params"]["max_tokens"]
+    assert second["token_ids"][: len(prefix)] == prefix
+    assert "<think>inspect</think>" in tokenizer.decode(second["token_ids"])
+    expected_ids = second["token_ids"] + sampled[1]
     mask = np.zeros(len(expected_ids), dtype=np.bool_)  # (T,)
-    mask[len(first["prompt"]) : len(prefix)] = True
-    mask[len(second["prompt"]) :] = True
+    mask[len(first["token_ids"]) : len(prefix)] = True
+    mask[len(second["token_ids"]) :] = True
     sequence = rollout.sequence
     assert sequence.token_ids.shape == sequence.loss_mask.shape == sequence.old_log_probs.shape == (len(expected_ids),)
+    assert sequence.weight_versions.shape == sequence.token_ids.shape
+    assert sequence.weight_versions.dtype == np.int32
+    versions = np.full(len(expected_ids), -1, dtype=np.int32)  # (T,)
+    versions[len(first["token_ids"])] = 2
+    versions[len(first["token_ids"]) + 1 : len(prefix)] = 3
+    versions[len(second["token_ids"]) :] = 4
+    np.testing.assert_array_equal(sequence.weight_versions, versions)
     assert sequence.token_ids.dtype == np.int32
     assert sequence.loss_mask.dtype == np.bool_
     assert sequence.old_log_probs.dtype == np.float32
@@ -383,12 +395,12 @@ def test_multiturn_exact_training_sequence(
         (ToolCall(name="go_to", arguments={"location": "shelf 1"}),),
         (ToolCall(name="move", arguments={"object": "mug 1", "location": "desk 1"}),),
     ]
-    initial_text = tokenizer.decode(first["prompt"])
+    initial_text = tokenizer.decode(first["token_ids"])
     assert environment.reset.return_value.prompt in initial_text
     assert environment.reset.return_value.system_prompt in initial_text
     assert rollout.prompt == environment.reset.return_value.prompt
     assert '"name": "move"' in initial_text and '"name": "inventory"' in initial_text
-    tool_context = tokenizer.decode(second["prompt"][len(prefix) :])
+    tool_context = tokenizer.decode(second["token_ids"][len(prefix) :])
     assert tool_context.startswith("\n<|im_start|>user\n<tool_response>\n")
     assert tool_context.endswith("\n</tool_response><|im_end|>\n<|im_start|>assistant\n")
     assert tool_context == (
@@ -404,17 +416,16 @@ def test_multiturn_exact_training_sequence(
     )
     assert rollout.interaction.startswith("<|im_start|>system\n" + environment.reset.return_value.system_prompt)
     assert "Task complete" not in rollout.interaction
-    assert {key: value for key, value in first.items() if key not in {"model", "prompt"}} == {
-        "max_tokens": 8192 - len(first["prompt"]),
+    assert first["model"] == "Qwen/test"
+    assert first["output_mode"] == "tokens"
+    assert first["sampling_params"] == {
+        "max_tokens": 8192 - len(first["token_ids"]),
         "temperature": 0.7,
         "top_p": 1.0,
         "top_k": -1,
         "logprobs": 0,
         "stop_token_ids": tokenizer.convert_tokens_to_ids(["<|im_end|>", "<|endoftext|>"]),
-        "skip_special_tokens": False,
-        "add_special_tokens": False,
-        "return_token_ids": True,
-        "return_tokens_as_token_ids": True,
+        "detokenize": False,
     }
     environment.__aenter__.assert_awaited_once()
     environment.__aexit__.assert_awaited_once()
@@ -463,11 +474,11 @@ def test_total_token_budget_across_turns(
     def respond(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         requests.append(body)
-        assert body["max_tokens"] == token_limit - len(body["prompt"])
+        assert body["sampling_params"]["max_tokens"] == token_limit - len(body["token_ids"])
         text = (
             '<tool_call>{"name":"look","arguments":{}}</tool_call><|im_end|>'
             if len(requests) == 1
-            else "x" * (body["max_tokens"] + extra_tokens)
+            else "x" * (body["sampling_params"]["max_tokens"] + extra_tokens)
         )
         return httpx.Response(200, json=response_for(tokenizer, text, "stop" if len(requests) == 1 else "length"))
 
@@ -487,7 +498,7 @@ def test_total_token_budget_across_turns(
     assert rollout.num_input_tokens + rollout.num_output_tokens == expected_length
     assert rollout.stop_condition == "max_tokens"
     assert len(requests) == rollout.num_turns == 2
-    assert requests[1]["max_tokens"] < requests[0]["max_tokens"]
+    assert requests[1]["sampling_params"]["max_tokens"] < requests[0]["sampling_params"]["max_tokens"]
     environment.step.assert_awaited_once()
 
 
@@ -562,7 +573,7 @@ def test_rollout_limits(boundary: str, tokenizer: PreTrainedTokenizerFast, envir
         assert environment.step.await_count == (0 if boundary in {"max_tokens", "context_generation"} else 1)
         assert rollout.num_turns == 1
         if boundary in {"max_tokens", "context_generation"}:
-            assert requests[0]["max_tokens"] == 1
+            assert requests[0]["sampling_params"]["max_tokens"] == 1
         assert len(rollout.sequence.token_ids) <= 8192
         assert rollout.interaction == tokenizer.decode(
             rollout.sequence.token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
@@ -593,14 +604,13 @@ def test_failures_close_environment(
         choice = data["choices"][0]
         if failure in {"empty", "abort_empty"}:
             choice["token_ids"] = []
-            choice["logprobs"]["tokens"] = []
-            choice["logprobs"]["token_logprobs"] = []
+            choice["logprobs"]["content"] = []
         elif failure == "logprobs":
-            choice["logprobs"]["token_logprobs"].pop()
+            choice["logprobs"]["content"].pop()
         elif failure == "alignment":
-            choice["logprobs"]["tokens"][0] = "token_id:999"
+            choice["logprobs"]["content"][0]["token_id"] = 999
         elif failure == "missing_probability":
-            choice["logprobs"]["token_logprobs"][0] = -9999.0
+            choice["logprobs"]["content"][0]["logprob"] = -9999.0
         if failure in {"abort", "abort_empty"}:
             choice["finish_reason"] = "abort"
         return httpx.Response(200, json=data)
@@ -751,22 +761,29 @@ def test_tool_response_renderer(
     if ending == "<|endoftext|>":
         # Preserve the sampled alternative EOS before inserting the chat boundary.
         expected = expected.replace(rendered, rendered.removesuffix("<|im_end|>\n") + ending + "<|im_end|>\n", 1)
-    assert tokenizer.decode(requests[1]["prompt"]) == expected
+    assert tokenizer.decode(requests[1]["token_ids"]) == expected
     assert loop.parse_tool_calls(reply) == calls
     assert rollout.stop_condition == "agent_completed"
     sampled = tokenizer.encode(reply, add_special_tokens=False)
-    start = len(requests[0]["prompt"])
+    start = len(requests[0]["token_ids"])
     np.testing.assert_array_equal(rollout.sequence.token_ids[start : start + len(sampled)], sampled)
     assert rollout.sequence.loss_mask[start : start + len(sampled)].all()
-    assert not rollout.sequence.loss_mask[start + len(sampled) : len(requests[1]["prompt"])].any()
+    assert not rollout.sequence.loss_mask[start + len(sampled) : len(requests[1]["token_ids"])].any()
 
 
 def test_completion_tokens_preserve_qwen_tokens() -> None:
     ids = [151667, 198, 151668, 151657, 151658, 151645]
     probabilities = [-0.1, -0.2, -0.3, -0.4, -0.5, 0.0]
-    choice = CompletionChoice.model_construct(
+    choice = loop.CompletionChoice(
         token_ids=ids,
-        logprobs=Logprobs(tokens=[f"token_id:{token}" for token in ids], token_logprobs=probabilities),
+        logprobs=loop.CompletionLogProbs(
+            content=[
+                loop.TokenLogProb(token_id=token, logprob=probability)
+                for token, probability in zip(ids, probabilities, strict=True)
+            ]
+        ),
+        weight_versions=[loop.WeightVersionSpan(version="0", start=0, end=len(ids))],
+        finish_reason="stop",
     )
     assert loop.completion_tokens(choice) == (ids, probabilities)
 
@@ -776,34 +793,49 @@ def test_completion_tokens_preserve_qwen_tokens() -> None:
     [-9999.0, 0.1, float("nan"), None, "invalid"],
     ids=["clipped", "positive", "nan", "missing", "nonnumeric"],
 )
-def test_completion_tokens_invalid_probability(logprob: Any) -> None:
+def test_completion_tokens_invalid_probability(logprob: Any, tokenizer: PreTrainedTokenizerFast) -> None:
+    data = response_for(tokenizer, "x")["choices"][0]
+    data["logprobs"]["content"][0]["logprob"] = logprob
     with pytest.raises(ValueError):
-        loop.completion_tokens(
-            CompletionChoice.model_construct(
-                token_ids=[151645],
-                logprobs=Logprobs.model_construct(tokens=["token_id:151645"], token_logprobs=[logprob]),
-            )
-        )
+        loop.completion_tokens(loop.CompletionChoice.model_validate(data, strict=True))
 
 
-@pytest.mark.parametrize("logprobs", [None, {}, {"tokens": ["token_id:151645"]}, {"token_logprobs": [-0.25]}])
-def test_completion_tokens_missing_evidence(logprobs: Any) -> None:
+@pytest.mark.parametrize("logprobs", [None, {}, {"content": []}])
+def test_completion_tokens_missing_evidence(logprobs: Any, tokenizer: PreTrainedTokenizerFast) -> None:
+    data = response_for(tokenizer, "x")["choices"][0]
+    data["logprobs"] = logprobs
     with pytest.raises(ValueError):
-        loop.completion_tokens(
-            CompletionChoice.model_construct(
-                token_ids=[151645], logprobs=None if logprobs is None else Logprobs.model_construct(**logprobs)
-            )
-        )
+        loop.completion_tokens(loop.CompletionChoice.model_validate(data, strict=True))
 
 
 @pytest.mark.parametrize("ids", [None, [-1], ["151645"]], ids=["missing", "negative", "string"])
-def test_completion_tokens_invalid_ids(ids: Any) -> None:
+def test_completion_tokens_invalid_ids(ids: Any, tokenizer: PreTrainedTokenizerFast) -> None:
+    data = response_for(tokenizer, "x")["choices"][0]
+    data["token_ids"] = ids
     with pytest.raises(ValueError):
-        loop.completion_tokens(
-            CompletionChoice.model_construct(
-                token_ids=ids, logprobs=Logprobs(tokens=["token_id:151645"], token_logprobs=[-0.25])
-            )
-        )
+        loop.completion_tokens(loop.CompletionChoice.model_validate(data, strict=True))
+
+
+@pytest.mark.parametrize(
+    "versions",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param([], id="empty"),
+        pytest.param([{"version": "default", "start": 0, "end": 2}], id="unlabelled"),
+        pytest.param([{"version": "-1", "start": 0, "end": 2}], id="negative"),
+        pytest.param([{"version": str(2**31), "start": 0, "end": 2}], id="overflow"),
+        pytest.param([{"version": "0", "start": 1, "end": 2}], id="gap"),
+        pytest.param([{"version": "0", "start": 0, "end": 1}], id="incomplete"),
+        pytest.param([{"version": "0", "start": 0, "end": 3}], id="out-of-bounds"),
+        pytest.param([{"version": "0", "start": 0, "end": 0}], id="empty-span"),
+        pytest.param([{"version": "0", "start": 0, "end": 1}, {"version": "1", "start": 0, "end": 2}], id="overlap"),
+    ],
+)
+def test_completion_tokens_invalid_versions(versions: Any, tokenizer: PreTrainedTokenizerFast) -> None:
+    data = response_for(tokenizer, "xx")["choices"][0]
+    data["weight_versions"] = versions
+    with pytest.raises(ValueError):
+        loop.completion_tokens(loop.CompletionChoice.model_validate(data, strict=True))
 
 
 def test_completion_preserves_literal_thinking_tags(
@@ -853,10 +885,10 @@ def test_tool_dispatch(mode: str, tokenizer: PreTrainedTokenizerFast, environmen
     assert environment.step.await_count == {"text": 0, "invalid": 1, "malformed": 0, "multiple": 2, "terminal": 1}[mode]
     assert rollout.reward == (1.0 if mode in {"multiple", "terminal"} else 0.0)
     if mode == "invalid":
-        assert "<tool_response>" in tokenizer.decode(requests[1]["prompt"])
+        assert "<tool_response>" in tokenizer.decode(requests[1]["token_ids"])
         assert "Unknown ALFWorld tool" in rollout.interaction
     if mode == "malformed":
-        assert '<tool_response>\n{"error":' in tokenizer.decode(requests[1]["prompt"])
+        assert '<tool_response>\n{"error":' in tokenizer.decode(requests[1]["token_ids"])
     if mode == "multiple":
         assert [call.args[0].name for call in environment.step.await_args_list] == ["look", "inventory"]
         assert "At shelf." not in rollout.interaction
@@ -912,7 +944,7 @@ def test_generic_task_environment_lifetime(mode: str, tokenizer: PreTrainedToken
                 events.append("exit")
 
     def respond(request: httpx.Request) -> httpx.Response:
-        prompt = tokenizer.decode(json.loads(request.content)["prompt"])
+        prompt = tokenizer.decode(json.loads(request.content)["token_ids"])
         assert "Count using tools." in prompt and "Count two." in prompt
         assert '"name": "count"' in prompt and "alfworld" not in prompt
         return httpx.Response(

@@ -30,11 +30,16 @@ from rl2.tracing import span
 
 
 @contextmanager
-def paused_generation(client: httpx.Client, pause_mode: Literal["wait", "keep"]) -> Generator[None]:
+def paused_generation(
+    client: httpx.Client, pause_mode: Literal["wait", "keep"], weight_version: int
+) -> Generator[None]:
     with span("learner.publish_weights.pause", {"mode": pause_mode}):
         response = client.post("/pause", params={"mode": pause_mode, "clear_cache": "true"})
         response.raise_for_status()
     yield
+    with span("learner.publish_weights.version"):
+        response = client.post("/update_weight_version", json={"new_version": str(weight_version)})
+        response.raise_for_status()
     # Failed publications leave generation paused until training cleanup.
     with span("learner.publish_weights.resume"):
         response = client.post("/resume")
@@ -51,11 +56,11 @@ def lora_weight_publisher(
     lora_rank: int,
     lora_alpha: float,
     pause_mode: Literal["wait", "keep"],
-) -> Generator[Callable[[], None]]:
+) -> Generator[Callable[[int], None]]:
     """Export the current adapters and retain their files until vLLM finishes loading."""
     with httpx.Client(base_url=server_url, timeout=600) as client:
 
-        def publish() -> None:
+        def publish(weight_version: int) -> None:
             with span("learner.publish_weights"), TemporaryDirectory(prefix="rl2-lora-") as temporary_directory:
                 adapters = jax.tree.map(
                     lambda value: np.asarray(value, dtype=np.float32), jax.device_get(get_params())
@@ -83,7 +88,10 @@ def lora_weight_publisher(
                         }
                     )
                 )
-                with paused_generation(client, pause_mode), span("learner.publish_weights.load_adapter"):
+                with (
+                    paused_generation(client, pause_mode, weight_version),
+                    span("learner.publish_weights.load_adapter"),
+                ):
                     response = client.post(
                         "/v1/load_lora_adapter",
                         json={"lora_name": adapter_name, "lora_path": temporary_directory, "load_inplace": True},
@@ -121,7 +129,7 @@ def full_weight_publisher(
     server_url: str,
     device_index: int,
     pause_mode: Literal["wait", "keep"],
-) -> Generator[Callable[[], None]]:
+) -> Generator[Callable[[int], None]]:
     """Keep one NCCL group alive across publications; HTTP carries only metadata."""
     with (
         torch.cuda.device(device_index),
@@ -180,10 +188,10 @@ def full_weight_publisher(
             engine.model_update_group = nccl_common.trainer_init(info)
             future.result()
 
-        def publish() -> None:
+        def publish(weight_version: int) -> None:
             with (
                 span("learner.publish_weights"),
-                paused_generation(client, pause_mode),
+                paused_generation(client, pause_mode, weight_version),
                 span("learner.publish_weights.transfer"),
             ):
                 engine.send_weights()

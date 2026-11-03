@@ -7,11 +7,11 @@ import time
 from dataclasses import dataclass
 from typing import Literal
 
+import httpx
 import numpy as np
 from numpy.typing import NDArray
 from openai import AsyncOpenAI
-from openai.types import CompletionChoice
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 from transformers import PreTrainedTokenizerBase
 
 from rl2.agent_task import Environment, ToolCall, ToolCallError
@@ -63,11 +63,34 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
     return calls
 
 
+class WeightVersionSpan(BaseModel):
+    version: str
+    start: int
+    end: int
+
+
+class TokenLogProb(BaseModel):
+    token_id: int
+    logprob: float
+
+
+class CompletionLogProbs(BaseModel):
+    content: list[TokenLogProb]
+
+
+class CompletionChoice(BaseModel):
+    token_ids: list[int]
+    logprobs: CompletionLogProbs
+    weight_versions: list[WeightVersionSpan]
+    finish_reason: str
+
+
 @dataclass(frozen=True)
 class TrainingSequence:
     token_ids: NDArray[np.int32]  # (T,) exact context and generated tokens.
     loss_mask: NDArray[np.bool_]  # (T,) True only for sampled tokens.
     old_log_probs: NDArray[np.float32]  # (T,) zero for context tokens.
+    weight_versions: NDArray[np.int32]  # (T,) publication counters; -1 for context tokens.
 
 
 @dataclass(frozen=True)
@@ -86,20 +109,29 @@ class Rollout:
 
 
 def completion_tokens(choice: CompletionChoice) -> tuple[list[int], list[float]]:
-    """Validate the token/log-probability alignment at the vLLM boundary."""
-    ids = TypeAdapter(list[int]).validate_python((choice.model_extra or {}).get("token_ids"), strict=True)
-    if choice.logprobs is None:
-        raise ValueError("Missing token/log-probability data")
-    tokens = TypeAdapter(list[str]).validate_python(choice.logprobs.tokens, strict=True)
-    log_probs = TypeAdapter(list[float]).validate_python(choice.logprobs.token_logprobs, strict=True)
-    if not ids or len(tokens) != len(ids) or len(log_probs) != len(ids):
+    """Validate sampled tokens, scores, and version coverage at the vLLM boundary."""
+    ids = choice.token_ids
+    log_probs = [token.logprob for token in choice.logprobs.content]
+    if not ids or len(log_probs) != len(ids):
         raise ValueError("Each sampled token must have a log-probability")
-    for token_id, token in zip(ids, tokens, strict=True):
-        if token_id < 0 or token != f"token_id:{token_id}":
+    for token_id, token in zip(ids, choice.logprobs.content, strict=True):
+        if token_id < 0 or token.token_id != token_id:
             raise ValueError("Sampled token and log-probability IDs differ")
-    # vLLM 0.27 uses token_id:N strings and clips unavailable/very low logprobs to -9999.
     if any(not -9999.0 < value <= 0 for value in log_probs):
         raise ValueError("Missing or invalid sampling log-probability")
+    end = 0
+    for version in choice.weight_versions:
+        if (
+            not version.version.isascii()
+            or not version.version.isdecimal()
+            or int(version.version) > np.iinfo(np.int32).max
+        ):
+            raise ValueError("Weight versions must be nonnegative int32 publication counters")
+        if version.start != end or not version.start < version.end <= len(ids):
+            raise ValueError("Weight version spans must cover each sampled token exactly once")
+        end = version.end
+    if end != len(ids):
+        raise ValueError("Weight version spans must cover each sampled token exactly once")
     return ids, log_probs
 
 
@@ -143,6 +175,7 @@ class Agent:
                 )
             loss_mask = [False] * len(token_ids)
             log_probs = [0.0] * len(token_ids)
+            weight_versions = [-1] * len(token_ids)
             num_turns = 0
             completion = ""
             stop_condition: StopCondition = "max_turns"
@@ -153,23 +186,27 @@ class Agent:
                     stop_condition = limit_condition
                     break
                 with span("actor.rollout.model", {"input_tokens": len(token_ids)}) as model_span:
-                    response = await self.client.completions.create(
-                        model=self.model,
-                        prompt=token_ids,
-                        max_tokens=remaining,
-                        temperature=self.temperature,
-                        top_p=1.0,
-                        logprobs=0,
-                        extra_body={
-                            "top_k": -1,
-                            "stop_token_ids": self.tokenizer.convert_tokens_to_ids(["<|im_end|>", "<|endoftext|>"]),
-                            "skip_special_tokens": False,
-                            "add_special_tokens": False,
-                            "return_token_ids": True,
-                            "return_tokens_as_token_ids": True,
+                    response = await self.client.post(
+                        str(self.client.base_url.copy_with(path="/inference/v1/generate")),
+                        cast_to=httpx.Response,
+                        body={
+                            "model": self.model,
+                            "token_ids": token_ids,
+                            "output_mode": "tokens",
+                            "sampling_params": {
+                                "max_tokens": remaining,
+                                "temperature": self.temperature,
+                                "top_p": 1.0,
+                                "top_k": -1,
+                                "logprobs": 0,
+                                "stop_token_ids": self.tokenizer.convert_tokens_to_ids(["<|im_end|>", "<|endoftext|>"]),
+                                "detokenize": False,
+                            },
                         },
                     )
-                    choices = response.choices
+                    choices = TypeAdapter(list[CompletionChoice]).validate_python(
+                        response.json().get("choices"), strict=True
+                    )
                     if len(choices) != 1:
                         raise ValueError("Expected one completion per model request")
                     choice = choices[0]
@@ -179,6 +216,8 @@ class Agent:
                     if len(ids) > remaining:
                         raise ValueError("Completion exceeds the requested token budget")
                     model_span.set_attribute("output_tokens", len(ids))
+                for version in choice.weight_versions:
+                    weight_versions.extend([int(version.version)] * (version.end - version.start))
                 token_ids.extend(ids)
                 loss_mask.extend([True] * len(ids))
                 log_probs.extend(sampled_log_probs)
@@ -234,6 +273,7 @@ class Agent:
                 token_ids.extend(context)
                 loss_mask.extend([False] * len(context))
                 log_probs.extend([0.0] * len(context))
+                weight_versions.extend([-1] * len(context))
                 pending = []
             if not any(loss_mask):
                 raise ValueError("Rollout has no trainable tokens")
@@ -247,6 +287,7 @@ class Agent:
                     token_ids=np.asarray(token_ids, dtype=np.int32),  # (T,)
                     loss_mask=np.asarray(loss_mask, dtype=np.bool_),  # (T,)
                     old_log_probs=np.asarray(log_probs, dtype=np.float32),  # (T,)
+                    weight_versions=np.asarray(weight_versions, dtype=np.int32),  # (T,)
                 ),
                 prompt=initial.prompt,
                 reward=reward,

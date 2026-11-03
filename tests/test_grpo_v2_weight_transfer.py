@@ -42,6 +42,7 @@ def spans(monkeypatch: pytest.MonkeyPatch) -> Generator[InMemorySpanExporter]:
         ("keep", None),
         ("wait", "/pause"),
         ("wait", "/v1/load_lora_adapter"),
+        ("wait", "/update_weight_version"),
         ("wait", "/resume"),
         ("wait", "export"),
     ],
@@ -103,6 +104,8 @@ def test_lora_publication(
             assert config["target_modules"] == ["q_proj", "up_proj"]
             helper = PEFTHelper.from_dict(config)
             assert helper.r == 1 and helper.lora_alpha == 3
+        elif request.url.path == "/update_weight_version":
+            assert json.loads(request.content) == {"new_version": str(len(directories) - 1)}
         return httpx.Response(status_code=500 if request.url.path == failure_path else 200)
 
     client = httpx.Client(base_url="http://vllm", transport=httpx.MockTransport(respond))
@@ -121,11 +124,11 @@ def test_lora_publication(
             pause_mode=pause_mode,
         ) as publish,
     ):
-        publish()
+        publish(0)
         assert not directories[-1].exists()
         params = jax.tree.map(lambda value: value + 1, params)  # Current (R, I), (O, R) leaves.
-        publish()
-    paths = ["/pause", "/v1/load_lora_adapter", "/resume"]
+        publish(1)
+    paths = ["/pause", "/v1/load_lora_adapter", "/update_weight_version", "/resume"]
     expected_paths = (
         [] if failure_path == "export" else paths[: paths.index(failure_path) + 1] if failure_path else paths * 2
     )
@@ -138,7 +141,12 @@ def test_lora_publication(
     finished = spans.get_finished_spans()
     parents = [item for item in finished if item.name == "learner.publish_weights"]
     phases = [item for item in finished if item.name.startswith("learner.publish_weights.")]
-    phase_names = {"/pause": "pause", "/v1/load_lora_adapter": "load_adapter", "/resume": "resume"}
+    phase_names = {
+        "/pause": "pause",
+        "/v1/load_lora_adapter": "load_adapter",
+        "/resume": "resume",
+        "/update_weight_version": "version",
+    }
     assert [item.name for item in phases] == [f"learner.publish_weights.{phase_names[path]}" for path in expected_paths]
     assert all(item.parent.span_id in {parent.context.span_id for parent in parents} for item in phases)
     assert parents[-1].status.status_code == (
@@ -189,6 +197,7 @@ def test_weight_source_rejects_sharded_parameters_before_transfer() -> None:
         ("keep", None, False),
         ("wait", "pause", False),
         ("wait", "transfer", False),
+        ("wait", "update_weight_version", False),
         ("wait", "resume", False),
         pytest.param("wait", "transfer", True, id="preserve-transfer-error"),
         pytest.param("wait", None, True, id="propagate-shutdown-error"),
@@ -209,7 +218,10 @@ def test_publisher_lifecycle(
         events.append(phase)
         if phase == "pause":
             assert dict(request.url.params) == {"mode": pause_mode, "clear_cache": "true"}
-        assert not request.content
+        if phase == "update_weight_version":
+            assert json.loads(request.content) == {"new_version": str(events.count("update_weight_version") - 1)}
+        else:
+            assert not request.content
         return httpx.Response(status_code=500 if failure == phase else 200)
 
     client = httpx.Client(base_url="http://vllm", transport=httpx.MockTransport(respond))
@@ -258,13 +270,13 @@ def test_publisher_lifecycle(
             lambda: params, server_url="http://vllm", device_index=1, pause_mode=pause_mode
         ) as publish,
     ):
-        publish()
-        publish()  # Reuses the communicator.
-    expected = ["init", "pause", "transfer", "resume"]
+        publish(0)
+        publish(1)  # Reuses the communicator.
+    expected = ["init", "pause", "transfer", "update_weight_version", "resume"]
     if failure:
         expected = expected[: expected.index(failure) + 1]
     else:
-        expected += ["pause", "transfer", "resume"]
+        expected += ["pause", "transfer", "update_weight_version", "resume"]
     assert events == expected + ["trainer_shutdown", "worker_shutdown"]
     if failure == "transfer":
         assert caught.value is transfer_error

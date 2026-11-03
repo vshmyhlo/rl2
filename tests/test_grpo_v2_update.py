@@ -34,6 +34,7 @@ def rollout(tokens: list[int], mask: list[bool], advantage: float) -> training.R
             token_ids=np.asarray(tokens, dtype=np.int32),  # (T,)
             loss_mask=np.asarray(mask, dtype=np.bool_),  # (T,)
             old_log_probs=np.zeros(len(tokens), dtype=np.float32),  # (T,)
+            weight_versions=np.where(np.asarray(mask, dtype=np.bool_), 0, -1).astype(np.int32),  # (T,)
         ),
         reward=float(advantage > 0),
         advantage=advantage,
@@ -64,6 +65,37 @@ def groups() -> list[training.RolloutGroup]:
             taskset_id="test",
         )
     ]
+
+
+def test_prepare_batch_masks_only_stale_sampled_tokens(batcher: Any, groups: list[training.RolloutGroup]) -> None:
+    batcher.config = replace(batcher.config, max_staleness=1, padding_multiple=8)
+    first, second = groups[0].rollouts
+    groups[0].rollouts[0] = replace(
+        first,
+        sequence=replace(
+            first.sequence,
+            weight_versions=np.array([-1, 1, -1, 2, 3], dtype=np.int32),  # (T=5,)
+        ),
+    )
+    batch = batcher.prepare_batch(groups, context_length=8, weight_version=3)
+    assert batch.token_ids.shape == batch.loss_mask.shape == batch.attention_mask.shape == (2, 8)
+    np.testing.assert_array_equal(
+        batch.loss_mask,
+        [
+            [False, False, False, True, True, False, False, False],
+            [False] * 8,
+        ],
+    )
+    for index, original in enumerate([first, second]):
+        length = len(original.sequence.token_ids)
+        np.testing.assert_array_equal(batch.token_ids[index, :length], original.sequence.token_ids)
+        np.testing.assert_array_equal(batch.old_log_probs[index, :length], original.sequence.old_log_probs)
+        np.testing.assert_array_equal(batch.attention_mask[index, :length], True)
+        np.testing.assert_array_equal(groups[0].rollouts[index].sequence.loss_mask, original.sequence.loss_mask)
+    np.testing.assert_array_equal(batch.advantages, [1.0, -1.0])
+    metrics = training.build_rollout_batch(groups, batch, {}).rollout_metrics
+    assert metrics["batcher/stale_tokens"] == 2
+    assert metrics["batcher/stale_token_fraction"] == 0.5
 
 
 @pytest.mark.parametrize("context_length,width", [(512, 256), (5, 5)], ids=["bucketed", "context-boundary"])
@@ -190,6 +222,28 @@ def test_objective_clipping_masking_and_sequence_weighting() -> None:
     adverse = jnp.array([[jnp.log(0.5) - 0.7, 1000, 1000], [jnp.log(1.5) - 0.7] * 2 + [1000]])  # (B, T-1)
     assert float(loss_fn(adverse)) == pytest.approx(0.5)
     np.testing.assert_allclose(jax.grad(loss_fn)(adverse), [[-0.25, 0, 0], [0.375, 0.375, 0]], atol=1e-6)
+
+
+def test_objective_excludes_stale_tokens_and_keeps_empty_rows() -> None:
+    batch = training.GRPOBatch(
+        token_ids=jnp.zeros((2, 4), dtype=jnp.int32),  # (B=2, T=4)
+        attention_mask=jnp.ones((2, 4), dtype=jnp.bool_),  # (B, T)
+        loss_mask=jnp.array([[False, False, True, True], [False, False, False, False]]),  # (B, T)
+        old_log_probs=jnp.full((2, 4), -1.0),  # (B, T)
+        advantages=jnp.array([1.0, -1.0]),  # (B,)
+    )
+    anchors = jnp.full((2, 3), -1.0)  # (B, T-1)
+
+    def loss(scores: jax.Array) -> tuple[jax.Array, training.Metrics]:  # (B, T-1) -> (), scalar leaves.
+        return training.objective(scores, batch, anchors, clip_coef=0.2)
+
+    scores = jnp.where(batch.loss_mask[:, 1:], anchors, 1000.0)  # (B, T-1)
+    (value, metrics), gradient = jax.value_and_grad(loss, has_aux=True)(scores)
+    assert float(value) == -0.5
+    np.testing.assert_allclose(gradient, [[0, -0.25, -0.25], [0, 0, 0]])
+    assert float(metrics["train/approx_kl"]) == 0.0
+    assert float(metrics["train/rollout_log_prob_error_mean"]) == 0.0
+    assert float(metrics["train/rollout_importance_weight_mean"]) == 0.5
 
 
 def test_clip_fraction_excludes_clip_boundaries() -> None:
@@ -649,14 +703,25 @@ def test_update_logs_only_new_traces(
     assert caplog.messages == ["JIT trace update: batch_shape=(2, 5) grad_accum_steps=2 temperature=0.7 clip_coef=0.2"]
 
 
-@pytest.mark.parametrize("has_momentum", [False, True], ids=["fresh", "with-momentum"])
+@pytest.mark.parametrize("case", ["zero-fresh", "zero-momentum", "all-stale", "inactive-rows"])
 @pytest.mark.usefixtures("mesh_context")
-def test_zero_advantages_preserve_optimizer_state(
-    state: training.LoRATrainState, batch: training.GRPOBatch[jax.Array], has_momentum: bool
+def test_inactive_tokens_preserve_optimizer_state(
+    state: training.LoRATrainState, batch: training.GRPOBatch[jax.Array], case: str
 ) -> None:
-    if has_momentum:
+    if case != "zero-fresh":
         state = state.apply_gradients(grads=jax.tree.map(jnp.ones_like, state.params))
-    batch = batch._replace(advantages=jnp.zeros_like(batch.advantages))  # (B, T), (B,) leaves.
+    if case.startswith("zero-"):
+        batch = batch._replace(advantages=jnp.zeros_like(batch.advantages))  # (B, T), (B,) leaves.
+    elif case == "all-stale":
+        batch = batch._replace(loss_mask=jnp.zeros_like(batch.loss_mask))  # (B, T), (B,) leaves.
+    else:
+        # The only nonzero advantage belongs to the fully masked row.
+        batch = batch._replace(
+            loss_mask=batch.loss_mask.at[0].set(False),  # (B, T)
+            advantages=jnp.array([1.0, 0.0]),  # (B,)
+        )
+    anchors = training.compute_anchor_log_probs(state, batch, 1, 0.7)  # (B, T-1)
+    np.testing.assert_array_equal(anchors, 0)
     updated, metrics = training.update(jax.tree.map(jnp.copy, state), batch, batch.old_log_probs[:, 1:], 2, 0.7, 0.2)
     assert float(metrics["train/gradient_norm"]) == float(metrics["train/policy_loss"]) == 0.0
     assert all(value.shape == () for value in metrics.values())

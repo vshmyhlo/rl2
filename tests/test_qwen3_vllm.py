@@ -34,7 +34,7 @@ from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
 from rl2 import qwen3
 from rl2 import train_grpo_v2 as training
-from rl2.agent_loop import completion_tokens
+from rl2.agent_loop import CompletionChoice, completion_tokens
 
 pytestmark = pytest.mark.skipif(os.environ.get("QWEN3_VLLM_TESTS") != "1", reason="Set QWEN3_VLLM_TESTS=1")
 
@@ -396,6 +396,7 @@ def test_nccl_full_weight_publication(engine: Engine) -> None:
                 learner.state = learner.state.replace(
                     params=jax.tree.map(lambda value: value + 0.05, learner.state.params)  # HF parameter shapes.
                 )
+            learner.weight_version = version - 1
             learner.publish_weights()
             assert_published_weights(engine, learner.state.params)
             response = engine.client.completions.create(
@@ -470,6 +471,7 @@ def test_published_rollout_parity(engine: Engine) -> None:
     for version in range(2):
         params = state.params  # FP32 adapter factors; version 1 contains a real LoRA update.
         engine.learner.state = state
+        engine.learner.weight_version = version - 1
         engine.learner.publish_weights()
         loaded_digests = assert_published_weights(engine, master)
         (engine.directory / f"base-weights-v{version}.json").write_text(json.dumps(loaded_digests, indent=2))
@@ -479,23 +481,38 @@ def test_published_rollout_parity(engine: Engine) -> None:
             sampled = [[0.0] * len(prompt) for prompt in prompts]
             candidates: dict[tuple[int, int, int], float] = {}
             for turn in range(2):
-                result = engine.client.completions.create(
-                    model=model_id,
-                    prompt=sequences,
-                    max_tokens=tokens_per_turn,
-                    temperature=temperature,
-                    top_p=1,
-                    logprobs=10 if engine.real else model.config.vocab_size,
-                    seed=123,
-                    extra_body={"return_token_ids": True, "return_tokens_as_token_ids": True, "ignore_eos": True},
-                )
-                assert len(result.choices) == len(prompts)
-                for choice in result.choices:
-                    row = choice.index
+                for row in range(len(prompts)):
+                    response = engine.http.post(
+                        "/inference/v1/generate",
+                        json={
+                            "model": model_id,
+                            "token_ids": sequences[row],
+                            "output_mode": "tokens",
+                            "sampling_params": {
+                                "max_tokens": tokens_per_turn,
+                                "temperature": temperature,
+                                "top_p": 1,
+                                "logprobs": 10 if engine.real else model.config.vocab_size,
+                                "seed": 123,
+                                "ignore_eos": True,
+                                "detokenize": False,
+                            },
+                        },
+                    )
+                    response.raise_for_status()
+                    choices = response.json()["choices"]
+                    assert len(choices) == 1
+                    choice = CompletionChoice.model_validate(choices[0], strict=True)
                     ids, log_probs = completion_tokens(choice)
                     assert len(ids) == tokens_per_turn
-                    assert choice.logprobs is not None and choice.logprobs.top_logprobs is not None
-                    for offset, alternatives in enumerate(choice.logprobs.top_logprobs):
+                    assert [span.model_dump() for span in choice.weight_versions] == [
+                        {"version": str(version), "start": 0, "end": len(ids)}
+                    ]
+                    top_logprobs = [
+                        {f"token_id:{entry['token_id']}": entry["logprob"] for entry in token["top_logprobs"]}
+                        for token in choices[0]["logprobs"]["content"]
+                    ]
+                    for offset, alternatives in enumerate(top_logprobs):
                         if engine.real:
                             assert (
                                 10 <= len(alternatives) <= 11
@@ -508,7 +525,7 @@ def test_published_rollout_parity(engine: Engine) -> None:
                             )
                     # Reused prefixes must see the new publication, including prefix-cache invalidation.
                     if turn == 0 and row == 0 and temperature == 1.0:
-                        current = choice.logprobs.top_logprobs[0]
+                        current = top_logprobs[0]
                         if previous is not None:
                             common = previous.keys() & current.keys()
                             assert common and max(abs(current[key] - previous[key]) for key in common) > 1e-4
@@ -526,6 +543,9 @@ def test_published_rollout_parity(engine: Engine) -> None:
                         token_ids=np.asarray(ids, dtype=np.int32),  # (L,)
                         loss_mask=np.asarray(mask, dtype=np.bool_),  # (L,)
                         old_log_probs=np.asarray(scores, dtype=np.float32),  # (L,)
+                        weight_versions=np.where(np.asarray(mask, dtype=np.bool_), version, -1).astype(
+                            np.int32
+                        ),  # (L,)
                     ),
                     prompt="",
                     reward=1.0,

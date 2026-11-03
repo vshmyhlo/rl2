@@ -22,8 +22,9 @@ Optimization scalars (averaged over minibatches and update epochs):
     train/rollout_importance_weight_mean: Mean applied token importance weight after safety bounding and truncation.
     train/rollout_importance_weight_clipped_fraction: Fraction of safety-bounded token weights above rollout_is_threshold.
     train/gradient_norm: Global trainable-parameter gradient norm after microbatch averaging, before clipping.
-    train/skipped_update_fraction: Fraction of optimizer minibatches skipped because all advantages are zero.
-Loss and policy diagnostics average sampled tokens within each rollout, then rollouts; weights do not change denominators.
+    train/skipped_update_fraction: Fraction of optimizer minibatches with no unmasked tokens carrying nonzero advantages.
+Loss and policy diagnostics average unmasked sampled tokens within each rollout, then all rollouts.
+Fully masked rollouts contribute zero; importance weights do not change denominators.
 Skipped minibatches contribute zero to loss and gradient norm metrics.
 Policy diagnostics average only evaluated minibatches and are omitted when all updates are skipped.
 
@@ -46,8 +47,8 @@ Rollout batch scalars:
     batcher/token_utilization_fraction: Non-padding transcript tokens divided by batch size times padded sequence length.
     batcher/padded_sequence_tokens: Padded sequence width chosen during batch construction, before the next-token shift.
     batcher/skipped_groups: Groups discarded by drop_degenerate_groups while filling this batch, including prefetch.
-    batcher/stale_groups: Groups discarded by max_staleness while filling this batch.
-    batcher/stale_rollouts: Rollouts discarded by max_staleness while filling this batch.
+    batcher/stale_tokens: Sampled tokens masked from training by max_staleness in this batch.
+    batcher/stale_token_fraction: Masked stale tokens divided by all sampled tokens in this batch.
 All StopCondition labels are logged each iteration, including zero for absent labels.
 
 Training progress and settings:
@@ -199,7 +200,7 @@ class Config(BaseConfig):
     group_size: Annotated[int, Field(ge=2)] = 4
     prefetch_batches: Annotated[int, Field(ge=0)] = 0  # Positive values trade policy staleness for overlap.
     parameter_sync_step: Annotated[int, Field(ge=1)] = 1  # Completed training batches between weight publications.
-    max_staleness: Annotated[int, Field(ge=0)] = 100  # Allowed weight publications since group submission.
+    max_staleness: Annotated[int, Field(ge=0)] = 100  # Allowed weight publications since each token was sampled.
     drop_degenerate_groups: bool = False
     continual_group_filling: bool = False
     max_resampling_attempts: Annotated[int, Field(ge=0)] = 100
@@ -403,7 +404,7 @@ def format_rollout_examples(groups: list[RolloutGroup]) -> str:
 class GRPOBatch[Array: np.ndarray | jax.Array](NamedTuple):
     token_ids: Array  # (B, T) int32 right-padded complete transcripts.
     attention_mask: Array  # (B, T) bool context and sampled tokens, excluding padding.
-    loss_mask: Array  # (B, T) bool sampled tokens only.
+    loss_mask: Array  # (B, T) bool sampled tokens within max_staleness only.
     old_log_probs: Array  # (B, T) float32 temperature-scaled sampling-policy log-probabilities.
     advantages: Array  # (B,) float32 mean-centered adjusted rewards within each rollout group.
 
@@ -421,7 +422,6 @@ class RolloutBatch:
 class CollectedGroup(NamedTuple):
     group: RolloutGroup
     skipped_groups: int
-    weight_version: int
 
 
 def build_rollout_batch(
@@ -431,8 +431,6 @@ def build_rollout_batch(
     *,
     include_examples: bool = False,
     skipped_groups: int = 0,
-    stale_groups: int = 0,
-    stale_rollouts: int = 0,
     latest_examples: dict[str, RolloutGroup] | None = None,
 ) -> RolloutBatch:
     """Summarize the batch and refresh the optional per-taskset example cache."""
@@ -445,6 +443,8 @@ def build_rollout_batch(
     for group in groups:
         rewards_by_taskset[group.taskset_id].extend(rollout.reward for rollout in group.rollouts)
         latest_examples[group.taskset_id] = replace(group, rollouts=group.rollouts[-1:])
+    sampled_tokens = sum(int(rollout.sequence.loss_mask.sum()) for rollout in rollouts)
+    stale_tokens = sampled_tokens - int(training_batch.loss_mask.sum())
     return RolloutBatch(
         training_batch=training_batch,
         rollout_metrics={
@@ -465,8 +465,8 @@ def build_rollout_batch(
             "batcher/token_utilization_fraction": float(training_batch.attention_mask.mean()),
             "batcher/padded_sequence_tokens": float(training_batch.attention_mask.shape[1]),
             "batcher/skipped_groups": skipped_groups,
-            "batcher/stale_groups": stale_groups,
-            "batcher/stale_rollouts": stale_rollouts,
+            "batcher/stale_tokens": stale_tokens,
+            "batcher/stale_token_fraction": stale_tokens / sampled_tokens,
             "actor/rollout_seconds_mean": mean(rollout.rollout_seconds for rollout in rollouts),
         },
         stop_counts=Counter(rollout.stop_condition for rollout in rollouts),
@@ -556,7 +556,9 @@ def compute_anchor_log_probs(
     def skip() -> jax.Array:  # (B, T-1)
         return jnp.zeros((size, width - 1), jnp.float32)  # (B, T-1), unused by skipped updates.
 
-    scores = jax.lax.cond(jnp.any(batch.advantages != 0), evaluate, skip)  # (B, T-1)
+    scores = jax.lax.cond(
+        jnp.any((batch.advantages != 0) & jnp.any(batch.loss_mask[:, 1:], axis=1)), evaluate, skip
+    )  # (B, T-1)
     return jax.lax.stop_gradient(scores)  # (B, T-1)
 
 
@@ -570,7 +572,8 @@ def objective(
     """Compute PPO loss against frozen anchors with detached rollout correction.
 
     Upper-truncate anchor/rollout importance weights before applying them to the
-    clipped surrogate. Average sampled tokens per rollout, then average rollouts.
+    clipped surrogate. Average unmasked tokens per rollout, then all rollouts;
+    fully masked rollouts contribute zero.
     """
     mask = batch.loss_mask[:, 1:]  # (B, T-1)
     anchor_log_probs = jax.lax.stop_gradient(anchor_log_probs)  # (B, T-1)
@@ -662,7 +665,7 @@ def update(
 ) -> tuple[TrainState, Metrics]:
     """Accumulate microbatch gradients and apply one optimizer step.
 
-    Donates state buffers; skips the step if all advantages are zero. Requires a
+    Donates state buffers; skips when no unmasked token has a nonzero advantage. Requires a
     `batch` mesh context and positional arguments for the sharded JIT inputs.
     """
     if grad_accum_steps < 1 or batch.token_ids.shape[0] % grad_accum_steps:
@@ -724,7 +727,9 @@ def update(
             "train/skipped_update_fraction": jnp.asarray(1.0, dtype=jnp.float32),  # ()
         }
 
-    return jax.lax.cond(jnp.any(batch.advantages != 0), apply_update, skip_update)
+    return jax.lax.cond(
+        jnp.any((batch.advantages != 0) & jnp.any(batch.loss_mask[:, 1:], axis=1)), apply_update, skip_update
+    )
 
 
 def score_group(
@@ -866,14 +871,17 @@ def wait_for_server(server: subprocess.Popen[bytes], timeout: float = 600) -> No
 # Shared imports must not initialize CUDA in rollout workers.
 @ray.remote(runtime_env={"env_vars": {"JAX_PLATFORMS": "cpu"}})
 class Batcher:
+    """Maintain a bounded rollout pool for sequential learner batch requests."""
+
     def __init__(self, actor: ActorHandle, config: Config = DEFAULT_CONFIG) -> None:
         self.actor = actor
         self.config = config
         self._pending_groups: list[asyncio.Task[CollectedGroup]] = []
         self._latest_examples: dict[str, RolloutGroup] = {}
-        self._weight_version = 0
 
-    def prepare_batch(self, groups: list[RolloutGroup], context_length: int) -> GRPOBatch[np.ndarray]:
+    def prepare_batch(
+        self, groups: list[RolloutGroup], context_length: int, *, weight_version: int = 0
+    ) -> GRPOBatch[np.ndarray]:
         """Flatten rollout groups in order and right-pad their transcripts into NumPy arrays.
 
         B is the total rollout count; T is the longest transcript length rounded up
@@ -883,7 +891,7 @@ class Batcher:
         Returns:
             GRPOBatch with token_ids: (B, T) int32 complete transcripts;
             attention_mask: (B, T) bool non-padding positions;
-            loss_mask: (B, T) bool sampled-token positions;
+            loss_mask: (B, T) bool sampled-token positions within max_staleness;
             old_log_probs: (B, T) float32 sampling-policy log-probabilities;
             advantages: (B,) float32 per-rollout advantages.
 
@@ -916,7 +924,9 @@ class Batcher:
             if length < 2 or mask[0] or not mask[1:].any():
                 raise ValueError("Each rollout needs context followed by at least one sampled token")
             batch.token_ids[index, :length] = sequence.token_ids  # (L,)
-            batch.loss_mask[index, :length] = sequence.loss_mask  # (L,)
+            batch.loss_mask[index, :length] = mask & (
+                sequence.weight_versions >= weight_version - self.config.max_staleness
+            )  # (L,)
             batch.old_log_probs[index, :length] = sequence.old_log_probs  # (L,)
             batch.attention_mask[index, :length] = True  # (L,)
         return batch  # (B, T), (B,) leaves.
@@ -925,7 +935,6 @@ class Batcher:
         """Fill one pool slot, replacing degenerate groups when configured."""
         skipped_groups = 0
         while True:
-            weight_version = self._weight_version
             pending = self.actor.fetch_next_group.remote(group_size=group_size)
             try:
                 group = await pending
@@ -933,7 +942,7 @@ class Batcher:
                 ray.cancel(pending, recursive=True)
                 raise
             if not self.config.drop_degenerate_groups or not group.is_degenerate:
-                return CollectedGroup(group=group, skipped_groups=skipped_groups, weight_version=weight_version)
+                return CollectedGroup(group=group, skipped_groups=skipped_groups)
             skipped_groups += 1
 
     def _fill_pending_groups(self, group_size: int, target_pending: int) -> None:
@@ -943,15 +952,13 @@ class Batcher:
             self._pending_groups.append(task)
 
     async def _fetch_group(self, *, group_size: int, pool_size: int, groups_until_drain: int) -> CollectedGroup:
-        """Pop the next ready group and immediately replenish within the drain limit."""
+        """Pop the next ready group and replenish within the drain limit."""
         self._fill_pending_groups(group_size=group_size, target_pending=min(pool_size, groups_until_drain))
         ready, _ = await asyncio.wait(self._pending_groups, return_when=asyncio.FIRST_COMPLETED)
         task = next(task for task in self._pending_groups if task in ready)
         group = await task
         self._pending_groups.remove(task)
-        # Only retained groups reduce demand; stale groups still need replacements.
-        if self._weight_version - group.weight_version <= self.config.max_staleness:
-            groups_until_drain -= 1
+        groups_until_drain -= 1
         self._fill_pending_groups(group_size=group_size, target_pending=min(pool_size, groups_until_drain))
         return group
 
@@ -975,7 +982,6 @@ class Batcher:
         """Consume groups from a bounded pool, draining it before periodic and final checkpoints."""
         if num_groups < 1:
             raise ValueError("num_groups must be at least 1")
-        self._weight_version = weight_version
         started = time.monotonic()
         batches_until_drain = (-iteration) % self.config.checkpoint_interval
         if self.config.total_iterations is not None:
@@ -987,8 +993,6 @@ class Batcher:
         try:
             groups: list[RolloutGroup] = []
             skipped_groups = 0
-            stale_groups = 0
-            stale_rollouts = 0
             while len(groups) < num_groups:
                 item = await self._fetch_group(
                     group_size=group_size,
@@ -996,15 +1000,11 @@ class Batcher:
                     groups_until_drain=groups_until_drain - len(groups),
                 )
                 skipped_groups += item.skipped_groups
-                if weight_version - item.weight_version > self.config.max_staleness:
-                    stale_groups += 1
-                    stale_rollouts += len(item.group.rollouts)
-                else:
-                    groups.append(item.group)
+                groups.append(item.group)
             fetched = time.monotonic()
             with span("batcher.prepare_batch"):
                 training_batch = await asyncio.to_thread(
-                    self.prepare_batch, groups, context_length=context_length
+                    self.prepare_batch, groups, context_length=context_length, weight_version=weight_version
                 )  # (B, T), (B,) leaves.
             prepared = time.monotonic()
             return build_rollout_batch(
@@ -1013,8 +1013,6 @@ class Batcher:
                 include_examples=include_examples,
                 latest_examples=self._latest_examples,
                 skipped_groups=skipped_groups,
-                stale_groups=stale_groups,
-                stale_rollouts=stale_rollouts,
                 timing_metrics={
                     "batcher/fetch_rollout_seconds": fetched - started,
                     "batcher/prepare_batch_seconds": prepared - fetched,
@@ -1098,6 +1096,7 @@ class Learner:
                     )
                 )
             resources.callback(self.cancel_pending_groups)
+            self.weight_version = -1  # The initial publication is version 0.
             self.publish_weights()
             self.weight_version = 0
             total_updates = int(self.state.step)
@@ -1170,12 +1169,12 @@ class Learner:
                         scalars["learner/weight_transfer_seconds"] = now - optimized
                     logger.info(
                         "iteration=%s reward=%.3f degenerate_group_fraction=%.3f skipped_groups=%d "
-                        "stale_rollouts=%d batch=%.2fs loss=%.4f update=%.2fs%s",
+                        "stale_tokens=%d batch=%.2fs loss=%.4f update=%.2fs%s",
                         iteration,
                         scalars["rollout/reward_mean"],
                         scalars["rollout/degenerate_group_fraction"],
                         scalars["batcher/skipped_groups"],
-                        scalars["batcher/stale_rollouts"],
+                        scalars["batcher/stale_tokens"],
                         scalars["learner/batch_fetch_seconds"],
                         scalars["train/policy_loss"],
                         scalars["learner/update_seconds"],
@@ -1219,7 +1218,7 @@ class Learner:
         )
 
     def publish_weights(self) -> None:
-        self._publish_weights()
+        self._publish_weights(self.weight_version + 1)
 
     def optimize(self, batch: GRPOBatch[np.ndarray]) -> dict[str, float]:  # Batch leaves: (B, T), (B,).
         """Freeze anchors once, then update shuffled minibatches across all epochs.

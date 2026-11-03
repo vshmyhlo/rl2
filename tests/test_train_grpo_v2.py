@@ -1094,6 +1094,7 @@ def rollout() -> training.Rollout:
             token_ids=np.array([1, 2], dtype=np.int32),  # (T=2,)
             loss_mask=np.array([False, True]),  # (T=2,)
             old_log_probs=np.array([0.0, -0.2], dtype=np.float32),  # (T=2,)
+            weight_versions=np.where(np.array([False, True]), 0, -1).astype(np.int32),  # (T,)
         ),
         reward=1.0,
         advantage=0.5,
@@ -1171,7 +1172,7 @@ def test_learner_pulls_groups_through_batcher(
         (0, 100, 9, [2, 4]),
         (3, 100, 12, [10, 10, 10, 10, 10]),
         (3, 100, 8, [2]),
-        (3, 12, None, [10, 10, 10, 10, 10]),
+        (3, 12, None, [10, 10, 10, 10, 10, 20]),
         (1, 100, None, [6, 8, 10]),
     ],
     ids=["disabled", "training-end", "final-batch-only", "checkpoint", "steady-pool"],
@@ -1206,7 +1207,7 @@ def test_batcher_prefetches_bounded_groups(
                 # Let newly scheduled groups start while the learner processes the batch.
                 await asyncio.sleep(0)
                 assert actor.fetch_next_group.remote.call_count == requests
-            assert len(batcher._pending_groups) == expected_requests[-1] - 2 * len(expected_requests)
+                assert len(batcher._pending_groups) == requests - 2 * (iteration - 7)
             await batcher.cancel_pending_groups()
             assert not batcher._pending_groups
 
@@ -1323,7 +1324,11 @@ def test_learner_cancels_prefetch_on_update_failure(
     learner.publish_weights = Mock()
     batch = training.build_rollout_batch(
         groups=[training.RolloutGroup(task_id="0", rollouts=[rollout] * 4, taskset_id="test")],
-        training_batch=Mock(spec=training.GRPOBatch, attention_mask=np.ones((4, 2), dtype=np.bool_)),  # (B, T)
+        training_batch=Mock(
+            spec=training.GRPOBatch,
+            attention_mask=np.ones((4, 2), dtype=np.bool_),  # (B=4, T=2)
+            loss_mask=np.tile([False, True], (4, 1)),  # (B, T)
+        ),
         timing_metrics={},
     )
     learner.batcher.fetch_next_batch.remote.return_value = batch
@@ -1366,6 +1371,41 @@ def test_batcher_cancels_prefetched_groups(
             assert not batcher._pending_groups
             await batcher.cancel_pending_groups()
             assert cancel.call_count == 4
+
+    asyncio.run(collect())
+
+
+def test_batcher_cancels_active_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    cancel = Mock()
+    monkeypatch.setattr(training.ray, "cancel", cancel)
+
+    async def collect() -> None:
+        pending = [asyncio.Future[training.RolloutGroup]() for _ in range(2)]
+        started: asyncio.Queue[int] = asyncio.Queue()
+        requests = iter(enumerate(pending))
+
+        def fetch(group_size: int) -> asyncio.Future[training.RolloutGroup]:
+            index, result = next(requests)
+            started.put_nowait(index)
+            return result
+
+        actor = Mock()
+        actor.fetch_next_group.remote.side_effect = fetch
+        batcher = training.Batcher.__ray_metadata__.modified_class(
+            actor=actor, config=training.Config(prefetch_batches=1)
+        )
+        batcher.prepare_batch = Mock()
+        async with asyncio.timeout(5), asyncio.TaskGroup() as tg:
+            batch = tg.create_task(batcher.fetch_next_batch(num_groups=1, group_size=2, context_length=8))
+            assert [await started.get() for _ in pending] == [0, 1]
+            batch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await batch
+            assert all(item.cancelled() for item in pending)
+            assert [call.args[0] for call in cancel.call_args_list] == pending
+            assert all(call.kwargs == {"recursive": True} for call in cancel.call_args_list)
+            assert not batcher._pending_groups
+            batcher.prepare_batch.assert_not_called()
 
     asyncio.run(collect())
 
@@ -1465,19 +1505,21 @@ def test_batch_skipped_groups_follow_prefetched_groups(rollout: training.Rollout
 
 
 @pytest.mark.parametrize(
-    ("max_staleness", "weight_version", "complete_before_fetch", "discarded"),
+    ("max_staleness", "weight_version", "sampled_version", "complete_before_fetch", "masked"),
     [
-        pytest.param(8, 8, True, False, id="inclusive-limit"),
-        pytest.param(8, 9, True, True, id="too-stale"),
-        pytest.param(0, 1, True, True, id="current-weights-only"),
-        pytest.param(0, 1, False, True, id="in-flight"),
+        pytest.param(8, 8, 0, True, False, id="inclusive-limit"),
+        pytest.param(8, 9, 0, True, True, id="too-stale"),
+        pytest.param(0, 1, 0, True, True, id="current-weights-only"),
+        pytest.param(0, 1, 0, False, True, id="in-flight"),
+        pytest.param(0, 1, 1, False, False, id="in-flight-fresh-weights"),
     ],
 )
-def test_batch_discards_stale_prefetched_groups(
+def test_batch_masks_stale_prefetched_tokens(
     max_staleness: int,
     weight_version: int,
+    sampled_version: int,
     complete_before_fetch: bool,
-    discarded: bool,
+    masked: bool,
     rollout: training.Rollout,
 ) -> None:
     async def collect() -> None:
@@ -1488,6 +1530,21 @@ def test_batch_discards_stale_prefetched_groups(
             )
             for index in range(3)
         ]
+        groups[1] = replace(
+            groups[1],
+            rollouts=[
+                replace(
+                    sample,
+                    sequence=replace(
+                        sample.sequence,
+                        weight_versions=np.where(sample.sequence.loss_mask, sampled_version, -1).astype(
+                            np.int32
+                        ),  # (T,)
+                    ),
+                )
+                for sample in groups[1].rollouts
+            ],
+        )
         requested = 0
 
         async def fetch(group_size: int) -> training.RolloutGroup:
@@ -1509,8 +1566,8 @@ def test_batch_discards_stale_prefetched_groups(
         async with asyncio.timeout(5), asyncio.TaskGroup() as tg:
             first = await batcher.fetch_next_batch(num_groups=1, group_size=2, context_length=8)
             assert requested == 2
-            assert first.rollout_metrics["batcher/stale_groups"] == 0
-            assert first.rollout_metrics["batcher/stale_rollouts"] == 0
+            assert first.rollout_metrics["batcher/stale_tokens"] == 0
+            assert first.rollout_metrics["batcher/stale_token_fraction"] == 0
             if complete_before_fetch:
                 pending.set_result(groups[1])
                 await batcher._pending_groups[0]
@@ -1528,17 +1585,16 @@ def test_batch_discards_stale_prefetched_groups(
                 await asyncio.sleep(0)
                 pending.set_result(groups[1])
             batch = await second
-            expected = 2 if discarded else 1
-            assert requested == expected + 1
+            assert requested == 2
             assert batch.training_batch.token_ids.shape == (2, 8)
             assert batch.training_batch.advantages.shape == (2,)
-            assert batch.rollout_metrics[f"rollout/reward_mean/taskset_{expected}"] == 0.5
-            assert f"task={expected} |" in batch.examples
-            if discarded:
-                assert "rollout/reward_mean/taskset_1" not in batch.rollout_metrics
-                assert "task=1 |" not in batch.examples
-            assert batch.rollout_metrics["batcher/stale_groups"] == int(discarded)
-            assert batch.rollout_metrics["batcher/stale_rollouts"] == 2 * int(discarded)
+            assert batch.rollout_metrics["rollout/reward_mean/taskset_1"] == 0.5
+            assert "task=1 |" in batch.examples
+            assert batch.rollout_metrics["batcher/stale_tokens"] == 2 * int(masked)
+            assert batch.rollout_metrics["batcher/stale_token_fraction"] == float(masked)
+            assert int(batch.training_batch.loss_mask.sum()) == (0 if masked else 2)
+            np.testing.assert_array_equal(batch.training_batch.attention_mask[:, :2], True)
+            np.testing.assert_array_equal(batch.training_batch.advantages, 0.5)
             assert not batcher._pending_groups
 
     asyncio.run(collect())
@@ -1552,7 +1608,7 @@ def test_batch_requires_groups() -> None:
     actor.fetch_next_group.remote.assert_not_called()
 
 
-def test_degenerate_retry_uses_current_weight_version(rollout: training.Rollout) -> None:
+def test_degenerate_retry_masks_actual_token_versions(rollout: training.Rollout) -> None:
     async def collect() -> None:
         pending = asyncio.Future[training.RolloutGroup]()
         retained = training.score_group(Mock(id="retained"), [rollout, replace(rollout, reward=0.0)], taskset_id="test")
@@ -1582,8 +1638,8 @@ def test_degenerate_retry_uses_current_weight_version(rollout: training.Rollout)
             batch = await second
             assert requested == 3
             assert batch.rollout_metrics["batcher/skipped_groups"] == 1
-            assert batch.rollout_metrics["batcher/stale_groups"] == 0
-            assert batch.rollout_metrics["batcher/stale_rollouts"] == 0
+            assert batch.rollout_metrics["batcher/stale_tokens"] == 2
+            assert batch.rollout_metrics["batcher/stale_token_fraction"] == 1
             assert not batcher._pending_groups
 
     asyncio.run(collect())
@@ -1694,9 +1750,13 @@ def test_batch_timings_and_order_survive_serialization(
     prepare_batch = batcher.prepare_batch
     event_loop_thread = threading.get_ident()
 
-    def prepare(groups: list[training.RolloutGroup], context_length: int) -> training.GRPOBatch[np.ndarray]:
+    def prepare(
+        groups: list[training.RolloutGroup], context_length: int, *, weight_version: int
+    ) -> training.GRPOBatch[np.ndarray]:
         assert threading.get_ident() != event_loop_thread
-        batch = prepare_batch(groups, context_length=context_length)  # (B, T), (B,) leaves.
+        batch = prepare_batch(
+            groups, context_length=context_length, weight_version=weight_version
+        )  # (B, T), (B,) leaves.
         clock.return_value += 2.0
         return batch  # (B, T), (B,) leaves.
 
@@ -1846,6 +1906,7 @@ def test_learner_logs_rollouts(
         token_ids=np.array([1], dtype=np.int32),  # (T=1,)
         loss_mask=np.array([True]),  # (T=1,)
         old_log_probs=np.array([-0.2], dtype=np.float32),  # (T=1,)
+        weight_versions=np.where(np.array([True]), 0, -1).astype(np.int32),  # (T,)
     )
     rollout = training.Rollout(
         prompt="Environment prompt",
@@ -1899,14 +1960,14 @@ def test_learner_logs_rollouts(
     prepared = Mock(spec=training.GRPOBatch)
     prepared.token_ids = Mock(shape=(4, 8))  # (B=4, T=8)
     prepared.attention_mask = np.tile([True, True, False, False, False, False, False, False], (4, 1))  # (B=4, T=8)
+    prepared.loss_mask = np.zeros((4, 8), dtype=np.bool_)  # (B=4, T=8) all stale.
     received = training.build_rollout_batch(
         groups=batch,
         training_batch=prepared,
         timing_metrics=timing_metrics,
         skipped_groups=3,
-        stale_groups=2,
-        stale_rollouts=4,
     )
+    prepared.loss_mask[:, 1] = True  # (B=4,) fresh sampled tokens.
     next_batch = training.build_rollout_batch(
         groups=[
             replace(group, rollouts=[replace(rollout, stop_condition="environment_done") for rollout in group.rollouts])
@@ -2016,8 +2077,8 @@ def test_learner_logs_rollouts(
         "batcher/token_utilization_fraction": 0.25,
         "batcher/padded_sequence_tokens": 8.0,
         "batcher/skipped_groups": 3,
-        "batcher/stale_groups": 2,
-        "batcher/stale_rollouts": 4,
+        "batcher/stale_tokens": 4,
+        "batcher/stale_token_fraction": 1.0,
         "train/iterations_total": 1,
         "train/updates_total": 1,
         "train/learning_rate": learner.config.learning_rate * 2,
@@ -2036,7 +2097,7 @@ def test_learner_logs_rollouts(
         assert calls[2].args[0]["train/rollouts_total"] == 8
         assert calls[2].args[0]["rollout/degenerate_group_fraction"] == degenerate_fraction
         assert calls[2].args[0]["batcher/skipped_groups"] == 0
-        assert calls[2].args[0]["batcher/stale_rollouts"] == 0
+        assert calls[2].args[0]["batcher/stale_tokens"] == 0
         assert {key: value for key, value in calls[2].args[0].items() if "stop_fraction/" in key} == {
             "rollout/stop_fraction/agent_completed": 0.0,
             "rollout/stop_fraction/max_tokens": 0.0,
@@ -2048,7 +2109,7 @@ def test_learner_logs_rollouts(
     assert "Run ID: None; MLflow run: mlflow-run" in caplog.messages
     assert (
         f"iteration=1 reward={mean(rewards):.3f} degenerate_group_fraction={degenerate_fraction:.3f} "
-        "skipped_groups=3 stale_rollouts=4 batch=1.00s "
+        "skipped_groups=3 stale_tokens=4 batch=1.00s "
         "loss=-0.2500 update=1.00s weights=1.00s"
     ) in caplog.messages
     writer.__exit__.assert_called_once()
@@ -2084,7 +2145,7 @@ def test_learner_skips_publication_without_updates(
                 "rollout/reward_mean": 0.0,
                 "rollout/degenerate_group_fraction": 1.0,
                 "batcher/skipped_groups": 0,
-                "batcher/stale_rollouts": 0,
+                "batcher/stale_tokens": 0,
             },
             stop_counts={},
             num_output_tokens=4,
@@ -2138,7 +2199,7 @@ def test_learner_parameter_sync_cadence(learner: Any, monkeypatch: pytest.Monkey
                 "rollout/reward_mean": 1.0,
                 "rollout/degenerate_group_fraction": 0.0,
                 "batcher/skipped_groups": 0,
-                "batcher/stale_rollouts": 0,
+                "batcher/stale_tokens": 0,
             },
             stop_counts={},
             num_output_tokens=4,
@@ -2221,7 +2282,7 @@ def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.Monke
                 "rollout/reward_mean": 1.0,
                 "rollout/degenerate_group_fraction": 0.0,
                 "batcher/skipped_groups": 0,
-                "batcher/stale_rollouts": 0,
+                "batcher/stale_tokens": 0,
             },
             stop_counts={"max_turns" if not saved else "agent_completed": num_rollouts},
             num_output_tokens=4,
@@ -2305,6 +2366,7 @@ def test_learner_logs_examples_at_configured_interval(
             token_ids=np.array([1, 2], dtype=np.int32),  # (T=2,)
             loss_mask=np.array([False, True]),  # (T=2,)
             old_log_probs=np.array([0.0, -0.2], dtype=np.float32),  # (T=2,)
+            weight_versions=np.where(np.array([False, True]), 0, -1).astype(np.int32),  # (T,)
         ),
         reward=1.0,
         advantage=0.5,
@@ -2432,7 +2494,7 @@ def test_learner_cleans_up_failed_start(learner: Any, monkeypatch: pytest.Monkey
 def test_learner_delegates_publication(learner: Any) -> None:
     learner._publish_weights = Mock()
     learner.publish_weights()
-    learner._publish_weights.assert_called_once_with()
+    learner._publish_weights.assert_called_once_with(learner.weight_version + 1)
     learner._publish_weights.side_effect = RuntimeError("transfer failed")
     with pytest.raises(RuntimeError, match="transfer failed"):
         learner.publish_weights()
@@ -2846,6 +2908,7 @@ def test_reward_penalties_actor_batcher_integration(
             token_ids=np.array([1, 2, 3], dtype=np.int32),  # (T=3,)
             loss_mask=np.array([False, True, True]),  # (T=3,)
             old_log_probs=np.array([0.0, -0.2, -0.2], dtype=np.float32),  # (T=3,)
+            weight_versions=np.where(np.array([False, True, True]), 0, -1).astype(np.int32),  # (T,)
         ),
     )
     agent = AsyncMock()
