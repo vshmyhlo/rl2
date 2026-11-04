@@ -277,7 +277,7 @@ minibatches_per_epoch: 1 # One optimizer update per epoch, using all 32 rollouts
 
 prefetch_batches: 1 # Overlap collection and training; not verl's warmup/staleness controls.
 parameter_sync_step: 1 # Publish every fourth training batch if weights have changed.
-max_staleness: 1 # Mask tokens older than eight weight publications.
+max_staleness: 2 # Mask tokens older than eight weight publications.
 
 # verl's off-policy threshold/drop strategy and minibatch streaming are unsupported.
 weight_update_pause_mode: keep

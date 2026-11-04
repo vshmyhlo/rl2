@@ -301,15 +301,7 @@ contain non-degenerate groups. There is no retry limit; collection can continue
 indefinitely if every group is degenerate. `batcher/skipped_groups` counts discarded
 groups per batch, including skips during prefetch, and is zero when none are skipped.
 The count appears in MLflow and the iteration log. Rollout metrics describe retained groups.
-Set `continual_group_filling: true` (default false) to keep sampling the same task
-until its group has different adjusted rewards. After the initial parallel
-`group_size` attempts, each additional attempt replaces the oldest sample;
-advantages are recomputed over the newest `group_size` samples.
-`max_resampling_attempts: 100` limits additional samples after the initial group
-(nonnegative; `0` disables retries). At the limit, the latest group is returned
-even if still degenerate. When both options are enabled, the batcher's
-`drop_degenerate_groups` filter discards such groups and samples replacement tasks.
-Rollout metrics and training include only retained samples.
+Each group collects `group_size` rollouts concurrently for the same task.
 `rollout/reward_*` reports raw task rewards; `rollout/adjusted_reward_*` reports
 adjusted rewards.
 The batcher pads complete transcripts to `padding_multiple` (default 256),

@@ -202,8 +202,6 @@ class Config(BaseConfig):
     parameter_sync_step: Annotated[int, Field(ge=1)] = 1  # Completed training batches between weight publications.
     max_staleness: Annotated[int, Field(ge=0)] = 100  # Allowed weight publications since each token was sampled.
     drop_degenerate_groups: bool = False
-    continual_group_filling: bool = False
-    max_resampling_attempts: Annotated[int, Field(ge=0)] = 100
     length_penalty: LengthPenaltyConfig = LengthPenaltyConfig()
     total_iterations: Annotated[int | None, Field(ge=1)] = None
     checkpoint_interval: Annotated[int, Field(gt=0)] = 100
@@ -1394,7 +1392,7 @@ class Actor:
         return await self.collect_group(sampled.task, group_size=group_size, taskset_id=sampled.taskset_id)
 
     async def collect_group(self, task: Task, group_size: int, *, taskset_id: str) -> RolloutGroup:
-        """Collect a fixed-size group, optionally replacing its oldest attempts until rewards differ."""
+        """Collect and score a fixed-size group of concurrent rollouts."""
         if group_size < 2:
             raise ValueError("group_size must be at least 2")
         span_data = {"group_id": uuid4().hex, "task_id": str(task.id), "group_size": str(group_size)}
@@ -1426,31 +1424,18 @@ class Actor:
                         rollout_span.set_attribute("stop_condition", result.stop_condition)
                         return result
 
-                rollouts: list[Rollout] = []
-                next_index = 0
-                attempts = group_size
-                while True:
-                    async with asyncio.TaskGroup() as tg:
-                        runs = [tg.create_task(run_rollout(next_index + offset)) for offset in range(attempts)]
-                        self._runs.update(runs)
-                        for run in runs:
-                            run.add_done_callback(self._runs.discard)
-                    next_index += attempts
-                    rollouts = (rollouts + [run.result() for run in runs])[-group_size:]
-                    with span("actor.score_group"):
-                        group = score_group(
-                            task,
-                            rollouts,
-                            length_penalty=self.config.length_penalty,
-                            taskset_id=taskset_id,
-                        )
-                    if (
-                        not self.config.continual_group_filling
-                        or not group.is_degenerate
-                        or next_index - group_size >= self.config.max_resampling_attempts
-                    ):
-                        break
-                    attempts = 1
+                async with asyncio.TaskGroup() as tg:
+                    runs = [tg.create_task(run_rollout(index)) for index in range(group_size)]
+                    self._runs.update(runs)
+                    for run in runs:
+                        run.add_done_callback(self._runs.discard)
+                with span("actor.score_group"):
+                    group = score_group(
+                        task,
+                        [run.result() for run in runs],
+                        length_penalty=self.config.length_penalty,
+                        taskset_id=taskset_id,
+                    )
         except Exception:
             logger.exception(
                 "Group failed: task=%s group_size=%s elapsed=%.2fs",

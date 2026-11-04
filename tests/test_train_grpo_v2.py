@@ -70,8 +70,6 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert defaults.parameter_sync_step == 1
     assert defaults.max_staleness == 100
     assert not defaults.drop_degenerate_groups
-    assert not defaults.continual_group_filling
-    assert defaults.max_resampling_attempts == 100
     assert defaults.length_penalty == training.LengthPenaltyConfig(reference_tokens=8192, penalty=0.0)
     assert defaults.update_epochs == 1
     assert defaults.checkpoint_interval == 100
@@ -102,8 +100,6 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
                 "enable_tracing": False,
                 "padding_multiple": 64,
                 "drop_degenerate_groups": False,
-                "continual_group_filling": True,
-                "max_resampling_attempts": 5,
                 "length_penalty": {"reference_tokens": 4096, "penalty": 0.05},
                 "rollout_is_threshold": 3.0,
                 "prefetch_batches": 3,
@@ -132,8 +128,6 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
             enable_tracing=False,
             padding_multiple=64,
             drop_degenerate_groups=False,
-            continual_group_filling=True,
-            max_resampling_attempts=5,
             length_penalty=training.LengthPenaltyConfig(reference_tokens=4096, penalty=0.05),
             rollout_is_threshold=3.0,
             prefetch_batches=3,
@@ -339,8 +333,8 @@ def test_reasoning_gym_cli_and_actor_task_stream(tmp_path: Path, monkeypatch: py
     [
         {"num_groups": 0},
         {"group_size": 1},
-        {"max_resampling_attempts": -1},
-        {"max_resampling_attempts": 1.5},
+        pytest.param({"continual_group_filling": True}, id="removed-continual-group-filling"),
+        pytest.param({"max_resampling_attempts": 100}, id="removed-max-resampling-attempts"),
         {"prefetch_batches": -1},
         {"prefetch_batches": 1.5},
         {"prefetch_mode": "next_ready"},
@@ -969,15 +963,11 @@ def test_actor_retries_agent_startup(actor: Any, monkeypatch: pytest.MonkeyPatch
     agent.__aexit__.assert_awaited_once()
 
 
-@pytest.mark.parametrize("continual_group_filling", [False, True])
 def test_actor_close_cancels_rollouts(
     actor: Any,
     monkeypatch: pytest.MonkeyPatch,
     task_discovery: list[ALFWorldTask],
-    rollout: training.Rollout,
-    continual_group_filling: bool,
 ) -> None:
-    actor.config = replace(actor.config, continual_group_filling=continual_group_filling)
     agent = AsyncMock()
     agent.__aenter__.return_value = agent
     started = asyncio.Event()
@@ -985,10 +975,8 @@ def test_actor_close_cancels_rollouts(
 
     async def run(env: Environment) -> training.Rollout:
         nonlocal active
-        if continual_group_filling and agent.run.await_count <= 2:
-            return rollout
         active += 1
-        if active == (1 if continual_group_filling else 2):
+        if active == 2:
             started.set()
         try:
             return await asyncio.Future[training.Rollout]()
@@ -2705,20 +2693,8 @@ def test_group_requires_multiple_rollouts(size: int, actor: Any) -> None:
         asyncio.run(actor.fetch_next_group(group_size=size))
 
 
-@pytest.mark.parametrize(
-    "enabled,limit,rewards",
-    [
-        pytest.param(False, 100, [0.0, 0.0], id="disabled"),
-        pytest.param(True, 100, [0.0, 1.0], id="initial-nondegenerate"),
-        pytest.param(True, 100, [0.0, 0.0, 0.0, 0.0, 1.0], id="sliding-window"),
-        pytest.param(True, 2, [0.0, 0.0, 0.0, 0.0], id="exhausted"),
-        pytest.param(True, 0, [0.0, 0.0], id="zero-limit"),
-        pytest.param(True, 1, [0.0, 0.0, 1.0], id="last-attempt-succeeds"),
-    ],
-)
-def test_continual_group_filling(
-    enabled: bool,
-    limit: int,
+@pytest.mark.parametrize("rewards", [[0.0, 0.0], [0.0, 1.0]], ids=["degenerate", "nondegenerate"])
+def test_group_collects_fixed_size(
     rewards: list[float],
     actor: Any,
     rollout: training.Rollout,
@@ -2726,7 +2702,6 @@ def test_continual_group_filling(
     task_discovery: list[ALFWorldTask],
     spans: InMemorySpanExporter,
 ) -> None:
-    actor.config = replace(actor.config, continual_group_filling=enabled, max_resampling_attempts=limit)
     samples = [replace(rollout, reward=reward, completion=str(index)) for index, reward in enumerate(rewards)]
     agent = AsyncMock()
     agent.__aenter__.return_value = agent
@@ -2738,7 +2713,7 @@ def test_continual_group_filling(
             return await actor.fetch_next_group(group_size=2)
 
     group = asyncio.run(collect())
-    assert group == training.score_group(task_discovery[0], samples[-2:], taskset_id="alfworld")
+    assert group == training.score_group(task_discovery[0], samples, taskset_id="alfworld")
     assert len(group.rollouts) == 2
     assert agent.run.await_count == len(samples)
     actor.rng.choice.assert_called_once_with(task_discovery)
@@ -2899,7 +2874,6 @@ def test_reward_penalties_actor_batcher_integration(
         length_penalty=training.LengthPenaltyConfig(reference_tokens=2, penalty=0.1),
         max_tokens=4,
         drop_degenerate_groups=True,
-        continual_group_filling=True,
     )
     longer = replace(
         rollout,
