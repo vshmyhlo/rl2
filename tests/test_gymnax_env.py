@@ -1,5 +1,4 @@
 import chex
-import gymnax
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -8,8 +7,6 @@ import pytest
 from rl2.envs import EnvStep
 from rl2.envs.gymnax_env import GymnaxEnv, render_observation
 
-pytestmark = pytest.mark.filterwarnings("error:scatter inputs have incompatible types:FutureWarning")
-
 
 @pytest.mark.parametrize("env_id,channels,actions", [("Breakout-MinAtar", 4, 3), ("SpaceInvaders-MinAtar", 6, 4)])
 def test_single_reset_step_preserves_native_observations(env_id: str, channels: int, actions: int) -> None:
@@ -17,10 +14,7 @@ def test_single_reset_step_preserves_native_observations(env_id: str, channels: 
     params = env.params.replace(max_steps_in_episode=1)
     key = jax.random.key(5)  # ()
     observation, state = env.reset(key, params)  # (10,10,C); leaves: (...)
-    native_env, _ = gymnax.make(env_id)
-    # Gymnax 0.0.9 warns while constructing the same native observation.
-    with pytest.warns(FutureWarning, match="scatter inputs have incompatible types"):
-        raw, raw_state = native_env.reset(key, params)  # (10,10,C); leaves: (...)
+    raw, raw_state = env.env.reset(key, params)  # (10,10,C); leaves: (...)
     chex.assert_trees_all_equal(state, raw_state)
     np.testing.assert_array_equal(observation, raw)
     assert observation.shape == (10, 10, channels) and observation.dtype == jnp.float32

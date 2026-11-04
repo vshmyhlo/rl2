@@ -41,6 +41,10 @@ Solving sparse reward Atari environments, such as Montezuma’s Revenge.
 
 ### PPO with JAX-native environments
 
+MinAtar Breakout using [ppo.py](src/rl2/ppo.py) with the
+[Breakout configuration](configs/ppo/minatar/breakout.yaml).
+
+[Watch the rollout](images/ppo_minatar_breakout.mp4).
 
 ## Useful links and references
 
