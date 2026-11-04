@@ -1,6 +1,6 @@
 from dataclasses import asdict, replace
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import chex
 import jax
@@ -137,6 +137,29 @@ def test_pendulum_initialization_and_step_on_two_devices() -> None:
     assert result.observation.sharding == batched
     np.testing.assert_array_equal(result.info["truncated"], True)
     np.testing.assert_array_equal(result.state.step_count, 0)
+
+
+def test_playback_with_single_device_physics_in_training_mesh(config: ppo.Config) -> None:
+    if jax.device_count() < 2:
+        pytest.skip("Requires two devices; use JAX_PLATFORMS=cpu JAX_NUM_CPU_DEVICES=2")
+    config = replace(config, env=BraxConfig(task="inverted_pendulum", max_steps=1))
+    mesh = Mesh(devices=jax.devices()[:2], axis_names=("batch",), axis_types=(AxisType.Auto,))
+    with jax.set_mesh(mesh):
+        env = BraxEnv(config.env)
+        assert len(env.env.sys.qpos0.devices()) == 1
+        observation, _ = jax.jit(env.reset)(jax.random.key(0), env.params)  # (O=4,); state leaves: (...)
+        model = ppo.ActorCritic(action_space=env.action_space, model=config.model)
+        carry = model.initial_carry(1)  # leaves: (B=1,H=2)
+        params = model.init(jax.random.key(1), observation[None, None], carry, jnp.ones((1, 1), bool))["params"]
+        state = jax.device_put(
+            TrainState.create(apply_fn=model.apply, params=params, tx=optax.sgd(0.1)), PartitionSpec()
+        )
+        with patch.object(env, "render", return_value=np.zeros((2, 3, 3), np.uint8)):
+            for record in (False, True):
+                result = ppo.play_episode(state, config, jax.random.key(2), carry, record=record, env=env)
+                assert result.length == 1
+                assert len(result.frames) == (2 if record else 0)
+                assert all(frame.shape == (2, 3, 3) for frame in result.frames)
 
 
 def test_native_spaces_rewards_and_batched_timeout(env: BraxEnv) -> None:

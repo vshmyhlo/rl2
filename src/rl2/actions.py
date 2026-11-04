@@ -1,4 +1,8 @@
-"""Action spaces and JAX policies; S denotes arbitrary batch dimensions."""
+"""Action spaces and JAX policies; S denotes batch dimensions, A categories, D flat action size.
+
+Continuous log probabilities and differential entropies sum over the D action coordinates.
+Sampling prepends sample_shape to S; log_prob also accepts these leading sample dimensions.
+"""
 
 from dataclasses import dataclass
 from math import isfinite, prod
@@ -84,7 +88,7 @@ class TruncatedGaussianPolicy:
     def distribution(self) -> distrax.Independent:
         low, high = jnp.asarray((self.action_space.low, self.action_space.high), jnp.float32)  # each (D,)
         normal = tfp.distributions.TruncatedNormal(loc=self.mean, scale=jnp.exp(self.log_std), low=low, high=high)
-        return distrax.Independent(normal, reinterpreted_batch_ndims=1)  # batch: (*S,); event: (D,)
+        return distrax.Independent(distribution=normal, reinterpreted_batch_ndims=1)  # batch: (*S,); event: (D,)
 
     def sample(
         self,
@@ -118,7 +122,11 @@ class TruncatedGaussianPolicy:
 
 @struct.dataclass
 class BetaPolicy:
-    """Independent Betas with positive alpha/beta, affinely scaled to Box bounds."""
+    """Independent Betas with positive alpha/beta, affinely scaled to Box bounds.
+
+    Bounds must have representable float32 interior values. Sampling clips rounded
+    endpoints into that interior; density and entropy describe the unclipped Beta.
+    """
 
     alpha: jax.Array  # (*S, D) float32
     beta: jax.Array  # (*S, D) float32
@@ -127,9 +135,11 @@ class BetaPolicy:
     @property
     def distribution(self) -> distrax.Independent:
         low, high = jnp.asarray((self.action_space.low, self.action_space.high), jnp.float32)  # each (D,)
-        beta = tfp.distributions.Beta(self.alpha, self.beta, force_probs_to_zero_outside_support=True)
-        scaled = distrax.Transformed(beta, distrax.ScalarAffine(shift=low, scale=high - low))
-        return distrax.Independent(scaled, reinterpreted_batch_ndims=1)  # batch: (*S,); event: (D,)
+        beta = tfp.distributions.Beta(
+            concentration1=self.alpha, concentration0=self.beta, force_probs_to_zero_outside_support=True
+        )
+        scaled = distrax.Transformed(distribution=beta, bijector=distrax.ScalarAffine(shift=low, scale=high - low))
+        return distrax.Independent(distribution=scaled, reinterpreted_batch_ndims=1)  # batch: (*S,); event: (D,)
 
     def sample(
         self,
@@ -160,7 +170,10 @@ class BetaPolicy:
         chex.assert_type(actions, float)
         batch_shape = actions.shape[: actions.ndim - len(self.action_space.shape)]
         flat_actions = actions.reshape((*batch_shape, self.action_space.size))  # (*S, D)
-        return self.distribution.log_prob(flat_actions)  # (*S,)
+        low, high = jnp.asarray((self.action_space.low, self.action_space.high), jnp.float32)  # each (D,)
+        # The affine inverse can round an out-of-bounds action back onto Beta's support.
+        outside = jnp.any((flat_actions < low) | (flat_actions > high), axis=-1)  # (*S,)
+        return jnp.where(outside, -jnp.inf, self.distribution.log_prob(flat_actions))  # (*S,)
 
     def entropy(self) -> jax.Array:  # (*S,)
         return self.distribution.entropy()  # (*S,)

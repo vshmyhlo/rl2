@@ -202,6 +202,19 @@ def test_beta_shapes_bounds_density_and_entropy(
         policy.log_prob(actions.astype(jnp.int32))
 
 
+def test_beta_log_prob_respects_box_bounds_before_affine_rounding() -> None:
+    policy = BetaPolicy(
+        alpha=jnp.ones(1),  # (D=1,)
+        beta=jnp.ones(1),  # (D=1,)
+        action_space=ContinuousSpace(shape=(1,), low=(-1.0,), high=(1.0,)),
+    )
+    bounds = jnp.array([[-1.0], [1.0]])  # (N=2, D=1)
+    outside = jnp.nextafter(bounds, bounds * 2)  # (N, D)
+    log_probs = jax.jit(policy.log_prob)(outside)  # (N,)
+    np.testing.assert_array_equal(log_probs, jnp.full(2, -jnp.inf))
+    np.testing.assert_allclose(policy.log_prob(bounds), -jnp.log(2.0), atol=1e-6)
+
+
 @pytest.mark.parametrize(
     "alpha,beta", [(1.0, 1.0), (0.01, 0.01), (1.0, 100.0)], ids=["uniform", "endpoint-singularities", "skewed"]
 )

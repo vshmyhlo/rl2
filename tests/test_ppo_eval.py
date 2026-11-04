@@ -66,6 +66,7 @@ def test_episode_renders_state_before_autoreset(record: bool) -> None:
     observation = jnp.zeros((4, 2, 2), jnp.uint8)  # (C, H, W)
     initial, final, reset = {"frame": 10}, {"frame": 20}, {"frame": 30}
     env = Mock()
+    env.params = {}
     env.reset.return_value = observation, initial
     env.step.return_value = observation, reset, jnp.asarray(1.0), jnp.asarray(True), {"final_state": final}
     env.render.side_effect = [np.full((3, 5, 3), pixel, np.uint8) for pixel in (10, 20)]  # each (P, Q, 3)

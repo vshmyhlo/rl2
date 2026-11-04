@@ -732,7 +732,8 @@ def play_episode(
 ) -> EpisodeResult:
     """Run on device, transferring bounded state chunks for optional host rendering."""
     key, reset_key = jax.random.split(key)  # each () typed PRNG key
-    observation, env_state = env.reset(reset_key, env.params)  # observation/state leaves: (...)
+    # Compile reset so single-device physics constants can join the active training mesh.
+    observation, env_state = jax.jit(env.reset)(reset_key, env.params)  # observation/state leaves: (...)
     state = PlaybackState(
         key=key,  # ()
         observation=observation,  # (*O,)
