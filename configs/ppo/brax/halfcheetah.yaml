@@ -35,12 +35,12 @@ value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
 run_id: ppo_${path_name:${env.id}}_${env.task}_${env.backend}_seed${seed}
-checkpoint_interval: 244
+checkpoint_interval: 122
 log_interval: 10
 # Intervals count completed PPO iterations.
-# Video/evaluation require an available OpenGL backend (e.g. MUJOCO_GL=egl).
-# Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
-video_interval: 122
+# Evaluation recording requires an available OpenGL backend (e.g. MUJOCO_GL=egl).
+# Checkpoints every 10% and eval every 20% of training, rounded up to iterations.
+# Evaluation (including GIF recording), checkpoints, and logging also run on completion.
 video_max_frames: 1001
 video_fps: 20.0
 eval_interval: 244

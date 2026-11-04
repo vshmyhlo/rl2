@@ -1,6 +1,5 @@
 """SMAX team observations, legal actions, and explicit autoreset boundaries."""
 
-from functools import partial
 from typing import Annotated, Literal
 
 import jax
@@ -52,13 +51,11 @@ class SMAXEnv(BaseMultiAgentEnv[State]):
             action_masks=jnp.stack([masks[agent] for agent in self.agents]).astype(bool),  # (N, A)
         )
 
-    @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array) -> tuple[AgentObservation, State]:  # key: ()
         """Return (N, O)/(N, A) observations/masks and (...) state leaves."""
         observations, state = self.env.reset(key)  # agent leaves: (O,); state leaves: (...)
         return self._observation(observations, state), state
 
-    @partial(jax.jit, static_argnames="self")
     def step(
         self,
         key: jax.Array,  # () typed PRNG key

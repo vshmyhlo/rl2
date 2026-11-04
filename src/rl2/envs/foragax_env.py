@@ -1,6 +1,5 @@
 """Foragax square-wave foraging with local grid observations and PPO time limits."""
 
-from functools import partial
 from typing import Annotated, Literal
 
 import jax
@@ -37,12 +36,10 @@ class ForagaxEnv(BaseEnv[EnvState, EnvParams]):
         self.params = self.env.default_params.replace(max_steps_in_episode=config.max_steps)
         self.action_space = DiscreteSpace(n=self.env.num_actions)
 
-    @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array, params: EnvParams) -> tuple[jax.Array, EnvState]:  # key: ()
         """Return (H, W, C) float32 observation and (...) state leaves."""
         return self.env.reset(key, params)  # (H, W, C); state leaves: (...)
 
-    @partial(jax.jit, static_argnames="self")
     def step(
         self,
         key: jax.Array,  # () typed PRNG key
@@ -73,6 +70,5 @@ class ForagaxEnv(BaseEnv[EnvState, EnvParams]):
             },
         )
 
-    @partial(jax.jit, static_argnames="self")
     def render(self, state: EnvState) -> jax.Array:  # state leaves: (...) -> (135, 216, 3)
         return self.env.render(state, self.params, render_mode="world").astype(jnp.uint8)  # (135, 216, 3)

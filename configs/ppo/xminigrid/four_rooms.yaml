@@ -37,12 +37,13 @@ value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
 run_id: ppo_${path_name:${env.id}}_${path_name:${env.env_id}}_${path_name:${env.benchmark}}_ruleset${env.ruleset_id}_seed${seed}
-# Intervals count PPO iterations; eval/checkpoints ~2M environment steps.
+# Intervals count completed PPO iterations.
+# Checkpoints every 10% and eval every 20% of training, rounded up to iterations.
 # Evaluation (including GIF recording), checkpoints, and logging also run on completion.
-checkpoint_interval: 245
+checkpoint_interval: 122
 log_interval: 10
 video_max_frames: 244 # Initial frame plus the native 243-step episode limit
 video_fps: 10.0
-eval_interval: 245
+eval_interval: 244
 eval_episodes: 10
 eval_seed: 10000

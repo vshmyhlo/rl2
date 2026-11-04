@@ -4,7 +4,6 @@ Native Pgx rules apply: an illegal move terminates the episode with reward -1.
 Legal moves earn the sum of merged tile values; actions are left/up/right/down.
 """
 
-from functools import partial
 from typing import Annotated, Literal, cast
 
 import jax
@@ -38,13 +37,11 @@ class PgxEnv(BaseEnv[State, PgxParams]):
         self.params = PgxParams(max_steps=config.max_steps)
         self.action_space = DiscreteSpace(n=4)
 
-    @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array, params: PgxParams) -> tuple[jax.Array, State]:  # key: ()
         """Return (4, 4, 31) bool tile planes and (...) native state leaves."""
         state = cast(State, self.env.init(key))  # leaves: (...)
         return state.observation, state  # (4, 4, 31); leaves: (...)
 
-    @partial(jax.jit, static_argnames="self")
     def step(
         self,
         key: jax.Array,  # () typed PRNG key

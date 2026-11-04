@@ -67,7 +67,9 @@ class PlaygroundEnv(BaseEnv[PlaygroundState, PlaygroundParams]):
         settings.impl = "jax"
         settings.episode_length = config.max_steps
         # Construct directly: the registry otherwise clones the entire Menagerie repository.
-        self.env = constructor(config=settings)
+        # MJX loads onto one device; defer the training mesh to batched simulation.
+        with jax.set_mesh(None):
+            self.env = constructor(config=settings)
         self.params = PlaygroundParams(max_steps=config.max_steps)
         size = self.env.action_size
         self.action_space = ContinuousSpace(shape=(size,), low=(-1.0,) * size, high=(1.0,) * size)
@@ -77,14 +79,12 @@ class PlaygroundEnv(BaseEnv[PlaygroundState, PlaygroundParams]):
             return cast(dict[str, jax.Array], physics.obs)["state"]  # (48,)
         return cast(jax.Array, physics.obs)  # (O,)
 
-    @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array, params: PlaygroundParams) -> tuple[jax.Array, PlaygroundState]:  # key: ()
         """Return (O,) float32 observation and (...) physics state leaves."""
         physics = self.env.reset(key)  # leaves: (...)
         state = PlaygroundState(physics=physics, step_count=jnp.array(0, jnp.int32))
         return self._observation(physics), state  # (O,); state leaves: (...)
 
-    @partial(jax.jit, static_argnames="self")
     def step(
         self,
         key: jax.Array,  # () typed PRNG key

@@ -1,6 +1,5 @@
 """Gymnax MinAtar and FourRooms with native visual observations."""
 
-from functools import partial
 from typing import Annotated, Literal
 
 import gymnax
@@ -21,7 +20,8 @@ type EnvState = breakout.EnvState | space_invaders.EnvState | rooms.EnvState
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class GymnaxConfig:
     id: Literal["Breakout-MinAtar", "SpaceInvaders-MinAtar", "FourRooms-misc"] = "Breakout-MinAtar"
-    max_steps: Annotated[int, Field(gt=0, lt=2**31, strict=True)] | None = None
+    # Reserve int32 max for disabling the native timeout during step.
+    max_steps: Annotated[int, Field(gt=0, lt=2**31 - 1, strict=True)] | None = None
 
 
 class GymnaxEnv(BaseEnv[EnvState, EnvParams]):
@@ -34,13 +34,11 @@ class GymnaxEnv(BaseEnv[EnvState, EnvParams]):
             self.params = self.params.replace(max_steps_in_episode=config.max_steps)
         self.action_space = DiscreteSpace(self.env.num_actions)
 
-    @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array, params: EnvParams) -> tuple[jax.Array, EnvState]:  # key: ()
         """Return (H, W, C) float32 observation and (...) state leaves."""
         observation, state = self.env.reset(key, params)  # (H, W, C); state leaves: (...)
         return observation, state  # (H, W, C); state leaves: (...)
 
-    @partial(jax.jit, static_argnames="self")
     def step(
         self,
         key: jax.Array,  # () typed PRNG key

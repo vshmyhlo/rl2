@@ -1,6 +1,5 @@
 """Brax continuous-control tasks with native actions and time-limit bootstrapping."""
 
-from functools import partial
 from typing import Annotated, Literal, cast
 
 import jax
@@ -48,14 +47,12 @@ class BraxEnv(BaseEnv[BraxState, BraxParams]):
         size = self.env.action_size
         self.action_space = ContinuousSpace(shape=(size,), low=(-1.0,) * size, high=(1.0,) * size)
 
-    @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array, params: BraxParams) -> tuple[jax.Array, BraxState]:  # key: ()
         """Return (O,) float32 observation and (...) physics state leaves."""
         physics = self.env.reset(key)  # leaves: (...)
         state = BraxState(physics=physics, step_count=jnp.array(0, jnp.int32))
         return cast(jax.Array, physics.obs), state  # (O,); state leaves: (...)
 
-    @partial(jax.jit, static_argnames="self")
     def step(
         self,
         key: jax.Array,  # () typed PRNG key

@@ -1,6 +1,5 @@
 """Single-environment Kinetix symbolic observations and discrete or continuous actions for PPO."""
 
-from functools import partial
 from typing import Annotated, Literal
 
 import jax
@@ -24,7 +23,8 @@ class KinetixConfig:
     size: Literal["s", "m", "l"] = "s"
     # None samples procedural levels; otherwise sample uniformly from this list.
     levels: Annotated[tuple[Annotated[str, Field(min_length=1)], ...], Field(min_length=1, strict=False)] | None = None
-    max_steps: Annotated[int, Field(gt=0, lt=2**31, strict=True)] = 256
+    # Reserve int32 max for disabling the native timeout during step.
+    max_steps: Annotated[int, Field(gt=0, lt=2**31 - 1, strict=True)] = 256
     frame_skip: Annotated[int, Field(gt=0, strict=True)] = 2
     downscale: Literal[1, 2, 4] = 4
     dense_reward_scale: Annotated[float, Field(ge=0, allow_inf_nan=False, strict=True)] = 0.1
@@ -61,13 +61,11 @@ class KinetixEnv(BaseEnv[EnvState, EnvParams]):
                 high=tuple(map(float, space.high.ravel())),
             )
 
-    @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array, params: EnvParams) -> tuple[jax.Array, EnvState]:  # key: ()
         """Return (F,) float32 symbolic observation and (...) state leaves."""
         observation, state = self.env.reset(key, params)  # observation: (F,); state leaves: (...)
         return observation, state  # (F,); state leaves: (...)
 
-    @partial(jax.jit, static_argnames="self")
     def step(
         self,
         key: jax.Array,  # () typed PRNG key
@@ -104,7 +102,6 @@ class KinetixEnv(BaseEnv[EnvState, EnvParams]):
             },
         )
 
-    @partial(jax.jit, static_argnames="self")
     def render(self, state: EnvState) -> jax.Array:  # state leaves: (...) -> (H, W, 3)
         pixels = self.render_pixels(state)  # (W, H, 3), y-up in [0, 255]
         return jnp.rint(jnp.clip(pixels, 0, 255)).astype(jnp.uint8).swapaxes(0, 1)[::-1]  # (H, W, 3)

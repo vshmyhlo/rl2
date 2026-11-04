@@ -424,6 +424,28 @@ The host keeps its existing NVIDIA driver and Container Toolkit. The device
 plugin uses the `nvidia` runtime; no GPU Operator or driver replacement is
 needed. See [Kueue's quick start](https://kueue.sigs.k8s.io/docs/getting-started/quick-start/).
 
+Headless MuJoCo/Brax videos also require the host's NVIDIA EGL/OpenGL libraries.
+On this Ubuntu host, install the graphics package matching the compute driver:
+
+```bash
+driver_version=$(dpkg-query -W -f='${Version}' libnvidia-compute-580-server)
+sudo apt-get install --no-install-recommends "libnvidia-gl-580-server=$driver_version"
+ldconfig -p | grep libEGL_nvidia
+```
+
+New training containers request the `graphics` driver capability and use EGL.
+Recreate existing containers after installing the libraries. Without them, Mesa
+software rendering can segfault inside TensorFlow's LLVM symbols during video
+recording even when CUDA training works. See [NVIDIA's driver capabilities](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/docker-specialized.html).
+Verify rendering with an existing local training image (queues a short one-GPU
+Job at low priority, waits up to 15 minutes, and removes it afterward):
+
+```bash
+(cd infra/k3s/tests && \
+  RL2_K3S_TESTS=1 RL2_TRAINING_IMAGE='rl2.local/train:train-<image-id>' \
+  uv run pytest --rootdir=. --confcutdir=. test_mujoco_rendering.py -q)
+```
+
 ### Build and queue training jobs
 
 Run `submit.py` on this k3s host to build the current working tree and submit a

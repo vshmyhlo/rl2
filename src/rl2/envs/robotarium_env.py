@@ -1,6 +1,5 @@
 """JaxRobotarium Material Transport with discrete waypoints and pure resets."""
 
-from functools import partial
 from typing import Annotated, Literal
 
 import jax
@@ -73,7 +72,6 @@ class RobotariumEnv(BaseMultiAgentEnv[State]):
             action_masks=jnp.ones((self.num_agents, self.action_space.n), dtype=bool),  # (N, A=5)
         )
 
-    @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array) -> tuple[AgentObservation, State]:  # key: ()
         """Return (N, O)/(N, A) observations/masks and (...) state leaves."""
         # Native reset stores traced poses/velocities on the simulator. Keep state explicit.
@@ -92,7 +90,6 @@ class RobotariumEnv(BaseMultiAgentEnv[State]):
         )
         return self._observation(self.env.get_obs(state)), state
 
-    @partial(jax.jit, static_argnames="self")
     def step(
         self,
         key: jax.Array,  # () typed PRNG key

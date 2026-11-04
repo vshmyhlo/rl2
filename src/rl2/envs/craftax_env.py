@@ -2,7 +2,6 @@
 
 Symbolic observations contain a spatial grid and non-spatial features. Pixels are (H,W,3)."""
 
-from functools import partial
 from math import prod
 from typing import Annotated, Literal
 
@@ -30,7 +29,8 @@ class CraftaxConfig:
     env_id: Literal[
         "Craftax-Pixels-v1", "Craftax-Classic-Pixels-v1", "Craftax-Symbolic-v1", "Craftax-Classic-Symbolic-v1"
     ] = "Craftax-Pixels-v1"
-    max_steps: Annotated[int, Field(gt=0, lt=2**31, strict=True)] | None = None
+    # Reserve int32 max for disabling the native timeout during step.
+    max_steps: Annotated[int, Field(gt=0, lt=2**31 - 1, strict=True)] | None = None
 
 
 class CraftaxEnv(BaseEnv[chex.ArrayTree, CraftaxParams]):
@@ -62,13 +62,11 @@ class CraftaxEnv(BaseEnv[chex.ArrayTree, CraftaxParams]):
             features=observation[size:],  # (F,)
         )
 
-    @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array, params: CraftaxParams) -> tuple[Observation, chex.ArrayTree]:  # key: ()
         """Return (*O,) float32 observation leaves and (...) state leaves."""
         observation, state = self.env.reset(key, params)  # (*O,); state leaves: (...)
         return self._observation(observation), state  # (*O,); state leaves: (...)
 
-    @partial(jax.jit, static_argnames="self")
     def step(
         self,
         key: jax.Array,  # () typed PRNG key
@@ -111,7 +109,6 @@ class CraftaxEnv(BaseEnv[chex.ArrayTree, CraftaxParams]):
     def render_observation(observation: jax.Array) -> jax.Array:  # (H, W, 3) -> (H, W, 3)
         return jnp.rint(jnp.clip(observation, 0, 1) * 255).astype(jnp.uint8)  # (H, W, 3)
 
-    @partial(jax.jit, static_argnames="self")
     def render(self, state: chex.ArrayTree) -> jax.Array:  # state leaves: (...) -> (H, W, 3)
         """Render the native player-centered view and inventory HUD."""
         observation = self.render_env.get_obs(state)  # (H, W, 3)

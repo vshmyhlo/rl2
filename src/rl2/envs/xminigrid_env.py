@@ -56,7 +56,6 @@ class XMiniGridEnv(BaseEnv[TimeStep, EnvParams]):
                 self.params = self.params.replace(ruleset=benchmark.get_ruleset(config.ruleset_id))
         self.action_space = DiscreteSpace(self.env.num_actions(self.params))
 
-    @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array, params: EnvParams) -> tuple[jax.Array, TimeStep]:  # key: ()
         """Return (H, W, 2) uint8 tile/color IDs and (...) timestep leaves."""
         if self.benchmark is not None:
@@ -65,7 +64,6 @@ class XMiniGridEnv(BaseEnv[TimeStep, EnvParams]):
         timestep = self.env.reset(params, key)  # observation: (H, W, 2) tile/color IDs; state leaves: (...)
         return timestep.observation, timestep  # (H, W, 2); leaves: (...)
 
-    @partial(jax.jit, static_argnames=("self", "auto_reset"))
     def step(
         self,
         key: jax.Array,  # () typed PRNG key
@@ -75,7 +73,10 @@ class XMiniGridEnv(BaseEnv[TimeStep, EnvParams]):
         *,
         auto_reset: bool = True,
     ) -> EnvStep[TimeStep]:
-        """Advance and autoreset; info retains (H, W, 2) final_observation tile/color IDs."""
+        """Advance and autoreset; info retains (H, W, 2) final_observation tile/color IDs.
+
+        auto_reset is a static option used by step_batch; bind it before applying JIT.
+        """
         timestep = self.env.step(params, state, action)  # observation: (H, W, 2) tile/color IDs; state leaves: (...)
         terminated = timestep.last() & (timestep.discount == 0)  # ()
         truncated = timestep.state.step_num >= params.max_steps  # ()
@@ -101,7 +102,6 @@ class XMiniGridEnv(BaseEnv[TimeStep, EnvParams]):
             },
         )
 
-    @partial(jax.jit, static_argnames="self")
     def step_batch(
         self,
         keys: jax.Array,  # (B,) typed PRNG keys

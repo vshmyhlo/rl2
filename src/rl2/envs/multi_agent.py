@@ -40,8 +40,8 @@ class BaseMultiAgentEnv[State](ABC):
     Actions and observations retain native values; agent dictionaries are packed
     in a fixed order. Masks expose native availability, or all actions when absent.
     N denotes agents, O local observation features, and A discrete actions.
-    Reset, step, and memory_resets support jax.jit and jax.vmap;
-    rendering may run on the host.
+    Reset, step, and memory_resets support caller-applied jax.jit and jax.vmap.
+    Adapters do not add JIT boundaries; rendering may run on the host.
     """
 
     num_agents: int

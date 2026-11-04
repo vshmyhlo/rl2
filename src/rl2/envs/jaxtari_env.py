@@ -1,6 +1,5 @@
 """JAXtari Breakout with native RGB frames and explicit episode boundaries."""
 
-from functools import partial
 from typing import Annotated, Literal, cast
 
 import jax
@@ -33,13 +32,11 @@ class JAXtariEnv(BaseEnv[BreakoutState, JAXtariParams]):
         self.params = JAXtariParams(max_steps=config.max_steps)
         self.action_space = DiscreteSpace(n=self.env.action_space().n)
 
-    @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array, params: JAXtariParams) -> tuple[jax.Array, BreakoutState]:  # key: ()
         """Return (210, 160, 3) uint8 RGB and (...) native game state leaves."""
         _, state = self.env.reset(key)  # state leaves: (...)
         return self.render(state), state  # (210, 160, 3); state leaves: (...)
 
-    @partial(jax.jit, static_argnames="self")
     def step(
         self,
         key: jax.Array,  # () typed PRNG key
@@ -73,6 +70,5 @@ class JAXtariEnv(BaseEnv[BreakoutState, JAXtariParams]):
             },
         )
 
-    @partial(jax.jit, static_argnames="self")
     def render(self, state: BreakoutState) -> jax.Array:  # leaves: (...) -> (210, 160, 3)
         return self.env.render(state)  # (210, 160, 3) uint8

@@ -1,16 +1,19 @@
 # Reach, grasp, and move a cube to a sampled target with the Franka Panda arm.
 # Run: uv run ppo --config configs/ppo/mujoco_playground/manipulation/panda_pick_cube.yaml
 # Setup: uv run python -m rl2.envs.playground_assets
+# Recurrent PPO starting point with raw observations/rewards and bounded actions.
+# Discount, entropy weight, and epochs follow Playground v0.2.0 manipulation_params.py;
+# retain a conservative learning rate for the smaller batch and shared recurrent model.
 env:
   id: MuJoCo-Playground
   task: PandaPickCube
   max_steps: 150 # 3 simulated seconds at 50 Hz; MJX uses the JAX backend
 seed: 1
-total_steps: 10_000_000
-num_envs: 32
-num_steps: 128
-num_minibatches: 4
-update_epochs: 4
+total_steps: 10_000_000 # Environment steps summed across environments; only full iterations run
+num_envs: 128
+num_steps: 32 # 4096 transitions per iteration; more parallel scenes, shorter recurrent sequences
+num_minibatches: 4 # 32 whole sequences / 1024 transitions per minibatch
+update_epochs: 8 # At most 32 updates per iteration, subject to KL stopping
 model:
   continuous_policy: truncated_gaussian
   encoder:
@@ -24,21 +27,22 @@ bf16: false
 learning_rate: 0.0003
 anneal_lr: true
 lr_decay: linear
-gamma: 0.99
+gamma: 0.97 # Dense shaped rewards; limits critic target scale without reward normalization
 gae_lambda: 0.95
 clip_coef: 0.2
-target_kl: 0.01
-entropy_coef: 0.001
+target_kl: 0.02 # Joint distribution over eight controls
+entropy_coef: 0.02 # Encourage grasp exploration, then anneal for precise placement
 entropy_decay: cosine
 value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
 run_id: ppo_${path_name:${env.id}}_${env.task}_seed${seed}
-checkpoint_interval: 489
+checkpoint_interval: 245
 log_interval: 10
-# Video/evaluation require an available OpenGL backend (e.g. MUJOCO_GL=egl).
-# Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
-video_interval: 245
+# Intervals count completed PPO iterations.
+# Evaluation recording requires an available OpenGL backend (e.g. MUJOCO_GL=egl).
+# Checkpoints every 10% and eval every 20% of training, rounded up to iterations.
+# Evaluation (including GIF recording), checkpoints, and logging also run on completion.
 video_max_frames: 151
 video_fps: 50.0
 eval_interval: 489

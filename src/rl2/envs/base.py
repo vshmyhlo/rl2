@@ -35,7 +35,8 @@ class BaseEnv[State, Params](ABC):
 
     Actions retain native values; observation arrays or pytrees use adapter-specific layouts.
     O denotes each observation leaf's dimensions. Reset and step support
-    jax.jit and jax.vmap; rendering may run on the host.
+    caller-applied jax.jit and jax.vmap. Adapters do not add JIT boundaries;
+    rendering may run on the host.
     """
 
     params: Params

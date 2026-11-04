@@ -1,6 +1,5 @@
 """STORM n-player matrix games with flat symbolic observations and time limits."""
 
-from functools import partial
 from typing import Annotated, Literal
 
 import jax
@@ -69,13 +68,11 @@ class STORMEnv(BaseMultiAgentEnv[State]):
             action_masks=jnp.ones((self.num_agents, self.action_space.n), dtype=bool),  # (N, 8)
         )
 
-    @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array) -> tuple[AgentObservation, State]:  # key: ()
         """Return (N, 350)/(N, 8) observations/masks and (...) state leaves."""
         observations, state = self.env.reset(key)  # (N, 5, 5, 14); state leaves: (...)
         return self._observation(observations), state
 
-    @partial(jax.jit, static_argnames="self")
     def step(
         self,
         key: jax.Array,  # () typed PRNG key
