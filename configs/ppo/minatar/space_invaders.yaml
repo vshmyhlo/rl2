@@ -1,0 +1,44 @@
+# MinAtar CNN + LSTM baseline for two GPUs; preserves the native 10x10 grid.
+env:
+  id: SpaceInvaders-MinAtar
+seed: 1
+total_steps: 10_000_000 # Agent transitions across all environments; only full rollouts run
+num_envs: 64 # 32 environments per GPU
+num_steps: 128 # 8192 transitions per rollout
+num_minibatches: 8 # 8 whole sequences per minibatch; 512 transitions per GPU
+update_epochs: 4
+model:
+  encoder:
+    type: rgb
+    stages:
+      - { channels: 32, blocks: 1, kernel_size: 3, resize_factor: 1.0 }
+    embedding_size: 128
+  recurrent:
+    type: lstm
+    hidden_size: 128
+    num_layers: 1
+    intermediate_size: 0
+bf16: false
+learning_rate: 0.0003
+anneal_lr: true
+lr_decay: linear
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: null # Fixed epoch count; no KL early stopping
+entropy_coef: 0.01
+entropy_decay: constant
+value_coef: 0.5 # Multiplies mean(0.5 * squared value error)
+max_grad_norm: 0.5
+ckpt_dir: /runs/ppo/${run_id}
+run_id: ppo_${path_name:${env.id}}_seed${seed}
+# Intervals count PPO iterations; video ~1M transitions, eval/checkpoints ~2M.
+# Video, evaluation, checkpoints, and logging also run on completion.
+checkpoint_interval: 245
+log_interval: 10
+video_interval: 123
+video_max_frames: 1001 # Initial frame plus the native 1000-step episode limit
+video_fps: 40.0
+eval_interval: 245
+eval_episodes: 10
+eval_seed: 10000

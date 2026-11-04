@@ -1,47 +1,44 @@
-# Enduro PPO hyperparameters adapted to MinAtar: https://arxiv.org/pdf/1707.06347, Table 5.
+# MinAtar CNN + LSTM baseline for two GPUs; preserves the native 10x10 grid.
 env:
   id: Breakout-MinAtar
 seed: 1
 total_steps: 10_000_000 # Agent transitions across all environments; only full rollouts run
-num_envs: 8
-num_steps: 128
-num_minibatches: 4 # 8 envs * 128 steps / 4 = 256 samples; preserve whole sequences
-update_epochs: 3
+num_envs: 64 # 32 environments per GPU
+num_steps: 128 # 8192 transitions per rollout
+num_minibatches: 8 # 8 whole sequences per minibatch; 512 transitions per GPU
+update_epochs: 4
 model:
   encoder:
     type: rgb
     stages:
-      # Enduro CNN settings; MinAtar spatial sizes are 10 -> 3 -> 2 -> 2.
-      # The fixed 7x7 stem, 768-wide projection, normalization/SiLU, and deeper heads remain.
-      # blocks=0 omits residual blocks; resize-convolution itself has no activation.
-      - { channels: 32, blocks: 0, kernel_size: 8, resize_factor: 0.25 } # 10 -> 3
-      - { channels: 64, blocks: 0, kernel_size: 4, resize_factor: 0.5 } # 3 -> 2
-      - { channels: 64, blocks: 0, kernel_size: 3, resize_factor: 1.0 } # 2 -> 2
-  recurrent: # Retain recurrence as requested; this LSTM is an adaptation of the reference CNN policy.
+      - { channels: 32, blocks: 1, kernel_size: 3, resize_factor: 1.0 }
+    embedding_size: 128
+  recurrent:
     type: lstm
-    hidden_size: 512
+    hidden_size: 128
     num_layers: 1
-    intermediate_size: 0 # Disable the optional recurrent MLP
-bf16: true # Mixed precision compute; parameters, recurrent memory, and losses stay float32
-learning_rate: 0.00025
-anneal_lr: true # false keeps a constant learning rate
-lr_decay: linear # Paper's alpha: linearly anneal from 1 to 0
+    intermediate_size: 0
+bf16: false
+learning_rate: 0.0003
+anneal_lr: true
+lr_decay: linear
 gamma: 0.99
 gae_lambda: 0.95
-clip_coef: 0.1 # Paper uses 0.1 * alpha; this trainer only supports a constant clip coefficient
+clip_coef: 0.2
 target_kl: null # Fixed epoch count; no KL early stopping
 entropy_coef: 0.01
 entropy_decay: constant
-value_coef: 2.0 # Paper c1=1 on squared error; trainer multiplies 0.5 * squared error
+value_coef: 0.5 # Multiplies mean(0.5 * squared value error)
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
 run_id: ppo_${path_name:${env.id}}_seed${seed}
-# All intervals count completed PPO iterations (one rollout and its updates).
-# Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
-checkpoint_interval: 1953 # Iterations between checkpoints; also save on completion
-log_interval: 60 # Iterations between progress logs; also log on completion
-video_interval: 977 # Iterations between recordings; 0 disables recording
-video_fps: 40.0 # Video playback frames per second
-eval_interval: 1953 # Iterations between evaluations; 0 disables
-eval_episodes: 10 # Full games per evaluation, after the rollout update; training pauses during evaluation
-eval_seed: 10000 # Fixed evaluation seed set, separate from training RNG
+# Intervals count PPO iterations; video ~1M transitions, eval/checkpoints ~2M.
+# Video, evaluation, checkpoints, and logging also run on completion.
+checkpoint_interval: 245
+log_interval: 10
+video_interval: 123
+video_max_frames: 1001 # Initial frame plus the native 1000-step episode limit
+video_fps: 40.0
+eval_interval: 245
+eval_episodes: 10
+eval_seed: 10000

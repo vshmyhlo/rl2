@@ -182,7 +182,14 @@ def test_clipped_policy_loss_and_gradient_direction(shape: tuple[int, ...]) -> N
     assert float(after[3]) > float(before[3])
 
 
-def test_single_transition_keeps_policy_gradient() -> None:
+@pytest.mark.parametrize(
+    "num_envs,advantage,expected_loss",
+    [(1, 1.0, -1.0), (3, 0.1, 0.0)],
+    ids=["single-transition-keeps-gradient", "equal-fractional-advantages-have-zero-gradient"],
+)
+def test_advantage_normalization_handles_single_and_constant_samples(
+    num_envs: int, advantage: float, expected_loss: float
+) -> None:
     config = replace(
         load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config),
         target_kl=None,
@@ -191,30 +198,45 @@ def test_single_transition_keeps_policy_gradient() -> None:
     )
 
     def apply(
-        variables: optax.Params, obs: jax.Array, carry: ppo.RecurrentCarry, starts: jax.Array
+        variables: optax.Params,  # logits: (B,T=1,A=2)
+        obs: jax.Array,  # (B,T=1,O=1)
+        carry: ppo.RecurrentCarry,  # leaves: (B,H=1)
+        starts: jax.Array,  # (B,T=1)
     ) -> ppo.ActorCriticOutput:
-        chex.assert_shape(obs, (1, 1, 1, 1, 1))
+        chex.assert_shape(obs, (num_envs, 1, 1))
         chex.assert_type(obs, jnp.uint8)
-        chex.assert_shape(starts, (1, 1))
+        chex.assert_shape(starts, (num_envs, 1))
         chex.assert_type(starts, jnp.bool_)
-        chex.assert_shape(variables["params"]["logits"], (1, 1, 2))
+        chex.assert_shape(variables["params"]["logits"], (num_envs, 1, 2))
         chex.assert_type(variables["params"]["logits"], jnp.float32)
-        return ppo.ActorCriticOutput(carry, ppo.CategoricalPolicy(variables["params"]["logits"]), jnp.zeros((1, 1)))
+        return ppo.ActorCriticOutput(
+            carry=carry,  # leaves: (B,H=1)
+            policy=ppo.CategoricalPolicy(variables["params"]["logits"]),  # logits: (B,T=1,A=2)
+            values=jnp.zeros((num_envs, 1)),  # (B,T=1)
+        )
 
-    state = TrainState.create(apply_fn=apply, params={"logits": jnp.zeros((1, 1, 2))}, tx=optax.sgd(0.1))
+    state = TrainState.create(
+        apply_fn=apply,
+        params={"logits": jnp.zeros((num_envs, 1, 2))},  # (B,T=1,A=2)
+        tx=optax.sgd(0.1),
+    )
     batch = ppo.PPOBatch(
-        observations=jnp.zeros((1, 1, 1, 1, 1), dtype=jnp.uint8),  # (*S, *O)
-        actions=jnp.zeros((1, 1), dtype=jnp.int32),  # (*S,)
-        old_log_probs=jnp.full((1, 1), -np.log(2)),  # (*S,)
-        values=jnp.zeros((1, 1)),  # (*S,)
-        advantages=jnp.ones((1, 1)),  # (*S,)
-        returns=jnp.zeros((1, 1)),  # (*S,)
-        model_carry=initial_carry(1, 1),  # leaves: (B, ...)
-        episode_starts=jnp.ones((1, 1), dtype=bool),  # (*S,)
+        observations=jnp.zeros((num_envs, 1, 1), dtype=jnp.uint8),  # (B,T=1,O=1)
+        actions=jnp.zeros((num_envs, 1), dtype=jnp.int32),  # (B,T=1)
+        old_log_probs=jnp.full((num_envs, 1), -np.log(2)),  # (B,T=1)
+        values=jnp.zeros((num_envs, 1)),  # (B,T=1)
+        advantages=jnp.full((num_envs, 1), advantage),  # (B,T=1)
+        returns=jnp.zeros((num_envs, 1)),  # (B,T=1)
+        model_carry=initial_carry(num_envs, 1),  # leaves: (B,H=1)
+        episode_starts=jnp.ones((num_envs, 1), dtype=bool),  # (B,T=1)
     )
     updated, metrics = update(state, batch, config)
-    assert float(metrics.policy_loss) == pytest.approx(-1.0)
-    assert float(jax.nn.softmax(updated.params["logits"])[0, 0, 0]) > 0.5
+    assert float(metrics.policy_loss) == pytest.approx(expected_loss)
+    chex.assert_shape(updated.params["logits"], (num_envs, 1, 2))
+    if num_envs == 1:
+        assert float(jax.nn.softmax(updated.params["logits"])[0, 0, 0]) > 0.5
+    else:
+        chex.assert_trees_all_equal(updated.params, state.params)
 
 
 @pytest.mark.parametrize(
@@ -591,6 +613,13 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     def now() -> float:
         return clock
 
+    def log_metrics(scalars: dict[str, float | int], step: int) -> None:
+        nonlocal clock
+        if "train/policy_loss" in scalars:
+            clock += 3.0
+
+    writer.log_metrics.side_effect = log_metrics
+
     with (
         jax.disable_jit(),
         patch("rl2.ppo.GymnaxEnv", return_value=envs),
@@ -636,11 +665,11 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         "train/approx_kl": [(0.02 / 3, 2), (0.0, 3)],
         "train/clip_fraction": [(0.04, 2), (0.12, 3)],
         "train/explained_variance_mean": [(0.0, 2)],
-        "train/updates_per_rollout_mean": [(1.0, 2), (2.0, 3)],
+        "train/updates_per_iteration_mean": [(1.0, 2), (2.0, 3)],
         "train/kl_early_stop_fraction": [(0.5, 2), (0.0, 3)],
-        "train/rollouts_per_second": [(2 / 60, 2), (1 / 20, 3)],
+        "train/iterations_per_second": [(2 / 60, 2), (1 / 20, 3)],
         "train/env_steps_per_second": [(2 / 60, 2), (1 / 20, 3)],
-        "train/episodes_per_second": [(1 / 60, 2), (0.0, 3)],
+        "train/updates_per_second": [(2 / 60, 2), (2 / 20, 3)],
         "rollout/episode_count": [(1.0, 2), (0.0, 3)],
         "rollout/return_mean": [(8.0, 2)],
         "rollout/episode_length_steps_mean": [(2.0, 2)],
@@ -648,10 +677,9 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         "train/episode_length_steps_mean": [(2.0, 2), (2.0, 3)],
         "train/episodes_total": [(1.0, 2), (1.0, 3)],
         "train/env_steps_total": [(2.0, 2), (3.0, 3)],
-        "train/rollouts_total": [(2.0, 2), (3.0, 3)],
+        "train/iterations_total": [(2.0, 2), (3.0, 3)],
         "train/updates_total": [(2.0, 2), (4.0, 3)],
         "train/progress_fraction": [(2 / 3, 2), (1.0, 3)],
-        "train/elapsed_seconds": [(60.0, 2), (80.0, 3)],
     }.items():
         np.testing.assert_allclose(logged[tag], expected, err_msg=tag)
     for tag, initial in (("train/learning_rate", config.learning_rate), ("train/entropy_coef", config.entropy_coef)):
@@ -660,22 +688,32 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     assert len(progress_lines) == 2
     assert "progress=0.667" in progress_lines[0]
     assert "progress=1.000" in progress_lines[1]
-    assert all("s/iteration=" not in line for line in progress_lines)
-    assert "iterations/s=0.033 observations/s=0.033 episodes/s=0.017" in progress_lines[0]
-    assert "iterations/s=0.050 observations/s=0.050 episodes/s=0.000" in progress_lines[1]
+    assert all(" s/iteration=" not in line for line in progress_lines)
+    assert "iterations/s=0.033 env_steps/s=0.033 updates/s=0.033" in progress_lines[0]
+    assert "iterations/s=0.050 env_steps/s=0.050 updates/s=0.100" in progress_lines[1]
+    assert "updates/iteration=1.00" in progress_lines[0]
+    assert "updates/iteration=2.00" in progress_lines[1]
     assert not {
         "time/rollout_seconds",
         "time/rollout_env_seconds",
         "time/rollout_model_seconds",
         "time/optimization_seconds",
         "time/eta_seconds",
+        "train/rollouts_per_second",
+        "train/episodes_per_second",
+        "train/rollouts_total",
+        "train/updates_per_rollout_mean",
+        "train/elapsed_seconds",
     }.intersection(logged)
     assert "step=2 episodes=1 return=8.0 episode_length=2.0" in progress_lines[0]
     assert "step=3 episodes=1 return=n/a episode_length=n/a" in progress_lines[1]
     assert "ev=0.000" in progress_lines[0]
     assert "ev=n/a" in progress_lines[1]
     assert logged["checkpoint/save_seconds"] == [(2.5, 3)]
-    assert writer.log_metrics.call_count == 4  # Startup, two progress windows, and checkpoint timing.
+    assert logged["train/metrics_seconds"] == [(3.0, 2), (3.0, 3)]
+    assert "actor/video_seconds" not in logged
+    assert "eval/evaluation_seconds" not in logged
+    assert writer.log_metrics.call_count == 6  # Startup, two windows and their timings, checkpoint timing.
     writer.__exit__.assert_called_once()
 
 
@@ -879,16 +917,14 @@ def test_train_evaluates_final_policy(
         ("train/episodes_total", [(1.0, 2), (2.0, 4)]),
         ("train/return_mean", [(3.0, 2), (5.0, 4)]),
         ("train/episode_length_steps_mean", [(2.0, 2), (1.5, 4)]),
-        ("train/elapsed_seconds", [(first_elapsed, 2), (final_elapsed, 4)]),
-        ("train/rollouts_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
+        ("train/iterations_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
         ("train/env_steps_per_second", [(2 / first_elapsed, 2), (2 / (final_elapsed - first_elapsed), 4)]),
-        ("train/episodes_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
+        ("train/updates_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
     ):
         logged = metric_history(writer.return_value)[tag]
         assert logged == expected
     output = capsys.readouterr().out
-    assert f"elapsed=0:01:{int(first_elapsed % 60):02d}" in output
-    assert f"elapsed=0:{int(final_elapsed // 60):02d}:{int(final_elapsed % 60):02d}" in output
+    assert "elapsed=" not in output
     assert "eta=" not in output
     assert "early_stop=n/a" in output
     writer.return_value.__exit__.assert_called_once()

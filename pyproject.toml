@@ -100,6 +100,9 @@ line-length = 120
 exclude-dependencies = ["opencv-python"]
 # The toolkit leaves the JIT linker's minor version open.
 constraint-dependencies = ["nvidia-nvjitlink<13.1"]
+# JAX 0.11.2 uses NCCL 2.30.7 headers; torch 2.13 pins the older 2.29.7 runtime.
+# Share the newer NCCL 2.x runtime across both frameworks.
+override-dependencies = ["nvidia-nccl-cu13==2.30.7; sys_platform == 'linux'"]
 
 # Verifiers' renderers need Pillow 12; retain MoviePy's other bounds.
 [[tool.uv.dependency-metadata]]

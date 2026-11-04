@@ -11,13 +11,29 @@ imply rl2 integration.
 - [JaxMARL](https://github.com/bold-lab-ai/JaxMARL) — multi-agent ([registry](https://github.com/bold-lab-ai/JaxMARL/blob/main/jaxmarl/registration.py)).
   - MPE: Simple, Tag, World Comm, Spread, Crypto, Speaker Listener, Push,
     Adversary, Reference, and FACMAC predator–prey (base, 3a, 6a, 9a).
-  - Overcooked and OvercookedV2: cooperative cooking.
+  - Overcooked (`overcooked`): cooperative cooking. [Layouts](https://github.com/bold-lab-ai/JaxMARL/blob/main/jaxmarl/environments/overcooked/layouts.py):
+    `cramped_room`, `asymm_advantages`, `coord_ring`, `forced_coord`, `counter_circuit`.
+  - OvercookedV2 (`overcooked_v2`): the same five layouts plus
+    [additional layouts](https://github.com/bold-lab-ai/JaxMARL/blob/main/jaxmarl/environments/overcooked_v2/layouts.py):
+    `cramped_room_v2`, `asymm_advantages_recipes_center`, `asymm_advantages_recipes_right`,
+    `asymm_advantages_recipes_left`, `two_rooms`, `two_rooms_both`, `long_room`,
+    `fun_coordination`, `more_fun_coordination`, `fun_symmetries`, `fun_symmetries_plates`,
+    `fun_symmetries1`, `grounded_coord_simple`, `grounded_coord_ring`, `test_time_simple`,
+    `test_time_wide`, `demo_cook_simple`, `demo_cook_wide`.
   - SMAX: `SMAX`, `HeuristicEnemySMAX`, `LearnedPolicyEnemySMAX`.
+    [Scenarios](https://github.com/bold-lab-ai/JaxMARL/blob/main/jaxmarl/environments/smax/smax_env.py):
+    `3m`, `2s3z`, `25m`, `3s5z`, `8m`, `5m_vs_6m`, `10m_vs_11m`, `27m_vs_30m`,
+    `3s5z_vs_3s6z`, `3s_vs_5z`, `6h_vs_8z`, `smacv2_5_units`, `smacv2_10_units`,
+    `smacv2_20_units`.
   - Hanabi: cooperative hidden-information card game.
   - STORM: two-/multi-player spatial matrix games (`storm`, `storm_2p`, `storm_np`).
   - Coin Game: resource collection/social dilemmas.
   - Switch Riddle: communication puzzle.
   - JaxNav: multi-robot navigation/collision avoidance.
+    [Named singleton maps](https://github.com/bold-lab-ai/JaxMARL/blob/main/jaxmarl/environments/jaxnav/jaxnav_singletons.py):
+    `BlankTest`, `MiddleTest`, `BlankCross2`, `BlankCross4`, `BlankCrossUneven2`, `CircleCross`,
+    `SingleNav1`, `SingleNav2`, `SingleNav3`, `Corridor4`, `Corridor8`, `LongCorridor2`,
+    `Layby4`, `Corner2`, `Chicane2`, `Chicane4`, `NarrowChicane2a`, `NarrowChicane2b`.
   - Multi-Agent Brax: Ant, HalfCheetah, Hopper, Humanoid, Walker2d (`ant_4x2`, `halfcheetah_6x1`,
     `hopper_3x1`, `humanoid_9|8`, `walker2d_2x3`); optional Brax dependency.
   - [JaxRobotarium](https://github.com/GT-STAR-Lab/JaxRobotarium): Navigation,
@@ -65,6 +81,10 @@ imply rl2 integration.
 - [JaxUED](https://github.com/DramaCow/jaxued#supported-environments) — curriculum learning.
   - [Maze, MazeEditor, and MazeSolved](https://github.com/DramaCow/jaxued/blob/main/src/jaxued/environments/maze/__init__.py):
     navigation, curriculum editing, and solved-maze support.
+  - [Prefab maze levels](https://github.com/DramaCow/jaxued/blob/main/src/jaxued/environments/maze/level.py):
+    `TrivialMaze`, `TrivialMaze2`, `TrivialMaze3`, `SixteenRooms`, `SixteenRooms2`,
+    `Labyrinth`, `LabyrinthFlipped`, `Labyrinth2`, `StandardMaze`, `StandardMaze2`,
+    `StandardMaze3`.
   - Craftax: `CraftaxSymbolic` curriculum example.
   - Gymnax example adapters: CartPole, Acrobot, Pendulum; variable physics.
 

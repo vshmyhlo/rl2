@@ -142,7 +142,7 @@ def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Confi
     [(ppo, "configs/ppo.yaml"), (train_mappo, "configs/mappo/smax.yaml")],
     ids=["ppo", "mappo"],
 )
-def test_checkpoint_timing_includes_completed_writes(
+def test_checkpoint_timing_matches_blocking_work(
     trainer: ModuleType, config_path: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config = trainer.load_config(Path(__file__).resolve().parents[1] / config_path, trainer.Config)
@@ -164,10 +164,16 @@ def test_checkpoint_timing_includes_completed_writes(
     manager.save.side_effect = partial(advance, 2.0)
     manager.wait_until_finished.side_effect = partial(advance, 3.0)
     with patch.object(trainer, "monotonic", side_effect=lambda: clock):
-        assert trainer.save_checkpoint(manager, progress, config) == 5.0
-        assert [call[0] for call in manager.mock_calls] == ["save", "wait_until_finished"]
-        assert capsys.readouterr().out == "Saved checkpoint at iteration 2 in 5.0s\n"
-        manager.wait_until_finished.side_effect = RuntimeError("write failed")
+        if trainer is ppo:
+            assert trainer.save_checkpoint(manager, progress, config) == 2.0
+            manager.wait_until_finished.assert_not_called()
+            assert capsys.readouterr().out == "Started checkpoint at iteration 2; blocked for 2.0s\n"
+            manager.save.side_effect = RuntimeError("write failed")
+        else:
+            assert trainer.save_checkpoint(manager, progress, config) == 5.0
+            assert [call[0] for call in manager.mock_calls] == ["save", "wait_until_finished"]
+            assert capsys.readouterr().out == "Saved checkpoint at iteration 2 in 5.0s\n"
+            manager.wait_until_finished.side_effect = RuntimeError("write failed")
         with pytest.raises(RuntimeError, match="write failed"):
             trainer.save_checkpoint(manager, progress, config)
         assert capsys.readouterr().out == ""
@@ -423,11 +429,15 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         logged = metric_history(writer.return_value)
         assert logged["train/episodes_total"] == [(3.0, 3), (4.0, 4)]
         assert logged["train/env_steps_total"][-1] == (4.0, 4)
+        assert logged["train/iterations_total"] == [(3.0, 3), (4.0, 4)]
+        assert logged["train/updates_total"] == [(3.0, 3), (4.0, 4)]
+        assert logged["train/iterations_per_second"] == [(1.0, 3), (1.0, 4)]
+        assert logged["train/updates_per_second"] == [(1.0, 3), (1.0, 4)]
         assert logged["train/progress_fraction"] == [(0.75, 3), (1.0, 4)]
         assert logged["train/return_mean"] == [(1.0, 3), (1.0, 4)]
         assert logged["train/episode_length_steps_mean"] == [(1.0, 3), (1.0, 4)]
         assert [value for value, _ in logged["train/env_steps_per_second"]] == [1.0, 1.0]
-        assert logged["train/elapsed_seconds"] == [(1.0, 3), (2.0, 4)]
+        assert "train/elapsed_seconds" not in logged
         # An already completed run does not perform more updates or duplicate a save.
         ppo.train(config)
         assert iterations == [0, 1, 2, 3]

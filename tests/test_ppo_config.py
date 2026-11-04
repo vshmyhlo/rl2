@@ -239,6 +239,7 @@ def test_optional_environments_reject_invalid_settings(name: str, settings: dict
     "filename,config_class,constructor_name",
     [
         ("minatar/breakout", ppo.GymnaxConfig, "GymnaxEnv"),
+        ("minatar/space_invaders", ppo.GymnaxConfig, "GymnaxEnv"),
         ("jaxtari/breakout", ppo.JAXtariConfig, "JAXtariEnv"),
         ("foragax/square_wave_two_biome", ppo.ForagaxConfig, "ForagaxEnv"),
         ("brax/pusher", ppo.BraxConfig, "BraxEnv"),

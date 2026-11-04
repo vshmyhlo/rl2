@@ -1,21 +1,26 @@
 """Recurrent PPO with a shared observation encoder/LSTM and policy/value heads.
 
 B denotes environments, T rollout steps, O observation leaf dimensions, A discrete
-actions, D continuous action size, and H recurrent width. Sequence arrays use (B, T, ...). Minibatches preserve
-entire environment sequences. Episode ends reset memory and stop GAE traces;
-timeouts bootstrap from final observations unless the episode also terminated.
+actions, D continuous action size, and H recurrent width. Sequence arrays use
+(B, T, ...). Minibatches preserve entire environment sequences. Episode ends reset
+memory and stop GAE traces; timeouts bootstrap from final observations unless the
+episode also terminated.
 
 Training uses all devices on JAX's default backend (all visible GPUs when available).
 Parameters and optimizer state are replicated; environments and minibatches are
 sharded along B, keeping each recurrent sequence intact. num_envs is global and
 must be divisible by num_minibatches * device_count. Losses, advantage normalization,
-gradient clipping, and KL stopping use global minibatch reductions.
+gradient clipping, and KL stopping use global minibatch reductions. Advantages
+are standardized per minibatch, except single transitions retain their raw advantage.
 Training enters a jax.set_mesh context; standalone updates and train steps require
 an active mesh with a batch axis, including on CPU.
 
 total_steps and MLflow steps count environment transitions across all environments.
-Window/lifetime metrics and latest settings are logged every log_interval rollouts.
-All enabled schedules use completed rollout counts, including resumed training,
+An iteration collects one batch of num_envs * num_steps transitions and runs PPO
+epochs. An update applies gradients from one accepted minibatch; KL-rejected
+minibatches do not count as updates.
+Window/lifetime metrics and latest settings are logged every log_interval iterations.
+All enabled schedules use completed iteration counts, including resumed training,
 and also run on normal completion. No metrics have categorical suffixes.
 
 Window metrics:
@@ -26,33 +31,42 @@ Window metrics:
     train/approx_kl: Mean exp(log_ratio) - 1 - log_ratio, in nats versus rollout policy.
     train/clip_fraction: Fraction of action probability ratios outside the clip range.
         All losses/diagnostics average transitions, then evaluated minibatches,
-        including KL-rejected minibatches; total loss uses each rollout's entropy weight.
-    train/explained_variance_mean: Mean over rollouts with nonconstant returns;
+        including KL-rejected minibatches; total loss uses each iteration's entropy weight.
+    train/explained_variance_mean: Mean over iterations with nonconstant returns;
         omitted if none are defined.
-    train/updates_per_rollout_mean, train/kl_early_stop_fraction: Accepted updates
-        and KL stop frequency, averaged over rollouts; omit stops when disabled.
+    train/updates_per_iteration_mean, train/kl_early_stop_fraction: Accepted updates
+        and KL stop frequency, averaged over iterations; omit stops when disabled.
     rollout/episode_count, rollout/return_mean, rollout/episode_length_steps_mean:
         Completed episodes and their raw return/length means; omit unavailable means.
-    train/rollouts_per_second, train/env_steps_per_second, train/episodes_per_second:
-        Window throughput, including intervening logging, playback, and checkpoints.
+    train/iterations_per_second, train/env_steps_per_second, train/updates_per_second:
+        Completed batches, environment transitions across all environments, and
+        accepted minibatch updates divided by window wall seconds, respectively.
+        Includes collection, optimization, and intervening logging, evaluation,
+        playback, and checkpoints. Zero accepted updates yields zero updates/second.
 
 Lifetime metrics:
-    train/rollouts_total, train/updates_total, train/episodes_total, train/env_steps_total:
-        Completed rollout, accepted update, episode, and environment transition counts.
+    train/iterations_total, train/updates_total, train/episodes_total, train/env_steps_total:
+        Completed iteration, accepted update, episode, and environment transition counts.
     train/return_mean, train/episode_length_steps_mean: Raw return and length means
         over all completed episodes; omitted before the first completion.
-    train/progress_fraction: Fraction of planned rollouts completed.
+    train/progress_fraction: Fraction of planned iterations completed.
         Lifetime counters and episode sums include restored checkpoint history.
 
 Latest settings and session timings:
-    train/learning_rate, train/entropy_coef: Latest rollout's scheduled settings.
-    train/elapsed_seconds: Wall time from loop startup to the current progress log,
-        including playback and prior checkpoints; resets on resume.
-    actor/video_seconds, eval/evaluation_seconds, checkpoint/save_seconds:
-        Seconds from operation entry through video encoding/upload, evaluation
-        gameplay/report uploads, or completed checkpoint writes, respectively.
-        Logged after each operation at video_interval, eval_interval, or
-        checkpoint_interval rollouts; omitted when the operation does not run.
+    train/learning_rate, train/entropy_coef: Latest iteration's scheduled settings.
+    actor/video_seconds, eval/evaluation_seconds: Wall seconds for gameplay through
+        video encoding/upload, or evaluation through gameplay/report uploads.
+        Logged per operation at video_interval or eval_interval iterations;
+        omitted when the operation does not run. Excludes logging the timing itself.
+    checkpoint/save_seconds: Blocking wall seconds to prepare and submit an async
+        checkpoint, including any wait for a previous save inside manager.save.
+        Excludes background writes and the final drain at manager close. Logged per
+        save at checkpoint_interval iterations; omitted when no save runs.
+    train/metrics_seconds: Wall seconds from collecting window metrics on the host
+        through scalar reduction, metric logging, progress printing, and window reset.
+        Includes the required device-to-host wait; adds no timing-only synchronization.
+        Logged after each log_interval window (also the final window), at the same
+        environment step; excludes logging this timing itself. No window means omitted.
     model/params_millions: Parameter count at startup, including resume.
 
 Evaluation uses fixed seeds and logs raw episode return mean, sample standard
@@ -67,7 +81,7 @@ Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
 model/parameter_count/<step>.txt, eval/report/<step>.json, gameplay/<step>.mp4,
 and eval/gameplay/<step>.mp4. Config parameters use dotted keys; existing values
 are preserved on resume. Checkpoints retain parameters, optimizer state, RNG,
-completed rollouts, and episode totals. Live environments and recurrent memory
+completed iterations, and episode totals. Live environments and recurrent memory
 restart on resume; unfinished episode statistics are discarded.
 """
 
@@ -77,8 +91,6 @@ import os
 from collections.abc import Callable
 from contextlib import ExitStack, closing
 from dataclasses import asdict, fields
-from datetime import timedelta
-from functools import partial
 from math import sqrt
 from operator import itemgetter
 from pathlib import Path
@@ -429,12 +441,12 @@ def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
         directory = str(Path(directory).resolve())
     return ocp.CheckpointManager(
         directory,
-        options=ocp.CheckpointManagerOptions(max_to_keep=2),
+        options=ocp.CheckpointManagerOptions(max_to_keep=2, enable_async_checkpointing=True),
     )
 
 
 def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, config: Config) -> float:
-    """Wait for a completed rollout checkpoint to finish saving and return elapsed seconds."""
+    """Submit an async checkpoint and return the blocking preparation/submission seconds."""
     started = monotonic()
     key_data = jax.random.key_data(progress.key)  # (K,) raw PRNG words
     manager.save(
@@ -454,9 +466,8 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
         ),
         force=True,
     )
-    manager.wait_until_finished()
     seconds = monotonic() - started
-    print(f"Saved checkpoint at iteration {progress.rollout_count} in {seconds:.1f}s", flush=True)
+    print(f"Started checkpoint at iteration {progress.rollout_count}; blocked for {seconds:.1f}s", flush=True)
     return seconds
 
 
@@ -656,23 +667,6 @@ class ActorCritic(nn.Module):
         return ActorCriticOutput(carry=model_carry, policy=policy, values=values)
 
 
-@partial(jax.jit, static_argnames="apply_fn")
-def sample_policy_step(
-    apply_fn: Callable[..., ActorCriticOutput],
-    params: optax.Params,
-    observations: Observation,  # leaves: (B, *O)
-    carry: RecurrentCarry,  # leaves: (B, H)
-    episode_starts: jax.Array,  # (B,)
-    key: jax.Array,  # () typed PRNG key
-) -> tuple[RecurrentCarry, jax.Array]:  # carry leaves: (B, H); actions: (B, *action_shape)
-    """Compile inference and sampling together; reuse across playback steps and episodes."""
-    carry, policy, _ = apply_fn(
-        {"params": params}, observations, carry, episode_starts, method="step"
-    )  # carry leaves: (B, H); policy leaves: (B, A/D); values: (B,)
-    # Eager Beta sampling rebuilds and recompiles rejection loops on every call.
-    return carry, policy.sample(seed=key)  # carry leaves: (B, H); actions: (B, *action_shape)
-
-
 type EpisodeState = PlaybackState[Observation, Any, RecurrentCarry]
 
 
@@ -682,15 +676,16 @@ def playback_step(
     params: optax.Params,
     state: EpisodeState,  # observation/state/memory leaves as in PlaybackState
 ) -> EpisodeState:
+    """Advance one step inside finish_episode's compiled playback loop."""
     key, action_key, env_key = jax.random.split(state.key, 3)  # each () typed PRNG key
-    memory, actions = sample_policy_step(
-        apply_fn,
-        params,
+    memory, policy, _ = apply_fn(
+        {"params": params},
         jax.tree.map(lambda x: x[None], state.observation),
         state.memory,
         state.episode_starts,
-        action_key,
-    )  # memory leaves: (1, H); actions: (1, *action_shape)
+        method="step",
+    )  # memory leaves: (1, H); policy leaves: (1, A/D); values: (1,)
+    actions = policy.sample(seed=action_key)  # (1, *action_shape)
     observation, env_state, reward, done, info = env.step(env_key, state.env_state, actions[0], env.params)
     # observation: (*O,); state leaves: (...); reward/done: ()
     return state._replace(
@@ -840,7 +835,9 @@ def update(
     chex.assert_scalar_positive(advantages.size)
     # Centering a single sample always gives zero and erases its policy gradient.
     if advantages.size > 1:
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # (*S,)
+        # Equal fractional values can round to a different mean in float32.
+        tied = jnp.all(advantages == advantages.reshape(-1)[0])  # ()
+        advantages = jnp.where(tied, 0.0, (advantages - advantages.mean()) / (advantages.std() + 1e-8))  # (*S,)
 
     def loss_fn(params: optax.Params) -> tuple[jax.Array, MinibatchMetrics]:  # (); scalar metric leaves
         _, policy, values = train_state.apply_fn(
@@ -1220,7 +1217,7 @@ def train(config: Config) -> TrainState:
         )
         rollout_carry = jax.device_put(rollout_carry, batched)  # leaves: (B, ...)
 
-        start = window_start = monotonic()
+        window_start = monotonic()
         window_start_step_count = initial_step_count
         planned_rollout_count = config.total_steps // batch_size
         for rollout_index in range(start_rollout_index, planned_rollout_count):
@@ -1251,6 +1248,7 @@ def train(config: Config) -> TrainState:
                     env=envs,
                 )
             if rollout_count % config.log_interval == 0 or is_final_rollout:
+                metrics_started = monotonic()
                 # Synchronize the window before measuring throughput.
                 window, total = jax.device_get(metrics)  # scalar leaves
                 now = monotonic()
@@ -1259,17 +1257,16 @@ def train(config: Config) -> TrainState:
                     field.name: float(getattr(window.minibatch_metrics, field.name)) / int(window.minibatch_count)
                     for field in fields(MinibatchMetrics)
                 }
-                window_rollout_count = int(window.rollout_count)
+                window_iteration_count = int(window.rollout_count)
+                window_update_count = int(window.update_count)
                 window_episode_count = int(window.episodes.episode_count)
                 episode_count = int(total.episode_count)
                 learning_rate = float(lr_schedule(rollout_index))
                 entropy_coef = float(entropy_schedule(rollout_index))
                 rate_seconds = max(window_seconds, 1e-9)
                 sps = (step_count - window_start_step_count) / rate_seconds
-                # Include evaluation/video overhead in this session's elapsed time.
-                elapsed_seconds = now - start
                 scalars: dict[str, float | int] = {
-                    "train/updates_per_rollout_mean": int(window.update_count) / window_rollout_count,
+                    "train/updates_per_iteration_mean": window_update_count / window_iteration_count,
                     "train/policy_loss": mean_metrics["policy_loss"],
                     "train/value_loss": mean_metrics["value_loss"],
                     "train/entropy_loss": -mean_metrics["entropy"],
@@ -1279,21 +1276,20 @@ def train(config: Config) -> TrainState:
                     "train/entropy": mean_metrics["entropy"],
                     "train/approx_kl": mean_metrics["approx_kl"],
                     "train/clip_fraction": mean_metrics["clip_fraction"],
-                    "train/rollouts_per_second": window_rollout_count / rate_seconds,
+                    "train/iterations_per_second": window_iteration_count / rate_seconds,
                     "train/env_steps_per_second": sps,
-                    "train/episodes_per_second": window_episode_count / rate_seconds,
+                    "train/updates_per_second": window_update_count / rate_seconds,
                     "train/learning_rate": learning_rate,
                     "train/entropy_coef": entropy_coef,
                     "train/episodes_total": episode_count,
                     "train/env_steps_total": step_count,
-                    "train/rollouts_total": rollout_count,
+                    "train/iterations_total": rollout_count,
                     "train/updates_total": int(train_state.step),
                     "train/progress_fraction": rollout_count / planned_rollout_count,
                     "rollout/episode_count": window_episode_count,
-                    "train/elapsed_seconds": elapsed_seconds,
                 }
                 if config.target_kl is not None:
-                    scalars["train/kl_early_stop_fraction"] = int(window.early_stop_count) / window_rollout_count
+                    scalars["train/kl_early_stop_fraction"] = int(window.early_stop_count) / window_iteration_count
                 if window.explained_variance_count:
                     scalars["train/explained_variance_mean"] = float(window.explained_variance_sum) / int(
                         window.explained_variance_count
@@ -1321,22 +1317,22 @@ def train(config: Config) -> TrainState:
                     f"iteration={rollout_count} step={step_count} episodes={episode_count} return={episode_return_text} "
                     f"episode_length={episode_length_text} "
                     f"progress={scalars['train/progress_fraction']:.3f} "
-                    f"iterations/s={scalars['train/rollouts_per_second']:.3f} "
-                    f"observations/s={sps:.3f} episodes/s={scalars['train/episodes_per_second']:.3f} "
+                    f"iterations/s={scalars['train/iterations_per_second']:.3f} "
+                    f"env_steps/s={sps:.3f} updates/s={scalars['train/updates_per_second']:.3f} "
                     f"lr={learning_rate:.3g} "
                     f"policy={mean_metrics['policy_loss']:.3f} value={mean_metrics['value_loss']:.3f} "
                     f"entropy={mean_metrics['entropy']:.3f} kl={mean_metrics['approx_kl']:.4f} "
                     f"clipfrac={mean_metrics['clip_fraction']:.3f} ev={variance_text} "
-                    f"updates={scalars['train/updates_per_rollout_mean']:.2f} "
+                    f"updates/iteration={scalars['train/updates_per_iteration_mean']:.2f} "
                     f"early_stop={early_stop_text} "
-                    f"window={window_seconds:.1f}s "
-                    f"elapsed={timedelta(seconds=int(elapsed_seconds))}",
+                    f"window={window_seconds:.1f}s",
                     flush=True,
                 )
                 window_start = now
                 window_start_step_count = step_count
                 with jax.enable_x64():
                     metrics = metrics._replace(window=RunningSum.init(metrics.window))  # scalar leaves
+                writer.log_metrics({"train/metrics_seconds": monotonic() - metrics_started}, step_count)
             if rollout_count % config.checkpoint_interval == 0 or is_final_rollout:
                 checkpoint_seconds = save_checkpoint(
                     manager,

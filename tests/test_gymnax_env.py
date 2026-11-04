@@ -1,4 +1,5 @@
 import chex
+import gymnax
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -7,26 +8,32 @@ import pytest
 from rl2.envs import EnvStep
 from rl2.envs.gymnax_env import GymnaxEnv, render_observation
 
+pytestmark = pytest.mark.filterwarnings("error:scatter inputs have incompatible types:FutureWarning")
 
-def test_single_reset_step_preserves_native_observations() -> None:
-    env = GymnaxEnv("Breakout-MinAtar")
+
+@pytest.mark.parametrize("env_id,channels,actions", [("Breakout-MinAtar", 4, 3), ("SpaceInvaders-MinAtar", 6, 4)])
+def test_single_reset_step_preserves_native_observations(env_id: str, channels: int, actions: int) -> None:
+    env = GymnaxEnv(env_id)
     params = env.params.replace(max_steps_in_episode=1)
     key = jax.random.key(5)  # ()
-    observation, state = env.reset(key, params)  # (10,10,4); leaves: (...)
-    raw, raw_state = env.env.reset(key, params)  # (10,10,4); leaves: (...)
+    observation, state = env.reset(key, params)  # (10,10,C); leaves: (...)
+    native_env, _ = gymnax.make(env_id)
+    # Gymnax 0.0.9 warns while constructing the same native observation.
+    with pytest.warns(FutureWarning, match="scatter inputs have incompatible types"):
+        raw, raw_state = native_env.reset(key, params)  # (10,10,C); leaves: (...)
     chex.assert_trees_all_equal(state, raw_state)
     np.testing.assert_array_equal(observation, raw)
-    assert observation.shape == (10, 10, 4) and observation.dtype == jnp.float32
-    assert env.action_space.n == 3
+    assert observation.shape == (10, 10, channels) and observation.dtype == jnp.float32
+    assert env.action_space.n == actions
     action = jnp.array(2)  # () native action ID
     native = env.env.step_env(jax.random.split(key)[0], state, action, params.replace(max_steps_in_episode=2**31 - 1))
-    result = env.step(key, state, action, params)  # observation: (10,10,4); state leaves: (...); reward/done: ()
+    result = env.step(key, state, action, params)  # observation: (10,10,C); state leaves: (...); reward/done: ()
     assert isinstance(result, EnvStep)
-    observation, state, reward, done, info = result
+    observation, state, reward, done, info = result  # (10,10,C); leaves: (...); scalars: ()
     assert result.observation is observation and result.state is state
     assert result.reward is reward and result.done is done and result.info is info
-    # observation/final_observation: (10,10,4); reward/done/flags: (); state leaves: (...)
-    assert observation.shape == info["final_observation"].shape == (10, 10, 4)
+    # observation/final_observation: (10,10,C); reward/done/flags: (); state leaves: (...)
+    assert observation.shape == info["final_observation"].shape == (10, 10, channels)
     chex.assert_shape((reward, done, info["terminated"], info["truncated"], state.time), ())
     assert bool(done) and bool(info["truncated"]) and not bool(info["terminated"])
     assert int(state.time) == 0
@@ -63,6 +70,25 @@ def test_terminal_timeout_both_and_partial_autoreset() -> None:
     np.testing.assert_array_equal(next_observations[3], info["final_observation"][3])
     assert not np.array_equal(next_observations[0], info["final_observation"][0])
     assert rewards.shape == (4,)
+
+
+def test_space_invaders_batched_collision_and_fire() -> None:
+    env = GymnaxEnv("SpaceInvaders-MinAtar")
+    keys = jax.random.split(jax.random.key(0), 2)  # (B=2,)
+    _, state = jax.vmap(env.reset, in_axes=(0, None))(keys, env.params)  # (B,10,10,6); leaves: (B,...)
+    state = state.replace(e_bullet_map=state.e_bullet_map.at[0, 8, 5].set(1))  # leaves: (B,...)
+    result = env.step_batch(keys, state, jnp.full(2, 3, jnp.int32), env.params)  # observation: (B,10,10,6)
+    assert result.observation.shape == result.info["final_observation"].shape == (2, 10, 10, 6)
+    assert result.reward.shape == (2,)
+    np.testing.assert_array_equal(result.done, [True, False])
+    np.testing.assert_array_equal(result.info["terminated"], [True, False])
+    np.testing.assert_array_equal(result.info["truncated"], [False, False])
+    np.testing.assert_array_equal(result.state.time, [0, 1])
+    # Firing creates a friendly bullet; the incoming enemy bullet survives in the final observation.
+    np.testing.assert_array_equal(result.info["final_observation"][:, 8, 5, 4], [1, 1])
+    assert result.info["final_observation"][0, 9, 5, 5] == 1
+    frame = env.render_observation(result.info["final_observation"][0])  # (160,160,3)
+    np.testing.assert_array_equal(frame[8 * 16, 5 * 16], [80, 255, 80])
 
 
 def test_rejects_non_native_environment() -> None:
