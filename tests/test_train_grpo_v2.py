@@ -1148,7 +1148,7 @@ def test_learner_pulls_groups_through_batcher(
         group_size=3,
         context_length=8,
         iteration=iteration,
-        weight_version=0,
+        consumption_weight_version=0,
         include_examples=include_examples,
     )
     assert actor.fetch_next_group.remote.call_count == num_groups
@@ -1313,6 +1313,8 @@ def test_learner_cancels_prefetch_on_update_failure(
     learner.publish_weights = Mock()
     batch = training.build_rollout_batch(
         groups=[training.RolloutGroup(task_id="0", rollouts=[rollout] * 4, taskset_id="test")],
+        consumption_weight_version=0,
+        max_staleness=learner.config.max_staleness,
         training_batch=Mock(
             spec=training.GRPOBatch,
             attention_mask=np.ones((4, 2), dtype=np.bool_),  # (B=4, T=2)
@@ -1326,7 +1328,12 @@ def test_learner_cancels_prefetch_on_update_failure(
 
     def optimize(batch: training.GRPOBatch[np.ndarray]) -> dict[str, float]:
         learner.batcher.fetch_next_batch.remote.assert_called_once_with(
-            num_groups=1, group_size=4, context_length=8, iteration=1, weight_version=0, include_examples=False
+            num_groups=1,
+            group_size=4,
+            context_length=8,
+            iteration=1,
+            consumption_weight_version=0,
+            include_examples=False,
         )
         raise RuntimeError("update failed")
 
@@ -1494,7 +1501,7 @@ def test_batch_skipped_groups_follow_prefetched_groups(rollout: training.Rollout
 
 
 @pytest.mark.parametrize(
-    ("max_staleness", "weight_version", "sampled_version", "complete_before_fetch", "masked"),
+    ("max_staleness", "consumption_weight_version", "sampled_version", "complete_before_fetch", "masked"),
     [
         pytest.param(8, 8, 0, True, False, id="inclusive-limit"),
         pytest.param(8, 9, 0, True, True, id="too-stale"),
@@ -1505,7 +1512,7 @@ def test_batch_skipped_groups_follow_prefetched_groups(rollout: training.Rollout
 )
 def test_batch_masks_stale_prefetched_tokens(
     max_staleness: int,
-    weight_version: int,
+    consumption_weight_version: int,
     sampled_version: int,
     complete_before_fetch: bool,
     masked: bool,
@@ -1575,7 +1582,7 @@ def test_batch_masks_stale_prefetched_tokens(
                     group_size=2,
                     context_length=8,
                     iteration=2,
-                    weight_version=weight_version,
+                    consumption_weight_version=consumption_weight_version,
                     include_examples=True,
                 )
             )
@@ -1590,6 +1597,9 @@ def test_batch_masks_stale_prefetched_tokens(
             assert "task=1 |" in batch.examples
             assert batch.rollout_metrics["batcher/stale_tokens"] == 2 * int(masked)
             assert batch.rollout_metrics["batcher/stale_transcript_token_fraction"] == 0.5 * masked
+            age = "older" if masked else str(consumption_weight_version - sampled_version)
+            assert batch.rollout_metrics[f"batcher/weight_age_transcript_token_fraction/{age}"] == 0.5
+            assert batch.rollout_metrics[f"batcher/weight_age_masked_transcript_token_fraction/{age}"] == 0.5 * masked
             assert int(batch.training_batch.loss_mask.sum()) == (0 if masked else 2)
             np.testing.assert_array_equal(batch.training_batch.attention_mask[:, :2], True)
             np.testing.assert_array_equal(batch.training_batch.advantages, 0.5)
@@ -1629,7 +1639,9 @@ def test_degenerate_retry_masks_actual_token_versions(rollout: training.Rollout)
         async with asyncio.timeout(5), asyncio.TaskGroup() as tg:
             await batcher.fetch_next_batch(num_groups=1, group_size=2, context_length=8)
             second = tg.create_task(
-                batcher.fetch_next_batch(num_groups=1, group_size=2, context_length=8, iteration=2, weight_version=1)
+                batcher.fetch_next_batch(
+                    num_groups=1, group_size=2, context_length=8, iteration=2, consumption_weight_version=1
+                )
             )
             await asyncio.sleep(0)
             pending.set_result(degenerate)
@@ -1686,24 +1698,27 @@ def test_batch_failure_cancels_pending_fetches(
 
 
 @pytest.mark.parametrize(
-    ("weight_version", "max_staleness", "masked_versions", "stale_fraction"),
+    ("consumption_weight_version", "max_staleness", "version_offset", "age_fractions"),
     [
-        pytest.param(4, 3, (), 0.0, id="all-sampled-unmasked"),
-        pytest.param(4, 1, (1,), 0.2, id="mixed-at-staleness-boundary"),
-        pytest.param(6, 1, (1, 3, 4), 0.6, id="all-sampled-masked"),
+        pytest.param(4, 3, 0, {"0": 0.1, "1": 0.3, "3": 0.2}, id="all-sampled-unmasked"),
+        pytest.param(4, 1, 0, {"0": 0.1, "1": 0.3, "older": 0.2}, id="mixed-at-staleness-boundary"),
+        pytest.param(6, 1, 0, {"older": 0.6}, id="all-sampled-masked"),
+        pytest.param(4, 0, 0, {"0": 0.1, "older": 0.5}, id="current-weights-only"),
+        pytest.param(10004, 1, 10000, {"0": 0.1, "1": 0.3, "older": 0.2}, id="absolute-version-independent"),
     ],
 )
-def test_batch_weight_version_token_fractions(
+def test_batch_weight_age_token_fractions(
     rollout: training.Rollout,
-    weight_version: int,
+    consumption_weight_version: int,
     max_staleness: int,
-    masked_versions: tuple[int, ...],
-    stale_fraction: float,
+    version_offset: int,
+    age_fractions: dict[str, float],
 ) -> None:
     rollouts = []
     for versions in ((-1, 1, 1, -1, 3, -1, 4), (-1, 3, 3)):
         weight_versions = np.asarray(versions, dtype=np.int32)  # (L,) includes interleaved context.
         mask = weight_versions >= 0  # (L,)
+        weight_versions[mask] += version_offset  # (S,) sampled tokens only.
         rollouts.append(
             replace(
                 rollout,
@@ -1721,25 +1736,31 @@ def test_batch_weight_version_token_fractions(
     batcher = training.Batcher.__ray_metadata__.modified_class(
         actor=Mock(), config=training.Config(max_staleness=max_staleness, padding_multiple=4)
     )
-    prepared = batcher.prepare_batch(groups, context_length=8, weight_version=weight_version)  # (B=2, T=8) leaves.
+    prepared = batcher.prepare_batch(
+        groups, context_length=8, consumption_weight_version=consumption_weight_version
+    )  # (B=2, T=8) leaves.
     assert prepared.loss_mask.shape == (2, 8)
-    batch = training.build_rollout_batch(groups=groups, training_batch=prepared, timing_metrics={})
+    batch = training.build_rollout_batch(
+        groups=groups,
+        training_batch=prepared,
+        timing_metrics={},
+        consumption_weight_version=consumption_weight_version,
+        max_staleness=max_staleness,
+    )
     metrics = batch.rollout_metrics
+    stale_fraction = age_fractions.get("older", 0.0)
     assert metrics["batcher/context_transcript_token_fraction"] == 0.4
     assert metrics["batcher/stale_transcript_token_fraction"] == stale_fraction
     assert metrics["batcher/masked_transcript_token_fraction"] == pytest.approx(0.4 + stale_fraction)
     assert metrics["batcher/unmasked_transcript_token_fraction"] == pytest.approx(0.6 - stale_fraction)
     assert "batcher/stale_token_fraction" not in metrics
     expected = {}
-    for version, fraction in ((1, 0.2), (3, 0.3), (4, 0.1)):
-        expected[f"batcher/weight_version_transcript_token_fraction/{version}"] = fraction
-        expected[f"batcher/weight_version_masked_transcript_token_fraction/{version}"] = (
-            fraction if version in masked_versions else 0.0
-        )
-        expected[f"batcher/weight_version_unmasked_transcript_token_fraction/{version}"] = (
-            0.0 if version in masked_versions else fraction
-        )
-    actual = {name: value for name, value in batch.rollout_metrics.items() if name.startswith("batcher/weight_version")}
+    for age, fraction in age_fractions.items():
+        expected[f"batcher/weight_age_transcript_token_fraction/{age}"] = fraction
+        expected[f"batcher/weight_age_masked_transcript_token_fraction/{age}"] = fraction if age == "older" else 0.0
+        expected[f"batcher/weight_age_unmasked_transcript_token_fraction/{age}"] = 0.0 if age == "older" else fraction
+    assert not any(name.startswith("batcher/weight_version") for name in metrics)
+    actual = {name: value for name, value in batch.rollout_metrics.items() if name.startswith("batcher/weight_age")}
     assert actual == pytest.approx(expected)
     assert sum(value for name, value in actual.items() if "_masked_" in name) == pytest.approx(
         metrics["batcher/stale_transcript_token_fraction"]
@@ -1764,7 +1785,13 @@ def test_batch_taskset_reward_means(rollout: training.Rollout) -> None:
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=Mock())
     prepared = batcher.prepare_batch(groups, context_length=8)  # (B=8, T=8), (B=8,) leaves.
     assert prepared.token_ids.shape == (8, 8)
-    batch = training.build_rollout_batch(groups=groups, training_batch=prepared, timing_metrics={})
+    batch = training.build_rollout_batch(
+        groups=groups,
+        training_batch=prepared,
+        timing_metrics={},
+        consumption_weight_version=0,
+        max_staleness=batcher.config.max_staleness,
+    )
     assert {
         name: value for name, value in batch.rollout_metrics.items() if name.startswith("rollout/reward_mean/")
     } == {"rollout/reward_mean/easy": pytest.approx(1 / 3), "rollout/reward_mean/hard": 0.0}
@@ -1813,11 +1840,11 @@ def test_batch_timings_and_order_survive_serialization(
     event_loop_thread = threading.get_ident()
 
     def prepare(
-        groups: list[training.RolloutGroup], context_length: int, *, weight_version: int
+        groups: list[training.RolloutGroup], context_length: int, *, consumption_weight_version: int
     ) -> training.GRPOBatch[np.ndarray]:
         assert threading.get_ident() != event_loop_thread
         batch = prepare_batch(
-            groups, context_length=context_length, weight_version=weight_version
+            groups, context_length=context_length, consumption_weight_version=consumption_weight_version
         )  # (B, T), (B,) leaves.
         clock.return_value += 2.0
         return batch  # (B, T), (B,) leaves.
@@ -2027,16 +2054,33 @@ def test_learner_logs_rollouts(
         groups=batch,
         training_batch=prepared,
         timing_metrics=timing_metrics,
+        consumption_weight_version=1,
+        max_staleness=0,
         skipped_groups=3,
     )
     prepared.loss_mask[:, 1] = True  # (B=4,) fresh sampled tokens.
     next_batch = training.build_rollout_batch(
         groups=[
-            replace(group, rollouts=[replace(rollout, stop_condition="environment_done") for rollout in group.rollouts])
+            replace(
+                group,
+                rollouts=[
+                    replace(
+                        rollout,
+                        stop_condition="environment_done",
+                        sequence=replace(
+                            rollout.sequence,
+                            weight_versions=np.array([-1, 1], dtype=np.int32),  # (T=2,)
+                        ),
+                    )
+                    for rollout in group.rollouts
+                ],
+            )
             for group in batch
         ],
         training_batch=prepared,
         timing_metrics=timing_metrics,
+        consumption_weight_version=1,
+        max_staleness=0,
     )
     learner.fetch_next_batch.side_effect = [received, RuntimeError("done") if fails else next_batch]
     learner.publish_weights = steps.publish
@@ -2144,9 +2188,9 @@ def test_learner_logs_rollouts(
         "batcher/stale_transcript_token_fraction": 0.5,
         "batcher/masked_transcript_token_fraction": 1.0,
         "batcher/unmasked_transcript_token_fraction": 0.0,
-        "batcher/weight_version_transcript_token_fraction/0": 0.5,
-        "batcher/weight_version_masked_transcript_token_fraction/0": 0.5,
-        "batcher/weight_version_unmasked_transcript_token_fraction/0": 0.0,
+        "batcher/weight_age_transcript_token_fraction/older": 0.5,
+        "batcher/weight_age_masked_transcript_token_fraction/older": 0.5,
+        "batcher/weight_age_unmasked_transcript_token_fraction/older": 0.0,
         "train/iterations_total": 1,
         "train/updates_total": 1,
         "train/learning_rate": learner.config.learning_rate * 2,
@@ -2170,9 +2214,9 @@ def test_learner_logs_rollouts(
         assert calls[2].args[0]["batcher/stale_transcript_token_fraction"] == 0.0
         assert calls[2].args[0]["batcher/masked_transcript_token_fraction"] == 0.5
         assert calls[2].args[0]["batcher/unmasked_transcript_token_fraction"] == 0.5
-        assert calls[2].args[0]["batcher/weight_version_transcript_token_fraction/0"] == 0.5
-        assert calls[2].args[0]["batcher/weight_version_masked_transcript_token_fraction/0"] == 0.0
-        assert calls[2].args[0]["batcher/weight_version_unmasked_transcript_token_fraction/0"] == 0.5
+        assert calls[2].args[0]["batcher/weight_age_transcript_token_fraction/0"] == 0.5
+        assert calls[2].args[0]["batcher/weight_age_masked_transcript_token_fraction/0"] == 0.0
+        assert calls[2].args[0]["batcher/weight_age_unmasked_transcript_token_fraction/0"] == 0.5
         assert {key: value for key, value in calls[2].args[0].items() if "stop_fraction/" in key} == {
             "rollout/stop_fraction/agent_completed": 0.0,
             "rollout/stop_fraction/max_tokens": 0.0,
@@ -2498,7 +2542,7 @@ def test_learner_logs_examples_at_configured_interval(
         context_length: int,
         *,
         iteration: int,
-        weight_version: int,
+        consumption_weight_version: int,
         include_examples: bool,
     ) -> training.RolloutBatch:
         batch = asyncio.run(
@@ -2507,7 +2551,7 @@ def test_learner_logs_examples_at_configured_interval(
                 group_size=group_size,
                 context_length=context_length,
                 iteration=iteration,
-                weight_version=weight_version,
+                consumption_weight_version=consumption_weight_version,
                 include_examples=include_examples,
             )
         )

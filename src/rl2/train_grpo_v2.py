@@ -52,12 +52,13 @@ Rollout batch scalars:
     batcher/stale_transcript_token_fraction: Stale sampled tokens divided by all non-padding transcript tokens.
     batcher/masked_transcript_token_fraction: Context plus stale sampled tokens divided by all non-padding transcript tokens.
     batcher/unmasked_transcript_token_fraction: Tokens retained by the loss mask divided by all non-padding transcript tokens.
-    batcher/weight_version_transcript_token_fraction/<version>: Sampled tokens from this version divided by all non-padding transcript tokens.
-    batcher/weight_version_masked_transcript_token_fraction/<version>: Masked sampled tokens from this version divided by all non-padding transcript tokens.
-    batcher/weight_version_unmasked_transcript_token_fraction/<version>: Unmasked sampled tokens from this version divided by all non-padding transcript tokens.
+    batcher/weight_age_transcript_token_fraction/<age>: Sampled tokens in this age bucket divided by all non-padding transcript tokens.
+    batcher/weight_age_masked_transcript_token_fraction/<age>: Masked sampled tokens in this age bucket divided by all non-padding transcript tokens.
+    batcher/weight_age_unmasked_transcript_token_fraction/<age>: Unmasked sampled tokens in this age bucket divided by all non-padding transcript tokens.
 Context, stale, and unmasked fractions sum to one; masked is context plus stale.
 Unmasked tokens may have zero advantages. Context tokens have no generating weight version.
-Weight-version metrics omit absent versions and retain measured zeros for present versions.
+Age is publications behind the version at batch consumption: 0 through max_staleness, then older.
+Weight-age metrics omit absent buckets and retain measured zeros for present buckets.
 All StopCondition labels are logged each iteration, including zero for absent labels.
 
 Training progress and settings:
@@ -436,6 +437,8 @@ def build_rollout_batch(
     training_batch: GRPOBatch[np.ndarray],  # Leaves: (B, T), except advantages: (B,).
     timing_metrics: dict[str, float | int],
     *,
+    consumption_weight_version: int,
+    max_staleness: int,
     include_examples: bool = False,
     skipped_groups: int = 0,
     latest_examples: dict[str, RolloutGroup] | None = None,
@@ -454,24 +457,26 @@ def build_rollout_batch(
     transcript_tokens = int(training_batch.attention_mask.sum())
     unmasked_tokens = int(training_batch.loss_mask.sum())
     stale_tokens = sampled_tokens - unmasked_tokens
-    version_counts: Counter[int] = Counter()
-    unmasked_version_counts: Counter[int] = Counter()
+    age_counts: Counter[int] = Counter()
+    unmasked_age_counts: Counter[int] = Counter()
     for index, rollout in enumerate(rollouts):
         sequence = rollout.sequence
+        token_ages = np.minimum(consumption_weight_version - sequence.weight_versions, max_staleness + 1)  # (L,)
         unmasked = training_batch.loss_mask[index, : len(sequence.token_ids)]  # (L,) unpadded transcript.
         for mask, counts in (
-            (sequence.loss_mask, version_counts),
-            (sequence.loss_mask & unmasked, unmasked_version_counts),
+            (sequence.loss_mask, age_counts),
+            (sequence.loss_mask & unmasked, unmasked_age_counts),
         ):
-            versions, token_counts = np.unique(sequence.weight_versions[mask], return_counts=True)  # (V,)
-            counts.update({int(version): int(count) for version, count in zip(versions, token_counts, strict=True)})
-    version_metrics = {
-        f"batcher/weight_version{suffix}_transcript_token_fraction/{version}": count / transcript_tokens
-        for version, total in version_counts.items()
+            ages, token_counts = np.unique(token_ages[mask], return_counts=True)  # (A,) observed age buckets.
+            counts.update({int(age): int(count) for age, count in zip(ages, token_counts, strict=True)})
+    age_metrics = {
+        f"batcher/weight_age{suffix}_transcript_token_fraction/{age if age <= max_staleness else 'older'}": count
+        / transcript_tokens
+        for age, total in age_counts.items()
         for suffix, count in (
             ("", total),
-            ("_masked", total - unmasked_version_counts[version]),
-            ("_unmasked", unmasked_version_counts[version]),
+            ("_masked", total - unmasked_age_counts[age]),
+            ("_unmasked", unmasked_age_counts[age]),
         )
     }
     return RolloutBatch(
@@ -499,7 +504,7 @@ def build_rollout_batch(
             "batcher/stale_transcript_token_fraction": stale_tokens / transcript_tokens,
             "batcher/masked_transcript_token_fraction": (transcript_tokens - unmasked_tokens) / transcript_tokens,
             "batcher/unmasked_transcript_token_fraction": unmasked_tokens / transcript_tokens,
-            **version_metrics,
+            **age_metrics,
             "actor/rollout_seconds_mean": mean(rollout.rollout_seconds for rollout in rollouts),
         },
         stop_counts=Counter(rollout.stop_condition for rollout in rollouts),
@@ -914,7 +919,7 @@ class Batcher:
         self._latest_examples: dict[str, RolloutGroup] = {}
 
     def prepare_batch(
-        self, groups: list[RolloutGroup], context_length: int, *, weight_version: int = 0
+        self, groups: list[RolloutGroup], context_length: int, *, consumption_weight_version: int = 0
     ) -> GRPOBatch[np.ndarray]:
         """Flatten rollout groups in order and right-pad their transcripts into NumPy arrays.
 
@@ -959,7 +964,7 @@ class Batcher:
                 raise ValueError("Each rollout needs context followed by at least one sampled token")
             batch.token_ids[index, :length] = sequence.token_ids  # (L,)
             batch.loss_mask[index, :length] = mask & (
-                sequence.weight_versions >= weight_version - self.config.max_staleness
+                sequence.weight_versions >= consumption_weight_version - self.config.max_staleness
             )  # (L,)
             batch.old_log_probs[index, :length] = sequence.old_log_probs  # (L,)
             batch.attention_mask[index, :length] = True  # (L,)
@@ -1010,7 +1015,7 @@ class Batcher:
         context_length: int,
         *,
         iteration: int = 1,
-        weight_version: int = 0,
+        consumption_weight_version: int = 0,
         include_examples: bool = False,
     ) -> RolloutBatch:
         """Consume groups from a bounded pool, draining it before periodic and final checkpoints."""
@@ -1038,12 +1043,17 @@ class Batcher:
             fetched = time.monotonic()
             with span("batcher.prepare_batch"):
                 training_batch = await asyncio.to_thread(
-                    self.prepare_batch, groups, context_length=context_length, weight_version=weight_version
+                    self.prepare_batch,
+                    groups,
+                    context_length=context_length,
+                    consumption_weight_version=consumption_weight_version,
                 )  # (B, T), (B,) leaves.
             prepared = time.monotonic()
             return build_rollout_batch(
                 groups=groups,
                 training_batch=training_batch,
+                consumption_weight_version=consumption_weight_version,
+                max_staleness=self.config.max_staleness,
                 include_examples=include_examples,
                 latest_examples=self._latest_examples,
                 skipped_groups=skipped_groups,
@@ -1246,7 +1256,7 @@ class Learner:
                 group_size=self.config.group_size,
                 context_length=self.model.config.max_position_embeddings,
                 iteration=iteration,
-                weight_version=self.weight_version,
+                consumption_weight_version=self.weight_version,
                 include_examples=iteration % self.config.example_log_interval == 0,
             )
         )

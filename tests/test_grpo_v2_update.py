@@ -77,7 +77,7 @@ def test_prepare_batch_masks_only_stale_sampled_tokens(batcher: Any, groups: lis
             weight_versions=np.array([-1, 1, -1, 2, 3], dtype=np.int32),  # (T=5,)
         ),
     )
-    batch = batcher.prepare_batch(groups, context_length=8, weight_version=3)
+    batch = batcher.prepare_batch(groups, context_length=8, consumption_weight_version=3)
     assert batch.token_ids.shape == batch.loss_mask.shape == batch.attention_mask.shape == (2, 8)
     np.testing.assert_array_equal(
         batch.loss_mask,
@@ -93,7 +93,9 @@ def test_prepare_batch_masks_only_stale_sampled_tokens(batcher: Any, groups: lis
         np.testing.assert_array_equal(batch.attention_mask[index, :length], True)
         np.testing.assert_array_equal(groups[0].rollouts[index].sequence.loss_mask, original.sequence.loss_mask)
     np.testing.assert_array_equal(batch.advantages, [1.0, -1.0])
-    metrics = training.build_rollout_batch(groups, batch, {}).rollout_metrics
+    metrics = training.build_rollout_batch(
+        groups, batch, {}, consumption_weight_version=3, max_staleness=batcher.config.max_staleness
+    ).rollout_metrics
     assert metrics["batcher/stale_tokens"] == 2
     assert metrics["batcher/context_transcript_token_fraction"] == 0.5
     assert metrics["batcher/stale_transcript_token_fraction"] == 0.25
@@ -110,7 +112,13 @@ def test_prepare_batch(batcher: Any, groups: list[training.RolloutGroup], contex
         )
         groups[0].rollouts[index] = replace(sample, sequence=sequence)
     batch = batcher.prepare_batch(groups, context_length=context_length)  # (B=2, T=width), (B,) leaves.
-    result = training.build_rollout_batch(groups=groups, training_batch=batch, timing_metrics={})
+    result = training.build_rollout_batch(
+        groups=groups,
+        training_batch=batch,
+        timing_metrics={},
+        consumption_weight_version=0,
+        max_staleness=batcher.config.max_staleness,
+    )
     assert result.rollout_metrics["batcher/token_utilization_fraction"] == pytest.approx(8 / (2 * width))
     assert result.rollout_metrics["rollout/total_tokens_mean"] == 4.0
     assert result.rollout_metrics["batcher/padded_sequence_tokens"] == width
@@ -154,7 +162,13 @@ def test_prepare_batch_bucket_boundaries(
     sample = rollout([1] * length, [False] + [True] * (length - 1), 1.0)
     groups = [training.RolloutGroup(task_id="0", rollouts=[sample], taskset_id="test")]
     batch = batcher.prepare_batch(groups, context_length=context_length)  # (B=1, T=width), (B,) leaves.
-    result = training.build_rollout_batch(groups=groups, training_batch=batch, timing_metrics={})
+    result = training.build_rollout_batch(
+        groups=groups,
+        training_batch=batch,
+        timing_metrics={},
+        consumption_weight_version=0,
+        max_staleness=batcher.config.max_staleness,
+    )
     assert result.rollout_metrics["batcher/token_utilization_fraction"] == pytest.approx(length / width)
     assert result.rollout_metrics["batcher/padded_sequence_tokens"] == width
     assert all(array.shape == (1, width) for array in batch[:-1])
@@ -170,7 +184,13 @@ def test_prepare_minimal_sequences_and_multiple_groups(batcher: Any) -> None:
         training.RolloutGroup(task_id="1", rollouts=[rollout([3, 4, 5], [False, True, True], 1.0)], taskset_id="test"),
     ]
     batch = batcher.prepare_batch(groups, context_length=8)  # (B=2, T=8), (B,) leaves.
-    result = training.build_rollout_batch(groups=groups, training_batch=batch, timing_metrics={})
+    result = training.build_rollout_batch(
+        groups=groups,
+        training_batch=batch,
+        timing_metrics={},
+        consumption_weight_version=0,
+        max_staleness=batcher.config.max_staleness,
+    )
     assert result.rollout_metrics["batcher/token_utilization_fraction"] == 5 / 16
     assert result.rollout_metrics["rollout/total_tokens_mean"] == 2.5
     assert batch.token_ids.shape == (2, 8)

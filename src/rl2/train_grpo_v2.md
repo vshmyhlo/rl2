@@ -473,18 +473,25 @@ Context + stale + unmasked = 1; masked + unmasked = 1. Zero advantages do not
 change these fractions. `batcher/stale_tokens` reports the stale sampled-token count.
 Padding remains covered separately by `batcher/token_utilization_fraction`.
 
-`batcher/weight_version_transcript_token_fraction/<version>` reports tokens
-sampled from each version using that same transcript denominator. The corresponding
-`batcher/weight_version_masked_transcript_token_fraction/<version>` and
-`batcher/weight_version_unmasked_transcript_token_fraction/<version>` split that share by the
-training loss mask. Context has no generating weight version: version totals sum
-to 1 minus the context fraction. Masked version fractions sum to the stale fraction;
-unmasked version fractions sum to the overall unmasked fraction. Absent versions
-are omitted; measured zeros are preserved.
+`batcher/weight_age_transcript_token_fraction/<age>` groups sampled tokens by
+publications behind the version at batch consumption, before that iteration's
+optimization and publication. The learner passes `consumption_weight_version` to
+the batcher, which uses it for both staleness masking and age metrics.
+Labels are `0` (current) through `max_staleness`,
+plus `older` for all greater ages. With `max_staleness: 4`, there are at most six
+buckets, regardless of how many versions are published.
+`batcher/weight_age_masked_transcript_token_fraction/<age>` and
+`batcher/weight_age_unmasked_transcript_token_fraction/<age>` split each bucket by
+the training loss mask. All use the same non-padding transcript denominator.
+Context has no weight age: age totals sum to 1 minus the context fraction. Masked
+age fractions sum to the stale fraction; unmasked age fractions sum to the overall
+unmasked fraction. Absent buckets are omitted; measured zeros are preserved.
 
 These replace `batcher/stale_token_fraction` and the
 `batcher/weight_version{,_masked,_unmasked}_token_fraction/<version>` metrics,
 whose denominator was sampled tokens only. The old names are no longer emitted.
+The absolute-version `batcher/weight_version{,_masked,_unmasked}_transcript_token_fraction/<version>`
+metrics are also replaced by the bounded age buckets above.
 The iteration log reports `stale_tokens`; `batcher/skipped_groups` continues to
 count only degenerate-group discards.
 `weight_update_pause_mode` accepts `wait` (default) or `keep`, operating
