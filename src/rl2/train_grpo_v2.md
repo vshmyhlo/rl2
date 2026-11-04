@@ -459,9 +459,32 @@ Missing, invalid, or incomplete version metadata fails the rollout.
 Versions advance on successful publications, not optimizer steps or skipped syncs,
 and reset on resume with an empty rollout pool. This also handles versions that
 change within a completion under `keep` or between turns under `wait`.
-`batcher/stale_tokens` and `batcher/stale_token_fraction` report masked sampled-token
-counts and their fraction of all sampled tokens in the consumed batch, including
-measured zeros. These replace `batcher/stale_groups` and `batcher/stale_rollouts`.
+All `*_transcript_token_fraction` metrics use the consumed batch's **non-padding
+transcript tokens** as their denominator, before the next-token shift:
+
+| Metric (`batcher/` prefix) | Tokens counted |
+| --- | --- |
+| `context_transcript_token_fraction` | Initial context, user/tool turns, and inserted formatting |
+| `stale_transcript_token_fraction` | Sampled tokens excluded by `max_staleness` |
+| `unmasked_transcript_token_fraction` | Sampled tokens retained by the loss mask |
+| `masked_transcript_token_fraction` | Context plus stale sampled tokens |
+
+Context + stale + unmasked = 1; masked + unmasked = 1. Zero advantages do not
+change these fractions. `batcher/stale_tokens` reports the stale sampled-token count.
+Padding remains covered separately by `batcher/token_utilization_fraction`.
+
+`batcher/weight_version_transcript_token_fraction/<version>` reports tokens
+sampled from each version using that same transcript denominator. The corresponding
+`batcher/weight_version_masked_transcript_token_fraction/<version>` and
+`batcher/weight_version_unmasked_transcript_token_fraction/<version>` split that share by the
+training loss mask. Context has no generating weight version: version totals sum
+to 1 minus the context fraction. Masked version fractions sum to the stale fraction;
+unmasked version fractions sum to the overall unmasked fraction. Absent versions
+are omitted; measured zeros are preserved.
+
+These replace `batcher/stale_token_fraction` and the
+`batcher/weight_version{,_masked,_unmasked}_token_fraction/<version>` metrics,
+whose denominator was sampled tokens only. The old names are no longer emitted.
 The iteration log reports `stale_tokens`; `batcher/skipped_groups` continues to
 count only degenerate-group discards.
 `weight_update_pause_mode` accepts `wait` (default) or `keep`, operating

@@ -95,7 +95,10 @@ def test_prepare_batch_masks_only_stale_sampled_tokens(batcher: Any, groups: lis
     np.testing.assert_array_equal(batch.advantages, [1.0, -1.0])
     metrics = training.build_rollout_batch(groups, batch, {}).rollout_metrics
     assert metrics["batcher/stale_tokens"] == 2
-    assert metrics["batcher/stale_token_fraction"] == 0.5
+    assert metrics["batcher/context_transcript_token_fraction"] == 0.5
+    assert metrics["batcher/stale_transcript_token_fraction"] == 0.25
+    assert metrics["batcher/masked_transcript_token_fraction"] == 0.75
+    assert metrics["batcher/unmasked_transcript_token_fraction"] == 0.25
 
 
 @pytest.mark.parametrize("context_length,width", [(512, 256), (5, 5)], ids=["bucketed", "context-boundary"])

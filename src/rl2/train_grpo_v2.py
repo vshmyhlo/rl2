@@ -48,7 +48,16 @@ Rollout batch scalars:
     batcher/padded_sequence_tokens: Padded sequence width chosen during batch construction, before the next-token shift.
     batcher/skipped_groups: Groups discarded by drop_degenerate_groups while filling this batch, including prefetch.
     batcher/stale_tokens: Sampled tokens masked from training by max_staleness in this batch.
-    batcher/stale_token_fraction: Masked stale tokens divided by all sampled tokens in this batch.
+    batcher/context_transcript_token_fraction: Context tokens divided by all non-padding transcript tokens.
+    batcher/stale_transcript_token_fraction: Stale sampled tokens divided by all non-padding transcript tokens.
+    batcher/masked_transcript_token_fraction: Context plus stale sampled tokens divided by all non-padding transcript tokens.
+    batcher/unmasked_transcript_token_fraction: Tokens retained by the loss mask divided by all non-padding transcript tokens.
+    batcher/weight_version_transcript_token_fraction/<version>: Sampled tokens from this version divided by all non-padding transcript tokens.
+    batcher/weight_version_masked_transcript_token_fraction/<version>: Masked sampled tokens from this version divided by all non-padding transcript tokens.
+    batcher/weight_version_unmasked_transcript_token_fraction/<version>: Unmasked sampled tokens from this version divided by all non-padding transcript tokens.
+Context, stale, and unmasked fractions sum to one; masked is context plus stale.
+Unmasked tokens may have zero advantages. Context tokens have no generating weight version.
+Weight-version metrics omit absent versions and retain measured zeros for present versions.
 All StopCondition labels are logged each iteration, including zero for absent labels.
 
 Training progress and settings:
@@ -442,7 +451,29 @@ def build_rollout_batch(
         rewards_by_taskset[group.taskset_id].extend(rollout.reward for rollout in group.rollouts)
         latest_examples[group.taskset_id] = replace(group, rollouts=group.rollouts[-1:])
     sampled_tokens = sum(int(rollout.sequence.loss_mask.sum()) for rollout in rollouts)
-    stale_tokens = sampled_tokens - int(training_batch.loss_mask.sum())
+    transcript_tokens = int(training_batch.attention_mask.sum())
+    unmasked_tokens = int(training_batch.loss_mask.sum())
+    stale_tokens = sampled_tokens - unmasked_tokens
+    version_counts: Counter[int] = Counter()
+    unmasked_version_counts: Counter[int] = Counter()
+    for index, rollout in enumerate(rollouts):
+        sequence = rollout.sequence
+        unmasked = training_batch.loss_mask[index, : len(sequence.token_ids)]  # (L,) unpadded transcript.
+        for mask, counts in (
+            (sequence.loss_mask, version_counts),
+            (sequence.loss_mask & unmasked, unmasked_version_counts),
+        ):
+            versions, token_counts = np.unique(sequence.weight_versions[mask], return_counts=True)  # (V,)
+            counts.update({int(version): int(count) for version, count in zip(versions, token_counts, strict=True)})
+    version_metrics = {
+        f"batcher/weight_version{suffix}_transcript_token_fraction/{version}": count / transcript_tokens
+        for version, total in version_counts.items()
+        for suffix, count in (
+            ("", total),
+            ("_masked", total - unmasked_version_counts[version]),
+            ("_unmasked", unmasked_version_counts[version]),
+        )
+    }
     return RolloutBatch(
         training_batch=training_batch,
         rollout_metrics={
@@ -464,7 +495,11 @@ def build_rollout_batch(
             "batcher/padded_sequence_tokens": float(training_batch.attention_mask.shape[1]),
             "batcher/skipped_groups": skipped_groups,
             "batcher/stale_tokens": stale_tokens,
-            "batcher/stale_token_fraction": stale_tokens / sampled_tokens,
+            "batcher/context_transcript_token_fraction": (transcript_tokens - sampled_tokens) / transcript_tokens,
+            "batcher/stale_transcript_token_fraction": stale_tokens / transcript_tokens,
+            "batcher/masked_transcript_token_fraction": (transcript_tokens - unmasked_tokens) / transcript_tokens,
+            "batcher/unmasked_transcript_token_fraction": unmasked_tokens / transcript_tokens,
+            **version_metrics,
             "actor/rollout_seconds_mean": mean(rollout.rollout_seconds for rollout in rollouts),
         },
         stop_counts=Counter(rollout.stop_condition for rollout in rollouts),

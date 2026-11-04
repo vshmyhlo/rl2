@@ -9,8 +9,8 @@ import runpy
 import subprocess
 import sys
 import threading
-from collections.abc import Generator, Iterator
-from contextlib import ExitStack, aclosing
+from collections.abc import Callable, Generator, Iterator
+from contextlib import AsyncExitStack, ExitStack, aclosing
 from dataclasses import asdict, replace
 from pathlib import Path
 from statistics import mean, pstdev
@@ -1510,7 +1510,15 @@ def test_batch_masks_stale_prefetched_tokens(
     complete_before_fetch: bool,
     masked: bool,
     rollout: training.Rollout,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    async def run_inline[T](func: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
+        return func(*args, **kwargs)
+
+    # Thread offloading is covered by test_batch_timings_and_order_survive_serialization.
+    monkeypatch.setattr(training.asyncio, "to_thread", run_inline)
+    monkeypatch.setattr(training.ray, "cancel", Mock())
+
     async def collect() -> None:
         pending = asyncio.Future[training.RolloutGroup]()
         groups = [
@@ -1552,11 +1560,12 @@ def test_batch_masks_stale_prefetched_tokens(
                 max_staleness=max_staleness,
             ),
         )
-        async with asyncio.timeout(5), asyncio.TaskGroup() as tg:
+        async with asyncio.timeout(5), AsyncExitStack() as resources, asyncio.TaskGroup() as tg:
+            resources.push_async_callback(batcher.cancel_pending_groups)
             first = await batcher.fetch_next_batch(num_groups=1, group_size=2, context_length=8)
             assert requested == 2
             assert first.rollout_metrics["batcher/stale_tokens"] == 0
-            assert first.rollout_metrics["batcher/stale_token_fraction"] == 0
+            assert first.rollout_metrics["batcher/stale_transcript_token_fraction"] == 0
             if complete_before_fetch:
                 pending.set_result(groups[1])
                 await batcher._pending_groups[0]
@@ -1580,7 +1589,7 @@ def test_batch_masks_stale_prefetched_tokens(
             assert batch.rollout_metrics["rollout/reward_mean/taskset_1"] == 0.5
             assert "task=1 |" in batch.examples
             assert batch.rollout_metrics["batcher/stale_tokens"] == 2 * int(masked)
-            assert batch.rollout_metrics["batcher/stale_token_fraction"] == float(masked)
+            assert batch.rollout_metrics["batcher/stale_transcript_token_fraction"] == 0.5 * masked
             assert int(batch.training_batch.loss_mask.sum()) == (0 if masked else 2)
             np.testing.assert_array_equal(batch.training_batch.attention_mask[:, :2], True)
             np.testing.assert_array_equal(batch.training_batch.advantages, 0.5)
@@ -1628,7 +1637,7 @@ def test_degenerate_retry_masks_actual_token_versions(rollout: training.Rollout)
             assert requested == 3
             assert batch.rollout_metrics["batcher/skipped_groups"] == 1
             assert batch.rollout_metrics["batcher/stale_tokens"] == 2
-            assert batch.rollout_metrics["batcher/stale_token_fraction"] == 1
+            assert batch.rollout_metrics["batcher/stale_transcript_token_fraction"] == 0.5
             assert not batcher._pending_groups
 
     asyncio.run(collect())
@@ -1674,6 +1683,70 @@ def test_batch_failure_cancels_pending_fetches(
     asyncio.run(collect())
     assert requested == 2 + drop_degenerate_groups
     batcher.prepare_batch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("weight_version", "max_staleness", "masked_versions", "stale_fraction"),
+    [
+        pytest.param(4, 3, (), 0.0, id="all-sampled-unmasked"),
+        pytest.param(4, 1, (1,), 0.2, id="mixed-at-staleness-boundary"),
+        pytest.param(6, 1, (1, 3, 4), 0.6, id="all-sampled-masked"),
+    ],
+)
+def test_batch_weight_version_token_fractions(
+    rollout: training.Rollout,
+    weight_version: int,
+    max_staleness: int,
+    masked_versions: tuple[int, ...],
+    stale_fraction: float,
+) -> None:
+    rollouts = []
+    for versions in ((-1, 1, 1, -1, 3, -1, 4), (-1, 3, 3)):
+        weight_versions = np.asarray(versions, dtype=np.int32)  # (L,) includes interleaved context.
+        mask = weight_versions >= 0  # (L,)
+        rollouts.append(
+            replace(
+                rollout,
+                sequence=training.TrainingSequence(
+                    token_ids=np.arange(len(versions), dtype=np.int32),  # (L,)
+                    loss_mask=mask,  # (L,)
+                    old_log_probs=np.zeros(len(versions), dtype=np.float32),  # (L,)
+                    weight_versions=weight_versions,  # (L,)
+                ),
+                num_output_tokens=int(mask.sum()),
+                advantage=0.0,  # Zero advantages do not change the loss mask or token fractions.
+            )
+        )
+    groups = [training.RolloutGroup(task_id="task", taskset_id="test", rollouts=rollouts)]
+    batcher = training.Batcher.__ray_metadata__.modified_class(
+        actor=Mock(), config=training.Config(max_staleness=max_staleness, padding_multiple=4)
+    )
+    prepared = batcher.prepare_batch(groups, context_length=8, weight_version=weight_version)  # (B=2, T=8) leaves.
+    assert prepared.loss_mask.shape == (2, 8)
+    batch = training.build_rollout_batch(groups=groups, training_batch=prepared, timing_metrics={})
+    metrics = batch.rollout_metrics
+    assert metrics["batcher/context_transcript_token_fraction"] == 0.4
+    assert metrics["batcher/stale_transcript_token_fraction"] == stale_fraction
+    assert metrics["batcher/masked_transcript_token_fraction"] == pytest.approx(0.4 + stale_fraction)
+    assert metrics["batcher/unmasked_transcript_token_fraction"] == pytest.approx(0.6 - stale_fraction)
+    assert "batcher/stale_token_fraction" not in metrics
+    expected = {}
+    for version, fraction in ((1, 0.2), (3, 0.3), (4, 0.1)):
+        expected[f"batcher/weight_version_transcript_token_fraction/{version}"] = fraction
+        expected[f"batcher/weight_version_masked_transcript_token_fraction/{version}"] = (
+            fraction if version in masked_versions else 0.0
+        )
+        expected[f"batcher/weight_version_unmasked_transcript_token_fraction/{version}"] = (
+            0.0 if version in masked_versions else fraction
+        )
+    actual = {name: value for name, value in batch.rollout_metrics.items() if name.startswith("batcher/weight_version")}
+    assert actual == pytest.approx(expected)
+    assert sum(value for name, value in actual.items() if "_masked_" in name) == pytest.approx(
+        metrics["batcher/stale_transcript_token_fraction"]
+    )
+    assert sum(value for name, value in actual.items() if "_unmasked_" in name) == pytest.approx(
+        metrics["batcher/unmasked_transcript_token_fraction"]
+    )
 
 
 def test_batch_taskset_reward_means(rollout: training.Rollout) -> None:
@@ -1892,10 +1965,10 @@ def test_learner_logs_rollouts(
     )
     caplog.set_level("INFO", logger=training.__name__)
     sequence = training.TrainingSequence(
-        token_ids=np.array([1], dtype=np.int32),  # (T=1,)
-        loss_mask=np.array([True]),  # (T=1,)
-        old_log_probs=np.array([-0.2], dtype=np.float32),  # (T=1,)
-        weight_versions=np.where(np.array([True]), 0, -1).astype(np.int32),  # (T,)
+        token_ids=np.array([0, 1], dtype=np.int32),  # (T=2,)
+        loss_mask=np.array([False, True]),  # (T=2,)
+        old_log_probs=np.array([0.0, -0.2], dtype=np.float32),  # (T=2,)
+        weight_versions=np.array([-1, 0], dtype=np.int32),  # (T=2,)
     )
     rollout = training.Rollout(
         prompt="Environment prompt",
@@ -2067,7 +2140,13 @@ def test_learner_logs_rollouts(
         "batcher/padded_sequence_tokens": 8.0,
         "batcher/skipped_groups": 3,
         "batcher/stale_tokens": 4,
-        "batcher/stale_token_fraction": 1.0,
+        "batcher/context_transcript_token_fraction": 0.5,
+        "batcher/stale_transcript_token_fraction": 0.5,
+        "batcher/masked_transcript_token_fraction": 1.0,
+        "batcher/unmasked_transcript_token_fraction": 0.0,
+        "batcher/weight_version_transcript_token_fraction/0": 0.5,
+        "batcher/weight_version_masked_transcript_token_fraction/0": 0.5,
+        "batcher/weight_version_unmasked_transcript_token_fraction/0": 0.0,
         "train/iterations_total": 1,
         "train/updates_total": 1,
         "train/learning_rate": learner.config.learning_rate * 2,
@@ -2087,6 +2166,13 @@ def test_learner_logs_rollouts(
         assert calls[2].args[0]["rollout/degenerate_group_fraction"] == degenerate_fraction
         assert calls[2].args[0]["batcher/skipped_groups"] == 0
         assert calls[2].args[0]["batcher/stale_tokens"] == 0
+        assert calls[2].args[0]["batcher/context_transcript_token_fraction"] == 0.5
+        assert calls[2].args[0]["batcher/stale_transcript_token_fraction"] == 0.0
+        assert calls[2].args[0]["batcher/masked_transcript_token_fraction"] == 0.5
+        assert calls[2].args[0]["batcher/unmasked_transcript_token_fraction"] == 0.5
+        assert calls[2].args[0]["batcher/weight_version_transcript_token_fraction/0"] == 0.5
+        assert calls[2].args[0]["batcher/weight_version_masked_transcript_token_fraction/0"] == 0.0
+        assert calls[2].args[0]["batcher/weight_version_unmasked_transcript_token_fraction/0"] == 0.5
         assert {key: value for key, value in calls[2].args[0].items() if "stop_fraction/" in key} == {
             "rollout/stop_fraction/agent_completed": 0.0,
             "rollout/stop_fraction/max_tokens": 0.0,
