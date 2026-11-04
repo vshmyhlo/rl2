@@ -10,6 +10,7 @@ import optax
 import pytest
 import yaml
 from flax.training.train_state import TrainState
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 from pydantic import ValidationError
 
 from rl2 import ppo
@@ -116,6 +117,26 @@ def test_pendulum_fall_terminates() -> None:
     assert abs(float(result.info["final_observation"][1])) > 0.2
     reset_observation, _ = env.reset(key, env.params)  # (O,)
     np.testing.assert_array_equal(result.observation, reset_observation)
+
+
+def test_pendulum_initialization_and_step_on_two_devices() -> None:
+    if jax.device_count() < 2:
+        pytest.skip("Requires two devices; use JAX_PLATFORMS=cpu JAX_NUM_CPU_DEVICES=2")
+    mesh = Mesh(devices=jax.devices()[:2], axis_names=("batch",), axis_types=(AxisType.Auto,))
+    batched = NamedSharding(mesh, PartitionSpec("batch"))
+    with jax.set_mesh(mesh):
+        env = BraxEnv(BraxConfig(task="inverted_pendulum", max_steps=1))
+        keys = jax.device_put(jax.random.split(jax.random.key(0), 2), batched)  # (B=2,)
+        reset = jax.jit(jax.vmap(env.reset, in_axes=(0, None)), out_shardings=batched)
+        observations, states = reset(keys, env.params)  # (B, O=4); leaves: (B,...)
+        actions = jax.device_put(jnp.zeros((2, 1)), batched)  # (B, A=1)
+        result = jax.jit(env.step_batch, out_shardings=batched)(keys, states, actions, env.params)
+    chex.assert_shape((observations, result.observation, result.info["final_observation"]), (2, 4))
+    chex.assert_shape((result.reward, result.done), (2,))
+    assert observations.sharding == batched
+    assert result.observation.sharding == batched
+    np.testing.assert_array_equal(result.info["truncated"], True)
+    np.testing.assert_array_equal(result.state.step_count, 0)
 
 
 def test_native_spaces_rewards_and_batched_timeout(env: BraxEnv) -> None:

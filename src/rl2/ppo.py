@@ -137,9 +137,9 @@ from rl2.envs.foragax_env import ForagaxConfig, ForagaxEnv
 from rl2.envs.gymnax_env import GymnaxConfig, GymnaxEnv
 from rl2.envs.jaxtari_env import JAXtariConfig, JAXtariEnv
 from rl2.envs.kinetix_env import KinetixConfig, KinetixEnv
+from rl2.envs.mujoco_playground_env import PlaygroundConfig, PlaygroundEnv
 from rl2.envs.observations import Observation
 from rl2.envs.pgx_env import PgxConfig, PgxEnv
-from rl2.envs.playground_env import PlaygroundConfig, PlaygroundEnv
 from rl2.envs.xminigrid_env import XMiniGridConfig, XMiniGridEnv
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry

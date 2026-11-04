@@ -8,7 +8,7 @@ num_minibatches: 4 # Must divide num_envs; 8 whole sequences / 1024 transitions 
 update_epochs: 4
 model:
   encoder:
-    type: rgb # Default convolution stages and 768-wide embedding
+    type: conv2d # Default convolution stages and 768-wide embedding
   recurrent: # LSTM backbone settings
     type: lstm
     hidden_size: 1536
@@ -22,10 +22,10 @@ clip_coef: 0.1
 target_kl: 0.01 # null disables KL early stopping
 entropy_coef: 0.01
 entropy_decay: constant # Keep the exploration bonus throughout training
-value_coef: 0.5
+value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
-run_id: ppo_${path_name:${env.id}}_rgb_${model.recurrent.type}_seed${seed}
+run_id: ppo_${path_name:${env.id}}_${model.encoder.type}_${model.recurrent.type}_seed${seed}
 # All intervals count completed PPO iterations (one rollout and its updates).
 # Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
 video_interval: 245 # Iterations between recordings; 0 disables recording

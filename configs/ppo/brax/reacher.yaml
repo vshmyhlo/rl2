@@ -7,7 +7,7 @@ env:
   backend: generalized
   max_steps: 50 # 1 simulated second at 50 Hz
 seed: 1
-total_steps: 2_000_000 # Environment steps summed across environments
+total_steps: 10_000_000 # Environment steps summed across environments
 num_envs: 64
 num_steps: 64 # 4096 transitions per iteration; longer than the 50-step episode limit
 num_minibatches: 8 # 8 whole sequences / 512 transitions per minibatch
@@ -35,14 +35,14 @@ value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
 run_id: ppo_${path_name:${env.id}}_${env.task}_${env.backend}_seed${seed}
-checkpoint_interval: 98
+checkpoint_interval: 489
 log_interval: 10
 # Intervals count completed PPO iterations.
 # Video/evaluation require an available OpenGL backend (e.g. MUJOCO_GL=egl).
 # Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
-video_interval: 49
+video_interval: 245
 video_max_frames: 51
 video_fps: 50.0
-eval_interval: 98
+eval_interval: 489
 eval_episodes: 10
 eval_seed: 10000

@@ -1,8 +1,15 @@
 model: Qwen/Qwen3-0.6B
-taskset:
-  id: appworld
-  python: /opt/appworld/bin/python
-  root: /data/appworld
+attention_backend: tokamax
+scan_layers: true
+gradient_checkpointing: true
+padding_multiple: 256
+tasksets:
+  appworld:
+    weight: 1.0
+    taskset:
+      id: appworld
+      python: /opt/appworld/bin/python
+      root: /data/appworld
 seed: 3
 num_groups: 1
 group_size: 4

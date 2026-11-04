@@ -1,0 +1,48 @@
+# Track sampled velocity commands with a Unitree Go1 on flat terrain.
+# Run: uv run ppo --config configs/ppo/mujoco_playground/locomotion/go1_joystick_flat_terrain.yaml
+# Setup: uv run python -m rl2.envs.playground_assets --robot go1
+# Both policy and value use the noisy 48-feature state; no privileged observations.
+env:
+  id: MuJoCo-Playground
+  task: Go1JoystickFlatTerrain
+  max_steps: 1000 # 20 simulated seconds at 50 Hz
+seed: 1
+total_steps: 10_000_000 # Environment steps summed across environments; only full iterations run
+num_envs: 128
+num_steps: 32 # 4096 transitions per iteration
+num_minibatches: 8 # 16 whole sequences / 512 transitions per minibatch
+update_epochs: 4
+model:
+  continuous_policy: truncated_gaussian
+  encoder:
+    type: mlp
+    hidden_size: 256
+    embedding_size: 256
+  recurrent:
+    type: lstm
+    hidden_size: 256
+bf16: false
+learning_rate: 0.0003
+anneal_lr: true
+lr_decay: linear
+gamma: 0.97
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: 0.02 # Joint distribution over 12 controls
+entropy_coef: 0.01
+entropy_decay: cosine
+value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
+max_grad_norm: 0.5
+ckpt_dir: /runs/ppo/${run_id}
+run_id: ppo_${path_name:${env.id}}_${env.task}_seed${seed}
+checkpoint_interval: 489
+log_interval: 10
+# Intervals count completed PPO iterations.
+# Video/evaluation require an available OpenGL backend (e.g. MUJOCO_GL=egl).
+# Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
+video_interval: 245
+video_max_frames: 1001
+video_fps: 50.0
+eval_interval: 489
+eval_episodes: 10
+eval_seed: 10000

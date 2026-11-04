@@ -1,0 +1,47 @@
+# Swing a hanging pole upright and balance it; dense rewards and bundled assets.
+# Run: uv run ppo --config configs/ppo/mujoco_playground/dm_control_suite/cartpole_swingup.yaml
+# Assets ship with Playground; MJX uses the JAX backend.
+env:
+  id: MuJoCo-Playground
+  task: CartpoleSwingup
+  max_steps: 1000 # 10 simulated seconds at 100 Hz
+seed: 1
+total_steps: 10_000_000 # Environment steps summed across environments; only full iterations run
+num_envs: 32
+num_steps: 128 # 4096 transitions per iteration
+num_minibatches: 4 # 8 whole sequences / 1024 transitions per minibatch
+update_epochs: 8
+model:
+  continuous_policy: truncated_gaussian
+  encoder:
+    type: mlp
+    hidden_size: 64
+    embedding_size: 64
+  recurrent:
+    type: lstm
+    hidden_size: 64
+bf16: false
+learning_rate: 0.0003
+anneal_lr: true
+lr_decay: linear
+gamma: 0.995
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: 0.01
+entropy_coef: 0.001
+entropy_decay: cosine
+value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
+max_grad_norm: 0.5
+ckpt_dir: /runs/ppo/${run_id}
+run_id: ppo_${path_name:${env.id}}_${env.task}_seed${seed}
+checkpoint_interval: 489
+log_interval: 10
+# Intervals count completed PPO iterations.
+# Video/evaluation require an available OpenGL backend (e.g. MUJOCO_GL=egl).
+# Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
+video_interval: 245
+video_max_frames: 1001
+video_fps: 100.0
+eval_interval: 489
+eval_episodes: 10
+eval_seed: 10000

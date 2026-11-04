@@ -41,7 +41,9 @@ class BraxEnv(BaseEnv[BraxState, BraxParams]):
     """O and A are the selected task's observation and action dimensions."""
 
     def __init__(self, config: BraxConfig) -> None:
-        self.env = cast(PipelineEnv, get_environment(env_name=config.task, backend=config.backend))
+        # MJX loads onto one device; defer the training mesh to batched simulation.
+        with jax.set_mesh(None):
+            self.env = cast(PipelineEnv, get_environment(env_name=config.task, backend=config.backend))
         self.params = BraxParams(max_steps=config.max_steps)
         size = self.env.action_size
         self.action_space = ContinuousSpace(shape=(size,), low=(-1.0,) * size, high=(1.0,) * size)

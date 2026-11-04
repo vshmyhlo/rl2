@@ -1,4 +1,5 @@
 # Reach, grasp, and move a cube to a sampled target with the Franka Panda arm.
+# Run: uv run ppo --config configs/ppo/mujoco_playground/manipulation/panda_pick_cube.yaml
 # Setup: uv run python -m rl2.envs.playground_assets
 env:
   id: MuJoCo-Playground
@@ -29,7 +30,7 @@ clip_coef: 0.2
 target_kl: 0.01
 entropy_coef: 0.001
 entropy_decay: cosine
-value_coef: 0.5
+value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
 run_id: ppo_${path_name:${env.id}}_${env.task}_seed${seed}
@@ -38,7 +39,7 @@ log_interval: 10
 # Video/evaluation require an available OpenGL backend (e.g. MUJOCO_GL=egl).
 # Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
 video_interval: 245
-video_max_frames: 150
+video_max_frames: 151
 video_fps: 50.0
 eval_interval: 489
 eval_episodes: 10

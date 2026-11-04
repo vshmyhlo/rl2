@@ -4,11 +4,13 @@ adamw_batch_size_scale: 1.0
 clip_coef: 0.2
 max_grad_norm: 1.0
 rollout_is_threshold: 2.0 # Decoupled token-level importance sampling; no rejection sampling.
-finetuning_mode: full # lora or full; full optimizes every weight and requires more GPU memory.
+finetuning:
+  mode: full # Optimizes every weight and requires more GPU memory.
 # learning_rate: 1e-5
-# finetuning_mode: lora # lora or full; full optimizes every weight and requires more GPU memory.
-lora_rank: 16
-lora_alpha: 32
+# finetuning:
+#   mode: lora
+#   rank: 16
+#   alpha: 32
 attention_backend: tokamax
 scan_layers: true
 gradient_checkpointing: true
@@ -31,7 +33,6 @@ update_epochs: 1
 minibatches_per_epoch: 1 # One optimizer update per epoch, using all 32 rollouts.
 
 prefetch_batches: 4 # Requires capacity for up to 160 concurrent CodeGym episodes.
-prefetch_mode: next_ready
 parameter_sync_step: 4 # Publish every fourth training batch if weights have changed.
 
 # verl's off-policy threshold/drop strategy and minibatch streaming are unsupported.
@@ -44,7 +45,7 @@ max_tokens: 8192 # Total transcript tokens, including system, prompt, and tools.
 max_turns: 50
 rollout_timeout: 1200
 environment_timeout: 600
-run_id: grpo_v2_codegym_${path_name:${model}}_${finetuning_mode}_${attention_backend}_s${seed}_lr${learning_rate}_adamw_scale${adamw_batch_size_scale}_ng${num_groups}_gs${group_size}_mb${minibatches_per_epoch}_ddg${drop_degenerate_groups}_pf${prefetch_batches}_${prefetch_mode}_ps${parameter_sync_step}_success_lp${length_penalty.reference_tokens}_${length_penalty.penalty}
+run_id: grpo_v2_codegym_${path_name:${model}}_${finetuning.mode}_${attention_backend}_s${seed}_lr${learning_rate}_adamw_scale${adamw_batch_size_scale}_ng${num_groups}_gs${group_size}_mb${minibatches_per_epoch}_ddg${drop_degenerate_groups}_pf${prefetch_batches}_next_ready_ps${parameter_sync_step}_success_lp${length_penalty.reference_tokens}_${length_penalty.penalty}
 ckpt_dir: /runs/grpo_v2/${run_id} # Checkpoints and profiling artifacts.
 checkpoint_interval: 50
 example_log_interval: 50
