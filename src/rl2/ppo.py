@@ -76,13 +76,15 @@ Evaluation uses fixed seeds and logs raw episode return mean, sample standard
 deviation, and standard error as eval/return_mean, eval/return_std, and
 eval/return_sem after each evaluation. eval/training_episodes_total is the lifetime
 completed training episode count at evaluation. Uncertainty metrics are omitted
-for a single episode. Evaluation always records its last episode, independently
-of video_interval. Standalone gameplay is disabled by default (video_interval=0);
-a positive video_interval enables recording at that iteration interval and on
-normal completion. video_max_frames caps recording (default: 1000), but
-only standalone gameplay stops the episode at that cap. Gameplay is saved as
-looping GIFs at video_fps, with frame boundaries rounded to 10 ms and a 10 ms
-minimum frame delay.
+for a single episode. Evaluation replays its highest-return episode with the same
+seed for recording, choosing the first on ties, independently of video_interval.
+The replay is excluded from score statistics and included in eval/evaluation_seconds.
+Standalone gameplay is disabled by default (video_interval=0); a positive
+video_interval enables recording at that iteration interval and on normal completion.
+video_max_frames caps recording (default: 1000). Standalone gameplay and evaluation
+replays stop at that cap; scored evaluation episodes always run to completion.
+Gameplay is saved as looping GIFs at video_fps, with frame boundaries rounded to
+10 ms and a 10 ms minimum frame delay.
 
 Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
 model/parameter_count/<step>.txt, eval/report/<step>.json, gameplay/<step>.gif,
@@ -794,24 +796,34 @@ def log_evaluation(
     initial_carry: RecurrentCarry,  # leaves: (1, H)
     env: PPOEnv | None = None,
 ) -> None:
-    """Evaluate fixed environment seeds, log raw scores, and record the last episode."""
+    """Evaluate fixed seeds, log raw scores, and replay the highest-return episode for video."""
     print(f"Evaluating {config.eval_episodes} games at step {step_count}...", flush=True)
     started = monotonic()
     episode_results: list[dict[str, float | int]] = []
     env = make_env(config) if env is None else env
     for episode_index in range(config.eval_episodes):
-        episode_return, episode_step_count, frames = play_episode(
+        episode_return, episode_step_count, _ = play_episode(
             train_state,
             config,
             jax.random.fold_in(jax.random.key(config.eval_seed), episode_index),
             initial_carry,
-            record=episode_index == config.eval_episodes - 1,
+            record=False,
             env=env,
         )
         episode_results.append({"return": episode_return, "length": episode_step_count})
-        if frames:
-            writer.log_video(frames, f"eval/gameplay/{step_count}.gif", fps=config.video_fps)
     returns = [result["return"] for result in episode_results]
+    best_episode_index = max(range(len(returns)), key=returns.__getitem__)
+    _, _, frames = play_episode(  # frames: each (H, W, 3)
+        train_state,
+        config,
+        jax.random.fold_in(jax.random.key(config.eval_seed), best_episode_index),
+        initial_carry,
+        record=True,
+        stop_at_frame_limit=True,
+        env=env,
+    )
+    if frames:
+        writer.log_video(frames, f"eval/gameplay/{step_count}.gif", fps=config.video_fps)
     std = stdev(returns) if len(returns) > 1 else None
     result = {
         "env_id": config.env.id,

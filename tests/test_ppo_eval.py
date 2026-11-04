@@ -173,20 +173,26 @@ def test_evaluation_logs_raw_scores_and_independent_seeds(
     state = Mock(spec=TrainState)
     carry = ((jnp.zeros((actor_count, 1)), jnp.zeros((actor_count, 1))),)  # leaves: (B, H=1)
     frame = np.zeros((2, 2, 3), np.uint8)  # (H,W,3)
+    episodes = [
+        ppo.EpisodeResult(episode_return=2.0, length=3, frames=[]),
+        ppo.EpisodeResult(episode_return=4.0, length=5, frames=[] if trainer is ppo else [frame]),
+    ]
+    if trainer is ppo:
+        episodes.append(ppo.EpisodeResult(episode_return=4.0, length=5, frames=[frame]))
     with (
         patch.object(trainer, "make_env") as make_env,
-        patch.object(trainer, "play_episode", side_effect=[(2.0, 3, []), (4.0, 5, [frame])]) as play,
+        patch.object(trainer, "play_episode", side_effect=episodes) as play,
     ):
         trainer.log_evaluation(state, config, writer, 1, 128, initial_carry=carry)
     make_env.assert_called_once_with(config)
     for index, call in enumerate(play.call_args_list):
         np.testing.assert_array_equal(
             jax.random.key_data(call.args[2]),
-            jax.random.key_data(jax.random.fold_in(jax.random.key(config.eval_seed), index)),
+            jax.random.key_data(jax.random.fold_in(jax.random.key(config.eval_seed), min(index, 1))),
         )
         assert call.args[3] is carry
         assert call.kwargs["env"] is make_env.return_value
-        assert call.kwargs["record"] == (index == 1)
+        assert call.kwargs["record"] == (index == len(episodes) - 1)
     scalars = writer.log_metrics.call_args.args[0]
     assert scalars["eval/return_mean"] == 3
     assert scalars["eval/return_std"] == pytest.approx(2**0.5)
@@ -205,6 +211,46 @@ def test_evaluation_logs_raw_scores_and_independent_seeds(
     assert writer.log_text.call_args.args[1] == "eval/report/128.json"
     assert writer.log_metrics.call_args.args[1] == 128
     assert writer.log_video.call_args.kwargs["fps"] == 12.5
+
+
+@pytest.mark.parametrize(
+    "returns,best_index",
+    [([-5.0, -1.0, -3.0], 1), ([0.0, 0.0], 0), ([2.0], 0)],
+    ids=["negative-returns", "first-tied-episode", "single-episode"],
+)
+def test_evaluation_records_highest_return_episode(returns: list[float], best_index: int) -> None:
+    config = replace(
+        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", ppo.Config),
+        eval_episodes=len(returns),
+        video_interval=0,
+        video_max_frames=1,
+    )
+    writer = Mock()
+    state = Mock(spec=TrainState)
+    env = Mock()
+    carry = ((jnp.zeros((1, 1)), jnp.zeros((1, 1))),)  # leaves: (B=1, H=1)
+    frame = np.zeros((2, 2, 3), np.uint8)  # (H, W, 3)
+    episodes = [ppo.EpisodeResult(episode_return=score, length=3, frames=[]) for score in returns]
+    # The capped replay's partial return must not enter evaluation statistics.
+    replay = ppo.EpisodeResult(episode_return=100.0, length=0, frames=[frame])
+    with patch.object(ppo, "play_episode", side_effect=[*episodes, replay]) as play:
+        ppo.log_evaluation(state, config, writer, 1, 128, initial_carry=carry, env=env)
+    assert play.call_count == len(returns) + 1
+    assert all(not call.kwargs["record"] for call in play.call_args_list[:-1])
+    recorded = play.call_args
+    assert recorded.args[0] is state
+    assert recorded.args[1] is config
+    assert recorded.args[3] is carry
+    assert recorded.kwargs == {"record": True, "stop_at_frame_limit": True, "env": env}
+    np.testing.assert_array_equal(
+        jax.random.key_data(recorded.args[2]),
+        jax.random.key_data(play.call_args_list[best_index].args[2]),
+    )
+    writer.log_video.assert_called_once()
+    assert writer.log_video.call_args.args[0] is replay.frames
+    report = json.loads(writer.log_text.call_args.args[0])
+    assert report["episodes"] == [{"return": score, "length": 3} for score in returns]
+    assert writer.log_metrics.call_args.args[0]["eval/return_mean"] == pytest.approx(sum(returns) / len(returns))
 
 
 def test_log_video_wiring() -> None:
@@ -261,16 +307,17 @@ def test_playback_logging_reports_progress(
     ):
         trainer.log_video(Mock(), config, writer, 2, 128, initial_carry=carry)
         trainer.log_evaluation(Mock(), config, writer, 2, 128, initial_carry=carry)
+    evaluation_seconds = 9.0 if trainer is ppo else 6.0
     assert capsys.readouterr().out.splitlines() == [
         "Recording gameplay at step 128 after 2 training episodes...",
         "Recorded 1 gameplay frames after 2 training episodes in 5.0s",
         "Evaluating 1 games at step 128...",
-        "Evaluation: return=2.0 over 1 games in 6.0s",
+        f"Evaluation: return=2.0 over 1 games in {evaluation_seconds:.1f}s",
     ]
     writer.log_metrics.assert_any_call({"actor/video_seconds" if trainer is ppo else "time/video_seconds": 5.0}, 128)
     assert (
         writer.log_metrics.call_args.args[0]["eval/evaluation_seconds" if trainer is ppo else "time/evaluation_seconds"]
-        == 6.0
+        == evaluation_seconds
     )
     assert writer.log_metrics.call_args.args[1] == 128
     assert [call.args[1] for call in writer.log_video.call_args_list] == ["gameplay/128.gif", "eval/gameplay/128.gif"]
@@ -305,6 +352,7 @@ def test_single_evaluation_omits_unavailable_uncertainty(
     assert report["return_std"] is None
     assert report["return_sem"] is None
     assert "training_scores" not in report
+    writer.log_video.assert_not_called()
 
 
 def test_kinetix_video_and_evaluation_use_configured_environment() -> None:

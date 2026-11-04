@@ -1,0 +1,47 @@
+# Manipulation: move a two-joint arm tip to a sampled target. Assets ship with Brax.
+# Run: uv run ppo --config configs/ppo/brax/reacher.yaml
+env:
+  id: Brax
+  task: reacher
+  backend: generalized
+  max_steps: 50 # 1 simulated second at 50 Hz
+seed: 1
+total_steps: 2_000_000 # Environment steps summed across environments
+num_envs: 32
+num_steps: 128
+num_minibatches: 4
+update_epochs: 4
+model:
+  continuous_policy: truncated_gaussian
+  encoder:
+    type: mlp
+    hidden_size: 64
+    embedding_size: 64
+  recurrent:
+    type: lstm
+    hidden_size: 64
+bf16: false
+learning_rate: 0.0003
+anneal_lr: true
+lr_decay: linear
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: 0.01
+entropy_coef: 0.001
+entropy_decay: cosine
+value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
+max_grad_norm: 0.5
+ckpt_dir: /runs/ppo/${run_id}
+run_id: ppo_${path_name:${env.id}}_${env.task}_${env.backend}_seed${seed}
+checkpoint_interval: 98
+log_interval: 10
+# Intervals count completed PPO iterations.
+# Video/evaluation require an available OpenGL backend (e.g. MUJOCO_GL=egl).
+# Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
+video_interval: 49
+video_max_frames: 51
+video_fps: 50.0
+eval_interval: 98
+eval_episodes: 10
+eval_seed: 10000

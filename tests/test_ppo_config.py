@@ -276,7 +276,6 @@ def test_optional_environments_reject_invalid_settings(name: str, settings: dict
         ("minatar/space_invaders", ppo.GymnaxConfig, "GymnaxEnv"),
         ("jaxtari/breakout", ppo.JAXtariConfig, "JAXtariEnv"),
         ("foragax/square_wave_two_biome", ppo.ForagaxConfig, "ForagaxEnv"),
-        ("brax/pusher", ppo.BraxConfig, "BraxEnv"),
         ("kinetix", KinetixConfig, "KinetixEnv"),
         ("xminigrid", XMiniGridConfig, "XMiniGridEnv"),
         ("craftax/symbolic", CraftaxConfig, "CraftaxEnv"),

@@ -12,7 +12,7 @@ num_minibatches: 4
 update_epochs: 4
 model:
   encoder:
-    type: rgb
+    type: conv2d
     stages:
       - { channels: 32, blocks: 1, resize_factor: 0.25 }
       - { channels: 64, blocks: 1, resize_factor: 0.5 }

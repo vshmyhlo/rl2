@@ -1,4 +1,8 @@
 model: Qwen/Qwen3-0.6B
+attention_backend: tokamax
+scan_layers: true
+gradient_checkpointing: true
+padding_multiple: 256
 taskset:
   id: toolrl
   # Official train split, pinned to an upstream revision. A local Parquet path also works.
@@ -16,6 +20,6 @@ max_grad_norm: 1.0
 update_epochs: 1
 minibatches_per_epoch: 4
 grad_accum_steps: 1
-weight_update_pause_mode: wait # wait, abort, or keep in-flight vLLM requests
+weight_update_pause_mode: wait # wait or keep in-flight vLLM requests
 run_id: grpo_v2_toolrl_${path_name:${model}}_seed${seed}
 ckpt_dir: /runs/grpo_v2/${run_id} # Profiling artifacts; checkpointing is not implemented.

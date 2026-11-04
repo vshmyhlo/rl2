@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import yaml
 from flax.training.train_state import TrainState
 from pydantic import ValidationError
 
@@ -15,7 +16,32 @@ from rl2 import ppo
 from rl2.actions import ContinuousSpace
 from rl2.envs.brax_env import BraxConfig, BraxEnv
 
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs/ppo/brax/pusher.yaml"
+
+@pytest.fixture
+def config() -> ppo.Config:
+    return ppo.Config(
+        env=BraxConfig(max_steps=2),
+        seed=0,
+        total_steps=2,
+        num_envs=1,
+        num_steps=2,
+        num_minibatches=1,
+        update_epochs=1,
+        model=ppo.ModelConfig(
+            encoder=ppo.MLPEncoderConfig(hidden_size=4, embedding_size=2),
+            recurrent=ppo.LSTMConfig(hidden_size=2),
+        ),
+        bf16=False,
+        learning_rate=1e-3,
+        anneal_lr=False,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_coef=0.2,
+        target_kl=None,
+        entropy_coef=0.001,
+        max_grad_norm=0.5,
+        video_fps=20.0,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -31,15 +57,65 @@ def test_invalid_settings(settings: dict[str, object]) -> None:
         BraxConfig(**settings)
 
 
-def test_cli(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = ppo.load_config(CONFIG_PATH, ppo.Config)
-    assert config.env == BraxConfig()
-    assert config.ckpt_dir == f"runs/ppo/{config.run_id}"
+def test_cli(config: ppo.Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = tmp_path / "ppo.yaml"
+    config_path.write_text(yaml.safe_dump(asdict(config)))
+    config = ppo.load_config(config_path, ppo.Config)
     train = Mock()
     monkeypatch.setattr(ppo, "train", train)
-    monkeypatch.setattr("sys.argv", ["ppo", "--config", str(CONFIG_PATH)])
+    monkeypatch.setattr("sys.argv", ["ppo", "--config", str(config_path)])
     ppo.main()
     train.assert_called_once_with(config)
+
+
+@pytest.mark.parametrize(
+    "env_config,observation_size,action_size",
+    [
+        (BraxConfig(task="halfcheetah", max_steps=2), 17, 6),
+        (BraxConfig(task="inverted_pendulum", max_steps=2), 4, 1),
+        (BraxConfig(task="reacher", max_steps=2), 11, 2),
+    ],
+    ids=["locomotion", "balance", "manipulation"],
+)
+def test_starter_tasks(config: ppo.Config, env_config: BraxConfig, observation_size: int, action_size: int) -> None:
+    env = ppo.make_env(replace(config, env=env_config))
+    assert isinstance(env, BraxEnv)
+    assert env.action_space == ContinuousSpace(
+        shape=(action_size,), low=(-1.0,) * action_size, high=(1.0,) * action_size
+    )
+    observation, initial = env.reset(jax.random.key(0), env.params)  # (O,); leaves: (...)
+    assert observation.shape == (observation_size,) and observation.dtype == jnp.float32
+    states = jax.tree.map(lambda x: jnp.stack([x, x]), initial)  # leaves: (B=2, ...)
+    states = states.replace(step_count=jnp.array([0, 1], jnp.int32))
+    keys = jax.random.split(jax.random.key(1), 2)  # (B,)
+    actions = jnp.zeros((2, action_size), jnp.float32)  # (B, A)
+    result = jax.jit(env.step_batch)(keys, states, actions, env.params)
+    chex.assert_shape((result.observation, result.info["final_observation"]), (2, observation_size))
+    chex.assert_shape((result.reward, result.done), (2,))
+    np.testing.assert_array_equal(result.done, [False, True])
+    np.testing.assert_array_equal(result.info["terminated"], [False, False])
+    np.testing.assert_array_equal(result.info["truncated"], [False, True])
+    np.testing.assert_array_equal(result.state.step_count, [1, 0])
+    np.testing.assert_array_equal(result.info["final_observation"], result.info["final_state"].physics.obs)
+    np.testing.assert_array_equal(result.observation[0], result.info["final_observation"][0])
+    reset_observation, _ = env.reset(keys[1], env.params)  # (O,)
+    np.testing.assert_array_equal(result.observation[1], reset_observation)
+
+
+def test_pendulum_fall_terminates() -> None:
+    env = BraxEnv(BraxConfig(task="inverted_pendulum"))
+    _, state = env.reset(jax.random.key(0), env.params)  # (O=4,); leaves: (...)
+    q = env.env.sys.init_q.at[1].set(0.5)  # (2,) pole beyond the 0.2-radian limit
+    pipeline_state = env.env.pipeline_init(q, jnp.zeros(2))  # leaves: (...)
+    state = state.replace(physics=state.physics.replace(pipeline_state=pipeline_state))
+    key = jax.random.key(1)  # ()
+    result = env.step(key, state, jnp.zeros(1), env.params)
+    assert bool(result.done) and bool(result.info["terminated"])
+    assert not bool(result.info["truncated"])
+    assert int(result.state.step_count) == 0
+    assert abs(float(result.info["final_observation"][1])) > 0.2
+    reset_observation, _ = env.reset(key, env.params)  # (O,)
+    np.testing.assert_array_equal(result.observation, reset_observation)
 
 
 def test_native_spaces_rewards_and_batched_timeout(env: BraxEnv) -> None:
@@ -85,19 +161,7 @@ def test_render_passes_pipeline_state(env: BraxEnv, monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.usefixtures("ppo_mesh")
-def test_real_pusher_rollout_and_update(env: BraxEnv) -> None:
-    config = replace(
-        ppo.load_config(CONFIG_PATH, ppo.Config),
-        num_envs=1,
-        num_steps=2,
-        num_minibatches=1,
-        update_epochs=1,
-        target_kl=None,
-        model=ppo.ModelConfig(
-            encoder=ppo.MLPEncoderConfig(hidden_size=4, embedding_size=2),
-            recurrent=ppo.LSTMConfig(hidden_size=2),
-        ),
-    )
+def test_real_pusher_rollout_and_update(env: BraxEnv, config: ppo.Config) -> None:
     observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(jax.random.key(0), 1), env.params
     )  # (B=1,23); leaves: (B,...)

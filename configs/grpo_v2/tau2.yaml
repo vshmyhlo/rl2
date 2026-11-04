@@ -1,4 +1,8 @@
 model: Qwen/Qwen3-0.6B
+attention_backend: tokamax
+scan_layers: true
+gradient_checkpointing: true
+padding_multiple: 256
 taskset:
   id: tau2
   python: /opt/tau2/bin/python
