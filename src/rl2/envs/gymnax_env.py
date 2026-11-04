@@ -1,13 +1,14 @@
 """Gymnax MinAtar and FourRooms with native visual observations."""
 
-from typing import Literal
+from functools import partial
+from typing import Annotated, Literal
 
 import gymnax
 import jax
 import jax.numpy as jnp
 from gymnax.environments.minatar import breakout, space_invaders
 from gymnax.environments.misc import rooms
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
 from rl2.actions import DiscreteSpace
@@ -20,41 +21,26 @@ type EnvState = breakout.EnvState | space_invaders.EnvState | rooms.EnvState
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class GymnaxConfig:
     id: Literal["Breakout-MinAtar", "SpaceInvaders-MinAtar", "FourRooms-misc"] = "Breakout-MinAtar"
+    max_steps: Annotated[int, Field(gt=0, lt=2**31, strict=True)] | None = None
 
 
 class GymnaxEnv(BaseEnv[EnvState, EnvParams]):
     """Visual environments with explicit state, independent RNGs, and same-step reset."""
 
-    @staticmethod
-    def render_observation(observation: jax.Array) -> jax.Array:  # (H, W, C) -> (H*16, W*16, 3)
-        return render_observation(observation)  # (H*16, W*16, 3)
-
-    def render(self, state: EnvState) -> jax.Array:  # state leaves: (...) -> (H*16, W*16, 3)
-        if isinstance(state, rooms.EnvState):
-            pixels = jnp.where(self.env.occupied_map[..., None], 80, 255)  # (H, W, 1)
-            pixels = jnp.repeat(pixels, 3, axis=-1).astype(jnp.uint8)  # (H, W, 3)
-            pixels = pixels.at[state.goal[0], state.goal[1]].set(jnp.array([80, 200, 80], jnp.uint8))  # (H, W, 3)
-            pixels = pixels.at[state.pos[0], state.pos[1]].set(jnp.array([80, 160, 255], jnp.uint8))  # (H, W, 3)
-            return pixels.repeat(16, axis=0).repeat(16, axis=1)  # (H*16, W*16, 3)
-        observation = self.env.get_obs(state, self.params)  # (H, W, C)
-        return render_observation(observation)  # (H*16, W*16, 3)
-
-    def __init__(self, env_id: str, *, max_steps_in_episode: int | None = None) -> None:
-        if env_id not in ("Breakout-MinAtar", "SpaceInvaders-MinAtar", "FourRooms-misc"):
-            raise ValueError("PPO supports Gymnax Breakout-MinAtar, SpaceInvaders-MinAtar, and FourRooms-misc")
-        kwargs = {"use_visual_obs": True} if env_id == "FourRooms-misc" else {}
-        self.env, self.params = gymnax.make(env_id, **kwargs)
-        if max_steps_in_episode is not None:
-            if max_steps_in_episode <= 0:
-                raise ValueError("max_steps_in_episode must be positive")
-            self.params = self.params.replace(max_steps_in_episode=max_steps_in_episode)
+    def __init__(self, config: GymnaxConfig) -> None:
+        kwargs = {"use_visual_obs": True} if config.id == "FourRooms-misc" else {}
+        self.env, self.params = gymnax.make(config.id, **kwargs)
+        if config.max_steps is not None:
+            self.params = self.params.replace(max_steps_in_episode=config.max_steps)
         self.action_space = DiscreteSpace(self.env.num_actions)
 
+    @partial(jax.jit, static_argnames="self")
     def reset(self, key: jax.Array, params: EnvParams) -> tuple[jax.Array, EnvState]:  # key: ()
         """Return (H, W, C) float32 observation and (...) state leaves."""
         observation, state = self.env.reset(key, params)  # (H, W, C); state leaves: (...)
         return observation, state  # (H, W, C); state leaves: (...)
 
+    @partial(jax.jit, static_argnames="self")
     def step(
         self,
         key: jax.Array,  # () typed PRNG key
@@ -92,6 +78,20 @@ class GymnaxEnv(BaseEnv[EnvState, EnvParams]):
                 "final_state": final_state,  # leaves: (...)
             },
         )
+
+    @staticmethod
+    def render_observation(observation: jax.Array) -> jax.Array:  # (H, W, C) -> (H*16, W*16, 3)
+        return render_observation(observation)  # (H*16, W*16, 3)
+
+    def render(self, state: EnvState) -> jax.Array:  # state leaves: (...) -> (H*16, W*16, 3)
+        if isinstance(state, rooms.EnvState):
+            pixels = jnp.where(self.env.occupied_map[..., None], 80, 255)  # (H, W, 1)
+            pixels = jnp.repeat(pixels, 3, axis=-1).astype(jnp.uint8)  # (H, W, 3)
+            pixels = pixels.at[state.goal[0], state.goal[1]].set(jnp.array([80, 200, 80], jnp.uint8))  # (H, W, 3)
+            pixels = pixels.at[state.pos[0], state.pos[1]].set(jnp.array([80, 160, 255], jnp.uint8))  # (H, W, 3)
+            return pixels.repeat(16, axis=0).repeat(16, axis=1)  # (H*16, W*16, 3)
+        observation = self.env.get_obs(state, self.params)  # (H, W, C)
+        return render_observation(observation)  # (H*16, W*16, 3)
 
 
 def render_observation(observation: jax.Array) -> jax.Array:  # (H, W, C) -> (H*16, W*16, 3)

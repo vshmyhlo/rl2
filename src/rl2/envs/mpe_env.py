@@ -27,7 +27,7 @@ class MPEConfig:
     id: MPEEnvId = "MPE_simple_spread_v3"
     num_agents: Annotated[int, Field(gt=0, strict=True)] = 3
     num_landmarks: Annotated[int, Field(gt=0, strict=True)] = 3
-    max_steps: Annotated[int, Field(gt=0, strict=True)] = 25
+    max_steps: Annotated[int, Field(gt=0, lt=2**31, strict=True)] = 25
     local_ratio: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)] = 0.5
 
     def __post_init__(self) -> None:

@@ -45,7 +45,7 @@ def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs:
         gamma=0.5,
         gae_lambda=1.0,
     )
-    env = GymnaxEnv(config.env.id, max_steps_in_episode=2)
+    env = GymnaxEnv(ppo.GymnaxConfig(id=config.env.id, max_steps=2))
     key = jax.random.key(0)  # ()
     observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(key, num_envs), env.params
@@ -113,7 +113,7 @@ def test_train_step_matches_separate_rollout_and_updates_with_real_model() -> No
             recurrent=ppo.LSTMConfig(hidden_size=4),
         ),
     )
-    env = GymnaxEnv(config.env.id)
+    env = GymnaxEnv(config.env)
     observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(jax.random.key(0), 2), env.params
     )  # (B=2,4,10,10); leaves: (B,...)
@@ -202,7 +202,7 @@ def test_train_step_stops_updates_and_rng_at_rejected_minibatch(reject_at: int) 
         update_epochs=2,
         target_kl=0.01,
     )
-    env = GymnaxEnv(config.env.id, max_steps_in_episode=1)
+    env = GymnaxEnv(ppo.GymnaxConfig(id=config.env.id, max_steps=1))
     key = jax.random.key(0)  # ()
     observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(key, 2), env.params
@@ -312,7 +312,7 @@ def test_terminal_and_timeout_targets_use_final_observations() -> None:
         num_minibatches=1,
         gamma=0.5,
     )
-    env = GymnaxEnv(config.env.id, max_steps_in_episode=2)
+    env = GymnaxEnv(ppo.GymnaxConfig(id=config.env.id, max_steps=2))
     _, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(jax.random.key(0), 4), env.params
     )  # leaves: (B=4,...)

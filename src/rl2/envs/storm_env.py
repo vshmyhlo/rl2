@@ -22,7 +22,8 @@ class STORMConfig:
     num_agents: Annotated[int, Field(ge=2, strict=True)] = 2
     grid_size: Annotated[int, Field(ge=5, strict=True)] = 8
     num_coins: Annotated[int, Field(gt=0, strict=True)] = 6
-    max_steps: Annotated[int, Field(gt=0, strict=True)] = 152
+    # The native inner horizon adds one to avoid its automatic reset.
+    max_steps: Annotated[int, Field(gt=0, lt=2**31 - 1, strict=True)] = 152
     freeze_penalty: Annotated[int, Field(gt=0, strict=True)] = 5
 
     def __post_init__(self) -> None:

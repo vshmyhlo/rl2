@@ -24,7 +24,7 @@ class JaxNavConfig:
     map_size: Annotated[int, Field(ge=5, strict=True)] = 11
     fill: Annotated[float, Field(ge=0, lt=1, allow_inf_nan=False)] = 0.3
     lidar_num_beams: Annotated[int, Field(gt=0, strict=True)] = 200
-    max_steps: Annotated[int, Field(gt=0, strict=True)] = 500
+    max_steps: Annotated[int, Field(gt=0, lt=2**31, strict=True)] = 500
     rew_lambda: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)] = 0.5
 
 
@@ -67,26 +67,26 @@ class JaxNavEnv(BaseMultiAgentEnv[State]):
         actions: jax.Array,  # (N,) int32
     ) -> MultiAgentStep[State]:
         step_key, reset_key = jax.random.split(key)  # each ()
-        observations, final_state, rewards, dones, _ = self.env.step_env(
+        observations, final_state, rewards, _, _ = self.env.step_env(
             step_key, state, {agent: actions[i] for i, agent in enumerate(self.agents)}
-        )  # observations: agent (O,); rewards/dones: agent (); state leaves: (...)
+        )  # observations: agent (O,); rewards: agent (); state leaves: (...)
         terminated = (final_state.goal_reached | final_state.move_term).all()  # ()
         truncated = final_state.step >= self.config.max_steps  # ()
-        done = dones["__all__"]  # ()
-        final_observation = self._observation(observations)
+        done = terminated | truncated  # ()
+        final_observation = self._observation(observations)  # (N, O)/(N, A)
         observation, next_state = jax.lax.cond(
             done, lambda: self.reset(reset_key), lambda: (final_observation, final_state)
         )  # observations: (N, O)/(N, A); state leaves: (...)
         return MultiAgentStep(
-            observation,
-            next_state,
-            jnp.stack([rewards[agent] for agent in self.agents]),  # (N,)
-            done,  # ()
-            self.memory_resets(final_state) | done,  # (N,)
-            terminated,
-            truncated,
-            final_observation,
-            final_state,
+            observation=observation,  # (N, O)/(N, A)
+            state=next_state,  # leaves: (...)
+            rewards=jnp.stack([rewards[agent] for agent in self.agents]),  # (N,)
+            done=done,  # ()
+            agent_dones=self.memory_resets(final_state) | done,  # (N,)
+            terminated=terminated,  # ()
+            truncated=truncated,  # ()
+            final_observation=final_observation,  # (N, O)/(N, A)
+            final_state=final_state,  # leaves: (...)
         )
 
     def memory_resets(self, state: State) -> jax.Array:  # state leaves: (...) -> (N,)

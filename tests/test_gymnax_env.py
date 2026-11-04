@@ -3,15 +3,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from pydantic import ValidationError
 
 from rl2.envs import EnvStep
-from rl2.envs.gymnax_env import GymnaxEnv, render_observation
+from rl2.envs.gymnax_env import GymnaxConfig, GymnaxEnv, render_observation
 
 
 @pytest.mark.parametrize("env_id,channels,actions", [("Breakout-MinAtar", 4, 3), ("SpaceInvaders-MinAtar", 6, 4)])
 def test_single_reset_step_preserves_native_observations(env_id: str, channels: int, actions: int) -> None:
-    env = GymnaxEnv(env_id)
-    params = env.params.replace(max_steps_in_episode=1)
+    env = GymnaxEnv(GymnaxConfig(id=env_id, max_steps=1))
+    params = env.params
+    assert params.max_steps_in_episode == 1
     key = jax.random.key(5)  # ()
     observation, state = env.reset(key, params)  # (10,10,C); leaves: (...)
     raw, raw_state = env.env.reset(key, params)  # (10,10,C); leaves: (...)
@@ -39,7 +41,7 @@ def test_single_reset_step_preserves_native_observations(env_id: str, channels: 
 
 
 def test_terminal_timeout_both_and_partial_autoreset() -> None:
-    env = GymnaxEnv("Breakout-MinAtar", max_steps_in_episode=2)
+    env = GymnaxEnv(GymnaxConfig(max_steps=2))
     _, state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(jax.random.key(0), 4), env.params
     )  # leaves: (B=4,...)
@@ -67,7 +69,7 @@ def test_terminal_timeout_both_and_partial_autoreset() -> None:
 
 
 def test_space_invaders_batched_collision_and_fire() -> None:
-    env = GymnaxEnv("SpaceInvaders-MinAtar")
+    env = GymnaxEnv(GymnaxConfig(id="SpaceInvaders-MinAtar"))
     keys = jax.random.split(jax.random.key(0), 2)  # (B=2,)
     _, state = jax.vmap(env.reset, in_axes=(0, None))(keys, env.params)  # (B,10,10,6); leaves: (B,...)
     state = state.replace(e_bullet_map=state.e_bullet_map.at[0, 8, 5].set(1))  # leaves: (B,...)
@@ -85,13 +87,21 @@ def test_space_invaders_batched_collision_and_fire() -> None:
     np.testing.assert_array_equal(frame[8 * 16, 5 * 16], [80, 255, 80])
 
 
-def test_rejects_non_native_environment() -> None:
-    with pytest.raises(ValueError, match="Gymnax"):
-        GymnaxEnv("ALE/Breakout-v5")
+@pytest.mark.parametrize(
+    "settings", [{"id": "ALE/Breakout-v5"}, {"max_steps": 0}, {"max_steps": True}, {"max_steps": 2**31}]
+)
+def test_invalid_config(settings: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        GymnaxConfig(**settings)
+
+
+def test_default_horizon_preserves_native_limit() -> None:
+    env = GymnaxEnv(GymnaxConfig())
+    assert env.params.max_steps_in_episode == env.env.default_params.max_steps_in_episode
 
 
 def test_four_rooms_visual_observations_and_episode_endings() -> None:
-    env = GymnaxEnv("FourRooms-misc", max_steps_in_episode=2)
+    env = GymnaxEnv(GymnaxConfig(id="FourRooms-misc", max_steps=2))
     params = env.params.replace(fail_prob=0.0)
     keys = jax.random.split(jax.random.key(0), 3)  # (B=3,)
     observations, state = jax.vmap(env.reset, in_axes=(0, None))(keys, params)  # (B,13,13,2); leaves: (B,...)

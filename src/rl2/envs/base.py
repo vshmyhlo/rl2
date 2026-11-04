@@ -12,7 +12,7 @@ from rl2.envs.observations import Observation
 
 
 class StepInfo[State](TypedDict):
-    """Termination flags and final observation/state before autoreset."""
+    """Pre-reset transition data, populated on every step; both flags may be true."""
 
     terminated: jax.Array  # () bool
     truncated: jax.Array  # () bool

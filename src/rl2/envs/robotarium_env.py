@@ -39,7 +39,7 @@ class RobotariumConfig:
     )
     zone1_load: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 50.0
     zone2_load: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 50.0
-    max_steps: Annotated[int, Field(gt=0, strict=True)] = 100
+    max_steps: Annotated[int, Field(gt=0, lt=2**31, strict=True)] = 100
     update_frequency: Annotated[int, Field(gt=0, strict=True)] = 30
     collision_avoidance: bool = True
 

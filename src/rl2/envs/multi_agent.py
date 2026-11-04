@@ -18,13 +18,18 @@ class AgentObservation(NamedTuple):
 
 
 class MultiAgentStep[State](NamedTuple):
+    """Transition with done = terminated | truncated; both flags may be true.
+
+    Final observation/state are populated on every step, before any autoreset.
+    """
+
     observation: AgentObservation  # (N, O); (N, A), after autoreset
     state: State  # leaves: (...)
-    rewards: jax.Array  # (N,)
-    done: jax.Array  # () environment completion
-    agent_dones: jax.Array  # (N,) recurrent reset flags
-    terminated: jax.Array  # () task ended
-    truncated: jax.Array  # () time limit reached
+    rewards: jax.Array  # (N,) floating-point
+    done: jax.Array  # () bool environment completion
+    agent_dones: jax.Array  # (N,) bool recurrent reset flags
+    terminated: jax.Array  # () bool task ended
+    truncated: jax.Array  # () bool time limit reached
     final_observation: AgentObservation  # (N, O); (N, A), before autoreset
     final_state: State  # leaves: (...), before autoreset
 

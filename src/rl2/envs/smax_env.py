@@ -22,7 +22,7 @@ from rl2.envs.multi_agent import AgentObservation, BaseMultiAgentEnv, MultiAgent
 class SMAXConfig:
     id: Literal["SMAX"] = "SMAX"
     map_name: str = "3m"
-    max_steps: Annotated[int, Field(gt=0, strict=True)] = 100
+    max_steps: Annotated[int, Field(gt=0, lt=2**31, strict=True)] = 100
 
     def __post_init__(self) -> None:
         try:
@@ -48,8 +48,8 @@ class SMAXEnv(BaseMultiAgentEnv[State]):
         """Pack agent observations: (O,) leaves and state: (...) leaves in fixed order."""
         masks = self.env.get_avail_actions(state)  # agent leaves: (A,)
         return AgentObservation(
-            jnp.stack([observations[agent] for agent in self.agents]),  # (N, O)
-            jnp.stack([masks[agent] for agent in self.agents]).astype(bool),  # (N, A)
+            observations=jnp.stack([observations[agent] for agent in self.agents]),  # (N, O)
+            action_masks=jnp.stack([masks[agent] for agent in self.agents]).astype(bool),  # (N, A)
         )
 
     @partial(jax.jit, static_argnames="self")
@@ -74,20 +74,20 @@ class SMAXEnv(BaseMultiAgentEnv[State]):
         truncated = final_state.state.step >= self.config.max_steps  # ()
         done = terminated | truncated  # ()
         final_state = final_state.replace(state=final_state.state.replace(done=done))
-        final_observation = self._observation(observations, final_state)
+        final_observation = self._observation(observations, final_state)  # (N, O)/(N, A)
         observation, next_state = jax.lax.cond(
             done, lambda: self.reset(reset_key), lambda: (final_observation, final_state)
         )  # observations: (N, O)/(N, A); state leaves: (...)
         return MultiAgentStep(
-            observation,
-            next_state,
-            jnp.stack([rewards[agent] for agent in self.agents]),  # (N,)
-            done,  # ()
-            jnp.stack([dones[agent] for agent in self.agents]) | done,  # (N,)
-            terminated,
-            truncated,
-            final_observation,
-            final_state,
+            observation=observation,  # (N, O)/(N, A)
+            state=next_state,  # leaves: (...)
+            rewards=jnp.stack([rewards[agent] for agent in self.agents]),  # (N,)
+            done=done,  # ()
+            agent_dones=jnp.stack([dones[agent] for agent in self.agents]) | done,  # (N,)
+            terminated=terminated,  # ()
+            truncated=truncated,  # ()
+            final_observation=final_observation,  # (N, O)/(N, A)
+            final_state=final_state,  # leaves: (...)
         )
 
     def memory_resets(self, state: State) -> jax.Array:  # state leaves: (...) -> (N,)

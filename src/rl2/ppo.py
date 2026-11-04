@@ -419,7 +419,7 @@ def make_env(config: Config) -> PPOEnv:
         return XMiniGridEnv(config.env)
     if isinstance(config.env, CraftaxConfig):
         return CraftaxEnv(config.env)
-    return GymnaxEnv(config.env.id)
+    return GymnaxEnv(config.env)
 
 
 class TrainingProgress(NamedTuple):

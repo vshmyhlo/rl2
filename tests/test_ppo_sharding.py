@@ -193,7 +193,7 @@ def test_sharded_training_matches_single_device_and_restores_checkpoint(
 ) -> None:
     replicated = NamedSharding(mesh, PartitionSpec())
     batched = NamedSharding(mesh, PartitionSpec("batch"))
-    env = GymnaxEnv(config.env.id, max_steps_in_episode=2)
+    env = GymnaxEnv(ppo.GymnaxConfig(id=config.env.id, max_steps=2))
     observations, env_state = jax.vmap(env.reset, in_axes=(0, None))(
         jax.random.split(jax.random.key(0), config.num_envs), env.params
     )  # observations: (B=4,10,10,4); state leaves: (B,...)

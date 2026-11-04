@@ -56,7 +56,9 @@ class KinetixEnv(BaseEnv[EnvState, EnvParams]):
             self.action_space = DiscreteSpace(space.n)
         else:
             self.action_space = ContinuousSpace(
-                space.shape, tuple(map(float, space.low.ravel())), tuple(map(float, space.high.ravel()))
+                shape=space.shape,
+                low=tuple(map(float, space.low.ravel())),
+                high=tuple(map(float, space.high.ravel())),
             )
 
     @partial(jax.jit, static_argnames="self")
@@ -90,11 +92,11 @@ class KinetixEnv(BaseEnv[EnvState, EnvParams]):
 
         observation, state = jax.lax.cond(done, reset_done, continue_episode, None)  # (F,); leaves: (...)
         return EnvStep(
-            observation,  # (F,)
-            state,  # leaves: (...)
-            reward,  # ()
-            done,  # ()
-            {
+            observation=observation,  # (F,)
+            state=state,  # leaves: (...)
+            reward=reward,  # ()
+            done=done,  # ()
+            info={
                 "terminated": terminated,  # ()
                 "truncated": truncated,  # ()
                 "final_observation": final_observation,  # (F,)

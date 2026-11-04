@@ -89,11 +89,11 @@ class XMiniGridEnv(BaseEnv[TimeStep, EnvParams]):
 
         state = jax.lax.cond(done, reset_done, continue_episode, None) if auto_reset else timestep  # leaves: (...)
         return EnvStep(
-            state.observation,  # (H, W, 2)
-            state,  # leaves: (...)
-            timestep.reward,  # ()
-            done,  # ()
-            {
+            observation=state.observation,  # (H, W, 2)
+            state=state,  # leaves: (...)
+            reward=timestep.reward,  # ()
+            done=done,  # ()
+            info={
                 "terminated": terminated,  # ()
                 "truncated": truncated,  # ()
                 "final_observation": timestep.observation,  # (H, W, 2)

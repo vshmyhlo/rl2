@@ -270,31 +270,47 @@ def test_optional_environments_reject_invalid_settings(name: str, settings: dict
 
 
 @pytest.mark.parametrize(
-    "filename,config_class,constructor_name",
+    "config_class,encoder,constructor_name",
     [
-        ("minatar/breakout", ppo.GymnaxConfig, "GymnaxEnv"),
-        ("minatar/space_invaders", ppo.GymnaxConfig, "GymnaxEnv"),
-        ("jaxtari/breakout", ppo.JAXtariConfig, "JAXtariEnv"),
-        ("foragax/square_wave_two_biome", ppo.ForagaxConfig, "ForagaxEnv"),
-        ("kinetix", KinetixConfig, "KinetixEnv"),
-        ("xminigrid", XMiniGridConfig, "XMiniGridEnv"),
-        ("craftax/symbolic", CraftaxConfig, "CraftaxEnv"),
-        ("craftax/pixels", CraftaxConfig, "CraftaxEnv"),
-        ("mujoco_playground/manipulation/panda_pick_cube", ppo.PlaygroundConfig, "PlaygroundEnv"),
+        (ppo.GymnaxConfig, ppo.Conv2DEncoderConfig(), "GymnaxEnv"),
+        (ppo.JAXtariConfig, ppo.Conv2DEncoderConfig(), "JAXtariEnv"),
+        (ppo.ForagaxConfig, ppo.Conv2DEncoderConfig(), "ForagaxEnv"),
+        (KinetixConfig, ppo.KinetixEncoderConfig(), "KinetixEnv"),
+        (XMiniGridConfig, ppo.XMiniGridEncoderConfig(), "XMiniGridEnv"),
+        (CraftaxConfig, ppo.Conv2DEncoderConfig(), "CraftaxEnv"),
+        (ppo.PlaygroundConfig, ppo.MLPEncoderConfig(), "PlaygroundEnv"),
+        (ppo.BraxConfig, ppo.MLPEncoderConfig(), "BraxEnv"),
+        (ppo.PgxConfig, ppo.Conv2DEncoderConfig(), "PgxEnv"),
     ],
 )
 def test_environment_round_trip_and_factory(
-    filename: str, config_class: type, constructor_name: str, monkeypatch: pytest.MonkeyPatch
+    config_class: type, encoder: ppo.EncoderConfig, constructor_name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / f"configs/ppo/{filename}.yaml", Config)
-    assert config.value_coef == 1.0
-    assert isinstance(config.env, config_class)
+    config = Config(
+        env=config_class(max_steps=2),
+        model=ppo.ModelConfig(encoder=encoder),
+        seed=0,
+        total_steps=2,
+        num_envs=1,
+        num_steps=2,
+        num_minibatches=1,
+        update_epochs=1,
+        learning_rate=1e-3,
+        anneal_lr=False,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_coef=0.2,
+        target_kl=None,
+        entropy_coef=0.001,
+        max_grad_norm=0.5,
+        video_fps=20.0,
+    )
     restored = Config(**yaml.safe_load(yaml.safe_dump(asdict(config))))
     assert restored == config and hash(restored) == hash(config)
     constructor = Mock()
     monkeypatch.setattr(ppo, constructor_name, constructor)
     assert ppo.make_env(config) is constructor.return_value
-    constructor.assert_called_once_with(config.env.id if isinstance(config.env, ppo.GymnaxConfig) else config.env)
+    constructor.assert_called_once_with(config.env)
 
 
 def test_craftax_encoder_requires_symbolic_environment() -> None:

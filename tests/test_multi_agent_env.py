@@ -2,11 +2,16 @@ from inspect import isabstract
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from rl2.envs import BaseMultiAgentEnv
-from rl2.envs.jaxnav_env import JaxNavEnv
-from rl2.envs.mpe_env import MPEEnv
-from rl2.envs.smax_env import SMAXEnv
+from rl2.envs.jaxnav_env import JaxNavConfig, JaxNavEnv
+from rl2.envs.mpe_env import MPEConfig, MPEEnv
+from rl2.envs.robotarium_env import RobotariumConfig, RobotariumEnv
+from rl2.envs.smax_env import SMAXConfig, SMAXEnv
+from rl2.envs.storm_env import STORMConfig, STORMEnv
+
+type MultiAgentConfig = JaxNavConfig | MPEConfig | RobotariumConfig | SMAXConfig | STORMConfig
 
 
 def test_base_multi_agent_env_cannot_be_instantiated() -> None:
@@ -23,7 +28,23 @@ def test_incomplete_adapter_cannot_be_instantiated(missing: str) -> None:
         incomplete()
 
 
-@pytest.mark.parametrize("adapter", [MPEEnv, SMAXEnv, JaxNavEnv])
+@pytest.mark.parametrize("adapter", [MPEEnv, SMAXEnv, JaxNavEnv, RobotariumEnv, STORMEnv])
 def test_adapters_implement_base_multi_agent_env(adapter: type[BaseMultiAgentEnv[Any]]) -> None:
     assert issubclass(adapter, BaseMultiAgentEnv)
     assert not isabstract(adapter)
+
+
+@pytest.mark.parametrize(
+    "config_class,upper_bound",
+    [
+        (JaxNavConfig, 2**31),
+        (MPEConfig, 2**31),
+        (RobotariumConfig, 2**31),
+        (SMAXConfig, 2**31),
+        (STORMConfig, 2**31 - 1),
+    ],
+)
+def test_horizon_fits_native_int32_counter(config_class: type[MultiAgentConfig], upper_bound: int) -> None:
+    assert config_class(max_steps=upper_bound - 1).max_steps == upper_bound - 1
+    with pytest.raises(ValidationError, match="max_steps"):
+        config_class(max_steps=upper_bound)

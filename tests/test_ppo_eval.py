@@ -46,7 +46,7 @@ def test_episode_frame_limits(frame_limit: int | None, stop: bool, expected_leng
         ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", ppo.Config),
         video_max_frames=frame_limit,
     )
-    env = GymnaxEnv(config.env.id, max_steps_in_episode=2)
+    env = GymnaxEnv(ppo.GymnaxConfig(id=config.env.id, max_steps=2))
     state = TrainState.create(apply_fn=policy, params={}, tx=optax.sgd(0.1))
     carry = ppo.ActorCritic(
         ppo.DiscreteSpace(3),
