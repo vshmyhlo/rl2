@@ -7,7 +7,7 @@ import numpy as np
 import optax
 import pytest
 
-from rl2.model.encoders.rgb import DEFAULT_STAGES, ConvObservationEncoder, ConvStage
+from rl2.model.encoders.conv2d import DEFAULT_STAGES, ConvObservationEncoder, ConvStage
 from rl2.observation_decoder import ConvObservationDecoder
 
 

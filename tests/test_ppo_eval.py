@@ -49,7 +49,8 @@ def test_episode_frame_limits(frame_limit: int | None, stop: bool, expected_leng
     env = GymnaxEnv(config.env.id, max_steps_in_episode=2)
     state = TrainState.create(apply_fn=policy, params={}, tx=optax.sgd(0.1))
     carry = ppo.ActorCritic(
-        ppo.DiscreteSpace(3), ppo.ModelConfig(encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1))
+        ppo.DiscreteSpace(3),
+        ppo.ModelConfig(encoder=ppo.Conv2DEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1)),
     ).initial_carry(1)  # leaves: (1,1)
     with patch.object(ppo, "GymnaxEnv", return_value=env):
         result = ppo.play_episode(
@@ -70,7 +71,8 @@ def test_episode_renders_state_before_autoreset(record: bool) -> None:
     env.render.side_effect = [np.full((3, 5, 3), pixel, np.uint8) for pixel in (10, 20)]  # each (P, Q, 3)
     state = TrainState.create(apply_fn=policy, params={}, tx=optax.sgd(0.1))
     carry = ppo.ActorCritic(
-        ppo.DiscreteSpace(3), ppo.ModelConfig(encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1))
+        ppo.DiscreteSpace(3),
+        ppo.ModelConfig(encoder=ppo.Conv2DEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1)),
     ).initial_carry(1)  # leaves: (1,1)
     result = ppo.play_episode(state, config, jax.random.key(0), carry, record=record, env=env)
     assert (result.episode_return, result.length) == (1.0, 1)
@@ -209,7 +211,8 @@ def test_log_video_wiring() -> None:
     config = ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/xminigrid.yaml", ppo.Config)
     writer = Mock()
     carry = ppo.ActorCritic(
-        ppo.DiscreteSpace(3), ppo.ModelConfig(encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1))
+        ppo.DiscreteSpace(3),
+        ppo.ModelConfig(encoder=ppo.Conv2DEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1)),
     ).initial_carry(1)  # leaves: (1,1)
     with (
         patch.object(ppo, "make_env"),
@@ -309,7 +312,8 @@ def test_kinetix_video_and_evaluation_use_configured_environment() -> None:
         ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/kinetix.yaml", ppo.Config), eval_episodes=1
     )
     carry = ppo.ActorCritic(
-        ppo.DiscreteSpace(11), ppo.ModelConfig(encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1))
+        ppo.DiscreteSpace(11),
+        ppo.ModelConfig(encoder=ppo.Conv2DEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1)),
     ).initial_carry(1)  # leaves: (1,1)
     writer = Mock()
     frame = np.zeros((2, 2, 3), np.uint8)  # (H,W,3)

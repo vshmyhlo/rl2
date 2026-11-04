@@ -20,7 +20,7 @@ from rl2 import (
 )
 from rl2.configuration import BaseConfig
 from rl2.karel import KarelConfig
-from rl2.model.encoders.rgb import ConvStage
+from rl2.model.encoders.conv2d import ConvStage
 
 
 @pytest.mark.parametrize(

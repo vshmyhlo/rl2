@@ -13,7 +13,7 @@ from flax.training.train_state import TrainState
 
 from rl2 import ppo
 from rl2.envs.gymnax_env import GymnaxEnv
-from rl2.model.encoders.rgb import ConvStage
+from rl2.model.encoders.conv2d import ConvStage
 
 pytestmark = pytest.mark.usefixtures("ppo_mesh")
 
@@ -51,7 +51,8 @@ def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs:
         jax.random.split(key, num_envs), env.params
     )  # (B,10,10,4); leaves: (B,...)
     memory = ppo.ActorCritic(
-        ppo.DiscreteSpace(3), ppo.ModelConfig(encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1))
+        ppo.DiscreteSpace(3),
+        ppo.ModelConfig(encoder=ppo.Conv2DEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1)),
     ).initial_carry(num_envs)  # leaves: (B,1)
     runner = ppo.RolloutCarry(
         env_state,
@@ -108,7 +109,7 @@ def test_train_step_matches_separate_rollout_and_updates_with_real_model() -> No
         target_kl=None,
         model=ppo.ModelConfig(
             # Two-channel LayerNorm magnifies FP32 fusion differences in this comparison.
-            encoder=ppo.RGBEncoderConfig(stages=(ConvStage(4, blocks=0),), embedding_size=4),
+            encoder=ppo.Conv2DEncoderConfig(stages=(ConvStage(4, blocks=0),), embedding_size=4),
             recurrent=ppo.LSTMConfig(hidden_size=4),
         ),
     )
@@ -207,7 +208,8 @@ def test_train_step_stops_updates_and_rng_at_rejected_minibatch(reject_at: int) 
         jax.random.split(key, 2), env.params
     )  # (B=2,4,10,10); leaves: (B,...)
     memory = ppo.ActorCritic(
-        ppo.DiscreteSpace(3), ppo.ModelConfig(encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1))
+        ppo.DiscreteSpace(3),
+        ppo.ModelConfig(encoder=ppo.Conv2DEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1)),
     ).initial_carry(2)  # leaves: (B,1)
     runner = ppo.RolloutCarry(
         env_state, observations, memory, jnp.ones(2, bool), jnp.array([1.0, 2.0]), jnp.zeros(2, jnp.int32)
@@ -322,7 +324,8 @@ def test_terminal_and_timeout_targets_use_final_observations() -> None:
     )
     observations = jax.vmap(env.env.get_obs)(env_state)  # (B,10,10,4)
     memory = ppo.ActorCritic(
-        ppo.DiscreteSpace(3), ppo.ModelConfig(encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1))
+        ppo.DiscreteSpace(3),
+        ppo.ModelConfig(encoder=ppo.Conv2DEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1)),
     ).initial_carry(4)  # leaves: (B,1)
 
     def position_policy(

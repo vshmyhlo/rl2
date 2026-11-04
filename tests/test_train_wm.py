@@ -18,7 +18,7 @@ from numpy.typing import NDArray
 from pydantic import ValidationError
 
 from rl2 import train_wm
-from rl2.model.encoders.rgb import ConvStage
+from rl2.model.encoders.conv2d import ConvStage
 from rl2.wm import LSTMWorldModel, MambaWorldModel, WorldModelState, categorical_kl
 
 

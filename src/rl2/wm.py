@@ -10,7 +10,7 @@ from flax import struct
 
 from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.mamba3 import Mamba3Stack, Mamba3StackCarry
-from rl2.model.encoders.rgb import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
+from rl2.model.encoders.conv2d import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
 from rl2.observation_decoder import ConvObservationDecoder
 from rl2.sequence_model import RecurrentSequenceModel
 

@@ -11,7 +11,7 @@ from rl2 import ppo
 from rl2.envs.craftax_env import CraftaxConfig
 from rl2.envs.kinetix_env import KinetixConfig
 from rl2.envs.xminigrid_env import XMiniGridConfig
-from rl2.ppo import Config, KinetixEncoderConfig, RGBEncoderConfig, XMiniGridEncoderConfig, load_config
+from rl2.ppo import Config, Conv2DEncoderConfig, KinetixEncoderConfig, XMiniGridEncoderConfig, load_config
 
 
 @pytest.fixture
@@ -218,10 +218,10 @@ def test_craftax_preset_uses_symbolic_encoder() -> None:
 @pytest.mark.parametrize(
     "env_id,encoder,expected",
     [
-        ("Craftax-Symbolic-v1", "rgb", "craftax"),
+        ("Craftax-Symbolic-v1", "conv2d", "craftax"),
         ("Craftax-Symbolic-v1", "mlp", "craftax"),
-        ("Craftax-Pixels-v1", "mlp", "rgb"),
-        ("Craftax-Pixels-v1", "craftax", "rgb"),
+        ("Craftax-Pixels-v1", "mlp", "conv2d"),
+        ("Craftax-Pixels-v1", "craftax", "conv2d"),
     ],
 )
 def test_craftax_rejects_mismatched_encoder(env_id: str, encoder: str, expected: str) -> None:
@@ -308,11 +308,11 @@ def test_craftax_encoder_requires_symbolic_environment() -> None:
 @pytest.mark.parametrize(
     "model,match",
     [
-        ({"encoder": {"type": "rgb", "stages": []}}, "stages"),
-        ({"encoder": {"type": "rgb", "stages": [{"channels": 0}]}}, "stages"),
-        ({"encoder": {"type": "rgb", "embedding_size": 0}}, "embedding_size"),
-        ({"encoder": {"type": "rgb", "embedding_size": True}}, "embedding_size"),
-        ({"encoder": {"type": "rgb", "unknown": 1}}, "unknown"),
+        ({"encoder": {"type": "conv2d", "stages": []}}, "stages"),
+        ({"encoder": {"type": "conv2d", "stages": [{"channels": 0}]}}, "stages"),
+        ({"encoder": {"type": "conv2d", "embedding_size": 0}}, "embedding_size"),
+        ({"encoder": {"type": "conv2d", "embedding_size": True}}, "embedding_size"),
+        ({"encoder": {"type": "conv2d", "unknown": 1}}, "unknown"),
         ({"hidden_size": 8}, "hidden_size"),
         ({"encoder_stages": []}, "encoder_stages"),
         ({"continuous_policy": "unknown"}, "continuous_policy"),
@@ -334,16 +334,18 @@ def test_rejects_top_level_encoder_stages(config_path: Path) -> None:
         load_config(config_path, Config)
 
 
-@pytest.mark.parametrize("kind", ["rgb", "xminigrid", "kinetix"])
+@pytest.mark.parametrize("kind", ["conv2d", "xminigrid", "kinetix"])
 def test_encoder_variant_round_trip(config_path: Path, kind: str) -> None:
     settings = yaml.safe_load(config_path.read_text())
-    settings["env"] = {"id": {"rgb": "Breakout-MinAtar", "xminigrid": "XLand-MiniGrid", "kinetix": "Kinetix"}[kind]}
+    settings["env"] = {"id": {"conv2d": "Breakout-MinAtar", "xminigrid": "XLand-MiniGrid", "kinetix": "Kinetix"}[kind]}
     settings["model"]["encoder"] = {"type": kind, "embedding_size": 8}
     config_path.write_text(yaml.safe_dump(settings))
     config = load_config(config_path, Config)
-    encoder_class = {"rgb": RGBEncoderConfig, "xminigrid": XMiniGridEncoderConfig, "kinetix": KinetixEncoderConfig}[
-        kind
-    ]
+    encoder_class = {
+        "conv2d": Conv2DEncoderConfig,
+        "xminigrid": XMiniGridEncoderConfig,
+        "kinetix": KinetixEncoderConfig,
+    }[kind]
     assert isinstance(config.model.encoder, encoder_class)
     assert config.model.encoder.embedding_size == 8
     config_path.write_text(yaml.safe_dump(asdict(config)))
@@ -356,7 +358,7 @@ def test_encoder_variant_round_trip(config_path: Path, kind: str) -> None:
     [
         ({}, "union_tag_not_found"),
         ({"type": "unknown"}, "union_tag_invalid"),
-        ({"type": "rgb", "token_size": 4}, "token_size"),
+        ({"type": "conv2d", "token_size": 4}, "token_size"),
         ({"type": "xminigrid", "stages": []}, "stages"),
         ({"type": "xminigrid", "token_size": 0}, "token_size"),
         ({"type": "xminigrid", "channels": True}, "channels"),
@@ -388,7 +390,7 @@ def test_symbolic_encoder_requires_xminigrid(config_path: Path) -> None:
 def test_xminigrid_requires_matching_encoder(config_path: Path) -> None:
     settings = yaml.safe_load(config_path.read_text())
     settings["env"] = {"id": "XLand-MiniGrid"}
-    settings["model"]["encoder"] = {"type": "rgb"}
+    settings["model"]["encoder"] = {"type": "conv2d"}
     config_path.write_text(yaml.safe_dump(settings))
     with pytest.raises(ValidationError, match="XLand-MiniGrid requires model.encoder.type: xminigrid"):
         load_config(config_path, Config)
@@ -396,7 +398,7 @@ def test_xminigrid_requires_matching_encoder(config_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "env_id,encoder,match",
-    [("Kinetix", "rgb", "Kinetix requires"), ("Breakout-MinAtar", "kinetix", "kinetix encoder requires")],
+    [("Kinetix", "conv2d", "Kinetix requires"), ("Breakout-MinAtar", "kinetix", "kinetix encoder requires")],
 )
 def test_kinetix_requires_matching_encoder(config_path: Path, env_id: str, encoder: str, match: str) -> None:
     settings = yaml.safe_load(config_path.read_text())

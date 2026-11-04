@@ -1,4 +1,4 @@
-"""Normalized residual convolutional encoder for Atari observations."""
+"""Residual 2D convolutional encoder for symbolic grids and RGB images."""
 
 import math
 from dataclasses import dataclass

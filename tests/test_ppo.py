@@ -21,7 +21,7 @@ from pydantic import ValidationError
 from rl2 import ppo
 from rl2.envs.base import BaseEnv
 from rl2.lstm import initial_carry
-from rl2.model.encoders.rgb import ConvStage
+from rl2.model.encoders.conv2d import ConvStage
 from rl2.ppo import (
     ActorCritic,
     Config,
@@ -37,7 +37,7 @@ pytestmark = pytest.mark.usefixtures("ppo_mesh")
 
 def small_model_config() -> ppo.ModelConfig:
     return ppo.ModelConfig(
-        encoder=ppo.RGBEncoderConfig(stages=(ConvStage(4, blocks=1),), embedding_size=8),
+        encoder=ppo.Conv2DEncoderConfig(stages=(ConvStage(4, blocks=1),), embedding_size=8),
         recurrent=ppo.LSTMConfig(hidden_size=8, num_layers=2, intermediate_size=8),
     )
 
@@ -355,7 +355,9 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
 def test_recurrent_sequences_match_steps_and_reset_only_finished_env() -> None:
     model = ActorCritic(
         ppo.DiscreteSpace(3),
-        replace(small_model_config(), encoder=ppo.RGBEncoderConfig(stages=(ConvStage(4, blocks=1),), embedding_size=6)),
+        replace(
+            small_model_config(), encoder=ppo.Conv2DEncoderConfig(stages=(ConvStage(4, blocks=1),), embedding_size=6)
+        ),
     )
     obs = jax.random.randint(jax.random.key(2), (2, 4, 4, 8, 8), 0, 256, dtype=jnp.uint8)  # (B=2,T=4,4,8,8)
     carry = model.initial_carry(2)
@@ -1035,7 +1037,7 @@ def test_invalid_video_frame_budget_rejected_by_config(frame_budget: Any) -> Non
 )
 def test_invalid_model_config(model_settings: Any, message: str) -> None:
     settings = vars(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config)).copy()
-    settings["model"] = {"encoder": {"type": "rgb"}, "recurrent": model_settings}
+    settings["model"] = {"encoder": {"type": "conv2d"}, "recurrent": model_settings}
     with pytest.raises(ValidationError, match=message):
         ppo.Config(**settings)
 
@@ -1051,14 +1053,14 @@ def test_flat_model_settings_are_rejected(field: str) -> None:
 def test_default_model_config(tmp_path: Path) -> None:
     settings = yaml.safe_load((Path(__file__).resolve().parents[1] / "configs/ppo.yaml").read_text())
     settings["run_id"] = "model_defaults"  # The preset name references model fields replaced below.
-    settings["model"] = {"encoder": {"type": "rgb"}}
+    settings["model"] = {"encoder": {"type": "conv2d"}}
     path = tmp_path / "ppo.yaml"
     path.write_text(yaml.safe_dump(settings))
-    assert load_config(path, Config).model == ppo.ModelConfig(encoder=ppo.RGBEncoderConfig())
+    assert load_config(path, Config).model == ppo.ModelConfig(encoder=ppo.Conv2DEncoderConfig())
     settings["model"]["recurrent"] = {"hidden_size": 8}
     path.write_text(yaml.safe_dump(settings))
     assert load_config(path, Config).model == ppo.ModelConfig(
-        encoder=ppo.RGBEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=8)
+        encoder=ppo.Conv2DEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=8)
     )
 
 

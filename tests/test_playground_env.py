@@ -76,8 +76,8 @@ def test_invalid_settings(settings: dict[str, object], match: str) -> None:
 @pytest.mark.parametrize(
     "env_id,encoder,match",
     [
-        ("MuJoCo-Playground", "rgb", "requires model.encoder.type: mlp"),
-        ("Brax", "rgb", "requires model.encoder.type: mlp"),
+        ("MuJoCo-Playground", "conv2d", "requires model.encoder.type: mlp"),
+        ("Brax", "conv2d", "requires model.encoder.type: mlp"),
         ("Breakout-MinAtar", "mlp", "mlp encoder requires"),
     ],
 )

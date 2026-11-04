@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from xminigrid.core.constants import NUM_COLORS, NUM_TILES
 
-from rl2.model.encoders.rgb import ResidualBlock
+from rl2.model.encoders.conv2d import ResidualBlock
 
 
 class XMiniGridEncoder(nn.Module):

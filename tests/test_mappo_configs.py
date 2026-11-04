@@ -22,7 +22,7 @@ def test_requires_encoder(field: str) -> None:
 @pytest.mark.parametrize(
     "encoder,field",
     [
-        ({"type": "rgb"}, "type"),
+        ({"type": "conv2d"}, "type"),
         ({"type": "mlp", "embedding_size": 0}, "embedding_size"),
         ({"type": "mlp", "embedding_size": True}, "embedding_size"),
         ({"type": "mlp", "unknown": 1}, "unknown"),

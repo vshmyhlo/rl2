@@ -42,7 +42,7 @@ from rl2.atari_env import make_env
 from rl2.configuration import BaseConfig, load_config
 from rl2.jax_cache import configure_compilation_cache
 from rl2.mlflow_logging import MLflowLogger
-from rl2.model.encoders.rgb import ConvStages, validate_stages
+from rl2.model.encoders.conv2d import ConvStages, validate_stages
 from rl2.wm import (
     LSTMWorldModel,
     MambaWorldModel,

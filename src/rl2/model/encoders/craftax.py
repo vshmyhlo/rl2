@@ -6,8 +6,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from rl2.envs.observations import CraftaxObservation
+from rl2.model.encoders.conv2d import ResidualBlock
 from rl2.model.encoders.mlp import MLPEncoder
-from rl2.model.encoders.rgb import ResidualBlock
 
 
 class CraftaxEncoder(nn.Module):

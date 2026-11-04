@@ -8,7 +8,7 @@ import numpy as np
 import optax
 import pytest
 
-from rl2.model.encoders.rgb import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages, ResidualBlock
+from rl2.model.encoders.conv2d import DEFAULT_STAGES, ConvObservationEncoder, ConvStage, ConvStages, ResidualBlock
 
 
 @pytest.mark.parametrize("shape", [(1, 2, 2), (1, 1, 2, 2, 4)], ids=["missing-batch", "wrong-rgb-channels"])

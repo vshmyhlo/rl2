@@ -16,7 +16,7 @@ from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
 from rl2 import ppo
 from rl2.envs.gymnax_env import GymnaxEnv
-from rl2.model.encoders.rgb import ConvStage
+from rl2.model.encoders.conv2d import ConvStage
 
 pytestmark = pytest.mark.usefixtures("ppo_mesh")
 
@@ -32,7 +32,7 @@ def config() -> ppo.Config:
         target_kl=1.0,
         bf16=False,
         model=ppo.ModelConfig(
-            encoder=ppo.RGBEncoderConfig(stages=(ConvStage(4, blocks=0),), embedding_size=4),
+            encoder=ppo.Conv2DEncoderConfig(stages=(ConvStage(4, blocks=0),), embedding_size=4),
             recurrent=ppo.LSTMConfig(hidden_size=4),
         ),
     )

@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 from rl2 import ppo
 from rl2.envs.foragax_env import ForagaxConfig, ForagaxEnv
-from rl2.model.encoders.rgb import ConvStage
+from rl2.model.encoders.conv2d import ConvStage
 
 PRESET = Path(__file__).resolve().parents[1] / "configs/ppo/foragax/square_wave_two_biome.yaml"
 
@@ -123,7 +123,7 @@ def test_invalid_settings(settings: dict[str, object]) -> None:
 
 def test_requires_cnn() -> None:
     config = ppo.load_config(PRESET, ppo.Config)
-    with pytest.raises(ValidationError, match="Foragax requires model.encoder.type: rgb"):
+    with pytest.raises(ValidationError, match="Foragax requires model.encoder.type: conv2d"):
         replace(config, model=ppo.ModelConfig(encoder=ppo.MLPEncoderConfig()))
 
 
@@ -138,7 +138,7 @@ def test_ppo_update_and_playback() -> None:
         update_epochs=1,
         target_kl=None,
         model=ppo.ModelConfig(
-            encoder=ppo.RGBEncoderConfig(
+            encoder=ppo.Conv2DEncoderConfig(
                 stages=(ConvStage(channels=2, blocks=0, resize_factor=1.0),), embedding_size=2
             ),
             recurrent=ppo.LSTMConfig(hidden_size=2),

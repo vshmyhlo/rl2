@@ -134,14 +134,15 @@ from rl2.envs.gymnax_env import GymnaxConfig, GymnaxEnv
 from rl2.envs.jaxtari_env import JAXtariConfig, JAXtariEnv
 from rl2.envs.kinetix_env import KinetixConfig, KinetixEnv
 from rl2.envs.observations import Observation
+from rl2.envs.pgx_env import PgxConfig, PgxEnv
 from rl2.envs.playground_env import PlaygroundConfig, PlaygroundEnv
 from rl2.envs.xminigrid_env import XMiniGridConfig, XMiniGridEnv
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.mlflow_logging import MLflowLogger
+from rl2.model.encoders.conv2d import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
 from rl2.model.encoders.craftax import CraftaxEncoder
 from rl2.model.encoders.mlp import MLPEncoder
-from rl2.model.encoders.rgb import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
 from rl2.model.encoders.xminigrid import XMiniGridEncoder
 from rl2.playback import EpisodeResult, PlaybackState, finish_episode
 from rl2.running_stats import RunningSum
@@ -268,8 +269,10 @@ class LSTMConfig:
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
-class RGBEncoderConfig:
-    type: Literal["rgb"] = "rgb"
+class Conv2DEncoderConfig:
+    """2D convolutions over channels-last symbolic grids or RGB images."""
+
+    type: Literal["conv2d"] = "conv2d"
     stages: Annotated[ConvStages, Field(min_length=1)] = DEFAULT_STAGES
     embedding_size: Annotated[int, Field(gt=0, strict=True)] = 768
 
@@ -307,7 +310,7 @@ class CraftaxEncoderConfig:
 
 
 type EncoderConfig = Annotated[
-    RGBEncoderConfig | XMiniGridEncoderConfig | KinetixEncoderConfig | MLPEncoderConfig | CraftaxEncoderConfig,
+    Conv2DEncoderConfig | XMiniGridEncoderConfig | KinetixEncoderConfig | MLPEncoderConfig | CraftaxEncoderConfig,
     Field(discriminator="type"),
 ]
 
@@ -330,7 +333,8 @@ class Config(BaseConfig):
         | PlaygroundConfig
         | JAXtariConfig
         | BraxConfig
-        | ForagaxConfig,
+        | ForagaxConfig
+        | PgxConfig,
         Field(discriminator="id"),
     ]
     seed: int
@@ -362,15 +366,17 @@ class Config(BaseConfig):
 
     @model_validator(mode="after")
     def validate_rollout(self) -> Self:
-        if isinstance(self.env, ForagaxConfig) and self.model.encoder.type != "rgb":
-            raise ValueError("Foragax requires model.encoder.type: rgb")
-        if isinstance(self.env, JAXtariConfig) and self.model.encoder.type != "rgb":
-            raise ValueError("JAXtari requires model.encoder.type: rgb")
+        if isinstance(self.env, PgxConfig) and self.model.encoder.type != "conv2d":
+            raise ValueError("Pgx requires model.encoder.type: conv2d")
+        if isinstance(self.env, ForagaxConfig) and self.model.encoder.type != "conv2d":
+            raise ValueError("Foragax requires model.encoder.type: conv2d")
+        if isinstance(self.env, JAXtariConfig) and self.model.encoder.type != "conv2d":
+            raise ValueError("JAXtari requires model.encoder.type: conv2d")
         symbolic_craftax = isinstance(self.env, CraftaxConfig) and "Symbolic" in self.env.env_id
         if self.model.encoder.type == "mlp" and self.env.id not in ("MuJoCo-Playground", "Brax"):
             raise ValueError("mlp encoder requires MuJoCo-Playground or Brax")
         if isinstance(self.env, CraftaxConfig):
-            encoder = "craftax" if symbolic_craftax else "rgb"
+            encoder = "craftax" if symbolic_craftax else "conv2d"
             if self.model.encoder.type != encoder:
                 raise ValueError(f"{self.env.env_id} requires model.encoder.type: {encoder}")
         if self.model.encoder.type == "craftax" and not symbolic_craftax:
@@ -393,6 +399,8 @@ class Config(BaseConfig):
 
 
 def make_env(config: Config) -> PPOEnv:
+    if isinstance(config.env, PgxConfig):
+        return PgxEnv(config.env)
     if isinstance(config.env, ForagaxConfig):
         return ForagaxEnv(config.env)
     if isinstance(config.env, BraxConfig):
@@ -560,7 +568,7 @@ class ActorCritic(nn.Module):
 
     def setup(self) -> None:
         encoder = self.model.encoder
-        if encoder.type == "rgb":
+        if encoder.type == "conv2d":
             self.encoder = ConvObservationEncoder(
                 channels_last=True,
                 stages=encoder.stages,

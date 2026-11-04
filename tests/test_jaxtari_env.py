@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from rl2 import ppo
 from rl2.actions import DiscreteSpace
 from rl2.envs.jaxtari_env import JAXtariConfig, JAXtariEnv
-from rl2.model.encoders.rgb import ConvStage
+from rl2.model.encoders.conv2d import ConvStage
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs/ppo/jaxtari/breakout.yaml"
 
@@ -35,9 +35,9 @@ def test_invalid_settings(settings: dict[str, object]) -> None:
 def test_preset_and_encoder_validation() -> None:
     config = ppo.load_config(CONFIG_PATH, ppo.Config)
     assert config.env == JAXtariConfig()
-    assert config.model.encoder.type == "rgb"
+    assert config.model.encoder.type == "conv2d"
     assert config.run_id == "ppo_JAXtari_breakout_seed1"
-    with pytest.raises(ValidationError, match="JAXtari requires model.encoder.type: rgb"):
+    with pytest.raises(ValidationError, match="JAXtari requires model.encoder.type: conv2d"):
         replace(config, model=replace(config.model, encoder=ppo.MLPEncoderConfig()))
 
 
@@ -109,7 +109,7 @@ def test_real_breakout_ppo_rollout_update_and_video(env: JAXtariEnv) -> None:
         update_epochs=1,
         target_kl=None,
         model=ppo.ModelConfig(
-            encoder=ppo.RGBEncoderConfig(
+            encoder=ppo.Conv2DEncoderConfig(
                 stages=(ConvStage(channels=2, blocks=0, resize_factor=0.125),), embedding_size=2
             ),
             recurrent=ppo.LSTMConfig(hidden_size=2),

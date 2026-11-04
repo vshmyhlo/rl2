@@ -14,7 +14,7 @@ from flax.training.train_state import TrainState
 from jax.sharding import PartitionSpec
 
 from rl2 import ppo
-from rl2.model.encoders.rgb import ConvStage
+from rl2.model.encoders.conv2d import ConvStage
 
 
 @pytest.mark.usefixtures("ppo_mesh")
@@ -22,7 +22,7 @@ def test_seeded_policy_and_update_are_reproducible() -> None:
     model = ppo.ActorCritic(
         ppo.DiscreteSpace(3),
         ppo.ModelConfig(
-            encoder=ppo.RGBEncoderConfig(stages=(ConvStage(2, blocks=1),), embedding_size=4),
+            encoder=ppo.Conv2DEncoderConfig(stages=(ConvStage(2, blocks=1),), embedding_size=4),
             recurrent=ppo.LSTMConfig(hidden_size=4),
         ),
     )
