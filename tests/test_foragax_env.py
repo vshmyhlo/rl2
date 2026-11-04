@@ -127,6 +127,7 @@ def test_requires_cnn() -> None:
         replace(config, model=ppo.ModelConfig(encoder=ppo.MLPEncoderConfig()))
 
 
+@pytest.mark.usefixtures("ppo_mesh")
 def test_ppo_update_and_playback() -> None:
     config = replace(
         ppo.load_config(PRESET, ppo.Config),
@@ -151,7 +152,7 @@ def test_ppo_update_and_playback() -> None:
     model = ppo.ActorCritic(action_space=env.action_space, model=config.model)
     carry = model.initial_carry(1)  # leaves: (B,H=2)
     starts = jnp.ones(1, bool)  # (B,)
-    params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]  # leaves: (...)
+    params = model.init(jax.random.key(1), observations[:, None], carry, starts[:, None])["params"]  # leaves: (...)
     train_state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(1e-3))
     runner = ppo.RolloutCarry(
         env_state=env_state,  # leaves: (B,...)
@@ -162,8 +163,8 @@ def test_ppo_update_and_playback() -> None:
         episode_step_counts=jnp.zeros(1, jnp.int32),  # (B,)
     )
     advanced, rollout = ppo.collect_rollout(runner, train_state, env, config, jax.random.key(2))
-    chex.assert_shape(rollout.batch.observations, (2, 1, 9, 9, 3))
-    chex.assert_shape((rollout.batch.actions, rollout.batch.returns), (2, 1))
+    chex.assert_shape(rollout.batch.observations, (1, 2, 9, 9, 3))
+    chex.assert_shape((rollout.batch.actions, rollout.batch.returns), (1, 2))
     assert int(rollout.episode_count) == 1 and int(rollout.episode_length_sum) == 2
     np.testing.assert_array_equal(advanced.env_state.time, 0)
     updated, _ = ppo.update(train_state, rollout.batch, config)

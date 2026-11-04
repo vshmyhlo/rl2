@@ -1,4 +1,5 @@
 from dataclasses import replace
+from operator import itemgetter
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -9,11 +10,14 @@ import numpy as np
 import optax
 import pytest
 from flax.training.train_state import TrainState
+from jax.sharding import PartitionSpec
 
 from rl2 import ppo
 from rl2.actions import BetaPolicy, ContinuousSpace, TruncatedGaussianPolicy
 from rl2.envs.base import BaseEnv, EnvStep
 from rl2.model.encoders.rgb import ConvStage
+
+pytestmark = pytest.mark.usefixtures("ppo_mesh")
 
 
 class State(NamedTuple):
@@ -74,7 +78,7 @@ def test_continuous_recurrent_training_replays_bounded_actions(
     model = ppo.ActorCritic(env.action_space, config.model, dtype=jnp.bfloat16)
     carry = model.initial_carry(2)  # leaves: (B,H=2)
     starts = jnp.ones(2, bool)  # (B,)
-    params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]
+    params = model.init(jax.random.key(1), observations[:, None], carry, starts[:, None])["params"]
     # Extreme network outputs must still produce stable bounded distributions.
     params["policy_output"]["bias"] = jnp.array(
         [12.0, -12.0] * (2 if continuous_policy == "beta" else 1)
@@ -90,10 +94,12 @@ def test_continuous_recurrent_training_replays_bounded_actions(
     batch = rollout.batch
     assert batch.actions.shape == (2, 2, 2, 1)
     assert batch.actions.dtype == jnp.float32
-    np.testing.assert_array_equal(advanced.env_state.action, batch.actions[-1])
+    np.testing.assert_array_equal(advanced.env_state.action, batch.actions[:, -1])
     low, high = jnp.asarray((env.action_space.low, env.action_space.high)).reshape(2, 2, 1)  # each (2,1)
     assert bool(jnp.all((batch.actions >= low) & (batch.actions <= high)))
-    output = jax.jit(model.apply)({"params": params}, batch.observations, carry, batch.episode_starts)
+    output = jax.jit(model.apply, in_shardings=PartitionSpec(), out_shardings=PartitionSpec())(
+        {"params": params}, batch.observations, carry, batch.episode_starts
+    )
     assert isinstance(output, ppo.ActorCriticOutput)
     if continuous_policy == "beta":
         assert isinstance(output.policy, BetaPolicy)
@@ -107,9 +113,9 @@ def test_continuous_recurrent_training_replays_bounded_actions(
         assert output.policy.mean.dtype == output.policy.log_std.dtype == jnp.float32
     assert output.values.shape == (2, 2)
     np.testing.assert_allclose(output.policy.log_prob(batch.actions), batch.old_log_probs, atol=1e-5)
-    selected = batch.select_sequences(jnp.array([1]))
-    assert selected.actions.shape == (2, 1, 2, 1)
-    np.testing.assert_array_equal(selected.actions, batch.actions[:, 1:])
+    selected = jax.tree.map(itemgetter(jnp.array([1])), batch)  # (B=1, T, ...); memory: (B, H)
+    assert selected.actions.shape == (1, 2, 2, 1)
+    np.testing.assert_array_equal(selected.actions, batch.actions[1:])
     result = ppo.train_step(runner, train_state, env, config, key, ppo.init_metrics())
     chex.assert_trees_all_equal(result, ppo.train_step(runner, train_state, env, config, key, ppo.init_metrics()))
     assert int(result.train_state.step) == 2
@@ -125,7 +131,7 @@ def test_continuous_recurrent_training_replays_bounded_actions(
     for index in range(2):
         expected, _ = ppo.update(
             expected,
-            batch.select_sequences(permutation[index : index + 1]),
+            jax.tree.map(itemgetter(permutation[index : index + 1]), batch),
             config,
         )
     chex.assert_trees_all_close(expected.params, result.train_state.params, atol=1e-5)

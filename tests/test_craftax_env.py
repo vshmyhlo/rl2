@@ -156,6 +156,7 @@ def test_real_craftax_reset_step_and_video(
         assert batched.shape == (2, *original.shape)
 
 
+@pytest.mark.usefixtures("ppo_mesh")
 def test_symbolic_ppo_rollout_and_update() -> None:
     config = replace(
         ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/craftax/symbolic.yaml", ppo.Config),
@@ -177,7 +178,9 @@ def test_symbolic_ppo_rollout_and_update() -> None:
     model = ppo.ActorCritic(action_space=env.action_space, model=config.model, dtype=jnp.bfloat16)
     carry = model.initial_carry(1)  # leaves: (B,H=2)
     starts = jnp.ones(1, bool)  # (B,)
-    params = model.init(jax.random.key(1), jax.tree.map(lambda x: x[None], observations), carry, starts[None])["params"]
+    params = model.init(jax.random.key(1), jax.tree.map(lambda x: x[:, None], observations), carry, starts[:, None])[
+        "params"
+    ]
     train_state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(1e-3))
     runner = ppo.RolloutCarry(
         env_state=env_state,  # leaves: (B,...)
@@ -189,15 +192,15 @@ def test_symbolic_ppo_rollout_and_update() -> None:
     )
     advanced, rollout = ppo.collect_rollout(runner, train_state, env, config, jax.random.key(2))
     batch = rollout.batch
-    assert batch.observations.grid.shape == (2, 1, 9, 11, 83)
-    assert batch.observations.features.shape == (2, 1, 51)
-    selected = batch.select_sequences(jnp.array([0, 0]))
+    assert batch.observations.grid.shape == (1, 2, 9, 11, 83)
+    assert batch.observations.features.shape == (1, 2, 51)
+    selected = jax.tree.map(itemgetter(jnp.array([0, 0])), batch)  # (B=2, T, ...); memory: (B, H)
     chex.assert_shape(selected.observations.grid, (2, 2, 9, 11, 83))
     chex.assert_shape(selected.observations.features, (2, 2, 51))
     chex.assert_trees_all_equal(
-        jax.tree.map(lambda x: x[:, 0], selected.observations), jax.tree.map(lambda x: x[:, 0], batch.observations)
+        jax.tree.map(lambda x: x[0], selected.observations), jax.tree.map(lambda x: x[0], batch.observations)
     )
-    assert batch.actions.shape == batch.returns.shape == (2, 1)
+    assert batch.actions.shape == batch.returns.shape == (1, 2)
     assert batch.actions.dtype == jnp.int32
     assert bool(jnp.all((batch.actions >= 0) & (batch.actions < 43)))
     output = model.apply({"params": params}, batch.observations, carry, batch.episode_starts)

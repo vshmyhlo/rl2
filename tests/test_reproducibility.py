@@ -1,6 +1,7 @@
 """Seed reproducibility for initialization, action sampling, and a single update."""
 
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 import chex
@@ -8,12 +9,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 from flax.training.train_state import TrainState
+from jax.sharding import PartitionSpec
 
 from rl2 import ppo
 from rl2.model.encoders.rgb import ConvStage
 
 
+@pytest.mark.usefixtures("ppo_mesh")
 def test_seeded_policy_and_update_are_reproducible() -> None:
     model = ppo.ActorCritic(
         ppo.DiscreteSpace(3),
@@ -31,7 +35,7 @@ def test_seeded_policy_and_update_are_reproducible() -> None:
     optimizer = optax.adam(1e-3)
 
     def initialize(seed: int) -> TrainState:
-        params = model.init(jax.random.key(seed), obs[None], carry, starts[None])["params"]
+        params = model.init(jax.random.key(seed), obs[:, None], carry, starts[:, None])["params"]
         return TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
 
     first, repeated, different = initialize(11), initialize(11), initialize(12)
@@ -41,29 +45,31 @@ def test_seeded_policy_and_update_are_reproducible() -> None:
         for a, b in zip(jax.tree.leaves(first.params), jax.tree.leaves(different.params), strict=True)
     )
     key = jax.random.key(13)
-    apply_step = jax.jit(model.apply, static_argnames=("method",))
+    apply_step = jax.jit(
+        partial(model.apply, method="step"), in_shardings=PartitionSpec(), out_shardings=PartitionSpec()
+    )
     memory, step_logits, values = apply_step(
-        {"params": first.params}, obs, carry, starts, method="step"
+        {"params": first.params}, obs, carry, starts
     )  # memory leaves: (B, H); step_logits: (B, A); values: (B,)
     step_logits = step_logits.logits  # (..., A)
     chex.assert_trees_all_equal(
         ppo.ActorCriticOutput(memory, ppo.CategoricalPolicy(step_logits), values),
-        apply_step({"params": repeated.params}, obs, carry, starts, method="step"),
+        apply_step({"params": repeated.params}, obs, carry, starts),
     )
     action = jax.random.categorical(key, step_logits)  # (B,)
     log_prob = ppo.CategoricalPolicy(step_logits).log_prob(action)  # (B,)
-    _, logits, _ = model.apply({"params": first.params}, obs[None], carry, starts[None])
+    _, logits, _ = model.apply({"params": first.params}, obs[:, None], carry, starts[:, None])
     logits = logits.logits  # (..., A)
-    np.testing.assert_array_equal(action, jax.random.categorical(key, logits[0]))
+    np.testing.assert_array_equal(action, jax.random.categorical(key, logits[:, 0]))
     batch = ppo.PPOBatch(
-        observations=obs[None],  # (*S, *O)
-        actions=action[None],  # (*S,)
-        old_log_probs=log_prob[None],  # (*S,)
-        values=values[None],  # (*S,)
-        advantages=jnp.array([[1.0, -1.0]]),  # (*S,)
-        returns=values[None] + 1,  # (*S,)
+        observations=obs[:, None],  # (*S, *O)
+        actions=action[:, None],  # (*S,)
+        old_log_probs=log_prob[:, None],  # (*S,)
+        values=values[:, None],  # (*S,)
+        advantages=jnp.array([[1.0], [-1.0]]),  # (*S,)
+        returns=values[:, None] + 1,  # (*S,)
         model_carry=carry,  # leaves: (B, ...)
-        episode_starts=starts[None],  # (*S,)
+        episode_starts=starts[:, None],  # (*S,)
     )
     updated, metrics = ppo.update(first, batch, config)
     replayed, replayed_metrics = ppo.update(repeated, batch, config)

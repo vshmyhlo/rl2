@@ -98,6 +98,7 @@ def test_losing_one_life_continues_the_game(env: JAXtariEnv) -> None:
     assert not bool(result.state.game_started)  # FIRE launches the next ball.
 
 
+@pytest.mark.usefixtures("ppo_mesh")
 def test_real_breakout_ppo_rollout_update_and_video(env: JAXtariEnv) -> None:
     config = replace(
         ppo.load_config(CONFIG_PATH, ppo.Config),
@@ -120,7 +121,7 @@ def test_real_breakout_ppo_rollout_update_and_video(env: JAXtariEnv) -> None:
     model = ppo.ActorCritic(action_space=env.action_space, model=config.model, dtype=jnp.bfloat16)
     carry = model.initial_carry(1)  # leaves: (B,H=2)
     starts = jnp.ones(1, bool)  # (B,)
-    params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]
+    params = model.init(jax.random.key(1), observations[:, None], carry, starts[:, None])["params"]
     train_state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(1e-3))
     runner = ppo.RolloutCarry(
         env_state=env_state,  # leaves: (B,...)
@@ -132,8 +133,8 @@ def test_real_breakout_ppo_rollout_update_and_video(env: JAXtariEnv) -> None:
     )
     advanced, rollout = ppo.collect_rollout(runner, train_state, env, config, jax.random.key(2))
     batch = rollout.batch
-    assert batch.observations.shape == (2, 1, 210, 160, 3) and batch.observations.dtype == jnp.uint8
-    assert batch.actions.shape == batch.returns.shape == (2, 1)
+    assert batch.observations.shape == (1, 2, 210, 160, 3) and batch.observations.dtype == jnp.uint8
+    assert batch.actions.shape == batch.returns.shape == (1, 2)
     assert batch.actions.dtype == jnp.int32
     assert bool(jnp.all((batch.actions >= 0) & (batch.actions < 4)))
     output = model.apply({"params": params}, batch.observations, carry, batch.episode_starts)

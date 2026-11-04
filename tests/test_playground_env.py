@@ -134,6 +134,7 @@ def test_batched_boundaries_preserve_final_observations(env: PlaygroundEnv) -> N
     chex.assert_shape((result.done, result.reward), (4,))
 
 
+@pytest.mark.usefixtures("ppo_mesh")
 def test_vector_policy_rollout_update_and_playback(env: PlaygroundEnv) -> None:
     config = replace(
         ppo.load_config(CONFIG_PATH, ppo.Config),
@@ -153,7 +154,7 @@ def test_vector_policy_rollout_update_and_playback(env: PlaygroundEnv) -> None:
     model = ppo.ActorCritic(action_space=env.action_space, model=config.model)
     carry = model.initial_carry(1)  # leaves: (B,2)
     starts = jnp.ones(1, bool)  # (B,)
-    params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]
+    params = model.init(jax.random.key(1), observations[:, None], carry, starts[:, None])["params"]
     train_state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(1e-3))
     runner = ppo.RolloutCarry(
         env_state=env_state,  # leaves: (B,...)
@@ -165,9 +166,9 @@ def test_vector_policy_rollout_update_and_playback(env: PlaygroundEnv) -> None:
     )
     advanced, rollout = ppo.collect_rollout(runner, train_state, env, config, jax.random.key(2))
     batch = rollout.batch
-    assert batch.observations.shape == (2, 1, 66)
-    assert batch.actions.shape == (2, 1, 8) and batch.actions.dtype == jnp.float32
-    assert batch.returns.shape == (2, 1)
+    assert batch.observations.shape == (1, 2, 66)
+    assert batch.actions.shape == (1, 2, 8) and batch.actions.dtype == jnp.float32
+    assert batch.returns.shape == (1, 2)
     assert bool(jnp.all((batch.actions >= -1) & (batch.actions <= 1)))
     output = model.apply({"params": params}, batch.observations, carry, batch.episode_starts)
     np.testing.assert_allclose(output.policy.log_prob(batch.actions), batch.old_log_probs, atol=1e-5)

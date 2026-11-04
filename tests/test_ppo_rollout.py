@@ -1,4 +1,5 @@
 from dataclasses import replace
+from operator import itemgetter
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +14,8 @@ from flax.training.train_state import TrainState
 from rl2 import ppo
 from rl2.envs.gymnax_env import GymnaxEnv
 from rl2.model.encoders.rgb import ConvStage
+
+pytestmark = pytest.mark.usefixtures("ppo_mesh")
 
 
 def policy(
@@ -64,8 +67,8 @@ def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs:
     duplicate, repeated = ppo.collect_rollout(runner, state, env, config, key)
     chex.assert_trees_all_equal((duplicate, repeated), (first, rollout))
     for result in (rollout, continued):
-        chex.assert_shape(result.batch.observations, (num_steps, num_envs, 10, 10, 4))
-        chex.assert_shape((result.batch.actions, result.batch.returns), (num_steps, num_envs))
+        chex.assert_shape(result.batch.observations, (num_envs, num_steps, 10, 10, 4))
+        chex.assert_shape((result.batch.actions, result.batch.returns), (num_envs, num_steps))
         chex.assert_shape((result.episode_count, result.episode_return_sum, result.episode_length_sum), ())
         chex.assert_type((result.episode_count, result.episode_length_sum), jnp.int32)
         chex.assert_type(result.episode_return_sum, jnp.float32)
@@ -84,7 +87,7 @@ def test_compiled_rollout_continues_rng_memory_and_bootstraps_timeouts(num_envs:
         chex.assert_trees_all_equal(result.key, expected_key)
     np.testing.assert_array_equal(second.episode_step_counts, 2 * num_steps % 2)
     np.testing.assert_array_equal(second.episode_starts, True)
-    np.testing.assert_array_equal(continued.batch.returns[-1], 1.0)  # gamma * value(final), not zero
+    np.testing.assert_array_equal(continued.batch.returns[:, -1], 1.0)  # gamma * value(final), not zero
     for leaf in jax.tree.leaves(second.model_carry):  # (B,1)
         np.testing.assert_array_equal(leaf, 2)
     chex.assert_trees_all_equal(continued.batch.model_carry, first.model_carry)
@@ -116,7 +119,7 @@ def test_train_step_matches_separate_rollout_and_updates_with_real_model() -> No
     model = ppo.ActorCritic(ppo.DiscreteSpace(3), config.model)
     carry = model.initial_carry(2)  # leaves: (B,4)
     starts = jnp.ones(2, bool)  # (B,)
-    params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]
+    params = model.init(jax.random.key(1), observations[:, None], carry, starts[:, None])["params"]
     state = TrainState.create(
         apply_fn=model.apply,
         params=params,
@@ -149,8 +152,10 @@ def test_train_step_matches_separate_rollout_and_updates_with_real_model() -> No
     for _ in range(config.update_epochs):
         expected_key, shuffle_key = jax.random.split(expected_key)  # each ()
         permutation = jax.random.permutation(shuffle_key, config.num_envs)  # (B,)
-        for indices in jnp.split(permutation, config.num_minibatches):  # (M=1,)
-            expected, update_metrics = ppo.update(expected, rollout.batch.select_sequences(indices), config, iteration)
+        for indices in jnp.split(permutation, config.num_minibatches):  # (B=1,)
+            expected, update_metrics = ppo.update(
+                expected, jax.tree.map(itemgetter(indices), rollout.batch), config, iteration
+            )
             metrics.append(update_metrics)
 
     def sum_metrics(*leaves: jax.Array) -> jax.Array:  # each ()
@@ -163,6 +168,8 @@ def test_train_step_matches_separate_rollout_and_updates_with_real_model() -> No
     chex.assert_trees_all_equal(result.key, expected_key)
     chex.assert_shape(jax.tree.leaves(result.metrics.window.minibatch_metrics), ())
     chex.assert_shape(result.metrics.window.explained_variance_sum, ())
+    chex.assert_shape(result.metrics.window.explained_variance_count, ())
+    assert int(result.metrics.window.explained_variance_count) == 1
     assert (
         int(result.train_state.step)
         == int(result.metrics.window.update_count)
@@ -211,7 +218,7 @@ def test_train_step_stops_updates_and_rng_at_rejected_minibatch(reject_at: int) 
 
     def update(
         state: TrainState,
-        batch: ppo.PPOBatch,  # observations: (T=1,M=1,4,10,10); targets: (T,M); memory: (M,1)
+        batch: ppo.PPOBatch,  # observations: (M=1,T=1,4,10,10); targets: (M,T); memory: (M,1)
         config: ppo.Config,
         iteration: int | jax.Array,  # ()
     ) -> tuple[TrainState, ppo.MinibatchMetrics]:
@@ -250,6 +257,9 @@ def test_train_step_stops_updates_and_rng_at_rejected_minibatch(reject_at: int) 
     chex.assert_shape(jax.tree.leaves(result.metrics), ())
     assert int(result.metrics.total.episode_count) == int(result.metrics.total.episode_length_sum) == 2
     assert float(result.metrics.total.episode_return_sum) == 3.0
+    # Both terminal transitions have zero rewards, so explained variance is undefined.
+    assert int(result.metrics.window.explained_variance_count) == 0
+    assert float(result.metrics.window.explained_variance_sum) == 0.0
 
     if reject_at == 1:
         # Exercise continued windows and resets once, including totals beyond 32-bit precision.
@@ -337,7 +347,7 @@ def test_terminal_and_timeout_targets_use_final_observations() -> None:
         jnp.array([0, 1, 1, 0]),  # (B,)
     )
     advanced, rollout = ppo.collect_rollout(runner, state, env, config, jax.random.key(1))
-    np.testing.assert_array_equal(rollout.batch.returns, [[0, 20.5, 0, 20.5]])
+    np.testing.assert_array_equal(rollout.batch.returns, [[0], [20.5], [0], [20.5]])
     np.testing.assert_array_equal(advanced.episode_starts, [True, True, True, False])
     assert int(rollout.episode_count) == 3
     assert float(rollout.episode_return_sum) == 3.0  # Excludes bootstrap values and unfinished returns.
@@ -347,6 +357,6 @@ def test_terminal_and_timeout_targets_use_final_observations() -> None:
     assert int(rollout.episode_count) == 1
     assert float(rollout.episode_return_sum) == 100.0
     assert int(rollout.episode_length_sum) == 2
-    np.testing.assert_array_equal(rollout.batch.episode_starts, [[True, True, True, False]])
+    np.testing.assert_array_equal(rollout.batch.episode_starts, [[True], [True], [True], [False]])
     for leaf in jax.tree.leaves(advanced.model_carry):  # (B,1)
         np.testing.assert_array_equal(leaf[:, 0], [1, 1, 1, 2])

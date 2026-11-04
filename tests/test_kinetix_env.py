@@ -117,6 +117,7 @@ def test_termination_timeout_and_partial_autoreset() -> None:
     np.testing.assert_array_equal(next_observations, info["final_observation"])
 
 
+@pytest.mark.usefixtures("ppo_mesh")
 def test_real_kinetix_rollout_update_and_video() -> None:
     pytest.importorskip("kinetix")
     config = replace(
@@ -144,14 +145,14 @@ def test_real_kinetix_rollout_update_and_video() -> None:
     model = ppo.ActorCritic(env.action_space, config.model)
     carry = model.initial_carry(1)  # leaves: (1,2)
     starts = jnp.ones(1, bool)  # (1,)
-    params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]  # parameter pytree
+    params = model.init(jax.random.key(1), observations[:, None], carry, starts[:, None])["params"]  # parameter pytree
     state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(1e-3))
     runner = ppo.RolloutCarry(env_state, observations, carry, starts, jnp.zeros(1), jnp.zeros(1, jnp.int32))
     advanced, rollout = ppo.collect_rollout(runner, state, env, config, jax.random.key(2))
-    assert rollout.batch.observations.shape == (2, 1, *feature_shape)
-    assert rollout.batch.actions.shape == (2, 1, env.action_space.size)
+    assert rollout.batch.observations.shape == (1, 2, *feature_shape)
+    assert rollout.batch.actions.shape == (1, 2, env.action_space.size)
     assert rollout.batch.actions.dtype == jnp.float32
-    assert rollout.batch.returns.shape == (2, 1)
+    assert rollout.batch.returns.shape == (1, 2)
     output = model.apply({"params": params}, rollout.batch.observations, carry, rollout.batch.episode_starts)
     np.testing.assert_allclose(output.policy.log_prob(rollout.batch.actions), rollout.batch.old_log_probs, atol=1e-5)
     chex.assert_shape((rollout.episode_count, rollout.episode_return_sum, rollout.episode_length_sum), ())

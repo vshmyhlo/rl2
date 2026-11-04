@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError, asdict, fields, replace
 from functools import partial
+from operator import itemgetter
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, Mock, patch
@@ -12,6 +13,7 @@ import optax
 import pytest
 import yaml
 from flax.training.train_state import TrainState
+from jax.sharding import PartitionSpec
 from omegaconf import OmegaConf
 from ppo_helpers import env_step, metric_history
 from pydantic import ValidationError
@@ -29,6 +31,8 @@ from rl2.ppo import (
     update,
 )
 from rl2.sweeps import load_sweep
+
+pytestmark = pytest.mark.usefixtures("ppo_mesh")
 
 
 def small_model_config() -> ppo.ModelConfig:
@@ -63,29 +67,29 @@ def test_sweep_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     [(1, (1,)), (3, (1, 0))],
     ids=["single-transition", "reordered-sequences"],
 )
-def test_batch_select_sequences_preserves_time_and_initial_memory(num_steps: int, selected: tuple[int, ...]) -> None:
-    targets = jnp.arange(num_steps * 2).reshape(num_steps, 2)  # (T, B=2)
+def test_batch_indexing_preserves_time_and_initial_memory(num_steps: int, selected: tuple[int, ...]) -> None:
+    targets = jnp.arange(num_steps * 2).reshape(2, num_steps)  # (B=2, T)
     memory = jnp.arange(4, dtype=jnp.float32).reshape(2, 2)  # (B=2, D=2)
     batch = ppo.PPOBatch(
-        observations=targets[..., None, None, None],  # (T, B, 1, 1, 1)
-        actions=targets % 2,  # (T, B)
-        old_log_probs=-targets.astype(jnp.float32),  # (T, B)
-        values=targets + 1.0,  # (T, B)
-        advantages=targets + 2.0,  # (T, B)
-        returns=targets + 3.0,  # (T, B)
+        observations=targets[..., None, None, None],  # (B, T, 1, 1, 1)
+        actions=targets % 2,  # (B, T)
+        old_log_probs=-targets.astype(jnp.float32),  # (B, T)
+        values=targets + 1.0,  # (B, T)
+        advantages=targets + 2.0,  # (B, T)
+        returns=targets + 3.0,  # (B, T)
         model_carry=((memory, memory + 1), (memory + 2, memory + 3)),  # leaves: (B, D)
-        episode_starts=targets % 2 == 0,  # (T, B)
+        episode_starts=targets % 2 == 0,  # (B, T)
     )
-    indices = jnp.asarray(selected)  # (M,)
-    minibatch = batch.select_sequences(indices)  # sequences: (T, M, ...); memory: (M, D)
+    indices = jnp.asarray(selected)  # (B,), B is the selected batch size
+    minibatch = jax.tree.map(itemgetter(indices), batch)  # sequences: (B, T, ...); memory: (B, D)
     for field in fields(batch):
         if field.name == "model_carry":
             continue
-        actual = getattr(minibatch, field.name)  # (T, M, ...)
-        original = getattr(batch, field.name)  # (T, B, ...)
-        assert actual.shape == (num_steps, len(selected), *original.shape[2:])
+        actual = getattr(minibatch, field.name)  # (B, T, ...)
+        original = getattr(batch, field.name)  # (B, T, ...)
+        assert actual.shape == (len(selected), num_steps, *original.shape[2:])
         assert actual.dtype == original.dtype
-        np.testing.assert_array_equal(actual, np.take(original, selected, axis=1))
+        np.testing.assert_array_equal(actual, np.take(original, selected, axis=0))
     assert len(minibatch.model_carry) == 2
     for actual, original in zip(
         jax.tree.leaves(minibatch.model_carry), jax.tree.leaves(batch.model_carry), strict=True
@@ -111,9 +115,9 @@ def test_default_model_parameter_budget_and_rgb_shapes() -> None:
     assert logits.shape == (1, 1, 6)
     assert values.shape == (1, 1)
     assert final[0][0].shape == (1, config.model.recurrent.hidden_size)
-    step_obs = jax.ShapeDtypeStruct(obs.shape[1:], obs.dtype)
+    step_obs = jax.ShapeDtypeStruct((obs.shape[0], *obs.shape[2:]), obs.dtype)
     step_final, step_logits, step_values = jax.eval_shape(
-        partial(model.apply, method=model.step), variables, step_obs, carry, starts[0]
+        partial(model.apply, method=model.step), variables, step_obs, carry, starts[:, 0]
     )
     step_logits = step_logits.logits  # (..., A)
     assert step_logits.shape == (1, 6)
@@ -156,7 +160,7 @@ def test_clipped_policy_loss_and_gradient_direction(shape: tuple[int, ...]) -> N
         values=jnp.zeros(shape),  # (*S,)
         advantages=advantages,  # (*S,)
         returns=returns,  # (*S,)
-        model_carry=initial_carry(shape[-1], 1),  # leaves: (B, ...)
+        model_carry=initial_carry(shape[0], 1),  # leaves: (B, ...)
         episode_starts=jnp.zeros(shape, dtype=bool),  # (*S,)
     )
     updated, metrics = update(state, batch, config)
@@ -266,12 +270,14 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
         model_config,
         dtype=jnp.bfloat16,
     )
-    obs = jax.random.randint(jax.random.key(2), (3, 2, 1, 8, 8), 0, 256, dtype=jnp.uint8)
+    obs = jax.random.randint(jax.random.key(2), (2, 3, 1, 8, 8), 0, 256, dtype=jnp.uint8)  # (B=2,T=3,1,8,8)
     carry = model.initial_carry(2)
-    starts = jnp.array([[True, True], [False, False], [True, False]])
+    starts = jnp.array([[True, False, True], [True, False, False]])  # (B,T)
     params = model.init(jax.random.key(1), obs, carry, starts)["params"]
     (final, logits, values), captured = jax.jit(
-        partial(model.apply, capture_intermediates=True, mutable=["intermediates"])
+        partial(model.apply, capture_intermediates=True, mutable=["intermediates"]),
+        in_shardings=PartitionSpec(),
+        out_shardings=PartitionSpec(),
     )({"params": params}, obs, carry, starts)
     logits = logits.logits  # (..., A)
     assert captured["intermediates"]["encoder"]["stem"]["__call__"][0].dtype == jnp.bfloat16
@@ -283,28 +289,30 @@ def test_bf16_recurrent_training_keeps_float32_state_and_losses() -> None:
         assert array.dtype == jnp.float32
     state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(0.001))
     replayed_log_probs = []
-    apply_step = jax.jit(state.apply_fn, static_argnames=("method",))
+    apply_step = jax.jit(
+        partial(state.apply_fn, method="step"), in_shardings=PartitionSpec(), out_shardings=PartitionSpec()
+    )
     for t in range(3):
         carry, step_logits, prediction = apply_step(
-            {"params": state.params}, obs[t], carry, starts[t], method="step"
+            {"params": state.params}, obs[:, t], carry, starts[:, t]
         )  # carry leaves: (B, ...); step_logits: (B, A); prediction: (B,)
         step_logits = step_logits.logits  # (..., A)
         actions = jax.random.categorical(jax.random.key(t), step_logits)  # (B,)
         log_probs = ppo.CategoricalPolicy(step_logits).log_prob(actions)  # (B,)
         # BF16 kernels may round differently for sequence and single-step batches.
-        np.testing.assert_allclose(prediction, values[t], atol=0.02, rtol=0.02)
-        np.testing.assert_allclose(log_probs, ppo.CategoricalPolicy(logits[t]).log_prob(actions), atol=1e-3, rtol=0)
-        replayed_log_probs.append(ppo.CategoricalPolicy(logits[t]).log_prob(jnp.zeros(2, dtype=jnp.int32)))
+        np.testing.assert_allclose(prediction, values[:, t], atol=0.02, rtol=0.02)
+        np.testing.assert_allclose(log_probs, ppo.CategoricalPolicy(logits[:, t]).log_prob(actions), atol=1e-3, rtol=0)
+        replayed_log_probs.append(ppo.CategoricalPolicy(logits[:, t]).log_prob(jnp.zeros(2, dtype=jnp.int32)))
     # Float32 carry still accumulates differences from the BF16 encoder.
     for actual, expected in zip(jax.tree.leaves(carry), jax.tree.leaves(final), strict=True):
         np.testing.assert_allclose(actual, expected, atol=0.03, rtol=0.02)
     batch = ppo.PPOBatch(
         observations=obs,  # (*S, *O)
-        actions=jnp.zeros((3, 2), dtype=jnp.int32),  # (*S,)
-        old_log_probs=jnp.stack(replayed_log_probs),  # (*S,)
+        actions=jnp.zeros((2, 3), dtype=jnp.int32),  # (B,T)
+        old_log_probs=jnp.stack(replayed_log_probs, axis=1),  # (B,T)
         values=values,  # (*S,)
-        advantages=jnp.arange(6, dtype=jnp.float32).reshape(3, 2),  # (*S,)
-        returns=jnp.ones((3, 2)),  # (*S,)
+        advantages=jnp.arange(6, dtype=jnp.float32).reshape(2, 3),  # (B,T)
+        returns=jnp.ones((2, 3)),  # (B,T)
         model_carry=model.initial_carry(2),  # leaves: (B, ...)
         episode_starts=starts,  # (*S,)
     )
@@ -327,48 +335,48 @@ def test_recurrent_sequences_match_steps_and_reset_only_finished_env() -> None:
         ppo.DiscreteSpace(3),
         replace(small_model_config(), encoder=ppo.RGBEncoderConfig(stages=(ConvStage(4, blocks=1),), embedding_size=6)),
     )
-    obs = jax.random.randint(jax.random.key(2), (4, 2, 4, 8, 8), 0, 256, dtype=jnp.uint8)
+    obs = jax.random.randint(jax.random.key(2), (2, 4, 4, 8, 8), 0, 256, dtype=jnp.uint8)  # (B=2,T=4,4,8,8)
     carry = model.initial_carry(2)
-    starts = jnp.array([[True, True], [False, False], [True, False], [False, False]])
+    starts = jnp.array([[True, False, True, False], [True, False, False, False]])  # (B,T)
     params = model.init(jax.random.key(1), obs, carry, starts)
-    encoded = model.apply(params, obs[0], method=model._encode)
+    encoded = model.apply(params, obs[:, 0], method=model._encode)
     assert encoded.shape == (2, model.model.recurrent.hidden_size)
-    apply = jax.jit(model.apply)
-    step = jax.jit(partial(model.apply, method=model.step))
+    apply = jax.jit(model.apply, in_shardings=PartitionSpec(), out_shardings=PartitionSpec())
+    step = jax.jit(partial(model.apply, method=model.step), in_shardings=PartitionSpec(), out_shardings=PartitionSpec())
     final, logits, values = apply(params, obs, carry, starts)
     logits = logits.logits  # (..., A)
     stepped_logits, stepped_values = [], []
     for t in range(4):
-        carry, policy, critic = step(params, obs[t], carry, starts[t])
+        carry, policy, critic = step(params, obs[:, t], carry, starts[:, t])
         policy = policy.logits  # (..., A)
         stepped_logits.append(policy)
         stepped_values.append(critic)
-    np.testing.assert_allclose(logits, jnp.stack(stepped_logits), atol=5e-6)
-    np.testing.assert_allclose(values, jnp.stack(stepped_values), atol=5e-6)
-    step_params = model.init(jax.random.key(1), obs[0], model.initial_carry(2), starts[0], method=model.step)
+    np.testing.assert_allclose(logits, jnp.stack(stepped_logits, axis=1), atol=5e-6)
+    np.testing.assert_allclose(values, jnp.stack(stepped_values, axis=1), atol=5e-6)
+    step_params = model.init(jax.random.key(1), obs[:, 0], model.initial_carry(2), starts[:, 0], method=model.step)
     for actual, expected in zip(jax.tree.leaves(step_params), jax.tree.leaves(params), strict=True):
         np.testing.assert_array_equal(actual, expected)
     for actual, expected in zip(jax.tree.leaves(carry), jax.tree.leaves(final), strict=True):
         np.testing.assert_allclose(actual, expected, atol=5e-6)
     # Splitting a rollout preserves memory; bootstrapping must not consume it.
-    prefix_carry, _, _ = apply(params, obs[:2], model.initial_carry(2), starts[:2])
-    peek = step(params, obs[2], prefix_carry, starts[2])[2]  # (B,)
-    np.testing.assert_allclose(peek, values[2], atol=5e-6)
-    _, suffix_logits, suffix_values = apply(params, obs[2:], prefix_carry, starts[2:])
+    prefix_carry, _, _ = apply(params, obs[:, :2], model.initial_carry(2), starts[:, :2])
+    peek = step(params, obs[:, 2], prefix_carry, starts[:, 2])[2]  # (B,)
+    np.testing.assert_allclose(peek, values[:, 2], atol=5e-6)
+    _, suffix_logits, suffix_values = apply(params, obs[:, 2:], prefix_carry, starts[:, 2:])
     suffix_logits = suffix_logits.logits  # (..., A)
-    np.testing.assert_allclose(suffix_values, values[2:], atol=5e-6)
+    np.testing.assert_allclose(suffix_values, values[:, 2:], atol=5e-6)
     # A reset discards history for env 0; env 1 still depends on it.
-    _, fresh_logits, fresh_values = apply(params, obs[2:], model.initial_carry(2), starts[2:])
+    _, fresh_logits, fresh_values = apply(params, obs[:, 2:], model.initial_carry(2), starts[:, 2:])
     fresh_logits = fresh_logits.logits  # (..., A)
-    np.testing.assert_allclose(suffix_logits[:, 0], fresh_logits[:, 0], atol=5e-6)
-    np.testing.assert_allclose(suffix_values[:, 0], fresh_values[:, 0], atol=5e-6)
-    assert float(jnp.max(jnp.abs(suffix_values[:, 1] - fresh_values[:, 1]))) > 1e-05
+    np.testing.assert_allclose(suffix_logits[0], fresh_logits[0], atol=5e-6)
+    np.testing.assert_allclose(suffix_values[0], fresh_values[0], atol=5e-6)
+    assert float(jnp.max(jnp.abs(suffix_values[1] - fresh_values[1]))) > 1e-05
 
     selected = jax.tree.map(lambda leaf: leaf[jnp.array([1])], prefix_carry)
-    selected_final, selected_logits, selected_values = apply(params, obs[2:, 1:], selected, starts[2:, 1:])
+    selected_final, selected_logits, selected_values = apply(params, obs[1:, 2:], selected, starts[1:, 2:])
     selected_logits = selected_logits.logits  # (..., A)
-    np.testing.assert_allclose(selected_logits, suffix_logits[:, 1:], atol=5e-6)
-    np.testing.assert_allclose(selected_values, suffix_values[:, 1:], atol=5e-6)
+    np.testing.assert_allclose(selected_logits, suffix_logits[1:], atol=5e-6)
+    np.testing.assert_allclose(selected_values, suffix_values[1:], atol=5e-6)
     for actual, expected in zip(jax.tree.leaves(selected_final), jax.tree.leaves(final), strict=True):
         np.testing.assert_allclose(actual, expected[1:], atol=5e-6)
 
@@ -558,7 +566,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
 
     def fake_update(
         state: TrainState,
-        batch: ppo.PPOBatch,  # obs: (T=1, B=1, O=1); targets/starts: (T, B); carry: pair of (B, H)
+        batch: ppo.PPOBatch,  # obs: (B=1, T=1, O=1); targets/starts: (B, T); carry: pair of (B, H)
         config: ppo.Config,
         iteration: int,
     ) -> tuple[TrainState, ppo.MinibatchMetrics]:
@@ -594,7 +602,7 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
             return_value=ppo.ActorCriticOutput(carry, ppo.CategoricalPolicy(jnp.array([[0.0, -jnp.inf]])), zeros),
         ),  # carry leaves: (B,H); (B,A); (B,)
         patch("rl2.ppo.update", side_effect=fake_update),
-        patch("rl2.ppo.explained_variance", side_effect=(0.2, 0.4, 0.8)),
+        patch("rl2.ppo.explained_variance", side_effect=(0.0, jnp.nan, jnp.nan)),
         patch("rl2.ppo.monotonic", side_effect=now),
         patch("rl2.ppo.checkpoint_manager"),
         patch("rl2.ppo.restore_checkpoint", return_value=None),
@@ -610,42 +618,43 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     np.testing.assert_allclose(learning_rates, config.learning_rate * np.array([1.0, 1.0, 0.75, 0.25, 0.25]))
     logged = metric_history(writer)
     writer.log_params.assert_called_once_with(asdict(config))
+    assert not any(tag.startswith(("charts/", "losses/", "policy/", "value/", "time/")) for tag in logged)
     assert "time/window_seconds" not in logged
     assert "time/iteration_seconds" not in logged
     assert "time/steps_per_second" not in logged
     assert not any("last_100" in tag for tag in logged)
     # Minibatch-weighted means: the rejected rollout contributes one sample, not two.
     for tag, expected in {
-        "losses/policy": [(4.0, 2), (12.0, 3)],
-        "losses/value": [(8.0, 2), (24.0, 3)],
-        "losses/entropy": [(-12.0, 2), (-36.0, 3)],
-        "losses/total": [
+        "train/policy_loss": [(4.0, 2), (12.0, 3)],
+        "train/value_loss": [(8.0, 2), (24.0, 3)],
+        "train/entropy_loss": [(-12.0, 2), (-36.0, 3)],
+        "train/total_loss": [
             (4.0 + config.value_coef * 8.0 - 10.0 * config.entropy_coef, 2),
             (12.0 + config.value_coef * 24.0 - 9.0 * config.entropy_coef, 3),
         ],
-        "policy/entropy": [(12.0, 2), (36.0, 3)],
-        "policy/approx_kl": [(0.02 / 3, 2), (0.0, 3)],
-        "policy/clip_fraction": [(0.04, 2), (0.12, 3)],
-        "value/explained_variance": [(0.3, 2), (0.8, 3)],
-        "charts/updates_per_rollout": [(1.0, 2), (2.0, 3)],
-        "policy/early_stop": [(0.5, 2), (0.0, 3)],
-        "time/iterations_per_second": [(2 / 60, 2), (1 / 20, 3)],
-        "time/observations_per_second": [(2 / 60, 2), (1 / 20, 3)],
-        "time/episodes_per_second": [(1 / 60, 2), (0.0, 3)],
-        "charts/episodes": [(1.0, 2), (0.0, 3)],
-        "charts/return_mean": [(8.0, 2)],
-        "charts/episode_length_mean": [(2.0, 2)],
-        "charts/total_return_mean": [(8.0, 2), (8.0, 3)],
-        "charts/total_episode_length_mean": [(2.0, 2), (2.0, 3)],
-        "charts/total_episodes": [(1.0, 2), (1.0, 3)],
-        "charts/total_observations": [(2.0, 2), (3.0, 3)],
-        "charts/total_iterations": [(2.0, 2), (3.0, 3)],
-        "charts/total_updates": [(2.0, 2), (4.0, 3)],
-        "charts/training_progress": [(2 / 3, 2), (1.0, 3)],
-        "time/elapsed_seconds": [(60.0, 2), (80.0, 3)],
+        "train/entropy": [(12.0, 2), (36.0, 3)],
+        "train/approx_kl": [(0.02 / 3, 2), (0.0, 3)],
+        "train/clip_fraction": [(0.04, 2), (0.12, 3)],
+        "train/explained_variance_mean": [(0.0, 2)],
+        "train/updates_per_rollout_mean": [(1.0, 2), (2.0, 3)],
+        "train/kl_early_stop_fraction": [(0.5, 2), (0.0, 3)],
+        "train/rollouts_per_second": [(2 / 60, 2), (1 / 20, 3)],
+        "train/env_steps_per_second": [(2 / 60, 2), (1 / 20, 3)],
+        "train/episodes_per_second": [(1 / 60, 2), (0.0, 3)],
+        "rollout/episode_count": [(1.0, 2), (0.0, 3)],
+        "rollout/return_mean": [(8.0, 2)],
+        "rollout/episode_length_steps_mean": [(2.0, 2)],
+        "train/return_mean": [(8.0, 2), (8.0, 3)],
+        "train/episode_length_steps_mean": [(2.0, 2), (2.0, 3)],
+        "train/episodes_total": [(1.0, 2), (1.0, 3)],
+        "train/env_steps_total": [(2.0, 2), (3.0, 3)],
+        "train/rollouts_total": [(2.0, 2), (3.0, 3)],
+        "train/updates_total": [(2.0, 2), (4.0, 3)],
+        "train/progress_fraction": [(2 / 3, 2), (1.0, 3)],
+        "train/elapsed_seconds": [(60.0, 2), (80.0, 3)],
     }.items():
         np.testing.assert_allclose(logged[tag], expected, err_msg=tag)
-    for tag, initial in (("charts/learning_rate", config.learning_rate), ("charts/entropy_coef", config.entropy_coef)):
+    for tag, initial in (("train/learning_rate", config.learning_rate), ("train/entropy_coef", config.entropy_coef)):
         np.testing.assert_allclose(logged[tag], [(initial * 0.75, 2), (initial * 0.25, 3)], rtol=1e-6)
     progress_lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("iteration=")]
     assert len(progress_lines) == 2
@@ -663,7 +672,9 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
     }.intersection(logged)
     assert "step=2 episodes=1 return=8.0 episode_length=2.0" in progress_lines[0]
     assert "step=3 episodes=1 return=n/a episode_length=n/a" in progress_lines[1]
-    assert logged["time/checkpoint_seconds"] == [(2.5, 3)]
+    assert "ev=0.000" in progress_lines[0]
+    assert "ev=n/a" in progress_lines[1]
+    assert logged["checkpoint/save_seconds"] == [(2.5, 3)]
     assert writer.log_metrics.call_count == 4  # Startup, two progress windows, and checkpoint timing.
     writer.__exit__.assert_called_once()
 
@@ -720,7 +731,7 @@ def test_video_schedule_uses_iterations(interval: int, expected_steps: list[int]
 
     def advance_update(
         state: TrainState,
-        batch: ppo.PPOBatch,  # observations: (T=1, B, O); targets/starts: (T, B); carry: pair of (B, H)
+        batch: ppo.PPOBatch,  # observations: (B, T=1, O); targets/starts: (B, T); carry: pair of (B, H)
         config: ppo.Config,
         iteration: int,
     ) -> tuple[TrainState, ppo.MinibatchMetrics]:
@@ -863,14 +874,15 @@ def test_train_evaluates_final_policy(
         assert evaluate.call_args.args[0] is state
     first_elapsed = 90.0 if 2 in expected_steps else 60.0
     final_elapsed = 120.0 + 30.0 * len(expected_steps)
+    assert "train/kl_early_stop_fraction" not in metric_history(writer.return_value)
     for tag, expected in (
-        ("charts/total_episodes", [(1.0, 2), (2.0, 4)]),
-        ("charts/total_return_mean", [(3.0, 2), (5.0, 4)]),
-        ("charts/total_episode_length_mean", [(2.0, 2), (1.5, 4)]),
-        ("time/elapsed_seconds", [(first_elapsed, 2), (final_elapsed, 4)]),
-        ("time/iterations_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
-        ("time/observations_per_second", [(2 / first_elapsed, 2), (2 / (final_elapsed - first_elapsed), 4)]),
-        ("time/episodes_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
+        ("train/episodes_total", [(1.0, 2), (2.0, 4)]),
+        ("train/return_mean", [(3.0, 2), (5.0, 4)]),
+        ("train/episode_length_steps_mean", [(2.0, 2), (1.5, 4)]),
+        ("train/elapsed_seconds", [(first_elapsed, 2), (final_elapsed, 4)]),
+        ("train/rollouts_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
+        ("train/env_steps_per_second", [(2 / first_elapsed, 2), (2 / (final_elapsed - first_elapsed), 4)]),
+        ("train/episodes_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
     ):
         logged = metric_history(writer.return_value)[tag]
         assert logged == expected
@@ -878,6 +890,7 @@ def test_train_evaluates_final_policy(
     assert f"elapsed=0:01:{int(first_elapsed % 60):02d}" in output
     assert f"elapsed=0:{int(final_elapsed // 60):02d}:{int(final_elapsed % 60):02d}" in output
     assert "eta=" not in output
+    assert "early_stop=n/a" in output
     writer.return_value.__exit__.assert_called_once()
 
 

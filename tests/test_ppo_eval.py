@@ -188,7 +188,7 @@ def test_evaluation_logs_raw_scores_and_independent_seeds(
     assert scalars["eval/return_mean"] == 3
     assert scalars["eval/return_std"] == pytest.approx(2**0.5)
     assert scalars["eval/return_sem"] == pytest.approx(1.0)
-    assert scalars["eval/total_training_episodes"] == 1
+    assert scalars["eval/training_episodes_total" if trainer is ppo else "eval/total_training_episodes"] == 1
     assert not any(tag.startswith("training/") for tag in scalars)
     assert not any("last_100" in tag for tag in scalars)
     assert "eval/human_normalized_score_percent" not in scalars
@@ -263,8 +263,11 @@ def test_playback_logging_reports_progress(
         "Evaluating 1 games at step 128...",
         "Evaluation: return=2.0 over 1 games in 6.0s",
     ]
-    writer.log_metrics.assert_any_call({"time/video_seconds": 5.0}, 128)
-    assert writer.log_metrics.call_args.args[0]["time/evaluation_seconds"] == 6.0
+    writer.log_metrics.assert_any_call({"actor/video_seconds" if trainer is ppo else "time/video_seconds": 5.0}, 128)
+    assert (
+        writer.log_metrics.call_args.args[0]["eval/evaluation_seconds" if trainer is ppo else "time/evaluation_seconds"]
+        == 6.0
+    )
     assert writer.log_metrics.call_args.args[1] == 128
     assert [call.args[1] for call in writer.log_video.call_args_list] == ["gameplay/128.mp4", "eval/gameplay/128.mp4"]
     assert all(

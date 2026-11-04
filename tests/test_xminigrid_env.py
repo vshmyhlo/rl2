@@ -171,6 +171,7 @@ def test_ruleset_index_is_checked_before_jax_indexing(benchmark: Benchmark) -> N
         XMiniGridEnv(XMiniGridConfig(env_id="XLand-MiniGrid-R1-9x9", benchmark="trivial-21k", ruleset_id=2))
 
 
+@pytest.mark.usefixtures("ppo_mesh")
 def test_real_rollout_update_and_video() -> None:
     config = replace(
         ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo/xminigrid.yaml", ppo.Config),
@@ -194,21 +195,21 @@ def test_real_rollout_update_and_video() -> None:
     model = ppo.ActorCritic(env.action_space, config.model)
     carry = model.initial_carry(1)  # leaves: (1,2)
     starts = jnp.ones(1, bool)  # (1,)
-    params = model.init(jax.random.key(1), observations[None], carry, starts[None])["params"]  # parameter pytree
+    params = model.init(jax.random.key(1), observations[:, None], carry, starts[:, None])["params"]  # parameter pytree
     state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(1e-3))
     runner = ppo.RolloutCarry(env_state, observations, carry, starts, jnp.zeros(1), jnp.zeros(1, jnp.int32))
     advanced, rollout = ppo.collect_rollout(runner, state, env, config, jax.random.key(2))
-    assert rollout.batch.observations.shape == (2, 1, 7, 7, 2)
-    chex.assert_shape((rollout.batch.actions, rollout.batch.returns), (2, 1))
+    assert rollout.batch.observations.shape == (1, 2, 7, 7, 2)
+    chex.assert_shape((rollout.batch.actions, rollout.batch.returns), (1, 2))
     chex.assert_shape((rollout.episode_count, rollout.episode_return_sum, rollout.episode_length_sum), ())
     assert int(rollout.episode_count) == 1
     assert int(rollout.episode_length_sum) == 2
     np.testing.assert_array_equal(advanced.env_state.state.step_num, 0)
     _, logits, values = model.apply(
         {"params": params}, rollout.batch.observations, rollout.batch.model_carry, rollout.batch.episode_starts
-    )  # carry leaves: (1,2); (T=2,B=1,A); (T=2,B=1)
+    )  # carry leaves: (1,2); (B=1,T=2,A); (B=1,T=2)
     logits = logits.logits  # (..., A)
-    assert logits.shape == (2, 1, env.action_space.n)
+    assert logits.shape == (1, 2, env.action_space.n)
     np.testing.assert_allclose(values, rollout.batch.values, atol=1e-5)
     updated, metrics = ppo.update(state, rollout.batch, config)
     assert int(updated.step) == 1

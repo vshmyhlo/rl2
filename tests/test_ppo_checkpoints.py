@@ -275,7 +275,7 @@ def test_checkpoint_paths_preserve_gcs_and_resolve_local(tmp_path: Path, monkeyp
 
 
 @pytest.mark.parametrize("failure", ["manager", "reset", "writer", "logging", "writer_close"])
-def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> None:
+def test_train_closes_resources_on_failure(config: ppo.Config, state: TrainState, failure: str) -> None:
     envs = Mock(action_space=ppo.DiscreteSpace(2), params={})
     envs.step_batch = partial(BaseEnv.step_batch, envs)
     envs.reset.return_value = (np.zeros(1, dtype=np.uint8), {})  # observation: (O=1,)
@@ -295,7 +295,7 @@ def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> 
         patch.object(ppo, "GymnaxEnv", return_value=envs),
         patch.object(ppo, "checkpoint_manager", return_value=manager) as make_manager,
         patch.object(ppo, "ActorCritic", return_value=model),
-        patch.object(ppo.TrainState, "create"),
+        patch.object(ppo.TrainState, "create", return_value=state),
         patch.object(ppo, "restore_checkpoint", return_value=None),
         patch.object(ppo, "MLflowLogger", return_value=writer) as make_writer,
     ):
@@ -317,6 +317,7 @@ def test_train_closes_resources_on_failure(config: ppo.Config, failure: str) -> 
         writer.__exit__.assert_not_called()
 
 
+@pytest.mark.usefixtures("ppo_mesh")
 def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config) -> None:
     path = Path(config.ckpt_dir) / "config.yaml"
     settings = asdict(config)
@@ -420,13 +421,13 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         np.testing.assert_allclose(learning_rates, [ppo.learning_rate_schedule(config)(i) for i in range(4)])
         writer.assert_called_once_with(experiment="ppo", run_name=config.run_id)
         logged = metric_history(writer.return_value)
-        assert logged["charts/total_episodes"] == [(3.0, 3), (4.0, 4)]
-        assert logged["charts/total_observations"][-1] == (4.0, 4)
-        assert logged["charts/training_progress"] == [(0.75, 3), (1.0, 4)]
-        assert logged["charts/total_return_mean"] == [(1.0, 3), (1.0, 4)]
-        assert logged["charts/total_episode_length_mean"] == [(1.0, 3), (1.0, 4)]
-        assert [value for value, _ in logged["time/observations_per_second"]] == [1.0, 1.0]
-        assert logged["time/elapsed_seconds"] == [(1.0, 3), (2.0, 4)]
+        assert logged["train/episodes_total"] == [(3.0, 3), (4.0, 4)]
+        assert logged["train/env_steps_total"][-1] == (4.0, 4)
+        assert logged["train/progress_fraction"] == [(0.75, 3), (1.0, 4)]
+        assert logged["train/return_mean"] == [(1.0, 3), (1.0, 4)]
+        assert logged["train/episode_length_steps_mean"] == [(1.0, 3), (1.0, 4)]
+        assert [value for value, _ in logged["train/env_steps_per_second"]] == [1.0, 1.0]
+        assert logged["train/elapsed_seconds"] == [(1.0, 3), (2.0, 4)]
         # An already completed run does not perform more updates or duplicate a save.
         ppo.train(config)
         assert iterations == [0, 1, 2, 3]
