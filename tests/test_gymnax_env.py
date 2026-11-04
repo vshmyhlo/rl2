@@ -88,3 +88,33 @@ def test_space_invaders_batched_collision_and_fire() -> None:
 def test_rejects_non_native_environment() -> None:
     with pytest.raises(ValueError, match="Gymnax"):
         GymnaxEnv("ALE/Breakout-v5")
+
+
+def test_four_rooms_visual_observations_and_episode_endings() -> None:
+    env = GymnaxEnv("FourRooms-misc", max_steps_in_episode=2)
+    params = env.params.replace(fail_prob=0.0)
+    keys = jax.random.split(jax.random.key(0), 3)  # (B=3,)
+    observations, state = jax.vmap(env.reset, in_axes=(0, None))(keys, params)  # (B,13,13,2); leaves: (B,...)
+    native, _ = env.env.reset(keys[0], params)  # (13,13,2); leaves: (...)
+    np.testing.assert_array_equal(observations[0], native)
+    assert observations.shape == (3, 13, 13, 2) and observations.dtype == jnp.float32
+    assert env.action_space.n == 4
+    # Move right into the goal, hit the time limit, or continue normally.
+    state = state.replace(
+        pos=jnp.array([[8, 8], [4, 1], [4, 1]]),  # (B,2)
+        time=jnp.array([0, 1, 0]),  # (B,)
+    )
+    result = jax.jit(env.step_batch)(keys, state, jnp.ones(3, jnp.int32), params)
+    assert result.observation.shape == result.info["final_observation"].shape == (3, 13, 13, 2)
+    assert result.reward.shape == (3,) and result.reward.dtype == jnp.float32
+    np.testing.assert_array_equal(result.reward, [1.0, 0.0, 0.0])
+    np.testing.assert_array_equal(result.done, [True, True, False])
+    np.testing.assert_array_equal(result.info["terminated"], [True, False, False])
+    np.testing.assert_array_equal(result.info["truncated"], [False, True, False])
+    np.testing.assert_array_equal(result.state.time, [0, 0, 1])
+    np.testing.assert_array_equal(result.info["final_state"].time, [1, 2, 1])
+    final_state = jax.tree.map(lambda leaf: leaf[2], result.info["final_state"])  # leaves: (...)
+    frame = env.render(final_state)  # (208,208,3)
+    assert frame.shape == (208, 208, 3) and frame.dtype == jnp.uint8
+    np.testing.assert_array_equal(frame[8 * 16, 9 * 16], [80, 200, 80])
+    np.testing.assert_array_equal(frame[4 * 16, 2 * 16], [80, 160, 255])

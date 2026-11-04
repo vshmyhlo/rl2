@@ -76,6 +76,19 @@ def test_load_config_returns_fully_resolved_config(config_path: Path) -> None:
     assert config.num_minibatches == config.num_envs
 
 
+def test_four_rooms_gymnax_config(config_path: Path) -> None:
+    settings = yaml.safe_load(config_path.read_text())
+    settings["env"] = {"id": "FourRooms-misc"}
+    config_path.write_text(yaml.safe_dump(settings))
+
+    config = load_config(config_path, Config)
+    env = ppo.make_env(config)
+
+    assert isinstance(config.env, ppo.GymnaxConfig)
+    assert env.env.name == "FourRooms-misc"
+    assert env.env.use_visual_obs
+
+
 @pytest.mark.parametrize(
     "ckpt_dir,error,match",
     [

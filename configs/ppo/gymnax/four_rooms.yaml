@@ -1,0 +1,43 @@
+# Gymnax FourRooms 13x13 visual CNN + LSTM baseline for two GPUs.
+env:
+  id: FourRooms-misc # Native fixed start/goal, stochastic actions, 500-step episode limit
+seed: 1
+total_steps: 10_000_000 # Environment steps summed across environments; only full rollouts run
+num_envs: 64 # 32 environments per GPU
+num_steps: 128 # 8192 environment steps per rollout
+num_minibatches: 8 # 8 whole sequences per minibatch; 512 environment steps per GPU
+update_epochs: 4
+model:
+  encoder:
+    type: rgb # Native wall/agent planes; preserve the 13x13 grid
+    stages:
+      - { channels: 64, blocks: 2, kernel_size: 3, resize_factor: 1.0 }
+    embedding_size: 256
+  recurrent:
+    type: lstm
+    hidden_size: 256
+    num_layers: 1
+    intermediate_size: 0
+bf16: false
+learning_rate: 0.0003
+anneal_lr: true
+lr_decay: linear
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: null # Fixed epoch count; no KL early stopping
+entropy_coef: 0.01
+entropy_decay: constant
+value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
+max_grad_norm: 0.5
+ckpt_dir: /runs/ppo/${run_id}
+run_id: ppo_${path_name:${env.id}}_seed${seed}
+# Intervals count PPO iterations; eval/checkpoints ~2M environment steps.
+# Evaluation (including GIF recording), checkpoints, and logging also run on completion.
+checkpoint_interval: 245
+log_interval: 10
+video_max_frames: 501 # Initial frame plus the native 500-step episode limit
+video_fps: 10.0
+eval_interval: 245
+eval_episodes: 10
+eval_seed: 10000

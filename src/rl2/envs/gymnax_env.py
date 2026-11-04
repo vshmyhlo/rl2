@@ -1,4 +1,4 @@
-"""Gymnax MinAtar Breakout and Space Invaders with native observations."""
+"""Gymnax MinAtar and FourRooms with native visual observations."""
 
 from typing import Literal
 
@@ -6,36 +6,44 @@ import gymnax
 import jax
 import jax.numpy as jnp
 from gymnax.environments.minatar import breakout, space_invaders
+from gymnax.environments.misc import rooms
 from pydantic import ConfigDict
 from pydantic.dataclasses import dataclass
 
 from rl2.actions import DiscreteSpace
 from rl2.envs.base import BaseEnv, EnvStep
 
-type EnvParams = breakout.EnvParams | space_invaders.EnvParams
-type EnvState = breakout.EnvState | space_invaders.EnvState
+type EnvParams = breakout.EnvParams | space_invaders.EnvParams | rooms.EnvParams
+type EnvState = breakout.EnvState | space_invaders.EnvState | rooms.EnvState
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class GymnaxConfig:
-    id: Literal["Breakout-MinAtar", "SpaceInvaders-MinAtar"] = "Breakout-MinAtar"
+    id: Literal["Breakout-MinAtar", "SpaceInvaders-MinAtar", "FourRooms-misc"] = "Breakout-MinAtar"
 
 
 class GymnaxEnv(BaseEnv[EnvState, EnvParams]):
-    """MinAtar with explicit state, independent RNGs, and same-step reset."""
+    """Visual environments with explicit state, independent RNGs, and same-step reset."""
 
     @staticmethod
     def render_observation(observation: jax.Array) -> jax.Array:  # (H, W, C) -> (H*16, W*16, 3)
         return render_observation(observation)  # (H*16, W*16, 3)
 
     def render(self, state: EnvState) -> jax.Array:  # state leaves: (...) -> (H*16, W*16, 3)
+        if isinstance(state, rooms.EnvState):
+            pixels = jnp.where(self.env.occupied_map[..., None], 80, 255)  # (H, W, 1)
+            pixels = jnp.repeat(pixels, 3, axis=-1).astype(jnp.uint8)  # (H, W, 3)
+            pixels = pixels.at[state.goal[0], state.goal[1]].set(jnp.array([80, 200, 80], jnp.uint8))  # (H, W, 3)
+            pixels = pixels.at[state.pos[0], state.pos[1]].set(jnp.array([80, 160, 255], jnp.uint8))  # (H, W, 3)
+            return pixels.repeat(16, axis=0).repeat(16, axis=1)  # (H*16, W*16, 3)
         observation = self.env.get_obs(state, self.params)  # (H, W, C)
         return render_observation(observation)  # (H*16, W*16, 3)
 
     def __init__(self, env_id: str, *, max_steps_in_episode: int | None = None) -> None:
-        if env_id not in ("Breakout-MinAtar", "SpaceInvaders-MinAtar"):
-            raise ValueError("PPO supports Gymnax Breakout-MinAtar and SpaceInvaders-MinAtar")
-        self.env, self.params = gymnax.make(env_id)
+        if env_id not in ("Breakout-MinAtar", "SpaceInvaders-MinAtar", "FourRooms-misc"):
+            raise ValueError("PPO supports Gymnax Breakout-MinAtar, SpaceInvaders-MinAtar, and FourRooms-misc")
+        kwargs = {"use_visual_obs": True} if env_id == "FourRooms-misc" else {}
+        self.env, self.params = gymnax.make(env_id, **kwargs)
         if max_steps_in_episode is not None:
             if max_steps_in_episode <= 0:
                 raise ValueError("max_steps_in_episode must be positive")
@@ -75,7 +83,7 @@ class GymnaxEnv(BaseEnv[EnvState, EnvParams]):
         return EnvStep(
             observation=observation,  # (H, W, C)
             state=state,  # leaves: (...)
-            reward=reward,  # ()
+            reward=reward.astype(jnp.float32),  # () FourRooms returns a boolean reward
             done=done,  # ()
             info={
                 "terminated": terminated,  # ()
@@ -87,7 +95,7 @@ class GymnaxEnv(BaseEnv[EnvState, EnvParams]):
 
 
 def render_observation(observation: jax.Array) -> jax.Array:  # (H, W, C) -> (H*16, W*16, 3)
-    """Color (H, W, C) MinAtar channels; C=4 for Breakout or 6 for Space Invaders."""
+    """Color (H, W, C) visual channels; C=2 for FourRooms, 4 or 6 for MinAtar."""
     palette = jnp.array(
         [[255, 255, 255], [255, 80, 80], [100, 100, 100], [80, 160, 255], [80, 255, 80], [255, 200, 80]],
         dtype=jnp.uint8,
