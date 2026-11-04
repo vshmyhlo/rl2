@@ -686,7 +686,10 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         np.testing.assert_allclose(logged[tag], expected, err_msg=tag)
     for tag, initial in (("train/learning_rate", config.learning_rate), ("train/entropy_coef", config.entropy_coef)):
         np.testing.assert_allclose(logged[tag], [(initial * 0.75, 2), (initial * 0.25, 3)], rtol=1e-6)
-    progress_lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("iteration=")]
+    output = capsys.readouterr().out
+    assert "Observation space: ShapeDtypeStruct(shape=(1,), dtype=uint8)" in output
+    assert "Action space: DiscreteSpace(n=2)" in output
+    progress_lines = [line for line in output.splitlines() if line.startswith("iteration=")]
     assert len(progress_lines) == 2
     assert "progress=0.667" in progress_lines[0]
     assert "progress=1.000" in progress_lines[1]

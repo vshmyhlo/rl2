@@ -87,7 +87,9 @@ minimum frame delay.
 Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
 model/parameter_count/<step>.txt, eval/report/<step>.json, gameplay/<step>.gif,
 and eval/gameplay/<step>.gif. Config parameters use dotted keys; existing values
-are preserved on resume. Checkpoints retain parameters, optimizer state, RNG,
+are preserved on resume. Startup console logs include per-environment observation
+shapes/dtypes and the action space (discrete count or continuous shape/bounds),
+including on resume. Checkpoints retain parameters, optimizer state, RNG,
 completed iterations, and episode totals. Live environments and recurrent memory
 restart on resume; unfinished episode statistics are discarded.
 """
@@ -1218,6 +1220,9 @@ def train(config: Config) -> TrainState:
         devices = str(jax.devices())
         print(f"JAX devices: {devices}", flush=True)
         writer.log_text(devices, f"devices/{initial_step_count}.txt")
+        observation_space = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape[1:], x.dtype), obs)
+        print(f"Observation space: {observation_space}", flush=True)
+        print(f"Action space: {envs.action_space}", flush=True)
         parameter_count = sum(parameter.size for parameter in jax.tree.leaves(train_state.params))
         writer.log_metrics({"model/params_millions": parameter_count / 1_000_000}, initial_step_count)
         print(f"Model parameters: {parameter_count:,}", flush=True)
