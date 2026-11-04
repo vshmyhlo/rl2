@@ -15,6 +15,7 @@ from types import TracebackType
 from typing import Any, Self, TextIO
 from uuid import uuid4
 
+import imageio.v3 as iio
 import numpy as np
 from mlflow import MlflowClient
 from mlflow.entities import Metric, Param
@@ -168,7 +169,10 @@ class MLflowLogger:
             self.client.log_batch(self.run_id, params=params, synchronous=True)
 
     def log_video(self, frames: list[NDArray[np.uint8]], artifact_file: str, *, fps: float) -> None:  # each (H, W, 3)
-        """Encode (H, W, 3) RGB frames as an MP4 artifact."""
+        """Encode (H, W, 3) RGB frames as MP4 or a looping GIF, selected by suffix.
+
+        GIF frame boundaries round to 10 ms, with a minimum delay of 10 ms.
+        """
         if not frames:
             raise ValueError("Video must contain at least one frame")
         if not isfinite(fps) or fps <= 0:
@@ -176,15 +180,20 @@ class MLflowLogger:
         artifact_path, filename = posixpath.split(artifact_file)
         with TemporaryDirectory() as directory:
             path = Path(directory) / filename
-            with ImageSequenceClip(frames, fps=fps) as clip:
-                # MoviePy truncates duration * fps; round upward to preserve the final frame.
-                clip.duration = nextafter(len(frames) / fps, inf)
-                clip.write_videofile(
-                    str(path),
-                    codec="libx264",
-                    audio=False,
-                    logger=None,
-                    # Set the output format explicitly; MoviePy's pixel_format controls the input.
-                    ffmpeg_params=["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p"],
-                )
+            if path.suffix.lower() == ".gif":
+                # Round cumulative timestamps so fractional delays do not accumulate drift.
+                durations = [max(1, round((i + 1) * 100 / fps) - round(i * 100 / fps)) * 10 for i in range(len(frames))]
+                iio.imwrite(path, frames, plugin="pillow", save_all=True, duration=durations, loop=0)
+            else:
+                with ImageSequenceClip(frames, fps=fps) as clip:
+                    # MoviePy truncates duration * fps; round upward to preserve the final frame.
+                    clip.duration = nextafter(len(frames) / fps, inf)
+                    clip.write_videofile(
+                        str(path),
+                        codec="libx264",
+                        audio=False,
+                        logger=None,
+                        # Set the output format explicitly; MoviePy's pixel_format controls the input.
+                        ffmpeg_params=["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p"],
+                    )
             self.client.log_artifact(self.run_id, str(path), artifact_path=artifact_path or None)

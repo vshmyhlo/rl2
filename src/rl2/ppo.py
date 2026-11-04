@@ -6,6 +6,8 @@ actions, D continuous action size, and H recurrent width. Sequence arrays use
 memory and stop GAE traces; timeouts bootstrap from final observations unless the
 episode also terminated.
 
+The default value_coef=1.0 weights the critic by 0.5 * mean squared value error.
+
 Training uses all devices on JAX's default backend (all visible GPUs when available).
 Parameters and optimizer state are replicated; environments and minibatches are
 sharded along B, keeping each recurrent sequence intact. num_envs is global and
@@ -19,7 +21,8 @@ total_steps and MLflow steps count environment transitions across all environmen
 An iteration collects one batch of num_envs * num_steps transitions and runs PPO
 epochs. An update applies gradients from one accepted minibatch; KL-rejected
 minibatches do not count as updates.
-Window/lifetime metrics and latest settings are logged every log_interval iterations.
+Window/lifetime metrics and latest settings are logged every log_interval iterations
+(default: 10). Checkpoints are saved every checkpoint_interval iterations (default: 100).
 All enabled schedules use completed iteration counts, including resumed training,
 and also run on normal completion. No metrics have categorical suffixes.
 
@@ -73,9 +76,13 @@ Evaluation uses fixed seeds and logs raw episode return mean, sample standard
 deviation, and standard error as eval/return_mean, eval/return_std, and
 eval/return_sem after each evaluation. eval/training_episodes_total is the lifetime
 completed training episode count at evaluation. Uncertainty metrics are omitted
-for a single episode. Evaluation records its last episode;
-standalone gameplay uses video_interval. video_max_frames caps recording, but
-only standalone gameplay stops the episode at that cap.
+for a single episode. Evaluation always records its last episode, independently
+of video_interval. Standalone gameplay is disabled by default (video_interval=0);
+a positive video_interval enables recording at that iteration interval and on
+normal completion. video_max_frames caps recording (default: 1000), but
+only standalone gameplay stops the episode at that cap. Gameplay is saved as
+looping GIFs at video_fps, with frame boundaries rounded to 10 ms and a 10 ms
+minimum frame delay.
 
 Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
 model/parameter_count/<step>.txt, eval/report/<step>.json, gameplay/<step>.gif,
@@ -339,19 +346,19 @@ class Config(BaseConfig):
     clip_coef: Annotated[float, Field(ge=0, lt=1, allow_inf_nan=False)]
     target_kl: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None
     entropy_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)]
-    value_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)]
     max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     video_fps: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    value_coef: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 1.0
     bf16: bool = True
-    video_max_frames: Annotated[int, Field(gt=0)] | None = 900
-    video_interval: Annotated[int, Field(ge=0)] = 600
+    video_max_frames: Annotated[int, Field(gt=0)] | None = 1000
+    video_interval: Annotated[int, Field(ge=0)] = 0
     eval_interval: Annotated[int, Field(ge=0)] = 0
     eval_episodes: Annotated[int, Field(gt=0)] = 100
     eval_seed: Annotated[int, Field(ge=0, lt=2**32)] = 10_000
     lr_decay: Literal["linear", "cosine"] = "linear"
     entropy_decay: Literal["constant", "cosine"] = "constant"
-    checkpoint_interval: Annotated[int, Field(gt=0)] = 600
-    log_interval: Annotated[int, Field(gt=0)] = 60
+    checkpoint_interval: Annotated[int, Field(gt=0)] = 100
+    log_interval: Annotated[int, Field(gt=0)] = 10
 
     @model_validator(mode="after")
     def validate_rollout(self) -> Self:
@@ -747,7 +754,7 @@ def log_video(
     initial_carry: RecurrentCarry,  # leaves: (1, H)
     env: PPOEnv | None = None,
 ) -> None:
-    """Record a separate episode up to the frame cap and log its gameplay video."""
+    """Record a separate episode up to the frame cap and log its gameplay GIF."""
     print(f"Recording gameplay at step {step_count} after {episode_count} training episodes...", flush=True)
     started = monotonic()
     _, _, frames = play_episode(

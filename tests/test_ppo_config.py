@@ -25,6 +25,27 @@ def config_path(tmp_path: Path) -> Path:
     return path
 
 
+@pytest.mark.parametrize(
+    "field,default,override",
+    [("video_max_frames", 1000, 7), ("log_interval", 10, 2), ("checkpoint_interval", 100, 3)],
+)
+def test_recording_logging_and_checkpoint_defaults(config_path: Path, field: str, default: int, override: int) -> None:
+    settings = yaml.safe_load(config_path.read_text())
+    settings.pop(field, None)
+    config_path.write_text(yaml.safe_dump(settings))
+    assert getattr(load_config(config_path, Config), field) == default
+    settings[field] = override
+    config_path.write_text(yaml.safe_dump(settings))
+    assert getattr(load_config(config_path, Config), field) == override
+
+
+def test_value_coefficient_default_and_override() -> None:
+    settings = asdict(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config))
+    assert settings.pop("value_coef") == 1.0
+    assert Config(**settings).value_coef == 1.0
+    assert Config(**settings, value_coef=0.0).value_coef == 0.0
+
+
 @pytest.mark.parametrize("field", ["model", "encoder"])
 def test_requires_encoder(config_path: Path, field: str) -> None:
     settings = yaml.safe_load(config_path.read_text())
@@ -254,6 +275,7 @@ def test_environment_round_trip_and_factory(
     filename: str, config_class: type, constructor_name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / f"configs/ppo/{filename}.yaml", Config)
+    assert config.value_coef == 1.0
     assert isinstance(config.env, config_class)
     restored = Config(**yaml.safe_load(yaml.safe_dump(asdict(config))))
     assert restored == config and hash(restored) == hash(config)

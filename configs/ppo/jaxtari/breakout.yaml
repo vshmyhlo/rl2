@@ -32,7 +32,7 @@ clip_coef: 0.2
 target_kl: 0.01
 entropy_coef: 0.01
 entropy_decay: constant
-value_coef: 0.5
+value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
 run_id: ppo_${path_name:${env.id}}_${env.game}_seed${seed}

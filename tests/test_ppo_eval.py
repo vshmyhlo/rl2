@@ -165,6 +165,7 @@ def test_evaluation_logs_raw_scores_and_independent_seeds(
         trainer.load_config(Path(__file__).resolve().parents[1] / config_path, trainer.Config),
         eval_episodes=2,
         video_fps=12.5,
+        video_interval=0,
     )
     writer = Mock()
     state = Mock(spec=TrainState)

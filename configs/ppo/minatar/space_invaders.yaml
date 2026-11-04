@@ -28,15 +28,14 @@ clip_coef: 0.2
 target_kl: null # Fixed epoch count; no KL early stopping
 entropy_coef: 0.01
 entropy_decay: constant
-value_coef: 0.5 # Multiplies mean(0.5 * squared value error)
+value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
 run_id: ppo_${path_name:${env.id}}_seed${seed}
-# Intervals count PPO iterations; video ~1M transitions, eval/checkpoints ~2M.
-# Video, evaluation, checkpoints, and logging also run on completion.
+# Intervals count PPO iterations; eval/checkpoints ~2M transitions.
+# Evaluation (including GIF recording), checkpoints, and logging also run on completion.
 checkpoint_interval: 245
 log_interval: 10
-video_interval: 123
 video_max_frames: 1001 # Initial frame plus the native 1000-step episode limit
 video_fps: 40.0
 eval_interval: 245

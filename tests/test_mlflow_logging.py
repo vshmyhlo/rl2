@@ -229,11 +229,10 @@ def test_video_preserves_frames_at_artifact_root(client: MlflowClient, frame_cou
     [
         pytest.param(1, 12.5, [80], id="single-frame-odd-dimensions"),
         pytest.param(4, 40, [20, 30, 30, 20], id="fractional-centisecond-timing"),
+        pytest.param(2, 200, [10, 10], id="minimum-frame-delay"),
     ],
 )
-def test_gif_artifact(
-    client: MlflowClient, frame_count: int, fps: float, expected_durations: list[int]
-) -> None:
+def test_gif_artifact(client: MlflowClient, frame_count: int, fps: float, expected_durations: list[int]) -> None:
     frames = [np.full((3, 5, 3), index * 60, dtype=np.uint8) for index in range(frame_count)]  # each (H=3, W=5, C=3)
     with MLflowLogger(experiment="ppo", run_name=None) as logger:
         logger.log_video(frames, "eval/gameplay/4.gif", fps=fps)

@@ -89,10 +89,11 @@ Video/images:
     gameplay: RGB gameplay from a separate episode under the current policy,
         rendered from environment state and saved as gameplay/<step>.gif.
         Recording ends at episode termination/truncation or video_max_frames
-        (default: 900; None removes the frame cap). Playback uses video_fps frames per second.
-    eval/gameplay: RGB video of the last episode in each evaluation run, using
-        the same frame cap and playback speed. Evaluation finishes the full
-        episode even when recording reaches the frame cap.
+        (default: 900; None removes the frame cap). GIFs loop at video_fps, with
+        frame boundaries rounded to 10 ms and a 10 ms minimum frame delay.
+    eval/gameplay: RGB GIF of the last episode in each evaluation run, saved as
+        eval/gameplay/<step>.gif with the same frame cap and playback speed.
+        Evaluation finishes the full episode even when recording reaches the frame cap.
     No standalone still images, audio, histograms, embeddings, or graphs are logged.
 
 Episode means are omitted when no corresponding episodes or history are available.
@@ -676,7 +677,7 @@ def log_video(
     initial_carry: RecurrentCarry,  # leaves: (N, H)
     env: PPOEnv | None = None,
 ) -> None:
-    """Record a separate episode up to the frame cap and log its gameplay video."""
+    """Record a separate episode up to the frame cap and log its gameplay GIF."""
     print(f"Recording gameplay at step {step_count} after {episode_count} training episodes...", flush=True)
     started = monotonic()
     _, _, frames = play_episode(

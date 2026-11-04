@@ -724,10 +724,11 @@ def test_invalid_log_interval(interval: float) -> None:
         replace(config, log_interval=interval)
 
 
-def test_video_interval_defaults_to_600_iterations() -> None:
+def test_standalone_video_is_disabled_by_default() -> None:
     settings = vars(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config)).copy()
     settings.pop("video_interval")
-    assert ppo.Config(**settings).video_interval == 600
+    assert ppo.Config(**settings).video_interval == 0
+    assert ppo.Config(**settings, video_interval=2).video_interval == 2
 
 
 @pytest.mark.parametrize("interval", [-1, 1.5, True])

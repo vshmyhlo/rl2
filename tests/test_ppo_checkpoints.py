@@ -330,7 +330,6 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
     settings.update(env={"id": "Breakout-MinAtar"}, ckpt_dir=config.ckpt_dir + "/${run_id}/${path_name:${env.id}}")
     path.write_text(ppo.yaml.safe_dump(settings))
     config = ppo.load_config(path, ppo.Config)
-    assert config.checkpoint_interval == 600
     config = replace(config, checkpoint_interval=2, log_interval=2)
     obs = np.zeros((1, 1), dtype=np.uint8)
     zeros = np.zeros(1, dtype=np.float32)
