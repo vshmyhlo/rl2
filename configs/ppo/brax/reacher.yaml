@@ -1,5 +1,6 @@
 # Manipulation: move a two-joint arm tip to a sampled target. Assets ship with Brax.
 # Run: uv run ppo --config configs/ppo/brax/reacher.yaml
+# Recurrent PPO starting point; raw observations/rewards, no action repeat.
 env:
   id: Brax
   task: reacher
@@ -7,10 +8,10 @@ env:
   max_steps: 50 # 1 simulated second at 50 Hz
 seed: 1
 total_steps: 2_000_000 # Environment steps summed across environments
-num_envs: 32
-num_steps: 128
-num_minibatches: 4
-update_epochs: 4
+num_envs: 64
+num_steps: 64 # 4096 transitions per iteration; longer than the 50-step episode limit
+num_minibatches: 8 # 8 whole sequences / 512 transitions per minibatch
+update_epochs: 8 # At most 64 updates per iteration, subject to KL stopping
 model:
   continuous_policy: truncated_gaussian
   encoder:
@@ -24,12 +25,12 @@ bf16: false
 learning_rate: 0.0003
 anneal_lr: true
 lr_decay: linear
-gamma: 0.99
+gamma: 0.95 # Favor reaching promptly under dense distance and control-cost rewards
 gae_lambda: 0.95
 clip_coef: 0.2
 target_kl: 0.01
-entropy_coef: 0.001
-entropy_decay: cosine
+entropy_coef: 0.0 # Allow precise low-torque actions as the policy learns
+entropy_decay: constant
 value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}

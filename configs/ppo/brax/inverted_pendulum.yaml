@@ -1,16 +1,17 @@
 # Balance: keep a pole upright using one cart actuator. Assets ship with Brax.
 # Run: uv run ppo --config configs/ppo/brax/inverted_pendulum.yaml
+# Recurrent PPO starting point for a four-feature, single-control balance task.
 env:
   id: Brax
   task: inverted_pendulum
   backend: generalized
   max_steps: 1000 # 40 simulated seconds at 25 Hz
 seed: 1
-total_steps: 1_000_000 # Environment steps summed across environments
+total_steps: 500_000 # Environment steps summed across environments
 num_envs: 32
-num_steps: 128
-num_minibatches: 4
-update_epochs: 4
+num_steps: 64 # 2048 transitions per iteration; frequent feedback on short failures
+num_minibatches: 4 # 8 whole sequences / 512 transitions per minibatch
+update_epochs: 8 # At most 32 updates per iteration, subject to KL stopping
 model:
   continuous_policy: truncated_gaussian
   encoder:
@@ -28,8 +29,8 @@ gamma: 0.99
 gae_lambda: 0.95
 clip_coef: 0.2
 target_kl: 0.01
-entropy_coef: 0.001
-entropy_decay: cosine
+entropy_coef: 0.0 # The stochastic policy explores initially; allow precise balance later
+entropy_decay: constant
 value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}

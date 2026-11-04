@@ -51,6 +51,11 @@ MinAtar Space Invaders using [ppo.py](src/rl2/ppo.py) with the
 
 ![MinAtar Space Invaders PPO rollout](images/ppo_minatar_space_invaders.gif)
 
+Pgx 2048 using [ppo.py](src/rl2/ppo.py) with the
+[2048 config](configs/ppo/pgx/2048.yaml).
+
+![Pgx 2048 PPO rollout](images/ppo_pgx_2048.gif)
+
 ## Useful links and references
 
 | Link | Description |

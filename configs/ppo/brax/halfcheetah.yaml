@@ -1,5 +1,6 @@
 # Locomotion: run forward with a planar six-joint robot. Assets ship with Brax.
 # Run: uv run ppo --config configs/ppo/brax/halfcheetah.yaml
+# Recurrent PPO starting point; raw observations/rewards, no action repeat.
 env:
   id: Brax
   task: halfcheetah
@@ -7,10 +8,10 @@ env:
   max_steps: 1000 # 50 simulated seconds at 20 Hz
 seed: 1
 total_steps: 10_000_000 # Environment steps summed across environments
-num_envs: 32
-num_steps: 128
-num_minibatches: 4
-update_epochs: 4
+num_envs: 128
+num_steps: 64 # 8192 transitions per iteration; short recurrent sequences
+num_minibatches: 8 # 16 whole sequences / 1024 transitions per minibatch
+update_epochs: 8 # At most 64 updates per iteration, subject to KL stopping
 model:
   continuous_policy: truncated_gaussian
   encoder:
@@ -19,29 +20,29 @@ model:
     embedding_size: 256
   recurrent:
     type: lstm
-    hidden_size: 256
+    hidden_size: 128 # Full-state observations need only a modest recurrent core
 bf16: false
 learning_rate: 0.0003
 anneal_lr: true
 lr_decay: linear
-gamma: 0.99
+gamma: 0.95 # Dense velocity reward; limits critic target scale without reward normalization
 gae_lambda: 0.95
 clip_coef: 0.2
-target_kl: 0.01
+target_kl: 0.02 # KL threshold for the six-dimensional action distribution
 entropy_coef: 0.001
 entropy_decay: cosine
 value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
 run_id: ppo_${path_name:${env.id}}_${env.task}_${env.backend}_seed${seed}
-checkpoint_interval: 489
+checkpoint_interval: 244
 log_interval: 10
 # Intervals count completed PPO iterations.
 # Video/evaluation require an available OpenGL backend (e.g. MUJOCO_GL=egl).
 # Video every 10% and eval every 20% of training, rounded up to iterations; also run on completion.
-video_interval: 245
+video_interval: 122
 video_max_frames: 1001
 video_fps: 20.0
-eval_interval: 489
+eval_interval: 244
 eval_episodes: 10
 eval_seed: 10000
