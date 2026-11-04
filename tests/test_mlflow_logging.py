@@ -10,6 +10,7 @@ from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import ErrorCode
 from moviepy import VideoFileClip
 from moviepy.config import FFMPEG_BINARY
+from PIL import Image
 
 from rl2.mlflow_logging import MLflowLogger
 
@@ -221,6 +222,34 @@ def test_video_preserves_frames_at_artifact_root(client: MlflowClient, frame_cou
     )
     assert len(decoded.stdout) == frame_count * 2 * 2 * 3
     assert min(decoded.stdout[-12:]) >= 250
+
+
+@pytest.mark.parametrize(
+    ("frame_count", "fps", "expected_durations"),
+    [
+        pytest.param(1, 12.5, [80], id="single-frame-odd-dimensions"),
+        pytest.param(4, 40, [20, 30, 30, 20], id="fractional-centisecond-timing"),
+    ],
+)
+def test_gif_artifact(
+    client: MlflowClient, frame_count: int, fps: float, expected_durations: list[int]
+) -> None:
+    frames = [np.full((3, 5, 3), index * 60, dtype=np.uint8) for index in range(frame_count)]  # each (H=3, W=5, C=3)
+    with MLflowLogger(experiment="ppo", run_name=None) as logger:
+        logger.log_video(frames, "eval/gameplay/4.gif", fps=fps)
+    path = client.download_artifacts(logger.run_id, "eval/gameplay/4.gif")
+    with Image.open(path) as animation:
+        assert animation.format == "GIF"
+        assert animation.n_frames == frame_count
+        assert animation.info["loop"] == 0
+        durations = []
+        for index, frame in enumerate(frames):
+            animation.seek(index)
+            decoded = np.asarray(animation.convert("RGB"))  # (H=3, W=5, C=3)
+            assert decoded.shape == frame.shape
+            np.testing.assert_array_equal(decoded, frame)
+            durations.append(animation.info["duration"])
+        assert durations == expected_durations
 
 
 @pytest.mark.parametrize(

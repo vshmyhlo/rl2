@@ -78,8 +78,8 @@ standalone gameplay uses video_interval. video_max_frames caps recording, but
 only standalone gameplay stops the episode at that cap.
 
 Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
-model/parameter_count/<step>.txt, eval/report/<step>.json, gameplay/<step>.mp4,
-and eval/gameplay/<step>.mp4. Config parameters use dotted keys; existing values
+model/parameter_count/<step>.txt, eval/report/<step>.json, gameplay/<step>.gif,
+and eval/gameplay/<step>.gif. Config parameters use dotted keys; existing values
 are preserved on resume. Checkpoints retain parameters, optimizer state, RNG,
 completed iterations, and episode totals. Live environments and recurrent memory
 restart on resume; unfinished episode statistics are discarded.
@@ -759,7 +759,7 @@ def log_video(
         stop_at_frame_limit=True,
         env=make_env(config) if env is None else env,
     )
-    writer.log_video(frames, f"gameplay/{step_count}.mp4", fps=config.video_fps)
+    writer.log_video(frames, f"gameplay/{step_count}.gif", fps=config.video_fps)
     seconds = monotonic() - started
     writer.log_metrics({"actor/video_seconds": seconds}, step_count)
     print(
@@ -793,7 +793,7 @@ def log_evaluation(
         )
         episode_results.append({"return": episode_return, "length": episode_step_count})
         if frames:
-            writer.log_video(frames, f"eval/gameplay/{step_count}.mp4", fps=config.video_fps)
+            writer.log_video(frames, f"eval/gameplay/{step_count}.gif", fps=config.video_fps)
     returns = [result["return"] for result in episode_results]
     std = stdev(returns) if len(returns) > 1 else None
     result = {

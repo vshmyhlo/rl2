@@ -44,9 +44,7 @@ Solving sparse reward Atari environments, such as Montezuma’s Revenge.
 MinAtar Breakout using [ppo.py](src/rl2/ppo.py) with the
 [Breakout configuration](configs/ppo/minatar/breakout.yaml).
 
-<video src="images/ppo_minatar_breakout.mp4" controls loop muted playsinline>
-  <a href="images/ppo_minatar_breakout.mp4">Watch the MinAtar Breakout rollout</a>
-</video>
+![MinAtar Breakout PPO rollout](images/ppo_minatar_breakout.gif)
 
 ## Useful links and references
 

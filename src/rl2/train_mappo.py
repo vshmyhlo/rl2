@@ -87,7 +87,7 @@ Artifacts (indexed by training step):
 
 Video/images:
     gameplay: RGB gameplay from a separate episode under the current policy,
-        rendered from environment state and saved as gameplay/<step>.mp4.
+        rendered from environment state and saved as gameplay/<step>.gif.
         Recording ends at episode termination/truncation or video_max_frames
         (default: 900; None removes the frame cap). Playback uses video_fps frames per second.
     eval/gameplay: RGB video of the last episode in each evaluation run, using
@@ -688,7 +688,7 @@ def log_video(
         stop_at_frame_limit=True,
         env=make_env(config) if env is None else env,
     )
-    writer.log_video(frames, f"gameplay/{step_count}.mp4", fps=config.video_fps)
+    writer.log_video(frames, f"gameplay/{step_count}.gif", fps=config.video_fps)
     seconds = monotonic() - started
     writer.log_metrics({"time/video_seconds": seconds}, step_count)
     print(
@@ -722,7 +722,7 @@ def log_evaluation(
         )
         episode_results.append({"return": episode_return, "length": episode_step_count})
         if frames:
-            writer.log_video(frames, f"eval/gameplay/{step_count}.mp4", fps=config.video_fps)
+            writer.log_video(frames, f"eval/gameplay/{step_count}.gif", fps=config.video_fps)
     returns = [result["return"] for result in episode_results]
     std = stdev(returns) if len(returns) > 1 else None
     result = {

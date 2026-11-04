@@ -198,7 +198,7 @@ def test_evaluation_logs_raw_scores_and_independent_seeds(
     assert "training_scores" not in report
     assert len(writer.log_video.call_args.args[0]) == 1
     assert writer.log_video.call_args.args[0][0].shape == (2, 2, 3)
-    assert writer.log_video.call_args.args[1] == "eval/gameplay/128.mp4"
+    assert writer.log_video.call_args.args[1] == "eval/gameplay/128.gif"
     assert writer.log_text.call_args.args[1] == "eval/report/128.json"
     assert writer.log_metrics.call_args.args[1] == 128
     assert writer.log_video.call_args.kwargs["fps"] == 12.5
@@ -217,7 +217,7 @@ def test_log_video_wiring() -> None:
         ppo.log_video(Mock(), config, writer, 2, 128, initial_carry=carry)
     assert play.call_args.kwargs["record"]
     assert play.call_args.kwargs["stop_at_frame_limit"]
-    assert writer.log_video.call_args.args[1] == "gameplay/128.mp4"
+    assert writer.log_video.call_args.args[1] == "gameplay/128.gif"
     assert writer.log_video.call_args.kwargs["fps"] == 10.0
 
 
@@ -269,7 +269,7 @@ def test_playback_logging_reports_progress(
         == 6.0
     )
     assert writer.log_metrics.call_args.args[1] == 128
-    assert [call.args[1] for call in writer.log_video.call_args_list] == ["gameplay/128.mp4", "eval/gameplay/128.mp4"]
+    assert [call.args[1] for call in writer.log_video.call_args_list] == ["gameplay/128.gif", "eval/gameplay/128.gif"]
     assert all(
         len(call.args[0]) == 1 and call.args[0][0].shape == (2, 2, 3) for call in writer.log_video.call_args_list
     )
