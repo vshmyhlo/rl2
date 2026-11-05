@@ -5,45 +5,47 @@ env:
   game: breakout
   max_steps: 108_000 # Single-frame actions, at most 30 simulated minutes at 60 Hz
 seed: 1
-total_steps: 10_000_000
-num_envs: 8
-num_steps: 128
-num_minibatches: 4
+total_steps: 10_000_000 # Environment steps across all environments; only full rollouts run
+num_envs: 16 # 8 environments per GPU on two GPUs
+num_steps: 256 # 4096 transitions per iteration; about 4.3 seconds per sequence
+num_minibatches: 4 # 4 whole sequences per minibatch; 512 transitions per GPU
 update_epochs: 4
 model:
   encoder:
     type: conv2d
     stages:
-      - { channels: 32, blocks: 1, resize_factor: 0.25 }
+      # Halve resolution gradually to retain small balls/bullets in early features.
+      - { channels: 16, blocks: 1, resize_factor: 0.5 }
+      - { channels: 32, blocks: 1, resize_factor: 0.5 }
       - { channels: 64, blocks: 1, resize_factor: 0.5 }
-      - { channels: 128, blocks: 1, resize_factor: 0.5 }
-      - { channels: 128, blocks: 1, resize_factor: 0.5 }
-    embedding_size: 256
+      - { channels: 64, blocks: 1, resize_factor: 0.5 }
+    embedding_size: 128
   recurrent:
     type: lstm
-    hidden_size: 256
+    hidden_size: 128
 bf16: true
 learning_rate: 0.00025
 anneal_lr: true
 lr_decay: linear
-gamma: 0.99
-gae_lambda: 0.95
-clip_coef: 0.2
-target_kl: 0.01
+# Single-frame decay: approximately the fourth roots of 0.99 and 0.95.
+gamma: 0.9975
+gae_lambda: 0.9873
+clip_coef: 0.1
+target_kl: null # Fixed four epochs per iteration
 entropy_coef: 0.01
 entropy_decay: constant
-value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
+value_coef: 0.5 # Weights the half-MSE value loss: 0.5 * mean squared error
 max_grad_norm: 0.5
 ckpt_dir: /runs/ppo/${run_id}
 run_id: ppo_${path_name:${env.id}}_${env.game}_seed${seed}
-# Intervals count completed PPO iterations; also run on completion.
-checkpoint_interval: 489
-log_interval: 60
+# Intervals count completed PPO iterations: 2441 planned.
+checkpoint_interval: 123
+log_interval: 10
 # Checkpoints every 5% and eval every 20% of training, rounded up to iterations.
 # Evaluation (including GIF recording), checkpoints, and logging also run on completion.
 video_interval: 0 # Record videos only during evaluation
 video_max_frames: 1800
 video_fps: 60.0
-eval_interval: 1953
+eval_interval: 489
 eval_episodes: 10
 eval_seed: 10000

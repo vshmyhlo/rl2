@@ -41,6 +41,10 @@ Solving sparse reward Atari environments, such as Montezuma’s Revenge.
 
 ### PPO with JAX-native environments
 
+JAXtari native RGB presets: [Breakout](configs/ppo/jaxtari/breakout.yaml) and
+[Space Invaders](configs/ppo/jaxtari/space_invaders.yaml), both with CNN + LSTM policies.
+Install sprites once with `uv run python -m jaxtari.install_sprites`.
+
 MinAtar Breakout using [ppo.py](src/rl2/ppo.py) with the
 [Breakout config](configs/ppo/minatar/breakout.yaml).
 

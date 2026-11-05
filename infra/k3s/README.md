@@ -557,6 +557,8 @@ submission gets a unique local image tag; no registry is needed. Source edits
 and untracked files are included, subject to `.dockerignore`, which excludes
 virtual environments, generated outputs, and common credential paths. Dependency
 layers are cached using `pyproject.toml`, `uv.lock`, and the selected extra.
+The image installs JAXtari's replacement sprite pack during the build, so training
+starts without an interactive sprite installation or runtime download.
 New image layers use zstd level 1 compression and OCI media types to reduce export overhead.
 Local `data/` files (including downloaded ALFWorld games) occupy a separate layer
 before the editable install and source copy, so source edits do not repack datasets.
