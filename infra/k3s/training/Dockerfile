@@ -14,18 +14,8 @@ ARG UV_EXTRA=""
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project ${UV_EXTRA:+--extra=$UV_EXTRA}
 # Bundle replacement sprites without an interactive ROM ownership confirmation.
-RUN JAX_PLATFORMS=cpu /app/.venv/bin/python - <<'PYTHON'
-import jax
-import jaxtari
-from jaxtari.install_sprites import download_and_extract
-
-download_and_extract(accepted_ownership=False)
-for game in ("breakout", "spaceinvaders"):
-    env = jaxtari.make(game)
-    _, state = env.reset(jax.random.key(0))  # native observation/state leaves: (...)
-    frame = env.render(state)  # (210, 160, 3)
-    assert frame.shape == (210, 160, 3) and frame.dtype == "uint8", game
-PYTHON
+RUN --mount=type=bind,source=src/rl2/envs/jaxtari_assets.py,target=/tmp/jaxtari_assets.py \
+    JAX_PLATFORMS=cpu /app/.venv/bin/python /tmp/jaxtari_assets.py
 # FlashInfer expects a conventional toolkit layout; CUDA wheels use nvidia/cu13.
 ENV CUDA_HOME=/app/.venv/lib/python3.12/site-packages/nvidia/cu13
 RUN test -x "$CUDA_HOME/bin/nvcc" \

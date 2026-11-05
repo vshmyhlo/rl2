@@ -1,5 +1,6 @@
 """JAXtari Breakout and Space Invaders with native RGB frames and episode boundaries."""
 
+from functools import partial
 from typing import Annotated, Literal, cast
 
 import jax
@@ -12,6 +13,7 @@ from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
 from rl2.actions import DiscreteSpace
+from rl2.envs.autoreset import reset_batch
 from rl2.envs.base import BaseEnv, EnvStep
 
 
@@ -35,7 +37,9 @@ class JAXtariState:
 
 class JAXtariEnv(BaseEnv[JAXtariState, JAXtariParams]):
     def __init__(self, config: JAXtariConfig) -> None:
-        self.env = cast(JaxBreakout | JaxSpaceInvaders, jaxtari.make(config.game))
+        # Native constants must also work inside shard-local reset computation.
+        with jax.set_mesh(None):
+            self.env = cast(JaxBreakout | JaxSpaceInvaders, jaxtari.make(config.game))
         self.params = JAXtariParams(max_steps=config.max_steps)
         self.action_space = DiscreteSpace(n=self.env.action_space().n)
 
@@ -51,8 +55,13 @@ class JAXtariEnv(BaseEnv[JAXtariState, JAXtariParams]):
         state: JAXtariState,  # leaves: (...)
         action: jax.Array,  # () int32 action ID
         params: JAXtariParams,
+        *,
+        auto_reset: bool = True,
     ) -> EnvStep[JAXtariState]:
-        """Advance one frame; retain (210, 160, 3) final_observation before autoreset."""
+        """Advance one frame; retain (210, 160, 3) final_observation before autoreset.
+
+        auto_reset is static; step_batch disables it before applying vmap.
+        """
         _, game_state, reward, terminated, _ = self.env.step(state.game_state, action)  # leaves: (...); scalars: ()
         final_state = JAXtariState(
             game_state=game_state,  # leaves: (...)
@@ -62,13 +71,12 @@ class JAXtariEnv(BaseEnv[JAXtariState, JAXtariParams]):
         truncated = final_state.elapsed_steps >= params.max_steps  # ()
         done = terminated | truncated  # ()
 
-        def reset_done(_: None) -> tuple[jax.Array, JAXtariState]:
-            return self.reset(key, params)  # (210, 160, 3); state leaves: (...)
-
-        def continue_episode(_: None) -> tuple[jax.Array, JAXtariState]:
-            return final_observation, final_state  # (210, 160, 3); state leaves: (...)
-
-        observation, next_state = jax.lax.cond(done, reset_done, continue_episode, None)  # (210,160,3); leaves: (...)
+        if auto_reset:
+            observation, next_state = jax.lax.cond(
+                done, lambda: self.reset(key, params), lambda: (final_observation, final_state)
+            )  # (210, 160, 3); state leaves: (...)
+        else:
+            observation, next_state = final_observation, final_state  # (210, 160, 3); state leaves: (...)
         return EnvStep(
             observation=observation,  # (210, 160, 3)
             state=next_state,  # leaves: (...)
@@ -81,6 +89,22 @@ class JAXtariEnv(BaseEnv[JAXtariState, JAXtariParams]):
                 "final_state": final_state,  # leaves: (...)
             },
         )
+
+    def step_batch(
+        self,
+        keys: jax.Array,  # (B,) typed PRNG keys
+        state: JAXtariState,  # leaves: (B, ...)
+        actions: jax.Array,  # (B,) int32 action IDs
+        params: JAXtariParams,
+    ) -> EnvStep[JAXtariState]:
+        """Skip reset rendering on shards without completed episodes."""
+        result = jax.vmap(partial(self.step, auto_reset=False), in_axes=(0, 0, 0, None))(
+            keys, state, actions, params
+        )  # observations: (B,210,160,3); state leaves: (B,...); rewards/flags: (B,)
+        observation, next_state = reset_batch(
+            partial(self.reset, params=params), keys, result.done, (result.observation, result.state)
+        )  # (B,210,160,3); state leaves: (B,...)
+        return result._replace(observation=observation, state=next_state)
 
     def render(self, state: JAXtariState) -> jax.Array:  # leaves: (...) -> (210, 160, 3)
         return self.env.render(state.game_state)  # (210, 160, 3) uint8

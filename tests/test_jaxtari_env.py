@@ -8,13 +8,14 @@ import numpy as np
 import optax
 import pytest
 from flax.training.train_state import TrainState
+from jax.sharding import AxisType, Mesh
 from jaxtari.games.jax_breakout import BreakoutState
 from jaxtari.paths import get_base_sprite_dir
 from pydantic import ValidationError
 
 from rl2 import ppo
 from rl2.actions import DiscreteSpace
-from rl2.envs.jaxtari_env import JAXtariConfig, JAXtariEnv
+from rl2.envs.jaxtari_env import JAXtariConfig, JAXtariEnv, JAXtariParams, JAXtariState
 from rl2.model.encoders.conv2d import ConvStage
 
 
@@ -51,7 +52,9 @@ def env(request: pytest.FixtureRequest) -> JAXtariEnv:
     config = JAXtariConfig(game=getattr(request, "param", "breakout"), max_steps=2)
     if not (Path(get_base_sprite_dir()) / config.game / "background.npy").is_file():
         pytest.skip("Install sprites with: uv run python -m jaxtari.install_sprites")
-    return JAXtariEnv(config)
+    # Training constructs environments inside the active batch mesh.
+    with jax.set_mesh(Mesh(devices=jax.devices(), axis_names=("batch",), axis_types=(AxisType.Auto,))):
+        return JAXtariEnv(config)
 
 
 @pytest.mark.parametrize("settings", [{"game": "unknown"}, {"max_steps": 0}, {"max_steps": True}])
@@ -95,6 +98,7 @@ def test_native_frames_actions_and_unclipped_reward(env: JAXtariEnv) -> None:
 
 
 @pytest.mark.parametrize("env", ["breakout", "spaceinvaders"], indirect=True)
+@pytest.mark.usefixtures("ppo_mesh")
 def test_batched_episode_boundaries_and_final_frames(env: JAXtariEnv) -> None:
     keys = jax.random.split(jax.random.key(0), 4)  # (B=4,)
     observations, initial = jax.vmap(env.reset, in_axes=(0, None))(keys, env.params)  # (B,210,160,3); leaves: (B,...)
@@ -107,7 +111,12 @@ def test_batched_episode_boundaries_and_final_frames(env: JAXtariEnv) -> None:
         elapsed_steps=jnp.array([0, 1, 1, 0]),  # (B,)
     )
     actions = jnp.full(4, 2, jnp.int32)  # (B,) RIGHT
+    keys = jax.random.split(jax.random.key(1), 4)  # (B,) fresh autoreset keys
     result = jax.jit(env.step_batch)(keys, state, actions, env.params)
+    expected = jax.jit(jax.vmap(env.step, in_axes=(0, 0, 0, None)))(
+        keys, state, actions, env.params
+    )  # observation/state/info leaves: (B,...); rewards/flags: (B,)
+    chex.assert_trees_all_equal(result, expected)
     np.testing.assert_array_equal(result.info["terminated"], [True, False, True, False])
     np.testing.assert_array_equal(result.info["truncated"], [False, True, True, False])
     np.testing.assert_array_equal(result.done, [True, True, True, False])
@@ -119,6 +128,34 @@ def test_batched_episode_boundaries_and_final_frames(env: JAXtariEnv) -> None:
     assert result.info["final_observation"].shape == result.observation.shape == (4, 210, 160, 3)
     assert not np.array_equal(result.info["final_observation"][0], observations[0])
     chex.assert_shape((result.done, result.reward), (4,))
+
+
+def test_batch_step_skips_reset_until_an_episode_ends(env: JAXtariEnv, monkeypatch: pytest.MonkeyPatch) -> None:
+    keys = jax.random.split(jax.random.key(0), 2)  # (B=2,)
+    _, initial = jax.vmap(env.reset, in_axes=(0, None))(keys, env.params)  # (B,210,160,3); leaves: (B,...)
+    calls: list[None] = []
+    original_reset = env.reset
+
+    def record_reset() -> None:
+        calls.append(None)
+
+    def counted_reset(key: jax.Array, params: JAXtariParams) -> tuple[jax.Array, JAXtariState]:  # key: ()
+        jax.debug.callback(record_reset)
+        return original_reset(key, params)  # (210,160,3); leaves: (...)
+
+    monkeypatch.setattr(env, "reset", counted_reset)
+    step = jax.jit(env.step_batch)
+    actions = jnp.zeros(2, jnp.int32)  # (B,) NOOP
+    first = step(keys, initial, actions, env.params)  # observation/state/info leaves: (B,...); rewards/flags: (B,)
+    np.testing.assert_array_equal(first.done, False)
+    jax.effects_barrier()
+    assert not calls
+    np.testing.assert_array_equal(first.observation, first.info["final_observation"])
+    second = step(keys, first.state, actions, env.params)  # observation/state/info leaves: (B,...); rewards/flags: (B,)
+    np.testing.assert_array_equal(second.done, True)
+    jax.effects_barrier()
+    assert calls
+    np.testing.assert_array_equal(second.state.elapsed_steps, 0)
 
 
 def test_losing_one_life_continues_the_game(env: JAXtariEnv) -> None:
