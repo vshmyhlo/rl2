@@ -74,7 +74,7 @@ def test_terminal_timeout_both_and_partial_autoreset() -> None:
     # state leaves: (B,), respectively terminal, timeout, both, continuing
     key = jax.random.key(1)  # ()
     actions = jnp.arange(4, dtype=jnp.int32)  # (B,) native action IDs
-    next_observations, next_state, rewards, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
+    next_observations, next_state, rewards, done, info = jax.jit(env.step_batch)(
         jax.random.split(key, 4), state, actions, env.params
     )  # (B,H,W,C); leaves: (B,...); rewards/done/flags: (B,); final_observation: (B,H,W,C)
     np.testing.assert_array_equal(info["terminated"], [True, False, True, False])
@@ -95,7 +95,7 @@ def test_terminal_timeout_both_and_partial_autoreset() -> None:
     np.testing.assert_array_equal(next_observations[3], info["final_observation"][3])
     expected_final = jnp.broadcast_to((state.color / 2 + actions)[:, None, None, None], (4, 2, 3, 3))  # (B,H,W,3)
     np.testing.assert_array_equal(info["final_observation"], expected_final)
-    next_observations, next_state, rewards, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
+    next_observations, next_state, rewards, done, info = jax.jit(env.step_batch)(
         jax.random.split(key, 4), initial, jnp.zeros(4, jnp.int32), env.params
     )  # (B,H,W,C); leaves: (B,...); rewards/done/flags: (B,); final_observation: (B,H,W,C)
     np.testing.assert_array_equal(next_state.timestep, 1)

@@ -86,7 +86,7 @@ def test_termination_timeout_and_partial_autoreset() -> None:
     # Terminal, timeout, both, continuing. Nonzero shaped rewards do not imply termination.
     state = initial._replace(timestep=jnp.array([0, 1, 1, 0]), terminal=jnp.array([True, False, True, False]))
     key = jax.random.key(1)  # ()
-    next_observations, next_state, rewards, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
+    next_observations, next_state, rewards, done, info = jax.jit(env.step_batch)(
         jax.random.split(key, 4), state, jnp.zeros(4, jnp.int32), env.params
     )  # (B,F=2); leaves: (B,...); rewards/done/flags: (B,); final_observation: (B,F=2)
     np.testing.assert_array_equal(info["terminated"], [True, False, True, False])
@@ -110,7 +110,7 @@ def test_termination_timeout_and_partial_autoreset() -> None:
     # (B,F=2), including terminal observations before reset
     np.testing.assert_array_equal(info["final_observation"], expected_final)
     # No boundaries: observations and states continue without autoreset.
-    next_observations, next_state, rewards, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
+    next_observations, next_state, rewards, done, info = jax.jit(env.step_batch)(
         jax.random.split(key, 4), initial, jnp.zeros(4, jnp.int32), env.params
     )  # (B,F=2); leaves: (B,...); rewards/done/flags: (B,); final_observation: (B,F=2)
     np.testing.assert_array_equal(next_state.timestep, 1)

@@ -1,5 +1,6 @@
 """Foragax square-wave foraging with local grid observations and PPO time limits."""
 
+from functools import partial
 from typing import Annotated, Literal
 
 import jax
@@ -10,6 +11,7 @@ from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
 from rl2.actions import DiscreteSpace
+from rl2.envs.autoreset import reset_batch
 from rl2.envs.base import BaseEnv, EnvStep
 
 
@@ -26,15 +28,17 @@ class ForagaxConfig:
 
 class ForagaxEnv(BaseEnv[EnvState, EnvParams]):
     def __init__(self, config: ForagaxConfig) -> None:
-        self.env = make(
-            config.env_id,
-            observation_type=config.observation_type,
-            aperture_size=config.aperture_size,
-            period=config.period,
-            reward_delay=config.reward_delay,
-        )
-        self.params = self.env.default_params.replace(max_steps_in_episode=config.max_steps)
-        self.action_space = DiscreteSpace(n=self.env.num_actions)
+        # Upstream constants must also work inside shard-local reset computation.
+        with jax.set_mesh(None):
+            self.env = make(
+                config.env_id,
+                observation_type=config.observation_type,
+                aperture_size=config.aperture_size,
+                period=config.period,
+                reward_delay=config.reward_delay,
+            )
+            self.params = self.env.default_params.replace(max_steps_in_episode=config.max_steps)
+            self.action_space = DiscreteSpace(n=self.env.num_actions)
 
     def reset(self, key: jax.Array, params: EnvParams) -> tuple[jax.Array, EnvState]:  # key: ()
         """Return (H, W, C) float32 observation and (...) state leaves."""
@@ -46,17 +50,25 @@ class ForagaxEnv(BaseEnv[EnvState, EnvParams]):
         state: EnvState,  # leaves: (...)
         action: jax.Array,  # () int32 action ID
         params: EnvParams,
+        *,
+        auto_reset: bool = True,
     ) -> EnvStep[EnvState]:
-        """Advance and autoreset; retain (H, W, C) final_observation for bootstrapping."""
+        """Advance and autoreset; retain (H, W, C) final_observation for bootstrapping.
+
+        auto_reset is static; step_batch disables it before applying vmap.
+        """
         step_key, reset_key = jax.random.split(key)  # each ()
         final_observation, final_state, reward, _, _ = self.env.step_env(
             step_key, state, action, params
         )  # (H, W, C); state leaves: (...); reward: ()
         # Native Foragax never terminates and ignores max_steps_in_episode.
         truncated = final_state.time >= params.max_steps_in_episode  # ()
-        observation, next_state = jax.lax.cond(
-            truncated, lambda: self.reset(reset_key, params), lambda: (final_observation, final_state)
-        )  # (H, W, C); state leaves: (...)
+        if auto_reset:
+            observation, next_state = jax.lax.cond(
+                truncated, lambda: self.reset(reset_key, params), lambda: (final_observation, final_state)
+            )  # (H, W, C); state leaves: (...)
+        else:
+            observation, next_state = final_observation, final_state  # observation/state leaves: (...)
         return EnvStep(
             observation=observation,  # (H, W, C)
             state=next_state,  # leaves: (...)
@@ -69,6 +81,23 @@ class ForagaxEnv(BaseEnv[EnvState, EnvParams]):
                 "final_state": final_state,  # leaves: (...)
             },
         )
+
+    def step_batch(
+        self,
+        keys: jax.Array,  # (B,) typed PRNG keys
+        state: EnvState,  # leaves: (B, ...)
+        actions: jax.Array,  # (B,) discrete action IDs
+        params: EnvParams,
+    ) -> EnvStep[EnvState]:
+        """Skip reset generation on shards without completed episodes."""
+        result = jax.vmap(partial(self.step, auto_reset=False), in_axes=(0, 0, 0, None))(
+            keys, state, actions, params
+        )  # observation/state leaves: (B, ...); rewards/flags: (B,)
+        reset_keys = jax.vmap(jax.random.split)(keys)[:, 1]  # (B,) typed keys
+        observation, state = reset_batch(
+            partial(self.reset, params=params), reset_keys, result.done, (result.observation, result.state)
+        )  # observation/state leaves: (B, ...)
+        return result._replace(observation=observation, state=state)
 
     def render(self, state: EnvState) -> jax.Array:  # state leaves: (...) -> (135, 216, 3)
         return self.env.render(state, self.params, render_mode="world").astype(jnp.uint8)  # (135, 216, 3)

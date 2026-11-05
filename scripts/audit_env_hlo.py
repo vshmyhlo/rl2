@@ -8,17 +8,20 @@ training executes. Reports describe compiler estimates, not measured throughput.
 Uses PPO's training mesh over all visible devices: state, keys, actions, and
 transition outputs are sharded over batch; environment parameters are replicated.
 Use --backend gpu on the training host; CPU HLO cannot establish GPU efficiency.
+Cases use representative adapter defaults. Use --env config --config PATH to
+compile the exact environment and batch size from a PPO configuration instead.
 """
 
 import argparse
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -46,9 +49,11 @@ from rl2.envs.smax_env import SMAXConfig, SMAXEnv
 from rl2.envs.storm_env import STORMConfig, STORMEnv
 from rl2.envs.xminigrid_env import XMiniGridConfig, XMiniGridEnv
 from rl2.jax_cache import configure_compilation_cache
-from rl2.ppo import Config, training_mesh
+from rl2.ppo import Config, make_env, training_mesh
 
 type Environment = BaseEnv[Any, Any] | BaseMultiAgentEnv[Any]
+
+logger = logging.getLogger(__name__)
 
 CASES: dict[str, Callable[[], Environment]] = {
     "brax": lambda: BraxEnv(BraxConfig()),
@@ -70,9 +75,7 @@ CASES: dict[str, Callable[[], Environment]] = {
 }
 
 
-def compile_case(
-    name: str, config: Config, backend: str, mode: str, output: Path
-) -> dict[str, Any]:
+def compile_case(name: str, config: Config, backend: str, mode: str, output: Path) -> dict[str, Any]:
     """Compile one adapter at B=config.num_envs, preserving every transition output."""
     configure_compilation_cache()
     devices = jax.devices(backend)
@@ -83,7 +86,7 @@ def compile_case(
     batched = PartitionSpec("batch")
     replicated = PartitionSpec()
     with jax.default_device(devices[0]), jax.set_mesh(mesh):
-        env = CASES[name]()
+        env = make_env(config) if name == "config" else CASES[name]()
         keys = jax.ShapeDtypeStruct((batch_size,), jax.random.key(0).dtype)  # (B,) typed keys
         if isinstance(env, BaseEnv):
             _, state = jax.eval_shape(jax.vmap(env.reset, in_axes=(0, None)), keys, env.params)  # (B, ...) leaves
@@ -110,6 +113,8 @@ def compile_case(
         memory = compiled.memory_analysis()
         return {
             "case": name,
+            "adapter": type(env).__name__,
+            **({"environment": asdict(config.env)} if name == "config" else {}),
             "status": "compiled",
             "jax": jax.__version__,
             "backend": devices[0].platform,
@@ -151,7 +156,7 @@ def compile_case(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--env", choices=CASES)
+    parser.add_argument("--env", choices=[*CASES, "config"])
     parser.add_argument("--config", type=Path, default=Path(__file__).resolve().parents[1] / "configs/ppo.yaml")
     parser.add_argument("--batch-size", type=int, help="Override the config's global environment count")
     parser.add_argument("--num-minibatches", type=int, help="Override PPO's mesh divisibility constraint")
@@ -164,6 +169,8 @@ def main() -> None:
         parser.error("batch-size, num-minibatches, and timeout must be positive")
     args.output.mkdir(parents=True, exist_ok=True)
     if args.env is not None:
+        for filename in ("summary.json", "step.optimized.hlo.txt", "step.stablehlo.mlir"):
+            (args.output / filename).unlink(missing_ok=True)
         try:
             config = load_config(args.config, Config)
             config = replace(
@@ -173,6 +180,7 @@ def main() -> None:
             )
             report = compile_case(args.env, config, args.backend, args.mode, args.output)
         except Exception as error:
+            logger.exception("Compilation failed for %s", args.env)
             report = {"case": args.env, "status": "failed", "error": f"{type(error).__name__}: {error}"}
         (args.output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report), flush=True)

@@ -1,5 +1,6 @@
 """Brax continuous-control tasks with native actions and time-limit bootstrapping."""
 
+from functools import partial
 from typing import Annotated, Literal, cast
 
 import jax
@@ -14,13 +15,14 @@ from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
 from rl2.actions import ContinuousSpace
+from rl2.envs.autoreset import reset_batch
 from rl2.envs.base import BaseEnv, EnvStep
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class BraxConfig:
     id: Literal["Brax"] = "Brax"
-    task: Literal["halfcheetah", "inverted_pendulum", "reacher", "pusher"] = "pusher"
+    task: Literal["halfcheetah", "humanoidstandup", "inverted_pendulum", "reacher", "pusher"] = "pusher"
     backend: Literal["generalized"] = "generalized"
     max_steps: Annotated[int, Field(gt=0, lt=2**31, strict=True)] = 1000
 
@@ -59,8 +61,13 @@ class BraxEnv(BaseEnv[BraxState, BraxParams]):
         state: BraxState,  # leaves: (...)
         action: jax.Array,  # (A,) continuous controls
         params: BraxParams,
+        *,
+        auto_reset: bool = True,
     ) -> EnvStep[BraxState]:
-        """Advance physics and autoreset, retaining (O,) final_observation for bootstrapping."""
+        """Advance physics and autoreset, retaining (O,) final_observation for bootstrapping.
+
+        auto_reset is static; step_batch disables it before applying vmap.
+        """
         physics = self.env.step(state.physics, action)  # leaves: (...)
         final_state = state.replace(physics=physics, step_count=state.step_count + 1)
         final_observation = cast(jax.Array, physics.obs)  # (O,)
@@ -74,7 +81,10 @@ class BraxEnv(BaseEnv[BraxState, BraxParams]):
         def continue_episode(_: None) -> tuple[jax.Array, BraxState]:
             return final_observation, final_state  # (O,); state leaves: (...)
 
-        observation, next_state = jax.lax.cond(done, reset_done, continue_episode, None)  # (O,); leaves: (...)
+        if auto_reset:
+            observation, next_state = jax.lax.cond(done, reset_done, continue_episode, None)  # (O,); leaves: (...)
+        else:
+            observation, next_state = final_observation, final_state  # observation/state leaves: (...)
         return EnvStep(
             observation=observation,  # (O,)
             state=next_state,  # leaves: (...)
@@ -87,6 +97,22 @@ class BraxEnv(BaseEnv[BraxState, BraxParams]):
                 "final_state": final_state,  # leaves: (...)
             },
         )
+
+    def step_batch(
+        self,
+        keys: jax.Array,  # (B,) typed PRNG keys
+        state: BraxState,  # leaves: (B, ...)
+        actions: jax.Array,  # (B, A) continuous controls
+        params: BraxParams,
+    ) -> EnvStep[BraxState]:
+        """Skip reset generation on shards without completed episodes."""
+        result = jax.vmap(partial(self.step, auto_reset=False), in_axes=(0, 0, 0, None))(
+            keys, state, actions, params
+        )  # observation/state leaves: (B, ...); rewards/flags: (B,)
+        observation, state = reset_batch(
+            partial(self.reset, params=params), keys, result.done, (result.observation, result.state)
+        )  # observation/state leaves: (B, ...)
+        return result._replace(observation=observation, state=state)
 
     def render(self, state: BraxState) -> NDArray[np.uint8]:  # leaves: (...) -> (240, 320, 3)
         return self.env.render([cast(PipelineState, state.physics.pipeline_state)], height=240, width=320)[

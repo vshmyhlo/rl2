@@ -2,6 +2,7 @@
 
 Symbolic observations contain a spatial grid and non-spatial features. Pixels are (H,W,3)."""
 
+from functools import partial
 from math import prod
 from typing import Annotated, Literal
 
@@ -17,6 +18,7 @@ from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
 from rl2.actions import DiscreteSpace
+from rl2.envs.autoreset import reset_batch
 from rl2.envs.base import BaseEnv, EnvStep
 from rl2.envs.observations import CraftaxObservation, Observation
 
@@ -73,8 +75,13 @@ class CraftaxEnv(BaseEnv[chex.ArrayTree, CraftaxParams]):
         state: chex.ArrayTree,  # leaves: (...)
         action: jax.Array,  # ()
         params: CraftaxParams,
+        *,
+        auto_reset: bool = True,
     ) -> EnvStep[chex.ArrayTree]:
-        """Advance and autoreset; info retains (*O,) final_observation leaves."""
+        """Advance and autoreset; info retains (*O,) final_observation leaves.
+
+        auto_reset is static; step_batch disables it before applying vmap.
+        """
         step_key, reset_key = jax.random.split(key)  # each () typed PRNG key
         # Separate time limits from termination for PPO timeout bootstrapping.
         observation, state, reward, terminated, _ = self.env.step_env(
@@ -91,7 +98,10 @@ class CraftaxEnv(BaseEnv[chex.ArrayTree, CraftaxParams]):
         def continue_episode(_: None) -> tuple[Observation, chex.ArrayTree]:
             return final_observation, state  # (*O,); state leaves: (...)
 
-        observation, state = jax.lax.cond(done, reset_done, continue_episode, None)  # (*O,); leaves: (...)
+        if auto_reset:
+            observation, state = jax.lax.cond(done, reset_done, continue_episode, None)  # (*O,); leaves: (...)
+        else:
+            observation, state = final_observation, final_state  # observation/state leaves: (...)
         return EnvStep(
             observation=observation,  # (*O,)
             state=state,  # leaves: (...)
@@ -104,6 +114,23 @@ class CraftaxEnv(BaseEnv[chex.ArrayTree, CraftaxParams]):
                 "final_state": final_state,  # leaves: (...)
             },
         )
+
+    def step_batch(
+        self,
+        keys: jax.Array,  # (B,) typed PRNG keys
+        state: chex.ArrayTree,  # leaves: (B, ...)
+        actions: jax.Array,  # (B,) discrete action IDs
+        params: CraftaxParams,
+    ) -> EnvStep[chex.ArrayTree]:
+        """Skip reset generation on shards without completed episodes."""
+        result = jax.vmap(partial(self.step, auto_reset=False), in_axes=(0, 0, 0, None))(
+            keys, state, actions, params
+        )  # observation/state leaves: (B, ...); rewards/flags: (B,)
+        reset_keys = jax.vmap(jax.random.split)(keys)[:, 1]  # (B,) typed keys
+        observation, state = reset_batch(
+            partial(self.reset, params=params), reset_keys, result.done, (result.observation, result.state)
+        )  # observation/state leaves: (B, ...)
+        return result._replace(observation=observation, state=state)
 
     @staticmethod
     def render_observation(observation: jax.Array) -> jax.Array:  # (H, W, 3) -> (H, W, 3)

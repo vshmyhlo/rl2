@@ -73,10 +73,11 @@ def test_cli(config: ppo.Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     "env_config,observation_size,action_size",
     [
         (BraxConfig(task="halfcheetah", max_steps=2), 17, 6),
+        (BraxConfig(task="humanoidstandup", max_steps=2), 244, 17),
         (BraxConfig(task="inverted_pendulum", max_steps=2), 4, 1),
         (BraxConfig(task="reacher", max_steps=2), 11, 2),
     ],
-    ids=["locomotion", "balance", "manipulation"],
+    ids=["locomotion", "standup", "balance", "manipulation"],
 )
 def test_starter_tasks(config: ppo.Config, env_config: BraxConfig, observation_size: int, action_size: int) -> None:
     env = ppo.make_env(replace(config, env=env_config))
@@ -100,7 +101,8 @@ def test_starter_tasks(config: ppo.Config, env_config: BraxConfig, observation_s
     np.testing.assert_array_equal(result.info["final_observation"], result.info["final_state"].physics.obs)
     np.testing.assert_array_equal(result.observation[0], result.info["final_observation"][0])
     reset_observation, _ = env.reset(keys[1], env.params)  # (O,)
-    np.testing.assert_array_equal(result.observation[1], reset_observation)
+    # Compiled physics reductions can differ slightly from the eager reset.
+    np.testing.assert_allclose(result.observation[1], reset_observation, rtol=1e-5, atol=1e-6)
 
 
 def test_pendulum_fall_terminates() -> None:

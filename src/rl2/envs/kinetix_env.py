@@ -1,5 +1,6 @@
 """Single-environment Kinetix symbolic observations and discrete or continuous actions for PPO."""
 
+from functools import partial
 from typing import Annotated, Literal
 
 import jax
@@ -13,6 +14,7 @@ from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
 from rl2.actions import ContinuousSpace, DiscreteSpace
+from rl2.envs.autoreset import reset_batch
 from rl2.envs.base import BaseEnv, EnvStep
 
 
@@ -34,32 +36,34 @@ class KinetixEnv(BaseEnv[EnvState, EnvParams]):
     """Explicit transitions preserve final observations for timeout bootstrapping."""
 
     def __init__(self, config: KinetixConfig) -> None:
-        self.params = EnvParams(max_timesteps=config.max_steps, dense_reward_scale=config.dense_reward_scale)
-        static_params = static_env_params_from_size(config.size).replace(
-            frame_skip=config.frame_skip, downscale=config.downscale
-        )
-        if config.levels is None:
-            reset_fn = make_reset_fn_sample_kinetix_level(self.params, static_params)
-        else:
-            reset_fn = make_reset_fn_list_of_levels(list(config.levels), static_params)
-        self.env = make_kinetix_env(
-            action_type=ActionType.DISCRETE if config.action_type == "discrete" else ActionType.CONTINUOUS,
-            observation_type=ObservationType.SYMBOLIC_FLAT,
-            reset_fn=reset_fn,
-            env_params=self.params,
-            static_env_params=static_params,
-            auto_reset=False,
-        )
-        self.render_pixels = make_render_pixels(self.params, static_params)
-        space = self.env.action_space(self.params)
-        if config.action_type == "discrete":
-            self.action_space = DiscreteSpace(space.n)
-        else:
-            self.action_space = ContinuousSpace(
-                shape=space.shape,
-                low=tuple(map(float, space.low.ravel())),
-                high=tuple(map(float, space.high.ravel())),
+        # Upstream constants must also work inside shard-local reset computation.
+        with jax.set_mesh(None):
+            self.params = EnvParams(max_timesteps=config.max_steps, dense_reward_scale=config.dense_reward_scale)
+            static_params = static_env_params_from_size(config.size).replace(
+                frame_skip=config.frame_skip, downscale=config.downscale
             )
+            if config.levels is None:
+                reset_fn = make_reset_fn_sample_kinetix_level(self.params, static_params)
+            else:
+                reset_fn = make_reset_fn_list_of_levels(list(config.levels), static_params)
+            self.env = make_kinetix_env(
+                action_type=ActionType.DISCRETE if config.action_type == "discrete" else ActionType.CONTINUOUS,
+                observation_type=ObservationType.SYMBOLIC_FLAT,
+                reset_fn=reset_fn,
+                env_params=self.params,
+                static_env_params=static_params,
+                auto_reset=False,
+            )
+            self.render_pixels = make_render_pixels(self.params, static_params)
+            space = self.env.action_space(self.params)
+            if config.action_type == "discrete":
+                self.action_space = DiscreteSpace(space.n)
+            else:
+                self.action_space = ContinuousSpace(
+                    shape=space.shape,
+                    low=tuple(map(float, space.low.ravel())),
+                    high=tuple(map(float, space.high.ravel())),
+                )
 
     def reset(self, key: jax.Array, params: EnvParams) -> tuple[jax.Array, EnvState]:  # key: ()
         """Return (F,) float32 symbolic observation and (...) state leaves."""
@@ -72,8 +76,13 @@ class KinetixEnv(BaseEnv[EnvState, EnvParams]):
         state: EnvState,  # leaves: (...)
         action: jax.Array,  # () integer ID or (D,) continuous action
         params: EnvParams,
+        *,
+        auto_reset: bool = True,
     ) -> EnvStep[EnvState]:
-        """Advance and autoreset; info retains (F,) final_observation."""
+        """Advance and autoreset; info retains (F,) final_observation.
+
+        auto_reset is static; step_batch disables it before applying vmap.
+        """
         step_key, reset_key = jax.random.split(key)  # each () typed PRNG key
         # Separate time limits from termination for PPO timeout bootstrapping.
         final_observation, final_state, reward, terminated, _ = self.env.step_env(
@@ -88,7 +97,10 @@ class KinetixEnv(BaseEnv[EnvState, EnvParams]):
         def continue_episode(_: None) -> tuple[jax.Array, EnvState]:
             return final_observation, final_state  # (F,); state leaves: (...)
 
-        observation, state = jax.lax.cond(done, reset_done, continue_episode, None)  # (F,); leaves: (...)
+        if auto_reset:
+            observation, state = jax.lax.cond(done, reset_done, continue_episode, None)  # (F,); leaves: (...)
+        else:
+            observation, state = final_observation, final_state  # observation/state leaves: (...)
         return EnvStep(
             observation=observation,  # (F,)
             state=state,  # leaves: (...)
@@ -101,6 +113,23 @@ class KinetixEnv(BaseEnv[EnvState, EnvParams]):
                 "final_state": final_state,  # leaves: (...)
             },
         )
+
+    def step_batch(
+        self,
+        keys: jax.Array,  # (B,) typed PRNG keys
+        state: EnvState,  # leaves: (B, ...)
+        actions: jax.Array,  # (B,) integer IDs or (B, D) continuous controls
+        params: EnvParams,
+    ) -> EnvStep[EnvState]:
+        """Skip reset generation on shards without completed episodes."""
+        result = jax.vmap(partial(self.step, auto_reset=False), in_axes=(0, 0, 0, None))(
+            keys, state, actions, params
+        )  # observation/state leaves: (B, ...); rewards/flags: (B,)
+        reset_keys = jax.vmap(jax.random.split)(keys)[:, 1]  # (B,) typed keys
+        observation, state = reset_batch(
+            partial(self.reset, params=params), reset_keys, result.done, (result.observation, result.state)
+        )  # observation/state leaves: (B, ...)
+        return result._replace(observation=observation, state=state)
 
     def render(self, state: EnvState) -> jax.Array:  # state leaves: (...) -> (H, W, 3)
         pixels = self.render_pixels(state)  # (W, H, 3), y-up in [0, 255]
