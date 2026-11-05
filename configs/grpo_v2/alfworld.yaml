@@ -1,4 +1,12 @@
 model: Qwen/Qwen3-0.6B
+vllm:
+  max_model_len: 8192
+  max_num_seqs: 256
+  max_num_batched_tokens: 2048
+  gpu_memory_utilization: 0.90
+  enable_prefix_caching: true
+  enable_chunked_prefill: true
+  async_scheduling: true
 learning_rate: 1e-6
 adamw_batch_size_scale: 1.0
 clip_coef: 0.2
@@ -6,15 +14,10 @@ max_grad_norm: 1.0
 rollout_is_threshold: 2.0 # Decoupled token-level importance sampling; no rejection sampling.
 finetuning:
   mode: full # Optimizes every weight and requires more GPU memory.
-# learning_rate: 1e-5
-# finetuning:
-#   mode: lora
-#   rank: 16
-#   alpha: 32
 attention_backend: tokamax
 scan_layers: true
 gradient_checkpointing: true
-padding_multiple: 512
+padding_multiple: 1024
 tasksets:
   alfworld:
     weight: 1.0
@@ -22,28 +25,30 @@ tasksets:
       id: alfworld
       config_file: data/alfworld/base_config.yaml
 seed: 1
+total_iterations: 1000
 
 num_groups: 4 # verl data.train_batch_size (task groups).
-group_size: 8 # verl rollout.n; 128 rollouts per batch.
-grad_accum_steps: 16 # 2 per update
+group_size: 8 # verl rollout.n; 32 rollouts per batch.
+grad_accum_steps: 32 # One rollout per microbatch.
 
 update_epochs: 1
-minibatches_per_epoch: 1 # One optimizer update per epoch, using all 128 rollouts.
+minibatches_per_epoch: 1 # One optimizer update per epoch, using all 32 rollouts.
 
-prefetch_batches: 4 # Overlap collection and training; not verl's warmup/staleness controls.
-parameter_sync_step: 4 # Publish every fourth training batch if weights have changed.
+prefetch_batches: 2 # Overlap collection and training; not verl's warmup/staleness controls.
+parameter_sync_step: 1 # Publish every fourth training batch if weights have changed.
+max_staleness: 2 # Mask tokens older than eight weight publications.
 
 # verl's off-policy threshold/drop strategy and minibatch streaming are unsupported.
-weight_update_pause_mode: wait
-drop_degenerate_groups: false
+weight_update_pause_mode: keep
+drop_degenerate_groups: true
 length_penalty:
   reference_tokens: 8192 # Generated-token scale, independent of the transcript budget.
-  penalty: 0.05 # Proportional token cost; requires rewards in [0, 1] when enabled.
+  penalty: 0.05 # Up to a 5% reward reduction, including partial credit.
 max_tokens: 8192 # Total transcript tokens, including system, prompt, and tools.
 max_turns: 50
 rollout_timeout: 1200
 environment_timeout: 600
-run_id: grpo_v2_alfworld_${path_name:${model}}_${finetuning.mode}_${attention_backend}_s${seed}_lr${learning_rate}_adamw_scale${adamw_batch_size_scale}_ng${num_groups}_gs${group_size}_mb${minibatches_per_epoch}_ddg${drop_degenerate_groups}_pf${prefetch_batches}_next_ready_ps${parameter_sync_step}_success_lp${length_penalty.reference_tokens}_${length_penalty.penalty}
+run_id: grpo_v2_alfworld_${path_name:${model}}_${finetuning.mode}_${attention_backend}_s${seed}_lr${learning_rate}_adamw_scale${adamw_batch_size_scale}_ng${num_groups}_gs${group_size}_mb${minibatches_per_epoch}_ddg${drop_degenerate_groups}_pf${prefetch_batches}_next_ready_ps${parameter_sync_step}_ms${max_staleness}_success_lp${length_penalty.reference_tokens}_${length_penalty.penalty}
 ckpt_dir: /runs/grpo_v2/${run_id} # Checkpoints and profiling artifacts.
 checkpoint_interval: 50
 example_log_interval: 50

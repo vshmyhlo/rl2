@@ -21,6 +21,7 @@ total_steps and MLflow steps count environment transitions across all environmen
 An iteration collects one batch of num_envs * num_steps transitions and runs PPO
 epochs. An update applies gradients from one accepted minibatch; KL-rejected
 minibatches do not count as updates.
+KL-rejected minibatches skip backpropagation and optimizer work.
 Window/lifetime metrics and latest settings are logged every log_interval iterations
 (default: 10). Checkpoints are saved every checkpoint_interval iterations (default: 100).
 All enabled schedules use completed iteration counts, including resumed training,
@@ -893,15 +894,21 @@ def update(
             clip_fraction=clip_fraction,  # ()
         )  # loss: (); metrics: scalar leaves
 
-    (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(train_state.params)
-    # Reduce gradients across the global minibatch before clipping and Adam.
-    grads = jax.lax.with_sharding_constraint(grads, PartitionSpec())
+    loss, backward, metrics = jax.vjp(loss_fn, train_state.params, has_aux=True)  # loss: (); metric leaves: ()
+
+    def apply_gradients() -> TrainState:
+        # Defer backpropagation until the KL check accepts the minibatch.
+        (grads,) = backward(jnp.ones_like(loss))  # parameter-shaped leaves
+        # Reduce gradients across the global minibatch before clipping and Adam.
+        grads = jax.lax.with_sharding_constraint(grads, PartitionSpec())
+        return train_state.apply_gradients(grads=grads)
+
     if config.target_kl is None:
-        return train_state.apply_gradients(grads=grads), metrics
+        return apply_gradients(), metrics
     train_state = jax.lax.cond(
         metrics.approx_kl > config.target_kl,
         lambda: train_state,
-        lambda: train_state.apply_gradients(grads=grads),
+        apply_gradients,
     )
     return train_state, metrics
 

@@ -938,6 +938,23 @@ def test_train_evaluates_final_policy(
 
 def test_kl_rejects_update_without_changing_optimizer() -> None:
     config = replace(load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", Config), target_kl=0.01)
+    backward_calls: list[None] = []
+
+    def record_backward() -> None:
+        backward_calls.append(None)
+
+    @jax.custom_vjp
+    def track_backward(logits: jax.Array) -> jax.Array:  # (B, A) -> (B, A)
+        return logits  # (B, A)
+
+    def forward(logits: jax.Array) -> tuple[jax.Array, None]:  # (B, A) -> (B, A); no residuals
+        return logits, None  # (B, A); no residuals
+
+    def backward(residuals: None, cotangent: jax.Array) -> tuple[jax.Array]:  # (B, A) -> ((B, A),)
+        jax.debug.callback(record_backward)
+        return (cotangent,)  # (B, A)
+
+    track_backward.defvjp(forward, backward)
 
     def apply(
         variables: optax.Params,
@@ -946,7 +963,9 @@ def test_kl_rejects_update_without_changing_optimizer() -> None:
         starts: jax.Array,  # (B,)
     ) -> ppo.ActorCriticOutput:
         return ppo.ActorCriticOutput(
-            carry, ppo.CategoricalPolicy(variables["params"]["logits"]), jnp.zeros_like(starts, dtype=jnp.float32)
+            carry=carry,  # leaves: (B, H)
+            policy=ppo.CategoricalPolicy(track_backward(variables["params"]["logits"])),  # logits: (B, A)
+            values=jnp.zeros_like(starts, dtype=jnp.float32),  # (B,)
         )  # carry leaves: (B,H); policy.logits: (B,A); values: (B,)
 
     state = TrainState.create(
@@ -964,13 +983,22 @@ def test_kl_rejects_update_without_changing_optimizer() -> None:
         model_carry=initial_carry(2, 1),  # leaves: (B, ...)
         episode_starts=jnp.zeros(2, dtype=bool),  # (*S,)
     )
-    stopped, metrics = update(state, batch, config)
+    run_update = jax.jit(update, static_argnames="config")
+    stopped, metrics = run_update(state, batch, config)
+    jax.effects_barrier()
+    assert not backward_calls
     assert float(metrics.approx_kl) > config.target_kl
     for before, after in zip(jax.tree.leaves(state), jax.tree.leaves(stopped)):
         np.testing.assert_array_equal(before, after)
-    continued, _ = update(state, batch, replace(config, target_kl=None))
+    continued, _ = run_update(state, batch, replace(config, target_kl=None))
+    jax.effects_barrier()
+    assert len(backward_calls) == 1
     assert int(continued.step) == 1
     assert not np.array_equal(state.params["logits"], continued.params["logits"])
+    accepted, _ = run_update(state, batch, replace(config, target_kl=1.0))
+    jax.effects_barrier()
+    assert len(backward_calls) == 2
+    chex.assert_trees_all_close(accepted, continued)
 
 
 def test_policy_diagnostics() -> None:
