@@ -293,14 +293,20 @@ and compare against a no-penalty baseline with the same mean-centering.
 Policy-loss reduction is a mean over unmasked sampled tokens per rollout, then
 across all rollouts; fully masked rollouts contribute zero. Monitor raw success and successful-rollout lengths together.
 
-Groups with equal adjusted rewards have zero advantages. The batcher gathers
-`num_groups` concurrently and preserves request order. Set
-`drop_degenerate_groups: true` (default false) to discard groups with equal
-adjusted rewards and sample replacement tasks until all `num_groups` slots
-contain non-degenerate groups. There is no retry limit; collection can continue
+`batch_size` counts rollouts per learner batch, replacing `num_groups`.
+The batcher pools completed, scored groups and returns exactly `batch_size` rollouts.
+A batch can mix groups or contain only part of one; unused rollouts remain for the
+next fetch. For example, `group_size: 8` and `batch_size: 3` produce two batches
+of three from the first group, then a batch mixing its last two with the next group.
+Advantages are computed over the full group before splitting and remain unchanged.
+
+Groups with equal adjusted rewards have zero advantages. Set
+`drop_degenerate_groups: true` (default false) to discard these whole groups before
+pooling and sample replacement tasks until the batch is full. There is no retry limit; collection can continue
 indefinitely if every group is degenerate. `batcher/skipped_groups` counts discarded
 groups per batch, including skips during prefetch, and is zero when none are skipped.
-The count appears in MLflow and the iteration log. Rollout metrics describe retained groups.
+The count appears in MLflow and the iteration log. Rollout metrics describe consumed rollouts. `rollout/degenerate_group_fraction`
+is the fraction of consumed rollouts from degenerate full groups, including split groups.
 Each group collects `group_size` rollouts concurrently for the same task.
 `rollout/reward_*` reports raw task rewards; `rollout/adjusted_reward_*` reports
 adjusted rewards.
@@ -347,8 +353,8 @@ This is an approximate scaling rule; weight-decay scaling assumes equal numbers
 of processed rollouts across runs.
 
 `adamw_batch_size_scale` only scales the optimizer. Configure the actual batch separately:
-`num_groups * group_size` rollouts per batch and
-`num_groups * group_size * grad_accum_steps` rollouts per optimizer update.
+`batch_size` rollouts per batch and
+`batch_size * grad_accum_steps` rollouts per optimizer update.
 
 Set `finetuning: {mode: full}` to optimize all model weights, including
 embeddings, normalization, and the output head, with FP32 master weights and Adam
@@ -388,7 +394,7 @@ Clipping and AdamW apply once to the averaged gradient.
 Parameters remain fixed within each accumulation window. There is no splitting or
 repeated optimization of a batch; `update_epochs` and `minibatches_per_epoch` are unsupported.
 The full batch must fit in learner memory, and `learner_gpus` must divide
-`num_groups * group_size`.
+`batch_size`.
 
 Every batch counts toward the window. Batches with no unmasked sampled tokens carrying
 nonzero advantages contribute zero gradients and zero policy loss, and omit policy diagnostics.
@@ -442,21 +448,18 @@ Each LoRA publication removes its
 temporary directory after the blocking weight update returns, including on failure.
 The loaded weights stay in vLLM memory. This trainer runs on one host; LoRA also
 requires a shared local filesystem.
-`prefetch_batches: 0` (default) collects each batch without overlapping training,
-avoiding weight changes within a rollout. With `parameter_sync_steps: 1`, each
-batch uses the latest learner weights; longer sync intervals can retain older weights.
-Positive `prefetch_batches: N` maintains a fixed pool of `(N + 1) * num_groups`
-pending rollout groups. Every popped group, whether accepted or stale, immediately
-queues a replacement, including the last group of a batch. The full pool remains
-running or ready while the learner optimizes. Each batch uses ready groups across
-the pool, without waiting for slower groups submitted alongside them. When multiple
-groups are ready, ties are broken by submission order.
-Groups stay intact, and degenerate groups are
-replaced within their pool slots when filtering is enabled. The pool target is capped
-by the number of groups still needed through the next checkpoint or `total_iterations`,
-so it shrinks to zero at those boundaries. Final checkpoints therefore do
-not advance the task sampler past consumed groups. Prefetched rollouts can use older
-weights, and multi-turn rollouts can span weight updates.
+`prefetch_batches: 0` (default) starts generation only when needed to fill the
+requested batch. Unused completed rollouts can still carry older weights into
+later batches. Positive `prefetch_batches: N` keeps up to
+`ceil((N + 1) * batch_size / group_size)` pending groups, with replacements
+queued as groups are consumed. The next ready group supplies the pool; simultaneous
+completions use submission order, without waiting for slower groups.
+Degenerate groups are replaced before pooling when filtering is enabled.
+Generation is capped at the groups needed through the next checkpoint or
+`total_iterations`, accounting for buffered rollouts. Pending generation drains at
+those boundaries; leftover completed rollouts are checkpointed with the sampler
+state. Prefetched rollouts can use older weights, and multi-turn rollouts can span
+weight updates.
 `max_staleness` is a nonnegative integer, defaulting to `100`. At batch consumption,
 only sampled tokens whose age exceeds this many successful weight publications
 are masked from the loss and policy diagnostics. `0` trains only tokens sampled
@@ -471,7 +474,8 @@ for each version. The agent expands them into `TrainingSequence.weight_versions`
 an `int32` array aligned with the full transcript; context tokens use `-1`.
 Missing, invalid, or incomplete version metadata fails the rollout.
 Versions advance on successful publications, not optimizer steps or skipped syncs,
-and reset on resume with an empty rollout pool. This also handles versions that
+and are restored with the rollout pool on resume. Resume publishes a new version
+so buffered tokens retain their age relative to the newly loaded weights. This also handles versions that
 change within a completion under `keep` or between turns under `wait`.
 All `*_transcript_token_fraction` metrics use the consumed batch's **non-padding
 transcript tokens** as their denominator, before the next-token shift:
@@ -532,7 +536,7 @@ the new checkpoint's background writes.
 Prefetching drains before periodic and final checkpoints so the saved sampling
 state does not skip unconsumed batches. Restarting with the same directory restores model weights (including LoRA factors in LoRA mode),
 optimizer state, shuffle key, task RNG,
-round-robin scores, and progress counters. `total_iterations` is a cumulative
+round-robin scores, unused scored rollouts, weight version, and progress counters. `total_iterations` is a cumulative
 target; `null` runs until interrupted. Environments restart fresh, so resumption
 is not bit-for-bit reproducible. Use a new directory for a fresh experiment or
 incompatible model changes. Checkpoints require matching `model` and `finetuning`,

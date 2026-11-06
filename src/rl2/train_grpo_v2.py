@@ -40,7 +40,7 @@ Rollout scalars (pooled over all batches consumed in the iteration):
     rollout/adjusted_reward_std: Population standard deviation of adjusted rollout rewards.
     rollout/adjusted_reward_min: Minimum adjusted rollout reward.
     rollout/adjusted_reward_max: Maximum adjusted rollout reward.
-    rollout/degenerate_group_fraction: Fraction of groups with identical adjusted rewards and zero advantages.
+    rollout/degenerate_group_fraction: Fraction of consumed rollouts whose full source group has identical adjusted rewards and zero advantages.
     rollout/stop_fraction/<label>: Fraction of iteration rollouts with each StopCondition.
     rollout/turns_mean: Mean model responses per rollout.
     rollout/input_tokens_mean: Mean context tokens appended per rollout, excluding sampled tokens.
@@ -96,7 +96,7 @@ import random
 import subprocess
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from collections.abc import AsyncGenerator, Generator
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
@@ -208,7 +208,7 @@ class Config(BaseConfig):
     )
     seed: Annotated[int, Field(ge=0)] = 1
     learner_gpus: Annotated[int, Field(ge=1)] = 1
-    num_groups: Annotated[int, Field(ge=1)] = 1
+    batch_size: Annotated[int, Field(ge=1)] = 4  # Rollouts consumed per learner batch.
     group_size: Annotated[int, Field(ge=2)] = 4
     prefetch_batches: Annotated[int, Field(ge=0)] = 0  # Positive values trade policy staleness for overlap.
     grad_accum_steps: Annotated[int, Field(ge=1)] = 1  # Consecutive full batches per optimizer update.
@@ -247,8 +247,8 @@ class Config(BaseConfig):
     def __post_init__(self) -> None:
         if not any(entry.weight > 0 for entry in self.tasksets.values()):
             raise ValueError("tasksets must contain at least one positive weight")
-        if self.num_groups * self.group_size % self.learner_gpus:
-            raise ValueError("learner_gpus must divide num_groups * group_size")
+        if self.batch_size % self.learner_gpus:
+            raise ValueError("learner_gpus must divide batch_size")
 
     @property
     def adamw_kwargs(self) -> dict[str, float]:
@@ -273,6 +273,8 @@ class TrainingProgress:
     iteration: int
     total_rollouts: int
     sampling_state: dict[str, Any]
+    rollout_pool: list[dict[str, Any]] = field(default_factory=list)
+    weight_version: int = -1  # Legacy checkpoints restart at publication 0.
 
 
 def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
@@ -305,6 +307,8 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
                     "iteration": progress.iteration,
                     "total_rollouts": progress.total_rollouts,
                     "sampling_state": progress.sampling_state,
+                    "rollout_pool": progress.rollout_pool,
+                    "weight_version": progress.weight_version,
                 }
             ),
         ),
@@ -357,6 +361,8 @@ def restore_checkpoint(
         iteration=iteration,
         total_rollouts=metadata["total_rollouts"],
         sampling_state=metadata["sampling_state"],
+        rollout_pool=metadata.get("rollout_pool", []),
+        weight_version=metadata.get("weight_version", -1),
     )
 
 
@@ -366,6 +372,7 @@ class RolloutGroup:
     taskset_id: str  # Configured tasksets key.
     rollouts: list[Rollout]  # Independent attempts at the same task, in sampling order, scored as one group.
     length_penalty: LengthPenaltyConfig = DEFAULT_CONFIG.length_penalty
+    source_is_degenerate: bool | None = None  # Preserve full-group status when slicing.
 
     @property
     def training_rewards(self) -> list[float]:
@@ -387,6 +394,8 @@ class RolloutGroup:
     @property
     def is_degenerate(self) -> bool:
         """Whether all adjusted rewards are equal, yielding zero group advantages."""
+        if self.source_is_degenerate is not None:
+            return self.source_is_degenerate
         rewards = self.training_rewards
         return all(reward == rewards[0] for reward in rewards)
 
@@ -544,7 +553,8 @@ def build_rollout_batch(
             "rollout/adjusted_reward_std": pstdev(training_rewards),
             "rollout/adjusted_reward_min": min(training_rewards),
             "rollout/adjusted_reward_max": max(training_rewards),
-            "rollout/degenerate_group_fraction": mean(group.is_degenerate for group in groups),
+            "rollout/degenerate_group_fraction": sum(len(group.rollouts) * group.is_degenerate for group in groups)
+            / len(rollouts),
             "rollout/turns_mean": mean(rollout.num_turns for rollout in rollouts),
             "rollout/input_tokens_mean": mean(rollout.num_input_tokens for rollout in rollouts),
             "rollout/output_tokens_mean": mean(rollout.num_output_tokens for rollout in rollouts),
@@ -950,6 +960,7 @@ class Batcher:
         self.config = config
         self._pending_groups: list[asyncio.Task[CollectedGroup]] = []
         self._latest_examples: dict[str, RolloutGroup] = {}
+        self._completed_groups: deque[RolloutGroup] = deque()
 
     def prepare_batch(
         self, groups: list[RolloutGroup], context_length: int, *, consumption_weight_version: int = 0
@@ -1034,6 +1045,41 @@ class Batcher:
         self._fill_pending_groups(group_size=group_size, target_pending=min(pool_size, groups_until_drain))
         return group
 
+    def get_pool_state(self) -> list[dict[str, Any]]:
+        """Serialize unconsumed rollouts after pending generation drains at a checkpoint."""
+        result: list[dict[str, Any]] = []
+        for group in self._completed_groups:
+            data = asdict(group)
+            for rollout in data["rollouts"]:
+                rollout["sequence"] = {name: value.tolist() for name, value in rollout["sequence"].items()}
+            result.append(data)
+        return result
+
+    def set_pool_state(self, groups: list[dict[str, Any]]) -> None:
+        """Restore already-scored rollouts without resampling or recomputing advantages."""
+        restored: deque[RolloutGroup] = deque()
+        for group in groups:
+            rollouts: list[Rollout] = []
+            for rollout in group["rollouts"]:
+                values = rollout["sequence"]
+                sequence = TrainingSequence(
+                    token_ids=np.asarray(values["token_ids"], dtype=np.int32),  # (T,)
+                    loss_mask=np.asarray(values["loss_mask"], dtype=np.bool_),  # (T,)
+                    old_log_probs=np.asarray(values["old_log_probs"], dtype=np.float32),  # (T,)
+                    weight_versions=np.asarray(values["weight_versions"], dtype=np.int32),  # (T,)
+                )
+                rollouts.append(Rollout(**(rollout | {"sequence": sequence})))
+            restored.append(
+                RolloutGroup(
+                    task_id=group["task_id"],
+                    taskset_id=group["taskset_id"],
+                    rollouts=rollouts,
+                    length_penalty=LengthPenaltyConfig(**group["length_penalty"]),
+                    source_is_degenerate=group["source_is_degenerate"],
+                )
+            )
+        self._completed_groups = restored
+
     async def cancel_pending_groups(self) -> None:
         """Cancel prefetched groups and their dependent rollout tasks."""
         for task in self._pending_groups:
@@ -1043,7 +1089,7 @@ class Batcher:
 
     async def fetch_next_batch(
         self,
-        num_groups: int,
+        batch_size: int,
         group_size: int,
         context_length: int,
         *,
@@ -1051,9 +1097,9 @@ class Batcher:
         consumption_weight_version: int = 0,
         include_examples: bool = False,
     ) -> RolloutBatch:
-        """Consume groups from a bounded pool, draining it before periodic and final checkpoints."""
-        if num_groups < 1:
-            raise ValueError("num_groups must be at least 1")
+        """Consume exactly batch_size rollouts, retaining unused parts of scored groups."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
         started = time.monotonic()
         batches_until_drain = (-iteration) % (self.config.checkpoint_interval * self.config.grad_accum_steps)
         if self.config.total_iterations is not None:
@@ -1062,19 +1108,33 @@ class Batcher:
             )
         if self.config.prefetch_batches == 0:
             batches_until_drain = 0
-        groups_until_drain = (batches_until_drain + 1) * num_groups
-        pool_size = (self.config.prefetch_batches + 1) * num_groups
+        buffered = sum(len(group.rollouts) for group in self._completed_groups)
+        rollouts_until_drain = max(0, (batches_until_drain + 1) * batch_size - buffered)
+        groups_until_drain = (rollouts_until_drain + group_size - 1) // group_size
+        pool_size = ((self.config.prefetch_batches + 1) * batch_size + group_size - 1) // group_size
         try:
             groups: list[RolloutGroup] = []
             skipped_groups = 0
-            while len(groups) < num_groups:
-                item = await self._fetch_group(
-                    group_size=group_size,
-                    pool_size=pool_size,
-                    groups_until_drain=groups_until_drain - len(groups),
-                )
-                skipped_groups += item.skipped_groups
-                groups.append(item.group)
+            remaining = batch_size
+            self._fill_pending_groups(group_size=group_size, target_pending=min(pool_size, groups_until_drain))
+            while remaining:
+                if not self._completed_groups:
+                    item = await self._fetch_group(
+                        group_size=group_size,
+                        pool_size=pool_size,
+                        groups_until_drain=groups_until_drain,
+                    )
+                    groups_until_drain -= 1
+                    skipped_groups += item.skipped_groups
+                    self._completed_groups.append(item.group)
+                group = self._completed_groups.popleft()
+                taken = min(remaining, len(group.rollouts))
+                groups.append(replace(group, rollouts=group.rollouts[:taken], source_is_degenerate=group.is_degenerate))
+                if taken < len(group.rollouts):
+                    self._completed_groups.appendleft(
+                        replace(group, rollouts=group.rollouts[taken:], source_is_degenerate=group.is_degenerate)
+                    )
+                remaining -= taken
             fetched = time.monotonic()
             with span("batcher.prepare_batch"):
                 training_batch = await asyncio.to_thread(
@@ -1145,6 +1205,7 @@ class Learner:
                 iteration = progress.iteration
                 total_rollouts = progress.total_rollouts
                 ray.get(self.actor.set_sampling_state.remote(progress.sampling_state))
+                ray.get(self.batcher.set_pool_state.remote(progress.rollout_pool))
                 logger.info("Resumed run %s at iteration %s", self.config.run_id, iteration)
             writer.log_text(yaml.safe_dump(asdict(self.config)), f"config/{iteration}.yaml")
             logger.info(
@@ -1175,9 +1236,9 @@ class Learner:
                     )
                 )
             resources.callback(self.cancel_pending_groups)
-            self.weight_version = -1  # The initial publication is version 0.
+            self.weight_version = progress.weight_version if progress is not None else -1
             self.publish_weights()
-            self.weight_version = 0
+            self.weight_version += 1
             total_updates = int(self.state.step)
             published_step = total_updates
             writer.log_metrics(
@@ -1310,6 +1371,8 @@ class Learner:
                                     iteration=iteration,
                                     total_rollouts=total_rollouts,
                                     sampling_state=ray.get(self.actor.get_sampling_state.remote()),
+                                    rollout_pool=ray.get(self.batcher.get_pool_state.remote()),
+                                    weight_version=self.weight_version,
                                 ),
                                 self.config,
                             )
@@ -1324,7 +1387,7 @@ class Learner:
         """Fetch one batch assembled from the batcher's pending rollout groups."""
         return ray.get(
             self.batcher.fetch_next_batch.remote(
-                num_groups=self.config.num_groups,
+                batch_size=self.config.batch_size,
                 group_size=self.config.group_size,
                 context_length=self.model.config.max_position_embeddings,
                 iteration=iteration,

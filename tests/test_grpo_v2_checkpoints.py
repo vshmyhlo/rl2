@@ -40,6 +40,8 @@ def progress() -> training.TrainingProgress:
         iteration=2,
         total_rollouts=2**31 + 4,
         sampling_state=actor.get_sampling_state(),
+        rollout_pool=[{"task_id": "pending", "rollouts": [{"advantage": 0.25}]}],
+        weight_version=7,
     )
 
 
@@ -74,6 +76,8 @@ def test_checkpoint_roundtrip_and_retention(tmp_path: Path, progress: training.T
         assert restored.iteration == 2
         assert restored.total_rollouts == 2**31 + 4
         assert restored.sampling_state == progress.sampling_state
+        assert restored.rollout_pool == progress.rollout_pool
+        assert restored.weight_version == 7
         assert restored.shuffle_key.shape == ()
         assert restored.train_state.params["model.layers.0.self_attn.q_proj.weight"].a.shape == (16, 2)
         chex.assert_trees_all_equal(restored.train_state.base_params, state.base_params)
@@ -145,6 +149,8 @@ def test_checkpoint_ignores_legacy_stop_conditions(progress: training.TrainingPr
     metadata = manager.save.call_args.kwargs["args"].metadata.item | {
         "stop_conditions": ["max_tokens", "alfworld_done", "unspecified"]
     }
+    del metadata["rollout_pool"]
+    del metadata["weight_version"]
     del metadata["config"]["finetuning"]
     metadata["config"] |= {"lora_rank": 16, "lora_alpha": 32.0}
     if mode is not None:
@@ -163,6 +169,8 @@ def test_checkpoint_ignores_legacy_stop_conditions(progress: training.TrainingPr
     assert restored is not None
     assert restored.iteration == progress.iteration
     assert restored.train_state is progress.train_state
+    assert restored.rollout_pool == []
+    assert restored.weight_version == -1
 
 
 @pytest.mark.parametrize(

@@ -51,7 +51,7 @@ def main() -> None:
     }  # HF parameter shapes; abstract inputs never allocate model weights.
     state = jax.eval_shape(lambda weights: create_state(model, weights, config), params)
     state = jax.tree.map(lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=replicated), state)
-    batch_size = config.num_groups * config.group_size
+    batch_size = config.batch_size
     shape = (batch_size, args.length)
     batch = GRPOBatch(
         token_ids=jax.ShapeDtypeStruct(shape, jnp.int32, sharding=batched),  # (B, T)
