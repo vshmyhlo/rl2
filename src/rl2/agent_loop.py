@@ -5,13 +5,14 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from math import exp
 from typing import Literal
 
 import httpx
 import numpy as np
 from numpy.typing import NDArray
 from openai import AsyncOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from transformers import PreTrainedTokenizerBase
 
 from rl2.agent_task import Environment, ToolCall, ToolCallError
@@ -69,9 +70,13 @@ class WeightVersionSpan(BaseModel):
     end: int
 
 
-class TokenLogProb(BaseModel):
+class AlternativeLogProb(BaseModel):
     token_id: int
     logprob: float
+
+
+class TokenLogProb(AlternativeLogProb):
+    top_logprobs: list[AlternativeLogProb] = Field(default_factory=list)
 
 
 class CompletionLogProbs(BaseModel):
@@ -95,6 +100,8 @@ class TrainingSequence:
     loss_mask: NDArray[np.bool_]  # (T,) True only for sampled tokens.
     old_log_probs: NDArray[np.float32]  # (T,) zero for context tokens.
     weight_versions: NDArray[np.int32]  # (T,) publication counters; -1 for context tokens.
+    sampler_topk_ids: NDArray[np.int32] | None = None  # (T, K) when score centering is enabled.
+    sampler_topk_log_probs: NDArray[np.float32] | None = None  # (T, K); zero for context.
 
 
 @dataclass(frozen=True)
@@ -139,6 +146,25 @@ def completion_tokens(choice: CompletionChoice) -> tuple[list[int], list[float]]
     return ids, log_probs
 
 
+def completion_topk(choice: CompletionChoice, top_k: int) -> tuple[list[list[int]], list[list[float]]]:
+    """Validate and retain K distinct sampler alternatives per generated token."""
+    ids: list[list[int]] = []
+    log_probs: list[list[float]] = []
+    for token in choice.logprobs.content:
+        # vLLM may include the sampled token in addition to its top K alternatives.
+        alternatives = sorted(token.top_logprobs, key=lambda entry: entry.logprob, reverse=True)[:top_k]
+        if len(alternatives) != top_k or len({entry.token_id for entry in alternatives}) != top_k:
+            raise ValueError("Score centering requires K distinct sampler top-logprobs per token")
+        if any(entry.token_id < 0 or not -9999.0 < entry.logprob <= 0 for entry in alternatives):
+            raise ValueError("Invalid sampler top-logprob")
+        values = [entry.logprob for entry in alternatives]
+        if sum(exp(value) for value in values) > 1.00001:
+            raise ValueError("Sampler top-logprob probability mass exceeds one")
+        ids.append([entry.token_id for entry in alternatives])
+        log_probs.append(values)
+    return ids, log_probs
+
+
 @dataclass(frozen=True)
 class Agent:
     client: AsyncOpenAI
@@ -150,6 +176,7 @@ class Agent:
     temperature: float
     rollout_timeout: float
     environment_timeout: float | None = None
+    sampler_top_k: int = 0
 
     async def run(self, env: Environment) -> Rollout:
         started = time.monotonic()
@@ -179,6 +206,8 @@ class Agent:
             loss_mask = [False] * len(token_ids)
             log_probs = [0.0] * len(token_ids)
             weight_versions = [-1] * len(token_ids)
+            topk_ids = [[0] * self.sampler_top_k for _ in token_ids] if self.sampler_top_k else []
+            topk_log_probs = [[0.0] * self.sampler_top_k for _ in token_ids] if self.sampler_top_k else []
             num_turns = 0
             completion = ""
             stop_condition: StopCondition = "max_turns"
@@ -198,7 +227,8 @@ class Agent:
                                 "temperature": self.temperature,
                                 "top_p": 1.0,
                                 "top_k": -1,
-                                "logprobs": 0,
+                                # vLLM includes the sampled token before truncating this list.
+                                "logprobs": self.sampler_top_k + 1 if self.sampler_top_k else 0,
                                 "stop_token_ids": stop_token_ids,
                                 "detokenize": False,
                             },
@@ -211,6 +241,10 @@ class Agent:
                     if choice.finish_reason not in {"stop", "length"}:
                         raise RuntimeError(f"Generation failed: {choice.finish_reason}")
                     ids, sampled_log_probs = completion_tokens(choice)
+                    if self.sampler_top_k:
+                        head_ids, head_log_probs = completion_topk(choice, self.sampler_top_k)
+                        topk_ids.extend(head_ids)
+                        topk_log_probs.extend(head_log_probs)
                     if len(ids) > remaining:
                         raise ValueError("Completion exceeds the requested token budget")
                     model_span.set_attribute("output_tokens", len(ids))
@@ -272,6 +306,9 @@ class Agent:
                 loss_mask.extend([False] * len(context))
                 log_probs.extend([0.0] * len(context))
                 weight_versions.extend([-1] * len(context))
+                if self.sampler_top_k:
+                    topk_ids.extend([[0] * self.sampler_top_k for _ in context])
+                    topk_log_probs.extend([[0.0] * self.sampler_top_k for _ in context])
             num_output_tokens = sum(loss_mask)
             if num_output_tokens == 0:
                 raise ValueError("Rollout has no trainable tokens")
@@ -284,6 +321,10 @@ class Agent:
                     loss_mask=np.asarray(loss_mask, dtype=np.bool_),  # (T,)
                     old_log_probs=np.asarray(log_probs, dtype=np.float32),  # (T,)
                     weight_versions=np.asarray(weight_versions, dtype=np.int32),  # (T,)
+                    sampler_topk_ids=(np.asarray(topk_ids, dtype=np.int32) if self.sampler_top_k else None),  # (T, K)
+                    sampler_topk_log_probs=(
+                        np.asarray(topk_log_probs, dtype=np.float32) if self.sampler_top_k else None
+                    ),  # (T, K)
                 ),
                 prompt=initial.prompt,
                 reward=reward,

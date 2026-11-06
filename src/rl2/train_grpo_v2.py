@@ -4,8 +4,9 @@ Rollout generation needs no explicit lock around weight publication: vLLM's
 pause/resume mechanism queues new requests and handles in-flight requests
 according to weight_update_pause_mode.
 
-MLflow's metric step counts completed outer iterations: grad_accum_steps rollout batches,
-one attempted optimizer update, and any scheduled weight publication. All metrics below
+MLflow's metric step counts completed outer iterations: batch_size rollouts split into
+grad_accum_steps equal microbatches, one attempted optimizer update, and any scheduled weight publication.
+Below, a consumed batch means one microbatch. All metrics below
 are logged every iteration except startup scalars, weight-transfer timing, checkpoint timing,
 unevaluated policy diagnostics, gradient norms for skipped updates, and tasksets absent from the iteration.
 
@@ -15,18 +16,25 @@ Startup scalars (at the restored iteration, or step 0 for a new run):
     learner/setup_seconds: Model/optimizer setup, checkpoint restore, and initial weight publication wall time.
 
 Optimization scalars (batch means averaged over the iteration unless noted):
-    train/policy_loss: GRPO policy loss with decoupled PPO clipping and truncated rollout importance weights.
-    train/approx_kl: Mean exp(log_ratio) - 1 - log_ratio, where log_ratio is current minus frozen pre-update learner log-probability, bounded to [-20, 20].
-    train/clip_fraction: Fraction of current/anchor sampled-token probability ratios outside the PPO clip range.
-    train/rollout_log_prob_error_mean: Mean absolute frozen learner minus rollout log-probability difference.
-    train/rollout_importance_weight_mean: Mean applied token importance weight after safety bounding and truncation.
-    train/rollout_importance_weight_clipped_fraction: Fraction of safety-bounded token weights above rollout_is_threshold.
+    train/policy_loss: GRPO clipped policy loss with truncated rollout importance weights, or score-centered REINFORCE excluding KL when stable_reinforce is enabled.
+    train/approx_kl: GRPO only: mean exp(log_ratio) - 1 - log_ratio, where log_ratio is current minus frozen pre-update learner log-probability, bounded to [-20, 20].
+    train/clip_fraction: GRPO only: fraction of current/anchor sampled-token probability ratios outside the PPO clip range.
+    train/rollout_log_prob_error_mean: Mean absolute learner minus rollout log-probability difference; uses frozen learner scores in GRPO and current scores in StableReinforce.
+    train/rollout_importance_weight_mean: GRPO only: mean applied token importance weight after safety bounding and truncation.
+    train/rollout_importance_weight_clipped_fraction: GRPO only: fraction of safety-bounded token weights above rollout_is_threshold.
+    train/loss: StableReinforce only: score-centered policy loss plus kl_coeff times train/sampler_kl.
+    train/score_correction_mean: StableReinforce only: mean additive log-probability surrogate whose gradient centers the score; in nats.
+    train/sampler_kl: StableReinforce only: sampler-to-learner KL estimate in nats, before kl_coeff. k1 is log(q)-log(p), which can be negative on a finite batch; k3 is exp(d)-1-d with d=clip(log(p)-log(q), -20, 20). Logged even when kl_coeff is zero.
+    train/sampler_topk_fraction_mean: StableReinforce only: mean recorded sampler probability mass in the retained top K alternatives, dimensionless.
     train/gradient_norm: Global norm of the window-averaged gradient before clipping; logged only when an optimizer update is applied.
     train/skipped_update_fraction: Logged at accumulation boundaries: 1 if the entire window has no training signal and is skipped, otherwise 0.
 Loss and policy diagnostics average unmasked sampled tokens within each rollout, then all rollouts in each batch.
 Policy diagnostics average only evaluated batches and are omitted if none are evaluated.
 Fully masked rollouts contribute zero; importance weights do not change denominators.
-Batches with no unmasked tokens carrying nonzero advantages contribute zero policy loss and omit policy diagnostics.
+Batches with no unmasked tokens carrying nonzero advantages contribute zero policy loss and omit policy diagnostics,
+unless StableReinforce's kl_coeff is positive, in which case retained tokens still train through KL.
+Fully inactive StableReinforce batches also contribute zero train/loss and omit its four diagnostics.
+Losses use dimensionless rewards; gradient norm is the unnormalized L2 norm over trainable parameter gradients.
 Every consumed batch counts toward grad_accum_steps; inactive batches contribute zero gradients.
 Gradients average equally across the window before clipping and AdamW; an entirely inactive window preserves optimizer state.
 
@@ -131,7 +139,9 @@ from rl2.agent_task import Task
 from rl2.alfworld_env import ALFWorldConfig, stream_alfworld_tasks
 from rl2.appworld_env import AppWorldConfig, stream_appworld_tasks
 from rl2.configuration import BaseConfig, load_config
+from rl2.grpo_v2 import stable_reinforce
 from rl2.grpo_v2.reasoning_gym import ReasoningGymConfig, stream_reasoning_gym_tasks
+from rl2.grpo_v2.stable_reinforce import StableReinforceConfig
 from rl2.grpo_v2.state import LoRATrainState, TrainParameters
 from rl2.grpo_v2.weight_transfer import full_weight_publisher, lora_weight_publisher
 from rl2.lm_envs.codegym.env import CodeGymConfig, stream_codegym_tasks
@@ -208,10 +218,10 @@ class Config(BaseConfig):
     )
     seed: Annotated[int, Field(ge=0)] = 1
     learner_gpus: Annotated[int, Field(ge=1)] = 1
-    batch_size: Annotated[int, Field(ge=1)] = 4  # Rollouts consumed per learner batch.
+    batch_size: Annotated[int, Field(ge=1)] = 4  # Total rollouts per optimizer update, before accumulation splitting.
     group_size: Annotated[int, Field(ge=2)] = 4
-    prefetch_batches: Annotated[int, Field(ge=0)] = 0  # Positive values trade policy staleness for overlap.
-    grad_accum_steps: Annotated[int, Field(ge=1)] = 1  # Consecutive full batches per optimizer update.
+    prefetch_batches: Annotated[int, Field(ge=0)] = 0  # Pending rollout capacity in units of batch_size.
+    grad_accum_steps: Annotated[int, Field(ge=1)] = 1  # Equal microbatches per optimizer update.
     parameter_sync_steps: Annotated[int, Field(ge=1)] = 1  # Completed optimizer updates between weight publications.
     max_staleness: Annotated[int, Field(ge=0)] = 100  # Allowed weight publications since each token was sampled.
     drop_degenerate_groups: bool = False
@@ -232,6 +242,7 @@ class Config(BaseConfig):
     finetuning: Annotated[LoRAConfig | FullFinetuningConfig, Field(discriminator="mode")] = LoRAConfig()
     clip_coef: Annotated[float, Field(gt=0, lt=1)] = 0.2
     rollout_is_threshold: Annotated[float, Field(gt=0)] = 2.0  # verl token-level truncated importance sampling.
+    stable_reinforce: StableReinforceConfig | None = None
     max_grad_norm: Annotated[float, Field(gt=0)] = 1.0
     attention_backend: AttentionBackend = "cudnn"  # Lower worst-case sampled-token error in the A100 vLLM audit.
     scan_layers: bool = True
@@ -247,8 +258,15 @@ class Config(BaseConfig):
     def __post_init__(self) -> None:
         if not any(entry.weight > 0 for entry in self.tasksets.values()):
             raise ValueError("tasksets must contain at least one positive weight")
-        if self.batch_size % self.learner_gpus:
-            raise ValueError("learner_gpus must divide batch_size")
+        if self.batch_size % self.grad_accum_steps:
+            raise ValueError("grad_accum_steps must divide batch_size")
+        if self.microbatch_size % self.learner_gpus:
+            raise ValueError("learner_gpus must divide microbatch_size (batch_size // grad_accum_steps)")
+
+    @property
+    def microbatch_size(self) -> int:
+        """Rollouts per accumulation step, summed across learner GPUs."""
+        return self.batch_size // self.grad_accum_steps
 
     @property
     def adamw_kwargs(self) -> dict[str, float]:
@@ -340,6 +358,9 @@ def restore_checkpoint(
         raise ValueError("GRPO v2 checkpoint finetuning does not match the current configuration")
     if saved_config.get("model") != config.model:
         raise ValueError("GRPO v2 checkpoint model does not match the current configuration")
+    current_loss = asdict(config.stable_reinforce) if config.stable_reinforce is not None else None
+    if saved_config.get("stable_reinforce") != current_loss:
+        raise ValueError("GRPO v2 checkpoint stable_reinforce does not match the current configuration")
     if metadata["iteration"] != iteration or iteration < 0 or metadata["total_rollouts"] < 0:
         raise ValueError("Invalid GRPO v2 checkpoint progress")
     restored = manager.restore(
@@ -422,11 +443,13 @@ class GRPOBatch[Array: np.ndarray | jax.Array](NamedTuple):
     loss_mask: Array  # (B, T) bool sampled tokens within max_staleness only.
     old_log_probs: Array  # (B, T) float32 temperature-scaled sampling-policy log-probabilities.
     advantages: Array  # (B,) float32 mean-centered adjusted rewards within each rollout group.
+    sampler_topk_ids: Array | None = None  # (B, T, K) int32 sampling-time alternatives, if enabled.
+    sampler_topk_log_probs: Array | None = None  # (B, T, K) float32 scores; zero for context/padding.
 
 
 @dataclass(frozen=True)
 class RolloutBatch:
-    training_batch: GRPOBatch[np.ndarray]  # Leaves: (B, T), except advantages: (B,).
+    training_batch: GRPOBatch[np.ndarray]  # (B, T), (B,), optional (B, T, K) sampler leaves.
     rollout_metrics: dict[str, float]
     stop_counts: dict[StopCondition, int]
     num_output_tokens: int
@@ -467,30 +490,34 @@ def summarize_iteration(batches: list[BatchSummary]) -> dict[str, float]:
         elif name == "batcher/padded_sequence_tokens":
             result[name] = present[-1].metrics[name]
         else:
-
-            def weight(batch: BatchSummary, name: str = name) -> float:
-                if name.startswith("rollout/reward_mean/"):
-                    return batch.taskset_counts.get(name.removeprefix("rollout/reward_mean/"), 0)
-                if "transcript_token_fraction" in name:
-                    return batch.metrics["rollout/total_tokens_mean"] * batch.num_rollouts
-                if name == "batcher/token_utilization_fraction":
-                    return batch.metrics["batcher/padded_sequence_tokens"] * batch.num_rollouts
-                return batch.num_rollouts
-
-            denominator = sum(weight(batch) for batch in batches)
+            weights: list[float]
+            if name.startswith("rollout/reward_mean/"):
+                taskset_id = name.removeprefix("rollout/reward_mean/")
+                weights = [batch.taskset_counts.get(taskset_id, 0) for batch in batches]
+            elif "transcript_token_fraction" in name:
+                weights = [batch.metrics["rollout/total_tokens_mean"] * batch.num_rollouts for batch in batches]
+            elif name == "batcher/token_utilization_fraction":
+                weights = [batch.metrics["batcher/padded_sequence_tokens"] * batch.num_rollouts for batch in batches]
+            else:
+                weights = [batch.num_rollouts for batch in batches]
+            # Absent age buckets still contribute transcript tokens to the denominator.
+            denominator = sum(weights)
+            weighted = [
+                (batch.metrics, weight) for batch, weight in zip(batches, weights, strict=True) if name in batch.metrics
+            ]
             if measurement.endswith("_std"):
                 mean_name = name.removesuffix("_std") + "_mean"
-                average = sum(batch.metrics[mean_name] * weight(batch) for batch in present) / denominator
+                average = sum(metrics[mean_name] * weight for metrics, weight in weighted) / denominator
                 variance = (
                     sum(
-                        (batch.metrics[name] ** 2 + (batch.metrics[mean_name] - average) ** 2) * weight(batch)
-                        for batch in present
+                        (metrics[name] ** 2 + (metrics[mean_name] - average) ** 2) * weight
+                        for metrics, weight in weighted
                     )
                     / denominator
                 )
                 result[name] = variance**0.5
             else:
-                result[name] = sum(batch.metrics[name] * weight(batch) for batch in present) / denominator
+                result[name] = sum(metrics[name] * weight for metrics, weight in weighted) / denominator
     return result
 
 
@@ -558,8 +585,8 @@ def build_rollout_batch(
             "rollout/turns_mean": mean(rollout.num_turns for rollout in rollouts),
             "rollout/input_tokens_mean": mean(rollout.num_input_tokens for rollout in rollouts),
             "rollout/output_tokens_mean": mean(rollout.num_output_tokens for rollout in rollouts),
-            "rollout/total_tokens_mean": float(training_batch.attention_mask.sum(axis=1).mean()),
-            "batcher/token_utilization_fraction": float(training_batch.attention_mask.mean()),
+            "rollout/total_tokens_mean": transcript_tokens / len(rollouts),
+            "batcher/token_utilization_fraction": transcript_tokens / training_batch.attention_mask.size,
             "batcher/padded_sequence_tokens": float(training_batch.attention_mask.shape[1]),
             "batcher/skipped_groups": skipped_groups,
             "batcher/stale_tokens": stale_tokens,
@@ -589,13 +616,13 @@ POLICY_DIAGNOSTICS = (
 )
 
 
-def token_log_probs(
+def token_distribution(
     state: TrainState,
     params: TrainParameters,  # HF parameter shapes or (R, I), (O, R) factors.
-    batch: GRPOBatch[jax.Array],  # (B, T), (B,) leaves.
+    batch: GRPOBatch[jax.Array],  # (B, T), (B,), optional (B, T, K) leaves.
     temperature: float,
-) -> jax.Array:  # (B, T-1)
-    """(B, T-1) log-probabilities for tokens at positions 1 through T-1."""
+) -> jax.Array:  # (B, T-1, V)
+    """(B, T-1, V) temperature-scaled learner log-probabilities."""
     if isinstance(state, LoRATrainState):
         logits = state.apply_fn(
             {"params": state.base_params},
@@ -611,9 +638,19 @@ def token_log_probs(
             attention_mask=batch.attention_mask[:, :-1],
         ).logits  # (B, T-1, V)
     logits = logits.astype(jnp.float32) / temperature  # (B, T-1, V)
-    log_probs = jax.nn.log_softmax(logits, axis=-1)  # (B, T-1, V); stable shifted arithmetic, as in vLLM.
+    return jax.nn.log_softmax(logits, axis=-1)  # (B, T-1, V); stable shifted arithmetic, as in vLLM.
+
+
+def token_log_probs(
+    state: TrainState,
+    params: TrainParameters,  # HF parameter shapes or (R, I), (O, R) factors.
+    batch: GRPOBatch[jax.Array],  # (B, T), (B,), optional (B, T, K) leaves.
+    temperature: float,
+) -> jax.Array:  # (B, T-1)
+    """(B, T-1) log-probabilities for tokens at positions 1 through T-1."""
+    log_probs = token_distribution(state, params, batch, temperature)  # (B, T-1, V)
     # Fuse selection's backward pass with softmax instead of scattering into a full FP32 vocabulary buffer.
-    targets = jax.nn.one_hot(batch.token_ids[:, 1:], logits.shape[-1], dtype=jnp.bool_)  # (B, T-1, V)
+    targets = jax.nn.one_hot(batch.token_ids[:, 1:], log_probs.shape[-1], dtype=jnp.bool_)  # (B, T-1, V)
     return jnp.where(targets, log_probs, 0).sum(axis=-1)  # (B, T-1)
 
 
@@ -736,19 +773,20 @@ def create_state(
 
 @partial(
     jax.jit,
-    static_argnames=("temperature", "clip_coef", "rollout_is_threshold"),
+    static_argnames=("temperature", "clip_coef", "rollout_is_threshold", "stable_config"),
     in_shardings=(PartitionSpec(), PartitionSpec("batch"), PartitionSpec("batch"), PartitionSpec()),
     out_shardings=PartitionSpec(),
     donate_argnums=(3,),
 )
 def accumulate_gradients(
     state: TrainState,
-    batch: GRPOBatch[jax.Array],  # Full rollout batch: (B, T), (B,) leaves.
+    batch: GRPOBatch[jax.Array],  # (B, T), (B,), optional (B, T, K) leaves.
     anchor_log_probs: jax.Array,  # (B, T-1) frozen learner scores aligned with batch rows.
     gradient_sum: TrainParameters,  # Parameter shapes; the running sum for this outer iteration.
     temperature: float,
     clip_coef: float,
     rollout_is_threshold: float = 2.0,
+    stable_config: StableReinforceConfig | None = None,
 ) -> tuple[TrainParameters, Metrics]:
     """Add one full batch's gradients, donating the running sum and preserving state."""
     if batch.token_ids.shape[0] % jax.sharding.get_abstract_mesh().shape["batch"]:
@@ -763,6 +801,21 @@ def accumulate_gradients(
 
     def compute_gradients() -> tuple[TrainParameters, Metrics]:
         def loss_fn(params: TrainParameters) -> tuple[jax.Array, Metrics]:  # Parameter leaves -> (), scalars.
+            if stable_config is not None:
+                if batch.sampler_topk_ids is None or batch.sampler_topk_log_probs is None:
+                    raise ValueError("StableReinforce requires sampling-time top-logprobs")
+                distribution = token_distribution(state, params, batch, temperature)  # (B, T-1, V)
+                selected = jnp.take_along_axis(distribution, batch.token_ids[:, 1:, None], axis=-1)[..., 0]  # (B, T-1)
+                head = jnp.take_along_axis(distribution, batch.sampler_topk_ids[:, 1:], axis=-1)  # (B, T-1, K)
+                return stable_reinforce.objective(
+                    selected,
+                    head,
+                    batch.sampler_topk_log_probs[:, 1:],
+                    batch.old_log_probs[:, 1:],
+                    batch.advantages,
+                    batch.loss_mask[:, 1:],
+                    stable_config,
+                )
             return objective(
                 token_log_probs(state, params, batch, temperature),
                 batch,
@@ -777,13 +830,17 @@ def accumulate_gradients(
 
     def skip_gradients() -> tuple[TrainParameters, Metrics]:
         # Fixed JIT output structure; optimize excludes unevaluated policy diagnostics from logging.
+        names = ("train/loss", *stable_reinforce.DIAGNOSTICS) if stable_config is not None else POLICY_DIAGNOSTICS
         return gradient_sum, {  # Parameter shapes; scalar metrics.
             "train/policy_loss": jnp.asarray(0.0, dtype=jnp.float32),  # ()
-            **{name: jnp.asarray(0.0, dtype=jnp.float32) for name in POLICY_DIAGNOSTICS},  # () Not evaluated.
+            **{name: jnp.asarray(0.0, dtype=jnp.float32) for name in names},  # () Not evaluated.
         }
 
+    kl_active = stable_config is not None and stable_config.kl_coeff > 0
     return jax.lax.cond(
-        jnp.any((batch.advantages != 0) & jnp.any(batch.loss_mask[:, 1:], axis=1)), compute_gradients, skip_gradients
+        jnp.any(((batch.advantages != 0) | kl_active) & jnp.any(batch.loss_mask[:, 1:], axis=1)),
+        compute_gradients,
+        skip_gradients,
     )
 
 
@@ -803,7 +860,6 @@ def update(
     """Average the accumulated gradients, then clip and apply one optimizer update."""
     if not has_signal:
         return state, {
-            "train/gradient_norm": jnp.asarray(0.0, jnp.float32),  # () Internal placeholder, omitted from logging.
             "train/skipped_update_fraction": jnp.asarray(1.0, jnp.float32),  # ()
         }
     gradients = jax.tree.map(lambda value: value / grad_accum_steps, gradient_sum)  # Parameter shapes.
@@ -843,6 +899,8 @@ def score_group(
 async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]:
     """Yield an agent configured from vLLM's context limit and close its client on exit."""
     tokenizer = await asyncio.to_thread(AutoTokenizer.from_pretrained, config.model)
+    if config.stable_reinforce is not None and config.stable_reinforce.top_k >= tokenizer.vocab_size:
+        raise ValueError("stable_reinforce.top_k must be smaller than the model vocabulary")
     async with AsyncOpenAI(
         base_url=f"{SERVER_URL}/v1", api_key="EMPTY", timeout=config.rollout_timeout, max_retries=3
     ) as client:
@@ -860,6 +918,7 @@ async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]
             temperature=config.temperature,
             rollout_timeout=config.rollout_timeout,
             environment_timeout=config.environment_timeout,
+            sampler_top_k=config.stable_reinforce.top_k if config.stable_reinforce is not None else 0,
         )
 
 
@@ -869,6 +928,7 @@ def serve_vllm(
     lora_rank: int | None = LoRAConfig().rank,
     *,
     config: VLLMConfig = DEFAULT_CONFIG.vllm,
+    sampler_top_k: int = 0,
 ) -> Generator[subprocess.Popen[bytes]]:
     """Manage vLLM's process lifetime; lora_rank=None enables full-weight transfer."""
     weight_args = ["--weight-transfer-config", '{"backend":"nccl"}']
@@ -909,6 +969,7 @@ def serve_vllm(
             "vllm",
             "--logprobs-mode",
             "processed_logprobs",
+            *(["--max-logprobs", str(sampler_top_k + 1)] if sampler_top_k else []),
             *serving_args,
             *weight_args,
         ],
@@ -977,6 +1038,8 @@ class Batcher:
             loss_mask: (B, T) bool sampled-token positions within max_staleness;
             old_log_probs: (B, T) float32 sampling-policy log-probabilities;
             advantages: (B,) float32 per-rollout advantages.
+            sampler_topk_ids: (B, T, K) int32 alternatives, or None in GRPO mode;
+            sampler_topk_log_probs: (B, T, K) float32 sampler scores, or None in GRPO mode.
 
         Raises:
             ValueError: If there are no rollouts, a transcript exceeds the token budget,
@@ -992,6 +1055,7 @@ class Batcher:
         multiple = self.config.padding_multiple
         width = min((length + multiple - 1) // multiple * multiple, token_limit)
         shape = (len(rollouts), width)
+        top_k = self.config.stable_reinforce.top_k if self.config.stable_reinforce is not None else 0
         # Host copies avoid compiling JAX padding and reductions for every transcript length.
         batch = GRPOBatch(
             token_ids=np.zeros(shape, dtype=np.int32),  # (B, T)
@@ -999,6 +1063,8 @@ class Batcher:
             loss_mask=np.zeros(shape, dtype=np.bool_),  # (B, T)
             old_log_probs=np.zeros(shape, dtype=np.float32),  # (B, T)
             advantages=np.asarray([rollout.advantage for rollout in rollouts], dtype=np.float32),  # (B,)
+            sampler_topk_ids=np.zeros((*shape, top_k), dtype=np.int32) if top_k else None,  # (B, T, K)
+            sampler_topk_log_probs=np.zeros((*shape, top_k), dtype=np.float32) if top_k else None,  # (B, T, K)
         )
         for index, rollout in enumerate(rollouts):
             sequence: TrainingSequence = rollout.sequence
@@ -1012,7 +1078,17 @@ class Batcher:
             )  # (L,)
             batch.old_log_probs[index, :length] = sequence.old_log_probs  # (L,)
             batch.attention_mask[index, :length] = True  # (L,)
-        return batch  # (B, T), (B,) leaves.
+            if batch.sampler_topk_ids is not None and batch.sampler_topk_log_probs is not None:
+                if (
+                    sequence.sampler_topk_ids is None
+                    or sequence.sampler_topk_log_probs is None
+                    or sequence.sampler_topk_ids.shape != (length, top_k)
+                    or sequence.sampler_topk_log_probs.shape != (length, top_k)
+                ):
+                    raise ValueError("StableReinforce requires matching sampling-time top-logprobs in every rollout")
+                batch.sampler_topk_ids[index, :length] = sequence.sampler_topk_ids  # (L, K)
+                batch.sampler_topk_log_probs[index, :length] = sequence.sampler_topk_log_probs  # (L, K)
+        return batch  # (B, T), (B,), optional (B, T, K) leaves.
 
     async def _collect_group(self, group_size: int) -> CollectedGroup:
         """Fill one pool slot, replacing degenerate groups when configured."""
@@ -1051,7 +1127,9 @@ class Batcher:
         for group in self._completed_groups:
             data = asdict(group)
             for rollout in data["rollouts"]:
-                rollout["sequence"] = {name: value.tolist() for name, value in rollout["sequence"].items()}
+                rollout["sequence"] = {
+                    name: value.tolist() for name, value in rollout["sequence"].items() if value is not None
+                }
             result.append(data)
         return result
 
@@ -1067,6 +1145,16 @@ class Batcher:
                     loss_mask=np.asarray(values["loss_mask"], dtype=np.bool_),  # (T,)
                     old_log_probs=np.asarray(values["old_log_probs"], dtype=np.float32),  # (T,)
                     weight_versions=np.asarray(values["weight_versions"], dtype=np.int32),  # (T,)
+                    sampler_topk_ids=(
+                        np.asarray(values["sampler_topk_ids"], dtype=np.int32)
+                        if values.get("sampler_topk_ids") is not None
+                        else None
+                    ),  # (T, K)
+                    sampler_topk_log_probs=(
+                        np.asarray(values["sampler_topk_log_probs"], dtype=np.float32)
+                        if values.get("sampler_topk_log_probs") is not None
+                        else None
+                    ),  # (T, K)
                 )
                 rollouts.append(Rollout(**(rollout | {"sequence": sequence})))
             restored.append(
@@ -1111,7 +1199,8 @@ class Batcher:
         buffered = sum(len(group.rollouts) for group in self._completed_groups)
         rollouts_until_drain = max(0, (batches_until_drain + 1) * batch_size - buffered)
         groups_until_drain = (rollouts_until_drain + group_size - 1) // group_size
-        pool_size = ((self.config.prefetch_batches + 1) * batch_size + group_size - 1) // group_size
+        pool_rollouts = max(batch_size, self.config.prefetch_batches * self.config.batch_size)
+        pool_size = (pool_rollouts + group_size - 1) // group_size
         try:
             groups: list[RolloutGroup] = []
             skipped_groups = 0
@@ -1177,9 +1266,9 @@ class Learner:
         with (
             jax.set_mesh(self.mesh),
             MLflowLogger(experiment="grpo_v2", run_name=self.config.run_id) as writer,
+            closing(checkpoint_manager(self.config.ckpt_dir)) as manager,
             ExitStack() as resources,
         ):
-            manager = resources.enter_context(closing(checkpoint_manager(self.config.ckpt_dir)))
             writer.log_params(asdict(self.config))
             logger.info("Run ID: %s; MLflow run: %s", self.config.run_id, writer.run_id)
             start = time.monotonic()
@@ -1215,32 +1304,27 @@ class Learner:
             )
             ray.get(self.actor.ready.remote())
             if self.config.finetuning.mode == "full":
-                self._publish_weights = resources.enter_context(
-                    full_weight_publisher(
-                        lambda: self.state.params,
-                        server_url=SERVER_URL,
-                        device_index=self.mesh.devices.flat[0].local_hardware_id,
-                        pause_mode=self.config.weight_update_pause_mode,
-                    )
+                publisher = full_weight_publisher(
+                    lambda: self.state.params,
+                    server_url=SERVER_URL,
+                    device_index=self.mesh.devices.flat[0].local_hardware_id,
+                    pause_mode=self.config.weight_update_pause_mode,
                 )
             else:
-                self._publish_weights = resources.enter_context(
-                    lora_weight_publisher(
-                        lambda: self.state.params,
-                        server_url=SERVER_URL,
-                        model=self.config.model,
-                        adapter_name=LORA_NAME,
-                        lora_rank=self.config.finetuning.rank,
-                        lora_alpha=self.config.finetuning.alpha,
-                        pause_mode=self.config.weight_update_pause_mode,
-                    )
+                publisher = lora_weight_publisher(
+                    lambda: self.state.params,
+                    server_url=SERVER_URL,
+                    model=self.config.model,
+                    adapter_name=LORA_NAME,
+                    lora_rank=self.config.finetuning.rank,
+                    lora_alpha=self.config.finetuning.alpha,
+                    pause_mode=self.config.weight_update_pause_mode,
                 )
+            self._publish_weights = resources.enter_context(publisher)
             resources.callback(self.cancel_pending_groups)
             self.weight_version = progress.weight_version if progress is not None else -1
             self.publish_weights()
             self.weight_version += 1
-            total_updates = int(self.state.step)
-            published_step = total_updates
             writer.log_metrics(
                 {
                     "model/parameters_billions": sum(
@@ -1256,146 +1340,154 @@ class Learner:
                 },
                 step=iteration,
             )
-            logger.info("Starting GRPO training loop")
-            while self.config.total_iterations is None or iteration < self.config.total_iterations:
-                iteration += 1
-                checkpoint_due = (
-                    iteration % self.config.checkpoint_interval == 0 or iteration == self.config.total_iterations
-                )
-                # Each iteration is a separate trace, including its remote calls and child tasks.
-                with span(
-                    "train.iteration",
-                    {"run_id": self.config.run_id or writer.run_id, "iteration": iteration, "model": self.config.model},
-                    root=True,
-                ):
-                    started = time.monotonic()
-                    summaries: list[BatchSummary] = []
-                    update_history: dict[str, list[float]] = defaultdict(list)
-                    timing_metrics: Counter[str] = Counter()
-                    stop_counts: Counter[StopCondition] = Counter()
-                    num_rollouts = 0
-                    num_output_tokens = 0
-                    fetch_seconds = 0.0
-                    update_seconds = 0.0
-                    previous = started
-                    gradient_sum = jax.tree.map(jnp.zeros_like, self.state.params)  # Parameter shapes.
-                    has_signal = False
-                    for accumulation_step in range(self.config.grad_accum_steps):
-                        batch_iteration = (iteration - 1) * self.config.grad_accum_steps + accumulation_step + 1
-                        with span("learner.fetch_batch"):
-                            batch = self.fetch_next_batch(iteration=batch_iteration)
-                        fetched = time.monotonic()
-                        with span("learner.optimize"):
-                            result = self.optimize(batch.training_batch, gradient_sum)
-                            gradient_sum = result.gradient_sum  # Parameter shapes.
-                            has_signal |= result.has_signal
-                            for name, value in result.metrics.items():
-                                update_history[name].append(value)
-                        optimized = time.monotonic()
-                        fetch_seconds += fetched - previous
-                        update_seconds += optimized - fetched
-                        previous = optimized
-                        batch_rollouts = batch.training_batch.token_ids.shape[0]
-                        num_rollouts += batch_rollouts
-                        num_output_tokens += batch.num_output_tokens
-                        summaries.append(
-                            BatchSummary(
-                                metrics=batch.rollout_metrics,
-                                num_rollouts=batch_rollouts,
-                                taskset_counts=batch.taskset_counts,
-                            )
+            self.run_iterations(writer, manager, iteration=iteration, total_rollouts=total_rollouts)
+
+    def run_iterations(
+        self,
+        writer: MLflowLogger,
+        manager: ocp.CheckpointManager,
+        *,
+        iteration: int,
+        total_rollouts: int,
+    ) -> None:
+        """Run accumulation, publication, and logging from the restored progress."""
+        published_step = int(self.state.step)
+        logger.info("Starting GRPO training loop")
+        while self.config.total_iterations is None or iteration < self.config.total_iterations:
+            iteration += 1
+            checkpoint_due = (
+                iteration % self.config.checkpoint_interval == 0 or iteration == self.config.total_iterations
+            )
+            # Each iteration is a separate trace, including its remote calls and child tasks.
+            with span(
+                "train.iteration",
+                {"run_id": self.config.run_id or writer.run_id, "iteration": iteration, "model": self.config.model},
+                root=True,
+            ):
+                started = time.monotonic()
+                summaries: list[BatchSummary] = []
+                update_history: dict[str, list[float]] = defaultdict(list)
+                timing_metrics: Counter[str] = Counter()
+                stop_counts: Counter[StopCondition] = Counter()
+                num_rollouts = 0
+                num_output_tokens = 0
+                fetch_seconds = 0.0
+                update_seconds = 0.0
+                previous = started
+                gradient_sum = jax.tree.map(jnp.zeros_like, self.state.params)  # Parameter shapes.
+                has_signal = False
+                for accumulation_step in range(self.config.grad_accum_steps):
+                    batch_iteration = (iteration - 1) * self.config.grad_accum_steps + accumulation_step + 1
+                    with span("learner.fetch_batch"):
+                        batch = self.fetch_next_batch(iteration=batch_iteration)
+                    fetched = time.monotonic()
+                    with span("learner.optimize"):
+                        result = self.optimize(batch.training_batch, gradient_sum)
+                        gradient_sum = result.gradient_sum  # Parameter shapes.
+                        has_signal |= result.has_signal
+                        for name, value in result.metrics.items():
+                            update_history[name].append(value)
+                    optimized = time.monotonic()
+                    fetch_seconds += fetched - previous
+                    update_seconds += optimized - fetched
+                    previous = optimized
+                    batch_rollouts = batch.training_batch.token_ids.shape[0]
+                    num_rollouts += batch_rollouts
+                    num_output_tokens += batch.num_output_tokens
+                    summaries.append(
+                        BatchSummary(
+                            metrics=batch.rollout_metrics,
+                            num_rollouts=batch_rollouts,
+                            taskset_counts=batch.taskset_counts,
                         )
-                        timing_metrics.update(batch.timing_metrics)
-                        stop_counts.update(batch.stop_counts)
-                    with span("learner.apply_update"):
-                        optimizer_metrics = self.apply_update(gradient_sum, has_signal=has_signal)
-                    applied = time.monotonic()
-                    update_seconds += applied - optimized
-                    optimized = applied
-                    total_updates = int(self.state.step)
-                    sync_due = total_updates % self.config.parameter_sync_steps == 0
-                    publish = sync_due and total_updates != published_step
-                    if publish:
-                        self.publish_weights()
-                        self.weight_version += 1
-                        published_step = total_updates
-                    now = time.monotonic()
-                    total_rollouts += num_rollouts
-                    seconds = max(now - started, 1e-9)
-                    scalars = {
-                        **{name: mean(values) for name, values in update_history.items()},
-                        **optimizer_metrics,
-                        **timing_metrics,
-                        **summarize_iteration(summaries),
-                        **{
-                            f"rollout/stop_fraction/{condition}": stop_counts.get(condition, 0) / num_rollouts
-                            for condition in get_args(StopCondition)
-                        },
-                        "train/iterations_total": iteration,
-                        "train/updates_total": total_updates,
-                        "train/learning_rate": self.config.adamw_kwargs["learning_rate"],
-                        "train/rollouts_total": total_rollouts,
-                        "learner/iterations_per_second": 1 / seconds,
-                        "learner/rollouts_per_second": num_rollouts / seconds,
-                        "learner/output_tokens_per_second": num_output_tokens / seconds,
-                        "learner/batch_fetch_seconds": fetch_seconds,
-                        "learner/update_seconds": update_seconds,
-                        "learner/iteration_seconds": now - started,
-                    }
-                    if publish:
-                        scalars["learner/weight_transfer_seconds"] = now - optimized
-                    logger.info(
-                        "iteration=%s reward=%.3f degenerate_group_fraction=%.3f skipped_groups=%d "
-                        "stale_tokens=%d batch=%.2fs loss=%.4f update=%.2fs%s",
-                        iteration,
-                        scalars["rollout/reward_mean"],
-                        scalars["rollout/degenerate_group_fraction"],
-                        scalars["batcher/skipped_groups"],
-                        scalars["batcher/stale_tokens"],
-                        scalars["learner/batch_fetch_seconds"],
-                        scalars["train/policy_loss"],
-                        scalars["learner/update_seconds"],
-                        f" weights={scalars['learner/weight_transfer_seconds']:.2f}s" if publish else "",
                     )
-                    if iteration % self.config.example_log_interval == 0:
-                        with span("learner.log_examples"):
-                            examples = f"Rollout examples | step {iteration}\n\n{batch.examples}"
-                            writer.log_text(examples, f"examples/{iteration}.txt")
-                    if checkpoint_due:
-                        with span("learner.checkpoint"):
-                            scalars["checkpoint/save_blocking_seconds"] = save_checkpoint(
-                                manager,
-                                TrainingProgress(
-                                    train_state=self.state,
-                                    shuffle_key=self.shuffle_key,  # ()
-                                    iteration=iteration,
-                                    total_rollouts=total_rollouts,
-                                    sampling_state=ray.get(self.actor.get_sampling_state.remote()),
-                                    rollout_pool=ray.get(self.batcher.get_pool_state.remote()),
-                                    weight_version=self.weight_version,
-                                ),
-                                self.config,
-                            )
-                    with span("learner.log_metrics"):
-                        writer.log_metrics(scalars, step=iteration)
+                    timing_metrics.update(batch.timing_metrics)
+                    stop_counts.update(batch.stop_counts)
+                with span("learner.apply_update"):
+                    optimizer_metrics = self.apply_update(gradient_sum, has_signal=has_signal)
+                applied = time.monotonic()
+                update_seconds += applied - optimized
+                total_updates = int(self.state.step)
+                sync_due = total_updates % self.config.parameter_sync_steps == 0
+                publish = sync_due and total_updates != published_step
+                if publish:
+                    self.publish_weights()
+                    self.weight_version += 1
+                    published_step = total_updates
+                now = time.monotonic()
+                total_rollouts += num_rollouts
+                seconds = max(now - started, 1e-9)
+                scalars = {
+                    **{name: mean(values) for name, values in update_history.items()},
+                    **optimizer_metrics,
+                    **timing_metrics,
+                    **summarize_iteration(summaries),
+                    **{
+                        f"rollout/stop_fraction/{condition}": stop_counts.get(condition, 0) / num_rollouts
+                        for condition in get_args(StopCondition)
+                    },
+                    "train/iterations_total": iteration,
+                    "train/updates_total": total_updates,
+                    "train/learning_rate": self.config.adamw_kwargs["learning_rate"],
+                    "train/rollouts_total": total_rollouts,
+                    "learner/iterations_per_second": 1 / seconds,
+                    "learner/rollouts_per_second": num_rollouts / seconds,
+                    "learner/output_tokens_per_second": num_output_tokens / seconds,
+                    "learner/batch_fetch_seconds": fetch_seconds,
+                    "learner/update_seconds": update_seconds,
+                    "learner/iteration_seconds": now - started,
+                }
+                if publish:
+                    scalars["learner/weight_transfer_seconds"] = now - applied
+                logger.info(
+                    "iteration=%s reward=%.3f degenerate_group_fraction=%.3f skipped_groups=%d "
+                    "stale_tokens=%d batch=%.2fs loss=%.4f update=%.2fs%s",
+                    iteration,
+                    scalars["rollout/reward_mean"],
+                    scalars["rollout/degenerate_group_fraction"],
+                    scalars["batcher/skipped_groups"],
+                    scalars["batcher/stale_tokens"],
+                    scalars["learner/batch_fetch_seconds"],
+                    scalars["train/policy_loss"],
+                    scalars["learner/update_seconds"],
+                    f" weights={scalars['learner/weight_transfer_seconds']:.2f}s" if publish else "",
+                )
+                if iteration % self.config.example_log_interval == 0:
+                    with span("learner.log_examples"):
+                        examples = f"Rollout examples | step {iteration}\n\n{batch.examples}"
+                        writer.log_text(examples, f"examples/{iteration}.txt")
+                if checkpoint_due:
+                    with span("learner.checkpoint"):
+                        scalars["checkpoint/save_blocking_seconds"] = save_checkpoint(
+                            manager,
+                            TrainingProgress(
+                                train_state=self.state,
+                                shuffle_key=self.shuffle_key,  # ()
+                                iteration=iteration,
+                                total_rollouts=total_rollouts,
+                                sampling_state=ray.get(self.actor.get_sampling_state.remote()),
+                                rollout_pool=ray.get(self.batcher.get_pool_state.remote()),
+                                weight_version=self.weight_version,
+                            ),
+                            self.config,
+                        )
+                with span("learner.log_metrics"):
+                    writer.log_metrics(scalars, step=iteration)
 
     def cancel_pending_groups(self) -> None:
         """Drain the batcher's rollout cancellation before shutting down training."""
         ray.get(self.batcher.cancel_pending_groups.remote())
 
     def fetch_next_batch(self, *, iteration: int) -> RolloutBatch:
-        """Fetch one batch assembled from the batcher's pending rollout groups."""
+        """Fetch one microbatch assembled from the batcher's pending rollout groups."""
         return ray.get(
             self.batcher.fetch_next_batch.remote(
-                batch_size=self.config.batch_size,
+                batch_size=self.config.microbatch_size,
                 group_size=self.config.group_size,
                 context_length=self.model.config.max_position_embeddings,
                 iteration=iteration,
                 consumption_weight_version=self.weight_version,
-                include_examples=(
-                    iteration % self.config.grad_accum_steps == 0
-                    and ((iteration - 1) // self.config.grad_accum_steps + 1) % self.config.example_log_interval == 0
-                ),
+                include_examples=iteration % (self.config.grad_accum_steps * self.config.example_log_interval) == 0,
             )
         )
 
@@ -1404,15 +1496,20 @@ class Learner:
 
     def optimize(
         self,
-        batch: GRPOBatch[np.ndarray],  # (B, T), (B,) leaves.
+        batch: GRPOBatch[np.ndarray],  # (B, T), (B,), optional (B, T, K) leaves.
         gradient_sum: TrainParameters,  # Parameter shapes.
     ) -> BatchGradientResult:
         """Accumulate one batch without changing parameters or optimizer state."""
         if batch.token_ids.shape[0] % self.mesh.size:
             raise ValueError("learner device count must divide the rollout batch size")
         batched = NamedSharding(self.mesh, PartitionSpec("batch"))
-        device_batch: GRPOBatch[jax.Array] = jax.device_put(batch, batched)  # (B, T), (B,) leaves.
-        anchors = compute_anchor_log_probs(self.state, device_batch, self.config.temperature)  # (B, T-1)
+        device_batch: GRPOBatch[jax.Array] = jax.device_put(batch, batched)  # (B, T), (B,), optional (B, T, K) leaves.
+        stable_config = self.config.stable_reinforce
+        anchors = (
+            compute_anchor_log_probs(self.state, device_batch, self.config.temperature)
+            if stable_config is None
+            else jnp.zeros_like(device_batch.old_log_probs[:, 1:])
+        )  # (B, T-1); score centering does not need an anchor forward pass.
         gradient_sum, metrics = accumulate_gradients(
             self.state,
             device_batch,
@@ -1421,20 +1518,19 @@ class Learner:
             self.config.temperature,
             self.config.clip_coef,
             self.config.rollout_is_threshold,
+            stable_config,
         )  # Parameter shapes; scalar metrics.
         scalars = {name: float(value) for name, value in metrics.items()}
-        has_signal = bool(np.any((batch.advantages != 0) & np.any(batch.loss_mask[:, 1:], axis=1)))
+        kl_active = stable_config is not None and stable_config.kl_coeff > 0
+        has_signal = bool(np.any(((batch.advantages != 0) | kl_active) & np.any(batch.loss_mask[:, 1:], axis=1)))
         if not has_signal:
-            for name in POLICY_DIAGNOSTICS:
+            for name in stable_reinforce.DIAGNOSTICS if stable_config is not None else POLICY_DIAGNOSTICS:
                 del scalars[name]
         return BatchGradientResult(gradient_sum=gradient_sum, metrics=scalars, has_signal=has_signal)
 
     def apply_update(self, gradient_sum: TrainParameters, *, has_signal: bool) -> dict[str, float]:  # Parameter shapes.
         self.state, metrics = update(self.state, gradient_sum, self.config.grad_accum_steps, has_signal)
-        scalars = {name: float(value) for name, value in metrics.items()}
-        if not has_signal:
-            del scalars["train/gradient_norm"]
-        return scalars
+        return {name: float(value) for name, value in metrics.items()}
 
 
 class SampledTask(NamedTuple):
@@ -1508,6 +1604,7 @@ class Actor:
                     model=config.model,
                     lora_rank=config.finetuning.rank if config.finetuning.mode == "lora" else None,
                     config=config.vllm,
+                    **({"sampler_top_k": config.stable_reinforce.top_k} if config.stable_reinforce is not None else {}),
                 )
             )
             wait_for_server(server)

@@ -201,6 +201,7 @@ def test_invalid_checkpoint_metadata(progress: training.TrainingProgress, damage
         {"finetuning": training.LoRAConfig(rank=8)},
         {"finetuning": training.LoRAConfig(alpha=16)},
         {"finetuning": training.FullFinetuningConfig()},
+        {"stable_reinforce": training.StableReinforceConfig()},
     ],
 )
 def test_checkpoint_rejects_incompatible_lora_config(

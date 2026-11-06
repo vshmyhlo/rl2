@@ -51,14 +51,21 @@ def main() -> None:
     }  # HF parameter shapes; abstract inputs never allocate model weights.
     state = jax.eval_shape(lambda weights: create_state(model, weights, config), params)
     state = jax.tree.map(lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=replicated), state)
-    batch_size = config.batch_size
-    shape = (batch_size, args.length)
+    microbatch_size = config.microbatch_size
+    shape = (microbatch_size, args.length)
+    top_k = config.stable_reinforce.top_k if config.stable_reinforce is not None else 0
     batch = GRPOBatch(
         token_ids=jax.ShapeDtypeStruct(shape, jnp.int32, sharding=batched),  # (B, T)
         attention_mask=jax.ShapeDtypeStruct(shape, jnp.bool_, sharding=batched),  # (B, T)
         loss_mask=jax.ShapeDtypeStruct(shape, jnp.bool_, sharding=batched),  # (B, T)
         old_log_probs=jax.ShapeDtypeStruct(shape, jnp.float32, sharding=batched),  # (B, T)
-        advantages=jax.ShapeDtypeStruct((batch_size,), jnp.float32, sharding=batched),  # (B,)
+        advantages=jax.ShapeDtypeStruct((microbatch_size,), jnp.float32, sharding=batched),  # (B,)
+        sampler_topk_ids=jax.ShapeDtypeStruct((*shape, top_k), jnp.int32, sharding=batched)
+        if top_k
+        else None,  # (B, T, K)
+        sampler_topk_log_probs=(
+            jax.ShapeDtypeStruct((*shape, top_k), jnp.float32, sharding=batched) if top_k else None
+        ),  # (B, T, K)
     )
     gradient_sum = jax.tree.map(
         lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=replicated), state.params
@@ -68,7 +75,7 @@ def main() -> None:
     if not args.donate_state:
         accumulation = jax.jit(
             accumulate_gradients.__wrapped__,
-            static_argnames=("temperature", "clip_coef", "rollout_is_threshold"),
+            static_argnames=("temperature", "clip_coef", "rollout_is_threshold", "stable_config"),
             in_shardings=(PartitionSpec(), PartitionSpec("batch"), PartitionSpec("batch"), PartitionSpec()),
             out_shardings=PartitionSpec(),
         )
@@ -83,11 +90,14 @@ def main() -> None:
             "accumulate": accumulation.lower(
                 state,
                 batch,
-                jax.ShapeDtypeStruct((batch_size, args.length - 1), jnp.float32, sharding=batched),  # (B, T-1) anchors.
+                jax.ShapeDtypeStruct(
+                    (microbatch_size, args.length - 1), jnp.float32, sharding=batched
+                ),  # (B, T-1) anchors.
                 gradient_sum,
                 config.temperature,
                 config.clip_coef,
                 config.rollout_is_threshold,
+                config.stable_reinforce,
             ),
             "update": optimizer_update.lower(state, gradient_sum, config.grad_accum_steps, True),
         }
@@ -109,7 +119,8 @@ def main() -> None:
             "jax": jax.__version__,
             "device": device.device_kind,
             "model": config.model,
-            "batch_size": batch_size,
+            "batch_size": config.batch_size,
+            "microbatch_size": microbatch_size,
             "grad_accum_steps": config.grad_accum_steps,
             "length": args.length,
             "gradient_checkpointing": config.gradient_checkpointing,

@@ -115,6 +115,7 @@ def test_prepare_batch_masks_only_stale_sampled_tokens(batcher: Any, groups: lis
         np.testing.assert_array_equal(batch.attention_mask[index, :length], True)
         np.testing.assert_array_equal(groups[0].rollouts[index].sequence.loss_mask, original.sequence.loss_mask)
     np.testing.assert_array_equal(batch.advantages, [1.0, -1.0])
+
     metrics = training.build_rollout_batch(
         groups, batch, {}, consumption_weight_version=3, max_staleness=batcher.config.max_staleness
     ).rollout_metrics
@@ -123,6 +124,46 @@ def test_prepare_batch_masks_only_stale_sampled_tokens(batcher: Any, groups: lis
     assert metrics["batcher/stale_transcript_token_fraction"] == 0.25
     assert metrics["batcher/masked_transcript_token_fraction"] == 0.75
     assert metrics["batcher/unmasked_transcript_token_fraction"] == 0.25
+
+
+def test_stable_sampler_data_batch_and_checkpoint(batcher: Any, groups: list[training.RolloutGroup]) -> None:
+    batcher.config = replace(
+        batcher.config,
+        padding_multiple=8,
+        max_staleness=0,
+        stable_reinforce=training.StableReinforceConfig(top_k=2),
+    )
+    with pytest.raises(ValueError, match="sampling-time top-logprobs"):
+        batcher.prepare_batch(groups, context_length=8)
+    for index, sample in enumerate(groups[0].rollouts):
+        length = len(sample.sequence.token_ids)
+        groups[0].rollouts[index] = replace(
+            sample,
+            sequence=replace(
+                sample.sequence,
+                sampler_topk_ids=np.tile([0, 1], (length, 1)).astype(np.int32),  # (L, K)
+                sampler_topk_log_probs=np.tile([-1.0, -1.5], (length, 1)).astype(np.float32),  # (L, K)
+            ),
+        )
+    batcher._completed_groups.extend(groups)
+    serialized = json.loads(json.dumps(batcher.get_pool_state(), allow_nan=False))
+    batcher.set_pool_state(serialized)
+    assert batcher.get_pool_state() == serialized
+    batch = batcher.prepare_batch(list(batcher._completed_groups), context_length=8, consumption_weight_version=1)
+    assert batch.sampler_topk_ids.shape == batch.sampler_topk_log_probs.shape == (2, 8, 2)
+    assert batch.sampler_topk_ids.dtype == np.int32 and batch.sampler_topk_log_probs.dtype == np.float32
+    assert not batch.loss_mask.any()  # Stale tokens retain sampler data but never enter the loss.
+    for index, sample in enumerate(groups[0].rollouts):
+        length = len(sample.sequence.token_ids)
+        np.testing.assert_array_equal(batch.sampler_topk_ids[index, :length], sample.sequence.sampler_topk_ids)
+        np.testing.assert_array_equal(
+            batch.sampler_topk_log_probs[index, :length], sample.sequence.sampler_topk_log_probs
+        )
+        np.testing.assert_array_equal(batch.sampler_topk_ids[index, length:], 0)
+        np.testing.assert_array_equal(batch.sampler_topk_log_probs[index, length:], 0)
+    batcher.config = replace(batcher.config, stable_reinforce=training.StableReinforceConfig(top_k=3))
+    with pytest.raises(ValueError, match="matching sampling-time top-logprobs"):
+        batcher.prepare_batch(groups, context_length=8)
 
 
 @pytest.mark.parametrize("context_length,width", [(512, 256), (5, 5)], ids=["bucketed", "context-boundary"])
@@ -147,12 +188,13 @@ def test_prepare_batch(batcher: Any, groups: list[training.RolloutGroup], contex
     assert batch.token_ids.shape == batch.attention_mask.shape == batch.loss_mask.shape == (2, width)
     assert batch.old_log_probs.shape == (2, width)
     assert batch.advantages.shape == (2,)
-    assert all(isinstance(array, np.ndarray) for array in batch)
+    assert all(isinstance(array, np.ndarray) for array in jax.tree.leaves(batch))
+    assert batch.sampler_topk_ids is batch.sampler_topk_log_probs is None
     assert batch.token_ids.dtype == np.int32
     assert batch.attention_mask.dtype == batch.loss_mask.dtype == np.bool_
     assert batch.old_log_probs.dtype == batch.advantages.dtype == np.float32
     restored = pickle.loads(pickle.dumps(batch))  # (B, T), (B,) leaves.
-    for original, value in zip(batch, restored, strict=True):
+    for original, value in zip(jax.tree.leaves(batch), jax.tree.leaves(restored), strict=True):
         assert isinstance(value, np.ndarray)
         np.testing.assert_array_equal(value, original)
     np.testing.assert_array_equal(batch.token_ids[0, :5], [1, 2, 3, 4, 5])
@@ -193,7 +235,7 @@ def test_prepare_batch_bucket_boundaries(
     )
     assert result.rollout_metrics["batcher/token_utilization_fraction"] == pytest.approx(length / width)
     assert result.rollout_metrics["batcher/padded_sequence_tokens"] == width
-    assert all(array.shape == (1, width) for array in batch[:-1])
+    assert all(array.shape == (1, width) for array in batch[:4])
     assert batch.advantages.shape == (1,)
     assert int(batch.attention_mask.sum()) == length
     assert int(batch.loss_mask.sum()) == length - 1
@@ -416,6 +458,45 @@ def batch(
     batch = jax.device_put(batcher.prepare_batch(groups, context_length=8))  # (B, T), (B,) leaves.
     old = training.token_log_probs(state, state.params, batch, temperature=0.7)  # (B=2, T-1=7)
     return batch._replace(old_log_probs=jnp.pad(old, ((0, 0), (1, 0))))
+
+
+@pytest.mark.usefixtures("mesh_context")
+def test_stable_reinforce_lora_matches_on_policy_gradient(
+    state: training.LoRATrainState,
+    batch: training.GRPOBatch[jax.Array],
+) -> None:
+    distribution = training.token_distribution(state, state.params, batch, 0.7)  # (B, T-1, V)
+    scores, ids = jax.lax.top_k(distribution, 2)  # Both (B, T-1, K).
+    stable_batch = batch._replace(
+        sampler_topk_ids=jnp.pad(ids, ((0, 0), (1, 0), (0, 0))),  # (B, T, K)
+        sampler_topk_log_probs=jnp.pad(scores, ((0, 0), (1, 0), (0, 0))),  # (B, T, K)
+    )
+    expected, _ = training.accumulate_gradients(
+        state,
+        batch,
+        batch.old_log_probs[:, 1:],
+        jax.tree.map(jnp.zeros_like, state.params),
+        0.7,
+        0.2,
+    )  # Parameter shapes; scalar metrics.
+    anchors = jnp.zeros_like(scores[..., 0])  # (B, T-1)
+    gradient_sum = jax.tree.map(jnp.zeros_like, state.params)  # Parameter shapes.
+    mesh = Mesh(devices=jax.devices()[:2], axis_names=("batch",))
+    with jax.set_mesh(mesh):
+        actual, metrics = training.accumulate_gradients(
+            jax.device_put(state, NamedSharding(mesh, PartitionSpec())),
+            jax.device_put(stable_batch, NamedSharding(mesh, PartitionSpec("batch"))),
+            jax.device_put(anchors, NamedSharding(mesh, PartitionSpec("batch"))),  # (B, T-1)
+            jax.device_put(gradient_sum, NamedSharding(mesh, PartitionSpec())),
+            0.7,
+            0.2,
+            2.0,
+            training.StableReinforceConfig(top_k=2, kl_coeff=0),
+        )  # Parameter shapes; scalar metrics.
+    assert float(metrics["train/sampler_topk_fraction_mean"]) > 0
+    for value, reference in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        assert value.shape == reference.shape
+        np.testing.assert_allclose(value, reference, atol=2e-6, rtol=2e-5)
 
 
 def test_token_log_probs_shift_temperature_and_padding(
@@ -751,12 +832,10 @@ def test_inactive_tokens_preserve_optimizer_state(
     anchors = training.compute_anchor_log_probs(state, batch, 0.7)  # (B, T-1)
     np.testing.assert_array_equal(anchors, 0)
     updated, metrics = update_batch(jax.tree.map(jnp.copy, state), batch, batch.old_log_probs[:, 1:], 0.7, 0.2)
-    assert float(metrics["train/gradient_norm"]) == float(metrics["train/policy_loss"]) == 0.0
     assert all(value.shape == () for value in metrics.values())
     assert {name: float(value) for name, value in metrics.items()} == {
         "train/policy_loss": 0.0,
         **{name: 0.0 for name in training.POLICY_DIAGNOSTICS},
-        "train/gradient_norm": 0.0,
         "train/skipped_update_fraction": 1.0,
     }
     for actual, expected in zip(jax.tree.leaves(updated), jax.tree.leaves(state), strict=True):
@@ -856,6 +935,7 @@ def test_learner_updates_full_batch_once(monkeypatch: pytest.MonkeyPatch) -> Non
         temperature: float,
         clip_coef: float,
         rollout_is_threshold: float,
+        stable_config: training.StableReinforceConfig | None,
     ) -> tuple[training.TrainParameters, training.Metrics]:
         assert jax.sharding.get_mesh() == learner.mesh
         assert full_batch.token_ids.shape == (3, 2)
@@ -914,6 +994,7 @@ def test_learner_omits_unevaluated_policy_metrics(value: float | None, monkeypat
         temperature: float,
         clip_coef: float,
         rollout_is_threshold: float,
+        stable_config: training.StableReinforceConfig | None,
     ) -> tuple[training.TrainParameters, training.Metrics]:
         measured = 0.0 if value is None else value
         return gradient_sum, {
@@ -989,7 +1070,7 @@ def test_learner_optimizes_and_publishes_updated_adapters(
     assert old.shape == (4, 7)
     assert old.dtype == jnp.float32
     batch = batch._replace(old_log_probs=np.pad(np.asarray(old), ((0, 0), (1, 0))))  # (B, T), (B,) leaves.
-    assert all(isinstance(value, np.ndarray) for value in batch)
+    assert all(isinstance(value, np.ndarray) for value in jax.tree.leaves(batch))
     actual_anchor_scores = training.compute_anchor_log_probs
     anchors: list[jax.Array] = []  # Each (B, T-1), one snapshot per rollout batch.
 
@@ -1015,10 +1096,18 @@ def test_learner_optimizes_and_publishes_updated_adapters(
         temperature: float,
         clip_coef: float,
         rollout_is_threshold: float,
+        stable_config: training.StableReinforceConfig | None,
     ) -> tuple[training.TrainParameters, training.Metrics]:
         steps.append(int(current.step))
         return actual_update(
-            current, full_batch, anchor_log_probs, gradient_sum, temperature, clip_coef, rollout_is_threshold
+            current,
+            full_batch,
+            anchor_log_probs,
+            gradient_sum,
+            temperature,
+            clip_coef,
+            rollout_is_threshold,
+            stable_config,
         )
 
     update = Mock(wraps=record_update)
@@ -1036,7 +1125,7 @@ def test_learner_optimizes_and_publishes_updated_adapters(
         assert jax.tree.leaves(call.args[0].params)[0].is_deleted()
         assert call.args[6] == 1.25
         placed_batch = call.args[1]  # (B=4, T=8), (B,) leaves.
-        for placed, original in zip(placed_batch, batch, strict=True):
+        for placed, original in zip(jax.tree.leaves(placed_batch), jax.tree.leaves(batch), strict=True):
             assert placed.shape == original.shape
             assert placed.sharding == NamedSharding(learner.mesh, PartitionSpec("batch"))
             np.testing.assert_array_equal(placed, original)
@@ -1099,7 +1188,7 @@ def test_accumulation_matches_one_update_over_consecutive_batches(
     learner = training.Learner.__ray_metadata__.modified_class(
         batcher=Mock(),
         actor=Mock(),
-        config=training.Config(grad_accum_steps=4, parameter_sync_steps=3, temperature=0.7),
+        config=training.Config(batch_size=8, grad_accum_steps=4, parameter_sync_steps=3, temperature=0.7),
     )
     learner.mesh = jax.sharding.get_mesh()
     learner.state = jax.tree.map(jnp.copy, state)
@@ -1138,6 +1227,7 @@ def test_accumulation_averages_before_clipping_and_preserves_inactive_windows() 
     before = jax.tree.map(jnp.copy, state)
     state, metrics = training.update(state, {"weight": jnp.zeros(2)}, 4, False)  # (D,)
     assert float(metrics["train/skipped_update_fraction"]) == 1
+    assert "train/gradient_norm" not in metrics
     for actual, reference in zip(jax.tree.leaves(state), jax.tree.leaves(before), strict=True):
         np.testing.assert_array_equal(actual, reference)
     # Genuine zero gradients still apply momentum and decay when training signal was present.

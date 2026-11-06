@@ -293,10 +293,10 @@ and compare against a no-penalty baseline with the same mean-centering.
 Policy-loss reduction is a mean over unmasked sampled tokens per rollout, then
 across all rollouts; fully masked rollouts contribute zero. Monitor raw success and successful-rollout lengths together.
 
-`batch_size` counts rollouts per learner batch, replacing `num_groups`.
-The batcher pools completed, scored groups and returns exactly `batch_size` rollouts.
-A batch can mix groups or contain only part of one; unused rollouts remain for the
-next fetch. For example, `group_size: 8` and `batch_size: 3` produce two batches
+`batch_size` counts total rollouts per optimizer update. The batcher pools completed,
+scored groups and returns `batch_size // grad_accum_steps` rollouts per microbatch.
+A microbatch can mix groups or contain only part of one; unused rollouts remain for the
+next fetch. For example, `group_size: 8`, `batch_size: 3`, and `grad_accum_steps: 1` produce two microbatches
 of three from the first group, then a batch mixing its last two with the next group.
 Advantages are computed over the full group before splitting and remain unchanged.
 
@@ -337,6 +337,55 @@ Separate `train/rollout_log_prob_error_mean`, `train/rollout_importance_weight_m
 and `train/rollout_importance_weight_clipped_fraction` expose the anchor/rollout
 gap and applied correction. All policy diagnostics exclude skipped updates.
 
+### Opt-in StableReinforce-style loss
+
+Omit `stable_reinforce` (or set it to `null`) to keep the default GRPO objective.
+Enable the local score-centering implementation with `stable_reinforce: {}` or:
+
+```yaml
+stable_reinforce:
+  top_k: 32
+  kl_coeff: 0.01
+  kl_estimator: k1 # k1 or k3; kl_coeff: 0 disables the penalty.
+```
+
+This implements the public [top-k score-centering method](https://arxiv.org/html/2609.20807v1#S4.SS1)
+with a sampler-to-learner KL penalty following [Tinker's documented estimators](https://tinker-docs.thinkingmachines.ai/tinker/losses/stable-reinforce/).
+It is not an exact reproduction of Tinker's unpublished StableReinforce variant.
+It replaces PPO clipping and truncated importance weighting; `clip_coef` and
+`rollout_is_threshold` apply only to the default objective. No anchor forward pass
+is needed. Advantages, length penalties, gradient accumulation, and staleness masks
+retain their existing semantics. Losses average retained tokens per rollout, then
+all rollouts, with fully masked rows contributing zero.
+
+For sampler head H, learner probabilities p, and recorded sampler probabilities q:
+`rho = max(1-sum(q_H), 0) / max(1-sum(p_H), float32_epsilon)` and
+`correction = sum(stop_gradient(q_H-rho*p_H) * log(p_H))`.
+The policy loss is `-advantage * (log(p_sampled)-correction)`. The denominator floor
+handles heads whose learner mass rounds to one; the unrecorded sampler tail is
+approximated by the learner's conditional tail. `k1` adds
+`kl_coeff * (log(q_sampled)-log(p_sampled))`; `k3` adds
+`kl_coeff * (exp(d)-1-d)` with `d=clip(log(p_sampled)-log(q_sampled), -20, 20)`.
+This KL targets the sampling policy, not a reference model.
+
+The actor records K alternatives per generated token at sampling time, including
+across weight publications and tool turns. It requests K+1 log-probabilities because
+vLLM may put the sampled token first, and automatically raises the server's
+`--max-logprobs` limit. K must be positive and smaller than the model vocabulary.
+Two extra `(B, T, K)` arrays cost about `8*B*T*K` bytes per padded batch, plus
+rollout transport and checkpoint storage. Missing sampler information is rejected.
+
+With positive `kl_coeff`, retained tokens still contribute KL updates when their
+advantages are zero. `drop_degenerate_groups: true` continues to discard those
+groups before training; set it to false if they should contribute KL updates.
+Fully masked batches are skipped. The module docstring specifies the additional
+loss and sampler diagnostics; PPO-only diagnostics are omitted in this mode.
+Use a new `ckpt_dir` when changing `stable_reinforce`: resume requires matching
+settings and restores the recorded sampler arrays with buffered rollouts. Existing
+checkpoints without this setting continue to use GRPO.
+
+### Optimizer and learner execution
+
 Both finetuning modes use AdamW with reference defaults `learning_rate: 1e-6`,
 Optax's `beta1: 0.9`, `beta2: 0.999`, and `eps: 1e-8`, and `weight_decay: 0.0`
 (disabled). Set `weight_decay` in the YAML to any nonnegative value.
@@ -353,8 +402,8 @@ This is an approximate scaling rule; weight-decay scaling assumes equal numbers
 of processed rollouts across runs.
 
 `adamw_batch_size_scale` only scales the optimizer. Configure the actual batch separately:
-`batch_size` rollouts per batch and
-`batch_size * grad_accum_steps` rollouts per optimizer update.
+`batch_size` rollouts per optimizer update and
+`batch_size // grad_accum_steps` rollouts per microbatch.
 
 Set `finetuning: {mode: full}` to optimize all model weights, including
 embeddings, normalization, and the output head, with FP32 master weights and Adam
@@ -388,16 +437,21 @@ training parity. Preserve the actor's sampling scores as the rollout-correction 
 Temperature is restricted to `[0.01, 2.0]`; vLLM returns
 `processed_logprobs` with neutral top-p/top-k sampling, matching the learner.
 
-Each outer iteration fetches `grad_accum_steps` full rollout batches (default 1)
-in an inner loop, averages their gradients, and applies one optimizer update.
+Each outer iteration consumes `batch_size` rollouts in `grad_accum_steps` equal
+microbatches (default 1), averages their gradients, and applies one optimizer update.
 Clipping and AdamW apply once to the averaged gradient.
-Parameters remain fixed within each accumulation window. There is no splitting or
-repeated optimization of a batch; `update_epochs` and `minibatches_per_epoch` are unsupported.
-The full batch must fit in learner memory, and `learner_gpus` must divide
-`batch_size`.
+Parameters remain fixed within each accumulation window; each rollout is used once.
+`update_epochs` and `minibatches_per_epoch` are unsupported.
+Only one microbatch must fit in learner memory. `grad_accum_steps` must divide
+`batch_size`, and `learner_gpus` must divide the resulting microbatch size.
+For example, `batch_size: 32` and `grad_accum_steps: 16` use 16 microbatches of 2
+rollouts per update. With `parameter_sync_steps: 1`, weights publish after each
+32 rollouts when the update has training signal.
 
-Every batch counts toward the window. Batches with no unmasked sampled tokens carrying
-nonzero advantages contribute zero gradients and zero policy loss, and omit policy diagnostics.
+Every batch counts toward the window. Without an active StableReinforce KL penalty,
+batches with no unmasked sampled tokens carrying nonzero advantages contribute zero
+gradients and zero policy loss, and omit policy diagnostics. With a positive KL
+coefficient, retained tokens contribute KL gradients even when advantages are zero.
 Entirely inactive windows preserve parameters, Adam state, and the optimizer step.
 `train/gradient_norm` reports the averaged gradient's norm only when an optimizer update runs.
 `train/skipped_update_fraction` is 1 for an entirely inactive window, otherwise 0.
@@ -434,7 +488,7 @@ To check repeated NCCL publication on two GPUs, run
 The learner waits for the actor and vLLM to become ready before initializing its publisher.
 The initial weights are published before any rollouts. `parameter_sync_steps: 1`
 (default) publishes after every optimizer update; `3` publishes after every third
-optimizer update. With `grad_accum_steps: 4`, that is every 12 batches when all
+optimizer update. With `grad_accum_steps: 4`, that is every 12 microbatches when all
 windows are active. Both settings must be positive; no divisibility constraint applies.
 The former `parameter_sync_step` setting is now named `parameter_sync_steps`.
 Skipped optimizer updates do not advance the publication schedule. Publication runs
@@ -451,9 +505,11 @@ requires a shared local filesystem.
 `prefetch_batches: 0` (default) starts generation only when needed to fill the
 requested batch. Unused completed rollouts can still carry older weights into
 later batches. Positive `prefetch_batches: N` keeps up to
-`ceil((N + 1) * batch_size / group_size)` pending groups, with replacements
-queued as groups are consumed. The next ready group supplies the pool; simultaneous
-completions use submission order, without waiting for slower groups.
+`ceil(N * batch_size / group_size)` pending groups, with replacements
+queued as groups are consumed. Thus `batch_size: 32` and `prefetch_batches: 2`
+prefetch 64 rollouts independently of gradient accumulation. Capacity rounds up
+to whole groups; unused rollouts from a partially consumed group are retained separately.
+The next ready group supplies the pool; simultaneous completions use submission order, without waiting for slower groups.
 Degenerate groups are replaced before pooling when filtering is enabled.
 Generation is capped at the groups needed through the next checkpoint or
 `total_iterations`, accounting for buffered rollouts. Pending generation drains at

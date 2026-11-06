@@ -27,13 +27,13 @@ tasksets:
 seed: 1
 total_iterations: 1000
 
-batch_size: 1 # Rollouts per learner batch.
-group_size: 8 # verl rollout.n; 32 rollouts per batch.
-grad_accum_steps: 1 # Consecutive full batches averaged per optimizer update.
+batch_size: 32 # Total rollouts per optimizer update.
+grad_accum_steps: 16 # Microbatches per update: 32 / 16 = 2 rollouts each.
+group_size: 8 # Rollouts per task, scored together before microbatch splitting.
 
-prefetch_batches: 2 # Overlap collection and training; not verl's warmup/staleness controls.
-parameter_sync_steps: 1 # Optimizer updates between weight publications.
-max_staleness: 2 # Mask tokens older than eight weight publications.
+prefetch_batches: 2 # Prefetch 2 * 32 = 64 rollouts.
+parameter_sync_steps: 1 # Publish every optimizer update (32 consumed rollouts).
+max_staleness: 2 # Mask tokens older than two weight publications.
 
 # verl's off-policy threshold/drop strategy and minibatch streaming are unsupported.
 weight_update_pause_mode: keep

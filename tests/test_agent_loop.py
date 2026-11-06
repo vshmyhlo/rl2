@@ -106,6 +106,75 @@ def make_client(respond: Callable[[httpx.Request], httpx.Response | Awaitable[ht
     )
 
 
+def test_score_centering_multiturn_sampling(
+    tokenizer: PreTrainedTokenizerFast,
+    environment: AsyncMock,
+) -> None:
+    replies = iter(
+        [
+            '<tool_call>{"name":"go_to","arguments":{"receptacle":"shelf 1"}}</tool_call><|im_end|>',
+            "Done<|im_end|>",
+        ]
+    )
+    requests = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        payload = json.loads(request.content)
+        assert payload["sampling_params"]["logprobs"] == 3  # K plus the possible sampled-token entry.
+        response = response_for(tokenizer, next(replies))
+        for token in response["choices"][0]["logprobs"]["content"]:
+            token["top_logprobs"] = [
+                {"token_id": 2, "logprob": -3.0},
+                {"token_id": 1, "logprob": -1.5},
+                {"token_id": 0, "logprob": -1.0},
+            ]
+        return httpx.Response(200, json=response)
+
+    async def run() -> loop.Rollout:
+        async with make_client(respond) as client:
+            return await replace(make_agent(tokenizer, client), sampler_top_k=2).run(environment)
+
+    sequence = asyncio.run(run()).sequence
+    assert requests == 2
+    assert sequence.sampler_topk_ids.shape == sequence.sampler_topk_log_probs.shape == (len(sequence.token_ids), 2)
+    assert sequence.sampler_topk_ids.dtype == np.int32
+    assert sequence.sampler_topk_log_probs.dtype == np.float32
+    sampled = sequence.loss_mask  # (T,)
+    np.testing.assert_array_equal(sequence.sampler_topk_ids[sampled], np.tile([0, 1], (sampled.sum(), 1)))
+    np.testing.assert_allclose(sequence.sampler_topk_log_probs[sampled], np.tile([-1.0, -1.5], (sampled.sum(), 1)))
+    np.testing.assert_array_equal(sequence.sampler_topk_ids[~sampled], 0)
+    np.testing.assert_array_equal(sequence.sampler_topk_log_probs[~sampled], 0)
+    # Context inserted between model calls must not acquire sampling information.
+    positions = np.flatnonzero(sampled)  # (S,)
+    assert np.any(np.diff(positions) > 1)
+
+
+@pytest.mark.parametrize(
+    "alternatives",
+    [
+        [],
+        [{"token_id": 0, "logprob": -1.0}] * 2,
+        [{"token_id": -1, "logprob": -1.0}, {"token_id": 1, "logprob": -1.5}],
+        [{"token_id": 0, "logprob": -9999.0}, {"token_id": 1, "logprob": -1.5}],
+        [{"token_id": 0, "logprob": -0.1}, {"token_id": 1, "logprob": -0.1}],
+    ],
+    ids=["missing", "duplicates", "invalid-id", "missing-score", "mass-above-one"],
+)
+def test_invalid_sampler_topk(alternatives: list[dict[str, int | float]]) -> None:
+    choice = loop.CompletionChoice.model_validate(
+        {
+            "token_ids": [0],
+            "logprobs": {"content": [{"token_id": 0, "logprob": -1.0, "top_logprobs": alternatives}]},
+            "weight_versions": [{"version": "0", "start": 0, "end": 1}],
+            "finish_reason": "stop",
+        }
+    )
+    with pytest.raises(ValueError, match="[Ss]ampler|[Ss]core centering"):
+        loop.completion_topk(choice, 2)
+
+
 def make_agent(tokenizer: PreTrainedTokenizerFast, client: AsyncOpenAI) -> loop.Agent:
     return loop.Agent(
         client=client,
