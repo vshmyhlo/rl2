@@ -23,7 +23,12 @@ def main() -> None:
     parser.add_argument("--model-config", type=Path, required=True)
     parser.add_argument("--length", type=int, required=True, help="Padded transcript width, including the first token")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--donate-state", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--donate-state",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Donate running gradients during accumulation and optimizer state during updates",
+    )
     args = parser.parse_args()
     config = load_config(args.config, Config)
     model_config = Qwen3Config.from_dict(json.loads(args.model_config.read_text()))

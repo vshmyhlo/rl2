@@ -618,7 +618,7 @@ def compute_anchor_log_probs(
     batch: GRPOBatch[jax.Array],  # (B, T), (B,) leaves.
     temperature: float,
 ) -> jax.Array:  # (B, T-1)
-    """(B, T-1) detached learner scores frozen before the batch update.
+    """(B, T-1) detached learner scores for this batch's gradient computation.
 
     Skip scoring when no unmasked token has a nonzero advantage.
     """
@@ -782,7 +782,7 @@ def accumulate_gradients(
     static_argnames=("grad_accum_steps", "has_signal"),
     in_shardings=(PartitionSpec(), PartitionSpec()),
     out_shardings=PartitionSpec(),
-    donate_argnums=(0, 1),
+    donate_argnums=(0,),
 )
 def update(
     state: TrainState,
