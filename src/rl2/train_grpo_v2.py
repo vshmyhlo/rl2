@@ -4,33 +4,35 @@ Rollout generation needs no explicit lock around weight publication: vLLM's
 pause/resume mechanism queues new requests and handles in-flight requests
 according to weight_update_pause_mode.
 
-MLflow's metric step counts completed training iterations: one rollout batch,
-its optimizer updates, and any scheduled weight publications. All metrics below
+MLflow's metric step counts completed outer iterations: grad_accum_steps rollout batches,
+one attempted optimizer update, and any scheduled weight publication. All metrics below
 are logged every iteration except startup scalars, weight-transfer timing, checkpoint timing,
-unevaluated policy diagnostics, and taskset metrics absent from the batch.
+unevaluated policy diagnostics, gradient norms for skipped updates, and tasksets absent from the iteration.
 
 Startup scalars (at the restored iteration, or step 0 for a new run):
     model/parameters_billions: Model parameter count in billions.
     model/trainable_parameters_billions: Trainable parameter count in billions.
     learner/setup_seconds: Model/optimizer setup, checkpoint restore, and initial weight publication wall time.
 
-Optimization scalars (averaged over minibatches and update epochs):
+Optimization scalars (batch means averaged over the iteration unless noted):
     train/policy_loss: GRPO policy loss with decoupled PPO clipping and truncated rollout importance weights.
     train/approx_kl: Mean exp(log_ratio) - 1 - log_ratio, where log_ratio is current minus frozen pre-update learner log-probability, bounded to [-20, 20].
     train/clip_fraction: Fraction of current/anchor sampled-token probability ratios outside the PPO clip range.
     train/rollout_log_prob_error_mean: Mean absolute frozen learner minus rollout log-probability difference.
     train/rollout_importance_weight_mean: Mean applied token importance weight after safety bounding and truncation.
     train/rollout_importance_weight_clipped_fraction: Fraction of safety-bounded token weights above rollout_is_threshold.
-    train/gradient_norm: Global trainable-parameter gradient norm after microbatch averaging, before clipping.
-    train/skipped_update_fraction: Fraction of optimizer minibatches with no unmasked tokens carrying nonzero advantages.
-Loss and policy diagnostics average unmasked sampled tokens within each rollout, then all rollouts.
+    train/gradient_norm: Global norm of the window-averaged gradient before clipping; logged only when an optimizer update is applied.
+    train/skipped_update_fraction: Logged at accumulation boundaries: 1 if the entire window has no training signal and is skipped, otherwise 0.
+Loss and policy diagnostics average unmasked sampled tokens within each rollout, then all rollouts in each batch.
+Policy diagnostics average only evaluated batches and are omitted if none are evaluated.
 Fully masked rollouts contribute zero; importance weights do not change denominators.
-Skipped minibatches contribute zero to loss and gradient norm metrics.
-Policy diagnostics average only evaluated minibatches and are omitted when all updates are skipped.
+Batches with no unmasked tokens carrying nonzero advantages contribute zero policy loss and omit policy diagnostics.
+Every consumed batch counts toward grad_accum_steps; inactive batches contribute zero gradients.
+Gradients average equally across the window before clipping and AdamW; an entirely inactive window preserves optimizer state.
 
-Rollout batch scalars:
+Rollout scalars (pooled over all batches consumed in the iteration):
     rollout/reward_mean: Mean raw rollout reward.
-    rollout/reward_mean/<taskset_id>: Mean raw reward over retained batch rollouts from that configured taskset key; omitted if absent.
+    rollout/reward_mean/<taskset_id>: Mean raw reward over retained iteration rollouts from that configured taskset key; omitted if absent.
     rollout/reward_std: Population standard deviation of raw rollout rewards.
     rollout/reward_min: Minimum raw rollout reward.
     rollout/reward_max: Maximum raw rollout reward.
@@ -39,15 +41,15 @@ Rollout batch scalars:
     rollout/adjusted_reward_min: Minimum adjusted rollout reward.
     rollout/adjusted_reward_max: Maximum adjusted rollout reward.
     rollout/degenerate_group_fraction: Fraction of groups with identical adjusted rewards and zero advantages.
-    rollout/stop_fraction/<label>: Fraction of batch rollouts with each StopCondition.
+    rollout/stop_fraction/<label>: Fraction of iteration rollouts with each StopCondition.
     rollout/turns_mean: Mean model responses per rollout.
     rollout/input_tokens_mean: Mean context tokens appended per rollout, excluding sampled tokens.
     rollout/output_tokens_mean: Mean sampled tokens per rollout across all model calls.
     rollout/total_tokens_mean: Mean full transcript tokens per learner batch row, including context and sampled tokens, excluding padding.
-    batcher/token_utilization_fraction: Non-padding transcript tokens divided by batch size times padded sequence length.
-    batcher/padded_sequence_tokens: Padded sequence width chosen during batch construction, before the next-token shift.
-    batcher/skipped_groups: Groups discarded by drop_degenerate_groups while filling this batch, including prefetch.
-    batcher/stale_tokens: Sampled tokens masked from training by max_staleness in this batch.
+    batcher/token_utilization_fraction: Total non-padding transcript tokens divided by total padded token capacity across batches.
+    batcher/padded_sequence_tokens: Final consumed batch's padded sequence width, before the next-token shift.
+    batcher/skipped_groups: Groups discarded by drop_degenerate_groups while filling the iteration's batches, including prefetch.
+    batcher/stale_tokens: Sampled tokens masked from training by max_staleness across the iteration's batches.
     batcher/context_transcript_token_fraction: Context tokens divided by all non-padding transcript tokens.
     batcher/stale_transcript_token_fraction: Stale sampled tokens divided by all non-padding transcript tokens.
     batcher/masked_transcript_token_fraction: Context plus stale sampled tokens divided by all non-padding transcript tokens.
@@ -62,20 +64,20 @@ Weight-age metrics omit absent buckets and retain measured zeros for present buc
 All StopCondition labels are logged each iteration, including zero for absent labels.
 
 Training progress and settings:
-    train/iterations_total: Cumulative completed training iterations.
-    train/updates_total: Cumulative optimizer updates, excluding skipped minibatches.
+    train/iterations_total: Cumulative completed outer iterations, including entirely inactive windows.
+    train/updates_total: Cumulative optimizer updates, excluding skipped updates.
     train/rollouts_total: Cumulative rollouts used for training.
     train/learning_rate: Effective optimizer learning rate after AdamW batch-size scaling.
 
 Timing and throughput (logged every iteration unless noted):
     learner/iterations_per_second: Reciprocal of iteration wall time.
-    learner/rollouts_per_second: Batch rollout count divided by iteration wall time.
-    learner/output_tokens_per_second: Batch sampled-token count divided by iteration wall time.
+    learner/rollouts_per_second: All consumed rollouts divided by iteration wall time.
+    learner/output_tokens_per_second: All consumed sampled tokens divided by iteration wall time.
     actor/rollout_seconds_mean: Mean agent execution time per rollout, including model calls and environment steps.
-    batcher/fetch_rollout_seconds: Wall time waiting for this batch's groups, including actor return transfers; excludes prior prefetch time.
-    batcher/prepare_batch_seconds: Wall time preparing the CPU training arrays without explicit synchronization.
-    learner/batch_fetch_seconds: Wall time fetching the rollout batch, including generation, scoring, and Ray transfers.
-    learner/update_seconds: Device transfer and optimizer update wall time, excluding weight publication.
+    batcher/fetch_rollout_seconds: Sum of wall times waiting for each batch's groups, including actor return transfers; excludes prior prefetch time.
+    batcher/prepare_batch_seconds: Sum of CPU batch preparation wall times without explicit synchronization.
+    learner/batch_fetch_seconds: Sum of batch-fetch wall times, including generation, scoring, and Ray transfers.
+    learner/update_seconds: Sum of device transfer, gradient accumulation, and optimizer update wall times, excluding weight publication.
     learner/weight_transfer_seconds: Wall time publishing weights to vLLM; logged only on publication.
     learner/iteration_seconds: Batch fetching, optimization, and weight publication wall time.
     checkpoint/save_blocking_seconds: Blocking save dispatch wall time, including staging and any previous-save wait;
@@ -130,7 +132,7 @@ from rl2.alfworld_env import ALFWorldConfig, stream_alfworld_tasks
 from rl2.appworld_env import AppWorldConfig, stream_appworld_tasks
 from rl2.configuration import BaseConfig, load_config
 from rl2.grpo_v2.reasoning_gym import ReasoningGymConfig, stream_reasoning_gym_tasks
-from rl2.grpo_v2.state import LoRATrainState
+from rl2.grpo_v2.state import LoRATrainState, TrainParameters
 from rl2.grpo_v2.weight_transfer import full_weight_publisher, lora_weight_publisher
 from rl2.lm_envs.codegym.env import CodeGymConfig, stream_codegym_tasks
 from rl2.mlflow_logging import MLflowLogger
@@ -209,7 +211,8 @@ class Config(BaseConfig):
     num_groups: Annotated[int, Field(ge=1)] = 1
     group_size: Annotated[int, Field(ge=2)] = 4
     prefetch_batches: Annotated[int, Field(ge=0)] = 0  # Positive values trade policy staleness for overlap.
-    parameter_sync_step: Annotated[int, Field(ge=1)] = 1  # Completed training batches between weight publications.
+    grad_accum_steps: Annotated[int, Field(ge=1)] = 1  # Consecutive full batches per optimizer update.
+    parameter_sync_steps: Annotated[int, Field(ge=1)] = 1  # Completed optimizer updates between weight publications.
     max_staleness: Annotated[int, Field(ge=0)] = 100  # Allowed weight publications since each token was sampled.
     drop_degenerate_groups: bool = False
     length_penalty: LengthPenaltyConfig = LengthPenaltyConfig()
@@ -230,9 +233,6 @@ class Config(BaseConfig):
     clip_coef: Annotated[float, Field(gt=0, lt=1)] = 0.2
     rollout_is_threshold: Annotated[float, Field(gt=0)] = 2.0  # verl token-level truncated importance sampling.
     max_grad_norm: Annotated[float, Field(gt=0)] = 1.0
-    update_epochs: Annotated[int, Field(ge=1)] = 1
-    minibatches_per_epoch: Annotated[int, Field(ge=1)] = 4
-    grad_accum_steps: Annotated[int, Field(ge=1)] = 1
     attention_backend: AttentionBackend = "cudnn"  # Lower worst-case sampled-token error in the A100 vLLM audit.
     scan_layers: bool = True
     gradient_checkpointing: bool = True
@@ -247,10 +247,8 @@ class Config(BaseConfig):
     def __post_init__(self) -> None:
         if not any(entry.weight > 0 for entry in self.tasksets.values()):
             raise ValueError("tasksets must contain at least one positive weight")
-        if self.num_groups * self.group_size % (self.minibatches_per_epoch * self.grad_accum_steps):
-            raise ValueError("minibatches_per_epoch * grad_accum_steps must divide num_groups * group_size")
-        if self.num_groups * self.group_size % (self.minibatches_per_epoch * self.grad_accum_steps * self.learner_gpus):
-            raise ValueError("learner_gpus must divide the microbatch size")
+        if self.num_groups * self.group_size % self.learner_gpus:
+            raise ValueError("learner_gpus must divide num_groups * group_size")
 
     @property
     def adamw_kwargs(self) -> dict[str, float]:
@@ -271,7 +269,7 @@ DEFAULT_CONFIG = Config()
 @dataclass(frozen=True)
 class TrainingProgress:
     train_state: TrainState  # Trainable parameter/moment shapes; () optimizer step.
-    shuffle_key: jax.Array  # () typed base PRNG key, folded with the optimizer step.
+    shuffle_key: jax.Array  # () legacy PRNG key retained for checkpoint compatibility.
     iteration: int
     total_rollouts: int
     sampling_state: dict[str, Any]
@@ -425,11 +423,66 @@ class RolloutBatch:
     num_output_tokens: int
     examples: str
     timing_metrics: dict[str, float | int]
+    taskset_counts: dict[str, int] = field(default_factory=dict)
+
+
+class BatchGradientResult(NamedTuple):
+    gradient_sum: TrainParameters  # Parameter shapes.
+    metrics: dict[str, float]
+    has_signal: bool
 
 
 class CollectedGroup(NamedTuple):
     group: RolloutGroup
     skipped_groups: int
+
+
+class BatchSummary(NamedTuple):
+    metrics: dict[str, float]
+    num_rollouts: int
+    taskset_counts: dict[str, int]
+
+
+def summarize_iteration(batches: list[BatchSummary]) -> dict[str, float]:
+    """Combine rollout statistics without retaining the training arrays."""
+    result: dict[str, float] = {}
+    for name in sorted({name for batch in batches for name in batch.metrics}):
+        measurement = name.split("/")[1]
+        present = [batch for batch in batches if name in batch.metrics]
+        if name in ("batcher/skipped_groups", "batcher/stale_tokens"):
+            result[name] = sum(batch.metrics[name] for batch in present)
+        elif measurement.endswith("_min"):
+            result[name] = min(batch.metrics[name] for batch in present)
+        elif measurement.endswith("_max"):
+            result[name] = max(batch.metrics[name] for batch in present)
+        elif name == "batcher/padded_sequence_tokens":
+            result[name] = present[-1].metrics[name]
+        else:
+
+            def weight(batch: BatchSummary, name: str = name) -> float:
+                if name.startswith("rollout/reward_mean/"):
+                    return batch.taskset_counts.get(name.removeprefix("rollout/reward_mean/"), 0)
+                if "transcript_token_fraction" in name:
+                    return batch.metrics["rollout/total_tokens_mean"] * batch.num_rollouts
+                if name == "batcher/token_utilization_fraction":
+                    return batch.metrics["batcher/padded_sequence_tokens"] * batch.num_rollouts
+                return batch.num_rollouts
+
+            denominator = sum(weight(batch) for batch in batches)
+            if measurement.endswith("_std"):
+                mean_name = name.removesuffix("_std") + "_mean"
+                average = sum(batch.metrics[mean_name] * weight(batch) for batch in present) / denominator
+                variance = (
+                    sum(
+                        (batch.metrics[name] ** 2 + (batch.metrics[mean_name] - average) ** 2) * weight(batch)
+                        for batch in present
+                    )
+                    / denominator
+                )
+                result[name] = variance**0.5
+            else:
+                result[name] = sum(batch.metrics[name] * weight(batch) for batch in present) / denominator
+    return result
 
 
 def build_rollout_batch(
@@ -511,12 +564,12 @@ def build_rollout_batch(
         num_output_tokens=sum(rollout.num_output_tokens for rollout in rollouts),
         examples=format_rollout_examples(list(latest_examples.values())) if include_examples else "",
         timing_metrics=timing_metrics,
+        taskset_counts={name: len(values) for name, values in rewards_by_taskset.items()},
     )
 
 
 # Use a value alias so Ray can serialize script-defined actors without importing __main__.Metrics.
 Metrics = dict[str, jax.Array]  # Scalar leaves.
-TrainParameters = Parameters | LoRAParameters  # HF parameter shapes or (R, I), (O, R) factors.
 POLICY_DIAGNOSTICS = (
     "train/approx_kl",
     "train/clip_fraction",
@@ -556,39 +609,25 @@ def token_log_probs(
 
 @partial(
     jax.jit,
-    static_argnames=("microbatch_size", "temperature"),
+    static_argnames=("temperature",),
     in_shardings=(PartitionSpec(), PartitionSpec("batch")),
     out_shardings=PartitionSpec("batch"),
 )
 def compute_anchor_log_probs(
     state: TrainState,
     batch: GRPOBatch[jax.Array],  # (B, T), (B,) leaves.
-    microbatch_size: int,
     temperature: float,
 ) -> jax.Array:  # (B, T-1)
-    """(B, T-1) detached learner scores to reuse across all updates of this batch.
+    """(B, T-1) detached learner scores frozen before the batch update.
 
-    Use the optimizer's microbatch shape; skip scoring if all advantages are zero.
+    Skip scoring when no unmasked token has a nonzero advantage.
     """
     size, width = batch.token_ids.shape
-    if microbatch_size < 1 or size % microbatch_size:
-        raise ValueError("microbatch_size must be positive and divide the rollout batch size")
-    if microbatch_size % jax.sharding.get_abstract_mesh().shape["batch"]:
-        raise ValueError("learner device count must divide the microbatch size")
+    if size % jax.sharding.get_abstract_mesh().shape["batch"]:
+        raise ValueError("learner device count must divide the rollout batch size")
 
     def evaluate() -> jax.Array:  # (B, T-1)
-        microbatches = jax.tree.map(
-            lambda value: value.reshape(size // microbatch_size, microbatch_size, *value.shape[1:]), batch
-        )  # (M, B/M, T), (M, B/M); M = number of microbatches.
-        microbatches = jax.lax.with_sharding_constraint(
-            microbatches, PartitionSpec(None, "batch")
-        )  # (M, B/M, T), (M, B/M).
-
-        def score(microbatch: GRPOBatch[jax.Array]) -> jax.Array:  # (B/M, T), (B/M,) -> (B/M, T-1)
-            return token_log_probs(state, state.params, microbatch, temperature)  # (B/M, T-1)
-
-        scores = jax.lax.map(score, microbatches)  # (M, B/M, T-1)
-        return scores.reshape(size, width - 1)  # (B, T-1)
+        return token_log_probs(state, state.params, batch, temperature)  # (B, T-1)
 
     # No policy diagnostics are logged for an entirely skipped rollout batch.
     def skip() -> jax.Array:  # (B, T-1)
@@ -687,87 +726,81 @@ def create_state(
 
 @partial(
     jax.jit,
-    static_argnames=("grad_accum_steps", "temperature", "clip_coef", "rollout_is_threshold"),
-    in_shardings=(PartitionSpec(), PartitionSpec("batch"), PartitionSpec("batch")),
+    static_argnames=("temperature", "clip_coef", "rollout_is_threshold"),
+    in_shardings=(PartitionSpec(), PartitionSpec("batch"), PartitionSpec("batch"), PartitionSpec()),
     out_shardings=PartitionSpec(),
-    donate_argnums=(0,),
+    donate_argnums=(3,),
 )
-def update(
+def accumulate_gradients(
     state: TrainState,
-    batch: GRPOBatch[jax.Array],  # One optimizer minibatch: (B, T), (B,) leaves.
+    batch: GRPOBatch[jax.Array],  # Full rollout batch: (B, T), (B,) leaves.
     anchor_log_probs: jax.Array,  # (B, T-1) frozen learner scores aligned with batch rows.
-    grad_accum_steps: int,
+    gradient_sum: TrainParameters,  # Parameter shapes; the running sum for this outer iteration.
     temperature: float,
     clip_coef: float,
     rollout_is_threshold: float = 2.0,
-) -> tuple[TrainState, Metrics]:
-    """Accumulate microbatch gradients and apply one optimizer step.
-
-    Donates state buffers; skips when no unmasked token has a nonzero advantage. Requires a
-    `batch` mesh context and positional arguments for the sharded JIT inputs.
-    """
-    if grad_accum_steps < 1 or batch.token_ids.shape[0] % grad_accum_steps:
-        raise ValueError("grad_accum_steps must be positive and divide the minibatch size")
-    if batch.token_ids.shape[0] % (grad_accum_steps * jax.sharding.get_abstract_mesh().shape["batch"]):
-        raise ValueError("learner device count must divide the microbatch size")
+) -> tuple[TrainParameters, Metrics]:
+    """Add one full batch's gradients, donating the running sum and preserving state."""
+    if batch.token_ids.shape[0] % jax.sharding.get_abstract_mesh().shape["batch"]:
+        raise ValueError("learner device count must divide the rollout batch size")
     # Python logging runs on tracing, not on cached executions.
     logger.info(
-        "JIT trace update: batch_shape=%s grad_accum_steps=%s temperature=%s clip_coef=%s",
+        "JIT trace accumulate_gradients: batch_shape=%s temperature=%s clip_coef=%s",
         batch.token_ids.shape,
-        grad_accum_steps,
         temperature,
         clip_coef,
     )
 
-    def apply_update() -> tuple[TrainState, Metrics]:
-        microbatch_size = batch.token_ids.shape[0] // grad_accum_steps
-        microbatches = jax.tree.map(
-            lambda value: value.reshape(grad_accum_steps, microbatch_size, *value.shape[1:]), (batch, anchor_log_probs)
-        )  # Batch (A, B/A, T), (A, B/A); anchors (A, B/A, T-1). A = grad_accum_steps.
-        microbatches = jax.lax.with_sharding_constraint(
-            microbatches, PartitionSpec(None, "batch")
-        )  # Batch (A, B/A, T), (A, B/A); anchors (A, B/A, T-1); shard examples within each microbatch.
+    def compute_gradients() -> tuple[TrainParameters, Metrics]:
+        def loss_fn(params: TrainParameters) -> tuple[jax.Array, Metrics]:  # Parameter leaves -> (), scalars.
+            return objective(
+                token_log_probs(state, params, batch, temperature),
+                batch,
+                anchor_log_probs,
+                clip_coef,
+                rollout_is_threshold,
+            )
 
-        def accumulate(
-            grads: TrainParameters,  # HF parameter shapes or (R, I), (O, R) factors.
-            inputs: tuple[GRPOBatch[jax.Array], jax.Array],  # Batch (B/A, T), (B/A,); anchors (B/A, T-1).
-        ) -> tuple[TrainParameters, Metrics]:
-            microbatch, anchors = inputs  # Batch (B/A, T), (B/A,); anchors (B/A, T-1).
-
-            def loss_fn(params: TrainParameters) -> tuple[jax.Array, Metrics]:  # Parameter leaves -> (), scalars.
-                return objective(
-                    token_log_probs(state, params, microbatch, temperature),
-                    microbatch,
-                    anchors,
-                    clip_coef,
-                    rollout_is_threshold,
-                )
-
-            (_, metrics), gradient = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-            return jax.tree.map(jnp.add, grads, gradient), metrics  # Parameter shapes; scalar metrics.
-
-        gradients, metrics = jax.lax.scan(
-            accumulate, jax.tree.map(jnp.zeros_like, state.params), microbatches
-        )  # Parameter shapes; metric leaves: (A,).
-        gradients = jax.tree.map(lambda value: value / grad_accum_steps, gradients)  # Parameter shapes.
+        (_, metrics), gradients = jax.value_and_grad(loss_fn, has_aux=True)(state.params)  # Scalars; parameter shapes.
         gradients = jax.lax.with_sharding_constraint(gradients, PartitionSpec())  # Parameter shapes.
-        metrics = jax.tree.map(jnp.mean, metrics)  # Scalar leaves.
-        metrics["train/gradient_norm"] = optax.global_norm(gradients)  # () Before clipping.
-        metrics["train/skipped_update_fraction"] = jnp.asarray(0.0, dtype=jnp.float32)  # ()
-        return state.apply_gradients(grads=gradients), metrics
+        return jax.tree.map(jnp.add, gradient_sum, gradients), metrics  # Parameter shapes; scalar metrics.
 
-    def skip_update() -> tuple[TrainState, Metrics]:
+    def skip_gradients() -> tuple[TrainParameters, Metrics]:
         # Fixed JIT output structure; optimize excludes unevaluated policy diagnostics from logging.
-        return state, {
+        return gradient_sum, {  # Parameter shapes; scalar metrics.
             "train/policy_loss": jnp.asarray(0.0, dtype=jnp.float32),  # ()
             **{name: jnp.asarray(0.0, dtype=jnp.float32) for name in POLICY_DIAGNOSTICS},  # () Not evaluated.
-            "train/gradient_norm": jnp.asarray(0.0, dtype=jnp.float32),  # ()
-            "train/skipped_update_fraction": jnp.asarray(1.0, dtype=jnp.float32),  # ()
         }
 
     return jax.lax.cond(
-        jnp.any((batch.advantages != 0) & jnp.any(batch.loss_mask[:, 1:], axis=1)), apply_update, skip_update
+        jnp.any((batch.advantages != 0) & jnp.any(batch.loss_mask[:, 1:], axis=1)), compute_gradients, skip_gradients
     )
+
+
+@partial(
+    jax.jit,
+    static_argnames=("grad_accum_steps", "has_signal"),
+    in_shardings=(PartitionSpec(), PartitionSpec()),
+    out_shardings=PartitionSpec(),
+    donate_argnums=(0, 1),
+)
+def update(
+    state: TrainState,
+    gradient_sum: TrainParameters,  # Parameter shapes; summed gradients from the inner loop.
+    grad_accum_steps: int,
+    has_signal: bool,
+) -> tuple[TrainState, Metrics]:
+    """Average the accumulated gradients, then clip and apply one optimizer update."""
+    if not has_signal:
+        return state, {
+            "train/gradient_norm": jnp.asarray(0.0, jnp.float32),  # () Internal placeholder, omitted from logging.
+            "train/skipped_update_fraction": jnp.asarray(1.0, jnp.float32),  # ()
+        }
+    gradients = jax.tree.map(lambda value: value / grad_accum_steps, gradient_sum)  # Parameter shapes.
+    return state.apply_gradients(grads=gradients), {
+        "train/gradient_norm": optax.global_norm(gradients),  # () Before clipping.
+        "train/skipped_update_fraction": jnp.asarray(0.0, jnp.float32),  # ()
+    }
 
 
 def score_group(
@@ -1022,9 +1055,11 @@ class Batcher:
         if num_groups < 1:
             raise ValueError("num_groups must be at least 1")
         started = time.monotonic()
-        batches_until_drain = (-iteration) % self.config.checkpoint_interval
+        batches_until_drain = (-iteration) % (self.config.checkpoint_interval * self.config.grad_accum_steps)
         if self.config.total_iterations is not None:
-            batches_until_drain = min(batches_until_drain, max(0, self.config.total_iterations - iteration))
+            batches_until_drain = min(
+                batches_until_drain, max(0, self.config.total_iterations * self.config.grad_accum_steps - iteration)
+            )
         if self.config.prefetch_batches == 0:
             batches_until_drain = 0
         groups_until_drain = (batches_until_drain + 1) * num_groups
@@ -1173,29 +1208,66 @@ class Learner:
                     root=True,
                 ):
                     started = time.monotonic()
-                    with span("learner.fetch_batch"):
-                        batch = self.fetch_next_batch(iteration=iteration)
-                    fetched = time.monotonic()
-                    with span("learner.optimize"):
-                        update_metrics = self.optimize(batch.training_batch)
+                    summaries: list[BatchSummary] = []
+                    update_history: dict[str, list[float]] = defaultdict(list)
+                    timing_metrics: Counter[str] = Counter()
+                    stop_counts: Counter[StopCondition] = Counter()
+                    num_rollouts = 0
+                    num_output_tokens = 0
+                    fetch_seconds = 0.0
+                    update_seconds = 0.0
+                    previous = started
+                    gradient_sum = jax.tree.map(jnp.zeros_like, self.state.params)  # Parameter shapes.
+                    has_signal = False
+                    for accumulation_step in range(self.config.grad_accum_steps):
+                        batch_iteration = (iteration - 1) * self.config.grad_accum_steps + accumulation_step + 1
+                        with span("learner.fetch_batch"):
+                            batch = self.fetch_next_batch(iteration=batch_iteration)
+                        fetched = time.monotonic()
+                        with span("learner.optimize"):
+                            result = self.optimize(batch.training_batch, gradient_sum)
+                            gradient_sum = result.gradient_sum  # Parameter shapes.
+                            has_signal |= result.has_signal
+                            for name, value in result.metrics.items():
+                                update_history[name].append(value)
+                        optimized = time.monotonic()
+                        fetch_seconds += fetched - previous
+                        update_seconds += optimized - fetched
+                        previous = optimized
+                        batch_rollouts = batch.training_batch.token_ids.shape[0]
+                        num_rollouts += batch_rollouts
+                        num_output_tokens += batch.num_output_tokens
+                        summaries.append(
+                            BatchSummary(
+                                metrics=batch.rollout_metrics,
+                                num_rollouts=batch_rollouts,
+                                taskset_counts=batch.taskset_counts,
+                            )
+                        )
+                        timing_metrics.update(batch.timing_metrics)
+                        stop_counts.update(batch.stop_counts)
+                    with span("learner.apply_update"):
+                        optimizer_metrics = self.apply_update(gradient_sum, has_signal=has_signal)
+                    applied = time.monotonic()
+                    update_seconds += applied - optimized
+                    optimized = applied
                     total_updates = int(self.state.step)
-                    optimized = time.monotonic()
-                    sync_due = iteration % self.config.parameter_sync_step == 0
+                    sync_due = total_updates % self.config.parameter_sync_steps == 0
                     publish = sync_due and total_updates != published_step
                     if publish:
                         self.publish_weights()
                         self.weight_version += 1
                         published_step = total_updates
                     now = time.monotonic()
-                    num_rollouts = batch.training_batch.token_ids.shape[0]
                     total_rollouts += num_rollouts
                     seconds = max(now - started, 1e-9)
                     scalars = {
-                        **update_metrics,
-                        **batch.timing_metrics,
-                        **batch.rollout_metrics,
+                        **{name: mean(values) for name, values in update_history.items()},
+                        **optimizer_metrics,
+                        **timing_metrics,
+                        **summarize_iteration(summaries),
                         **{
-                            f"rollout/stop_fraction/{condition}": batch.stop_counts.get(condition, 0) / num_rollouts
+                            f"rollout/stop_fraction/{condition}": stop_counts.get(condition, 0) / num_rollouts
                             for condition in get_args(StopCondition)
                         },
                         "train/iterations_total": iteration,
@@ -1204,9 +1276,9 @@ class Learner:
                         "train/rollouts_total": total_rollouts,
                         "learner/iterations_per_second": 1 / seconds,
                         "learner/rollouts_per_second": num_rollouts / seconds,
-                        "learner/output_tokens_per_second": batch.num_output_tokens / seconds,
-                        "learner/batch_fetch_seconds": fetched - started,
-                        "learner/update_seconds": optimized - fetched,
+                        "learner/output_tokens_per_second": num_output_tokens / seconds,
+                        "learner/batch_fetch_seconds": fetch_seconds,
+                        "learner/update_seconds": update_seconds,
                         "learner/iteration_seconds": now - started,
                     }
                     if publish:
@@ -1257,59 +1329,48 @@ class Learner:
                 context_length=self.model.config.max_position_embeddings,
                 iteration=iteration,
                 consumption_weight_version=self.weight_version,
-                include_examples=iteration % self.config.example_log_interval == 0,
+                include_examples=(
+                    iteration % self.config.grad_accum_steps == 0
+                    and ((iteration - 1) // self.config.grad_accum_steps + 1) % self.config.example_log_interval == 0
+                ),
             )
         )
 
     def publish_weights(self) -> None:
         self._publish_weights(self.weight_version + 1)
 
-    def optimize(self, batch: GRPOBatch[np.ndarray]) -> dict[str, float]:  # Batch leaves: (B, T), (B,).
-        """Freeze anchors once, then update shuffled minibatches across all epochs.
-
-        Return mean update metrics, excluding skipped updates from policy diagnostics.
-        """
-        if batch.token_ids.shape[0] % self.config.minibatches_per_epoch:
-            raise ValueError("minibatches_per_epoch must divide the rollout batch size")
-        minibatch_size = batch.token_ids.shape[0] // self.config.minibatches_per_epoch
-        if minibatch_size % (self.config.grad_accum_steps * self.mesh.size):
-            raise ValueError("grad_accum_steps * learner device count must divide the minibatch size")
+    def optimize(
+        self,
+        batch: GRPOBatch[np.ndarray],  # (B, T), (B,) leaves.
+        gradient_sum: TrainParameters,  # Parameter shapes.
+    ) -> BatchGradientResult:
+        """Accumulate one batch without changing parameters or optimizer state."""
+        if batch.token_ids.shape[0] % self.mesh.size:
+            raise ValueError("learner device count must divide the rollout batch size")
         batched = NamedSharding(self.mesh, PartitionSpec("batch"))
         device_batch: GRPOBatch[jax.Array] = jax.device_put(batch, batched)  # (B, T), (B,) leaves.
-        anchors = compute_anchor_log_probs(
-            self.state, device_batch, minibatch_size // self.config.grad_accum_steps, self.config.temperature
-        )  # (B, T-1), computed before any donated optimizer state is changed.
-        history: list[Metrics] = []
-        for _ in range(self.config.update_epochs):
-            key = jax.random.fold_in(self.shuffle_key, self.state.step)  # () typed PRNG key.
-            permutation = jax.random.permutation(key, batch.token_ids.shape[0])  # (B,)
-            shuffled = jax.tree.map(
-                lambda value, permutation=permutation: value[permutation], (device_batch, anchors)
-            )  # Batch (B, T), (B,); frozen anchors (B, T-1).
-            for start in range(0, batch.token_ids.shape[0], minibatch_size):
-                minibatch = jax.tree.map(
-                    lambda value, start=start: value[start : start + minibatch_size], shuffled
-                )  # Batch (B/N, T), (B/N,); anchors (B/N, T-1); N = minibatches_per_epoch.
-                minibatch, minibatch_anchors = jax.device_put(minibatch, batched)  # Batch leaves; (B/N, T-1).
-                self.state, metrics = update(
-                    self.state,
-                    minibatch,
-                    minibatch_anchors,
-                    self.config.grad_accum_steps,
-                    self.config.temperature,
-                    self.config.clip_coef,
-                    self.config.rollout_is_threshold,
-                )
-                history.append(metrics)
-        metrics = jax.tree.map(lambda *values: jnp.stack(values).sum(), *history)  # Scalar leaves.
-        totals = {name: float(value) for name, value in metrics.items()}
-        scalars = {name: value / len(history) for name, value in totals.items()}
-        evaluated = len(history) - totals["train/skipped_update_fraction"]
-        for name in POLICY_DIAGNOSTICS:
-            if evaluated:
-                scalars[name] = totals[name] / evaluated
-            else:
+        anchors = compute_anchor_log_probs(self.state, device_batch, self.config.temperature)  # (B, T-1)
+        gradient_sum, metrics = accumulate_gradients(
+            self.state,
+            device_batch,
+            anchors,
+            gradient_sum,
+            self.config.temperature,
+            self.config.clip_coef,
+            self.config.rollout_is_threshold,
+        )  # Parameter shapes; scalar metrics.
+        scalars = {name: float(value) for name, value in metrics.items()}
+        has_signal = bool(np.any((batch.advantages != 0) & np.any(batch.loss_mask[:, 1:], axis=1)))
+        if not has_signal:
+            for name in POLICY_DIAGNOSTICS:
                 del scalars[name]
+        return BatchGradientResult(gradient_sum=gradient_sum, metrics=scalars, has_signal=has_signal)
+
+    def apply_update(self, gradient_sum: TrainParameters, *, has_signal: bool) -> dict[str, float]:  # Parameter shapes.
+        self.state, metrics = update(self.state, gradient_sum, self.config.grad_accum_steps, has_signal)
+        scalars = {name: float(value) for name, value in metrics.items()}
+        if not has_signal:
+            del scalars["train/gradient_norm"]
         return scalars
 
 

@@ -170,7 +170,7 @@ cancellation terminate it. Keep task settings and seed unchanged when resuming.
 Ray reserves one GPU for the actor's vLLM server and `learner_gpus` GPUs for the
 learner (default 1). Multi-GPU training uses fully replicated data parallelism:
 base weights, LoRA factors, and optimizer state are replicated on every learner
-GPU; each microbatch is split across those GPUs, with gradients averaged globally.
+GPU; each full batch is split across those GPUs, with gradients averaged globally.
 The JIT update declares input/output `PartitionSpec`s and runs inside the learner's
 `jax.set_mesh` context; direct callers must also provide a mesh context with a `batch` axis.
 Set `learner_gpus` in the YAML and expose at least `learner_gpus + 1` GPUs.
@@ -310,8 +310,8 @@ capped at the model context length. Oversized transcripts are rejected.
 GRPO uses [verl-style decoupled token-TIS](https://verl.readthedocs.io/en/latest/algo/rollout_corr.html#decoupled-mode-with-token-level-importance-sampling-decoupled-token-is),
 averaged over unmasked sampled tokens within each rollout and then across all rollouts.
 Before optimizing each batch, the learner scores its transcripts once using the
-optimizer's microbatch shape and temperature. These anchor scores stay fixed
-across all minibatches and epochs; the original vLLM sampling scores are retained.
+optimizer's full batch shape and temperature. These anchor scores stay fixed
+during the update; the original vLLM sampling scores are retained.
 For each unmasked sampled token:
 
 - PPO ratio: `r = exp(clip(current_logp - anchor_logp, -20, 20))`.
@@ -329,7 +329,7 @@ retains gradients; rollout correction still weights those gradients.
 `train/approx_kl` and `train/clip_fraction` measure current-versus-anchor drift.
 Separate `train/rollout_log_prob_error_mean`, `train/rollout_importance_weight_mean`,
 and `train/rollout_importance_weight_clipped_fraction` expose the anchor/rollout
-gap and applied correction. All policy diagnostics exclude skipped minibatches.
+gap and applied correction. All policy diagnostics exclude skipped updates.
 
 Both finetuning modes use AdamW with reference defaults `learning_rate: 1e-6`,
 Optax's `beta1: 0.9`, `beta2: 0.999`, and `eps: 1e-8`, and `weight_decay: 0.0`
@@ -347,8 +347,8 @@ This is an approximate scaling rule; weight-decay scaling assumes equal numbers
 of processed rollouts across runs.
 
 `adamw_batch_size_scale` only scales the optimizer. Configure the actual batch separately:
-`num_groups * group_size / minibatches_per_epoch` rollouts per update.
-Changing only `grad_accum_steps` does not change that batch size.
+`num_groups * group_size` rollouts per batch and
+`num_groups * group_size * grad_accum_steps` rollouts per optimizer update.
 
 Set `finetuning: {mode: full}` to optimize all model weights, including
 embeddings, normalization, and the output head, with FP32 master weights and Adam
@@ -382,15 +382,27 @@ training parity. Preserve the actor's sampling scores as the rollout-correction 
 Temperature is restricted to `[0.01, 2.0]`; vLLM returns
 `processed_logprobs` with neutral top-p/top-k sampling, matching the learner.
 
-Each iteration makes `update_epochs` passes with `minibatches_per_epoch` optimizer
-minibatches per pass. `grad_accum_steps` splits each minibatch into microbatches.
-Minibatches with no unmasked sampled tokens carrying nonzero advantages skip forward/backward computation and preserve
-parameters, Adam state, and the optimizer step. `train/skipped_update_fraction` reports the
-skipped fraction. Skipped minibatches contribute zero to policy loss and gradient norm.
-Policy diagnostics average only evaluated minibatches and are omitted when all updates are skipped.
-`minibatches_per_epoch * grad_accum_steps` must divide `num_groups * group_size`.
-The resulting microbatch size must also be divisible by `learner_gpus`.
-Shuffling uses the saved seed and optimizer step. The learner selects a context-managed
+Each outer iteration fetches `grad_accum_steps` full rollout batches (default 1)
+in an inner loop, averages their gradients, and applies one optimizer update.
+Clipping and AdamW apply once to the averaged gradient.
+Parameters remain fixed within each accumulation window. There is no splitting or
+repeated optimization of a batch; `update_epochs` and `minibatches_per_epoch` are unsupported.
+The full batch must fit in learner memory, and `learner_gpus` must divide
+`num_groups * group_size`.
+
+Every batch counts toward the window. Batches with no unmasked sampled tokens carrying
+nonzero advantages contribute zero gradients and zero policy loss, and omit policy diagnostics.
+Entirely inactive windows preserve parameters, Adam state, and the optimizer step.
+`train/gradient_norm` reports the averaged gradient's norm only when an optimizer update runs.
+`train/skipped_update_fraction` is 1 for an entirely inactive window, otherwise 0.
+`total_iterations`, checkpoint intervals, example intervals, and metric steps count
+outer iterations. Checkpoints and normal training completion occur after the inner loop.
+Rollout statistics pool all consumed batches; policy diagnostics average the evaluated
+batches, while policy loss also includes zero contributions from inactive batches.
+Accumulation buffers are local to the inner loop and are not checkpointed.
+`grad_accum_steps` may change when resuming at an iteration boundary.
+
+The learner selects a context-managed
 publisher from `grpo_v2/weight_transfer.py` at startup. Both modes expose the same
 callable, read the current parameters on every call, and own their HTTP and transfer
 resources. Publication runs in the learner; the actor handles rollouts.
@@ -414,13 +426,15 @@ learner and checkpoints. The NCCL group is closed when the learner exits.
 To check repeated NCCL publication on two GPUs, run
 `QWEN3_VLLM_TESTS=1 CUDA_VISIBLE_DEVICES=0 QWEN3_VLLM_DEVICE=1 uv run pytest tests/test_qwen3_vllm.py -k nccl_full_weight_publication`.
 The learner waits for the actor and vLLM to become ready before initializing its publisher.
-The initial weights are published before any rollouts. `parameter_sync_step: 1`
-(default) publishes after each training batch; `4` publishes every fourth batch,
-regardless of PPO minibatch count or update epochs. All completed batches count,
-including batches with skipped updates. Scheduled publication runs only if the
-optimizer step has advanced since the last publication. The cumulative iteration
-count preserves the schedule across restarts. Startup and resume also publish
-immediately. Checkpoints and training completion do not force an extra publication
+The initial weights are published before any rollouts. `parameter_sync_steps: 1`
+(default) publishes after every optimizer update; `3` publishes after every third
+optimizer update. With `grad_accum_steps: 4`, that is every 12 batches when all
+windows are active. Both settings must be positive; no divisibility constraint applies.
+The former `parameter_sync_step` setting is now named `parameter_sync_steps`.
+Skipped optimizer updates do not advance the publication schedule. Publication runs
+when the cumulative optimizer update count reaches a multiple of `parameter_sync_steps`
+and has advanced since the last publication. This schedule is preserved across restarts.
+Startup and resume also publish immediately. Checkpoints and training completion do not force an extra publication
 before the interval ends.
 `learner/weight_transfer_seconds` is omitted when no publication runs;
 `learner/update_seconds` excludes publication time.
@@ -429,7 +443,7 @@ temporary directory after the blocking weight update returns, including on failu
 The loaded weights stay in vLLM memory. This trainer runs on one host; LoRA also
 requires a shared local filesystem.
 `prefetch_batches: 0` (default) collects each batch without overlapping training,
-avoiding weight changes within a rollout. With `parameter_sync_step: 1`, each
+avoiding weight changes within a rollout. With `parameter_sync_steps: 1`, each
 batch uses the latest learner weights; longer sync intervals can retain older weights.
 Positive `prefetch_batches: N` maintains a fixed pool of `(N + 1) * num_groups`
 pending rollout groups. Every popped group, whether accepted or stale, immediately
@@ -517,11 +531,12 @@ measures save dispatch, including staging and any previous-save wait, excluding
 the new checkpoint's background writes.
 Prefetching drains before periodic and final checkpoints so the saved sampling
 state does not skip unconsumed batches. Restarting with the same directory restores model weights (including LoRA factors in LoRA mode),
-optimizer state, shuffle key, task RNG, round-robin scores, and progress counters. `total_iterations` is a cumulative
+optimizer state, shuffle key, task RNG,
+round-robin scores, and progress counters. `total_iterations` is a cumulative
 target; `null` runs until interrupted. Environments restart fresh, so resumption
 is not bit-for-bit reproducible. Use a new directory for a fresh experiment or
-incompatible model changes. Checkpoints require matching `model` and `finetuning`.
-This includes `rank` and `alpha` for LoRA. Existing version 2 checkpoints with
+incompatible model changes. Checkpoints require matching `model` and `finetuning`,
+including `rank` and `alpha` for LoRA. Existing version 2 checkpoints with
 a string `finetuning_mode` and top-level LoRA settings remain supported; those without
 `finetuning_mode` are treated as LoRA. Legacy version 1
 checkpoints cannot be resumed. Use a new `ckpt_dir` when switching modes.

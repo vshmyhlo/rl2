@@ -29,13 +29,10 @@ total_iterations: 1000
 
 num_groups: 4 # verl data.train_batch_size (task groups).
 group_size: 8 # verl rollout.n; 32 rollouts per batch.
-grad_accum_steps: 32 # One rollout per microbatch.
-
-update_epochs: 1
-minibatches_per_epoch: 1 # One optimizer update per epoch, using all 32 rollouts.
+grad_accum_steps: 1 # Consecutive full batches averaged per optimizer update.
 
 prefetch_batches: 2 # Overlap collection and training; not verl's warmup/staleness controls.
-parameter_sync_step: 1 # Publish every fourth training batch if weights have changed.
+parameter_sync_steps: 1 # Optimizer updates between weight publications.
 max_staleness: 2 # Mask tokens older than eight weight publications.
 
 # verl's off-policy threshold/drop strategy and minibatch streaming are unsupported.
@@ -48,7 +45,7 @@ max_tokens: 8192 # Total transcript tokens, including system, prompt, and tools.
 max_turns: 50
 rollout_timeout: 1200
 environment_timeout: 600
-run_id: grpo_v2_alfworld_${path_name:${model}}_${finetuning.mode}_${attention_backend}_s${seed}_lr${learning_rate}_adamw_scale${adamw_batch_size_scale}_ng${num_groups}_gs${group_size}_mb${minibatches_per_epoch}_ddg${drop_degenerate_groups}_pf${prefetch_batches}_next_ready_ps${parameter_sync_step}_ms${max_staleness}_success_lp${length_penalty.reference_tokens}_${length_penalty.penalty}
+run_id: grpo_v2_alfworld_${path_name:${model}}_${finetuning.mode}_${attention_backend}_s${seed}_lr${learning_rate}_adamw_scale${adamw_batch_size_scale}_ng${num_groups}_gs${group_size}_ddg${drop_degenerate_groups}_pf${prefetch_batches}_next_ready_ps${parameter_sync_steps}_ms${max_staleness}_success_lp${length_penalty.reference_tokens}_${length_penalty.penalty}
 ckpt_dir: /runs/grpo_v2/${run_id} # Checkpoints and profiling artifacts.
 checkpoint_interval: 50
 example_log_interval: 50

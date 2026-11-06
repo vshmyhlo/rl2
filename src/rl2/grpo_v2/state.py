@@ -5,6 +5,8 @@ from flax.training.train_state import TrainState
 
 from rl2.qwen3 import LoRAParameters, Parameters
 
+type TrainParameters = Parameters | LoRAParameters
+
 
 class LoRATrainState(TrainState):
     params: LoRAParameters  # Trainable (R, I) and (O, R) leaves.

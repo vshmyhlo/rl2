@@ -64,7 +64,11 @@ def test_checkpoint_roundtrip_and_retention(tmp_path: Path, progress: training.T
         assert metadata["config"] == json.loads(json.dumps(asdict(config)))
         assert "stop_conditions" not in metadata
         restored = training.restore_checkpoint(
-            manager, fresh, replace(config, seed=99, total_iterations=5, checkpoint_interval=2)
+            manager,
+            fresh,
+            replace(
+                config, seed=99, total_iterations=5, checkpoint_interval=2, grad_accum_steps=4, parameter_sync_steps=3
+            ),
         )
         assert restored is not None
         assert restored.iteration == 2

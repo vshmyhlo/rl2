@@ -1,0 +1,51 @@
+# Large Kinetix hard grasping level with symbolic observations and continuous control.
+# Run: uv run ppo --config configs/ppo/kinetix/large/grasp_hard.yaml
+env:
+  id: Kinetix
+  action_type: continuous
+  size: l
+  levels: [l/grasp_hard.json] # null samples a new procedural level at each reset
+  max_steps: 256 # Agent steps, each advancing frame_skip physics steps
+  frame_skip: 2
+  downscale: 4 # Evaluation videos only: 500 / 4 = 125 pixels per side
+  dense_reward_scale: 0.1 # Reward progress toward the goal
+seed: 1
+total_steps: 10_000_000 # Environment steps summed across environments; only full rollouts run
+num_envs: 32
+num_steps: 256 # 8192 environment steps per iteration; full episode-length sequences
+num_minibatches: 4 # 8 whole recurrent sequences per minibatch
+update_epochs: 8
+model:
+  continuous_policy: truncated_gaussian
+  encoder:
+    type: kinetix
+    hidden_size: 256
+    embedding_size: 256
+  recurrent:
+    type: lstm
+    hidden_size: 256
+bf16: false # Keep symbolic features and continuous-control heads in float32
+learning_rate: 0.0003
+anneal_lr: true
+lr_decay: linear
+gamma: 0.995 # Longer credit horizon for coordinated control
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: 0.01
+entropy_coef: 0.001 # Modest exploration bonus for the continuous action distribution
+entropy_decay: cosine # Reduce exploration late in training
+value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
+max_grad_norm: 0.5
+ckpt_dir: /runs/ppo/${run_id}
+run_id: ppo_${path_name:${env.id}}_${path_name:${env.levels.0}}_${model.continuous_policy}_seed${seed}
+# All intervals count completed PPO iterations (one rollout and its updates).
+# Checkpoints every 5% and eval every 20% of planned iterations, rounded up.
+# Evaluation (including GIF recording), checkpoints, and logging also run on completion.
+checkpoint_interval: 61
+log_interval: 10
+video_interval: 0 # Record videos only during evaluation
+video_max_frames: 257 # Initial frame plus the 256-step episode limit
+video_fps: 30.0 # 60 Hz physics / frame_skip 2
+eval_interval: 244
+eval_episodes: 10
+eval_seed: 10000

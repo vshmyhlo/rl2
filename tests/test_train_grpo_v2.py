@@ -64,14 +64,12 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert defaults.weight_decay == 0.0
     assert defaults.adamw_kwargs["weight_decay"] == 0.0
     assert defaults.adamw_batch_size_scale == 1.0
-    assert defaults.minibatches_per_epoch == 4
-    assert defaults.grad_accum_steps == 1
     assert defaults.prefetch_batches == 0
-    assert defaults.parameter_sync_step == 1
+    assert defaults.parameter_sync_steps == 1
+    assert defaults.grad_accum_steps == 1
     assert defaults.max_staleness == 100
     assert not defaults.drop_degenerate_groups
     assert defaults.length_penalty == training.LengthPenaltyConfig(reference_tokens=8192, penalty=0.0)
-    assert defaults.update_epochs == 1
     assert defaults.checkpoint_interval == 100
     assert defaults.padding_multiple == 256
     assert defaults.attention_backend == "cudnn"
@@ -103,7 +101,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
                 "length_penalty": {"reference_tokens": 4096, "penalty": 0.05},
                 "rollout_is_threshold": 3.0,
                 "prefetch_batches": 3,
-                "parameter_sync_step": 4,
+                "parameter_sync_steps": 4,
                 "max_staleness": 2,
                 "finetuning": {"mode": "full"},
                 "weight_decay": 0.05,
@@ -131,7 +129,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
             length_penalty=training.LengthPenaltyConfig(reference_tokens=4096, penalty=0.05),
             rollout_is_threshold=3.0,
             prefetch_batches=3,
-            parameter_sync_step=4,
+            parameter_sync_steps=4,
             max_staleness=2,
             finetuning=training.FullFinetuningConfig(),
             weight_decay=0.05,
@@ -222,7 +220,7 @@ def test_adamw_scaling(batch_size_scale: float, expected: dict[str, float]) -> N
     assert config.adamw_kwargs == pytest.approx(expected)
     assert config.learning_rate == 1e-6
     assert config.weight_decay == 0.01
-    assert (config.num_groups, config.group_size, config.minibatches_per_epoch, config.grad_accum_steps) == (1, 4, 4, 1)
+    assert (config.num_groups, config.group_size) == (1, 4)
 
 
 def test_example_log_interval_config(tmp_path: Path) -> None:
@@ -338,8 +336,8 @@ def test_reasoning_gym_cli_and_actor_task_stream(tmp_path: Path, monkeypatch: py
         {"prefetch_batches": -1},
         {"prefetch_batches": 1.5},
         {"prefetch_mode": "next_ready"},
-        {"parameter_sync_step": 0},
-        {"parameter_sync_step": 1.5},
+        {"parameter_sync_steps": 0},
+        {"parameter_sync_steps": 1.5},
         {"max_staleness": -1},
         {"max_staleness": 1.5},
         {"max_staleness": None},
@@ -367,13 +365,11 @@ def test_reasoning_gym_cli_and_actor_task_stream(tmp_path: Path, monkeypatch: py
         {"clip_coef": 1.0},
         {"rollout_is_threshold": 0.0},
         {"max_grad_norm": 0.0},
-        {"minibatches_per_epoch": 0},
-        {"minibatches_per_epoch": 3},
-        {"minibatches_per_epoch": 8},
+        pytest.param({"minibatches_per_epoch": 1}, id="removed-minibatching"),
         {"grad_accum_steps": 0},
-        {"grad_accum_steps": 3},
-        {"minibatches_per_epoch": 2, "grad_accum_steps": 4},
-        {"update_epochs": 0},
+        {"grad_accum_steps": 1.5},
+        pytest.param({"parameter_sync_step": 1}, id="renamed-parameter-sync"),
+        pytest.param({"update_epochs": 1}, id="removed-update-epochs"),
         {"attention_backend": "unknown"},
         {"weight_update_pause_mode": "unknown"},
         pytest.param({"weight_update_pause_mode": "abort"}, id="removed-abort-mode"),
@@ -1107,7 +1103,7 @@ def test_learner_pulls_groups_through_batcher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     actor = Mock()
-    learner.config = replace(learner.config, num_groups=num_groups, group_size=3, minibatches_per_epoch=1)
+    learner.config = replace(learner.config, num_groups=num_groups, group_size=3)
     groups = [
         training.RolloutGroup(task_id=str(i), rollouts=[rollout] * 3, taskset_id="test") for i in range(num_groups)
     ]
@@ -1326,7 +1322,10 @@ def test_learner_cancels_prefetch_on_update_failure(
     monkeypatch.setattr(training.ray, "get", lambda value: value)
     monkeypatch.setattr(training, "MLflowLogger", MagicMock())
 
-    def optimize(batch: training.GRPOBatch[np.ndarray]) -> dict[str, float]:
+    def optimize(
+        batch: training.GRPOBatch[np.ndarray],  # (B, T), (B,) leaves.
+        gradient_sum: training.TrainParameters,  # Parameter shapes.
+    ) -> training.BatchGradientResult:
         learner.batcher.fetch_next_batch.remote.assert_called_once_with(
             num_groups=1,
             group_size=4,
@@ -1902,6 +1901,7 @@ def learner(monkeypatch: pytest.MonkeyPatch) -> Any:
     )
     learner = training.Learner.__ray_metadata__.modified_class(batcher=Mock(), actor=Mock(), config=config)
     learner.model = model
+    learner.apply_update = Mock(return_value={})
     loader.assert_not_called()
     assert not hasattr(learner, "state")
     return learner
@@ -1913,7 +1913,7 @@ def test_learner_initializes_replicated_state(learner: Any, monkeypatch: pytest.
         pytest.skip("Requires two CPU devices; use JAX_NUM_CPU_DEVICES=2")
     monkeypatch.setattr(training.jax, "devices", Mock(return_value=devices))
     monkeypatch.setattr(training, "MLflowLogger", MagicMock())
-    learner.config = replace(learner.config, learner_gpus=2, minibatches_per_epoch=2)
+    learner.config = replace(learner.config, learner_gpus=2)
     previous_mesh = jax.sharding.get_mesh()
 
     def load(*args: Any, **kwargs: Any) -> Any:
@@ -2085,11 +2085,16 @@ def test_learner_logs_rollouts(
     learner.fetch_next_batch.side_effect = [received, RuntimeError("done") if fails else next_batch]
     learner.publish_weights = steps.publish
 
-    def optimize(batch: training.GRPOBatch[np.ndarray]) -> dict[str, float]:
+    def optimize(
+        batch: training.GRPOBatch[np.ndarray],  # (B, T), (B,) leaves.
+        gradient_sum: training.TrainParameters,  # Parameter shapes.
+    ) -> training.BatchGradientResult:
         assert batch is prepared
         assert jax.sharding.get_mesh() == learner.mesh
         learner.state = learner.state.replace(step=learner.state.step + 1)
-        return {"train/policy_loss": -0.25}
+        return training.BatchGradientResult(
+            gradient_sum=gradient_sum, metrics={"train/policy_loss": -0.25}, has_signal=True
+        )
 
     steps.optimize.side_effect = optimize
     learner.optimize = steps.optimize
@@ -2195,14 +2200,14 @@ def test_learner_logs_rollouts(
         "train/updates_total": 1,
         "train/learning_rate": learner.config.learning_rate * 2,
         "train/rollouts_total": 4,
-        "learner/iterations_per_second": 1 / 3,
-        "learner/rollouts_per_second": 4 / 3,
-        "learner/output_tokens_per_second": 16 / 3,
+        "learner/iterations_per_second": 1 / 4,
+        "learner/rollouts_per_second": 1.0,
+        "learner/output_tokens_per_second": 4.0,
         "actor/rollout_seconds_mean": 1.0,
         "learner/batch_fetch_seconds": 1.0,
-        "learner/update_seconds": 1.0,
+        "learner/update_seconds": 2.0,
         "learner/weight_transfer_seconds": 1.0,
-        "learner/iteration_seconds": 3.0,
+        "learner/iteration_seconds": 4.0,
     }
     if not fails:
         assert calls[2].kwargs == {"step": 2}
@@ -2229,7 +2234,7 @@ def test_learner_logs_rollouts(
     assert (
         f"iteration=1 reward={mean(rewards):.3f} degenerate_group_fraction={degenerate_fraction:.3f} "
         "skipped_groups=3 stale_tokens=4 batch=1.00s "
-        "loss=-0.2500 update=1.00s weights=1.00s"
+        "loss=-0.2500 update=2.00s weights=1.00s"
     ) in caplog.messages
     writer.__exit__.assert_called_once()
     assert writer.__exit__.call_args.args[0] is (RuntimeError if fails else None)
@@ -2275,9 +2280,14 @@ def test_learner_skips_publication_without_updates(
     increments = iter((0, 1, 0))  # All skipped, partially skipped, then all skipped at a nonzero step.
     published_steps: list[int] = []
 
-    def optimize(batch: training.GRPOBatch[np.ndarray]) -> dict[str, float]:  # (B, T), (B,) leaves.
+    def optimize(
+        batch: training.GRPOBatch[np.ndarray],  # (B, T), (B,) leaves.
+        gradient_sum: training.TrainParameters,  # Parameter shapes.
+    ) -> training.BatchGradientResult:
         learner.state = learner.state.replace(step=learner.state.step + next(increments))
-        return {"train/policy_loss": 0.0}
+        return training.BatchGradientResult(
+            gradient_sum=gradient_sum, metrics={"train/policy_loss": 0.0}, has_signal=True
+        )
 
     def publish() -> None:
         published_steps.append(int(learner.state.step))
@@ -2302,9 +2312,7 @@ def test_learner_skips_publication_without_updates(
 
 
 def test_learner_parameter_sync_cadence(learner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    learner.config = replace(
-        learner.config, parameter_sync_step=3, update_epochs=2, total_iterations=7, checkpoint_interval=2
-    )
+    learner.config = replace(learner.config, parameter_sync_steps=3, total_iterations=7, checkpoint_interval=2)
     writer = MagicMock()
     writer.__enter__.return_value = writer
     monkeypatch.setattr(training, "MLflowLogger", Mock(return_value=writer))
@@ -2326,7 +2334,7 @@ def test_learner_parameter_sync_cadence(learner: Any, monkeypatch: pytest.Monkey
             timing_metrics={},
         )
     )
-    increments = iter([8, 1, 0, 0, 0, 0, 2, 8, 8, 8])
+    increments = iter([1, 1, 0, 0, 0, 0, 1, 1, 1, 1])
     published_steps: list[int] = []
     consumed_versions: list[int] = []
 
@@ -2336,9 +2344,14 @@ def test_learner_parameter_sync_cadence(learner: Any, monkeypatch: pytest.Monkey
 
     learner.fetch_next_batch.side_effect = fetch
 
-    def optimize(batch: training.GRPOBatch[np.ndarray]) -> dict[str, float]:  # (B, T), (B,) leaves.
+    def optimize(
+        batch: training.GRPOBatch[np.ndarray],  # (B, T), (B,) leaves.
+        gradient_sum: training.TrainParameters,  # Parameter shapes.
+    ) -> training.BatchGradientResult:
         learner.state = learner.state.replace(step=learner.state.step + next(increments))
-        return {"train/policy_loss": 0.0}
+        return training.BatchGradientResult(
+            gradient_sum=gradient_sum, metrics={"train/policy_loss": 0.0}, has_signal=True
+        )
 
     def publish() -> None:
         published_steps.append(int(learner.state.step))
@@ -2346,36 +2359,28 @@ def test_learner_parameter_sync_cadence(learner: Any, monkeypatch: pytest.Monkey
     learner.optimize = optimize
     learner.publish_weights = publish
     learner.start()
-    # Batch 3 publishes earlier updates despite being skipped; batch 6 has no new weights.
-    assert published_steps == [0, 9]
-    assert consumed_versions == [0, 0, 0, 1, 1, 1, 1]
+    # Skipped windows do not advance the publication schedule; iteration 7 completes update 3.
+    assert published_steps == [0, 3]
+    assert consumed_versions == [0, 0, 0, 0, 0, 0, 0]
     metrics = [call.args[0] for call in writer.log_metrics.call_args_list[1:]]
-    assert [values["train/updates_total"] for values in metrics] == [8, 9, 9, 9, 9, 9, 11]
-    assert [values.get("learner/weight_transfer_seconds") for values in metrics] == [
-        None,
-        None,
-        1.0,
-        None,
-        None,
-        None,
-        None,
-    ]
+    assert [values["train/updates_total"] for values in metrics] == [1, 2, 2, 2, 2, 2, 3]
+    assert [values.get("learner/weight_transfer_seconds") for values in metrics] == [None] * 6 + [1.0]
     progress = training.save_checkpoint.call_args.args[1]
-    assert int(progress.train_state.step) == 11
+    assert int(progress.train_state.step) == 3
     assert [call.args[1].iteration for call in training.save_checkpoint.call_args_list] == [2, 4, 6, 7]
 
-    # Resume publishes immediately; scheduled publication stays on cumulative batch 9.
+    # Resume publishes immediately; scheduled publication follows cumulative optimizer update 6.
     training.restore_checkpoint.return_value = progress
     learner.config = replace(learner.config, total_iterations=10)
     published_steps.clear()
     consumed_versions.clear()
     writer.reset_mock()
     learner.start()
-    assert published_steps == [11, 27]
-    assert consumed_versions == [0, 0, 1]
+    assert published_steps == [3, 6]
+    assert consumed_versions == [0, 0, 0]
     calls = writer.log_metrics.call_args_list[1:]
     assert [call.kwargs["step"] for call in calls] == [8, 9, 10]
-    assert [call.args[0].get("learner/weight_transfer_seconds") for call in calls] == [None, 1.0, None]
+    assert [call.args[0].get("learner/weight_transfer_seconds") for call in calls] == [None, None, 1.0]
 
 
 def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2409,11 +2414,14 @@ def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.Monke
             timing_metrics={},
         )
 
-    def optimize(batch: training.GRPOBatch[np.ndarray]) -> dict[str, float]:
-        learner.state = learner.state.replace(
-            step=learner.state.step + learner.config.update_epochs * learner.config.minibatches_per_epoch
+    def optimize(
+        batch: training.GRPOBatch[np.ndarray],  # (B, T), (B,) leaves.
+        gradient_sum: training.TrainParameters,  # Parameter shapes.
+    ) -> training.BatchGradientResult:
+        learner.state = learner.state.replace(step=learner.state.step + 1)
+        return training.BatchGradientResult(
+            gradient_sum=gradient_sum, metrics={"train/policy_loss": 0.0}, has_signal=True
         )
-        return {"train/policy_loss": 0.0}
 
     def save(manager: Any, progress: training.TrainingProgress, config: training.Config) -> float:
         assert published_steps[-1] == int(progress.train_state.step)
@@ -2429,26 +2437,26 @@ def test_learner_checkpoints_and_resumes(learner: Any, monkeypatch: pytest.Monke
     assert [call.kwargs["iteration"] for call in learner.fetch_next_batch.call_args_list] == [1, 2, 3]
     assert [progress.iteration for progress in saved] == [2, 3]
     assert [progress.total_rollouts for progress in saved] == [8, 12]
-    assert published_steps == [0, 4, 8, 12]
+    assert published_steps == [0, 1, 2, 3]
     learner.actor.set_sampling_state.remote.assert_not_called()
     saved_key = jax.random.key_data(saved[-1].shuffle_key)  # (K,)
 
     # New settings govern future work; restored totals are not recomputed from batch size.
-    learner.config = replace(learner.config, total_iterations=5, num_groups=2, update_epochs=2, seed=99)
+    learner.config = replace(learner.config, total_iterations=5, num_groups=2, seed=99)
     learner.shuffle_key = jax.random.key(99)  # () simulate a restarted learner.
     published_steps.clear()
     writer.reset_mock()
     learner.start()
     assert [progress.iteration for progress in saved] == [2, 3, 4, 5]
     assert [progress.total_rollouts for progress in saved] == [8, 12, 20, 28]
-    assert published_steps == [12, 20, 28]
+    assert published_steps == [3, 4, 5]
     learner.actor.set_sampling_state.remote.assert_called_once_with({"task_rng": "saved"})
     np.testing.assert_array_equal(jax.random.key_data(learner.shuffle_key), saved_key)
     writer.log_text.assert_called_once_with(yaml.safe_dump(asdict(learner.config)), "config/3.yaml")
     assert [call.kwargs["step"] for call in writer.log_metrics.call_args_list] == [3, 4, 5]
     metrics = writer.log_metrics.call_args.args[0]
     assert metrics["train/rollouts_total"] == 28
-    assert metrics["train/updates_total"] == 28
+    assert metrics["train/updates_total"] == 5
     assert metrics["rollout/stop_fraction/max_turns"] == 0
     assert metrics["checkpoint/save_blocking_seconds"] == 0.5
 
@@ -2515,13 +2523,16 @@ def test_learner_logs_examples_at_configured_interval(
         learner.config,
         num_groups=2,
         group_size=2,
-        minibatches_per_epoch=1,
         total_iterations=7,
         prefetch_batches=0,
         example_log_interval=3,
     )
     learner.publish_weights = Mock()
-    learner.optimize = Mock(return_value={"train/policy_loss": 0.0})
+    learner.optimize = Mock(
+        side_effect=lambda batch, gradient_sum: training.BatchGradientResult(
+            gradient_sum=gradient_sum, metrics={"train/policy_loss": 0.0}, has_signal=False
+        )
+    )
     actor = Mock()
     actor.fetch_next_group.remote = AsyncMock(
         side_effect=[
@@ -2691,7 +2702,6 @@ def test_train_gracefully_terminates_actor(
         ckpt_dir=str(tmp_path),
         padding_multiple=64,
         learner_gpus=2,
-        minibatches_per_epoch=2,
         enable_ray_dashboard=enable_dashboard,
         enable_ray_timeline=enable_timeline,
         enable_tracing=enable_tracing,
@@ -3437,3 +3447,163 @@ def test_create_agent_config_and_cleanup(
         base_url=f"{training.SERVER_URL}/v1", api_key="EMPTY", timeout=config.rollout_timeout, max_retries=3
     )
     assert client.is_closed()
+
+
+@pytest.mark.parametrize("inactive_window", [False, True], ids=["all-active", "first-window-inactive"])
+def test_learner_accumulates_four_batches_and_publishes_every_twelve(
+    learner: Any, monkeypatch: pytest.MonkeyPatch, inactive_window: bool
+) -> None:
+    learner.config = replace(
+        learner.config, grad_accum_steps=4, parameter_sync_steps=3, total_iterations=4, checkpoint_interval=2
+    )
+    writer = MagicMock()
+    writer.__enter__.return_value = writer
+    monkeypatch.setattr(training, "MLflowLogger", Mock(return_value=writer))
+    prepared = Mock(spec=training.GRPOBatch)
+    prepared.token_ids = Mock(shape=(4, 2))  # (B=4, T=2)
+    learner.fetch_next_batch = Mock(
+        return_value=training.RolloutBatch(
+            training_batch=prepared,
+            rollout_metrics={
+                "rollout/reward_mean": 1.0,
+                "rollout/degenerate_group_fraction": 0.0,
+                "batcher/skipped_groups": 0,
+                "batcher/stale_tokens": 0,
+            },
+            stop_counts={},
+            num_output_tokens=4,
+            examples="",
+            timing_metrics={},
+        )
+    )
+    del learner.apply_update  # Use the real optimizer update after the inner loop.
+    published_steps: list[int] = []
+    calls = 0
+
+    def optimize(
+        batch: training.GRPOBatch[np.ndarray],  # (B, T), (B,) leaves.
+        gradient_sum: training.TrainParameters,  # Parameter shapes.
+    ) -> training.BatchGradientResult:
+        nonlocal calls
+        calls += 1
+        active = not (inactive_window and calls <= 4)
+        return training.BatchGradientResult(
+            gradient_sum=jax.tree.map(lambda value: value + float(active), gradient_sum),  # Parameter shapes.
+            metrics={"train/policy_loss": 0.0},
+            has_signal=active,
+        )
+
+    def publish() -> None:
+        published_steps.append(int(learner.state.step))
+
+    learner.optimize = optimize
+    learner.publish_weights = publish
+    learner.start()
+    assert published_steps == [0, 3]
+    metrics = [call.args[0] for call in writer.log_metrics.call_args_list[1:]]
+    assert [values["train/updates_total"] for values in metrics] == [
+        index - int(inactive_window) for index in range(1, 5)
+    ]
+    assert [index for index, values in enumerate(metrics, start=1) if "learner/weight_transfer_seconds" in values] == [
+        4 if inactive_window else 3
+    ]
+    assert [call.kwargs["iteration"] for call in learner.fetch_next_batch.call_args_list] == list(range(1, 17))
+    assert metrics[-1]["train/rollouts_total"] == 64
+    saves = [call.args[1] for call in training.save_checkpoint.call_args_list]
+    assert [progress.iteration for progress in saves] == [2, 4]
+    assert int(learner.state.step) == 4 - int(inactive_window)
+
+
+def test_iteration_rollout_metrics_pool_batches() -> None:
+    summaries = [
+        training.BatchSummary(
+            metrics={
+                "rollout/reward_mean": 0.0,
+                "rollout/reward_std": 0.0,
+                "rollout/reward_min": 0.0,
+                "rollout/reward_max": 0.0,
+                "rollout/reward_mean/first_max": 0.0,
+                "rollout/reward_mean/shared_max": 0.0,
+                "rollout/total_tokens_mean": 2.0,
+                "batcher/padded_sequence_tokens": 4.0,
+                "batcher/token_utilization_fraction": 0.5,
+                "batcher/context_transcript_token_fraction": 0.5,
+                "batcher/weight_age_transcript_token_fraction/0": 0.5,
+                "batcher/skipped_groups": 1,
+                "batcher/stale_tokens": 1,
+                "actor/rollout_seconds_mean": 1.0,
+            },
+            num_rollouts=2,
+            taskset_counts={"first_max": 1, "shared_max": 1},
+        ),
+        training.BatchSummary(
+            metrics={
+                "rollout/reward_mean": 3.0,
+                "rollout/reward_std": 1.0,
+                "rollout/reward_min": 2.0,
+                "rollout/reward_max": 4.0,
+                "rollout/reward_mean/second": 4.0,
+                "rollout/reward_mean/shared_max": 2.0,
+                "rollout/total_tokens_mean": 6.0,
+                "batcher/padded_sequence_tokens": 8.0,
+                "batcher/token_utilization_fraction": 0.75,
+                "batcher/context_transcript_token_fraction": 0.75,
+                "batcher/weight_age_transcript_token_fraction/1": 0.25,
+                "batcher/skipped_groups": 2,
+                "batcher/stale_tokens": 3,
+                "actor/rollout_seconds_mean": 3.0,
+            },
+            num_rollouts=2,
+            taskset_counts={"second": 1, "shared_max": 1},
+        ),
+    ]
+    assert training.summarize_iteration(summaries) == pytest.approx(
+        {
+            "rollout/reward_mean": 1.5,
+            "rollout/reward_std": 2.75**0.5,
+            "rollout/reward_min": 0.0,
+            "rollout/reward_max": 4.0,
+            "rollout/reward_mean/first_max": 0.0,
+            "rollout/reward_mean/second": 4.0,
+            "rollout/reward_mean/shared_max": 1.0,
+            "rollout/total_tokens_mean": 4.0,
+            "batcher/padded_sequence_tokens": 8.0,
+            "batcher/token_utilization_fraction": 2 / 3,
+            "batcher/context_transcript_token_fraction": 11 / 16,
+            "batcher/weight_age_transcript_token_fraction/0": 2 / 16,
+            "batcher/weight_age_transcript_token_fraction/1": 3 / 16,
+            "batcher/skipped_groups": 3,
+            "batcher/stale_tokens": 4,
+            "actor/rollout_seconds_mean": 2.0,
+        }
+    )
+
+
+def test_batcher_drains_on_outer_iteration_boundaries(rollout: training.Rollout) -> None:
+    actor = Mock()
+    actor.fetch_next_group.remote = AsyncMock(
+        return_value=training.RolloutGroup(task_id="0", rollouts=[rollout] * 2, taskset_id="test")
+    )
+    batcher = training.Batcher.__ray_metadata__.modified_class(
+        actor=actor,
+        config=training.Config(
+            grad_accum_steps=4,
+            parameter_sync_steps=3,
+            checkpoint_interval=2,
+            total_iterations=3,
+            prefetch_batches=3,
+        ),
+    )
+
+    async def collect() -> None:
+        async with asyncio.timeout(5):
+            for iteration in range(1, 13):
+                await batcher.fetch_next_batch(num_groups=1, group_size=2, context_length=8, iteration=iteration)
+                await asyncio.sleep(0)
+                if iteration in (8, 12):
+                    assert not batcher._pending_groups
+                    assert actor.fetch_next_group.remote.call_count == iteration
+                else:
+                    assert batcher._pending_groups
+
+    asyncio.run(collect())
