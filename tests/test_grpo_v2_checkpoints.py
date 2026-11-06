@@ -201,7 +201,8 @@ def test_invalid_checkpoint_metadata(progress: training.TrainingProgress, damage
         {"finetuning": training.LoRAConfig(rank=8)},
         {"finetuning": training.LoRAConfig(alpha=16)},
         {"finetuning": training.FullFinetuningConfig()},
-        {"stable_reinforce": training.StableReinforceConfig()},
+        {"loss": training.StableReinforceConfig()},
+        {"loss": training.GRPOLossConfig(clip_coef=0.1)},
     ],
 )
 def test_checkpoint_rejects_incompatible_lora_config(
@@ -216,6 +217,46 @@ def test_checkpoint_rejects_incompatible_lora_config(
     with pytest.raises(ValueError, match="checkpoint .* does not match"):
         training.restore_checkpoint(manager, progress.train_state, replace(config, **change))
     manager.restore.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "loss",
+    [
+        training.GRPOLossConfig(),
+        training.GRPOLossConfig(clip_coef=0.1, rollout_is_threshold=3.0),
+        training.StableReinforceConfig(top_k=8, kl_coeff=0.02),
+    ],
+    ids=["legacy-default", "legacy-grpo", "legacy-stable"],
+)
+def test_restore_legacy_loss_config(progress: training.TrainingProgress, loss: training.LossConfig) -> None:
+    manager = Mock()
+    config = training.Config(loss=loss)
+    training.save_checkpoint(manager, progress, config)
+    metadata = manager.save.call_args.kwargs["args"].metadata.item
+    values = metadata["config"].pop("loss")
+    values.pop("kind")
+    if isinstance(loss, training.StableReinforceConfig):
+        metadata["config"]["stable_reinforce"] = values
+    elif loss != training.GRPOLossConfig():
+        metadata["config"].update(values)
+    manager.latest_step.return_value = progress.iteration
+    manager.restore.side_effect = [
+        SimpleNamespace(metadata=metadata),
+        SimpleNamespace(
+            state={
+                "train_state": progress.train_state,
+                "shuffle_key": jax.random.key_data(progress.shuffle_key),  # (K,)
+            }
+        ),
+    ]
+    restored = training.restore_checkpoint(manager, progress.train_state, config)
+    assert restored is not None and restored.train_state is progress.train_state
+    assert restored.rollout_pool == progress.rollout_pool
+
+    manager.restore.side_effect = None
+    manager.restore.return_value = SimpleNamespace(metadata=metadata)
+    with pytest.raises(ValueError, match="checkpoint loss does not match"):
+        training.restore_checkpoint(manager, progress.train_state, training.Config())
 
 
 def test_full_weight_checkpoint(tmp_path: Path, progress: training.TrainingProgress) -> None:

@@ -31,14 +31,55 @@ def test_centered_gradient_matches_sampler_expectation(head_size: int) -> None:
 
 
 def test_centering_is_noop_on_policy_and_handles_saturated_head() -> None:
-    logits = jnp.log(jnp.array([[0.4, 0.3, 0.2, 0.1], [1.0, 1e-30, 1e-30, 1e-30]]))  # (B, V)
-    sampler = jax.nn.log_softmax(logits, axis=-1)[:, :2]  # (B, K)
+    logits = jnp.log(jnp.array([[0.4, 0.3, 0.2, 0.1], [0.75, 0.25, 1e-8, 1e-8]]))  # (B, V)
 
     def correction(values: jax.Array) -> jax.Array:  # (B, V) -> ()
-        return stable.score_correction(jax.nn.log_softmax(values, axis=-1)[:, :2], sampler).sum()  # ()
+        head = jax.nn.log_softmax(values, axis=-1)[:, :2]  # (B, K)
+        # Use identical scores to isolate centering from eager/JIT log-softmax rounding differences.
+        return stable.score_correction(head, jax.lax.stop_gradient(head)).sum()  # ()
 
     gradient = jax.jit(jax.grad(correction))(logits)  # (B, V)
-    np.testing.assert_allclose(gradient, 0, atol=2e-7)
+    np.testing.assert_allclose(gradient, 0, atol=1e-12)
+
+
+def test_k3_gradient_remains_active_for_large_mismatch() -> None:
+    scores = jnp.array([[-1.0, -31.0, -jnp.inf]])  # (B, T)
+    old = jnp.array([[-31.0, -1.0, -jnp.inf]])  # (B, T)
+    head = jnp.full((1, 3, 2), -2.0)  # (B, T, K)
+
+    def loss(current: jax.Array) -> jax.Array:  # (B, T) -> ()
+        return stable.objective(
+            current,
+            head,
+            head,
+            old,
+            jnp.zeros(1),
+            jnp.array([[True, True, False]]),
+            stable.StableReinforceConfig(kl_coeff=0.01, kl_estimator="k3"),
+        )[0]
+
+    value, gradient = jax.jit(jax.value_and_grad(loss))(scores)  # (), (B, T)
+    assert value.shape == () and gradient.shape == (1, 3)
+    np.testing.assert_allclose(gradient, [[0.005 * np.expm1(30), 0.005 * np.expm1(-30), 0]], rtol=1e-6)
+
+
+def test_disabled_k3_does_not_affect_policy_gradient_on_overflow() -> None:
+    head = jnp.full((1, 1, 2), -2.0)  # (B, T, K)
+
+    def loss(current: jax.Array) -> jax.Array:  # (B, T) -> ()
+        return stable.objective(
+            current,
+            head,
+            head,
+            jnp.full((1, 1), -1000.0),
+            jnp.ones(1),
+            jnp.ones((1, 1), dtype=jnp.bool_),
+            stable.StableReinforceConfig(kl_coeff=0, kl_estimator="k3"),
+        )[0]
+
+    value, gradient = jax.jit(jax.value_and_grad(loss))(jnp.full((1, 1), -1.0))  # (), (B, T)
+    assert float(value) == pytest.approx(1.0)
+    np.testing.assert_array_equal(gradient, -1.0)
 
 
 @pytest.mark.parametrize("estimator", ["k1", "k3"])
@@ -103,7 +144,7 @@ def test_learner_stable_reinforce_updates_and_skips(monkeypatch: pytest.MonkeyPa
     learner = training.Learner.__ray_metadata__.modified_class(
         actor=Mock(),
         batcher=Mock(),
-        config=training.Config(stable_reinforce=stable.StableReinforceConfig(top_k=2), temperature=0.7),
+        config=training.Config(loss=stable.StableReinforceConfig(top_k=2), temperature=0.7),
     )
     learner.mesh = jax.sharding.get_mesh()
     learner.state = training.TrainState.create(
@@ -132,20 +173,22 @@ def test_learner_stable_reinforce_updates_and_skips(monkeypatch: pytest.MonkeyPa
     assert float(learner.state.params["logits"][0, 0, 2]) > 0
     np.testing.assert_array_equal(learner.state.params["logits"][0, 1], 0)
 
-    learner.config = replace(learner.config, stable_reinforce=stable.StableReinforceConfig(top_k=2, kl_coeff=0))
+    learner.config = replace(learner.config, loss=stable.StableReinforceConfig(top_k=2, kl_coeff=0))
     result = learner.optimize(batch, jax.tree.map(jnp.zeros_like, learner.state.params))
     assert not result.has_signal and result.metrics == {"train/policy_loss": 0, "train/loss": 0}
     learner.apply_update(result.gradient_sum, has_signal=result.has_signal)
     assert int(learner.state.step) == 1
 
-    learner.config = replace(learner.config, stable_reinforce=stable.StableReinforceConfig(top_k=2))
+    learner.config = replace(learner.config, loss=stable.StableReinforceConfig(top_k=2))
     result = learner.optimize(
         batch._replace(loss_mask=np.zeros((1, 3), dtype=np.bool_)), jax.tree.map(jnp.zeros_like, learner.state.params)
     )
     assert not result.has_signal and result.metrics == {"train/policy_loss": 0, "train/loss": 0}
 
 
-@pytest.mark.parametrize("options", [{"top_k": 0}, {"kl_coeff": -0.1}, {"kl_estimator": "unknown"}])
+@pytest.mark.parametrize(
+    "options", [{"top_k": 0}, {"kl_coeff": -0.1}, {"kl_coeff": float("inf")}, {"kl_estimator": "unknown"}]
+)
 def test_invalid_stable_config(options: dict[str, Any]) -> None:
     with pytest.raises(ValidationError):
         stable.StableReinforceConfig(**options)
@@ -153,12 +196,13 @@ def test_invalid_stable_config(options: dict[str, Any]) -> None:
 
 def test_opt_in_config_and_server_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "training.yaml"
-    path.write_text("stable_reinforce: {}\n")
+    path.write_text("loss:\n  kind: stable_reinforce\n")
     config = training.load_config(path, training.Config)
-    assert config.stable_reinforce == stable.StableReinforceConfig()
-    assert training.Config().stable_reinforce is None
+    assert config.loss == stable.StableReinforceConfig()
+    assert config.loss.kl_coeff == 0.01 and config.loss.kl_estimator == "k1"
+    assert training.Config().loss == training.CISPOConfig()
     launch = Mock(return_value=MagicMock())
     monkeypatch.setattr(training.subprocess, "Popen", launch)
-    with training.serve_vllm(sampler_top_k=config.stable_reinforce.top_k):
+    with training.serve_vllm(sampler_top_k=config.loss.top_k):
         command = launch.call_args.args[0]
         assert command[command.index("--max-logprobs") + 1] == "33"

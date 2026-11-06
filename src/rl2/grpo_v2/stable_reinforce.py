@@ -2,6 +2,7 @@
 
 Uses https://arxiv.org/html/2609.20807v1#S4.SS1, not Tinker's private implementation.
 The unrecorded sampler tail is approximated by the learner's conditional tail.
+KL defaults match Tinker's documentation; top_k is a local setting.
 """
 
 from typing import Annotated, Literal
@@ -14,8 +15,9 @@ from pydantic.dataclasses import dataclass
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class StableReinforceConfig:
+    kind: Literal["stable_reinforce"] = "stable_reinforce"
     top_k: Annotated[int, Field(ge=1)] = 32
-    kl_coeff: Annotated[float, Field(ge=0)] = 0.01
+    kl_coeff: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.01
     kl_estimator: Literal["k1", "k3"] = "k1"
 
 
@@ -34,8 +36,8 @@ def score_correction(
     """(...,) surrogate whose gradient is the approximate sampler-expected score."""
     head_probs = jnp.exp(head_log_probs)  # (..., K)
     sampler_probs = jnp.exp(sampler_head_log_probs)  # (..., K)
-    sampler_tail = jnp.maximum(1 - sampler_probs.sum(axis=-1), 0)  # (...,)
-    # The head sum can round to one in FP32; floor the denominator at machine epsilon.
+    # Floor both tails equally so matching saturated heads still give zero correction.
+    sampler_tail = jnp.maximum(1 - sampler_probs.sum(axis=-1), jnp.finfo(jnp.float32).eps)  # (...,)
     learner_tail = jnp.maximum(1 - head_probs.sum(axis=-1), jnp.finfo(jnp.float32).eps)  # (...,)
     residual = jax.lax.stop_gradient(sampler_probs - (sampler_tail / learner_tail)[..., None] * head_probs)  # (..., K)
     return (residual * head_log_probs).sum(axis=-1)  # (...,)
@@ -67,11 +69,10 @@ def objective(
     if config.kl_estimator == "k1":
         kl = -log_ratio  # (B, T)
     else:
-        # Match the existing objective's exponentiation safety bound.
-        bounded = jnp.clip(log_ratio, -20, 20)  # (B, T)
-        kl = jnp.expm1(bounded) - bounded  # (B, T)
+        kl = jnp.expm1(log_ratio) - log_ratio  # (B, T)
     sampler_kl = average(kl)  # ()
-    loss = policy_loss + config.kl_coeff * sampler_kl  # ()
+    # A disabled penalty must not introduce 0 * inf or its gradient through a large k3 ratio.
+    loss = policy_loss if config.kl_coeff == 0 else policy_loss + config.kl_coeff * sampler_kl  # ()
     return loss, {
         "train/policy_loss": policy_loss,  # ()
         "train/loss": loss,  # ()

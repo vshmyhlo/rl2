@@ -313,6 +313,39 @@ adjusted rewards.
 The batcher pads complete transcripts to `padding_multiple` (default 256),
 capped at the model context length. Oversized transcripts are rejected.
 
+The `loss` configuration is a tagged union. Omitting it selects CISPO:
+
+```yaml
+loss:
+  kind: cispo
+  clip_low_threshold: 0.0
+  clip_high_threshold: 4.0
+```
+
+These thresholds match [Tinker's CISPO defaults](https://tinker-docs.thinkingmachines.ai/tinker/losses/cispo/).
+For each sampled token, `w = stop_gradient(clip(exp(current_logp - rollout_logp), low, high))`
+and the loss is `-w * advantage * current_logp`. Clipping the detached weight
+keeps the sampled-token gradient active outside the thresholds. The lower threshold
+must be nonnegative, the upper positive, and lower must not exceed upper.
+The upper cap is applied before exponentiation to avoid overflow; there is no
+additional ratio floor. We average tokens within each rollout, then all rollouts
+equally; fully masked rows contribute zero. Tinker reports a token sum instead.
+CISPO needs neither anchor scoring nor top-k probabilities. It logs applied weights,
+the clipped fraction, absolute learner/sampler log-probability error, and a k3
+`train/sampler_kl` diagnostic; it adds no KL penalty.
+
+GRPO remains available explicitly:
+
+```yaml
+loss:
+  kind: grpo
+  clip_coef: 0.2
+  rollout_is_threshold: 2.0
+```
+
+Each variant accepts only its own settings; the former top-level `clip_coef`,
+`rollout_is_threshold`, and `stable_reinforce` settings are no longer accepted.
+
 GRPO uses [verl-style decoupled token-TIS](https://verl.readthedocs.io/en/latest/algo/rollout_corr.html#decoupled-mode-with-token-level-importance-sampling-decoupled-token-is),
 averaged over unmasked sampled tokens within each rollout and then across all rollouts.
 Before optimizing each batch, the learner scores its transcripts once using the
@@ -324,7 +357,7 @@ For each unmasked sampled token:
 - Detached correction: `w = min(exp(clip(anchor_logp - rollout_logp, -20, 20)), rollout_is_threshold)`.
 - Loss: `-w * min(r * advantage, clip(r, 1 - clip_coef, 1 + clip_coef) * advantage)`.
 
-`rollout_is_threshold` defaults to `2.0` and must be positive. Correction weights
+`loss.rollout_is_threshold` defaults to `2.0` and must be positive. Correction weights
 are zero on context/padding tokens, are not batch-normalized, and do not change
 loss denominators. There is no rejection sampling or reference-policy KL penalty.
 Token-level correction and truncation trade bias for lower variance; they do not
@@ -339,11 +372,12 @@ gap and applied correction. All policy diagnostics exclude skipped updates.
 
 ### Opt-in StableReinforce-style loss
 
-Omit `stable_reinforce` (or set it to `null`) to keep the default GRPO objective.
-Enable the local score-centering implementation with `stable_reinforce: {}` or:
+Select the local score-centering implementation with `loss: {kind: stable_reinforce}`
+or specify its parameters:
 
 ```yaml
-stable_reinforce:
+loss:
+  kind: stable_reinforce
   top_k: 32
   kl_coeff: 0.01
   kl_estimator: k1 # k1 or k3; kl_coeff: 0 disables the penalty.
@@ -352,20 +386,25 @@ stable_reinforce:
 This implements the public [top-k score-centering method](https://arxiv.org/html/2609.20807v1#S4.SS1)
 with a sampler-to-learner KL penalty following [Tinker's documented estimators](https://tinker-docs.thinkingmachines.ai/tinker/losses/stable-reinforce/).
 It is not an exact reproduction of Tinker's unpublished StableReinforce variant.
-It replaces PPO clipping and truncated importance weighting; `clip_coef` and
-`rollout_is_threshold` apply only to the default objective. No anchor forward pass
+The KL defaults (`0.01`, `k1`) match Tinker; `top_k: 32` is a local choice,
+not a published Tinker default.
+It replaces PPO clipping and truncated importance weighting; `loss.clip_coef` and
+`loss.rollout_is_threshold` belong exclusively to the GRPO variant. No anchor forward pass
 is needed. Advantages, length penalties, gradient accumulation, and staleness masks
 retain their existing semantics. Losses average retained tokens per rollout, then
 all rollouts, with fully masked rows contributing zero.
 
 For sampler head H, learner probabilities p, and recorded sampler probabilities q:
-`rho = max(1-sum(q_H), 0) / max(1-sum(p_H), float32_epsilon)` and
+`rho = max(1-sum(q_H), float32_epsilon) / max(1-sum(p_H), float32_epsilon)` and
 `correction = sum(stop_gradient(q_H-rho*p_H) * log(p_H))`.
-The policy loss is `-advantage * (log(p_sampled)-correction)`. The denominator floor
-handles heads whose learner mass rounds to one; the unrecorded sampler tail is
+The policy loss is `-advantage * (log(p_sampled)-correction)`. Equal tail floors
+preserve zero correction for matching heads whose mass rounds to one; the unrecorded sampler tail is
 approximated by the learner's conditional tail. `k1` adds
 `kl_coeff * (log(q_sampled)-log(p_sampled))`; `k3` adds
-`kl_coeff * (exp(d)-1-d)` with `d=clip(log(p_sampled)-log(q_sampled), -20, 20)`.
+`kl_coeff * (exp(d)-1-d)` with `d=log(p_sampled)-log(q_sampled)`. The k3 ratio is unclipped, matching
+the documented gradient; extreme positive differences can overflow. Setting
+`kl_coeff: 0` fully disables the penalty even then. Both KL estimators use our
+rollout averaging rather than Tinker’s token sum.
 This KL targets the sampling policy, not a reference model.
 
 The actor records K alternatives per generated token at sampling time, including
@@ -380,9 +419,10 @@ advantages are zero. `drop_degenerate_groups: true` continues to discard those
 groups before training; set it to false if they should contribute KL updates.
 Fully masked batches are skipped. The module docstring specifies the additional
 loss and sampler diagnostics; PPO-only diagnostics are omitted in this mode.
-Use a new `ckpt_dir` when changing `stable_reinforce`: resume requires matching
-settings and restores the recorded sampler arrays with buffered rollouts. Existing
-checkpoints without this setting continue to use GRPO.
+Use a new `ckpt_dir` when changing `loss`: resume requires matching loss settings
+and restores the recorded sampler arrays with buffered rollouts. Older checkpoints
+with top-level loss settings are normalized to the corresponding variant on restore;
+checkpoints without loss settings use GRPO defaults.
 
 ### Optimizer and learner execution
 

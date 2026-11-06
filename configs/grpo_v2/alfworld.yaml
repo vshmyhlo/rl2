@@ -9,9 +9,9 @@ vllm:
   async_scheduling: true
 learning_rate: 1e-6
 adamw_batch_size_scale: 1.0
-clip_coef: 0.2
+loss:
+  kind: cispo
 max_grad_norm: 1.0
-rollout_is_threshold: 2.0 # Decoupled token-level importance sampling; no rejection sampling.
 finetuning:
   mode: full # Optimizes every weight and requires more GPU memory.
 attention_backend: tokamax
@@ -45,7 +45,7 @@ max_tokens: 8192 # Total transcript tokens, including system, prompt, and tools.
 max_turns: 50
 rollout_timeout: 1200
 environment_timeout: 600
-run_id: grpo_v2_alfworld_${path_name:${model}}_${finetuning.mode}_${attention_backend}_s${seed}_lr${learning_rate}_adamw_scale${adamw_batch_size_scale}_bs${batch_size}_gs${group_size}_ga${grad_accum_steps}_pf${prefetch_batches}_next_ready_ps${parameter_sync_steps}_ms${max_staleness}_ddg${drop_degenerate_groups}_success_lp${length_penalty.reference_tokens}_${length_penalty.penalty}
+run_id: grpo_v2_alfworld_${loss.kind}_${path_name:${model}}_${finetuning.mode}_${attention_backend}_s${seed}_lr${learning_rate}_adamw_scale${adamw_batch_size_scale}_bs${batch_size}_gs${group_size}_ga${grad_accum_steps}_pf${prefetch_batches}_next_ready_ps${parameter_sync_steps}_ms${max_staleness}_ddg${drop_degenerate_groups}_success_lp${length_penalty.reference_tokens}_${length_penalty.penalty}
 ckpt_dir: /runs/grpo_v2/${run_id} # Checkpoints and profiling artifacts.
 checkpoint_interval: 50
 example_log_interval: 50

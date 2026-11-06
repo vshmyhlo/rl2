@@ -35,8 +35,7 @@ def update_batch(
         anchors,
         jax.tree.map(jnp.zeros_like, state.params),
         temperature,
-        clip_coef,
-        rollout_is_threshold,
+        training.GRPOLossConfig(clip_coef=clip_coef, rollout_is_threshold=rollout_is_threshold),
     )  # Parameter shapes; scalar metrics.
     has_signal = bool(jnp.any((batch.advantages != 0) & jnp.any(batch.loss_mask[:, 1:], axis=1)))
     state, optimizer_metrics = training.update(state, gradients, 1, has_signal)
@@ -131,7 +130,7 @@ def test_stable_sampler_data_batch_and_checkpoint(batcher: Any, groups: list[tra
         batcher.config,
         padding_multiple=8,
         max_staleness=0,
-        stable_reinforce=training.StableReinforceConfig(top_k=2),
+        loss=training.StableReinforceConfig(top_k=2),
     )
     with pytest.raises(ValueError, match="sampling-time top-logprobs"):
         batcher.prepare_batch(groups, context_length=8)
@@ -161,7 +160,7 @@ def test_stable_sampler_data_batch_and_checkpoint(batcher: Any, groups: list[tra
         )
         np.testing.assert_array_equal(batch.sampler_topk_ids[index, length:], 0)
         np.testing.assert_array_equal(batch.sampler_topk_log_probs[index, length:], 0)
-    batcher.config = replace(batcher.config, stable_reinforce=training.StableReinforceConfig(top_k=3))
+    batcher.config = replace(batcher.config, loss=training.StableReinforceConfig(top_k=3))
     with pytest.raises(ValueError, match="matching sampling-time top-logprobs"):
         batcher.prepare_batch(groups, context_length=8)
 
@@ -477,7 +476,6 @@ def test_stable_reinforce_lora_matches_on_policy_gradient(
         batch.old_log_probs[:, 1:],
         jax.tree.map(jnp.zeros_like, state.params),
         0.7,
-        0.2,
     )  # Parameter shapes; scalar metrics.
     anchors = jnp.zeros_like(scores[..., 0])  # (B, T-1)
     gradient_sum = jax.tree.map(jnp.zeros_like, state.params)  # Parameter shapes.
@@ -489,8 +487,6 @@ def test_stable_reinforce_lora_matches_on_policy_gradient(
             jax.device_put(anchors, NamedSharding(mesh, PartitionSpec("batch"))),  # (B, T-1)
             jax.device_put(gradient_sum, NamedSharding(mesh, PartitionSpec())),
             0.7,
-            0.2,
-            2.0,
             training.StableReinforceConfig(top_k=2, kl_coeff=0),
         )  # Parameter shapes; scalar metrics.
     assert float(metrics["train/sampler_topk_fraction_mean"]) > 0
@@ -558,7 +554,9 @@ def test_token_log_probs_gradients_match_gather(
 def test_default_attention_optimizer_on_cuda(mesh_context: None) -> None:
     if not any("NVIDIA" in device.device_kind for device in jax.devices()):
         pytest.skip("Requires an NVIDIA GPU with cuDNN")
-    config = training.Config(group_size=2, finetuning=training.LoRAConfig(rank=1, alpha=2))
+    config = training.Config(
+        group_size=2, loss=training.GRPOLossConfig(), finetuning=training.LoRAConfig(rank=1, alpha=2)
+    )
     model = Qwen3LM(
         config=Qwen3Config(
             vocab_size=8,
@@ -589,7 +587,7 @@ def test_default_attention_optimizer_on_cuda(mesh_context: None) -> None:
     assert anchors.shape == (2, 15)
     assert anchors.dtype == jnp.float32
     batch = batch._replace(old_log_probs=jnp.pad(anchors - jnp.log(1.5), ((0, 0), (1, 0))))  # (B, T)
-    state, metrics = update_batch(state, batch, anchors, config.temperature, config.clip_coef)
+    state, metrics = update_batch(state, batch, anchors, config.temperature, config.loss.clip_coef)
     assert int(state.step) == 1
     assert float(metrics["train/clip_fraction"]) == 0
     assert float(metrics["train/rollout_importance_weight_mean"]) == pytest.approx(1.5, abs=1e-6)
@@ -796,7 +794,7 @@ def test_update_logs_only_new_traces(
         full_batch: training.GRPOBatch[jax.Array],  # (B, T), (B,) leaves.
     ) -> jax.stages.Lowered:
         return training.accumulate_gradients.lower(
-            current, full_batch, full_batch.old_log_probs[:, 1:], jax.tree.map(jnp.zeros_like, current.params), 0.7, 0.2
+            current, full_batch, full_batch.old_log_probs[:, 1:], jax.tree.map(jnp.zeros_like, current.params), 0.7
         )
 
     caplog.set_level(logging.INFO, logger=training.__name__)
@@ -804,12 +802,12 @@ def test_update_logs_only_new_traces(
     trace(state, batch)
     # The device scalar returned by the first update must reuse the initial trace.
     trace(state.replace(step=jnp.asarray(1, dtype=jnp.int32)), batch)
-    assert caplog.messages == ["JIT trace accumulate_gradients: batch_shape=(2, 8) temperature=0.7 clip_coef=0.2"]
+    assert caplog.messages == ["JIT trace accumulate_gradients: batch_shape=(2, 8) temperature=0.7 loss=cispo"]
     caplog.clear()
     shorter = jax.tree.map(lambda value: value[:, :5] if value.ndim == 2 else value, batch)  # (B, 5), (B,).
     trace(state, shorter)
     trace(state, batch)
-    assert caplog.messages == ["JIT trace accumulate_gradients: batch_shape=(2, 5) temperature=0.7 clip_coef=0.2"]
+    assert caplog.messages == ["JIT trace accumulate_gradients: batch_shape=(2, 5) temperature=0.7 loss=cispo"]
 
 
 @pytest.mark.parametrize("case", ["zero-fresh", "zero-momentum", "all-stale", "inactive-rows"])
@@ -890,7 +888,7 @@ def test_data_parallel_update_rejects_indivisible_batch(
         pytest.raises(ValueError, match="learner device count must divide the rollout batch size"),
     ):
         training.accumulate_gradients.__wrapped__(
-            state, batch, batch.old_log_probs[:, 1:], jax.tree.map(jnp.zeros_like, state.params), 0.7, 0.2
+            state, batch, batch.old_log_probs[:, 1:], jax.tree.map(jnp.zeros_like, state.params), 0.7
         )
     with (
         jax.set_mesh(mesh),
@@ -911,7 +909,7 @@ def test_data_parallel_config_rejects_invalid_settings(settings: dict[str, int])
 
 def test_learner_updates_full_batch_once(monkeypatch: pytest.MonkeyPatch) -> None:
     learner = training.Learner.__ray_metadata__.modified_class(
-        batcher=Mock(), actor=Mock(), config=training.Config(group_size=3)
+        batcher=Mock(), actor=Mock(), config=training.Config(group_size=3, loss=training.GRPOLossConfig())
     )
     learner.mesh = Mesh(devices=jax.devices()[:1], axis_names=("batch",))
     learner.state = training.TrainState.create(
@@ -933,9 +931,7 @@ def test_learner_updates_full_batch_once(monkeypatch: pytest.MonkeyPatch) -> Non
         anchor_log_probs: jax.Array,  # (B, T-1)
         gradient_sum: training.TrainParameters,  # Parameter shapes.
         temperature: float,
-        clip_coef: float,
-        rollout_is_threshold: float,
-        stable_config: training.StableReinforceConfig | None,
+        loss_config: training.LossConfig,
     ) -> tuple[training.TrainParameters, training.Metrics]:
         assert jax.sharding.get_mesh() == learner.mesh
         assert full_batch.token_ids.shape == (3, 2)
@@ -973,7 +969,9 @@ def test_learner_updates_full_batch_once(monkeypatch: pytest.MonkeyPatch) -> Non
     ],
 )
 def test_learner_omits_unevaluated_policy_metrics(value: float | None, monkeypatch: pytest.MonkeyPatch) -> None:
-    learner = training.Learner.__ray_metadata__.modified_class(batcher=Mock(), actor=Mock(), config=training.Config())
+    learner = training.Learner.__ray_metadata__.modified_class(
+        batcher=Mock(), actor=Mock(), config=training.Config(loss=training.GRPOLossConfig())
+    )
     learner.mesh = Mesh(devices=jax.devices()[:1], axis_names=("batch",))
     learner.state = training.TrainState.create(
         apply_fn=Mock(), params={"weight": jnp.zeros(())}, tx=optax.sgd(0.1)
@@ -992,9 +990,7 @@ def test_learner_omits_unevaluated_policy_metrics(value: float | None, monkeypat
         anchor_log_probs: jax.Array,  # (B, T-1) frozen scores.
         gradient_sum: training.TrainParameters,  # Parameter shapes.
         temperature: float,
-        clip_coef: float,
-        rollout_is_threshold: float,
-        stable_config: training.StableReinforceConfig | None,
+        loss_config: training.LossConfig,
     ) -> tuple[training.TrainParameters, training.Metrics]:
         measured = 0.0 if value is None else value
         return gradient_sum, {
@@ -1051,7 +1047,7 @@ def test_learner_optimizes_and_publishes_updated_adapters(
         config=training.Config(
             temperature=0.7,
             finetuning=training.LoRAConfig(rank=2, alpha=4),
-            rollout_is_threshold=1.25,
+            loss=training.GRPOLossConfig(rollout_is_threshold=1.25),
         ),
     )
     learner.model = model.clone(dtype="bfloat16", param_dtype=jnp.bfloat16)
@@ -1094,9 +1090,7 @@ def test_learner_optimizes_and_publishes_updated_adapters(
         anchor_log_probs: jax.Array,  # (B, T-1) frozen scores.
         gradient_sum: training.TrainParameters,  # Parameter shapes.
         temperature: float,
-        clip_coef: float,
-        rollout_is_threshold: float,
-        stable_config: training.StableReinforceConfig | None,
+        loss_config: training.LossConfig,
     ) -> tuple[training.TrainParameters, training.Metrics]:
         steps.append(int(current.step))
         return actual_update(
@@ -1105,9 +1099,7 @@ def test_learner_optimizes_and_publishes_updated_adapters(
             anchor_log_probs,
             gradient_sum,
             temperature,
-            clip_coef,
-            rollout_is_threshold,
-            stable_config,
+            loss_config,
         )
 
     update = Mock(wraps=record_update)
@@ -1123,7 +1115,7 @@ def test_learner_optimizes_and_publishes_updated_adapters(
     assert steps == [0]
     for call in update.call_args_list:
         assert jax.tree.leaves(call.args[0].params)[0].is_deleted()
-        assert call.args[6] == 1.25
+        assert call.args[5] == training.GRPOLossConfig(rollout_is_threshold=1.25)
         placed_batch = call.args[1]  # (B=4, T=8), (B,) leaves.
         for placed, original in zip(jax.tree.leaves(placed_batch), jax.tree.leaves(batch), strict=True):
             assert placed.shape == original.shape
@@ -1188,7 +1180,9 @@ def test_accumulation_matches_one_update_over_consecutive_batches(
     learner = training.Learner.__ray_metadata__.modified_class(
         batcher=Mock(),
         actor=Mock(),
-        config=training.Config(batch_size=8, grad_accum_steps=4, parameter_sync_steps=3, temperature=0.7),
+        config=training.Config(
+            batch_size=8, grad_accum_steps=4, parameter_sync_steps=3, temperature=0.7, loss=training.GRPOLossConfig()
+        ),
     )
     learner.mesh = jax.sharding.get_mesh()
     learner.state = jax.tree.map(jnp.copy, state)

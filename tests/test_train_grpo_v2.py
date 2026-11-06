@@ -29,7 +29,7 @@ from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 from ray import cloudpickle
 from ray._private import ray_constants
 from ray.exceptions import RayTaskError
@@ -99,7 +99,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
                 "padding_multiple": 64,
                 "drop_degenerate_groups": False,
                 "length_penalty": {"reference_tokens": 4096, "penalty": 0.05},
-                "rollout_is_threshold": 3.0,
+                "loss": {"kind": "grpo", "rollout_is_threshold": 3.0},
                 "prefetch_batches": 3,
                 "parameter_sync_steps": 4,
                 "max_staleness": 2,
@@ -127,7 +127,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
             padding_multiple=64,
             drop_degenerate_groups=False,
             length_penalty=training.LengthPenaltyConfig(reference_tokens=4096, penalty=0.05),
-            rollout_is_threshold=3.0,
+            loss=training.GRPOLossConfig(rollout_is_threshold=3.0),
             prefetch_batches=3,
             parameter_sync_steps=4,
             max_staleness=2,
@@ -364,8 +364,9 @@ def test_reasoning_gym_cli_and_actor_task_stream(tmp_path: Path, monkeypatch: py
         {"adamw_batch_size_scale": 10.01},
         pytest.param({"length_penalty_coef": 0.0}, id="removed-length-coefficient"),
         pytest.param({"max_tokens_penalty": 0.0}, id="removed-max-tokens-penalty"),
-        {"clip_coef": 1.0},
-        {"rollout_is_threshold": 0.0},
+        {"loss": {"kind": "grpo", "clip_coef": 1.0}},
+        {"loss": {"kind": "grpo", "rollout_is_threshold": 0.0}},
+        pytest.param({"clip_coef": 0.2}, id="removed-top-level-loss-setting"),
         {"max_grad_norm": 0.0},
         pytest.param({"minibatches_per_epoch": 1}, id="removed-minibatching"),
         {"grad_accum_steps": 0},
@@ -381,6 +382,41 @@ def test_reasoning_gym_cli_and_actor_task_stream(tmp_path: Path, monkeypatch: py
 def test_config_rejects_invalid_settings(settings: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         training.Config(**settings)
+
+
+@pytest.mark.parametrize(
+    "loss",
+    [
+        training.CISPOConfig(clip_low_threshold=0.5, clip_high_threshold=2.0),
+        training.GRPOLossConfig(clip_coef=0.15, rollout_is_threshold=3.0),
+        training.StableReinforceConfig(top_k=8, kl_coeff=0.02, kl_estimator="k3"),
+    ],
+    ids=["cispo", "grpo", "stable-reinforce"],
+)
+def test_tagged_loss_round_trip(loss: training.LossConfig, tmp_path: Path) -> None:
+    path = tmp_path / "loss.yaml"
+    path.write_text(yaml.safe_dump({"loss": asdict(loss)}))
+    config = training.load_config(path, training.Config)
+    assert type(config.loss) is type(loss)
+    assert config.loss == loss
+    assert pickle.loads(pickle.dumps(config)) == config
+    assert TypeAdapter(training.Config).validate_json(json.dumps(asdict(config))) == config
+
+
+@pytest.mark.parametrize(
+    "loss,error",
+    [
+        ({}, "union_tag_not_found"),
+        ({"kind": "unknown"}, "union_tag_invalid"),
+        ({"kind": "cispo", "clip_coef": 0.2}, "unexpected_keyword_argument"),
+        ({"kind": "grpo", "top_k": 32}, "unexpected_keyword_argument"),
+        ({"kind": "stable_reinforce", "clip_coef": 0.2}, "unexpected_keyword_argument"),
+        (None, "dict_type"),
+    ],
+)
+def test_tagged_loss_rejects_invalid_variants(loss: dict[str, object] | None, error: str) -> None:
+    with pytest.raises(ValidationError, match=error):
+        TypeAdapter(training.Config).validate_json(json.dumps({"loss": loss}))
 
 
 @pytest.mark.parametrize(
@@ -1009,7 +1045,7 @@ def test_actor_server_lifetime(
         model="Qwen/custom",
         finetuning=training.LoRAConfig() if mode == "lora" else training.FullFinetuningConfig(),
         vllm=training.VLLMConfig(max_num_batched_tokens=4096),
-        stable_reinforce=training.StableReinforceConfig() if mode == "full" else None,
+        loss=training.StableReinforceConfig() if mode == "full" else training.GRPOLossConfig(),
     )
     server = MagicMock()
     serve = Mock(return_value=server)
@@ -3413,7 +3449,7 @@ def test_create_agent_config_and_cleanup(
         temperature=0.7,
         rollout_timeout=300,
         finetuning=training.LoRAConfig() if mode == "lora" else training.FullFinetuningConfig(),
-        stable_reinforce=training.StableReinforceConfig() if mode == "full" else None,
+        loss=training.StableReinforceConfig() if mode == "full" else training.GRPOLossConfig(),
     )
     tokenizer = Mock()
     tokenizer.vocab_size = 128

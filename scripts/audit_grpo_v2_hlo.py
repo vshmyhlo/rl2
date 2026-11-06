@@ -14,7 +14,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from rl2.configuration import load_config
 from rl2.qwen3 import Qwen3Config, Qwen3LM
-from rl2.train_grpo_v2 import Config, GRPOBatch, accumulate_gradients, create_state, update
+from rl2.train_grpo_v2 import Config, GRPOBatch, StableReinforceConfig, accumulate_gradients, create_state, update
 
 
 def main() -> None:
@@ -53,7 +53,7 @@ def main() -> None:
     state = jax.tree.map(lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=replicated), state)
     microbatch_size = config.microbatch_size
     shape = (microbatch_size, args.length)
-    top_k = config.stable_reinforce.top_k if config.stable_reinforce is not None else 0
+    top_k = config.loss.top_k if isinstance(config.loss, StableReinforceConfig) else 0
     batch = GRPOBatch(
         token_ids=jax.ShapeDtypeStruct(shape, jnp.int32, sharding=batched),  # (B, T)
         attention_mask=jax.ShapeDtypeStruct(shape, jnp.bool_, sharding=batched),  # (B, T)
@@ -75,7 +75,7 @@ def main() -> None:
     if not args.donate_state:
         accumulation = jax.jit(
             accumulate_gradients.__wrapped__,
-            static_argnames=("temperature", "clip_coef", "rollout_is_threshold", "stable_config"),
+            static_argnames=("temperature", "loss_config"),
             in_shardings=(PartitionSpec(), PartitionSpec("batch"), PartitionSpec("batch"), PartitionSpec()),
             out_shardings=PartitionSpec(),
         )
@@ -95,9 +95,7 @@ def main() -> None:
                 ),  # (B, T-1) anchors.
                 gradient_sum,
                 config.temperature,
-                config.clip_coef,
-                config.rollout_is_threshold,
-                config.stable_reinforce,
+                config.loss,
             ),
             "update": optimizer_update.lower(state, gradient_sum, config.grad_accum_steps, True),
         }

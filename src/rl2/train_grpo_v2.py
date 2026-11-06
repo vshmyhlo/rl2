@@ -16,15 +16,15 @@ Startup scalars (at the restored iteration, or step 0 for a new run):
     learner/setup_seconds: Model/optimizer setup, checkpoint restore, and initial weight publication wall time.
 
 Optimization scalars (batch means averaged over the iteration unless noted):
-    train/policy_loss: GRPO clipped policy loss with truncated rollout importance weights, or score-centered REINFORCE excluding KL when stable_reinforce is enabled.
+    train/policy_loss: CISPO detached clipped-importance-weighted REINFORCE, GRPO clipped policy loss with truncated rollout importance weights, or StableReinforce score-centered policy loss excluding KL.
     train/approx_kl: GRPO only: mean exp(log_ratio) - 1 - log_ratio, where log_ratio is current minus frozen pre-update learner log-probability, bounded to [-20, 20].
     train/clip_fraction: GRPO only: fraction of current/anchor sampled-token probability ratios outside the PPO clip range.
-    train/rollout_log_prob_error_mean: Mean absolute learner minus rollout log-probability difference; uses frozen learner scores in GRPO and current scores in StableReinforce.
-    train/rollout_importance_weight_mean: GRPO only: mean applied token importance weight after safety bounding and truncation.
-    train/rollout_importance_weight_clipped_fraction: GRPO only: fraction of safety-bounded token weights above rollout_is_threshold.
+    train/rollout_log_prob_error_mean: Mean absolute learner minus rollout log-probability difference; uses frozen learner scores in GRPO and current scores in CISPO/StableReinforce.
+    train/rollout_importance_weight_mean: CISPO/GRPO: mean applied token importance weight after configured clipping (GRPO also safety-bounds log ratios).
+    train/rollout_importance_weight_clipped_fraction: CISPO/GRPO: fraction of raw CISPO ratios outside its configured thresholds, or safety-bounded GRPO weights above loss.rollout_is_threshold.
     train/loss: StableReinforce only: score-centered policy loss plus kl_coeff times train/sampler_kl.
     train/score_correction_mean: StableReinforce only: mean additive log-probability surrogate whose gradient centers the score; in nats.
-    train/sampler_kl: StableReinforce only: sampler-to-learner KL estimate in nats, before kl_coeff. k1 is log(q)-log(p), which can be negative on a finite batch; k3 is exp(d)-1-d with d=clip(log(p)-log(q), -20, 20). Logged even when kl_coeff is zero.
+    train/sampler_kl: CISPO/StableReinforce: sampler-to-learner KL estimate in nats. CISPO uses k3 for diagnostics only; StableReinforce reports its configured estimator before kl_coeff. k1 is log(q)-log(p), which can be negative on a finite batch; k3 is exp(d)-1-d with d=log(p)-log(q), without ratio clipping; extreme positive d can overflow. Logged even when kl_coeff is zero.
     train/sampler_topk_fraction_mean: StableReinforce only: mean recorded sampler probability mass in the retained top K alternatives, dimensionless.
     train/gradient_norm: Global norm of the window-averaged gradient before clipping; logged only when an optimizer update is applied.
     train/skipped_update_fraction: Logged at accumulation boundaries: 1 if the entire window has no training signal and is skipped, otherwise 0.
@@ -139,7 +139,8 @@ from rl2.agent_task import Task
 from rl2.alfworld_env import ALFWorldConfig, stream_alfworld_tasks
 from rl2.appworld_env import AppWorldConfig, stream_appworld_tasks
 from rl2.configuration import BaseConfig, load_config
-from rl2.grpo_v2 import stable_reinforce
+from rl2.grpo_v2 import cispo, stable_reinforce
+from rl2.grpo_v2.cispo import CISPOConfig
 from rl2.grpo_v2.reasoning_gym import ReasoningGymConfig, stream_reasoning_gym_tasks
 from rl2.grpo_v2.stable_reinforce import StableReinforceConfig
 from rl2.grpo_v2.state import LoRATrainState, TrainParameters
@@ -207,6 +208,16 @@ class FullFinetuningConfig:
     mode: Literal["full"] = "full"
 
 
+@config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class GRPOLossConfig:
+    kind: Literal["grpo"] = "grpo"
+    clip_coef: Annotated[float, Field(gt=0, lt=1)] = 0.2
+    rollout_is_threshold: Annotated[float, Field(gt=0)] = 2.0
+
+
+LossConfig = Annotated[CISPOConfig | GRPOLossConfig | StableReinforceConfig, Field(discriminator="kind")]
+
+
 @config_dataclass(frozen=True)
 class Config(BaseConfig):
     model: str = MODEL
@@ -240,9 +251,7 @@ class Config(BaseConfig):
     # New/reference optimizer batch-size ratio; configure batch dimensions separately.
     adamw_batch_size_scale: Annotated[float, Field(gt=0, le=10)] = 1.0
     finetuning: Annotated[LoRAConfig | FullFinetuningConfig, Field(discriminator="mode")] = LoRAConfig()
-    clip_coef: Annotated[float, Field(gt=0, lt=1)] = 0.2
-    rollout_is_threshold: Annotated[float, Field(gt=0)] = 2.0  # verl token-level truncated importance sampling.
-    stable_reinforce: StableReinforceConfig | None = None
+    loss: LossConfig = CISPOConfig()
     max_grad_norm: Annotated[float, Field(gt=0)] = 1.0
     attention_backend: AttentionBackend = "cudnn"  # Lower worst-case sampled-token error in the A100 vLLM audit.
     scan_layers: bool = True
@@ -358,9 +367,21 @@ def restore_checkpoint(
         raise ValueError("GRPO v2 checkpoint finetuning does not match the current configuration")
     if saved_config.get("model") != config.model:
         raise ValueError("GRPO v2 checkpoint model does not match the current configuration")
-    current_loss = asdict(config.stable_reinforce) if config.stable_reinforce is not None else None
-    if saved_config.get("stable_reinforce") != current_loss:
-        raise ValueError("GRPO v2 checkpoint stable_reinforce does not match the current configuration")
+    saved_loss = saved_config.get("loss")
+    if saved_loss is None:
+        # Version 2 checkpoints predating the tagged loss stored these fields at the top level.
+        saved_stable = saved_config.get("stable_reinforce")
+        saved_loss = (
+            {"kind": "stable_reinforce", **saved_stable}
+            if saved_stable is not None
+            else {
+                "kind": "grpo",
+                "clip_coef": saved_config.get("clip_coef", 0.2),
+                "rollout_is_threshold": saved_config.get("rollout_is_threshold", 2.0),
+            }
+        )
+    if saved_loss != asdict(config.loss):
+        raise ValueError("GRPO v2 checkpoint loss does not match the current configuration")
     if metadata["iteration"] != iteration or iteration < 0 or metadata["total_rollouts"] < 0:
         raise ValueError("Invalid GRPO v2 checkpoint progress")
     restored = manager.restore(
@@ -616,6 +637,14 @@ POLICY_DIAGNOSTICS = (
 )
 
 
+def policy_diagnostics(loss_config: LossConfig) -> tuple[str, ...]:
+    if isinstance(loss_config, CISPOConfig):
+        return cispo.DIAGNOSTICS
+    if isinstance(loss_config, StableReinforceConfig):
+        return stable_reinforce.DIAGNOSTICS
+    return POLICY_DIAGNOSTICS
+
+
 def token_distribution(
     state: TrainState,
     params: TrainParameters,  # HF parameter shapes or (R, I), (O, R) factors.
@@ -773,7 +802,7 @@ def create_state(
 
 @partial(
     jax.jit,
-    static_argnames=("temperature", "clip_coef", "rollout_is_threshold", "stable_config"),
+    static_argnames=("temperature", "loss_config"),
     in_shardings=(PartitionSpec(), PartitionSpec("batch"), PartitionSpec("batch"), PartitionSpec()),
     out_shardings=PartitionSpec(),
     donate_argnums=(3,),
@@ -784,24 +813,22 @@ def accumulate_gradients(
     anchor_log_probs: jax.Array,  # (B, T-1) frozen learner scores aligned with batch rows.
     gradient_sum: TrainParameters,  # Parameter shapes; the running sum for this outer iteration.
     temperature: float,
-    clip_coef: float,
-    rollout_is_threshold: float = 2.0,
-    stable_config: StableReinforceConfig | None = None,
+    loss_config: LossConfig = DEFAULT_CONFIG.loss,
 ) -> tuple[TrainParameters, Metrics]:
     """Add one full batch's gradients, donating the running sum and preserving state."""
     if batch.token_ids.shape[0] % jax.sharding.get_abstract_mesh().shape["batch"]:
         raise ValueError("learner device count must divide the rollout batch size")
     # Python logging runs on tracing, not on cached executions.
     logger.info(
-        "JIT trace accumulate_gradients: batch_shape=%s temperature=%s clip_coef=%s",
+        "JIT trace accumulate_gradients: batch_shape=%s temperature=%s loss=%s",
         batch.token_ids.shape,
         temperature,
-        clip_coef,
+        loss_config.kind,
     )
 
     def compute_gradients() -> tuple[TrainParameters, Metrics]:
         def loss_fn(params: TrainParameters) -> tuple[jax.Array, Metrics]:  # Parameter leaves -> (), scalars.
-            if stable_config is not None:
+            if isinstance(loss_config, StableReinforceConfig):
                 if batch.sampler_topk_ids is None or batch.sampler_topk_log_probs is None:
                     raise ValueError("StableReinforce requires sampling-time top-logprobs")
                 distribution = token_distribution(state, params, batch, temperature)  # (B, T-1, V)
@@ -814,14 +841,19 @@ def accumulate_gradients(
                     batch.old_log_probs[:, 1:],
                     batch.advantages,
                     batch.loss_mask[:, 1:],
-                    stable_config,
+                    loss_config,
+                )
+            log_probs = token_log_probs(state, params, batch, temperature)  # (B, T-1)
+            if isinstance(loss_config, CISPOConfig):
+                return cispo.objective(
+                    log_probs, batch.old_log_probs[:, 1:], batch.advantages, batch.loss_mask[:, 1:], loss_config
                 )
             return objective(
-                token_log_probs(state, params, batch, temperature),
+                log_probs,
                 batch,
                 anchor_log_probs,
-                clip_coef,
-                rollout_is_threshold,
+                loss_config.clip_coef,
+                loss_config.rollout_is_threshold,
             )
 
         (_, metrics), gradients = jax.value_and_grad(loss_fn, has_aux=True)(state.params)  # Scalars; parameter shapes.
@@ -830,13 +862,15 @@ def accumulate_gradients(
 
     def skip_gradients() -> tuple[TrainParameters, Metrics]:
         # Fixed JIT output structure; optimize excludes unevaluated policy diagnostics from logging.
-        names = ("train/loss", *stable_reinforce.DIAGNOSTICS) if stable_config is not None else POLICY_DIAGNOSTICS
+        names = policy_diagnostics(loss_config)
+        if isinstance(loss_config, StableReinforceConfig):
+            names = ("train/loss", *names)
         return gradient_sum, {  # Parameter shapes; scalar metrics.
             "train/policy_loss": jnp.asarray(0.0, dtype=jnp.float32),  # ()
             **{name: jnp.asarray(0.0, dtype=jnp.float32) for name in names},  # () Not evaluated.
         }
 
-    kl_active = stable_config is not None and stable_config.kl_coeff > 0
+    kl_active = isinstance(loss_config, StableReinforceConfig) and loss_config.kl_coeff > 0
     return jax.lax.cond(
         jnp.any(((batch.advantages != 0) | kl_active) & jnp.any(batch.loss_mask[:, 1:], axis=1)),
         compute_gradients,
@@ -899,8 +933,8 @@ def score_group(
 async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]:
     """Yield an agent configured from vLLM's context limit and close its client on exit."""
     tokenizer = await asyncio.to_thread(AutoTokenizer.from_pretrained, config.model)
-    if config.stable_reinforce is not None and config.stable_reinforce.top_k >= tokenizer.vocab_size:
-        raise ValueError("stable_reinforce.top_k must be smaller than the model vocabulary")
+    if isinstance(config.loss, StableReinforceConfig) and config.loss.top_k >= tokenizer.vocab_size:
+        raise ValueError("loss.top_k must be smaller than the model vocabulary")
     async with AsyncOpenAI(
         base_url=f"{SERVER_URL}/v1", api_key="EMPTY", timeout=config.rollout_timeout, max_retries=3
     ) as client:
@@ -918,7 +952,7 @@ async def create_agent(config: Config = DEFAULT_CONFIG) -> AsyncGenerator[Agent]
             temperature=config.temperature,
             rollout_timeout=config.rollout_timeout,
             environment_timeout=config.environment_timeout,
-            sampler_top_k=config.stable_reinforce.top_k if config.stable_reinforce is not None else 0,
+            sampler_top_k=config.loss.top_k if isinstance(config.loss, StableReinforceConfig) else 0,
         )
 
 
@@ -1038,8 +1072,8 @@ class Batcher:
             loss_mask: (B, T) bool sampled-token positions within max_staleness;
             old_log_probs: (B, T) float32 sampling-policy log-probabilities;
             advantages: (B,) float32 per-rollout advantages.
-            sampler_topk_ids: (B, T, K) int32 alternatives, or None in GRPO mode;
-            sampler_topk_log_probs: (B, T, K) float32 sampler scores, or None in GRPO mode.
+            sampler_topk_ids: (B, T, K) int32 alternatives, or None outside StableReinforce;
+            sampler_topk_log_probs: (B, T, K) float32 sampler scores, or None outside StableReinforce.
 
         Raises:
             ValueError: If there are no rollouts, a transcript exceeds the token budget,
@@ -1055,7 +1089,7 @@ class Batcher:
         multiple = self.config.padding_multiple
         width = min((length + multiple - 1) // multiple * multiple, token_limit)
         shape = (len(rollouts), width)
-        top_k = self.config.stable_reinforce.top_k if self.config.stable_reinforce is not None else 0
+        top_k = self.config.loss.top_k if isinstance(self.config.loss, StableReinforceConfig) else 0
         # Host copies avoid compiling JAX padding and reductions for every transcript length.
         batch = GRPOBatch(
             token_ids=np.zeros(shape, dtype=np.int32),  # (B, T)
@@ -1504,27 +1538,25 @@ class Learner:
             raise ValueError("learner device count must divide the rollout batch size")
         batched = NamedSharding(self.mesh, PartitionSpec("batch"))
         device_batch: GRPOBatch[jax.Array] = jax.device_put(batch, batched)  # (B, T), (B,), optional (B, T, K) leaves.
-        stable_config = self.config.stable_reinforce
+        loss_config = self.config.loss
         anchors = (
             compute_anchor_log_probs(self.state, device_batch, self.config.temperature)
-            if stable_config is None
+            if isinstance(loss_config, GRPOLossConfig)
             else jnp.zeros_like(device_batch.old_log_probs[:, 1:])
-        )  # (B, T-1); score centering does not need an anchor forward pass.
+        )  # (B, T-1); only GRPO needs an anchor forward pass.
         gradient_sum, metrics = accumulate_gradients(
             self.state,
             device_batch,
             anchors,
             gradient_sum,
             self.config.temperature,
-            self.config.clip_coef,
-            self.config.rollout_is_threshold,
-            stable_config,
+            loss_config,
         )  # Parameter shapes; scalar metrics.
         scalars = {name: float(value) for name, value in metrics.items()}
-        kl_active = stable_config is not None and stable_config.kl_coeff > 0
+        kl_active = isinstance(loss_config, StableReinforceConfig) and loss_config.kl_coeff > 0
         has_signal = bool(np.any(((batch.advantages != 0) | kl_active) & np.any(batch.loss_mask[:, 1:], axis=1)))
         if not has_signal:
-            for name in stable_reinforce.DIAGNOSTICS if stable_config is not None else POLICY_DIAGNOSTICS:
+            for name in policy_diagnostics(loss_config):
                 del scalars[name]
         return BatchGradientResult(gradient_sum=gradient_sum, metrics=scalars, has_signal=has_signal)
 
@@ -1604,7 +1636,7 @@ class Actor:
                     model=config.model,
                     lora_rank=config.finetuning.rank if config.finetuning.mode == "lora" else None,
                     config=config.vllm,
-                    **({"sampler_top_k": config.stable_reinforce.top_k} if config.stable_reinforce is not None else {}),
+                    **({"sampler_top_k": config.loss.top_k} if isinstance(config.loss, StableReinforceConfig) else {}),
                 )
             )
             wait_for_server(server)
