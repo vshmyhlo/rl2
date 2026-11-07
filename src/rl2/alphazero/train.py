@@ -1,6 +1,6 @@
 """Single-device AlphaZero sketch using PGX rules and Mctx PUCT search.
 
-Run: uv run --extra alphazero python -m rl2.train_alphazero --config configs/alphazero_chess.yaml
+Run: uv run --extra alphazero python -m rl2.alphazero.train --config configs/alphazero_chess.yaml
 For a cheap start, set env_id: tic_tac_toe and max_moves: 9 in the YAML config.
 
 Each iteration starts fresh games and samples updates from that rollout only.

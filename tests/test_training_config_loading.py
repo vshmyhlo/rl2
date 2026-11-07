@@ -10,7 +10,6 @@ from pydantic import ValidationError
 from rl2 import (
     ppo,
     ppo_rnd,
-    train_alphazero,
     train_grpo_reasoning,
     train_karel_ast_ar_edit,
     train_karel_ast_grpo,
@@ -18,6 +17,7 @@ from rl2 import (
     train_mappo,
     train_wm,
 )
+from rl2.alphazero import train as train_alphazero
 from rl2.configuration import BaseConfig
 from rl2.karel import KarelConfig
 from rl2.model.encoders.conv2d import ConvStage

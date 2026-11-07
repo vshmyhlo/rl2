@@ -18,7 +18,7 @@ pytest.importorskip("pgx")
 pytest.importorskip("mctx")
 import pgx
 
-from rl2 import train_alphazero as az
+from rl2.alphazero import train as az
 from rl2.alphazero.config import EvaluationConfig, ModelConfig
 
 
@@ -233,7 +233,7 @@ def test_main_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path.write_text("env_id: tic_tac_toe\niterations: 1\nrun_id: test\nckpt_dir: runs/alphazero/${run_id}\n")
     train = Mock()
     monkeypatch.setattr(az, "train", train)
-    monkeypatch.setattr(sys, "argv", ["train_alphazero", "--config", str(path)])
+    monkeypatch.setattr(sys, "argv", ["rl2.alphazero.train", "--config", str(path)])
     az.main()
     train.assert_called_once_with(
         replace(
@@ -249,7 +249,7 @@ def test_main_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 def test_main_rejects_cli_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     train = Mock()
     monkeypatch.setattr(az, "train", train)
-    monkeypatch.setattr(sys, "argv", ["train_alphazero", "--iterations", "1"])
+    monkeypatch.setattr(sys, "argv", ["rl2.alphazero.train", "--iterations", "1"])
     with pytest.raises(SystemExit) as error:
         az.main()
     assert error.value.code == 2
@@ -263,7 +263,7 @@ def test_main_reports_config_errors(
     path.write_text("num_envs: 0\n")
     train = Mock()
     monkeypatch.setattr(az, "train", train)
-    monkeypatch.setattr(sys, "argv", ["train_alphazero", "--config", str(path)])
+    monkeypatch.setattr(sys, "argv", ["rl2.alphazero.train", "--config", str(path)])
     with pytest.raises(SystemExit) as error:
         az.main()
     assert error.value.code == 2
