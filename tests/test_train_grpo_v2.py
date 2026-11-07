@@ -1163,7 +1163,6 @@ def test_learner_pulls_groups_through_batcher(
     monkeypatch.setattr(training.ray, "get", get)
     format_examples = Mock(wraps=training.format_rollout_examples)
     monkeypatch.setattr(training, "format_rollout_examples", format_examples)
-    include_examples = iteration % learner.config.example_log_interval == 0
 
     if fails:
         with pytest.raises(RuntimeError, match="rollout failed"):
@@ -1173,12 +1172,8 @@ def test_learner_pulls_groups_through_batcher(
         assert not hasattr(batch, "groups")
         assert batch.stop_counts == {"agent_completed": num_groups * 3}
         assert batch.num_output_tokens == num_groups * 3
-        if include_examples:
-            assert batch.examples.count("Full token sequence (special tokens preserved):") == 1
-            format_examples.assert_called_once()
-        else:
-            assert batch.examples == ""
-            format_examples.assert_not_called()
+        assert batch.examples.count("Full token sequence (special tokens preserved):") == 1
+        format_examples.assert_called_once()
         assert batch.training_batch.token_ids.shape == (num_groups * 3, 8)
         np.testing.assert_array_equal(batch.training_batch.advantages, 0.5)
     batcher_handle.fetch_next_batch.remote.assert_called_once_with(
@@ -1187,7 +1182,6 @@ def test_learner_pulls_groups_through_batcher(
         context_length=8,
         iteration=iteration,
         consumption_weight_version=0,
-        include_examples=include_examples,
     )
     assert actor.fetch_next_group.remote.call_count == num_groups
     assert all(call.kwargs == {"group_size": 3} for call in actor.fetch_next_group.remote.call_args_list)
@@ -1306,9 +1300,7 @@ def test_batcher_selects_groups_across_batch_boundaries(rollout: training.Rollou
             config=training.Config(prefetch_batches=2, checkpoint_interval=2),
         )
         async with asyncio.timeout(5), asyncio.TaskGroup() as tg:
-            first = tg.create_task(
-                batcher.fetch_next_batch(batch_size=4, group_size=2, context_length=8, include_examples=True)
-            )
+            first = tg.create_task(batcher.fetch_next_batch(batch_size=4, group_size=2, context_length=8))
             assert [await started.get() for _ in groups] == list(range(4))
             # The fastest groups belong to different submission-order batches.
             pending[3].set_result(groups[3])
@@ -1323,11 +1315,7 @@ def test_batcher_selects_groups_across_batch_boundaries(rollout: training.Rollou
             np.testing.assert_array_equal(first_batch.training_batch.advantages, np.repeat(first_indices, 2))
             assert first_batch.training_batch.token_ids.shape == (4, 8)
 
-            second = tg.create_task(
-                batcher.fetch_next_batch(
-                    batch_size=4, group_size=2, context_length=8, iteration=2, include_examples=True
-                )
-            )
+            second = tg.create_task(batcher.fetch_next_batch(batch_size=4, group_size=2, context_length=8, iteration=2))
             pending[0].set_result(groups[0])
             await asyncio.sleep(0)
             pending[2].set_result(groups[2])
@@ -1374,7 +1362,6 @@ def test_learner_cancels_prefetch_on_update_failure(
             context_length=8,
             iteration=1,
             consumption_weight_version=0,
-            include_examples=False,
         )
         raise RuntimeError("update failed")
 
@@ -1496,7 +1483,7 @@ def test_batch_refills_degenerate_groups(drop_degenerate_groups: bool, rollout: 
         actor=actor, config=training.Config(drop_degenerate_groups=drop_degenerate_groups)
     )
 
-    batch = asyncio.run(batcher.fetch_next_batch(batch_size=4, group_size=2, context_length=8, include_examples=True))
+    batch = asyncio.run(batcher.fetch_next_batch(batch_size=4, group_size=2, context_length=8))
 
     expected_groups = groups[2:] if drop_degenerate_groups else groups[:2]
     assert actor.fetch_next_group.remote.await_count == (4 if drop_degenerate_groups else 2)
@@ -1624,7 +1611,6 @@ def test_batch_masks_stale_prefetched_tokens(
                     context_length=8,
                     iteration=2,
                     consumption_weight_version=consumption_weight_version,
-                    include_examples=True,
                 )
             )
             if not complete_before_fetch:
@@ -2523,7 +2509,7 @@ def test_batcher_logs_every_taskset(rollout: training.Rollout) -> None:
     actor.fetch_next_group.remote = AsyncMock(side_effect=groups)
     batcher = training.Batcher.__ray_metadata__.modified_class(actor=actor)
 
-    batch = asyncio.run(batcher.fetch_next_batch(batch_size=18, group_size=2, context_length=8, include_examples=True))
+    batch = asyncio.run(batcher.fetch_next_batch(batch_size=18, group_size=2, context_length=8))
 
     assert batch.examples.count("Full token sequence") == 9
     for index in range(9):
@@ -2601,7 +2587,6 @@ def test_learner_logs_examples_at_configured_interval(
         *,
         iteration: int,
         consumption_weight_version: int,
-        include_examples: bool,
     ) -> training.RolloutBatch:
         batch = asyncio.run(
             batcher.fetch_next_batch(
@@ -2610,7 +2595,6 @@ def test_learner_logs_examples_at_configured_interval(
                 context_length=context_length,
                 iteration=iteration,
                 consumption_weight_version=consumption_weight_version,
-                include_examples=include_examples,
             )
         )
         submitted.append(batch)
@@ -2629,7 +2613,8 @@ def test_learner_logs_examples_at_configured_interval(
     messages = [message for message in caplog.messages if "Rollout examples | step" in message]
     assert not messages
     assert len([message for message in caplog.messages if message.startswith("iteration=")]) == 7
-    assert [bool(batch.examples) for batch in submitted] == [False, False, True, False, False, True, False]
+    assert len(submitted) == 7
+    assert all(batch.examples for batch in submitted)
     for step, call in zip((3, 6), artifacts, strict=True):
         text = call.args[0]
         assert text.startswith(f"Rollout examples | step {step}\n\n{'=' * 72}\n")
@@ -3132,9 +3117,7 @@ def test_batcher_collects_groups_concurrently(
         async with aclosing(actor):
             with training.span("test.batch") as parent:
                 async with asyncio.timeout(5):
-                    result = await batcher.fetch_next_batch(
-                        batch_size=4, group_size=2, context_length=16, include_examples=True
-                    )
+                    result = await batcher.fetch_next_batch(batch_size=4, group_size=2, context_length=16)
                 assert otel_trace.get_current_span() is parent
                 return result
 
@@ -3568,7 +3551,6 @@ def test_learner_accumulates_microbatches_and_publishes_on_updates(
     )
     fetches = learner.batcher.fetch_next_batch.remote.call_args_list
     assert [call.kwargs["iteration"] for call in fetches] == list(range(1, 65))
-    assert [call.kwargs["iteration"] for call in fetches if call.kwargs["include_examples"]] == [32, 64]
     assert all(call.kwargs["batch_size"] == 2 for call in fetches)
     assert [values["train/rollouts_total"] for values in metrics] == [32, 64, 96, 128]
     saves = [call.args[1] for call in training.save_checkpoint.call_args_list]
@@ -3767,7 +3749,6 @@ def test_batcher_splits_groups_and_restores_leftovers(rollout: training.Rollout,
                 context_length=8,
                 iteration=iteration,
                 consumption_weight_version=0 if iteration <= 2 else 1,
-                include_examples=True,
             )
             assert batch.training_batch.token_ids.shape == (3, 8)
             consumed.extend(batch.training_batch.token_ids[:, 1].tolist())

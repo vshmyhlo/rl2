@@ -22,9 +22,9 @@ Optimization scalars (batch means averaged over the iteration unless noted):
     train/rollout_log_prob_error_mean: Mean absolute learner minus rollout log-probability difference; uses frozen learner scores in GRPO and current scores in CISPO/StableReinforce.
     train/rollout_importance_weight_mean: CISPO/GRPO: mean applied token importance weight after configured clipping (GRPO also safety-bounds log ratios).
     train/rollout_importance_weight_clipped_fraction: CISPO/GRPO: fraction of raw CISPO ratios outside its configured thresholds, or safety-bounded GRPO weights above loss.rollout_is_threshold.
-    train/loss: StableReinforce only: score-centered policy loss plus kl_coeff times train/sampler_kl.
+    train/loss: StableReinforce only: score-centered policy loss plus the configured sampler KL penalty, using uncapped KL values.
     train/score_correction_mean: StableReinforce only: mean additive log-probability surrogate whose gradient centers the score; in nats.
-    train/sampler_kl: CISPO/StableReinforce: sampler-to-learner KL estimate in nats. CISPO uses k3 for diagnostics only; StableReinforce reports its configured estimator before kl_coeff. k1 is log(q)-log(p), which can be negative on a finite batch; k3 is exp(d)-1-d with d=log(p)-log(q), without ratio clipping; extreme positive d can overflow. Logged even when kl_coeff is zero.
+    train/sampler_kl: CISPO/StableReinforce: sampler-to-learner KL estimate in nats. CISPO uses k3 for diagnostics only; StableReinforce reports its configured estimator before kl_coeff. k1 is log(q)-log(p), which can be negative on a finite batch. k3 is exp(d)-1-d with d=log(p)-log(q), capped per token at 1e30 before averaging with the exponent bounded before evaluation. This diagnostic cap does not affect the loss or gradients. Logged even when kl_coeff is zero.
     train/sampler_topk_fraction_mean: StableReinforce only: mean recorded sampler probability mass in the retained top K alternatives, dimensionless.
     train/gradient_norm: Global norm of the window-averaged gradient before clipping; logged only when an optimizer update is applied.
     train/skipped_update_fraction: Logged at accumulation boundaries: 1 if the entire window has no training signal and is skipped, otherwise 0.
@@ -549,7 +549,6 @@ def build_rollout_batch(
     *,
     consumption_weight_version: int,
     max_staleness: int,
-    include_examples: bool = False,
     skipped_groups: int = 0,
     latest_examples: dict[str, RolloutGroup] | None = None,
 ) -> RolloutBatch:
@@ -620,7 +619,7 @@ def build_rollout_batch(
         },
         stop_counts=Counter(rollout.stop_condition for rollout in rollouts),
         num_output_tokens=sum(rollout.num_output_tokens for rollout in rollouts),
-        examples=format_rollout_examples(list(latest_examples.values())) if include_examples else "",
+        examples=format_rollout_examples(list(latest_examples.values())),
         timing_metrics=timing_metrics,
         taskset_counts={name: len(values) for name, values in rewards_by_taskset.items()},
     )
@@ -1217,7 +1216,6 @@ class Batcher:
         *,
         iteration: int = 1,
         consumption_weight_version: int = 0,
-        include_examples: bool = False,
     ) -> RolloutBatch:
         """Consume exactly batch_size rollouts, retaining unused parts of scored groups."""
         if batch_size < 1:
@@ -1272,7 +1270,6 @@ class Batcher:
                 training_batch=training_batch,
                 consumption_weight_version=consumption_weight_version,
                 max_staleness=self.config.max_staleness,
-                include_examples=include_examples,
                 latest_examples=self._latest_examples,
                 skipped_groups=skipped_groups,
                 timing_metrics={
@@ -1521,7 +1518,6 @@ class Learner:
                 context_length=self.model.config.max_position_embeddings,
                 iteration=iteration,
                 consumption_weight_version=self.weight_version,
-                include_examples=iteration % (self.config.grad_accum_steps * self.config.example_log_interval) == 0,
             )
         )
 

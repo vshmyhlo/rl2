@@ -12,6 +12,8 @@ import jax.numpy as jnp
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
+from rl2.grpo_v2.kl import k3_diagnostic
+
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class StableReinforceConfig:
@@ -37,8 +39,8 @@ def score_correction(
     head_probs = jnp.exp(head_log_probs)  # (..., K)
     sampler_probs = jnp.exp(sampler_head_log_probs)  # (..., K)
     # Floor both tails equally so matching saturated heads still give zero correction.
-    sampler_tail = jnp.maximum(1 - sampler_probs.sum(axis=-1), jnp.finfo(jnp.float32).eps)  # (...,)
-    learner_tail = jnp.maximum(1 - head_probs.sum(axis=-1), jnp.finfo(jnp.float32).eps)  # (...,)
+    sampler_tail = jnp.maximum(1 - sampler_probs.sum(axis=-1), 1e-6)  # (...,)
+    learner_tail = jnp.maximum(1 - head_probs.sum(axis=-1), 1e-6)  # (...,)
     residual = jax.lax.stop_gradient(sampler_probs - (sampler_tail / learner_tail)[..., None] * head_probs)  # (..., K)
     return (residual * head_log_probs).sum(axis=-1)  # (...,)
 
@@ -77,7 +79,7 @@ def objective(
         "train/policy_loss": policy_loss,  # ()
         "train/loss": loss,  # ()
         "train/score_correction_mean": average(correction),  # ()
-        "train/sampler_kl": sampler_kl,  # ()
+        "train/sampler_kl": average(k3_diagnostic(log_ratio)) if config.kl_estimator == "k3" else sampler_kl,  # ()
         "train/sampler_topk_fraction_mean": average(jnp.exp(sampler_head_log_probs).sum(axis=-1)),  # ()
         "train/rollout_log_prob_error_mean": average(jnp.abs(log_ratio)),  # ()
     }

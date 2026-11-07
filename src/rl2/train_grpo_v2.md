@@ -332,7 +332,7 @@ additional ratio floor. We average tokens within each rollout, then all rollouts
 equally; fully masked rows contribute zero. Tinker reports a token sum instead.
 CISPO needs neither anchor scoring nor top-k probabilities. It logs applied weights,
 the clipped fraction, absolute learner/sampler log-probability error, and a k3
-`train/sampler_kl` diagnostic; it adds no KL penalty.
+`train/sampler_kl` diagnostic, capped per token at `1e30` before averaging; it adds no KL penalty.
 
 GRPO remains available explicitly:
 
@@ -395,7 +395,7 @@ retain their existing semantics. Losses average retained tokens per rollout, the
 all rollouts, with fully masked rows contributing zero.
 
 For sampler head H, learner probabilities p, and recorded sampler probabilities q:
-`rho = max(1-sum(q_H), float32_epsilon) / max(1-sum(p_H), float32_epsilon)` and
+`rho = max(1-sum(q_H), 1e-6) / max(1-sum(p_H), 1e-6)` and
 `correction = sum(stop_gradient(q_H-rho*p_H) * log(p_H))`.
 The policy loss is `-advantage * (log(p_sampled)-correction)`. Equal tail floors
 preserve zero correction for matching heads whose mass rounds to one; the unrecorded sampler tail is
@@ -403,7 +403,9 @@ approximated by the learner's conditional tail. `k1` adds
 `kl_coeff * (log(q_sampled)-log(p_sampled))`; `k3` adds
 `kl_coeff * (exp(d)-1-d)` with `d=log(p_sampled)-log(q_sampled)`. The k3 ratio is unclipped, matching
 the documented gradient; extreme positive differences can overflow. Setting
-`kl_coeff: 0` fully disables the penalty even then. Both KL estimators use our
+`kl_coeff: 0` fully disables the penalty even then. The logged k3 diagnostic caps
+each token at `1e30` before averaging, with bounded exponentiation to avoid overflow;
+this does not cap the actual KL penalty or its gradient. Both KL estimators use our
 rollout averaging rather than Tinker’s token sum.
 This KL targets the sampling policy, not a reference model.
 
@@ -666,8 +668,8 @@ mean over all retained rollouts in the batch.
 Every `example_log_interval` iterations (default 10, positive integer), it saves
 full token transcripts, final observations, rewards, and advantages. The batcher
 keeps the last rollout in sampling order from the latest consumed group for each
-configured taskset name, including across logging intervals. At each interval it
-formats one example per taskset seen so far, labeled with its taskset name and
+configured taskset name, including across logging intervals. Every batch includes
+one formatted example per taskset seen so far, labeled with its taskset name and
 task ID. Unconsumed prefetched groups and discarded groups are excluded. This
 example cache starts empty when training restarts.
 Stop fractions include all `StopCondition` labels, with zero for absent labels.

@@ -9,7 +9,15 @@ from pydantic import ValidationError
 
 from rl2 import train_grpo_v2 as training
 from rl2.grpo_v2 import cispo
+from rl2.grpo_v2.kl import k3_diagnostic
 from rl2.qwen3 import Qwen3Output, Variables
+
+
+def test_k3_diagnostic_bounds_extremes_and_preserves_ordinary_values() -> None:
+    log_ratio = jnp.array([[0.0, 1.0, -1.0], [100.0, 1e35, -1e35]])  # (B, T)
+    diagnostic = jax.jit(k3_diagnostic)(log_ratio)  # (B, T)
+    assert diagnostic.shape == log_ratio.shape
+    np.testing.assert_allclose(diagnostic, [[0, np.expm1(1) - 1, np.expm1(-1) + 1], [1e30, 1e30, 1e30]], rtol=1e-6)
 
 
 @pytest.mark.parametrize("lower", [0.0, 0.5], ids=["default-no-floor", "positive-floor"])
@@ -44,13 +52,14 @@ def test_extreme_ratios_preserve_configured_clipping(upper: float) -> None:
     scores = jnp.array([[-1.0, -40.0, -jnp.inf]])  # (B, T)
     old = jnp.array([[-100.0, -1.0, -jnp.inf]])  # (B, T)
 
-    def loss(current: jax.Array) -> jax.Array:  # (B, T) -> ()
+    def loss(current: jax.Array) -> tuple[jax.Array, training.Metrics]:  # (B, T) -> (), scalar metrics.
         return cispo.objective(
             current, old, jnp.ones(1), jnp.array([[True, True, False]]), cispo.CISPOConfig(clip_high_threshold=upper)
-        )[0]
+        )
 
-    gradient = jax.jit(jax.grad(loss))(scores)  # (B, T)
+    (_, metrics), gradient = jax.jit(jax.value_and_grad(loss, has_aux=True))(scores)  # Scalars; (B, T).
     np.testing.assert_allclose(gradient, [[-upper / 2, -np.exp(-39) / 2, 0]], rtol=1e-6, atol=0)
+    assert float(metrics["train/sampler_kl"]) == pytest.approx(5e29)
 
 
 @pytest.mark.parametrize(

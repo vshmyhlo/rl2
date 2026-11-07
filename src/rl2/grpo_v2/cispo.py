@@ -7,6 +7,8 @@ import jax.numpy as jnp
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
+from rl2.grpo_v2.kl import k3_diagnostic
+
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class CISPOConfig:
@@ -50,7 +52,7 @@ def objective(
     loss = -average(weights * advantages[:, None] * log_probs)  # ()
     return loss, {
         "train/policy_loss": loss,  # ()
-        "train/sampler_kl": average(jnp.expm1(log_ratio) - log_ratio),  # ()
+        "train/sampler_kl": average(k3_diagnostic(log_ratio)),  # ()
         "train/rollout_log_prob_error_mean": average(jnp.abs(log_ratio)),  # ()
         "train/rollout_importance_weight_mean": average(weights),  # ()
         "train/rollout_importance_weight_clipped_fraction": average(

@@ -43,11 +43,11 @@ def test_centering_is_noop_on_policy_and_handles_saturated_head() -> None:
 
 
 def test_k3_gradient_remains_active_for_large_mismatch() -> None:
-    scores = jnp.array([[-1.0, -31.0, -jnp.inf]])  # (B, T)
-    old = jnp.array([[-31.0, -1.0, -jnp.inf]])  # (B, T)
+    scores = jnp.array([[-1.0, -76.0, -jnp.inf]])  # (B, T)
+    old = jnp.array([[-76.0, -1.0, -jnp.inf]])  # (B, T)
     head = jnp.full((1, 3, 2), -2.0)  # (B, T, K)
 
-    def loss(current: jax.Array) -> jax.Array:  # (B, T) -> ()
+    def loss(current: jax.Array) -> tuple[jax.Array, training.Metrics]:  # (B, T) -> (), scalar metrics.
         return stable.objective(
             current,
             head,
@@ -56,17 +56,19 @@ def test_k3_gradient_remains_active_for_large_mismatch() -> None:
             jnp.zeros(1),
             jnp.array([[True, True, False]]),
             stable.StableReinforceConfig(kl_coeff=0.01, kl_estimator="k3"),
-        )[0]
+        )
 
-    value, gradient = jax.jit(jax.value_and_grad(loss))(scores)  # (), (B, T)
+    (value, metrics), gradient = jax.jit(jax.value_and_grad(loss, has_aux=True))(scores)  # Scalars; (B, T).
     assert value.shape == () and gradient.shape == (1, 3)
-    np.testing.assert_allclose(gradient, [[0.005 * np.expm1(30), 0.005 * np.expm1(-30), 0]], rtol=1e-6)
+    np.testing.assert_allclose(gradient, [[0.005 * np.expm1(75), 0.005 * np.expm1(-75), 0]], rtol=1e-6)
+    assert float(value) == pytest.approx(0.005 * np.expm1(75))
+    assert float(metrics["train/sampler_kl"]) == pytest.approx(5e29)
 
 
 def test_disabled_k3_does_not_affect_policy_gradient_on_overflow() -> None:
     head = jnp.full((1, 1, 2), -2.0)  # (B, T, K)
 
-    def loss(current: jax.Array) -> jax.Array:  # (B, T) -> ()
+    def loss(current: jax.Array) -> tuple[jax.Array, training.Metrics]:  # (B, T) -> (), scalar metrics.
         return stable.objective(
             current,
             head,
@@ -75,11 +77,24 @@ def test_disabled_k3_does_not_affect_policy_gradient_on_overflow() -> None:
             jnp.ones(1),
             jnp.ones((1, 1), dtype=jnp.bool_),
             stable.StableReinforceConfig(kl_coeff=0, kl_estimator="k3"),
-        )[0]
+        )
 
-    value, gradient = jax.jit(jax.value_and_grad(loss))(jnp.full((1, 1), -1.0))  # (), (B, T)
+    (value, metrics), gradient = jax.jit(jax.value_and_grad(loss, has_aux=True))(jnp.full((1, 1), -1.0))
     assert float(value) == pytest.approx(1.0)
     np.testing.assert_array_equal(gradient, -1.0)
+    assert float(metrics["train/sampler_kl"]) == pytest.approx(1e30)
+
+
+def test_score_centering_uses_reference_tail_floor() -> None:
+    head = jnp.log(jnp.array([[1.0], [0.5]]))  # (B, K)
+    sampler = jnp.log(jnp.array([[0.5], [1.0]]))  # (B, K)
+
+    def correction(current: jax.Array) -> jax.Array:  # (B, K) -> ()
+        return stable.score_correction(current, sampler).sum()  # ()
+
+    gradient = jax.jit(jax.grad(correction))(head)  # (B, K)
+    assert gradient.shape == (2, 1)
+    np.testing.assert_allclose(gradient, [[-499999.5], [0.999999]], rtol=1e-7)
 
 
 @pytest.mark.parametrize("estimator", ["k1", "k3"])
