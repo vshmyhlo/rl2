@@ -1,11 +1,53 @@
 ---
 layout: ../layouts/ArticleLayout.astro
 title: Hello, world
-description: A place for articles and interactive explanations.
+description: A tiny exploration of circles and waves, with equations and an interactive figure.
 ---
+
+import WaveDemo from '../components/WaveDemo';
+
+<p className="eyebrow">A small experiment · 2 minute read</p>
 
 # Hello, world
 
-A place for articles and interactive explanations.
+What does a circle sound like? Let's start with something simpler:
+watch a point move around one, and follow its height.
 
-This is the first page, written in **MDX** and built with **Astro**.
+## One idea, two pictures
+
+<figure>
+  <div className="image-pair">
+    <img src="/images/orbit.svg" width="480" height="300" alt="A point on a circle, with its vertical height highlighted in orange." />
+    <img src="/images/wave.svg" width="480" height="300" alt="A sine wave showing how that height rises and falls over one full turn." />
+  </div>
+  <figcaption>Fig. 1 — Circular motion on the left; the same vertical motion unfolded on the right.</figcaption>
+</figure>
+
+The point moves around a circle of radius $A$. Its position at angle $\theta$ is:
+
+$$
+x = A\cos\theta, \qquad y = A\sin\theta.
+$$
+
+Plot just the height against the angle, and you get a sine wave.
+One complete turn is $2\pi$ radians.
+
+## Give it a turn
+
+Press **Play**, or move the angle slider yourself. Change the amplitude to make
+both the circle and the wave taller. The two orange dots always have the same height.
+
+<WaveDemo client:visible />
+
+## A little more math
+
+If the point makes $f$ turns per second, its angle is $\theta = 2\pi ft$:
+
+$$
+y(t) = A\sin(2\pi ft).
+$$
+
+Amplitude controls the height; frequency controls how quickly the pattern repeats.
+That same simple shape shows up in sound, pendulums, and signals.
+
+<footer>A first note. More things to play with soon.</footer>

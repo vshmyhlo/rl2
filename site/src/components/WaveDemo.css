@@ -1,0 +1,15 @@
+.wave-demo { padding: 1.25rem; border: 1px solid #deded8; border-radius: 0.75rem; background: #fffefa; }
+.wave-demo svg { display: block; width: 100%; height: auto; overflow: visible; }
+.wave-demo .axes { fill: none; stroke: #d6d6d0; stroke-width: 1.5; }
+.wave-demo .curve { fill: none; stroke: #606ca0; stroke-width: 2.5; }
+.wave-demo .guide { fill: none; stroke: #c66539; stroke-dasharray: 4 5; opacity: 0.5; }
+.wave-demo .dot { fill: #c66539; }
+.wave-demo .labels { fill: #64656c; font: 13px system-ui, sans-serif; }
+.wave-demo .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 1.25rem; margin-top: 1rem; font: 0.85rem system-ui, sans-serif; }
+.wave-demo label { flex: 1; min-width: 9rem; }
+.wave-demo label span { display: flex; justify-content: space-between; gap: 0.5rem; }
+.wave-demo output { font-variant-numeric: tabular-nums; color: #64656c; }
+.wave-demo input { width: 100%; margin: 0.75rem 0 0; accent-color: #606ca0; cursor: pointer; }
+.wave-demo button { min-width: 5rem; min-height: 2.75rem; padding: 0.6rem 1rem; border: 0; border-radius: 0.4rem; background: #606ca0; color: white; font: inherit; cursor: pointer; }
+.wave-demo button:hover { background: #4c5888; }
+.wave-demo :focus-visible { outline: 2px solid #c66539; outline-offset: 4px; }
