@@ -12,9 +12,9 @@ from rl2.configuration import load_config
     "changes,match",
     [
         ({"num_simulations": 0}, "num_simulations"),
-        ({"checkpoint_interval_seconds": 0.0}, "checkpoint_interval_seconds"),
-        ({"log_interval_seconds": 0.0}, "log_interval_seconds"),
-        ({"log_interval_seconds": float("inf")}, "log_interval_seconds"),
+        ({"checkpoint_interval": 0}, "checkpoint_interval"),
+        ({"log_interval": 0}, "log_interval"),
+        ({"eval_interval": 0}, "eval_interval"),
         ({"learning_rate": float("nan")}, "learning_rate"),
         ({"max_grad_norm": float("inf")}, "max_grad_norm"),
         ({"weight_decay": -1.0}, "weight_decay"),
@@ -57,11 +57,13 @@ def test_load_partial_model_config(tmp_path: Path) -> None:
     assert config.model == ModelConfig(channels=4)
 
 
-def test_load_log_interval(tmp_path: Path) -> None:
-    assert Config().log_interval_seconds == 60.0
+def test_load_intervals(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
-    path.write_text("log_interval_seconds: 15.5\n")
-    assert load_config(path, Config).log_interval_seconds == 15.5
+    path.write_text("log_interval: 2\ncheckpoint_interval: 5\neval_interval: 15\n")
+    config = load_config(path, Config)
+    assert config.log_interval == 2
+    assert config.checkpoint_interval == 5
+    assert config.eval_interval == 15
 
 
 def test_load_evaluation_config(tmp_path: Path) -> None:
@@ -69,14 +71,11 @@ def test_load_evaluation_config(tmp_path: Path) -> None:
     path.write_text("evaluation:\n  num_openings: 3\n")
     config = load_config(path, Config)
     assert config.evaluation == EvaluationConfig(num_openings=3)
-    assert config.evaluation.interval_seconds == 1800.0
 
 
 @pytest.mark.parametrize(
     "settings",
     [
-        {"interval_seconds": 0.0},
-        {"interval_seconds": float("inf")},
         {"num_openings": 0},
         {"num_openings": True},
         {"opening_moves": -1},
@@ -108,8 +107,14 @@ def test_load_rejects_invalid_model_config(tmp_path: Path, contents: str, match:
         load_config(path, Config)
 
 
-def test_load_default_config() -> None:
-    path = Path(__file__).resolve().parents[1] / "configs/alphazero_chess.yaml"
+def test_load_interpolated_run_paths(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "env_id: chess\n"
+        "seed: 0\n"
+        "run_id: alphazero_${path_name:${env_id}}_seed${seed}\n"
+        "ckpt_dir: /runs/alphazero/${run_id}\n"
+    )
     config = load_config(path, Config)
     assert config.env_id == "chess"
     assert config.run_id == "alphazero_chess_seed0"
@@ -123,6 +128,12 @@ def test_load_default_config() -> None:
         ("num_envs: 1.5", ValueError, "num_envs"),
         ("num_envs: true", ValueError, "num_envs"),
         ("unknown_setting: 1", ValueError, "unknown_setting"),
+        ("log_interval: 1.5", ValueError, "log_interval"),
+        ("checkpoint_interval: true", ValueError, "checkpoint_interval"),
+        ("eval_interval: -1", ValueError, "eval_interval"),
+        ("log_interval_seconds: 60.0", ValueError, "log_interval_seconds"),
+        ("checkpoint_interval_seconds: 600.0", ValueError, "checkpoint_interval_seconds"),
+        ("evaluation:\n  interval_seconds: 1800.0", ValueError, "interval_seconds"),
     ],
 )
 def test_load_config_rejects_invalid_input(tmp_path: Path, contents: str, error: type[Exception], match: str) -> None:

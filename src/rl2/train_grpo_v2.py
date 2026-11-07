@@ -146,6 +146,7 @@ from rl2.grpo_v2.stable_reinforce import StableReinforceConfig
 from rl2.grpo_v2.state import LoRATrainState, TrainParameters
 from rl2.grpo_v2.weight_transfer import full_weight_publisher, lora_weight_publisher
 from rl2.lm_envs.codegym.env import CodeGymConfig, stream_codegym_tasks
+from rl2.lm_envs.crafter import CrafterConfig, stream_crafter_tasks
 from rl2.mlflow_logging import MLflowLogger
 from rl2.qwen3 import (
     AttentionBackend,
@@ -175,7 +176,8 @@ class LengthPenaltyConfig:
 @config_dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class WeightedTasksetConfig:
     taskset: Annotated[
-        ALFWorldConfig | AppWorldConfig | CodeGymConfig | ReasoningGymConfig | WebShopConfig, Field(discriminator="id")
+        ALFWorldConfig | AppWorldConfig | CodeGymConfig | CrafterConfig | ReasoningGymConfig | WebShopConfig,
+        Field(discriminator="id"),
     ]
     weight: Annotated[float, Field(ge=0, lt=float("inf"))] = 1.0
 
@@ -1589,6 +1591,8 @@ def stream_tasks(
             streams[name] = stream_appworld_tasks(taskset, rng, timeout)
         elif isinstance(taskset, CodeGymConfig):
             streams[name] = stream_codegym_tasks(taskset, rng)
+        elif isinstance(taskset, CrafterConfig):
+            streams[name] = stream_crafter_tasks(taskset, rng)
         elif isinstance(taskset, WebShopConfig):
             streams[name] = stream_webshop_tasks(taskset, rng, timeout)
         else:

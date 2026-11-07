@@ -4,7 +4,7 @@
 and a small custom tool-calling interaction loop. `tasksets` is a mapping keyed by
 unique, lowercase `snake_case` taskset identifiers (starting with a letter). Each entry contains
 a relative `weight` (default 1) and a `taskset` with `id: alfworld`, `appworld`,
-`codegym`, `reasoning_gym`, or `webshop`; the other environment presets are unsupported. For example:
+`codegym`, `crafter`, `reasoning_gym`, or `webshop`; the other environment presets are unsupported. For example:
 
 ```yaml
 tasksets:
@@ -100,6 +100,30 @@ The preset matches `mix.yaml` training settings, including full finetuning,
 It needs capacity for up to 160 concurrent episodes. Increase the deployed
 40-worker pool and its allowed worker ports before running this preset, or set
 `prefetch_batches: 0` to fit that pool. Account for other jobs sharing the server.
+
+For [Crafter](https://github.com/danijar/crafter), use `configs/grpo_v2/crafter.yaml`.
+The pinned upstream package is installed by `uv sync`; no dataset or server is needed.
+Each group samples a world seed from the checkpointed task RNG. Every attempt owns
+a separate Ray worker and starts with that same seed. Workers are killed on rollout
+exit, including errors, timeouts, and cancellation.
+
+Observations replace RGB images with a 9-column, 7-row symbol map matching Crafter's
+local viewport, plus position, facing, sleeping, daylight, vitals, inventory counts,
+and unlocked achievement counts. The system prompt explains the symbols; plants
+distinguish growing and ripe states. Objects cover terrain, and cells outside the
+world are `?`. No tiles outside the local view are exposed. This is a semantic text
+view: darkness and sleep do not obscure symbols as they do pixels. Rendering reads
+upstream state directly, not image recognition; RGB rendering still runs internally
+to preserve upstream RNG consumption.
+
+The 17 upstream actions are individual tools with empty arguments, for example
+`move_up()` and `do()`. Each valid call advances one game step. Invalid calls return
+correction feedback without advancing the game. Step rewards pass through unchanged;
+the rollout return sums achievement bonuses and health changes. Keep
+`length_penalty.penalty: 0` because these returns can be negative or exceed one.
+Death or `taskset.max_episode_steps` (default 10,000) ends the episode. The agent's
+turn/token/time budgets can stop it earlier; the preset allows 100 turns and 32,768
+transcript tokens. Increase both budgets for longer exploration.
 
 Run on Linux x86_64 with Python 3.12 and two visible GPUs:
 

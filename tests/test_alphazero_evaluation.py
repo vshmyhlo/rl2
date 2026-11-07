@@ -16,7 +16,7 @@ mctx = pytest.importorskip("mctx")
 from rl2.alphazero import evaluation as ev
 from rl2.alphazero.config import Config, EvaluationConfig
 from rl2.alphazero.model import PolicyValueNet
-from rl2.alphazero.search import PolicyValueFn
+from rl2.alphazero.train import PolicyValueFn
 
 
 def test_match_summary_separates_unfinished_games_and_accounts_for_pairs() -> None:
@@ -120,7 +120,7 @@ def test_search_uses_acting_network_and_greedy_legal_action(monkeypatch: pytest.
         weights = jnp.array([[100, 0, 10, 0, 0, 0, 0, 0, 0]], jnp.float32)
         return mctx.PolicyOutput(action=jnp.array([8], jnp.int32), action_weights=weights, search_tree=None)
 
-    monkeypatch.setattr(ev, "puct_policy", search)
+    monkeypatch.setattr(ev.train, "puct_policy", search)
     with jax.disable_jit():
         for player, expected_reward in ((state.current_player, 1), (1 - state.current_player, -1)):
             reward, terminated = ev.play_game(

@@ -8,7 +8,7 @@ import pytest
 pgx = pytest.importorskip("pgx")
 pytest.importorskip("mctx")
 
-from rl2.alphazero.search import recurrent_step
+from rl2.alphazero.train import recurrent_step
 
 
 def test_recurrent_step_finished_nodes_do_not_repeat_reward_or_bootstrap() -> None:

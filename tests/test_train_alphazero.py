@@ -19,7 +19,7 @@ pytest.importorskip("mctx")
 import pgx
 
 from rl2.alphazero import train as az
-from rl2.alphazero.config import EvaluationConfig, ModelConfig
+from rl2.alphazero.config import ModelConfig
 
 
 @pytest.fixture(scope="module")
@@ -195,6 +195,8 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
     state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(1e-3))
     updated, losses = az.train_step(state, batch, model=model)
     assert updated.step == 1
+    chex.assert_shape(tuple(losses.values()), ())
+    assert losses["value_updates"] == 1
     assert all(np.isfinite(value) for value in losses.values())
     assert any(
         np.any(np.asarray(before) != np.asarray(after))
@@ -202,8 +204,9 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
     )
     # Padding must not train either head; masked losses have zero gradient.
     empty = batch.replace(policy_mask=jnp.zeros(size, bool), value_mask=jnp.zeros(size, bool))
-    (loss, _), grads = jax.value_and_grad(az.loss_fn, has_aux=True)(params, model, empty)
+    (loss, empty_metrics), grads = jax.value_and_grad(az.loss_fn, has_aux=True)(params, model, empty)
     assert loss == 0
+    assert empty_metrics["value_updates"] == 0
     assert all(np.all(np.asarray(leaf) == 0) for leaf in jax.tree.leaves(grads))
 
 
@@ -276,6 +279,7 @@ def logging_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> az.Config
     """Exercise the training loop's logging without running a model or search."""
     config = az.Config(
         iterations=2,
+        log_interval=2,
         updates_per_iteration=2,
         run_id="test",
         ckpt_dir=str(tmp_path / "checkpoints" / "test"),
@@ -301,8 +305,13 @@ def logging_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> az.Config
     monkeypatch.setattr(az, "collect_selfplay", Mock(side_effect=rollouts))
 
     def fake_step(state: TrainState, batch: az.Batch, *, model: az.PolicyValueNet) -> tuple[TrainState, az.Metrics]:
-        loss = jnp.float32(2 * state.step + 1)
-        return state.replace(step=state.step + 1), {"loss": loss, "policy_loss": loss, "value_loss": jnp.float32(0)}
+        loss = jnp.float32(2 * state.step + 1)  # ()
+        return state.replace(step=state.step + 1), {
+            "loss": loss,  # ()
+            "policy_loss": loss,  # ()
+            "value_loss": jnp.float32(0),  # ()
+            "value_updates": jnp.int32(1),  # ()
+        }
 
     monkeypatch.setattr(az, "train_step", fake_step)
     return config
@@ -317,10 +326,10 @@ def test_mlflow_progress(
         iterations=5,
         run_id="test-run",
         ckpt_dir=str(tmp_path / "checkpoints" / "test-run"),
-        log_interval_seconds=30.0,
+        log_interval=2,
     )
     clock = 0.0
-    durations = [29.0, 1.0, 15.0, 15.0, 5.0]
+    durations = [600.0, 1.0, 2.0, 3.0, 5.0]
     original_step = az.train_step
     rollouts = list(az.collect_selfplay.side_effect)
     az.collect_selfplay.side_effect = rollouts * 2 + rollouts[:1]
@@ -343,21 +352,24 @@ def test_mlflow_progress(
     for call in writer.log_metrics.call_args_list:
         for tag, value in call.args[0].items():
             metrics.setdefault(tag, []).append((value, call.args[1]))
-    assert metrics["losses/loss"] == [(4, 5), (12, 10), (18, 13)]
+    assert metrics["train/loss"] == [(4, 5), (12, 10), (18, 13)]
+    assert metrics["train/value_loss"] == [(0, 5), (0, 10), (0, 13)]
     for tag, values in {
-        "charts/completed_games": [1, 2, 3],
-        "selfplay/completed_games": [1, 1, 1],
-        "selfplay/positions": [5, 5, 3],
-        "selfplay/value_positions": [2, 2, 2],
-        "charts/iteration": [2, 4, 5],
-        "time/window_seconds": [30, 30, 5],
-        "time/iteration_seconds": [30, 30, 5],
+        "rollout/completed_games_total": [1, 2, 3],
+        "rollout/completed_games": [1, 1, 1],
+        "rollout/positions": [5, 5, 3],
+        "rollout/value_positions": [2, 2, 2],
+        "train/iteration": [2, 4, 5],
+        "train/window_seconds": [601, 5, 5],
+        "train/iteration_seconds_mean": [300.5, 2.5, 5],
     }.items():
         assert [value for value, _ in metrics[tag]] == values
     assert "time/rollout_seconds" not in metrics
     assert "time/optimization_seconds" not in metrics
-    assert [value for value, _ in metrics["time/SPS"]] == pytest.approx([5 / 30, 5 / 30, 3 / 5])
-    assert metrics["time/eta_seconds"][-1][0] == 0
+    assert [value for value, _ in metrics["train/environment_steps_per_second"]] == pytest.approx(
+        [5 / 601, 5 / 5, 3 / 5]
+    )
+    assert metrics["train/eta_seconds"][-1][0] == 0
     assert metrics["model/params_millions"][0][0] == pytest.approx(1e-6)
     artifacts = {call.args[1]: call.args[0] for call in writer.log_text.call_args_list}
     saved_config = yaml.safe_load(artifacts["config.yaml"])
@@ -371,7 +383,7 @@ def test_mlflow_progress(
     reports = [message for message in messages if message.startswith("Iteration ")]
     assert len(reports) == 3
     for report, iteration, steps, loss, positions, seconds in zip(
-        reports, [2, 4, 5], [5, 10, 13], [4, 12, 18], [5, 5, 3], [30, 30, 5], strict=True
+        reports, [2, 4, 5], [5, 10, 13], [4, 12, 18], [5, 5, 3], [601, 5, 5], strict=True
     ):
         assert report.startswith(f"Iteration {iteration}/5 | steps={steps} | ")
         assert f" | loss={loss} | " in report
@@ -395,9 +407,38 @@ def test_mlflow_closes_on_error(logging_config: az.Config, monkeypatch: pytest.M
     az.checkpoint_manager.assert_called_once_with("checkpoints/${run_id}")
 
 
+@pytest.mark.parametrize("has_targets", [True, False], ids=["mixed-with-measured-zero", "no-value-targets"])
+def test_value_loss_logging_omits_updates_without_targets(
+    logging_config: az.Config, monkeypatch: pytest.MonkeyPatch, has_targets: bool
+) -> None:
+    losses = iter([3.0, 0.0, 0.0, 0.0] if has_targets else [0.0] * 4)
+
+    def step(state: TrainState, batch: az.Batch, *, model: az.PolicyValueNet) -> tuple[TrainState, az.Metrics]:
+        value_loss = jnp.float32(next(losses))  # ()
+        return state.replace(step=state.step + 1), {
+            "loss": 2.0 + value_loss,  # ()
+            "policy_loss": jnp.float32(2.0),  # ()
+            "value_loss": value_loss,  # ()
+            "value_updates": jnp.int32(has_targets and state.step % 2 == 0),  # ()
+        }
+
+    def now() -> float:
+        return 0.0
+
+    monkeypatch.setattr(az, "train_step", step)
+    monkeypatch.setattr(az, "monotonic", now)
+    az.train(logging_config)
+    metrics = az.MLflowLogger.return_value.log_metrics.call_args.args[0]
+    assert metrics["train/policy_loss"] == 2.0
+    assert metrics["train/loss"] == (2.75 if has_targets else 2.0)
+    if has_targets:
+        assert metrics["train/value_loss"] == 1.5
+    else:
+        assert "train/value_loss" not in metrics
+
+
 def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: pytest.MonkeyPatch) -> None:
-    config = replace(logging_config, iterations=4, updates_per_iteration=1, run_id="resume")
-    assert config.checkpoint_interval_seconds == 600.0
+    config = replace(logging_config, iterations=5, updates_per_iteration=1, run_id="resume", checkpoint_interval=2)
     clock = 0.0
     interrupted = False
     original_step = az.train_step
@@ -407,7 +448,7 @@ def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: p
         if state.step == 2 and not interrupted:
             interrupted = True
             raise RuntimeError("interrupted")
-        clock += 599.0 if state.step == 0 else 1.0
+        clock += 1000.0 if state.step == 0 else 1.0
         return original_step(state, batch, model=model)
 
     def now() -> float:
@@ -437,32 +478,32 @@ def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: p
     restore.return_value = saved
     writer.reset_mock()
     state = az.train(config)
-    assert state.step == 4
-    assert [call.args[1].iteration for call in save.call_args_list] == [2, 4]
+    assert state.step == 5
+    assert [call.args[1].iteration for call in save.call_args_list] == [2, 4, 5]
     final = save.call_args.args[1]
-    assert (final.steps, final.completed_games) == (8, 4)
+    assert (final.steps, final.completed_games) == (10, 5)
     assert make_writer.call_args.kwargs["run_name"] == "resume"
     # Replay the interrupted iteration with the same self-play RNG.
     np.testing.assert_array_equal(rollout.call_args_list[2].args[1], rollout.call_args_list[3].args[1])
     eta = [
-        call.args[0]["time/eta_seconds"]
+        call.args[0]["train/eta_seconds"]
         for call in writer.log_metrics.call_args_list
-        if "time/eta_seconds" in call.args[0]
+        if "train/eta_seconds" in call.args[0]
     ]
-    assert eta == [0.0]  # Resumed iterations share a final partial logging window.
+    assert eta == [1.0, 0.0]  # Regular boundary followed by a final partial logging window.
 
     restore.return_value = final
     rollout.reset_mock()
     az.train(config)
     rollout.assert_not_called()
-    assert save.call_count == 2
+    assert save.call_count == 3
 
 
 def test_evaluation_cadence_previous_checkpoint_and_resume(
     logging_config: az.Config, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.INFO, logger=az.__name__)
-    config = replace(logging_config, iterations=6, updates_per_iteration=1)
+    config = replace(logging_config, iterations=6, updates_per_iteration=1, checkpoint_interval=1, eval_interval=3)
     clock = 0.0
     original_step = az.train_step
 
@@ -471,7 +512,7 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
 
     def timed_step(state: TrainState, batch: az.Batch, *, model: az.PolicyValueNet) -> tuple[TrainState, az.Metrics]:
         nonlocal clock
-        clock += 600.0
+        clock += 1.0
         state, metrics = original_step(state, batch, model=model)
         return state.replace(params={"weight": jnp.full(1, state.step, jnp.float32)}), metrics
 
@@ -484,7 +525,7 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
         config: az.Config,
     ) -> dict[str, float]:
         nonlocal clock
-        clock += 120.0  # Evaluation time must not trigger another immediate evaluation.
+        clock += 120.0  # Evaluation time does not affect the iteration cadence.
         return {"score": 0.5, "games": 2.0}
 
     rollout = Mock(return_value=(None, {"positions": 2, "completed_games": 1, "value_positions": 2}))
@@ -496,7 +537,7 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
     monkeypatch.setattr(az, "train_step", timed_step)
     monkeypatch.setattr(az, "monotonic", now)
     monkeypatch.setattr(az, "save_checkpoint", save)
-    monkeypatch.setattr(az, "evaluate", run_evaluation)
+    monkeypatch.setattr(az.evaluation, "evaluate", run_evaluation)
     monkeypatch.setattr(az, "MLflowLogger", Mock(return_value=writer))
     az.train(config)
     assert run_evaluation.call_count == 2
@@ -520,7 +561,7 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
     # Turning off evaluations by extending the interval must not change training RNG.
     clock = 0.0
     rollout.reset_mock()
-    az.train(replace(config, evaluation=EvaluationConfig(interval_seconds=10000.0)))
+    az.train(replace(config, eval_interval=10))
     for key, call in zip(training_keys, rollout.call_args_list, strict=True):
         np.testing.assert_array_equal(key, call.args[1])
     np.testing.assert_array_equal(saved_key, save.call_args.args[1].key)
@@ -530,27 +571,14 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
     clock = 0.0
     monkeypatch.setattr(az, "restore_checkpoint", Mock(return_value=saved_second_iteration))
     run_evaluation.reset_mock()
-    az.train(replace(config, iterations=3, evaluation=EvaluationConfig(interval_seconds=600.0)))
+    az.train(replace(config, iterations=3))
     run_evaluation.assert_called_once()
     assert run_evaluation.call_args.kwargs["opponent_params"]["weight"].item() == 2
     assert run_evaluation.call_args.kwargs["candidate_params"]["weight"].item() == 3
 
 
 def test_evaluation_skips_missing_checkpoint(logging_config: az.Config, monkeypatch: pytest.MonkeyPatch) -> None:
-    clock = 0.0
-    original_step = az.train_step
-
-    def now() -> float:
-        return clock
-
-    def timed_step(state: TrainState, batch: az.Batch, *, model: az.PolicyValueNet) -> tuple[TrainState, az.Metrics]:
-        nonlocal clock
-        clock += 1800.0
-        return original_step(state, batch, model=model)
-
     evaluate = Mock()
-    monkeypatch.setattr(az, "monotonic", now)
-    monkeypatch.setattr(az, "train_step", timed_step)
-    monkeypatch.setattr(az, "evaluate", evaluate)
-    az.train(replace(logging_config, iterations=1, updates_per_iteration=1))
+    monkeypatch.setattr(az.evaluation, "evaluate", evaluate)
+    az.train(replace(logging_config, iterations=1, updates_per_iteration=1, eval_interval=1))
     evaluate.assert_not_called()

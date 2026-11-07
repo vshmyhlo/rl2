@@ -9,8 +9,7 @@ pytest.importorskip("pgx")
 mctx = pytest.importorskip("mctx")
 from mctx._src import search as mctx_search
 
-from rl2.alphazero.puct import _backward, puct_policy
-from rl2.alphazero.search import PolicyValueFn
+from rl2.alphazero.train import PolicyValueFn, _backward, puct_policy
 
 
 def test_backup_preserves_finished_rows_and_matches_mctx() -> None:

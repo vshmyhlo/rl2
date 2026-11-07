@@ -1,0 +1,28 @@
+model: Qwen/Qwen3-0.6B
+tasksets:
+  crafter:
+    taskset:
+      id: crafter
+      max_episode_steps: 1000
+seed: 1
+batch_size: 16
+group_size: 8
+prefetch_batches: 1
+learning_rate: 1e-6
+loss:
+  kind: grpo
+finetuning:
+  mode: lora
+  rank: 16
+  alpha: 32
+# Crafter returns are not restricted to [0, 1].
+length_penalty:
+  penalty: 0.0
+max_tokens: 32768 # Total transcript budget, including observations and tools.
+max_turns: 100
+rollout_timeout: 1200
+environment_timeout: 600
+run_id: grpo_v2_crafter_${path_name:${model}}_s${seed}
+ckpt_dir: /runs/grpo_v2/${run_id}
+checkpoint_interval: 50
+example_log_interval: 50

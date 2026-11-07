@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -12,42 +12,34 @@ from flax.training.train_state import TrainState
 from pydantic import ValidationError
 
 from rl2.alphazero import checkpoints as ckpt
-from rl2.alphazero.config import Config, EvaluationConfig
+from rl2.alphazero.config import Config
 
 
 def test_checkpoint_round_trip(tmp_path: Path) -> None:
-    def apply(params: dict[str, jax.Array]) -> jax.Array:
+    def apply(params: dict[str, jax.Array]) -> jax.Array:  # weight: (1,)
         chex.assert_shape(params["weight"], (1,))
         chex.assert_type(params["weight"], jnp.float32)
-        return params["weight"]
+        return params["weight"]  # (1,)
 
     state = TrainState.create(apply_fn=apply, params={"weight": jnp.ones(1)}, tx=optax.adam(1e-3))
-    grads = {"weight": jnp.full(1, 0.5)}
+    grads = {"weight": jnp.full(1, 0.5)}  # weight: (1,)
     trained = state.apply_gradients(grads=grads)
     config = Config()
-    progress = ckpt.TrainingProgress(trained, jax.random.PRNGKey(3), 1, 5, 1)
+    progress = ckpt.TrainingProgress(state=trained, key=jax.random.PRNGKey(3), iteration=1, steps=5, completed_games=1)
     with ckpt.checkpoint_manager(str(tmp_path)) as manager:
         assert ckpt.restore_checkpoint(manager, state, config) is None
         ckpt.save_checkpoint(manager, progress, config)
     with ckpt.checkpoint_manager(str(tmp_path)) as manager:
-        restored = ckpt.restore_checkpoint(manager, state, replace(config, iterations=200))
+        metadata = manager.restore(1, args=ckpt.ocp.args.Composite(metadata=ckpt.ocp.args.JsonRestore())).metadata
+        assert metadata["config"] == asdict(config)
+        restored = ckpt.restore_checkpoint(manager, state, replace(config, iterations=200, learning_rate=0.01, seed=7))
         assert restored is not None
         chex.assert_trees_all_equal(restored, progress)
         chex.assert_trees_all_equal(restored.state.apply_gradients(grads=grads), trained.apply_gradients(grads=grads))
-        with pytest.raises(ValueError, match="incompatible.*new run_id"):
-            ckpt.restore_checkpoint(manager, state, replace(config, learning_rate=0.01))
         for iteration in (2, 3):
             ckpt.save_checkpoint(manager, progress._replace(iteration=iteration), config)
-        assert manager.all_steps() == [2, 3]
-
-
-def test_checkpoint_settings_allow_log_interval_changes() -> None:
-    config = Config()
-    settings = ckpt.checkpoint_settings(config)
-    assert "log_interval_seconds" not in settings  # Also compatible with checkpoints predating this option.
-    assert ckpt.checkpoint_settings(replace(config, log_interval_seconds=15.0)) == settings
-    assert "evaluation" not in settings  # Existing checkpoints have no evaluation settings.
-    assert ckpt.checkpoint_settings(replace(config, evaluation=EvaluationConfig(num_openings=2))) == settings
+        assert manager.all_steps() == [3]
+    assert {path.name for path in (tmp_path / "checkpoints").iterdir() if path.is_dir()} == {"3"}
 
 
 def test_checkpoint_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -66,11 +58,11 @@ def test_checkpoint_metadata_validation(metadata: dict[str, int]) -> None:
         ckpt.CheckpointMetadata.model_validate(values)
 
 
-def test_restore_accepts_legacy_logging_paths() -> None:
+def test_restore_ignores_legacy_config() -> None:
     state = TrainState.create(apply_fn=jnp.add, params={"weight": jnp.ones(1)}, tx=optax.adam(1e-3))
     config = Config(ckpt_dir="new-location")
     metadata = ckpt.CheckpointMetadata(
-        config=ckpt.checkpoint_settings(config) | {"ckpt_dir": "old-location"},
+        config={"ckpt_dir": "old-location", "log_dir": "legacy-logs", "learning_rate": 0.02},
         iteration=1,
         steps=2,
         completed_games=1,

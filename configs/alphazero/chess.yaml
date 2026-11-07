@@ -19,10 +19,10 @@ dirichlet_fraction: 0.25
 exploration_moves: 30 # Sample search visits for the first 30 plies, then select greedily
 ckpt_dir: /runs/alphazero/${run_id}
 run_id: alphazero_${path_name:${env_id}}_seed${seed}
-log_interval_seconds: 60.0 # Aggregate metrics; emit at iteration boundaries and at normal completion
-checkpoint_interval_seconds: 600.0 # Save after an iteration every 10 minutes, and at normal completion
+log_interval: 10 # Aggregate metrics every 10 iterations, and at normal completion
+checkpoint_interval: 100 # Save every 100 iterations, and at normal completion
+eval_interval: 100 # Evaluate every 100 iterations before checkpoint saving; pauses training
 evaluation:
-  interval_seconds: 1800.0 # Evaluate before checkpoint saving at iteration boundaries; pauses training
   num_openings: 50 # Two games per opening, with the agents swapping colors
   opening_moves: 8 # Fixed-seed random legal prefix; terminal moves are rejected
   openings_per_batch: 5 # Ten games searched in parallel; uses training num_simulations and max_moves

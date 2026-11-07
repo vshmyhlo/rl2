@@ -1,6 +1,7 @@
 # Development guidelines
 
 - Use consistent training terminology: an **iteration** performs one or more updates over a batch; an **update** is a parameter update over a batch or minibatch; **environment steps** count interactions/steps/observations from the environment, summed across environments.
+- Save the full configuration in checkpoints. On restore, ignore the saved configuration and use the current configuration; do not perform configuration compatibility checks.
 - Name new or renamed metrics `<scope>/<measurement>[_<unit>][_<statistic>]` in lowercase `snake_case`. Use semantic scopes such as `model`, `train`, `rollout`, `learner`, `actor`, `batcher`, and `checkpoint`; avoid presentation prefixes such as `charts/` and put timing under the responsible component rather than `time/`.
 - Include units where needed (`_seconds`, `_tokens`, `_per_second`), use `_mean`, `_std`, `_min`, or `_max` for distribution summaries, and `_total` for cumulative counters. Use `_fraction` for proportions in [0, 1]. Append categorical labels after a slash, for example `rollout/stop_fraction/max_tokens`.
 - Keep optimization metric names concise (for example, `train/policy_loss` and `train/gradient_norm`) and document their reduction semantics. Make averaging explicit for rollout and timing summaries, for example `rollout/reward_mean` and `actor/rollout_seconds_mean`. Update producers, consumers, tests, and metric documentation together when renaming metrics.

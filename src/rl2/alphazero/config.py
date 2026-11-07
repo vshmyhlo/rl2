@@ -19,7 +19,6 @@ class ModelConfig:
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class EvaluationConfig:
-    interval_seconds: Annotated[PositiveFiniteFloat, Field(strict=True)] = 1800.0
     num_openings: Annotated[PositiveInt, Field(strict=True)] = 50
     opening_moves: Annotated[NonNegativeInt, Field(strict=True)] = 8
     openings_per_batch: Annotated[PositiveInt, Field(strict=True)] = 5
@@ -43,6 +42,7 @@ class Config(BaseConfig):
     dirichlet_alpha: PositiveFiniteFloat = 0.3
     dirichlet_fraction: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)] = 0.25
     exploration_moves: NonNegativeInt = 30
-    log_interval_seconds: PositiveFiniteFloat = 60.0
-    checkpoint_interval_seconds: PositiveFiniteFloat = 600.0
+    log_interval: PositiveInt = 1
+    checkpoint_interval: PositiveInt = 10
+    eval_interval: PositiveInt = 30
     evaluation: EvaluationConfig = EvaluationConfig()

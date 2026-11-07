@@ -40,19 +40,14 @@ def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
         directory = str(Path(directory).resolve())
     return ocp.CheckpointManager(
         directory,
-        options=ocp.CheckpointManagerOptions(max_to_keep=2, enable_async_checkpointing=False),
+        options=ocp.CheckpointManagerOptions(max_to_keep=1, enable_async_checkpointing=False),
     )
 
 
-def checkpoint_settings(config: Config) -> dict[str, Any]:
-    mutable = {"run_id", "ckpt_dir", "iterations", "log_interval_seconds", "checkpoint_interval_seconds", "evaluation"}
-    return {name: value for name, value in asdict(config).items() if name not in mutable}
-
-
 def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, config: Config) -> None:
-    """Save weights, optimizer, RNG, and counters after a complete iteration."""
+    """Save weights, optimizer, RNG, counters, and the full config after a complete iteration."""
     metadata = CheckpointMetadata(
-        config=checkpoint_settings(config),
+        config=asdict(config),
         iteration=progress.iteration,
         steps=progress.steps,
         completed_games=progress.completed_games,
@@ -68,14 +63,12 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
 
 
 def restore_checkpoint(manager: ocp.CheckpointManager, state: TrainState, config: Config) -> TrainingProgress | None:
+    """Restore training progress using the supplied state template, ignoring the saved config."""
     iteration = manager.latest_step()
     if iteration is None:
         return None
     saved = manager.restore(iteration, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
     metadata = CheckpointMetadata.model_validate(saved)
-    saved_settings = {name: value for name, value in metadata.config.items() if name not in ("log_dir", "ckpt_dir")}
-    if saved_settings != checkpoint_settings(config):
-        raise ValueError("Checkpoint training settings are incompatible with this config. Use a new run_id.")
     if metadata.iteration != iteration:
         raise ValueError("Checkpoint iteration does not match its directory")
     restored = manager.restore(

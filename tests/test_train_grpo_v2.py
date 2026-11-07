@@ -503,6 +503,18 @@ def test_codegym_task_stream(monkeypatch: pytest.MonkeyPatch) -> None:
     load.assert_called_once_with(config, rng)
 
 
+def test_crafter_config_and_task_stream() -> None:
+    config = training.Config(tasksets={"survival": {"taskset": {"id": "crafter", "max_episode_steps": 12}}})
+    taskset = config.tasksets["survival"].taskset
+    assert isinstance(taskset, training.CrafterConfig)
+    assert taskset.max_episode_steps == 12
+    sampled = next(training.stream_tasks(config.tasksets, random.Random(3), timeout=120))
+    assert sampled.taskset_id == "survival"
+    assert sampled.task.name == "crafter"
+    assert sampled.task.config == taskset
+    assert cloudpickle.loads(cloudpickle.dumps(sampled)) == sampled
+
+
 def test_mix_preset_accepts_native_reasoning_rewards() -> None:
     path = Path(__file__).parents[1] / "configs/grpo_v2/mix.yaml"
     config = training.load_config(path, training.Config)

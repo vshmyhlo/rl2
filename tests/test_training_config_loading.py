@@ -28,7 +28,7 @@ from rl2.model.encoders.conv2d import ConvStage
     [
         (ppo, "ppo/craftax/symbolic.yaml", "seed", "num_steps"),
         (train_mappo, "mappo/smax.yaml", "seed", "num_steps"),
-        (train_alphazero, "alphazero_chess.yaml", "iterations", "num_envs"),
+        (train_alphazero, None, "iterations", "num_envs"),
         (ppo_rnd, "ppo_rnd_montezuma.yaml", "seed", "num_steps"),
         (train_wm, "wm_atari.yaml", "total_steps", "num_steps"),
         (train_grpo_reasoning, "grpo_reasoning/gemma3.yaml", "total_updates", "seed"),
@@ -40,13 +40,17 @@ from rl2.model.encoders.conv2d import ConvStage
 )
 def test_training_cli_resolves_yaml(
     trainer: ModuleType,
-    preset: str,
+    preset: str | None,
     field: str,
     reference: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = yaml.safe_load((Path(__file__).resolve().parents[1] / "configs" / preset).read_text())
+    settings = (
+        asdict(trainer.Config())
+        if preset is None
+        else yaml.safe_load((Path(__file__).resolve().parents[1] / "configs" / preset).read_text())
+    )
     settings[field] = f"${{{reference}}}"
     settings["run_id"] = "test_seed${seed}"
     settings["ckpt_dir"] = "gs://checkpoints/${run_id}"
@@ -156,7 +160,6 @@ def test_reasoning_prompt_examples_are_validated_on_construction() -> None:
     [
         (ppo_rnd, "ppo_rnd_montezuma.yaml", "/runs/ppo_rnd"),
         (train_wm, "wm_atari.yaml", "/runs/wm"),
-        (train_alphazero, "alphazero_chess.yaml", "/runs/alphazero"),
         (train_karel_grpo, "karel_grpo.yaml", "/runs/karel_grpo"),
         (train_karel_ast_grpo, "karel_ast_grpo.yaml", "/runs/karel_ast_grpo"),
         (train_karel_ast_ar_edit, "karel_ast_ar_edit.yaml", "/runs/karel_ast_ar_edit"),

@@ -16,11 +16,9 @@ import mctx
 import numpy as np
 import pgx
 
+from rl2.alphazero import train
 from rl2.alphazero.config import Config
 from rl2.alphazero.model import Parameters, PolicyValueNet
-from rl2.alphazero.puct import puct_policy
-from rl2.alphazero.search import PolicyValueFn, recurrent_step
-from rl2.alphazero.utils import masked_logits
 
 
 def make_opening(key: jax.Array, *, env: pgx.Env, moves: int) -> pgx.State:
@@ -56,10 +54,10 @@ def play_game(
     """Return scalar candidate reward and termination flag; false means unfinished."""
 
     def recurrent_fn(
-        model: PolicyValueFn, _key: jax.Array, actions: jax.Array, states: pgx.State
+        model: train.PolicyValueFn, _key: jax.Array, actions: jax.Array, states: pgx.State
     ) -> tuple[mctx.RecurrentFnOutput, pgx.State]:
         # Mctx requires a PRNG key even for deterministic transitions.
-        return recurrent_step(model, actions, states, env=env)
+        return train.recurrent_step(model, actions, states, env=env)
 
     def ongoing(carry: tuple[pgx.State, jax.Array]) -> jax.Array:
         state, move = carry
@@ -80,9 +78,9 @@ def play_game(
         states = jax.tree.map(add_batch, state)
         logits, value = predict(states.observation)
         root = mctx.RootFnOutput(
-            prior_logits=masked_logits(logits, states.legal_action_mask), value=value, embedding=states
+            prior_logits=train.masked_logits(logits, states.legal_action_mask), value=value, embedding=states
         )
-        policy = puct_policy(
+        policy = train.puct_policy(
             predict,
             jax.random.fold_in(key, move),
             root,

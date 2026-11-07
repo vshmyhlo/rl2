@@ -1,7 +1,21 @@
 # Site
 
-Astro + MDX, with KaTeX formulas and a React + D3 figure. Requires Node.js
-24.22.2 or newer.
+Personal site for articles and interactive visualisations.
+
+## Stack
+
+- **Astro + MDX:** website structure and article content.
+- **React:** interactive components, state, and controls.
+- **D3.js:** visualisation geometry, scales, and SVG paths.
+- **Motion:** animated transitions and interactions.
+- **KaTeX:** inline and display formulas.
+
+Motion is part of the agreed stack but is not installed yet. The wave demo uses
+D3's timer for continuous animation. Keep one animation owner per property.
+
+## Development
+
+Requires Node.js 24.22.2 or newer.
 
 From this directory:
 
