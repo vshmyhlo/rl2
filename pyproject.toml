@@ -34,7 +34,6 @@ dependencies = [
     "jsonschema>=4.26,<5",
     "kauldron>=1.4.4,<2",
     "kinetix-env==3.0.2",
-    "mctx>=0.0.6,<0.1",
     "metaljax>=0.11.8,<0.12; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "mlflow-skinny[db]>=3.17.1,<4",
     "moviepy>=2.2,<3",

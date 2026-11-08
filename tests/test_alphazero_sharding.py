@@ -120,21 +120,47 @@ def test_update_uses_global_masked_means(mesh: Mesh) -> None:
     )
     key = jax.random.PRNGKey(2)  # (2,)
     single = Mesh(devices=jax.devices()[:1], axis_names=("batch",), axis_types=(AxisType.Auto,))
-    with jax.set_mesh(single):
-        minibatch = az.sample_batch(batch, key, batch_size=8)  # Leaves: (B, ...).
+
+    @jax.jit
+    def update_once(
+        state: TrainState,
+        minibatch: az.Batch,  # Leaves: (B, ...).
+    ) -> tuple[TrainState, az.TrainMetrics]:
         (_, metrics), grads = jax.value_and_grad(az.loss_fn, has_aux=True)(state.params, state.apply_fn, minibatch)
-        expected = state.apply_gradients(grads=grads), metrics
+        return state.apply_gradients(grads=grads), metrics  # Metric leaves: ().
+
+    updates_per_iteration = 3
+    expected_state = state
+    expected_key = key  # (2,)
+    metrics = []
+    with jax.set_mesh(single):
+        for _ in range(updates_per_iteration):
+            expected_key, sample_key = jax.random.split(expected_key)  # Each: (2,)
+            minibatch = az.sample_batch(batch, sample_key, batch_size=8)  # Leaves: (B, ...).
+            expected_state, update_metrics = update_once(expected_state, minibatch)
+            metrics.append(update_metrics)
+        expected = (
+            expected_state,
+            expected_key,  # (2,)
+            jax.tree.map(lambda *values: sum(values), *metrics),  # Scalar leaves: ().
+        )
     with jax.set_mesh(mesh):
         template_state = jax.device_put(state, PartitionSpec())
         actual = az.train_step(
             template_state,
-            jax.device_put(batch, PartitionSpec("batch")),
             jax.device_put(key, PartitionSpec()),
+            jax.device_put(batch, PartitionSpec("batch")),
             batch_size=8,
+            updates_per_iteration=updates_per_iteration,
         )
     chex.assert_trees_all_close(actual, expected, rtol=1e-5, atol=1e-6)
-    assert actual[0].step == 1
-    assert actual[1].value_updates == 1
+    assert type(actual) is tuple
+    actual_state, actual_key, actual_metrics = actual  # Key: (2,); metric leaves: ().
+    assert actual_state.step == updates_per_iteration
+    assert actual_metrics.value_updates == updates_per_iteration
+    chex.assert_shape(actual_metrics, ())
+    chex.assert_shape(actual_key, (2,))
+    np.testing.assert_array_equal(actual_key, expected_key)
     for leaf in jax.tree.leaves(actual):  # Parameter/optimizer shapes and scalar metrics.
         assert leaf.sharding == NamedSharding(mesh, PartitionSpec())
         assert len(leaf.addressable_shards) == 2

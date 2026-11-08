@@ -17,7 +17,6 @@ from flax.training.train_state import TrainState
 from jax.sharding import AxisType, Mesh
 
 pytest.importorskip("pgx")
-pytest.importorskip("mctx")
 import pgx
 
 from rl2.alphazero import train as az
@@ -201,7 +200,7 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
         assert targets[-1] in (0, 1)
 
     state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(1e-3))
-    updated, losses = az.train_step(state, batch, jax.random.PRNGKey(0), batch_size=4)
+    updated, _, losses = az.train_step(state, jax.random.PRNGKey(0), batch, batch_size=4, updates_per_iteration=1)
     assert updated.step == 1
     assert isinstance(losses, az.TrainMetrics)
     chex.assert_shape(losses, ())
@@ -315,17 +314,24 @@ def logging_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> az.Config
 
     def fake_step(
         state: TrainState,
-        batch: az.Batch,  # Leaves: (N, ...).
         key: jax.Array,  # (2,)
+        batch: az.Batch,  # Leaves: (N, ...).
         *,
         batch_size: int,
-    ) -> tuple[TrainState, az.TrainMetrics]:
-        loss = jnp.float32(2 * state.step + 1)  # ()
-        return state.replace(step=state.step + 1), az.TrainMetrics(
-            loss=loss,  # ()
-            policy_loss=loss,  # ()
-            value_loss=jnp.float32(0),  # ()
-            value_updates=jnp.int32(1),  # ()
+        updates_per_iteration: int,
+    ) -> tuple[TrainState, jax.Array, az.TrainMetrics]:
+        loss = jnp.float32(updates_per_iteration * (2 * state.step + updates_per_iteration))  # ()
+        for _ in range(updates_per_iteration):
+            key, _ = jax.random.split(key)  # Each: (2,)
+        return (
+            state.replace(step=state.step + updates_per_iteration),
+            key,  # (2,)
+            az.TrainMetrics(
+                loss=loss,  # ()
+                policy_loss=loss,  # ()
+                value_loss=jnp.float32(0),  # ()
+                value_updates=jnp.int32(updates_per_iteration),  # ()
+            ),
         )
 
     monkeypatch.setattr(az, "train_step", fake_step)
@@ -351,14 +357,15 @@ def test_mlflow_progress(
 
     def timed_step(
         state: TrainState,
-        batch: az.Batch,  # Leaves: (N, ...).
         key: jax.Array,  # (2,)
+        batch: az.Batch,  # Leaves: (N, ...).
         *,
         batch_size: int,
-    ) -> tuple[TrainState, az.TrainMetrics]:
+        updates_per_iteration: int,
+    ) -> tuple[TrainState, jax.Array, az.TrainMetrics]:
         nonlocal clock
-        clock += durations[state.step // logging_config.updates_per_iteration] / logging_config.updates_per_iteration
-        return original_step(state, batch, key, batch_size=batch_size)
+        clock += durations[state.step // updates_per_iteration]
+        return original_step(state, key, batch, batch_size=batch_size, updates_per_iteration=updates_per_iteration)
 
     def now() -> float:
         return clock
@@ -455,17 +462,22 @@ def test_value_loss_logging_omits_updates_without_targets(
 
     def step(
         state: TrainState,
-        batch: az.Batch,  # Leaves: (N, ...).
         key: jax.Array,  # (2,)
+        batch: az.Batch,  # Leaves: (N, ...).
         *,
         batch_size: int,
-    ) -> tuple[TrainState, az.TrainMetrics]:
-        value_loss = jnp.float32(next(losses))  # ()
-        return state.replace(step=state.step + 1), az.TrainMetrics(
-            loss=2.0 + value_loss,  # ()
-            policy_loss=jnp.float32(2.0),  # ()
-            value_loss=value_loss,  # ()
-            value_updates=jnp.int32(has_targets and state.step < 4 and state.step % 2 == 0),  # ()
+        updates_per_iteration: int,
+    ) -> tuple[TrainState, jax.Array, az.TrainMetrics]:
+        value_loss = jnp.float32(sum(next(losses) for _ in range(updates_per_iteration)))  # ()
+        return (
+            state.replace(step=state.step + updates_per_iteration),
+            key,  # (2,)
+            az.TrainMetrics(
+                loss=2.0 * updates_per_iteration + value_loss,  # ()
+                policy_loss=jnp.float32(2.0 * updates_per_iteration),  # ()
+                value_loss=value_loss,  # ()
+                value_updates=jnp.int32(has_targets and state.step < 4),  # ()
+            ),
         )
 
     def now() -> float:
@@ -496,17 +508,18 @@ def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: p
 
     def timed_step(
         state: TrainState,
-        batch: az.Batch,  # Leaves: (N, ...).
         key: jax.Array,  # (2,)
+        batch: az.Batch,  # Leaves: (N, ...).
         *,
         batch_size: int,
-    ) -> tuple[TrainState, az.TrainMetrics]:
+        updates_per_iteration: int,
+    ) -> tuple[TrainState, jax.Array, az.TrainMetrics]:
         nonlocal clock, interrupted
         if state.step == 2 and not interrupted:
             interrupted = True
             raise RuntimeError("interrupted")
         clock += 1000.0 if state.step == 0 else 1.0
-        return original_step(state, batch, key, batch_size=batch_size)
+        return original_step(state, key, batch, batch_size=batch_size, updates_per_iteration=updates_per_iteration)
 
     def now() -> float:
         return clock
@@ -577,15 +590,22 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
 
     def timed_step(
         state: TrainState,
-        batch: az.Batch,  # Leaves: (N, ...).
         key: jax.Array,  # (2,)
+        batch: az.Batch,  # Leaves: (N, ...).
         *,
         batch_size: int,
-    ) -> tuple[TrainState, az.TrainMetrics]:
+        updates_per_iteration: int,
+    ) -> tuple[TrainState, jax.Array, az.TrainMetrics]:
         nonlocal clock
         clock += 1.0
-        state, metrics = original_step(state, batch, key, batch_size=batch_size)
-        return state.replace(params={"weight": jnp.full(1, state.step, jnp.float32)}), metrics
+        state, key, metrics = original_step(
+            state, key, batch, batch_size=batch_size, updates_per_iteration=updates_per_iteration
+        )
+        return (
+            state.replace(params={"weight": jnp.full(1, state.step, jnp.float32)}),  # weight: (1,)
+            key,  # (2,)
+            metrics,  # Scalar leaves: ().
+        )
 
     def evaluate(
         candidate_params: az.Parameters,

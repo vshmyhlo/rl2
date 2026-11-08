@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 
 pgx = pytest.importorskip("pgx")
-pytest.importorskip("mctx")
 
+from rl2.alphazero import train as az
 from rl2.alphazero.train import recurrent_step
 
 
@@ -60,3 +60,64 @@ def test_recurrent_step_rejects_malformed_predictions(
     step = jax.jit(partial(recurrent_step, predict, env=env))
     with pytest.raises(AssertionError, match="shape"):
         step(jnp.zeros(2, jnp.int32), states)
+
+
+@pytest.mark.parametrize("simulations", [0, 4], ids=["no-expansions", "absorbing-terminal-branches"])
+def test_local_puct_terminal_rewards_and_nested_state_shapes(simulations: int) -> None:
+    # The first game has one legal terminal move; the second is already finished.
+    root = az.RootFnOutput(
+        prior_logits=jnp.zeros((2, 2)),  # (B, A)
+        value=jnp.array([0.25, 0.0]),  # (B,)
+        embedding={
+            "done": jnp.array([False, True]),  # (B,)
+            "board": jnp.zeros((2, 2, 2), jnp.int32),  # (B, H, W)
+        },
+    )
+    invalid = jnp.array([[False, True], [True, True]])  # (B, A)
+
+    def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (B, H, W)
+        return jnp.zeros((observation.shape[0], 2)), jnp.zeros(observation.shape[0])  # (B, A), (B,)
+
+    def recurrent(
+        model: az.PolicyValueFn,
+        key: jax.Array,  # (2,)
+        actions: jax.Array,  # (B,)
+        state: dict[str, jax.Array],  # Leaves: (B, ...)
+    ) -> tuple[az.RecurrentFnOutput, dict[str, jax.Array]]:
+        logits, value = model(state["board"])  # (B, A), (B,)
+        return az.RecurrentFnOutput(
+            reward=(~state["done"]).astype(jnp.float32),  # (B,)
+            discount=jnp.zeros(2),  # (B,)
+            prior_logits=logits,  # (B, A)
+            value=value,  # (B,)
+        ), {"done": jnp.ones(2, bool), "board": state["board"]}  # (B,), (B, H, W)
+
+    search = jax.jit(
+        partial(
+            az.puct_policy,
+            predict,
+            recurrent_fn=recurrent,
+            num_simulations=simulations,
+            invalid_actions=invalid,
+            temperature=0.0,
+        )
+    )
+    result = search(jax.random.PRNGKey(0), root)
+    tree = result.search_tree
+    assert result.action.shape == (2,)
+    assert result.action_weights.shape == (2, 2)
+    assert tree.children_visits.shape == (2, simulations + 1, 2)
+    assert tree.embeddings["done"].shape == (2, simulations + 1)
+    assert tree.embeddings["board"].shape == (2, simulations + 1, 2, 2)
+    np.testing.assert_array_equal(tree.node_visits[:, 0], simulations + 1)
+    np.testing.assert_allclose(tree.node_values[:, 0], [(0.25 + simulations) / (simulations + 1), 0.0])
+    np.testing.assert_array_equal(tree.children_visits[:, 0].sum(axis=-1), simulations)
+    if simulations:
+        np.testing.assert_array_equal(result.action, [0, 0])
+        np.testing.assert_array_equal(result.action_weights, [[1, 0], [1, 0]])
+        np.testing.assert_array_equal(tree.children_rewards[:, 0, 0], [1, 0])
+        np.testing.assert_array_equal(tree.children_rewards[:, 1:], 0)
+    else:
+        # Match Mctx's uniform fallback when there are no visit counts.
+        np.testing.assert_array_equal(result.action_weights, 0.5)
+        np.testing.assert_array_equal(tree.parents, -1)

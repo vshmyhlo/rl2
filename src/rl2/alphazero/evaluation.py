@@ -12,7 +12,6 @@ from math import log, sqrt
 import chex
 import jax
 import jax.numpy as jnp
-import mctx
 import numpy as np
 import pgx
 
@@ -54,9 +53,12 @@ def play_game(
     """Return scalar candidate reward and termination flag; false means unfinished."""
 
     def recurrent_fn(
-        model: train.PolicyValueFn, _key: jax.Array, actions: jax.Array, states: pgx.State
-    ) -> tuple[mctx.RecurrentFnOutput, pgx.State]:
-        # Mctx requires a PRNG key even for deterministic transitions.
+        model: train.PolicyValueFn,
+        _key: jax.Array,  # (2,)
+        actions: jax.Array,  # (B,)
+        states: pgx.State,  # Leaves: (B, ...)
+    ) -> tuple[train.RecurrentFnOutput, pgx.State]:
+        # The search interface also supports stochastic transitions.
         return train.recurrent_step(model, actions, states, env=env)
 
     def ongoing(carry: tuple[pgx.State, jax.Array]) -> jax.Array:
@@ -77,7 +79,7 @@ def play_game(
 
         states = jax.tree.map(add_batch, state)
         logits, value = predict(states.observation)
-        root = mctx.RootFnOutput(
+        root = train.RootFnOutput(
             prior_logits=train.masked_logits(logits, states.legal_action_mask), value=value, embedding=states
         )
         policy = train.puct_policy(

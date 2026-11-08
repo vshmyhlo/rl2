@@ -11,7 +11,6 @@ import numpy as np
 import pytest
 
 pgx = pytest.importorskip("pgx")
-mctx = pytest.importorskip("mctx")
 
 from rl2.alphazero import evaluation as ev
 from rl2.alphazero.config import Config, EvaluationConfig
@@ -104,12 +103,12 @@ def test_search_uses_acting_network_and_greedy_legal_action(monkeypatch: pytest.
 
     def search(
         predict: PolicyValueFn,
-        key: jax.Array,
-        root: mctx.RootFnOutput,
-        recurrent_fn: mctx.RecurrentFn,
+        key: jax.Array,  # (2,)
+        root: ev.train.RootFnOutput[pgx.State],  # Leaves: (B, ...)
+        recurrent_fn: ev.train.RecurrentFn[pgx.State],
         num_simulations: int,
         **kwargs: Any,
-    ) -> mctx.PolicyOutput:
+    ) -> ev.train.PolicyOutput[pgx.State]:
         _, value = predict(root.embedding.observation)
         seen.append(float(value[0]))
         np.testing.assert_array_equal(value, root.value)
@@ -118,7 +117,11 @@ def test_search_uses_acting_network_and_greedy_legal_action(monkeypatch: pytest.
         np.testing.assert_array_equal(kwargs["invalid_actions"], ~state.legal_action_mask[None])
         # Illegal square 0 has the highest weight; legal square 2 wins the game.
         weights = jnp.array([[100, 0, 10, 0, 0, 0, 0, 0, 0]], jnp.float32)
-        return mctx.PolicyOutput(action=jnp.array([8], jnp.int32), action_weights=weights, search_tree=None)
+        return ev.train.PolicyOutput(
+            action=jnp.array([8], jnp.int32),  # (B,)
+            action_weights=weights,  # (B, A)
+            search_tree=ev.train._init_tree(root, 0, kwargs["invalid_actions"]),
+        )
 
     monkeypatch.setattr(ev.train, "puct_policy", search)
     with jax.disable_jit():

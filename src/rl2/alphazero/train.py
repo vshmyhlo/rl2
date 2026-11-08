@@ -10,7 +10,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Data-parallel AlphaZero sketch using PGX rules and Mctx PUCT search.
+"""Data-parallel AlphaZero sketch using PGX rules and local Mctx-style PUCT search.
 
 Run: uv run python -m rl2.alphazero.train --config configs/alphazero/chess.yaml
 For a cheap start, set env_id: tic_tac_toe and max_moves: 9 in the YAML config.
@@ -110,14 +110,12 @@ from typing import NamedTuple, Protocol
 import chex
 import jax
 import jax.numpy as jnp
-import mctx
 import optax
 import pgx
 import yaml
 from flax import struct
 from flax.training.train_state import TrainState
 from jax.sharding import AxisType, Mesh, PartitionSpec
-from mctx._src import search as mctx_search
 from omegaconf.errors import OmegaConfBaseException
 
 from rl2.alphazero import evaluation
@@ -131,8 +129,59 @@ from rl2.running_stats import RunningSum
 logger = logging.getLogger(__name__)
 
 type Metrics = dict[str, jax.Array]
-type SearchTree = mctx.Tree[None]
-type SearchState = tuple[jax.Array, SearchTree]
+
+
+@struct.dataclass
+class RootFnOutput[StateT]:
+    prior_logits: jax.Array  # (B, A)
+    value: jax.Array  # (B,)
+    embedding: StateT  # Array leaves: (B, ...)
+
+
+@struct.dataclass
+class RecurrentFnOutput:
+    reward: jax.Array  # (B,)
+    discount: jax.Array  # (B,)
+    prior_logits: jax.Array  # (B, A)
+    value: jax.Array  # (B,)
+
+
+@struct.dataclass
+class SearchTree[StateT]:
+    """Batched search storage; N = num_simulations + 1, root = 0, missing = -1."""
+
+    node_visits: jax.Array  # (B, N)
+    raw_values: jax.Array  # (B, N)
+    node_values: jax.Array  # (B, N)
+    parents: jax.Array  # (B, N)
+    action_from_parent: jax.Array  # (B, N)
+    children_index: jax.Array  # (B, N, A)
+    children_prior_logits: jax.Array  # (B, N, A)
+    children_values: jax.Array  # (B, N, A)
+    children_visits: jax.Array  # (B, N, A)
+    children_rewards: jax.Array  # (B, N, A)
+    children_discounts: jax.Array  # (B, N, A)
+    embeddings: StateT  # Array leaves: (B, N, ...)
+    root_invalid_actions: jax.Array  # (B, A)
+
+
+@struct.dataclass
+class PolicyOutput[StateT]:
+    action: jax.Array  # (B,)
+    action_weights: jax.Array  # (B, A)
+    search_tree: SearchTree[StateT]  # Array leaves: (B, N, ...)
+
+
+type SearchState[StateT] = tuple[jax.Array, SearchTree[StateT]]
+
+
+class SimulationState(NamedTuple):
+    key: jax.Array  # (2,)
+    parent: jax.Array  # ()
+    action: jax.Array  # ()
+    next_node: jax.Array  # ()
+    depth: jax.Array  # ()
+    continuing: jax.Array  # ()
 
 
 class TrainMetrics(NamedTuple):
@@ -155,8 +204,8 @@ class WindowMetrics(NamedTuple):
     iteration_seconds: jax.Array  # ()
 
 
-class BackupState(NamedTuple):
-    tree: SearchTree  # Leaves: (B, N, ...)
+class BackupState[StateT](NamedTuple):
+    tree: SearchTree[StateT]  # Leaves: (B, N, ...)
     leaf_value: jax.Array  # (B,)
     index: jax.Array  # (B,)
 
@@ -186,6 +235,155 @@ class PolicyValueFn(Protocol):
         ...
 
 
+class RecurrentFn[StateT](Protocol):
+    def __call__(
+        self,
+        model: PolicyValueFn,
+        key: jax.Array,  # (2,)
+        actions: jax.Array,  # (B,)
+        states: StateT,  # Array leaves: (B, ...)
+        /,
+    ) -> tuple[RecurrentFnOutput, StateT]:
+        """Return (B, ...) predictions and child state leaves."""
+        ...
+
+
+def _init_tree[StateT](
+    root: RootFnOutput[StateT],  # Array leaves: (B, ...)
+    num_simulations: int,
+    invalid_actions: jax.Array,  # (B, A)
+) -> SearchTree[StateT]:
+    """Allocate (B, N, ...) storage and count the root prediction as its first visit."""
+    chex.assert_rank(root.prior_logits, 2)
+    batch_size, num_actions = root.prior_logits.shape
+    chex.assert_shape(root.value, (batch_size,))
+    chex.assert_shape(invalid_actions, (batch_size, num_actions))
+    node_shape = (batch_size, num_simulations + 1)
+    edge_shape = (*node_shape, num_actions)
+
+    def allocate(state: jax.Array) -> jax.Array:  # (B, ...) -> (B, N, ...)
+        chex.assert_shape(state, (batch_size, *state.shape[1:]))
+        return jnp.zeros((*node_shape, *state.shape[1:]), state.dtype).at[:, 0].set(state)  # (B, N, ...)
+
+    values = jnp.zeros(node_shape, root.value.dtype).at[:, 0].set(root.value)  # (B, N)
+    return SearchTree(
+        node_visits=jnp.zeros(node_shape, jnp.int32).at[:, 0].set(1),  # (B, N)
+        raw_values=values,  # (B, N)
+        node_values=values,  # (B, N)
+        parents=jnp.full(node_shape, -1, jnp.int32),  # (B, N)
+        action_from_parent=jnp.full(node_shape, -1, jnp.int32),  # (B, N)
+        children_index=jnp.full(edge_shape, -1, jnp.int32),  # (B, N, A)
+        children_prior_logits=jnp.zeros(edge_shape, root.prior_logits.dtype)
+        .at[:, 0]
+        .set(root.prior_logits),  # (B, N, A)
+        children_values=jnp.zeros(edge_shape, root.value.dtype),  # (B, N, A)
+        children_visits=jnp.zeros(edge_shape, jnp.int32),  # (B, N, A)
+        children_rewards=jnp.zeros(edge_shape, root.value.dtype),  # (B, N, A)
+        children_discounts=jnp.zeros(edge_shape, root.value.dtype),  # (B, N, A)
+        embeddings=jax.tree.map(allocate, root.embedding),  # Leaves: (B, N, ...)
+        root_invalid_actions=invalid_actions,  # (B, A)
+    )
+
+
+def _select_action(
+    key: jax.Array,  # (2,)
+    tree: SearchTree,  # Unbatched leaves: (N, ...)
+    node: jax.Array,  # ()
+) -> jax.Array:  # ()
+    """Select by Mctx's default PUCT with parent/sibling Q normalization."""
+    visits = tree.children_visits[node]  # (A,)
+    node_visits = tree.node_visits[node]  # ()
+    pb_c = 1.25 + jnp.log((node_visits + 19652.0 + 1.0) / 19652.0)  # ()
+    priors = jax.nn.softmax(tree.children_prior_logits[node])  # (A,)
+    policy_score = jnp.sqrt(node_visits) * pb_c * priors / (visits + 1)  # (A,)
+    qvalues = tree.children_rewards[node] + tree.children_discounts[node] * tree.children_values[node]  # (A,)
+    value = tree.node_values[node]  # ()
+    safe_qvalues = jnp.where(visits > 0, qvalues, value)  # (A,)
+    minimum = jnp.minimum(value, safe_qvalues.min())  # ()
+    maximum = jnp.maximum(value, safe_qvalues.max())  # ()
+    value_score = (jnp.where(visits > 0, qvalues, minimum) - minimum) / jnp.maximum(maximum - minimum, 1e-8)  # (A,)
+    noise = 1e-7 * jax.random.uniform(key, priors.shape)  # (A,)
+    scores = value_score + policy_score + noise  # (A,)
+    scores = jnp.where(tree.root_invalid_actions & (node == 0), -jnp.inf, scores)  # (A,)
+    return jnp.argmax(scores).astype(jnp.int32)  # ()
+
+
+@partial(jax.vmap, in_axes=(0, 0, None))
+def _simulate(
+    key: jax.Array,  # (2,) per game; caller supplies (B, 2).
+    tree: SearchTree,  # Unbatched leaves: (N, ...)
+    max_depth: int,
+) -> tuple[jax.Array, jax.Array]:  # (), () per game; caller receives (B,), (B,).
+    """Traverse to an unvisited edge or the simulation-budget depth limit."""
+
+    def ongoing(state: SimulationState) -> jax.Array:  # ()
+        return state.continuing  # ()
+
+    def advance(state: SimulationState) -> SimulationState:
+        key, action_key = jax.random.split(state.key)  # Each: (2,)
+        node = state.next_node  # ()
+        action = _select_action(action_key, tree, node)  # ()
+        next_node = tree.children_index[node, action]  # ()
+        depth = state.depth + 1  # ()
+        return SimulationState(
+            key=key,
+            parent=node,
+            action=action,
+            next_node=next_node,
+            depth=depth,
+            continuing=(next_node != -1) & (depth < max_depth),  # ()
+        )
+
+    initial = SimulationState(
+        key=key,
+        parent=jnp.int32(-1),
+        action=jnp.int32(-1),
+        next_node=jnp.int32(0),
+        depth=jnp.int32(0),
+        continuing=jnp.bool_(True),
+    )
+    result = jax.lax.while_loop(ongoing, advance, initial)
+    return result.parent, result.action  # (), ()
+
+
+def _expand[StateT](
+    model: PolicyValueFn,
+    key: jax.Array,  # (2,)
+    tree: SearchTree[StateT],  # Leaves: (B, N, ...)
+    recurrent_fn: RecurrentFn[StateT],
+    parent: jax.Array,  # (B,)
+    action: jax.Array,  # (B,)
+    next_node: jax.Array,  # (B,)
+) -> SearchTree[StateT]:
+    """Evaluate (B,) selected edges and store child predictions and transitions."""
+    batch_size, _, num_actions = tree.children_index.shape
+    batch = jnp.arange(batch_size)  # (B,)
+
+    def select(states: jax.Array) -> jax.Array:  # (B, N, ...) -> (B, ...)
+        return states[batch, parent]  # (B, ...)
+
+    output, states = recurrent_fn(model, key, action, jax.tree.map(select, tree.embeddings))
+    chex.assert_shape(output.prior_logits, (batch_size, num_actions))
+    chex.assert_shape((output.reward, output.discount, output.value), (batch_size,))
+
+    def update(old: jax.Array, new: jax.Array) -> jax.Array:  # (B, N, ...), (B, ...) -> (B, N, ...)
+        chex.assert_shape(new, (batch_size, *old.shape[2:]))
+        return old.at[batch, next_node].set(new)  # (B, N, ...)
+
+    return tree.replace(
+        children_prior_logits=update(tree.children_prior_logits, output.prior_logits),  # (B, N, A)
+        raw_values=update(tree.raw_values, output.value),  # (B, N)
+        node_values=update(tree.node_values, output.value),  # (B, N)
+        node_visits=tree.node_visits.at[batch, next_node].add(1),  # (B, N)
+        embeddings=jax.tree.map(update, tree.embeddings, states),  # Leaves: (B, N, ...)
+        children_index=tree.children_index.at[batch, parent, action].set(next_node),  # (B, N, A)
+        children_rewards=tree.children_rewards.at[batch, parent, action].set(output.reward),  # (B, N, A)
+        children_discounts=tree.children_discounts.at[batch, parent, action].set(output.discount),  # (B, N, A)
+        parents=tree.parents.at[batch, next_node].set(parent),  # (B, N)
+        action_from_parent=tree.action_from_parent.at[batch, next_node].set(action),  # (B, N)
+    )
+
+
 def masked_logits(
     logits: jax.Array,  # (..., A)
     legal: jax.Array,  # (..., A)
@@ -210,12 +408,12 @@ def recurrent_step(
     states: pgx.State,  # Leaves: (B, ...)
     *,
     env: pgx.Env,
-) -> tuple[mctx.RecurrentFnOutput, pgx.State]:
-    """Expand batched Mctx nodes for deterministic, alternating-turn, two-player games.
+) -> tuple[RecurrentFnOutput, pgx.State]:
+    """Expand batched search nodes for deterministic, alternating-turn, two-player games.
 
     Args:
         model: Bound observation-to-(logits, value) callable, forwarded through
-            Mctx's params argument. Values use the player-to-move perspective.
+            the search's model argument. Values use the player-to-move perspective.
         actions: (B,) int32 action IDs.
         states: (B, ...) array leaves forming a batched PGX state pytree.
         env: Game rules and action/observation encodings.
@@ -246,7 +444,7 @@ def recurrent_step(
     chex.assert_shape(value, states.current_player.shape)
     reward = jnp.take_along_axis(next_states.rewards, states.current_player[:, None], axis=1)[:, 0]  # (B,)
     done = next_states.terminated | next_states.truncated  # (B,)
-    output = mctx.RecurrentFnOutput(
+    output = RecurrentFnOutput(
         reward=reward,  # (B,)
         discount=jnp.where(done, 0.0, -1.0),  # (B,)
         prior_logits=masked_logits(logits, next_states.legal_action_mask),  # (B, A)
@@ -255,10 +453,10 @@ def recurrent_step(
     return output, next_states
 
 
-def _backward(
-    tree: SearchTree,  # Leaves: (B, N, ...)
+def _backward[StateT](
+    tree: SearchTree[StateT],  # Leaves: (B, N, ...)
     leaf_index: jax.Array,  # (B,)
-) -> SearchTree:  # Leaves: (B, N, ...)
+) -> SearchTree[StateT]:  # Leaves: (B, N, ...)
     """Back up (B,) leaf indices, masking individual updates once a root is reached.
 
     Mctx vmaps a per-game while loop. Its implicit masking selects entire
@@ -266,7 +464,7 @@ def _backward(
     A single batched loop only needs to mask the (B,) values being scattered.
 
     Args:
-        tree: (B, N, ...) array leaves forming an Mctx tree.
+        tree: (B, N, ...) array leaves forming a search tree.
         leaf_index: (B,) int32 node indices to back up.
 
     Returns:
@@ -274,12 +472,12 @@ def _backward(
     """
     batch = jnp.arange(leaf_index.shape[0])  # (B,)
 
-    def ongoing(carry: BackupState) -> jax.Array:  # ()
-        return jnp.any(carry.index != mctx.Tree.ROOT_INDEX)  # ()
+    def ongoing(carry: BackupState[StateT]) -> jax.Array:  # ()
+        return jnp.any(carry.index != 0)  # ()
 
-    def advance(carry: BackupState) -> BackupState:
+    def advance(carry: BackupState[StateT]) -> BackupState[StateT]:
         tree, leaf_value, index = carry  # Tree leaves: (B, N, ...); values and indices: (B,)
-        active = index != mctx.Tree.ROOT_INDEX  # (B,)
+        active = index != 0  # (B,)
         # Inactive games use valid dummy indices and retain the old entries.
         parent = jnp.where(active, tree.parents[batch, index], 0)  # (B,)
         action = jnp.where(active, tree.action_from_parent[batch, index], 0)  # (B,)
@@ -304,17 +502,17 @@ def _backward(
     return jax.lax.while_loop(ongoing, advance, initial).tree  # Leaves: (B, N, ...)
 
 
-def puct_policy(
+def puct_policy[StateT](
     model: PolicyValueFn,
     key: jax.Array,  # (2,)
-    root: mctx.RootFnOutput,  # Leaves: (B, ...)
-    recurrent_fn: mctx.RecurrentFn,
+    root: RootFnOutput[StateT],  # Leaves: (B, ...)
+    recurrent_fn: RecurrentFn[StateT],
     num_simulations: int,
     *,
     invalid_actions: jax.Array,  # (B, A)
     temperature: jax.Array | float,  # ()
-) -> mctx.PolicyOutput[None]:
-    """Run Mctx's default MuZero PUCT policy without adding root noise.
+) -> PolicyOutput[StateT]:
+    """Run a local implementation of Mctx's default MuZero PUCT policy without adding root noise.
 
     Args:
         model: Bound policy/value function passed to recurrent_fn.
@@ -323,8 +521,8 @@ def puct_policy(
             prior_logits: (B, A) float32 policy logits.
             value: (B,) float32 root values.
             embedding: (B, ...) state array leaves.
-        recurrent_fn: Mctx transition function.
-        num_simulations: Number of node expansions per game.
+        recurrent_fn: Batched transition and prediction function.
+        num_simulations: Number of node expansions per game; zero gives uniform weights.
         invalid_actions: (B, A) boolean mask of invalid root actions.
         temperature: () action-sampling temperature, or a Python scalar.
 
@@ -344,30 +542,23 @@ def puct_policy(
     batch_size = root.value.shape[0]
     batch = jnp.arange(batch_size)  # (B,)
 
-    def simulate(simulation: int, carry: SearchState) -> SearchState:
+    def simulate(simulation: int, carry: SearchState[StateT]) -> SearchState[StateT]:
         key, tree = carry  # Key: (2,); tree leaves: (B, N, ...)
         key, simulate_key, expand_key = jax.random.split(key, 3)  # Each: (2,)
-        parent, action = mctx_search.simulate(
-            jax.random.split(simulate_key, batch_size), tree, mctx.muzero_action_selection, num_simulations
-        )  # Each: (B,)
+        parent, action = _simulate(jax.random.split(simulate_key, batch_size), tree, num_simulations)  # Each: (B,)
         next_node = tree.children_index[batch, parent, action]  # (B,)
-        next_node = jnp.where(next_node == mctx.Tree.UNVISITED, simulation + 1, next_node)  # (B,)
-        tree = mctx_search.expand(
-            model, expand_key, tree, recurrent_fn, parent, action, next_node
-        )  # Leaves: (B, N, ...)
+        next_node = jnp.where(next_node == -1, simulation + 1, next_node)  # (B,)
+        tree = _expand(model, expand_key, tree, recurrent_fn, parent, action, next_node)  # Leaves: (B, N, ...)
         return key, _backward(tree, next_node)
 
-    # Mctx exposes no backup hook. Reuse its internal allocation, traversal and
-    # expansion helpers; reference-policy tests guard this small compatibility
-    # surface when the dependency is upgraded.
-    tree = mctx_search.instantiate_tree_from_root(
-        root, num_simulations, invalid_actions, extra_data=None
-    )  # Leaves: (B, N, ...)
+    tree = _init_tree(root, num_simulations, invalid_actions)  # Leaves: (B, N, ...)
     _, tree = jax.lax.fori_loop(0, num_simulations, simulate, (search_key, tree))  # Tree leaves: (B, N, ...)
-    weights = tree.summary().visit_probs  # (B, A)
+    counts = tree.children_visits[:, 0].astype(root.value.dtype)  # (B, A)
+    total = counts.sum(axis=-1, keepdims=True)  # (B, 1)
+    weights = jnp.where(total > 0, counts / jnp.maximum(total, 1), 1 / counts.shape[-1])  # (B, A)
     logits = jnp.log(jnp.maximum(weights, tiny))  # (B, A)
     logits = (logits - logits.max(axis=-1, keepdims=True)) / jnp.maximum(tiny, temperature)  # (B, A)
-    return mctx.PolicyOutput(
+    return PolicyOutput(
         action=jax.random.categorical(action_key, logits),  # (B,)
         action_weights=weights,  # (B, A)
         search_tree=tree,  # Leaves: (B, N, ...)
@@ -452,8 +643,8 @@ def collect_selfplay(
         _key: jax.Array,  # (2,)
         actions: jax.Array,  # (B,)
         states: pgx.State,  # Leaves: (B, ...)
-    ) -> tuple[mctx.RecurrentFnOutput, pgx.State]:
-        # Mctx requires a PRNG key even for deterministic transitions.
+    ) -> tuple[RecurrentFnOutput, pgx.State]:
+        # The search interface also supports stochastic transitions.
         return recurrent_step(model, actions, states, env=env)
 
     def step(
@@ -464,7 +655,7 @@ def collect_selfplay(
         noise_key, search_key = jax.random.split(key)  # Each: (2,)
         logits, value = predict(states.observation)  # (B, A), (B,)
         done = states.terminated | states.truncated  # (B,)
-        root = mctx.RootFnOutput(
+        root = RootFnOutput(
             prior_logits=selfplay_prior_logits(
                 logits,
                 states.legal_action_mask,
@@ -475,7 +666,7 @@ def collect_selfplay(
             value=jnp.where(done, 0.0, value),  # (B,)
             embedding=states,  # Leaves: (B, ...)
         )
-        # PGX supplies exact transitions for Mctx's PUCT, with no learned dynamics.
+        # PGX supplies exact transitions for PUCT, with no learned dynamics.
         policy = puct_policy(
             predict,
             search_key,
@@ -559,22 +750,50 @@ def loss_fn(
 
 @partial(
     jax.jit,
-    static_argnames=("batch_size",),
+    static_argnames=("batch_size", "updates_per_iteration"),
     out_shardings=PartitionSpec(),
 )
 def train_step(
     train_state: TrainState,
-    batch: Batch,  # Leaves: (N, ...), rollout positions including padding.
     key: jax.Array,  # (2,)
+    batch: Batch,  # Leaves: (N, ...), rollout positions including padding.
     *,
     batch_size: int,
-) -> tuple[TrainState, TrainMetrics]:
-    """Sample a minibatch and update replicated parameters using globally masked means."""
+    updates_per_iteration: int,
+) -> tuple[TrainState, jax.Array, TrainMetrics]:
+    """Run sampled updates; return replicated state, (2,) RNG key, and () metric sums."""
     train_state = jax.lax.with_sharding_constraint(train_state, PartitionSpec())
-    minibatch = sample_batch(batch, key, batch_size)  # Leaves: (B, ...), B = batch_size.
-    (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(train_state.params, train_state.apply_fn, minibatch)
-    grads = jax.lax.with_sharding_constraint(grads, PartitionSpec())  # Parameter shapes.
-    return train_state.apply_gradients(grads=grads), metrics
+    metrics = TrainMetrics(
+        loss=jnp.float32(0),  # ()
+        policy_loss=jnp.float32(0),  # ()
+        value_loss=jnp.float32(0),  # ()
+        value_updates=jnp.int32(0),  # ()
+    )
+
+    def update(
+        carry: tuple[TrainState, jax.Array, TrainMetrics],  # Key: (2,); metric leaves: ().
+        _: None,
+    ) -> tuple[tuple[TrainState, jax.Array, TrainMetrics], None]:
+        train_state, key, metrics = carry
+        key, sample_key = jax.random.split(key)  # Each: (2,)
+        minibatch = sample_batch(batch, sample_key, batch_size)  # Leaves: (B, ...), B = batch_size.
+        (_, update_metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+            train_state.params, train_state.apply_fn, minibatch
+        )
+        grads = jax.lax.with_sharding_constraint(grads, PartitionSpec())  # Parameter shapes.
+        return (
+            train_state.apply_gradients(grads=grads),
+            key,  # (2,)
+            RunningSum.update(metrics, update_metrics),  # Scalar leaves: ().
+        ), None
+
+    result, _ = jax.lax.scan(
+        update,
+        (train_state, key, metrics),  # Key: (2,); metric leaves: ().
+        xs=None,
+        length=updates_per_iteration,
+    )
+    return result
 
 
 @partial(
@@ -673,16 +892,13 @@ def train(config: Config) -> TrainState:
             batch, rollout_metrics = collect_selfplay(
                 train_state.params, play_key, env=env, apply_fn=train_state.apply_fn, config=config
             )
-            update_metrics = TrainMetrics(
-                loss=jnp.float32(0),  # ()
-                policy_loss=jnp.float32(0),  # ()
-                value_loss=jnp.float32(0),  # ()
-                value_updates=jnp.int32(0),  # ()
-            )  # Scalar leaves: ().
-            for _ in range(config.updates_per_iteration):
-                key, sample_key = jax.random.split(key)  # Each: (2,)
-                train_state, metrics = train_step(train_state, batch, sample_key, batch_size=config.batch_size)
-                update_metrics = RunningSum.update(update_metrics, metrics)  # Scalar leaves: ().
+            train_state, key, update_metrics = train_step(
+                train_state,
+                key,
+                batch,
+                batch_size=config.batch_size,
+                updates_per_iteration=config.updates_per_iteration,
+            )
             iteration_metrics = WindowMetrics(
                 update_metrics=update_metrics,  # Scalar leaves: ().
                 completed_games=rollout_metrics["completed_games"],  # ()

@@ -1,0 +1,42 @@
+.selfplay-demo { padding: clamp(0.75rem, 3vw, 1.5rem); border: 1px solid #deded8; border-radius: 0.75rem; background: #fffefa; font: 0.875rem/1.5 system-ui, sans-serif; }
+.selfplay-demo .az-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.5rem; }
+.selfplay-demo .az-heading > strong { font-size: 1rem; }
+.selfplay-demo .az-heading > span, .selfplay-demo .az-intro { color: #64656c; }
+.selfplay-demo .az-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; margin-top: 1.25rem; }
+.selfplay-demo button { font: inherit; cursor: pointer; }
+.selfplay-demo .az-controls button { padding: 0.6rem 0.8rem; min-height: 2.75rem; border: 1px solid #606ca0; border-radius: 0.4rem; color: #fff; background: #606ca0; }
+.selfplay-demo .az-controls button:disabled { opacity: 0.5; cursor: default; }
+.selfplay-demo .az-controls label { flex: 1; min-width: 10rem; margin-left: 0.5rem; }
+.selfplay-demo label > span { display: flex; justify-content: space-between; }
+.selfplay-demo input { width: 100%; margin: 0.5rem 0 0; accent-color: #606ca0; }
+.selfplay-demo .az-status { min-height: 2.7rem; color: #64656c; font-size: 0.8rem; }
+.selfplay-demo .az-grid-scroll { overflow-x: auto; padding: 0.25rem; }
+.selfplay-demo .az-grid { display: grid; grid-template-columns: 3.5rem repeat(6, minmax(0, 1fr)); gap: 0.5rem; min-width: 28rem; }
+.selfplay-demo .az-axis { align-self: center; text-align: center; color: #64656c; font-size: 0.75rem; }
+.selfplay-demo .az-cell { display: flex; flex-direction: column; align-items: center; padding: 0.5rem 0.1rem; border: 1px solid transparent; border-radius: 0.35rem; min-height: 3.5rem; }
+.selfplay-demo .az-cell small { font-size: 0.7rem; }
+.selfplay-demo .az-game-0 { color: #37436e; background: #e7eaf5; }
+.selfplay-demo .az-game-1 { color: #315b4d; background: #e1eee6; }
+.selfplay-demo .az-game-2 { color: #7b491d; background: #f6ead8; }
+.selfplay-demo .az-padding { color: #64656c; background: repeating-linear-gradient(135deg, #eeeee9, #eeeee9 4px, #faf9f6 4px, #faf9f6 8px); }
+.selfplay-demo .az-pending { color: #777870; background: #f3f2ee; }
+.selfplay-demo .az-cell[aria-pressed="true"], .selfplay-demo .az-selected { outline: 2px solid #a44e29; outline-offset: 1px; }
+.selfplay-demo :focus-visible { outline: 3px solid #a44e29; outline-offset: 3px; }
+.selfplay-demo .az-outcome { grid-column: 2 / -1; font-size: 0.7rem; padding-bottom: 0.5rem; }
+.selfplay-demo .az-inspector { margin-top: 1.5rem; border-top: 1px solid #deded8; padding-top: 1rem; }
+.selfplay-demo dl { display: grid; grid-template-columns: auto 1fr; gap: 0.4rem 1rem; font-size: 0.8rem; }
+.selfplay-demo dt { font-family: ui-monospace, monospace; }
+.selfplay-demo dd { margin: 0; }
+.selfplay-demo .az-inspector p, .selfplay-demo .az-flat p { font-size: 0.8rem; color: #64656c; }
+.selfplay-demo .az-flat { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid #deded8; }
+.selfplay-demo .az-flat-games { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+.selfplay-demo .az-flat-games > div { flex: 1; min-width: 9rem; font-size: 0.7rem; }
+.selfplay-demo .az-flat-slots { display: grid; grid-template-columns: repeat(6, 1fr); gap: 0.2rem; margin-top: 0.4rem; }
+.selfplay-demo .az-flat-slots > span { text-align: center; padding: 0.3rem 0; border-radius: 0.2rem; }
+.az-table-wrap { overflow-x: auto; font-size: 0.875rem; }
+.az-table-wrap table { width: 100%; border-collapse: collapse; }
+.az-table-wrap th, .az-table-wrap td { text-align: left; padding: 0.7rem; border-bottom: 1px solid #deded8; }
+@media (max-width: 420px) {
+  .selfplay-demo dl { grid-template-columns: 1fr; gap: 0.2rem; }
+  .selfplay-demo dd { margin-bottom: 0.5rem; }
+}

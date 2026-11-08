@@ -1,3 +1,6 @@
+"""Optional parity checks against Mctx; install mctx to run this reference suite."""
+
+from dataclasses import fields
 from functools import partial
 
 import jax
@@ -9,6 +12,7 @@ pytest.importorskip("pgx")
 mctx = pytest.importorskip("mctx")
 from mctx._src import search as mctx_search
 
+from rl2.alphazero import train as az
 from rl2.alphazero.train import PolicyValueFn, _backward, puct_policy
 
 
@@ -26,10 +30,10 @@ def test_backup_preserves_finished_rows_and_matches_mctx() -> None:
     # One game is already at the root; the others back up one and three edges.
     leaves = jnp.array([0, 1, 3], jnp.int32)
     expected = jax.jit(mctx_search.backward)(tree, leaves)
-    actual = jax.jit(_backward)(tree, leaves)
-    for before, got, want in zip(
-        jax.tree.leaves(tree), jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True
-    ):
+    local_tree = az.SearchTree(**{field.name: getattr(tree, field.name) for field in fields(az.SearchTree)})
+    actual = jax.jit(_backward)(local_tree, leaves)
+    for field in fields(az.SearchTree):
+        before, got, want = (getattr(item, field.name) for item in (tree, actual, expected))
         assert got.shape == want.shape
         np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
         np.testing.assert_array_equal(got[0], before[0])
@@ -72,11 +76,27 @@ def test_puct_matches_mctx_policy(batch_size: int, simulations: int, temperature
         "temperature": temperature,
     }
     reference = jax.jit(partial(mctx.muzero_policy, predict, dirichlet_fraction=0.0, **kwargs))(key, root)
-    actual = jax.jit(partial(puct_policy, predict, **kwargs))(key, root)
+
+    def local_recurrent(
+        model: PolicyValueFn,
+        key: jax.Array,  # (2,)
+        actions: jax.Array,  # (B,)
+        state: jax.Array,  # (B, 2)
+    ) -> tuple[az.RecurrentFnOutput, jax.Array]:
+        output, state = recurrent(model, key, actions, state)
+        return az.RecurrentFnOutput(
+            reward=output.reward, discount=output.discount, prior_logits=output.prior_logits, value=output.value
+        ), state  # Output leaves: (B, ...); state: (B, 2).
+
+    local_root = az.RootFnOutput(prior_logits=root.prior_logits, value=root.value, embedding=root.embedding)
+    actual = jax.jit(partial(puct_policy, predict, **{**kwargs, "recurrent_fn": local_recurrent}))(key, local_root)
     assert actual.action.shape == (batch_size,)
     assert actual.action_weights.shape == (batch_size, 4)
     assert actual.search_tree.children_values.shape == (batch_size, simulations + 1, 4)
-    for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(reference), strict=True):
+    np.testing.assert_array_equal(actual.action, reference.action)
+    np.testing.assert_allclose(actual.action_weights, reference.action_weights)
+    for field in fields(az.SearchTree):
+        got, want = (getattr(output.search_tree, field.name) for output in (actual, reference))
         np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
     np.testing.assert_array_equal(actual.action_weights[invalid], 0.0)
     np.testing.assert_allclose(actual.action_weights.sum(axis=-1), 1.0)

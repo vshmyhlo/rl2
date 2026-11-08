@@ -4667,20 +4667,6 @@ wheels = [
 ]
 
 [[package]]
-name = "mctx"
-version = "0.0.71"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "chex" },
-    { name = "jax" },
-    { name = "jaxlib" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/ba/cc/6478f9d28768dbb83433306409d445398fa5b05b8d23fab16d06cac29998/mctx-0.0.71.tar.gz", hash = "sha256:f1546009fe5d714a10a200ffeb51e5b1ea4710f4b15f96ccb8d9874d9651941d", size = 404535, upload-time = "2026-06-15T10:33:46.985Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/af/f8/1702f59a448afc21a86a172e47c10327fde260617de04630dc8044b587de/mctx-0.0.71-py3-none-any.whl", hash = "sha256:15be68b6344ca93e3bc4ae5be3a7ced93609839909acecd896e7d17a73b9b87e", size = 482505, upload-time = "2026-06-15T10:33:45.515Z" },
-]
-
-[[package]]
 name = "mdurl"
 version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
@@ -7964,7 +7950,6 @@ dependencies = [
     { name = "jsonschema" },
     { name = "kauldron" },
     { name = "kinetix-env" },
-    { name = "mctx" },
     { name = "metaljax", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "mlflow-skinny", extra = ["db"] },
     { name = "moviepy" },
@@ -8039,7 +8024,6 @@ requires-dist = [
     { name = "jsonschema", specifier = ">=4.26,<5" },
     { name = "kauldron", specifier = ">=1.4.4,<2" },
     { name = "kinetix-env", specifier = "==3.0.2" },
-    { name = "mctx", specifier = ">=0.0.6,<0.1" },
     { name = "metaljax", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.11.8,<0.12" },
     { name = "mlflow-skinny", extras = ["db"], specifier = ">=3.17.1,<4" },
     { name = "moviepy", specifier = ">=2.2,<3" },
