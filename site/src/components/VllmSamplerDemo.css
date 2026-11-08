@@ -1,0 +1,75 @@
+.vllm-demo { padding: clamp(0.75rem, 3vw, 1.5rem); border: 1px solid #deded8; border-radius: 0.75rem; background: #fffefa; font: 0.85rem/1.5 system-ui, sans-serif; }
+.vllm-demo .vs-heading { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 0.35rem 1rem; }
+.vllm-demo .vs-heading > strong { font-size: 1rem; }
+.vllm-demo .vs-heading > span { color: #64656c; font-size: 0.75rem; }
+.vllm-demo .vs-muted { color: #64656c; font-size: 0.78rem; }
+.vllm-demo button { font: inherit; cursor: pointer; }
+.vllm-demo :focus-visible { outline: 3px solid #a44e29; outline-offset: 3px; }
+.vllm-demo .vs-controls { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 1.25rem; }
+.vllm-demo .vs-controls button { border: 1px solid #aeb3c6; border-radius: 0.4rem; background: transparent; color: #37436e; padding: 0.5rem 0.7rem; min-height: 2.75rem; }
+.vllm-demo .vs-controls .vs-primary { background: #53628e; color: white; border-color: #53628e; }
+.vllm-demo button:disabled { opacity: 0.45; cursor: default; }
+.vllm-demo button:not(:disabled):hover { filter: brightness(0.94); }
+.vllm-demo .vs-progress { flex: 1; min-width: 9rem; margin-left: 0.25rem; }
+.vllm-demo output { float: right; font-variant-numeric: tabular-nums; }
+.vllm-demo input[type="range"] { display: block; width: 100%; margin: 0.4rem 0 0; accent-color: #53628e; }
+.vllm-demo .vs-stage { margin: 1.2rem 0; padding: 1rem; border-left: 3px solid #53628e; background: #f0f1f6; min-height: 6rem; }
+.vllm-demo .vs-stage p { margin: 0.4rem 0 0; color: #535866; }
+.vllm-demo .vs-pipeline { display: grid; grid-template-columns: repeat(4, 1fr); list-style: none; padding: 0; gap: 0.4rem; }
+.vllm-demo .vs-pipeline li { border-top: 2px solid #deded8; padding: 0.65rem 0.2rem; font-weight: 600; }
+.vllm-demo .vs-pipeline li.vs-current { border-color: #53628e; color: #37436e; }
+.vllm-demo .vs-pipeline span { display: block; color: #64656c; font-weight: 400; font-size: 0.7rem; }
+.vllm-demo .vs-legend { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; font-size: 0.72rem; margin: 1rem 0; }
+.vllm-demo .vs-legend span { display: flex; align-items: center; gap: 0.35rem; }
+.vllm-demo .vs-legend i { width: 0.7rem; height: 0.7rem; border: 1px solid currentColor; border-radius: 2px; }
+.vllm-demo .vs-model, .vllm-demo .vs-sampled { background: #e4e8f5; color: #37436e; }
+.vllm-demo .vs-tool, .vllm-demo .vs-result { background: #e1eee6; color: #315b4d; }
+.vllm-demo .vs-feedback { background: #f6ead8; color: #7b491d; }
+.vllm-demo .vs-scroll { overflow-x: auto; padding: 0.3rem; }
+.vllm-demo .vs-timeline { min-width: 31rem; }
+.vllm-demo .vs-time-heading, .vllm-demo .vs-lane { display: grid; grid-template-columns: 3.6rem 1fr 3rem; align-items: center; gap: 0.5rem; }
+.vllm-demo .vs-time-heading { color: #64656c; font-size: 0.68rem; margin-bottom: 0.5rem; }
+.vllm-demo .vs-lane { margin: 0.35rem 0; border-radius: 0.25rem; }
+.vllm-demo .vs-row-label { background: transparent; border: 0; padding: 0.35rem 0; color: #292b30; text-align: left; }
+.vllm-demo .vs-row-label small { display: block; font-size: 0.65rem; color: #64656c; }
+.vllm-demo .vs-selected { outline: 1px solid #a44e29; outline-offset: 2px; }
+.vllm-demo .vs-track { position: relative; height: 2.75rem; background: repeating-linear-gradient(90deg, #f4f3ef, #f4f3ef calc(16.666% - 1px), #deded8 calc(16.666% - 1px), #deded8 16.666%); }
+.vllm-demo .vs-event { position: absolute; top: 0.1rem; bottom: 0.1rem; border: 2px solid #fffefa; border-radius: 0.3rem; padding: 0; font-size: 0.68rem; }
+.vllm-demo .vs-future { opacity: 0.35; }
+.vllm-demo .vs-running { border-bottom: 3px solid currentColor; }
+.vllm-demo .vs-cursor { position: absolute; top: -0.2rem; bottom: -0.2rem; width: 2px; background: #a44e29; pointer-events: none; }
+.vllm-demo .vs-return { text-align: center; font-variant-numeric: tabular-nums; }
+.vllm-demo .vs-counters { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; margin-top: 1rem; color: #64656c; font-size: 0.72rem; }
+.vllm-demo .vs-counters b { color: #292b30; }
+.vllm-demo .vs-inspector, .vllm-demo .vs-batch { margin-top: 1.5rem; padding-top: 1.25rem; border-top: 1px solid #deded8; }
+.vllm-demo .vs-prompt { font-size: 0.8rem; }
+.vllm-demo .vs-transcript { list-style: none; padding: 0; }
+.vllm-demo .vs-transcript li { display: grid; grid-template-columns: 5.5rem minmax(0, 1fr); gap: 0.6rem; margin: 0.8rem 0; align-items: start; }
+.vllm-demo .vs-badge { border-radius: 0.2rem; padding: 0.25rem 0.4rem; font-size: 0.7rem; }
+.vllm-demo .vs-transcript code { font-size: 0.75rem; overflow-wrap: anywhere; }
+.vllm-demo .vs-transcript small { display: block; font-size: 0.68rem; color: #64656c; margin-top: 0.35rem; }
+.vllm-demo .vs-token-strip { display: flex; gap: 0.25rem; }
+.vllm-demo .vs-block { text-align: center; padding: 0.4rem 0.6rem; border-radius: 0.2rem; }
+.vllm-demo .vs-token-strip small { display: block; font-size: 0.6rem; }
+.vllm-demo .vs-prompt { background: #f0efeb; color: #53534e; padding: 0.6rem; }
+.vllm-demo .vs-padding { background: repeating-linear-gradient(135deg, #eeeee9, #eeeee9 4px, #faf9f6 4px, #faf9f6 8px); color: #64656c; }
+.vllm-demo .vs-stale { text-decoration: line-through; background: #f6ead8; color: #7b491d; }
+.vllm-demo .vs-batch-controls { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; margin-top: 1rem; font-size: 0.75rem; }
+.vllm-demo .vs-batch-controls label { display: flex; align-items: center; gap: 0.4rem; min-height: 2.5rem; cursor: pointer; }
+.vllm-demo input[type="checkbox"] { accent-color: #53628e; width: 1rem; height: 1rem; }
+.vllm-demo .vs-batch-table { width: 100%; min-width: 29rem; border-spacing: 0.25rem 0.5rem; font-size: 0.75rem; }
+.vllm-demo .vs-batch-table th { font-weight: 500; color: #64656c; }
+.vllm-demo .vs-batch-table button { border: 0; background: transparent; padding: 0.6rem 0.2rem; color: #292b30; }
+.vllm-demo .vs-advantage { text-align: center; font-variant-numeric: tabular-nums; }
+.vllm-demo .vs-weight-loop { border: 1px dashed #aeb3c6; border-radius: 0.3rem; padding: 0.75rem; color: #37436e; font-size: 0.75rem; text-align: center; }
+.vllm-demo .vs-weight-loop span { padding-inline: 0.3rem; }
+.vllm-demo figcaption { font-size: 0.72rem; margin-top: 1.25rem; }
+.vs-table-wrap { overflow-x: auto; font-size: 0.85rem; }
+.vs-table-wrap table { width: 100%; border-collapse: collapse; }
+.vs-table-wrap th, .vs-table-wrap td { text-align: left; padding: 0.7rem; border-bottom: 1px solid #deded8; }
+@media (max-width: 480px) {
+  .vllm-demo .vs-pipeline { grid-template-columns: repeat(2, 1fr); }
+  .vllm-demo .vs-transcript li { grid-template-columns: 1fr; gap: 0.35rem; }
+  .vllm-demo .vs-badge { justify-self: start; }
+  .vllm-demo .vs-progress { flex-basis: 100%; margin-top: 0.5rem; }
+}

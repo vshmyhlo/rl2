@@ -122,7 +122,7 @@ correction feedback without advancing the game. Step rewards pass through unchan
 the rollout return sums achievement bonuses and health changes. Keep
 `length_penalty.penalty: 0` because these returns can be negative or exceed one.
 Death or `taskset.max_episode_steps` (default 10,000) ends the episode. The agent's
-turn/token/time budgets can stop it earlier; the preset allows 100 turns and 32,768
+turn/token/time budgets can stop it earlier; the preset allows 50 turns and 8,192
 transcript tokens. Increase both budgets for longer exploration.
 
 Run on Linux x86_64 with Python 3.12 and two visible GPUs:

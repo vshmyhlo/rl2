@@ -1,0 +1,108 @@
+---
+layout: ../layouts/ArticleLayout.astro
+title: vLLM sampler · From tool calls to a training batch
+description: Step through concurrent tool-calling rollouts, inspect their transcripts, and see how sampled tokens become a masked RL training batch.
+---
+
+import VllmSamplerDemo from '../components/VllmSamplerDemo';
+
+<a href="/">← All notes</a>
+
+<p className="eyebrow">vLLM sampler · Inside the training loop</p>
+
+# From tool calls to a training batch
+
+A **rollout** is one attempt at a task. It can contain several **turns**: the model
+generates a response, the agent executes any tool calls, and the results become
+context for the next response. Many rollouts progress concurrently, sharing a
+vLLM server while keeping their environments and transcripts separate.
+
+The actor owns this loop. vLLM samples assistant tokens; the environment executes
+tools and returns observations, rewards, and a `done` flag. A tool call is generated
+text. Its result is new context.
+
+<VllmSamplerDemo client:load />
+
+## Two different kinds of batch
+
+vLLM uses [continuous batching](https://docs.vllm.ai/en/latest/) to serve incoming
+generation requests. Requests from different rollouts can overlap, finish, and
+re-enter on their next turns. While one rollout awaits a tool, other rollouts can
+continue generating. The timeline above illustrates request lifetimes; it does
+not represent individual GPU scheduling or decode steps.
+
+The **learner batch** is assembled later from completed rollouts. In this code,
+the actor runs `group_size` independent attempts at the same task and waits for
+all of them before scoring the group. `score_group` subtracts the group's mean
+training reward from each rollout's training reward. An optional length penalty
+adjusts rewards before this subtraction; the demo disables it.
+
+The batcher consumes ready groups until it has the requested number of rollout
+rows. It preserves order within each group and retains any unused rows for a
+later batch. With prefetching enabled, sampling can continue while the learner
+works. Optionally, groups with identical training rewards are discarded and
+replaced, since all their advantages are zero.
+
+## One transcript, several model requests
+
+`Agent.run` starts with a tokenized system prompt, user prompt, tool schemas, and
+assistant prefix. For each turn it sends the **full current token history** to
+`/inference/v1/generate`, requesting one completion. It appends the returned token
+IDs unchanged, along with their sampling log-probabilities and weight versions.
+
+The agent then parses tool calls and executes them sequentially within that
+rollout. A single response can contain multiple calls, unless the task requires
+one call per response. Each successful environment step adds its reward to the
+episode return. Recoverable parsing or tool errors become feedback the model can
+use on its next turn.
+
+If the rollout continues, the agent appends tool results and the next assistant
+prefix as context. It does not re-tokenize previously sampled history. A terminal
+tool result is used for reward and stopping, but is not appended for another turn.
+
+## Keep context; train on sampled tokens
+
+The batcher right-pads complete transcripts into arrays shaped **(B, T)**:
+`B` rollout rows and `T` token positions. `T` is the longest transcript length
+rounded up to `padding_multiple`, capped by the transcript/context limit.
+
+<div className="vs-table-wrap">
+
+| Field | Shape | Meaning |
+| --- | --- | --- |
+| `token_ids` | `(B, T)` | Exact context and sampled tokens, then right padding |
+| `attention_mask` | `(B, T)` | True for every transcript token; false for padding |
+| `loss_mask` | `(B, T)` | True for sampled tokens within the allowed weight staleness |
+| `old_log_probs` | `(B, T)` | Sampling log-probabilities; zero for context and padding |
+| `advantages` | `(B,)` | One group-centered training reward per rollout |
+
+</div>
+
+Tool-call tokens belong to the assistant and can contribute to the policy loss.
+Tool-result tokens condition subsequent predictions but have no direct policy-loss
+term. Padding contributes to neither mask. At consumption, tokens sampled from
+weight versions older than `max_staleness` allows also lose their loss mask;
+they remain in the context. StableReinforce additionally retains sampler top-K
+token IDs and log-probabilities in arrays shaped `(B, T, K)`.
+
+For next-token training, inputs are `token_ids[:, :-1]`, targets are
+`token_ids[:, 1:]`, and the loss uses `loss_mask[:, 1:]`. The example shows one
+iteration with one update and no gradient accumulation. In the trainer,
+`grad_accum_steps` microbatches together supply `batch_size` rollouts for an update.
+Updated weights are published to vLLM at the configured `parameter_sync_steps`
+cadence; prefetching means later batches may contain older sampled tokens.
+
+## What ends a rollout?
+
+- **`agent_completed`:** a completed model response contains no tool calls.
+- **`environment_done`:** a tool step ends the environment episode.
+- **`max_turns`:** the maximum number of model responses is reached.
+- **`max_tokens` / `context_length`:** the total transcript budget or model context
+  window prevents further generation. Prompts and tool results count toward this
+  budget too; the context limit wins a tie.
+
+<footer>Based on <code>Agent.run</code> in <code>src/rl2/agent_loop.py</code> and
+<code>Actor.collect_group</code>, <code>score_group</code>, <code>Batcher.prepare_batch</code>,
+and <code>Learner</code> in <code>src/rl2/train_grpo_v2.py</code>.
+The visualization uses a deterministic toy schedule, symbolic token blocks, and
+illustrative rewards. It makes no live inference or tool requests.</footer>

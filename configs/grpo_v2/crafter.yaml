@@ -1,28 +1,51 @@
 model: Qwen/Qwen3-0.6B
+vllm:
+  max_model_len: 8192
+  max_num_seqs: 256
+  max_num_batched_tokens: 2048
+  gpu_memory_utilization: 0.90
+  enable_prefix_caching: true
+  enable_chunked_prefill: true
+  async_scheduling: true
+learning_rate: 1e-6
+adamw_batch_size_scale: 1.0
+loss:
+  kind: stable_reinforce
+max_grad_norm: 1.0
+finetuning:
+  mode: full # Optimizes every weight and requires more GPU memory.
+attention_backend: tokamax
+scan_layers: true
+gradient_checkpointing: true
+padding_multiple: 1024
 tasksets:
   crafter:
+    weight: 1.0
     taskset:
       id: crafter
       max_episode_steps: 1000
 seed: 1
-batch_size: 16
-group_size: 8
-prefetch_batches: 1
-learning_rate: 1e-6
-loss:
-  kind: grpo
-finetuning:
-  mode: lora
-  rank: 16
-  alpha: 32
-# Crafter returns are not restricted to [0, 1].
+total_iterations: 1000
+
+batch_size: 32 # Total rollouts per optimizer update.
+grad_accum_steps: 32 # Microbatches per update: one rollout each.
+group_size: 8 # Rollouts per task, scored together before microbatch splitting.
+
+prefetch_batches: 4 # Prefetch 4 * 32 = 128 rollouts.
+parameter_sync_steps: 1 # Publish every optimizer update (32 consumed rollouts).
+max_staleness: 10 # Mask tokens older than ten weight publications.
+
+# verl's off-policy threshold/drop strategy and minibatch streaming are unsupported.
+weight_update_pause_mode: keep
+drop_degenerate_groups: true
 length_penalty:
-  penalty: 0.0
-max_tokens: 32768 # Total transcript budget, including observations and tools.
-max_turns: 100
+  reference_tokens: 8192 # Generated-token scale, independent of the transcript budget.
+  penalty: 0.0 # Crafter returns can be negative or exceed one.
+max_tokens: 8192 # Total transcript tokens, including system, prompt, and tools.
+max_turns: 50
 rollout_timeout: 1200
 environment_timeout: 600
-run_id: grpo_v2_crafter_${path_name:${model}}_s${seed}
-ckpt_dir: /runs/grpo_v2/${run_id}
+run_id: grpo_v2_crafter_${loss.kind}_${path_name:${model}}_${finetuning.mode}_${attention_backend}_s${seed}_lr${learning_rate}_adamw_scale${adamw_batch_size_scale}_bs${batch_size}_gs${group_size}_ga${grad_accum_steps}_pf${prefetch_batches}_next_ready_ps${parameter_sync_steps}_ms${max_staleness}_ddg${drop_degenerate_groups}_success_lp${length_penalty.reference_tokens}_${length_penalty.penalty}
+ckpt_dir: /runs/grpo_v2/${run_id} # Checkpoints and profiling artifacts.
 checkpoint_interval: 50
 example_log_interval: 50
