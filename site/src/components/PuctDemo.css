@@ -1,0 +1,67 @@
+.puct-demo { --puct-ink: #606ca0; --puct-accent: #a44e29; --puct-line: #deded8; --puct-muted: #64656c; padding: clamp(0.75rem, 3vw, 1.5rem); border: 1px solid var(--puct-line); border-radius: 0.75rem; background: #fffefa; font: 0.875rem/1.5 system-ui, sans-serif; }
+.puct-demo .puct-heading { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; }
+.puct-demo .puct-heading > strong { font-size: 1rem; }
+.puct-demo .puct-heading > span, .puct-demo .puct-muted { color: var(--puct-muted); }
+.puct-demo button, .puct-demo select, .puct-demo input { font: inherit; }
+.puct-demo button, .puct-demo select { min-height: 2.75rem; border: 1px solid var(--puct-ink); border-radius: 0.4rem; background: transparent; color: #37436e; padding: 0.5rem 0.75rem; cursor: pointer; }
+.puct-demo .puct-primary { background: var(--puct-ink); color: white; min-width: 4.5rem; }
+.puct-demo button:disabled { opacity: 0.5; cursor: default; }
+.puct-demo button:hover:not(:disabled) { background: #e7eaf5; color: #37436e; }
+.puct-demo :focus-visible { outline: 3px solid var(--puct-accent); outline-offset: 3px; }
+.puct-demo .puct-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 1rem 0; }
+.puct-demo .puct-controls label { display: flex; align-items: center; gap: 0.4rem; }
+.puct-demo .puct-progress, .puct-demo .puct-temperature { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.3rem; }
+.puct-demo input[type="range"] { width: 100%; accent-color: var(--puct-ink); margin: 0.5rem 0; min-height: 1.5rem; }
+.puct-demo output { font-variant-numeric: tabular-nums; }
+.puct-demo .puct-phases { display: grid; grid-template-columns: repeat(5, 1fr); list-style: none; padding: 0; gap: 0.25rem; margin: 1rem 0; font-size: 0.75rem; }
+.puct-demo .puct-phases li { padding: 0.5rem 0.2rem; border-bottom: 2px solid var(--puct-line); text-align: center; }
+.puct-demo .puct-phases span { display: block; }
+.puct-demo .puct-phases [aria-current] { color: var(--puct-accent); border-color: var(--puct-accent); background: #fbf0e7; font-weight: 650; }
+.puct-demo .puct-stage { padding: 1rem; border-radius: 0.4rem; background: #f3f2ee; min-height: 8rem; }
+.puct-demo .puct-stage p { margin: 0.5rem 0 0; }
+.puct-demo .puct-tree-scroll, .puct-demo .puct-table-scroll { overflow-x: auto; }
+.puct-demo .puct-tree { display: block; width: 100%; min-width: 560px; margin-top: 1rem; }
+.puct-demo .puct-tree text { font-size: 12px; fill: #454750; }
+.puct-demo .puct-tree .puct-tree-note { fill: var(--puct-muted); font-size: 11px; }
+.puct-demo .puct-edge path { stroke: #babdc8; stroke-width: 2; fill: none; }
+.puct-demo .puct-edge.puct-active path { stroke: var(--puct-accent); stroke-width: 3; }
+.puct-demo .puct-edge.puct-active text { fill: var(--puct-accent); }
+.puct-demo .puct-node rect { fill: #e7eaf5; stroke: #b9bfd5; }
+.puct-demo .puct-node.puct-active rect { stroke: var(--puct-accent); stroke-width: 2; fill: #fbf0e7; }
+.puct-demo .puct-ghost path, .puct-demo .puct-ghost rect { stroke: #aaa99f; stroke-dasharray: 4 4; fill: none; }
+.puct-demo .puct-missing path, .puct-demo .puct-missing rect { stroke: var(--puct-accent); }
+.puct-demo .puct-legend { display: flex; flex-wrap: wrap; gap: 0.3rem 1rem; font-size: 0.75rem; color: var(--puct-muted); }
+.puct-demo .puct-detail { padding: 1rem 0; border-top: 1px solid var(--puct-line); min-height: 16.5rem; }
+.puct-demo .puct-detail p { font-size: 0.8rem; color: var(--puct-muted); }
+.puct-demo table { width: 100%; min-width: 420px; border-collapse: collapse; margin-top: 0.75rem; font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+.puct-demo th, .puct-demo td { padding: 0.4rem; text-align: right; border-bottom: 1px solid var(--puct-line); }
+.puct-demo th:first-child { text-align: left; }
+.puct-demo .puct-chosen { background: #fbf0e7; color: var(--puct-accent); }
+.puct-demo .puct-backup { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 1rem 0; color: var(--puct-accent); }
+.puct-demo .puct-detail code { font-size: 0.75rem; }
+.puct-demo .puct-output { padding-top: 1rem; border-top: 1px solid var(--puct-line); }
+.puct-demo .puct-distributions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; margin: 1rem 0; }
+.puct-demo .puct-distributions > div > strong { display: block; min-height: 2.5rem; font-size: 0.75rem; }
+.puct-demo .puct-distributions small { display: block; font-size: 0.7rem; color: var(--puct-muted); margin-top: 0.4rem; }
+.puct-demo .puct-bar-row { display: flex; align-items: center; gap: 0.3rem; font-size: 0.7rem; margin-bottom: 0.4rem; }
+.puct-demo .puct-bar-row output { width: 3rem; text-align: right; }
+.puct-demo .puct-bar-track { flex: 1; height: 0.65rem; border-radius: 2px; background: #eeeee9; overflow: hidden; }
+.puct-demo .puct-bar-track > span { display: block; height: 100%; background: var(--puct-ink); transition: width 350ms ease; }
+.puct-demo .puct-distributions > div:last-child .puct-bar-track > span { background: var(--puct-accent); }
+.puct-demo .puct-sample { display: flex; align-items: center; flex-wrap: wrap; gap: 0.75rem; }
+.puct-demo .puct-sample span { flex: 1; min-width: 10rem; font-size: 0.8rem; }
+.puct-demo .puct-new { animation: puct-reveal 350ms ease both; }
+.puct-demo .puct-select path { animation: puct-traverse 650ms ease both; }
+.puct-demo .puct-backup path { animation: puct-return 650ms ease both; }
+@keyframes puct-reveal { from { opacity: 0; } to { opacity: 1; } }
+@keyframes puct-traverse { from { stroke-dasharray: 1; stroke-dashoffset: 1; } to { stroke-dasharray: 1; stroke-dashoffset: 0; } }
+@keyframes puct-return { from { stroke-dasharray: 1; stroke-dashoffset: -1; } to { stroke-dasharray: 1; stroke-dashoffset: 0; } }
+@media (max-width: 520px) {
+  .puct-demo .puct-distributions { grid-template-columns: 1fr; }
+  .puct-demo .puct-distributions > div > strong { min-height: 0; margin-bottom: 0.5rem; }
+  .puct-demo .puct-stage { min-height: 13rem; }
+  .puct-demo .puct-detail { min-height: 22rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .puct-demo *, .puct-demo *::before, .puct-demo *::after { animation: none !important; transition: none !important; }
+}

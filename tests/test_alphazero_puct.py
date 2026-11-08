@@ -17,7 +17,8 @@ from rl2.alphazero import train as az
 from rl2.alphazero.train import PolicyValueFn, backward, puct_policy
 
 MCTX_TREE_FIELDS = {
-    field.name: "embeddings" if field.name == "env_states" else field.name for field in fields(az.SearchTree)
+    field.name: {"env_states": "embeddings", "action_at_parent": "action_from_parent"}.get(field.name, field.name)
+    for field in fields(az.SearchTree)
 }
 
 

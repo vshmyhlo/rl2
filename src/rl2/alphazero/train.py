@@ -173,7 +173,7 @@ class SearchTree:
     node_visits: jax.Array  # (B, N)
     node_values: jax.Array  # (B, N)
     parents: jax.Array  # (B, N)
-    action_from_parent: jax.Array  # (B, N)
+    action_at_parent: jax.Array  # (B, N)
     children_index: jax.Array  # (B, N, A)
     children_prior_logits: jax.Array  # (B, N, A)
     children_values: jax.Array  # (B, N, A)
@@ -271,7 +271,7 @@ class RecurrentFn(Protocol):
         ...
 
 
-def init_tree(
+def init_search_tree(
     root: RootFnOutput,  # Array leaves: (B, ...)
     num_simulations: int,
     invalid_actions: jax.Array,  # (B, A)
@@ -292,7 +292,7 @@ def init_tree(
         node_visits=jnp.zeros(node_shape, jnp.int32).at[:, 0].set(1),  # (B, N)
         node_values=jnp.zeros(node_shape, root.value.dtype).at[:, 0].set(root.value),  # (B, N)
         parents=jnp.full(node_shape, -1, jnp.int32),  # (B, N)
-        action_from_parent=jnp.full(node_shape, -1, jnp.int32),  # (B, N)
+        action_at_parent=jnp.full(node_shape, -1, jnp.int32),  # (B, N)
         children_index=jnp.full(edge_shape, -1, jnp.int32),  # (B, N, A)
         children_prior_logits=jnp.zeros(edge_shape, root.prior_logits.dtype)
         .at[:, 0]
@@ -329,11 +329,10 @@ def select_action(
     return jnp.argmax(scores).astype(jnp.int32)  # ()
 
 
-@jax.vmap
 def simulate(
-    key: jax.Array,  # (2,) per game; caller supplies (B, 2).
+    key: jax.Array,  # (2,)
     tree: SearchTree,  # Unbatched leaves: (N, ...)
-) -> tuple[jax.Array, jax.Array]:  # (), () per game; caller receives (B,), (B,).
+) -> tuple[jax.Array, jax.Array]:  # (), ()
     """Traverse an acyclic search tree to an unvisited edge."""
 
     def ongoing(carry: SimulationState) -> jax.Array:  # ()
@@ -392,7 +391,7 @@ def expand(
         children_rewards=tree.children_rewards.at[batch_indices, parent, action].set(output.reward),  # (B, N, A)
         children_discounts=tree.children_discounts.at[batch_indices, parent, action].set(output.discount),  # (B, N, A)
         parents=tree.parents.at[batch_indices, next_node].set(parent),  # (B, N)
-        action_from_parent=tree.action_from_parent.at[batch_indices, next_node].set(action),  # (B, N)
+        action_at_parent=tree.action_at_parent.at[batch_indices, next_node].set(action),  # (B, N)
     )
 
 
@@ -494,7 +493,7 @@ def backward(
         active = index != 0  # (B,)
         # Inactive games use valid dummy indices and retain the old entries.
         parent = jnp.where(active, tree.parents[batch_indices, index], 0)  # (B,)
-        action = jnp.where(active, tree.action_from_parent[batch_indices, index], 0)  # (B,)
+        action = jnp.where(active, tree.action_at_parent[batch_indices, index], 0)  # (B,)
         count = tree.node_visits[batch_indices, parent]  # (B,)
         leaf_value = (
             tree.children_rewards[batch_indices, parent, action]
@@ -564,13 +563,13 @@ def puct_policy(
     def run_simulation(simulation: int, carry: SearchState) -> SearchState:
         key, tree = carry  # Key: (2,); tree leaves: (B, N, ...)
         key, simulate_key, _ = jax.random.split(key, 3)  # Each: (2,); preserve Mctx's selection RNG.
-        parent, action = simulate(jax.random.split(simulate_key, batch_size), tree)  # Each: (B,)
+        parent, action = jax.vmap(simulate)(jax.random.split(simulate_key, batch_size), tree)  # Each: (B,)
         # Each simulation reaches a missing edge and allocates one new node per game.
         next_node = jnp.full((batch_size,), simulation + 1, jnp.int32)  # (B,)
         tree = expand(predict, tree, recurrent_fn, parent, action, next_node)  # Leaves: (B, N, ...)
         return key, backward(tree, next_node)
 
-    tree = init_tree(root, num_simulations, invalid_actions)  # Leaves: (B, N, ...)
+    tree = init_search_tree(root, num_simulations, invalid_actions)  # Leaves: (B, N, ...)
     _, tree = jax.lax.fori_loop(0, num_simulations, run_simulation, (search_key, tree))  # Tree leaves: (B, N, ...)
     counts = tree.children_visits[:, 0].astype(root.value.dtype)  # (B, A)
     total = counts.sum(axis=-1, keepdims=True)  # (B, 1)

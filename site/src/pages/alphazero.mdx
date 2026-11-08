@@ -1,10 +1,11 @@
 ---
 layout: ../layouts/ArticleLayout.astro
 title: AlphaZero · From self-play to a batch
-description: Step through parallel self-play games and inspect the game-by-time batch used to sample training positions.
+description: Animate PUCT search, explore visit counts and temperature, then inspect the self-play batch used to sample training positions.
 ---
 
 import SelfPlayDemo from '../components/SelfPlayDemo';
+import PuctDemo from '../components/PuctDemo';
 
 <a href="/">← All notes</a>
 
@@ -17,6 +18,43 @@ a policy target for each position. `jax.lax.scan` stacks those records along a n
 time axis, producing arrays shaped `(T, B, …)`. The code immediately swaps these
 axes to use the **(B, T) convention: B game rows × T time columns**, matching the
 visualization and the returned rollout.
+
+## Inside one move: `puct_policy`
+
+Before a game takes an action, search explores possible futures. The caller
+evaluates the root position and, during self-play, mixes in exploration noise.
+`puct_policy` masks invalid root actions and builds one tree per game. It repeats
+**select → expand → back up** for `num_simulations` simulations.
+
+Play the walkthrough or use **Next** to inspect each phase. The model predictions
+are illustrative; the scores and visit counts are computed from the tree.
+
+<PuctDemo client:load />
+
+Selection balances a normalized value estimate $\bar Q$ with an exploration bonus:
+
+$$
+\operatorname{score}(s,a) = \bar Q(s,a)
++ \left[1.25 + \log\frac{N(s)+19652+1}{19652}\right]
+\frac{P(s,a)\sqrt{N(s)}}{1+N(s,a)}.
+$$
+
+Here $P$ is the prior probability, $N(s)$ counts node visits (including its initial
+prediction), and $N(s,a)$ counts visits through an action. The implementation
+normalizes Q using the parent value and visited sibling values; unvisited actions
+have normalized value zero. A tiny random perturbation breaks score ties.
+
+`simulate` follows existing children until it finds a missing edge. `expand`
+calls `recurrent_fn` to step the environment and evaluate that new position.
+`backward` carries **reward + discount × child value** up the selected path.
+For an ongoing alternating-turn game, discount is −1: the opponent's good position
+is bad for the parent player. Terminal or truncated transitions use discount 0
+and child value 0, so their immediate reward determines the backed-up return.
+
+After search, root edge counts become `action_weights`, the policy training target.
+Temperature changes only how `action` is sampled from those weights. With zero
+simulations, the weights are uniform over legal actions; with no legal actions,
+the fallback is uniform over all actions. The caller preserves finished games.
 
 ## Collect one time step at a time
 
@@ -99,4 +137,4 @@ and gathers all fields at those coordinates, returning `(M, …)` arrays where
 parameter updates using minibatches of size `batch_size` from this rollout.
 There is no persistent replay buffer here.
 
-<footer>Based on <code>collect_selfplay</code> and <code>sample_batch</code> in <code>src/rl2/alphazero/train.py</code>. The figure uses illustrative data, not a live model.</footer>
+<footer>Based on <code>puct_policy</code>, <code>collect_selfplay</code>, and <code>sample_batch</code> in <code>src/rl2/alphazero/train.py</code>. The figures use illustrative data, not a live model.</footer>
