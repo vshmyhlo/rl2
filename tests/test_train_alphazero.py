@@ -1,5 +1,6 @@
 import logging
 import sys
+from collections.abc import Generator
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -13,6 +14,7 @@ import optax
 import pytest
 import yaml
 from flax.training.train_state import TrainState
+from jax.sharding import AxisType, Mesh
 
 pytest.importorskip("pgx")
 pytest.importorskip("mctx")
@@ -20,6 +22,12 @@ import pgx
 
 from rl2.alphazero import train as az
 from rl2.alphazero.config import ModelConfig
+
+
+@pytest.fixture(autouse=True)
+def single_device_mesh() -> Generator[None]:
+    with jax.set_mesh(Mesh(devices=jax.devices()[:1], axis_names=("batch",), axis_types=(AxisType.Auto,))):
+        yield
 
 
 @pytest.fixture(scope="module")
@@ -121,13 +129,13 @@ def test_outcomes_use_player_ids_and_adjudicate_move_limit_draws(
     observations = jnp.zeros((3, 4, *states.observation.shape[1:]))  # (T, B, 3, 3, 2)
     policies = jnp.full((3, 4, env.num_actions), 1 / env.num_actions)  # (T, B, A)
     monkeypatch.setattr(jax.lax, "scan", Mock(return_value=(states, (observations, policies, players, valid))))
-    batch, metrics = az.collect_selfplay.__wrapped__(params, jax.random.PRNGKey(0), env=env, model=model, config=config)
+    batch, metrics = az.collect_selfplay(params, jax.random.PRNGKey(0), env=env, apply_fn=model.apply, config=config)
     chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (12,))
-    np.testing.assert_array_equal(batch.value_targets, [1, 0, 0, 0, -1, 0, 0, 0, 1, 0, 0, 0])
+    np.testing.assert_array_equal(batch.value_targets, [1, -1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0])
     np.testing.assert_array_equal(
-        batch.value_mask, [True, True, True, False, True, True, True, False, True, False, True, False]
+        batch.value_mask, [True, True, True, True, True, False, True, True, True, False, False, False]
     )
-    np.testing.assert_array_equal(batch.policy_mask, valid.reshape(-1))
+    np.testing.assert_array_equal(batch.policy_mask, valid.T.reshape(-1))
     assert metrics["value_positions"] == 8
     assert metrics["positions"] == 10
     assert metrics["completed_games"] == 3
@@ -170,7 +178,7 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
         model=ModelConfig(channels=4, num_blocks=1),
         batch_size=10,
     )
-    batch, metrics = az.collect_selfplay(params, jax.random.PRNGKey(2), env=env, model=model, config=config)
+    batch, metrics = az.collect_selfplay(params, jax.random.PRNGKey(2), env=env, apply_fn=model.apply, config=config)
     size = config.max_moves * config.num_envs
     chex.assert_shape(batch.observations, (size, 3, 3, 2))
     chex.assert_shape(batch.policy_targets, (size, 9))
@@ -180,33 +188,34 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
     assert metrics["completed_games"] == 2
     assert 10 <= metrics["positions"] <= 18
     np.testing.assert_array_equal(batch.value_mask, batch.policy_mask)
-    assert not batch.policy_mask[-2:].any()
+    assert not batch.policy_mask.reshape(config.num_envs, config.max_moves)[:, -1].any()
     np.testing.assert_allclose(batch.policy_targets.sum(-1), 1.0)
     occupied = np.asarray(batch.observations).any(axis=-1).reshape(size, 9)
     real_positions = np.asarray(batch.policy_mask)
     assert np.all(np.asarray(batch.policy_targets)[occupied & real_positions[:, None]] == 0)
     # Every valid move has the game's result, alternating with the player to move.
     for game in range(config.num_envs):
-        game_mask = real_positions.reshape(config.max_moves, config.num_envs)[:, game]
-        targets = np.asarray(batch.value_targets).reshape(config.max_moves, config.num_envs)[game_mask, game]
+        game_mask = real_positions.reshape(config.num_envs, config.max_moves)[game]
+        targets = np.asarray(batch.value_targets).reshape(config.num_envs, config.max_moves)[game, game_mask]
         np.testing.assert_array_equal(targets[:-1], -targets[1:])
         assert targets[-1] in (0, 1)
 
     state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(1e-3))
-    updated, losses = az.train_step(state, batch, model=model)
+    updated, losses = az.train_step(state, batch, jax.random.PRNGKey(0), batch_size=4)
     assert updated.step == 1
-    chex.assert_shape(tuple(losses.values()), ())
-    assert losses["value_updates"] == 1
-    assert all(np.isfinite(value) for value in losses.values())
+    assert isinstance(losses, az.TrainMetrics)
+    chex.assert_shape(losses, ())
+    assert losses.value_updates == 1
+    assert all(np.isfinite(value) for value in losses)
     assert any(
         np.any(np.asarray(before) != np.asarray(after))
         for before, after in zip(jax.tree.leaves(params), jax.tree.leaves(updated.params), strict=True)
     )
     # Padding must not train either head; masked losses have zero gradient.
     empty = batch.replace(policy_mask=jnp.zeros(size, bool), value_mask=jnp.zeros(size, bool))
-    (loss, empty_metrics), grads = jax.value_and_grad(az.loss_fn, has_aux=True)(params, model, empty)
+    (loss, empty_metrics), grads = jax.value_and_grad(az.loss_fn, has_aux=True)(params, state.apply_fn, empty)
     assert loss == 0
-    assert empty_metrics["value_updates"] == 0
+    assert empty_metrics.value_updates == 0
     assert all(np.all(np.asarray(leaf) == 0) for leaf in jax.tree.leaves(grads))
 
 
@@ -216,7 +225,7 @@ def test_chess_search_smoke() -> None:
     model = az.PolicyValueNet(env.num_actions, channels=4, num_blocks=1)
     observation = env.init(jax.random.PRNGKey(0)).observation[None]  # (1, 8, 8, 119)
     params = model.init(jax.random.PRNGKey(0), observation)["params"]
-    batch, metrics = az.collect_selfplay(params, jax.random.PRNGKey(0), env=env, model=model, config=config)
+    batch, metrics = az.collect_selfplay(params, jax.random.PRNGKey(0), env=env, apply_fn=model.apply, config=config)
     assert batch.observations.shape == (1, *observation.shape[1:])
     assert batch.policy_targets.shape == (1, 4672)
     assert metrics["positions"] == 1
@@ -277,6 +286,7 @@ def test_main_reports_config_errors(
 @pytest.fixture
 def logging_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> az.Config:
     """Exercise the training loop's logging without running a model or search."""
+    monkeypatch.setattr(az, "training_mesh", Mock(return_value=jax.get_mesh()))
     config = az.Config(
         iterations=2,
         log_interval=2,
@@ -297,21 +307,26 @@ def logging_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> az.Config
     model = Mock()
     model.init.return_value = {"params": {"weight": jnp.zeros(1, jnp.float32)}}
     monkeypatch.setattr(az, "PolicyValueNet", Mock(return_value=model))
-    monkeypatch.setattr(az, "sample_batch", Mock(return_value=None))
     rollouts = [
         (None, {"positions": jnp.int32(3), "completed_games": jnp.int32(1), "value_positions": jnp.int32(2)}),
         (None, {"positions": jnp.int32(2), "completed_games": jnp.int32(0), "value_positions": jnp.int32(0)}),
     ]
     monkeypatch.setattr(az, "collect_selfplay", Mock(side_effect=rollouts))
 
-    def fake_step(state: TrainState, batch: az.Batch, *, model: az.PolicyValueNet) -> tuple[TrainState, az.Metrics]:
+    def fake_step(
+        state: TrainState,
+        batch: az.Batch,  # Leaves: (N, ...).
+        key: jax.Array,  # (2,)
+        *,
+        batch_size: int,
+    ) -> tuple[TrainState, az.TrainMetrics]:
         loss = jnp.float32(2 * state.step + 1)  # ()
-        return state.replace(step=state.step + 1), {
-            "loss": loss,  # ()
-            "policy_loss": loss,  # ()
-            "value_loss": jnp.float32(0),  # ()
-            "value_updates": jnp.int32(1),  # ()
-        }
+        return state.replace(step=state.step + 1), az.TrainMetrics(
+            loss=loss,  # ()
+            policy_loss=loss,  # ()
+            value_loss=jnp.float32(0),  # ()
+            value_updates=jnp.int32(1),  # ()
+        )
 
     monkeypatch.setattr(az, "train_step", fake_step)
     return config
@@ -334,18 +349,38 @@ def test_mlflow_progress(
     rollouts = list(az.collect_selfplay.side_effect)
     az.collect_selfplay.side_effect = rollouts * 2 + rollouts[:1]
 
-    def timed_step(state: TrainState, batch: az.Batch, *, model: az.PolicyValueNet) -> tuple[TrainState, az.Metrics]:
+    def timed_step(
+        state: TrainState,
+        batch: az.Batch,  # Leaves: (N, ...).
+        key: jax.Array,  # (2,)
+        *,
+        batch_size: int,
+    ) -> tuple[TrainState, az.TrainMetrics]:
         nonlocal clock
         clock += durations[state.step // logging_config.updates_per_iteration] / logging_config.updates_per_iteration
-        return original_step(state, batch, model=model)
+        return original_step(state, batch, key, batch_size=batch_size)
 
     def now() -> float:
         return clock
 
     monkeypatch.setattr(az, "train_step", timed_step)
     monkeypatch.setattr(az, "monotonic", now)
+    transfers: list[int] = []
+    device_get = jax.device_get
+
+    def get_metrics(metrics: az.WindowMetrics) -> chex.ArrayTree:  # Scalar leaves: () -> ().
+        assert isinstance(metrics, az.WindowMetrics)
+        assert isinstance(metrics.update_metrics, az.TrainMetrics)
+        chex.assert_shape(jax.tree.leaves(metrics), ())
+        transfers.append(az.collect_selfplay.call_count)
+        return device_get(metrics)
+
+    monkeypatch.setattr(az.jax, "device_get", get_metrics)
     state = az.train(logging_config)
+    assert transfers == [2, 4, 5]
     assert state.step == 10
+    for call in az.collect_selfplay.call_args_list:
+        assert call.kwargs["apply_fn"] is state.apply_fn
     writer = az.MLflowLogger.return_value
     az.MLflowLogger.assert_called_once_with(experiment="alphazero", run_name="test-run")
     metrics: dict[str, list[tuple[float, int]]] = {}
@@ -353,6 +388,7 @@ def test_mlflow_progress(
         for tag, value in call.args[0].items():
             metrics.setdefault(tag, []).append((value, call.args[1]))
     assert metrics["train/loss"] == [(4, 5), (12, 10), (18, 13)]
+    assert metrics["train/progress_fraction"] == [(0.4, 5), (0.8, 10), (1.0, 13)]
     assert metrics["train/value_loss"] == [(0, 5), (0, 10), (0, 13)]
     for tag, values in {
         "rollout/completed_games_total": [1, 2, 3],
@@ -369,7 +405,8 @@ def test_mlflow_progress(
     assert [value for value, _ in metrics["train/environment_steps_per_second"]] == pytest.approx(
         [5 / 601, 5 / 5, 3 / 5]
     )
-    assert metrics["train/eta_seconds"][-1][0] == 0
+    assert "train/elapsed_seconds" not in metrics
+    assert "train/eta_seconds" not in metrics
     assert metrics["model/params_millions"][0][0] == pytest.approx(1e-6)
     artifacts = {call.args[1]: call.args[0] for call in writer.log_text.call_args_list}
     saved_config = yaml.safe_load(artifacts["config.yaml"])
@@ -377,7 +414,7 @@ def test_mlflow_progress(
     assert saved_config["ckpt_dir"] == str(tmp_path / "checkpoints" / "test-run")
     writer.log_params.assert_called_once_with(saved_config)
     az.checkpoint_manager.assert_called_once_with(str(tmp_path / "checkpoints" / "test-run"))
-    assert "devices.txt" in artifacts
+    assert "devices.txt" not in artifacts
     messages = [record.getMessage() for record in caplog.records if record.name == az.__name__]
     assert "Run ID: test-run" in messages
     reports = [message for message in messages if message.startswith("Iteration ")]
@@ -411,16 +448,25 @@ def test_mlflow_closes_on_error(logging_config: az.Config, monkeypatch: pytest.M
 def test_value_loss_logging_omits_updates_without_targets(
     logging_config: az.Config, monkeypatch: pytest.MonkeyPatch, has_targets: bool
 ) -> None:
-    losses = iter([3.0, 0.0, 0.0, 0.0] if has_targets else [0.0] * 4)
+    logging_config = replace(logging_config, iterations=4)
+    az.collect_selfplay.side_effect = list(az.collect_selfplay.side_effect) * 2
+    # The second window has no targets, even if the first window had eligible updates.
+    losses = iter(([3.0, 0.0, 0.0, 0.0] if has_targets else [0.0] * 4) + [0.0] * 4)
 
-    def step(state: TrainState, batch: az.Batch, *, model: az.PolicyValueNet) -> tuple[TrainState, az.Metrics]:
+    def step(
+        state: TrainState,
+        batch: az.Batch,  # Leaves: (N, ...).
+        key: jax.Array,  # (2,)
+        *,
+        batch_size: int,
+    ) -> tuple[TrainState, az.TrainMetrics]:
         value_loss = jnp.float32(next(losses))  # ()
-        return state.replace(step=state.step + 1), {
-            "loss": 2.0 + value_loss,  # ()
-            "policy_loss": jnp.float32(2.0),  # ()
-            "value_loss": value_loss,  # ()
-            "value_updates": jnp.int32(has_targets and state.step % 2 == 0),  # ()
-        }
+        return state.replace(step=state.step + 1), az.TrainMetrics(
+            loss=2.0 + value_loss,  # ()
+            policy_loss=jnp.float32(2.0),  # ()
+            value_loss=value_loss,  # ()
+            value_updates=jnp.int32(has_targets and state.step < 4 and state.step % 2 == 0),  # ()
+        )
 
     def now() -> float:
         return 0.0
@@ -428,28 +474,39 @@ def test_value_loss_logging_omits_updates_without_targets(
     monkeypatch.setattr(az, "train_step", step)
     monkeypatch.setattr(az, "monotonic", now)
     az.train(logging_config)
-    metrics = az.MLflowLogger.return_value.log_metrics.call_args.args[0]
+    first_window, second_window = az.MLflowLogger.return_value.log_metrics.call_args_list[-2:]
+    metrics = first_window.args[0]
     assert metrics["train/policy_loss"] == 2.0
     assert metrics["train/loss"] == (2.75 if has_targets else 2.0)
     if has_targets:
         assert metrics["train/value_loss"] == 1.5
     else:
         assert "train/value_loss" not in metrics
+    assert "train/value_loss" not in second_window.args[0]
+    assert second_window.args[0]["train/loss"] == 2.0
 
 
 def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: pytest.MonkeyPatch) -> None:
-    config = replace(logging_config, iterations=5, updates_per_iteration=1, run_id="resume", checkpoint_interval=2)
+    config = replace(
+        logging_config, iterations=5, updates_per_iteration=1, run_id="resume", log_interval=3, checkpoint_interval=2
+    )
     clock = 0.0
     interrupted = False
     original_step = az.train_step
 
-    def timed_step(state: TrainState, batch: az.Batch, *, model: az.PolicyValueNet) -> tuple[TrainState, az.Metrics]:
+    def timed_step(
+        state: TrainState,
+        batch: az.Batch,  # Leaves: (N, ...).
+        key: jax.Array,  # (2,)
+        *,
+        batch_size: int,
+    ) -> tuple[TrainState, az.TrainMetrics]:
         nonlocal clock, interrupted
         if state.step == 2 and not interrupted:
             interrupted = True
             raise RuntimeError("interrupted")
         clock += 1000.0 if state.step == 0 else 1.0
-        return original_step(state, batch, model=model)
+        return original_step(state, batch, key, batch_size=batch_size)
 
     def now() -> float:
         return clock
@@ -485,12 +542,20 @@ def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: p
     assert make_writer.call_args.kwargs["run_name"] == "resume"
     # Replay the interrupted iteration with the same self-play RNG.
     np.testing.assert_array_equal(rollout.call_args_list[2].args[1], rollout.call_args_list[3].args[1])
-    eta = [
-        call.args[0]["train/eta_seconds"]
+    iterations = [
+        call.args[0]["train/iteration"]
         for call in writer.log_metrics.call_args_list
-        if "train/eta_seconds" in call.args[0]
+        if "train/iteration" in call.args[0]
     ]
-    assert eta == [1.0, 0.0]  # Regular boundary followed by a final partial logging window.
+    assert iterations == [3, 5]  # Regular boundary followed by a final partial logging window.
+    assert [
+        (call.args[0]["train/progress_fraction"], call.args[1])
+        for call in writer.log_metrics.call_args_list
+        if "train/progress_fraction" in call.args[0]
+    ] == [(0.6, 6), (1.0, 10)]
+    for call in writer.log_metrics.call_args_list:
+        assert "train/elapsed_seconds" not in call.args[0]
+        assert "train/eta_seconds" not in call.args[0]
 
     restore.return_value = final
     rollout.reset_mock()
@@ -503,17 +568,23 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
     logging_config: az.Config, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.INFO, logger=az.__name__)
-    config = replace(logging_config, iterations=6, updates_per_iteration=1, checkpoint_interval=1, eval_interval=3)
+    config = replace(logging_config, iterations=6, updates_per_iteration=1, checkpoint_interval=2, eval_interval=3)
     clock = 0.0
     original_step = az.train_step
 
     def now() -> float:
         return clock
 
-    def timed_step(state: TrainState, batch: az.Batch, *, model: az.PolicyValueNet) -> tuple[TrainState, az.Metrics]:
+    def timed_step(
+        state: TrainState,
+        batch: az.Batch,  # Leaves: (N, ...).
+        key: jax.Array,  # (2,)
+        *,
+        batch_size: int,
+    ) -> tuple[TrainState, az.TrainMetrics]:
         nonlocal clock
         clock += 1.0
-        state, metrics = original_step(state, batch, model=model)
+        state, metrics = original_step(state, batch, key, batch_size=batch_size)
         return state.replace(params={"weight": jnp.full(1, state.step, jnp.float32)}), metrics
 
     def evaluate(
@@ -521,10 +592,11 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
         opponent_params: az.Parameters,
         *,
         env: pgx.Env,
-        model: az.PolicyValueNet,
+        apply_fn: az.PolicyValueApplyFn,
         config: az.Config,
     ) -> dict[str, float]:
         nonlocal clock
+        assert apply_fn is az.PolicyValueNet.return_value.apply
         clock += 120.0  # Evaluation time does not affect the iteration cadence.
         return {"score": 0.5, "games": 2.0}
 
@@ -541,7 +613,7 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
     monkeypatch.setattr(az, "MLflowLogger", Mock(return_value=writer))
     az.train(config)
     assert run_evaluation.call_count == 2
-    for call, candidate, opponent in zip(run_evaluation.call_args_list, [3, 6], [2, 5], strict=True):
+    for call, candidate, opponent in zip(run_evaluation.call_args_list, [3, 6], [2, 4], strict=True):
         assert call.kwargs["candidate_params"]["weight"].item() == candidate
         assert call.kwargs["opponent_params"]["weight"].item() == opponent
     logged = [
@@ -551,11 +623,11 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
         if tag.startswith("eval/")
     ]
     assert ("eval/opponent_iteration", 2, 6) in logged
-    assert ("eval/opponent_iteration", 5, 12) in logged
+    assert ("eval/opponent_iteration", 4, 12) in logged
     assert ("eval/seconds", 120.0, 12) in logged
     assert sum(record.getMessage().startswith("Evaluation | ") for record in caplog.records) == 2
     saved_key = save.call_args.args[1].key
-    saved_second_iteration = save.call_args_list[1].args[1]
+    saved_second_iteration = save.call_args_list[0].args[1]
     training_keys = [call.args[1] for call in rollout.call_args_list]
 
     # Turning off evaluations by extending the interval must not change training RNG.

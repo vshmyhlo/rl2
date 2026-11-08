@@ -1,6 +1,6 @@
 """Residual policy and value network for AlphaZero."""
 
-from typing import Any
+from typing import Any, Protocol
 
 import chex
 import jax
@@ -8,6 +8,19 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 type Parameters = dict[str, Any]
+
+
+class PolicyValueApplyFn(Protocol):
+    """Apply policy/value parameters to batched observations."""
+
+    def __call__(
+        self,
+        variables: dict[str, Parameters],
+        observation: jax.Array,  # (B, H, W, C)
+        /,
+    ) -> tuple[jax.Array, jax.Array]:  # (B, A), (B,)
+        """Return (B, A) logits and (B,) values for (B, H, W, C) observations."""
+        ...
 
 
 class PolicyValueNet(nn.Module):

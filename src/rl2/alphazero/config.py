@@ -1,9 +1,10 @@
 """Validated AlphaZero settings and OmegaConf YAML loading."""
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import ConfigDict, Field, NonNegativeInt, PositiveInt
+from pydantic import ConfigDict, Field, NonNegativeInt, PositiveInt, model_validator
 from pydantic.dataclasses import dataclass
+from pydantic_core import ArgsKwargs
 
 from rl2.configuration import BaseConfig
 
@@ -46,3 +47,13 @@ class Config(BaseConfig):
     checkpoint_interval: PositiveInt = 10
     eval_interval: PositiveInt = 30
     evaluation: EvaluationConfig = EvaluationConfig()
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_fields(cls, values: Any) -> Any:
+        if isinstance(values, ArgsKwargs):
+            return ArgsKwargs(values.args, cls.normalize_legacy_fields(values.kwargs))
+        if isinstance(values, dict):
+            values = values.copy()
+            values.pop("log_dir", None)
+        return values

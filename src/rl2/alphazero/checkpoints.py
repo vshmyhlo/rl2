@@ -3,7 +3,7 @@
 import os
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Literal, NamedTuple
+from typing import NamedTuple
 
 # Use gcsfs for gs:// paths, matching PPO and avoiding a TensorFlow import.
 os.environ.setdefault("EPATH_USE_TF", "0")
@@ -11,27 +11,16 @@ os.environ.setdefault("EPATH_USE_TF", "0")
 import jax
 import orbax.checkpoint as ocp
 from flax.training.train_state import TrainState
-from pydantic import BaseModel, ConfigDict, NonNegativeInt
 
 from rl2.alphazero.config import Config
 
 
-class TrainingProgress(NamedTuple):
-    state: TrainState
-    key: jax.Array
+class Checkpoint(NamedTuple):
+    train_state: TrainState
+    key: jax.Array  # (2,)
     iteration: int
     steps: int
     completed_games: int
-
-
-class CheckpointMetadata(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    version: Literal[1] = 1
-    config: dict[str, Any]
-    iteration: NonNegativeInt
-    steps: NonNegativeInt
-    completed_games: NonNegativeInt
 
 
 def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
@@ -44,39 +33,25 @@ def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
     )
 
 
-def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, config: Config) -> None:
+def save_checkpoint(manager: ocp.CheckpointManager, checkpoint: Checkpoint, config: Config) -> None:
     """Save weights, optimizer, RNG, counters, and the full config after a complete iteration."""
-    metadata = CheckpointMetadata(
-        config=asdict(config),
-        iteration=progress.iteration,
-        steps=progress.steps,
-        completed_games=progress.completed_games,
-    )
     manager.save(
-        progress.iteration,
+        checkpoint.iteration,
         args=ocp.args.Composite(
-            state=ocp.args.StandardSave({"train_state": progress.state, "key": progress.key}),
-            metadata=ocp.args.JsonSave(metadata.model_dump()),
+            state=ocp.args.StandardSave(checkpoint),
+            config=ocp.args.JsonSave(asdict(config)),
         ),
         force=True,
     )
 
 
-def restore_checkpoint(manager: ocp.CheckpointManager, state: TrainState, config: Config) -> TrainingProgress | None:
-    """Restore training progress using the supplied state template, ignoring the saved config."""
+def restore_checkpoint(manager: ocp.CheckpointManager, checkpoint: Checkpoint) -> Checkpoint | None:
+    """Restore training state using the supplied template, ignoring the saved config."""
     iteration = manager.latest_step()
     if iteration is None:
         return None
-    saved = manager.restore(iteration, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
-    metadata = CheckpointMetadata.model_validate(saved)
-    if metadata.iteration != iteration:
-        raise ValueError("Checkpoint iteration does not match its directory")
-    restored = manager.restore(
+    checkpoint = manager.restore(
         iteration,
-        args=ocp.args.Composite(
-            state=ocp.args.StandardRestore({"train_state": state, "key": jax.random.PRNGKey(config.seed)})
-        ),
+        args=ocp.args.Composite(state=ocp.args.StandardRestore(checkpoint)),
     ).state
-    return TrainingProgress(
-        restored["train_state"], restored["key"], iteration, metadata.steps, metadata.completed_games
-    )
+    return checkpoint._replace(iteration=iteration)

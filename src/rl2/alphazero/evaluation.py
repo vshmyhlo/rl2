@@ -18,7 +18,7 @@ import pgx
 
 from rl2.alphazero import train
 from rl2.alphazero.config import Config
-from rl2.alphazero.model import Parameters, PolicyValueNet
+from rl2.alphazero.model import Parameters, PolicyValueApplyFn
 
 
 def make_opening(key: jax.Array, *, env: pgx.Env, moves: int) -> pgx.State:
@@ -42,15 +42,15 @@ def make_opening(key: jax.Array, *, env: pgx.Env, moves: int) -> pgx.State:
 def play_game(
     candidate_params: Parameters,
     opponent_params: Parameters,
-    state: pgx.State,
-    candidate_player: jax.Array,
-    key: jax.Array,
+    state: pgx.State,  # Unbatched environment state leaves.
+    candidate_player: jax.Array,  # ()
+    key: jax.Array,  # (2,)
     *,
     env: pgx.Env,
-    model: PolicyValueNet,
+    apply_fn: PolicyValueApplyFn,
     num_simulations: int,
     max_moves: int,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array]:  # (), ()
     """Return scalar candidate reward and termination flag; false means unfinished."""
 
     def recurrent_fn(
@@ -70,7 +70,7 @@ def play_game(
             return jnp.where(state.current_player == candidate_player, candidate, opponent)
 
         params = jax.tree.map(choose, candidate_params, opponent_params)
-        predict = partial(model.apply, {"params": params})
+        predict = partial(apply_fn, {"params": params})
 
         def add_batch(x: jax.Array) -> jax.Array:
             return x[None]
@@ -99,16 +99,16 @@ def play_game(
     return reward, final.terminated
 
 
-@partial(jax.jit, static_argnames=("env", "model", "config"))
+@partial(jax.jit, static_argnames=("env", "apply_fn", "config"))
 def evaluate_batch(
     candidate_params: Parameters,
     opponent_params: Parameters,
-    opening_ids: jax.Array,
+    opening_ids: jax.Array,  # (O,), opening count O.
     *,
     env: pgx.Env,
-    model: PolicyValueNet,
+    apply_fn: PolicyValueApplyFn,
     config: Config,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array]:  # (O, 2), (O, 2)
     """Return rewards and termination flags of shape (openings, 2), one per color."""
     seed = jax.random.PRNGKey(config.evaluation.seed)
 
@@ -122,7 +122,7 @@ def evaluate_batch(
             state,
             key=search_key,
             env=env,
-            model=model,
+            apply_fn=apply_fn,
             num_simulations=config.num_simulations,
             max_moves=config.max_moves,
         )
@@ -175,7 +175,12 @@ def summarize_matches(rewards: jax.Array, terminated: jax.Array) -> dict[str, fl
 
 
 def evaluate(
-    candidate_params: Parameters, opponent_params: Parameters, *, env: pgx.Env, model: PolicyValueNet, config: Config
+    candidate_params: Parameters,
+    opponent_params: Parameters,
+    *,
+    env: pgx.Env,
+    apply_fn: PolicyValueApplyFn,
+    config: Config,
 ) -> dict[str, float]:
     """Run a fixed suite in bounded batches without consuming training RNG."""
     rewards, terminated = [], []
@@ -183,7 +188,7 @@ def evaluate(
     for start in range(0, evaluation.num_openings, evaluation.openings_per_batch):
         ids = jnp.arange(start, min(start + evaluation.openings_per_batch, evaluation.num_openings), dtype=jnp.int32)
         batch_rewards, batch_terminated = evaluate_batch(
-            candidate_params, opponent_params, ids, env=env, model=model, config=config
+            candidate_params, opponent_params, ids, env=env, apply_fn=apply_fn, config=config
         )
         rewards.append(batch_rewards)
         terminated.append(batch_terminated)

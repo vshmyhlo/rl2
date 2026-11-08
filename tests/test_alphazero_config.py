@@ -66,6 +66,20 @@ def test_load_intervals(tmp_path: Path) -> None:
     assert config.eval_interval == 15
 
 
+def test_normalize_legacy_log_dir(tmp_path: Path) -> None:
+    values = {"log_dir": "legacy-logs", "ckpt_dir": "current-checkpoints"}
+    config = Config(**values)
+    assert config.ckpt_dir == "current-checkpoints"
+    assert "log_dir" not in asdict(config)
+    assert values["log_dir"] == "legacy-logs"
+
+    path = tmp_path / "config.yaml"
+    path.write_text("log_dir: legacy-logs\nckpt_dir: current-checkpoints\n")
+    loaded = load_config(path, Config)
+    assert loaded.ckpt_dir == config.ckpt_dir
+    assert "log_dir" not in asdict(loaded)
+
+
 def test_load_evaluation_config(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text("evaluation:\n  num_openings: 3\n")

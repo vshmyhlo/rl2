@@ -10,10 +10,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Single-device AlphaZero sketch using PGX rules and Mctx PUCT search.
+"""Data-parallel AlphaZero sketch using PGX rules and Mctx PUCT search.
 
 Run: uv run python -m rl2.alphazero.train --config configs/alphazero/chess.yaml
 For a cheap start, set env_id: tic_tac_toe and max_moves: 9 in the YAML config.
+
+Training always uses a mesh over all visible JAX devices, including one device.
+Self-play games and training batches are sharded on the batch axis; parameters,
+optimizer state, RNG keys, and scalar metrics are fully replicated. num_envs and
+batch_size are global sizes and must be divisible by the device count. Losses
+average eligible positions globally, before gradient clipping and optimization.
+Standalone collect_selfplay, sample_batch, and train_step calls require a
+jax.set_mesh context with an Auto batch axis. Evaluation retains its fixed suite.
 
 Each iteration starts fresh games and samples updates from that rollout only.
 Games still active at max_moves are adjudicated as draws and train both heads;
@@ -43,24 +51,25 @@ terminal padding. Each logging window contains complete training iterations:
 - rollout/completed_games: Total completed games in the window, including
   move-limit draws. Environment-truncated games are excluded.
 - train/iteration: Latest completed iteration number, starting at one.
+- train/progress_fraction: Completed iterations, including restored progress,
+  divided by configured iterations; a unitless fraction in [0, 1], without averaging.
 - rollout/completed_games_total: Cumulative completed games, including move-limit draws and restored
   checkpoint progress.
 - train/learning_rate: Configured constant optimizer learning rate.
 - train/environment_steps_per_second: Window positions divided by window wall time.
-- train/iteration_seconds_mean: Mean iteration wall time in the window, covering
-  self-play and optimization; excludes logging, evaluation, and checkpoint saving.
+- train/iteration_seconds_mean: Mean host elapsed time dispatching self-play and
+  optimization per iteration; excludes metric transfers, logging, evaluation,
+  and checkpoint saving. Device execution can continue after dispatch returns.
 - train/window_seconds: Wall time since the previous window boundary, including
-  intervening logging, evaluation, and checkpoint overhead.
-- train/elapsed_seconds: Wall time since this training invocation's loop began;
-  resets on resume and excludes initialization and checkpoint restoration.
-- train/eta_seconds: Estimated remaining training time from the mean iteration
-  duration since this invocation began, including intervening overhead.
-Unless noted, these metrics are emitted for every logging window. Iteration
-timings include the host transfer of metrics but do not explicitly synchronize
-optimizer outputs; outstanding device work may overlap the next boundary.
+  intervening logging, evaluation, and checkpoint overhead, through the current
+  window's metric transfer.
+Unless noted, these metrics are emitted for every logging window. Metrics stay
+on-device until logging, evaluation, or checkpointing needs host values. Timings
+do not explicitly synchronize optimizer outputs; outstanding device work may
+overlap the next boundary.
 
 At startup, model/params_millions records the parameter count in millions;
-config and devices record the resolved configuration and JAX devices as text.
+config records the resolved configuration as text.
 Stdout reports the latest iteration and cumulative steps, window self-play
 totals, mean losses, and window wall time (seconds).
 
@@ -107,21 +116,43 @@ import pgx
 import yaml
 from flax import struct
 from flax.training.train_state import TrainState
+from jax.sharding import AxisType, Mesh, PartitionSpec
 from mctx._src import search as mctx_search
 from omegaconf.errors import OmegaConfBaseException
 
 from rl2.alphazero import evaluation
-from rl2.alphazero.checkpoints import TrainingProgress, checkpoint_manager, restore_checkpoint, save_checkpoint
+from rl2.alphazero.checkpoints import Checkpoint, checkpoint_manager, restore_checkpoint, save_checkpoint
 from rl2.alphazero.config import Config
-from rl2.alphazero.model import Parameters, PolicyValueNet
+from rl2.alphazero.model import Parameters, PolicyValueApplyFn, PolicyValueNet
 from rl2.configuration import load_config
 from rl2.mlflow_logging import MLflowLogger
+from rl2.running_stats import RunningSum
 
 logger = logging.getLogger(__name__)
 
 type Metrics = dict[str, jax.Array]
 type SearchTree = mctx.Tree[None]
 type SearchState = tuple[jax.Array, SearchTree]
+
+
+class TrainMetrics(NamedTuple):
+    """Per-update losses averaged over eligible positions and value-update count."""
+
+    loss: jax.Array  # ()
+    policy_loss: jax.Array  # ()
+    value_loss: jax.Array  # ()
+    value_updates: jax.Array  # () int32; one when the update has value targets, otherwise zero.
+
+
+class WindowMetrics(NamedTuple):
+    """Sums of update losses, rollout counters, and iteration timing in a logging window."""
+
+    update_metrics: TrainMetrics  # Scalar leaves: ().
+    completed_games: jax.Array  # ()
+    positions: jax.Array  # ()
+    value_positions: jax.Array  # ()
+    iterations: jax.Array  # ()
+    iteration_seconds: jax.Array  # ()
 
 
 class BackupState(NamedTuple):
@@ -374,13 +405,17 @@ def selfplay_prior_logits(
     return masked_logits(jnp.log(jnp.maximum(probs, jnp.finfo(probs.dtype).tiny)), legal)  # (B, A)
 
 
-@partial(jax.jit, static_argnames=("env", "model", "config"))
+@partial(
+    jax.jit,
+    static_argnames=("env", "apply_fn", "config"),
+    out_shardings=(PartitionSpec("batch"), PartitionSpec()),
+)
 def collect_selfplay(
     params: Parameters,
     key: jax.Array,  # (2,)
     *,
     env: pgx.Env,
-    model: PolicyValueNet,
+    apply_fn: PolicyValueApplyFn,
     config: Config,
 ) -> tuple[Batch, Metrics]:
     """Collect padded games, adjudicating games still active at max_moves as draws.
@@ -392,23 +427,25 @@ def collect_selfplay(
         params: Model parameter pytree.
         key: (2,) uint32 PRNG key.
         env: Game rules and encodings.
-        model: Policy and value network.
+        apply_fn: Policy/value apply function from the training state.
         config: Self-play settings.
 
     Returns:
         Batch and metrics, with fields:
-            observations: (T * B, *O) float32 recorded observations.
-            policy_targets: (T * B, A) float32 MCTS action weights.
-            value_targets: (T * B,) float32 player-relative outcomes, zero for cutoff draws.
-            policy_mask: (T * B,) bool non-padding positions.
-            value_mask: (T * B,) bool positions with terminal or adjudicated outcomes.
+            observations: (B * T, *O) float32 recorded observations, grouped by game.
+            policy_targets: (B * T, A) float32 MCTS action weights.
+            value_targets: (B * T,) float32 player-relative outcomes, zero for cutoff draws.
+            policy_mask: (B * T,) bool non-padding positions.
+            value_mask: (B * T,) bool positions with terminal or adjudicated outcomes.
             completed_games: () integer count including move-limit draws.
             positions: () integer count of non-padding positions.
             value_positions: () integer count of positions with outcome targets.
     """
+    params, key = jax.lax.with_sharding_constraint((params, key), PartitionSpec())  # Parameter shapes; key: (2,).
     init_key, play_key = jax.random.split(key)  # Each: (2,)
     states = jax.vmap(env.init)(jax.random.split(init_key, config.num_envs))  # Leaves: (B, ...)
-    predict = partial(model.apply, {"params": params})
+    states = jax.lax.with_sharding_constraint(states, PartitionSpec("batch"))  # Leaves: (B, ...)
+    predict = partial(apply_fn, {"params": params})
 
     def recurrent_fn(
         model: PolicyValueFn,
@@ -488,8 +525,9 @@ def collect_selfplay(
         value_mask=value_mask,  # (T, B)
     )
 
-    def flatten(x: jax.Array) -> jax.Array:  # (T, B, ...) -> (T * B, ...)
-        return x.reshape((-1, *x.shape[2:]))  # (T * B, ...)
+    def flatten(x: jax.Array) -> jax.Array:  # (T, B, ...) -> (B * T, ...)
+        # Keep each game's positions on its device when flattening the rollout.
+        return x.swapaxes(0, 1).reshape((-1, *x.shape[2:]))  # (B * T, ...)
 
     return jax.tree.map(flatten, batch), {
         "completed_games": completed.sum(),  # ()
@@ -498,32 +536,56 @@ def collect_selfplay(
     }
 
 
-def loss_fn(params: Parameters, model: PolicyValueNet, batch: Batch) -> tuple[jax.Array, Metrics]:
+def loss_fn(
+    params: Parameters,
+    apply_fn: PolicyValueApplyFn,
+    batch: Batch,  # Leaves: (B, ...).
+) -> tuple[jax.Array, TrainMetrics]:  # Loss and metric leaves: ().
     """Return () loss and scalar metrics; each head averages its eligible positions."""
-    logits, values = model.apply({"params": params}, batch.observations)  # (B, A), (B,)
+    logits, values = apply_fn({"params": params}, batch.observations)  # (B, A), (B,)
     policy_errors = optax.softmax_cross_entropy(logits, batch.policy_targets)  # (B,)
     value_errors = jnp.square(values - batch.value_targets)  # (B,)
     policy_loss = jnp.where(batch.policy_mask, policy_errors, 0.0).sum() / jnp.maximum(batch.policy_mask.sum(), 1)  # ()
     value_count = batch.value_mask.sum()  # ()
     value_loss = jnp.where(batch.value_mask, value_errors, 0.0).sum() / jnp.maximum(value_count, 1)  # ()
     loss = policy_loss + value_loss  # ()
-    return loss, {
-        "loss": loss,  # ()
-        "policy_loss": policy_loss,  # ()
-        "value_loss": value_loss,  # ()
-        "value_updates": (value_count > 0).astype(jnp.int32),  # () eligible update count, not a logged loss.
-    }
+    return loss, TrainMetrics(
+        loss=loss,  # ()
+        policy_loss=policy_loss,  # ()
+        value_loss=value_loss,  # ()
+        value_updates=(value_count > 0).astype(jnp.int32),  # ()
+    )
 
 
-@partial(jax.jit, static_argnames=("model",))
-def train_step(state: TrainState, batch: Batch, *, model: PolicyValueNet) -> tuple[TrainState, Metrics]:
-    (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params, model, batch)
-    return state.apply_gradients(grads=grads), metrics
+@partial(
+    jax.jit,
+    static_argnames=("batch_size",),
+    out_shardings=PartitionSpec(),
+)
+def train_step(
+    train_state: TrainState,
+    batch: Batch,  # Leaves: (N, ...), rollout positions including padding.
+    key: jax.Array,  # (2,)
+    *,
+    batch_size: int,
+) -> tuple[TrainState, TrainMetrics]:
+    """Sample a minibatch and update replicated parameters using globally masked means."""
+    train_state = jax.lax.with_sharding_constraint(train_state, PartitionSpec())
+    minibatch = sample_batch(batch, key, batch_size)  # Leaves: (B, ...), B = batch_size.
+    (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(train_state.params, train_state.apply_fn, minibatch)
+    grads = jax.lax.with_sharding_constraint(grads, PartitionSpec())  # Parameter shapes.
+    return train_state.apply_gradients(grads=grads), metrics
 
 
-@partial(jax.jit, static_argnames=("batch_size",))
+@partial(
+    jax.jit,
+    static_argnames=("batch_size",),
+    out_shardings=PartitionSpec("batch"),
+)
 def sample_batch(batch: Batch, key: jax.Array, batch_size: int) -> Batch:  # key: (2,)
     """Sample real positions uniformly with replacement; at least one must exist."""
+    batch = jax.lax.with_sharding_constraint(batch, PartitionSpec("batch"))  # Leaves: (N, ...).
+    key = jax.lax.with_sharding_constraint(key, PartitionSpec())  # (2,)
     # Invert cumulative counts instead of generating a (batch_size, rollout_size)
     # Gumbel array. Right insertion skips padding, including leading zero counts.
     counts = jnp.cumsum(batch.policy_mask, dtype=jnp.int32)  # (N,) rollout positions including padding.
@@ -536,94 +598,135 @@ def sample_batch(batch: Batch, key: jax.Array, batch_size: int) -> Batch:  # key
     return jax.tree.map(select, batch)
 
 
+def training_mesh(config: Config) -> Mesh:
+    """Use all visible devices with equally sized game and minibatch shards."""
+    devices = jax.devices()
+    for name in ("num_envs", "batch_size"):
+        size = getattr(config, name)
+        if size % len(devices):
+            raise ValueError(f"{name} ({size}) must be divisible by device_count ({len(devices)})")
+    return Mesh(devices=devices, axis_names=("batch",), axis_types=(AxisType.Auto,))
+
+
 def train(config: Config) -> TrainState:
-    env = pgx.make(config.env_id)
-    model = PolicyValueNet(
-        num_actions=env.num_actions, channels=config.model.channels, num_blocks=config.model.num_blocks
-    )
-    key, init_key, env_key = jax.random.split(jax.random.PRNGKey(config.seed), 3)  # Each: (2,)
-    observation = env.init(env_key).observation[None].astype(jnp.float32)  # (1, *O)
-    params = model.init(init_key, observation)["params"]
-    state = TrainState.create(
-        apply_fn=model.apply,
-        params=params,
-        tx=optax.chain(
-            optax.clip_by_global_norm(config.max_grad_norm),
-            optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
-        ),
-    )
     with (
+        jax.set_mesh(training_mesh(config)),
         checkpoint_manager(config.ckpt_dir) as manager,
         MLflowLogger(experiment="alphazero", run_name=config.run_id) as writer,
     ):
-        progress = restore_checkpoint(manager, state, config)
+        # initialize
+        env = pgx.make(config.env_id)
+        model = PolicyValueNet(
+            num_actions=env.num_actions, channels=config.model.channels, num_blocks=config.model.num_blocks
+        )
+        key, init_key, env_key = jax.random.split(jax.random.PRNGKey(config.seed), 3)  # Each: (2,)
+        observation = env.init(env_key).observation[None].astype(jnp.float32)  # (1, *O)
+        params = model.init(init_key, observation)["params"]
+        train_state = TrainState.create(
+            apply_fn=model.apply,
+            params=params,
+            tx=optax.chain(
+                optax.clip_by_global_norm(config.max_grad_norm),
+                optax.adamw(config.learning_rate, weight_decay=config.weight_decay),
+            ),
+        )
+        train_state, key = jax.device_put((train_state, key), PartitionSpec())  # State leaves; key: (2,).
+
+        checkpoint = restore_checkpoint(
+            manager,
+            Checkpoint(train_state=train_state, key=key, iteration=0, steps=0, completed_games=0),
+        )
         start_iteration = steps = completed_games = 0
-        if progress is not None:
-            state, key, start_iteration, steps, completed_games = progress
-        opponent_params = state.params if progress is not None else None
+        if checkpoint is not None:
+            train_state, key, start_iteration, steps, completed_games = checkpoint
+            train_state, key = jax.device_put((train_state, key), PartitionSpec())  # State leaves; key: (2,).
+        opponent_params = train_state.params if checkpoint is not None else None
         opponent_iteration = start_iteration
         resolved_config = asdict(config)
         writer.log_params(resolved_config)
         writer.log_text(yaml.safe_dump(resolved_config), "config.yaml")
-        writer.log_text(str(jax.devices()), "devices.txt")
-        parameter_count = sum(parameter.size for parameter in jax.tree.leaves(state.params))
+        parameter_count = sum(parameter.size for parameter in jax.tree.leaves(train_state.params))
         writer.log_metrics({"model/params_millions": parameter_count / 1_000_000}, steps)
         logger.info("Run ID: %s", config.run_id)
         logger.info("MLflow run: %s", writer.run_id)
-        if progress is not None:
+        if checkpoint is not None:
             logger.info("Resumed iteration %d, step %d", start_iteration, steps)
-        start = monotonic()
-        window_start = start
-        window_iterations = 0
-        window_value_updates = 0
-        window_losses: dict[str, float] = {}
-        window_rollout: dict[str, float] = {}
-        window_iteration_seconds = 0.0
+        window_start = monotonic()
+        window_start_steps = steps
+        window_start_completed_games = completed_games
+        window_metrics = WindowMetrics(
+            update_metrics=TrainMetrics(
+                loss=jnp.float32(0),  # ()
+                policy_loss=jnp.float32(0),  # ()
+                value_loss=jnp.float32(0),  # ()
+                value_updates=jnp.int32(0),  # ()
+            ),
+            completed_games=jnp.int32(0),  # ()
+            positions=jnp.int32(0),  # ()
+            value_positions=jnp.int32(0),  # ()
+            iterations=jnp.int32(0),  # ()
+            iteration_seconds=jnp.float32(0),  # ()
+        )  # Scalar leaves: ().
         for iteration in range(start_iteration, config.iterations):
             iteration_start = monotonic()
             key, play_key = jax.random.split(key)  # Each: (2,)
-            batch, rollout_metrics = collect_selfplay(state.params, play_key, env=env, model=model, config=config)
-            update_metrics: list[Metrics] = []  # Scalar leaves for each update.
+            batch, rollout_metrics = collect_selfplay(
+                train_state.params, play_key, env=env, apply_fn=train_state.apply_fn, config=config
+            )
+            update_metrics = TrainMetrics(
+                loss=jnp.float32(0),  # ()
+                policy_loss=jnp.float32(0),  # ()
+                value_loss=jnp.float32(0),  # ()
+                value_updates=jnp.int32(0),  # ()
+            )  # Scalar leaves: ().
             for _ in range(config.updates_per_iteration):
                 key, sample_key = jax.random.split(key)  # Each: (2,)
-                minibatch = sample_batch(batch, sample_key, config.batch_size)
-                state, metrics = train_step(state, minibatch, model=model)
-                update_metrics.append(metrics)
-            # Transfer once per iteration instead of synchronizing every update.
-            host_updates, host_rollout = jax.device_get((update_metrics, rollout_metrics))
-            for metrics in host_updates:
-                window_value_updates += int(metrics["value_updates"])
-                for name in ("loss", "policy_loss", "value_loss"):
-                    window_losses[name] = window_losses.get(name, 0.0) + float(metrics[name])
-            rollout = {name: int(value) for name, value in host_rollout.items()}
-            # Use actual played positions as the x-axis, excluding terminal padding.
-            steps += rollout["positions"]
-            completed_games += rollout["completed_games"]
-            window_iteration_seconds += monotonic() - iteration_start
-            window_iterations += 1
-            for name, value in rollout.items():
-                window_rollout[name] = window_rollout.get(name, 0.0) + value
-            now = monotonic()
-            window_seconds = now - window_start
-            if (iteration + 1) % config.log_interval == 0 or iteration + 1 == config.iterations:
+                train_state, metrics = train_step(train_state, batch, sample_key, batch_size=config.batch_size)
+                update_metrics = RunningSum.update(update_metrics, metrics)  # Scalar leaves: ().
+            iteration_metrics = WindowMetrics(
+                update_metrics=update_metrics,  # Scalar leaves: ().
+                completed_games=rollout_metrics["completed_games"],  # ()
+                positions=rollout_metrics["positions"],  # ()
+                value_positions=rollout_metrics["value_positions"],  # ()
+                iterations=jnp.int32(1),  # ()
+                iteration_seconds=jnp.float32(monotonic() - iteration_start),  # ()
+            )  # Scalar leaves: ().
+            window_metrics = RunningSum.update(window_metrics, iteration_metrics)  # Scalar leaves: ().
+            log_due = (iteration + 1) % config.log_interval == 0 or iteration + 1 == config.iterations
+            eval_due = (iteration + 1) % config.eval_interval == 0
+            checkpoint_due = (iteration + 1) % config.checkpoint_interval == 0 or iteration + 1 == config.iterations
+            if log_due or checkpoint_due or (eval_due and opponent_params is not None):
+                host_metrics = jax.device_get(window_metrics)  # Scalar leaves: ().
+                # Use actual played positions as the x-axis, excluding terminal padding.
+                steps = window_start_steps + int(host_metrics.positions)
+                completed_games = window_start_completed_games + int(host_metrics.completed_games)
+            if log_due:
+                now = monotonic()
+                window_seconds = now - window_start
+                window_iterations = int(host_metrics.iterations)
                 window_updates = window_iterations * config.updates_per_iteration
-                mean_losses = {name: window_losses[name] / window_updates for name in ("loss", "policy_loss")}
-                if window_value_updates:
-                    mean_losses["value_loss"] = window_losses["value_loss"] / window_value_updates
-                elapsed_seconds = now - start
+                host_updates = host_metrics.update_metrics  # Scalar leaves: ().
+                mean_losses = {
+                    "loss": float(host_updates.loss) / window_updates,
+                    "policy_loss": float(host_updates.policy_loss) / window_updates,
+                }
+                if host_updates.value_updates:
+                    mean_losses["value_loss"] = float(host_updates.value_loss) / int(host_updates.value_updates)
+                window_rollout = {
+                    "completed_games": int(host_metrics.completed_games),
+                    "positions": int(host_metrics.positions),
+                    "value_positions": int(host_metrics.value_positions),
+                }
                 scalars = {
                     **{f"train/{name}": value for name, value in mean_losses.items()},
                     **{f"rollout/{name}": value for name, value in window_rollout.items()},
                     "train/iteration": iteration + 1,
+                    "train/progress_fraction": (iteration + 1) / config.iterations,
                     "rollout/completed_games_total": completed_games,
                     "train/learning_rate": config.learning_rate,
                     "train/environment_steps_per_second": window_rollout["positions"] / max(window_seconds, 1e-9),
-                    "train/iteration_seconds_mean": window_iteration_seconds / window_iterations,
+                    "train/iteration_seconds_mean": float(host_metrics.iteration_seconds) / window_iterations,
                     "train/window_seconds": window_seconds,
-                    "train/elapsed_seconds": elapsed_seconds,
-                    "train/eta_seconds": elapsed_seconds
-                    * (config.iterations - iteration - 1)
-                    / (iteration + 1 - start_iteration),
                 }
                 writer.log_metrics(scalars, steps)
                 logger.info(
@@ -635,21 +738,19 @@ def train(config: Config) -> TrainState:
                     window_seconds,
                 )
                 window_start = now
-                window_iterations = 0
-                window_value_updates = 0
-                window_losses.clear()
-                window_rollout.clear()
-                window_iteration_seconds = 0.0
-            if (iteration + 1) % config.eval_interval == 0:
+                window_start_steps = steps
+                window_start_completed_games = completed_games
+                window_metrics = RunningSum.init(window_metrics)  # Scalar leaves: ().
+            if eval_due:
                 if opponent_params is None:
                     logger.info("Skipping evaluation: no previous checkpoint yet")
                 else:
                     evaluation_start = monotonic()
                     evaluation_metrics = evaluation.evaluate(
                         opponent_params=opponent_params,
-                        candidate_params=state.params,
+                        candidate_params=train_state.params,
                         env=env,
-                        model=model,
+                        apply_fn=train_state.apply_fn,
                         config=config,
                     )
                     evaluation_metrics.update(
@@ -662,17 +763,21 @@ def train(config: Config) -> TrainState:
                         "Evaluation | %s",
                         " | ".join(f"{name}={value:.6g}" for name, value in evaluation_metrics.items()),
                     )
-            if (iteration + 1) % config.checkpoint_interval == 0 or iteration + 1 == config.iterations:
+            if checkpoint_due:
                 save_checkpoint(
                     manager,
-                    TrainingProgress(
-                        state=state, key=key, iteration=iteration + 1, steps=steps, completed_games=completed_games
+                    Checkpoint(
+                        train_state=train_state,
+                        key=key,
+                        iteration=iteration + 1,
+                        steps=steps,
+                        completed_games=completed_games,
                     ),
                     config,
                 )
-                opponent_params = state.params
+                opponent_params = train_state.params
                 opponent_iteration = iteration + 1
-        return state
+        return train_state
 
 
 def main() -> None:

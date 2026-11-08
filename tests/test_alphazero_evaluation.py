@@ -69,7 +69,7 @@ def test_paired_search_is_reproducible_and_swaps_agents() -> None:
         evaluation=EvaluationConfig(num_openings=2, openings_per_batch=2, opening_moves=2),
     )
     ids = jnp.arange(2, dtype=jnp.int32)
-    match = partial(ev.evaluate_batch, opening_ids=ids, env=env, model=model, config=config)
+    match = partial(ev.evaluate_batch, opening_ids=ids, env=env, apply_fn=model.apply, config=config)
     rewards, terminated = match(candidate, opponent)
     repeated_rewards, repeated_terminated = match(candidate, opponent)
     swapped_rewards, swapped_terminated = match(opponent, candidate)
@@ -80,7 +80,7 @@ def test_paired_search_is_reproducible_and_swaps_agents() -> None:
     np.testing.assert_array_equal(terminated, swapped_terminated[:, ::-1])
     # Same search shape, but a deliberately insufficient move budget.
     _, unfinished = ev.evaluate_batch(
-        candidate, opponent, ids, env=env, model=model, config=replace(config, max_moves=1)
+        candidate, opponent, ids, env=env, apply_fn=model.apply, config=replace(config, max_moves=1)
     )
     assert not unfinished.any()
 
@@ -130,7 +130,7 @@ def test_search_uses_acting_network_and_greedy_legal_action(monkeypatch: pytest.
                 player,
                 jax.random.PRNGKey(0),
                 env=env,
-                model=model,
+                apply_fn=model.apply,
                 num_simulations=3,
                 max_moves=1,
             )
@@ -149,7 +149,7 @@ def test_chess_evaluation_search_smoke() -> None:
         max_moves=1,
         evaluation=EvaluationConfig(num_openings=1, opening_moves=1, openings_per_batch=1),
     )
-    metrics = ev.evaluate(params, params, env=env, model=model, config=config)
+    metrics = ev.evaluate(params, params, env=env, apply_fn=model.apply, config=config)
     assert metrics["games"] == metrics["truncated_games"] == 2
     assert metrics["completed_games"] == 0  # No illegal-action termination during either search.
 
@@ -165,7 +165,7 @@ def test_evaluation_batches_cover_openings_once(monkeypatch: pytest.MonkeyPatch)
         return jnp.zeros((ids.size, 2), jnp.float32), jnp.ones((ids.size, 2), jnp.bool_)
 
     monkeypatch.setattr(ev, "evaluate_batch", batch)
-    result = ev.evaluate({}, {}, env=Mock(), model=Mock(), config=config)
+    result = ev.evaluate({}, {}, env=Mock(), apply_fn=Mock(), config=config)
     assert batches == [[0, 1], [2]]
     assert result["games"] == result["draws"] == 6
     assert result["score"] == 0.5
