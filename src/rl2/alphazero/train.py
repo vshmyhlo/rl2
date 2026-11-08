@@ -20,11 +20,28 @@ Self-play games and training batches are sharded on the batch axis; parameters,
 optimizer state, RNG keys, and scalar metrics are fully replicated. num_envs and
 batch_size are global sizes and must be divisible by the device count. Losses
 average eligible positions globally, before gradient clipping and optimization.
-Shape notation: B = games, T = rollout moves, N = search nodes, A = actions,
-M = sampled positions, P = players, and O = observation dimensions.
-Rollouts use (B, T, ...) arrays; sampled minibatches use (M, ...).
 Standalone collect_selfplay, sample_batch, and train_step calls require a
 jax.set_mesh context with an Auto batch axis. Evaluation retains its fixed suite.
+
+Array dimensions used throughout this module:
+
+- B: Parallel game states; config.num_envs during self-play.
+- T: Recorded moves per game; config.max_moves, including terminal padding.
+- N: Search-node slots per game; num_simulations + 1, including the root.
+- A: Available action IDs; env.num_actions, including currently illegal actions.
+- M: Positions sampled for one optimizer update; config.batch_size.
+- P: Players per game; env.num_players (2 for the supported games).
+- O: Tuple of observation dimensions; *O expands these axes, for example
+  (3, 3, 2) for tic-tac-toe, so (B, T, *O) means (B, T, 3, 3, 2).
+
+Rollouts have shape (B, T, ...), with B * T slots including padding. Minibatches
+have shape (M, ...): M is configured independently of B * T and counts samples,
+not unique positions. Sampling excludes padding and uses replacement, so M can
+exceed B * T. Sharding partitions the global B or M axis across devices.
+Only lax.scan's temporary output is time-first (T, B, ...); it is immediately
+converted to (B, T, ...). Within a per-game vmap body, the B axis is absent.
+() denotes a scalar, ... denotes remaining array axes, and (2,) RNG keys contain
+two uint32 words; their length is unrelated to P.
 
 Each iteration starts fresh games and samples updates from that rollout only.
 Games still active at max_moves are adjudicated as draws and train both heads;
@@ -151,7 +168,7 @@ class RecurrentFnOutput:
 
 @struct.dataclass
 class SearchTree:
-    """Batched search storage; N = num_simulations + 1, root = 0, missing = -1."""
+    """Batched search storage; node 0 is the root and -1 denotes a missing node."""
 
     node_visits: jax.Array  # (B, N)
     node_values: jax.Array  # (B, N)
@@ -533,7 +550,7 @@ def puct_policy(
         A PolicyOutput containing:
             action: (B,) sampled action IDs.
             action_weights: (B, A) float32 normalized visit counts.
-            search_tree: (B, N, ...) array leaves, where N = num_simulations + 1.
+            search_tree: (B, N, ...) node arrays and a (B, A) root action mask.
     """
     # Preserve Mctx's RNG split and zero-noise probability round trip so search
     # visits and sampled actions agree with muzero_policy(dirichlet_fraction=0).
@@ -617,7 +634,6 @@ def collect_selfplay(
 ) -> tuple[Batch, Metrics]:
     """Collect padded games, adjudicating games still active at max_moves as draws.
 
-    B: games; T: max_moves; A: actions; O: environment observation dimensions.
     Environment truncations remain excluded from value supervision.
 
     Args:
@@ -800,11 +816,11 @@ def train_step(
 def sample_batch(batch: Batch, key: jax.Array, batch_size: int) -> Batch:  # key: (2,)
     """Sample (M, ...) positions from (B, T, ...) rollouts uniformly with replacement.
 
-    M = batch_size. At least one non-padding position must exist.
+    M = batch_size, independently of B * T. At least one non-padding position must exist.
     """
     batch = jax.lax.with_sharding_constraint(batch, PartitionSpec("batch"))  # Leaves: (B, T, ...).
     key = jax.lax.with_sharding_constraint(key, PartitionSpec())  # (2,)
-    # Invert cumulative counts instead of generating a (batch_size, rollout_size)
+    # Invert cumulative counts instead of generating a (M, B * T)
     # Gumbel array. Right insertion skips padding, including leading zero counts.
     counts = jnp.cumsum(batch.policy_mask, dtype=jnp.int32)  # (B * T,) in game-major order.
     ranks = jax.random.randint(key, (batch_size,), 0, counts[-1])  # (M,)
