@@ -63,12 +63,12 @@ def test_selfplay_shards_games_and_preserves_global_results(mesh: Mesh) -> None:
         )
     chex.assert_trees_all_close(actual, expected, atol=1e-6)
     batch, metrics = actual
-    chex.assert_shape(batch.observations, (8, 3, 3, 2))
-    chex.assert_shape(batch.policy_targets, (8, 9))
-    chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (8,))
-    for leaf in jax.tree.leaves(batch):  # (B * T, ...)
+    chex.assert_shape(batch.observations, (4, 2, 3, 3, 2))
+    chex.assert_shape(batch.policy_targets, (4, 2, 9))
+    chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (4, 2))
+    for leaf in jax.tree.leaves(batch):  # (B, T, ...)
         assert leaf.sharding == NamedSharding(mesh, PartitionSpec("batch"))
-        assert leaf.addressable_shards[0].data.shape == (4, *leaf.shape[1:])
+        assert leaf.addressable_shards[0].data.shape == (2, *leaf.shape[1:])
     for leaf in jax.tree.leaves(metrics):  # ()
         assert leaf.sharding == NamedSharding(mesh, PartitionSpec())
     assert metrics["positions"] == 8
@@ -76,13 +76,13 @@ def test_selfplay_shards_games_and_preserves_global_results(mesh: Mesh) -> None:
 
 
 def test_sampling_uses_global_valid_positions_with_empty_shard(mesh: Mesh) -> None:
-    labels = jnp.arange(6, dtype=jnp.float32)  # (N,)
+    labels = jnp.arange(6, dtype=jnp.float32).reshape(2, 3)  # (B, T)
     batch = az.Batch(
-        observations=labels[:, None, None, None],  # (N, 1, 1, 1)
-        policy_targets=labels[:, None],  # (N, 1)
-        value_targets=labels,  # (N,)
-        policy_mask=jnp.array([False, False, False, True, False, True]),  # (N,)
-        value_mask=jnp.array([False, False, False, True, False, False]),  # (N,)
+        observations=labels[..., None, None, None],  # (B, T, 1, 1, 1)
+        policy_targets=labels[..., None],  # (B, T, 1)
+        value_targets=labels,  # (B, T)
+        policy_mask=jnp.array([[False, False, False], [True, False, True]]),  # (B, T)
+        value_mask=jnp.array([[False, False, False], [True, False, False]]),  # (B, T)
     )
     key = jax.random.PRNGKey(2)  # (2,)
     single = Mesh(devices=jax.devices()[:1], axis_names=("batch",), axis_types=(AxisType.Auto,))
@@ -104,7 +104,7 @@ def test_sampling_uses_global_valid_positions_with_empty_shard(mesh: Mesh) -> No
 
 def test_update_uses_global_masked_means(mesh: Mesh) -> None:
     model = az.PolicyValueNet(num_actions=2, channels=2, num_blocks=1)
-    observations = jax.random.normal(jax.random.PRNGKey(0), (4, 1, 1, 1))  # (B, H, W, C)
+    observations = jax.random.normal(jax.random.PRNGKey(0), (4, 1, 1, 1))  # (B * T, *O)
     params = model.init(jax.random.PRNGKey(1), observations)["params"]  # Parameter shapes.
     state = TrainState.create(
         apply_fn=model.apply,
@@ -112,19 +112,24 @@ def test_update_uses_global_masked_means(mesh: Mesh) -> None:
         tx=optax.chain(optax.clip_by_global_norm(0.1), optax.adamw(1e-3)),
     )
     batch = az.Batch(
-        observations=observations,  # (B, H, W, C)
-        policy_targets=jnp.array([[1, 0], [1, 0], [0, 1], [0, 1]], jnp.float32),  # (B, A)
-        value_targets=jnp.array([0.0, 0.0, -1.0, 1.0]),  # (B,)
-        policy_mask=jnp.array([True, False, True, True]),  # (B,); unequal counts across shards.
-        value_mask=jnp.array([False, False, True, True]),  # (B,); one shard has no value targets.
+        observations=observations,  # (B * T, *O)
+        policy_targets=jnp.array([[1, 0], [1, 0], [0, 1], [0, 1]], jnp.float32),  # (B * T, A)
+        value_targets=jnp.array([0.0, 0.0, -1.0, 1.0]),  # (B * T,)
+        policy_mask=jnp.array([True, False, True, True]),  # (B * T,); unequal counts across shards.
+        value_mask=jnp.array([False, False, True, True]),  # (B * T,); one shard has no value targets.
     )
+
+    def as_rollout(x: jax.Array) -> jax.Array:  # (B * T, ...) -> (B, T, ...)
+        return x.reshape((2, 2, *x.shape[1:]))  # (B, T, ...)
+
+    batch = jax.tree.map(as_rollout, batch)  # Leaves: (B, T, ...).
     key = jax.random.PRNGKey(2)  # (2,)
     single = Mesh(devices=jax.devices()[:1], axis_names=("batch",), axis_types=(AxisType.Auto,))
 
     @jax.jit
     def update_once(
         state: TrainState,
-        minibatch: az.Batch,  # Leaves: (B, ...).
+        minibatch: az.Batch,  # Leaves: (M, ...).
     ) -> tuple[TrainState, az.TrainMetrics]:
         (_, metrics), grads = jax.value_and_grad(az.loss_fn, has_aux=True)(state.params, state.apply_fn, minibatch)
         return state.apply_gradients(grads=grads), metrics  # Metric leaves: ().
@@ -136,13 +141,13 @@ def test_update_uses_global_masked_means(mesh: Mesh) -> None:
     with jax.set_mesh(single):
         for _ in range(updates_per_iteration):
             expected_key, sample_key = jax.random.split(expected_key)  # Each: (2,)
-            minibatch = az.sample_batch(batch, sample_key, batch_size=8)  # Leaves: (B, ...).
+            minibatch = az.sample_batch(batch, sample_key, batch_size=8)  # Leaves: (M, ...).
             expected_state, update_metrics = update_once(expected_state, minibatch)
             metrics.append(update_metrics)
-        expected = (
-            expected_state,
-            expected_key,  # (2,)
-            jax.tree.map(lambda *values: sum(values), *metrics),  # Scalar leaves: ().
+        expected = az.TrainStepResult(
+            train_state=expected_state,
+            key=expected_key,  # (2,)
+            metrics=jax.tree.map(lambda *values: sum(values), *metrics),  # Scalar leaves: ().
         )
     with jax.set_mesh(mesh):
         template_state = jax.device_put(state, PartitionSpec())
@@ -154,7 +159,7 @@ def test_update_uses_global_masked_means(mesh: Mesh) -> None:
             updates_per_iteration=updates_per_iteration,
         )
     chex.assert_trees_all_close(actual, expected, rtol=1e-5, atol=1e-6)
-    assert type(actual) is tuple
+    assert isinstance(actual, az.TrainStepResult)
     actual_state, actual_key, actual_metrics = actual  # Key: (2,); metric leaves: ().
     assert actual_state.step == updates_per_iteration
     assert actual_metrics.value_updates == updates_per_iteration

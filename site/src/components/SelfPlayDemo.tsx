@@ -24,7 +24,7 @@ export default function SelfPlayDemo(): JSX.Element {
   return (
     <figure className="selfplay-demo">
       <div className="az-heading">
-        <strong>The batch before flattening</strong>
+        <strong>The self-play batch</strong>
         <span>B = 3 · T = 6</span>
       </div>
       <p className="az-intro">Games × time: rows are games, columns are scan steps. This (B, T) view swaps the scan's first two axes. Select a cell to look inside.</p>
@@ -75,9 +75,9 @@ export default function SelfPlayDemo(): JSX.Element {
           <>
             <dl>
               <dt>observations</dt><dd>{valid ? `o[${b}, ${t}] · shape (*O)` : 'Preserved final observation'}</dd>
-              <dt>policies</dt><dd>{valid ? `π[${b}, ${t}] · shape (A,)` : 'Ignored search weights'}</dd>
-              <dt>players</dt><dd>{valid ? `P${player}` : 'Preserved final player ID'}</dd>
-              <dt>valid / policy_mask</dt><dd>{String(valid)}</dd>
+              <dt>policy_targets</dt><dd>{valid ? `π[${b}, ${t}] · shape (A,)` : 'Ignored search weights'}</dd>
+              <dt>player_ids</dt><dd>{valid ? `P${player}` : 'Preserved final player ID'}</dd>
+              <dt>policy_mask</dt><dd>{String(valid)}</dd>
               <dt>value_targets</dt><dd>{complete ? (value > 0 ? '+1' : String(value)) : 'Attached after the scan'}</dd>
               <dt>value_mask</dt><dd>{complete ? String(valid) : 'Attached after the scan'}</dd>
             </dl>
@@ -89,7 +89,7 @@ export default function SelfPlayDemo(): JSX.Element {
         )}
       </div>
       <div className="az-flat">
-        <strong>After swapaxes + reshape</strong>
+        <strong>Position indices for sampling</strong>
         <p>Read each game row left to right. The selected cell lands at flat index <b>{b * moves + t}</b>.</p>
         <div className="az-flat-games">
           {games.map((item, index) => (

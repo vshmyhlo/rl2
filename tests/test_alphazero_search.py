@@ -62,35 +62,40 @@ def test_recurrent_step_rejects_malformed_predictions(
         step(jnp.zeros(2, jnp.int32), states)
 
 
-@pytest.mark.parametrize("simulations", [0, 4], ids=["no-expansions", "absorbing-terminal-branches"])
-def test_local_puct_terminal_rewards_and_nested_state_shapes(simulations: int) -> None:
+@pytest.mark.parametrize(
+    ("simulations", "temperature"),
+    [
+        pytest.param(0, 0.0, id="no-expansions"),
+        pytest.param(4, 0.0, id="absorbing-terminal-branches"),
+        pytest.param(4, 1e6, id="high-temperature-preserves-zero-probabilities"),
+    ],
+)
+def test_local_puct_terminal_rewards_and_nested_state_shapes(simulations: int, temperature: float) -> None:
     # The first game has one legal terminal move; the second is already finished.
+    env_states = jax.vmap(pgx.make("tic_tac_toe").init)(jax.random.split(jax.random.PRNGKey(0), 2))  # Leaves: (B, ...).
+    env_states = env_states.replace(terminated=jnp.array([False, True]))  # Leaves: (B, ...).
     root = az.RootFnOutput(
         prior_logits=jnp.zeros((2, 2)),  # (B, A)
         value=jnp.array([0.25, 0.0]),  # (B,)
-        embedding={
-            "done": jnp.array([False, True]),  # (B,)
-            "board": jnp.zeros((2, 2, 2), jnp.int32),  # (B, H, W)
-        },
+        env_states=env_states,  # Leaves: (B, ...).
     )
     invalid = jnp.array([[False, True], [True, True]])  # (B, A)
 
-    def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (B, H, W)
+    def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (B, *O)
         return jnp.zeros((observation.shape[0], 2)), jnp.zeros(observation.shape[0])  # (B, A), (B,)
 
     def recurrent(
         model: az.PolicyValueFn,
-        key: jax.Array,  # (2,)
         actions: jax.Array,  # (B,)
-        state: dict[str, jax.Array],  # Leaves: (B, ...)
-    ) -> tuple[az.RecurrentFnOutput, dict[str, jax.Array]]:
-        logits, value = model(state["board"])  # (B, A), (B,)
+        env_states: pgx.State,  # Leaves: (B, ...)
+    ) -> tuple[az.RecurrentFnOutput, pgx.State]:
+        logits, value = model(env_states.observation)  # (B, A), (B,)
         return az.RecurrentFnOutput(
-            reward=(~state["done"]).astype(jnp.float32),  # (B,)
+            reward=(~env_states.terminated).astype(jnp.float32),  # (B,)
             discount=jnp.zeros(2),  # (B,)
             prior_logits=logits,  # (B, A)
             value=value,  # (B,)
-        ), {"done": jnp.ones(2, bool), "board": state["board"]}  # (B,), (B, H, W)
+        ), env_states.replace(terminated=jnp.ones(2, bool))  # Leaves: (B, ...).
 
     search = jax.jit(
         partial(
@@ -99,7 +104,7 @@ def test_local_puct_terminal_rewards_and_nested_state_shapes(simulations: int) -
             recurrent_fn=recurrent,
             num_simulations=simulations,
             invalid_actions=invalid,
-            temperature=0.0,
+            temperature=temperature,
         )
     )
     result = search(jax.random.PRNGKey(0), root)
@@ -107,8 +112,8 @@ def test_local_puct_terminal_rewards_and_nested_state_shapes(simulations: int) -
     assert result.action.shape == (2,)
     assert result.action_weights.shape == (2, 2)
     assert tree.children_visits.shape == (2, simulations + 1, 2)
-    assert tree.embeddings["done"].shape == (2, simulations + 1)
-    assert tree.embeddings["board"].shape == (2, simulations + 1, 2, 2)
+    assert tree.env_states.terminated.shape == (2, simulations + 1)
+    assert tree.env_states.observation.shape == (2, simulations + 1, 3, 3, 2)
     np.testing.assert_array_equal(tree.node_visits[:, 0], simulations + 1)
     np.testing.assert_allclose(tree.node_values[:, 0], [(0.25 + simulations) / (simulations + 1), 0.0])
     np.testing.assert_array_equal(tree.children_visits[:, 0].sum(axis=-1), simulations)
@@ -118,6 +123,53 @@ def test_local_puct_terminal_rewards_and_nested_state_shapes(simulations: int) -
         np.testing.assert_array_equal(tree.children_rewards[:, 0, 0], [1, 0])
         np.testing.assert_array_equal(tree.children_rewards[:, 1:], 0)
     else:
-        # Match Mctx's uniform fallback when there are no visit counts.
-        np.testing.assert_array_equal(result.action_weights, 0.5)
+        # With no visits, use legal moves; finished rows still have a defined fallback.
+        assert result.action[0] == 0
+        np.testing.assert_array_equal(result.action_weights, [[1, 0], [0.5, 0.5]])
         np.testing.assert_array_equal(tree.parents, -1)
+
+
+def test_search_expands_one_new_node_per_simulation() -> None:
+    # One action forces the deepest possible tree: a chain through every allocated node.
+    def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (B, *O)
+        return jnp.zeros((observation.shape[0], 1)), jnp.zeros(observation.shape[0])  # (B, A), (B,)
+
+    def recurrent(
+        model: az.PolicyValueFn,
+        actions: jax.Array,  # (B,)
+        env_states: pgx.State,  # Leaves: (B, ...).
+    ) -> tuple[az.RecurrentFnOutput, pgx.State]:
+        next_env_states = env_states.replace(_step_count=env_states._step_count + 1)  # Leaves: (B, ...).
+        logits, value = model(next_env_states.observation)  # (B, A), (B,)
+        return az.RecurrentFnOutput(
+            reward=jnp.zeros_like(value),  # (B,)
+            discount=jnp.ones_like(value),  # (B,)
+            prior_logits=logits,  # (B, A)
+            value=value,  # (B,)
+        ), next_env_states  # Leaves: (B, ...).
+
+    env_states = jax.vmap(pgx.make("tic_tac_toe").init)(jax.random.split(jax.random.PRNGKey(0), 1))  # Leaves: (B, ...).
+    root = az.RootFnOutput(
+        prior_logits=jnp.zeros((1, 1)),  # (B, A)
+        value=jnp.zeros(1),  # (B,)
+        env_states=env_states,  # Leaves: (B, ...).
+    )
+    search = jax.jit(
+        partial(
+            az.puct_policy,
+            predict,
+            recurrent_fn=recurrent,
+            num_simulations=4,
+            invalid_actions=jnp.zeros((1, 1), bool),  # (B, A)
+            temperature=0.0,
+        )
+    )
+    result = search(jax.random.PRNGKey(0), root)
+    tree = result.search_tree
+    assert tree.children_index.shape == (1, 5, 1)
+    assert tree.env_states._step_count.shape == (1, 5)
+    np.testing.assert_array_equal(tree.parents, [[-1, 0, 1, 2, 3]])
+    np.testing.assert_array_equal(tree.children_index, [[[1], [2], [3], [4], [-1]]])
+    np.testing.assert_array_equal(tree.env_states._step_count, [[0, 1, 2, 3, 4]])
+    np.testing.assert_array_equal(tree.node_visits, [[5, 4, 3, 2, 1]])
+    np.testing.assert_array_equal(result.action_weights, [[1.0]])

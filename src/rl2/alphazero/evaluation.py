@@ -23,25 +23,25 @@ from rl2.alphazero.model import Parameters, PolicyValueApplyFn
 def make_opening(key: jax.Array, *, env: pgx.Env, moves: int) -> pgx.State:
     """Generate a live opening; reject moves that would end the game."""
     init_key, move_key = jax.random.split(key)
-    state = env.init(init_key)
+    env_state = env.init(init_key)
 
-    def advance(move: int, state: pgx.State) -> pgx.State:
-        logits = jnp.where(state.legal_action_mask, 0.0, -jnp.inf)
+    def advance(move: int, env_state: pgx.State) -> pgx.State:
+        logits = jnp.where(env_state.legal_action_mask, 0.0, -jnp.inf)
         action = jax.random.categorical(jax.random.fold_in(move_key, move), logits).astype(jnp.int32)
-        next_state = env.step(state, action)
+        next_env_state = env.step(env_state, action)
 
         def keep_live(old: jax.Array, new: jax.Array) -> jax.Array:
-            return jnp.where(next_state.terminated | next_state.truncated, old, new)
+            return jnp.where(next_env_state.terminated | next_env_state.truncated, old, new)
 
-        return jax.tree.map(keep_live, state, next_state)
+        return jax.tree.map(keep_live, env_state, next_env_state)
 
-    return jax.lax.fori_loop(0, moves, advance, state)
+    return jax.lax.fori_loop(0, moves, advance, env_state)
 
 
 def play_game(
     candidate_params: Parameters,
     opponent_params: Parameters,
-    state: pgx.State,  # Unbatched environment state leaves.
+    env_state: pgx.State,  # Unbatched environment state leaves.
     candidate_player: jax.Array,  # ()
     key: jax.Array,  # (2,)
     *,
@@ -52,24 +52,15 @@ def play_game(
 ) -> tuple[jax.Array, jax.Array]:  # (), ()
     """Return scalar candidate reward and termination flag; false means unfinished."""
 
-    def recurrent_fn(
-        model: train.PolicyValueFn,
-        _key: jax.Array,  # (2,)
-        actions: jax.Array,  # (B,)
-        states: pgx.State,  # Leaves: (B, ...)
-    ) -> tuple[train.RecurrentFnOutput, pgx.State]:
-        # The search interface also supports stochastic transitions.
-        return train.recurrent_step(model, actions, states, env=env)
-
     def ongoing(carry: tuple[pgx.State, jax.Array]) -> jax.Array:
-        state, move = carry
-        return ~(state.terminated | state.truncated) & (move < max_moves)
+        env_state, move = carry
+        return ~(env_state.terminated | env_state.truncated) & (move < max_moves)
 
     def advance(carry: tuple[pgx.State, jax.Array]) -> tuple[pgx.State, jax.Array]:
-        state, move = carry
+        env_state, move = carry
 
         def choose(candidate: jax.Array, opponent: jax.Array) -> jax.Array:
-            return jnp.where(state.current_player == candidate_player, candidate, opponent)
+            return jnp.where(env_state.current_player == candidate_player, candidate, opponent)
 
         params = jax.tree.map(choose, candidate_params, opponent_params)
         predict = partial(apply_fn, {"params": params})
@@ -77,26 +68,26 @@ def play_game(
         def add_batch(x: jax.Array) -> jax.Array:
             return x[None]
 
-        states = jax.tree.map(add_batch, state)
-        logits, value = predict(states.observation)
+        env_states = jax.tree.map(add_batch, env_state)
+        logits, value = predict(env_states.observation)
         root = train.RootFnOutput(
-            prior_logits=train.masked_logits(logits, states.legal_action_mask), value=value, embedding=states
+            prior_logits=train.masked_logits(logits, env_states.legal_action_mask), value=value, env_states=env_states
         )
         policy = train.puct_policy(
             predict,
             jax.random.fold_in(key, move),
             root,
-            recurrent_fn,
+            partial(train.recurrent_step, env=env),
             num_simulations,
-            invalid_actions=~states.legal_action_mask,
+            invalid_actions=~env_states.legal_action_mask,
             temperature=0.0,
         )
         # Explicit argmax avoids random tie breaking in the policy's sampled action.
-        weights = jnp.where(states.legal_action_mask, policy.action_weights, -jnp.inf)
+        weights = jnp.where(env_states.legal_action_mask, policy.action_weights, -jnp.inf)
         action = jnp.argmax(weights[0]).astype(jnp.int32)
-        return env.step(state, action), move + 1
+        return env.step(env_state, action), move + 1
 
-    final, _ = jax.lax.while_loop(ongoing, advance, (state, jnp.int32(0)))
+    final, _ = jax.lax.while_loop(ongoing, advance, (env_state, jnp.int32(0)))
     reward = final.rewards[candidate_player]
     return reward, final.terminated
 
@@ -105,23 +96,23 @@ def play_game(
 def evaluate_batch(
     candidate_params: Parameters,
     opponent_params: Parameters,
-    opening_ids: jax.Array,  # (O,), opening count O.
+    opening_ids: jax.Array,  # (K,), opening count K.
     *,
     env: pgx.Env,
     apply_fn: PolicyValueApplyFn,
     config: Config,
-) -> tuple[jax.Array, jax.Array]:  # (O, 2), (O, 2)
-    """Return rewards and termination flags of shape (openings, 2), one per color."""
+) -> tuple[jax.Array, jax.Array]:  # (K, P), (K, P); P = 2 players.
+    """Return (K, P) rewards and termination flags for K openings and P = 2 players."""
     seed = jax.random.PRNGKey(config.evaluation.seed)
 
     def play_pair(opening_id: jax.Array) -> tuple[jax.Array, jax.Array]:
         opening_key, search_key = jax.random.split(jax.random.fold_in(seed, opening_id))
-        state = make_opening(opening_key, env=env, moves=config.evaluation.opening_moves)
+        env_state = make_opening(opening_key, env=env, moves=config.evaluation.opening_moves)
         game = partial(
             play_game,
             candidate_params,
             opponent_params,
-            state,
+            env_state,
             key=search_key,
             env=env,
             apply_fn=apply_fn,

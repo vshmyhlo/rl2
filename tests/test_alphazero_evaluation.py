@@ -104,12 +104,12 @@ def test_search_uses_acting_network_and_greedy_legal_action(monkeypatch: pytest.
     def search(
         predict: PolicyValueFn,
         key: jax.Array,  # (2,)
-        root: ev.train.RootFnOutput[pgx.State],  # Leaves: (B, ...)
-        recurrent_fn: ev.train.RecurrentFn[pgx.State],
+        root: ev.train.RootFnOutput,  # Leaves: (B, ...)
+        recurrent_fn: ev.train.RecurrentFn,
         num_simulations: int,
         **kwargs: Any,
-    ) -> ev.train.PolicyOutput[pgx.State]:
-        _, value = predict(root.embedding.observation)
+    ) -> ev.train.PolicyOutput:
+        _, value = predict(root.env_states.observation)
         seen.append(float(value[0]))
         np.testing.assert_array_equal(value, root.value)
         assert num_simulations == 3
@@ -120,7 +120,7 @@ def test_search_uses_acting_network_and_greedy_legal_action(monkeypatch: pytest.
         return ev.train.PolicyOutput(
             action=jnp.array([8], jnp.int32),  # (B,)
             action_weights=weights,  # (B, A)
-            search_tree=ev.train._init_tree(root, 0, kwargs["invalid_actions"]),
+            search_tree=ev.train.init_tree(root, 0, kwargs["invalid_actions"]),
         )
 
     monkeypatch.setattr(ev.train, "puct_policy", search)

@@ -1,0 +1,91 @@
+---
+layout: ../layouts/ArticleLayout.astro
+title: My training stack
+description: A small, single-node RL training stack built on K3s, with queued GPU jobs, persistent checkpoints, and observability.
+---
+
+import StackBudget from '../components/StackBudget';
+import '../components/Stack.css';
+
+<a href="/">← All notes</a>
+
+<p className="eyebrow">Infrastructure · From source to a run</p>
+
+# My training stack
+
+One machine, two NVIDIA GPUs, and a small **K3s** cluster. Kubernetes runs the
+jobs; **Kueue** decides when they fit. Images, checkpoints, and supporting
+services stay on the same host.
+
+<figure className="stack-figure" aria-labelledby="stack-flow-caption">
+  <div className="stack-panel">
+    <p className="stack-label">Submit on the host</p>
+    <ol className="stack-flow">
+      <li><strong>Source + config</strong><span><code>submit.py</code> snapshots the working tree</span></li>
+      <li><strong>BuildKit → containerd</strong><span>Cached image build; no registry</span></li>
+      <li><strong>Kueue → Job pod</strong><span>Admission by priority and available quota</span></li>
+    </ol>
+    <div className="stack-runtime">
+      <p className="stack-label">Inside K3s · one server / worker node</p>
+      <div className="stack-branches">
+        <div><strong>GPU training</strong><span>JAX or PyTorch / vLLM<br />Exclusive GPU allocations</span></div>
+        <div><strong>↔ CodeGym</strong><span>Separate CPU service<br />160 environment workers</span></div>
+        <div><strong>↓ /runs</strong><span>Shared local-path volume<br />Checkpoints and Ray timelines</span></div>
+      </div>
+    </div>
+  </div>
+  <figcaption id="stack-flow-caption">Source → image → queued Job → execution. CodeGym is used by CodeGym runs; other environments run with their trainer.</figcaption>
+</figure>
+
+## Two GPUs, one shared budget
+
+The training queue has **2 GPUs, 10 CPU cores, and 64 GiB RAM**. These are admission
+quotas, not the host’s total capacity. Each job must fit all three resources;
+the GPUs are not time-shared or split with MIG.
+
+<StackBudget client:load />
+
+High-priority jobs can preempt low-priority jobs. Kueue deletes the old pod and
+later restarts its command. PPO and MAPPO resume from their latest saved
+checkpoint; work since that checkpoint is lost.
+
+## Three ways to see a run
+
+<figure className="stack-figure" aria-labelledby="stack-signals-caption">
+  <div className="stack-panel stack-signals">
+    <div className="stack-signal">
+      <div><strong>Experiments</strong><span>Training metrics, config, artifacts</span></div>
+      <span className="stack-arrow" aria-hidden="true">→</span>
+      <div><strong>MLflow</strong><span>SQLite + artifact volume</span></div>
+    </div>
+    <div className="stack-signal">
+      <div><strong>Resource & serving metrics</strong><span>DCGM, Node Exporter, cAdvisor,<br />kube-state-metrics, vLLM</span></div>
+      <span className="stack-arrow" aria-hidden="true">→</span>
+      <div><strong>Prometheus → Grafana</strong><span>15 s scrapes · up to 7 days / 4 GB</span></div>
+    </div>
+    <div className="stack-signal">
+      <div><strong>Request traces</strong><span>Opt-in GRPO v2 OpenTelemetry spans</span></div>
+      <span className="stack-arrow" aria-hidden="true">→</span>
+      <div><strong>Tempo → Grafana</strong><span>14-day retention</span></div>
+    </div>
+  </div>
+  <figcaption id="stack-signals-caption">Experiments explain learning; metrics explain resource use; traces explain time spent inside a request. Ray timelines are separate files in <code>/runs</code>, viewed with Perfetto.</figcaption>
+</figure>
+
+**Headlamp** inspects workloads and logs; **KueueViz** shows queue admission.
+The training-jobs viewer links to Ray dashboards, saved timelines, and Grafana.
+Browser access uses localhost port-forwards on **8080–8085**, forwarded through
+SSH or the IDE when remote.
+
+## What survives a job?
+
+Checkpoints in **`/runs`** survive pod replacement and Job deletion. MLflow,
+Prometheus, Grafana, and Tempo have their own persistent volumes. Container-local
+files and in-memory CodeGym episodes disappear with their pods.
+
+All of those volumes live on this one machine. They provide persistence, not a
+backup; durable checkpoints need a separate copy.
+
+<footer>Based on <code>infra/k3s/README.md</code>, <code>kueue/queues.yaml</code>,
+and the service manifests in <code>infra/k3s/</code>. Figures describe the checked-in
+setup and illustrative allocations, not live cluster status.</footer>

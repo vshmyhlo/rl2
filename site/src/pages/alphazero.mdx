@@ -1,7 +1,7 @@
 ---
 layout: ../layouts/ArticleLayout.astro
 title: AlphaZero · From self-play to a batch
-description: Step through parallel self-play games and inspect the game-by-time batch before it is flattened for training.
+description: Step through parallel self-play games and inspect the game-by-time batch used to sample training positions.
 ---
 
 import SelfPlayDemo from '../components/SelfPlayDemo';
@@ -14,9 +14,9 @@ import SelfPlayDemo from '../components/SelfPlayDemo';
 
 One model plays both sides of **B parallel games**. At every move, search produces
 a policy target for each position. `jax.lax.scan` stacks those records along a new
-time axis, producing arrays shaped `(T, B, …)`. The visualization uses the
-**(B, T) convention: B game rows × T time columns**, matching the order after
-`swapaxes(0, 1)` and before flattening.
+time axis, producing arrays shaped `(T, B, …)`. The code immediately swaps these
+axes to use the **(B, T) convention: B game rows × T time columns**, matching the
+visualization and the returned rollout.
 
 ## Collect one time step at a time
 
@@ -25,7 +25,7 @@ Each iteration starts fresh games. For each of the `T = max_moves` scan steps:
 1. Evaluate the current observations with the policy/value network.
 2. Run MCTS with legal-action masking and root exploration noise.
 3. Record the **pre-move** observation, search action weights, acting player, and
-   `valid = ~done`; advance each game with the selected action.
+   `policy_mask = ~done`; advance each game with the selected action.
 
 The next states become the scan's carry. Finished games stay finished: they are
 preserved, not reset, and subsequent positions in their rows are padding.
@@ -34,33 +34,38 @@ preserved, not reset, and subsequent positions in their rows are padding.
 
 ## What the scan returns
 
-`states` is the **final** batched state, with leaves shaped `(B, …)`. It is not a
-history of states. The second return value contains the stacked records:
+`env_states` is the **final** batched state, with leaves shaped `(B, …)`. It is not a
+history of states. The second return value contains the stacked records, which
+are converted to batch-first order:
 
 ```python
 # T = max_moves; B = num_envs; A = number of actions.
 # *O = the environment's observation dimensions.
-states, (observations, policies, players, valid) = jax.lax.scan(
+env_states, rollout = jax.lax.scan(
     step,
-    states,
+    env_states,
     (jax.random.split(play_key, config.max_moves),
      jnp.arange(config.max_moves, dtype=jnp.int32)),
 )
+
+def batch_first(x: jax.Array) -> jax.Array:  # (T, B, ...) -> (B, T, ...)
+    return x.swapaxes(0, 1)
+
+observations, policy_targets, player_ids, policy_mask = jax.tree.map(batch_first, rollout)
 ```
 
 <div className="az-table-wrap">
 
-| Recorded array | Before flattening | One cell `[t, b]` |
+| Recorded array | Shape | One cell `[b, t]` |
 | --- | --- | --- |
-| `observations` | `(T, B, *O)` | Observation before the action; shape `(*O)` |
-| `policies` | `(T, B, A)` | MCTS action weights; shape `(A,)` |
-| `players` | `(T, B)` | Acting player ID; scalar |
-| `valid` | `(T, B)` | Whether this position is real; scalar |
+| `observations` | `(B, T, *O)` | Observation before the action; shape `(*O)` |
+| `policy_targets` | `(B, T, A)` | MCTS action weights; shape `(A,)` |
+| `player_ids` | `(B, T)` | Acting player ID; scalar |
+| `policy_mask` | `(B, T)` | Whether this position is real; scalar |
 
 </div>
 
-The table above uses the scan's native `(T, B)` order; the figure transposes these
-arrays to `(B, T)` and labels cells `[b, t]`. Every cell lines up across the arrays.
+Every cell `[b, t]` lines up across the arrays and the figure.
 A cell represents **one position**, not
 one whole game. The action that ends a game still has a valid pre-move position;
 only later time steps are masked.
@@ -72,30 +77,25 @@ A win becomes `+1` for the winner's positions and `−1` for the opponent's posi
 Games still active at the move limit are adjudicated as draws with value target
 `0`; a win on the final allowed move keeps its result.
 
-The pre-flattening `Batch` contains `observations`, `policy_targets = policies`,
-`value_targets`, `policy_mask = valid`, and `value_mask`. The last three arrays
-all have shape `(T, B)`. `players` is used to construct targets, then discarded.
+The returned `Batch` contains `observations`, `policy_targets`,
+`value_targets`, `policy_mask`, and `value_mask`. The last three arrays
+all have shape `(B, T)`. `player_ids` is used to construct targets, then discarded.
 
 Terminal padding trains neither head. Environment-truncated games keep their
 valid policy positions but have **no value supervision**. This differs from a
 move-limit draw, whose valid positions train both heads with value target zero.
 
-## Flatten by game, then sample
+## Sample positions from the rollout
 
-The code first swaps time and game axes, then merges them:
-
-```python
-# Applied to every field in Batch:
-# (T, B, ...) → (B, T, ...) → (B * T, ...)
-x.swapaxes(0, 1).reshape((-1, *x.shape[2:]))
-```
-
-So flat index `b * T + t` corresponds to visual cell `[b, t]` (scan entry `[t, b]`): all positions from game 0,
-then game 1, and so on. Keeping each game's positions together preserves its
-device placement. Padding still occupies slots in the flattened batch.
+The rollout keeps its `(B, T, …)` shape and is sharded across games. Sampling
+flattens `policy_mask` to compute cumulative valid-position counts in game order:
+all positions from game 0, then game 1, and so on. Flat index `b * T + t`
+corresponds to cell `[b, t]`; padding occupies slots but is never selected.
 
 `sample_batch` samples real positions uniformly **with replacement**, skipping
-padding via `policy_mask`. Each iteration performs `updates_per_iteration`
+padding via `policy_mask`. It converts each sampled flat index back to `[b, t]`
+and gathers all fields at those coordinates, returning `(M, …)` arrays where
+`M = batch_size`. Each iteration performs `updates_per_iteration`
 parameter updates using minibatches of size `batch_size` from this rollout.
 There is no persistent replay buffer here.
 
