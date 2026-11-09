@@ -163,7 +163,7 @@ def test_update_uses_global_masked_means(mesh: Mesh) -> None:
     assert isinstance(actual, az.TrainStepResult)
     actual_state, actual_key, actual_metrics = actual  # Key: (2,); metric leaves: ().
     assert actual_state.step == updates_per_iteration
-    assert actual_metrics.value_updates == updates_per_iteration
+    assert actual_metrics.value_update_count == updates_per_iteration
     chex.assert_shape(actual_metrics, ())
     chex.assert_shape(actual_key, (2,))
     np.testing.assert_array_equal(actual_key, expected_key)

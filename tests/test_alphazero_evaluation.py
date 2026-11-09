@@ -116,7 +116,7 @@ def test_search_uses_acting_network_and_greedy_legal_action(monkeypatch: pytest.
         assert kwargs.get("dirichlet_fraction", 0.0) == 0.0
         np.testing.assert_array_equal(env_state.legal_action_mask, state.legal_action_mask)
         root = ev.train.SearchRoot(
-            prior_logits=logits,  # (A,)
+            logits=logits,  # (A,)
             value=value,  # ()
             env_state=env_state,  # Leaves: (...)
         )
@@ -125,7 +125,7 @@ def test_search_uses_acting_network_and_greedy_legal_action(monkeypatch: pytest.
         return ev.train.PolicyOutput(
             action=jnp.int32(8),  # ()
             action_weights=weights,  # (A,)
-            search_tree=ev.train.init_search_tree(root, 0),
+            tree=ev.train.init_search_tree(root, 0),
         )
 
     monkeypatch.setattr(ev.train, "puct_policy", search)

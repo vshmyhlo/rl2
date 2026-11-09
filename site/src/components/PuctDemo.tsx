@@ -28,7 +28,7 @@ function explanation(frame: Frame): string {
     case 'select': return `Start at the root and follow the highest PUCT score until an edge has no child. Path: ${frame.path.map((id) => `n${id}`).join(' → ')} → action ${actionNames[frame.action]}. The table shows the last decision on this path.`;
     case 'expand': return `recurrent_fn steps a copy of the state and predicts the child policy and value. Store n${leaf.id} with value ${signed(leaf.prediction)} from its player's perspective and one node visit. Edge counts have not changed yet.`;
     case 'backup': return `Walk back to the root. Here reward = 0 and discount = −1, so the return changes sign at each edge. Update each ancestor's running mean and increment each traversed edge's visit count.`;
-    case 'output': return `After ${simulationCount} simulations, normalize the root edge visits into action_weights. Temperature changes the distribution used to sample action, while action_weights stays the same. The complete search_tree is also returned.`;
+    case 'output': return `After ${simulationCount} simulations, normalize the root edge visits into action_weights. Temperature changes the distribution used to sample action, while action_weights stays the same. The complete tree is also returned.`;
   }
 }
 
@@ -153,7 +153,7 @@ export default function PuctDemo(): JSX.Element {
       <div className="puct-detail">
         {frame.phase === 'prepare' || frame.phase === 'output' ? <>
           <strong>{frame.phase === 'prepare' ? 'What enters the function' : 'What leaves the function'}</strong>
-          <p>{frame.phase === 'prepare' ? 'root: prior_logits (B, A), value (B,), env_states (B, …). Here the legal priors are [0.50, 0.30, 0.20]. Self-play has already mixed in root noise.' : 'action (B,) is sampled once per game. action_weights (B, A) supplies the policy target. search_tree has 1 + num_simulations node slots per game.'}</p>
+          <p>{frame.phase === 'prepare' ? 'root: logits (B, A), value (B,), env_states (B, …). Here the legal priors are [0.50, 0.30, 0.20]. Self-play has already mixed in root noise.' : 'action (B,) is sampled once per game. action_weights (B, A) supplies the policy target. tree has 1 + num_simulations node slots per game.'}</p>
         </> : frame.phase === 'backup' ? <>
           <strong>Return flowing from leaf to root</strong>
           <div className="puct-backup">{frame.returns.map((item, index) => <span key={item.node}>{index > 0 && <b aria-hidden="true"> → </b>}n{item.node}: <b>{signed(item.value)}</b></span>)}</div>

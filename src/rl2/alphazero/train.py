@@ -66,7 +66,7 @@ terminal padding. Each logging window contains complete training iterations:
   zero value contribution for updates without value targets. AdamW
   weight decay is applied by the optimizer and is not included in this loss.
 - rollout/environment_steps: Number of moves played across all games in the window, excluding padding.
-- rollout/value_positions: Total positions with outcome targets, including move-limit draws,
+- rollout/value_target_count: Total positions with outcome targets, including move-limit draws,
   collected in the window, before sampling training minibatches.
 - rollout/completed_games: Total completed games in the window, including
   move-limit draws. Environment-truncated games are excluded.
@@ -150,18 +150,18 @@ logger = logging.getLogger(__name__)
 
 @struct.dataclass
 class SearchRoot:
-    prior_logits: jax.Array  # (A,)
-    value: jax.Array  # ()
-    env_state: pgx.State  # Array leaves: (...)
+    logits: jax.Array  # (A,) Policy scores guiding action exploration at the root.
+    value: jax.Array  # () Estimated return from the root player's perspective.
+    env_state: pgx.State  # Array leaves: (...) Game state from which search starts.
 
 
 @struct.dataclass
 class SearchTransition:
-    reward: jax.Array  # ()
-    discount: jax.Array  # ()
-    prior_logits: jax.Array  # (A,)
-    value: jax.Array  # ()
-    env_state: pgx.State  # Array leaves: (...)
+    reward: jax.Array  # () Immediate reward for the player who took the action.
+    discount: jax.Array  # () Child-value multiplier: -1 for ongoing games, 0 when finished.
+    logits: jax.Array  # (A,) Policy scores guiding action exploration at the child state.
+    value: jax.Array  # () Estimated return from the child's player-to-move perspective.
+    env_state: pgx.State  # Array leaves: (...) Child game state reached by taking the action.
 
 
 @struct.dataclass
@@ -170,7 +170,7 @@ class SearchTree:
 
     node_visits: jax.Array  # (N,) Visit counts, including each node's initial prediction.
     node_values: jax.Array  # (N,) Mean values from each node's player-to-move perspective.
-    node_prior_logits: jax.Array  # (N, A) Policy scores from each node's state, guiding action exploration.
+    node_logits: jax.Array  # (N, A) Policy scores from each node's state, guiding action exploration.
     node_env_states: pgx.State  # Array leaves: (N, ...) Game states stored at each node.
     node_action_visits: jax.Array  # (N, A) Number of times each node-action edge was traversed.
     node_action_rewards: jax.Array  # (N, A) Immediate rewards for actions taken by this node's player.
@@ -181,21 +181,55 @@ class SearchTree:
     children_values: jax.Array  # (N, A) Cached child values, from the child's player-to-move perspective.
 
 
-@struct.dataclass
-class PolicyOutput:
-    action: jax.Array  # ()
-    action_weights: jax.Array  # (A,)
-    search_tree: SearchTree  # Array leaves: (N, ...)
-
-
-type SearchState = tuple[jax.Array, SearchTree]
+class SearchState(NamedTuple):
+    key: jax.Array  # (2,) RNG key for the next simulation.
+    tree: SearchTree  # Array leaves: (N, ...) Accumulated search state.
 
 
 class SimulationState(NamedTuple):
     key: jax.Array  # (2,)
-    parent: jax.Array  # ()
-    action: jax.Array  # ()
-    next_node: jax.Array  # ()
+    parent_index: jax.Array  # () Node index from which the last action was selected.
+    parent_action: jax.Array  # () Action selected at the parent node.
+    child_index: jax.Array  # () Child node to visit next; -1 if the selected edge is unexpanded.
+
+
+class BackupState(NamedTuple):
+    tree: SearchTree  # Unbatched leaves: (N, ...)
+    leaf_value: jax.Array  # ()
+    node_index: jax.Array  # () Current node in the backup traversal.
+
+
+@struct.dataclass
+class PolicyOutput:
+    action: jax.Array  # () Action sampled from root visit weights with temperature applied.
+    action_weights: jax.Array  # (A,) Normalized root visits used as policy targets; uniform legal fallback if none.
+    tree: SearchTree  # Array leaves: (N, ...) Tree and accumulated statistics after search.
+
+
+class SelfplayStep(NamedTuple):
+    observations: jax.Array  # (*O,)
+    policy_targets: jax.Array  # (A,)
+    player_ids: jax.Array  # ()
+    policy_mask: jax.Array  # ()
+
+
+@struct.dataclass
+class Batch:
+    """Training targets for a rollout or a sampled minibatch."""
+
+    observations: jax.Array  # (T, *O), (B, T, *O), or (M, *O)
+    policy_targets: jax.Array  # (T, A), (B, T, A), or (M, A)
+    value_targets: jax.Array  # (T,), (B, T), or (M,)
+    policy_mask: jax.Array  # (T,), (B, T), or (M,)
+    value_mask: jax.Array  # (T,), (B, T), or (M,)
+
+
+class RolloutMetrics(NamedTuple):
+    """Counts summed across games in one self-play rollout."""
+
+    completed_games: jax.Array  # ()
+    environment_steps: jax.Array  # ()
+    value_target_count: jax.Array  # () Number of rollout positions with valid value targets.
 
 
 class TrainMetrics(NamedTuple):
@@ -204,15 +238,7 @@ class TrainMetrics(NamedTuple):
     loss: jax.Array  # ()
     policy_loss: jax.Array  # ()
     value_loss: jax.Array  # ()
-    value_updates: jax.Array  # () int32; one when the update has value targets, otherwise zero.
-
-
-class RolloutMetrics(NamedTuple):
-    """Counts summed across games in one self-play rollout."""
-
-    completed_games: jax.Array  # ()
-    environment_steps: jax.Array  # ()
-    value_positions: jax.Array  # ()
+    value_update_count: jax.Array  # () int32; number of updates with valid value targets (0 or 1 per update).
 
 
 class TrainStepResult(NamedTuple):
@@ -227,30 +253,6 @@ class WindowMetrics(NamedTuple):
     update_metrics: TrainMetrics  # Scalar leaves: ().
     rollout_metrics: RolloutMetrics  # Scalar leaves: ().
     iterations: jax.Array  # ()
-
-
-class BackupState(NamedTuple):
-    tree: SearchTree  # Unbatched leaves: (N, ...)
-    leaf_value: jax.Array  # ()
-    index: jax.Array  # ()
-
-
-@struct.dataclass
-class Batch:
-    """Training targets for a rollout or a sampled minibatch."""
-
-    observations: jax.Array  # (T, *O), (B, T, *O), or (M, *O)
-    policy_targets: jax.Array  # (T, A), (B, T, A), or (M, A)
-    value_targets: jax.Array  # (T,), (B, T), or (M,)
-    policy_mask: jax.Array  # (T,), (B, T), or (M,)
-    value_mask: jax.Array  # (T,), (B, T), or (M,)
-
-
-class SelfplayStep(NamedTuple):
-    observations: jax.Array  # (*O,)
-    policy_targets: jax.Array  # (A,)
-    player_ids: jax.Array  # ()
-    policy_mask: jax.Array  # ()
 
 
 class PolicyValueFn(Protocol):
@@ -292,11 +294,11 @@ def init_search_tree(
     num_simulations: int,
 ) -> SearchTree:
     """Allocate (N, ...) storage and count the root prediction as its first visit."""
-    chex.assert_rank(root.prior_logits, 1)
+    chex.assert_rank(root.logits, 1)
     chex.assert_shape(root.value, ())
-    chex.assert_shape(root.env_state.legal_action_mask, root.prior_logits.shape)
+    chex.assert_shape(root.env_state.legal_action_mask, root.logits.shape)
     node_shape = (num_simulations + 1,)
-    edge_shape = (*node_shape, root.prior_logits.shape[0])
+    edge_shape = (*node_shape, root.logits.shape[0])
 
     def allocate(leaf: jax.Array) -> jax.Array:  # (...) -> (N, ...)
         return jnp.zeros((*node_shape, *leaf.shape), leaf.dtype).at[0].set(leaf)  # (N, ...)
@@ -304,7 +306,7 @@ def init_search_tree(
     return SearchTree(
         node_visits=jnp.zeros(node_shape, jnp.int32).at[0].set(1),  # (N,)
         node_values=jnp.zeros(node_shape, root.value.dtype).at[0].set(root.value),  # (N,)
-        node_prior_logits=jnp.zeros(edge_shape, root.prior_logits.dtype).at[0].set(root.prior_logits),  # (N, A)
+        node_logits=jnp.zeros(edge_shape, root.logits.dtype).at[0].set(root.logits),  # (N, A)
         node_env_states=jax.tree.map(allocate, root.env_state),  # Leaves: (N, ...)
         node_action_visits=jnp.zeros(edge_shape, jnp.int32),  # (N, A)
         node_action_rewards=jnp.zeros(edge_shape, root.value.dtype),  # (N, A)
@@ -325,7 +327,7 @@ def select_action(
     visits = tree.node_action_visits[node]  # (A,)
     node_visits = tree.node_visits[node]  # ()
     pb_c = 1.25 + jnp.log((node_visits + 19652.0 + 1.0) / 19652.0)  # ()
-    priors = jax.nn.softmax(tree.node_prior_logits[node])  # (A,)
+    priors = jax.nn.softmax(tree.node_logits[node])  # (A,)
     policy_score = jnp.sqrt(node_visits) * pb_c * priors / (visits + 1)  # (A,)
     qvalues = tree.node_action_rewards[node] + tree.node_action_discounts[node] * tree.children_values[node]  # (A,)
     value = tree.node_values[node]  # ()
@@ -343,31 +345,34 @@ def select_action(
 def simulate(
     key: jax.Array,  # (2,)
     tree: SearchTree,  # Unbatched leaves: (N, ...)
-) -> tuple[jax.Array, jax.Array]:  # (), ()
-    """Traverse an acyclic search tree to an unvisited edge."""
+) -> SimulationState:
+    """Stop at an unexpanded edge (child_index=-1) or a terminal/truncated node."""
 
     def ongoing(carry: SimulationState) -> jax.Array:  # ()
-        return carry.next_node != -1  # ()
+        done = (
+            tree.node_env_states.terminated[carry.child_index] | tree.node_env_states.truncated[carry.child_index]
+        )  # ()
+        return (carry.child_index != -1) & ~done  # ()
 
     def advance(carry: SimulationState) -> SimulationState:
         key, action_key = jax.random.split(carry.key)  # Each: (2,)
-        node = carry.next_node  # ()
+        node = carry.child_index  # ()
         action = select_action(action_key, tree, node)  # ()
         return SimulationState(
             key=key,
-            parent=node,
-            action=action,
-            next_node=tree.children_indices[node, action],  # ()
+            parent_index=node,
+            parent_action=action,
+            child_index=tree.children_indices[node, action],  # ()
         )
 
     initial = SimulationState(
         key=key,
-        parent=jnp.int32(-1),
-        action=jnp.int32(-1),
-        next_node=jnp.int32(0),
+        # Valid placeholders for finished roots in batches with other games still expanding.
+        parent_index=jnp.int32(0),
+        parent_action=jnp.int32(0),
+        child_index=jnp.int32(0),
     )
-    result = jax.lax.while_loop(ongoing, advance, initial)
-    return result.parent, result.action  # (), ()
+    return jax.lax.while_loop(ongoing, advance, initial)
 
 
 def expand(
@@ -385,7 +390,7 @@ def expand(
         return leaf[parent]  # (...)
 
     output = recurrent_fn(predict, action, jax.tree.map(select, tree.node_env_states))
-    chex.assert_shape(output.prior_logits, (num_actions,))
+    chex.assert_shape(output.logits, (num_actions,))
     chex.assert_shape((output.reward, output.discount, output.value), ())
 
     def update(old: jax.Array, new: jax.Array) -> jax.Array:  # (N, ...), (...) -> (N, ...)
@@ -393,7 +398,7 @@ def expand(
         return old.at[next_node].set(new)  # (N, ...)
 
     return tree.replace(
-        node_prior_logits=update(tree.node_prior_logits, output.prior_logits),  # (N, A)
+        node_logits=update(tree.node_logits, output.logits),  # (N, A)
         node_values=update(tree.node_values, output.value),  # (N,)
         node_visits=tree.node_visits.at[next_node].set(1),  # (N,)
         node_env_states=jax.tree.map(update, tree.node_env_states, output.env_state),  # Leaves: (N, ...)
@@ -447,7 +452,7 @@ def recurrent_step(
         A SearchTransition containing:
             reward: () float32 immediate reward for the parent state's acting player.
             discount: () float32; -1 for ongoing games, 0 on termination or truncation.
-            prior_logits: (A,) float32 masked child policy logits, A = env.num_actions.
+            logits: (A,) float32 masked child policy logits, A = env.num_actions.
             value: () float32 child player-to-move value, zero on termination or truncation.
             env_state: (...) array leaves forming the child PGX state pytree.
         Backup uses reward + discount * child_value, negating the opponent's value.
@@ -472,7 +477,7 @@ def recurrent_step(
     return SearchTransition(
         reward=reward,  # ()
         discount=jnp.where(done, 0.0, -1.0),  # ()
-        prior_logits=masked_logits(logits, next_env_state.legal_action_mask),  # (A,)
+        logits=masked_logits(logits, next_env_state.legal_action_mask),  # (A,)
         value=jnp.where(done, 0.0, value),  # ()
         env_state=next_env_state,  # Leaves: (...)
     )
@@ -493,12 +498,12 @@ def backward(
     """
 
     def ongoing(carry: BackupState) -> jax.Array:  # ()
-        return carry.index != 0  # ()
+        return carry.node_index != 0  # ()
 
     def advance(carry: BackupState) -> BackupState:
-        tree, leaf_value, index = carry  # Tree leaves: (N, ...); value and index: ().
-        parent = tree.parent_indices[index]  # ()
-        action = tree.parent_actions[index]  # ()
+        tree, leaf_value, node_index = carry  # Tree leaves: (N, ...); value and node_index: ().
+        parent = tree.parent_indices[node_index]  # ()
+        action = tree.parent_actions[node_index]  # ()
         count = tree.node_visits[parent]  # ()
         leaf_value = (
             tree.node_action_rewards[parent, action] + tree.node_action_discounts[parent, action] * leaf_value
@@ -507,12 +512,12 @@ def backward(
         tree = tree.replace(
             node_values=tree.node_values.at[parent].set(parent_value),  # (N,)
             node_visits=tree.node_visits.at[parent].add(1),  # (N,)
-            children_values=tree.children_values.at[parent, action].set(tree.node_values[index]),  # (N, A)
+            children_values=tree.children_values.at[parent, action].set(tree.node_values[node_index]),  # (N, A)
             node_action_visits=tree.node_action_visits.at[parent, action].add(1),  # (N, A)
         )  # Leaves: (N, ...)
-        return BackupState(tree=tree, leaf_value=leaf_value, index=parent)
+        return BackupState(tree=tree, leaf_value=leaf_value, node_index=parent)
 
-    initial = BackupState(tree=tree, leaf_value=tree.node_values[leaf_index], index=leaf_index)
+    initial = BackupState(tree=tree, leaf_value=tree.node_values[leaf_index], node_index=leaf_index)
     return jax.lax.while_loop(ongoing, advance, initial).tree  # Leaves: (N, ...)
 
 
@@ -534,7 +539,8 @@ def puct_policy(
         key: (2,) uint32 PRNG key.
         env_state: (...) state array leaves; finished root values are zeroed.
         recurrent_fn: Single-game transition and prediction function.
-        num_simulations: Number of node expansions per game; zero gives uniform legal weights.
+        num_simulations: Number of simulations; each expands at most one node.
+            Finished leaves are revisited without expansion. Zero gives uniform legal weights.
             States with no legal actions fall back to uniform weights over all actions.
         temperature: () action-sampling temperature, or a Python scalar.
         dirichlet_alpha: Positive concentration for each legal root action.
@@ -544,7 +550,7 @@ def puct_policy(
         A PolicyOutput containing:
             action: () sampled action ID.
             action_weights: (A,) float32 normalized visit counts.
-            search_tree: (N, ...) node arrays, including each node's environment state.
+            tree: (N, ...) node arrays, including each node's environment state.
     """
     action_key, noise_key, search_key = jax.random.split(key, 3)  # Each: (2,)
     logits, value = predict(env_state.observation)  # (A,), ()
@@ -552,7 +558,7 @@ def puct_policy(
     chex.assert_shape(value, ())
     done = env_state.terminated | env_state.truncated  # ()
     root = SearchRoot(
-        prior_logits=prepare_prior_logits(
+        logits=prepare_logits(
             logits,
             env_state.legal_action_mask,
             noise_key,
@@ -564,15 +570,32 @@ def puct_policy(
     )
 
     def advance(simulation: int, carry: SearchState) -> SearchState:
-        key, tree = carry  # Key: (2,); tree leaves: (N, ...)
-        key, simulate_key = jax.random.split(key)  # Each: (2,)
-        parent, action = simulate(simulate_key, tree)  # Each: ()
+        tree = carry.tree  # Leaves: (N, ...)
+        key, simulate_key = jax.random.split(carry.key)  # Each: (2,)
+        leaf = simulate(simulate_key, tree)
         next_node = jnp.asarray(simulation + 1, jnp.int32)  # ()
-        tree = expand(predict, tree, recurrent_fn, parent, action, next_node)
-        return key, backward(tree, next_node)
+
+        def pending(carry: tuple[SearchTree, jax.Array]) -> jax.Array:  # ((N, ...) tree, () flag) -> ()
+            return carry[1]  # ()
+
+        def expand_leaf(carry: tuple[SearchTree, jax.Array]) -> tuple[SearchTree, jax.Array]:
+            tree, _ = carry  # Tree leaves: (N, ...); flag: ().
+            return expand(predict, tree, recurrent_fn, leaf.parent_index, leaf.parent_action, next_node), jnp.bool_(
+                False
+            )  # (N, ...), ()
+
+        # A single-pass while keeps model parameters shared under vmap, unlike a batched cond.
+        tree, _ = jax.lax.while_loop(pending, expand_leaf, (tree, leaf.child_index == -1))
+        leaf_index = jnp.where(leaf.child_index == -1, next_node, leaf.child_index)  # ()
+        tree = tree.replace(
+            node_visits=tree.node_visits.at[leaf_index].add((leaf.child_index != -1).astype(jnp.int32)),  # (N,)
+        )
+        return SearchState(key=key, tree=backward(tree, leaf_index))
 
     tree = init_search_tree(root, num_simulations)  # Leaves: (N, ...)
-    _, tree = jax.lax.fori_loop(0, num_simulations, advance, (search_key, tree))  # Tree leaves: (N, ...)
+    tree = jax.lax.fori_loop(
+        0, num_simulations, advance, SearchState(key=search_key, tree=tree)
+    ).tree  # Leaves: (N, ...)
     counts = tree.node_action_visits[0].astype(root.value.dtype)  # (A,)
     total = counts.sum()  # ()
     legal = env_state.legal_action_mask  # (A,)
@@ -587,11 +610,11 @@ def puct_policy(
     return PolicyOutput(
         action=jax.random.categorical(action_key, action_logits),  # ()
         action_weights=weights,  # (A,)
-        search_tree=tree,  # Leaves: (N, ...)
+        tree=tree,  # Leaves: (N, ...)
     )
 
 
-def prepare_prior_logits(
+def prepare_logits(
     logits: jax.Array,  # (A,)
     legal: jax.Array,  # (A,)
     key: jax.Array,  # (2,)
@@ -611,14 +634,14 @@ def prepare_prior_logits(
     Returns:
         (A,) float32 noisy, masked logits; states with no legal actions remain finite.
     """
-    prior_logits = masked_logits(logits, legal)  # (A,)
+    logits = masked_logits(logits, legal)  # (A,)
     if dirichlet_fraction == 0.0:
-        return prior_logits
+        return logits
     # Independent Gamma samples normalized over legal moves form a Dirichlet
     # sample on that subset. Log space avoids underflow for small concentrations.
     log_noise = jax.random.loggamma(key, dirichlet_alpha, shape=logits.shape)  # (A,)
     noise = jax.nn.softmax(masked_logits(log_noise, legal))  # (A,)
-    probs = (1.0 - dirichlet_fraction) * jax.nn.softmax(prior_logits) + dirichlet_fraction * noise  # (A,)
+    probs = (1.0 - dirichlet_fraction) * jax.nn.softmax(logits) + dirichlet_fraction * noise  # (A,)
     return masked_logits(jnp.log(jnp.maximum(probs, jnp.finfo(probs.dtype).tiny)), legal)  # (A,)
 
 
@@ -655,7 +678,7 @@ def collect_selfplay(
             value_mask: (B, T) bool positions with terminal or adjudicated outcomes.
             completed_games: () integer count including move-limit draws.
             environment_steps: () integer count of moves played across all games, excluding padding.
-            value_positions: () integer count of positions with outcome targets.
+            value_target_count: () integer count of positions with outcome targets.
     """
     params, key = jax.lax.with_sharding_constraint((params, key), PartitionSpec())  # Parameter shapes; key: (2,).
     keys = jax.random.split(key, config.num_envs)  # (B, 2)
@@ -691,7 +714,7 @@ def collect_one_game(
             value_mask: (T,) bool positions with terminal or adjudicated outcomes, excluding truncations.
             completed_games: () int32; one for a terminal or adjudicated game, otherwise zero.
             environment_steps: () integer count of non-padding moves.
-            value_positions: () integer count of supervised value targets.
+            value_target_count: () integer count of supervised value targets.
     """
     init_key, play_key = jax.random.split(key)  # Each: (2,)
     env_state = env.init(init_key)  # Unbatched array leaves.
@@ -758,7 +781,7 @@ def collect_one_game(
     return batch, RolloutMetrics(
         completed_games=completed.astype(jnp.int32),  # ()
         environment_steps=policy_mask.sum(),  # ()
-        value_positions=value_mask.sum(),  # ()
+        value_target_count=value_mask.sum(),  # ()
     )
 
 
@@ -779,7 +802,7 @@ def loss_fn(
         loss=loss,  # ()
         policy_loss=policy_loss,  # ()
         value_loss=value_loss,  # ()
-        value_updates=(value_count > 0).astype(jnp.int32),  # ()
+        value_update_count=(value_count > 0).astype(jnp.int32),  # ()
     )
 
 
@@ -802,7 +825,7 @@ def train_step(
         loss=jnp.float32(0),  # ()
         policy_loss=jnp.float32(0),  # ()
         value_loss=jnp.float32(0),  # ()
-        value_updates=jnp.int32(0),  # ()
+        value_update_count=jnp.int32(0),  # ()
     )
 
     def update(
@@ -915,12 +938,12 @@ def train(config: Config) -> TrainState:
                 loss=jnp.float32(0),  # ()
                 policy_loss=jnp.float32(0),  # ()
                 value_loss=jnp.float32(0),  # ()
-                value_updates=jnp.int32(0),  # ()
+                value_update_count=jnp.int32(0),  # ()
             ),
             rollout_metrics=RolloutMetrics(
                 completed_games=jnp.int32(0),  # ()
                 environment_steps=jnp.int32(0),  # ()
-                value_positions=jnp.int32(0),  # ()
+                value_target_count=jnp.int32(0),  # ()
             ),
             iterations=jnp.int32(0),  # ()
         )  # Scalar leaves: ().
@@ -960,8 +983,8 @@ def train(config: Config) -> TrainState:
                     "loss": float(host_updates.loss) / window_updates,
                     "policy_loss": float(host_updates.policy_loss) / window_updates,
                 }
-                if host_updates.value_updates:
-                    mean_losses["value_loss"] = float(host_updates.value_loss) / int(host_updates.value_updates)
+                if host_updates.value_update_count:
+                    mean_losses["value_loss"] = float(host_updates.value_loss) / int(host_updates.value_update_count)
                 window_rollout = {name: int(value) for name, value in host_metrics.rollout_metrics._asdict().items()}
                 scalars = {
                     **{f"train/{name}": value for name, value in mean_losses.items()},

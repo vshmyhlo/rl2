@@ -39,17 +39,17 @@ def test_puct_prepares_root_predictions(noise_fraction: float) -> None:
         dirichlet_fraction=noise_fraction,
     )
     result = jax.jit(jax.vmap(search))(jax.random.split(jax.random.PRNGKey(1), 3), states)
-    tree = result.search_tree
-    assert tree.node_prior_logits.shape == (3, 1, 9)
+    tree = result.tree
+    assert tree.node_logits.shape == (3, 1, 9)
     assert tree.node_values.shape == (3, 1)
     np.testing.assert_array_equal(tree.node_values[:, 0], [0.75, 0.0, 0.0])
     np.testing.assert_array_equal(tree.node_env_states.legal_action_mask[:, 0], states.legal_action_mask)
-    probabilities = jax.nn.softmax(tree.node_prior_logits[:, 0])  # (B, A)
+    probabilities = jax.nn.softmax(tree.node_logits[:, 0])  # (B, A)
     np.testing.assert_array_equal(probabilities[:, 2:], 0.0)
     np.testing.assert_allclose(probabilities.sum(axis=-1), 1.0)
     if noise_fraction == 0.0:
         # Preserve log-odds even when their probabilities underflow to zero.
-        np.testing.assert_array_equal(tree.node_prior_logits[:, 0, :2], [[0.0, -200.0]] * 3)
+        np.testing.assert_array_equal(tree.node_logits[:, 0, :2], [[0.0, -200.0]] * 3)
         np.testing.assert_array_equal(probabilities[:, :2], [[1.0, 0.0]] * 3)
     else:
         assert not np.allclose(probabilities[:, :2], 0.5)
@@ -106,7 +106,7 @@ def test_recurrent_step_finished_nodes_do_not_repeat_reward_or_bootstrap() -> No
     np.testing.assert_array_equal(next_states.terminated, states.terminated)
     np.testing.assert_array_equal(next_states.truncated, states.truncated)
     np.testing.assert_array_equal(next_states.legal_action_mask, states.legal_action_mask)
-    assert np.isfinite(jax.nn.softmax(output.prior_logits)).all()
+    assert np.isfinite(jax.nn.softmax(output.logits)).all()
 
 
 @pytest.mark.parametrize(
@@ -132,18 +132,22 @@ def test_recurrent_step_rejects_malformed_predictions(
 
 
 @pytest.mark.parametrize(
-    ("simulations", "temperature"),
+    ("simulations", "temperature", "truncated"),
     [
-        pytest.param(0, 0.0, id="no-expansions"),
-        pytest.param(4, 0.0, id="absorbing-terminal-branches"),
-        pytest.param(4, 1e6, id="high-temperature-preserves-zero-probabilities"),
+        pytest.param(0, 0.0, False, id="no-expansions"),
+        pytest.param(4, 0.0, False, id="terminal-leaf-revisits"),
+        pytest.param(4, 1e6, False, id="high-temperature-preserves-zero-probabilities"),
+        pytest.param(4, 0.0, True, id="truncated-leaf-revisits"),
     ],
 )
-def test_local_puct_terminal_rewards_and_nested_state_shapes(simulations: int, temperature: float) -> None:
+def test_local_puct_terminal_rewards_and_nested_state_shapes(
+    simulations: int, temperature: float, truncated: bool
+) -> None:
     # The first game has one legal terminal move; the second is already finished.
     env_states = jax.vmap(pgx.make("tic_tac_toe").init)(jax.random.split(jax.random.PRNGKey(0), 2))  # Leaves: (B, ...).
     env_states = env_states.replace(
-        terminated=jnp.array([False, True]),  # (B,)
+        terminated=jnp.array([False, not truncated]),  # (B,)
+        truncated=jnp.array([False, truncated]),  # (B,)
         legal_action_mask=jnp.array([[True, False], [False, False]]),  # (B, A)
     )  # Leaves: (B, ...).
 
@@ -157,11 +161,13 @@ def test_local_puct_terminal_rewards_and_nested_state_shapes(simulations: int, t
     ) -> az.SearchTransition:
         logits, value = model(env_state.observation)  # (A,), ()
         return az.SearchTransition(
-            reward=(~env_state.terminated).astype(jnp.float32),  # ()
+            reward=(~(env_state.terminated | env_state.truncated)).astype(jnp.float32),  # ()
             discount=jnp.zeros_like(value),  # ()
-            prior_logits=logits,  # (A,)
-            value=value,  # ()
-            env_state=env_state.replace(terminated=jnp.ones_like(env_state.terminated)),  # Leaves: (...)
+            logits=logits,  # (A,)
+            value=jnp.float32(0.0),  # ()
+            env_state=env_state.replace(
+                terminated=jnp.bool_(not truncated), truncated=jnp.bool_(truncated)
+            ),  # Leaves: (...)
         )
 
     search = partial(
@@ -172,7 +178,7 @@ def test_local_puct_terminal_rewards_and_nested_state_shapes(simulations: int, t
         temperature=temperature,
     )
     result = jax.jit(jax.vmap(search))(jax.random.split(jax.random.PRNGKey(0), 2), env_states)
-    tree = result.search_tree
+    tree = result.tree
     assert result.action.shape == (2,)
     assert result.action_weights.shape == (2, 2)
     assert tree.node_action_visits.shape == (2, simulations + 1, 2)
@@ -180,10 +186,19 @@ def test_local_puct_terminal_rewards_and_nested_state_shapes(simulations: int, t
     assert tree.node_env_states.observation.shape == (2, simulations + 1, 3, 3, 2)
     np.testing.assert_array_equal(tree.node_visits[:, 0], simulations + 1)
     np.testing.assert_allclose(tree.node_values[:, 0], [(0.25 + simulations) / (simulations + 1), 0.0])
-    np.testing.assert_array_equal(tree.node_action_visits[:, 0].sum(axis=-1), simulations)
+    np.testing.assert_array_equal(tree.node_action_visits[:, 0].sum(axis=-1), [simulations, 0])
+    np.testing.assert_array_equal((tree.node_visits > 0).sum(axis=-1), [2 if simulations else 1, 1])
+    np.testing.assert_array_equal(tree.children_indices[:, 1:], -1)
+    np.testing.assert_array_equal(tree.node_action_visits[:, 1:], 0)
+    np.testing.assert_array_equal(tree.parent_indices[1], -1)
+    np.testing.assert_allclose(result.action_weights[1], [0.5, 0.5])
+    np.testing.assert_allclose(result.action_weights.sum(axis=-1), 1.0)
+    assert (result.action_weights >= 0).all()
+    assert 0 <= result.action[1] < 2  # Either fallback action is valid for the finished game.
     if simulations:
-        np.testing.assert_array_equal(result.action, [0, 0])
-        np.testing.assert_array_equal(result.action_weights, [[1, 0], [1, 0]])
+        np.testing.assert_array_equal(tree.node_visits[:, 1], [simulations, 0])
+        assert result.action[0] == 0
+        np.testing.assert_array_equal(result.action_weights[0], [1, 0])
         np.testing.assert_array_equal(tree.node_action_rewards[:, 0, 0], [1, 0])
         np.testing.assert_array_equal(tree.node_action_rewards[:, 1:], 0)
     else:
@@ -193,8 +208,9 @@ def test_local_puct_terminal_rewards_and_nested_state_shapes(simulations: int, t
         np.testing.assert_array_equal(tree.parent_indices, -1)
 
 
-def test_search_expands_one_new_node_per_simulation() -> None:
-    # One action forces the deepest possible tree: a chain through every allocated node.
+@pytest.mark.parametrize("terminal_depth", [None, 2], ids=["ongoing-chain", "terminal-grandchild"])
+def test_search_expands_chain_until_finished(terminal_depth: int | None) -> None:
+    # One action forces a chain; terminal revisits must still back up through every ancestor.
     def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (*O,)
         return jnp.zeros(1), jnp.float32(0.0)  # (A,), ()
 
@@ -203,12 +219,16 @@ def test_search_expands_one_new_node_per_simulation() -> None:
         action: jax.Array,  # ()
         env_state: pgx.State,  # Leaves: (...).
     ) -> az.SearchTransition:
-        next_env_state = env_state.replace(_step_count=env_state._step_count + 1)  # Leaves: (...).
+        next_depth = env_state._step_count + 1  # ()
+        next_env_state = env_state.replace(
+            _step_count=next_depth,  # ()
+            terminated=jnp.bool_(False) if terminal_depth is None else next_depth >= terminal_depth,  # ()
+        )  # Leaves: (...)
         logits, value = model(next_env_state.observation)  # (A,), ()
         return az.SearchTransition(
             reward=jnp.zeros_like(value),  # ()
-            discount=jnp.ones_like(value),  # ()
-            prior_logits=logits,  # (A,)
+            discount=jnp.where(next_env_state.terminated, 0.0, 1.0),  # ()
+            logits=logits,  # (A,)
             value=value,  # ()
             env_state=next_env_state,  # Leaves: (...)
         )
@@ -227,11 +247,13 @@ def test_search_expands_one_new_node_per_simulation() -> None:
     result = search(jax.random.PRNGKey(0), env_state)
     assert result.action.shape == ()
     assert result.action_weights.shape == (1,)
-    tree = result.search_tree
+    tree = result.tree
     assert tree.children_indices.shape == (5, 1)
     assert tree.node_env_states._step_count.shape == (5,)
-    np.testing.assert_array_equal(tree.parent_indices, [-1, 0, 1, 2, 3])
-    np.testing.assert_array_equal(tree.children_indices, [[1], [2], [3], [4], [-1]])
-    np.testing.assert_array_equal(tree.node_env_states._step_count, [0, 1, 2, 3, 4])
-    np.testing.assert_array_equal(tree.node_visits, [5, 4, 3, 2, 1])
+    depth = 4 if terminal_depth is None else terminal_depth
+    np.testing.assert_array_equal(tree.parent_indices, [-1, *range(depth), *([-1] * (4 - depth))])
+    np.testing.assert_array_equal(tree.children_indices[:, 0], [*range(1, depth + 1), *([-1] * (5 - depth))])
+    np.testing.assert_array_equal(tree.node_env_states._step_count, [*range(depth + 1), *([0] * (4 - depth))])
+    np.testing.assert_array_equal(tree.node_visits, [*(5 - i for i in range(depth + 1)), *([0] * (4 - depth))])
+    np.testing.assert_array_equal(tree.node_action_visits[:, 0], [*(4 - i for i in range(depth)), *([0] * (5 - depth))])
     np.testing.assert_array_equal(result.action_weights, [1.0])

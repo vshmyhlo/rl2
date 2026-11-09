@@ -77,13 +77,13 @@ def test_sample_batch_sparse_positions_preserves_fields() -> None:
 
 
 @pytest.mark.parametrize("fraction", [0.0, 0.25, 1.0], ids=["disabled", "mixture", "noise-only"])
-def test_prepare_prior_logits_uses_only_legal_actions(fraction: float, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_prepare_logits_uses_only_legal_actions(fraction: float, monkeypatch: pytest.MonkeyPatch) -> None:
     logits = jnp.log(jnp.array([3, 1, 500, 500], jnp.float32))  # (A,)
     legal = jnp.array([True, True, False, False])  # (A,)
     # Most Gamma mass is on illegal actions; it must not dilute the noise weight.
     loggamma = Mock(return_value=jnp.log(jnp.array([1, 3, 1000, 1000], jnp.float32)))
     monkeypatch.setattr(az.jax.random, "loggamma", loggamma)
-    prepare = partial(az.prepare_prior_logits, dirichlet_alpha=0.3, dirichlet_fraction=fraction)
+    prepare = partial(az.prepare_logits, dirichlet_alpha=0.3, dirichlet_fraction=fraction)
     noisy = prepare(logits, legal, jax.random.PRNGKey(0))  # (A,)
     assert noisy.shape == (4,)
     assert noisy.dtype == jnp.float32
@@ -145,7 +145,7 @@ def test_outcomes_use_player_ids_and_adjudicate_move_limit_draws(
     np.testing.assert_array_equal(batch.value_targets, expected)
     np.testing.assert_array_equal(batch.value_mask, jnp.array(policy_mask) & ~jnp.bool_(truncated))
     np.testing.assert_array_equal(batch.policy_mask, policy_mask)
-    assert metrics.value_positions == (0 if truncated else sum(policy_mask))
+    assert metrics.value_target_count == (0 if truncated else sum(policy_mask))
     assert metrics.environment_steps == sum(policy_mask)
     assert metrics.completed_games == int(not truncated)
 
@@ -168,7 +168,7 @@ def test_recurrent_step_terminal_reward_and_opponent_discount(
     )
     next_states = output.env_state  # Leaves: (B, ...)
     chex.assert_shape((output.reward, output.discount, output.value), (2,))
-    chex.assert_shape(output.prior_logits, (2, env.num_actions))
+    chex.assert_shape(output.logits, (2, env.num_actions))
     chex.assert_shape(next_states.observation, (2, *state.observation.shape))
     chex.assert_shape(next_states.legal_action_mask, (2, env.num_actions))
     np.testing.assert_array_equal(next_states.terminated, [True, False])
@@ -177,7 +177,7 @@ def test_recurrent_step_terminal_reward_and_opponent_discount(
     assert output.value[0] == 0
     _, expected_values = model.apply({"params": params}, next_states.observation)
     np.testing.assert_allclose(output.value[1], expected_values[1], atol=1e-7)
-    probs = jax.nn.softmax(output.prior_logits)
+    probs = jax.nn.softmax(output.logits)
     assert np.all(np.asarray(probs[1])[~np.asarray(next_states.legal_action_mask[1])] == 0)
 
 
@@ -243,7 +243,7 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
     assert updated.step == 1
     assert isinstance(losses, az.TrainMetrics)
     chex.assert_shape(losses, ())
-    assert losses.value_updates == 1
+    assert losses.value_update_count == 1
     assert all(np.isfinite(value) for value in losses)
     assert any(
         np.any(np.asarray(before) != np.asarray(after))
@@ -259,7 +259,7 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
     )  # Leaves: (B * T, ...).
     (loss, empty_metrics), grads = jax.value_and_grad(az.loss_fn, has_aux=True)(params, state.apply_fn, empty)
     assert loss == 0
-    assert empty_metrics.value_updates == 0
+    assert empty_metrics.value_update_count == 0
     assert all(np.all(np.asarray(leaf) == 0) for leaf in jax.tree.leaves(grads))
 
 
@@ -275,7 +275,7 @@ def test_chess_search_smoke() -> None:
     assert metrics.environment_steps == 1
     chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (1, 1))
     assert metrics.completed_games == 1
-    assert metrics.value_positions == 1
+    assert metrics.value_target_count == 1
     assert batch.value_mask.all()
     assert batch.policy_mask.all()
     np.testing.assert_array_equal(batch.value_targets, [[0.0]])
@@ -355,13 +355,13 @@ def logging_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> az.Config
         (
             None,
             az.RolloutMetrics(
-                environment_steps=jnp.int32(3), completed_games=jnp.int32(1), value_positions=jnp.int32(2)
+                environment_steps=jnp.int32(3), completed_games=jnp.int32(1), value_target_count=jnp.int32(2)
             ),
         ),
         (
             None,
             az.RolloutMetrics(
-                environment_steps=jnp.int32(2), completed_games=jnp.int32(0), value_positions=jnp.int32(0)
+                environment_steps=jnp.int32(2), completed_games=jnp.int32(0), value_target_count=jnp.int32(0)
             ),
         ),
     ]
@@ -385,7 +385,7 @@ def logging_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> az.Config
                 loss=loss,  # ()
                 policy_loss=loss,  # ()
                 value_loss=jnp.float32(0),  # ()
-                value_updates=jnp.int32(updates_per_iteration),  # ()
+                value_update_count=jnp.int32(updates_per_iteration),  # ()
             ),
         )
 
@@ -456,7 +456,7 @@ def test_mlflow_progress(
         "rollout/completed_games_total": [1, 2, 3],
         "rollout/completed_games": [1, 1, 1],
         "rollout/environment_steps": [5, 5, 3],
-        "rollout/value_positions": [2, 2, 2],
+        "rollout/value_target_count": [2, 2, 2],
         "train/iteration": [2, 4, 5],
         "train/window_seconds": [601, 5, 5],
         "train/iteration_seconds": [300.5, 2.5, 5],
@@ -531,7 +531,7 @@ def test_value_loss_logging_omits_updates_without_targets(
                 loss=2.0 * updates_per_iteration + value_loss,  # ()
                 policy_loss=jnp.float32(2.0 * updates_per_iteration),  # ()
                 value_loss=value_loss,  # ()
-                value_updates=jnp.int32(has_targets and state.step < 4),  # ()
+                value_update_count=jnp.int32(has_targets and state.step < 4),  # ()
             ),
         )
 
@@ -583,7 +583,7 @@ def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: p
         return_value=(
             None,
             az.RolloutMetrics(
-                environment_steps=jnp.int32(2), completed_games=jnp.int32(1), value_positions=jnp.int32(2)
+                environment_steps=jnp.int32(2), completed_games=jnp.int32(1), value_target_count=jnp.int32(2)
             ),
         )
     )
@@ -686,7 +686,7 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
         return_value=(
             None,
             az.RolloutMetrics(
-                environment_steps=jnp.int32(2), completed_games=jnp.int32(1), value_positions=jnp.int32(2)
+                environment_steps=jnp.int32(2), completed_games=jnp.int32(1), value_target_count=jnp.int32(2)
             ),
         )
     )
