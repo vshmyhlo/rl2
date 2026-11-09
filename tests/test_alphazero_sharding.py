@@ -90,9 +90,11 @@ def test_sampling_uses_global_valid_positions_with_empty_shard(mesh: Mesh) -> No
     with jax.set_mesh(single):
         expected = az.sample_batch(batch, key, batch_size=8)
     with jax.set_mesh(mesh):
-        sampled = az.sample_batch(
-            jax.device_put(batch, PartitionSpec("batch")), jax.device_put(key, PartitionSpec()), batch_size=8
-        )
+        sharded_batch = jax.device_put(batch, PartitionSpec("batch"))  # Leaves: (B, T, ...).
+        counts = jax.jit(az.sampling_counts)(sharded_batch.policy_mask)  # (B * T,)
+        np.testing.assert_array_equal(counts, [0, 0, 0, 1, 1, 2])
+        assert counts.sharding == NamedSharding(mesh, PartitionSpec())
+        sampled = az.sample_batch(sharded_batch, jax.device_put(key, PartitionSpec()), batch_size=8, counts=counts)
     chex.assert_trees_all_equal(sampled, expected)
     np.testing.assert_array_equal(np.unique(sampled.value_targets), [3, 5])
     np.testing.assert_array_equal(sampled.value_mask, sampled.value_targets == 3)

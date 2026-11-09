@@ -22,27 +22,50 @@ from rl2.utils import mask_logits
     ],
 )
 def test_selection_uses_each_nodes_legal_actions(node: int, legal: list[bool], expected: int) -> None:
-    state = (
-        pgx.make("tic_tac_toe")
-        .init(jax.random.PRNGKey(0))
-        .replace(
-            legal_action_mask=jnp.array([True, False]),  # (A,)
-        )
-    )
-    root = az.SearchRoot(logits=jnp.array([100.0, 0.0]), value=jnp.float32(0.0), env_state=state)
+    env = pgx.make("tic_tac_toe")
+    state = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 1))  # Leaves: (1, ...)
+    state = state.replace(legal_action_mask=jnp.array([[True, False]]))  # (1, A)
+    root = az.SearchRoot(logits=jnp.array([[100.0, 0.0]]), value=jnp.zeros(1), env_state=state)
     tree = az.init_search_tree(root, 1)
     # Action 0 has the dominant score, but the child's own mask forbids it.
     tree = tree.replace(
-        node_visits=jnp.ones(2, jnp.int32),  # (N,)
-        node_logits=jnp.tile(root.logits, (2, 1)),  # (N, A)
+        node_visits=jnp.ones((1, 2), jnp.int32),  # (1, N)
+        node_logits=jnp.broadcast_to(root.logits[:, None], (1, 2, 2)),  # (1, N, A)
         node_env_states=tree.node_env_states.replace(
-            legal_action_mask=tree.node_env_states.legal_action_mask.at[node].set(jnp.array(legal)),  # (N, A)
-            terminated=tree.node_env_states.terminated.at[node].set(not any(legal)),  # (N,)
+            legal_action_mask=tree.node_env_states.legal_action_mask.at[0, node].set(jnp.array(legal)),  # (1, N, A)
+            terminated=tree.node_env_states.terminated.at[0, node].set(not any(legal)),  # (1, N)
         ),
     )
-    action = jax.jit(az.select_puct_action)(jax.random.PRNGKey(0), tree, jnp.int32(node))  # ()
-    assert action.shape == ()
-    assert action == expected
+    action = jax.jit(az.select_puct_action)(jax.random.PRNGKey(0)[None], tree, jnp.array([node]))  # (1,)
+    assert action.shape == (1,)
+    assert action[0] == expected
+
+
+def test_simulation_freezes_paths_at_different_depths() -> None:
+    env = pgx.make("tic_tac_toe")
+    states = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 3))  # Leaves: (B, ...)
+    states = states.replace(legal_action_mask=jnp.ones((3, 1), jnp.bool_))  # (B, A)
+    tree = az.init_search_tree(az.SearchRoot(env_state=states, logits=jnp.zeros((3, 1)), value=jnp.zeros(3)), 3)
+    tree = tree.replace(
+        children_indices=jnp.broadcast_to(jnp.array([1, 2, -1, -1])[None, :, None], (3, 4, 1)),  # (B, N, A)
+        node_env_states=tree.node_env_states.replace(
+            legal_action_mask=jnp.ones((3, 4, 1), jnp.bool_),  # (B, N, A)
+            terminated=tree.node_env_states.terminated.at[0, 0].set(True).at[1, 2].set(True),  # (B, N)
+        ),
+    )
+    keys = jax.random.split(jax.random.PRNGKey(1), 3)  # (B, 2)
+    result = jax.jit(az.simulate)(keys, tree)
+    # Finished root, terminal grandchild, and an unexpanded edge at depth two.
+    chex.assert_shape((result.node_index, result.action, result.child_index), (3,))
+    chex.assert_shape(result.key, (3, 2))
+    np.testing.assert_array_equal(result.node_index, [0, 1, 2])
+    np.testing.assert_array_equal(result.action, [0, 0, 0])
+    np.testing.assert_array_equal(result.child_index, [0, 2, -1])
+    expected_keys = [keys[0], keys[1], keys[2]]
+    for row, depth in ((1, 2), (2, 3)):
+        for _ in range(depth):
+            expected_keys[row] = jax.random.split(expected_keys[row])[0]  # (2,)
+    np.testing.assert_array_equal(result.key, jnp.stack(expected_keys))
 
 
 def test_backup_accumulates_returns_and_preserves_finished_rows() -> None:
@@ -53,7 +76,7 @@ def test_backup_accumulates_returns_and_preserves_finished_rows() -> None:
         value=jnp.zeros(3),  # (B,)
         env_state=env_states,  # Leaves: (B, ...)
     )
-    tree = jax.vmap(partial(az.init_search_tree, num_simulations=3))(root)
+    tree = az.init_search_tree(root, num_simulations=3)
     tree = tree.replace(
         parent_indices=jnp.tile(jnp.array([-1, 0, 1, 2]), (3, 1)),  # (B, N)
         parent_actions=jnp.tile(jnp.array([-1, 0, 1, 0]), (3, 1)),  # (B, N)
@@ -64,7 +87,7 @@ def test_backup_accumulates_returns_and_preserves_finished_rows() -> None:
     )
     # Paths of length zero, one, and three; the last stops bootstrapping at node 2.
     leaves = jnp.array([0, 1, 3], jnp.int32)  # (B,)
-    actual = jax.jit(jax.vmap(az.backup))(tree, leaves)
+    actual = jax.jit(az.backup)(tree, leaves)
     assert actual.node_values.shape == (3, 4)
     assert actual.children_values.shape == (3, 4, 2)
     np.testing.assert_array_equal(actual.node_visits, [[4, 3, 2, 1], [5, 3, 2, 1], [5, 4, 3, 1]])
@@ -88,12 +111,12 @@ def test_backup_accumulates_returns_and_preserves_finished_rows() -> None:
 
     chex.assert_trees_all_equal(jax.tree.map(first_game, actual), jax.tree.map(first_game, tree))
 
-    def last_game(leaf: jax.Array) -> jax.Array:  # (B, ...) -> (...)
-        return leaf[-1]  # (...)
+    def last_game(leaf: jax.Array) -> jax.Array:  # (B, ...) -> (1, ...)
+        return leaf[-1:]  # (1, ...)
 
-    single = jax.jit(az.backup)(jax.tree.map(last_game, tree), leaves[-1])
-    assert single.node_values.shape == (4,)
-    assert single.children_values.shape == (4, 2)
+    single = jax.jit(az.backup)(jax.tree.map(last_game, tree), leaves[-1:])
+    assert single.node_values.shape == (1, 4)
+    assert single.children_values.shape == (1, 4, 2)
     chex.assert_trees_all_close(single, jax.tree.map(last_game, actual), atol=1e-7)
 
 
@@ -108,32 +131,32 @@ def test_search_prefers_winning_actions_over_initial_priors(
         legal_action_mask=jnp.tile(jnp.array([True, True, False]), (2, 1)),  # (B, A)
     )
 
-    def predict(observations: jax.Array) -> tuple[jax.Array, jax.Array]:  # (*O,)
+    def predict(observations: jax.Array) -> tuple[jax.Array, jax.Array]:  # (B, *O)
         return (
-            jnp.array([0.0, 1.0, 100.0]),  # (A,)
-            jnp.float32(0.0),  # ()
+            jnp.broadcast_to(jnp.array([0.0, 1.0, 100.0]), (observations.shape[0], 3)),  # (B, A)
+            jnp.zeros(observations.shape[0]),  # (B,)
         )
 
     def transition(
         model: az.PolicyValueFn,
-        state: pgx.State,  # Leaves: (...)
-        action: jax.Array,  # ()
+        state: pgx.State,  # Leaves: (B, ...)
+        action: jax.Array,  # (B,)
         *,
         env: pgx.Env,
     ) -> az.SearchTransition:
-        logits, value = model(state.observation)  # (A,), ()
-        reward = jnp.where(action == state.current_player, 1.0, -1.0)  # ()
+        logits, value = model(state.observation)  # (B, A), (B,)
+        reward = jnp.where(action == state.current_player, 1.0, -1.0)  # (B,)
         return az.SearchTransition(
-            reward=jnp.where(state.terminated, 0.0, reward),  # ()
-            discount=jnp.zeros_like(value),  # ()
-            child_logits=mask_logits(logits, state.legal_action_mask),  # (A,)
-            child_value=value,  # ()
-            child_env_state=state.replace(terminated=jnp.ones_like(state.terminated)),  # Leaves: (...)
+            reward=jnp.where(state.terminated, 0.0, reward),  # (B,)
+            discount=jnp.zeros_like(value),  # (B,)
+            child_logits=mask_logits(logits, state.legal_action_mask),  # (B, A)
+            child_value=value,  # (B,)
+            child_env_state=state.replace(terminated=jnp.ones_like(state.terminated)),  # Leaves: (B, ...)
         )
 
     monkeypatch.setattr(az, "transition_step", transition)
-    search = partial(az.puct_policy, predict, env=env, num_simulations=16, temperature=temperature)
-    result = jax.jit(jax.vmap(search))(jax.random.split(jax.random.PRNGKey(0), 2), env_states)
+    search = partial(az.batched_puct_policy, predict, env=env, num_simulations=16, temperature=temperature)
+    result = jax.jit(search)(jax.random.split(jax.random.PRNGKey(0), 2), env_states)
     assert result.action.shape == (2,)
     assert result.action_weights.shape == (2, 3)
     assert result.tree.children_values.shape == (2, 17, 3)

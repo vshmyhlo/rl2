@@ -13,15 +13,14 @@ from numpy.typing import ArrayLike, NDArray
 
 
 def mask_logits(
-    logits: jax.Array,  # (A,)
-    valid: jax.Array,  # (A,)
-) -> jax.Array:  # (A,)
-    chex.assert_rank(logits, 1)
+    logits: jax.Array,  # (..., A)
+    valid: jax.Array,  # (..., A)
+) -> jax.Array:  # (..., A)
     chex.assert_shape(valid, logits.shape)
     # Finite masking also keeps terminal nodes with no legal moves well-defined.
     minimum = jnp.finfo(jnp.float32).min
-    logits = jnp.where(valid, logits, minimum)  # (A,)
-    return jnp.where(valid, logits - logits.max(), minimum)  # (A,)
+    logits = jnp.where(valid, logits, minimum)  # (..., A)
+    return jnp.where(valid, logits - logits.max(axis=-1, keepdims=True), minimum)  # (..., A)
 
 
 @jax.jit

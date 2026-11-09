@@ -44,14 +44,14 @@ def test_puct_prepares_root_predictions(noise_fraction: float) -> None:
         ),  # (B, A)
     )
 
-    def predict(observations: jax.Array) -> tuple[jax.Array, jax.Array]:  # (*O,)
+    def predict(observations: jax.Array) -> tuple[jax.Array, jax.Array]:  # (B, *O)
         return (
-            jnp.array([0.0, -200.0, *([1000.0] * 7)]),  # (A,)
-            jnp.float32(0.75),  # ()
+            jnp.broadcast_to(jnp.array([0.0, -200.0, *([1000.0] * 7)]), (observations.shape[0], 9)),  # (B, A)
+            jnp.full(observations.shape[0], 0.75),  # (B,)
         )
 
     search = partial(
-        az.puct_policy,
+        az.batched_puct_policy,
         predict,
         env=env,
         num_simulations=0,
@@ -59,7 +59,7 @@ def test_puct_prepares_root_predictions(noise_fraction: float) -> None:
         dirichlet_alpha=0.3,
         dirichlet_fraction=noise_fraction,
     )
-    result = jax.jit(jax.vmap(search))(jax.random.split(jax.random.PRNGKey(1), 3), states)
+    result = jax.jit(search)(jax.random.split(jax.random.PRNGKey(1), 3), states)
     tree = result.tree
     assert tree.node_logits.shape == (3, 1, 9)
     assert tree.node_values.shape == (3, 1)
@@ -116,10 +116,12 @@ def test_transition_step_finished_nodes_do_not_repeat_reward_or_bootstrap() -> N
         legal_action_mask=states.legal_action_mask.at[1, 0].set(False),
     )
 
-    def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (*O,)
-        return jnp.arange(9, dtype=jnp.float32), jnp.float32(0.5)  # (A,), ()
+    def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (B, *O)
+        return jnp.broadcast_to(jnp.arange(9, dtype=jnp.float32), (observation.shape[0], 9)), jnp.full(
+            observation.shape[0], 0.5
+        )  # (B, A), (B,)
 
-    step = jax.jit(jax.vmap(partial(transition_step, predict, env=env)))
+    step = jax.jit(partial(transition_step, predict, env=env))
     output = step(states, jnp.zeros(2, jnp.int32))
     child_states = output.child_env_state  # Leaves: (B, ...)
     np.testing.assert_array_equal(output.reward, [0, 0])
@@ -137,9 +139,9 @@ def test_transition_step_finished_nodes_do_not_repeat_reward_or_bootstrap() -> N
 @pytest.mark.parametrize(
     ("logits_shape", "value_shape"),
     [
-        pytest.param((9,), (1,), id="batched-value"),
-        pytest.param((1, 9), (), id="batched-policy"),
-        pytest.param((1,), (), id="wrong-action-count"),
+        pytest.param((9,), (1,), id="unbatched-policy"),
+        pytest.param((1, 9), (), id="unbatched-value"),
+        pytest.param((1, 1), (1,), id="wrong-action-count"),
     ],
 )
 def test_transition_step_rejects_malformed_predictions(
@@ -153,7 +155,7 @@ def test_transition_step_rejects_malformed_predictions(
 
     step = jax.jit(partial(transition_step, predict, env=env))
     with pytest.raises(AssertionError, match="shape"):
-        step(state, jnp.int32(0))
+        step(jax.tree.map(partial(jnp.expand_dims, axis=0), state), jnp.array([0]))
 
 
 @pytest.mark.parametrize(
@@ -177,36 +179,37 @@ def test_local_puct_terminal_rewards_and_nested_state_shapes(
         legal_action_mask=jnp.array([[True, False], [False, False]]),  # (B, A)
     )  # Leaves: (B, ...).
 
-    def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (*O,)
-        return jnp.zeros(2), jnp.float32(0.25)  # (A,), ()
+    def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (B, *O)
+        return jnp.zeros((observation.shape[0], 2)), jnp.full(observation.shape[0], 0.25)  # (B, A), (B,)
 
     def transition(
         model: az.PolicyValueFn,
-        env_state: pgx.State,  # Leaves: (...)
-        action: jax.Array,  # ()
+        env_state: pgx.State,  # Leaves: (B, ...)
+        action: jax.Array,  # (B,)
         *,
         env: pgx.Env,
     ) -> az.SearchTransition:
-        logits, value = model(env_state.observation)  # (A,), ()
+        logits, value = model(env_state.observation)  # (B, A), (B,)
         return az.SearchTransition(
-            reward=(~(env_state.terminated | env_state.truncated)).astype(jnp.float32),  # ()
-            discount=jnp.zeros_like(value),  # ()
-            child_logits=logits,  # (A,)
-            child_value=jnp.float32(0.0),  # ()
+            reward=(~(env_state.terminated | env_state.truncated)).astype(jnp.float32),  # (B,)
+            discount=jnp.zeros_like(value),  # (B,)
+            child_logits=logits,  # (B, A)
+            child_value=jnp.zeros_like(value),  # (B,)
             child_env_state=env_state.replace(
-                terminated=jnp.bool_(not truncated), truncated=jnp.bool_(truncated)
-            ),  # Leaves: (...)
+                terminated=jnp.full_like(env_state.terminated, not truncated),
+                truncated=jnp.full_like(env_state.truncated, truncated),
+            ),  # Leaves: (B, ...)
         )
 
     monkeypatch.setattr(az, "transition_step", transition)
     search = partial(
-        az.puct_policy,
+        az.batched_puct_policy,
         predict,
         env=env,
         num_simulations=simulations,
         temperature=temperature,
     )
-    result = jax.jit(jax.vmap(search))(jax.random.split(jax.random.PRNGKey(0), 2), env_states)
+    result = jax.jit(search)(jax.random.split(jax.random.PRNGKey(0), 2), env_states)
     tree = result.tree
     assert result.action.shape == (2,)
     assert result.action_weights.shape == (2, 2)
@@ -245,23 +248,25 @@ def test_search_expands_chain_until_finished(terminal_depth: int | None, monkeyp
 
     def transition(
         model: az.PolicyValueFn,
-        env_state: pgx.State,  # Leaves: (...).
-        action: jax.Array,  # ()
+        env_state: pgx.State,  # Leaves: (B, ...).
+        action: jax.Array,  # (B,)
         *,
         env: pgx.Env,
     ) -> az.SearchTransition:
-        child_depth = env_state._step_count + 1  # ()
+        child_depth = env_state._step_count + 1  # (B,)
         child_env_state = env_state.replace(
-            _step_count=child_depth,  # ()
-            terminated=jnp.bool_(False) if terminal_depth is None else child_depth >= terminal_depth,  # ()
-        )  # Leaves: (...)
-        logits, value = model(child_env_state.observation)  # (A,), ()
+            _step_count=child_depth,  # (B,)
+            terminated=jnp.zeros_like(child_depth, dtype=jnp.bool_)
+            if terminal_depth is None
+            else child_depth >= terminal_depth,  # (B,)
+        )  # Leaves: (B, ...)
+        logits, value = model(child_env_state.observation)  # (B, A), (B,)
         return az.SearchTransition(
-            reward=jnp.zeros_like(value),  # ()
-            discount=jnp.where(child_env_state.terminated, 0.0, 1.0),  # ()
-            child_logits=logits,  # (A,)
-            child_value=value,  # ()
-            child_env_state=child_env_state,  # Leaves: (...)
+            reward=jnp.zeros_like(value),  # (B,)
+            discount=jnp.where(child_env_state.terminated, 0.0, 1.0),  # (B,)
+            child_logits=logits,  # (B, A)
+            child_value=value,  # (B,)
+            child_env_state=child_env_state,  # Leaves: (B, ...)
         )
 
     monkeypatch.setattr(az, "transition_step", transition)

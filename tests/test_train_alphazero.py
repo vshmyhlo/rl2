@@ -89,7 +89,12 @@ def test_prepare_logits_uses_only_legal_actions(fraction: float, monkeypatch: py
     # Most Gamma mass is on illegal actions; it must not dilute the noise weight.
     loggamma = Mock(return_value=jnp.log(jnp.array([1, 3, 1000, 1000], jnp.float32)))
     monkeypatch.setattr(az.jax.random, "loggamma", loggamma)
-    prepare = partial(az.prepare_logits, dirichlet_alpha=0.3, dirichlet_fraction=fraction)
+
+    def prepare(logits: jax.Array, legal: jax.Array, key: jax.Array) -> jax.Array:  # (A,), (A,), (2,) -> (A,)
+        return az.prepare_logits(
+            logits[None], legal[None], key[None], dirichlet_alpha=0.3, dirichlet_fraction=fraction
+        )[0]  # (A,)
+
     noisy = prepare(logits, legal, jax.random.PRNGKey(0))  # (A,)
     assert noisy.shape == (4,)
     assert noisy.dtype == jnp.float32
@@ -132,7 +137,16 @@ def test_outcomes_use_player_ids_and_adjudicate_move_limit_draws(
         current_player=jnp.array([1, 0, 1]),  # (T,)
         policy_mask=jnp.array(policy_mask),  # (T,)
     )
-    monkeypatch.setattr(jax.lax, "scan", Mock(return_value=(state, rollout)))
+    monkeypatch.setattr(
+        jax.lax,
+        "scan",
+        Mock(
+            return_value=(
+                jax.tree.map(partial(jnp.expand_dims, axis=0), state),
+                jax.tree.map(partial(jnp.expand_dims, axis=1), rollout),
+            )
+        ),
+    )
     batch, metrics = az.collect_one_game({}, jax.random.PRNGKey(0), env=env, apply_fn=Mock(), config=config)
     chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (3,))
     np.testing.assert_array_equal(batch.observation, rollout.observation)
@@ -162,12 +176,12 @@ def test_selfplay_skips_finished_moves(truncated: bool, monkeypatch: pytest.Monk
     )  # Leaves: (...), (A,), ()
     policy = Mock(
         return_value=az.PolicyOutput(
-            action=jnp.int32(0),  # ()
-            action_weights=jax.nn.one_hot(0, env.num_actions),  # (A,)
-            tree=az.init_search_tree(root, 0),  # Leaves: (N, ...)
+            action=jnp.array([0], jnp.int32),  # (1,)
+            action_weights=jax.nn.one_hot(jnp.array([0]), env.num_actions),  # (1, A)
+            tree=az.init_search_tree(jax.tree.map(partial(jnp.expand_dims, axis=0), root), 0),  # Leaves: (N, ...)
         )
     )
-    monkeypatch.setattr(az, "puct_policy", policy)
+    monkeypatch.setattr(az, "batched_puct_policy", policy)
     # Eager control flow distinguishes executing a branch from tracing it.
     with jax.disable_jit():
         batch, metrics = az.collect_one_game(
@@ -199,14 +213,10 @@ def test_transition_step_terminal_reward_and_opponent_discount(
     def duplicate(x: jax.Array) -> jax.Array:
         return jnp.stack((x, x))
 
-    def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (*O,) -> (A,), ()
-        logits, value = model.apply({"params": params}, observation[None])  # (1, A), (1,)
-        chex.assert_rank(logits, 2)
-        chex.assert_shape(logits, (1, logits.shape[-1]))
-        chex.assert_shape(value, (1,))
-        return logits[0], value[0]  # (A,), ()
+    def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (B, *O) -> (B, A), (B,)
+        return model.apply({"params": params}, observation)
 
-    output = jax.jit(jax.vmap(partial(az.transition_step, predict, env=env)))(
+    output = jax.jit(partial(az.transition_step, predict, env=env))(
         jax.tree.map(duplicate, state), jnp.array([2, 8], jnp.int32)
     )
     child_states = output.child_env_state  # Leaves: (B, ...)
@@ -242,7 +252,13 @@ def test_collect_selfplay_matches_independent_games(
         return jnp.stack(leaves)  # (B, ...)
 
     expected_batch, per_game_metrics = jax.tree.map(stack, *games)
-    batch, metrics = az.collect_selfplay(params, key, env=env, apply_fn=model.apply, config=config)
+
+    def batched_apply(variables: dict[str, az.Parameters], observation: jax.Array) -> tuple[jax.Array, jax.Array]:
+        # Inference must see the full local game batch, including inside search.
+        chex.assert_shape(observation, (config.num_envs, 3, 3, 2))  # (B, *O)
+        return model.apply(variables, observation)  # (B, A), (B,)
+
+    batch, metrics = az.collect_selfplay(params, key, env=env, apply_fn=batched_apply, config=config)
     chex.assert_trees_all_close(batch, expected_batch, atol=1e-6)
     chex.assert_trees_all_equal(metrics, jax.tree.map(jnp.sum, per_game_metrics))
     assert games[0][0].observation.shape == (2, 3, 3, 2)

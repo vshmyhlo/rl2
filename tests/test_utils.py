@@ -12,9 +12,10 @@ def test_mask_logits() -> None:
     # A large illegal logit must not erase differences between legal logits.
     logits = jnp.array([[1.0, 1e8, 2.0], [0.0, 0.0, 0.0]], jnp.float32)  # (B, A)
     legal = jnp.array([[True, False, True], [False, False, False]])  # (B, A)
-    masked = jax.vmap(utils.mask_logits)(logits, legal)  # (B, A)
+    masked = utils.mask_logits(logits, legal)  # (B, A)
     assert masked.shape == logits.shape
     assert masked.dtype == jnp.float32
+    np.testing.assert_array_equal(utils.mask_logits(logits[0], legal[0]), masked[0])
     probs = jax.nn.softmax(masked)  # (B, A)
     np.testing.assert_allclose(probs, [[1 / (1 + np.e), 0, 1 / (1 + np.exp(-1))], [1 / 3] * 3], rtol=1e-6)
 

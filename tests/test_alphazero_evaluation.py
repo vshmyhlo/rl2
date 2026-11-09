@@ -125,7 +125,10 @@ def test_search_uses_acting_network_and_greedy_legal_action(monkeypatch: pytest.
         return ev.train.PolicyOutput(
             action=jnp.int32(8),  # ()
             action_weights=weights,  # (A,)
-            tree=ev.train.init_search_tree(root, 0),
+            tree=jax.tree.map(
+                partial(jnp.squeeze, axis=0),
+                ev.train.init_search_tree(jax.tree.map(partial(jnp.expand_dims, axis=0), root), 0),
+            ),
         )
 
     monkeypatch.setattr(ev.train, "puct_policy", search)
