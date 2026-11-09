@@ -63,12 +63,19 @@ def play_game(
             return jnp.where(env_state.current_player == candidate_player, candidate, opponent)
 
         params = jax.tree.map(choose, candidate_params, opponent_params)
-        predict = partial(train.predict_observation, params, apply_fn=apply_fn)
+
+        def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (*O,) -> (A,), ()
+            logits, value = apply_fn({"params": params}, observation[None])  # (1, A), (1,)
+            chex.assert_rank(logits, 2)
+            chex.assert_shape(logits, (1, logits.shape[-1]))
+            chex.assert_shape(value, (1,))
+            return logits[0], value[0]  # (A,), ()
+
         policy = train.puct_policy(
             predict,
             jax.random.fold_in(key, move),
             env_state,
-            partial(train.recurrent_step, env=env),
+            partial(train.transition_step, env=env),
             num_simulations,
             temperature=0.0,
         )

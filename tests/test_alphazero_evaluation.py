@@ -105,7 +105,7 @@ def test_search_uses_acting_network_and_greedy_legal_action(monkeypatch: pytest.
         predict: PolicyValueFn,
         key: jax.Array,  # (2,)
         env_state: pgx.State,  # Leaves: (...)
-        recurrent_fn: ev.train.RecurrentFn,
+        transition_fn: ev.train.TransitionFn,
         num_simulations: int,
         **kwargs: Any,
     ) -> ev.train.PolicyOutput:

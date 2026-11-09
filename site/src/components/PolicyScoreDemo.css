@@ -1,0 +1,27 @@
+.policy-score-demo .policy-score-controls { display: grid; gap: 1rem; margin-top: 1rem; }
+.policy-score-demo .policy-score-controls label { display: grid; grid-template-columns: 1fr auto auto; gap: 0.2rem 0.5rem; align-items: baseline; }
+.policy-score-demo .policy-score-controls input, .policy-score-demo .policy-score-controls small { grid-column: 1 / -1; }
+.policy-score-demo .policy-score-controls small { color: var(--puct-muted); }
+.policy-score-demo .policy-score-controls output { min-width: 3rem; text-align: right; font-weight: 650; }
+.policy-score-demo .policy-score-equation { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; padding: 1rem; margin-top: 1.25rem; border-radius: 0.4rem; background: #f3f2ee; font-variant-numeric: tabular-nums; }
+.policy-score-demo .policy-score-equation > span { text-align: center; }
+.policy-score-demo .policy-score-equation small { display: block; color: var(--puct-muted); font-size: 0.75rem; }
+.policy-score-demo .policy-score-result { color: var(--puct-accent); font-size: 1.15rem; font-weight: 650; }
+.policy-score-demo .policy-score-chart { overflow-x: auto; }
+.policy-score-demo svg { display: block; width: 100%; min-width: 540px; }
+.policy-score-demo svg text { font: 12px system-ui, sans-serif; fill: #454750; }
+.policy-score-demo .policy-score-grid { stroke: var(--puct-line); }
+.policy-score-demo .policy-score-guide { stroke: var(--puct-accent); stroke-dasharray: 3 3; }
+.policy-score-demo .policy-score-point { fill: var(--puct-accent); stroke: #fffefa; stroke-width: 1.5; }
+.policy-score-demo .policy-score-reading { font-variant-numeric: tabular-nums; }
+.policy-score-demo .policy-score-range { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 1rem 0; }
+.policy-score-demo .policy-score-surface-faces polygon { stroke: #6977a3; stroke-width: 0.3; cursor: crosshair; }
+.policy-score-demo .policy-score-surface-faces polygon:hover { stroke: var(--puct-accent); stroke-width: 1.5; }
+.policy-score-demo .policy-score-axis { fill: none; stroke: #64656c; stroke-width: 1; }
+.policy-score-demo .policy-score-invalid-label { fill: var(--puct-muted); font-size: 11px; }
+.policy-score-demo .policy-score-color-key { display: flex; align-items: center; justify-content: center; gap: 0.5rem; font-size: 0.75rem; }
+.policy-score-demo .policy-score-color-ramp { width: 8rem; height: 0.7rem; background: linear-gradient(to right, #e7eaf5, #485689); }
+.policy-score-demo .policy-score-scroll-hint { display: none; color: var(--puct-muted); font-size: 0.75rem; }
+@media (max-width: 620px) {
+  .policy-score-demo .policy-score-scroll-hint { display: block; }
+}

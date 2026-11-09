@@ -39,14 +39,14 @@ def tiny_model() -> tuple[pgx.Env, az.PolicyValueNet, az.Parameters]:
 
 def test_sample_batch_excludes_padding() -> None:
     batch = az.Batch(
-        observations=jnp.zeros((1, 2, 3, 3, 2), jnp.float32),  # (B, T, *O)
-        policy_targets=jnp.full((1, 2, 9), 1 / 9, jnp.float32),  # (B, T, A)
+        observation=jnp.zeros((1, 2, 3, 3, 2), jnp.float32),  # (B, T, *O)
+        action_weights=jnp.full((1, 2, 9), 1 / 9, jnp.float32),  # (B, T, A)
         value_targets=jnp.array([[1.0, -1.0]], jnp.float32),  # (B, T)
         policy_mask=jnp.array([[True, False]]),  # (B, T)
         value_mask=jnp.array([[True, False]]),  # (B, T)
     )
     sampled = az.sample_batch(batch, jax.random.PRNGKey(0), batch_size=4)
-    assert sampled.observations.shape == (4, 3, 3, 2)
+    assert sampled.observation.shape == (4, 3, 3, 2)
     assert sampled.policy_mask.all()
     assert sampled.value_mask.all()
     np.testing.assert_array_equal(sampled.value_targets, np.ones(4))
@@ -56,19 +56,19 @@ def test_sample_batch_sparse_positions_preserves_fields() -> None:
     # Leading, interior, and trailing padding; valid targets have distinct labels.
     labels = jnp.arange(6, dtype=jnp.float32).reshape(2, 3)  # (B, T)
     batch = az.Batch(
-        observations=labels[..., None, None, None],  # (B, T, 1, 1, 1)
-        policy_targets=labels[..., None],  # (B, T, 1)
+        observation=labels[..., None, None, None],  # (B, T, 1, 1, 1)
+        action_weights=labels[..., None],  # (B, T, 1)
         value_targets=labels,  # (B, T)
         policy_mask=jnp.array([[False, True, False], [True, False, False]]),  # (B, T)
         value_mask=jnp.array([[False, True, False], [False, False, False]]),  # (B, T)
     )
     sampled = az.sample_batch(batch, jax.random.PRNGKey(0), batch_size=128)
-    assert sampled.observations.shape == (128, 1, 1, 1)
-    assert sampled.policy_targets.shape == (128, 1)
+    assert sampled.observation.shape == (128, 1, 1, 1)
+    assert sampled.action_weights.shape == (128, 1)
     chex.assert_shape((sampled.value_targets, sampled.policy_mask, sampled.value_mask), (128,))
     assert sampled.policy_mask.all()
-    np.testing.assert_array_equal(sampled.observations[:, 0, 0, 0], sampled.value_targets)
-    np.testing.assert_array_equal(sampled.policy_targets[:, 0], sampled.value_targets)
+    np.testing.assert_array_equal(sampled.observation[:, 0, 0, 0], sampled.value_targets)
+    np.testing.assert_array_equal(sampled.action_weights[:, 0], sampled.value_targets)
     np.testing.assert_array_equal(sampled.value_mask, sampled.value_targets == 1)
     labels, counts = np.unique(sampled.value_targets, return_counts=True)
     np.testing.assert_array_equal(labels, [1, 3])
@@ -132,16 +132,16 @@ def test_outcomes_use_player_ids_and_adjudicate_move_limit_draws(
         truncated=jnp.bool_(truncated),  # ()
     )
     rollout = az.SelfplayStep(
-        observations=jnp.zeros((3, 3, 3, 2)),  # (T, *O)
-        policy_targets=jax.nn.one_hot(jnp.arange(3), env.num_actions),  # (T, A)
-        player_ids=jnp.array([1, 0, 1]),  # (T,)
+        observation=jnp.zeros((3, 3, 3, 2)),  # (T, *O)
+        action_weights=jax.nn.one_hot(jnp.arange(3), env.num_actions),  # (T, A)
+        current_player=jnp.array([1, 0, 1]),  # (T,)
         policy_mask=jnp.array(policy_mask),  # (T,)
     )
     monkeypatch.setattr(jax.lax, "scan", Mock(return_value=(state, rollout)))
     batch, metrics = az.collect_one_game({}, jax.random.PRNGKey(0), env=env, apply_fn=Mock(), config=config)
     chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (3,))
-    np.testing.assert_array_equal(batch.observations, rollout.observations)
-    np.testing.assert_array_equal(batch.policy_targets, rollout.policy_targets)
+    np.testing.assert_array_equal(batch.observation, rollout.observation)
+    np.testing.assert_array_equal(batch.action_weights, rollout.action_weights)
     np.testing.assert_array_equal(batch.value_targets, expected)
     np.testing.assert_array_equal(batch.value_mask, jnp.array(policy_mask) & ~jnp.bool_(truncated))
     np.testing.assert_array_equal(batch.policy_mask, policy_mask)
@@ -150,7 +150,7 @@ def test_outcomes_use_player_ids_and_adjudicate_move_limit_draws(
     assert metrics.completed_games == int(not truncated)
 
 
-def test_recurrent_step_terminal_reward_and_opponent_discount(
+def test_transition_step_terminal_reward_and_opponent_discount(
     tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Parameters],
 ) -> None:
     env, model, params = tiny_model
@@ -162,23 +162,29 @@ def test_recurrent_step_terminal_reward_and_opponent_discount(
     def duplicate(x: jax.Array) -> jax.Array:
         return jnp.stack((x, x))
 
-    predict = partial(az.predict_observation, params, apply_fn=model.apply)
-    output = jax.jit(jax.vmap(partial(az.recurrent_step, predict, env=env)))(
-        jnp.array([2, 8], jnp.int32), jax.tree.map(duplicate, state)
+    def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (*O,) -> (A,), ()
+        logits, value = model.apply({"params": params}, observation[None])  # (1, A), (1,)
+        chex.assert_rank(logits, 2)
+        chex.assert_shape(logits, (1, logits.shape[-1]))
+        chex.assert_shape(value, (1,))
+        return logits[0], value[0]  # (A,), ()
+
+    output = jax.jit(jax.vmap(partial(az.transition_step, predict, env=env)))(
+        jax.tree.map(duplicate, state), jnp.array([2, 8], jnp.int32)
     )
-    next_states = output.env_state  # Leaves: (B, ...)
-    chex.assert_shape((output.reward, output.discount, output.value), (2,))
-    chex.assert_shape(output.logits, (2, env.num_actions))
-    chex.assert_shape(next_states.observation, (2, *state.observation.shape))
-    chex.assert_shape(next_states.legal_action_mask, (2, env.num_actions))
-    np.testing.assert_array_equal(next_states.terminated, [True, False])
+    child_states = output.child_env_state  # Leaves: (B, ...)
+    chex.assert_shape((output.reward, output.discount, output.child_value), (2,))
+    chex.assert_shape(output.child_logits, (2, env.num_actions))
+    chex.assert_shape(child_states.observation, (2, *state.observation.shape))
+    chex.assert_shape(child_states.legal_action_mask, (2, env.num_actions))
+    np.testing.assert_array_equal(child_states.terminated, [True, False])
     np.testing.assert_array_equal(output.reward, [1, 0])
     np.testing.assert_array_equal(output.discount, [0, -1])
-    assert output.value[0] == 0
-    _, expected_values = model.apply({"params": params}, next_states.observation)
-    np.testing.assert_allclose(output.value[1], expected_values[1], atol=1e-7)
-    probs = jax.nn.softmax(output.logits)
-    assert np.all(np.asarray(probs[1])[~np.asarray(next_states.legal_action_mask[1])] == 0)
+    assert output.child_value[0] == 0
+    _, expected_values = model.apply({"params": params}, child_states.observation)
+    np.testing.assert_allclose(output.child_value[1], expected_values[1], atol=1e-7)
+    probs = jax.nn.softmax(output.child_logits)
+    assert np.all(np.asarray(probs[1])[~np.asarray(child_states.legal_action_mask[1])] == 0)
 
 
 def test_collect_selfplay_matches_independent_games(
@@ -198,11 +204,11 @@ def test_collect_selfplay_matches_independent_games(
     batch, metrics = az.collect_selfplay(params, key, env=env, apply_fn=model.apply, config=config)
     chex.assert_trees_all_close(batch, expected_batch, atol=1e-6)
     chex.assert_trees_all_equal(metrics, jax.tree.map(jnp.sum, per_game_metrics))
-    assert games[0][0].observations.shape == (2, 3, 3, 2)
-    assert games[0][0].policy_targets.shape == (2, 9)
+    assert games[0][0].observation.shape == (2, 3, 3, 2)
+    assert games[0][0].action_weights.shape == (2, 9)
     chex.assert_shape((games[0][0].value_targets, games[0][0].policy_mask, games[0][0].value_mask), (2,))
     chex.assert_shape(games[0][1], ())
-    assert batch.observations.shape == (2, 2, 3, 3, 2)
+    assert batch.observation.shape == (2, 2, 3, 3, 2)
     chex.assert_shape(metrics, ())
 
 
@@ -218,19 +224,19 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
     )
     batch, metrics = az.collect_selfplay(params, jax.random.PRNGKey(2), env=env, apply_fn=model.apply, config=config)
     size = config.max_moves * config.num_envs
-    chex.assert_shape(batch.observations, (config.num_envs, config.max_moves, 3, 3, 2))
-    chex.assert_shape(batch.policy_targets, (config.num_envs, config.max_moves, 9))
+    chex.assert_shape(batch.observation, (config.num_envs, config.max_moves, 3, 3, 2))
+    chex.assert_shape(batch.action_weights, (config.num_envs, config.max_moves, 9))
     chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (config.num_envs, config.max_moves))
-    chex.assert_type((batch.observations, batch.policy_targets, batch.value_targets), jnp.float32)
+    chex.assert_type((batch.observation, batch.action_weights, batch.value_targets), jnp.float32)
     chex.assert_type((batch.policy_mask, batch.value_mask), jnp.bool_)
     assert metrics.completed_games == 2
     assert 10 <= metrics.environment_steps <= 18
     np.testing.assert_array_equal(batch.value_mask, batch.policy_mask)
     assert not batch.policy_mask[:, -1].any()
-    np.testing.assert_allclose(batch.policy_targets.sum(-1), 1.0)
-    occupied = np.asarray(batch.observations).any(axis=-1).reshape(config.num_envs, config.max_moves, 9)  # (B, T, A)
+    np.testing.assert_allclose(batch.action_weights.sum(-1), 1.0)
+    occupied = np.asarray(batch.observation).any(axis=-1).reshape(config.num_envs, config.max_moves, 9)  # (B, T, A)
     real_positions = np.asarray(batch.policy_mask)  # (B, T)
-    assert np.all(np.asarray(batch.policy_targets)[occupied & real_positions[..., None]] == 0)
+    assert np.all(np.asarray(batch.action_weights)[occupied & real_positions[..., None]] == 0)
     # Every valid move has the game's result, alternating with the player to move.
     for game in range(config.num_envs):
         game_mask = real_positions[game]  # (T,)
@@ -241,7 +247,7 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
     state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(1e-3))
     updated, _, losses = az.train_step(state, jax.random.PRNGKey(0), batch, batch_size=4, updates_per_iteration=1)
     assert updated.step == 1
-    assert isinstance(losses, az.TrainMetrics)
+    assert isinstance(losses, az.UpdateMetrics)
     chex.assert_shape(losses, ())
     assert losses.value_update_count == 1
     assert all(np.isfinite(value) for value in losses)
@@ -270,8 +276,8 @@ def test_chess_search_smoke() -> None:
     observation = env.init(jax.random.PRNGKey(0)).observation[None]  # (1, 8, 8, 119)
     params = model.init(jax.random.PRNGKey(0), observation)["params"]
     batch, metrics = az.collect_selfplay(params, jax.random.PRNGKey(0), env=env, apply_fn=model.apply, config=config)
-    assert batch.observations.shape == (1, 1, *observation.shape[1:])
-    assert batch.policy_targets.shape == (1, 1, 4672)
+    assert batch.observation.shape == (1, 1, *observation.shape[1:])
+    assert batch.action_weights.shape == (1, 1, 4672)
     assert metrics.environment_steps == 1
     chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (1, 1))
     assert metrics.completed_games == 1
@@ -280,8 +286,8 @@ def test_chess_search_smoke() -> None:
     assert batch.policy_mask.all()
     np.testing.assert_array_equal(batch.value_targets, [[0.0]])
     legal = env.init(jax.random.PRNGKey(0)).legal_action_mask  # (4672,)
-    assert np.all(np.asarray(batch.policy_targets[0, 0])[~np.asarray(legal)] == 0)
-    np.testing.assert_allclose(batch.policy_targets.sum(), 1.0)
+    assert np.all(np.asarray(batch.action_weights[0, 0])[~np.asarray(legal)] == 0)
+    np.testing.assert_allclose(batch.action_weights.sum(), 1.0)
 
 
 def test_main_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -374,14 +380,14 @@ def logging_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> az.Config
         *,
         batch_size: int,
         updates_per_iteration: int,
-    ) -> tuple[TrainState, jax.Array, az.TrainMetrics]:
+    ) -> tuple[TrainState, jax.Array, az.UpdateMetrics]:
         loss = jnp.float32(updates_per_iteration * (2 * state.step + updates_per_iteration))  # ()
         for _ in range(updates_per_iteration):
             key, _ = jax.random.split(key)  # Each: (2,)
         return (
             state.replace(step=state.step + updates_per_iteration),
             key,  # (2,)
-            az.TrainMetrics(
+            az.UpdateMetrics(
                 loss=loss,  # ()
                 policy_loss=loss,  # ()
                 value_loss=jnp.float32(0),  # ()
@@ -417,7 +423,7 @@ def test_mlflow_progress(
         *,
         batch_size: int,
         updates_per_iteration: int,
-    ) -> tuple[TrainState, jax.Array, az.TrainMetrics]:
+    ) -> tuple[TrainState, jax.Array, az.UpdateMetrics]:
         nonlocal clock
         clock += durations[state.step // updates_per_iteration]
         return original_step(state, key, batch, batch_size=batch_size, updates_per_iteration=updates_per_iteration)
@@ -432,7 +438,7 @@ def test_mlflow_progress(
 
     def get_metrics(metrics: az.WindowMetrics) -> chex.ArrayTree:  # Scalar leaves: () -> ().
         assert isinstance(metrics, az.WindowMetrics)
-        assert isinstance(metrics.update_metrics, az.TrainMetrics)
+        assert isinstance(metrics.update_metrics, az.UpdateMetrics)
         chex.assert_shape(jax.tree.leaves(metrics), ())
         transfers.append(az.collect_selfplay.call_count)
         return device_get(metrics)
@@ -522,12 +528,12 @@ def test_value_loss_logging_omits_updates_without_targets(
         *,
         batch_size: int,
         updates_per_iteration: int,
-    ) -> tuple[TrainState, jax.Array, az.TrainMetrics]:
+    ) -> tuple[TrainState, jax.Array, az.UpdateMetrics]:
         value_loss = jnp.float32(sum(next(losses) for _ in range(updates_per_iteration)))  # ()
         return (
             state.replace(step=state.step + updates_per_iteration),
             key,  # (2,)
-            az.TrainMetrics(
+            az.UpdateMetrics(
                 loss=2.0 * updates_per_iteration + value_loss,  # ()
                 policy_loss=jnp.float32(2.0 * updates_per_iteration),  # ()
                 value_loss=value_loss,  # ()
@@ -568,7 +574,7 @@ def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: p
         *,
         batch_size: int,
         updates_per_iteration: int,
-    ) -> tuple[TrainState, jax.Array, az.TrainMetrics]:
+    ) -> tuple[TrainState, jax.Array, az.UpdateMetrics]:
         nonlocal clock, interrupted
         if state.step == 2 and not interrupted:
             interrupted = True
@@ -657,7 +663,7 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
         *,
         batch_size: int,
         updates_per_iteration: int,
-    ) -> tuple[TrainState, jax.Array, az.TrainMetrics]:
+    ) -> tuple[TrainState, jax.Array, az.UpdateMetrics]:
         nonlocal clock
         clock += 1.0
         state, key, metrics = original_step(

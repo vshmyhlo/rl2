@@ -63,7 +63,7 @@ def test_backup_accumulates_returns_and_preserves_finished_rows() -> None:
     )
     # Paths of length zero, one, and three; the last stops bootstrapping at node 2.
     leaves = jnp.array([0, 1, 3], jnp.int32)  # (B,)
-    actual = jax.jit(jax.vmap(az.backward))(tree, leaves)
+    actual = jax.jit(jax.vmap(az.backup))(tree, leaves)
     assert actual.node_values.shape == (3, 4)
     assert actual.children_values.shape == (3, 4, 2)
     np.testing.assert_array_equal(actual.node_visits, [[4, 3, 2, 1], [5, 3, 2, 1], [5, 4, 3, 1]])
@@ -90,7 +90,7 @@ def test_backup_accumulates_returns_and_preserves_finished_rows() -> None:
     def last_game(leaf: jax.Array) -> jax.Array:  # (B, ...) -> (...)
         return leaf[-1]  # (...)
 
-    single = jax.jit(az.backward)(jax.tree.map(last_game, tree), leaves[-1])
+    single = jax.jit(az.backup)(jax.tree.map(last_game, tree), leaves[-1])
     assert single.node_values.shape == (4,)
     assert single.children_values.shape == (4, 2)
     chex.assert_trees_all_close(single, jax.tree.map(last_game, actual), atol=1e-7)
@@ -110,22 +110,22 @@ def test_search_prefers_winning_actions_over_initial_priors(temperature: float) 
             jnp.float32(0.0),  # ()
         )
 
-    def recurrent(
+    def transition_fn(
         model: az.PolicyValueFn,
-        action: jax.Array,  # ()
         state: pgx.State,  # Leaves: (...)
+        action: jax.Array,  # ()
     ) -> az.SearchTransition:
         logits, value = model(state.observation)  # (A,), ()
         reward = jnp.where(action == state.current_player, 1.0, -1.0)  # ()
         return az.SearchTransition(
             reward=jnp.where(state.terminated, 0.0, reward),  # ()
             discount=jnp.zeros_like(value),  # ()
-            logits=az.masked_logits(logits, state.legal_action_mask),  # (A,)
-            value=value,  # ()
-            env_state=state.replace(terminated=jnp.ones_like(state.terminated)),  # Leaves: (...)
+            child_logits=az.masked_logits(logits, state.legal_action_mask),  # (A,)
+            child_value=value,  # ()
+            child_env_state=state.replace(terminated=jnp.ones_like(state.terminated)),  # Leaves: (...)
         )
 
-    search = partial(az.puct_policy, predict, recurrent_fn=recurrent, num_simulations=16, temperature=temperature)
+    search = partial(az.puct_policy, predict, transition_fn=transition_fn, num_simulations=16, temperature=temperature)
     result = jax.jit(jax.vmap(search))(jax.random.split(jax.random.PRNGKey(0), 2), env_states)
     assert result.action.shape == (2,)
     assert result.action_weights.shape == (2, 3)

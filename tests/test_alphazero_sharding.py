@@ -63,8 +63,8 @@ def test_selfplay_shards_games_and_preserves_global_results(mesh: Mesh) -> None:
         )
     chex.assert_trees_all_close(actual, expected, atol=1e-6)
     batch, metrics = actual
-    chex.assert_shape(batch.observations, (4, 2, 3, 3, 2))
-    chex.assert_shape(batch.policy_targets, (4, 2, 9))
+    chex.assert_shape(batch.observation, (4, 2, 3, 3, 2))
+    chex.assert_shape(batch.action_weights, (4, 2, 9))
     chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (4, 2))
     for leaf in jax.tree.leaves(batch):  # (B, T, ...)
         assert leaf.sharding == NamedSharding(mesh, PartitionSpec("batch"))
@@ -79,8 +79,8 @@ def test_selfplay_shards_games_and_preserves_global_results(mesh: Mesh) -> None:
 def test_sampling_uses_global_valid_positions_with_empty_shard(mesh: Mesh) -> None:
     labels = jnp.arange(6, dtype=jnp.float32).reshape(2, 3)  # (B, T)
     batch = az.Batch(
-        observations=labels[..., None, None, None],  # (B, T, 1, 1, 1)
-        policy_targets=labels[..., None],  # (B, T, 1)
+        observation=labels[..., None, None, None],  # (B, T, 1, 1, 1)
+        action_weights=labels[..., None],  # (B, T, 1)
         value_targets=labels,  # (B, T)
         policy_mask=jnp.array([[False, False, False], [True, False, True]]),  # (B, T)
         value_mask=jnp.array([[False, False, False], [True, False, False]]),  # (B, T)
@@ -113,8 +113,8 @@ def test_update_uses_global_masked_means(mesh: Mesh) -> None:
         tx=optax.chain(optax.clip_by_global_norm(0.1), optax.adamw(1e-3)),
     )
     batch = az.Batch(
-        observations=observations,  # (B * T, *O)
-        policy_targets=jnp.array([[1, 0], [1, 0], [0, 1], [0, 1]], jnp.float32),  # (B * T, A)
+        observation=observations,  # (B * T, *O)
+        action_weights=jnp.array([[1, 0], [1, 0], [0, 1], [0, 1]], jnp.float32),  # (B * T, A)
         value_targets=jnp.array([0.0, 0.0, -1.0, 1.0]),  # (B * T,)
         policy_mask=jnp.array([True, False, True, True]),  # (B * T,); unequal counts across shards.
         value_mask=jnp.array([False, False, True, True]),  # (B * T,); one shard has no value targets.
@@ -131,7 +131,7 @@ def test_update_uses_global_masked_means(mesh: Mesh) -> None:
     def update_once(
         state: TrainState,
         minibatch: az.Batch,  # Leaves: (M, ...).
-    ) -> tuple[TrainState, az.TrainMetrics]:
+    ) -> tuple[TrainState, az.UpdateMetrics]:
         (_, metrics), grads = jax.value_and_grad(az.loss_fn, has_aux=True)(state.params, state.apply_fn, minibatch)
         return state.apply_gradients(grads=grads), metrics  # Metric leaves: ().
 
@@ -148,7 +148,7 @@ def test_update_uses_global_masked_means(mesh: Mesh) -> None:
         expected = az.TrainStepResult(
             train_state=expected_state,
             key=expected_key,  # (2,)
-            metrics=jax.tree.map(lambda *values: sum(values), *metrics),  # Scalar leaves: ().
+            update_metrics=jax.tree.map(lambda *values: sum(values), *metrics),  # Scalar leaves: ().
         )
     with jax.set_mesh(mesh):
         template_state = jax.device_put(state, PartitionSpec())

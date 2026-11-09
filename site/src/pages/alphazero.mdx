@@ -6,6 +6,7 @@ description: Animate PUCT search, explore visit counts and temperature, then ins
 
 import SelfPlayDemo from '../components/SelfPlayDemo';
 import PuctDemo from '../components/PuctDemo';
+import PolicyScoreDemo from '../components/PolicyScoreDemo';
 
 <a href="/">← All notes</a>
 
@@ -44,9 +45,20 @@ prediction), and $N(s,a)$ counts visits through an action. The implementation
 normalizes Q using the parent value and visited sibling values; unvisited actions
 have normalized value zero. A tiny random perturbation breaks score ties.
 
-`simulate` follows existing children until it finds a missing edge. `expand`
-calls `recurrent_fn` to step the environment and evaluate that new position.
-`backward` carries **reward + discount × child value** up the selected path.
+### Explore the policy score
+
+`compute_policy_score(action_probs, node_visits, action_visits)` returns one
+exploration bonus per action. Focus on one action below: increase its probability
+to raise its bonus, or increase its visit count to reduce the bonus. More visits
+to the node raise the shared exploration pressure through $\sqrt{N}$ and $c(N)$.
+The surface maps node visits on X and action visits on Y; height and color show
+the exploration bonus at the selected probability.
+
+<PolicyScoreDemo client:load />
+
+`simulate` follows `node_index → action → child_index` until it reaches an unexpanded edge or a finished node. `expand`
+calls `transition_fn` to step the environment and evaluate that new position.
+`backup` carries **reward + discount × child value** up the selected path.
 For an ongoing alternating-turn game, discount is −1: the opponent's good position
 is bad for the parent player. Terminal or truncated transitions use discount 0
 and child value 0, so their immediate reward determines the backed-up return.
@@ -89,16 +101,16 @@ env_states, rollout = jax.lax.scan(
 def batch_first(x: jax.Array) -> jax.Array:  # (T, B, ...) -> (B, T, ...)
     return x.swapaxes(0, 1)
 
-observations, policy_targets, player_ids, policy_mask = jax.tree.map(batch_first, rollout)
+observation, action_weights, current_player, policy_mask = jax.tree.map(batch_first, rollout)
 ```
 
 <div className="az-table-wrap">
 
 | Recorded array | Shape | One cell `[b, t]` |
 | --- | --- | --- |
-| `observations` | `(B, T, *O)` | Observation before the action; shape `(*O)` |
-| `policy_targets` | `(B, T, A)` | MCTS action weights; shape `(A,)` |
-| `player_ids` | `(B, T)` | Acting player ID; scalar |
+| `observation` | `(B, T, *O)` | Observation before the action; shape `(*O)` |
+| `action_weights` | `(B, T, A)` | MCTS action weights; shape `(A,)` |
+| `current_player` | `(B, T)` | Acting player ID; scalar |
 | `policy_mask` | `(B, T)` | Whether this position is real; scalar |
 
 </div>
@@ -115,9 +127,9 @@ A win becomes `+1` for the winner's positions and `−1` for the opponent's posi
 Games still active at the move limit are adjudicated as draws with value target
 `0`; a win on the final allowed move keeps its result.
 
-The returned `Batch` contains `observations`, `policy_targets`,
+The returned `Batch` contains `observation`, `action_weights`,
 `value_targets`, `policy_mask`, and `value_mask`. The last three arrays
-all have shape `(B, T)`. `player_ids` is used to construct targets, then discarded.
+all have shape `(B, T)`. `current_player` is used to construct targets, then discarded.
 
 Terminal padding trains neither head. Environment-truncated games keep their
 valid policy positions but have **no value supervision**. This differs from a

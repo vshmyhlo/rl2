@@ -1,3 +1,5 @@
+import { computePolicyScore } from './policyScore.ts';
+
 export const actionNames = ['A', 'B', 'C', 'D'];
 export const simulationCount = 8;
 
@@ -37,11 +39,10 @@ export function selectionScores(nodes: SearchNode[], node: SearchNode): Score[] 
   const q = node.children.map((child) => child < 0 ? node.value : -nodes[child].value);
   const minimum = Math.min(node.value, ...q);
   const maximum = Math.max(node.value, ...q);
-  const coefficient = 1.25 + Math.log((node.visits + 19653) / 19652);
   return node.priors.map((prior, action) => {
     const visits = node.counts[action];
     const normalized = visits === 0 ? 0 : (q[action] - minimum) / Math.max(maximum - minimum, 1e-8);
-    const bonus = Math.sqrt(node.visits) * coefficient * prior / (visits + 1);
+    const bonus = computePolicyScore(prior, node.visits, visits);
     return { prior, visits, q: visits === 0 ? 0 : q[action], normalized, bonus, total: action === 3 ? -Infinity : normalized + bonus };
   });
 }
