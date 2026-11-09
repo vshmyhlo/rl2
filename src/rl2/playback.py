@@ -43,20 +43,20 @@ def advance_episode(
     *,
     record: bool,
 ) -> tuple[PlaybackState, Any]:  # state leaves as above; saved states: (32, ...) or None
-    def active(state: PlaybackState) -> jax.Array:  # state leaves as above; ()
+    def condition(state: PlaybackState) -> jax.Array:  # state leaves as above; ()
         return ~state.done & (state.length < limit)  # ()
 
-    def advance(state: PlaybackState) -> PlaybackState:
+    def body(state: PlaybackState) -> PlaybackState:
         return step(env, apply_fn, params, state)
 
     if not record:
-        return jax.lax.while_loop(active, advance, state), None
+        return jax.lax.while_loop(condition, body, state), None
 
-    def body(state: PlaybackState, _: None) -> tuple[PlaybackState, Any]:
-        state = jax.lax.cond(active(state), advance, lambda state: state, state)
+    def scan_body(state: PlaybackState, _: None) -> tuple[PlaybackState, Any]:
+        state = jax.lax.cond(condition(state), body, lambda state: state, state)
         return state, state.final_state  # saved state leaves: (...)
 
-    return jax.lax.scan(body, state, None, length=32)  # saved state leaves: (32, ...)
+    return jax.lax.scan(scan_body, state, None, length=32)  # saved state leaves: (32, ...)
 
 
 def finish_episode(

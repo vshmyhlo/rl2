@@ -10,6 +10,7 @@ import pgx
 import pytest
 
 from rl2.alphazero import train as az
+from rl2.utils import mask_logits
 
 
 @pytest.mark.parametrize(
@@ -39,7 +40,7 @@ def test_selection_uses_each_nodes_legal_actions(node: int, legal: list[bool], e
             terminated=tree.node_env_states.terminated.at[node].set(not any(legal)),  # (N,)
         ),
     )
-    action = jax.jit(az.select_action)(jax.random.PRNGKey(0), tree, jnp.int32(node))  # ()
+    action = jax.jit(az.select_puct_action)(jax.random.PRNGKey(0), tree, jnp.int32(node))  # ()
     assert action.shape == ()
     assert action == expected
 
@@ -120,7 +121,7 @@ def test_search_prefers_winning_actions_over_initial_priors(temperature: float) 
         return az.SearchTransition(
             reward=jnp.where(state.terminated, 0.0, reward),  # ()
             discount=jnp.zeros_like(value),  # ()
-            child_logits=az.masked_logits(logits, state.legal_action_mask),  # (A,)
+            child_logits=mask_logits(logits, state.legal_action_mask),  # (A,)
             child_value=value,  # ()
             child_env_state=state.replace(terminated=jnp.ones_like(state.terminated)),  # Leaves: (...)
         )

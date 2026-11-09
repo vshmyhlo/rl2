@@ -1,6 +1,6 @@
 .policy-score-demo .policy-score-controls { display: grid; gap: 1rem; margin-top: 1rem; }
 .policy-score-demo .policy-score-controls label { display: grid; grid-template-columns: 1fr auto auto; gap: 0.2rem 0.5rem; align-items: baseline; }
-.policy-score-demo .policy-score-controls input, .policy-score-demo .policy-score-controls small { grid-column: 1 / -1; }
+.policy-score-demo .policy-score-controls select, .policy-score-demo .policy-score-controls input, .policy-score-demo .policy-score-controls small { grid-column: 1 / -1; }
 .policy-score-demo .policy-score-controls small { color: var(--puct-muted); }
 .policy-score-demo .policy-score-controls output { min-width: 3rem; text-align: right; font-weight: 650; }
 .policy-score-demo .policy-score-equation { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; padding: 1rem; margin-top: 1.25rem; border-radius: 0.4rem; background: #f3f2ee; font-variant-numeric: tabular-nums; }

@@ -4,11 +4,24 @@ import os
 import tempfile
 from pathlib import Path
 
+import chex
 import gcsfs
 import jax
 import jax.numpy as jnp
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+
+
+def mask_logits(
+    logits: jax.Array,  # (A,)
+    valid: jax.Array,  # (A,)
+) -> jax.Array:  # (A,)
+    chex.assert_rank(logits, 1)
+    chex.assert_shape(valid, logits.shape)
+    # Finite masking also keeps terminal nodes with no legal moves well-defined.
+    minimum = jnp.finfo(jnp.float32).min
+    logits = jnp.where(valid, logits, minimum)  # (A,)
+    return jnp.where(valid, logits - logits.max(), minimum)  # (A,)
 
 
 @jax.jit

@@ -153,6 +153,7 @@ from rl2.alphazero.model import Parameters, PolicyValueApplyFn, PolicyValueNet
 from rl2.configuration import load_config
 from rl2.mlflow_logging import MLflowLogger
 from rl2.running_stats import RunningSum
+from rl2.utils import mask_logits
 
 logger = logging.getLogger(__name__)
 
@@ -319,17 +320,7 @@ def init_search_tree(
     )
 
 
-def compute_policy_score(
-    action_probs: jax.Array,  # (A,)
-    node_visits: jax.Array,  # ()
-    action_visits: jax.Array,  # (A,)
-) -> jax.Array:  # (A,)
-    """Return (A,) PUCT exploration bonuses from policy probabilities and visit counts."""
-    exploration_coefficient = 1.25 + jnp.log((node_visits + 19652.0 + 1.0) / 19652.0)  # ()
-    return jnp.sqrt(node_visits) * exploration_coefficient * action_probs / (action_visits + 1)  # (A,)
-
-
-def select_action(
+def select_puct_action(
     key: jax.Array,  # (2,)
     tree: SearchTree,  # Unbatched leaves: (N, ...)
     node_index: jax.Array,  # ()
@@ -347,7 +338,8 @@ def select_action(
     action_visits = tree.node_action_visits[node_index]  # (A,)
     node_visits = tree.node_visits[node_index]  # ()
     action_probs = jax.nn.softmax(tree.node_logits[node_index])  # (A,)
-    policy_score = compute_policy_score(action_probs, node_visits, action_visits)  # (A,)
+    exploration_coefficient = 1.25 + jnp.log((node_visits + 19652.0 + 1.0) / 19652.0)  # ()
+    policy_score = jnp.sqrt(node_visits) * exploration_coefficient * action_probs / (action_visits + 1)  # (A,)
     action_values = (
         tree.node_action_rewards[node_index] + tree.node_action_discounts[node_index] * tree.children_values[node_index]
     )  # (A,)
@@ -363,97 +355,6 @@ def select_action(
     legal = tree.node_env_states.legal_action_mask[node_index]  # (A,)
     scores = jnp.where(legal | ~legal.any(), scores, -jnp.inf)  # (A,)
     return jnp.argmax(scores).astype(jnp.int32)  # ()
-
-
-def simulate(
-    key: jax.Array,  # (2,)
-    tree: SearchTree,  # Unbatched leaves: (N, ...)
-) -> SimulationState:
-    """Traverse from the root to an unexpanded edge or a terminal/truncated node."""
-
-    def ongoing(carry: SimulationState) -> jax.Array:  # ()
-        done = (
-            tree.node_env_states.terminated[carry.child_index] | tree.node_env_states.truncated[carry.child_index]
-        )  # ()
-        return (carry.child_index != -1) & ~done  # ()
-
-    def advance(carry: SimulationState) -> SimulationState:
-        key, action_key = jax.random.split(carry.key)  # Each: (2,)
-        node_index = carry.child_index  # ()
-        action = select_action(action_key, tree, node_index)  # ()
-        return SimulationState(
-            key=key,
-            node_index=node_index,
-            action=action,
-            child_index=tree.children_indices[node_index, action],  # ()
-        )
-
-    initial = SimulationState(
-        key=key,
-        # Valid placeholders for finished roots in batches with other games still expanding.
-        node_index=jnp.int32(0),
-        action=jnp.int32(0),
-        child_index=jnp.int32(0),
-    )
-    return jax.lax.while_loop(ongoing, advance, initial)
-
-
-def expand(
-    predict: PolicyValueFn,
-    tree: SearchTree,  # Unbatched leaves: (N, ...)
-    transition_fn: TransitionFn,
-    node_index: jax.Array,  # ()
-    action: jax.Array,  # ()
-    child_index: jax.Array,  # ()
-) -> SearchTree:  # Unbatched leaves: (N, ...)
-    """Evaluate node_index --action--> child_index and store the transition."""
-    _, num_actions = tree.children_indices.shape
-
-    def select(leaf: jax.Array) -> jax.Array:  # (N, ...) -> (...)
-        return leaf[node_index]  # (...)
-
-    env_state = jax.tree.map(select, tree.node_env_states)  # Leaves: (...)
-    transition = transition_fn(predict, env_state, action)
-    chex.assert_shape(transition.child_logits, (num_actions,))
-    chex.assert_shape((transition.reward, transition.discount, transition.child_value), ())
-
-    def update(old: jax.Array, new: jax.Array) -> jax.Array:  # (N, ...), (...) -> (N, ...)
-        chex.assert_shape(new, old.shape[1:])
-        return old.at[child_index].set(new)  # (N, ...)
-
-    return tree.replace(
-        node_env_states=jax.tree.map(update, tree.node_env_states, transition.child_env_state),  # Leaves: (N, ...)
-        node_logits=update(tree.node_logits, transition.child_logits),  # (N, A)
-        node_values=update(tree.node_values, transition.child_value),  # (N,)
-        node_visits=tree.node_visits.at[child_index].set(1),  # (N,)
-        parent_indices=tree.parent_indices.at[child_index].set(node_index),  # (N,)
-        parent_actions=tree.parent_actions.at[child_index].set(action),  # (N,)
-        node_action_rewards=tree.node_action_rewards.at[node_index, action].set(transition.reward),  # (N, A)
-        node_action_discounts=tree.node_action_discounts.at[node_index, action].set(transition.discount),  # (N, A)
-        children_indices=tree.children_indices.at[node_index, action].set(child_index),  # (N, A)
-    )
-
-
-def masked_logits(
-    logits: jax.Array,  # (A,)
-    legal: jax.Array,  # (A,)
-) -> jax.Array:  # (A,)
-    """Shift logits by their legal maximum and mask illegal actions.
-
-    Args:
-        logits: (A,) floating-point logits over A actions.
-        legal: (A,) boolean mask indicating legal actions.
-
-    Returns:
-        (A,) shifted logits with illegal actions set to the minimum finite
-        float32 value. States with no legal actions contain only this finite value.
-    """
-    chex.assert_rank(logits, 1)
-    chex.assert_shape(legal, logits.shape)
-    # Finite masking also keeps terminal nodes with no legal moves well-defined.
-    minimum = jnp.finfo(jnp.float32).min
-    logits = jnp.where(legal, logits, minimum)  # (A,)
-    return jnp.where(legal, logits - logits.max(), minimum)  # (A,)
 
 
 def transition_step(
@@ -501,7 +402,7 @@ def transition_step(
         reward=reward,  # ()
         discount=jnp.where(done, 0.0, -1.0),  # ()
         child_env_state=child_env_state,  # Leaves: (...)
-        child_logits=masked_logits(child_logits, child_env_state.legal_action_mask),  # (A,)
+        child_logits=mask_logits(child_logits, child_env_state.legal_action_mask),  # (A,)
         child_value=jnp.where(done, 0.0, child_value),  # ()
     )
 
@@ -520,10 +421,10 @@ def backup(
         (N, ...) updated node arrays; environment states are unchanged.
     """
 
-    def ongoing(carry: BackupState) -> jax.Array:  # ()
+    def condition(carry: BackupState) -> jax.Array:  # ()
         return carry.node_index != 0  # ()
 
-    def advance(carry: BackupState) -> BackupState:
+    def body(carry: BackupState) -> BackupState:
         tree, node_index, node_return = carry  # Tree leaves: (N, ...); index and return: ().
         parent_index = tree.parent_indices[node_index]  # ()
         parent_action = tree.parent_actions[node_index]  # ()
@@ -546,7 +447,78 @@ def backup(
         return BackupState(tree=tree, node_index=parent_index, node_return=parent_return)
 
     initial = BackupState(tree=tree, node_index=leaf_index, node_return=tree.node_values[leaf_index])
-    return jax.lax.while_loop(ongoing, advance, initial).tree  # Leaves: (N, ...)
+    return jax.lax.while_loop(condition, body, initial).tree  # Leaves: (N, ...)
+
+
+def simulate(
+    key: jax.Array,  # (2,)
+    tree: SearchTree,  # Unbatched leaves: (N, ...)
+) -> SimulationState:
+    """Traverse from the root to an unexpanded edge or a terminal/truncated node."""
+
+    def condition(carry: SimulationState) -> jax.Array:  # ()
+        """Continue while the child node exists and is neither terminated nor truncated."""
+        child_exists = carry.child_index != -1
+        done = (
+            tree.node_env_states.terminated[carry.child_index] | tree.node_env_states.truncated[carry.child_index]
+        )  # ()
+        return child_exists & ~done  # ()
+
+    def body(carry: SimulationState) -> SimulationState:
+        key, action_key = jax.random.split(carry.key)  # Each: (2,)
+        node_index = carry.child_index  # ()
+        action = select_puct_action(action_key, tree, node_index)  # ()
+        return SimulationState(
+            key=key,
+            node_index=node_index,
+            action=action,
+            child_index=tree.children_indices[node_index, action],  # ()
+        )
+
+    initial = SimulationState(
+        key=key,
+        # Valid placeholders for finished roots in batches with other games still expanding.
+        node_index=jnp.int32(0),
+        action=jnp.int32(0),
+        child_index=jnp.int32(0),
+    )
+    return jax.lax.while_loop(condition, body, initial)
+
+
+def expand(
+    predict: PolicyValueFn,
+    tree: SearchTree,  # Unbatched leaves: (N, ...)
+    transition_fn: TransitionFn,
+    node_index: jax.Array,  # ()
+    action: jax.Array,  # ()
+    child_index: jax.Array,  # ()
+) -> SearchTree:  # Unbatched leaves: (N, ...)
+    """Evaluate node_index --action--> child_index and store the transition."""
+    _, num_actions = tree.children_indices.shape
+
+    def select(leaf: jax.Array) -> jax.Array:  # (N, ...) -> (...)
+        return leaf[node_index]  # (...)
+
+    env_state = jax.tree.map(select, tree.node_env_states)  # Leaves: (...)
+    transition = transition_fn(predict, env_state, action)
+    chex.assert_shape(transition.child_logits, (num_actions,))
+    chex.assert_shape((transition.reward, transition.discount, transition.child_value), ())
+
+    def update(old: jax.Array, new: jax.Array) -> jax.Array:  # (N, ...), (...) -> (N, ...)
+        chex.assert_shape(new, old.shape[1:])
+        return old.at[child_index].set(new)  # (N, ...)
+
+    return tree.replace(
+        node_env_states=jax.tree.map(update, tree.node_env_states, transition.child_env_state),  # Leaves: (N, ...)
+        node_logits=update(tree.node_logits, transition.child_logits),  # (N, A)
+        node_values=update(tree.node_values, transition.child_value),  # (N,)
+        node_visits=tree.node_visits.at[child_index].set(1),  # (N,)
+        parent_indices=tree.parent_indices.at[child_index].set(node_index),  # (N,)
+        parent_actions=tree.parent_actions.at[child_index].set(action),  # (N,)
+        node_action_rewards=tree.node_action_rewards.at[node_index, action].set(transition.reward),  # (N, A)
+        node_action_discounts=tree.node_action_discounts.at[node_index, action].set(transition.discount),  # (N, A)
+        children_indices=tree.children_indices.at[node_index, action].set(child_index),  # (N, A)
+    )
 
 
 def puct_policy(
@@ -603,17 +575,17 @@ def puct_policy(
         simulation_state = simulate(simulation_key, tree)
         new_node_index = jnp.asarray(simulation + 1, jnp.int32)  # ()
 
-        def pending(carry: tuple[SearchTree, jax.Array]) -> jax.Array:  # ((N, ...) tree, () flag) -> ()
+        def condition(carry: tuple[SearchTree, jax.Array]) -> jax.Array:  # ((N, ...) tree, () flag) -> ()
             return carry[1]  # ()
 
-        def expand_leaf(carry: tuple[SearchTree, jax.Array]) -> tuple[SearchTree, jax.Array]:
+        def body(carry: tuple[SearchTree, jax.Array]) -> tuple[SearchTree, jax.Array]:
             tree, _ = carry  # Tree leaves: (N, ...); flag: ().
             return expand(
                 predict, tree, transition_fn, simulation_state.node_index, simulation_state.action, new_node_index
             ), jnp.bool_(False)  # (N, ...), ()
 
         # A single-pass while keeps model parameters shared under vmap, unlike a batched cond.
-        tree, _ = jax.lax.while_loop(pending, expand_leaf, (tree, simulation_state.child_index == -1))
+        tree, _ = jax.lax.while_loop(condition, body, (tree, simulation_state.child_index == -1))
         leaf_index = jnp.where(simulation_state.child_index == -1, new_node_index, simulation_state.child_index)  # ()
         tree = tree.replace(
             node_visits=tree.node_visits.at[leaf_index].add(
@@ -664,15 +636,15 @@ def prepare_logits(
     Returns:
         (A,) float32 noisy, masked logits; states with no legal actions remain finite.
     """
-    logits = masked_logits(logits, legal)  # (A,)
+    logits = mask_logits(logits, legal)  # (A,)
     if dirichlet_fraction == 0.0:
         return logits
     # Independent Gamma samples normalized over legal moves form a Dirichlet
     # sample on that subset. Log space avoids underflow for small concentrations.
     log_noise = jax.random.loggamma(key, dirichlet_alpha, shape=logits.shape)  # (A,)
-    noise = jax.nn.softmax(masked_logits(log_noise, legal))  # (A,)
+    noise = jax.nn.softmax(mask_logits(log_noise, legal))  # (A,)
     probs = (1.0 - dirichlet_fraction) * jax.nn.softmax(logits) + dirichlet_fraction * noise  # (A,)
-    return masked_logits(jnp.log(jnp.maximum(probs, jnp.finfo(probs.dtype).tiny)), legal)  # (A,)
+    return mask_logits(jnp.log(jnp.maximum(probs, jnp.finfo(probs.dtype).tiny)), legal)  # (A,)
 
 
 @partial(

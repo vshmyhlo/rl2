@@ -45,14 +45,18 @@ prediction), and $N(s,a)$ counts visits through an action. The implementation
 normalizes Q using the parent value and visited sibling values; unvisited actions
 have normalized value zero. A tiny random perturbation breaks score ties.
 
-### Explore the policy score
+### Explore the final selection score
 
-`compute_policy_score(action_probs, node_visits, action_visits)` returns one
-exploration bonus per action. Focus on one action below: increase its probability
-to raise its bonus, or increase its visit count to reduce the bonus. More visits
-to the node raise the shared exploration pressure through $\sqrt{N}$ and $c(N)$.
+`select_puct_action` adds the normalized value score, the exploration bonus from
+`compute_policy_score`, and tiny tie-breaking noise. It then sets illegal actions
+to $-\infty$ before taking `argmax`; if no actions are legal, it allows all actions.
+
 The surface maps node visits on X and action visits on Y; height and color show
-the exploration bonus at the selected probability.
+this **final score before argmax** for one action. Adjust its probability and
+normalized value to see their combined effect. The normalized value is held fixed
+for visited actions and is zero for unvisited actions. In search, that normalization
+comes from the parent and visited sibling values. Change the legal-action mask to
+inspect exclusion and the no-legal-actions fallback.
 
 <PolicyScoreDemo client:load />
 

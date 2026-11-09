@@ -52,11 +52,11 @@ def play_game(
 ) -> tuple[jax.Array, jax.Array]:  # (), ()
     """Return scalar candidate reward and termination flag; false means unfinished."""
 
-    def ongoing(carry: tuple[pgx.State, jax.Array]) -> jax.Array:
+    def condition(carry: tuple[pgx.State, jax.Array]) -> jax.Array:
         env_state, move = carry
         return ~(env_state.terminated | env_state.truncated) & (move < max_moves)
 
-    def advance(carry: tuple[pgx.State, jax.Array]) -> tuple[pgx.State, jax.Array]:
+    def body(carry: tuple[pgx.State, jax.Array]) -> tuple[pgx.State, jax.Array]:
         env_state, move = carry
 
         def choose(candidate: jax.Array, opponent: jax.Array) -> jax.Array:
@@ -84,7 +84,7 @@ def play_game(
         action = jnp.argmax(weights).astype(jnp.int32)
         return env.step(env_state, action), move + 1
 
-    final, _ = jax.lax.while_loop(ongoing, advance, (env_state, jnp.int32(0)))
+    final, _ = jax.lax.while_loop(condition, body, (env_state, jnp.int32(0)))
     reward = final.rewards[candidate_player]
     return reward, final.terminated
 

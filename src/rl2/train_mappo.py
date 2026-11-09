@@ -980,10 +980,10 @@ def train_step(
         minibatch_count: jax.Array  # () evaluated minibatches
         kl_exceeded: jax.Array  # () bool
 
-    def should_update(current: UpdateCarry) -> jax.Array:
+    def condition(current: UpdateCarry) -> jax.Array:
         return (current.minibatch_count < config.update_epochs * config.num_minibatches) & ~current.kl_exceeded  # ()
 
-    def update_minibatch(current: UpdateCarry) -> UpdateCarry:
+    def body(current: UpdateCarry) -> UpdateCarry:
         def shuffle(key: jax.Array) -> tuple[jax.Array, jax.Array]:  # () typed PRNG key
             key, shuffle_key = jax.random.split(key)  # each () typed PRNG key
             return key, jax.random.permutation(shuffle_key, batch.actions.shape[1])  # (); (B,)
@@ -1007,8 +1007,8 @@ def train_step(
         )
 
     updated = jax.lax.while_loop(
-        should_update,
-        update_minibatch,
+        condition,
+        body,
         UpdateCarry(
             train_state=train_state,
             key=rollout.key,  # ()
