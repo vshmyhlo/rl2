@@ -70,9 +70,10 @@ def test_selfplay_shards_games_and_preserves_global_results(mesh: Mesh) -> None:
         assert leaf.sharding == NamedSharding(mesh, PartitionSpec("batch"))
         assert leaf.addressable_shards[0].data.shape == (2, *leaf.shape[1:])
     for leaf in jax.tree.leaves(metrics):  # ()
+        assert leaf.shape == ()
         assert leaf.sharding == NamedSharding(mesh, PartitionSpec())
-    assert metrics["positions"] == 8
-    assert metrics["completed_games"] == 4
+    assert metrics.environment_steps == 8
+    assert metrics.completed_games == 4
 
 
 def test_sampling_uses_global_valid_positions_with_empty_shard(mesh: Mesh) -> None:

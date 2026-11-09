@@ -63,28 +63,18 @@ def play_game(
             return jnp.where(env_state.current_player == candidate_player, candidate, opponent)
 
         params = jax.tree.map(choose, candidate_params, opponent_params)
-        predict = partial(apply_fn, {"params": params})
-
-        def add_batch(x: jax.Array) -> jax.Array:
-            return x[None]
-
-        env_states = jax.tree.map(add_batch, env_state)
-        logits, value = predict(env_states.observation)
-        root = train.RootFnOutput(
-            prior_logits=train.masked_logits(logits, env_states.legal_action_mask), value=value, env_states=env_states
-        )
+        predict = partial(train.predict_observation, params, apply_fn=apply_fn)
         policy = train.puct_policy(
             predict,
             jax.random.fold_in(key, move),
-            root,
+            env_state,
             partial(train.recurrent_step, env=env),
             num_simulations,
-            invalid_actions=~env_states.legal_action_mask,
             temperature=0.0,
         )
         # Explicit argmax avoids random tie breaking in the policy's sampled action.
-        weights = jnp.where(env_states.legal_action_mask, policy.action_weights, -jnp.inf)
-        action = jnp.argmax(weights[0]).astype(jnp.int32)
+        weights = jnp.where(env_state.legal_action_mask, policy.action_weights, -jnp.inf)  # (A,)
+        action = jnp.argmax(weights).astype(jnp.int32)
         return env.step(env_state, action), move + 1
 
     final, _ = jax.lax.while_loop(ongoing, advance, (env_state, jnp.int32(0)))

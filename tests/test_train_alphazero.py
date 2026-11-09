@@ -77,23 +77,21 @@ def test_sample_batch_sparse_positions_preserves_fields() -> None:
 
 
 @pytest.mark.parametrize("fraction", [0.0, 0.25, 1.0], ids=["disabled", "mixture", "noise-only"])
-def test_selfplay_prior_noise_uses_only_legal_actions(fraction: float, monkeypatch: pytest.MonkeyPatch) -> None:
-    logits = jnp.log(jnp.array([[3, 1, 500, 500], [1, 1, 1, 1], [1, 1, 1, 1]], jnp.float32))
-    legal = jnp.array([[True, True, False, False], [False, False, True, False], [False] * 4])
+def test_prepare_prior_logits_uses_only_legal_actions(fraction: float, monkeypatch: pytest.MonkeyPatch) -> None:
+    logits = jnp.log(jnp.array([3, 1, 500, 500], jnp.float32))  # (A,)
+    legal = jnp.array([True, True, False, False])  # (A,)
     # Most Gamma mass is on illegal actions; it must not dilute the noise weight.
-    loggamma = Mock(return_value=jnp.log(jnp.array([[1, 3, 1000, 1000], [1, 2, 3, 4], [1, 1, 1, 1]], jnp.float32)))
+    loggamma = Mock(return_value=jnp.log(jnp.array([1, 3, 1000, 1000], jnp.float32)))
     monkeypatch.setattr(az.jax.random, "loggamma", loggamma)
-    noisy = az.selfplay_prior_logits(
-        logits, legal, jax.random.PRNGKey(0), dirichlet_alpha=0.3, dirichlet_fraction=fraction
-    )
-    assert noisy.shape == logits.shape
+    prepare = partial(az.prepare_prior_logits, dirichlet_alpha=0.3, dirichlet_fraction=fraction)
+    noisy = prepare(logits, legal, jax.random.PRNGKey(0))  # (A,)
+    assert noisy.shape == (4,)
     assert noisy.dtype == jnp.float32
-    assert np.isfinite(noisy).all()
-    np.testing.assert_allclose(
-        jax.nn.softmax(noisy),
-        [[0.75 - 0.5 * fraction, 0.25 + 0.5 * fraction, 0, 0], [0, 0, 1, 0], [0.25] * 4],
-        rtol=1e-6,
-    )
+    np.testing.assert_allclose(jax.nn.softmax(noisy), [0.75 - 0.5 * fraction, 0.25 + 0.5 * fraction, 0, 0], rtol=1e-6)
+    single = prepare(logits, jnp.array([False, False, True, False]), jax.random.PRNGKey(0))  # (A,)
+    empty = prepare(logits, jnp.zeros(4, bool), jax.random.PRNGKey(0))  # (A,)
+    np.testing.assert_array_equal(jax.nn.softmax(single), [0, 0, 1, 0])
+    np.testing.assert_array_equal(jax.nn.softmax(empty), [0.25] * 4)
     if fraction == 0.0:
         loggamma.assert_not_called()
 
@@ -102,56 +100,54 @@ def test_masked_logits() -> None:
     # A large illegal logit must not erase differences between legal logits.
     logits = jnp.array([[1.0, 1e8, 2.0], [0.0, 0.0, 0.0]], jnp.float32)  # (B, A)
     legal = jnp.array([[True, False, True], [False, False, False]])  # (B, A)
-    masked = az.masked_logits(logits, legal)  # (B, A)
+    masked = jax.vmap(az.masked_logits)(logits, legal)  # (B, A)
     assert masked.shape == logits.shape
     assert masked.dtype == jnp.float32
     probs = jax.nn.softmax(masked)  # (B, A)
     np.testing.assert_allclose(probs, [[1 / (1 + np.e), 0, 1 / (1 + np.exp(-1))], [1 / 3] * 3], rtol=1e-6)
 
 
+@pytest.mark.parametrize(
+    ("terminated", "truncated", "policy_mask", "rewards", "expected"),
+    [
+        pytest.param(True, False, [True, True, True], [-1.0, 1.0], [1.0, -1.0, 1.0], id="last-move-win"),
+        pytest.param(True, False, [True, True, False], [0.0, 0.0], [0.0] * 3, id="natural-draw"),
+        pytest.param(False, False, [True, True, True], [1.0, -1.0], [0.0] * 3, id="move-limit-draw"),
+        pytest.param(False, True, [True, True, False], [1.0, -1.0], [0.0] * 3, id="truncated"),
+    ],
+)
 def test_outcomes_use_player_ids_and_adjudicate_move_limit_draws(
-    tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Parameters], monkeypatch: pytest.MonkeyPatch
+    terminated: bool,
+    truncated: bool,
+    policy_mask: list[bool],
+    rewards: list[float],
+    expected: list[float],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    env, model, params = tiny_model
-    config = az.Config(num_envs=4, max_moves=3)
-    # Rows: win on the last allowed move, natural draw, move limit, env truncation.
-    # Only the natural draw and env truncation have padding in the last column.
-    # B: games; T: recorded time steps; P: players; A: actions.
-    player_ids = jnp.array([[1, 0, 1], [0, 1, 0], [0, 1, 0], [0, 1, 0]], jnp.int32)  # (B, T)
-    policy_mask = jnp.array(
-        [[True, True, True], [True, True, False], [True, True, True], [True, True, False]]
-    )  # (B, T)
-    # Nonterminal rewards must not leak into draw targets or masked targets.
-    rewards = jnp.array([[-1, 1], [0, 0], [1, -1], [1, -1]], jnp.float32)  # (B, P)
-    env_states = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 4))  # Leaves: (B, ...)
-    env_states = env_states.replace(
-        rewards=rewards,  # (B, P)
-        terminated=jnp.array([True, True, False, False]),  # (B,)
-        truncated=jnp.array([False, False, False, True]),  # (B,)
+    env = pgx.make("tic_tac_toe")
+    config = az.Config(max_moves=3)
+    state = env.init(jax.random.PRNGKey(0)).replace(
+        rewards=jnp.array(rewards),  # (P,)
+        terminated=jnp.bool_(terminated),  # ()
+        truncated=jnp.bool_(truncated),  # ()
     )
-    labels = jnp.arange(12, dtype=jnp.float32).reshape(4, 3)  # (B, T)
-    observations = jnp.broadcast_to(labels[..., None, None, None], (4, 3, 3, 3, 2))  # (B, T, *O)
-    policy_targets = jax.nn.one_hot(labels.astype(jnp.int32) % env.num_actions, env.num_actions)  # (B, T, A)
-
-    def time_first(x: jax.Array) -> jax.Array:  # (B, T, ...) -> (T, B, ...)
-        return x.swapaxes(0, 1)  # (T, B, ...)
-
     rollout = az.SelfplayStep(
-        observations=observations, policy_targets=policy_targets, player_ids=player_ids, policy_mask=policy_mask
+        observations=jnp.zeros((3, 3, 3, 2)),  # (T, *O)
+        policy_targets=jax.nn.one_hot(jnp.arange(3), env.num_actions),  # (T, A)
+        player_ids=jnp.array([1, 0, 1]),  # (T,)
+        policy_mask=jnp.array(policy_mask),  # (T,)
     )
-    monkeypatch.setattr(jax.lax, "scan", Mock(return_value=(env_states, jax.tree.map(time_first, rollout))))
-    batch, metrics = az.collect_selfplay(params, jax.random.PRNGKey(0), env=env, apply_fn=model.apply, config=config)
-    chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (4, 3))
-    np.testing.assert_array_equal(batch.observations, observations)
-    np.testing.assert_array_equal(batch.policy_targets, policy_targets)
-    np.testing.assert_array_equal(batch.value_targets, [[1, -1, 1], [0, 0, 0], [0, 0, 0], [0, 0, 0]])
-    np.testing.assert_array_equal(
-        batch.value_mask, [[True, True, True], [True, True, False], [True, True, True], [False, False, False]]
-    )
+    monkeypatch.setattr(jax.lax, "scan", Mock(return_value=(state, rollout)))
+    batch, metrics = az.collect_one_game({}, jax.random.PRNGKey(0), env=env, apply_fn=Mock(), config=config)
+    chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (3,))
+    np.testing.assert_array_equal(batch.observations, rollout.observations)
+    np.testing.assert_array_equal(batch.policy_targets, rollout.policy_targets)
+    np.testing.assert_array_equal(batch.value_targets, expected)
+    np.testing.assert_array_equal(batch.value_mask, jnp.array(policy_mask) & ~jnp.bool_(truncated))
     np.testing.assert_array_equal(batch.policy_mask, policy_mask)
-    assert metrics["value_positions"] == 8
-    assert metrics["positions"] == 10
-    assert metrics["completed_games"] == 3
+    assert metrics.value_positions == (0 if truncated else sum(policy_mask))
+    assert metrics.environment_steps == sum(policy_mask)
+    assert metrics.completed_games == int(not truncated)
 
 
 def test_recurrent_step_terminal_reward_and_opponent_discount(
@@ -166,19 +162,48 @@ def test_recurrent_step_terminal_reward_and_opponent_discount(
     def duplicate(x: jax.Array) -> jax.Array:
         return jnp.stack((x, x))
 
-    output, next_states = az.recurrent_step(
-        partial(model.apply, {"params": params}),
-        jnp.array([2, 8], jnp.int32),
-        jax.tree.map(duplicate, state),
-        env=env,
+    predict = partial(az.predict_observation, params, apply_fn=model.apply)
+    output = jax.jit(jax.vmap(partial(az.recurrent_step, predict, env=env)))(
+        jnp.array([2, 8], jnp.int32), jax.tree.map(duplicate, state)
     )
+    next_states = output.env_state  # Leaves: (B, ...)
+    chex.assert_shape((output.reward, output.discount, output.value), (2,))
+    chex.assert_shape(output.prior_logits, (2, env.num_actions))
+    chex.assert_shape(next_states.observation, (2, *state.observation.shape))
+    chex.assert_shape(next_states.legal_action_mask, (2, env.num_actions))
+    np.testing.assert_array_equal(next_states.terminated, [True, False])
     np.testing.assert_array_equal(output.reward, [1, 0])
     np.testing.assert_array_equal(output.discount, [0, -1])
     assert output.value[0] == 0
     _, expected_values = model.apply({"params": params}, next_states.observation)
-    np.testing.assert_allclose(output.value[1], expected_values[1])
+    np.testing.assert_allclose(output.value[1], expected_values[1], atol=1e-7)
     probs = jax.nn.softmax(output.prior_logits)
     assert np.all(np.asarray(probs[1])[~np.asarray(next_states.legal_action_mask[1])] == 0)
+
+
+def test_collect_selfplay_matches_independent_games(
+    tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Parameters],
+) -> None:
+    env, model, params = tiny_model
+    config = az.Config(num_envs=2, max_moves=2, num_simulations=2)
+    key = jax.random.PRNGKey(5)  # (2,)
+    keys = jax.random.split(key, config.num_envs)  # (B, 2)
+    collect = jax.jit(partial(az.collect_one_game, params, env=env, apply_fn=model.apply, config=config))
+    games = [collect(game_key) for game_key in keys]
+
+    def stack(*leaves: jax.Array) -> jax.Array:  # (...) -> (B, ...)
+        return jnp.stack(leaves)  # (B, ...)
+
+    expected_batch, per_game_metrics = jax.tree.map(stack, *games)
+    batch, metrics = az.collect_selfplay(params, key, env=env, apply_fn=model.apply, config=config)
+    chex.assert_trees_all_close(batch, expected_batch, atol=1e-6)
+    chex.assert_trees_all_equal(metrics, jax.tree.map(jnp.sum, per_game_metrics))
+    assert games[0][0].observations.shape == (2, 3, 3, 2)
+    assert games[0][0].policy_targets.shape == (2, 9)
+    chex.assert_shape((games[0][0].value_targets, games[0][0].policy_mask, games[0][0].value_mask), (2,))
+    chex.assert_shape(games[0][1], ())
+    assert batch.observations.shape == (2, 2, 3, 3, 2)
+    chex.assert_shape(metrics, ())
 
 
 def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Parameters]) -> None:
@@ -198,8 +223,8 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
     chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (config.num_envs, config.max_moves))
     chex.assert_type((batch.observations, batch.policy_targets, batch.value_targets), jnp.float32)
     chex.assert_type((batch.policy_mask, batch.value_mask), jnp.bool_)
-    assert metrics["completed_games"] == 2
-    assert 10 <= metrics["positions"] <= 18
+    assert metrics.completed_games == 2
+    assert 10 <= metrics.environment_steps <= 18
     np.testing.assert_array_equal(batch.value_mask, batch.policy_mask)
     assert not batch.policy_mask[:, -1].any()
     np.testing.assert_allclose(batch.policy_targets.sum(-1), 1.0)
@@ -247,10 +272,10 @@ def test_chess_search_smoke() -> None:
     batch, metrics = az.collect_selfplay(params, jax.random.PRNGKey(0), env=env, apply_fn=model.apply, config=config)
     assert batch.observations.shape == (1, 1, *observation.shape[1:])
     assert batch.policy_targets.shape == (1, 1, 4672)
-    assert metrics["positions"] == 1
+    assert metrics.environment_steps == 1
     chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (1, 1))
-    assert metrics["completed_games"] == 1
-    assert metrics["value_positions"] == 1
+    assert metrics.completed_games == 1
+    assert metrics.value_positions == 1
     assert batch.value_mask.all()
     assert batch.policy_mask.all()
     np.testing.assert_array_equal(batch.value_targets, [[0.0]])
@@ -327,8 +352,18 @@ def logging_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> az.Config
     model.init.return_value = {"params": {"weight": jnp.zeros(1, jnp.float32)}}
     monkeypatch.setattr(az, "PolicyValueNet", Mock(return_value=model))
     rollouts = [
-        (None, {"positions": jnp.int32(3), "completed_games": jnp.int32(1), "value_positions": jnp.int32(2)}),
-        (None, {"positions": jnp.int32(2), "completed_games": jnp.int32(0), "value_positions": jnp.int32(0)}),
+        (
+            None,
+            az.RolloutMetrics(
+                environment_steps=jnp.int32(3), completed_games=jnp.int32(1), value_positions=jnp.int32(2)
+            ),
+        ),
+        (
+            None,
+            az.RolloutMetrics(
+                environment_steps=jnp.int32(2), completed_games=jnp.int32(0), value_positions=jnp.int32(0)
+            ),
+        ),
     ]
     monkeypatch.setattr(az, "collect_selfplay", Mock(side_effect=rollouts))
 
@@ -420,11 +455,11 @@ def test_mlflow_progress(
     for tag, values in {
         "rollout/completed_games_total": [1, 2, 3],
         "rollout/completed_games": [1, 1, 1],
-        "rollout/positions": [5, 5, 3],
+        "rollout/environment_steps": [5, 5, 3],
         "rollout/value_positions": [2, 2, 2],
         "train/iteration": [2, 4, 5],
         "train/window_seconds": [601, 5, 5],
-        "train/iteration_seconds_mean": [300.5, 2.5, 5],
+        "train/iteration_seconds": [300.5, 2.5, 5],
     }.items():
         assert [value for value, _ in metrics[tag]] == values
     assert "time/rollout_seconds" not in metrics
@@ -446,12 +481,12 @@ def test_mlflow_progress(
     assert "Run ID: test-run" in messages
     reports = [message for message in messages if message.startswith("Iteration ")]
     assert len(reports) == 3
-    for report, iteration, steps, loss, positions, seconds in zip(
+    for report, iteration, steps, loss, environment_steps, seconds in zip(
         reports, [2, 4, 5], [5, 10, 13], [4, 12, 18], [5, 5, 3], [601, 5, 5], strict=True
     ):
         assert report.startswith(f"Iteration {iteration}/5 | steps={steps} | ")
         assert f" | loss={loss} | " in report
-        assert f" | positions={positions} | " in report
+        assert f" | environment_steps={environment_steps} | " in report
         assert report.endswith(f"seconds={seconds:.2f}")
 
 
@@ -544,7 +579,14 @@ def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: p
     def now() -> float:
         return clock
 
-    rollout = Mock(return_value=(None, {"positions": 2, "completed_games": 1, "value_positions": 2}))
+    rollout = Mock(
+        return_value=(
+            None,
+            az.RolloutMetrics(
+                environment_steps=jnp.int32(2), completed_games=jnp.int32(1), value_positions=jnp.int32(2)
+            ),
+        )
+    )
     restore = Mock(return_value=None)
     save = Mock()
     writer = MagicMock()
@@ -640,7 +682,14 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
         clock += 120.0  # Evaluation time does not affect the iteration cadence.
         return {"score": 0.5, "games": 2.0}
 
-    rollout = Mock(return_value=(None, {"positions": 2, "completed_games": 1, "value_positions": 2}))
+    rollout = Mock(
+        return_value=(
+            None,
+            az.RolloutMetrics(
+                environment_steps=jnp.int32(2), completed_games=jnp.int32(1), value_positions=jnp.int32(2)
+            ),
+        )
+    )
     run_evaluation = Mock(side_effect=evaluate)
     save = Mock()
     writer = MagicMock()
@@ -653,6 +702,10 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
     monkeypatch.setattr(az, "MLflowLogger", Mock(return_value=writer))
     az.train(config)
     assert run_evaluation.call_count == 2
+    # The middle logging window includes the evaluation after iteration 3.
+    windows = [call.args[0] for call in writer.log_metrics.call_args_list if "train/window_seconds" in call.args[0]]
+    assert [window["train/window_seconds"] for window in windows] == [2.0, 122.0, 2.0]
+    assert [window["train/iteration_seconds"] for window in windows] == [1.0, 61.0, 1.0]
     for call, candidate, opponent in zip(run_evaluation.call_args_list, [3, 6], [2, 4], strict=True):
         assert call.kwargs["candidate_params"]["weight"].item() == candidate
         assert call.kwargs["opponent_params"]["weight"].item() == opponent

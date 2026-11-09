@@ -104,23 +104,28 @@ def test_search_uses_acting_network_and_greedy_legal_action(monkeypatch: pytest.
     def search(
         predict: PolicyValueFn,
         key: jax.Array,  # (2,)
-        root: ev.train.RootFnOutput,  # Leaves: (B, ...)
+        env_state: pgx.State,  # Leaves: (...)
         recurrent_fn: ev.train.RecurrentFn,
         num_simulations: int,
         **kwargs: Any,
     ) -> ev.train.PolicyOutput:
-        _, value = predict(root.env_states.observation)
-        seen.append(float(value[0]))
-        np.testing.assert_array_equal(value, root.value)
+        logits, value = predict(env_state.observation)  # (A,), ()
+        seen.append(float(value))
         assert num_simulations == 3
         assert kwargs["temperature"] == 0
-        np.testing.assert_array_equal(kwargs["invalid_actions"], ~state.legal_action_mask[None])
+        assert kwargs.get("dirichlet_fraction", 0.0) == 0.0
+        np.testing.assert_array_equal(env_state.legal_action_mask, state.legal_action_mask)
+        root = ev.train.SearchRoot(
+            prior_logits=logits,  # (A,)
+            value=value,  # ()
+            env_state=env_state,  # Leaves: (...)
+        )
         # Illegal square 0 has the highest weight; legal square 2 wins the game.
-        weights = jnp.array([[100, 0, 10, 0, 0, 0, 0, 0, 0]], jnp.float32)
+        weights = jnp.array([100, 0, 10, 0, 0, 0, 0, 0, 0], jnp.float32)
         return ev.train.PolicyOutput(
-            action=jnp.array([8], jnp.int32),  # (B,)
-            action_weights=weights,  # (B, A)
-            search_tree=ev.train.init_search_tree(root, 0, kwargs["invalid_actions"]),
+            action=jnp.int32(8),  # ()
+            action_weights=weights,  # (A,)
+            search_tree=ev.train.init_search_tree(root, 0),
         )
 
     monkeypatch.setattr(ev.train, "puct_policy", search)
