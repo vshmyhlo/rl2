@@ -65,8 +65,18 @@ iterations (default: 1), with a final partial window emitted on normal completio
 All intervals use multiples of the cumulative completed iteration count, including
 restored progress; the first logging window after resume may be shorter.
 
-MLflow metrics use cumulative environment steps as the step axis, excluding
-terminal padding. Each logging window contains complete training iterations:
+All MLflow metrics use cumulative training environment steps as the step axis,
+including restored checkpoint progress and excluding terminal padding and
+evaluation moves. Startup metrics use zero steps or the restored step count;
+evaluation metrics use the current training step count.
+
+Startup metric, emitted once per invocation, including resume:
+
+- model/params_millions: Total model parameter count divided by 1,000,000,
+  in millions of parameters, without averaging.
+
+Training-window metrics, each covering complete training iterations. Losses and
+the learning rate are unitless; counts are unaveraged window totals unless noted:
 
 - train/policy_loss: Mean policy cross-entropy against MCTS action weights,
   averaged over optimizer updates in the window. Padding is masked out.
@@ -82,6 +92,18 @@ terminal padding. Each logging window contains complete training iterations:
   collected in the window, before sampling training minibatches.
 - rollout/completed_games: Total completed games in the window, including
   move-limit draws. Environment-truncated games are excluded.
+- rollout/finish_fraction/<reason>: Games ending for each reason divided by all
+  games collected in the window, including environment truncations; unitless.
+  Chess labels, in precedence order when terminal conditions overlap: checkmate,
+  stalemate, fifty_move_rule (100 plies without a pawn move or capture),
+  insufficient_material, threefold_repetition, environment_move_limit (PGX's
+  built-in 512-ply cap), other_terminal (unclassified terminal state).
+  Other environments use win (nonzero reward for either player) and draw.
+  All environments also report truncated (nonterminal environment truncation)
+  and max_moves (still active at the trainer's move limit, adjudicated a draw).
+  Each game contributes to exactly one reason, so fractions sum to one. All
+  applicable labels are logged every window, including measured zeros;
+  labels specific to other environments are omitted.
 - train/iteration: Latest completed iteration number, starting at one.
 - train/progress_fraction: Completed iterations, including restored progress,
   divided by configured iterations; a unitless fraction in [0, 1], without averaging.
@@ -99,10 +121,10 @@ on-device until logging, evaluation, or checkpointing needs host values. Timings
 do not explicitly synchronize optimizer outputs; outstanding device work may
 overlap the next boundary.
 
-At startup, model/params_millions records the parameter count in millions;
-config records the resolved configuration as text.
+At startup, the resolved configuration is logged as parameters and as the
+config.yaml text artifact; these are not metrics.
 Stdout reports the latest iteration and cumulative steps, window self-play
-totals, mean losses, and window wall time (seconds).
+counts and finish fractions, mean losses, and window wall time (seconds).
 
 Every eval_interval iterations (default: 30),
 the current model plays the most recently saved checkpoint, before a new save.
@@ -112,18 +134,37 @@ num_simulations, no root noise, and greedy visit-count actions. max_moves caps
 each game after the opening.
 If no checkpoint exists yet, evaluation is skipped until the next interval.
 
-Evaluation metrics are logged immediately under eval/, without window averaging:
-- wins, draws, losses, completed_games: Counts from terminated evaluation games.
-- games, truncated_games, truncation_rate: Total attempted games and those
-  unfinished at the move limit (or truncated by the environment).
-- score: (wins + 0.5 * draws) / completed_games; win_rate, draw_rate, loss_rate
-  also use completed_games. Omitted when no game finishes. Truncation can bias
-  this conditional score, so always inspect truncation_rate alongside it.
-- score_lower_bound, score_upper_bound: Conservative 95% bounds for all-game
-  score over sampled openings, using opening pairs as independent samples and
-  allowing unfinished games any outcome. These can be wide for small suites.
-- candidate_iteration, opponent_iteration: Iterations identifying both models.
-- seconds: Wall time for the evaluation, including any initial JIT compilation.
+Evaluation metrics are logged immediately after each evaluation, without
+training-window averaging. Counts cover that evaluation suite only; rates,
+scores, and bounds are unitless in [0, 1]. All are omitted when evaluation is
+skipped; otherwise only the completed-game score and rates can be omitted:
+
+- eval/wins: Number of terminated games won by the current model.
+- eval/draws: Number of terminated games drawn by the current model.
+- eval/losses: Number of terminated games lost by the current model.
+- eval/completed_games: Total terminated games, the sum of wins, draws, and losses.
+- eval/games: Total attempted games, twice the configured number of openings.
+- eval/truncated_games: Number of games unfinished at the move limit or truncated
+  by the environment; unlike training, evaluation move-limit games are not draws.
+- eval/truncation_rate: Truncated games divided by attempted games.
+- eval/score: (wins + 0.5 * draws) / completed_games; omitted when none finish.
+- eval/win_rate: Wins divided by completed games; omitted when none finish.
+- eval/draw_rate: Draws divided by completed games; omitted when none finish.
+- eval/loss_rate: Losses divided by completed games; omitted when none finish.
+- eval/score_lower_bound: Conservative 95% Hoeffding lower bound for all-game
+  score, treating unfinished games as losses and opening pairs as independent
+  samples; clipped to [0, 1]. Emitted even when no games finish.
+- eval/score_upper_bound: Corresponding upper bound, treating unfinished games
+  as wins; clipped to [0, 1]. Emitted even when no games finish.
+- eval/candidate_iteration: Current model's completed training iteration count.
+- eval/opponent_iteration: Saved opponent's completed training iteration count,
+  including restored progress. Neither iteration count is averaged.
+- eval/seconds: Wall time in seconds from immediately before evaluation through
+  match summarization and host transfer, including any initial JIT compilation,
+  excluding metric logging and checkpoint saving.
+
+Truncation can bias the conditional score, so inspect eval/truncation_rate
+alongside it. Bounds can be wide for small suites. Measured zeros are retained.
 Evaluation does not alter training RNG, progress counters, or checkpoint policy.
 This scaffold has no persistent replay.
 PGX owns observation/action encodings and in-game draw rules. Values always use the
@@ -152,6 +193,7 @@ from omegaconf.errors import OmegaConfBaseException
 from rl2.alphazero import evaluation
 from rl2.alphazero.checkpoints import Checkpoint, checkpoint_manager, restore_checkpoint, save_checkpoint
 from rl2.alphazero.config import Config
+from rl2.alphazero.finish_reasons import game_finish_counts
 from rl2.alphazero.model import Parameters, PolicyValueApplyFn, PolicyValueNet
 from rl2.configuration import load_config
 from rl2.mlflow_logging import MLflowLogger
@@ -254,6 +296,7 @@ class RolloutMetrics(NamedTuple):
     completed_games: jax.Array  # (B,) or ()
     environment_steps: jax.Array  # (B,) or ()
     value_target_count: jax.Array  # (B,) or () Number of rollout positions with valid value targets.
+    finish_counts: dict[str, jax.Array]  # Leaves: (B,) or () Counts by mutually exclusive reason.
 
 
 class UpdateMetrics(NamedTuple):
@@ -726,6 +769,7 @@ def collect_games(
         completed_games=completed.astype(jnp.int32),  # (B,)
         environment_steps=policy_mask.sum(axis=1),  # (B,)
         value_target_count=value_mask.sum(axis=1),  # (B,)
+        finish_counts=game_finish_counts(final),  # Leaves: (B,)
     )
 
 
@@ -946,20 +990,7 @@ def train(config: Config) -> TrainState:
         window_start = monotonic()
         window_start_steps = steps
         window_start_completed_games = completed_games
-        window_metrics = WindowMetrics(
-            update_metrics=UpdateMetrics(
-                loss=jnp.float32(0),  # ()
-                policy_loss=jnp.float32(0),  # ()
-                value_loss=jnp.float32(0),  # ()
-                value_update_count=jnp.int32(0),  # ()
-            ),
-            rollout_metrics=RolloutMetrics(
-                completed_games=jnp.int32(0),  # ()
-                environment_steps=jnp.int32(0),  # ()
-                value_target_count=jnp.int32(0),  # ()
-            ),
-            iterations=jnp.int32(0),  # ()
-        )  # Scalar leaves: ().
+        window_metrics: WindowMetrics | None = None  # Scalar leaves: ().
         for iteration in range(start_iteration + 1, config.iterations + 1):
             key, play_key = jax.random.split(key)  # Each: (2,)
             batch, rollout_metrics = collect_selfplay(
@@ -977,6 +1008,8 @@ def train(config: Config) -> TrainState:
                 rollout_metrics=rollout_metrics,  # Scalar leaves: ().
                 iterations=jnp.int32(1),  # ()
             )  # Scalar leaves: ().
+            if window_metrics is None:
+                window_metrics = RunningSum.init(iteration_metrics)  # Scalar leaves: ().
             window_metrics = RunningSum.update(window_metrics, iteration_metrics)  # Scalar leaves: ().
             log_due = iteration % config.log_interval == 0 or iteration == config.iterations
             eval_due = iteration % config.eval_interval == 0
@@ -998,7 +1031,16 @@ def train(config: Config) -> TrainState:
                 }
                 if host_updates.value_update_count:
                     mean_losses["value_loss"] = float(host_updates.value_loss) / int(host_updates.value_update_count)
-                window_rollout = {name: int(value) for name, value in host_metrics.rollout_metrics._asdict().items()}
+                window_rollout: dict[str, int | float] = {
+                    name: int(value)
+                    for name, value in host_metrics.rollout_metrics._asdict().items()
+                    if name != "finish_counts"
+                }
+                finish_counts = host_metrics.rollout_metrics.finish_counts  # Leaves: ().
+                games = sum(int(count) for count in finish_counts.values())
+                window_rollout.update(
+                    {f"finish_fraction/{reason}": int(count) / games for reason, count in finish_counts.items()}
+                )
                 scalars = {
                     **{f"train/{name}": value for name, value in mean_losses.items()},
                     "train/iteration": iteration,

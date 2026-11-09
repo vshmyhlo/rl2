@@ -34,6 +34,7 @@ dependencies = [
     "jsonschema>=4.26,<5",
     "kauldron>=1.4.4,<2",
     "kinetix-env==3.0.2",
+    "luxai-s3==0.2.1",
     "metaljax>=0.11.8,<0.12; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "mlflow-skinny[db]>=3.17.1,<4",
     "moviepy>=2.2,<3",
@@ -149,7 +150,14 @@ requires-dist = [
     "grain",
 ]
 
+# Lux's core reset/step API supports the Gymnax version used by rl2.
+[[tool.uv.dependency-metadata]]
+name = "luxai-s3"
+version = "0.2.1"
+requires-dist = ["jax", "gymnax>=0.0.9,<0.1", "tyro"]
+
 [tool.uv.sources]
+luxai-s3 = { url = "https://github.com/Lux-AI-Challenge/Lux-Design-S3/archive/c6d1e665d12a467b299fb586b3f876e47847746b.tar.gz", subdirectory = "src" }
 jaxrobotarium = { url = "https://github.com/GT-STAR-Lab/JaxRobotarium/archive/6200711f6fb98015579af3e7a534bcfb8bcb69af.tar.gz" }
 robotarium-python-simulator = { url = "https://github.com/shalin-jain/robotarium_python_simulator/archive/117043719147e8ab04a6332ae4abe9ce8511a762.tar.gz" }
 

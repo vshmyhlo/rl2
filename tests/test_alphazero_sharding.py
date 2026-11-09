@@ -74,6 +74,8 @@ def test_selfplay_shards_games_and_preserves_global_results(mesh: Mesh) -> None:
         assert leaf.sharding == NamedSharding(mesh, PartitionSpec())
     assert metrics.environment_steps == 8
     assert metrics.completed_games == 4
+    assert metrics.finish_counts["max_moves"] == 4
+    assert sum(metrics.finish_counts.values()) == 4
 
 
 def test_sampling_uses_global_valid_positions_with_empty_shard(mesh: Mesh) -> None:

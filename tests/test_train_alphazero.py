@@ -35,8 +35,9 @@ def chess_env() -> pgx.Env:
     return pgx.make("chess")
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="module", autouse=True)
 def tiny_model() -> tuple[pgx.Env, az.PolicyValueNet, az.Parameters]:
+    # Load PGX's module-level arrays before any test enters single_device_mesh.
     env = pgx.make("tic_tac_toe")
     model = az.PolicyValueNet(env.num_actions, channels=4, num_blocks=1)
     params = model.init(jax.random.PRNGKey(0), jnp.zeros((1, 3, 3, 2), jnp.float32))["params"]
@@ -108,12 +109,12 @@ def test_prepare_logits_uses_only_legal_actions(fraction: float, monkeypatch: py
 
 
 @pytest.mark.parametrize(
-    ("terminated", "truncated", "policy_mask", "rewards", "expected"),
+    ("terminated", "truncated", "policy_mask", "rewards", "expected", "reason"),
     [
-        pytest.param(True, False, [True, True, True], [-1.0, 1.0], [1.0, -1.0, 1.0], id="last-move-win"),
-        pytest.param(True, False, [True, True, False], [0.0, 0.0], [0.0] * 3, id="natural-draw"),
-        pytest.param(False, False, [True, True, True], [1.0, -1.0], [0.0] * 3, id="move-limit-draw"),
-        pytest.param(False, True, [True, True, False], [1.0, -1.0], [0.0] * 3, id="truncated"),
+        pytest.param(True, False, [True, True, True], [-1.0, 1.0], [1.0, -1.0, 1.0], "win", id="last-move-win"),
+        pytest.param(True, False, [True, True, False], [0.0, 0.0], [0.0] * 3, "draw", id="natural-draw"),
+        pytest.param(False, False, [True, True, True], [1.0, -1.0], [0.0] * 3, "max_moves", id="move-limit-draw"),
+        pytest.param(False, True, [True, True, False], [1.0, -1.0], [0.0] * 3, "truncated", id="truncated"),
     ],
 )
 def test_outcomes_use_player_ids_and_adjudicate_move_limit_draws(
@@ -122,6 +123,7 @@ def test_outcomes_use_player_ids_and_adjudicate_move_limit_draws(
     policy_mask: list[bool],
     rewards: list[float],
     expected: list[float],
+    reason: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     env = pgx.make("tic_tac_toe")
@@ -157,6 +159,10 @@ def test_outcomes_use_player_ids_and_adjudicate_move_limit_draws(
     assert metrics.value_target_count == (0 if truncated else sum(policy_mask))
     assert metrics.environment_steps == sum(policy_mask)
     assert metrics.completed_games == int(not truncated)
+    assert {name: int(count) for name, count in metrics.finish_counts.items()} == {
+        name: int(name == reason) for name in ("win", "draw", "max_moves", "truncated")
+    }
+    chex.assert_shape(jax.tree.leaves(metrics), ())
 
 
 @pytest.mark.parametrize("truncated", [False, True], ids=["terminated", "truncated"])
@@ -264,9 +270,9 @@ def test_collect_selfplay_matches_independent_games(
     assert games[0][0].observation.shape == (2, 3, 3, 2)
     assert games[0][0].action_weights.shape == (2, 9)
     chex.assert_shape((games[0][0].value_targets, games[0][0].policy_mask, games[0][0].value_mask), (2,))
-    chex.assert_shape(games[0][1], ())
+    chex.assert_shape(jax.tree.leaves(games[0][1]), ())
     assert batch.observation.shape == (2, 2, 3, 3, 2)
-    chex.assert_shape(metrics, ())
+    chex.assert_shape(jax.tree.leaves(metrics), ())
 
 
 def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Parameters]) -> None:
@@ -339,6 +345,8 @@ def test_chess_search_smoke(chess_env: pgx.Env) -> None:
     chex.assert_shape((batch.value_targets, batch.policy_mask, batch.value_mask), (1, 1))
     assert metrics.completed_games == 1
     assert metrics.value_target_count == 1
+    assert metrics.finish_counts["max_moves"] == 1
+    assert sum(metrics.finish_counts.values()) == 1
     assert batch.value_mask.all()
     assert batch.policy_mask.all()
     np.testing.assert_array_equal(batch.value_targets, [[0.0]])
@@ -418,13 +426,29 @@ def logging_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> az.Config
         (
             None,
             az.RolloutMetrics(
-                environment_steps=jnp.int32(3), completed_games=jnp.int32(1), value_target_count=jnp.int32(2)
+                environment_steps=jnp.int32(3),
+                completed_games=jnp.int32(1),
+                value_target_count=jnp.int32(2),
+                finish_counts={
+                    "win": jnp.int32(1),
+                    "draw": jnp.int32(0),
+                    "max_moves": jnp.int32(0),
+                    "truncated": jnp.int32(0),
+                },
             ),
         ),
         (
             None,
             az.RolloutMetrics(
-                environment_steps=jnp.int32(2), completed_games=jnp.int32(0), value_target_count=jnp.int32(0)
+                environment_steps=jnp.int32(2),
+                completed_games=jnp.int32(0),
+                value_target_count=jnp.int32(0),
+                finish_counts={
+                    "win": jnp.int32(0),
+                    "draw": jnp.int32(0),
+                    "max_moves": jnp.int32(0),
+                    "truncated": jnp.int32(1),
+                },
             ),
         ),
     ]
@@ -518,6 +542,10 @@ def test_mlflow_progress(
     for tag, values in {
         "rollout/completed_games_total": [1, 2, 3],
         "rollout/completed_games": [1, 1, 1],
+        "rollout/finish_fraction/win": [0.5, 0.5, 1.0],
+        "rollout/finish_fraction/draw": [0.0, 0.0, 0.0],
+        "rollout/finish_fraction/max_moves": [0.0, 0.0, 0.0],
+        "rollout/finish_fraction/truncated": [0.5, 0.5, 0.0],
         "rollout/environment_steps": [5, 5, 3],
         "rollout/value_target_count": [2, 2, 2],
         "train/iteration": [2, 4, 5],
@@ -525,6 +553,9 @@ def test_mlflow_progress(
         "train/iteration_seconds": [300.5, 2.5, 5],
     }.items():
         assert [value for value, _ in metrics[tag]] == values
+    assert "rollout/finish_fraction/checkmate" not in metrics
+    assert "rollout/finish_counts" not in metrics
+    assert "finish_fraction/win=0.5" in caplog.text
     assert "time/rollout_seconds" not in metrics
     assert "time/optimization_seconds" not in metrics
     assert [value for value, _ in metrics["train/environment_steps_per_second"]] == pytest.approx(
@@ -646,7 +677,15 @@ def test_checkpoint_cadence_and_resume(logging_config: az.Config, monkeypatch: p
         return_value=(
             None,
             az.RolloutMetrics(
-                environment_steps=jnp.int32(2), completed_games=jnp.int32(1), value_target_count=jnp.int32(2)
+                environment_steps=jnp.int32(2),
+                completed_games=jnp.int32(1),
+                value_target_count=jnp.int32(2),
+                finish_counts={
+                    "win": jnp.int32(1),
+                    "draw": jnp.int32(0),
+                    "max_moves": jnp.int32(0),
+                    "truncated": jnp.int32(0),
+                },
             ),
         )
     )
@@ -749,7 +788,15 @@ def test_evaluation_cadence_previous_checkpoint_and_resume(
         return_value=(
             None,
             az.RolloutMetrics(
-                environment_steps=jnp.int32(2), completed_games=jnp.int32(1), value_target_count=jnp.int32(2)
+                environment_steps=jnp.int32(2),
+                completed_games=jnp.int32(1),
+                value_target_count=jnp.int32(2),
+                finish_counts={
+                    "win": jnp.int32(1),
+                    "draw": jnp.int32(0),
+                    "max_moves": jnp.int32(0),
+                    "truncated": jnp.int32(0),
+                },
             ),
         )
     )

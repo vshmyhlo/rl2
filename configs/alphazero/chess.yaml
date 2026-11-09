@@ -25,5 +25,5 @@ eval_interval: 10 # Evaluate every 100 iterations before checkpoint saving; paus
 evaluation:
   num_openings: 50 # Two games per opening, with the agents swapping colors
   opening_moves: 8 # Fixed-seed random legal prefix; terminal moves are rejected
-  openings_per_batch: 5 # Ten games searched in parallel; uses training num_simulations and max_moves
+  openings_per_batch: 8 # Ten games searched in parallel; uses training num_simulations and max_moves
   seed: 0 # Independent of training RNG; keep fixed for comparable evaluations
