@@ -103,7 +103,11 @@ exclude-dependencies = ["opencv-python"]
 constraint-dependencies = ["nvidia-nvjitlink<13.1"]
 # JAX 0.11.2 uses NCCL 2.30.7 headers; torch 2.13 pins the older 2.29.7 runtime.
 # Share the newer NCCL 2.x runtime across both frameworks.
-override-dependencies = ["nvidia-nccl-cu13==2.30.7; sys_platform == 'linux'"]
+override-dependencies = [
+    "nvidia-nccl-cu13==2.30.7; sys_platform == 'linux'",
+    # Lux pins Gymnax 0.0.8; its core reset/step API also works with rl2's version.
+    "gymnax>=0.0.9,<0.1",
+]
 
 # Verifiers' renderers need Pillow 12; retain MoviePy's other bounds.
 [[tool.uv.dependency-metadata]]
@@ -149,12 +153,6 @@ requires-dist = [
     "numcodecs==0.13.1",
     "grain",
 ]
-
-# Lux's core reset/step API supports the Gymnax version used by rl2.
-[[tool.uv.dependency-metadata]]
-name = "luxai-s3"
-version = "0.2.1"
-requires-dist = ["jax", "gymnax>=0.0.9,<0.1", "tyro"]
 
 [tool.uv.sources]
 luxai-s3 = { url = "https://github.com/Lux-AI-Challenge/Lux-Design-S3/archive/c6d1e665d12a467b299fb586b3f876e47847746b.tar.gz", subdirectory = "src" }

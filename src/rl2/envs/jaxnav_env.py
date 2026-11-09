@@ -44,49 +44,49 @@ class JaxNavEnv(BaseMultiAgentEnv[State]):
         self.num_agents = config.num_agents
         self.action_space = DiscreteSpace(self.env.action_space(self.agents[0]).n)
 
-    def _observation(self, observations: dict[str, jax.Array]) -> AgentObservation:
-        """Pack observations: (O,) agent leaves in fixed order."""
+    def _observation(self, observation: dict[str, jax.Array]) -> AgentObservation:
+        """Pack observation: (O,) agent leaves in fixed order."""
         # JaxNav's get_avail_actions reports two continuous controls even in discrete mode.
         return AgentObservation(
-            observations=jnp.stack([observations[agent] for agent in self.agents]),  # (N, O)
-            action_masks=jnp.ones((self.num_agents, self.action_space.n), dtype=bool),  # (N, A)
+            observation=jnp.stack([observation[agent] for agent in self.agents]),  # (N, O)
+            actions_mask=jnp.ones((self.num_agents, self.action_space.n), dtype=bool),  # (N, A)
         )
 
     def reset(self, key: jax.Array) -> tuple[AgentObservation, State]:  # key: ()
         """Return (N, O)/(N, A) local observations/masks and (...) state leaves."""
-        observations, state = self.env.reset(key)  # agent leaves: (O,); state leaves: (...)
-        return self._observation(observations), state
+        observation, state = self.env.reset(key)  # agent leaves: (O,); state leaves: (...)
+        return self._observation(observation), state
 
     def step(
         self,
         key: jax.Array,  # () typed PRNG key
         state: State,  # leaves: (...)
-        actions: jax.Array,  # (N,) int32
+        action: jax.Array,  # (N,) int32
     ) -> MultiAgentStep[State]:
         step_key, reset_key = jax.random.split(key)  # each ()
-        observations, final_state, rewards, _, _ = self.env.step_env(
-            step_key, state, {agent: actions[i] for i, agent in enumerate(self.agents)}
-        )  # observations: agent (O,); rewards: agent (); state leaves: (...)
+        observation, final_state, reward, _, _ = self.env.step_env(
+            step_key, state, {agent: action[i] for i, agent in enumerate(self.agents)}
+        )  # observation: agent (O,); reward: agent (); state leaves: (...)
         terminated = (final_state.goal_reached | final_state.move_term).all()  # ()
         truncated = final_state.step >= self.config.max_steps  # ()
         done = terminated | truncated  # ()
-        final_observation = self._observation(observations)  # (N, O)/(N, A)
+        final_observation = self._observation(observation)  # (N, O)/(N, A)
         observation, next_state = jax.lax.cond(
             done, lambda: self.reset(reset_key), lambda: (final_observation, final_state)
-        )  # observations: (N, O)/(N, A); state leaves: (...)
+        )  # observation: (N, O)/(N, A); state leaves: (...)
         return MultiAgentStep(
             observation=observation,  # (N, O)/(N, A)
             state=next_state,  # leaves: (...)
-            rewards=jnp.stack([rewards[agent] for agent in self.agents]),  # (N,)
+            reward=jnp.stack([reward[agent] for agent in self.agents]),  # (N,)
             done=done,  # ()
-            agent_dones=self.memory_resets(final_state) | done,  # (N,)
+            agent_done=self.memory_reset(final_state) | done,  # (N,)
             terminated=terminated,  # ()
             truncated=truncated,  # ()
             final_observation=final_observation,  # (N, O)/(N, A)
             final_state=final_state,  # leaves: (...)
         )
 
-    def memory_resets(self, state: State) -> jax.Array:  # state leaves: (...) -> (N,)
+    def memory_reset(self, state: State) -> jax.Array:  # state leaves: (...) -> (N,)
         return state.move_term  # (N,)
 
     def render(self, state: State) -> NDArray[np.uint8]:  # state leaves: (...) -> (H, W, 3)

@@ -24,34 +24,34 @@ def test_batched_shapes_observations_and_timeout() -> None:
             jax.random.split(jax.random.key(0), 2)
         )  # (E=2, N=4, O=22)/(E, N, A=5); state leaves: (E, ...)
         first = jax.jit(jax.vmap(env.step))(jax.random.split(jax.random.key(1), 2), state, jnp.zeros((2, 4), jnp.int32))
-    chex.assert_shape(observation.observations, (2, 4, 22))
-    chex.assert_shape(observation.action_masks, (2, 4, 5))
-    assert observation.observations.dtype == jnp.float32
-    assert observation.action_masks.dtype == jnp.bool_
-    np.testing.assert_array_equal(observation.action_masks, True)
+    chex.assert_shape(observation.observation, (2, 4, 22))
+    chex.assert_shape(observation.actions_mask, (2, 4, 5))
+    assert observation.observation.dtype == jnp.float32
+    assert observation.actions_mask.dtype == jnp.bool_
+    np.testing.assert_array_equal(observation.actions_mask, True)
     for i in range(4):
-        np.testing.assert_array_equal(observation.observations[:, i, :3], state.p_pos[:, i])
+        np.testing.assert_array_equal(observation.observation[:, i, :3], state.p_pos[:, i])
         expected = jnp.roll(state.het_rep, -i, axis=1).reshape(2, -1)  # (E, 2N)
-        np.testing.assert_array_equal(observation.observations[:, i, -8:], expected)
-    np.testing.assert_array_equal(observation.observations[:, :, 12:14], 50)
+        np.testing.assert_array_equal(observation.observation[:, i, -8:], expected)
+    np.testing.assert_array_equal(observation.observation[:, :, 12:14], 50)
     np.testing.assert_array_equal(first.done, False)
     chex.assert_trees_all_equal(first.state, first.final_state)
     result = jax.jit(jax.vmap(env.step))(
         jax.random.split(jax.random.key(2), 2), first.state, jnp.zeros((2, 4), jnp.int32)
     )
-    chex.assert_shape(result.observation.observations, (2, 4, 22))
-    chex.assert_shape(result.rewards, (2, 4))
+    chex.assert_shape(result.observation.observation, (2, 4, 22))
+    chex.assert_shape(result.reward, (2, 4))
     chex.assert_shape(result.done, (2,))
-    chex.assert_shape(result.agent_dones, (2, 4))
+    chex.assert_shape(result.agent_done, (2, 4))
     np.testing.assert_array_equal(result.truncated, True)
-    np.testing.assert_array_equal(result.agent_dones, True)
+    np.testing.assert_array_equal(result.agent_done, True)
     np.testing.assert_array_equal(result.terminated, False)
     np.testing.assert_array_equal(result.final_state.step, 2)
     np.testing.assert_array_equal(result.state.step, 0)
-    np.testing.assert_array_equal(jax.vmap(env.memory_resets)(result.final_state), False)
+    np.testing.assert_array_equal(jax.vmap(env.memory_reset)(result.final_state), False)
     raw_final = jax.vmap(env.env.get_obs)(result.final_state)  # agent leaves: (E, O)
     for i, agent in enumerate(env.agents):
-        np.testing.assert_array_equal(result.final_observation.observations[:, i], raw_final[agent])
+        np.testing.assert_array_equal(result.final_observation.observation[:, i], raw_final[agent])
 
 
 @pytest.mark.parametrize("num_agents", [2, 15], ids=["smallest-team", "all-starting-positions"])
@@ -59,8 +59,8 @@ def test_team_size_boundaries(num_agents: int) -> None:
     config = RobotariumConfig()
     env = RobotariumEnv(replace(config, robots=(config.robots[0],) * num_agents, collision_avoidance=False))
     observation, state = env.reset(jax.random.key(0))  # (N, 5N+2)/(N, 5); state leaves: (...)
-    chex.assert_shape(observation.observations, (num_agents, 5 * num_agents + 2))
-    chex.assert_shape(observation.action_masks, (num_agents, 5))
+    chex.assert_shape(observation.observation, (num_agents, 5 * num_agents + 2))
+    chex.assert_shape(observation.actions_mask, (num_agents, 5))
     assert np.unique(state.p_pos[:, :2], axis=0).shape[0] == num_agents
 
 
@@ -92,25 +92,25 @@ def test_pickup_dropoff_rewards_and_movement() -> None:
         zone1_load=jnp.array([3.0]),  # (1,): less than the robot's capacity
         zone2_load=jnp.array([20.0]),  # (1,)
     )
-    actions = jnp.zeros(4, jnp.int32)  # (N,)
-    first = env.step(jax.random.key(1), state, actions)
-    np.testing.assert_allclose(first.rewards, 2 * 0.25 + 0.75 - 0.1)
+    action = jnp.zeros(4, jnp.int32)  # (N,)
+    first = env.step(jax.random.key(1), state, action)
+    np.testing.assert_allclose(first.reward, 2 * 0.25 + 0.75 - 0.1)
     np.testing.assert_array_equal(first.state.payload, [1, 0, 1, 0])
     np.testing.assert_array_equal(first.state.zone1_load, [0])
     np.testing.assert_array_equal(first.state.zone2_load, [5])
-    second = env.step(jax.random.key(2), first.state, actions)
-    np.testing.assert_allclose(second.rewards, -0.1)  # No repeat pickup while loaded.
+    second = env.step(jax.random.key(2), first.state, action)
+    np.testing.assert_allclose(second.reward, -0.1)  # No repeat pickup while loaded.
     np.testing.assert_array_equal(second.state.zone2_load, [5])
     # Final unloading still incurs the pre-unloading time penalty; later steps give zero.
     last_load = first.state.replace(
         p_pos=first.state.p_pos.at[[0, 2], 0].set(-1.3),  # (N, 3)
         zone2_load=jnp.zeros(1),  # (1,)
     )
-    finished = env.step(jax.random.key(3), last_load, actions)
-    np.testing.assert_allclose(finished.rewards, 2 * 0.75 - 0.1)
+    finished = env.step(jax.random.key(3), last_load, action)
+    np.testing.assert_allclose(finished.reward, 2 * 0.75 - 0.1)
     np.testing.assert_array_equal(finished.state.payload, 0)
-    idle = env.step(jax.random.key(4), finished.state, actions)
-    np.testing.assert_array_equal(idle.rewards, 0)
+    idle = env.step(jax.random.key(4), finished.state, action)
+    np.testing.assert_array_equal(idle.reward, 0)
     assert not bool(idle.done)
     # Payload is deliberately absent from native observations.
     chex.assert_trees_all_equal(env.env.get_obs(state), env.env.get_obs(state.replace(payload=1 - state.payload)))
@@ -142,7 +142,7 @@ def test_mappo_update_and_playback() -> None:
     memory = model.initial_carry(2)  # leaves: (B=2, H=4)
     starts = jnp.ones(2, bool)  # (B,)
     params = model.init(
-        jax.random.key(1), observation.observations, memory, starts[None], observation.action_masks
+        jax.random.key(1), observation.observation, memory, starts[None], observation.actions_mask
     )  # leaves: (...)
     train_state = TrainState.create(
         apply_fn=model.apply,
@@ -151,11 +151,11 @@ def test_mappo_update_and_playback() -> None:
     )
     runner = ppo.RolloutCarry(
         env_state=state,  # leaves: (E, ...)
-        observations=observation,  # (E, N, O)/(E, N, A)
+        observation=observation,  # (E, N, O)/(E, N, A)
         model_carry=memory,  # leaves: (B, H)
-        episode_starts=starts,  # (B,)
-        episode_returns=jnp.zeros(1),  # (E,)
-        episode_step_counts=jnp.zeros(1, jnp.int32),  # (E,)
+        episode_start=starts,  # (B,)
+        episode_return=jnp.zeros(1),  # (E,)
+        episode_step_count=jnp.zeros(1, jnp.int32),  # (E,)
     )
     result = ppo.train_step(runner, train_state, env, config, jax.random.key(2), ppo.init_metrics())
     assert int(result.train_state.step) == 1

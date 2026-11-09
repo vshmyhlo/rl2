@@ -19,9 +19,9 @@ def test_base_multi_agent_env_cannot_be_instantiated() -> None:
         BaseMultiAgentEnv()
 
 
-@pytest.mark.parametrize("missing", ["reset", "step", "memory_resets", "render"])
+@pytest.mark.parametrize("missing", ["reset", "step", "memory_reset", "render"])
 def test_incomplete_adapter_cannot_be_instantiated(missing: str) -> None:
-    methods = {name: MPEEnv.__dict__[name] for name in ("reset", "step", "memory_resets", "render")}
+    methods = {name: MPEEnv.__dict__[name] for name in ("reset", "step", "memory_reset", "render")}
     del methods[missing]
     incomplete = type("IncompleteEnv", (BaseMultiAgentEnv,), methods)
     with pytest.raises(TypeError, match=missing):

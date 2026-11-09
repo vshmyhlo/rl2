@@ -40,22 +40,22 @@ def test_reset_packing_batch_shapes_and_render(env: JaxNavEnv, state: State) -> 
     observation, reset_state = env.reset(jax.random.key(0))
     raw = env.env.get_obs(reset_state)  # agent leaves: (O,)
     assert env.action_space.n == 15
-    chex.assert_shape(observation.observations, (2, 13))
-    chex.assert_shape(observation.action_masks, (2, 15))
-    assert observation.action_masks.dtype == jnp.bool_
-    np.testing.assert_array_equal(observation.action_masks, True)
+    chex.assert_shape(observation.observation, (2, 13))
+    chex.assert_shape(observation.actions_mask, (2, 15))
+    assert observation.actions_mask.dtype == jnp.bool_
+    np.testing.assert_array_equal(observation.actions_mask, True)
     for i, agent in enumerate(env.agents):
-        np.testing.assert_allclose(observation.observations[i], raw[agent])
+        np.testing.assert_allclose(observation.observation[i], raw[agent])
     states = jax.tree.map(lambda x: jnp.stack([x, x]), state)  # leaves: (E=2, ...)
     result = jax.jit(jax.vmap(env.step))(
         jax.random.split(jax.random.key(1), 2),
         states,
         jnp.full((2, 2), 2),
     )
-    chex.assert_shape(result.observation.observations, (2, 2, 13))
-    chex.assert_shape(result.rewards, (2, 2))
+    chex.assert_shape(result.observation.observation, (2, 2, 13))
+    chex.assert_shape(result.reward, (2, 2))
     chex.assert_shape(result.done, (2,))
-    assert bool(jnp.isfinite(result.rewards).all())
+    assert bool(jnp.isfinite(result.reward).all())
     np.testing.assert_array_equal(result.done, False)
     np.testing.assert_array_equal(result.final_state.step, 1)
     frame = env.render(state)  # (H, W, 3)
@@ -78,18 +78,18 @@ def test_boundaries_and_action_masks(env: JaxNavEnv, state: State, boundary: str
     assert bool(result.truncated) == (boundary in ("timeout", "goals"))
     if bool(result.done):
         assert int(result.state.step) == 0 and int(result.final_state.step) == 2
-        np.testing.assert_array_equal(result.agent_dones, True)
-        assert not np.array_equal(result.observation.observations, result.final_observation.observations)
+        np.testing.assert_array_equal(result.agent_done, True)
+        assert not np.array_equal(result.observation.observation, result.final_observation.observation)
     else:
         chex.assert_trees_all_equal(result.state, result.final_state)
         if boundary == "collision":
-            np.testing.assert_array_equal(result.agent_dones, [True, False])
-            np.testing.assert_array_equal(result.observation.action_masks, True)
-            assert float(result.rewards[0]) < float(result.rewards[1])
+            np.testing.assert_array_equal(result.agent_done, [True, False])
+            np.testing.assert_array_equal(result.observation.actions_mask, True)
+            assert float(result.reward[0]) < float(result.reward[1])
         else:
             # Native non-evaporating agents can leave their goals to make room for teammates.
-            np.testing.assert_array_equal(result.agent_dones, False)
-            np.testing.assert_array_equal(result.observation.action_masks, True)
+            np.testing.assert_array_equal(result.agent_done, False)
+            np.testing.assert_array_equal(result.observation.actions_mask, True)
             np.testing.assert_array_equal(result.final_state.goal_reached, [True, False])
 
 
@@ -122,15 +122,15 @@ def test_jaxnav_config_matches_smax_and_validates(monkeypatch: pytest.MonkeyPatc
 
 def constant_policy(
     variables: dict[str, Any],
-    observations: jax.Array,  # (B, O)
+    observation: jax.Array,  # (B, O)
     carry: ppo.RecurrentCarry,  # leaves: (B, H)
     starts: jax.Array,  # (B,)
-    masks: jax.Array,  # (B, A)
+    actions_mask: jax.Array,  # (B, A)
     *,
     method: str,
 ) -> ppo.ActorCriticOutput:
-    logits = jnp.full(masks.shape, -1e10).at[:, 2].set(0.0)  # (B, A), stop only
-    return ppo.ActorCriticOutput(carry, ppo.CategoricalPolicy(logits), jnp.full(observations.shape[0], 2.0))
+    logits = jnp.full(actions_mask.shape, -1e10).at[:, 2].set(0.0)  # (B, A), stop only
+    return ppo.ActorCriticOutput(carry, ppo.CategoricalPolicy(logits), jnp.full(observation.shape[0], 2.0))
 
 
 def test_jaxnav_rollout_timeout_update_and_evaluation(env: JaxNavEnv, state: State) -> None:
@@ -151,10 +151,10 @@ def test_jaxnav_rollout_timeout_update_and_evaluation(env: JaxNavEnv, state: Sta
     memory = model.initial_carry(2)  # leaves: (B=2, H=4)
     final_input = state.replace(step=jnp.asarray(1))
     observation = env._observation(env.env.get_obs(final_input))  # (N, O)/(N, A)
-    batched_state, observations = jax.tree.map(lambda x: jnp.asarray(x)[None], (final_input, observation))
+    batched_state, observation = jax.tree.map(lambda x: jnp.asarray(x)[None], (final_input, observation))
     runner = ppo.RolloutCarry(
         batched_state,
-        observations,
+        observation,
         memory,
         jnp.ones(2, bool),
         jnp.zeros(1),
@@ -163,14 +163,14 @@ def test_jaxnav_rollout_timeout_update_and_evaluation(env: JaxNavEnv, state: Sta
     fake = TrainState.create(apply_fn=constant_policy, params={}, tx=optax.sgd(0.1))
     advanced, rollout = ppo.collect_rollout(runner, fake, env, config, jax.random.key(3))
     expected = env.step(jax.random.key(4), final_input, jnp.full(2, 2))
-    np.testing.assert_allclose(rollout.batch.returns[0], expected.rewards + 1.0, atol=1e-6)
-    chex.assert_shape(rollout.batch.observations, (1, 2, 13))
-    chex.assert_shape(rollout.batch.action_masks, (1, 2, 15))
+    np.testing.assert_allclose(rollout.batch.return_target[0], expected.reward + 1.0, atol=1e-6)
+    chex.assert_shape(rollout.batch.observation, (1, 2, 13))
+    chex.assert_shape(rollout.batch.actions_mask, (1, 2, 15))
     assert int(rollout.episode_count) == 1
-    np.testing.assert_allclose(rollout.episode_return_sum, expected.rewards.mean())
-    np.testing.assert_array_equal(advanced.episode_starts, True)
+    np.testing.assert_allclose(rollout.episode_return_sum, expected.reward.mean())
+    np.testing.assert_array_equal(advanced.episode_start, True)
     params = model.init(
-        jax.random.key(5), observations.observations, memory, jnp.ones((1, 2), bool), observations.action_masks
+        jax.random.key(5), observation.observation, memory, jnp.ones((1, 2), bool), observation.actions_mask
     )
     real = TrainState.create(
         apply_fn=model.apply,

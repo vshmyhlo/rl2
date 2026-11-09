@@ -21,42 +21,42 @@ def test_shapes_rewards_and_timeout(num_agents: int, num_landmarks: int) -> None
     env = MPEEnv(MPEConfig(num_agents=num_agents, num_landmarks=num_landmarks, max_steps=2))
     observation, state = env.reset(jax.random.key(0))  # (N, O)/(N, A); state leaves: (...)
     features = 4 * num_agents + 2 * num_landmarks
-    chex.assert_shape(observation.observations, (num_agents, features))
-    chex.assert_shape(observation.action_masks, (num_agents, 5))
-    assert observation.observations.dtype == jnp.float32
-    assert observation.action_masks.dtype == jnp.bool_
-    np.testing.assert_array_equal(observation.action_masks, True)
+    chex.assert_shape(observation.observation, (num_agents, features))
+    chex.assert_shape(observation.actions_mask, (num_agents, 5))
+    assert observation.observation.dtype == jnp.float32
+    assert observation.actions_mask.dtype == jnp.bool_
+    np.testing.assert_array_equal(observation.actions_mask, True)
     raw = env.env.get_obs(state)  # agent leaves: (O,)
     for i, agent in enumerate(env.agents):
-        np.testing.assert_array_equal(observation.observations[i], raw[agent])
-    actions = jnp.zeros(num_agents, jnp.int32)  # (N,)
-    first = env.step(jax.random.key(1), state, actions)
+        np.testing.assert_array_equal(observation.observation[i], raw[agent])
+    action = jnp.zeros(num_agents, jnp.int32)  # (N,)
+    first = env.step(jax.random.key(1), state, action)
     assert not bool(first.done) and not bool(first.terminated)
-    np.testing.assert_array_equal(first.agent_dones, False)
-    np.testing.assert_array_equal(env.memory_resets(first.state), False)
+    np.testing.assert_array_equal(first.agent_done, False)
+    np.testing.assert_array_equal(env.memory_reset(first.state), False)
     chex.assert_trees_all_equal(first.state, first.final_state)
-    rewards = env.env.rewards(first.final_state)  # agent leaves: ()
-    np.testing.assert_allclose(first.rewards, jnp.stack([rewards[agent] for agent in env.agents]))
+    reward = env.env.rewards(first.final_state)  # agent leaves: ()
+    np.testing.assert_allclose(first.reward, jnp.stack([reward[agent] for agent in env.agents]))
     states = jax.tree.map(lambda x: jnp.stack([x, x]), first.state)  # leaves: (E=2, ...)
     result = jax.jit(jax.vmap(env.step))(
         jax.random.split(jax.random.key(2), 2), states, jnp.zeros((2, num_agents), jnp.int32)
     )
-    chex.assert_shape(result.observation.observations, (2, num_agents, features))
-    chex.assert_shape(result.observation.action_masks, (2, num_agents, 5))
-    chex.assert_shape(result.rewards, (2, num_agents))
+    chex.assert_shape(result.observation.observation, (2, num_agents, features))
+    chex.assert_shape(result.observation.actions_mask, (2, num_agents, 5))
+    chex.assert_shape(result.reward, (2, num_agents))
     chex.assert_shape(result.done, (2,))
-    chex.assert_shape(result.agent_dones, (2, num_agents))
+    chex.assert_shape(result.agent_done, (2, num_agents))
     np.testing.assert_array_equal(result.done, True)
     np.testing.assert_array_equal(result.truncated, True)
     np.testing.assert_array_equal(result.terminated, False)
-    np.testing.assert_array_equal(result.agent_dones, True)
+    np.testing.assert_array_equal(result.agent_done, True)
     np.testing.assert_array_equal(result.final_state.step, 2)
     np.testing.assert_array_equal(result.state.step, 0)
-    np.testing.assert_array_equal(jax.vmap(env.memory_resets)(result.final_state), False)
-    assert not np.array_equal(result.observation.observations, result.final_observation.observations)
+    np.testing.assert_array_equal(jax.vmap(env.memory_reset)(result.final_state), False)
+    assert not np.array_equal(result.observation.observation, result.final_observation.observation)
     raw_final = jax.vmap(env.env.get_obs)(result.final_state)  # agent leaves: (E, O)
     for i, agent in enumerate(env.agents):
-        np.testing.assert_array_equal(result.final_observation.observations[:, i], raw_final[agent])
+        np.testing.assert_array_equal(result.final_observation.observation[:, i], raw_final[agent])
 
 
 @pytest.mark.parametrize(
@@ -85,40 +85,40 @@ def test_reference_communication_movement_and_timeout() -> None:
     config = ppo.load_config(PRESET.with_name("simple_reference.yaml"), ppo.Config)
     env = ppo.make_env(replace(config, env=replace(config.env, max_steps=2)))
     observation, state = env.reset(jax.random.key(0))  # (N=2, O=21)/(N, A=50); state leaves: (...)
-    chex.assert_shape(observation.observations, (2, 21))
-    chex.assert_shape(observation.action_masks, (2, 50))
-    np.testing.assert_array_equal(observation.action_masks, True)
-    np.testing.assert_array_equal(observation.observations[:, -10:], 0)
+    chex.assert_shape(observation.observation, (2, 21))
+    chex.assert_shape(observation.actions_mask, (2, 50))
+    np.testing.assert_array_equal(observation.actions_mask, True)
+    np.testing.assert_array_equal(observation.observation[:, -10:], 0)
     assert env.action_space.n == 50
     # Each agent observes the partner's target, which it must communicate back.
-    goals = jnp.argmax(observation.observations[:, 8:11], axis=-1)  # (N,)
+    goals = jnp.argmax(observation.observation[:, 8:11], axis=-1)  # (N,)
     np.testing.assert_array_equal(goals, state.goal[::-1])
     first = env.step(jax.random.key(1), state, jnp.array([12, 46], jnp.int32))
     messages = jax.nn.one_hot(jnp.array([2, 9]), 10)  # (N, C=10)
     np.testing.assert_array_equal(first.state.c, messages)
-    np.testing.assert_array_equal(first.observation.observations[:, -10:], messages[::-1])
+    np.testing.assert_array_equal(first.observation.observation[:, -10:], messages[::-1])
     assert float(first.state.p_vel[0, 0]) > 0
     assert float(first.state.p_vel[1, 0]) < 0
     assert not bool(first.done)
-    np.testing.assert_allclose(first.rewards[0], first.rewards[1])
+    np.testing.assert_allclose(first.reward[0], first.reward[1])
     states = jax.tree.map(lambda x: jnp.stack([x, x]), first.state)  # leaves: (E=2, ...)
     result = jax.jit(jax.vmap(env.step))(
         jax.random.split(jax.random.key(2), 2), states, jnp.tile(jnp.array([0, 49], jnp.int32), (2, 1))
     )
-    chex.assert_shape(result.observation.observations, (2, 2, 21))
-    chex.assert_shape(result.observation.action_masks, (2, 2, 50))
-    chex.assert_shape(result.rewards, (2, 2))
+    chex.assert_shape(result.observation.observation, (2, 2, 21))
+    chex.assert_shape(result.observation.actions_mask, (2, 2, 50))
+    chex.assert_shape(result.reward, (2, 2))
     assert bool((result.final_state.p_pos[:, 0, 0] > state.p_pos[0, 0]).all())
     assert bool((result.final_state.p_pos[:, 1, 0] < state.p_pos[1, 0]).all())
     np.testing.assert_array_equal(result.truncated, True)
     np.testing.assert_array_equal(result.terminated, False)
-    np.testing.assert_array_equal(result.agent_dones, True)
+    np.testing.assert_array_equal(result.agent_done, True)
     np.testing.assert_array_equal(result.final_state.step, 2)
     np.testing.assert_array_equal(result.state.step, 0)
-    np.testing.assert_array_equal(result.observation.observations[..., -10:], 0)
+    np.testing.assert_array_equal(result.observation.observation[..., -10:], 0)
     final_messages = jax.nn.one_hot(jnp.array([9, 0]), 10)  # (N, C), received from partner
-    np.testing.assert_array_equal(result.final_observation.observations[..., -10:], jnp.tile(final_messages, (2, 1, 1)))
-    np.testing.assert_array_equal(jax.vmap(env.memory_resets)(result.final_state), False)
+    np.testing.assert_array_equal(result.final_observation.observation[..., -10:], jnp.tile(final_messages, (2, 1, 1)))
+    np.testing.assert_array_equal(jax.vmap(env.memory_reset)(result.final_state), False)
 
 
 @pytest.mark.parametrize("num_agents,num_landmarks", [(3, 3), (2, 2)])
@@ -147,7 +147,7 @@ def test_update_playback_and_checkpoint(tmp_path: Path, env_id: MPEEnvId) -> Non
     memory = model.initial_carry(2)  # leaves: (B=2, H=4)
     starts = jnp.ones(2, bool)  # (B,)
     params = model.init(
-        jax.random.key(1), observation.observations, memory, starts[None], observation.action_masks
+        jax.random.key(1), observation.observation, memory, starts[None], observation.actions_mask
     )  # leaves: (...)
     train_state = TrainState.create(
         apply_fn=model.apply,
@@ -156,11 +156,11 @@ def test_update_playback_and_checkpoint(tmp_path: Path, env_id: MPEEnvId) -> Non
     )
     runner = ppo.RolloutCarry(
         env_state=state,  # leaves: (E, ...)
-        observations=observation,  # (E, N, O)/(E, N, A)
+        observation=observation,  # (E, N, O)/(E, N, A)
         model_carry=memory,  # leaves: (B, H)
-        episode_starts=starts,  # (B,)
-        episode_returns=jnp.zeros(1),  # (E,)
-        episode_step_counts=jnp.zeros(1, jnp.int32),  # (E,)
+        episode_start=starts,  # (B,)
+        episode_return=jnp.zeros(1),  # (E,)
+        episode_step_count=jnp.zeros(1, jnp.int32),  # (E,)
     )
     result = ppo.train_step(runner, train_state, env, config, jax.random.key(2), ppo.init_metrics())
     assert int(result.train_state.step) == 1

@@ -24,18 +24,18 @@ def initial_state(env: SMAXEnv) -> State:
 def test_reset_packing_and_batched_step(env: SMAXEnv, initial_state: State) -> None:
     observation, state = env.reset(jax.random.key(0))  # (N, O)/(N, A); state leaves: (...)
     raw, _ = env.env.reset(jax.random.key(0))  # agent leaves: (O,)
-    assert observation.observations.shape == (3, env.env.observation_space(env.agents[0]).shape[0])
-    assert observation.action_masks.shape == (3, 8)
-    assert observation.action_masks.dtype == jnp.bool_
+    assert observation.observation.shape == (3, env.env.observation_space(env.agents[0]).shape[0])
+    assert observation.actions_mask.shape == (3, 8)
+    assert observation.actions_mask.dtype == jnp.bool_
     for index, agent in enumerate(env.agents):
-        np.testing.assert_array_equal(observation.observations[index], raw[agent])
+        np.testing.assert_array_equal(observation.observation[index], raw[agent])
     keys = jax.random.split(jax.random.key(1), 2)  # (E=2,)
     states = jax.tree.map(lambda x: jnp.stack([x, x]), state)  # leaves: (E, ...)
     result = jax.jit(jax.vmap(env.step))(keys, states, jnp.full((2, 3), 4))
-    chex.assert_shape(result.rewards, (2, 3))
-    chex.assert_shape(result.agent_dones, (2, 3))
+    chex.assert_shape(result.reward, (2, 3))
+    chex.assert_shape(result.agent_done, (2, 3))
     chex.assert_shape(result.done, (2,))
-    assert result.observation.observations.shape == (2, *observation.observations.shape)
+    assert result.observation.observation.shape == (2, *observation.observation.shape)
     np.testing.assert_array_equal(result.done, False)
     np.testing.assert_array_equal(result.state.state.step, 1)
     chex.assert_trees_all_equal(state, initial_state)
@@ -68,14 +68,14 @@ def test_boundaries_preserve_final_state_and_reset_only_completed_battles(
     assert bool(result.done) == (boundary != "death")
     assert int(result.final_state.state.step) == (1 if boundary == "death" else 2)
     if boundary == "death":
-        np.testing.assert_array_equal(result.agent_dones, [True, False, False])
-        np.testing.assert_array_equal(result.observation.action_masks[0], jnp.arange(8) == 4)
+        np.testing.assert_array_equal(result.agent_done, [True, False, False])
+        np.testing.assert_array_equal(result.observation.actions_mask[0], jnp.arange(8) == 4)
         chex.assert_trees_all_equal(result.state, result.final_state)
     else:
-        np.testing.assert_array_equal(result.agent_dones, True)
+        np.testing.assert_array_equal(result.agent_done, True)
         assert int(result.state.state.step) == 0
         assert bool(result.state.state.unit_alive.all())
-        assert not np.array_equal(result.observation.observations, result.final_observation.observations)
+        assert not np.array_equal(result.observation.observation, result.final_observation.observation)
 
 
 def test_render(env: SMAXEnv, initial_state: State) -> None:

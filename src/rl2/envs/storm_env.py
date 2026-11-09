@@ -62,51 +62,51 @@ class STORMEnv(BaseMultiAgentEnv[State]):
         self.num_agents = config.num_agents
         self.action_space = DiscreteSpace(self.env.num_actions)
 
-    def _observation(self, observations: jax.Array) -> AgentObservation:  # (N, 5, 5, 14)
+    def _observation(self, observation: jax.Array) -> AgentObservation:  # (N, 5, 5, 14)
         return AgentObservation(
-            observations=observations.reshape(self.num_agents, -1).astype(jnp.float32),  # (N, 350)
-            action_masks=jnp.ones((self.num_agents, self.action_space.n), dtype=bool),  # (N, 8)
+            observation=observation.reshape(self.num_agents, -1).astype(jnp.float32),  # (N, 350)
+            actions_mask=jnp.ones((self.num_agents, self.action_space.n), dtype=bool),  # (N, 8)
         )
 
     def reset(self, key: jax.Array) -> tuple[AgentObservation, State]:  # key: ()
         """Return (N, 350)/(N, 8) observations/masks and (...) state leaves."""
-        observations, state = self.env.reset(key)  # (N, 5, 5, 14); state leaves: (...)
-        return self._observation(observations), state
+        observation, state = self.env.reset(key)  # (N, 5, 5, 14); state leaves: (...)
+        return self._observation(observation), state
 
     def step(
         self,
         key: jax.Array,  # () typed PRNG key
         state: State,  # leaves: (...)
-        actions: jax.Array,  # (N,) int32
+        action: jax.Array,  # (N,) int32
     ) -> MultiAgentStep[State]:
         step_key, reset_key = jax.random.split(key)  # each ()
-        observations, final_state, _, _, _ = self.env.step_env(step_key, state, actions)
-        # observations: (N, 5, 5, 14); state leaves: (...)
+        observation, final_state, _, _, _ = self.env.step_env(step_key, state, action)
+        # observation: (N, 5, 5, 14); state leaves: (...)
         # Upstream's reward scatter can overwrite a successful zap with zero.
         # Newly frozen pairs identify accepted interactions, including simultaneous ones.
-        interactions = (final_state.freeze > 0) & (state.freeze <= 0)  # (N, N)
-        inventories = final_state.agent_invs.astype(jnp.float32)  # (N, 2)
-        proportions = inventories / jnp.maximum(inventories.sum(axis=-1, keepdims=True), 1)  # (N, 2)
-        rewards = ((proportions @ self.payoff @ proportions.T) * interactions).sum(axis=-1)  # (N,)
+        interaction = (final_state.freeze > 0) & (state.freeze <= 0)  # (N, N)
+        inventory = final_state.agent_invs.astype(jnp.float32)  # (N, 2)
+        proportion = inventory / jnp.maximum(inventory.sum(axis=-1, keepdims=True), 1)  # (N, 2)
+        reward = ((proportion @ self.payoff @ proportion.T) * interaction).sum(axis=-1)  # (N,)
         truncated = final_state.step >= self.config.max_steps  # ()
         final_state = final_state.replace(done=truncated)  # leaves: (...)
-        final_observation = self._observation(observations)  # (N, 350)/(N, 8)
+        final_observation = self._observation(observation)  # (N, 350)/(N, 8)
         observation, next_state = jax.lax.cond(
             truncated, lambda: self.reset(reset_key), lambda: (final_observation, final_state)
-        )  # observations: (N, 350)/(N, 8); state leaves: (...)
+        )  # observation: (N, 350)/(N, 8); state leaves: (...)
         return MultiAgentStep(
             observation=observation,  # (N, 350)/(N, 8)
             state=next_state,  # leaves: (...)
-            rewards=rewards.astype(jnp.float32),  # (N,)
+            reward=reward.astype(jnp.float32),  # (N,)
             done=truncated,  # ()
-            agent_dones=jnp.full(self.num_agents, truncated),  # (N,)
+            agent_done=jnp.full(self.num_agents, truncated),  # (N,)
             terminated=jnp.asarray(False),  # ()
             truncated=truncated,  # ()
             final_observation=final_observation,  # (N, 350)/(N, 8)
             final_state=final_state,  # leaves: (...)
         )
 
-    def memory_resets(self, state: State) -> jax.Array:  # state leaves: (...) -> (N,)
+    def memory_reset(self, state: State) -> jax.Array:  # state leaves: (...) -> (N,)
         # Interactions, freezes and respawns remain part of the same social game.
         return jnp.zeros(self.num_agents, dtype=bool)  # (N,)
 

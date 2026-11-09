@@ -13,8 +13,8 @@ from rl2.actions import DiscreteSpace
 class AgentObservation(NamedTuple):
     """N agents, O local features, A discrete actions; optional leading batch axes."""
 
-    observations: jax.Array  # (..., N, O) float32
-    action_masks: jax.Array  # (..., N, A) bool
+    observation: jax.Array  # (..., N, O) float32
+    actions_mask: jax.Array  # (..., N, A) bool
 
 
 class MultiAgentStep[State](NamedTuple):
@@ -25,9 +25,9 @@ class MultiAgentStep[State](NamedTuple):
 
     observation: AgentObservation  # (N, O); (N, A), after autoreset
     state: State  # leaves: (...)
-    rewards: jax.Array  # (N,) floating-point
+    reward: jax.Array  # (N,) floating-point
     done: jax.Array  # () bool environment completion
-    agent_dones: jax.Array  # (N,) bool recurrent reset flags
+    agent_done: jax.Array  # (N,) bool recurrent reset flags
     terminated: jax.Array  # () bool task ended
     truncated: jax.Array  # () bool time limit reached
     final_observation: AgentObservation  # (N, O); (N, A), before autoreset
@@ -40,7 +40,7 @@ class BaseMultiAgentEnv[State](ABC):
     Actions and observations retain native values; agent dictionaries are packed
     in a fixed order. Masks expose native availability, or all actions when absent.
     N denotes agents, O local observation features, and A discrete actions.
-    Reset, step, and memory_resets support caller-applied jax.jit and jax.vmap.
+    Reset, step, and memory_reset support caller-applied jax.jit and jax.vmap.
     Adapters do not add JIT boundaries; rendering may run on the host.
     """
 
@@ -59,12 +59,12 @@ class BaseMultiAgentEnv[State](ABC):
         self,
         key: jax.Array,  # () typed PRNG key
         state: State,  # leaves: (...)
-        actions: jax.Array,  # (N,) integer action IDs
+        action: jax.Array,  # (N,) integer action IDs
     ) -> MultiAgentStep[State]:
         """Advance and autoreset the environment when terminated or truncated."""
 
     @abstractmethod
-    def memory_resets(
+    def memory_reset(
         self,
         state: State,  # leaves: (...)
     ) -> jax.Array:  # (N,) bool

@@ -19,7 +19,10 @@ resolution-markers = [
 
 [manifest]
 constraints = [{ name = "nvidia-nvjitlink", specifier = "<13.1" }]
-overrides = [{ name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux'", specifier = "==2.30.7" }]
+overrides = [
+    { name = "gymnax", specifier = ">=0.0.9,<0.1" },
+    { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux'", specifier = "==2.30.7" },
+]
 excludes = ["opencv-python"]
 
 [[manifest.dependency-metadata]]
@@ -4368,6 +4371,24 @@ wheels = [
 ]
 
 [[package]]
+name = "luxai-s3"
+version = "0.2.1"
+source = { url = "https://github.com/Lux-AI-Challenge/Lux-Design-S3/archive/c6d1e665d12a467b299fb586b3f876e47847746b.tar.gz", subdirectory = "src" }
+dependencies = [
+    { name = "gymnax" },
+    { name = "jax" },
+    { name = "tyro" },
+]
+sdist = { hash = "sha256:2419e6fe47ee02bbf755532995e1a10d3d6471c06d25d8a225516d58b2eb7631" }
+
+[package.metadata]
+requires-dist = [
+    { name = "gymnax", specifier = "==0.0.8" },
+    { name = "jax" },
+    { name = "tyro" },
+]
+
+[[package]]
 name = "lxml"
 version = "6.1.3"
 source = { registry = "https://pypi.org/simple" }
@@ -7950,6 +7971,7 @@ dependencies = [
     { name = "jsonschema" },
     { name = "kauldron" },
     { name = "kinetix-env" },
+    { name = "luxai-s3" },
     { name = "metaljax", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "mlflow-skinny", extra = ["db"] },
     { name = "moviepy" },
@@ -8024,6 +8046,7 @@ requires-dist = [
     { name = "jsonschema", specifier = ">=4.26,<5" },
     { name = "kauldron", specifier = ">=1.4.4,<2" },
     { name = "kinetix-env", specifier = "==3.0.2" },
+    { name = "luxai-s3", url = "https://github.com/Lux-AI-Challenge/Lux-Design-S3/archive/c6d1e665d12a467b299fb586b3f876e47847746b.tar.gz", subdirectory = "src" },
     { name = "metaljax", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.11.8,<0.12" },
     { name = "mlflow-skinny", extras = ["db"], specifier = ">=3.17.1,<4" },
     { name = "moviepy", specifier = ">=2.2,<3" },
@@ -9757,6 +9780,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a3/26/b09b8010994eccc3c09092e6b34058f36a460eea2d4c3e8b910c695975a0/typing_inspection-0.4.4.tar.gz", hash = "sha256:547274fa6b0a561ccf549cc9524b999a578e737d015d8709d021f9d0d13bea47", size = 76928, upload-time = "2026-08-12T12:37:25.997Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/67/81/4add07e5172b7ac40d8ed5ff580409a7801a4fe26d529bdd915401dabfbe/typing_inspection-0.4.4-py3-none-any.whl", hash = "sha256:65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147", size = 14750, upload-time = "2026-08-12T12:37:24.648Z" },
+]
+
+[[package]]
+name = "tyro"
+version = "1.0.17"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "docstring-parser" },
+    { name = "typeguard" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/91/02/9f6388420d5365a24317178157c02d4c737ab5c754baf036f6d0544ac21e/tyro-1.0.17.tar.gz", hash = "sha256:484a040f4bebf8374df2e3fa202b10e413f8d1506ca997ba18cd149bb540203e", size = 606203, upload-time = "2026-11-04T09:47:51.725Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/61/00/2f6e3ec8a96846564028bc20dd7d7a367f01c584067d01db9752d888aca0/tyro-1.0.17-py3-none-any.whl", hash = "sha256:89bbe5b4907965cac4077d2a1c3eaa3648afe177e214c57e490906d0ffef84c1", size = 217323, upload-time = "2026-11-04T09:47:49.994Z" },
 ]
 
 [[package]]
