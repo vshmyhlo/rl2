@@ -21,7 +21,9 @@ optimizer state, RNG keys, and scalar metrics are fully replicated. num_envs and
 batch_size are global sizes and must be divisible by the device count. Losses
 average eligible positions globally, before gradient clipping and optimization.
 Standalone collect_selfplay, sample_batch, and train_step calls require a
-jax.set_mesh context with an Auto batch axis. Evaluation retains its fixed suite.
+jax.set_mesh context with an Auto batch axis. Construct PGX environments before
+entering the mesh so their module-level arrays remain usable within device shards.
+Evaluation retains its fixed suite.
 
 Array dimensions used throughout this module:
 
@@ -279,18 +281,6 @@ class PolicyValueFn(Protocol):
         ...
 
 
-class TransitionFn(Protocol):
-    def __call__(
-        self,
-        predict: PolicyValueFn,
-        env_state: pgx.State,  # Unbatched array leaves.
-        action: jax.Array,  # ()
-        /,
-    ) -> SearchTransition:
-        """Take action in env_state; return reward, discount, and child-state predictions."""
-        ...
-
-
 def init_search_tree(
     root: SearchRoot,
     num_simulations: int,
@@ -318,6 +308,37 @@ def init_search_tree(
         children_indices=jnp.full(edge_shape, -1, jnp.int32),  # (N, A)
         children_values=jnp.zeros(edge_shape, root.value.dtype),  # (N, A)
     )
+
+
+def prepare_logits(
+    logits: jax.Array,  # (A,)
+    legal: jax.Array,  # (A,)
+    key: jax.Array,  # (2,)
+    *,
+    dirichlet_alpha: float,
+    dirichlet_fraction: float,
+) -> jax.Array:
+    """Mask policy logits and optionally mix in Dirichlet noise over legal actions.
+
+    Args:
+        logits: (A,) float32 network policy logits.
+        legal: (A,) boolean legal-action mask.
+        key: (2,) uint32 PRNG key.
+        dirichlet_alpha: Positive concentration for each legal action.
+        dirichlet_fraction: Noise mixture weight in [0, 1].
+
+    Returns:
+        (A,) float32 noisy, masked logits; states with no legal actions remain finite.
+    """
+    logits = mask_logits(logits, legal)  # (A,)
+    if dirichlet_fraction == 0.0:
+        return logits
+    # Independent Gamma samples normalized over legal moves form a Dirichlet
+    # sample on that subset. Log space avoids underflow for small concentrations.
+    log_noise = jax.random.loggamma(key, dirichlet_alpha, shape=logits.shape)  # (A,)
+    noise = jax.nn.softmax(mask_logits(log_noise, legal))  # (A,)
+    probs = (1.0 - dirichlet_fraction) * jax.nn.softmax(logits) + dirichlet_fraction * noise  # (A,)
+    return mask_logits(jnp.log(jnp.maximum(probs, jnp.finfo(probs.dtype).tiny)), legal)  # (A,)
 
 
 def select_puct_action(
@@ -357,6 +378,41 @@ def select_puct_action(
     return jnp.argmax(scores).astype(jnp.int32)  # ()
 
 
+def simulate(
+    key: jax.Array,  # (2,)
+    tree: SearchTree,  # Unbatched leaves: (N, ...)
+) -> SimulationState:
+    """Traverse from the root to an unexpanded edge or a terminal/truncated node."""
+
+    def condition_fn(carry: SimulationState) -> jax.Array:  # ()
+        """Continue while the child node exists and is neither terminated nor truncated."""
+        child_exists = carry.child_index != -1
+        done = (
+            tree.node_env_states.terminated[carry.child_index] | tree.node_env_states.truncated[carry.child_index]
+        )  # ()
+        return child_exists & ~done  # ()
+
+    def body_fn(carry: SimulationState) -> SimulationState:
+        key, action_key = jax.random.split(carry.key)  # Each: (2,)
+        node_index = carry.child_index  # ()
+        action = select_puct_action(action_key, tree, node_index)  # ()
+        return SimulationState(
+            key=key,
+            node_index=node_index,
+            action=action,
+            child_index=tree.children_indices[node_index, action],  # ()
+        )
+
+    initial = SimulationState(
+        key=key,
+        # Valid placeholders for finished roots in batches with other games still expanding.
+        node_index=jnp.int32(0),
+        action=jnp.int32(0),
+        child_index=jnp.int32(0),
+    )
+    return jax.lax.while_loop(condition_fn, body_fn, initial)
+
+
 def transition_step(
     predict: PolicyValueFn,
     env_state: pgx.State,  # Leaves: (...)
@@ -364,7 +420,7 @@ def transition_step(
     *,
     env: pgx.Env,
 ) -> SearchTransition:
-    """Take one action and predict policy/value at the resulting state in a two-player game.
+    """Take one action and predict policy/value only for an ongoing child in a two-player game.
 
     Args:
         predict: Bound observation-to-(logits, value) callable; values use the player-to-move perspective.
@@ -377,33 +433,78 @@ def transition_step(
             reward: () float32 immediate reward for env_state's acting player.
             discount: () float32; -1 for ongoing games, 0 on termination or truncation.
             child_env_state: (...) array leaves forming the resulting PGX state pytree.
-            child_logits: (A,) float32 masked policy logits at child_env_state, A = env.num_actions.
+            child_logits: (A,) float32 masked policy logits; zero when finished, A = env.num_actions.
             child_value: () float32 value for child_env_state's player, zero on termination or truncation.
         Backup uses reward + discount * child_value, negating the opponent's value.
     """
-    child_env_state = env.step(env_state, action)  # Leaves: (...)
-    finished = env_state.terminated | env_state.truncated  # ()
+    parent_done = env_state.terminated | env_state.truncated  # ()
 
-    def preserve_finished(old: jax.Array, new: jax.Array) -> jax.Array:  # Each: (...)
-        return jnp.where(finished, old, new)  # (...)
+    def preserve_finished() -> pgx.State:
+        return env_state.replace(rewards=jnp.zeros_like(env_state.rewards))  # Leaves: (...)
+
+    def step_parent() -> pgx.State:
+        return env.step(env_state, action)  # Leaves: (...)
 
     # PGX checks action legality even after a game has ended. Keep finished
     # nodes absorbing, including truncated states whose mask still has illegal moves.
-    child_env_state = jax.tree.map(
-        preserve_finished, env_state.replace(rewards=jnp.zeros_like(env_state.rewards)), child_env_state
-    )  # Leaves: (...)
-    child_logits, child_value = predict(child_env_state.observation)  # (A,), ()
-    chex.assert_shape(child_logits, (env.num_actions,))
-    chex.assert_shape(child_value, ())
+    child_env_state = jax.lax.cond(parent_done, preserve_finished, step_parent)  # Leaves: (...)
+    child_done = child_env_state.terminated | child_env_state.truncated  # ()
+
+    def finished_predictions() -> tuple[jax.Array, jax.Array]:
+        return jnp.zeros(env.num_actions, jnp.float32), jnp.float32(0.0)  # (A,), ()
+
+    def predict_child() -> tuple[jax.Array, jax.Array]:
+        logits, value = predict(child_env_state.observation)  # (A,), ()
+        chex.assert_shape(logits, (env.num_actions,))
+        chex.assert_shape(value, ())
+        return mask_logits(logits, child_env_state.legal_action_mask), value  # (A,), ()
+
+    child_logits, child_value = jax.lax.cond(child_done, finished_predictions, predict_child)  # (A,), ()
     chex.assert_shape(action, ())
     reward = child_env_state.rewards[env_state.current_player]  # ()
-    done = child_env_state.terminated | child_env_state.truncated  # ()
     return SearchTransition(
         reward=reward,  # ()
-        discount=jnp.where(done, 0.0, -1.0),  # ()
+        discount=jnp.where(child_done, 0.0, -1.0),  # ()
         child_env_state=child_env_state,  # Leaves: (...)
-        child_logits=mask_logits(child_logits, child_env_state.legal_action_mask),  # (A,)
-        child_value=jnp.where(done, 0.0, child_value),  # ()
+        child_logits=child_logits,  # (A,)
+        child_value=child_value,  # ()
+    )
+
+
+def expand(
+    predict: PolicyValueFn,
+    tree: SearchTree,  # Unbatched leaves: (N, ...)
+    node_index: jax.Array,  # ()
+    action: jax.Array,  # ()
+    child_index: jax.Array,  # ()
+    *,
+    env: pgx.Env,
+) -> SearchTree:  # Unbatched leaves: (N, ...)
+    """Evaluate node_index --action--> child_index and store the transition."""
+    _, num_actions = tree.children_indices.shape
+
+    def select(leaf: jax.Array) -> jax.Array:  # (N, ...) -> (...)
+        return leaf[node_index]  # (...)
+
+    env_state = jax.tree.map(select, tree.node_env_states)  # Leaves: (...)
+    transition = transition_step(predict, env_state, action, env=env)
+    chex.assert_shape(transition.child_logits, (num_actions,))
+    chex.assert_shape((transition.reward, transition.discount, transition.child_value), ())
+
+    def update(old: jax.Array, new: jax.Array) -> jax.Array:  # (N, ...), (...) -> (N, ...)
+        chex.assert_shape(new, old.shape[1:])
+        return old.at[child_index].set(new)  # (N, ...)
+
+    return tree.replace(
+        node_env_states=jax.tree.map(update, tree.node_env_states, transition.child_env_state),  # Leaves: (N, ...)
+        node_logits=update(tree.node_logits, transition.child_logits),  # (N, A)
+        node_values=update(tree.node_values, transition.child_value),  # (N,)
+        node_visits=tree.node_visits.at[child_index].set(1),  # (N,)
+        parent_indices=tree.parent_indices.at[child_index].set(node_index),  # (N,)
+        parent_actions=tree.parent_actions.at[child_index].set(action),  # (N,)
+        node_action_rewards=tree.node_action_rewards.at[node_index, action].set(transition.reward),  # (N, A)
+        node_action_discounts=tree.node_action_discounts.at[node_index, action].set(transition.discount),  # (N, A)
+        children_indices=tree.children_indices.at[node_index, action].set(child_index),  # (N, A)
     )
 
 
@@ -421,10 +522,10 @@ def backup(
         (N, ...) updated node arrays; environment states are unchanged.
     """
 
-    def condition(carry: BackupState) -> jax.Array:  # ()
+    def condition_fn(carry: BackupState) -> jax.Array:  # ()
         return carry.node_index != 0  # ()
 
-    def body(carry: BackupState) -> BackupState:
+    def body_fn(carry: BackupState) -> BackupState:
         tree, node_index, node_return = carry  # Tree leaves: (N, ...); index and return: ().
         parent_index = tree.parent_indices[node_index]  # ()
         parent_action = tree.parent_actions[node_index]  # ()
@@ -447,87 +548,16 @@ def backup(
         return BackupState(tree=tree, node_index=parent_index, node_return=parent_return)
 
     initial = BackupState(tree=tree, node_index=leaf_index, node_return=tree.node_values[leaf_index])
-    return jax.lax.while_loop(condition, body, initial).tree  # Leaves: (N, ...)
-
-
-def simulate(
-    key: jax.Array,  # (2,)
-    tree: SearchTree,  # Unbatched leaves: (N, ...)
-) -> SimulationState:
-    """Traverse from the root to an unexpanded edge or a terminal/truncated node."""
-
-    def condition(carry: SimulationState) -> jax.Array:  # ()
-        """Continue while the child node exists and is neither terminated nor truncated."""
-        child_exists = carry.child_index != -1
-        done = (
-            tree.node_env_states.terminated[carry.child_index] | tree.node_env_states.truncated[carry.child_index]
-        )  # ()
-        return child_exists & ~done  # ()
-
-    def body(carry: SimulationState) -> SimulationState:
-        key, action_key = jax.random.split(carry.key)  # Each: (2,)
-        node_index = carry.child_index  # ()
-        action = select_puct_action(action_key, tree, node_index)  # ()
-        return SimulationState(
-            key=key,
-            node_index=node_index,
-            action=action,
-            child_index=tree.children_indices[node_index, action],  # ()
-        )
-
-    initial = SimulationState(
-        key=key,
-        # Valid placeholders for finished roots in batches with other games still expanding.
-        node_index=jnp.int32(0),
-        action=jnp.int32(0),
-        child_index=jnp.int32(0),
-    )
-    return jax.lax.while_loop(condition, body, initial)
-
-
-def expand(
-    predict: PolicyValueFn,
-    tree: SearchTree,  # Unbatched leaves: (N, ...)
-    transition_fn: TransitionFn,
-    node_index: jax.Array,  # ()
-    action: jax.Array,  # ()
-    child_index: jax.Array,  # ()
-) -> SearchTree:  # Unbatched leaves: (N, ...)
-    """Evaluate node_index --action--> child_index and store the transition."""
-    _, num_actions = tree.children_indices.shape
-
-    def select(leaf: jax.Array) -> jax.Array:  # (N, ...) -> (...)
-        return leaf[node_index]  # (...)
-
-    env_state = jax.tree.map(select, tree.node_env_states)  # Leaves: (...)
-    transition = transition_fn(predict, env_state, action)
-    chex.assert_shape(transition.child_logits, (num_actions,))
-    chex.assert_shape((transition.reward, transition.discount, transition.child_value), ())
-
-    def update(old: jax.Array, new: jax.Array) -> jax.Array:  # (N, ...), (...) -> (N, ...)
-        chex.assert_shape(new, old.shape[1:])
-        return old.at[child_index].set(new)  # (N, ...)
-
-    return tree.replace(
-        node_env_states=jax.tree.map(update, tree.node_env_states, transition.child_env_state),  # Leaves: (N, ...)
-        node_logits=update(tree.node_logits, transition.child_logits),  # (N, A)
-        node_values=update(tree.node_values, transition.child_value),  # (N,)
-        node_visits=tree.node_visits.at[child_index].set(1),  # (N,)
-        parent_indices=tree.parent_indices.at[child_index].set(node_index),  # (N,)
-        parent_actions=tree.parent_actions.at[child_index].set(action),  # (N,)
-        node_action_rewards=tree.node_action_rewards.at[node_index, action].set(transition.reward),  # (N, A)
-        node_action_discounts=tree.node_action_discounts.at[node_index, action].set(transition.discount),  # (N, A)
-        children_indices=tree.children_indices.at[node_index, action].set(child_index),  # (N, A)
-    )
+    return jax.lax.while_loop(condition_fn, body_fn, initial).tree  # Leaves: (N, ...)
 
 
 def puct_policy(
     predict: PolicyValueFn,
     key: jax.Array,  # (2,)
     env_state: pgx.State,  # Leaves: (...)
-    transition_fn: TransitionFn,
     num_simulations: int,
     *,
+    env: pgx.Env,
     temperature: jax.Array | float,  # ()
     dirichlet_alpha: float = 0.3,
     dirichlet_fraction: float = 0.0,
@@ -535,13 +565,14 @@ def puct_policy(
     """Predict the root and run PUCT search with optional legal-action Dirichlet noise.
 
     Args:
-        predict: Bound policy/value function used at the root and passed to transition_fn.
+        predict: Bound policy/value function used at the root and ongoing children.
         key: (2,) uint32 PRNG key.
-        env_state: (...) state array leaves; finished root values are zeroed.
-        transition_fn: Single-game transition and prediction function.
+        env_state: (...) state array leaves; finished roots skip prediction and search,
+            with zero values and uniform legal priors.
         num_simulations: Number of simulations; each expands at most one node.
             Finished leaves are revisited without expansion. Zero gives uniform legal weights.
             States with no legal actions fall back to uniform weights over all actions.
+        env: Game rules and action/observation encodings.
         temperature: () action-sampling temperature, or a Python scalar.
         dirichlet_alpha: Positive concentration for each legal root action.
         dirichlet_fraction: Noise mixture weight in [0, 1]; zero disables root noise.
@@ -553,39 +584,47 @@ def puct_policy(
             tree: (N, ...) node arrays, including each node's environment state.
     """
     action_key, noise_key, search_key = jax.random.split(key, 3)  # Each: (2,)
-    logits, value = predict(env_state.observation)  # (A,), ()
-    chex.assert_shape(logits, env_state.legal_action_mask.shape)
-    chex.assert_shape(value, ())
     done = env_state.terminated | env_state.truncated  # ()
-    root = SearchRoot(
-        env_state=env_state,  # Leaves: (...)
-        logits=prepare_logits(
+
+    def finished_predictions() -> tuple[jax.Array, jax.Array]:
+        logits = jnp.zeros(env_state.legal_action_mask.shape, jnp.float32)  # (A,)
+        return mask_logits(logits, env_state.legal_action_mask), jnp.float32(0.0)  # (A,), ()
+
+    def predict_root() -> tuple[jax.Array, jax.Array]:
+        logits, value = predict(env_state.observation)  # (A,), ()
+        chex.assert_shape(logits, env_state.legal_action_mask.shape)
+        chex.assert_shape(value, ())
+        logits = prepare_logits(
             logits,
             env_state.legal_action_mask,
             noise_key,
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_fraction=dirichlet_fraction,
-        ),  # (A,)
-        value=jnp.where(done, 0.0, value),  # ()
+        )  # (A,)
+        return logits, value  # (A,), ()
+
+    logits, value = jax.lax.cond(done, finished_predictions, predict_root)  # (A,), ()
+    root = SearchRoot(
+        env_state=env_state,  # Leaves: (...)
+        logits=logits,  # (A,)
+        value=value,  # ()
     )
 
-    def advance(simulation: int, carry: SearchState) -> SearchState:
+    def body_fn(simulation: int, carry: SearchState) -> SearchState:
         tree = carry.tree  # Leaves: (N, ...)
         key, simulation_key = jax.random.split(carry.key)  # Each: (2,)
         simulation_state = simulate(simulation_key, tree)
         new_node_index = jnp.asarray(simulation + 1, jnp.int32)  # ()
 
-        def condition(carry: tuple[SearchTree, jax.Array]) -> jax.Array:  # ((N, ...) tree, () flag) -> ()
-            return carry[1]  # ()
-
-        def body(carry: tuple[SearchTree, jax.Array]) -> tuple[SearchTree, jax.Array]:
-            tree, _ = carry  # Tree leaves: (N, ...); flag: ().
+        def expand_leaf(tree: SearchTree) -> SearchTree:  # Leaves: (N, ...)
             return expand(
-                predict, tree, transition_fn, simulation_state.node_index, simulation_state.action, new_node_index
-            ), jnp.bool_(False)  # (N, ...), ()
+                predict, tree, simulation_state.node_index, simulation_state.action, new_node_index, env=env
+            )  # Leaves: (N, ...)
 
-        # A single-pass while keeps model parameters shared under vmap, unlike a batched cond.
-        tree, _ = jax.lax.while_loop(condition, body, (tree, simulation_state.child_index == -1))
+        def keep_tree(tree: SearchTree) -> SearchTree:  # Leaves: (N, ...)
+            return tree
+
+        tree = jax.lax.cond(simulation_state.child_index == -1, expand_leaf, keep_tree, tree)  # Leaves: (N, ...)
         leaf_index = jnp.where(simulation_state.child_index == -1, new_node_index, simulation_state.child_index)  # ()
         tree = tree.replace(
             node_visits=tree.node_visits.at[leaf_index].add(
@@ -595,9 +634,16 @@ def puct_policy(
         return SearchState(key=key, tree=backup(tree, leaf_index))
 
     tree = init_search_tree(root, num_simulations)  # Leaves: (N, ...)
-    tree = jax.lax.fori_loop(
-        0, num_simulations, advance, SearchState(key=search_key, tree=tree)
-    ).tree  # Leaves: (N, ...)
+
+    def keep_root() -> SearchTree:
+        return tree  # Leaves: (N, ...)
+
+    def search() -> SearchTree:
+        return jax.lax.fori_loop(
+            0, num_simulations, body_fn, SearchState(key=search_key, tree=tree)
+        ).tree  # Leaves: (N, ...)
+
+    tree = jax.lax.cond(done, keep_root, search)  # Leaves: (N, ...)
     counts = tree.node_action_visits[0].astype(root.value.dtype)  # (A,)
     total = counts.sum()  # ()
     legal = env_state.legal_action_mask  # (A,)
@@ -616,35 +662,103 @@ def puct_policy(
     )
 
 
-def prepare_logits(
-    logits: jax.Array,  # (A,)
-    legal: jax.Array,  # (A,)
+def collect_one_game(
+    params: Parameters,
     key: jax.Array,  # (2,)
     *,
-    dirichlet_alpha: float,
-    dirichlet_fraction: float,
-) -> jax.Array:
-    """Mask policy logits and optionally mix in Dirichlet noise over legal actions.
+    env: pgx.Env,
+    apply_fn: PolicyValueApplyFn,
+    config: Config,
+) -> tuple[Batch, RolloutMetrics]:
+    """Collect one padded game; active games at the move limit are adjudicated draws.
 
     Args:
-        logits: (A,) float32 network policy logits.
-        legal: (A,) boolean legal-action mask.
-        key: (2,) uint32 PRNG key.
-        dirichlet_alpha: Positive concentration for each legal action.
-        dirichlet_fraction: Noise mixture weight in [0, 1].
+        params: Model parameter pytree shared across games.
+        key: (2,) uint32 game PRNG key.
+        env: Game rules and encodings.
+        apply_fn: Batched network, adapted to one observation at its boundary.
+        config: Self-play settings; num_envs is used only by collect_selfplay.
 
     Returns:
-        (A,) float32 noisy, masked logits; states with no legal actions remain finite.
+        Batch and RolloutMetrics, with fields:
+            observation: (T, *O) float32 observations before each move.
+            action_weights: (T, A) float32 normalized search visit counts; zero for padding.
+            value_targets: (T,) float32 actor-relative outcomes; zero for padding and draws.
+            policy_mask: (T,) bool non-padding positions.
+            value_mask: (T,) bool positions with terminal or adjudicated outcomes, excluding truncations.
+            completed_games: () int32; one for a terminal or adjudicated game, otherwise zero.
+            environment_steps: () integer count of non-padding moves.
+            value_target_count: () integer count of supervised value targets.
     """
-    logits = mask_logits(logits, legal)  # (A,)
-    if dirichlet_fraction == 0.0:
-        return logits
-    # Independent Gamma samples normalized over legal moves form a Dirichlet
-    # sample on that subset. Log space avoids underflow for small concentrations.
-    log_noise = jax.random.loggamma(key, dirichlet_alpha, shape=logits.shape)  # (A,)
-    noise = jax.nn.softmax(mask_logits(log_noise, legal))  # (A,)
-    probs = (1.0 - dirichlet_fraction) * jax.nn.softmax(logits) + dirichlet_fraction * noise  # (A,)
-    return mask_logits(jnp.log(jnp.maximum(probs, jnp.finfo(probs.dtype).tiny)), legal)  # (A,)
+    init_key, play_key = jax.random.split(key)  # Each: (2,)
+    env_state = env.init(init_key)  # Unbatched array leaves.
+
+    def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (*O,) -> (A,), ()
+        logits, value = apply_fn({"params": params}, observation[None])  # (1, A), (1,)
+        chex.assert_rank(logits, 2)
+        chex.assert_shape(logits, (1, logits.shape[-1]))
+        chex.assert_shape(value, (1,))
+        return logits[0], value[0]  # (A,), ()
+
+    def scan_fn(
+        env_state: pgx.State,  # Leaves: (...)
+        inputs: tuple[jax.Array, jax.Array],  # (2,) key and () move index.
+    ) -> tuple[pgx.State, SelfplayStep]:
+        key, move_index = inputs  # key: (2,); move_index: ().
+        done = env_state.terminated | env_state.truncated  # ()
+
+        def pad_finished() -> tuple[pgx.State, jax.Array]:
+            # Preserve final rewards: PGX otherwise clears them on later steps.
+            return env_state, jnp.zeros(env.num_actions, jnp.float32)  # Leaves: (...); (A,)
+
+        def play_move() -> tuple[pgx.State, jax.Array]:
+            # PGX supplies exact transitions for PUCT, with no learned dynamics.
+            policy = puct_policy(
+                predict,
+                key,
+                env_state,
+                config.num_simulations,
+                env=env,
+                temperature=jnp.where(move_index < config.exploration_moves, 1.0, 0.0),
+                dirichlet_alpha=config.dirichlet_alpha,
+                dirichlet_fraction=config.dirichlet_fraction,
+            )
+            return env.step(env_state, policy.action), policy.action_weights  # Leaves: (...); (A,)
+
+        next_env_state, action_weights = jax.lax.cond(done, pad_finished, play_move)  # Leaves: (...); (A,)
+
+        return next_env_state, SelfplayStep(
+            observation=env_state.observation.astype(jnp.float32),  # (*O,)
+            action_weights=action_weights,  # (A,)
+            current_player=env_state.current_player,  # ()
+            policy_mask=~done,  # ()
+        )
+
+    final_env_state, rollout = jax.lax.scan(  # State leaves: (...); rollout leaves: (T, ...).
+        scan_fn,
+        env_state,
+        (jax.random.split(play_key, config.max_moves), jnp.arange(config.max_moves, dtype=jnp.int32)),
+    )
+
+    observation, action_weights, current_player, policy_mask = rollout  # Leaves: (T, ...)
+    # Map final rewards to the player who acted at each move.
+    completed = final_env_state.terminated | ~final_env_state.truncated  # ()
+    value_mask = policy_mask & completed  # (T,)
+    value_targets = final_env_state.rewards[current_player]  # (T,)
+    value_targets = jnp.where(policy_mask & final_env_state.terminated, value_targets, 0.0)  # (T,)
+    batch = Batch(
+        observation=observation,  # (T, *O)
+        action_weights=action_weights,  # (T, A)
+        value_targets=value_targets,  # (T,)
+        policy_mask=policy_mask,  # (T,)
+        value_mask=value_mask,  # (T,)
+    )
+
+    return batch, RolloutMetrics(
+        completed_games=completed.astype(jnp.int32),  # ()
+        environment_steps=policy_mask.sum(),  # ()
+        value_target_count=value_mask.sum(),  # ()
+    )
 
 
 @partial(
@@ -674,7 +788,7 @@ def collect_selfplay(
     Returns:
         Batch and RolloutMetrics, with fields:
             observation: (B, T, *O) float32 recorded observations.
-            action_weights: (B, T, A) float32 MCTS action weights.
+            action_weights: (B, T, A) float32 MCTS action weights; zero for padding.
             value_targets: (B, T) float32 player-relative outcomes, zero for cutoff draws.
             policy_mask: (B, T) bool non-padding positions.
             value_mask: (B, T) bool positions with terminal or adjudicated outcomes.
@@ -685,112 +799,46 @@ def collect_selfplay(
     params, key = jax.lax.with_sharding_constraint((params, key), PartitionSpec())  # Parameter shapes; key: (2,).
     keys = jax.random.split(key, config.num_envs)  # (B, 2)
     keys = jax.lax.with_sharding_constraint(keys, PartitionSpec("batch"))  # (B, 2)
-    collect = partial(collect_one_game, params, env=env, apply_fn=apply_fn, config=config)
-    batch, metrics = jax.vmap(collect)(keys)  # Batch leaves: (B, T, ...); metric leaves: (B,)
+
+    @partial(
+        jax.shard_map,
+        in_specs=(PartitionSpec(), PartitionSpec("batch")),
+        out_specs=(PartitionSpec("batch"), PartitionSpec("batch")),
+        # Search and PGX branches mix constants with varying leaves; all outputs are sharded.
+        check_vma=False,
+    )
+    def collect_shard(params: Parameters, keys: jax.Array) -> tuple[Batch, RolloutMetrics]:  # Keys: (b, 2)
+        # b is the local game count. Keep cond's batched convolutions within each device.
+        collect = partial(collect_one_game, params, env=env, apply_fn=apply_fn, config=config)
+        return jax.vmap(collect)(keys)  # Batch leaves: (b, T, ...); metric leaves: (b,)
+
+    batch, metrics = collect_shard(params, keys)  # Batch leaves: (B, T, ...); metric leaves: (B,)
     return batch, jax.tree.map(jnp.sum, metrics)  # Batch leaves: (B, T, ...); metric leaves: ().
 
 
-def collect_one_game(
-    params: Parameters,
-    key: jax.Array,  # (2,)
-    *,
-    env: pgx.Env,
-    apply_fn: PolicyValueApplyFn,
-    config: Config,
-) -> tuple[Batch, RolloutMetrics]:
-    """Collect one padded game; active games at the move limit are adjudicated draws.
+@partial(
+    jax.jit,
+    static_argnames=("batch_size",),
+    out_shardings=PartitionSpec("batch"),
+)
+def sample_batch(batch: Batch, key: jax.Array, batch_size: int) -> Batch:  # key: (2,)
+    """Sample (M, ...) positions from (B, T, ...) rollouts uniformly with replacement.
 
-    Args:
-        params: Model parameter pytree shared across games.
-        key: (2,) uint32 game PRNG key.
-        env: Game rules and encodings.
-        apply_fn: Batched network, adapted to one observation at its boundary.
-        config: Self-play settings; num_envs is used only by collect_selfplay.
-
-    Returns:
-        Batch and RolloutMetrics, with fields:
-            observation: (T, *O) float32 observations before each move.
-            action_weights: (T, A) float32 normalized search visit counts.
-            value_targets: (T,) float32 actor-relative outcomes; zero for padding and draws.
-            policy_mask: (T,) bool non-padding positions.
-            value_mask: (T,) bool positions with terminal or adjudicated outcomes, excluding truncations.
-            completed_games: () int32; one for a terminal or adjudicated game, otherwise zero.
-            environment_steps: () integer count of non-padding moves.
-            value_target_count: () integer count of supervised value targets.
+    M = batch_size, independently of B * T. At least one non-padding position must exist.
     """
-    init_key, play_key = jax.random.split(key)  # Each: (2,)
-    env_state = env.init(init_key)  # Unbatched array leaves.
+    batch = jax.lax.with_sharding_constraint(batch, PartitionSpec("batch"))  # Leaves: (B, T, ...).
+    key = jax.lax.with_sharding_constraint(key, PartitionSpec())  # (2,)
+    # Invert cumulative counts instead of generating a (M, B * T)
+    # Gumbel array. Right insertion skips padding, including leading zero counts.
+    counts = jnp.cumsum(batch.policy_mask, dtype=jnp.int32)  # (B * T,) in game-major order.
+    ranks = jax.random.randint(key, (batch_size,), 0, counts[-1])  # (M,)
+    indices = jnp.searchsorted(counts, ranks, side="right")  # (M,)
+    games, moves = jnp.divmod(indices, batch.policy_mask.shape[1])  # Each: (M,)
 
-    def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (*O,) -> (A,), ()
-        logits, value = apply_fn({"params": params}, observation[None])  # (1, A), (1,)
-        chex.assert_rank(logits, 2)
-        chex.assert_shape(logits, (1, logits.shape[-1]))
-        chex.assert_shape(value, (1,))
-        return logits[0], value[0]  # (A,), ()
+    def select(x: jax.Array) -> jax.Array:  # (B, T, ...) -> (M, ...)
+        return x[games, moves]  # (M, ...)
 
-    def step(
-        env_state: pgx.State,  # Leaves: (...)
-        inputs: tuple[jax.Array, jax.Array],  # (2,) key and () move index.
-    ) -> tuple[pgx.State, SelfplayStep]:
-        key, move_index = inputs  # key: (2,); move_index: ().
-        done = env_state.terminated | env_state.truncated  # ()
-        # PGX supplies exact transitions for PUCT, with no learned dynamics.
-        policy = puct_policy(
-            predict,
-            key,
-            env_state,
-            partial(transition_step, env=env),
-            config.num_simulations,
-            temperature=jnp.where(move_index < config.exploration_moves, 1.0, 0.0),
-            dirichlet_alpha=config.dirichlet_alpha,
-            dirichlet_fraction=config.dirichlet_fraction,
-        )
-        next_env_state = env.step(env_state, policy.action)  # Leaves: (...)
-
-        def preserve_finished(
-            old: jax.Array,  # (...)
-            new: jax.Array,  # (...)
-        ) -> jax.Array:  # (...)
-            """Preserve (...) state leaves for games that have already stopped."""
-            # Preserve final rewards: PGX otherwise clears them on later steps.
-            return jnp.where(done, old, new)  # (...)
-
-        next_env_state = jax.tree.map(preserve_finished, env_state, next_env_state)  # Leaves: (...)
-
-        return next_env_state, SelfplayStep(
-            observation=env_state.observation.astype(jnp.float32),  # (*O,)
-            action_weights=policy.action_weights,  # (A,)
-            current_player=env_state.current_player,  # ()
-            policy_mask=~done,  # ()
-        )
-
-    final_env_state, rollout = jax.lax.scan(  # State leaves: (...); rollout leaves: (T, ...).
-        step,
-        env_state,
-        (jax.random.split(play_key, config.max_moves), jnp.arange(config.max_moves, dtype=jnp.int32)),
-    )
-
-    observation, action_weights, current_player, policy_mask = rollout  # Leaves: (T, ...)
-    # Map final rewards to the player who acted at each move.
-    value_targets = final_env_state.rewards[current_player]  # (T,)
-    move_limit_draws = ~(final_env_state.terminated | final_env_state.truncated)  # ()
-    completed = final_env_state.terminated | move_limit_draws  # ()
-    value_mask = policy_mask & completed  # (T,)
-    # A win on the final allowed move keeps its outcome; only active games draw.
-    value_targets = jnp.where(policy_mask & final_env_state.terminated, value_targets, 0.0)  # (T,)
-    batch = Batch(
-        observation=observation,  # (T, *O)
-        action_weights=action_weights,  # (T, A)
-        value_targets=value_targets,  # (T,)
-        policy_mask=policy_mask,  # (T,)
-        value_mask=value_mask,  # (T,)
-    )
-
-    return batch, RolloutMetrics(
-        completed_games=completed.astype(jnp.int32),  # ()
-        environment_steps=policy_mask.sum(),  # ()
-        value_target_count=value_mask.sum(),  # ()
-    )
+    return jax.tree.map(select, batch)
 
 
 def loss_fn(
@@ -836,7 +884,7 @@ def train_step(
         value_update_count=jnp.int32(0),  # ()
     )
 
-    def update(
+    def body_fn(
         _: int,
         carry: TrainStepResult,
     ) -> TrainStepResult:
@@ -856,34 +904,9 @@ def train_step(
     return jax.lax.fori_loop(
         0,
         updates_per_iteration,
-        update,
+        body_fn,
         TrainStepResult(train_state=train_state, key=key, update_metrics=metrics),
     )
-
-
-@partial(
-    jax.jit,
-    static_argnames=("batch_size",),
-    out_shardings=PartitionSpec("batch"),
-)
-def sample_batch(batch: Batch, key: jax.Array, batch_size: int) -> Batch:  # key: (2,)
-    """Sample (M, ...) positions from (B, T, ...) rollouts uniformly with replacement.
-
-    M = batch_size, independently of B * T. At least one non-padding position must exist.
-    """
-    batch = jax.lax.with_sharding_constraint(batch, PartitionSpec("batch"))  # Leaves: (B, T, ...).
-    key = jax.lax.with_sharding_constraint(key, PartitionSpec())  # (2,)
-    # Invert cumulative counts instead of generating a (M, B * T)
-    # Gumbel array. Right insertion skips padding, including leading zero counts.
-    counts = jnp.cumsum(batch.policy_mask, dtype=jnp.int32)  # (B * T,) in game-major order.
-    ranks = jax.random.randint(key, (batch_size,), 0, counts[-1])  # (M,)
-    indices = jnp.searchsorted(counts, ranks, side="right")  # (M,)
-    games, moves = jnp.divmod(indices, batch.policy_mask.shape[1])  # Each: (M,)
-
-    def select(x: jax.Array) -> jax.Array:  # (B, T, ...) -> (M, ...)
-        return x[games, moves]  # (M, ...)
-
-    return jax.tree.map(select, batch)
 
 
 def training_mesh(config: Config) -> Mesh:
@@ -897,12 +920,12 @@ def training_mesh(config: Config) -> Mesh:
 
 
 def train(config: Config) -> TrainState:
+    env = pgx.make(config.env_id)
     with (
         jax.set_mesh(training_mesh(config)),
         checkpoint_manager(config.ckpt_dir) as manager,
         MLflowLogger(experiment="alphazero", run_name=config.run_id) as writer,
     ):
-        env = pgx.make(config.env_id)
         model = PolicyValueNet(
             num_actions=env.num_actions, channels=config.model.channels, num_blocks=config.model.num_blocks
         )

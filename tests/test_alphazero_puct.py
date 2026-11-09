@@ -98,8 +98,11 @@ def test_backup_accumulates_returns_and_preserves_finished_rows() -> None:
 
 
 @pytest.mark.parametrize("temperature", [0.0, 1.0], ids=["greedy", "sampling"])
-def test_search_prefers_winning_actions_over_initial_priors(temperature: float) -> None:
-    env_states = jax.vmap(pgx.make("tic_tac_toe").init)(jax.random.split(jax.random.PRNGKey(0), 2))  # Leaves: (B, ...)
+def test_search_prefers_winning_actions_over_initial_priors(
+    temperature: float, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = pgx.make("tic_tac_toe")
+    env_states = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 2))  # Leaves: (B, ...)
     env_states = env_states.replace(
         current_player=jnp.arange(2, dtype=jnp.int32),  # (B,)
         legal_action_mask=jnp.tile(jnp.array([True, True, False]), (2, 1)),  # (B, A)
@@ -111,10 +114,12 @@ def test_search_prefers_winning_actions_over_initial_priors(temperature: float) 
             jnp.float32(0.0),  # ()
         )
 
-    def transition_fn(
+    def transition(
         model: az.PolicyValueFn,
         state: pgx.State,  # Leaves: (...)
         action: jax.Array,  # ()
+        *,
+        env: pgx.Env,
     ) -> az.SearchTransition:
         logits, value = model(state.observation)  # (A,), ()
         reward = jnp.where(action == state.current_player, 1.0, -1.0)  # ()
@@ -126,7 +131,8 @@ def test_search_prefers_winning_actions_over_initial_priors(temperature: float) 
             child_env_state=state.replace(terminated=jnp.ones_like(state.terminated)),  # Leaves: (...)
         )
 
-    search = partial(az.puct_policy, predict, transition_fn=transition_fn, num_simulations=16, temperature=temperature)
+    monkeypatch.setattr(az, "transition_step", transition)
+    search = partial(az.puct_policy, predict, env=env, num_simulations=16, temperature=temperature)
     result = jax.jit(jax.vmap(search))(jax.random.split(jax.random.PRNGKey(0), 2), env_states)
     assert result.action.shape == (2,)
     assert result.action_weights.shape == (2, 3)

@@ -1,12 +1,13 @@
 ---
 layout: ../layouts/ArticleLayout.astro
 title: AlphaZero · From self-play to a batch
-description: Animate PUCT search, explore visit counts and temperature, then inspect the self-play batch used to sample training positions.
+description: Explore legal-action masking and Dirichlet noise, animate PUCT search, then inspect the self-play batch used to sample training positions.
 ---
 
 import SelfPlayDemo from '../components/SelfPlayDemo';
 import PuctDemo from '../components/PuctDemo';
 import PolicyScoreDemo from '../components/PolicyScoreDemo';
+import DirichletNoiseDemo from '../components/DirichletNoiseDemo';
 
 <a href="/">← All notes</a>
 
@@ -19,6 +20,32 @@ a policy target for each position. `jax.lax.scan` stacks those records along a n
 time axis, producing arrays shaped `(T, B, …)`. The code immediately swaps these
 axes to use the **(B, T) convention: B game rows × T time columns**, matching the
 visualization and the returned rollout.
+
+## Before search: `prepare_logits`
+
+The network returns a logit for each action. `prepare_logits` first masks illegal
+actions; softmax then renormalizes the policy over the legal moves. During
+self-play, it mixes that policy with a Dirichlet noise sample:
+
+$$
+p = \operatorname{softmax}(\operatorname{mask}(\ell)),\qquad
+\eta \sim \operatorname{Dirichlet}(\alpha,\ldots,\alpha),\qquad
+p' = (1-\varepsilon)p + \varepsilon\eta.
+$$
+
+Here α is `dirichlet_alpha` for each legal action and ε is
+`dirichlet_fraction`. Independent Gamma samples, normalized over legal actions,
+produce η; the implementation works in log space to avoid underflow for small α.
+The mixture happens in **probability space**, then the function converts it back
+to masked logits. This changes the **root prior used by search**, before visit
+counts produce the training target.
+
+Compare three discrete distributions: a fixed, slightly peaked **original** policy,
+a **Dirichlet** sample, and their **mixed** distribution. All six actions are legal.
+Adjust α to change the noise concentration and ε to change its share of the mixture.
+Use **Sample new Dirichlet** to draw fresh noise while keeping the original fixed.
+
+<DirichletNoiseDemo client:load />
 
 ## Inside one move: `puct_policy`
 
@@ -153,4 +180,4 @@ and gathers all fields at those coordinates, returning `(M, …)` arrays where
 parameter updates using minibatches of size `batch_size` from this rollout.
 There is no persistent replay buffer here.
 
-<footer>Based on <code>puct_policy</code>, <code>collect_selfplay</code>, and <code>sample_batch</code> in <code>src/rl2/alphazero/train.py</code>. The figures use illustrative data, not a live model.</footer>
+<footer>Based on <code>prepare_logits</code>, <code>puct_policy</code>, <code>collect_selfplay</code>, and <code>sample_batch</code> in <code>src/rl2/alphazero/train.py</code>. The figures use illustrative data, not a live model.</footer>

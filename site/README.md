@@ -39,3 +39,7 @@ npm run preview
 ```
 
 The production build is written to `dist/`.
+
+The Dirichlet figure samples Gamma values directly in JavaScript and normalizes
+them in log space. It follows `prepare_logits` masking, mixing, and probability
+flooring, but does not reproduce JAX’s PRNG sequence or float32 arithmetic.

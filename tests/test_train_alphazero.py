@@ -30,6 +30,12 @@ def single_device_mesh() -> Generator[None]:
 
 
 @pytest.fixture(scope="module")
+def chess_env() -> pgx.Env:
+    # PGX's module-level constants must be created before entering the training mesh.
+    return pgx.make("chess")
+
+
+@pytest.fixture(scope="module")
 def tiny_model() -> tuple[pgx.Env, az.PolicyValueNet, az.Parameters]:
     env = pgx.make("tic_tac_toe")
     model = az.PolicyValueNet(env.num_actions, channels=4, num_blocks=1)
@@ -139,6 +145,48 @@ def test_outcomes_use_player_ids_and_adjudicate_move_limit_draws(
     assert metrics.completed_games == int(not truncated)
 
 
+@pytest.mark.parametrize("truncated", [False, True], ids=["terminated", "truncated"])
+def test_selfplay_skips_finished_moves(truncated: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = pgx.make("tic_tac_toe")
+    state = env.init(jax.random.PRNGKey(0))  # Leaves: (...)
+    finished = state.replace(
+        terminated=jnp.bool_(not truncated),  # ()
+        truncated=jnp.bool_(truncated),  # ()
+        rewards=jnp.array([1.0, -1.0]),  # (P,)
+    )
+    monkeypatch.setattr(env, "init", Mock(return_value=state))
+    step = Mock(return_value=finished)
+    monkeypatch.setattr(env, "step", step)
+    root = az.SearchRoot(
+        env_state=state, logits=jnp.zeros(env.num_actions), value=jnp.float32(0.0)
+    )  # Leaves: (...), (A,), ()
+    policy = Mock(
+        return_value=az.PolicyOutput(
+            action=jnp.int32(0),  # ()
+            action_weights=jax.nn.one_hot(0, env.num_actions),  # (A,)
+            tree=az.init_search_tree(root, 0),  # Leaves: (N, ...)
+        )
+    )
+    monkeypatch.setattr(az, "puct_policy", policy)
+    # Eager control flow distinguishes executing a branch from tracing it.
+    with jax.disable_jit():
+        batch, metrics = az.collect_one_game(
+            {}, jax.random.PRNGKey(0), env=env, apply_fn=Mock(), config=az.Config(max_moves=3)
+        )
+    policy.assert_called_once()
+    step.assert_called_once()
+    assert batch.observation.shape == (3, *state.observation.shape)
+    assert batch.action_weights.shape == (3, env.num_actions)
+    np.testing.assert_array_equal(batch.policy_mask, [True, False, False])
+    np.testing.assert_array_equal(batch.value_mask, [not truncated, False, False])
+    np.testing.assert_array_equal(batch.action_weights[1:], 0.0)
+    np.testing.assert_array_equal(
+        batch.value_targets, [0.0 if truncated else finished.rewards[state.current_player], 0.0, 0.0]
+    )
+    assert metrics.environment_steps == 1
+    assert metrics.completed_games == int(not truncated)
+
+
 def test_transition_step_terminal_reward_and_opponent_discount(
     tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Parameters],
 ) -> None:
@@ -170,7 +218,11 @@ def test_transition_step_terminal_reward_and_opponent_discount(
     np.testing.assert_array_equal(output.reward, [1, 0])
     np.testing.assert_array_equal(output.discount, [0, -1])
     assert output.child_value[0] == 0
-    _, expected_values = model.apply({"params": params}, child_states.observation)
+    np.testing.assert_array_equal(output.child_logits[0], 0.0)
+    expected_logits, expected_values = model.apply({"params": params}, child_states.observation)  # (B, A), (B,)
+    np.testing.assert_allclose(
+        output.child_logits[1], az.mask_logits(expected_logits[1], child_states.legal_action_mask[1]), atol=1e-7
+    )
     np.testing.assert_allclose(output.child_value[1], expected_values[1], atol=1e-7)
     probs = jax.nn.softmax(output.child_logits)
     assert np.all(np.asarray(probs[1])[~np.asarray(child_states.legal_action_mask[1])] == 0)
@@ -222,7 +274,7 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
     assert 10 <= metrics.environment_steps <= 18
     np.testing.assert_array_equal(batch.value_mask, batch.policy_mask)
     assert not batch.policy_mask[:, -1].any()
-    np.testing.assert_allclose(batch.action_weights.sum(-1), 1.0)
+    np.testing.assert_allclose(batch.action_weights.sum(-1), batch.policy_mask.astype(jnp.float32))
     occupied = np.asarray(batch.observation).any(axis=-1).reshape(config.num_envs, config.max_moves, 9)  # (B, T, A)
     real_positions = np.asarray(batch.policy_mask)  # (B, T)
     assert np.all(np.asarray(batch.action_weights)[occupied & real_positions[..., None]] == 0)
@@ -258,8 +310,8 @@ def test_selfplay_and_update(tiny_model: tuple[pgx.Env, az.PolicyValueNet, az.Pa
     assert all(np.all(np.asarray(leaf) == 0) for leaf in jax.tree.leaves(grads))
 
 
-def test_chess_search_smoke() -> None:
-    env = pgx.make("chess")
+def test_chess_search_smoke(chess_env: pgx.Env) -> None:
+    env = chess_env
     config = az.Config(num_envs=1, max_moves=1, num_simulations=1, model=ModelConfig(channels=4, num_blocks=1))
     model = az.PolicyValueNet(env.num_actions, channels=4, num_blocks=1)
     observation = env.init(jax.random.PRNGKey(0)).observation[None]  # (1, 8, 8, 119)

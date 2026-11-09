@@ -105,13 +105,13 @@ def test_search_uses_acting_network_and_greedy_legal_action(monkeypatch: pytest.
         predict: PolicyValueFn,
         key: jax.Array,  # (2,)
         env_state: pgx.State,  # Leaves: (...)
-        transition_fn: ev.train.TransitionFn,
         num_simulations: int,
         **kwargs: Any,
     ) -> ev.train.PolicyOutput:
         logits, value = predict(env_state.observation)  # (A,), ()
         seen.append(float(value))
         assert num_simulations == 3
+        assert kwargs["env"] is env
         assert kwargs["temperature"] == 0
         assert kwargs.get("dirichlet_fraction", 0.0) == 0.0
         np.testing.assert_array_equal(env_state.legal_action_mask, state.legal_action_mask)

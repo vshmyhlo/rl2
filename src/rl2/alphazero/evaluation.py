@@ -75,8 +75,8 @@ def play_game(
             predict,
             jax.random.fold_in(key, move),
             env_state,
-            partial(train.transition_step, env=env),
             num_simulations,
+            env=env,
             temperature=0.0,
         )
         # Explicit argmax avoids random tie breaking in the policy's sampled action.

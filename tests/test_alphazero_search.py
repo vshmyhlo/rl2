@@ -1,4 +1,5 @@
 from functools import partial
+from unittest.mock import Mock
 
 import jax
 import jax.numpy as jnp
@@ -9,6 +10,26 @@ pgx = pytest.importorskip("pgx")
 
 from rl2.alphazero import train as az
 from rl2.alphazero.train import transition_step
+
+
+@pytest.mark.parametrize("truncated", [False, True], ids=["terminated", "truncated"])
+def test_finished_root_skips_prediction_and_simulations(truncated: bool) -> None:
+    env = pgx.make("tic_tac_toe")
+    state = env.init(jax.random.PRNGKey(0)).replace(
+        terminated=jnp.bool_(not truncated), truncated=jnp.bool_(truncated)
+    )  # Leaves: (...)
+    predict = Mock(return_value=(jnp.zeros(env.num_actions), jnp.float32(0.75)))  # (A,), ()
+    with jax.disable_jit():
+        result = az.puct_policy(
+            predict, jax.random.PRNGKey(0), state, 2, env=env, temperature=0.0, dirichlet_fraction=0.25
+        )
+    predict.assert_not_called()
+    assert result.action.shape == ()
+    assert result.action_weights.shape == (env.num_actions,)
+    np.testing.assert_allclose(result.action_weights, 1 / env.num_actions)
+    np.testing.assert_array_equal(result.tree.node_visits, [1, 0, 0])
+    np.testing.assert_array_equal(result.tree.node_values, 0.0)
+    np.testing.assert_array_equal(result.tree.children_indices, -1)
 
 
 @pytest.mark.parametrize("noise_fraction", [0.0, 1.0], ids=["network-priors", "noise-priors"])
@@ -32,7 +53,7 @@ def test_puct_prepares_root_predictions(noise_fraction: float) -> None:
     search = partial(
         az.puct_policy,
         predict,
-        transition_fn=partial(transition_step, env=env),
+        env=env,
         num_simulations=0,
         temperature=0.0,
         dirichlet_alpha=0.3,
@@ -47,12 +68,13 @@ def test_puct_prepares_root_predictions(noise_fraction: float) -> None:
     probabilities = jax.nn.softmax(tree.node_logits[:, 0])  # (B, A)
     np.testing.assert_array_equal(probabilities[:, 2:], 0.0)
     np.testing.assert_allclose(probabilities.sum(axis=-1), 1.0)
+    np.testing.assert_array_equal(probabilities[1:, :2], 0.5)
     if noise_fraction == 0.0:
         # Preserve log-odds even when their probabilities underflow to zero.
-        np.testing.assert_array_equal(tree.node_logits[:, 0, :2], [[0.0, -200.0]] * 3)
-        np.testing.assert_array_equal(probabilities[:, :2], [[1.0, 0.0]] * 3)
+        np.testing.assert_array_equal(tree.node_logits[0, 0, :2], [0.0, -200.0])
+        np.testing.assert_array_equal(probabilities[0, :2], [1.0, 0.0])
     else:
-        assert not np.allclose(probabilities[:, :2], 0.5)
+        assert not np.allclose(probabilities[0, :2], 0.5)
         assert not np.allclose(probabilities[0], probabilities[1])
 
 
@@ -76,8 +98,8 @@ def test_puct_rejects_malformed_root_predictions(logits_shape: tuple[int, ...], 
             predict,
             jax.random.PRNGKey(0),
             state,
-            partial(transition_step, env=env),
             0,
+            env=env,
             temperature=0.0,
         )
 
@@ -94,8 +116,8 @@ def test_transition_step_finished_nodes_do_not_repeat_reward_or_bootstrap() -> N
         legal_action_mask=states.legal_action_mask.at[1, 0].set(False),
     )
 
-    def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:
-        return jnp.zeros(9, jnp.float32), jnp.float32(0.5)  # (A,), ()
+    def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (*O,)
+        return jnp.arange(9, dtype=jnp.float32), jnp.float32(0.5)  # (A,), ()
 
     step = jax.jit(jax.vmap(partial(transition_step, predict, env=env)))
     output = step(states, jnp.zeros(2, jnp.int32))
@@ -103,10 +125,13 @@ def test_transition_step_finished_nodes_do_not_repeat_reward_or_bootstrap() -> N
     np.testing.assert_array_equal(output.reward, [0, 0])
     np.testing.assert_array_equal(output.discount, [0, 0])
     np.testing.assert_array_equal(output.child_value, [0, 0])
-    np.testing.assert_array_equal(child_states.terminated, states.terminated)
-    np.testing.assert_array_equal(child_states.truncated, states.truncated)
-    np.testing.assert_array_equal(child_states.legal_action_mask, states.legal_action_mask)
-    assert np.isfinite(jax.nn.softmax(output.child_logits)).all()
+    assert output.child_logits.shape == (2, env.num_actions)
+    np.testing.assert_array_equal(output.child_logits, 0.0)
+    jax.tree.map(
+        np.testing.assert_array_equal,
+        child_states,
+        states.replace(rewards=jnp.zeros_like(states.rewards)),
+    )
 
 
 @pytest.mark.parametrize(
@@ -141,10 +166,11 @@ def test_transition_step_rejects_malformed_predictions(
     ],
 )
 def test_local_puct_terminal_rewards_and_nested_state_shapes(
-    simulations: int, temperature: float, truncated: bool
+    simulations: int, temperature: float, truncated: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The first game has one legal terminal move; the second is already finished.
-    env_states = jax.vmap(pgx.make("tic_tac_toe").init)(jax.random.split(jax.random.PRNGKey(0), 2))  # Leaves: (B, ...).
+    env = pgx.make("tic_tac_toe")
+    env_states = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 2))  # Leaves: (B, ...).
     env_states = env_states.replace(
         terminated=jnp.array([False, not truncated]),  # (B,)
         truncated=jnp.array([False, truncated]),  # (B,)
@@ -154,10 +180,12 @@ def test_local_puct_terminal_rewards_and_nested_state_shapes(
     def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (*O,)
         return jnp.zeros(2), jnp.float32(0.25)  # (A,), ()
 
-    def transition_fn(
+    def transition(
         model: az.PolicyValueFn,
         env_state: pgx.State,  # Leaves: (...)
         action: jax.Array,  # ()
+        *,
+        env: pgx.Env,
     ) -> az.SearchTransition:
         logits, value = model(env_state.observation)  # (A,), ()
         return az.SearchTransition(
@@ -170,10 +198,11 @@ def test_local_puct_terminal_rewards_and_nested_state_shapes(
             ),  # Leaves: (...)
         )
 
+    monkeypatch.setattr(az, "transition_step", transition)
     search = partial(
         az.puct_policy,
         predict,
-        transition_fn=transition_fn,
+        env=env,
         num_simulations=simulations,
         temperature=temperature,
     )
@@ -184,7 +213,7 @@ def test_local_puct_terminal_rewards_and_nested_state_shapes(
     assert tree.node_action_visits.shape == (2, simulations + 1, 2)
     assert tree.node_env_states.terminated.shape == (2, simulations + 1)
     assert tree.node_env_states.observation.shape == (2, simulations + 1, 3, 3, 2)
-    np.testing.assert_array_equal(tree.node_visits[:, 0], simulations + 1)
+    np.testing.assert_array_equal(tree.node_visits[:, 0], [simulations + 1, 1])
     np.testing.assert_allclose(tree.node_values[:, 0], [(0.25 + simulations) / (simulations + 1), 0.0])
     np.testing.assert_array_equal(tree.node_action_visits[:, 0].sum(axis=-1), [simulations, 0])
     np.testing.assert_array_equal((tree.node_visits > 0).sum(axis=-1), [2 if simulations else 1, 1])
@@ -209,15 +238,17 @@ def test_local_puct_terminal_rewards_and_nested_state_shapes(
 
 
 @pytest.mark.parametrize("terminal_depth", [None, 2], ids=["ongoing-chain", "terminal-grandchild"])
-def test_search_expands_chain_until_finished(terminal_depth: int | None) -> None:
+def test_search_expands_chain_until_finished(terminal_depth: int | None, monkeypatch: pytest.MonkeyPatch) -> None:
     # One action forces a chain; terminal revisits must still back up through every ancestor.
     def predict(observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (*O,)
         return jnp.zeros(1), jnp.float32(0.0)  # (A,), ()
 
-    def transition_fn(
+    def transition(
         model: az.PolicyValueFn,
         env_state: pgx.State,  # Leaves: (...).
         action: jax.Array,  # ()
+        *,
+        env: pgx.Env,
     ) -> az.SearchTransition:
         child_depth = env_state._step_count + 1  # ()
         child_env_state = env_state.replace(
@@ -233,13 +264,15 @@ def test_search_expands_chain_until_finished(terminal_depth: int | None) -> None
             child_env_state=child_env_state,  # Leaves: (...)
         )
 
-    env_state = pgx.make("tic_tac_toe").init(jax.random.PRNGKey(0))  # Leaves: (...).
+    monkeypatch.setattr(az, "transition_step", transition)
+    env = pgx.make("tic_tac_toe")
+    env_state = env.init(jax.random.PRNGKey(0))  # Leaves: (...).
     env_state = env_state.replace(legal_action_mask=jnp.ones(1, bool))  # Leaves: (...).
     search = jax.jit(
         partial(
             az.puct_policy,
             predict,
-            transition_fn=transition_fn,
+            env=env,
             num_simulations=4,
             temperature=0.0,
         )
