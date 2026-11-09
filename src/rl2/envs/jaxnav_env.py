@@ -79,15 +79,13 @@ class JaxNavEnv(BaseMultiAgentEnv[State]):
             state=next_state,  # leaves: (...)
             reward=jnp.stack([reward[agent] for agent in self.agents]),  # (N,)
             done=done,  # ()
-            agent_done=self.memory_reset(final_state) | done,  # (N,)
+            agent_done=final_state.move_term | done,  # (N,)
+            agent_inactive=final_state.move_term,  # (N,)
             terminated=terminated,  # ()
             truncated=truncated,  # ()
             final_observation=final_observation,  # (N, O)/(N, A)
             final_state=final_state,  # leaves: (...)
         )
-
-    def memory_reset(self, state: State) -> jax.Array:  # state leaves: (...) -> (N,)
-        return state.move_term  # (N,)
 
     def render(self, state: State) -> NDArray[np.uint8]:  # state leaves: (...) -> (H, W, 3)
         figure = Figure(figsize=(5, 5), dpi=80)

@@ -113,14 +113,12 @@ class RobotariumEnv(BaseMultiAgentEnv[State]):
             reward=jnp.stack([reward[agent] for agent in self.agents]),  # (N,)
             done=truncated,  # ()
             agent_done=jnp.full(self.num_agents, truncated),  # (N,)
+            agent_inactive=jnp.zeros(self.num_agents, dtype=bool),  # (N,)
             terminated=jnp.asarray(False),  # () Native success does not end the episode.
             truncated=truncated,  # ()
             final_observation=final_observation,  # (N, O)/(N, A)
             final_state=final_state,  # leaves: (...)
         )
-
-    def memory_reset(self, state: State) -> jax.Array:  # state leaves: (...) -> (N,)
-        return jnp.zeros(self.num_agents, dtype=bool)  # (N,)
 
     def render(self, state: State) -> NDArray[np.uint8]:  # state leaves: (...) -> (H, W, 3)
         figure = Figure(figsize=(6, 4), dpi=80)

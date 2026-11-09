@@ -16,6 +16,7 @@ from jaxmarl.environments.smax.smax_env import State as BattleState
 from ppo_helpers import metric_history
 
 from rl2 import train_mappo as ppo
+from rl2.envs.lux_env import LuxConfig, LuxEnv
 from rl2.envs.multi_agent import AgentObservation, MultiAgentStep
 from rl2.envs.smax_env import SMAXConfig, SMAXEnv
 from rl2.playback import PlaybackState, advance_episode
@@ -93,15 +94,16 @@ class ScriptedSMAX(SMAXEnv):
         reset = self.reset(key)[1].replace(enemy_policy_state=state.enemy_policy_state)
         advanced = jax.tree.map(lambda a, b: jnp.where(done, a, b), reset, final)
         return MultiAgentStep(
-            self.observation(advanced),
-            advanced,
-            jnp.full(2, step, jnp.float32),  # reward: (N,)
-            done,
-            jnp.array([True, done]),
-            terminated,
-            done & ~terminated,
-            self.observation(final),
-            final,
+            observation=self.observation(advanced),  # (N, O)/(N, A)
+            state=advanced,  # leaves: (...)
+            reward=jnp.full(2, step, jnp.float32),  # (N,)
+            done=done,  # ()
+            agent_done=jnp.array([True, done]),  # (N,)
+            agent_inactive=jnp.array([True, False]),  # (N,)
+            terminated=terminated,  # ()
+            truncated=done & ~terminated,  # ()
+            final_observation=self.observation(final),  # (N, O)/(N, A)
+            final_state=final,  # leaves: (...)
         )
 
 
@@ -133,14 +135,26 @@ def test_rollout_team_gae_death_timeout_and_sequence_selection(config: ppo.Confi
     runner = ppo.RolloutCarry(state, observation, memory, jnp.ones(4, bool), jnp.zeros(2), jnp.zeros(2, jnp.int32))
     train_state = TrainState.create(apply_fn=scripted_policy, params={}, tx=optax.sgd(0.1))
     advanced, result = ppo.collect_rollout(runner, train_state, env, config, jax.random.key(1))
-    chex.assert_shape(result.batch.observation, (2, 4, 2))
-    chex.assert_shape(result.batch.actions_mask, (2, 4, 3))
-    chex.assert_shape((result.batch.action, result.batch.value, result.batch.return_target), (2, 4))
-    np.testing.assert_array_equal(result.batch.observation[0, :, 1], [0, 1, 0, 1])
-    np.testing.assert_array_equal(result.batch.action, [[0, 1, 0, 1]] * 2)
+    chex.assert_shape(result.batch.observation, (4, 2, 2))
+    chex.assert_shape(result.batch.actions_mask, (4, 2, 3))
+    chex.assert_shape(
+        (
+            result.batch.action,
+            result.batch.old_log_prob,
+            result.batch.value,
+            result.batch.advantage,
+            result.batch.return_target,
+            result.batch.episode_start,
+        ),
+        (4, 2),
+    )
+    np.testing.assert_array_equal(result.batch.observation[:, 0, 1], [0, 1, 0, 1])
+    np.testing.assert_array_equal(result.batch.action, [[0, 0], [1, 1], [0, 0], [1, 1]])
     # Team reward survives death. Timeout adds gamma * V(final)=10, never V(reset)=0.
-    np.testing.assert_allclose(result.batch.return_target, [[7, 7, 2, 2], [12, 12, 2, 2]])
-    np.testing.assert_array_equal(result.batch.episode_start, [[True] * 4, [True, False, True, False]])
+    np.testing.assert_allclose(result.batch.return_target, [[7, 12], [7, 12], [2, 2], [2, 2]])
+    np.testing.assert_array_equal(
+        result.batch.episode_start, [[True, True], [True, False], [True, True], [True, False]]
+    )
     for leaf in jax.tree.leaves(advanced.model_carry):  # each (B, H)
         np.testing.assert_array_equal(leaf[:, 0], [1, 2, 1, 2])
     assert int(result.episode_count) == 2
@@ -149,7 +163,7 @@ def test_rollout_team_gae_death_timeout_and_sequence_selection(config: ppo.Confi
     np.testing.assert_array_equal(advanced.episode_return, 0)
     np.testing.assert_array_equal(advanced.episode_start, True)
     selected = result.batch.select_sequences(jnp.array([3, 0]))
-    np.testing.assert_array_equal(selected.return_target, [[2, 7], [2, 12]])
+    np.testing.assert_array_equal(selected.return_target, [[2, 2], [7, 12]])
     chex.assert_shape(jax.tree.leaves(selected.model_carry), (2, 4))
     repeated, duplicate = ppo.collect_rollout(advanced, train_state, env, config, result.key)
     chex.assert_trees_all_equal(duplicate.batch.model_carry, advanced.model_carry)
@@ -158,32 +172,72 @@ def test_rollout_team_gae_death_timeout_and_sequence_selection(config: ppo.Confi
     np.testing.assert_array_equal(repeated.episode_step_count, 0)
 
 
+def test_timeout_bootstrap_resets_only_inactive_agent_memory(config: ppo.Config) -> None:
+    def memory_policy(
+        variables: dict[str, Any],
+        observation: jax.Array,  # (B, O)
+        memory: ppo.RecurrentCarry,  # leaves: (B, H)
+        starts: jax.Array,  # (B,)
+        actions_mask: jax.Array,  # (B, A)
+        *,
+        method: str,
+    ) -> ppo.ActorCriticOutput:
+        output = scripted_policy(variables, observation, memory, starts, actions_mask, method=method)
+        return output._replace(value=output.carry[0][0][:, 0])  # value: (B,)
+
+    env = ScriptedSMAX()
+    _, state = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 1))  # leaves: (E=1, ...)
+    state = state.replace(state=state.state.replace(step=jnp.ones(1, jnp.int32)))
+    observation = jax.vmap(env.observation)(state)  # (E, N=2, O=2)/(E, N, A=3)
+    runner = ppo.RolloutCarry(
+        env_state=state,
+        observation=observation,
+        model_carry=((jnp.full((2, 1), 7.0), jnp.full((2, 1), 7.0)),),  # leaves: (B=2, H=1)
+        episode_start=jnp.zeros(2, bool),  # (B,)
+        episode_return=jnp.zeros(1),  # (E,)
+        episode_step_count=jnp.ones(1, jnp.int32),  # (E,)
+    )
+    train_state = TrainState.create(apply_fn=memory_policy, params={}, tx=optax.sgd(0.1))
+    advanced, result = ppo.collect_rollout(
+        runner, train_state, env, replace(config, num_envs=1, num_steps=1, num_minibatches=1), jax.random.key(1)
+    )
+    # Final values use cleared memory for the dead agent (1), retained memory for the living one (9).
+    np.testing.assert_allclose(result.batch.return_target, [[2.5], [6.5]])
+    np.testing.assert_array_equal(advanced.episode_start, True)
+    for leaf in jax.tree.leaves(advanced.model_carry):  # (B, H)
+        np.testing.assert_array_equal(leaf, 8.0)  # Bootstrap evaluation does not advance rollout memory.
+
+
 def test_local_model_mask_replay_and_shared_memory(config: ppo.Config) -> None:
     model = ppo.ActorCritic(ppo.DiscreteSpace(3), config.model)
-    observation = jnp.arange(16, dtype=jnp.float32).reshape(2, 2, 4) / 16  # (T, B, O)
-    starts = jnp.array([[True, True], [True, False]])  # (T, B)
-    actions_mask = jnp.array([[[True, False, True], [False, True, False]]] * 2)  # (T, B, A)
-    memory = model.initial_carry(2)  # leaves: (B, H)
+    observation = jnp.arange(24, dtype=jnp.float32).reshape(3, 2, 4) / 24  # (B, T, O)
+    starts = jnp.array([[True, True], [True, False], [False, False]])  # (B, T)
+    actions_mask = jnp.array(
+        [[[True, False, True]] * 2, [[False, True, False]] * 2, [[True, True, False]] * 2]
+    )  # (B, T, A)
+    memory = model.initial_carry(3)  # leaves: (B, H)
     assert len(memory) == config.model.recurrent.num_layers
-    chex.assert_shape(jax.tree.leaves(memory), (2, 4))
+    chex.assert_shape(jax.tree.leaves(memory), (3, 4))
     params = model.init(jax.random.key(0), observation, memory, starts, actions_mask)
     chex.assert_shape(params["params"]["encoder"]["kernel"], (4, config.model.encoder.embedding_size))
     # Keep the tiny ReLU encoder active so the test exercises recurrent features.
     params["params"]["encoder"]["kernel"] = jnp.eye(4)  # (O, F)
     output = model.apply(params, observation, memory, starts, actions_mask)
-    first = model.apply(params, observation[0], memory, starts[0], actions_mask[0], method="step")
-    chex.assert_shape(first.policy.logits, (2, 3))
-    chex.assert_shape(first.value, (2,))
-    second = model.apply(params, observation[1], first.carry, starts[1], actions_mask[1], method="step")
+    first = model.apply(params, observation[:, 0], memory, starts[:, 0], actions_mask[:, 0], method="step")
+    chex.assert_shape(first.policy.logits, (3, 3))
+    chex.assert_shape(first.value, (3,))
+    second = model.apply(params, observation[:, 1], first.carry, starts[:, 1], actions_mask[:, 1], method="step")
     chex.assert_trees_all_close(second.carry, output.carry, atol=1e-6)
-    np.testing.assert_allclose(output.value, jnp.stack([first.value, second.value]), atol=1e-6)
-    np.testing.assert_allclose(output.policy.logits, jnp.stack([first.policy.logits, second.policy.logits]), atol=1e-6)
-    action, log_prob = output.policy.sample_and_log_prob(seed=jax.random.key(2))  # each (T, B)
+    np.testing.assert_allclose(output.value, jnp.stack([first.value, second.value], axis=1), atol=1e-6)
+    np.testing.assert_allclose(
+        output.policy.logits, jnp.stack([first.policy.logits, second.policy.logits], axis=1), atol=1e-6
+    )
+    action, log_prob = output.policy.sample_and_log_prob(seed=jax.random.key(2))  # each (B, T)
     assert bool(jnp.take_along_axis(actions_mask, action[..., None], axis=-1).all())
     assert bool(jnp.isfinite(output.policy.entropy()).all())
     np.testing.assert_allclose(output.policy.log_prob(action), log_prob, atol=1e-6)
-    chex.assert_shape(output.value, (2, 2))
-    chex.assert_shape(output.policy.logits, (2, 2, 3))
+    chex.assert_shape(output.value, (3, 2))
+    chex.assert_shape(output.policy.logits, (3, 2, 3))
     # Both heads depend on the shared encoder; changing only the value head leaves policy and memory intact.
     changed = dict(params["params"], encoder=jax.tree.map(jnp.zeros_like, params["params"]["encoder"]))
     no_features = model.apply({"params": changed}, observation, memory, starts, actions_mask)
@@ -198,31 +252,31 @@ def test_local_model_mask_replay_and_shared_memory(config: ppo.Config) -> None:
 
 def tiny_policy(
     variables: dict[str, dict[str, jax.Array]],  # params: logits (A,), value ()
-    observation: jax.Array,  # (T, B, O)
+    observation: jax.Array,  # (B, T, O)
     memory: ppo.RecurrentCarry,  # leaves: (B, H)
-    starts: jax.Array,  # (T, B)
-    actions_mask: jax.Array,  # (T, B, A)
+    starts: jax.Array,  # (B, T)
+    actions_mask: jax.Array,  # (B, T, A)
 ) -> ppo.ActorCriticOutput:
-    logits = jnp.where(actions_mask, variables["params"]["logits"], -1e10)  # (T, B, A)
+    logits = jnp.where(actions_mask, variables["params"]["logits"], -1e10)  # (B, T, A)
     return ppo.ActorCriticOutput(
         carry=memory,
         policy=ppo.CategoricalPolicy(logits),
-        value=jnp.broadcast_to(variables["params"]["value"], starts.shape),  # (T, B)
+        value=jnp.broadcast_to(variables["params"]["value"], starts.shape),  # (B, T)
     )
 
 
 @pytest.fixture
 def tiny_batch() -> ppo.PPOBatch:
     return ppo.PPOBatch(
-        observation=jnp.zeros((2, 2, 1)),  # (T, B, O)
-        actions_mask=jnp.ones((2, 2, 2), dtype=bool),  # (T, B, A)
-        action=jnp.array([[0, 1], [0, 1]]),  # (T, B)
-        old_log_prob=jnp.full((2, 2), -jnp.log(2.0)),  # (T, B)
-        value=jnp.array([[0.0, 1.0], [0.0, 1.0]]),  # (T, B)
-        advantage=jnp.array([[1.0, -1.0], [1.0, -1.0]]),  # (T, B)
-        return_target=jnp.array([[0.0, 1.0], [0.0, 1.0]]),  # (T, B)
+        observation=jnp.zeros((2, 3, 1)),  # (B, T, O)
+        actions_mask=jnp.ones((2, 3, 2), dtype=bool),  # (B, T, A)
+        action=jnp.array([[0, 0, 0], [1, 1, 1]]),  # (B, T)
+        old_log_prob=jnp.full((2, 3), -jnp.log(2.0)),  # (B, T)
+        value=jnp.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]),  # (B, T)
+        advantage=jnp.array([[1.0, 1.0, 1.0], [-1.0, -1.0, -1.0]]),  # (B, T)
+        return_target=jnp.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]),  # (B, T)
         model_carry=((jnp.zeros((2, 1)), jnp.zeros((2, 1))),),  # leaves: (B, H)
-        episode_start=jnp.ones((2, 2), dtype=bool),  # (T, B)
+        episode_start=jnp.ones((2, 3), dtype=bool),  # (B, T)
     )
 
 
@@ -244,8 +298,8 @@ def test_update_losses_single_sample_and_kl_rejection(config: ppo.Config, tiny_b
     assert float(updated.params["logits"][0]) > 0
 
     # One transition must retain its nonzero advantage rather than normalize to zero.
-    singleton = jax.tree.map(lambda leaf: leaf[:1], tiny_batch.select_sequences(jnp.array([0])))
-    # Sequence leaves: (T=1, B=1, ...); memory leaves remain (B=1, H=1).
+    singleton = jax.tree.map(lambda leaf: leaf[:, :1], tiny_batch.select_sequences(jnp.array([0])))
+    # Sequence leaves: (B=1, T=1, ...); memory leaves remain (B=1, H=1).
     single_updated, single_metrics = ppo.update(state, singleton, config)
     assert float(single_metrics.policy_loss) == pytest.approx(-1.0)
     assert float(single_updated.params["logits"][0]) > 0
@@ -278,7 +332,10 @@ def test_train_step_omits_undefined_variance_and_stops_updates(
     )
     runner = Mock(spec=ppo.RolloutCarry)
     collect = Mock(
-        return_value=(runner, rollout._replace(batch=rollout.batch.replace(return_target=jnp.zeros((2, 2)))))
+        return_value=(
+            runner,
+            rollout._replace(batch=rollout.batch.replace(return_target=jnp.zeros_like(tiny_batch.return_target))),
+        )
     )
     monkeypatch.setattr(ppo, "collect_rollout", collect)
     result = ppo.train_step(runner, state, ScriptedSMAX(), config, rollout.key, ppo.init_metrics(), 4)
@@ -363,7 +420,13 @@ def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_pat
     model = ppo.ActorCritic(env.action_space, config.model)
     memory = model.initial_carry(3)  # leaves: (B=3, H)
     starts = jnp.ones(3, bool)  # (B,)
-    params = model.init(jax.random.key(1), observation.observation, memory, starts[None], observation.actions_mask)
+    params = model.init(
+        jax.random.key(1),
+        observation.observation[0, :, None],  # (B, T=1, O)
+        memory,
+        starts[:, None],  # (B, T=1)
+        observation.actions_mask[0, :, None],  # (B, T=1, A)
+    )
     train_state = TrainState.create(
         apply_fn=model.apply,
         params=params["params"],
@@ -650,3 +713,86 @@ def test_mlflow_resume_without_checkpoint(config: ppo.Config) -> None:
     ):
         ppo.train(config)
     logger.assert_called_once_with(experiment="mappo", run_name=config.run_id)
+
+
+def test_multi_discrete_model_masks_and_sequence_replay(config: ppo.Config) -> None:
+    model = ppo.ActorCritic(action_space=ppo.MultiDiscreteSpace(nvec=(2, 3)), model=config.model)
+    observation = jnp.ones((2, 2, 4))  # (B, T, O)
+    starts = jnp.array([[True, False], [True, False]])  # (B, T)
+    masks = jnp.ones((2, 2, 2, 3), dtype=bool).at[..., 1, 1].set(False)  # (B, T, D, A)
+    memory = model.initial_carry(2)  # leaves: (B, H)
+    params = model.init(jax.random.key(0), observation, memory, starts, masks)
+    output = model.apply(params, observation, memory, starts, masks)
+    assert isinstance(output.policy, ppo.MultiCategoricalPolicy)
+    chex.assert_shape(output.policy.logits, (2, 2, 2, 3))
+    chex.assert_shape(output.value, (2, 2))
+    action, log_prob = output.policy.sample_and_log_prob(seed=jax.random.key(1))  # (B, T, D); (B, T)
+    assert action.shape == (2, 2, 2) and log_prob.shape == (2, 2)
+    assert bool((action[..., 0] < 2).all())  # Padded category is masked even when requested by caller.
+    assert bool((action[..., 1] != 1).all())
+    np.testing.assert_allclose(output.policy.log_prob(action), log_prob, atol=1e-6)
+    first = model.apply(params, observation[:, 0], memory, starts[:, 0], masks[:, 0], method="step")
+    second = model.apply(params, observation[:, 1], first.carry, starts[:, 1], masks[:, 1], method="step")
+    chex.assert_trees_all_close(second.carry, output.carry, atol=1e-6)
+    np.testing.assert_allclose(
+        output.policy.logits, jnp.stack((first.policy.logits, second.policy.logits), axis=1), atol=1e-6
+    )
+
+
+def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Path) -> None:
+    config = replace(
+        config,
+        env=LuxConfig(max_units=2, max_steps_in_match=2, match_count=1, randomize_params=False),
+        num_envs=1,
+        num_steps=3,
+        num_minibatches=1,
+        total_steps=3,
+    )
+    path = tmp_path / "lux.yaml"
+    path.write_text(yaml.safe_dump(asdict(config)))
+    loaded = ppo.load_config(path, ppo.Config)
+    env = ppo.make_env(loaded)
+    assert isinstance(env, LuxEnv) and env.num_agents == 2
+    with pytest.raises(ValueError, match="num_agents"):
+        ppo.make_env(replace(loaded, num_minibatches=3))
+    observation, state = jax.jit(jax.vmap(env.reset))(jax.random.split(jax.random.key(0), 1))
+    # observation: (E, N, O)/(E, N, U, A); state leaves: (E, ...)
+    model = ppo.ActorCritic(action_space=env.action_space, model=config.model)
+    memory = model.initial_carry(2)  # leaves: (B, H)
+    starts = jnp.ones(2, dtype=bool)  # (B,)
+    sequence = jax.tree.map(lambda leaf: jnp.swapaxes(leaf, 0, 1), observation)  # (B, T=1, ...)
+    params = model.init(jax.random.key(1), sequence.observation, memory, starts[:, None], sequence.actions_mask)
+    train_state = TrainState.create(apply_fn=model.apply, params=params["params"], tx=optax.adam(0.001))
+    runner = ppo.RolloutCarry(
+        env_state=state,
+        observation=observation,
+        model_carry=memory,
+        episode_start=starts,
+        episode_return=jnp.zeros(1),
+        episode_step_count=jnp.zeros(1, dtype=jnp.int32),
+    )  # state leaves: (E, ...); observation: (E, N, O)/(E, N, U, A); memory: (B, H); counts: (E,)
+    advanced, rollout = jax.jit(ppo.collect_rollout, static_argnames=("env", "config"))(
+        runner, train_state, env, config, jax.random.key(2)
+    )
+    batch = rollout.batch  # batch-major array leaves: (B, T, ...)
+    chex.assert_shape(batch.action, (2, 3, 2))
+    chex.assert_shape(batch.old_log_prob, (2, 3))
+    chex.assert_shape(batch.actions_mask, (2, 3, 2, 230))
+    assert int(rollout.episode_count) == 1 and int(rollout.episode_length_sum) == 3
+    assert float(rollout.episode_return_sum) == 0.5
+    np.testing.assert_array_equal(advanced.episode_start, True)
+    replay = model.apply(
+        {"params": train_state.params}, batch.observation, memory, batch.episode_start, batch.actions_mask
+    )
+    np.testing.assert_allclose(replay.policy.log_prob(batch.action), batch.old_log_prob, atol=1e-5)
+    updated, metrics = jax.jit(ppo.update, static_argnames="config")(train_state, batch, config)
+    assert int(updated.step) == 1
+    assert float(metrics.entropy) > 0
+    assert float(metrics.approx_kl) == pytest.approx(0.0, abs=1e-6)
+    assert any(
+        not np.array_equal(a, b) for a, b in zip(jax.tree.leaves(train_state.params), jax.tree.leaves(updated.params))
+    )
+    episode = ppo.play_episode(updated, config, jax.random.key(3), memory, record=True, env=env)
+    assert episode.length == 3 and episode.episode_return == 0.5
+    assert len(episode.frames) == 4
+    assert all(frame.shape == (288, 288, 3) and frame.dtype == np.uint8 for frame in episode.frames)

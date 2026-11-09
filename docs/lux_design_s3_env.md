@@ -102,10 +102,43 @@ model shapes from the actual pytrees.
 
 ## rl2 integration
 
-The dependency is available, but no rl2 environment adapter or training config is
-provided. The AlphaZero trainer currently constructs PGX environments. Lux needs
-an adapter and policy/search design for simultaneous joint actions, hidden
-information, per-unit actions, reward conversion, and memory across matches.
+[LuxEnv](../src/rl2/envs/lux_env.py) implements `BaseMultiAgentEnv` with **two team
+agents**. Run `uv run mappo --config configs/mappo/lux.yaml` to train both teams
+with shared policy weights and separate recurrent memory.
+
+- Each team policy call receives one flat observation and outputs all 16 ship
+  commands. The policy has one categorical head per ship, conditioned on the
+  same team encoder/LSTM. Heads sample independently given that representation;
+  this is not an autoregressive joint-action model.
+- Adapter actions have shape `(2, U)`, with 230 categories per ship. IDs 0–4 are
+  stay/up/right/down/left. For ID `a >= 5`, sap offsets are
+  `dx = (a - 5) // 15 - 7`, `dy = (a - 5) % 15 - 7`. The adapter converts them to
+  Lux's `(U, 3)` arrays. Masks have shape `(2, U, 230)` and exclude absent ships,
+  insufficient energy, out-of-range/off-map sap targets, and boundary-frame
+  actions; stay is always allowed. Failed movement attempts remain available.
+- Observations flatten the native `EnvObs` leaves in JAX pytree order, append a
+  two-element team ID, then public move cost, sap cost, sap range, and sensor
+  range. Shapes are `(2, 1886)` for `U=16`, or `(2, 1758 + 8*U)` generally.
+  Values retain native units. Hidden simulator state and hidden parameters are
+  excluded; team indices and map coordinates remain absolute.
+- PPO computes one joint log probability and one value per **team**. Log
+  probabilities and entropies sum over ship commands; batches and recurrent
+  memory retain two agent sequences per environment, not 32 ship sequences.
+- Rewards are increments in match wins: the match winner receives 1 and the
+  other team 0. Memory persists through ship deaths and match boundaries.
+  Completing the whole game is treated as terminal, with no value bootstrap,
+  even though upstream labels it a truncation. Same-step autoreset preserves
+  final observations/state and samples fresh game parameters.
+- Parameters are randomized once per game by default. `randomize_params: false`
+  uses native defaults. `max_units`, `max_steps_in_match`, and `match_count`
+  can reduce the game for experiments. Map dimensions remain 24 × 24.
+- The trainer averages agent returns for episode metrics. With both opposing
+  teams included, a completed game always has mean return `match_count / 2`;
+  this is not a playing-strength metric. A fixed-opponent evaluation is not yet
+  implemented. The headless renderer shows the full map for debugging.
+
+The AlphaZero trainer remains separate and still requires a PGX-compatible
+adapter and search design for Lux's hidden information and simultaneous actions.
 
 Upstream references: [game rules](https://github.com/Lux-AI-Challenge/Lux-Design-S3/blob/c6d1e665d12a467b299fb586b3f876e47847746b/docs/specs.md),
 [environment implementation](https://github.com/Lux-AI-Challenge/Lux-Design-S3/blob/c6d1e665d12a467b299fb586b3f876e47847746b/src/luxai_s3/env.py),

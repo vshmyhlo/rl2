@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from rl2.envs import BaseMultiAgentEnv
 from rl2.envs.jaxnav_env import JaxNavConfig, JaxNavEnv
+from rl2.envs.lux_env import LuxEnv
 from rl2.envs.mpe_env import MPEConfig, MPEEnv
 from rl2.envs.robotarium_env import RobotariumConfig, RobotariumEnv
 from rl2.envs.smax_env import SMAXConfig, SMAXEnv
@@ -19,16 +20,16 @@ def test_base_multi_agent_env_cannot_be_instantiated() -> None:
         BaseMultiAgentEnv()
 
 
-@pytest.mark.parametrize("missing", ["reset", "step", "memory_reset", "render"])
+@pytest.mark.parametrize("missing", ["reset", "step", "render"])
 def test_incomplete_adapter_cannot_be_instantiated(missing: str) -> None:
-    methods = {name: MPEEnv.__dict__[name] for name in ("reset", "step", "memory_reset", "render")}
+    methods = {name: MPEEnv.__dict__[name] for name in ("reset", "step", "render")}
     del methods[missing]
     incomplete = type("IncompleteEnv", (BaseMultiAgentEnv,), methods)
     with pytest.raises(TypeError, match=missing):
         incomplete()
 
 
-@pytest.mark.parametrize("adapter", [MPEEnv, SMAXEnv, JaxNavEnv, RobotariumEnv, STORMEnv])
+@pytest.mark.parametrize("adapter", [MPEEnv, SMAXEnv, JaxNavEnv, RobotariumEnv, STORMEnv, LuxEnv])
 def test_adapters_implement_base_multi_agent_env(adapter: type[BaseMultiAgentEnv[Any]]) -> None:
     assert issubclass(adapter, BaseMultiAgentEnv)
     assert not isabstract(adapter)

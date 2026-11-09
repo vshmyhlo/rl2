@@ -9,7 +9,15 @@ import pytest
 from scipy.stats import beta as beta_distribution
 from scipy.stats import truncnorm
 
-from rl2.actions import BetaPolicy, CategoricalPolicy, ContinuousSpace, DiscreteSpace, TruncatedGaussianPolicy
+from rl2.actions import (
+    BetaPolicy,
+    CategoricalPolicy,
+    ContinuousSpace,
+    DiscreteSpace,
+    MultiCategoricalPolicy,
+    MultiDiscreteSpace,
+    TruncatedGaussianPolicy,
+)
 
 
 @pytest.mark.parametrize("batch_shape", [(), (2,), (2, 3)], ids=["scalar", "batch", "sequence"])
@@ -236,3 +244,45 @@ def test_beta_boundary_samples_and_gradients(alpha: float, beta: float) -> None:
     value, gradients = jax.jit(jax.value_and_grad(objective, argnums=(0, 1)))(policy.alpha, policy.beta)
     assert bool(jnp.isfinite(value))
     assert all(bool(jnp.all(jnp.isfinite(gradient))) for gradient in gradients)
+
+
+@pytest.mark.parametrize("batch_shape", [(), (2, 3)], ids=["unbatched", "sequence"])
+def test_multi_categorical_joint_probability_and_entropy(batch_shape: tuple[int, ...]) -> None:
+    logits = jnp.broadcast_to(
+        jnp.array([[0.0, jnp.log(3.0), -jnp.inf], [0.0, -jnp.inf, -jnp.inf]]), (*batch_shape, 2, 3)
+    )  # (*S, D=2, A=3)
+    policy = MultiCategoricalPolicy(logits=logits)
+    actions, log_prob = jax.jit(policy.sample_and_log_prob)(seed=jax.random.key(0))  # (*S, D); (*S,)
+    assert actions.shape == (*batch_shape, 2) and log_prob.shape == batch_shape
+    np.testing.assert_array_equal(actions[..., 1], 0)
+    np.testing.assert_allclose(log_prob, jnp.log(jnp.where(actions[..., 0] == 0, 0.25, 0.75)), atol=1e-7)
+    np.testing.assert_allclose(policy.log_prob(actions), log_prob, atol=1e-7)
+    np.testing.assert_allclose(policy.entropy(), -0.25 * np.log(0.25) - 0.75 * np.log(0.75), rtol=1e-6)
+    samples, probs = policy.sample_and_log_prob(seed=jax.random.key(1), sample_shape=(2, 1))
+    # samples: (2, 1, *S, D); probs: (2, 1, *S)
+    assert samples.shape == (2, 1, *batch_shape, 2) and probs.shape == (2, 1, *batch_shape)
+    np.testing.assert_allclose(probs, policy.log_prob(samples), atol=1e-7)
+    np.testing.assert_array_equal(samples, policy.sample(seed=jax.random.key(1), sample_shape=(2, 1)))
+    with pytest.raises(AssertionError):
+        policy.log_prob(actions.astype(jnp.float32))
+
+
+def test_multi_categorical_sums_components_and_has_gradients() -> None:
+    logits = jnp.array([[0.0, jnp.log(3.0)], [jnp.log(2.0), 0.0]])  # (D=2, A=2)
+    actions = jnp.array([1, 0], dtype=jnp.int32)  # (D,)
+    policy = MultiCategoricalPolicy(logits=logits)
+    np.testing.assert_allclose(policy.log_prob(actions), np.log(0.75 * 2 / 3), atol=1e-7)
+    expected = -0.25 * np.log(0.25) - 0.75 * np.log(0.75) - 2 / 3 * np.log(2 / 3) - 1 / 3 * np.log(1 / 3)
+    np.testing.assert_allclose(policy.entropy(), expected, rtol=1e-6)
+
+    def objective(values: jax.Array) -> jax.Array:  # (D, A) -> ()
+        return MultiCategoricalPolicy(logits=values).log_prob(actions)  # ()
+
+    gradient = jax.grad(objective)(logits)  # (D, A)
+    np.testing.assert_allclose(gradient, [[-0.25, 0.25], [1 / 3, -1 / 3]], atol=1e-7)
+
+
+@pytest.mark.parametrize("counts", [(), (0,), (2, -1)])
+def test_invalid_multi_discrete_space(counts: tuple[int, ...]) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        MultiDiscreteSpace(nvec=counts)

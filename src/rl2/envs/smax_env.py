@@ -81,14 +81,12 @@ class SMAXEnv(BaseMultiAgentEnv[State]):
             reward=jnp.stack([reward[agent] for agent in self.agents]),  # (N,)
             done=done,  # ()
             agent_done=jnp.stack([native_done[agent] for agent in self.agents]) | done,  # (N,)
+            agent_inactive=~alive[: self.num_agents],  # (N,)
             terminated=terminated,  # ()
             truncated=truncated,  # ()
             final_observation=final_observation,  # (N, O)/(N, A)
             final_state=final_state,  # leaves: (...)
         )
-
-    def memory_reset(self, state: State) -> jax.Array:  # state leaves: (...) -> (N,)
-        return ~state.state.unit_alive[: self.num_agents]  # (N,)
 
     def render(self, state: State) -> NDArray[np.uint8]:  # leaves: (...) -> (H, W, 3)
         figure = Figure(figsize=(5, 5), dpi=80)

@@ -33,7 +33,7 @@ def test_shapes_rewards_and_timeout(num_agents: int, num_landmarks: int) -> None
     first = env.step(jax.random.key(1), state, action)
     assert not bool(first.done) and not bool(first.terminated)
     np.testing.assert_array_equal(first.agent_done, False)
-    np.testing.assert_array_equal(env.memory_reset(first.state), False)
+    np.testing.assert_array_equal(first.agent_inactive, False)
     chex.assert_trees_all_equal(first.state, first.final_state)
     reward = env.env.rewards(first.final_state)  # agent leaves: ()
     np.testing.assert_allclose(first.reward, jnp.stack([reward[agent] for agent in env.agents]))
@@ -45,14 +45,14 @@ def test_shapes_rewards_and_timeout(num_agents: int, num_landmarks: int) -> None
     chex.assert_shape(result.observation.actions_mask, (2, num_agents, 5))
     chex.assert_shape(result.reward, (2, num_agents))
     chex.assert_shape(result.done, (2,))
-    chex.assert_shape(result.agent_done, (2, num_agents))
+    chex.assert_shape((result.agent_done, result.agent_inactive), (2, num_agents))
     np.testing.assert_array_equal(result.done, True)
     np.testing.assert_array_equal(result.truncated, True)
     np.testing.assert_array_equal(result.terminated, False)
     np.testing.assert_array_equal(result.agent_done, True)
     np.testing.assert_array_equal(result.final_state.step, 2)
     np.testing.assert_array_equal(result.state.step, 0)
-    np.testing.assert_array_equal(jax.vmap(env.memory_reset)(result.final_state), False)
+    np.testing.assert_array_equal(result.agent_inactive, False)
     assert not np.array_equal(result.observation.observation, result.final_observation.observation)
     raw_final = jax.vmap(env.env.get_obs)(result.final_state)  # agent leaves: (E, O)
     for i, agent in enumerate(env.agents):
@@ -118,7 +118,7 @@ def test_reference_communication_movement_and_timeout() -> None:
     np.testing.assert_array_equal(result.observation.observation[..., -10:], 0)
     final_messages = jax.nn.one_hot(jnp.array([9, 0]), 10)  # (N, C), received from partner
     np.testing.assert_array_equal(result.final_observation.observation[..., -10:], jnp.tile(final_messages, (2, 1, 1)))
-    np.testing.assert_array_equal(jax.vmap(env.memory_reset)(result.final_state), False)
+    np.testing.assert_array_equal(result.agent_inactive, False)
 
 
 @pytest.mark.parametrize("num_agents,num_landmarks", [(3, 3), (2, 2)])
@@ -147,7 +147,11 @@ def test_update_playback_and_checkpoint(tmp_path: Path, env_id: MPEEnvId) -> Non
     memory = model.initial_carry(2)  # leaves: (B=2, H=4)
     starts = jnp.ones(2, bool)  # (B,)
     params = model.init(
-        jax.random.key(1), observation.observation, memory, starts[None], observation.actions_mask
+        jax.random.key(1),
+        observation.observation[0, :, None],  # (B, T=1, O)
+        memory,
+        starts[:, None],  # (B, T=1)
+        observation.actions_mask[0, :, None],  # (B, T=1, A)
     )  # leaves: (...)
     train_state = TrainState.create(
         apply_fn=model.apply,

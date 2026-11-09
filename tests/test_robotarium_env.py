@@ -42,13 +42,13 @@ def test_batched_shapes_observations_and_timeout() -> None:
     chex.assert_shape(result.observation.observation, (2, 4, 22))
     chex.assert_shape(result.reward, (2, 4))
     chex.assert_shape(result.done, (2,))
-    chex.assert_shape(result.agent_done, (2, 4))
+    chex.assert_shape((result.agent_done, result.agent_inactive), (2, 4))
     np.testing.assert_array_equal(result.truncated, True)
     np.testing.assert_array_equal(result.agent_done, True)
     np.testing.assert_array_equal(result.terminated, False)
     np.testing.assert_array_equal(result.final_state.step, 2)
     np.testing.assert_array_equal(result.state.step, 0)
-    np.testing.assert_array_equal(jax.vmap(env.memory_reset)(result.final_state), False)
+    np.testing.assert_array_equal(result.agent_inactive, False)
     raw_final = jax.vmap(env.env.get_obs)(result.final_state)  # agent leaves: (E, O)
     for i, agent in enumerate(env.agents):
         np.testing.assert_array_equal(result.final_observation.observation[:, i], raw_final[agent])
@@ -142,7 +142,11 @@ def test_mappo_update_and_playback() -> None:
     memory = model.initial_carry(2)  # leaves: (B=2, H=4)
     starts = jnp.ones(2, bool)  # (B,)
     params = model.init(
-        jax.random.key(1), observation.observation, memory, starts[None], observation.actions_mask
+        jax.random.key(1),
+        observation.observation[0, :, None],  # (B, T=1, O)
+        memory,
+        starts[:, None],  # (B, T=1)
+        observation.actions_mask[0, :, None],  # (B, T=1, A)
     )  # leaves: (...)
     train_state = TrainState.create(
         apply_fn=model.apply,

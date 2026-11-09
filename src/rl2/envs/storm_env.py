@@ -100,15 +100,13 @@ class STORMEnv(BaseMultiAgentEnv[State]):
             reward=reward.astype(jnp.float32),  # (N,)
             done=truncated,  # ()
             agent_done=jnp.full(self.num_agents, truncated),  # (N,)
+            # Interactions, freezes and respawns remain part of the same social game.
+            agent_inactive=jnp.zeros(self.num_agents, dtype=bool),  # (N,)
             terminated=jnp.asarray(False),  # ()
             truncated=truncated,  # ()
             final_observation=final_observation,  # (N, 350)/(N, 8)
             final_state=final_state,  # leaves: (...)
         )
-
-    def memory_reset(self, state: State) -> jax.Array:  # state leaves: (...) -> (N,)
-        # Interactions, freezes and respawns remain part of the same social game.
-        return jnp.zeros(self.num_agents, dtype=bool)  # (N,)
 
     def render(self, state: State) -> NDArray[np.uint8]:  # state leaves: (...) -> (H, W, 3)
         return self.env.render(state)  # (H, W, 3)

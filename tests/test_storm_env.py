@@ -47,7 +47,7 @@ def test_shapes_interactions_and_timeout(preset: str, num_agents: int, grid_size
     chex.assert_shape(result.observation.observation, (2, num_agents, 350))
     chex.assert_shape(result.observation.actions_mask, (2, num_agents, 8))
     chex.assert_shape(result.reward, (2, num_agents))
-    chex.assert_shape(result.agent_done, (2, num_agents))
+    chex.assert_shape((result.agent_done, result.agent_inactive), (2, num_agents))
     expected = [1, 1] if preset == "basic" else [0, 5, 0, 0]
     np.testing.assert_allclose(result.reward, [expected, expected])
     np.testing.assert_array_equal(result.done, [False, True])
@@ -56,7 +56,7 @@ def test_shapes_interactions_and_timeout(preset: str, num_agents: int, grid_size
     np.testing.assert_array_equal(result.agent_done, [[False] * num_agents, [True] * num_agents])
     np.testing.assert_array_equal(result.final_state.step, [1, 2])
     np.testing.assert_array_equal(result.state.step, [1, 0])
-    np.testing.assert_array_equal(jax.vmap(env.memory_reset)(result.final_state), False)
+    np.testing.assert_array_equal(result.agent_inactive, False)
     raw = jax.vmap(env.env.get_obs)(result.final_state)  # (E, N, 5, 5, 14)
     np.testing.assert_array_equal(result.final_observation.observation, raw.reshape(2, num_agents, -1))
     assert not np.array_equal(result.observation.observation[1], result.final_observation.observation[1])
@@ -96,7 +96,7 @@ def test_simultaneous_mixed_payoffs_and_respawn() -> None:
     np.testing.assert_array_equal(respawn.reward, 0)
     np.testing.assert_array_equal(respawn.state.agent_invs, 0)
     np.testing.assert_array_equal(respawn.agent_done, False)
-    np.testing.assert_array_equal(env.memory_reset(respawn.state), False)
+    np.testing.assert_array_equal(respawn.agent_inactive, False)
     assert not bool(respawn.done)
 
 
@@ -119,7 +119,11 @@ def test_update_and_playback() -> None:
     memory = model.initial_carry(2)  # leaves: (B=2, H=4)
     starts = jnp.ones(2, bool)  # (B,)
     params = model.init(
-        jax.random.key(1), observation.observation, memory, starts[None], observation.actions_mask
+        jax.random.key(1),
+        observation.observation[0, :, None],  # (B, T=1, O)
+        memory,
+        starts[:, None],  # (B, T=1)
+        observation.actions_mask[0, :, None],  # (B, T=1, A)
     )  # leaves: (...)
     train_state = TrainState.create(
         apply_fn=model.apply,

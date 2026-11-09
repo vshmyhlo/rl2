@@ -1,6 +1,7 @@
 """Action spaces and JAX policies; S denotes batch dimensions, A categories, D flat action size.
 
 Continuous log probabilities and differential entropies sum over the D action coordinates.
+Multi-categorical log probabilities and entropies sum over discrete components.
 Sampling prepends sample_shape to S; log_prob also accepts these leading sample dimensions.
 """
 
@@ -22,6 +23,21 @@ class DiscreteSpace:
     def __post_init__(self) -> None:
         if self.n <= 0:
             raise ValueError("Discrete action count must be positive")
+
+
+@dataclass(frozen=True)
+class MultiDiscreteSpace:
+    """Vector of categorical actions; logits pad each component to max(nvec)."""
+
+    nvec: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.nvec or any(n <= 0 for n in self.nvec):
+            raise ValueError("Multi-discrete action counts must be nonempty and positive")
+
+    @property
+    def logits_shape(self) -> tuple[int, int]:
+        return len(self.nvec), max(self.nvec)
 
 
 @dataclass(frozen=True)
@@ -74,6 +90,40 @@ class CategoricalPolicy:
 
     def entropy(self) -> jax.Array:  # (*S,)
         return distrax.Categorical(logits=self.logits).entropy()  # (*S,)
+
+
+@struct.dataclass
+class MultiCategoricalPolicy:
+    """One joint action with conditionally independent categorical components."""
+
+    logits: jax.Array  # (*S, D, A) float32; unavailable/padded categories masked
+
+    @property
+    def distribution(self) -> distrax.Independent:
+        return distrax.Independent(distrax.Categorical(logits=self.logits), reinterpreted_batch_ndims=1)
+
+    def sample(
+        self,
+        *,
+        seed: jax.Array,  # ()
+        sample_shape: int | tuple[int, ...] = (),
+    ) -> jax.Array:  # (*sample_shape, *S, D)
+        return self.distribution.sample(seed=seed, sample_shape=sample_shape)
+
+    def sample_and_log_prob(
+        self,
+        *,
+        seed: jax.Array,  # ()
+        sample_shape: int | tuple[int, ...] = (),
+    ) -> tuple[jax.Array, jax.Array]:  # (*sample_shape, *S, D); (*sample_shape, *S)
+        return self.distribution.sample_and_log_prob(seed=seed, sample_shape=sample_shape)
+
+    def log_prob(self, actions: jax.Array) -> jax.Array:  # (*S, D) -> (*S,)
+        chex.assert_type(actions, int)
+        return self.distribution.log_prob(actions)  # (*S,)
+
+    def entropy(self) -> jax.Array:  # (*S,)
+        return self.distribution.entropy()  # (*S,)
 
 
 @struct.dataclass

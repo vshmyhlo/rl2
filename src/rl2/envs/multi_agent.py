@@ -7,68 +7,65 @@ import jax
 import numpy as np
 from numpy.typing import NDArray
 
-from rl2.actions import DiscreteSpace
+from rl2.actions import DiscreteSpace, MultiDiscreteSpace
 
 
 class AgentObservation(NamedTuple):
-    """N agents, O local features, A discrete actions; optional leading batch axes."""
+    """N agents, O features, A categories, optional D action components and batch axes."""
 
     observation: jax.Array  # (..., N, O) float32
-    actions_mask: jax.Array  # (..., N, A) bool
+    actions_mask: jax.Array  # (..., N, *C, A) bool
 
 
 class MultiAgentStep[State](NamedTuple):
     """Transition with done = terminated | truncated; both flags may be true.
 
     Final observation/state are populated on every step, before any autoreset.
+    agent_done resets memory for observation; agent_inactive resets memory for
+    final_observation when bootstrapping, excluding environment completion alone.
     """
 
-    observation: AgentObservation  # (N, O); (N, A), after autoreset
+    observation: AgentObservation  # (N, O); (N, *C, A), after autoreset
     state: State  # leaves: (...)
     reward: jax.Array  # (N,) floating-point
     done: jax.Array  # () bool environment completion
-    agent_done: jax.Array  # (N,) bool recurrent reset flags
+    agent_done: jax.Array  # (N,) bool agent inactivity or environment completion
+    agent_inactive: jax.Array  # (N,) bool agent inactivity in the final state
     terminated: jax.Array  # () bool task ended
     truncated: jax.Array  # () bool time limit reached
-    final_observation: AgentObservation  # (N, O); (N, A), before autoreset
+    final_observation: AgentObservation  # (N, O); (N, *C, A), before autoreset
     final_state: State  # leaves: (...), before autoreset
 
 
 class BaseMultiAgentEnv[State](ABC):
     """Explicit state and RNGs, discrete actions, and same-step environment autoreset.
 
-    Actions and observations retain native values; agent dictionaries are packed
-    in a fixed order. Masks expose native availability, or all actions when absent.
-    N denotes agents, O local observation features, and A discrete actions.
-    Reset, step, and memory_reset support caller-applied jax.jit and jax.vmap.
+    Agent dictionaries are packed in a fixed order; adapters document observation
+    layouts and any lossless action encoding. N denotes agents, O local features,
+    and A categories. C is empty for discrete actions or (D,) for multi-discrete
+    actions. Masks expose available actions, including padding for unequal counts.
+    Reset and step support caller-applied jax.jit and jax.vmap.
     Adapters do not add JIT boundaries; rendering may run on the host.
     """
 
     num_agents: int
-    action_space: DiscreteSpace
+    action_space: DiscreteSpace | MultiDiscreteSpace
 
     @abstractmethod
     def reset(
         self,
         key: jax.Array,  # () typed PRNG key
-    ) -> tuple[AgentObservation, State]:  # (N, O)/(N, A); state leaves: (...)
-        """Return (N, O)/(N, A) observations/masks and (...) state leaves."""
+    ) -> tuple[AgentObservation, State]:  # (N, O)/(N, *C, A); state leaves: (...)
+        """Return (N, O)/(N, *C, A) observations/masks and (...) state leaves."""
 
     @abstractmethod
     def step(
         self,
         key: jax.Array,  # () typed PRNG key
         state: State,  # leaves: (...)
-        action: jax.Array,  # (N,) integer action IDs
+        action: jax.Array,  # (N, *C) integer action IDs
     ) -> MultiAgentStep[State]:
         """Advance and autoreset the environment when terminated or truncated."""
-
-    @abstractmethod
-    def memory_reset(
-        self,
-        state: State,  # leaves: (...)
-    ) -> jax.Array:  # (N,) bool
-        """Return (N,) bool recurrent reset flags, including for final-state bootstrapping."""
 
     @abstractmethod
     def render(

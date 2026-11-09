@@ -33,7 +33,9 @@ def test_reset_packing_and_batched_step(env: SMAXEnv, initial_state: State) -> N
     states = jax.tree.map(lambda x: jnp.stack([x, x]), state)  # leaves: (E, ...)
     result = jax.jit(jax.vmap(env.step))(keys, states, jnp.full((2, 3), 4))
     chex.assert_shape(result.reward, (2, 3))
-    chex.assert_shape(result.agent_done, (2, 3))
+    chex.assert_shape((result.agent_done, result.agent_inactive), (2, 3))
+    assert result.agent_inactive.dtype == jnp.bool_
+    np.testing.assert_array_equal(result.agent_inactive, False)
     chex.assert_shape(result.done, (2,))
     assert result.observation.observation.shape == (2, *observation.observation.shape)
     np.testing.assert_array_equal(result.done, False)
@@ -67,6 +69,10 @@ def test_boundaries_preserve_final_state_and_reset_only_completed_battles(
     assert bool(result.truncated) == (boundary != "death")
     assert bool(result.done) == (boundary != "death")
     assert int(result.final_state.state.step) == (1 if boundary == "death" else 2)
+    chex.assert_shape(result.agent_inactive, (3,))
+    np.testing.assert_array_equal(
+        result.agent_inactive, [boundary in ("death", "defeat"), boundary == "defeat", boundary == "defeat"]
+    )
     if boundary == "death":
         np.testing.assert_array_equal(result.agent_done, [True, False, False])
         np.testing.assert_array_equal(result.observation.actions_mask[0], jnp.arange(8) == 4)

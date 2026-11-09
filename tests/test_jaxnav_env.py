@@ -54,6 +54,9 @@ def test_reset_packing_batch_shapes_and_render(env: JaxNavEnv, state: State) -> 
     )
     chex.assert_shape(result.observation.observation, (2, 2, 13))
     chex.assert_shape(result.reward, (2, 2))
+    chex.assert_shape(result.agent_inactive, (2, 2))
+    assert result.agent_inactive.dtype == jnp.bool_
+    np.testing.assert_array_equal(result.agent_inactive, False)
     chex.assert_shape(result.done, (2,))
     assert bool(jnp.isfinite(result.reward).all())
     np.testing.assert_array_equal(result.done, False)
@@ -76,6 +79,8 @@ def test_boundaries_and_action_masks(env: JaxNavEnv, state: State, boundary: str
     assert bool(result.done) == (boundary in ("timeout", "goals"))
     assert bool(result.terminated) == (boundary == "goals")
     assert bool(result.truncated) == (boundary in ("timeout", "goals"))
+    chex.assert_shape(result.agent_inactive, (2,))
+    np.testing.assert_array_equal(result.agent_inactive, [boundary == "collision", False])
     if bool(result.done):
         assert int(result.state.step) == 0 and int(result.final_state.step) == 2
         np.testing.assert_array_equal(result.agent_done, True)
@@ -163,14 +168,18 @@ def test_jaxnav_rollout_timeout_update_and_evaluation(env: JaxNavEnv, state: Sta
     fake = TrainState.create(apply_fn=constant_policy, params={}, tx=optax.sgd(0.1))
     advanced, rollout = ppo.collect_rollout(runner, fake, env, config, jax.random.key(3))
     expected = env.step(jax.random.key(4), final_input, jnp.full(2, 2))
-    np.testing.assert_allclose(rollout.batch.return_target[0], expected.reward + 1.0, atol=1e-6)
-    chex.assert_shape(rollout.batch.observation, (1, 2, 13))
-    chex.assert_shape(rollout.batch.actions_mask, (1, 2, 15))
+    np.testing.assert_allclose(rollout.batch.return_target[:, 0], expected.reward + 1.0, atol=1e-6)
+    chex.assert_shape(rollout.batch.observation, (2, 1, 13))
+    chex.assert_shape(rollout.batch.actions_mask, (2, 1, 15))
     assert int(rollout.episode_count) == 1
     np.testing.assert_allclose(rollout.episode_return_sum, expected.reward.mean())
     np.testing.assert_array_equal(advanced.episode_start, True)
     params = model.init(
-        jax.random.key(5), observation.observation, memory, jnp.ones((1, 2), bool), observation.actions_mask
+        jax.random.key(5),
+        observation.observation[0, :, None],  # (B, T=1, O)
+        memory,
+        jnp.ones((2, 1), bool),  # (B, T=1)
+        observation.actions_mask[0, :, None],  # (B, T=1, A)
     )
     real = TrainState.create(
         apply_fn=model.apply,
