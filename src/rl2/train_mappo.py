@@ -109,17 +109,19 @@ evaluations and are not checkpointed.
 Enabled video, evaluation, and checkpoint schedules use completed iteration counts,
 including on resume, and also run on normal completion. video_interval and
 eval_interval default to 0 (disabled), and checkpoint_interval to 600. A zero video
-interval disables standalone gameplay. Evaluation records its last episode
-independently of video_interval. video_max_frames (default: 900; None: unlimited)
-caps recordings; evaluation still finishes the full episode. GIFs loop at video_fps
+interval disables standalone gameplay. Evaluation replays its highest-return episode
+(per opponent age for Lux) for one video, independently of video_interval. The first
+episode wins ties. Scores include every full episode; the replay does not enter metrics.
+video_max_frames (default: 900; None: unlimited) caps recordings. GIFs loop at video_fps
 with frame boundaries rounded to 10 ms and a minimum 10 ms frame delay.
 
 Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
 model/parameter_count/<step>.txt, eval/report/<step>.json, gameplay/<step>.gif,
 and eval/gameplay/<step>.gif. Lux uses eval/report/age_<age>/<step>.json and
 eval/gameplay/age_<age>/<step>.gif. Evaluation reports include individual returns and
-lengths, aggregate scores, configuration, seed, and training counters. Configuration
-parameters use dotted keys; existing MLflow parameter values are preserved on resume.
+lengths, aggregate scores, the zero-based video_episode_index, configuration, seed,
+and training counters. Configuration parameters use dotted keys; existing MLflow
+parameter values are preserved on resume.
 
 Checkpoints save the full configuration, parameters, optimizer state, RNG, iteration
 and transition counters, and cumulative episode statistics. Restore uses the current
@@ -751,6 +753,15 @@ def playback_step(
     )
 
 
+@partial(jax.jit, static_argnames="env")
+def reset_episode(
+    env: PPOEnv,
+    key: jax.Array,  # () typed PRNG key
+) -> tuple[AgentObservation[Observation], Any]:  # observation: (N, ...)/(N, *C, A); state leaves: (...)
+    """Reuse the compiled reset across episodes within the active training mesh."""
+    return env.reset(key)
+
+
 def play_episode(
     train_state: TrainState,
     config: Config,
@@ -765,8 +776,7 @@ def play_episode(
 ) -> EpisodeResult:
     """Run on device, transferring bounded state chunks for optional host rendering."""
     key, reset_key = jax.random.split(key)  # each () typed PRNG key
-    # Compile reset so environment constants can join the active training mesh.
-    observation, env_state = jax.jit(env.reset)(reset_key)  # observation/state leaves: (...)
+    observation, env_state = reset_episode(env, reset_key)  # observation/state leaves: (...)
     state = PlaybackState(
         key=key,  # ()
         observation=observation,  # (N, ...)/(N, *C, A)
@@ -838,27 +848,39 @@ def log_evaluation(
     opponent_params: optax.Params | None = None,  # leaves: parameter shapes
     opponent_age: int | None = None,
 ) -> None:
-    """Evaluate fixed environment seeds, log raw scores, and record the last episode."""
+    """Evaluate fixed seeds, then replay the highest-return episode for one video."""
     print(f"Evaluating {config.eval_episodes} games at step {step_count}...", flush=True)
     suffix = "" if opponent_age is None else f"/age_{opponent_age}"
     started = monotonic()
     episode_results: list[dict[str, float | int]] = []
     env = make_env(config) if env is None else env
     for episode_index in range(config.eval_episodes):
-        episode_return, episode_step_count, frames = play_episode(
+        episode_return, episode_step_count, _ = play_episode(
             train_state,
             config,
             jax.random.fold_in(jax.random.key(config.eval_seed), episode_index),
             initial_carry,
-            record=episode_index == config.eval_episodes - 1,
+            record=False,
             env=env,
             opponent_params=opponent_params,
             current_team=episode_index % 2,
         )
         episode_results.append({"return": episode_return, "length": episode_step_count})
-        if frames:
-            writer.log_video(frames, f"eval/gameplay{suffix}/{step_count}.gif", fps=config.video_fps)
     episode_return_sample = [result["return"] for result in episode_results]
+    video_episode_index = max(range(config.eval_episodes), key=episode_return_sample.__getitem__)
+    _, _, frames = play_episode(
+        train_state,
+        config,
+        jax.random.fold_in(jax.random.key(config.eval_seed), video_episode_index),
+        initial_carry,
+        record=True,
+        stop_at_frame_limit=True,
+        env=env,
+        opponent_params=opponent_params,
+        current_team=video_episode_index % 2,
+    )
+    if frames:
+        writer.log_video(frames, f"eval/gameplay{suffix}/{step_count}.gif", fps=config.video_fps)
     std = stdev(episode_return_sample) if len(episode_return_sample) > 1 else None
     result = {
         "env_id": config.env.id,
@@ -866,6 +888,7 @@ def log_evaluation(
         "return_std": std,
         "return_sem": std / sqrt(config.eval_episodes) if std is not None else None,
         "episodes": episode_results,
+        "video_episode_index": video_episode_index,
         "eval_seed": config.eval_seed,
         "training_config": asdict(config),
         "training_steps": step_count,

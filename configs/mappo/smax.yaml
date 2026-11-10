@@ -2,6 +2,7 @@
 env:
   id: SMAX
   map_name: 3m
+  selfplay: false # Set true to control both teams with win/loss rewards.
   max_steps: 100
 seed: 1
 total_env_steps: 10_000_000 # Environment transitions; each contains num_agents observations

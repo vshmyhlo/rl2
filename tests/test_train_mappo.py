@@ -1,3 +1,4 @@
+import json
 from contextlib import ExitStack, closing, nullcontext
 from dataclasses import asdict, replace
 from functools import partial
@@ -500,13 +501,14 @@ def test_async_checkpoint_finishes_on_close(config: ppo.Config, tmp_path: Path, 
             chex.assert_trees_all_equal(ppo.restore_checkpoint(manager, state, config), progress)
 
 
-def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_path: Path) -> None:
-    config = replace(config, num_envs=1, num_steps=1, num_minibatches=3, env=SMAXConfig(max_steps=1))
-    env = ppo.make_env(config)  # Three agent sequences can form three minibatches in one environment.
-    observation, state = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 1))
+@pytest.mark.parametrize("selfplay", [False, True], ids=["heuristic_enemy", "selfplay"])
+def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_path: Path, selfplay: bool) -> None:
+    config = replace(config, num_envs=1, num_steps=1, num_minibatches=3, env=SMAXConfig(max_steps=1, selfplay=selfplay))
+    env = ppo.make_env(config)  # Three or six agent sequences form three minibatches.
+    observation, state = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 1))  # (E=1, N, O)/(E, N, A); (...)
     model = ppo.ActorCritic(env.action_space, config.model)
-    memory = model.initial_carry(3)  # leaves: (B=3, H)
-    starts = jnp.ones(3, bool)  # (B,)
+    memory = model.initial_carry(env.num_agents)  # leaves: (B=N, H)
+    starts = jnp.ones(env.num_agents, bool)  # (B,)
     params = model.init(
         jax.random.key(1),
         observation.observation[0, :, None],  # (B, T=1, O)
@@ -535,7 +537,7 @@ def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_pat
         )
     )
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(result.metrics.window.minibatch_metrics))
-    # Evaluation uses all allies and records the actual terminal frame.
+    # Evaluation uses all controlled agents and records the actual terminal frame.
     episode_return, length, frames = ppo.play_episode(
         result.train_state,
         config,
@@ -555,14 +557,14 @@ def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_pat
         episode_return_sum=episode_return,
         episode_length_sum=1,
         environment_step_count=1,
-        observation_count=3,
+        observation_count=env.num_agents,
     )
     with ppo.checkpoint_manager(str(tmp_path)) as manager:
         ppo.save_checkpoint(manager, progress, config)
         manager.wait_until_finished()
         metadata = manager.restore(1, args=ppo.ocp.args.Composite(metadata=ppo.ocp.args.JsonRestore())).metadata
         assert metadata["config"] == asdict(config)
-        assert metadata["environment_steps"] == 1 and metadata["observations"] == 3
+        assert metadata["environment_steps"] == 1 and metadata["observations"] == env.num_agents
         changed = replace(config, env=SMAXConfig(map_name="8m"), num_envs=2, num_steps=2)
         restored = ppo.restore_checkpoint(manager, train_state, changed)
         assert restored is not None
@@ -607,6 +609,20 @@ def test_playback_reuses_compiled_sampling_with_updated_inputs() -> None:
     chex.assert_shape(jax.tree.leaves(memory), (2, 1))
     for leaf in jax.tree.leaves(memory):  # (B, H)
         np.testing.assert_array_equal(leaf, [[1], [2]])
+
+
+def test_playback_reuses_compiled_reset(config: ppo.Config) -> None:
+    env = ScriptedSMAX()
+    state = TrainState.create(apply_fn=scripted_policy, params={}, tx=optax.sgd(0.1))
+    memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
+    # Count class-method traces without replacing the bound-method cache key.
+    with patch.object(ScriptedSMAX, "observation", autospec=True, side_effect=ScriptedSMAX.observation) as observe:
+        first = ppo.play_episode(state, config, jax.random.key(0), memory, record=False, env=env)
+        traces = observe.call_count
+        second = ppo.play_episode(state, config, jax.random.key(1), memory, record=False, env=env)
+        assert observe.call_count == traces
+    assert first.length == second.length == 2
+    assert first.episode_return == second.episode_return == 3.0
 
 
 @pytest.mark.parametrize(
@@ -670,13 +686,15 @@ def test_compiled_playback_resets_dead_agent_memory() -> None:
     assert int(result.env_state.state.step) == 0 and int(result.final_state.state.step) == 2
 
 
-def test_config_and_cli(config: ppo.Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("selfplay", [False, True], ids=["heuristic_enemy", "selfplay"])
+def test_config_and_cli(config: ppo.Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selfplay: bool) -> None:
+    config = replace(config, env=SMAXConfig(selfplay=selfplay))
     path = tmp_path / "smax.yaml"
     path.write_text(yaml.safe_dump(asdict(config)))
     assert ppo.load_config(path, ppo.Config) == config
     assert hash(config)
     with pytest.raises(ValueError, match="num_agents"):
-        ppo.make_env(replace(config, num_minibatches=4))
+        ppo.make_env(replace(config, num_minibatches=5))
     with pytest.raises(ValueError, match="at least one rollout"):
         replace(config, total_env_steps=1)
     monkeypatch.setattr("sys.argv", ["mappo", "--config", str(path)])
@@ -1054,8 +1072,13 @@ def test_historical_playback_uses_separate_weights_and_current_team_reward(confi
         assert result.length == 2
 
 
-@pytest.mark.parametrize("episodes", [1, 2], ids=["no-uncertainty", "alternating-sides"])
-def test_historical_eval_metrics_and_artifacts(config: ppo.Config, episodes: int) -> None:
+@pytest.mark.parametrize(
+    "returns,best_index",
+    [([0.0], 0), ([-2.0, 3.0, 1.0], 1), ([0.0, 0.0], 0)],
+    ids=["no-uncertainty", "best-on-opposite-side", "first-tied-zero"],
+)
+def test_historical_eval_metrics_and_artifacts(config: ppo.Config, returns: list[float], best_index: int) -> None:
+    episodes = len(returns)
     config = replace(
         config, env=LuxConfig(), model=replace(config.model, encoder=ppo.LuxEncoderConfig()), eval_episodes=episodes
     )
@@ -1063,9 +1086,10 @@ def test_historical_eval_metrics_and_artifacts(config: ppo.Config, episodes: int
     memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
     opponent = {"weight": jnp.asarray(7.0)}  # ()
     frame = np.zeros((2, 2, 3), dtype=np.uint8)  # (H, W, C)
-    with patch.object(
-        ppo, "play_episode", return_value=ppo.EpisodeResult(episode_return=0.0, length=2, frames=[frame])
-    ) as play:
+    results = [ppo.EpisodeResult(episode_return=value, length=2, frames=[]) for value in returns]
+    # The capped replay must not contribute to score or episode-length statistics.
+    results.append(ppo.EpisodeResult(episode_return=99.0, length=1, frames=[frame]))
+    with patch.object(ppo, "play_episode", side_effect=results * len(ppo.EVAL_OPPONENT_AGES)) as play:
         for age in ppo.EVAL_OPPONENT_AGES:
             ppo.log_evaluation(
                 Mock(),
@@ -1079,26 +1103,38 @@ def test_historical_eval_metrics_and_artifacts(config: ppo.Config, episodes: int
                 opponent_age=age,
             )
     for index, call in enumerate(play.call_args_list):
+        position = index % (episodes + 1)
+        recorded = position == episodes
+        episode_index = best_index if recorded else position
         assert call.kwargs["opponent_params"] is opponent
-        assert call.kwargs["current_team"] == (index % episodes) % 2
+        assert call.kwargs["current_team"] == episode_index % 2
+        assert call.kwargs["record"] is recorded
+        if recorded:
+            assert call.kwargs["stop_at_frame_limit"] is True
         np.testing.assert_array_equal(
             jax.random.key_data(call.args[2]),
-            jax.random.key_data(jax.random.fold_in(jax.random.key(config.eval_seed), index % episodes)),
+            jax.random.key_data(jax.random.fold_in(jax.random.key(config.eval_seed), episode_index)),
         )
     for age, call in zip(ppo.EVAL_OPPONENT_AGES, writer.log_metrics.call_args_list, strict=True):
         metrics, step = call.args
         assert step == 1600
-        assert metrics[f"eval/return_mean/age_{age}"] == 0.0
+        assert metrics[f"eval/return_mean/age_{age}"] == pytest.approx(sum(returns) / episodes)
         assert metrics[f"eval/training_episodes_total/age_{age}"] == 5
         assert (f"eval/return_std/age_{age}" in metrics) == (episodes > 1)
         assert (f"eval/return_sem/age_{age}" in metrics) == (episodes > 1)
         assert all(tag.endswith(f"/age_{age}") for tag in metrics)
+    for call in writer.log_text.call_args_list:
+        report = json.loads(call.args[0])
+        assert report["video_episode_index"] == best_index
+        assert report["episodes"] == [
+            {"return": value, "length": 2, "current_team": index % 2} for index, value in enumerate(returns)
+        ]
     assert [call.args[1] for call in writer.log_text.call_args_list] == [
         f"eval/report/age_{age}/1600.json" for age in ppo.EVAL_OPPONENT_AGES
     ]
-    assert {call.args[1] for call in writer.log_video.call_args_list} == {
+    assert [call.args[1] for call in writer.log_video.call_args_list] == [
         f"eval/gameplay/age_{age}/1600.gif" for age in ppo.EVAL_OPPONENT_AGES
-    }
+    ]
 
 
 def test_training_evaluates_exact_historical_iterations(config: ppo.Config) -> None:

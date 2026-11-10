@@ -41,6 +41,7 @@ def test_adapters_implement_base_multi_agent_env(adapter: type[BaseMultiAgentEnv
         pytest.param(MPEEnv, MPEConfig(), False, id="mpe_spread"),
         pytest.param(MPEEnv, MPEConfig(id="MPE_simple_reference_v3", num_agents=2), False, id="mpe_reference"),
         pytest.param(SMAXEnv, SMAXConfig(), False, id="smax_heuristic_enemy"),
+        pytest.param(SMAXEnv, SMAXConfig(selfplay=True), True, id="smax_selfplay"),
         pytest.param(JaxNavEnv, JaxNavConfig(), False, id="jaxnav"),
         pytest.param(RobotariumEnv, RobotariumConfig(), False, id="robotarium"),
         pytest.param(STORMEnv, STORMConfig(game="coordination"), False, id="storm_coordination"),
