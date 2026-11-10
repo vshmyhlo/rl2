@@ -100,10 +100,10 @@ def evaluate_batch(
     config: Config,
 ) -> tuple[jax.Array, jax.Array]:  # (K, P), (K, P); P = 2 players.
     """Return (K, P) rewards and termination flags for K openings and P = 2 players."""
-    seed = jax.random.PRNGKey(config.evaluation.seed)
+    key = jax.random.PRNGKey(config.evaluation.seed)  # (2,) legacy PRNG key
 
     def play_pair(opening_id: jax.Array) -> tuple[jax.Array, jax.Array]:
-        opening_key, search_key = jax.random.split(jax.random.fold_in(seed, opening_id))
+        opening_key, search_key = jax.random.split(jax.random.fold_in(key, opening_id))  # each (2,)
         env_state = make_opening(opening_key, env=env, moves=config.evaluation.opening_moves)
         game = partial(
             play_game,

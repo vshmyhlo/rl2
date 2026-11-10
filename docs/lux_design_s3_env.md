@@ -107,9 +107,15 @@ agents**. Run `uv run mappo --config configs/mappo/lux.yaml` to train both teams
 with shared policy weights and separate recurrent memory.
 
 - Each team policy call receives one flat observation and outputs all 16 ship
-  commands. The policy has one categorical head per ship, conditioned on the
-  same team encoder/LSTM. Heads sample independently given that representation;
-  this is not an autoregressive joint-action model.
+  commands. Each ship has a stay/move/sap choice, with a conditional direction
+  or sap target. All ships share the team encoder/LSTM and sample independently
+  given that representation; this is not an autoregressive joint-action model.
+  Raw logits have shape `(..., U, 232)`: 3 type, 4 direction, and 225 target logits.
+  Masked hierarchical probabilities flatten to `(..., U, 230)` command logits.
+  Equal type logits give equal mass to available types, independent of target
+  count; unavailable branches receive zero mass. Entropy includes conditional
+  entropy weighted by type probability. This changes the policy head shape;
+  checkpoints from the flat 230-logit head require a fresh model.
 - Adapter actions have shape `(2, U)`, with 230 categories per ship. IDs 0–4 are
   stay/up/right/down/left. For ID `a >= 5`, sap offsets are
   `dx = (a - 5) // 15 - 7`, `dy = (a - 5) % 15 - 7`. The adapter converts them to
@@ -129,6 +135,8 @@ with shared policy weights and separate recurrent memory.
   Completing the whole game is treated as terminal, with no value bootstrap,
   even though upstream labels it a truncation. Same-step autoreset preserves
   final observations/state and samples fresh game parameters.
+  Batched autoreset skips map generation when no game finishes; otherwise it
+  resets in parallel and selects fresh state only for completed games.
 - Parameters are randomized once per game by default. `randomize_params: false`
   uses native defaults. `max_units`, `max_steps_in_match`, and `match_count`
   can reduce the game for experiments. Map dimensions remain 24 × 24.

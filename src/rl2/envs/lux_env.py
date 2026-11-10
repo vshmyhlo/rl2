@@ -1,11 +1,11 @@
 """Lux S3 team agents with joint ship commands and memory across matches."""
 
-from typing import Annotated, Literal, NamedTuple
+from typing import Annotated, Any, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.custom_batching import sequential_vmap
+from jax.custom_batching import custom_vmap
 from luxai_s3.env import LuxAIS3Env
 from luxai_s3.params import EnvParams, env_params_ranges
 from luxai_s3.state import EnvObs, EnvState
@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 from pydantic import ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
-from rl2.actions import MultiDiscreteSpace
+from rl2.actions import HierarchicalMultiDiscreteSpace
 from rl2.envs.multi_agent import AgentObservation, BaseMultiAgentEnv, MultiAgentStep
 
 
@@ -53,10 +53,13 @@ class LuxEnv(BaseMultiAgentEnv[LuxState]):
             match_count_per_episode=config.match_count,
         )
         self.env = LuxAIS3Env(auto_reset=False, fixed_env_params=self.params)
-        # Ordinary vmap turns reset conditionals into selects and generates unused maps every step.
-        self._autoreset = sequential_vmap(self._autoreset)
+        self._autoreset = custom_vmap(self._autoreset)
+        self._autoreset.def_vmap(self._autoreset_batch)
         self.sap_range = max(env_params_ranges["unit_sap_range"])
-        self.action_space = MultiDiscreteSpace(nvec=(5 + (2 * self.sap_range + 1) ** 2,) * config.max_units)
+        self.action_space = HierarchicalMultiDiscreteSpace(
+            nvec=(5 + (2 * self.sap_range + 1) ** 2,) * config.max_units,
+            group_sizes=(1, 4, (2 * self.sap_range + 1) ** 2),  # Stay, move direction, sap target.
+        )
         offsets = jnp.arange((2 * self.sap_range + 1) ** 2, dtype=jnp.int16)  # (A-5,)
         self.sap_offsets = (
             jnp.stack((offsets // (2 * self.sap_range + 1), offsets % (2 * self.sap_range + 1)), axis=-1)
@@ -132,6 +135,37 @@ class LuxEnv(BaseMultiAgentEnv[LuxState]):
     ) -> tuple[AgentObservation, LuxState]:
         return jax.lax.cond(done, lambda: self.reset(key), lambda: (observation, state))
 
+    def _autoreset_batch(
+        self,
+        axis_size: int,
+        in_batched: list[Any],  # Boolean pytrees for the four inputs.
+        done: jax.Array,  # (E,) if batched, otherwise ()
+        key: jax.Array,  # (E,) if batched, otherwise () typed PRNG key
+        observation: AgentObservation,  # optionally E-prefixed observation/mask leaves
+        state: LuxState,  # optionally E-prefixed state leaves
+    ) -> tuple[tuple[AgentObservation, LuxState], Any]:
+        """Reset in parallel only when any game ends; keep unfinished games unchanged."""
+
+        def broadcast(value: jax.Array, batched: bool) -> jax.Array:  # (...) -> (E, ...)
+            return value if batched else jnp.broadcast_to(value, (axis_size, *value.shape))  # (E, ...)
+
+        done, key, observation, state = jax.tree.map(
+            broadcast, (done, key, observation, state), tuple(in_batched)
+        )  # done/key: (E,); observation/state leaves: (E, ...)
+
+        def reset_finished() -> tuple[AgentObservation, LuxState]:
+            fresh = jax.vmap(self.reset)(key)  # observation/state leaves: (E, ...)
+
+            def select(new: jax.Array, old: jax.Array) -> jax.Array:  # each (E, ...)
+                mask = done.reshape((axis_size,) + (1,) * (old.ndim - 1))  # (E, 1, ...)
+                return jnp.where(mask, new, old)  # (E, ...)
+
+            return jax.tree.map(select, fresh, (observation, state))  # observation/state leaves: (E, ...)
+
+        # A scalar guard avoids eager map generation without serializing the environment axis.
+        result = jax.lax.cond(done.any(), reset_finished, lambda: (observation, state))  # leaves: (E, ...)
+        return result, jax.tree.map(lambda _: True, result)
+
     def step(
         self,
         key: jax.Array,  # () typed PRNG key
@@ -182,6 +216,8 @@ class LuxEnv(BaseMultiAgentEnv[LuxState]):
         energy = game.units.energy[..., 0]  # (N, U)
         active = game.units_mask & (energy >= 0)  # (N, U)
         team_colors = ((70, 180, 255), (255, 95, 85))
+        scoring_color = (165, 140, 65)
+        relic_color = (240, 205, 70)
         colors = np.array([[25, 30, 45], [70, 45, 100], [105, 105, 115]], dtype=np.uint8)  # (3, RGB)
         tiles = np.asarray(game.map_features.tile_type).T  # (H, W)
         pixels = np.repeat(np.repeat(colors[tiles], 12, axis=0), 12, axis=1)  # (H*12, W*12, 3)
@@ -203,12 +239,12 @@ class LuxEnv(BaseMultiAgentEnv[LuxState]):
             )
             for x, y in np.argwhere(scoring):
                 left, top = 16 + int(x) * 12, 72 + int(y) * 12
-                draw.rectangle((left + 1, top + 1, left + 10, top + 10), outline=(165, 140, 65))
+                draw.rectangle((left + 1, top + 1, left + 10, top + 10), outline=scoring_color)
             for position, visible in zip(game.relic_nodes, game.relic_nodes_mask):
                 if visible:
                     x, y = map(int, position)
                     left, top = 16 + x * 12, 72 + y * 12
-                    draw.ellipse((left + 3, top + 3, left + 9, top + 9), fill=(240, 205, 70))
+                    draw.ellipse((left + 3, top + 3, left + 9, top + 9), fill=relic_color)
             for team, color in enumerate(team_colors):
                 for position in game.units.position[team][active[team]]:  # (2,) per active ship
                     x, y = map(int, position)
@@ -235,15 +271,22 @@ class LuxEnv(BaseMultiAgentEnv[LuxState]):
             draw.text((324, 312), f"Active relic nodes: {int(game.relic_nodes_mask.sum())}", font=font, fill="white")
             if boundary:
                 draw.text((324, 339), "Relic points reset at match end.", font=small_font, fill=(185, 195, 210))
+            for tile, label in enumerate(("Empty", "Nebula", "Asteroid")):
+                left = 16 + tile * 108
+                color = tuple(int(channel) for channel in colors[tile])
+                draw.rectangle((left, 374, left + 12, 386), fill=color, outline=(130, 140, 155))
+                draw.text((left + 18, 373), label, font=small_font, fill=(185, 195, 210))
+            draw.ellipse((343, 377, 349, 383), fill=relic_color)
+            draw.text((358, 373), "Relic", font=small_font, fill=(185, 195, 210))
+            draw.rectangle((448, 374, 460, 386), outline=scoring_color)
+            draw.text((466, 373), "Scoring tile", font=small_font, fill=(185, 195, 210))
+            for team, color in enumerate(team_colors):
+                left = 16 + team * 108
+                draw.rectangle((left + 3, 399, left + 9, 405), fill=color)
+                draw.text((left + 18, 395), f"Team {team}", font=small_font, fill=(185, 195, 210))
             draw.text(
-                (16, 374),
-                "Gold outline: scoring tile   |   Gold dot: relic   |   Blue / red: team ships",
-                font=small_font,
-                fill=(185, 195, 210),
-            )
-            draw.text(
-                (16, 396),
-                "Purple: nebula   |   Gray: asteroid   |   Full map shown (includes hidden information)",
+                (244, 395),
+                "Full map shown (includes hidden information)",
                 font=small_font,
                 fill=(185, 195, 210),
             )

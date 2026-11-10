@@ -225,10 +225,12 @@ def test_sharded_training_matches_single_device_and_restores_checkpoint(
     assert episode.length == 2
 
 
-def test_multi_discrete_sharded_update_preserves_sequences_and_matches_single_device(
+def test_hierarchical_sharded_update_preserves_sequences_and_matches_single_device(
     config: ppo.Config, mesh: Mesh
 ) -> None:
-    model = ppo.ActorCritic(action_space=ppo.MultiDiscreteSpace(nvec=(2, 3)), model=config.model)
+    model = ppo.ActorCritic(
+        action_space=ppo.HierarchicalMultiDiscreteSpace(nvec=(3, 3), group_sizes=(1, 2)), model=config.model
+    )
     observation = jnp.arange(8, dtype=jnp.float32).reshape(2, 2, 2)  # (B=2, T=2, O=2)
     memory = model.initial_carry(2)  # leaves: (B, H=4)
     starts = jnp.array([[True, False], [False, True]])  # (B, T)

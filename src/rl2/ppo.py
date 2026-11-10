@@ -705,7 +705,7 @@ def playback_step(
         state.episode_starts,
         method="step",
     )  # memory leaves: (1, H); policy leaves: (1, A/D); values: (1,)
-    actions = policy.sample(seed=action_key)  # (1, *action_shape)
+    actions = policy.sample(key=action_key)  # (1, *action_shape)
     observation, env_state, reward, done, info = env.step(env_key, state.env_state, actions[0], env.params)
     # observation: (*O,); state leaves: (...); reward/done: ()
     return state._replace(
@@ -955,7 +955,7 @@ def collect_rollout(
             current.episode_starts,
             method="step",
         )  # memory leaves: (B, H); policy leaves: (B, A/D); predictions: (B,)
-        actions, log_probs = policy.sample_and_log_prob(seed=action_key)  # (B, *action_shape); (B,)
+        actions, log_probs = policy.sample_and_log_prob(key=action_key)  # (B, *action_shape); (B,)
         env_keys = jax.random.split(env_key, config.num_envs)  # (B,) typed PRNG keys
         observations, env_state, raw_rewards, episode_ends, info = envs.step_batch(
             env_keys, current.env_state, actions, envs.params

@@ -1,3 +1,4 @@
+from operator import itemgetter
 from unittest.mock import patch
 
 import chex
@@ -5,9 +6,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import AxisType, Mesh, PartitionSpec
 from PIL import ImageDraw
 from pydantic import ValidationError
 
+from rl2.actions import HierarchicalMultiDiscreteSpace
 from rl2.envs.lux_env import LuxConfig, LuxEnv, LuxState
 from rl2.envs.multi_agent import AgentObservation
 
@@ -25,7 +28,10 @@ def initial(env: LuxEnv) -> tuple[AgentObservation, LuxState]:
 def test_shapes_randomization_and_action_encoding(env: LuxEnv, initial: tuple[AgentObservation, LuxState]) -> None:
     observation, state = initial  # observation: (N, O)/(N, U, A); state leaves: (...)
     assert env.num_agents == 2
+    assert isinstance(env.action_space, HierarchicalMultiDiscreteSpace)
     assert env.action_space.nvec == (230, 230)
+    assert env.action_space.group_sizes == (1, 4, 225)
+    assert env.action_space.logits_shape == (2, 232)
     chex.assert_shape(observation.observation, (2, 1774))
     chex.assert_shape(observation.actions_mask, (2, 2, 230))
     assert observation.observation.dtype == jnp.float32
@@ -128,6 +134,37 @@ def test_native_transition_match_memory_and_batched_game_autoreset(
     assert not np.array_equal(batched.observation.observation[1], batched.final_observation.observation[1])
 
 
+def test_batched_autoreset_guards_reset_without_gathering_environments(
+    env: LuxEnv, initial: tuple[AgentObservation, LuxState]
+) -> None:
+    key = jax.random.key(7)  # ()
+    fresh = jax.jit(env.reset)(key)  # observation/state leaves: (...)
+    mesh = Mesh(devices=jax.devices()[:2], axis_names=("batch",), axis_types=(AxisType.Auto,))
+    with jax.set_mesh(mesh):
+        key, observation, state = jax.device_put((key, *initial), PartitionSpec())  # key: (); other leaves: (...)
+        done = jax.device_put(jnp.zeros(2, bool), PartitionSpec("batch"))  # (E=2,)
+        reset = (
+            jax.jit(
+                jax.vmap(env._autoreset, in_axes=(0, None, None, None)),
+                in_shardings=(PartitionSpec("batch"), PartitionSpec(), PartitionSpec(), PartitionSpec()),
+                out_shardings=PartitionSpec("batch"),
+            )
+            .lower(done, key, observation, state)
+            .compile()
+        )
+        for flags in ((False, False), (False, True), (True, True)):
+            done = jax.device_put(jnp.asarray(flags), PartitionSpec("batch"))  # (E,)
+            actual = reset(done, key, observation, state)  # observation/state leaves: (E, ...)
+            chex.assert_shape(actual[0].observation, (2, 2, 1774))
+            chex.assert_shape(actual[0].actions_mask, (2, 2, 2, 230))
+            for index, finished in enumerate(flags):
+                selected = jax.tree.map(itemgetter(index), actual)  # leaves: (...)
+                chex.assert_trees_all_equal(selected, fresh if finished else initial)
+        hlo = reset.as_text()
+        assert " conditional(" in hlo  # Reset generation remains guarded by the scalar batch predicate.
+        assert " all-gather(" not in hlo
+
+
 @pytest.mark.parametrize(
     "overrides",
     [{"max_units": 0}, {"max_units": 17}, {"max_steps_in_match": 1}, {"match_count": 0}, {"max_steps_in_match": 2**30}],
@@ -186,3 +223,16 @@ def test_render_progress_and_team_statistics(
     assert ("Relic points reset at match end." in labels) == (steps > 0 and match_steps == 0)
     assert frame.shape == (416, 640, 3) and frame.dtype == np.uint8
     np.testing.assert_array_equal(frame[72 + 4 * 12 + 1, 16 + 3 * 12 + 1], [165, 140, 65])
+
+
+def test_render_legend(env: LuxEnv, initial: tuple[AgentObservation, LuxState]) -> None:
+    _, state = initial
+    with patch.object(ImageDraw.ImageDraw, "text", autospec=True, side_effect=ImageDraw.ImageDraw.text) as text:
+        frame = env.render(state)  # (416, 640, 3)
+    labels = {call.args[2] for call in text.call_args_list}
+    assert {"Empty", "Nebula", "Asteroid", "Relic", "Scoring tile", "Team 0", "Team 1"} <= labels
+    np.testing.assert_array_equal(frame[380, [22, 130, 238]], [[25, 30, 45], [70, 45, 100], [105, 105, 115]])
+    np.testing.assert_array_equal(frame[380, 346], [240, 205, 70])
+    np.testing.assert_array_equal(frame[374, 454], [165, 140, 65])
+    np.testing.assert_array_equal(frame[380, 454], [14, 18, 28])  # Scoring marker is an outline.
+    np.testing.assert_array_equal(frame[402, [22, 130]], [[70, 180, 255], [255, 95, 85]])

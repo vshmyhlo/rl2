@@ -7,7 +7,7 @@ import jax
 import numpy as np
 from numpy.typing import NDArray
 
-from rl2.actions import DiscreteSpace, MultiDiscreteSpace
+from rl2.actions import MultiAgentActionSpace
 
 
 class AgentObservation(NamedTuple):
@@ -43,13 +43,13 @@ class BaseMultiAgentEnv[State](ABC):
     Agent dictionaries are packed in a fixed order; adapters document observation
     layouts and any lossless action encoding. N denotes agents, O local features,
     and A categories. C is empty for discrete actions or (D,) for multi-discrete
-    actions. Masks expose available actions, including padding for unequal counts.
+    actions. Masks expose available commands for each action component.
     Reset and step support caller-applied jax.jit and jax.vmap.
     Adapters do not add JIT boundaries; rendering may run on the host.
     """
 
     num_agents: int
-    action_space: DiscreteSpace | MultiDiscreteSpace
+    action_space: MultiAgentActionSpace
 
     @abstractmethod
     def reset(

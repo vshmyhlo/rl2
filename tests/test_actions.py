@@ -14,9 +14,11 @@ from rl2.actions import (
     CategoricalPolicy,
     ContinuousSpace,
     DiscreteSpace,
+    HierarchicalMultiCategoricalPolicy,
+    HierarchicalMultiDiscreteSpace,
     MultiCategoricalPolicy,
-    MultiDiscreteSpace,
     TruncatedGaussianPolicy,
+    hierarchical_log_probs,
 )
 
 
@@ -25,8 +27,8 @@ def test_categorical_shapes_likelihood_and_masked_entropy(batch_shape: tuple[int
     logits = jnp.broadcast_to(jnp.array([0.0, jnp.log(3.0), -jnp.inf]), (*batch_shape, 3))  # (*S, A=3)
     policy = CategoricalPolicy(logits)
     key = jax.random.key(0)  # ()
-    actions = jax.jit(policy.sample)(seed=key)  # (*S,)
-    sampled, log_probs = jax.jit(policy.sample_and_log_prob)(seed=key)  # each (*S,)
+    actions = jax.jit(policy.sample)(key=key)  # (*S,)
+    sampled, log_probs = jax.jit(policy.sample_and_log_prob)(key=key)  # each (*S,)
     chex.assert_shape((actions, sampled, log_probs), batch_shape)
     assert actions.dtype == jnp.int32
     assert bool(jnp.all(actions < 2))
@@ -55,14 +57,14 @@ def test_gaussian_shapes_bounds_and_joint_density(batch_shape: tuple[int, ...], 
     log_std = jnp.full_like(mean, -1.0)  # (*S, D)
     policy = TruncatedGaussianPolicy(mean, log_std, action_space)
     key = jax.random.key(0)  # ()
-    actions = jax.jit(policy.sample)(seed=key)  # (*S, *action_shape)
-    sampled, log_probs = jax.jit(policy.sample_and_log_prob)(seed=key)  # (*S, *action_shape); (*S,)
+    actions = jax.jit(policy.sample)(key=key)  # (*S, *action_shape)
+    sampled, log_probs = jax.jit(policy.sample_and_log_prob)(key=key)  # (*S, *action_shape); (*S,)
     assert actions.shape == sampled.shape == (*batch_shape, *action_shape)
     assert log_probs.shape == batch_shape
     assert actions.dtype == log_probs.dtype == jnp.float32
     assert bool(jnp.all((actions >= -0.3) & (actions <= 0.7)))
     np.testing.assert_array_equal(actions, sampled)
-    assert not np.array_equal(actions, policy.sample(seed=jax.random.key(1)))
+    assert not np.array_equal(actions, policy.sample(key=jax.random.key(1)))
     np.testing.assert_allclose(log_probs, jax.jit(policy.log_prob)(actions), atol=2e-6)
     reference = truncnorm((-0.3 - 0.2) / np.exp(-1.0), (0.7 - 0.2) / np.exp(-1.0), loc=0.2, scale=np.exp(-1.0))
     flat_actions = np.asarray(actions).reshape((*batch_shape, size))  # (*S, D)
@@ -97,7 +99,7 @@ def test_discrete_space_requires_at_least_one_action() -> None:
     with pytest.raises(ValueError, match="positive"):
         DiscreteSpace(0)
     policy = CategoricalPolicy(jnp.zeros((1,)))  # logits: (A=1,)
-    actions, log_probs = policy.sample_and_log_prob(seed=jax.random.key(0))  # each ()
+    actions, log_probs = policy.sample_and_log_prob(key=jax.random.key(0))  # each ()
     assert int(actions) == 0
     assert float(log_probs) == float(policy.entropy()) == 0
 
@@ -116,20 +118,20 @@ def test_leading_sample_dimensions_and_broadcast_log_prob() -> None:
     key = jax.random.key(0)  # ()
     categorical = CategoricalPolicy(jnp.zeros((2, 3)))  # logits: (B=2, A=3)
     actions, log_probs = jax.jit(categorical.sample_and_log_prob, static_argnames="sample_shape")(
-        seed=key, sample_shape=2
+        key=key, sample_shape=2
     )  # each (N=2, B=2)
     assert actions.shape == log_probs.shape == (2, 2)
-    np.testing.assert_array_equal(actions, categorical.sample(seed=key, sample_shape=2))
+    np.testing.assert_array_equal(actions, categorical.sample(key=key, sample_shape=2))
     np.testing.assert_allclose(categorical.log_prob(actions), log_probs)
     gaussian = TruncatedGaussianPolicy(
         jnp.zeros((2, 2)), jnp.full((2, 2), -1.0), ContinuousSpace((2, 1), (-2.0, 0.0), (4.0, 1.0))
     )  # mean/log_std: (B=2, D=2)
     actions, log_probs = jax.jit(gaussian.sample_and_log_prob, static_argnames="sample_shape")(
-        seed=key, sample_shape=(2, 1)
+        key=key, sample_shape=(2, 1)
     )  # (N=2, M=1, B=2, 2, 1); (N, M, B)
     assert actions.shape == (2, 1, 2, 2, 1)
     assert log_probs.shape == (2, 1, 2)
-    np.testing.assert_allclose(actions, gaussian.sample(seed=key, sample_shape=(2, 1)), atol=1e-6)
+    np.testing.assert_allclose(actions, gaussian.sample(key=key, sample_shape=(2, 1)), atol=1e-6)
     np.testing.assert_allclose(gaussian.log_prob(actions), log_probs, atol=2e-6)
 
 
@@ -142,7 +144,7 @@ def test_truncated_sampling_entropy_and_gradients_at_boundaries(mean: float, log
     policy = TruncatedGaussianPolicy(
         jnp.array([mean]), jnp.array([log_std]), ContinuousSpace((1,), (-1.0,), (1.0,))
     )  # mean/log_std: (D=1,)
-    actions, log_prob = jax.jit(policy.sample_and_log_prob)(seed=jax.random.key(0))  # (D,); ()
+    actions, log_prob = jax.jit(policy.sample_and_log_prob)(key=jax.random.key(0))  # (D,); ()
     assert bool(jnp.all((actions >= -1) & (actions <= 1)))
     np.testing.assert_allclose(log_prob, policy.log_prob(actions), atol=1e-6)
     assert bool(jnp.isfinite(policy.entropy()))
@@ -185,13 +187,13 @@ def test_beta_shapes_bounds_density_and_entropy(
     policy = BetaPolicy(alpha, beta, space)
     key = jax.random.key(0)  # ()
     actions, log_probs = jax.jit(policy.sample_and_log_prob, static_argnames="sample_shape")(
-        seed=key, sample_shape=sample_shape
+        key=key, sample_shape=sample_shape
     )  # (*sample_shape, *S, *action_shape); (*sample_shape, *S)
     samples = (sample_shape,) if isinstance(sample_shape, int) else sample_shape
     assert actions.shape == (*samples, *batch_shape, *action_shape)
     assert log_probs.shape == (*samples, *batch_shape)
     assert actions.dtype == log_probs.dtype == jnp.float32
-    np.testing.assert_allclose(actions, policy.sample(seed=key, sample_shape=sample_shape), atol=1e-6)
+    np.testing.assert_allclose(actions, policy.sample(key=key, sample_shape=sample_shape), atol=1e-6)
     np.testing.assert_allclose(log_probs, jax.jit(policy.log_prob)(actions), atol=2e-6)
     flat_actions = actions.reshape((*samples, *batch_shape, size))  # (*sample_shape, *S, D)
     low, high = jnp.asarray((space.low, space.high))  # each (D,)
@@ -230,7 +232,7 @@ def test_beta_boundary_samples_and_gradients(alpha: float, beta: float) -> None:
     space = ContinuousSpace((2,), (-1.0, 5.0), (1.0, 5.001))
     policy = BetaPolicy(jnp.full(2, alpha), jnp.full(2, beta), space)  # alpha/beta: (D=2,)
     actions, log_probs = jax.jit(policy.sample_and_log_prob, static_argnames="sample_shape")(
-        seed=jax.random.key(0), sample_shape=8
+        key=jax.random.key(0), sample_shape=8
     )  # (N=8, D=2); (N,)
     low, high = jnp.asarray((space.low, space.high))  # each (D,)
     assert bool(jnp.all((actions > low) & (actions < high)))
@@ -252,17 +254,17 @@ def test_multi_categorical_joint_probability_and_entropy(batch_shape: tuple[int,
         jnp.array([[0.0, jnp.log(3.0), -jnp.inf], [0.0, -jnp.inf, -jnp.inf]]), (*batch_shape, 2, 3)
     )  # (*S, D=2, A=3)
     policy = MultiCategoricalPolicy(logits=logits)
-    actions, log_prob = jax.jit(policy.sample_and_log_prob)(seed=jax.random.key(0))  # (*S, D); (*S,)
+    actions, log_prob = jax.jit(policy.sample_and_log_prob)(key=jax.random.key(0))  # (*S, D); (*S,)
     assert actions.shape == (*batch_shape, 2) and log_prob.shape == batch_shape
     np.testing.assert_array_equal(actions[..., 1], 0)
     np.testing.assert_allclose(log_prob, jnp.log(jnp.where(actions[..., 0] == 0, 0.25, 0.75)), atol=1e-7)
     np.testing.assert_allclose(policy.log_prob(actions), log_prob, atol=1e-7)
     np.testing.assert_allclose(policy.entropy(), -0.25 * np.log(0.25) - 0.75 * np.log(0.75), rtol=1e-6)
-    samples, probs = policy.sample_and_log_prob(seed=jax.random.key(1), sample_shape=(2, 1))
+    samples, probs = policy.sample_and_log_prob(key=jax.random.key(1), sample_shape=(2, 1))
     # samples: (2, 1, *S, D); probs: (2, 1, *S)
     assert samples.shape == (2, 1, *batch_shape, 2) and probs.shape == (2, 1, *batch_shape)
     np.testing.assert_allclose(probs, policy.log_prob(samples), atol=1e-7)
-    np.testing.assert_array_equal(samples, policy.sample(seed=jax.random.key(1), sample_shape=(2, 1)))
+    np.testing.assert_array_equal(samples, policy.sample(key=jax.random.key(1), sample_shape=(2, 1)))
     with pytest.raises(AssertionError):
         policy.log_prob(actions.astype(jnp.float32))
 
@@ -283,6 +285,101 @@ def test_multi_categorical_sums_components_and_has_gradients() -> None:
 
 
 @pytest.mark.parametrize("counts", [(), (0,), (2, -1)])
-def test_invalid_multi_discrete_space(counts: tuple[int, ...]) -> None:
+def test_invalid_hierarchical_multi_discrete_space(counts: tuple[int, ...]) -> None:
     with pytest.raises(ValueError, match="positive"):
-        MultiDiscreteSpace(nvec=counts)
+        HierarchicalMultiDiscreteSpace(nvec=counts, group_sizes=(1,))
+
+
+def test_hierarchical_multi_discrete_logit_shapes() -> None:
+    assert HierarchicalMultiDiscreteSpace(nvec=(3, 3), group_sizes=(1, 1, 1)).logits_shape == (2, 3)
+    assert HierarchicalMultiDiscreteSpace(nvec=(3,), group_sizes=(3,)).logits_shape == (1, 4)
+
+
+@pytest.mark.parametrize("batch_shape", [(), (2, 3)], ids=["unbatched", "batched-sequences"])
+def test_hierarchical_uniform_types_and_joint_entropy(batch_shape: tuple[int, ...]) -> None:
+    space = HierarchicalMultiDiscreteSpace(nvec=(230,), group_sizes=(1, 4, 225))
+    assert space.logits_shape == (1, 232)
+    logits = jnp.zeros((*batch_shape, 232))  # (*S, L)
+    mask = jnp.ones((*batch_shape, 230), dtype=bool)  # (*S, A)
+    flat = jax.jit(hierarchical_log_probs, static_argnames="group_sizes")(logits, mask, space.group_sizes)
+    # flat: (*S, A), valid command log probabilities
+    probs = jnp.exp(flat)  # (*S, A)
+    assert probs.shape == (*batch_shape, 230)
+    np.testing.assert_allclose(probs[..., 0], 1 / 3, rtol=1e-6)
+    np.testing.assert_allclose(probs[..., 1:5].sum(-1), 1 / 3, rtol=1e-6)
+    np.testing.assert_allclose(probs[..., 5:].sum(-1), 1 / 3, rtol=1e-6)
+    policy = HierarchicalMultiCategoricalPolicy(
+        raw_logits=jnp.broadcast_to(logits[..., None, :], (*batch_shape, 2, 232)),  # (*S, D=2, L)
+        actions_mask=jnp.broadcast_to(mask[..., None, :], (*batch_shape, 2, 230)),  # (*S, D=2, A)
+        group_sizes=space.group_sizes,
+    )
+    policy = jax.jit(lambda distribution: distribution)(policy)
+    assert policy.logits.shape == (*batch_shape, 2, 230)
+    np.testing.assert_allclose(policy.logits[..., 0, :], flat, atol=1e-6)
+    np.testing.assert_allclose(policy.entropy(), 2 * (np.log(3) + (np.log(4) + np.log(225)) / 3), rtol=1e-6)
+    key = jax.random.key(0)  # ()
+    action, lp = jax.jit(policy.sample_and_log_prob, static_argnames="sample_shape")(key=key, sample_shape=2)
+    assert action.shape == (2, *batch_shape, 2) and lp.shape == (2, *batch_shape)
+    np.testing.assert_array_equal(action, policy.sample(key=key, sample_shape=2))
+    np.testing.assert_allclose(lp, policy.log_prob(action), atol=1e-6)
+
+
+def test_hierarchical_masks_and_gradients() -> None:
+    groups = (1, 2, 3)
+    logits = jnp.zeros((4, 8))  # (B, G + K)
+    mask = jnp.array(
+        [
+            [True, True, False, True, False, True],  # All types; different numbers of valid children.
+            [True, True, True, False, False, False],  # Sap unavailable.
+            [True, False, False, False, False, False],  # Inactive ship: stay only.
+            [False, False, False, True, False, True],
+        ]  # Only a non-singleton group available.
+    )  # (B, A)
+
+    def objective(raw: jax.Array) -> jax.Array:  # (B, L) -> ()
+        policy = HierarchicalMultiCategoricalPolicy(
+            raw_logits=raw[:, None, :], actions_mask=mask[:, None, :], group_sizes=groups
+        )  # logits: (B, D=1, A)
+        return policy.entropy().sum()  # ()
+
+    flat = hierarchical_log_probs(logits, mask, groups)  # (B, A)
+    expected = [
+        [1 / 3, 1 / 3, 0, 1 / 6, 0, 1 / 6],
+        [1 / 2, 1 / 4, 1 / 4, 0, 0, 0],
+        [1, 0, 0, 0, 0, 0],
+        [0, 0, 0, 1 / 2, 0, 1 / 2],
+    ]
+    np.testing.assert_allclose(jnp.exp(flat), expected, rtol=1e-6)
+    entropy, gradient = jax.jit(jax.value_and_grad(objective))(logits)  # (); (B, L)
+    np.testing.assert_allclose(entropy, np.log(3) + np.log(2) / 3 + np.log(2) * 1.5 + np.log(2), rtol=1e-6)
+    expected_gradient = np.zeros((4, 8))  # (B, L)
+    expected_gradient[0, :3] = [-np.log(2) / 9, -np.log(2) / 9, 2 * np.log(2) / 9]
+    expected_gradient[1, :3] = [-np.log(2) / 4, np.log(2) / 4, 0]
+    np.testing.assert_allclose(gradient, expected_gradient, atol=1e-6)
+
+
+def test_hierarchical_selected_branch_probability_and_gradient() -> None:
+    logits = jnp.log(jnp.array([2.0, 3.0, 5.0, 1.0, 3.0, 2.0, 3.0, 5.0]))  # (L=8), groups=(1, 2, 3)
+    mask = jnp.ones(6, dtype=bool)  # (A,)
+
+    def log_probability(raw: jax.Array, command: jax.Array) -> jax.Array:  # (L,); () -> ()
+        policy = HierarchicalMultiCategoricalPolicy(
+            raw_logits=raw[None, :], actions_mask=mask[None, :], group_sizes=(1, 2, 3)
+        )  # logits: (D=1, A)
+        return policy.log_prob(command[None])  # ()
+
+    stay, stay_grad = jax.value_and_grad(log_probability)(logits, jnp.array(0))  # (); (L,)
+    move, move_grad = jax.value_and_grad(log_probability)(logits, jnp.array(2))  # (); (L,)
+    sap, sap_grad = jax.value_and_grad(log_probability)(logits, jnp.array(5))  # (); (L,)
+    np.testing.assert_allclose([stay, move, sap], np.log([0.2, 0.3 * 0.75, 0.5 * 0.5]), atol=1e-6)
+    np.testing.assert_allclose(stay_grad[3:], 0, atol=1e-6)
+    np.testing.assert_allclose(move_grad[5:], 0, atol=1e-6)
+    np.testing.assert_allclose(sap_grad[3:5], 0, atol=1e-6)
+    np.testing.assert_allclose(move_grad[:5], [-0.2, 0.7, -0.5, -0.25, 0.25], atol=1e-6)
+    np.testing.assert_allclose(sap_grad, [-0.2, -0.3, 0.5, 0, 0, -0.2, -0.3, 0.5], atol=1e-6)
+
+
+@pytest.mark.parametrize("counts,groups", [((6,), ()), ((6,), (1, 0, 5)), ((6,), (1, -1, 6)), ((6, 7), (1, 2, 3))])
+def test_invalid_hierarchical_groups(counts: tuple[int, ...], groups: tuple[int, ...]) -> None:
+    with pytest.raises(ValueError, match="group sizes"):
+        HierarchicalMultiDiscreteSpace(nvec=counts, group_sizes=groups)

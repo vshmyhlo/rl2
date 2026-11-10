@@ -255,7 +255,7 @@ def test_local_model_mask_replay_and_shared_memory(config: ppo.Config) -> None:
     np.testing.assert_allclose(
         output.policy.logits, jnp.stack([first.policy.logits, second.policy.logits], axis=1), atol=1e-6
     )
-    action, log_prob = output.policy.sample_and_log_prob(seed=jax.random.key(2))  # each (B, T)
+    action, log_prob = output.policy.sample_and_log_prob(key=jax.random.key(2))  # each (B, T)
     assert bool(jnp.take_along_axis(actions_mask, action[..., None], axis=-1).all())
     assert bool(jnp.isfinite(output.policy.entropy()).all())
     np.testing.assert_allclose(output.policy.log_prob(action), log_prob, atol=1e-6)
@@ -808,20 +808,22 @@ def test_mlflow_resume_without_checkpoint(config: ppo.Config) -> None:
     logger.assert_called_once_with(experiment="mappo", run_name=config.run_id)
 
 
-def test_multi_discrete_model_masks_and_sequence_replay(config: ppo.Config) -> None:
-    model = ppo.ActorCritic(action_space=ppo.MultiDiscreteSpace(nvec=(2, 3)), model=config.model)
+def test_hierarchical_model_masks_and_sequence_replay(config: ppo.Config) -> None:
+    model = ppo.ActorCritic(
+        action_space=ppo.HierarchicalMultiDiscreteSpace(nvec=(3, 3), group_sizes=(1, 2)), model=config.model
+    )
     observation = jnp.ones((2, 2, 4))  # (B, T, O)
     starts = jnp.array([[True, False], [True, False]])  # (B, T)
-    masks = jnp.ones((2, 2, 2, 3), dtype=bool).at[..., 1, 1].set(False)  # (B, T, D, A)
+    masks = jnp.broadcast_to(jnp.array([[True, True, False], [True, False, True]]), (2, 2, 2, 3))  # (B, T, D, A)
     memory = model.initial_carry(2)  # leaves: (B, H)
     params = model.init(jax.random.key(0), observation, memory, starts, masks)
     output = model.apply(params, observation, memory, starts, masks)
-    assert isinstance(output.policy, ppo.MultiCategoricalPolicy)
+    assert isinstance(output.policy, ppo.HierarchicalMultiCategoricalPolicy)
     chex.assert_shape(output.policy.logits, (2, 2, 2, 3))
     chex.assert_shape(output.value, (2, 2))
-    action, log_prob = output.policy.sample_and_log_prob(seed=jax.random.key(1))  # (B, T, D); (B, T)
+    action, log_prob = output.policy.sample_and_log_prob(key=jax.random.key(1))  # (B, T, D); (B, T)
     assert action.shape == (2, 2, 2) and log_prob.shape == (2, 2)
-    assert bool((action[..., 0] < 2).all())  # Padded category is masked even when requested by caller.
+    assert bool((action[..., 0] < 2).all())
     assert bool((action[..., 1] != 1).all())
     np.testing.assert_allclose(output.policy.log_prob(action), log_prob, atol=1e-6)
     first = model.apply(params, observation[:, 0], memory, starts[:, 0], masks[:, 0], method="step")
@@ -855,6 +857,7 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
     starts = jnp.ones(2, dtype=bool)  # (B,)
     sequence = jax.tree.map(lambda leaf: jnp.swapaxes(leaf, 0, 1), observation)  # (B, T=1, ...)
     params = model.init(jax.random.key(1), sequence.observation, memory, starts[:, None], sequence.actions_mask)
+    assert params["params"]["policy_output"]["bias"].shape == (2 * 232,)
     train_state = TrainState.create(apply_fn=model.apply, params=params["params"], tx=optax.adam(0.001))
     runner = ppo.RolloutCarry(
         env_state=state,
@@ -889,3 +892,25 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
     assert episode.length == 3 and episode.episode_return == 0.5
     assert len(episode.frames) == 4
     assert all(frame.shape == (416, 640, 3) and frame.dtype == np.uint8 for frame in episode.frames)
+
+
+def test_grouped_model_balances_types_and_masks(config: ppo.Config) -> None:
+    model = ppo.ActorCritic(
+        action_space=ppo.HierarchicalMultiDiscreteSpace(nvec=(6, 6), group_sizes=(1, 2, 3)), model=config.model
+    )
+    observation = jnp.zeros((2, 1, 4))  # (B, T, O)
+    starts = jnp.ones((2, 1), dtype=bool)  # (B, T)
+    mask = jnp.ones((2, 1, 2, 6), dtype=bool).at[1, :, :, 3:].set(False)  # (B, T, D, A), no sap for team 1
+    memory = model.initial_carry(2)  # leaves: (B, H)
+    params = model.init(jax.random.key(0), observation, memory, starts, mask)
+    params["params"]["policy_output"] = jax.tree.map(jnp.zeros_like, params["params"]["policy_output"])
+    output = model.apply(params, observation, memory, starts, mask)
+    assert isinstance(output.policy, ppo.HierarchicalMultiCategoricalPolicy)
+    assert output.policy.raw_logits.shape == (2, 1, 2, 8)
+    assert output.policy.logits.shape == (2, 1, 2, 6)
+    probs = jax.nn.softmax(output.policy.logits, axis=-1)  # (B, T, D, A)
+    np.testing.assert_allclose(probs[0, 0, 0], [1 / 3, 1 / 6, 1 / 6, 1 / 9, 1 / 9, 1 / 9], rtol=1e-6)
+    np.testing.assert_allclose(probs[1, 0, 0], [1 / 2, 1 / 4, 1 / 4, 0, 0, 0], rtol=1e-6)
+    step = model.apply(params, observation[:, 0], memory, starts[:, 0], mask[:, 0], method="step")
+    np.testing.assert_allclose(step.policy.logits, output.policy.logits[:, 0], atol=1e-6)
+    np.testing.assert_allclose(step.policy.entropy(), output.policy.entropy()[:, 0], atol=1e-6)

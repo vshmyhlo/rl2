@@ -10,6 +10,8 @@ E denotes environments, N agents, B = E * N agent sequences, T rollout steps,
 O local observation features, A categories, and H recurrent width. C is empty
 for scalar actions or (D,) for D discrete components. Multi-discrete policies
 produce one joint action per agent: log probabilities and entropies sum over D.
+Grouped choices normalize action types and their conditional commands separately;
+their joint entropy includes conditional entropy weighted by type probability.
 Recurrent minibatches preserve entire (B, T, ...) agent sequences. Advantages are
 standardized per minibatch; a single transition retains its raw advantage.
 KL-rejected minibatches skip backpropagation and optimizer updates.
@@ -143,7 +145,14 @@ from jax.sharding import AxisType, Mesh, PartitionSpec
 from pydantic import ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
 
-from rl2.actions import CategoricalPolicy, DiscreteSpace, MultiCategoricalPolicy, MultiDiscreteSpace
+from rl2.actions import (
+    CategoricalPolicy,
+    DiscreteSpace,
+    HierarchicalMultiCategoricalPolicy,
+    HierarchicalMultiDiscreteSpace,
+    MultiAgentActionSpace,
+    Policy,
+)
 from rl2.configuration import BaseConfig, load_config
 from rl2.envs.jaxnav_env import JaxNavConfig, JaxNavEnv
 from rl2.envs.lux_env import LuxConfig, LuxEnv
@@ -499,14 +508,14 @@ def entropy_coef_schedule(config: Config) -> optax.Schedule:
 
 class ActorCriticOutput(NamedTuple):
     carry: RecurrentCarry  # leaves: (B, H)
-    policy: CategoricalPolicy | MultiCategoricalPolicy  # logits: (*S, *C, A)
+    policy: Policy  # logits: (*S, *C, A)
     value: jax.Array  # (*S,)
 
 
 class ActorCritic(nn.Module):
     """Shared local observation encoder/LSTM with separate policy and value heads."""
 
-    action_space: DiscreteSpace | MultiDiscreteSpace
+    action_space: MultiAgentActionSpace
     model: ModelConfig
     dtype: jax.typing.DTypeLike = jnp.float32
 
@@ -556,23 +565,21 @@ class ActorCritic(nn.Module):
         self,
         x: jax.Array,  # (*S, H)
         actions_mask: jax.Array,  # (*S, *C, A)
-    ) -> tuple[CategoricalPolicy | MultiCategoricalPolicy, jax.Array]:  # logits: (*S, *C, A); value: (*S,)
+    ) -> tuple[Policy, jax.Array]:  # logits: (*S, *C, A); value: (*S,)
         x = x.astype(self.dtype)  # (*S, H), S is (B,) or (B, T)
         policy = nn.relu(self.policy_norm(self.policy_hidden(x)))  # (*S, 512)
         critic = nn.relu(self.value_norm(self.value_hidden(x)))  # (*S, 512)
         # Heads use the compute dtype; float32 outputs keep PPO loss arithmetic precise.
-        logits = self.policy_output(policy).astype(jnp.float32)  # (*S, prod(C)*A), before component reshape
-        if isinstance(self.action_space, MultiDiscreteSpace):
-            logits = logits.reshape((*x.shape[:-1], *self.action_space.logits_shape))  # (*S, D, A)
-            counts = jnp.asarray(self.action_space.nvec)  # (D,)
-            actions_mask = actions_mask & (jnp.arange(logits.shape[-1]) < counts[:, None])  # (*S, D, A)
-        logits = jnp.where(actions_mask, logits, -1e10)  # (*S, *C, A)
+        logits = self.policy_output(policy).astype(jnp.float32)  # (*S, D*L) or (*S, A); L is raw logits per component
+        distribution: Policy
+        if isinstance(self.action_space, HierarchicalMultiDiscreteSpace):
+            logits = logits.reshape((*x.shape[:-1], *self.action_space.logits_shape))  # (*S, D, L)
+            distribution = HierarchicalMultiCategoricalPolicy(
+                raw_logits=logits, actions_mask=actions_mask, group_sizes=self.action_space.group_sizes
+            )
+        else:
+            distribution = CategoricalPolicy(logits=jnp.where(actions_mask, logits, -1e10))
         value = self.value_output(critic).squeeze(-1).astype(jnp.float32)  # (*S,)
-        distribution = (
-            MultiCategoricalPolicy(logits=logits)
-            if isinstance(self.action_space, MultiDiscreteSpace)
-            else CategoricalPolicy(logits=logits)
-        )
         return distribution, value  # logits: (*S, *C, A); value: (*S,)
 
     def __call__(
@@ -623,7 +630,7 @@ def sample_policy_step(
     carry, policy, _ = apply_fn(
         {"params": params}, observation, carry, episode_start, actions_mask, method="step"
     )  # carry leaves: (B, H); logits: (B, *C, A); value: (B,)
-    return carry, policy.sample(seed=key)  # carry leaves: (B, H); action: (B, *C)
+    return carry, policy.sample(key=key)  # carry leaves: (B, H); action: (B, *C)
 
 
 type EpisodeState = PlaybackState[AgentObservation, Any, RecurrentCarry]
@@ -885,7 +892,7 @@ def collect_rollout(
             observation.actions_mask,
             method="step",
         )  # memory leaves: (B, H); logits: (B, *C, A); prediction: (B,)
-        action, log_prob = policy.sample_and_log_prob(seed=action_key)  # (B, *C); (B,)
+        action, log_prob = policy.sample_and_log_prob(key=action_key)  # (B, *C); (B,)
         env_key = jax.random.split(env_key, config.num_envs)  # (E,) typed PRNG keys
         result = jax.vmap(env.step)(
             env_key,
