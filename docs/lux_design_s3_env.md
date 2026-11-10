@@ -122,17 +122,20 @@ with shared policy weights and separate recurrent memory.
   Lux's `(U, 3)` arrays. Masks have shape `(2, U, 230)` and exclude absent ships,
   insufficient energy, out-of-range/off-map sap targets, and boundary-frame
   actions; stay is always allowed. Failed movement attempts remain available.
-- `AgentObservation[LuxObservation]` retains the native `EnvObs` tree under
-  `obs`, with a leading observing-team axis `(2, ...)` and native dtypes.
-  `team_id` is `(2, 2)` one-hot; `public_params` is `(2, 4)` containing move cost,
-  sap cost, sap range, and sensor range. `LuxEnv.observation_space` describes
-  one team's tree with `ShapeDtypeStruct` leaves, excluding action masks.
-- MAPPO's `model.encoder.type: lux` converts native leaves to float32 in JAX
-  pytree order, appends team identity and public parameters, and applies a dense
-  projection. The projection has `1758 + 8*U` inputs (1886 for `U=16`). Its
-  parameter layout matches the previous flat MLP encoder. Rollout storage keeps
-  the nested native arrays. Hidden state and parameters remain excluded;
-  values use native units and coordinates remain absolute.
+- `AgentObservation[LuxObservation]` has `self` and `opponent` team views,
+  each containing `units.position`, `units.energy`, `units_mask`, `points`, and
+  `wins`. Both use the acting player's visibility; opponent data never comes
+  from the opponent's private observation. The outer axis remains
+  `[player_0, player_1]`; ship positions have shape `(2, U, 2)` per team view.
+- Sensor masks, map features, relics, and step counters remain shared fields in
+  each observation. `public_params` is `(2, 4)`: move cost, sap cost, sap range,
+  and sensor range. Native dtypes, units, and absolute coordinates are retained.
+  `LuxEnv.observation_space` describes one player's tree with
+  `ShapeDtypeStruct` leaves, excluding action masks.
+- MAPPO's `model.encoder.type: lux` flattens the tree to float32 in JAX pytree
+  order and applies a dense projection with `1756 + 8*U` inputs (1884 for
+  `U=16`). There is no team-ID feature. The changed feature order and input
+  width require a fresh run directory; older encoder checkpoints are incompatible.
 - PPO computes one joint log probability and one value per **team**. Log
   probabilities and entropies sum over ship commands; batches and recurrent
   memory retain two agent sequences per environment, not 32 ship sequences.

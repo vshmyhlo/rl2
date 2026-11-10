@@ -164,16 +164,10 @@ def test_checkpoint_timing_matches_blocking_work(
     manager.save.side_effect = partial(advance, 2.0)
     manager.wait_until_finished.side_effect = partial(advance, 3.0)
     with patch.object(trainer, "monotonic", side_effect=lambda: clock):
-        if trainer is ppo:
-            assert trainer.save_checkpoint(manager, progress, config) == 2.0
-            manager.wait_until_finished.assert_not_called()
-            assert capsys.readouterr().out == "Started checkpoint at iteration 2; blocked for 2.0s\n"
-            manager.save.side_effect = RuntimeError("write failed")
-        else:
-            assert trainer.save_checkpoint(manager, progress, config) == 5.0
-            assert [call[0] for call in manager.mock_calls] == ["save", "wait_until_finished"]
-            assert capsys.readouterr().out == "Saved checkpoint at iteration 2 in 5.0s\n"
-            manager.wait_until_finished.side_effect = RuntimeError("write failed")
+        assert trainer.save_checkpoint(manager, progress, config) == 2.0
+        manager.wait_until_finished.assert_not_called()
+        assert capsys.readouterr().out == "Started checkpoint at iteration 2; blocked for 2.0s\n"
+        manager.save.side_effect = RuntimeError("write failed")
         with pytest.raises(RuntimeError, match="write failed"):
             trainer.save_checkpoint(manager, progress, config)
         assert capsys.readouterr().out == ""

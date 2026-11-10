@@ -8,7 +8,7 @@ import numpy as np
 from jax.custom_batching import custom_vmap
 from luxai_s3.env import LuxAIS3Env
 from luxai_s3.params import EnvParams, env_params_ranges
-from luxai_s3.state import EnvObs, EnvState
+from luxai_s3.state import EnvObs, EnvState, MapTile, UnitState
 from numpy.typing import NDArray
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import ConfigDict, Field
@@ -36,25 +36,52 @@ class LuxState(NamedTuple):
     params: EnvParams  # Array leaves: (), sampled once per game.
 
 
-class LuxObservation[Array](NamedTuple):
-    """Native masked observation plus public context; optional leading axes S.
+class LuxTeamObservation[Array](NamedTuple):
+    """One team's visible ships and public scores; optional leading axes S.
 
-    obs: (*S, ...) native EnvObs leaves, with absolute team/map coordinates.
-    team_id: (*S, 2) one-hot observing team.
+    units: (*S, U, 2) positions and (*S, U) energy in native units.
+    units_mask: (*S, U) visible, existing ship slots.
+    points: (*S,) current match points.
+    wins: (*S,) cumulative match wins in the current game.
+    """
+
+    units: UnitState  # position: (*S, U, 2); energy: (*S, U)
+    units_mask: Array  # (*S, U) bool
+    points: Array  # (*S,) int32
+    wins: Array  # (*S,) int32
+
+
+class LuxObservation[Array](NamedTuple):
+    """Observer-relative teams and shared visible world; optional leading axes S.
+
+    self: (*S, ...) own team leaves.
+    opponent: (*S, ...) opponent leaves masked by the observer's visibility.
+    sensor_mask: (*S, W, H) visible tiles.
+    map_features: (*S, W, H) energy and tile-type leaves, with absolute coordinates.
+    relic_nodes: (*S, R, 2) visible relic positions.
+    relic_nodes_mask: (*S, R) visible relic slots.
+    steps: (*S,) game step counter.
+    match_steps: (*S,) match step counter.
     public_params: (*S, 4) move cost, sap cost, sap range, sensor range, in native units.
     Array is jax.Array for observations or ShapeDtypeStruct for the observation space.
     """
 
-    obs: EnvObs  # leaves: (*S, ...), native shapes/dtypes
-    team_id: Array  # (*S, 2) float32
+    self: LuxTeamObservation[Array]  # leaves: (*S, ...)
+    opponent: LuxTeamObservation[Array]  # leaves: (*S, ...)
+    sensor_mask: Array  # (*S, W, H) bool
+    map_features: MapTile  # leaves: (*S, W, H), native dtypes
+    relic_nodes: Array  # (*S, R, 2) int16
+    relic_nodes_mask: Array  # (*S, R) bool
+    steps: Array  # (*S,) int32
+    match_steps: Array  # (*S,) int32
     public_params: Array  # (*S, 4), native parameter dtype
 
 
 class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
     """Two agents; each chooses U categorical ship commands from A=230 choices.
 
-    Observations preserve the native EnvObs tree and dtypes, with a leading
-    observing-team axis. Only each team's masked observation is exposed.
+    Observations split native team fields into self/opponent, preserving native
+    dtypes and a leading observing-team axis. World fields retain the observer's mask.
     """
 
     def __init__(self, config: LuxConfig) -> None:
@@ -104,12 +131,32 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
         public_params = jnp.stack(
             (params.unit_move_cost, params.unit_sap_cost, params.unit_sap_range, params.unit_sensor_range)
         )  # (4,)
-        features = LuxObservation(
-            obs=jax.tree.map(lambda *leaves: jnp.stack(leaves), observation["player_0"], observation["player_1"]),
-            # obs leaves: (N, ...), preserving native structure and dtypes
-            team_id=jnp.eye(2, dtype=jnp.float32),  # (N, 2)
-            public_params=jnp.broadcast_to(public_params, (2, 4)),  # (N, 4)
-        )
+
+        def team_observation(obs: EnvObs, team: int) -> LuxTeamObservation[jax.Array]:  # obs leaves: (...)
+            return LuxTeamObservation(
+                units=jax.tree.map(lambda leaf: leaf[team], obs.units),  # position: (U, 2); energy: (U,)
+                units_mask=obs.units_mask[team],  # (U,)
+                points=obs.team_points[team],  # ()
+                wins=obs.team_wins[team],  # ()
+            )
+
+        views: list[LuxObservation[jax.Array]] = []  # each view has (...) leaves
+        for team in range(2):
+            obs = observation[f"player_{team}"]  # leaves: (...), this observer's masked view
+            views.append(
+                LuxObservation(
+                    self=team_observation(obs, team),  # leaves: (...)
+                    opponent=team_observation(obs, 1 - team),  # leaves: (...), same observer's visibility
+                    sensor_mask=obs.sensor_mask,  # (W, H)
+                    map_features=obs.map_features,  # leaves: (W, H)
+                    relic_nodes=obs.relic_nodes,  # (R, 2)
+                    relic_nodes_mask=obs.relic_nodes_mask,  # (R,)
+                    steps=obs.steps,  # ()
+                    match_steps=obs.match_steps,  # ()
+                    public_params=public_params,  # (4,)
+                )
+            )
+        features = jax.tree.map(lambda *leaves: jnp.stack(leaves), *views)  # leaves: (N, ...)
         energy = game.units.energy[..., 0]  # (N, U), own ship energy for each team
         active = game.units_mask & (energy >= 0) & (game.match_steps != 0)  # (N, U)
         targets = game.units.position[..., None, :] + self.sap_offsets  # (N, U, A-5, 2)

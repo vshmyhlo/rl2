@@ -5,8 +5,8 @@ Actions are masked during collection and updates. Agent death/inactivity resets
 memory without ending the reward stream or GAE trace. Environment completion ends
 traces; timeouts bootstrap from final local observations unless also terminated.
 Despite the historical MAPPO filename, the critic uses no centralized state.
-Lux observations retain their native tree and dtypes through rollout storage;
-the lux encoder flattens native leaves and public context before its projection.
+Lux observations separate self/opponent teams and retain native dtypes through
+rollout storage; the lux encoder flattens these leaves before its projection.
 
 E denotes environments, N agents, B = E * N agent sequences, T rollout steps,
 O local observation features, A categories, and H recurrent width. C is empty
@@ -82,7 +82,9 @@ Latest settings and session timings:
         through the current metric read, including intervening overhead.
     actor/video_seconds: Gameplay recording, encoding, and upload wall seconds.
     eval/evaluation_seconds: Evaluation through gameplay/report upload wall seconds.
-    checkpoint/save_seconds: Checkpoint save wall seconds through completed writes.
+    checkpoint/save_seconds: Blocking wall seconds to prepare and submit an async
+        checkpoint, including any wait for the previous save; excludes background
+        writes and the final shutdown wait.
         Operation timings are logged only when that operation runs, at its current
         environment step, and exclude logging the timing itself.
     model/params_millions: Parameter count in millions at startup, including resume.
@@ -110,7 +112,8 @@ Checkpoints save the full configuration, parameters, optimizer state, RNG, itera
 and transition counters, and cumulative episode statistics. Restore uses the current
 configuration without compatibility checks. Legacy checkpoints lacking transition
 counters estimate them using current rollout dimensions. Live environments and
-memory restart on resume; unfinished episode statistics are discarded.
+memory restart on resume; unfinished episode statistics are discarded. Checkpoint
+writes overlap training; shutdown waits for pending writes and surfaces failures.
 """
 
 import argparse
@@ -420,12 +423,12 @@ def checkpoint_manager(run_dir: str) -> ocp.CheckpointManager:
         directory = str(Path(directory).resolve())
     return ocp.CheckpointManager(
         directory,
-        options=ocp.CheckpointManagerOptions(max_to_keep=2),
+        options=ocp.CheckpointManagerOptions(max_to_keep=2, enable_async_checkpointing=True),
     )
 
 
 def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, config: Config) -> float:
-    """Wait for a completed rollout checkpoint to finish saving and return elapsed seconds."""
+    """Submit an async checkpoint and return the blocking preparation/submission seconds."""
     started = monotonic()
     key_data = jax.random.key_data(progress.key)  # (K,) raw PRNG words
     manager.save(
@@ -448,9 +451,8 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
         ),
         force=True,
     )
-    manager.wait_until_finished()
     seconds = monotonic() - started
-    print(f"Saved checkpoint at iteration {progress.rollout_count} in {seconds:.1f}s", flush=True)
+    print(f"Started checkpoint at iteration {progress.rollout_count}; blocked for {seconds:.1f}s", flush=True)
     return seconds
 
 
@@ -518,16 +520,15 @@ def entropy_coef_schedule(config: Config) -> optax.Schedule:
 
 
 class LuxEncoder(nn.Dense):
-    """Encode native Lux leaves in their original units, followed by public context."""
+    """Encode self/opponent teams, visible world, and public context in native units."""
 
     @nn.compact
     def __call__(self, observation: LuxObservation[jax.Array]) -> jax.Array:  # leaves: (*S, ...) -> (*S, F)
-        batch_shape = observation.team_id.shape[:-1]
+        batch_shape = observation.public_params.shape[:-1]
         features = jnp.concatenate(
-            [leaf.reshape((*batch_shape, -1)).astype(jnp.float32) for leaf in jax.tree.leaves(observation.obs)]
-            + [observation.team_id, observation.public_params.astype(jnp.float32)],
+            [leaf.reshape((*batch_shape, -1)).astype(jnp.float32) for leaf in jax.tree.leaves(observation)],
             axis=-1,
-        )  # (*S, O), O = 1758 + 8*U, U ship slots per team
+        )  # (*S, O), O = 1756 + 8*U, U ship slots per team
         return super().__call__(features)  # (*S, F), F = self.features
 
 

@@ -116,3 +116,20 @@ environments, two ships, three steps, and width-four encoder/LSTM. Rollout has
 no all-gathers; training gathers shuffled minibatch leaves. This verifies nested
 storage and partitioning, not GPU efficiency or throughput. Artifacts are under
 `/tmp/rl2-nested-obs-hlo/{before,after,training}/`.
+
+## Self/opponent observations (CPU)
+
+Compared the preceding nested layout against explicit `self`/`opponent` team
+fields without `team_id`, using the same scalar and eight-environment paths.
+Shared world fields are stored once per observer; opponent fields retain that
+observer's visibility. Loop counts and reset guards are unchanged, with no
+environment all-gathers or host callbacks. Extra split-output copies remain:
+batched-step copy sites increase from 1,211 to 1,228. Batched-step output storage
+falls by 192 bytes and temporary storage rises by 96 bytes; reset temporary
+storage is unchanged for the batch and falls by 64 bytes for a single environment.
+
+Two-device CPU rollout and training compile at the small shapes above. Rollout
+still has no all-gathers; learner gathers now cover the split minibatch leaves.
+Eighteen targeted tests passed, including ownership/visibility, two-device
+autoreset, encoding, rollout, update, and playback. CUDA efficiency remains
+unverified. Artifacts are under `/tmp/rl2-nested-obs-hlo/self_opponent_{before,after,training}/`.

@@ -36,16 +36,21 @@ def test_shapes_randomization_and_action_encoding(
     assert env.action_space.logits_shape == (2, 232)
     native = env.env.get_obs(state.game, state.params)  # per-team leaves: (...)
     for team in range(2):
-        chex.assert_trees_all_equal(
-            jax.tree.map(itemgetter(team), observation.observation.obs), native[f"player_{team}"]
-        )
+        view = jax.tree.map(itemgetter(team), observation.observation)  # leaves: (...)
+        raw = native[f"player_{team}"]  # leaves: (...)
+        for relative, index in ((view.self, team), (view.opponent, 1 - team)):
+            chex.assert_trees_all_equal(relative.units, jax.tree.map(itemgetter(index), raw.units))
+            np.testing.assert_array_equal(relative.units_mask, raw.units_mask[index])
+            np.testing.assert_array_equal(relative.points, raw.team_points[index])
+            np.testing.assert_array_equal(relative.wins, raw.team_wins[index])
+        for field in ("sensor_mask", "map_features", "relic_nodes", "relic_nodes_mask", "steps", "match_steps"):
+            chex.assert_trees_all_equal(getattr(view, field), getattr(raw, field))
     space = env.observation_space  # per-team shape/dtype leaves: (...)
     chex.assert_trees_all_equal_shapes_and_dtypes(jax.tree.map(itemgetter(0), observation.observation), space)
-    chex.assert_shape(observation.observation.obs.units.position, (2, 2, 2, 2))
-    chex.assert_shape(observation.observation.obs.units.energy, (2, 2, 2))
-    chex.assert_shape(observation.observation.obs.sensor_mask, (2, 24, 24))
-    chex.assert_shape(observation.observation.obs.steps, (2,))
-    np.testing.assert_array_equal(observation.observation.team_id, jnp.eye(2))
+    chex.assert_shape(observation.observation.self.units.position, (2, 2, 2))
+    chex.assert_shape(observation.observation.self.units.energy, (2, 2))
+    chex.assert_shape(observation.observation.sensor_mask, (2, 24, 24))
+    chex.assert_shape(observation.observation.steps, (2,))
     np.testing.assert_array_equal(
         observation.observation.public_params,
         jnp.broadcast_to(
@@ -61,8 +66,8 @@ def test_shapes_randomization_and_action_encoding(
         ),
     )
     chex.assert_shape(observation.actions_mask, (2, 2, 230))
-    assert observation.observation.obs.units.position.dtype == jnp.int16
-    assert observation.observation.obs.sensor_mask.dtype == jnp.bool_
+    assert observation.observation.self.units.position.dtype == jnp.int16
+    assert observation.observation.sensor_mask.dtype == jnp.bool_
     assert observation.actions_mask.dtype == jnp.bool_
     np.testing.assert_array_equal(observation.actions_mask[..., 0], True)
     np.testing.assert_array_equal(observation.actions_mask[..., 1:], False)
@@ -77,10 +82,40 @@ def test_shapes_randomization_and_action_encoding(
     # Default-size contract without compiling another simulator executable.
     default = LuxEnv(LuxConfig(randomize_params=False))
     default_observation, default_state = jax.eval_shape(default.reset, jax.random.key(0))
-    chex.assert_shape(default_observation.observation.obs.units.position, (2, 2, 16, 2))
-    chex.assert_shape(default_observation.observation.obs.units_mask, (2, 2, 16))
+    chex.assert_shape(default_observation.observation.self.units.position, (2, 16, 2))
+    chex.assert_shape(default_observation.observation.self.units_mask, (2, 16))
     chex.assert_shape(default_observation.actions_mask, (2, 16, 230))
     chex.assert_shape(default_state.game.units.position, (2, 16, 2))
+
+
+def test_relative_teams_preserve_observer_visibility(
+    env: LuxEnv, initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]
+) -> None:
+    _, state = initial
+    game = state.game.replace(
+        units=state.game.units.replace(
+            position=jnp.array([[[0, 0], [1, 1]], [[22, 22], [23, 23]]], dtype=jnp.int16),  # (N, U, 2)
+            energy=jnp.array([[[10], [20]], [[30], [40]]], dtype=jnp.int16),  # (N, U, 1)
+        ),
+        units_mask=jnp.ones((2, 2), dtype=bool),  # (N, U)
+        sensor_mask=jnp.zeros((2, 24, 24), dtype=bool).at[0, 22, 22].set(True).at[1, 0, 0].set(True),  # (N, W, H)
+        team_points=jnp.array([3, 7], dtype=jnp.int32),  # (N,)
+        team_wins=jnp.array([1, 2], dtype=jnp.int32),  # (N,)
+    )
+    state = state._replace(game=game)
+    view = env._observation(env.env.get_obs(game, state.params), state).observation  # leaves: (N, ...)
+    chex.assert_trees_all_equal_shapes_and_dtypes(view.self, view.opponent)
+    np.testing.assert_array_equal(view.self.units.position, game.units.position)
+    np.testing.assert_array_equal(view.self.units.energy, [[10, 20], [30, 40]])
+    np.testing.assert_array_equal(view.self.units_mask, True)
+    np.testing.assert_array_equal(view.self.points, [3, 7])
+    np.testing.assert_array_equal(view.self.wins, [1, 2])
+    np.testing.assert_array_equal(view.opponent.units.position, [[[22, 22], [-1, -1]], [[0, 0], [-1, -1]]])
+    np.testing.assert_array_equal(view.opponent.units.energy, [[30, -1], [10, -1]])
+    np.testing.assert_array_equal(view.opponent.units_mask, [[True, False], [True, False]])
+    np.testing.assert_array_equal(view.opponent.points, [7, 3])
+    np.testing.assert_array_equal(view.opponent.wins, [2, 1])
+    np.testing.assert_array_equal(view.sensor_mask, game.sensor_mask)
 
 
 def test_masks_and_hidden_information(
@@ -150,8 +185,8 @@ def test_native_transition_match_memory_and_batched_game_autoreset(
     final = match.state._replace(game=match.state.game.replace(steps=jnp.array(5), match_steps=jnp.array(2)))
     states = jax.tree.map(lambda a, b: jnp.stack((a, b)), first.state, final)  # leaves: (E=2, ...)
     batched = jax.jit(jax.vmap(env.step))(jax.random.split(jax.random.key(3), 2), states, jnp.stack((action, action)))
-    chex.assert_shape(batched.observation.observation.obs.units.position, (2, 2, 2, 2, 2))
-    chex.assert_shape(batched.observation.observation.obs.steps, (2, 2))
+    chex.assert_shape(batched.observation.observation.self.units.position, (2, 2, 2, 2))
+    chex.assert_shape(batched.observation.observation.steps, (2, 2))
     chex.assert_shape(batched.observation.actions_mask, (2, 2, 2, 230))
     chex.assert_shape(batched.reward, (2, 2))
     np.testing.assert_array_equal(batched.done, [False, True])
@@ -163,8 +198,8 @@ def test_native_transition_match_memory_and_batched_game_autoreset(
     np.testing.assert_array_equal(batched.reward.sum(-1), [0, 1])
     np.testing.assert_array_equal(batched.final_state.game.team_wins[1].sum(), 2)
     chex.assert_trees_all_equal(batched.final_state.params, states.params)
-    np.testing.assert_array_equal(batched.observation.observation.obs.steps, [[2, 2], [0, 0]])
-    np.testing.assert_array_equal(batched.final_observation.observation.obs.steps, [[2, 2], [6, 6]])
+    np.testing.assert_array_equal(batched.observation.observation.steps, [[2, 2], [0, 0]])
+    np.testing.assert_array_equal(batched.final_observation.observation.steps, [[2, 2], [6, 6]])
 
 
 def test_batched_autoreset_guards_reset_without_gathering_environments(
@@ -188,7 +223,7 @@ def test_batched_autoreset_guards_reset_without_gathering_environments(
         for flags in ((False, False), (False, True), (True, True)):
             done = jax.device_put(jnp.asarray(flags), PartitionSpec("batch"))  # (E,)
             actual = reset(done, key, observation, state)  # observation/state leaves: (E, ...)
-            chex.assert_shape(actual[0].observation.obs.units.position, (2, 2, 2, 2, 2))
+            chex.assert_shape(actual[0].observation.self.units.position, (2, 2, 2, 2))
             chex.assert_shape(actual[0].actions_mask, (2, 2, 2, 230))
             for index, finished in enumerate(flags):
                 selected = jax.tree.map(itemgetter(index), actual)  # leaves: (...)

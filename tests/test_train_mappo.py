@@ -1,5 +1,8 @@
+from contextlib import ExitStack, closing, nullcontext
 from dataclasses import asdict, replace
+from functools import partial
 from pathlib import Path
+from threading import Event
 from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
@@ -455,6 +458,47 @@ def test_checkpoint_ignores_saved_config_and_preserves_progress(config: ppo.Conf
     chex.assert_trees_all_equal(ppo.restore_checkpoint(manager, state, changed), progress)
 
 
+@pytest.mark.parametrize("fail", [False, True], ids=["completed", "background-failure"])
+def test_async_checkpoint_finishes_on_close(config: ppo.Config, tmp_path: Path, fail: bool) -> None:
+    release = Event()
+
+    def finalize() -> None:
+        assert release.wait(timeout=10), "save blocked on background finalization"
+        if fail:
+            raise OSError("background save failed")
+
+    state = TrainState.create(apply_fn=scripted_policy, params={}, tx=optax.sgd(0.1))
+    progress = ppo.TrainingProgress(
+        train_state=state,
+        key=jax.random.key(0),  # ()
+        rollout_count=1,
+        episode_count=2,
+        episode_return_sum=3.0,
+        episode_length_sum=4,
+        environment_step_count=4,
+        observation_count=8,
+    )
+    with (
+        patch.object(
+            ppo.ocp,
+            "CheckpointManagerOptions",
+            partial(
+                ppo.ocp.CheckpointManagerOptions,
+                async_options=ppo.ocp.AsyncOptions(post_finalization_callback=finalize),
+            ),
+        ),
+        pytest.raises(OSError, match="background save failed") if fail else nullcontext(),
+        ExitStack() as resources,
+    ):
+        manager = resources.enter_context(closing(ppo.checkpoint_manager(str(tmp_path))))
+        resources.callback(release.set)
+        ppo.save_checkpoint(manager, progress, config)
+        assert manager.is_saving_in_progress()
+    if not fail:
+        with ppo.checkpoint_manager(str(tmp_path)) as manager:
+            chex.assert_trees_all_equal(ppo.restore_checkpoint(manager, state, config), progress)
+
+
 def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_path: Path) -> None:
     config = replace(config, num_envs=1, num_steps=1, num_minibatches=3, env=SMAXConfig(max_steps=1))
     env = ppo.make_env(config)  # Three agent sequences can form three minibatches in one environment.
@@ -514,6 +558,7 @@ def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_pat
     )
     with ppo.checkpoint_manager(str(tmp_path)) as manager:
         ppo.save_checkpoint(manager, progress, config)
+        manager.wait_until_finished()
         metadata = manager.restore(1, args=ppo.ocp.args.Composite(metadata=ppo.ocp.args.JsonRestore())).metadata
         assert metadata["config"] == asdict(config)
         assert metadata["environment_steps"] == 1 and metadata["observations"] == 3
@@ -857,12 +902,9 @@ def test_lux_encoder_preserves_batch_axes_and_native_features() -> None:
     np.testing.assert_array_equal(output, jnp.broadcast_to(encoded, (2, 1, 4)))
     steps = jax.tree.map(lambda leaf: leaf[:, 0], sequence)  # leaves: (B=2, ...)
     np.testing.assert_array_equal(encoder.apply(params, steps), output[:, 0])
-    # Match the old flattened feature contract with the same projection weights.
-    flat = jnp.concatenate(
-        [leaf.reshape(-1).astype(jnp.float32) for leaf in jax.tree.leaves(observation.obs)]
-        + [observation.team_id, observation.public_params]
-    )  # (O=1774,)
-    assert flat.shape == (1774,)
+    # Encode every relative-team and shared-world field, without an identity feature.
+    flat = jnp.concatenate([leaf.reshape(-1).astype(jnp.float32) for leaf in jax.tree.leaves(observation)])  # (O=1772,)
+    assert flat.shape == (1772,)
     dense = params["params"]
     expected = flat.astype(jnp.bfloat16) @ dense["kernel"].astype(jnp.bfloat16) + dense["bias"].astype(jnp.bfloat16)
     np.testing.assert_array_equal(encoded, expected)  # each (F=4,)
@@ -918,9 +960,9 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
     )
     batch = rollout.batch  # batch-major array leaves: (B, T, ...)
     chex.assert_shape(batch.action, (2, 3, 2))
-    chex.assert_shape(batch.observation.obs.units.position, (2, 3, 2, 2, 2))
-    chex.assert_shape(batch.observation.obs.steps, (2, 3))
-    assert batch.observation.obs.units.position.dtype == jnp.int16
+    chex.assert_shape(batch.observation.self.units.position, (2, 3, 2, 2))
+    chex.assert_shape(batch.observation.steps, (2, 3))
+    assert batch.observation.self.units.position.dtype == jnp.int16
     selected = batch.select_sequences(jnp.array([1]))  # leaves: (M=1, T=3, ...)
     chex.assert_trees_all_equal(selected.observation, jax.tree.map(lambda leaf: leaf[1:2], batch.observation))
     chex.assert_shape(batch.old_log_prob, (2, 3))

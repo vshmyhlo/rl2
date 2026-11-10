@@ -6,12 +6,12 @@ env:
   max_steps_in_match: 100
   match_count: 5
   randomize_params: true
-seed: 2
+seed: 4
 total_env_steps: 10_000_000
 # Two GPUs: 64 environments and 32 recurrent sequences per minibatch per GPU.
-num_envs: 128
+num_envs: 32
 # Covers the full five-match, 505-step game.
-num_steps: 512
+num_steps: 256
 num_minibatches: 4
 update_epochs: 4
 model:
@@ -42,9 +42,9 @@ run_id: mappo_lux_hierarchical_seed${seed}
 log_interval: 1
 video_interval: 0
 video_fps: 10
-# Approximately 5% of the environment-step budget (rounded up to full iterations).
-checkpoint_interval: 8
+# Approximately 10% of the environment-step budget (rounded up to full iterations).
+checkpoint_interval: 16
 # Both teams share the policy; mean self-play return cannot measure strength.
-eval_interval: 8
+eval_interval: 16
 eval_episodes: 10
 eval_seed: 10000
