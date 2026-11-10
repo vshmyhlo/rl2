@@ -85,7 +85,10 @@ video_interval enables recording at that iteration interval and on normal comple
 video_max_frames caps recording (default: 1000). Standalone gameplay and evaluation
 replays stop at that cap; scored evaluation episodes always run to completion.
 Gameplay is saved as looping GIFs at video_fps, with frame boundaries rounded to
-10 ms and a 10 ms minimum frame delay.
+10 ms and a 10 ms minimum frame delay. Each evaluation/video episode compiles
+reset, inference, and environment steps together in one JAX while loop. Video
+buffers states up to the frame cap or environment episode bound, then transfers
+once for host rendering. video_max_frames=None records the full episode.
 
 Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
 model/parameter_count/<step>.txt, eval/report/<step>.json, gameplay/<step>.gif,
@@ -103,6 +106,7 @@ import os
 from collections.abc import Callable
 from contextlib import ExitStack, closing
 from dataclasses import asdict, fields
+from functools import partial
 from math import sqrt
 from operator import itemgetter
 from pathlib import Path
@@ -118,6 +122,7 @@ os.environ.setdefault("EPATH_USE_TF", "0")
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import rlax
@@ -126,6 +131,7 @@ from flax import linen as nn
 from flax import struct
 from flax.training.train_state import TrainState
 from jax.sharding import AxisType, Mesh, PartitionSpec
+from numpy.typing import NDArray
 from pydantic import ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
 
@@ -149,7 +155,6 @@ from rl2.model.encoders.conv2d import DEFAULT_STAGES, ConvObservationEncoder, Co
 from rl2.model.encoders.craftax import CraftaxEncoder
 from rl2.model.encoders.mlp import MLPEncoder
 from rl2.model.encoders.xminigrid import XMiniGridEncoder
-from rl2.playback import EpisodeResult, PlaybackState, finish_episode
 from rl2.running_stats import RunningSum
 from rl2.utils import explained_variance, gae
 
@@ -687,38 +692,97 @@ class ActorCritic(nn.Module):
         return ActorCriticOutput(carry=model_carry, policy=policy, values=values)
 
 
-type EpisodeState = PlaybackState[Observation, Any, RecurrentCarry]
+class EpisodeState(NamedTuple):
+    key: jax.Array  # () typed PRNG key
+    observation: Observation  # leaves: (*O,)
+    env_state: Any  # leaves: (...)
+    memory: RecurrentCarry  # leaves: (1, H)
+    episode_starts: jax.Array  # (1,)
+    episode_return: jax.Array  # ()
+    length: jax.Array  # ()
+    done: jax.Array  # ()
 
 
-def playback_step(
+class EpisodeResult(NamedTuple):
+    episode_return: float
+    length: int
+    frames: list[NDArray[np.uint8]]  # each (H, W, 3)
+
+
+class CompiledEpisode(NamedTuple):
+    episode_return: jax.Array  # ()
+    length: jax.Array  # ()
+    states: Any  # leaves: (F, ...), initial then pre-autoreset states; None without recording
+
+
+@partial(jax.jit, static_argnames=("env", "apply_fn", "recording_capacity", "stop_at_frame_limit"))
+def run_episode(
     env: PPOEnv,
     apply_fn: Callable[..., ActorCriticOutput],
-    params: optax.Params,
-    state: EpisodeState,  # observation/state/memory leaves as in PlaybackState
-) -> EpisodeState:
-    """Advance one step inside finish_episode's compiled playback loop."""
-    key, action_key, env_key = jax.random.split(state.key, 3)  # each () typed PRNG key
-    memory, policy, _ = apply_fn(
-        {"params": params},
-        jax.tree.map(lambda x: x[None], state.observation),
-        state.memory,
-        state.episode_starts,
-        method="step",
-    )  # memory leaves: (1, H); policy leaves: (1, A/D); values: (1,)
-    actions = policy.sample(key=action_key)  # (1, *action_shape)
-    observation, env_state, reward, done, info = env.step(env_key, state.env_state, actions[0], env.params)
-    # observation: (*O,); state leaves: (...); reward/done: ()
-    return state._replace(
+    params: optax.Params,  # leaves: parameter shapes
+    key: jax.Array,  # () typed PRNG key
+    initial_carry: RecurrentCarry,  # leaves: (1, H)
+    *,
+    recording_capacity: int,
+    stop_at_frame_limit: bool,
+) -> CompiledEpisode:
+    """Compile reset and the full episode; recording_capacity=0 disables state recording."""
+    key, reset_key = jax.random.split(key)  # each () typed PRNG key
+    observation, env_state = env.reset(reset_key, env.params)  # observation/state leaves: (...)
+    state = EpisodeState(
         key=key,  # ()
         observation=observation,  # (*O,)
         env_state=env_state,  # leaves: (...)
-        final_state=info["final_state"],  # leaves: (...)
-        memory=memory,  # leaves: (1, H)
-        episode_starts=jnp.zeros(1, dtype=bool),  # (1,)
-        episode_return=state.episode_return + reward,  # ()
-        length=state.length + 1,  # ()
-        done=done,  # ()
+        memory=initial_carry,  # leaves: (1, H)
+        episode_starts=jnp.ones(1, dtype=bool),  # (1,)
+        episode_return=jnp.asarray(0.0, dtype=jnp.float32),  # ()
+        length=jnp.asarray(0, dtype=jnp.int32),  # ()
+        done=jnp.asarray(False),  # ()
     )
+    saved = None
+    if recording_capacity > 0:
+        saved = jax.tree.map(
+            lambda leaf: jnp.zeros_like(leaf, shape=(recording_capacity, *jnp.shape(leaf))).at[0].set(leaf), env_state
+        )  # leaves: (F, ...), initial state at index zero
+
+    def condition(carry: tuple[EpisodeState, Any]) -> jax.Array:  # ()
+        state, _ = carry
+        if recording_capacity > 0 and stop_at_frame_limit:
+            return ~state.done & (state.length < recording_capacity - 1)  # ()
+        return ~state.done  # ()
+
+    def body(loop_state: tuple[EpisodeState, Any]) -> tuple[EpisodeState, Any]:
+        state, saved = loop_state  # saved leaves: (F, ...) or None
+        key, action_key, env_key = jax.random.split(state.key, 3)  # each () typed PRNG key
+        memory, policy, _ = apply_fn(
+            {"params": params},
+            jax.tree.map(lambda x: x[None], state.observation),  # leaves: (1, *O)
+            state.memory,
+            state.episode_starts,
+            method="step",
+        )  # memory leaves: (1, H); policy leaves: (1, A/D); values: (1,)
+        actions = policy.sample(key=action_key)  # (1, *action_shape)
+        observation, env_state, reward, done, info = env.step(env_key, state.env_state, actions[0], env.params)
+        # observation: (*O,); state leaves: (...); reward/done: ()
+        state = state._replace(
+            key=key,  # ()
+            observation=observation,  # (*O,)
+            env_state=env_state,  # leaves: (...)
+            memory=memory,  # leaves: (1, H)
+            episode_starts=jnp.zeros(1, dtype=bool),  # (1,)
+            episode_return=state.episode_return + reward,  # ()
+            length=state.length + 1,  # ()
+            done=jnp.asarray(done, dtype=bool),  # ()
+        )
+        if recording_capacity > 0:
+            # Keep scoring after the video cap without writing past its buffer.
+            saved = jax.tree.map(
+                lambda buffer, leaf: buffer.at[state.length].set(leaf, mode="drop"), saved, info["final_state"]
+            )  # leaves: (F, ...)
+        return state, saved
+
+    state, saved = jax.lax.while_loop(condition, body, (state, saved))
+    return CompiledEpisode(episode_return=state.episode_return, length=state.length, states=saved)
 
 
 def play_episode(
@@ -731,31 +795,36 @@ def play_episode(
     env: PPOEnv,
     stop_at_frame_limit: bool = False,
 ) -> EpisodeResult:
-    """Run on device, transferring bounded state chunks for optional host rendering."""
-    key, reset_key = jax.random.split(key)  # each () typed PRNG key
-    # Compile reset so single-device physics constants can join the active training mesh.
-    observation, env_state = jax.jit(env.reset)(reset_key, env.params)  # observation/state leaves: (...)
-    state = PlaybackState(
-        key=key,  # ()
-        observation=observation,  # (*O,)
-        env_state=env_state,  # leaves: (...)
-        final_state=env_state,  # leaves: (...)
-        memory=initial_carry,  # leaves: (1, H)
-        episode_starts=jnp.ones(1, dtype=bool),  # (1,)
-        episode_return=jnp.asarray(0.0, dtype=jnp.float32),  # ()
-        length=jnp.asarray(0, dtype=jnp.int32),  # ()
-        done=jnp.asarray(False),  # ()
-    )
-    return finish_episode(
-        playback_step,
+    """Run one compiled episode, then transfer once and render its valid recorded states."""
+    recording_capacity = 0
+    if record:
+        max_episode_steps = config.env.max_steps
+        if max_episode_steps is None:
+            if isinstance(config.env, GymnaxConfig):
+                max_episode_steps = int(env.params.max_steps_in_episode)
+            elif isinstance(config.env, CraftaxConfig):
+                max_episode_steps = int(env.params.max_timesteps)
+            else:
+                max_episode_steps = int(env.params.max_steps)  # XMiniGrid resolves its native horizon at construction.
+        recording_capacity = max_episode_steps + 1
+        if config.video_max_frames is not None:
+            recording_capacity = min(recording_capacity, config.video_max_frames)
+    result = run_episode(
         env,
         train_state.apply_fn,
         train_state.params,
-        state,
-        record=record,
-        frame_limit=config.video_max_frames,
+        key,
+        initial_carry,
+        recording_capacity=recording_capacity,
         stop_at_frame_limit=stop_at_frame_limit,
     )
+    result = jax.device_get(result)  # return/length: (); states: (F, ...) or None
+    frames = []  # each (H, W, 3) uint8
+    if record:
+        for index in range(min(int(result.length) + 1, recording_capacity)):
+            env_state = jax.tree.map(itemgetter(index), result.states)  # leaves: (...)
+            frames.append(np.asarray(env.render(env_state)))  # (H, W, 3)
+    return EpisodeResult(episode_return=float(result.episode_return), length=int(result.length), frames=frames)
 
 
 def log_video(

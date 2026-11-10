@@ -24,7 +24,6 @@ from rl2.actions import MultiCategoricalPolicy
 from rl2.envs.lux_env import LuxConfig, LuxEnv
 from rl2.envs.multi_agent import AgentObservation, MultiAgentStep
 from rl2.envs.smax_env import SMAXConfig, SMAXEnv
-from rl2.playback import PlaybackState, advance_episode
 
 pytestmark = pytest.mark.usefixtures("ppo_mesh")
 
@@ -202,6 +201,34 @@ def test_rollout_team_gae_death_timeout_and_sequence_selection(config: ppo.Confi
     assert int(completed.terminated_episode_count) == 1
 
 
+def test_rollout_normalizes_weak_episode_flags(config: ppo.Config) -> None:
+    env = ScriptedSMAX()
+    original_step = env.step
+
+    def step(key: jax.Array, state: State, action: jax.Array) -> MultiAgentStep:  # (); state leaves: (...); (N,)
+        result = original_step(key, state, action)
+        return result._replace(agent_done=jnp.full(2, result.done))  # (N=2,) weak bool, as emitted by Lux
+
+    observation, env_state = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 2))
+    # observation: (E=2, N=2, O=2)/(E, N, A=3); state leaves: (E, ...)
+    runner = ppo.RolloutCarry(
+        env_state=env_state,
+        observation=observation,
+        model_carry=((jnp.zeros((4, 1)), jnp.zeros((4, 1))),),  # leaves: (B=4, H=1)
+        episode_start=jnp.ones(4, dtype=bool),  # (B,)
+        episode_return=jnp.zeros(2),  # (E,)
+        episode_step_count=jnp.zeros(2, dtype=jnp.int32),  # (E,)
+    )
+    state = TrainState.create(apply_fn=scripted_policy, params={}, tx=optax.sgd(0.1))
+    with patch.object(env, "step", side_effect=step):
+        advanced, _ = jax.jit(ppo.collect_rollout, static_argnames=("env", "config"))(
+            runner, state, env, config, jax.random.key(1)
+        )
+    assert advanced.episode_start.shape == (4,)
+    assert advanced.episode_start.dtype == jnp.bool_ and not advanced.episode_start.weak_type
+    np.testing.assert_array_equal(advanced.episode_start, True)
+
+
 def test_timeout_bootstrap_resets_only_inactive_agent_memory(config: ppo.Config) -> None:
     def memory_policy(
         variables: dict[str, Any],
@@ -350,7 +377,7 @@ def test_train_step_omits_undefined_variance_and_stops_updates(
     config = replace(config, num_minibatches=1, update_epochs=3, target_kl=0.1)
     state = TrainState.create(
         apply_fn=tiny_policy,
-        params={"logits": jnp.zeros(2), "value": jnp.asarray(0.0)},  # (A,); ()
+        params={"logits": jnp.zeros(2), "value": jnp.asarray(0.0, dtype=jnp.float32)},  # (A,); ()
         tx=optax.inject_hyperparams(optax.adam)(learning_rate=config.learning_rate),
     )
     rollout = ppo.RolloutResult(
@@ -398,6 +425,28 @@ def test_train_step_omits_undefined_variance_and_stops_updates(
     assert int(result.metrics.window.explained_variance_count) == 1
     assert float(result.metrics.window.explained_variance_sum) == pytest.approx(1.0)
     assert int(result.metrics.window.terminated_episode_count) == 1
+
+    # Window resets and changing step counts must reuse the compiled learner on every device.
+    with jax.set_mesh(ppo.training_mesh(config, env.num_agents)):
+        state, key, metrics = jax.device_put((state, rollout.key, ppo.init_metrics()), ppo.PartitionSpec())
+        runner = jax.device_put(runner, ppo.PartitionSpec("batch"))  # state: (E, ...); memory: (B, H)
+        collect.return_value = (runner, collect.return_value[1])
+        result = ppo.train_step_donated(runner, state, env, config, key, metrics, jnp.asarray(4, dtype=jnp.float32))
+        traces = collect.call_count
+        with jax.enable_x64():
+            metrics = result.metrics._replace(window=ppo.RunningSum.init(result.metrics.window))  # scalar leaves
+        result = ppo.train_step_donated(
+            result.rollout_carry,
+            result.train_state,
+            env,
+            config,
+            result.key,
+            metrics,
+            jnp.asarray(8, dtype=jnp.float32),  # ()
+        )
+        assert collect.call_count == traces
+        assert int(result.metrics.window.rollout_count) == 1
+        assert int(result.metrics.total.episode_count) == 4
 
 
 def test_schedules_use_environment_steps(config: ppo.Config) -> None:
@@ -572,46 +621,65 @@ def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_pat
 
 
 def test_playback_reuses_compiled_sampling_with_updated_inputs() -> None:
-    memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (B=2, H=1)
-    observation = jnp.zeros((2, 1))  # (B, O=1)
-    starts = jnp.array([True, False])  # (B,)
-    actions_mask = jnp.array([[True, False, True], [False, True, False]])  # (B, A=3)
-    params = {"logits": jnp.array([[100.0, 0.0, -100.0], [0.0, 0.0, 0.0]])}  # (B, A)
+    memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
+    observation = AgentObservation(
+        observation=jnp.zeros((2, 1)),  # (N, O=1)
+        actions_mask=jnp.array([[True, False, True], [False, True, False]]),  # (N, A=3)
+    )
+    params = {"logits": jnp.array([[100.0, 0.0, -100.0], [0.0, 0.0, 0.0]])}  # (N, A)
 
     def policy(
         variables: dict[str, dict[str, jax.Array]],
-        observation: jax.Array,  # (B, O)
-        carry: ppo.RecurrentCarry,  # leaves: (B, H)
-        episode_start: jax.Array,  # (B,)
-        actions_mask: jax.Array,  # (B, A)
+        observation: jax.Array,  # (N, O)
+        carry: ppo.RecurrentCarry,  # leaves: (N, H)
+        episode_start: jax.Array,  # (N,)
+        actions_mask: jax.Array,  # (N, A)
         *,
         method: str,
     ) -> ppo.ActorCriticOutput:
-        carry = jax.tree.map(lambda leaf: jnp.where(episode_start[:, None], 0, leaf) + 1, carry)  # (B, H)
-        logits = jnp.where(actions_mask, variables["params"]["logits"], -1e10)  # (B, A)
-        return ppo.ActorCriticOutput(carry, ppo.CategoricalPolicy(logits), jnp.zeros(2))  # (B, H); (B, A); (B,)
+        logits = jnp.where(actions_mask, variables["params"]["logits"], -1e10)  # (N, A)
+        return ppo.ActorCriticOutput(carry=carry, policy=ppo.CategoricalPolicy(logits), value=jnp.zeros(2))
 
+    def step(key: jax.Array, state: jax.Array, action: jax.Array) -> MultiAgentStep:  # (); (N,); (N,)
+        return MultiAgentStep(
+            observation=observation,
+            state=action,  # (N,)
+            reward=action.astype(jnp.float32),  # (N,)
+            done=jnp.asarray(True),  # ()
+            agent_done=jnp.ones(2, dtype=bool),  # (N,)
+            agent_inactive=jnp.zeros(2, dtype=bool),  # (N,)
+            terminated=jnp.asarray(True),  # ()
+            truncated=jnp.asarray(False),  # ()
+            final_observation=observation,
+            final_state=action,  # (N,)
+        )
+
+    env = Mock(num_agents=2)
+    env.reset.return_value = observation, jnp.zeros(2, dtype=jnp.int32)  # (N, O)/(N, A); (N,)
+    env.step.side_effect = step
     with patch.object(
         ppo.CategoricalPolicy, "sample", autospec=True, side_effect=ppo.CategoricalPolicy.sample
     ) as sample:
-        memory, action = ppo.sample_policy_step(
-            policy, params, observation, memory, starts, jax.random.key(0), actions_mask
+        first = ppo.run_episode(
+            env, policy, params, jax.random.key(0), memory, recording_capacity=2, stop_at_frame_limit=False
         )
-        chex.assert_shape(action, (2,))
-        np.testing.assert_array_equal(action, [0, 1])
-        params = {"logits": -params["logits"]}  # (B, A)
-        actions_mask = actions_mask.at[1].set(jnp.array([True, False, False]))  # (B, A)
-        memory, action = ppo.sample_policy_step(
-            policy, params, observation, memory, starts, jax.random.key(1), actions_mask
+        second = ppo.run_episode(
+            env,
+            policy,
+            {"logits": -params["logits"]},
+            jax.random.key(1),
+            memory,
+            recording_capacity=2,
+            stop_at_frame_limit=False,
         )
-        np.testing.assert_array_equal(action, [2, 0])
     assert sample.call_count == 1
-    chex.assert_shape(jax.tree.leaves(memory), (2, 1))
-    for leaf in jax.tree.leaves(memory):  # (B, H)
-        np.testing.assert_array_equal(leaf, [[1], [2]])
+    assert first.states.shape == second.states.shape == (2, 2)
+    np.testing.assert_array_equal(first.states[1], [0, 1])
+    np.testing.assert_array_equal(second.states[1], [2, 1])
+    assert float(first.episode_return) == 0.5 and float(second.episode_return) == 1.5
 
 
-def test_playback_reuses_compiled_reset(config: ppo.Config) -> None:
+def test_playback_reuses_compiled_episode(config: ppo.Config) -> None:
     env = ScriptedSMAX()
     state = TrainState.create(apply_fn=scripted_policy, params={}, tx=optax.sgd(0.1))
     memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
@@ -625,10 +693,36 @@ def test_playback_reuses_compiled_reset(config: ppo.Config) -> None:
     assert first.episode_return == second.episode_return == 3.0
 
 
+@pytest.mark.parametrize("recording_capacity", [0, 4], ids=["no-recording", "recorded-states"])
+def test_compiled_episode_state_buffer(recording_capacity: int) -> None:
+    env = ScriptedSMAX()
+    memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
+    result = ppo.run_episode(
+        env,
+        scripted_policy,
+        {},
+        jax.random.key(0),
+        memory,
+        recording_capacity=recording_capacity,
+        stop_at_frame_limit=True,
+    )
+    assert result.episode_return.shape == result.length.shape == ()
+    assert float(result.episode_return) == 3.0 and int(result.length) == 2
+    if recording_capacity == 0:
+        assert result.states is None
+        return
+    assert result.states.state.step.shape == (4,)
+    assert result.states.state.unit_positions.shape == (4, 3, 2)
+    assert result.states.state.unit_alive.shape == (4, 3)
+    assert result.states.state.unit_alive.dtype == jnp.bool_
+    np.testing.assert_array_equal(result.states.state.step[:3], [0, 1, 2])
+    np.testing.assert_array_equal(result.states.state.unit_alive[:3, 0], [True, False, False])
+
+
 @pytest.mark.parametrize(
     "frame_limit,stop,expected_length,expected_frames",
-    [(1, True, 0, 1), (2, True, 1, 2), (1, False, 2, 1), (None, True, 2, 3)],
-    ids=["initial-frame-only", "capped-video", "evaluation-finishes", "uncapped-video"],
+    [(1, True, 0, 1), (2, True, 1, 2), (1, False, 2, 1), (2, False, 2, 2), (None, True, 2, 3)],
+    ids=["initial-frame-only", "capped-video", "evaluation-finishes", "finish-after-recording", "uncapped-video"],
 )
 def test_episode_frame_limits(
     config: ppo.Config,
@@ -663,27 +757,38 @@ def test_episode_frame_limits(
 
 def test_compiled_playback_resets_dead_agent_memory() -> None:
     env = ScriptedSMAX()
-    key, reset_key = jax.random.split(jax.random.key(0))  # each ()
-    observation, env_state = env.reset(reset_key)  # (N, O)/(N, A); state leaves: (...)
-    state = PlaybackState(
-        key=key,  # ()
-        observation=observation,  # (N=2, O=2)/(N, A=3)
-        env_state=env_state,  # leaves: (...)
-        final_state=env_state,  # leaves: (...)
-        memory=((jnp.full((2, 1), 9.0), jnp.full((2, 1), 9.0)),),  # leaves: (N, H=1)
-        episode_starts=jnp.ones(2, dtype=bool),  # (N,)
-        episode_return=jnp.asarray(0.0),  # ()
-        length=jnp.asarray(0, dtype=jnp.int32),  # ()
-        done=jnp.asarray(False),  # ()
-    )
-    result, saved = advance_episode(ppo.playback_step, env, scripted_policy, {}, state, 100, record=False)
-    assert saved is None and int(result.length) == 2 and float(result.episode_return) == 3.0
-    assert result.observation.observation.shape == (2, 2)
-    assert result.observation.actions_mask.shape == (2, 3)
-    for leaf in jax.tree.leaves(result.memory):  # (N, H)
-        np.testing.assert_array_equal(leaf, [[1.0], [2.0]])
-    np.testing.assert_array_equal(result.episode_starts, [True, True])
-    assert int(result.env_state.state.step) == 0 and int(result.final_state.state.step) == 2
+    memory = ((jnp.full((2, 1), 9.0), jnp.full((2, 1), 9.0)),)  # leaves: (N=2, H=1)
+
+    def policy(
+        variables: dict[str, Any],
+        observation: jax.Array,  # (N, O=2)
+        carry: ppo.RecurrentCarry,  # leaves: (N, H)
+        starts: jax.Array,  # (N,)
+        mask: jax.Array,  # (N, A=3)
+        *,
+        method: str,
+    ) -> ppo.ActorCriticOutput:
+        carry = jax.tree.map(lambda leaf: jnp.where(starts[:, None], 0, leaf) + 1, carry)  # leaves: (N, H)
+        logits = jnp.where(jnp.arange(3) == carry[0][0], 0.0, -jnp.inf)  # (N, A)
+        return ppo.ActorCriticOutput(carry=carry, policy=ppo.CategoricalPolicy(logits), value=jnp.zeros(2))
+
+    def step(key: jax.Array, state: State, action: jax.Array) -> MultiAgentStep:  # (); leaves: (...); (N,)
+        result = ScriptedSMAX.step(env, key, state, action)
+        final = result.final_state.replace(
+            state=result.final_state.state.replace(
+                prev_attack_actions=jnp.concatenate((action, jnp.zeros(1, jnp.int32)))
+            )
+        )  # prev_attack_actions: (units=3,)
+        return result._replace(final_state=final)
+
+    with patch.object(env, "step", side_effect=step):
+        result = ppo.run_episode(
+            env, policy, {}, jax.random.key(0), memory, recording_capacity=3, stop_at_frame_limit=False
+        )
+    assert int(result.length) == 2 and float(result.episode_return) == 3.0
+    np.testing.assert_array_equal(result.states.state.step, [0, 1, 2])
+    # Actions expose memory: both reset initially, then only the dead agent resets.
+    np.testing.assert_array_equal(result.states.state.prev_attack_actions[1:, :2], [[1, 1], [1, 2]])
 
 
 @pytest.mark.parametrize("selfplay", [False, True], ids=["heuristic_enemy", "selfplay"])
@@ -1198,17 +1303,7 @@ def test_historical_playback_pytree_observations_and_multidiscrete_actions() -> 
         observation={"map": jnp.zeros((2, 2, 2), dtype=jnp.int16), "score": jnp.zeros((2, 1))},
         actions_mask=jnp.ones((2, 2, 3), dtype=bool),
     )  # observation leaves: (N=2, ...); mask: (N, D=2, A=3)
-    state = PlaybackState(
-        key=jax.random.key(0),
-        observation=observation,
-        env_state=jnp.zeros((2, 2), dtype=jnp.int32),
-        final_state=jnp.zeros((2, 2), dtype=jnp.int32),
-        memory=((jnp.zeros((2, 1)), jnp.zeros((2, 1))),),
-        episode_starts=jnp.ones(2, dtype=bool),
-        episode_return=jnp.asarray(0.0),
-        length=jnp.asarray(0),
-        done=jnp.asarray(False),
-    )  # state leaves: (N, D); memory: (N, H=1); starts: (N,); key/return/length/done: ()
+    memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
 
     def policy(
         variables: dict[str, Any],
@@ -1240,20 +1335,20 @@ def test_historical_playback_pytree_observations_and_multidiscrete_actions() -> 
             final_state=action,
         )  # observation: (N, ...); state: (N, D); reward/done flags: (N,) or ()
 
-    env = Mock()
+    env = Mock(num_agents=2)
+    env.reset.return_value = observation, jnp.zeros((2, 2), dtype=jnp.int32)  # state: (N, D)
     env.step.side_effect = step
-    result, _ = advance_episode(
-        ppo.playback_step,
+    result = ppo.run_episode(
         env,
         policy,
         ppo.EvaluationMatch(
             current={"action": jnp.asarray(0)}, opponent={"action": jnp.asarray(1)}, current_team=jnp.asarray(1)
         ),
-        state,
-        1,
-        record=False,
+        jax.random.key(0),
+        memory,
+        recording_capacity=2,
+        stop_at_frame_limit=False,
     )
-    np.testing.assert_array_equal(result.final_state, [[1, 1], [0, 0]])
-    assert float(result.episode_return) == 0.0
-    for leaf in jax.tree.leaves(result.memory):  # (N, H)
-        np.testing.assert_array_equal(leaf, [[2], [1]])
+    assert result.states.shape == (2, 2, 2)
+    np.testing.assert_array_equal(result.states[1], [[1, 1], [0, 0]])
+    assert float(result.episode_return) == 0.0 and int(result.length) == 1

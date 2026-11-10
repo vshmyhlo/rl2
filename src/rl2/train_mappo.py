@@ -114,6 +114,9 @@ interval disables standalone gameplay. Evaluation replays its highest-return epi
 episode wins ties. Scores include every full episode; the replay does not enter metrics.
 video_max_frames (default: 900; None: unlimited) caps recordings. GIFs loop at video_fps
 with frame boundaries rounded to 10 ms and a minimum 10 ms frame delay.
+Each evaluation/video episode compiles reset, inference, and environment steps
+together. Video buffers states up to the frame cap or configured episode horizon,
+then transfers them once for host rendering; uncapped video stores the full episode.
 
 Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
 model/parameter_count/<step>.txt, eval/report/<step>.json, gameplay/<step>.gif,
@@ -154,6 +157,7 @@ os.environ.setdefault("EPATH_USE_TF", "0")
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import rlax
@@ -162,6 +166,7 @@ from flax import linen as nn
 from flax import struct
 from flax.training.train_state import TrainState
 from jax.sharding import AxisType, Mesh, PartitionSpec
+from numpy.typing import NDArray
 from pydantic import ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
 
@@ -185,7 +190,6 @@ from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.mlflow_logging import MLflowLogger
 from rl2.model.encoders.lux import LuxEncoder
-from rl2.playback import EpisodeResult, PlaybackState, finish_episode
 from rl2.running_stats import RunningSum
 from rl2.utils import explained_variance, gae
 
@@ -655,24 +659,22 @@ class ActorCritic(nn.Module):
         return ActorCriticOutput(carry=model_carry, policy=policy, value=value)
 
 
-@partial(jax.jit, static_argnames="apply_fn")
-def sample_policy_step(
-    apply_fn: Callable[..., ActorCriticOutput],
-    params: optax.Params,
-    observation: Observation,  # leaves: (B, ...)
-    carry: RecurrentCarry,  # leaves: (B, H)
-    episode_start: jax.Array,  # (B,)
-    key: jax.Array,  # () typed PRNG key
-    actions_mask: jax.Array,  # (B, *C, A)
-) -> tuple[RecurrentCarry, jax.Array]:  # carry leaves: (B, H); action: (B, *C)
-    """Compile inference and sampling together; reuse across playback steps and episodes."""
-    carry, policy, _ = apply_fn(
-        {"params": params}, observation, carry, episode_start, actions_mask, method="step"
-    )  # carry leaves: (B, H); logits: (B, *C, A); value: (B,)
-    return carry, policy.sample(key=key)  # carry leaves: (B, H); action: (B, *C)
+class EpisodeState(NamedTuple):
+    key: jax.Array  # () typed PRNG key
+    observation: AgentObservation[Observation]  # leaves: (N, ...); mask: (N, *C, A)
+    env_state: Any  # leaves: (...)
+    final_state: Any  # leaves: (...), before autoreset
+    memory: RecurrentCarry  # leaves: (N, H)
+    episode_starts: jax.Array  # (N,)
+    episode_return: jax.Array  # ()
+    length: jax.Array  # ()
+    done: jax.Array  # ()
 
 
-type EpisodeState = PlaybackState[AgentObservation[Observation], Any, RecurrentCarry]
+class EpisodeResult(NamedTuple):
+    episode_return: float
+    length: int
+    frames: list[NDArray[np.uint8]]  # each (H, W, 3)
 
 
 EVAL_OPPONENT_AGES = (100, 200, 300, 400)
@@ -704,62 +706,104 @@ def retain_eval_snapshot(
         history[iteration] = jax.tree.map(lambda leaf: leaf.copy(), jax.device_get(params))
 
 
-def playback_step(
+class CompiledEpisode(NamedTuple):
+    episode_return: jax.Array  # ()
+    length: jax.Array  # ()
+    states: Any  # leaves: (F, ...), initial then pre-autoreset states; None without recording
+
+
+@partial(jax.jit, static_argnames=("env", "apply_fn", "recording_capacity", "stop_at_frame_limit"))
+def run_episode(
     env: PPOEnv,
     apply_fn: Callable[..., ActorCriticOutput],
-    params: optax.Params,
-    state: EpisodeState,  # observation/state/memory leaves as in PlaybackState
-) -> EpisodeState:
-    key, action_key, env_key = jax.random.split(state.key, 3)  # each () typed PRNG key
-    if isinstance(params, EvaluationMatch):
-        memory = state.memory  # leaves: (N=2, H)
-        actions = []
-        for team, weights in ((params.current_team, params.current), (1 - params.current_team, params.opponent)):
-            indices = team[None]  # (1,)
-            observation, carry, starts, mask = jax.tree.map(
-                itemgetter(indices),
-                (state.observation.observation, state.memory, state.episode_starts, state.observation.actions_mask),
-            )  # observation: (1, ...); carry: (1, H); starts: (1,); mask: (1, *C, A)
-            carry, action = sample_policy_step(
-                apply_fn, weights, observation, carry, starts, jax.random.fold_in(action_key, team), mask
-            )  # carry leaves: (1, H); action: (1, *C)
-            memory = jax.tree.map(
-                lambda full, part, indices=indices: full.at[indices].set(part), memory, carry
-            )  # leaves: (N, H)
-            actions.append(action[0])  # (*C,)
-        action = jnp.stack(actions)[jnp.arange(2) ^ params.current_team]  # (N=2, *C)
-    else:
-        memory, action = sample_policy_step(
-            apply_fn,
-            params,
-            state.observation.observation,
-            state.memory,
-            state.episode_starts,
-            action_key,
-            state.observation.actions_mask,
-        )  # memory leaves: (N, H); action: (N, *C)
-    result = env.step(env_key, state.env_state, action)
-    return state._replace(
-        key=key,  # ()
-        observation=result.observation,  # (N, ...)/(N, *C, A)
-        env_state=result.state,  # leaves: (...)
-        final_state=result.final_state,  # leaves: (...)
-        memory=memory,  # leaves: (N, H)
-        episode_starts=result.agent_done,  # (N,)
-        episode_return=state.episode_return
-        + (result.reward[params.current_team] if isinstance(params, EvaluationMatch) else result.reward.mean()),  # ()
-        length=state.length + 1,  # ()
-        done=result.done,  # ()
-    )
-
-
-@partial(jax.jit, static_argnames="env")
-def reset_episode(
-    env: PPOEnv,
+    params: optax.Params,  # leaves: parameter shapes, or EvaluationMatch
     key: jax.Array,  # () typed PRNG key
-) -> tuple[AgentObservation[Observation], Any]:  # observation: (N, ...)/(N, *C, A); state leaves: (...)
-    """Reuse the compiled reset across episodes within the active training mesh."""
-    return env.reset(key)
+    initial_carry: RecurrentCarry,  # leaves: (N, H)
+    *,
+    recording_capacity: int,
+    stop_at_frame_limit: bool,
+) -> CompiledEpisode:
+    """Compile reset and the full episode; recording_capacity=0 disables state recording."""
+    key, reset_key = jax.random.split(key)  # each () typed PRNG key
+    observation, env_state = env.reset(reset_key)  # observation/state leaves: (...)
+    state = EpisodeState(
+        key=key,  # ()
+        observation=observation,  # (N, ...)/(N, *C, A)
+        env_state=env_state,  # leaves: (...)
+        final_state=env_state,  # leaves: (...)
+        memory=initial_carry,  # leaves: (N, H)
+        episode_starts=jnp.ones(env.num_agents, dtype=bool),  # (N,)
+        episode_return=jnp.asarray(0.0, dtype=jnp.float32),  # ()
+        length=jnp.asarray(0, dtype=jnp.int32),  # ()
+        done=jnp.asarray(False),  # ()
+    )
+    saved = None
+    if recording_capacity > 0:
+        saved = jax.tree.map(
+            lambda leaf: jnp.zeros_like(leaf, shape=(recording_capacity, *jnp.shape(leaf))).at[0].set(leaf), env_state
+        )  # leaves: (F, ...), initial state at index zero
+
+    def condition(carry: tuple[EpisodeState, Any]) -> jax.Array:  # ()
+        state, _ = carry
+        if recording_capacity > 0 and stop_at_frame_limit:
+            return ~state.done & (state.length < recording_capacity - 1)  # ()
+        return ~state.done  # ()
+
+    def body(loop_state: tuple[EpisodeState, Any]) -> tuple[EpisodeState, Any]:
+        state, saved = loop_state  # saved leaves: (F, ...) or None
+        key, action_key, env_key = jax.random.split(state.key, 3)  # each () typed PRNG key
+        if isinstance(params, EvaluationMatch):
+            memory = state.memory  # leaves: (N=2, H)
+            actions = []
+            for team, weights in ((params.current_team, params.current), (1 - params.current_team, params.opponent)):
+                indices = team[None]  # (1,)
+                observation, carry, starts, mask = jax.tree.map(
+                    itemgetter(indices),
+                    (state.observation.observation, state.memory, state.episode_starts, state.observation.actions_mask),
+                )  # observation: (1, ...); carry: (1, H); starts: (1,); mask: (1, *C, A)
+                carry, policy, _ = apply_fn(
+                    {"params": weights}, observation, carry, starts, mask, method="step"
+                )  # carry leaves: (1, H); logits: (1, *C, A); value: (1,)
+                action = policy.sample(key=jax.random.fold_in(action_key, team))  # (1, *C)
+                memory = jax.tree.map(
+                    lambda full, part, indices=indices: full.at[indices].set(part), memory, carry
+                )  # leaves: (N, H)
+                actions.append(action[0])  # (*C,)
+            action = jnp.stack(actions)[jnp.arange(2) ^ params.current_team]  # (N=2, *C)
+        else:
+            memory, policy, _ = apply_fn(
+                {"params": params},
+                state.observation.observation,
+                state.memory,
+                state.episode_starts,
+                state.observation.actions_mask,
+                method="step",
+            )  # memory leaves: (N, H); logits: (N, *C, A); value: (N,)
+            action = policy.sample(key=action_key)  # (N, *C)
+        result = env.step(env_key, state.env_state, action)
+        state = state._replace(
+            key=key,  # ()
+            observation=result.observation,  # (N, ...)/(N, *C, A)
+            env_state=result.state,  # leaves: (...)
+            final_state=result.final_state,  # leaves: (...)
+            memory=memory,  # leaves: (N, H)
+            episode_starts=jnp.asarray(result.agent_done, dtype=bool),  # (N,)
+            episode_return=state.episode_return
+            + (
+                result.reward[params.current_team] if isinstance(params, EvaluationMatch) else result.reward.mean()
+            ),  # ()
+            length=state.length + 1,  # ()
+            done=jnp.asarray(result.done, dtype=bool),  # ()
+        )
+        if recording_capacity > 0:
+            # Keep scoring after the video cap without writing past its buffer.
+            saved = jax.tree.map(
+                lambda buffer, leaf: buffer.at[state.length].set(leaf, mode="drop"), saved, result.final_state
+            )  # leaves: (F, ...)
+        return state, saved
+
+    state, saved = jax.lax.while_loop(condition, body, (state, saved))
+    return CompiledEpisode(episode_return=state.episode_return, length=state.length, states=saved)
 
 
 def play_episode(
@@ -774,22 +818,18 @@ def play_episode(
     opponent_params: optax.Params | None = None,  # leaves: parameter shapes
     current_team: int = 0,
 ) -> EpisodeResult:
-    """Run on device, transferring bounded state chunks for optional host rendering."""
-    key, reset_key = jax.random.split(key)  # each () typed PRNG key
-    observation, env_state = reset_episode(env, reset_key)  # observation/state leaves: (...)
-    state = PlaybackState(
-        key=key,  # ()
-        observation=observation,  # (N, ...)/(N, *C, A)
-        env_state=env_state,  # leaves: (...)
-        final_state=env_state,  # leaves: (...)
-        memory=initial_carry,  # leaves: (N, H)
-        episode_starts=jnp.ones(env.num_agents, dtype=bool),  # (N,)
-        episode_return=jnp.asarray(0.0, dtype=jnp.float32),  # ()
-        length=jnp.asarray(0, dtype=jnp.int32),  # ()
-        done=jnp.asarray(False),  # ()
+    """Run one compiled episode, then transfer once and render its valid recorded states."""
+    max_episode_steps = (
+        (config.env.max_steps_in_match + 1) * config.env.match_count
+        if isinstance(config.env, LuxConfig)
+        else config.env.max_steps
     )
-    return finish_episode(
-        playback_step,
+    recording_capacity = 0
+    if record:
+        recording_capacity = max_episode_steps + 1
+        if config.video_max_frames is not None:
+            recording_capacity = min(recording_capacity, config.video_max_frames)
+    result = run_episode(
         env,
         train_state.apply_fn,
         train_state.params
@@ -799,11 +839,18 @@ def play_episode(
             opponent=opponent_params,
             current_team=jnp.asarray(current_team, dtype=jnp.int32),  # ()
         ),
-        state,
-        record=record,
-        frame_limit=config.video_max_frames,
+        key,
+        initial_carry,
+        recording_capacity=recording_capacity,
         stop_at_frame_limit=stop_at_frame_limit,
     )
+    result = jax.device_get(result)  # return/length: (); states: (F, ...) or None
+    frames = []  # each (H, W, 3) uint8
+    if record:
+        for index in range(min(int(result.length) + 1, recording_capacity)):
+            env_state = jax.tree.map(itemgetter(index), result.states)  # leaves: (...)
+            frames.append(np.asarray(env.render(env_state)))  # (H, W, 3)
+    return EpisodeResult(episode_return=float(result.episode_return), length=int(result.length), frames=frames)
 
 
 def log_video(
@@ -1027,7 +1074,8 @@ def collect_rollout(
             action.reshape((config.num_envs, env.num_agents, *action.shape[1:])),  # (E, N, *C)
         )
         timeout = jnp.repeat(result.truncated & ~result.terminated, env.num_agents)  # (B,)
-        episode_start = result.agent_done.reshape(actor_count)  # (B,)
+        # Weak boolean outputs would change the next iteration's compilation signature.
+        episode_start = jnp.asarray(result.agent_done, dtype=bool).reshape(actor_count)  # (B,)
 
         def bootstrap(_: None) -> jax.Array:  # (B,)
             final = jax.tree.map(flatten, result.final_observation)  # (B, ...)/(B, *C, A)

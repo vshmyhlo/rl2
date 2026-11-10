@@ -2,7 +2,7 @@ import json
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import jax
@@ -16,6 +16,30 @@ from rl2 import ppo, train_mappo
 from rl2.actions import ContinuousSpace
 from rl2.envs.base import EnvStep
 from rl2.envs.gymnax_env import GymnaxEnv
+
+
+@pytest.fixture
+def config() -> ppo.Config:
+    return ppo.Config(
+        env=ppo.GymnaxConfig(),
+        seed=0,
+        total_steps=2,
+        num_envs=1,
+        num_steps=2,
+        num_minibatches=1,
+        update_epochs=1,
+        model=ppo.ModelConfig(encoder=ppo.Conv2DEncoderConfig(), recurrent=ppo.LSTMConfig(hidden_size=1)),
+        bf16=False,
+        learning_rate=1e-3,
+        anneal_lr=False,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_coef=0.2,
+        target_kl=None,
+        entropy_coef=0.001,
+        max_grad_norm=0.5,
+        video_fps=20.0,
+    )
 
 
 def policy(
@@ -37,15 +61,15 @@ def policy(
         (1, True, 0, 1),
         (2, True, 1, 2),
         (1, False, 2, 1),
+        (2, False, 2, 2),
         (None, True, 2, 3),
     ],
-    ids=["initial-frame-only", "capped-video", "evaluation-finishes", "uncapped-video"],
+    ids=["initial-frame-only", "capped-video", "evaluation-finishes", "finish-after-recording", "uncapped-video"],
 )
-def test_episode_frame_limits(frame_limit: int | None, stop: bool, expected_length: int, expected_frames: int) -> None:
-    config = replace(
-        ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", ppo.Config),
-        video_max_frames=frame_limit,
-    )
+def test_episode_frame_limits(
+    config: ppo.Config, frame_limit: int | None, stop: bool, expected_length: int, expected_frames: int
+) -> None:
+    config = replace(config, video_max_frames=frame_limit)
     env = GymnaxEnv(ppo.GymnaxConfig(id=config.env.id, max_steps=2))
     state = TrainState.create(apply_fn=policy, params={}, tx=optax.sgd(0.1))
     carry = ppo.ActorCritic(
@@ -61,12 +85,11 @@ def test_episode_frame_limits(frame_limit: int | None, stop: bool, expected_leng
 
 
 @pytest.mark.parametrize("record", [True, False])
-def test_episode_renders_state_before_autoreset(record: bool) -> None:
-    config = ppo.load_config(Path(__file__).resolve().parents[1] / "configs/ppo.yaml", ppo.Config)
+def test_episode_renders_state_before_autoreset(config: ppo.Config, record: bool) -> None:
     observation = jnp.zeros((4, 2, 2), jnp.uint8)  # (C, H, W)
     initial, final, reset = {"frame": 10}, {"frame": 20}, {"frame": 30}
     env = Mock()
-    env.params = {}
+    env.params = SimpleNamespace(max_steps_in_episode=2)
     env.reset.return_value = observation, initial
     env.step.return_value = observation, reset, jnp.asarray(1.0), jnp.asarray(True), {"final_state": final}
     env.render.side_effect = [np.full((3, 5, 3), pixel, np.uint8) for pixel in (10, 20)]  # each (P, Q, 3)
@@ -84,6 +107,30 @@ def test_episode_renders_state_before_autoreset(record: bool) -> None:
     else:
         assert result.frames == []
         env.render.assert_not_called()
+
+
+@pytest.mark.parametrize("env_id", ["Craftax", "XLand-MiniGrid"])
+def test_uncapped_video_uses_native_episode_bound(config: ppo.Config, env_id: str) -> None:
+    if env_id == "Craftax":
+        env_config = ppo.CraftaxConfig()
+        encoder = ppo.Conv2DEncoderConfig()
+        params = SimpleNamespace(max_timesteps=2)
+    else:
+        env_config = ppo.XMiniGridConfig()
+        encoder = ppo.XMiniGridEncoderConfig()
+        params = SimpleNamespace(max_steps=2)
+    config = replace(config, env=env_config, model=replace(config.model, encoder=encoder), video_max_frames=None)
+    env = Mock(params=params)
+    env.render.return_value = np.zeros((2, 2, 3), np.uint8)  # (H, W, 3)
+    state = TrainState.create(apply_fn=policy, params={}, tx=optax.sgd(0.1))
+    carry = ((jnp.zeros((1, 1)), jnp.zeros((1, 1))),)  # leaves: (B=1, H=1)
+    recorded = ppo.CompiledEpisode(
+        episode_return=jnp.asarray(2.0), length=jnp.asarray(2), states=jnp.arange(3)
+    )  # return/length: (); states: (F=3,)
+    with patch.object(ppo, "run_episode", return_value=recorded) as run:
+        result = ppo.play_episode(state, config, jax.random.key(0), carry, record=True, env=env)
+    assert run.call_args.kwargs["recording_capacity"] == 3
+    assert len(result.frames) == 3 and result.length == 2
 
 
 def test_beta_playback_reuses_compiled_sampling_across_steps_and_episodes() -> None:
@@ -141,6 +188,7 @@ def test_beta_playback_reuses_compiled_sampling_across_steps_and_episodes() -> N
         patch.object(ppo.BetaPolicy, "sample", autospec=True, side_effect=ppo.BetaPolicy.sample) as sample,
         patch.object(env, "render", wraps=env.render) as render,
         patch.object(env, "step", wraps=env.step) as step,
+        patch.object(env, "reset", wraps=env.reset) as reset,
     ):
         for _ in range(2):
             score, length, frames = ppo.play_episode(state, config, jax.random.key(0), carry, record=True, env=env)
@@ -148,7 +196,7 @@ def test_beta_playback_reuses_compiled_sampling_across_steps_and_episodes() -> N
             state = state.replace(params={"alpha": jnp.full((1, 2), 10.0)})
     # Sampling should execute in the cached graph, including after parameter changes.
     assert sample.call_count == 1
-    assert step.call_count == 1
+    assert step.call_count == reset.call_count == 1
     actions = np.stack([render.call_args_list[i].args[0]["action"] for i in (1, 2, 4, 5)])  # (T=4, D=2)
     assert actions.shape == (4, 2)
     assert np.all((actions > -1) & (actions < 1))
