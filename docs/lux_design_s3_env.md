@@ -127,9 +127,10 @@ with shared policy weights and separate recurrent memory.
   `wins`. Both use the acting player's visibility; opponent data never comes
   from the opponent's private observation. The outer axis remains
   `[player_0, player_1]`; ship positions have shape `(2, U, 2)` per team view.
-- Sensor masks, map features, relics, and step counters remain shared fields in
-  each observation. `public_params` is `(2, 4)`: move cost, sap cost, sap range,
-  and sensor range. Native dtypes, units, and absolute coordinates are retained.
+- Sensor masks, map features, relics, and step counters are grouped under
+  `world: LuxWorldObservation` in each observation. `public_params` is `(2, 4)`:
+  move cost, sap cost, sap range, and sensor range. Native dtypes, units, and
+  absolute coordinates are retained.
   `LuxEnv.observation_space` describes one player's tree with
   `ShapeDtypeStruct` leaves, excluding action masks.
 - MAPPO's `model.encoder.type: lux` flattens the tree to float32 in JAX pytree

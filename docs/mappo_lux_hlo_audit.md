@@ -133,3 +133,10 @@ still has no all-gathers; learner gathers now cover the split minibatch leaves.
 Eighteen targeted tests passed, including ownership/visibility, two-device
 autoreset, encoding, rollout, update, and playback. CUDA efficiency remains
 unverified. Artifacts are under `/tmp/rl2-nested-obs-hlo/self_opponent_{before,after,training}/`.
+
+Grouping world fields under `LuxWorldObservation` preserves leaf order. Scalar
+and eight-environment reset/step, plus two-device reset/rollout/training HLO,
+are identical after removing source metadata and locations; operation counts
+and compiler memory estimates are unchanged. Seven targeted tests passed.
+Artifacts are under `/tmp/rl2-nested-obs-hlo/{world_after,world_training}/`.
+This comparison remains CPU-only.

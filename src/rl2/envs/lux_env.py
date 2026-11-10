@@ -51,29 +51,38 @@ class LuxTeamObservation[Array](NamedTuple):
     wins: Array  # (*S,) int32
 
 
-class LuxObservation[Array](NamedTuple):
-    """Observer-relative teams and shared visible world; optional leading axes S.
+class LuxWorldObservation[Array](NamedTuple):
+    """Visible world and progress counters; optional leading axes S.
 
-    self: (*S, ...) own team leaves.
-    opponent: (*S, ...) opponent leaves masked by the observer's visibility.
     sensor_mask: (*S, W, H) visible tiles.
     map_features: (*S, W, H) energy and tile-type leaves, with absolute coordinates.
     relic_nodes: (*S, R, 2) visible relic positions.
     relic_nodes_mask: (*S, R) visible relic slots.
     steps: (*S,) game step counter.
     match_steps: (*S,) match step counter.
-    public_params: (*S, 4) move cost, sap cost, sap range, sensor range, in native units.
-    Array is jax.Array for observations or ShapeDtypeStruct for the observation space.
     """
 
-    self: LuxTeamObservation[Array]  # leaves: (*S, ...)
-    opponent: LuxTeamObservation[Array]  # leaves: (*S, ...)
     sensor_mask: Array  # (*S, W, H) bool
     map_features: MapTile  # leaves: (*S, W, H), native dtypes
     relic_nodes: Array  # (*S, R, 2) int16
     relic_nodes_mask: Array  # (*S, R) bool
     steps: Array  # (*S,) int32
     match_steps: Array  # (*S,) int32
+
+
+class LuxObservation[Array](NamedTuple):
+    """Observer-relative teams and visible world; optional leading axes S.
+
+    self: (*S, ...) own team leaves.
+    opponent: (*S, ...) opponent leaves masked by the observer's visibility.
+    world: (*S, ...) visible world and progress-counter leaves.
+    public_params: (*S, 4) move cost, sap cost, sap range, sensor range, in native units.
+    Array is jax.Array for observations or ShapeDtypeStruct for the observation space.
+    """
+
+    self: LuxTeamObservation[Array]  # leaves: (*S, ...)
+    opponent: LuxTeamObservation[Array]  # leaves: (*S, ...)
+    world: LuxWorldObservation[Array]  # leaves: (*S, ...)
     public_params: Array  # (*S, 4), native parameter dtype
 
 
@@ -147,12 +156,14 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
                 LuxObservation(
                     self=team_observation(obs, team),  # leaves: (...)
                     opponent=team_observation(obs, 1 - team),  # leaves: (...), same observer's visibility
-                    sensor_mask=obs.sensor_mask,  # (W, H)
-                    map_features=obs.map_features,  # leaves: (W, H)
-                    relic_nodes=obs.relic_nodes,  # (R, 2)
-                    relic_nodes_mask=obs.relic_nodes_mask,  # (R,)
-                    steps=obs.steps,  # ()
-                    match_steps=obs.match_steps,  # ()
+                    world=LuxWorldObservation(
+                        sensor_mask=obs.sensor_mask,  # (W, H)
+                        map_features=obs.map_features,  # leaves: (W, H)
+                        relic_nodes=obs.relic_nodes,  # (R, 2)
+                        relic_nodes_mask=obs.relic_nodes_mask,  # (R,)
+                        steps=obs.steps,  # ()
+                        match_steps=obs.match_steps,  # ()
+                    ),
                     public_params=public_params,  # (4,)
                 )
             )

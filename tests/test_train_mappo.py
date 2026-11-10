@@ -902,8 +902,15 @@ def test_lux_encoder_preserves_batch_axes_and_native_features() -> None:
     np.testing.assert_array_equal(output, jnp.broadcast_to(encoded, (2, 1, 4)))
     steps = jax.tree.map(lambda leaf: leaf[:, 0], sequence)  # leaves: (B=2, ...)
     np.testing.assert_array_equal(encoder.apply(params, steps), output[:, 0])
-    # Encode every relative-team and shared-world field, without an identity feature.
-    flat = jnp.concatenate([leaf.reshape(-1).astype(jnp.float32) for leaf in jax.tree.leaves(observation)])  # (O=1772,)
+    # Grouping world fields must preserve the previous encoder feature order.
+    flat = jnp.concatenate(
+        [
+            leaf.reshape(-1).astype(jnp.float32)
+            for leaf in jax.tree.leaves(
+                (observation.self, observation.opponent, *observation.world, observation.public_params)
+            )
+        ]
+    )  # (O=1772,)
     assert flat.shape == (1772,)
     dense = params["params"]
     expected = flat.astype(jnp.bfloat16) @ dense["kernel"].astype(jnp.bfloat16) + dense["bias"].astype(jnp.bfloat16)
@@ -961,7 +968,7 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
     batch = rollout.batch  # batch-major array leaves: (B, T, ...)
     chex.assert_shape(batch.action, (2, 3, 2))
     chex.assert_shape(batch.observation.self.units.position, (2, 3, 2, 2))
-    chex.assert_shape(batch.observation.steps, (2, 3))
+    chex.assert_shape(batch.observation.world.steps, (2, 3))
     assert batch.observation.self.units.position.dtype == jnp.int16
     selected = batch.select_sequences(jnp.array([1]))  # leaves: (M=1, T=3, ...)
     chex.assert_trees_all_equal(selected.observation, jax.tree.map(lambda leaf: leaf[1:2], batch.observation))
