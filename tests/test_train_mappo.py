@@ -82,7 +82,9 @@ class ScriptedSMAX(SMAXEnv):
         state = State(state=battle, enemy_policy_state=jnp.asarray(False))
         return self.observation(state), state
 
-    def step(self, key: jax.Array, state: State, action: jax.Array) -> MultiAgentStep[State]:  # key: (); action: (N,)
+    def step(
+        self, key: jax.Array, state: State, action: jax.Array
+    ) -> MultiAgentStep[State, jax.Array]:  # key: (); action: (N,)
         step = state.state.step + 1  # ()
         done = step == 2  # ()
         terminated = done & state.enemy_policy_state  # ()
@@ -182,7 +184,7 @@ def test_rollout_team_gae_death_timeout_and_sequence_selection(config: ppo.Confi
         key: jax.Array,
         state: State,
         action: jax.Array,  # key: (); state leaves: (...); action: (N,)
-    ) -> MultiAgentStep[State]:
+    ) -> MultiAgentStep[State, jax.Array]:
         result = step(key, state, action)
         return result._replace(truncated=result.done)  # ()
 
@@ -834,10 +836,53 @@ def test_hierarchical_model_masks_and_sequence_replay(config: ppo.Config) -> Non
     )
 
 
+def test_lux_encoder_preserves_batch_axes_and_native_features() -> None:
+    env = LuxEnv(LuxConfig(max_units=2, randomize_params=False))
+    leaves, structure = jax.tree.flatten(env.observation_space)
+    observation = jax.tree.unflatten(
+        structure,
+        [
+            ((jnp.arange(leaf.size).reshape(leaf.shape) + index) % 7 + 1).astype(leaf.dtype)  # (...)
+            for index, leaf in enumerate(leaves)
+        ],
+    )  # native leaves: (...), without batch axes
+    encoder = ppo.LuxEncoder(features=4, dtype=jnp.bfloat16)
+    params = encoder.init(jax.random.key(0), observation)
+    encoded = jax.jit(encoder.apply)(params, observation)  # (F=4,)
+    assert encoded.shape == (4,) and encoded.dtype == jnp.bfloat16
+    sequence = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (2, 1, *leaf.shape)), observation)
+    # sequence leaves: (B=2, T=1, ...), including scalar native counters
+    output = jax.jit(encoder.apply)(params, sequence)  # (B=2, T=1, F=4)
+    chex.assert_shape(output, (2, 1, 4))
+    np.testing.assert_array_equal(output, jnp.broadcast_to(encoded, (2, 1, 4)))
+    steps = jax.tree.map(lambda leaf: leaf[:, 0], sequence)  # leaves: (B=2, ...)
+    np.testing.assert_array_equal(encoder.apply(params, steps), output[:, 0])
+    # Match the old flattened feature contract with the same projection weights.
+    flat = jnp.concatenate(
+        [leaf.reshape(-1).astype(jnp.float32) for leaf in jax.tree.leaves(observation.obs)]
+        + [observation.team_id, observation.public_params]
+    )  # (O=1774,)
+    assert flat.shape == (1774,)
+    dense = params["params"]
+    expected = flat.astype(jnp.bfloat16) @ dense["kernel"].astype(jnp.bfloat16) + dense["bias"].astype(jnp.bfloat16)
+    np.testing.assert_array_equal(encoded, expected)  # each (F=4,)
+
+
+@pytest.mark.parametrize("lux_env", [False, True], ids=["lux-encoder-other-env", "lux-env-mlp-encoder"])
+def test_lux_encoder_requires_matching_environment(config: ppo.Config, lux_env: bool) -> None:
+    with pytest.raises(ValueError, match="lux encoder"):
+        replace(
+            config,
+            env=LuxConfig() if lux_env else config.env,
+            model=config.model if lux_env else replace(config.model, encoder=ppo.LuxEncoderConfig()),
+        )
+
+
 def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Path) -> None:
     config = replace(
         config,
         env=LuxConfig(max_units=2, max_steps_in_match=2, match_count=1, randomize_params=False),
+        model=replace(config.model, encoder=ppo.LuxEncoderConfig(embedding_size=4)),
         num_envs=1,
         num_steps=3,
         num_minibatches=1,
@@ -848,10 +893,11 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
     loaded = ppo.load_config(path, ppo.Config)
     env = ppo.make_env(loaded)
     assert isinstance(env, LuxEnv) and env.num_agents == 2
+    assert isinstance(loaded.model.encoder, ppo.LuxEncoderConfig)
     with pytest.raises(ValueError, match="num_agents"):
         ppo.make_env(replace(loaded, num_minibatches=3))
     observation, state = jax.jit(jax.vmap(env.reset))(jax.random.split(jax.random.key(0), 1))
-    # observation: (E, N, O)/(E, N, U, A); state leaves: (E, ...)
+    # observation: (E, N, ...)/(E, N, U, A); state leaves: (E, ...)
     model = ppo.ActorCritic(action_space=env.action_space, model=config.model)
     memory = model.initial_carry(2)  # leaves: (B, H)
     starts = jnp.ones(2, dtype=bool)  # (B,)
@@ -866,12 +912,17 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
         episode_start=starts,
         episode_return=jnp.zeros(1),
         episode_step_count=jnp.zeros(1, dtype=jnp.int32),
-    )  # state leaves: (E, ...); observation: (E, N, O)/(E, N, U, A); memory: (B, H); counts: (E,)
+    )  # state leaves: (E, ...); observation: (E, N, ...)/(E, N, U, A); memory: (B, H); counts: (E,)
     advanced, rollout = jax.jit(ppo.collect_rollout, static_argnames=("env", "config"))(
         runner, train_state, env, config, jax.random.key(2)
     )
     batch = rollout.batch  # batch-major array leaves: (B, T, ...)
     chex.assert_shape(batch.action, (2, 3, 2))
+    chex.assert_shape(batch.observation.obs.units.position, (2, 3, 2, 2, 2))
+    chex.assert_shape(batch.observation.obs.steps, (2, 3))
+    assert batch.observation.obs.units.position.dtype == jnp.int16
+    selected = batch.select_sequences(jnp.array([1]))  # leaves: (M=1, T=3, ...)
+    chex.assert_trees_all_equal(selected.observation, jax.tree.map(lambda leaf: leaf[1:2], batch.observation))
     chex.assert_shape(batch.old_log_prob, (2, 3))
     chex.assert_shape(batch.actions_mask, (2, 3, 2, 230))
     assert int(rollout.episode_count) == 1 and int(rollout.episode_length_sum) == 3

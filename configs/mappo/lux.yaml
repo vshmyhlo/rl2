@@ -8,13 +8,15 @@ env:
   randomize_params: true
 seed: 2
 total_env_steps: 10_000_000
-num_envs: 16
-num_steps: 256
+# Two GPUs: 64 environments and 32 recurrent sequences per minibatch per GPU.
+num_envs: 128
+# Covers the full five-match, 505-step game.
+num_steps: 512
 num_minibatches: 4
 update_epochs: 4
 model:
   encoder:
-    type: mlp
+    type: lux
     embedding_size: 128
   recurrent:
     hidden_size: 128
@@ -37,12 +39,12 @@ ckpt_dir: /runs/mappo/${run_id}
 # The hierarchical action head requires a separate run from flat-head checkpoints.
 run_id: mappo_lux_hierarchical_seed${seed}
 # Intervals count training iterations.
-log_interval: 10
+log_interval: 1
 video_interval: 0
 video_fps: 10
 # Approximately 5% of the environment-step budget (rounded up to full iterations).
-checkpoint_interval: 123
+checkpoint_interval: 8
 # Both teams share the policy; mean self-play return cannot measure strength.
-eval_interval: 123
+eval_interval: 8
 eval_episodes: 10
 eval_seed: 10000

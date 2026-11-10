@@ -39,7 +39,7 @@ class _InTheMatrix(InTheMatrix):
         return image  # (16, W, 3)
 
 
-class STORMEnv(BaseMultiAgentEnv[State]):
+class STORMEnv(BaseMultiAgentEnv[State, jax.Array]):
     def __init__(self, config: STORMConfig) -> None:
         self.config = config
         payoff = (
@@ -62,13 +62,13 @@ class STORMEnv(BaseMultiAgentEnv[State]):
         self.num_agents = config.num_agents
         self.action_space = DiscreteSpace(self.env.num_actions)
 
-    def _observation(self, observation: jax.Array) -> AgentObservation:  # (N, 5, 5, 14)
+    def _observation(self, observation: jax.Array) -> AgentObservation[jax.Array]:  # (N, 5, 5, 14)
         return AgentObservation(
             observation=observation.reshape(self.num_agents, -1).astype(jnp.float32),  # (N, 350)
             actions_mask=jnp.ones((self.num_agents, self.action_space.n), dtype=bool),  # (N, 8)
         )
 
-    def reset(self, key: jax.Array) -> tuple[AgentObservation, State]:  # key: ()
+    def reset(self, key: jax.Array) -> tuple[AgentObservation[jax.Array], State]:  # key: ()
         """Return (N, 350)/(N, 8) observations/masks and (...) state leaves."""
         observation, state = self.env.reset(key)  # (N, 5, 5, 14); state leaves: (...)
         return self._observation(observation), state
@@ -78,7 +78,7 @@ class STORMEnv(BaseMultiAgentEnv[State]):
         key: jax.Array,  # () typed PRNG key
         state: State,  # leaves: (...)
         action: jax.Array,  # (N,) int32
-    ) -> MultiAgentStep[State]:
+    ) -> MultiAgentStep[State, jax.Array]:
         step_key, reset_key = jax.random.split(key)  # each ()
         observation, final_state, _, _, _ = self.env.step_env(step_key, state, action)
         # observation: (N, 5, 5, 14); state leaves: (...)

@@ -36,12 +36,25 @@ class LuxState(NamedTuple):
     params: EnvParams  # Array leaves: (), sampled once per game.
 
 
-class LuxEnv(BaseMultiAgentEnv[LuxState]):
+class LuxObservation[Array](NamedTuple):
+    """Native masked observation plus public context; optional leading axes S.
+
+    obs: (*S, ...) native EnvObs leaves, with absolute team/map coordinates.
+    team_id: (*S, 2) one-hot observing team.
+    public_params: (*S, 4) move cost, sap cost, sap range, sensor range, in native units.
+    Array is jax.Array for observations or ShapeDtypeStruct for the observation space.
+    """
+
+    obs: EnvObs  # leaves: (*S, ...), native shapes/dtypes
+    team_id: Array  # (*S, 2) float32
+    public_params: Array  # (*S, 4), native parameter dtype
+
+
+class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
     """Two agents; each chooses U categorical ship commands from A=230 choices.
 
-    Observations flatten each native EnvObs pytree in JAX leaf order, followed by
-    a two-element team ID and public move cost, sap cost/range, and sensor range.
-    Values retain native units. Only the team's masked observation is exposed.
+    Observations preserve the native EnvObs tree and dtypes, with a leading
+    observing-team axis. Only each team's masked observation is exposed.
     """
 
     def __init__(self, config: LuxConfig) -> None:
@@ -73,21 +86,30 @@ class LuxEnv(BaseMultiAgentEnv[LuxState]):
             (jnp.where(sap, 5, action)[..., None], jnp.where(sap[..., None], offsets, 0)), axis=-1
         ).astype(jnp.int16)  # (N, U, 3)
 
-    def _observation(self, observation: dict[str, EnvObs], state: LuxState) -> AgentObservation:
-        """Return (N, O) features and (N, U, A) masks from (...) state/observation leaves."""
+    @property
+    def observation_space(self) -> LuxObservation[jax.ShapeDtypeStruct]:
+        """Return (...) shape/dtype leaves for one team's observation, excluding masks."""
+        observation, _ = jax.eval_shape(self.reset, jax.random.key(0))
+        return jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(leaf.shape[1:], leaf.dtype), observation.observation
+        )  # leaves: (...), without the observing-team axis
+
+    def _observation(
+        self,
+        observation: dict[str, EnvObs],  # per-team leaves: (...)
+        state: LuxState,  # leaves: (...)
+    ) -> AgentObservation[LuxObservation[jax.Array]]:
+        """Return (N, ...) native observation leaves and (N, U, A) action masks."""
         params, game = state.params, state.game
         public_params = jnp.stack(
             (params.unit_move_cost, params.unit_sap_cost, params.unit_sap_range, params.unit_sensor_range)
         )  # (4,)
-        features = jnp.stack(
-            [
-                jnp.concatenate(
-                    [leaf.reshape(-1).astype(jnp.float32) for leaf in jax.tree.leaves(observation[f"player_{team}"])]
-                    + [jax.nn.one_hot(team, 2), public_params]
-                )
-                for team in range(2)
-            ]
-        )  # (N, O)
+        features = LuxObservation(
+            obs=jax.tree.map(lambda *leaves: jnp.stack(leaves), observation["player_0"], observation["player_1"]),
+            # obs leaves: (N, ...), preserving native structure and dtypes
+            team_id=jnp.eye(2, dtype=jnp.float32),  # (N, 2)
+            public_params=jnp.broadcast_to(public_params, (2, 4)),  # (N, 4)
+        )
         energy = game.units.energy[..., 0]  # (N, U), own ship energy for each team
         active = game.units_mask & (energy >= 0) & (game.match_steps != 0)  # (N, U)
         targets = game.units.position[..., None, :] + self.sap_offsets  # (N, U, A-5, 2)
@@ -106,8 +128,8 @@ class LuxEnv(BaseMultiAgentEnv[LuxState]):
         # masks: (N, U, A); stay is always available, including absent ships/boundary frames.
         return AgentObservation(observation=features, actions_mask=masks)
 
-    def reset(self, key: jax.Array) -> tuple[AgentObservation, LuxState]:  # key: ()
-        """Return (N, O)/(N, U, A) observation/masks and (...) state leaves."""
+    def reset(self, key: jax.Array) -> tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]:  # key: ()
+        """Return (N, ...)/(N, U, A) observation/masks and (...) state leaves."""
         params_key, map_key = jax.random.split(key)  # each ()
         params = self.params
         if self.config.randomize_params:
@@ -130,9 +152,9 @@ class LuxEnv(BaseMultiAgentEnv[LuxState]):
         self,
         done: jax.Array,  # ()
         key: jax.Array,  # () typed PRNG key
-        observation: AgentObservation,  # (N, O)/(N, U, A)
+        observation: AgentObservation[LuxObservation[jax.Array]],  # (N, ...)/(N, U, A)
         state: LuxState,  # leaves: (...)
-    ) -> tuple[AgentObservation, LuxState]:
+    ) -> tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]:
         return jax.lax.cond(done, lambda: self.reset(key), lambda: (observation, state))
 
     def _autoreset_batch(
@@ -141,9 +163,9 @@ class LuxEnv(BaseMultiAgentEnv[LuxState]):
         in_batched: list[Any],  # Boolean pytrees for the four inputs.
         done: jax.Array,  # (E,) if batched, otherwise ()
         key: jax.Array,  # (E,) if batched, otherwise () typed PRNG key
-        observation: AgentObservation,  # optionally E-prefixed observation/mask leaves
+        observation: AgentObservation[LuxObservation[jax.Array]],  # optionally E-prefixed observation/mask leaves
         state: LuxState,  # optionally E-prefixed state leaves
-    ) -> tuple[tuple[AgentObservation, LuxState], Any]:
+    ) -> tuple[tuple[AgentObservation[LuxObservation[jax.Array]], LuxState], Any]:
         """Reset in parallel only when any game ends; keep unfinished games unchanged."""
 
         def broadcast(value: jax.Array, batched: bool) -> jax.Array:  # (...) -> (E, ...)
@@ -153,7 +175,7 @@ class LuxEnv(BaseMultiAgentEnv[LuxState]):
             broadcast, (done, key, observation, state), tuple(in_batched)
         )  # done/key: (E,); observation/state leaves: (E, ...)
 
-        def reset_finished() -> tuple[AgentObservation, LuxState]:
+        def reset_finished() -> tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]:
             fresh = jax.vmap(self.reset)(key)  # observation/state leaves: (E, ...)
 
             def select(new: jax.Array, old: jax.Array) -> jax.Array:  # each (E, ...)
@@ -171,17 +193,17 @@ class LuxEnv(BaseMultiAgentEnv[LuxState]):
         key: jax.Array,  # () typed PRNG key
         state: LuxState,  # leaves: (...)
         action: jax.Array,  # (N, U) integer command IDs
-    ) -> MultiAgentStep[LuxState]:
+    ) -> MultiAgentStep[LuxState, LuxObservation[jax.Array]]:
         step_key, reset_key = jax.random.split(key)  # each ()
         commands = self._decode_action(action)  # (N, U, 3)
         observation, game, _, _, game_ended, _ = self.env.step_env(
             step_key, state.game, {f"player_{team}": commands[team] for team in range(2)}, state.params
         )  # observation/game leaves: (...); game_ended: ()
         final_state = LuxState(game=game, params=state.params)
-        final_observation = self._observation(observation, final_state)  # (N, O)/(N, U, A)
+        final_observation = self._observation(observation, final_state)  # (N, ...)/(N, U, A)
         observation, next_state = self._autoreset(
             game_ended, reset_key, final_observation, final_state
-        )  # observation: (N, O)/(N, U, A); state leaves: (...)
+        )  # observation: (N, ...)/(N, U, A); state leaves: (...)
         return MultiAgentStep(
             observation=observation,
             state=next_state,

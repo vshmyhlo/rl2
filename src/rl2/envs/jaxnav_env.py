@@ -27,7 +27,7 @@ class JaxNavConfig:
     rew_lambda: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)] = 0.5
 
 
-class JaxNavEnv(BaseMultiAgentEnv[State]):
+class JaxNavEnv(BaseMultiAgentEnv[State, jax.Array]):
     def __init__(self, config: JaxNavConfig) -> None:
         self.config = config
         self.env = JaxNav(
@@ -44,7 +44,7 @@ class JaxNavEnv(BaseMultiAgentEnv[State]):
         self.num_agents = config.num_agents
         self.action_space = DiscreteSpace(self.env.action_space(self.agents[0]).n)
 
-    def _observation(self, observation: dict[str, jax.Array]) -> AgentObservation:
+    def _observation(self, observation: dict[str, jax.Array]) -> AgentObservation[jax.Array]:
         """Pack observation: (O,) agent leaves in fixed order."""
         # JaxNav's get_avail_actions reports two continuous controls even in discrete mode.
         return AgentObservation(
@@ -52,7 +52,7 @@ class JaxNavEnv(BaseMultiAgentEnv[State]):
             actions_mask=jnp.ones((self.num_agents, self.action_space.n), dtype=bool),  # (N, A)
         )
 
-    def reset(self, key: jax.Array) -> tuple[AgentObservation, State]:  # key: ()
+    def reset(self, key: jax.Array) -> tuple[AgentObservation[jax.Array], State]:  # key: ()
         """Return (N, O)/(N, A) local observations/masks and (...) state leaves."""
         observation, state = self.env.reset(key)  # agent leaves: (O,); state leaves: (...)
         return self._observation(observation), state
@@ -62,7 +62,7 @@ class JaxNavEnv(BaseMultiAgentEnv[State]):
         key: jax.Array,  # () typed PRNG key
         state: State,  # leaves: (...)
         action: jax.Array,  # (N,) int32
-    ) -> MultiAgentStep[State]:
+    ) -> MultiAgentStep[State, jax.Array]:
         step_key, reset_key = jax.random.split(key)  # each ()
         observation, final_state, reward, _, _ = self.env.step_env(
             step_key, state, {agent: action[i] for i, agent in enumerate(self.agents)}

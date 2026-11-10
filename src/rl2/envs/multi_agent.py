@@ -10,14 +10,14 @@ from numpy.typing import NDArray
 from rl2.actions import MultiAgentActionSpace
 
 
-class AgentObservation(NamedTuple):
-    """N agents, O features, A categories, optional D action components and batch axes."""
+class AgentObservation[Obs](NamedTuple):
+    """N agents, per-leaf dimensions O, A categories, optional action components C."""
 
-    observation: jax.Array  # (..., N, O) float32
+    observation: Obs  # leaves: (..., N, *O), native dtypes
     actions_mask: jax.Array  # (..., N, *C, A) bool
 
 
-class MultiAgentStep[State](NamedTuple):
+class MultiAgentStep[State, Obs](NamedTuple):
     """Transition with done = terminated | truncated; both flags may be true.
 
     Final observation/state are populated on every step, before any autoreset.
@@ -25,7 +25,7 @@ class MultiAgentStep[State](NamedTuple):
     final_observation when bootstrapping, excluding environment completion alone.
     """
 
-    observation: AgentObservation  # (N, O); (N, *C, A), after autoreset
+    observation: AgentObservation[Obs]  # leaves: (N, *O); mask: (N, *C, A), after autoreset
     state: State  # leaves: (...)
     reward: jax.Array  # (N,) floating-point
     done: jax.Array  # () bool environment completion
@@ -33,15 +33,15 @@ class MultiAgentStep[State](NamedTuple):
     agent_inactive: jax.Array  # (N,) bool agent inactivity in the final state
     terminated: jax.Array  # () bool task ended
     truncated: jax.Array  # () bool time limit reached
-    final_observation: AgentObservation  # (N, O); (N, *C, A), before autoreset
+    final_observation: AgentObservation[Obs]  # leaves: (N, *O); mask: (N, *C, A), before autoreset
     final_state: State  # leaves: (...), before autoreset
 
 
-class BaseMultiAgentEnv[State](ABC):
+class BaseMultiAgentEnv[State, Obs](ABC):
     """Explicit state and RNGs, discrete actions, and same-step environment autoreset.
 
     Agent dictionaries are packed in a fixed order; adapters document observation
-    layouts and any lossless action encoding. N denotes agents, O local features,
+    pytrees and any lossless action encoding. N denotes agents, O each leaf's dimensions,
     and A categories. C is empty for discrete actions or (D,) for multi-discrete
     actions. Masks expose available commands for each action component.
     Reset and step support caller-applied jax.jit and jax.vmap.
@@ -55,8 +55,8 @@ class BaseMultiAgentEnv[State](ABC):
     def reset(
         self,
         key: jax.Array,  # () typed PRNG key
-    ) -> tuple[AgentObservation, State]:  # (N, O)/(N, *C, A); state leaves: (...)
-        """Return (N, O)/(N, *C, A) observations/masks and (...) state leaves."""
+    ) -> tuple[AgentObservation[Obs], State]:  # leaves: (N, *O); mask: (N, *C, A); state: (...)
+        """Return (N, *O) observation leaves, (N, *C, A) masks and (...) state leaves."""
 
     @abstractmethod
     def step(
@@ -64,7 +64,7 @@ class BaseMultiAgentEnv[State](ABC):
         key: jax.Array,  # () typed PRNG key
         state: State,  # leaves: (...)
         action: jax.Array,  # (N, *C) integer action IDs
-    ) -> MultiAgentStep[State]:
+    ) -> MultiAgentStep[State, Obs]:
         """Advance and autoreset the environment when terminated or truncated."""
 
     @abstractmethod

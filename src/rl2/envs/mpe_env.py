@@ -34,7 +34,7 @@ class MPEConfig:
             raise ValueError("MPE Simple Reference requires 2 agents and 3 landmarks")
 
 
-class MPEEnv(BaseMultiAgentEnv[State]):
+class MPEEnv(BaseMultiAgentEnv[State, jax.Array]):
     def __init__(self, config: MPEConfig) -> None:
         self.config = config
         env_class = SimpleSpreadMPE if config.id == "MPE_simple_spread_v3" else SimpleReferenceMPE
@@ -48,13 +48,13 @@ class MPEEnv(BaseMultiAgentEnv[State]):
         self.num_agents = config.num_agents
         self.action_space = DiscreteSpace(self.env.action_space(self.agents[0]).n)
 
-    def _observation(self, observation: dict[str, jax.Array]) -> AgentObservation:  # agent leaves: (O,)
+    def _observation(self, observation: dict[str, jax.Array]) -> AgentObservation[jax.Array]:  # agent leaves: (O,)
         return AgentObservation(
             observation=jnp.stack([observation[agent] for agent in self.agents]),  # (N, O)
             actions_mask=jnp.ones((self.num_agents, self.action_space.n), dtype=bool),  # (N, A)
         )
 
-    def reset(self, key: jax.Array) -> tuple[AgentObservation, State]:  # key: ()
+    def reset(self, key: jax.Array) -> tuple[AgentObservation[jax.Array], State]:  # key: ()
         """Return (N, O)/(N, A) observations/masks and (...) state leaves."""
         observation, state = self.env.reset(key)  # agent leaves: (O,); state leaves: (...)
         return self._observation(observation), state
@@ -64,7 +64,7 @@ class MPEEnv(BaseMultiAgentEnv[State]):
         key: jax.Array,  # () typed PRNG key
         state: State,  # leaves: (...)
         action: jax.Array,  # (N,) int32
-    ) -> MultiAgentStep[State]:
+    ) -> MultiAgentStep[State, jax.Array]:
         step_key, reset_key = jax.random.split(key)  # each ()
         observation, final_state, reward, _, _ = self.env.step_env(
             step_key, state, {agent: action[i] for i, agent in enumerate(self.agents)}

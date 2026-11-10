@@ -51,7 +51,7 @@ from rl2.envs.xminigrid_env import XMiniGridConfig, XMiniGridEnv
 from rl2.jax_cache import configure_compilation_cache
 from rl2.ppo import Config, make_env, training_mesh
 
-type Environment = BaseEnv[Any, Any] | BaseMultiAgentEnv[Any]
+type Environment = BaseEnv[Any, Any] | BaseMultiAgentEnv[Any, Any]
 
 logger = logging.getLogger(__name__)
 

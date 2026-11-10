@@ -30,7 +30,7 @@ def test_incomplete_adapter_cannot_be_instantiated(missing: str) -> None:
 
 
 @pytest.mark.parametrize("adapter", [MPEEnv, SMAXEnv, JaxNavEnv, RobotariumEnv, STORMEnv, LuxEnv])
-def test_adapters_implement_base_multi_agent_env(adapter: type[BaseMultiAgentEnv[Any]]) -> None:
+def test_adapters_implement_base_multi_agent_env(adapter: type[BaseMultiAgentEnv[Any, Any]]) -> None:
     assert issubclass(adapter, BaseMultiAgentEnv)
     assert not isabstract(adapter)
 

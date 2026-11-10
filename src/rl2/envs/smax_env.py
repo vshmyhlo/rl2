@@ -30,7 +30,7 @@ class SMAXConfig:
             raise ValueError(f"Unknown SMAX map: {self.map_name}") from error
 
 
-class SMAXEnv(BaseMultiAgentEnv[State]):
+class SMAXEnv(BaseMultiAgentEnv[State, jax.Array]):
     def __init__(self, config: SMAXConfig) -> None:
         self.config = config
         self.env = HeuristicEnemySMAX(
@@ -43,7 +43,7 @@ class SMAXEnv(BaseMultiAgentEnv[State]):
         self.num_agents = self.env.num_agents
         self.action_space = DiscreteSpace(self.env.action_space(self.agents[0]).n)
 
-    def _observation(self, observation: dict[str, jax.Array], state: State) -> AgentObservation:
+    def _observation(self, observation: dict[str, jax.Array], state: State) -> AgentObservation[jax.Array]:
         """Pack agent observation: (O,) leaves and state: (...) leaves in fixed order."""
         actions_mask = self.env.get_avail_actions(state)  # agent leaves: (A,)
         return AgentObservation(
@@ -51,7 +51,7 @@ class SMAXEnv(BaseMultiAgentEnv[State]):
             actions_mask=jnp.stack([actions_mask[agent] for agent in self.agents]).astype(bool),  # (N, A)
         )
 
-    def reset(self, key: jax.Array) -> tuple[AgentObservation, State]:  # key: ()
+    def reset(self, key: jax.Array) -> tuple[AgentObservation[jax.Array], State]:  # key: ()
         """Return (N, O)/(N, A) observations/masks and (...) state leaves."""
         observation, state = self.env.reset(key)  # agent leaves: (O,); state leaves: (...)
         return self._observation(observation, state), state
@@ -61,7 +61,7 @@ class SMAXEnv(BaseMultiAgentEnv[State]):
         key: jax.Array,  # () typed PRNG key
         state: State,  # leaves: (...)
         action: jax.Array,  # (N,) int32
-    ) -> MultiAgentStep[State]:
+    ) -> MultiAgentStep[State, jax.Array]:
         step_key, reset_key = jax.random.split(key)  # each ()
         observation, final_state, reward, native_done, _ = self.env.step_env(
             step_key, state, {agent: action[i] for i, agent in enumerate(self.agents)}

@@ -43,7 +43,7 @@ class RobotariumConfig:
     collision_avoidance: bool = True
 
 
-class RobotariumEnv(BaseMultiAgentEnv[State]):
+class RobotariumEnv(BaseMultiAgentEnv[State, jax.Array]):
     def __init__(self, config: RobotariumConfig) -> None:
         self.config = config
         self.num_agents = len(config.robots)
@@ -66,13 +66,13 @@ class RobotariumEnv(BaseMultiAgentEnv[State]):
         self.agents = tuple(self.env.agents)
         self.action_space = DiscreteSpace(5)
 
-    def _observation(self, observation: dict[str, jax.Array]) -> AgentObservation:  # agent leaves: (O,)
+    def _observation(self, observation: dict[str, jax.Array]) -> AgentObservation[jax.Array]:  # agent leaves: (O,)
         return AgentObservation(
             observation=jnp.stack([observation[agent] for agent in self.agents]),  # (N, O=5N+2)
             actions_mask=jnp.ones((self.num_agents, self.action_space.n), dtype=bool),  # (N, A=5)
         )
 
-    def reset(self, key: jax.Array) -> tuple[AgentObservation, State]:  # key: ()
+    def reset(self, key: jax.Array) -> tuple[AgentObservation[jax.Array], State]:  # key: ()
         """Return (N, O)/(N, A) observations/masks and (...) state leaves."""
         # Native reset stores traced pose/velocities on the simulator. Keep state explicit.
         _, pose_key = jax.random.split(key)  # each ()
@@ -95,7 +95,7 @@ class RobotariumEnv(BaseMultiAgentEnv[State]):
         key: jax.Array,  # () typed PRNG key
         state: State,  # leaves: (...)
         action: jax.Array,  # (N,) int32
-    ) -> MultiAgentStep[State]:
+    ) -> MultiAgentStep[State, jax.Array]:
         step_key, reset_key = jax.random.split(key)  # each ()
         observation, final_state, reward, _, _ = self.env.step_env(
             step_key, state, {agent: action[i] for i, agent in enumerate(self.agents)}

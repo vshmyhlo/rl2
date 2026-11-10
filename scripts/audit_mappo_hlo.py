@@ -60,7 +60,7 @@ def compile_steps(config: ppo.Config, output: Path, step: Step = "all") -> None:
         reset = jax.jit(jax.vmap(env.reset), in_shardings=batched, out_shardings=batched)
         observation, env_state = jax.tree.map(
             lambda leaf: shape(leaf, batched), jax.eval_shape(reset, reset_keys)
-        )  # observation: (E, N, O)/(E, N, *C, A); state: (E, ...)
+        )  # observation: (E, N, ...)/(E, N, *C, A); state: (E, ...)
         model = ppo.ActorCritic(
             action_space=env.action_space,
             model=config.model,
@@ -73,7 +73,9 @@ def compile_steps(config: ppo.Config, output: Path, step: Step = "all") -> None:
                 apply_fn=model.apply,
                 params=model.init(
                     key,
-                    jnp.zeros((1, 1, observation.observation.shape[-1]), jnp.float32),  # (B=1, T=1, O)
+                    jax.tree.map(
+                        lambda leaf: jnp.zeros((1, 1, *leaf.shape[2:]), leaf.dtype), observation.observation
+                    ),  # observation leaves: (B=1, T=1, ...)
                     model.initial_carry(1),  # leaves: (B=1, H)
                     jnp.ones((1, 1), bool),  # (B=1, T=1)
                     jnp.ones((1, 1, *observation.actions_mask.shape[2:]), bool),  # (B=1, T=1, *C, A)
@@ -88,7 +90,7 @@ def compile_steps(config: ppo.Config, output: Path, step: Step = "all") -> None:
         state = jax.tree.map(lambda leaf: shape(leaf, replicated), jax.eval_shape(create_state, key))
         carry = ppo.RolloutCarry(
             env_state=env_state,  # leaves: (E, ...)
-            observation=observation,  # (E, N, O)/(E, N, *C, A)
+            observation=observation,  # (E, N, ...)/(E, N, *C, A)
             model_carry=jax.tree.map(
                 lambda leaf: shape(leaf, batched), jax.eval_shape(lambda: model.initial_carry(actor_count))
             ),  # leaves: (B, H)
