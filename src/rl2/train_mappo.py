@@ -95,6 +95,17 @@ mean, sample standard deviation, and standard error over eval_episodes fixed see
 Uncertainty metrics are omitted for one episode. eval/training_episodes_total is
 the lifetime completed training episode count at evaluation.
 
+Lux evaluates against snapshots exactly 100, 200, 300, and 400 completed iterations
+old (not minibatch updates), with eval_episodes fixed seeds per opponent. The current
+policy alternates team sides by episode index; its return sums only its own team's
+match-win rewards. Metrics are eval/return_mean/age_<age>, eval/return_std/age_<age>,
+eval/return_sem/age_<age>, eval/training_episodes_total/age_<age>, and
+eval/evaluation_seconds/age_<age>, where <age> is 100, 200, 300, or 400. Reductions,
+timing boundaries, omission of single-episode uncertainty, and environment-step
+semantics match ordinary evaluation. Unavailable ages are omitted, including until
+enough new history exists after resume. Host snapshots cover scheduled and final
+evaluations and are not checkpointed.
+
 Enabled video, evaluation, and checkpoint schedules use completed iteration counts,
 including on resume, and also run on normal completion. video_interval and
 eval_interval default to 0 (disabled), and checkpoint_interval to 600. A zero video
@@ -105,7 +116,8 @@ with frame boundaries rounded to 10 ms and a minimum 10 ms frame delay.
 
 Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
 model/parameter_count/<step>.txt, eval/report/<step>.json, gameplay/<step>.gif,
-and eval/gameplay/<step>.gif. Evaluation reports include individual returns and
+and eval/gameplay/<step>.gif. Lux uses eval/report/age_<age>/<step>.json and
+eval/gameplay/age_<age>/<step>.gif. Evaluation reports include individual returns and
 lengths, aggregate scores, configuration, seed, and training counters. Configuration
 parameters use dotted keys; existing MLflow parameter values are preserved on resume.
 
@@ -661,6 +673,35 @@ def sample_policy_step(
 type EpisodeState = PlaybackState[AgentObservation[Observation], Any, RecurrentCarry]
 
 
+EVAL_OPPONENT_AGES = (100, 200, 300, 400)
+
+
+class EvaluationMatch(NamedTuple):
+    current: optax.Params  # leaves: parameter shapes
+    opponent: optax.Params  # leaves: matching parameter shapes
+    current_team: jax.Array  # () team index
+
+
+def retain_eval_snapshot(
+    history: dict[int, optax.Params],
+    params: optax.Params,  # leaves: parameter shapes
+    iteration: int,
+    eval_interval: int,
+    final_iteration: int,
+) -> None:
+    """Keep independent host weights needed by scheduled or final evaluations."""
+    for previous in list(history):
+        if previous < iteration - max(EVAL_OPPONENT_AGES):
+            del history[previous]
+    if any(
+        iteration + age <= final_iteration
+        and ((iteration + age) % eval_interval == 0 or iteration + age == final_iteration)
+        for age in EVAL_OPPONENT_AGES
+    ):
+        # Training donates its buffers; host copies must own their storage.
+        history[iteration] = jax.tree.map(lambda leaf: leaf.copy(), jax.device_get(params))
+
+
 def playback_step(
     env: PPOEnv,
     apply_fn: Callable[..., ActorCriticOutput],
@@ -668,15 +709,33 @@ def playback_step(
     state: EpisodeState,  # observation/state/memory leaves as in PlaybackState
 ) -> EpisodeState:
     key, action_key, env_key = jax.random.split(state.key, 3)  # each () typed PRNG key
-    memory, action = sample_policy_step(
-        apply_fn,
-        params,
-        state.observation.observation,
-        state.memory,
-        state.episode_starts,
-        action_key,
-        state.observation.actions_mask,
-    )  # memory leaves: (N, H); action: (N, *C)
+    if isinstance(params, EvaluationMatch):
+        memory = state.memory  # leaves: (N=2, H)
+        actions = []
+        for team, weights in ((params.current_team, params.current), (1 - params.current_team, params.opponent)):
+            indices = team[None]  # (1,)
+            observation, carry, starts, mask = jax.tree.map(
+                itemgetter(indices),
+                (state.observation.observation, state.memory, state.episode_starts, state.observation.actions_mask),
+            )  # observation: (1, ...); carry: (1, H); starts: (1,); mask: (1, *C, A)
+            carry, action = sample_policy_step(
+                apply_fn, weights, observation, carry, starts, jax.random.fold_in(action_key, team), mask
+            )  # carry leaves: (1, H); action: (1, *C)
+            memory = jax.tree.map(
+                lambda full, part, indices=indices: full.at[indices].set(part), memory, carry
+            )  # leaves: (N, H)
+            actions.append(action[0])  # (*C,)
+        action = jnp.stack(actions)[jnp.arange(2) ^ params.current_team]  # (N=2, *C)
+    else:
+        memory, action = sample_policy_step(
+            apply_fn,
+            params,
+            state.observation.observation,
+            state.memory,
+            state.episode_starts,
+            action_key,
+            state.observation.actions_mask,
+        )  # memory leaves: (N, H); action: (N, *C)
     result = env.step(env_key, state.env_state, action)
     return state._replace(
         key=key,  # ()
@@ -685,7 +744,8 @@ def playback_step(
         final_state=result.final_state,  # leaves: (...)
         memory=memory,  # leaves: (N, H)
         episode_starts=result.agent_done,  # (N,)
-        episode_return=state.episode_return + result.reward.mean(),  # ()
+        episode_return=state.episode_return
+        + (result.reward[params.current_team] if isinstance(params, EvaluationMatch) else result.reward.mean()),  # ()
         length=state.length + 1,  # ()
         done=result.done,  # ()
     )
@@ -700,6 +760,8 @@ def play_episode(
     record: bool,
     env: PPOEnv,
     stop_at_frame_limit: bool = False,
+    opponent_params: optax.Params | None = None,  # leaves: parameter shapes
+    current_team: int = 0,
 ) -> EpisodeResult:
     """Run on device, transferring bounded state chunks for optional host rendering."""
     key, reset_key = jax.random.split(key)  # each () typed PRNG key
@@ -720,7 +782,13 @@ def play_episode(
         playback_step,
         env,
         train_state.apply_fn,
-        train_state.params,
+        train_state.params
+        if opponent_params is None
+        else EvaluationMatch(
+            current=train_state.params,
+            opponent=opponent_params,
+            current_team=jnp.asarray(current_team, dtype=jnp.int32),  # ()
+        ),
         state,
         record=record,
         frame_limit=config.video_max_frames,
@@ -767,9 +835,12 @@ def log_evaluation(
     *,
     initial_carry: RecurrentCarry,  # leaves: (N, H)
     env: PPOEnv | None = None,
+    opponent_params: optax.Params | None = None,  # leaves: parameter shapes
+    opponent_age: int | None = None,
 ) -> None:
     """Evaluate fixed environment seeds, log raw scores, and record the last episode."""
     print(f"Evaluating {config.eval_episodes} games at step {step_count}...", flush=True)
+    suffix = "" if opponent_age is None else f"/age_{opponent_age}"
     started = monotonic()
     episode_results: list[dict[str, float | int]] = []
     env = make_env(config) if env is None else env
@@ -781,10 +852,12 @@ def log_evaluation(
             initial_carry,
             record=episode_index == config.eval_episodes - 1,
             env=env,
+            opponent_params=opponent_params,
+            current_team=episode_index % 2,
         )
         episode_results.append({"return": episode_return, "length": episode_step_count})
         if frames:
-            writer.log_video(frames, f"eval/gameplay/{step_count}.gif", fps=config.video_fps)
+            writer.log_video(frames, f"eval/gameplay{suffix}/{step_count}.gif", fps=config.video_fps)
     episode_return_sample = [result["return"] for result in episode_results]
     std = stdev(episode_return_sample) if len(episode_return_sample) > 1 else None
     result = {
@@ -798,13 +871,19 @@ def log_evaluation(
         "training_steps": step_count,
         "training_episodes": episode_count,
     }
+    if opponent_age is not None:
+        result["opponent_age_iterations"] = opponent_age
+        for index, episode in enumerate(episode_results):
+            episode["current_team"] = index % 2
     scalars = {
-        f"eval/{name}": result[name] for name in ("return_mean", "return_std", "return_sem") if result[name] is not None
+        f"eval/{name}{suffix}": result[name]
+        for name in ("return_mean", "return_std", "return_sem")
+        if result[name] is not None
     }
-    scalars["eval/training_episodes_total"] = episode_count
-    writer.log_text(json.dumps(result, indent=2, allow_nan=False), f"eval/report/{step_count}.json")
+    scalars[f"eval/training_episodes_total{suffix}"] = episode_count
+    writer.log_text(json.dumps(result, indent=2, allow_nan=False), f"eval/report{suffix}/{step_count}.json")
     seconds = monotonic() - started
-    scalars["eval/evaluation_seconds"] = seconds
+    scalars[f"eval/evaluation_seconds{suffix}"] = seconds
     writer.log_metrics(scalars, step_count)
     print(
         f"Evaluation: return={result['return_mean']:.1f} over {config.eval_episodes} games in {seconds:.1f}s",
@@ -1264,7 +1343,13 @@ def train(config: Config) -> TrainState:
         remaining_rollout_count = max(0, (config.total_env_steps - initial_step_count) // batch_size)
         planned_rollout_count = start_rollout_index + remaining_rollout_count
         step_count = initial_step_count
+        eval_history: dict[int, optax.Params] = {}  # host leaves: parameter shapes
+        historical_eval = isinstance(config.env, LuxConfig) and config.eval_interval > 0
         for rollout_index in range(start_rollout_index, planned_rollout_count):
+            if historical_eval:
+                retain_eval_snapshot(
+                    eval_history, train_state.params, rollout_index, config.eval_interval, planned_rollout_count
+                )
             # Schedules need a fraction, while exact lifetime counters stay as host integers.
             schedule_step = jnp.asarray(step_count, dtype=jnp.float32)  # (); avoids JIT's default int32 limit
             train_state, rollout_carry, key, metrics = train_step_donated(
@@ -1285,15 +1370,27 @@ def train(config: Config) -> TrainState:
                     env=env,
                 )
             if config.eval_interval and (rollout_count % config.eval_interval == 0 or is_final_rollout):
-                log_evaluation(
-                    train_state,
-                    config,
-                    writer,
-                    int(metrics.total.episode_count),
-                    step_count,
-                    initial_carry=model.initial_carry(env.num_agents),
-                    env=env,
+                opponents = (
+                    {
+                        age: eval_history[rollout_count - age]
+                        for age in EVAL_OPPONENT_AGES
+                        if rollout_count - age in eval_history
+                    }
+                    if historical_eval
+                    else {None: None}
                 )
+                for age, opponent_params in opponents.items():
+                    log_evaluation(
+                        train_state,
+                        config,
+                        writer,
+                        int(metrics.total.episode_count),
+                        step_count,
+                        initial_carry=model.initial_carry(env.num_agents),
+                        env=env,
+                        opponent_params=jax.device_put(opponent_params, replicated),
+                        opponent_age=age,
+                    )
             if rollout_count % config.log_interval == 0 or is_final_rollout:
                 # Host logging requires the completed device metrics.
                 window, total = jax.device_get(metrics)  # scalar leaves

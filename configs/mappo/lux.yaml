@@ -2,17 +2,19 @@
 # Run: uv run mappo --config configs/mappo/lux.yaml
 env:
   id: luxai_s3
+  map_size: 8
   max_units: 16
   max_steps_in_match: 100
   match_count: 5
   randomize_params: true
 seed: 4
 total_env_steps: 10_000_000
-# Two GPUs: 64 environments and 32 recurrent sequences per minibatch per GPU.
+# Two GPUs: 16 environments each; one recurrent sequence per minibatch per GPU.
 num_envs: 32
 # Covers the full five-match, 505-step game.
-num_steps: 256
-num_minibatches: 4
+num_steps: 128
+# Smaller learner batches bound spatial encoder memory on the 128×128 board.
+num_minibatches: 32
 update_epochs: 4
 model:
   encoder:
@@ -38,14 +40,14 @@ value_coef: 1.0
 max_grad_norm: 0.5
 ckpt_dir: /runs/mappo/${run_id}
 # The spatial/entity encoder requires a fresh checkpoint.
-run_id: mappo_lux_spatial_seed${seed}
+run_id: mappo_lux_spatial_${env.map_size}x${env.map_size}_seed${seed}
 # Intervals count training iterations.
 log_interval: 1
 video_interval: 0
 video_fps: 10
 # Approximately 10% of training: ceil(10_000_000 / (32 * 256) * 0.1).
-checkpoint_interval: 123
+checkpoint_interval: 100
 # Both teams share the policy; mean self-play return cannot measure strength.
-eval_interval: 123
+eval_interval: 100
 eval_episodes: 10
 eval_seed: 10000

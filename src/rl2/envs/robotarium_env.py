@@ -44,6 +44,10 @@ class RobotariumConfig:
 
 
 class RobotariumEnv(BaseMultiAgentEnv[State, jax.Array]):
+    @property
+    def supports_selfplay(self) -> bool:
+        return False
+
     def __init__(self, config: RobotariumConfig) -> None:
         self.config = config
         self.num_agents = len(config.robots)

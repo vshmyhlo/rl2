@@ -106,6 +106,11 @@ model shapes from the actual pytrees.
 agents**. Run `uv run mappo --config configs/mappo/lux.yaml` to train both teams
 with shared policy weights and separate recurrent memory.
 
+The training preset uses `env.map_size: 128` (128×128); the adapter default remains
+24×24. Map sides must be multiples of eight. Larger maps change encoder parameter
+shapes and need a fresh run directory. Rendering scales the board to fit its panel.
+The 128×128 preset uses 32 minibatches to limit encoder activation memory.
+
 - Each team policy call receives one structured observation and outputs all 16 ship
   commands. Each ship has a stay/move/sap choice, with a conditional direction
   or sap target. All ships share the team encoder/LSTM and sample independently
@@ -135,7 +140,7 @@ with shared policy weights and separate recurrent memory.
   `ShapeDtypeStruct` leaves, excluding action masks.
 - MAPPO's `model.encoder.type: lux` uses tile-type embeddings, normalized tile
   energy, visibility, coordinates, and separate ship/relic spatial channels.
-  A residual CNN provides local ship features and a 6×6 map for four-head
+  A residual CNN provides local ship features and a map downsampled by four for four-head
   ship-to-map attention. Own ship slots retain their order; opponent ships are
   pooled and relics rasterized, making their slot order irrelevant. Projected
   public context includes scores, wins, progress, costs/ranges, and visible counts.

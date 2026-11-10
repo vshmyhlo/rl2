@@ -28,6 +28,10 @@ class JaxNavConfig:
 
 
 class JaxNavEnv(BaseMultiAgentEnv[State, jax.Array]):
+    @property
+    def supports_selfplay(self) -> bool:
+        return False
+
     def __init__(self, config: JaxNavConfig) -> None:
         self.config = config
         self.env = JaxNav(

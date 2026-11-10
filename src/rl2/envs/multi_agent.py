@@ -51,6 +51,11 @@ class BaseMultiAgentEnv[State, Obs](ABC):
     num_agents: int
     action_space: MultiAgentActionSpace
 
+    @property
+    @abstractmethod
+    def supports_selfplay(self) -> bool:
+        """Whether controlled agents have competing interests, rather than cooperating."""
+
     @abstractmethod
     def reset(
         self,

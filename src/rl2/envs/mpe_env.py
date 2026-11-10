@@ -35,6 +35,10 @@ class MPEConfig:
 
 
 class MPEEnv(BaseMultiAgentEnv[State, jax.Array]):
+    @property
+    def supports_selfplay(self) -> bool:
+        return False
+
     def __init__(self, config: MPEConfig) -> None:
         self.config = config
         env_class = SimpleSpreadMPE if config.id == "MPE_simple_spread_v3" else SimpleReferenceMPE

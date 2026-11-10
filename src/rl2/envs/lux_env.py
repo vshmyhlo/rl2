@@ -21,6 +21,8 @@ from rl2.envs.multi_agent import AgentObservation, BaseMultiAgentEnv, MultiAgent
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LuxConfig:
     id: Literal["luxai_s3"] = "luxai_s3"
+    # Square noise grid; leave room for sap offsets in native int16 coordinates.
+    map_size: Annotated[int, Field(ge=8, le=32760, multiple_of=8, strict=True)] = 24
     max_units: Annotated[int, Field(ge=1, le=16, strict=True)] = 16
     max_steps_in_match: Annotated[int, Field(ge=2, lt=2**31, strict=True)] = 100
     match_count: Annotated[int, Field(ge=1, le=5, strict=True)] = 5
@@ -93,10 +95,16 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
     dtypes and a leading observing-team axis. World fields retain the observer's mask.
     """
 
+    @property
+    def supports_selfplay(self) -> bool:
+        return True
+
     def __init__(self, config: LuxConfig) -> None:
         self.config = config
         self.num_agents = 2
         self.params = EnvParams(
+            map_width=config.map_size,
+            map_height=config.map_size,
             max_units=config.max_units,
             max_steps_in_match=config.max_steps_in_match,
             match_count_per_episode=config.match_count,
@@ -300,14 +308,19 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
         relic_color = (240, 205, 70)
         colors = np.array([[25, 30, 45], [70, 45, 100], [105, 105, 115]], dtype=np.uint8)  # (3, RGB)
         tiles = np.asarray(game.map_features.tile_type).T  # (H, W)
-        pixels = np.repeat(np.repeat(colors[tiles], 12, axis=0), 12, axis=1)  # (H*12, W*12, 3)
+        pixels = colors[tiles]  # (H, W, 3)
+        cell_size = 288 / int(params.map_width)
         scoring = (game.relic_nodes_map_weights > 0) & (
             game.relic_nodes_map_weights <= game.relic_nodes_mask.sum() // 2
         )  # (W, H), same active scoring tiles used by the simulator
         title_font = ImageFont.load_default(size=20)
         font = ImageFont.load_default(size=16)
         small_font = ImageFont.load_default(size=13)
-        with Image.new("RGB", (640, 416), (14, 18, 28)) as frame, Image.fromarray(pixels) as board:
+        with (
+            Image.new("RGB", (640, 416), (14, 18, 28)) as frame,
+            Image.fromarray(pixels) as tiles_image,
+            tiles_image.resize((288, 288), resample=Image.Resampling.NEAREST) as board,
+        ):
             frame.paste(board, (16, 72))
             draw = ImageDraw.Draw(frame)
             draw.text((16, 14), f"LUX S3  |  {status}", font=title_font, fill="white")
@@ -318,18 +331,27 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
                 fill=(185, 195, 210),
             )
             for x, y in np.argwhere(scoring):
-                left, top = 16 + int(x) * 12, 72 + int(y) * 12
-                draw.rectangle((left + 1, top + 1, left + 10, top + 10), outline=scoring_color)
+                left, top = 16 + int(x) * cell_size, 72 + int(y) * cell_size
+                draw.rectangle(
+                    (left + cell_size / 12, top + cell_size / 12, left + cell_size * 5 / 6, top + cell_size * 5 / 6),
+                    outline=scoring_color,
+                )
             for position, visible in zip(game.relic_nodes, game.relic_nodes_mask):
                 if visible:
                     x, y = map(int, position)
-                    left, top = 16 + x * 12, 72 + y * 12
-                    draw.ellipse((left + 3, top + 3, left + 9, top + 9), fill=relic_color)
+                    left, top = 16 + x * cell_size, 72 + y * cell_size
+                    draw.ellipse(
+                        (left + cell_size / 4, top + cell_size / 4, left + cell_size * 3 / 4, top + cell_size * 3 / 4),
+                        fill=relic_color,
+                    )
             for team, color in enumerate(team_colors):
                 for position in game.units.position[team][active[team]]:  # (2,) per active ship
                     x, y = map(int, position)
-                    left, top = 16 + x * 12, 72 + y * 12
-                    draw.rectangle((left + 4, top + 4, left + 8, top + 8), fill=color)
+                    left, top = 16 + x * cell_size, 72 + y * cell_size
+                    draw.rectangle(
+                        (left + cell_size / 3, top + cell_size / 3, left + cell_size * 2 / 3, top + cell_size * 2 / 3),
+                        fill=color,
+                    )
                 top = 72 + team * 116
                 points = "--" if boundary else str(int(game.team_points[team]))
                 ships = int(active[team].sum())

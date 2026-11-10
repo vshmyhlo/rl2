@@ -243,6 +243,36 @@ def test_invalid_settings(overrides: dict[str, int]) -> None:
         LuxConfig(**overrides)
 
 
+@pytest.mark.parametrize("map_size", [0, 25, 32768], ids=["too-small", "noise-grid-alignment", "coordinate-overflow"])
+def test_invalid_map_size(map_size: int) -> None:
+    with pytest.raises(ValidationError, match="map_size"):
+        LuxConfig(map_size=map_size)
+
+
+def test_large_map_reset_step_and_render() -> None:
+    env = LuxEnv(LuxConfig(map_size=128, max_units=2, randomize_params=False))
+    keys = jax.random.split(jax.random.key(42), 2)  # (E=2,)
+    observation, state = jax.jit(jax.vmap(env.reset))(keys)  # observation/state leaves: (E, ...)
+    assert env.params.map_width == env.params.map_height == 128
+    chex.assert_shape(observation.observation.world.sensor_mask, (2, 2, 128, 128))
+    chex.assert_shape(state.game.map_features.tile_type, (2, 128, 128))
+    transition = jax.jit(jax.vmap(env.step))(keys, state, jnp.zeros((2, 2, 2), dtype=jnp.int32))
+    # action: (E, N, U); transition leaves: (E, ...)
+    chex.assert_shape(transition.observation.observation.world.map_features.energy, (2, 2, 128, 128))
+    chex.assert_shape(transition.observation.actions_mask, (2, 2, 2, 230))
+    rendered = jax.tree.map(itemgetter(0), transition.state)  # state leaves: (...)
+    game = rendered.game.replace(
+        units=rendered.game.units.replace(
+            position=rendered.game.units.position.at[1, 0].set(jnp.array([127, 127], jnp.int16)),  # (N, U, 2)
+            energy=rendered.game.units.energy.at[1, 0, 0].set(100),  # (N, U, 1)
+        ),
+        units_mask=jnp.zeros((2, 2), dtype=bool).at[1, 0].set(True),  # (N, U)
+    )
+    frame = env.render(rendered._replace(game=game))  # (416, 640, 3)
+    assert frame.shape == (416, 640, 3)
+    np.testing.assert_array_equal(frame[359, 303], [255, 95, 85])  # Bottom-right ship stays inside the board panel.
+
+
 @pytest.mark.parametrize(
     "steps,match_steps,wins,status,turn,points",
     [

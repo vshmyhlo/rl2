@@ -19,6 +19,7 @@ from jaxmarl.environments.smax.smax_env import State as BattleState
 from ppo_helpers import metric_history
 
 from rl2 import train_mappo as ppo
+from rl2.actions import MultiCategoricalPolicy
 from rl2.envs.lux_env import LuxConfig, LuxEnv
 from rl2.envs.multi_agent import AgentObservation, MultiAgentStep
 from rl2.envs.smax_env import SMAXConfig, SMAXEnv
@@ -900,7 +901,7 @@ def test_lux_encoder_requires_positive_even_channels(channels: int) -> None:
 def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Path) -> None:
     config = replace(
         config,
-        env=LuxConfig(max_units=2, max_steps_in_match=2, match_count=1, randomize_params=False),
+        env=LuxConfig(map_size=128, max_units=2, max_steps_in_match=2, match_count=1, randomize_params=False),
         model=replace(config.model, encoder=ppo.LuxEncoderConfig(embedding_size=4, channels=4)),
         num_envs=1,
         num_steps=3,
@@ -939,6 +940,7 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
     chex.assert_shape(batch.action, (2, 3, 2))
     chex.assert_shape(batch.observation.self.units.position, (2, 3, 2, 2))
     chex.assert_shape(batch.observation.world.steps, (2, 3))
+    chex.assert_shape(batch.observation.world.sensor_mask, (2, 3, 128, 128))
     assert batch.observation.self.units.position.dtype == jnp.int16
     selected = batch.select_sequences(jnp.array([1]))  # leaves: (M=1, T=3, ...)
     chex.assert_trees_all_equal(selected.observation, jax.tree.map(lambda leaf: leaf[1:2], batch.observation))
@@ -984,3 +986,238 @@ def test_grouped_model_balances_types_and_masks(config: ppo.Config) -> None:
     step = model.apply(params, observation[:, 0], memory, starts[:, 0], mask[:, 0], method="step")
     np.testing.assert_allclose(step.policy.logits, output.policy.logits[:, 0], atol=1e-6)
     np.testing.assert_allclose(step.policy.entropy(), output.policy.entropy()[:, 0], atol=1e-6)
+
+
+@pytest.mark.parametrize("start", [0, 137], ids=["fresh", "resume-without-history"])
+def test_eval_snapshot_ages_and_final_schedule(start: int) -> None:
+    history: dict[int, optax.Params] = {}
+    final_iteration = 651
+    for iteration in range(start, final_iteration):
+        params = {"weight": np.asarray([iteration], dtype=np.float32)}  # (1,)
+        ppo.retain_eval_snapshot(history, params, iteration, 60, final_iteration)
+        params["weight"][0] = -1  # Snapshots must own storage even on CPU.
+        completed = iteration + 1
+        if completed % 60 == 0 or completed == final_iteration:
+            available = {age: history[completed - age] for age in ppo.EVAL_OPPONENT_AGES if completed - age in history}
+            assert set(available) == {age for age in ppo.EVAL_OPPONENT_AGES if completed - age >= start}
+            for age, snapshot in available.items():
+                np.testing.assert_array_equal(snapshot["weight"], [completed - age])
+        assert all(previous >= iteration - 400 for previous in history)
+
+
+class ScriptedMatch(ScriptedSMAX):
+    def step(
+        self,
+        key: jax.Array,  # ()
+        state: State,  # leaves: (...)
+        action: jax.Array,  # (N=2,)
+    ) -> MultiAgentStep[State, jax.Array]:
+        result = super().step(key, state, action)
+        return result._replace(reward=action.astype(jnp.float32))  # (N=2,)
+
+
+def test_historical_playback_uses_separate_weights_and_current_team_reward(config: ppo.Config) -> None:
+    env = ScriptedMatch()
+
+    def policy(
+        variables: dict[str, Any],
+        observation: jax.Array,  # (B, O)
+        memory: ppo.RecurrentCarry,  # leaves: (B, H)
+        starts: jax.Array,  # (B,)
+        actions_mask: jax.Array,  # (B, A)
+        *,
+        method: str,
+    ) -> ppo.ActorCriticOutput:
+        memory = jax.tree.map(
+            lambda leaf: jnp.where(starts[:, None], 0, leaf) + variables["params"]["increment"], memory
+        )  # leaves: (B, H)
+        # Deterministic actions expose both policy selection and each team's memory.
+        logits = jnp.where(jnp.arange(3) == memory[0][0], 0.0, -jnp.inf)  # (B, A=3)
+        return ppo.ActorCriticOutput(
+            carry=memory, policy=ppo.CategoricalPolicy(logits=logits), value=jnp.zeros(starts.shape)
+        )  # carry: (B, H); logits: (B, A); value: (B,)
+
+    state = TrainState.create(apply_fn=policy, params={"increment": jnp.asarray(1.0)}, tx=optax.sgd(0.1))
+    memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
+    for team, expected_return in ((0, 2.0), (1, 3.0)):
+        result = ppo.play_episode(
+            state,
+            config,
+            jax.random.key(0),
+            memory,
+            record=False,
+            env=env,
+            opponent_params={"increment": jnp.asarray(0.0)},  # ()
+            current_team=team,
+        )
+        assert result.episode_return == expected_return
+        assert result.length == 2
+
+
+@pytest.mark.parametrize("episodes", [1, 2], ids=["no-uncertainty", "alternating-sides"])
+def test_historical_eval_metrics_and_artifacts(config: ppo.Config, episodes: int) -> None:
+    config = replace(
+        config, env=LuxConfig(), model=replace(config.model, encoder=ppo.LuxEncoderConfig()), eval_episodes=episodes
+    )
+    writer = Mock()
+    memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
+    opponent = {"weight": jnp.asarray(7.0)}  # ()
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)  # (H, W, C)
+    with patch.object(
+        ppo, "play_episode", return_value=ppo.EpisodeResult(episode_return=0.0, length=2, frames=[frame])
+    ) as play:
+        for age in ppo.EVAL_OPPONENT_AGES:
+            ppo.log_evaluation(
+                Mock(),
+                config,
+                writer,
+                5,
+                1600,
+                initial_carry=memory,
+                env=Mock(),
+                opponent_params=opponent,
+                opponent_age=age,
+            )
+    for index, call in enumerate(play.call_args_list):
+        assert call.kwargs["opponent_params"] is opponent
+        assert call.kwargs["current_team"] == (index % episodes) % 2
+        np.testing.assert_array_equal(
+            jax.random.key_data(call.args[2]),
+            jax.random.key_data(jax.random.fold_in(jax.random.key(config.eval_seed), index % episodes)),
+        )
+    for age, call in zip(ppo.EVAL_OPPONENT_AGES, writer.log_metrics.call_args_list, strict=True):
+        metrics, step = call.args
+        assert step == 1600
+        assert metrics[f"eval/return_mean/age_{age}"] == 0.0
+        assert metrics[f"eval/training_episodes_total/age_{age}"] == 5
+        assert (f"eval/return_std/age_{age}" in metrics) == (episodes > 1)
+        assert (f"eval/return_sem/age_{age}" in metrics) == (episodes > 1)
+        assert all(tag.endswith(f"/age_{age}") for tag in metrics)
+    assert [call.args[1] for call in writer.log_text.call_args_list] == [
+        f"eval/report/age_{age}/1600.json" for age in ppo.EVAL_OPPONENT_AGES
+    ]
+    assert {call.args[1] for call in writer.log_video.call_args_list} == {
+        f"eval/gameplay/age_{age}/1600.gif" for age in ppo.EVAL_OPPONENT_AGES
+    }
+
+
+def test_training_evaluates_exact_historical_iterations(config: ppo.Config) -> None:
+    config = replace(
+        config,
+        env=LuxConfig(),
+        model=replace(config.model, encoder=ppo.LuxEncoderConfig()),
+        total_env_steps=401 * 4,
+        eval_interval=100,
+        log_interval=1000,
+    )
+    model = Mock()
+    model.init.return_value = {"params": {"weight": jnp.asarray(0.0)}}  # ()
+    model.initial_carry.side_effect = lambda size: ((jnp.zeros((size, 1)), jnp.zeros((size, 1))),)  # (B, H=1)
+    metrics = jax.tree.map(lambda leaf: leaf + 1, ppo.init_metrics())  # scalar leaves
+
+    def train_step(
+        runner: ppo.RolloutCarry,
+        state: TrainState,
+        env: ppo.PPOEnv,
+        config: ppo.Config,
+        key: jax.Array,  # ()
+        old_metrics: ppo.TrainingMetrics,  # scalar leaves
+        step: jax.Array,  # ()
+    ) -> ppo.TrainStepResult:
+        iteration = int(state.step) // 7 + 1
+        return ppo.TrainStepResult(
+            train_state=state.replace(step=iteration * 7, params={"weight": np.asarray(float(iteration))}),  # ()
+            rollout_carry=runner,
+            key=key,
+            metrics=metrics,
+        )
+
+    with (
+        patch.object(ppo, "make_env", return_value=ScriptedSMAX()),
+        patch.object(ppo, "ActorCritic", return_value=model),
+        patch.object(ppo, "MLflowLogger"),
+        patch.object(ppo, "checkpoint_manager"),
+        patch.object(ppo, "restore_checkpoint", return_value=None),
+        patch.object(ppo, "save_checkpoint", return_value=1.0),
+        patch.object(ppo, "train_step_donated", side_effect=train_step),
+        patch.object(ppo, "log_evaluation") as evaluate,
+    ):
+        ppo.train(config)
+    expected = [
+        (iteration, age)
+        for iteration in (100, 200, 300, 400, 401)
+        for age in ppo.EVAL_OPPONENT_AGES
+        if age <= iteration
+    ]
+    assert len(evaluate.call_args_list) == len(expected)
+    for call, (iteration, age) in zip(evaluate.call_args_list, expected, strict=True):
+        assert call.args[4] == iteration * 4
+        assert call.kwargs["opponent_age"] == age
+        assert float(call.args[0].params["weight"]) == iteration
+        assert float(call.kwargs["opponent_params"]["weight"]) == iteration - age
+
+
+def test_historical_playback_pytree_observations_and_multidiscrete_actions() -> None:
+    observation = AgentObservation(
+        observation={"map": jnp.zeros((2, 2, 2), dtype=jnp.int16), "score": jnp.zeros((2, 1))},
+        actions_mask=jnp.ones((2, 2, 3), dtype=bool),
+    )  # observation leaves: (N=2, ...); mask: (N, D=2, A=3)
+    state = PlaybackState(
+        key=jax.random.key(0),
+        observation=observation,
+        env_state=jnp.zeros((2, 2), dtype=jnp.int32),
+        final_state=jnp.zeros((2, 2), dtype=jnp.int32),
+        memory=((jnp.zeros((2, 1)), jnp.zeros((2, 1))),),
+        episode_starts=jnp.ones(2, dtype=bool),
+        episode_return=jnp.asarray(0.0),
+        length=jnp.asarray(0),
+        done=jnp.asarray(False),
+    )  # state leaves: (N, D); memory: (N, H=1); starts: (N,); key/return/length/done: ()
+
+    def policy(
+        variables: dict[str, Any],
+        observation: dict[str, jax.Array],  # leaves: (B=1, ...)
+        memory: ppo.RecurrentCarry,  # leaves: (B, H=1)
+        starts: jax.Array,  # (B,)
+        mask: jax.Array,  # (B, D, A)
+        *,
+        method: str,
+    ) -> ppo.ActorCriticOutput:
+        assert observation["map"].shape == (1, 2, 2) and observation["map"].dtype == jnp.int16
+        assert observation["score"].shape == (1, 1)
+        logits = jnp.where(mask & (jnp.arange(3) == variables["params"]["action"]), 0.0, -jnp.inf)  # (B, D, A)
+        memory = jax.tree.map(lambda leaf: leaf + variables["params"]["action"] + 1, memory)  # (B, H)
+        return ppo.ActorCriticOutput(carry=memory, policy=MultiCategoricalPolicy(logits=logits), value=jnp.zeros(1))
+
+    def step(key: jax.Array, old_state: jax.Array, action: jax.Array) -> MultiAgentStep:  # (); (N, D); (N, D)
+        assert action.shape == (2, 2)
+        return MultiAgentStep(
+            observation=observation,
+            state=action,
+            reward=action.sum(axis=-1).astype(jnp.float32),
+            done=jnp.asarray(True),
+            agent_done=jnp.ones(2, dtype=bool),
+            agent_inactive=jnp.zeros(2, dtype=bool),
+            terminated=jnp.asarray(True),
+            truncated=jnp.asarray(False),
+            final_observation=observation,
+            final_state=action,
+        )  # observation: (N, ...); state: (N, D); reward/done flags: (N,) or ()
+
+    env = Mock()
+    env.step.side_effect = step
+    result, _ = advance_episode(
+        ppo.playback_step,
+        env,
+        policy,
+        ppo.EvaluationMatch(
+            current={"action": jnp.asarray(0)}, opponent={"action": jnp.asarray(1)}, current_team=jnp.asarray(1)
+        ),
+        state,
+        1,
+        record=False,
+    )
+    np.testing.assert_array_equal(result.final_state, [[1, 1], [0, 0]])
+    assert float(result.episode_return) == 0.0
+    for leaf in jax.tree.leaves(result.memory):  # (N, H)
+        np.testing.assert_array_equal(leaf, [[2], [1]])

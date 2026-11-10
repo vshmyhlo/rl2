@@ -40,6 +40,10 @@ class _InTheMatrix(InTheMatrix):
 
 
 class STORMEnv(BaseMultiAgentEnv[State, jax.Array]):
+    @property
+    def supports_selfplay(self) -> bool:
+        return self.config.game == "prisoners_dilemma"
+
     def __init__(self, config: STORMConfig) -> None:
         self.config = config
         payoff = (
