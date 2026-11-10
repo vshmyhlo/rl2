@@ -138,6 +138,7 @@ def constant_policy(
     return ppo.ActorCriticOutput(carry, ppo.CategoricalPolicy(logits), jnp.full(observation.shape[0], 2.0))
 
 
+@pytest.mark.usefixtures("ppo_mesh")
 def test_jaxnav_rollout_timeout_update_and_evaluation(env: JaxNavEnv, state: State) -> None:
     config = replace(
         ppo.load_config(Path(__file__).resolve().parents[1] / "configs/mappo/jaxnav.yaml", ppo.Config),
@@ -146,7 +147,7 @@ def test_jaxnav_rollout_timeout_update_and_evaluation(env: JaxNavEnv, state: Sta
         num_steps=1,
         num_minibatches=1,
         update_epochs=1,
-        total_steps=2,
+        total_env_steps=2,
         gamma=0.5,
         gae_lambda=1.0,
         target_kl=None,

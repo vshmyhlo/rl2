@@ -1,8 +1,11 @@
+from unittest.mock import patch
+
 import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from PIL import ImageDraw
 from pydantic import ValidationError
 
 from rl2.envs.lux_env import LuxConfig, LuxEnv, LuxState
@@ -77,7 +80,7 @@ def test_masks_and_hidden_information(env: LuxEnv, initial: tuple[AgentObservati
     np.testing.assert_array_equal(packed.observation[0], changed_obs.observation[0])
     np.testing.assert_array_equal(packed.actions_mask[0], changed_obs.actions_mask[0])
     frame = env.render(state)  # (H, W, 3)
-    assert frame.shape == (288, 288, 3) and frame.dtype == np.uint8
+    assert frame.shape == (416, 640, 3) and frame.dtype == np.uint8
 
 
 def test_native_transition_match_memory_and_batched_game_autoreset(
@@ -133,3 +136,53 @@ def test_native_transition_match_memory_and_batched_game_autoreset(
 def test_invalid_settings(overrides: dict[str, int]) -> None:
     with pytest.raises(ValidationError):
         LuxConfig(**overrides)
+
+
+@pytest.mark.parametrize(
+    "steps,match_steps,wins,status,turn,points",
+    [
+        (0, 0, (0, 0), "MATCH 1 / 2", "Turn 0 / 2", "37"),
+        (2, 2, (0, 0), "MATCH 1 / 2", "Turn 1 / 2", "37"),
+        (3, 0, (1, 0), "MATCH 1 / 2 COMPLETE", "Turn 2 / 2", "--"),
+        (6, 0, (2, 0), "GAME OVER - TEAM 0 WINS", "Turn 2 / 2", "--"),
+        (6, 0, (1, 1), "GAME OVER - TIE", "Turn 2 / 2", "--"),
+    ],
+    ids=["initial", "live", "match-boundary", "game-over", "even-match-tie"],
+)
+def test_render_progress_and_team_statistics(
+    env: LuxEnv,
+    initial: tuple[AgentObservation, LuxState],
+    steps: int,
+    match_steps: int,
+    wins: tuple[int, int],
+    status: str,
+    turn: str,
+    points: str,
+) -> None:
+    _, state = initial
+    game = state.game.replace(
+        steps=jnp.asarray(steps),
+        match_steps=jnp.asarray(match_steps),  # each ()
+        team_points=jnp.array([37, 19]),
+        team_wins=jnp.array(wins),  # each (N,)
+        units=state.game.units.replace(
+            position=jnp.array([[[0, 0], [1, 1]], [[22, 22], [23, 23]]], dtype=jnp.int16),  # (N, U, 2)
+            energy=jnp.array([[[80], [-1]], [[60], [40]]], dtype=jnp.int16),  # (N, U, 1)
+        ),
+        units_mask=jnp.ones((2, 2), dtype=bool),  # (N, U)
+        relic_nodes_mask=jnp.array([True, False, False, True, False, False]),  # (R,)
+        relic_nodes_map_weights=jnp.zeros((24, 24), dtype=jnp.int16).at[3, 4].set(1),  # (W, H)
+    )
+    with patch.object(ImageDraw.ImageDraw, "text", autospec=True, side_effect=ImageDraw.ImageDraw.text) as text:
+        frame = env.render(state._replace(game=game))  # (416, 640, 3)
+    labels = [call.args[2] for call in text.call_args_list]
+    assert f"LUX S3  |  {status}" in labels
+    assert f"{turn}   |   Game step {steps} / 6" in labels
+    assert f"Relic points {points}   |   Wins {wins[0]}" in labels
+    assert f"Relic points {'--' if points == '--' else '19'}   |   Wins {wins[1]}" in labels
+    assert "Ships 1 / 2   |   Energy 80" in labels
+    assert "Ships 2 / 2   |   Energy 100" in labels
+    assert "Active relic nodes: 2" in labels
+    assert ("Relic points reset at match end." in labels) == (steps > 0 and match_steps == 0)
+    assert frame.shape == (416, 640, 3) and frame.dtype == np.uint8
+    np.testing.assert_array_equal(frame[72 + 4 * 12 + 1, 16 + 3 * 12 + 1], [165, 140, 65])

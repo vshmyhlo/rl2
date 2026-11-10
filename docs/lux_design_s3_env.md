@@ -135,7 +135,9 @@ with shared policy weights and separate recurrent memory.
 - The trainer averages agent returns for episode metrics. With both opposing
   teams included, a completed game always has mean return `match_count / 2`;
   this is not a playing-strength metric. A fixed-opponent evaluation is not yet
-  implemented. The headless renderer shows the full map for debugging.
+  implemented. The headless renderer shows the full map and active scoring tiles,
+  match/turn progress, team relic points, wins, active ships, and energy. Points
+  display as `--` at match boundaries because the simulator has already reset them.
 
 The AlphaZero trainer remains separate and still requires a PGX-compatible
 adapter and search design for Lux's hidden information and simultaneous actions.

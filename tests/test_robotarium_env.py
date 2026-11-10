@@ -121,6 +121,7 @@ def test_pickup_dropoff_rewards_and_movement() -> None:
     np.testing.assert_array_equal(moved.state.p_pos[1:], state.p_pos[1:])
 
 
+@pytest.mark.usefixtures("ppo_mesh")
 def test_mappo_update_and_playback() -> None:
     preset = ppo.load_config(PRESET, ppo.Config)
     config = replace(
@@ -130,7 +131,7 @@ def test_mappo_update_and_playback() -> None:
         num_steps=1,
         num_minibatches=1,
         update_epochs=1,
-        total_steps=1,
+        total_env_steps=1,
         model=ppo.ModelConfig(encoder=ppo.MLPEncoderConfig(embedding_size=4), recurrent=ppo.LSTMConfig(hidden_size=4)),
     )
     env = ppo.make_env(config)

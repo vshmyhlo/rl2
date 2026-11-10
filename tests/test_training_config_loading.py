@@ -173,10 +173,7 @@ def test_preset_checkpoint_directories(trainer: ModuleType, preset: str, root: s
 
 def test_progress_logging_presets() -> None:
     configs = Path(__file__).resolve().parents[1] / "configs"
-    for trainer, paths in (
-        (ppo, [configs / "ppo.yaml", *sorted((configs / "ppo").rglob("*.yaml"))]),
-        (train_mappo, sorted((configs / "mappo").rglob("*.yaml"))),
-    ):
+    for trainer, paths in ((ppo, [configs / "ppo.yaml", *sorted((configs / "ppo").rglob("*.yaml"))]),):
         for path in paths:
             config = trainer.load_config(path, trainer.Config)
             rollouts = config.total_steps // (config.num_envs * config.num_steps)

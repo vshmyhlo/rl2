@@ -1,0 +1,49 @@
+# Posture: raise a prone humanoid to standing. Assets ship with Brax.
+# Run: uv run ppo --config configs/ppo/brax/humanoidstandup.yaml
+# Recurrent PPO starting point; raw observations/rewards, no action repeat.
+env:
+  id: Brax
+  task: humanoidstandup
+  backend: generalized
+  max_steps: 1000 # 15 simulated seconds at approximately 66.67 Hz
+seed: 1
+total_steps: 10_000_000 # Environment steps summed across environments
+num_envs: 128
+num_steps: 64 # 8192 transitions per iteration; short recurrent sequences
+num_minibatches: 8 # 16 whole sequences / 1024 transitions per minibatch
+update_epochs: 8 # At most 64 updates per iteration, subject to KL stopping
+model:
+  continuous_policy: truncated_gaussian
+  encoder:
+    type: mlp
+    hidden_size: 256
+    embedding_size: 256
+  recurrent:
+    type: lstm
+    hidden_size: 128
+bf16: false
+learning_rate: 0.0003
+anneal_lr: true
+lr_decay: linear
+gamma: 0.95 # Dense height reward; limits critic target scale without reward normalization
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: 0.02 # KL threshold for the joint 17-dimensional action distribution
+entropy_coef: 0.001
+entropy_decay: cosine
+value_coef: 1.0 # Weights the half-MSE value loss: 0.5 * mean squared error
+max_grad_norm: 0.5
+ckpt_dir: /runs/ppo/${run_id}
+run_id: ppo_${path_name:${env.id}}_${env.task}_${env.backend}_seed${seed}
+checkpoint_interval: 61
+log_interval: 10
+# Intervals count completed PPO iterations.
+# Evaluation recording requires an available OpenGL backend (e.g. MUJOCO_GL=egl).
+# Checkpoints every 5% and eval every 20% of training, rounded up to iterations.
+# Evaluation (including GIF recording), checkpoints, and logging also run on completion.
+video_interval: 0 # Record videos only during evaluation
+video_max_frames: 1001
+video_fps: 66.66666666666667
+eval_interval: 244
+eval_episodes: 10
+eval_seed: 10000

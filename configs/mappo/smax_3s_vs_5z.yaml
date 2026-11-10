@@ -4,7 +4,7 @@ env:
   map_name: 3s_vs_5z
   max_steps: 200
 seed: 1
-total_steps: 20_000_000 # Environment transitions; each contains num_agents observations
+total_env_steps: 20_000_000 # Environment transitions; each contains num_agents observations
 num_envs: 128
 num_steps: 128
 num_minibatches: 4 # Divides num_envs * num_agents; keep recurrent sequences intact

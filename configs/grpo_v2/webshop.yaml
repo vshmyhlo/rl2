@@ -9,7 +9,7 @@ tasksets:
       id: webshop
       root: /opt/WebShop
 seed: 3
-num_groups: 1
+batch_size: 4 # Total rollouts per optimizer update.
 group_size: 4
 max_tokens: 1024
 max_turns: 50

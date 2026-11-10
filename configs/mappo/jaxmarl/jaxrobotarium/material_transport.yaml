@@ -12,7 +12,7 @@ env:
   update_frequency: 30 # 30 × 0.033 s simulator steps per policy action
   collision_avoidance: true # Native robust barrier controller
 seed: 1
-total_steps: 5_000_000 # Environment transitions; each contains one observation per robot
+total_env_steps: 5_000_000 # Environment transitions; each contains one observation per robot
 num_envs: 32
 num_steps: 128
 num_minibatches: 4 # Divides num_envs * num_agents; keep recurrent sequences intact

@@ -9,9 +9,11 @@ vllm:
   async_scheduling: true
 learning_rate: 1e-6
 adamw_batch_size_scale: 1.0
-clip_coef: 0.2
+loss:
+  kind: grpo
+  clip_coef: 0.2
+  rollout_is_threshold: 2.0 # Decoupled token-level importance sampling; no rejection sampling.
 max_grad_norm: 1.0
-rollout_is_threshold: 2.0 # Decoupled token-level importance sampling; no rejection sampling.
 finetuning:
   mode: full # Optimizes every weight and requires more GPU memory.
 attention_backend: tokamax
@@ -268,11 +270,11 @@ tasksets:
 seed: 1
 total_iterations: 1000
 
-batch_size: 32 # Rollouts per learner batch.
+batch_size: 32 # Total rollouts per optimizer update.
 group_size: 8 # verl rollout.n; 32 rollouts per batch.
 
 prefetch_batches: 2 # Overlap collection and training; not verl's warmup/staleness controls.
-grad_accum_steps: 1 # Consecutive full batches averaged per optimizer update.
+grad_accum_steps: 1 # Equal microbatches averaged per optimizer update.
 parameter_sync_steps: 1 # Optimizer updates between weight publications.
 max_staleness: 2 # Mask tokens older than eight weight publications.
 

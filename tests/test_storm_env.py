@@ -100,6 +100,7 @@ def test_simultaneous_mixed_payoffs_and_respawn() -> None:
     assert not bool(respawn.done)
 
 
+@pytest.mark.usefixtures("ppo_mesh")
 def test_update_and_playback() -> None:
     config = replace(
         ppo.load_config(PRESETS / "basic.yaml", ppo.Config),
@@ -108,7 +109,7 @@ def test_update_and_playback() -> None:
         num_steps=1,
         num_minibatches=1,
         update_epochs=1,
-        total_steps=1,
+        total_env_steps=1,
         model=ppo.ModelConfig(encoder=ppo.MLPEncoderConfig(embedding_size=4), recurrent=ppo.LSTMConfig(hidden_size=4)),
     )
     env = ppo.make_env(config)

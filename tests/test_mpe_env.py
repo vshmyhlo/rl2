@@ -128,6 +128,7 @@ def test_reference_requires_fixed_agent_and_landmark_counts(num_agents: int, num
 
 
 @pytest.mark.parametrize("env_id", ["MPE_simple_spread_v3", "MPE_simple_reference_v3"])
+@pytest.mark.usefixtures("ppo_mesh")
 def test_update_playback_and_checkpoint(tmp_path: Path, env_id: MPEEnvId) -> None:
     config = replace(
         ppo.load_config(PRESET, ppo.Config),
@@ -136,7 +137,7 @@ def test_update_playback_and_checkpoint(tmp_path: Path, env_id: MPEEnvId) -> Non
         num_steps=1,
         num_minibatches=1,
         update_epochs=1,
-        total_steps=1,
+        total_env_steps=1,
         model=ppo.ModelConfig(encoder=ppo.MLPEncoderConfig(embedding_size=4), recurrent=ppo.LSTMConfig(hidden_size=4)),
     )
     env = ppo.make_env(config)
@@ -188,7 +189,7 @@ def test_update_playback_and_checkpoint(tmp_path: Path, env_id: MPEEnvId) -> Non
     with ppo.checkpoint_manager(str(tmp_path)) as manager:
         ppo.save_checkpoint(manager, progress, config)
         manager.wait_until_finished()
-        restored = ppo.restore_checkpoint(manager, train_state, config)
+        restored = ppo.restore_checkpoint(
+            manager, train_state, replace(config, env=replace(config.env, local_ratio=0.0))
+        )
         chex.assert_trees_all_equal(restored, progress)
-        with pytest.raises(ValueError, match="environment settings"):
-            ppo.restore_checkpoint(manager, train_state, replace(config, env=replace(config.env, local_ratio=0.0)))

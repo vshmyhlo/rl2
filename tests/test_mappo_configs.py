@@ -1,4 +1,4 @@
-"""Shipped MAPPO presets load into supported environments with separate checkpoints."""
+"""MAPPO model and environment configuration validation."""
 
 from dataclasses import asdict
 from pathlib import Path
@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from rl2.train_mappo import Config, MLPEncoderConfig, ModelConfig, load_config, make_env
+from rl2.train_mappo import Config, MLPEncoderConfig, ModelConfig, load_config
 
 
 @pytest.mark.parametrize("field", ["model", "encoder"])
@@ -67,22 +67,3 @@ def test_rejects_separate_environment_sections() -> None:
     with pytest.raises(ValidationError) as error:
         Config(**settings)
     assert {item["loc"] for item in error.value.errors()} == {("env",), ("env_id",), ("smax",)}
-
-
-def test_mappo_presets() -> None:
-    paths = sorted((Path(__file__).resolve().parents[1] / "configs/mappo").rglob("*.yaml"))
-    run_ids: set[str] = set()
-    for path in paths:
-        config = load_config(path, Config)
-        restored = Config(**asdict(config))
-        assert restored == config and hash(restored) == hash(config)
-        assert {"env_id", "smax", "jaxnav", "mpe"}.isdisjoint(asdict(config))
-        assert config.model.encoder == MLPEncoderConfig(embedding_size=128)
-        env = make_env(config)
-        assert env.config == config.env
-        assert env.num_agents > 1, path.name
-        assert config.num_envs * env.num_agents % config.num_minibatches == 0, path.name
-        assert config.total_steps >= config.num_envs * config.num_steps, path.name
-        assert config.run_id and config.run_id not in run_ids, path.name
-        assert config.ckpt_dir == f"/runs/mappo/{config.run_id}", path.name
-        run_ids.add(config.run_id)

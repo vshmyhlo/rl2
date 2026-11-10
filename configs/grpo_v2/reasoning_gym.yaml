@@ -18,10 +18,8 @@ tasksets:
         min_animals: 1
         max_animals: 5
 seed: 1
-num_groups: 2
+batch_size: 16 # Total rollouts per optimizer update.
 group_size: 8
-minibatches_per_epoch: 1 # Optimizer updates per epoch, excluding skipped minibatches.
-grad_accum_steps: 8
 prefetch_batches: 1
 weight_update_pause_mode: wait
 drop_degenerate_groups: false
@@ -32,7 +30,7 @@ max_tokens: 8192 # Total transcript tokens, including system, prompt, and tools.
 max_turns: 50
 rollout_timeout: 1200
 environment_timeout: 600
-run_id: grpo_v2_reasoning_gym_${tasksets.leg_counting.taskset.task}_${path_name:${model}}_s${seed}_ng${num_groups}_gs${group_size}_mb${minibatches_per_epoch}_ddg${drop_degenerate_groups}_pf${prefetch_batches}_success_lp${length_penalty.reference_tokens}_${length_penalty.penalty}
+run_id: grpo_v2_reasoning_gym_${tasksets.leg_counting.taskset.task}_${path_name:${model}}_s${seed}_bs${batch_size}_gs${group_size}_ddg${drop_degenerate_groups}_pf${prefetch_batches}_success_lp${length_penalty.reference_tokens}_${length_penalty.penalty}
 ckpt_dir: /runs/grpo_v2/${run_id} # Checkpoints and profiling artifacts.
 checkpoint_interval: 50
 example_log_interval: 50

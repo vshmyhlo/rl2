@@ -4,18 +4,17 @@ scan_layers: true
 gradient_checkpointing: true
 padding_multiple: 256
 seed: 1 # Task sampling seed
-num_groups: 1
+batch_size: 4 # Total rollouts per optimizer update.
 group_size: 4
 total_iterations: null # Run until interrupted
 max_tokens: 512 # Total transcript tokens, including system, prompt, and tools.
 max_turns: 3
 temperature: 1.0
 learning_rate: 0.000001
-clip_coef: 0.2
+loss:
+  kind: grpo
+  clip_coef: 0.2
 max_grad_norm: 1.0
-update_epochs: 1
-minibatches_per_epoch: 4
-grad_accum_steps: 1
 weight_update_pause_mode: wait # wait or keep in-flight vLLM requests
 run_id: grpo_v2_addition_${path_name:${model}}_seed${seed}
 ckpt_dir: /runs/grpo_v2/${run_id} # Profiling artifacts; checkpointing is not implemented.

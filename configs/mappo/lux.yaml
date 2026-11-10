@@ -1,0 +1,47 @@
+# Two team agents; each policy call selects commands for all 16 ships.
+# Run: uv run mappo --config configs/mappo/lux.yaml
+env:
+  id: luxai_s3
+  max_units: 16
+  max_steps_in_match: 100
+  match_count: 5
+  randomize_params: true
+seed: 2
+total_env_steps: 10_000_000
+num_envs: 16
+num_steps: 256
+num_minibatches: 4
+update_epochs: 4
+model:
+  encoder:
+    type: mlp
+    embedding_size: 128
+  recurrent:
+    hidden_size: 128
+    num_layers: 1
+    intermediate_size: 0
+bf16: false
+learning_rate: 0.0003
+anneal_lr: true
+lr_decay: linear
+gamma: 0.997
+gae_lambda: 0.99
+clip_coef: 0.2
+target_kl: 0.03
+# Entropy is summed across all ship commands in the team action.
+entropy_coef: 0.001
+entropy_decay: constant
+value_coef: 1.0
+max_grad_norm: 0.5
+ckpt_dir: /runs/mappo/${run_id}
+run_id: mappo_lux_seed${seed}
+# Intervals count training iterations.
+log_interval: 10
+video_interval: 0
+video_fps: 10
+# Approximately 10% of the environment-step budget (rounded up to full iterations).
+checkpoint_interval: 245
+# Both teams share the policy; mean self-play return cannot measure strength.
+eval_interval: 245
+eval_episodes: 10
+eval_seed: 10000

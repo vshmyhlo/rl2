@@ -1,6 +1,6 @@
 model: Qwen/Qwen3-0.6B
 vllm:
-  max_model_len: 8192
+  max_model_len: 10240
   max_num_seqs: 256
   max_num_batched_tokens: 2048
   gpu_memory_utilization: 0.90
@@ -39,9 +39,9 @@ max_staleness: 10 # Mask tokens older than ten weight publications.
 weight_update_pause_mode: keep
 drop_degenerate_groups: true
 length_penalty:
-  reference_tokens: 8192 # Generated-token scale, independent of the transcript budget.
+  reference_tokens: 10240 # Generated-token scale, independent of the transcript budget.
   penalty: 0.0 # Crafter returns can be negative or exceed one.
-max_tokens: 8192 # Total transcript tokens, including system, prompt, and tools.
+max_tokens: 10240 # Total transcript tokens, including system, prompt, and tools.
 max_turns: 50
 rollout_timeout: 1200
 environment_timeout: 600
