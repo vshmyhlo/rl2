@@ -881,42 +881,6 @@ def test_hierarchical_model_masks_and_sequence_replay(config: ppo.Config) -> Non
     )
 
 
-def test_lux_encoder_preserves_batch_axes_and_native_features() -> None:
-    env = LuxEnv(LuxConfig(max_units=2, randomize_params=False))
-    leaves, structure = jax.tree.flatten(env.observation_space)
-    observation = jax.tree.unflatten(
-        structure,
-        [
-            ((jnp.arange(leaf.size).reshape(leaf.shape) + index) % 7 + 1).astype(leaf.dtype)  # (...)
-            for index, leaf in enumerate(leaves)
-        ],
-    )  # native leaves: (...), without batch axes
-    encoder = ppo.LuxEncoder(features=4, dtype=jnp.bfloat16)
-    params = encoder.init(jax.random.key(0), observation)
-    encoded = jax.jit(encoder.apply)(params, observation)  # (F=4,)
-    assert encoded.shape == (4,) and encoded.dtype == jnp.bfloat16
-    sequence = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (2, 1, *leaf.shape)), observation)
-    # sequence leaves: (B=2, T=1, ...), including scalar native counters
-    output = jax.jit(encoder.apply)(params, sequence)  # (B=2, T=1, F=4)
-    chex.assert_shape(output, (2, 1, 4))
-    np.testing.assert_array_equal(output, jnp.broadcast_to(encoded, (2, 1, 4)))
-    steps = jax.tree.map(lambda leaf: leaf[:, 0], sequence)  # leaves: (B=2, ...)
-    np.testing.assert_array_equal(encoder.apply(params, steps), output[:, 0])
-    # Grouping world fields must preserve the previous encoder feature order.
-    flat = jnp.concatenate(
-        [
-            leaf.reshape(-1).astype(jnp.float32)
-            for leaf in jax.tree.leaves(
-                (observation.self, observation.opponent, *observation.world, observation.public_params)
-            )
-        ]
-    )  # (O=1772,)
-    assert flat.shape == (1772,)
-    dense = params["params"]
-    expected = flat.astype(jnp.bfloat16) @ dense["kernel"].astype(jnp.bfloat16) + dense["bias"].astype(jnp.bfloat16)
-    np.testing.assert_array_equal(encoded, expected)  # each (F=4,)
-
-
 @pytest.mark.parametrize("lux_env", [False, True], ids=["lux-encoder-other-env", "lux-env-mlp-encoder"])
 def test_lux_encoder_requires_matching_environment(config: ppo.Config, lux_env: bool) -> None:
     with pytest.raises(ValueError, match="lux encoder"):
@@ -927,11 +891,17 @@ def test_lux_encoder_requires_matching_environment(config: ppo.Config, lux_env: 
         )
 
 
+@pytest.mark.parametrize("channels", [0, 3], ids=["nonpositive", "incompatible_attention_width"])
+def test_lux_encoder_requires_positive_even_channels(channels: int) -> None:
+    with pytest.raises(ValueError, match="channels"):
+        ppo.LuxEncoderConfig(channels=channels)
+
+
 def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Path) -> None:
     config = replace(
         config,
         env=LuxConfig(max_units=2, max_steps_in_match=2, match_count=1, randomize_params=False),
-        model=replace(config.model, encoder=ppo.LuxEncoderConfig(embedding_size=4)),
+        model=replace(config.model, encoder=ppo.LuxEncoderConfig(embedding_size=4, channels=4)),
         num_envs=1,
         num_steps=3,
         num_minibatches=1,

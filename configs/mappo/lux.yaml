@@ -18,6 +18,7 @@ model:
   encoder:
     type: lux
     embedding_size: 128
+    channels: 16
   recurrent:
     hidden_size: 128
     num_layers: 1
@@ -36,15 +37,15 @@ entropy_decay: constant
 value_coef: 1.0
 max_grad_norm: 0.5
 ckpt_dir: /runs/mappo/${run_id}
-# The hierarchical action head requires a separate run from flat-head checkpoints.
-run_id: mappo_lux_hierarchical_seed${seed}
+# The spatial/entity encoder requires a fresh checkpoint.
+run_id: mappo_lux_spatial_seed${seed}
 # Intervals count training iterations.
 log_interval: 1
 video_interval: 0
 video_fps: 10
-# Approximately 10% of the environment-step budget (rounded up to full iterations).
-checkpoint_interval: 16
+# Approximately 10% of training: ceil(10_000_000 / (32 * 256) * 0.1).
+checkpoint_interval: 123
 # Both teams share the policy; mean self-play return cannot measure strength.
-eval_interval: 16
+eval_interval: 123
 eval_episodes: 10
 eval_seed: 10000

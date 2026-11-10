@@ -106,7 +106,7 @@ model shapes from the actual pytrees.
 agents**. Run `uv run mappo --config configs/mappo/lux.yaml` to train both teams
 with shared policy weights and separate recurrent memory.
 
-- Each team policy call receives one flat observation and outputs all 16 ship
+- Each team policy call receives one structured observation and outputs all 16 ship
   commands. Each ship has a stay/move/sap choice, with a conditional direction
   or sap target. All ships share the team encoder/LSTM and sample independently
   given that representation; this is not an autoregressive joint-action model.
@@ -133,10 +133,21 @@ with shared policy weights and separate recurrent memory.
   absolute coordinates are retained.
   `LuxEnv.observation_space` describes one player's tree with
   `ShapeDtypeStruct` leaves, excluding action masks.
-- MAPPO's `model.encoder.type: lux` flattens the tree to float32 in JAX pytree
-  order and applies a dense projection with `1756 + 8*U` inputs (1884 for
-  `U=16`). There is no team-ID feature. The changed feature order and input
-  width require a fresh run directory; older encoder checkpoints are incompatible.
+- MAPPO's `model.encoder.type: lux` uses tile-type embeddings, normalized tile
+  energy, visibility, coordinates, and separate ship/relic spatial channels.
+  A residual CNN provides local ship features and a 6×6 map for four-head
+  ship-to-map attention. Own ship slots retain their order; opponent ships are
+  pooled and relics rasterized, making their slot order irrelevant. Projected
+  public context includes scores, wins, progress, costs/ranges, and visible counts.
+  Hidden fields are masked before encoding; relic scoring tiles are never inputs.
+  `channels` (default 16, positive even integer) controls CNN width; attention
+  width is twice that. `embedding_size` controls the final team embedding.
+  Continuous features use fixed physical scales (tile energy 20, ship energy
+  400, wins 5, game/match steps 505/100); scores also receive a log transform.
+  These scales do not impose limits on configured game lengths.
+  This architecture requires a fresh run directory; old encoder checkpoints
+  are incompatible. It adds spatial structure but needs training evaluation
+  to establish improvements in playing strength.
 - PPO computes one joint log probability and one value per **team**. Log
   probabilities and entropies sum over ship commands; batches and recurrent
   memory retain two agent sequences per environment, not 32 ship sequences.

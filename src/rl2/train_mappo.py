@@ -6,7 +6,8 @@ memory without ending the reward stream or GAE trace. Environment completion end
 traces; timeouts bootstrap from final local observations unless also terminated.
 Despite the historical MAPPO filename, the critic uses no centralized state.
 Lux observations separate self/opponent teams and retain native dtypes through
-rollout storage; the lux encoder flattens these leaves before its projection.
+rollout storage; the lux encoder combines spatial map features, ship features,
+and public context with ship-to-map attention.
 
 E denotes environments, N agents, B = E * N agent sequences, T rollout steps,
 O local observation features, A categories, and H recurrent width. C is empty
@@ -169,6 +170,7 @@ from rl2.envs.storm_env import STORMConfig, STORMEnv
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.mlflow_logging import MLflowLogger
+from rl2.model.encoders.lux import LuxEncoder
 from rl2.playback import EpisodeResult, PlaybackState, finish_episode
 from rl2.running_stats import RunningSum
 from rl2.utils import explained_variance, gae
@@ -313,6 +315,7 @@ class MLPEncoderConfig:
 class LuxEncoderConfig:
     type: Literal["lux"] = "lux"
     embedding_size: Annotated[int, Field(gt=0, strict=True)] = 128
+    channels: Annotated[int, Field(gt=0, multiple_of=2, strict=True)] = 16
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -519,19 +522,6 @@ def entropy_coef_schedule(config: Config) -> optax.Schedule:
     return decay_schedule(config.entropy_coef, config.total_env_steps, "cosine")
 
 
-class LuxEncoder(nn.Dense):
-    """Encode self/opponent teams, visible world, and public context in native units."""
-
-    @nn.compact
-    def __call__(self, observation: LuxObservation[jax.Array]) -> jax.Array:  # leaves: (*S, ...) -> (*S, F)
-        batch_shape = observation.public_params.shape[:-1]
-        features = jnp.concatenate(
-            [leaf.reshape((*batch_shape, -1)).astype(jnp.float32) for leaf in jax.tree.leaves(observation)],
-            axis=-1,
-        )  # (*S, O), O = 1756 + 8*U, U ship slots per team
-        return super().__call__(features)  # (*S, F), F = self.features
-
-
 class ActorCriticOutput(NamedTuple):
     carry: RecurrentCarry  # leaves: (B, H)
     policy: Policy  # logits: (*S, *C, A)
@@ -562,7 +552,12 @@ class ActorCritic(nn.Module):
 
     def setup(self) -> None:
         self.encoder = (
-            LuxEncoder(features=self.model.encoder.embedding_size, dtype=self.dtype, name="encoder")
+            LuxEncoder(
+                features=self.model.encoder.embedding_size,
+                channels=self.model.encoder.channels,
+                dtype=self.dtype,
+                name="encoder",
+            )
             if isinstance(self.model.encoder, LuxEncoderConfig)
             else nn.Dense(features=self.model.encoder.embedding_size, dtype=self.dtype, name="encoder")
         )
