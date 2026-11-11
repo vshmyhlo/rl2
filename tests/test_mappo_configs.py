@@ -6,7 +6,7 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 from test_train_mappo import config as config  # noqa: PLC0414
 
-from rl2.train_mappo import Config, GenericModelConfig, LSTMConfig, LuxModelConfig, MLPEncoderConfig, ModelConfig
+from rl2.train_mappo import Config, GenericModelConfig, LuxModelConfig, MLPEncoderConfig, ModelConfig
 
 
 @pytest.mark.parametrize(
@@ -48,7 +48,6 @@ def test_invalid_encoder(encoder: dict[str, object], field: str) -> None:
             num_blocks=3,
             heads=2,
             head_dim=4,
-            ship_recurrent=LSTMConfig(hidden_size=6),
         ),
     ],
 )
@@ -95,24 +94,21 @@ def test_rejects_invalid_model_variant(settings: dict[str, object]) -> None:
         TypeAdapter(ModelConfig).validate_python(settings)
 
 
-@pytest.mark.parametrize("field", ["hidden_size", "num_layers", "intermediate_size"])
-def test_rejects_invalid_ship_recurrence(field: str) -> None:
-    with pytest.raises(ValidationError, match=field):
-        TypeAdapter(ModelConfig).validate_python({"type": "lux", "ship_recurrent": {field: -1}})
+def test_rejects_separate_ship_recurrence() -> None:
+    with pytest.raises(ValidationError, match="ship_recurrent"):
+        TypeAdapter(ModelConfig).validate_python({"type": "lux", "ship_recurrent": {"hidden_size": 4}})
 
 
 @pytest.mark.parametrize(
-    "name,settings",
+    "settings",
     [
-        ("recurrent", {"num_layers": 2}),
-        ("ship_recurrent", {"num_layers": 2}),
-        ("recurrent", {"intermediate_size": 4}),
-        ("ship_recurrent", {"intermediate_size": 4}),
+        {"num_layers": 2},
+        {"intermediate_size": 4},
     ],
 )
-def test_lux_rejects_stack_settings(name: str, settings: dict[str, int]) -> None:
-    with pytest.raises(ValidationError, match=f"{name} requires num_layers=1 and intermediate_size=0"):
-        TypeAdapter(ModelConfig).validate_python({"type": "lux", name: settings})
+def test_lux_rejects_stack_settings(settings: dict[str, int]) -> None:
+    with pytest.raises(ValidationError, match="recurrent requires num_layers=1 and intermediate_size=0"):
+        TypeAdapter(ModelConfig).validate_python({"type": "lux", "recurrent": settings})
 
 
 @pytest.mark.parametrize("num_blocks", [0, True], ids=["empty_stack", "non_integer"])

@@ -96,7 +96,9 @@ class GenericActorCritic(BaseActorCritic[jax.Array, LSTMStackCarry, GenericPolic
         model_carry: LSTMStackCarry,  # leaves: (B, H)
         episode_start: jax.Array,  # (B, T)
         actions_mask: jax.Array,  # (B, T, *C, A)
-    ) -> ActorCriticOutput[LSTMStackCarry, GenericPolicy]:  # carry leaves: (B, H); logits: (B, T, *C, A); value: (B, T)
+    ) -> tuple[
+        ActorCriticOutput[GenericPolicy], LSTMStackCarry
+    ]:  # carry leaves: (B, H); logits: (B, T, *C, A); value: (B, T)
         """Process observation sequences, resetting memory at episode starts."""
         x = self._encode(observation)  # (B, T, H)
         # The shared LSTM scans time-major inputs; MAPPO exposes batch-major arrays.
@@ -108,7 +110,7 @@ class GenericActorCritic(BaseActorCritic[jax.Array, LSTMStackCarry, GenericPolic
         )  # model_carry leaves: (B, H); recurrent_x: (T, B, H)
         x = jnp.swapaxes(recurrent_x, 0, 1)  # (B, T, H)
         policy, value = self._heads(x, actions_mask)  # logits: (B, T, *C, A); (B, T)
-        return ActorCriticOutput(carry=model_carry, policy=policy, value=value)
+        return ActorCriticOutput(policy=policy, value=value), model_carry
 
     def step(
         self,
@@ -116,9 +118,11 @@ class GenericActorCritic(BaseActorCritic[jax.Array, LSTMStackCarry, GenericPolic
         model_carry: LSTMStackCarry,  # leaves: (B, H)
         episode_start: jax.Array,  # (B,)
         actions_mask: jax.Array,  # (B, *C, A)
-    ) -> ActorCriticOutput[LSTMStackCarry, GenericPolicy]:  # carry leaves: (B, H); logits: (B, *C, A); value: (B,)
+    ) -> tuple[
+        ActorCriticOutput[GenericPolicy], LSTMStackCarry
+    ]:  # carry leaves: (B, H); logits: (B, *C, A); value: (B,)
         """Process one observation per sequence, resetting memory at episode starts."""
         x = self._encode(observation)  # (B, H)
         model_carry, x = self.recurrent.step(x, model_carry, episode_start)  # model_carry leaves: (B, H); x: (B, H)
         policy, value = self._heads(x, actions_mask)  # logits: (B, *C, A); (B,)
-        return ActorCriticOutput(carry=model_carry, policy=policy, value=value)
+        return ActorCriticOutput(policy=policy, value=value), model_carry

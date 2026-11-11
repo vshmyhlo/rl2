@@ -126,15 +126,14 @@ def scripted_policy(
     actions_mask: jax.Array,  # (B, A)
     *,
     method: str,
-) -> ppo.ActorCriticOutput:
+) -> tuple[ppo.ActorCriticOutput, ppo.RecurrentCarry]:
     def advance(leaf: jax.Array) -> jax.Array:  # (B, H) -> (B, H)
         return jnp.where(starts[:, None], 0, leaf) + 1  # (B, H)
 
     return ppo.ActorCriticOutput(
-        jax.tree.map(advance, memory),
-        ppo.CategoricalPolicy(jnp.where(actions_mask, 0.0, -1e10)),
-        observation[:, 0],
-    )
+        policy=ppo.CategoricalPolicy(jnp.where(actions_mask, 0.0, -1e10)),
+        value=observation[:, 0],  # (B,)
+    ), jax.tree.map(advance, memory)
 
 
 def test_rollout_team_gae_death_timeout_and_sequence_selection(config: ppo.Config) -> None:
@@ -241,9 +240,9 @@ def test_timeout_bootstrap_resets_only_inactive_agent_memory(config: ppo.Config)
         actions_mask: jax.Array,  # (B, A)
         *,
         method: str,
-    ) -> ppo.ActorCriticOutput:
-        output = scripted_policy(variables, observation, memory, starts, actions_mask, method=method)
-        return output._replace(value=output.carry[0][0][:, 0])  # value: (B,)
+    ) -> tuple[ppo.ActorCriticOutput, ppo.RecurrentCarry]:
+        output, output_carry = scripted_policy(variables, observation, memory, starts, actions_mask, method=method)
+        return output._replace(value=output_carry[0][0][:, 0]), output_carry  # value: (B,)
 
     env = ScriptedSMAX()
     _, state = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 1))  # leaves: (E=1, ...)
@@ -282,12 +281,14 @@ def test_local_model_mask_replay_and_shared_memory(config: ppo.Config) -> None:
     chex.assert_shape(params["params"]["encoder"]["kernel"], (4, config.model.encoder.embedding_size))
     # Keep the tiny ReLU encoder active so the test exercises recurrent features.
     params["params"]["encoder"]["kernel"] = jnp.eye(4)  # (O, F)
-    output = model.apply(params, observation, memory, starts, actions_mask)
-    first = model.apply(params, observation[:, 0], memory, starts[:, 0], actions_mask[:, 0], method="step")
+    output, output_carry = model.apply(params, observation, memory, starts, actions_mask)
+    first, first_carry = model.apply(params, observation[:, 0], memory, starts[:, 0], actions_mask[:, 0], method="step")
     chex.assert_shape(first.policy.logits, (3, 3))
     chex.assert_shape(first.value, (3,))
-    second = model.apply(params, observation[:, 1], first.carry, starts[:, 1], actions_mask[:, 1], method="step")
-    chex.assert_trees_all_close(second.carry, output.carry, atol=1e-6)
+    second, second_carry = model.apply(
+        params, observation[:, 1], first_carry, starts[:, 1], actions_mask[:, 1], method="step"
+    )
+    chex.assert_trees_all_close(second_carry, output_carry, atol=1e-6)
     np.testing.assert_allclose(output.value, jnp.stack([first.value, second.value], axis=1), atol=1e-6)
     np.testing.assert_allclose(
         output.policy.logits, jnp.stack([first.policy.logits, second.policy.logits], axis=1), atol=1e-6
@@ -300,13 +301,13 @@ def test_local_model_mask_replay_and_shared_memory(config: ppo.Config) -> None:
     chex.assert_shape(output.policy.logits, (3, 2, 3))
     # Both heads depend on the shared encoder; changing only the value head leaves policy and memory intact.
     changed = dict(params["params"], encoder=jax.tree.map(jnp.zeros_like, params["params"]["encoder"]))
-    no_features = model.apply({"params": changed}, observation, memory, starts, actions_mask)
+    no_features, _ = model.apply({"params": changed}, observation, memory, starts, actions_mask)
     assert not np.array_equal(output.policy.logits, no_features.policy.logits)
     assert not np.array_equal(output.value, no_features.value)
     changed = dict(params["params"], value_output=jax.tree.map(jnp.zeros_like, params["params"]["value_output"]))
     changed["value_output"]["bias"] = jnp.ones(1)  # (1,)
-    new_output = model.apply({"params": changed}, observation, memory, starts, actions_mask)
-    chex.assert_trees_all_equal((output.policy, output.carry), (new_output.policy, new_output.carry))
+    new_output, new_output_carry = model.apply({"params": changed}, observation, memory, starts, actions_mask)
+    chex.assert_trees_all_equal((output.policy, output_carry), (new_output.policy, new_output_carry))
     assert not np.array_equal(output.value, new_output.value)
 
 
@@ -316,13 +317,12 @@ def tiny_policy(
     memory: ppo.RecurrentCarry,  # leaves: (B, H)
     starts: jax.Array,  # (B, T)
     actions_mask: jax.Array,  # (B, T, A)
-) -> ppo.ActorCriticOutput:
+) -> tuple[ppo.ActorCriticOutput, ppo.RecurrentCarry]:
     logits = jnp.where(actions_mask, variables["params"]["logits"], -1e10)  # (B, T, A)
     return ppo.ActorCriticOutput(
-        carry=memory,
         policy=ppo.CategoricalPolicy(logits),
         value=jnp.broadcast_to(variables["params"]["value"], starts.shape),  # (B, T)
-    )
+    ), memory
 
 
 @pytest.fixture
@@ -639,9 +639,9 @@ def test_playback_reuses_compiled_sampling_with_updated_inputs() -> None:
         actions_mask: jax.Array,  # (N, A)
         *,
         method: str,
-    ) -> ppo.ActorCriticOutput:
+    ) -> tuple[ppo.ActorCriticOutput, ppo.RecurrentCarry]:
         logits = jnp.where(actions_mask, variables["params"]["logits"], -1e10)  # (N, A)
-        return ppo.ActorCriticOutput(carry=carry, policy=ppo.CategoricalPolicy(logits), value=jnp.zeros(2))
+        return ppo.ActorCriticOutput(policy=ppo.CategoricalPolicy(logits), value=jnp.zeros(2)), carry
 
     def step(key: jax.Array, state: jax.Array, action: jax.Array) -> MultiAgentStep:  # (); (N,); (N,)
         return MultiAgentStep(
@@ -770,10 +770,10 @@ def test_compiled_playback_resets_dead_agent_memory() -> None:
         mask: jax.Array,  # (N, A=3)
         *,
         method: str,
-    ) -> ppo.ActorCriticOutput:
+    ) -> tuple[ppo.ActorCriticOutput, ppo.RecurrentCarry]:
         carry = jax.tree.map(lambda leaf: jnp.where(starts[:, None], 0, leaf) + 1, carry)  # leaves: (N, H)
         logits = jnp.where(jnp.arange(3) == carry[0][0], 0.0, -jnp.inf)  # (N, A)
-        return ppo.ActorCriticOutput(carry=carry, policy=ppo.CategoricalPolicy(logits), value=jnp.zeros(2))
+        return ppo.ActorCriticOutput(policy=ppo.CategoricalPolicy(logits), value=jnp.zeros(2)), carry
 
     def step(key: jax.Array, state: State, action: jax.Array) -> MultiAgentStep:  # (); leaves: (...); (N,)
         result = ScriptedSMAX.step(env, key, state, action)
@@ -1008,7 +1008,7 @@ def test_hierarchical_model_masks_and_sequence_replay(config: ppo.Config) -> Non
     masks = jnp.broadcast_to(jnp.array([[True, True, False], [True, False, True]]), (2, 2, 2, 3))  # (B, T, D, A)
     memory = model.initial_carry(2)  # leaves: (B, H)
     params = model.init(jax.random.key(0), observation, memory, starts, masks)
-    output = model.apply(params, observation, memory, starts, masks)
+    output, output_carry = model.apply(params, observation, memory, starts, masks)
     assert isinstance(output.policy, ppo.HierarchicalMultiCategoricalPolicy)
     chex.assert_shape(output.policy.logits, (2, 2, 2, 3))
     chex.assert_shape(output.value, (2, 2))
@@ -1017,9 +1017,9 @@ def test_hierarchical_model_masks_and_sequence_replay(config: ppo.Config) -> Non
     assert bool((action[..., 0] < 2).all())
     assert bool((action[..., 1] != 1).all())
     np.testing.assert_allclose(output.policy.log_prob(action), log_prob, atol=1e-6)
-    first = model.apply(params, observation[:, 0], memory, starts[:, 0], masks[:, 0], method="step")
-    second = model.apply(params, observation[:, 1], first.carry, starts[:, 1], masks[:, 1], method="step")
-    chex.assert_trees_all_close(second.carry, output.carry, atol=1e-6)
+    first, first_carry = model.apply(params, observation[:, 0], memory, starts[:, 0], masks[:, 0], method="step")
+    second, second_carry = model.apply(params, observation[:, 1], first_carry, starts[:, 1], masks[:, 1], method="step")
+    chex.assert_trees_all_close(second_carry, output_carry, atol=1e-6)
     np.testing.assert_allclose(
         output.policy.logits, jnp.stack((first.policy.logits, second.policy.logits), axis=1), atol=1e-6
     )
@@ -1048,7 +1048,7 @@ def test_default_lux_parameter_budget_and_output_shapes() -> None:
     observation = jax.tree.map(
         lambda leaf: jax.ShapeDtypeStruct((1, 1, *leaf.shape), leaf.dtype), env.observation_space
     )  # leaves: (B=1, T=1, ...)
-    output, variables = jax.eval_shape(
+    (output, output_carry), variables = jax.eval_shape(
         model.init_with_output,
         jax.random.key(0),
         observation,
@@ -1063,14 +1063,14 @@ def test_default_lux_parameter_budget_and_output_shapes() -> None:
         for attention in (block["map_attention"], block["set_attention"]["attention"]):
             assert attention["query"]["kernel"].shape == (token_size, config.heads, config.head_dim)
             assert attention["out"]["kernel"].shape == (config.heads, config.head_dim, token_size)
-    assert 4_200_000 <= sum(leaf.size for leaf in jax.tree.leaves(variables["params"])) <= 4_500_000
+    assert 5_200_000 <= sum(leaf.size for leaf in jax.tree.leaves(variables["params"])) <= 5_400_000
     assert output.policy.raw_logits.shape == (1, 1, 1, 232)
     assert jax.eval_shape(lambda policy: policy.logits, output.policy).shape == (1, 1, 1, 230)
     assert output.value.shape == (1, 1) and output.value.dtype == jnp.float32
-    for leaf in jax.tree.leaves(output.carry.team):
+    for leaf in jax.tree.leaves(output_carry.team):
         assert leaf.shape == (1, config.recurrent.hidden_size) and leaf.dtype == jnp.float32
-    for leaf in jax.tree.leaves(output.carry.ships):
-        assert leaf.shape == (1, 1, config.ship_recurrent.hidden_size) and leaf.dtype == jnp.float32
+    for leaf in jax.tree.leaves(output_carry.ships):
+        assert leaf.shape == (1, 1, config.heads * config.head_dim) and leaf.dtype == jnp.float32
 
 
 def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Path) -> None:
@@ -1083,7 +1083,6 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
             heads=4,
             head_dim=2,
             recurrent=config.model.recurrent,
-            ship_recurrent=ppo.LSTMConfig(hidden_size=4),
             attention_implementation="xla",
         ),
         num_envs=1,
@@ -1131,7 +1130,7 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
     assert int(rollout.episode_count) == 1 and int(rollout.episode_length_sum) == 3
     assert float(rollout.episode_return_sum) == 0.5
     np.testing.assert_array_equal(advanced.episode_start, True)
-    replay = model.apply(
+    replay, _ = model.apply(
         {"params": train_state.params}, batch.observation, memory, batch.episode_start, batch.actions_mask
     )
     np.testing.assert_allclose(replay.policy.log_prob(batch.action), batch.old_log_prob, atol=1e-5)
@@ -1158,14 +1157,14 @@ def test_grouped_model_balances_types_and_masks(config: ppo.Config) -> None:
     memory = model.initial_carry(2)  # leaves: (B, H)
     params = model.init(jax.random.key(0), observation, memory, starts, mask)
     params["params"]["policy_output"] = jax.tree.map(jnp.zeros_like, params["params"]["policy_output"])
-    output = model.apply(params, observation, memory, starts, mask)
+    output, _ = model.apply(params, observation, memory, starts, mask)
     assert isinstance(output.policy, ppo.HierarchicalMultiCategoricalPolicy)
     assert output.policy.raw_logits.shape == (2, 1, 2, 8)
     assert output.policy.logits.shape == (2, 1, 2, 6)
     probs = jax.nn.softmax(output.policy.logits, axis=-1)  # (B, T, D, A)
     np.testing.assert_allclose(probs[0, 0, 0], [1 / 3, 1 / 6, 1 / 6, 1 / 9, 1 / 9, 1 / 9], rtol=1e-6)
     np.testing.assert_allclose(probs[1, 0, 0], [1 / 2, 1 / 4, 1 / 4, 0, 0, 0], rtol=1e-6)
-    step = model.apply(params, observation[:, 0], memory, starts[:, 0], mask[:, 0], method="step")
+    step, _ = model.apply(params, observation[:, 0], memory, starts[:, 0], mask[:, 0], method="step")
     np.testing.assert_allclose(step.policy.logits, output.policy.logits[:, 0], atol=1e-6)
     np.testing.assert_allclose(step.policy.entropy(), output.policy.entropy()[:, 0], atol=1e-6)
 
@@ -1209,15 +1208,15 @@ def test_historical_playback_uses_separate_weights_and_current_team_reward(confi
         actions_mask: jax.Array,  # (B, A)
         *,
         method: str,
-    ) -> ppo.ActorCriticOutput:
+    ) -> tuple[ppo.ActorCriticOutput, ppo.RecurrentCarry]:
         memory = jax.tree.map(
             lambda leaf: jnp.where(starts[:, None], 0, leaf) + variables["params"]["increment"], memory
         )  # leaves: (B, H)
         # Deterministic actions expose both policy selection and each team's memory.
         logits = jnp.where(jnp.arange(3) == memory[0][0], 0.0, -jnp.inf)  # (B, A=3)
         return ppo.ActorCriticOutput(
-            carry=memory, policy=ppo.CategoricalPolicy(logits=logits), value=jnp.zeros(starts.shape)
-        )  # carry: (B, H); logits: (B, A); value: (B,)
+            policy=ppo.CategoricalPolicy(logits=logits), value=jnp.zeros(starts.shape)
+        ), memory  # carry: (B, H); logits: (B, A); value: (B,)
 
     state = TrainState.create(apply_fn=policy, params={"increment": jnp.asarray(1.0)}, tx=optax.sgd(0.1))
     memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
@@ -1372,12 +1371,12 @@ def test_historical_playback_pytree_observations_and_multidiscrete_actions() -> 
         mask: jax.Array,  # (B, D, A)
         *,
         method: str,
-    ) -> ppo.ActorCriticOutput:
+    ) -> tuple[ppo.ActorCriticOutput, ppo.RecurrentCarry]:
         assert observation["map"].shape == (1, 2, 2) and observation["map"].dtype == jnp.int16
         assert observation["score"].shape == (1, 1)
         logits = jnp.where(mask & (jnp.arange(3) == variables["params"]["action"]), 0.0, -jnp.inf)  # (B, D, A)
         memory = jax.tree.map(lambda leaf: leaf + variables["params"]["action"] + 1, memory)  # (B, H)
-        return ppo.ActorCriticOutput(carry=memory, policy=MultiCategoricalPolicy(logits=logits), value=jnp.zeros(1))
+        return ppo.ActorCriticOutput(policy=MultiCategoricalPolicy(logits=logits), value=jnp.zeros(1)), memory
 
     def step(key: jax.Array, old_state: jax.Array, action: jax.Array) -> MultiAgentStep:  # (); (N, D); (N, D)
         assert action.shape == (2, 2)

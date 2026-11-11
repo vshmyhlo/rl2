@@ -37,13 +37,10 @@ class LuxModelConfig:
     head_dim: Annotated[int, Field(gt=0, strict=True)] = 32
     attention_implementation: Literal["triton", "xla"] = "triton"
     recurrent: LSTMConfig = LSTMConfig(hidden_size=256)
-    ship_recurrent: LSTMConfig = LSTMConfig(hidden_size=128)
 
     def __post_init__(self) -> None:
-        for name in ("recurrent", "ship_recurrent"):
-            config = getattr(self, name)
-            if config.num_layers != 1 or config.intermediate_size != 0:
-                raise ValueError(f"{name} requires num_layers=1 and intermediate_size=0 for a single LSTM")
+        if self.recurrent.num_layers != 1 or self.recurrent.intermediate_size != 0:
+            raise ValueError("recurrent requires num_layers=1 and intermediate_size=0 for a single LSTM")
 
 
 def _default_model_type(value: Any) -> Any:

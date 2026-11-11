@@ -105,12 +105,12 @@ model shapes from the actual pytrees.
 [LuxActorCritic](../src/rl2/model/lux.py) processes each team's visible observation.
 The diagram shows `step` with batch size `B` and `U` own-ship slots;
 `__call__` adds a time axis after `B` and scans the team and ship LSTMs over that axis.
-`D` is `model.heads * model.head_dim`; `C` is `model.channels`; `Hs` is the ship LSTM width; `A` is commands per ship (230).
+`D` is `model.heads * model.head_dim`; `C` is `model.channels`; `Hs = D` is the ship LSTM width; `A` is commands per ship (230).
 
-The default model has 2,126,168 parameters: CNN width 64, attention width 128
-(four 32-wide heads with per-head RMSNorm on queries/keys, 512-wide self-attention FFNs),
+The default model has 5,297,624 parameters: CNN width 64, attention width 256
+(eight 32-wide heads with per-head RMSNorm on queries/keys, 1024-wide self-attention FFNs),
 two blocks of ship LSTM → map cross-attention → self-attention,
-128-wide single-layer ship LSTMs, a single-layer team LSTM of width 256, and 192-wide
+256-wide single-layer ship LSTMs, a single-layer team LSTM of width 256, and 192-wide
 team embeddings and policy/value hidden layers.
 
 ```mermaid
@@ -161,12 +161,12 @@ flowchart TB
     end
 
     subgraph outputs[Policy and value]
-        head["Shared per-ship head<br/>ship i features + ship i memory + team memory"]
+        head["Shared per-ship head<br/>ship i features + team memory"]
         choices["Type logits: 3<br/>movement logits: 4"]
         targets["Sap target keys<br/>project spatial features; gather at ship + offsets<br/>add offset MLP embedding"]
         sap["Sap logits<br/>ship query · target key / √C"]
         policy["Masked hierarchical policy<br/>logits: B × U × A · commands: B × U"]
-        critic["Team value head<br/>team embedding + team memory + pooled ship memory<br/>value: B"]
+        critic["Team value head<br/>team embedding + team memory<br/>value: B"]
     end
     legal["Legal-action masks"]
 
@@ -205,8 +205,6 @@ flowchart TB
     embedding --> lstm
     carry --> lstm
     lstm --> next
-    ship_second -->|ship i memory| head
-    ship_second -->|masked mean of memory| critic
     ships --> head
     lstm -->|broadcast memory| head
     head --> choices
@@ -286,7 +284,7 @@ not model parameter shapes. Rendering scales the board to fit its panel.
 - Each own-ship token retains its input row through two recurrent stages:
   one before map cross-attention and one between the self-attention blocks.
   Each LSTM output is projected and added to its own-ship token. The final
-  tokens, second-stage ship memory, and team memory feed the command heads.
+  tokens and team memory feed the command heads.
   Sap scores use target-map features plus an offset MLP: normalized
   `[dx, dy, |dx|, |dy|]` → Dense(C) → SiLU → Dense(C). Ship permutations
   include their recurrent state; opponent/relic permutations leave commands unchanged.
@@ -295,8 +293,8 @@ not model parameter shapes. Rendering scales the board to fit its panel.
 - `model.channels` controls CNN width and requires positive even channels;
   attention width is `model.heads * model.head_dim`.
   `model.embedding_size` controls team and head widths;
-  `model.recurrent` configures team memory; `model.ship_recurrent` configures
-  hidden size for each ship stage. Team and ship memory each use a single
+  `model.recurrent` configures team memory; ship memory uses the attention
+  width in each block. Team and ship memory each use a single
   LSTM without stack normalization, residual layers, or intermediate MLPs.
   `model.attention_implementation` defaults to `triton`: both attention paths
   call Tokamax's Triton kernel.

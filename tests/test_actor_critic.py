@@ -23,7 +23,7 @@ class SequenceOnly(BaseActorCritic[jax.Array, None, CategoricalPolicy]):
         model_carry: None,
         episode_start: jax.Array,  # (B, T)
         actions_mask: jax.Array,  # (B, T, A)
-    ) -> ActorCriticOutput[None, CategoricalPolicy]:
+    ) -> tuple[ActorCriticOutput[CategoricalPolicy], None]:
         raise NotImplementedError("Only abstract method completeness is exercised")
 
 
@@ -34,7 +34,7 @@ class StepOnly(BaseActorCritic[jax.Array, None, CategoricalPolicy]):
         model_carry: None,
         episode_start: jax.Array,  # (B,)
         actions_mask: jax.Array,  # (B, A)
-    ) -> ActorCriticOutput[None, CategoricalPolicy]:
+    ) -> tuple[ActorCriticOutput[CategoricalPolicy], None]:
         raise NotImplementedError("Only abstract method completeness is exercised")
 
 
@@ -73,8 +73,16 @@ def test_incomplete_actor_critics_cannot_be_instantiated(
 )
 def test_mappo_variants_implement_actor_critic_interface(model: GenericActorCritic | LuxActorCritic) -> None:
     assert isinstance(model, BaseActorCritic)
-    carry = model.initial_carry(2)  # leaves: (B=2, H=128), available without parameter initialization
-    assert all(leaf.shape == (2, 128) for leaf in jax.tree.leaves(carry))
+    carry = model.initial_carry(2)  # leaves: (B=2, ...), available without parameter initialization
+    if isinstance(model, LuxActorCritic):
+        assert all(leaf.shape == (2, model.model.recurrent.hidden_size) for leaf in carry.team)
+        assert len(carry.ships) == model.model.num_blocks
+        assert all(
+            leaf.shape == (2, 1, model.model.heads * model.model.head_dim) for leaf in jax.tree.leaves(carry.ships)
+        )
+        assert carry.ship_alive.shape == (2, 1) and carry.match_start.shape == (2,)
+    else:
+        assert all(leaf.shape == (2, model.model.recurrent.hidden_size) for leaf in jax.tree.leaves(carry))
 
 
 @pytest.mark.parametrize(

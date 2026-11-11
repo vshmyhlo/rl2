@@ -70,16 +70,15 @@ def counting_policy(
     actions_mask: jax.Array,  # (B, A)
     *,
     method: str,
-) -> ppo.ActorCriticOutput:
+) -> tuple[ppo.ActorCriticOutput, ppo.RecurrentCarry]:
     carry = jax.tree.map(
         lambda leaf: jnp.where(starts[:, None], 0, leaf) + variables["params"]["increment"], memory
     )  # leaves: (B, H)
     logits = jnp.where(jnp.arange(7) == carry[0][0], 0.0, -jnp.inf)  # (B, A=7)
     return ppo.ActorCriticOutput(
-        carry=carry,
         policy=ppo.CategoricalPolicy(logits=logits),
         value=jnp.zeros(starts.shape),  # (B,)
-    )
+    ), carry
 
 
 def test_pool_protects_initial_and_active_snapshots_and_resizes() -> None:
@@ -267,7 +266,8 @@ def test_lux_pool_preserves_structured_observations_and_match_memory(config: ppo
             embedding_size=4,
             channels=4,
             recurrent=config.model.recurrent,
-            ship_recurrent=ppo.LSTMConfig(hidden_size=4),
+            heads=2,
+            head_dim=2,
             attention_implementation="xla",
         ),
         num_envs=1,
@@ -304,7 +304,7 @@ def test_lux_pool_preserves_structured_observations_and_match_memory(config: ppo
     assert batch.observation.self.units.position.dtype == jnp.int16
     np.testing.assert_array_equal(batch.episode_start, [[True, False, False, False]])
     chex.assert_trees_all_equal(advanced.selfplay, runner.selfplay)
-    replay = model.apply(
+    replay, _ = model.apply(
         {"params": params}, batch.observation, batch.model_carry, batch.episode_start, batch.actions_mask
     )
     np.testing.assert_allclose(replay.policy.log_prob(batch.action), batch.old_log_prob, atol=1e-5)

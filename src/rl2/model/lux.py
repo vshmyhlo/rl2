@@ -10,14 +10,14 @@ from rl2.actions import HierarchicalMultiCategoricalPolicy, HierarchicalMultiDis
 from rl2.envs.lux_env import LuxObservation
 from rl2.lstm import LSTM, LSTMCarry
 from rl2.model.actor_critic import ActorCriticOutput, BaseActorCritic
-from rl2.model.config import LSTMConfig, LuxModelConfig
+from rl2.model.config import LuxModelConfig
 from rl2.model.encoders.conv2d import ResidualBlock
 
 # Shape dimensions: B = local batch size (possibly flattened); T = time; *S = leading batch axes.
 # U/V = own/opponent ship slots; N = U+V; R = relic slots; E = N+R+1 entity tokens.
 # H/W = map height/width; P = downsampled map tokens; C = spatial CNN channels.
 # Q/K = attention query/key counts; Nh = heads; Dh = head_dim; D = Nh*Dh token width.
-# F = embedding size; Ht/Hs = team/ship LSTM hidden sizes.
+# F = embedding size; Ht/Hs = team/ship LSTM hidden sizes; Hs = D in attention blocks.
 # A = action logits per ship; As = sap targets, A = 7+As.
 # M/Cv = rasterized entity count/value channels.
 
@@ -59,7 +59,7 @@ def _global_context(observation: LuxObservation[jax.Array]) -> jax.Array:  # lea
 class _Attention(nn.Module):
     """Noncausal attention; Triton pads narrow heads for tensor cores."""
 
-    implementation: Literal["triton", "xla"]
+    attention_implementation: Literal["triton", "xla"]
     heads: int = 8
     head_dim: int = 32
     dtype: jax.typing.DTypeLike | None = None
@@ -67,12 +67,12 @@ class _Attention(nn.Module):
     @nn.compact
     def __call__(
         self,
-        x: jax.Array,  # (B, Q, D)
-        context: jax.Array,  # (B, K, D)
-        mask: jax.Array | None = None,  # (B, 1, 1, K) bool; at least one valid key per example
+        tokens: jax.Array,  # (B, Q, Dx), Dx is the input width
+        context: jax.Array,  # (B, K, Dc), Dc is the context width
+        key_mask: jax.Array | None = None,  # (B, 1, 1, K) bool; at least one valid key per example
     ) -> jax.Array:  # (B, Q, D)
         query = nn.DenseGeneral(features=(self.heads, self.head_dim), dtype=self.dtype, name="query")(
-            x
+            tokens
         )  # (B, Q, Nh, Dh)
         key = nn.DenseGeneral(features=(self.heads, self.head_dim), dtype=self.dtype, name="key")(
             context
@@ -88,15 +88,23 @@ class _Attention(nn.Module):
                 lambda x: jnp.pad(x, ((0, 0), (0, 0), (0, 0), (0, 16 - self.head_dim))), (query, key, value)
             )  # (B, Q/K, Nh, 16)
         attended = tokamax.dot_product_attention(
-            query, key, value, mask=mask, is_causal=False, scale=self.head_dim**-0.5, implementation=self.implementation
+            query,
+            key,
+            value,
+            mask=key_mask,
+            is_causal=False,
+            scale=self.head_dim**-0.5,
+            implementation=self.attention_implementation,
         )[..., : self.head_dim]  # (B, Q, Nh, Dh)
-        return nn.DenseGeneral(features=x.shape[-1], axis=(-2, -1), dtype=self.dtype, name="out")(attended)  # (B, Q, D)
+        return nn.DenseGeneral(features=self.heads * self.head_dim, axis=(-2, -1), dtype=self.dtype, name="out")(
+            attended
+        )  # (B, Q, D)
 
 
 class _SetAttentionBlock(nn.Module):
     """Bidirectional entity attention without slot embeddings or causal masks."""
 
-    implementation: Literal["triton", "xla"]
+    attention_implementation: Literal["triton", "xla"]
     heads: int = 8
     head_dim: int = 32
     dtype: jax.typing.DTypeLike | None = None
@@ -105,17 +113,17 @@ class _SetAttentionBlock(nn.Module):
     def __call__(
         self,
         tokens: jax.Array,  # (B, E, D), E includes an always-valid global token
-        valid: jax.Array,  # (B, E) bool
+        token_mask: jax.Array,  # (B, E) bool
     ) -> jax.Array:  # (B, E, D)
         normalized = nn.LayerNorm(dtype=self.dtype, name="attention_norm")(tokens)  # (B, E, D)
         attended = _Attention(
+            attention_implementation=self.attention_implementation,
             heads=self.heads,
             head_dim=self.head_dim,
-            implementation=self.implementation,
             dtype=self.dtype,
             name="attention",
         )(
-            normalized, normalized, valid[:, None, None, :]
+            normalized, normalized, token_mask[:, None, None, :]
         )  # (B, E, D); masking keys excludes padded entities in both directions
         tokens = tokens + attended  # (B, E, D)
         hidden = nn.LayerNorm(dtype=self.dtype, name="ffn_norm")(tokens)  # (B, E, D)
@@ -123,7 +131,7 @@ class _SetAttentionBlock(nn.Module):
             nn.Dense(features=4 * self.heads * self.head_dim, dtype=self.dtype, name="ffn_in")(hidden)
         )  # (B, E, 4D)
         hidden = nn.Dense(features=self.heads * self.head_dim, dtype=self.dtype, name="ffn_out")(hidden)  # (B, E, D)
-        return jnp.where(valid[..., None], tokens + hidden, 0)  # (B, E, D)
+        return jnp.where(token_mask[..., None], tokens + hidden, 0)  # (B, E, D)
 
 
 class LuxFeatures(NamedTuple):
@@ -146,7 +154,7 @@ class LuxCarry(NamedTuple):
 
 class _LuxTokens(NamedTuple):
     tokens: jax.Array  # (*S, E, D), own ships first and global token last
-    valid: jax.Array  # (*S, E) bool
+    token_mask: jax.Array  # (*S, E) bool
     map_tokens: jax.Array  # (*S, P, D)
     spatial: jax.Array  # (*S, H, W, C)
 
@@ -157,38 +165,26 @@ class _ShipLifecycle(NamedTuple):
     match_start: jax.Array  # (B, T) int32
 
 
-class _ShipMemoryOutput(NamedTuple):
-    carry: LSTMCarry  # cell/hidden leaves: (B, U, Hs)
-    tokens: jax.Array  # (B, T, U, D), current tokens plus recurrent features
-    memory: jax.Array  # (B, T, U, Hs), zero for inactive ships
-
-
-class _LuxEncoding(NamedTuple):
-    features: LuxFeatures  # leaves: (B, T, ...)
-    carry: LuxCarry  # leaves: (B, ...); team carry is unchanged
-    ship_memory: jax.Array  # (B, T, U, Hs), last block output
-
-
 class _ShipMemory(nn.Module):
     """Shared single-layer ship LSTM with a residual projection back to token width."""
 
-    config: LSTMConfig
+    features: int
     dtype: jax.typing.DTypeLike | None = None
 
     @nn.nowrap
     def _make_recurrent(self, *, parent: nn.Module | None = None) -> LSTM:
         return LSTM(
-            features=self.config.hidden_size,
+            features=self.features,
             dtype=self.dtype,
             name="lstm",
             parent=parent,
         )
 
     @nn.nowrap
-    def initial_carry(self, actor_count: int, unit_count: int) -> LSTMCarry:
+    def initial_carry(self, actor_count: int, own_ship_count: int) -> LSTMCarry:
         """Return (B, U, Hs) float32 zero cell/hidden states."""
-        carry = self._make_recurrent().initial_carry(actor_count * unit_count)  # leaves: (B*U, Hs)
-        return jax.tree.map(lambda leaf: leaf.reshape((actor_count, unit_count, -1)), carry)  # leaves: (B, U, Hs)
+        carry = self._make_recurrent().initial_carry(actor_count * own_ship_count)  # leaves: (B*U, Hs)
+        return jax.tree.map(lambda leaf: leaf.reshape((actor_count, own_ship_count, -1)), carry)  # leaves: (B, U, Hs)
 
     @nn.compact
     def __call__(
@@ -196,39 +192,30 @@ class _ShipMemory(nn.Module):
         tokens: jax.Array,  # (B, T, U, D)
         carry: LSTMCarry,  # cell/hidden leaves: (B, U, Hs)
         lifecycle: _ShipLifecycle,  # alive/reset: (B, T, U); match_start: (B, T)
-    ) -> _ShipMemoryOutput:
-        batch_size, time_steps, unit_count, token_size = tokens.shape
-        inputs = nn.Dense(features=self.config.hidden_size, dtype=self.dtype, name="input")(
-            nn.relu(tokens)
-        )  # (B, T, U, Hs)
-        inputs = jnp.swapaxes(inputs, 0, 1).reshape((time_steps, batch_size * unit_count, -1))  # (T, B*U, Hs)
-        reset = jnp.swapaxes(lifecycle.reset, 0, 1).reshape((time_steps, batch_size * unit_count))  # (T, B*U)
-        carry = jax.tree.map(lambda leaf: leaf.reshape((batch_size * unit_count, -1)), carry)  # leaves: (B*U, Hs)
+    ) -> tuple[jax.Array, LSTMCarry]:  # tokens: (B, T, U, D); carry leaves: (B, U, Hs)
+        batch_size, time_steps, own_ship_count, token_size = tokens.shape
+        inputs = nn.Dense(features=self.features, dtype=self.dtype, name="input")(nn.relu(tokens))  # (B, T, U, Hs)
+        inputs = jnp.swapaxes(inputs, 0, 1).reshape((time_steps, batch_size * own_ship_count, -1))  # (T, B*U, Hs)
+        reset = jnp.swapaxes(lifecycle.reset, 0, 1).reshape((time_steps, batch_size * own_ship_count))  # (T, B*U)
+        carry = jax.tree.map(lambda leaf: leaf.reshape((batch_size * own_ship_count, -1)), carry)  # leaves: (B*U, Hs)
         carry, outputs = self._make_recurrent(parent=self)(
             inputs, carry, reset
         )  # carry leaves: (B*U, Hs); outputs: (T, B*U, Hs)
         carry = jax.tree.map(
-            lambda leaf: jnp.where(lifecycle.alive[:, -1, :, None], leaf.reshape((batch_size, unit_count, -1)), 0),
+            lambda leaf: jnp.where(lifecycle.alive[:, -1, :, None], leaf.reshape((batch_size, own_ship_count, -1)), 0),
             carry,
         )  # leaves: (B, U, Hs)
-        memory = jnp.swapaxes(outputs.reshape((time_steps, batch_size, unit_count, -1)), 0, 1)  # (B, T, U, Hs)
+        memory = jnp.swapaxes(outputs.reshape((time_steps, batch_size, own_ship_count, -1)), 0, 1)  # (B, T, U, Hs)
         memory = jnp.where(lifecycle.alive[..., None], memory, 0)  # (B, T, U, Hs)
         projected = nn.Dense(features=token_size, use_bias=False, dtype=self.dtype, name="output")(
             memory
         )  # (B, T, U, D)
-        return _ShipMemoryOutput(carry=carry, tokens=tokens + projected, memory=memory)
-
-
-class _LuxBlockOutput(NamedTuple):
-    encoded: _LuxTokens  # leaves: (B, T, ...)
-    carry: LSTMCarry  # cell/hidden: (B, U, Hs)
-    memory: jax.Array  # (B, T, U, Hs), zero for inactive ships
+        return tokens + projected, carry  # (B, T, U, D); leaves: (B, U, Hs)
 
 
 class LuxAttentionBlock(nn.Module):
     """Ship recurrence, map retrieval, then bidirectional entity mixing."""
 
-    recurrent: LSTMConfig
     attention_implementation: Literal["triton", "xla"]
     heads: int = 8
     head_dim: int = 32
@@ -236,52 +223,53 @@ class LuxAttentionBlock(nn.Module):
 
     @nn.nowrap
     def _make_ship_memory(self, *, parent: nn.Module | None = None) -> _ShipMemory:
-        return _ShipMemory(config=self.recurrent, dtype=self.dtype, name="ship_memory", parent=parent)
+        return _ShipMemory(features=self.heads * self.head_dim, dtype=self.dtype, name="ship_memory", parent=parent)
 
     @nn.nowrap
-    def initial_carry(self, actor_count: int, unit_count: int) -> LSTMCarry:
+    def initial_carry(self, actor_count: int, own_ship_count: int) -> LSTMCarry:
         """Return (B, U, Hs) cell/hidden states from this block's ship memory."""
-        return self._make_ship_memory().initial_carry(actor_count, unit_count)  # leaves: (B, U, Hs)
+        return self._make_ship_memory().initial_carry(actor_count, own_ship_count)  # leaves: (B, U, Hs)
 
     def setup(self) -> None:
         self.ship_memory = self._make_ship_memory(parent=self)
         self.input_norm = nn.LayerNorm(dtype=self.dtype, name="input_norm")
         self.map_attention = _Attention(
+            attention_implementation=self.attention_implementation,
             heads=self.heads,
             head_dim=self.head_dim,
-            implementation=self.attention_implementation,
             dtype=self.dtype,
             name="map_attention",
         )
         self.set_attention = _SetAttentionBlock(
+            attention_implementation=self.attention_implementation,
             heads=self.heads,
             head_dim=self.head_dim,
-            implementation=self.attention_implementation,
             dtype=self.dtype,
             name="set_attention",
         )
 
     def __call__(
         self,
-        encoded: _LuxTokens,  # leaves: (B, T, ...)
+        tokens: jax.Array,  # (B, T, E, D)
         carry: LSTMCarry,  # cell/hidden leaves: (B, U, Hs)
         lifecycle: _ShipLifecycle,  # alive/reset: (B, T, U); match_start: (B, T)
-    ) -> _LuxBlockOutput:
-        unit_count = lifecycle.alive.shape[-1]
-        recurrent = self.ship_memory(encoded.tokens[..., :unit_count, :], carry, lifecycle)
-        tokens = encoded.tokens.at[..., :unit_count, :].set(recurrent.tokens)  # (B, T, E, D)
+        token_mask: jax.Array,  # (B, T, E) bool
+        map_tokens: jax.Array,  # (B, T, P, D)
+    ) -> tuple[jax.Array, LSTMCarry]:  # tokens: (B, T, E, D); carry leaves: (B, U, Hs)
+        own_ship_count = lifecycle.alive.shape[-1]
+        ships, carry = self.ship_memory(
+            tokens[..., :own_ship_count, :], carry, lifecycle
+        )  # ships: (B, T, U, D); carry leaves: (B, U, Hs)
+        tokens = tokens.at[..., :own_ship_count, :].set(ships)  # (B, T, E, D)
+        token_shape = tokens.shape
         batch_size = prod(tokens.shape[:-2])
         tokens = tokens.reshape((batch_size, *tokens.shape[-2:]))  # (B*T, E, D)
-        maps = encoded.map_tokens.reshape((batch_size, *encoded.map_tokens.shape[-2:]))  # (B*T, P, D)
-        valid = encoded.valid.reshape((batch_size, encoded.valid.shape[-1]))  # (B*T, E)
-        attended = self.map_attention(self.input_norm(tokens), maps)  # (B*T, E, D)
-        tokens = jnp.where(valid[..., None], tokens + attended, 0)  # (B*T, E, D)
-        tokens = self.set_attention(tokens, valid).reshape(encoded.tokens.shape)  # (B, T, E, D)
-        return _LuxBlockOutput(
-            encoded=encoded._replace(tokens=tokens),
-            carry=recurrent.carry,  # leaves: (B, U, Hs)
-            memory=recurrent.memory,  # (B, T, U, Hs)
-        )
+        map_tokens = map_tokens.reshape((batch_size, *map_tokens.shape[-2:]))  # (B*T, P, D)
+        token_mask = token_mask.reshape((batch_size, token_mask.shape[-1]))  # (B*T, E)
+        attended = self.map_attention(self.input_norm(tokens), map_tokens)  # (B*T, E, D)
+        tokens = jnp.where(token_mask[..., None], tokens + attended, 0)  # (B*T, E, D)
+        tokens = self.set_attention(tokens, token_mask).reshape(token_shape)  # (B, T, E, D)
+        return tokens, carry  # (B, T, E, D); leaves: (B, U, Hs)
 
 
 class LuxMapEncoder(nn.Module):
@@ -309,35 +297,37 @@ class LuxMapEncoder(nn.Module):
 
     def __call__(
         self,
-        obs: LuxObservation[jax.Array],  # leaves: (B, ...)
+        observation: LuxObservation[jax.Array],  # leaves: (B, ...)
         positions: jax.Array,  # (B, N, 2), masked positions replaced with zero
         energy: jax.Array,  # (B, N), normalized and zero for masked ships
-        unit_mask: jax.Array,  # (B, N), own ships followed by opponents
+        ship_mask: jax.Array,  # (B, N), own ships followed by opponents
     ) -> tuple[jax.Array, jax.Array]:  # spatial: (B, H, W, C); map tokens: (B, P, D)
-        visible = obs.world.sensor_mask  # (B, H, W)
-        batch_size, height, width = visible.shape
-        unit_count = obs.self.units_mask.shape[-1]
+        sensor_mask = observation.world.sensor_mask  # (B, H, W)
+        batch_size, height, width = sensor_mask.shape
+        own_ship_count = observation.self.units_mask.shape[-1]
         token_size = self.token_size
         ship_values = jnp.stack((jnp.ones_like(energy), energy), axis=-1)  # (B, N, 2), count/total energy
         own_grid = _rasterize(
-            positions[:, :unit_count], unit_mask[:, :unit_count], ship_values[:, :unit_count], height, width
+            positions[:, :own_ship_count], ship_mask[:, :own_ship_count], ship_values[:, :own_ship_count], height, width
         )  # (B, H, W, 2)
         opponent_grid = _rasterize(
-            positions[:, unit_count:], unit_mask[:, unit_count:], ship_values[:, unit_count:], height, width
+            positions[:, own_ship_count:], ship_mask[:, own_ship_count:], ship_values[:, own_ship_count:], height, width
         )  # (B, H, W, 2)
         relic_grid = _rasterize(
-            obs.world.relic_nodes,
-            obs.world.relic_nodes_mask,
-            jnp.ones((*obs.world.relic_nodes_mask.shape, 1), dtype=jnp.float32),
+            observation.world.relic_nodes,
+            observation.world.relic_nodes_mask,
+            jnp.ones((*observation.world.relic_nodes_mask.shape, 1), dtype=jnp.float32),
             height=height,
             width=width,
         )  # (B, H, W, 1), visible relic centers only, never hidden scoring tiles
 
         tile_ids = jnp.where(
-            visible, obs.world.map_features.tile_type + 1, 0
+            sensor_mask, observation.world.map_features.tile_type + 1, 0
         )  # (B, H, W), unknown/empty/nebula/asteroid
         tile_embedding = self.tile_embedding(tile_ids)  # (B, H, W, 4)
-        tile_energy = jnp.where(visible, obs.world.map_features.energy, 0).astype(jnp.float32) / 20.0  # (B, H, W)
+        tile_energy = (
+            jnp.where(sensor_mask, observation.world.map_features.energy, 0).astype(jnp.float32) / 20.0
+        )  # (B, H, W)
         coordinates = jnp.stack(
             jnp.meshgrid(jnp.linspace(-1, 1, width), jnp.linspace(-1, 1, height), indexing="xy"), axis=-1
         )  # (H, W, 2), x/y coordinates preserve map orientation
@@ -347,7 +337,7 @@ class LuxMapEncoder(nn.Module):
                 (
                     tile_embedding,
                     tile_energy[..., None],
-                    visible[..., None],
+                    sensor_mask[..., None],
                     coordinates,
                     own_grid,
                     opponent_grid,
@@ -360,13 +350,13 @@ class LuxMapEncoder(nn.Module):
         grid = self.map_stem(grid)  # (B, H, W, C)
         grid = nn.silu(self.map_norm(grid))  # (B, H, W, C)
         grid = self.map_local(grid)  # (B, H, W, C)
-        spatial_features = grid  # (B, H, W, C), retained for command target scoring
+        spatial = grid  # (B, H, W, C), retained for command target scoring
         for index in range(2):
             grid = self.map_downsample[index](grid)  # (B, ceil(H/2**(index+1)), ceil(W/2**(index+1)), D)
             grid = nn.silu(self.map_downsample_norm[index](grid))  # (B, ceil(H/2**(index+1)), ceil(W/2**(index+1)), D)
         map_tokens = grid.reshape((batch_size, -1, token_size))  # (B, P, D), P=36 for a 24x24 map
 
-        return spatial_features, map_tokens  # (B, H, W, C); (B, P, D)
+        return spatial, map_tokens  # (B, H, W, C); (B, P, D)
 
 
 class LuxEncoder(nn.Module):
@@ -401,24 +391,28 @@ class LuxEncoder(nn.Module):
 
     def _encode_entities(
         self,
-        obs: LuxObservation[jax.Array],  # leaves: (B, ...)
+        observation: LuxObservation[jax.Array],  # leaves: (B, ...)
         positions: jax.Array,  # (B, N, 2), masked positions replaced with zero
         energy: jax.Array,  # (B, N), normalized and zero for masked ships
-        spatial_features: jax.Array,  # (B, H, W, C)
+        spatial: jax.Array,  # (B, H, W, C)
     ) -> tuple[jax.Array, jax.Array]:  # ships: (B, N, D); relics: (B, R, D)
-        batch_size, height, width, _ = spatial_features.shape
-        unit_count = obs.self.units_mask.shape[-1]
-        opponent_count = obs.opponent.units_mask.shape[-1]
-        local = spatial_features[jnp.arange(batch_size)[:, None], positions[..., 1], positions[..., 0]]  # (B, N, C)
-        unit_coordinates = positions.astype(jnp.float32) / jnp.array([width - 1, height - 1]) * 2 - 1  # (B, N, 2)
-        unit_features = jnp.concatenate((unit_coordinates, energy[..., None], local), axis=-1)  # (B, N, C+3)
-        units = self.ship_projection(unit_features)  # (B, N, D)
-        roles = jnp.concatenate((jnp.zeros(unit_count, jnp.int32), jnp.ones(opponent_count, jnp.int32)))  # (N,)
+        batch_size, height, width, _ = spatial.shape
+        own_ship_count = observation.self.units_mask.shape[-1]
+        opponent_ship_count = observation.opponent.units_mask.shape[-1]
+        local = spatial[jnp.arange(batch_size)[:, None], positions[..., 1], positions[..., 0]]  # (B, N, C)
+        ship_coordinates = positions.astype(jnp.float32) / jnp.array([width - 1, height - 1]) * 2 - 1  # (B, N, 2)
+        ship_features = jnp.concatenate((ship_coordinates, energy[..., None], local), axis=-1)  # (B, N, C+3)
+        ships = self.ship_projection(ship_features)  # (B, N, D)
+        roles = jnp.concatenate(
+            (jnp.zeros(own_ship_count, jnp.int32), jnp.ones(opponent_ship_count, jnp.int32))
+        )  # (N,)
         role_embedding = self.entity_type_embedding(roles)  # (N, D)
-        units = nn.silu(units + role_embedding)  # (B, N, D)
+        ships = nn.silu(ships + role_embedding)  # (B, N, D)
 
-        relic_positions = jnp.where(obs.world.relic_nodes_mask[..., None], obs.world.relic_nodes, 0)  # (B, R, 2)
-        relic_local = spatial_features[
+        relic_positions = jnp.where(
+            observation.world.relic_nodes_mask[..., None], observation.world.relic_nodes, 0
+        )  # (B, R, 2)
+        relic_local = spatial[
             jnp.arange(batch_size)[:, None], relic_positions[..., 1], relic_positions[..., 0]
         ]  # (B, R, C)
         relic_coordinates = (
@@ -429,47 +423,49 @@ class LuxEncoder(nn.Module):
             self.relic_projection(relic_features) + self.entity_type_embedding(jnp.asarray(2))
         )  # (B, R, D)
 
-        return units, relics  # (B, N, D); (B, R, D)
+        return ships, relics  # (B, N, D); (B, R, D)
 
     def prepare(self, observation: LuxObservation[jax.Array]) -> _LuxTokens:  # leaves: (*S, ...)
         batch_shape = observation.public_params.shape[:-1]
         batch_size = prod(batch_shape)
-        obs = jax.tree.map(lambda leaf: leaf.reshape((batch_size, *leaf.shape[len(batch_shape) :])), observation)
-        # obs leaves: (B, ...), B = prod(S), including unbatched B=1
-        visible = obs.world.sensor_mask  # (B, H, W)
-        height, width = visible.shape[-2:]
+        observation = jax.tree.map(
+            lambda leaf: leaf.reshape((batch_size, *leaf.shape[len(batch_shape) :])), observation
+        )
+        # observation leaves: (B, ...), B = prod(S), including unbatched B=1
+        sensor_mask = observation.world.sensor_mask  # (B, H, W)
+        height, width = sensor_mask.shape[-2:]
         token_size = self.token_size
-        positions, energy, unit_mask = jax.tree.map(
+        positions, energy, ship_mask = jax.tree.map(
             lambda own, opponent: jnp.concatenate((own, opponent), axis=1),
-            (obs.self.units.position, obs.self.units.energy, obs.self.units_mask),
-            (obs.opponent.units.position, obs.opponent.units.energy, obs.opponent.units_mask),
+            (observation.self.units.position, observation.self.units.energy, observation.self.units_mask),
+            (observation.opponent.units.position, observation.opponent.units.energy, observation.opponent.units_mask),
         )  # (B, N, 2); (B, N); (B, N)
-        positions = jnp.where(unit_mask[..., None], positions, 0)  # (B, N, 2)
-        energy = jnp.where(unit_mask, energy, 0).astype(jnp.float32) / 400.0  # (B, N)
-        spatial_features, map_tokens = self.map_encoder(obs, positions, energy, unit_mask)  # (B, H, W, C); (B, P, D)
-        units, relics = self._encode_entities(obs, positions, energy, spatial_features)  # (B, N, D); (B, R, D)
-        context = _global_context(obs)  # (B, 14)
+        positions = jnp.where(ship_mask[..., None], positions, 0)  # (B, N, 2)
+        energy = jnp.where(ship_mask, energy, 0).astype(jnp.float32) / 400.0  # (B, N)
+        spatial, map_tokens = self.map_encoder(observation, positions, energy, ship_mask)  # (B, H, W, C); (B, P, D)
+        ships, relics = self._encode_entities(observation, positions, energy, spatial)  # (B, N, D); (B, R, D)
+        context = _global_context(observation)  # (B, 14)
         context = nn.silu(self.context_projection(context))  # (B, D)
-        tokens = jnp.concatenate((units, relics, context[:, None]), axis=1)  # (B, E, D)
-        valid = jnp.concatenate(
-            (unit_mask, obs.world.relic_nodes_mask, jnp.ones((batch_size, 1), bool)), axis=1
+        tokens = jnp.concatenate((ships, relics, context[:, None]), axis=1)  # (B, E, D)
+        token_mask = jnp.concatenate(
+            (ship_mask, observation.world.relic_nodes_mask, jnp.ones((batch_size, 1), bool)), axis=1
         )  # (B, E)
-        tokens = jnp.where(valid[..., None], tokens, 0)  # (B, E, D)
+        tokens = jnp.where(token_mask[..., None], tokens, 0)  # (B, E, D)
         return _LuxTokens(
             tokens=tokens.reshape((*batch_shape, tokens.shape[1], token_size)),  # (*S, E, D)
-            valid=valid.reshape((*batch_shape, valid.shape[1])),  # (*S, E)
+            token_mask=token_mask.reshape((*batch_shape, token_mask.shape[1])),  # (*S, E)
             map_tokens=map_tokens.reshape((*batch_shape, map_tokens.shape[1], token_size)),  # (*S, P, D)
-            spatial=spatial_features.reshape((*batch_shape, height, width, self.channels)),  # (*S, H, W, C)
+            spatial=spatial.reshape((*batch_shape, height, width, self.channels)),  # (*S, H, W, C)
         )
 
     def summarize(self, encoded: _LuxTokens, observation: LuxObservation[jax.Array]) -> LuxFeatures:
         # encoded and observation leaves: (*S, ...)
-        unit_count = observation.self.units_mask.shape[-1]
-        ship_count = unit_count + observation.opponent.units_mask.shape[-1]
-        tokens = jnp.where(encoded.valid[..., None], self.entity_norm(encoded.tokens), 0)  # (*S, E, D)
-        own = tokens[..., :unit_count, :]  # (*S, U, D)
+        own_ship_count = observation.self.units_mask.shape[-1]
+        total_ship_count = own_ship_count + observation.opponent.units_mask.shape[-1]
+        tokens = jnp.where(encoded.token_mask[..., None], self.entity_norm(encoded.tokens), 0)  # (*S, E, D)
+        own = tokens[..., :own_ship_count, :]  # (*S, U, D)
         own_mean = own.sum(-2) / jnp.maximum(observation.self.units_mask.sum(-1, keepdims=True), 1)  # (*S, D)
-        opponents = tokens[..., unit_count:ship_count, :]  # (*S, V, D)
+        opponents = tokens[..., own_ship_count:total_ship_count, :]  # (*S, V, D)
         opponent_mean = opponents.sum(-2) / jnp.maximum(
             observation.opponent.units_mask.sum(-1, keepdims=True), 1
         )  # (*S, D)
@@ -487,11 +483,11 @@ class LuxEncoder(nn.Module):
 
 
 class LuxModel(nn.Module):
-    """Encode visible state; decode team and ship memory into commands and value."""
+    """Encode visible state; decode token features and team memory into commands and value."""
 
     embedding_size: int
-    channels: int
     token_size: int
+    channels: int
     action_space: HierarchicalMultiDiscreteSpace
     dtype: jax.typing.DTypeLike | None = None
 
@@ -532,13 +528,13 @@ class LuxModel(nn.Module):
     ) -> jax.Array:  # (*S, U, As)
         batch_shape = ships.shape[:-2]
         batch_size = prod(batch_shape)
-        unit_count = ships.shape[-2]
+        own_ship_count = ships.shape[-2]
         height, width = spatial.shape[-3:-1]
         # Match LuxEnv's x-major, y-minor relative target enumeration.
         axis = jnp.arange(-self.sap_range, self.sap_range + 1)  # (2*sap_range+1,)
         offsets = jnp.stack(jnp.meshgrid(axis, axis, indexing="ij"), axis=-1).reshape((-1, 2))  # (As, 2)
         positions = jnp.where(observation.self.units_mask[..., None], observation.self.units.position, 0)  # (*S, U, 2)
-        targets = positions.reshape((batch_size, unit_count, 1, 2)) + offsets  # (B, U, As, 2)
+        targets = positions.reshape((batch_size, own_ship_count, 1, 2)) + offsets  # (B, U, As, 2)
         targets = jnp.clip(targets, 0, jnp.array([width - 1, height - 1]))  # (B, U, As, 2); off-map commands are masked
         keys = self.sap_key(spatial).reshape((batch_size, height, width, self.channels))  # (B, H, W, C)
         keys = keys[jnp.arange(batch_size)[:, None, None], targets[..., 1], targets[..., 0]]  # (B, U, As, C)
@@ -546,28 +542,27 @@ class LuxModel(nn.Module):
         offset_features = jnp.concatenate((normalized_offsets, jnp.abs(normalized_offsets)), axis=-1)  # (As, 4)
         relative = self.sap_offset(nn.silu(self.sap_offset_hidden(offset_features)))  # (As, C)
         keys = keys + relative  # (B, U, As, C)
-        queries = self.sap_query(ships).reshape((batch_size, unit_count, self.channels))  # (B, U, C)
+        queries = self.sap_query(ships).reshape((batch_size, own_ship_count, self.channels))  # (B, U, C)
         # Keep close target scores distinct instead of rounding the dot product to bf16.
         sap = jnp.einsum("bukc,buc->buk", keys, queries, preferred_element_type=jnp.float32) / sqrt(
             self.channels
         )  # (B, U, As)
-        sap = sap.reshape((*batch_shape, unit_count, offsets.shape[0]))  # (*S, U, As)
+        sap = sap.reshape((*batch_shape, own_ship_count, offsets.shape[0]))  # (*S, U, As)
         return sap  # (*S, U, As)
 
     def heads(
         self,
         memory: jax.Array,  # (*S, Ht)
-        ship_memory: jax.Array,  # (*S, U, Hs), zero for inactive ships
         features: LuxFeatures,  # global: (*S, F); ships: (*S, U, D); spatial: (*S, H, W, C)
         observation: LuxObservation[jax.Array],  # leaves: (*S, ...)
         actions_mask: jax.Array,  # (*S, U, A)
     ) -> tuple[HierarchicalMultiCategoricalPolicy, jax.Array]:  # logits: (*S, U, A); value: (*S,)
         batch_shape = memory.shape[:-1]
-        unit_count = features.ships.shape[-2]
+        own_ship_count = features.ships.shape[-2]
         team_memory = jnp.broadcast_to(
-            memory[..., None, :], (*batch_shape, unit_count, memory.shape[-1])
+            memory[..., None, :], (*batch_shape, own_ship_count, memory.shape[-1])
         )  # (*S, U, Ht)
-        ships = jnp.concatenate((features.ships, ship_memory, team_memory), axis=-1)  # (*S, U, D+Hs+Ht)
+        ships = jnp.concatenate((features.ships, team_memory), axis=-1)  # (*S, U, D+Ht)
         ships = nn.silu(self.ship_norm(self.ship_hidden(ships)))  # (*S, U, F)
         types = self.type_output(ships).astype(jnp.float32)  # (*S, U, 3), stay/move/sap
         moves = self.move_output(ships).astype(jnp.float32)  # (*S, U, 4), north/east/south/west
@@ -577,9 +572,7 @@ class LuxModel(nn.Module):
         policy = HierarchicalMultiCategoricalPolicy(
             raw_logits=logits, actions_mask=actions_mask, group_sizes=self.action_space.group_sizes
         )
-        alive = observation.self.units_mask & (observation.self.units.energy >= 0)  # (*S, U)
-        pooled_memory = ship_memory.sum(-2) / jnp.maximum(alive.sum(-1, keepdims=True), 1)  # (*S, Hs)
-        context = jnp.concatenate((memory, features.global_, pooled_memory), axis=-1)  # (*S, Ht+F+Hs)
+        context = jnp.concatenate((memory, features.global_), axis=-1)  # (*S, Ht+F)
         critic = nn.silu(self.value_norm(self.value_hidden(context)))  # (*S, F)
         value = self.value_output(critic).squeeze(-1).astype(jnp.float32)  # (*S,)
         return policy, value
@@ -604,10 +597,9 @@ class LuxActorCritic(BaseActorCritic[LuxObservation[jax.Array], LuxCarry, Hierar
     @nn.nowrap
     def _make_block(self, index: int, *, parent: nn.Module | None = None) -> LuxAttentionBlock:
         return LuxAttentionBlock(
+            attention_implementation=self.model.attention_implementation,
             heads=self.model.heads,
             head_dim=self.model.head_dim,
-            recurrent=self.model.ship_recurrent,
-            attention_implementation=self.model.attention_implementation,
             dtype=self.dtype,
             name=f"block_{index}",
             parent=parent,
@@ -615,13 +607,14 @@ class LuxActorCritic(BaseActorCritic[LuxObservation[jax.Array], LuxCarry, Hierar
 
     @nn.nowrap
     def initial_carry(self, actor_count: int) -> LuxCarry:
-        unit_count = len(self.action_space.nvec)
+        own_ship_count = len(self.action_space.nvec)
         return LuxCarry(
             team=self._make_recurrent().initial_carry(actor_count),  # leaves: (B, Ht)
             ships=tuple(
-                self._make_block(index).initial_carry(actor_count, unit_count) for index in range(self.model.num_blocks)
+                self._make_block(index).initial_carry(actor_count, own_ship_count)
+                for index in range(self.model.num_blocks)
             ),  # per-block leaves: (B, U, Hs)
-            ship_alive=jnp.zeros((actor_count, unit_count), dtype=bool),  # (B, U)
+            ship_alive=jnp.zeros((actor_count, own_ship_count), dtype=bool),  # (B, U)
             match_start=jnp.full((actor_count,), -1, dtype=jnp.int32),  # (B,)
         )
 
@@ -652,7 +645,7 @@ class LuxActorCritic(BaseActorCritic[LuxObservation[jax.Array], LuxCarry, Hierar
             & (observation.world.match_steps[..., None] != 0)
         )  # (B, T, U)
         previous_alive = jnp.concatenate((carry.ship_alive[:, None], alive[:, :-1]), axis=1)  # (B, T, U)
-        previous_match = jnp.concatenate((carry.match_start[:, None], match_start[:, :-1]), axis=1)  # (B, T)
+        previous_match_start = jnp.concatenate((carry.match_start[:, None], match_start[:, :-1]), axis=1)  # (B, T)
         positions = observation.self.units.position  # (B, T, U, 2)
         corner = jnp.array(observation.world.sensor_mask.shape[-2:][::-1]) - 1  # (2,)
         at_spawn = (positions == 0).all(-1) | (positions == corner).all(-1)  # (B, T, U)
@@ -665,7 +658,7 @@ class LuxActorCritic(BaseActorCritic[LuxObservation[jax.Array], LuxCarry, Hierar
         )  # (B, T, U)
         reset = (
             episode_start[..., None]
-            | (match_start != previous_match)[..., None]
+            | (match_start != previous_match_start)[..., None]
             | ~alive
             | ~previous_alive
             | possible_spawn
@@ -677,24 +670,28 @@ class LuxActorCritic(BaseActorCritic[LuxObservation[jax.Array], LuxCarry, Hierar
         observation: LuxObservation[jax.Array],  # leaves: (B, T, ...)
         carry: LuxCarry,  # leaves: (B, ...)
         episode_start: jax.Array,  # (B, T)
-    ) -> _LuxEncoding:
+    ) -> tuple[LuxFeatures, LuxCarry]:  # features: (B, T, ...); carry: (B, ...)
         """Interleave temporal ship recurrence with within-observation attention."""
         lifecycle = self._ship_lifecycle(observation, carry, episode_start)
         encoded = self.lux.encoder.prepare(observation)  # leaves: (B, T, ...)
         ship_carries: list[LSTMCarry] = []  # per-block leaves: (B, U, Hs)
         for block, ship_carry in zip(self.blocks, carry.ships, strict=True):
-            result = block(encoded, ship_carry, lifecycle)
-            encoded = result.encoded  # leaves: (B, T, ...)
-            ship_carries.append(result.carry)
-        return _LuxEncoding(
-            features=self.lux.encoder.summarize(encoded, observation),  # leaves: (B, T, ...)
-            carry=carry._replace(
-                ships=tuple(ship_carries),  # (B, U, Hs)
-                ship_alive=lifecycle.alive[:, -1],  # (B, U)
-                match_start=lifecycle.match_start[:, -1],  # (B,)
-            ),
-            ship_memory=result.memory,  # (B, T, U, Hs)
+            tokens, ship_carry = block(
+                tokens=encoded.tokens,
+                carry=ship_carry,
+                lifecycle=lifecycle,
+                token_mask=encoded.token_mask,
+                map_tokens=encoded.map_tokens,
+            )  # tokens: (B, T, E, D); carry leaves: (B, U, Hs)
+            encoded = encoded._replace(tokens=tokens)  # leaves: (B, T, ...)
+            ship_carries.append(ship_carry)
+        features = self.lux.encoder.summarize(encoded, observation)  # leaves: (B, T, ...)
+        carry = carry._replace(
+            ships=tuple(ship_carries),  # (B, U, Hs)
+            ship_alive=lifecycle.alive[:, -1],  # (B, U)
+            match_start=lifecycle.match_start[:, -1],  # (B,)
         )
+        return features, carry  # leaves: (B, T, ...); (B, ...), team carry unchanged
 
     def __call__(
         self,
@@ -702,12 +699,10 @@ class LuxActorCritic(BaseActorCritic[LuxObservation[jax.Array], LuxCarry, Hierar
         model_carry: LuxCarry,  # team: (B, Ht); ships: (B, U, Hs); metadata: (B, ...)
         episode_start: jax.Array,  # (B, T)
         actions_mask: jax.Array,  # (B, T, U, A)
-    ) -> ActorCriticOutput[
-        LuxCarry, HierarchicalMultiCategoricalPolicy
-    ]:  # carry: (B, ...); logits: (B, T, U, A); value: (B, T)
+    ) -> tuple[ActorCriticOutput[HierarchicalMultiCategoricalPolicy], LuxCarry]:
+        # logits: (B, T, U, A); value: (B, T); carry: (B, ...)
         """Scan team and ship memory over time, resetting each ship at lifetime boundaries."""
-        encoded = self._encode(observation, model_carry, episode_start)
-        features = encoded.features  # leaves: (B, T, ...)
+        features, model_carry = self._encode(observation, model_carry, episode_start)  # (B, T, ...); (B, ...)
         x = jnp.asarray(self.recurrent_input(nn.relu(features.global_)), dtype=self.dtype)  # (B, T, Ht)
         recurrent_x, recurrent_starts = jax.tree.map(
             lambda leaf: jnp.swapaxes(leaf, 0, 1), (x, episode_start)
@@ -716,11 +711,9 @@ class LuxActorCritic(BaseActorCritic[LuxObservation[jax.Array], LuxCarry, Hierar
             recurrent_x, model_carry.team, recurrent_starts
         )  # team_carry leaves: (B, Ht); recurrent_x: (T, B, Ht)
         x = jnp.swapaxes(recurrent_x, 0, 1)  # (B, T, Ht)
-        model_carry = encoded.carry._replace(team=team_carry)  # leaves: (B, ...)
-        policy, value = self.lux.heads(
-            x, encoded.ship_memory, features, observation, actions_mask
-        )  # logits: (B, T, U, A); value: (B, T)
-        return ActorCriticOutput(carry=model_carry, policy=policy, value=value)
+        model_carry = model_carry._replace(team=team_carry)  # leaves: (B, ...)
+        policy, value = self.lux.heads(x, features, observation, actions_mask)  # logits: (B, T, U, A); value: (B, T)
+        return ActorCriticOutput(policy=policy, value=value), model_carry
 
     def step(
         self,
@@ -728,15 +721,14 @@ class LuxActorCritic(BaseActorCritic[LuxObservation[jax.Array], LuxCarry, Hierar
         model_carry: LuxCarry,  # team: (B, Ht); ships: (B, U, Hs); metadata: (B, ...)
         episode_start: jax.Array,  # (B,)
         actions_mask: jax.Array,  # (B, U, A)
-    ) -> ActorCriticOutput[
-        LuxCarry, HierarchicalMultiCategoricalPolicy
-    ]:  # carry: (B, ...); logits: (B, U, A); value: (B,)
+    ) -> tuple[ActorCriticOutput[HierarchicalMultiCategoricalPolicy], LuxCarry]:
+        # logits: (B, U, A); value: (B,); carry: (B, ...)
         """Process one observation, retaining team history and resetting expired ship memory."""
         sequence, starts, masks = jax.tree.map(
             lambda leaf: leaf[:, None], (observation, episode_start, actions_mask)
         )  # observation: (B, 1, ...); starts: (B, 1); masks: (B, 1, U, A)
-        output = self(sequence, model_carry, starts, masks)
+        output, model_carry = self(sequence, model_carry, starts, masks)
         policy, value = jax.tree.map(
             lambda leaf: leaf[:, 0], (output.policy, output.value)
         )  # logits: (B, U, A); value: (B,)
-        return ActorCriticOutput(carry=output.carry, policy=policy, value=value)
+        return ActorCriticOutput(policy=policy, value=value), model_carry

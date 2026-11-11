@@ -9,10 +9,9 @@ from flax import linen as nn
 from rl2.actions import Policy
 
 
-class ActorCriticOutput[CarryT, PolicyT: Policy](NamedTuple):
-    """Outgoing memory, action distribution, and one value per observation."""
+class ActorCriticOutput[PolicyT: Policy](NamedTuple):
+    """Action distribution and one value per observation."""
 
-    carry: CarryT  # model-specific pytree; array leaves retain batch axis B
     policy: PolicyT  # batch shape (B,) for step or (B, T) for sequences
     value: jax.Array  # (B,) for step or (B, T) for sequences
 
@@ -43,8 +42,8 @@ class BaseActorCritic[ObservationT, CarryT, PolicyT: Policy](nn.Module, ABC):
         model_carry: CarryT,  # model-specific memory with batch axis B
         episode_start: jax.Array,  # (B, T) bool
         actions_mask: jax.Array,  # (B, T, *C, A) bool
-    ) -> ActorCriticOutput[CarryT, PolicyT]:
-        """Return final carry, (B, T) policy batch, and (B, T) values."""
+    ) -> tuple[ActorCriticOutput[PolicyT], CarryT]:
+        """Return (output, carry): (B, T) policy/value batch and final memory."""
 
     @abstractmethod
     def step(
@@ -53,5 +52,5 @@ class BaseActorCritic[ObservationT, CarryT, PolicyT: Policy](nn.Module, ABC):
         model_carry: CarryT,  # model-specific memory with batch axis B
         episode_start: jax.Array,  # (B,) bool
         actions_mask: jax.Array,  # (B, *C, A) bool
-    ) -> ActorCriticOutput[CarryT, PolicyT]:
-        """Return updated carry, (B,) policy batch, and (B,) values."""
+    ) -> tuple[ActorCriticOutput[PolicyT], CarryT]:
+        """Return (output, carry): (B,) policy/value batch and updated memory."""

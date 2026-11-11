@@ -71,6 +71,19 @@ def test_shapes_batch_replay_and_bfloat16(
     actual = jax.jit(encoder.apply)(params, sequence)  # (B, T, F)
     assert actual.shape == (2, 2, 8) and actual.dtype == jnp.float32
     encoded = encoder.apply(params, sequence, method="prepare")
+    expected_mask = jnp.concatenate(
+        (
+            sequence.self.units_mask,
+            sequence.opponent.units_mask,
+            sequence.world.relic_nodes_mask,
+            jnp.ones((2, 2, 1), bool),
+        ),
+        axis=-1,
+    )  # (B, T, E)
+    assert encoded.tokens.shape == (*expected_mask.shape, 8)
+    assert encoded.token_mask.shape == expected_mask.shape
+    np.testing.assert_array_equal(encoded.token_mask, expected_mask)
+    np.testing.assert_array_equal(encoded.tokens[~encoded.token_mask], 0)
     assert encoded.spatial.shape == (2, 2, 12, 8, 4)
     assert encoded.map_tokens.shape == (2, 2, 6, 8)
     np.testing.assert_allclose(actual, jnp.broadcast_to(expected, actual.shape), atol=2e-6)

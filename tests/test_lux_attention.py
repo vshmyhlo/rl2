@@ -18,39 +18,39 @@ def tokens() -> jax.Array:  # (B=1, E=4, D=8)
 
 
 @pytest.fixture(scope="module")
-def valid() -> jax.Array:  # (B=1, E=4)
+def token_mask() -> jax.Array:  # (B=1, E=4)
     return jnp.array([[True, True, False, True]])  # (B, E), last token is global
 
 
 @pytest.fixture(scope="module")
 def block() -> _SetAttentionBlock:
-    return _SetAttentionBlock(heads=4, head_dim=2, implementation="xla", dtype=jnp.float32)
+    return _SetAttentionBlock(attention_implementation="xla", heads=4, head_dim=2, dtype=jnp.float32)
 
 
 @pytest.fixture(scope="module")
-def params(block: _SetAttentionBlock, tokens: jax.Array, valid: jax.Array) -> dict[str, Any]:
-    # tokens: (B, E, D); valid: (B, E)
-    return block.init(jax.random.key(3), tokens, valid)
+def params(block: _SetAttentionBlock, tokens: jax.Array, token_mask: jax.Array) -> dict[str, Any]:
+    # tokens: (B, E, D); token_mask: (B, E)
+    return block.init(jax.random.key(3), tokens=tokens, token_mask=token_mask)
 
 
 def test_bidirectional_mixing_masking_and_permutation(
-    block: _SetAttentionBlock, params: dict[str, Any], tokens: jax.Array, valid: jax.Array
+    block: _SetAttentionBlock, params: dict[str, Any], tokens: jax.Array, token_mask: jax.Array
 ) -> None:
-    # tokens: (B, E, D); valid: (B, E)
+    # tokens: (B, E, D); token_mask: (B, E)
     apply = jax.jit(block.apply)
-    expected = apply(params, tokens, valid)  # (B, E, D)
+    expected = apply(params, tokens, token_mask)  # (B, E, D)
     assert expected.shape == (1, 4, block.heads * block.head_dim)
     assert params["params"]["ffn_in"]["kernel"].shape == (8, 32)
     assert params["params"]["ffn_out"]["kernel"].shape == (32, 8)
-    later_changed = apply(params, tokens.at[:, 1].add(jnp.arange(8)), valid)  # (B, E, D)
-    earlier_changed = apply(params, tokens.at[:, 0].add(jnp.arange(8)), valid)  # (B, E, D)
+    later_changed = apply(params, tokens.at[:, 1].add(jnp.arange(8)), token_mask)  # (B, E, D)
+    earlier_changed = apply(params, tokens.at[:, 0].add(jnp.arange(8)), token_mask)  # (B, E, D)
     assert float(jnp.max(jnp.abs(later_changed[:, 0] - expected[:, 0]))) > 1e-4
     assert float(jnp.max(jnp.abs(earlier_changed[:, 1] - expected[:, 1]))) > 1e-4
-    masked_changed = apply(params, tokens.at[:, 2].set(30000), valid)  # (B, E, D)
+    masked_changed = apply(params, tokens.at[:, 2].set(30000), token_mask)  # (B, E, D)
     np.testing.assert_array_equal(masked_changed, expected)
     np.testing.assert_array_equal(expected[:, 2], 0)
     permutation = jnp.array([2, 1, 3, 0])  # (E,)
-    reordered = apply(params, tokens[:, permutation], valid[:, permutation])  # (B, E, D)
+    reordered = apply(params, tokens[:, permutation], token_mask[:, permutation])  # (B, E, D)
     np.testing.assert_allclose(reordered, expected[:, permutation], atol=2e-6)
 
 
@@ -65,7 +65,7 @@ def test_qk_rmsnorm_precedes_padding_and_preserves_values(
     variables["query_norm"]["scale"] = jnp.array([2.0, 0.5])  # (d,), learned scale shared across heads
     attention = Mock(wraps=tokamax.dot_product_attention)
     monkeypatch.setattr(tokamax, "dot_product_attention", attention)
-    output = _Attention(heads=4, head_dim=2, implementation="xla", dtype=jnp.float32).apply(
+    output = _Attention(attention_implementation="xla", heads=4, head_dim=2, dtype=jnp.float32).apply(
         {"params": variables}, tokens, tokens[:, :2]
     )  # (B, Q, D)
     query, key, value = attention.call_args.args  # (B, Q/K, H, padded_d=16)
@@ -83,22 +83,22 @@ def test_qk_rmsnorm_precedes_padding_and_preserves_values(
 
 @pytest.mark.parametrize("head_dim", [2, 16], ids=["padded", "unpadded"])
 def test_attention_head_dimensions(tokens: jax.Array, head_dim: int) -> None:
-    # tokens: (B=1, Q=4, D=8); context has K=2 tokens.
-    attention = _Attention(heads=2, head_dim=head_dim, implementation="xla", dtype=jnp.float32)
-    output, variables = attention.init_with_output(jax.random.key(3), x=tokens, context=tokens[:, :2])
-    # output: (B, Q, D); projection kernels: (D, H, d).
-    assert output.shape == tokens.shape
+    # tokens: (B=1, Q=4, Dx=8); context has K=2 tokens and Dc=8.
+    attention = _Attention(attention_implementation="xla", heads=2, head_dim=head_dim, dtype=jnp.float32)
+    output, variables = attention.init_with_output(jax.random.key(3), tokens=tokens, context=tokens[:, :2])
+    # output: (B, Q, D=H*d); projection kernels: (Dx/Dc, H, d).
+    assert output.shape == (*tokens.shape[:-1], 2 * head_dim)
     for name in ("query", "key", "value"):
         assert variables["params"][name]["kernel"].shape == (8, 2, head_dim)
-    assert variables["params"]["out"]["kernel"].shape == (2, head_dim, 8)
+    assert variables["params"]["out"]["kernel"].shape == (2, head_dim, 2 * head_dim)
 
 
 def test_bfloat16_normalized_attention_matches_float32(
-    block: _SetAttentionBlock, params: dict[str, Any], tokens: jax.Array, valid: jax.Array
+    block: _SetAttentionBlock, params: dict[str, Any], tokens: jax.Array, token_mask: jax.Array
 ) -> None:
-    # tokens: (B, E, D); valid: (B, E). Check normalization numerics independently of recurrence.
-    expected = jax.jit(block.apply)(params, tokens, valid)  # (B, E, D)
-    reduced = jax.jit(block.clone(dtype=jnp.bfloat16).apply)(params, tokens, valid)  # (B, E, D)
+    # tokens: (B, E, D); token_mask: (B, E). Check normalization numerics independently of recurrence.
+    expected = jax.jit(block.apply)(params, tokens, token_mask)  # (B, E, D)
+    reduced = jax.jit(block.clone(dtype=jnp.bfloat16).apply)(params, tokens, token_mask)  # (B, E, D)
     assert reduced.dtype == tokens.dtype
     np.testing.assert_allclose(reduced.astype(jnp.float32), expected, atol=0.04, rtol=0.02)
     np.testing.assert_array_equal(reduced[:, 2], 0)
@@ -109,7 +109,7 @@ def test_triton_forward_and_backward_match_reference(
     block: _SetAttentionBlock,
     params: dict[str, Any],
     tokens: jax.Array,  # (B, E, D)
-    valid: jax.Array,  # (B, E)
+    token_mask: jax.Array,  # (B, E)
     monkeypatch: pytest.MonkeyPatch,
     real_triton: bool,
 ) -> None:
@@ -118,7 +118,7 @@ def test_triton_forward_and_backward_match_reference(
 
     def evaluate(module: _SetAttentionBlock) -> tuple[tuple[jax.Array, jax.Array], dict[str, Any]]:
         def loss(variables: dict[str, Any]) -> tuple[jax.Array, jax.Array]:
-            output = module.apply(variables, tokens, valid)  # (B, E, D)
+            output = module.apply(variables, tokens, token_mask)  # (B, E, D)
             return jnp.square(output).mean(), output  # (); (B, E, D)
 
         return jax.jit(jax.value_and_grad(loss, has_aux=True))(params)
@@ -143,7 +143,7 @@ def test_triton_forward_and_backward_match_reference(
 
     attention = Mock(wraps=original if real_triton else reference)
     monkeypatch.setattr(tokamax, "dot_product_attention", attention)
-    actual = evaluate(block.clone(implementation="triton"))
+    actual = evaluate(block.clone(attention_implementation="triton"))
     assert attention.called
     assert attention.call_args.kwargs["implementation"] == "triton"
     assert attention.call_args.kwargs["is_causal"] is False
