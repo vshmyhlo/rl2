@@ -172,6 +172,20 @@ The 128×128 preset uses 32 minibatches to limit encoder activation memory.
   implemented. The headless renderer shows the full map and active scoring tiles,
   match/turn progress, team relic points, wins, active ships, and energy. Points
   display as `--` at match boundaries because the simulator has already reset them.
+  Each scorecard counts distinct active scoring tiles currently occupied by that
+  team's ships with nonnegative energy; stacked ships count once and absent ships
+  are excluded. This is current occupancy, not the previous turn's points gained.
+  Tile energy uses an orange–neutral–teal scale fixed to the parameter bounds,
+  with outlined nebulae and solid asteroids. The separate nebula drain is labeled;
+  the heatmap shows raw tile energy before that penalty.
+  Blue/red outlines on the main map trace each team's current sensor coverage,
+  including unseen holes; shared boundaries alternate team colors. They show
+  current visibility, not remembered exploration; the map remains privileged.
+  Single ships have energy bars scaled to `max_unit_energy`, separated from the
+  ship marker by one pixel; stacked ships show a count badge instead. Bars and
+  badges are omitted when tiles are under 10 pixels wide. Frames are 640 × 416 pixels.
+  The board is 288 × 288 pixels; larger maps are downsampled and can omit individual
+  tiles and their markers. Team statistics still include all active ships and tiles.
 
 The AlphaZero trainer remains separate and still requires a PGX-compatible
 adapter and search design for Lux's hidden information and simultaneous actions.

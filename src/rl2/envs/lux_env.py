@@ -38,6 +38,13 @@ class LuxState(NamedTuple):
     params: EnvParams  # Array leaves: (), sampled once per game.
 
 
+class _RenderTile(NamedTuple):
+    left: int
+    top: int
+    width: int
+    height: int
+
+
 class LuxTeamObservation[Array](NamedTuple):
     """One team's visible ships and public scores; optional leading axes S.
 
@@ -284,7 +291,7 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
         )
 
     def render(self, state: LuxState) -> NDArray[np.uint8]:  # leaves: (...) -> (416, 640, 3)
-        """Return (416, 640, 3) uint8 overview with privileged map and team scorecards."""
+        """Return (416, 640, 3) uint8 privileged overview with visibility outlines and ship energy bars."""
         game, params = jax.device_get(state)
         steps, match_steps = int(game.steps), int(game.match_steps)
         match_count, match_length = int(params.match_count_per_episode), int(params.max_steps_in_match)
@@ -306,16 +313,45 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
         team_colors = ((70, 180, 255), (255, 95, 85))
         scoring_color = (165, 140, 65)
         relic_color = (240, 205, 70)
-        colors = np.array([[25, 30, 45], [70, 45, 100], [105, 105, 115]], dtype=np.uint8)  # (3, RGB)
+        neutral_color = (25, 30, 45)
+        nebula_color = (160, 100, 210)
+        asteroid_color = (105, 105, 115)
+        palette = np.array([[205, 115, 45], neutral_color, [45, 170, 155]], dtype=np.uint8)  # (3, RGB)
+        minimum, maximum = int(params.min_energy_per_tile), int(params.max_energy_per_tile)
+
+        def energy_colors(values: NDArray[np.number]) -> NDArray[np.uint8]:  # (...) -> (..., RGB)
+            return np.stack(
+                [np.interp(values, (minimum, 0, maximum), palette[:, channel]) for channel in range(3)], axis=-1
+            ).astype(np.uint8)  # (..., RGB)
+
         tiles = np.asarray(game.map_features.tile_type).T  # (H, W)
-        pixels = colors[tiles]  # (H, W, 3)
-        cell_size = 288 / int(params.map_width)
+        pixels = energy_colors(np.asarray(game.map_features.energy).T)  # (H, W, RGB)
+        pixels[tiles == 2] = asteroid_color
+        map_size = int(params.map_width)
+        cell_size = 288 / map_size
+        tile_ids = np.arange(map_size, dtype=np.int32)[None, :]  # (1, W)
+        with (
+            Image.fromarray(tile_ids) as index_image,
+            index_image.resize((288, 1), resample=Image.Resampling.NEAREST) as index_board,
+        ):
+            # Use Pillow's exact pixel allocation, including fractional scaling and omitted tiles.
+            tile_edges = np.searchsorted(np.asarray(index_board)[0], np.arange(map_size + 1))  # (W+1,)
+
+        def tile_bounds(x: int, y: int) -> _RenderTile:
+            return _RenderTile(
+                left=16 + int(tile_edges[x]),
+                top=72 + int(tile_edges[y]),
+                width=int(tile_edges[x + 1] - tile_edges[x]),
+                height=int(tile_edges[y + 1] - tile_edges[y]),
+            )
+
         scoring = (game.relic_nodes_map_weights > 0) & (
             game.relic_nodes_map_weights <= game.relic_nodes_mask.sum() // 2
         )  # (W, H), same active scoring tiles used by the simulator
         title_font = ImageFont.load_default(size=20)
         font = ImageFont.load_default(size=16)
         small_font = ImageFont.load_default(size=13)
+        badge_font = ImageFont.load_default(size=max(6, min(12, int(cell_size * 0.75))))
         with (
             Image.new("RGB", (640, 416), (14, 18, 28)) as frame,
             Image.fromarray(pixels) as tiles_image,
@@ -330,34 +366,102 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
                 font=font,
                 fill=(185, 195, 210),
             )
+            for y, x in np.argwhere(tiles == 1):
+                left, top, width, height = tile_bounds(int(x), int(y))
+                if width and height:
+                    draw.rectangle((left, top, left + width - 1, top + height - 1), outline=nebula_color)
+            outlines = np.zeros((288, 288, 4), dtype=np.uint8)  # (H, W, RGBA)
+            previous_edge = np.zeros((288, 288), dtype=bool)  # (H, W)
+            stripes = (np.indices((288, 288)).sum(axis=0) // 3) % 2 == 1  # (H, W), alternate shared edges
+            for team, color in enumerate(team_colors):
+                with (
+                    Image.fromarray(np.asarray(game.sensor_mask[team]).T.astype(np.uint8)) as mask_image,
+                    mask_image.resize((288, 288), resample=Image.Resampling.NEAREST) as mask_board,
+                ):
+                    visible = np.asarray(mask_board, dtype=bool)  # (H, W)
+                padded = np.pad(visible, 1)  # (H+2, W+2), outside the board is unseen
+                edge = visible & ~(
+                    padded[:-2, 1:-1] & padded[2:, 1:-1] & padded[1:-1, :-2] & padded[1:-1, 2:]
+                )  # (H, W), only the perimeter, including holes
+                outlines[edge & (~previous_edge | stripes)] = (*color, 255)
+                previous_edge = edge  # (H, W), shared boundaries retain both team colors
+            with Image.fromarray(outlines) as outline_image:
+                frame.paste(outline_image, (16, 72), outline_image)
             for x, y in np.argwhere(scoring):
-                left, top = 16 + int(x) * cell_size, 72 + int(y) * cell_size
+                left, top, width, height = tile_bounds(int(x), int(y))
+                if not width or not height:
+                    continue
                 draw.rectangle(
-                    (left + cell_size / 12, top + cell_size / 12, left + cell_size * 5 / 6, top + cell_size * 5 / 6),
+                    (left + width / 12, top + height / 12, left + width * 5 / 6, top + height * 5 / 6),
                     outline=scoring_color,
                 )
             for position, visible in zip(game.relic_nodes, game.relic_nodes_mask):
                 if visible:
                     x, y = map(int, position)
-                    left, top = 16 + x * cell_size, 72 + y * cell_size
+                    left, top, width, height = tile_bounds(x, y)
+                    if not width or not height:
+                        continue
                     draw.ellipse(
-                        (left + cell_size / 4, top + cell_size / 4, left + cell_size * 3 / 4, top + cell_size * 3 / 4),
+                        (left + width / 4, top + height / 4, left + width * 3 / 4, top + height * 3 / 4),
                         fill=relic_color,
                     )
             for team, color in enumerate(team_colors):
-                for position in game.units.position[team][active[team]]:  # (2,) per active ship
-                    x, y = map(int, position)
-                    left, top = 16 + x * cell_size, 72 + y * cell_size
+                occupied_scoring: set[tuple[int, int]] = set()
+                ship_ids = np.flatnonzero(active[team])  # (S,), existing ships with nonnegative energy
+                ships_by_position: dict[tuple[int, int], list[int]] = {}
+                for ship_id in ship_ids:
+                    x, y = map(int, game.units.position[team, ship_id])
+                    ships_by_position.setdefault((x, y), []).append(int(ship_id))
+                for (x, y), stacked_ids in ships_by_position.items():
+                    if scoring[x, y]:
+                        occupied_scoring.add((x, y))
+                    left, top, width, height = tile_bounds(x, y)
+                    if not width or not height:
+                        continue
                     draw.rectangle(
-                        (left + cell_size / 3, top + cell_size / 3, left + cell_size * 2 / 3, top + cell_size * 2 / 3),
+                        (left + width / 3, top + height / 3, left + width * 2 / 3, top + height * 2 / 3),
                         fill=color,
                     )
-                top = 72 + team * 116
+                    # Omit bars and badges when they cannot fit inside a tile.
+                    if min(width, height) >= 10:
+                        if len(stacked_ids) > 1:
+                            draw.rectangle(
+                                (left + 1, top + 1, left + width - 2, top + height - 2),
+                                fill=neutral_color,
+                                outline=color,
+                            )
+                            draw.text(
+                                (left + width / 2, top + height / 2),
+                                str(len(stacked_ids)),
+                                font=badge_font,
+                                anchor="mm",
+                                fill=color,
+                            )
+                        else:
+                            bar_left = int(left + width / 6)
+                            bar_top = int(top + height * 2 / 3) + 2  # Leave one row after the inclusive ship edge.
+                            bar_right, bar_bottom = int(left + width * 5 / 6) - 1, top + height - 2
+                            draw.rectangle((bar_left, bar_top, bar_right, bar_bottom), fill=neutral_color)
+                            filled = round(
+                                (bar_right - bar_left + 1)
+                                * int(energy[team, stacked_ids[0]])
+                                / int(params.max_unit_energy)
+                            )
+                            if filled > 0:
+                                draw.rectangle((bar_left, bar_top, bar_left + filled - 1, bar_bottom), fill=color)
+                top = 72 + team * 100
                 points = "--" if boundary else str(int(game.team_points[team]))
                 ships = int(active[team].sum())
                 total_energy = int(energy[team][active[team]].sum())
-                draw.rounded_rectangle((324, top, 624, top + 104), radius=8, fill=(25, 31, 44))
+                draw.rounded_rectangle((324, top, 624, top + 94), radius=8, fill=(25, 31, 44))
                 draw.text((336, top + 10), f"TEAM {team}", font=title_font, fill=color)
+                draw.text(
+                    (612, top + 14),
+                    f"Scoring tiles: {len(occupied_scoring)}",
+                    anchor="rt",
+                    font=font,
+                    fill="white",
+                )
                 draw.text(
                     (336, top + 40),
                     f"Relic points {points}   |   Wins {int(game.team_wins[team])}",
@@ -365,18 +469,35 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
                     fill="white",
                 )
                 draw.text(
-                    (336, top + 72),
+                    (336, top + 66),
                     f"Ships {ships} / {int(params.max_units)}   |   Energy {total_energy}",
                     font=font,
                     fill=(185, 195, 210),
                 )
-            draw.text((324, 312), f"Active relic nodes: {int(game.relic_nodes_mask.sum())}", font=font, fill="white")
+            draw.text((324, 274), f"Active relic nodes: {int(game.relic_nodes_mask.sum())}", font=font, fill="white")
             if boundary:
-                draw.text((324, 339), "Relic points reset at match end.", font=small_font, fill=(185, 195, 210))
-            for tile, label in enumerate(("Empty", "Nebula", "Asteroid")):
+                draw.text((324, 293), "Relic points reset at match end.", font=small_font, fill=(185, 195, 210))
+            draw.text((324, 309), "Tile energy / turn", font=small_font, fill="white")
+            scale_values = np.concatenate((np.linspace(minimum, 0, 151), np.linspace(0, maximum, 151)[1:]))  # (301,)
+            for offset, rgb in enumerate(energy_colors(scale_values)):  # rgb: (3,)
+                draw.line((324 + offset, 329, 324 + offset, 337), fill=tuple(int(channel) for channel in rgb))
+            for x, value, anchor in ((324, minimum, "lt"), (474, 0, "mt"), (624, maximum, "rt")):
+                draw.text((x, 339), str(value), anchor=anchor, font=small_font, fill=(185, 195, 210))
+            draw.text(
+                (324, 355),
+                f"Nebula drain: {int(params.nebula_tile_energy_reduction)} / turn",
+                font=small_font,
+                fill=(185, 195, 210),
+            )
+            for tile, (label, color) in enumerate(
+                (("Empty", neutral_color), ("Nebula", nebula_color), ("Asteroid", asteroid_color))
+            ):
                 left = 16 + tile * 108
-                color = tuple(int(channel) for channel in colors[tile])
-                draw.rectangle((left, 374, left + 12, 386), fill=color, outline=(130, 140, 155))
+                draw.rectangle(
+                    (left, 374, left + 12, 386),
+                    fill=neutral_color if tile == 1 else color,
+                    outline=nebula_color if tile == 1 else (130, 140, 155),
+                )
                 draw.text((left + 18, 373), label, font=small_font, fill=(185, 195, 210))
             draw.ellipse((343, 377, 349, 383), fill=relic_color)
             draw.text((358, 373), "Relic", font=small_font, fill=(185, 195, 210))
@@ -388,7 +509,7 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
                 draw.text((left + 18, 395), f"Team {team}", font=small_font, fill=(185, 195, 210))
             draw.text(
                 (244, 395),
-                "Full map shown (includes hidden information)",
+                "Full map (hidden info); outlines = vision",
                 font=small_font,
                 fill=(185, 195, 210),
             )

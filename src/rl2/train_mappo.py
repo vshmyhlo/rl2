@@ -9,15 +9,44 @@ Lux observations separate self/opponent teams and retain native dtypes through
 rollout storage; the lux encoder combines spatial map features, ship features,
 and public context with ship-to-map attention.
 
-E denotes environments, N agents, B = E * N agent sequences, T rollout steps,
-O local observation features, A categories, and H recurrent width. C is empty
-for scalar actions or (D,) for D discrete components. Multi-discrete policies
-produce one joint action per agent: log probabilities and entropies sum over D.
+Shape dimensions:
+    E: Parallel environments (config.num_envs).
+    N: Controlled agents per environment (env.num_agents).
+    B: Agent sequences; E * N during rollout, E for training with an opponent pool.
+    T: Rollout steps per environment (config.num_steps).
+    M: Agent sequences per minibatch (training B / config.num_minibatches).
+    S: Leading batch axes: (B,) per step, (T, B) during scans, (B, T) for training.
+    O: Local observation features.
+    A: Action categories per discrete component.
+    C: Action component shape; () for scalar actions or (D,) for D components.
+    D: Discrete action components per agent (e.g., ships controlled by a team in Lux).
+    H: Hidden width: model.encoder.embedding_size at encoder output, otherwise
+        model.recurrent.hidden_size. These widths may differ.
+    L: Raw policy logits per action component.
+    K: Raw PRNG key words.
+    In video arrays, F is frame capacity and (H, W, 3) is image height, width, RGB.
+    Flattened loss arrays use N = prod(S) for transition count.
+    *S and *C unpack shape tuples; ... denotes remaining leaf dimensions; () is scalar.
+
+Multi-discrete policies produce one joint action per agent: log probabilities and
+entropies sum over D.
 Grouped choices normalize action types and their conditional commands separately;
 their joint entropy includes conditional entropy weighted by type probability.
 Recurrent minibatches preserve entire (B, T, ...) agent sequences. Advantages are
 standardized per minibatch; a single transition retains its raw advantage.
 KL-rejected minibatches skip backpropagation and optimizer updates.
+
+Optional selfplay config enables a historical opponent pool for environments with
+supports_selfplay=True and exactly two controlled agents. Defaults: pool_size=8,
+snapshot_interval=100 completed iterations, current_policy_fraction=0.5. Slot zero
+retains the initial policy; scheduled snapshots replace the oldest unreferenced
+slot, or are skipped when all replaceable slots are active. Opponents are sampled
+uniformly from populated slots. Each environment samples a learner side and an
+opponent at full-game reset, retaining assignments and separate memory across
+iterations and matches. Only learner transitions enter PPO, including current-policy
+games: training B=E, while rollout memory retains E*N agents. num_envs must then
+be divisible by num_minibatches * device_count. Historical inference maps over
+environments to avoid materializing a parameter copy per environment.
 
 Training uses all devices on JAX's default backend (all visible GPUs when available).
 Parameters and optimizer state are replicated; environments are sharded along E
@@ -32,6 +61,9 @@ observations count each agent separately. Team returns sum mean agent rewards,
 counting shared rewards once. Episodes count environment completions. Lux uses
 match-win increments; averaging both teams gives match_count / 2 per full game,
 so self-play return is not a measure of playing strength.
+With a pool, training episode returns sum only the selected learner's raw rewards;
+observation counters still count both agents. Loss and explained-variance metrics
+use only learner transitions. Evaluation and standalone video behavior are unchanged.
 
 Progress metrics are logged every log_interval iterations (default: 60) and on
 normal completion.
@@ -132,6 +164,11 @@ configuration without compatibility checks. Legacy checkpoints lacking transitio
 counters estimate them using current rollout dimensions. Live environments and
 memory restart on resume; unfinished episode statistics are discarded. Checkpoint
 writes overlap training; shutdown waits for pending writes and surfaces failures.
+Pool parameters and snapshot iterations are checkpointed separately. Resume uses
+the current pool capacity, preserving the initial snapshot and newest history;
+enabling a pool on an older checkpoint starts it from the restored learner. Live
+opponent assignments and memory restart with environments. Disabling the feature
+ignores saved pool state. Saved lifetime return totals retain their original meaning.
 """
 
 import argparse
@@ -147,7 +184,7 @@ from operator import itemgetter
 from pathlib import Path
 from statistics import fmean, stdev
 from time import monotonic
-from typing import Annotated, Any, Literal, NamedTuple, Self
+from typing import Annotated, Any, Literal, NamedTuple, Self, cast
 
 # Orbax's epath otherwise loads TensorFlow for gs:// paths when it is installed.
 # That native runtime can crash a later Triton import; use our gcsfs dependency.
@@ -191,6 +228,15 @@ from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.mlflow_logging import MLflowLogger
 from rl2.model.encoders.lux import LuxEncoder
 from rl2.running_stats import RunningSum
+from rl2.selfplay.pool import (
+    MatchAssignment,
+    OpponentPool,
+    SelfPlayConfig,
+    init_pool,
+    insert_snapshot,
+    resize_pool,
+    sample_opponents,
+)
 from rl2.utils import explained_variance, gae
 
 type RecurrentCarry = LSTMStackCarry
@@ -247,6 +293,7 @@ class RolloutCarry(NamedTuple):
     episode_start: jax.Array  # (B,) reset on agent death or environment completion
     episode_return: jax.Array  # (E,) unfinished team returns
     episode_step_count: jax.Array  # (E,) unfinished episode lengths
+    selfplay: MatchAssignment | None = None  # leaves: (E,), assignments persist until environment completion
 
 
 class RolloutResult(NamedTuple):
@@ -374,6 +421,7 @@ class Config(BaseConfig):
     entropy_decay: Literal["constant", "cosine"] = "constant"
     checkpoint_interval: Annotated[int, Field(gt=0)] = 600
     log_interval: Annotated[int, Field(gt=0)] = 60
+    selfplay: SelfPlayConfig | None = None
 
     @model_validator(mode="after")
     def validate_rollout(self) -> Self:
@@ -398,8 +446,15 @@ def make_env(config: Config) -> PPOEnv:
         env = STORMEnv(config.env)
     else:
         env = RobotariumEnv(config.env)
-    if config.num_envs * env.num_agents % config.num_minibatches:
-        raise ValueError("num_envs * num_agents must be divisible by num_minibatches to preserve sequences")
+    if config.selfplay is not None:
+        if not env.supports_selfplay:
+            raise ValueError("selfplay pool requires an environment with supports_selfplay=True")
+        if env.num_agents != 2:
+            raise ValueError("selfplay pool requires two controlled agents; multi-agent teams need explicit grouping")
+    sequence_count = config.num_envs * (1 if config.selfplay is not None else env.num_agents)
+    if sequence_count % config.num_minibatches:
+        label = "num_envs" if config.selfplay is not None else "num_envs * num_agents"
+        raise ValueError(f"{label} must be divisible by num_minibatches to preserve sequences")
     return env
 
 
@@ -412,6 +467,7 @@ class TrainingProgress(NamedTuple):
     episode_length_sum: int
     environment_step_count: int | None = None  # None for legacy checkpoints without transition counters.
     observation_count: int | None = None
+    opponent_pool: OpponentPool | None = None
 
 
 def init_metrics(progress: TrainingProgress | None = None) -> TrainingMetrics:
@@ -452,10 +508,16 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
     """Submit an async checkpoint and return the blocking preparation/submission seconds."""
     started = monotonic()
     key_data = jax.random.key_data(progress.key)  # (K,) raw PRNG words
+    pool_items = (
+        {}
+        if progress.opponent_pool is None
+        else {"opponent_pool": ocp.args.StandardSave(progress.opponent_pool._asdict())}
+    )
     manager.save(
         progress.rollout_count,
         args=ocp.args.Composite(
             state=ocp.args.StandardSave({"train_state": progress.train_state, "key": key_data}),
+            **pool_items,
             metadata=ocp.args.JsonSave(
                 {
                     "version": 2,
@@ -467,6 +529,7 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
                     "training_length_sum": progress.episode_length_sum,
                     "environment_steps": progress.environment_step_count,
                     "observations": progress.observation_count,
+                    "opponent_pool": progress.opponent_pool is not None,
                 }
             ),
         ),
@@ -502,6 +565,12 @@ def restore_checkpoint(
             )
         ),
     ).state
+    pool = None
+    if config.selfplay is not None and metadata.get("opponent_pool", False):
+        saved_pool = manager.restore(
+            rollout_count, args=ocp.args.Composite(opponent_pool=ocp.args.StandardRestore())
+        ).opponent_pool
+        pool = resize_pool(OpponentPool(**saved_pool), config.selfplay.pool_size)
     return TrainingProgress(
         train_state=restored["train_state"],
         key=jax.random.wrap_key_data(restored["key"]),
@@ -511,6 +580,7 @@ def restore_checkpoint(
         episode_length_sum=metadata["training_length_sum"],
         environment_step_count=metadata.get("environment_steps"),
         observation_count=metadata.get("observations"),
+        opponent_pool=pool,
     )
 
 
@@ -601,8 +671,8 @@ class ActorCritic(nn.Module):
         )
 
     def _encode(self, observation: Observation) -> jax.Array:  # leaves: (*S, ...) -> (*S, H)
-        x = nn.relu(self.encoder(observation))  # (*S, F), F is model.encoder.embedding_size
-        return self.recurrent_input(x).astype(self.dtype)  # (*S, H)
+        x = nn.relu(self.encoder(observation))  # (*S, H), H is model.encoder.embedding_size
+        return self.recurrent_input(x).astype(self.dtype)  # (*S, H), H is model.recurrent.hidden_size
 
     def _heads(
         self,
@@ -1021,6 +1091,7 @@ def collect_rollout(
     env: PPOEnv,
     config: Config,
     key: jax.Array,  # () typed PRNG key
+    opponent_pool: OpponentPool | None = None,
 ) -> tuple[RolloutCarry, RolloutResult]:
     """Collect (B, T, ...) transitions entirely on device and compute GAE.
 
@@ -1067,6 +1138,44 @@ def collect_rollout(
             method="step",
         )  # memory leaves: (B, H); logits: (B, *C, A); prediction: (B,)
         action, log_prob = policy.sample_and_log_prob(key=action_key)  # (B, *C); (B,)
+        assignment = current.selfplay
+        if opponent_pool is not None:
+            assignment = cast(MatchAssignment, assignment)
+            key, opponent_key = jax.random.split(key)  # each ()
+            opponent_keys = jax.random.split(opponent_key, config.num_envs)  # (E,)
+            opponent_indices = 2 * jnp.arange(config.num_envs) + 1 - assignment.learner_team  # (E,)
+
+            def opponent_step(env_index: jax.Array) -> tuple[jax.Array, RecurrentCarry]:  # () -> (*C), leaves: (H,)
+                index = opponent_indices[env_index]  # ()
+                slot = assignment.opponent[env_index]  # ()
+
+                def historical() -> tuple[jax.Array, RecurrentCarry]:
+                    inputs = jax.tree.map(lambda leaf: leaf[index][None], observation)  # (1, ...)/(1, *C, A)
+                    carry = jax.tree.map(lambda leaf: leaf[index][None], current.model_carry)  # (1, H)
+                    output = train_state.apply_fn(
+                        {"params": jax.tree.map(lambda leaf: leaf[slot], opponent_pool.params)},
+                        inputs.observation,
+                        carry,
+                        current.episode_start[index][None],
+                        inputs.actions_mask,
+                        method="step",
+                    )
+                    command = output.policy.sample_and_log_prob(key=opponent_keys[env_index])[0][0]  # (*C,)
+                    return command, jax.tree.map(lambda leaf: leaf[0], output.carry)  # (*C,); leaves: (H,)
+
+                return jax.lax.cond(
+                    slot >= 0,
+                    historical,
+                    lambda: (action[index], jax.tree.map(lambda leaf: leaf[index], memory)),
+                )
+
+            # Map one environment at a time so inference does not gather E copies of the parameters.
+            opponent_action, opponent_memory = jax.lax.map(opponent_step, jnp.arange(config.num_envs))
+            # opponent_action: (E, *C); opponent_memory leaves: (E, H)
+            action = action.at[opponent_indices].set(opponent_action)  # (B, *C)
+            memory = jax.tree.map(
+                lambda all_agents, opponents: all_agents.at[opponent_indices].set(opponents), memory, opponent_memory
+            )
         env_key = jax.random.split(env_key, config.num_envs)  # (E,) typed PRNG keys
         result = jax.vmap(env.step)(
             env_key,
@@ -1096,7 +1205,12 @@ def collect_rollout(
 
         raw_reward = result.reward.reshape(actor_count)  # (B,)
         reward = raw_reward + config.gamma * jax.lax.cond(timeout.any(), bootstrap, no_bootstrap, None)  # (B,)
-        episode_return = current.episode_return + result.reward.mean(axis=-1)  # (E,)
+        episode_reward = (
+            result.reward.mean(axis=-1)
+            if assignment is None
+            else result.reward[jnp.arange(config.num_envs), assignment.learner_team]
+        )  # (E,)
+        episode_return = current.episode_return + episode_reward  # (E,)
         episode_step_count = current.episode_step_count + 1  # (E,)
         episode_metrics = RunningSum.update(
             episode_metrics,
@@ -1109,6 +1223,13 @@ def collect_rollout(
                 ),
             ),
         )  # each ()
+        next_assignment = assignment
+        if opponent_pool is not None:
+            key, assignment_key = jax.random.split(key)  # each ()
+            sampled = sample_opponents(
+                assignment_key, opponent_pool, cast(SelfPlayConfig, config.selfplay), config.num_envs
+            )
+            next_assignment = jax.tree.map(lambda new, old: jnp.where(result.done, new, old), sampled, assignment)
         advanced = RolloutCarry(
             env_state=result.state,  # leaves: (E, ...)
             observation=result.observation,  # observation: (E, N, ...); actions_mask: (E, N, *C, A)
@@ -1116,13 +1237,9 @@ def collect_rollout(
             episode_start=episode_start,  # (B,)
             episode_return=jnp.where(result.done, 0.0, episode_return),  # (E,)
             episode_step_count=jnp.where(result.done, 0, episode_step_count),  # (E,)
+            selfplay=next_assignment,  # leaves: (E,)
         )
-        return Runner(
-            current=advanced,
-            key=key,  # ()
-            episode_metrics=episode_metrics,  # scalar leaves
-            terminated_episode_count=terminated_episode_count + jnp.sum(result.done & result.terminated),  # ()
-        ), Transition(
+        transition = Transition(
             observation=observation.observation,  # (B, ...)
             actions_mask=observation.actions_mask,  # (B, *C, A)
             action=action,  # (B, *C)
@@ -1132,6 +1249,15 @@ def collect_rollout(
             episode_end=jnp.repeat(result.done, env.num_agents),  # (B,)
             episode_start=current.episode_start,  # (B,)
         )
+        if assignment is not None:
+            learner_indices = 2 * jnp.arange(config.num_envs) + assignment.learner_team  # (E,)
+            transition = jax.tree.map(lambda leaf: leaf[learner_indices], transition)  # leaves: (E, ...)
+        return Runner(
+            current=advanced,
+            key=key,  # ()
+            episode_metrics=episode_metrics,  # scalar leaves
+            terminated_episode_count=terminated_episode_count + jnp.sum(result.done & result.terminated),  # ()
+        ), transition
 
     episode_metrics = EpisodeMetrics(
         episode_count=jnp.zeros((), dtype=int),  # ()
@@ -1159,6 +1285,14 @@ def collect_rollout(
         observation.actions_mask,
         method="step",
     ).value  # (B,)
+    initial_memory = rollout_carry.model_carry  # leaves: (B, H)
+    if advanced.selfplay is not None:
+        learner_indices = 2 * jnp.arange(config.num_envs) + advanced.selfplay.learner_team  # (E,)
+        next_value = next_value[learner_indices]  # (E,)
+        initial_indices = (
+            2 * jnp.arange(config.num_envs) + cast(MatchAssignment, rollout_carry.selfplay).learner_team
+        )  # (E,)
+        initial_memory = jax.tree.map(lambda leaf: leaf[initial_indices], initial_memory)  # leaves: (E, H)
     advantage, return_target = gae(
         trajectory.reward, trajectory.episode_end, trajectory.value, next_value, config.gamma, config.gae_lambda
     )  # each (T, B)
@@ -1173,7 +1307,7 @@ def collect_rollout(
         value=trajectory.value,  # (B, T)
         advantage=advantage,  # (B, T)
         return_target=return_target,  # (B, T)
-        model_carry=rollout_carry.model_carry,  # leaves: (B, H)
+        model_carry=initial_memory,  # leaves: (B, H), B=E with an opponent pool
         episode_start=trajectory.episode_start,  # (B, T)
     )
     return advanced, RolloutResult(
@@ -1194,9 +1328,14 @@ def train_step(
     key: jax.Array,  # () typed PRNG key
     metrics: TrainingMetrics,  # scalar leaves
     environment_step_count: int | jax.Array = 0,  # () completed environment transitions before this iteration
+    opponent_pool: OpponentPool | None = None,
 ) -> TrainStepResult:
     """Collect a rollout, run PPO epochs, and accumulate window/lifetime metrics."""
-    rollout_carry, rollout = collect_rollout(rollout_carry, train_state, env, config, key)
+    rollout_carry, rollout = (
+        collect_rollout(rollout_carry, train_state, env, config, key)
+        if opponent_pool is None
+        else collect_rollout(rollout_carry, train_state, env, config, key, opponent_pool)
+    )
     batch = jax.lax.with_sharding_constraint(rollout.batch, PartitionSpec("batch"))  # (B, T, ...); memory: (B, H)
     learning_rate = jnp.asarray(learning_rate_schedule(config)(environment_step_count), dtype=jnp.float32)  # ()
     train_state = train_state.replace(
@@ -1304,14 +1443,33 @@ train_step_donated = jax.jit(
 )
 
 
+train_step_with_pool_donated = jax.jit(
+    train_step,
+    static_argnames=("env", "config"),
+    donate_argnames=("train_state",),
+    in_shardings=(
+        PartitionSpec("batch"),
+        PartitionSpec(),
+        PartitionSpec(),
+        PartitionSpec(),
+        PartitionSpec(),
+        PartitionSpec(),
+    ),
+    out_shardings=TrainStepResult(
+        train_state=PartitionSpec(), rollout_carry=PartitionSpec("batch"), key=PartitionSpec(), metrics=PartitionSpec()
+    ),
+)
+
+
 def training_mesh(config: Config, num_agents: int) -> Mesh:
     """Use every available device with equal environment and agent-sequence shards."""
     devices = jax.devices()
     if config.num_envs % len(devices):
         raise ValueError(f"num_envs ({config.num_envs}) must be divisible by device_count ({len(devices)})")
-    if config.num_envs * num_agents % (config.num_minibatches * len(devices)):
+    learner_agents = 1 if config.selfplay is not None else num_agents
+    if config.num_envs * learner_agents % (config.num_minibatches * len(devices)):
         raise ValueError(
-            f"num_envs ({config.num_envs}) * num_agents ({num_agents}) must be divisible by "
+            f"num_envs ({config.num_envs}) * learner_agents ({learner_agents}) must be divisible by "
             f"num_minibatches ({config.num_minibatches}) * device_count ({len(devices)})"
         )
     return Mesh(devices=devices, axis_names=("batch",), axis_types=(AxisType.Auto,))
@@ -1375,6 +1533,17 @@ def train(config: Config) -> TrainState:
             )  # (E, N, ...)/(E, N, *C, A); state: (E, ...)
         train_state = jax.device_put(train_state, replicated)
         key, metrics = jax.device_put((key, metrics), replicated)  # key: (); metrics: scalar leaves
+        opponent_pool = None
+        assignment = None
+        if config.selfplay is not None:
+            opponent_pool = (
+                progress.opponent_pool
+                if progress is not None and progress.opponent_pool is not None
+                else init_pool(train_state.params, config.selfplay.pool_size, start_rollout_index)
+            )
+            opponent_pool = jax.device_put(opponent_pool, replicated)
+            key, assignment_key = jax.random.split(key)  # each ()
+            assignment = sample_opponents(assignment_key, opponent_pool, config.selfplay, config.num_envs)
         initial_step_count = (
             progress.environment_step_count
             if progress is not None and progress.environment_step_count is not None
@@ -1406,6 +1575,7 @@ def train(config: Config) -> TrainState:
             episode_start=episode_start,  # (B,)
             episode_return=jnp.zeros(config.num_envs, dtype=jnp.float32),  # (E,)
             episode_step_count=jnp.zeros(config.num_envs, dtype=jnp.int32),  # (E,)
+            selfplay=assignment,  # leaves: (E,)
         )
         rollout_carry = jax.device_put(rollout_carry, batched)  # state: (E, ...); memory: (B, H)
 
@@ -1423,10 +1593,21 @@ def train(config: Config) -> TrainState:
                 )
             # Schedules need a fraction, while exact lifetime counters stay as host integers.
             schedule_step = jnp.asarray(step_count, dtype=jnp.float32)  # (); avoids JIT's default int32 limit
-            train_state, rollout_carry, key, metrics = train_step_donated(
-                rollout_carry, train_state, env, config, key, metrics, schedule_step
-            )  # state: (E, ...); memory: (B, H); key/metrics: ()
+            if opponent_pool is None:
+                result = train_step_donated(rollout_carry, train_state, env, config, key, metrics, schedule_step)
+            else:
+                result = train_step_with_pool_donated(
+                    rollout_carry, train_state, env, config, key, metrics, schedule_step, opponent_pool
+                )
+            train_state, rollout_carry, key, metrics = result  # state: (E, ...); memory: (B, H); key/metrics: ()
             rollout_count = rollout_index + 1
+            if config.selfplay is not None and rollout_count % config.selfplay.snapshot_interval == 0:
+                opponent_pool = insert_snapshot(
+                    cast(OpponentPool, opponent_pool),
+                    train_state.params,
+                    rollout_count,
+                    cast(MatchAssignment, rollout_carry.selfplay).opponent,
+                )
             is_final_rollout = rollout_count == planned_rollout_count
             step_count += batch_size
             observation_count += batch_size * env.num_agents
@@ -1563,6 +1744,7 @@ def train(config: Config) -> TrainState:
                         episode_length_sum=int(metrics.total.episode_length_sum),
                         environment_step_count=step_count,
                         observation_count=observation_count,
+                        opponent_pool=opponent_pool,
                     ),
                     config,
                 )

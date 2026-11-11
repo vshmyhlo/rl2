@@ -267,10 +267,49 @@ def test_large_map_reset_step_and_render() -> None:
             energy=rendered.game.units.energy.at[1, 0, 0].set(100),  # (N, U, 1)
         ),
         units_mask=jnp.zeros((2, 2), dtype=bool).at[1, 0].set(True),  # (N, U)
+        map_features=rendered.game.map_features.replace(
+            tile_type=jnp.zeros((128, 128), dtype=jnp.int16).at[3, 4].set(1),  # (W, H)
+            energy=jnp.zeros((128, 128), dtype=jnp.int16),  # (W, H)
+        ),
+        sensor_mask=jnp.zeros((2, 128, 128), dtype=bool),  # (N, W, H)
+        relic_nodes_mask=jnp.zeros(6, dtype=bool),  # (R,)
     )
     frame = env.render(rendered._replace(game=game))  # (416, 640, 3)
     assert frame.shape == (416, 640, 3)
     np.testing.assert_array_equal(frame[359, 303], [255, 95, 85])  # Bottom-right ship stays inside the board panel.
+    # Nearest-neighbor resizing maps tile (3, 4) to columns 7..8, rows 9..10.
+    np.testing.assert_array_equal(frame[81, 22], [25, 30, 45])  # Nebula outline must not spill into tile (2, 4).
+    np.testing.assert_array_equal(frame[81:83, 23:25], np.tile([160, 100, 210], (2, 2, 1)))
+
+
+def test_render_downsampled_map(initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]) -> None:
+    _, state = initial
+    env = LuxEnv(LuxConfig(map_size=512, max_units=2, randomize_params=False))
+    # Tile (1, 1) receives no pixels when Pillow downsamples 512 tiles to 288 pixels.
+    game = state.game.replace(
+        map_features=state.game.map_features.replace(
+            tile_type=jnp.zeros((512, 512), dtype=jnp.int16).at[1, 1].set(1),  # (W, H)
+            energy=jnp.zeros((512, 512), dtype=jnp.int16),  # (W, H)
+        ),
+        sensor_mask=jnp.zeros((2, 512, 512), dtype=bool),  # (N, W, H)
+        relic_nodes=jnp.ones((6, 2), dtype=jnp.int16),  # (R, 2)
+        relic_nodes_mask=jnp.array([True, False, False, True, False, False]),  # (R,)
+        relic_nodes_map_weights=jnp.zeros((512, 512), dtype=jnp.int16).at[1, 1].set(1),  # (W, H)
+        units=state.game.units.replace(
+            position=jnp.array([[[1, 1], [0, 0]], [[0, 0], [0, 0]]], dtype=jnp.int16),  # (N, U, 2)
+            energy=jnp.zeros((2, 2, 1), dtype=jnp.int16),  # (N, U, 1)
+        ),
+        units_mask=jnp.array([[True, False], [True, False]]),  # (N, U)
+    )
+    with patch.object(ImageDraw.ImageDraw, "text", autospec=True, side_effect=ImageDraw.ImageDraw.text) as text:
+        frame = env.render(
+            state._replace(game=game, params=state.params.replace(map_width=512, map_height=512))
+        )  # (416, 640, 3)
+    expected = np.tile([25, 30, 45], (288, 288, 1))  # (H, W, RGB)
+    expected[0, 0] = [255, 95, 85]  # Team 1's one-pixel tile remains visible.
+    np.testing.assert_array_equal(frame[72:360, 16:304], expected)
+    labels = [call.args[2] for call in text.call_args_list if call.args[2].startswith("Scoring tiles:")]
+    assert labels == ["Scoring tiles: 1", "Scoring tiles: 0"]  # Counts still include unrepresented tiles.
 
 
 @pytest.mark.parametrize(
@@ -323,13 +362,185 @@ def test_render_progress_and_team_statistics(
     np.testing.assert_array_equal(frame[72 + 4 * 12 + 1, 16 + 3 * 12 + 1], [165, 140, 65])
 
 
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ("occupied", (1, 2)),
+        ("inactive_relic", (1, 1)),
+        ("non_scoring", (0, 0)),
+        ("absent", (0, 0)),
+        ("negative_energy", (0, 1)),
+    ],
+)
+def test_render_scoring_occupancy(
+    env: LuxEnv,
+    initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState],
+    case: str,
+    expected: tuple[int, int],
+) -> None:
+    _, state = initial
+    game = state.game.replace(
+        units=state.game.units.replace(
+            position=jnp.array([[[1, 3], [1, 3]], [[2, 4], [3, 5]]], dtype=jnp.int16),  # (N, U, 2)
+            energy=jnp.array([[[0], [10]], [[0], [10]]], dtype=jnp.int16),  # (N, U, 1), zero energy still counts
+        ),
+        units_mask=jnp.ones((2, 2), dtype=bool),  # (N, U)
+        relic_nodes_mask=jnp.array([True, True, False, True, True, False]),  # (R,)
+        relic_nodes_map_weights=jnp.zeros((24, 24), dtype=jnp.int16)
+        .at[1, 3]
+        .set(1)
+        .at[2, 4]
+        .set(1)
+        .at[3, 5]
+        .set(2),  # (W, H)
+    )
+    if case == "inactive_relic":
+        game = game.replace(relic_nodes_mask=jnp.array([True, False, False, True, False, False]))  # (R,)
+    elif case == "non_scoring":
+        game = game.replace(relic_nodes_map_weights=jnp.zeros((24, 24), dtype=jnp.int16))  # (W, H)
+    elif case == "absent":
+        game = game.replace(units_mask=jnp.zeros((2, 2), dtype=bool))  # (N, U)
+    elif case == "negative_energy":
+        game = game.replace(
+            units=game.units.replace(energy=jnp.full((2, 2, 1), -1, dtype=jnp.int16).at[1, 0, 0].set(0))  # (N, U, 1)
+        )
+    with patch.object(ImageDraw.ImageDraw, "text", autospec=True, side_effect=ImageDraw.ImageDraw.text) as text:
+        env.render(state._replace(game=game))
+    labels = [call.args[2] for call in text.call_args_list if call.args[2].startswith("Scoring tiles:")]
+    assert labels == [f"Scoring tiles: {count}" for count in expected]
+
+
+def test_render_ship_energy(env: LuxEnv, initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]) -> None:
+    _, state = initial
+    game = state.game.replace(
+        units=state.game.units.replace(
+            position=jnp.array([[[3, 4], [5, 4]], [[3, 7], [5, 7]]], dtype=jnp.int16),  # (N, U, 2)
+            energy=jnp.array([[[0], [50]], [[100], [100]]], dtype=jnp.int16),  # (N, U, 1)
+        ),
+        units_mask=jnp.array([[True, True], [True, False]]),  # (N, U)
+        map_features=jax.tree.map(jnp.zeros_like, state.game.map_features),  # leaves: (W, H)
+        sensor_mask=jnp.zeros((2, 24, 24), dtype=bool),  # (N, W, H)
+        relic_nodes_mask=jnp.zeros(6, dtype=bool),  # (R,)
+    )
+    frame = env.render(state._replace(game=game, params=state.params.replace(max_unit_energy=100)))  # (416, 640, 3)
+    blue, red, empty = (70, 180, 255), (255, 95, 85), (25, 30, 45)
+    np.testing.assert_array_equal(frame[130, 54:62], np.tile(empty, (8, 1)))  # Empty bar, tile (3, 4).
+    np.testing.assert_array_equal(frame[130, 78:86], [blue] * 4 + [empty] * 4)  # Half-full bar, tile (5, 4).
+    np.testing.assert_array_equal(frame[166, 54:62], np.tile(red, (8, 1)))  # Full bar, tile (3, 7).
+    np.testing.assert_array_equal(frame[128, 80:85], np.tile(blue, (5, 1)))  # Last row of ship marker.
+    np.testing.assert_array_equal(frame[129, 78:86], np.tile(empty, (8, 1)))  # Exactly one row before bar.
+    np.testing.assert_array_equal(frame[165, 54:62], np.tile(empty, (8, 1)))  # Same gap for team 1.
+    np.testing.assert_array_equal(frame[156:168, 76:88], np.tile(empty, (12, 12, 1)))  # Absent ship is not drawn.
+    assert frame.shape == (416, 640, 3)  # No roster panel.
+
+
+def test_render_stack_badge(initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]) -> None:
+    _, state = initial
+    env = LuxEnv(LuxConfig(randomize_params=False))
+    game = state.game.replace(
+        units=state.game.units.replace(
+            position=jnp.full((2, 16, 2), 23, dtype=jnp.int16),  # (N, U, 2), bottom-right tile
+            energy=jnp.broadcast_to(jnp.arange(16, dtype=jnp.int16)[None, :, None] * 25, (2, 16, 1)),  # (N, U, 1)
+        ),
+        units_mask=jnp.zeros((2, 16), dtype=bool).at[0].set(True),  # (N, U)
+    )
+    with patch.object(ImageDraw.ImageDraw, "text", autospec=True, side_effect=ImageDraw.ImageDraw.text) as text:
+        frame = env.render(state._replace(game=game, params=state.params.replace(max_units=16)))  # (416, 640, 3)
+    labels = {call.args[1]: call.args[2] for call in text.call_args_list}
+    assert labels[298, 354] == "16"  # One count badge instead of overlapping ship markers/bars.
+    assert frame.shape == (416, 640, 3) and frame.dtype == np.uint8
+    np.testing.assert_array_equal(frame[348:360, 304:308], np.tile([14, 18, 28], (12, 4, 1)))  # Badge stays inside map.
+
+
+def test_render_energy_field(
+    env: LuxEnv, initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]
+) -> None:
+    _, state = initial
+    game = state.game.replace(
+        map_features=state.game.map_features.replace(
+            energy=jnp.zeros((24, 24), dtype=jnp.int16)
+            .at[1:6, 4]
+            .set(jnp.array([-10, -5, 0, 15, 30], dtype=jnp.int16))
+            .at[1:6, 2]
+            .set(30),  # (W, H)
+            tile_type=jnp.zeros((24, 24), dtype=jnp.int16).at[1, 2].set(1).at[2, 2].set(2),  # (W, H)
+        ),
+        units=state.game.units.replace(
+            position=state.game.units.position.at[0, 0].set(jnp.array([4, 2], dtype=jnp.int16)),  # (N, U, 2)
+            energy=state.game.units.energy.at[0, 0, 0].set(100),  # (N, U, 1)
+        ),
+        units_mask=jnp.zeros((2, 2), dtype=bool).at[0, 0].set(True),  # (N, U)
+        relic_nodes=state.game.relic_nodes.at[0].set(jnp.array([3, 2], dtype=jnp.int16)),  # (R, 2)
+        relic_nodes_mask=jnp.array([True, False, False, True, False, False]),  # (R,)
+        relic_nodes_map_weights=jnp.zeros((24, 24), dtype=jnp.int16).at[5, 2].set(1),  # (W, H)
+    )
+    state = state._replace(game=game, params=state.params.replace(min_energy_per_tile=-10, max_energy_per_tile=30))
+    frame = env.render(state)  # (416, 640, 3)
+    np.testing.assert_array_equal(
+        frame[72 + 4 * 12 + 6, 16 + np.arange(1, 6) * 12 + 6],
+        [[205, 115, 45], [115, 72, 45], [25, 30, 45], [35, 100, 100], [45, 170, 155]],
+    )
+    np.testing.assert_array_equal(frame[72 + 1 * 12 + 6, 16 + 4 * 12 + 6], [25, 30, 45])  # No x/y swap.
+    np.testing.assert_array_equal(frame[96, 28], [160, 100, 210])  # Nebula border.
+    np.testing.assert_array_equal(frame[102, 34], [45, 170, 155])  # Energy remains visible inside nebula.
+    np.testing.assert_array_equal(frame[102, 46], [105, 105, 115])  # Asteroid stays solid.
+    np.testing.assert_array_equal(frame[102, 58], [240, 205, 70])  # Relic above heatmap.
+    np.testing.assert_array_equal(frame[102, 70], [70, 180, 255])  # Ship above heatmap.
+    np.testing.assert_array_equal(frame[97, 77], [165, 140, 65])  # Scoring outline above heatmap.
+
+    # Changing the frame's extrema must not rescale an unchanged tile.
+    game = game.replace(map_features=game.map_features.replace(energy=game.map_features.energy.clip(-5, 15)))
+    next_frame = env.render(state._replace(game=game))  # (416, 640, 3)
+    np.testing.assert_array_equal(next_frame[126, 46], frame[126, 46])
+
+
+def test_render_team_visibility(
+    env: LuxEnv, initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]
+) -> None:
+    _, state = initial
+    sensor_mask = (
+        jnp.zeros((2, 24, 24), dtype=bool).at[0, 1:4, 4:7].set(True).at[0, 2, 5].set(False).at[1, 3:6, 4:7].set(True)
+    )  # (N, W, H), overlapping regions and an unseen hole in team 0's coverage
+    game = state.game.replace(
+        sensor_mask=sensor_mask,  # (N, W, H)
+        map_features=jax.tree.map(jnp.zeros_like, state.game.map_features),  # leaves: (W, H)
+        units_mask=jnp.zeros((2, 2), dtype=bool),  # (N, U)
+        relic_nodes_mask=jnp.zeros(6, dtype=bool),  # (R,)
+    )
+    frame = env.render(state._replace(game=game))  # (416, 640, 3)
+    blue, red, unseen = (70, 180, 255), (255, 95, 85), (25, 30, 45)
+    np.testing.assert_array_equal(frame[120, 34], blue)
+    np.testing.assert_array_equal(frame[120, 70], red)
+    np.testing.assert_array_equal(frame[120, [54, 57]], [blue, red])  # Shared boundary keeps both colors.
+    np.testing.assert_array_equal(frame[138, [39, 40]], [blue, unseen])  # Outline borders the unseen hole.
+    np.testing.assert_array_equal(frame[126, 40], unseen)  # No edge between adjacent visible tiles.
+    np.testing.assert_array_equal(frame[126, 34], unseen)  # Tile interiors retain their energy colors.
+    np.testing.assert_array_equal(frame[84, 70], unseen)  # No x/y swap.
+    np.testing.assert_array_equal(frame[120, 90], unseen)  # Unseen tiles stay unoutlined.
+
+    for visible in (False, True):
+        game = game.replace(sensor_mask=jnp.full((2, 24, 24), visible))  # mask: (N, W, H)
+        frame = env.render(state._replace(game=game))  # (416, 640, 3)
+        expected = np.broadcast_to(unseen, (286, 286, 3))  # (H, W, RGB)
+        np.testing.assert_array_equal(frame[73:359, 17:303], expected)
+        np.testing.assert_array_equal(frame[72, [16, 19]], [blue, red] if visible else [unseen, unseen])
+        np.testing.assert_array_equal(frame[359, [17, 20]], [blue, red] if visible else [unseen, unseen])
+
+
 def test_render_legend(env: LuxEnv, initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]) -> None:
     _, state = initial
     with patch.object(ImageDraw.ImageDraw, "text", autospec=True, side_effect=ImageDraw.ImageDraw.text) as text:
         frame = env.render(state)  # (416, 640, 3)
     labels = {call.args[2] for call in text.call_args_list}
     assert {"Empty", "Nebula", "Asteroid", "Relic", "Scoring tile", "Team 0", "Team 1"} <= labels
-    np.testing.assert_array_equal(frame[380, [22, 130, 238]], [[25, 30, 45], [70, 45, 100], [105, 105, 115]])
+    assert "Tile energy / turn" in labels
+    assert "SHIP ENERGY" not in labels
+    assert "Full map (hidden info); outlines = vision" in labels
+    assert f"Nebula drain: {int(state.params.nebula_tile_energy_reduction)} / turn" in labels
+    assert {str(int(state.params.min_energy_per_tile)), "0", str(int(state.params.max_energy_per_tile))} <= labels
+    np.testing.assert_array_equal(frame[333, [324, 474, 624]], [[205, 115, 45], [25, 30, 45], [45, 170, 155]])
+    np.testing.assert_array_equal(frame[380, [22, 130, 238]], [[25, 30, 45], [25, 30, 45], [105, 105, 115]])
+    np.testing.assert_array_equal(frame[374, 130], [160, 100, 210])
     np.testing.assert_array_equal(frame[380, 346], [240, 205, 70])
     np.testing.assert_array_equal(frame[374, 454], [165, 140, 65])
     np.testing.assert_array_equal(frame[380, 454], [14, 18, 28])  # Scoring marker is an outline.
