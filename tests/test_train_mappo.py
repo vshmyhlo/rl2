@@ -1031,7 +1031,7 @@ def test_lux_model_requires_matching_environment(config: ppo.Config, lux_env: bo
         replace(
             config,
             env=LuxConfig() if lux_env else config.env,
-            model=config.model if lux_env else ppo.LuxModelConfig(recurrent=config.model.recurrent),
+            model=config.model if lux_env else ppo.LuxModelConfig(),
         )
 
 
@@ -1068,7 +1068,7 @@ def test_default_lux_parameter_budget_and_output_shapes() -> None:
     assert jax.eval_shape(lambda policy: policy.logits, output.policy).shape == (1, 1, 1, 230)
     assert output.value.shape == (1, 1) and output.value.dtype == jnp.float32
     for leaf in jax.tree.leaves(output_carry.global_):
-        assert leaf.shape == (1, config.recurrent.hidden_size) and leaf.dtype == jnp.float32
+        assert leaf.shape == (1, token_size) and leaf.dtype == jnp.float32
 
 
 def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Path) -> None:
@@ -1080,7 +1080,6 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
             channels=4,
             heads=4,
             head_dim=2,
-            recurrent=config.model.recurrent,
             attention_implementation="xla",
         ),
         num_envs=1,
@@ -1240,9 +1239,7 @@ def test_historical_playback_uses_separate_weights_and_current_team_reward(confi
 )
 def test_historical_eval_metrics_and_artifacts(config: ppo.Config, returns: list[float], best_index: int) -> None:
     episodes = len(returns)
-    config = replace(
-        config, env=LuxConfig(), model=ppo.LuxModelConfig(recurrent=config.model.recurrent), eval_episodes=episodes
-    )
+    config = replace(config, env=LuxConfig(), model=ppo.LuxModelConfig(), eval_episodes=episodes)
     writer = Mock()
     memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
     opponent = {"weight": jnp.asarray(7.0)}  # ()
@@ -1302,7 +1299,7 @@ def test_training_evaluates_exact_historical_iterations(config: ppo.Config) -> N
     config = replace(
         config,
         env=LuxConfig(),
-        model=ppo.LuxModelConfig(recurrent=config.model.recurrent),
+        model=ppo.LuxModelConfig(),
         total_env_steps=401 * 4,
         eval_interval=100,
         log_interval=1000,

@@ -79,9 +79,10 @@ def test_shapes_batch_replay_and_bfloat16(
         axis=-1,
     )  # (B, T, E)
     assert encoded.tokens.shape == (*expected_mask.shape, 8)
-    assert encoded.token_mask.shape == expected_mask.shape
-    np.testing.assert_array_equal(encoded.token_mask, expected_mask)
-    np.testing.assert_array_equal(encoded.tokens[~encoded.token_mask], 0)
+    assert encoded.tokens_mask.shape == expected_mask.shape
+    np.testing.assert_array_equal(encoded.tokens_mask, expected_mask)
+    np.testing.assert_array_equal(encoded.token_types, [0, 1, 1, 1, 2, 2, 2, 3, 3])
+    np.testing.assert_array_equal(encoded.tokens[~encoded.tokens_mask], 0)
     assert encoded.spatial.shape == (2, 2, 12, 8, 4)
     assert encoded.map_tokens.shape == (2, 2, 6, 8)
     np.testing.assert_allclose(actual, jnp.broadcast_to(expected, actual.shape), atol=2e-6)

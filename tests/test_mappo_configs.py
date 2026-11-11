@@ -99,16 +99,9 @@ def test_rejects_separate_ship_recurrence() -> None:
         TypeAdapter(ModelConfig).validate_python({"type": "lux", "ship_recurrent": {"hidden_size": 4}})
 
 
-@pytest.mark.parametrize(
-    "settings",
-    [
-        {"num_layers": 2},
-        {"intermediate_size": 4},
-    ],
-)
-def test_lux_rejects_stack_settings(settings: dict[str, int]) -> None:
-    with pytest.raises(ValidationError, match="recurrent requires num_layers=1 and intermediate_size=0"):
-        TypeAdapter(ModelConfig).validate_python({"type": "lux", "recurrent": settings})
+def test_lux_rejects_separate_recurrent_settings() -> None:
+    with pytest.raises(ValidationError, match="recurrent"):
+        TypeAdapter(ModelConfig).validate_python({"type": "lux", "recurrent": {"hidden_size": 4}})
 
 
 @pytest.mark.parametrize("num_blocks", [0, True], ids=["empty_stack", "non_integer"])

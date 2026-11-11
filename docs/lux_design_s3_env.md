@@ -106,7 +106,7 @@ model shapes from the actual pytrees.
 The diagram shows `step` with batch size `B` and `U` own-ship slots;
 `__call__` adds a time axis after `B` and scans the global-token LSTMs over that axis.
 `D` is `model.heads * model.head_dim`; `C` is `model.channels`;
-`Hg` is `model.recurrent.hidden_size`; `A` is commands per ship (230).
+`Hg` is the global LSTM width, equal to `D`; `A` is commands per ship (230).
 
 The default model has 4,661,464 parameters: CNN width 64, attention width 256
 (eight 32-wide heads with per-head RMSNorm on queries/keys, 1024-wide self-attention FFNs),
@@ -214,8 +214,9 @@ flowchart TB
 Token order is global → own ships → opponent ships → relics.
 Reordering own ships permutes policy rows while global carry and value remain
 invariant. Opponent/relic ordering and masked padding do not affect outputs.
-Each block updates only its global token recurrently, then applies map
-cross-attention and self-attention + FFN to all valid tokens.
+Each block updates only its global token recurrently, adds its learned embeddings
+for the four token types, then applies map cross-attention and self-attention + FFN
+to all valid tokens.
 `model.num_blocks` defaults to 2; blocks have separate parameters and global
 memory. Each LSTM scans time independently; CNN and attention remain batched
 over timesteps, equivalent to repeated `step`.
@@ -278,7 +279,7 @@ not model parameter shapes. Rendering scales the board to fit its panel.
 - `model.channels` controls CNN width and requires positive even channels;
   attention width is `model.heads * model.head_dim`.
   `model.embedding_size` controls team and head widths;
-  `model.recurrent` configures the single global-token LSTM in each block,
+  each block uses a single global-token LSTM with width `model.heads * model.head_dim`,
   without stacking or intermediate MLPs.
   `model.attention_implementation` defaults to `triton`: both attention paths
   call Tokamax's Triton kernel.

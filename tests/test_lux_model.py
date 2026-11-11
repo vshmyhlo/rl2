@@ -14,7 +14,7 @@ from test_lux_encoder import observation as observation  # noqa: PLC0414
 
 from rl2.actions import HierarchicalMultiDiscreteSpace
 from rl2.envs.lux_env import LuxObservation
-from rl2.model.config import LSTMConfig, LuxModelConfig
+from rl2.model.config import LuxModelConfig
 from rl2.model.lux import (
     LuxActorCritic,
     LuxAttentionBlock,
@@ -34,7 +34,6 @@ def model() -> LuxActorCritic:
             channels=4,
             heads=4,
             head_dim=2,
-            recurrent=LSTMConfig(hidden_size=4),
             attention_implementation="xla",
         ),
     )
@@ -66,17 +65,16 @@ def test_recurrent_modules_initialize_carry_without_parameters(model: LuxActorCr
         attention_implementation="xla",
         heads=model.model.heads,
         head_dim=model.model.head_dim,
-        global_hidden_size=model.model.recurrent.hidden_size,
         dtype=jnp.bfloat16,
     )
-    memory = _GlobalMemory(features=model.model.recurrent.hidden_size, dtype=jnp.bfloat16)
+    memory = _GlobalMemory(features=model.model.heads * model.model.head_dim, dtype=jnp.bfloat16)
     carry = block.initial_carry(actor_count=2)  # leaves: (B, Hg)
     for module in (memory, block):
         chex.assert_trees_all_equal(module.initial_carry(2), carry)
         chex.assert_trees_all_equal(module.apply({}, 2, method="initial_carry"), carry)
     assert len(carry) == 2
     for leaf in carry:
-        assert leaf.shape == (2, model.model.recurrent.hidden_size) and leaf.dtype == jnp.float32
+        assert leaf.shape == (2, model.model.heads * model.model.head_dim) and leaf.dtype == jnp.float32
         np.testing.assert_array_equal(leaf, 0)
     combined = model.initial_carry(2)
     assert combined._fields == ("global_",)
@@ -88,21 +86,33 @@ def test_recurrent_modules_initialize_carry_without_parameters(model: LuxActorCr
 
 def test_recurrent_modules_return_output_and_carry(model: LuxActorCritic, params: dict[str, Any]) -> None:
     width = model.model.heads * model.model.head_dim
-    tokens = jax.random.normal(jax.random.key(5), (1, 2, 4, width))  # (B, T, E, D), global then three own ships
+    tokens = jax.random.normal(jax.random.key(5), (1, 2, 4, width))  # (B, T, E, D), one of each token type
+    token_types = jnp.arange(4, dtype=jnp.int32)  # (E,)
     mask = jnp.array([[[True, True, True, False]] * 2])  # (B, T, E)
     block = LuxAttentionBlock(
         attention_implementation="xla",
         heads=model.model.heads,
         head_dim=model.model.head_dim,
-        global_hidden_size=model.model.recurrent.hidden_size,
     )
     carry = block.initial_carry(actor_count=1)  # leaves: (B, Hg)
     variables = params["params"]["block_0"]
-    global_result = jax.jit(_GlobalMemory(features=model.model.recurrent.hidden_size).apply)(
+    global_result = jax.jit(_GlobalMemory(features=model.model.heads * model.model.head_dim).apply)(
         {"params": variables["global_memory"]}, tokens[..., 0, :], carry, jnp.ones((1, 2), bool)
     )  # token: (B, T, D); carry: (B, Hg)
-    block_result = jax.jit(block.apply)(
-        {"params": variables}, tokens, carry, jnp.ones((1, 2), bool), mask, jnp.ones((1, 2, 2, width))
+
+    def capture(module: nn.Module, method: str) -> bool:
+        return method == "__call__" and module.name == "input_norm"
+
+    block_result, state = jax.jit(block.apply, static_argnames=("capture_intermediates", "mutable"))(
+        {"params": variables},
+        tokens,
+        mask,
+        carry,
+        jnp.ones((1, 2), bool),
+        jnp.ones((1, 2, 2, width)),
+        token_types,
+        capture_intermediates=capture,
+        mutable=("intermediates",),
     )  # tokens: (B, T, E, D); carry: (B, Hg)
     for result, shape in ((global_result, (1, 2, width)), (block_result, (1, 2, 4, width))):
         assert type(result) is tuple and len(result) == 2
@@ -110,9 +120,14 @@ def test_recurrent_modules_return_output_and_carry(model: LuxActorCritic, params
         assert output.shape == shape
         assert len(updated_carry) == 2
         for leaf in updated_carry:
-            assert leaf.shape == (1, model.model.recurrent.hidden_size) and leaf.dtype == jnp.float32
+            assert leaf.shape == (1, model.model.heads * model.model.head_dim) and leaf.dtype == jnp.float32
     chex.assert_trees_all_equal(global_result[1], block_result[1])
-    np.testing.assert_array_equal(block_result[0][..., 3, :], 0)  # Masked ship remains inactive.
+    np.testing.assert_array_equal(block_result[0][..., 3, :], 0)  # Masked relic remains inactive.
+    embeddings = variables["token_type_embedding"]["embedding"]  # (4, D)
+    assert embeddings.shape == (4, width)
+    typed = tokens.at[..., 0, :].set(global_result[0]) + embeddings[token_types]  # (B, T, E, D)
+    expected = nn.LayerNorm().apply({"params": variables["input_norm"]}, typed.reshape((2, 4, width)))  # (B*T, E, D)
+    np.testing.assert_allclose(state["intermediates"]["input_norm"]["__call__"][0], expected, atol=2e-6)
 
 
 def test_sequence_step_replay_reset_and_bfloat16(
@@ -578,13 +593,13 @@ def test_history_conditions_the_following_attention(
     original, updated = attend(memory), attend(changed)
     assert all(leaf.shape == (1, 9, 8) for leaf in original)
     if stage == 0:
-        assert float(jnp.max(jnp.abs(original.first_map[:, -1] - updated.first_map[:, -1]))) > 1e-4
-        assert float(jnp.max(jnp.abs(original.first_set[:, 1] - updated.first_set[:, 1]))) > 1e-4
+        assert float(jnp.max(jnp.abs(original.first_map[:, 0] - updated.first_map[:, 0]))) > 1e-4
+        assert float(jnp.max(jnp.abs(original.first_set[:, 2] - updated.first_set[:, 2]))) > 1e-4
     else:
         np.testing.assert_array_equal(original.first_map, updated.first_map)
         np.testing.assert_array_equal(original.first_set, updated.first_set)
-    assert float(jnp.max(jnp.abs(original.second_map[:, -1] - updated.second_map[:, -1]))) > 1e-4
-    assert float(jnp.max(jnp.abs(original.second_set[:, 1] - updated.second_set[:, 1]))) > 1e-4
+    assert float(jnp.max(jnp.abs(original.second_map[:, 0] - updated.second_map[:, 0]))) > 1e-4
+    assert float(jnp.max(jnp.abs(original.second_set[:, 2] - updated.second_set[:, 2]))) > 1e-4
 
 
 @pytest.mark.parametrize("num_blocks", [1, 3], ids=["minimum_depth", "additional_block"])
@@ -604,9 +619,11 @@ def test_configurable_block_depth(
     assert output.policy.raw_logits.shape == (1, 1, 3, 16)
     assert output.value.shape == (1, 1)
     assert len(output_carry.global_) == num_blocks
-    assert all(leaf.shape == (1, model.model.recurrent.hidden_size) for leaf in jax.tree.leaves(output_carry.global_))
+    assert all(
+        leaf.shape == (1, model.model.heads * model.model.head_dim) for leaf in jax.tree.leaves(output_carry.global_)
+    )
     for index in range(num_blocks):
-        assert {"global_memory", "input_norm", "map_attention", "set_attention"} == set(
+        assert {"global_memory", "token_type_embedding", "input_norm", "map_attention", "set_attention"} == set(
             variables["params"][f"block_{index}"]
         )
 
@@ -627,7 +644,7 @@ def test_attention_width_is_independent_of_cnn_channels(
     assert output.policy.raw_logits.shape == (1, 1, 3, 16)
     assert output.value.shape == (1, 1)
     encoder = variables["params"]["lux"]["encoder"]
-    assert all(leaf.shape == (1, model.model.recurrent.hidden_size) for leaf in jax.tree.leaves(output_carry))
+    assert all(leaf.shape == (1, model.model.heads * model.model.head_dim) for leaf in jax.tree.leaves(output_carry))
     assert encoder["ship_projection"]["kernel"].shape == (7, 6)
     assert encoder["map_encoder"]["map_downsample_1"]["kernel"].shape == (3, 3, 6, 6)
     for index in range(model.model.num_blocks):

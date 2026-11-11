@@ -24,7 +24,7 @@ Shape dimensions:
     A: Action categories per discrete component.
     C: Action component shape; () for scalar actions or (D,) for D components.
     D: Discrete action components per agent (e.g., ships controlled by a team in Lux).
-    H: Recurrent hidden width (model.recurrent.hidden_size).
+    H: Recurrent hidden width (Lux: model.heads * model.head_dim; generic: model.recurrent.hidden_size).
     L: Raw policy logits per action component.
     K: Raw PRNG key words.
     Spatial arrays use H, W for height, width; Lux maps have shape (*S, H, W).

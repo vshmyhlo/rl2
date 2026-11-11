@@ -265,7 +265,6 @@ def test_lux_pool_preserves_structured_observations_and_match_memory(config: ppo
         model=ppo.LuxModelConfig(
             embedding_size=4,
             channels=4,
-            recurrent=config.model.recurrent,
             heads=2,
             head_dim=2,
             attention_implementation="xla",

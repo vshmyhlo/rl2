@@ -17,21 +17,21 @@ from rl2.model.encoders.conv2d import ResidualBlock
 # U/V = own/opponent ship slots; N = U+V; R = relic slots; E = N+R+1 entity tokens.
 # H/W = map height/width; P = downsampled map tokens; C = spatial CNN channels.
 # Q/K = attention query/key counts; Nh = heads; Dh = head_dim; D = Nh*Dh token width.
-# F = embedding size; Hg = global LSTM hidden size.
+# F = embedding size; Hg = global LSTM hidden size (equal to D).
 # A = action logits per ship; As = sap targets, A = 7+As.
 # M/Cv = rasterized entity count/value channels.
 
 
 def _rasterize(
     positions: jax.Array,  # (B, M, 2), x/y coordinates
-    mask: jax.Array,  # (B, M)
+    positions_mask: jax.Array,  # (B, M)
     values: jax.Array,  # (B, M, Cv)
     height: int,
     width: int,
 ) -> jax.Array:  # (B, H, W, Cv)
     """Sum visible entities on each tile, including stacked ships."""
     positions = jnp.clip(positions, 0, jnp.array([width - 1, height - 1]))  # (B, M, 2)
-    values = jnp.where(mask[..., None], values, 0)  # (B, M, Cv)
+    values = jnp.where(positions_mask[..., None], values, 0)  # (B, M, Cv)
     grid = jnp.zeros((positions.shape[0], height, width, values.shape[-1]), dtype=values.dtype)  # (B, H, W, Cv)
     return grid.at[jnp.arange(positions.shape[0])[:, None], positions[..., 1], positions[..., 0]].add(values)
 
@@ -69,7 +69,7 @@ class _Attention(nn.Module):
         self,
         tokens: jax.Array,  # (B, Q, Dx), Dx is the input width
         context: jax.Array,  # (B, K, Dc), Dc is the context width
-        key_mask: jax.Array | None = None,  # (B, 1, 1, K) bool; at least one valid key per example
+        context_mask: jax.Array | None = None,  # (B, 1, 1, K) bool; at least one valid key per example
     ) -> jax.Array:  # (B, Q, D)
         query = nn.DenseGeneral(features=(self.heads, self.head_dim), dtype=self.dtype, name="query")(
             tokens
@@ -91,7 +91,7 @@ class _Attention(nn.Module):
             query,
             key,
             value,
-            mask=key_mask,
+            mask=context_mask,
             is_causal=False,
             scale=self.head_dim**-0.5,
             implementation=self.attention_implementation,
@@ -113,7 +113,7 @@ class _SetAttentionBlock(nn.Module):
     def __call__(
         self,
         tokens: jax.Array,  # (B, E, D), E includes an always-valid global token
-        token_mask: jax.Array,  # (B, E) bool
+        tokens_mask: jax.Array,  # (B, E) bool
     ) -> jax.Array:  # (B, E, D)
         normalized = nn.LayerNorm(dtype=self.dtype, name="attention_norm")(tokens)  # (B, E, D)
         attended = _Attention(
@@ -123,7 +123,7 @@ class _SetAttentionBlock(nn.Module):
             dtype=self.dtype,
             name="attention",
         )(
-            normalized, normalized, token_mask[:, None, None, :]
+            normalized, normalized, tokens_mask[:, None, None, :]
         )  # (B, E, D); masking keys excludes padded entities in both directions
         tokens = tokens + attended  # (B, E, D)
         hidden = nn.LayerNorm(dtype=self.dtype, name="ffn_norm")(tokens)  # (B, E, D)
@@ -131,7 +131,7 @@ class _SetAttentionBlock(nn.Module):
             nn.Dense(features=4 * self.heads * self.head_dim, dtype=self.dtype, name="ffn_in")(hidden)
         )  # (B, E, 4D)
         hidden = nn.Dense(features=self.heads * self.head_dim, dtype=self.dtype, name="ffn_out")(hidden)  # (B, E, D)
-        return jnp.where(token_mask[..., None], tokens + hidden, 0)  # (B, E, D)
+        return jnp.where(tokens_mask[..., None], tokens + hidden, 0)  # (B, E, D)
 
 
 class LuxFeatures(NamedTuple):
@@ -148,7 +148,8 @@ class LuxCarry(NamedTuple):
 
 class _LuxTokens(NamedTuple):
     tokens: jax.Array  # (*S, E, D), global, own ships, opponent ships, relics
-    token_mask: jax.Array  # (*S, E) bool
+    tokens_mask: jax.Array  # (*S, E) bool
+    token_types: jax.Array  # (E,) int32: global=0, own=1, opponent=2, relic=3
     map_tokens: jax.Array  # (*S, P, D)
     spatial: jax.Array  # (*S, H, W, C)
 
@@ -186,17 +187,16 @@ class _GlobalMemory(nn.Module):
 
 
 class LuxAttentionBlock(nn.Module):
-    """Global-token recurrence, map retrieval, then entity mixing."""
+    """Global-token recurrence, type embeddings, map retrieval, then entity mixing."""
 
     attention_implementation: Literal["triton", "xla"]
     heads: int = 8
     head_dim: int = 32
-    global_hidden_size: int = 256
     dtype: jax.typing.DTypeLike | None = None
 
     @nn.nowrap
     def _make_global_memory(self, *, parent: nn.Module | None = None) -> _GlobalMemory:
-        return _GlobalMemory(features=self.global_hidden_size, dtype=self.dtype, name="global_memory", parent=parent)
+        return _GlobalMemory(features=self.heads * self.head_dim, dtype=self.dtype, name="global_memory", parent=parent)
 
     @nn.nowrap
     def initial_carry(self, actor_count: int) -> LSTMCarry:
@@ -205,6 +205,9 @@ class LuxAttentionBlock(nn.Module):
 
     def setup(self) -> None:
         self.global_memory = self._make_global_memory(parent=self)
+        self.token_type_embedding = nn.Embed(
+            num_embeddings=4, features=self.heads * self.head_dim, dtype=self.dtype, name="token_type_embedding"
+        )
         self.input_norm = nn.LayerNorm(dtype=self.dtype, name="input_norm")
         self.map_attention = _Attention(
             attention_implementation=self.attention_implementation,
@@ -224,42 +227,43 @@ class LuxAttentionBlock(nn.Module):
     def __call__(
         self,
         tokens: jax.Array,  # (B, T, E, D)
+        tokens_mask: jax.Array,  # (B, T, E) bool
         carry: LSTMCarry,  # cell/hidden: (B, Hg)
         episode_start: jax.Array,  # (B, T) bool
-        token_mask: jax.Array,  # (B, T, E) bool
         map_tokens: jax.Array,  # (B, T, P, D)
+        token_types: jax.Array,  # (E,) int32: global=0, own=1, opponent=2, relic=3
     ) -> tuple[jax.Array, LSTMCarry]:  # tokens: (B, T, E, D); carry leaves: (B, Hg)
         global_token, carry = self.global_memory(
             tokens[..., 0, :], carry, episode_start
         )  # token: (B, T, D); carry leaves: (B, Hg)
         tokens = tokens.at[..., 0, :].set(global_token)  # (B, T, E, D)
+        tokens = tokens + self.token_type_embedding(token_types)  # (B, T, E, D)
         token_shape = tokens.shape
         batch_size = prod(tokens.shape[:-2])
         tokens = tokens.reshape((batch_size, *tokens.shape[-2:]))  # (B*T, E, D)
         map_tokens = map_tokens.reshape((batch_size, *map_tokens.shape[-2:]))  # (B*T, P, D)
-        token_mask = token_mask.reshape((batch_size, token_mask.shape[-1]))  # (B*T, E)
+        tokens_mask = tokens_mask.reshape((batch_size, tokens_mask.shape[-1]))  # (B*T, E)
         attended = self.map_attention(self.input_norm(tokens), map_tokens)  # (B*T, E, D)
-        tokens = jnp.where(token_mask[..., None], tokens + attended, 0)  # (B*T, E, D)
-        tokens = self.set_attention(tokens, token_mask).reshape(token_shape)  # (B, T, E, D)
+        tokens = jnp.where(tokens_mask[..., None], tokens + attended, 0)  # (B*T, E, D)
+        tokens = self.set_attention(tokens, tokens_mask).reshape(token_shape)  # (B, T, E, D)
         return tokens, carry  # (B, T, E, D); leaves: (B, Hg)
 
 
 class LuxMapEncoder(nn.Module):
     """Encode visible map tiles and entities into spatial features and map tokens."""
 
-    token_size: int
+    features: int
     channels: int = 64
     dtype: jax.typing.DTypeLike | None = None
 
     def setup(self) -> None:
-        token_size = self.token_size
         self.tile_embedding = nn.Embed(num_embeddings=4, features=4, dtype=self.dtype, name="tile_embedding")
         self.map_stem = nn.Conv(features=self.channels, kernel_size=(3, 3), dtype=self.dtype, name="map_stem")
         self.map_norm = nn.LayerNorm(dtype=self.dtype, name="map_norm")
         self.map_local = ResidualBlock(channels=self.channels, dtype=self.dtype, name="map_local")
         self.map_downsample = tuple(
             nn.Conv(
-                features=token_size, kernel_size=(3, 3), strides=(2, 2), dtype=self.dtype, name=f"map_downsample_{i}"
+                features=self.features, kernel_size=(3, 3), strides=(2, 2), dtype=self.dtype, name=f"map_downsample_{i}"
             )
             for i in range(2)
         )
@@ -271,19 +275,26 @@ class LuxMapEncoder(nn.Module):
         self,
         observation: LuxObservation[jax.Array],  # leaves: (B, ...)
         positions: jax.Array,  # (B, N, 2), masked positions replaced with zero
+        positions_mask: jax.Array,  # (B, N), own ships followed by opponents
         energy: jax.Array,  # (B, N), normalized and zero for masked ships
-        ship_mask: jax.Array,  # (B, N), own ships followed by opponents
     ) -> tuple[jax.Array, jax.Array]:  # spatial: (B, H, W, C); map tokens: (B, P, D)
         sensor_mask = observation.world.sensor_mask  # (B, H, W)
         batch_size, height, width = sensor_mask.shape
         own_ship_count = observation.self.units_mask.shape[-1]
-        token_size = self.token_size
         ship_values = jnp.stack((jnp.ones_like(energy), energy), axis=-1)  # (B, N, 2), count/total energy
         own_grid = _rasterize(
-            positions[:, :own_ship_count], ship_mask[:, :own_ship_count], ship_values[:, :own_ship_count], height, width
+            positions[:, :own_ship_count],
+            positions_mask[:, :own_ship_count],
+            ship_values[:, :own_ship_count],
+            height,
+            width,
         )  # (B, H, W, 2)
         opponent_grid = _rasterize(
-            positions[:, own_ship_count:], ship_mask[:, own_ship_count:], ship_values[:, own_ship_count:], height, width
+            positions[:, own_ship_count:],
+            positions_mask[:, own_ship_count:],
+            ship_values[:, own_ship_count:],
+            height,
+            width,
         )  # (B, H, W, 2)
         relic_grid = _rasterize(
             observation.world.relic_nodes,
@@ -326,7 +337,7 @@ class LuxMapEncoder(nn.Module):
         for index in range(2):
             grid = self.map_downsample[index](grid)  # (B, ceil(H/2**(index+1)), ceil(W/2**(index+1)), D)
             grid = nn.silu(self.map_downsample_norm[index](grid))  # (B, ceil(H/2**(index+1)), ceil(W/2**(index+1)), D)
-        map_tokens = grid.reshape((batch_size, -1, token_size))  # (B, P, D), P=36 for a 24x24 map
+        map_tokens = grid.reshape((batch_size, -1, self.features))  # (B, P, D), P=36 for a 24x24 map
 
         return spatial, map_tokens  # (B, H, W, C); (B, P, D)
 
@@ -352,7 +363,7 @@ class LuxEncoder(nn.Module):
         self.output_projection = nn.Dense(features=self.features, dtype=self.dtype, name="output_projection")
         self.output_norm = nn.LayerNorm(dtype=self.dtype, name="output_norm")
         self.map_encoder = LuxMapEncoder(
-            token_size=self.token_size, channels=self.channels, dtype=self.dtype, name="map_encoder"
+            features=self.token_size, channels=self.channels, dtype=self.dtype, name="map_encoder"
         )
         self.ship_projection = nn.Dense(features=token_size, dtype=self.dtype, name="ship_projection")
         self.relic_projection = nn.Dense(features=token_size, dtype=self.dtype, name="relic_projection")
@@ -407,34 +418,45 @@ class LuxEncoder(nn.Module):
         sensor_mask = observation.world.sensor_mask  # (B, H, W)
         height, width = sensor_mask.shape[-2:]
         token_size = self.token_size
-        positions, energy, ship_mask = jax.tree.map(
+        positions, energy, positions_mask = jax.tree.map(
             lambda own, opponent: jnp.concatenate((own, opponent), axis=1),
             (observation.self.units.position, observation.self.units.energy, observation.self.units_mask),
             (observation.opponent.units.position, observation.opponent.units.energy, observation.opponent.units_mask),
         )  # (B, N, 2); (B, N); (B, N)
-        positions = jnp.where(ship_mask[..., None], positions, 0)  # (B, N, 2)
-        energy = jnp.where(ship_mask, energy, 0).astype(jnp.float32) / 400.0  # (B, N)
-        spatial, map_tokens = self.map_encoder(observation, positions, energy, ship_mask)  # (B, H, W, C); (B, P, D)
+        positions = jnp.where(positions_mask[..., None], positions, 0)  # (B, N, 2)
+        energy = jnp.where(positions_mask, energy, 0).astype(jnp.float32) / 400.0  # (B, N)
+        spatial, map_tokens = self.map_encoder(
+            observation, positions, positions_mask, energy
+        )  # (B, H, W, C); (B, P, D)
         ships, relics = self._encode_entities(observation, positions, energy, spatial)  # (B, N, D); (B, R, D)
         context = _global_context(observation)  # (B, 14)
         context = nn.silu(self.context_projection(context))  # (B, D)
         tokens = jnp.concatenate((context[:, None], ships, relics), axis=1)  # (B, E, D)
-        token_mask = jnp.concatenate(
-            (jnp.ones((batch_size, 1), bool), ship_mask, observation.world.relic_nodes_mask), axis=1
+        tokens_mask = jnp.concatenate(
+            (jnp.ones((batch_size, 1), bool), positions_mask, observation.world.relic_nodes_mask), axis=1
         )  # (B, E)
-        tokens = jnp.where(token_mask[..., None], tokens, 0)  # (B, E, D)
+        tokens = jnp.where(tokens_mask[..., None], tokens, 0)  # (B, E, D)
+        token_types = jnp.concatenate(
+            (
+                jnp.zeros(1, jnp.int32),
+                jnp.ones(observation.self.units_mask.shape[-1], jnp.int32),
+                jnp.full(observation.opponent.units_mask.shape[-1], 2, jnp.int32),
+                jnp.full(observation.world.relic_nodes_mask.shape[-1], 3, jnp.int32),
+            )
+        )  # (E,)
         return _LuxTokens(
             tokens=tokens.reshape((*batch_shape, tokens.shape[1], token_size)),  # (*S, E, D)
-            token_mask=token_mask.reshape((*batch_shape, token_mask.shape[1])),  # (*S, E)
+            tokens_mask=tokens_mask.reshape((*batch_shape, tokens_mask.shape[1])),  # (*S, E)
+            token_types=token_types,  # (E,)
             map_tokens=map_tokens.reshape((*batch_shape, map_tokens.shape[1], token_size)),  # (*S, P, D)
             spatial=spatial.reshape((*batch_shape, height, width, self.channels)),  # (*S, H, W, C)
         )
 
     def summarize(self, encoded: _LuxTokens, observation: LuxObservation[jax.Array]) -> LuxFeatures:
-        # encoded and observation leaves: (*S, ...)
+        # Batched leaves: (*S, ...); encoded.token_types: (E,).
         own_ship_count = observation.self.units_mask.shape[-1]
         total_ship_count = own_ship_count + observation.opponent.units_mask.shape[-1]
-        tokens = jnp.where(encoded.token_mask[..., None], self.entity_norm(encoded.tokens), 0)  # (*S, E, D)
+        tokens = jnp.where(encoded.tokens_mask[..., None], self.entity_norm(encoded.tokens), 0)  # (*S, E, D)
         own = tokens[..., 1 : 1 + own_ship_count, :]  # (*S, U, D)
         own_mean = own.sum(-2) / jnp.maximum(observation.self.units_mask.sum(-1, keepdims=True), 1)  # (*S, D)
         opponents = tokens[..., 1 + own_ship_count : 1 + total_ship_count, :]  # (*S, V, D)
@@ -560,7 +582,6 @@ class LuxActorCritic(BaseActorCritic[LuxObservation[jax.Array], LuxCarry, Hierar
             attention_implementation=self.model.attention_implementation,
             heads=self.model.heads,
             head_dim=self.model.head_dim,
-            global_hidden_size=self.model.recurrent.hidden_size,
             dtype=self.dtype,
             name=f"block_{index}",
             parent=parent,
@@ -592,17 +613,18 @@ class LuxActorCritic(BaseActorCritic[LuxObservation[jax.Array], LuxCarry, Hierar
         episode_start: jax.Array,  # (B, T)
     ) -> tuple[LuxFeatures, LuxCarry]:  # features: (B, T, ...); carry: (B, ...)
         """Interleave global-token recurrence with within-observation attention."""
-        encoded = self.lux.encoder.prepare(observation)  # leaves: (B, T, ...)
+        encoded = self.lux.encoder.prepare(observation)  # batched leaves: (B, T, ...); token_types: (E,)
         global_carries: list[LSTMCarry] = []  # per-block leaves: (B, Hg)
         for block, global_carry in zip(self.blocks, carry.global_, strict=True):
             tokens, global_carry = block(
                 tokens=encoded.tokens,
+                tokens_mask=encoded.tokens_mask,
                 carry=global_carry,  # leaves: (B, Hg)
                 episode_start=episode_start,  # (B, T)
-                token_mask=encoded.token_mask,
                 map_tokens=encoded.map_tokens,
+                token_types=encoded.token_types,
             )  # tokens: (B, T, E, D); carry leaves: (B, Hg)
-            encoded = encoded._replace(tokens=tokens)  # leaves: (B, T, ...)
+            encoded = encoded._replace(tokens=tokens)  # batched leaves: (B, T, ...); token_types: (E,)
             global_carries.append(global_carry)
         features = self.lux.encoder.summarize(encoded, observation)  # leaves: (B, T, ...)
         carry = LuxCarry(global_=tuple(global_carries))  # per-block leaves: (B, Hg)

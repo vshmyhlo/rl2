@@ -36,11 +36,6 @@ class LuxModelConfig:
     heads: Annotated[int, Field(gt=0, strict=True)] = 8
     head_dim: Annotated[int, Field(gt=0, strict=True)] = 32
     attention_implementation: Literal["triton", "xla"] = "triton"
-    recurrent: LSTMConfig = LSTMConfig(hidden_size=256)
-
-    def __post_init__(self) -> None:
-        if self.recurrent.num_layers != 1 or self.recurrent.intermediate_size != 0:
-            raise ValueError("recurrent requires num_layers=1 and intermediate_size=0 for a single LSTM")
 
 
 def _default_model_type(value: Any) -> Any:
