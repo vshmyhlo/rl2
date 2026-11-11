@@ -21,8 +21,8 @@ def test_initial_carry_is_zero_float32_even_with_bf16_compute() -> None:
 
 def test_bf16_lstm_preserves_float32_gate_and_memory_precision() -> None:
     model = LSTM(1, dtype=jnp.bfloat16)
-    x = jnp.zeros((2, 1, 1), dtype=jnp.bfloat16)
-    starts = jnp.zeros((2, 1), dtype=jnp.bool_)
+    x = jnp.zeros((1, 2, 1), dtype=jnp.bfloat16)  # (B, T, I)
+    starts = jnp.zeros((1, 2), dtype=jnp.bool_)  # (B, T)
     carry = (jnp.full((1, 1), 0.75, dtype=jnp.float32), jnp.zeros((1, 1), dtype=jnp.float32))
     variables = model.init(jax.random.key(0), x, carry, starts)
     variables = jax.tree.map(jnp.zeros_like, variables)
@@ -42,13 +42,13 @@ def test_bf16_lstm_preserves_float32_gate_and_memory_precision() -> None:
     final, output = jax.jit(model.apply)(variables, x, carry, starts)
     np.testing.assert_allclose(final[0], expected_cell, rtol=1e-6, atol=0)
     np.testing.assert_allclose(final[1], expected_hidden[-1], rtol=1e-6, atol=0)
-    np.testing.assert_array_equal(output, jnp.array(expected_hidden, dtype=jnp.bfloat16).reshape(2, 1, 1))
+    np.testing.assert_array_equal(output, jnp.array(expected_hidden, dtype=jnp.bfloat16).reshape(1, 2, 1))
 
 
 def test_bf16_lstm_accepts_weakly_typed_float32_carry() -> None:
     model = LSTM(1, dtype=jnp.bfloat16)
-    x = jax.ShapeDtypeStruct((2, 1, 1), jnp.bfloat16)
-    starts = jax.ShapeDtypeStruct((2, 1), jnp.bool_)
+    x = jax.ShapeDtypeStruct((1, 2, 1), jnp.bfloat16)  # (B, T, I)
+    starts = jax.ShapeDtypeStruct((1, 2), jnp.bool_)  # (B, T)
     # Arrays made from Python floats can have weak_type=True while still
     # satisfying the float32 carry contract; promotion must not narrow them.
     memory = jax.ShapeDtypeStruct((1, 1), jnp.float32, weak_type=True)
@@ -76,8 +76,8 @@ def test_lstm_sequence_step_chunks_and_resets(
 ) -> None:
     model = LSTMStack(4, num_layers, intermediate_size, dtype=dtype) if num_layers else LSTM(4, dtype=dtype)
     assert isinstance(model, RecurrentSequenceModel)
-    x = jax.random.normal(jax.random.key(0), (4, 2, 4 if num_layers else 3)).astype(dtype)
-    starts = jnp.zeros((4, 2), dtype=jnp.bool_).at[2:, 0].set(True)
+    x = jax.random.normal(jax.random.key(0), (2, 4, 4 if num_layers else 3)).astype(dtype)  # (B, T, I)
+    starts = jnp.zeros((2, 4), dtype=jnp.bool_).at[0, 2:].set(True)  # (B, T)
     fresh_carry = model.initial_carry(2)
     incoming = jax.tree.map(partial(jnp.full_like, fill_value=0.5), fresh_carry) if supplied_carry else fresh_carry
     params = model.init(jax.random.key(1), x, incoming, starts)
@@ -86,49 +86,53 @@ def test_lstm_sequence_step_chunks_and_resets(
     final, output = apply(params, x, incoming, starts)
     carry = incoming
     outputs = []
-    for t in range(x.shape[0]):
-        carry, value = step(params, x[t], carry, starts[t])
+    for t in range(x.shape[1]):
+        carry, value = step(params, x[:, t], carry, starts[:, t])  # carry leaves: (B, H); value: (B, H)
         outputs.append(value)
     tolerance = 0.008 if dtype == jnp.bfloat16 else 1e-6
-    np.testing.assert_allclose(output, jnp.stack(outputs), atol=tolerance, rtol=0)
+    np.testing.assert_allclose(output, jnp.stack(outputs, axis=1), atol=tolerance, rtol=0)
     for actual, expected in zip(jax.tree.leaves(carry), jax.tree.leaves(final), strict=True):
         np.testing.assert_allclose(actual, expected, atol=tolerance, rtol=0)
         assert actual.dtype == jnp.float32
-    assert output.shape == (4, 2, 4)
+    assert output.shape == (2, 4, 4)
     assert output.dtype == dtype
     for leaf in jax.tree.leaves(params):
         assert leaf.dtype == jnp.float32
 
     # Both entry points initialize the same parameters, allowing step-only use.
-    step_params = model.init(jax.random.key(1), x[0], incoming, starts[0], method=model.step)
+    step_params = model.init(jax.random.key(1), x[:, 0], incoming, starts[:, 0], method=model.step)
     for actual, expected in zip(jax.tree.leaves(step_params), jax.tree.leaves(params), strict=True):
         np.testing.assert_array_equal(actual, expected)
 
-    prefix_carry, prefix = apply(params, x[:2], incoming, starts[:2])
-    chunk_carry, suffix = apply(params, x[2:], prefix_carry, starts[2:])
-    np.testing.assert_allclose(jnp.concatenate((prefix, suffix)), output, atol=tolerance, rtol=0)
+    prefix_carry, prefix = apply(params, x[:, :2], incoming, starts[:, :2])  # carry leaves: (B, H); prefix: (B, 2, H)
+    chunk_carry, suffix = apply(
+        params, x[:, 2:], prefix_carry, starts[:, 2:]
+    )  # carry leaves: (B, H); suffix: (B, 2, H)
+    np.testing.assert_allclose(jnp.concatenate((prefix, suffix), axis=1), output, atol=tolerance, rtol=0)
     for actual, expected in zip(jax.tree.leaves(chunk_carry), jax.tree.leaves(final), strict=True):
         np.testing.assert_allclose(actual, expected, atol=tolerance, rtol=0)
-    _, fresh = apply(params, x[2:], fresh_carry, starts[2:])
-    np.testing.assert_allclose(suffix[:, 0], fresh[:, 0], atol=tolerance, rtol=0)
-    assert float(jnp.max(jnp.abs(suffix[:, 1] - fresh[:, 1]))) > 1e-3
+    _, fresh = apply(params, x[:, 2:], fresh_carry, starts[:, 2:])  # (B, 2, H)
+    np.testing.assert_allclose(suffix[0], fresh[0], atol=tolerance, rtol=0)
+    assert float(jnp.max(jnp.abs(suffix[1] - fresh[1]))) > 1e-3
 
 
 @pytest.mark.parametrize("stacked", (False, True))
 def test_lstm_gradients_follow_history_but_stop_at_episode_reset(stacked: bool) -> None:
     model = LSTMStack(4, 2, 8) if stacked else LSTM(4)
-    inputs = jax.random.normal(jax.random.key(2), (4, 2, 4 if stacked else 3))
-    starts = jnp.zeros((4, 2), dtype=jnp.bool_).at[2, 0].set(True)
+    inputs = jax.random.normal(jax.random.key(2), (2, 4, 4 if stacked else 3))  # (B, T, I)
+    starts = jnp.zeros((2, 4), dtype=jnp.bool_).at[0, 2].set(True)  # (B, T)
     carry = model.initial_carry(2)
     params = model.init(jax.random.key(1), inputs, carry, starts)
 
-    def loss(x: jax.Array, memory: LSTMCarry | LSTMStackCarry) -> jax.Array:
-        return model.apply(params, x, memory, starts)[1][-1].sum()
+    def loss(
+        x: jax.Array, memory: LSTMCarry | LSTMStackCarry
+    ) -> jax.Array:  # x: (B, T, I); memory leaves: (B, H); result: ()
+        return model.apply(params, x, memory, starts)[1][:, -1].sum()  # ()
 
     grads, carry_grads = jax.jit(jax.grad(loss, argnums=(0, 1)))(inputs, carry)
-    np.testing.assert_array_equal(grads[:2, 0], 0)
-    assert float(jnp.linalg.norm(grads[:2, 1])) > 0
-    assert float(jnp.linalg.norm(grads[2:, 0])) > 0
+    np.testing.assert_array_equal(grads[0, :2], 0)
+    assert float(jnp.linalg.norm(grads[1, :2])) > 0
+    assert float(jnp.linalg.norm(grads[0, 2:])) > 0
     for grad in jax.tree.leaves(carry_grads):
         np.testing.assert_array_equal(grad[0], 0)
         assert float(jnp.linalg.norm(grad[1])) > 0
@@ -137,16 +141,16 @@ def test_lstm_gradients_follow_history_but_stop_at_episode_reset(stacked: bool) 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
 def test_batched_projection_gradients_match_original_cell(dtype: jax.typing.DTypeLike) -> None:
     model = LSTM(4, dtype=dtype)
-    x = jax.random.normal(jax.random.key(0), (4, 2, 3)).astype(dtype)  # (T, B, I)
-    starts = jnp.zeros((4, 2), bool).at[2, 0].set(True)  # (T, B)
+    x = jax.random.normal(jax.random.key(0), (2, 4, 3)).astype(dtype)  # (B, T, I)
+    starts = jnp.zeros((2, 4), bool).at[0, 2].set(True)  # (B, T)
     memory = jax.tree.map(lambda state: state + 0.25, model.initial_carry(2))  # each (B, H)
     variables = model.init(jax.random.key(1), x, memory, starts)  # parameter leaves
 
     def loss(
         params: chex.ArrayTree, inputs: jax.Array, carry: LSTMCarry, *, sequence: bool
-    ) -> jax.Array:  # inputs: (T, B, I); carry: each (B, H); result: ()
+    ) -> jax.Array:  # inputs: (B, T, I); carry: each (B, H); result: ()
         if sequence:
-            final, output = model.apply(params, inputs, carry, starts)  # each (B, H); (T, B, H)
+            final, output = model.apply(params, inputs, carry, starts)  # each (B, H); (B, T, H)
         else:
 
             def step(
@@ -154,7 +158,9 @@ def test_batched_projection_gradients_match_original_cell(dtype: jax.typing.DTyp
             ) -> tuple[LSTMCarry, jax.Array]:  # state: each (B, H); data: (B, I), (B,); output: (B, H)
                 return model.apply(params, data[0], state, data[1], method=model.step)
 
-            final, output = jax.lax.scan(step, carry, (inputs, starts))  # each (B, H); (T, B, H)
+            scan_inputs = jax.tree.map(lambda leaf: jnp.swapaxes(leaf, 0, 1), (inputs, starts))  # (T, B, I); (T, B)
+            final, output = jax.lax.scan(step, carry, scan_inputs)  # each (B, H); (T, B, H)
+            output = jnp.swapaxes(output, 0, 1)  # (B, T, H)
         return jnp.square(output.astype(jnp.float32)).sum() + sum(jnp.square(s).sum() for s in final)  # ()
 
     actual = jax.jit(jax.value_and_grad(partial(loss, sequence=True), argnums=(0, 1, 2)))(variables, x, memory)
@@ -164,7 +170,7 @@ def test_batched_projection_gradients_match_original_cell(dtype: jax.typing.DTyp
     chex.assert_trees_all_close(actual, expected, atol=tolerance, rtol=tolerance)
 
 
-@pytest.mark.parametrize("shape", [(0, 1, 3), (1, 0, 3), (1, 1, 0)], ids=["time", "batch", "features"])
+@pytest.mark.parametrize("shape", [(0, 1, 3), (1, 0, 3), (1, 1, 0)], ids=["batch", "time", "features"])
 def test_lstm_rejects_empty_input_dimensions(shape: tuple[int, int, int]) -> None:
     model = LSTM(4)
     x = jax.ShapeDtypeStruct(shape, jnp.float32)
@@ -215,12 +221,12 @@ def test_lstm_stack_validates_layer_count(method: str) -> None:
 )
 def test_lstm_rejects_invalid_array_contracts(method: str, invalid: str) -> None:
     model = LSTM(4)
-    shape = (2, 3) if method == "step" or invalid == "input_rank" else (1, 2, 3)
-    x = jax.ShapeDtypeStruct(shape, jnp.int32 if invalid == "input_dtype" else jnp.float32)  # (B, I) or (T, B, I)
+    shape = (2, 3) if method == "step" or invalid == "input_rank" else (2, 1, 3)
+    x = jax.ShapeDtypeStruct(shape, jnp.int32 if invalid == "input_dtype" else jnp.float32)  # (B, I) or (B, T, I)
     reset_shape = (1,) if invalid == "reset_batch" else (2,)
     if method != "step" and invalid != "reset_rank":
-        reset_shape = (1, *reset_shape)
-    starts = jax.ShapeDtypeStruct(reset_shape, jnp.int32 if invalid == "reset_dtype" else jnp.bool_)  # (B,) or (T, B)
+        reset_shape = (*reset_shape, 1)
+    starts = jax.ShapeDtypeStruct(reset_shape, jnp.int32 if invalid == "reset_dtype" else jnp.bool_)  # (B,) or (B, T)
     carry_shape = (1 if invalid == "carry_batch" else 2, 1 if invalid == "carry_width" else 4)
     hidden = jax.ShapeDtypeStruct(carry_shape, jnp.bfloat16 if invalid == "carry_dtype" else jnp.float32)  # (B, H)
     cell = jax.ShapeDtypeStruct((2, 1), jnp.float32) if invalid == "cell_width" else hidden  # (B, H)
@@ -232,9 +238,9 @@ def test_lstm_rejects_invalid_array_contracts(method: str, invalid: str) -> None
 def test_lstm_stack_rejects_inputs_before_normalization(invalid: str) -> None:
     model = LSTMStack(4, 1)
     x = jax.ShapeDtypeStruct(
-        (1, 2, 1 if invalid == "input_width" else 4), jnp.int32 if invalid == "input_dtype" else jnp.float32
-    )  # (T, B, I)
-    starts = jax.ShapeDtypeStruct((1, 2), jnp.bool_)  # (T, B)
+        (2, 1, 1 if invalid == "input_width" else 4), jnp.int32 if invalid == "input_dtype" else jnp.float32
+    )  # (B, T, I)
+    starts = jax.ShapeDtypeStruct((2, 1), jnp.bool_)  # (B, T)
     carry = model.initial_carry(2)  # leaves: (B, H)
     with pytest.raises(AssertionError):
         jax.eval_shape(model.init, jax.random.key(0), x, carry, starts)
@@ -243,14 +249,14 @@ def test_lstm_stack_rejects_inputs_before_normalization(invalid: str) -> None:
 def test_bf16_sequence_accumulates_recurrent_gradients_in_float32() -> None:
     model = LSTM(1, dtype=jnp.bfloat16)
     # 512 half-unit contributions expose rounding in a BF16 scan accumulator.
-    x = jnp.zeros((512, 1, 1), jnp.bfloat16)  # (T, B, I)
-    starts = jnp.zeros((512, 1), bool)  # (T, B)
+    x = jnp.zeros((1, 512, 1), jnp.bfloat16)  # (B, T, I)
+    starts = jnp.zeros((1, 512), bool)  # (B, T)
     carry = model.initial_carry(1)  # each (B, H)
     params = jax.tree.map(jnp.zeros_like, model.init(jax.random.key(0), x, carry, starts))
 
     def loss(variables: chex.ArrayTree, *, sequence: bool) -> jax.Array:  # ()
         if sequence:
-            _, output = model.apply(variables, x, carry, starts)  # carry: (B, H) leaves; output: (T, B, H)
+            _, output = model.apply(variables, x, carry, starts)  # carry: (B, H) leaves; output: (B, T, H)
         else:
 
             def step(
@@ -258,7 +264,9 @@ def test_bf16_sequence_accumulates_recurrent_gradients_in_float32() -> None:
             ) -> tuple[LSTMCarry, jax.Array]:  # memory: (B, H) leaves; data: (B, I), (B,); output: (B, H)
                 return model.apply(variables, data[0], memory, data[1], method=model.step)
 
-            _, output = jax.lax.scan(step, carry, (x, starts))  # carry: (B, H) leaves; output: (T, B, H)
+            scan_inputs = jax.tree.map(lambda leaf: jnp.swapaxes(leaf, 0, 1), (x, starts))  # (T, B, I); (T, B)
+            _, output = jax.lax.scan(step, carry, scan_inputs)  # carry: (B, H) leaves; output: (T, B, H)
+            output = jnp.swapaxes(output, 0, 1)  # (B, T, H)
         return output.astype(jnp.float32).sum()  # ()
 
     actual = jax.jit(jax.grad(partial(loss, sequence=True)))(params)  # parameter-shaped leaves

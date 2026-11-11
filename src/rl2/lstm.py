@@ -32,7 +32,7 @@ class _LSTMWeights(NamedTuple):
 
 class _LSTMCell(nn.OptimizedLSTMCell):
     @nn.compact
-    def weights(self, x: jax.Array, hidden: jax.Array) -> _LSTMWeights:  # (T, B, I); (B, H)
+    def weights(self, x: jax.Array, hidden: jax.Array) -> _LSTMWeights:  # (B, T, I); (B, H)
         """Pack the original Flax parameters without changing checkpoint keys."""
         inputs: list[jax.Array] = []  # each (I, H)
         recurrent: list[jax.Array] = []  # each (H, H)
@@ -74,7 +74,7 @@ def initial_carry(num_envs: int, hidden_size: int) -> LSTMCarry:
 
 
 class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
-    """Time-major LSTM with inputs/outputs in ``dtype`` and float32 carry.
+    """Batch-major LSTM with inputs/outputs in ``dtype`` and float32 carry.
 
     B is batch size, I is input width, H is ``features``, and T is time.
     Carry is (cell state, hidden state), each (B, H), and is required.
@@ -106,20 +106,20 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
 
     def __call__(
         self,
-        x: jax.Array,  # (T, B, I)
+        x: jax.Array,  # (B, T, I)
         carry: LSTMCarry,  # Each (B, H), float32
-        episode_starts: jax.Array,  # (T, B), bool
+        episode_starts: jax.Array,  # (B, T), bool
     ) -> tuple[LSTMCarry, jax.Array]:
         chex.assert_rank(x, 3)
         chex.assert_type(x, float)
-        chex.assert_shape(carry, (x.shape[1], self.features))
+        chex.assert_shape(carry, (x.shape[0], self.features))
         chex.assert_type(carry, jnp.float32)
         chex.assert_shape(episode_starts, x.shape[:2])
         chex.assert_type(episode_starts, jnp.bool_)
         for size in x.shape:
             chex.assert_scalar_positive(size)
         weights = self.cell.weights(x, carry[1])
-        projected = jnp.matmul(jnp.asarray(x, dtype=self.dtype), weights.input)  # (T, B, 4H)
+        projected = jnp.matmul(jnp.asarray(x, dtype=self.dtype), weights.input)  # (B, T, 4H)
 
         def recurrent_step(
             memory: LSTMCarry,  # Each (B, H)
@@ -128,13 +128,18 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
             inputs_x, starts = inputs  # (B, 4H), (B,)
             cell, hidden = jax.tree.map(lambda state: jnp.where(starts[:, None], 0, state), memory)  # each (B, H)
             # Cast inside the scan so its parameter-gradient accumulators stay float32.
-            recurrent = jnp.matmul(jnp.asarray(hidden, dtype=self.dtype), jnp.asarray(weights.recurrent, dtype=self.dtype))  # (B, 4H)
+            recurrent = jnp.matmul(
+                jnp.asarray(hidden, dtype=self.dtype), jnp.asarray(weights.recurrent, dtype=self.dtype)
+            )  # (B, 4H)
             gates = (recurrent + jnp.asarray(weights.bias, dtype=self.dtype)) + inputs_x  # (B, 4H)
             memory = _apply_gates(cell, gates)  # each (B, H)
             return memory, jnp.asarray(memory[1], dtype=self.dtype)  # carry: each (B, H); output: (B, H)
 
-        carry, output = jax.lax.scan(recurrent_step, carry, (projected, episode_starts))  # (B, H) leaves; (T, B, H)
-        return carry, output  # Carry: each (B, H); output: (T, B, H)
+        scan_inputs = jax.tree.map(
+            lambda leaf: jnp.swapaxes(leaf, 0, 1), (projected, episode_starts)
+        )  # (T, B, 4H); (T, B)
+        carry, output = jax.lax.scan(recurrent_step, carry, scan_inputs)  # (B, H) leaves; (T, B, H)
+        return carry, jnp.swapaxes(output, 0, 1)  # Carry: each (B, H); output: (B, T, H)
 
     def step(
         self,
@@ -167,6 +172,7 @@ class LSTMStack(nn.Module, RecurrentSequenceModel[LSTMStackCarry]):
     RMSNorm produces outputs in ``dtype``. Inputs must have width ``features``.
     Parameters, residual additions, and per-layer (cell, hidden) carry stay
     float32. Episode starts reset every layer's carry for that example.
+    Inputs and outputs are batch-major (B, T, H).
     T is time, B is batch size, H is ``features``, and M is ``intermediate_size``.
     """
 
@@ -189,9 +195,9 @@ class LSTMStack(nn.Module, RecurrentSequenceModel[LSTMStackCarry]):
     @nn.compact
     def __call__(
         self,
-        x: jax.Array,  # (T, B, H)
+        x: jax.Array,  # (B, T, H)
         carry: LSTMStackCarry,  # Leaves: (B, H), float32
-        episode_starts: jax.Array,  # (T, B), bool
+        episode_starts: jax.Array,  # (B, T), bool
     ) -> tuple[LSTMStackCarry, jax.Array]:
         self._validate_config()
         chex.assert_shape(x, (None, None, self.features))
@@ -201,44 +207,44 @@ class LSTMStack(nn.Module, RecurrentSequenceModel[LSTMStackCarry]):
         if len(carry) != self.num_layers:
             raise ValueError("carry must contain one LSTMCarry per layer")
 
-        x = x.astype(jnp.float32)  # (T, B, H)
+        x = x.astype(jnp.float32)  # (B, T, H)
         updated: list[LSTMCarry] = []  # Leaves: (B, H)
         mlp_init = nn.initializers.variance_scaling(1 / 3, "fan_in", "uniform")
         residual_init = nn.initializers.variance_scaling(1 / (6 * self.num_layers), "fan_in", "uniform")
         for i, state in enumerate(carry):
-            normalized = nn.RMSNorm(epsilon=1e-5, dtype=self.dtype, name=f"norm_mixer_{i}")(x)  # (T, B, H)
+            normalized = nn.RMSNorm(epsilon=1e-5, dtype=self.dtype, name=f"norm_mixer_{i}")(x)  # (B, T, H)
             state, mixed = LSTM(self.features, dtype=self.dtype, name=f"mixer_{i}")(
                 normalized, state, episode_starts
-            )  # State: each (B, H); mixed: (T, B, H)
+            )  # State: each (B, H); mixed: (B, T, H)
             updated.append(state)
-            x = x + mixed.astype(jnp.float32)  # (T, B, H)
+            x = x + mixed.astype(jnp.float32)  # (B, T, H)
             if self.intermediate_size:
-                normalized = nn.RMSNorm(epsilon=1e-5, dtype=self.dtype, name=f"norm_mlp_{i}")(x)  # (T, B, H)
+                normalized = nn.RMSNorm(epsilon=1e-5, dtype=self.dtype, name=f"norm_mlp_{i}")(x)  # (B, T, H)
                 gate = nn.Dense(
                     self.intermediate_size,
                     use_bias=False,
                     dtype=self.dtype,
                     kernel_init=mlp_init,
                     name=f"mlp_gate_{i}",
-                )(normalized)  # (T, B, M)
+                )(normalized)  # (B, T, M)
                 value = nn.Dense(
                     self.intermediate_size,
                     use_bias=False,
                     dtype=self.dtype,
                     kernel_init=mlp_init,
                     name=f"mlp_up_{i}",
-                )(normalized)  # (T, B, M)
-                hidden = nn.silu(gate) * value  # (T, B, M)
+                )(normalized)  # (B, T, M)
+                hidden = nn.silu(gate) * value  # (B, T, M)
                 mixed = nn.Dense(
                     self.features,
                     use_bias=False,
                     dtype=self.dtype,
                     kernel_init=residual_init,
                     name=f"mlp_down_{i}",
-                )(hidden)  # (T, B, H)
-                x = x + mixed.astype(jnp.float32)  # (T, B, H)
-        output = nn.RMSNorm(epsilon=1e-5, dtype=self.dtype, name="final_norm")(x)  # (T, B, H)
-        return tuple(updated), output  # Carry leaves: (B, H); output: (T, B, H)
+                )(hidden)  # (B, T, H)
+                x = x + mixed.astype(jnp.float32)  # (B, T, H)
+        output = nn.RMSNorm(epsilon=1e-5, dtype=self.dtype, name="final_norm")(x)  # (B, T, H)
+        return tuple(updated), output  # Carry leaves: (B, H); output: (B, T, H)
 
     def step(
         self,
@@ -246,5 +252,5 @@ class LSTMStack(nn.Module, RecurrentSequenceModel[LSTMStackCarry]):
         carry: LSTMStackCarry,  # Leaves: (B, H), float32
         episode_starts: jax.Array,  # (B,), bool
     ) -> tuple[LSTMStackCarry, jax.Array]:
-        carry, output = self(x[None], carry, episode_starts[None])  # Carry leaves: (B, H); output: (1, B, H)
-        return carry, output[0]  # Carry leaves: (B, H); output: (B, H)
+        carry, output = self(x[:, None], carry, episode_starts[:, None])  # Carry leaves: (B, H); output: (B, 1, H)
+        return carry, output[:, 0]  # Carry leaves: (B, H); output: (B, H)

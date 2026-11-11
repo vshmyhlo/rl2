@@ -33,8 +33,8 @@ from rl2.model.lux import (
     LuxMapEncoder,
     LuxModel,
     _Attention,
+    _GlobalMemory,
     _SetAttentionBlock,
-    _ShipMemory,
 )
 from rl2.observation_decoder import ConvObservationDecoder
 from rl2.ppo import ActorCritic
@@ -77,8 +77,8 @@ from rl2.wm import LSTMWorldModel, MambaWorldModel
         LuxMapEncoder,
         LuxModel,
         _Attention,
+        _GlobalMemory,
         _SetAttentionBlock,
-        _ShipMemory,
         ConvObservationDecoder,
         ActorCritic,
         RNDActorCritic,
@@ -198,9 +198,7 @@ def test_qwen_optional_dtype_and_cache(dtype: jax.typing.DTypeLike | None, param
     )
     tokens = jnp.ones((1, 1), dtype=jnp.int32)  # (B, T)
     cache = model.init_cache(batch_size=1, capacity=2)  # key/value: (L, B, C, H, d)
-    output, variables = jax.eval_shape(
-        lambda key: model.init_with_output(key, tokens, cache=cache), jax.random.key(0)
-    )
+    output, variables = jax.eval_shape(lambda key: model.init_with_output(key, tokens, cache=cache), jax.random.key(0))
     assert output.logits.shape == (1, 1, 4)
     assert output.logits.dtype == jnp.float32
     assert output.cache.key.shape == (1, 1, 2, 1, 4)

@@ -77,10 +77,7 @@ def test_shapes_randomization_and_action_encoding(
     chex.assert_shape(observation.observation.self.units.energy, (2, 2))
     chex.assert_shape(observation.observation.world.sensor_mask, (2, 24, 24))
     chex.assert_shape(observation.observation.world.steps, (2,))
-    for field in ("init_unit_energy", "spawn_rate"):
-        value = getattr(observation.observation, field)  # (N,)
-        assert value.shape == (2,)
-        np.testing.assert_array_equal(value, jnp.broadcast_to(getattr(state.params, field), (2,)))
+    assert observation.observation._fields == ("self", "opponent", "world", "public_params")
     np.testing.assert_array_equal(
         observation.observation.public_params,
         jnp.broadcast_to(
@@ -189,7 +186,6 @@ def test_native_transition_match_memory_and_batched_game_autoreset(
     env: LuxEnv, initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]
 ) -> None:
     _, state = initial
-    state = state._replace(params=state.params.replace(init_unit_energy=jnp.array(75), spawn_rate=jnp.array(5)))
     step = jax.jit(env.step)
     action = jnp.zeros((2, 2), dtype=jnp.int32)  # (N, U)
     key = jax.random.key(1)  # ()
@@ -218,14 +214,6 @@ def test_native_transition_match_memory_and_batched_game_autoreset(
     batched = jax.jit(jax.vmap(env.step))(jax.random.split(jax.random.key(3), 2), states, jnp.stack((action, action)))
     chex.assert_shape(batched.observation.observation.self.units.position, (2, 2, 2, 2))
     chex.assert_shape(batched.observation.observation.world.steps, (2, 2))
-    for field in ("init_unit_energy", "spawn_rate"):
-        for view, current in (
-            (batched.observation.observation, batched.state),
-            (batched.final_observation.observation, batched.final_state),
-        ):
-            value = getattr(view, field)  # (E, N)
-            assert value.shape == (2, 2)
-            np.testing.assert_array_equal(value, jnp.broadcast_to(getattr(current.params, field)[:, None], (2, 2)))
     chex.assert_shape(batched.observation.actions_mask, (2, 2, 2, 230))
     chex.assert_shape(batched.reward, (2, 2))
     np.testing.assert_array_equal(batched.done, [False, True])

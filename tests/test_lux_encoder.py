@@ -46,8 +46,6 @@ def observation() -> LuxObservation[jax.Array]:
             match_steps=jnp.array(44),  # ()
         ),
         public_params=jnp.array([3, 30, 4, 2], jnp.int16),  # (4,)
-        init_unit_energy=jnp.array(100, jnp.int32),  # ()
-        spawn_rate=jnp.array(3, jnp.int32),  # ()
     )
 
 
@@ -73,10 +71,10 @@ def test_shapes_batch_replay_and_bfloat16(
     encoded = encoder.apply(params, sequence, method="prepare")
     expected_mask = jnp.concatenate(
         (
+            jnp.ones((2, 2, 1), bool),
             sequence.self.units_mask,
             sequence.opponent.units_mask,
             sequence.world.relic_nodes_mask,
-            jnp.ones((2, 2, 1), bool),
         ),
         axis=-1,
     )  # (B, T, E)
@@ -143,6 +141,9 @@ def test_entity_ordering(encoder: LuxEncoder, params: dict[str, Any], observatio
     )
     own_permuted = observation._replace(self=permute(observation.self))
     batch = jax.tree.map(lambda *leaves: jnp.stack(leaves), observation, unordered, own_permuted)  # leaves: (B=3, ...)
+    encoded = encoder.apply(params, batch, method="prepare")  # leaves: (B, ...)
+    np.testing.assert_allclose(encoded.tokens[1], encoded.tokens[0, jnp.array([0, 1, 2, 3, 5, 4, 6, 8, 7])], atol=2e-6)
+    np.testing.assert_allclose(encoded.tokens[2], encoded.tokens[0, jnp.array([0, 2, 1, 3, 4, 5, 6, 7, 8])], atol=2e-6)
     output = jax.jit(lambda obs: encoder.apply(params, obs, method="encode_features"))(batch)
     np.testing.assert_allclose(output.global_[0], output.global_[1], atol=2e-6)
     np.testing.assert_allclose(output.global_[0], output.global_[2], atol=2e-6)

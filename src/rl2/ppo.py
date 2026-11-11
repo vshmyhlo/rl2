@@ -670,12 +670,7 @@ class ActorCritic(nn.Module):
         env_count, step_count = episode_starts.shape
         x = self._encode(jax.tree.map(lambda x: x.reshape((-1, *x.shape[2:])), obs))  # (B * T, H)
         x = x.reshape((env_count, step_count, -1))  # (B, T, H)
-        # The shared LSTM scans time-major inputs; PPO exposes batch-major arrays.
-        recurrent_x, recurrent_starts = jax.tree.map(
-            lambda leaf: jnp.swapaxes(leaf, 0, 1), (x, episode_starts)
-        )  # (T, B, H); (T, B)
-        model_carry, recurrent_x = self.recurrent(recurrent_x, model_carry, recurrent_starts)  # (B,H) leaves; (T,B,H)
-        x = jnp.swapaxes(recurrent_x, 0, 1)  # (B, T, H)
+        model_carry, x = self.recurrent(x, model_carry, episode_starts)  # (B, H) leaves; (B, T, H)
         policy, values = self._heads(x)  # policy leaves: (B, T, A/D); (B, T)
         return ActorCriticOutput(carry=model_carry, policy=policy, values=values)
 

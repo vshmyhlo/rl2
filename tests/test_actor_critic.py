@@ -75,12 +75,8 @@ def test_mappo_variants_implement_actor_critic_interface(model: GenericActorCrit
     assert isinstance(model, BaseActorCritic)
     carry = model.initial_carry(2)  # leaves: (B=2, ...), available without parameter initialization
     if isinstance(model, LuxActorCritic):
-        assert all(leaf.shape == (2, model.model.recurrent.hidden_size) for leaf in carry.team)
-        assert len(carry.ships) == model.model.num_blocks
-        assert all(
-            leaf.shape == (2, 1, model.model.heads * model.model.head_dim) for leaf in jax.tree.leaves(carry.ships)
-        )
-        assert carry.ship_alive.shape == (2, 1) and carry.match_start.shape == (2,)
+        assert all(leaf.shape == (2, model.model.recurrent.hidden_size) for leaf in jax.tree.leaves(carry.global_))
+        assert len(carry.global_) == model.model.num_blocks
     else:
         assert all(leaf.shape == (2, model.model.recurrent.hidden_size) for leaf in jax.tree.leaves(carry))
 

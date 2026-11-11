@@ -101,14 +101,7 @@ class GenericActorCritic(BaseActorCritic[jax.Array, LSTMStackCarry, GenericPolic
     ]:  # carry leaves: (B, H); logits: (B, T, *C, A); value: (B, T)
         """Process observation sequences, resetting memory at episode starts."""
         x = self._encode(observation)  # (B, T, H)
-        # The shared LSTM scans time-major inputs; MAPPO exposes batch-major arrays.
-        recurrent_x, recurrent_starts = jax.tree.map(
-            lambda leaf: jnp.swapaxes(leaf, 0, 1), (x, episode_start)
-        )  # (T, B, H); (T, B)
-        model_carry, recurrent_x = self.recurrent(
-            recurrent_x, model_carry, recurrent_starts
-        )  # model_carry leaves: (B, H); recurrent_x: (T, B, H)
-        x = jnp.swapaxes(recurrent_x, 0, 1)  # (B, T, H)
+        model_carry, x = self.recurrent(x, model_carry, episode_start)  # (B, H) leaves; (B, T, H)
         policy, value = self._heads(x, actions_mask)  # logits: (B, T, *C, A); (B, T)
         return ActorCriticOutput(policy=policy, value=value), model_carry
 

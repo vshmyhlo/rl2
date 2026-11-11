@@ -1063,14 +1063,12 @@ def test_default_lux_parameter_budget_and_output_shapes() -> None:
         for attention in (block["map_attention"], block["set_attention"]["attention"]):
             assert attention["query"]["kernel"].shape == (token_size, config.heads, config.head_dim)
             assert attention["out"]["kernel"].shape == (config.heads, config.head_dim, token_size)
-    assert 5_200_000 <= sum(leaf.size for leaf in jax.tree.leaves(variables["params"])) <= 5_400_000
+    assert 4_600_000 <= sum(leaf.size for leaf in jax.tree.leaves(variables["params"])) <= 4_700_000
     assert output.policy.raw_logits.shape == (1, 1, 1, 232)
     assert jax.eval_shape(lambda policy: policy.logits, output.policy).shape == (1, 1, 1, 230)
     assert output.value.shape == (1, 1) and output.value.dtype == jnp.float32
-    for leaf in jax.tree.leaves(output_carry.team):
+    for leaf in jax.tree.leaves(output_carry.global_):
         assert leaf.shape == (1, config.recurrent.hidden_size) and leaf.dtype == jnp.float32
-    for leaf in jax.tree.leaves(output_carry.ships):
-        assert leaf.shape == (1, 1, config.heads * config.head_dim) and leaf.dtype == jnp.float32
 
 
 def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Path) -> None:

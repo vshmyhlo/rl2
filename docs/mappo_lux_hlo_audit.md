@@ -140,3 +140,16 @@ are identical after removing source metadata and locations; operation counts
 and compiler memory estimates are unchanged. Seven targeted tests passed.
 Artifacts are under `/tmp/rl2-nested-obs-hlo/{world_after,world_training}/`.
 This comparison remains CPU-only.
+
+## Remove unused spawn observation fields (CPU)
+
+Compared optimized single-environment and two-environment `reset`/`step` HLO
+on 24×24 maps with two ship slots, randomized parameters, and mixed game autoreset.
+Removing `init_unit_energy` and `spawn_rate` from policy observations preserves
+all 408 retained output leaves exactly, including simulator parameters/state.
+Loop counts, reset guards, and largest array intermediates are unchanged;
+no operations were added. Redundant observation broadcasts/selects disappear,
+and batched-step copies fall from 1,202 to 1,196. Batched-step output/temporary
+storage falls from 72,050/124,080 to 71,954/123,936 bytes. No all-gathers appear.
+Artifacts: `/tmp/rl2-global-only-hlo/{before,after}/`. CUDA was unavailable;
+GPU fusion and throughput remain unverified.

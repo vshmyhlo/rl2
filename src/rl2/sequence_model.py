@@ -8,14 +8,15 @@ import jax
 class RecurrentSequenceModel[CarryT](ABC):
     """Recurrent sequence and step operations with PPO-style episode resets.
 
-    ``__call__`` is the time-stacked version of ``step``. It accepts a leading
-    time dimension, ``x[time,batch,input_dim]``, while ``step`` accepts
+    ``__call__`` is the time-stacked version of ``step``. Sequence layout is
+    implementation-specific: LSTM uses [batch,time,input_dim]; Mamba3 and
+    GatedDeltaNet2Recurrent use [time,batch,input_dim]. ``step`` accepts
     ``x[batch,input_dim]`` with no time dimension. Both methods require incoming
     model-specific carry and return updated outgoing carry. To start fresh,
     supply ``initial_carry(num_envs)``; otherwise supply carry from a previous
     call to continue prior history. Carry cannot be omitted or ``None``.
 
-    Required boolean ``episode_starts`` masks have shape [time,batch] for
+    Required boolean ``episode_starts`` masks match the first two input axes for
     ``__call__`` and [batch] for ``step``. Each true entry resets only that
     example's carry to the model's initial state before processing the current
     input; a false entry continues from its incoming carry. Every input is
@@ -23,9 +24,9 @@ class RecurrentSequenceModel[CarryT](ABC):
 
     Calling ``self(x, carry, episode_starts)`` must be equivalent, up to
     floating-point numerical tolerance, to calling
-    ``step(x[t], carry, episode_starts[t])`` in increasing time order and
-    passing each returned carry to the next step. Stacking step outputs on
-    axis 0 must reproduce the sequence output and yield the same final carry.
+    ``step`` on each time slice in increasing time order and passing each
+    returned carry to the next step. Stacking step outputs on the sequence's
+    time axis must reproduce the sequence output and yield the same final carry.
     This parity must hold both from the model's fresh initial state and from
     any valid carry containing prior history, including when resets occur
     within the sequence. It assumes identical parameters and computation settings.
@@ -34,7 +35,8 @@ class RecurrentSequenceModel[CarryT](ABC):
     inputs or on history preceding the most recent episode reset.
 
     Both methods return (updated outgoing carry, output). Outputs have shape
-    [time,batch,output_dim] or [batch,output_dim]; output_dim need not match
+    the input's batch/time layout with output_dim replacing input_dim, or
+    [batch,output_dim] for ``step``; output_dim need not match
     input_dim. Carry structure, initial state, and input/output dtypes are
     implementation-specific. Gradients flow through supplied carry unless
     the caller detaches it; episode resets discard the prior history.
@@ -64,9 +66,9 @@ class RecurrentSequenceModel[CarryT](ABC):
         carry: CarryT,
         episode_starts: jax.Array,
     ) -> tuple[CarryT, jax.Array]:
-        """Process [time,batch,input_dim] with boolean resets [time,batch].
+        """Process sequences with boolean resets matching their batch/time axes.
 
-        Return (final carry, output [time,batch,output_dim]), equivalently to
+        Return (final carry, output with the same batch/time layout), equivalently to
         scanning ``step`` calls from the same required incoming carry.
         Supply the model's initial state to start fresh. True ``episode_starts`` entries
         reset carry before processing the corresponding inputs.
@@ -87,7 +89,7 @@ class RecurrentSequenceModel[CarryT](ABC):
         required; supply the model's initial state to start fresh. True
         ``episode_starts`` entries reset the corresponding examples' carry
         before processing their input. Equivalent to
-        ``__call__`` with a singleton leading time axis, removing that axis
+        ``__call__`` with a singleton time axis, removing that axis
         from the output.
         """
         raise NotImplementedError

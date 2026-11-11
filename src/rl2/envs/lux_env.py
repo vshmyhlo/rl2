@@ -86,8 +86,6 @@ class LuxObservation[Array](NamedTuple):
     opponent: (*S, ...) opponent leaves masked by the observer's visibility.
     world: (*S, ...) visible world and progress-counter leaves.
     public_params: (*S, 4) move cost, sap cost, sap range, sensor range, in native units.
-    init_unit_energy: (*S,) public initial ship energy in native units.
-    spawn_rate: (*S,) public ship spawn interval in environment steps.
     Array is jax.Array for observations or ShapeDtypeStruct for the observation space.
     """
 
@@ -95,8 +93,6 @@ class LuxObservation[Array](NamedTuple):
     opponent: LuxTeamObservation[Array]  # leaves: (*S, ...)
     world: LuxWorldObservation[Array]  # leaves: (*S, ...)
     public_params: Array  # (*S, 4), native parameter dtype
-    init_unit_energy: Array  # (*S,), native parameter dtype
-    spawn_rate: Array  # (*S,), native parameter dtype
 
 
 class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
@@ -188,8 +184,6 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
                         match_steps=obs.match_steps,  # ()
                     ),
                     public_params=public_params,  # (4,)
-                    init_unit_energy=params.init_unit_energy,  # ()
-                    spawn_rate=params.spawn_rate,  # ()
                 )
             )
         features = jax.tree.map(lambda *leaves: jnp.stack(leaves), *views)  # leaves: (N, ...)

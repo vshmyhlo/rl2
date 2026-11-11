@@ -13,7 +13,7 @@ from jax.sharding import AxisType, Mesh, PartitionSpec
 from test_lux_encoder import observation as observation  # noqa: PLC0414
 
 from rl2.actions import HierarchicalMultiDiscreteSpace
-from rl2.envs.lux_env import LuxConfig, LuxEnv, LuxObservation
+from rl2.envs.lux_env import LuxObservation
 from rl2.model.config import LSTMConfig, LuxModelConfig
 from rl2.model.lux import (
     LuxActorCritic,
@@ -21,8 +21,7 @@ from rl2.model.lux import (
     LuxCarry,
     LuxFeatures,
     LuxModel,
-    _ShipLifecycle,
-    _ShipMemory,
+    _GlobalMemory,
 )
 
 
@@ -41,17 +40,9 @@ def model() -> LuxActorCritic:
     )
 
 
-def history(model: LuxActorCritic, observation: LuxObservation[jax.Array], batch_size: int) -> LuxCarry:
-    """Return nonzero (B, ...) state with distinct ship histories and valid metadata."""
-    carry = model.initial_carry(batch_size)
-    return carry._replace(
-        team=jax.tree.map(lambda leaf: leaf + 0.5, carry.team),  # (B, H)
-        ships=jax.tree.map(
-            lambda leaf: leaf + jnp.arange(leaf.shape[1])[None, :, None] + 0.5, carry.ships
-        ),  # (B, U, Hs)
-        ship_alive=jnp.ones_like(carry.ship_alive),  # (B, U)
-        match_start=jnp.full_like(carry.match_start, observation.world.steps - observation.world.match_steps),  # (B,)
-    )
+def history(model: LuxActorCritic, batch_size: int) -> LuxCarry:
+    """Return nonzero per-block (B, Hg) cell/hidden states."""
+    return jax.tree.map(lambda leaf: leaf + 0.5, model.initial_carry(batch_size))
 
 
 def action_mask(observation: LuxObservation[jax.Array]) -> jax.Array:  # leaves: (*S, ...) -> (*S, U, A=14)
@@ -71,58 +62,57 @@ def params(model: LuxActorCritic, observation: LuxObservation[jax.Array]) -> dic
 
 
 def test_recurrent_modules_initialize_carry_without_parameters(model: LuxActorCritic) -> None:
-    features = model.model.heads * model.model.head_dim
-    memory = _ShipMemory(features=features, dtype=jnp.bfloat16)
     block = LuxAttentionBlock(
         attention_implementation="xla",
         heads=model.model.heads,
         head_dim=model.model.head_dim,
+        global_hidden_size=model.model.recurrent.hidden_size,
         dtype=jnp.bfloat16,
     )
+    memory = _GlobalMemory(features=model.model.recurrent.hidden_size, dtype=jnp.bfloat16)
+    carry = block.initial_carry(actor_count=2)  # leaves: (B, Hg)
     for module in (memory, block):
-        carry = module.initial_carry(actor_count=2, own_ship_count=3)  # cell/hidden leaves: (B, U, Hs)
-        assert len(carry) == 2
-        for leaf in jax.tree.leaves(carry):
-            assert leaf.shape == (2, 3, features) and leaf.dtype == jnp.float32
-            np.testing.assert_array_equal(leaf, 0)
-        bound = module.apply({}, 2, 3, method="initial_carry")  # cell/hidden leaves: (B, U, Hs)
-        chex.assert_trees_all_equal(bound, carry)
-    combined = model.initial_carry(2)
-    assert len(combined.team) == 2
-    for leaf in combined.team:
+        chex.assert_trees_all_equal(module.initial_carry(2), carry)
+        chex.assert_trees_all_equal(module.apply({}, 2, method="initial_carry"), carry)
+    assert len(carry) == 2
+    for leaf in carry:
         assert leaf.shape == (2, model.model.recurrent.hidden_size) and leaf.dtype == jnp.float32
         np.testing.assert_array_equal(leaf, 0)
-    assert len(combined.ships) == model.model.num_blocks
-    for state in combined.ships:
-        chex.assert_trees_all_equal(state, block.initial_carry(actor_count=2, own_ship_count=3))
+    combined = model.initial_carry(2)
+    assert combined._fields == ("global_",)
+    assert len(combined.global_) == model.model.num_blocks
+    for state in combined.global_:
+        chex.assert_trees_all_equal(state, carry)
     chex.assert_trees_all_equal(model.apply({}, 2, method="initial_carry"), combined)
 
 
 def test_recurrent_modules_return_output_and_carry(model: LuxActorCritic, params: dict[str, Any]) -> None:
     width = model.model.heads * model.model.head_dim
-    tokens = jnp.ones((1, 2, 4, width))  # (B, T, E, D), three own ships and a global token
-    mask = jnp.array([[[True, True, False, True]] * 2])  # (B, T, E)
-    lifecycle = _ShipLifecycle(
-        alive=mask[..., :3],  # (B, T, U)
-        reset=jnp.ones((1, 2, 3), bool),  # (B, T, U)
-        match_start=jnp.zeros((1, 2), jnp.int32),  # (B, T)
+    tokens = jax.random.normal(jax.random.key(5), (1, 2, 4, width))  # (B, T, E, D), global then three own ships
+    mask = jnp.array([[[True, True, True, False]] * 2])  # (B, T, E)
+    block = LuxAttentionBlock(
+        attention_implementation="xla",
+        heads=model.model.heads,
+        head_dim=model.model.head_dim,
+        global_hidden_size=model.model.recurrent.hidden_size,
     )
-    memory = _ShipMemory(features=width)
-    block = LuxAttentionBlock(attention_implementation="xla", heads=model.model.heads, head_dim=model.model.head_dim)
-    carry = memory.initial_carry(actor_count=1, own_ship_count=3)  # leaves: (B, U, Hs)
+    carry = block.initial_carry(actor_count=1)  # leaves: (B, Hg)
     variables = params["params"]["block_0"]
-    memory_result = jax.jit(memory.apply)({"params": variables["ship_memory"]}, tokens[..., :3, :], carry, lifecycle)
+    global_result = jax.jit(_GlobalMemory(features=model.model.recurrent.hidden_size).apply)(
+        {"params": variables["global_memory"]}, tokens[..., 0, :], carry, jnp.ones((1, 2), bool)
+    )  # token: (B, T, D); carry: (B, Hg)
     block_result = jax.jit(block.apply)(
-        {"params": variables}, tokens, carry, lifecycle, mask, jnp.ones((1, 2, 2, width))
-    )
-    for result, count in ((memory_result, 3), (block_result, 4)):
+        {"params": variables}, tokens, carry, jnp.ones((1, 2), bool), mask, jnp.ones((1, 2, 2, width))
+    )  # tokens: (B, T, E, D); carry: (B, Hg)
+    for result, shape in ((global_result, (1, 2, width)), (block_result, (1, 2, 4, width))):
         assert type(result) is tuple and len(result) == 2
-        output, updated_carry = result  # (B, T, U/E, D); carry leaves: (B, U, Hs)
-        assert output.shape == (1, 2, count, width)
+        output, updated_carry = result  # (B, T, [E,] D); carry leaves: (B, Hg)
+        assert output.shape == shape
+        assert len(updated_carry) == 2
         for leaf in updated_carry:
-            assert leaf.shape == (1, 3, width) and leaf.dtype == jnp.float32
-            np.testing.assert_array_equal(leaf[:, 2], 0)
-    chex.assert_trees_all_equal(memory_result[1], block_result[1])
+            assert leaf.shape == (1, model.model.recurrent.hidden_size) and leaf.dtype == jnp.float32
+    chex.assert_trees_all_equal(global_result[1], block_result[1])
+    np.testing.assert_array_equal(block_result[0][..., 3, :], 0)  # Masked ship remains inactive.
 
 
 def test_sequence_step_replay_reset_and_bfloat16(
@@ -130,7 +120,7 @@ def test_sequence_step_replay_reset_and_bfloat16(
 ) -> None:
     sequence = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (2, 2, *leaf.shape)), observation)  # (B, T, ...)
     starts = jnp.array([[False, False], [False, True]])  # (B, T)
-    memory = history(model, observation, 2)  # leaves: (B, ...)
+    memory = history(model, 2)  # leaves: (B, ...)
     masks = action_mask(sequence).at[0, :, 0, 5:].set(False)  # (B, T, U, A), no sap for this ship
     output, output_carry = jax.jit(model.apply)(params, sequence, memory, starts, masks)
     assert output.policy.raw_logits.shape == (2, 2, 3, 16)
@@ -176,7 +166,7 @@ def test_sequence_step_replay_reset_and_bfloat16(
         atol=2e-3,
     )
     chex.assert_trees_all_close(reduced_carry, reduced_second_carry, atol=2e-3)
-    assert all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves((reduced_carry.team, reduced_carry.ships)))
+    assert all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(reduced_carry))
     np.testing.assert_allclose(reduced.policy.raw_logits, output.policy.raw_logits, atol=0.01, rtol=0.04)
 
 
@@ -201,22 +191,15 @@ def test_ship_permutation_equivariance(
     batch = jax.tree.map(
         lambda *leaves: jnp.stack(leaves), observation, observation._replace(self=team), reordered_world
     )  # (B=3, ...)
-    memory = history(model, observation, 3)  # leaves: (B, ...)
-    memory = memory._replace(
-        ships=jax.tree.map(lambda leaf: leaf.at[1].set(leaf[1, permutation]), memory.ships),  # (B, U, Hs)
-        ship_alive=memory.ship_alive.at[1].set(memory.ship_alive[1, permutation]),  # (B, U)
-    )
+    memory = history(model, 3)  # leaves: (B, ...)
     output, output_carry = jax.jit(
         lambda obs: model.apply(params, obs, memory, jnp.zeros(3, bool), action_mask(obs), method="step")
     )(batch)
     np.testing.assert_allclose(output.policy.logits[1], output.policy.logits[0, permutation], atol=2e-6)
     np.testing.assert_allclose(output.policy.logits[2], output.policy.logits[0], atol=2e-6)
     np.testing.assert_allclose(output.value[1:], jnp.broadcast_to(output.value[0], (2,)), atol=2e-6)
-    for leaf in jax.tree.leaves((output_carry.team, output_carry.match_start)):
+    for leaf in jax.tree.leaves(output_carry):
         np.testing.assert_allclose(leaf[1:], jnp.broadcast_to(leaf[0], leaf[1:].shape), atol=2e-6)
-    for leaf in jax.tree.leaves((output_carry.ships, output_carry.ship_alive)):
-        np.testing.assert_allclose(leaf[1], leaf[0, permutation], atol=2e-6)
-        np.testing.assert_allclose(leaf[2], leaf[0], atol=2e-6)
 
 
 def test_empty_team_has_no_policy_gradient(
@@ -250,60 +233,10 @@ def test_sap_scores_follow_relative_target_coordinates(
     spatial = jnp.zeros((1, 12, 8, 4)).at[0, :, :, 0].set(10 * x + y)  # (B, H, W, C)
     features = LuxFeatures(global_=jnp.zeros((1, 8)), ships=jnp.zeros((1, 3, 8)), spatial=spatial)
     obs = jax.tree.map(lambda leaf: leaf[None], observation)  # leaves: (B, ...)
-    policy, value = network.apply(
-        {"params": variables}, jnp.zeros((1, 4)), features, obs, action_mask(obs), method="heads"
-    )
+    policy, value = network.apply({"params": variables}, features, obs, action_mask(obs), method="heads")
     # First ship is at (1, 2); offsets enumerate x first, then y, matching Lux's command IDs.
     np.testing.assert_allclose(policy.raw_logits[0, 0, 7:], 2 * jnp.array([1, 2, 3, 11, 12, 13, 21, 22, 23]))
     assert value.shape == (1,)
-
-
-def test_ship_spawn_corner_uses_xy_coordinates_on_rectangular_map(
-    model: LuxActorCritic, observation: LuxObservation[jax.Array]
-) -> None:
-    observation = observation._replace(
-        self=observation.self._replace(
-            units=observation.self.units.replace(
-                position=jnp.array([[7, 11], [5, 8], [-1, -1]], dtype=jnp.int16),  # (U, 2), first ship at far corner
-                energy=jnp.full(3, 100, dtype=jnp.int16),  # (U,), native spawn energy
-            ),
-        ),
-        world=observation.world._replace(steps=jnp.asarray(107), match_steps=jnp.asarray(7)),  # scalar counters
-    )
-    carry = history(model, observation, batch_size=1)
-    sequence = jax.tree.map(lambda leaf: leaf[None, None], observation)  # leaves: (B=1, T=1, ...)
-    lifecycle = model._ship_lifecycle(sequence, carry, jnp.zeros((1, 1), dtype=bool))
-    np.testing.assert_array_equal(lifecycle.reset, [[[True, False, True]]])
-
-
-def test_ship_spawn_uses_observed_parameters(model: LuxActorCritic, observation: LuxObservation[jax.Array]) -> None:
-    sequence = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (2, 2, *leaf.shape)), observation)
-    # leaves: (B=2, T=2, ...); identical ships, different game parameters.
-    sequence = sequence._replace(
-        self=sequence.self._replace(
-            units=sequence.self.units.replace(
-                position=jnp.zeros((2, 2, 3, 2), jnp.int16),  # (B, T, U, 2)
-                energy=jnp.full((2, 2, 3), 75, jnp.int16),  # (B, T, U)
-            ),
-        ),
-        world=sequence.world._replace(
-            steps=jnp.array([[106, 107], [106, 107]]),  # (B, T)
-            match_steps=jnp.array([[6, 7], [6, 7]]),  # (B, T)
-        ),
-        init_unit_energy=jnp.array([[75, 75], [100, 100]]),  # (B, T)
-        spawn_rate=jnp.array([[5, 5], [3, 3]]),  # (B, T)
-    )
-    carry = model.initial_carry(2)._replace(
-        ship_alive=jnp.ones((2, 3), dtype=bool),  # (B, U)
-        match_start=jnp.full(2, 100),  # (B,)
-    )
-    lifecycle = jax.jit(model._ship_lifecycle)(sequence, carry, jnp.zeros((2, 2), dtype=bool))
-    assert lifecycle.reset.shape == lifecycle.alive.shape == (2, 2, 3)
-    assert lifecycle.match_start.shape == (2, 2)
-    np.testing.assert_array_equal(
-        lifecycle.reset,
-        [[[True, True, True], [False, False, True]], [[False, False, True], [False, False, True]]],
-    )
 
 
 def test_sap_offsets_can_prefer_nearby_targets_symmetrically(
@@ -334,7 +267,7 @@ def test_sap_offsets_can_prefer_nearby_targets_symmetrically(
     )
     obs = jax.tree.map(lambda leaf: leaf[None], observation)  # leaves: (B, ...)
     masks = jnp.broadcast_to(obs.self.units_mask[..., None], (1, 3, 30)).at[..., 0].set(True)  # (B, U, A)
-    policy, value = network.apply({"params": variables}, jnp.zeros((1, 4)), features, obs, masks, method="heads")
+    policy, value = network.apply({"params": variables}, features, obs, masks, method="heads")
     assert policy.logits.shape == (1, 3, 30) and value.shape == (1,)
     scores = policy.raw_logits[0, 0, 7:].reshape((5, 5))  # (dx, dy), center is offset (0, 0)
     assert float(scores[2, 2]) > float(scores[2, 3]) > float(scores[2, 4]) > float(scores[4, 4])
@@ -447,7 +380,7 @@ def test_sharded_policy_and_value_gradients(
         magnitude = sum(float(jnp.abs(leaf).sum()) for leaf in jax.tree.leaves(actual[1]["params"]["lux"][name]))
         assert 0 < magnitude < 1e6
     for index in range(model.model.num_blocks):
-        for name in ("ship_memory", "map_attention", "set_attention"):
+        for name in ("global_memory", "map_attention", "set_attention"):
             leaves = jax.tree.leaves(actual[1]["params"][f"block_{index}"][name])
             assert 0 < sum(float(jnp.abs(leaf).sum()) for leaf in leaves) < 1e6
     relic_gradient = actual[1]["params"]["lux"]["encoder"]["relic_projection"]
@@ -465,7 +398,7 @@ def test_each_policy_row_uses_its_own_ship_features(
     changed = features._replace(ships=features.ships.at[:, 0].add(jnp.arange(8)))  # (B, U, D)
 
     def heads(encoded: LuxFeatures) -> tuple[jax.Array, jax.Array]:
-        policy, value = network.apply(variables, jnp.zeros((1, 4)), encoded, obs, action_mask(obs), method="heads")
+        policy, value = network.apply(variables, encoded, obs, action_mask(obs), method="heads")
         return policy.raw_logits, value  # (B, U, L); (B,)
 
     expected_logits, expected_value = heads(features)  # (B, U, L); (B,)
@@ -475,16 +408,16 @@ def test_each_policy_row_uses_its_own_ship_features(
     np.testing.assert_array_equal(actual_value, expected_value)
 
 
-def test_ship_history_reaches_heads_only_through_tokens(
+def test_global_history_reaches_heads_only_through_tokens(
     model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
     variables = jax.tree.map(lambda leaf: leaf, params)
     for index in range(model.model.num_blocks):
-        projection = variables["params"][f"block_{index}"]["ship_memory"]["output"]
-        projection["kernel"] = jnp.zeros_like(projection["kernel"])  # (Hs, D)
+        projection = variables["params"][f"block_{index}"]["global_memory"]["output"]
+        projection["kernel"] = jnp.zeros_like(projection["kernel"])  # (Hg, D)
     sequence = jax.tree.map(lambda leaf: leaf[None, None], observation)  # leaves: (B=1, T=1, ...)
-    carry = history(model, observation, 1)
-    changed = carry._replace(ships=jax.tree.map(lambda leaf: leaf + 2, carry.ships))  # leaves: (B, U, Hs)
+    carry = history(model, 1)
+    changed = carry._replace(global_=jax.tree.map(lambda leaf: leaf + 2, carry.global_))  # leaves: (B, Hg)
     evaluate = jax.jit(model.apply)
     original, original_carry = evaluate(variables, sequence, carry, jnp.zeros((1, 1), bool), action_mask(sequence))
     updated, updated_carry = evaluate(variables, sequence, changed, jnp.zeros((1, 1), bool), action_mask(sequence))
@@ -493,11 +426,11 @@ def test_ship_history_reaches_heads_only_through_tokens(
     np.testing.assert_array_equal(original.policy.raw_logits, updated.policy.raw_logits)
     np.testing.assert_array_equal(original.value, updated.value)
     # Recurrence still retains history even when its token projection is disabled.
-    for original_state, updated_state in zip(original_carry.ships, updated_carry.ships, strict=True):
+    for original_state, updated_state in zip(original_carry.global_, updated_carry.global_, strict=True):
         assert float(jnp.max(jnp.abs(original_state[1] - updated_state[1]))) > 1e-4
 
 
-def test_padding_capacity_does_not_change_ship_policies_or_team_memory(
+def test_padding_capacity_does_not_change_ship_policies_or_global_memory(
     model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
     compact = observation._replace(
@@ -524,71 +457,39 @@ def test_padding_capacity_does_not_change_ship_policies_or_team_memory(
     )
     assert actual.policy.logits.shape == (1, 1, 2, 14)
     np.testing.assert_allclose(actual.policy.logits, expected.policy.logits[..., :2, :], atol=2e-6)
-    expected_carry = expected_carry._replace(
-        ships=jax.tree.map(lambda leaf: leaf[:, :2], expected_carry.ships),  # (B, U=2, Hs)
-        ship_alive=expected_carry.ship_alive[:, :2],  # (B, U=2)
-    )
     chex.assert_trees_all_close((actual.value, actual_carry), (expected.value, expected_carry), atol=2e-6)
     np.testing.assert_allclose(actual.policy.entropy(), expected.policy.entropy(), atol=2e-6)
 
 
-def test_ship_lifetime_resets_and_inactive_state(
+def test_global_history_survives_match_changes_and_absent_ships_but_not_game_resets(
     model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
-    # Rows: survivor, absent, negative energy, newborn, game reset, boundary,
-    # skipped boundary, possible same-step respawn. Only ship 0's history differs.
-    batch_size = 8
-    sequence = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (batch_size, 1, *leaf.shape)), observation)
-    # sequence leaves: (B=8, T=1, ...)
+    sequence = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (3, 3, *leaf.shape)), observation)  # (B, T, ...)
     sequence = sequence._replace(
-        self=sequence.self._replace(
-            units_mask=sequence.self.units_mask.at[1, 0, 0].set(False),  # (B, T, U)
-            units=sequence.self.units.replace(
-                energy=sequence.self.units.energy.at[2, 0, 0].set(-1).at[7, 0, 0].set(100),  # (B, T, U)
-                position=sequence.self.units.position.at[7, 0, 0].set(0),  # (B, T, U, 2)
-            ),
-        ),
+        self=sequence.self._replace(units_mask=sequence.self.units_mask.at[2].set(False)),  # (B, T, U)
         world=sequence.world._replace(
-            match_steps=sequence.world.match_steps.at[5, 0].set(0).at[7, 0].set(46),  # (B, T)
-            steps=sequence.world.steps.at[7, 0].set(147),  # (B, T), same match offset 101
+            steps=sequence.world.steps + jnp.arange(3),  # (B, T)
+            match_steps=(sequence.world.match_steps + jnp.arange(3)).at[1, 1:].set(jnp.array([0, 1])),  # (B, T)
         ),
     )
-    memory = history(model, observation, batch_size)
-    memory = memory._replace(
-        ship_alive=memory.ship_alive.at[3, 0].set(False),  # (B, U)
-        match_start=memory.match_start.at[6].set(100),  # (B,)
-    )
-    fresh = memory._replace(ships=jax.tree.map(lambda leaf: leaf.at[:, 0].set(0), memory.ships))  # (B, U, Hs)
-    starts = jnp.zeros((batch_size, 1), bool).at[4, 0].set(True)  # (B, T)
-
-    def apply(carry: LuxCarry) -> tuple[LuxCarry, LuxFeatures]:  # carry: (B, ...); features: (B, T, ...)
-        result, result_carry = model.apply(params, sequence, carry, starts, method="_encode")
-        return result_carry, result
-
-    evaluate = jax.jit(apply)
-    actual, output = evaluate(memory)
-    expected, fresh_output = evaluate(fresh)
-    assert output.ships.shape == (8, 1, 3, 8)
-    assert len(actual.ships) == model.model.num_blocks
-    assert all(len(state) == 2 for state in actual.ships)
-    assert actual.ship_alive.dtype == jnp.bool_ and actual.match_start.dtype == jnp.int32
-    # Reset happens before attention: discarded memory cannot affect any entity or summary.
+    memory = history(model, 3)
+    changed = memory._replace(global_=jax.tree.map(lambda leaf: leaf + 2, memory.global_))  # (B, Hg)
+    starts = jnp.zeros((3, 3), bool).at[:, -1].set(True)  # (B, T)
+    encode = jax.jit(model.apply, static_argnames="method")
+    expected, expected_carry = encode(params, sequence, memory, starts, method="_encode")
+    actual, actual_carry = encode(params, sequence, changed, starts, method="_encode")
+    # Rows cover ordinary history, a match boundary, and an entirely absent team.
+    difference = jnp.max(jnp.abs(actual.global_[:, :2] - expected.global_[:, :2]), axis=-1)  # (B, T=2)
+    assert bool((difference > 1e-5).all())
     chex.assert_trees_all_close(
-        jax.tree.map(lambda leaf: leaf[1:], output), jax.tree.map(lambda leaf: leaf[1:], fresh_output), atol=2e-6
+        jax.tree.map(lambda leaf: leaf[:, -1], actual),
+        jax.tree.map(lambda leaf: leaf[:, -1], expected),
+        atol=2e-6,
     )
-    assert float(jnp.max(jnp.abs(output.ships[0] - fresh_output.ships[0]))) > 1e-4
-    for state, reference in zip(jax.tree.leaves(actual.ships), jax.tree.leaves(expected.ships), strict=True):
-        assert state.shape == (8, 3, 8) and state.dtype == jnp.float32
-        np.testing.assert_allclose(state[1:, 0], reference[1:, 0], atol=2e-6)
-        np.testing.assert_array_equal(state[[1, 2, 5], 0], 0)
-        np.testing.assert_array_equal(state[:, 2], 0)
-    # The first stage has not mixed entities yet, so other ships' state is independent.
-    for state, reference in zip(jax.tree.leaves(actual.ships[0]), jax.tree.leaves(expected.ships[0]), strict=True):
-        np.testing.assert_allclose(state[:, 1], reference[:, 1], atol=2e-6)
-    chex.assert_trees_all_equal(actual.team, memory.team)
+    chex.assert_trees_all_close(actual_carry, expected_carry, atol=2e-6)
 
 
-def test_recurrent_attention_replay_is_causal_and_shares_ship_history(
+def test_recurrent_attention_replay_is_causal_and_shares_global_history(
     model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
     sequence = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (1, 4, *leaf.shape)), observation)  # (B=1, T=4, ...)
@@ -599,15 +500,15 @@ def test_recurrent_attention_replay_is_causal_and_shares_ship_history(
             match_steps=sequence.world.match_steps + jnp.arange(4),  # (B, T)
         ),
     )
-    initial = history(model, observation, 1)
-    changed = initial._replace(ships=jax.tree.map(lambda leaf: leaf.at[:, 0].add(2), initial.ships))  # (B, U, Hs)
+    initial = history(model, 1)
+    changed = initial._replace(global_=jax.tree.map(lambda leaf: leaf + 2, initial.global_))  # (B, Hg)
     starts = jnp.zeros((1, 4), bool)  # (B, T)
     masks = action_mask(sequence)  # (B, T, U, A)
     evaluate = jax.jit(model.apply)
     output, output_carry = evaluate(params, sequence, initial, starts, masks)
     alternative, _ = evaluate(params, sequence, changed, starts, masks)
     assert float(jnp.max(jnp.abs(output.policy.raw_logits[:, 0, 0] - alternative.policy.raw_logits[:, 0, 0]))) > 1e-5
-    # Attention now communicates ship 0's history to other ships and the team summary.
+    # Attention communicates global history to ship tokens.
     assert float(jnp.max(jnp.abs(output.policy.raw_logits[:, 0, 1] - alternative.policy.raw_logits[:, 0, 1]))) > 1e-5
     future = sequence._replace(
         self=sequence.self._replace(
@@ -632,39 +533,6 @@ def test_recurrent_attention_replay_is_causal_and_shares_ship_history(
     np.testing.assert_allclose(jnp.swapaxes(logits, 0, 1), output.policy.raw_logits, atol=2e-6)
 
 
-def test_native_collision_and_same_step_respawn_clear_ship_memory(
-    model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
-) -> None:
-    env = LuxEnv(LuxConfig(map_size=8, max_units=3, randomize_params=False))
-    _, state = jax.jit(env.reset)(jax.random.key(19))
-    # Equal-energy opposing ships collide at the home tile on a spawning step.
-    # Both slots remain present in consecutive observations despite being replaced.
-    game = state.game.replace(
-        units=state.game.units.replace(
-            position=jnp.full((2, 3, 2), -1, jnp.int16).at[:, 0].set(0),  # (N, U, 2)
-            energy=jnp.zeros((2, 3, 1), jnp.int16).at[:, 0].set(100),  # (N, U, 1)
-        ),
-        units_mask=jnp.zeros((2, 3), bool).at[:, 0].set(True),  # (N, U)
-        match_steps=jnp.array(3, jnp.int32),  # ()
-        steps=jnp.array(3, jnp.int32),  # ()
-    )
-    result = jax.jit(env.step)(jax.random.key(20), state._replace(game=game), jnp.zeros((2, 3), jnp.int32))
-    obs = result.observation.observation  # leaves: (B=N=2, ...)
-    np.testing.assert_array_equal(obs.self.units_mask[:, 0], True)
-    np.testing.assert_array_equal(obs.self.units.energy[:, 0], 100)
-    np.testing.assert_array_equal(obs.self.units.position[:, 0], [[0, 0], [7, 7]])
-    assert int(result.state.game.match_steps) == 4
-    memory = history(model, observation, 2)._replace(match_start=jnp.zeros(2, jnp.int32))
-    fresh = memory._replace(ships=jax.tree.map(jnp.zeros_like, memory.ships))  # (B, U, Hs)
-
-    def apply(carry: LuxCarry) -> tuple[LuxCarry, jax.Array]:  # carry: (B, ...); logits: (B, U, L)
-        output, output_carry = model.apply(params, obs, carry, jnp.zeros(2, bool), action_mask(obs), method="step")
-        return output_carry, output.policy.raw_logits  # carry: (B, ...); logits: (B, U, L)
-
-    evaluate = jax.jit(apply)
-    chex.assert_trees_all_close(evaluate(memory), evaluate(fresh), atol=2e-6)
-
-
 class AttentionOutputs(NamedTuple):
     first_map: jax.Array  # (B*T, E, D)
     first_set: jax.Array  # (B*T, E, D)
@@ -673,16 +541,16 @@ class AttentionOutputs(NamedTuple):
 
 
 @pytest.mark.parametrize("stage", [0, 1], ids=["first_block", "second_block"])
-def test_ship_history_conditions_the_following_attention(
+def test_history_conditions_the_following_attention(
     model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array], stage: int
 ) -> None:
     sequence = jax.tree.map(lambda leaf: leaf[None, None], observation)  # leaves: (B=1, T=1, ...)
-    memory = history(model, observation, 1)
+    memory = history(model, 1)
     changed = memory._replace(
-        ships=tuple(
-            jax.tree.map(lambda leaf: leaf.at[:, 0].add(2), state) if index == stage else state
-            for index, state in enumerate(memory.ships)
-        )  # leaves: (B, U, Hs)
+        global_=tuple(
+            jax.tree.map(lambda leaf: leaf + 2, state) if index == stage else state
+            for index, state in enumerate(memory.global_)
+        )  # per-block leaves: (B, Hg)
     )
 
     def capture(module: nn.Module, method: str) -> bool:
@@ -710,12 +578,12 @@ def test_ship_history_conditions_the_following_attention(
     original, updated = attend(memory), attend(changed)
     assert all(leaf.shape == (1, 9, 8) for leaf in original)
     if stage == 0:
-        assert float(jnp.max(jnp.abs(original.first_map[:, 0] - updated.first_map[:, 0]))) > 1e-4
+        assert float(jnp.max(jnp.abs(original.first_map[:, -1] - updated.first_map[:, -1]))) > 1e-4
         assert float(jnp.max(jnp.abs(original.first_set[:, 1] - updated.first_set[:, 1]))) > 1e-4
     else:
         np.testing.assert_array_equal(original.first_map, updated.first_map)
         np.testing.assert_array_equal(original.first_set, updated.first_set)
-    assert float(jnp.max(jnp.abs(original.second_map[:, 0] - updated.second_map[:, 0]))) > 1e-4
+    assert float(jnp.max(jnp.abs(original.second_map[:, -1] - updated.second_map[:, -1]))) > 1e-4
     assert float(jnp.max(jnp.abs(original.second_set[:, 1] - updated.second_set[:, 1]))) > 1e-4
 
 
@@ -735,10 +603,10 @@ def test_configurable_block_depth(
     )
     assert output.policy.raw_logits.shape == (1, 1, 3, 16)
     assert output.value.shape == (1, 1)
-    assert len(output_carry.ships) == num_blocks
-    for index, state in enumerate(output_carry.ships):
-        assert all(leaf.shape == (1, 3, 8) for leaf in jax.tree.leaves(state))
-        assert {"ship_memory", "input_norm", "map_attention", "set_attention"} == set(
+    assert len(output_carry.global_) == num_blocks
+    assert all(leaf.shape == (1, model.model.recurrent.hidden_size) for leaf in jax.tree.leaves(output_carry.global_))
+    for index in range(num_blocks):
+        assert {"global_memory", "input_norm", "map_attention", "set_attention"} == set(
             variables["params"][f"block_{index}"]
         )
 
@@ -759,7 +627,7 @@ def test_attention_width_is_independent_of_cnn_channels(
     assert output.policy.raw_logits.shape == (1, 1, 3, 16)
     assert output.value.shape == (1, 1)
     encoder = variables["params"]["lux"]["encoder"]
-    assert all(leaf.shape == (1, 3, 6) for leaf in jax.tree.leaves(output_carry.ships))
+    assert all(leaf.shape == (1, model.model.recurrent.hidden_size) for leaf in jax.tree.leaves(output_carry))
     assert encoder["ship_projection"]["kernel"].shape == (7, 6)
     assert encoder["map_encoder"]["map_downsample_1"]["kernel"].shape == (3, 3, 6, 6)
     for index in range(model.model.num_blocks):
