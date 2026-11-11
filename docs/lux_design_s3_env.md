@@ -108,47 +108,89 @@ The diagram shows `step` with batch size `B` and `U` own-ship slots;
 `C` is `model.channels`; `A` is the number of commands per ship (230).
 
 ```mermaid
+%%{init: {"flowchart": {"defaultRenderer": "elk", "curve": "linear", "nodeSpacing": 30, "rankSpacing": 45}, "themeVariables": {"fontSize": "14px"}}}%%
 flowchart TB
-    subgraph encoder[Spatial and set encoder]
-        map["Visible map, sensor mask, coordinates"] --> cnn["Residual CNN<br/>full-resolution spatial features"]
-        entities["Unordered sets + validity masks<br/>own ships · opponent ships · relic nodes"] --> raster["Rasterize visible entities"]
-        raster --> cnn
-        entities --> tokens["Entity tokens<br/>type + coordinates + energy for ships"]
-        cnn -->|features at entity positions| tokens
-        cnn --> coarse["Downsample map by 4<br/>coarse map tokens"]
-        context["Scores, wins, progress, public parameters,<br/>active counts, visibility"] --> global["Always-valid global token"]
-        tokens --> cross["Map cross-attention<br/>entity + global queries; map keys/values"]
-        global --> cross
-        coarse --> cross
-        cross --> sets["2 × masked bidirectional self-attention + FFN<br/>4 heads · Tokamax/Triton · no slot embeddings"]
-        entities -.->|exclude absent and hidden keys| sets
-        sets --> ships["Own-ship features: B × U × 2C<br/>row i still identifies ship i"]
-        sets --> summary["Invariant summary<br/>own/opponent masked means + global token"]
-        coarse -->|mean + projection| summary
-        summary --> embedding["Team embedding"]
+    subgraph observation[LuxObservation]
+        own["self<br/>ships + mask · points · wins"]
+        opponent["opponent<br/>visible ships + mask · points · wins"]
+        world["world<br/>map + sensor mask · relics + mask<br/>game and match steps"]
+        params["public_params<br/>move cost · sap cost · sap range · sensor range"]
+    end
+
+    entities["Unordered entity sets + masks<br/>own ships · opponent ships · relic nodes"]
+    context["Global context<br/>scores · wins · progress · parameters<br/>active counts · visibility"]
+
+    subgraph spatial[CNN spatial encoder]
+        map["Map channels<br/>tile embedding · energy · visibility · coordinates"]
+        raster["Entity raster<br/>own/opponent counts + summed energy · relic counts"]
+        cnn["Concatenate 13 channels<br/>3 × 3 convolution + norm + SiLU + residual block"]
+        features["Spatial features<br/>B × W × H × C"]
+        coarse["2 stride-2 convolutions → map tokens<br/>B × P × 2C; P = W × H / 16"]
+    end
+
+    subgraph encoder[Set attention]
+        tokens["Entity tokens<br/>type + coordinates + energy for ships<br/>+ spatial features at entity positions"]
+        global["Always-valid global token"]
+        cross["Map cross-attention<br/>entity/global queries · map keys/values"]
+        sets["2 × masked bidirectional self-attention + FFN<br/>4 heads · Tokamax/Triton · no slot embeddings"]
+        ships["Ship features: B × U × 2C<br/>row i identifies ship i"]
+        embedding["Team embedding<br/>own/opponent masked means + global token<br/>+ projected map-token mean"]
     end
 
     subgraph recurrent[Team memory]
-        embedding -->|ReLU + projection| lstm["Team LSTM"]
-        carry["Incoming carry + episode-start reset"] --> lstm
-        lstm --> next["Outgoing carry"]
+        carry["Incoming carry + episode-start reset"]
+        lstm["Team LSTM<br/>ReLU + projection of team embedding"]
+        next["Outgoing carry"]
     end
 
     subgraph outputs[Policy and value]
-        ships --> head["Shared per-ship head<br/>ship i features + team memory"]
-        lstm -->|broadcast to ships| head
-        head --> choices["Per-ship type logits: 3<br/>movement logits: 4"]
-        head -->|sap query for ship i| sap["Sap target scores<br/>query · target key"]
-        cnn --> targets["Gather keys at ship position + sap offsets<br/>add relative-offset embedding"]
-        entities -->|own-ship positions| targets
-        targets --> sap
-        choices --> policy["Masked hierarchical policy<br/>logits: B × U × A<br/>sampled commands: B × U"]
-        sap --> policy
-        legal["Legal-action masks"] --> policy
-        embedding --> critic["Team value head"]
-        lstm --> critic
-        critic --> value["Value: B<br/>one scalar per team"]
+        head["Shared per-ship head<br/>ship i features + team memory"]
+        choices["Type logits: 3<br/>movement logits: 4"]
+        targets["Sap target keys<br/>project spatial features; gather at ship + offsets<br/>add relative-offset embedding"]
+        sap["Sap logits<br/>ship query · target key / √C"]
+        policy["Masked hierarchical policy<br/>logits: B × U × A · commands: B × U"]
+        critic["Team value head<br/>team embedding + memory<br/>value: B"]
     end
+    legal["Legal-action masks"]
+
+    own -->|ships| entities
+    opponent -->|ships| entities
+    world -->|relics| entities
+    own -->|scores + counts| context
+    opponent -->|scores + counts| context
+    world -->|progress + visibility| context
+    params --> context
+    world -->|map + sensor mask| map
+    entities --> raster
+    map --> cnn
+    raster --> cnn
+    cnn --> features
+    features --> coarse
+    entities --> tokens
+    features -->|gather| tokens
+    context --> global
+    tokens --> cross
+    global --> cross
+    coarse --> cross
+    cross --> sets
+    sets --> ships
+    sets --> embedding
+    coarse -->|mean + projection| embedding
+    embedding --> lstm
+    carry --> lstm
+    lstm --> next
+    ships --> head
+    lstm -->|broadcast memory| head
+    head --> choices
+    head -->|sap queries| sap
+    features --> targets
+    entities -->|own-ship positions| targets
+    targets --> sap
+    choices --> policy
+    sap --> policy
+    legal --> policy
+    embedding --> critic
+    lstm --> critic
 ```
 
 Reordering own ships reorders policy rows; opponent/relic permutations leave

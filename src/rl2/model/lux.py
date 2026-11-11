@@ -1,4 +1,14 @@
-"""Lux set-attention policy with aligned ship decisions and spatial sap targets."""
+"""Lux actor-critic with shared team memory and aligned per-ship actions.
+
+- CNN: encode the visible map into spatial features.
+- Attention: masked, unordered own-ship, opponent-ship, and relic tokens attend
+  to map features and each other via Tokamax/Triton.
+- Memory: feed an invariant team summary into a team LSTM.
+- Ship policy: combine each ship's features with team memory to predict
+  stay/move/sap types and movement directions.
+- Sap: score ship queries against target-tile keys plus relative-offset embeddings.
+- Value: combine team memory and the current summary into one value per team.
+"""
 
 from math import isqrt, prod, sqrt
 from typing import Literal, NamedTuple
