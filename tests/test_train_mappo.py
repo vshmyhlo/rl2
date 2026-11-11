@@ -1042,7 +1042,9 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
     config = replace(
         config,
         env=LuxConfig(map_size=128, max_units=2, max_steps_in_match=2, match_count=1, randomize_params=False),
-        model=ppo.LuxModelConfig(embedding_size=4, channels=4, recurrent=config.model.recurrent),
+        model=ppo.LuxModelConfig(
+            embedding_size=4, channels=4, recurrent=config.model.recurrent, attention_implementation="xla"
+        ),
         num_envs=1,
         num_steps=3,
         num_minibatches=1,

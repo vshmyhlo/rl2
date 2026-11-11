@@ -20,6 +20,7 @@ model:
   type: lux
   embedding_size: 128
   channels: 16
+  attention_implementation: triton
   recurrent:
     hidden_size: 128
     num_layers: 1
@@ -38,8 +39,8 @@ entropy_decay: constant
 value_coef: 1.0
 max_grad_norm: 0.5
 ckpt_dir: /runs/mappo/${run_id}
-# The ship/target policy requires a fresh checkpoint.
-run_id: mappo_lux_ship_selfplay_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
+# The entity-set attention policy requires a fresh checkpoint.
+run_id: mappo_lux_set_selfplay_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
 # Intervals count training iterations.
 log_interval: 1
 video_interval: 0

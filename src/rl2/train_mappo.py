@@ -7,7 +7,7 @@ traces; timeouts bootstrap from final local observations unless also terminated.
 Despite the historical MAPPO filename, the critic uses no centralized state.
 Lux observations separate self/opponent teams and retain native dtypes through
 rollout storage. The default generic model uses an MLP; model.type=lux uses
-spatial/entity encoding, shared ship heads, and spatial sap-target scoring.
+masked entity-set self-attention, shared ship heads, and spatial sap-target scoring.
 Both models retain one recurrent state and one value per agent/team.
 
 Shape dimensions:
@@ -191,6 +191,11 @@ from typing import Annotated, Any, Literal, NamedTuple, Self, cast
 # That native runtime can crash a later Triton import; use our gcsfs dependency.
 # Set this before importing Orbax, since epath caches its backend selection.
 os.environ.setdefault("EPATH_USE_TF", "0")
+
+# Load Triton before environment dependencies load TensorFlow's native runtime.
+import tokamax  # noqa: F401
+
+# isort: split
 
 import chex
 import jax

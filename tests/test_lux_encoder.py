@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tokamax  # noqa: F401 - load Triton before luxai_s3 imports TensorFlow
 from jax.sharding import AxisType, Mesh, PartitionSpec
 from luxai_s3.state import MapTile, UnitState
 
@@ -50,7 +51,7 @@ def observation() -> LuxObservation[jax.Array]:
 
 @pytest.fixture(scope="module")
 def encoder() -> LuxEncoder:
-    return LuxEncoder(features=8, channels=4)
+    return LuxEncoder(features=8, channels=4, attention_implementation="xla")
 
 
 @pytest.fixture(scope="module")
@@ -96,11 +97,19 @@ def test_hidden_values_are_ignored(
         ),
     )
     pair = jax.tree.map(lambda *leaves: jnp.stack(leaves), observation, changed)  # leaves: (B=2, ...)
-    outputs = jax.jit(encoder.apply)(params, pair)  # (B, F)
-    np.testing.assert_array_equal(outputs[0], outputs[1])
+    outputs = jax.jit(lambda obs: encoder.apply(params, obs, method="encode_features"))(pair)
+    for leaf in jax.tree.leaves(outputs):
+        np.testing.assert_array_equal(leaf[0], leaf[1])
 
 
 def test_entity_ordering(encoder: LuxEncoder, params: dict[str, Any], observation: LuxObservation[jax.Array]) -> None:
+    observation = observation._replace(
+        world=observation.world._replace(
+            relic_nodes=jnp.array([[3, 3], [4, 5]], jnp.int16),  # (R=2, 2)
+            relic_nodes_mask=jnp.ones(2, dtype=bool),  # (R,)
+        )
+    )
+
     def permute(team: LuxTeamObservation[jax.Array]) -> LuxTeamObservation[jax.Array]:
         return team._replace(
             units=jax.tree.map(lambda leaf: leaf[jnp.array([1, 0, 2])], team.units),  # (U, 2)/(U,)
@@ -116,9 +125,11 @@ def test_entity_ordering(encoder: LuxEncoder, params: dict[str, Any], observatio
     )
     own_permuted = observation._replace(self=permute(observation.self))
     batch = jax.tree.map(lambda *leaves: jnp.stack(leaves), observation, unordered, own_permuted)  # leaves: (B=3, ...)
-    output = jax.jit(encoder.apply)(params, batch)  # (B, F)
-    np.testing.assert_allclose(output[0], output[1], atol=2e-6)
-    np.testing.assert_allclose(output[0], output[2], atol=2e-6)
+    output = jax.jit(lambda obs: encoder.apply(params, obs, method="encode_features"))(batch)
+    np.testing.assert_allclose(output.global_features[0], output.global_features[1], atol=2e-6)
+    np.testing.assert_allclose(output.global_features[0], output.global_features[2], atol=2e-6)
+    np.testing.assert_allclose(output.ships[0], output.ships[1], atol=2e-6)
+    np.testing.assert_allclose(output.ships[2], output.ships[0, jnp.array([1, 0, 2])], atol=2e-6)
 
 
 def test_visible_inputs_affect_encoding(
@@ -175,6 +186,9 @@ def test_gradients_and_empty_observation(
         "ship_projection",
         "context_projection",
         "map_attention",
+        "relic_projection",
+        "set_attention_0",
+        "set_attention_1",
         "output_projection",
     ):
         norm = sum(float(jnp.sum(jnp.abs(leaf))) for leaf in jax.tree.leaves(gradient["params"][name]))
@@ -230,3 +244,41 @@ def test_sharded_encoder_matches_outputs_and_gradients(
     for value, reference in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_allclose(value, reference, atol=2e-5, rtol=2e-4)
     assert actual[0][1].addressable_shards[0].data.shape == (1, 8)
+
+
+@pytest.mark.parametrize("empty", [False, True], ids=["unequal_set_lengths", "all_sets_empty"])
+def test_set_padding_does_not_change_features(
+    encoder: LuxEncoder, params: dict[str, Any], observation: LuxObservation[jax.Array], empty: bool
+) -> None:
+    own_count, opponent_count, relic_count = (0, 0, 0) if empty else (2, 1, 1)
+
+    def select(team: LuxTeamObservation[jax.Array], count: int, compact: bool) -> LuxTeamObservation[jax.Array]:
+        if compact:
+            return team._replace(
+                units=jax.tree.map(lambda leaf: leaf[:count], team.units),  # (count, 2)/(count,)
+                units_mask=team.units_mask[:count],  # (count,)
+            )
+        return team._replace(units_mask=team.units_mask & (jnp.arange(team.units_mask.size) < count))  # (U/V,)
+
+    padded = observation._replace(
+        self=select(observation.self, own_count, False),
+        opponent=select(observation.opponent, opponent_count, False),
+        world=observation.world._replace(
+            relic_nodes_mask=observation.world.relic_nodes_mask & (jnp.arange(2) < relic_count)
+        ),
+    )
+    compact = observation._replace(
+        self=select(observation.self, own_count, True),
+        opponent=select(observation.opponent, opponent_count, True),
+        world=observation.world._replace(
+            relic_nodes=observation.world.relic_nodes[:relic_count],  # (R, 2)
+            relic_nodes_mask=observation.world.relic_nodes_mask[:relic_count],  # (R,)
+        ),
+    )
+    apply = jax.jit(lambda obs: encoder.apply(params, obs, method="encode_features"))
+    reference, actual = apply(padded), apply(compact)
+    assert actual.ships.shape == (own_count, 8)
+    np.testing.assert_allclose(actual.global_features, reference.global_features, atol=2e-6)
+    np.testing.assert_allclose(actual.ships, reference.ships[:own_count], atol=2e-6)
+    np.testing.assert_allclose(actual.spatial, reference.spatial, atol=2e-6)
+    np.testing.assert_array_equal(reference.ships[own_count:], 0)

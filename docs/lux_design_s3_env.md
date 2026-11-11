@@ -100,6 +100,62 @@ model shapes from the actual pytrees.
   `env_params_ranges` on reset; its host-side wrapper is separate from the pure
   JAX API. Its reset info includes privileged `full_params` and `state` fields.
 
+## Model architecture
+
+[LuxActorCritic](../src/rl2/model/lux.py) processes each team's visible observation.
+The diagram shows `step` with batch size `B` and `U` own-ship slots;
+`__call__` adds a time axis after `B` and scans the team LSTM over that axis.
+`C` is `model.channels`; `A` is the number of commands per ship (230).
+
+```mermaid
+flowchart TB
+    subgraph encoder[Spatial and set encoder]
+        map["Visible map, sensor mask, coordinates"] --> cnn["Residual CNN<br/>full-resolution spatial features"]
+        entities["Unordered sets + validity masks<br/>own ships · opponent ships · relic nodes"] --> raster["Rasterize visible entities"]
+        raster --> cnn
+        entities --> tokens["Entity tokens<br/>type + coordinates + energy for ships"]
+        cnn -->|features at entity positions| tokens
+        cnn --> coarse["Downsample map by 4<br/>coarse map tokens"]
+        context["Scores, wins, progress, public parameters,<br/>active counts, visibility"] --> global["Always-valid global token"]
+        tokens --> cross["Map cross-attention<br/>entity + global queries; map keys/values"]
+        global --> cross
+        coarse --> cross
+        cross --> sets["2 × masked bidirectional self-attention + FFN<br/>4 heads · Tokamax/Triton · no slot embeddings"]
+        entities -.->|exclude absent and hidden keys| sets
+        sets --> ships["Own-ship features: B × U × 2C<br/>row i still identifies ship i"]
+        sets --> summary["Invariant summary<br/>own/opponent masked means + global token"]
+        coarse -->|mean + projection| summary
+        summary --> embedding["Team embedding"]
+    end
+
+    subgraph recurrent[Team memory]
+        embedding -->|ReLU + projection| lstm["Team LSTM"]
+        carry["Incoming carry + episode-start reset"] --> lstm
+        lstm --> next["Outgoing carry"]
+    end
+
+    subgraph outputs[Policy and value]
+        ships --> head["Shared per-ship head<br/>ship i features + team memory"]
+        lstm -->|broadcast to ships| head
+        head --> choices["Per-ship type logits: 3<br/>movement logits: 4"]
+        head -->|sap query for ship i| sap["Sap target scores<br/>query · target key"]
+        cnn --> targets["Gather keys at ship position + sap offsets<br/>add relative-offset embedding"]
+        entities -->|own-ship positions| targets
+        targets --> sap
+        choices --> policy["Masked hierarchical policy<br/>logits: B × U × A<br/>sampled commands: B × U"]
+        sap --> policy
+        legal["Legal-action masks"] --> policy
+        embedding --> critic["Team value head"]
+        lstm --> critic
+        critic --> value["Value: B<br/>one scalar per team"]
+    end
+```
+
+Reordering own ships reorders policy rows; opponent/relic permutations leave
+the policy unchanged. Team embeddings, carry, and values are invariant to all
+three permutations. Masked padding does not affect valid entities. Attention
+mixes entities within each observation; temporal history flows through the LSTM.
+
 ## rl2 integration
 
 [LuxEnv](../src/rl2/envs/lux_env.py) implements `BaseMultiAgentEnv` with **two team
@@ -138,28 +194,30 @@ The 128×128 preset uses 32 minibatches to limit encoder activation memory.
   absolute coordinates are retained.
   `LuxEnv.observation_space` describes one player's tree with
   `ShapeDtypeStruct` leaves, excluding action masks.
-- MAPPO's `model.type: lux` uses tile-type embeddings, normalized tile
-  energy, visibility, coordinates, and separate ship/relic spatial channels.
-  A residual CNN provides local ship features and a map downsampled by four for four-head
-  ship-to-map attention. Shared ship heads preserve command-slot order; masked means of both teams
-  feed team memory, so slot permutations preserve the value and permute commands.
-  Relics are rasterized. Sap scores combine ship queries, full-resolution target
-  map features, and relative target offsets; separate heads select action type
-  and movement direction. Legal-action masks retain the environment's command order. Projected
-  public context includes scores, wins, progress, costs/ranges, and visible counts.
-  Hidden fields are masked before encoding; relic scoring tiles are never inputs.
-  `model.channels` (default 16, positive even integer) controls CNN width; attention
-  width is twice that. `model.embedding_size` controls team embeddings and policy/value hidden widths.
-  `model.recurrent` controls the shared team LSTM. Omitting `model.type` selects
-  `generic`, which retains the flat MLP and dense heads for other environments.
-  `make_actor_critic` constructs `GenericActorCritic` or `LuxActorCritic`; both
-  implement `BaseActorCritic` with their own observation and policy types.
-  Continuous features use fixed physical scales (tile energy 20, ship energy
-  400, wins 5, game/match steps 505/100); scores also receive a log transform.
-  These scales do not impose limits on configured game lengths.
-  This architecture requires a fresh run directory; old encoder checkpoints
-  are incompatible. It adds spatial structure but needs training evaluation
-  to establish improvements in playing strength.
+- MAPPO's `model.type: lux` encodes the spatial map with a residual CNN.
+  Own ships, visible opponent ships, and visible relic nodes are separate typed
+  entities in one set. Tokens combine physical coordinates and local map features;
+  ships also carry energy. There are no slot-index embeddings.
+  Map cross-attention precedes two bidirectional self-attention blocks with four
+  heads and residual feed-forward layers. Masks exclude hidden/absent entities;
+  an always-valid global token handles empty sets. Padding capacity does not
+  affect features; active ship counts use a fixed scale of 16.
+- Each own-ship token retains its input row through attention and feeds shared
+  action-type, movement, and sap-query heads together with team memory. Sap
+  scores use target-map features and relative offsets. Reordering own ships
+  reorders their commands; opponent/relic permutations leave commands unchanged.
+  Invariant summaries feed the team LSTM and value head. Hidden scoring tiles
+  are never inputs, and legality masks preserve the environment's command order.
+- `model.channels` controls CNN width; attention width is twice that and requires
+  positive even channels. `model.embedding_size` controls team and head widths;
+  `model.recurrent` configures team memory. `model.attention_implementation`
+  defaults to `triton`: both attention paths call Tokamax's Triton kernel.
+  Explicit `xla` selects Tokamax's CPU-compatible reference implementation.
+  This architecture requires a fresh run directory; previous checkpoints are
+  incompatible. Playing-strength improvements require training evaluation.
+- Omitting `model.type` selects `generic`, the flat MLP model. `make_actor_critic`
+  constructs `GenericActorCritic` or `LuxActorCritic`, both implementing
+  `BaseActorCritic` with their own observation and policy types.
 - PPO computes one joint log probability and one value per **team**. Log
   probabilities and entropies sum over ship commands; batches and recurrent
   memory retain two agent sequences per environment, not 32 ship sequences.

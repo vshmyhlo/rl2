@@ -32,6 +32,7 @@ class LuxModelConfig:
     type: Literal["lux"] = "lux"
     embedding_size: Annotated[int, Field(gt=0, strict=True)] = 128
     channels: Annotated[int, Field(gt=0, multiple_of=2, strict=True)] = 16
+    attention_implementation: Literal["triton", "xla"] = "triton"
     recurrent: LSTMConfig = LSTMConfig()
 
 

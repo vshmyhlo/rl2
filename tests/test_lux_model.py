@@ -20,7 +20,9 @@ from rl2.model.lux import LuxActorCritic, LuxFeatures, LuxModel
 def model() -> LuxActorCritic:
     return LuxActorCritic(
         action_space=HierarchicalMultiDiscreteSpace(nvec=(14,) * 3, group_sizes=(1, 4, 9)),
-        model=LuxModelConfig(embedding_size=8, channels=4, recurrent=LSTMConfig(hidden_size=4)),
+        model=LuxModelConfig(
+            embedding_size=8, channels=4, recurrent=LSTMConfig(hidden_size=4), attention_implementation="xla"
+        ),
     )
 
 
@@ -87,14 +89,28 @@ def test_ship_permutation_equivariance(
         units=jax.tree.map(lambda leaf: leaf[permutation], observation.self.units),  # position: (U, 2); energy: (U,)
         units_mask=observation.self.units_mask[permutation],  # (U,)
     )
-    batch = jax.tree.map(lambda a, b: jnp.stack((a, b)), observation, observation._replace(self=team))  # (B=2, ...)
-    output = jax.jit(
-        lambda obs: model.apply(params, obs, model.initial_carry(2), jnp.ones(2, bool), action_mask(obs), method="step")
-    )(batch)
+    reordered_world = observation._replace(
+        opponent=observation.opponent._replace(
+            units=jax.tree.map(lambda leaf: leaf[permutation], observation.opponent.units),
+            units_mask=observation.opponent.units_mask[permutation],  # (V,)
+        ),
+        world=observation.world._replace(
+            relic_nodes=observation.world.relic_nodes[::-1],  # (R, 2)
+            relic_nodes_mask=observation.world.relic_nodes_mask[::-1],  # (R,)
+        ),
+    )
+    batch = jax.tree.map(
+        lambda *leaves: jnp.stack(leaves), observation, observation._replace(self=team), reordered_world
+    )  # (B=3, ...)
+    memory = jax.tree.map(lambda leaf: leaf + 0.5, model.initial_carry(3))  # leaves: (B, H), same prior history
+    output = jax.jit(lambda obs: model.apply(params, obs, memory, jnp.zeros(3, bool), action_mask(obs), method="step"))(
+        batch
+    )
     np.testing.assert_allclose(output.policy.logits[1], output.policy.logits[0, permutation], atol=2e-6)
-    np.testing.assert_allclose(output.value[1], output.value[0], atol=2e-6)
+    np.testing.assert_allclose(output.policy.logits[2], output.policy.logits[0], atol=2e-6)
+    np.testing.assert_allclose(output.value[1:], jnp.broadcast_to(output.value[0], (2,)), atol=2e-6)
     for leaf in jax.tree.leaves(output.carry):
-        np.testing.assert_allclose(leaf[0], leaf[1], atol=2e-6)
+        np.testing.assert_allclose(leaf[1:], jnp.broadcast_to(leaf[0], leaf[1:].shape), atol=2e-6)
 
 
 def test_empty_team_has_no_policy_gradient(
@@ -204,3 +220,52 @@ def test_sharded_policy_and_value_gradients(
         magnitude = sum(float(jnp.abs(leaf).sum()) for leaf in jax.tree.leaves(actual[1]["params"]["lux"][name]))
         assert 0 < magnitude < 1e6
     assert actual[0][1].addressable_shards[0].data.shape == (1, 1)
+
+
+def test_each_policy_row_uses_its_own_ship_features(
+    model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
+) -> None:
+    network = LuxModel(embedding_size=8, channels=4, action_space=model.action_space, attention_implementation="xla")
+    variables = {"params": params["params"]["lux"]}
+    obs = jax.tree.map(lambda leaf: leaf[None], observation)  # leaves: (B=1, ...)
+    features = network.apply(variables, obs, method="encode")
+    changed = features._replace(ships=features.ships.at[:, 0].add(jnp.arange(8)))  # (B, U, D)
+
+    def heads(encoded: LuxFeatures) -> tuple[jax.Array, jax.Array]:
+        policy, value = network.apply(variables, jnp.zeros((1, 4)), encoded, obs, action_mask(obs), method="heads")
+        return policy.raw_logits, value  # (B, U, L); (B,)
+
+    expected_logits, expected_value = heads(features)  # (B, U, L); (B,)
+    actual_logits, actual_value = heads(changed)  # (B, U, L); (B,)
+    assert float(jnp.max(jnp.abs(actual_logits[:, 0] - expected_logits[:, 0]))) > 1e-5
+    np.testing.assert_array_equal(actual_logits[:, 1:], expected_logits[:, 1:])
+    np.testing.assert_array_equal(actual_value, expected_value)
+
+
+def test_padding_capacity_does_not_change_ship_policies_or_team_memory(
+    model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
+) -> None:
+    compact = observation._replace(
+        self=observation.self._replace(
+            units=jax.tree.map(lambda leaf: leaf[:2], observation.self.units),  # positions: (U=2, 2); energy: (U,)
+            units_mask=observation.self.units_mask[:2],  # (U,)
+        ),
+        opponent=observation.opponent._replace(
+            units=jax.tree.map(lambda leaf: leaf[:2], observation.opponent.units),  # positions: (V=2, 2); energy: (V,)
+            units_mask=observation.opponent.units_mask[:2],  # (V,)
+        ),
+        world=observation.world._replace(
+            relic_nodes=observation.world.relic_nodes[:1],  # (R=1, 2)
+            relic_nodes_mask=observation.world.relic_nodes_mask[:1],  # (R,)
+        ),
+    )
+    padded, compact = jax.tree.map(lambda leaf: leaf[None, None], (observation, compact))  # leaves: (B=1, T=1, ...)
+    smaller = model.clone(action_space=HierarchicalMultiDiscreteSpace(nvec=(14,) * 2, group_sizes=(1, 4, 9)))
+    expected = jax.jit(model.apply)(params, padded, model.initial_carry(1), jnp.ones((1, 1), bool), action_mask(padded))
+    actual = jax.jit(smaller.apply)(
+        params, compact, model.initial_carry(1), jnp.ones((1, 1), bool), action_mask(compact)
+    )
+    assert actual.policy.logits.shape == (1, 1, 2, 14)
+    np.testing.assert_allclose(actual.policy.logits, expected.policy.logits[..., :2, :], atol=2e-6)
+    chex.assert_trees_all_close((actual.value, actual.carry), (expected.value, expected.carry), atol=2e-6)
+    np.testing.assert_allclose(actual.policy.entropy(), expected.policy.entropy(), atol=2e-6)
