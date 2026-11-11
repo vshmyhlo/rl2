@@ -140,7 +140,7 @@ def test_rollout_team_gae_death_timeout_and_sequence_selection(config: ppo.Confi
     env = ScriptedSMAX()
     observation, state = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 2))
     state = state.replace(enemy_policy_state=jnp.array([False, True]))
-    model = ppo.ActorCritic(env.action_space, config.model)
+    model = ppo.make_actor_critic(env.action_space, config.model)
     memory = model.initial_carry(4)  # leaves: (B=4, H=4)
     runner = ppo.RolloutCarry(state, observation, memory, jnp.ones(4, bool), jnp.zeros(2), jnp.zeros(2, jnp.int32))
     train_state = TrainState.create(apply_fn=scripted_policy, params={}, tx=optax.sgd(0.1))
@@ -268,7 +268,7 @@ def test_timeout_bootstrap_resets_only_inactive_agent_memory(config: ppo.Config)
 
 
 def test_local_model_mask_replay_and_shared_memory(config: ppo.Config) -> None:
-    model = ppo.ActorCritic(ppo.DiscreteSpace(3), config.model)
+    model = ppo.make_actor_critic(ppo.DiscreteSpace(3), config.model)
     observation = jnp.arange(24, dtype=jnp.float32).reshape(3, 2, 4) / 24  # (B, T, O)
     starts = jnp.array([[True, True], [True, False], [False, False]])  # (B, T)
     actions_mask = jnp.array(
@@ -395,7 +395,7 @@ def test_train_step_omits_undefined_variance_and_stops_updates(
     runner = ppo.RolloutCarry(
         env_state=env_state,  # leaves: (E=2, ...)
         observation=observation,  # (E, N=2, O=2)/(E, N, A=3)
-        model_carry=ppo.ActorCritic(env.action_space, config.model).initial_carry(4),  # leaves: (B=4, H=4)
+        model_carry=ppo.make_actor_critic(env.action_space, config.model).initial_carry(4),  # leaves: (B=4, H=4)
         episode_start=jnp.ones(4, bool),  # (B,)
         episode_return=jnp.zeros(2),  # (E,)
         episode_step_count=jnp.zeros(2, jnp.int32),  # (E,)
@@ -557,7 +557,7 @@ def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_pat
     config = replace(config, num_envs=1, num_steps=1, num_minibatches=3, env=SMAXConfig(max_steps=1, selfplay=selfplay))
     env = ppo.make_env(config)  # Three or six agent sequences form three minibatches.
     observation, state = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 1))  # (E=1, N, O)/(E, N, A); (...)
-    model = ppo.ActorCritic(env.action_space, config.model)
+    model = ppo.make_actor_critic(env.action_space, config.model)
     memory = model.initial_carry(env.num_agents)  # leaves: (B=N, H)
     starts = jnp.ones(env.num_agents, bool)  # (B,)
     params = model.init(
@@ -811,11 +811,16 @@ def test_config_and_cli(config: ppo.Config, tmp_path: Path, monkeypatch: pytest.
     train.assert_called_once_with(config)
 
 
-@pytest.mark.parametrize("interval", [1, 3, 0], ids=["final-on-interval", "final-before-interval", "disabled"])
+@pytest.mark.parametrize(
+    "interval,checkpoint_fails",
+    [(1, False), (3, False), (0, False), (0, True)],
+    ids=["final-on-interval", "final-before-interval", "disabled", "checkpoint-close-failure"],
+)
 def test_training_resume_wiring_and_environment_step_logging(
     config: ppo.Config,
     monkeypatch: pytest.MonkeyPatch,
     interval: int,
+    checkpoint_fails: bool,
 ) -> None:
     config = replace(
         config,
@@ -827,6 +832,9 @@ def test_training_resume_wiring_and_environment_step_logging(
     )
     env = ScriptedSMAX()
     writer, manager = MagicMock(), Mock()
+    checkpoint_error = OSError("final checkpoint failed")
+    if checkpoint_fails:
+        manager.close.side_effect = checkpoint_error
     video, evaluation, save = Mock(), Mock(), Mock(return_value=2.5)
     monkeypatch.setattr(ppo, "make_env", lambda _: env)
     monkeypatch.setattr(ppo, "MLflowLogger", Mock(return_value=writer))
@@ -878,7 +886,12 @@ def test_training_resume_wiring_and_environment_step_logging(
 
     monkeypatch.setattr(ppo, "restore_checkpoint", restore)
     monkeypatch.setattr(ppo, "train_step_donated", train_step)
-    state = ppo.train(config)
+    if checkpoint_fails:
+        with pytest.raises(OSError, match="final checkpoint failed"):
+            ppo.train(config)
+        state = save.call_args.args[1].train_state
+    else:
+        state = ppo.train(config)
     writer.log_params.assert_called_once_with(asdict(config))
     for logger in (video, evaluation):
         if not interval:
@@ -908,6 +921,8 @@ def test_training_resume_wiring_and_environment_step_logging(
     assert save.call_args.args[1].environment_step_count == 10
     assert save.call_args.args[1].observation_count == 26
     writer.__exit__.assert_called_once()
+    # ExitStack passes the context manager itself before the exception arguments.
+    assert writer.__exit__.call_args.args[-3:-1] == ((OSError, checkpoint_error) if checkpoint_fails else (None, None))
     manager.close.assert_called_once()
 
 
@@ -954,7 +969,7 @@ def test_episode_end_fractions_use_completed_window_episodes(config: ppo.Config)
         patch.object(ppo, "configure_compilation_cache"),
         patch.object(ppo, "make_env", return_value=ScriptedSMAX()),
         patch.object(ppo, "checkpoint_manager"),
-        patch.object(ppo, "ActorCritic", return_value=model),
+        patch.object(ppo, "make_actor_critic", return_value=model),
         patch.object(ppo, "restore_checkpoint", return_value=None),
         patch.object(ppo, "save_checkpoint", return_value=1.0),
         patch.object(ppo, "MLflowLogger", return_value=writer),
@@ -982,7 +997,7 @@ def test_mlflow_resume_without_checkpoint(config: ppo.Config) -> None:
 
 
 def test_hierarchical_model_masks_and_sequence_replay(config: ppo.Config) -> None:
-    model = ppo.ActorCritic(
+    model = ppo.make_actor_critic(
         action_space=ppo.HierarchicalMultiDiscreteSpace(nvec=(3, 3), group_sizes=(1, 2)), model=config.model
     )
     observation = jnp.ones((2, 2, 4))  # (B, T, O)
@@ -1043,7 +1058,7 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
         ppo.make_env(replace(loaded, num_minibatches=3))
     observation, state = jax.jit(jax.vmap(env.reset))(jax.random.split(jax.random.key(0), 1))
     # observation: (E, N, ...)/(E, N, U, A); state leaves: (E, ...)
-    model = ppo.ActorCritic(action_space=env.action_space, model=config.model)
+    model = ppo.make_actor_critic(action_space=env.action_space, model=config.model)
     memory = model.initial_carry(2)  # leaves: (B, H)
     starts = jnp.ones(2, dtype=bool)  # (B,)
     sequence = jax.tree.map(lambda leaf: jnp.swapaxes(leaf, 0, 1), observation)  # (B, T=1, ...)
@@ -1091,7 +1106,7 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
 
 
 def test_grouped_model_balances_types_and_masks(config: ppo.Config) -> None:
-    model = ppo.ActorCritic(
+    model = ppo.make_actor_critic(
         action_space=ppo.HierarchicalMultiDiscreteSpace(nvec=(6, 6), group_sizes=(1, 2, 3)), model=config.model
     )
     observation = jnp.zeros((2, 1, 4))  # (B, T, O)
@@ -1276,7 +1291,7 @@ def test_training_evaluates_exact_historical_iterations(config: ppo.Config) -> N
 
     with (
         patch.object(ppo, "make_env", return_value=ScriptedSMAX()),
-        patch.object(ppo, "ActorCritic", return_value=model),
+        patch.object(ppo, "make_actor_critic", return_value=model),
         patch.object(ppo, "MLflowLogger"),
         patch.object(ppo, "checkpoint_manager"),
         patch.object(ppo, "restore_checkpoint", return_value=None),

@@ -212,7 +212,7 @@ def test_pool_checkpoint_restore_resize_and_disable(config: ppo.Config, tmp_path
 def test_pool_training_matches_replicated_and_sharded_updates(config: ppo.Config) -> None:
     config = replace(config, selfplay=SelfPlayConfig(pool_size=2), num_minibatches=1)
     env = Duel()
-    model = ppo.ActorCritic(action_space=env.action_space, model=config.model)
+    model = ppo.make_actor_critic(action_space=env.action_space, model=config.model)
     observation, env_state = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 2))
     memory = model.initial_carry(4)  # leaves: (B=4, H)
     params = model.init(
@@ -269,7 +269,7 @@ def test_lux_pool_preserves_structured_observations_and_match_memory(config: ppo
     )
     env = ppo.make_env(config)
     observation, env_state = jax.jit(jax.vmap(env.reset))(jax.random.split(jax.random.key(0), 1))
-    model = ppo.ActorCritic(action_space=env.action_space, model=config.model)
+    model = ppo.make_actor_critic(action_space=env.action_space, model=config.model)
     memory = model.initial_carry(2)  # leaves: (E*N=2, H)
     sequence = jax.tree.map(lambda leaf: jnp.swapaxes(leaf, 0, 1), observation)  # leaves: (B=2, T=1, ...)
     params = model.init(jax.random.key(1), sequence.observation, memory, jnp.ones((2, 1), bool), sequence.actions_mask)[

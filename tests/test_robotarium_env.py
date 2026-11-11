@@ -141,7 +141,7 @@ def test_mappo_update_and_playback() -> None:
     observation, state = jax.vmap(env.reset)(
         jax.random.split(jax.random.key(0), 1)
     )  # (E=1, N=2, O=12)/(E, N, A=5); state leaves: (E, ...)
-    model = ppo.ActorCritic(action_space=env.action_space, model=config.model)
+    model = ppo.make_actor_critic(action_space=env.action_space, model=config.model)
     memory = model.initial_carry(2)  # leaves: (B=2, H=4)
     starts = jnp.ones(2, bool)  # (B,)
     params = model.init(

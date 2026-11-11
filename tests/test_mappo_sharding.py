@@ -147,7 +147,7 @@ def test_sharded_training_matches_single_device_and_restores_checkpoint(
     env = ScriptedSMAX()
     observation, env_state = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 2))  # (E=2, N=2, O=2)/(E,N,A=3)
     env_state = env_state.replace(enemy_policy_state=jnp.array([False, True]))  # (E,); timeout and termination
-    model = ppo.ActorCritic(action_space=env.action_space, model=config.model)
+    model = ppo.make_actor_critic(action_space=env.action_space, model=config.model)
     memory = model.initial_carry(4)  # leaves: (B=4, H=4)
     starts = jnp.ones(4, bool)  # (B,)
     state = TrainState.create(
@@ -228,7 +228,7 @@ def test_sharded_training_matches_single_device_and_restores_checkpoint(
 def test_hierarchical_sharded_update_preserves_sequences_and_matches_single_device(
     config: ppo.Config, mesh: Mesh
 ) -> None:
-    model = ppo.ActorCritic(
+    model = ppo.make_actor_critic(
         action_space=ppo.HierarchicalMultiDiscreteSpace(nvec=(3, 3), group_sizes=(1, 2)), model=config.model
     )
     observation = jnp.arange(8, dtype=jnp.float32).reshape(2, 2, 2)  # (B=2, T=2, O=2)

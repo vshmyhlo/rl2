@@ -9,6 +9,9 @@ from flax import linen as nn
 
 from rl2.actions import HierarchicalMultiCategoricalPolicy, HierarchicalMultiDiscreteSpace
 from rl2.envs.lux_env import LuxObservation
+from rl2.lstm import LSTMStack, LSTMStackCarry
+from rl2.model.actor_critic import ActorCriticOutput, BaseActorCritic
+from rl2.model.config import LuxModelConfig
 from rl2.model.encoders.conv2d import ResidualBlock
 
 
@@ -236,3 +239,80 @@ class LuxModel(nn.Module):
         critic = nn.silu(self.value_norm(self.value_hidden(context)))  # (*S, F)
         value = self.value_output(critic).squeeze(-1).astype(jnp.float32)  # (*S,)
         return policy, value
+
+
+class LuxActorCritic(BaseActorCritic[LuxObservation[jax.Array], LSTMStackCarry, HierarchicalMultiCategoricalPolicy]):
+    """Lux spatial/entity policy with recurrent team memory and shared ship heads."""
+
+    action_space: HierarchicalMultiDiscreteSpace
+    model: LuxModelConfig
+    dtype: jax.typing.DTypeLike = jnp.float32
+
+    @nn.nowrap
+    def _make_recurrent(self, *, parent: nn.Module | None = None) -> LSTMStack:
+        return LSTMStack(
+            features=self.model.recurrent.hidden_size,
+            num_layers=self.model.recurrent.num_layers,
+            intermediate_size=self.model.recurrent.intermediate_size,
+            dtype=self.dtype,
+            name="lstm",
+            parent=parent,
+        )
+
+    @nn.nowrap
+    def initial_carry(self, actor_count: int) -> LSTMStackCarry:
+        return self._make_recurrent().initial_carry(actor_count)  # leaves: (B, H)
+
+    def setup(self) -> None:
+        self.lux = LuxModel(
+            embedding_size=self.model.embedding_size,
+            channels=self.model.channels,
+            action_space=self.action_space,
+            dtype=self.dtype,
+            name="lux",
+        )
+        self.recurrent = self._make_recurrent(parent=self)
+        self.recurrent_input = nn.Dense(features=self.model.recurrent.hidden_size, dtype=self.dtype, name="lstm_input")
+
+    def _encode(self, observation: LuxObservation[jax.Array]) -> tuple[jax.Array, LuxFeatures]:
+        """Return (*S, H) recurrent inputs and Lux spatial/entity features."""
+        features = self.lux.encode(observation)  # leaves: (*S, ...)
+        x = self.recurrent_input(nn.relu(features.global_features)).astype(self.dtype)  # (*S, H)
+        return x, features  # (*S, H); leaves: (*S, ...)
+
+    def __call__(
+        self,
+        observation: LuxObservation[jax.Array],  # leaves: (B, T, ...)
+        model_carry: LSTMStackCarry,  # leaves: (B, H)
+        episode_start: jax.Array,  # (B, T)
+        actions_mask: jax.Array,  # (B, T, *C, A)
+    ) -> ActorCriticOutput[
+        LSTMStackCarry, HierarchicalMultiCategoricalPolicy
+    ]:  # carry leaves: (B, H); logits: (B, T, *C, A); value: (B, T)
+        """Process observation sequences, resetting memory at episode starts."""
+        x, features = self._encode(observation)  # (B, T, H)
+        # The shared LSTM scans time-major inputs; MAPPO exposes batch-major arrays.
+        recurrent_x, recurrent_starts = jax.tree.map(
+            lambda leaf: jnp.swapaxes(leaf, 0, 1), (x, episode_start)
+        )  # (T, B, H); (T, B)
+        model_carry, recurrent_x = self.recurrent(
+            recurrent_x, model_carry, recurrent_starts
+        )  # model_carry leaves: (B, H); recurrent_x: (T, B, H)
+        x = jnp.swapaxes(recurrent_x, 0, 1)  # (B, T, H)
+        policy, value = self.lux.heads(x, features, observation, actions_mask)  # logits: (B, T, *C, A); (B, T)
+        return ActorCriticOutput(carry=model_carry, policy=policy, value=value)
+
+    def step(
+        self,
+        observation: LuxObservation[jax.Array],  # leaves: (B, ...)
+        model_carry: LSTMStackCarry,  # leaves: (B, H)
+        episode_start: jax.Array,  # (B,)
+        actions_mask: jax.Array,  # (B, *C, A)
+    ) -> ActorCriticOutput[
+        LSTMStackCarry, HierarchicalMultiCategoricalPolicy
+    ]:  # carry leaves: (B, H); logits: (B, *C, A); value: (B,)
+        """Process one observation per sequence, resetting memory at episode starts."""
+        x, features = self._encode(observation)  # (B, H)
+        model_carry, x = self.recurrent.step(x, model_carry, episode_start)  # model_carry leaves: (B, H); x: (B, H)
+        policy, value = self.lux.heads(x, features, observation, actions_mask)  # logits: (B, *C, A); (B,)
+        return ActorCriticOutput(carry=model_carry, policy=policy, value=value)

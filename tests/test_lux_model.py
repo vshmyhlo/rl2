@@ -12,13 +12,13 @@ from test_lux_encoder import observation as observation  # noqa: PLC0414
 
 from rl2.actions import HierarchicalMultiDiscreteSpace
 from rl2.envs.lux_env import LuxObservation
-from rl2.model.lux import LuxFeatures, LuxModel
-from rl2.model.mappo import ActorCritic, LSTMConfig, LuxModelConfig
+from rl2.model.config import LSTMConfig, LuxModelConfig
+from rl2.model.lux import LuxActorCritic, LuxFeatures, LuxModel
 
 
 @pytest.fixture(scope="module")
-def model() -> ActorCritic:
-    return ActorCritic(
+def model() -> LuxActorCritic:
+    return LuxActorCritic(
         action_space=HierarchicalMultiDiscreteSpace(nvec=(14,) * 3, group_sizes=(1, 4, 9)),
         model=LuxModelConfig(embedding_size=8, channels=4, recurrent=LSTMConfig(hidden_size=4)),
     )
@@ -33,7 +33,7 @@ def action_mask(observation: LuxObservation[jax.Array]) -> jax.Array:  # leaves:
 
 
 @pytest.fixture(scope="module")
-def params(model: ActorCritic, observation: LuxObservation[jax.Array]) -> dict[str, Any]:
+def params(model: LuxActorCritic, observation: LuxObservation[jax.Array]) -> dict[str, Any]:
     sequence = jax.tree.map(lambda leaf: leaf[None, None], observation)  # leaves: (B=1, T=1, ...)
     return model.init(
         jax.random.key(4), sequence, model.initial_carry(1), jnp.ones((1, 1), dtype=bool), action_mask(sequence)
@@ -41,7 +41,7 @@ def params(model: ActorCritic, observation: LuxObservation[jax.Array]) -> dict[s
 
 
 def test_sequence_step_replay_reset_and_bfloat16(
-    model: ActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
+    model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
     sequence = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (2, 2, *leaf.shape)), observation)  # (B, T, ...)
     starts = jnp.array([[False, False], [False, True]])  # (B, T)
@@ -80,7 +80,7 @@ def test_sequence_step_replay_reset_and_bfloat16(
 
 
 def test_ship_permutation_equivariance(
-    model: ActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
+    model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
     permutation = jnp.array([1, 2, 0])  # (U,)
     team = observation.self._replace(
@@ -98,7 +98,7 @@ def test_ship_permutation_equivariance(
 
 
 def test_empty_team_has_no_policy_gradient(
-    model: ActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
+    model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
     empty = observation._replace(self=observation.self._replace(units_mask=jnp.zeros(3, dtype=bool)))
     empty = jax.tree.map(lambda leaf: leaf[None, None], empty)  # leaves: (B=1, T=1, ...)
@@ -117,7 +117,7 @@ def test_empty_team_has_no_policy_gradient(
 
 
 def test_sap_scores_follow_relative_target_coordinates(
-    model: ActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
+    model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
     network = LuxModel(embedding_size=8, channels=4, action_space=model.action_space)
     variables = jax.tree.map(lambda leaf: leaf, params["params"]["lux"])
@@ -137,7 +137,7 @@ def test_sap_scores_follow_relative_target_coordinates(
 
 
 def test_single_ship_small_map_reuses_parameters(
-    model: ActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
+    model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
     small = observation._replace(
         self=observation.self._replace(
@@ -174,7 +174,7 @@ def test_rejects_incompatible_command_groups(groups: tuple[int, ...], observatio
 
 
 def test_sharded_policy_and_value_gradients(
-    model: ActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
+    model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
     if jax.device_count() < 2:
         pytest.skip("Requires two devices; use JAX_NUM_CPU_DEVICES=2 on CPU")

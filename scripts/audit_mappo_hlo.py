@@ -61,7 +61,7 @@ def compile_steps(config: ppo.Config, output: Path, step: Step = "all") -> None:
         observation, env_state = jax.tree.map(
             lambda leaf: shape(leaf, batched), jax.eval_shape(reset, reset_keys)
         )  # observation: (E, N, ...)/(E, N, *C, A); state: (E, ...)
-        model = ppo.ActorCritic(
+        model = ppo.make_actor_critic(
             action_space=env.action_space,
             model=config.model,
             dtype=jnp.bfloat16 if config.bf16 else jnp.float32,

@@ -152,6 +152,8 @@ The 128×128 preset uses 32 minibatches to limit encoder activation memory.
   width is twice that. `model.embedding_size` controls team embeddings and policy/value hidden widths.
   `model.recurrent` controls the shared team LSTM. Omitting `model.type` selects
   `generic`, which retains the flat MLP and dense heads for other environments.
+  `make_actor_critic` constructs `GenericActorCritic` or `LuxActorCritic`; both
+  implement `BaseActorCritic` with their own observation and policy types.
   Continuous features use fixed physical scales (tile energy 20, ship energy
   400, wins 5, game/match steps 505/100); scores also receive a log transform.
   These scales do not impose limits on configured game lengths.

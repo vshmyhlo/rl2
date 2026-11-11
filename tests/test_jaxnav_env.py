@@ -155,7 +155,7 @@ def test_jaxnav_rollout_timeout_update_and_evaluation(env: JaxNavEnv, state: Sta
             encoder=ppo.MLPEncoderConfig(embedding_size=4), recurrent=ppo.LSTMConfig(hidden_size=4)
         ),
     )
-    model = ppo.ActorCritic(env.action_space, config.model)
+    model = ppo.make_actor_critic(env.action_space, config.model)
     memory = model.initial_carry(2)  # leaves: (B=2, H=4)
     final_input = state.replace(step=jnp.asarray(1))
     observation = env._observation(env.env.get_obs(final_input))  # (N, O)/(N, A)

@@ -163,7 +163,8 @@ and transition counters, and cumulative episode statistics. Restore uses the cur
 configuration without compatibility checks. Legacy checkpoints lacking transition
 counters estimate them using current rollout dimensions. Live environments and
 memory restart on resume; unfinished episode statistics are discarded. Checkpoint
-writes overlap training; shutdown waits for pending writes and surfaces failures.
+writes overlap training; shutdown waits for pending writes and surfaces failures
+before finalizing MLflow.
 Pool parameters and snapshot iterations are checkpointed separately. Resume uses
 the current pool capacity, preserving the initial snapshot and newest history;
 enabling a pool on an older checkpoint starts it from the restored learner. Live
@@ -211,29 +212,24 @@ from rl2.actions import (
     DiscreteSpace,
     HierarchicalMultiCategoricalPolicy,
     HierarchicalMultiDiscreteSpace,
+    MultiAgentActionSpace,
     Policy,
 )
 from rl2.configuration import BaseConfig, load_config
 from rl2.envs.jaxnav_env import JaxNavConfig, JaxNavEnv
-from rl2.envs.lux_env import LuxConfig, LuxEnv
+from rl2.envs.lux_env import LuxConfig, LuxEnv, LuxObservation
 from rl2.envs.mpe_env import MPEConfig, MPEEnv
 from rl2.envs.multi_agent import AgentObservation, BaseMultiAgentEnv
 from rl2.envs.robotarium_env import RobotariumConfig, RobotariumEnv
 from rl2.envs.smax_env import SMAXConfig, SMAXEnv
 from rl2.envs.storm_env import STORMConfig, STORMEnv
 from rl2.jax_cache import configure_compilation_cache
+from rl2.lstm import LSTMStackCarry
 from rl2.mlflow_logging import MLflowLogger
-from rl2.model.actor_critic import ActorCriticOutput, BaseActorCritic
-from rl2.model.mappo import (
-    ActorCritic,
-    GenericModelConfig,
-    LSTMConfig,
-    LuxModelConfig,
-    MLPEncoderConfig,
-    ModelConfig,
-    Observation,
-    RecurrentCarry,
-)
+from rl2.model.actor_critic import ActorCriticOutput
+from rl2.model.config import GenericModelConfig, LSTMConfig, LuxModelConfig, MLPEncoderConfig, ModelConfig
+from rl2.model.generic import GenericActorCritic
+from rl2.model.lux import LuxActorCritic
 from rl2.running_stats import RunningSum
 from rl2.selfplay.pool import (
     MatchAssignment,
@@ -247,7 +243,6 @@ from rl2.selfplay.pool import (
 from rl2.utils import explained_variance, gae
 
 __all__ = [
-    "ActorCritic",
     "ActorCriticOutput",
     "CategoricalPolicy",
     "DiscreteSpace",
@@ -258,9 +253,12 @@ __all__ = [
     "LuxModelConfig",
     "MLPEncoderConfig",
     "ModelConfig",
+    "make_actor_critic",
 ]
 
 
+type RecurrentCarry = LSTMStackCarry
+type Observation = jax.Array | LuxObservation[jax.Array]
 type PPOEnv = BaseMultiAgentEnv[Any, Observation]
 
 
@@ -423,6 +421,19 @@ class Config(BaseConfig):
         if isinstance(self.env, LuxConfig) != isinstance(self.model, LuxModelConfig):
             raise ValueError("The lux model requires the luxai_s3 environment and vice versa")
         return self
+
+
+def make_actor_critic(
+    action_space: MultiAgentActionSpace,
+    model: ModelConfig,
+    dtype: jax.typing.DTypeLike = jnp.float32,
+) -> GenericActorCritic | LuxActorCritic:
+    """Select a concrete model; validate the Lux model/action-space pairing."""
+    if isinstance(model, LuxModelConfig):
+        if not isinstance(action_space, HierarchicalMultiDiscreteSpace):
+            raise TypeError("The lux model requires a hierarchical multi-discrete action space")
+        return LuxActorCritic(action_space=action_space, model=model, dtype=dtype)
+    return GenericActorCritic(action_space=action_space, model=model, dtype=dtype)
 
 
 def make_env(config: Config) -> PPOEnv:
@@ -1357,12 +1368,14 @@ def train(config: Config) -> TrainState:
         replicated = PartitionSpec()
         batched = PartitionSpec("batch")
         batch_size = config.num_envs * config.num_steps
+        writer = MLflowLogger(experiment="mappo", run_name=config.run_id)
+        resources.enter_context(writer)
         manager = resources.enter_context(closing(checkpoint_manager(config.ckpt_dir)))
         key, init_key, reset_key = jax.random.split(jax.random.key(config.seed), 3)  # each () typed PRNG key
         reset_key = jax.random.split(reset_key, config.num_envs)  # (E,) typed PRNG keys
         reset = jax.jit(jax.vmap(env.reset), in_shardings=batched, out_shardings=batched)
         observation, env_state = reset(jax.device_put(reset_key, batched))  # (E, N, ...)/(E, N, *C, A); state: (E, ...)
-        model: BaseActorCritic[Observation, RecurrentCarry, Policy] = ActorCritic(
+        model = make_actor_critic(
             action_space=env.action_space,
             model=config.model,
             dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
@@ -1428,8 +1441,6 @@ def train(config: Config) -> TrainState:
             if progress is not None and progress.observation_count is not None
             else initial_step_count * env.num_agents
         )
-        writer = MLflowLogger(experiment="mappo", run_name=config.run_id)
-        resources.enter_context(writer)
         if progress is not None:
             print(f"Resumed run {config.run_id} at step {initial_step_count}", flush=True)
         writer.log_text(yaml.safe_dump(asdict(config)), f"config/{initial_step_count}.yaml")
