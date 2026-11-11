@@ -21,7 +21,7 @@ class XMiniGridEncoder(nn.Module):
     channels: int = 64
     blocks: int = 2
     embedding_size: int = 256
-    dtype: jax.typing.DTypeLike = jnp.float32
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.compact
     def __call__(self, obs: jax.Array) -> jax.Array:  # (B, H, W, 2) -> (B, E)

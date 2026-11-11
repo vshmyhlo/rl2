@@ -44,8 +44,8 @@ class ASTTransformer(nn.Module):
     max_nodes: int = 128
     max_depth: int = 64
     max_markers: int = 10
-    dtype: jax.typing.DTypeLike = jnp.float32
     attention_implementation: AttentionType = "xla"
+    dtype: jax.typing.DTypeLike | None = None
 
     def setup(self) -> None:
         for name in ("d_model", "num_layers", "num_heads", "max_nodes", "max_markers"):
@@ -55,12 +55,12 @@ class ASTTransformer(nn.Module):
         chex.assert_scalar_positive(kv_heads)
         chex.assert_is_divisible(self.d_model, self.num_heads)
         chex.assert_is_divisible(self.num_heads, kv_heads)
-        if jnp.dtype(self.dtype) not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
+        if self.dtype is not None and jnp.dtype(self.dtype) not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
             raise ValueError("dtype must be float32, bfloat16, or float16")
         if self.attention_implementation not in ("xla", "cudnn"):
             raise ValueError("attention_implementation must be 'xla' or 'cudnn'")
         if self.attention_implementation == "cudnn":
-            if jnp.dtype(self.dtype) == jnp.float32:
+            if self.dtype is not None and jnp.dtype(self.dtype) == jnp.float32:
                 raise ValueError("cuDNN requires BF16 or float16")
             chex.assert_is_divisible(self.d_model // self.num_heads, 8)
         self.context_projection = nn.Dense(self.d_model, dtype=self.dtype)

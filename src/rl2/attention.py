@@ -69,7 +69,7 @@ def _check_attention_config(
     max_seq_len: int,
     rope_theta: float,
     implementation: AttentionType,
-    dtype: jax.typing.DTypeLike,
+    dtype: jax.typing.DTypeLike | None,
     use_rope: bool = True,
 ) -> None:
     """Keep module and standalone attention validation consistent."""
@@ -91,8 +91,8 @@ def _check_attention_config(
         max_log_angle = max_log_frequency + math.log(max(1, max_seq_len - 1))
         if max_log_angle > math.log(float(jnp.finfo(jnp.float32).max)):
             raise ValueError("RoPE frequencies and angles must fit in float32 for all cache positions")
-    dtype = jnp.dtype(dtype)
-    if dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
+    dtype = None if dtype is None else jnp.dtype(dtype)
+    if dtype is not None and dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
         raise ValueError("dtype must be float32, bfloat16, or float16")
     if implementation == "cudnn":
         if dtype == jnp.float32:

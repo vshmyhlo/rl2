@@ -136,7 +136,7 @@ class RNDNetwork(nn.Module):
     predictor: bool = False
     channels: tuple[int, ...] = (32, 64, 64)
     feature_size: int = 512
-    dtype: jax.typing.DTypeLike = jnp.float32
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.compact
     def __call__(self, obs: Array) -> jax.Array:
@@ -154,7 +154,8 @@ class RNDNetwork(nn.Module):
                 x = nn.relu(nn.Dense(self.feature_size, kernel_init=init, dtype=self.dtype)(x))
         x = nn.Dense(self.feature_size, kernel_init=init, dtype=self.dtype)(x)
         chex.assert_shape(x, (obs.shape[0], self.feature_size))
-        chex.assert_type(x, self.dtype)
+        if self.dtype is not None:
+            chex.assert_type(x, self.dtype)
         # Intrinsic rewards and predictor losses accumulate in float32.
         return x.astype(jnp.float32)
 
@@ -201,7 +202,7 @@ def warmup_rnd_observations(envs: gym.vector.VectorEnv, config: Config, moments:
 
 class ResetLSTM(nn.Module):
     features: int
-    dtype: jax.typing.DTypeLike = jnp.float32
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.compact
     def __call__(
@@ -213,14 +214,14 @@ class ResetLSTM(nn.Module):
         carry = jax.tree.map(lambda c: jnp.where(episode_starts[:, None], 0, c), carry)
         # Float32 carry preserves recurrent accumulation and scan dtype stability.
         carry, x = nn.OptimizedLSTMCell(self.features, dtype=self.dtype)(carry, x)
-        return carry, x.astype(self.dtype)
+        return carry, jnp.asarray(x, dtype=self.dtype)
 
 
 class ResidualBlock(nn.Module):
     """Pre-activation residual block with per-pixel channel normalization."""
 
     channels: int
-    dtype: jax.typing.DTypeLike = jnp.float32
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -234,15 +235,15 @@ class ResidualBlock(nn.Module):
                 kernel_init=nn.initializers.variance_scaling(2.0 if index == 0 else 1.0, "fan_in", "truncated_normal"),
                 dtype=self.dtype,
             )(x)
-        return (residual + x) * jnp.asarray(2**-0.5, dtype=self.dtype)
+        return (residual + x) * jnp.asarray(2**-0.5, dtype=x.dtype)  # (B, H, W, C)
 
 
 class ActorCritic(nn.Module):
     num_actions: int
     lstm_hidden_size: int
-    dtype: jax.typing.DTypeLike = jnp.float32
     encoder_channels: tuple[int, ...] = (128, 256, 384, 512)
     embedding_size: int = 768
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.compact
     def __call__(
@@ -265,7 +266,7 @@ class ActorCritic(nn.Module):
             x = x.reshape((*x.shape[:3], -1))
         else:
             x = jnp.moveaxis(obs, 1, -1)
-        x = (x.astype(jnp.float32) / 255.0).astype(self.dtype)
+        x = jnp.asarray(x.astype(jnp.float32) / 255.0, dtype=self.dtype)
         # Flax keeps parameters and LayerNorm statistics in float32 by default.
         init = nn.initializers.orthogonal(np.sqrt(2))
         # IMPALA-style stages; normalization is independent of rollout/minibatch size.

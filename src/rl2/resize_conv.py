@@ -11,8 +11,8 @@ class ResizeConv(nn.Module):
 
     channels: int
     spatial_shape: tuple[int, int]
-    dtype: jax.typing.DTypeLike = jnp.float32
     kernel_size: int = 3
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:

@@ -559,7 +559,7 @@ class ActorCritic(nn.Module):
 
     action_space: ActionSpace
     model: ModelConfig
-    dtype: jax.typing.DTypeLike = jnp.float32
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.nowrap
     def _make_recurrent(self, *, parent: nn.Module | None = None) -> LSTMStack:
@@ -633,10 +633,10 @@ class ActorCritic(nn.Module):
 
     def _encode(self, obs: Observation) -> jax.Array:  # leaves: (B, *O) -> (B, H)
         x = self.encoder(obs)  # (B, F), F is model.encoder.embedding_size
-        return self.recurrent_input(x).astype(self.dtype)  # (B, H)
+        return jnp.asarray(self.recurrent_input(x), dtype=self.dtype)  # (B, H)
 
     def _heads(self, x: jax.Array) -> tuple[Policy, jax.Array]:  # (*S, H) -> policy leaves: (*S, A/D); (*S,)
-        x = x.astype(self.dtype)  # (*S, H), S is (B,) or (B, T)
+        x = jnp.asarray(x, dtype=self.dtype)  # (*S, H), S is (B,) or (B, T)
         policy = nn.relu(self.policy_norm(self.policy_hidden(x)))  # (*S, 512)
         critic = nn.relu(self.value_norm(self.value_hidden(x)))  # (*S, 512)
         # Heads use the compute dtype; float32 outputs keep PPO loss arithmetic precise.

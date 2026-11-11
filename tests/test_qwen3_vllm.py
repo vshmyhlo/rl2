@@ -214,7 +214,7 @@ def engine(request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFact
             eos_token_id=2,
             tie_word_embeddings=request.param == "tied",
         )
-        model = qwen3.Qwen3LM(config=config, attention_backend=learner_backend)
+        model = qwen3.Qwen3LM(config=config, attention_backend=learner_backend, dtype=jnp.bfloat16)
         variables = model.init(jax.random.key(42), jnp.ones((1, 2), jnp.int32))
         # Trained norm scales expose rounding differences hidden by unit initialization.
         variables["params"] = {

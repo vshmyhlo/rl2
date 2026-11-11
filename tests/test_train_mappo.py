@@ -1056,7 +1056,13 @@ def test_default_lux_parameter_budget_and_output_shapes() -> None:
         jax.ShapeDtypeStruct((1, 1), jnp.bool_),  # (B, T)
         jax.ShapeDtypeStruct((1, 1, 1, 230), jnp.bool_),  # (B, T, U, A)
     )
-    assert 1_900_000 <= sum(leaf.size for leaf in jax.tree.leaves(variables["params"])) <= 2_200_000
+    assert config.heads == 8 and config.head_dim == 32
+    for index in range(config.num_blocks):
+        block = variables["params"][f"block_{index}"]
+        for attention in (block["map_attention"], block["set_attention"]["attention"]):
+            assert attention["query"]["kernel"].shape == (2 * config.channels, 8, 32)
+            assert attention["out"]["kernel"].shape == (8, 32, 2 * config.channels)
+    assert 2_200_000 <= sum(leaf.size for leaf in jax.tree.leaves(variables["params"])) <= 2_500_000
     assert output.policy.raw_logits.shape == (1, 1, 1, 232)
     assert jax.eval_shape(lambda policy: policy.logits, output.policy).shape == (1, 1, 1, 230)
     assert output.value.shape == (1, 1) and output.value.dtype == jnp.float32
@@ -1073,6 +1079,8 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
         model=ppo.LuxModelConfig(
             embedding_size=4,
             channels=4,
+            heads=4,
+            head_dim=2,
             recurrent=config.model.recurrent,
             ship_recurrent=ppo.LSTMConfig(hidden_size=4),
             attention_implementation="xla",

@@ -87,10 +87,11 @@ class TreeAttentionBias(nn.Module):
     """Per-head additive logit bias, zero-initialized independently per layer."""
 
     num_heads: int
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.compact
-    def __call__(self, relations: TreeRelations) -> jax.Array:
-        """Return float32 [B, H, N+1, N+1] biases before the attention softmax."""
+    def __call__(self, relations: TreeRelations) -> jax.Array:  # leaves: (B, N+1, N+1) -> (B, H, N+1, N+1)
+        """Return (B, H, N+1, N+1) biases in dtype, inferred from parameters if None."""
         chex.assert_scalar_positive(self.num_heads)
         chex.assert_rank(relations, 3)
         chex.assert_equal_shape(relations)
@@ -102,4 +103,4 @@ class TreeAttentionBias(nn.Module):
         geometry = distance[relations.distance] + depth[relations.relative_depth]
         bias = kind[relations.kind] + jnp.where((relations.kind <= Relation.OTHER)[..., None], geometry, 0)
         bias = jnp.where((relations.kind != Relation.PADDING)[..., None], bias, 0)
-        return jnp.moveaxis(bias, -1, 1)
+        return jnp.asarray(jnp.moveaxis(bias, -1, 1), dtype=self.dtype)  # (B, H, N+1, N+1)

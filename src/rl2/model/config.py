@@ -33,6 +33,8 @@ class LuxModelConfig:
     embedding_size: Annotated[int, Field(gt=0, strict=True)] = 192
     channels: Annotated[int, Field(gt=0, multiple_of=2, strict=True)] = 64
     num_blocks: Annotated[int, Field(gt=0, strict=True)] = 2
+    heads: Annotated[int, Field(gt=0, strict=True)] = 8
+    head_dim: Annotated[int, Field(gt=0, strict=True)] = 32
     attention_implementation: Literal["triton", "xla"] = "triton"
     recurrent: LSTMConfig = LSTMConfig(hidden_size=256)
     ship_recurrent: LSTMConfig = LSTMConfig(hidden_size=128)

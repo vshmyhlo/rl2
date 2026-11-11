@@ -63,16 +63,16 @@ class LuxTeamObservation[Array](NamedTuple):
 class LuxWorldObservation[Array](NamedTuple):
     """Visible world and progress counters; optional leading axes S.
 
-    sensor_mask: (*S, W, H) visible tiles.
-    map_features: (*S, W, H) energy and tile-type leaves, with absolute coordinates.
+    sensor_mask: (*S, H, W) visible tiles.
+    map_features: (*S, H, W) energy and tile-type leaves, with absolute coordinates.
     relic_nodes: (*S, R, 2) visible relic positions.
     relic_nodes_mask: (*S, R) visible relic slots.
     steps: (*S,) game step counter.
     match_steps: (*S,) match step counter.
     """
 
-    sensor_mask: Array  # (*S, W, H) bool
-    map_features: MapTile  # leaves: (*S, W, H), native dtypes
+    sensor_mask: Array  # (*S, H, W) bool
+    map_features: MapTile  # leaves: (*S, H, W), native dtypes
     relic_nodes: Array  # (*S, R, 2) int16
     relic_nodes_mask: Array  # (*S, R) bool
     steps: Array  # (*S,) int32
@@ -86,6 +86,8 @@ class LuxObservation[Array](NamedTuple):
     opponent: (*S, ...) opponent leaves masked by the observer's visibility.
     world: (*S, ...) visible world and progress-counter leaves.
     public_params: (*S, 4) move cost, sap cost, sap range, sensor range, in native units.
+    init_unit_energy: (*S,) public initial ship energy in native units.
+    spawn_rate: (*S,) public ship spawn interval in environment steps.
     Array is jax.Array for observations or ShapeDtypeStruct for the observation space.
     """
 
@@ -93,13 +95,16 @@ class LuxObservation[Array](NamedTuple):
     opponent: LuxTeamObservation[Array]  # leaves: (*S, ...)
     world: LuxWorldObservation[Array]  # leaves: (*S, ...)
     public_params: Array  # (*S, 4), native parameter dtype
+    init_unit_energy: Array  # (*S,), native parameter dtype
+    spawn_rate: Array  # (*S,), native parameter dtype
 
 
 class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
     """Two agents; each chooses U categorical ship commands from A=230 choices.
 
     Observations split native team fields into self/opponent, preserving native
-    dtypes and a leading observing-team axis. World fields retain the observer's mask.
+    dtypes and a leading observing-team axis. Native x/y maps become H, W arrays;
+    positions and action offsets remain x, y. World fields retain the observer's mask.
     """
 
     @property
@@ -167,19 +172,24 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
         views: list[LuxObservation[jax.Array]] = []  # each view has (...) leaves
         for team in range(2):
             obs = observation[f"player_{team}"]  # leaves: (...), this observer's masked view
+            sensor_mask, map_features = jax.tree.map(
+                lambda leaf: jnp.swapaxes(leaf, -2, -1), (obs.sensor_mask, obs.map_features)
+            )  # sensor_mask/map leaves: (H, W), converted from native x/y axes
             views.append(
                 LuxObservation(
                     self=team_observation(obs, team),  # leaves: (...)
                     opponent=team_observation(obs, 1 - team),  # leaves: (...), same observer's visibility
                     world=LuxWorldObservation(
-                        sensor_mask=obs.sensor_mask,  # (W, H)
-                        map_features=obs.map_features,  # leaves: (W, H)
+                        sensor_mask=sensor_mask,  # (H, W)
+                        map_features=map_features,  # leaves: (H, W)
                         relic_nodes=obs.relic_nodes,  # (R, 2)
                         relic_nodes_mask=obs.relic_nodes_mask,  # (R,)
                         steps=obs.steps,  # ()
                         match_steps=obs.match_steps,  # ()
                     ),
                     public_params=public_params,  # (4,)
+                    init_unit_energy=params.init_unit_energy,  # ()
+                    spawn_rate=params.spawn_rate,  # ()
                 )
             )
         features = jax.tree.map(lambda *leaves: jnp.stack(leaves), *views)  # leaves: (N, ...)
@@ -345,9 +355,10 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
                 height=int(tile_edges[y + 1] - tile_edges[y]),
             )
 
-        scoring = (game.relic_nodes_map_weights > 0) & (
-            game.relic_nodes_map_weights <= game.relic_nodes_mask.sum() // 2
-        )  # (W, H), same active scoring tiles used by the simulator
+        scoring_weights = np.asarray(game.relic_nodes_map_weights).T  # (H, W)
+        scoring = (scoring_weights > 0) & (
+            scoring_weights <= game.relic_nodes_mask.sum() // 2
+        )  # (H, W), same active scoring tiles used by the simulator
         title_font = ImageFont.load_default(size=20)
         font = ImageFont.load_default(size=16)
         small_font = ImageFont.load_default(size=13)
@@ -387,7 +398,7 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
                 previous_edge = edge  # (H, W), shared boundaries retain both team colors
             with Image.fromarray(outlines) as outline_image:
                 frame.paste(outline_image, (16, 72), outline_image)
-            for x, y in np.argwhere(scoring):
+            for y, x in np.argwhere(scoring):
                 left, top, width, height = tile_bounds(int(x), int(y))
                 if not width or not height:
                     continue
@@ -413,7 +424,7 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
                     x, y = map(int, game.units.position[team, ship_id])
                     ships_by_position.setdefault((x, y), []).append(int(ship_id))
                 for (x, y), stacked_ids in ships_by_position.items():
-                    if scoring[x, y]:
+                    if scoring[y, x]:
                         occupied_scoring.add((x, y))
                     left, top, width, height = tile_bounds(x, y)
                     if not width or not height:

@@ -25,6 +25,8 @@ def model() -> LuxActorCritic:
         model=LuxModelConfig(
             embedding_size=8,
             channels=4,
+            heads=4,
+            head_dim=2,
             recurrent=LSTMConfig(hidden_size=4),
             ship_recurrent=LSTMConfig(hidden_size=4, num_layers=2),
             attention_implementation="xla",
@@ -206,8 +208,8 @@ def test_sap_scores_follow_relative_target_coordinates(
     variables["sap_query"] = {"kernel": jnp.zeros((8, 4)), "bias": jnp.ones(4)}
     variables["sap_key"] = {"kernel": jnp.zeros((4, 4)).at[0].set(1), "bias": jnp.zeros(4)}
     variables["sap_offset"] = jax.tree.map(jnp.zeros_like, variables["sap_offset"])
-    x, y = jnp.meshgrid(jnp.arange(8), jnp.arange(12), indexing="ij")  # each (W, H)
-    spatial = jnp.zeros((1, 8, 12, 4)).at[0, :, :, 0].set(10 * x + y)  # (B, W, H, C)
+    x, y = jnp.meshgrid(jnp.arange(8), jnp.arange(12), indexing="xy")  # each (H, W)
+    spatial = jnp.zeros((1, 12, 8, 4)).at[0, :, :, 0].set(10 * x + y)  # (B, H, W, C)
     features = LuxFeatures(global_features=jnp.zeros((1, 8)), ships=jnp.zeros((1, 3, 8)), spatial=spatial)
     obs = jax.tree.map(lambda leaf: leaf[None], observation)  # leaves: (B, ...)
     policy, value = network.apply(
@@ -216,6 +218,54 @@ def test_sap_scores_follow_relative_target_coordinates(
     # First ship is at (1, 2); offsets enumerate x first, then y, matching Lux's command IDs.
     np.testing.assert_allclose(policy.raw_logits[0, 0, 7:], 2 * jnp.array([1, 2, 3, 11, 12, 13, 21, 22, 23]))
     assert value.shape == (1,)
+
+
+def test_ship_spawn_corner_uses_xy_coordinates_on_rectangular_map(
+    model: LuxActorCritic, observation: LuxObservation[jax.Array]
+) -> None:
+    observation = observation._replace(
+        self=observation.self._replace(
+            units=observation.self.units.replace(
+                position=jnp.array([[7, 11], [5, 8], [-1, -1]], dtype=jnp.int16),  # (U, 2), first ship at far corner
+                energy=jnp.full(3, 100, dtype=jnp.int16),  # (U,), native spawn energy
+            ),
+        ),
+        world=observation.world._replace(steps=jnp.asarray(107), match_steps=jnp.asarray(7)),  # scalar counters
+    )
+    carry = history(model, observation, batch_size=1)
+    sequence = jax.tree.map(lambda leaf: leaf[None, None], observation)  # leaves: (B=1, T=1, ...)
+    lifecycle = model._ship_lifecycle(sequence, carry, jnp.zeros((1, 1), dtype=bool))
+    np.testing.assert_array_equal(lifecycle.reset, [[[True, False, True]]])
+
+
+def test_ship_spawn_uses_observed_parameters(model: LuxActorCritic, observation: LuxObservation[jax.Array]) -> None:
+    sequence = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (2, 2, *leaf.shape)), observation)
+    # leaves: (B=2, T=2, ...); identical ships, different game parameters.
+    sequence = sequence._replace(
+        self=sequence.self._replace(
+            units=sequence.self.units.replace(
+                position=jnp.zeros((2, 2, 3, 2), jnp.int16),  # (B, T, U, 2)
+                energy=jnp.full((2, 2, 3), 75, jnp.int16),  # (B, T, U)
+            ),
+        ),
+        world=sequence.world._replace(
+            steps=jnp.array([[106, 107], [106, 107]]),  # (B, T)
+            match_steps=jnp.array([[6, 7], [6, 7]]),  # (B, T)
+        ),
+        init_unit_energy=jnp.array([[75, 75], [100, 100]]),  # (B, T)
+        spawn_rate=jnp.array([[5, 5], [3, 3]]),  # (B, T)
+    )
+    carry = model.initial_carry(2)._replace(
+        ship_alive=jnp.ones((2, 3), dtype=bool),  # (B, U)
+        match_start=jnp.full(2, 100),  # (B,)
+    )
+    lifecycle = jax.jit(model._ship_lifecycle)(sequence, carry, jnp.zeros((2, 2), dtype=bool))
+    assert lifecycle.reset.shape == lifecycle.alive.shape == (2, 2, 3)
+    assert lifecycle.match_start.shape == (2, 2)
+    np.testing.assert_array_equal(
+        lifecycle.reset,
+        [[[True, True, True], [False, False, True]], [[False, False, True], [False, False, True]]],
+    )
 
 
 def test_sap_offsets_can_prefer_nearby_targets_symmetrically(
@@ -241,7 +291,7 @@ def test_sap_offsets_can_prefer_nearby_targets_symmetrically(
     features = LuxFeatures(
         global_features=jnp.zeros((1, 8)),  # (B, F)
         ships=jnp.zeros((1, 3, 8)),  # (B, U, 2C)
-        spatial=jnp.zeros((1, 8, 12, 4)),  # (B, W, H, C)
+        spatial=jnp.zeros((1, 12, 8, 4)),  # (B, H, W, C)
     )
     obs = jax.tree.map(lambda leaf: leaf[None], observation)  # leaves: (B, ...)
     masks = jnp.broadcast_to(obs.self.units_mask[..., None], (1, 3, 30)).at[..., 0].set(True)  # (B, U, A)
@@ -265,12 +315,12 @@ def test_bfloat16_sap_preserves_close_target_scores(
     variables["sap_key"] = {"kernel": jnp.eye(4), "bias": jnp.zeros(4)}  # (C, C); (C,)
     variables["sap_offset"] = jax.tree.map(jnp.zeros_like, variables["sap_offset"])
     spatial = (
-        jnp.zeros((1, 8, 12, 4), jnp.bfloat16)
+        jnp.zeros((1, 12, 8, 4), jnp.bfloat16)
         .at[..., 0]
         .set(1)
         .at[0, :, :, 1]
-        .set(jnp.arange(8, dtype=jnp.bfloat16)[:, None] / 256)
-    )  # (B, W, H, C)
+        .set(jnp.arange(8, dtype=jnp.bfloat16)[None, :] / 256)
+    )  # (B, H, W, C)
     obs = jax.tree.map(lambda leaf: leaf[None], observation)  # leaves: (B, ...)
     scores = network.apply(
         {"params": variables}, jnp.zeros((1, 3, 8), jnp.bfloat16), spatial, obs, method="_sap_logits"
@@ -294,8 +344,8 @@ def test_single_ship_small_map_reuses_parameters(
             units_mask=observation.opponent.units_mask[:1],
         ),
         world=observation.world._replace(
-            sensor_mask=observation.world.sensor_mask[:, :8],  # (W=8, H=8)
-            map_features=jax.tree.map(lambda leaf: leaf[:, :8], observation.world.map_features),  # (W, H)
+            sensor_mask=observation.world.sensor_mask[:8, :],  # (H=8, W=8)
+            map_features=jax.tree.map(lambda leaf: leaf[:8, :], observation.world.map_features),  # (H, W)
         ),
     )
     small = jax.tree.map(lambda leaf: leaf[None, None], small)  # leaves: (B=1, T=1, ...)

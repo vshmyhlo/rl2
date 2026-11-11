@@ -207,12 +207,12 @@ class MambaWorldModel(WorldModel):
     headdim: int = 32
     mimo_rank: int = 1
     encoder_stages: ConvStages = DEFAULT_STAGES
-    dtype: jax.typing.DTypeLike = jnp.float32
     num_layers: int = 4
     d_intermediate: int | None = None
     stochastic_size: int = 16
     stochastic_classes: int = 16
     unimix: float = 0.01
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.nowrap
     def _make_dynamics(self) -> RecurrentSequenceModel[WorldModelCarry]:
@@ -292,7 +292,8 @@ class MambaWorldModel(WorldModel):
         return self.encoder(images).astype(jnp.float32).reshape((*leading, self.d_model))
 
     def _logits(self, raw: jax.Array) -> jax.Array:
-        chex.assert_type(raw, self.dtype)
+        if self.dtype is not None:
+            chex.assert_type(raw, self.dtype)
         raw = raw.astype(jnp.float32).reshape((-1, self.stochastic_size, self.stochastic_classes))
         log_probs = jax.nn.log_softmax(raw, axis=-1)
         if self.unimix == 0:

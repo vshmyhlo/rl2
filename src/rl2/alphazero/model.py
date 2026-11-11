@@ -27,9 +27,10 @@ class PolicyValueNet(nn.Module):
     num_actions: int
     channels: int = 64
     num_blocks: int = 3
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.compact
-    def __call__(self, observation: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def __call__(self, observation: jax.Array) -> tuple[jax.Array, jax.Array]:  # (B, H, W, C) -> (B, A), (B,)
         """Predict policy logits and values from batched board observations.
 
         Args:
@@ -44,14 +45,15 @@ class PolicyValueNet(nn.Module):
         # below require exactly one batch axis when flattening board features.
         chex.assert_rank(observation, 4)
         # PGX chess observations are floats; tic-tac-toe observations are bools.
-        observation = observation.astype(jnp.float32)
-        x = nn.relu(nn.Conv(self.channels, (3, 3))(observation))
+        observation = observation.astype(jnp.float32)  # (B, H, W, C)
+        x = nn.relu(nn.Conv(self.channels, (3, 3), dtype=self.dtype)(observation))  # (B, H, W, D)
         for _ in range(self.num_blocks):
-            residual = x
-            x = nn.relu(nn.LayerNorm()(nn.Conv(self.channels, (3, 3))(x)))
-            x = nn.relu(residual + nn.LayerNorm()(nn.Conv(self.channels, (3, 3))(x)))
-        policy = nn.relu(nn.Conv(2, (1, 1))(x)).reshape((x.shape[0], -1))
-        logits = nn.Dense(self.num_actions)(policy)
-        value = nn.relu(nn.Conv(1, (1, 1))(x)).reshape((x.shape[0], -1))
-        value = jnp.tanh(nn.Dense(1)(nn.relu(nn.Dense(self.channels)(value))))[:, 0]
+            residual = x  # (B, H, W, D)
+            x = nn.relu(nn.LayerNorm(dtype=self.dtype)(nn.Conv(self.channels, (3, 3), dtype=self.dtype)(x)))
+            x = nn.relu(residual + nn.LayerNorm(dtype=self.dtype)(nn.Conv(self.channels, (3, 3), dtype=self.dtype)(x)))
+        policy = nn.relu(nn.Conv(2, (1, 1), dtype=self.dtype)(x)).reshape((x.shape[0], -1))  # (B, 2HW)
+        logits = nn.Dense(self.num_actions, dtype=self.dtype)(policy).astype(jnp.float32)  # (B, A)
+        value = nn.relu(nn.Conv(1, (1, 1), dtype=self.dtype)(x)).reshape((x.shape[0], -1))  # (B, HW)
+        value = nn.Dense(1, dtype=self.dtype)(nn.relu(nn.Dense(self.channels, dtype=self.dtype)(value)))  # (B, 1)
+        value = jnp.tanh(value.astype(jnp.float32))[:, 0]  # (B,)
         return logits, value

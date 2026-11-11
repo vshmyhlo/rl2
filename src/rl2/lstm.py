@@ -48,7 +48,7 @@ class _LSTMCell(nn.OptimizedLSTMCell):
             recurrent.append(kernel)
             biases.append(cast(jax.Array, bias))
         return _LSTMWeights(
-            jnp.concatenate(inputs, axis=-1).astype(self.dtype),  # (I, 4H)
+            jnp.asarray(jnp.concatenate(inputs, axis=-1), dtype=self.dtype),  # (I, 4H)
             jnp.concatenate(recurrent, axis=-1),  # (H, 4H), float32
             jnp.concatenate(biases),  # (4H,), float32
         )
@@ -87,7 +87,7 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
     """
 
     features: int
-    dtype: jax.typing.DTypeLike = jnp.float32
+    dtype: jax.typing.DTypeLike | None = None
 
     def setup(self) -> None:
         chex.assert_scalar_positive(self.features)
@@ -119,7 +119,7 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
         for size in x.shape:
             chex.assert_scalar_positive(size)
         weights = self.cell.weights(x, carry[1])
-        projected = jnp.matmul(x.astype(self.dtype), weights.input)  # (T, B, 4H)
+        projected = jnp.matmul(jnp.asarray(x, dtype=self.dtype), weights.input)  # (T, B, 4H)
 
         def recurrent_step(
             memory: LSTMCarry,  # Each (B, H)
@@ -128,10 +128,10 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
             inputs_x, starts = inputs  # (B, 4H), (B,)
             cell, hidden = jax.tree.map(lambda state: jnp.where(starts[:, None], 0, state), memory)  # each (B, H)
             # Cast inside the scan so its parameter-gradient accumulators stay float32.
-            recurrent = jnp.matmul(hidden.astype(self.dtype), weights.recurrent.astype(self.dtype))  # (B, 4H)
-            gates = (recurrent + weights.bias.astype(self.dtype)) + inputs_x  # (B, 4H)
+            recurrent = jnp.matmul(jnp.asarray(hidden, dtype=self.dtype), jnp.asarray(weights.recurrent, dtype=self.dtype))  # (B, 4H)
+            gates = (recurrent + jnp.asarray(weights.bias, dtype=self.dtype)) + inputs_x  # (B, 4H)
             memory = _apply_gates(cell, gates)  # each (B, H)
-            return memory, memory[1].astype(self.dtype)  # carry: each (B, H); output: (B, H)
+            return memory, jnp.asarray(memory[1], dtype=self.dtype)  # carry: each (B, H); output: (B, H)
 
         carry, output = jax.lax.scan(recurrent_step, carry, (projected, episode_starts))  # (B, H) leaves; (T, B, H)
         return carry, output  # Carry: each (B, H); output: (T, B, H)
@@ -156,7 +156,7 @@ class LSTM(nn.Module, RecurrentSequenceModel[LSTMCarry]):
 
         carry = jax.tree.map(reset, carry)  # Each (B, H)
         carry, output = self.cell(carry, x)  # Carry: each (B, H); output: (B, H)
-        return carry, output.astype(self.dtype)  # Carry: each (B, H); output: (B, H)
+        return carry, jnp.asarray(output, dtype=self.dtype)  # Carry: each (B, H); output: (B, H)
 
 
 class LSTMStack(nn.Module, RecurrentSequenceModel[LSTMStackCarry]):
@@ -173,7 +173,7 @@ class LSTMStack(nn.Module, RecurrentSequenceModel[LSTMStackCarry]):
     features: int
     num_layers: int
     intermediate_size: int = 0
-    dtype: jax.typing.DTypeLike = jnp.float32
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.nowrap
     def _validate_config(self) -> None:

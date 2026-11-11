@@ -61,12 +61,13 @@ class ResidualBlock(nn.Module):
     """Two Conv-LayerNorm-SiLU layers followed by a scaled residual sum."""
 
     channels: int
-    dtype: jax.typing.DTypeLike = jnp.float32
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
         chex.assert_shape(x, (None, None, None, self.channels))
-        chex.assert_type(x, self.dtype)
+        if self.dtype is not None:
+            chex.assert_type(x, self.dtype)
         chex.assert_scalar_positive(self.channels)
         residual = x
         for _ in range(2):
@@ -78,7 +79,7 @@ class ResidualBlock(nn.Module):
                 dtype=self.dtype,
             )(x)
             x = nn.silu(nn.LayerNorm(dtype=self.dtype)(x))
-        return (residual + x) * jnp.asarray(2**-0.5, dtype=self.dtype)
+        return (residual + x) * jnp.asarray(2**-0.5, dtype=x.dtype)  # (B, H, W, C)
 
 
 class ConvObservationStage(nn.Module):
@@ -87,8 +88,8 @@ class ConvObservationStage(nn.Module):
     channels: int
     spatial_shape: tuple[int, int]
     blocks: int = 2
-    dtype: jax.typing.DTypeLike = jnp.float32
     kernel_size: int = 3
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -121,8 +122,8 @@ class ConvObservationEncoder(nn.Module):
 
     stages: ConvStages = DEFAULT_STAGES
     embedding_size: int = 768
-    dtype: jax.typing.DTypeLike = jnp.float32
     channels_last: bool = False
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.compact
     def __call__(self, obs: jax.Array | NDArray[np.uint8]) -> jax.Array:  # (B, F, H, W[, 3]) or (B, H, W, C) -> (B, E)
@@ -141,7 +142,7 @@ class ConvObservationEncoder(nn.Module):
         else:
             x = jnp.moveaxis(obs, 1, -1)  # (B, H, W, F)
         scale = 255.0 if obs.dtype == jnp.uint8 else 1.0
-        x = (x.astype(jnp.float32) / scale).astype(self.dtype)  # (B, H, W, C)
+        x = jnp.asarray(x.astype(jnp.float32) / scale, dtype=self.dtype)  # (B, H, W, C)
         # Flax keeps parameters and LayerNorm statistics in float32 by default.
         # IMPALA-style stages; normalization is independent of rollout/minibatch size.
         # Variance scaling avoids expensive QR initialization of large visual kernels.

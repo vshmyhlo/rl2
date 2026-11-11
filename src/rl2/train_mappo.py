@@ -6,8 +6,11 @@ memory without ending the reward stream or GAE trace. Environment completion end
 traces; timeouts bootstrap from final local observations unless also terminated.
 Despite the historical MAPPO filename, the critic uses no centralized state.
 Lux observations separate self/opponent teams and retain native dtypes through
-rollout storage. The default generic model uses an MLP; model.type=lux uses
-masked entity-set self-attention, shared ship heads, and spatial sap-target scoring.
+rollout storage, with map arrays in H, W order and positions in x, y order.
+The default generic model uses an MLP; model.type=lux uses masked entity-set
+self-attention, shared ship heads, and spatial sap-target scoring.
+Lux map and entity attention default to model.heads=8 and model.head_dim=32,
+with output projections preserving the encoder token width of 2 * model.channels.
 Both models retain one recurrent state and one value per agent/team.
 
 Shape dimensions:
@@ -24,6 +27,7 @@ Shape dimensions:
     H: Recurrent hidden width (model.recurrent.hidden_size).
     L: Raw policy logits per action component.
     K: Raw PRNG key words.
+    Spatial arrays use H, W for height, width; Lux maps have shape (*S, H, W).
     In video arrays, F is frame capacity and (H, W, 3) is image height, width, RGB.
     Flattened loss arrays use N = prod(S) for transition count.
     *S and *C unpack shape tuples; ... denotes remaining leaf dimensions; () is scalar.

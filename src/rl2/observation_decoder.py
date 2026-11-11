@@ -25,7 +25,7 @@ class ConvObservationDecoder(nn.Module):
 
     observation_shape: tuple[int, ...]
     stages: ConvStages = DEFAULT_STAGES
-    dtype: jax.typing.DTypeLike = jnp.float32
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.compact
     def __call__(self, latent: jax.Array) -> jax.Array:

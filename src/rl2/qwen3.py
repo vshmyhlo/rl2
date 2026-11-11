@@ -139,23 +139,22 @@ class Qwen3Output(NamedTuple):
     cache: Qwen3Cache | None
 
 
-def _compute_cast(x: jax.Array, dtype: jax.typing.DTypeLike) -> jax.Array:  # (...) -> (...)
+def _compute_cast(x: jax.Array, dtype: jax.typing.DTypeLike | None) -> jax.Array:  # (...) -> (...)
     # XLA can erase BF16 cast roundtrips; preserve rounding of stored serving values.
-    if jnp.dtype(dtype) == jnp.bfloat16:
+    if dtype is not None and jnp.dtype(dtype) == jnp.bfloat16:
         x = jax.lax.reduce_precision(x.astype(jnp.float32), exponent_bits=8, mantissa_bits=7)  # (...)
-    return x.astype(dtype)  # (...)
+    return jnp.asarray(x, dtype=dtype)  # (...)
 
 
 def _linear(
     inputs: jax.Array,  # (..., I)
     weight: jax.Array,  # (O, I)
-    dtype: jax.typing.DTypeLike,
+    dtype: jax.typing.DTypeLike | None,
     *,
     output_dtype: jax.typing.DTypeLike | None = None,
     adapter: LoRAWeights | None = None,  # (R, I), (O, R).
     lora_scale: float = 1.0,
 ) -> jax.Array:  # (..., O)
-    result_dtype = jnp.dtype(dtype if output_dtype is None else output_dtype)
     output = jnp.matmul(
         _compute_cast(inputs, dtype),
         _compute_cast(weight, dtype).T,
@@ -163,6 +162,7 @@ def _linear(
     )  # (..., O)
     if adapter is None:
         return output  # (..., O)
+    result_dtype = output.dtype
     # vLLM casts factors before folding alpha/r into B, then rounds B again.
     scaled_b = _compute_cast(_compute_cast(adapter.b, dtype).astype(jnp.float32) * lora_scale, dtype)  # (O, R)
     hidden = _linear(inputs, adapter.a, dtype)  # (..., R); shrink buffer rounds before expand.
@@ -266,18 +266,18 @@ class Qwen3LM(nn.Module):
     """Linen module with flat Hugging Face parameter names and explicit KV cache."""
 
     config: Qwen3Config = Qwen3Config()
-    dtype: str = "bfloat16"
     param_dtype: jax.typing.DTypeLike = jnp.float32
     attention_backend: AttentionBackend = DEFAULT_ATTENTION_BACKEND
     gradient_checkpointing: bool = True
     scan_layers: bool = True
+    dtype: jax.typing.DTypeLike | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.dtype not in ("float32", "bfloat16"):
+        if self.dtype is not None and jnp.dtype(self.dtype) not in (jnp.float32, jnp.bfloat16):
             raise ValueError("dtype must be float32 or bfloat16")
         if self.attention_backend == "cudnn":
-            if self.dtype != "bfloat16":
+            if jnp.dtype(self.param_dtype if self.dtype is None else self.dtype) != jnp.bfloat16:
                 raise ValueError("cuDNN attention requires dtype=bfloat16")
             if self.config.head_dim % 8:
                 raise ValueError("cuDNN attention requires head_dim divisible by 8")
@@ -294,8 +294,8 @@ class Qwen3LM(nn.Module):
             self.config.head_dim,
         )
         return Qwen3Cache(
-            key=jnp.zeros(shape, self.dtype),  # (L, B, C, K, H)
-            value=jnp.zeros(shape, self.dtype),  # (L, B, C, K, H)
+            key=jnp.zeros(shape, self.param_dtype if self.dtype is None else self.dtype),  # (L, B, C, K, H)
+            value=jnp.zeros(shape, self.param_dtype if self.dtype is None else self.dtype),  # (L, B, C, K, H)
             valid=jnp.zeros((batch_size, capacity), jnp.bool_),  # (B, C)
             lengths=jnp.zeros((batch_size,), jnp.int32),  # (B,)
             index=jnp.array(0, jnp.int32),  # ()

@@ -14,7 +14,8 @@ Model sizes and KV head counts remain configurable.
 Neither includes embeddings or a prediction head. Projections are bias-free,
 parameters/norm statistics are float32, and ``dtype`` controls projections and
 cached keys/values. Block outputs use the residual operands' promoted dtype;
-stack outputs are cast to ``dtype`` even when the final norm is disabled.
+stack outputs are cast to ``dtype`` when specified, even when the final norm is disabled.
+The default ``dtype=None`` infers computation from inputs and parameters.
 All projection weights use normal initialization with standard deviation
 ``initializer_range`` (default 0.02), without depth-dependent scaling.
 The XLA float16 path evaluates attention in float32 for CPU portability.
@@ -128,10 +129,10 @@ class _TransformerBlock(nn.Module):
     rope_theta: float = 10000.0
     norm_epsilon: float = 1e-5
     attention_implementation: _attention.AttentionType = "xla"
-    dtype: jax.typing.DTypeLike = jnp.float32
     initializer_range: float = 0.02
     causal: bool = True
     use_rope: bool = True
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.nowrap
     def _mlp_width(self) -> int:
@@ -284,9 +285,9 @@ class _TransformerStack(nn.Module):
     final_norm: bool = True
     initializer_range: float = 0.02
     attention_implementation: _attention.AttentionType = "xla"
-    dtype: jax.typing.DTypeLike = jnp.float32
     causal: bool = True
     use_rope: bool = True
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.nowrap
     def _mlp_width(self) -> int:
@@ -351,7 +352,7 @@ class _TransformerStack(nn.Module):
             next_carry.append(state)
         if self.final_norm:
             x = self.norm_f(x)
-        output = x.astype(self.dtype)
+        output = jnp.asarray(x, dtype=self.dtype)
         return tuple(next_carry), output
 
 

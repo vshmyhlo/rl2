@@ -51,8 +51,8 @@ class KarelProgramModel(nn.Module):
     num_heads: int = 8
     num_kv_heads: int | None = None
     max_seq_len: int = 128  # Transformer cache capacity, including the image-pair prefix.
-    dtype: jax.typing.DTypeLike = jnp.float32
     attention_implementation: AttentionType = "xla"
+    dtype: jax.typing.DTypeLike | None = None
 
     def setup(self) -> None:
         if self.backbone_type not in ("mamba3", "transformer"):

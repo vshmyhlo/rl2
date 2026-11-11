@@ -10,7 +10,7 @@ Sequences are time-major, matching rl2's recurrent policies. This reference uses
 mixer; ``Mamba3Stack`` adds pre-norm residual layers and SwiGLU feed-forwards.
 Neither includes an embedding or prediction head.
 Parameters and recurrent accumulation remain float32; projection precision is
-controlled by ``dtype`` (float32 by default). Normalization statistics also use
+controlled by ``dtype`` (None infers from inputs and parameters). Normalization statistics also use
 float32, including the stack's residual stream before casting norm outputs.
 For mixed-precision training, set ``dtype=jnp.bfloat16`` on the mixer or stack;
 inputs may be float32 or bfloat16. Keep the initialized parameters and optimizer
@@ -129,8 +129,8 @@ class Mamba3(nn.Module, RecurrentSequenceModel[Mamba3Carry]):
     dt_init_floor: float = 1e-4
     a_floor: float = 1e-4
     outproj_norm: bool = False
-    dtype: jax.typing.DTypeLike = jnp.float32
     out_proj_init_scale: float = 1.0
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.nowrap
     def _dimensions(self) -> tuple[int, int, int]:
@@ -155,7 +155,7 @@ class Mamba3(nn.Module, RecurrentSequenceModel[Mamba3Carry]):
             raise ValueError("a_floor must be positive and finite")
         if not 0 < self.out_proj_init_scale < math.inf:
             raise ValueError("out_proj_init_scale must be positive and finite")
-        if jnp.dtype(self.dtype) not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
+        if self.dtype is not None and jnp.dtype(self.dtype) not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
             raise ValueError("dtype must be float32, bfloat16, or float16")
         return inner, heads, pairs
 
@@ -278,13 +278,13 @@ class _Mamba3Block(nn.Module):
         norm_cls = nn.RMSNorm if self.rms_norm else nn.LayerNorm
         dtype = self.mixer.dtype
         residual_dtype = jnp.float32 if self.residual_in_fp32 else dtype
-        x = x.astype(residual_dtype)
+        x = jnp.asarray(x, dtype=residual_dtype)
         # PyTorch LayerNorm uses centered variance. E[x^2] - E[x]^2 can
         # catastrophically cancel for large-offset inputs in float32.
         normalized = norm_cls(epsilon=self.norm_epsilon, dtype=dtype, use_fast_variance=False, name="norm")(x)
         # The mixer validates all carry leaves and the reset mask.
         carry, y = self.mixer(normalized, carry, episode_starts)
-        x = x + y.astype(residual_dtype)
+        x = x + jnp.asarray(y, dtype=residual_dtype)
         if self.d_intermediate:
             y = norm_cls(epsilon=self.norm_epsilon, dtype=dtype, use_fast_variance=False, name="norm2")(x)
             linear_init = nn.initializers.variance_scaling(1 / 3, "fan_in", "uniform")
@@ -293,7 +293,7 @@ class _Mamba3Block(nn.Module):
             y = value * nn.silu(gate)
             out_init = nn.initializers.variance_scaling(self.mixer.out_proj_init_scale**2 / 3, "fan_in", "uniform")
             y = nn.Dense(self.mixer.d_model, use_bias=False, kernel_init=out_init, dtype=dtype, name="fc2")(y)
-            x = x + y.astype(residual_dtype)
+            x = x + jnp.asarray(y, dtype=residual_dtype)
         return carry, x
 
 
@@ -351,7 +351,7 @@ class Mamba3Stack(nn.Module, RecurrentSequenceModel[Mamba3StackCarry]):
     dt_init_floor: float = 1e-4
     a_floor: float = 1e-4
     outproj_norm: bool = False
-    dtype: jax.typing.DTypeLike = jnp.float32
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.nowrap
     def _mlp_width(self) -> int:
@@ -430,7 +430,7 @@ class Mamba3Stack(nn.Module, RecurrentSequenceModel[Mamba3StackCarry]):
             next_carry.append(state)
         if self.final_norm:
             x = self.norm_f(x)
-        output = x.astype(self.dtype)
+        output = jnp.asarray(x, dtype=self.dtype)
         return tuple(next_carry), output
 
     def step(

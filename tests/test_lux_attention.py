@@ -24,7 +24,7 @@ def valid() -> jax.Array:  # (B=1, E=4)
 
 @pytest.fixture(scope="module")
 def block() -> _SetAttentionBlock:
-    return _SetAttentionBlock(features=8, implementation="xla", dtype=jnp.float32)
+    return _SetAttentionBlock(features=8, heads=4, head_dim=2, implementation="xla", dtype=jnp.float32)
 
 
 @pytest.fixture(scope="module")
@@ -62,7 +62,7 @@ def test_qk_rmsnorm_precedes_padding_and_preserves_values(
     variables["query_norm"]["scale"] = jnp.array([2.0, 0.5])  # (d,), learned scale shared across heads
     attention = Mock(wraps=tokamax.dot_product_attention)
     monkeypatch.setattr(tokamax, "dot_product_attention", attention)
-    output = _Attention(features=8, implementation="xla", dtype=jnp.float32).apply(
+    output = _Attention(heads=4, head_dim=2, implementation="xla", dtype=jnp.float32).apply(
         {"params": variables}, tokens, tokens[:, :2]
     )  # (B, Q, D)
     query, key, value = attention.call_args.args  # (B, Q/K, H, padded_d=16)
@@ -76,6 +76,18 @@ def test_qk_rmsnorm_precedes_padding_and_preserves_values(
     np.testing.assert_array_equal(value[..., :2], jnp.broadcast_to(jnp.array([3.0, 4.0]), (1, 2, 4, 2)))
     for array in (query, key, value):
         np.testing.assert_array_equal(array[..., 2:], 0)
+
+
+@pytest.mark.parametrize("head_dim", [2, 16], ids=["padded", "unpadded"])
+def test_attention_head_dimensions(tokens: jax.Array, head_dim: int) -> None:
+    # tokens: (B=1, Q=4, D=8); context has K=2 tokens.
+    attention = _Attention(heads=2, head_dim=head_dim, implementation="xla", dtype=jnp.float32)
+    output, variables = attention.init_with_output(jax.random.key(3), x=tokens, context=tokens[:, :2])
+    # output: (B, Q, D); projection kernels: (D, H, d).
+    assert output.shape == tokens.shape
+    for name in ("query", "key", "value"):
+        assert variables["params"][name]["kernel"].shape == (8, 2, head_dim)
+    assert variables["params"]["out"]["kernel"].shape == (2, head_dim, 8)
 
 
 def test_bfloat16_normalized_attention_matches_float32(

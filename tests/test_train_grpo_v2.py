@@ -73,7 +73,7 @@ def test_config_and_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert defaults.checkpoint_interval == 100
     assert defaults.padding_multiple == 256
     assert defaults.attention_backend == "cudnn"
-    assert training.Qwen3LM().dtype == "bfloat16"
+    assert training.Qwen3LM().dtype is None
     assert defaults.scan_layers
     assert defaults.gradient_checkpointing
     assert not defaults.enable_ray_dashboard

@@ -15,7 +15,7 @@ class CraftaxEncoder(nn.Module):
     blocks: int = 2
     hidden_size: int = 128
     embedding_size: int = 256
-    dtype: jax.typing.DTypeLike = jnp.float32
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.compact
     def __call__(self, obs: CraftaxObservation) -> jax.Array:
@@ -24,7 +24,7 @@ class CraftaxEncoder(nn.Module):
         chex.assert_rank(obs.features, 2)
         chex.assert_equal_shape_prefix((obs.grid, obs.features), 1)
         chex.assert_type((obs.grid, obs.features), float)
-        grid = obs.grid.astype(self.dtype)  # (B,H,W,C)
+        grid = jnp.asarray(obs.grid, dtype=self.dtype)  # (B,H,W,C)
         grid = nn.Conv(self.channels, (3, 3), padding="SAME", dtype=self.dtype)(grid)  # (B,H,W,K)
         grid = nn.silu(nn.LayerNorm(dtype=self.dtype)(grid))  # (B,H,W,K)
         for index in range(self.blocks):

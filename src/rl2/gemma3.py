@@ -133,14 +133,14 @@ class Gemma3Carry(NamedTuple):
 class Gemma3LM:
     model: gm.nn.Transformer
     cache_length: int
-    dtype: ComputeDtype = "float32"
     attention_backend: AttentionBackend = "xla"
+    dtype: jax.typing.DTypeLike | None = None
 
     def __post_init__(self) -> None:
         if not 0 < self.cache_length <= 32768:
             raise ValueError("Gemma 3 270M prompt + completion budget must fit its 32768-token context")
         if self.attention_backend == "cudnn":
-            if self.dtype != "bfloat16":
+            if self.dtype is None or jnp.dtype(self.dtype) != jnp.bfloat16:
                 raise ValueError("cuDNN attention requires dtype=bfloat16")
             if self.model.config.head_dim % 8:
                 raise ValueError("cuDNN attention requires head_dim divisible by 8")
@@ -162,7 +162,7 @@ class Gemma3LM:
         # Gemma's model dtype controls initialization. Cast for computation here
         # while retaining float32 master parameters and differentiable casts.
         def to_compute_dtype(value: jax.Array) -> jax.Array:  # (...) -> (...)
-            return value.astype(self.dtype)  # (...)
+            return jnp.asarray(value, dtype=self.dtype)  # (...)
 
         return {"params": jax.tree.map(to_compute_dtype, params)}
 
@@ -197,7 +197,9 @@ class Gemma3LM:
             raise ValueError("Prompt width must be positive and fit Gemma cache length")
         # Prefill attends only to prompt slots; reserve completion slots afterward.
         cache = self.model.init_cache(
-            batch_size=tokens.shape[0], dtype=jnp.dtype(self.dtype), cache_length=tokens.shape[1]
+            batch_size=tokens.shape[0],
+            dtype=jnp.result_type(*jax.tree.leaves(params)) if self.dtype is None else jnp.dtype(self.dtype),
+            cache_length=tokens.shape[1],
         )
         positions = jnp.broadcast_to(jnp.arange(tokens.shape[1], dtype=jnp.int32), tokens.shape)  # (B, T)
         slots = jnp.arange(tokens.shape[1])  # (T,)

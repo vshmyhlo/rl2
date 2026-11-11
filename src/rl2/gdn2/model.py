@@ -46,7 +46,7 @@ class GatedDeltaNet2Config:
     conv_bias: bool = False
     allow_neg_eigval: bool = False
     norm_eps: float = 1e-5
-    dtype: jax.typing.DTypeLike = jnp.float32
+    dtype: jax.typing.DTypeLike | None = None
 
     def __post_init__(self) -> None:
         for name in ("hidden_size", "head_dim", "num_heads", "conv_size"):
@@ -59,7 +59,7 @@ class GatedDeltaNet2Config:
             raise ValueError("head_dim * expand_v must be a positive integer")
         if not 0 < self.norm_eps < math.inf:
             raise ValueError("norm_eps must be positive and finite")
-        if jnp.dtype(self.dtype) not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
+        if self.dtype is not None and jnp.dtype(self.dtype) not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
             raise ValueError("dtype must be float32, bfloat16, or float16")
 
     @property
@@ -145,10 +145,12 @@ class GatedDeltaNet2(nn.Module, ARSequenceModel[GatedDeltaNet2Carry]):
     x [B,D] and required boolean x_active [B]. Padding returns zero and
     preserves every carry leaf. No hidden mutable cache is used.
     backend="triton" enables optional GPU kernels with shared parameters/carry.
+    ``dtype=None`` uses config.dtype; when both are None, projections infer dtype.
     """
 
     config: GatedDeltaNet2Config = GatedDeltaNet2Config()
     backend: GatedDeltaNet2Backend = "jax"
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.nowrap
     def initial_carry(self, batch_size: int) -> GatedDeltaNet2Carry:
@@ -163,14 +165,15 @@ class GatedDeltaNet2(nn.Module, ARSequenceModel[GatedDeltaNet2Carry]):
     ) -> tuple[GatedDeltaNet2Carry, jax.Array]:
         valid = _sequence_mask(x, x_len, self.config.hidden_size)
         c = self.config
+        dtype = c.dtype if self.dtype is None else self.dtype
         chex.assert_type(x, jnp.floating)
         carry = self.initial_carry(x.shape[0]) if carry is None else carry
         key_width, value_width = c.num_heads * c.head_dim, c.value_heads * c.value_head_dim
         # Padding values must not enter projections (including NaNs in padding).
-        x = jnp.where(valid[..., None], x, 0).astype(c.dtype)
+        x = jnp.asarray(jnp.where(valid[..., None], x, 0), dtype=dtype)
 
         def dense(inputs: jax.Array, width: int, name: str, bias: bool = False) -> jax.Array:
-            result = nn.Dense(width, use_bias=bias, dtype=c.dtype, kernel_init=_linear_init, name=name)(inputs)
+            result = nn.Dense(width, use_bias=bias, dtype=dtype, kernel_init=_linear_init, name=name)(inputs)
             return result
 
         q, k, v = (
@@ -278,7 +281,7 @@ class GatedDeltaNet2(nn.Module, ARSequenceModel[GatedDeltaNet2Carry]):
         else:
             output = output * jax.lax.rsqrt(jnp.mean(output**2, axis=-1, keepdims=True) + c.norm_eps)
             output = output * norm_weight * jax.nn.silu(gate)
-        y = dense(output.reshape((*x.shape[:2], value_width)).astype(c.dtype), c.hidden_size, "o_proj")
+        y = dense(jnp.asarray(output.reshape((*x.shape[:2], value_width)), dtype=dtype), c.hidden_size, "o_proj")
         y = jnp.where(valid[..., None], y, 0)
         return carry, y
 
@@ -301,18 +304,20 @@ class GatedDeltaNet2Stack(nn.Module, ARSequenceModel[GatedDeltaNet2StackCarry]):
     The mixer config is shared; each layer has independent parameters and carry.
     ``intermediate_size`` is the SwiGLU width (upstream 1.3B recipe uses 6208).
     Residual accumulation and normalization statistics stay float32.
+    ``dtype`` overrides config.dtype when supplied.
     """
 
     config: GatedDeltaNet2Config
     num_layers: int
     intermediate_size: int
     backend: GatedDeltaNet2Backend = "jax"
+    dtype: jax.typing.DTypeLike | None = None
 
     def setup(self) -> None:
         if self.num_layers <= 0 or self.intermediate_size <= 0:
             raise ValueError("num_layers and intermediate_size must be positive")
         self.mixers = [
-            GatedDeltaNet2(self.config, backend=self.backend, name=f"mixer_{i}") for i in range(self.num_layers)
+            GatedDeltaNet2(config=self.config, backend=self.backend, dtype=self.dtype, name=f"mixer_{i}") for i in range(self.num_layers)
         ]
 
     @nn.nowrap
@@ -330,6 +335,7 @@ class GatedDeltaNet2Stack(nn.Module, ARSequenceModel[GatedDeltaNet2StackCarry]):
     ) -> tuple[GatedDeltaNet2StackCarry, jax.Array]:
         valid = _sequence_mask(x, x_len, self.config.hidden_size)
         c = self.config
+        dtype = c.dtype if self.dtype is None else self.dtype
         chex.assert_type(x, jnp.floating)
         carry = self.initial_carry(x.shape[0]) if carry is None else carry
         if len(carry) != self.num_layers:
@@ -342,22 +348,22 @@ class GatedDeltaNet2Stack(nn.Module, ARSequenceModel[GatedDeltaNet2StackCarry]):
         mlp_init = nn.initializers.variance_scaling(1 / 3, "fan_in", "uniform")
         residual_init = nn.initializers.variance_scaling(1 / (6 * self.num_layers), "fan_in", "uniform")
         for i, mixer in enumerate(self.mixers):
-            normed = nn.RMSNorm(epsilon=c.norm_eps, dtype=c.dtype, name=f"norm_mixer_{i}")(x)
+            normed = nn.RMSNorm(epsilon=c.norm_eps, dtype=dtype, name=f"norm_mixer_{i}")(x)
             state, mixed = mixer(normed, x_len, carry[i])
             updated.append(state)
             x = x + mixed.astype(jnp.float32)
-            normed = nn.RMSNorm(epsilon=c.norm_eps, dtype=c.dtype, name=f"norm_mlp_{i}")(x)
+            normed = nn.RMSNorm(epsilon=c.norm_eps, dtype=dtype, name=f"norm_mlp_{i}")(x)
             gate = nn.Dense(
-                self.intermediate_size, use_bias=False, dtype=c.dtype, kernel_init=mlp_init, name=f"mlp_gate_{i}"
+                self.intermediate_size, use_bias=False, dtype=dtype, kernel_init=mlp_init, name=f"mlp_gate_{i}"
             )(normed)
             value = nn.Dense(
-                self.intermediate_size, use_bias=False, dtype=c.dtype, kernel_init=mlp_init, name=f"mlp_up_{i}"
+                self.intermediate_size, use_bias=False, dtype=dtype, kernel_init=mlp_init, name=f"mlp_up_{i}"
             )(normed)
             hidden = jax.nn.silu(gate) * value
             x = x + nn.Dense(
-                c.hidden_size, use_bias=False, dtype=c.dtype, kernel_init=residual_init, name=f"mlp_down_{i}"
+                c.hidden_size, use_bias=False, dtype=dtype, kernel_init=residual_init, name=f"mlp_down_{i}"
             )(hidden).astype(jnp.float32)
-        y = nn.RMSNorm(epsilon=c.norm_eps, dtype=c.dtype, name="final_norm")(x)
+        y = nn.RMSNorm(epsilon=c.norm_eps, dtype=dtype, name="final_norm")(x)
         y = jnp.where(valid[..., None], y, 0)
         return tuple(updated), y
 
@@ -377,7 +383,7 @@ class GatedDeltaNet2Recurrent(nn.Module, RecurrentSequenceModel[GatedDeltaNet2St
     """Time-major stack wrapper with per-example episode resets.
 
     Inputs and outputs have width ``config.hidden_size``. Floating inputs are
-    cast to ``config.dtype`` by the stack; outputs use that dtype and all carry
+    cast to ``dtype`` (falling back to config.dtype) by the stack; all carry
     leaves remain float32. Incoming carry is required. Each episode start
     clears every layer's recurrent state and convolution history before its
     input is processed. Time and batch dimensions must be nonempty.
@@ -390,9 +396,10 @@ class GatedDeltaNet2Recurrent(nn.Module, RecurrentSequenceModel[GatedDeltaNet2St
     num_layers: int
     intermediate_size: int
     backend: GatedDeltaNet2Backend = "jax"
+    dtype: jax.typing.DTypeLike | None = None
 
     def setup(self) -> None:
-        self.stack = GatedDeltaNet2Stack(self.config, self.num_layers, self.intermediate_size, backend=self.backend)
+        self.stack = GatedDeltaNet2Stack(config=self.config, num_layers=self.num_layers, intermediate_size=self.intermediate_size, backend=self.backend, dtype=self.dtype)
 
     @nn.nowrap
     def initial_carry(self, num_envs: int) -> GatedDeltaNet2StackCarry:
@@ -464,15 +471,16 @@ class GatedDeltaNet2LM(nn.Module):
     intermediate_size: int
     vocab_size: int
     backend: GatedDeltaNet2Backend = "jax"
+    dtype: jax.typing.DTypeLike | None = None
 
     def setup(self) -> None:
         if self.vocab_size <= 0:
             raise ValueError("vocab_size must be positive")
-        self.backbone = GatedDeltaNet2Stack(self.config, self.num_layers, self.intermediate_size, backend=self.backend)
+        self.backbone = GatedDeltaNet2Stack(config=self.config, num_layers=self.num_layers, intermediate_size=self.intermediate_size, backend=self.backend, dtype=self.dtype)
         self.embedding = nn.Embed(
             self.vocab_size,
             self.config.hidden_size,
-            dtype=self.config.dtype,
+            dtype=self.config.dtype if self.dtype is None else self.dtype,
             embedding_init=nn.initializers.normal(0.02),
         )
         self.lm_head = nn.Dense(

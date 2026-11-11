@@ -13,25 +13,12 @@ total_env_steps: 100_000_000
 num_envs: 32
 # Recurrent carry persists across rollout boundaries.
 num_steps: 128
-# Limit activation memory for the wider spatial and recurrent layers.
+# Limit activation memory.
 num_minibatches: 4
 update_epochs: 4
 model:
   type: lux
-  # ~2.13M parameters; each block is ship LSTM -> cross-attention -> self-attention.
-  embedding_size: 192
-  channels: 64
-  num_blocks: 2
   attention_implementation: triton
-  recurrent:
-    hidden_size: 256
-    num_layers: 1
-    intermediate_size: 0
-  # Independent ship LSTM in each block; weights shared across ships.
-  ship_recurrent:
-    hidden_size: 128
-    num_layers: 1
-    intermediate_size: 0
 bf16: false
 learning_rate: 0.0003
 anneal_lr: true
@@ -46,8 +33,7 @@ entropy_decay: constant
 value_coef: 1.0
 max_grad_norm: 0.5
 ckpt_dir: /runs/mappo/${run_id}
-# Wider model dimensions require a fresh checkpoint.
-run_id: mappo_lux_2m_blocks${model.num_blocks}_selfplay_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
+run_id: mappo_lux_selfplay_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
 # Intervals count training iterations.
 log_interval: 1
 video_interval: 0

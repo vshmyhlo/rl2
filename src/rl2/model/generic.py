@@ -25,7 +25,7 @@ class GenericActorCritic(BaseActorCritic[jax.Array, LSTMStackCarry, GenericPolic
 
     action_space: MultiAgentActionSpace
     model: GenericModelConfig
-    dtype: jax.typing.DTypeLike = jnp.float32
+    dtype: jax.typing.DTypeLike | None = None
 
     @nn.nowrap
     def _make_recurrent(self, *, parent: nn.Module | None = None) -> LSTMStack:
@@ -67,14 +67,14 @@ class GenericActorCritic(BaseActorCritic[jax.Array, LSTMStackCarry, GenericPolic
 
     def _encode(self, observation: jax.Array) -> jax.Array:  # (*S, O) -> (*S, H)
         x = nn.relu(self.encoder(observation))  # (*S, F)
-        return self.recurrent_input(x).astype(self.dtype)  # (*S, H)
+        return jnp.asarray(self.recurrent_input(x), dtype=self.dtype)  # (*S, H)
 
     def _heads(
         self,
         x: jax.Array,  # (*S, H)
         actions_mask: jax.Array,  # (*S, *C, A)
     ) -> tuple[GenericPolicy, jax.Array]:  # logits: (*S, *C, A); value: (*S,)
-        x = x.astype(self.dtype)  # (*S, H), S is (B,) or (B, T)
+        x = jnp.asarray(x, dtype=self.dtype)  # (*S, H), S is (B,) or (B, T)
         policy = nn.relu(self.policy_norm(self.policy_hidden(x)))  # (*S, 512)
         critic = nn.relu(self.value_norm(self.value_hidden(x)))  # (*S, 512)
         # Heads use the compute dtype; float32 outputs keep PPO loss arithmetic precise.

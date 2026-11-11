@@ -75,8 +75,8 @@ class EditTransformer(nn.Module):
     max_nodes: int = 64
     max_seq_len: int = 256
     max_markers: int = 10
-    dtype: jax.typing.DTypeLike = jnp.float32
     attention_implementation: AttentionType = "xla"
+    dtype: jax.typing.DTypeLike | None = None
 
     @property
     def vocab_size(self) -> int:

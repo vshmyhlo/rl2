@@ -14,8 +14,8 @@ from rl2.model.lux import LuxEncoder, _rasterize
 
 @pytest.fixture(scope="module")
 def observation() -> LuxObservation[jax.Array]:
-    x, y = jnp.meshgrid(jnp.arange(8), jnp.arange(12), indexing="ij")  # each (W=8, H=12)
-    visible = x < 6  # (W, H)
+    x, y = jnp.meshgrid(jnp.arange(8), jnp.arange(12), indexing="xy")  # each (H=12, W=8)
+    visible = x < 6  # (H, W)
     own = LuxTeamObservation(
         units=UnitState(
             position=jnp.array([[1, 2], [5, 8], [-1, -1]], jnp.int16), energy=jnp.array([90, 160, -1], jnp.int16)
@@ -35,10 +35,10 @@ def observation() -> LuxObservation[jax.Array]:
         self=own,
         opponent=opponent,
         world=LuxWorldObservation(
-            sensor_mask=visible,  # (W, H)
+            sensor_mask=visible,  # (H, W)
             map_features=MapTile(
-                energy=jnp.where(visible, x - y, -1).astype(jnp.int16),  # (W, H)
-                tile_type=jnp.where(visible, (x + y) % 3, -1).astype(jnp.int16),  # (W, H)
+                energy=jnp.where(visible, x - y, -1).astype(jnp.int16),  # (H, W)
+                tile_type=jnp.where(visible, (x + y) % 3, -1).astype(jnp.int16),  # (H, W)
             ),
             relic_nodes=jnp.array([[3, 3], [-1, -1]], jnp.int16),  # (R=2, 2)
             relic_nodes_mask=jnp.array([True, False]),  # (R,)
@@ -46,6 +46,8 @@ def observation() -> LuxObservation[jax.Array]:
             match_steps=jnp.array(44),  # ()
         ),
         public_params=jnp.array([3, 30, 4, 2], jnp.int16),  # (4,)
+        init_unit_energy=jnp.array(100, jnp.int32),  # ()
+        spawn_rate=jnp.array(3, jnp.int32),  # ()
     )
 
 
@@ -68,6 +70,9 @@ def test_shapes_batch_replay_and_bfloat16(
     )  # leaves: (B, T, ...)
     actual = jax.jit(encoder.apply)(params, sequence)  # (B, T, F)
     assert actual.shape == (2, 2, 8) and actual.dtype == jnp.float32
+    encoded = encoder.apply(params, sequence, method="prepare")
+    assert encoded.spatial.shape == (2, 2, 12, 8, 4)
+    assert encoded.map_tokens.shape == (2, 2, 6, 8)
     np.testing.assert_allclose(actual, jnp.broadcast_to(expected, actual.shape), atol=2e-6)
     steps = jax.tree.map(lambda leaf: leaf[:, 0], sequence)  # leaves: (B, ...)
     np.testing.assert_allclose(encoder.apply(params, steps), actual[:, 0], atol=2e-6)
@@ -180,20 +185,20 @@ def test_gradients_and_empty_observation(
         return jnp.vdot(output, jnp.arange(8, dtype=jnp.float32))  # ()
 
     gradient = jax.jit(jax.grad(objective))(params, observation)  # parameter leaves: (...)
-    for name in (
-        "tile_embedding",
-        "map_stem",
-        "ship_projection",
-        "context_projection",
-        "output_projection",
-    ):
-        norm = sum(float(jnp.sum(jnp.abs(leaf))) for leaf in jax.tree.leaves(gradient["params"][name]))
+    for layer in (
+        gradient["params"]["map_encoder"]["tile_embedding"],
+        gradient["params"]["map_encoder"]["map_stem"],
+        gradient["params"]["ship_projection"],
+        gradient["params"]["context_projection"],
+        gradient["params"]["output_projection"],
+    ):  # parameter leaves: (...)
+        norm = sum(float(jnp.sum(jnp.abs(leaf))) for leaf in jax.tree.leaves(layer))
         assert 0 < norm < 1e6
     empty = observation._replace(
         self=observation.self._replace(units_mask=jnp.zeros_like(observation.self.units_mask)),  # (U,)
         opponent=observation.opponent._replace(units_mask=jnp.zeros_like(observation.opponent.units_mask)),  # (U,)
         world=observation.world._replace(
-            sensor_mask=jnp.zeros_like(observation.world.sensor_mask),  # (W, H)
+            sensor_mask=jnp.zeros_like(observation.world.sensor_mask),  # (H, W)
             relic_nodes_mask=jnp.zeros_like(observation.world.relic_nodes_mask),  # (R,)
         ),
     )
@@ -209,9 +214,30 @@ def test_rasterization_accumulates_stacked_ships_and_ignores_absent_slots() -> N
     positions = jnp.array([[[1, 2], [1, 2], [-1, -1]]])  # (B=1, U=3, 2)
     mask = jnp.array([[True, True, False]])  # (B, U)
     values = jnp.array([[[1.0, 0.25], [1.0, 0.5], [1.0, -1.0]]])  # (B, U, C=2)
-    actual = _rasterize(positions, mask, values, width=4, height=4)  # (B, W, H, C)
-    expected = jnp.zeros((1, 4, 4, 2)).at[0, 1, 2].set(jnp.array([2.0, 0.75]))  # (B, W, H, C)
+    actual = _rasterize(positions, mask, values, height=3, width=4)  # (B, H, W, C)
+    expected = jnp.zeros((1, 3, 4, 2)).at[0, 2, 1].set(jnp.array([2.0, 0.75]))  # (B, H, W, C)
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_entities_gather_height_width_tiles(
+    encoder: LuxEncoder, params: dict[str, Any], observation: LuxObservation[jax.Array]
+) -> None:
+    obs = jax.tree.map(lambda leaf: leaf[None], observation)  # leaves: (B=1, ...)
+    obs = obs._replace(world=obs.world._replace(relic_nodes=obs.world.relic_nodes.at[0, 0].set(jnp.array([5, 8]))))
+    positions = jnp.concatenate((obs.self.units.position, obs.opponent.units.position), axis=1)  # (B, N=6, 2)
+    positions = jnp.maximum(positions, 0)  # (B, N, 2), masked slots at the origin
+    energy = jnp.zeros((1, 6))  # (B, N)
+    spatial = jnp.zeros((1, 12, 8, 4))  # (B, H, W, C)
+    reference_units, reference_relics = encoder.apply(
+        params, obs, positions, energy, spatial, method="_encode_entities"
+    )  # (B, N, 2C); (B, R, 2C)
+    units, relics = encoder.apply(
+        params, obs, positions, energy, spatial.at[0, 8, 5].set(1), method="_encode_entities"
+    )  # (B, N, 2C); (B, R, 2C)
+    np.testing.assert_array_equal(
+        jnp.any(units != reference_units, axis=-1), [[False, True, False, False, False, False]]
+    )
+    np.testing.assert_array_equal(jnp.any(relics != reference_relics, axis=-1), [[True, False]])
 
 
 def test_sharded_encoder_matches_outputs_and_gradients(
