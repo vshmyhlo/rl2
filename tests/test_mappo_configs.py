@@ -43,7 +43,9 @@ def test_invalid_encoder(encoder: dict[str, object], field: str) -> None:
     "config",
     [
         GenericModelConfig(encoder=MLPEncoderConfig(embedding_size=4)),
-        LuxModelConfig(channels=4, ship_recurrent=LSTMConfig(hidden_size=6, num_layers=2, intermediate_size=8)),
+        LuxModelConfig(
+            channels=4, num_blocks=3, ship_recurrent=LSTMConfig(hidden_size=6, num_layers=2, intermediate_size=8)
+        ),
     ],
 )
 def test_model_round_trip(config: GenericModelConfig | LuxModelConfig) -> None:
@@ -93,3 +95,9 @@ def test_rejects_invalid_model_variant(settings: dict[str, object]) -> None:
 def test_rejects_invalid_ship_recurrence(field: str) -> None:
     with pytest.raises(ValidationError, match=field):
         TypeAdapter(ModelConfig).validate_python({"type": "lux", "ship_recurrent": {field: -1}})
+
+
+@pytest.mark.parametrize("num_blocks", [0, True], ids=["empty_stack", "non_integer"])
+def test_rejects_invalid_lux_block_count(num_blocks: int) -> None:
+    with pytest.raises(ValidationError, match="num_blocks"):
+        TypeAdapter(ModelConfig).validate_python({"type": "lux", "num_blocks": num_blocks})

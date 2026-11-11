@@ -30,11 +30,12 @@ class GenericModelConfig:
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LuxModelConfig:
     type: Literal["lux"] = "lux"
-    embedding_size: Annotated[int, Field(gt=0, strict=True)] = 128
-    channels: Annotated[int, Field(gt=0, multiple_of=2, strict=True)] = 16
+    embedding_size: Annotated[int, Field(gt=0, strict=True)] = 192
+    channels: Annotated[int, Field(gt=0, multiple_of=2, strict=True)] = 64
+    num_blocks: Annotated[int, Field(gt=0, strict=True)] = 2
     attention_implementation: Literal["triton", "xla"] = "triton"
-    recurrent: LSTMConfig = LSTMConfig()
-    ship_recurrent: LSTMConfig = LSTMConfig(hidden_size=64)
+    recurrent: LSTMConfig = LSTMConfig(hidden_size=256)
+    ship_recurrent: LSTMConfig = LSTMConfig(hidden_size=128)
 
 
 def _default_model_type(value: Any) -> Any:

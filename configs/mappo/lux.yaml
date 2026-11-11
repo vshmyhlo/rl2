@@ -9,25 +9,27 @@ env:
   randomize_params: true
 seed: 7
 total_env_steps: 100_000_000
-# Two GPUs: 16 environments each; one recurrent sequence per minibatch per GPU.
+# Two GPUs: 16 environments each.
 num_envs: 32
-# Covers the full five-match, 505-step game.
+# Recurrent carry persists across rollout boundaries.
 num_steps: 128
-# Smaller learner batches bound spatial encoder memory on the 128×128 board.
+# Limit activation memory for the wider spatial and recurrent layers.
 num_minibatches: 4
 update_epochs: 4
 model:
   type: lux
-  embedding_size: 128
-  channels: 16
+  # ~2.13M parameters; each block is ship LSTM -> cross-attention -> self-attention.
+  embedding_size: 192
+  channels: 64
+  num_blocks: 2
   attention_implementation: triton
   recurrent:
-    hidden_size: 128
+    hidden_size: 256
     num_layers: 1
     intermediate_size: 0
-  # Each of two stages: before map attention and between self-attention blocks.
+  # Independent ship LSTM in each block; weights shared across ships.
   ship_recurrent:
-    hidden_size: 64
+    hidden_size: 128
     num_layers: 1
     intermediate_size: 0
 bf16: false
@@ -44,13 +46,12 @@ entropy_decay: constant
 value_coef: 1.0
 max_grad_norm: 0.5
 ckpt_dir: /runs/mappo/${run_id}
-# Interleaved recurrent attention requires a fresh checkpoint.
-run_id: mappo_lux_recurrent_attention_selfplay_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
+# Wider model dimensions require a fresh checkpoint.
+run_id: mappo_lux_2m_blocks${model.num_blocks}_selfplay_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
 # Intervals count training iterations.
 log_interval: 1
 video_interval: 0
 video_fps: 10
-# Approximately 10% of training: ceil(10_000_000 / (32 * 256) * 0.1).
 checkpoint_interval: 200
 # Both teams share the policy; mean self-play return cannot measure strength.
 eval_interval: 400

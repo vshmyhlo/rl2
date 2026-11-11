@@ -107,6 +107,12 @@ The diagram shows `step` with batch size `B` and `U` own-ship slots;
 `__call__` adds a time axis after `B` and scans the team and ship LSTMs over that axis.
 `C` is `model.channels`; `Hs` is the ship LSTM width; `A` is commands per ship (230).
 
+The default model has 2,126,168 parameters: CNN width 64, attention width 128
+(four 32-wide heads with per-head RMSNorm on queries/keys, 512-wide self-attention FFNs),
+two blocks of ship LSTM → map cross-attention → self-attention,
+128-wide single-layer ship LSTMs, a single-layer team LSTM of width 256, and 192-wide
+team embeddings and policy/value hidden layers.
+
 ```mermaid
 %%{init: {"flowchart": {"defaultRenderer": "elk", "curve": "linear", "nodeSpacing": 30, "rankSpacing": 45}, "themeVariables": {"fontSize": "14px"}}}%%
 flowchart TB
@@ -131,11 +137,16 @@ flowchart TB
     subgraph encoder[Recurrent set attention]
         tokens["Entity tokens<br/>type + coordinates + energy for ships<br/>+ spatial features at entity positions"]
         global["Always-valid global token"]
-        cross["Map cross-attention<br/>entity/global queries · map keys/values"]
-        ship_first["Ship LSTM 1 + residual token projection<br/>own slots only; other entities pass through"]
-        set_first["Self-attention 1 + FFN<br/>masked · bidirectional · 4 heads · Tokamax/Triton"]
-        ship_second["Ship LSTM 2 + residual token projection<br/>own slots only; other entities pass through"]
-        set_second["Self-attention 2 + FFN<br/>masked · bidirectional · 4 heads · Tokamax/Triton"]
+        subgraph block_first[LuxAttentionBlock 1]
+            ship_first["Ship LSTM + residual token projection<br/>own slots only; other entities pass through"]
+            cross["Map cross-attention<br/>entity/global queries · map keys/values · QK RMSNorm"]
+            set_first["Self-attention + FFN<br/>masked · bidirectional · QK RMSNorm · Tokamax/Triton"]
+        end
+        subgraph block_second[LuxAttentionBlock 2]
+            ship_second["Ship LSTM + residual token projection<br/>own slots only; other entities pass through"]
+            cross_second["Map cross-attention<br/>entity/global queries · map keys/values · QK RMSNorm"]
+            set_second["Self-attention + FFN<br/>masked · bidirectional · QK RMSNorm · Tokamax/Triton"]
+        end
         ships["Ship features: B × U × 2C<br/>row i identifies ship i"]
         embedding["Team embedding<br/>own/opponent masked means + global token<br/>+ projected map-token mean"]
     end
@@ -185,7 +196,9 @@ flowchart TB
     coarse --> cross
     cross --> set_first
     set_first --> ship_second
-    ship_second --> set_second
+    ship_second --> cross_second
+    coarse --> cross_second
+    cross_second --> set_second
     set_second --> ships
     set_second --> embedding
     coarse -->|mean + projection| embedding
@@ -211,14 +224,14 @@ flowchart TB
 Own ships use stable native slots across time. Reordering ships requires the
 same permutation of their carry and lifecycle metadata; policy rows and ship
 carry follow that permutation, while team carry and value remain invariant.
-Opponent/relic ordering and masked padding do not affect outputs. Ship LSTM 1
-conditions map cross-attention and the first self-attention block; ship LSTM 2
-conditions the second block. Their weights and states are independent across
-stages, with weights shared across ships. Each stage scans time independently;
+Opponent/relic ordering and masked padding do not affect outputs. Each block
+updates ship memory, then applies map cross-attention and self-attention + FFN.
+`model.num_blocks` defaults to 2; blocks have separate parameters and memory, with
+LSTM weights shared across ships. Each block scans time independently;
 CNN and attention remain batched over timesteps, equivalent to repeated `step`.
 History communicated to other ships or team memory can persist after a ship dies.
 
-Both ship-memory stages reset before their output enters attention on game
+All ship-memory blocks reset before their output enters attention on game
 starts, match changes, absent/negative-energy ships, and newly active slots. Boundary frames retain no ship state. Native Lux can
 kill and respawn a slot within one step without an absent observation, so a
 spawn-corner ship with initial energy on a spawn tick is conservatively reset.

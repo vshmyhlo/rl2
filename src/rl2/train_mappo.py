@@ -411,7 +411,7 @@ class Config(BaseConfig):
     max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     video_fps: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     model: ModelConfig = GenericModelConfig()
-    bf16: bool = True
+    bf16: bool = False
     video_max_frames: Annotated[int, Field(gt=0)] | None = 900
     video_interval: Annotated[int, Field(ge=0)] = 0
     eval_interval: Annotated[int, Field(ge=0)] = 0

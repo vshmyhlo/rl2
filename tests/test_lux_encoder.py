@@ -51,7 +51,7 @@ def observation() -> LuxObservation[jax.Array]:
 
 @pytest.fixture(scope="module")
 def encoder() -> LuxEncoder:
-    return LuxEncoder(features=8, channels=4, attention_implementation="xla")
+    return LuxEncoder(features=8, channels=4)
 
 
 @pytest.fixture(scope="module")
@@ -185,10 +185,6 @@ def test_gradients_and_empty_observation(
         "map_stem",
         "ship_projection",
         "context_projection",
-        "map_attention",
-        "relic_projection",
-        "set_attention_0",
-        "set_attention_1",
         "output_projection",
     ):
         norm = sum(float(jnp.sum(jnp.abs(leaf))) for leaf in jax.tree.leaves(gradient["params"][name]))

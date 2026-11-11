@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import tokamax
 
-from rl2.model.lux import _SetAttentionBlock
+from rl2.model.lux import _Attention, _SetAttentionBlock
 
 
 @pytest.fixture(scope="module")
@@ -49,6 +49,44 @@ def test_bidirectional_mixing_masking_and_permutation(
     permutation = jnp.array([2, 1, 3, 0])  # (E,)
     reordered = apply(params, tokens[:, permutation], valid[:, permutation])  # (B, E, D)
     np.testing.assert_allclose(reordered, expected[:, permutation], atol=2e-6)
+
+
+def test_qk_rmsnorm_precedes_padding_and_preserves_values(
+    params: dict[str, Any], tokens: jax.Array, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # tokens: (B=1, Q=4, D=8); constant projections distinguish RMSNorm from centering.
+    variables = jax.tree.map(lambda leaf: leaf, params["params"]["attention"])
+    for name in ("query", "key", "value"):
+        variables[name]["kernel"] = jnp.zeros_like(variables[name]["kernel"])  # (D, H=4, d=2)
+        variables[name]["bias"] = jnp.broadcast_to(jnp.array([3.0, 4.0]), (4, 2))  # (H, d)
+    variables["query_norm"]["scale"] = jnp.array([2.0, 0.5])  # (d,), learned scale shared across heads
+    attention = Mock(wraps=tokamax.dot_product_attention)
+    monkeypatch.setattr(tokamax, "dot_product_attention", attention)
+    output = _Attention(features=8, implementation="xla", dtype=jnp.float32).apply(
+        {"params": variables}, tokens, tokens[:, :2]
+    )  # (B, Q, D)
+    query, key, value = attention.call_args.args  # (B, Q/K, H, padded_d=16)
+    assert output.shape == (1, 4, 8)
+    assert query.shape == (1, 4, 4, 16) and key.shape == value.shape == (1, 2, 4, 16)
+    expected = jnp.array([3.0, 4.0]) / jnp.sqrt(12.5 + 1e-6)  # (d,)
+    np.testing.assert_allclose(
+        query[..., :2], jnp.broadcast_to(expected * jnp.array([2.0, 0.5]), (1, 4, 4, 2)), atol=1e-6
+    )
+    np.testing.assert_allclose(key[..., :2], jnp.broadcast_to(expected, (1, 2, 4, 2)), atol=1e-6)
+    np.testing.assert_array_equal(value[..., :2], jnp.broadcast_to(jnp.array([3.0, 4.0]), (1, 2, 4, 2)))
+    for array in (query, key, value):
+        np.testing.assert_array_equal(array[..., 2:], 0)
+
+
+def test_bfloat16_normalized_attention_matches_float32(
+    block: _SetAttentionBlock, params: dict[str, Any], tokens: jax.Array, valid: jax.Array
+) -> None:
+    # tokens: (B, E, D); valid: (B, E). Check normalization numerics independently of recurrence.
+    expected = jax.jit(block.apply)(params, tokens, valid)  # (B, E, D)
+    reduced = jax.jit(block.clone(dtype=jnp.bfloat16).apply)(params, tokens, valid)  # (B, E, D)
+    assert reduced.dtype == tokens.dtype
+    np.testing.assert_allclose(reduced.astype(jnp.float32), expected, atol=0.04, rtol=0.02)
+    np.testing.assert_array_equal(reduced[:, 2], 0)
 
 
 @pytest.mark.parametrize("real_triton", [False, True], ids=["cpu_routing", "gpu_kernel"])

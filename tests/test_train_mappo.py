@@ -1041,6 +1041,31 @@ def test_lux_model_requires_positive_even_channels(channels: int) -> None:
         ppo.LuxModelConfig(channels=channels)
 
 
+def test_default_lux_parameter_budget_and_output_shapes() -> None:
+    env = LuxEnv(LuxConfig(map_size=8, max_units=1, randomize_params=False))
+    config = ppo.LuxModelConfig(attention_implementation="xla")
+    model = ppo.make_actor_critic(action_space=env.action_space, model=config)
+    observation = jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct((1, 1, *leaf.shape), leaf.dtype), env.observation_space
+    )  # leaves: (B=1, T=1, ...)
+    output, variables = jax.eval_shape(
+        model.init_with_output,
+        jax.random.key(0),
+        observation,
+        model.initial_carry(1),
+        jax.ShapeDtypeStruct((1, 1), jnp.bool_),  # (B, T)
+        jax.ShapeDtypeStruct((1, 1, 1, 230), jnp.bool_),  # (B, T, U, A)
+    )
+    assert 1_900_000 <= sum(leaf.size for leaf in jax.tree.leaves(variables["params"])) <= 2_200_000
+    assert output.policy.raw_logits.shape == (1, 1, 1, 232)
+    assert jax.eval_shape(lambda policy: policy.logits, output.policy).shape == (1, 1, 1, 230)
+    assert output.value.shape == (1, 1) and output.value.dtype == jnp.float32
+    for leaf in jax.tree.leaves(output.carry.team):
+        assert leaf.shape == (1, config.recurrent.hidden_size) and leaf.dtype == jnp.float32
+    for leaf in jax.tree.leaves(output.carry.ships):
+        assert leaf.shape == (1, 1, config.ship_recurrent.hidden_size) and leaf.dtype == jnp.float32
+
+
 def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Path) -> None:
     config = replace(
         config,
