@@ -267,6 +267,47 @@ def test_visible_inputs_affect_encoding(
     assert bool(jnp.all(jnp.max(jnp.abs(output[1:] - output[:1]), axis=-1) > 1e-5))
 
 
+def test_single_block_remembers_entities_and_map(
+    encoder: LuxEncoder, params: dict[str, Any], observation: LuxObservation[jax.Array]
+) -> None:
+    alternatives = (
+        observation._replace(
+            self=observation.self._replace(
+                units=observation.self.units.replace(energy=observation.self.units.energy.at[0].set(300))
+            )
+        ),
+        observation._replace(
+            world=observation.world._replace(
+                map_features=observation.world.map_features.replace(
+                    energy=observation.world.map_features.energy.at[2, 3].set(20)
+                )
+            )
+        ),
+        observation._replace(
+            world=observation.world._replace(
+                relic_nodes=observation.world.relic_nodes.at[0].set(jnp.array([4, 5], jnp.int16))
+            )
+        ),
+    )
+    # These observations have identical global context, but different entity/map details.
+    sequence = jax.tree.map(
+        lambda *leaves: jnp.stack(leaves)[:, None], observation, *alternatives
+    )  # leaves: (B=4, T=1, ...)
+    apply = jax.jit(encoder.apply)
+    _, carry = apply(params, sequence, encoder.initial_carry(4), jnp.ones((4, 1), bool))
+    for leaf in jax.tree.leaves(carry):  # (B, Hg)
+        assert bool((jnp.max(jnp.abs(leaf[1:] - leaf[:1]), axis=-1) > 1e-6).all())
+    identical = jax.tree.map(
+        lambda leaf: jnp.broadcast_to(leaf, (4, 1, *leaf.shape)), observation
+    )  # leaves: (B, T, ...)
+    output, _ = apply(params, identical, carry, jnp.zeros((4, 1), bool))
+    for leaf in (output.global_, output.ships[..., 0, :]):  # (B, T, D)
+        assert bool((jnp.max(jnp.abs(leaf[1:] - leaf[:1]), axis=-1) > 1e-6).all())
+    reset, reset_carry = apply(params, identical, carry, jnp.ones((4, 1), bool))
+    for leaf in jax.tree.leaves((reset, reset_carry)):
+        np.testing.assert_allclose(leaf[1:], jnp.broadcast_to(leaf[:1], leaf[1:].shape), atol=2e-6)
+
+
 def test_gradients_and_empty_observation(
     encoder: LuxEncoder, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:

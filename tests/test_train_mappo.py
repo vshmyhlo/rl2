@@ -1066,10 +1066,14 @@ def test_default_lux_parameter_budget_and_output_shapes() -> None:
     assert heads["value_hidden"]["kernel"].shape == (token_size, token_size)
     for index in range(config.num_blocks):
         block = variables["params"]["encoder"][f"block_{index}"]
-        for attention in (block["map_attention"], block["set_attention"]["attention"]):
+        for attention in (
+            block["map_attention"],
+            block["set_attention"]["attention"],
+            block["memory_attention"]["attention"],
+        ):
             assert attention["query"]["kernel"].shape == (token_size, config.heads, config.head_dim)
             assert attention["out"]["kernel"].shape == (config.heads, config.head_dim, token_size)
-    assert 4_800_000 <= sum(leaf.size for leaf in jax.tree.leaves(variables["params"])) <= 4_900_000
+    assert 6_400_000 <= sum(leaf.size for leaf in jax.tree.leaves(variables["params"])) <= 6_500_000
     assert output.policy.raw_logits.shape == (1, 1, 1, 232)
     assert jax.eval_shape(lambda policy: policy.logits, output.policy).shape == (1, 1, 1, 230)
     assert output.value.shape == (1, 1) and output.value.dtype == jnp.float32

@@ -96,12 +96,9 @@ def test_recurrent_modules_return_output_and_carry(model: LuxActorCritic, params
     )
     carry = block.initial_carry(actor_count=1)  # leaves: (B, Hg)
     variables = params["params"]["encoder"]["block_0"]
-    global_result = jax.jit(_GlobalMemory(features=model.model.heads * model.model.head_dim).apply)(
-        {"params": variables["global_memory"]}, tokens[..., 0, :], carry, jnp.ones((1, 2), bool)
-    )  # token: (B, T, D); carry: (B, Hg)
 
     def capture(module: nn.Module, method: str) -> bool:
-        return method == "__call__" and module.name == "input_norm"
+        return method == "__call__" and module.name in {"input_norm", "set_attention"}
 
     block_result, state = jax.jit(block.apply, static_argnames=("capture_intermediates", "mutable"))(
         {"params": variables},
@@ -114,6 +111,10 @@ def test_recurrent_modules_return_output_and_carry(model: LuxActorCritic, params
         capture_intermediates=capture,
         mutable=("intermediates",),
     )  # tokens: (B, T, E, D); carry: (B, Hg)
+    aggregated = state["intermediates"]["set_attention"]["__call__"][0].reshape(tokens.shape)  # (B, T, E, D)
+    global_result = jax.jit(_GlobalMemory(features=width).apply)(
+        {"params": variables["global_memory"]}, aggregated[..., 0, :], carry, jnp.ones((1, 2), bool)
+    )  # token: (B, T, D); carry: (B, Hg)
     for result, shape in ((global_result, (1, 2, width)), (block_result, (1, 2, 4, width))):
         assert type(result) is tuple and len(result) == 2
         output, updated_carry = result  # (B, T, [E,] D); carry leaves: (B, Hg)
@@ -125,7 +126,7 @@ def test_recurrent_modules_return_output_and_carry(model: LuxActorCritic, params
     np.testing.assert_array_equal(block_result[0][..., 3, :], 0)  # Masked relic remains inactive.
     embeddings = variables["token_type_embedding"]["embedding"]  # (4, D)
     assert embeddings.shape == (4, width)
-    typed = tokens.at[..., 0, :].set(global_result[0]) + embeddings[token_types]  # (B, T, E, D)
+    typed = tokens + embeddings[token_types]  # (B, T, E, D)
     expected = nn.LayerNorm().apply({"params": variables["input_norm"]}, typed.reshape((2, 4, width)))  # (B*T, E, D)
     np.testing.assert_allclose(state["intermediates"]["input_norm"]["__call__"][0], expected, atol=2e-6)
 
@@ -398,7 +399,7 @@ def test_sharded_policy_and_value_gradients(
         magnitude = sum(float(jnp.abs(leaf).sum()) for leaf in jax.tree.leaves(actual[1]["params"]["heads"][name]))
         assert 0 < magnitude < 1e6
     for index in range(model.model.num_blocks):
-        for name in ("global_memory", "map_attention", "set_attention"):
+        for name in ("global_memory", "map_attention", "set_attention", "memory_attention"):
             leaves = jax.tree.leaves(actual[1]["params"]["encoder"][f"block_{index}"][name])
             assert 0 < sum(float(jnp.abs(leaf).sum()) for leaf in leaves) < 1e6
     relic_gradient = actual[1]["params"]["encoder"]["relic_projection"]
@@ -560,8 +561,10 @@ def test_recurrent_attention_replay_is_causal_and_shares_global_history(
 class AttentionOutputs(NamedTuple):
     first_map: jax.Array  # (B*T, E, D)
     first_set: jax.Array  # (B*T, E, D)
+    first_memory: jax.Array  # (B*T, E, D)
     second_map: jax.Array  # (B*T, E, D)
     second_set: jax.Array  # (B*T, E, D)
+    second_memory: jax.Array  # (B*T, E, D)
 
 
 @pytest.mark.parametrize("stage", [0, 1], ids=["first_block", "second_block"])
@@ -578,7 +581,7 @@ def test_history_conditions_the_following_attention(
     )
 
     def capture(module: nn.Module, method: str) -> bool:
-        return method == "__call__" and module.name in {"map_attention", "set_attention"}
+        return method == "__call__" and module.name in {"map_attention", "set_attention", "memory_attention"}
 
     encoder = LuxEncoder(model=model.model)
 
@@ -596,20 +599,25 @@ def test_history_conditions_the_following_attention(
         return AttentionOutputs(
             first_map=layers["block_0"]["map_attention"]["__call__"][0],
             first_set=layers["block_0"]["set_attention"]["__call__"][0],
+            first_memory=layers["block_0"]["memory_attention"]["__call__"][0],
             second_map=layers["block_1"]["map_attention"]["__call__"][0],
             second_set=layers["block_1"]["set_attention"]["__call__"][0],
+            second_memory=layers["block_1"]["memory_attention"]["__call__"][0],
         )
 
     original, updated = attend(memory), attend(changed)
     assert all(leaf.shape == (1, 9, 8) for leaf in original)
+    np.testing.assert_array_equal(original.first_map, updated.first_map)
+    np.testing.assert_array_equal(original.first_set, updated.first_set)
     if stage == 0:
-        assert float(jnp.max(jnp.abs(original.first_map[:, 0] - updated.first_map[:, 0]))) > 1e-4
-        assert float(jnp.max(jnp.abs(original.first_set[:, 2] - updated.first_set[:, 2]))) > 1e-4
+        assert float(jnp.max(jnp.abs(original.first_memory[:, 2] - updated.first_memory[:, 2]))) > 1e-4
+        assert float(jnp.max(jnp.abs(original.second_map[:, 0] - updated.second_map[:, 0]))) > 1e-4
+        assert float(jnp.max(jnp.abs(original.second_set[:, 2] - updated.second_set[:, 2]))) > 1e-4
     else:
-        np.testing.assert_array_equal(original.first_map, updated.first_map)
-        np.testing.assert_array_equal(original.first_set, updated.first_set)
-    assert float(jnp.max(jnp.abs(original.second_map[:, 0] - updated.second_map[:, 0]))) > 1e-4
-    assert float(jnp.max(jnp.abs(original.second_set[:, 2] - updated.second_set[:, 2]))) > 1e-4
+        np.testing.assert_array_equal(original.first_memory, updated.first_memory)
+        np.testing.assert_array_equal(original.second_map, updated.second_map)
+        np.testing.assert_array_equal(original.second_set, updated.second_set)
+    assert float(jnp.max(jnp.abs(original.second_memory[:, 2] - updated.second_memory[:, 2]))) > 1e-4
 
 
 @pytest.mark.parametrize("num_blocks", [1, 3], ids=["minimum_depth", "additional_block"])
@@ -633,9 +641,14 @@ def test_configurable_block_depth(
         leaf.shape == (1, model.model.heads * model.model.head_dim) for leaf in jax.tree.leaves(output_carry.global_)
     )
     for index in range(num_blocks):
-        assert {"global_memory", "token_type_embedding", "input_norm", "map_attention", "set_attention"} == set(
-            variables["params"]["encoder"][f"block_{index}"]
-        )
+        assert {
+            "global_memory",
+            "token_type_embedding",
+            "input_norm",
+            "map_attention",
+            "set_attention",
+            "memory_attention",
+        } == set(variables["params"]["encoder"][f"block_{index}"])
 
 
 def test_attention_width_is_independent_of_cnn_channels(
@@ -663,6 +676,7 @@ def test_attention_width_is_independent_of_cnn_channels(
     assert heads["ship_hidden"]["kernel"].shape == (12, 6)
     assert heads["value_hidden"]["kernel"].shape == (6, 6)
     for index in range(model.model.num_blocks):
-        attention = variables["params"]["encoder"][f"block_{index}"]["set_attention"]
-        assert attention["ffn_in"]["kernel"].shape == (6, 24)
-        assert attention["ffn_out"]["kernel"].shape == (24, 6)
+        for name in ("set_attention", "memory_attention"):
+            attention = variables["params"]["encoder"][f"block_{index}"][name]
+            assert attention["ffn_in"]["kernel"].shape == (6, 24)
+            assert attention["ffn_out"]["kernel"].shape == (24, 6)

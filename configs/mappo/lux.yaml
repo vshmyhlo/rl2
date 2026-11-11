@@ -45,6 +45,6 @@ eval_episodes: 100
 eval_seed: 10000
 
 selfplay:
-  pool_size: 8
-  snapshot_interval: 100
+  pool_size: 32
+  snapshot_interval: 50
   current_policy_fraction: 0.5

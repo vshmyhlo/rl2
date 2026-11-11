@@ -108,9 +108,9 @@ The diagram shows `step` with batch size `B` and `U` own-ship slots;
 `D` is `model.heads * model.head_dim`; `C` is `model.conv_channels`;
 `Hg` is the global LSTM width, equal to `D`; `A` is commands per ship (230).
 
-The default model has 4,836,696 parameters: CNN width 64, attention width 256
+The default model has 6,416,344 parameters: CNN width 64, attention width 256
 (eight 32-wide heads with per-head RMSNorm on queries/keys, 1024-wide self-attention FFNs),
-two blocks of global-token LSTM → map cross-attention → self-attention,
+two blocks of map cross-attention → self-attention → global-token LSTM → self-attention,
 256-wide single-layer global LSTMs, and 256-wide team embeddings and policy/value
 hidden layers.
 
@@ -139,14 +139,16 @@ flowchart TB
         tokens["Entity tokens<br/>type + coordinates + energy for ships<br/>+ spatial features at entity positions"]
         global["Always-valid global token"]
         subgraph block_first[LuxAttentionBlock 1]
-            global_first["Global LSTM + residual token projection"]
             cross["Map cross-attention<br/>entity/global queries · map keys/values · QK RMSNorm"]
-            set_first["Self-attention + FFN<br/>masked · bidirectional · QK RMSNorm · Tokamax/Triton"]
+            set_first["Observation self-attention + FFN<br/>aggregate map and entity information"]
+            global_first["Global LSTM + residual token projection"]
+            memory_first["Memory self-attention + FFN<br/>distribute updated global memory to entities"]
         end
         subgraph block_second[LuxAttentionBlock 2]
-            global_second["Global LSTM + residual token projection"]
             cross_second["Map cross-attention<br/>entity/global queries · map keys/values · QK RMSNorm"]
-            set_second["Self-attention + FFN<br/>masked · bidirectional · QK RMSNorm · Tokamax/Triton"]
+            set_second["Observation self-attention + FFN<br/>aggregate map and entity information"]
+            global_second["Global LSTM + residual token projection"]
+            memory_second["Memory self-attention + FFN<br/>distribute updated global memory to entities"]
         end
         ships["Ship features: B × U × D<br/>row i identifies ship i"]
         embedding["Team embedding<br/>own/opponent masked means + global token<br/>+ projected map-token mean"]
@@ -182,21 +184,24 @@ flowchart TB
     features -->|gather| tokens
     context --> global
     tokens --> cross
-    global --> global_first
-    global_first --> cross
+    global --> cross
     global_carry --> global_first
     global_carry --> global_second
     global_first --> global_next
     global_second --> global_next
     coarse --> cross
     cross --> set_first
-    set_first --> cross_second
-    set_first --> global_second
-    global_second --> cross_second
+    set_first -->|global token| global_first
+    set_first --> memory_first
+    global_first --> memory_first
+    memory_first --> cross_second
     coarse --> cross_second
     cross_second --> set_second
-    set_second --> ships
-    set_second --> embedding
+    set_second -->|global token| global_second
+    set_second --> memory_second
+    global_second --> memory_second
+    memory_second --> ships
+    memory_second --> embedding
     coarse -->|mean + projection| embedding
     ships --> head
     embedding -->|broadcast| head
@@ -214,9 +219,11 @@ flowchart TB
 Token order is global → own ships → opponent ships → relics.
 Reordering own ships permutes policy rows while global carry and value remain
 invariant. Opponent/relic ordering and masked padding do not affect outputs.
-Each block updates only its global token recurrently, adds its learned embeddings
-for the four token types, then applies map cross-attention and self-attention + FFN
-to all valid tokens.
+Each block adds embeddings for the four token types, retrieves map features,
+and mixes entities with self-attention + FFN. Its global-token LSTM then stores
+this contextualized observation. A separate self-attention + FFN distributes
+updated memory to all valid tokens. Both self-attention stages are masked and
+bidirectional, with QK RMSNorm. Even one block can retain map and entity details.
 `model.num_blocks` defaults to 2; blocks have separate parameters and global
 memory. Each LSTM scans time independently; CNN and attention remain batched
 over timesteps, equivalent to repeated `step`.
@@ -268,8 +275,9 @@ not model parameter shapes. Rendering scales the board to fit its panel.
   self-attention with residual feed-forward layers. Masks exclude hidden/absent entities;
   an always-valid global token handles empty sets. Padding capacity does not
   affect features; active ship counts use a fixed scale of 16.
-- Each block runs an LSTM over the global token before map retrieval and
-  entity mixing. Its output is projected and added to the global token. Final
+- Each block runs map cross-attention and entity self-attention before its
+  global-token LSTM. The projected memory is added to the global token, then
+  a second entity self-attention stage distributes that memory to ships. Final
   ship tokens and the invariant team embedding feed the command heads.
   Sap scores use target-map features plus an offset MLP: normalized
   `[dx, dy, |dx|, |dy|]` → Dense(C) → SiLU → Dense(C). Ship permutations

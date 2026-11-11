@@ -209,7 +209,7 @@ class _GlobalMemory(nn.Module):
 
 
 class LuxAttentionBlock(nn.Module):
-    """Global-token recurrence, type embeddings, map retrieval, then entity mixing."""
+    """Map retrieval, entity aggregation, global recurrence, then memory distribution."""
 
     attention_implementation: Literal["triton", "xla"]
     heads: int = 8
@@ -245,6 +245,13 @@ class LuxAttentionBlock(nn.Module):
             dtype=self.dtype,
             name="set_attention",
         )
+        self.memory_attention = _SetAttentionBlock(
+            attention_implementation=self.attention_implementation,
+            heads=self.heads,
+            head_dim=self.head_dim,
+            dtype=self.dtype,
+            name="memory_attention",
+        )
 
     def __call__(
         self,
@@ -255,10 +262,6 @@ class LuxAttentionBlock(nn.Module):
         map_tokens: jax.Array,  # (B, T, P, D)
         token_types: jax.Array,  # (E,) int32: global=0, own=1, opponent=2, relic=3
     ) -> tuple[jax.Array, LSTMCarry]:  # tokens: (B, T, E, D); carry leaves: (B, Hg)
-        global_token, carry = self.global_memory(
-            tokens[..., 0, :], carry, episode_start
-        )  # token: (B, T, D); carry leaves: (B, Hg)
-        tokens = tokens.at[..., 0, :].set(global_token)  # (B, T, E, D)
         tokens = tokens + self.token_type_embedding(token_types)  # (B, T, E, D)
         token_shape = tokens.shape
         batch_size = prod(tokens.shape[:-2])
@@ -268,6 +271,13 @@ class LuxAttentionBlock(nn.Module):
         attended = self.map_attention(self.input_norm(tokens), map_tokens)  # (B*T, E, D)
         tokens = jnp.where(tokens_mask[..., None], tokens + attended, 0)  # (B*T, E, D)
         tokens = self.set_attention(tokens, tokens_mask).reshape(token_shape)  # (B, T, E, D)
+        global_token, carry = self.global_memory(
+            tokens[..., 0, :], carry, episode_start
+        )  # token: (B, T, D); carry leaves: (B, Hg)
+        tokens = tokens.at[..., 0, :].set(global_token)  # (B, T, E, D)
+        tokens = self.memory_attention(tokens.reshape((batch_size, *token_shape[-2:])), tokens_mask).reshape(
+            token_shape
+        )  # (B, T, E, D)
         return tokens, carry  # (B, T, E, D); leaves: (B, Hg)
 
 
