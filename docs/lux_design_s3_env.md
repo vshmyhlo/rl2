@@ -105,7 +105,7 @@ model shapes from the actual pytrees.
 [LuxActorCritic](../src/rl2/model/lux.py) processes each team's visible observation.
 The diagram shows `step` with batch size `B` and `U` own-ship slots;
 `__call__` adds a time axis after `B` and scans the team and ship LSTMs over that axis.
-`C` is `model.channels`; `Hs` is the ship LSTM width; `A` is commands per ship (230).
+`D` is `model.heads * model.head_dim`; `C` is `model.channels`; `Hs` is the ship LSTM width; `A` is commands per ship (230).
 
 The default model has 2,126,168 parameters: CNN width 64, attention width 128
 (four 32-wide heads with per-head RMSNorm on queries/keys, 512-wide self-attention FFNs),
@@ -131,7 +131,7 @@ flowchart TB
         raster["Entity raster<br/>own/opponent counts + summed energy · relic counts"]
         cnn["Concatenate 13 channels<br/>3 × 3 convolution + norm + SiLU + residual block"]
         features["Spatial features<br/>B × W × H × C"]
-        coarse["2 stride-2 convolutions → map tokens<br/>B × P × 2C; P = W × H / 16"]
+        coarse["2 stride-2 convolutions → map tokens<br/>B × P × D; P = W × H / 16"]
     end
 
     subgraph encoder[Recurrent set attention]
@@ -147,7 +147,7 @@ flowchart TB
             cross_second["Map cross-attention<br/>entity/global queries · map keys/values · QK RMSNorm"]
             set_second["Self-attention + FFN<br/>masked · bidirectional · QK RMSNorm · Tokamax/Triton"]
         end
-        ships["Ship features: B × U × 2C<br/>row i identifies ship i"]
+        ships["Ship features: B × U × D<br/>row i identifies ship i"]
         embedding["Team embedding<br/>own/opponent masked means + global token<br/>+ projected map-token mean"]
     end
 
@@ -292,12 +292,14 @@ not model parameter shapes. Rendering scales the board to fit its panel.
   include their recurrent state; opponent/relic permutations leave commands unchanged.
   Invariant summaries feed the team LSTM and value head. Hidden scoring tiles
   are never inputs, and legality masks preserve the environment's command order.
-- `model.channels` controls CNN width; attention width is twice that and requires
-  positive even channels. `model.embedding_size` controls team and head widths;
+- `model.channels` controls CNN width and requires positive even channels;
+  attention width is `model.heads * model.head_dim`.
+  `model.embedding_size` controls team and head widths;
   `model.recurrent` configures team memory; `model.ship_recurrent` configures
-  hidden size, layer count, and intermediate MLP size for each of the two ship
-  stages. `model.attention_implementation`
-  defaults to `triton`: both attention paths call Tokamax's Triton kernel.
+  hidden size for each ship stage. Team and ship memory each use a single
+  LSTM without stack normalization, residual layers, or intermediate MLPs.
+  `model.attention_implementation` defaults to `triton`: both attention paths
+  call Tokamax's Triton kernel.
   Explicit `xla` selects Tokamax's CPU-compatible reference implementation.
   This architecture requires a fresh run directory; previous checkpoints are
   incompatible. Playing-strength improvements require training evaluation.

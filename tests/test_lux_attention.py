@@ -24,7 +24,7 @@ def valid() -> jax.Array:  # (B=1, E=4)
 
 @pytest.fixture(scope="module")
 def block() -> _SetAttentionBlock:
-    return _SetAttentionBlock(features=8, heads=4, head_dim=2, implementation="xla", dtype=jnp.float32)
+    return _SetAttentionBlock(heads=4, head_dim=2, implementation="xla", dtype=jnp.float32)
 
 
 @pytest.fixture(scope="module")
@@ -39,6 +39,9 @@ def test_bidirectional_mixing_masking_and_permutation(
     # tokens: (B, E, D); valid: (B, E)
     apply = jax.jit(block.apply)
     expected = apply(params, tokens, valid)  # (B, E, D)
+    assert expected.shape == (1, 4, block.heads * block.head_dim)
+    assert params["params"]["ffn_in"]["kernel"].shape == (8, 32)
+    assert params["params"]["ffn_out"]["kernel"].shape == (32, 8)
     later_changed = apply(params, tokens.at[:, 1].add(jnp.arange(8)), valid)  # (B, E, D)
     earlier_changed = apply(params, tokens.at[:, 0].add(jnp.arange(8)), valid)  # (B, E, D)
     assert float(jnp.max(jnp.abs(later_changed[:, 0] - expected[:, 0]))) > 1e-4

@@ -53,7 +53,7 @@ def observation() -> LuxObservation[jax.Array]:
 
 @pytest.fixture(scope="module")
 def encoder() -> LuxEncoder:
-    return LuxEncoder(features=8, channels=4)
+    return LuxEncoder(features=8, token_size=8, channels=4)
 
 
 @pytest.fixture(scope="module")
@@ -131,8 +131,8 @@ def test_entity_ordering(encoder: LuxEncoder, params: dict[str, Any], observatio
     own_permuted = observation._replace(self=permute(observation.self))
     batch = jax.tree.map(lambda *leaves: jnp.stack(leaves), observation, unordered, own_permuted)  # leaves: (B=3, ...)
     output = jax.jit(lambda obs: encoder.apply(params, obs, method="encode_features"))(batch)
-    np.testing.assert_allclose(output.global_features[0], output.global_features[1], atol=2e-6)
-    np.testing.assert_allclose(output.global_features[0], output.global_features[2], atol=2e-6)
+    np.testing.assert_allclose(output.global_[0], output.global_[1], atol=2e-6)
+    np.testing.assert_allclose(output.global_[0], output.global_[2], atol=2e-6)
     np.testing.assert_allclose(output.ships[0], output.ships[1], atol=2e-6)
     np.testing.assert_allclose(output.ships[2], output.ships[0, jnp.array([1, 0, 2])], atol=2e-6)
 
@@ -300,7 +300,7 @@ def test_set_padding_does_not_change_features(
     apply = jax.jit(lambda obs: encoder.apply(params, obs, method="encode_features"))
     reference, actual = apply(padded), apply(compact)
     assert actual.ships.shape == (own_count, 8)
-    np.testing.assert_allclose(actual.global_features, reference.global_features, atol=2e-6)
+    np.testing.assert_allclose(actual.global_, reference.global_, atol=2e-6)
     np.testing.assert_allclose(actual.ships, reference.ships[:own_count], atol=2e-6)
     np.testing.assert_allclose(actual.spatial, reference.spatial, atol=2e-6)
     np.testing.assert_array_equal(reference.ships[own_count:], 0)

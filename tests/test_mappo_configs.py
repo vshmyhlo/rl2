@@ -48,7 +48,7 @@ def test_invalid_encoder(encoder: dict[str, object], field: str) -> None:
             num_blocks=3,
             heads=2,
             head_dim=4,
-            ship_recurrent=LSTMConfig(hidden_size=6, num_layers=2, intermediate_size=8),
+            ship_recurrent=LSTMConfig(hidden_size=6),
         ),
     ],
 )
@@ -99,6 +99,20 @@ def test_rejects_invalid_model_variant(settings: dict[str, object]) -> None:
 def test_rejects_invalid_ship_recurrence(field: str) -> None:
     with pytest.raises(ValidationError, match=field):
         TypeAdapter(ModelConfig).validate_python({"type": "lux", "ship_recurrent": {field: -1}})
+
+
+@pytest.mark.parametrize(
+    "name,settings",
+    [
+        ("recurrent", {"num_layers": 2}),
+        ("ship_recurrent", {"num_layers": 2}),
+        ("recurrent", {"intermediate_size": 4}),
+        ("ship_recurrent", {"intermediate_size": 4}),
+    ],
+)
+def test_lux_rejects_stack_settings(name: str, settings: dict[str, int]) -> None:
+    with pytest.raises(ValidationError, match=f"{name} requires num_layers=1 and intermediate_size=0"):
+        TypeAdapter(ModelConfig).validate_python({"type": "lux", name: settings})
 
 
 @pytest.mark.parametrize("num_blocks", [0, True], ids=["empty_stack", "non_integer"])

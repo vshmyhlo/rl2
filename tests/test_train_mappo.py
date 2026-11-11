@@ -1057,12 +1057,13 @@ def test_default_lux_parameter_budget_and_output_shapes() -> None:
         jax.ShapeDtypeStruct((1, 1, 1, 230), jnp.bool_),  # (B, T, U, A)
     )
     assert config.heads == 8 and config.head_dim == 32
+    token_size = config.heads * config.head_dim
     for index in range(config.num_blocks):
         block = variables["params"][f"block_{index}"]
         for attention in (block["map_attention"], block["set_attention"]["attention"]):
-            assert attention["query"]["kernel"].shape == (2 * config.channels, 8, 32)
-            assert attention["out"]["kernel"].shape == (8, 32, 2 * config.channels)
-    assert 2_200_000 <= sum(leaf.size for leaf in jax.tree.leaves(variables["params"])) <= 2_500_000
+            assert attention["query"]["kernel"].shape == (token_size, config.heads, config.head_dim)
+            assert attention["out"]["kernel"].shape == (config.heads, config.head_dim, token_size)
+    assert 4_200_000 <= sum(leaf.size for leaf in jax.tree.leaves(variables["params"])) <= 4_500_000
     assert output.policy.raw_logits.shape == (1, 1, 1, 232)
     assert jax.eval_shape(lambda policy: policy.logits, output.policy).shape == (1, 1, 1, 230)
     assert output.value.shape == (1, 1) and output.value.dtype == jnp.float32
