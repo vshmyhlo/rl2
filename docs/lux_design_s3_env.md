@@ -103,118 +103,14 @@ model shapes from the actual pytrees.
 ## Model architecture
 
 [LuxActorCritic](../src/rl2/model/lux.py) processes each team's visible observation.
-The diagram shows `step` with batch size `B` and `U` own-ship slots;
-`__call__` adds a time axis after `B` and scans the global-token LSTMs over that axis.
-`D` is `model.heads * model.head_dim`; `C` is `model.conv_channels`;
-`Hg` is the global LSTM width, equal to `D`; `A` is commands per ship (230).
+`__call__` adds a time axis after the batch axis and scans the global-token LSTMs
+over that axis.
 
 The default model has 6,416,344 parameters: CNN width 64, attention width 256
 (eight 32-wide heads with per-head RMSNorm on queries/keys, 1024-wide self-attention FFNs),
 two blocks of map cross-attention → self-attention → global-token LSTM → self-attention,
 256-wide single-layer global LSTMs, and 256-wide team embeddings and policy/value
 hidden layers.
-
-```mermaid
-%%{init: {"flowchart": {"defaultRenderer": "elk", "curve": "linear", "nodeSpacing": 30, "rankSpacing": 45}, "themeVariables": {"fontSize": "14px"}}}%%
-flowchart TB
-    subgraph observation[LuxObservation]
-        own["self<br/>ships + mask · points · wins"]
-        opponent["opponent<br/>visible ships + mask · points · wins"]
-        world["world<br/>map + sensor mask · relics + mask<br/>game and match steps"]
-        params["public_params<br/>move cost · sap cost · sap range · sensor range"]
-    end
-
-    entities["Unordered entity sets + masks<br/>own ships · opponent ships · relic nodes"]
-    context["Global context<br/>scores · wins · progress · parameters<br/>active counts · visibility"]
-
-    subgraph spatial[CNN spatial encoder]
-        map["Map channels<br/>tile embedding · energy · visibility · coordinates"]
-        raster["Entity raster<br/>own/opponent counts + summed energy · relic counts"]
-        cnn["Concatenate 13 channels<br/>3 × 3 convolution + norm + SiLU + residual block"]
-        features["Spatial features<br/>B × W × H × C"]
-        coarse["2 stride-2 convolutions → map tokens<br/>B × P × D; P = W × H / 16"]
-    end
-
-    subgraph encoder[Recurrent set attention]
-        tokens["Entity tokens<br/>type + coordinates + energy for ships<br/>+ spatial features at entity positions"]
-        global["Always-valid global token"]
-        subgraph block_first[LuxAttentionBlock 1]
-            cross["Map cross-attention<br/>entity/global queries · map keys/values · QK RMSNorm"]
-            set_first["Observation self-attention + FFN<br/>aggregate map and entity information"]
-            global_first["Global LSTM + residual token projection"]
-            memory_first["Memory self-attention + FFN<br/>distribute updated global memory to entities"]
-        end
-        subgraph block_second[LuxAttentionBlock 2]
-            cross_second["Map cross-attention<br/>entity/global queries · map keys/values · QK RMSNorm"]
-            set_second["Observation self-attention + FFN<br/>aggregate map and entity information"]
-            global_second["Global LSTM + residual token projection"]
-            memory_second["Memory self-attention + FFN<br/>distribute updated global memory to entities"]
-        end
-        ships["Ship features: B × U × D<br/>row i identifies ship i"]
-        embedding["Team embedding<br/>own/opponent masked means + global token<br/>+ projected map-token mean"]
-    end
-
-    global_carry["Previous global carry + game-start resets<br/>per block: B × Hg"]
-    global_next["Updated global carry for both blocks"]
-
-    subgraph outputs[Policy and value]
-        head["Shared per-ship head<br/>ship i features + team embedding"]
-        choices["Type logits: 3<br/>movement logits: 4"]
-        targets["Sap target keys<br/>project spatial features; gather at ship + offsets<br/>add offset MLP embedding"]
-        sap["Sap logits<br/>ship query · target key / √C"]
-        policy["Masked hierarchical policy<br/>logits: B × U × A · commands: B × U"]
-        critic["Team value head<br/>team embedding<br/>value: B"]
-    end
-    legal["Legal-action masks"]
-
-    own -->|ships| entities
-    opponent -->|ships| entities
-    world -->|relics| entities
-    own -->|scores + counts| context
-    opponent -->|scores + counts| context
-    world -->|progress + visibility| context
-    params --> context
-    world -->|map + sensor mask| map
-    entities --> raster
-    map --> cnn
-    raster --> cnn
-    cnn --> features
-    features --> coarse
-    entities --> tokens
-    features -->|gather| tokens
-    context --> global
-    tokens --> cross
-    global --> cross
-    global_carry --> global_first
-    global_carry --> global_second
-    global_first --> global_next
-    global_second --> global_next
-    coarse --> cross
-    cross --> set_first
-    set_first -->|global token| global_first
-    set_first --> memory_first
-    global_first --> memory_first
-    memory_first --> cross_second
-    coarse --> cross_second
-    cross_second --> set_second
-    set_second -->|global token| global_second
-    set_second --> memory_second
-    global_second --> memory_second
-    memory_second --> ships
-    memory_second --> embedding
-    coarse -->|mean + projection| embedding
-    ships --> head
-    embedding -->|broadcast| head
-    head --> choices
-    head -->|sap queries| sap
-    features --> targets
-    entities -->|own-ship positions| targets
-    targets --> sap
-    choices --> policy
-    sap --> policy
-    legal --> policy
-    embedding --> critic
-```
 
 Token order is global → own ships → opponent ships → relics.
 Reordering own ships permutes policy rows while global carry and value remain
@@ -288,7 +184,7 @@ not model parameter shapes. Rendering scales the board to fit its panel.
   attention, team embeddings, policy/value heads, and global-token LSTMs all use
   width `model.heads * model.head_dim`. Each block uses a single LSTM without
   stacking or intermediate MLPs.
-  `model.attention_implementation` defaults to `triton`: both attention paths
+  `model.attention_implementation` defaults to `triton`: all attention stages
   call Tokamax's Triton kernel.
   Explicit `xla` selects Tokamax's CPU-compatible reference implementation.
   This architecture requires a fresh run directory; previous checkpoints are
