@@ -263,8 +263,7 @@ def test_lux_pool_preserves_structured_observations_and_match_memory(config: ppo
         config,
         env=ppo.LuxConfig(map_size=8, max_units=1, max_steps_in_match=2, match_count=2, randomize_params=False),
         model=ppo.LuxModelConfig(
-            embedding_size=4,
-            channels=4,
+            conv_channels=4,
             heads=2,
             head_dim=2,
             attention_implementation="xla",

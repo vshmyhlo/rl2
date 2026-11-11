@@ -1,3 +1,5 @@
+from functools import partial
+from math import prod
 from typing import Any
 
 import jax
@@ -9,7 +11,8 @@ from jax.sharding import AxisType, Mesh, PartitionSpec
 from luxai_s3.state import MapTile, UnitState
 
 from rl2.envs.lux_env import LuxObservation, LuxTeamObservation, LuxWorldObservation
-from rl2.model.lux import LuxEncoder, _rasterize
+from rl2.model.config import LuxModelConfig
+from rl2.model.lux import LuxEncoder, LuxFeatures, _preprocess_observation, _rasterize
 
 
 @pytest.fixture(scope="module")
@@ -51,24 +54,90 @@ def observation() -> LuxObservation[jax.Array]:
 
 @pytest.fixture(scope="module")
 def encoder() -> LuxEncoder:
-    return LuxEncoder(features=8, token_size=8, channels=4)
+    return LuxEncoder(
+        model=LuxModelConfig(conv_channels=4, num_blocks=1, heads=4, head_dim=2, attention_implementation="xla")
+    )
 
 
 @pytest.fixture(scope="module")
 def params(encoder: LuxEncoder, observation: LuxObservation[jax.Array]) -> dict[str, Any]:
-    return encoder.init(jax.random.key(0), observation)
+    sequence = jax.tree.map(lambda leaf: leaf[None, None], observation)  # leaves: (B=1, T=1, ...)
+    return encoder.init(jax.random.key(0), sequence, encoder.initial_carry(1), jnp.ones((1, 1), bool))
+
+
+def encode_independent(
+    encoder: LuxEncoder,
+    params: dict[str, Any],
+    observation: LuxObservation[jax.Array],  # leaves: (*S, ...)
+) -> LuxFeatures:  # leaves: (*S, ...)
+    """Encode each observation as a one-step sequence with fresh memory."""
+    batch_shape = observation.public_params.shape[:-1]
+    batch_size = prod(batch_shape)
+    sequence = jax.tree.map(
+        lambda leaf: leaf.reshape((batch_size, 1, *leaf.shape[len(batch_shape) :])), observation
+    )  # leaves: (B, T=1, ...)
+    features, _ = encoder.apply(
+        params, sequence, encoder.initial_carry(batch_size), jnp.ones((batch_size, 1), bool)
+    )  # features: (B, T=1, ...); carry leaves: (B, Hg)
+    return jax.tree.map(lambda leaf: leaf.reshape((*batch_shape, *leaf.shape[2:])), features)  # leaves: (*S, ...)
+
+
+@pytest.mark.parametrize("batch_shape", [(), (2, 1)], ids=["unbatched", "batch_and_time"])
+def test_preprocess_observation(observation: LuxObservation[jax.Array], batch_shape: tuple[int, ...]) -> None:
+    observation = jax.tree.map(
+        lambda leaf: jnp.broadcast_to(leaf, (*batch_shape, *leaf.shape)), observation
+    )  # leaves: (*S, ...)
+    actual = jax.jit(_preprocess_observation)(observation)  # leaves: (*S, ...)
+    assert isinstance(actual, LuxObservation)
+    assert jax.tree.structure(actual) == jax.tree.structure(observation)
+    for original, processed in zip(jax.tree.leaves(observation), jax.tree.leaves(actual), strict=True):
+        assert processed.shape == original.shape
+    for original, processed, expected_energy in (
+        (observation.self, actual.self, [0.225, 0.4, 0.0]),
+        (observation.opponent, actual.opponent, [0.1, 0.2, 0.0]),
+    ):
+        assert processed.units.energy.dtype == jnp.float32
+        assert processed.units.position.dtype == original.units.position.dtype
+        np.testing.assert_allclose(
+            processed.units.energy, jnp.broadcast_to(jnp.array(expected_energy), (*batch_shape, 3))
+        )
+        np.testing.assert_array_equal(processed.units.position[..., :2, :], original.units.position[..., :2, :])
+        np.testing.assert_array_equal(processed.units.position[..., 2, :], 0)
+        np.testing.assert_array_equal(processed.units_mask, original.units_mask)
+        np.testing.assert_array_equal(processed.points, original.points)
+        np.testing.assert_array_equal(processed.wins, original.wins)
+        np.testing.assert_array_equal(original.units.energy[..., 2], -1)
+        np.testing.assert_array_equal(original.units.position[..., 2, :], -1)
+    np.testing.assert_array_equal(actual.world.relic_nodes[..., 0, :], observation.world.relic_nodes[..., 0, :])
+    np.testing.assert_array_equal(actual.world.relic_nodes[..., 1, :], 0)
+    unchanged = actual._replace(self=observation.self, opponent=observation.opponent)
+    unchanged = unchanged._replace(world=unchanged.world._replace(relic_nodes=observation.world.relic_nodes))
+    for original, processed in zip(jax.tree.leaves(observation), jax.tree.leaves(unchanged), strict=True):
+        np.testing.assert_array_equal(processed, original)
 
 
 def test_shapes_batch_replay_and_bfloat16(
     encoder: LuxEncoder, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
-    expected = jax.jit(encoder.apply)(params, observation)  # (F=8,)
+    expected = jax.jit(partial(encode_independent, encoder))(
+        params, observation
+    )  # global: (F=8,); ships: (U, D); spatial: (H, W, C)
+    assert expected.global_.shape == (8,)
+    assert expected.ships.shape == (3, 8)
+    assert expected.spatial.shape == (12, 8, 4)
     sequence = jax.tree.map(
         lambda leaf: jnp.broadcast_to(leaf, (2, 2, *leaf.shape)), observation
     )  # leaves: (B, T, ...)
-    actual = jax.jit(encoder.apply)(params, sequence)  # (B, T, F)
-    assert actual.shape == (2, 2, 8) and actual.dtype == jnp.float32
-    encoded = encoder.apply(params, sequence, method="prepare")
+    actual, carry = jax.jit(encoder.apply)(
+        params, sequence, encoder.initial_carry(2), jnp.ones((2, 2), bool)
+    )  # features: (B, T, ...); carry leaves: (B, Hg)
+    assert len(carry.global_) == encoder.model.num_blocks
+    assert all(leaf.shape == (2, 8) and leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(carry))
+    assert actual.global_.shape == (2, 2, 8)
+    assert actual.ships.shape == (2, 2, 3, 8)
+    assert actual.spatial.shape == (2, 2, 12, 8, 4)
+    assert all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(actual))
+    encoded = encoder.apply(params, sequence, method="_prepare")
     expected_mask = jnp.concatenate(
         (
             jnp.ones((2, 2, 1), bool),
@@ -85,12 +154,18 @@ def test_shapes_batch_replay_and_bfloat16(
     np.testing.assert_array_equal(encoded.tokens[~encoded.tokens_mask], 0)
     assert encoded.spatial.shape == (2, 2, 12, 8, 4)
     assert encoded.map_tokens.shape == (2, 2, 6, 8)
-    np.testing.assert_allclose(actual, jnp.broadcast_to(expected, actual.shape), atol=2e-6)
+    for value, reference in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        np.testing.assert_allclose(value, jnp.broadcast_to(reference, value.shape), atol=2e-6)
     steps = jax.tree.map(lambda leaf: leaf[:, 0], sequence)  # leaves: (B, ...)
-    np.testing.assert_allclose(encoder.apply(params, steps), actual[:, 0], atol=2e-6)
-    reduced = jax.jit(encoder.clone(dtype=jnp.bfloat16).apply)(params, steps)  # (B, F)
-    assert reduced.shape == (2, 8) and reduced.dtype == jnp.bfloat16
-    np.testing.assert_allclose(reduced.astype(jnp.float32), actual[:, 0], atol=0.06, rtol=0.06)
+    step_features = encode_independent(encoder, params, steps)  # leaves: (B, ...)
+    reduced = jax.jit(partial(encode_independent, encoder.clone(dtype=jnp.bfloat16)))(params, steps)  # leaves: (B, ...)
+    for value, reference, low_precision in zip(
+        jax.tree.leaves(step_features), jax.tree.leaves(actual), jax.tree.leaves(reduced), strict=True
+    ):
+        assert value.shape == low_precision.shape == reference[:, 0].shape
+        assert low_precision.dtype == jnp.bfloat16
+        np.testing.assert_allclose(value, reference[:, 0], atol=2e-6)
+        np.testing.assert_allclose(low_precision.astype(jnp.float32), reference[:, 0], atol=0.06, rtol=0.06)
 
 
 def test_hidden_values_are_ignored(
@@ -114,7 +189,7 @@ def test_hidden_values_are_ignored(
         ),
     )
     pair = jax.tree.map(lambda *leaves: jnp.stack(leaves), observation, changed)  # leaves: (B=2, ...)
-    outputs = jax.jit(lambda obs: encoder.apply(params, obs, method="encode_features"))(pair)
+    outputs = jax.jit(partial(encode_independent, encoder))(params, pair)  # leaves: (B, ...)
     for leaf in jax.tree.leaves(outputs):
         np.testing.assert_array_equal(leaf[0], leaf[1])
 
@@ -142,10 +217,10 @@ def test_entity_ordering(encoder: LuxEncoder, params: dict[str, Any], observatio
     )
     own_permuted = observation._replace(self=permute(observation.self))
     batch = jax.tree.map(lambda *leaves: jnp.stack(leaves), observation, unordered, own_permuted)  # leaves: (B=3, ...)
-    encoded = encoder.apply(params, batch, method="prepare")  # leaves: (B, ...)
+    encoded = encoder.apply(params, batch, method="_prepare")  # leaves: (B, ...)
     np.testing.assert_allclose(encoded.tokens[1], encoded.tokens[0, jnp.array([0, 1, 2, 3, 5, 4, 6, 8, 7])], atol=2e-6)
     np.testing.assert_allclose(encoded.tokens[2], encoded.tokens[0, jnp.array([0, 2, 1, 3, 4, 5, 6, 7, 8])], atol=2e-6)
-    output = jax.jit(lambda obs: encoder.apply(params, obs, method="encode_features"))(batch)
+    output = jax.jit(partial(encode_independent, encoder))(params, batch)  # leaves: (B, ...)
     np.testing.assert_allclose(output.global_[0], output.global_[1], atol=2e-6)
     np.testing.assert_allclose(output.global_[0], output.global_[2], atol=2e-6)
     np.testing.assert_allclose(output.ships[0], output.ships[1], atol=2e-6)
@@ -188,7 +263,7 @@ def test_visible_inputs_affect_encoding(
         observation._replace(public_params=jnp.array([5, 50, 7, 7], jnp.int16)),
     ]
     batch = jax.tree.map(lambda *leaves: jnp.stack(leaves), observation, *alternatives)  # leaves: (B=10, ...)
-    output = jax.jit(encoder.apply)(params, batch)  # (B, F)
+    output = jax.jit(partial(encode_independent, encoder))(params, batch).global_  # (B, F)
     assert bool(jnp.all(jnp.max(jnp.abs(output[1:] - output[:1]), axis=-1) > 1e-5))
 
 
@@ -196,7 +271,7 @@ def test_gradients_and_empty_observation(
     encoder: LuxEncoder, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
     def objective(variables: dict[str, Any], obs: LuxObservation[jax.Array]) -> jax.Array:  # obs leaves: (...) -> ()
-        output = encoder.apply(variables, obs)  # (F,)
+        output = encode_independent(encoder, variables, obs).global_  # (F,)
         return jnp.vdot(output, jnp.arange(8, dtype=jnp.float32))  # ()
 
     gradient = jax.jit(jax.grad(objective))(params, observation)  # parameter leaves: (...)
@@ -217,7 +292,7 @@ def test_gradients_and_empty_observation(
             relic_nodes_mask=jnp.zeros_like(observation.world.relic_nodes_mask),  # (R,)
         ),
     )
-    output = encoder.apply(params, empty)  # (F,)
+    output = encode_independent(encoder, params, empty).global_  # (F,)
     assert float(jnp.max(jnp.abs(output))) < 3  # Layer-normalized eight-dimensional output.
     empty_gradient = jax.jit(jax.grad(objective))(params, empty)  # parameter leaves: (...)
     assert all(float(jnp.max(jnp.abs(leaf))) < 1e6 for leaf in jax.tree.leaves(empty_gradient))
@@ -239,15 +314,13 @@ def test_entities_gather_height_width_tiles(
 ) -> None:
     obs = jax.tree.map(lambda leaf: leaf[None], observation)  # leaves: (B=1, ...)
     obs = obs._replace(world=obs.world._replace(relic_nodes=obs.world.relic_nodes.at[0, 0].set(jnp.array([5, 8]))))
-    positions = jnp.concatenate((obs.self.units.position, obs.opponent.units.position), axis=1)  # (B, N=6, 2)
-    positions = jnp.maximum(positions, 0)  # (B, N, 2), masked slots at the origin
-    energy = jnp.zeros((1, 6))  # (B, N)
+    obs = _preprocess_observation(obs)  # leaves: (B, ...)
     spatial = jnp.zeros((1, 12, 8, 4))  # (B, H, W, C)
     reference_units, reference_relics = encoder.apply(
-        params, obs, positions, energy, spatial, method="_encode_entities"
+        params, obs, spatial, method="_encode_entities"
     )  # (B, N, 2C); (B, R, 2C)
     units, relics = encoder.apply(
-        params, obs, positions, energy, spatial.at[0, 8, 5].set(1), method="_encode_entities"
+        params, obs, spatial.at[0, 8, 5].set(1), method="_encode_entities"
     )  # (B, N, 2C); (B, R, 2C)
     np.testing.assert_array_equal(
         jnp.any(units != reference_units, axis=-1), [[False, True, False, False, False, False]]
@@ -266,7 +339,7 @@ def test_sharded_encoder_matches_outputs_and_gradients(
     def objective(
         variables: dict[str, Any], obs: LuxObservation[jax.Array]
     ) -> tuple[jax.Array, jax.Array]:  # obs leaves: (B, ...) -> (); (B, F)
-        output = encoder.apply(variables, obs)  # (B, F)
+        output = encode_independent(encoder, variables, obs).global_  # (B, F)
         return jnp.mean(output * jnp.arange(8, dtype=jnp.float32)), output  # (); (B, F)
 
     differentiated = jax.value_and_grad(objective, has_aux=True)
@@ -312,8 +385,8 @@ def test_set_padding_does_not_change_features(
             relic_nodes_mask=observation.world.relic_nodes_mask[:relic_count],  # (R,)
         ),
     )
-    apply = jax.jit(lambda obs: encoder.apply(params, obs, method="encode_features"))
-    reference, actual = apply(padded), apply(compact)
+    apply = jax.jit(partial(encode_independent, encoder))
+    reference, actual = apply(params, padded), apply(params, compact)  # leaves: (...)
     assert actual.ships.shape == (own_count, 8)
     np.testing.assert_allclose(actual.global_, reference.global_, atol=2e-6)
     np.testing.assert_allclose(actual.ships, reference.ships[:own_count], atol=2e-6)

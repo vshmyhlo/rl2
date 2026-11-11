@@ -44,7 +44,7 @@ def test_invalid_encoder(encoder: dict[str, object], field: str) -> None:
     [
         GenericModelConfig(encoder=MLPEncoderConfig(embedding_size=4)),
         LuxModelConfig(
-            channels=4,
+            conv_channels=4,
             num_blocks=3,
             heads=2,
             head_dim=4,
@@ -102,6 +102,12 @@ def test_rejects_separate_ship_recurrence() -> None:
 def test_lux_rejects_separate_recurrent_settings() -> None:
     with pytest.raises(ValidationError, match="recurrent"):
         TypeAdapter(ModelConfig).validate_python({"type": "lux", "recurrent": {"hidden_size": 4}})
+
+
+@pytest.mark.parametrize("field", ["embedding_size", "channels"])
+def test_lux_rejects_removed_width_settings(field: str) -> None:
+    with pytest.raises(ValidationError, match=field):
+        TypeAdapter(ModelConfig).validate_python({"type": "lux", field: 4})
 
 
 @pytest.mark.parametrize("num_blocks", [0, True], ids=["empty_stack", "non_integer"])

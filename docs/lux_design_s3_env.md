@@ -105,13 +105,13 @@ model shapes from the actual pytrees.
 [LuxActorCritic](../src/rl2/model/lux.py) processes each team's visible observation.
 The diagram shows `step` with batch size `B` and `U` own-ship slots;
 `__call__` adds a time axis after `B` and scans the global-token LSTMs over that axis.
-`D` is `model.heads * model.head_dim`; `C` is `model.channels`;
+`D` is `model.heads * model.head_dim`; `C` is `model.conv_channels`;
 `Hg` is the global LSTM width, equal to `D`; `A` is commands per ship (230).
 
-The default model has 4,661,464 parameters: CNN width 64, attention width 256
+The default model has 4,836,696 parameters: CNN width 64, attention width 256
 (eight 32-wide heads with per-head RMSNorm on queries/keys, 1024-wide self-attention FFNs),
 two blocks of global-token LSTM → map cross-attention → self-attention,
-256-wide single-layer global LSTMs, and 192-wide team embeddings and policy/value
+256-wide single-layer global LSTMs, and 256-wide team embeddings and policy/value
 hidden layers.
 
 ```mermaid
@@ -276,11 +276,10 @@ not model parameter shapes. Rendering scales the board to fit its panel.
   permute policy rows; opponent/relic permutations leave commands unchanged.
   Invariant summaries feed the value head. Hidden scoring tiles
   are never inputs, and legality masks preserve the environment's command order.
-- `model.channels` controls CNN width and requires positive even channels;
-  attention width is `model.heads * model.head_dim`.
-  `model.embedding_size` controls team and head widths;
-  each block uses a single global-token LSTM with width `model.heads * model.head_dim`,
-  without stacking or intermediate MLPs.
+- `model.conv_channels` controls CNN width and requires positive even channels;
+  attention, team embeddings, policy/value heads, and global-token LSTMs all use
+  width `model.heads * model.head_dim`. Each block uses a single LSTM without
+  stacking or intermediate MLPs.
   `model.attention_implementation` defaults to `triton`: both attention paths
   call Tokamax's Triton kernel.
   Explicit `xla` selects Tokamax's CPU-compatible reference implementation.

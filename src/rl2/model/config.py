@@ -30,8 +30,7 @@ class GenericModelConfig:
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LuxModelConfig:
     type: Literal["lux"] = "lux"
-    embedding_size: Annotated[int, Field(gt=0, strict=True)] = 192
-    channels: Annotated[int, Field(gt=0, multiple_of=2, strict=True)] = 64
+    conv_channels: Annotated[int, Field(gt=0, multiple_of=2, strict=True)] = 64
     num_blocks: Annotated[int, Field(gt=0, strict=True)] = 2
     heads: Annotated[int, Field(gt=0, strict=True)] = 8
     head_dim: Annotated[int, Field(gt=0, strict=True)] = 32

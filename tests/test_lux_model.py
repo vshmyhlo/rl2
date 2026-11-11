@@ -19,8 +19,9 @@ from rl2.model.lux import (
     LuxActorCritic,
     LuxAttentionBlock,
     LuxCarry,
+    LuxEncoder,
     LuxFeatures,
-    LuxModel,
+    LuxHeads,
     _GlobalMemory,
 )
 
@@ -30,8 +31,7 @@ def model() -> LuxActorCritic:
     return LuxActorCritic(
         action_space=HierarchicalMultiDiscreteSpace(nvec=(14,) * 3, group_sizes=(1, 4, 9)),
         model=LuxModelConfig(
-            embedding_size=8,
-            channels=4,
+            conv_channels=4,
             heads=4,
             head_dim=2,
             attention_implementation="xla",
@@ -95,7 +95,7 @@ def test_recurrent_modules_return_output_and_carry(model: LuxActorCritic, params
         head_dim=model.model.head_dim,
     )
     carry = block.initial_carry(actor_count=1)  # leaves: (B, Hg)
-    variables = params["params"]["block_0"]
+    variables = params["params"]["encoder"]["block_0"]
     global_result = jax.jit(_GlobalMemory(features=model.model.heads * model.model.head_dim).apply)(
         {"params": variables["global_memory"]}, tokens[..., 0, :], carry, jnp.ones((1, 2), bool)
     )  # token: (B, T, D); carry: (B, Hg)
@@ -239,8 +239,8 @@ def test_empty_team_has_no_policy_gradient(
 def test_sap_scores_follow_relative_target_coordinates(
     model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
-    network = LuxModel(embedding_size=8, token_size=8, channels=4, action_space=model.action_space)
-    variables = jax.tree.map(lambda leaf: leaf, params["params"]["lux"])
+    network = LuxHeads(features=8, conv_channels=4, action_space=model.action_space)
+    variables = jax.tree.map(lambda leaf: leaf, params["params"]["heads"])
     variables["sap_query"] = {"kernel": jnp.zeros((8, 4)), "bias": jnp.ones(4)}
     variables["sap_key"] = {"kernel": jnp.zeros((4, 4)).at[0].set(1), "bias": jnp.zeros(4)}
     variables["sap_offset"] = jax.tree.map(jnp.zeros_like, variables["sap_offset"])
@@ -248,7 +248,7 @@ def test_sap_scores_follow_relative_target_coordinates(
     spatial = jnp.zeros((1, 12, 8, 4)).at[0, :, :, 0].set(10 * x + y)  # (B, H, W, C)
     features = LuxFeatures(global_=jnp.zeros((1, 8)), ships=jnp.zeros((1, 3, 8)), spatial=spatial)
     obs = jax.tree.map(lambda leaf: leaf[None], observation)  # leaves: (B, ...)
-    policy, value = network.apply({"params": variables}, features, obs, action_mask(obs), method="heads")
+    policy, value = network.apply({"params": variables}, features, obs, action_mask(obs))
     # First ship is at (1, 2); offsets enumerate x first, then y, matching Lux's command IDs.
     np.testing.assert_allclose(policy.raw_logits[0, 0, 7:], 2 * jnp.array([1, 2, 3, 11, 12, 13, 21, 22, 23]))
     assert value.shape == (1,)
@@ -258,13 +258,12 @@ def test_sap_offsets_can_prefer_nearby_targets_symmetrically(
     model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
     # Reuse parameters with a wider sap range; identical tile features isolate offset scoring.
-    network = LuxModel(
-        embedding_size=8,
-        token_size=8,
-        channels=4,
+    network = LuxHeads(
+        features=8,
+        conv_channels=4,
         action_space=HierarchicalMultiDiscreteSpace(nvec=(30,) * 3, group_sizes=(1, 4, 25)),
     )
-    variables = jax.tree.map(lambda leaf: leaf, params["params"]["lux"])
+    variables = jax.tree.map(lambda leaf: leaf, params["params"]["heads"])
     variables["sap_query"] = {
         "kernel": jnp.zeros((8, 4)),  # (F, C)
         "bias": jnp.array([1.0, 0, 0, 0]),  # (C,)
@@ -282,7 +281,7 @@ def test_sap_offsets_can_prefer_nearby_targets_symmetrically(
     )
     obs = jax.tree.map(lambda leaf: leaf[None], observation)  # leaves: (B, ...)
     masks = jnp.broadcast_to(obs.self.units_mask[..., None], (1, 3, 30)).at[..., 0].set(True)  # (B, U, A)
-    policy, value = network.apply({"params": variables}, features, obs, masks, method="heads")
+    policy, value = network.apply({"params": variables}, features, obs, masks)
     assert policy.logits.shape == (1, 3, 30) and value.shape == (1,)
     scores = policy.raw_logits[0, 0, 7:].reshape((5, 5))  # (dx, dy), center is offset (0, 0)
     assert float(scores[2, 2]) > float(scores[2, 3]) > float(scores[2, 4]) > float(scores[4, 4])
@@ -294,8 +293,8 @@ def test_sap_offsets_can_prefer_nearby_targets_symmetrically(
 def test_bfloat16_sap_preserves_close_target_scores(
     model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
-    network = LuxModel(embedding_size=8, token_size=8, channels=4, action_space=model.action_space, dtype=jnp.bfloat16)
-    variables = jax.tree.map(lambda leaf: leaf, params["params"]["lux"])
+    network = LuxHeads(features=8, conv_channels=4, action_space=model.action_space, dtype=jnp.bfloat16)
+    variables = jax.tree.map(lambda leaf: leaf, params["params"]["heads"])
     variables["sap_query"] = {"kernel": jnp.zeros((8, 4)), "bias": jnp.ones(4)}  # (F, C); (C,)
     variables["sap_key"] = {"kernel": jnp.eye(4), "bias": jnp.zeros(4)}  # (C, C); (C,)
     variables["sap_offset"] = jax.tree.map(jnp.zeros_like, variables["sap_offset"])
@@ -346,14 +345,18 @@ def test_single_ship_small_map_reuses_parameters(
     "groups", [(1, 2, 9), (1, 4, 8), (1, 4, 4), (1, 4, 1)], ids=["move_count", "non_square", "even_side", "zero_range"]
 )
 def test_rejects_incompatible_command_groups(groups: tuple[int, ...], observation: LuxObservation[jax.Array]) -> None:
-    model = LuxModel(
-        embedding_size=8,
-        token_size=8,
-        channels=4,
+    model = LuxHeads(
+        features=8,
+        conv_channels=4,
         action_space=HierarchicalMultiDiscreteSpace(nvec=(sum(groups),) * 3, group_sizes=groups),
     )
+    features = LuxFeatures(
+        global_=jnp.zeros(8),  # (F,)
+        ships=jnp.zeros((3, 8)),  # (U, D)
+        spatial=jnp.zeros((12, 8, 4)),  # (H, W, C)
+    )
     with pytest.raises(ValueError, match="stay/move/sap"):
-        model.init(jax.random.key(0), observation, method="encode")
+        model.init(jax.random.key(0), features, observation, action_mask(observation))
 
 
 def test_sharded_policy_and_value_gradients(
@@ -392,13 +395,13 @@ def test_sharded_policy_and_value_gradients(
         "type_output",
         "value_output",
     ):
-        magnitude = sum(float(jnp.abs(leaf).sum()) for leaf in jax.tree.leaves(actual[1]["params"]["lux"][name]))
+        magnitude = sum(float(jnp.abs(leaf).sum()) for leaf in jax.tree.leaves(actual[1]["params"]["heads"][name]))
         assert 0 < magnitude < 1e6
     for index in range(model.model.num_blocks):
         for name in ("global_memory", "map_attention", "set_attention"):
-            leaves = jax.tree.leaves(actual[1]["params"][f"block_{index}"][name])
+            leaves = jax.tree.leaves(actual[1]["params"]["encoder"][f"block_{index}"][name])
             assert 0 < sum(float(jnp.abs(leaf).sum()) for leaf in leaves) < 1e6
-    relic_gradient = actual[1]["params"]["lux"]["encoder"]["relic_projection"]
+    relic_gradient = actual[1]["params"]["encoder"]["relic_projection"]
     assert 0 < sum(float(jnp.abs(leaf).sum()) for leaf in jax.tree.leaves(relic_gradient)) < 1e6
     assert actual[0][1].addressable_shards[0].data.shape == (1, 1)
 
@@ -406,14 +409,19 @@ def test_sharded_policy_and_value_gradients(
 def test_each_policy_row_uses_its_own_ship_features(
     model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:
-    network = LuxModel(embedding_size=8, token_size=8, channels=4, action_space=model.action_space)
-    variables = {"params": params["params"]["lux"]}
+    network = LuxHeads(features=8, conv_channels=4, action_space=model.action_space)
+    variables = {"params": params["params"]["heads"]}
     obs = jax.tree.map(lambda leaf: leaf[None], observation)  # leaves: (B=1, ...)
-    features = network.apply(variables, obs, method="encode")
+    encoder = LuxEncoder(model=model.model)
+    sequence = jax.tree.map(lambda leaf: leaf[:, None], obs)  # leaves: (B=1, T=1, ...)
+    features, _ = encoder.apply(
+        {"params": params["params"]["encoder"]}, sequence, encoder.initial_carry(1), jnp.ones((1, 1), bool)
+    )  # features: (B, T, ...)
+    features = jax.tree.map(lambda leaf: leaf[:, 0], features)  # leaves: (B, ...)
     changed = features._replace(ships=features.ships.at[:, 0].add(jnp.arange(8)))  # (B, U, D)
 
     def heads(encoded: LuxFeatures) -> tuple[jax.Array, jax.Array]:
-        policy, value = network.apply(variables, encoded, obs, action_mask(obs), method="heads")
+        policy, value = network.apply(variables, encoded, obs, action_mask(obs))
         return policy.raw_logits, value  # (B, U, L); (B,)
 
     expected_logits, expected_value = heads(features)  # (B, U, L); (B,)
@@ -428,7 +436,7 @@ def test_global_history_reaches_heads_only_through_tokens(
 ) -> None:
     variables = jax.tree.map(lambda leaf: leaf, params)
     for index in range(model.model.num_blocks):
-        projection = variables["params"][f"block_{index}"]["global_memory"]["output"]
+        projection = variables["params"]["encoder"][f"block_{index}"]["global_memory"]["output"]
         projection["kernel"] = jnp.zeros_like(projection["kernel"])  # (Hg, D)
     sequence = jax.tree.map(lambda leaf: leaf[None, None], observation)  # leaves: (B=1, T=1, ...)
     carry = history(model, 1)
@@ -490,9 +498,10 @@ def test_global_history_survives_match_changes_and_absent_ships_but_not_game_res
     memory = history(model, 3)
     changed = memory._replace(global_=jax.tree.map(lambda leaf: leaf + 2, memory.global_))  # (B, Hg)
     starts = jnp.zeros((3, 3), bool).at[:, -1].set(True)  # (B, T)
-    encode = jax.jit(model.apply, static_argnames="method")
-    expected, expected_carry = encode(params, sequence, memory, starts, method="_encode")
-    actual, actual_carry = encode(params, sequence, changed, starts, method="_encode")
+    encode = jax.jit(LuxEncoder(model=model.model).apply)
+    variables = {"params": params["params"]["encoder"]}
+    expected, expected_carry = encode(variables, sequence, memory, starts)
+    actual, actual_carry = encode(variables, sequence, changed, starts)
     # Rows cover ordinary history, a match boundary, and an entirely absent team.
     difference = jnp.max(jnp.abs(actual.global_[:, :2] - expected.global_[:, :2]), axis=-1)  # (B, T=2)
     assert bool((difference > 1e-5).all())
@@ -571,14 +580,15 @@ def test_history_conditions_the_following_attention(
     def capture(module: nn.Module, method: str) -> bool:
         return method == "__call__" and module.name in {"map_attention", "set_attention"}
 
+    encoder = LuxEncoder(model=model.model)
+
     @jax.jit
     def attend(carry: LuxCarry) -> AttentionOutputs:  # carry leaves: (B, ...)
-        _, state = model.apply(
-            params,
+        _, state = encoder.apply(
+            {"params": params["params"]["encoder"]},
             sequence,
             carry,
             jnp.zeros((1, 1), bool),
-            method="_encode",
             capture_intermediates=capture,
             mutable=["intermediates"],
         )
@@ -624,7 +634,7 @@ def test_configurable_block_depth(
     )
     for index in range(num_blocks):
         assert {"global_memory", "token_type_embedding", "input_norm", "map_attention", "set_attention"} == set(
-            variables["params"][f"block_{index}"]
+            variables["params"]["encoder"][f"block_{index}"]
         )
 
 
@@ -643,11 +653,16 @@ def test_attention_width_is_independent_of_cnn_channels(
     )
     assert output.policy.raw_logits.shape == (1, 1, 3, 16)
     assert output.value.shape == (1, 1)
-    encoder = variables["params"]["lux"]["encoder"]
+    encoder = variables["params"]["encoder"]
     assert all(leaf.shape == (1, model.model.heads * model.model.head_dim) for leaf in jax.tree.leaves(output_carry))
     assert encoder["ship_projection"]["kernel"].shape == (7, 6)
     assert encoder["map_encoder"]["map_downsample_1"]["kernel"].shape == (3, 3, 6, 6)
+    assert encoder["map_projection"]["kernel"].shape == (6, 6)
+    assert encoder["output_projection"]["kernel"].shape == (24, 6)
+    heads = variables["params"]["heads"]
+    assert heads["ship_hidden"]["kernel"].shape == (12, 6)
+    assert heads["value_hidden"]["kernel"].shape == (6, 6)
     for index in range(model.model.num_blocks):
-        attention = variables["params"][f"block_{index}"]["set_attention"]
+        attention = variables["params"]["encoder"][f"block_{index}"]["set_attention"]
         assert attention["ffn_in"]["kernel"].shape == (6, 24)
         assert attention["ffn_out"]["kernel"].shape == (24, 6)

@@ -1035,10 +1035,10 @@ def test_lux_model_requires_matching_environment(config: ppo.Config, lux_env: bo
         )
 
 
-@pytest.mark.parametrize("channels", [0, 3], ids=["nonpositive", "incompatible_attention_width"])
-def test_lux_model_requires_positive_even_channels(channels: int) -> None:
-    with pytest.raises(ValueError, match="channels"):
-        ppo.LuxModelConfig(channels=channels)
+@pytest.mark.parametrize("conv_channels", [0, 3], ids=["nonpositive", "odd_channels"])
+def test_lux_model_requires_positive_even_conv_channels(conv_channels: int) -> None:
+    with pytest.raises(ValueError, match="conv_channels"):
+        ppo.LuxModelConfig(conv_channels=conv_channels)
 
 
 def test_default_lux_parameter_budget_and_output_shapes() -> None:
@@ -1058,12 +1058,18 @@ def test_default_lux_parameter_budget_and_output_shapes() -> None:
     )
     assert config.heads == 8 and config.head_dim == 32
     token_size = config.heads * config.head_dim
+    assert token_size == 256
+    encoder = variables["params"]["encoder"]
+    heads = variables["params"]["heads"]
+    assert encoder["output_projection"]["kernel"].shape == (4 * token_size, token_size)
+    assert heads["ship_hidden"]["kernel"].shape == (2 * token_size, token_size)
+    assert heads["value_hidden"]["kernel"].shape == (token_size, token_size)
     for index in range(config.num_blocks):
-        block = variables["params"][f"block_{index}"]
+        block = variables["params"]["encoder"][f"block_{index}"]
         for attention in (block["map_attention"], block["set_attention"]["attention"]):
             assert attention["query"]["kernel"].shape == (token_size, config.heads, config.head_dim)
             assert attention["out"]["kernel"].shape == (config.heads, config.head_dim, token_size)
-    assert 4_600_000 <= sum(leaf.size for leaf in jax.tree.leaves(variables["params"])) <= 4_700_000
+    assert 4_800_000 <= sum(leaf.size for leaf in jax.tree.leaves(variables["params"])) <= 4_900_000
     assert output.policy.raw_logits.shape == (1, 1, 1, 232)
     assert jax.eval_shape(lambda policy: policy.logits, output.policy).shape == (1, 1, 1, 230)
     assert output.value.shape == (1, 1) and output.value.dtype == jnp.float32
@@ -1076,8 +1082,7 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
         config,
         env=LuxConfig(map_size=128, max_units=2, max_steps_in_match=2, match_count=1, randomize_params=False),
         model=ppo.LuxModelConfig(
-            embedding_size=4,
-            channels=4,
+            conv_channels=4,
             heads=4,
             head_dim=2,
             attention_implementation="xla",
