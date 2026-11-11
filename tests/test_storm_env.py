@@ -110,7 +110,9 @@ def test_update_and_playback() -> None:
         num_minibatches=1,
         update_epochs=1,
         total_env_steps=1,
-        model=ppo.ModelConfig(encoder=ppo.MLPEncoderConfig(embedding_size=4), recurrent=ppo.LSTMConfig(hidden_size=4)),
+        model=ppo.GenericModelConfig(
+            encoder=ppo.MLPEncoderConfig(embedding_size=4), recurrent=ppo.LSTMConfig(hidden_size=4)
+        ),
     )
     env = ppo.make_env(config)
     observation, state = jax.vmap(env.reset)(

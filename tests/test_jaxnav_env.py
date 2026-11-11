@@ -151,7 +151,9 @@ def test_jaxnav_rollout_timeout_update_and_evaluation(env: JaxNavEnv, state: Sta
         gamma=0.5,
         gae_lambda=1.0,
         target_kl=None,
-        model=ppo.ModelConfig(encoder=ppo.MLPEncoderConfig(embedding_size=4), recurrent=ppo.LSTMConfig(hidden_size=4)),
+        model=ppo.GenericModelConfig(
+            encoder=ppo.MLPEncoderConfig(embedding_size=4), recurrent=ppo.LSTMConfig(hidden_size=4)
+        ),
     )
     model = ppo.ActorCritic(env.action_space, config.model)
     memory = model.initial_carry(2)  # leaves: (B=2, H=4)

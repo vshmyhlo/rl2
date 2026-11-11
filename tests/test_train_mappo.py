@@ -52,7 +52,9 @@ def config() -> ppo.Config:
         bf16=False,
         video_interval=0,
         eval_interval=0,
-        model=ppo.ModelConfig(encoder=ppo.MLPEncoderConfig(embedding_size=4), recurrent=ppo.LSTMConfig(hidden_size=4)),
+        model=ppo.GenericModelConfig(
+            encoder=ppo.MLPEncoderConfig(embedding_size=4), recurrent=ppo.LSTMConfig(hidden_size=4)
+        ),
     )
 
 
@@ -1005,27 +1007,27 @@ def test_hierarchical_model_masks_and_sequence_replay(config: ppo.Config) -> Non
     )
 
 
-@pytest.mark.parametrize("lux_env", [False, True], ids=["lux-encoder-other-env", "lux-env-mlp-encoder"])
-def test_lux_encoder_requires_matching_environment(config: ppo.Config, lux_env: bool) -> None:
-    with pytest.raises(ValueError, match="lux encoder"):
+@pytest.mark.parametrize("lux_env", [False, True], ids=["lux-model-other-env", "lux-env-generic-model"])
+def test_lux_model_requires_matching_environment(config: ppo.Config, lux_env: bool) -> None:
+    with pytest.raises(ValueError, match="lux model"):
         replace(
             config,
             env=LuxConfig() if lux_env else config.env,
-            model=config.model if lux_env else replace(config.model, encoder=ppo.LuxEncoderConfig()),
+            model=config.model if lux_env else ppo.LuxModelConfig(recurrent=config.model.recurrent),
         )
 
 
 @pytest.mark.parametrize("channels", [0, 3], ids=["nonpositive", "incompatible_attention_width"])
-def test_lux_encoder_requires_positive_even_channels(channels: int) -> None:
+def test_lux_model_requires_positive_even_channels(channels: int) -> None:
     with pytest.raises(ValueError, match="channels"):
-        ppo.LuxEncoderConfig(channels=channels)
+        ppo.LuxModelConfig(channels=channels)
 
 
 def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Path) -> None:
     config = replace(
         config,
         env=LuxConfig(map_size=128, max_units=2, max_steps_in_match=2, match_count=1, randomize_params=False),
-        model=replace(config.model, encoder=ppo.LuxEncoderConfig(embedding_size=4, channels=4)),
+        model=ppo.LuxModelConfig(embedding_size=4, channels=4, recurrent=config.model.recurrent),
         num_envs=1,
         num_steps=3,
         num_minibatches=1,
@@ -1036,7 +1038,7 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
     loaded = ppo.load_config(path, ppo.Config)
     env = ppo.make_env(loaded)
     assert isinstance(env, LuxEnv) and env.num_agents == 2
-    assert isinstance(loaded.model.encoder, ppo.LuxEncoderConfig)
+    assert isinstance(loaded.model, ppo.LuxModelConfig)
     with pytest.raises(ValueError, match="num_agents"):
         ppo.make_env(replace(loaded, num_minibatches=3))
     observation, state = jax.jit(jax.vmap(env.reset))(jax.random.split(jax.random.key(0), 1))
@@ -1046,7 +1048,6 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
     starts = jnp.ones(2, dtype=bool)  # (B,)
     sequence = jax.tree.map(lambda leaf: jnp.swapaxes(leaf, 0, 1), observation)  # (B, T=1, ...)
     params = model.init(jax.random.key(1), sequence.observation, memory, starts[:, None], sequence.actions_mask)
-    assert params["params"]["policy_output"]["bias"].shape == (2 * 232,)
     train_state = TrainState.create(apply_fn=model.apply, params=params["params"], tx=optax.adam(0.001))
     runner = ppo.RolloutCarry(
         env_state=state,
@@ -1185,7 +1186,7 @@ def test_historical_playback_uses_separate_weights_and_current_team_reward(confi
 def test_historical_eval_metrics_and_artifacts(config: ppo.Config, returns: list[float], best_index: int) -> None:
     episodes = len(returns)
     config = replace(
-        config, env=LuxConfig(), model=replace(config.model, encoder=ppo.LuxEncoderConfig()), eval_episodes=episodes
+        config, env=LuxConfig(), model=ppo.LuxModelConfig(recurrent=config.model.recurrent), eval_episodes=episodes
     )
     writer = Mock()
     memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
@@ -1246,7 +1247,7 @@ def test_training_evaluates_exact_historical_iterations(config: ppo.Config) -> N
     config = replace(
         config,
         env=LuxConfig(),
-        model=replace(config.model, encoder=ppo.LuxEncoderConfig()),
+        model=ppo.LuxModelConfig(recurrent=config.model.recurrent),
         total_env_steps=401 * 4,
         eval_interval=100,
         log_interval=1000,

@@ -138,15 +138,20 @@ The 128×128 preset uses 32 minibatches to limit encoder activation memory.
   absolute coordinates are retained.
   `LuxEnv.observation_space` describes one player's tree with
   `ShapeDtypeStruct` leaves, excluding action masks.
-- MAPPO's `model.encoder.type: lux` uses tile-type embeddings, normalized tile
+- MAPPO's `model.type: lux` uses tile-type embeddings, normalized tile
   energy, visibility, coordinates, and separate ship/relic spatial channels.
   A residual CNN provides local ship features and a map downsampled by four for four-head
-  ship-to-map attention. Own ship slots retain their order; opponent ships are
-  pooled and relics rasterized, making their slot order irrelevant. Projected
+  ship-to-map attention. Shared ship heads preserve command-slot order; masked means of both teams
+  feed team memory, so slot permutations preserve the value and permute commands.
+  Relics are rasterized. Sap scores combine ship queries, full-resolution target
+  map features, and relative target offsets; separate heads select action type
+  and movement direction. Legal-action masks retain the environment's command order. Projected
   public context includes scores, wins, progress, costs/ranges, and visible counts.
   Hidden fields are masked before encoding; relic scoring tiles are never inputs.
-  `channels` (default 16, positive even integer) controls CNN width; attention
-  width is twice that. `embedding_size` controls the final team embedding.
+  `model.channels` (default 16, positive even integer) controls CNN width; attention
+  width is twice that. `model.embedding_size` controls team embeddings and policy/value hidden widths.
+  `model.recurrent` controls the shared team LSTM. Omitting `model.type` selects
+  `generic`, which retains the flat MLP and dense heads for other environments.
   Continuous features use fixed physical scales (tile energy 20, ship energy
   400, wins 5, game/match steps 505/100); scores also receive a log transform.
   These scales do not impose limits on configured game lengths.

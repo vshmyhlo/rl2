@@ -8,7 +8,7 @@ from jax.sharding import AxisType, Mesh, PartitionSpec
 from luxai_s3.state import MapTile, UnitState
 
 from rl2.envs.lux_env import LuxObservation, LuxTeamObservation, LuxWorldObservation
-from rl2.model.encoders.lux import LuxEncoder, _rasterize
+from rl2.model.lux import LuxEncoder, _rasterize
 
 
 @pytest.fixture(scope="module")
@@ -118,7 +118,7 @@ def test_entity_ordering(encoder: LuxEncoder, params: dict[str, Any], observatio
     batch = jax.tree.map(lambda *leaves: jnp.stack(leaves), observation, unordered, own_permuted)  # leaves: (B=3, ...)
     output = jax.jit(encoder.apply)(params, batch)  # (B, F)
     np.testing.assert_allclose(output[0], output[1], atol=2e-6)
-    assert float(jnp.max(jnp.abs(output[0] - output[2]))) > 1e-3
+    np.testing.assert_allclose(output[0], output[2], atol=2e-6)
 
 
 def test_visible_inputs_affect_encoding(

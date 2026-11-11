@@ -1,11 +1,13 @@
-"""Spatial and entity encoding of the acting team's visible Lux observation."""
+"""Lux team policy with shared ship decisions and spatial sap-target scores."""
 
-from math import prod
+from math import isqrt, prod, sqrt
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from rl2.actions import HierarchicalMultiCategoricalPolicy, HierarchicalMultiDiscreteSpace
 from rl2.envs.lux_env import LuxObservation
 from rl2.model.encoders.conv2d import ResidualBlock
 
@@ -24,8 +26,14 @@ def _rasterize(
     return grid.at[jnp.arange(positions.shape[0])[:, None], positions[..., 0], positions[..., 1]].add(values)
 
 
+class LuxFeatures(NamedTuple):
+    global_features: jax.Array  # (*S, F), invariant to ship slot ordering
+    ships: jax.Array  # (*S, U, 2C), equivariant to own ship slot ordering
+    spatial: jax.Array  # (*S, W, H, C), full-resolution map features
+
+
 class LuxEncoder(nn.Module):
-    """CNN map features plus ship-to-map attention, with ordered own-ship slots.
+    """CNN map features plus ship-to-map attention.
 
     Opponent/relic slot permutations are immaterial; own-ship order identifies
     action components. All hidden fields are masked before feature extraction.
@@ -35,8 +43,11 @@ class LuxEncoder(nn.Module):
     channels: int = 16
     dtype: jax.typing.DTypeLike = jnp.float32
 
-    @nn.compact
     def __call__(self, observation: LuxObservation[jax.Array]) -> jax.Array:  # leaves: (*S, ...) -> (*S, F)
+        return self.encode_features(observation).global_features  # (*S, F)
+
+    @nn.compact
+    def encode_features(self, observation: LuxObservation[jax.Array]) -> LuxFeatures:  # leaves: (*S, ...)
         batch_shape = observation.public_params.shape[:-1]
         batch_size = prod(batch_shape)
         obs = jax.tree.map(lambda leaf: leaf.reshape((batch_size, *leaf.shape[len(batch_shape) :])), observation)
@@ -92,6 +103,7 @@ class LuxEncoder(nn.Module):
         grid = nn.Conv(features=self.channels, kernel_size=(3, 3), dtype=self.dtype, name="map_stem")(grid)
         grid = nn.silu(nn.LayerNorm(dtype=self.dtype, name="map_norm")(grid))  # (B, W, H, C)
         grid = ResidualBlock(channels=self.channels, dtype=self.dtype, name="map_local")(grid)  # (B, W, H, C)
+        spatial_features = grid  # (B, W, H, C), retained for command target scoring
         local = grid[jnp.arange(batch_size)[:, None], positions[..., 0], positions[..., 1]]  # (B, 2U, C)
         for index in range(2):
             grid = nn.Conv(
@@ -137,14 +149,90 @@ class LuxEncoder(nn.Module):
         )  # (B, 2U+1, 2C); global map access without quadratic attention over all tiles
         queries = nn.LayerNorm(dtype=self.dtype, name="attention_norm")(queries + attended)  # (B, 2U+1, 2C)
         units = jnp.where(unit_mask[..., None], queries[:, :-1], 0)  # (B, 2U, 2C)
-        own = units[:, :unit_count].reshape((batch_size, -1))  # (B, U*2C), retain command-slot identity
+        own = units[:, :unit_count]  # (B, U, 2C)
+        own_mean = own.sum(1) / jnp.maximum(obs.self.units_mask.sum(-1, keepdims=True), 1)  # (B, 2C)
         opponents = units[:, unit_count:]  # (B, U, 2C)
         opponent_mean = opponents.sum(1) / jnp.maximum(obs.opponent.units_mask.sum(-1, keepdims=True), 1)  # (B, 2C)
-        # Flatten the coarse map to retain absolute spatial layout for the team-level output head.
+        # Coordinates and attention preserve spatial information without map-size-dependent parameters.
         spatial = nn.silu(
-            nn.Dense(features=self.features, dtype=self.dtype, name="map_projection")(grid.reshape((batch_size, -1)))
+            nn.Dense(features=self.features, dtype=self.dtype, name="map_projection")(grid.mean(axis=(1, 2)))
         )  # (B, F)
-        combined = jnp.concatenate((own, opponent_mean, queries[:, -1], spatial), axis=-1)  # (B, U*2C+4C+F)
+        combined = jnp.concatenate((own_mean, opponent_mean, queries[:, -1], spatial), axis=-1)  # (B, 6C+F)
         output = nn.Dense(features=self.features, dtype=self.dtype, name="output_projection")(combined)  # (B, F)
         output = nn.LayerNorm(dtype=self.dtype, name="output_norm")(output)  # (B, F)
-        return output.reshape((*batch_shape, self.features))  # (*S, F)
+        return LuxFeatures(
+            global_features=output.reshape((*batch_shape, self.features)),  # (*S, F)
+            ships=own.reshape((*batch_shape, unit_count, token_size)),  # (*S, U, 2C)
+            spatial=spatial_features.reshape((*batch_shape, width, height, self.channels)),  # (*S, W, H, C)
+        )
+
+
+class LuxModel(nn.Module):
+    """Encode visible state; decode team memory into ship commands and a team value."""
+
+    embedding_size: int
+    channels: int
+    action_space: HierarchicalMultiDiscreteSpace
+    dtype: jax.typing.DTypeLike = jnp.float32
+
+    def setup(self) -> None:
+        groups = self.action_space.group_sizes
+        side = isqrt(groups[-1])
+        if len(groups) != 3 or groups[:2] != (1, 4) or side < 3 or side % 2 != 1 or side * side != groups[-1]:
+            raise ValueError("Lux requires stay/move/sap groups (1, 4, odd_square) with sap range >= 1")
+        self.sap_range = side // 2
+        self.encoder = LuxEncoder(features=self.embedding_size, channels=self.channels, dtype=self.dtype)
+        self.ship_hidden = nn.Dense(features=self.embedding_size, dtype=self.dtype)
+        self.ship_norm = nn.LayerNorm(dtype=self.dtype)
+        self.type_output = nn.Dense(features=3, kernel_init=nn.initializers.orthogonal(0.01), dtype=self.dtype)
+        self.move_output = nn.Dense(features=4, kernel_init=nn.initializers.orthogonal(0.01), dtype=self.dtype)
+        self.sap_query = nn.Dense(
+            features=self.channels, kernel_init=nn.initializers.orthogonal(0.01), dtype=self.dtype
+        )
+        self.sap_key = nn.Dense(features=self.channels, dtype=self.dtype)
+        self.sap_offset = nn.Dense(features=self.channels, use_bias=False, dtype=self.dtype)
+        self.value_hidden = nn.Dense(features=self.embedding_size, dtype=self.dtype)
+        self.value_norm = nn.LayerNorm(dtype=self.dtype)
+        self.value_output = nn.Dense(features=1, kernel_init=nn.initializers.orthogonal(1.0), dtype=self.dtype)
+
+    def encode(self, observation: LuxObservation[jax.Array]) -> LuxFeatures:  # leaves: (*S, ...)
+        return self.encoder.encode_features(observation)  # leaves: (*S, ...)
+
+    def heads(
+        self,
+        memory: jax.Array,  # (*S, H)
+        features: LuxFeatures,  # global: (*S, F); ships: (*S, U, 2C); spatial: (*S, W, Hmap, C)
+        observation: LuxObservation[jax.Array],  # leaves: (*S, ...)
+        actions_mask: jax.Array,  # (*S, U, A)
+    ) -> tuple[HierarchicalMultiCategoricalPolicy, jax.Array]:  # logits: (*S, U, A); value: (*S,)
+        batch_shape = memory.shape[:-1]
+        batch_size = prod(batch_shape)
+        unit_count = features.ships.shape[-2]
+        width, height = features.spatial.shape[-3:-1]
+        team_memory = jnp.broadcast_to(memory[..., None, :], (*batch_shape, unit_count, memory.shape[-1]))  # (*S, U, H)
+        ships = jnp.concatenate((features.ships, team_memory), axis=-1)  # (*S, U, 2C+H)
+        ships = nn.silu(self.ship_norm(self.ship_hidden(ships)))  # (*S, U, F)
+        types = self.type_output(ships).astype(jnp.float32)  # (*S, U, 3), stay/move/sap
+        moves = self.move_output(ships).astype(jnp.float32)  # (*S, U, 4), north/east/south/west
+
+        # Match LuxEnv's x-major, y-minor relative target enumeration.
+        axis = jnp.arange(-self.sap_range, self.sap_range + 1)  # (2R+1,)
+        offsets = jnp.stack(jnp.meshgrid(axis, axis, indexing="ij"), axis=-1).reshape((-1, 2))  # (K, 2)
+        positions = jnp.where(observation.self.units_mask[..., None], observation.self.units.position, 0)  # (*S, U, 2)
+        targets = positions.reshape((batch_size, unit_count, 1, 2)) + offsets  # (B, U, K, 2)
+        targets = jnp.clip(targets, 0, jnp.array([width - 1, height - 1]))  # (B, U, K, 2); off-map commands are masked
+        keys = self.sap_key(features.spatial).reshape((batch_size, width, height, self.channels))  # (B, W, Hmap, C)
+        keys = keys[jnp.arange(batch_size)[:, None, None], targets[..., 0], targets[..., 1]]  # (B, U, K, C)
+        relative = self.sap_offset(offsets.astype(self.dtype) / self.sap_range)  # (K, C)
+        keys = keys + relative  # (B, U, K, C)
+        queries = self.sap_query(ships).reshape((batch_size, unit_count, self.channels))  # (B, U, C)
+        sap = jnp.einsum("bukc,buc->buk", keys, queries).astype(jnp.float32) / sqrt(self.channels)  # (B, U, K)
+        sap = sap.reshape((*batch_shape, unit_count, offsets.shape[0]))  # (*S, U, K)
+        logits = jnp.concatenate((types, moves, sap), axis=-1)  # (*S, U, 7+K)
+        policy = HierarchicalMultiCategoricalPolicy(
+            raw_logits=logits, actions_mask=actions_mask, group_sizes=self.action_space.group_sizes
+        )
+        context = jnp.concatenate((memory, features.global_features), axis=-1)  # (*S, H+F)
+        critic = nn.silu(self.value_norm(self.value_hidden(context)))  # (*S, F)
+        value = self.value_output(critic).squeeze(-1).astype(jnp.float32)  # (*S,)
+        return policy, value

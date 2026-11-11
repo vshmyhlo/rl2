@@ -2,13 +2,13 @@
 # Run: uv run mappo --config configs/mappo/lux.yaml
 env:
   id: luxai_s3
-  map_size: 32
+  map_size: 16
   max_units: 16
   max_steps_in_match: 100
   match_count: 5
   randomize_params: true
-seed: 4
-total_env_steps: 10_000_000
+seed: 6
+total_env_steps: 100_000_000
 # Two GPUs: 16 environments each; one recurrent sequence per minibatch per GPU.
 num_envs: 32
 # Covers the full five-match, 505-step game.
@@ -17,10 +17,9 @@ num_steps: 128
 num_minibatches: 4
 update_epochs: 4
 model:
-  encoder:
-    type: lux
-    embedding_size: 128
-    channels: 16
+  type: lux
+  embedding_size: 128
+  channels: 16
   recurrent:
     hidden_size: 128
     num_layers: 1
@@ -39,15 +38,20 @@ entropy_decay: constant
 value_coef: 1.0
 max_grad_norm: 0.5
 ckpt_dir: /runs/mappo/${run_id}
-# The spatial/entity encoder requires a fresh checkpoint.
-run_id: mappo_lux_spatial_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
+# The ship/target policy requires a fresh checkpoint.
+run_id: mappo_lux_ship_selfplay_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
 # Intervals count training iterations.
 log_interval: 1
 video_interval: 0
 video_fps: 10
 # Approximately 10% of training: ceil(10_000_000 / (32 * 256) * 0.1).
-checkpoint_interval: 100
+checkpoint_interval: 200
 # Both teams share the policy; mean self-play return cannot measure strength.
-eval_interval: 100
+eval_interval: 400
 eval_episodes: 100
 eval_seed: 10000
+
+selfplay:
+  pool_size: 8
+  snapshot_interval: 100
+  current_policy_fraction: 0.5
