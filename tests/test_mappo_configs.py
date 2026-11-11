@@ -6,7 +6,7 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 from test_train_mappo import config as config  # noqa: PLC0414
 
-from rl2.train_mappo import Config, GenericModelConfig, LuxModelConfig, MLPEncoderConfig, ModelConfig
+from rl2.train_mappo import Config, GenericModelConfig, LSTMConfig, LuxModelConfig, MLPEncoderConfig, ModelConfig
 
 
 @pytest.mark.parametrize(
@@ -40,7 +40,11 @@ def test_invalid_encoder(encoder: dict[str, object], field: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "config", [GenericModelConfig(encoder=MLPEncoderConfig(embedding_size=4)), LuxModelConfig(channels=4)]
+    "config",
+    [
+        GenericModelConfig(encoder=MLPEncoderConfig(embedding_size=4)),
+        LuxModelConfig(channels=4, ship_recurrent=LSTMConfig(hidden_size=6, num_layers=2, intermediate_size=8)),
+    ],
 )
 def test_model_round_trip(config: GenericModelConfig | LuxModelConfig) -> None:
     adapter = TypeAdapter(ModelConfig)
@@ -83,3 +87,9 @@ def test_rejects_separate_environment_sections(config: Config) -> None:
 def test_rejects_invalid_model_variant(settings: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         TypeAdapter(ModelConfig).validate_python(settings)
+
+
+@pytest.mark.parametrize("field", ["hidden_size", "num_layers", "intermediate_size"])
+def test_rejects_invalid_ship_recurrence(field: str) -> None:
+    with pytest.raises(ValidationError, match=field):
+        TypeAdapter(ModelConfig).validate_python({"type": "lux", "ship_recurrent": {field: -1}})

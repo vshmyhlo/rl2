@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import tokamax  # noqa: F401 - load Triton before jaxmarl imports TensorFlow
 import yaml
 from flax.training.train_state import TrainState
 from jaxmarl.environments.smax.heuristic_enemy_smax_env import State
@@ -913,6 +914,8 @@ def test_training_resume_wiring_and_environment_step_logging(
     assert scalars["checkpoint/save_seconds"] == (2.5, 10)
     assert "train/explained_variance_mean" not in scalars
     assert "train/kl_early_stop_fraction" not in scalars
+    assert "train/pool_param_iteration_min" not in scalars
+    assert "train/pool_param_iteration_max" not in scalars
     for name in ("iterations", "env_steps", "observations", "episodes"):
         assert scalars[f"train/{name}_per_second"][0] > 0
     save.assert_called_once()
@@ -1043,7 +1046,11 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
         config,
         env=LuxConfig(map_size=128, max_units=2, max_steps_in_match=2, match_count=1, randomize_params=False),
         model=ppo.LuxModelConfig(
-            embedding_size=4, channels=4, recurrent=config.model.recurrent, attention_implementation="xla"
+            embedding_size=4,
+            channels=4,
+            recurrent=config.model.recurrent,
+            ship_recurrent=ppo.LSTMConfig(hidden_size=4),
+            attention_implementation="xla",
         ),
         num_envs=1,
         num_steps=3,

@@ -104,8 +104,8 @@ model shapes from the actual pytrees.
 
 [LuxActorCritic](../src/rl2/model/lux.py) processes each team's visible observation.
 The diagram shows `step` with batch size `B` and `U` own-ship slots;
-`__call__` adds a time axis after `B` and scans the team LSTM over that axis.
-`C` is `model.channels`; `A` is the number of commands per ship (230).
+`__call__` adds a time axis after `B` and scans the team and ship LSTMs over that axis.
+`C` is `model.channels`; `Hs` is the ship LSTM width; `A` is commands per ship (230).
 
 ```mermaid
 %%{init: {"flowchart": {"defaultRenderer": "elk", "curve": "linear", "nodeSpacing": 30, "rankSpacing": 45}, "themeVariables": {"fontSize": "14px"}}}%%
@@ -128,28 +128,34 @@ flowchart TB
         coarse["2 stride-2 convolutions → map tokens<br/>B × P × 2C; P = W × H / 16"]
     end
 
-    subgraph encoder[Set attention]
+    subgraph encoder[Recurrent set attention]
         tokens["Entity tokens<br/>type + coordinates + energy for ships<br/>+ spatial features at entity positions"]
         global["Always-valid global token"]
         cross["Map cross-attention<br/>entity/global queries · map keys/values"]
-        sets["2 × masked bidirectional self-attention + FFN<br/>4 heads · Tokamax/Triton · no slot embeddings"]
+        ship_first["Ship LSTM 1 + residual token projection<br/>own slots only; other entities pass through"]
+        set_first["Self-attention 1 + FFN<br/>masked · bidirectional · 4 heads · Tokamax/Triton"]
+        ship_second["Ship LSTM 2 + residual token projection<br/>own slots only; other entities pass through"]
+        set_second["Self-attention 2 + FFN<br/>masked · bidirectional · 4 heads · Tokamax/Triton"]
         ships["Ship features: B × U × 2C<br/>row i identifies ship i"]
         embedding["Team embedding<br/>own/opponent masked means + global token<br/>+ projected map-token mean"]
     end
 
+    ship_carry["Previous ship carry + lifetime resets<br/>two stages; cell/hidden per layer: B × U × Hs"]
+    ship_next["Updated ship carry for both stages<br/>inactive slots zeroed"]
+
     subgraph recurrent[Team memory]
         carry["Incoming carry + episode-start reset"]
         lstm["Team LSTM<br/>ReLU + projection of team embedding"]
-        next["Outgoing carry"]
+        next["Outgoing team carry"]
     end
 
     subgraph outputs[Policy and value]
-        head["Shared per-ship head<br/>ship i features + team memory"]
+        head["Shared per-ship head<br/>ship i features + ship i memory + team memory"]
         choices["Type logits: 3<br/>movement logits: 4"]
-        targets["Sap target keys<br/>project spatial features; gather at ship + offsets<br/>add relative-offset embedding"]
+        targets["Sap target keys<br/>project spatial features; gather at ship + offsets<br/>add offset MLP embedding"]
         sap["Sap logits<br/>ship query · target key / √C"]
         policy["Masked hierarchical policy<br/>logits: B × U × A · commands: B × U"]
-        critic["Team value head<br/>team embedding + memory<br/>value: B"]
+        critic["Team value head<br/>team embedding + team memory + pooled ship memory<br/>value: B"]
     end
     legal["Legal-action masks"]
 
@@ -169,16 +175,25 @@ flowchart TB
     entities --> tokens
     features -->|gather| tokens
     context --> global
-    tokens --> cross
+    tokens --> ship_first
+    ship_first --> cross
+    ship_carry -->|reset stage 1| ship_first
+    ship_carry -->|reset stage 2| ship_second
+    ship_first -->|stage 1 state| ship_next
+    ship_second -->|stage 2 state| ship_next
     global --> cross
     coarse --> cross
-    cross --> sets
-    sets --> ships
-    sets --> embedding
+    cross --> set_first
+    set_first --> ship_second
+    ship_second --> set_second
+    set_second --> ships
+    set_second --> embedding
     coarse -->|mean + projection| embedding
     embedding --> lstm
     carry --> lstm
     lstm --> next
+    ship_second -->|ship i memory| head
+    ship_second -->|masked mean of memory| critic
     ships --> head
     lstm -->|broadcast memory| head
     head --> choices
@@ -193,10 +208,22 @@ flowchart TB
     lstm --> critic
 ```
 
-Reordering own ships reorders policy rows; opponent/relic permutations leave
-the policy unchanged. Team embeddings, carry, and values are invariant to all
-three permutations. Masked padding does not affect valid entities. Attention
-mixes entities within each observation; temporal history flows through the LSTM.
+Own ships use stable native slots across time. Reordering ships requires the
+same permutation of their carry and lifecycle metadata; policy rows and ship
+carry follow that permutation, while team carry and value remain invariant.
+Opponent/relic ordering and masked padding do not affect outputs. Ship LSTM 1
+conditions map cross-attention and the first self-attention block; ship LSTM 2
+conditions the second block. Their weights and states are independent across
+stages, with weights shared across ships. Each stage scans time independently;
+CNN and attention remain batched over timesteps, equivalent to repeated `step`.
+History communicated to other ships or team memory can persist after a ship dies.
+
+Both ship-memory stages reset before their output enters attention on game
+starts, match changes, absent/negative-energy ships, and newly active slots. Boundary frames retain no ship state. Native Lux can
+kill and respawn a slot within one step without an absent observation, so a
+spawn-corner ship with initial energy on a spawn tick is conservatively reset.
+This can also reset a survivor with the same signature; no hidden state is used.
+Team memory persists across ship deaths and matches and resets with the game.
 
 ## rl2 integration
 
@@ -244,15 +271,20 @@ The 128×128 preset uses 32 minibatches to limit encoder activation memory.
   heads and residual feed-forward layers. Masks exclude hidden/absent entities;
   an always-valid global token handles empty sets. Padding capacity does not
   affect features; active ship counts use a fixed scale of 16.
-- Each own-ship token retains its input row through attention and feeds shared
-  action-type, movement, and sap-query heads together with team memory. Sap
-  scores use target-map features and relative offsets. Reordering own ships
-  reorders their commands; opponent/relic permutations leave commands unchanged.
+- Each own-ship token retains its input row through two recurrent stages:
+  one before map cross-attention and one between the self-attention blocks.
+  Each LSTM output is projected and added to its own-ship token. The final
+  tokens, second-stage ship memory, and team memory feed the command heads.
+  Sap scores use target-map features plus an offset MLP: normalized
+  `[dx, dy, |dx|, |dy|]` → Dense(C) → SiLU → Dense(C). Ship permutations
+  include their recurrent state; opponent/relic permutations leave commands unchanged.
   Invariant summaries feed the team LSTM and value head. Hidden scoring tiles
   are never inputs, and legality masks preserve the environment's command order.
 - `model.channels` controls CNN width; attention width is twice that and requires
   positive even channels. `model.embedding_size` controls team and head widths;
-  `model.recurrent` configures team memory. `model.attention_implementation`
+  `model.recurrent` configures team memory; `model.ship_recurrent` configures
+  hidden size, layer count, and intermediate MLP size for each of the two ship
+  stages. `model.attention_implementation`
   defaults to `triton`: both attention paths call Tokamax's Triton kernel.
   Explicit `xla` selects Tokamax's CPU-compatible reference implementation.
   This architecture requires a fresh run directory; previous checkpoints are
@@ -261,10 +293,11 @@ The 128×128 preset uses 32 minibatches to limit encoder activation memory.
   constructs `GenericActorCritic` or `LuxActorCritic`, both implementing
   `BaseActorCritic` with their own observation and policy types.
 - PPO computes one joint log probability and one value per **team**. Log
-  probabilities and entropies sum over ship commands; batches and recurrent
-  memory retain two agent sequences per environment, not 32 ship sequences.
+  probabilities and entropies sum over ship commands. PPO batches retain two
+  team sequences per environment; each carry contains team state `(B, H)`,
+  two stages of ship state `(B, U, Hs)`, and lifecycle metadata `(B, U)` / `(B,)`.
 - Rewards are increments in match wins: the match winner receives 1 and the
-  other team 0. Memory persists through ship deaths and match boundaries.
+  other team 0. Team memory persists through ship deaths and match boundaries.
   Completing the whole game is treated as terminal, with no value bootstrap,
   even though upstream labels it a truncation. Same-step autoreset preserves
   final observations/state and samples fresh game parameters.

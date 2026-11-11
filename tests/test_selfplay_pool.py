@@ -11,9 +11,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import tokamax  # noqa: F401 - load Triton before environment helpers import TensorFlow
 import yaml
 from flax.training.train_state import TrainState
 from jax.sharding import AxisType, Mesh, PartitionSpec
+from ppo_helpers import metric_history
 from test_train_mappo import config as config  # noqa: PLC0414
 
 from rl2 import train_mappo as ppo
@@ -262,7 +264,11 @@ def test_lux_pool_preserves_structured_observations_and_match_memory(config: ppo
         config,
         env=ppo.LuxConfig(map_size=8, max_units=1, max_steps_in_match=2, match_count=2, randomize_params=False),
         model=ppo.LuxModelConfig(
-            embedding_size=4, channels=4, recurrent=config.model.recurrent, attention_implementation="xla"
+            embedding_size=4,
+            channels=4,
+            recurrent=config.model.recurrent,
+            ship_recurrent=ppo.LSTMConfig(hidden_size=4),
+            attention_implementation="xla",
         ),
         num_envs=1,
         num_steps=4,
@@ -307,14 +313,15 @@ def test_lux_pool_preserves_structured_observations_and_match_memory(config: ppo
 def test_training_restores_pool_inserts_snapshots_and_saves(config: ppo.Config) -> None:
     config = replace(
         config,
-        selfplay=SelfPlayConfig(pool_size=2, snapshot_interval=1, current_policy_fraction=1),
+        selfplay=SelfPlayConfig(pool_size=3, snapshot_interval=1, current_policy_fraction=1),
         num_minibatches=1,
-        total_env_steps=16,
+        total_env_steps=20,
+        log_interval=1,
     )
     calls = []
 
     def restore(manager: Any, state: TrainState, settings: ppo.Config) -> ppo.TrainingProgress:
-        pool = init_pool(jax.tree.map(lambda leaf: leaf - 1, state.params), 2)
+        pool = init_pool(jax.tree.map(lambda leaf: leaf - 1, state.params), 3)
         return ppo.TrainingProgress(
             train_state=state,
             key=jax.random.key(1),
@@ -339,7 +346,7 @@ def test_training_restores_pool_inserts_snapshots_and_saves(config: ppo.Config) 
     ) -> ppo.TrainStepResult:
         # runner leaves: (E, ...)/(E*N, H); key/step/metric leaves: (); pool leaves: (K, ...)
         calls.append(int(environment_step_count))
-        np.testing.assert_array_equal(pool.iteration, [0, -1] if len(calls) == 1 else [0, 3])
+        np.testing.assert_array_equal(pool.iteration, ([0, -1, -1], [0, 3, -1], [0, 3, 4])[len(calls) - 1])
         np.testing.assert_array_equal(runner.selfplay.opponent, -1)
         if len(calls) == 1:
             chex.assert_trees_all_close(jax.tree.map(lambda leaf: leaf[0] + 1, pool.params), state.params, atol=1e-7)
@@ -351,14 +358,17 @@ def test_training_restores_pool_inserts_snapshots_and_saves(config: ppo.Config) 
         patch.object(ppo, "make_env", return_value=Duel()),
         patch.object(ppo, "checkpoint_manager"),
         patch.object(ppo, "restore_checkpoint", side_effect=restore),
-        patch.object(ppo, "MLflowLogger"),
+        patch.object(ppo, "MLflowLogger") as logger,
         patch.object(ppo, "train_step_with_pool_donated", side_effect=step),
         patch.object(ppo, "train_step_donated") as ordinary,
         patch.object(ppo, "save_checkpoint", return_value=0.0) as save,
     ):
         ppo.train(config)
-    assert calls == [8, 12]
+    assert calls == [8, 12, 16]
+    history = metric_history(logger.return_value)
+    assert history["train/pool_param_iteration_min"] == [(0.0, 12), (0.0, 16), (0.0, 20)]
+    assert history["train/pool_param_iteration_max"] == [(3.0, 12), (4.0, 16), (5.0, 20)]
     ordinary.assert_not_called()
     progress = save.call_args.args[1]
-    assert progress.environment_step_count == 16 and progress.observation_count == 32
-    np.testing.assert_array_equal(progress.opponent_pool.iteration, [0, 4])
+    assert progress.environment_step_count == 20 and progress.observation_count == 40
+    np.testing.assert_array_equal(progress.opponent_pool.iteration, [0, 5, 4])

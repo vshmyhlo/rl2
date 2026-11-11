@@ -7,7 +7,7 @@ env:
   max_steps_in_match: 100
   match_count: 5
   randomize_params: true
-seed: 6
+seed: 7
 total_env_steps: 100_000_000
 # Two GPUs: 16 environments each; one recurrent sequence per minibatch per GPU.
 num_envs: 32
@@ -25,6 +25,11 @@ model:
     hidden_size: 128
     num_layers: 1
     intermediate_size: 0
+  # Each of two stages: before map attention and between self-attention blocks.
+  ship_recurrent:
+    hidden_size: 64
+    num_layers: 1
+    intermediate_size: 0
 bf16: false
 learning_rate: 0.0003
 anneal_lr: true
@@ -39,8 +44,8 @@ entropy_decay: constant
 value_coef: 1.0
 max_grad_norm: 0.5
 ckpt_dir: /runs/mappo/${run_id}
-# The entity-set attention policy requires a fresh checkpoint.
-run_id: mappo_lux_set_selfplay_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
+# Interleaved recurrent attention requires a fresh checkpoint.
+run_id: mappo_lux_recurrent_attention_selfplay_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
 # Intervals count training iterations.
 log_interval: 1
 video_interval: 0

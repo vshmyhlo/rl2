@@ -34,6 +34,7 @@ class LuxModelConfig:
     channels: Annotated[int, Field(gt=0, multiple_of=2, strict=True)] = 16
     attention_implementation: Literal["triton", "xla"] = "triton"
     recurrent: LSTMConfig = LSTMConfig()
+    ship_recurrent: LSTMConfig = LSTMConfig(hidden_size=64)
 
 
 def _default_model_type(value: Any) -> Any:
