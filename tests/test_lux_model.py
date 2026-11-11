@@ -215,6 +215,31 @@ def test_sap_offsets_can_prefer_nearby_targets_symmetrically(
     np.testing.assert_allclose(scores, scores.T, atol=1e-6)
 
 
+def test_bfloat16_sap_preserves_close_target_scores(
+    model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
+) -> None:
+    network = LuxModel(embedding_size=8, channels=4, action_space=model.action_space, dtype=jnp.bfloat16)
+    variables = jax.tree.map(lambda leaf: leaf, params["params"]["lux"])
+    variables["sap_query"] = {"kernel": jnp.zeros((8, 4)), "bias": jnp.ones(4)}  # (F, C); (C,)
+    variables["sap_key"] = {"kernel": jnp.eye(4), "bias": jnp.zeros(4)}  # (C, C); (C,)
+    variables["sap_offset"] = jax.tree.map(jnp.zeros_like, variables["sap_offset"])
+    spatial = (
+        jnp.zeros((1, 8, 12, 4), jnp.bfloat16)
+        .at[..., 0]
+        .set(1)
+        .at[0, :, :, 1]
+        .set(jnp.arange(8, dtype=jnp.bfloat16)[:, None] / 256)
+    )  # (B, W, H, C)
+    obs = jax.tree.map(lambda leaf: leaf[None], observation)  # leaves: (B, ...)
+    scores = network.apply(
+        {"params": variables}, jnp.zeros((1, 3, 8), jnp.bfloat16), spatial, obs, method="_sap_logits"
+    )  # (B, U, K)
+    assert scores.shape == (1, 3, 9) and scores.dtype == jnp.float32
+    # Each component is representable in bf16; rounding the dot product would tie x=0 and x=1.
+    expected = jnp.repeat(0.5 + jnp.arange(3, dtype=jnp.float32) / 512, 3)  # (K,)
+    np.testing.assert_array_equal(scores[0, 0], expected)
+
+
 def test_single_ship_small_map_reuses_parameters(
     model: LuxActorCritic, params: dict[str, Any], observation: LuxObservation[jax.Array]
 ) -> None:

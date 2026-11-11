@@ -42,6 +42,26 @@ def _rasterize(
     return grid.at[jnp.arange(positions.shape[0])[:, None], positions[..., 0], positions[..., 1]].add(values)
 
 
+def _global_context(observation: LuxObservation[jax.Array]) -> jax.Array:  # leaves: (B, ...) -> (B, 14)
+    """Public scores, progress, game parameters, visible counts, and coverage."""
+    # Fixed physical scales, not observed batch statistics; keep relative score and progress explicit.
+    scores = jnp.stack((observation.self.points, observation.opponent.points), axis=-1).astype(jnp.float32)  # (B, 2)
+    context = jnp.concatenate(
+        (
+            jnp.log1p(scores) / 8.0,
+            (scores[:, :1] - scores[:, 1:]) / 100.0,
+            jnp.stack((observation.self.wins, observation.opponent.wins), axis=-1) / 5.0,
+            observation.world.steps[:, None] / 505.0,
+            observation.world.match_steps[:, None] / 100.0,
+            observation.public_params / jnp.array([5.0, 50.0, 7.0, 7.0]),
+            jnp.stack((observation.self.units_mask.sum(-1), observation.opponent.units_mask.sum(-1)), axis=-1) / 16.0,
+            observation.world.sensor_mask.mean(axis=(-2, -1))[:, None],
+        ),
+        axis=-1,
+    )  # (B, 14)
+    return context  # (B, 14)
+
+
 class _Attention(nn.Module):
     """Four-head noncausal attention; Triton pads narrow heads for tensor cores."""
 
@@ -214,25 +234,37 @@ class LuxEncoder(nn.Module):
         self.map_projection = nn.Dense(features=self.features, dtype=self.dtype, name="map_projection")
         self.output_projection = nn.Dense(features=self.features, dtype=self.dtype, name="output_projection")
         self.output_norm = nn.LayerNorm(dtype=self.dtype, name="output_norm")
+        self.tile_embedding = nn.Embed(num_embeddings=4, features=4, dtype=self.dtype, name="tile_embedding")
+        self.map_stem = nn.Conv(features=self.channels, kernel_size=(3, 3), dtype=self.dtype, name="map_stem")
+        self.map_norm = nn.LayerNorm(dtype=self.dtype, name="map_norm")
+        self.map_local = ResidualBlock(channels=self.channels, dtype=self.dtype, name="map_local")
+        self.map_downsample = tuple(
+            nn.Conv(
+                features=token_size, kernel_size=(3, 3), strides=(2, 2), dtype=self.dtype, name=f"map_downsample_{i}"
+            )
+            for i in range(2)
+        )
+        self.map_downsample_norm = tuple(
+            nn.LayerNorm(dtype=self.dtype, name=f"map_downsample_norm_{i}") for i in range(2)
+        )
+        self.ship_projection = nn.Dense(features=token_size, dtype=self.dtype, name="ship_projection")
+        self.relic_projection = nn.Dense(features=token_size, dtype=self.dtype, name="relic_projection")
+        self.entity_type_embedding = nn.Embed(
+            num_embeddings=3, features=token_size, dtype=self.dtype, name="entity_type_embedding"
+        )
+        self.context_projection = nn.Dense(features=token_size, dtype=self.dtype, name="context_projection")
 
-    @nn.compact
-    def prepare(self, observation: LuxObservation[jax.Array]) -> _LuxTokens:  # leaves: (*S, ...)
-        batch_shape = observation.public_params.shape[:-1]
-        batch_size = prod(batch_shape)
-        obs = jax.tree.map(lambda leaf: leaf.reshape((batch_size, *leaf.shape[len(batch_shape) :])), observation)
-        # obs leaves: (B, ...), B = prod(S), including unbatched B=1
+    def _encode_map(
+        self,
+        obs: LuxObservation[jax.Array],  # leaves: (B, ...)
+        positions: jax.Array,  # (B, N, 2), masked positions replaced with zero
+        energy: jax.Array,  # (B, N), normalized and zero for masked ships
+        unit_mask: jax.Array,  # (B, N), own ships followed by opponents
+    ) -> tuple[jax.Array, jax.Array]:  # spatial: (B, W, H, C); map tokens: (B, P, 2C)
         visible = obs.world.sensor_mask  # (B, W, H)
-        width, height = visible.shape[-2:]
+        batch_size, width, height = visible.shape
         unit_count = obs.self.units_mask.shape[-1]
-        opponent_count = obs.opponent.units_mask.shape[-1]
         token_size = 2 * self.channels
-        positions, energy, unit_mask = jax.tree.map(
-            lambda own, opponent: jnp.concatenate((own, opponent), axis=1),
-            (obs.self.units.position, obs.self.units.energy, obs.self.units_mask),
-            (obs.opponent.units.position, obs.opponent.units.energy, obs.opponent.units_mask),
-        )  # (B, N, 2); (B, N); (B, N)
-        positions = jnp.where(unit_mask[..., None], positions, 0)  # (B, N, 2)
-        energy = jnp.where(unit_mask, energy, 0).astype(jnp.float32) / 400.0  # (B, N)
         ship_values = jnp.stack((jnp.ones_like(energy), energy), axis=-1)  # (B, N, 2), count/total energy
         own_grid = _rasterize(
             positions[:, :unit_count], unit_mask[:, :unit_count], ship_values[:, :unit_count], width, height
@@ -251,8 +283,7 @@ class LuxEncoder(nn.Module):
         tile_ids = jnp.where(
             visible, obs.world.map_features.tile_type + 1, 0
         )  # (B, W, H), unknown/empty/nebula/asteroid
-        tile_embedding = nn.Embed(num_embeddings=4, features=4, dtype=self.dtype, name="tile_embedding")(tile_ids)
-        # tile_embedding: (B, W, H, 4)
+        tile_embedding = self.tile_embedding(tile_ids)  # (B, W, H, 4)
         tile_energy = jnp.where(visible, obs.world.map_features.energy, 0).astype(jnp.float32) / 20.0  # (B, W, H)
         coordinates = jnp.stack(
             jnp.meshgrid(jnp.linspace(-1, 1, width), jnp.linspace(-1, 1, height), indexing="ij"), axis=-1
@@ -270,28 +301,33 @@ class LuxEncoder(nn.Module):
             ),
             axis=-1,
         ).astype(self.dtype)  # (B, W, H, 13)
-        grid = nn.Conv(features=self.channels, kernel_size=(3, 3), dtype=self.dtype, name="map_stem")(grid)
-        grid = nn.silu(nn.LayerNorm(dtype=self.dtype, name="map_norm")(grid))  # (B, W, H, C)
-        grid = ResidualBlock(channels=self.channels, dtype=self.dtype, name="map_local")(grid)  # (B, W, H, C)
+        grid = self.map_stem(grid)  # (B, W, H, C)
+        grid = nn.silu(self.map_norm(grid))  # (B, W, H, C)
+        grid = self.map_local(grid)  # (B, W, H, C)
         spatial_features = grid  # (B, W, H, C), retained for command target scoring
-        local = grid[jnp.arange(batch_size)[:, None], positions[..., 0], positions[..., 1]]  # (B, N, C)
         for index in range(2):
-            grid = nn.Conv(
-                features=token_size,
-                kernel_size=(3, 3),
-                strides=(2, 2),
-                dtype=self.dtype,
-                name=f"map_downsample_{index}",
-            )(grid)  # (B, ceil(W/2**(i+1)), ceil(H/2**(i+1)), 2C)
-            grid = nn.silu(nn.LayerNorm(dtype=self.dtype, name=f"map_downsample_norm_{index}")(grid))
+            grid = self.map_downsample[index](grid)  # (B, ceil(W/2**(i+1)), ceil(H/2**(i+1)), 2C)
+            grid = nn.silu(self.map_downsample_norm[index](grid))  # (B, ceil(W/2**(i+1)), ceil(H/2**(i+1)), 2C)
         map_tokens = grid.reshape((batch_size, -1, token_size))  # (B, P, 2C), P=36 for a 24x24 map
 
+        return spatial_features, map_tokens  # (B, W, H, C); (B, P, 2C)
+
+    def _encode_entities(
+        self,
+        obs: LuxObservation[jax.Array],  # leaves: (B, ...)
+        positions: jax.Array,  # (B, N, 2), masked positions replaced with zero
+        energy: jax.Array,  # (B, N), normalized and zero for masked ships
+        spatial_features: jax.Array,  # (B, W, H, C)
+    ) -> tuple[jax.Array, jax.Array]:  # ships: (B, N, 2C); relics: (B, R, 2C)
+        batch_size, width, height, _ = spatial_features.shape
+        unit_count = obs.self.units_mask.shape[-1]
+        opponent_count = obs.opponent.units_mask.shape[-1]
+        local = spatial_features[jnp.arange(batch_size)[:, None], positions[..., 0], positions[..., 1]]  # (B, N, C)
         unit_coordinates = positions.astype(jnp.float32) / jnp.array([width - 1, height - 1]) * 2 - 1  # (B, N, 2)
         unit_features = jnp.concatenate((unit_coordinates, energy[..., None], local), axis=-1)  # (B, N, C+3)
-        units = nn.Dense(features=token_size, dtype=self.dtype, name="ship_projection")(unit_features)  # (B, N, 2C)
+        units = self.ship_projection(unit_features)  # (B, N, 2C)
         roles = jnp.concatenate((jnp.zeros(unit_count, jnp.int32), jnp.ones(opponent_count, jnp.int32)))  # (N,)
-        type_embedding = nn.Embed(num_embeddings=3, features=token_size, dtype=self.dtype, name="entity_type_embedding")
-        role_embedding = type_embedding(roles)  # (N, 2C)
+        role_embedding = self.entity_type_embedding(roles)  # (N, 2C)
         units = nn.silu(units + role_embedding)  # (B, N, 2C)
 
         relic_positions = jnp.where(obs.world.relic_nodes_mask[..., None], obs.world.relic_nodes, 0)  # (B, R, 2)
@@ -303,28 +339,30 @@ class LuxEncoder(nn.Module):
         )  # (B, R, 2)
         relic_features = jnp.concatenate((relic_coordinates, relic_local), axis=-1)  # (B, R, C+2)
         relics = nn.silu(
-            nn.Dense(features=token_size, dtype=self.dtype, name="relic_projection")(relic_features)
-            + type_embedding(jnp.asarray(2))
+            self.relic_projection(relic_features) + self.entity_type_embedding(jnp.asarray(2))
         )  # (B, R, 2C)
 
-        # Fixed physical scales, not observed batch statistics; keep relative score and progress explicit.
-        scores = jnp.stack((obs.self.points, obs.opponent.points), axis=-1).astype(jnp.float32)  # (B, 2)
-        context = jnp.concatenate(
-            (
-                jnp.log1p(scores) / 8.0,
-                (scores[:, :1] - scores[:, 1:]) / 100.0,
-                jnp.stack((obs.self.wins, obs.opponent.wins), axis=-1) / 5.0,
-                obs.world.steps[:, None] / 505.0,
-                obs.world.match_steps[:, None] / 100.0,
-                obs.public_params / jnp.array([5.0, 50.0, 7.0, 7.0]),
-                jnp.stack((obs.self.units_mask.sum(-1), obs.opponent.units_mask.sum(-1)), axis=-1) / 16.0,
-                visible.mean(axis=(-2, -1))[:, None],
-            ),
-            axis=-1,
-        )  # (B, 14)
-        context = nn.silu(
-            nn.Dense(features=token_size, dtype=self.dtype, name="context_projection")(context)
-        )  # (B, 2C)
+        return units, relics  # (B, N, 2C); (B, R, 2C)
+
+    def prepare(self, observation: LuxObservation[jax.Array]) -> _LuxTokens:  # leaves: (*S, ...)
+        batch_shape = observation.public_params.shape[:-1]
+        batch_size = prod(batch_shape)
+        obs = jax.tree.map(lambda leaf: leaf.reshape((batch_size, *leaf.shape[len(batch_shape) :])), observation)
+        # obs leaves: (B, ...), B = prod(S), including unbatched B=1
+        visible = obs.world.sensor_mask  # (B, W, H)
+        width, height = visible.shape[-2:]
+        token_size = 2 * self.channels
+        positions, energy, unit_mask = jax.tree.map(
+            lambda own, opponent: jnp.concatenate((own, opponent), axis=1),
+            (obs.self.units.position, obs.self.units.energy, obs.self.units_mask),
+            (obs.opponent.units.position, obs.opponent.units.energy, obs.opponent.units_mask),
+        )  # (B, N, 2); (B, N); (B, N)
+        positions = jnp.where(unit_mask[..., None], positions, 0)  # (B, N, 2)
+        energy = jnp.where(unit_mask, energy, 0).astype(jnp.float32) / 400.0  # (B, N)
+        spatial_features, map_tokens = self._encode_map(obs, positions, energy, unit_mask)  # (B, W, H, C); (B, P, 2C)
+        units, relics = self._encode_entities(obs, positions, energy, spatial_features)  # (B, N, 2C); (B, R, 2C)
+        context = _global_context(obs)  # (B, 14)
+        context = nn.silu(self.context_projection(context))  # (B, 2C)
         tokens = jnp.concatenate((units, relics, context[:, None]), axis=1)  # (B, E=N+R+1, 2C)
         valid = jnp.concatenate(
             (unit_mask, obs.world.relic_nodes_mask, jnp.ones((batch_size, 1), bool)), axis=1
@@ -416,6 +454,36 @@ class LuxModel(nn.Module):
     def encode(self, observation: LuxObservation[jax.Array]) -> LuxFeatures:  # leaves: (*S, ...)
         return self.encoder.encode_features(observation)  # leaves: (*S, ...)
 
+    def _sap_logits(
+        self,
+        ships: jax.Array,  # (*S, U, F)
+        spatial: jax.Array,  # (*S, W, H, C)
+        observation: LuxObservation[jax.Array],  # leaves: (*S, ...)
+    ) -> jax.Array:  # (*S, U, K)
+        batch_shape = ships.shape[:-2]
+        batch_size = prod(batch_shape)
+        unit_count = ships.shape[-2]
+        width, height = spatial.shape[-3:-1]
+        # Match LuxEnv's x-major, y-minor relative target enumeration.
+        axis = jnp.arange(-self.sap_range, self.sap_range + 1)  # (2R+1,)
+        offsets = jnp.stack(jnp.meshgrid(axis, axis, indexing="ij"), axis=-1).reshape((-1, 2))  # (K, 2)
+        positions = jnp.where(observation.self.units_mask[..., None], observation.self.units.position, 0)  # (*S, U, 2)
+        targets = positions.reshape((batch_size, unit_count, 1, 2)) + offsets  # (B, U, K, 2)
+        targets = jnp.clip(targets, 0, jnp.array([width - 1, height - 1]))  # (B, U, K, 2); off-map commands are masked
+        keys = self.sap_key(spatial).reshape((batch_size, width, height, self.channels))  # (B, W, Hmap, C)
+        keys = keys[jnp.arange(batch_size)[:, None, None], targets[..., 0], targets[..., 1]]  # (B, U, K, C)
+        normalized_offsets = offsets.astype(self.dtype) / self.sap_range  # (K, 2)
+        offset_features = jnp.concatenate((normalized_offsets, jnp.abs(normalized_offsets)), axis=-1)  # (K, 4)
+        relative = self.sap_offset(nn.silu(self.sap_offset_hidden(offset_features)))  # (K, C)
+        keys = keys + relative  # (B, U, K, C)
+        queries = self.sap_query(ships).reshape((batch_size, unit_count, self.channels))  # (B, U, C)
+        # Keep close target scores distinct instead of rounding the dot product to bf16.
+        sap = jnp.einsum("bukc,buc->buk", keys, queries, preferred_element_type=jnp.float32) / sqrt(
+            self.channels
+        )  # (B, U, K)
+        sap = sap.reshape((*batch_shape, unit_count, offsets.shape[0]))  # (*S, U, K)
+        return sap  # (*S, U, K)
+
     def heads(
         self,
         memory: jax.Array,  # (*S, H)
@@ -425,30 +493,14 @@ class LuxModel(nn.Module):
         actions_mask: jax.Array,  # (*S, U, A)
     ) -> tuple[HierarchicalMultiCategoricalPolicy, jax.Array]:  # logits: (*S, U, A); value: (*S,)
         batch_shape = memory.shape[:-1]
-        batch_size = prod(batch_shape)
         unit_count = features.ships.shape[-2]
-        width, height = features.spatial.shape[-3:-1]
         team_memory = jnp.broadcast_to(memory[..., None, :], (*batch_shape, unit_count, memory.shape[-1]))  # (*S, U, H)
         ships = jnp.concatenate((features.ships, ship_memory, team_memory), axis=-1)  # (*S, U, 2C+Hs+H)
         ships = nn.silu(self.ship_norm(self.ship_hidden(ships)))  # (*S, U, F)
         types = self.type_output(ships).astype(jnp.float32)  # (*S, U, 3), stay/move/sap
         moves = self.move_output(ships).astype(jnp.float32)  # (*S, U, 4), north/east/south/west
 
-        # Match LuxEnv's x-major, y-minor relative target enumeration.
-        axis = jnp.arange(-self.sap_range, self.sap_range + 1)  # (2R+1,)
-        offsets = jnp.stack(jnp.meshgrid(axis, axis, indexing="ij"), axis=-1).reshape((-1, 2))  # (K, 2)
-        positions = jnp.where(observation.self.units_mask[..., None], observation.self.units.position, 0)  # (*S, U, 2)
-        targets = positions.reshape((batch_size, unit_count, 1, 2)) + offsets  # (B, U, K, 2)
-        targets = jnp.clip(targets, 0, jnp.array([width - 1, height - 1]))  # (B, U, K, 2); off-map commands are masked
-        keys = self.sap_key(features.spatial).reshape((batch_size, width, height, self.channels))  # (B, W, Hmap, C)
-        keys = keys[jnp.arange(batch_size)[:, None, None], targets[..., 0], targets[..., 1]]  # (B, U, K, C)
-        normalized_offsets = offsets.astype(self.dtype) / self.sap_range  # (K, 2)
-        offset_features = jnp.concatenate((normalized_offsets, jnp.abs(normalized_offsets)), axis=-1)  # (K, 4)
-        relative = self.sap_offset(nn.silu(self.sap_offset_hidden(offset_features)))  # (K, C)
-        keys = keys + relative  # (B, U, K, C)
-        queries = self.sap_query(ships).reshape((batch_size, unit_count, self.channels))  # (B, U, C)
-        sap = jnp.einsum("bukc,buc->buk", keys, queries).astype(jnp.float32) / sqrt(self.channels)  # (B, U, K)
-        sap = sap.reshape((*batch_shape, unit_count, offsets.shape[0]))  # (*S, U, K)
+        sap = self._sap_logits(ships, features.spatial, observation)  # (*S, U, K)
         logits = jnp.concatenate((types, moves, sap), axis=-1)  # (*S, U, 7+K)
         policy = HierarchicalMultiCategoricalPolicy(
             raw_logits=logits, actions_mask=actions_mask, group_sizes=self.action_space.group_sizes
