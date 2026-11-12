@@ -119,8 +119,6 @@ Latest settings and session timings:
         at each progress log's environment step; omitted when selfplay is disabled.
     train/learning_rate, train/entropy_coef: Latest iteration's scheduled settings,
         evaluated at its starting environment-step count against total_env_steps.
-    train/elapsed_seconds: Wall seconds since this session's rollout loop started,
-        through the current metric read, including intervening overhead.
     actor/video_seconds: Gameplay recording, encoding, and upload wall seconds.
     checkpoint/save_seconds: Blocking wall seconds to prepare and submit an async
         checkpoint, including any wait for the previous save; excludes background
@@ -201,7 +199,6 @@ from collections.abc import Callable
 from contextlib import ExitStack, closing
 from dataclasses import asdict, fields
 from dataclasses import field as dataclass_field
-from datetime import timedelta
 from functools import partial
 from math import sqrt
 from operator import itemgetter
@@ -677,7 +674,6 @@ class EpisodeState(NamedTuple):
     key: jax.Array  # () typed PRNG key
     observation: AgentObservation[Observation]  # leaves: (N, ...); mask: (N, *C, A)
     env_state: Any  # leaves: (...)
-    final_state: Any  # leaves: (...), before autoreset
     model_carry: RecurrentCarry  # leaves: (N, ...)
     episode_starts: jax.Array  # (N,)
     team_returns: jax.Array  # (N,)
@@ -723,7 +719,6 @@ def run_episode(
         key=key,  # ()
         observation=observation,  # (N, ...)/(N, *C, A)
         env_state=env_state,  # leaves: (...)
-        final_state=env_state,  # leaves: (...)
         model_carry=initial_carry,  # leaves: (N, ...)
         episode_starts=jnp.ones(env.num_agents, dtype=bool),  # (N,)
         team_returns=jnp.zeros(env.num_agents, dtype=jnp.float32),  # (N,)
@@ -783,7 +778,6 @@ def run_episode(
             key=key,  # ()
             observation=result.observation,  # (N, ...)/(N, *C, A)
             env_state=result.state,  # leaves: (...)
-            final_state=result.final_state,  # leaves: (...)
             model_carry=model_carry,  # leaves: (N, ...)
             episode_starts=jnp.asarray(result.agent_done, dtype=bool),  # (N,)
             team_returns=state.team_returns + result.reward,  # (N,)
@@ -1126,7 +1120,7 @@ def collect_rollout(
                         inputs.actions_mask,
                         method="step",
                     )
-                    command = output.policy.sample_and_log_prob(key=opponent_keys[env_index])[0][0]  # (*C,)
+                    command = output.policy.sample(key=opponent_keys[env_index])[0]  # (*C,)
                     return command, jax.tree.map(lambda leaf: leaf[0], opponent_model_carry)  # (*C,); leaves: (...)
 
                 return jax.lax.cond(
@@ -1552,7 +1546,7 @@ def train(config: Config) -> TrainState:
         )
         rollout_carry = jax.device_put(rollout_carry, batched)  # state: (E, ...); model_carry: (B, ...)
 
-        start = window_start = monotonic()
+        window_start = monotonic()
         window_start_step_count = initial_step_count
         remaining_rollout_count = max(0, (config.total_env_steps - initial_step_count) // batch_size)
         planned_rollout_count = start_rollout_index + remaining_rollout_count
@@ -1617,8 +1611,6 @@ def train(config: Config) -> TrainState:
                 entropy_coef = float(entropy_schedule(schedule_step))
                 rate_seconds = max(window_seconds, 1e-9)
                 sps = (step_count - window_start_step_count) / rate_seconds
-                # Include evaluation/video overhead in this session's elapsed time.
-                elapsed_seconds = now - start
                 scalars: dict[str, float | int] = {
                     "train/updates_per_iteration_mean": int(window.update_count) / window_rollout_count,
                     "train/policy_loss": mean_metrics["policy_loss"],
@@ -1640,7 +1632,6 @@ def train(config: Config) -> TrainState:
                     "train/updates_total": int(train_state.step),
                     "train/progress_fraction": min(step_count / config.total_env_steps, 1.0),
                     "rollout/episode_count": window_episode_count,
-                    "train/elapsed_seconds": elapsed_seconds,
                 }
                 if opponent_pool is not None:
                     pool_iterations = jax.device_get(opponent_pool.iteration)  # (K,)
@@ -1687,8 +1678,7 @@ def train(config: Config) -> TrainState:
                     f"entropy={mean_metrics['entropy']:.3f} kl={mean_metrics['approx_kl']:.4f} "
                     f"clipfrac={mean_metrics['clip_fraction']:.3f} ev={explained_variance_text} "
                     f"updates={scalars['train/updates_per_iteration_mean']:.2f} "
-                    f"window={window_seconds:.1f}s "
-                    f"elapsed={timedelta(seconds=int(elapsed_seconds))}",
+                    f"window={window_seconds:.1f}s",
                     flush=True,
                 )
                 window_start = now

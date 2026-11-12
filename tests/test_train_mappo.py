@@ -822,6 +822,7 @@ def test_config_and_cli(config: ppo.Config, tmp_path: Path, monkeypatch: pytest.
 def test_training_resume_wiring_and_environment_step_logging(
     config: ppo.Config,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
     interval: int,
     checkpoint_fails: bool,
 ) -> None:
@@ -914,6 +915,8 @@ def test_training_resume_wiring_and_environment_step_logging(
     assert scalars["train/progress_fraction"] == (1.0, 10)
     assert scalars["train/learning_rate"] == pytest.approx((0.0004, 10))
     assert scalars["checkpoint/save_seconds"] == (2.5, 10)
+    assert "train/elapsed_seconds" not in scalars
+    assert "elapsed=" not in capsys.readouterr().out
     assert "train/explained_variance_mean" not in scalars
     assert "train/kl_early_stop_fraction" not in scalars
     assert "train/pool_param_iteration_min" not in scalars
