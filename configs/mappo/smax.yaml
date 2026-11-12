@@ -5,7 +5,7 @@ env:
   selfplay: false # Set true to control both teams with win/loss rewards.
   max_steps: 100
 seed: 1
-total_env_steps: 10_000_000 # Environment transitions; each contains num_agents observations
+total_iterations: 610
 num_envs: 128
 num_steps: 128
 num_minibatches: 4 # Divides num_envs * num_agents; keep recurrent sequences intact

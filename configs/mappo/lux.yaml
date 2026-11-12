@@ -2,15 +2,21 @@
 # Run: uv run mappo --config configs/mappo/lux.yaml
 env:
   id: luxai_s3
-  map_size: 16
+  map_size: 32
   max_units: 16
   max_steps_in_match: 100
   match_count: 5
   randomize_params: true
-seed: 7
+# Thresholds count completed training iterations.
+map_size_curriculum:
+  - { start_iteration: 0, map_size: 8 }
+  - { start_iteration: 500, map_size: 16 }
+  - { start_iteration: 1000, map_size: 24 }
+  - { start_iteration: 1500, map_size: 32 }
+seed: 8
 total_env_steps: 100_000_000
 # Two GPUs: 16 environments each.
-num_envs: 16
+num_envs: 8
 # Recurrent carry persists across rollout boundaries.
 num_steps: 512
 # Limit activation memory.
@@ -33,7 +39,7 @@ entropy_decay: constant
 value_coef: 1.0
 max_grad_norm: 0.5
 ckpt_dir: /runs/mappo/${run_id}
-run_id: mappo_lux_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
+run_id: mappo_lux_curric_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
 # Intervals count training iterations.
 log_interval: 10
 video_interval: 0
@@ -44,7 +50,9 @@ eval_interval: 400
 eval_episodes: 100
 eval_seed: 10000
 eval_ref_policies:
-  selfplay_s7: /runs/mappo/mappo_lux_selfplay_16x16_mb4_ep1_s7/checkpoints/5400
+  selfplay_16x16_mb4_ep1_s7_5400: /runs/mappo/mappo_lux_selfplay_16x16_mb4_ep1_s7/checkpoints/5400
+  baseline_16x16_mb4_ep1_s7_2400: /runs/mappo/mappo_lux_16x16_mb4_ep1_s7/checkpoints/2400
+  baseline_32x32_mb4_ep1_s8_2000: /runs/mappo/mappo_lux_32x32_mb4_ep1_s8/checkpoints/2000
 
 # selfplay:
 #   pool_size: 32

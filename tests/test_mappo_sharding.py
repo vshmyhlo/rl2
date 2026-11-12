@@ -28,7 +28,7 @@ def mesh() -> Mesh:
 
 
 def test_training_mesh_uses_all_devices_and_allows_agent_minibatches(config: ppo.Config) -> None:
-    config = replace(config, num_envs=jax.device_count(), num_minibatches=3, total_env_steps=2 * jax.device_count())
+    config = replace(config, num_envs=jax.device_count(), num_minibatches=3, total_iterations=1)
     mesh = ppo.training_mesh(config, num_agents=3)
     assert list(mesh.devices.flat) == jax.devices()
     assert mesh.axis_names == ("batch",)
@@ -45,7 +45,7 @@ def test_training_mesh_rejects_indivisible_batches(config: ppo.Config, num_envs:
 
 
 def test_train_places_restored_state_and_fresh_environments_on_all_devices(config: ppo.Config, mesh: Mesh) -> None:
-    config = replace(config, num_envs=jax.device_count(), total_env_steps=4 * jax.device_count())
+    config = replace(config, num_envs=jax.device_count(), total_iterations=2)
     devices = set(jax.devices())
 
     def restore(manager: ppo.ocp.CheckpointManager, state: TrainState, config: ppo.Config) -> ppo.TrainingProgress:
@@ -66,9 +66,9 @@ def test_train_places_restored_state_and_fresh_environments_on_all_devices(confi
         config: ppo.Config,
         key: jax.Array,  # ()
         metrics: ppo.TrainingMetrics,  # scalar leaves
-        environment_step_count: jax.Array,  # ()
+        iteration_count: jax.Array,  # ()
     ) -> ppo.TrainStepResult:
-        assert int(environment_step_count) == config.num_envs * config.num_steps
+        assert int(iteration_count) == 1
         assert int(state.step) == 7
         assert int(metrics.total.episode_count) == 3
         np.testing.assert_array_equal(jax.random.key_data(key), jax.random.key_data(jax.random.key(42)))
@@ -176,7 +176,7 @@ def test_sharded_training_matches_single_device_and_restores_checkpoint(
     metrics = ppo.init_metrics()  # scalar leaves
     expected = jax.jit(
         ppo.train_step, static_argnames=("env", "config"), in_shardings=PartitionSpec(), out_shardings=PartitionSpec()
-    )(runner, state, env, config, key, metrics, 4)
+    )(runner, state, env, config, key, metrics, 1)
     with jax.set_mesh(mesh):
         actual = ppo.train_step_donated(
             jax.device_put(runner, batched),
@@ -185,7 +185,7 @@ def test_sharded_training_matches_single_device_and_restores_checkpoint(
             config,
             jax.device_put(key, replicated),
             jax.device_put(metrics, replicated),
-            4,
+            1,
         )
     chex.assert_trees_all_close(
         (actual.train_state, actual.metrics), (expected.train_state, expected.metrics), rtol=2e-5, atol=2e-6

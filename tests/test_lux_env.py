@@ -437,6 +437,36 @@ def test_render_scoring_occupancy(
     assert labels == [f"Scoring tiles: {count}" for count in expected]
 
 
+@pytest.mark.parametrize("reference", ["baseline", "reference_" * 20], ids=["short-name", "long-name"])
+def test_render_team_labels(
+    env: LuxEnv,
+    initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState],
+    reference: str,
+) -> None:
+    _, state = initial
+    original = env.render(state)  # (416, 640, 3)
+    team_labels = (f"Reference: {reference}", "Trained policy")
+    with patch.object(ImageDraw.ImageDraw, "text", autospec=True, side_effect=ImageDraw.ImageDraw.text) as text:
+        frame = env.render(state, team_labels=team_labels)  # (416, 640, 3)
+    assert frame.shape == (416, 640, 3) and frame.dtype == np.uint8
+    # Labels stay inside the existing team boxes; the board and legends are unchanged.
+    np.testing.assert_array_equal(frame[:, :324], original[:, :324])
+    np.testing.assert_array_equal(frame[:72], original[:72])
+    np.testing.assert_array_equal(frame[267:], original[267:])
+    labels = {call.args[1]: call for call in text.call_args_list}
+    for team, color in enumerate(((70, 180, 255), (255, 95, 85))):
+        call = labels[336, 106 + 100 * team]
+        label = call.args[2]
+        assert call.kwargs["fill"] == color
+        assert call.kwargs["font"].getlength(label) <= 276
+        if team == 0 and reference != "baseline":
+            assert label.endswith("...") and team_labels[team].startswith(label[:-3])
+        else:
+            assert label == team_labels[team]
+    assert labels[336, 125].args[2].startswith("Relic points")
+    assert labels[336, 145].args[2].startswith("Ships")
+
+
 def test_render_ship_energy(env: LuxEnv, initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]) -> None:
     _, state = initial
     game = state.game.replace(

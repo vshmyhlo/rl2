@@ -294,8 +294,13 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
             final_state=final_state,
         )
 
-    def render(self, state: LuxState) -> NDArray[np.uint8]:  # leaves: (...) -> (416, 640, 3)
-        """Return (416, 640, 3) uint8 privileged overview with visibility outlines and ship energy bars."""
+    def render(
+        self,
+        state: LuxState,  # leaves: (...)
+        *,
+        team_labels: tuple[str, str] | None = None,
+    ) -> NDArray[np.uint8]:  # (416, 640, 3)
+        """Return (416, 640, 3) uint8 privileged overview with optional labels indexed by team."""
         game, params = jax.device_get(state)
         steps, match_steps = int(game.steps), int(game.match_steps)
         match_count, match_length = int(params.match_count_per_episode), int(params.max_steps_in_match)
@@ -467,16 +472,23 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
                     font=font,
                     fill="white",
                 )
+                if team_labels is not None:
+                    label = team_labels[team]
+                    if small_font.getlength(label) > 276:
+                        while small_font.getlength(label + "...") > 276:
+                            label = label[:-1]
+                        label += "..."
+                    draw.text((336, top + 34), label, font=small_font, fill=color)
                 draw.text(
-                    (336, top + 40),
+                    (336, top + (53 if team_labels is not None else 40)),
                     f"Relic points {points}   |   Wins {int(game.team_wins[team])}",
-                    font=font,
+                    font=small_font if team_labels is not None else font,
                     fill="white",
                 )
                 draw.text(
-                    (336, top + 66),
+                    (336, top + (73 if team_labels is not None else 66)),
                     f"Ships {ships} / {int(params.max_units)}   |   Energy {total_energy}",
-                    font=font,
+                    font=small_font if team_labels is not None else font,
                     fill=(185, 195, 210),
                 )
             draw.text((324, 274), f"Active relic nodes: {int(game.relic_nodes_mask.sum())}", font=font, fill="white")

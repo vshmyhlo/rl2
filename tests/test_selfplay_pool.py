@@ -312,7 +312,7 @@ def test_training_restores_pool_inserts_snapshots_and_saves(config: ppo.Config) 
         config,
         selfplay=SelfPlayConfig(pool_size=3, snapshot_interval=1, current_policy_fraction=1),
         num_minibatches=1,
-        total_env_steps=20,
+        total_iterations=5,
         log_interval=1,
     )
     calls = []
@@ -337,11 +337,11 @@ def test_training_restores_pool_inserts_snapshots_and_saves(config: ppo.Config) 
         settings: ppo.Config,
         key: jax.Array,
         metrics: ppo.TrainingMetrics,
-        environment_step_count: jax.Array,
+        iteration_count: jax.Array,  # ()
         pool: ppo.OpponentPool,
     ) -> ppo.TrainStepResult:
         # runner leaves: (E, ...)/(E*N, H); key/step/metric leaves: (); pool leaves: (K, ...)
-        calls.append(int(environment_step_count))
+        calls.append(int(iteration_count))
         np.testing.assert_array_equal(pool.iteration, ([0, -1, -1], [0, 3, -1], [0, 3, 4])[len(calls) - 1])
         np.testing.assert_array_equal(runner.selfplay.opponent, -1)
         if len(calls) == 1:
@@ -360,7 +360,7 @@ def test_training_restores_pool_inserts_snapshots_and_saves(config: ppo.Config) 
         patch.object(ppo, "save_checkpoint", return_value=0.0) as save,
     ):
         ppo.train(config)
-    assert calls == [8, 12, 16]
+    assert calls == [2, 3, 4]
     history = metric_history(logger.return_value)
     assert history["train/pool_param_iteration_min"] == [(0.0, 12), (0.0, 16), (0.0, 20)]
     assert history["train/pool_param_iteration_max"] == [(3.0, 12), (4.0, 16), (5.0, 20)]

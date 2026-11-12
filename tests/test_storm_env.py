@@ -109,7 +109,7 @@ def test_update_and_playback() -> None:
         num_steps=1,
         num_minibatches=1,
         update_epochs=1,
-        total_env_steps=1,
+        total_iterations=1,
         model=ppo.GenericModelConfig(
             encoder=ppo.MLPEncoderConfig(embedding_size=4), recurrent=ppo.LSTMConfig(hidden_size=4)
         ),

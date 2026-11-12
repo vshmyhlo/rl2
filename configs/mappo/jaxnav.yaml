@@ -8,7 +8,7 @@ env:
   max_steps: 500
   rew_lambda: 0.5 # Mix individual reward (1.0) with mean team reward (0.0)
 seed: 1
-total_env_steps: 10_000_000 # Environment transitions; each contains num_agents observations
+total_iterations: 610
 num_envs: 128
 num_steps: 128
 num_minibatches: 4 # Divides num_envs * num_agents; keep recurrent sequences intact

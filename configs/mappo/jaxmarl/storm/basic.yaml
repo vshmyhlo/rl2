@@ -9,7 +9,7 @@ env:
   max_steps: 128
   freeze_penalty: 5
 seed: 1
-total_env_steps: 5_000_000 # Environment transitions; each contains num_agents observations
+total_iterations: 1_220
 num_envs: 32
 num_steps: 128
 num_minibatches: 4

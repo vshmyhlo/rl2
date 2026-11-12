@@ -39,7 +39,7 @@ def config() -> ppo.Config:
         num_steps=2,
         num_minibatches=2,
         update_epochs=1,
-        total_env_steps=8,
+        total_iterations=2,
         gamma=0.5,
         gae_lambda=1.0,
         learning_rate=0.001,
@@ -408,7 +408,7 @@ def test_train_step_omits_undefined_variance_and_stops_updates(
         )
     )
     monkeypatch.setattr(ppo, "collect_rollout", collect)
-    result = ppo.train_step(runner, state, ScriptedSMAX(), config, rollout.key, ppo.init_metrics(), 4)
+    result = ppo.train_step(runner, state, ScriptedSMAX(), config, rollout.key, ppo.init_metrics(), 1)
     assert int(result.train_state.step) == 0
     assert int(result.metrics.window.minibatch_count) == 1
     assert int(result.metrics.window.update_count) == 0
@@ -429,12 +429,12 @@ def test_train_step_omits_undefined_variance_and_stops_updates(
     assert float(result.metrics.window.explained_variance_sum) == pytest.approx(1.0)
     assert int(result.metrics.window.terminated_episode_count) == 1
 
-    # Window resets and changing step counts must reuse the compiled learner on every device.
+    # Window resets and changing iteration counts must reuse the compiled learner on every device.
     with jax.set_mesh(ppo.training_mesh(config, env.num_agents)):
         state, key, metrics = jax.device_put((state, rollout.key, ppo.init_metrics()), ppo.PartitionSpec())
         runner = jax.device_put(runner, ppo.PartitionSpec("batch"))  # state: (E, ...); memory: (B, H)
         collect.return_value = (runner, collect.return_value[1])
-        result = ppo.train_step_donated(runner, state, env, config, key, metrics, jnp.asarray(4, dtype=jnp.float32))
+        result = ppo.train_step_donated(runner, state, env, config, key, metrics, jnp.asarray(1, dtype=jnp.float32))
         traces = collect.call_count
         with jax.enable_x64():
             metrics = result.metrics._replace(window=ppo.RunningSum.init(result.metrics.window))  # scalar leaves
@@ -445,15 +445,15 @@ def test_train_step_omits_undefined_variance_and_stops_updates(
             config,
             result.key,
             metrics,
-            jnp.asarray(8, dtype=jnp.float32),  # ()
+            jnp.asarray(2, dtype=jnp.float32),  # ()
         )
         assert collect.call_count == traces
         assert int(result.metrics.window.rollout_count) == 1
         assert int(result.metrics.total.episode_count) == 4
 
 
-def test_schedules_use_environment_steps(config: ppo.Config) -> None:
-    config = replace(config, total_env_steps=16, entropy_decay="cosine")
+def test_schedules_use_iterations(config: ppo.Config) -> None:
+    config = replace(config, total_iterations=16, entropy_decay="cosine")
     lr = ppo.learning_rate_schedule(config)
     entropy = ppo.entropy_coef_schedule(config)
     assert float(lr(4)) == pytest.approx(config.learning_rate * 0.75)
@@ -467,9 +467,38 @@ def test_schedules_use_environment_steps(config: ppo.Config) -> None:
     constant = replace(config, anneal_lr=False, entropy_decay="constant")
     assert float(ppo.learning_rate_schedule(constant)(16)) == config.learning_rate
     assert float(ppo.entropy_coef_schedule(constant)(16)) == config.entropy_coef
-    large = replace(config, total_env_steps=2**33)
+    large = replace(config, total_iterations=2**33)
     step = jnp.asarray(2**32, dtype=jnp.float32)  # (); counters can exceed int32
     assert float(jax.jit(ppo.learning_rate_schedule(large))(step)) == pytest.approx(config.learning_rate / 2)
+
+
+@pytest.mark.parametrize("completed_iterations", [1, 2], ids=["at_budget", "past_budget"])
+def test_resume_with_exhausted_iteration_budget(config: ppo.Config, completed_iterations: int) -> None:
+    config = replace(config, total_iterations=1)
+
+    def restore(manager: Any, state: TrainState, config: ppo.Config) -> ppo.TrainingProgress:
+        return ppo.TrainingProgress(
+            train_state=state.replace(step=7),
+            key=jax.random.key(0),  # ()
+            rollout_count=completed_iterations,
+            episode_count=0,
+            episode_return_sum=0.0,
+            episode_length_sum=0,
+            environment_step_count=1,
+        )
+
+    with (
+        patch.object(ppo, "make_env", return_value=ScriptedSMAX()),
+        patch.object(ppo, "checkpoint_manager"),
+        patch.object(ppo, "restore_checkpoint", side_effect=restore),
+        patch.object(ppo, "MLflowLogger"),
+        patch.object(ppo, "train_step_donated") as train_step,
+        patch.object(ppo, "save_checkpoint") as save,
+    ):
+        state = ppo.train(config)
+    assert int(state.step) == 7
+    train_step.assert_not_called()
+    save.assert_not_called()
 
 
 def test_rejects_checkpoint_with_separate_networks(config: ppo.Config) -> None:
@@ -803,8 +832,8 @@ def test_config_and_cli(config: ppo.Config, tmp_path: Path, monkeypatch: pytest.
     assert hash(config)
     with pytest.raises(ValueError, match="num_agents"):
         ppo.make_env(replace(config, num_minibatches=5))
-    with pytest.raises(ValueError, match="at least one rollout"):
-        replace(config, total_env_steps=1)
+    with pytest.raises(ValueError, match="total_iterations"):
+        replace(config, total_iterations=0)
     monkeypatch.setattr("sys.argv", ["mappo", "--config", str(path)])
     train = Mock()
     monkeypatch.setattr(ppo, "train", train)
@@ -826,7 +855,7 @@ def test_training_resume_wiring_and_environment_step_logging(
 ) -> None:
     config = replace(
         config,
-        total_env_steps=10,
+        total_iterations=2,
         video_interval=interval,
         eval_interval=interval,
         checkpoint_interval=interval or 3,
@@ -863,9 +892,9 @@ def test_training_resume_wiring_and_environment_step_logging(
         config: ppo.Config,
         key: jax.Array,
         metrics: ppo.TrainingMetrics,
-        environment_step_count: jax.Array,  # (); key: (); metrics: scalar leaves
+        iteration_count: jax.Array,  # (); key: (); metrics: scalar leaves
     ) -> ppo.TrainStepResult:
-        assert environment_step_count == 6
+        assert iteration_count == 1
         chex.assert_shape(runner.observation.observation, (2, 2, 2))
         chex.assert_shape(jax.tree.leaves(runner.model_carry), (4, 4))
         np.testing.assert_array_equal(runner.episode_start, True)
@@ -920,7 +949,7 @@ def test_training_resume_wiring_and_environment_step_logging(
     assert {"train/episode_return_mean", "train/episode_length_mean", "train/progress_fraction_total"}.isdisjoint(
         scalars
     )
-    assert scalars["train/learning_rate"] == pytest.approx((0.0004, 10))
+    assert scalars["train/learning_rate"] == pytest.approx((0.0005, 10))
     assert scalars["train/ppo_clip_fraction"] == (1.0, 10)
     assert "train/clip_fraction" not in scalars
     assert scalars["checkpoint/save_seconds"] == (2.5, 10)
@@ -943,7 +972,7 @@ def test_training_resume_wiring_and_environment_step_logging(
 
 
 def test_episode_end_fractions_use_completed_window_episodes(config: ppo.Config) -> None:
-    config = replace(config, total_env_steps=20, log_interval=2)
+    config = replace(config, total_iterations=5, log_interval=2)
     writer = MagicMock()
     model = Mock()
     model.init.return_value = {"params": {}}
@@ -961,7 +990,7 @@ def test_episode_end_fractions_use_completed_window_episodes(config: ppo.Config)
         config: ppo.Config,
         key: jax.Array,  # ()
         metrics: ppo.TrainingMetrics,  # scalar leaves
-        environment_step_count: jax.Array,  # ()
+        iteration_count: jax.Array,  # ()
     ) -> ppo.TrainStepResult:
         completed, terminated = next(episode_counts)
         with jax.enable_x64():
@@ -1109,7 +1138,7 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
         num_envs=1,
         num_steps=3,
         num_minibatches=1,
-        total_env_steps=3,
+        total_iterations=1,
     )
     path = tmp_path / "lux.yaml"
     path.write_text(yaml.safe_dump(asdict(config)))
@@ -1353,7 +1382,7 @@ def test_reference_eval_metrics_and_artifacts(
         for value, opponent_return in zip(returns, opponent_returns, strict=True)
     ]
     # The capped replay must not contribute to score or episode-length statistics.
-    results.append(ppo.EpisodeResult(episode_return=99.0, length=1, frames=[frame], opponent_return=0.0))
+    results.append(ppo.EpisodeResult(episode_return=99.0, length=1, frames=[frame, frame], opponent_return=0.0))
     with patch.object(ppo, "play_episode", side_effect=results * len(references)) as play:
         for name in references:
             ppo.log_reference_evaluation(
@@ -1376,6 +1405,10 @@ def test_reference_eval_metrics_and_artifacts(
         assert call.kwargs["record"] is recorded
         if recorded:
             assert call.kwargs["stop_at_frame_limit"] is True
+            name = list(references)[index // (episodes + 1)]
+            assert call.kwargs["team_labels"] == tuple(
+                "Trained policy" if team == best_index % 2 else f"Reference: {name}" for team in range(2)
+            )
         np.testing.assert_array_equal(
             jax.random.key_data(call.args[2]),
             jax.random.key_data(jax.random.fold_in(jax.random.key(config.eval_seed), episode_index)),
@@ -1406,6 +1439,28 @@ def test_reference_eval_metrics_and_artifacts(
     assert [call.args[1] for call in writer.log_video.call_args_list] == [
         f"eval/gameplay/{name}/1600.gif" for name in references
     ]
+    for call in writer.log_video.call_args_list:
+        assert call.args[0] is results[-1].frames
+
+
+@pytest.mark.parametrize("team_labels", [None, ("Reference: baseline", "Trained policy")])
+def test_playback_passes_team_labels_to_lux_renderer(config: ppo.Config, team_labels: tuple[str, str] | None) -> None:
+    frame = np.zeros((416, 640, 3), dtype=np.uint8)  # (H, W, 3)
+    env = Mock(spec=LuxEnv)
+    env.render.return_value = frame
+    episode = ppo.CompiledEpisode(
+        episode_return=jnp.asarray(0.0),  # ()
+        length=jnp.asarray(1),  # ()
+        states=jnp.arange(2),  # (F,), stand-in render states
+        opponent_return=None,
+    )
+    with patch.object(ppo, "run_episode", return_value=episode):
+        result = ppo.play_episode(Mock(), config, jax.random.key(0), (), record=True, env=env, team_labels=team_labels)
+    assert len(result.frames) == 2
+    for index, call in enumerate(env.render.call_args_list):
+        assert int(call.args[0]) == index
+        assert call.kwargs == {"team_labels": team_labels}
+        assert result.frames[index] is frame
 
 
 @pytest.mark.parametrize(
@@ -1548,7 +1603,7 @@ def test_training_evaluates_fixed_references(config: ppo.Config, lux: bool, refe
         config,
         env=LuxConfig() if lux else config.env,
         model=ppo.LuxModelConfig() if lux else config.model,
-        total_env_steps=3 * 4,
+        total_iterations=3,
         eval_interval=2,
         eval_ref_policies=references,
         log_interval=1000,

@@ -74,7 +74,8 @@ divisible by num_minibatches * device_count. Losses, advantage normalization,
 gradient clipping, KL stopping, and metrics reduce over the global batch.
 
 An iteration collects num_envs * num_steps environment transitions and runs PPO
-updates. total_env_steps and MLflow steps count transitions summed across environments.
+updates. total_iterations sets the cumulative iteration budget, including restored
+history. MLflow steps count transitions summed across environments.
 Team returns sum mean agent rewards, counting shared rewards once. Episodes count
 environment completions. Lux uses
 match-win increments; averaging both teams gives match_count / 2 per full game,
@@ -124,8 +125,7 @@ Lifetime metrics (include restored history):
     train/episode_return_total: Raw return averaged over completed episodes.
     train/episode_length_total: Episode length averaged over completed episodes.
         Lifetime episode means are omitted before any episode completes.
-    train/progress_fraction: Completed environment transitions / total_env_steps,
-        capped at one. The budget remainder smaller than a rollout is unused.
+    train/progress_fraction: Completed iterations / total_iterations, capped at one.
 
 Latest settings and session timings:
     train/map_size: Latest iteration's map side length in cells, at each progress
@@ -135,7 +135,7 @@ Latest settings and session timings:
         the preserved initial snapshot, after any insertion this iteration. Logged
         at each progress log's environment step; omitted when selfplay is disabled.
     train/learning_rate, train/entropy_coef: Latest iteration's scheduled settings,
-        evaluated at its starting environment-step count against total_env_steps.
+        evaluated at its starting completed-iteration count against total_iterations.
     actor/video_seconds: Gameplay recording, encoding, and upload wall seconds.
     checkpoint/save_seconds: Blocking wall seconds to prepare and submit an async
         checkpoint, including any wait for the previous save; excludes background
@@ -191,6 +191,7 @@ eval_interval default to 0 (disabled), and checkpoint_interval to 600. A zero vi
 interval disables standalone gameplay. Evaluation replays its highest-return episode
 (per reference policy) for one video, independently of video_interval. The first
 episode wins ties. Scores include every full episode; the replay does not enter metrics.
+Lux evaluation replays label the trained policy and named reference inside their team boxes.
 video_max_frames (default: 900; None: unlimited) caps recordings. GIFs loop at video_fps
 with frame boundaries rounded to 10 ms and a minimum 10 ms frame delay.
 Each evaluation/video episode compiles reset, inference, and environment steps
@@ -447,7 +448,7 @@ class Config(BaseConfig):
         SMAXConfig | JaxNavConfig | MPEConfig | STORMConfig | RobotariumConfig | LuxConfig, Field(discriminator="id")
     ]
     seed: int
-    total_env_steps: int
+    total_iterations: Annotated[int, Field(gt=0)]
     num_envs: Annotated[int, Field(gt=0)]
     num_steps: Annotated[int, Field(gt=0)]
     num_minibatches: Annotated[int, Field(gt=0)]
@@ -482,8 +483,6 @@ class Config(BaseConfig):
 
     @model_validator(mode="after")
     def validate_rollout(self) -> Self:
-        if self.total_env_steps < self.num_envs * self.num_steps:
-            raise ValueError("total_env_steps must cover at least one rollout")
         if isinstance(self.env, LuxConfig) != isinstance(self.model, LuxModelConfig):
             raise ValueError("The lux model requires the luxai_s3 environment and vice versa")
         if self.map_size_curriculum:
@@ -699,30 +698,30 @@ def load_eval_ref_policies(config: Config, params: optax.Params) -> dict[str, op
     return references  # leaves: parameter shapes
 
 
-def decay_schedule(initial_value: float, total_env_steps: int, decay: Literal["linear", "cosine"]) -> optax.Schedule:
+def decay_schedule(initial_value: float, total_iterations: int, decay: Literal["linear", "cosine"]) -> optax.Schedule:
     schedule = (
         optax.cosine_decay_schedule(initial_value, 1)
         if decay == "cosine"
         else optax.linear_schedule(initial_value, 0.0, 1)
     )
 
-    def by_environment_steps(count: jax.Array) -> jax.Array:  # () -> ()
+    def by_iterations(count: jax.Array) -> jax.Array:  # () -> ()
         # Normalize before Optax's clipping to support budgets beyond int32.
-        return schedule(jnp.asarray(count, dtype=jnp.float32) / float(total_env_steps))  # ()
+        return schedule(jnp.asarray(count, dtype=jnp.float32) / float(total_iterations))  # ()
 
-    return by_environment_steps
+    return by_iterations
 
 
 def learning_rate_schedule(config: Config) -> optax.Schedule:
     if not config.anneal_lr:
         return optax.constant_schedule(config.learning_rate)
-    return decay_schedule(config.learning_rate, config.total_env_steps, config.lr_decay)
+    return decay_schedule(config.learning_rate, config.total_iterations, config.lr_decay)
 
 
 def entropy_coef_schedule(config: Config) -> optax.Schedule:
     if config.entropy_decay == "constant":
         return optax.constant_schedule(config.entropy_coef)
-    return decay_schedule(config.entropy_coef, config.total_env_steps, "cosine")
+    return decay_schedule(config.entropy_coef, config.total_iterations, "cosine")
 
 
 class EpisodeState(NamedTuple):
@@ -872,6 +871,7 @@ def play_episode(
     stop_at_frame_limit: bool = False,
     opponent_params: optax.Params | None = None,  # leaves: parameter shapes
     current_team: int = 0,
+    team_labels: tuple[str, str] | None = None,
 ) -> EpisodeResult:
     """Run one compiled episode, then transfer once and render its valid recorded states."""
     max_episode_steps = (
@@ -904,7 +904,10 @@ def play_episode(
     if record:
         for index in range(min(int(result.length) + 1, recording_capacity)):
             env_state = jax.tree.map(itemgetter(index), result.states)  # leaves: (...)
-            frames.append(np.asarray(env.render(env_state)))  # (H, W, 3)
+            frame = (
+                env.render(env_state, team_labels=team_labels) if isinstance(env, LuxEnv) else env.render(env_state)
+            )  # (H, W, 3)
+            frames.append(np.asarray(frame))  # (H, W, 3)
     return EpisodeResult(
         episode_return=float(result.episode_return),
         length=int(result.length),
@@ -984,6 +987,9 @@ def log_reference_evaluation(
         )
     episode_return_sample = [result["return"] for result in episode_results]
     video_episode_index = max(range(config.eval_episodes), key=episode_return_sample.__getitem__)
+    team_labels = ("Trained policy", f"Reference: {opponent_name}")
+    if video_episode_index % 2:
+        team_labels = team_labels[::-1]
     replay = play_episode(
         train_state,
         config,
@@ -994,6 +1000,7 @@ def log_reference_evaluation(
         env=env,
         opponent_params=opponent_params,
         current_team=video_episode_index % 2,
+        team_labels=team_labels,
     )
     if replay.frames:
         writer.log_video(replay.frames, f"eval/gameplay{suffix}/{step_count}.gif", fps=config.video_fps)
@@ -1111,9 +1118,9 @@ def update(
     train_state: TrainState,
     batch: PPOBatch,  # observation: (*S, ...); actions_mask: (*S, *C, A); targets/starts: (*S,); model_carry leaves: (B, ...)
     config: Config,
-    environment_step_count: int | jax.Array = 0,  # () completed environment transitions before this iteration
+    iteration_count: int | jax.Array = 0,  # () completed iterations
 ) -> tuple[TrainState, MinibatchMetrics]:
-    entropy_coef = jnp.asarray(entropy_coef_schedule(config)(environment_step_count), dtype=jnp.float32)  # ()
+    entropy_coef = jnp.asarray(entropy_coef_schedule(config)(iteration_count), dtype=jnp.float32)  # ()
     advantage = batch.advantage  # (*S,)
     chex.assert_scalar_positive(advantage.size)
     # Centering a single sample always gives zero and erases its policy gradient.
@@ -1407,7 +1414,7 @@ def train_step(
     config: Config,
     key: jax.Array,  # () typed PRNG key
     metrics: TrainingMetrics,  # scalar leaves
-    environment_step_count: int | jax.Array = 0,  # () completed environment transitions before this iteration
+    iteration_count: int | jax.Array = 0,  # () completed iterations
     opponent_pool: OpponentPool | None = None,
 ) -> TrainStepResult:
     """Collect a rollout, run PPO epochs, and accumulate window/lifetime metrics."""
@@ -1419,7 +1426,7 @@ def train_step(
     batch = jax.lax.with_sharding_constraint(
         rollout.batch, PartitionSpec("batch")
     )  # (B, T, ...); model_carry: (B, ...)
-    learning_rate = jnp.asarray(learning_rate_schedule(config)(environment_step_count), dtype=jnp.float32)  # ()
+    learning_rate = jnp.asarray(learning_rate_schedule(config)(iteration_count), dtype=jnp.float32)  # ()
     train_state = train_state.replace(
         opt_state=train_state.opt_state._replace(
             hyperparams={**train_state.opt_state.hyperparams, "learning_rate": learning_rate}  # ()
@@ -1452,7 +1459,7 @@ def train_step(
         minibatch = jax.lax.with_sharding_constraint(
             minibatch, PartitionSpec("batch")
         )  # (M, T, ...); model_carry: (M, ...)
-        train_state, metrics = update(current.train_state, minibatch, config, environment_step_count)
+        train_state, metrics = update(current.train_state, minibatch, config, iteration_count)
         train_state = jax.lax.with_sharding_constraint(train_state, PartitionSpec())
         kl_exceeded = jnp.asarray(False) if config.target_kl is None else metrics.approx_kl > config.target_kl  # ()
         return UpdateCarry(
@@ -1686,10 +1693,8 @@ def train(config: Config) -> TrainState:
 
         window_start = monotonic()
         window_start_step_count = initial_step_count
-        remaining_rollout_count = max(0, (config.total_env_steps - initial_step_count) // batch_size)
-        planned_rollout_count = start_rollout_index + remaining_rollout_count
         step_count = initial_step_count
-        for rollout_index in range(start_rollout_index, planned_rollout_count):
+        for rollout_index in range(start_rollout_index, config.total_iterations):
             next_config = config_for_iteration(active_config, rollout_index)
             if next_config.env != active_config.env:
                 active_config = next_config
@@ -1704,7 +1709,7 @@ def train(config: Config) -> TrainState:
                     flush=True,
                 )
             # Schedules need a fraction, while exact lifetime counters stay as host integers.
-            schedule_step = jnp.asarray(step_count, dtype=jnp.float32)  # (); avoids JIT's default int32 limit
+            schedule_step = jnp.asarray(rollout_index, dtype=jnp.float32)  # (); avoids JIT's default int32 limit
             if opponent_pool is None:
                 result = train_step_donated(rollout_carry, train_state, env, active_config, key, metrics, schedule_step)
             else:
@@ -1720,7 +1725,7 @@ def train(config: Config) -> TrainState:
                     rollout_count,
                     cast(MatchAssignment, rollout_carry.selfplay).opponent,
                 )
-            is_final_rollout = rollout_count == planned_rollout_count
+            is_final_rollout = rollout_count == config.total_iterations
             step_count += batch_size
             if config.video_interval and (rollout_count % config.video_interval == 0 or is_final_rollout):
                 log_video(
@@ -1779,7 +1784,7 @@ def train(config: Config) -> TrainState:
                     "train/episodes_total": episode_count,
                     "train/env_steps_total": step_count,
                     "train/iterations_total": rollout_count,
-                    "train/progress_fraction": min(step_count / config.total_env_steps, 1.0),
+                    "train/progress_fraction": min(rollout_count / config.total_iterations, 1.0),
                     "rollout/episode_count": window_episode_count,
                 }
                 if isinstance(active_config.env, (LuxConfig, JaxNavConfig)):

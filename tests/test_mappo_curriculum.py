@@ -122,7 +122,7 @@ def test_curriculum_training_wiring(config: ppo.Config, resume_iteration: int, p
             ppo.MapSizeStage(start_iteration=2, map_size=16),
         ),
         selfplay=ppo.SelfPlayConfig(pool_size=2, current_policy_fraction=0.0) if pool_enabled else None,
-        total_env_steps=16,
+        total_iterations=4,
         log_interval=1,
         video_interval=1,
         eval_interval=1,
@@ -160,7 +160,7 @@ def test_curriculum_training_wiring(config: ppo.Config, resume_iteration: int, p
         step: jax.Array,  # ()
         pool: ppo.OpponentPool | None = None,
     ) -> ppo.TrainStepResult:
-        iteration = int(step) // 4
+        iteration = int(step)
         assert int(state.step) == iteration * 7
         assert float(state.params["weight"]) == 1.0
         seen_sizes.append(active.env.map_size)

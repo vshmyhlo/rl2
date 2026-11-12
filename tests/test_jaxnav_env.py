@@ -147,7 +147,7 @@ def test_jaxnav_rollout_timeout_update_and_evaluation(env: JaxNavEnv, state: Sta
         num_steps=1,
         num_minibatches=1,
         update_epochs=1,
-        total_env_steps=2,
+        total_iterations=1,
         gamma=0.5,
         gae_lambda=1.0,
         target_kl=None,
