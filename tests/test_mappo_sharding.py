@@ -210,7 +210,6 @@ def test_sharded_training_matches_single_device_and_restores_checkpoint(
         episode_return_sum=float(actual.metrics.total.episode_return_sum),
         episode_length_sum=int(actual.metrics.total.episode_length_sum),
         environment_step_count=8,
-        observation_count=16,
     )
     with ppo.checkpoint_manager(str(tmp_path)) as manager:
         ppo.save_checkpoint(manager, progress, config)

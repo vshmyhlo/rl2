@@ -13,6 +13,20 @@ Lux map and entity attention default to model.heads=8 and model.head_dim=32,
 with feature width model.heads * model.head_dim and CNN width model.conv_channels.
 Both models retain one recurrent state and one value per agent/team.
 
+Optional map_size_curriculum (Lux and JaxNav) overrides env.map_size:
+    map_size_curriculum:
+      - {start_iteration: 0, map_size: 8}
+      - {start_iteration: 500, map_size: 16}
+      - {start_iteration: 2500, map_size: 24}
+Thresholds count completed iterations: sizes above run for 500 iterations, then
+2000, then the remainder. Stages start at zero and have strictly increasing
+thresholds. An empty/omitted curriculum keeps env.map_size fixed. Resume selects
+the stage using restored iterations and the current configuration. Size changes
+restart environments, recurrent memory, and opponent assignments, discarding
+unfinished episodes without counting them as completed. Parameters, optimizer,
+opponent history, and lifetime counters persist. JAX recompiles for new shapes.
+Evaluation and video use the active training size; log windows may span stages.
+
 Shape dimensions:
     E: Parallel environments (config.num_envs).
     N: Controlled agents per environment (env.num_agents).
@@ -60,17 +74,20 @@ divisible by num_minibatches * device_count. Losses, advantage normalization,
 gradient clipping, KL stopping, and metrics reduce over the global batch.
 
 An iteration collects num_envs * num_steps environment transitions and runs PPO
-updates. total_env_steps and MLflow steps count transitions summed across environments;
-observations count each agent separately. Team returns sum mean agent rewards,
-counting shared rewards once. Episodes count environment completions. Lux uses
+updates. total_env_steps and MLflow steps count transitions summed across environments.
+Team returns sum mean agent rewards, counting shared rewards once. Episodes count
+environment completions. Lux uses
 match-win increments; averaging both teams gives match_count / 2 per full game,
 so self-play return is not a measure of playing strength.
-With a pool, training episode returns sum only the selected learner's raw rewards;
-observation counters still count both agents. Loss and explained-variance metrics
-use only learner transitions. Evaluation and standalone video behavior are unchanged.
+With a pool, training episode returns sum only the selected learner's raw rewards.
+Loss and explained-variance metrics use only learner transitions. Evaluation and
+standalone video behavior are unchanged.
 
 Progress metrics are logged every log_interval iterations (default: 60) and on
 normal completion.
+Distribution summaries default to the mean without a suffix; _std and _sem mark
+standard deviation and standard error. _total marks lifetime scope, including
+restored history; lifetime return and episode length remain means, not sums.
 
 Window metrics:
     train/policy_loss: Mean clipped surrogate policy loss.
@@ -78,17 +95,17 @@ Window metrics:
     train/total_loss: Policy loss + value_coef * value loss - entropy_coef * entropy.
     train/entropy: Masked joint action entropy in nats, summed over components.
     train/approx_kl: Mean exp(log_ratio) - 1 - log_ratio in nats versus rollout policy.
-    train/clip_fraction: Fraction of action probability ratios outside the clip range.
+    train/ppo_clip_fraction: Fraction of action probability ratios outside PPO's clip range.
         These average over transitions, then evaluated minibatches, including
         KL-rejected minibatches. Total loss uses each iteration's entropy weight.
-    train/explained_variance_mean: Mean rollout value explained variance over
+    train/explained_variance: Mean rollout value explained variance over
         iterations with nonconstant GAE returns; omitted when none are defined.
-    train/updates_per_iteration_mean: Accepted minibatch updates per iteration.
+    train/updates_per_iteration: Accepted minibatch updates per iteration.
     train/kl_early_stop_fraction: Fraction of iterations stopped by target_kl;
         omitted when KL stopping is disabled.
     rollout/episode_count: Number of completed episodes in the window.
-    rollout/return_mean: Mean raw return of completed episodes.
-    rollout/episode_length_steps_mean: Mean length of completed episodes in steps.
+    rollout/episode_return: Mean raw return of completed episodes.
+    rollout/episode_length: Mean length of completed episodes in steps.
         Episode means are omitted when no episodes completed.
     rollout/episode_end_fraction/terminated: Fraction of completed window episodes
         with task termination, including episodes also flagged as truncated.
@@ -96,23 +113,23 @@ Window metrics:
         truncated without task termination. Both fractions use environment episode
         counts, reset each window, and are omitted when no episodes completed.
     train/iterations_per_second, train/env_steps_per_second,
-    train/observations_per_second, train/episodes_per_second: Window counts divided
+    train/episodes_per_second: Window counts divided
         by wall seconds. Includes collection, updates, and intervening logging,
         evaluation, video, and checkpoints; excludes the current log and later save.
 
 Lifetime metrics (include restored history):
     train/iterations_total: Completed iterations.
-    train/updates_total: Accepted optimizer updates.
     train/episodes_total: Completed training episodes.
     train/env_steps_total: Environment transitions.
-    train/observations_total: Agent observations.
-    train/return_mean: Raw return averaged over completed episodes.
-    train/episode_length_steps_mean: Episode length averaged over completed episodes.
+    train/episode_return_total: Raw return averaged over completed episodes.
+    train/episode_length_total: Episode length averaged over completed episodes.
         Lifetime episode means are omitted before any episode completes.
     train/progress_fraction: Completed environment transitions / total_env_steps,
         capped at one. The budget remainder smaller than a rollout is unused.
 
 Latest settings and session timings:
+    train/map_size: Latest iteration's map side length in cells, at each progress
+        log's environment step; omitted for environments without map_size.
     train/pool_param_iteration_min, train/pool_param_iteration_max: Minimum and
         maximum snapshot iteration across populated opponent-pool slots, including
         the preserved initial snapshot, after any insertion this iteration. Logged
@@ -139,24 +156,34 @@ without references, evaluation is omitted for every environment.
 Each reference gets eval_episodes fixed seeds. The current policy alternates team
 sides by episode index; returns sum only its team's rewards (Lux: match-win rewards).
 Evaluation metrics use <name> from eval_ref_policies:
-    eval/return_mean/<name>, eval/return_std/<name>, eval/return_sem/<name>: Raw return
+    eval/episode_return/<name>, eval/episode_return_std/<name>, eval/episode_return_sem/<name>: Raw return
         mean, sample standard deviation, and standard error over eval_episodes seeds.
         Uncertainty metrics are omitted for one episode.
-    eval/trueskill_mean/<name>, eval/trueskill_std/<name>: Current policy's posterior
-        skill mean (mu) and standard deviation (sigma), in TrueSkill rating points.
-    eval/trueskill_conservative/<name>: Current policy's mu - 3 * sigma rating.
-        Each full episode is one result: higher total team reward wins; equal
-        rewards draw (Lux: compare total match wins). Both policies start fresh
-        per reference/evaluation with package defaults: mu=25, sigma=25/3,
-        beta=25/6, tau=25/300, draw_probability=0.1. Update both ratings in seed
-        order, excluding the video replay. Ratings are relative to that reference,
-        not calibrated across references, and do not accumulate across evaluations.
-    eval/training_episodes_total/<name>: Lifetime completed training episode count,
-        including restored history.
     eval/evaluation_seconds/<name>: Wall seconds from evaluation through gameplay
-        and report upload, excluding metric logging.
+        and report upload, excluding metric logging and subsequent joint rating.
 These metrics are logged only when that reference is evaluated, at the current
 environment-step count, on the evaluation schedule below.
+    eval/evaluation_seconds: Wall seconds for the full evaluation, including
+        environment setup, all references, gameplay/report uploads, joint ratings,
+        and their metric logging; excludes logging this timing. Logged once per
+        evaluation at the current environment step; omitted without references.
+Joint ratings are logged once after all references finish, at the same step:
+    eval/trueskill, eval/trueskill_std, eval/trueskill_conservative: Current
+        policy's posterior mu, sigma, and mu - 3 * sigma, in TrueSkill rating points.
+    eval/reference_trueskill/<name>, eval/reference_trueskill_std/<name>,
+    eval/reference_trueskill_conservative/<name>: Each reference's posterior mu,
+        sigma, and mu - 3 * sigma from the same rating pool.
+    These are posterior parameters, not averages over games; omitted without references.
+Each full episode is one result: higher total team reward wins; equal rewards draw
+(Lux: compare total match wins). A single learner rating is shared across references;
+each result updates both participants. All ratings start fresh at each checkpoint
+evaluation with package defaults: mu=25, sigma=25/3, beta=25/6, tau=25/300,
+draw_probability=0.1. Games run grouped by reference, then results sorted by reference
+name and episode index are shuffled once with Python Random(eval_seed) for rating.
+The replay is excluded. This makes ratings independent of reference execution order,
+but sequential TrueSkill still depends on the chosen shuffle. Ratings do not carry
+across checkpoint steps or process restarts; rerunning the same games does not accumulate
+evidence. No reference-versus-reference games are played.
 
 Enabled video, evaluation, and checkpoint schedules use completed iteration counts,
 including on resume, and also run on normal completion. video_interval and
@@ -172,11 +199,12 @@ then transfers them once for host rendering; uncapped video stores the full epis
 
 Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
 model/parameter_count/<step>.txt, gameplay/<step>.gif, eval/report/<name>/<step>.json,
-and eval/gameplay/<name>/<step>.gif. Reports include the reference name and checkpoint,
-both teams' individual returns and episode lengths, aggregate scores and TrueSkill
-ratings, the zero-based video_episode_index, configuration, seed,
-and training counters. Configuration parameters use dotted keys; existing MLflow
-parameter values are preserved on resume.
+eval/gameplay/<name>/<step>.gif, and eval/ratings/<step>.json. Per-reference reports
+include the reference name and checkpoint, both teams' individual returns and episode
+lengths, aggregate scores, the zero-based video_episode_index, configuration, seed,
+and training counters. The ratings report contains all final joint ratings, reference
+checkpoint paths, evaluation seed, and environment step. Configuration parameters use
+dotted keys; existing MLflow parameter values are preserved on resume.
 
 Checkpoints save the full configuration, parameters, optimizer state, RNG, iteration
 and transition counters, and cumulative episode statistics. Restore uses the current
@@ -197,12 +225,13 @@ import json
 import os
 from collections.abc import Callable
 from contextlib import ExitStack, closing
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 from dataclasses import field as dataclass_field
 from functools import partial
 from math import sqrt
 from operator import itemgetter
 from pathlib import Path
+from random import Random
 from statistics import fmean, stdev
 from time import monotonic
 from typing import Annotated, Any, Literal, NamedTuple, Self, cast
@@ -230,7 +259,7 @@ from flax import struct
 from flax.training.train_state import TrainState
 from jax.sharding import AxisType, Mesh, PartitionSpec
 from numpy.typing import NDArray
-from pydantic import Field, model_validator
+from pydantic import ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
 
 from rl2.actions import (
@@ -406,6 +435,12 @@ class TrainStepResult(NamedTuple):
     metrics: TrainingMetrics  # scalar leaves
 
 
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class MapSizeStage:
+    start_iteration: Annotated[int, Field(ge=0, strict=True)]
+    map_size: Annotated[int, Field(gt=0, strict=True)]
+
+
 @dataclass(frozen=True)
 class Config(BaseConfig):
     env: Annotated[
@@ -443,6 +478,7 @@ class Config(BaseConfig):
     checkpoint_interval: Annotated[int, Field(gt=0)] = 600
     log_interval: Annotated[int, Field(gt=0)] = 60
     selfplay: SelfPlayConfig | None = None
+    map_size_curriculum: tuple[MapSizeStage, ...] = ()
 
     @model_validator(mode="after")
     def validate_rollout(self) -> Self:
@@ -450,7 +486,29 @@ class Config(BaseConfig):
             raise ValueError("total_env_steps must cover at least one rollout")
         if isinstance(self.env, LuxConfig) != isinstance(self.model, LuxModelConfig):
             raise ValueError("The lux model requires the luxai_s3 environment and vice versa")
+        if self.map_size_curriculum:
+            if not isinstance(self.env, (LuxConfig, JaxNavConfig)):
+                raise ValueError("map_size_curriculum requires a Lux or JaxNav environment")
+            if self.map_size_curriculum[0].start_iteration != 0:
+                raise ValueError("map_size_curriculum must start at iteration 0")
+            previous = -1
+            for stage in self.map_size_curriculum:
+                if stage.start_iteration <= previous:
+                    raise ValueError("map_size_curriculum thresholds must be strictly increasing")
+                replace(self.env, map_size=stage.map_size)
+                previous = stage.start_iteration
         return self
+
+
+def config_for_iteration(config: Config, completed_iterations: int) -> Config:
+    """Resolve the active map size without changing the saved curriculum."""
+    for stage in reversed(config.map_size_curriculum):
+        if completed_iterations >= stage.start_iteration:
+            env = cast(LuxConfig | JaxNavConfig, config.env)
+            return (
+                config if env.map_size == stage.map_size else replace(config, env=replace(env, map_size=stage.map_size))
+            )
+    return config
 
 
 def make_actor_critic(
@@ -502,7 +560,6 @@ class TrainingProgress(NamedTuple):
     episode_return_sum: float
     episode_length_sum: int
     environment_step_count: int | None = None  # None for legacy checkpoints without transition counters.
-    observation_count: int | None = None
     opponent_pool: OpponentPool | None = None
 
 
@@ -564,7 +621,6 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
                     "training_return_sum": progress.episode_return_sum,
                     "training_length_sum": progress.episode_length_sum,
                     "environment_steps": progress.environment_step_count,
-                    "observations": progress.observation_count,
                     "opponent_pool": progress.opponent_pool is not None,
                 }
             ),
@@ -615,7 +671,6 @@ def restore_checkpoint(
         episode_return_sum=metadata["training_return_sum"],
         episode_length_sum=metadata["training_length_sum"],
         environment_step_count=metadata.get("environment_steps"),
-        observation_count=metadata.get("observations"),
         opponent_pool=pool,
     )
 
@@ -889,7 +944,7 @@ def log_video(
     )
 
 
-def log_evaluation(
+def log_reference_evaluation(
     train_state: TrainState,
     config: Config,
     writer: MLflowLogger,
@@ -900,14 +955,12 @@ def log_evaluation(
     opponent_params: optax.Params,  # leaves: parameter shapes
     opponent_name: str,
     env: PPOEnv | None = None,
-) -> None:
-    """Evaluate against a reference on fixed seeds, then replay the best episode."""
+) -> list[tuple[float, float]]:
+    """Log reference games and replay; return (current return, opponent return) pairs."""
     print(f"Evaluating {config.eval_episodes} games at step {step_count}...", flush=True)
     suffix = f"/{opponent_name}"
     started = monotonic()
     episode_results: list[dict[str, float | int]] = []
-    rating_env = trueskill.TrueSkill()
-    rating, opponent_rating = rating_env.create_rating(), rating_env.create_rating()
     env = make_env(config) if env is None else env
     for episode_index in range(config.eval_episodes):
         episode = play_episode(
@@ -921,10 +974,6 @@ def log_evaluation(
             current_team=episode_index % 2,
         )
         opponent_return = cast(float, episode.opponent_return)
-        (rating,), (opponent_rating,) = rating_env.rate(
-            [(rating,), (opponent_rating,)],
-            ranks=[int(episode.episode_return < opponent_return), int(opponent_return < episode.episode_return)],
-        )
         episode_results.append(
             {
                 "return": episode.episode_return,
@@ -954,9 +1003,6 @@ def log_evaluation(
         "return_mean": fmean(episode_return_sample),
         "return_std": std,
         "return_sem": std / sqrt(config.eval_episodes) if std is not None else None,
-        "trueskill_mean": rating.mu,
-        "trueskill_std": rating.sigma,
-        "trueskill_conservative": rating_env.expose(rating),
         "episodes": episode_results,
         "video_episode_index": video_episode_index,
         "eval_seed": config.eval_seed,
@@ -967,26 +1013,98 @@ def log_evaluation(
         "opponent_checkpoint": config.eval_ref_policies[opponent_name],
     }
     scalars = {
-        f"eval/{name}{suffix}": result[name]
-        for name in (
-            "return_mean",
-            "return_std",
-            "return_sem",
-            "trueskill_mean",
-            "trueskill_std",
-            "trueskill_conservative",
-        )
+        f"eval/episode_{name.removesuffix('_mean')}{suffix}": result[name]
+        for name in ("return_mean", "return_std", "return_sem")
         if result[name] is not None
     }
-    scalars[f"eval/training_episodes_total{suffix}"] = episode_count
     writer.log_text(json.dumps(result, indent=2, allow_nan=False), f"eval/report{suffix}/{step_count}.json")
     seconds = monotonic() - started
     scalars[f"eval/evaluation_seconds{suffix}"] = seconds
     writer.log_metrics(scalars, step_count)
     print(
-        f"Evaluation: return={result['return_mean']:.1f} over {config.eval_episodes} games in {seconds:.1f}s",
+        f"Evaluation: episode_return={result['return_mean']:.1f} over {config.eval_episodes} games in {seconds:.1f}s",
         flush=True,
     )
+    return [(result["return"], result["opponent_return"]) for result in episode_results]
+
+
+def rate_evaluation(
+    outcomes: dict[str, list[tuple[float, float]]],
+    seed: int,
+) -> tuple[trueskill.Rating, dict[str, trueskill.Rating]]:
+    """Rate (current return, opponent return) pairs once in a seeded shuffled order."""
+    rating_env = trueskill.TrueSkill()
+    current = rating_env.create_rating()
+    references = {name: rating_env.create_rating() for name in sorted(outcomes)}
+    matches = [(name, index) for name in references for index in range(len(outcomes[name]))]
+    Random(seed).shuffle(matches)
+    for name, index in matches:
+        current_return, opponent_return = outcomes[name][index]
+        (current,), (references[name],) = rating_env.rate(
+            [(current,), (references[name],)],
+            ranks=[int(current_return < opponent_return), int(opponent_return < current_return)],
+        )
+    return current, references
+
+
+def log_evaluation(
+    train_state: TrainState,
+    config: Config,
+    writer: MLflowLogger,
+    episode_count: int,
+    step_count: int,
+    *,
+    initial_carry: RecurrentCarry,  # leaves: (N, ...)
+    opponents: dict[str, optax.Params],  # values: parameter-shaped leaves
+    env: PPOEnv | None = None,
+) -> None:
+    """Evaluate all references and jointly rate this checkpoint's match results."""
+    if not opponents:
+        return
+    started = monotonic()
+    env = make_env(config) if env is None else env
+    outcomes = {
+        name: log_reference_evaluation(
+            train_state,
+            config,
+            writer,
+            episode_count,
+            step_count,
+            initial_carry=initial_carry,
+            opponent_params=params,
+            opponent_name=name,
+            env=env,
+        )
+        for name, params in opponents.items()
+    }
+    current, references = rate_evaluation(outcomes, config.eval_seed)
+    ratings = [("trueskill", "", current)] + [
+        ("reference_trueskill", f"/{name}", rating) for name, rating in references.items()
+    ]
+    scalars = {
+        f"eval/{prefix}{measurement}{suffix}": value
+        for prefix, suffix, rating in ratings
+        for measurement, value in (
+            ("", rating.mu),
+            ("_std", rating.sigma),
+            ("_conservative", rating.mu - 3 * rating.sigma),
+        )
+    }
+    writer.log_text(
+        json.dumps(
+            {
+                "ratings": scalars,
+                "eval_seed": config.eval_seed,
+                "training_steps": step_count,
+                "opponent_checkpoints": config.eval_ref_policies,
+            },
+            indent=2,
+            allow_nan=False,
+        ),
+        f"eval/ratings/{step_count}.json",
+    )
+    writer.log_metrics(scalars, step_count)
+    writer.log_metrics({"eval/evaluation_seconds": monotonic() - started}, step_count)
 
 
 def update(
@@ -1441,10 +1559,44 @@ def training_mesh(config: Config, num_agents: int) -> Mesh:
     return Mesh(devices=devices, axis_names=("batch",), axis_types=(AxisType.Auto,))
 
 
+def init_rollout_carry(
+    env: PPOEnv,
+    model: GenericActorCritic | LuxActorCritic,
+    config: Config,
+    key: jax.Array,  # () typed PRNG key
+    opponent_pool: OpponentPool | None = None,
+) -> RolloutCarry:
+    """Return fresh (E, ...) environments and (E*N, ...) memory on the training mesh."""
+    batched = PartitionSpec("batch")
+    reset_keys = jax.random.split(key, config.num_envs)  # (E,)
+    reset = jax.jit(jax.vmap(env.reset), in_shardings=batched, out_shardings=batched)
+    observation, env_state = reset(jax.device_put(reset_keys, batched))  # leaves: (E, N, ...); (E, ...)
+    assignment = None
+    if opponent_pool is not None:
+        assignment = sample_opponents(
+            jax.random.fold_in(key, config.num_envs),
+            opponent_pool,
+            cast(SelfPlayConfig, config.selfplay),
+            config.num_envs,
+        )  # leaves: (E,)
+    actor_count = config.num_envs * env.num_agents
+    carry = RolloutCarry(
+        env_state=env_state,  # leaves: (E, ...)
+        observation=observation,  # observation: (E, N, ...); masks: (E, N, *C, A)
+        model_carry=model.initial_carry(actor_count),  # leaves: (E*N, ...)
+        episode_start=jnp.ones(actor_count, dtype=bool),  # (E*N,)
+        episode_return=jnp.zeros(config.num_envs, dtype=jnp.float32),  # (E,)
+        episode_step_count=jnp.zeros(config.num_envs, dtype=jnp.int32),  # (E,)
+        selfplay=assignment,  # leaves: (E,)
+    )
+    return jax.device_put(carry, batched)  # leaves: (E, ...) or (E*N, ...)
+
+
 def train(config: Config) -> TrainState:
     """Train with a fully resolved config, as returned by load_config."""
     configure_compilation_cache()
-    env = make_env(config)
+    active_config = config_for_iteration(config, 0)
+    env = make_env(active_config)
     with ExitStack() as resources, jax.set_mesh(training_mesh(config, env.num_agents)):
         replicated = PartitionSpec()
         batched = PartitionSpec("batch")
@@ -1453,17 +1605,13 @@ def train(config: Config) -> TrainState:
         resources.enter_context(writer)
         manager = resources.enter_context(closing(checkpoint_manager(config.ckpt_dir)))
         key, init_key, reset_key = jax.random.split(jax.random.key(config.seed), 3)  # each () typed PRNG key
-        reset_key = jax.random.split(reset_key, config.num_envs)  # (E,) typed PRNG keys
-        reset = jax.jit(jax.vmap(env.reset), in_shardings=batched, out_shardings=batched)
-        observation, env_state = reset(jax.device_put(reset_key, batched))  # (E, N, ...)/(E, N, *C, A); state: (E, ...)
         model = make_actor_critic(
             action_space=env.action_space,
             model=config.model,
             dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
         )
-        actor_count = config.num_envs * env.num_agents
-        model_carry = model.initial_carry(actor_count)  # leaves: (B, ...)
-        episode_start = jnp.ones(actor_count, dtype=bool)  # (B,)
+        rollout_carry = init_rollout_carry(env, model, active_config, reset_key)  # leaves: (E, ...) or (B, ...)
+        observation = rollout_carry.observation  # leaves: (E, N, ...)
         lr_schedule = learning_rate_schedule(config)
         entropy_schedule = entropy_coef_schedule(config)
         optimizer = optax.inject_hyperparams(
@@ -1478,7 +1626,7 @@ def train(config: Config) -> TrainState:
                 init_key,
                 jax.tree.map(lambda leaf: leaf[:1, :1], observation.observation),  # leaves: (B=1, T=1, ...)
                 model.initial_carry(1),  # leaves: (B=1, ...)
-                episode_start[:1, None],  # (B=1, T=1)
+                rollout_carry.episode_start[:1, None],  # (B=1, T=1)
                 observation.actions_mask[:1, :1],  # (B=1, T=1, *C, A)
             )["params"],
             tx=optimizer(config.learning_rate),
@@ -1495,10 +1643,13 @@ def train(config: Config) -> TrainState:
             )  # key: ()
             # Live environment states are not serialized. Start fresh episodes
             # with fresh recurrent memory, retaining the policy and training RNGs.
-            reset_key = jax.random.split(jax.random.fold_in(key, start_rollout_index), config.num_envs)  # (E,) keys
-            observation, env_state = reset(
-                jax.device_put(reset_key, batched)
-            )  # (E, N, ...)/(E, N, *C, A); state: (E, ...)
+            resumed_config = config_for_iteration(config, start_rollout_index)
+            if resumed_config.env != active_config.env:
+                active_config = resumed_config
+                env = make_env(active_config)
+            rollout_carry = init_rollout_carry(
+                env, model, active_config, jax.random.fold_in(key, start_rollout_index)
+            )  # leaves: (E, ...) or (B, ...)
         train_state = jax.device_put(train_state, replicated)
         eval_references = load_eval_ref_policies(config, train_state.params)  # leaves: parameter shapes
         key, metrics = jax.device_put((key, metrics), replicated)  # key: (); metrics: scalar leaves
@@ -1518,11 +1669,6 @@ def train(config: Config) -> TrainState:
             if progress is not None and progress.environment_step_count is not None
             else start_rollout_index * batch_size
         )
-        observation_count = (
-            progress.observation_count
-            if progress is not None and progress.observation_count is not None
-            else initial_step_count * env.num_agents
-        )
         if progress is not None:
             print(f"Resumed run {config.run_id} at step {initial_step_count}", flush=True)
         writer.log_text(yaml.safe_dump(asdict(config)), f"config/{initial_step_count}.yaml")
@@ -1535,15 +1681,7 @@ def train(config: Config) -> TrainState:
         writer.log_metrics({"model/params_millions": parameter_count / 1_000_000}, initial_step_count)
         print(f"Model parameters: {parameter_count:,}", flush=True)
         writer.log_text(str(parameter_count), f"model/parameter_count/{initial_step_count}.txt")
-        rollout_carry = RolloutCarry(
-            env_state=env_state,  # leaves: (E, ...)
-            observation=observation,  # (E, N, ...)/(E, N, *C, A)
-            model_carry=model_carry,  # leaves: (B, ...)
-            episode_start=episode_start,  # (B,)
-            episode_return=jnp.zeros(config.num_envs, dtype=jnp.float32),  # (E,)
-            episode_step_count=jnp.zeros(config.num_envs, dtype=jnp.int32),  # (E,)
-            selfplay=assignment,  # leaves: (E,)
-        )
+        rollout_carry = rollout_carry._replace(selfplay=assignment)  # assignment leaves: (E,)
         rollout_carry = jax.device_put(rollout_carry, batched)  # state: (E, ...); model_carry: (B, ...)
 
         window_start = monotonic()
@@ -1552,13 +1690,26 @@ def train(config: Config) -> TrainState:
         planned_rollout_count = start_rollout_index + remaining_rollout_count
         step_count = initial_step_count
         for rollout_index in range(start_rollout_index, planned_rollout_count):
+            next_config = config_for_iteration(active_config, rollout_index)
+            if next_config.env != active_config.env:
+                active_config = next_config
+                env = make_env(active_config)
+                key, reset_key = jax.random.split(key)  # each ()
+                rollout_carry = init_rollout_carry(
+                    env, model, active_config, reset_key, opponent_pool
+                )  # leaves: (E, ...) or (B, ...)
+                print(
+                    f"Map size changed to {cast(LuxConfig | JaxNavConfig, active_config.env).map_size} "
+                    f"after {rollout_index} iterations",
+                    flush=True,
+                )
             # Schedules need a fraction, while exact lifetime counters stay as host integers.
             schedule_step = jnp.asarray(step_count, dtype=jnp.float32)  # (); avoids JIT's default int32 limit
             if opponent_pool is None:
-                result = train_step_donated(rollout_carry, train_state, env, config, key, metrics, schedule_step)
+                result = train_step_donated(rollout_carry, train_state, env, active_config, key, metrics, schedule_step)
             else:
                 result = train_step_with_pool_donated(
-                    rollout_carry, train_state, env, config, key, metrics, schedule_step, opponent_pool
+                    rollout_carry, train_state, env, active_config, key, metrics, schedule_step, opponent_pool
                 )
             train_state, rollout_carry, key, metrics = result  # state: (E, ...); model_carry: (B, ...); key/metrics: ()
             rollout_count = rollout_index + 1
@@ -1571,30 +1722,31 @@ def train(config: Config) -> TrainState:
                 )
             is_final_rollout = rollout_count == planned_rollout_count
             step_count += batch_size
-            observation_count += batch_size * env.num_agents
             if config.video_interval and (rollout_count % config.video_interval == 0 or is_final_rollout):
                 log_video(
                     train_state,
-                    config,
+                    active_config,
                     writer,
                     int(metrics.total.episode_count),
                     step_count,
                     initial_carry=model.initial_carry(env.num_agents),
                     env=env,
                 )
-            if config.eval_interval and (rollout_count % config.eval_interval == 0 or is_final_rollout):
-                for name, opponent_params in eval_references.items():
-                    log_evaluation(
-                        train_state,
-                        config,
-                        writer,
-                        int(metrics.total.episode_count),
-                        step_count,
-                        initial_carry=model.initial_carry(env.num_agents),
-                        env=env,
-                        opponent_params=opponent_params,
-                        opponent_name=name,
-                    )
+            if (
+                config.eval_interval
+                and (rollout_count % config.eval_interval == 0 or is_final_rollout)
+                and eval_references
+            ):
+                log_evaluation(
+                    train_state,
+                    active_config,
+                    writer,
+                    int(metrics.total.episode_count),
+                    step_count,
+                    initial_carry=model.initial_carry(env.num_agents),
+                    env=env,
+                    opponents=eval_references,
+                )
             if rollout_count % config.log_interval == 0 or is_final_rollout:
                 # Host logging requires the completed device metrics.
                 window, total = jax.device_get(metrics)  # scalar leaves
@@ -1612,27 +1764,26 @@ def train(config: Config) -> TrainState:
                 rate_seconds = max(window_seconds, 1e-9)
                 sps = (step_count - window_start_step_count) / rate_seconds
                 scalars: dict[str, float | int] = {
-                    "train/updates_per_iteration_mean": int(window.update_count) / window_rollout_count,
+                    "train/updates_per_iteration": int(window.update_count) / window_rollout_count,
                     "train/policy_loss": mean_metrics["policy_loss"],
                     "train/value_loss": mean_metrics["value_loss"],
                     "train/total_loss": mean_metrics["total_loss"],
                     "train/entropy": mean_metrics["entropy"],
                     "train/approx_kl": mean_metrics["approx_kl"],
-                    "train/clip_fraction": mean_metrics["clip_fraction"],
+                    "train/ppo_clip_fraction": mean_metrics["clip_fraction"],
                     "train/iterations_per_second": window_rollout_count / rate_seconds,
                     "train/env_steps_per_second": sps,
-                    "train/observations_per_second": sps * env.num_agents,
                     "train/episodes_per_second": window_episode_count / rate_seconds,
                     "train/learning_rate": learning_rate,
                     "train/entropy_coef": entropy_coef,
                     "train/episodes_total": episode_count,
                     "train/env_steps_total": step_count,
-                    "train/observations_total": observation_count,
                     "train/iterations_total": rollout_count,
-                    "train/updates_total": int(train_state.step),
                     "train/progress_fraction": min(step_count / config.total_env_steps, 1.0),
                     "rollout/episode_count": window_episode_count,
                 }
+                if isinstance(active_config.env, (LuxConfig, JaxNavConfig)):
+                    scalars["train/map_size"] = active_config.env.map_size
                 if opponent_pool is not None:
                     pool_iterations = jax.device_get(opponent_pool.iteration)  # (K,)
                     populated_iterations = pool_iterations[pool_iterations >= 0]  # (populated_slots,)
@@ -1641,7 +1792,7 @@ def train(config: Config) -> TrainState:
                 if config.target_kl is not None:
                     scalars["train/kl_early_stop_fraction"] = int(window.early_stop_count) / window_rollout_count
                 if int(window.explained_variance_count):
-                    scalars["train/explained_variance_mean"] = float(window.explained_variance_sum) / int(
+                    scalars["train/explained_variance"] = float(window.explained_variance_sum) / int(
                         window.explained_variance_count
                     )
                 if window_episode_count:
@@ -1650,25 +1801,19 @@ def train(config: Config) -> TrainState:
                     scalars["rollout/episode_end_fraction/truncated"] = (
                         window_episode_count - terminated_episode_count
                     ) / window_episode_count
-                    scalars["rollout/return_mean"] = float(window.episodes.episode_return_sum) / window_episode_count
-                    scalars["rollout/episode_length_steps_mean"] = (
-                        int(window.episodes.episode_length_sum) / window_episode_count
-                    )
+                    scalars["rollout/episode_return"] = float(window.episodes.episode_return_sum) / window_episode_count
+                    scalars["rollout/episode_length"] = int(window.episodes.episode_length_sum) / window_episode_count
                 if episode_count:
-                    scalars["train/return_mean"] = float(total.episode_return_sum) / episode_count
-                    scalars["train/episode_length_steps_mean"] = int(total.episode_length_sum) / episode_count
+                    scalars["train/episode_return_total"] = float(total.episode_return_sum) / episode_count
+                    scalars["train/episode_length_total"] = int(total.episode_length_sum) / episode_count
                 writer.log_metrics(scalars, step_count)
-                episode_return_text = f"{scalars['rollout/return_mean']:.1f}" if window_episode_count else "n/a"
-                episode_length_text = (
-                    f"{scalars['rollout/episode_length_steps_mean']:.1f}" if window_episode_count else "n/a"
-                )
+                episode_return_text = f"{scalars['rollout/episode_return']:.1f}" if window_episode_count else "n/a"
+                episode_length_text = f"{scalars['rollout/episode_length']:.1f}" if window_episode_count else "n/a"
                 explained_variance_text = (
-                    f"{scalars['train/explained_variance_mean']:.3f}"
-                    if "train/explained_variance_mean" in scalars
-                    else "n/a"
+                    f"{scalars['train/explained_variance']:.3f}" if "train/explained_variance" in scalars else "n/a"
                 )
                 print(
-                    f"iteration={rollout_count} step={step_count} episodes={episode_count} return={episode_return_text} "
+                    f"iteration={rollout_count} step={step_count} episodes={episode_count} episode_return={episode_return_text} "
                     f"episode_length={episode_length_text} "
                     f"progress={scalars['train/progress_fraction']:.3f} "
                     f"iterations/s={scalars['train/iterations_per_second']:.3f} "
@@ -1677,7 +1822,7 @@ def train(config: Config) -> TrainState:
                     f"policy={mean_metrics['policy_loss']:.3f} value={mean_metrics['value_loss']:.3f} "
                     f"entropy={mean_metrics['entropy']:.3f} kl={mean_metrics['approx_kl']:.4f} "
                     f"clipfrac={mean_metrics['clip_fraction']:.3f} ev={explained_variance_text} "
-                    f"updates={scalars['train/updates_per_iteration_mean']:.2f} "
+                    f"updates={scalars['train/updates_per_iteration']:.2f} "
                     f"window={window_seconds:.1f}s",
                     flush=True,
                 )
@@ -1696,7 +1841,6 @@ def train(config: Config) -> TrainState:
                         episode_return_sum=float(metrics.total.episode_return_sum),
                         episode_length_sum=int(metrics.total.episode_length_sum),
                         environment_step_count=step_count,
-                        observation_count=observation_count,
                         opponent_pool=opponent_pool,
                     ),
                     config,

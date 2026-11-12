@@ -189,7 +189,6 @@ def test_pool_checkpoint_restore_resize_and_disable(config: ppo.Config, tmp_path
         episode_return_sum=5.0,
         episode_length_sum=9,
         environment_step_count=9,
-        observation_count=18,
         opponent_pool=pool,
     )
     with ppo.checkpoint_manager(str(tmp_path)) as manager:
@@ -328,7 +327,6 @@ def test_training_restores_pool_inserts_snapshots_and_saves(config: ppo.Config) 
             episode_return_sum=0.0,
             episode_length_sum=0,
             environment_step_count=8,
-            observation_count=16,
             opponent_pool=pool,
         )
 
@@ -368,5 +366,5 @@ def test_training_restores_pool_inserts_snapshots_and_saves(config: ppo.Config) 
     assert history["train/pool_param_iteration_max"] == [(3.0, 12), (4.0, 16), (5.0, 20)]
     ordinary.assert_not_called()
     progress = save.call_args.args[1]
-    assert progress.environment_step_count == 20 and progress.observation_count == 40
+    assert progress.environment_step_count == 20
     np.testing.assert_array_equal(progress.opponent_pool.iteration, [0, 5, 4])
