@@ -1,11 +1,13 @@
 """MAPPO model and environment configuration validation."""
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from pathlib import Path
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
 from test_train_mappo import config as config  # noqa: PLC0414
 
+from rl2.configuration import load_config
 from rl2.train_mappo import Config, GenericModelConfig, LuxModelConfig, MLPEncoderConfig, ModelConfig
 
 
@@ -120,3 +122,26 @@ def test_rejects_invalid_lux_block_count(num_blocks: int) -> None:
 def test_rejects_invalid_attention_dimensions(field: str, value: float) -> None:
     with pytest.raises(ValidationError, match=field):
         TypeAdapter(ModelConfig).validate_python({"type": "lux", field: value})
+
+
+def test_eval_reference_config_roundtrip(config: Config, tmp_path: Path) -> None:
+    config = replace(config, eval_ref_policies={"baseline_s7": "/runs/mappo/old-run/checkpoints/5400"})
+    adapter = TypeAdapter(Config)
+    path = tmp_path / "config.yaml"
+    path.write_bytes(adapter.dump_json(config))
+    assert load_config(path, Config) == config
+    assert hash(config)
+
+
+@pytest.mark.parametrize(
+    "references",
+    [
+        {"Bad Name": "/runs/run/checkpoints/1"},
+        {"baseline": ""},
+        {"baseline": "   "},
+    ],
+    ids=["metric-label", "empty-path", "blank-path"],
+)
+def test_invalid_eval_references(config: Config, references: dict[str, str]) -> None:
+    with pytest.raises(ValidationError, match="eval_ref_policies"):
+        replace(config, eval_ref_policies=references)

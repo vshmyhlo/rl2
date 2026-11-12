@@ -2,7 +2,7 @@ import json
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import jax
@@ -12,7 +12,7 @@ import optax
 import pytest
 from flax.training.train_state import TrainState
 
-from rl2 import ppo, train_mappo
+from rl2 import ppo
 from rl2.actions import ContinuousSpace
 from rl2.envs.base import EnvStep
 from rl2.envs.gymnax_env import GymnaxEnv
@@ -204,35 +204,22 @@ def test_beta_playback_reuses_compiled_sampling_across_steps_and_episodes() -> N
     assert not np.array_equal(actions[:2], actions[2:])  # Updated parameters reach the cached graph.
 
 
-@pytest.mark.parametrize(
-    "trainer,config_path,actor_count",
-    [(ppo, "configs/ppo.yaml", 1), (train_mappo, "configs/mappo/smax.yaml", 2)],
-    ids=["ppo", "mappo"],
-)
-def test_evaluation_logs_raw_scores_and_independent_seeds(
-    trainer: ModuleType, config_path: str, actor_count: int
-) -> None:
-    config = replace(
-        trainer.load_config(Path(__file__).resolve().parents[1] / config_path, trainer.Config),
-        eval_episodes=2,
-        video_fps=12.5,
-        video_interval=0,
-    )
+def test_evaluation_logs_raw_scores_and_independent_seeds(config: ppo.Config) -> None:
+    config = replace(config, eval_episodes=2, video_fps=12.5, video_interval=0)
     writer = Mock()
     state = Mock(spec=TrainState)
-    carry = ((jnp.zeros((actor_count, 1)), jnp.zeros((actor_count, 1))),)  # leaves: (B, H=1)
+    carry = ((jnp.zeros((1, 1)), jnp.zeros((1, 1))),)  # leaves: (B, H=1)
     frame = np.zeros((2, 2, 3), np.uint8)  # (H,W,3)
     episodes = [
         ppo.EpisodeResult(episode_return=2.0, length=3, frames=[]),
-        ppo.EpisodeResult(episode_return=4.0, length=5, frames=[] if trainer is ppo else [frame]),
+        ppo.EpisodeResult(episode_return=4.0, length=5, frames=[]),
     ]
-    if trainer is ppo:
-        episodes.append(ppo.EpisodeResult(episode_return=4.0, length=5, frames=[frame]))
+    episodes.append(ppo.EpisodeResult(episode_return=4.0, length=5, frames=[frame]))
     with (
-        patch.object(trainer, "make_env") as make_env,
-        patch.object(trainer, "play_episode", side_effect=episodes) as play,
+        patch.object(ppo, "make_env") as make_env,
+        patch.object(ppo, "play_episode", side_effect=episodes) as play,
     ):
-        trainer.log_evaluation(state, config, writer, 1, 128, initial_carry=carry)
+        ppo.log_evaluation(state, config, writer, 1, 128, initial_carry=carry)
     make_env.assert_called_once_with(config)
     for index, call in enumerate(play.call_args_list):
         np.testing.assert_array_equal(
@@ -320,22 +307,10 @@ def test_log_video_wiring() -> None:
     assert writer.log_video.call_args.kwargs["fps"] == 10.0
 
 
-@pytest.mark.parametrize(
-    "trainer,config_path,actor_count",
-    [(ppo, "configs/ppo.yaml", 1), (train_mappo, "configs/mappo/smax.yaml", 2)],
-    ids=["ppo", "mappo"],
-)
-def test_playback_logging_reports_progress(
-    trainer: ModuleType,
-    config_path: str,
-    actor_count: int,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    config = replace(
-        trainer.load_config(Path(__file__).resolve().parents[1] / config_path, trainer.Config), eval_episodes=1
-    )
+def test_playback_logging_reports_progress(config: ppo.Config, capsys: pytest.CaptureFixture[str]) -> None:
+    config = replace(config, eval_episodes=1)
     writer = Mock()
-    carry = ((jnp.zeros((actor_count, 1)), jnp.zeros((actor_count, 1))),)  # leaves: (B, H=1)
+    carry = ((jnp.zeros((1, 1)), jnp.zeros((1, 1))),)  # leaves: (B, H=1)
     frame = np.zeros((2, 2, 3), np.uint8)  # (H, W, C)
     clock = 10.0
 
@@ -350,13 +325,13 @@ def test_playback_logging_reports_progress(
     writer.log_video.side_effect = partial(advance, 2.0)
     writer.log_text.side_effect = partial(advance, 1.0)
     with (
-        patch.object(trainer, "make_env"),
-        patch.object(trainer, "play_episode", side_effect=play_episode),
-        patch.object(trainer, "monotonic", side_effect=lambda: clock),
+        patch.object(ppo, "make_env"),
+        patch.object(ppo, "play_episode", side_effect=play_episode),
+        patch.object(ppo, "monotonic", side_effect=lambda: clock),
     ):
-        trainer.log_video(Mock(), config, writer, 2, 128, initial_carry=carry)
-        trainer.log_evaluation(Mock(), config, writer, 2, 128, initial_carry=carry)
-    evaluation_seconds = 9.0 if trainer is ppo else 6.0
+        ppo.log_video(Mock(), config, writer, 2, 128, initial_carry=carry)
+        ppo.log_evaluation(Mock(), config, writer, 2, 128, initial_carry=carry)
+    evaluation_seconds = 9.0
     assert capsys.readouterr().out.splitlines() == [
         "Recording gameplay at step 128 after 2 training episodes...",
         "Recorded 1 gameplay frames after 2 training episodes in 5.0s",
@@ -372,24 +347,15 @@ def test_playback_logging_reports_progress(
     )
 
 
-@pytest.mark.parametrize(
-    "trainer,config_path,actor_count",
-    [(ppo, "configs/ppo.yaml", 1), (train_mappo, "configs/mappo/smax.yaml", 2)],
-    ids=["ppo", "mappo"],
-)
-def test_single_evaluation_omits_unavailable_uncertainty(
-    trainer: ModuleType, config_path: str, actor_count: int
-) -> None:
-    config = replace(
-        trainer.load_config(Path(__file__).resolve().parents[1] / config_path, trainer.Config), eval_episodes=1
-    )
+def test_single_evaluation_omits_unavailable_uncertainty(config: ppo.Config) -> None:
+    config = replace(config, eval_episodes=1)
     writer = Mock()
-    carry = ((jnp.zeros((actor_count, 1)), jnp.zeros((actor_count, 1))),)  # leaves: (B, H=1)
+    carry = ((jnp.zeros((1, 1)), jnp.zeros((1, 1))),)  # leaves: (B, H=1)
     with (
-        patch.object(trainer, "make_env"),
-        patch.object(trainer, "play_episode", return_value=(2.0, 3, [])),
+        patch.object(ppo, "make_env"),
+        patch.object(ppo, "play_episode", return_value=(2.0, 3, [])),
     ):
-        trainer.log_evaluation(Mock(), config, writer, 0, 0, initial_carry=carry)
+        ppo.log_evaluation(Mock(), config, writer, 0, 0, initial_carry=carry)
     tags = set(writer.log_metrics.call_args.args[0])
     assert "eval/return_mean" in tags
     assert not {"eval/return_std", "eval/return_sem"} & tags

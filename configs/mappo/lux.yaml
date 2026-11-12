@@ -10,12 +10,12 @@ env:
 seed: 7
 total_env_steps: 100_000_000
 # Two GPUs: 16 environments each.
-num_envs: 32
+num_envs: 16
 # Recurrent carry persists across rollout boundaries.
-num_steps: 128
+num_steps: 512
 # Limit activation memory.
 num_minibatches: 4
-update_epochs: 4
+update_epochs: 1
 model:
   type: lux
   attention_implementation: triton
@@ -33,18 +33,20 @@ entropy_decay: constant
 value_coef: 1.0
 max_grad_norm: 0.5
 ckpt_dir: /runs/mappo/${run_id}
-run_id: mappo_lux_selfplay_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
+run_id: mappo_lux_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
 # Intervals count training iterations.
-log_interval: 1
+log_interval: 10
 video_interval: 0
 video_fps: 10
 checkpoint_interval: 200
-# Both teams share the policy; mean self-play return cannot measure strength.
+# Full Orbax checkpoint directories; each contains state/ and metadata/.
 eval_interval: 400
 eval_episodes: 100
 eval_seed: 10000
+eval_ref_policies:
+  selfplay_s7: /runs/mappo/mappo_lux_selfplay_16x16_mb4_ep1_s7/checkpoints/5400
 
-selfplay:
-  pool_size: 32
-  snapshot_interval: 50
-  current_policy_fraction: 0.5
+# selfplay:
+#   pool_size: 32
+#   snapshot_interval: 50
+#   current_policy_fraction: 0.5

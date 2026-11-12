@@ -590,7 +590,7 @@ def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_pat
     )
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(result.metrics.window.minibatch_metrics))
     # Evaluation uses all controlled agents and records the actual terminal frame.
-    episode_return, length, frames = ppo.play_episode(
+    episode = ppo.play_episode(
         result.train_state,
         config,
         jax.random.key(3),
@@ -598,15 +598,15 @@ def test_real_smax_single_step_update_and_checkpoint(config: ppo.Config, tmp_pat
         record=True,
         env=env,
     )
-    assert np.isfinite(episode_return)
-    assert length == 1 and len(frames) == 2
-    assert frames[-1].shape == (400, 400, 3)
+    assert np.isfinite(episode.episode_return)
+    assert episode.length == 1 and len(episode.frames) == 2
+    assert episode.frames[-1].shape == (400, 400, 3)
     progress = ppo.TrainingProgress(
         train_state=result.train_state,
         key=result.key,  # ()
         rollout_count=1,
         episode_count=1,
-        episode_return_sum=episode_return,
+        episode_return_sum=episode.episode_return,
         episode_length_sum=1,
         environment_step_count=1,
         observation_count=env.num_agents,
@@ -710,6 +710,7 @@ def test_compiled_episode_state_buffer(recording_capacity: int) -> None:
         stop_at_frame_limit=True,
     )
     assert result.episode_return.shape == result.length.shape == ()
+    assert result.opponent_return is None
     assert float(result.episode_return) == 3.0 and int(result.length) == 2
     if recording_capacity == 0:
         assert result.states is None
@@ -753,6 +754,7 @@ def test_episode_frame_limits(
         )
     assert result.length == expected_length and len(result.frames) == expected_frames
     assert result.episode_return == sum(range(1, expected_length + 1))
+    assert result.opponent_return is None
     assert all(frame.shape == (2, 2, 3) and frame.dtype == np.uint8 for frame in result.frames)
     # The final frame must precede autoreset, which returns the step counter to zero.
     np.testing.assert_array_equal(result.frames[-1], expected_frames - 1)
@@ -894,15 +896,15 @@ def test_training_resume_wiring_and_environment_step_logging(
     else:
         state = ppo.train(config)
     writer.log_params.assert_called_once_with(asdict(config))
-    for logger in (video, evaluation):
-        if not interval:
-            logger.assert_not_called()
-            continue
-        logger.assert_called_once()
-        assert logger.call_args.args[0] is state
-        assert logger.call_args.args[3:] == (2, 10)
-        chex.assert_shape(jax.tree.leaves(logger.call_args.kwargs["initial_carry"]), (2, 4))
-        assert logger.call_args.kwargs["env"] is env
+    evaluation.assert_not_called()
+    if interval:
+        video.assert_called_once()
+        assert video.call_args.args[0] is state
+        assert video.call_args.args[3:] == (2, 10)
+        chex.assert_shape(jax.tree.leaves(video.call_args.kwargs["initial_carry"]), (2, 4))
+        assert video.call_args.kwargs["env"] is env
+    else:
+        video.assert_not_called()
     scalars = {tag: value[-1] for tag, value in metric_history(writer).items()}
     assert scalars["train/env_steps_total"] == (10.0, 10)
     assert scalars["train/observations_total"] == (26.0, 10)
@@ -1175,21 +1177,86 @@ def test_grouped_model_balances_types_and_masks(config: ppo.Config) -> None:
     np.testing.assert_allclose(step.policy.entropy(), output.policy.entropy()[:, 0], atol=1e-6)
 
 
-@pytest.mark.parametrize("start", [0, 137], ids=["fresh", "resume-without-history"])
-def test_eval_snapshot_ages_and_final_schedule(start: int) -> None:
-    history: dict[int, optax.Params] = {}
-    final_iteration = 651
-    for iteration in range(start, final_iteration):
-        params = {"weight": np.asarray([iteration], dtype=np.float32)}  # (1,)
-        ppo.retain_eval_snapshot(history, params, iteration, 60, final_iteration)
-        params["weight"][0] = -1  # Snapshots must own storage even on CPU.
-        completed = iteration + 1
-        if completed % 60 == 0 or completed == final_iteration:
-            available = {age: history[completed - age] for age in ppo.EVAL_OPPONENT_AGES if completed - age in history}
-            assert set(available) == {age for age in ppo.EVAL_OPPONENT_AGES if completed - age >= start}
-            for age, snapshot in available.items():
-                np.testing.assert_array_equal(snapshot["weight"], [completed - age])
-        assert all(previous >= iteration - 400 for previous in history)
+def test_reference_checkpoint_restores_only_pinned_parameters(config: ppo.Config, tmp_path: Path) -> None:
+    config = replace(
+        config,
+        ckpt_dir=str(tmp_path / "learner"),
+        eval_interval=1,
+        eval_ref_policies={"baseline": str(tmp_path / "reference/checkpoints/1")},
+    )
+    params = {"weight": jnp.array([2.0, 3.0])}  # (2,)
+    state = TrainState.create(apply_fn=Mock(), params=params, tx=optax.adam(0.1))
+    progress = ppo.TrainingProgress(
+        train_state=state,
+        key=jax.random.key(0),  # ()
+        rollout_count=1,
+        episode_count=0,
+        episode_return_sum=0.0,
+        episode_length_sum=0,
+    )
+    with ppo.checkpoint_manager(str(tmp_path / "reference")) as manager:
+        ppo.save_checkpoint(manager, progress, config)
+        ppo.save_checkpoint(
+            manager,
+            progress._replace(rollout_count=2, train_state=state.replace(params={"weight": params["weight"] + 10})),
+            config,
+        )
+    # A reference needs neither its optimizer nor its saved configuration/metadata.
+    (tmp_path / "reference/checkpoints/1/metadata/metadata").unlink()
+    target = jax.tree.map(jnp.zeros_like, params)  # leaves: (2,)
+    restored = ppo.load_eval_ref_policies(config, target)["baseline"]  # leaves: (2,)
+    chex.assert_trees_all_equal(restored, params)
+    assert restored["weight"].shape == (2,)
+    assert restored["weight"].sharding == target["weight"].sharding
+    assert not (tmp_path / "learner").exists()
+    with pytest.raises(FileNotFoundError):
+        ppo.load_eval_ref_policies(
+            replace(config, eval_ref_policies={"missing": str(tmp_path / "reference/checkpoints/3")}), target
+        )
+    with pytest.raises(ValueError, match="shape"):
+        ppo.load_eval_ref_policies(config, {"weight": jnp.zeros(3)})  # (3,) differs from saved (2,)
+
+
+@pytest.mark.parametrize("location", ["absolute", "relative", "gcs"])
+def test_reference_checkpoint_paths(
+    config: ppo.Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    root = {"absolute": str(tmp_path / "references"), "relative": "references", "gcs": "gs://bucket/references"}[
+        location
+    ]
+    config = replace(
+        config,
+        ckpt_dir="unrelated/learner",
+        eval_interval=1,
+        eval_ref_policies={"baseline": f"{root}/reference/checkpoints/12/"},
+    )
+    params = {"weight": jnp.zeros(2)}  # (2,)
+    with patch.object(ppo.ocp, "PyTreeCheckpointer") as factory:
+        checkpointer = factory.return_value.__enter__.return_value
+        checkpointer.restore.return_value = {"train_state": {"params": params}}
+        assert ppo.load_eval_ref_policies(config, params)["baseline"] is params
+        directory = f"{root}/reference/checkpoints/12/state"
+        assert checkpointer.restore.call_args.args == (directory if location == "gcs" else str(tmp_path / directory),)
+
+
+@pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "empty-references"])
+def test_reference_loading_skips_unused_checkpoints(config: ppo.Config, enabled: bool) -> None:
+    config = replace(
+        config, eval_interval=int(enabled), eval_ref_policies={} if enabled else {"baseline": "/missing/checkpoints/1"}
+    )
+    with patch.object(ppo.ocp, "PyTreeCheckpointer") as factory:
+        assert ppo.load_eval_ref_policies(config, {}) == {}
+        factory.assert_not_called()
+
+
+@pytest.mark.parametrize("selfplay", [False, True], ids=["unsupported", "too-many-agents"])
+def test_reference_evaluation_requires_two_opposing_agents(config: ppo.Config, selfplay: bool) -> None:
+    config = replace(
+        config, env=SMAXConfig(selfplay=selfplay), eval_ref_policies={"baseline": "/runs/reference/checkpoints/1"}
+    )
+    with pytest.raises(ValueError, match="eval_ref_policies"):
+        ppo.make_env(config)
 
 
 class ScriptedMatch(ScriptedSMAX):
@@ -1200,10 +1267,10 @@ class ScriptedMatch(ScriptedSMAX):
         action: jax.Array,  # (N=2,)
     ) -> MultiAgentStep[State, jax.Array]:
         result = super().step(key, state, action)
-        return result._replace(reward=action.astype(jnp.float32))  # (N=2,)
+        return result._replace(reward=action.astype(jnp.float32) + 1)  # (N=2,)
 
 
-def test_historical_playback_uses_separate_weights_and_current_team_reward(config: ppo.Config) -> None:
+def test_reference_playback_uses_separate_weights_and_current_team_reward(config: ppo.Config) -> None:
     env = ScriptedMatch()
 
     def policy(
@@ -1226,7 +1293,7 @@ def test_historical_playback_uses_separate_weights_and_current_team_reward(confi
 
     state = TrainState.create(apply_fn=policy, params={"increment": jnp.asarray(1.0)}, tx=optax.sgd(0.1))
     memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
-    for team, expected_return in ((0, 2.0), (1, 3.0)):
+    for team, expected_return in ((0, 4.0), (1, 5.0)):
         result = ppo.play_episode(
             state,
             config,
@@ -1238,26 +1305,45 @@ def test_historical_playback_uses_separate_weights_and_current_team_reward(confi
             current_team=team,
         )
         assert result.episode_return == expected_return
+        assert result.opponent_return == 2.0
         assert result.length == 2
 
 
 @pytest.mark.parametrize(
-    "returns,best_index",
-    [([0.0], 0), ([-2.0, 3.0, 1.0], 1), ([0.0, 0.0], 0)],
-    ids=["no-uncertainty", "best-on-opposite-side", "first-tied-zero"],
+    "returns,opponent_returns,best_index,expected_mu",
+    [
+        ([3.0], [2.0], 0, 29.395832),
+        ([1.0], [4.0], 0, 20.604168),
+        ([2.0], [2.0], 0, 25.0),
+        ([-2.0, 3.0, 1.0], [0.0, 2.0, 1.0], 1, 25.531627),
+        ([0.0, 0.0], [0.0, 0.0], 0, 25.0),
+    ],
+    ids=["win", "positive-return-loss", "nonzero-draw", "mixed-results", "first-tied-zero"],
 )
-def test_historical_eval_metrics_and_artifacts(config: ppo.Config, returns: list[float], best_index: int) -> None:
+def test_reference_eval_metrics_and_artifacts(
+    config: ppo.Config,
+    returns: list[float],
+    opponent_returns: list[float],
+    best_index: int,
+    expected_mu: float,
+) -> None:
     episodes = len(returns)
-    config = replace(config, env=LuxConfig(), model=ppo.LuxModelConfig(), eval_episodes=episodes)
+    references = {"baseline": "/runs/old_run/checkpoints/20", "stronger": "/runs/other_run/checkpoints/40"}
+    config = replace(
+        config, env=LuxConfig(), model=ppo.LuxModelConfig(), eval_episodes=episodes, eval_ref_policies=references
+    )
     writer = Mock()
     memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
     opponent = {"weight": jnp.asarray(7.0)}  # ()
     frame = np.zeros((2, 2, 3), dtype=np.uint8)  # (H, W, C)
-    results = [ppo.EpisodeResult(episode_return=value, length=2, frames=[]) for value in returns]
+    results = [
+        ppo.EpisodeResult(episode_return=value, length=2, frames=[], opponent_return=opponent_return)
+        for value, opponent_return in zip(returns, opponent_returns, strict=True)
+    ]
     # The capped replay must not contribute to score or episode-length statistics.
-    results.append(ppo.EpisodeResult(episode_return=99.0, length=1, frames=[frame]))
-    with patch.object(ppo, "play_episode", side_effect=results * len(ppo.EVAL_OPPONENT_AGES)) as play:
-        for age in ppo.EVAL_OPPONENT_AGES:
+    results.append(ppo.EpisodeResult(episode_return=99.0, length=1, frames=[frame], opponent_return=0.0))
+    with patch.object(ppo, "play_episode", side_effect=results * len(references)) as play:
+        for name in references:
             ppo.log_evaluation(
                 Mock(),
                 config,
@@ -1267,7 +1353,7 @@ def test_historical_eval_metrics_and_artifacts(config: ppo.Config, returns: list
                 initial_carry=memory,
                 env=Mock(),
                 opponent_params=opponent,
-                opponent_age=age,
+                opponent_name=name,
             )
     for index, call in enumerate(play.call_args_list):
         position = index % (episodes + 1)
@@ -1282,35 +1368,95 @@ def test_historical_eval_metrics_and_artifacts(config: ppo.Config, returns: list
             jax.random.key_data(call.args[2]),
             jax.random.key_data(jax.random.fold_in(jax.random.key(config.eval_seed), episode_index)),
         )
-    for age, call in zip(ppo.EVAL_OPPONENT_AGES, writer.log_metrics.call_args_list, strict=True):
+    for name, call in zip(references, writer.log_metrics.call_args_list, strict=True):
         metrics, step = call.args
         assert step == 1600
-        assert metrics[f"eval/return_mean/age_{age}"] == pytest.approx(sum(returns) / episodes)
-        assert metrics[f"eval/training_episodes_total/age_{age}"] == 5
-        assert (f"eval/return_std/age_{age}" in metrics) == (episodes > 1)
-        assert (f"eval/return_sem/age_{age}" in metrics) == (episodes > 1)
-        assert all(tag.endswith(f"/age_{age}") for tag in metrics)
-    for call in writer.log_text.call_args_list:
+        assert metrics[f"eval/return_mean/{name}"] == pytest.approx(sum(returns) / episodes)
+        assert metrics[f"eval/training_episodes_total/{name}"] == 5
+        assert (f"eval/return_std/{name}" in metrics) == (episodes > 1)
+        assert (f"eval/return_sem/{name}" in metrics) == (episodes > 1)
+        mu = metrics[f"eval/trueskill_mean/{name}"]
+        sigma = metrics[f"eval/trueskill_std/{name}"]
+        assert 0 < sigma < 25 / 3
+        assert mu == pytest.approx(expected_mu)
+        assert metrics[f"eval/trueskill_conservative/{name}"] == pytest.approx(mu - 3 * sigma)
+        assert all(tag.endswith(f"/{name}") for tag in metrics)
+    # Each reference starts fresh, even when evaluated in the same process.
+    first, second = (call.args[0] for call in writer.log_metrics.call_args_list)
+    for metric in ("trueskill_mean", "trueskill_std", "trueskill_conservative"):
+        assert first[f"eval/{metric}/baseline"] == second[f"eval/{metric}/stronger"]
+    for name, call in zip(references, writer.log_text.call_args_list, strict=True):
         report = json.loads(call.args[0])
+        assert report["opponent_name"] == name
+        assert report["opponent_checkpoint"] == references[name]
         assert report["video_episode_index"] == best_index
         assert report["episodes"] == [
-            {"return": value, "length": 2, "current_team": index % 2} for index, value in enumerate(returns)
+            {"return": value, "opponent_return": opponent_returns[index], "length": 2, "current_team": index % 2}
+            for index, value in enumerate(returns)
         ]
+        for metric in ("trueskill_mean", "trueskill_std", "trueskill_conservative"):
+            assert report[metric] == first[f"eval/{metric}/baseline"]
     assert [call.args[1] for call in writer.log_text.call_args_list] == [
-        f"eval/report/age_{age}/1600.json" for age in ppo.EVAL_OPPONENT_AGES
+        f"eval/report/{name}/1600.json" for name in references
     ]
     assert [call.args[1] for call in writer.log_video.call_args_list] == [
-        f"eval/gameplay/age_{age}/1600.gif" for age in ppo.EVAL_OPPONENT_AGES
+        f"eval/gameplay/{name}/1600.gif" for name in references
     ]
 
 
-def test_training_evaluates_exact_historical_iterations(config: ppo.Config) -> None:
+def test_reference_evaluation_progress_and_timings(config: ppo.Config, capsys: pytest.CaptureFixture[str]) -> None:
+    config = replace(config, eval_episodes=1, eval_ref_policies={"baseline": "/runs/reference/checkpoints/1"})
+    writer = Mock()
+    memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)  # (H, W, C)
+    episode = ppo.EpisodeResult(episode_return=2.0, length=1, frames=[frame], opponent_return=1.0)
+    with (
+        patch.object(ppo, "play_episode", return_value=episode),
+        patch.object(ppo, "monotonic", side_effect=[10.0, 15.0, 15.0, 24.0]),
+    ):
+        ppo.log_video(Mock(), config, writer, 2, 128, initial_carry=memory, env=Mock())
+        ppo.log_evaluation(
+            Mock(),
+            config,
+            writer,
+            2,
+            128,
+            initial_carry=memory,
+            env=Mock(),
+            opponent_params={},
+            opponent_name="baseline",
+        )
+    assert capsys.readouterr().out.splitlines() == [
+        "Recording gameplay at step 128 after 2 training episodes...",
+        "Recorded 1 gameplay frames after 2 training episodes in 5.0s",
+        "Evaluating 1 games at step 128...",
+        "Evaluation: return=2.0 over 1 games in 9.0s",
+    ]
+    writer.log_metrics.assert_any_call({"actor/video_seconds": 5.0}, 128)
+    assert writer.log_metrics.call_args.args[0]["eval/evaluation_seconds/baseline"] == 9.0
+    assert [call.args[1] for call in writer.log_video.call_args_list] == [
+        "gameplay/128.gif",
+        "eval/gameplay/baseline/128.gif",
+    ]
+
+
+@pytest.mark.parametrize(
+    "lux,references",
+    [
+        (True, {}),
+        (False, {}),
+        (True, {"baseline": "/runs/old_run/checkpoints/20", "stronger": "/runs/other_run/checkpoints/40"}),
+    ],
+    ids=["lux-no-references", "generic-no-references", "fixed-references"],
+)
+def test_training_evaluates_fixed_references(config: ppo.Config, lux: bool, references: dict[str, str]) -> None:
     config = replace(
         config,
-        env=LuxConfig(),
-        model=ppo.LuxModelConfig(),
-        total_env_steps=401 * 4,
-        eval_interval=100,
+        env=LuxConfig() if lux else config.env,
+        model=ppo.LuxModelConfig() if lux else config.model,
+        total_env_steps=3 * 4,
+        eval_interval=2,
+        eval_ref_policies=references,
         log_interval=1000,
     )
     model = Mock()
@@ -1335,6 +1481,7 @@ def test_training_evaluates_exact_historical_iterations(config: ppo.Config) -> N
             metrics=metrics,
         )
 
+    opponents = {name: {"weight": jnp.asarray(float(index))} for index, name in enumerate(references)}  # leaves: ()
     with (
         patch.object(ppo, "make_env", return_value=ScriptedSMAX()),
         patch.object(ppo, "make_actor_critic", return_value=model),
@@ -1344,23 +1491,20 @@ def test_training_evaluates_exact_historical_iterations(config: ppo.Config) -> N
         patch.object(ppo, "save_checkpoint", return_value=1.0),
         patch.object(ppo, "train_step_donated", side_effect=train_step),
         patch.object(ppo, "log_evaluation") as evaluate,
+        patch.object(ppo, "load_eval_ref_policies", return_value=opponents) as load,
     ):
         ppo.train(config)
-    expected = [
-        (iteration, age)
-        for iteration in (100, 200, 300, 400, 401)
-        for age in ppo.EVAL_OPPONENT_AGES
-        if age <= iteration
-    ]
+    load.assert_called_once()
+    expected = [(iteration, name) for iteration in (2, 3) for name in references]
     assert len(evaluate.call_args_list) == len(expected)
-    for call, (iteration, age) in zip(evaluate.call_args_list, expected, strict=True):
+    for call, (iteration, name) in zip(evaluate.call_args_list, expected, strict=True):
         assert call.args[4] == iteration * 4
-        assert call.kwargs["opponent_age"] == age
+        assert call.kwargs["opponent_name"] == name
         assert float(call.args[0].params["weight"]) == iteration
-        assert float(call.kwargs["opponent_params"]["weight"]) == iteration - age
+        assert call.kwargs["opponent_params"] is opponents[name]
 
 
-def test_historical_playback_pytree_observations_and_multidiscrete_actions() -> None:
+def test_reference_playback_pytree_observations_and_multidiscrete_actions() -> None:
     observation = AgentObservation(
         observation={"map": jnp.zeros((2, 2, 2), dtype=jnp.int16), "score": jnp.zeros((2, 1))},
         actions_mask=jnp.ones((2, 2, 3), dtype=bool),
@@ -1412,5 +1556,7 @@ def test_historical_playback_pytree_observations_and_multidiscrete_actions() -> 
         stop_at_frame_limit=False,
     )
     assert result.states.shape == (2, 2, 2)
+    assert result.episode_return.shape == result.opponent_return.shape == ()
+    assert float(result.opponent_return) == 2.0
     np.testing.assert_array_equal(result.states[1], [[1, 1], [0, 0]])
     assert float(result.episode_return) == 0.0 and int(result.length) == 1

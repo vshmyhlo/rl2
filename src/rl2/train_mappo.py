@@ -122,7 +122,6 @@ Latest settings and session timings:
     train/elapsed_seconds: Wall seconds since this session's rollout loop started,
         through the current metric read, including intervening overhead.
     actor/video_seconds: Gameplay recording, encoding, and upload wall seconds.
-    eval/evaluation_seconds: Evaluation through gameplay/report upload wall seconds.
     checkpoint/save_seconds: Blocking wall seconds to prepare and submit an async
         checkpoint, including any wait for the previous save; excludes background
         writes and the final shutdown wait.
@@ -130,27 +129,42 @@ Latest settings and session timings:
         environment step, and exclude logging the timing itself.
     model/params_millions: Parameter count in millions at startup, including resume.
 
-Evaluation logs eval/return_mean, eval/return_std, and eval/return_sem: raw return
-mean, sample standard deviation, and standard error over eval_episodes fixed seeds.
-Uncertainty metrics are omitted for one episode. eval/training_episodes_total is
-the lifetime completed training episode count at evaluation.
-
-Lux evaluates against snapshots exactly 100, 200, 300, and 400 completed iterations
-old (not minibatch updates), with eval_episodes fixed seeds per opponent. The current
-policy alternates team sides by episode index; its return sums only its own team's
-match-win rewards. Metrics are eval/return_mean/age_<age>, eval/return_std/age_<age>,
-eval/return_sem/age_<age>, eval/training_episodes_total/age_<age>, and
-eval/evaluation_seconds/age_<age>, where <age> is 100, 200, 300, or 400. Reductions,
-timing boundaries, omission of single-episode uncertainty, and environment-step
-semantics match ordinary evaluation. Unavailable ages are omitted, including until
-enough new history exists after resume. Host snapshots cover scheduled and final
-evaluations and are not checkpointed.
+eval_ref_policies maps lowercase snake_case names to full Orbax checkpoint directory
+paths, such as /runs/mappo/<run_id>/checkpoints/<iteration>. Local and gs:// storage
+are supported; relative local paths resolve from the working directory. Each path
+points to the checkpoint root; the loader reads its state/ child.
+Only policy parameters are loaded, once at startup when evaluation is enabled,
+using the current model configuration and device placement. Saved configurations,
+optimizers, and opponent pools are ignored. References require a self-play environment
+with exactly two controlled agents. Evaluation only plays against references;
+without references, evaluation is omitted for every environment.
+Each reference gets eval_episodes fixed seeds. The current policy alternates team
+sides by episode index; returns sum only its team's rewards (Lux: match-win rewards).
+Evaluation metrics use <name> from eval_ref_policies:
+    eval/return_mean/<name>, eval/return_std/<name>, eval/return_sem/<name>: Raw return
+        mean, sample standard deviation, and standard error over eval_episodes seeds.
+        Uncertainty metrics are omitted for one episode.
+    eval/trueskill_mean/<name>, eval/trueskill_std/<name>: Current policy's posterior
+        skill mean (mu) and standard deviation (sigma), in TrueSkill rating points.
+    eval/trueskill_conservative/<name>: Current policy's mu - 3 * sigma rating.
+        Each full episode is one result: higher total team reward wins; equal
+        rewards draw (Lux: compare total match wins). Both policies start fresh
+        per reference/evaluation with package defaults: mu=25, sigma=25/3,
+        beta=25/6, tau=25/300, draw_probability=0.1. Update both ratings in seed
+        order, excluding the video replay. Ratings are relative to that reference,
+        not calibrated across references, and do not accumulate across evaluations.
+    eval/training_episodes_total/<name>: Lifetime completed training episode count,
+        including restored history.
+    eval/evaluation_seconds/<name>: Wall seconds from evaluation through gameplay
+        and report upload, excluding metric logging.
+These metrics are logged only when that reference is evaluated, at the current
+environment-step count, on the evaluation schedule below.
 
 Enabled video, evaluation, and checkpoint schedules use completed iteration counts,
 including on resume, and also run on normal completion. video_interval and
 eval_interval default to 0 (disabled), and checkpoint_interval to 600. A zero video
 interval disables standalone gameplay. Evaluation replays its highest-return episode
-(per opponent age for Lux) for one video, independently of video_interval. The first
+(per reference policy) for one video, independently of video_interval. The first
 episode wins ties. Scores include every full episode; the replay does not enter metrics.
 video_max_frames (default: 900; None: unlimited) caps recordings. GIFs loop at video_fps
 with frame boundaries rounded to 10 ms and a minimum 10 ms frame delay.
@@ -159,10 +173,10 @@ together. Video buffers states up to the frame cap or configured episode horizon
 then transfers them once for host rendering; uncapped video stores the full episode.
 
 Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
-model/parameter_count/<step>.txt, eval/report/<step>.json, gameplay/<step>.gif,
-and eval/gameplay/<step>.gif. Lux uses eval/report/age_<age>/<step>.json and
-eval/gameplay/age_<age>/<step>.gif. Evaluation reports include individual returns and
-lengths, aggregate scores, the zero-based video_episode_index, configuration, seed,
+model/parameter_count/<step>.txt, gameplay/<step>.gif, eval/report/<name>/<step>.json,
+and eval/gameplay/<name>/<step>.gif. Reports include the reference name and checkpoint,
+both teams' individual returns and episode lengths, aggregate scores and TrueSkill
+ratings, the zero-based video_episode_index, configuration, seed,
 and training counters. Configuration parameters use dotted keys; existing MLflow
 parameter values are preserved on resume.
 
@@ -186,6 +200,7 @@ import os
 from collections.abc import Callable
 from contextlib import ExitStack, closing
 from dataclasses import asdict, fields
+from dataclasses import field as dataclass_field
 from datetime import timedelta
 from functools import partial
 from math import sqrt
@@ -212,6 +227,7 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import rlax
+import trueskill
 import yaml
 from flax import struct
 from flax.training.train_state import TrainState
@@ -421,6 +437,10 @@ class Config(BaseConfig):
     eval_interval: Annotated[int, Field(ge=0)] = 0
     eval_episodes: Annotated[int, Field(gt=0)] = 100
     eval_seed: Annotated[int, Field(ge=0, lt=2**32)] = 10_000
+    eval_ref_policies: dict[
+        Annotated[str, Field(pattern=r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")],
+        Annotated[str, Field(pattern=r"\S")],
+    ] = dataclass_field(default_factory=dict, hash=False)
     lr_decay: Literal["linear", "cosine"] = "linear"
     entropy_decay: Literal["constant", "cosine"] = "constant"
     checkpoint_interval: Annotated[int, Field(gt=0)] = 600
@@ -468,6 +488,8 @@ def make_env(config: Config) -> PPOEnv:
             raise ValueError("selfplay pool requires an environment with supports_selfplay=True")
         if env.num_agents != 2:
             raise ValueError("selfplay pool requires two controlled agents; multi-agent teams need explicit grouping")
+    if config.eval_ref_policies and (not env.supports_selfplay or env.num_agents != 2):
+        raise ValueError("eval_ref_policies requires a self-play environment with two controlled agents")
     sequence_count = config.num_envs * (1 if config.selfplay is not None else env.num_agents)
     if sequence_count % config.num_minibatches:
         label = "num_envs" if config.selfplay is not None else "num_envs * num_agents"
@@ -601,6 +623,30 @@ def restore_checkpoint(
     )
 
 
+def load_eval_ref_policies(config: Config, params: optax.Params) -> dict[str, optax.Params]:  # parameter-shaped leaves
+    """Restore only fixed opponent weights, with the current parameters' shapes and sharding."""
+    if not config.eval_interval or not config.eval_ref_policies:
+        return {}
+    target = {"train_state": {"params": params}}  # leaves: parameter shapes
+    references: dict[str, optax.Params] = {}  # leaves: parameter shapes
+    with ocp.PyTreeCheckpointer() as checkpointer:
+        for name, checkpoint in config.eval_ref_policies.items():
+            directory = f"{checkpoint.rstrip('/')}/state"
+            if not directory.startswith("gs://"):
+                directory = str(Path(directory).resolve())
+            restored = checkpointer.restore(
+                directory,
+                args=ocp.args.PyTreeRestore(
+                    item=target,
+                    restore_args=ocp.checkpoint_utils.construct_restore_args(target),
+                    partial_restore=True,
+                ),
+            )  # leaves: parameter shapes
+            references[name] = restored["train_state"]["params"]
+            print(f"Loaded evaluation reference {name}: {checkpoint}", flush=True)
+    return references  # leaves: parameter shapes
+
+
 def decay_schedule(initial_value: float, total_env_steps: int, decay: Literal["linear", "cosine"]) -> optax.Schedule:
     schedule = (
         optax.cosine_decay_schedule(initial_value, 1)
@@ -634,7 +680,7 @@ class EpisodeState(NamedTuple):
     final_state: Any  # leaves: (...), before autoreset
     model_carry: RecurrentCarry  # leaves: (N, ...)
     episode_starts: jax.Array  # (N,)
-    episode_return: jax.Array  # ()
+    team_returns: jax.Array  # (N,)
     length: jax.Array  # ()
     done: jax.Array  # ()
 
@@ -643,9 +689,7 @@ class EpisodeResult(NamedTuple):
     episode_return: float
     length: int
     frames: list[NDArray[np.uint8]]  # each (H, W, 3)
-
-
-EVAL_OPPONENT_AGES = (100, 200, 300, 400)
+    opponent_return: float | None  # None without a reference opponent
 
 
 class EvaluationMatch(NamedTuple):
@@ -654,30 +698,11 @@ class EvaluationMatch(NamedTuple):
     current_team: jax.Array  # () team index
 
 
-def retain_eval_snapshot(
-    history: dict[int, optax.Params],
-    params: optax.Params,  # leaves: parameter shapes
-    iteration: int,
-    eval_interval: int,
-    final_iteration: int,
-) -> None:
-    """Keep independent host weights needed by scheduled or final evaluations."""
-    for previous in list(history):
-        if previous < iteration - max(EVAL_OPPONENT_AGES):
-            del history[previous]
-    if any(
-        iteration + age <= final_iteration
-        and ((iteration + age) % eval_interval == 0 or iteration + age == final_iteration)
-        for age in EVAL_OPPONENT_AGES
-    ):
-        # Training donates its buffers; host copies must own their storage.
-        history[iteration] = jax.tree.map(lambda leaf: leaf.copy(), jax.device_get(params))
-
-
 class CompiledEpisode(NamedTuple):
     episode_return: jax.Array  # ()
     length: jax.Array  # ()
     states: Any  # leaves: (F, ...), initial then pre-autoreset states; None without recording
+    opponent_return: jax.Array | None  # () with a reference opponent
 
 
 @partial(jax.jit, static_argnames=("env", "apply_fn", "recording_capacity", "stop_at_frame_limit"))
@@ -701,7 +726,7 @@ def run_episode(
         final_state=env_state,  # leaves: (...)
         model_carry=initial_carry,  # leaves: (N, ...)
         episode_starts=jnp.ones(env.num_agents, dtype=bool),  # (N,)
-        episode_return=jnp.asarray(0.0, dtype=jnp.float32),  # ()
+        team_returns=jnp.zeros(env.num_agents, dtype=jnp.float32),  # (N,)
         length=jnp.asarray(0, dtype=jnp.int32),  # ()
         done=jnp.asarray(False),  # ()
     )
@@ -761,10 +786,7 @@ def run_episode(
             final_state=result.final_state,  # leaves: (...)
             model_carry=model_carry,  # leaves: (N, ...)
             episode_starts=jnp.asarray(result.agent_done, dtype=bool),  # (N,)
-            episode_return=state.episode_return
-            + (
-                result.reward[params.current_team] if isinstance(params, EvaluationMatch) else result.reward.mean()
-            ),  # ()
+            team_returns=state.team_returns + result.reward,  # (N,)
             length=state.length + 1,  # ()
             done=jnp.asarray(result.done, dtype=bool),  # ()
         )
@@ -776,7 +798,18 @@ def run_episode(
         return state, saved
 
     state, saved = jax.lax.while_loop(condition, body, (state, saved))
-    return CompiledEpisode(episode_return=state.episode_return, length=state.length, states=saved)
+    return CompiledEpisode(
+        episode_return=(
+            state.team_returns[params.current_team]
+            if isinstance(params, EvaluationMatch)
+            else state.team_returns.mean()
+        ),  # ()
+        length=state.length,  # ()
+        states=saved,  # leaves: (F, ...) or None
+        opponent_return=(
+            state.team_returns[1 - params.current_team] if isinstance(params, EvaluationMatch) else None
+        ),  # () or None
+    )
 
 
 def play_episode(
@@ -823,7 +856,12 @@ def play_episode(
         for index in range(min(int(result.length) + 1, recording_capacity)):
             env_state = jax.tree.map(itemgetter(index), result.states)  # leaves: (...)
             frames.append(np.asarray(env.render(env_state)))  # (H, W, 3)
-    return EpisodeResult(episode_return=float(result.episode_return), length=int(result.length), frames=frames)
+    return EpisodeResult(
+        episode_return=float(result.episode_return),
+        length=int(result.length),
+        frames=frames,
+        opponent_return=None if result.opponent_return is None else float(result.opponent_return),
+    )
 
 
 def log_video(
@@ -839,7 +877,7 @@ def log_video(
     """Record a separate episode up to the frame cap and log its gameplay GIF."""
     print(f"Recording gameplay at step {step_count} after {episode_count} training episodes...", flush=True)
     started = monotonic()
-    _, _, frames = play_episode(
+    episode = play_episode(
         train_state,
         config,
         jax.random.fold_in(jax.random.key(config.seed), episode_count),
@@ -848,11 +886,12 @@ def log_video(
         stop_at_frame_limit=True,
         env=make_env(config) if env is None else env,
     )
-    writer.log_video(frames, f"gameplay/{step_count}.gif", fps=config.video_fps)
+    writer.log_video(episode.frames, f"gameplay/{step_count}.gif", fps=config.video_fps)
     seconds = monotonic() - started
     writer.log_metrics({"actor/video_seconds": seconds}, step_count)
     print(
-        f"Recorded {len(frames)} gameplay frames after {episode_count} training episodes in {seconds:.1f}s", flush=True
+        f"Recorded {len(episode.frames)} gameplay frames after {episode_count} training episodes in {seconds:.1f}s",
+        flush=True,
     )
 
 
@@ -864,18 +903,20 @@ def log_evaluation(
     step_count: int,
     *,
     initial_carry: RecurrentCarry,  # leaves: (N, ...)
+    opponent_params: optax.Params,  # leaves: parameter shapes
+    opponent_name: str,
     env: PPOEnv | None = None,
-    opponent_params: optax.Params | None = None,  # leaves: parameter shapes
-    opponent_age: int | None = None,
 ) -> None:
-    """Evaluate fixed seeds, then replay the highest-return episode for one video."""
+    """Evaluate against a reference on fixed seeds, then replay the best episode."""
     print(f"Evaluating {config.eval_episodes} games at step {step_count}...", flush=True)
-    suffix = "" if opponent_age is None else f"/age_{opponent_age}"
+    suffix = f"/{opponent_name}"
     started = monotonic()
     episode_results: list[dict[str, float | int]] = []
+    rating_env = trueskill.TrueSkill()
+    rating, opponent_rating = rating_env.create_rating(), rating_env.create_rating()
     env = make_env(config) if env is None else env
     for episode_index in range(config.eval_episodes):
-        episode_return, episode_step_count, _ = play_episode(
+        episode = play_episode(
             train_state,
             config,
             jax.random.fold_in(jax.random.key(config.eval_seed), episode_index),
@@ -885,10 +926,22 @@ def log_evaluation(
             opponent_params=opponent_params,
             current_team=episode_index % 2,
         )
-        episode_results.append({"return": episode_return, "length": episode_step_count})
+        opponent_return = cast(float, episode.opponent_return)
+        (rating,), (opponent_rating,) = rating_env.rate(
+            [(rating,), (opponent_rating,)],
+            ranks=[int(episode.episode_return < opponent_return), int(opponent_return < episode.episode_return)],
+        )
+        episode_results.append(
+            {
+                "return": episode.episode_return,
+                "opponent_return": opponent_return,
+                "length": episode.length,
+                "current_team": episode_index % 2,
+            }
+        )
     episode_return_sample = [result["return"] for result in episode_results]
     video_episode_index = max(range(config.eval_episodes), key=episode_return_sample.__getitem__)
-    _, _, frames = play_episode(
+    replay = play_episode(
         train_state,
         config,
         jax.random.fold_in(jax.random.key(config.eval_seed), video_episode_index),
@@ -899,28 +952,36 @@ def log_evaluation(
         opponent_params=opponent_params,
         current_team=video_episode_index % 2,
     )
-    if frames:
-        writer.log_video(frames, f"eval/gameplay{suffix}/{step_count}.gif", fps=config.video_fps)
+    if replay.frames:
+        writer.log_video(replay.frames, f"eval/gameplay{suffix}/{step_count}.gif", fps=config.video_fps)
     std = stdev(episode_return_sample) if len(episode_return_sample) > 1 else None
     result = {
         "env_id": config.env.id,
         "return_mean": fmean(episode_return_sample),
         "return_std": std,
         "return_sem": std / sqrt(config.eval_episodes) if std is not None else None,
+        "trueskill_mean": rating.mu,
+        "trueskill_std": rating.sigma,
+        "trueskill_conservative": rating_env.expose(rating),
         "episodes": episode_results,
         "video_episode_index": video_episode_index,
         "eval_seed": config.eval_seed,
         "training_config": asdict(config),
         "training_steps": step_count,
         "training_episodes": episode_count,
+        "opponent_name": opponent_name,
+        "opponent_checkpoint": config.eval_ref_policies[opponent_name],
     }
-    if opponent_age is not None:
-        result["opponent_age_iterations"] = opponent_age
-        for index, episode in enumerate(episode_results):
-            episode["current_team"] = index % 2
     scalars = {
         f"eval/{name}{suffix}": result[name]
-        for name in ("return_mean", "return_std", "return_sem")
+        for name in (
+            "return_mean",
+            "return_std",
+            "return_sem",
+            "trueskill_mean",
+            "trueskill_std",
+            "trueskill_conservative",
+        )
         if result[name] is not None
     }
     scalars[f"eval/training_episodes_total{suffix}"] = episode_count
@@ -1445,6 +1506,7 @@ def train(config: Config) -> TrainState:
                 jax.device_put(reset_key, batched)
             )  # (E, N, ...)/(E, N, *C, A); state: (E, ...)
         train_state = jax.device_put(train_state, replicated)
+        eval_references = load_eval_ref_policies(config, train_state.params)  # leaves: parameter shapes
         key, metrics = jax.device_put((key, metrics), replicated)  # key: (); metrics: scalar leaves
         opponent_pool = None
         assignment = None
@@ -1495,13 +1557,7 @@ def train(config: Config) -> TrainState:
         remaining_rollout_count = max(0, (config.total_env_steps - initial_step_count) // batch_size)
         planned_rollout_count = start_rollout_index + remaining_rollout_count
         step_count = initial_step_count
-        eval_history: dict[int, optax.Params] = {}  # host leaves: parameter shapes
-        historical_eval = isinstance(config.env, LuxConfig) and config.eval_interval > 0
         for rollout_index in range(start_rollout_index, planned_rollout_count):
-            if historical_eval:
-                retain_eval_snapshot(
-                    eval_history, train_state.params, rollout_index, config.eval_interval, planned_rollout_count
-                )
             # Schedules need a fraction, while exact lifetime counters stay as host integers.
             schedule_step = jnp.asarray(step_count, dtype=jnp.float32)  # (); avoids JIT's default int32 limit
             if opponent_pool is None:
@@ -1533,16 +1589,7 @@ def train(config: Config) -> TrainState:
                     env=env,
                 )
             if config.eval_interval and (rollout_count % config.eval_interval == 0 or is_final_rollout):
-                opponents = (
-                    {
-                        age: eval_history[rollout_count - age]
-                        for age in EVAL_OPPONENT_AGES
-                        if rollout_count - age in eval_history
-                    }
-                    if historical_eval
-                    else {None: None}
-                )
-                for age, opponent_params in opponents.items():
+                for name, opponent_params in eval_references.items():
                     log_evaluation(
                         train_state,
                         config,
@@ -1551,8 +1598,8 @@ def train(config: Config) -> TrainState:
                         step_count,
                         initial_carry=model.initial_carry(env.num_agents),
                         env=env,
-                        opponent_params=jax.device_put(opponent_params, replicated),
-                        opponent_age=age,
+                        opponent_params=opponent_params,
+                        opponent_name=name,
                     )
             if rollout_count % config.log_interval == 0 or is_final_rollout:
                 # Host logging requires the completed device metrics.
