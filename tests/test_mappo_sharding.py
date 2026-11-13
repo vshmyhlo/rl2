@@ -235,7 +235,7 @@ def test_hierarchical_sharded_update_preserves_sequences_and_matches_single_devi
     starts = jnp.array([[True, False], [False, True]])  # (B, T)
     mask = jnp.ones((2, 2, 2, 3), bool).at[..., 0, 2].set(False)  # (B, T, D=2, A=3)
     params = model.init(jax.random.key(0), observation, memory, starts, mask)["params"]
-    output = model.apply({"params": params}, observation, memory, starts, mask)
+    output, _ = model.apply({"params": params}, observation, memory, starts, mask)  # policy/value batch: (B, T)
     action = jnp.array([[[0, 1], [1, 2]], [[1, 0], [0, 2]]])  # (B, T, D)
     batch = ppo.PPOBatch(
         observation=observation,  # (B, T, O)

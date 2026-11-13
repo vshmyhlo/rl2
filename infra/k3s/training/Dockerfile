@@ -18,6 +18,8 @@ RUN --mount=type=bind,source=src/rl2/envs/jaxtari_assets.py,target=/tmp/jaxtari_
     JAX_PLATFORMS=cpu /app/.venv/bin/python /tmp/jaxtari_assets.py
 # FlashInfer expects a conventional toolkit layout; CUDA wheels use nvidia/cu13.
 ENV CUDA_HOME=/app/.venv/lib/python3.12/site-packages/nvidia/cu13
+# cuDNN attention loads NVRTC and its builtins through the dynamic loader.
+ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib"
 RUN test -x "$CUDA_HOME/bin/nvcc" \
     && ln -s lib "$CUDA_HOME/lib64" \
     && ln -s libcudart.so.13 "$CUDA_HOME/lib/libcudart.so"

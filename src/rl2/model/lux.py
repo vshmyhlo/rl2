@@ -3,7 +3,6 @@ from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
-import tokamax
 from flax import linen as nn
 
 from rl2.actions import HierarchicalMultiCategoricalPolicy, HierarchicalMultiDiscreteSpace
@@ -79,9 +78,9 @@ def _global_context(observation: LuxObservation[jax.Array]) -> jax.Array:  # lea
 
 
 class _Attention(nn.Module):
-    """Noncausal attention; Triton pads narrow heads for tensor cores."""
+    """Noncausal JAX attention with cuDNN-compatible token padding."""
 
-    attention_implementation: Literal["triton", "xla"]
+    attention_implementation: Literal["cudnn", "xla"]
     heads: int = 8
     head_dim: int = 32
     dtype: jax.typing.DTypeLike | None = None
@@ -93,6 +92,8 @@ class _Attention(nn.Module):
         context: jax.Array,  # (B, K, Dc), Dc is the context width
         context_mask: jax.Array | None = None,  # (B, 1, 1, K) bool; at least one valid key per example
     ) -> jax.Array:  # (B, Q, D)
+        if self.attention_implementation == "cudnn":
+            assert self.head_dim % 8 == 0, "cuDNN attention requires head_dim divisible by 8"
         query = nn.DenseGeneral(features=(self.heads, self.head_dim), dtype=self.dtype, name="query")(
             tokens
         )  # (B, Q, Nh, Dh)
@@ -102,14 +103,24 @@ class _Attention(nn.Module):
         value = nn.DenseGeneral(features=(self.heads, self.head_dim), dtype=self.dtype, name="value")(
             context
         )  # (B, K, Nh, Dh)
-        # Normalize each logical head before padding; padding must not change its RMS.
         query = nn.RMSNorm(dtype=self.dtype, name="query_norm")(query)  # (B, Q, Nh, Dh)
         key = nn.RMSNorm(dtype=self.dtype, name="key_norm")(key)  # (B, K, Nh, Dh)
-        if self.head_dim < 16:
-            query, key, value = jax.tree.map(
-                lambda x: jnp.pad(x, ((0, 0), (0, 0), (0, 0), (0, 16 - self.head_dim))), (query, key, value)
-            )  # (B, Q/K, Nh, 16)
-        attended = tokamax.dot_product_attention(
+        query_count = query.shape[1]
+        if self.attention_implementation == "cudnn":
+            # JAX's cuDNN backward checks even Q/K even when no mask is supplied.
+            query = jnp.pad(query, ((0, 0), (0, query_count % 2), (0, 0), (0, 0)))  # (B, Qp, Nh, Dh)
+            key_padding = key.shape[1] % 2
+            if key_padding and context_mask is None:
+                context_mask = jnp.ones((1, 1, 1, key.shape[1]), dtype=bool)  # (1, 1, 1, K), shared across shards
+            key, value = jax.tree.map(
+                lambda x: jnp.pad(x, ((0, 0), (0, key_padding), (0, 0), (0, 0))), (key, value)
+            )  # (B, Kp, Nh, Dh)
+            if context_mask is not None:
+                context_mask = jnp.broadcast_to(
+                    jnp.pad(context_mask, ((0, 0), (0, 0), (0, 0), (0, key_padding))),
+                    (context_mask.shape[0], 1, query.shape[1], key.shape[1]),
+                )  # (B or 1, 1, Qp, Kp); padded queries retain valid keys, padded keys are masked
+        attended = jax.nn.dot_product_attention(
             query,
             key,
             value,
@@ -117,7 +128,7 @@ class _Attention(nn.Module):
             is_causal=False,
             scale=self.head_dim**-0.5,
             implementation=self.attention_implementation,
-        )[..., : self.head_dim]  # (B, Q, Nh, Dh)
+        )[:, :query_count]  # (B, Q, Nh, Dh)
         return nn.DenseGeneral(features=self.heads * self.head_dim, axis=(-2, -1), dtype=self.dtype, name="out")(
             attended
         )  # (B, Q, D)
@@ -126,7 +137,7 @@ class _Attention(nn.Module):
 class _SetAttentionBlock(nn.Module):
     """Bidirectional entity attention without slot embeddings or causal masks."""
 
-    attention_implementation: Literal["triton", "xla"]
+    attention_implementation: Literal["cudnn", "xla"]
     heads: int = 8
     head_dim: int = 32
     dtype: jax.typing.DTypeLike | None = None
@@ -211,7 +222,7 @@ class _GlobalMemory(nn.Module):
 class LuxAttentionBlock(nn.Module):
     """Map retrieval, entity aggregation, global recurrence, then memory distribution."""
 
-    attention_implementation: Literal["triton", "xla"]
+    attention_implementation: Literal["cudnn", "xla"]
     heads: int = 8
     head_dim: int = 32
     dtype: jax.typing.DTypeLike | None = None

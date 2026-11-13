@@ -8,6 +8,7 @@ from pydantic import TypeAdapter, ValidationError
 from test_train_mappo import config as config  # noqa: PLC0414
 
 from rl2.configuration import load_config
+from rl2.envs.lux_env import LuxConfig
 from rl2.train_mappo import Config, GenericModelConfig, LuxModelConfig, MLPEncoderConfig, ModelConfig
 
 
@@ -57,6 +58,14 @@ def test_model_round_trip(config: GenericModelConfig | LuxModelConfig) -> None:
     adapter = TypeAdapter(ModelConfig)
     restored = adapter.validate_json(adapter.dump_json(config))
     assert restored == config and hash(restored) == hash(config)
+
+
+def test_lux_cudnn_requires_bfloat16(config: Config) -> None:
+    config = replace(config, env=LuxConfig(), model=LuxModelConfig(attention_implementation="cudnn"), bf16=True)
+    assert config.bf16
+    with pytest.raises(ValueError, match="cuDNN attention requires bf16=true"):
+        replace(config, bf16=False)
+    assert not replace(config, model=LuxModelConfig(attention_implementation="xla"), bf16=False).bf16
 
 
 @pytest.mark.parametrize(

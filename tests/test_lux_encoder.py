@@ -6,7 +6,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import tokamax  # noqa: F401 - load Triton before luxai_s3 imports TensorFlow
 from jax.sharding import AxisType, Mesh, PartitionSpec
 from luxai_s3.state import MapTile, UnitState
 

@@ -11,7 +11,10 @@ The default generic model uses an MLP; model.type=lux uses masked entity-set
 self-attention, shared ship heads, and spatial sap-target scoring.
 Lux map and entity attention default to model.heads=8 and model.head_dim=32,
 with feature width model.heads * model.head_dim and CNN width model.conv_channels.
-Both models retain one recurrent state and one value per agent/team.
+Lux cuDNN attention requires bf16=true; select xla for float32 or CPU execution.
+Both models retain recurrent memory and one value per agent/team.
+Lux memory consists of a global-token LSTM cell/hidden state per attention block,
+retained across matches and reset at full-game boundaries.
 
 Optional map_size_curriculum (Lux and JaxNav) overrides env.map_size:
     map_size_curriculum:
@@ -238,12 +241,9 @@ from time import monotonic
 from typing import Annotated, Any, Literal, NamedTuple, Self, cast
 
 # Orbax's epath otherwise loads TensorFlow for gs:// paths when it is installed.
-# That native runtime can crash a later Triton import; use our gcsfs dependency.
+# Use our gcsfs dependency instead of TensorFlow's native runtime.
 # Set this before importing Orbax, since epath caches its backend selection.
 os.environ.setdefault("EPATH_USE_TF", "0")
-
-# Load Triton before environment dependencies load TensorFlow's native runtime.
-import tokamax  # noqa: F401
 
 # isort: split
 
@@ -330,7 +330,7 @@ class PPOBatch:
         value: (*S,) rollout-time value predictions for explained variance.
         advantage: (*S,) unnormalized advantage estimates.
         return_target: (*S,) value targets.
-        model_carry: (B, ...) model-specific initial memory leaves, including Lux ship state and lifecycle metadata.
+        model_carry: (B, H) initial LSTM cell/hidden leaves per generic layer or Lux global attention block.
         episode_start: (*S,) boolean agent or environment reset flags.
     """
 
@@ -355,7 +355,7 @@ class RolloutCarry(NamedTuple):
     Attributes:
         env_state: (E, ...) batched environment state leaves.
         observation: (E, N, ...) local observation leaves and (E, N, *C, A) legal-action masks.
-        model_carry: (B, ...) model-specific memory leaves, including Lux ship state and lifecycle metadata.
+        model_carry: (B, H) LSTM cell/hidden leaves per generic layer or Lux global attention block.
         episode_start: (B,) boolean agent or environment reset flags.
         episode_return: (E,) accumulated raw team rewards for unfinished episodes.
         episode_step_count: (E,) step counts for unfinished episodes.
@@ -485,6 +485,8 @@ class Config(BaseConfig):
     def validate_rollout(self) -> Self:
         if isinstance(self.env, LuxConfig) != isinstance(self.model, LuxModelConfig):
             raise ValueError("The lux model requires the luxai_s3 environment and vice versa")
+        if isinstance(self.model, LuxModelConfig) and self.model.attention_implementation == "cudnn" and not self.bf16:
+            raise ValueError("Lux cuDNN attention requires bf16=true; use attention_implementation=xla for float32")
         if self.map_size_curriculum:
             if not isinstance(self.env, (LuxConfig, JaxNavConfig)):
                 raise ValueError("map_size_curriculum requires a Lux or JaxNav environment")

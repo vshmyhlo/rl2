@@ -11,7 +11,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-import tokamax  # noqa: F401 - load Triton before environment helpers import TensorFlow
 import yaml
 from flax.training.train_state import TrainState
 from jax.sharding import AxisType, Mesh, PartitionSpec

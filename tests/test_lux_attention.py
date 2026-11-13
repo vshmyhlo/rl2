@@ -1,4 +1,4 @@
-"""Set attention symmetry, bidirectional mixing, padding, and Triton routing."""
+"""Set attention symmetry, bidirectional mixing, padding, and cuDNN sharding."""
 
 from typing import Any
 from unittest.mock import Mock
@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import tokamax
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
 from rl2.model.lux import _Attention, _SetAttentionBlock
 
@@ -54,7 +54,7 @@ def test_bidirectional_mixing_masking_and_permutation(
     np.testing.assert_allclose(reordered, expected[:, permutation], atol=2e-6)
 
 
-def test_qk_rmsnorm_precedes_padding_and_preserves_values(
+def test_qk_rmsnorm_preserves_values(
     params: dict[str, Any], tokens: jax.Array, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # tokens: (B=1, Q=4, D=8); constant projections distinguish RMSNorm from centering.
@@ -63,25 +63,23 @@ def test_qk_rmsnorm_precedes_padding_and_preserves_values(
         variables[name]["kernel"] = jnp.zeros_like(variables[name]["kernel"])  # (D, H=4, d=2)
         variables[name]["bias"] = jnp.broadcast_to(jnp.array([3.0, 4.0]), (4, 2))  # (H, d)
     variables["query_norm"]["scale"] = jnp.array([2.0, 0.5])  # (d,), learned scale shared across heads
-    attention = Mock(wraps=tokamax.dot_product_attention)
-    monkeypatch.setattr(tokamax, "dot_product_attention", attention)
+    attention = Mock(wraps=jax.nn.dot_product_attention)
+    monkeypatch.setattr(jax.nn, "dot_product_attention", attention)
     output = _Attention(attention_implementation="xla", heads=4, head_dim=2, dtype=jnp.float32).apply(
         {"params": variables}, tokens, tokens[:, :2]
     )  # (B, Q, D)
-    query, key, value = attention.call_args.args  # (B, Q/K, H, padded_d=16)
+    query, key, value = attention.call_args.args  # (B, Q/K, H, d=2)
     assert output.shape == (1, 4, 8)
-    assert query.shape == (1, 4, 4, 16) and key.shape == value.shape == (1, 2, 4, 16)
+    assert query.shape == (1, 4, 4, 2) and key.shape == value.shape == (1, 2, 4, 2)
     expected = jnp.array([3.0, 4.0]) / jnp.sqrt(12.5 + 1e-6)  # (d,)
     np.testing.assert_allclose(
         query[..., :2], jnp.broadcast_to(expected * jnp.array([2.0, 0.5]), (1, 4, 4, 2)), atol=1e-6
     )
     np.testing.assert_allclose(key[..., :2], jnp.broadcast_to(expected, (1, 2, 4, 2)), atol=1e-6)
     np.testing.assert_array_equal(value[..., :2], jnp.broadcast_to(jnp.array([3.0, 4.0]), (1, 2, 4, 2)))
-    for array in (query, key, value):
-        np.testing.assert_array_equal(array[..., 2:], 0)
 
 
-@pytest.mark.parametrize("head_dim", [2, 16], ids=["padded", "unpadded"])
+@pytest.mark.parametrize("head_dim", [2, 16], ids=["narrow", "wide"])
 def test_attention_head_dimensions(tokens: jax.Array, head_dim: int) -> None:
     # tokens: (B=1, Q=4, Dx=8); context has K=2 tokens and Dc=8.
     attention = _Attention(attention_implementation="xla", heads=2, head_dim=head_dim, dtype=jnp.float32)
@@ -104,50 +102,90 @@ def test_bfloat16_normalized_attention_matches_float32(
     np.testing.assert_array_equal(reduced[:, 2], 0)
 
 
-@pytest.mark.parametrize("real_triton", [False, True], ids=["cpu_routing", "gpu_kernel"])
-def test_triton_forward_and_backward_match_reference(
-    block: _SetAttentionBlock,
-    params: dict[str, Any],
-    tokens: jax.Array,  # (B, E, D)
-    tokens_mask: jax.Array,  # (B, E)
-    monkeypatch: pytest.MonkeyPatch,
-    real_triton: bool,
-) -> None:
-    if real_triton and jax.default_backend() != "gpu":
-        pytest.skip("Tokamax Triton kernel verification requires a GPU")
+def test_cudnn_rejects_unaligned_head_width(tokens: jax.Array) -> None:  # (B=1, Q=4, Dx=8)
+    module = _Attention(attention_implementation="cudnn", heads=2, head_dim=2, dtype=jnp.bfloat16)
+    with pytest.raises(AssertionError, match="head_dim divisible by 8"):
+        module.init(jax.random.key(5), tokens, tokens)
 
-    def evaluate(module: _SetAttentionBlock) -> tuple[tuple[jax.Array, jax.Array], dict[str, Any]]:
-        def loss(variables: dict[str, Any]) -> tuple[jax.Array, jax.Array]:
-            output = module.apply(variables, tokens, tokens_mask)  # (B, E, D)
-            return jnp.square(output).mean(), output  # (); (B, E, D)
 
-        return jax.jit(jax.value_and_grad(loss, has_aux=True))(params)
-
-    expected = evaluate(block)
-    original = tokamax.dot_product_attention
+def test_cudnn_token_padding_preserves_masks(monkeypatch: pytest.MonkeyPatch) -> None:
+    tokens = jax.random.normal(jax.random.key(4), (1, 3, 8))  # (B=1, Q=K=3, Dx=8)
+    mask = jnp.array([[[[True, False, True]]]])  # (B, 1, 1, K)
+    module = _Attention(attention_implementation="cudnn", heads=2, head_dim=8, dtype=jnp.bfloat16)
+    original = jax.nn.dot_product_attention
 
     def reference(
-        query: jax.Array,  # (B, E, 4, 16), narrow logical heads are padded
-        key: jax.Array,  # (B, E, 4, 16)
-        value: jax.Array,  # (B, E, 4, 16)
+        query: jax.Array,  # (B, Qp=4, Nh=2, Dh=8)
+        key: jax.Array,  # (B, Kp=4, Nh, Dh)
+        value: jax.Array,  # (B, Kp, Nh, Dh)
         *,
-        mask: jax.Array | None,  # (B, 1, 1, E)
+        mask: jax.Array,  # (B, 1, Qp, Kp)
         is_causal: bool,
         scale: float,
         implementation: str,
-    ) -> jax.Array:  # (B, E, 4, 16)
-        assert implementation == "triton" and not is_causal
-        assert query.shape[-1] == key.shape[-1] == value.shape[-1] == 16
-        assert scale == 2**-0.5  # Preserve the logical head size, not the padded width.
+    ) -> jax.Array:  # (B, Qp, Nh, Dh)
+        assert implementation == "cudnn" and not is_causal
+        assert query.shape == key.shape == value.shape == (1, 4, 2, 8)
+        assert query.dtype == key.dtype == value.dtype == jnp.bfloat16
+        assert scale == 8**-0.5
+        np.testing.assert_array_equal(mask, jnp.broadcast_to(jnp.array([True, False, True, False]), (1, 1, 4, 4)))
         return original(query, key, value, mask=mask, is_causal=is_causal, scale=scale, implementation="xla")
 
-    attention = Mock(wraps=original if real_triton else reference)
-    monkeypatch.setattr(tokamax, "dot_product_attention", attention)
-    actual = evaluate(block.clone(attention_implementation="triton"))
-    assert attention.called
-    assert attention.call_args.kwargs["implementation"] == "triton"
-    assert attention.call_args.kwargs["is_causal"] is False
-    assert attention.call_args.kwargs["mask"].shape == (1, 1, 1, 4)
-    assert attention.call_args.kwargs["mask"].dtype == jnp.bool_
+    attention = Mock(wraps=reference)
+    monkeypatch.setattr(jax.nn, "dot_product_attention", attention)
+    actual, variables = module.init_with_output(jax.random.key(5), tokens, tokens, mask)  # (B, Q, D=16); parameters
+    assert attention.called and actual.shape == (1, 3, 16)
+    monkeypatch.setattr(jax.nn, "dot_product_attention", original)
+    expected = module.clone(attention_implementation="xla").apply(variables, tokens, tokens, mask)  # (B, Q, D)
+    np.testing.assert_allclose(actual.astype(jnp.float32), expected.astype(jnp.float32), atol=0.02, rtol=0.02)
+
+
+@pytest.mark.parametrize(
+    "key_count,masked",
+    [(2, False), (3, False), (3, True)],
+    ids=["cross_attention", "unmasked_odd_keys", "masked_self_attention"],
+)
+def test_cudnn_batch_sharding_preserves_outputs_and_gradients(key_count: int, masked: bool) -> None:
+    if jax.default_backend() != "gpu" or jax.device_count() < 2:
+        pytest.skip("Requires two GPUs for cuDNN partitioning verification")
+    mesh = Mesh(devices=jax.devices()[:2], axis_names=("batch",), axis_types=(AxisType.Auto,))
+    tokens = jax.random.normal(jax.random.key(4), (2, 3, 8))  # (B=2, Q=3, Dx=8)
+    context = tokens[:, :key_count]  # (B, K=3/2, Dc=8)
+    mask = jnp.array([[[[True, False, True]]], [[[False, True, True]]]]) if masked else None
+    # mask: (B, 1, 1, K) or None; distinct masks exercise per-device masking.
+    attention = _Attention(attention_implementation="cudnn", heads=2, head_dim=8, dtype=jnp.bfloat16)
+    reference = attention.clone(attention_implementation="xla")
+    variables = reference.init(jax.random.key(5), tokens, context, mask)
+
+    def loss(
+        variables: dict[str, Any],
+        tokens: jax.Array,  # (B, Q, Dx)
+        context: jax.Array,  # (B, K, Dc)
+        mask: jax.Array | None,  # (B, 1, 1, K)
+        module: _Attention,
+    ) -> tuple[jax.Array, jax.Array]:  # (); (B, Q, D=16)
+        output = module.apply(variables, tokens, context, mask).astype(jnp.float32)  # (B, Q, D)
+        return jnp.square(output).mean(), output  # (); (B, Q, D)
+
+    evaluate = jax.value_and_grad(loss, has_aux=True)
+    expected = jax.jit(evaluate, static_argnames="module")(variables, tokens, context, mask, reference)
+    with jax.set_mesh(mesh):
+        compiled = (
+            jax.jit(
+                evaluate,
+                static_argnames="module",
+                in_shardings=(PartitionSpec(), PartitionSpec("batch"), PartitionSpec("batch"), PartitionSpec("batch")),
+                out_shardings=((PartitionSpec(), PartitionSpec("batch")), PartitionSpec()),
+            )
+            .lower(variables, tokens, context, mask, attention)
+            .compile()
+        )
+        actual = compiled(variables, tokens, context, mask)
+    assert actual[0][1].shape == (2, 3, 16)
+    assert actual[0][1].sharding == NamedSharding(mesh, PartitionSpec("batch"))
     for result, target in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
-        np.testing.assert_allclose(result, target, atol=3e-5, rtol=3e-4)
+        assert result.shape == target.shape
+        np.testing.assert_allclose(result, target, atol=0.02, rtol=0.03)
+    hlo = compiled.as_text()
+    assert "__cudnn$fmha" in hlo
+    assert "all-gather" not in hlo

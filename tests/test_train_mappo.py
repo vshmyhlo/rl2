@@ -13,7 +13,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-import tokamax  # noqa: F401 - load Triton before jaxmarl imports TensorFlow
 import yaml
 from flax.training.train_state import TrainState
 from jaxmarl.environments.smax.heuristic_enemy_smax_env import State
@@ -1075,7 +1074,7 @@ def test_lux_model_requires_matching_environment(config: ppo.Config, lux_env: bo
         replace(
             config,
             env=LuxConfig() if lux_env else config.env,
-            model=config.model if lux_env else ppo.LuxModelConfig(),
+            model=config.model if lux_env else ppo.LuxModelConfig(attention_implementation="xla"),
         )
 
 
@@ -1371,7 +1370,11 @@ def test_reference_eval_metrics_and_artifacts(
     episodes = len(returns)
     references = {"baseline": "/runs/old_run/checkpoints/20", "stronger": "/runs/other_run/checkpoints/40"}
     config = replace(
-        config, env=LuxConfig(), model=ppo.LuxModelConfig(), eval_episodes=episodes, eval_ref_policies=references
+        config,
+        env=LuxConfig(),
+        model=ppo.LuxModelConfig(attention_implementation="xla"),
+        eval_episodes=episodes,
+        eval_ref_policies=references,
     )
     writer = Mock()
     memory = ((jnp.zeros((2, 1)), jnp.zeros((2, 1))),)  # leaves: (N=2, H=1)
@@ -1602,7 +1605,7 @@ def test_training_evaluates_fixed_references(config: ppo.Config, lux: bool, refe
     config = replace(
         config,
         env=LuxConfig() if lux else config.env,
-        model=ppo.LuxModelConfig() if lux else config.model,
+        model=ppo.LuxModelConfig(attention_implementation="xla") if lux else config.model,
         total_iterations=3,
         eval_interval=2,
         eval_ref_policies=references,

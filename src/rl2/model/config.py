@@ -34,7 +34,7 @@ class LuxModelConfig:
     num_blocks: Annotated[int, Field(gt=0, strict=True)] = 2
     heads: Annotated[int, Field(gt=0, strict=True)] = 8
     head_dim: Annotated[int, Field(gt=0, strict=True)] = 32
-    attention_implementation: Literal["triton", "xla"] = "triton"
+    attention_implementation: Literal["cudnn", "xla"] = "cudnn"
 
 
 def _default_model_type(value: Any) -> Any:

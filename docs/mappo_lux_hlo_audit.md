@@ -1,5 +1,148 @@
 # Lux MAPPO two-GPU HLO audit
 
+## Built-in cuDNN attention: 2026-11-13
+
+Lux now uses `jax.nn.dot_product_attention`, with `cudnn` as its default
+backend and `xla` for CPU/float32 execution. The training configuration selects
+`cudnn` and `bf16: true`; float32 cuDNN configurations are rejected early.
+Parameters and recurrent memory remain float32. cuDNN head widths are asserted
+to be divisible by eight. Query/key lengths are padded to
+even values for JAX's cuDNN backward path; padded keys are masked, extra query
+outputs are discarded, and the attention scale uses the original head width.
+
+The current 32×32 configuration compiles on two A100-SXM4-40GB GPUs with JAX
+0.11.2: eight environments, 512 steps, four minibatches, one update epoch.
+Optimized HLO confirms:
+
+- All six attention calls use cuDNN forward/backward kernels. Rollout attention
+  processes eight actors per GPU; learner attention processes 1,024 observations
+  per GPU. **No attention all-gathers remain.**
+- Two static all-gather sites remain: minibatch indices and spatial-gather
+  gradients. Rollout has no all-gathers; autoreset retains its boolean reduction.
+- Estimated total executable storage is **12.129 GiB per GPU**, including
+  12.057 GiB of temporaries. Parameters/optimizer storage aliases 73.429 MiB.
+  No host callbacks occur. The sap-head intermediate remains outside this fix.
+
+Artifacts: `runs/mappo_hlo/lux_cudnn_32_20261113/`. The earlier baseline below
+used a 16×16 map and float32; its memory estimate is not a like-for-like comparison.
+Compilation still encountered convolution autotuning workspace shortages while
+another job occupied the GPUs; no full-training throughput benchmark was run.
+
+cuDNN's runtime compiler needs the project's CUDA 13 NVRTC libraries. Selecting
+their directory resolved the host's `No valid execution plans built` failures,
+including for tiny unmasked attention. The training Dockerfile now sets this
+library path; the image has not been rebuilt during this change. For host runs:
+
+```bash
+export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/nvidia/cu13/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false uv run python \
+  scripts/audit_mappo_hlo.py --config configs/mappo/lux.yaml --step train \
+  --output runs/mappo_hlo/lux_cudnn_32_20261113
+```
+
+Validation: 61 targeted cases passed across attention, configuration, recurrent
+replay, sharded policy gradients, curriculum wiring, self-play configuration,
+and evaluation wiring. GPU tests compare cuDNN outputs/parameter gradients with
+XLA and assert no attention all-gathers, covering masked and unmasked attention
+and odd key lengths. Ruff formatting/checks and `git diff --check` passed.
+Tests ran from `tests/` with `--rootdir=. --confcutdir=.` because repository-root
+collection encountered an unreadable `cluster-runs` directory. The curriculum
+pool wiring test requires one CPU device; sharding tests used two devices.
+
+## Triton baseline: 2026-11-13
+
+Compiled `train_step_donated` with JAX 0.11.2 on two A100-SXM4-40GB GPUs,
+using the saved `configs/mappo/lux.yaml` snapshot: 8 environments, 512 steps,
+4 minibatches, 1 update epoch, float32, and Triton attention. The model has
+two attention blocks, eight heads of width 32, and 64 convolution channels.
+Each GPU receives four environments, eight rollout actors, and two recurrent
+sequences per minibatch. One iteration collects 4,096 environment steps and
+attempts at most four updates. The snapshot's YAML comment claiming 16
+environments per GPU was stale and is now corrected.
+
+**Compilation succeeds, but this execution is not efficient enough to call
+optimal.** The primary issue is replicated Triton attention; the sap head also
+materializes a large intermediate.
+
+| Compiler diagnostic | Current Triton configuration |
+| --- | ---: |
+| Compilation, including lowering | 113.65 seconds |
+| Temporary buffers per GPU | 11.865 GiB |
+| Arguments + outputs + temporaries − aliases per GPU | 11.937 GiB |
+| Donated/aliased storage per GPU | 73.429 MiB |
+| Static all-gather sites, counting asynchronous start/done once | 63 |
+| Host callbacks | None |
+
+Findings, in priority order:
+
+1. **Attention loses batch sharding.** `model/lux.py` calls Tokamax without
+   `q_sharding`. Optimized HLO gathers Q/K/V before all six attention calls
+   per policy evaluation. Rollout kernels process 16 actors on each GPU
+   instead of eight; learner kernels process 2,048 observations instead of
+   1,024. Backward attention is replicated too. Six gathers per rollout step
+   receive approximately 4.767 MiB per GPU, or 2.383 GiB over 512 steps.
+   Learner forward/backward gathers receive approximately 1.437 GiB per
+   accepted update. Including the final value evaluation, all-gather peer
+   receives total approximately **8.136 GiB per GPU per iteration** when all
+   four updates run; this excludes all-reduce/reduce-scatter traffic and
+   protocol overhead. Tokamax exposes explicit `q_sharding`; integrating and
+   validating batch sharding is the first optimization to pursue.
+2. **Sap scoring materializes 900 MiB.** The forward fusion produces
+   `f32[1024,16,225,64]` in `LuxHeads._sap_logits`: gathered spatial keys plus
+   relative-offset embeddings, retained for differentiation. Consider scoring
+   the 16×16 map against each ship query first, then gathering scalar scores
+   and adding separate relative-offset scores. The corresponding map-score
+   tensor would be 16 MiB. Numerical/gradient equivalence and actual compiler
+   memory savings need validation before changing this path.
+3. **Recurrence has little batch parallelism.** Each block retains 512-step
+   forward/backward loops with only two sequences per GPU. Input projections
+   are already outside these loops. Increasing environments or reducing
+   minibatches may improve utilization, but changes training batch semantics
+   and increases activation memory; benchmark after fixing attention sharding.
+4. **Some communication is expected.** Global sequence shuffling uses an
+   index gather and three grouped minibatch reduce-scatters. Accepted updates
+   combine gradients into one approximately 24.61 MiB all-reduce. Autoreset
+   retains one boolean all-reduce per environment step, without gathering
+   environment state. A further reduce-scatter and feature/index gather occur
+   in spatial-gather gradients. Reset generation remains conditional; the
+   always-false Lux timeout removes the timeout-bootstrap policy evaluation.
+
+The executable uses cuBLASLt matmuls, cuDNN convolutions, and Triton attention;
+model/optimizer state donation is effective. Static copies and fusion counts
+alone do not establish runtime cost.
+
+An otherwise identical diagnostic configuration using `attention_implementation:
+xla` also compiles. It removes every attention all-gather, leaving two static
+sites (minibatch indices and spatial-gather gradients), and no rollout gathers.
+However, its estimated total storage rises to **18.160 GiB per GPU**, including
+18.088 GiB of temporaries. This confirms the attention communication is
+avoidable, but does not establish XLA attention as the preferred replacement.
+Explicitly sharded Triton should be evaluated first. The comparison config,
+HLO, summary, and compilation log are saved alongside the baseline artifacts.
+
+Artifacts are under `runs/mappo_hlo/lux_2gpu_20261113/`: optimized HLO,
+StableHLO, resolved configuration, compiler summary, source/configuration
+snapshots and hashes, and `gather_analysis.json`. Communication estimates use
+half each gathered output's bytes as the two-device peer receive payload,
+weighted by loop execution counts; KL stopping reduces learner traffic.
+
+Reproduce the baseline on two visible GPUs:
+
+```bash
+JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false uv run python \
+  scripts/audit_mappo_hlo.py --config configs/mappo/lux.yaml --step train \
+  --output runs/mappo_hlo/lux_2gpu_20261113
+```
+
+No training was executed; training source and configuration remain unchanged.
+Another job held approximately 37 GB on each GPU; compilation
+completed despite workspace allocation failures during convolution autotuning.
+Consequently, kernel choices and throughput must be rechecked on idle GPUs.
+Memory figures exclude runtime/library overhead. No pytest run was needed for
+this compilation and documentation-only audit.
+
+## Historical audits
+
 Compared on 2026-11-10 with JAX 0.11.2 and two NVIDIA A100-SXM4-40GB GPUs:
 16 environments, 256 rollout steps, four minibatches, four update epochs, and
 float32 computation. Each GPU holds eight environments, 16 actor sequences,
@@ -8,7 +151,7 @@ the comparison holds the policy and trainer source fixed.
 
 ## Larger rollout configuration
 
-`configs/mappo/lux.yaml` now uses 128 environments and a 512-step horizon,
+A previous `configs/mappo/lux.yaml` used 128 environments and a 512-step horizon,
 with four minibatches and four update epochs. The horizon exceeds the 505-step
 game length. On two GPUs this gives:
 

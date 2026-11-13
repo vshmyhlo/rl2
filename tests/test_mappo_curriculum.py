@@ -9,7 +9,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import tokamax  # noqa: F401 - load Triton before environment dependencies
 import yaml
 from flax.training.train_state import TrainState
 from ppo_helpers import metric_history
@@ -22,7 +21,7 @@ pytestmark = pytest.mark.usefixtures("ppo_mesh")
 
 
 def test_curriculum_loading_and_thresholds(config: ppo.Config, tmp_path: Path) -> None:
-    settings = asdict(replace(config, env=ppo.LuxConfig(), model=ppo.LuxModelConfig()))
+    settings = asdict(replace(config, env=ppo.LuxConfig(), model=ppo.LuxModelConfig(attention_implementation="xla")))
     settings["map_size_curriculum"] = [
         {"start_iteration": 0, "map_size": 8},
         {"start_iteration": 500, "map_size": 16},
@@ -57,7 +56,12 @@ def test_curriculum_loading_and_thresholds(config: ppo.Config, tmp_path: Path) -
 )
 def test_invalid_curriculum(config: ppo.Config, stages: tuple[ppo.MapSizeStage, ...], match: str) -> None:
     with pytest.raises(ValueError, match=match):
-        replace(config, env=ppo.LuxConfig(), model=ppo.LuxModelConfig(), map_size_curriculum=stages)
+        replace(
+            config,
+            env=ppo.LuxConfig(),
+            model=ppo.LuxModelConfig(attention_implementation="xla"),
+            map_size_curriculum=stages,
+        )
 
 
 @pytest.mark.parametrize("iteration,size", [(-1, 8), (True, 8), (0, 0), (0, 8.5)])
@@ -116,7 +120,7 @@ def test_curriculum_training_wiring(config: ppo.Config, resume_iteration: int, p
     config = replace(
         config,
         env=ppo.LuxConfig(),
-        model=ppo.LuxModelConfig(),
+        model=ppo.LuxModelConfig(attention_implementation="xla"),
         map_size_curriculum=(
             ppo.MapSizeStage(start_iteration=0, map_size=8),
             ppo.MapSizeStage(start_iteration=2, map_size=16),
