@@ -57,14 +57,17 @@ def test_bfloat16_module_tree_and_ppo_update(
         next_fun: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any], context: InterceptorContext
     ) -> Any:
         module = context.module
+        expected_dtype = (
+            jnp.float32 if isinstance(module, nn.Embed) and module.name == "tile_embedding" else jnp.bfloat16
+        )
         if hasattr(module, "dtype"):
-            assert jnp.dtype(module.dtype) == jnp.bfloat16, context.module.path
+            assert jnp.dtype(module.dtype) == expected_dtype, context.module.path
             visited.add(type(module))
         result = next_fun(*args, **kwargs)
         if context.method_name == "__call__" and isinstance(
             module, (nn.Dense, nn.DenseGeneral, nn.Conv, nn.Embed, nn.LayerNorm, nn.RMSNorm)
         ):
-            assert result.dtype == jnp.bfloat16, context.module.path
+            assert result.dtype == expected_dtype, context.module.path
         return result
 
     with nn.intercept_methods(check_dtype):

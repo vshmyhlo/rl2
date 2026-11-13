@@ -314,7 +314,8 @@ class LuxMapEncoder(nn.Module):
     dtype: jax.typing.DTypeLike | None = None
 
     def setup(self) -> None:
-        self.tile_embedding = nn.Embed(num_embeddings=4, features=4, dtype=self.dtype, name="tile_embedding")
+        # Avoid slow bf16 scatter-add accumulation into the four shared tile embeddings.
+        self.tile_embedding = nn.Embed(num_embeddings=4, features=4, dtype=jnp.float32, name="tile_embedding")
         self.map_stem = nn.Conv(features=self.conv_channels, kernel_size=(3, 3), dtype=self.dtype, name="map_stem")
         self.map_norm = nn.LayerNorm(dtype=self.dtype, name="map_norm")
         self.map_local = ResidualBlock(channels=self.conv_channels, dtype=self.dtype, name="map_local")

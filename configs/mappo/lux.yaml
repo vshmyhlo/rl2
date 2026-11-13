@@ -24,8 +24,8 @@ num_minibatches: 4
 update_epochs: 1
 model:
   type: lux
-  attention_implementation: cudnn
-dtype: bfloat16
+  attention_implementation: xla
+dtype: float32
 learning_rate: 0.0003
 anneal_lr: true
 lr_decay: linear

@@ -11,7 +11,7 @@ from luxai_s3.state import MapTile, UnitState
 
 from rl2.envs.lux_env import LuxObservation, LuxTeamObservation, LuxWorldObservation
 from rl2.model.config import LuxModelConfig
-from rl2.model.lux import LuxEncoder, LuxFeatures, _preprocess_observation, _rasterize
+from rl2.model.lux import LuxEncoder, LuxFeatures, LuxMapEncoder, _preprocess_observation, _rasterize
 
 
 @pytest.fixture(scope="module")
@@ -305,6 +305,32 @@ def test_single_block_remembers_entities_and_map(
     reset, reset_carry = apply(params, identical, carry, jnp.ones((4, 1), bool))
     for leaf in jax.tree.leaves((reset, reset_carry)):
         np.testing.assert_allclose(leaf[1:], jnp.broadcast_to(leaf[:1], leaf[1:].shape), atol=2e-6)
+
+
+def test_bfloat16_tile_embedding_accumulates_gradients_in_float32() -> None:
+    encoder = LuxMapEncoder(features=4, conv_channels=4, dtype=jnp.bfloat16)
+    tile_ids = jnp.arange(4, dtype=jnp.int32).repeat(2).reshape(2, 2, 2)  # (B, H, W), all four tile IDs
+    embedding = jnp.arange(16, dtype=jnp.float32).reshape(4, 4) / 16  # (V=4, F=4)
+    channels = jnp.arange(1, 5, dtype=jnp.float32)  # (F,)
+    weights = jnp.broadcast_to(jnp.array([1.0, 1 / 256]), tile_ids.shape)[..., None] * channels  # (B, H, W, F)
+
+    def lookup(module: LuxMapEncoder, ids: jax.Array) -> jax.Array:  # (B, H, W) -> (B, H, W, F)
+        return module.tile_embedding(ids)  # (B, H, W, F)
+
+    def objective(table: jax.Array) -> tuple[jax.Array, jax.Array]:  # (V, F) -> (); (B, H, W, F)
+        output = encoder.apply(
+            {"params": {"tile_embedding": {"embedding": table}}}, tile_ids, method=lookup
+        )  # (B, H, W, F)
+        # Downstream bf16 computation must still accumulate repeated IDs in float32.
+        loss = jnp.sum(output.astype(jnp.bfloat16).astype(jnp.float32) * weights)  # ()
+        return loss, output  # (); (B, H, W, F)
+
+    (_, output), gradient = jax.jit(jax.value_and_grad(objective, has_aux=True))(embedding)  # (B, H, W, F); (V, F)
+    assert gradient.shape == (4, 4) and gradient.dtype == jnp.float32
+    expected = jnp.broadcast_to((1 + 1 / 256) * channels, gradient.shape)  # (V, F), sums not representable in bf16
+    np.testing.assert_array_equal(gradient, expected)
+    assert output.shape == (2, 2, 2, 4) and output.dtype == jnp.float32
+    np.testing.assert_array_equal(output, embedding[tile_ids])
 
 
 def test_gradients_and_empty_observation(

@@ -164,6 +164,8 @@ not model parameter shapes. Rendering scales the board to fit its panel.
   `LuxEnv.observation_space` describes one player's tree with
   `ShapeDtypeStruct` leaves, excluding action masks.
 - MAPPO's `model.type: lux` encodes the spatial map with a residual CNN.
+  Tile embeddings and their gradient accumulation remain float32 to avoid slow
+  bf16 scatter-adds; the CNN inputs use the configured compute dtype.
   Own ships, visible opponent ships, and visible relic nodes are separate typed
   entities in one set. Tokens combine physical coordinates and local map features;
   ships also carry energy. There are no slot-index embeddings.

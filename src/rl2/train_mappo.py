@@ -247,6 +247,12 @@ os.environ.setdefault("EPATH_USE_TF", "0")
 
 # isort: split
 
+# Initialize Tokamax/Triton before RLax's TensorFlow dependencies; loading
+# libtriton after TensorFlow can segfault during native module initialization.
+from rl2.model.lux import LuxActorCritic, LuxCarry
+
+# isort: split
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -285,7 +291,6 @@ from rl2.mlflow_logging import MLflowLogger
 from rl2.model.actor_critic import ActorCriticOutput
 from rl2.model.config import GenericModelConfig, LSTMConfig, LuxModelConfig, MLPEncoderConfig, ModelConfig
 from rl2.model.generic import GenericActorCritic
-from rl2.model.lux import LuxActorCritic, LuxCarry
 from rl2.running_stats import RunningSum
 from rl2.selfplay.pool import (
     MatchAssignment,
