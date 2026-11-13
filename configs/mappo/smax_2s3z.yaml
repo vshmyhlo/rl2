@@ -17,7 +17,7 @@ model:
     hidden_size: 128
     num_layers: 1
     intermediate_size: 0
-bf16: false
+dtype: float32
 learning_rate: 0.0003
 anneal_lr: true
 lr_decay: linear

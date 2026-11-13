@@ -2,6 +2,7 @@
 
 from dataclasses import asdict, replace
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -60,12 +61,32 @@ def test_model_round_trip(config: GenericModelConfig | LuxModelConfig) -> None:
     assert restored == config and hash(restored) == hash(config)
 
 
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_dtype_round_trip(config: Config, tmp_path: Path, dtype: Literal["float32", "bfloat16"]) -> None:
+    config = replace(config, dtype=dtype)
+    path = tmp_path / "config.yaml"
+    path.write_bytes(TypeAdapter(Config).dump_json(config))
+    assert load_config(path, Config) == config
+
+
+def test_default_dtype(config: Config) -> None:
+    settings = asdict(config)
+    del settings["dtype"]
+    assert Config(**settings).dtype == "float32"
+
+
+@pytest.mark.parametrize("settings", [{"dtype": "float16"}, {"dtype": True}, {"bf16": True}])
+def test_invalid_dtype_settings(config: Config, settings: dict[str, object]) -> None:
+    with pytest.raises(ValidationError, match=next(iter(settings))):
+        Config(**(asdict(config) | settings))
+
+
 def test_lux_cudnn_requires_bfloat16(config: Config) -> None:
-    config = replace(config, env=LuxConfig(), model=LuxModelConfig(attention_implementation="cudnn"), bf16=True)
-    assert config.bf16
-    with pytest.raises(ValueError, match="cuDNN attention requires bf16=true"):
-        replace(config, bf16=False)
-    assert not replace(config, model=LuxModelConfig(attention_implementation="xla"), bf16=False).bf16
+    config = replace(config, env=LuxConfig(), model=LuxModelConfig(attention_implementation="cudnn"), dtype="bfloat16")
+    assert config.dtype == "bfloat16"
+    with pytest.raises(ValueError, match="cuDNN attention requires dtype=bfloat16"):
+        replace(config, dtype="float32")
+    assert replace(config, model=LuxModelConfig(attention_implementation="xla"), dtype="float32").dtype == "float32"
 
 
 @pytest.mark.parametrize(

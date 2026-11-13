@@ -581,17 +581,18 @@ class LuxHeads(nn.Module):
         positions = jnp.where(observation.self.units_mask[..., None], observation.self.units.position, 0)  # (*S, U, 2)
         targets = positions.reshape((batch_size, own_ship_count, 1, 2)) + offsets  # (B, U, As, 2)
         targets = jnp.clip(targets, 0, jnp.array([width - 1, height - 1]))  # (B, U, As, 2); off-map commands are masked
-        keys = self.sap_key(spatial).reshape((batch_size, height, width, self.conv_channels))  # (B, H, W, C)
-        keys = keys[jnp.arange(batch_size)[:, None, None], targets[..., 1], targets[..., 0]]  # (B, U, As, C)
+        keys = self.sap_key(spatial).reshape((batch_size, height * width, self.conv_channels))  # (B, H*W, C)
         normalized_offsets = jnp.asarray(offsets, dtype=self.dtype) / self.sap_range  # (As, 2)
         offset_features = jnp.concatenate((normalized_offsets, jnp.abs(normalized_offsets)), axis=-1)  # (As, 4)
         relative = self.sap_offset(nn.silu(self.sap_offset_hidden(offset_features)))  # (As, C)
-        keys = keys + relative  # (B, U, As, C)
         queries = self.sap_query(ships).reshape((batch_size, own_ship_count, self.conv_channels))  # (B, U, C)
-        # Keep close target scores distinct instead of rounding the dot product to bf16.
-        sap = jnp.einsum("bukc,buc->buk", keys, queries, preferred_element_type=jnp.float32) / sqrt(
-            self.conv_channels
-        )  # (B, U, As)
+        # Score before gathering to avoid retaining (B, U, As, C) features for differentiation.
+        # Accumulate both dot products in float32 to preserve close target scores.
+        map_scores = jnp.einsum("buc,bmc->bum", queries, keys, preferred_element_type=jnp.float32)  # (B, U, H*W)
+        target_indices = targets[..., 1] * width + targets[..., 0]  # (B, U, As)
+        target_scores = jnp.take_along_axis(map_scores, target_indices, axis=-1)  # (B, U, As)
+        offset_scores = jnp.einsum("buc,kc->buk", queries, relative, preferred_element_type=jnp.float32)  # (B, U, As)
+        sap = (target_scores + offset_scores) / sqrt(self.conv_channels)  # (B, U, As)
         sap = sap.reshape((*batch_shape, own_ship_count, offsets.shape[0]))  # (*S, U, As)
         return sap  # (*S, U, As)
 

@@ -11,7 +11,7 @@ The default generic model uses an MLP; model.type=lux uses masked entity-set
 self-attention, shared ship heads, and spatial sap-target scoring.
 Lux map and entity attention default to model.heads=8 and model.head_dim=32,
 with feature width model.heads * model.head_dim and CNN width model.conv_channels.
-Lux cuDNN attention requires bf16=true; select xla for float32 or CPU execution.
+Lux cuDNN attention requires dtype=bfloat16; select xla for float32 or CPU execution.
 Both models retain recurrent memory and one value per agent/team.
 Lux memory consists of a global-token LSTM cell/hidden state per attention block,
 retained across matches and reset at full-game boundaries.
@@ -464,7 +464,7 @@ class Config(BaseConfig):
     max_grad_norm: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     video_fps: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     model: ModelConfig = GenericModelConfig()
-    bf16: bool = False
+    dtype: Literal["float32", "bfloat16"] = "float32"
     video_max_frames: Annotated[int, Field(gt=0)] | None = 900
     video_interval: Annotated[int, Field(ge=0)] = 0
     eval_interval: Annotated[int, Field(ge=0)] = 0
@@ -485,8 +485,14 @@ class Config(BaseConfig):
     def validate_rollout(self) -> Self:
         if isinstance(self.env, LuxConfig) != isinstance(self.model, LuxModelConfig):
             raise ValueError("The lux model requires the luxai_s3 environment and vice versa")
-        if isinstance(self.model, LuxModelConfig) and self.model.attention_implementation == "cudnn" and not self.bf16:
-            raise ValueError("Lux cuDNN attention requires bf16=true; use attention_implementation=xla for float32")
+        if (
+            isinstance(self.model, LuxModelConfig)
+            and self.model.attention_implementation == "cudnn"
+            and self.dtype != "bfloat16"
+        ):
+            raise ValueError(
+                "Lux cuDNN attention requires dtype=bfloat16; use attention_implementation=xla for float32"
+            )
         if self.map_size_curriculum:
             if not isinstance(self.env, (LuxConfig, JaxNavConfig)):
                 raise ValueError("map_size_curriculum requires a Lux or JaxNav environment")
@@ -1617,7 +1623,7 @@ def train(config: Config) -> TrainState:
         model = make_actor_critic(
             action_space=env.action_space,
             model=config.model,
-            dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
+            dtype=jnp.dtype(config.dtype),
         )
         rollout_carry = init_rollout_carry(env, model, active_config, reset_key)  # leaves: (E, ...) or (B, ...)
         observation = rollout_carry.observation  # leaves: (E, N, ...)

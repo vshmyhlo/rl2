@@ -15,7 +15,7 @@ env:
 #   - { start_iteration: 1500, map_size: 32 }
 seed: 8
 total_iterations: 10_000
-# Two GPUs: 16 environments each.
+# Two GPUs: four environments each.
 num_envs: 8
 # Recurrent carry persists across rollout boundaries.
 num_steps: 512
@@ -24,8 +24,8 @@ num_minibatches: 4
 update_epochs: 1
 model:
   type: lux
-  attention_implementation: triton
-bf16: false
+  attention_implementation: cudnn
+dtype: bfloat16
 learning_rate: 0.0003
 anneal_lr: true
 lr_decay: linear

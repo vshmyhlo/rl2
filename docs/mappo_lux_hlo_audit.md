@@ -1,10 +1,43 @@
 # Lux MAPPO two-GPU HLO audit
 
+## Sap score matmuls: 2026-11-13
+
+Sap scoring now computes ship-to-map and ship-to-offset dot products separately,
+then gathers scalar map scores. Parameters, target ordering, clipping, and output
+shapes are unchanged. Both dot products accumulate in float32; distributing the
+dot product removes the previous bf16 rounding of `key + relative`, so results
+are not bitwise identical.
+
+The full train step compiles on two A100s with the same resolved 32×32
+configuration and training sources as the cuDNN audit below:
+
+| Optimized HLO diagnostic, per GPU | Before | After |
+| --- | ---: | ---: |
+| Estimated total executable storage | 12.129 GiB | 11.829 GiB |
+| Sap gathered-feature intermediate | 450 MiB | Absent |
+| Sap map-score tensor, float32 | Absent | 64 MiB |
+| Static reduce-scatter sites | 4 | 3 |
+| Static all-gather sites | 2 | 2 |
+
+Estimated storage falls by 306.305 MiB. The map-score operation uses an XLA
+Triton GEMM fusion. Its backward scatter stays local, eliminating the previous
+sap-gradient reduce-scatter. The other spatial-gradient all-gather and minibatch
+index all-gather remain. cuDNN attention stays batch-sharded, and there are no
+host callbacks.
+
+Artifacts: `runs/mappo_hlo/lux_sap_matmul_20261113/`, including optimized HLO,
+compiler summary, the previous model source, and updated source/config snapshots.
+Six focused CPU cases passed, including float32/bf16 logits and parameter/input
+gradient comparisons against the original calculation, clipped map-edge targets,
+rectangular maps, sequence axes, and close-score precision. GPU validation is
+recorded alongside the artifacts. Compilation encountered convolution autotuning
+workspace shortages on occupied GPUs; throughput remains unmeasured.
+
 ## Built-in cuDNN attention: 2026-11-13
 
 Lux now uses `jax.nn.dot_product_attention`, with `cudnn` as its default
 backend and `xla` for CPU/float32 execution. The training configuration selects
-`cudnn` and `bf16: true`; float32 cuDNN configurations are rejected early.
+`cudnn` and `dtype: bfloat16`; float32 cuDNN configurations are rejected early.
 Parameters and recurrent memory remain float32. cuDNN head widths are asserted
 to be divisible by eight. Query/key lengths are padded to
 even values for JAX's cuDNN backward path; padded keys are masked, extra query

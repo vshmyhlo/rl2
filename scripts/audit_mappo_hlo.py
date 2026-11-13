@@ -64,7 +64,7 @@ def compile_steps(config: ppo.Config, output: Path, step: Step = "all") -> None:
         model = ppo.make_actor_critic(
             action_space=env.action_space,
             model=config.model,
-            dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
+            dtype=jnp.dtype(config.dtype),
         )
         actor_count = config.num_envs * env.num_agents
 

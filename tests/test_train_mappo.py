@@ -49,7 +49,7 @@ def config() -> ppo.Config:
         value_coef=1.0,
         max_grad_norm=0.5,
         video_fps=5.0,
-        bf16=False,
+        dtype="float32",
         video_interval=0,
         eval_interval=0,
         model=ppo.GenericModelConfig(
