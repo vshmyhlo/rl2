@@ -1,4 +1,4 @@
-"""Set attention symmetry, bidirectional mixing, padding, and cuDNN sharding."""
+"""Set attention symmetry, backend parity, padding, and cuDNN sharding."""
 
 from typing import Any
 from unittest.mock import Mock
@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tokamax
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
 from rl2.model.lux import _Attention, _SetAttentionBlock
@@ -138,6 +139,81 @@ def test_cudnn_token_padding_preserves_masks(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(jax.nn, "dot_product_attention", original)
     expected = module.clone(attention_implementation="xla").apply(variables, tokens, tokens, mask)  # (B, Q, D)
     np.testing.assert_allclose(actual.astype(jnp.float32), expected.astype(jnp.float32), atol=0.02, rtol=0.02)
+
+
+def test_tokamax_rejects_narrow_heads(tokens: jax.Array) -> None:  # (B=1, Q=4, Dx=8)
+    module = _Attention(attention_implementation="tokamax", heads=2, head_dim=15, dtype=jnp.bfloat16)
+    with pytest.raises(AssertionError, match="head_dim >= 16"):
+        module.init(jax.random.key(5), tokens, tokens)
+
+
+@pytest.mark.parametrize(
+    "key_count,masked",
+    [
+        pytest.param(2, False, id="map_cross_attention"),
+        pytest.param(3, True, id="masked_entities"),
+    ],
+)
+def test_tokamax_preserves_outputs_and_gradients(monkeypatch: pytest.MonkeyPatch, key_count: int, masked: bool) -> None:
+    tokens = jax.random.normal(jax.random.key(4), (2, 3, 8))  # (B=2, Q=3, Dx=8)
+    context = tokens[:, :key_count]  # (B, K, Dc=8)
+    mask = jnp.array([[[[True, False, True]]], [[[False, True, False]]]]) if masked else None
+    # mask: (B, 1, 1, K); the second example has only one valid key.
+    module = _Attention(attention_implementation="tokamax", heads=2, head_dim=16, dtype=jnp.bfloat16)
+    reference = module.clone(attention_implementation="xla")
+    variables = reference.init(jax.random.key(5), tokens, context, mask)
+    original = tokamax.dot_product_attention
+
+    def attend(
+        query: jax.Array,  # (B, Q, Nh=2, Dh=16)
+        key: jax.Array,  # (B, K, Nh, Dh)
+        value: jax.Array,  # (B, K, Nh, Dh)
+        *,
+        mask: jax.Array | None,  # (B, 1, 1, K)
+        is_causal: bool,
+        scale: float,
+        implementation: str,
+    ) -> jax.Array:  # (B, Q, Nh, Dh)
+        assert implementation == "triton" and not is_causal
+        assert query.shape == (2, 3, 2, 16)
+        assert key.shape == value.shape == (2, key_count, 2, 16)
+        assert query.dtype == key.dtype == value.dtype == jnp.bfloat16
+        assert scale == 16**-0.5
+        # Exercise the real Triton kernel on GPU; use Tokamax's reference on CPU.
+        return original(
+            query,
+            key,
+            value,
+            mask=mask,
+            is_causal=is_causal,
+            scale=scale,
+            implementation="triton" if jax.default_backend() == "gpu" else "xla",
+        )
+
+    routed = Mock(wraps=attend)
+    monkeypatch.setattr(tokamax, "dot_product_attention", routed)
+
+    def loss(
+        variables: dict[str, Any],
+        tokens: jax.Array,  # (B, Q, Dx)
+        context: jax.Array,  # (B, K, Dc)
+        module: _Attention,
+    ) -> tuple[jax.Array, jax.Array]:  # (); (B, Q, D=Nh*Dh)
+        output = module.apply(variables, tokens, context, mask).astype(jnp.float32)  # (B, Q, D)
+        return jnp.square(output).mean(), output  # (); (B, Q, D)
+
+    evaluate = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True), static_argnames="module")
+    expected = evaluate(variables, tokens, context, reference)
+    actual = evaluate(variables, tokens, context, module)
+    assert routed.called and actual[0][1].shape == (2, 3, 32)
+    for result, target in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        assert result.shape == target.shape
+        np.testing.assert_allclose(result, target, atol=0.02, rtol=0.03)
+    if mask is not None:
+        np.testing.assert_array_equal(actual[1][2][~mask[:, 0, 0]], 0)
+        changed = context + (~mask[:, 0, 0, :, None]) * 1000  # (B, K, Dc)
+        output = jax.jit(module.apply)(variables, tokens, changed, mask)  # (B, Q, D)
+        np.testing.assert_array_equal(output.astype(jnp.float32), actual[0][1])
 
 
 @pytest.mark.parametrize(

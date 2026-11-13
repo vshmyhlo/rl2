@@ -184,9 +184,9 @@ not model parameter shapes. Rendering scales the board to fit its panel.
   attention, team embeddings, policy/value heads, and global-token LSTMs all use
   width `model.heads * model.head_dim`. Each block uses a single LSTM without
   stacking or intermediate MLPs.
-  `model.attention_implementation` defaults to `triton`: all attention stages
-  call Tokamax's Triton kernel.
-  Explicit `xla` selects Tokamax's CPU-compatible reference implementation.
+  `model.attention_implementation` defaults to `cudnn`. Set `tokamax` to use
+  Tokamax's Triton kernel for every attention stage on GPU, or `xla` for JAX's
+  CPU-compatible implementation. Tokamax requires `model.head_dim >= 16`.
   This architecture requires a fresh run directory; previous checkpoints are
   incompatible. Playing-strength improvements require training evaluation.
 - Omitting `model.type` selects `generic`, the flat MLP model. `make_actor_critic`

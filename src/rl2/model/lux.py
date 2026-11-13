@@ -1,15 +1,16 @@
 from math import isqrt, prod, sqrt
-from typing import Literal, NamedTuple
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import tokamax
 from flax import linen as nn
 
 from rl2.actions import HierarchicalMultiCategoricalPolicy, HierarchicalMultiDiscreteSpace
 from rl2.envs.lux_env import LuxObservation, LuxTeamObservation
 from rl2.lstm import LSTM, LSTMCarry
 from rl2.model.actor_critic import ActorCriticOutput, BaseActorCritic
-from rl2.model.config import LuxModelConfig
+from rl2.model.config import LuxAttentionImplementation, LuxModelConfig
 from rl2.model.encoders.conv2d import ResidualBlock
 
 # Shape dimensions: B = local batch size (possibly flattened); T = time; *S = leading batch axes.
@@ -78,9 +79,9 @@ def _global_context(observation: LuxObservation[jax.Array]) -> jax.Array:  # lea
 
 
 class _Attention(nn.Module):
-    """Noncausal JAX attention with cuDNN-compatible token padding."""
+    """Noncausal JAX or Tokamax attention with backend-specific padding."""
 
-    attention_implementation: Literal["cudnn", "xla"]
+    attention_implementation: LuxAttentionImplementation
     heads: int = 8
     head_dim: int = 32
     dtype: jax.typing.DTypeLike | None = None
@@ -94,6 +95,8 @@ class _Attention(nn.Module):
     ) -> jax.Array:  # (B, Q, D)
         if self.attention_implementation == "cudnn":
             assert self.head_dim % 8 == 0, "cuDNN attention requires head_dim divisible by 8"
+        if self.attention_implementation == "tokamax":
+            assert self.head_dim >= 16, "Tokamax Triton attention requires head_dim >= 16"
         query = nn.DenseGeneral(features=(self.heads, self.head_dim), dtype=self.dtype, name="query")(
             tokens
         )  # (B, Q, Nh, Dh)
@@ -120,15 +123,26 @@ class _Attention(nn.Module):
                     jnp.pad(context_mask, ((0, 0), (0, 0), (0, 0), (0, key_padding))),
                     (context_mask.shape[0], 1, query.shape[1], key.shape[1]),
                 )  # (B or 1, 1, Qp, Kp); padded queries retain valid keys, padded keys are masked
-        attended = jax.nn.dot_product_attention(
-            query,
-            key,
-            value,
-            mask=context_mask,
-            is_causal=False,
-            scale=self.head_dim**-0.5,
-            implementation=self.attention_implementation,
-        )[:, :query_count]  # (B, Q, Nh, Dh)
+        if self.attention_implementation == "tokamax":
+            attended = tokamax.dot_product_attention(
+                query,
+                key,
+                value,
+                mask=context_mask,
+                is_causal=False,
+                scale=self.head_dim**-0.5,
+                implementation="triton",
+            )  # (B, Q, Nh, Dh)
+        else:
+            attended = jax.nn.dot_product_attention(
+                query,
+                key,
+                value,
+                mask=context_mask,
+                is_causal=False,
+                scale=self.head_dim**-0.5,
+                implementation=self.attention_implementation,
+            )[:, :query_count]  # (B, Q, Nh, Dh)
         return nn.DenseGeneral(features=self.heads * self.head_dim, axis=(-2, -1), dtype=self.dtype, name="out")(
             attended
         )  # (B, Q, D)
@@ -137,7 +151,7 @@ class _Attention(nn.Module):
 class _SetAttentionBlock(nn.Module):
     """Bidirectional entity attention without slot embeddings or causal masks."""
 
-    attention_implementation: Literal["cudnn", "xla"]
+    attention_implementation: LuxAttentionImplementation
     heads: int = 8
     head_dim: int = 32
     dtype: jax.typing.DTypeLike | None = None
@@ -222,7 +236,7 @@ class _GlobalMemory(nn.Module):
 class LuxAttentionBlock(nn.Module):
     """Map retrieval, entity aggregation, global recurrence, then memory distribution."""
 
-    attention_implementation: Literal["cudnn", "xla"]
+    attention_implementation: LuxAttentionImplementation
     heads: int = 8
     head_dim: int = 32
     dtype: jax.typing.DTypeLike | None = None

@@ -5,6 +5,8 @@ from typing import Annotated, Any, Literal
 from pydantic import BeforeValidator, ConfigDict, Field
 from pydantic.dataclasses import dataclass
 
+type LuxAttentionImplementation = Literal["cudnn", "xla", "tokamax"]
+
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LSTMConfig:
@@ -34,7 +36,7 @@ class LuxModelConfig:
     num_blocks: Annotated[int, Field(gt=0, strict=True)] = 2
     heads: Annotated[int, Field(gt=0, strict=True)] = 8
     head_dim: Annotated[int, Field(gt=0, strict=True)] = 32
-    attention_implementation: Literal["cudnn", "xla"] = "cudnn"
+    attention_implementation: LuxAttentionImplementation = "cudnn"
 
 
 def _default_model_type(value: Any) -> Any:

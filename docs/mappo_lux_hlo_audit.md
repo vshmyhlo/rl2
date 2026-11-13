@@ -27,10 +27,14 @@ host callbacks.
 
 Artifacts: `runs/mappo_hlo/lux_sap_matmul_20261113/`, including optimized HLO,
 compiler summary, the previous model source, and updated source/config snapshots.
-Six focused CPU cases passed, including float32/bf16 logits and parameter/input
-gradient comparisons against the original calculation, clipped map-edge targets,
-rectangular maps, sequence axes, and close-score precision. GPU validation is
-recorded alongside the artifacts. Compilation encountered convolution autotuning
+Six focused CPU cases and three GPU cases passed, covering float32/bf16 logits
+and parameter/input gradients against the original calculation, clipped map-edge
+targets, rectangular maps, sequence axes, and close-score precision. The full
+sharded policy/value gradient test passes on two CPU devices and two GPUs with
+`JAX_DEFAULT_MATMUL_PRECISION=highest`. At default GPU precision it fails on a
+critic-value mismatch, reproduced with the original sap calculation. Training
+precision is unchanged. Logs and validation results accompany the artifacts.
+Ruff and `git diff --check` passed. Compilation encountered convolution autotuning
 workspace shortages on occupied GPUs; throughput remains unmeasured.
 
 ## Built-in cuDNN attention: 2026-11-13

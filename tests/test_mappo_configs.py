@@ -53,6 +53,7 @@ def test_invalid_encoder(encoder: dict[str, object], field: str) -> None:
             heads=2,
             head_dim=4,
         ),
+        LuxModelConfig(attention_implementation="tokamax"),
     ],
 )
 def test_model_round_trip(config: GenericModelConfig | LuxModelConfig) -> None:
