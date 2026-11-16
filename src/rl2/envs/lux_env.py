@@ -38,6 +38,17 @@ class LuxState(NamedTuple):
     params: EnvParams  # Array leaves: (), sampled once per game.
 
 
+class LuxRenderTransition(NamedTuple):
+    previous_state: LuxState  # Array leaves: (...), before the rendered step.
+    action: jax.Array | NDArray[np.integer]  # (N, U), commands producing the rendered state.
+
+
+class _RenderSap(NamedTuple):
+    team: int
+    origin: tuple[int, int]
+    target: tuple[int, int]
+
+
 class _RenderTile(NamedTuple):
     left: int
     top: int
@@ -299,8 +310,9 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
         state: LuxState,  # leaves: (...)
         *,
         team_labels: tuple[str, str] | None = None,
+        transition: LuxRenderTransition | None = None,
     ) -> NDArray[np.uint8]:  # (416, 640, 3)
-        """Return (416, 640, 3) uint8 privileged overview with optional labels indexed by team."""
+        """Return (416, 640, 3) uint8 overview; transition adds valid saps from the preceding step."""
         game, params = jax.device_get(state)
         steps, match_steps = int(game.steps), int(game.match_steps)
         match_count, match_length = int(params.match_count_per_episode), int(params.max_steps_in_match)
@@ -337,6 +349,32 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
         pixels = energy_colors(np.asarray(game.map_features.energy).T)  # (H, W, RGB)
         pixels[tiles == 2] = asteroid_color
         map_size = int(params.map_width)
+        shots: list[_RenderSap] = []
+        if transition is not None:
+            previous, action = jax.device_get(transition)  # state leaves: (...); action: (N, U)
+            action = np.asarray(action, dtype=np.int32)  # (N, U), offsets require signed arithmetic
+            prior = previous.game
+            offsets = (
+                np.stack(((action - 5) // (2 * self.sap_range + 1), (action - 5) % (2 * self.sap_range + 1)), axis=-1)
+                - self.sap_range
+            )  # (N, U, 2), dx/dy
+            targets = prior.units.position.astype(np.int32) + offsets  # (N, U, 2)
+            valid = (
+                (action >= 5)
+                & prior.units_mask
+                & (prior.match_steps != 0)
+                & (prior.units.energy[..., 0] >= previous.params.unit_sap_cost)
+                & (np.abs(offsets).max(axis=-1) <= previous.params.unit_sap_range)
+                & ((targets >= 0) & (targets < map_size)).all(axis=-1)
+            )  # (N, U), sappers do not move before firing; later damage does not cancel shots
+            for team, ship in np.argwhere(valid):
+                shots.append(
+                    _RenderSap(
+                        team=int(team),
+                        origin=tuple(map(int, prior.units.position[team, ship])),
+                        target=tuple(map(int, targets[team, ship])),
+                    )
+                )
         cell_size = 288 / map_size
         tile_ids = np.arange(map_size, dtype=np.int32)[None, :]  # (1, W)
         with (
@@ -415,6 +453,40 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
                         (left + width / 4, top + height / 4, left + width * 3 / 4, top + height * 3 / 4),
                         fill=relic_color,
                     )
+            for team, color in enumerate(team_colors):
+                team_shots = [shot for shot in shots if shot.team == team]
+                if not team_shots:
+                    continue
+                with Image.new("RGBA", frame.size) as splash:
+                    splash_draw = ImageDraw.Draw(splash)
+                    for shot in team_shots:
+                        x, y = shot.target
+                        for dy in (-1, 0, 1):
+                            for dx in (-1, 0, 1):
+                                if not (0 <= x + dx < map_size and 0 <= y + dy < map_size):
+                                    continue
+                                left, top, width, height = tile_bounds(x + dx, y + dy)
+                                if width and height:
+                                    splash_draw.rectangle(
+                                        (left, top, left + width - 1, top + height - 1), fill=(*color, 28)
+                                    )
+                    for shot in team_shots:
+                        left, top, width, height = tile_bounds(*shot.target)
+                        if width and height:
+                            splash_draw.rectangle((left, top, left + width - 1, top + height - 1), fill=(*color, 64))
+                    frame.paste(splash, (0, 0), splash)
+            for shot in shots:
+                origin, target = tile_bounds(*shot.origin), tile_bounds(*shot.target)
+                if not (origin.width and origin.height and target.width and target.height):
+                    continue
+                color = team_colors[shot.team]
+                source = (origin.left + (origin.width - 1) / 2, origin.top + (origin.height - 1) / 2)
+                x, y = target.left + (target.width - 1) / 2, target.top + (target.height - 1) / 2
+                draw.line((*source, x, y), fill=color)
+                radius = min(target.width - 1, target.height - 1) / 3
+                draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=color)
+                draw.line((x - radius, y, x + radius, y), fill=color)
+                draw.line((x, y - radius, x, y + radius), fill=color)
             for team, color in enumerate(team_colors):
                 occupied_scoring: set[tuple[int, int]] = set()
                 ship_ids = np.flatnonzero(active[team])  # (S,), existing ships with nonnegative energy
@@ -526,7 +598,9 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
                 draw.text((left + 18, 395), f"Team {team}", font=small_font, fill=(185, 195, 210))
             draw.text(
                 (244, 395),
-                "Full map (hidden info); outlines = vision",
+                "Full map; outlines = vision; beams = sap"
+                if transition is not None
+                else "Full map (hidden info); outlines = vision",
                 font=small_font,
                 fill=(185, 195, 210),
             )

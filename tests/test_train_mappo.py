@@ -722,6 +722,39 @@ def test_playback_reuses_compiled_episode(config: ppo.Config) -> None:
     assert first.episode_return == second.episode_return == 3.0
 
 
+@pytest.mark.parametrize("capacity", [0, 1, 2, 3], ids=["disabled", "initial-only", "capped", "terminal"])
+def test_compiled_lux_action_recording(capacity: int) -> None:
+    scripted = ScriptedSMAX()
+    env = Mock(spec=LuxEnv, num_agents=2, config=LuxConfig(max_units=1))
+    env.reset.side_effect = scripted.reset
+    env.step.side_effect = scripted.step
+
+    def policy(
+        variables: dict[str, Any],
+        observation: jax.Array,  # (N, O=2)
+        carry: ppo.RecurrentCarry,  # leaves: (N, H)
+        starts: jax.Array,  # (N,)
+        mask: jax.Array,  # (N, A=3)
+        *,
+        method: str,
+    ) -> tuple[ppo.ActorCriticOutput, ppo.RecurrentCarry]:
+        selected = (observation[:, :1] / 10).astype(jnp.int32) + jnp.arange(2)[:, None]  # (N, U=1)
+        logits = jnp.where(jnp.arange(3) == selected[..., None], 0.0, -jnp.inf)  # (N, U, A)
+        return ppo.ActorCriticOutput(policy=MultiCategoricalPolicy(logits=logits), value=jnp.zeros(2)), carry
+
+    result = ppo.run_episode(
+        env, policy, {}, jax.random.key(0), (), recording_capacity=capacity, stop_at_frame_limit=False
+    )
+    assert int(result.length) == 2
+    if capacity == 0:
+        assert result.actions is None and result.states is None
+    else:
+        assert result.actions.shape == (capacity, 2, 1)
+        assert result.actions.dtype == jnp.int32
+        np.testing.assert_array_equal(result.actions, np.array([[[0], [0]], [[0], [1]], [[1], [2]]])[:capacity])
+        np.testing.assert_array_equal(result.states.state.step, np.arange(capacity))
+
+
 @pytest.mark.parametrize("recording_capacity", [0, 4], ids=["no-recording", "recorded-states"])
 def test_compiled_episode_state_buffer(recording_capacity: int) -> None:
     env = ScriptedSMAX()
@@ -737,6 +770,7 @@ def test_compiled_episode_state_buffer(recording_capacity: int) -> None:
     )
     assert result.episode_return.shape == result.length.shape == ()
     assert result.opponent_return is None
+    assert result.actions is None  # Non-Lux episodes do not allocate an action buffer.
     assert float(result.episode_return) == 3.0 and int(result.length) == 2
     if recording_capacity == 0:
         assert result.states is None
@@ -1447,7 +1481,9 @@ def test_reference_eval_metrics_and_artifacts(
 
 
 @pytest.mark.parametrize("team_labels", [None, ("Reference: baseline", "Trained policy")])
-def test_playback_passes_team_labels_to_lux_renderer(config: ppo.Config, team_labels: tuple[str, str] | None) -> None:
+def test_playback_passes_labels_and_transitions_to_lux_renderer(
+    config: ppo.Config, team_labels: tuple[str, str] | None
+) -> None:
     frame = np.zeros((416, 640, 3), dtype=np.uint8)  # (H, W, 3)
     env = Mock(spec=LuxEnv)
     env.render.return_value = frame
@@ -1455,6 +1491,7 @@ def test_playback_passes_team_labels_to_lux_renderer(config: ppo.Config, team_la
         episode_return=jnp.asarray(0.0),  # ()
         length=jnp.asarray(1),  # ()
         states=jnp.arange(2),  # (F,), stand-in render states
+        actions=jnp.array([[[0], [0]], [[163], [71]]]),  # (F, N, U)
         opponent_return=None,
     )
     with patch.object(ppo, "run_episode", return_value=episode):
@@ -1462,7 +1499,13 @@ def test_playback_passes_team_labels_to_lux_renderer(config: ppo.Config, team_la
     assert len(result.frames) == 2
     for index, call in enumerate(env.render.call_args_list):
         assert int(call.args[0]) == index
-        assert call.kwargs == {"team_labels": team_labels}
+        assert call.kwargs["team_labels"] == team_labels
+        transition = call.kwargs["transition"]
+        if index == 0:
+            assert transition is None
+        else:
+            assert int(transition.previous_state) == index - 1
+            np.testing.assert_array_equal(transition.action, [[163], [71]])
         assert result.frames[index] is frame
 
 

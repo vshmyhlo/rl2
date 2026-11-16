@@ -211,7 +211,7 @@ not model parameter shapes. Rendering scales the board to fit its panel.
 - The trainer averages agent returns for episode metrics. With both opposing
   teams included, a completed game always has mean return `match_count / 2`;
   this is not a playing-strength metric. A fixed-opponent evaluation is not yet
-  implemented. The headless renderer shows the full map and active scoring tiles,
+  implemented. The headless renderer shows the map and active scoring tiles,
   match/turn progress, team relic points, wins, active ships, and energy. Points
   display as `--` at match boundaries because the simulator has already reset them.
   Each scorecard counts distinct active scoring tiles currently occupied by that
@@ -220,9 +220,15 @@ not model parameter shapes. Rendering scales the board to fit its panel.
   Tile energy uses an orange–neutral–teal scale fixed to the parameter bounds,
   with outlined nebulae and solid asteroids. The separate nebula drain is labeled;
   the heatmap shows raw tile energy before that penalty.
-  Blue/red outlines on the main map trace each team's current sensor coverage,
-  including unseen holes; shared boundaries alternate team colors. They show
-  current visibility, not remembered exploration; the map remains privileged.
+  `render_vision: fog_of_war` (default) hides tiles unseen by either team,
+  including ships, relics, scoring markers, and sap effects. Visibility uses current
+  sensor coverage, not remembered exploration; scorecards remain omniscient.
+  `render_vision: outline` shows the full map with blue/red sensor boundaries,
+  including unseen holes; shared boundaries alternate team colors.
+  Video recordings retain actions alongside states. Valid saps appear on the resulting
+  frame as team-colored beams and target crosshairs, with translucent target and
+  eight-neighbor splash tiles. Eligibility and origins use the preceding state;
+  misses remain visible and match-reset actions are omitted. Overlays do not report damage.
   Single ships have energy bars scaled to `max_unit_energy`, separated from the
   ship marker by one pixel; stacked ships show a count badge instead. Bars and
   badges are omitted when tiles are under 10 pixels wide. Frames are 640 × 416 pixels.

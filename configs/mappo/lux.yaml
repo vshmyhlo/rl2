@@ -24,8 +24,8 @@ num_minibatches: 4
 update_epochs: 1
 model:
   type: lux
-  attention_implementation: xla
-dtype: float32
+  attention_implementation: cudnn
+dtype: bfloat16
 learning_rate: 0.0003
 anneal_lr: true
 lr_decay: linear
@@ -39,22 +39,24 @@ entropy_decay: constant
 value_coef: 1.0
 max_grad_norm: 0.5
 ckpt_dir: /runs/mappo/${run_id}
-run_id: mappo_lux_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
+run_id: mappo_lux_pool_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
 # Intervals count training iterations.
 log_interval: 10
-video_interval: 200
+video_interval: 500
 video_fps: 10
 checkpoint_interval: 200
 # Full Orbax checkpoint directories; each contains state/ and metadata/.
 eval_interval: 1000
 eval_episodes: 100
 
-# eval_ref_policies:
-#   selfplay_16x16_mb4_ep1_s7_5400: /runs/mappo/mappo_lux_selfplay_16x16_mb4_ep1_s7/checkpoints/5400
-#   baseline_16x16_mb4_ep1_s7_2400: /runs/mappo/mappo_lux_16x16_mb4_ep1_s7/checkpoints/2400
-#   baseline_32x32_mb4_ep1_s8_2000: /runs/mappo/mappo_lux_32x32_mb4_ep1_s8/checkpoints/2000
+eval_ref_policies:
+  # selfplay_16x16_mb4_ep1_s7_5400: /runs/mappo/mappo_lux_selfplay_16x16_mb4_ep1_s7/checkpoints/5400
+  # baseline_16x16_mb4_ep1_s7_2400: /runs/mappo/mappo_lux_16x16_mb4_ep1_s7/checkpoints/2400
+  baseline_32x32_mb4_ep1_s8_10000: /runs/mappo/mappo_lux_32x32_mb4_ep1_s8/checkpoints/10000
+  baseline_16x16_mb4_ep1_s8_10000: /runs/mappo/mappo_lux_16x16_mb4_ep1_s8/checkpoints/10000
+  baseline_8x8_mb4_ep1_s8_10000: /runs/mappo/mappo_lux_8x8_mb4_ep1_s8/checkpoints/10000
 
-# selfplay:
-#   pool_size: 32
-#   snapshot_interval: 50
-#   current_policy_fraction: 0.5
+selfplay:
+  pool_size: 32
+  snapshot_interval: 200
+  current_policy_fraction: 0.5

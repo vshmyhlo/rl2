@@ -200,6 +200,8 @@ with frame boundaries rounded to 10 ms and a minimum 10 ms frame delay.
 Each evaluation/video episode compiles reset, inference, and environment steps
 together. Video buffers states up to the frame cap or configured episode horizon,
 then transfers them once for host rendering; uncapped video stores the full episode.
+Lux recordings also retain actions to show valid sap beams and splash footprints
+on the resulting frames, using the preceding state for firing eligibility and origins.
 
 Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
 model/parameter_count/<step>.txt, gameplay/<step>.gif, eval/report/<name>/<step>.json,
@@ -279,7 +281,7 @@ from rl2.actions import (
 )
 from rl2.configuration import BaseConfig, load_config
 from rl2.envs.jaxnav_env import JaxNavConfig, JaxNavEnv
-from rl2.envs.lux_env import LuxConfig, LuxEnv, LuxObservation
+from rl2.envs.lux_env import LuxConfig, LuxEnv, LuxObservation, LuxRenderTransition
 from rl2.envs.mpe_env import MPEConfig, MPEEnv
 from rl2.envs.multi_agent import AgentObservation, BaseMultiAgentEnv
 from rl2.envs.robotarium_env import RobotariumConfig, RobotariumEnv
@@ -761,10 +763,16 @@ class EvaluationMatch(NamedTuple):
     current_team: jax.Array  # () team index
 
 
+class EpisodeRecording(NamedTuple):
+    states: Any  # leaves: (F, ...), initial then pre-autoreset states; None without recording
+    actions: jax.Array | None  # (F, N, U), Lux only; index i produced state i, index zero unused
+
+
 class CompiledEpisode(NamedTuple):
     episode_return: jax.Array  # ()
     length: jax.Array  # ()
     states: Any  # leaves: (F, ...), initial then pre-autoreset states; None without recording
+    actions: jax.Array | None  # (F, N, U), Lux only; index zero unused; None without recording
     opponent_return: jax.Array | None  # () with a reference opponent
 
 
@@ -792,19 +800,25 @@ def run_episode(
         length=jnp.asarray(0, dtype=jnp.int32),  # ()
         done=jnp.asarray(False),  # ()
     )
-    saved = None
+    saved = EpisodeRecording(states=None, actions=None)
     if recording_capacity > 0:
-        saved = jax.tree.map(
+        states = jax.tree.map(
             lambda leaf: jnp.zeros_like(leaf, shape=(recording_capacity, *jnp.shape(leaf))).at[0].set(leaf), env_state
         )  # leaves: (F, ...), initial state at index zero
+        actions = (
+            jnp.zeros((recording_capacity, env.num_agents, env.config.max_units), dtype=jnp.int32)
+            if isinstance(env, LuxEnv)
+            else None
+        )  # (F, N, U) or None
+        saved = EpisodeRecording(states=states, actions=actions)
 
-    def condition(loop_state: tuple[EpisodeState, Any]) -> jax.Array:  # ()
+    def condition(loop_state: tuple[EpisodeState, EpisodeRecording]) -> jax.Array:  # ()
         state, _ = loop_state
         if recording_capacity > 0 and stop_at_frame_limit:
             return ~state.done & (state.length < recording_capacity - 1)  # ()
         return ~state.done  # ()
 
-    def body(loop_state: tuple[EpisodeState, Any]) -> tuple[EpisodeState, Any]:
+    def body(loop_state: tuple[EpisodeState, EpisodeRecording]) -> tuple[EpisodeState, EpisodeRecording]:
         state, saved = loop_state  # saved leaves: (F, ...) or None
         key, action_key, env_key = jax.random.split(state.key, 3)  # each () typed PRNG key
         if isinstance(params, EvaluationMatch):
@@ -853,9 +867,13 @@ def run_episode(
         )
         if recording_capacity > 0:
             # Keep scoring after the video cap without writing past its buffer.
-            saved = jax.tree.map(
-                lambda buffer, leaf: buffer.at[state.length].set(leaf, mode="drop"), saved, result.final_state
+            states = jax.tree.map(
+                lambda buffer, leaf: buffer.at[state.length].set(leaf, mode="drop"), saved.states, result.final_state
             )  # leaves: (F, ...)
+            actions = (
+                saved.actions.at[state.length].set(action, mode="drop") if saved.actions is not None else None
+            )  # (F, N, U) or None
+            saved = EpisodeRecording(states=states, actions=actions)
         return state, saved
 
     state, saved = jax.lax.while_loop(condition, body, (state, saved))
@@ -866,7 +884,8 @@ def run_episode(
             else state.team_returns.mean()
         ),  # ()
         length=state.length,  # ()
-        states=saved,  # leaves: (F, ...) or None
+        states=saved.states,  # leaves: (F, ...) or None
+        actions=saved.actions,  # (F, N, U) or None
         opponent_return=(
             state.team_returns[1 - params.current_team] if isinstance(params, EvaluationMatch) else None
         ),  # () or None
@@ -917,9 +936,18 @@ def play_episode(
     if record:
         for index in range(min(int(result.length) + 1, recording_capacity)):
             env_state = jax.tree.map(itemgetter(index), result.states)  # leaves: (...)
-            frame = (
-                env.render(env_state, team_labels=team_labels) if isinstance(env, LuxEnv) else env.render(env_state)
-            )  # (H, W, 3)
+            if isinstance(env, LuxEnv):
+                transition = (
+                    LuxRenderTransition(
+                        previous_state=jax.tree.map(itemgetter(index - 1), result.states),  # leaves: (...)
+                        action=result.actions[index],  # (N, U)
+                    )
+                    if index > 0 and result.actions is not None
+                    else None
+                )
+                frame = env.render(env_state, team_labels=team_labels, transition=transition)  # (H, W, 3)
+            else:
+                frame = env.render(env_state)  # (H, W, 3)
             frames.append(np.asarray(frame))  # (H, W, 3)
     return EpisodeResult(
         episode_return=float(result.episode_return),

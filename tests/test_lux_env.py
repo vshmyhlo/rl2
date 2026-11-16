@@ -11,18 +11,147 @@ from PIL import ImageDraw
 from pydantic import ValidationError
 
 from rl2.actions import HierarchicalMultiDiscreteSpace
-from rl2.envs.lux_env import LuxConfig, LuxEnv, LuxObservation, LuxState
+from rl2.envs.lux_env import LuxConfig, LuxEnv, LuxObservation, LuxRenderTransition, LuxState
 from rl2.envs.multi_agent import AgentObservation
 
 
 @pytest.fixture(scope="module")
 def env() -> LuxEnv:
-    return LuxEnv(LuxConfig(max_units=2, max_steps_in_match=2, match_count=2))
+    return LuxEnv(LuxConfig(max_units=2, max_steps_in_match=2, match_count=2, render_vision="outline"))
 
 
 @pytest.fixture(scope="module")
 def initial(env: LuxEnv) -> tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]:
     return jax.jit(env.reset)(jax.random.key(0))  # (N, ...)/(N, U, A); state leaves: (...)
+
+
+@pytest.fixture
+def sap_transition(initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]) -> LuxRenderTransition:
+    _, state = initial
+    game = state.game.replace(
+        steps=jnp.asarray(2),
+        match_steps=jnp.asarray(2),
+        units=state.game.units.replace(
+            position=jnp.array([[[3, 4], [0, 0]], [[20, 19], [0, 0]]], dtype=jnp.int16),  # (N, U, 2)
+            energy=jnp.full((2, 2, 1), 30, dtype=jnp.int16),  # (N, U, 1)
+        ),
+        units_mask=jnp.array([[True, False], [True, False]]),  # (N, U)
+        map_features=jax.tree.map(jnp.zeros_like, state.game.map_features),  # leaves: (W, H)
+        sensor_mask=jnp.zeros_like(state.game.sensor_mask),  # (N, W, H)
+        relic_nodes_mask=jnp.zeros_like(state.game.relic_nodes_mask),  # (R,)
+        relic_nodes_map_weights=jnp.zeros_like(state.game.relic_nodes_map_weights),  # (W, H)
+    )
+    return LuxRenderTransition(
+        previous_state=state._replace(game=game, params=state.params.replace(unit_sap_cost=30, unit_sap_range=3)),
+        action=np.array([[163, 0], [71, 0]], dtype=np.int32),  # (N, U), offsets (3, 1) and (-3, -1)
+    )
+
+
+def test_render_sap_origins_targets_and_splash(env: LuxEnv, sap_transition: LuxRenderTransition) -> None:
+    prior = sap_transition.previous_state
+    # Both shooters disappear after firing, and the result is a match boundary.
+    state = prior._replace(
+        game=prior.game.replace(steps=jnp.asarray(3), match_steps=jnp.asarray(0), units_mask=jnp.zeros((2, 2), bool))
+    )
+    plain = env.render(state)  # (416, 640, 3)
+    frame = env.render(state, transition=sap_transition)  # (416, 640, 3)
+    assert frame.shape == (416, 640, 3) and frame.dtype == np.uint8
+    for origin, target, color in (((3, 4), (6, 5), (70, 180, 255)), ((20, 19), (17, 18), (255, 95, 85))):
+        for x, y in (origin, target):
+            np.testing.assert_array_equal(frame[72 + y * 12 + 5, 16 + x * 12 + 5], color)
+        x, y = target
+        # Splash reaches all eight neighbors, but does not tint the next tile out.
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                pixel = (72 + (y + dy) * 12 + 1, 16 + (x + dx) * 12 + 1)
+                assert np.any(frame[pixel] != plain[pixel])
+        np.testing.assert_array_equal(frame[72 + (y + 2) * 12 + 1, 16 + x * 12 + 1], [25, 30, 45])
+    np.testing.assert_array_equal(frame[72:360, 304:], plain[72:360, 304:])  # Scorecards stay unchanged.
+
+
+def test_render_sap_unsigned_actions(env: LuxEnv, sap_transition: LuxRenderTransition) -> None:
+    signed = env.render(sap_transition.previous_state, transition=sap_transition)  # (416, 640, 3)
+    unsigned = env.render(
+        sap_transition.previous_state,
+        transition=sap_transition._replace(action=sap_transition.action.astype(np.uint8)),  # (N, U)
+    )  # (416, 640, 3)
+    np.testing.assert_array_equal(unsigned, signed)  # Negative offsets must not wrap in unsigned arithmetic.
+
+
+def test_render_sap_after_collision_reuses_ship_slot(
+    env: LuxEnv, initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]
+) -> None:
+    _, state = initial
+    prior = state._replace(
+        game=state.game.replace(
+            steps=jnp.asarray(2),
+            match_steps=jnp.asarray(2),
+            units=state.game.units.replace(
+                position=jnp.array([[[3, 4], [0, 0]], [[4, 4], [0, 0]]], dtype=jnp.int16),  # (N, U, 2)
+                energy=jnp.array([[[50], [0]], [[150], [0]]], dtype=jnp.int16),  # (N, U, 1)
+            ),
+            units_mask=jnp.array([[True, False], [True, False]]),  # (N, U)
+            map_features=jax.tree.map(jnp.zeros_like, state.game.map_features),  # leaves: (W, H)
+        ),
+        params=state.params.replace(spawn_rate=jnp.asarray(2)),
+    )
+    action = jnp.array([[119, 0], [4, 0]], dtype=jnp.int32)  # (N, U), sap (0, 2); enemy moves left
+    result = jax.jit(env.step)(jax.random.key(21), prior, action)
+    assert bool(result.final_state.game.units_mask[0, 0])
+    np.testing.assert_array_equal(result.final_state.game.units.position[0, 0], [0, 0])  # Replacement ship.
+    frame = env.render(
+        result.final_state, transition=LuxRenderTransition(previous_state=prior, action=action)
+    )  # (416, 640, 3)
+    np.testing.assert_array_equal(frame[149, 57], [70, 180, 255])  # Original target (3, 6), not (0, 2).
+
+
+@pytest.mark.parametrize("reason", ["absent", "energy", "range", "off-map", "match-reset", "move"])
+def test_render_omits_invalid_saps(env: LuxEnv, sap_transition: LuxRenderTransition, reason: str) -> None:
+    prior = sap_transition.previous_state
+    game, params = prior
+    action = np.array([[163, 0], [0, 0]], dtype=np.int32)  # (N, U)
+    if reason == "absent":
+        game = game.replace(units_mask=game.units_mask.at[0, 0].set(False))
+    elif reason == "energy":
+        game = game.replace(units=game.units.replace(energy=game.units.energy.at[0, 0, 0].set(29)))
+    elif reason == "range":
+        params = params.replace(unit_sap_range=2)
+    elif reason == "off-map":
+        game = game.replace(
+            units=game.units.replace(
+                position=game.units.position.at[0, 0].set(jnp.array([23, 4], dtype=jnp.int16))  # (N, U, 2)
+            )
+        )
+    elif reason == "match-reset":
+        game = game.replace(match_steps=jnp.asarray(0))
+    else:
+        action[0, 0] = 1
+    transition = LuxRenderTransition(previous_state=LuxState(game=game, params=params), action=action)
+    plain = env.render(prior)  # (416, 640, 3)
+    frame = env.render(prior, transition=transition)  # (416, 640, 3)
+    np.testing.assert_array_equal(frame[72:360, 16:304], plain[72:360, 16:304])
+
+
+def test_render_sap_at_board_edges(env: LuxEnv, sap_transition: LuxRenderTransition) -> None:
+    prior = sap_transition.previous_state
+    prior = prior._replace(
+        game=prior.game.replace(
+            units=prior.game.units.replace(
+                position=jnp.array([[[0, 0], [0, 0]], [[23, 23], [0, 0]]], dtype=jnp.int16)  # (N, U, 2)
+            )
+        )
+    )
+    transition = LuxRenderTransition(
+        previous_state=prior,
+        action=np.array([[117, 0], [117, 0]], dtype=np.int32),  # (N, U), zero-offset saps
+    )
+    plain = env.render(prior)  # (416, 640, 3)
+    frame = env.render(prior, transition=transition)  # (416, 640, 3)
+    assert np.any(frame[72:96, 16:40] != plain[72:96, 16:40])
+    assert np.any(frame[336:360, 280:304] != plain[336:360, 280:304])
+    np.testing.assert_array_equal(frame[:72], plain[:72])
+    np.testing.assert_array_equal(frame[72:360, :16], plain[72:360, :16])
+    np.testing.assert_array_equal(frame[360:390], plain[360:390])
 
 
 def test_observation_converts_rectangular_native_maps_to_height_width(
@@ -277,7 +406,7 @@ def test_invalid_map_size(map_size: int) -> None:
 
 
 def test_large_map_reset_step_and_render() -> None:
-    env = LuxEnv(LuxConfig(map_size=128, max_units=2, randomize_params=False))
+    env = LuxEnv(LuxConfig(map_size=128, max_units=2, randomize_params=False, render_vision="outline"))
     keys = jax.random.split(jax.random.key(42), 2)  # (E=2,)
     observation, state = jax.jit(jax.vmap(env.reset))(keys)  # observation/state leaves: (E, ...)
     assert env.params.map_width == env.params.map_height == 128
@@ -311,7 +440,7 @@ def test_large_map_reset_step_and_render() -> None:
 
 def test_render_downsampled_map(initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]) -> None:
     _, state = initial
-    env = LuxEnv(LuxConfig(map_size=512, max_units=2, randomize_params=False))
+    env = LuxEnv(LuxConfig(map_size=512, max_units=2, randomize_params=False, render_vision="outline"))
     # Tile (1, 1) receives no pixels when Pillow downsamples 512 tiles to 288 pixels.
     game = state.game.replace(
         map_features=state.game.map_features.replace(
@@ -337,6 +466,23 @@ def test_render_downsampled_map(initial: tuple[AgentObservation[LuxObservation[j
     np.testing.assert_array_equal(frame[72:360, 16:304], expected)
     labels = [call.args[2] for call in text.call_args_list if call.args[2].startswith("Scoring tiles:")]
     assert labels == ["Scoring tiles: 1", "Scoring tiles: 0"]  # Counts still include unrepresented tiles.
+    rendered = state._replace(game=game, params=state.params.replace(map_width=512, map_height=512))
+    prior = rendered._replace(
+        game=game.replace(
+            match_steps=jnp.asarray(1),
+            units=game.units.replace(energy=jnp.full((2, 2, 1), 100, dtype=jnp.int16)),  # (N, U, 1)
+        )
+    )
+    overlay = env.render(
+        rendered,
+        transition=LuxRenderTransition(
+            previous_state=prior,
+            action=np.array([[117, 0], [0, 0]], dtype=np.int32),  # (N, U)
+        ),
+    )  # (416, 640, 3)
+    assert overlay.shape == frame.shape and overlay.dtype == np.uint8
+    assert np.any(overlay[73, 17] != frame[73, 17])  # Splash tile (2, 2) survives the omitted center.
+    np.testing.assert_array_equal(overlay[72:360, 304:], frame[72:360, 304:])
 
 
 @pytest.mark.parametrize(
@@ -584,15 +730,79 @@ def test_render_team_visibility(
         np.testing.assert_array_equal(frame[359, [17, 20]], [blue, red] if visible else [unseen, unseen])
 
 
-def test_render_legend(env: LuxEnv, initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]) -> None:
+@pytest.mark.parametrize("coverage", ["partial", "none", "all"])
+def test_render_fog_of_war(env: LuxEnv, sap_transition: LuxRenderTransition, coverage: str) -> None:
+    fog_env = LuxEnv(LuxConfig(max_units=2))
+    assert fog_env.config.render_vision == "fog_of_war"
+    state = sap_transition.previous_state
+    game = state.game.replace(
+        map_features=state.game.map_features.replace(
+            energy=jnp.full((24, 24), 10, dtype=jnp.int16),  # (W, H)
+            tile_type=jnp.zeros((24, 24), dtype=jnp.int16).at[3, 4].set(1).at[4, 4].set(2),  # (W, H)
+        ),
+        relic_nodes=state.game.relic_nodes.at[0].set(jnp.array([4, 5], dtype=jnp.int16)),  # (R, 2)
+        relic_nodes_mask=jnp.array([True, False, False, True, False, False]),  # (R,)
+        relic_nodes_map_weights=jnp.zeros((24, 24), dtype=jnp.int16).at[5, 5].set(1),  # (W, H)
+    )
+    full = env.render(state._replace(game=game), transition=sap_transition)  # (416, 640, 3), no outlines
+    sensor_mask = np.full((2, 24, 24), coverage == "all", dtype=bool)  # (N, W, H)
+    if coverage == "partial":
+        sensor_mask[0, 2:7, 3:7] = True
+        sensor_mask[1, 5:9, 5:9] = True  # Overlap and tiles visible only to team 1.
+        sensor_mask[:, 3, 4] = False  # Hole hides a ship, nebula border, and sap origin.
+        sensor_mask[:, 4:6, 5] = False  # Hidden asteroid/relic/scoring/sap pixels.
+    game = game.replace(sensor_mask=jnp.asarray(sensor_mask))
+    with patch.object(ImageDraw.ImageDraw, "text", autospec=True, side_effect=ImageDraw.ImageDraw.text) as text:
+        frame = fog_env.render(state._replace(game=game), transition=sap_transition)  # (416, 640, 3)
+    assert frame.shape == (416, 640, 3) and frame.dtype == np.uint8
+    visible = np.repeat(np.repeat(sensor_mask.any(axis=0).T, 12, axis=0), 12, axis=1)  # (288, 288)
+    board, full_board = frame[72:360, 16:304], full[72:360, 16:304]  # each (288, 288, 3)
+    np.testing.assert_array_equal(board[visible], full_board[visible])
+    np.testing.assert_array_equal(board[~visible], np.tile([14, 18, 28], ((~visible).sum(), 1)))
+    np.testing.assert_array_equal(frame[72:390, 304:], full[72:390, 304:])  # Scorecards and legend.
+    assert "Fog of war; beams = sap" in {call.args[2] for call in text.call_args_list}
+
+
+@pytest.mark.parametrize("map_size", [128, 512], ids=["fractional-upscale", "downsample"])
+def test_render_fog_scaled_map(
+    initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState], map_size: int
+) -> None:
     _, state = initial
+    env = LuxEnv(LuxConfig(map_size=map_size, max_units=2))
+    game = state.game.replace(
+        map_features=jax.tree.map(
+            lambda leaf: jnp.zeros((map_size, map_size), dtype=leaf.dtype), state.game.map_features
+        ),  # leaves: (W, H)
+        sensor_mask=jnp.zeros((2, map_size, map_size), dtype=bool).at[1, : map_size // 2, :].set(True),  # (N, W, H)
+        units_mask=jnp.zeros((2, 2), dtype=bool),  # (N, U)
+        relic_nodes_mask=jnp.zeros(6, dtype=bool),  # (R,)
+        relic_nodes_map_weights=jnp.zeros((map_size, map_size), dtype=jnp.int16),  # (W, H)
+    )
+    frame = env.render(
+        state._replace(game=game, params=state.params.replace(map_width=map_size, map_height=map_size))
+    )  # (416, 640, 3)
+    np.testing.assert_array_equal(frame[72:360, 16:160], np.tile([25, 30, 45], (288, 144, 1)))
+    np.testing.assert_array_equal(frame[72:360, 160:304], np.tile([14, 18, 28], (288, 144, 1)))
+
+
+def test_render_vision_validation() -> None:
+    with pytest.raises(ValidationError, match="render_vision"):
+        LuxConfig(render_vision="invalid")
+
+
+@pytest.mark.parametrize("vision", ["outline", "fog_of_war"])
+def test_render_legend(initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState], vision: str) -> None:
+    _, state = initial
+    env = LuxEnv(LuxConfig(max_units=2, render_vision=vision))
     with patch.object(ImageDraw.ImageDraw, "text", autospec=True, side_effect=ImageDraw.ImageDraw.text) as text:
         frame = env.render(state)  # (416, 640, 3)
     labels = {call.args[2] for call in text.call_args_list}
     assert {"Empty", "Nebula", "Asteroid", "Relic", "Scoring tile", "Team 0", "Team 1"} <= labels
     assert "Tile energy / turn" in labels
     assert "SHIP ENERGY" not in labels
-    assert "Full map (hidden info); outlines = vision" in labels
+    assert (
+        "Full map (hidden info); outlines = vision" if vision == "outline" else "Fog of war; either team's vision"
+    ) in labels
     assert f"Nebula drain: {int(state.params.nebula_tile_energy_reduction)} / turn" in labels
     assert {str(int(state.params.min_energy_per_tile)), "0", str(int(state.params.max_energy_per_tile))} <= labels
     np.testing.assert_array_equal(frame[333, [324, 474, 624]], [[205, 115, 45], [25, 30, 45], [45, 170, 155]])
