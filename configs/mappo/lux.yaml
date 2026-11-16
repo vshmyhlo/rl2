@@ -7,7 +7,7 @@ env:
   max_steps_in_match: 100
   match_count: 5
   randomize_params: true
-  point_reward_weight: 0.0 # Weight on own minus opponent point gains; try 0.01 to enable.
+  point_reward_weight: 0.01 # Weight on own minus opponent point gains.
   render_vision: fog_of_war # outline shows the full map with colored vision boundaries.
 # Thresholds count completed training iterations.
 # map_size_curriculum:
@@ -41,7 +41,7 @@ entropy_decay: constant
 value_coef: 1.0
 max_grad_norm: 0.5
 ckpt_dir: /runs/mappo/${run_id}
-run_id: mappo_lux_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
+run_id: mappo_lux_${env.map_size}x${env.map_size}_point${env.point_reward_weight}_mb${num_minibatches}_ep${update_epochs}_s${seed}
 # Intervals count training iterations.
 log_interval: 10
 video_interval: 500
