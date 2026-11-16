@@ -1,4 +1,6 @@
+from dataclasses import replace
 from operator import itemgetter
+from typing import Literal
 from unittest.mock import patch
 
 import chex
@@ -274,6 +276,49 @@ def test_relative_teams_preserve_observer_visibility(
     np.testing.assert_array_equal(view.world.sensor_mask, jnp.swapaxes(game.sensor_mask, -2, -1))
 
 
+@pytest.mark.parametrize(
+    ("energy", "present", "match_steps", "move", "sap"),
+    [
+        (30, False, 1, False, False),
+        (30, True, 0, False, False),
+        (-1, True, 1, False, False),
+        (1, True, 1, False, False),
+        (2, True, 1, True, False),
+        (29, True, 1, True, False),
+        (30, True, 1, True, True),
+    ],
+    ids=["absent", "match-boundary", "negative-energy", "below-move", "exact-move", "below-sap", "exact-sap"],
+)
+def test_action_mask_eligibility(
+    env: LuxEnv,
+    initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState],
+    energy: int,
+    present: bool,
+    match_steps: int,
+    move: bool,
+    sap: bool,
+) -> None:
+    _, state = initial
+    game = state.game.replace(
+        units=state.game.units.replace(
+            position=jnp.full((2, 2, 2), 12, dtype=jnp.int16),  # (N, U, 2)
+            energy=jnp.full((2, 2, 1), energy, dtype=jnp.int16),  # (N, U, 1)
+        ),
+        units_mask=jnp.full((2, 2), present),  # (N, U)
+        match_steps=jnp.asarray(match_steps, dtype=jnp.int32),  # ()
+    )
+    state = state._replace(game=game, params=state.params.replace(unit_move_cost=2, unit_sap_cost=30, unit_sap_range=3))
+    packed = env._observation(env.env.get_obs(game, state.params), state)
+    mask = packed.actions_mask  # (N, U, A)
+    assert mask.shape == (2, 2, 230) and mask.dtype == jnp.bool_
+    np.testing.assert_array_equal(mask[..., 0], True)
+    np.testing.assert_array_equal(mask[..., 1:5], move)
+    np.testing.assert_array_equal(mask[..., 5:].sum(-1), 49 if sap else 0)
+    # Inclusive Chebyshev range: diagonal (+3, +3) is valid; (+4, 0) is not.
+    np.testing.assert_array_equal(mask[..., 165], sap)
+    np.testing.assert_array_equal(mask[..., 177], False)
+
+
 def test_masks_and_hidden_information(
     env: LuxEnv, initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]
 ) -> None:
@@ -284,13 +329,17 @@ def test_masks_and_hidden_information(
             energy=jnp.array([[[100], [0]], [[100], [-1]]], dtype=jnp.int16),  # (N, U, 1)
         ),
         units_mask=jnp.ones((2, 2), dtype=bool),  # (N, U)
+        map_features=state.game.map_features.replace(
+            tile_type=state.game.map_features.tile_type.at[1, 0].set(2)  # (W, H), asteroid to the right
+        ),
+        sensor_mask=state.game.sensor_mask.at[0, 1, 0].set(True),  # (N, W, H)
         match_steps=jnp.array(1, dtype=jnp.int32),  # ()
     )
     state = state._replace(game=game, params=state.params.replace(unit_sap_range=jnp.array(3)))
     obs = env.env.get_obs(game, state.params)  # per-team observation leaves: (...)
     packed = env._observation(obs, state)  # (N, ...)/(N, U, A)
     np.testing.assert_array_equal(packed.actions_mask[:, 1, 1:], False)
-    np.testing.assert_array_equal(packed.actions_mask[:, 0, :5], True)
+    np.testing.assert_array_equal(packed.actions_mask[:, 0, :5], True)  # Includes off-map/visible-asteroid moves.
     assert not bool(packed.actions_mask[0, 0, 5])  # Out-of-range, off-map sap.
     assert bool(packed.actions_mask[0, 0, 117])  # In-bounds sap at the ship's own tile.
     assert int(packed.actions_mask[0, 0, 5:].sum()) == 16  # Corner: offsets 0..3 on each axis.
@@ -358,6 +407,80 @@ def test_native_transition_match_memory_and_batched_game_autoreset(
     np.testing.assert_array_equal(batched.final_observation.observation.world.steps, [[2, 2], [6, 6]])
 
 
+@pytest.mark.parametrize(
+    "next_points,match_steps,expected",
+    [
+        ((23, 11), 2, (0.5, -0.5)),
+        ((22, 12), 2, (0.0, 0.0)),
+        ((20, 10), 2, (0.0, 0.0)),
+        ((0, 0), 0, (1.0, 0.0)),
+    ],
+    ids=["relative-gain", "equal-gains", "no-gain", "match-end"],
+)
+def test_point_reward_from_score_deltas(
+    env: LuxEnv,
+    initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState],
+    next_points: tuple[int, int],
+    match_steps: int,
+    expected: tuple[float, float],
+) -> None:
+    _, state = initial
+    previous = state._replace(
+        game=state.game.replace(team_points=jnp.array([20, 10], dtype=jnp.int32), match_steps=jnp.asarray(1))
+    )  # state leaves: (...); team_points: (N,)
+    wins = jnp.array([int(match_steps == 0), 0], dtype=jnp.int32)  # (N,)
+    game = previous.game.replace(
+        team_points=jnp.asarray(next_points, dtype=jnp.int32),  # (N,)
+        team_wins=previous.game.team_wins + wins,  # (N,)
+        match_steps=jnp.asarray(match_steps),  # ()
+    )
+    shaped = LuxEnv(replace(env.config, point_reward_weight=0.25))
+    reward = shaped._reward(previous, game)  # (N,)
+    chex.assert_shape(reward, (2,))
+    assert reward.dtype == jnp.float32
+    np.testing.assert_array_equal(reward, expected)
+    np.testing.assert_array_equal(env._reward(previous, game), wins)  # Default disables shaping.
+
+
+def test_point_reward_across_match_and_game_boundaries(
+    env: LuxEnv, initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]
+) -> None:
+    shaped = LuxEnv(replace(env.config, point_reward_weight=0.25))
+    _, state = initial
+    game = state.game.replace(
+        units=state.game.units.replace(
+            position=jnp.array([[[3, 4], [3, 4]], [[20, 19], [20, 19]]], dtype=jnp.int16),  # (N, U, 2)
+            energy=jnp.full((2, 2, 1), 300, dtype=jnp.int16),  # (N, U, 1)
+        ),
+        units_mask=jnp.ones((2, 2), dtype=bool),  # (N, U)
+        relic_spawn_schedule=jnp.zeros_like(state.game.relic_spawn_schedule),  # (R,)
+        relic_nodes_map_weights=jnp.zeros((24, 24), dtype=jnp.int16).at[3, 4].set(1),  # (W, H)
+        team_points=jnp.array([7, 10], dtype=jnp.int32),  # (N,), opponent wins despite our scoring
+    )
+    states = jax.tree.map(
+        lambda *leaves: jnp.stack(leaves),
+        *(
+            state._replace(
+                game=game.replace(
+                    steps=jnp.asarray(step),  # ()
+                    match_steps=jnp.asarray(match_step),  # ()
+                    team_points=game.team_points if match_step else jnp.zeros_like(game.team_points),  # (N,)
+                )
+            )
+            for step, match_step in ((1, 1), (2, 2), (5, 2), (3, 0))
+        ),
+    )  # leaves: (E=4, ...), ordinary step, match end, game end, new match
+    result = jax.jit(jax.vmap(shaped.step))(
+        jax.random.split(jax.random.key(3), 4), states, jnp.zeros((4, 2, 2), dtype=jnp.int32)
+    )
+    chex.assert_shape(result.reward, (4, 2))
+    assert result.reward.dtype == jnp.float32
+    np.testing.assert_array_equal(result.reward, [[0.25, -0.25], [0, 1], [0, 1], [0, 0]])
+    np.testing.assert_array_equal(result.done, [False, False, True, False])
+    np.testing.assert_array_equal(result.final_state.game.team_points[:3], [[8, 10], [0, 0], [0, 0]])
+    assert int(result.state.game.steps[2]) == 0  # Reward uses terminal state, before game autoreset.
+
+
 def test_batched_autoreset_guards_reset_without_gathering_environments(
     env: LuxEnv, initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState]
 ) -> None:
@@ -391,8 +514,22 @@ def test_batched_autoreset_guards_reset_without_gathering_environments(
 
 @pytest.mark.parametrize(
     "overrides",
-    [{"max_units": 0}, {"max_units": 17}, {"max_steps_in_match": 1}, {"match_count": 0}, {"max_steps_in_match": 2**30}],
-    ids=["empty-team", "too-many-ships", "invalid-map-horizon", "empty-game", "counter-overflow"],
+    [
+        {"max_units": 0},
+        {"max_units": 17},
+        {"max_steps_in_match": 1},
+        {"match_count": 0},
+        {"max_steps_in_match": 2**30},
+        {"point_reward_weight": -1},
+    ],
+    ids=[
+        "empty-team",
+        "too-many-ships",
+        "invalid-map-horizon",
+        "empty-game",
+        "counter-overflow",
+        "negative-reward-weight",
+    ],
 )
 def test_invalid_settings(overrides: dict[str, int]) -> None:
     with pytest.raises(ValidationError):
@@ -750,7 +887,7 @@ def test_render_fog_of_war(env: LuxEnv, sap_transition: LuxRenderTransition, cov
         sensor_mask[0, 2:7, 3:7] = True
         sensor_mask[1, 5:9, 5:9] = True  # Overlap and tiles visible only to team 1.
         sensor_mask[:, 3, 4] = False  # Hole hides a ship, nebula border, and sap origin.
-        sensor_mask[:, 4:6, 5] = False  # Hidden asteroid/relic/scoring/sap pixels.
+        sensor_mask[:, 4:6, 5] = False  # Hidden relic/scoring/sap pixels.
     game = game.replace(sensor_mask=jnp.asarray(sensor_mask))
     with patch.object(ImageDraw.ImageDraw, "text", autospec=True, side_effect=ImageDraw.ImageDraw.text) as text:
         frame = fog_env.render(state._replace(game=game), transition=sap_transition)  # (416, 640, 3)
@@ -791,7 +928,9 @@ def test_render_vision_validation() -> None:
 
 
 @pytest.mark.parametrize("vision", ["outline", "fog_of_war"])
-def test_render_legend(initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState], vision: str) -> None:
+def test_render_legend(
+    initial: tuple[AgentObservation[LuxObservation[jax.Array]], LuxState], vision: Literal["outline", "fog_of_war"]
+) -> None:
     _, state = initial
     env = LuxEnv(LuxConfig(max_units=2, render_vision=vision))
     with patch.object(ImageDraw.ImageDraw, "text", autospec=True, side_effect=ImageDraw.ImageDraw.text) as text:

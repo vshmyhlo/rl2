@@ -27,6 +27,8 @@ class LuxConfig:
     max_steps_in_match: Annotated[int, Field(ge=2, lt=2**31, strict=True)] = 100
     match_count: Annotated[int, Field(ge=1, le=5, strict=True)] = 5
     randomize_params: bool = True
+    point_reward_weight: Annotated[float, Field(ge=0)] = 0.0
+    render_vision: Literal["outline", "fog_of_war"] = "fog_of_war"
 
     def __post_init__(self) -> None:
         if (self.max_steps_in_match + 1) * self.match_count >= 2**31:
@@ -276,6 +278,14 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
         result = jax.lax.cond(done.any(), reset_finished, lambda: (observation, state))  # leaves: (E, ...)
         return result, jax.tree.map(lambda _: True, result)
 
+    def _reward(self, previous: LuxState, game: EnvState) -> jax.Array:  # state leaves: (...) -> (N,)
+        reward = (game.team_wins - previous.game.team_wins).astype(jnp.float32)  # (N,)
+        if self.config.point_reward_weight:
+            # Lux clears scores at match end; omit shaping on that step.
+            points = jnp.where(game.match_steps == 0, 0, game.team_points - previous.game.team_points)  # (N,)
+            reward = reward + self.config.point_reward_weight * (points - points[::-1])  # (N,)
+        return reward  # (N,)
+
     def step(
         self,
         key: jax.Array,  # () typed PRNG key
@@ -284,6 +294,8 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
     ) -> MultiAgentStep[LuxState, LuxObservation[jax.Array]]:
         step_key, reset_key = jax.random.split(key)  # each ()
         commands = self._decode_action(action)  # (N, U, 3)
+        # Returns observations, state, cumulative match-win rewards, terminated, truncated, info.
+        # Native truncation marks the full game's end.
         observation, game, _, _, game_ended, _ = self.env.step_env(
             step_key, state.game, {f"player_{team}": commands[team] for team in range(2)}, state.params
         )  # observation/game leaves: (...); game_ended: ()
@@ -295,7 +307,7 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
         return MultiAgentStep(
             observation=observation,
             state=next_state,
-            reward=(game.team_wins - state.game.team_wins).astype(jnp.float32),  # (N,)
+            reward=self._reward(state, game),  # (N,)
             done=game_ended,  # ()
             agent_done=jnp.full(2, game_ended),  # (N,), retain team memory across matches/deaths
             agent_inactive=jnp.zeros(2, dtype=bool),  # (N,), teams always remain active
@@ -312,7 +324,11 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
         team_labels: tuple[str, str] | None = None,
         transition: LuxRenderTransition | None = None,
     ) -> NDArray[np.uint8]:  # (416, 640, 3)
-        """Return (416, 640, 3) uint8 overview; transition adds valid saps from the preceding step."""
+        """Return (416, 640, 3) uint8 overview; transition adds preceding-step saps.
+
+        Fog hides tiles outside both teams' current vision, including all overlays.
+        Outline mode shows the full map with team-colored vision boundaries.
+        """
         game, params = jax.device_get(state)
         steps, match_steps = int(game.steps), int(game.match_steps)
         match_count, match_length = int(params.match_count_per_episode), int(params.max_steps_in_match)
@@ -418,23 +434,24 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
                 left, top, width, height = tile_bounds(int(x), int(y))
                 if width and height:
                     draw.rectangle((left, top, left + width - 1, top + height - 1), outline=nebula_color)
-            outlines = np.zeros((288, 288, 4), dtype=np.uint8)  # (H, W, RGBA)
-            previous_edge = np.zeros((288, 288), dtype=bool)  # (H, W)
-            stripes = (np.indices((288, 288)).sum(axis=0) // 3) % 2 == 1  # (H, W), alternate shared edges
-            for team, color in enumerate(team_colors):
-                with (
-                    Image.fromarray(np.asarray(game.sensor_mask[team]).T.astype(np.uint8)) as mask_image,
-                    mask_image.resize((288, 288), resample=Image.Resampling.NEAREST) as mask_board,
-                ):
-                    visible = np.asarray(mask_board, dtype=bool)  # (H, W)
-                padded = np.pad(visible, 1)  # (H+2, W+2), outside the board is unseen
-                edge = visible & ~(
-                    padded[:-2, 1:-1] & padded[2:, 1:-1] & padded[1:-1, :-2] & padded[1:-1, 2:]
-                )  # (H, W), only the perimeter, including holes
-                outlines[edge & (~previous_edge | stripes)] = (*color, 255)
-                previous_edge = edge  # (H, W), shared boundaries retain both team colors
-            with Image.fromarray(outlines) as outline_image:
-                frame.paste(outline_image, (16, 72), outline_image)
+            if self.config.render_vision == "outline":
+                outlines = np.zeros((288, 288, 4), dtype=np.uint8)  # (H, W, RGBA)
+                previous_edge = np.zeros((288, 288), dtype=bool)  # (H, W)
+                stripes = (np.indices((288, 288)).sum(axis=0) // 3) % 2 == 1  # (H, W), alternate shared edges
+                for team, color in enumerate(team_colors):
+                    with (
+                        Image.fromarray(np.asarray(game.sensor_mask[team]).T.astype(np.uint8)) as mask_image,
+                        mask_image.resize((288, 288), resample=Image.Resampling.NEAREST) as mask_board,
+                    ):
+                        visible = np.asarray(mask_board, dtype=bool)  # (H, W)
+                    padded = np.pad(visible, 1)  # (H+2, W+2), outside the board is unseen
+                    edge = visible & ~(
+                        padded[:-2, 1:-1] & padded[2:, 1:-1] & padded[1:-1, :-2] & padded[1:-1, 2:]
+                    )  # (H, W), only the perimeter, including holes
+                    outlines[edge & (~previous_edge | stripes)] = (*color, 255)
+                    previous_edge = edge  # (H, W), shared boundaries retain both team colors
+                with Image.fromarray(outlines) as outline_image:
+                    frame.paste(outline_image, (16, 72), outline_image)
             for y, x in np.argwhere(scoring):
                 left, top, width, height = tile_bounds(int(x), int(y))
                 if not width or not height:
@@ -563,6 +580,14 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
                     font=small_font if team_labels is not None else font,
                     fill=(185, 195, 210),
                 )
+            if self.config.render_vision == "fog_of_war":
+                hidden = ~np.asarray(game.sensor_mask).any(axis=0).T  # (H, W), unseen by either team
+                with (
+                    Image.fromarray(hidden.astype(np.uint8) * 255) as mask_image,
+                    mask_image.resize((288, 288), resample=Image.Resampling.NEAREST) as mask_board,
+                ):
+                    # Apply last so ships, relics, and sap effects cannot reveal hidden tiles.
+                    frame.paste((14, 18, 28), (16, 72, 304, 360), mask_board)
             draw.text((324, 274), f"Active relic nodes: {int(game.relic_nodes_mask.sum())}", font=font, fill="white")
             if boundary:
                 draw.text((324, 293), "Relic points reset at match end.", font=small_font, fill=(185, 195, 210))
@@ -596,11 +621,20 @@ class LuxEnv(BaseMultiAgentEnv[LuxState, LuxObservation[jax.Array]]):
                 left = 16 + team * 108
                 draw.rectangle((left + 3, 399, left + 9, 405), fill=color)
                 draw.text((left + 18, 395), f"Team {team}", font=small_font, fill=(185, 195, 210))
+            vision_label = (
+                "Fog of war; either team's vision"
+                if self.config.render_vision == "fog_of_war"
+                else "Full map (hidden info); outlines = vision"
+            )
+            if transition is not None:
+                vision_label = (
+                    "Fog of war; beams = sap"
+                    if self.config.render_vision == "fog_of_war"
+                    else "Full map; outlines = vision; beams = sap"
+                )
             draw.text(
                 (244, 395),
-                "Full map; outlines = vision; beams = sap"
-                if transition is not None
-                else "Full map (hidden info); outlines = vision",
+                vision_label,
                 font=small_font,
                 fill=(185, 195, 210),
             )

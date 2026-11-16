@@ -21,7 +21,7 @@ from ppo_helpers import metric_history
 
 from rl2 import train_mappo as ppo
 from rl2.actions import MultiCategoricalPolicy
-from rl2.envs.lux_env import LuxConfig, LuxEnv
+from rl2.envs.lux_env import LuxConfig, LuxEnv, LuxObservation, LuxState
 from rl2.envs.multi_agent import AgentObservation, MultiAgentStep
 from rl2.envs.smax_env import SMAXConfig, SMAXEnv
 
@@ -900,7 +900,7 @@ def test_training_resume_wiring_and_environment_step_logging(
     if checkpoint_fails:
         manager.close.side_effect = checkpoint_error
     video, evaluation, save = Mock(), Mock(), Mock(return_value=2.5)
-    monkeypatch.setattr(ppo, "make_env", lambda _: env)
+    monkeypatch.setattr(ppo, "make_env", Mock(return_value=env))
     monkeypatch.setattr(ppo, "MLflowLogger", Mock(return_value=writer))
     monkeypatch.setattr(ppo, "checkpoint_manager", lambda _: manager)
     monkeypatch.setattr(ppo, "log_video", video)
@@ -1083,6 +1083,7 @@ def test_hierarchical_model_masks_and_sequence_replay(config: ppo.Config) -> Non
     observation = jnp.ones((2, 2, 4))  # (B, T, O)
     starts = jnp.array([[True, False], [True, False]])  # (B, T)
     masks = jnp.broadcast_to(jnp.array([[True, True, False], [True, False, True]]), (2, 2, 2, 3))  # (B, T, D, A)
+    masks = masks.at[:, 1].set(jnp.array([[True, False, True], [True, False, False]]))  # (B, T, D, A)
     memory = model.initial_carry(2)  # leaves: (B, H)
     params = model.init(jax.random.key(0), observation, memory, starts, masks)
     output, output_carry = model.apply(params, observation, memory, starts, masks)
@@ -1091,8 +1092,9 @@ def test_hierarchical_model_masks_and_sequence_replay(config: ppo.Config) -> Non
     chex.assert_shape(output.value, (2, 2))
     action, log_prob = output.policy.sample_and_log_prob(key=jax.random.key(1))  # (B, T, D); (B, T)
     assert action.shape == (2, 2, 2) and log_prob.shape == (2, 2)
-    assert bool((action[..., 0] < 2).all())
-    assert bool((action[..., 1] != 1).all())
+    np.testing.assert_array_equal(jnp.take_along_axis(masks, action[..., None], axis=-1), True)
+    np.testing.assert_array_equal(jax.nn.softmax(output.policy.logits, axis=-1)[~masks], 0)
+    np.testing.assert_array_equal(action[:, 1, 1], 0)  # Stay-only ship after its mask changes.
     np.testing.assert_allclose(output.policy.log_prob(action), log_prob, atol=1e-6)
     first, first_carry = model.apply(params, observation[:, 0], memory, starts[:, 0], masks[:, 0], method="step")
     second, second_carry = model.apply(params, observation[:, 1], first_carry, starts[:, 1], masks[:, 1], method="step")
@@ -1158,6 +1160,62 @@ def test_default_lux_parameter_budget_and_output_shapes() -> None:
         assert leaf.shape == (1, token_size) and leaf.dtype == jnp.float32
 
 
+def test_lux_evaluation_environment_disables_shaping(config: ppo.Config) -> None:
+    config = replace(
+        config,
+        env=LuxConfig(map_size=8, max_units=1, point_reward_weight=0.25),
+        model=ppo.LuxModelConfig(attention_implementation="xla"),
+    )
+    training = ppo.make_env(config)
+    evaluation = ppo.make_env(config, evaluation=True)
+    assert isinstance(training, LuxEnv) and isinstance(evaluation, LuxEnv)
+    assert training.config == config.env
+    assert training.config.point_reward_weight == 0.25
+    assert evaluation.config == replace(config.env, point_reward_weight=0.0)
+    assert config.env.point_reward_weight == 0.25
+
+
+def test_lux_episode_uses_environment_rewards() -> None:
+    env = LuxEnv(LuxConfig(map_size=8, max_units=1, max_steps_in_match=2, match_count=1, point_reward_weight=0.25))
+    native_step = env.step
+
+    def shaped_step(
+        key: jax.Array,
+        state: LuxState,
+        action: jax.Array,  # key: (); state leaves: (...); action: (N, U)
+    ) -> MultiAgentStep[LuxState, LuxObservation[jax.Array]]:
+        result = native_step(key, state, action)
+        return result._replace(reward=result.reward + jnp.array([100.0, 0.0]))  # (N,), guaranteed shaping
+
+    def policy(
+        variables: dict[str, Any],
+        observation: LuxObservation[jax.Array],  # leaves: (N, ...)
+        carry: ppo.RecurrentCarry,  # leaves: (N, H)
+        starts: jax.Array,  # (N,)
+        mask: jax.Array,  # (N, U, A)
+        *,
+        method: str,
+    ) -> tuple[ppo.ActorCriticOutput, ppo.RecurrentCarry]:
+        logits = jnp.broadcast_to(jnp.where(jnp.arange(mask.shape[-1]) == 0, 0.0, -jnp.inf), mask.shape)  # (N, U, A)
+        return ppo.ActorCriticOutput(policy=MultiCategoricalPolicy(logits=logits), value=jnp.zeros(2)), carry
+
+    with patch.object(env, "step", side_effect=shaped_step):
+        result = ppo.run_episode(
+            env,
+            policy,
+            ppo.EvaluationMatch(current={}, opponent={}, current_team=jnp.asarray(0)),
+            jax.random.key(0),
+            (),
+            recording_capacity=4,
+            stop_at_frame_limit=False,
+        )
+    assert int(result.length) == 3
+    np.testing.assert_array_equal(
+        [result.episode_return, result.opponent_return], result.states.game.team_wins[-1] + np.array([300, 0])
+    )
+    assert float(result.episode_return + result.opponent_return) == 301
+
+
 def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Path) -> None:
     config = replace(
         config,
@@ -1210,12 +1268,14 @@ def test_lux_config_rollout_update_and_playback(config: ppo.Config, tmp_path: Pa
     chex.assert_trees_all_equal(selected.observation, jax.tree.map(lambda leaf: leaf[1:2], batch.observation))
     chex.assert_shape(batch.old_log_prob, (2, 3))
     chex.assert_shape(batch.actions_mask, (2, 3, 2, 230))
+    np.testing.assert_array_equal(jnp.take_along_axis(batch.actions_mask, batch.action[..., None], axis=-1), True)
     assert int(rollout.episode_count) == 1 and int(rollout.episode_length_sum) == 3
     assert float(rollout.episode_return_sum) == 0.5
     np.testing.assert_array_equal(advanced.episode_start, True)
     replay, _ = model.apply(
         {"params": train_state.params}, batch.observation, memory, batch.episode_start, batch.actions_mask
     )
+    np.testing.assert_array_equal(jax.nn.softmax(replay.policy.logits, axis=-1)[~batch.actions_mask], 0)
     np.testing.assert_allclose(replay.policy.log_prob(batch.action), batch.old_log_prob, atol=1e-5)
     updated, metrics = jax.jit(ppo.update, static_argnames="config")(train_state, batch, config)
     assert int(updated.step) == 1
@@ -1536,11 +1596,15 @@ def test_joint_evaluation_ratings(config: ppo.Config) -> None:
     writer = Mock()
     with (
         patch.object(ppo, "play_episode", side_effect=episodes * 2) as play,
+        patch.object(ppo, "make_env", return_value=Mock()) as make_env,
         patch.object(ppo, "monotonic", side_effect=[0.0, 1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 21.0, 22.0, 23.0, 24.0, 30.0]),
     ):
         for step in (1600, 3200):
-            ppo.log_evaluation(Mock(), config, writer, 5, step, initial_carry=memory, opponents=opponents, env=Mock())
+            ppo.log_evaluation(Mock(), config, writer, 5, step, initial_carry=memory, opponents=opponents)
     assert play.call_count == 8
+    assert make_env.call_count == 2
+    make_env.assert_called_with(config, evaluation=True)
+    assert all(call.kwargs["env"] is make_env.return_value for call in play.call_args_list)
     metrics = writer.log_metrics.call_args_list[2].args[0]
     assert set(metrics) == {
         f"eval/{prefix}{measurement}{suffix}"
@@ -1606,10 +1670,11 @@ def test_reference_evaluation_progress_and_timings(config: ppo.Config, capsys: p
     frame = np.zeros((2, 2, 3), dtype=np.uint8)  # (H, W, C)
     episode = ppo.EpisodeResult(episode_return=2.0, length=1, frames=[frame], opponent_return=1.0)
     with (
-        patch.object(ppo, "play_episode", return_value=episode),
+        patch.object(ppo, "play_episode", return_value=episode) as play,
+        patch.object(ppo, "make_env", return_value=Mock()) as make_env,
         patch.object(ppo, "monotonic", side_effect=[10.0, 15.0, 15.0, 24.0]),
     ):
-        ppo.log_video(Mock(), config, writer, 2, 128, initial_carry=memory, env=Mock())
+        ppo.log_video(Mock(), config, writer, 2, 128, initial_carry=memory)
         ppo.log_reference_evaluation(
             Mock(),
             config,
@@ -1617,10 +1682,12 @@ def test_reference_evaluation_progress_and_timings(config: ppo.Config, capsys: p
             2,
             128,
             initial_carry=memory,
-            env=Mock(),
             opponent_params={},
             opponent_name="baseline",
         )
+    assert make_env.call_count == 2
+    make_env.assert_called_with(config, evaluation=True)
+    assert all(call.kwargs["env"] is make_env.return_value for call in play.call_args_list)
     assert capsys.readouterr().out.splitlines() == [
         "Recording gameplay at step 128 after 2 training episodes...",
         "Recorded 1 gameplay frames after 2 training episodes in 5.0s",

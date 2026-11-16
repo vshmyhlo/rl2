@@ -2,11 +2,13 @@
 # Run: uv run mappo --config configs/mappo/lux.yaml
 env:
   id: luxai_s3
-  map_size: 32
+  map_size: 16
   max_units: 16
   max_steps_in_match: 100
   match_count: 5
   randomize_params: true
+  point_reward_weight: 0.0 # Weight on own minus opponent point gains; try 0.01 to enable.
+  render_vision: fog_of_war # outline shows the full map with colored vision boundaries.
 # Thresholds count completed training iterations.
 # map_size_curriculum:
 #   - { start_iteration: 0, map_size: 8 }
@@ -39,7 +41,7 @@ entropy_decay: constant
 value_coef: 1.0
 max_grad_norm: 0.5
 ckpt_dir: /runs/mappo/${run_id}
-run_id: mappo_lux_pool_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
+run_id: mappo_lux_${env.map_size}x${env.map_size}_mb${num_minibatches}_ep${update_epochs}_s${seed}
 # Intervals count training iterations.
 log_interval: 10
 video_interval: 500
@@ -56,7 +58,7 @@ eval_ref_policies:
   baseline_16x16_mb4_ep1_s8_10000: /runs/mappo/mappo_lux_16x16_mb4_ep1_s8/checkpoints/10000
   baseline_8x8_mb4_ep1_s8_10000: /runs/mappo/mappo_lux_8x8_mb4_ep1_s8/checkpoints/10000
 
-selfplay:
-  pool_size: 32
-  snapshot_interval: 200
-  current_policy_fraction: 0.5
+# selfplay:
+#   pool_size: 32
+#   snapshot_interval: 200
+#   current_policy_fraction: 0.1

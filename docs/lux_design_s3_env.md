@@ -199,7 +199,15 @@ not model parameter shapes. Rendering scales the board to fit its panel.
   team sequences per environment; each carry contains only per-block global
   cell/hidden state `(B, Hg)`.
 - Rewards are increments in match wins: the match winner receives 1 and the
-  other team 0. Global memory persists through ship deaths and match boundaries.
+  other team 0. Optional `env.point_reward_weight` (nonnegative, default `0.0`)
+  adds that weight times own minus opponent relic-point gains; `0.01` enables
+  shaping. Gains use `team_points` deltas. Shaping is omitted on each match's
+  final step because Lux clears scores; match-win rewards still apply.
+  Policy observations are unchanged. Training returns include
+  shaping; evaluation/video use a separate environment with weight zero so
+  reference ratings still use match wins. This environment is reused across
+  episodes and recreated when the curriculum changes map size.
+  Global memory persists through ship deaths and match boundaries.
   Completing the whole game is treated as terminal, with no value bootstrap,
   even though upstream labels it a truncation. Same-step autoreset preserves
   final observations/state and samples fresh game parameters.
@@ -209,9 +217,10 @@ not model parameter shapes. Rendering scales the board to fit its panel.
   uses native defaults. `max_units`, `max_steps_in_match`, and `match_count`
   can reduce the game for experiments. Map dimensions remain 24 × 24.
 - The trainer averages agent returns for episode metrics. With both opposing
-  teams included, a completed game always has mean return `match_count / 2`;
-  this is not a playing-strength metric. A fixed-opponent evaluation is not yet
-  implemented. The headless renderer shows the map and active scoring tiles,
+  teams included, a completed game has mean return
+  `match_count / 2`; this is not a playing-strength metric. With an opponent pool,
+  training returns include only the learner's rewards. The headless renderer shows
+  the map and active scoring tiles,
   match/turn progress, team relic points, wins, active ships, and energy. Points
   display as `--` at match boundaries because the simulator has already reset them.
   Each scorecard counts distinct active scoring tiles currently occupied by that

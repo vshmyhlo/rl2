@@ -141,6 +141,12 @@ def test_curriculum_training_wiring(config: ppo.Config, resume_iteration: int, p
     model.initial_carry.side_effect = initial_carry
     seen_sizes: list[int] = []
     pools: list[ppo.OpponentPool] = []
+    environments: dict[tuple[int, bool], ScriptedSMAX] = {}
+
+    def make_environment(active: ppo.Config, *, evaluation: bool = False) -> ScriptedSMAX:
+        env = ScriptedSMAX()
+        environments[active.env.map_size, evaluation] = env
+        return env
 
     def restore(manager: Mock, state: TrainState, current: ppo.Config) -> ppo.TrainingProgress | None:
         if not resume_iteration:
@@ -168,6 +174,7 @@ def test_curriculum_training_wiring(config: ppo.Config, resume_iteration: int, p
         assert int(state.step) == iteration * 7
         assert float(state.params["weight"]) == 1.0
         seen_sizes.append(active.env.map_size)
+        assert env is environments[active.env.map_size, False]
         fresh = iteration in (resume_iteration, 2)
         np.testing.assert_array_equal(runner.episode_return, 0 if fresh else 99)
         np.testing.assert_array_equal(runner.episode_step_count, 0 if fresh else 99)
@@ -192,7 +199,7 @@ def test_curriculum_training_wiring(config: ppo.Config, resume_iteration: int, p
 
     with (
         patch.object(ppo, "configure_compilation_cache"),
-        patch.object(ppo, "make_env", side_effect=lambda _: ScriptedSMAX()) as make_env,
+        patch.object(ppo, "make_env", side_effect=make_environment) as make_env,
         patch.object(ppo, "make_actor_critic", return_value=model),
         patch.object(ppo, "MLflowLogger", return_value=writer),
         patch.object(ppo, "checkpoint_manager"),
@@ -206,11 +213,16 @@ def test_curriculum_training_wiring(config: ppo.Config, resume_iteration: int, p
     ):
         result = ppo.train(config)
     assert seen_sizes == [8, 8, 16, 16][resume_iteration:]
-    assert [call.args[0].env.map_size for call in make_env.call_args_list] == [8, 16]
+    assert [(call.args[0].env.map_size, call.kwargs.get("evaluation", False)) for call in make_env.call_args_list] == (
+        [(8, False), (16, False), (16, True)] if resume_iteration else [(8, False), (8, True), (16, False), (16, True)]
+    )
     assert model.init.call_count == 1
     assert int(result.step) == 28
     for logger in (video, evaluate):
         assert [call.args[1].env.map_size for call in logger.call_args_list] == seen_sizes
+        assert all(
+            call.kwargs["env"] is environments[call.args[1].env.map_size, True] for call in logger.call_args_list
+        )
     assert metric_history(writer)["train/map_size"] == [
         (float(size), (index + resume_iteration + 1) * 4) for index, size in enumerate(seen_sizes)
     ]

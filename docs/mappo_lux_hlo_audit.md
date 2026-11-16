@@ -333,3 +333,17 @@ and batched-step copies fall from 1,202 to 1,196. Batched-step output/temporary
 storage falls from 72,050/124,080 to 71,954/123,936 bytes. No all-gathers appear.
 Artifacts: `/tmp/rl2-global-only-hlo/{before,after}/`. CUDA was unavailable;
 GPU fusion and throughput remain unverified.
+
+## Optional relic-point rewards (CPU)
+
+Compared optimized scalar and eight-environment reset/step executables on
+16×16 maps with 16 ships and randomized parameters. Shaping now uses team-point
+deltas minus opponent gains, omitting match-ending steps. Against occupancy-based
+shaping at weight `0.01`, each step executable loses one fused map reduction.
+Score differences, opponent reversal, and boundary masking fuse into reward
+arithmetic. Reset operation counts are unchanged; no copies, scatters, loops,
+collectives, host callbacks, or large intermediates are added. Output and temporary
+storage remain unchanged (batched step: 253,592 and 352,480 bytes).
+
+Artifacts: `/tmp/rl2-point-reward-hlo/{delta_before,delta_after}/`. CUDA was
+unavailable; GPU efficiency and throughput remain unverified.

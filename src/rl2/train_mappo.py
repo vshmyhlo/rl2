@@ -80,9 +80,13 @@ An iteration collects num_envs * num_steps environment transitions and runs PPO
 updates. total_iterations sets the cumulative iteration budget, including restored
 history. MLflow steps count transitions summed across environments.
 Team returns sum mean agent rewards, counting shared rewards once. Episodes count
-environment completions. Lux uses
-match-win increments; averaging both teams gives match_count / 2 per full game,
-so self-play return is not a measure of playing strength.
+environment completions. Lux uses match-win increments plus optional
+env.point_reward_weight times own minus opponent relic-point gains. Shaping uses
+team_points deltas and is omitted on match-ending steps, when Lux clears scores.
+Averaging both teams gives match_count / 2 per full game, so self-play return is
+not a measure of playing strength. Evaluation and video use a separate environment
+with Lux shaping disabled, reused until the curriculum changes map size;
+evaluation returns and ratings continue to measure match wins.
 With a pool, training episode returns sum only the selected learner's raw rewards.
 Loss and explained-variance metrics use only learner transitions. Evaluation and
 standalone video behavior are unchanged.
@@ -538,7 +542,8 @@ def make_actor_critic(
     return GenericActorCritic(action_space=action_space, model=model, dtype=dtype)
 
 
-def make_env(config: Config) -> PPOEnv:
+def make_env(config: Config, *, evaluation: bool = False) -> PPOEnv:
+    """Build an environment; evaluation disables optional reward shaping."""
     env: PPOEnv
     if isinstance(config.env, SMAXConfig):
         env = SMAXEnv(config.env)
@@ -547,7 +552,7 @@ def make_env(config: Config) -> PPOEnv:
     elif isinstance(config.env, MPEConfig):
         env = MPEEnv(config.env)
     elif isinstance(config.env, LuxConfig):
-        env = LuxEnv(config.env)
+        env = LuxEnv(replace(config.env, point_reward_weight=0.0) if evaluation else config.env)
     elif isinstance(config.env, STORMConfig):
         env = STORMEnv(config.env)
     else:
@@ -977,7 +982,7 @@ def log_video(
         initial_carry,
         record=True,
         stop_at_frame_limit=True,
-        env=make_env(config) if env is None else env,
+        env=make_env(config, evaluation=True) if env is None else env,
     )
     writer.log_video(episode.frames, f"gameplay/{step_count}.gif", fps=config.video_fps)
     seconds = monotonic() - started
@@ -1005,7 +1010,7 @@ def log_reference_evaluation(
     suffix = f"/{opponent_name}"
     started = monotonic()
     episode_results: list[dict[str, float | int]] = []
-    env = make_env(config) if env is None else env
+    env = make_env(config, evaluation=True) if env is None else env
     for episode_index in range(config.eval_episodes):
         episode = play_episode(
             train_state,
@@ -1110,7 +1115,7 @@ def log_evaluation(
     if not opponents:
         return
     started = monotonic()
-    env = make_env(config) if env is None else env
+    env = make_env(config, evaluation=True) if env is None else env
     outcomes = {
         name: log_reference_evaluation(
             train_state,
@@ -1699,6 +1704,7 @@ def train(config: Config) -> TrainState:
                 env, model, active_config, jax.random.fold_in(key, start_rollout_index)
             )  # leaves: (E, ...) or (B, ...)
         train_state = jax.device_put(train_state, replicated)
+        evaluation_env = make_env(active_config, evaluation=True)
         eval_references = load_eval_ref_policies(config, train_state.params)  # leaves: parameter shapes
         key, metrics = jax.device_put((key, metrics), replicated)  # key: (); metrics: scalar leaves
         opponent_pool = None
@@ -1740,6 +1746,7 @@ def train(config: Config) -> TrainState:
             if next_config.env != active_config.env:
                 active_config = next_config
                 env = make_env(active_config)
+                evaluation_env = make_env(active_config, evaluation=True)
                 key, reset_key = jax.random.split(key)  # each ()
                 rollout_carry = init_rollout_carry(
                     env, model, active_config, reset_key, opponent_pool
@@ -1776,7 +1783,7 @@ def train(config: Config) -> TrainState:
                     int(metrics.total.episode_count),
                     step_count,
                     initial_carry=model.initial_carry(env.num_agents),
-                    env=env,
+                    env=evaluation_env,
                 )
             if (
                 config.eval_interval
@@ -1790,7 +1797,7 @@ def train(config: Config) -> TrainState:
                     int(metrics.total.episode_count),
                     step_count,
                     initial_carry=model.initial_carry(env.num_agents),
-                    env=env,
+                    env=evaluation_env,
                     opponents=eval_references,
                 )
             if rollout_count % config.log_interval == 0 or is_final_rollout:
