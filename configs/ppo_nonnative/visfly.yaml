@@ -1,0 +1,59 @@
+env:
+  id: VisFly
+  entry_point: VisFly.envs.NavigationEnv:NavigationEnv
+  num_scenes: 1 # num_envs / num_scenes agents per scene
+  kwargs:
+    device: cpu # JAX independently selects its training devices
+    visual: true
+    max_episode_steps: 256
+    target: [9.0, 0.0, 1.0]
+    scene_kwargs:
+      path: ${oc.env:VISFLY_SCENE_PATH}
+      scene_type: json
+    dynamics_kwargs:
+      action_type: bodyrate
+      dt: 0.03
+      ctrl_dt: 0.03
+    random_kwargs:
+      state_generator:
+        class: Uniform
+        kwargs:
+          - position:
+              mean: [1.0, 0.0, 1.5]
+              half: [0.0, 2.0, 1.0]
+    sensor_kwargs:
+      - sensor_type: DEPTH
+        uuid: depth
+        resolution: [64, 64]
+seed: 1
+total_steps: 10000000
+num_envs: 32
+num_steps: 64
+num_minibatches: 4
+update_epochs: 4
+model:
+  encoder:
+    type: conv2d # Image CNNs combined with state/target vectors
+    stages:
+      - {channels: 16, blocks: 1}
+      - {channels: 32, blocks: 1}
+      - {channels: 64, blocks: 1}
+    embedding_size: 128
+  recurrent:
+    hidden_size: 128
+  continuous_policy: truncated_gaussian
+bf16: false
+learning_rate: 0.0003
+anneal_lr: true
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: 0.02
+entropy_coef: 0.001
+max_grad_norm: 0.5
+video_fps: 30.0
+video_interval: 0 # Enable only after configuring scene_kwargs.render_settings
+eval_interval: 100
+eval_episodes: 10
+eval_video: false
+run_id: ppo_nonnative_visfly_seed${seed}

@@ -60,6 +60,43 @@ Pgx 2048 using [train_ppo.py](src/rl2/train_ppo.py) with the
 
 ![Pgx 2048 PPO rollout](images/ppo_pgx_2048.gif)
 
+### PPO with Gymnasium and VisFly
+
+[train_ppo_nonnative.py](src/rl2/train_ppo_nonnative.py) steps environments in Python
+and compiles recurrent policy inference and PPO updates in JAX. It supports
+zero-based Discrete and bounded floating-point Box actions, plus Box/Dict/Tuple
+observations. `mlp` flattens observation leaves; `conv2d` encodes HWC image leaves
+with CNNs and combines them with vector features. Set `env.channels_first: true`
+for CHW inputs (the VisFly default).
+
+```bash
+uv run python -m rl2.train_ppo_nonnative --config configs/ppo_nonnative.yaml
+```
+
+The [VisFly preset](configs/ppo_nonnative/visfly.yaml) uses NavigationEnv with depth,
+state, and target observations. Install [VisFly's dependencies, modified Habitat-Sim,
+and datasets](https://github.com/SJTU-ViSYS-team/VisFly#installation) in a Python
+environment compatible with this project's dependencies. VisFly is loaded through
+its configurable `env.entry_point`; it is not installed by `uv sync`. Put the parent
+of the `VisFly` source directory on `PYTHONPATH`, and set `VISFLY_SCENE_PATH` to the
+absolute scene directory, such as `VisFly/datasets/visfly-beta/configs/scenes/garage_simple_l_medium`.
+Run from the directory expected by the dataset's relative asset paths.
+
+```bash
+python -m rl2.train_ppo_nonnative --config /path/to/rl2/configs/ppo_nonnative/visfly.yaml
+```
+
+`num_envs` counts agents across scenes and must divide evenly by `env.num_scenes`.
+Constructor options go in `env.kwargs`; scene/agent counts, seed, and
+`requires_grad=False` are managed by the trainer. VisFly tensors cross the host
+boundary as owned NumPy arrays. Both end flags reset recurrent memory; only
+nonterminal timeouts bootstrap from the final observation before autoreset.
+
+Evaluation creates separate single-agent environments. Scoring works without RGB
+rendering; `eval_video: true` or a positive `video_interval` requires appropriate
+`scene_kwargs.render_settings`. Checkpoints save the full configuration, but resume
+uses the current configuration and starts fresh environments and recurrent memory.
+
 ## Useful links and references
 
 | Link | Description |
