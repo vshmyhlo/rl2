@@ -1,4 +1,6 @@
-"""Recurrent PPO for host-stepped Gymnasium and VisFly environments.
+"""Recurrent PPO for host-stepped, non-JAX-native Gym-style environments.
+
+Supports Gymnasium and VisFly through backend-specific GymStyleEnv subclasses.
 
 B denotes environments, T rollout steps, O observation leaf dimensions, A discrete
 actions, D continuous action size, and H recurrent width. Sequence arrays use
@@ -114,7 +116,7 @@ import json
 import os
 from collections.abc import Callable
 from contextlib import ExitStack, closing
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, fields
 from functools import partial
 from math import sqrt
 from operator import itemgetter
@@ -155,8 +157,9 @@ from rl2.actions import (
     TruncatedGaussianPolicy,
 )
 from rl2.configuration import BaseConfig, load_config
-from rl2.envs.gym_env import EnvConfig, GymEnv, VisFlyConfig
-from rl2.envs.gym_style_env import GymStyleEnv
+from rl2.envs.gym_env import GymConfig, GymEnv
+from rl2.envs.gym_style_env import GymStyleEnv, Observation
+from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.mlflow_logging import MLflowLogger
@@ -165,9 +168,10 @@ from rl2.model.encoders.mlp import MLPEncoder
 from rl2.running_stats import RunningSum
 from rl2.utils import explained_variance, gae
 
+type EnvConfig = Annotated[GymConfig | VisFlyConfig, Field(discriminator="id")]
+
 type RecurrentCarry = LSTMStackCarry
 type PPOEnv = GymStyleEnv
-type Observation = jax.Array | dict[str, Observation] | tuple[Observation, ...]
 
 
 @struct.dataclass
@@ -185,7 +189,7 @@ class PPOBatch:
         episode_starts: (*S,) boolean episode reset flags.
     """
 
-    observations: Observation  # leaves: (*S, *O)
+    observations: Observation[jax.Array]  # leaves: (*S, *O)
     actions: jax.Array  # (*S,) integer IDs or (*S, *action_shape) bounded continuous actions
     old_log_probs: jax.Array  # (*S,)
     values: jax.Array  # (*S,)
@@ -206,7 +210,7 @@ class RolloutCarry(NamedTuple):
         episode_step_counts: (B,) step counts for unfinished episodes.
     """
 
-    observations: Observation  # leaves: (B, *O)
+    observations: Observation[jax.Array]  # leaves: (B, *O)
     model_carry: RecurrentCarry  # leaves: (B, H)
     episode_starts: jax.Array  # (B,)
     episode_returns: jax.Array  # (B,)
@@ -344,8 +348,6 @@ class Config(BaseConfig):
 
     @model_validator(mode="after")
     def validate_rollout(self) -> Self:
-        if isinstance(self.env, VisFlyConfig) and self.num_envs % self.env.num_scenes:
-            raise ValueError("num_envs must be divisible by env.num_scenes")
         if self.num_envs % self.num_minibatches:
             raise ValueError("num_envs must be divisible by num_minibatches to preserve sequences")
         if self.total_steps < self.num_envs * self.num_steps:
@@ -369,12 +371,14 @@ def action_space(space: gym.Space) -> ActionSpace:
 
 def make_env(config: Config, *, seed: int | None = None, evaluation: bool = False, record: bool = False) -> PPOEnv:
     env_config = config.env
-    if evaluation and isinstance(env_config, VisFlyConfig):
-        env_config = replace(env_config, num_scenes=1)
+    num_envs = 1 if evaluation else config.num_envs
+    seed = config.seed if seed is None else seed
+    if isinstance(env_config, VisFlyConfig):
+        return VisFlyEnv(config=env_config, num_envs=num_envs, seed=seed, evaluation=evaluation)
     return GymEnv(
         config=env_config,
-        num_envs=1 if evaluation else config.num_envs,
-        seed=config.seed if seed is None else seed,
+        num_envs=num_envs,
+        seed=seed,
         record=record,
     )
 
@@ -522,7 +526,7 @@ class ObservationEncoder(nn.Module):
     dtype: jax.typing.DTypeLike | None = None
 
     @nn.compact
-    def __call__(self, obs: Observation) -> jax.Array:  # leaves: (B, *O) -> (B, E)
+    def __call__(self, obs: Observation[jax.Array]) -> jax.Array:  # leaves: (B, *O) -> (B, E)
         features = []  # each (B, F)
         for index, leaf in enumerate(jax.tree.leaves(obs)):
             if self.config.type == "conv2d" and leaf.ndim == 4:
@@ -590,7 +594,7 @@ class ActorCritic(nn.Module):
             features=1, kernel_init=nn.initializers.orthogonal(1.0), name="value_output", dtype=self.dtype
         )
 
-    def _encode(self, obs: Observation) -> jax.Array:  # leaves: (B, *O) -> (B, H)
+    def _encode(self, obs: Observation[jax.Array]) -> jax.Array:  # leaves: (B, *O) -> (B, H)
         x = self.encoder(obs)  # (B, F), F is model.encoder.embedding_size
         return jnp.asarray(self.recurrent_input(x), dtype=self.dtype)  # (B, H)
 
@@ -621,7 +625,7 @@ class ActorCritic(nn.Module):
 
     def __call__(
         self,
-        obs: Observation,  # leaves: (B, T, *O), O is encoder-specific
+        obs: Observation[jax.Array],  # leaves: (B, T, *O), O is encoder-specific
         model_carry: RecurrentCarry,  # leaves: (B, H)
         episode_starts: jax.Array,  # (B, T)
     ) -> ActorCriticOutput:  # carry leaves: (B, H); policy leaves: (B, T, A/D); values: (B, T)
@@ -635,7 +639,7 @@ class ActorCritic(nn.Module):
 
     def step(
         self,
-        obs: Observation,  # leaves: (B, *O), O is encoder-specific
+        obs: Observation[jax.Array],  # leaves: (B, *O), O is encoder-specific
         model_carry: RecurrentCarry,  # leaves: (B, H)
         episode_starts: jax.Array,  # (B,)
     ) -> ActorCriticOutput:  # carry leaves: (B, H); policy leaves: (B, A/D); values: (B,)
@@ -650,7 +654,7 @@ class ActorCritic(nn.Module):
 def policy_step(
     apply_fn: Callable[..., ActorCriticOutput],
     params: optax.Params,
-    observations: Observation,  # leaves: (B, *O)
+    observations: Observation[jax.Array],  # leaves: (B, *O)
     memory: RecurrentCarry,  # leaves: (B, H)
     starts: jax.Array,  # (B,)
 ) -> ActorCriticOutput:
@@ -879,7 +883,7 @@ def collect_rollout(
     class Transition(NamedTuple):
         """S is (B,) per step, (T, B) after scanning, then (B, T) in the batch."""
 
-        observations: Observation  # leaves: (*S, *O)
+        observations: Observation[jax.Array]  # leaves: (*S, *O)
         actions: jax.Array  # (*S,) integer IDs or (*S, *action_shape) bounded continuous actions
         log_probs: jax.Array  # (*S,)
         values: jax.Array  # (*S,)
@@ -1153,7 +1157,7 @@ def train(config: Config) -> TrainState:
             # The environment and recurrent memory were freshly initialized above.
         key, metrics = jax.device_put((key, metrics), replicated)  # key: (); metrics: scalar leaves
         initial_step_count = progress.env_steps if progress is not None else 0
-        writer = MLflowLogger(experiment="ppo_nonnative", run_name=config.run_id)
+        writer = MLflowLogger(experiment="ppo_gym", run_name=config.run_id)
         resources.enter_context(writer)
         if progress is not None:
             print(f"Resumed run {config.run_id} at step {initial_step_count}", flush=True)
@@ -1315,7 +1319,7 @@ def train(config: Config) -> TrainState:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/ppo_nonnative.yaml", help="Path to a YAML config")
+    parser.add_argument("--config", default="configs/ppo_gym.yaml", help="Path to a YAML config")
     args = parser.parse_args()
     train(load_config(args.config, Config))
 

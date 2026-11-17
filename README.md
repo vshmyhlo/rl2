@@ -60,20 +60,20 @@ Pgx 2048 using [train_ppo.py](src/rl2/train_ppo.py) with the
 
 ![Pgx 2048 PPO rollout](images/ppo_pgx_2048.gif)
 
-### PPO with Gymnasium and VisFly
+### PPO with Gym-style environments
 
-[train_ppo_nonnative.py](src/rl2/train_ppo_nonnative.py) steps environments in Python
-and compiles recurrent policy inference and PPO updates in JAX. It supports
+[train_ppo_gym.py](src/rl2/train_ppo_gym.py) steps non-JAX-native Gymnasium and
+VisFly environments in Python and compiles recurrent policy inference and PPO updates in JAX. It supports
 zero-based Discrete and bounded floating-point Box actions, plus Box/Dict/Tuple
 observations. `mlp` flattens observation leaves; `conv2d` encodes HWC image leaves
 with CNNs and combines them with vector features. Set `env.channels_first: true`
 for CHW inputs (the VisFly default).
 
 ```bash
-uv run python -m rl2.train_ppo_nonnative --config configs/ppo_nonnative.yaml
+uv run python -m rl2.train_ppo_gym --config configs/ppo_gym.yaml
 ```
 
-The [VisFly preset](configs/ppo_nonnative/visfly.yaml) uses NavigationEnv with depth,
+The [VisFly preset](configs/ppo_gym/visfly.yaml) uses NavigationEnv with depth,
 state, and target observations. Install [VisFly's dependencies, modified Habitat-Sim,
 and datasets](https://github.com/SJTU-ViSYS-team/VisFly#installation) in a Python
 environment compatible with this project's dependencies. VisFly is loaded through
@@ -83,7 +83,7 @@ absolute scene directory, such as `VisFly/datasets/visfly-beta/configs/scenes/ga
 Run from the directory expected by the dataset's relative asset paths.
 
 ```bash
-python -m rl2.train_ppo_nonnative --config /path/to/rl2/configs/ppo_nonnative/visfly.yaml
+python -m rl2.train_ppo_gym --config /path/to/rl2/configs/ppo_gym/visfly.yaml
 ```
 
 `num_envs` counts agents across scenes and must divide evenly by `env.num_scenes`.

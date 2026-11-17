@@ -18,10 +18,11 @@ from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 from pydantic import TypeAdapter
 
-from rl2 import train_ppo_nonnative as ppo
+from rl2 import train_ppo_gym as ppo
 from rl2.actions import ContinuousSpace, TruncatedGaussianPolicy
 from rl2.envs import GymStyleEnv, GymStyleStep
-from rl2.envs.gym_env import GymConfig, GymEnv, VisFlyConfig
+from rl2.envs.gym_env import GymConfig, GymEnv
+from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv
 from rl2.model.encoders.conv2d import ConvStage
 
 pytestmark = pytest.mark.usefixtures("ppo_mesh")
@@ -125,8 +126,8 @@ def test_visfly_factory_tensors_terminal_observations_and_cleanup() -> None:
     backend = VisFlyBatch()
     settings = VisFlyConfig(num_scenes=2, kwargs={"device": "cpu", "visual": True})
     with (
-        patch("rl2.envs.gym_env.load_env_creator", return_value=Mock(return_value=backend)) as loader,
-        closing(GymEnv(config=settings, num_envs=4, seed=17)) as env,
+        patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)) as loader,
+        closing(VisFlyEnv(config=settings, num_envs=4, seed=17)) as env,
     ):
         initial = env.reset()
         result = env.step(np.zeros((4, 4), dtype=np.float32))
@@ -161,12 +162,42 @@ def test_visfly_requires_timeout_final_observation() -> None:
 
     backend.step = missing_terminal
     with (
-        patch("rl2.envs.gym_env.load_env_creator", return_value=Mock(return_value=backend)),
-        closing(GymEnv(config=VisFlyConfig(), num_envs=4, seed=1)) as env,
+        patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
+        closing(VisFlyEnv(config=VisFlyConfig(), num_envs=4, seed=1)) as env,
     ):
         env.reset()
         with pytest.raises(ValueError, match="terminal_observation"):
             env.step(np.zeros((4, 4), dtype=np.float32))
+
+
+@pytest.mark.parametrize(
+    ("env_config", "evaluation"),
+    [
+        pytest.param(GymConfig(), False, id="gym-training"),
+        pytest.param(GymConfig(), True, id="gym-evaluation"),
+        pytest.param(VisFlyConfig(num_scenes=2), False, id="visfly-training"),
+        pytest.param(VisFlyConfig(num_scenes=2), True, id="visfly-evaluation"),
+    ],
+)
+def test_factory_selects_backend(config: ppo.Config, env_config: ppo.EnvConfig, evaluation: bool) -> None:
+    config = replace(config, env=env_config)
+    with patch.object(ppo, "GymEnv") as gym_env, patch.object(ppo, "VisFlyEnv") as visfly_env:
+        env = ppo.make_env(config, seed=17, evaluation=evaluation, record=True)
+    if isinstance(env_config, VisFlyConfig):
+        assert env is visfly_env.return_value
+        visfly_env.assert_called_once_with(
+            config=env_config,
+            num_envs=1 if evaluation else config.num_envs,
+            seed=17,
+            evaluation=evaluation,
+        )
+        gym_env.assert_not_called()
+    else:
+        assert env is gym_env.return_value
+        gym_env.assert_called_once_with(
+            config=env_config, num_envs=1 if evaluation else config.num_envs, seed=17, record=True
+        )
+        visfly_env.assert_not_called()
 
 
 @pytest.mark.parametrize("space", [gym.spaces.MultiDiscrete([2, 3]), gym.spaces.Discrete(2, start=1)])
@@ -205,7 +236,7 @@ def test_rollout_bootstraps_timeout_with_final_observation_and_memory(config: pp
     config = replace(config, env=VisFlyConfig(), num_envs=4)
     backend = VisFlyBatch()
     with (
-        patch("rl2.envs.gym_env.load_env_creator", return_value=Mock(return_value=backend)),
+        patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
         closing(ppo.make_env(config)) as env,
     ):
         runner = ppo.RolloutCarry(
@@ -296,7 +327,7 @@ def test_evaluation_uses_fresh_environment_and_closes_on_failure(config: ppo.Con
     config = replace(config, env=VisFlyConfig(), video_max_frames=1)
     state = TrainState.create(apply_fn=value_policy, params={}, tx=optax.sgd(0.1))
     memory = ((jnp.zeros((1, 1)), jnp.zeros((1, 1))),)  # leaves: (1, 1)
-    with patch("rl2.envs.gym_env.load_env_creator", return_value=Mock(return_value=backend)):
+    with patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)):
         result = ppo.play_episode(state, config, jax.random.key(0), memory, record=True, stop_at_frame_limit=True)
         assert len(result.frames) == 1
         assert result.length == 0
@@ -311,15 +342,13 @@ def test_evaluation_uses_fresh_environment_and_closes_on_failure(config: ppo.Con
         assert backend.closed
 
 
-def test_configuration_round_trip_and_scene_validation(config: ppo.Config) -> None:
+def test_configuration_round_trip(config: ppo.Config) -> None:
     values = asdict(config)
     values["env"] = {"id": "VisFly", "num_scenes": 2, "kwargs": {"visual": True}}
     parsed = TypeAdapter(ppo.Config).validate_json(json.dumps(values))
     assert isinstance(parsed.env, VisFlyConfig)
     assert parsed.env.kwargs == {"visual": True}
     hash(parsed)  # Configurations with arbitrary environment kwargs can specialize JIT updates.
-    with pytest.raises(ValueError, match="num_scenes"):
-        replace(parsed, env=replace(parsed.env, num_scenes=3))
 
 
 def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:
@@ -335,7 +364,7 @@ def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:
     state = TrainState.create(apply_fn=value_policy, params={}, tx=optax.sgd(0.1))
     memory = ((jnp.zeros((1, 1)), jnp.zeros((1, 1))),)  # leaves: (1, 1)
     writer = Mock()
-    with patch("rl2.envs.gym_env.load_env_creator", return_value=create):
+    with patch("rl2.envs.visfly_env.load_env_creator", return_value=create):
         ppo.log_evaluation(state, config, writer, 0, 4, initial_carry=memory)
     assert len(backends) == 2
     assert all(backend.closed and backend.steps == 1 for backend in backends)

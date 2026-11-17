@@ -56,4 +56,4 @@ video_interval: 0 # Enable only after configuring scene_kwargs.render_settings
 eval_interval: 100
 eval_episodes: 10
 eval_video: false
-run_id: ppo_nonnative_visfly_seed${seed}
+run_id: ppo_gym_visfly_seed${seed}

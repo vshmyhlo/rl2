@@ -2,12 +2,14 @@
 
 import subprocess
 import sys
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
 
 from rl2.envs import GymStyleEnv
-from rl2.envs.gym_env import GymEnv, convert_observation, host_observation, replace_observation
+from rl2.envs.gym_env import GymConfig, GymEnv
+from rl2.envs.gym_style_env import convert_observation, host_observation, replace_observation
 
 
 def test_gym_style_env_cannot_be_instantiated() -> None:
@@ -39,6 +41,16 @@ with closing(GymEnv(config=GymConfig(), num_envs=1, seed=0)) as env:
 assert 'jax' not in sys.modules
 """
     subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+
+
+def test_gym_partial_construction_closes_created_instances() -> None:
+    instance = Mock()
+    with (
+        patch("rl2.envs.gym_env.gym.make", side_effect=[instance, RuntimeError("construction failed")]),
+        pytest.raises(RuntimeError, match="construction failed"),
+    ):
+        GymEnv(config=GymConfig(), num_envs=2, seed=0)
+    instance.close.assert_called_once_with()
 
 
 def test_nested_numpy_observations_preserve_layout_and_snapshots() -> None:

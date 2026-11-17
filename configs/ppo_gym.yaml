@@ -28,4 +28,4 @@ video_interval: 0
 eval_interval: 100
 eval_episodes: 10
 eval_video: false
-run_id: ppo_nonnative_cartpole_seed${seed}
+run_id: ppo_gym_cartpole_seed${seed}
