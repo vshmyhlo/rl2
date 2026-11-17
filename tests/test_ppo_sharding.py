@@ -101,6 +101,7 @@ def test_train_places_restored_state_and_fresh_environments_on_all_devices(confi
             episode_count=3,
             episode_return_sum=5.0,
             episode_length_sum=6,
+            env_steps=config.num_envs * config.num_steps,
         )
 
     def inspect_step(
@@ -252,6 +253,7 @@ def test_sharded_training_matches_single_device_and_restores_checkpoint(
         episode_count=config.num_envs,
         episode_return_sum=float(actual.metrics.total.episode_return_sum),
         episode_length_sum=int(actual.metrics.total.episode_length_sum),
+        env_steps=2 * config.num_envs * config.num_steps,
     )
     with ppo.checkpoint_manager(str(tmp_path)) as manager:
         ppo.save_checkpoint(manager, progress, config)

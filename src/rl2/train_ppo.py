@@ -24,8 +24,10 @@ minibatches do not count as updates.
 KL-rejected minibatches skip backpropagation and optimizer work.
 Window/lifetime metrics and latest settings are logged every log_interval iterations
 (default: 10). Checkpoints are saved every checkpoint_interval iterations (default: 100).
-All enabled schedules use completed iteration counts, including resumed training,
-and also run on normal completion. No metrics have categorical suffixes.
+Periodic operations use completed iteration counts, including resumed training,
+and also run on normal completion. Learning-rate and entropy schedules use completed
+environment steps divided by the current batch size, rounded down. No metrics have
+categorical suffixes. Only complete batches fitting within total_steps are collected.
 
 Window metrics:
     train/policy_loss, train/value_loss: Mean clipped surrogate loss and half
@@ -36,11 +38,11 @@ Window metrics:
     train/clip_fraction: Fraction of action probability ratios outside the clip range.
         All losses/diagnostics average transitions, then evaluated minibatches,
         including KL-rejected minibatches; total loss uses each iteration's entropy weight.
-    train/explained_variance_mean: Mean over iterations with nonconstant returns;
+    train/explained_variance: Mean over iterations with nonconstant returns;
         omitted if none are defined.
-    train/updates_per_iteration_mean, train/kl_early_stop_fraction: Accepted updates
+    train/updates_per_iteration, train/kl_early_stop_fraction: Accepted updates
         and KL stop frequency, averaged over iterations; omit stops when disabled.
-    rollout/episode_count, rollout/return_mean, rollout/episode_length_steps_mean:
+    rollout/episode_count, rollout/return, rollout/episode_length_steps:
         Completed episodes and their raw return/length means; omit unavailable means.
     train/iterations_per_second, train/env_steps_per_second, train/updates_per_second:
         Completed batches, environment transitions across all environments, and
@@ -51,9 +53,9 @@ Window metrics:
 Lifetime metrics:
     train/iterations_total, train/updates_total, train/episodes_total, train/env_steps_total:
         Completed iteration, accepted update, episode, and environment transition counts.
-    train/return_mean, train/episode_length_steps_mean: Raw return and length means
+    train/return, train/episode_length_steps: Raw return and length means
         over all completed episodes; omitted before the first completion.
-    train/progress_fraction: Fraction of planned iterations completed.
+    train/progress_fraction: Fraction of the environment-step budget completed.
         Lifetime counters and episode sums include restored checkpoint history.
 
 Latest settings and session timings:
@@ -74,7 +76,7 @@ Latest settings and session timings:
     model/params_millions: Parameter count at startup, including resume.
 
 Evaluation uses fixed seeds and logs raw episode return mean, sample standard
-deviation, and standard error as eval/return_mean, eval/return_std, and
+deviation, and standard error as eval/return, eval/return_std, and
 eval/return_sem after each evaluation. eval/training_episodes_total is the lifetime
 completed training episode count at evaluation. Uncertainty metrics are omitted
 for a single episode. Evaluation replays its highest-return episode with the same
@@ -96,8 +98,11 @@ and eval/gameplay/<step>.gif. Config parameters use dotted keys; existing values
 are preserved on resume. Startup console logs include per-environment observation
 shapes/dtypes and the action space (discrete count or continuous shape/bounds),
 including on resume. Checkpoints retain parameters, optimizer state, RNG,
-completed iterations, and episode totals. Live environments and recurrent memory
-restart on resume; unfinished episode statistics are discarded.
+completed iterations, environment steps, and episode totals. Legacy checkpoints
+without an environment-step count infer it using the current batch size, so their
+historical count is exact only when that size is unchanged. Saved configuration is
+ignored on restore. Live environments and recurrent memory restart on resume;
+unfinished episode statistics are discarded.
 """
 
 import argparse
@@ -442,6 +447,7 @@ class TrainingProgress(NamedTuple):
     episode_count: int
     episode_return_sum: float
     episode_length_sum: int
+    env_steps: int
 
 
 def init_metrics(progress: TrainingProgress | None = None) -> TrainingMetrics:
@@ -487,12 +493,13 @@ def save_checkpoint(manager: ocp.CheckpointManager, progress: TrainingProgress, 
             state=ocp.args.StandardSave({"train_state": progress.train_state, "key": key_data}),
             metadata=ocp.args.JsonSave(
                 {
-                    "version": 3,
+                    "version": 4,
                     "config": asdict(config),
                     "iteration": progress.rollout_count,
                     "completed_episodes": progress.episode_count,
                     "training_return_sum": progress.episode_return_sum,
                     "training_length_sum": progress.episode_length_sum,
+                    "environment_steps": progress.env_steps,
                 }
             ),
         ),
@@ -510,13 +517,20 @@ def restore_checkpoint(
     if rollout_count is None:
         return None
     metadata = manager.restore(rollout_count, args=ocp.args.Composite(metadata=ocp.args.JsonRestore())).metadata
-    if metadata["version"] not in (1, 2, 3):
+    if metadata["version"] not in (1, 2, 3, 4):
         raise ValueError("Unsupported PPO checkpoint version")
     if metadata["iteration"] != rollout_count or rollout_count < 0 or metadata["completed_episodes"] < 0:
         raise ValueError("Invalid PPO checkpoint progress")
     for field in ("training_return_sum", "training_length_sum"):
         if metadata.get(field) is None:
             raise ValueError(f"PPO checkpoint requires {field}; use a new run directory")
+    env_steps = (
+        metadata["environment_steps"]
+        if metadata["version"] >= 4
+        else rollout_count * config.num_envs * config.num_steps
+    )
+    if env_steps < 0:
+        raise ValueError("Invalid PPO checkpoint environment steps")
     restored = manager.restore(
         rollout_count,
         args=ocp.args.Composite(
@@ -536,6 +550,7 @@ def restore_checkpoint(
         episode_count=metadata["completed_episodes"],
         episode_return_sum=metadata["training_return_sum"],
         episode_length_sum=metadata["training_length_sum"],
+        env_steps=env_steps,
     )
 
 
@@ -909,10 +924,9 @@ def log_evaluation(
         "training_steps": step_count,
         "training_episodes": episode_count,
     }
-    scalars = {
-        f"eval/{name}": result[name] for name in ("return_mean", "return_std", "return_sem") if result[name] is not None
-    }
-    scalars["eval/training_episodes_total"] = episode_count
+    scalars = {"eval/return": result["return_mean"], "eval/training_episodes_total": episode_count}
+    if std is not None:
+        scalars.update({"eval/return_std": std, "eval/return_sem": result["return_sem"]})
     writer.log_text(json.dumps(result, indent=2, allow_nan=False), f"eval/report/{step_count}.json")
     seconds = monotonic() - started
     scalars["eval/evaluation_seconds"] = seconds
@@ -927,12 +941,12 @@ def update(
     train_state: TrainState,
     batch: PPOBatch,  # observations: (*S, *O); targets/starts: (*S,); model_carry leaves: (B, H)
     config: Config,
-    rollout_index: int | jax.Array = 0,  # () zero-based rollout position for schedules
+    schedule_index: int | jax.Array = 0,  # () completed environment steps // current batch size, for schedules
 ) -> tuple[TrainState, MinibatchMetrics]:
     """Apply a global-minibatch update inside the active batch mesh."""
-    rollout_index = jnp.asarray(rollout_index)  # ()
-    chex.assert_type(rollout_index, int)
-    entropy_coef = jnp.asarray(entropy_coef_schedule(config)(rollout_index), dtype=jnp.float32)  # ()
+    schedule_index = jnp.asarray(schedule_index)  # ()
+    chex.assert_type(schedule_index, int)
+    entropy_coef = jnp.asarray(entropy_coef_schedule(config)(schedule_index), dtype=jnp.float32)  # ()
     advantages = batch.advantages  # (*S,)
     chex.assert_scalar_positive(advantages.size)
     # Centering a single sample always gives zero and erases its policy gradient.
@@ -1127,12 +1141,12 @@ def train_step(
     config: Config,
     key: jax.Array,  # () typed PRNG key
     metrics: TrainingMetrics,  # scalar leaves
-    rollout_index: int | jax.Array = 0,  # () zero-based rollout position for schedules
+    schedule_index: int | jax.Array = 0,  # () completed environment steps // current batch size, for schedules
 ) -> TrainStepResult:
     """Collect a rollout, run PPO epochs, and accumulate window/lifetime metrics."""
     rollout_carry, rollout = collect_rollout(rollout_carry, train_state, envs, config, key)
     batch = jax.lax.with_sharding_constraint(rollout.batch, PartitionSpec("batch"))  # (B, T, ...); memory: (B, H)
-    learning_rate = jnp.asarray(learning_rate_schedule(config)(rollout_index), dtype=jnp.float32)  # ()
+    learning_rate = jnp.asarray(learning_rate_schedule(config)(schedule_index), dtype=jnp.float32)  # ()
     train_state = train_state.replace(
         opt_state=train_state.opt_state._replace(
             hyperparams={**train_state.opt_state.hyperparams, "learning_rate": learning_rate}  # ()
@@ -1163,7 +1177,7 @@ def train_step(
         indices = permutation.reshape(config.num_minibatches, -1)[minibatch_index]  # (B,), B is minibatch size
         minibatch = jax.tree.map(itemgetter(indices), batch)  # (B, T, ...); memory: (B, H)
         minibatch = jax.lax.with_sharding_constraint(minibatch, PartitionSpec("batch"))
-        train_state, metrics = update(current.train_state, minibatch, config, rollout_index)
+        train_state, metrics = update(current.train_state, minibatch, config, schedule_index)
         train_state = jax.lax.with_sharding_constraint(train_state, PartitionSpec())
         kl_exceeded = jnp.asarray(False) if config.target_kl is None else metrics.approx_kl > config.target_kl  # ()
         return UpdateCarry(
@@ -1289,18 +1303,15 @@ def train(config: Config) -> TrainState:
         metrics = init_metrics(progress)  # scalar leaves
         start_rollout_index = 0
         if progress is not None:
-            train_state, key, start_rollout_index = (
-                progress.train_state,
-                progress.key,
-                progress.rollout_count,
-            )  # key: ()
+            train_state = jax.device_put(progress.train_state, replicated)
+            key = progress.key  # ()
+            start_rollout_index = progress.rollout_count
             # Live environment states are not serialized. Start fresh episodes
             # with fresh recurrent memory, retaining the policy and training RNGs.
             reset_keys = jax.random.split(jax.random.fold_in(key, start_rollout_index), config.num_envs)  # (B,) keys
             obs, env_state = reset(jax.device_put(reset_keys, batched), envs.params)  # (B,*O); leaves: (B,...)
-        train_state = jax.device_put(train_state, replicated)
         key, metrics = jax.device_put((key, metrics), replicated)  # key: (); metrics: scalar leaves
-        initial_step_count = start_rollout_index * batch_size
+        initial_step_count = progress.env_steps if progress is not None else 0
         writer = MLflowLogger(experiment="ppo", run_name=config.run_id)
         resources.enter_context(writer)
         if progress is not None:
@@ -1330,14 +1341,16 @@ def train(config: Config) -> TrainState:
 
         window_start = monotonic()
         window_start_step_count = initial_step_count
-        planned_rollout_count = config.total_steps // batch_size
+        planned_rollout_count = start_rollout_index + max(config.total_steps - initial_step_count, 0) // batch_size
+        step_count = initial_step_count
         for rollout_index in range(start_rollout_index, planned_rollout_count):
+            schedule_index = step_count // batch_size
             train_state, rollout_carry, key, metrics = train_step_donated(
-                rollout_carry, train_state, envs, config, key, metrics, rollout_index
+                rollout_carry, train_state, envs, config, key, metrics, schedule_index
             )  # state: (B, ...); memory: (B, H); key/metrics: ()
             rollout_count = rollout_index + 1
             is_final_rollout = rollout_count == planned_rollout_count
-            step_count = rollout_count * batch_size
+            step_count += batch_size
             if config.video_interval and (rollout_count % config.video_interval == 0 or is_final_rollout):
                 log_video(
                     train_state,
@@ -1372,12 +1385,12 @@ def train(config: Config) -> TrainState:
                 window_update_count = int(window.update_count)
                 window_episode_count = int(window.episodes.episode_count)
                 episode_count = int(total.episode_count)
-                learning_rate = float(lr_schedule(rollout_index))
-                entropy_coef = float(entropy_schedule(rollout_index))
+                learning_rate = float(lr_schedule(schedule_index))
+                entropy_coef = float(entropy_schedule(schedule_index))
                 rate_seconds = max(window_seconds, 1e-9)
                 sps = (step_count - window_start_step_count) / rate_seconds
                 scalars: dict[str, float | int] = {
-                    "train/updates_per_iteration_mean": window_update_count / window_iteration_count,
+                    "train/updates_per_iteration": window_update_count / window_iteration_count,
                     "train/policy_loss": mean_metrics["policy_loss"],
                     "train/value_loss": mean_metrics["value_loss"],
                     "train/entropy_loss": -mean_metrics["entropy"],
@@ -1396,30 +1409,30 @@ def train(config: Config) -> TrainState:
                     "train/env_steps_total": step_count,
                     "train/iterations_total": rollout_count,
                     "train/updates_total": int(train_state.step),
-                    "train/progress_fraction": rollout_count / planned_rollout_count,
+                    "train/progress_fraction": step_count / config.total_steps,
                     "rollout/episode_count": window_episode_count,
                 }
                 if config.target_kl is not None:
                     scalars["train/kl_early_stop_fraction"] = int(window.early_stop_count) / window_iteration_count
                 if window.explained_variance_count:
-                    scalars["train/explained_variance_mean"] = float(window.explained_variance_sum) / int(
+                    scalars["train/explained_variance"] = float(window.explained_variance_sum) / int(
                         window.explained_variance_count
                     )
                 if window_episode_count:
-                    scalars["rollout/return_mean"] = float(window.episodes.episode_return_sum) / window_episode_count
-                    scalars["rollout/episode_length_steps_mean"] = (
+                    scalars["rollout/return"] = float(window.episodes.episode_return_sum) / window_episode_count
+                    scalars["rollout/episode_length_steps"] = (
                         int(window.episodes.episode_length_sum) / window_episode_count
                     )
                 if episode_count:
-                    scalars["train/return_mean"] = float(total.episode_return_sum) / episode_count
-                    scalars["train/episode_length_steps_mean"] = int(total.episode_length_sum) / episode_count
+                    scalars["train/return"] = float(total.episode_return_sum) / episode_count
+                    scalars["train/episode_length_steps"] = int(total.episode_length_sum) / episode_count
                 writer.log_metrics(scalars, step_count)
-                episode_return_text = f"{scalars['rollout/return_mean']:.1f}" if window_episode_count else "n/a"
+                episode_return_text = f"{scalars['rollout/return']:.1f}" if window_episode_count else "n/a"
                 episode_length_text = (
-                    f"{scalars['rollout/episode_length_steps_mean']:.1f}" if window_episode_count else "n/a"
+                    f"{scalars['rollout/episode_length_steps']:.1f}" if window_episode_count else "n/a"
                 )
                 variance_text = (
-                    f"{scalars['train/explained_variance_mean']:.3f}" if window.explained_variance_count else "n/a"
+                    f"{scalars['train/explained_variance']:.3f}" if window.explained_variance_count else "n/a"
                 )
                 early_stop_text = (
                     f"{scalars['train/kl_early_stop_fraction']:.2f}" if config.target_kl is not None else "n/a"
@@ -1434,7 +1447,7 @@ def train(config: Config) -> TrainState:
                     f"policy={mean_metrics['policy_loss']:.3f} value={mean_metrics['value_loss']:.3f} "
                     f"entropy={mean_metrics['entropy']:.3f} kl={mean_metrics['approx_kl']:.4f} "
                     f"clipfrac={mean_metrics['clip_fraction']:.3f} ev={variance_text} "
-                    f"updates/iteration={scalars['train/updates_per_iteration_mean']:.2f} "
+                    f"updates/iteration={scalars['train/updates_per_iteration']:.2f} "
                     f"early_stop={early_stop_text} "
                     f"window={window_seconds:.1f}s",
                     flush=True,
@@ -1454,6 +1467,7 @@ def train(config: Config) -> TrainState:
                         episode_count=int(metrics.total.episode_count),
                         episode_return_sum=float(metrics.total.episode_return_sum),
                         episode_length_sum=int(metrics.total.episode_length_sum),
+                        env_steps=step_count,
                     ),
                     config,
                 )

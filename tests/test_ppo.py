@@ -22,6 +22,7 @@ from rl2 import train_ppo as ppo
 from rl2.envs.base import BaseEnv
 from rl2.lstm import initial_carry
 from rl2.model.encoders.conv2d import ConvStage
+from rl2.sweeps import load_sweep
 from rl2.train_ppo import (
     ActorCritic,
     Config,
@@ -30,7 +31,6 @@ from rl2.train_ppo import (
     train,
     update,
 )
-from rl2.sweeps import load_sweep
 
 pytestmark = pytest.mark.usefixtures("ppo_mesh")
 
@@ -666,17 +666,17 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
         "train/entropy": [(12.0, 2), (36.0, 3)],
         "train/approx_kl": [(0.02 / 3, 2), (0.0, 3)],
         "train/clip_fraction": [(0.04, 2), (0.12, 3)],
-        "train/explained_variance_mean": [(0.0, 2)],
-        "train/updates_per_iteration_mean": [(1.0, 2), (2.0, 3)],
+        "train/explained_variance": [(0.0, 2)],
+        "train/updates_per_iteration": [(1.0, 2), (2.0, 3)],
         "train/kl_early_stop_fraction": [(0.5, 2), (0.0, 3)],
         "train/iterations_per_second": [(2 / 60, 2), (1 / 20, 3)],
         "train/env_steps_per_second": [(2 / 60, 2), (1 / 20, 3)],
         "train/updates_per_second": [(2 / 60, 2), (2 / 20, 3)],
         "rollout/episode_count": [(1.0, 2), (0.0, 3)],
-        "rollout/return_mean": [(8.0, 2)],
-        "rollout/episode_length_steps_mean": [(2.0, 2)],
-        "train/return_mean": [(8.0, 2), (8.0, 3)],
-        "train/episode_length_steps_mean": [(2.0, 2), (2.0, 3)],
+        "rollout/return": [(8.0, 2)],
+        "rollout/episode_length_steps": [(2.0, 2)],
+        "train/return": [(8.0, 2), (8.0, 3)],
+        "train/episode_length_steps": [(2.0, 2), (2.0, 3)],
         "train/episodes_total": [(1.0, 2), (1.0, 3)],
         "train/env_steps_total": [(2.0, 2), (3.0, 3)],
         "train/iterations_total": [(2.0, 2), (3.0, 3)],
@@ -921,8 +921,8 @@ def test_train_evaluates_final_policy(
     assert "train/kl_early_stop_fraction" not in metric_history(writer.return_value)
     for tag, expected in (
         ("train/episodes_total", [(1.0, 2), (2.0, 4)]),
-        ("train/return_mean", [(3.0, 2), (5.0, 4)]),
-        ("train/episode_length_steps_mean", [(2.0, 2), (1.5, 4)]),
+        ("train/return", [(3.0, 2), (5.0, 4)]),
+        ("train/episode_length_steps", [(2.0, 2), (1.5, 4)]),
         ("train/iterations_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),
         ("train/env_steps_per_second", [(2 / first_elapsed, 2), (2 / (final_elapsed - first_elapsed), 4)]),
         ("train/updates_per_second", [(1 / first_elapsed, 2), (1 / (final_elapsed - first_elapsed), 4)]),

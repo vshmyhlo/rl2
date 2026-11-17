@@ -230,7 +230,7 @@ def test_evaluation_logs_raw_scores_and_independent_seeds(config: ppo.Config) ->
         assert call.kwargs["env"] is make_env.return_value
         assert call.kwargs["record"] == (index == len(episodes) - 1)
     scalars = writer.log_metrics.call_args.args[0]
-    assert scalars["eval/return_mean"] == 3
+    assert scalars["eval/return"] == 3
     assert scalars["eval/return_std"] == pytest.approx(2**0.5)
     assert scalars["eval/return_sem"] == pytest.approx(1.0)
     assert scalars["eval/training_episodes_total"] == 1
@@ -286,7 +286,7 @@ def test_evaluation_records_highest_return_episode(returns: list[float], best_in
     assert writer.log_video.call_args.args[0] is replay.frames
     report = json.loads(writer.log_text.call_args.args[0])
     assert report["episodes"] == [{"return": score, "length": 3} for score in returns]
-    assert writer.log_metrics.call_args.args[0]["eval/return_mean"] == pytest.approx(sum(returns) / len(returns))
+    assert writer.log_metrics.call_args.args[0]["eval/return"] == pytest.approx(sum(returns) / len(returns))
 
 
 def test_log_video_wiring() -> None:
@@ -357,7 +357,7 @@ def test_single_evaluation_omits_unavailable_uncertainty(config: ppo.Config) -> 
     ):
         ppo.log_evaluation(Mock(), config, writer, 0, 0, initial_carry=carry)
     tags = set(writer.log_metrics.call_args.args[0])
-    assert "eval/return_mean" in tags
+    assert "eval/return" in tags
     assert not {"eval/return_std", "eval/return_sem"} & tags
     report = json.loads(writer.log_text.call_args.args[0])
     assert report["return_mean"] == 2.0

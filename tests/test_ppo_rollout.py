@@ -266,9 +266,16 @@ def test_train_step_stops_updates_and_rng_at_rejected_minibatch(reject_at: int) 
     if reject_at == 1:
         # Exercise continued windows and resets once, including totals beyond 32-bit precision.
         x64_enabled = jax.config.x64_enabled
-        metrics = ppo.init_metrics(ppo.TrainingProgress(state, key, 0, 2**31 - 1, float(2**24), 2**31 - 1))._replace(
-            window=result.metrics.window
-        )  # scalar leaves
+        progress = ppo.TrainingProgress(
+            train_state=state,
+            key=key,  # ()
+            rollout_count=0,
+            episode_count=2**31 - 1,
+            episode_return_sum=float(2**24),
+            episode_length_sum=2**31 - 1,
+            env_steps=0,
+        )
+        metrics = ppo.init_metrics(progress)._replace(window=result.metrics.window)  # scalar leaves
         with patch.object(ppo, "update", side_effect=update):
             continued = ppo.train_step(runner, state, env, config, key, metrics)
             window = continued.metrics.window  # scalar leaves

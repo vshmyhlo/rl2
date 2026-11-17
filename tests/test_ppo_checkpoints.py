@@ -95,7 +95,15 @@ def state() -> TrainState:
 
 def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Config, state: TrainState) -> None:
     directory = f"{config.ckpt_dir}/{config.run_id}"
-    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 8, 12.5, 40)
+    progress = ppo.TrainingProgress(
+        train_state=state,
+        key=jax.random.key(3),  # () typed PRNG key
+        rollout_count=2,
+        episode_count=8,
+        episode_return_sum=12.5,
+        episode_length_sum=40,
+        env_steps=2,
+    )
     with ppo.checkpoint_manager(directory) as manager:
         assert ppo.restore_checkpoint(manager, state, config) is None
         ppo.save_checkpoint(manager, progress._replace(rollout_count=1), config)
@@ -113,6 +121,7 @@ def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Confi
             replace(
                 config,
                 total_steps=8,
+                num_steps=2,
                 log_interval=15,
                 video_interval=600,
                 eval_interval=1800,
@@ -120,7 +129,8 @@ def test_checkpoint_restores_optimizer_rng_and_latest_progress(config: ppo.Confi
         )
         assert restored is not None
         chex.assert_trees_all_equal(restored, progress)
-        assert metadata["version"] == 3
+        assert metadata["version"] == 4
+        assert metadata["environment_steps"] == 2
         assert "recent_returns" not in metadata
         assert "recent_lengths" not in metadata
         assert "numpy_rng" not in metadata
@@ -154,6 +164,7 @@ def test_checkpoint_timing_matches_blocking_work(
         episode_count=0,
         episode_return_sum=0.0,
         episode_length_sum=0,
+        **({"env_steps": 2 * config.num_envs * config.num_steps} if trainer is ppo else {}),
     )
     clock = 10.0
 
@@ -174,24 +185,55 @@ def test_checkpoint_timing_matches_blocking_work(
         assert capsys.readouterr().out == ""
 
 
-@pytest.mark.parametrize("version", [2, 3], ids=["legacy-recent-history", "current-totals-only"])
+@pytest.mark.parametrize("version", [2, 3, 4], ids=["legacy-recent-history", "legacy-totals-only", "environment-steps"])
 def test_checkpoint_preserves_episode_totals(config: ppo.Config, state: TrainState, version: int) -> None:
-    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 101, 300.0, 305)
+    progress = ppo.TrainingProgress(
+        train_state=state,
+        key=jax.random.key(3),  # () typed PRNG key
+        rollout_count=2,
+        episode_count=101,
+        episode_return_sum=300.0,
+        episode_length_sum=305,
+        env_steps=2,
+    )
     manager = Mock()
     ppo.save_checkpoint(manager, progress, config)
     saved = manager.save.call_args.kwargs["args"]
     metadata = json.loads(json.dumps(saved.metadata.item))
-    assert metadata["version"] == 3
+    assert metadata["version"] == 4
     assert "recent_returns" not in metadata
     assert "recent_lengths" not in metadata
     if version == 2:
-        metadata.update(version=2, recent_returns=[2.0] * 100, recent_lengths=[3] * 100)
+        metadata.update(recent_returns=[2.0] * 100, recent_lengths=[3] * 100)
+    metadata["version"] = version
+    if version < 4:
+        del metadata["environment_steps"]
+        # Legacy accounting must not depend on the saved configuration either.
+        metadata["config"] = {}
     manager.latest_step.return_value = progress.rollout_count
     manager.restore.side_effect = [SimpleNamespace(metadata=metadata), SimpleNamespace(state=saved.state.item)]
     restored = ppo.restore_checkpoint(manager, state, config)
     assert restored is not None
     assert restored.episode_length_sum == 305
     chex.assert_trees_all_equal(restored, progress)
+
+
+def test_checkpoint_rejects_negative_environment_steps(config: ppo.Config, state: TrainState) -> None:
+    manager = Mock()
+    manager.latest_step.return_value = 2
+    manager.restore.return_value = SimpleNamespace(
+        metadata={
+            "version": 4,
+            "iteration": 2,
+            "completed_episodes": 0,
+            "training_return_sum": 0.0,
+            "training_length_sum": 0,
+            "environment_steps": -1,
+        }
+    )
+    with pytest.raises(ValueError, match="Invalid PPO checkpoint environment steps"):
+        ppo.restore_checkpoint(manager, state, config)
+    manager.restore.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -208,6 +250,7 @@ def test_checkpoint_ignores_saved_config(trainer: ModuleType, config_path: str, 
         episode_count=8,
         episode_return_sum=12.5,
         episode_length_sum=40,
+        **({"env_steps": 2 * config.num_envs * config.num_steps} if trainer is ppo else {}),
     )
     manager = Mock()
     trainer.save_checkpoint(manager, progress, config)
@@ -239,7 +282,15 @@ def test_checkpoint_ignores_saved_config(trainer: ModuleType, config_path: str, 
 )
 def test_checkpoint_requires_training_totals(config: ppo.Config, state: TrainState, field: str, missing: bool) -> None:
     manager = Mock()
-    progress = ppo.TrainingProgress(state, jax.random.key(3), 2, 101, 300.0, 305)
+    progress = ppo.TrainingProgress(
+        train_state=state,
+        key=jax.random.key(3),  # () typed PRNG key
+        rollout_count=2,
+        episode_count=101,
+        episode_return_sum=300.0,
+        episode_length_sum=305,
+        env_steps=2,
+    )
     ppo.save_checkpoint(manager, progress, config)
     metadata = manager.save.call_args.kwargs["args"].metadata.item
     if missing:
@@ -258,6 +309,104 @@ def test_checkpoint_requires_training_totals(config: ppo.Config, state: TrainSta
 def test_invalid_run_id(config: ppo.Config, run_id: str) -> None:
     with pytest.raises(ValueError, match="run_id"):
         replace(config, run_id=run_id)
+
+
+@pytest.mark.parametrize(
+    "num_steps,total_steps,expected_steps,schedule_indices",
+    [(3, 15, [11, 14], [2, 3]), (1, 10, [9, 10], [8, 9])],
+    ids=["larger-batch-with-remainder", "smaller-batch"],
+)
+def test_resume_preserves_environment_steps_when_batch_size_changes(
+    config: ppo.Config,
+    num_steps: int,
+    total_steps: int,
+    expected_steps: list[int],
+    schedule_indices: list[int],
+) -> None:
+    config = replace(
+        config,
+        num_steps=num_steps,
+        total_steps=total_steps,
+        log_interval=1,
+        checkpoint_interval=2,
+        eval_interval=2,
+        video_interval=2,
+        anneal_lr=True,
+        entropy_decay="cosine",
+    )
+    env = Mock(action_space=ppo.DiscreteSpace(n=2), params={})
+    env.reset.return_value = (jnp.zeros(1), {})  # observation: (O=1,)
+    model = Mock()
+    model.initial_carry.return_value = initial_carry(1, 1)  # leaves: (B=1, H=1)
+    model.init.return_value = {"params": {"weight": jnp.zeros(1)}}  # (1,)
+    writer = MagicMock()
+    indices: list[int] = []
+
+    def restore(manager: ppo.ocp.CheckpointManager, state: TrainState, config: ppo.Config) -> ppo.TrainingProgress:
+        return ppo.TrainingProgress(
+            train_state=state,
+            key=jax.random.key(3),  # () typed PRNG key
+            rollout_count=2,
+            episode_count=0,
+            episode_return_sum=0.0,
+            episode_length_sum=0,
+            env_steps=8,
+        )
+
+    def step(
+        runner: ppo.RolloutCarry,  # leaves: (B, ...)
+        state: TrainState,
+        env: ppo.PPOEnv,
+        config: ppo.Config,
+        key: jax.Array,  # ()
+        metrics: ppo.TrainingMetrics,  # scalar leaves
+        schedule_index: int,
+    ) -> ppo.TrainStepResult:
+        indices.append(schedule_index)
+        window = metrics.window._replace(
+            rollout_count=jnp.asarray(1),  # ()
+            minibatch_count=jnp.asarray(1),  # ()
+            update_count=jnp.asarray(1),  # ()
+        )  # scalar leaves
+        return ppo.TrainStepResult(
+            train_state=state.replace(step=state.step + 1),
+            rollout_carry=runner,  # leaves: (B, ...)
+            key=key,  # ()
+            metrics=metrics._replace(window=window),  # scalar leaves
+        )
+
+    with (
+        patch.object(ppo, "make_env", return_value=env),
+        patch.object(ppo, "ActorCritic", return_value=model),
+        patch.object(ppo, "checkpoint_manager"),
+        patch.object(ppo, "restore_checkpoint", side_effect=restore),
+        patch.object(ppo, "train_step_donated", side_effect=step),
+        patch.object(ppo, "MLflowLogger", return_value=writer),
+        patch.object(ppo, "save_checkpoint", return_value=0.1) as save,
+        patch.object(ppo, "log_video") as video,
+        patch.object(ppo, "log_evaluation") as evaluate,
+    ):
+        ppo.train(config)
+    assert indices == schedule_indices
+    logged = metric_history(writer)
+    assert logged["train/env_steps_total"] == [(step, step) for step in expected_steps]
+    assert logged["train/iterations_total"] == list(zip([3, 4], expected_steps, strict=True))
+    assert logged["train/progress_fraction"][-1] == (expected_steps[-1] / total_steps, expected_steps[-1])
+    assert logged["model/params_millions"][0][1] == 8
+    for name, schedule in (("learning_rate", ppo.learning_rate_schedule), ("entropy_coef", ppo.entropy_coef_schedule)):
+        np.testing.assert_allclose(
+            logged[f"train/{name}"],
+            [
+                (float(schedule(config)(index)), step)
+                for index, step in zip(schedule_indices, expected_steps, strict=True)
+            ],
+        )
+    save.assert_called_once()
+    progress = save.call_args.args[1]
+    assert progress.env_steps == expected_steps[-1]
+    assert progress.rollout_count == 4
+    assert [call.args[4] for call in video.call_args_list] == [expected_steps[-1]]
+    assert [call.args[4] for call in evaluate.call_args_list] == [expected_steps[-1]]
 
 
 @pytest.mark.parametrize("interval", [0, -1, 1.5, True])
@@ -428,8 +577,8 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         assert logged["train/iterations_per_second"] == [(1.0, 3), (1.0, 4)]
         assert logged["train/updates_per_second"] == [(1.0, 3), (1.0, 4)]
         assert logged["train/progress_fraction"] == [(0.75, 3), (1.0, 4)]
-        assert logged["train/return_mean"] == [(1.0, 3), (1.0, 4)]
-        assert logged["train/episode_length_steps_mean"] == [(1.0, 3), (1.0, 4)]
+        assert logged["train/return"] == [(1.0, 3), (1.0, 4)]
+        assert logged["train/episode_length_steps"] == [(1.0, 3), (1.0, 4)]
         assert [value for value, _ in logged["train/env_steps_per_second"]] == [1.0, 1.0]
         assert "train/elapsed_seconds" not in logged
         # An already completed run does not perform more updates or duplicate a save.
@@ -440,6 +589,7 @@ def test_train_checkpoints_at_iteration_intervals_and_resumes(config: ppo.Config
         assert checkpoint is not None
         checkpoint = checkpoint._replace(
             rollout_count=3,
+            env_steps=3,
             episode_count=2**31 - 1,
             episode_return_sum=float(2**24),
             episode_length_sum=2**31 - 1,
