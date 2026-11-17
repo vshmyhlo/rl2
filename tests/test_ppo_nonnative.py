@@ -20,8 +20,8 @@ from pydantic import TypeAdapter
 
 from rl2 import train_ppo_nonnative as ppo
 from rl2.actions import ContinuousSpace, TruncatedGaussianPolicy
-from rl2.envs import BaseNonnativeEnv, NonnativeStep
-from rl2.envs.gym_env import GymConfig, GymEnv, VisFlyConfig, action_space
+from rl2.envs import GymStyleEnv, GymStyleStep
+from rl2.envs.gym_env import GymConfig, GymEnv, VisFlyConfig
 from rl2.model.encoders.conv2d import ConvStage
 
 pytestmark = pytest.mark.usefixtures("ppo_mesh")
@@ -69,6 +69,7 @@ class VisFlyBatch:
         return {"state": self.state, "depth": self.depth}
 
     def step(self, actions: NDArray[np.float32]) -> tuple[Any, ...]:  # (B, 4)
+        assert isinstance(actions, np.ndarray)
         assert actions.shape == (self.num_envs, 4)
         assert np.all((actions >= -1) & (actions <= 1))
         self.steps += 1
@@ -103,10 +104,14 @@ class VisFlyBatch:
 @pytest.mark.parametrize("num_envs", [1, 2], ids=["single", "batched"])
 def test_gymnasium_autoreset_keeps_timeout_observation(num_envs: int) -> None:
     with closing(GymEnv(config=GymConfig(kwargs={"max_episode_steps": 1}), num_envs=num_envs, seed=3)) as env:
-        assert isinstance(env, BaseNonnativeEnv)
+        assert isinstance(env, GymStyleEnv)
         initial = env.reset()  # (B, 4)
-        result = env.step(jnp.zeros(num_envs, dtype=jnp.int32))
-        assert isinstance(result, NonnativeStep)
+        result = env.step(np.zeros(num_envs, dtype=np.int32))
+        assert isinstance(result, GymStyleStep)
+        assert isinstance(initial, np.ndarray)
+        assert all(isinstance(leaf, np.ndarray) for leaf in result)
+        assert result.rewards.dtype == np.float32
+        assert result.terminated.dtype == result.truncated.dtype == np.bool_
         assert initial.shape == result.observations.shape == result.final_observations.shape == (num_envs, 4)
         assert result.rewards.shape == result.truncated.shape == result.terminated.shape == (num_envs,)
         np.testing.assert_array_equal(result.truncated, True)
@@ -124,7 +129,8 @@ def test_visfly_factory_tensors_terminal_observations_and_cleanup() -> None:
         closing(GymEnv(config=settings, num_envs=4, seed=17)) as env,
     ):
         initial = env.reset()
-        result = env.step(jnp.zeros((4, 4)))
+        result = env.step(np.zeros((4, 4), dtype=np.float32))
+        assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves((initial, result)))
         assert result.observations["depth"].shape == (4, 4, 4, 1)
         assert result.final_observations["state"].shape == (4, 1)
         np.testing.assert_array_equal(result.terminated, [True, False, True, False])
@@ -160,17 +166,17 @@ def test_visfly_requires_timeout_final_observation() -> None:
     ):
         env.reset()
         with pytest.raises(ValueError, match="terminal_observation"):
-            env.step(jnp.zeros((4, 4)))
+            env.step(np.zeros((4, 4), dtype=np.float32))
 
 
 @pytest.mark.parametrize("space", [gym.spaces.MultiDiscrete([2, 3]), gym.spaces.Discrete(2, start=1)])
 def test_reject_unsupported_actions(space: gym.Space) -> None:
     with pytest.raises(ValueError):
-        action_space(space)
+        ppo.action_space(space)
 
 
 def test_scalar_continuous_actions() -> None:
-    space = action_space(gym.spaces.Box(-2.0, 3.0, shape=(), dtype=np.float32))
+    space = ppo.action_space(gym.spaces.Box(-2.0, 3.0, shape=(), dtype=np.float32))
     assert space == ContinuousSpace(shape=(), low=(-2.0,), high=(3.0,))
 
 
@@ -203,7 +209,7 @@ def test_rollout_bootstraps_timeout_with_final_observation_and_memory(config: pp
         closing(ppo.make_env(config)) as env,
     ):
         runner = ppo.RolloutCarry(
-            observations=env.reset(),
+            observations=jax.tree.map(jnp.asarray, env.reset()),
             model_carry=((jnp.zeros((4, 1)), jnp.zeros((4, 1))),),
             episode_starts=jnp.ones(4, dtype=bool),
             episode_returns=jnp.zeros(4),
@@ -212,6 +218,7 @@ def test_rollout_bootstraps_timeout_with_final_observation_and_memory(config: pp
         state = TrainState.create(apply_fn=value_policy, params={}, tx=optax.sgd(0.1))
         advanced, rollout = ppo.collect_rollout(runner, state, env, config, jax.random.key(9))
         batch = rollout.batch
+        assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves((advanced, batch)))
         assert batch.actions.shape == (4, 2, 4)
         assert batch.observations["depth"].shape == (4, 2, 4, 4, 1)
         assert batch.returns.shape == (4, 2)
@@ -228,8 +235,8 @@ def test_rollout_bootstraps_timeout_with_final_observation_and_memory(config: pp
 
 def test_real_gym_rollout_compiled_update_and_checkpoint(config: ppo.Config, tmp_path: Path) -> None:
     with closing(ppo.make_env(config)) as env:
-        observations = env.reset()  # (B, 3)
-        model = ppo.ActorCritic(action_space=env.action_space, model=config.model)
+        observations = jax.tree.map(jnp.asarray, env.reset())  # (B, 3)
+        model = ppo.ActorCritic(action_space=ppo.action_space(env.action_space), model=config.model)
         memory = model.initial_carry(2)  # leaves: (B, H)
         starts = jnp.ones(2, dtype=bool)  # (B,)
         state = TrainState.create(
@@ -341,8 +348,8 @@ def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:
 
 def test_train_orchestration_uses_host_env_and_closes_resources(config: ppo.Config) -> None:
     config = replace(config, total_steps=4, run_id="host-test")
-    env = Mock(action_space=ppo.DiscreteSpace(n=2))
-    env.reset.return_value = jnp.zeros((2, 3))  # (B, O)
+    env = Mock(action_space=gym.spaces.Discrete(2))
+    env.reset.return_value = np.zeros((2, 3), dtype=np.float32)  # (B, O)
     model = Mock()
     model.initial_carry.side_effect = lambda batch: ((jnp.zeros((batch, 1)), jnp.zeros((batch, 1))),)
     model.init.return_value = {"params": {"weight": jnp.ones(1)}}

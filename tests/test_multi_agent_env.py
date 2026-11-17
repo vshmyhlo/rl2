@@ -4,10 +4,10 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from rl2.envs import BaseMultiAgentEnv
 from rl2.envs.jaxnav_env import JaxNavConfig, JaxNavEnv
 from rl2.envs.lux_env import LuxConfig, LuxEnv
 from rl2.envs.mpe_env import MPEConfig, MPEEnv
+from rl2.envs.multi_agent import BaseMultiAgentEnv
 from rl2.envs.robotarium_env import RobotariumConfig, RobotariumEnv
 from rl2.envs.smax_env import SMAXConfig, SMAXEnv
 from rl2.envs.storm_env import STORMConfig, STORMEnv

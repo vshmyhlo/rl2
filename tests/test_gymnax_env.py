@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
-from rl2.envs import EnvStep
+from rl2.envs.base import EnvStep
 from rl2.envs.gymnax_env import GymnaxConfig, GymnaxEnv, render_observation
 
 

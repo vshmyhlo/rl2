@@ -81,8 +81,9 @@ Evaluation uses fixed seeds and logs raw episode return mean, sample standard
 deviation, and standard error as eval/return, eval/return_std, and
 eval/return_sem after each evaluation. eval/training_episodes_total is the lifetime
 completed training episode count at evaluation. Uncertainty metrics are omitted
-for a single episode. With eval_video=true, evaluation replays its highest-return episode with the same
-seed for recording, choosing the first on ties, independently of video_interval.
+for a single episode. With eval_video=true (default: false), evaluation replays its
+highest-return episode with the same seed, choosing the first on ties, independently
+of video_interval.
 The replay is excluded from score statistics and included in eval/evaluation_seconds.
 Standalone gameplay is disabled by default (video_interval=0); a positive
 video_interval enables recording at that iteration interval and on normal completion.
@@ -128,6 +129,7 @@ from typing import Annotated, Literal, NamedTuple, Self
 os.environ.setdefault("EPATH_USE_TF", "0")
 
 import chex
+import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -143,10 +145,18 @@ from numpy.typing import NDArray
 from pydantic import ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
 
-from rl2.actions import ActionSpace, BetaPolicy, CategoricalPolicy, DiscreteSpace, Policy, TruncatedGaussianPolicy
+from rl2.actions import (
+    ActionSpace,
+    BetaPolicy,
+    CategoricalPolicy,
+    ContinuousSpace,
+    DiscreteSpace,
+    Policy,
+    TruncatedGaussianPolicy,
+)
 from rl2.configuration import BaseConfig, load_config
 from rl2.envs.gym_env import EnvConfig, GymEnv, VisFlyConfig
-from rl2.envs.nonnative import BaseNonnativeEnv, Observation
+from rl2.envs.gym_style_env import GymStyleEnv
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.mlflow_logging import MLflowLogger
@@ -156,7 +166,8 @@ from rl2.running_stats import RunningSum
 from rl2.utils import explained_variance, gae
 
 type RecurrentCarry = LSTMStackCarry
-type PPOEnv = BaseNonnativeEnv
+type PPOEnv = GymStyleEnv
+type Observation = jax.Array | dict[str, Observation] | tuple[Observation, ...]
 
 
 @struct.dataclass
@@ -340,6 +351,20 @@ class Config(BaseConfig):
         if self.total_steps < self.num_envs * self.num_steps:
             raise ValueError("total_steps must cover at least one rollout")
         return self
+
+
+def action_space(space: gym.Space) -> ActionSpace:
+    if isinstance(space, gym.spaces.Discrete):
+        if space.start != 0:
+            raise ValueError("Discrete actions must start at zero")
+        return DiscreteSpace(n=int(space.n))
+    if isinstance(space, gym.spaces.Box) and np.issubdtype(space.dtype, np.floating):
+        return ContinuousSpace(
+            shape=space.shape,
+            low=tuple(float(x) for x in space.low.ravel()),
+            high=tuple(float(x) for x in space.high.ravel()),
+        )
+    raise ValueError("Supported action spaces are zero-based Discrete and bounded floating-point Box")
 
 
 def make_env(config: Config, *, seed: int | None = None, evaluation: bool = False, record: bool = False) -> PPOEnv:
@@ -660,7 +685,7 @@ def play_episode(
     memory = initial_carry  # leaves: (1, H)
     starts = jnp.ones(1, dtype=bool)  # (1,)
     with closing(make_env(config, seed=seed, evaluation=True, record=record)) as env:
-        observations = env.reset()  # leaves: (1, *O)
+        observations = jax.tree.map(jnp.asarray, env.reset())  # leaves: (1, *O)
         while True:
             if record and (config.video_max_frames is None or len(frames) < config.video_max_frames):
                 frames.append(env.render())
@@ -674,8 +699,8 @@ def play_episode(
             key, action_key = jax.random.split(key)  # each ()
             memory, policy, _ = policy_step(train_state.apply_fn, train_state.params, observations, memory, starts)
             actions, _ = sample_actions(policy, action_key)  # (1, *action_shape); (1,)
-            transition = env.step(actions)
-            observations = transition.observations  # leaves: (1, *O)
+            transition = env.step(np.asarray(jax.device_get(actions)))
+            observations = jax.tree.map(jnp.asarray, transition.observations)  # leaves: (1, *O)
             episode_return += float(transition.rewards[0])
             length += 1
             if bool((transition.terminated | transition.truncated)[0]):
@@ -872,17 +897,19 @@ def collect_rollout(
             train_state.apply_fn, train_state.params, current.observations, current.model_carry, current.episode_starts
         )  # memory: (B, H); policy: (B, A/D); predictions: (B,)
         actions, log_probs = sample_actions(policy, action_key)  # (B, *action_shape); (B,)
-        transition = envs.step(actions)
-        observations = transition.observations  # leaves: (B, *O)
-        raw_rewards = transition.rewards  # (B,)
-        episode_ends = transition.terminated | transition.truncated  # (B,)
-        timeout = transition.truncated & ~transition.terminated  # (B,)
+        transition = envs.step(np.asarray(jax.device_get(actions)))
+        observations = jax.tree.map(jnp.asarray, transition.observations)  # leaves: (B, *O)
+        raw_rewards, terminated, truncated = jax.tree.map(
+            jnp.asarray, (transition.rewards, transition.terminated, transition.truncated)
+        )  # each (B,)
+        episode_ends = terminated | truncated  # (B,)
+        timeout = truncated & ~terminated  # (B,)
         rewards = raw_rewards  # (B,)
         if bool(jnp.any(timeout)):
             values = policy_step(
                 train_state.apply_fn,
                 train_state.params,
-                transition.final_observations,
+                jax.tree.map(jnp.asarray, transition.final_observations),
                 memory,
                 jnp.zeros(config.num_envs, dtype=bool),
             ).values  # (B,)
@@ -1092,9 +1119,9 @@ def train(config: Config) -> TrainState:
         envs = resources.enter_context(closing(make_env(config)))
         manager = resources.enter_context(closing(checkpoint_manager(config.ckpt_dir)))
         key, init_key = jax.random.split(jax.random.key(config.seed))  # each () typed PRNG key
-        obs = envs.reset()  # leaves: (B, *O)
+        obs = jax.tree.map(jnp.asarray, envs.reset())  # leaves: (B, *O)
         model = ActorCritic(
-            action_space=envs.action_space,
+            action_space=action_space(envs.action_space),
             model=config.model,
             dtype=jnp.bfloat16 if config.bf16 else jnp.float32,
         )
