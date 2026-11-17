@@ -663,9 +663,28 @@ def policy_step(
     return apply_fn({"params": params}, observations, memory, starts, method="step")
 
 
-@jax.jit
-def sample_actions(policy: Policy, key: jax.Array) -> tuple[jax.Array, jax.Array]:  # key: ()
-    return policy.sample_and_log_prob(key=key)  # (B, *action_shape); (B,)
+class SampledPolicyStep(NamedTuple):
+    memory: RecurrentCarry  # leaves: (B, H)
+    actions: jax.Array  # (B, *action_shape)
+    log_probs: jax.Array  # (B,)
+    values: jax.Array  # (B,)
+    key: jax.Array  # () advanced typed PRNG key
+
+
+@partial(jax.jit, static_argnames=("apply_fn",))
+def sample_policy_step(
+    apply_fn: Callable[..., ActorCriticOutput],
+    params: optax.Params,
+    observations: Observation[jax.Array],  # leaves: (B, *O)
+    memory: RecurrentCarry,  # leaves: (B, H)
+    starts: jax.Array,  # (B,)
+    key: jax.Array,  # () typed PRNG key
+) -> SampledPolicyStep:
+    """Fuse inference, RNG advancement, and sampling before the host action readback."""
+    key, action_key = jax.random.split(key)  # each ()
+    memory, policy, values = policy_step(apply_fn, params, observations, memory, starts)
+    actions, log_probs = policy.sample_and_log_prob(key=action_key)  # (B, *action_shape); (B,)
+    return SampledPolicyStep(memory=memory, actions=actions, log_probs=log_probs, values=values, key=key)
 
 
 class EpisodeResult(NamedTuple):
@@ -702,11 +721,10 @@ def play_episode(
                 and len(frames) >= config.video_max_frames
             ):
                 break
-            key, action_key = jax.random.split(key)  # each ()
-            memory, policy, _ = policy_step(train_state.apply_fn, train_state.params, observations, memory, starts)
-            actions, _ = sample_actions(policy, action_key)  # (1, *action_shape); (1,)
-            transition = env.step(np.asarray(jax.device_get(actions)))
-            observations = jax.tree.map(jnp.asarray, transition.observations)  # leaves: (1, *O)
+            sampled = sample_policy_step(train_state.apply_fn, train_state.params, observations, memory, starts, key)
+            memory, key = sampled.memory, sampled.key  # leaves: (1, H); ()
+            transition = env.step(np.asarray(jax.device_get(sampled.actions)))
+            observations = jax.device_put(transition.observations)  # leaves: (1, *O)
             episode_return += float(transition.rewards[0])
             length += 1
             if bool((transition.terminated | transition.truncated)[0]):
@@ -864,6 +882,35 @@ def update(
     return train_state, metrics
 
 
+@jax.jit
+def advance_episode_metrics(
+    carry: RolloutCarry,  # observations: (B, *O); memory: (B, H)
+    raw_rewards: jax.Array,  # (B,)
+    episode_ends: jax.Array,  # (B,)
+    metrics: EpisodeMetrics,  # scalar leaves
+) -> tuple[RolloutCarry, EpisodeMetrics]:
+    """Accumulate raw episode statistics and reset finished episodes in one dispatch."""
+    episode_returns = carry.episode_returns + raw_rewards  # (B,)
+    episode_step_counts = carry.episode_step_counts + 1  # (B,)
+    metrics = RunningSum.update(
+        metrics,
+        jax.tree.map(
+            jnp.sum,
+            EpisodeMetrics(
+                episode_count=episode_ends,  # (B,)
+                episode_return_sum=jnp.where(episode_ends, episode_returns, 0.0),  # (B,)
+                episode_length_sum=jnp.where(episode_ends, episode_step_counts, 0),  # (B,)
+            ),
+        ),
+    )  # scalar leaves
+    carry = carry._replace(
+        episode_starts=episode_ends,  # (B,)
+        episode_returns=jnp.where(episode_ends, 0.0, episode_returns),  # (B,)
+        episode_step_counts=jnp.where(episode_ends, 0, episode_step_counts),  # (B,)
+    )
+    return carry, metrics
+
+
 def collect_rollout(
     rollout_carry: RolloutCarry,  # observations: (B, *O); memory: (B, H)
     train_state: TrainState,
@@ -877,11 +924,6 @@ def collect_rollout(
     Completed episode returns, lengths, and count are reduced to scalars on device.
     """
 
-    class Runner(NamedTuple):
-        current: RolloutCarry  # memory: (B, H)
-        key: jax.Array  # () typed PRNG key
-        episode_metrics: EpisodeMetrics  # scalar leaves
-
     class Transition(NamedTuple):
         """S is (B,) per step, (T, B) after scanning, then (B, T) in the batch."""
 
@@ -893,74 +935,57 @@ def collect_rollout(
         episode_ends: jax.Array  # (*S,)
         episode_starts: jax.Array  # (*S,)
 
-    def step(
-        runner: Runner,  # memory: (B, H); key/completed totals: ()
-        _: None,
-    ) -> tuple[Runner, Transition]:
-        current, key, episode_metrics = runner  # memory: (B, H); key/completed totals: ()
-        key, action_key = jax.random.split(key)  # each () typed PRNG key
-        memory, policy, predictions = policy_step(
-            train_state.apply_fn, train_state.params, current.observations, current.model_carry, current.episode_starts
-        )  # memory: (B, H); policy: (B, A/D); predictions: (B,)
-        actions, log_probs = sample_actions(policy, action_key)  # (B, *action_shape); (B,)
-        transition = envs.step(np.asarray(jax.device_get(actions)))
-        observations = jax.tree.map(jnp.asarray, transition.observations)  # leaves: (B, *O)
-        raw_rewards, terminated, truncated = jax.tree.map(
-            jnp.asarray, (transition.rewards, transition.terminated, transition.truncated)
-        )  # each (B,)
-        episode_ends = terminated | truncated  # (B,)
-        timeout = truncated & ~terminated  # (B,)
-        rewards = raw_rewards  # (B,)
-        if bool(jnp.any(timeout)):
-            values = policy_step(
-                train_state.apply_fn,
-                train_state.params,
-                jax.tree.map(jnp.asarray, transition.final_observations),
-                memory,
-                jnp.zeros(config.num_envs, dtype=bool),
-            ).values  # (B,)
-            rewards = rewards + config.gamma * jnp.where(timeout, values, 0.0)  # (B,)
-        episode_returns = current.episode_returns + raw_rewards  # (B,)
-        episode_step_counts = current.episode_step_counts + 1  # (B,)
-        episode_metrics = RunningSum.update(
-            episode_metrics,
-            jax.tree.map(
-                jnp.sum,
-                EpisodeMetrics(
-                    episode_count=episode_ends,  # (B,)
-                    episode_return_sum=jnp.where(episode_ends, episode_returns, 0.0),  # (B,)
-                    episode_length_sum=jnp.where(episode_ends, episode_step_counts, 0),  # (B,)
-                ),
-            ),
-        )  # each ()
-        advanced = RolloutCarry(
-            observations=observations,  # (B, *O)
-            model_carry=memory,  # leaves: (B, H)
-            episode_starts=episode_ends,  # (B,)
-            episode_returns=jnp.where(episode_ends, 0.0, episode_returns),  # (B,)
-            episode_step_counts=jnp.where(episode_ends, 0, episode_step_counts),  # (B,)
-        )
-        return Runner(current=advanced, key=key, episode_metrics=episode_metrics), Transition(
-            observations=current.observations,  # (B, *O)
-            actions=actions,  # (B, *action_shape)
-            log_probs=log_probs,  # (B,)
-            values=predictions,  # (B,)
-            rewards=rewards,  # (B,)
-            episode_ends=episode_ends,  # (B,)
-            episode_starts=current.episode_starts,  # (B,)
-        )
-
     episode_metrics = EpisodeMetrics(
         episode_count=jnp.zeros((), dtype=int),  # ()
         episode_return_sum=jnp.zeros((), dtype=rollout_carry.episode_returns.dtype),  # ()
         episode_length_sum=jnp.zeros((), dtype=int),  # ()
     )
-    runner = Runner(current=rollout_carry, key=key, episode_metrics=episode_metrics)
+    advanced = rollout_carry
     transitions = []
     for _ in range(config.num_steps):
-        runner, transition = step(runner, None)
-        transitions.append(transition)
-    advanced, key, episode_metrics = runner
+        current = advanced
+        sampled = sample_policy_step(
+            train_state.apply_fn,
+            train_state.params,
+            current.observations,
+            current.model_carry,
+            current.episode_starts,
+            key,
+        )
+        key = sampled.key  # ()
+        transition = envs.step(np.asarray(jax.device_get(sampled.actions)))
+        # End flags originate on the host; checking them here avoids a device scalar readback.
+        timeout = transition.truncated & ~transition.terminated  # (B,)
+        observations, raw_rewards, episode_ends = jax.device_put(
+            (transition.observations, transition.rewards, transition.terminated | transition.truncated)
+        )  # observation leaves: (B, *O); rewards/ends: (B,)
+        rewards = raw_rewards  # (B,)
+        if np.any(timeout):
+            values = policy_step(
+                train_state.apply_fn,
+                train_state.params,
+                jax.device_put(transition.final_observations),
+                sampled.memory,
+                jnp.zeros(config.num_envs, dtype=bool),
+            ).values  # (B,)
+            rewards = rewards + config.gamma * jnp.where(jax.device_put(timeout), values, 0.0)  # (B,)
+        advanced, episode_metrics = advance_episode_metrics(
+            current._replace(observations=observations, model_carry=sampled.memory),
+            raw_rewards,
+            episode_ends,
+            episode_metrics,
+        )
+        transitions.append(
+            Transition(
+                observations=current.observations,  # (B, *O)
+                actions=sampled.actions,  # (B, *action_shape)
+                log_probs=sampled.log_probs,  # (B,)
+                values=sampled.values,  # (B,)
+                rewards=rewards,  # (B,)
+                episode_ends=episode_ends,  # (B,)
+                episode_starts=current.episode_starts,  # (B,)
+            )
+        )
     trajectory = jax.tree.map(lambda *leaves: jnp.stack(leaves), *transitions)  # leaves: (T, B, ...)
     next_value = policy_step(
         train_state.apply_fn, train_state.params, advanced.observations, advanced.model_carry, advanced.episode_starts

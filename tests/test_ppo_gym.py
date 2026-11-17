@@ -19,7 +19,7 @@ from numpy.typing import NDArray
 from pydantic import TypeAdapter
 
 from rl2 import train_ppo_gym as ppo
-from rl2.actions import ContinuousSpace, TruncatedGaussianPolicy
+from rl2.actions import CategoricalPolicy, ContinuousSpace, Policy, TruncatedGaussianPolicy
 from rl2.envs import GymStyleEnv, GymStyleStep
 from rl2.envs.gym_env import GymConfig, GymEnv
 from rl2.envs.visfly_env import RawVisFlyObservation, VisFlyConfig, VisFlyEnv
@@ -235,6 +235,48 @@ def value_policy(
     )
 
 
+@pytest.mark.parametrize("action_shape", [None, (), (4,)], ids=["discrete", "scalar", "vector"])
+def test_sample_policy_step_preserves_rng_and_outputs(action_shape: tuple[int, ...] | None) -> None:
+    policy: Policy
+    if action_shape is None:
+        policy = CategoricalPolicy(jnp.zeros((2, 3)))  # logits: (B, A)
+    else:
+        size = int(np.prod(action_shape))
+        policy = TruncatedGaussianPolicy(
+            mean=jnp.zeros((2, size)),  # (B, D)
+            log_std=jnp.zeros((2, size)),  # (B, D)
+            action_space=ContinuousSpace(shape=action_shape, low=(-1.0,) * size, high=(1.0,) * size),
+        )
+
+    def apply(
+        variables: dict[str, Any],
+        observations: jax.Array,  # (B, O)
+        memory: ppo.RecurrentCarry,  # leaves: (B, H)
+        starts: jax.Array,  # (B,)
+        *,
+        method: str,
+    ) -> ppo.ActorCriticOutput:
+        memory = jax.tree.map(lambda leaf: jnp.where(starts[:, None], 0, leaf) + 1, memory)  # leaves: (B, H)
+        return ppo.ActorCriticOutput(carry=memory, policy=policy, values=observations[:, 0])
+
+    observations = jnp.asarray([[2.0], [3.0]])  # (B, O)
+    memory = ((jnp.ones((2, 1)), jnp.ones((2, 1))),)  # leaves: (B, H)
+    starts = jnp.asarray([True, False])  # (B,)
+    key = jax.random.key(9)  # ()
+    next_key, action_key = jax.random.split(key)  # each ()
+    expected_actions, expected_log_probs = policy.sample_and_log_prob(key=action_key)  # (B, *A); (B,)
+    sampled = ppo.sample_policy_step(apply, {}, observations, memory, starts, key)
+    assert sampled.actions.shape == (2, *(action_shape or ()))
+    assert sampled.values.shape == sampled.log_probs.shape == (2,)
+    assert all(leaf.shape == (2, 1) for leaf in jax.tree.leaves(sampled.memory))
+    np.testing.assert_array_equal(jax.random.key_data(sampled.key), jax.random.key_data(next_key))
+    np.testing.assert_allclose(sampled.actions, expected_actions, atol=1e-6)
+    np.testing.assert_allclose(sampled.log_probs, expected_log_probs, atol=1e-6)
+    np.testing.assert_array_equal(sampled.values, [2, 3])
+    for leaf in jax.tree.leaves(sampled.memory):
+        np.testing.assert_array_equal(leaf, [[1], [2]])
+
+
 def test_rollout_bootstraps_timeout_with_final_observation_and_memory(config: ppo.Config) -> None:
     config = replace(config, env=VisFlyConfig(), num_envs=4)
     backend = VisFlyBatch()
@@ -250,7 +292,13 @@ def test_rollout_bootstraps_timeout_with_final_observation_and_memory(config: pp
             episode_step_counts=jnp.zeros(4, dtype=jnp.int32),
         )
         state = TrainState.create(apply_fn=value_policy, params={}, tx=optax.sgd(0.1))
-        advanced, rollout = ppo.collect_rollout(runner, state, env, config, jax.random.key(9))
+        key = jax.random.key(9)  # ()
+        # Catch implicit scalar readbacks on CPU too, where transfer guards are ineffective.
+        with (
+            jax.transfer_guard_device_to_host("disallow"),
+            patch.object(type(runner.episode_starts), "__bool__", side_effect=AssertionError("Device scalar readback")),
+        ):
+            advanced, rollout = ppo.collect_rollout(runner, state, env, config, key)
         batch = rollout.batch
         assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves((advanced, batch)))
         assert batch.actions.shape == (4, 2, 4)

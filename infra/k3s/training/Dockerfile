@@ -69,13 +69,16 @@ ENV UV_NO_SYNC=1 UV_ENV_FILE=/app/nvida.env PATH="/app/.venv/bin:${CUDA_HOME}/bi
 ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 RAY_DEDUP_LOGS=0
 
 FROM training AS visfly
-RUN apt-get update && apt-get install -y --no-install-recommends libassimp5 libzstd1 libgmp10 libmpfr6 \
+RUN apt-get update && apt-get install -y --no-install-recommends libassimp5 libzstd1 libgmp10 libmpfr6 patch \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=habitat-build /wheels /tmp/visfly-wheels
 RUN uv pip install --no-deps /tmp/visfly-wheels/*.whl \
     && uv pip install numpy-quaternion==2024.0.13 stable-baselines3==2.9.2 \
     && rm -rf /tmp/visfly-wheels
 COPY --from=visfly-assets /opt/VisFly /opt/VisFly
+COPY infra/k3s/training/visfly/scene_lifecycle.patch /tmp/scene_lifecycle.patch
+RUN patch --directory=/opt/VisFly --strip=1 < /tmp/scene_lifecycle.patch \
+    && rm /tmp/scene_lifecycle.patch
 # Remove unused example imports that load torchvision/Triton after TensorFlow.
 RUN sed -i '/^from \.\.utils\.tools\.train_encoder import model as encoder$/d' /opt/VisFly/envs/NavigationEnv.py \
     && sed -i '/^from torchvision import datasets, transforms$/d' /opt/VisFly/utils/dataloader.py

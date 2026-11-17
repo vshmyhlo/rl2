@@ -14,18 +14,20 @@ pytestmark = pytest.mark.skipif(os.environ.get("RL2_VISFLY_TESTS") != "1", reaso
 
 
 @pytest.mark.parametrize(
-    ("num_envs", "scenes"),
+    ("num_envs", "num_scenes", "scenes"),
     [
         pytest.param(
+            4,
             2,
             ("garage_empty/garage_empty_0.scene_instance.json", "v3_sc0_staging_08.scene_instance.json"),
-            id="batch",
+            id="shared_context_rotation",
         ),
-        pytest.param(1, ("v3_sc0_staging_08.scene_instance.json",), id="articulated-evaluation"),
+        pytest.param(1, 1, ("v3_sc0_staging_08.scene_instance.json",), id="articulated-evaluation"),
     ],
 )
-def test_rendered_reset_step_and_autoreset(num_envs: int, scenes: tuple[str, ...]) -> None:
+def test_rendered_reset_step_and_autoreset(num_envs: int, num_scenes: int, scenes: tuple[str, ...]) -> None:
     config = VisFlyConfig(
+        num_scenes=num_scenes,
         scene_rotation_env_steps=num_envs,
         kwargs={
             "device": "cpu",

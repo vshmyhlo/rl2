@@ -1,0 +1,37 @@
+--- a/utils/SceneManager.py
++++ b/utils/SceneManager.py
+@@ -831,11 +831,15 @@
+         indices = [indices] if not hasattr(indices, "__iter__") else indices
+         scene_paths = self._scene_loader.next(len(indices))
+
++        # The first simulator owns the GL context shared by later scenes.
++        # Release dependent resources before that context, then reload the batch.
++        for scene_id in reversed(indices):
++            if self.scenes[scene_id] is not None:
++                self.scenes[scene_id].close()
++                self.scenes[scene_id] = None
++
+         for scene_id in indices:
+             scene_path = scene_paths[scene_id]
+-            # if scene is not empty, close it and release resource.
+-            if self.scenes[scene_id] is not None:
+-                self.scenes[scene_id].close()
+             self.scenes[scene_id] = self._load_scene(scene_path)
+             self._scene_bounds[scene_id] = self.scenes[scene_id].get_active_scene_graph().get_root_node().cumulative_bb
+             # if self.is_find_path:
+@@ -1034,10 +1038,11 @@
+
+         return sensor_cfgs_list
+
+-    def close(self):
+-        for scene_id in range(self.num_scene):
+-            self.scenes[scene_id].close()
+-            # self.scenes[scene_id] = None
++    def close(self) -> None:
++        for scene_id in reversed(range(self.num_scene)):
++            if self.scenes[scene_id] is not None:
++                self.scenes[scene_id].close()
++                self.scenes[scene_id] = None
+
+     @property
+     def is_out_bounds(self):
