@@ -3,7 +3,7 @@
 from contextlib import ExitStack, closing
 from copy import deepcopy
 from dataclasses import field, replace
-from typing import Annotated, Any, Literal, NotRequired, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 import jax
 import numpy as np
@@ -27,15 +27,15 @@ class RawVisFlyObservation[Array](TypedDict):
 
     state: Array  # (*B, S): position, orientation, linear velocity, angular velocity
     target: Array  # (*B, 3): target position
-    depth: NotRequired[Array]  # (*B, 1, H, W), or (*B, H, W, 1) if channels_first=False; absent when visual=False
+    rgb: Array  # (*B, 3, H, W), or (*B, H, W, 3) if channels_first=False; uint8 pixels
 
 
-class VisFlyObservation(TypedDict):
-    """Owned NumPy NavigationEnv snapshots; *B is (B,) or () for terminal observations."""
+class VisFlyObservation[Array](TypedDict):
+    """Channels-last NavigationEnv fields; *B denotes batch/sequence dimensions or () for terminals."""
 
-    state: NDArray[Any]  # (*B, S): same ordering and dtype as RawVisFlyObservation
-    target: NDArray[Any]  # (*B, 3): target position
-    depth: NotRequired[NDArray[Any]]  # (*B, H, W, 1); absent when visual=False
+    state: Array  # (*B, S): same ordering and dtype as RawVisFlyObservation
+    target: Array  # (*B, 3): target position
+    rgb: Array  # (*B, H, W, 3): uint8 pixels
 
 
 def to_numpy(value: Any) -> NDArray[Any]:
@@ -46,35 +46,36 @@ def to_numpy(value: Any) -> NDArray[Any]:
 
 
 def convert_observation(
-    value: RawVisFlyObservation[Any],  # state: (*B, S), target: (*B, 3), depth: (*B, 1, H, W)
+    value: RawVisFlyObservation[Any],  # state: (*B, S), target: (*B, 3), rgb: (*B, 3, H, W)
     channels_first: bool,
-) -> VisFlyObservation:
-    """Return (*B, S) state, (*B, 3) target, and optional (*B, H, W, 1) depth.
+) -> VisFlyObservation[NDArray[Any]]:
+    """Return (*B, S) state, (*B, 3) target, and (*B, H, W, 3) RGB.
 
     Detach tensors, move them to CPU, and copy all leaves into NumPy snapshots.
-    Only depth changes layout: (*B, 1, H, W) -> (*B, H, W, 1). With
-    channels_first=False, input depth must already be channels-last.
+    Only RGB changes layout: (*B, 3, H, W) -> (*B, H, W, 3). With
+    channels_first=False, input RGB must already be channels-last.
     Values and dtypes are preserved; no normalization or clipping is applied.
     """
     # VisFly's TensorDict subclass is not a registered JAX pytree.
     snapshot = jax.tree.map(to_numpy, dict(value))  # leaves: (*B, *O)
-    result = VisFlyObservation(state=snapshot["state"], target=snapshot["target"])
-    if "depth" in snapshot:
-        depth = snapshot["depth"]  # (*B, 1, H, W) or (*B, H, W, 1)
-        result["depth"] = np.moveaxis(depth, -3, -1) if channels_first else depth  # (*B, H, W, 1)
-    return result
+    rgb = snapshot["rgb"]  # (*B, 3, H, W) or (*B, H, W, 3)
+    return VisFlyObservation(
+        state=snapshot["state"],  # (*B, S)
+        target=snapshot["target"],  # (*B, 3)
+        rgb=np.moveaxis(rgb, -3, -1) if channels_first else rgb,  # (*B, H, W, 3)
+    )
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class VisFlyConfig:
     id: Literal["VisFly"] = "VisFly"
-    entry_point: str = "VisFly.envs.NavigationEnv:NavigationEnv"  # Must implement RawVisFlyObservation.
+    entry_point: str = "rl2.envs.visfly.navigation:RGBNavigationEnv"  # Must implement RawVisFlyObservation.
     num_scenes: Annotated[int, Field(gt=0)] = 1
     kwargs: dict[str, Any] = field(default_factory=dict, hash=False)
-    channels_first: bool = True  # Backend depth is CHW; False accepts already-HWC depth.
+    channels_first: bool = True  # Backend RGB is CHW; False accepts already-HWC RGB.
 
 
-class VisFlyEnv(GymStyleEnv[VisFlyObservation]):
+class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
     """Own a VisFly autoresetting batch, seeded at construction."""
 
     def __init__(self, config: VisFlyConfig, num_envs: int, seed: int, *, evaluation: bool = False) -> None:
@@ -105,11 +106,11 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation]):
                 raise ValueError("VisFly environment count does not match num_envs")
             resources.pop_all()
 
-    def reset(self) -> VisFlyObservation:
-        """Return (B, S) state, (B, 3) target, and optional (B, H, W, 1) depth."""
+    def reset(self) -> VisFlyObservation[NDArray[Any]]:
+        """Return (B, S) state, (B, 3) target, and (B, H, W, 3) RGB."""
         return convert_observation(self.backend.reset(), self.config.channels_first)
 
-    def step(self, actions: NDArray[Any]) -> GymStyleStep[VisFlyObservation]:  # (B, *action_shape)
+    def step(self, actions: NDArray[Any]) -> GymStyleStep[VisFlyObservation[NDArray[Any]]]:  # (B, *action_shape)
         host_actions = np.array(actions, copy=True)  # (B, *action_shape)
         observations, rewards, done, infos = self.backend.step(host_actions)
         done = to_numpy(done).astype(bool)  # (B,)
@@ -120,7 +121,7 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation]):
         terminated = np.array(
             [done[i] and info.get("episode_done", not truncated[i]) for i, info in enumerate(infos)]
         )  # (B,)
-        observations = convert_observation(observations, self.config.channels_first)  # depth: (B, H, W, 1)
+        observations = convert_observation(observations, self.config.channels_first)  # rgb: (B, H, W, 3)
         final = jax.tree.map(to_numpy, observations)  # leaves: (B, *O)
         for index in np.flatnonzero(done):
             if truncated[index] and not terminated[index] and "terminal_observation" not in infos[index]:
@@ -128,14 +129,14 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation]):
             if "terminal_observation" in infos[index]:
                 terminal = convert_observation(
                     infos[index]["terminal_observation"], self.config.channels_first
-                )  # state: (S,), target: (3,), depth: (H, W, 1)
+                )  # state: (S,), target: (3,), rgb: (H, W, 3)
                 replace_observation(final, terminal, index=int(index))
         return GymStyleStep(
-            observations=observations,  # state: (B, S), target: (B, 3), depth: (B, H, W, 1)
+            observations=observations,  # state: (B, S), target: (B, 3), rgb: (B, H, W, 3)
             rewards=to_numpy(rewards).astype(np.float32, copy=False),  # (B,)
             terminated=to_numpy(terminated).astype(bool, copy=False),  # (B,)
             truncated=to_numpy(truncated).astype(bool, copy=False),  # (B,)
-            final_observations=final,  # state: (B, S), target: (B, 3), depth: (B, H, W, 1)
+            final_observations=final,  # state: (B, S), target: (B, 3), rgb: (B, H, W, 3)
         )
 
     def render(self) -> NDArray[np.uint8]:  # (B, H, W, 3)

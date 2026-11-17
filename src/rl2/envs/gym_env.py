@@ -16,9 +16,10 @@ from pydantic.dataclasses import dataclass
 from rl2.envs.gym_style_env import (
     GymStyleEnv,
     GymStyleStep,
-    Observation,
     replace_observation,
 )
+
+type GymObservation[Array] = Array | dict[str, GymObservation[Array]] | tuple[GymObservation[Array], ...]
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -28,7 +29,7 @@ class GymConfig:
     kwargs: dict[str, Any] = field(default_factory=dict, hash=False)
 
 
-class GymEnv(GymStyleEnv[Observation[NDArray[Any]]]):
+class GymEnv(GymStyleEnv[GymObservation[NDArray[Any]]]):
     """Own a Gymnasium vector environment."""
 
     def __init__(self, config: GymConfig, num_envs: int, seed: int, *, record: bool = False) -> None:
@@ -51,12 +52,12 @@ class GymEnv(GymStyleEnv[Observation[NDArray[Any]]]):
     def _instance(env: gym.Env) -> gym.Env:
         return env
 
-    def reset(self) -> Observation[NDArray[Any]]:
+    def reset(self) -> GymObservation[NDArray[Any]]:
         """Return (B, *O) initial observation leaves seeded on each reset."""
         observations, _ = self.backend.reset(seed=self.seed)  # leaves: (B, *O)
         return observations  # leaves: (B, *O)
 
-    def step(self, actions: NDArray[Any]) -> GymStyleStep[Observation[NDArray[Any]]]:  # (B, *action_shape)
+    def step(self, actions: NDArray[Any]) -> GymStyleStep[GymObservation[NDArray[Any]]]:  # (B, *action_shape)
         host_actions = np.array(actions, copy=True)  # (B, *action_shape)
         observations, rewards, terminated, truncated, infos = self.backend.step(host_actions)  # obs leaves: (B, *O)
         final = deepcopy(observations)  # leaves: (B, *O)

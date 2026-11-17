@@ -8,12 +8,10 @@ import jax
 import numpy as np
 from numpy.typing import NDArray
 
-type Observation[Array] = Array | dict[str, Observation[Array]] | tuple[Observation[Array], ...]
 
-
-def replace_observation[Obs](
-    batch: Obs,  # NumPy leaves: (B, *O)
-    observation: Obs,  # NumPy leaves: (*O,)
+def replace_observation[ObservationT](
+    batch: ObservationT,  # NumPy leaves: (B, *O)
+    observation: ObservationT,  # NumPy leaves: (*O,)
     *,
     index: int,
 ) -> None:
@@ -28,17 +26,17 @@ def replace_observation[Obs](
     jax.tree.map(replace_leaf, batch, observation)
 
 
-class GymStyleStep[Obs](NamedTuple):
+class GymStyleStep[ObservationT](NamedTuple):
     """Batched transition with same-step autoreset; both end flags may be true."""
 
-    observations: Obs  # NumPy leaves: (B, *O), autoreset observations at episode ends
+    observations: ObservationT  # NumPy leaves: (B, *O), autoreset observations at episode ends
     rewards: NDArray[np.float32]  # (B,) float32
     terminated: NDArray[np.bool_]  # (B,) bool
     truncated: NDArray[np.bool_]  # (B,) bool
-    final_observations: Obs  # NumPy leaves: (B, *O), before autoreset
+    final_observations: ObservationT  # NumPy leaves: (B, *O), before autoreset
 
 
-class GymStyleEnv[Obs](ABC):
+class GymStyleEnv[ObservationT](ABC):
     """Own simulator state and RNGs for B environments stepped on the host.
 
     O denotes each observation leaf's dimensions; image channels are last.
@@ -49,14 +47,14 @@ class GymStyleEnv[Obs](ABC):
     action_space: gym.Space
 
     @abstractmethod
-    def reset(self) -> Obs:
+    def reset(self) -> ObservationT:
         """Return (B, *O) initial observation leaves for all environments."""
 
     @abstractmethod
     def step(
         self,
         actions: NDArray[Any],  # (B,) integer IDs or (B, *action_shape) continuous actions
-    ) -> GymStyleStep[Obs]:
+    ) -> GymStyleStep[ObservationT]:
         """Return (B, *O) observation leaves and (B,) rewards and end flags."""
 
     @abstractmethod

@@ -27,23 +27,25 @@ def test_rendered_reset_step_and_autoreset(num_envs: int) -> None:
                     "kwargs": [{"position": {"mean": [1.0, 0.0, 1.5], "half": [0.0, 0.0, 0.0]}}],
                 }
             },
-            "sensor_kwargs": [{"sensor_type": "DEPTH", "uuid": "depth", "resolution": [16, 16]}],
+            "sensor_kwargs": [{"sensor_type": "COLOR", "uuid": "color", "resolution": [16, 16]}],
         }
     )
     with closing(VisFlyEnv(config=config, num_envs=num_envs, seed=1, evaluation=num_envs == 1)) as env:
         observation = env.reset()  # leaves: (B, *O)
         assert isinstance(observation, dict)
-        assert observation["depth"].shape == (num_envs, 16, 16, 1)
+        assert set(observation) == {"state", "target", "rgb"}
+        assert observation["rgb"].dtype == np.uint8
+        assert observation["rgb"].shape == (num_envs, 16, 16, 3)
         assert observation["state"].shape == (num_envs, 13)
         assert observation["target"].shape == (num_envs, 3)
-        depth = observation["depth"].copy()  # (B, H, W, 1)
+        rgb = observation["rgb"].copy()  # (B, H, W, 3)
         actions = np.zeros((num_envs, *env.action_space.shape), dtype=np.float32)  # (B, A)
         result = env.step(actions)
         assert result.rewards.shape == result.terminated.shape == result.truncated.shape == (num_envs,)
         assert result.truncated.all()
         assert not result.terminated.any()
-        assert result.final_observations["depth"].shape == depth.shape
-        assert result.observations["depth"].shape == depth.shape
-        np.testing.assert_array_equal(observation["depth"], depth)
-        assert (depth > 0).any()
+        assert result.final_observations["rgb"].shape == rgb.shape
+        assert result.observations["rgb"].shape == rgb.shape
+        np.testing.assert_array_equal(observation["rgb"], rgb)
+        assert (rgb > 0).any()
         assert env.step(actions).truncated.all()

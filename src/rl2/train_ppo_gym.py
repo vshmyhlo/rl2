@@ -123,7 +123,7 @@ from operator import itemgetter
 from pathlib import Path
 from statistics import fmean, stdev
 from time import monotonic
-from typing import Annotated, Literal, NamedTuple, Self
+from typing import Annotated, Any, Literal, NamedTuple, Self
 
 # Orbax's epath otherwise loads TensorFlow for gs:// paths when it is installed.
 # That native runtime can crash a later Triton import; use our gcsfs dependency.
@@ -157,9 +157,9 @@ from rl2.actions import (
     TruncatedGaussianPolicy,
 )
 from rl2.configuration import BaseConfig, load_config
-from rl2.envs.gym_env import GymConfig, GymEnv
-from rl2.envs.gym_style_env import GymStyleEnv, Observation
-from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv
+from rl2.envs.gym_env import GymConfig, GymEnv, GymObservation
+from rl2.envs.gym_style_env import GymStyleEnv
+from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv, VisFlyObservation
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.mlflow_logging import MLflowLogger
@@ -171,7 +171,8 @@ from rl2.utils import explained_variance, gae
 type EnvConfig = Annotated[GymConfig | VisFlyConfig, Field(discriminator="id")]
 
 type RecurrentCarry = LSTMStackCarry
-type PPOEnv = GymStyleEnv
+type Observation[Array] = GymObservation[Array] | VisFlyObservation[Array]
+type PPOEnv = GymStyleEnv[Observation[NDArray[Any]]]
 
 
 @struct.dataclass

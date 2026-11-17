@@ -66,10 +66,10 @@ class VisFlyBatch:
         self.steps = 0
         self.state = torch.zeros((num_envs, 13))  # (B, S)
         self.target = torch.zeros((num_envs, 3))  # (B, 3)
-        self.depth = torch.zeros((num_envs, 1, 4, 4))  # (B, C, H, W)
+        self.rgb = torch.zeros((num_envs, 3, 4, 4), dtype=torch.uint8)  # (B, C, H, W)
 
     def reset(self) -> RawVisFlyObservation[torch.Tensor]:
-        return RawVisFlyObservation(state=self.state, target=self.target, depth=self.depth)
+        return RawVisFlyObservation(state=self.state, target=self.target, rgb=self.rgb)
 
     def step(self, actions: NDArray[np.float32]) -> tuple[Any, ...]:  # (B, 4)
         assert isinstance(actions, np.ndarray)
@@ -77,7 +77,7 @@ class VisFlyBatch:
         assert np.all((actions >= -1) & (actions <= 1))
         self.steps += 1
         self.state[:] = -1
-        self.depth[:] = -1
+        self.rgb[:] = 255
         infos = []
         for index in range(self.num_envs):
             infos.append(
@@ -87,7 +87,7 @@ class VisFlyBatch:
                     "terminal_observation": {
                         "state": torch.full((13,), 10.0 * (index + 1)),  # (S,)
                         "target": self.target[index],  # (3,)
-                        "depth": torch.full((1, 4, 4), float(index + 1)),  # (C, H, W)
+                        "rgb": torch.full((3, 4, 4), index + 1, dtype=torch.uint8),  # (C, H, W)
                     },
                 }
             )
@@ -135,7 +135,7 @@ def test_visfly_factory_tensors_terminal_observations_and_cleanup() -> None:
         initial = env.reset()
         result = env.step(np.zeros((4, 4), dtype=np.float32))
         assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves((initial, result)))
-        assert result.observations["depth"].shape == (4, 4, 4, 1)
+        assert result.observations["rgb"].shape == (4, 4, 4, 3)
         assert result.final_observations["state"].shape == (4, 13)
         np.testing.assert_array_equal(result.terminated, [True, False, True, False])
         np.testing.assert_array_equal(result.truncated, [False, True, True, False])
@@ -254,7 +254,7 @@ def test_rollout_bootstraps_timeout_with_final_observation_and_memory(config: pp
         batch = rollout.batch
         assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves((advanced, batch)))
         assert batch.actions.shape == (4, 2, 4)
-        assert batch.observations["depth"].shape == (4, 2, 4, 4, 1)
+        assert batch.observations["rgb"].shape == (4, 2, 4, 4, 3)
         assert batch.returns.shape == (4, 2)
         # Bootstrap sees the terminal observation (20), and memory advanced twice (2).
         np.testing.assert_allclose(batch.returns[:3], [[1, 1], [13, 13], [3, 3]])
@@ -315,7 +315,7 @@ def test_mixed_image_vector_encoder_and_sequence_shapes(config: ppo.Config) -> N
         config.model, encoder=ppo.Conv2DEncoderConfig(stages=(ConvStage(channels=2, blocks=0),), embedding_size=4)
     )
     model = ppo.ActorCritic(action_space=ppo.DiscreteSpace(n=2), model=settings)
-    obs = {"depth": jnp.zeros((2, 2, 4, 4, 1)), "state": jnp.zeros((2, 2, 3))}  # (B, T, *O)
+    obs = {"rgb": jnp.full((2, 2, 4, 4, 3), 255, dtype=jnp.uint8), "state": jnp.zeros((2, 2, 3))}  # (B, T, *O)
     memory = model.initial_carry(2)  # leaves: (B, H)
     starts = jnp.zeros((2, 2), dtype=bool)  # (B, T)
     params = model.init(jax.random.key(1), obs, memory, starts)

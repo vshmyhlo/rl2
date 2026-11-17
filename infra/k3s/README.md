@@ -600,6 +600,10 @@ the example scenes. The image sets `PYTHONPATH` and `VISFLY_SCENE_PATH`:
 ./submit.py --visfly -- uv run python -m rl2.train_ppo_gym --config configs/ppo_gym/visfly.yaml
 ```
 
+The VisFly adapter uses RGB-only navigation observations: `state`, `target`, and
+`rgb` (uint8, channels-last). Configure one `COLOR` sensor with UUID `color`;
+the example uses 64×64 pixels. `visual` must remain enabled.
+
 The first simulator build is slow; its compiled dependencies are cached separately
 from training source edits. Scene downloads happen during the build, not at startup.
 

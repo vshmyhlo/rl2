@@ -23,42 +23,48 @@ from rl2.envs.visfly_env import RawVisFlyObservation, VisFlyConfig, VisFlyEnv, c
 def test_navigation_observation_layout_and_snapshots(batch_shape: tuple[int, ...], channels_first: bool) -> None:
     state = np.ones((*batch_shape, 13), dtype=np.float64)  # (*B, S)
     target = np.full((*batch_shape, 3), 9, dtype=np.float32)  # (*B, 3)
-    depth_shape = (*batch_shape, 1, 2, 3)
-    depth = np.arange(np.prod(depth_shape), dtype=np.float32).reshape(depth_shape)  # (*B, 1, H, W)
-    expected_depth = np.moveaxis(depth, -3, -1).copy()  # (*B, H, W, 1)
+    rgb_shape = (*batch_shape, 3, 2, 4)
+    rgb = np.arange(np.prod(rgb_shape), dtype=np.uint8).reshape(rgb_shape)  # (*B, 3, H, W)
+    expected_rgb = np.moveaxis(rgb, -3, -1).copy()  # (*B, H, W, 3)
     raw = RawVisFlyObservation(
         state=state,
         target=target,
-        depth=depth if channels_first else np.moveaxis(depth, -3, -1),
+        rgb=rgb if channels_first else np.moveaxis(rgb, -3, -1),
     )
     converted = convert_observation(raw, channels_first=channels_first)
-    assert set(converted) == {"state", "target", "depth"}
+    assert set(converted) == {"state", "target", "rgb"}
     assert converted["state"].shape == (*batch_shape, 13)
     assert converted["target"].shape == (*batch_shape, 3)
-    assert converted["depth"].shape == (*batch_shape, 2, 3, 1)
+    assert converted["rgb"].shape == (*batch_shape, 2, 4, 3)
     assert converted["state"].dtype == np.float64
-    assert converted["target"].dtype == converted["depth"].dtype == np.float32
+    assert converted["target"].dtype == np.float32
+    assert converted["rgb"].dtype == np.uint8
     state[:] = 0
     target[:] = 0
-    depth[:] = 0
+    rgb[:] = 0
     np.testing.assert_array_equal(converted["state"], 1)
     np.testing.assert_array_equal(converted["target"], 9)
-    np.testing.assert_array_equal(converted["depth"], expected_depth)
+    np.testing.assert_array_equal(converted["rgb"], expected_rgb)
 
 
-def test_nonvisual_tensor_observations_are_detached_snapshots() -> None:
+def test_tensor_observations_are_detached_snapshots() -> None:
     state = torch.ones((2, 12), requires_grad=True)  # (B, S): Euler orientation
     target = torch.full((2, 3), 9.0, requires_grad=True)  # (B, 3)
-    snapshot = convert_observation(RawVisFlyObservation(state=state, target=target), channels_first=True)
-    assert set(snapshot) == {"state", "target"}
+    rgb = torch.full((2, 3, 2, 4), 255, dtype=torch.uint8)  # (B, 3, H, W)
+    snapshot = convert_observation(RawVisFlyObservation(state=state, target=target, rgb=rgb), channels_first=True)
+    assert set(snapshot) == {"state", "target", "rgb"}
+    assert snapshot["rgb"].shape == (2, 2, 4, 3)
+    assert snapshot["rgb"].dtype == np.uint8
     assert snapshot["state"].shape == (2, 12)
     assert snapshot["target"].shape == (2, 3)
     assert snapshot["state"].dtype == snapshot["target"].dtype == np.float32
     with torch.no_grad():
         state.zero_()
         target.zero_()
+        rgb.zero_()
     np.testing.assert_array_equal(snapshot["state"], 1)
     np.testing.assert_array_equal(snapshot["target"], 9)
+    np.testing.assert_array_equal(snapshot["rgb"], 255)
 
 
 def test_visfly_dict_subclass_observations() -> None:
@@ -69,7 +75,7 @@ def test_visfly_dict_subclass_observations() -> None:
     observation = TensorDict(
         state=state,  # (B, S)
         target=torch.zeros((2, 3)),  # (B, 3)
-        depth=torch.zeros((2, 1, 2, 3)),  # (B, 1, H, W)
+        rgb=torch.zeros((2, 3, 2, 4), dtype=torch.uint8),  # (B, 3, H, W)
     )
     backend = Mock(num_envs=2, action_space=gym.spaces.Box(low=-1, high=1, shape=(4,)))
     backend.reset.return_value = observation
@@ -83,7 +89,7 @@ def test_visfly_dict_subclass_observations() -> None:
                 "terminal_observation": TensorDict(
                     state=torch.full((13,), 2.0),  # (S,)
                     target=torch.full((3,), 9.0),  # (3,)
-                    depth=torch.arange(6, dtype=torch.float32).reshape(1, 2, 3),  # (1, H, W)
+                    rgb=torch.arange(24, dtype=torch.uint8).reshape(3, 2, 4),  # (3, H, W)
                 ),
             },
             {},
@@ -101,10 +107,12 @@ def test_visfly_dict_subclass_observations() -> None:
         np.testing.assert_array_equal(result.final_observations["state"][0], 2)
         np.testing.assert_array_equal(result.final_observations["state"][1], 1)
         np.testing.assert_array_equal(result.final_observations["target"], [[9, 9, 9], [0, 0, 0]])
-        assert initial["depth"].shape == result.final_observations["depth"].shape == (2, 2, 3, 1)
-        np.testing.assert_array_equal(result.final_observations["depth"][0, ..., 0], np.arange(6).reshape(2, 3))
-        np.testing.assert_array_equal(result.final_observations["depth"][1], 0)
-        np.testing.assert_array_equal(result.observations["depth"], 0)
+        assert initial["rgb"].shape == result.final_observations["rgb"].shape == (2, 2, 4, 3)
+        np.testing.assert_array_equal(
+            result.final_observations["rgb"][0], np.moveaxis(np.arange(24).reshape(3, 2, 4), 0, -1)
+        )
+        np.testing.assert_array_equal(result.final_observations["rgb"][1], 0)
+        np.testing.assert_array_equal(result.observations["rgb"], 0)
         state.zero_()
         np.testing.assert_array_equal(initial["state"], 1)
         np.testing.assert_array_equal(result.observations["state"], 1)

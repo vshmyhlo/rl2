@@ -83,7 +83,7 @@ ENV PYTHONPATH=/opt VISFLY_SCENE_PATH=/opt/VisFly/datasets/visfly-beta/configs/s
 # Use TensorBoard's no-TensorFlow mode for PyTorch logging. Loading TensorFlow
 # before Triton introduces conflicting native compiler libraries.
 RUN touch /app/.venv/lib/python3.12/site-packages/tensorboard/compat/notf.py
-RUN python -X faulthandler -c "from rl2 import train_ppo_gym; from VisFly.envs.NavigationEnv import NavigationEnv; import habitat_sim; assert hasattr(habitat_sim.Simulator, 'get_closest_collision_point')"
+RUN python -X faulthandler -c "from rl2 import train_ppo_gym; from rl2.envs.visfly.navigation import RGBNavigationEnv; import habitat_sim; assert hasattr(habitat_sim.Simulator, 'get_closest_collision_point')"
 
 # Keep the standard image as the default build target.
 FROM training AS default
