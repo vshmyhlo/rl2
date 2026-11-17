@@ -29,6 +29,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--cpus", type=int, choices=range(1, 11), default=10, metavar="1..10")
     parser.add_argument("--memory-gib", type=int, choices=range(1, 65), default=32, metavar="1..64")
     parser.add_argument("--extra", choices=("bfcl",), help="Include an optional dependency group in the image")
+    parser.add_argument("--visfly", action="store_true", help="Build VisFly, headless Habitat-Sim, and example scenes")
     parser.add_argument(
         "--python-sandbox", action="store_true", help="Allow this job to manage offline Python sandbox pods"
     )
@@ -134,6 +135,7 @@ def submit(args: argparse.Namespace) -> list[str]:
                 {
                     "command": args.command,
                     "extra": args.extra,
+                    "visfly": args.visfly,
                     "gpus": args.gpus,
                     "python_sandbox": args.python_sandbox,
                     "sweep": sweep.name if sweep else None,
@@ -196,6 +198,7 @@ def submit_jobs(args: argparse.Namespace, manifests: list[dict[str, Any]], image
             f"dockerfile={ROOT}",
             "--opt",
             "filename=infra/k3s/training/Dockerfile",
+            *(["--opt", "target=visfly"] if args.visfly else []),
             *(["--opt", f"build-arg:UV_EXTRA={args.extra}"] if args.extra else []),
             "--output",
             f"type=image,name={image},unpack=true,compression=zstd,compression-level=1,oci-mediatypes=true",

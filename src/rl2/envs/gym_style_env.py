@@ -1,7 +1,6 @@
 """Shared interface for host-stepped, batched PPO environments."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
 from typing import Any, NamedTuple, cast
 
 import gymnasium as gym
@@ -9,31 +8,6 @@ import numpy as np
 from numpy.typing import NDArray
 
 type Observation[Array] = Array | dict[str, Observation[Array]] | tuple[Observation[Array], ...]
-
-
-def host_array(value: Any) -> NDArray[Any]:
-    """Return (*S,) owned host data from a NumPy-compatible value."""
-    return np.array(value, copy=True)  # (*S,)
-
-
-def host_observation(value: Any) -> Observation[NDArray[Any]]:
-    """Return (*S, *O) copied leaves before an environment reuses its buffers."""
-    if isinstance(value, Mapping):
-        return {key: host_observation(leaf) for key, leaf in value.items()}
-    if isinstance(value, tuple):
-        return tuple(host_observation(leaf) for leaf in value)
-    return host_array(value)  # (*S, *O)
-
-
-def convert_observation(value: Observation[NDArray[Any]], channels_first: bool) -> Observation[NDArray[Any]]:
-    """Return (B, *O) NumPy leaves, moving CHW images to HWC when requested."""
-    if isinstance(value, dict):
-        return {key: convert_observation(leaf, channels_first) for key, leaf in value.items()}
-    if isinstance(value, tuple):
-        return tuple(convert_observation(leaf, channels_first) for leaf in value)
-    if channels_first and value.ndim == 4:
-        return np.moveaxis(value, 1, -1)  # (B, H, W, C)
-    return value  # (B, *O)
 
 
 def replace_observation(

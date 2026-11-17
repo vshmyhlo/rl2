@@ -1,5 +1,25 @@
 # syntax=docker/dockerfile:1.19
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-bookworm AS habitat-build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build libegl1-mesa-dev libgl1-mesa-dev \
+    libcgal-dev libeigen3-dev libassimp-dev rapidjson-dev libzstd-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir setuptools==75.8.0 wheel==0.45.1 pybind11==2.13.6
+COPY infra/k3s/training/visfly/fetch_sources.py infra/k3s/training/visfly/sources.json /tmp/visfly/
+RUN python /tmp/visfly/fetch_sources.py /tmp/visfly/sources.json /opt
+WORKDIR /opt/habitat-sim
+RUN --mount=type=cache,target=/opt/habitat-sim/build \
+    python setup.py --headless --bullet --no-update-submodules --skip-install-magnum \
+    --build-type Release \
+    --cmake-args="-DUSE_SYSTEM_EIGEN=ON -DUSE_SYSTEM_ASSIMP=ON -DUSE_SYSTEM_OPENEXR=ON -DUSE_SYSTEM_RAPIDJSON=ON -DUSE_SYSTEM_ZSTD=ON -DUSE_SYSTEM_PYBIND11=ON -Dpybind11_DIR=/usr/local/lib/python3.12/site-packages/pybind11/share/cmake/pybind11" \
+    build_ext --parallel 3 bdist_wheel --dist-dir /wheels \
+    && pip wheel --no-deps --no-build-isolation build/deps/magnum-bindings/src/python -w /wheels
+
+FROM habitat-build AS visfly-assets
+RUN pip install --no-cache-dir huggingface-hub==1.33.0
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('LiFanxing/visfly-beta', repo_type='dataset', revision='04ad03b9a2a079891c0ae10fd99e3e1b35bc5824', local_dir='/opt/VisFly/datasets/visfly-beta', ignore_patterns=['.git*', '.vscode/*'])"
+
+FROM python:3.12-slim-bookworm AS training
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential git ffmpeg libegl1 libgl1 libopengl0 libglib2.0-0 libgomp1 libibverbs1 \
     && rm -rf /var/lib/apt/lists/*
@@ -43,3 +63,19 @@ COPY --exclude=data . .
 ENV UV_NO_SYNC=1 UV_ENV_FILE=/app/nvida.env PATH="/app/.venv/bin:${CUDA_HOME}/bin:$PATH"
 # Ray workers share the installed image environment, including optional extras.
 ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 RAY_DEDUP_LOGS=0
+
+FROM training AS visfly
+RUN apt-get update && apt-get install -y --no-install-recommends libassimp5 libzstd1 libgmp10 libmpfr6 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=habitat-build /wheels /tmp/visfly-wheels
+RUN uv pip install --no-deps /tmp/visfly-wheels/*.whl \
+    && uv pip install numpy-quaternion==2024.0.13 stable-baselines3==2.7.1 \
+    && rm -rf /tmp/visfly-wheels
+COPY --from=visfly-assets /opt/VisFly /opt/VisFly
+# Scene JSON contains paths relative to the parent of VisFly.
+RUN ln -s /opt/VisFly /app/VisFly
+ENV PYTHONPATH=/opt VISFLY_SCENE_PATH=/opt/VisFly/datasets/visfly-beta/configs/scenes/garage_simple_l_medium
+RUN python -c "from VisFly.envs.NavigationEnv import NavigationEnv; import habitat_sim; assert hasattr(habitat_sim.Simulator, 'get_closest_collision_point')"
+
+# Keep the standard image as the default build target.
+FROM training AS default

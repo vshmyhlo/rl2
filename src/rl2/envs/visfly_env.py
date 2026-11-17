@@ -16,7 +16,6 @@ from rl2.envs.gym_style_env import (
     GymStyleEnv,
     GymStyleStep,
     Observation,
-    convert_observation,
     replace_observation,
 )
 
@@ -35,6 +34,20 @@ def host_observation(value: Any) -> Observation[NDArray[Any]]:
     if isinstance(value, tuple):
         return tuple(host_observation(leaf) for leaf in value)
     return host_array(value)  # (*S, *O)
+
+
+def convert_observation(
+    value: Observation[NDArray[Any]],  # leaves: (B, *O)
+    channels_first: bool,
+) -> Observation[NDArray[Any]]:
+    """Return (B, *O) NumPy leaves, moving CHW images to HWC when requested."""
+    if isinstance(value, dict):
+        return {key: convert_observation(leaf, channels_first) for key, leaf in value.items()}
+    if isinstance(value, tuple):
+        return tuple(convert_observation(leaf, channels_first) for leaf in value)
+    if channels_first and value.ndim == 4:
+        return np.moveaxis(value, 1, -1)  # (B, H, W, C)
+    return value  # (B, *O)
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))

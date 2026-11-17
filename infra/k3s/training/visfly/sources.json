@@ -1,0 +1,52 @@
+[
+  {
+    "path": "habitat-sim",
+    "url": "https://codeload.github.com/Fanxing-LI/habitat-sim/tar.gz/2553be68c0b243d7dc19a9da80ee797b366f62d0",
+    "sha256": "7bf3533106507e5479c8f736ee3ee41904b28a3eb51db1d5c4e07f9ef5b0a000"
+  },
+  {
+    "path": "habitat-sim/src/deps/bullet3",
+    "url": "https://codeload.github.com/bulletphysics/bullet3/tar.gz/2c204c49e56ed15ec5fcfa71d199ab6d6570b3f5",
+    "sha256": "f7c486f10b9f645d0577249d02855e076e8368babaa3d31ced6095e7162baee9"
+  },
+  {
+    "path": "habitat-sim/src/deps/corrade",
+    "url": "https://codeload.github.com/mosra/corrade/tar.gz/295bbba1f49887da060465f88b8501965f6acd7d",
+    "sha256": "e923c6564dae5365fcc787dc676d4d5f4102ad2cae339f39739139118fc119f9"
+  },
+  {
+    "path": "habitat-sim/src/deps/magnum",
+    "url": "https://codeload.github.com/mosra/magnum/tar.gz/8538610fa27e1db37070eaabe34f1e4e41648bab",
+    "sha256": "0afcae7895a33441717436628185e7469966c00c89d145635dbe8cf13f9171ab"
+  },
+  {
+    "path": "habitat-sim/src/deps/magnum-bindings",
+    "url": "https://codeload.github.com/mosra/magnum-bindings/tar.gz/a775640b027b1b541bd682300c1fe69d7f816a61",
+    "sha256": "ae109e6ada55939d56261cd831583564de953b4c687f788266f64fd9f823e7dc"
+  },
+  {
+    "path": "habitat-sim/src/deps/magnum-integration",
+    "url": "https://codeload.github.com/mosra/magnum-integration/tar.gz/bf09698491f2061733dc263f375da1f02f41d8ec",
+    "sha256": "cd06ed5a240709400e3064413c73d02f0aeaf2c1dd186a6540481ac21cd1930e"
+  },
+  {
+    "path": "habitat-sim/src/deps/magnum-plugins",
+    "url": "https://codeload.github.com/mosra/magnum-plugins/tar.gz/4a6add209667a32061c535eba7f8aa908dd7fc81",
+    "sha256": "eb44c823c7a640846f8455920cf7bc2d448a350f296c01e88facb43274af1aa0"
+  },
+  {
+    "path": "habitat-sim/src/deps/recastnavigation",
+    "url": "https://codeload.github.com/erikwijmans/recastnavigation/tar.gz/8eef00be6003a6bf9c49cb4c126662e05e58d508",
+    "sha256": "b237275985282fe9d38a184de37e06da57da475601cf1e853da203570ef3ada7"
+  },
+  {
+    "path": "habitat-sim/src/deps/tinyobjloader",
+    "url": "https://codeload.github.com/syoyo/tinyobjloader/tar.gz/e52dfdbecdf8893b161a65e508bc009746fa6042",
+    "sha256": "704dac8444b668206ce42dbef8299db12103ae30f934a651278c5a2531cbbda8"
+  },
+  {
+    "path": "VisFly",
+    "url": "https://codeload.github.com/SJTU-ViSYS-team/VisFly/tar.gz/6ff29bfcbc752da4f9474f6f0ece29d836111a22",
+    "sha256": "7bb3c9a393ce38988ee82af6049bf7b816463a032a90b65db914fb3b0ec85904"
+  }
+]

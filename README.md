@@ -66,15 +66,26 @@ Pgx 2048 using [train_ppo.py](src/rl2/train_ppo.py) with the
 VisFly environments in Python and compiles recurrent policy inference and PPO updates in JAX. It supports
 zero-based Discrete and bounded floating-point Box actions, plus Box/Dict/Tuple
 observations. `mlp` flattens observation leaves; `conv2d` encodes HWC image leaves
-with CNNs and combines them with vector features. Set `env.channels_first: true`
-for CHW inputs (the VisFly default).
+with CNNs and combines them with vector features. Gymnasium observations retain
+their original layout; image inputs to `conv2d` must be HWC. VisFly converts CHW
+images to HWC by default (`env.channels_first: true`).
 
 ```bash
 uv run python -m rl2.train_ppo_gym --config configs/ppo_gym.yaml
 ```
 
 The [VisFly preset](configs/ppo_gym/visfly.yaml) uses NavigationEnv with depth,
-state, and target observations. Install [VisFly's dependencies, modified Habitat-Sim,
+state, and target observations. On the local k3s cluster, build the simulator and
+bundle its example scenes with:
+
+```bash
+./submit.py --visfly -- uv run python -m rl2.train_ppo_gym --config configs/ppo_gym/visfly.yaml
+```
+
+The image supplies `VISFLY_SCENE_PATH` and saves checkpoints under `/runs/ppo_gym`.
+The first build compiles headless Habitat-Sim; subsequent builds reuse its cache.
+
+For a host installation, install [VisFly's dependencies, modified Habitat-Sim,
 and datasets](https://github.com/SJTU-ViSYS-team/VisFly#installation) in a Python
 environment compatible with this project's dependencies. VisFly is loaded through
 its configurable `env.entry_point`; it is not installed by `uv sync`. Put the parent

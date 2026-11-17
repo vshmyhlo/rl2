@@ -57,3 +57,4 @@ eval_interval: 100
 eval_episodes: 10
 eval_video: false
 run_id: ppo_gym_visfly_seed${seed}
+ckpt_dir: /runs/ppo_gym/${run_id}

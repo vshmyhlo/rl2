@@ -88,6 +88,16 @@ def test_python_sandbox_access_is_opt_in() -> None:
     assert any(call.args[0][-3:] == ["get", "runtimeclass", "runsc-no-network"] for call in calls[:build_index])
 
 
+def test_visfly_build_target() -> None:
+    args = submit.parse_args(["--visfly", "--", "python", "-m", "rl2.train_ppo_gym"])
+    with patch("subprocess.run") as run:
+        submit.submit(args)
+    build = next(call.args[0] for call in run.call_args_list if "buildctl" in call.args[0])
+    assert "target=visfly" in build
+    job = json.loads(run.call_args_list[-1].kwargs["input"])
+    assert job["spec"]["template"]["spec"]["containers"][0]["command"] == args.command
+
+
 @pytest.mark.parametrize(
     "argv",
     [

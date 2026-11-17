@@ -593,6 +593,16 @@ The non-secret `nvida.env` configuration is included in the image and loaded by
 put credentials in `nvida.env`; supply secrets at runtime. Resubmit after changing
 this file so the job uses a newly built image.
 
+For VisFly, add `--visfly` to build the pinned headless Habitat-Sim fork and bundle
+the example scenes. The image sets `PYTHONPATH` and `VISFLY_SCENE_PATH`:
+
+```bash
+./submit.py --visfly -- uv run python -m rl2.train_ppo_gym --config configs/ppo_gym/visfly.yaml
+```
+
+The first simulator build is slow; its compiled dependencies are cached separately
+from training source edits. Scene downloads happen during the build, not at startup.
+
 Defaults are `--prio low --gpus 1 --cpus 10 --memory-gib 32`. High priority moves ahead of
 waiting low-priority Jobs and preempts running low-priority Jobs when quota is
 full. Kueue suspends the low-priority Job and deletes its Pod, then readmits the
