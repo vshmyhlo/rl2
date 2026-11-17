@@ -122,15 +122,17 @@ class VisFlyEnv(GymStyleEnv):
             final_observations=convert_observation(final, self.config.channels_first),
         )
 
-    def render(self) -> NDArray[np.uint8]:
-        """Return (H, W, 3) RGB pixels for a single evaluation environment."""
-        frame = self.backend.render()  # (H, W, C) or (1, H, W, C)
-        frame = host_array(frame)  # (H, W, C) or (1, H, W, C)
-        if frame.ndim == 4 and frame.shape[0] == 1:
-            frame = frame[0]  # (H, W, C)
-        if frame.ndim != 3 or frame.shape[-1] not in (3, 4):
-            raise ValueError("Rendering requires an RGB array; configure VisFly render settings")
-        return frame[..., :3].astype(np.uint8)  # (H, W, 3)
+    def render(self) -> NDArray[np.uint8]:  # (B, H, W, 3)
+        """Return (B, H, W, 3) uint8 RGB pixels; agents share their scene's camera."""
+        frames = host_array(self.backend.render())  # (S, H, W, C) or (H, W, C); S: scenes
+        if frames.ndim == 3:
+            frames = frames[None]  # (1, H, W, C)
+        if frames.ndim != 4 or frames.shape[-1] not in (3, 4):
+            raise ValueError("Rendering requires RGB arrays; configure VisFly render settings")
+        if frames.shape[0] != self.config.num_scenes:
+            raise ValueError("VisFly rendering requires one RGB array per scene")
+        frames = frames[..., :3].astype(np.uint8)  # (S, H, W, 3)
+        return np.repeat(frames, self.num_envs // self.config.num_scenes, axis=0)  # (B, H, W, 3)
 
     def close(self) -> None:
         self.backend.close()

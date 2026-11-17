@@ -58,8 +58,9 @@ def config() -> ppo.Config:
 class VisFlyBatch:
     """VisFly's tensor-valued, four-result API with all end-flag combinations."""
 
-    def __init__(self, num_envs: int = 4) -> None:
+    def __init__(self, num_envs: int = 4, num_scenes: int = 1) -> None:
         self.num_envs = num_envs
+        self.num_scenes = num_scenes
         self.action_space = gym.spaces.Box(-1, 1, (4,), dtype=np.float32)
         self.closed = False
         self.steps = 0
@@ -96,7 +97,7 @@ class VisFlyBatch:
         )
 
     def render(self) -> list[NDArray[np.uint8]]:
-        return [np.full((4, 4, 4), self.steps, dtype=np.uint8)]  # one (H, W, RGBA) scene
+        return [np.full((4, 4, 4), self.steps, dtype=np.uint8) for _ in range(self.num_scenes)]  # each (H, W, RGBA)
 
     def close(self) -> None:
         self.closed = True
@@ -123,7 +124,7 @@ def test_gymnasium_autoreset_keeps_timeout_observation(num_envs: int) -> None:
 
 
 def test_visfly_factory_tensors_terminal_observations_and_cleanup() -> None:
-    backend = VisFlyBatch()
+    backend = VisFlyBatch(num_scenes=2)
     settings = VisFlyConfig(num_scenes=2, kwargs={"device": "cpu", "visual": True})
     with (
         patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)) as loader,
@@ -147,7 +148,7 @@ def test_visfly_factory_tensors_terminal_observations_and_cleanup() -> None:
             device="cpu",
             visual=True,
         )
-        assert env.render().shape == (4, 4, 3)
+        assert env.render().shape == (4, 4, 4, 3)
     assert backend.closed
 
 
@@ -330,6 +331,8 @@ def test_evaluation_uses_fresh_environment_and_closes_on_failure(config: ppo.Con
     with patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)):
         result = ppo.play_episode(state, config, jax.random.key(0), memory, record=True, stop_at_frame_limit=True)
         assert len(result.frames) == 1
+        assert result.frames[0].shape == (4, 4, 3)
+        assert result.frames[0].dtype == np.uint8
         assert result.length == 0
         assert backend.steps == 0
         assert backend.closed

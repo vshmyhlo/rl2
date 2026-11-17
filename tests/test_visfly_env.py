@@ -82,3 +82,49 @@ def test_visfly_count_mismatch_closes_backend() -> None:
     ):
         VisFlyEnv(config=VisFlyConfig(), num_envs=2, seed=0)
     backend.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("num_envs", "num_scenes", "unbatched"),
+    [
+        pytest.param(1, 1, True, id="single_image"),
+        pytest.param(1, 1, False, id="singleton_batch"),
+        pytest.param(4, 2, False, id="shared_scene_cameras"),
+    ],
+)
+def test_visfly_render_preserves_batch_and_scene_order(num_envs: int, num_scenes: int, unbatched: bool) -> None:
+    pixels = torch.arange(num_scenes * 2 * 3 * 4).reshape(num_scenes, 2, 3, 4)  # (S, H, W, RGBA)
+    backend = Mock(num_envs=num_envs, action_space=gym.spaces.Discrete(2))
+    backend.render.return_value = pixels[0] if unbatched else pixels
+    with (
+        patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
+        closing(VisFlyEnv(config=VisFlyConfig(num_scenes=num_scenes), num_envs=num_envs, seed=0)) as env,
+    ):
+        frames = env.render()  # (B, H, W, 3)
+        assert frames.shape == (num_envs, 2, 3, 3)
+        assert frames.dtype == np.uint8
+        for index in range(num_envs):
+            scene_index = index // (num_envs // num_scenes)
+            np.testing.assert_array_equal(frames[index], pixels[scene_index, ..., :3].numpy())
+        snapshot = frames.copy()  # (B, H, W, 3)
+        pixels.zero_()
+        np.testing.assert_array_equal(frames, snapshot)
+
+
+@pytest.mark.parametrize(
+    ("frame_shape", "message"),
+    [
+        pytest.param((2, 3), "requires RGB arrays", id="missing_channels"),
+        pytest.param((1, 2, 3, 2), "requires RGB arrays", id="invalid_channels"),
+        pytest.param((2, 2, 3, 3), "one RGB array per scene", id="scene_count_mismatch"),
+    ],
+)
+def test_visfly_render_rejects_invalid_images(frame_shape: tuple[int, ...], message: str) -> None:
+    backend = Mock(num_envs=1, action_space=gym.spaces.Discrete(2))
+    backend.render.return_value = np.zeros(frame_shape)
+    with (
+        patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
+        closing(VisFlyEnv(config=VisFlyConfig(), num_envs=1, seed=0)) as env,
+        pytest.raises(ValueError, match=message),
+    ):
+        env.render()

@@ -1,9 +1,10 @@
 """Shared interface for host-stepped, batched PPO environments."""
 
 from abc import ABC, abstractmethod
-from typing import Any, NamedTuple, cast
+from typing import Any, NamedTuple
 
 import gymnasium as gym
+import jax
 import numpy as np
 from numpy.typing import NDArray
 
@@ -17,16 +18,14 @@ def replace_observation(
     index: int,
 ) -> None:
     """Replace one batch entry in place, preserving dict and tuple structure."""
-    if isinstance(batch, dict):
-        observation = cast(dict[str, Observation[NDArray[Any]]], observation)
-        for key in batch:
-            replace_observation(batch[key], observation[key], index=index)
-    elif isinstance(batch, tuple):
-        observation = cast(tuple[Observation[NDArray[Any]], ...], observation)
-        for leaf, replacement in zip(batch, observation, strict=True):
-            replace_observation(leaf, replacement, index=index)
-    else:
-        batch[index] = cast(NDArray[Any], observation)
+
+    def replace_leaf(
+        leaf: NDArray[Any],  # (B, *O)
+        replacement: NDArray[Any],  # (*O,)
+    ) -> None:
+        leaf[index] = replacement
+
+    jax.tree.map(replace_leaf, batch, observation)
 
 
 class GymStyleStep(NamedTuple):
@@ -61,8 +60,8 @@ class GymStyleEnv(ABC):
         """Return (B, *O) observation leaves and (B,) rewards and end flags."""
 
     @abstractmethod
-    def render(self) -> NDArray[np.uint8]:  # (H, W, 3)
-        """Return (H, W, 3) uint8 RGB pixels for a single evaluation environment."""
+    def render(self) -> NDArray[np.uint8]:  # (B, H, W, 3)
+        """Return (B, H, W, 3) uint8 RGB pixels in environment order."""
 
     @abstractmethod
     def close(self) -> None:

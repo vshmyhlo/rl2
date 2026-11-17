@@ -12,7 +12,7 @@ RUN --mount=type=cache,target=/opt/habitat-sim/build \
     python setup.py --headless --bullet --no-update-submodules --skip-install-magnum \
     --build-type Release \
     --cmake-args="-DUSE_SYSTEM_EIGEN=ON -DUSE_SYSTEM_ASSIMP=ON -DUSE_SYSTEM_OPENEXR=ON -DUSE_SYSTEM_RAPIDJSON=ON -DUSE_SYSTEM_ZSTD=ON -DUSE_SYSTEM_PYBIND11=ON -Dpybind11_DIR=/usr/local/lib/python3.12/site-packages/pybind11/share/cmake/pybind11" \
-    build_ext --parallel 3 bdist_wheel --dist-dir /wheels \
+    build_ext --parallel 8 bdist_wheel --dist-dir /wheels \
     && pip wheel --no-deps --no-build-isolation build/deps/magnum-bindings/src/python -w /wheels
 
 FROM habitat-build AS visfly-assets

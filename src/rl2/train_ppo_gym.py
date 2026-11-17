@@ -692,7 +692,7 @@ def play_episode(
         observations = jax.tree.map(jnp.asarray, env.reset())  # leaves: (1, *O)
         while True:
             if record and (config.video_max_frames is None or len(frames) < config.video_max_frames):
-                frames.append(env.render())
+                frames.append(env.render()[0])  # (H, W, 3)
             if (
                 record
                 and stop_at_frame_limit

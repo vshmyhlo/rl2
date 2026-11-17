@@ -71,14 +71,17 @@ class GymEnv(GymStyleEnv):
             final_observations=final,  # leaves: (B, *O)
         )
 
-    def render(self) -> NDArray[np.uint8]:
-        """Return (H, W, 3) RGB pixels for a single evaluation environment."""
-        frame = self.backend.envs[0].render()  # (H, W, C) or (1, H, W, C)
-        if frame.ndim == 4 and frame.shape[0] == 1:
-            frame = frame[0]  # (H, W, C)
-        if frame.ndim != 3 or frame.shape[-1] not in (3, 4):
-            raise ValueError("Rendering requires an RGB array")
-        return frame[..., :3].astype(np.uint8)  # (H, W, 3)
+    def render(self) -> NDArray[np.uint8]:  # (B, H, W, 3)
+        """Return (B, H, W, 3) uint8 RGB pixels in environment order."""
+        frames = []  # each (H, W, 3)
+        for env in self.backend.envs:
+            frame = np.asarray(env.render())  # (H, W, C) or (1, H, W, C)
+            if frame.ndim == 4 and frame.shape[0] == 1:
+                frame = frame[0]  # (H, W, C)
+            if frame.ndim != 3 or frame.shape[-1] not in (3, 4):
+                raise ValueError("Rendering requires an RGB array per environment")
+            frames.append(frame[..., :3])
+        return np.stack(frames).astype(np.uint8)  # (B, H, W, 3)
 
     def close(self) -> None:
         self.backend.close()
