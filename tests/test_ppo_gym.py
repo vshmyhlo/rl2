@@ -362,20 +362,22 @@ def test_real_gym_rollout_compiled_update_and_checkpoint(config: ppo.Config, tmp
             assert int(restored.train_state.step) == 1
 
 
-@pytest.mark.parametrize("visfly", [False, True], ids=["generic", "visfly"])
-def test_mixed_image_vector_encoder_and_sequence_shapes(config: ppo.Config, visfly: bool) -> None:
+@pytest.mark.parametrize("encoder_type", ["mlp", "conv2d", "visfly"])
+def test_mixed_image_vector_encoder_and_sequence_shapes(config: ppo.Config, encoder_type: str) -> None:
     encoder = ppo.Conv2DEncoderConfig(stages=(ConvStage(channels=2, blocks=0),), embedding_size=4)
-    settings = replace(
-        config.model,
-        encoder=ppo.VisFlyEncoderConfig(
-            stages=encoder.stages, embedding_size=4, goal_scale=2, velocity_scale=4, angular_velocity_scale=8
+    settings = config.model
+    if encoder_type == "conv2d":
+        settings = replace(settings, encoder=encoder)
+    elif encoder_type == "visfly":
+        settings = replace(
+            settings,
+            encoder=ppo.VisFlyEncoderConfig(
+                stages=encoder.stages, embedding_size=4, goal_scale=2, velocity_scale=4, angular_velocity_scale=8
+            ),
         )
-        if visfly
-        else encoder,
-    )
     model = ppo.ActorCritic(action_space=ppo.DiscreteSpace(n=2), model=settings)
     obs = {"rgb": jnp.full((2, 2, 4, 4, 3), 255, dtype=jnp.uint8), "state": jnp.zeros((2, 2, 3))}  # (B, T, *O)
-    if visfly:
+    if encoder_type == "visfly":
         obs["state"] = jnp.tile(
             jnp.array([3, 4, 5, 1, 0, 0, 0, 4, 8, 12, 8, 16, 24], jnp.float32), (2, 2, 1)
         )  # (B, T, 13)
@@ -387,11 +389,13 @@ def test_mixed_image_vector_encoder_and_sequence_shapes(config: ppo.Config, visf
     assert output.values.shape == (2, 2)
     assert output.policy.logits.shape == (2, 2, 2)
     assert all(leaf.shape == (2, 4) for leaf in jax.tree.leaves(output.carry))
-    if visfly:
+    if encoder_type == "visfly":
         generic = ppo.ActorCritic(action_space=ppo.DiscreteSpace(n=2), model=replace(settings, encoder=encoder))
         prepared = {
             "rgb": obs["rgb"],  # (B, T, H, W, 3)
-            "state": jnp.tile(jnp.array([1, 0, 0, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3], jnp.float32), (2, 2, 1)),  # (B, T, 13)
+            "state": jnp.tile(
+                jnp.array([1, 0, 0, 0, 1, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3], jnp.float32), (2, 2, 1)
+            ),  # (B, T, 15)
         }
         expected = jax.jit(generic.apply)(params, prepared, memory, starts)
         np.testing.assert_allclose(jax.device_get(output.values), jax.device_get(expected.values), atol=1e-6)

@@ -31,17 +31,17 @@ def test_navigation_features_shapes_and_orientation(batch_shape: tuple[int, ...]
     target = np.broadcast_to(np.array([12, 24, 36], dtype=np.float32), (*batch_shape, 3))  # (*B, 3)
     features = jax.jit(partial(navigation_features, goal_scale=2.0, velocity_scale=4.0, angular_velocity_scale=8.0))(
         *jax.device_put((state, target))
-    )  # (*B, 13)
-    assert features.shape == (*batch_shape, 13)
+    )  # (*B, 15)
+    assert features.shape == (*batch_shape, 15)
     assert features.dtype == jnp.float32
     expected = np.concatenate(
         (
-            quaternion,
+            rotation.as_matrix()[:, :2].T.reshape(6),
             rotation.inv().apply([4, -2, 1]) / 4,
             np.array([1, -2, 3]) / 8,
             rotation.inv().apply([2, 4, 6]) / 2,
         )
-    )  # (13,)
+    )  # (15,)
     np.testing.assert_allclose(jax.device_get(features), np.broadcast_to(expected, features.shape), atol=2e-6)
 
 
@@ -53,20 +53,39 @@ def test_navigation_features_body_axes_and_translation_invariance() -> None:
     )  # (B, 13)
     target = np.tile(np.array([0, 20, 0], dtype=np.float32), (3, 1))  # (B, 3)
     preprocess = jax.jit(partial(navigation_features, goal_scale=10.0, velocity_scale=5.0, angular_velocity_scale=10.0))
-    features = jax.device_get(preprocess(*jax.device_put((state, target))))  # (B, 13)
-    np.testing.assert_allclose(features[:, 4:7], [[0, 1, 0], [1, 0, 0], [0, 0, -1]], atol=1e-6)
-    np.testing.assert_allclose(features[:, 7:10], np.tile([0, 0, 1], (3, 1)), atol=1e-6)
-    np.testing.assert_allclose(features[:, 10:], [[0, 2, 0], [2, 0, 0], [0, 0, -2]], atol=1e-6)  # No clipping.
+    features = jax.device_get(preprocess(*jax.device_put((state, target))))  # (B, 15)
+    np.testing.assert_allclose(features[:, 6:9], [[0, 1, 0], [1, 0, 0], [0, 0, -1]], atol=1e-6)
+    np.testing.assert_allclose(features[:, 9:12], np.tile([0, 0, 1], (3, 1)), atol=1e-6)
+    np.testing.assert_allclose(features[:, 12:], [[0, 2, 0], [2, 0, 0], [0, 0, -2]], atol=1e-6)  # No clipping.
     offset = np.array([100, -200, 300], dtype=np.float32)  # (3,)
     state[:, :3] += offset
     target += offset
-    translated = jax.device_get(preprocess(*jax.device_put((state, target))))  # (B, 13)
+    translated = jax.device_get(preprocess(*jax.device_put((state, target))))  # (B, 15)
     np.testing.assert_allclose(translated, features, atol=1e-6)
     state[:, 3:7] *= -1
-    sign_flipped = jax.device_get(preprocess(*jax.device_put((state, target))))  # (B, 13)
-    np.testing.assert_allclose(sign_flipped[:, 4:], features[:, 4:], atol=1e-6)
-    at_goal = jax.device_get(preprocess(*jax.device_put((state, state[:, :3]))))  # (B, 13)
-    np.testing.assert_array_equal(at_goal[:, 10:], 0)
+    sign_flipped = jax.device_get(preprocess(*jax.device_put((state, target))))  # (B, 15)
+    np.testing.assert_allclose(sign_flipped, features, atol=1e-6)
+    state[:, 3:7] *= 3
+    scaled = jax.device_get(preprocess(*jax.device_put((state, target))))  # (B, 15)
+    np.testing.assert_allclose(scaled, features, atol=1e-6)
+    at_goal = jax.device_get(preprocess(*jax.device_put((state, state[:, :3]))))  # (B, 15)
+    np.testing.assert_array_equal(at_goal[:, 12:], 0)
+
+
+def test_orientation_encoding_is_continuous_across_half_turn() -> None:
+    epsilon = 1e-4
+    w, z = np.sin(epsilon / 2), np.cos(epsilon / 2)
+    state = np.zeros((2, 13), dtype=np.float32)  # (B, S)
+    # Positive-w quaternions on either side of the yaw wrap are nearly antipodal.
+    state[:, 3:7] = [[w, 0, 0, z], [w, 0, 0, -z]]
+    target = np.zeros((2, 3), dtype=np.float32)  # (B, 3)
+    features = jax.device_get(
+        jax.jit(partial(navigation_features, goal_scale=10.0, velocity_scale=5.0, angular_velocity_scale=10.0))(
+            *jax.device_put((state, target))
+        )
+    )  # (B, 15)
+    np.testing.assert_allclose(features[0], features[1], atol=3 * epsilon, rtol=0)
+    np.testing.assert_allclose(features[:, :6], np.tile([-1, 0, 0, 0, -1, 0], (2, 1)), atol=2 * epsilon, rtol=0)
 
 
 @pytest.mark.parametrize(

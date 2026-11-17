@@ -126,7 +126,7 @@ from operator import itemgetter
 from pathlib import Path
 from statistics import fmean, stdev
 from time import monotonic
-from typing import Annotated, Any, Literal, NamedTuple, Self, cast
+from typing import Annotated, Any, Literal, NamedTuple, Self
 
 # Orbax's epath otherwise loads TensorFlow for gs:// paths when it is installed.
 # That native runtime can crash a later Triton import; use our gcsfs dependency.
@@ -166,9 +166,9 @@ from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv, VisFlyObservation
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.mlflow_logging import MLflowLogger
-from rl2.model.encoders.conv2d import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
-from rl2.model.encoders.mlp import MLPEncoder
-from rl2.model.encoders.visfly import navigation_features
+from rl2.model.encoders.conv2d import DEFAULT_STAGES, ConvStages
+from rl2.model.encoders.gym import GymConvEncoder, GymMLPEncoder
+from rl2.model.encoders.visfly import VisFlyEncoder
 from rl2.running_stats import RunningSum
 from rl2.utils import explained_variance, gae
 
@@ -540,49 +540,6 @@ class ActorCriticOutput(NamedTuple):
     values: jax.Array  # (*S,)
 
 
-class ObservationEncoder(nn.Module):
-    """Combine image and vector leaves from Box, Dict, or Tuple observations."""
-
-    config: EncoderConfig
-    dtype: jax.typing.DTypeLike | None = None
-
-    @nn.compact
-    def __call__(self, obs: Observation[jax.Array]) -> jax.Array:  # leaves: (B, *O) -> (B, E)
-        if isinstance(self.config, VisFlyEncoderConfig):
-            navigation = cast(VisFlyObservation[jax.Array], obs)
-            obs = {
-                "rgb": navigation["rgb"],  # (B, H, W, 3)
-                "state": navigation_features(
-                    navigation["state"],
-                    navigation["target"],
-                    goal_scale=self.config.goal_scale,
-                    velocity_scale=self.config.velocity_scale,
-                    angular_velocity_scale=self.config.angular_velocity_scale,
-                ),  # (B, 13)
-            }
-        features = []  # each (B, F)
-        for index, leaf in enumerate(jax.tree.leaves(obs)):
-            if self.config.type != "mlp" and leaf.ndim == 4:
-                feature = ConvObservationEncoder(
-                    channels_last=True,
-                    stages=self.config.stages,
-                    embedding_size=self.config.embedding_size,
-                    dtype=self.dtype,
-                    name=f"image_{index}",
-                )(leaf)  # (B, E)
-            else:
-                feature = leaf.reshape((leaf.shape[0], -1)).astype(jnp.float32)  # (B, F)
-                if leaf.dtype == jnp.uint8:
-                    feature = feature / 255.0  # (B, F)
-            features.append(feature)
-        combined = jnp.concatenate(features, axis=-1)  # (B, sum(F))
-        return MLPEncoder(
-            hidden_size=self.config.hidden_size if self.config.type == "mlp" else self.config.embedding_size,
-            embedding_size=self.config.embedding_size,
-            dtype=self.dtype,
-        )(combined)  # (B, E)
-
-
 class ActorCritic(nn.Module):
     """Shared observation encoder/LSTM with separate policy and value heads."""
 
@@ -606,7 +563,32 @@ class ActorCritic(nn.Module):
         return self._make_recurrent().initial_carry(num_envs)  # leaves: (B, H)
 
     def setup(self) -> None:
-        self.encoder = ObservationEncoder(config=self.model.encoder, dtype=self.dtype, name="encoder")
+        encoder = self.model.encoder
+        match encoder.type:
+            case "mlp":
+                self.encoder = GymMLPEncoder(
+                    hidden_size=encoder.hidden_size,
+                    embedding_size=encoder.embedding_size,
+                    dtype=self.dtype,
+                    name="encoder",
+                )
+            case "conv2d":
+                self.encoder = GymConvEncoder(
+                    stages=encoder.stages,
+                    embedding_size=encoder.embedding_size,
+                    dtype=self.dtype,
+                    name="encoder",
+                )
+            case "visfly":
+                self.encoder = VisFlyEncoder(
+                    stages=encoder.stages,
+                    embedding_size=encoder.embedding_size,
+                    goal_scale=encoder.goal_scale,
+                    velocity_scale=encoder.velocity_scale,
+                    angular_velocity_scale=encoder.angular_velocity_scale,
+                    dtype=self.dtype,
+                    name="encoder",
+                )
         self.recurrent = self._make_recurrent(parent=self)
         self.recurrent_input = nn.Dense(features=self.model.recurrent.hidden_size, dtype=self.dtype, name="lstm_input")
         init = nn.initializers.orthogonal(sqrt(2))

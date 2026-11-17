@@ -2,7 +2,7 @@ env:
   id: VisFly
   entry_point: rl2.envs.visfly.navigation:RGBNavigationEnv
   num_scenes: 8 # 4 agents per scene
-  scene_rotation_env_steps: 32768 # Reload after 1024 steps per agent; truncate ongoing episodes
+  scene_rotation_env_steps: 32000 # Reload after 1000 steps per agent (20 simulated seconds at 50 Hz); truncate ongoing episodes
   kwargs:
     device: cpu # VisFly tensors/dynamics; Habitat still renders on GPU alongside JAX
     visual: true
@@ -41,10 +41,10 @@ env:
       - sensor_type: COLOR
         uuid: color
         resolution: [64, 64]
-seed: 2
+seed: 4
 total_steps: 10000000
 num_envs: 32
-num_steps: 64
+num_steps: 100 # 2 simulated seconds per agent at 50 Hz
 num_minibatches: 4
 update_epochs: 1
 model:

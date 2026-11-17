@@ -76,8 +76,9 @@ uv run python -m rl2.train_ppo_gym --config configs/ppo_gym.yaml
 
 The [VisFly preset](configs/ppo_gym/visfly.yaml) uses NavigationEnv with RGB,
 state, and target observations. Its `visfly` encoder combines RGB features with
-unit quaternion orientation, body-frame linear/angular velocity, and a body-frame
-target displacement; absolute position is omitted. `model.encoder.goal_scale`,
+continuous 6D orientation (body x/y axes in world coordinates), body-frame
+linear/angular velocity, and a body-frame target displacement; absolute position
+is omitted. Quaternion sign does not affect the encoding. `model.encoder.goal_scale`,
 `velocity_scale`, and `angular_velocity_scale` divide these vectors by 10 m,
 5 m/s, and 10 rad/s by default, without clipping. Raw environment observations
 are preserved; preprocessing runs in JAX during inference and updates.
