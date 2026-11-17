@@ -8,48 +8,106 @@ import numpy as np
 import pytest
 import torch
 
-from rl2.envs.gym_style_env import replace_observation
-from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv, convert_observation, host_observation
+from rl2.envs.visfly_env import RawVisFlyObservation, VisFlyConfig, VisFlyEnv, convert_observation
 
 
-def test_nested_numpy_observations_preserve_layout_and_snapshots() -> None:
-    image = np.arange(24, dtype=np.uint8).reshape(2, 1, 3, 4)  # (B, C, H, W)
-    state = np.ones((2, 3), dtype=np.float64)  # (B, O)
-    initial = host_observation({"sensors": (image, {"state": state})})  # nested (B, *O) leaves
-    final = host_observation(initial)  # nested (B, *O) leaves
-    terminal = {"sensors": (np.full((1, 3, 4), 99, dtype=np.uint8), {"state": np.zeros(3)})}  # (*O,) leaves
-    replace_observation(final, terminal, index=1)
-    converted = convert_observation(final, channels_first=True)  # nested (B, *O) leaves
-    pixels, vectors = converted["sensors"]  # (B, H, W, C); {state: (B, O)}
-    assert pixels.shape == (2, 3, 4, 1)
-    assert pixels.dtype == np.uint8
-    assert vectors["state"].shape == (2, 3)
-    assert vectors["state"].dtype == np.float64
-    np.testing.assert_array_equal(pixels[0, ..., 0], image[0, 0])
-    np.testing.assert_array_equal(pixels[1], 99)
-    np.testing.assert_array_equal(vectors["state"], [[1, 1, 1], [0, 0, 0]])
-    image[:] = 0
+@pytest.mark.parametrize(
+    ("batch_shape", "channels_first"),
+    [
+        pytest.param((2,), True, id="batch"),
+        pytest.param((1,), True, id="singleton_batch"),
+        pytest.param((), True, id="terminal"),
+        pytest.param((2,), False, id="already_channels_last"),
+    ],
+)
+def test_navigation_observation_layout_and_snapshots(batch_shape: tuple[int, ...], channels_first: bool) -> None:
+    state = np.ones((*batch_shape, 13), dtype=np.float64)  # (*B, S)
+    target = np.full((*batch_shape, 3), 9, dtype=np.float32)  # (*B, 3)
+    depth_shape = (*batch_shape, 1, 2, 3)
+    depth = np.arange(np.prod(depth_shape), dtype=np.float32).reshape(depth_shape)  # (*B, 1, H, W)
+    expected_depth = np.moveaxis(depth, -3, -1).copy()  # (*B, H, W, 1)
+    raw = RawVisFlyObservation(
+        state=state,
+        target=target,
+        depth=depth if channels_first else np.moveaxis(depth, -3, -1),
+    )
+    converted = convert_observation(raw, channels_first=channels_first)
+    assert set(converted) == {"state", "target", "depth"}
+    assert converted["state"].shape == (*batch_shape, 13)
+    assert converted["target"].shape == (*batch_shape, 3)
+    assert converted["depth"].shape == (*batch_shape, 2, 3, 1)
+    assert converted["state"].dtype == np.float64
+    assert converted["target"].dtype == converted["depth"].dtype == np.float32
     state[:] = 0
-    np.testing.assert_array_equal(initial["sensors"][0], np.arange(24).reshape(2, 1, 3, 4))
-    np.testing.assert_array_equal(initial["sensors"][1]["state"], 1)
-    unchanged = convert_observation(initial, channels_first=False)  # nested (B, *O) leaves
-    assert unchanged["sensors"][0].shape == (2, 1, 3, 4)
+    target[:] = 0
+    depth[:] = 0
+    np.testing.assert_array_equal(converted["state"], 1)
+    np.testing.assert_array_equal(converted["target"], 9)
+    np.testing.assert_array_equal(converted["depth"], expected_depth)
 
 
-def test_nested_tensor_observations_are_detached_snapshots() -> None:
-    state = torch.ones((2, 3), requires_grad=True)  # (B, O)
-    image = np.zeros((2, 1, 3, 4), dtype=np.uint8)  # (B, C, H, W)
-    snapshot = host_observation({"sensors": (state, {"image": image})})  # leaves: (B, *O)
-    vectors, sensors = snapshot["sensors"]  # (B, O); {image: (B, C, H, W)}
-    assert vectors.shape == (2, 3)
-    assert vectors.dtype == np.float32
-    assert sensors["image"].shape == (2, 1, 3, 4)
-    assert sensors["image"].dtype == np.uint8
+def test_nonvisual_tensor_observations_are_detached_snapshots() -> None:
+    state = torch.ones((2, 12), requires_grad=True)  # (B, S): Euler orientation
+    target = torch.full((2, 3), 9.0, requires_grad=True)  # (B, 3)
+    snapshot = convert_observation(RawVisFlyObservation(state=state, target=target), channels_first=True)
+    assert set(snapshot) == {"state", "target"}
+    assert snapshot["state"].shape == (2, 12)
+    assert snapshot["target"].shape == (2, 3)
+    assert snapshot["state"].dtype == snapshot["target"].dtype == np.float32
     with torch.no_grad():
         state.zero_()
-    image[:] = 1
-    np.testing.assert_array_equal(vectors, 1)
-    np.testing.assert_array_equal(sensors["image"], 0)
+        target.zero_()
+    np.testing.assert_array_equal(snapshot["state"], 1)
+    np.testing.assert_array_equal(snapshot["target"], 9)
+
+
+def test_visfly_dict_subclass_observations() -> None:
+    class TensorDict(dict[str, torch.Tensor]):
+        """VisFly's container is not registered as a JAX pytree."""
+
+    state = torch.ones((2, 13))  # (B, S)
+    observation = TensorDict(
+        state=state,  # (B, S)
+        target=torch.zeros((2, 3)),  # (B, 3)
+        depth=torch.zeros((2, 1, 2, 3)),  # (B, 1, H, W)
+    )
+    backend = Mock(num_envs=2, action_space=gym.spaces.Box(low=-1, high=1, shape=(4,)))
+    backend.reset.return_value = observation
+    backend.step.return_value = (
+        observation,
+        torch.zeros(2),  # (B,)
+        torch.tensor([True, False]),  # (B,)
+        [
+            {
+                "TimeLimit.truncated": True,
+                "terminal_observation": TensorDict(
+                    state=torch.full((13,), 2.0),  # (S,)
+                    target=torch.full((3,), 9.0),  # (3,)
+                    depth=torch.arange(6, dtype=torch.float32).reshape(1, 2, 3),  # (1, H, W)
+                ),
+            },
+            {},
+        ],
+    )
+    with (
+        patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
+        closing(VisFlyEnv(config=VisFlyConfig(), num_envs=2, seed=0)) as env,
+    ):
+        initial = env.reset()  # leaves: (B, O)
+        assert isinstance(initial, dict)
+        assert initial["state"].shape == (2, 13)
+        result = env.step(np.zeros((2, 4), dtype=np.float32))
+        assert result.observations["state"].shape == (2, 13)
+        np.testing.assert_array_equal(result.final_observations["state"][0], 2)
+        np.testing.assert_array_equal(result.final_observations["state"][1], 1)
+        np.testing.assert_array_equal(result.final_observations["target"], [[9, 9, 9], [0, 0, 0]])
+        assert initial["depth"].shape == result.final_observations["depth"].shape == (2, 2, 3, 1)
+        np.testing.assert_array_equal(result.final_observations["depth"][0, ..., 0], np.arange(6).reshape(2, 3))
+        np.testing.assert_array_equal(result.final_observations["depth"][1], 0)
+        np.testing.assert_array_equal(result.observations["depth"], 0)
+        state.zero_()
+        np.testing.assert_array_equal(initial["state"], 1)
+        np.testing.assert_array_equal(result.observations["state"], 1)
 
 
 def test_invalid_scene_count_fails_before_loading_backend() -> None:

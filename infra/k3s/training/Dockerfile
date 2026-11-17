@@ -8,11 +8,13 @@ RUN pip install --no-cache-dir setuptools==75.8.0 wheel==0.45.1 pybind11==2.13.6
 COPY infra/k3s/training/visfly/fetch_sources.py infra/k3s/training/visfly/sources.json /tmp/visfly/
 RUN python /tmp/visfly/fetch_sources.py /tmp/visfly/sources.json /opt
 WORKDIR /opt/habitat-sim
-RUN --mount=type=cache,target=/opt/habitat-sim/build \
+# Pybind11 2.13 supplies NumPy 2 support; the fork retains an obsolete NumPy pin.
+RUN sed -i 's/numpy>=1.20.0,<1.24.0/numpy>=2,<3/' requirements.txt
+RUN --mount=type=cache,target=/opt/habitat-sim/build,sharing=locked \
     python setup.py --headless --bullet --no-update-submodules --skip-install-magnum \
     --build-type Release \
-    --cmake-args="-DUSE_SYSTEM_EIGEN=ON -DUSE_SYSTEM_ASSIMP=ON -DUSE_SYSTEM_OPENEXR=ON -DUSE_SYSTEM_RAPIDJSON=ON -DUSE_SYSTEM_ZSTD=ON -DUSE_SYSTEM_PYBIND11=ON -Dpybind11_DIR=/usr/local/lib/python3.12/site-packages/pybind11/share/cmake/pybind11" \
-    build_ext --parallel 8 bdist_wheel --dist-dir /wheels \
+    --cmake-args="-DUSE_SYSTEM_EIGEN=ON -DUSE_SYSTEM_ASSIMP=ON -DUSE_SYSTEM_OPENEXR=ON -DUSE_SYSTEM_RAPIDJSON=OFF -DUSE_SYSTEM_ZSTD=ON -DUSE_SYSTEM_PYBIND11=ON -Dpybind11_DIR=/usr/local/lib/python3.12/site-packages/pybind11/share/cmake/pybind11" \
+    build_ext --parallel 8 build_py bdist_wheel --skip-build --dist-dir /wheels \
     && pip wheel --no-deps --no-build-isolation build/deps/magnum-bindings/src/python -w /wheels
 
 FROM habitat-build AS visfly-assets
@@ -69,13 +71,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends libassimp5 libz
     && rm -rf /var/lib/apt/lists/*
 COPY --from=habitat-build /wheels /tmp/visfly-wheels
 RUN uv pip install --no-deps /tmp/visfly-wheels/*.whl \
-    && uv pip install numpy-quaternion==2024.0.13 stable-baselines3==2.7.1 \
+    && uv pip install numpy-quaternion==2024.0.13 stable-baselines3==2.9.2 \
     && rm -rf /tmp/visfly-wheels
 COPY --from=visfly-assets /opt/VisFly /opt/VisFly
+# Remove unused example imports that load torchvision/Triton after TensorFlow.
+RUN sed -i '/^from \.\.utils\.tools\.train_encoder import model as encoder$/d' /opt/VisFly/envs/NavigationEnv.py \
+    && sed -i '/^from torchvision import datasets, transforms$/d' /opt/VisFly/utils/dataloader.py
 # Scene JSON contains paths relative to the parent of VisFly.
 RUN ln -s /opt/VisFly /app/VisFly
 ENV PYTHONPATH=/opt VISFLY_SCENE_PATH=/opt/VisFly/datasets/visfly-beta/configs/scenes/garage_simple_l_medium
-RUN python -c "from VisFly.envs.NavigationEnv import NavigationEnv; import habitat_sim; assert hasattr(habitat_sim.Simulator, 'get_closest_collision_point')"
+# Use TensorBoard's no-TensorFlow mode for PyTorch logging. Loading TensorFlow
+# before Triton introduces conflicting native compiler libraries.
+RUN touch /app/.venv/lib/python3.12/site-packages/tensorboard/compat/notf.py
+RUN python -X faulthandler -c "from rl2 import train_ppo_gym; from VisFly.envs.NavigationEnv import NavigationEnv; import habitat_sim; assert hasattr(habitat_sim.Simulator, 'get_closest_collision_point')"
 
 # Keep the standard image as the default build target.
 FROM training AS default

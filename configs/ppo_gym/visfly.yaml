@@ -10,6 +10,11 @@ env:
     scene_kwargs:
       path: ${oc.env:VISFLY_SCENE_PATH}
       scene_type: json
+      render_settings:
+        sensor_type: color
+        mode: follow
+        view: near
+        resolution: [256, 256]
     dynamics_kwargs:
       action_type: bodyrate
       dt: 0.03
@@ -30,7 +35,7 @@ total_steps: 10000000
 num_envs: 32
 num_steps: 64
 num_minibatches: 4
-update_epochs: 4
+update_epochs: 1
 model:
   encoder:
     type: conv2d # Image CNNs combined with state/target vectors
@@ -52,9 +57,9 @@ target_kl: 0.02
 entropy_coef: 0.001
 max_grad_norm: 0.5
 video_fps: 30.0
-video_interval: 0 # Enable only after configuring scene_kwargs.render_settings
+video_interval: 0 # Record videos only during evaluation
 eval_interval: 100
 eval_episodes: 10
-eval_video: false
+eval_video: true
 run_id: ppo_gym_visfly_seed${seed}
 ckpt_dir: /runs/ppo_gym/${run_id}

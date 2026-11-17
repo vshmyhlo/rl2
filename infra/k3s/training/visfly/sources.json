@@ -35,6 +35,11 @@
     "sha256": "eb44c823c7a640846f8455920cf7bc2d448a350f296c01e88facb43274af1aa0"
   },
   {
+    "path": "habitat-sim/src/deps/rapidjson",
+    "url": "https://codeload.github.com/Tencent/rapidjson/tar.gz/73063f5002612c6bf64fe24f851cd5cc0d83eef9",
+    "sha256": "896eb817fb2bc62a0a84ca65fac3e3c385b410e6dbf70d69c411e25776663e39"
+  },
+  {
     "path": "habitat-sim/src/deps/recastnavigation",
     "url": "https://codeload.github.com/erikwijmans/recastnavigation/tar.gz/8eef00be6003a6bf9c49cb4c126662e05e58d508",
     "sha256": "b237275985282fe9d38a184de37e06da57da475601cf1e853da203570ef3ada7"

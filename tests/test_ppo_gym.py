@@ -22,7 +22,7 @@ from rl2 import train_ppo_gym as ppo
 from rl2.actions import ContinuousSpace, TruncatedGaussianPolicy
 from rl2.envs import GymStyleEnv, GymStyleStep
 from rl2.envs.gym_env import GymConfig, GymEnv
-from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv
+from rl2.envs.visfly_env import RawVisFlyObservation, VisFlyConfig, VisFlyEnv
 from rl2.model.encoders.conv2d import ConvStage
 
 pytestmark = pytest.mark.usefixtures("ppo_mesh")
@@ -64,11 +64,12 @@ class VisFlyBatch:
         self.action_space = gym.spaces.Box(-1, 1, (4,), dtype=np.float32)
         self.closed = False
         self.steps = 0
-        self.state = torch.zeros((num_envs, 1))  # (B, 1)
+        self.state = torch.zeros((num_envs, 13))  # (B, S)
+        self.target = torch.zeros((num_envs, 3))  # (B, 3)
         self.depth = torch.zeros((num_envs, 1, 4, 4))  # (B, C, H, W)
 
-    def reset(self) -> dict[str, torch.Tensor]:
-        return {"state": self.state, "depth": self.depth}
+    def reset(self) -> RawVisFlyObservation[torch.Tensor]:
+        return RawVisFlyObservation(state=self.state, target=self.target, depth=self.depth)
 
     def step(self, actions: NDArray[np.float32]) -> tuple[Any, ...]:  # (B, 4)
         assert isinstance(actions, np.ndarray)
@@ -84,7 +85,8 @@ class VisFlyBatch:
                     "episode_done": index in (0, 2),
                     "TimeLimit.truncated": index in (1, 2),
                     "terminal_observation": {
-                        "state": torch.tensor([10.0 * (index + 1)]),  # (1,)
+                        "state": torch.full((13,), 10.0 * (index + 1)),  # (S,)
+                        "target": self.target[index],  # (3,)
                         "depth": torch.full((1, 4, 4), float(index + 1)),  # (C, H, W)
                     },
                 }
@@ -134,7 +136,7 @@ def test_visfly_factory_tensors_terminal_observations_and_cleanup() -> None:
         result = env.step(np.zeros((4, 4), dtype=np.float32))
         assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves((initial, result)))
         assert result.observations["depth"].shape == (4, 4, 4, 1)
-        assert result.final_observations["state"].shape == (4, 1)
+        assert result.final_observations["state"].shape == (4, 13)
         np.testing.assert_array_equal(result.terminated, [True, False, True, False])
         np.testing.assert_array_equal(result.truncated, [False, True, True, False])
         np.testing.assert_array_equal(result.final_observations["state"][:, 0], [10, 20, 30, -1])

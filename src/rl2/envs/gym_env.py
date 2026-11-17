@@ -28,7 +28,7 @@ class GymConfig:
     kwargs: dict[str, Any] = field(default_factory=dict, hash=False)
 
 
-class GymEnv(GymStyleEnv):
+class GymEnv(GymStyleEnv[Observation[NDArray[Any]]]):
     """Own a Gymnasium vector environment."""
 
     def __init__(self, config: GymConfig, num_envs: int, seed: int, *, record: bool = False) -> None:
@@ -56,7 +56,7 @@ class GymEnv(GymStyleEnv):
         observations, _ = self.backend.reset(seed=self.seed)  # leaves: (B, *O)
         return observations  # leaves: (B, *O)
 
-    def step(self, actions: NDArray[Any]) -> GymStyleStep:  # (B, *action_shape)
+    def step(self, actions: NDArray[Any]) -> GymStyleStep[Observation[NDArray[Any]]]:  # (B, *action_shape)
         host_actions = np.array(actions, copy=True)  # (B, *action_shape)
         observations, rewards, terminated, truncated, infos = self.backend.step(host_actions)  # obs leaves: (B, *O)
         final = deepcopy(observations)  # leaves: (B, *O)

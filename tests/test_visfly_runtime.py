@@ -6,7 +6,8 @@ from contextlib import closing
 import numpy as np
 import pytest
 
-from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv
+# Exercise the trainer's native-library import order before constructing VisFly.
+from rl2.train_ppo_gym import VisFlyConfig, VisFlyEnv
 
 pytestmark = pytest.mark.skipif(os.environ.get("RL2_VISFLY_TESTS") != "1", reason="requires the VisFly GPU image")
 
