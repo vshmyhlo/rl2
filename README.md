@@ -74,6 +74,8 @@ Pgx 2048 using [ppo.py](src/rl2/ppo.py) with the
 | [minimax](https://github.com/facebookresearch/minimax) | **(jax env)** JAX-based unsupervised environment design baselines for automatic curricula, including PAIRED, Prioritized Level Replay, and ACCEL, with multi-device training support. |
 | [JaxUED](https://github.com/DramaCow/jaxued) | **(jax env)** Unsupervised environment design in JAX, with readable single-file implementations of domain randomization, Prioritized Level Replay, ACCEL, and PAIRED, plus reusable level-sampling utilities. |
 | [Brax](https://github.com/google/brax) | **(jax env)** JAX-based physics simulation and RL training, including PPO and SAC, with accelerator-parallel execution. Active development focuses on training, with support for MuJoCo Playground environments. |
+| [Crazyflow](https://github.com/learnsyslab/crazyflow) | **(jax env)** Single-drone continuous-control tasks for PPO. See [drone adapters](docs/drone_envs.md). |
+| [CrazyRL](https://github.com/ffelten/CrazyRL) | **(jax env)** Multi-drone tasks with continuous actions through the MAPPO/IPPO entry point. See [drone adapters](docs/drone_envs.md). |
 | [Gymnax](https://github.com/RobertTLange/gymnax) | **(jax env)** JAX RL environments spanning classic control, MinAtar, and meta-RL tasks, with vectorized rollouts. |
 | [MuJoCo Playground](https://github.com/google-deepmind/mujoco_playground) | **(jax env)** GPU-accelerated environments for robot learning and sim-to-real transfer. |
 | [Jumanji](https://github.com/instadeepai/jumanji) | **(jax env)** JAX RL environments for logic puzzles, packing, and routing problems. |

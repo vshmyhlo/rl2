@@ -14,7 +14,7 @@ class AgentObservation[Obs](NamedTuple):
     """N agents, per-leaf dimensions O, A categories, optional action components C."""
 
     observation: Obs  # leaves: (..., N, *O), native dtypes
-    actions_mask: jax.Array  # (..., N, *C, A) bool
+    actions_mask: jax.Array  # (..., N, *C, A) bool; (..., N, 0) for continuous actions
 
 
 class MultiAgentStep[State, Obs](NamedTuple):
@@ -38,12 +38,13 @@ class MultiAgentStep[State, Obs](NamedTuple):
 
 
 class BaseMultiAgentEnv[State, Obs](ABC):
-    """Explicit state and RNGs, discrete actions, and same-step environment autoreset.
+    """Explicit state and RNGs, native actions, and same-step environment autoreset.
 
     Agent dictionaries are packed in a fixed order; adapters document observation
     pytrees and any lossless action encoding. N denotes agents, O each leaf's dimensions,
     and A categories. C is empty for discrete actions or (D,) for multi-discrete
-    actions. Masks expose available commands for each action component.
+    actions. Continuous actions have shape (N, *action_shape) and empty (N, 0)
+    masks; discrete masks expose available commands for each action component.
     Reset and step support caller-applied jax.jit and jax.vmap.
     Adapters do not add JIT boundaries; rendering may run on the host.
     """
@@ -68,7 +69,7 @@ class BaseMultiAgentEnv[State, Obs](ABC):
         self,
         key: jax.Array,  # () typed PRNG key
         state: State,  # leaves: (...)
-        action: jax.Array,  # (N, *C) integer action IDs
+        action: jax.Array,  # (N, *C) integer IDs or (N, *action_shape) continuous controls
     ) -> MultiAgentStep[State, Obs]:
         """Advance and autoreset the environment when terminated or truncated."""
 

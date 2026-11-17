@@ -140,6 +140,7 @@ from rl2.configuration import BaseConfig, load_config
 from rl2.envs.base import BaseEnv
 from rl2.envs.brax_env import BraxConfig, BraxEnv
 from rl2.envs.craftax_env import CraftaxConfig, CraftaxEnv
+from rl2.envs.crazyflow_env import CrazyflowConfig, CrazyflowEnv
 from rl2.envs.foragax_env import ForagaxConfig, ForagaxEnv
 from rl2.envs.gymnax_env import GymnaxConfig, GymnaxEnv
 from rl2.envs.jaxtari_env import JAXtariConfig, JAXtariEnv
@@ -343,6 +344,7 @@ class Config(BaseConfig):
         | PlaygroundConfig
         | JAXtariConfig
         | BraxConfig
+        | CrazyflowConfig
         | ForagaxConfig
         | PgxConfig,
         Field(discriminator="id"),
@@ -383,15 +385,15 @@ class Config(BaseConfig):
         if isinstance(self.env, JAXtariConfig) and self.model.encoder.type != "conv2d":
             raise ValueError("JAXtari requires model.encoder.type: conv2d")
         symbolic_craftax = isinstance(self.env, CraftaxConfig) and "Symbolic" in self.env.env_id
-        if self.model.encoder.type == "mlp" and self.env.id not in ("MuJoCo-Playground", "Brax"):
-            raise ValueError("mlp encoder requires MuJoCo-Playground or Brax")
+        if self.model.encoder.type == "mlp" and self.env.id not in ("MuJoCo-Playground", "Brax", "Crazyflow"):
+            raise ValueError("mlp encoder requires MuJoCo-Playground, Brax or Crazyflow")
         if isinstance(self.env, CraftaxConfig):
             encoder = "craftax" if symbolic_craftax else "conv2d"
             if self.model.encoder.type != encoder:
                 raise ValueError(f"{self.env.env_id} requires model.encoder.type: {encoder}")
         if self.model.encoder.type == "craftax" and not symbolic_craftax:
             raise ValueError("craftax encoder requires symbolic Craftax")
-        if self.env.id in ("MuJoCo-Playground", "Brax") and self.model.encoder.type != "mlp":
+        if self.env.id in ("MuJoCo-Playground", "Brax", "Crazyflow") and self.model.encoder.type != "mlp":
             raise ValueError(f"{self.env.id} requires model.encoder.type: mlp")
         if self.model.encoder.type == "kinetix" and self.env.id != "Kinetix":
             raise ValueError("kinetix encoder requires env.id: Kinetix")
@@ -413,6 +415,8 @@ def make_env(config: Config) -> PPOEnv:
         return PgxEnv(config.env)
     if isinstance(config.env, ForagaxConfig):
         return ForagaxEnv(config.env)
+    if isinstance(config.env, CrazyflowConfig):
+        return CrazyflowEnv(config.env)
     if isinstance(config.env, BraxConfig):
         return BraxEnv(config.env)
     if isinstance(config.env, JAXtariConfig):

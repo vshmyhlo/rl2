@@ -2,6 +2,11 @@
 
 from collections.abc import Generator
 
+# Configure SciPy array API before JAX imports SciPy.
+import rl2  # noqa: F401
+
+# isort: split
+
 import jax
 import pytest
 from jax.sharding import AxisType, Mesh

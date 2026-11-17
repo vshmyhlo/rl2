@@ -1,0 +1,39 @@
+# Run: uv run mappo --config configs/mappo/crazyrl/catch.yaml
+# Parameter-sharing IPPO; continuous xyz commands and upstream scalar rewards.
+env:
+  id: CrazyRL
+  task: catch
+  initial_positions: [[-1.0, 0.0, 1.0], [1.0, 0.0, 1.0]]
+  max_steps: 200
+seed: 1
+total_iterations: 1000
+num_envs: 128
+num_steps: 128
+num_minibatches: 4
+update_epochs: 4
+model:
+  type: generic
+  encoder:
+    type: mlp
+    embedding_size: 64
+  recurrent:
+    hidden_size: 64
+dtype: float32
+learning_rate: 0.0003
+anneal_lr: true
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+target_kl: 0.01
+entropy_coef: 0.0
+value_coef: 1.0
+max_grad_norm: 0.5
+ckpt_dir: /runs/mappo/${run_id}
+run_id: mappo_crazyrl_${env.task}_seed${seed}
+log_interval: 10
+video_interval: 0
+video_max_frames: 201
+video_fps: 10
+checkpoint_interval: 100
+eval_interval: 200
+eval_episodes: 10

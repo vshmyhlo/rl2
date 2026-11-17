@@ -73,7 +73,7 @@ class ContinuousSpace:
 
 
 type ActionSpace = DiscreteSpace | ContinuousSpace
-type MultiAgentActionSpace = DiscreteSpace | HierarchicalMultiDiscreteSpace
+type MultiAgentActionSpace = DiscreteSpace | HierarchicalMultiDiscreteSpace | ContinuousSpace
 
 
 class Policy(ABC):

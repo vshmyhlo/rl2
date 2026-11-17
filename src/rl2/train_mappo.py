@@ -1,7 +1,9 @@
-"""Recurrent parameter-sharing IPPO for SMAX, JaxNav, MPE, STORM, JaxRobotarium, and Lux.
+"""Recurrent parameter-sharing IPPO for SMAX, JaxNav, MPE, STORM, JaxRobotarium, Lux, and CrazyRL.
 
 The actor and critic share a local observation encoder/LSTM with separate heads.
-Actions are masked during collection and updates. Agent death/inactivity resets
+Discrete actions are masked during collection and updates. Continuous actions use
+bounded truncated Gaussian policies with joint log probabilities and differential
+entropies summed over action coordinates; masks have shape (*S, 0). Agent death/inactivity resets
 memory without ending the reward stream or GAE trace. Environment completion ends
 traces; timeouts bootstrap from final local observations unless also terminated.
 Despite the historical MAPPO filename, the critic uses no centralized state.
@@ -39,8 +41,9 @@ Shape dimensions:
     S: Leading batch axes: (B,) per step, (T, B) during scans, (B, T) for training.
     O: Local observation features.
     A: Action categories per discrete component.
-    C: Action component shape; () for scalar actions or (D,) for D components.
-    D: Discrete action components per agent (e.g., ships controlled by a team in Lux).
+    C: Action component shape; () for discrete scalars, (D,) for D components,
+       or the native continuous action shape.
+    D: Action coordinates or discrete components per agent (e.g., ships controlled by a team in Lux).
     H: Recurrent hidden width (Lux: model.heads * model.head_dim; generic: model.recurrent.hidden_size).
     L: Raw policy logits per action component.
     K: Raw PRNG key words.
@@ -101,7 +104,8 @@ Window metrics:
     train/policy_loss: Mean clipped surrogate policy loss.
     train/value_loss: Half mean squared value error, before value_coef.
     train/total_loss: Policy loss + value_coef * value loss - entropy_coef * entropy.
-    train/entropy: Masked joint action entropy in nats, summed over components.
+    train/entropy: Joint action entropy in nats, summed over components;
+        differential entropy (possibly negative) for continuous actions.
     train/approx_kl: Mean exp(log_ratio) - 1 - log_ratio in nats versus rollout policy.
     train/ppo_clip_fraction: Fraction of action probability ratios outside PPO's clip range.
         These average over transitions, then evaluated minibatches, including
@@ -284,6 +288,7 @@ from rl2.actions import (
     Policy,
 )
 from rl2.configuration import BaseConfig, load_config
+from rl2.envs.crazyrl_env import CrazyRLConfig, CrazyRLEnv
 from rl2.envs.jaxnav_env import JaxNavConfig, JaxNavEnv
 from rl2.envs.lux_env import LuxConfig, LuxEnv, LuxObservation, LuxRenderTransition
 from rl2.envs.mpe_env import MPEConfig, MPEEnv
@@ -335,8 +340,8 @@ class PPOBatch:
 
     Attributes:
         observation: (*S, ...) local observation leaves.
-        actions_mask: (*S, *C, A) boolean legal-action flags.
-        action: (*S, *C) integer action IDs.
+        actions_mask: (*S, *C, A) boolean legal-action flags; (*S, 0) for continuous actions.
+        action: (*S, *C) integer IDs or continuous controls.
         old_log_prob: (*S,) rollout action log probabilities.
         value: (*S,) rollout-time value predictions for explained variance.
         advantage: (*S,) unnormalized advantage estimates.
@@ -347,7 +352,7 @@ class PPOBatch:
 
     observation: Observation  # leaves: (*S, ...)
     actions_mask: jax.Array  # (*S, *C, A) bool
-    action: jax.Array  # (*S, *C) integer action IDs
+    action: jax.Array  # (*S, *C) integer IDs or continuous controls
     old_log_prob: jax.Array  # (*S,)
     value: jax.Array  # (*S,)
     advantage: jax.Array  # (*S,)
@@ -456,7 +461,8 @@ class MapSizeStage:
 @dataclass(frozen=True)
 class Config(BaseConfig):
     env: Annotated[
-        SMAXConfig | JaxNavConfig | MPEConfig | STORMConfig | RobotariumConfig | LuxConfig, Field(discriminator="id")
+        SMAXConfig | JaxNavConfig | MPEConfig | STORMConfig | RobotariumConfig | LuxConfig | CrazyRLConfig,
+        Field(discriminator="id"),
     ]
     seed: int
     total_iterations: Annotated[int, Field(gt=0)]
@@ -549,6 +555,8 @@ def make_env(config: Config, *, evaluation: bool = False) -> PPOEnv:
         env = SMAXEnv(config.env)
     elif isinstance(config.env, JaxNavConfig):
         env = JaxNavEnv(config.env)
+    elif isinstance(config.env, CrazyRLConfig):
+        env = CrazyRLEnv(config.env)
     elif isinstance(config.env, MPEConfig):
         env = MPEEnv(config.env)
     elif isinstance(config.env, LuxConfig):

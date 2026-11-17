@@ -14,6 +14,8 @@ dependencies = [
     "chex>=0.1.90,<0.2",
     "craftax==1.6.1",
     "crafter==1.8.3",
+    "crazyflow==0.4.0",
+    "crazy-rl @ https://github.com/ffelten/CrazyRL/archive/7a991d0a15a90c6a7a81491d76afd4e7a5d080f8.tar.gz#sha256=afdd979917e182d4b2732fc37f998d1251ddc060614c312f3e628cf7aa68ca44",
     # Match the CUDA 13.0 runtime used by torch/vLLM, including JIT compilation.
     "cuda-toolkit[cccl,nvcc]==13.0.3.0; sys_platform == 'linux'",
     "cuda-python>=13.0.3,<13.1; sys_platform == 'linux'",
@@ -155,7 +157,19 @@ requires-dist = [
     "grain",
 ]
 
+# Use CrazyRL's JAX environments with the project's current Python/JAX stack.
+# Its upstream metadata also pins unused training scripts to Python <3.12/Torch 1.x.
+[[tool.uv.dependency-metadata]]
+name = "crazy-rl"
+version = "0.0.1"
+requires-python = ">=3.12"
+requires-dist = [
+    "jax", "jax-dataclasses>=1.6", "flax", "chex", "numpy", "gymnasium",
+    "pettingzoo", "pygame", "pyopengl", "cflib", "matplotlib", "typing-extensions",
+]
+
 [tool.uv.sources]
+crazyflow = { url = "https://github.com/learnsyslab/crazyflow/archive/d1291b0c94bad360f35ac775e069ff5e39db9b85.tar.gz" }
 luxai-s3 = { url = "https://github.com/Lux-AI-Challenge/Lux-Design-S3/archive/c6d1e665d12a467b299fb586b3f876e47847746b.tar.gz", subdirectory = "src" }
 jaxrobotarium = { url = "https://github.com/GT-STAR-Lab/JaxRobotarium/archive/6200711f6fb98015579af3e7a534bcfb8bcb69af.tar.gz" }
 robotarium-python-simulator = { url = "https://github.com/shalin-jain/robotarium_python_simulator/archive/117043719147e8ab04a6332ae4abe9ce8511a762.tar.gz" }
