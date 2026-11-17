@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import field, replace
 from typing import Annotated, Any, Literal, TypedDict
 
+import cv2
 import jax
 import numpy as np
 from gymnasium.envs.registration import load_env_creator
@@ -151,8 +152,11 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
             final_observations=final,  # state: (B, S), target: (B, 3), rgb: (B, H, W, 3)
         )
 
-    def render(self) -> NDArray[np.uint8]:  # (B, H, W, 3)
-        """Return (B, H, W, 3) uint8 RGB pixels; agents share their scene's camera."""
+    def render(self) -> NDArray[np.uint8]:  # (B, H, W_scene + W_agent, 3)
+        """Return (B, H, W_scene + W_agent, 3) uint8 scene/agent views, left/right.
+
+        Scale agent RGB to the scene height with nearest-neighbor sampling, preserving aspect ratio.
+        """
         frames = to_numpy(self.backend.render())  # (S, H, W, C) or (H, W, C); S: scenes
         if frames.ndim == 3:
             frames = frames[None]  # (1, H, W, C)
@@ -161,7 +165,16 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         if frames.shape[0] != self.config.num_scenes:
             raise ValueError("VisFly rendering requires one RGB array per scene")
         frames = frames[..., :3].astype(np.uint8)  # (S, H, W, 3)
-        return np.repeat(frames, self.num_envs // self.config.num_scenes, axis=0)  # (B, H, W, 3)
+        frames = np.repeat(frames, self.num_envs // self.config.num_scenes, axis=0)  # (B, H, W_scene, 3)
+        rgb = to_numpy(self.backend.get_observation()["rgb"])  # (B, 3, H_agent, W_agent) or (B, H_agent, W_agent, 3)
+        if self.config.channels_first:
+            rgb = np.moveaxis(rgb, 1, -1)  # (B, H_agent, W_agent, 3)
+        height = frames.shape[1]
+        width = max(1, round(rgb.shape[2] * height / rgb.shape[1]))
+        agent_frames = np.stack(
+            [cv2.resize(frame, (width, height), interpolation=cv2.INTER_NEAREST) for frame in rgb]
+        )  # (B, H, W_agent, 3)
+        return np.concatenate((frames, agent_frames), axis=2)  # (B, H, W_scene + W_agent, 3)
 
     def close(self) -> None:
         self.backend.close()

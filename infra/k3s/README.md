@@ -600,6 +600,15 @@ the example scenes. The image sets `PYTHONPATH` and `VISFLY_SCENE_PATH`:
 ./submit.py --visfly -- uv run python -m rl2.train_ppo_gym --config configs/ppo_gym/visfly.yaml
 ```
 
+The VisFly image sets `XLA_PYTHON_CLIENT_PREALLOCATE=true` and
+`XLA_CLIENT_MEM_FRACTION=0.50`, overriding the 90% default loaded from `nvida.env`.
+Keep VisFly tensors on CPU; Habitat rendering shares GPU memory with JAX.
+Tune the budget for peak PPO, scene rotation, and evaluation usage. To override it:
+
+```bash
+./submit.py --visfly -- env XLA_CLIENT_MEM_FRACTION=0.60 uv run python -m rl2.train_ppo_gym --config configs/ppo_gym/visfly.yaml
+```
+
 The VisFly adapter uses RGB-only navigation observations: `state`, `target`, and
 `rgb` (uint8, channels-last). Configure one `COLOR` sensor with UUID `color`;
 the example uses 64×64 pixels. `visual` must remain enabled.

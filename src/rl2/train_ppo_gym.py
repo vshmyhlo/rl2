@@ -1,6 +1,8 @@
 """Recurrent PPO for host-stepped, non-JAX-native Gym-style environments.
 
 Supports Gymnasium and VisFly through backend-specific GymStyleEnv subclasses.
+The visfly encoder preprocesses raw navigation state into scaled body-frame
+velocity and relative goals, retaining orientation and omitting absolute position.
 
 B denotes environments, T rollout steps, O observation leaf dimensions, A discrete
 actions, D continuous action size, and H recurrent width. Sequence arrays use
@@ -124,7 +126,7 @@ from operator import itemgetter
 from pathlib import Path
 from statistics import fmean, stdev
 from time import monotonic
-from typing import Annotated, Any, Literal, NamedTuple, Self
+from typing import Annotated, Any, Literal, NamedTuple, Self, cast
 
 # Orbax's epath otherwise loads TensorFlow for gs:// paths when it is installed.
 # That native runtime can crash a later Triton import; use our gcsfs dependency.
@@ -166,6 +168,7 @@ from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.mlflow_logging import MLflowLogger
 from rl2.model.encoders.conv2d import DEFAULT_STAGES, ConvObservationEncoder, ConvStages
 from rl2.model.encoders.mlp import MLPEncoder
+from rl2.model.encoders.visfly import navigation_features
 from rl2.running_stats import RunningSum
 from rl2.utils import explained_variance, gae
 
@@ -300,13 +303,27 @@ class Conv2DEncoderConfig:
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class VisFlyEncoderConfig:
+    """RGB convolutions fused with scaled body-frame navigation features."""
+
+    type: Literal["visfly"] = "visfly"
+    stages: Annotated[ConvStages, Field(min_length=1)] = DEFAULT_STAGES
+    embedding_size: Annotated[int, Field(gt=0, strict=True)] = 768
+    goal_scale: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 10.0  # Metres.
+    velocity_scale: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 5.0  # Metres/second.
+    angular_velocity_scale: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 10.0  # Radians/second.
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class MLPEncoderConfig:
     type: Literal["mlp"] = "mlp"
     hidden_size: Annotated[int, Field(gt=0, strict=True)] = 256
     embedding_size: Annotated[int, Field(gt=0, strict=True)] = 256
 
 
-type EncoderConfig = Annotated[Conv2DEncoderConfig | MLPEncoderConfig, Field(discriminator="type")]
+type EncoderConfig = Annotated[
+    Conv2DEncoderConfig | VisFlyEncoderConfig | MLPEncoderConfig, Field(discriminator="type")
+]
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -350,6 +367,8 @@ class Config(BaseConfig):
 
     @model_validator(mode="after")
     def validate_rollout(self) -> Self:
+        if self.model.encoder.type == "visfly" and self.env.id != "VisFly":
+            raise ValueError("The visfly encoder requires a VisFly environment")
         if self.num_envs % self.num_minibatches:
             raise ValueError("num_envs must be divisible by num_minibatches to preserve sequences")
         if self.total_steps < self.num_envs * self.num_steps:
@@ -529,9 +548,21 @@ class ObservationEncoder(nn.Module):
 
     @nn.compact
     def __call__(self, obs: Observation[jax.Array]) -> jax.Array:  # leaves: (B, *O) -> (B, E)
+        if isinstance(self.config, VisFlyEncoderConfig):
+            navigation = cast(VisFlyObservation[jax.Array], obs)
+            obs = {
+                "rgb": navigation["rgb"],  # (B, H, W, 3)
+                "state": navigation_features(
+                    navigation["state"],
+                    navigation["target"],
+                    goal_scale=self.config.goal_scale,
+                    velocity_scale=self.config.velocity_scale,
+                    angular_velocity_scale=self.config.angular_velocity_scale,
+                ),  # (B, 13)
+            }
         features = []  # each (B, F)
         for index, leaf in enumerate(jax.tree.leaves(obs)):
-            if self.config.type == "conv2d" and leaf.ndim == 4:
+            if self.config.type != "mlp" and leaf.ndim == 4:
                 feature = ConvObservationEncoder(
                     channels_last=True,
                     stages=self.config.stages,

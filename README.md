@@ -74,15 +74,21 @@ images to HWC by default (`env.channels_first: true`).
 uv run python -m rl2.train_ppo_gym --config configs/ppo_gym.yaml
 ```
 
-The [VisFly preset](configs/ppo_gym/visfly.yaml) uses NavigationEnv with depth,
-state, and target observations. On the local k3s cluster, build the simulator and
-bundle its example scenes with:
+The [VisFly preset](configs/ppo_gym/visfly.yaml) uses NavigationEnv with RGB,
+state, and target observations. Its `visfly` encoder combines RGB features with
+unit quaternion orientation, body-frame linear/angular velocity, and a body-frame
+target displacement; absolute position is omitted. `model.encoder.goal_scale`,
+`velocity_scale`, and `angular_velocity_scale` divide these vectors by 10 m,
+5 m/s, and 10 rad/s by default, without clipping. Raw environment observations
+are preserved; preprocessing runs in JAX during inference and updates.
+On the local k3s cluster, build the simulator and bundle its example scenes with:
 
 ```bash
 ./submit.py --visfly -- uv run python -m rl2.train_ppo_gym --config configs/ppo_gym/visfly.yaml
 ```
 
 The image supplies `VISFLY_SCENE_PATH` and saves checkpoints under `/runs/ppo_gym`.
+It defaults JAX's memory pool to 50% of GPU memory, leaving room for Habitat rendering.
 The first build compiles headless Habitat-Sim; subsequent builds reuse its cache.
 
 For a host installation, install [VisFly's dependencies, modified Habitat-Sim,
@@ -94,8 +100,14 @@ absolute scene directory, such as `VisFly/datasets/visfly-beta/configs/scenes/ga
 Run from the directory expected by the dataset's relative asset paths.
 
 ```bash
+XLA_PYTHON_CLIENT_PREALLOCATE=true XLA_CLIENT_MEM_FRACTION=0.50 \
 python -m rl2.train_ppo_gym --config /path/to/rl2/configs/ppo_gym/visfly.yaml
 ```
+
+Keep `env.kwargs.device: cpu` for the host observation path; Habitat still uses the GPU.
+Set the memory budget before starting Python, after sourcing any environment preset.
+Tune the fraction against peak usage during PPO updates, scene rotation, and evaluation;
+50% is a starting budget, not a measured requirement.
 
 `num_envs` counts agents across scenes and must divide evenly by `env.num_scenes`.
 Constructor options go in `env.kwargs`; scene/agent counts, seed, and

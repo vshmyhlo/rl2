@@ -198,30 +198,41 @@ def test_scene_rotation_truncates_ongoing_episodes_with_old_scene_observations()
 
 
 @pytest.mark.parametrize(
-    ("num_envs", "num_scenes", "unbatched"),
+    ("num_envs", "num_scenes", "unbatched", "channels_first"),
     [
-        pytest.param(1, 1, True, id="single_image"),
-        pytest.param(1, 1, False, id="singleton_batch"),
-        pytest.param(4, 2, False, id="shared_scene_cameras"),
+        pytest.param(1, 1, True, True, id="single_image"),
+        pytest.param(1, 1, False, False, id="singleton_batch_channels_last"),
+        pytest.param(4, 2, False, True, id="shared_scene_cameras"),
     ],
 )
-def test_visfly_render_preserves_batch_and_scene_order(num_envs: int, num_scenes: int, unbatched: bool) -> None:
+def test_visfly_render_preserves_batch_and_scene_order(
+    num_envs: int, num_scenes: int, unbatched: bool, channels_first: bool
+) -> None:
     pixels = torch.arange(num_scenes * 2 * 3 * 4).reshape(num_scenes, 2, 3, 4)  # (S, H, W, RGBA)
+    rgb = np.arange(num_envs * 1 * 2 * 3, dtype=np.uint8).reshape(num_envs, 1, 2, 3)  # (B, H_agent, W_agent, 3)
     backend = Mock(num_envs=num_envs, action_space=gym.spaces.Discrete(2))
     backend.render.return_value = pixels[0] if unbatched else pixels
+    backend.get_observation.return_value = {"rgb": np.moveaxis(rgb, -1, 1) if channels_first else rgb}
     with (
         patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
-        closing(VisFlyEnv(config=VisFlyConfig(num_scenes=num_scenes), num_envs=num_envs, seed=0)) as env,
+        closing(
+            VisFlyEnv(
+                config=VisFlyConfig(num_scenes=num_scenes, channels_first=channels_first), num_envs=num_envs, seed=0
+            )
+        ) as env,
     ):
         frames = env.render()  # (B, H, W, 3)
-        assert frames.shape == (num_envs, 2, 3, 3)
+        assert frames.shape == (num_envs, 2, 7, 3)
         assert frames.dtype == np.uint8
         for index in range(num_envs):
             scene_index = index // (num_envs // num_scenes)
-            np.testing.assert_array_equal(frames[index], pixels[scene_index, ..., :3].numpy())
+            np.testing.assert_array_equal(frames[index, :, :3], pixels[scene_index, ..., :3].numpy())
+        np.testing.assert_array_equal(frames[:, :, 3:], rgb.repeat(2, axis=1).repeat(2, axis=2))
         snapshot = frames.copy()  # (B, H, W, 3)
         pixels.zero_()
+        rgb[:] = 0
         np.testing.assert_array_equal(frames, snapshot)
+        np.testing.assert_array_equal(env.render(), 0)  # Read the latest sensor pixels on each render.
 
 
 @pytest.mark.parametrize(

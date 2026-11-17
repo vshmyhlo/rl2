@@ -3,6 +3,7 @@
 import json
 from contextlib import closing
 from dataclasses import asdict, replace
+from functools import partial
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, Mock, patch
@@ -68,8 +69,11 @@ class VisFlyBatch:
         self.target = torch.zeros((num_envs, 3))  # (B, 3)
         self.rgb = torch.zeros((num_envs, 3, 4, 4), dtype=torch.uint8)  # (B, C, H, W)
 
-    def reset(self) -> RawVisFlyObservation[torch.Tensor]:
+    def get_observation(self) -> RawVisFlyObservation[torch.Tensor]:
         return RawVisFlyObservation(state=self.state, target=self.target, rgb=self.rgb)
+
+    def reset(self) -> RawVisFlyObservation[torch.Tensor]:
+        return self.get_observation()
 
     def step(self, actions: NDArray[np.float32]) -> tuple[Any, ...]:  # (B, 4)
         assert isinstance(actions, np.ndarray)
@@ -150,7 +154,7 @@ def test_visfly_factory_tensors_terminal_observations_and_cleanup() -> None:
             device="cpu",
             visual=True,
         )
-        assert env.render().shape == (4, 4, 4, 3)
+        assert env.render().shape == (4, 4, 8, 3)
     assert backend.closed
 
 
@@ -358,12 +362,24 @@ def test_real_gym_rollout_compiled_update_and_checkpoint(config: ppo.Config, tmp
             assert int(restored.train_state.step) == 1
 
 
-def test_mixed_image_vector_encoder_and_sequence_shapes(config: ppo.Config) -> None:
+@pytest.mark.parametrize("visfly", [False, True], ids=["generic", "visfly"])
+def test_mixed_image_vector_encoder_and_sequence_shapes(config: ppo.Config, visfly: bool) -> None:
+    encoder = ppo.Conv2DEncoderConfig(stages=(ConvStage(channels=2, blocks=0),), embedding_size=4)
     settings = replace(
-        config.model, encoder=ppo.Conv2DEncoderConfig(stages=(ConvStage(channels=2, blocks=0),), embedding_size=4)
+        config.model,
+        encoder=ppo.VisFlyEncoderConfig(
+            stages=encoder.stages, embedding_size=4, goal_scale=2, velocity_scale=4, angular_velocity_scale=8
+        )
+        if visfly
+        else encoder,
     )
     model = ppo.ActorCritic(action_space=ppo.DiscreteSpace(n=2), model=settings)
     obs = {"rgb": jnp.full((2, 2, 4, 4, 3), 255, dtype=jnp.uint8), "state": jnp.zeros((2, 2, 3))}  # (B, T, *O)
+    if visfly:
+        obs["state"] = jnp.tile(
+            jnp.array([3, 4, 5, 1, 0, 0, 0, 4, 8, 12, 8, 16, 24], jnp.float32), (2, 2, 1)
+        )  # (B, T, 13)
+        obs["target"] = jnp.tile(jnp.array([5, 8, 11], jnp.float32), (2, 2, 1))  # (B, T, 3)
     memory = model.initial_carry(2)  # leaves: (B, H)
     starts = jnp.zeros((2, 2), dtype=bool)  # (B, T)
     params = model.init(jax.random.key(1), obs, memory, starts)
@@ -371,6 +387,21 @@ def test_mixed_image_vector_encoder_and_sequence_shapes(config: ppo.Config) -> N
     assert output.values.shape == (2, 2)
     assert output.policy.logits.shape == (2, 2, 2)
     assert all(leaf.shape == (2, 4) for leaf in jax.tree.leaves(output.carry))
+    if visfly:
+        generic = ppo.ActorCritic(action_space=ppo.DiscreteSpace(n=2), model=replace(settings, encoder=encoder))
+        prepared = {
+            "rgb": obs["rgb"],  # (B, T, H, W, 3)
+            "state": jnp.tile(jnp.array([1, 0, 0, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3], jnp.float32), (2, 2, 1)),  # (B, T, 13)
+        }
+        expected = jax.jit(generic.apply)(params, prepared, memory, starts)
+        np.testing.assert_allclose(jax.device_get(output.values), jax.device_get(expected.values), atol=1e-6)
+        np.testing.assert_allclose(
+            jax.device_get(output.policy.logits), jax.device_get(expected.policy.logits), atol=1e-6
+        )
+        step = jax.jit(partial(model.apply, method="step"))(
+            params, jax.tree.map(lambda leaf: leaf[:, 0], obs), memory, starts[:, 0]
+        )
+        np.testing.assert_allclose(jax.device_get(step.values), jax.device_get(output.values[:, 0]), atol=1e-6)
 
 
 def test_evaluation_uses_fresh_environment_and_closes_on_failure(config: ppo.Config) -> None:
@@ -381,7 +412,7 @@ def test_evaluation_uses_fresh_environment_and_closes_on_failure(config: ppo.Con
     with patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)):
         result = ppo.play_episode(state, config, jax.random.key(0), memory, record=True, stop_at_frame_limit=True)
         assert len(result.frames) == 1
-        assert result.frames[0].shape == (4, 4, 3)
+        assert result.frames[0].shape == (4, 8, 3)
         assert result.frames[0].dtype == np.uint8
         assert result.length == 0
         assert backend.steps == 0
@@ -398,10 +429,29 @@ def test_evaluation_uses_fresh_environment_and_closes_on_failure(config: ppo.Con
 def test_configuration_round_trip(config: ppo.Config) -> None:
     values = asdict(config)
     values["env"] = {"id": "VisFly", "num_scenes": 2, "kwargs": {"visual": True}}
+    values["model"]["encoder"] = asdict(
+        ppo.VisFlyEncoderConfig(stages=(ConvStage(channels=2, blocks=0),), embedding_size=4, goal_scale=2.0)
+    )
     parsed = TypeAdapter(ppo.Config).validate_json(json.dumps(values))
     assert isinstance(parsed.env, VisFlyConfig)
     assert parsed.env.kwargs == {"visual": True}
+    assert isinstance(parsed.model.encoder, ppo.VisFlyEncoderConfig)
+    assert parsed.model.encoder.goal_scale == 2.0
     hash(parsed)  # Configurations with arbitrary environment kwargs can specialize JIT updates.
+
+
+@pytest.mark.parametrize(
+    "scales",
+    [{"goal_scale": 0.0}, {"velocity_scale": -1.0}, {"angular_velocity_scale": float("inf")}],
+)
+def test_visfly_encoder_requires_positive_scales(scales: dict[str, float]) -> None:
+    with pytest.raises(ValueError):
+        ppo.VisFlyEncoderConfig(**scales)
+
+
+def test_visfly_encoder_requires_navigation_environment(config: ppo.Config) -> None:
+    with pytest.raises(ValueError, match="visfly encoder requires a VisFly"):
+        replace(config, model=replace(config.model, encoder=ppo.VisFlyEncoderConfig()))
 
 
 def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:

@@ -4,7 +4,7 @@ env:
   num_scenes: 8 # 4 agents per scene
   scene_rotation_env_steps: 32768 # Reload after 1024 steps per agent; truncate ongoing episodes
   kwargs:
-    device: cpu # JAX independently selects its training devices
+    device: cpu # VisFly tensors/dynamics; Habitat still renders on GPU alongside JAX
     visual: true
     max_episode_steps: 500 # 10 seconds at 50 Hz
     scene_randomization: true
@@ -49,12 +49,15 @@ num_minibatches: 4
 update_epochs: 1
 model:
   encoder:
-    type: conv2d # RGB CNN combined with state/target vectors
+    type: visfly # RGB CNN with body-frame navigation features
     stages:
-      - { channels: 16, blocks: 1 }
-      - { channels: 32, blocks: 1 }
-      - { channels: 64, blocks: 1 }
+      - { channels: 16, blocks: 1 } # 32x32
+      - { channels: 32, blocks: 1 } # 16x16
+      - { channels: 64, blocks: 1 } # 8x8
     embedding_size: 128
+    goal_scale: 10.0 # Metres
+    velocity_scale: 5.0 # Metres/second
+    angular_velocity_scale: 10.0 # Radians/second
   recurrent:
     hidden_size: 128
   continuous_policy: truncated_gaussian
@@ -72,5 +75,5 @@ video_interval: 0 # Record videos only during evaluation
 eval_interval: 100
 eval_episodes: 10
 eval_video: true
-run_id: ppo_gym_visfly_seed${seed}
+run_id: ppo_gym_visfly_ne${num_envs}_ns${num_steps}_seed${seed}
 ckpt_dir: /runs/ppo_gym/${run_id}
