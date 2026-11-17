@@ -20,6 +20,8 @@ RUN --mount=type=cache,target=/opt/habitat-sim/build,sharing=locked \
 FROM habitat-build AS visfly-assets
 RUN pip install --no-cache-dir huggingface-hub==1.33.0
 RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('LiFanxing/visfly-beta', repo_type='dataset', revision='04ad03b9a2a079891c0ae10fd99e3e1b35bc5824', local_dir='/opt/VisFly/datasets/visfly-beta', ignore_patterns=['.git*', '.vscode/*'])"
+COPY infra/k3s/training/visfly/prepare_assets.py /tmp/visfly/prepare_assets.py
+RUN python /tmp/visfly/prepare_assets.py /opt/VisFly/datasets/visfly-beta
 
 FROM python:3.12-slim-bookworm AS training
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -77,6 +79,8 @@ COPY --from=visfly-assets /opt/VisFly /opt/VisFly
 # Remove unused example imports that load torchvision/Triton after TensorFlow.
 RUN sed -i '/^from \.\.utils\.tools\.train_encoder import model as encoder$/d' /opt/VisFly/envs/NavigationEnv.py \
     && sed -i '/^from torchvision import datasets, transforms$/d' /opt/VisFly/utils/dataloader.py
+# Articulated scene furniture requires Bullet; drone dynamics remain in VisFly.
+RUN sed -i 's/sim_cfg.enable_physics = False/sim_cfg.enable_physics = True/' /opt/VisFly/utils/SceneManager.py
 # Scene JSON contains paths relative to the parent of VisFly.
 RUN ln -s /opt/VisFly /app/VisFly
 ENV PYTHONPATH=/opt VISFLY_SCENE_PATH=/opt/VisFly/datasets/visfly-beta/configs/scenes

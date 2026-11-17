@@ -2,6 +2,7 @@
 
 import os
 from contextlib import closing
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -12,8 +13,18 @@ from rl2.train_ppo_gym import VisFlyConfig, VisFlyEnv
 pytestmark = pytest.mark.skipif(os.environ.get("RL2_VISFLY_TESTS") != "1", reason="requires the VisFly GPU image")
 
 
-@pytest.mark.parametrize("num_envs", [pytest.param(2, id="batch"), pytest.param(1, id="evaluation")])
-def test_rendered_reset_step_and_autoreset(num_envs: int) -> None:
+@pytest.mark.parametrize(
+    ("num_envs", "scenes"),
+    [
+        pytest.param(
+            2,
+            ("garage_empty/garage_empty_0.scene_instance.json", "v3_sc0_staging_08.scene_instance.json"),
+            id="batch",
+        ),
+        pytest.param(1, ("v3_sc0_staging_08.scene_instance.json",), id="articulated-evaluation"),
+    ],
+)
+def test_rendered_reset_step_and_autoreset(num_envs: int, scenes: tuple[str, ...]) -> None:
     config = VisFlyConfig(
         scene_rotation_env_steps=num_envs,
         kwargs={
@@ -27,6 +38,9 @@ def test_rendered_reset_step_and_autoreset(num_envs: int) -> None:
         },
     )
     with closing(VisFlyEnv(config=config, num_envs=num_envs, seed=1, evaluation=num_envs == 1)) as env:
+        loader = env.backend.envs.sceneManager._scene_loader
+        loader.paths = [str(Path(os.environ["VISFLY_SCENE_PATH"]) / scene) for scene in scenes]
+        loader._select_index = list(range(len(scenes)))
         observation = env.reset()  # leaves: (B, *O)
         assert isinstance(observation, dict)
         assert set(observation) == {"state", "target", "rgb"}

@@ -605,8 +605,10 @@ The VisFly adapter uses RGB-only navigation observations: `state`, `target`, and
 the example uses 64×64 pixels. `visual` must remain enabled.
 
 The image exposes the complete scene directory (734 scene files in the pinned
-dataset, including repeated layouts). The example runs eight scenes with four
-agents each and cycles through a seeded scene permutation every 32,768 environment
+dataset, including repeated layouts). The build registers the bundled articulated
+furniture assets and enables Bullet to instantiate them; VisFly handles drone dynamics.
+The example runs eight scenes with four agents each and cycles through a seeded
+scene permutation every 32,768 environment
 steps (1,024 steps per agent). Ongoing episodes are truncated at scene changes;
 bootstrapping uses their final observations from the old scene.
 

@@ -6,7 +6,7 @@ env:
   kwargs:
     device: cpu # JAX independently selects its training devices
     visual: true
-    max_episode_steps: 256
+    max_episode_steps: 500 # 10 seconds at 50 Hz
     scene_randomization: true
     spawn_clearance: 0.3 # Metres from geometry
     flight_height: [0.5, 2.5] # Metres above each scene's bounding-box floor
@@ -22,8 +22,8 @@ env:
         resolution: [256, 256]
     dynamics_kwargs:
       action_type: bodyrate
-      dt: 0.03
-      ctrl_dt: 0.03
+      dt: 0.0025 # 400 Hz physics
+      ctrl_dt: 0.02 # 50 Hz control; 8 physics steps per action
     random_kwargs:
       state_generator:
         class: Uniform
@@ -67,7 +67,7 @@ clip_coef: 0.2
 target_kl: 0.02
 entropy_coef: 0.001
 max_grad_norm: 0.5
-video_fps: 30.0
+video_fps: 50.0
 video_interval: 0 # Record videos only during evaluation
 eval_interval: 100
 eval_episodes: 10
