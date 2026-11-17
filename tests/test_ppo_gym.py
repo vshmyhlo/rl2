@@ -5,7 +5,7 @@ from contextlib import closing
 from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import MagicMock, Mock, patch
 
 import gymnasium as gym
@@ -23,6 +23,7 @@ from rl2 import train_ppo_gym as ppo
 from rl2.actions import CategoricalPolicy, ContinuousSpace, Policy, TruncatedGaussianPolicy
 from rl2.envs import GymStyleEnv, GymStyleStep
 from rl2.envs.gym_env import GymConfig, GymEnv
+from rl2.envs.gym_style_env import StopReason
 from rl2.envs.visfly_env import RawVisFlyObservation, VisFlyConfig, VisFlyEnv
 from rl2.model.encoders.conv2d import ConvStage
 
@@ -87,6 +88,8 @@ class VisFlyBatch:
             infos.append(
                 {
                     "episode_done": index in (0, 2),
+                    "is_success": index == 0,
+                    "episode": {"extra": {"collision": index == 2}},
                     "TimeLimit.truncated": index in (1, 2),
                     "terminal_observation": {
                         "state": torch.full((13,), 10.0 * (index + 1)),  # (S,)
@@ -117,7 +120,8 @@ def test_gymnasium_autoreset_keeps_timeout_observation(num_envs: int) -> None:
         result = env.step(np.zeros(num_envs, dtype=np.int32))
         assert isinstance(result, GymStyleStep)
         assert isinstance(initial, np.ndarray)
-        assert all(isinstance(leaf, np.ndarray) for leaf in result)
+        assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(result))
+        assert result.info is None
         assert result.rewards.dtype == np.float32
         assert result.terminated.dtype == result.truncated.dtype == np.bool_
         assert initial.shape == result.observations.shape == result.final_observations.shape == (num_envs, 4)
@@ -141,6 +145,9 @@ def test_visfly_factory_tensors_terminal_observations_and_cleanup() -> None:
         assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves((initial, result)))
         assert result.observations["rgb"].shape == (4, 4, 4, 3)
         assert result.final_observations["state"].shape == (4, 13)
+        assert result.info["goal_distance"].shape == (4,)
+        assert result.info["goal_distance"].dtype == np.float32
+        np.testing.assert_allclose(result.info["goal_distance"], np.sqrt(3) * np.array([10, 20, 30, 1]))
         np.testing.assert_array_equal(result.terminated, [True, False, True, False])
         np.testing.assert_array_equal(result.truncated, [False, True, True, False])
         np.testing.assert_array_equal(result.final_observations["state"][:, 0], [10, 20, 30, -1])
@@ -419,6 +426,9 @@ def test_evaluation_uses_fresh_environment_and_closes_on_failure(config: ppo.Con
         assert result.frames[0].shape == (4, 8, 3)
         assert result.frames[0].dtype == np.uint8
         assert result.length == 0
+        assert result.stop_reason is None
+        assert result.final_goal_distance is None
+        assert not result.terminated and not result.truncated
         assert backend.steps == 0
         assert backend.closed
         backend.closed = False
@@ -479,10 +489,77 @@ def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:
     assert step == 4
     assert scalars["eval/return"] == 1
     assert scalars["eval/return_std"] == scalars["eval/return_sem"] == 0
+    assert scalars["eval/stop_fraction/success"] == 1
+    assert scalars["eval/stop_fraction/terminated"] == scalars["eval/stop_fraction/collision"] == 0
+    assert scalars["eval/final_goal_distance_meters"] == pytest.approx(np.sqrt(300))
+    assert scalars["eval/termination_fraction"] == 1
+    assert scalars["eval/truncation_fraction"] == 0
     writer.log_video.assert_not_called()
 
 
-def test_train_orchestration_uses_host_env_and_closes_resources(config: ppo.Config) -> None:
+@pytest.mark.parametrize("availability", ["complete", "missing", "partial", "zero_distance"])
+def test_evaluation_stop_fractions_exclude_video_replay(
+    config: ppo.Config, availability: Literal["complete", "missing", "partial", "zero_distance"]
+) -> None:
+    config = replace(config, eval_episodes=2, eval_video=True)
+    complete = availability in ("complete", "zero_distance")
+    episodes = [
+        ppo.EpisodeResult(
+            episode_return=reward,
+            length=1,
+            frames=[],
+            stop_reason=(StopReason.SUCCESS if success else StopReason.COLLISION)
+            if complete or (availability == "partial" and success)
+            else None,
+            terminated=True,
+            truncated=not success,  # Simultaneous termination and timeout retain both flags.
+            final_goal_distance=(0.0 if success or availability == "zero_distance" else 2.0)
+            if complete or (availability == "partial" and success)
+            else None,
+        )
+        for reward, success in [(1.0, True), (0.0, False)]
+    ]
+    replay = ppo.EpisodeResult(
+        episode_return=1.0,
+        length=1,
+        frames=[np.zeros((2, 2, 3), dtype=np.uint8)],  # each (H, W, 3)
+        stop_reason=StopReason.SUCCESS,
+        terminated=True,
+        final_goal_distance=100.0,  # Replay must not affect scored distances.
+    )
+    writer = Mock()
+    with patch.object(ppo, "play_episode", side_effect=[*episodes, replay]):
+        ppo.log_evaluation(Mock(), config, writer, 0, 4, initial_carry=())
+    scalars, step = writer.log_metrics.call_args.args
+    fractions = {key: value for key, value in scalars.items() if key.startswith("eval/stop_fraction/")}
+    assert step == 4
+    assert scalars["eval/termination_fraction"] == 1
+    assert scalars["eval/truncation_fraction"] == 0.5
+    if complete:
+        assert fractions == {
+            "eval/stop_fraction/success": 0.5,
+            "eval/stop_fraction/collision": 0.5,
+            "eval/stop_fraction/time_limit": 0.0,
+            "eval/stop_fraction/terminated": 0.0,
+            "eval/stop_fraction/scene_rotation": 0.0,
+        }
+        assert sum(fractions.values()) == 1
+        assert scalars["eval/final_goal_distance_meters"] == (0 if availability == "zero_distance" else 1)
+    else:
+        assert fractions == {}
+        assert "eval/final_goal_distance_meters" not in scalars
+    report = json.loads(writer.log_text.call_args.args[0])
+    assert len(report["episodes"]) == 2
+    assert ("stop_reason" in report["episodes"][0]) == (availability != "missing")
+    if complete:
+        assert [episode["stop_reason"] for episode in report["episodes"]] == ["success", "collision"]
+        assert report["episodes"][0]["final_goal_distance_meters"] == 0
+    assert report["episodes"][1]["terminated"] and report["episodes"][1]["truncated"]
+    writer.log_video.assert_called_once()
+
+
+@pytest.mark.parametrize("accepted", [True, False], ids=["accepted_updates", "all_updates_rejected"])
+def test_train_orchestration_uses_host_env_and_closes_resources(config: ppo.Config, accepted: bool) -> None:
     config = replace(config, total_steps=4, run_id="host-test")
     env = Mock(action_space=gym.spaces.Discrete(2))
     env.reset.return_value = np.zeros((2, 3), dtype=np.float32)  # (B, O)
@@ -505,12 +582,17 @@ def test_train_orchestration_uses_host_env_and_closes_resources(config: ppo.Conf
         assert envs is env
         assert schedule_index == 0
         window = metrics.window._replace(
-            minibatch_count=jnp.asarray(1),
+            minibatch_count=jnp.asarray(3),
             rollout_count=jnp.asarray(1),
-            update_count=jnp.asarray(1),
+            update_count=jnp.asarray(2 if accepted else 0),
+            minibatch_metrics=metrics.window.minibatch_metrics.replace(
+                gradient_norm=jnp.asarray(6.0 if accepted else 0.0),  # () sum over accepted updates
+                gradient_clip_fraction=jnp.asarray(1.0 if accepted else 0.0),  # () accepted clipping count
+            ),
+            final_approx_kl_sum=jnp.asarray(0.03),  # ()
         )
         return ppo.TrainStepResult(
-            train_state=state.replace(step=1),
+            train_state=state.replace(step=2 if accepted else 0),
             rollout_carry=runner,
             key=key,
             metrics=metrics._replace(window=window),
@@ -524,7 +606,7 @@ def test_train_orchestration_uses_host_env_and_closes_resources(config: ppo.Conf
         patch.object(ppo, "train_step", side_effect=iteration),
     ):
         result = ppo.train(config)
-    assert int(result.step) == 1
+    assert int(result.step) == (2 if accepted else 0)
     env.reset.assert_called_once_with()
     env.close.assert_called_once_with()
     manager.close.assert_called_once_with()
@@ -534,3 +616,120 @@ def test_train_orchestration_uses_host_env_and_closes_resources(config: ppo.Conf
     assert scalars["train/iterations_total"] == 1
     assert "rollout/return" not in scalars
     assert "train/return" not in scalars
+    assert scalars["train/final_approx_kl"] == pytest.approx(0.03)
+    if accepted:
+        assert scalars["train/gradient_norm"] == 3
+        assert scalars["train/gradient_clip_fraction"] == 0.5
+    else:
+        assert "train/gradient_norm" not in scalars
+        assert "train/gradient_clip_fraction" not in scalars
+
+
+def scalar_policy(
+    variables: dict[str, dict[str, jax.Array]],  # parameter leaves: ()
+    observations: jax.Array,  # (B, T, 1)
+    memory: ppo.RecurrentCarry,  # leaves: (B, H)
+    starts: jax.Array,  # (B, T)
+) -> ppo.ActorCriticOutput:
+    weight = variables["params"]["weight"]  # () shared actor/critic parameter
+    return ppo.ActorCriticOutput(
+        carry=memory,
+        policy=TruncatedGaussianPolicy(
+            mean=weight + observations,  # (B, T, 1)
+            log_std=jnp.zeros_like(observations),  # (B, T, 1)
+            action_space=ContinuousSpace(shape=(1,), low=(-1.0,), high=(1.0,)),
+        ),
+        values=jnp.broadcast_to(weight, starts.shape),  # (B, T)
+    )
+
+
+@pytest.fixture
+def scalar_batch() -> ppo.PPOBatch:
+    observations = jnp.array([[[0.0]], [[0.5]]])  # (B, T, O), distinct states test full-batch KL reduction
+    starts = jnp.ones((2, 1), dtype=bool)  # (B, T)
+    policy = scalar_policy({"params": {"weight": jnp.asarray(0.0)}}, observations, (), starts).policy
+    return ppo.PPOBatch(
+        observations=observations,
+        actions=jnp.zeros((2, 1, 1)),  # (B, T, D)
+        old_log_probs=policy.log_prob(jnp.zeros((2, 1, 1))),  # (B, T)
+        values=jnp.zeros((2, 1)),  # (B, T)
+        advantages=jnp.zeros((2, 1)),  # (B, T), isolate the known critic gradient
+        returns=jnp.full((2, 1), 2.0),  # (B, T)
+        model_carry=(),
+        episode_starts=starts,
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_grad_norm", "rejected"),
+    [(0.5, False), (3.0, False), (0.5, True)],
+    ids=["clipped", "unclipped", "kl_rejected"],
+)
+def test_update_gradient_metrics(
+    config: ppo.Config, scalar_batch: ppo.PPOBatch, max_grad_norm: float, rejected: bool
+) -> None:
+    config = replace(config, entropy_coef=0.0, max_grad_norm=max_grad_norm, target_kl=0.02)
+    if rejected:
+        scalar_batch = scalar_batch.replace(old_log_probs=scalar_batch.old_log_probs - 1.0)  # (B, T)
+    state = TrainState.create(
+        apply_fn=scalar_policy,
+        params={"weight": jnp.asarray(0.0)},  # ()
+        tx=optax.chain(optax.clip_by_global_norm(max_grad_norm), optax.sgd(0.1)),
+    )
+    updated, metrics = jax.jit(partial(ppo.update, config=config))(state, scalar_batch)
+    assert metrics.gradient_norm.shape == metrics.gradient_clip_fraction.shape == ()
+    assert float(metrics.gradient_norm) == (0.0 if rejected else 2.0)
+    assert float(metrics.gradient_clip_fraction) == float(not rejected and max_grad_norm < 2.0)
+    assert int(updated.step) == int(not rejected)
+    expected_weight = 0.0 if rejected else 0.1 * min(2.0, max_grad_norm)
+    assert float(updated.params["weight"]) == pytest.approx(expected_weight)
+
+
+@pytest.mark.parametrize("early_stop", [False, True], ids=["all_epochs", "kl_stop"])
+def test_final_kl_uses_final_parameters_and_full_batch(
+    config: ppo.Config, scalar_batch: ppo.PPOBatch, early_stop: bool
+) -> None:
+    config = replace(
+        config,
+        num_steps=1,
+        num_minibatches=2,
+        learning_rate=0.1,
+        entropy_coef=0.0,
+        target_kl=1e-12 if early_stop else None,
+    )
+
+    def optimizer(learning_rate: float) -> optax.GradientTransformation:
+        return optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.sgd(learning_rate))
+
+    state = TrainState.create(
+        apply_fn=scalar_policy,
+        params={"weight": jnp.asarray(0.0)},  # ()
+        tx=optax.inject_hyperparams(optimizer)(learning_rate=config.learning_rate),
+    )
+    rollout = ppo.RolloutResult(
+        batch=scalar_batch,
+        key=jax.random.key(0),  # key: ()
+        episode_return_sum=jnp.asarray(0.0),  # ()
+        episode_length_sum=jnp.asarray(0),  # ()
+        episode_count=jnp.asarray(0),  # ()
+    )
+    carry = ppo.RolloutCarry(
+        observations=scalar_batch.observations[:, 0],  # (B, O)
+        model_carry=(),
+        episode_starts=jnp.zeros(2, dtype=bool),  # (B,)
+        episode_returns=jnp.zeros(2),  # (B,)
+        episode_step_counts=jnp.zeros(2, dtype=jnp.int32),  # (B,)
+    )
+    result = ppo.optimize_rollout(carry, rollout, state, config, ppo.init_metrics())
+    output = scalar_policy(
+        {"params": result.train_state.params}, scalar_batch.observations, (), scalar_batch.episode_starts
+    )
+    log_ratio = output.policy.log_prob(scalar_batch.actions) - scalar_batch.old_log_probs  # (B, T)
+    expected = (jnp.expm1(log_ratio) - log_ratio).mean()  # ()
+    window = result.metrics.window
+    assert window.final_approx_kl_sum.shape == ()
+    assert float(window.final_approx_kl_sum) == pytest.approx(float(expected), rel=1e-4, abs=1e-9)
+    assert float(window.final_approx_kl_sum) > 0
+    assert int(window.update_count) == (1 if early_stop else 2)
+    assert int(window.early_stop_count) == int(early_stop)
+    assert float(window.minibatch_metrics.gradient_norm) == pytest.approx(2.0 if early_stop else 3.95)

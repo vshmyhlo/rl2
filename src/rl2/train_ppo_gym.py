@@ -32,8 +32,8 @@ Window/lifetime metrics and latest settings are logged every log_interval iterat
 (default: 10). Checkpoints are saved every checkpoint_interval iterations (default: 100).
 Periodic operations use completed iteration counts, including resumed training,
 and also run on normal completion. Learning-rate and entropy schedules use completed
-environment steps divided by the current batch size, rounded down. No metrics have
-categorical suffixes. Only complete batches fitting within total_steps are collected.
+environment steps divided by the current batch size, rounded down.
+Only complete batches fitting within total_steps are collected.
 
 Window metrics:
     train/policy_loss, train/value_loss: Mean clipped surrogate loss and half
@@ -43,8 +43,16 @@ Window metrics:
     train/total_loss: Policy loss + value_coef * value loss + entropy loss.
     train/approx_kl: Mean exp(log_ratio) - 1 - log_ratio, in nats versus rollout policy.
     train/clip_fraction: Fraction of action probability ratios outside the clip range.
-        All losses/diagnostics average transitions, then evaluated minibatches,
+        These losses and policy diagnostics average transitions, then evaluated minibatches,
         including KL-rejected minibatches; total loss uses each iteration's entropy weight.
+    train/gradient_norm: Global L2 norm of total-loss gradients before clipping,
+        averaged over accepted minibatch updates; omit if no updates were accepted.
+    train/gradient_clip_fraction: Fraction of accepted updates with pre-clipping
+        gradient norm above max_grad_norm; omit if no updates were accepted.
+    train/final_approx_kl: Mean exp(log_ratio) - 1 - log_ratio in nats over the full
+        rollout batch after optimization, then averaged over iterations. Uses the
+        final parameters and stored initial recurrent states, including iterations
+        stopped by KL. Evaluated in minibatches with no gradients or extra host sync.
     train/explained_variance: Mean over iterations with nonconstant returns;
         omitted if none are defined.
     train/updates_per_iteration, train/kl_early_stop_fraction: Accepted updates
@@ -86,7 +94,22 @@ Evaluation uses fixed seeds and logs raw episode return mean, sample standard
 deviation, and standard error as eval/return, eval/return_std, and
 eval/return_sem after each evaluation. eval/training_episodes_total is the lifetime
 completed training episode count at evaluation. Uncertainty metrics are omitted
-for a single episode. With eval_video=true (default: false), evaluation replays its
+for a single episode. eval/stop_fraction/success, eval/stop_fraction/collision,
+eval/stop_fraction/terminated, eval/stop_fraction/time_limit, and
+eval/stop_fraction/scene_rotation log the fraction ending for each reason when all scored episodes
+provide it (currently VisFly only), including measured zeros. Reasons are exclusive:
+success wins simultaneous collision, termination wins timeout, and scene rotation
+only counts ongoing episodes. terminated covers other or unspecified terminations.
+Fractions are per evaluation, not cumulative, and use the training environment-step
+count as their metric step. eval/termination_fraction and eval/truncation_fraction
+log the respective end-flag means over all scored episodes for every backend, on
+the same cadence and step. Both flags may be true, so these fractions can sum above
+one. eval/final_goal_distance_meters is the mean Euclidean goal distance at episode
+end, before autoreset or scene rotation, over all scored episodes; omit it if any
+episode lacks goal-distance metadata. It uses the same cadence and metric step,
+preserves measured zeros, and is not cumulative. Video replays are excluded from
+all evaluation summaries.
+With eval_video=true (default: false), evaluation replays its
 highest-return episode with the same seed, choosing the first on ties, independently
 of video_interval.
 The replay is excluded from score statistics and included in eval/evaluation_seconds.
@@ -161,7 +184,7 @@ from rl2.actions import (
 )
 from rl2.configuration import BaseConfig, load_config
 from rl2.envs.gym_env import GymConfig, GymEnv, GymObservation
-from rl2.envs.gym_style_env import GymStyleEnv
+from rl2.envs.gym_style_env import STOP_REASON_NAMES, GymStyleEnv
 from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv, VisFlyObservation
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
@@ -242,7 +265,7 @@ class RolloutResult(NamedTuple):
 
 @struct.dataclass
 class MinibatchMetrics:
-    """Scalar diagnostics for one evaluated minibatch, including KL-rejected updates."""
+    """Scalar diagnostics; rejected updates contribute zero to gradient aggregates."""
 
     policy_loss: jax.Array  # ()
     value_loss: jax.Array  # ()
@@ -250,6 +273,8 @@ class MinibatchMetrics:
     entropy: jax.Array  # ()
     approx_kl: jax.Array  # ()
     clip_fraction: jax.Array  # ()
+    gradient_norm: jax.Array  # () pre-clipping norm; zero aggregate contribution if rejected
+    gradient_clip_fraction: jax.Array  # () clipping indicator; zero contribution if rejected
 
 
 class EpisodeMetrics(NamedTuple):
@@ -269,6 +294,7 @@ class WindowMetrics(NamedTuple):
     rollout_count: jax.Array  # () completed rollouts
     update_count: jax.Array  # () accepted minibatches
     early_stop_count: jax.Array  # () rollouts stopped by the KL threshold
+    final_approx_kl_sum: jax.Array  # () post-optimization batch KL summed over iterations
 
 
 class TrainingMetrics(NamedTuple):
@@ -433,6 +459,7 @@ def init_metrics(progress: TrainingProgress | None = None) -> TrainingMetrics:
             rollout_count=jnp.zeros((), jnp.int64),  # ()
             update_count=jnp.zeros((), jnp.int64),  # ()
             early_stop_count=jnp.zeros((), jnp.int64),  # ()
+            final_approx_kl_sum=jnp.zeros((), jnp.float64),  # ()
         )
     return TrainingMetrics(window=window, total=total)  # scalar leaves
 
@@ -704,6 +731,10 @@ class EpisodeResult(NamedTuple):
     episode_return: float
     length: int
     frames: list[NDArray[np.uint8]]  # each (H, W, 3)
+    stop_reason: int | None = None
+    terminated: bool = False
+    truncated: bool = False
+    final_goal_distance: float | None = None
 
 
 def play_episode(
@@ -720,6 +751,9 @@ def play_episode(
     frames = []  # each (H, W, 3)
     episode_return = 0.0
     length = 0
+    stop_reason = None
+    terminated = truncated = False
+    final_goal_distance = None
     memory = initial_carry  # leaves: (1, H)
     starts = jnp.ones(1, dtype=bool)  # (1,)
     with closing(make_env(config, seed=seed, evaluation=True, record=record)) as env:
@@ -741,9 +775,24 @@ def play_episode(
             episode_return += float(transition.rewards[0])
             length += 1
             if bool((transition.terminated | transition.truncated)[0]):
+                terminated = bool(transition.terminated[0])
+                truncated = bool(transition.truncated[0])
+                if transition.info is not None:
+                    if "stop_reason" in transition.info:
+                        stop_reason = int(transition.info["stop_reason"][0])
+                    if "goal_distance" in transition.info:
+                        final_goal_distance = float(transition.info["goal_distance"][0])
                 break
             starts = jnp.zeros(1, dtype=bool)  # (1,)
-    return EpisodeResult(episode_return=episode_return, length=length, frames=frames)
+    return EpisodeResult(
+        episode_return=episode_return,
+        length=length,
+        frames=frames,
+        stop_reason=stop_reason,
+        terminated=terminated,
+        truncated=truncated,
+        final_goal_distance=final_goal_distance,
+    )
 
 
 def log_video(
@@ -758,7 +807,7 @@ def log_video(
     """Record a separate episode up to the frame cap and log its gameplay GIF."""
     print(f"Recording gameplay at step {step_count} after {episode_count} training episodes...", flush=True)
     started = monotonic()
-    _, _, frames = play_episode(
+    episode = play_episode(
         train_state,
         config,
         jax.random.fold_in(jax.random.key(config.seed), episode_count),
@@ -766,11 +815,12 @@ def log_video(
         record=True,
         stop_at_frame_limit=True,
     )
-    writer.log_video(frames, f"gameplay/{step_count}.gif", fps=config.video_fps)
+    writer.log_video(episode.frames, f"gameplay/{step_count}.gif", fps=config.video_fps)
     seconds = monotonic() - started
     writer.log_metrics({"actor/video_seconds": seconds}, step_count)
     print(
-        f"Recorded {len(frames)} gameplay frames after {episode_count} training episodes in {seconds:.1f}s", flush=True
+        f"Recorded {len(episode.frames)} gameplay frames after {episode_count} training episodes in {seconds:.1f}s",
+        flush=True,
     )
 
 
@@ -786,20 +836,20 @@ def log_evaluation(
     """Evaluate fixed seeds, log raw scores, and optionally replay the best episode."""
     print(f"Evaluating {config.eval_episodes} games at step {step_count}...", flush=True)
     started = monotonic()
-    episode_results: list[dict[str, float | int]] = []
+    episodes: list[EpisodeResult] = []
     for episode_index in range(config.eval_episodes):
-        episode_return, episode_step_count, _ = play_episode(
+        episode = play_episode(
             train_state,
             config,
             jax.random.fold_in(jax.random.key(config.eval_seed), episode_index),
             initial_carry,
             record=False,
         )
-        episode_results.append({"return": episode_return, "length": episode_step_count})
-    returns = [result["return"] for result in episode_results]
+        episodes.append(episode)
+    returns = [episode.episode_return for episode in episodes]
     best_episode_index = max(range(len(returns)), key=returns.__getitem__)
     if config.eval_video:
-        _, _, frames = play_episode(  # frames: each (H, W, 3)
+        replay = play_episode(
             train_state,
             config,
             jax.random.fold_in(jax.random.key(config.eval_seed), best_episode_index),
@@ -807,21 +857,47 @@ def log_evaluation(
             record=True,
             stop_at_frame_limit=True,
         )
-        if frames:
-            writer.log_video(frames, f"eval/gameplay/{step_count}.gif", fps=config.video_fps)
+        if replay.frames:
+            writer.log_video(replay.frames, f"eval/gameplay/{step_count}.gif", fps=config.video_fps)
     std = stdev(returns) if len(returns) > 1 else None
     result = {
         "env_id": config.env.id,
         "return_mean": fmean(returns),
         "return_std": std,
         "return_sem": std / sqrt(config.eval_episodes) if std is not None else None,
-        "episodes": episode_results,
+        "episodes": [
+            {
+                "return": episode.episode_return,
+                "length": episode.length,
+                "terminated": episode.terminated,
+                "truncated": episode.truncated,
+                **({"stop_reason": STOP_REASON_NAMES[episode.stop_reason]} if episode.stop_reason is not None else {}),
+                **(
+                    {"final_goal_distance_meters": episode.final_goal_distance}
+                    if episode.final_goal_distance is not None
+                    else {}
+                ),
+            }
+            for episode in episodes
+        ],
         "eval_seed": config.eval_seed,
         "training_config": asdict(config),
         "training_steps": step_count,
         "training_episodes": episode_count,
     }
-    scalars = {"eval/return": result["return_mean"], "eval/training_episodes_total": episode_count}
+    scalars = {
+        "eval/return": result["return_mean"],
+        "eval/training_episodes_total": episode_count,
+        "eval/termination_fraction": fmean(episode.terminated for episode in episodes),
+        "eval/truncation_fraction": fmean(episode.truncated for episode in episodes),
+    }
+    reasons = [episode.stop_reason for episode in episodes if episode.stop_reason is not None]
+    if len(reasons) == len(episodes):
+        for code, reason in STOP_REASON_NAMES.items():
+            scalars[f"eval/stop_fraction/{reason}"] = fmean(value == code for value in reasons)
+    distances = [episode.final_goal_distance for episode in episodes if episode.final_goal_distance is not None]
+    if len(distances) == len(episodes):
+        scalars["eval/final_goal_distance_meters"] = fmean(distances)
     if std is not None:
         scalars.update({"eval/return_std": std, "eval/return_sem": result["return_sem"]})
     writer.log_text(json.dumps(result, indent=2, allow_nan=False), f"eval/report/{step_count}.json")
@@ -874,25 +950,30 @@ def update(
             entropy=entropy,  # ()
             approx_kl=approx_kl,  # ()
             clip_fraction=clip_fraction,  # ()
+            gradient_norm=jnp.zeros((), dtype=jnp.float32),  # () populated only for accepted updates
+            gradient_clip_fraction=jnp.zeros((), dtype=jnp.float32),  # ()
         )  # loss: (); metrics: scalar leaves
 
     loss, backward, metrics = jax.vjp(loss_fn, train_state.params, has_aux=True)  # loss: (); metric leaves: ()
 
-    def apply_gradients() -> TrainState:
+    def apply_gradients() -> tuple[TrainState, MinibatchMetrics]:
         # Defer backpropagation until the KL check accepts the minibatch.
         (grads,) = backward(jnp.ones_like(loss))  # parameter-shaped leaves
         # Reduce gradients across the global minibatch before clipping and Adam.
         grads = jax.lax.with_sharding_constraint(grads, PartitionSpec())
-        return train_state.apply_gradients(grads=grads)
+        gradient_norm = optax.tree.norm(grads).astype(jnp.float32)  # ()
+        return train_state.apply_gradients(grads=grads), metrics.replace(
+            gradient_norm=gradient_norm,  # ()
+            gradient_clip_fraction=(gradient_norm > config.max_grad_norm).astype(jnp.float32),  # ()
+        )
 
     if config.target_kl is None:
-        return apply_gradients(), metrics
-    train_state = jax.lax.cond(
+        return apply_gradients()
+    return jax.lax.cond(
         metrics.approx_kl > config.target_kl,
-        lambda: train_state,
+        lambda: (train_state, metrics),
         apply_gradients,
     )
-    return train_state, metrics
 
 
 @jax.jit
@@ -1096,6 +1177,21 @@ def optimize_rollout(
             kl_exceeded=jnp.asarray(False),  # ()
         ),
     )
+
+    def final_minibatch_kl(indices: jax.Array) -> jax.Array:  # (M,) -> (); M = B / num_minibatches
+        minibatch = jax.tree.map(itemgetter(indices), batch)  # (M, T, ...); memory: (M, H)
+        minibatch = jax.lax.with_sharding_constraint(minibatch, PartitionSpec("batch"))
+        output = updated.train_state.apply_fn(
+            {"params": updated.train_state.params},
+            minibatch.observations,
+            minibatch.model_carry,
+            minibatch.episode_starts,
+        )
+        log_ratio = output.policy.log_prob(minibatch.actions) - minibatch.old_log_probs  # (M, T)
+        return (jnp.expm1(log_ratio) - log_ratio).mean()  # ()
+
+    indices = jnp.arange(config.num_envs).reshape(config.num_minibatches, -1)  # (num_minibatches, M)
+    final_approx_kl = jax.lax.map(final_minibatch_kl, indices).mean()  # ()
     episodes = EpisodeMetrics(
         episode_count=rollout.episode_count,  # ()
         episode_return_sum=rollout.episode_return_sum,  # ()
@@ -1112,6 +1208,7 @@ def optimize_rollout(
         rollout_count=jnp.asarray(1, dtype=jnp.int32),  # ()
         update_count=updated.minibatch_count - updated.kl_exceeded.astype(jnp.int32),  # ()
         early_stop_count=updated.kl_exceeded.astype(jnp.int32),  # ()
+        final_approx_kl_sum=final_approx_kl,  # ()
     )
     # Widen only metric arithmetic; model and environment computation keep their dtypes.
     with jax.enable_x64():
@@ -1281,6 +1378,7 @@ def train(config: Config) -> TrainState:
                     + mean_metrics["entropy_loss"],
                     "train/entropy": mean_metrics["entropy"],
                     "train/approx_kl": mean_metrics["approx_kl"],
+                    "train/final_approx_kl": float(window.final_approx_kl_sum) / window_iteration_count,
                     "train/clip_fraction": mean_metrics["clip_fraction"],
                     "train/iterations_per_second": window_iteration_count / rate_seconds,
                     "train/env_steps_per_second": sps,
@@ -1294,6 +1392,11 @@ def train(config: Config) -> TrainState:
                     "train/progress_fraction": step_count / config.total_steps,
                     "rollout/episode_count": window_episode_count,
                 }
+                if window_update_count:
+                    scalars["train/gradient_norm"] = float(window.minibatch_metrics.gradient_norm) / window_update_count
+                    scalars["train/gradient_clip_fraction"] = (
+                        float(window.minibatch_metrics.gradient_clip_fraction) / window_update_count
+                    )
                 if config.target_kl is not None:
                     scalars["train/kl_early_stop_fraction"] = int(window.early_stop_count) / window_iteration_count
                 if window.explained_variance_count:

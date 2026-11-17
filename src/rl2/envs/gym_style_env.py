@@ -1,12 +1,32 @@
 """Shared interface for host-stepped, batched PPO environments."""
 
 from abc import ABC, abstractmethod
-from typing import Any, NamedTuple
+from enum import IntEnum
+from typing import Any, NamedTuple, TypedDict
 
 import gymnasium as gym
 import jax
 import numpy as np
 from numpy.typing import NDArray
+
+
+class StopReason(IntEnum):
+    ONGOING = 0  # Episode continues; excluded from stop fractions.
+    SUCCESS = 1  # Termination: goal reached; takes precedence over a simultaneous collision.
+    COLLISION = 2  # Termination: collision ended the episode without success.
+    TERMINATED = 3  # Termination: other or unspecified terminal condition.
+    TIME_LIMIT = 4  # Truncation: episode horizon reached without a terminal condition.
+    SCENE_ROTATION = 5  # Truncation: scene reload interrupted an otherwise ongoing episode.
+
+
+STOP_REASON_NAMES = {int(reason): reason.name.lower() for reason in StopReason if reason != StopReason.ONGOING}
+
+
+class GymStyleInfo(TypedDict, total=False):
+    """Optional host metadata, captured before autoreset or scene rotation."""
+
+    stop_reason: NDArray[np.int32]  # (B,) StopReason codes
+    goal_distance: NDArray[np.float32]  # (B,) Euclidean distance to the goal in metres
 
 
 def replace_observation[ObservationT](
@@ -34,6 +54,7 @@ class GymStyleStep[ObservationT](NamedTuple):
     terminated: NDArray[np.bool_]  # (B,) bool
     truncated: NDArray[np.bool_]  # (B,) bool
     final_observations: ObservationT  # NumPy leaves: (B, *O), before autoreset
+    info: GymStyleInfo | None = None  # optional (B,) metadata leaves
 
 
 class GymStyleEnv[ObservationT](ABC):

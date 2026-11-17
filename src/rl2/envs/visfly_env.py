@@ -16,6 +16,7 @@ from pydantic.dataclasses import dataclass
 from rl2.envs.gym_style_env import (
     GymStyleEnv,
     GymStyleStep,
+    StopReason,
     replace_observation,
 )
 
@@ -130,7 +131,20 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         )  # (B,)
         observations = convert_observation(observations, self.config.channels_first)  # rgb: (B, H, W, 3)
         final = jax.tree.map(to_numpy, observations)  # leaves: (B, *O)
+        stop_reasons = np.full(self.num_envs, StopReason.ONGOING, dtype=np.int32)  # (B,)
         for index in np.flatnonzero(done):
+            info = infos[index]
+            # Success wins simultaneous collisions; termination wins simultaneous timeouts.
+            if terminated[index]:
+                if info.get("is_success", False):
+                    reason = StopReason.SUCCESS
+                elif info.get("episode", {}).get("extra", {}).get("collision", False):
+                    reason = StopReason.COLLISION
+                else:
+                    reason = StopReason.TERMINATED
+            else:
+                reason = StopReason.TIME_LIMIT
+            stop_reasons[index] = reason
             if truncated[index] and not terminated[index] and "terminal_observation" not in infos[index]:
                 raise ValueError("VisFly timeouts require terminal_observation")
             if "terminal_observation" in infos[index]:
@@ -142,6 +156,7 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         interval = self.config.scene_rotation_env_steps
         if interval is not None and self._scene_env_steps >= interval:
             # End ongoing episodes at the old scene state, then reload all scenes together.
+            stop_reasons[~done] = StopReason.SCENE_ROTATION
             truncated |= ~done  # (B,)
             observations = self.reset()  # leaves: (B, *O)
         return GymStyleStep(
@@ -150,6 +165,12 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
             terminated=to_numpy(terminated).astype(bool, copy=False),  # (B,)
             truncated=to_numpy(truncated).astype(bool, copy=False),  # (B,)
             final_observations=final,  # state: (B, S), target: (B, 3), rgb: (B, H, W, 3)
+            info={
+                "stop_reason": stop_reasons,  # (B,)
+                "goal_distance": np.linalg.norm(final["target"] - final["state"][:, :3], axis=-1).astype(
+                    np.float32
+                ),  # (B,)
+            },
         )
 
     def render(self) -> NDArray[np.uint8]:  # (B, H, W_scene + W_agent, 3)

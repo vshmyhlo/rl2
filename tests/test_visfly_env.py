@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from rl2.envs.gym_style_env import StopReason
 from rl2.envs.visfly_env import RawVisFlyObservation, VisFlyConfig, VisFlyEnv, convert_observation
 
 
@@ -154,7 +155,7 @@ def test_scene_rotation_truncates_ongoing_episodes_with_old_scene_observations()
     def observation(value: int) -> RawVisFlyObservation[np.ndarray]:
         return RawVisFlyObservation(
             state=np.full((4, 13), value, dtype=np.float32),  # (B, S)
-            target=np.full((4, 3), value, dtype=np.float32),  # (B, 3)
+            target=np.zeros((4, 3), dtype=np.float32),  # (B, 3)
             rgb=np.full((4, 3, 2, 4), value, dtype=np.uint8),  # (B, 3, H, W)
         )
 
@@ -180,13 +181,19 @@ def test_scene_rotation_truncates_ongoing_episodes_with_old_scene_observations()
         env.reset()
         first = env.step(np.zeros((4, 4)))
         np.testing.assert_array_equal(first.truncated, [False, False, True, False])
+        np.testing.assert_array_equal(first.info["stop_reason"], [0, StopReason.TERMINATED, StopReason.TIME_LIMIT, 0])
         assert backend.reset.call_count == 1
         rotated = env.step(np.zeros((4, 4)))
         np.testing.assert_array_equal(rotated.terminated, [False, True, False, False])
         np.testing.assert_array_equal(rotated.truncated, [True, False, True, True])
+        np.testing.assert_array_equal(
+            rotated.info["stop_reason"],
+            [StopReason.SCENE_ROTATION, StopReason.TERMINATED, StopReason.TIME_LIMIT, StopReason.SCENE_ROTATION],
+        )
         np.testing.assert_array_equal(rotated.observations["state"], 100)
         np.testing.assert_array_equal(rotated.final_observations["state"][:, 0], [1, 10, 10, 1])
-        np.testing.assert_array_equal(rotated.final_observations["target"][:, 0], [1, 10, 10, 1])
+        np.testing.assert_array_equal(rotated.final_observations["target"], 0)
+        np.testing.assert_allclose(rotated.info["goal_distance"], np.sqrt(3) * np.array([1, 10, 10, 1]))
         np.testing.assert_array_equal(rotated.final_observations["rgb"][:, 0, 0, 0], [1, 10, 10, 1])
         env.step(np.zeros((4, 4)))
         assert backend.reset.call_count == 2
@@ -195,6 +202,53 @@ def test_scene_rotation_truncates_ongoing_episodes_with_old_scene_observations()
         assert backend.reset.call_count == 3  # Explicit resets also restart the rotation counter.
         assert loader.return_value.call_args.kwargs["random_kwargs"]["scene_iter"] is True
         assert config.kwargs["random_kwargs"]["scene_iter"] is False
+
+
+def test_visfly_stop_reasons_preserve_terminal_info_and_precedence() -> None:
+    observation = RawVisFlyObservation(
+        state=np.zeros((5, 13), dtype=np.float32),  # (B, S)
+        target=np.zeros((5, 3), dtype=np.float32),  # (B, 3)
+        rgb=np.zeros((5, 3, 2, 4), dtype=np.uint8),  # (B, C, H, W)
+    )
+    terminal = {key: value[0].copy() for key, value in observation.items()}  # leaves: (*O,)
+    backend = Mock(num_envs=5, action_space=gym.spaces.Box(low=-1, high=1, shape=(4,)))
+    backend.step.return_value = (
+        observation,
+        np.zeros(5, dtype=np.float32),  # (B,)
+        np.array([True, True, True, True, False]),  # (B,)
+        [
+            {
+                "is_success": True,
+                "episode_done": True,
+                "TimeLimit.truncated": True,
+                "episode": {"extra": {"collision": True}},
+            },
+            {
+                "is_success": False,
+                "episode_done": True,
+                "TimeLimit.truncated": True,
+                "episode": {"extra": {"collision": True}},
+            },
+            {"TimeLimit.truncated": True, "terminal_observation": terminal},
+            {"episode_done": True},
+            {"is_success": True, "episode": {"extra": {"collision": True}}},  # Stale info on a live episode.
+        ],
+    )
+    with (
+        patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
+        closing(VisFlyEnv(config=VisFlyConfig(), num_envs=5, seed=0)) as env,
+    ):
+        result = env.step(np.zeros((5, 4), dtype=np.float32))
+    assert result.info["stop_reason"] is not None
+    assert result.info["stop_reason"].shape == (5,)
+    assert result.info["stop_reason"].dtype == np.int32
+    np.testing.assert_array_equal(
+        result.info["stop_reason"],
+        [StopReason.SUCCESS, StopReason.COLLISION, StopReason.TIME_LIMIT, StopReason.TERMINATED, StopReason.ONGOING],
+    )
+    np.testing.assert_array_equal(
+        result.info["stop_reason"] != StopReason.ONGOING, result.terminated | result.truncated
+    )
 
 
 @pytest.mark.parametrize(
