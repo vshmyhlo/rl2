@@ -118,6 +118,9 @@ from typing import Annotated, Any, Literal, NamedTuple, Self
 # That native runtime can crash a later Triton import; use our gcsfs dependency.
 # Set this before importing Orbax, since epath caches its backend selection.
 os.environ.setdefault("EPATH_USE_TF", "0")
+# Direct script execution loads dependencies before rl2's package initialization.
+# Crazyflow requires this flag before any dependency imports SciPy.
+os.environ.setdefault("SCIPY_ARRAY_API", "1")
 
 import chex
 import jax

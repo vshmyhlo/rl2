@@ -49,7 +49,7 @@ from rl2.envs.smax_env import SMAXConfig, SMAXEnv
 from rl2.envs.storm_env import STORMConfig, STORMEnv
 from rl2.envs.xminigrid_env import XMiniGridConfig, XMiniGridEnv
 from rl2.jax_cache import configure_compilation_cache
-from rl2.ppo import Config, make_env, training_mesh
+from rl2.train_ppo import Config, make_env, training_mesh
 
 type Environment = BaseEnv[Any, Any] | BaseMultiAgentEnv[Any, Any]
 

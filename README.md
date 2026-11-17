@@ -45,17 +45,17 @@ JAXtari native RGB presets: [Breakout](configs/ppo/jaxtari/breakout.yaml) and
 [Space Invaders](configs/ppo/jaxtari/space_invaders.yaml), both with CNN + LSTM policies.
 Install sprites once with `uv run python -m jaxtari.install_sprites`.
 
-MinAtar Breakout using [ppo.py](src/rl2/ppo.py) with the
+MinAtar Breakout using [train_ppo.py](src/rl2/train_ppo.py) with the
 [Breakout config](configs/ppo/minatar/breakout.yaml).
 
 ![MinAtar Breakout PPO rollout](images/ppo_minatar_breakout.gif)
 
-MinAtar Space Invaders using [ppo.py](src/rl2/ppo.py) with the
+MinAtar Space Invaders using [train_ppo.py](src/rl2/train_ppo.py) with the
 [Space Invaders config](configs/ppo/minatar/space_invaders.yaml).
 
 ![MinAtar Space Invaders PPO rollout](images/ppo_minatar_space_invaders.gif)
 
-Pgx 2048 using [ppo.py](src/rl2/ppo.py) with the
+Pgx 2048 using [train_ppo.py](src/rl2/train_ppo.py) with the
 [2048 config](configs/ppo/pgx/2048.yaml).
 
 ![Pgx 2048 PPO rollout](images/ppo_pgx_2048.gif)

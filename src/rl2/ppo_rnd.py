@@ -1,6 +1,6 @@
 """Recurrent PPO with Random Network Distillation for exploration.
 
-Copied from ppo.py. Values have a final axis of (extrinsic, intrinsic); the
+Copied from train_ppo.py. Values have a final axis of (extrinsic, intrinsic); the
 intrinsic return continues across resets while recurrent memory still resets.
 """
 

@@ -18,7 +18,7 @@ from xminigrid.core.rules import EmptyRule
 from xminigrid.environment import EnvParams
 from xminigrid.types import TimeStep
 
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 from rl2.envs.xminigrid_env import XMiniGridConfig, XMiniGridEnv
 
 

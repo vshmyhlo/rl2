@@ -13,7 +13,7 @@ import pytest
 from flax.training.train_state import TrainState
 from jax.sharding import PartitionSpec
 
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 from rl2.model.encoders.conv2d import ConvStage
 
 

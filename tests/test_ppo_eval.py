@@ -12,7 +12,7 @@ import optax
 import pytest
 from flax.training.train_state import TrainState
 
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 from rl2.actions import ContinuousSpace
 from rl2.envs.base import EnvStep
 from rl2.envs.gymnax_env import GymnaxEnv

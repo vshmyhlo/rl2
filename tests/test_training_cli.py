@@ -3,7 +3,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from rl2 import ppo, train_mappo
+from rl2 import train_mappo
+from rl2 import train_ppo as ppo
 
 
 @pytest.mark.parametrize(

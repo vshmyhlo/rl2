@@ -20,7 +20,7 @@ submit = SimpleNamespace(**runpy.run_path(str(Path(__file__).resolve().parents[3
 
 # Import the trainer first: TensorFlow's exported LLVM symbols can crash Mesa.
 RENDER_CHECK = """
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 import mujoco
 import numpy as np
 from OpenGL import GL

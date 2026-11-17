@@ -37,7 +37,7 @@ from rl2.model.lux import (
     _SetAttentionBlock,
 )
 from rl2.observation_decoder import ConvObservationDecoder
-from rl2.ppo import ActorCritic
+from rl2.train_ppo import ActorCritic
 from rl2.ppo_rnd import ActorCritic as RNDActorCritic
 from rl2.ppo_rnd import ResetLSTM, RNDNetwork
 from rl2.ppo_rnd import ResidualBlock as RNDResidualBlock

@@ -19,7 +19,8 @@ import pytest
 from flax.training.train_state import TrainState
 from ppo_helpers import env_step, metric_history
 
-from rl2 import ppo, train_mappo
+from rl2 import train_mappo
+from rl2 import train_ppo as ppo
 from rl2.envs.base import BaseEnv
 from rl2.lstm import initial_carry
 
@@ -40,7 +41,7 @@ def test_cloud_filesystem_backend_on_startup(use_tf: str | None) -> None:
             """
 import sys
 from unittest.mock import patch
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 from etils import epath
 from etils.epath import backend
 

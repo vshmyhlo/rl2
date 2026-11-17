@@ -7,11 +7,11 @@ import yaml
 from omegaconf.errors import OmegaConfBaseException
 from pydantic import ValidationError
 
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 from rl2.envs.craftax_env import CraftaxConfig
 from rl2.envs.kinetix_env import KinetixConfig
 from rl2.envs.xminigrid_env import XMiniGridConfig
-from rl2.ppo import Config, Conv2DEncoderConfig, KinetixEncoderConfig, XMiniGridEncoderConfig, load_config
+from rl2.train_ppo import Config, Conv2DEncoderConfig, KinetixEncoderConfig, XMiniGridEncoderConfig, load_config
 
 
 @pytest.fixture

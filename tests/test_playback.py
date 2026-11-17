@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 from rl2.envs.base import EnvStep
 from rl2.envs.observations import CraftaxObservation
 

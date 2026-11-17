@@ -18,11 +18,11 @@ from omegaconf import OmegaConf
 from ppo_helpers import env_step, metric_history
 from pydantic import ValidationError
 
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 from rl2.envs.base import BaseEnv
 from rl2.lstm import initial_carry
 from rl2.model.encoders.conv2d import ConvStage
-from rl2.ppo import (
+from rl2.train_ppo import (
     ActorCritic,
     Config,
     learning_rate_schedule,
@@ -624,20 +624,20 @@ def test_train_logs_metric_windows_with_kl_stopping(capsys: pytest.CaptureFixtur
 
     with (
         jax.disable_jit(),
-        patch("rl2.ppo.GymnaxEnv", return_value=envs),
-        patch("rl2.ppo.ActorCritic", return_value=model) as actor_critic,
-        patch("rl2.ppo.MLflowLogger", return_value=writer),
+        patch("rl2.train_ppo.GymnaxEnv", return_value=envs),
+        patch("rl2.train_ppo.ActorCritic", return_value=model) as actor_critic,
+        patch("rl2.train_ppo.MLflowLogger", return_value=writer),
         patch.object(
             model,
             "apply",
             return_value=ppo.ActorCriticOutput(carry, ppo.CategoricalPolicy(jnp.array([[0.0, -jnp.inf]])), zeros),
         ),  # carry leaves: (B,H); (B,A); (B,)
-        patch("rl2.ppo.update", side_effect=fake_update),
-        patch("rl2.ppo.explained_variance", side_effect=(0.0, jnp.nan, jnp.nan)),
-        patch("rl2.ppo.monotonic", side_effect=now),
-        patch("rl2.ppo.checkpoint_manager"),
-        patch("rl2.ppo.restore_checkpoint", return_value=None),
-        patch("rl2.ppo.save_checkpoint", return_value=2.5),
+        patch("rl2.train_ppo.update", side_effect=fake_update),
+        patch("rl2.train_ppo.explained_variance", side_effect=(0.0, jnp.nan, jnp.nan)),
+        patch("rl2.train_ppo.monotonic", side_effect=now),
+        patch("rl2.train_ppo.checkpoint_manager"),
+        patch("rl2.train_ppo.restore_checkpoint", return_value=None),
+        patch("rl2.train_ppo.save_checkpoint", return_value=2.5),
     ):
         train(config)
     actor_critic.assert_called_once_with(

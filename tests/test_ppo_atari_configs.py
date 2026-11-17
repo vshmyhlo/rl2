@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from rl2.ppo import Config, load_config, make_env
+from rl2.train_ppo import Config, load_config, make_env
 
 
 @pytest.mark.parametrize(

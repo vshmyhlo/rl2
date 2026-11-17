@@ -84,13 +84,6 @@ bfcl = [
     "bfcl-eval==2025.12.17; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
 ]
 
-[project.scripts]
-mappo = "rl2.train_mappo:main"
-ppo = "rl2.ppo:main"
-ppo_rnd = "rl2.ppo_rnd:main"
-rl2-reasoning = "rl2.reasoning_cli:main"
-rl2-bfcl = "rl2.bfcl.runner:main"
-
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
 build-backend = "uv_build"

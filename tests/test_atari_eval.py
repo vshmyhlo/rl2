@@ -14,7 +14,8 @@ import pytest
 from flax.training.train_state import TrainState
 from numpy.typing import NDArray
 
-from rl2 import ppo, ppo_rnd
+from rl2 import ppo_rnd
+from rl2 import train_ppo as ppo
 from rl2.atari_eval import (
     EvaluationAgent,
     EvaluationConfig,
@@ -25,7 +26,7 @@ from rl2.atari_eval import (
     make_evaluation_env,
 )
 from rl2.atari_scores import ATARI_REFERENCE_SCORES, REFERENCE_SOURCE, get_reference_scores
-from rl2.ppo import LSTMStackCarry
+from rl2.train_ppo import LSTMStackCarry
 
 
 @dataclass(frozen=True)

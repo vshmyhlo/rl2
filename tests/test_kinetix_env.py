@@ -12,7 +12,7 @@ import pytest
 from flax import struct
 from flax.training.train_state import TrainState
 
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 from rl2.actions import ContinuousSpace, DiscreteSpace
 from rl2.envs.kinetix_env import KinetixConfig, KinetixEnv
 

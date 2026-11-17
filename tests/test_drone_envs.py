@@ -19,7 +19,7 @@ from rl2 import train_mappo as mappo
 
 # isort: split
 
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 from rl2.actions import ContinuousSpace, TruncatedGaussianPolicy
 from rl2.envs.crazyflow_env import CrazyflowConfig, CrazyflowEnv
 from rl2.envs.crazyrl_env import CrazyRLConfig, CrazyRLEnv

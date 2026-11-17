@@ -10,7 +10,7 @@ import yaml
 from flax.training.train_state import TrainState
 from pydantic import ValidationError
 
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 from rl2.actions import DiscreteSpace
 from rl2.envs.pgx_env import PgxConfig, PgxEnv
 from rl2.model.encoders.conv2d import ConvStage

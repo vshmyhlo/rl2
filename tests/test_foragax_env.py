@@ -10,7 +10,7 @@ import pytest
 from flax.training.train_state import TrainState
 from pydantic import ValidationError
 
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 from rl2.envs.foragax_env import ForagaxConfig, ForagaxEnv
 from rl2.model.encoders.conv2d import ConvStage
 

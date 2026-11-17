@@ -13,7 +13,7 @@ from jaxtari.games.jax_breakout import BreakoutState
 from jaxtari.paths import get_base_sprite_dir
 from pydantic import ValidationError
 
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 from rl2.actions import DiscreteSpace
 from rl2.envs.jaxtari_env import JAXtariConfig, JAXtariEnv, JAXtariParams, JAXtariState
 from rl2.model.encoders.conv2d import ConvStage

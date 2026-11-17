@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import jax
 import pytest
 
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 from rl2.envs.gymnax_env import GymnaxConfig
 
 

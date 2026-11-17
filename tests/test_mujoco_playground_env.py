@@ -14,7 +14,7 @@ from flax.training.train_state import TrainState
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 from pydantic import ValidationError
 
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 from rl2.actions import ContinuousSpace
 from rl2.envs import mujoco_playground_env, playground_assets
 from rl2.envs.mujoco_playground_env import PlaygroundConfig, PlaygroundEnv, PlaygroundParams

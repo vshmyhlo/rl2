@@ -11,7 +11,7 @@ import optax
 import pytest
 from flax.training.train_state import TrainState
 
-from rl2 import ppo
+from rl2 import train_ppo as ppo
 from rl2.envs.gymnax_env import GymnaxEnv
 from rl2.model.encoders.conv2d import ConvStage
 
