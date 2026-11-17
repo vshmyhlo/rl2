@@ -1,15 +1,20 @@
 env:
   id: VisFly
-  entry_point: VisFly.envs.NavigationEnv:NavigationEnv
-  num_scenes: 1 # num_envs / num_scenes agents per scene
+  entry_point: rl2.envs.visfly.navigation:RGBNavigationEnv
+  num_scenes: 8 # 4 agents per scene
+  scene_rotation_env_steps: 32768 # Reload after 1024 steps per agent; truncate ongoing episodes
   kwargs:
     device: cpu # JAX independently selects its training devices
     visual: true
     max_episode_steps: 256
-    target: [9.0, 0.0, 1.0]
+    scene_randomization: true
+    spawn_clearance: 0.3 # Metres from geometry
+    flight_height: [0.5, 2.5] # Metres above each scene's bounding-box floor
+    goal_distance: [2.0, 8.0] # Metres from the sampled start
     scene_kwargs:
       path: ${oc.env:VISFLY_SCENE_PATH}
       scene_type: json
+      shuffle: true
       render_settings:
         sensor_type: color
         mode: follow
@@ -23,14 +28,20 @@ env:
       state_generator:
         class: Uniform
         kwargs:
-          - position:
-              mean: [1.0, 0.0, 1.5]
-              half: [0.0, 2.0, 1.0]
+          - orientation: # Roll/pitch/yaw in radians; positions use scene bounds
+              mean: [0.0, 0.0, 0.0]
+              half: [0.1, 0.1, 3.141592653589793]
+            velocity: # Metres per second
+              mean: [0.0, 0.0, 0.0]
+              half: [0.5, 0.5, 0.2]
+            angular_velocity: # Radians per second
+              mean: [0.0, 0.0, 0.0]
+              half: [0.1, 0.1, 0.2]
     sensor_kwargs:
-      - sensor_type: DEPTH
-        uuid: depth
+      - sensor_type: COLOR
+        uuid: color
         resolution: [64, 64]
-seed: 1
+seed: 2
 total_steps: 10000000
 num_envs: 32
 num_steps: 64
@@ -38,11 +49,11 @@ num_minibatches: 4
 update_epochs: 1
 model:
   encoder:
-    type: conv2d # Image CNNs combined with state/target vectors
+    type: conv2d # RGB CNN combined with state/target vectors
     stages:
-      - {channels: 16, blocks: 1}
-      - {channels: 32, blocks: 1}
-      - {channels: 64, blocks: 1}
+      - { channels: 16, blocks: 1 }
+      - { channels: 32, blocks: 1 }
+      - { channels: 64, blocks: 1 }
     embedding_size: 128
   recurrent:
     hidden_size: 128

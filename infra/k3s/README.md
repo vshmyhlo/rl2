@@ -604,6 +604,22 @@ The VisFly adapter uses RGB-only navigation observations: `state`, `target`, and
 `rgb` (uint8, channels-last). Configure one `COLOR` sensor with UUID `color`;
 the example uses 64×64 pixels. `visual` must remain enabled.
 
+The image exposes the complete scene directory (734 scene files in the pinned
+dataset, including repeated layouts). The example runs eight scenes with four
+agents each and cycles through a seeded scene permutation every 32,768 environment
+steps (1,024 steps per agent). Ongoing episodes are truncated at scene changes;
+bootstrapping uses their final observations from the old scene.
+
+`scene_randomization` samples collision-free starts and goals from each scene's
+bounding box. `flight_height` is relative to its lowest point, `spawn_clearance`
+sets obstacle clearance, and `goal_distance` bounds start-to-goal separation, all
+in metres. Sampling is bounded and fails if no valid placement is found; endpoint
+checks do not guarantee a connected flight path. Orientation and linear/angular
+velocities also vary; the pinned backend's drag randomization has broken batched
+reset indexing and remains disabled. Evaluation uses the same scene pool, not a
+held-out split. Override
+`VISFLY_SCENE_PATH` to restrict the pool; rebuild the image to use the new default.
+
 The first simulator build is slow; its compiled dependencies are cached separately
 from training source edits. Scene downloads happen during the build, not at startup.
 

@@ -150,6 +150,53 @@ def test_visfly_count_mismatch_closes_backend() -> None:
     backend.close.assert_called_once_with()
 
 
+def test_scene_rotation_truncates_ongoing_episodes_with_old_scene_observations() -> None:
+    def observation(value: int) -> RawVisFlyObservation[np.ndarray]:
+        return RawVisFlyObservation(
+            state=np.full((4, 13), value, dtype=np.float32),  # (B, S)
+            target=np.full((4, 3), value, dtype=np.float32),  # (B, 3)
+            rgb=np.full((4, 3, 2, 4), value, dtype=np.uint8),  # (B, 3, H, W)
+        )
+
+    backend = Mock(num_envs=4, action_space=gym.spaces.Box(low=-1, high=1, shape=(4,)))
+    backend.reset.side_effect = [observation(0), observation(100), observation(200)]
+    terminal = {key: value[0] for key, value in observation(10).items()}  # leaves: (*O,)
+    backend.step.return_value = (
+        observation(1),
+        np.ones(4),  # (B,)
+        np.array([False, True, True, False]),  # (B,)
+        [
+            {},
+            {"episode_done": True, "terminal_observation": terminal},
+            {"TimeLimit.truncated": True, "terminal_observation": terminal},
+            {},
+        ],
+    )
+    config = VisFlyConfig(scene_rotation_env_steps=7, kwargs={"random_kwargs": {"scene_iter": False}})
+    with (
+        patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)) as loader,
+        closing(VisFlyEnv(config=config, num_envs=4, seed=0)) as env,
+    ):
+        env.reset()
+        first = env.step(np.zeros((4, 4)))
+        np.testing.assert_array_equal(first.truncated, [False, False, True, False])
+        assert backend.reset.call_count == 1
+        rotated = env.step(np.zeros((4, 4)))
+        np.testing.assert_array_equal(rotated.terminated, [False, True, False, False])
+        np.testing.assert_array_equal(rotated.truncated, [True, False, True, True])
+        np.testing.assert_array_equal(rotated.observations["state"], 100)
+        np.testing.assert_array_equal(rotated.final_observations["state"][:, 0], [1, 10, 10, 1])
+        np.testing.assert_array_equal(rotated.final_observations["target"][:, 0], [1, 10, 10, 1])
+        np.testing.assert_array_equal(rotated.final_observations["rgb"][:, 0, 0, 0], [1, 10, 10, 1])
+        env.step(np.zeros((4, 4)))
+        assert backend.reset.call_count == 2
+        env.reset()
+        env.step(np.zeros((4, 4)))
+        assert backend.reset.call_count == 3  # Explicit resets also restart the rotation counter.
+        assert loader.return_value.call_args.kwargs["random_kwargs"]["scene_iter"] is True
+        assert config.kwargs["random_kwargs"]["scene_iter"] is False
+
+
 @pytest.mark.parametrize(
     ("num_envs", "num_scenes", "unbatched"),
     [

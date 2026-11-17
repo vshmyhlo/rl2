@@ -79,7 +79,7 @@ RUN sed -i '/^from \.\.utils\.tools\.train_encoder import model as encoder$/d' /
     && sed -i '/^from torchvision import datasets, transforms$/d' /opt/VisFly/utils/dataloader.py
 # Scene JSON contains paths relative to the parent of VisFly.
 RUN ln -s /opt/VisFly /app/VisFly
-ENV PYTHONPATH=/opt VISFLY_SCENE_PATH=/opt/VisFly/datasets/visfly-beta/configs/scenes/garage_simple_l_medium
+ENV PYTHONPATH=/opt VISFLY_SCENE_PATH=/opt/VisFly/datasets/visfly-beta/configs/scenes
 # Use TensorBoard's no-TensorFlow mode for PyTorch logging. Loading TensorFlow
 # before Triton introduces conflicting native compiler libraries.
 RUN touch /app/.venv/lib/python3.12/site-packages/tensorboard/compat/notf.py

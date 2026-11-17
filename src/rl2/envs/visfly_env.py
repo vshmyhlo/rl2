@@ -71,6 +71,7 @@ class VisFlyConfig:
     id: Literal["VisFly"] = "VisFly"
     entry_point: str = "rl2.envs.visfly.navigation:RGBNavigationEnv"  # Must implement RawVisFlyObservation.
     num_scenes: Annotated[int, Field(gt=0)] = 1
+    scene_rotation_env_steps: Annotated[int, Field(gt=0)] | None = None  # Across all agents; checked per vector step.
     kwargs: dict[str, Any] = field(default_factory=dict, hash=False)
     channels_first: bool = True  # Backend RGB is CHW; False accepts already-HWC RGB.
 
@@ -83,12 +84,16 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
             config = replace(config, num_scenes=1)
         self.config = config
         self.num_envs = num_envs
+        self._scene_env_steps = 0
         if num_envs % config.num_scenes:
             raise ValueError("num_envs must be divisible by env.num_scenes")
         reserved = {"num_scene", "num_agent_per_scene", "seed", "requires_grad"} & config.kwargs.keys()
         if reserved:
             raise ValueError(f"VisFly kwargs are managed by the trainer: {sorted(reserved)}")
         creator = load_env_creator(config.entry_point)
+        kwargs = deepcopy(config.kwargs)
+        if config.scene_rotation_env_steps is not None:
+            kwargs.setdefault("random_kwargs", {})["scene_iter"] = True
         with ExitStack() as resources:
             self.backend = resources.enter_context(
                 closing(
@@ -97,7 +102,7 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
                         num_agent_per_scene=num_envs // config.num_scenes,
                         seed=seed,
                         requires_grad=False,
-                        **deepcopy(config.kwargs),
+                        **kwargs,
                     )
                 )
             )
@@ -108,6 +113,7 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
 
     def reset(self) -> VisFlyObservation[NDArray[Any]]:
         """Return (B, S) state, (B, 3) target, and (B, H, W, 3) RGB."""
+        self._scene_env_steps = 0
         return convert_observation(self.backend.reset(), self.config.channels_first)
 
     def step(self, actions: NDArray[Any]) -> GymStyleStep[VisFlyObservation[NDArray[Any]]]:  # (B, *action_shape)
@@ -131,6 +137,12 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
                     infos[index]["terminal_observation"], self.config.channels_first
                 )  # state: (S,), target: (3,), rgb: (H, W, 3)
                 replace_observation(final, terminal, index=int(index))
+        self._scene_env_steps += self.num_envs
+        interval = self.config.scene_rotation_env_steps
+        if interval is not None and self._scene_env_steps >= interval:
+            # End ongoing episodes at the old scene state, then reload all scenes together.
+            truncated |= ~done  # (B,)
+            observations = self.reset()  # leaves: (B, *O)
         return GymStyleStep(
             observations=observations,  # state: (B, S), target: (B, 3), rgb: (B, H, W, 3)
             rewards=to_numpy(rewards).astype(np.float32, copy=False),  # (B,)

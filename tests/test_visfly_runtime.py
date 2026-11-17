@@ -15,20 +15,16 @@ pytestmark = pytest.mark.skipif(os.environ.get("RL2_VISFLY_TESTS") != "1", reaso
 @pytest.mark.parametrize("num_envs", [pytest.param(2, id="batch"), pytest.param(1, id="evaluation")])
 def test_rendered_reset_step_and_autoreset(num_envs: int) -> None:
     config = VisFlyConfig(
+        scene_rotation_env_steps=num_envs,
         kwargs={
             "device": "cpu",
             "visual": True,
             "max_episode_steps": 1,
+            "scene_randomization": True,
             "scene_kwargs": {"path": os.environ["VISFLY_SCENE_PATH"], "scene_type": "json"},
             "dynamics_kwargs": {"action_type": "bodyrate", "dt": 0.03, "ctrl_dt": 0.03},
-            "random_kwargs": {
-                "state_generator": {
-                    "class": "Uniform",
-                    "kwargs": [{"position": {"mean": [1.0, 0.0, 1.5], "half": [0.0, 0.0, 0.0]}}],
-                }
-            },
             "sensor_kwargs": [{"sensor_type": "COLOR", "uuid": "color", "resolution": [16, 16]}],
-        }
+        },
     )
     with closing(VisFlyEnv(config=config, num_envs=num_envs, seed=1, evaluation=num_envs == 1)) as env:
         observation = env.reset()  # leaves: (B, *O)

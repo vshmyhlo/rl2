@@ -5,8 +5,9 @@ Supports Gymnasium and VisFly through backend-specific GymStyleEnv subclasses.
 B denotes environments, T rollout steps, O observation leaf dimensions, A discrete
 actions, D continuous action size, and H recurrent width. Sequence arrays use
 (B, T, ...). Minibatches preserve entire environment sequences. Episode ends reset
-memory and stop GAE traces; timeouts bootstrap from final observations unless the
-episode also terminated.
+memory and stop GAE traces; truncations (timeouts or scene rotations) bootstrap
+from final observations unless the episode also terminated. Episode counts and
+return/length summaries include these truncated episodes.
 
 The default value_coef=1.0 weights the critic by 0.5 * mean squared value error.
 
