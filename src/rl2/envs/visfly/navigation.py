@@ -2,8 +2,9 @@
 
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from random import Random
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import numpy as np
 import torch
@@ -76,6 +77,7 @@ class RGBNavigationEnv(NavigationEnv):
         visual: bool = True,
         sensor_kwargs: list[dict[str, Any]] | None = None,
         scene_randomization: bool = False,
+        scene_split: Literal["train", "test"] = "train",
         spawn_clearance: float = 0.3,
         flight_height: tuple[float, float] = (0.5, 2.5),
         goal_distance: tuple[float, float] = (2.0, 8.0),
@@ -107,14 +109,26 @@ class RGBNavigationEnv(NavigationEnv):
             raise ValueError("RGBNavigationEnv requires one COLOR sensor with uuid='color'")
         super().__init__(visual=True, sensor_kwargs=sensor_kwargs, **kwargs)
         self.observation_space.spaces["rgb"] = self.observation_space.spaces.pop("color")
+        manager = self.envs.sceneManager
+        loader = manager._scene_loader
+        root = Path(manager.root_path)
+        loader.paths = [
+            path
+            for path in loader.paths
+            if any(
+                part == "test" or part.endswith("_test")
+                for part in (root.name, *Path(path).relative_to(root).parts[:-1])
+            )
+            == (scene_split == "test")
+        ]
+        if not loader.paths:
+            raise ValueError(f"No scenes in the {scene_split} split under {root}")
+        # Filter before the first reset, then cycle through the selected inventory.
+        loader.paths = sorted(loader.paths)
+        if loader.shuffle:
+            Random(kwargs.get("seed", 42)).shuffle(loader.paths)
+        loader._select_index = list(range(len(loader.paths)))
         if scene_randomization:
-            manager = self.envs.sceneManager
-            # Cycle through a reproducible permutation of the complete recursive scene inventory.
-            loader = manager._scene_loader
-            loader.paths = sorted(loader.paths)
-            if loader.shuffle:
-                Random(kwargs.get("seed", 42)).shuffle(loader.paths)
-            loader._select_index = list(range(len(loader.paths)))
             self.envs.stateGenerators = [
                 SceneStateRandomizer(
                     base=base,

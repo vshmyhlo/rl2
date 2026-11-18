@@ -7,12 +7,13 @@ env:
     device: cpu # VisFly tensors/dynamics; Habitat still renders on GPU alongside JAX
     visual: true
     max_episode_steps: 500 # 10 seconds at 50 Hz
+    failure_penalty: 20.0 # Subtract once on terminal failure; 0 disables. Success and truncation alone are exempt.
     scene_randomization: true
     spawn_clearance: 0.3 # Metres from geometry
     flight_height: [0.5, 2.5] # Metres above each scene's bounding-box floor
     goal_distance: [2.0, 8.0] # Metres from the sampled start
     scene_kwargs:
-      path: ${oc.env:VISFLY_SCENE_PATH}
+      path: ${oc.env:VISFLY_SCENE_PATH} # Trainer reserves test/* and *_test/* scenes for evaluation
       scene_type: json
       shuffle: true
       render_settings:
@@ -75,5 +76,5 @@ video_interval: 0 # Record videos only during evaluation
 eval_interval: 100
 eval_episodes: 10
 eval_video: true
-run_id: ppo_gym_visfly_ne${num_envs}_ns${num_steps}_mb${num_minibatches}_ue${update_epochs}_seed${seed}
+run_id: ppo_gym_visfly_ne${num_envs}_ns${num_steps}_mb${num_minibatches}_ue${update_epochs}_fp${env.kwargs.failure_penalty}_seed${seed}
 ckpt_dir: /runs/ppo_gym/${run_id}

@@ -630,9 +630,11 @@ sets obstacle clearance, and `goal_distance` bounds start-to-goal separation, al
 in metres. Sampling is bounded and fails if no valid placement is found; endpoint
 checks do not guarantee a connected flight path. Orientation and linear/angular
 velocities also vary; the pinned backend's drag randomization has broken batched
-reset indexing and remains disabled. Evaluation uses the same scene pool, not a
-held-out split. Override
-`VISFLY_SCENE_PATH` to restrict the pool; rebuild the image to use the new default.
+reset indexing and remains disabled. The trainer reserves directories named `test`
+or ending in `_test`, at or below `VISFLY_SCENE_PATH`, for evaluation and gameplay;
+training uses the remaining scenes (631 train / 103 test files in the pinned dataset).
+An empty requested split raises an error. Override `VISFLY_SCENE_PATH` to restrict
+the pool; keep both splits available when evaluation is enabled.
 
 The first simulator build is slow; its compiled dependencies are cached separately
 from training source edits. Scene downloads happen during the build, not at startup.

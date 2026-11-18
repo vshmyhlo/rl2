@@ -206,12 +206,13 @@ def test_factory_selects_backend(config: ppo.Config, env_config: ppo.EnvConfig, 
     if isinstance(env_config, VisFlyConfig):
         assert env is visfly_env.return_value
         visfly_env.assert_called_once_with(
-            config=env_config,
+            config=replace(env_config, kwargs={**env_config.kwargs, "scene_split": "test" if evaluation else "train"}),
             num_envs=1 if evaluation else config.num_envs,
             seed=17,
             evaluation=evaluation,
         )
         gym_env.assert_not_called()
+        assert "scene_split" not in env_config.kwargs
     else:
         assert env is gym_env.return_value
         gym_env.assert_called_once_with(
@@ -546,6 +547,7 @@ def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:
 
     def create(**kwargs: Any) -> VisFlyBatch:
         assert kwargs["num_scene"] == kwargs["num_agent_per_scene"] == 1
+        assert kwargs["scene_split"] == "test"
         backend = VisFlyBatch(num_envs=1)
         backends.append(backend)
         return backend

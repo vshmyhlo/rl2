@@ -3,6 +3,9 @@
 Supports Gymnasium and VisFly through backend-specific GymStyleEnv subclasses.
 The visfly encoder preprocesses raw navigation state into scaled body-frame
 velocity and relative goals, retaining orientation and omitting absolute position.
+VisFly training excludes scene directories named test or ending in _test, at or
+below scene_kwargs.path. Evaluation and gameplay use only those test directories;
+an empty requested split raises an error. Other Gymnasium environments are unchanged.
 
 B denotes environments, T rollout steps, O observation leaf dimensions, A discrete
 actions, D continuous action size, and H recurrent width. Sequence arrays use
@@ -135,7 +138,11 @@ Gameplay is saved as looping GIFs at video_fps, with frame boundaries rounded to
 single-environment instances seeded independently of training. Frames are rendered
 before actions; autoreset frames are excluded. video_max_frames=None records the
 full episode. VisFly requires its simulator dependencies, scene assets, and RGB
-render settings for video; scoring alone does not require RGB rendering.
+render settings for video; scoring alone does not require RGB rendering. VisFly's
+third view shows navigation diagnostics and previous-transition actions/rewards.
+At episode end, a final diagnostics card uses terminal state with labeled last
+recorded views, held for up to one second within video_max_frames (replacing the
+last frame if the cap is full). This hold adds no environment steps.
 
 Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
 model/parameter_count/<step>.txt, eval/report/<step>.json, gameplay/<step>.gif,
@@ -155,7 +162,7 @@ import json
 import os
 from collections.abc import Callable
 from contextlib import ExitStack, closing
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 from functools import partial
 from math import sqrt
 from operator import itemgetter
@@ -198,6 +205,7 @@ from rl2.actions import (
 from rl2.configuration import BaseConfig, load_config
 from rl2.envs.gym_env import GymConfig, GymEnv, GymObservation
 from rl2.envs.gym_style_env import STOP_REASON_NAMES, GymStyleEnv
+from rl2.envs.visfly.render import RenderContext
 from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv, VisFlyObservation
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
@@ -434,6 +442,7 @@ def make_env(config: Config, *, seed: int | None = None, evaluation: bool = Fals
     num_envs = 1 if evaluation else config.num_envs
     seed = config.seed if seed is None else seed
     if isinstance(env_config, VisFlyConfig):
+        env_config = replace(env_config, kwargs={**env_config.kwargs, "scene_split": "test" if evaluation else "train"})
         return VisFlyEnv(config=env_config, num_envs=num_envs, seed=seed, evaluation=evaluation)
     return GymEnv(
         config=env_config,
@@ -763,6 +772,8 @@ def play_episode(
     seed = int(jax.random.bits(key, dtype=jnp.uint32))
     frames = []  # each (H, W, 3)
     episode_return = 0.0
+    last_reward = None
+    last_action = None  # (A,) for continuous VisFly actions
     length = 0
     stop_reason = None
     terminated = truncated = False
@@ -773,7 +784,13 @@ def play_episode(
         observations = jax.tree.map(jnp.asarray, env.reset())  # leaves: (1, *O)
         while True:
             if record and (config.video_max_frames is None or len(frames) < config.video_max_frames):
-                frames.append(env.render()[0])  # (H, W, 3)
+                if isinstance(env, VisFlyEnv):
+                    context = RenderContext(
+                        step=length, episode_return=episode_return, reward=last_reward, action=last_action
+                    )
+                    frames.append(env.render(contexts=[context])[0])  # (H, W, 3)
+                else:
+                    frames.append(env.render()[0])  # (H, W, 3)
             if (
                 record
                 and stop_at_frame_limit
@@ -783,9 +800,12 @@ def play_episode(
                 break
             sampled = sample_policy_step(train_state.apply_fn, train_state.params, observations, memory, starts, key)
             memory, key = sampled.memory, sampled.key  # leaves: (1, H); ()
-            transition = env.step(np.asarray(jax.device_get(sampled.actions)))
+            actions = np.asarray(jax.device_get(sampled.actions))  # (1, *action_shape)
+            transition = env.step(actions)
             observations = jax.device_put(transition.observations)  # leaves: (1, *O)
-            episode_return += float(transition.rewards[0])
+            last_action = actions[0]  # (*action_shape,)
+            last_reward = float(transition.rewards[0])
+            episode_return += last_reward
             length += 1
             if bool((transition.terminated | transition.truncated)[0]):
                 terminated = bool(transition.terminated[0])
@@ -795,6 +815,26 @@ def play_episode(
                         stop_reason = int(transition.info["stop_reason"][0])
                     if "goal_distance" in transition.info:
                         final_goal_distance = float(transition.info["goal_distance"][0])
+                if frames and isinstance(env, VisFlyEnv):
+                    context = RenderContext(
+                        step=length,
+                        episode_return=episode_return,
+                        reward=last_reward,
+                        action=last_action,
+                        stop_reason=stop_reason,
+                    )
+                    outcome = env.render_outcome(
+                        frames[-1], transition.final_observations, context=context
+                    )  # (H, W, 3)
+                    remaining = (
+                        max(1, round(config.video_fps))
+                        if config.video_max_frames is None
+                        else config.video_max_frames - len(frames)
+                    )
+                    if remaining:
+                        frames.extend([outcome] * min(remaining, max(1, round(config.video_fps))))
+                    else:
+                        frames[-1] = outcome
                 break
             starts = jnp.zeros(1, dtype=bool)  # (1,)
     return EpisodeResult(

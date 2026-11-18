@@ -3,7 +3,7 @@
 import runpy
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 from unittest.mock import Mock, patch
 
 import gymnasium as gym
@@ -53,9 +53,17 @@ class NavigationStub:
         self.num_envs = 2
         self.num_agent_per_scene = 1
         self.base_reward = torch.tensor([-0.25, 3.0])  # (B,)
+        scene_kwargs = kwargs.get("scene_kwargs", {})
+        root = scene_kwargs.get("path", ".")
+        paths = (
+            [str(path) for path in Path(root).rglob("*.scene_instance.json")]
+            if scene_kwargs
+            else ["scene_c", "scene_a", "scene_b"]
+        )
         self.envs = SimpleNamespace(
             sceneManager=SimpleNamespace(
-                _scene_loader=SimpleNamespace(paths=["scene_c", "scene_a", "scene_b"], shuffle=True),
+                root_path=root,
+                _scene_loader=SimpleNamespace(paths=paths, shuffle=scene_kwargs.get("shuffle", True)),
                 _scene_bounds=[SimpleNamespace(min=[-10, 0, -10], max=[0, 4, 0])] * 2,
                 get_point_is_collision=collision_free,
             ),
@@ -105,6 +113,62 @@ def test_navigation_failure_penalty_is_opt_in(navigation_class: type[Any]) -> No
     reward = env.get_reward()  # (B,)
     assert reward.shape == (2,)
     torch.testing.assert_close(reward, env.base_reward)
+
+
+@pytest.mark.parametrize(
+    ("split", "randomization", "shuffle"),
+    [("train", True, True), ("test", False, False), ("test", True, True)],
+)
+def test_navigation_scene_split(
+    navigation_class: type[Any], tmp_path: Path, split: Literal["train", "test"], randomization: bool, shuffle: bool
+) -> None:
+    # Ancestors outside the configured root must not affect membership.
+    root = tmp_path / "dataset_test" / "scenes"
+    train = ["apt.scene_instance.json", "latest/room.scene_instance.json", "train/nested/room.scene_instance.json"]
+    test = ["garage_test/room.scene_instance.json", "test/nested/room.scene_instance.json"]
+    for name in train + test:
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+    kwargs = {
+        "scene_kwargs": {"path": str(root), "shuffle": shuffle},
+        "scene_split": split,
+        "scene_randomization": randomization,
+        "seed": 7,
+    }
+    env = navigation_class(**kwargs)
+    loader = env.envs.sceneManager._scene_loader
+    expected = {str(root / name) for name in (train if split == "train" else test)}
+    assert set(loader.paths) == expected
+    assert {loader.paths[index] for index in loader._select_index} == expected
+    assert loader.paths == navigation_class(**kwargs).envs.sceneManager._scene_loader.paths
+    if not shuffle:
+        assert loader.paths == sorted(expected)
+    assert "scene_split" not in env.kwargs
+
+
+def test_navigation_scene_split_defaults_to_train(navigation_class: type[Any], tmp_path: Path) -> None:
+    train_path = tmp_path / "room.scene_instance.json"
+    train_path.write_text("{}")
+    test_dir = tmp_path / "test"
+    test_dir.mkdir()
+    (test_dir / "room.scene_instance.json").write_text("{}")
+
+    env = navigation_class(scene_kwargs={"path": str(tmp_path)})
+    loader = env.envs.sceneManager._scene_loader
+    assert loader.paths == [str(train_path)]
+    assert loader._select_index == [0]
+
+
+@pytest.mark.parametrize(("split", "directory"), [("train", "garage_test"), ("test", "garage")])
+def test_navigation_rejects_empty_scene_split(
+    navigation_class: type[Any], tmp_path: Path, split: Literal["train", "test"], directory: str
+) -> None:
+    root = tmp_path / directory
+    root.mkdir()
+    (root / "room.scene_instance.json").write_text("{}")
+    with pytest.raises(ValueError, match=f"No scenes in the {split} split"):
+        navigation_class(scene_kwargs={"path": str(root)}, scene_split=split)
 
 
 def test_navigation_failure_penalty_terminal_events(navigation_class: type[Any]) -> None:

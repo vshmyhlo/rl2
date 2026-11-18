@@ -1,5 +1,6 @@
 """Host-stepped VisFly batches with tensor snapshots and timeout bootstrapping."""
 
+from collections.abc import Sequence
 from contextlib import ExitStack, closing
 from copy import deepcopy
 from dataclasses import field, replace
@@ -19,6 +20,7 @@ from rl2.envs.gym_style_env import (
     StopReason,
     replace_observation,
 )
+from rl2.envs.visfly.render import RenderContext, diagnostics_panel
 
 
 class RawVisFlyObservation[Array](TypedDict):
@@ -173,10 +175,32 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
             },
         )
 
-    def render(self) -> NDArray[np.uint8]:  # (B, H, W_scene + W_agent, 3)
-        """Return (B, H, W_scene + W_agent, 3) uint8 scene/agent views, left/right.
+    def _diagnostics_panel(
+        self,
+        observation: VisFlyObservation[NDArray[Any]],  # leaves: (B, *O)
+        *,
+        index: int,
+        height: int,
+        context: RenderContext | None,
+    ) -> NDArray[np.uint8]:  # (H, W_debug, 3)
+        return diagnostics_panel(
+            observation["state"][index],  # (S,)
+            observation["target"][index],  # (3,)
+            height=height,
+            action_low=self.action_space.low,  # (A,)
+            action_high=self.action_space.high,  # (A,)
+            action_type=self.config.kwargs.get("dynamics_kwargs", {}).get("action_type", "bodyrate"),
+            context=context,
+            max_episode_steps=self.config.kwargs.get("max_episode_steps"),
+        )  # (H, W_debug, 3)
+
+    def render(
+        self, *, contexts: Sequence[RenderContext] | None = None
+    ) -> NDArray[np.uint8]:  # (B, H, W_scene + W_agent + W_debug, 3)
+        """Return (B, H, W_scene + W_agent + W_debug, 3) scene/camera/diagnostics RGB.
 
         Scale agent RGB to the scene height with nearest-neighbor sampling, preserving aspect ratio.
+        W_debug is round(1.5 * H). Optional contexts supply per-agent episode and last-action details.
         """
         frames = to_numpy(self.backend.render())  # (S, H, W, C) or (H, W, C); S: scenes
         if frames.ndim == 3:
@@ -187,15 +211,41 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
             raise ValueError("VisFly rendering requires one RGB array per scene")
         frames = frames[..., :3].astype(np.uint8)  # (S, H, W, 3)
         frames = np.repeat(frames, self.num_envs // self.config.num_scenes, axis=0)  # (B, H, W_scene, 3)
-        rgb = to_numpy(self.backend.get_observation()["rgb"])  # (B, 3, H_agent, W_agent) or (B, H_agent, W_agent, 3)
-        if self.config.channels_first:
-            rgb = np.moveaxis(rgb, 1, -1)  # (B, H_agent, W_agent, 3)
+        observation = convert_observation(self.backend.get_observation(), self.config.channels_first)  # leaves: (B, *O)
+        rgb = observation["rgb"]  # (B, H_agent, W_agent, 3)
         height = frames.shape[1]
         width = max(1, round(rgb.shape[2] * height / rgb.shape[1]))
         agent_frames = np.stack(
             [cv2.resize(frame, (width, height), interpolation=cv2.INTER_NEAREST) for frame in rgb]
         )  # (B, H, W_agent, 3)
-        return np.concatenate((frames, agent_frames), axis=2)  # (B, H, W_scene + W_agent, 3)
+        panels = np.stack(
+            [
+                self._diagnostics_panel(
+                    observation,
+                    index=index,
+                    height=height,
+                    context=None if contexts is None else contexts[index],
+                )
+                for index in range(self.num_envs)
+            ]
+        )  # (B, H, W_debug, 3)
+        return np.concatenate((frames, agent_frames, panels), axis=2)  # (B, H, W_scene + W_agent + W_debug, 3)
+
+    def render_outcome(
+        self,
+        frame: NDArray[np.uint8],  # (H, W_scene + W_agent + W_debug, 3)
+        observation: VisFlyObservation[NDArray[Any]],  # leaves: (B, *O), before autoreset
+        *,
+        context: RenderContext,
+        index: int = 0,
+    ) -> NDArray[np.uint8]:  # (H, W_scene + W_agent + W_debug, 3)
+        """Return (H, W, 3) final diagnostics with explicitly labeled last pre-action views."""
+        panel = self._diagnostics_panel(
+            observation, index=index, height=frame.shape[0], context=context
+        )  # (H, W_debug, 3)
+        result = frame.copy()  # (H, W, 3)
+        result[:, -panel.shape[1] :] = panel
+        return result  # (H, W, 3)
 
     def close(self) -> None:
         self.backend.close()
