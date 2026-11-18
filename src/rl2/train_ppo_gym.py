@@ -143,7 +143,7 @@ single-environment instances seeded independently of training. Frames are render
 before actions; autoreset frames are excluded. video_max_frames=None records the
 full episode. VisFly requires its simulator dependencies, scene assets, and RGB
 render settings for video; scoring alone does not require RGB rendering. VisFly's
-third view shows navigation diagnostics and previous-transition actions/rewards.
+last view shows navigation diagnostics and previous-transition actions/rewards.
 At episode end, a final diagnostics card uses terminal state with labeled last
 recorded views, held for up to one second within video_max_frames (replacing the
 last frame if the cap is full). Omit the card when a custom backend provides no
@@ -796,10 +796,9 @@ def play_episode(
     initial_carry: RecurrentCarry,  # leaves: (1, H)
     *,
     record: bool,
-    stop_at_frame_limit: bool = False,
     deterministic: bool = False,
 ) -> EpisodeResult:
-    """Run a fresh host environment; record frames before actions, excluding autoresets."""
+    """Run a fresh episode, or record up to the frame cap; render before actions, excluding autoresets."""
     seed = int(jax.random.bits(key, dtype=jnp.uint32))
     frames = []  # each (H, W, 3)
     episode_return = 0.0
@@ -812,14 +811,9 @@ def play_episode(
     with closing(make_env(config, seed=seed, evaluation=True, record=record)) as env:
         observations = jax.device_put(env.reset())  # leaves: (1, *O)
         while True:
-            if (
-                record
-                and stop_at_frame_limit
-                and config.video_max_frames is not None
-                and len(frames) >= config.video_max_frames
-            ):
+            if record and config.video_max_frames is not None and len(frames) >= config.video_max_frames:
                 break
-            if record and (config.video_max_frames is None or len(frames) < config.video_max_frames):
+            if record:
                 frames.append(env.render()[0])  # (H, W, 3)
             if deterministic:
                 memory, actions = deterministic_policy_step(
@@ -890,7 +884,6 @@ def log_video(
         jax.random.fold_in(jax.random.key(config.seed), episode_count),
         initial_carry,
         record=True,
-        stop_at_frame_limit=True,
     )
     writer.log_video(episode.frames, f"gameplay/{step_count}.gif", fps=config.video_fps)
     seconds = monotonic() - started
@@ -933,7 +926,6 @@ def log_evaluation(
             jax.random.fold_in(jax.random.key(config.eval_seed), best_episode_index),
             initial_carry,
             record=True,
-            stop_at_frame_limit=True,
             deterministic=True,
         )
         if replay.frames:

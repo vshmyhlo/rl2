@@ -3,6 +3,7 @@
 Omit goal distances if a backend omits any completed episode's terminal observation.
 """
 
+import random
 from collections.abc import Generator
 from contextlib import ExitStack, closing, contextmanager
 from copy import deepcopy
@@ -92,17 +93,21 @@ class VisFlyConfig:
 
 
 class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
-    """Own a VisFly batch and its CPU Torch RNG; backend calls must run serially."""
+    """Own a VisFly batch and its Python/CPU Torch RNGs; backend calls must run serially."""
 
     @contextmanager
     def _use_rng(self) -> Generator[None]:
-        """Isolate upstream global CPU draws, including sampling during autoreset."""
+        """Isolate scene-loader shuffling and CPU sampling, including autoresets."""
         with torch.random.fork_rng(devices=[]):
             torch.set_rng_state(self._rng_state)
+            python_rng = random.getstate()
+            random.setstate(self._python_rng_state)
             try:
                 yield
             finally:
                 self._rng_state = torch.get_rng_state()  # (R,) serialized CPU RNG state
+                self._python_rng_state = random.getstate()
+                random.setstate(python_rng)
 
     def __init__(self, config: VisFlyConfig, num_envs: int, seed: int, *, evaluation: bool = False) -> None:
         if evaluation:
@@ -117,12 +122,13 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         reserved = {"num_scene", "num_agent_per_scene", "seed", "requires_grad"} & config.kwargs.keys()
         if reserved:
             raise ValueError(f"VisFly kwargs are managed by the trainer: {sorted(reserved)}")
-        creator = load_env_creator(config.entry_point)
         kwargs = deepcopy(config.kwargs)
         if config.scene_rotation_env_steps is not None:
             kwargs.setdefault("random_kwargs", {})["scene_iter"] = True
         self._rng_state = torch.Generator().manual_seed(seed).get_state()  # (R,) serialized CPU RNG state
+        self._python_rng_state = random.Random(seed).getstate()
         with self._use_rng(), ExitStack() as resources:
+            creator = load_env_creator(config.entry_point)  # Upstream imports initialize a Torch model.
             self.backend = resources.enter_context(
                 closing(
                     creator(

@@ -91,7 +91,8 @@ class NavigationStub:
         return self.base_reward  # (B,)
 
     def get_full_observation(self) -> dict[str, torch.Tensor]:
-        return self.get_observation()  # leaves: (B, *O)
+        self._observations = self.get_observation()  # leaves: (B, *O)
+        return self._observations  # leaves: (B, *O)
 
     def reset(self, state: Any = None, **kwargs: Any) -> dict[str, torch.Tensor]:
         return self.get_full_observation()  # leaves: (B, *O)
@@ -347,9 +348,11 @@ def test_reset_goals_preserve_other_agents_and_terminal_targets(navigation_class
         distances = (targets - env.position).norm(dim=-1)  # (B,)
         assert torch.all((distances >= 2.0) & (distances <= 8.0))
         refreshed = env.reset_agent_by_id(torch.tensor([1]))  # leaves: (B, *O)
+        assert refreshed is env._observations  # Upstream step returns this cached observation after autoreset.
         torch.testing.assert_close(initial["target"], targets)
         torch.testing.assert_close(refreshed["target"][0], targets[0])
         assert not torch.equal(refreshed["target"][1], targets[1])
+        torch.testing.assert_close(refreshed["target"], env.target)
 
 
 def test_rgb_backend_defaults_and_observation_space(navigation_class: type[Any]) -> None:

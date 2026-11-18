@@ -513,7 +513,7 @@ def test_evaluation_uses_fresh_environment_and_closes_on_failure(config: ppo.Con
         patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
         patch.object(VisFlyEnv, "render_outcome", autospec=True, side_effect=VisFlyEnv.render_outcome) as outcome,
     ):
-        result = ppo.play_episode(state, config, jax.random.key(0), memory, record=True, stop_at_frame_limit=True)
+        result = ppo.play_episode(state, config, jax.random.key(0), memory, record=True)
         assert len(result.frames) == 1
         assert result.frames[0].shape == (4, 14, 3)
         assert result.frames[0].dtype == np.uint8
@@ -547,14 +547,14 @@ def test_video_frame_limit_stops_after_last_recorded_action(config: ppo.Config) 
     state = TrainState.create(apply_fn=value_policy, params={}, tx=optax.sgd(0.1))
     memory = ((jnp.zeros((1, 1)), jnp.zeros((1, 1))),)  # leaves: (1, 1)
     with patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)):
-        result = ppo.play_episode(state, config, jax.random.key(0), memory, record=True, stop_at_frame_limit=True)
+        result = ppo.play_episode(state, config, jax.random.key(0), memory, record=True)
     assert len(result.frames) == result.length == backend.steps == 2
     assert result.stop_reason is None
     assert not result.terminated and not result.truncated
     assert backend.closed
 
 
-@pytest.mark.parametrize("frame_cap", [None, 2, 1], ids=["full_hold", "cap_at_end", "cap_before_end"])
+@pytest.mark.parametrize("frame_cap", [None, 3, 2], ids=["full_hold", "partial_hold", "cap_at_end"])
 def test_visfly_video_diagnostics_preserve_terminal_state_and_frame_cap(
     config: ppo.Config, frame_cap: int | None
 ) -> None:
@@ -581,14 +581,13 @@ def test_visfly_video_diagnostics_preserve_terminal_state_and_frame_cap(
     assert result.episode_return == 2
     assert result.stop_reason == StopReason.SUCCESS
     assert len(result.frames) == (4 if frame_cap is None else frame_cap)
-    assert render.call_count == (1 if frame_cap == 1 else 2)  # No render of the autoreset state.
+    assert render.call_count == 2  # No render of the autoreset state.
     initial: RenderContext = panel.call_args_list[0].kwargs["context"]
     assert initial.step == initial.episode_return == 0
     assert initial.reward is initial.action is None
-    if frame_cap != 1:
-        ongoing: RenderContext = panel.call_args_list[1].kwargs["context"]
-        assert ongoing.step == ongoing.episode_return == ongoing.reward == 1
-        assert ongoing.action.shape == (4,)
+    ongoing: RenderContext = panel.call_args_list[1].kwargs["context"]
+    assert ongoing.step == ongoing.episode_return == ongoing.reward == 1
+    assert ongoing.action.shape == (4,)
     terminal: RenderContext = panel.call_args.kwargs["context"]
     assert terminal.step == terminal.episode_return == 2
     assert terminal.reward == 1
@@ -723,14 +722,22 @@ def test_visfly_encoder_requires_navigation_environment(config: ppo.Config) -> N
 
 
 def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:
-    config = replace(config, env=VisFlyConfig(), eval_episodes=2)
+    config = replace(config, env=VisFlyConfig(), eval_episodes=2, video_max_frames=1)
     backends = []
 
     def create(**kwargs: Any) -> VisFlyBatch:
         assert kwargs["num_scene"] == kwargs["num_agent_per_scene"] == 1
         assert kwargs["scene_split"] == "test"
         backend = VisFlyBatch(num_envs=1)
-        backend.step = Mock(wraps=backend.step)
+        step = backend.step
+
+        def delayed_done(actions: NDArray[np.float32]) -> tuple[Any, ...]:  # (1, 4)
+            observations, rewards, done, infos = step(actions)
+            if backend.steps == 1:
+                done[:] = False
+            return observations, rewards, done, infos
+
+        backend.step = Mock(side_effect=delayed_done)
         backends.append(backend)
         return backend
 
@@ -740,14 +747,14 @@ def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:
     with patch("rl2.envs.visfly_env.load_env_creator", return_value=create):
         ppo.log_evaluation(state, config, writer, 0, 4, initial_carry=memory)
     assert len(backends) == 2
-    assert all(backend.closed and backend.steps == 1 for backend in backends)
+    assert all(backend.closed and backend.steps == 2 for backend in backends)  # Scoring ignores the video cap.
     for backend in backends:
         actions = backend.step.call_args.args[0]  # (1, 4)
         assert actions.shape == (1, 4)
         np.testing.assert_array_equal(actions, np.zeros((1, 4), dtype=np.float32))
     scalars, step = writer.log_metrics.call_args.args
     assert step == 4
-    assert scalars["eval/return"] == 1
+    assert scalars["eval/return"] == 2
     assert scalars["eval/return_std"] == scalars["eval/return_sem"] == 0
     assert scalars["eval/stop_fraction/success"] == 1
     assert scalars["eval/stop_fraction/terminated"] == scalars["eval/stop_fraction/collision"] == 0

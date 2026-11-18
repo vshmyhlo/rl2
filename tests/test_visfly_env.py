@@ -1,5 +1,6 @@
 """VisFly tensor snapshots and scene configuration."""
 
+import random
 from contextlib import closing
 from typing import Any, NamedTuple
 from unittest.mock import Mock, patch
@@ -24,12 +25,13 @@ class RandomTransition(NamedTuple):
 def random_backend(*, seed: int, **kwargs: Any) -> Mock:
     torch.manual_seed(seed)  # Match upstream construction's global seeding and draws.
     torch.rand(1)
+    random.random()  # The upstream scene/object loaders also consume Python's global RNG.
     backend = Mock(num_envs=1, action_space=gym.spaces.Box(low=-1, high=1, shape=(4,)))
 
     def observation() -> RawVisFlyObservation[torch.Tensor]:
         return RawVisFlyObservation(
             state=torch.rand((1, 13)),  # (B, S)
-            target=torch.rand((1, 3)),  # (B, 3)
+            target=torch.rand((1, 3)) + random.random(),  # (B, 3)
             rgb=torch.zeros((1, 3, 2, 4), dtype=torch.uint8),  # (B, C, H, W)
         )
 
@@ -56,10 +58,12 @@ def test_rng_streams_are_independent_of_evaluation_and_global_draws() -> None:
         patch("rl2.envs.visfly_env.load_env_creator", return_value=random_backend),
     ):
         initial_rng = torch.get_rng_state()  # (R,)
+        initial_python_rng = random.getstate()
         with closing(VisFlyEnv(config=config, num_envs=1, seed=7)) as baseline:
             expected_reset = baseline.reset()  # leaves: (B, *O)
             expected_steps = [baseline.step(actions), baseline.step(actions)]
         torch.testing.assert_close(torch.get_rng_state(), initial_rng)
+        assert random.getstate() == initial_python_rng
 
         with closing(VisFlyEnv(config=config, num_envs=1, seed=7)) as training:
             actual_reset = training.reset()  # leaves: (B, *O)
@@ -70,28 +74,35 @@ def test_rng_streams_are_independent_of_evaluation_and_global_draws() -> None:
                     evaluation.reset()
                     evaluation.step(actions)
                 torch.rand(3)
+                random.random()
                 global_rng = torch.get_rng_state()  # (R,)
+                global_python_rng = random.getstate()
                 actual = training.step(actions)
                 for key in expected.observations:
                     np.testing.assert_array_equal(actual.observations[key], expected.observations[key])
                     np.testing.assert_array_equal(actual.final_observations[key], expected.final_observations[key])
                 np.testing.assert_array_equal(actual.rewards, expected.rewards)
                 torch.testing.assert_close(torch.get_rng_state(), global_rng)
+                assert random.getstate() == global_python_rng
 
 
-@pytest.mark.parametrize("operation", ["construct", "reset", "step"])
+@pytest.mark.parametrize("operation", ["load", "construct", "reset", "step"])
 def test_backend_errors_restore_global_rng(operation: str) -> None:
     def fail(*args: Any, **kwargs: Any) -> None:
         torch.rand(3)
+        random.random()
         raise RuntimeError("backend failed")
 
     with (
         torch.random.fork_rng(devices=[]),
         patch(
-            "rl2.envs.visfly_env.load_env_creator", return_value=fail if operation == "construct" else random_backend
+            "rl2.envs.visfly_env.load_env_creator",
+            side_effect=fail if operation == "load" else None,
+            return_value=fail if operation == "construct" else random_backend,
         ),
     ):
         initial_rng = torch.get_rng_state()  # (R,)
+        initial_python_rng = random.getstate()
         with (
             pytest.raises(RuntimeError, match="backend failed"),
             closing(VisFlyEnv(config=VisFlyConfig(), num_envs=1, seed=7)) as env,
@@ -103,6 +114,7 @@ def test_backend_errors_restore_global_rng(operation: str) -> None:
                 env.backend.step.side_effect = fail
                 env.step(np.zeros((1, 4), dtype=np.float32))
         torch.testing.assert_close(torch.get_rng_state(), initial_rng)
+        assert random.getstate() == initial_python_rng
 
 
 @pytest.mark.parametrize(

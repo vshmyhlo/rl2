@@ -215,7 +215,7 @@ class RGBNavigationEnv(NavigationEnv):
         observations = super().reset(state=state, **kwargs)  # leaves: (B, *O)
         if self.scene_randomization:
             self._randomize_targets(torch.arange(self.num_envs))
-            observations = self.get_full_observation()  # leaves: (B, *O)
+            observations["target"] = self.target.to(self.device)  # (B, 3); retain the existing camera snapshots
         return observations  # leaves: (B, *O)
 
     def reset_agent_by_id(
@@ -229,7 +229,7 @@ class RGBNavigationEnv(NavigationEnv):
         if self.scene_randomization:
             indices = torch.arange(self.num_envs) if agent_indices is None else agent_indices.cpu()  # (N,)
             self._randomize_targets(indices)
-            observations = self.get_full_observation()  # leaves: (B, *O)
+            observations["target"] = self.target.to(self.device)  # (B, 3)
         return observations  # leaves: (B, *O)
 
     def get_observation(
