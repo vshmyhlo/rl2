@@ -52,6 +52,7 @@ class NavigationStub:
         self.position = torch.ones((2, 3))  # (B, 3)
         self.num_envs = 2
         self.num_agent_per_scene = 1
+        self.base_reward = torch.tensor([-0.25, 3.0])  # (B,)
         self.envs = SimpleNamespace(
             sceneManager=SimpleNamespace(
                 _scene_loader=SimpleNamespace(paths=["scene_c", "scene_a", "scene_b"], shuffle=True),
@@ -69,6 +70,9 @@ class NavigationStub:
                 "color": gym.spaces.Box(low=0, high=255, shape=(3, height, width), dtype=np.uint8),
             }
         )
+
+    def get_reward(self, predicted_obs: dict[str, torch.Tensor] | None = None) -> torch.Tensor:  # (B,)
+        return self.base_reward  # (B,)
 
     def get_full_observation(self) -> dict[str, torch.Tensor]:
         return self.get_observation()  # leaves: (B, *O)
@@ -94,6 +98,51 @@ def navigation_class() -> type[Any]:
     with patch.dict("sys.modules", modules):
         namespace = runpy.run_path(str(Path(visfly_env.__file__).parent / "visfly" / "navigation.py"))
     return namespace["RGBNavigationEnv"]
+
+
+def test_navigation_failure_penalty_is_opt_in(navigation_class: type[Any]) -> None:
+    env = navigation_class()
+    reward = env.get_reward()  # (B,)
+    assert reward.shape == (2,)
+    torch.testing.assert_close(reward, env.base_reward)
+
+
+def test_navigation_failure_penalty_terminal_events(navigation_class: type[Any]) -> None:
+    env = navigation_class(failure_penalty=20.0)
+    # Collision, bounds, both, other failure, success+failure, timeout, ongoing, already ended.
+    env.base_reward = torch.tensor([-0.1, -0.2, -0.3, -0.4, 3.0, -0.5, -0.6, -0.7])  # (B,)
+    env.is_collision = torch.tensor([True, False, True, False, True, False, False, True])  # (B,)
+    env.is_out_bounds = torch.tensor([False, True, True, False, True, False, False, False])  # (B,)
+    env._failure = torch.tensor([False, False, False, True, False, False, False, False])  # (B,)
+    env._success = torch.tensor([False, False, False, False, True, False, False, False])  # (B,)
+    env._episode_done = torch.tensor([False, False, False, False, False, False, False, True])  # (B,)
+    env._step_count = torch.tensor([1, 1, 500, 1, 1, 500, 1, 2])  # (B,)
+    env.max_episode_steps = 500
+    env.is_collision_reset = True
+    reward = env.get_reward()  # (B,)
+    assert reward.shape == (8,)
+    torch.testing.assert_close(reward, torch.tensor([-20.1, -20.2, -20.3, -20.4, 3.0, -0.5, -0.6, -0.7]))
+    torch.testing.assert_close(env.base_reward, torch.tensor([-0.1, -0.2, -0.3, -0.4, 3.0, -0.5, -0.6, -0.7]))
+
+
+def test_navigation_nonterminal_collision_has_no_penalty(navigation_class: type[Any]) -> None:
+    env = navigation_class(failure_penalty=20.0)
+    env.base_reward = torch.tensor([-0.25])  # (B,): singleton evaluation batch
+    env.is_collision = torch.tensor([True])  # (B,)
+    env.is_out_bounds = torch.tensor([False])  # (B,)
+    env._failure = torch.tensor([False])  # (B,)
+    env._success = torch.tensor([False])  # (B,)
+    env._episode_done = torch.tensor([False])  # (B,)
+    env.is_collision_reset = False
+    reward = env.get_reward()  # (B,)
+    assert reward.shape == (1,)
+    torch.testing.assert_close(reward, env.base_reward)
+
+
+@pytest.mark.parametrize("penalty", [-1.0, float("nan"), float("inf")], ids=["negative", "nan", "infinite"])
+def test_navigation_rejects_invalid_failure_penalty(navigation_class: type[Any], penalty: float) -> None:
+    with pytest.raises(ValueError, match="failure_penalty"):
+        navigation_class(failure_penalty=penalty)
 
 
 def test_scene_bounds_randomization_and_seeded_scene_order(navigation_class: type[Any]) -> None:

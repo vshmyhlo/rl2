@@ -24,6 +24,7 @@ from rl2.actions import CategoricalPolicy, ContinuousSpace, Policy, TruncatedGau
 from rl2.envs import GymStyleEnv, GymStyleStep
 from rl2.envs.gym_env import GymConfig, GymEnv
 from rl2.envs.gym_style_env import StopReason
+from rl2.envs.visfly.render import RenderContext, diagnostics_panel
 from rl2.envs.visfly_env import RawVisFlyObservation, VisFlyConfig, VisFlyEnv
 from rl2.model.encoders.conv2d import ConvStage
 
@@ -67,6 +68,7 @@ class VisFlyBatch:
         self.closed = False
         self.steps = 0
         self.state = torch.zeros((num_envs, 13))  # (B, S)
+        self.state[:, 3] = 1  # identity wxyz quaternion
         self.target = torch.zeros((num_envs, 3))  # (B, 3)
         self.rgb = torch.zeros((num_envs, 3, 4, 4), dtype=torch.uint8)  # (B, C, H, W)
 
@@ -152,7 +154,11 @@ def test_visfly_factory_tensors_terminal_observations_and_cleanup() -> None:
         np.testing.assert_array_equal(result.truncated, [False, True, True, False])
         np.testing.assert_array_equal(result.final_observations["state"][:, 0], [10, 20, 30, -1])
         np.testing.assert_array_equal(result.observations["state"], -1)
-        np.testing.assert_array_equal(initial["state"], 0)  # simulator buffer reuse cannot mutate a rollout
+        expected_state = np.zeros((4, 13), dtype=np.float32)  # (B, S)
+        expected_state[:, 3] = 1
+        np.testing.assert_array_equal(
+            initial["state"], expected_state
+        )  # simulator buffer reuse cannot mutate a rollout
         loader.return_value.assert_called_once_with(
             num_scene=2,
             num_agent_per_scene=2,
@@ -161,7 +167,7 @@ def test_visfly_factory_tensors_terminal_observations_and_cleanup() -> None:
             device="cpu",
             visual=True,
         )
-        assert env.render().shape == (4, 4, 8, 3)
+        assert env.render().shape == (4, 4, 14, 3)
     assert backend.closed
 
 
@@ -323,7 +329,7 @@ def test_rollout_bootstraps_timeout_with_final_observation_and_memory(config: pp
         assert float(rollout.episode_return_sum) == 12.0  # raw rewards, excluding timeout correction
         assert int(rollout.episode_length_sum) == 6
         np.testing.assert_array_equal(advanced.episode_returns, [0, 0, 0, 8])
-        np.testing.assert_array_equal(batch.observations["state"][:, 0], 0)
+        np.testing.assert_array_equal(batch.observations["state"][:, 0], jax.device_get(runner.observations["state"]))
 
 
 def test_real_gym_rollout_compiled_update_and_checkpoint(config: ppo.Config, tmp_path: Path) -> None:
@@ -423,7 +429,7 @@ def test_evaluation_uses_fresh_environment_and_closes_on_failure(config: ppo.Con
     with patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)):
         result = ppo.play_episode(state, config, jax.random.key(0), memory, record=True, stop_at_frame_limit=True)
         assert len(result.frames) == 1
-        assert result.frames[0].shape == (4, 8, 3)
+        assert result.frames[0].shape == (4, 14, 3)
         assert result.frames[0].dtype == np.uint8
         assert result.length == 0
         assert result.stop_reason is None
@@ -438,6 +444,72 @@ def test_evaluation_uses_fresh_environment_and_closes_on_failure(config: ppo.Con
         ):
             ppo.play_episode(state, config, jax.random.key(0), memory, record=True)
         assert backend.closed
+
+
+@pytest.mark.parametrize("frame_cap", [None, 2, 1], ids=["full_hold", "cap_at_end", "cap_before_end"])
+def test_visfly_video_diagnostics_preserve_terminal_state_and_frame_cap(
+    config: ppo.Config, frame_cap: int | None
+) -> None:
+    backend = VisFlyBatch(num_envs=1)
+    step = backend.step
+
+    def delayed_done(actions: NDArray[np.float32]) -> tuple[Any, ...]:  # (B, 4)
+        observations, rewards, done, infos = step(actions)
+        if backend.steps == 1:
+            done[:] = False
+        return observations, rewards, done, infos
+
+    backend.step = delayed_done
+    config = replace(config, env=VisFlyConfig(), video_max_frames=frame_cap, video_fps=2)
+    state = TrainState.create(apply_fn=value_policy, params={}, tx=optax.sgd(0.1))
+    memory = ((jnp.zeros((1, 1)), jnp.zeros((1, 1))),)  # leaves: (1, 1)
+    with (
+        patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
+        patch("rl2.envs.visfly_env.diagnostics_panel", wraps=diagnostics_panel) as panel,
+        patch.object(backend, "render", wraps=backend.render) as render,
+    ):
+        result = ppo.play_episode(state, config, jax.random.key(0), memory, record=True)
+    assert result.length == backend.steps == 2
+    assert result.episode_return == 2
+    assert result.stop_reason == StopReason.SUCCESS
+    assert len(result.frames) == (4 if frame_cap is None else frame_cap)
+    assert render.call_count == (1 if frame_cap == 1 else 2)  # No render of the autoreset state.
+    initial: RenderContext = panel.call_args_list[0].kwargs["context"]
+    assert initial.step == initial.episode_return == 0
+    assert initial.reward is initial.action is None
+    if frame_cap != 1:
+        ongoing: RenderContext = panel.call_args_list[1].kwargs["context"]
+        assert ongoing.step == ongoing.episode_return == ongoing.reward == 1
+        assert ongoing.action.shape == (4,)
+    terminal: RenderContext = panel.call_args.kwargs["context"]
+    assert terminal.step == terminal.episode_return == 2
+    assert terminal.reward == 1
+    assert terminal.action.shape == (4,)
+    assert terminal.stop_reason == StopReason.SUCCESS
+    np.testing.assert_array_equal(panel.call_args.args[0], 10)  # Terminal state, not autoreset's -1.
+    assert all(frame.shape == (4, 14, 3) for frame in result.frames)
+    assert backend.closed
+
+
+def test_visfly_render_channels_last_rectangular_camera_and_final_views() -> None:
+    backend = VisFlyBatch(num_envs=1)
+    backend.rgb = torch.full((1, 2, 4, 3), 150, dtype=torch.uint8)  # (B, H, W, C)
+    with (
+        patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
+        closing(VisFlyEnv(config=VisFlyConfig(channels_first=False), num_envs=1, seed=1)) as env,
+    ):
+        observation = env.reset()  # leaves: (B, *O)
+        frame = env.render()[0]  # (H, W_scene + W_agent + W_debug, 3)
+        assert frame.shape == (4, 18, 3)
+        np.testing.assert_array_equal(frame[:, :4], 0)
+        np.testing.assert_array_equal(frame[:, 4:12], 150)
+        before = frame.copy()  # (H, W, 3)
+        final = env.render_outcome(
+            frame, observation, context=RenderContext(step=1, episode_return=0, stop_reason=StopReason.TIME_LIMIT)
+        )  # (H, W, 3)
+        np.testing.assert_array_equal(frame, before)
+        np.testing.assert_array_equal(final[:, :12], frame[:, :12])
+        assert not np.array_equal(final[:, 12:], frame[:, 12:])
 
 
 def test_configuration_round_trip(config: ppo.Config) -> None:
@@ -586,6 +658,10 @@ def test_train_orchestration_uses_host_env_and_closes_resources(config: ppo.Conf
             rollout_count=jnp.asarray(1),
             update_count=jnp.asarray(2 if accepted else 0),
             minibatch_metrics=metrics.window.minibatch_metrics.replace(
+                policy_loss=jnp.asarray(0.6),  # () sum over three evaluated minibatches
+                value_loss=jnp.asarray(1.2),  # ()
+                entropy=jnp.asarray(6.0),  # ()
+                entropy_loss=jnp.asarray(-0.06),  # () coefficient-weighted negative entropy sum
                 gradient_norm=jnp.asarray(6.0 if accepted else 0.0),  # () sum over accepted updates
                 gradient_clip_fraction=jnp.asarray(1.0 if accepted else 0.0),  # () accepted clipping count
             ),
@@ -617,6 +693,18 @@ def test_train_orchestration_uses_host_env_and_closes_resources(config: ppo.Conf
     assert "rollout/return" not in scalars
     assert "train/return" not in scalars
     assert scalars["train/final_approx_kl"] == pytest.approx(0.03)
+    assert scalars["train/entropy"] == 2
+    assert scalars["train/entropy_loss"] == pytest.approx(-0.02)
+    assert scalars["train/total_loss"] == pytest.approx(
+        scalars["train/policy_loss"] + config.value_coef * scalars["train/value_loss"] + scalars["train/entropy_loss"]
+    )
+    assert scalars["rollout/episode_count"] == scalars["train/episodes_total"] == 0
+    assert "rollout/episode_length_steps" not in scalars
+    assert "train/episode_length_steps" not in scalars
+    assert "train/explained_variance" not in scalars
+    assert "train/kl_early_stop_fraction" not in scalars
+    assert "actor/video_seconds" not in scalars
+    assert not any(key.startswith("eval/") for key in scalars)
     if accepted:
         assert scalars["train/gradient_norm"] == 3
         assert scalars["train/gradient_clip_fraction"] == 0.5

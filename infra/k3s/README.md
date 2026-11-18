@@ -615,7 +615,8 @@ the example uses 64×64 pixels. `visual` must remain enabled.
 
 The image exposes the complete scene directory (734 scene files in the pinned
 dataset, including repeated layouts). The build registers the bundled articulated
-furniture assets and enables Bullet to instantiate them; VisFly handles drone dynamics.
+furniture and missing pillar/wall templates, including the `suqare_pillar` alias,
+and enables Bullet to instantiate them; VisFly handles drone dynamics.
 Scene rotation closes simulators in reverse order before loading the next batch,
 keeping their shared OpenGL context alive until dependent resources are released.
 The example runs eight scenes with four agents each and cycles through a seeded

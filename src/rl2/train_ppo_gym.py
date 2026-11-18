@@ -24,6 +24,8 @@ Training enters a jax.set_mesh context; standalone updates and train steps requi
 an active mesh with a batch axis, including on CPU.
 
 total_steps and MLflow steps count environment transitions across all environments.
+Every metric uses the current completed environment-step count, including startup
+metrics at step zero or the restored count.
 An iteration collects one batch of num_envs * num_steps transitions and runs PPO
 epochs. An update applies gradients from one accepted minibatch; KL-rejected
 minibatches do not count as updates.
@@ -53,17 +55,22 @@ Window metrics:
         rollout batch after optimization, then averaged over iterations. Uses the
         final parameters and stored initial recurrent states, including iterations
         stopped by KL. Evaluated in minibatches with no gradients or extra host sync.
-    train/explained_variance: Mean over iterations with nonconstant returns;
-        omitted if none are defined.
+    train/explained_variance: Dimensionless 1 - var(returns - rollout values) /
+        var(returns) over the full batch, then averaged over iterations with
+        nonconstant returns; omitted if none are defined.
     train/updates_per_iteration, train/kl_early_stop_fraction: Accepted updates
         and KL stop frequency, averaged over iterations; omit stops when disabled.
     rollout/episode_count, rollout/return, rollout/episode_length_steps:
-        Completed episodes and their raw return/length means; omit unavailable means.
+        Number of episodes completed in the window and their raw return/length
+        means (length in environment steps per episode); omit unavailable means.
+        Episodes spanning windows contribute their full return and length on completion.
     train/iterations_per_second, train/env_steps_per_second, train/updates_per_second:
         Completed batches, environment transitions across all environments, and
         accepted minibatch updates divided by window wall seconds, respectively.
         Includes collection, optimization, and intervening logging, evaluation,
         playback, and checkpoints. Zero accepted updates yields zero updates/second.
+        Windows end after the required metric device-to-host transfer; the first
+        starts before collection. Startup and final logging/checkpoint drain are excluded.
 
 Lifetime metrics:
     train/iterations_total, train/updates_total, train/episodes_total, train/env_steps_total:
@@ -74,11 +81,14 @@ Lifetime metrics:
         Lifetime counters and episode sums include restored checkpoint history.
 
 Latest settings and session timings:
-    train/learning_rate, train/entropy_coef: Latest iteration's scheduled settings.
+    train/learning_rate, train/entropy_coef: Latest iteration's scheduled settings;
+        not window means. Entropy loss averages the weighted minibatch losses,
+        rather than weighting window entropy by the latest coefficient.
     actor/video_seconds, eval/evaluation_seconds: Wall seconds for gameplay through
         video encoding/upload, or evaluation through gameplay/report uploads.
-        Logged per operation at video_interval or eval_interval iterations;
-        omitted when the operation does not run. Excludes logging the timing itself.
+        Logged per operation at video_interval or eval_interval iterations and on
+        normal completion when enabled; omitted when the operation does not run.
+        Includes fresh environment setup/cleanup; excludes logging the timing itself.
     checkpoint/save_seconds: Blocking wall seconds to prepare and submit an async
         checkpoint, including any wait for a previous save inside manager.save.
         Excludes background writes and the final drain at manager close. Logged per
@@ -88,11 +98,14 @@ Latest settings and session timings:
         Includes the required device-to-host wait; adds no timing-only synchronization.
         Logged after each log_interval window (also the final window), at the same
         environment step; excludes logging this timing itself. No window means omitted.
-    model/params_millions: Parameter count at startup, including resume.
+    model/params_millions: Parameter count divided by one million, logged once at
+        startup, including resume; not cumulative.
 
 Evaluation uses fixed seeds and logs raw episode return mean, sample standard
 deviation, and standard error as eval/return, eval/return_std, and
-eval/return_sem after each evaluation. eval/training_episodes_total is the lifetime
+eval/return_sem after each evaluation (eval_interval iterations and normal completion
+when enabled). These use raw reward units; SEM is sample std / sqrt(eval_episodes).
+eval/training_episodes_total is the lifetime
 completed training episode count at evaluation. Uncertainty metrics are omitted
 for a single episode. eval/stop_fraction/success, eval/stop_fraction/collision,
 eval/stop_fraction/terminated, eval/stop_fraction/time_limit, and
@@ -1372,7 +1385,7 @@ def train(config: Config) -> TrainState:
                     "train/updates_per_iteration": window_update_count / window_iteration_count,
                     "train/policy_loss": mean_metrics["policy_loss"],
                     "train/value_loss": mean_metrics["value_loss"],
-                    "train/entropy_loss": -mean_metrics["entropy"],
+                    "train/entropy_loss": mean_metrics["entropy_loss"],
                     "train/total_loss": mean_metrics["policy_loss"]
                     + config.value_coef * mean_metrics["value_loss"]
                     + mean_metrics["entropy_loss"],

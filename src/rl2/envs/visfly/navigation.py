@@ -79,8 +79,11 @@ class RGBNavigationEnv(NavigationEnv):
         spawn_clearance: float = 0.3,
         flight_height: tuple[float, float] = (0.5, 2.5),
         goal_distance: tuple[float, float] = (2.0, 8.0),
+        failure_penalty: float = 0.0,
         **kwargs: Any,
     ) -> None:
+        if not 0 <= failure_penalty < float("inf"):
+            raise ValueError("failure_penalty must be nonnegative and finite")
         if spawn_clearance <= 0 or not 0 <= flight_height[0] < flight_height[1]:
             raise ValueError(
                 "spawn_clearance must be positive and flight_height must be an increasing nonnegative range"
@@ -91,6 +94,7 @@ class RGBNavigationEnv(NavigationEnv):
         self.spawn_clearance = spawn_clearance
         self.flight_height = flight_height
         self.goal_distance = goal_distance
+        self.failure_penalty = failure_penalty
         if not visual:
             raise ValueError("RGBNavigationEnv requires visual=True")
         if sensor_kwargs is None:
@@ -121,6 +125,26 @@ class RGBNavigationEnv(NavigationEnv):
                 )
                 for index, base in enumerate(self.envs.stateGenerators)
             ]
+
+    def get_reward(
+        self,
+        predicted_obs: dict[str, torch.Tensor] | None = None,  # leaves: (B, *O)
+    ) -> torch.Tensor:  # (B,)
+        """Return (B,) navigation rewards with an optional one-time terminal failure cost.
+
+        Zero preserves upstream rewards. Success overrides failure; timeouts and
+        scene rotations alone incur no penalty. VisFly records rewards before autoreset.
+        """
+        reward = super().get_reward(predicted_obs=predicted_obs)  # (B,)
+        if self.failure_penalty == 0:
+            return reward  # (B,)
+        # End flags are updated after get_reward; _episode_done describes the previous step.
+        failure = (
+            ~self._episode_done
+            & ~self._success
+            & (self._failure | self.is_out_bounds | (self.is_collision & self.is_collision_reset))
+        )  # (B,)
+        return reward - self.failure_penalty * failure  # (B,)
 
     def _randomize_targets(self, indices: torch.Tensor) -> None:  # (N,) agent indices
         manager = self.envs.sceneManager

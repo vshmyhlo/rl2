@@ -45,8 +45,8 @@ seed: 6
 total_steps: 10000000
 num_envs: 32
 num_steps: 100 # 2 simulated seconds per agent at 50 Hz
-num_minibatches: 4
-update_epochs: 4
+num_minibatches: 2
+update_epochs: 2
 model:
   encoder:
     type: visfly # RGB CNN with body-frame navigation features
@@ -75,5 +75,5 @@ video_interval: 0 # Record videos only during evaluation
 eval_interval: 100
 eval_episodes: 10
 eval_video: true
-run_id: ppo_gym_visfly_ne${num_envs}_ns${num_steps}_ue${update_epochs}_seed${seed}
+run_id: ppo_gym_visfly_ne${num_envs}_ns${num_steps}_mb${num_minibatches}_ue${update_epochs}_seed${seed}
 ckpt_dir: /runs/ppo_gym/${run_id}
