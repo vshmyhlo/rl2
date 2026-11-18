@@ -353,6 +353,7 @@ def test_visfly_stop_reasons_preserve_terminal_info_and_precedence() -> None:
     assert result.info["stop_reason"] is not None
     assert result.info["stop_reason"].shape == (5,)
     assert result.info["stop_reason"].dtype == np.int32
+    assert "goal_distance" not in result.info  # Some terminations lack a terminal observation.
     np.testing.assert_array_equal(
         result.info["stop_reason"],
         [StopReason.SUCCESS, StopReason.COLLISION, StopReason.TIME_LIMIT, StopReason.TERMINATED, StopReason.ONGOING],

@@ -90,7 +90,7 @@ def diagnostics_panel(
     data = navigation_diagnostics(state, target)
     title = "FLIGHT DIAGNOSTICS"
     final = context is not None and context.stop_reason not in (None, StopReason.ONGOING)
-    if context is not None and context.stop_reason not in (None, StopReason.ONGOING):
+    if final:
         title = STOP_REASON_NAMES[context.stop_reason].replace("_", " ").upper()
     text(title, 10, 18, accent)
     if context is not None:

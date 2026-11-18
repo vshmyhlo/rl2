@@ -1,4 +1,7 @@
-"""Host-stepped VisFly batches with tensor snapshots and timeout bootstrapping."""
+"""Host-stepped VisFly batches with tensor snapshots and timeout bootstrapping.
+
+Omit goal distances if a backend omits any completed episode's terminal observation.
+"""
 
 from collections.abc import Generator
 from contextlib import ExitStack, closing, contextmanager
@@ -17,6 +20,7 @@ from pydantic.dataclasses import dataclass
 
 from rl2.envs.gym_style_env import (
     GymStyleEnv,
+    GymStyleInfo,
     GymStyleStep,
     StopReason,
     replace_observation,
@@ -159,6 +163,7 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         observations = convert_observation(observations, self.config.channels_first)  # rgb: (B, H, W, 3)
         final = jax.tree.map(to_numpy, observations)  # leaves: (B, *O)
         stop_reasons = np.full(self.num_envs, StopReason.ONGOING, dtype=np.int32)  # (B,)
+        has_final_observations = True
         for index in np.flatnonzero(done):
             info = infos[index]
             # Success wins simultaneous collisions; termination wins simultaneous timeouts.
@@ -179,6 +184,8 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
                     infos[index]["terminal_observation"], self.config.channels_first
                 )  # state: (S,), target: (3,), rgb: (H, W, 3)
                 replace_observation(final, terminal, index=int(index))
+            else:
+                has_final_observations = False
         contexts = self._contexts  # Preserve episode totals across scene resets.
         self._scene_env_steps += self.num_envs
         interval = self.config.scene_rotation_env_steps
@@ -201,18 +208,18 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
             RenderContext(step=0, episode_return=0.0) if terminated[index] or truncated[index] else context
             for index, context in enumerate(self._last_contexts)
         ]
+        info = GymStyleInfo(stop_reason=stop_reasons)  # leaves: (B,)
+        if has_final_observations:
+            info["goal_distance"] = np.linalg.norm(final["target"] - final["state"][:, :3], axis=-1).astype(
+                np.float32
+            )  # (B,)
         return GymStyleStep(
             observations=observations,  # state: (B, S), target: (B, 3), rgb: (B, H, W, 3)
             rewards=rewards,  # (B,)
-            terminated=to_numpy(terminated).astype(bool, copy=False),  # (B,)
-            truncated=to_numpy(truncated).astype(bool, copy=False),  # (B,)
+            terminated=terminated,  # (B,)
+            truncated=truncated,  # (B,)
             final_observations=final,  # state: (B, S), target: (B, 3), rgb: (B, H, W, 3)
-            info={
-                "stop_reason": stop_reasons,  # (B,)
-                "goal_distance": np.linalg.norm(final["target"] - final["state"][:, :3], axis=-1).astype(
-                    np.float32
-                ),  # (B,)
-            },
+            info=info,
         )
 
     def _diagnostics_panel(

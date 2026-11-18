@@ -49,3 +49,28 @@ def test_sampling_rejects_empty_volume_before_collision_queries() -> None:
     with pytest.raises(ValueError, match="no sampling volume"):
         sample_positions(torch.zeros(3), torch.tensor([1.0, 0.0, 1.0]), count=1, collision=collision)
     collision.assert_not_called()
+
+
+def test_goal_sampling_rejects_disjoint_reference_bounds() -> None:
+    collision = Mock(return_value=np.array([False]))
+    with (
+        patch("torch.rand", return_value=torch.zeros((1, 3))),
+        pytest.raises(ValueError, match="no sampling volume"),
+    ):
+        sample_positions(
+            lower=torch.zeros(3),  # (3,)
+            upper=torch.ones(3),  # (3,)
+            count=1,
+            collision=collision,
+            reference=torch.tensor([[4.0, 0.0, 0.0]]),  # (N, 3)
+            distance=(1.0, 2.0),
+        )
+    collision.assert_not_called()
+
+
+def test_sampling_empty_batch_skips_collision_queries() -> None:
+    collision = Mock(side_effect=AssertionError("No positions to query"))
+    positions = sample_positions(torch.zeros(3), torch.ones(3), count=0, collision=collision)  # (0, 3)
+    assert positions.shape == (0, 3)
+    assert positions.dtype == torch.float32
+    collision.assert_not_called()

@@ -61,8 +61,10 @@ class NavigationStub:
             else ["scene_c", "scene_a", "scene_b"]
         )
         self.envs = SimpleNamespace(
+            dynamics=Mock(),
             uav_radius=0.1,
             sceneManager=SimpleNamespace(
+                scenes=[None, None],
                 root_path=root,
                 _scene_loader=SimpleNamespace(paths=paths, shuffle=scene_kwargs.get("shuffle", True)),
                 _scene_bounds=[SimpleNamespace(min=[-10, 0, -10], max=[0, 4, 0])] * 2,
@@ -187,8 +189,13 @@ def test_navigation_rejects_empty_scene_split(
     root = tmp_path / directory
     root.mkdir()
     (root / "room.scene_instance.json").write_text("{}")
-    with pytest.raises(ValueError, match=f"No scenes in the {split} split"):
+    with (
+        patch.object(navigation_class, "close", autospec=True, side_effect=navigation_class.close) as close,
+        pytest.raises(ValueError, match=f"No scenes in the {split} split"),
+    ):
         navigation_class(scene_kwargs={"path": str(root)}, scene_split=split)
+    close.assert_called_once()
+    close.call_args.args[0].envs.dynamics.close.assert_called_once_with()
 
 
 def test_navigation_failure_penalty_terminal_events(navigation_class: type[Any]) -> None:
@@ -313,8 +320,22 @@ def test_spawn_clearance_accepts_drone_radius(navigation_class: type[Any]) -> No
 
 
 def test_spawn_clearance_rejects_less_than_drone_radius(navigation_class: type[Any]) -> None:
-    with pytest.raises(ValueError, match="spawn_clearance.*drone collision radius"):
+    with (
+        patch.object(navigation_class, "close", autospec=True, side_effect=navigation_class.close) as close,
+        pytest.raises(ValueError, match="spawn_clearance.*drone collision radius"),
+    ):
         navigation_class(scene_randomization=True, spawn_clearance=0.05)
+    close.assert_called_once()
+    close.call_args.args[0].envs.dynamics.close.assert_called_once_with()
+
+
+def test_close_releases_loaded_scenes_after_partial_reset(navigation_class: type[Any]) -> None:
+    env = navigation_class()
+    scene = Mock()
+    env.envs.sceneManager.scenes = [scene, None]
+    env.close()
+    env.envs.dynamics.close.assert_called_once_with()
+    scene.close.assert_called_once_with()
 
 
 def test_reset_goals_preserve_other_agents_and_terminal_targets(navigation_class: type[Any]) -> None:

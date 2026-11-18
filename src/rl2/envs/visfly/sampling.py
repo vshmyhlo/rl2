@@ -28,7 +28,11 @@ def sample_positions(
     if reference is not None:
         low = torch.maximum(low, reference - distance[1])  # (N, 3)
         high = torch.minimum(high, reference + distance[1])  # (N, 3)
+        if torch.any(high <= low):
+            raise ValueError("Scene has no sampling volume within the requested goal distance")
     positions = torch.empty((count, 3), dtype=lower.dtype, device=lower.device)  # (N, 3)
+    if count == 0:
+        return positions  # (0, 3)
     pending = torch.arange(count, device=lower.device)  # (P,)
     for _ in range(max_attempts):
         candidates = low[pending] + torch.rand((len(pending), 3), device=lower.device) * (

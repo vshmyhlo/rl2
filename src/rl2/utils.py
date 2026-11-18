@@ -74,8 +74,12 @@ def explained_variance(
     values: jax.Array,  # (*S,)
     returns: jax.Array,  # (*S,)
 ) -> jax.Array:  # ()
+    """Return scalar explained variance, or NaN for constant returns."""
+    flat_returns = returns.reshape(-1)  # (N,), N = prod(S)
+    # A fractional constant can round to a different mean in float32.
+    tied = jnp.all(flat_returns == flat_returns[:1])  # ()
     variance = jnp.var(returns)  # ()
-    return jnp.where(variance > 0, 1 - jnp.var(returns - values) / variance, jnp.nan)  # ()
+    return jnp.where((variance > 0) & ~tied, 1 - jnp.var(returns - values) / variance, jnp.nan)  # ()
 
 
 def group_advantages(

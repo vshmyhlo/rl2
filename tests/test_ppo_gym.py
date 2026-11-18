@@ -494,21 +494,35 @@ def test_mixed_image_vector_encoder_and_sequence_shapes(config: ppo.Config, enco
         np.testing.assert_allclose(jax.device_get(step.values), jax.device_get(output.values[:, 0]), atol=1e-6)
 
 
-def test_evaluation_uses_fresh_environment_and_closes_on_failure(config: ppo.Config) -> None:
+@pytest.mark.parametrize("terminal_available", [True, False], ids=["terminal_observation", "missing_terminal"])
+def test_evaluation_uses_fresh_environment_and_closes_on_failure(config: ppo.Config, terminal_available: bool) -> None:
     backend = VisFlyBatch(num_envs=1)
+    step = backend.step
+
+    def backend_step(actions: NDArray[np.float32]) -> tuple[Any, ...]:  # (B, 4)
+        observations, rewards, done, infos = step(actions)
+        if not terminal_available:
+            infos[0].pop("terminal_observation")
+        return observations, rewards, done, infos
+
+    backend.step = backend_step
     config = replace(config, env=VisFlyConfig(), video_max_frames=1)
     state = TrainState.create(apply_fn=value_policy, params={}, tx=optax.sgd(0.1))
     memory = ((jnp.zeros((1, 1)), jnp.zeros((1, 1))),)  # leaves: (1, 1)
-    with patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)):
+    with (
+        patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
+        patch.object(VisFlyEnv, "render_outcome", autospec=True, side_effect=VisFlyEnv.render_outcome) as outcome,
+    ):
         result = ppo.play_episode(state, config, jax.random.key(0), memory, record=True, stop_at_frame_limit=True)
         assert len(result.frames) == 1
         assert result.frames[0].shape == (4, 14, 3)
         assert result.frames[0].dtype == np.uint8
-        assert result.length == 0
-        assert result.stop_reason is None
-        assert result.final_goal_distance is None
-        assert not result.terminated and not result.truncated
-        assert backend.steps == 0
+        assert result.length == 1
+        assert result.stop_reason == StopReason.SUCCESS
+        assert (result.final_goal_distance is not None) == terminal_available
+        assert outcome.call_count == int(terminal_available)
+        assert result.terminated and not result.truncated
+        assert backend.steps == 1
         assert backend.closed
         backend.closed = False
         with (
@@ -517,6 +531,27 @@ def test_evaluation_uses_fresh_environment_and_closes_on_failure(config: ppo.Con
         ):
             ppo.play_episode(state, config, jax.random.key(0), memory, record=True)
         assert backend.closed
+
+
+def test_video_frame_limit_stops_after_last_recorded_action(config: ppo.Config) -> None:
+    backend = VisFlyBatch(num_envs=1)
+    step = backend.step
+
+    def ongoing_step(actions: NDArray[np.float32]) -> tuple[Any, ...]:  # (B, 4)
+        observations, rewards, done, infos = step(actions)
+        done[:] = False
+        return observations, rewards, done, infos
+
+    backend.step = ongoing_step
+    config = replace(config, env=VisFlyConfig(), video_max_frames=2)
+    state = TrainState.create(apply_fn=value_policy, params={}, tx=optax.sgd(0.1))
+    memory = ((jnp.zeros((1, 1)), jnp.zeros((1, 1))),)  # leaves: (1, 1)
+    with patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)):
+        result = ppo.play_episode(state, config, jax.random.key(0), memory, record=True, stop_at_frame_limit=True)
+    assert len(result.frames) == result.length == backend.steps == 2
+    assert result.stop_reason is None
+    assert not result.terminated and not result.truncated
+    assert backend.closed
 
 
 @pytest.mark.parametrize("frame_cap", [None, 2, 1], ids=["full_hold", "cap_at_end", "cap_before_end"])
@@ -785,17 +820,36 @@ def test_evaluation_stop_fractions_exclude_video_replay(
     writer.log_video.assert_called_once()
 
 
-@pytest.mark.parametrize("accepted", [True, False], ids=["accepted_updates", "all_updates_rejected"])
-def test_train_orchestration_uses_host_env_and_closes_resources(config: ppo.Config, accepted: bool) -> None:
-    config = replace(config, total_steps=4, run_id="host-test")
+@pytest.mark.parametrize(
+    ("accepted", "resume"),
+    [(True, False), (False, False), (True, True)],
+    ids=["accepted_updates", "all_updates_rejected", "resume_changed_batch_size"],
+)
+def test_train_orchestration_uses_host_env_and_closes_resources(
+    config: ppo.Config, accepted: bool, resume: bool
+) -> None:
+    config = replace(config, total_steps=11 if resume else 4, anneal_lr=True, run_id="host-test")
     env = Mock(action_space=gym.spaces.Discrete(2))
     env.reset.return_value = np.zeros((2, 3), dtype=np.float32)  # (B, O)
     model = Mock()
     model.initial_carry.side_effect = lambda batch: ((jnp.zeros((batch, 1)), jnp.zeros((batch, 1))),)
     model.init.return_value = {"params": {"weight": jnp.ones(1)}}
     manager = MagicMock()
-    manager.latest_step.return_value = None
     writer = MagicMock()
+    writer.__enter__.return_value = writer
+
+    def restore(manager: Any, state: TrainState, settings: ppo.Config) -> ppo.TrainingProgress | None:
+        if not resume:
+            return None
+        return ppo.TrainingProgress(
+            train_state=state.replace(step=2),
+            key=jax.random.key(3),  # ()
+            rollout_count=3,
+            episode_count=5,
+            episode_return_sum=10.0,
+            episode_length_sum=15,
+            env_steps=6,  # Saved batch size was 2; current batch size is 4.
+        )
 
     def iteration(
         runner: ppo.RolloutCarry,
@@ -807,7 +861,7 @@ def test_train_orchestration_uses_host_env_and_closes_resources(config: ppo.Conf
         schedule_index: int,
     ) -> ppo.TrainStepResult:
         assert envs is env
-        assert schedule_index == 0
+        assert schedule_index == (1 if resume else 0)
         window = metrics.window._replace(
             minibatch_count=jnp.asarray(3),
             rollout_count=jnp.asarray(1),
@@ -823,7 +877,7 @@ def test_train_orchestration_uses_host_env_and_closes_resources(config: ppo.Conf
             final_approx_kl_sum=jnp.asarray(0.03),  # ()
         )
         return ppo.TrainStepResult(
-            train_state=state.replace(step=2 if accepted else 0),
+            train_state=state.replace(step=state.step + (2 if accepted else 0)),
             rollout_carry=runner,
             key=key,
             metrics=metrics._replace(window=window),
@@ -833,29 +887,38 @@ def test_train_orchestration_uses_host_env_and_closes_resources(config: ppo.Conf
         patch.object(ppo, "make_env", return_value=env),
         patch.object(ppo, "ActorCritic", return_value=model),
         patch.object(ppo, "checkpoint_manager", return_value=manager),
+        patch.object(ppo, "restore_checkpoint", side_effect=restore),
         patch.object(ppo, "MLflowLogger", return_value=writer),
         patch.object(ppo, "train_step", side_effect=iteration),
     ):
         result = ppo.train(config)
-    assert int(result.step) == (2 if accepted else 0)
+    assert int(result.step) == (4 if resume else 2 if accepted else 0)
     env.reset.assert_called_once_with()
     env.close.assert_called_once_with()
     manager.close.assert_called_once_with()
     manager.save.assert_called_once()
+    assert manager.save.call_args.args[0] == (4 if resume else 1)
     scalars = {key: value for call in writer.log_metrics.call_args_list for key, value in call.args[0].items()}
-    assert scalars["train/env_steps_total"] == 4
-    assert scalars["train/iterations_total"] == 1
+    assert scalars["train/env_steps_total"] == (10 if resume else 4)
+    assert scalars["train/iterations_total"] == (4 if resume else 1)
+    assert scalars["train/learning_rate"] == pytest.approx(config.learning_rate / (2 if resume else 1))
+    assert scalars["train/progress_fraction"] == pytest.approx(10 / 11 if resume else 1)
     assert "rollout/return" not in scalars
-    assert "train/return" not in scalars
     assert scalars["train/final_approx_kl"] == pytest.approx(0.03)
     assert scalars["train/entropy"] == 2
     assert scalars["train/entropy_loss"] == pytest.approx(-0.02)
     assert scalars["train/total_loss"] == pytest.approx(
         scalars["train/policy_loss"] + config.value_coef * scalars["train/value_loss"] + scalars["train/entropy_loss"]
     )
-    assert scalars["rollout/episode_count"] == scalars["train/episodes_total"] == 0
+    assert scalars["rollout/episode_count"] == 0
+    assert scalars["train/episodes_total"] == (5 if resume else 0)
     assert "rollout/episode_length_steps" not in scalars
-    assert "train/episode_length_steps" not in scalars
+    if resume:
+        assert scalars["train/return"] == 2.0
+        assert scalars["train/episode_length_steps"] == 3.0
+    else:
+        assert "train/return" not in scalars
+        assert "train/episode_length_steps" not in scalars
     assert "train/explained_variance" not in scalars
     assert "train/kl_early_stop_fraction" not in scalars
     assert "actor/video_seconds" not in scalars
@@ -901,6 +964,33 @@ def scalar_batch() -> ppo.PPOBatch:
         model_carry=(),
         episode_starts=starts,
     )
+
+
+@pytest.mark.parametrize("kind", ["normalized", "constant", "singleton"])
+def test_update_advantage_normalization(config: ppo.Config, scalar_batch: ppo.PPOBatch, kind: str) -> None:
+    config = replace(config, value_coef=0.0, entropy_coef=0.0)
+    if kind == "singleton":
+        scalar_batch = jax.tree.map(lambda leaf: leaf[1:], scalar_batch)  # leaves: (B=1, T=1, ...)
+        advantages = jnp.full((1, 1), 0.7)  # (B, T)
+    elif kind == "constant":
+        advantages = jnp.full((2, 1), 0.7)  # (B, T)
+    else:
+        advantages = jnp.asarray([[3.0], [1.0]])  # (B, T), normalized to [1, -1]
+    state = TrainState.create(
+        apply_fn=scalar_policy,
+        params={"weight": jnp.asarray(0.0)},  # ()
+        tx=optax.sgd(0.1),
+    )
+    updated, metrics = jax.jit(partial(ppo.update, config=config))(state, scalar_batch.replace(advantages=advantages))
+    assert metrics.policy_loss.shape == metrics.gradient_norm.shape == ()
+    assert int(updated.step) == 1
+    assert float(metrics.policy_loss) == pytest.approx(-0.7 if kind == "singleton" else 0.0, abs=1e-6)
+    if kind == "constant":
+        assert float(metrics.gradient_norm) == 0.0
+        assert float(updated.params["weight"]) == 0.0
+    else:
+        assert float(metrics.gradient_norm) > 0.0
+        assert (float(updated.params["weight"]) < 0.0) == (kind == "singleton")
 
 
 @pytest.mark.parametrize(

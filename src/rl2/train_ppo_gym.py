@@ -135,7 +135,8 @@ The replay is excluded from score statistics and included in eval/evaluation_sec
 Standalone gameplay is disabled by default (video_interval=0); a positive
 video_interval enables recording at that iteration interval and on normal completion.
 video_max_frames caps recording (default: 1000). Standalone gameplay and evaluation
-replays stop at that cap; scored evaluation episodes always run to completion.
+replays execute the action for each recorded frame, then stop at that cap;
+scored evaluation episodes always run to completion.
 Gameplay is saved as looping GIFs at video_fps, with frame boundaries rounded to
 10 ms and a 10 ms minimum frame delay. Evaluation and playback create fresh,
 single-environment instances seeded independently of training. Frames are rendered
@@ -145,7 +146,8 @@ render settings for video; scoring alone does not require RGB rendering. VisFly'
 third view shows navigation diagnostics and previous-transition actions/rewards.
 At episode end, a final diagnostics card uses terminal state with labeled last
 recorded views, held for up to one second within video_max_frames (replacing the
-last frame if the cap is full). This hold adds no environment steps.
+last frame if the cap is full). Omit the card when a custom backend provides no
+terminal observation. This hold adds no environment steps.
 
 Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
 model/parameter_count/<step>.txt, eval/report/<step>.json, gameplay/<step>.gif,
@@ -808,10 +810,8 @@ def play_episode(
     memory = initial_carry  # leaves: (1, H)
     starts = jnp.ones(1, dtype=bool)  # (1,)
     with closing(make_env(config, seed=seed, evaluation=True, record=record)) as env:
-        observations = jax.tree.map(jnp.asarray, env.reset())  # leaves: (1, *O)
+        observations = jax.device_put(env.reset())  # leaves: (1, *O)
         while True:
-            if record and (config.video_max_frames is None or len(frames) < config.video_max_frames):
-                frames.append(env.render()[0])  # (H, W, 3)
             if (
                 record
                 and stop_at_frame_limit
@@ -819,6 +819,8 @@ def play_episode(
                 and len(frames) >= config.video_max_frames
             ):
                 break
+            if record and (config.video_max_frames is None or len(frames) < config.video_max_frames):
+                frames.append(env.render()[0])  # (H, W, 3)
             if deterministic:
                 memory, actions = deterministic_policy_step(
                     train_state.apply_fn, train_state.params, observations, memory, starts
@@ -829,8 +831,7 @@ def play_episode(
                 )
                 memory, key = sampled.memory, sampled.key  # leaves: (1, H); ()
                 actions = sampled.actions  # (1, *action_shape)
-            actions = np.asarray(jax.device_get(actions))  # (1, *action_shape)
-            transition = env.step(actions)
+            transition = env.step(jax.device_get(actions))
             observations = jax.device_put(transition.observations)  # leaves: (1, *O)
             episode_return += float(transition.rewards[0])
             length += 1
@@ -842,7 +843,12 @@ def play_episode(
                         stop_reason = int(transition.info["stop_reason"][0])
                     if "goal_distance" in transition.info:
                         final_goal_distance = float(transition.info["goal_distance"][0])
-                if frames and isinstance(env, VisFlyEnv):
+                if (
+                    frames
+                    and isinstance(env, VisFlyEnv)
+                    and transition.info is not None
+                    and "goal_distance" in transition.info
+                ):
                     outcome = env.render_outcome(frames[-1], transition.final_observations)  # (H, W, 3)
                     remaining = (
                         max(1, round(config.video_fps))
@@ -919,8 +925,8 @@ def log_evaluation(
         )
         episodes.append(episode)
     returns = [episode.episode_return for episode in episodes]
-    best_episode_index = max(range(len(returns)), key=returns.__getitem__)
     if config.eval_video:
+        best_episode_index = max(range(len(returns)), key=returns.__getitem__)
         replay = play_episode(
             train_state,
             config,
@@ -1092,7 +1098,7 @@ def collect_rollout(
     """
 
     class Transition(NamedTuple):
-        """S is (B,) per step, (T, B) after scanning, then (B, T) in the batch."""
+        """S is (B,) per step, (T, B) after stacking, then (B, T) in the batch."""
 
         observations: Observation[jax.Array]  # leaves: (*S, *O)
         actions: jax.Array  # (*S,) integer IDs or (*S, *action_shape) bounded continuous actions
@@ -1120,7 +1126,7 @@ def collect_rollout(
             key,
         )
         key = sampled.key  # ()
-        transition = envs.step(np.asarray(jax.device_get(sampled.actions)))
+        transition = envs.step(jax.device_get(sampled.actions))
         # End flags originate on the host; checking them here avoids a device scalar readback.
         timeout = transition.truncated & ~transition.terminated  # (B,)
         observations, raw_rewards, episode_ends = jax.device_put(
@@ -1333,7 +1339,7 @@ def train(config: Config) -> TrainState:
         envs = resources.enter_context(closing(make_env(config)))
         manager = resources.enter_context(closing(checkpoint_manager(config.ckpt_dir)))
         key, init_key = jax.random.split(jax.random.key(config.seed))  # each () typed PRNG key
-        obs = jax.tree.map(jnp.asarray, envs.reset())  # leaves: (B, *O)
+        obs = jax.device_put(envs.reset())  # leaves: (B, *O)
         model = ActorCritic(
             action_space=action_space(envs.action_space),
             model=config.model,
@@ -1343,12 +1349,14 @@ def train(config: Config) -> TrainState:
         episode_starts = jnp.ones(config.num_envs, dtype=bool)  # (B,)
         lr_schedule = learning_rate_schedule(config)
         entropy_schedule = entropy_coef_schedule(config)
-        optimizer = optax.inject_hyperparams(
-            lambda learning_rate: optax.chain(
+
+        @optax.inject_hyperparams
+        def optimizer(learning_rate: float) -> optax.GradientTransformation:
+            return optax.chain(
                 optax.clip_by_global_norm(config.max_grad_norm),
                 optax.adam(learning_rate, eps=1e-5),
             )
-        )
+
         train_state = TrainState.create(
             apply_fn=model.apply,
             params=model.init(
@@ -1367,8 +1375,7 @@ def train(config: Config) -> TrainState:
             # The environment and recurrent memory were freshly initialized above.
         key, metrics = jax.device_put((key, metrics), replicated)  # key: (); metrics: scalar leaves
         initial_step_count = progress.env_steps if progress is not None else 0
-        writer = MLflowLogger(experiment="ppo_gym", run_name=config.run_id)
-        resources.enter_context(writer)
+        writer = resources.enter_context(MLflowLogger(experiment="ppo_gym", run_name=config.run_id))
         if progress is not None:
             print(f"Resumed run {config.run_id} at step {initial_step_count}", flush=True)
         writer.log_text(yaml.safe_dump(asdict(config)), f"config/{initial_step_count}.yaml")
@@ -1432,6 +1439,7 @@ def train(config: Config) -> TrainState:
                 mean_metrics = {
                     field.name: float(getattr(window.minibatch_metrics, field.name)) / int(window.minibatch_count)
                     for field in fields(MinibatchMetrics)
+                    if field.name not in ("gradient_norm", "gradient_clip_fraction")
                 }
                 window_iteration_count = int(window.rollout_count)
                 window_update_count = int(window.update_count)

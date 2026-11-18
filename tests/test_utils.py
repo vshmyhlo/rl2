@@ -49,6 +49,15 @@ def test_explained_variance(shape: tuple[int, ...]) -> None:
     assert np.isnan(utils.explained_variance(returns, jnp.ones_like(returns)))
 
 
+def test_explained_variance_omits_fractional_constant_returns() -> None:
+    returns = jnp.full((1, 3), 0.1, dtype=jnp.float32)  # (B, T), mean can round away from 0.1
+    values = jnp.arange(3, dtype=jnp.float32)[None]  # (B, T)
+    for evaluate in (utils.explained_variance, jax.jit(utils.explained_variance)):
+        result = evaluate(values, returns)  # ()
+        assert result.shape == ()
+        assert np.isnan(jax.device_get(result))
+
+
 @pytest.mark.parametrize(
     ("rewards", "expected"),
     [

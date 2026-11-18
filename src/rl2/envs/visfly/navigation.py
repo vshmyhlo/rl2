@@ -1,5 +1,6 @@
 """Navigation rewards and dynamics with RGB and optional aligned depth observations."""
 
+from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -132,39 +133,44 @@ class RGBNavigationEnv(NavigationEnv):
                 if tuple(sensors["color"].get(key, default)) != tuple(sensors["depth"].get(key, default)):
                     raise ValueError(f"RGBNavigationEnv requires matching RGB/depth {key}")
         super().__init__(visual=True, sensor_kwargs=sensor_kwargs, **kwargs)
-        if spawn_clearance < self.envs.uav_radius:
-            raise ValueError(f"spawn_clearance must be at least the drone collision radius ({self.envs.uav_radius} m)")
-        self.observation_space.spaces["rgb"] = self.observation_space.spaces.pop("color")
-        manager = self.envs.sceneManager
-        loader = manager._scene_loader
-        root = Path(manager.root_path)
-        loader.paths = [
-            path
-            for path in loader.paths
-            if any(
-                part == "test" or part.endswith("_test")
-                for part in (root.name, *Path(path).relative_to(root).parts[:-1])
-            )
-            == (scene_split == "test")
-        ]
-        if not loader.paths:
-            raise ValueError(f"No scenes in the {scene_split} split under {root}")
-        # Filter before the first reset, then cycle through the selected inventory.
-        loader.paths = sorted(loader.paths)
-        if loader.shuffle:
-            Random(kwargs.get("seed", 42)).shuffle(loader.paths)
-        loader._select_index = list(range(len(loader.paths)))
-        if scene_randomization:
-            self.envs.stateGenerators = [
-                SceneStateRandomizer(
-                    base=base,
-                    manager=manager,
-                    scene_id=index // self.num_agent_per_scene,
-                    clearance=spawn_clearance,
-                    height=flight_height,
+        with ExitStack() as resources:
+            resources.enter_context(closing(self))
+            if spawn_clearance < self.envs.uav_radius:
+                raise ValueError(
+                    f"spawn_clearance must be at least the drone collision radius ({self.envs.uav_radius} m)"
                 )
-                for index, base in enumerate(self.envs.stateGenerators)
+            self.observation_space.spaces["rgb"] = self.observation_space.spaces.pop("color")
+            manager = self.envs.sceneManager
+            loader = manager._scene_loader
+            root = Path(manager.root_path)
+            loader.paths = [
+                path
+                for path in loader.paths
+                if any(
+                    part == "test" or part.endswith("_test")
+                    for part in (root.name, *Path(path).relative_to(root).parts[:-1])
+                )
+                == (scene_split == "test")
             ]
+            if not loader.paths:
+                raise ValueError(f"No scenes in the {scene_split} split under {root}")
+            # Filter before the first reset, then cycle through the selected inventory.
+            loader.paths = sorted(loader.paths)
+            if loader.shuffle:
+                Random(kwargs.get("seed", 42)).shuffle(loader.paths)
+            loader._select_index = list(range(len(loader.paths)))
+            if scene_randomization:
+                self.envs.stateGenerators = [
+                    SceneStateRandomizer(
+                        base=base,
+                        manager=manager,
+                        scene_id=index // self.num_agent_per_scene,
+                        clearance=spawn_clearance,
+                        height=flight_height,
+                    )
+                    for index, base in enumerate(self.envs.stateGenerators)
+                ]
+            resources.pop_all()
 
     def get_reward(
         self,
@@ -246,3 +252,11 @@ class RGBNavigationEnv(NavigationEnv):
         if self.has_depth:
             observation["depth"] = torch.tensor(self.sensor_obs["depth"], device=self.device)  # (B, 1, H, W)
         return observation
+
+    def close(self) -> None:
+        """Release dynamics and loaded scenes, including before the first successful reset."""
+        self.envs.dynamics.close()
+        # Upstream close assumes every scene has loaded, even when reset failed.
+        for scene in self.envs.sceneManager.scenes:
+            if scene is not None:
+                scene.close()
