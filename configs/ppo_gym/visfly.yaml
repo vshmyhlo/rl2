@@ -42,7 +42,10 @@ env:
       - sensor_type: COLOR
         uuid: color
         resolution: [64, 64]
-seed: 6
+      - sensor_type: DEPTH
+        uuid: depth
+        resolution: [64, 64]
+seed: 8
 total_steps: 10000000
 num_envs: 32
 num_steps: 100 # 2 simulated seconds per agent at 50 Hz
@@ -50,7 +53,7 @@ num_minibatches: 2
 update_epochs: 2
 model:
   encoder:
-    type: visfly # RGB CNN with body-frame navigation features
+    type: visfly # RGB-D CNN with body-frame navigation features
     stages:
       - { channels: 16, blocks: 1 } # 32x32
       - { channels: 32, blocks: 1 } # 16x16
@@ -59,6 +62,7 @@ model:
     goal_scale: 10.0 # Metres
     velocity_scale: 5.0 # Metres/second
     angular_velocity_scale: 10.0 # Radians/second
+    depth_scale: 20.0 # Metres; divide depth by this scale and clip to [0, 1]
   recurrent:
     hidden_size: 128
   continuous_policy: truncated_gaussian
@@ -76,5 +80,5 @@ video_interval: 0 # Record videos only during evaluation
 eval_interval: 100
 eval_episodes: 10
 eval_video: true
-run_id: ppo_gym_visfly_ne${num_envs}_ns${num_steps}_mb${num_minibatches}_ue${update_epochs}_fp${env.kwargs.failure_penalty}_seed${seed}
+run_id: ppo_gym_visfly_rgbd_ne${num_envs}_ns${num_steps}_mb${num_minibatches}_ue${update_epochs}_fp${env.kwargs.failure_penalty}_seed${seed}
 ckpt_dir: /runs/ppo_gym/${run_id}

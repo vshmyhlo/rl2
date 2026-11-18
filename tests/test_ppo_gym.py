@@ -20,7 +20,7 @@ from numpy.typing import NDArray
 from pydantic import TypeAdapter
 
 from rl2 import train_ppo_gym as ppo
-from rl2.actions import CategoricalPolicy, ContinuousSpace, Policy, TruncatedGaussianPolicy
+from rl2.actions import BetaPolicy, CategoricalPolicy, ContinuousSpace, Policy, TruncatedGaussianPolicy
 from rl2.envs import GymStyleEnv, GymStyleStep
 from rl2.envs.gym_env import GymConfig, GymEnv
 from rl2.envs.gym_style_env import StopReason
@@ -295,6 +295,62 @@ def test_sample_policy_step_preserves_rng_and_outputs(action_shape: tuple[int, .
         np.testing.assert_array_equal(leaf, [[1], [2]])
 
 
+@pytest.mark.parametrize(
+    ("kind", "action_shape"),
+    [
+        pytest.param("categorical", (), id="categorical_ties"),
+        pytest.param("gaussian", (), id="gaussian_scalar"),
+        pytest.param("gaussian", (2, 2), id="gaussian_matrix"),
+        pytest.param("beta", (), id="beta_scalar"),
+        pytest.param("beta", (4,), id="beta_vector"),
+    ],
+)
+def test_deterministic_policy_step(kind: str, action_shape: tuple[int, ...]) -> None:
+    policy: Policy
+    if kind == "categorical":
+        policy = CategoricalPolicy(jnp.asarray([[0.0, 2.0, 1.0], [3.0, 3.0, 0.0]]))  # (B, A)
+        expected = jnp.asarray([1, 0])  # (B,)
+    else:
+        size = int(np.prod(action_shape))
+        space = ContinuousSpace(shape=action_shape, low=(-2.0,) * size, high=(4.0,) * size)
+        if kind == "gaussian":
+            policy = TruncatedGaussianPolicy(
+                mean=jnp.broadcast_to(jnp.asarray([[-3.0], [5.0]]), (2, size)),  # (B, D)
+                log_std=jnp.zeros((2, size)),  # (B, D)
+                action_space=space,
+            )
+            expected = jnp.broadcast_to(jnp.asarray([[-2.0], [4.0]]), (2, size))  # (B, D)
+        else:
+            policy = BetaPolicy(
+                alpha=jnp.full((2, size), 0.5),  # (B, D)
+                beta=jnp.full((2, size), 1.5),  # (B, D)
+                action_space=space,
+            )
+            expected = jnp.full((2, size), -0.5)  # (B, D)
+        expected = expected.reshape((2, *action_shape))  # (B, *action_shape)
+
+    def apply(
+        variables: dict[str, Any],
+        observations: jax.Array,  # (B, O)
+        memory: ppo.RecurrentCarry,  # leaves: (B, H)
+        starts: jax.Array,  # (B,)
+        *,
+        method: str,
+    ) -> ppo.ActorCriticOutput:
+        memory = jax.tree.map(lambda leaf: jnp.where(starts[:, None], 0, leaf) + 1, memory)  # leaves: (B, H)
+        return ppo.ActorCriticOutput(carry=memory, policy=policy, values=observations[:, 0])
+
+    observations = jnp.zeros((2, 1))  # (B, O)
+    memory = ((jnp.ones((2, 1)), jnp.ones((2, 1))),)  # leaves: (B, H)
+    starts = jnp.asarray([True, False])  # (B,)
+    next_memory, actions = ppo.deterministic_policy_step(apply, {}, observations, memory, starts)
+    assert actions.shape == (2, *action_shape)
+    np.testing.assert_allclose(jax.device_get(actions), jax.device_get(expected))
+    for leaf in jax.tree.leaves(next_memory):
+        assert leaf.shape == (2, 1)
+        np.testing.assert_array_equal(jax.device_get(leaf), [[1], [2]])
+
+
 def test_rollout_bootstraps_timeout_with_final_observation_and_memory(config: ppo.Config) -> None:
     config = replace(config, env=VisFlyConfig(), num_envs=4)
     backend = VisFlyBatch()
@@ -376,26 +432,35 @@ def test_real_gym_rollout_compiled_update_and_checkpoint(config: ppo.Config, tmp
             assert int(restored.train_state.step) == 1
 
 
-@pytest.mark.parametrize("encoder_type", ["mlp", "conv2d", "visfly"])
+@pytest.mark.parametrize("encoder_type", ["mlp", "conv2d", "visfly", "visfly_rgbd"])
 def test_mixed_image_vector_encoder_and_sequence_shapes(config: ppo.Config, encoder_type: str) -> None:
     encoder = ppo.Conv2DEncoderConfig(stages=(ConvStage(channels=2, blocks=0),), embedding_size=4)
     settings = config.model
     if encoder_type == "conv2d":
         settings = replace(settings, encoder=encoder)
-    elif encoder_type == "visfly":
+    elif encoder_type.startswith("visfly"):
         settings = replace(
             settings,
             encoder=ppo.VisFlyEncoderConfig(
-                stages=encoder.stages, embedding_size=4, goal_scale=2, velocity_scale=4, angular_velocity_scale=8
+                stages=encoder.stages,
+                embedding_size=4,
+                goal_scale=2,
+                velocity_scale=4,
+                angular_velocity_scale=8,
+                depth_scale=4,
             ),
         )
     model = ppo.ActorCritic(action_space=ppo.DiscreteSpace(n=2), model=settings)
     obs = {"rgb": jnp.full((2, 2, 4, 4, 3), 255, dtype=jnp.uint8), "state": jnp.zeros((2, 2, 3))}  # (B, T, *O)
-    if encoder_type == "visfly":
+    if encoder_type.startswith("visfly"):
         obs["state"] = jnp.tile(
             jnp.array([3, 4, 5, 1, 0, 0, 0, 4, 8, 12, 8, 16, 24], jnp.float32), (2, 2, 1)
         )  # (B, T, 13)
         obs["target"] = jnp.tile(jnp.array([5, 8, 11], jnp.float32), (2, 2, 1))  # (B, T, 3)
+    if encoder_type == "visfly_rgbd":
+        obs["depth"] = jnp.tile(
+            jnp.array([-1, 0, 2, 20], jnp.float32)[None, None, None, :, None], (2, 2, 4, 1, 1)
+        )  # (B, T, H, W, 1)
     memory = model.initial_carry(2)  # leaves: (B, H)
     starts = jnp.zeros((2, 2), dtype=bool)  # (B, T)
     params = model.init(jax.random.key(1), obs, memory, starts)
@@ -403,7 +468,7 @@ def test_mixed_image_vector_encoder_and_sequence_shapes(config: ppo.Config, enco
     assert output.values.shape == (2, 2)
     assert output.policy.logits.shape == (2, 2, 2)
     assert all(leaf.shape == (2, 4) for leaf in jax.tree.leaves(output.carry))
-    if encoder_type == "visfly":
+    if encoder_type.startswith("visfly"):
         generic = ppo.ActorCritic(action_space=ppo.DiscreteSpace(n=2), model=replace(settings, encoder=encoder))
         prepared = {
             "rgb": obs["rgb"],  # (B, T, H, W, 3)
@@ -411,6 +476,13 @@ def test_mixed_image_vector_encoder_and_sequence_shapes(config: ppo.Config, enco
                 jnp.array([1, 0, 0, 0, 1, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3], jnp.float32), (2, 2, 1)
             ),  # (B, T, 15)
         }
+        if encoder_type == "visfly_rgbd":
+            expected_depth = jnp.tile(
+                jnp.array([0, 0, 0.5, 1], jnp.float32)[None, None, None, :, None], (2, 2, 4, 1, 1)
+            )  # (B, T, H, W, 1)
+            prepared["rgb"] = jnp.concatenate(
+                (jnp.ones_like(obs["rgb"], dtype=jnp.float32), expected_depth), axis=-1
+            )  # (B, T, H, W, 4)
         expected = jax.jit(generic.apply)(params, prepared, memory, starts)
         np.testing.assert_allclose(jax.device_get(output.values), jax.device_get(expected.values), atol=1e-6)
         np.testing.assert_allclose(
@@ -546,15 +618,19 @@ def test_visfly_render_tracks_each_episode_across_resets(rotation_interval: int 
 def test_visfly_render_channels_last_rectangular_camera_and_final_views() -> None:
     backend = VisFlyBatch(num_envs=1)
     backend.rgb = torch.full((1, 2, 4, 3), 150, dtype=torch.uint8)  # (B, H, W, C)
+    raw = backend.get_observation()  # leaves: (B, *O)
+    raw["depth"] = torch.full((1, 2, 4, 1), 10.0)  # (B, H, W, 1)
     with (
+        patch.object(backend, "get_observation", return_value=raw),
         patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
         closing(VisFlyEnv(config=VisFlyConfig(channels_first=False), num_envs=1, seed=1)) as env,
     ):
         env.reset()
-        frame = env.render()[0]  # (H, W_scene + W_agent + W_debug, 3)
-        assert frame.shape == (4, 18, 3)
+        frame = env.render()[0]  # (H, W_scene + W_agent + W_depth + W_debug, 3)
+        assert frame.shape == (4, 26, 3)
         np.testing.assert_array_equal(frame[:, :4], 0)
         np.testing.assert_array_equal(frame[:, 4:12], 150)
+        assert frame[:, 12:20].any()
         before = frame.copy()  # (H, W, 3)
         raw = backend.get_observation()  # leaves: (B, *O)
         with patch.object(
@@ -570,27 +646,36 @@ def test_visfly_render_channels_last_rectangular_camera_and_final_views() -> Non
             transition = env.step(np.zeros((1, 4), dtype=np.float32))
         final = env.render_outcome(frame, transition.final_observations)  # (H, W, 3)
         np.testing.assert_array_equal(frame, before)
-        np.testing.assert_array_equal(final[:, :12], frame[:, :12])
-        assert not np.array_equal(final[:, 12:], frame[:, 12:])
+        np.testing.assert_array_equal(final[:, :20], frame[:, :20])
+        assert not np.array_equal(final[:, 20:], frame[:, 20:])
 
 
 def test_configuration_round_trip(config: ppo.Config) -> None:
     values = asdict(config)
     values["env"] = {"id": "VisFly", "num_scenes": 2, "kwargs": {"visual": True}}
     values["model"]["encoder"] = asdict(
-        ppo.VisFlyEncoderConfig(stages=(ConvStage(channels=2, blocks=0),), embedding_size=4, goal_scale=2.0)
+        ppo.VisFlyEncoderConfig(
+            stages=(ConvStage(channels=2, blocks=0),), embedding_size=4, goal_scale=2.0, depth_scale=4.0
+        )
     )
     parsed = TypeAdapter(ppo.Config).validate_json(json.dumps(values))
     assert isinstance(parsed.env, VisFlyConfig)
     assert parsed.env.kwargs == {"visual": True}
     assert isinstance(parsed.model.encoder, ppo.VisFlyEncoderConfig)
     assert parsed.model.encoder.goal_scale == 2.0
+    assert parsed.model.encoder.depth_scale == 4.0
     hash(parsed)  # Configurations with arbitrary environment kwargs can specialize JIT updates.
 
 
 @pytest.mark.parametrize(
     "scales",
-    [{"goal_scale": 0.0}, {"velocity_scale": -1.0}, {"angular_velocity_scale": float("inf")}],
+    [
+        {"goal_scale": 0.0},
+        {"velocity_scale": -1.0},
+        {"angular_velocity_scale": float("inf")},
+        {"depth_scale": 0.0},
+        {"depth_scale": float("nan")},
+    ],
 )
 def test_visfly_encoder_requires_positive_scales(scales: dict[str, float]) -> None:
     with pytest.raises(ValueError):
@@ -610,6 +695,7 @@ def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:
         assert kwargs["num_scene"] == kwargs["num_agent_per_scene"] == 1
         assert kwargs["scene_split"] == "test"
         backend = VisFlyBatch(num_envs=1)
+        backend.step = Mock(wraps=backend.step)
         backends.append(backend)
         return backend
 
@@ -620,6 +706,10 @@ def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:
         ppo.log_evaluation(state, config, writer, 0, 4, initial_carry=memory)
     assert len(backends) == 2
     assert all(backend.closed and backend.steps == 1 for backend in backends)
+    for backend in backends:
+        actions = backend.step.call_args.args[0]  # (1, 4)
+        assert actions.shape == (1, 4)
+        np.testing.assert_array_equal(actions, np.zeros((1, 4), dtype=np.float32))
     scalars, step = writer.log_metrics.call_args.args
     assert step == 4
     assert scalars["eval/return"] == 1
@@ -663,8 +753,10 @@ def test_evaluation_stop_fractions_exclude_video_replay(
         final_goal_distance=100.0,  # Replay must not affect scored distances.
     )
     writer = Mock()
-    with patch.object(ppo, "play_episode", side_effect=[*episodes, replay]):
+    with patch.object(ppo, "play_episode", side_effect=[*episodes, replay]) as play:
         ppo.log_evaluation(Mock(), config, writer, 0, 4, initial_carry=())
+    assert play.call_count == 3
+    assert all(call.kwargs["deterministic"] for call in play.call_args_list)
     scalars, step = writer.log_metrics.call_args.args
     fractions = {key: value for key, value in scalars.items() if key.startswith("eval/stop_fraction/")}
     assert step == 4

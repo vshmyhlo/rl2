@@ -1,4 +1,4 @@
-"""RGB backend behavior without loading Habitat's native renderer."""
+"""RGB/RGB-D backend behavior without loading Habitat's native renderer."""
 
 import runpy
 from pathlib import Path
@@ -61,6 +61,7 @@ class NavigationStub:
             else ["scene_c", "scene_a", "scene_b"]
         )
         self.envs = SimpleNamespace(
+            uav_radius=0.1,
             sceneManager=SimpleNamespace(
                 root_path=root,
                 _scene_loader=SimpleNamespace(paths=paths, shuffle=scene_kwargs.get("shuffle", True)),
@@ -78,6 +79,11 @@ class NavigationStub:
                 "color": gym.spaces.Box(low=0, high=255, shape=(3, height, width), dtype=np.uint8),
             }
         )
+        if any(sensor["uuid"] == "depth" for sensor in sensor_kwargs):
+            self.sensor_obs["depth"] = np.full((2, 1, height, width), 7, dtype=np.float32)  # (B, 1, H, W)
+            self.observation_space.spaces["depth"] = gym.spaces.Box(
+                low=0, high=np.inf, shape=(1, height, width), dtype=np.float32
+            )
 
     def get_reward(self, predicted_obs: dict[str, torch.Tensor] | None = None) -> torch.Tensor:  # (B,)
         return self.base_reward  # (B,)
@@ -95,9 +101,9 @@ class NavigationStub:
 
 
 @pytest.fixture(scope="module")
-def navigation_class() -> type[Any]:
+def navigation_module() -> SimpleNamespace:
     modules = {
-        "habitat_sim": SimpleNamespace(SensorType=SimpleNamespace(COLOR=object())),
+        "habitat_sim": SimpleNamespace(SensorType=SimpleNamespace(COLOR=object(), DEPTH=object())),
         "VisFly.envs.NavigationEnv": SimpleNamespace(NavigationEnv=NavigationStub),
         "VisFly.utils.type": SimpleNamespace(TensorDict=dict),
         "VisFly.utils.common": SimpleNamespace(habitat_to_std=habitat_to_std),
@@ -105,7 +111,12 @@ def navigation_class() -> type[Any]:
     }
     with patch.dict("sys.modules", modules):
         namespace = runpy.run_path(str(Path(visfly_env.__file__).parent / "visfly" / "navigation.py"))
-    return namespace["RGBNavigationEnv"]
+    return SimpleNamespace(**namespace)
+
+
+@pytest.fixture(scope="module")
+def navigation_class(navigation_module: SimpleNamespace) -> type[Any]:
+    return navigation_module.RGBNavigationEnv
 
 
 def test_navigation_failure_penalty_is_opt_in(navigation_class: type[Any]) -> None:
@@ -246,6 +257,66 @@ def test_scene_bounds_randomization_and_seeded_scene_order(navigation_class: typ
             assert torch.all((moved.position[0, :2] >= 10.3) & (moved.position[0, :2] <= 19.7))
 
 
+@pytest.mark.parametrize(
+    ("scene_min", "scene_max", "height", "expected_lower", "expected_upper"),
+    [
+        pytest.param(
+            [-110, -1, -110],
+            [110, 25, 110],
+            (0.5, 23.0),
+            [-100, -100, 0],
+            [100, 100, 20],
+            id="all_dynamics_limits",
+        ),
+        pytest.param(
+            [-10, -1, -10],
+            [0, 4, 0],
+            (0.5, 2.5),
+            [0.3, 0.3, 0],
+            [9.7, 9.7, 1.5],
+            id="height_stays_relative_to_scene_floor",
+        ),
+    ],
+)
+def test_sampling_bounds_intersect_dynamics_limits(
+    navigation_module: SimpleNamespace,
+    scene_min: list[float],
+    scene_max: list[float],
+    height: tuple[float, float],
+    expected_lower: list[float],
+    expected_upper: list[float],
+) -> None:
+    manager = SimpleNamespace(_scene_bounds=[SimpleNamespace(min=scene_min, max=scene_max)])
+    bounds = navigation_module.sampling_bounds(manager, scene_id=0, clearance=0.3, height=height)
+    assert bounds.lower.shape == bounds.upper.shape == (3,)
+    torch.testing.assert_close(bounds.lower, torch.tensor(expected_lower, dtype=torch.float32))
+    torch.testing.assert_close(bounds.upper, torch.tensor(expected_upper, dtype=torch.float32))
+
+
+@pytest.mark.parametrize("operation", ["spawn", "target"])
+def test_randomization_rejects_scenes_outside_dynamics_limits(navigation_class: type[Any], operation: str) -> None:
+    env = navigation_class(scene_randomization=True)
+    manager = env.envs.sceneManager
+    manager._scene_bounds[0] = SimpleNamespace(min=[-10, -5, -10], max=[0, -1, 0])
+    manager.get_point_is_collision = Mock(side_effect=collision_free)
+    with pytest.raises(ValueError, match="no sampling volume"):
+        if operation == "spawn":
+            env.envs.stateGenerators[0].safe_generate()
+        else:
+            env.reset()
+    manager.get_point_is_collision.assert_not_called()
+
+
+def test_spawn_clearance_accepts_drone_radius(navigation_class: type[Any]) -> None:
+    env = navigation_class(scene_randomization=True, spawn_clearance=0.1)
+    assert env.spawn_clearance == env.envs.uav_radius
+
+
+def test_spawn_clearance_rejects_less_than_drone_radius(navigation_class: type[Any]) -> None:
+    with pytest.raises(ValueError, match="spawn_clearance.*drone collision radius"):
+        navigation_class(scene_randomization=True, spawn_clearance=0.05)
+
+
 def test_reset_goals_preserve_other_agents_and_terminal_targets(navigation_class: type[Any]) -> None:
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(3)
@@ -273,15 +344,42 @@ def test_rgb_backend_defaults_and_observation_space(navigation_class: type[Any])
 
 
 def test_rgb_terminal_image_survives_sensor_buffer_reuse(navigation_class: type[Any]) -> None:
-    env = navigation_class(sensor_kwargs=[{"sensor_type": "COLOR", "uuid": "color", "resolution": [2, 4]}])
+    env = navigation_class(
+        sensor_kwargs=[
+            {"sensor_type": "COLOR", "uuid": "color", "resolution": [2, 4]},
+            {"sensor_type": "DEPTH", "uuid": "depth", "resolution": [2, 4]},
+        ]
+    )
     observation = env.get_observation()  # leaves: (B, *O)
+    assert set(observation) == set(env.observation_space.spaces) == {"state", "target", "rgb", "depth"}
+    assert observation["depth"].dtype == torch.float32
+    assert env.observation_space.contains({key: value[0].numpy() for key, value in observation.items()})
     terminal = observation["rgb"][0]  # (3, H, W): upstream retains a view before autoreset
+    terminal_depth = observation["depth"][0]  # (1, H, W)
     env.sensor_obs["color"][0] = 0
+    env.sensor_obs["depth"][0] = 20
     after_reset = env.get_observation()  # leaves: (B, *O)
     assert after_reset["rgb"].shape == (2, 3, 2, 4)
     np.testing.assert_array_equal(terminal.numpy(), 255)
     np.testing.assert_array_equal(after_reset["rgb"][0].numpy(), 0)
     np.testing.assert_array_equal(after_reset["rgb"][1].numpy(), 255)
+    assert after_reset["depth"].shape == (2, 1, 2, 4)
+    np.testing.assert_array_equal(terminal_depth.numpy(), 7)
+    np.testing.assert_array_equal(after_reset["depth"][0].numpy(), 20)
+    np.testing.assert_array_equal(after_reset["depth"][1].numpy(), 7)
+
+
+@pytest.mark.parametrize("setting", ["resolution", "position", "orientation"])
+def test_rgbd_requires_aligned_cameras(navigation_class: type[Any], setting: str) -> None:
+    depth: dict[str, Any] = {"sensor_type": "DEPTH", "uuid": "depth", "resolution": [2, 4]}
+    depth[setting] = [4, 2] if setting == "resolution" else [1, 0, 0]
+    with pytest.raises(ValueError, match=f"matching RGB/depth {setting}"):
+        navigation_class(
+            sensor_kwargs=[
+                {"sensor_type": "COLOR", "uuid": "color", "resolution": [2, 4]},
+                depth,
+            ]
+        )
 
 
 @pytest.mark.parametrize(

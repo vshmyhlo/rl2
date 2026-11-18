@@ -104,8 +104,11 @@ Latest settings and session timings:
     model/params_millions: Parameter count divided by one million, logged once at
         startup, including resume; not cumulative.
 
-Evaluation uses fixed seeds and logs raw episode return mean, sample standard
-deviation, and standard error as eval/return, eval/return_std, and
+Evaluation and its video replays use deterministic actions: categorical argmax,
+clipped Gaussian means, or Beta means scaled to the action bounds. Training and
+standalone gameplay sample actions. Evaluation uses fixed environment seeds and
+logs raw episode return mean, sample standard deviation, and standard error as
+eval/return, eval/return_std, and
 eval/return_sem after each evaluation (eval_interval iterations and normal completion
 when enabled). These use raw reward units; SEM is sample std / sqrt(eval_episodes).
 eval/training_episodes_total is the lifetime
@@ -350,7 +353,7 @@ class Conv2DEncoderConfig:
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class VisFlyEncoderConfig:
-    """RGB convolutions fused with scaled body-frame navigation features."""
+    """RGB or RGB-D convolutions fused with scaled body-frame navigation features."""
 
     type: Literal["visfly"] = "visfly"
     stages: Annotated[ConvStages, Field(min_length=1)] = DEFAULT_STAGES
@@ -358,6 +361,7 @@ class VisFlyEncoderConfig:
     goal_scale: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 10.0  # Metres.
     velocity_scale: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 5.0  # Metres/second.
     angular_velocity_scale: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 10.0  # Radians/second.
+    depth_scale: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 20.0  # Metres; depth is clipped to [0, 1].
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -634,6 +638,7 @@ class ActorCritic(nn.Module):
                     goal_scale=encoder.goal_scale,
                     velocity_scale=encoder.velocity_scale,
                     angular_velocity_scale=encoder.angular_velocity_scale,
+                    depth_scale=encoder.depth_scale,
                     dtype=self.dtype,
                     name="encoder",
                 )
@@ -758,6 +763,30 @@ class EpisodeResult(NamedTuple):
     final_goal_distance: float | None = None
 
 
+@partial(jax.jit, static_argnames=("apply_fn",))
+def deterministic_policy_step(
+    apply_fn: Callable[..., ActorCriticOutput],
+    params: optax.Params,
+    observations: Observation[jax.Array],  # leaves: (B, *O)
+    memory: RecurrentCarry,  # leaves: (B, H)
+    starts: jax.Array,  # (B,)
+) -> tuple[RecurrentCarry, jax.Array]:  # memory leaves: (B, H); actions: (B, *action_shape)
+    """Fuse inference and deterministic action selection before host readback."""
+    memory, policy, _ = policy_step(apply_fn, params, observations, memory, starts)
+    if isinstance(policy, CategoricalPolicy):
+        return memory, jnp.argmax(policy.logits, axis=-1)  # leaves: (B, H); (B,)
+    if isinstance(policy, (TruncatedGaussianPolicy, BetaPolicy)):
+        low, high = jnp.asarray((policy.action_space.low, policy.action_space.high), jnp.float32)  # each (D,)
+        if isinstance(policy, TruncatedGaussianPolicy):
+            actions = jnp.clip(policy.mean, low, high)  # (B, D)
+        else:
+            actions = low + (high - low) * policy.alpha / (policy.alpha + policy.beta)  # (B, D)
+        return memory, actions.reshape(
+            (*actions.shape[:-1], *policy.action_space.shape)
+        )  # (B, H) leaves; (B, *action_shape)
+    raise TypeError(f"Unsupported deterministic policy: {type(policy).__name__}")
+
+
 def play_episode(
     train_state: TrainState,
     config: Config,
@@ -766,6 +795,7 @@ def play_episode(
     *,
     record: bool,
     stop_at_frame_limit: bool = False,
+    deterministic: bool = False,
 ) -> EpisodeResult:
     """Run a fresh host environment; record frames before actions, excluding autoresets."""
     seed = int(jax.random.bits(key, dtype=jnp.uint32))
@@ -789,9 +819,17 @@ def play_episode(
                 and len(frames) >= config.video_max_frames
             ):
                 break
-            sampled = sample_policy_step(train_state.apply_fn, train_state.params, observations, memory, starts, key)
-            memory, key = sampled.memory, sampled.key  # leaves: (1, H); ()
-            actions = np.asarray(jax.device_get(sampled.actions))  # (1, *action_shape)
+            if deterministic:
+                memory, actions = deterministic_policy_step(
+                    train_state.apply_fn, train_state.params, observations, memory, starts
+                )  # leaves: (1, H); (1, *action_shape)
+            else:
+                sampled = sample_policy_step(
+                    train_state.apply_fn, train_state.params, observations, memory, starts, key
+                )
+                memory, key = sampled.memory, sampled.key  # leaves: (1, H); ()
+                actions = sampled.actions  # (1, *action_shape)
+            actions = np.asarray(jax.device_get(actions))  # (1, *action_shape)
             transition = env.step(actions)
             observations = jax.device_put(transition.observations)  # leaves: (1, *O)
             episode_return += float(transition.rewards[0])
@@ -877,6 +915,7 @@ def log_evaluation(
             jax.random.fold_in(jax.random.key(config.eval_seed), episode_index),
             initial_carry,
             record=False,
+            deterministic=True,
         )
         episodes.append(episode)
     returns = [episode.episode_return for episode in episodes]
@@ -889,6 +928,7 @@ def log_evaluation(
             initial_carry,
             record=True,
             stop_at_frame_limit=True,
+            deterministic=True,
         )
         if replay.frames:
             writer.log_video(replay.frames, f"eval/gameplay/{step_count}.gif", fps=config.video_fps)

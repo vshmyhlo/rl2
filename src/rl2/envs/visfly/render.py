@@ -28,6 +28,21 @@ class NavigationDiagnostics(NamedTuple):
     body_goal: NDArray[np.float64]  # (3,) forward, left, up displacement in metres
 
 
+def depth_panel(depth: NDArray[Any], *, height: int) -> NDArray[np.uint8]:  # (H_depth, W_depth, 1) -> (H, W, 3)
+    """Return (H, W, 3) RGB depth with preserved aspect ratio and a fixed 0–20 m inferno scale.
+
+    Near surfaces are dark; distances at or above 20 m (including upstream
+    background readings) are pale yellow. Labels are drawn at display resolution.
+    """
+    pixels = np.rint(np.clip(depth[..., 0] / 20.0, 0.0, 1.0) * 255).astype(np.uint8)  # (H_depth, W_depth)
+    colors = cv2.cvtColor(cv2.applyColorMap(pixels, cv2.COLORMAP_INFERNO), cv2.COLOR_BGR2RGB)  # (H_depth, W_depth, 3)
+    width = max(1, round(depth.shape[1] * height / depth.shape[0]))
+    panel = cv2.resize(colors, (width, height), interpolation=cv2.INTER_NEAREST)  # (H, W, 3)
+    cv2.putText(panel, "Depth: 0-20 m", (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(panel, "Depth: 0-20 m", (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+    return panel  # (H, W, 3)
+
+
 def navigation_diagnostics(
     state: NDArray[Any],  # (S,) S=12 Euler or S=13 wxyz quaternion
     target: NDArray[Any],  # (3,)

@@ -1,4 +1,4 @@
-"""Navigation rewards and dynamics with an RGB-only camera observation."""
+"""Navigation rewards and dynamics with RGB and optional aligned depth observations."""
 
 from dataclasses import dataclass
 from functools import partial
@@ -23,7 +23,7 @@ class SamplingBounds(NamedTuple):
 
 
 def sampling_bounds(manager: Any, scene_id: int, clearance: float, height: tuple[float, float]) -> SamplingBounds:
-    """Return (3,) lower/upper bounds, with height measured above the scene AABB floor."""
+    """Return (3,) bounds within dynamics limits; height is relative to the scene AABB floor."""
     bounds = manager._scene_bounds[scene_id]
     corners, _ = habitat_to_std(np.array([bounds.min, bounds.max]))  # (2, 3)
     lower = corners.amin(dim=0) + clearance  # (3,)
@@ -31,6 +31,9 @@ def sampling_bounds(manager: Any, scene_id: int, clearance: float, height: tuple
     floor = corners[:, 2].min()  # ()
     lower[2] = torch.maximum(lower[2], floor + height[0])
     upper[2] = torch.minimum(upper[2], floor + height[1])
+    # Match Dynamics._ugly_fix in pinned VisFly; starts and goals must survive its position clamp.
+    lower = torch.maximum(lower, lower.new_tensor([-100.0, -100.0, 0.0]))  # (3,)
+    upper = torch.minimum(upper, upper.new_tensor([100.0, 100.0, 20.0]))  # (3,)
     return SamplingBounds(lower=lower, upper=upper)
 
 
@@ -69,7 +72,7 @@ class SceneStateRandomizer:
 
 
 class RGBNavigationEnv(NavigationEnv):
-    """Expose RGB and quaternion state, including pre-autoreset observations."""
+    """Expose RGB, optional depth, and quaternion state, including pre-autoreset observations."""
 
     def __init__(
         self,
@@ -103,13 +106,34 @@ class RGBNavigationEnv(NavigationEnv):
             raise ValueError("RGBNavigationEnv requires visual=True")
         if sensor_kwargs is None:
             sensor_kwargs = [{"sensor_type": "COLOR", "uuid": "color", "resolution": [64, 64]}]
+        sensors = {sensor.get("uuid"): sensor for sensor in sensor_kwargs}
+        allowed_types = {
+            "color": ("COLOR", "color", SensorType.COLOR),
+            "depth": ("DEPTH", "depth", SensorType.DEPTH),
+        }
         if (
-            len(sensor_kwargs) != 1
-            or sensor_kwargs[0].get("sensor_type") not in ("COLOR", "color", SensorType.COLOR)
-            or sensor_kwargs[0].get("uuid") != "color"
+            len(sensors) != len(sensor_kwargs)
+            or "color" not in sensors
+            or any(
+                uuid not in allowed_types or sensor.get("sensor_type") not in allowed_types[uuid]
+                for uuid, sensor in sensors.items()
+            )
         ):
-            raise ValueError("RGBNavigationEnv requires one COLOR sensor with uuid='color'")
+            raise ValueError(
+                "RGBNavigationEnv requires one COLOR sensor with uuid='color' and optional DEPTH with uuid='depth'"
+            )
+        self.has_depth = "depth" in sensors
+        if self.has_depth:
+            for key, default in (
+                ("resolution", [128, 128]),
+                ("position", [0, 0, -0.2]),
+                ("orientation", [0, 0, 0]),
+            ):
+                if tuple(sensors["color"].get(key, default)) != tuple(sensors["depth"].get(key, default)):
+                    raise ValueError(f"RGBNavigationEnv requires matching RGB/depth {key}")
         super().__init__(visual=True, sensor_kwargs=sensor_kwargs, **kwargs)
+        if spawn_clearance < self.envs.uav_radius:
+            raise ValueError(f"spawn_clearance must be at least the drone collision radius ({self.envs.uav_radius} m)")
         self.observation_space.spaces["rgb"] = self.observation_space.spaces.pop("color")
         manager = self.envs.sceneManager
         loader = manager._scene_loader
@@ -207,12 +231,18 @@ class RGBNavigationEnv(NavigationEnv):
         indices: torch.Tensor | None = None,  # (N,) selected agents; upstream returns the full batch
         predicted_obs: dict[str, torch.Tensor] | None = None,  # leaves: (B, *O); unused by NavigationEnv
     ) -> TensorDict:
-        """Return (B, S) state, (B, 3) target, and (B, 3, H, W) uint8 RGB."""
-        return TensorDict(
+        """Return (B, S) state, (B, 3) target, (B, 3, H, W) RGB, and optional (B, 1, H, W) depth.
+
+        Depth is float32 metres; upstream maps zero background readings to 20 m.
+        Copy camera buffers because partial autoresets overwrite them in place.
+        """
+        observation = TensorDict(
             {
                 "state": self.state.to(self.device),  # (B, S)
                 "target": self.target.to(self.device),  # (B, 3)
-                # Partial autoresets overwrite the NumPy sensor buffer in place.
                 "rgb": torch.tensor(self.sensor_obs["color"], device=self.device),  # (B, 3, H, W)
             }
         )
+        if self.has_depth:
+            observation["depth"] = torch.tensor(self.sensor_obs["depth"], device=self.device)  # (B, 1, H, W)
+        return observation

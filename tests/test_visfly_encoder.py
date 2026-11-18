@@ -8,7 +8,8 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
-from rl2.model.encoders.visfly import navigation_features
+from rl2.model.encoders.conv2d import ConvStage
+from rl2.model.encoders.visfly import VisFlyEncoder, navigation_features
 
 
 @pytest.mark.parametrize(
@@ -104,3 +105,36 @@ def test_navigation_features_reject_invalid_shapes(
             jax.ShapeDtypeStruct(state_shape, jnp.float32),
             jax.ShapeDtypeStruct(target_shape, jnp.float32),
         )
+
+
+@pytest.mark.parametrize(
+    "depth_shape",
+    [
+        pytest.param((1, 2, 4, 1), id="rectangular_singleton"),
+        pytest.param((1, 4, 2, 1), id="mismatched_resolution"),
+        pytest.param((2, 2, 4, 1), id="mismatched_batch"),
+        pytest.param((1, 2, 4, 3), id="multiple_depth_channels"),
+        pytest.param((1, 2, 4), id="missing_channel"),
+    ],
+)
+def test_rgbd_encoder_shape_contract(depth_shape: tuple[int, ...]) -> None:
+    encoder = VisFlyEncoder(
+        stages=(ConvStage(channels=2, blocks=0),),
+        embedding_size=4,
+        goal_scale=10.0,
+        velocity_scale=5.0,
+        angular_velocity_scale=10.0,
+    )
+    observation = {
+        "state": jax.ShapeDtypeStruct((1, 13), jnp.float32),  # (B, S)
+        "target": jax.ShapeDtypeStruct((1, 3), jnp.float32),  # (B, 3)
+        "rgb": jax.ShapeDtypeStruct((1, 2, 4, 3), jnp.uint8),  # (B, H, W, 3)
+        "depth": jax.ShapeDtypeStruct(depth_shape, jnp.float32),  # (B, H, W, 1) when valid
+    }
+    if depth_shape == (1, 2, 4, 1):
+        output, _ = jax.eval_shape(encoder.init_with_output, jax.random.key(0), observation)
+        assert output.shape == (1, 4)
+        assert output.dtype == jnp.float32
+    else:
+        with pytest.raises(AssertionError):
+            jax.eval_shape(encoder.init_with_output, jax.random.key(0), observation)

@@ -50,24 +50,36 @@ def navigation_features(
 
 
 class VisFlyEncoder(nn.Module):
-    """Fuse RGB features with scaled body-frame navigation features."""
+    """Fuse RGB or aligned RGB-D features with scaled body-frame navigation features.
+
+    RGB is divided by 255; depth in metres is divided by depth_scale and clipped
+    to [0, 1]. The optional depth field adds a fourth CNN input channel.
+    """
 
     stages: ConvStages
     embedding_size: int
     goal_scale: float
     velocity_scale: float
     angular_velocity_scale: float
+    depth_scale: float = 20.0
     dtype: jax.typing.DTypeLike | None = None
 
     @nn.compact
     def __call__(self, obs: VisFlyObservation[jax.Array]) -> jax.Array:  # leaves: (B, *O) -> (B, E)
+        pixels = obs["rgb"]  # (B, H, W, 3)
+        chex.assert_shape(pixels, (None, None, None, 3))
+        if "depth" in obs:
+            chex.assert_shape(obs["depth"], (*pixels.shape[:-1], 1))
+            rgb = pixels.astype(jnp.float32) / 255.0  # (B, H, W, 3)
+            depth = jnp.clip(obs["depth"].astype(jnp.float32) / self.depth_scale, 0.0, 1.0)  # (B, H, W, 1)
+            pixels = jnp.concatenate((rgb, depth), axis=-1)  # (B, H, W, 4)
         image = ConvObservationEncoder(
             channels_last=True,
             stages=self.stages,
             embedding_size=self.embedding_size,
             dtype=self.dtype,
             name="image_0",
-        )(obs["rgb"])  # (B, E)
+        )(pixels)  # (B, E)
         navigation = navigation_features(
             obs["state"],
             obs["target"],

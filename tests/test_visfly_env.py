@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from rl2.envs.gym_style_env import StopReason
+from rl2.envs.visfly.render import depth_panel
 from rl2.envs.visfly_env import RawVisFlyObservation, VisFlyConfig, VisFlyEnv, convert_observation
 
 
@@ -119,25 +120,34 @@ def test_navigation_observation_layout_and_snapshots(batch_shape: tuple[int, ...
     rgb_shape = (*batch_shape, 3, 2, 4)
     rgb = np.arange(np.prod(rgb_shape), dtype=np.uint8).reshape(rgb_shape)  # (*B, 3, H, W)
     expected_rgb = np.moveaxis(rgb, -3, -1).copy()  # (*B, H, W, 3)
+    depth = np.arange(np.prod((*batch_shape, 1, 2, 4)), dtype=np.float32).reshape(
+        (*batch_shape, 1, 2, 4)
+    )  # (*B, 1, H, W)
+    expected_depth = np.moveaxis(depth, -3, -1).copy()  # (*B, H, W, 1)
     raw = RawVisFlyObservation(
         state=state,
         target=target,
         rgb=rgb if channels_first else np.moveaxis(rgb, -3, -1),
+        depth=depth if channels_first else np.moveaxis(depth, -3, -1),  # (*B, 1, H, W) or (*B, H, W, 1)
     )
     converted = convert_observation(raw, channels_first=channels_first)
-    assert set(converted) == {"state", "target", "rgb"}
+    assert set(converted) == {"state", "target", "rgb", "depth"}
     assert converted["state"].shape == (*batch_shape, 13)
     assert converted["target"].shape == (*batch_shape, 3)
     assert converted["rgb"].shape == (*batch_shape, 2, 4, 3)
     assert converted["state"].dtype == np.float64
     assert converted["target"].dtype == np.float32
     assert converted["rgb"].dtype == np.uint8
+    assert converted["depth"].shape == (*batch_shape, 2, 4, 1)
+    assert converted["depth"].dtype == np.float32
     state[:] = 0
     target[:] = 0
     rgb[:] = 0
+    depth[:] = 0
     np.testing.assert_array_equal(converted["state"], 1)
     np.testing.assert_array_equal(converted["target"], 9)
     np.testing.assert_array_equal(converted["rgb"], expected_rgb)
+    np.testing.assert_array_equal(converted["depth"], expected_depth)
 
 
 def test_tensor_observations_are_detached_snapshots() -> None:
@@ -169,6 +179,7 @@ def test_visfly_dict_subclass_observations() -> None:
         state=state,  # (B, S)
         target=torch.zeros((2, 3)),  # (B, 3)
         rgb=torch.zeros((2, 3, 2, 4), dtype=torch.uint8),  # (B, 3, H, W)
+        depth=torch.full((2, 1, 2, 4), 20.0),  # (B, 1, H, W)
     )
     backend = Mock(num_envs=2, action_space=gym.spaces.Box(low=-1, high=1, shape=(4,)))
     backend.reset.return_value = observation
@@ -183,6 +194,7 @@ def test_visfly_dict_subclass_observations() -> None:
                     state=torch.full((13,), 2.0),  # (S,)
                     target=torch.full((3,), 9.0),  # (3,)
                     rgb=torch.arange(24, dtype=torch.uint8).reshape(3, 2, 4),  # (3, H, W)
+                    depth=torch.full((1, 2, 4), 3.0),  # (1, H, W)
                 ),
             },
             {},
@@ -190,7 +202,7 @@ def test_visfly_dict_subclass_observations() -> None:
     )
     with (
         patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
-        closing(VisFlyEnv(config=VisFlyConfig(), num_envs=2, seed=0)) as env,
+        closing(VisFlyEnv(config=VisFlyConfig(scene_rotation_env_steps=2), num_envs=2, seed=0)) as env,
     ):
         initial = env.reset()  # leaves: (B, O)
         assert isinstance(initial, dict)
@@ -206,6 +218,13 @@ def test_visfly_dict_subclass_observations() -> None:
         )
         np.testing.assert_array_equal(result.final_observations["rgb"][1], 0)
         np.testing.assert_array_equal(result.observations["rgb"], 0)
+        assert initial["depth"].shape == result.final_observations["depth"].shape == (2, 2, 4, 1)
+        np.testing.assert_array_equal(result.final_observations["depth"][0], 3)
+        np.testing.assert_array_equal(result.final_observations["depth"][1], 20)
+        np.testing.assert_array_equal(result.observations["depth"], 20)
+        np.testing.assert_array_equal(result.truncated, [True, True])
+        observation["depth"].zero_()
+        np.testing.assert_array_equal(initial["depth"], 20)
         state.zero_()
         np.testing.assert_array_equal(initial["state"], 1)
         np.testing.assert_array_equal(result.observations["state"], 1)
@@ -365,6 +384,10 @@ def test_visfly_render_preserves_batch_and_scene_order(
         target=np.zeros((num_envs, 3), dtype=np.float32),  # (B, 3)
         rgb=np.moveaxis(rgb, -1, 1) if channels_first else rgb,  # (B, 3, H, W) or (B, H, W, 3)
     )
+    if num_scenes > 1:
+        backend.get_observation.return_value["depth"] = np.arange(num_envs * 2, dtype=np.float32).reshape(
+            num_envs, 1, 1, 2
+        )  # (B, 1, H_agent, W_agent)
     with (
         patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
         closing(
@@ -374,13 +397,18 @@ def test_visfly_render_preserves_batch_and_scene_order(
         ) as env,
     ):
         frames = env.render()  # (B, H, W, 3)
-        assert frames.shape == (num_envs, 2, 10, 3)
+        debug_start = 11 if num_scenes > 1 else 7
+        assert frames.shape == (num_envs, 2, debug_start + 3, 3)
         assert frames.dtype == np.uint8
         for index in range(num_envs):
             scene_index = index // (num_envs // num_scenes)
             np.testing.assert_array_equal(frames[index, :, :3], pixels[scene_index, ..., :3].numpy())
         np.testing.assert_array_equal(frames[:, :, 3:7], rgb.repeat(2, axis=1).repeat(2, axis=2))
-        assert frames[:, :, 7:].any()  # Diagnostics occupy the final panel.
+        if num_scenes > 1:
+            for index in range(num_envs):
+                depth = backend.get_observation.return_value["depth"][index].transpose(1, 2, 0)  # (H_agent, W_agent, 1)
+                np.testing.assert_array_equal(frames[index, :, 7:11], depth_panel(depth, height=2))
+        assert frames[:, :, debug_start:].any()  # Diagnostics occupy the final panel.
         snapshot = frames.copy()  # (B, H, W, 3)
         pixels.zero_()
         rgb[:] = 0

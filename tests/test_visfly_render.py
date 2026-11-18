@@ -7,7 +7,26 @@ import numpy as np
 import pytest
 
 from rl2.envs.gym_style_env import StopReason
-from rl2.envs.visfly.render import RenderContext, diagnostics_panel, navigation_diagnostics
+from rl2.envs.visfly.render import RenderContext, depth_panel, diagnostics_panel, navigation_diagnostics
+
+
+def test_depth_panel_fixed_scale_clipping_and_aspect_ratio() -> None:
+    depth = np.tile(np.array([-1, 0, 10, 20, 30], dtype=np.float32)[None, :, None], (2, 1, 1))  # (H_depth, W_depth, 1)
+    before = depth.copy()  # (H_depth, W_depth, 1)
+    with patch("rl2.envs.visfly.render.cv2.putText", wraps=cv2.putText) as put_text:
+        panel = depth_panel(depth, height=64)  # (H, W, 3)
+    assert panel.shape == (64, 160, 3)
+    assert panel.dtype == np.uint8
+    assert "Depth: 0-20 m" in [call.args[1] for call in put_text.call_args_list]
+    np.testing.assert_array_equal(depth, before)
+    expected = cv2.cvtColor(
+        cv2.applyColorMap(np.array([[0, 0, 128, 255, 255]], dtype=np.uint8), cv2.COLORMAP_INFERNO),
+        cv2.COLOR_BGR2RGB,
+    )  # (1, W_depth, 3)
+    np.testing.assert_array_equal(panel[-1, ::32], expected[0])
+    depth[:] = 10
+    constant = depth_panel(depth, height=64)  # (H, W, 3)
+    np.testing.assert_array_equal(constant[-1, 0], panel[-1, 64])  # Same metres retain the same colour.
 
 
 def test_quaternion_diagnostics_rotate_goal_and_project_velocity() -> None:

@@ -4,7 +4,7 @@ from collections.abc import Generator
 from contextlib import ExitStack, closing, contextmanager
 from copy import deepcopy
 from dataclasses import field, replace
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 import cv2
 import jax
@@ -21,7 +21,7 @@ from rl2.envs.gym_style_env import (
     StopReason,
     replace_observation,
 )
-from rl2.envs.visfly.render import RenderContext, diagnostics_panel
+from rl2.envs.visfly.render import RenderContext, depth_panel, diagnostics_panel
 
 
 class RawVisFlyObservation[Array](TypedDict):
@@ -33,6 +33,7 @@ class RawVisFlyObservation[Array](TypedDict):
     state: Array  # (*B, S): position, orientation, linear velocity, angular velocity
     target: Array  # (*B, 3): target position
     rgb: Array  # (*B, 3, H, W), or (*B, H, W, 3) if channels_first=False; uint8 pixels
+    depth: NotRequired[Array]  # (*B, 1, H, W), or (*B, H, W, 1); float32 metres, when configured
 
 
 class VisFlyObservation[Array](TypedDict):
@@ -41,6 +42,7 @@ class VisFlyObservation[Array](TypedDict):
     state: Array  # (*B, S): same ordering and dtype as RawVisFlyObservation
     target: Array  # (*B, 3): target position
     rgb: Array  # (*B, H, W, 3): uint8 pixels
+    depth: NotRequired[Array]  # (*B, H, W, 1): float32 metres, when configured
 
 
 def to_numpy(value: Any) -> NDArray[Any]:
@@ -51,24 +53,28 @@ def to_numpy(value: Any) -> NDArray[Any]:
 
 
 def convert_observation(
-    value: RawVisFlyObservation[Any],  # state: (*B, S), target: (*B, 3), rgb: (*B, 3, H, W)
+    value: RawVisFlyObservation[Any],  # state: (*B, S), target: (*B, 3), images: (*B, C, H, W) or (*B, H, W, C)
     channels_first: bool,
 ) -> VisFlyObservation[NDArray[Any]]:
-    """Return (*B, S) state, (*B, 3) target, and (*B, H, W, 3) RGB.
+    """Return (*B, S) state, (*B, 3) target, (*B, H, W, 3) RGB, and optional (*B, H, W, 1) depth.
 
     Detach tensors, move them to CPU, and copy all leaves into NumPy snapshots.
-    Only RGB changes layout: (*B, 3, H, W) -> (*B, H, W, 3). With
-    channels_first=False, input RGB must already be channels-last.
+    Images change layout: (*B, C, H, W) -> (*B, H, W, C). With
+    channels_first=False, input images must already be channels-last.
     Values and dtypes are preserved; no normalization or clipping is applied.
     """
     # VisFly's TensorDict subclass is not a registered JAX pytree.
     snapshot = jax.tree.map(to_numpy, dict(value))  # leaves: (*B, *O)
     rgb = snapshot["rgb"]  # (*B, 3, H, W) or (*B, H, W, 3)
-    return VisFlyObservation(
+    observation = VisFlyObservation(
         state=snapshot["state"],  # (*B, S)
         target=snapshot["target"],  # (*B, 3)
         rgb=np.moveaxis(rgb, -3, -1) if channels_first else rgb,  # (*B, H, W, 3)
     )
+    if "depth" in snapshot:
+        depth = snapshot["depth"]  # (*B, 1, H, W) or (*B, H, W, 1)
+        observation["depth"] = np.moveaxis(depth, -3, -1) if channels_first else depth  # (*B, H, W, 1)
+    return observation
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -78,7 +84,7 @@ class VisFlyConfig:
     num_scenes: Annotated[int, Field(gt=0)] = 1
     scene_rotation_env_steps: Annotated[int, Field(gt=0)] | None = None  # Across all agents; checked per vector step.
     kwargs: dict[str, Any] = field(default_factory=dict, hash=False)
-    channels_first: bool = True  # Backend RGB is CHW; False accepts already-HWC RGB.
+    channels_first: bool = True  # Backend images are CHW; False accepts already-HWC images.
 
 
 class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
@@ -130,7 +136,7 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
             resources.pop_all()
 
     def reset(self) -> VisFlyObservation[NDArray[Any]]:
-        """Return (B, S) state, (B, 3) target, and (B, H, W, 3) RGB."""
+        """Return (B, S) state, (B, 3) target, (B, H, W, 3) RGB, and optional (B, H, W, 1) depth."""
         self._scene_env_steps = 0
         self._contexts = [RenderContext(step=0, episode_return=0.0) for _ in range(self.num_envs)]
         self._last_contexts = self._contexts
@@ -228,10 +234,11 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
             max_episode_steps=self.config.kwargs.get("max_episode_steps"),
         )  # (H, W_debug, 3)
 
-    def render(self) -> NDArray[np.uint8]:  # (B, H, W_scene + W_agent + W_debug, 3)
-        """Return (B, H, W_scene + W_agent + W_debug, 3) scene/camera/diagnostics RGB.
+    def render(self) -> NDArray[np.uint8]:  # (B, H, W_scene + W_agent + W_depth + W_debug, 3)
+        """Return (B, H, W_scene + W_agent + W_depth + W_debug, 3) scene/RGB/depth/diagnostics.
 
-        Scale agent RGB to the scene height with nearest-neighbor sampling, preserving aspect ratio.
+        Scale camera views to scene height with nearest-neighbor sampling, preserving aspect ratio.
+        W_depth is zero without depth; otherwise show a fixed 0–20 m inferno colour scale.
         W_debug is round(1.5 * H). Diagnostics include per-agent episode and last-action details.
         """
         frames = to_numpy(self.backend.render())  # (S, H, W, C) or (H, W, C); S: scenes
@@ -250,6 +257,11 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         agent_frames = np.stack(
             [cv2.resize(frame, (width, height), interpolation=cv2.INTER_NEAREST) for frame in rgb]
         )  # (B, H, W_agent, 3)
+        views = [frames, agent_frames]  # each (B, H, W_view, 3)
+        if "depth" in observation:
+            views.append(
+                np.stack([depth_panel(depth, height=height) for depth in observation["depth"]])
+            )  # (B, H, W_depth, 3)
         panels = np.stack(
             [
                 self._diagnostics_panel(
@@ -261,15 +273,15 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
                 for index in range(self.num_envs)
             ]
         )  # (B, H, W_debug, 3)
-        return np.concatenate((frames, agent_frames, panels), axis=2)  # (B, H, W_scene + W_agent + W_debug, 3)
+        return np.concatenate((*views, panels), axis=2)  # (B, H, W_scene + W_agent + W_depth + W_debug, 3)
 
     def render_outcome(
         self,
-        frame: NDArray[np.uint8],  # (H, W_scene + W_agent + W_debug, 3)
+        frame: NDArray[np.uint8],  # (H, W_scene + W_agent + W_depth + W_debug, 3)
         observation: VisFlyObservation[NDArray[Any]],  # leaves: (B, *O), before autoreset
         *,
         index: int = 0,
-    ) -> NDArray[np.uint8]:  # (H, W_scene + W_agent + W_debug, 3)
+    ) -> NDArray[np.uint8]:  # (H, W_scene + W_agent + W_depth + W_debug, 3)
         """Return (H, W, 3) diagnostics for the latest transition with labeled last pre-action views."""
         panel = self._diagnostics_panel(
             observation, index=index, height=frame.shape[0], context=self._last_contexts[index]
