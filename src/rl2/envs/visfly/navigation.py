@@ -69,7 +69,7 @@ class SceneStateRandomizer:
 
 
 class RGBNavigationEnv(NavigationEnv):
-    """Expose one color sensor as RGB, including pre-autoreset observations."""
+    """Expose RGB and quaternion state, including pre-autoreset observations."""
 
     def __init__(
         self,
@@ -84,6 +84,8 @@ class RGBNavigationEnv(NavigationEnv):
         failure_penalty: float = 0.0,
         **kwargs: Any,
     ) -> None:
+        if kwargs.get("dynamics_kwargs", {}).get("ori_output_type", "quaternion") != "quaternion":
+            raise ValueError("RGBNavigationEnv requires ori_output_type='quaternion' for the upstream reward")
         if not 0 <= failure_penalty < float("inf"):
             raise ValueError("failure_penalty must be nonnegative and finite")
         if spawn_clearance <= 0 or not 0 <= flight_height[0] < flight_height[1]:

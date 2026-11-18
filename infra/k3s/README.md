@@ -612,6 +612,8 @@ Tune the budget for peak PPO, scene rotation, and evaluation usage. To override 
 The VisFly adapter uses RGB-only navigation observations: `state`, `target`, and
 `rgb` (uint8, channels-last). Configure one `COLOR` sensor with UUID `color`;
 the example uses 64×64 pixels. `visual` must remain enabled.
+The built-in navigation reward requires quaternion state (`ori_output_type: quaternion`).
+Each adapter isolates its CPU Torch RNG, so evaluation does not alter training resets.
 
 The image exposes the complete scene directory (734 scene files in the pinned
 dataset, including repeated layouts). The build registers the bundled articulated

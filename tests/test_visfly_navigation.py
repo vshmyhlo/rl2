@@ -115,6 +115,15 @@ def test_navigation_failure_penalty_is_opt_in(navigation_class: type[Any]) -> No
     torch.testing.assert_close(reward, env.base_reward)
 
 
+def test_navigation_rejects_euler_before_initializing_backend(navigation_class: type[Any]) -> None:
+    with (
+        patch.object(NavigationStub, "__init__", return_value=None) as initialize,
+        pytest.raises(ValueError, match="requires ori_output_type='quaternion'"),
+    ):
+        navigation_class(dynamics_kwargs={"ori_output_type": "euler"})
+    initialize.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("split", "randomization", "shuffle"),
     [("train", True, True), ("test", False, False), ("test", True, True)],

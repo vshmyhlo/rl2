@@ -1,7 +1,7 @@
 """Host-stepped VisFly batches with tensor snapshots and timeout bootstrapping."""
 
-from collections.abc import Sequence
-from contextlib import ExitStack, closing
+from collections.abc import Generator
+from contextlib import ExitStack, closing, contextmanager
 from copy import deepcopy
 from dataclasses import field, replace
 from typing import Annotated, Any, Literal, TypedDict
@@ -9,6 +9,7 @@ from typing import Annotated, Any, Literal, TypedDict
 import cv2
 import jax
 import numpy as np
+import torch
 from gymnasium.envs.registration import load_env_creator
 from numpy.typing import NDArray
 from pydantic import ConfigDict, Field
@@ -26,7 +27,7 @@ from rl2.envs.visfly.render import RenderContext, diagnostics_panel
 class RawVisFlyObservation[Array](TypedDict):
     """NavigationEnv fields before conversion; *B is (B,) or () for terminal observations.
 
-    S = 12 with Euler orientation or 13 with quaternion orientation (the default).
+    S = 13 for RGBNavigationEnv; custom backends may use 12 with Euler orientation.
     """
 
     state: Array  # (*B, S): position, orientation, linear velocity, angular velocity
@@ -81,7 +82,17 @@ class VisFlyConfig:
 
 
 class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
-    """Own a VisFly autoresetting batch, seeded at construction."""
+    """Own a VisFly batch and its CPU Torch RNG; backend calls must run serially."""
+
+    @contextmanager
+    def _use_rng(self) -> Generator[None]:
+        """Isolate upstream global CPU draws, including sampling during autoreset."""
+        with torch.random.fork_rng(devices=[]):
+            torch.set_rng_state(self._rng_state)
+            try:
+                yield
+            finally:
+                self._rng_state = torch.get_rng_state()  # (R,) serialized CPU RNG state
 
     def __init__(self, config: VisFlyConfig, num_envs: int, seed: int, *, evaluation: bool = False) -> None:
         if evaluation:
@@ -89,6 +100,8 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         self.config = config
         self.num_envs = num_envs
         self._scene_env_steps = 0
+        self._contexts = [RenderContext(step=0, episode_return=0.0) for _ in range(num_envs)]
+        self._last_contexts = self._contexts
         if num_envs % config.num_scenes:
             raise ValueError("num_envs must be divisible by env.num_scenes")
         reserved = {"num_scene", "num_agent_per_scene", "seed", "requires_grad"} & config.kwargs.keys()
@@ -98,7 +111,8 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         kwargs = deepcopy(config.kwargs)
         if config.scene_rotation_env_steps is not None:
             kwargs.setdefault("random_kwargs", {})["scene_iter"] = True
-        with ExitStack() as resources:
+        self._rng_state = torch.Generator().manual_seed(seed).get_state()  # (R,) serialized CPU RNG state
+        with self._use_rng(), ExitStack() as resources:
             self.backend = resources.enter_context(
                 closing(
                     creator(
@@ -118,11 +132,16 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
     def reset(self) -> VisFlyObservation[NDArray[Any]]:
         """Return (B, S) state, (B, 3) target, and (B, H, W, 3) RGB."""
         self._scene_env_steps = 0
-        return convert_observation(self.backend.reset(), self.config.channels_first)
+        self._contexts = [RenderContext(step=0, episode_return=0.0) for _ in range(self.num_envs)]
+        self._last_contexts = self._contexts
+        with self._use_rng():
+            return convert_observation(self.backend.reset(), self.config.channels_first)
 
     def step(self, actions: NDArray[Any]) -> GymStyleStep[VisFlyObservation[NDArray[Any]]]:  # (B, *action_shape)
         host_actions = np.array(actions, copy=True)  # (B, *action_shape)
-        observations, rewards, done, infos = self.backend.step(host_actions)
+        with self._use_rng():
+            observations, rewards, done, infos = self.backend.step(host_actions)
+        rewards = to_numpy(rewards).astype(np.float32, copy=False)  # (B,)
         done = to_numpy(done).astype(bool)  # (B,)
         truncated = np.array(
             [done[i] and info.get("TimeLimit.truncated", False) for i, info in enumerate(infos)]
@@ -154,6 +173,7 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
                     infos[index]["terminal_observation"], self.config.channels_first
                 )  # state: (S,), target: (3,), rgb: (H, W, 3)
                 replace_observation(final, terminal, index=int(index))
+        contexts = self._contexts  # Preserve episode totals across scene resets.
         self._scene_env_steps += self.num_envs
         interval = self.config.scene_rotation_env_steps
         if interval is not None and self._scene_env_steps >= interval:
@@ -161,9 +181,23 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
             stop_reasons[~done] = StopReason.SCENE_ROTATION
             truncated |= ~done  # (B,)
             observations = self.reset()  # leaves: (B, *O)
+        self._last_contexts = [
+            RenderContext(
+                step=context.step + 1,
+                episode_return=context.episode_return + float(rewards[index]),
+                reward=float(rewards[index]),
+                action=host_actions[index],  # (A,)
+                stop_reason=int(stop_reasons[index]) if terminated[index] or truncated[index] else None,
+            )
+            for index, context in enumerate(contexts)
+        ]
+        self._contexts = [
+            RenderContext(step=0, episode_return=0.0) if terminated[index] or truncated[index] else context
+            for index, context in enumerate(self._last_contexts)
+        ]
         return GymStyleStep(
             observations=observations,  # state: (B, S), target: (B, 3), rgb: (B, H, W, 3)
-            rewards=to_numpy(rewards).astype(np.float32, copy=False),  # (B,)
+            rewards=rewards,  # (B,)
             terminated=to_numpy(terminated).astype(bool, copy=False),  # (B,)
             truncated=to_numpy(truncated).astype(bool, copy=False),  # (B,)
             final_observations=final,  # state: (B, S), target: (B, 3), rgb: (B, H, W, 3)
@@ -181,7 +215,7 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         *,
         index: int,
         height: int,
-        context: RenderContext | None,
+        context: RenderContext,
     ) -> NDArray[np.uint8]:  # (H, W_debug, 3)
         return diagnostics_panel(
             observation["state"][index],  # (S,)
@@ -194,13 +228,11 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
             max_episode_steps=self.config.kwargs.get("max_episode_steps"),
         )  # (H, W_debug, 3)
 
-    def render(
-        self, *, contexts: Sequence[RenderContext] | None = None
-    ) -> NDArray[np.uint8]:  # (B, H, W_scene + W_agent + W_debug, 3)
+    def render(self) -> NDArray[np.uint8]:  # (B, H, W_scene + W_agent + W_debug, 3)
         """Return (B, H, W_scene + W_agent + W_debug, 3) scene/camera/diagnostics RGB.
 
         Scale agent RGB to the scene height with nearest-neighbor sampling, preserving aspect ratio.
-        W_debug is round(1.5 * H). Optional contexts supply per-agent episode and last-action details.
+        W_debug is round(1.5 * H). Diagnostics include per-agent episode and last-action details.
         """
         frames = to_numpy(self.backend.render())  # (S, H, W, C) or (H, W, C); S: scenes
         if frames.ndim == 3:
@@ -224,7 +256,7 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
                     observation,
                     index=index,
                     height=height,
-                    context=None if contexts is None else contexts[index],
+                    context=self._contexts[index],
                 )
                 for index in range(self.num_envs)
             ]
@@ -236,12 +268,11 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         frame: NDArray[np.uint8],  # (H, W_scene + W_agent + W_debug, 3)
         observation: VisFlyObservation[NDArray[Any]],  # leaves: (B, *O), before autoreset
         *,
-        context: RenderContext,
         index: int = 0,
     ) -> NDArray[np.uint8]:  # (H, W_scene + W_agent + W_debug, 3)
-        """Return (H, W, 3) final diagnostics with explicitly labeled last pre-action views."""
+        """Return (H, W, 3) diagnostics for the latest transition with labeled last pre-action views."""
         panel = self._diagnostics_panel(
-            observation, index=index, height=frame.shape[0], context=context
+            observation, index=index, height=frame.shape[0], context=self._last_contexts[index]
         )  # (H, W_debug, 3)
         result = frame.copy()  # (H, W, 3)
         result[:, -panel.shape[1] :] = panel

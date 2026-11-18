@@ -1,6 +1,7 @@
 """VisFly tensor snapshots and scene configuration."""
 
 from contextlib import closing
+from typing import Any, NamedTuple
 from unittest.mock import Mock, patch
 
 import gymnasium as gym
@@ -10,6 +11,97 @@ import torch
 
 from rl2.envs.gym_style_env import StopReason
 from rl2.envs.visfly_env import RawVisFlyObservation, VisFlyConfig, VisFlyEnv, convert_observation
+
+
+class RandomTransition(NamedTuple):
+    observation: RawVisFlyObservation[torch.Tensor]  # leaves: (B, *O)
+    rewards: torch.Tensor  # (B,)
+    done: torch.Tensor  # (B,)
+    infos: list[dict[str, Any]]
+
+
+def random_backend(*, seed: int, **kwargs: Any) -> Mock:
+    torch.manual_seed(seed)  # Match upstream construction's global seeding and draws.
+    torch.rand(1)
+    backend = Mock(num_envs=1, action_space=gym.spaces.Box(low=-1, high=1, shape=(4,)))
+
+    def observation() -> RawVisFlyObservation[torch.Tensor]:
+        return RawVisFlyObservation(
+            state=torch.rand((1, 13)),  # (B, S)
+            target=torch.rand((1, 3)),  # (B, 3)
+            rgb=torch.zeros((1, 3, 2, 4), dtype=torch.uint8),  # (B, C, H, W)
+        )
+
+    def step(actions: np.ndarray) -> RandomTransition:  # (B, A)
+        # An autoreset also consumes the backend's global RNG inside step().
+        terminal = observation()  # leaves: (B, *O)
+        return RandomTransition(
+            observation=observation(),
+            rewards=torch.rand(1),  # (B,)
+            done=torch.ones(1, dtype=torch.bool),  # (B,)
+            infos=[{"terminal_observation": {key: value[0] for key, value in terminal.items()}}],
+        )
+
+    backend.reset.side_effect = observation
+    backend.step.side_effect = step
+    return backend
+
+
+def test_rng_streams_are_independent_of_evaluation_and_global_draws() -> None:
+    config = VisFlyConfig(scene_rotation_env_steps=1)
+    actions = np.zeros((1, 4), dtype=np.float32)  # (B, A)
+    with (
+        torch.random.fork_rng(devices=[]),
+        patch("rl2.envs.visfly_env.load_env_creator", return_value=random_backend),
+    ):
+        initial_rng = torch.get_rng_state()  # (R,)
+        with closing(VisFlyEnv(config=config, num_envs=1, seed=7)) as baseline:
+            expected_reset = baseline.reset()  # leaves: (B, *O)
+            expected_steps = [baseline.step(actions), baseline.step(actions)]
+        torch.testing.assert_close(torch.get_rng_state(), initial_rng)
+
+        with closing(VisFlyEnv(config=config, num_envs=1, seed=7)) as training:
+            actual_reset = training.reset()  # leaves: (B, *O)
+            for key in expected_reset:
+                np.testing.assert_array_equal(actual_reset[key], expected_reset[key])
+            for expected in expected_steps:
+                with closing(VisFlyEnv(config=config, num_envs=1, seed=19, evaluation=True)) as evaluation:
+                    evaluation.reset()
+                    evaluation.step(actions)
+                torch.rand(3)
+                global_rng = torch.get_rng_state()  # (R,)
+                actual = training.step(actions)
+                for key in expected.observations:
+                    np.testing.assert_array_equal(actual.observations[key], expected.observations[key])
+                    np.testing.assert_array_equal(actual.final_observations[key], expected.final_observations[key])
+                np.testing.assert_array_equal(actual.rewards, expected.rewards)
+                torch.testing.assert_close(torch.get_rng_state(), global_rng)
+
+
+@pytest.mark.parametrize("operation", ["construct", "reset", "step"])
+def test_backend_errors_restore_global_rng(operation: str) -> None:
+    def fail(*args: Any, **kwargs: Any) -> None:
+        torch.rand(3)
+        raise RuntimeError("backend failed")
+
+    with (
+        torch.random.fork_rng(devices=[]),
+        patch(
+            "rl2.envs.visfly_env.load_env_creator", return_value=fail if operation == "construct" else random_backend
+        ),
+    ):
+        initial_rng = torch.get_rng_state()  # (R,)
+        with (
+            pytest.raises(RuntimeError, match="backend failed"),
+            closing(VisFlyEnv(config=VisFlyConfig(), num_envs=1, seed=7)) as env,
+        ):
+            if operation == "reset":
+                env.backend.reset.side_effect = fail
+                env.reset()
+            else:
+                env.backend.step.side_effect = fail
+                env.step(np.zeros((1, 4), dtype=np.float32))
+        torch.testing.assert_close(torch.get_rng_state(), initial_rng)
 
 
 @pytest.mark.parametrize(
@@ -264,9 +356,15 @@ def test_visfly_render_preserves_batch_and_scene_order(
 ) -> None:
     pixels = torch.arange(num_scenes * 2 * 3 * 4).reshape(num_scenes, 2, 3, 4)  # (S, H, W, RGBA)
     rgb = np.arange(num_envs * 1 * 2 * 3, dtype=np.uint8).reshape(num_envs, 1, 2, 3)  # (B, H_agent, W_agent, 3)
-    backend = Mock(num_envs=num_envs, action_space=gym.spaces.Discrete(2))
+    state = np.zeros((num_envs, 13), dtype=np.float32)  # (B, S)
+    state[:, 3] = 1  # Identity wxyz quaternion.
+    backend = Mock(num_envs=num_envs, action_space=gym.spaces.Box(low=-1, high=1, shape=(4,)))
     backend.render.return_value = pixels[0] if unbatched else pixels
-    backend.get_observation.return_value = {"rgb": np.moveaxis(rgb, -1, 1) if channels_first else rgb}
+    backend.get_observation.return_value = RawVisFlyObservation(
+        state=state,  # (B, S)
+        target=np.zeros((num_envs, 3), dtype=np.float32),  # (B, 3)
+        rgb=np.moveaxis(rgb, -1, 1) if channels_first else rgb,  # (B, 3, H, W) or (B, H, W, 3)
+    )
     with (
         patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
         closing(
@@ -276,17 +374,20 @@ def test_visfly_render_preserves_batch_and_scene_order(
         ) as env,
     ):
         frames = env.render()  # (B, H, W, 3)
-        assert frames.shape == (num_envs, 2, 7, 3)
+        assert frames.shape == (num_envs, 2, 10, 3)
         assert frames.dtype == np.uint8
         for index in range(num_envs):
             scene_index = index // (num_envs // num_scenes)
             np.testing.assert_array_equal(frames[index, :, :3], pixels[scene_index, ..., :3].numpy())
-        np.testing.assert_array_equal(frames[:, :, 3:], rgb.repeat(2, axis=1).repeat(2, axis=2))
+        np.testing.assert_array_equal(frames[:, :, 3:7], rgb.repeat(2, axis=1).repeat(2, axis=2))
+        assert frames[:, :, 7:].any()  # Diagnostics occupy the final panel.
         snapshot = frames.copy()  # (B, H, W, 3)
         pixels.zero_()
         rgb[:] = 0
         np.testing.assert_array_equal(frames, snapshot)
-        np.testing.assert_array_equal(env.render(), 0)  # Read the latest sensor pixels on each render.
+        refreshed = env.render()  # (B, H, W, 3)
+        np.testing.assert_array_equal(refreshed[:, :, :7], 0)  # Read the latest scene and sensor pixels.
+        np.testing.assert_array_equal(refreshed[:, :, 7:], snapshot[:, :, 7:])
 
 
 @pytest.mark.parametrize(

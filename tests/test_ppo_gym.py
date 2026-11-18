@@ -492,6 +492,57 @@ def test_visfly_video_diagnostics_preserve_terminal_state_and_frame_cap(
     assert backend.closed
 
 
+@pytest.mark.parametrize("rotation_interval", [None, 8], ids=["autoreset", "scene_rotation"])
+def test_visfly_render_tracks_each_episode_across_resets(rotation_interval: int | None) -> None:
+    backend = VisFlyBatch()
+    settings = VisFlyConfig(scene_rotation_env_steps=rotation_interval)
+    actions = np.full((4, 4), 0.5, dtype=np.float32)  # (B, A)
+    with (
+        patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
+        patch("rl2.envs.visfly_env.diagnostics_panel", wraps=diagnostics_panel) as panel,
+        closing(VisFlyEnv(config=settings, num_envs=4, seed=1)) as env,
+    ):
+        env.reset()
+        env.step(actions)
+        transition = env.step(actions)
+        actions[:] = 0  # Caller buffer reuse must not change the recorded action.
+        frames = env.render()  # (B, H, W, 3)
+        assert frames.shape == (4, 4, 14, 3)
+        current = [call.kwargs["context"] for call in panel.call_args_list]
+        assert [context.step for context in current] == [0, 0, 0, 2 if rotation_interval is None else 0]
+        assert [context.episode_return for context in current] == [0, 0, 0, 8 if rotation_interval is None else 0]
+        for context in current[:3] if rotation_interval is None else current:
+            assert context.reward is context.action is context.stop_reason is None
+        panel.reset_mock()
+        for index in range(4):
+            outcome = env.render_outcome(frames[index], transition.final_observations, index=index)  # (H, W, 3)
+            assert outcome.shape == frames[index].shape
+        terminal = [call.kwargs["context"] for call in panel.call_args_list]
+        assert [context.step for context in terminal] == [1, 1, 1, 2]
+        assert [context.episode_return for context in terminal] == [1, 2, 3, 8]
+        assert [context.reward for context in terminal] == [1, 2, 3, 4]
+        assert [context.stop_reason for context in terminal] == [
+            StopReason.SUCCESS,
+            StopReason.TIME_LIMIT,
+            StopReason.COLLISION,
+            None if rotation_interval is None else StopReason.SCENE_ROTATION,
+        ]
+        for context in terminal:
+            assert context.action.shape == (4,)
+            np.testing.assert_array_equal(context.action, 0.5)
+        panel.reset_mock()
+        env.step(actions)
+        env.render()
+        ongoing: RenderContext = panel.call_args.kwargs["context"]
+        assert ongoing.step == (3 if rotation_interval is None else 1)
+        assert ongoing.episode_return == (12 if rotation_interval is None else 4)
+        panel.reset_mock()
+        env.reset()
+        env.render()
+        for call in panel.call_args_list:
+            assert call.kwargs["context"] == RenderContext(step=0, episode_return=0.0)
+
+
 def test_visfly_render_channels_last_rectangular_camera_and_final_views() -> None:
     backend = VisFlyBatch(num_envs=1)
     backend.rgb = torch.full((1, 2, 4, 3), 150, dtype=torch.uint8)  # (B, H, W, C)
@@ -499,15 +550,25 @@ def test_visfly_render_channels_last_rectangular_camera_and_final_views() -> Non
         patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
         closing(VisFlyEnv(config=VisFlyConfig(channels_first=False), num_envs=1, seed=1)) as env,
     ):
-        observation = env.reset()  # leaves: (B, *O)
+        env.reset()
         frame = env.render()[0]  # (H, W_scene + W_agent + W_debug, 3)
         assert frame.shape == (4, 18, 3)
         np.testing.assert_array_equal(frame[:, :4], 0)
         np.testing.assert_array_equal(frame[:, 4:12], 150)
         before = frame.copy()  # (H, W, 3)
-        final = env.render_outcome(
-            frame, observation, context=RenderContext(step=1, episode_return=0, stop_reason=StopReason.TIME_LIMIT)
-        )  # (H, W, 3)
+        raw = backend.get_observation()  # leaves: (B, *O)
+        with patch.object(
+            backend,
+            "step",
+            return_value=(
+                raw,
+                np.zeros(1),  # (B,)
+                np.ones(1, dtype=bool),  # (B,)
+                [{"TimeLimit.truncated": True, "terminal_observation": {key: value[0] for key, value in raw.items()}}],
+            ),
+        ):
+            transition = env.step(np.zeros((1, 4), dtype=np.float32))
+        final = env.render_outcome(frame, transition.final_observations)  # (H, W, 3)
         np.testing.assert_array_equal(frame, before)
         np.testing.assert_array_equal(final[:, :12], frame[:, :12])
         assert not np.array_equal(final[:, 12:], frame[:, 12:])

@@ -36,6 +36,26 @@ def test_euler_diagnostics_at_goal_with_tilt() -> None:
     np.testing.assert_array_equal(result.body_goal, np.zeros(3))
 
 
+def test_ongoing_stop_reason_keeps_flight_title() -> None:
+    state = np.zeros(13)  # (S,)
+    state[3] = 1
+    with patch("rl2.envs.visfly.render.cv2.putText", wraps=cv2.putText) as put_text:
+        panel = diagnostics_panel(
+            state,
+            np.zeros(3),  # (3,)
+            height=256,
+            action_low=-np.ones(4),  # (A,)
+            action_high=np.ones(4),  # (A,)
+            action_type="bodyrate",
+            context=RenderContext(step=1, episode_return=0, stop_reason=StopReason.ONGOING),
+        )  # (H, W_debug, 3)
+    labels = [call.args[1] for call in put_text.call_args_list]
+    assert panel.shape == (256, 384, 3)
+    assert "FLIGHT DIAGNOSTICS" in labels
+    assert "Step 1" in labels
+    assert not any("last recorded" in label for label in labels)
+
+
 @pytest.mark.parametrize("height", [256, 128], ids=["native", "scaled"])
 def test_panel_shape_content_and_missing_transition(height: int) -> None:
     state = np.zeros(13)  # (S,)

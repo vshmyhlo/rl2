@@ -205,7 +205,6 @@ from rl2.actions import (
 from rl2.configuration import BaseConfig, load_config
 from rl2.envs.gym_env import GymConfig, GymEnv, GymObservation
 from rl2.envs.gym_style_env import STOP_REASON_NAMES, GymStyleEnv
-from rl2.envs.visfly.render import RenderContext
 from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv, VisFlyObservation
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
@@ -772,8 +771,6 @@ def play_episode(
     seed = int(jax.random.bits(key, dtype=jnp.uint32))
     frames = []  # each (H, W, 3)
     episode_return = 0.0
-    last_reward = None
-    last_action = None  # (A,) for continuous VisFly actions
     length = 0
     stop_reason = None
     terminated = truncated = False
@@ -784,13 +781,7 @@ def play_episode(
         observations = jax.tree.map(jnp.asarray, env.reset())  # leaves: (1, *O)
         while True:
             if record and (config.video_max_frames is None or len(frames) < config.video_max_frames):
-                if isinstance(env, VisFlyEnv):
-                    context = RenderContext(
-                        step=length, episode_return=episode_return, reward=last_reward, action=last_action
-                    )
-                    frames.append(env.render(contexts=[context])[0])  # (H, W, 3)
-                else:
-                    frames.append(env.render()[0])  # (H, W, 3)
+                frames.append(env.render()[0])  # (H, W, 3)
             if (
                 record
                 and stop_at_frame_limit
@@ -803,9 +794,7 @@ def play_episode(
             actions = np.asarray(jax.device_get(sampled.actions))  # (1, *action_shape)
             transition = env.step(actions)
             observations = jax.device_put(transition.observations)  # leaves: (1, *O)
-            last_action = actions[0]  # (*action_shape,)
-            last_reward = float(transition.rewards[0])
-            episode_return += last_reward
+            episode_return += float(transition.rewards[0])
             length += 1
             if bool((transition.terminated | transition.truncated)[0]):
                 terminated = bool(transition.terminated[0])
@@ -816,16 +805,7 @@ def play_episode(
                     if "goal_distance" in transition.info:
                         final_goal_distance = float(transition.info["goal_distance"][0])
                 if frames and isinstance(env, VisFlyEnv):
-                    context = RenderContext(
-                        step=length,
-                        episode_return=episode_return,
-                        reward=last_reward,
-                        action=last_action,
-                        stop_reason=stop_reason,
-                    )
-                    outcome = env.render_outcome(
-                        frames[-1], transition.final_observations, context=context
-                    )  # (H, W, 3)
+                    outcome = env.render_outcome(frames[-1], transition.final_observations)  # (H, W, 3)
                     remaining = (
                         max(1, round(config.video_fps))
                         if config.video_max_frames is None

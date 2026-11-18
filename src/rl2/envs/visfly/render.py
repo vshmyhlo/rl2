@@ -8,7 +8,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation
 
-from rl2.envs.gym_style_env import STOP_REASON_NAMES
+from rl2.envs.gym_style_env import STOP_REASON_NAMES, StopReason
 
 
 @dataclass(frozen=True)
@@ -74,8 +74,8 @@ def diagnostics_panel(
 
     data = navigation_diagnostics(state, target)
     title = "FLIGHT DIAGNOSTICS"
-    final = context is not None and context.stop_reason is not None
-    if context is not None and context.stop_reason is not None:
+    final = context is not None and context.stop_reason not in (None, StopReason.ONGOING)
+    if context is not None and context.stop_reason not in (None, StopReason.ONGOING):
         title = STOP_REASON_NAMES[context.stop_reason].replace("_", " ").upper()
     text(title, 10, 18, accent)
     if context is not None:
