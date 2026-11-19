@@ -25,7 +25,7 @@ from rl2.envs import GymStyleEnv, GymStyleStep
 from rl2.envs.gym_env import GymConfig, GymEnv
 from rl2.envs.gym_style_env import StopReason
 from rl2.envs.visfly import generate_manifest as manifest_generation
-from rl2.envs.visfly.render import RenderContext, diagnostics_panel
+from rl2.envs.visfly.render import RenderContext, diagnostics_panel, top_down_panel
 from rl2.envs.visfly.routes import CATEGORIES, Route, RouteConfig
 from rl2.envs.visfly.scenarios import EvaluationConfig, Manifest, Scenario, SceneCoverage
 from rl2.envs.visfly_env import RawVisFlyObservation, VisFlyConfig, VisFlyEnv
@@ -518,7 +518,7 @@ def test_evaluation_uses_fresh_environment_and_closes_on_failure(config: ppo.Con
     ):
         result = ppo.play_episode(state, config, jax.random.key(0), memory, record=True)
         assert len(result.frames) == 1
-        assert result.frames[0].shape == (4, 14, 3)
+        assert result.frames[0].shape == (8, 10, 3)
         assert result.frames[0].dtype == np.uint8
         assert result.length == 1
         assert result.stop_reason == StopReason.SUCCESS
@@ -597,7 +597,7 @@ def test_visfly_video_diagnostics_preserve_terminal_state_and_frame_cap(
     assert terminal.action.shape == (4,)
     assert terminal.stop_reason == StopReason.SUCCESS
     np.testing.assert_array_equal(panel.call_args.args[0], 10)  # Terminal state, not autoreset's -1.
-    assert all(frame.shape == (4, 14, 3) for frame in result.frames)
+    assert all(frame.shape == (8, 10, 3) for frame in result.frames)
     assert backend.closed
 
 
@@ -609,23 +609,34 @@ def test_visfly_render_tracks_each_episode_across_resets(rotation_interval: int 
     with (
         patch("rl2.envs.visfly_env.load_env_creator", return_value=Mock(return_value=backend)),
         patch("rl2.envs.visfly_env.diagnostics_panel", wraps=diagnostics_panel) as panel,
+        patch("rl2.envs.visfly_env.top_down_panel", wraps=top_down_panel) as trail,
         closing(VisFlyEnv(config=settings, num_envs=4, seed=1)) as env,
     ):
         env.reset()
+        env.render()
+        panel.reset_mock()
         env.step(actions)
         transition = env.step(actions)
         actions[:] = 0  # Caller buffer reuse must not change the recorded action.
         frames = env.render()  # (B, H, W, 3)
-        assert frames.shape == (4, 4, 14, 3)
+        assert frames.shape == (4, 8, 10, 3)
+        for call in trail.call_args_list[-4:-1]:
+            np.testing.assert_array_equal(call.args[0], [[-1, -1, -1]])
+        expected_ongoing = [[0, 0, 0], [-1, -1, -1], [-1, -1, -1]] if rotation_interval is None else [[-1, -1, -1]]
+        np.testing.assert_array_equal(trail.call_args.args[0], expected_ongoing)
         current = [call.kwargs["context"] for call in panel.call_args_list]
         assert [context.step for context in current] == [0, 0, 0, 2 if rotation_interval is None else 0]
         assert [context.episode_return for context in current] == [0, 0, 0, 8 if rotation_interval is None else 0]
         for context in current[:3] if rotation_interval is None else current:
             assert context.reward is context.action is context.stop_reason is None
         panel.reset_mock()
+        trail.reset_mock()
         for index in range(4):
             outcome = env.render_outcome(frames[index], transition.final_observations, index=index)  # (H, W, 3)
             assert outcome.shape == frames[index].shape
+            np.testing.assert_array_equal(outcome[:4], frames[index, :4])
+            expected_trail = [[-1, -1, -1], [10 * (index + 1)] * 3] if index < 3 else [[0] * 3, [-1] * 3, [-1] * 3]
+            np.testing.assert_array_equal(trail.call_args.args[0], expected_trail)
         terminal = [call.kwargs["context"] for call in panel.call_args_list]
         assert [context.step for context in terminal] == [1, 1, 1, 2]
         assert [context.episode_return for context in terminal] == [1, 2, 3, 8]
@@ -648,6 +659,8 @@ def test_visfly_render_tracks_each_episode_across_resets(rotation_interval: int 
         panel.reset_mock()
         env.reset()
         env.render()
+        for call in trail.call_args_list[-4:]:
+            np.testing.assert_array_equal(call.args[0], [[-1, -1, -1]])
         for call in panel.call_args_list:
             assert call.kwargs["context"] == RenderContext(step=0, episode_return=0.0)
 
@@ -663,11 +676,11 @@ def test_visfly_render_channels_last_rectangular_camera_and_final_views() -> Non
         closing(VisFlyEnv(config=VisFlyConfig(channels_first=False), num_envs=1, seed=1)) as env,
     ):
         env.reset()
-        frame = env.render()[0]  # (H, W_scene + W_agent + W_depth + W_debug, 3)
-        assert frame.shape == (4, 26, 3)
-        np.testing.assert_array_equal(frame[:, :4], 0)
-        np.testing.assert_array_equal(frame[:, 4:12], 150)
-        assert frame[:, 12:20].any()
+        frame = env.render()[0]  # (2 * H, H + W_right, 3)
+        assert frame.shape == (8, 10, 3)
+        np.testing.assert_array_equal(frame[:4, :4], 0)
+        np.testing.assert_array_equal(frame[1, 4:7], 150)
+        assert frame[1, 7:].any()
         before = frame.copy()  # (H, W, 3)
         raw = backend.get_observation()  # leaves: (B, *O)
         with patch.object(
@@ -683,8 +696,8 @@ def test_visfly_render_channels_last_rectangular_camera_and_final_views() -> Non
             transition = env.step(np.zeros((1, 4), dtype=np.float32))
         final = env.render_outcome(frame, transition.final_observations)  # (H, W, 3)
         np.testing.assert_array_equal(frame, before)
-        np.testing.assert_array_equal(final[:, :20], frame[:, :20])
-        assert not np.array_equal(final[:, 20:], frame[:, 20:])
+        np.testing.assert_array_equal(final[:4], frame[:4])
+        assert not np.array_equal(final[4:, 4:], frame[4:, 4:])
 
 
 def test_configuration_round_trip(config: ppo.Config) -> None:

@@ -16,9 +16,28 @@ from ompl import geometric as og
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components, dijkstra
 
+from rl2.envs.visfly.collision import SceneCollision
 from rl2.envs.visfly.routes import DIFFICULTIES, Point, Route, RouteConfig
 
 type CollisionQuery = Callable[[NDArray[np.float32], float], NDArray[np.bool_]]  # (N, 3), radius -> (N,)
+
+
+class NativeMotionValidator(ob.MotionValidator):
+    """Delegate probes to Habitat, retaining OMPL's segment count and start contract."""
+
+    def __init__(self, info: ob.SpaceInformation, collision: SceneCollision, radius: float) -> None:
+        super().__init__(info)
+        self.space = info.getStateSpace()
+        self.scene = collision.scene
+        self.radius = radius
+
+    def checkMotion(self, start: ob.RealVectorStateType, end: ob.RealVectorStateType) -> bool:
+        return self.scene.route_motion_is_valid(
+            tuple(start[axis] for axis in range(3)),  # (3,)
+            tuple(end[axis] for axis in range(3)),  # (3,)
+            self.space.validSegmentCount(start, end),
+            self.radius,
+        )
 
 
 def space_information(
@@ -42,7 +61,18 @@ def space_information(
         return not bool(collision(point, radius + step / 2)[0])
 
     info = ob.SpaceInformation(space)
-    info.setStateValidityChecker(valid)
+    if isinstance(collision, SceneCollision):
+
+        def native_valid(state: ob.RealVectorStateType) -> bool:
+            return not collision.scene.route_point_collides(
+                tuple(state[axis] for axis in range(3)),  # (3,)
+                radius + step / 2,
+            )
+
+        info.setStateValidityChecker(native_valid)
+        info.setMotionValidator(NativeMotionValidator(info, collision, radius + step / 2))
+    else:
+        info.setStateValidityChecker(valid)
     info.setup()
     return info
 
@@ -144,7 +174,7 @@ def shortcut_path(points: torch.Tensor, info: ob.SpaceInformation) -> tuple[Poin
 class Roadmap:
     points: torch.Tensor  # (N, 3), CPU route samples
     edges: csr_matrix  # (N, N), symmetric edge lengths in metres
-    wide_components: NDArray[np.int32]  # (N,), -1 for points without extra clearance
+    wide_components: NDArray[np.int32] | None  # (N,), -1 for invalid points; None when classification is skipped
     extent: float
 
 
@@ -165,8 +195,10 @@ def build_roadmap(
     collision: CollisionQuery,
     clearance: float,
     config: RouteConfig,
+    *,
+    classify_passages: bool = True,
 ) -> Roadmap:
-    """Build an OMPL PRM from a fixed budget of seeded uniform samples."""
+    """Build a seeded PRM, optionally classifying connectivity with extra clearance."""
     if torch.any(upper <= lower):
         raise ValueError("Scene has no route sampling volume")
     count = prod(max(2, ceil(float(size) / config.spacing) + 1) for size in upper - lower)
@@ -179,15 +211,17 @@ def build_roadmap(
     pairs = prm_edges(points, info, config.neighbors)  # (E, 2)
     left, right = pairs.unbind(dim=1)  # each (E,)
     lengths = (points[left] - points[right]).norm(dim=-1)  # (E,)
-    wide = segments_clear(
-        points[left], points[right], collision, clearance + config.passage_margin, config.probe_step
-    )  # (E,)
     edges = sparse_graph(left, right, lengths, len(points))  # (N, N)
-    wide_edges = sparse_graph(left[wide], right[wide], lengths[wide], len(points))  # (N, N)
-    _, labels = connected_components(wide_edges, directed=False)  # (N,)
-    # Isolated valid nodes have distinct labels; invalid nodes cannot mark a passage endpoint.
-    invalid = collision(points.numpy(), clearance + config.passage_margin + config.probe_step / 2)  # (N,)
-    labels[invalid] = -1
+    labels = None  # (N,) when passage classification is enabled
+    if classify_passages:
+        wide = segments_clear(
+            points[left], points[right], collision, clearance + config.passage_margin, config.probe_step
+        )  # (E,)
+        wide_edges = sparse_graph(left[wide], right[wide], lengths[wide], len(points))  # (N, N)
+        _, labels = connected_components(wide_edges, directed=False)  # (N,)
+        # Isolated valid nodes have distinct labels; invalid nodes cannot mark a passage endpoint.
+        invalid = collision(points.numpy(), clearance + config.passage_margin + config.probe_step / 2)  # (N,)
+        labels[invalid] = -1
     return Roadmap(
         points=points,
         edges=edges,
@@ -196,12 +230,19 @@ def build_roadmap(
     )
 
 
-def build_routes(graph: Roadmap, collision: CollisionQuery, clearance: float, config: RouteConfig) -> list[Route]:
+def build_routes(
+    graph: Roadmap, collision: CollisionQuery, clearance: float, config: RouteConfig, *, shortcut: bool = True
+) -> list[Route]:
+    """Select seeded endpoint pairs, retaining graph paths when shortcutting is disabled.
+
+    Passage labels are only populated when the roadmap includes that classification.
+    Neither option changes endpoint selection or the training difficulty groups.
+    """
     if len(graph.points) < 2:
         return []
     lower = graph.points.amin(dim=0) - config.probe_step  # (3,)
     upper = graph.points.amax(dim=0) + config.probe_step  # (3,)
-    info = space_information(lower, upper, collision, clearance, config.probe_step)
+    info = space_information(lower, upper, collision, clearance, config.probe_step) if shortcut else None
     routes = []
     seen: set[tuple[int, int]] = set()
     for source in torch.randperm(len(graph.points))[: config.sources].tolist():
@@ -229,15 +270,21 @@ def build_routes(graph: Roadmap, collision: CollisionQuery, clearance: float, co
                 path.append(int(parents[path[-1]]))
             points = graph.points[list(reversed(path))]  # (K, 3)
             direct = bool(segments_clear(points[:1], points[-1:], collision, clearance, config.probe_step)[0])
-            smoothed = (
-                (tuple(points[0].tolist()), tuple(points[-1].tolist())) if direct else shortcut_path(points, info)
-            )
-            wide_start, wide_goal = graph.wide_components[source], graph.wide_components[goal]
+            if direct:
+                reference = (tuple(points[0].tolist()), tuple(points[-1].tolist()))  # (2, 3)
+            elif info is not None:
+                reference = shortcut_path(points, info)  # (P, 3)
+            else:
+                reference = tuple(tuple(point) for point in points.tolist())  # (K, 3)
+            constrained = False
+            if graph.wide_components is not None:
+                wide_start, wide_goal = graph.wide_components[source], graph.wide_components[goal]
+                constrained = not direct and wide_start >= 0 and wide_goal >= 0 and wide_start != wide_goal
             routes.append(
                 Route(
-                    points=smoothed,
+                    points=reference,  # (P, 3) reference path
                     direct_blocked=not direct,
-                    constrained=not direct and wide_start >= 0 and wide_goal >= 0 and wide_start != wide_goal,
+                    constrained=constrained,
                     long=float(separation[goal]) >= config.long_fraction * graph.extent,
                     detour_threshold=config.detour_ratio,
                 )

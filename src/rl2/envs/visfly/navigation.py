@@ -13,14 +13,13 @@ from typing import Any, Literal, NamedTuple
 import numpy as np
 import torch
 from habitat_sim import SensorType
-from numpy.typing import NDArray
 from pydantic import TypeAdapter
 from VisFly.envs.NavigationEnv import NavigationEnv
 from VisFly.utils.common import habitat_to_std
 from VisFly.utils.maths import Quaternion
 from VisFly.utils.type import TensorDict
 
-from rl2.envs.visfly.collision import collision_points
+from rl2.envs.visfly.collision import SceneCollision
 from rl2.envs.visfly.dynamics import CompiledEuler
 from rl2.envs.visfly.planning import build_roadmap, build_routes, sample_route, segments_clear
 from rl2.envs.visfly.routes import Route, RouteConfig
@@ -58,6 +57,7 @@ class SampledState(NamedTuple):
 class RouteCatalogue:
     scene: Any
     config: RouteConfig
+    training: bool
     routes: list[Route]
     long_threshold: float
 
@@ -110,9 +110,7 @@ class SceneStateRandomizer:
             bounds = sampling_bounds(self.manager._scene_bounds[self.scene_id], self.clearance, self.height)
             points = torch.tensor(scenario.route.points)  # (P, 3)
 
-            def collision(positions: NDArray[np.float32], radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
-                return collision_points(self.manager.scenes[self.scene_id], positions, radius)
-
+            collision = SceneCollision(scene=self.manager.scenes[self.scene_id])
             if not bool(((points >= bounds.lower) & (points <= bounds.upper)).all()) or not bool(
                 segments_clear(points[:-1], points[1:], collision, self.clearance, scenario.probe_step).all()
             ):
@@ -345,23 +343,25 @@ class RGBNavigationEnv(NavigationEnv):
                 scene_path = loader.next(1)[0]
         raise ValueError("No compatible VisFly scenes remain. " + "; ".join(self._rejected_scenes.values()))
 
-    def _route_collision(
-        self, positions: NDArray[np.float32], radius: float, *, scene_id: int
-    ) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
-        return collision_points(self.envs.sceneManager.scenes[scene_id], positions, radius)
-
-    def route_catalogue(self, scene_id: int, config: RouteConfig) -> list[Route]:
+    def route_catalogue(self, scene_id: int, config: RouteConfig, *, training: bool = False) -> list[Route]:
+        """Cache scene routes; training omits passage labels and path shortcutting."""
         manager = self.envs.sceneManager
         scene = manager.scenes[scene_id]
         cached = self._route_catalogues.get(scene_id)
-        if cached is not None and cached.scene is scene and cached.config == config:
+        if cached is not None and cached.scene is scene and cached.config == config and cached.training == training:
             return cached.routes
         bounds = sampling_bounds(manager._scene_bounds[scene_id], self.spawn_clearance, self.flight_height)
-        collision = partial(self._route_collision, scene_id=scene_id)
-        graph = build_roadmap(bounds.lower, bounds.upper, collision, self.spawn_clearance, config)
-        routes = build_routes(graph, collision, self.spawn_clearance, config)
+        collision = SceneCollision(scene=scene)
+        graph = build_roadmap(
+            bounds.lower, bounds.upper, collision, self.spawn_clearance, config, classify_passages=not training
+        )
+        routes = build_routes(graph, collision, self.spawn_clearance, config, shortcut=not training)
         self._route_catalogues[scene_id] = RouteCatalogue(
-            scene=scene, config=config, routes=routes, long_threshold=config.long_fraction * graph.extent
+            scene=scene,
+            config=config,
+            training=training,
+            routes=routes,
+            long_threshold=config.long_fraction * graph.extent,
         )
         counts = {level: sum(route.difficulty == level for route in routes) for level in ("easy", "medium", "hard")}
         logging.getLogger(__name__).info("VisFly scene %s route catalogue: %s", scene_id, counts)
@@ -374,8 +374,8 @@ class RGBNavigationEnv(NavigationEnv):
             self.envs.sceneManager._scene_bounds[scene_id], self.spawn_clearance, self.flight_height
         )
         route = sample_route(
-            self.route_catalogue(scene_id, config),
-            partial(self._route_collision, scene_id=scene_id),
+            self.route_catalogue(scene_id, config, training=True),
+            SceneCollision(scene=self.envs.sceneManager.scenes[scene_id]),
             self.spawn_clearance,
             config,
             bounds.lower,

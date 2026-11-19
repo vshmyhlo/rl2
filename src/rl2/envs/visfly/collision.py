@@ -1,9 +1,24 @@
-"""Host collision queries without per-point Torch conversion."""
+"""Native scene collision queries and their Python precision reference."""
 
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
+
+
+@dataclass(frozen=True)
+class SceneCollision:
+    """Native Habitat queries; the caller owns the scene for the query lifetime."""
+
+    scene: Any
+
+    def __call__(
+        self,
+        positions: NDArray[np.float32],
+        radius: float,  # (N, 3)
+    ) -> NDArray[np.bool_]:  # (N,)
+        return self.scene.route_points_collide(np.ascontiguousarray(positions), radius)  # (N,)
 
 
 def collision_points(

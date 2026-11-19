@@ -31,10 +31,15 @@ def collision_free(positions: torch.Tensor, **kwargs: Any) -> NDArray[np.bool_]:
 
 
 def empty_geometry() -> SimpleNamespace:
-    def query(*, pt: NDArray[np.float64], max_search_radius: float) -> SimpleNamespace:  # (3, 1)
-        return SimpleNamespace(hit_pos=pt.reshape(3) + 100, is_out_bound=False)
+    def points(positions: NDArray[np.float32], radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
+        return np.zeros(len(positions), dtype=bool)  # (N,)
 
-    return SimpleNamespace(get_closest_collision_point=query, seed=Mock())
+    return SimpleNamespace(
+        route_points_collide=points,
+        route_point_collides=Mock(return_value=False),
+        route_motion_is_valid=Mock(return_value=True),
+        seed=Mock(),
+    )
 
 
 class GeneratedState(NamedTuple):
@@ -632,19 +637,44 @@ def test_route_catalogues_refresh_on_scene_rotation_and_metrics_drain(navigation
     manager.scenes = [empty_geometry(), empty_geometry()]
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(4)
-        first = env.route_catalogue(0, config)
-        assert first is env.route_catalogue(0, config)
+        first = env.route_catalogue(0, config, training=True)
+        assert first is env.route_catalogue(0, config, training=True)
         assert all(route.long == (route.initial_distance >= env._route_catalogues[0].long_threshold) for route in first)
         sampled = env._sample_route(0)
         assert sampled in first or tuple(reversed(sampled.points)) in [route.points for route in first]
         manager.scenes[0] = empty_geometry()
         manager._scene_bounds[0] = SimpleNamespace(min=[-20, 0, -20], max=[-10, 4, -10])
-        second = env.route_catalogue(0, config)
+        second = env.route_catalogue(0, config, training=True)
     assert second is not first
     assert all(route.points[0][0] >= 10 for route in second)
     metrics = env.sampling_metrics()
     assert metrics["rollout/sampled_episode_count"] == 1
+    assert metrics["rollout/reference_route_length_meters"] == sampled.length
     assert metrics["rollout/direct_path_blocked_fraction"] == 0
     assert metrics["rollout/difficulty_fraction/hard"] == 0
     assert sum(metrics[f"rollout/difficulty_fraction/{level}"] for level in ("easy", "medium", "hard")) == 1
     assert env.sampling_metrics() == {}
+
+
+def test_route_catalogue_modes_do_not_share_cached_metadata(navigation_class: type[Any]) -> None:
+    config = RouteConfig()
+    env = navigation_class(scene_randomization=True, route_sampling=asdict(config))
+    env.envs.sceneManager.scenes = [empty_geometry(), empty_geometry()]
+    detailed = Route(
+        points=((1.0, 1.0, 1.0), (8.0, 8.0, 1.0)),
+        direct_blocked=True,
+        constrained=True,
+        long=True,
+        detour_threshold=1.25,
+    )
+    training = replace(detailed, constrained=False)
+    graph = Mock(return_value=SimpleNamespace(extent=10.0))
+    routes = Mock(side_effect=[[detailed], [training], [detailed]])
+    with patch.dict(env.route_catalogue.__func__.__globals__, build_roadmap=graph, build_routes=routes):
+        assert env.route_catalogue(0, config) == [detailed]
+        selected = env.route_catalogue(0, config, training=True)
+        assert selected == [training]
+        assert env.route_catalogue(0, config, training=True) is selected
+        assert env.route_catalogue(0, config) == [detailed]
+    assert [call.kwargs["classify_passages"] for call in graph.call_args_list] == [True, False, True]
+    assert [call.kwargs["shortcut"] for call in routes.call_args_list] == [True, False, True]

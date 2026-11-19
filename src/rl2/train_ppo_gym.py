@@ -80,7 +80,9 @@ VisFly route-sampling window metrics (only with env.route_sampling):
         log window, including initial starts in the first window; not cumulative.
     rollout/initial_goal_distance_meters, rollout/reference_route_length_meters:
         Means over those starts of Euclidean goal distance and collision-checked,
-        smoothed roadmap path length. Reference paths are not exact shortest paths.
+        roadmap path length, including accepted endpoint connectors. Training retains
+        unsmoothed graph paths for obstructed corridors and straight paths otherwise;
+        these reference lengths are not exact shortest paths.
     rollout/direct_path_blocked_fraction: Fraction of those starts whose direct
         swept-drone corridor is obstructed.
     rollout/difficulty_fraction/easy, rollout/difficulty_fraction/medium,
@@ -198,8 +200,13 @@ other integrators and CUDA dynamics retain the upstream implementation. Frames a
 before actions; autoreset frames are excluded. video_max_frames=None records the
 full episode. VisFly requires its simulator dependencies, scene assets, and RGB
 render settings for video; scoring alone does not require RGB rendering. VisFly's
-last view shows navigation diagnostics and previous-transition actions/rewards.
-At episode end, a final diagnostics card uses terminal state with labeled last
+2x2 video grid shows scene and onboard RGB/depth cameras above a top-down XY
+flight trail and navigation diagnostics with previous-transition actions/rewards.
+The left column is square; the right is 50% wider for sensor views and readable text.
+The trail tracks every step from the first render, resets per episode,
+and fits the trail and target with equal axis scales;
+altitude is labeled numerically and scene geometry is omitted.
+At episode end, the trail and diagnostics use terminal state with labeled last
 recorded views, held for up to one second within video_max_frames (replacing the
 last frame if the cap is full). Omit the card when a custom backend provides no
 terminal observation. This hold adds no environment steps.

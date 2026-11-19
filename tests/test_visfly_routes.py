@@ -3,7 +3,7 @@
 import json
 from dataclasses import asdict, replace
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -286,6 +286,55 @@ def test_catalogue_is_repeatable_after_unrelated_planning() -> None:
     assert (first.edges != second.edges).nnz == 0
     assert any(route.direct_blocked for route in routes)
     assert routes == repeated
+
+
+def test_training_planning_preserves_graph_endpoints_and_sampling() -> None:
+    config = RouteConfig(spacing=0.5, sources=3, goals_per_source=4, min_distance=1, passage_margin=0.4)
+    lower, upper = torch.tensor([0.0, 0.0, 1.0]), torch.tensor([6.0, 5.0, 1.5])  # each (3,)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(4)
+        detailed = build_roadmap(lower, upper, doorway, 0.1, config)
+        reference = build_routes(detailed, doorway, 0.1, config)
+        reference_rng = torch.get_rng_state()  # (R,)
+        torch.manual_seed(4)
+        with patch("rl2.envs.visfly.planning.segments_clear", side_effect=AssertionError("no wide pass")):
+            training = build_roadmap(lower, upper, doorway, 0.1, config, classify_passages=False)
+        with patch("rl2.envs.visfly.planning.shortcut_path", side_effect=AssertionError("no shortcutting")):
+            routes = build_routes(training, doorway, 0.1, config, shortcut=False)
+        torch.testing.assert_close(torch.get_rng_state(), reference_rng, rtol=0, atol=0)
+        assert training.points.shape == detailed.points.shape
+        assert training.edges.shape == detailed.edges.shape
+        torch.testing.assert_close(training.points, detailed.points, rtol=0, atol=0)
+        assert (training.edges != detailed.edges).nnz == 0
+        assert training.wide_components is None
+        assert detailed.wide_components is not None
+        assert any(route.direct_blocked for route in routes)
+        assert len(routes) == len(reference)
+        for actual, expected in zip(routes, reference, strict=True):
+            assert (actual.points[0], actual.points[-1], actual.difficulty) == (
+                expected.points[0],
+                expected.points[-1],
+                expected.difficulty,
+            )
+            points = torch.tensor(actual.points)  # (P, 3)
+            assert points.shape[1:] == (3,)
+            assert segments_clear(points[:-1], points[1:], doorway, 0.1, config.probe_step).all()
+            assert actual.length >= expected.length - 1e-5
+        # A hard episode exercises direction selection and validated endpoint jitter.
+        sampling = replace(config, weights=(0.0, 0.0, 1.0), jitter=0.1)
+        torch.manual_seed(8)
+        expected = sample_route(
+            reference, doorway, 0.1, sampling, lower, upper, long_threshold=config.long_fraction * detailed.extent
+        )
+        torch.manual_seed(8)
+        actual = sample_route(
+            routes, doorway, 0.1, sampling, lower, upper, long_threshold=config.long_fraction * training.extent
+        )
+        assert (actual.points[0], actual.points[-1], actual.difficulty) == (
+            expected.points[0],
+            expected.points[-1],
+            expected.difficulty,
+        )
 
 
 def test_segment_validation_checks_invalid_starts_and_zero_length() -> None:

@@ -26,7 +26,7 @@ from rl2.envs.gym_style_env import (
     StopReason,
     replace_observation,
 )
-from rl2.envs.visfly.render import RenderContext, depth_panel, diagnostics_panel
+from rl2.envs.visfly.render import RenderContext, depth_panel, diagnostics_panel, fit_panel, top_down_panel
 from rl2.envs.visfly.routes import RouteConfig
 from rl2.envs.visfly.scenarios import EvaluationConfig, Manifest, Scenario
 from rl2.utils import read_optional
@@ -122,6 +122,10 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         self._scene_env_steps = 0
         self._contexts = [RenderContext(step=0, episode_return=0.0) for _ in range(num_envs)]
         self._last_contexts = self._contexts
+        # Start recording on first render so training-only batches retain no history.
+        self._record_trajectory = False
+        self._trajectories: list[list[NDArray[Any]]] = [[] for _ in range(num_envs)]  # each point: (3,)
+        self._last_trajectories = self._trajectories
         if num_envs % config.num_scenes:
             raise ValueError("num_envs must be divisible by env.num_scenes")
         reserved = {"num_scene", "num_agent_per_scene", "seed", "requires_grad"} & config.kwargs.keys()
@@ -168,7 +172,12 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         self._contexts = [RenderContext(step=0, episode_return=0.0) for _ in range(self.num_envs)]
         self._last_contexts = self._contexts
         with self._use_rng():
-            return convert_observation(self.backend.reset(), self.config.channels_first)
+            observation = convert_observation(self.backend.reset(), self.config.channels_first)  # leaves: (B, *O)
+        self._trajectories = [
+            [state[:3].copy()] if self._record_trajectory else [] for state in observation["state"]
+        ]  # each point: (3,)
+        self._last_trajectories = self._trajectories
+        return observation
 
     def step(self, actions: NDArray[Any]) -> GymStyleStep[VisFlyObservation[NDArray[Any]]]:  # (B, *action_shape)
         host_actions = np.array(actions, copy=True)  # (B, *action_shape)
@@ -210,6 +219,11 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
             else:
                 has_final_observations = False
         contexts = self._contexts  # Preserve episode totals across scene resets.
+        trajectories = self._trajectories
+        if self._record_trajectory:
+            for index, trajectory in enumerate(trajectories):
+                if not done[index] or "terminal_observation" in infos[index]:
+                    trajectory.append(final["state"][index, :3].copy())  # (3,)
         self._scene_env_steps += self.num_envs
         interval = self.config.scene_rotation_env_steps
         if interval is not None and self._scene_env_steps >= interval:
@@ -231,6 +245,12 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
             RenderContext(step=0, episode_return=0.0) if terminated[index] or truncated[index] else context
             for index, context in enumerate(self._last_contexts)
         ]
+        self._last_trajectories = trajectories if self._record_trajectory else [[] for _ in range(self.num_envs)]
+        if self._record_trajectory:
+            self._trajectories = [
+                [observations["state"][index, :3].copy()] if terminated[index] or truncated[index] else trajectory
+                for index, trajectory in enumerate(trajectories)
+            ]  # each point: (3,)
         info = GymStyleInfo(stop_reason=stop_reasons)  # leaves: (B,)
         if has_final_observations:
             info["goal_distance"] = np.linalg.norm(final["target"] - final["state"][:, :3], axis=-1).astype(
@@ -265,12 +285,13 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         )  # (H, W_debug, 3)
 
     @torch.inference_mode()
-    def render(self) -> NDArray[np.uint8]:  # (B, H, W_scene + W_agent + W_depth + W_debug, 3)
-        """Return (B, H, W_scene + W_agent + W_depth + W_debug, 3) scene/RGB/depth/diagnostics.
+    def render(self) -> NDArray[np.uint8]:  # (B, 2 * H, H + round(1.5 * H), 3)
+        """Return (B, 2 * H, H + round(1.5 * H), 3) RGB grids; H is the scene camera height.
 
-        Scale camera views to scene height with nearest-neighbor sampling, preserving aspect ratio.
-        W_depth is zero without depth; otherwise show a fixed 0–20 m inferno colour scale.
-        W_debug is round(1.5 * H). Diagnostics include per-agent episode and last-action details.
+        Top: scene camera, onboard RGB with optional 0–20 m inferno depth alongside.
+        Bottom: XY trail, diagnostics. The left column is square; the right is 1.5 times
+        wider for sensors and text. Fit cameras with nearest-neighbor letterboxing.
+        Record every step from first render, resetting per episode.
         """
         frames = to_numpy(self.backend.render())  # (S, H, W, C) or (H, W, C); S: scenes
         if frames.ndim == 3:
@@ -288,37 +309,52 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         agent_frames = np.stack(
             [cv2.resize(frame, (width, height), interpolation=cv2.INTER_NEAREST) for frame in rgb]
         )  # (B, H, W_agent, 3)
-        views = [frames, agent_frames]  # each (B, H, W_view, 3)
+        sensors = agent_frames  # (B, H, W_sensors, 3)
         if "depth" in observation:
-            views.append(
-                np.stack([depth_panel(depth, height=height) for depth in observation["depth"]])
+            depth_frames = np.stack(
+                [depth_panel(depth, height=height) for depth in observation["depth"]]
             )  # (B, H, W_depth, 3)
-        panels = np.stack(
-            [
-                self._diagnostics_panel(
-                    observation,
-                    index=index,
-                    height=height,
-                    context=self._contexts[index],
+            sensors = np.concatenate((sensors, depth_frames), axis=2)  # (B, H, W_sensors, 3)
+        self._record_trajectory = True
+        for index, trajectory in enumerate(self._trajectories):
+            if not trajectory:
+                trajectory.append(observation["state"][index, :3].copy())  # (3,)
+        right_width = round(1.5 * height)
+        grids = []
+        for index, trajectory in enumerate(self._trajectories):
+            top_down = top_down_panel(np.stack(trajectory), observation["target"][index], height=height)  # (H, H, 3)
+            diagnostics = self._diagnostics_panel(
+                observation, index=index, height=height, context=self._contexts[index]
+            )  # (H, W_right, 3)
+            scene = fit_panel(frames[index], height=height, width=height)  # (H, H, 3)
+            sensor = fit_panel(sensors[index], height=height, width=right_width)  # (H, W_right, 3)
+            grids.append(
+                np.concatenate(
+                    (np.concatenate((scene, sensor), axis=1), np.concatenate((top_down, diagnostics), axis=1)), axis=0
                 )
-                for index in range(self.num_envs)
-            ]
-        )  # (B, H, W_debug, 3)
-        return np.concatenate((*views, panels), axis=2)  # (B, H, W_scene + W_agent + W_depth + W_debug, 3)
+            )  # (2 * H, H + W_right, 3)
+        return np.stack(grids)  # (B, 2 * H, H + W_right, 3)
 
     def render_outcome(
         self,
-        frame: NDArray[np.uint8],  # (H, W_scene + W_agent + W_depth + W_debug, 3)
+        frame: NDArray[np.uint8],  # (2 * H, H + W_right, 3)
         observation: VisFlyObservation[NDArray[Any]],  # leaves: (B, *O), before autoreset
         *,
         index: int = 0,
-    ) -> NDArray[np.uint8]:  # (H, W_scene + W_agent + W_depth + W_debug, 3)
-        """Return (H, W, 3) diagnostics for the latest transition with labeled last pre-action views."""
+    ) -> NDArray[np.uint8]:  # (2 * H, H + W_right, 3)
+        """Return (H, W, 3) terminal trail/diagnostics with labeled last pre-action camera views."""
+        height = frame.shape[0] // 2
         panel = self._diagnostics_panel(
-            observation, index=index, height=frame.shape[0], context=self._last_contexts[index]
+            observation, index=index, height=height, context=self._last_contexts[index]
         )  # (H, W_debug, 3)
         result = frame.copy()  # (H, W, 3)
-        result[:, -panel.shape[1] :] = panel
+        result[height:, height:] = panel
+        top_down = top_down_panel(
+            np.stack(self._last_trajectories[index] or [observation["state"][index, :3]]),  # (T, 3)
+            observation["target"][index],  # (3,)
+            height=height,
+        )  # (H, H, 3)
+        result[height:, :height] = top_down
         return result  # (H, W, 3)
 
     @torch.inference_mode()

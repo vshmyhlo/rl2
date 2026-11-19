@@ -63,7 +63,7 @@ def backends(config: VisFlyConfig, monkeypatch: pytest.MonkeyPatch) -> list[Mock
     return created
 
 
-def test_generate_unique_scenes_and_reuse_manifest(config: VisFlyConfig, backends: list[Mock]) -> None:
+def test_generate_unique_scenes_and_overwrite_manifest(config: VisFlyConfig, backends: list[Mock]) -> None:
     manifest = generation.generate_manifest(config, seed=3, workers=1)
     assert len(backends) == 4  # Inventory plus three unique layouts.
     assert all(backend.close.call_count == 1 for backend in backends)
@@ -75,10 +75,14 @@ def test_generate_unique_scenes_and_reuse_manifest(config: VisFlyConfig, backend
     changed = replace(config, evaluation=replace(manifest.generation, reference_speed=5))
     with patch("rl2.envs.visfly_env.load_env_creator", side_effect=AssertionError("must reuse manifest")):
         assert evaluation_manifest(changed) == manifest
-        assert generation.generate_manifest(changed, seed=99, workers=1) == manifest
+    regenerated = generation.generate_manifest(changed, seed=99, workers=1)
+    assert regenerated.seed == 99
+    assert regenerated.generation.reference_speed == 5
+    assert evaluation_manifest(changed) == regenerated
+    assert len(backends) == 8
 
 
-def test_interrupted_generation_resumes_completed_scenes(
+def test_interrupted_generation_restarts_completed_scenes(
     config: VisFlyConfig, backends: list[Mock], tmp_path: Path
 ) -> None:
     original = generation.generate_scene
@@ -97,33 +101,40 @@ def test_interrupted_generation_resumes_completed_scenes(
     assert len(list((tmp_path / "manifest.json.scenes").glob("*.json"))) == 1
     with patch.object(generation, "generate_scene", wraps=original) as resumed:
         manifest = generation.generate_manifest(config, seed=3, workers=1)
-    assert [call.args[1] for call in resumed.call_args_list] == ["b.json", "bad.json"]
+    assert [call.args[1] for call in resumed.call_args_list] == ["a.json", "b.json", "bad.json"]
     assert [scenario.seed for scenario in manifest.scenarios] == [3, 7]
     assert all(backend.close.call_count == 1 for backend in backends)
     assert evaluation_manifest(config) == manifest
-    # A missing final file can be rebuilt entirely from completed scene records.
-    (tmp_path / "manifest.json").unlink()
-    with patch.object(generation, "generate_scene", side_effect=AssertionError("already generated")):
-        assert generation.generate_manifest(config, seed=3, workers=1) == manifest
 
 
-@pytest.mark.parametrize("change", ["seed", "config", "scene"])
-def test_scene_cache_tracks_generation_inputs(
-    config: VisFlyConfig, backends: list[Mock], tmp_path: Path, change: str
+@pytest.mark.parametrize("invalid", [False, True], ids=["valid_outputs", "invalid_outputs"])
+def test_generation_overwrites_existing_outputs_with_unchanged_inputs(
+    config: VisFlyConfig, backends: list[Mock], tmp_path: Path, invalid: bool
 ) -> None:
     manifest = generation.generate_manifest(config, seed=3, workers=1)
-    (tmp_path / "manifest.json").unlink()
-    seed = 3
-    if change == "seed":
-        seed = 4
-    elif change == "config":
-        config = replace(config, evaluation=replace(manifest.generation, reference_speed=5))
-    else:
-        (tmp_path / "test/b.json").write_text('{"layout": 4}')
+    paths = [tmp_path / "manifest.json", *sorted((tmp_path / "manifest.json.scenes").glob("*.json"))]
+    contents = {path: path.read_bytes() for path in paths}
+    if invalid:
+        for path in paths:
+            path.write_bytes(b"invalid JSON")
     with patch.object(generation, "generate_scene", wraps=generation.generate_scene) as regenerated:
-        generation.generate_manifest(config, seed=seed, workers=1)
-    expected = ["b.json"] if change == "scene" else ["a.json", "b.json", "bad.json"]
-    assert [call.args[1] for call in regenerated.call_args_list] == expected
+        assert generation.generate_manifest(config, seed=3, workers=1) == manifest
+    assert [call.args[1] for call in regenerated.call_args_list] == ["a.json", "b.json", "bad.json"]
+    assert {path: path.read_bytes() for path in paths} == contents
+
+
+def test_failed_regeneration_preserves_existing_manifest(
+    config: VisFlyConfig, backends: list[Mock], tmp_path: Path
+) -> None:
+    generation.generate_manifest(config, seed=3, workers=1)
+    path = tmp_path / "manifest.json"
+    previous = path.read_bytes()
+    with (
+        patch.object(generation, "generate_scene", side_effect=RuntimeError("interrupted")),
+        pytest.raises(RuntimeError, match="interrupted"),
+    ):
+        generation.generate_manifest(config, seed=4, workers=1)
+    assert path.read_bytes() == previous
 
 
 @pytest.mark.parametrize(

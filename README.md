@@ -128,9 +128,15 @@ of 20/40/40: short clear flights, long clear flights, and obstacle-crossing flig
 An OMPL PRM route catalogue is cached per loaded scene; endpoint jitter provides fresh
 starts/goals. Missing difficulty levels are excluded and weights renormalized.
 OMPL 2.0.1 requires Python 3.12 or 3.13. It supplies roadmap construction,
-discrete motion validation, and deterministic rope shortcutting; SciPy supplies
-shortest paths and extra-clearance connectivity. Validation retains the half-probe
-clearance margin. Generation uses seeded uniform samples and a fixed count, not a
+probe counts, and deterministic rope shortcutting; SciPy supplies
+shortest paths and extra-clearance connectivity. Training skips passage classification
+and shortcutting, retaining valid graph paths with the same endpoint sampling and
+easy/medium/hard groups. Its reference-length metric uses these unsmoothed paths.
+Offline evaluation generation retains both operations for category labels and
+route-length-based budgets. The VisFly image runs collision probes in native Habitat
+code, retaining OMPL's probe order, float conversions, and half-probe clearance margin.
+Rebuild the image after native validator changes; older Habitat wheels lack these methods.
+Generation uses seeded uniform samples and a fixed count, not a
 time limit. `spacing` controls sampling density: the candidate count is the product
 of `max(2, ceil(axis_length / spacing) + 1)` across three axes. Defaults of 0.75 m
 and `max_nodes: 32768` support a 60 × 60 × 2 m volume. Occupied samples are discarded;
@@ -152,13 +158,12 @@ scripts/generate_visfly_manifest.sh --workers 4
 The command uses four spawned scene workers by default (`--workers 1` is serial)
 and saves one route per supported category: long traversal, obstacle
 avoidance, substantial detour, and constrained passage. Completed scenes are
-saved under `<manifest_path>.scenes/`; rerun the same command to resume. Only a
+saved under `<manifest_path>.scenes/`. Every run regenerates all scenes and
+overwrites existing outputs. Only a
 completed inventory publishes the final manifest. Local paths and `gs://` are
 supported. The preset writes `data/visfly/eval_manifest.json` in the repository;
-training images bundle that file. Per-scene caches are ignored by Git and image builds.
-Scene caches track configuration, seed, control interval, and scene
-JSON; use a new manifest path after changing referenced assets or planner code.
-An existing final manifest is reused without regeneration.
+training images bundle that file. Per-scene records are ignored by Git and image builds.
+Their filenames track configuration, seed, control interval, and scene JSON.
 
 Manifest evaluation requires `eval_episodes: null`; configuring both modes is
 rejected. Reuse the same manifest across runs for identical comparisons; choose

@@ -1,4 +1,4 @@
-"""Generate fixed VisFly evaluation scenarios offline, resuming completed scenes."""
+"""Generate fixed VisFly evaluation scenarios offline, overwriting existing outputs."""
 
 import argparse
 import json
@@ -20,7 +20,7 @@ from rl2.envs.visfly.routes import CATEGORIES
 from rl2.envs.visfly.scenarios import Manifest, Scenario, SceneCoverage, select_scenarios, unique_scenes
 from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv
 from rl2.train_ppo_gym import Config
-from rl2.utils import read_optional, write_bytes
+from rl2.utils import write_bytes
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -59,7 +59,7 @@ def initialize_worker() -> None:
     torch.set_num_threads(1)
 
 
-def cached_scene(task: SceneTask) -> SceneResult:
+def generate_and_save_scene(task: SceneTask) -> SceneResult:
     settings = task.config.evaluation
     assert settings is not None
     identity = {
@@ -70,30 +70,19 @@ def cached_scene(task: SceneTask) -> SceneResult:
     }
     digest = sha256(json.dumps(identity, sort_keys=True, allow_nan=False).encode()).hexdigest()
     cache_path = f"{settings.manifest_path}.scenes/{digest}.json"
-    cached = read_optional(cache_path)
-    if cached is None:
-        result = generate_scene(task.config, task.scene, task.seed, task.control_dt)
-        write_bytes(cache_path, TypeAdapter(SceneResult).dump_json(result))
-    else:
-        result = TypeAdapter(SceneResult).validate_json(cached)
-    print(f"{'Generated' if cached is None else 'Reused'}: {task.scene}", flush=True)
+    result = generate_scene(task.config, task.scene, task.seed, task.control_dt)
+    write_bytes(cache_path, TypeAdapter(SceneResult).dump_json(result))
+    print(f"Generated: {task.scene}", flush=True)
     return result
 
 
 def generate_manifest(config: VisFlyConfig, seed: int, *, workers: int = 4) -> Manifest:
-    """Generate scenes in isolated processes; publish only after the inventory finishes.
-
-    Scene caches track config, seed, control interval, and scene JSON. Use a new
-    manifest path after changing referenced assets or the route algorithm.
-    """
+    """Regenerate all scenes; overwrite the manifest only after the inventory finishes."""
     if workers < 1:
         raise ValueError("workers must be greater than 0")
     settings = config.evaluation
     if settings is None:
         raise ValueError("Offline manifest generation requires env.evaluation")
-    existing = read_optional(settings.manifest_path)
-    if existing is not None:
-        return TypeAdapter(Manifest).validate_json(existing)
     generation_config = replace(
         config,
         route_sampling=None,
@@ -115,7 +104,7 @@ def generate_manifest(config: VisFlyConfig, seed: int, *, workers: int = 4) -> M
         for index, (scene, _) in enumerate(inventory)
     ]
     if workers == 1 or len(tasks) < 2:
-        results = {index: cached_scene(task) for index, task in enumerate(tasks)}
+        results = {index: generate_and_save_scene(task) for index, task in enumerate(tasks)}
     else:
         results = {}
         with ProcessPoolExecutor(
@@ -123,7 +112,7 @@ def generate_manifest(config: VisFlyConfig, seed: int, *, workers: int = 4) -> M
             mp_context=multiprocessing.get_context("spawn"),
             initializer=initialize_worker,
         ) as pool:
-            pending = {pool.submit(cached_scene, task): index for index, task in enumerate(tasks)}
+            pending = {pool.submit(generate_and_save_scene, task): index for index, task in enumerate(tasks)}
             try:
                 for future in as_completed(pending):
                     results[pending[future]] = future.result()

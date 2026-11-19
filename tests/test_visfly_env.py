@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from rl2.envs.gym_style_env import StopReason
-from rl2.envs.visfly.render import depth_panel
+from rl2.envs.visfly.render import depth_panel, fit_panel
 from rl2.envs.visfly_env import RawVisFlyObservation, VisFlyConfig, VisFlyEnv, convert_observation
 
 
@@ -414,25 +414,28 @@ def test_visfly_render_preserves_batch_and_scene_order(
         ) as env,
     ):
         frames = env.render()  # (B, H, W, 3)
-        debug_start = 11 if num_scenes > 1 else 7
-        assert frames.shape == (num_envs, 2, debug_start + 3, 3)
+        assert frames.shape == (num_envs, 4, 5, 3)
         assert frames.dtype == np.uint8
         for index in range(num_envs):
             scene_index = index // (num_envs // num_scenes)
-            np.testing.assert_array_equal(frames[index, :, :3], pixels[scene_index, ..., :3].numpy())
-        np.testing.assert_array_equal(frames[:, :, 3:7], rgb.repeat(2, axis=1).repeat(2, axis=2))
-        if num_scenes > 1:
-            for index in range(num_envs):
+            np.testing.assert_array_equal(
+                frames[index, :2, :2], fit_panel(pixels[scene_index, ..., :3].numpy(), height=2, width=2)
+            )
+            sensors = rgb[index].repeat(2, axis=0).repeat(2, axis=1)  # (H, W_agent, 3)
+            if num_scenes > 1:
                 depth = backend.get_observation.return_value["depth"][index].transpose(1, 2, 0)  # (H_agent, W_agent, 1)
-                np.testing.assert_array_equal(frames[index, :, 7:11], depth_panel(depth, height=2))
-        assert frames[:, :, debug_start:].any()  # Diagnostics occupy the final panel.
+                sensors = np.concatenate((sensors, depth_panel(depth, height=2)), axis=1)  # (H, W_sensors, 3)
+            np.testing.assert_array_equal(frames[index, :2, 2:], fit_panel(sensors, height=2, width=3))
+        assert frames[:, 2:, :2].any()  # Trail at bottom left.
+        assert frames[:, 2:, 2:].any()  # Diagnostics at bottom right.
         snapshot = frames.copy()  # (B, H, W, 3)
         pixels.zero_()
         rgb[:] = 0
         np.testing.assert_array_equal(frames, snapshot)
         refreshed = env.render()  # (B, H, W, 3)
-        np.testing.assert_array_equal(refreshed[:, :, :7], 0)  # Read the latest scene and sensor pixels.
-        np.testing.assert_array_equal(refreshed[:, :, 7:], snapshot[:, :, 7:])
+        np.testing.assert_array_equal(refreshed[:, 0, :2], 0)  # Read the latest scene pixels; second row is padding.
+        assert not np.array_equal(refreshed[:, :2, 2:], snapshot[:, :2, 2:])
+        np.testing.assert_array_equal(refreshed[:, 2:], snapshot[:, 2:])
 
 
 @pytest.mark.parametrize(

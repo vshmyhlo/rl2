@@ -28,6 +28,67 @@ class NavigationDiagnostics(NamedTuple):
     body_goal: NDArray[np.float64]  # (3,) forward, left, up displacement in metres
 
 
+def fit_panel(
+    panel: NDArray[np.uint8],  # (H_source, W_source, 3)
+    *,
+    height: int,
+    width: int,
+) -> NDArray[np.uint8]:  # (H, W, 3)
+    """Return (H, W, 3) centered RGB pixels, preserving aspect ratio with letterboxing."""
+    scale = min(height / panel.shape[0], width / panel.shape[1])
+    resized_height = max(1, round(panel.shape[0] * scale))
+    resized_width = max(1, round(panel.shape[1] * scale))
+    resized = cv2.resize(panel, (resized_width, resized_height), interpolation=cv2.INTER_NEAREST)  # (Hr, Wr, 3)
+    result = np.full((height, width, 3), (20, 25, 34), dtype=np.uint8)  # (H, W, 3)
+    y, x = (height - resized_height) // 2, (width - resized_width) // 2
+    result[y : y + resized_height, x : x + resized_width] = resized
+    return result  # (H, W, 3)
+
+
+def top_down_panel(
+    trajectory: NDArray[Any],  # (T, 3), T >= 1, world positions in metres
+    target: NDArray[Any],  # (3,), world position in metres
+    *,
+    height: int,
+) -> NDArray[np.uint8]:  # (H, H, 3)
+    """Return (H, H, 3) XY trail with equal axis scales, +X right and +Y up.
+
+    Fit the recorded trail and target with padding; show altitude numerically.
+    This schematic contains no scene geometry. The last trail point is the agent.
+    """
+    panel = np.full((320, 320, 3), (20, 25, 34), dtype=np.uint8)  # (H_panel, W_panel, 3)
+    foreground = (225, 232, 240)
+    trail_color = (100, 180, 255)
+    start_color = (255, 190, 90)
+    target_color = (90, 215, 190)
+
+    def text(label: str, x: int, y: int, color: tuple[int, int, int] = foreground) -> None:
+        cv2.putText(panel, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+    xy = np.concatenate((trajectory[:, :2], target[None, :2]), axis=0)  # (T + 1, 2)
+    lower, upper = xy.min(axis=0), xy.max(axis=0)  # (2,), (2,)
+    center = (lower + upper) / 2  # (2,)
+    span = max(2.0, float(np.max(upper - lower)) * 1.2)
+    normalized = (xy - center) / span + 0.5  # (T + 1, 2)
+    pixels = np.rint(normalized * [224, -224] + [44, 268]).astype(np.int32)  # (T + 1, 2)
+    start, agent, goal = (tuple(int(v) for v in point) for point in pixels[[0, -2, -1]])
+    for coordinate in range(44, 269, 56):
+        cv2.line(panel, (coordinate, 44), (coordinate, 268), (45, 53, 66), 1)
+        cv2.line(panel, (44, coordinate), (268, coordinate), (45, 53, 66), 1)
+    cv2.line(panel, agent, goal, (65, 100, 95), 1, cv2.LINE_AA)
+    cv2.polylines(panel, [pixels[:-1]], False, trail_color, 2, cv2.LINE_AA)
+    cv2.rectangle(panel, (start[0] - 4, start[1] - 4), (start[0] + 4, start[1] + 4), start_color, 2)
+    cv2.circle(panel, goal, 8, target_color, 2, cv2.LINE_AA)
+    cv2.circle(panel, agent, 4, trail_color, -1, cv2.LINE_AA)
+    text("TOP-DOWN FLIGHT (XY)", 10, 18, target_color)
+    text("Start", 10, 35, start_color)
+    text("Trail / agent", 85, 35, trail_color)
+    text("Target", 240, 35, target_color)
+    text(f"Span {span:.1f} m | +X right, +Y up", 10, 288)
+    text(f"Altitude {trajectory[-1, 2]:.1f} m | target {target[2]:.1f} m", 10, 308)
+    return cv2.resize(panel, (height, height), interpolation=cv2.INTER_AREA)  # (H, H, 3)
+
+
 def depth_panel(depth: NDArray[Any], *, height: int) -> NDArray[np.uint8]:  # (H_depth, W_depth, 1) -> (H, W, 3)
     """Return (H, W, 3) RGB depth with preserved aspect ratio and a fixed 0–20 m inferno scale.
 

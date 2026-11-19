@@ -3,14 +3,18 @@
 import os
 from contextlib import closing
 from dataclasses import asdict, replace
+from functools import partial
 from pathlib import Path
 
 import jax
 import numpy as np
 import pytest
+import torch
 from jax.sharding import Mesh
 
+from rl2.envs.visfly.collision import SceneCollision, collision_points
 from rl2.envs.visfly.generate_manifest import generate_manifest
+from rl2.envs.visfly.planning import build_roadmap, build_routes, sample_route, segments_clear
 from rl2.envs.visfly.routes import RouteConfig
 from rl2.envs.visfly.scenarios import EvaluationConfig
 from rl2.envs.visfly_env import evaluation_manifest
@@ -19,6 +23,75 @@ from rl2.envs.visfly_env import evaluation_manifest
 from rl2.train_ppo_gym import VisFlyConfig, VisFlyEnv
 
 pytestmark = pytest.mark.skipif(os.environ.get("RL2_VISFLY_TESTS") != "1", reason="requires the VisFly GPU image")
+
+
+def test_native_collision_and_route_parity() -> None:
+    root = Path(os.environ["VISFLY_SCENE_PATH"])
+    config = VisFlyConfig(
+        route_sampling=None,
+        kwargs={
+            "device": "cpu",
+            "visual": True,
+            "scene_randomization": True,
+            "scene_kwargs": {"path": str(root), "scene_type": "json"},
+            "scene_path": str(root / "box30_0.01tree/box30_0.01tree_0.scene_instance.json"),
+            "sensor_kwargs": [{"sensor_type": "COLOR", "uuid": "color", "resolution": [16, 16]}],
+        },
+    )
+    with closing(VisFlyEnv(config=config, num_envs=1, seed=7)) as env:
+        env.reset()
+        manager = env.backend.envs.sceneManager
+        scene = manager.scenes[0]
+        reference = partial(collision_points, scene)
+        native = SceneCollision(scene=scene)
+        bounds = manager._scene_bounds[0]
+        corners = np.array([bounds.min, bounds.max])[:, [2, 0, 1]] * [-1, -1, 1]  # (2, 3)
+        lower = torch.tensor(corners.min(axis=0) + 0.4, dtype=torch.float32)  # (3,)
+        upper = torch.tensor(corners.max(axis=0) - 0.4, dtype=torch.float32)  # (3,)
+        lower[2], upper[2] = lower[2] + 0.5, lower[2] + 1.5
+        rng = np.random.default_rng(7)
+        points = rng.uniform(lower.numpy() - 1, upper.numpy() + 1, (256, 3)).astype(np.float32)  # (N, 3)
+        for batch in (points, points[:1], points[:0], points[::2]):
+            actual = native(batch, 0.3)  # (N,)
+            assert actual.shape == (len(batch),) and actual.dtype == np.bool_
+            np.testing.assert_array_equal(actual, reference(batch, 0.3))
+        for point, expected in zip(points, reference(points, 0.3), strict=True):
+            assert scene.route_point_collides(tuple(point), 0.3) == expected
+        with pytest.raises(ValueError, match="shape"):
+            scene.route_points_collide(points[:, :2].copy(), 0.3)
+        with pytest.raises(TypeError):
+            scene.route_points_collide(points.astype(np.float64), 0.3)
+        starts, ends = torch.from_numpy(points[:32]), torch.from_numpy(points[32:64])  # each (E, 3)
+        torch.testing.assert_close(
+            segments_clear(starts, ends, native, 0.3, 0.2), segments_clear(starts, ends, reference, 0.3, 0.2)
+        )
+        route_config = RouteConfig(spacing=4, sources=3, goals_per_source=4)
+        graphs, catalogues, sampled, random_states = [], [], [], []
+        for collision in (reference, native):
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(7)
+                graph = build_roadmap(lower, upper, collision, 0.3, route_config)
+                routes = build_routes(graph, collision, 0.3, route_config)
+                graphs.append(graph)
+                catalogues.append(routes)
+                sampled.append(
+                    sample_route(
+                        routes,
+                        collision,
+                        0.3,
+                        route_config,
+                        lower,
+                        upper,
+                        long_threshold=route_config.long_fraction * graph.extent,
+                    )
+                )
+                random_states.append(torch.get_rng_state())  # (R,)
+        torch.testing.assert_close(graphs[0].points, graphs[1].points, rtol=0, atol=0)
+        assert (graphs[0].edges != graphs[1].edges).nnz == 0
+        np.testing.assert_array_equal(graphs[0].wide_components, graphs[1].wide_components)
+        assert catalogues[0] == catalogues[1]
+        assert sampled[0] == sampled[1]
+        torch.testing.assert_close(random_states[0], random_states[1], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

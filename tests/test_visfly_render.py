@@ -7,7 +7,62 @@ import numpy as np
 import pytest
 
 from rl2.envs.gym_style_env import StopReason
-from rl2.envs.visfly.render import RenderContext, depth_panel, diagnostics_panel, navigation_diagnostics
+from rl2.envs.visfly.render import (
+    RenderContext,
+    depth_panel,
+    diagnostics_panel,
+    fit_panel,
+    navigation_diagnostics,
+    top_down_panel,
+)
+
+
+@pytest.mark.parametrize("shape", [(2, 8), (8, 2)], ids=["wide", "tall"])
+def test_fit_panel_preserves_aspect_ratio_and_centers(shape: tuple[int, int]) -> None:
+    source = np.full((*shape, 3), 180, dtype=np.uint8)  # (H_source, W_source, 3)
+    result = fit_panel(source, height=8, width=8)  # (H, W, 3)
+    assert result.shape == (8, 8, 3)
+    assert result.dtype == np.uint8
+    if shape[0] == 2:
+        np.testing.assert_array_equal(result[3:5], 180)
+        np.testing.assert_array_equal(result[[0, 7], 0], [[20, 25, 34]] * 2)
+    else:
+        np.testing.assert_array_equal(result[:, 3:5], 180)
+        np.testing.assert_array_equal(result[0, [0, 7]], [[20, 25, 34]] * 2)
+    np.testing.assert_array_equal(source, 180)
+
+
+def test_top_down_trail_orientation_scale_and_markers() -> None:
+    trajectory = np.array([[0, 0, 1], [0, 4, 1], [3, 4, 2]], dtype=np.float32)  # (T, 3)
+    target = np.array([6, 0, 3], dtype=np.float32)  # (3,)
+    with (
+        patch("rl2.envs.visfly.render.cv2.polylines", wraps=cv2.polylines) as lines,
+        patch("rl2.envs.visfly.render.cv2.circle", wraps=cv2.circle) as circles,
+        patch("rl2.envs.visfly.render.cv2.putText", wraps=cv2.putText) as text,
+    ):
+        panel = top_down_panel(trajectory, target, height=320)  # (H, H, 3)
+    assert panel.shape == (320, 320, 3)
+    assert panel.dtype == np.uint8
+    points = lines.call_args.args[1][0]  # (T, 2)
+    assert points.shape == (3, 2)
+    assert points[0, 0] == points[1, 0] < points[2, 0]  # +X right.
+    assert points[0, 1] > points[1, 1] == points[2, 1]  # +Y up.
+    assert (points[0, 1] - points[1, 1]) / 4 == pytest.approx((points[2, 0] - points[1, 0]) / 3, abs=0.5)
+    goal, agent = [call.args[1] for call in circles.call_args_list]
+    assert goal[0] > agent[0] and goal[1] > agent[1]
+    assert agent == tuple(points[-1])
+    assert "Altitude 2.0 m | target 3.0 m" in [call.args[1] for call in text.call_args_list]
+    translated = top_down_panel(trajectory + [100, -50, 0], target + [100, -50, 0], height=320)  # (H, H, 3)
+    np.testing.assert_array_equal(panel, translated)
+    np.testing.assert_array_equal(trajectory, [[0, 0, 1], [0, 4, 1], [3, 4, 2]])
+    np.testing.assert_array_equal(target, [6, 0, 3])
+
+
+def test_top_down_single_position_at_target() -> None:
+    panel = top_down_panel(np.zeros((1, 3)), np.zeros(3), height=64)  # (H, H, 3)
+    assert panel.shape == (64, 64, 3)
+    assert panel.dtype == np.uint8
+    assert panel.any()
 
 
 def test_depth_panel_fixed_scale_clipping_and_aspect_ratio() -> None:
