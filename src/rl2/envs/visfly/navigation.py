@@ -21,6 +21,7 @@ from VisFly.utils.type import TensorDict
 
 from rl2.envs.visfly.collision import SceneCollision
 from rl2.envs.visfly.dynamics import CompiledEuler
+from rl2.envs.visfly.errors import NoSamplingVolumeError
 from rl2.envs.visfly.planning import build_roadmap, build_routes, sample_route, segments_clear
 from rl2.envs.visfly.routes import Route, RouteConfig
 from rl2.envs.visfly.sampling import sample_positions
@@ -337,11 +338,11 @@ class RGBNavigationEnv(NavigationEnv):
                     )
                     self._rejected_scenes[scene_path] = reason
                     if self._pinned_scene is not None:
-                        raise ValueError(reason)
+                        raise NoSamplingVolumeError(reason)
                     logging.getLogger(__name__).warning("Skipping VisFly scene %s", reason)
             if attempt < len(loader.paths):
                 scene_path = loader.next(1)[0]
-        raise ValueError("No compatible VisFly scenes remain. " + "; ".join(self._rejected_scenes.values()))
+        raise NoSamplingVolumeError("No compatible VisFly scenes remain. " + "; ".join(self._rejected_scenes.values()))
 
     def route_catalogue(self, scene_id: int, config: RouteConfig, *, training: bool = False) -> list[Route]:
         """Cache scene routes; training omits passage labels and path shortcutting."""

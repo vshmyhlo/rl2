@@ -16,6 +16,7 @@ from pydantic import ConfigDict, TypeAdapter
 from pydantic.dataclasses import dataclass
 
 from rl2.configuration import load_config
+from rl2.envs.visfly.errors import NoSamplingVolumeError
 from rl2.envs.visfly.routes import CATEGORIES
 from rl2.envs.visfly.scenarios import Manifest, Scenario, SceneCoverage, select_scenarios, unique_scenes
 from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv
@@ -41,7 +42,7 @@ def generate_scene(config: VisFlyConfig, scene: str, seed: int, control_dt: floa
             env.backend.envs.sceneManager.load_scenes()
             routes = env.backend.route_catalogue(0, settings.routes)
             selected = select_scenarios(scene, routes, settings, seed, control_dt)
-    except ValueError as error:
+    except NoSamplingVolumeError as error:
         return SceneResult(scenarios=(), reason=str(error))
     return SceneResult(scenarios=selected, reason=None)
 
@@ -87,7 +88,11 @@ def generate_manifest(config: VisFlyConfig, seed: int, *, workers: int = 4) -> M
         config,
         route_sampling=None,
         scene_rotation_env_steps=None,
-        kwargs={**config.kwargs, "scene_split": "test", "scene_randomization": True},
+        kwargs={
+            **{key: value for key, value in config.kwargs.items() if key not in {"scene_path", "scenario"}},
+            "scene_split": "test",
+            "scene_randomization": True,
+        },
     )
     with closing(VisFlyEnv(config=generation_config, num_envs=1, seed=seed, evaluation=True)) as env:
         manager = env.backend.envs.sceneManager

@@ -11,6 +11,7 @@ import torch
 from numpy.typing import NDArray
 from pydantic import TypeAdapter
 
+from rl2.envs.visfly.errors import NoSamplingVolumeError
 from rl2.envs.visfly.planning import (
     build_roadmap,
     build_routes,
@@ -129,9 +130,10 @@ def test_default_route_budget_supports_large_scene(monkeypatch: pytest.MonkeyPat
 
 def test_route_sample_budget_and_empty_bounds() -> None:
     config = RouteConfig(max_nodes=8)
-    with pytest.raises(ValueError, match="samples"):
+    with pytest.raises(ValueError, match="samples") as raised:
         build_roadmap(torch.zeros(3), torch.ones(3) * 10, empty_scene, 0.1, config)
-    with pytest.raises(ValueError, match="sampling volume"):
+    assert not isinstance(raised.value, NoSamplingVolumeError)
+    with pytest.raises(NoSamplingVolumeError, match="sampling volume"):
         build_roadmap(torch.ones(3), torch.zeros(3), empty_scene, 0.1, config)
 
 

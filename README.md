@@ -159,7 +159,9 @@ The command uses four spawned scene workers by default (`--workers 1` is serial)
 and saves one route per supported category: long traversal, obstacle
 avoidance, substantial detour, and constrained passage. Completed scenes are
 saved under `<manifest_path>.scenes/`. Every run regenerates all scenes and
-overwrites existing outputs. Only a
+overwrites existing outputs, ignoring `env.kwargs.scene_path` and `scenario` pins.
+Scenes without usable flight volume are recorded as unavailable; roadmap limits
+and unexpected errors abort generation, preserving the existing manifest. Only a
 completed inventory publishes the final manifest. Local paths and `gs://` are
 supported. The preset writes `data/visfly/eval_manifest.json` in the repository;
 training images bundle that file. Per-scene records are ignored by Git and image builds.

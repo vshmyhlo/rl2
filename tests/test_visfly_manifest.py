@@ -2,7 +2,8 @@
 
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future
-from dataclasses import replace
+from contextlib import nullcontext
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,8 +14,9 @@ import pytest
 from pydantic import ValidationError
 
 from rl2.envs.visfly import generate_manifest as generation
+from rl2.envs.visfly.errors import NoSamplingVolumeError
 from rl2.envs.visfly.routes import Route
-from rl2.envs.visfly.scenarios import EvaluationConfig
+from rl2.envs.visfly.scenarios import EvaluationConfig, Scenario
 from rl2.envs.visfly_env import VisFlyConfig, evaluation_manifest
 
 
@@ -44,18 +46,24 @@ def backends(config: VisFlyConfig, monkeypatch: pytest.MonkeyPatch) -> list[Mock
 
     def create(**kwargs: Any) -> Mock:
         assert kwargs["scene_split"] == "test"
+        paths = [str(path) for path in root.glob("*.json")]
+        scene_path = kwargs.get("scene_path")
+        if kwargs.get("scenario") is not None:
+            scene_path = str(root / kwargs["scenario"]["scene"])
+        if scene_path is not None:
+            paths = [scene_path]
         backend = Mock(num_envs=1, action_space=gym.spaces.Box(low=-1, high=1, shape=(4,)))
         backend.envs = SimpleNamespace(
             dynamics=SimpleNamespace(ctrl_dt=0.03),
             sceneManager=SimpleNamespace(
                 root_path=str(root),
-                _scene_loader=SimpleNamespace(paths=[str(path) for path in root.glob("*.json")]),
+                _scene_loader=SimpleNamespace(paths=paths),
                 load_scenes=Mock(),
             ),
         )
         backend.route_catalogue.return_value = [route]
         if kwargs.get("scene_path", "").endswith("bad.json"):
-            backend.route_catalogue.side_effect = ValueError("no sampling volume")
+            backend.envs.sceneManager.load_scenes.side_effect = NoSamplingVolumeError("no sampling volume")
         created.append(backend)
         return backend
 
@@ -80,6 +88,63 @@ def test_generate_unique_scenes_and_overwrite_manifest(config: VisFlyConfig, bac
     assert regenerated.generation.reference_speed == 5
     assert evaluation_manifest(changed) == regenerated
     assert len(backends) == 8
+
+
+@pytest.mark.parametrize("pin", ["scene_path", "scenario"])
+def test_generation_ignores_scene_pins(config: VisFlyConfig, backends: list[Mock], pin: str) -> None:
+    baseline = generation.generate_manifest(config, seed=3, workers=1)
+    kwargs = {**config.kwargs}
+    if pin == "scene_path":
+        kwargs[pin] = str(Path(kwargs["scene_kwargs"]["path"]) / "a.json")
+    else:
+        kwargs[pin] = asdict(baseline.scenarios[0])
+    pinned = replace(config, kwargs=kwargs)
+
+    assert generation.generate_manifest(pinned, seed=3, workers=1) == baseline
+    assert pinned.kwargs[pin] == kwargs[pin]
+
+
+def test_selection_error_preserves_existing_manifest(
+    config: VisFlyConfig, backends: list[Mock], tmp_path: Path
+) -> None:
+    generation.generate_manifest(config, seed=3, workers=1)
+    path = tmp_path / "manifest.json"
+    previous = path.read_bytes()
+    select = generation.select_scenarios
+
+    def fail_selection(
+        scene: str, routes: list[Route], settings: EvaluationConfig, seed: int, control_dt: float
+    ) -> tuple[Scenario, ...]:
+        if scene == "b.json":
+            raise ValueError("unexpected scenario validation failure")
+        return select(scene, routes, settings, seed, control_dt)
+
+    with (
+        patch.object(generation, "select_scenarios", side_effect=fail_selection),
+        pytest.raises(ValueError, match="unexpected scenario validation failure"),
+    ):
+        generation.generate_manifest(config, seed=4, workers=1)
+    assert path.read_bytes() == previous
+    assert all(backend.close.call_count == 1 for backend in backends)
+
+
+@pytest.mark.parametrize("stage", ["construction", "scene_loading", "route_catalogue"])
+def test_unexpected_scene_errors_propagate(config: VisFlyConfig, stage: str) -> None:
+    env = Mock()
+    env._use_rng.return_value = nullcontext()
+    error = ValueError("unexpected backend failure")
+    with patch.object(generation, "VisFlyEnv", return_value=env) as create:
+        if stage == "construction":
+            create.side_effect = error
+        elif stage == "scene_loading":
+            env.backend.envs.sceneManager.load_scenes.side_effect = error
+        else:
+            env.backend.route_catalogue.side_effect = error
+        with pytest.raises(ValueError, match="unexpected backend failure") as raised:
+            generation.generate_scene(config, "a.json", seed=3, control_dt=0.03)
+    assert raised.value is error
+    if stage != "construction":
+        env.close.assert_called_once_with()
 
 
 def test_interrupted_generation_restarts_completed_scenes(

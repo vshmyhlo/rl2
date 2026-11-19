@@ -17,6 +17,7 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components, dijkstra
 
 from rl2.envs.visfly.collision import SceneCollision
+from rl2.envs.visfly.errors import NoSamplingVolumeError
 from rl2.envs.visfly.routes import DIFFICULTIES, Point, Route, RouteConfig
 
 type CollisionQuery = Callable[[NDArray[np.float32], float], NDArray[np.bool_]]  # (N, 3), radius -> (N,)
@@ -200,7 +201,7 @@ def build_roadmap(
 ) -> Roadmap:
     """Build a seeded PRM, optionally classifying connectivity with extra clearance."""
     if torch.any(upper <= lower):
-        raise ValueError("Scene has no route sampling volume")
+        raise NoSamplingVolumeError("Scene has no route sampling volume")
     count = prod(max(2, ceil(float(size) / config.spacing) + 1) for size in upper - lower)
     if count > config.max_nodes:
         raise ValueError(f"Route roadmap needs {count} samples; increase spacing or max_nodes")

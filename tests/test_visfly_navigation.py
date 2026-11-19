@@ -17,6 +17,7 @@ import torch
 from numpy.typing import NDArray
 
 from rl2.envs import visfly_env
+from rl2.envs.visfly.errors import NoSamplingVolumeError
 from rl2.envs.visfly.routes import Route, RouteConfig
 from rl2.envs.visfly.scenarios import Scenario
 
@@ -375,6 +376,18 @@ def test_scene_loading_skips_and_caches_empty_bounds(
     assert [call.args[0] for call in env._load_unchecked_scene.call_args_list] == ["bad", "good", "good"]
 
 
+def test_scene_loading_rejects_pinned_empty_bounds(navigation_class: type[Any]) -> None:
+    env = navigation_class(scene_randomization=True)
+    env._pinned_scene = "bad"
+    scene = scene_stub([-10, -5, -10], [0, -1, 0])
+    env._load_unchecked_scene.return_value = scene
+
+    with pytest.raises(NoSamplingVolumeError, match="bad: no sampling volume"):
+        env.envs.sceneManager._load_scene("bad")
+    env._load_unchecked_scene.assert_called_once_with("bad")
+    scene.close.assert_called_once_with()
+
+
 def test_scene_loading_stops_when_inventory_is_incompatible(navigation_class: type[Any]) -> None:
     env = navigation_class(scene_randomization=True)
     manager = env.envs.sceneManager
@@ -382,7 +395,7 @@ def test_scene_loading_stops_when_inventory_is_incompatible(navigation_class: ty
     env._load_unchecked_scene.side_effect = scenes
     manager._scene_loader.paths = ["bad_a", "bad_b"]
     manager._scene_loader.next = Mock(side_effect=[["bad_a"], ["bad_b"]])
-    with pytest.raises(ValueError, match="No compatible VisFly scenes remain.*bad_a.*bad_b"):
+    with pytest.raises(NoSamplingVolumeError, match="No compatible VisFly scenes remain.*bad_a.*bad_b"):
         manager._load_scene("bad_a")
     assert env._load_unchecked_scene.call_count == 2
     for scene in scenes:
