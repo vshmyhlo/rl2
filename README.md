@@ -82,15 +82,18 @@ is omitted. Quaternion sign does not affect the encoding. `model.encoder.goal_sc
 `velocity_scale`, and `angular_velocity_scale` divide these vectors by 10 m,
 5 m/s, and 10 rad/s by default, without clipping. Raw environment observations
 are preserved; preprocessing runs in JAX during inference and updates.
-On the local k3s cluster, generate with an existing VisFly image, then submit training:
+On the local k3s cluster, submit manifest generation and wait for it to succeed before submitting training:
 
 ```bash
-VISFLY_IMAGE='rl2.local/train:<image-tag>' VISFLY_GPU=0 scripts/generate_visfly_manifest.sh --workers 4
-# Generate using an existing VisFly image, then build training with the saved manifest.
+./submit.py --visfly --gpus 1 --memory-gib 32 --cpus 5 -- \
+  uv run python -m rl2.envs.visfly.generate_manifest --config configs/ppo_gym/visfly.yaml --workers 4
+# After the generation Job completes:
 ./submit.py --visfly -- uv run python -m rl2.train_ppo_gym --config configs/ppo_gym/visfly.yaml
 ```
 
 The image supplies `VISFLY_SCENE_PATH` and saves checkpoints under `/runs/ppo_gym`.
+Generation and training share `/runs/visfly/eval_manifest.json` on the `training-runs` volume.
+Neither command requires `--python-sandbox`.
 It defaults JAX's memory pool to 50% of GPU memory, leaving room for Habitat rendering.
 The first build compiles headless Habitat-Sim; subsequent builds reuse its cache.
 
@@ -149,10 +152,11 @@ to restore `goal_distance` sampling. Training allows 30-second episodes. The
 `env.evaluation.manifest_path` requires a pre-generated manifest over distinct
 test-scene JSON layouts. When evaluation is enabled, training fails before
 initialization if the manifest is missing or invalid; evaluation never generates routes. Generate it
-in a VisFly runtime before training:
+with the submitted Job above. With a host VisFly installation, configure a writable
+`env.evaluation.manifest_path` and run:
 
 ```bash
-scripts/generate_visfly_manifest.sh --workers 4
+uv run python -m rl2.envs.visfly.generate_manifest --config configs/ppo_gym/visfly.yaml --workers 4
 ```
 
 The command uses four spawned scene workers by default (`--workers 1` is serial)
@@ -163,8 +167,8 @@ overwrites existing outputs, ignoring `env.kwargs.scene_path` and `scenario` pin
 Scenes without usable flight volume are recorded as unavailable; roadmap limits
 and unexpected errors abort generation, preserving the existing manifest. Only a
 completed inventory publishes the final manifest. Local paths and `gs://` are
-supported. The preset writes `data/visfly/eval_manifest.json` in the repository;
-training images bundle that file. Per-scene records are ignored by Git and image builds.
+supported. The preset writes `/runs/visfly/eval_manifest.json`; subsequent training Jobs
+read it from the shared volume. Per-scene records are ignored by Git and image builds.
 Their filenames track configuration, seed, control interval, and scene JSON.
 
 Manifest evaluation requires `eval_episodes: null`; configuring both modes is

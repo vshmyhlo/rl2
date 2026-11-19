@@ -10,6 +10,9 @@ RUN python /tmp/visfly/fetch_sources.py /tmp/visfly/sources.json /opt
 WORKDIR /opt/habitat-sim
 # Pybind11 2.13 supplies NumPy 2 support; the fork retains an obsolete NumPy pin.
 RUN sed -i 's/numpy>=1.20.0,<1.24.0/numpy>=2,<3/' requirements.txt
+COPY infra/k3s/training/visfly/route_collision.h /opt/habitat-sim/src/esp/bindings/route_collision.h
+COPY infra/k3s/training/visfly/route_collision.patch /tmp/visfly/route_collision.patch
+RUN patch --strip=1 < /tmp/visfly/route_collision.patch
 RUN --mount=type=cache,target=/opt/habitat-sim/build,sharing=locked \
     python setup.py --headless --bullet --no-update-submodules --skip-install-magnum \
     --build-type Release \
@@ -69,6 +72,8 @@ ENV UV_NO_SYNC=1 UV_ENV_FILE=/app/nvida.env PATH="/app/.venv/bin:${CUDA_HOME}/bi
 ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 RAY_DEDUP_LOGS=0
 
 FROM training AS visfly
+# Leave GPU memory for Habitat scenes and evaluation; overrides uv's nvida.env default.
+ENV XLA_PYTHON_CLIENT_PREALLOCATE=true XLA_CLIENT_MEM_FRACTION=0.50
 RUN apt-get update && apt-get install -y --no-install-recommends libassimp5 libzstd1 libgmp10 libmpfr6 patch \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=habitat-build /wheels /tmp/visfly-wheels
@@ -90,7 +95,7 @@ ENV PYTHONPATH=/opt VISFLY_SCENE_PATH=/opt/VisFly/datasets/visfly-beta/configs/s
 # Use TensorBoard's no-TensorFlow mode for PyTorch logging. Loading TensorFlow
 # before Triton introduces conflicting native compiler libraries.
 RUN touch /app/.venv/lib/python3.12/site-packages/tensorboard/compat/notf.py
-RUN python -X faulthandler -c "from rl2 import train_ppo_gym; from rl2.envs.visfly.navigation import RGBNavigationEnv; import habitat_sim; assert hasattr(habitat_sim.Simulator, 'get_closest_collision_point')"
+RUN python -X faulthandler -c "from rl2 import train_ppo_gym; from rl2.envs.visfly.navigation import RGBNavigationEnv; import habitat_sim; assert hasattr(habitat_sim.Simulator, 'route_motion_is_valid')"
 
 # Keep the standard image as the default build target.
 FROM training AS default
