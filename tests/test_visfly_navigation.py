@@ -623,6 +623,7 @@ def test_route_catalogues_refresh_on_scene_rotation_and_metrics_drain(navigation
         torch.manual_seed(4)
         first = env.route_catalogue(0, config)
         assert first is env.route_catalogue(0, config)
+        assert all(route.long == (route.initial_distance >= env._route_catalogues[0].long_threshold) for route in first)
         sampled = env._sample_route(0)
         assert sampled in first or tuple(reversed(sampled.points)) in [route.points for route in first]
         manager.scenes[0] = object()

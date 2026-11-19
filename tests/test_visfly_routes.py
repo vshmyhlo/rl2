@@ -140,12 +140,52 @@ def test_difficulty_sampling_preserves_hard_routes_and_jitters(door_routes: list
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(8)
         sampled = sample_route(
-            door_routes, doorway, 0.1, config, torch.tensor([0.0, 0.0, 1.0]), torch.tensor([6.0, 5.0, 1.5])
+            door_routes,
+            doorway,
+            0.1,
+            config,
+            torch.tensor([0.0, 0.0, 1.0]),
+            torch.tensor([6.0, 5.0, 1.5]),
+            long_threshold=config.long_fraction * (6**2 + 5**2 + 0.5**2) ** 0.5,
         )
     assert sampled.difficulty == "hard"
     points = torch.tensor(sampled.points)  # (P, 3)
     assert segments_clear(points[:-1], points[1:], doorway, 0.1, config.probe_step).all()
     assert not segments_clear(points[:1], points[-1:], doorway, 0.1, config.probe_step).item()
+
+
+@pytest.mark.parametrize(
+    ("distance", "offset", "accepted"),
+    [
+        pytest.param(5.9, 0.4, False, id="easy_to_medium"),
+        pytest.param(6.1, -0.4, False, id="medium_to_easy"),
+        pytest.param(5.75, 0.25, False, id="easy_reaches_threshold"),
+        pytest.param(6.25, -0.25, True, id="medium_stays_at_threshold"),
+        pytest.param(5.5, 0.25, True, id="easy_stays_below_threshold"),
+    ],
+)
+def test_jitter_preserves_long_route_threshold(
+    distance: float, offset: float, accepted: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    route = Route(
+        points=((1.0, 1.0, 1.0), (1.0 + distance, 1.0, 1.0)),
+        direct_blocked=False,
+        constrained=False,
+        long=distance >= 6.0,
+        detour_threshold=1.25,
+    )
+    config = RouteConfig(jitter=0.5)
+    # Fix route direction and move only the goal along x.
+    draws = torch.tensor([[0.5, 0.5, 0.5], [0.5 + offset, 0.5, 0.5]])  # (2, 3)
+    monkeypatch.setattr(torch, "randint", Mock(return_value=torch.tensor(0)))
+    monkeypatch.setattr(torch, "rand", Mock(return_value=draws))
+    sampled = sample_route(
+        [route], empty_scene, 0.1, config, torch.zeros(3), torch.full((3,), 10.0), long_threshold=6.0
+    )
+    assert torch.tensor(sampled.points).shape == (2, 3)
+    assert sampled.initial_distance == pytest.approx(distance + offset if accepted else distance)
+    assert sampled.long == (sampled.initial_distance >= 6.0)
+    assert sampled.difficulty == route.difficulty
 
 
 def test_missing_difficulties_renormalize_without_fake_hard_cases() -> None:
@@ -157,10 +197,18 @@ def test_missing_difficulties_renormalize_without_fake_hard_cases() -> None:
         detour_threshold=1.25,
     )
     config = RouteConfig(jitter=0)
-    selected = sample_route([route], empty_scene, 0.1, config, torch.zeros(3), torch.ones(3) * 4)
+    selected = sample_route([route], empty_scene, 0.1, config, torch.zeros(3), torch.ones(3) * 4, long_threshold=2.0)
     assert selected.difficulty == "medium"
     with pytest.raises(ValueError, match="positively weighted"):
-        sample_route([route], empty_scene, 0.1, replace(config, weights=(0, 0, 1)), torch.zeros(3), torch.ones(3) * 4)
+        sample_route(
+            [route],
+            empty_scene,
+            0.1,
+            replace(config, weights=(0, 0, 1)),
+            torch.zeros(3),
+            torch.ones(3) * 4,
+            long_threshold=2.0,
+        )
 
 
 def test_evaluation_categories_horizons_and_serialization(door_routes: list[Route], tmp_path: Path) -> None:

@@ -56,6 +56,7 @@ class RouteCatalogue:
     scene: Any
     config: RouteConfig
     routes: list[Route]
+    long_threshold: float
 
 
 @dataclass
@@ -317,7 +318,9 @@ class RGBNavigationEnv(NavigationEnv):
         collision = partial(self._route_collision, scene_id=scene_id)
         graph = build_roadmap(bounds.lower, bounds.upper, collision, self.spawn_clearance, config)
         routes = build_routes(graph, collision, self.spawn_clearance, config)
-        self._route_catalogues[scene_id] = RouteCatalogue(scene=scene, config=config, routes=routes)
+        self._route_catalogues[scene_id] = RouteCatalogue(
+            scene=scene, config=config, routes=routes, long_threshold=config.long_fraction * graph.extent
+        )
         counts = {level: sum(route.difficulty == level for route in routes) for level in ("easy", "medium", "hard")}
         logging.getLogger(__name__).info("VisFly scene %s route catalogue: %s", scene_id, counts)
         return routes
@@ -335,6 +338,7 @@ class RGBNavigationEnv(NavigationEnv):
             config,
             bounds.lower,
             bounds.upper,
+            long_threshold=self._route_catalogues[scene_id].long_threshold,
         )
         self.route_statistics.add(route)
         return route

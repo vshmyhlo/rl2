@@ -723,6 +723,34 @@ def test_visfly_encoder_requires_navigation_environment(config: ppo.Config) -> N
         replace(config, model=replace(config.model, encoder=ppo.VisFlyEncoderConfig()))
 
 
+@pytest.mark.parametrize(
+    ("manifest", "episodes", "error"),
+    [
+        pytest.param(False, 2, None, id="seeded"),
+        pytest.param(True, None, None, id="manifest"),
+        pytest.param(True, 2, "mutually exclusive", id="both_modes"),
+        pytest.param(False, None, "eval_episodes is required", id="neither_mode"),
+        pytest.param(False, 0, "greater than 0", id="empty_seeded_evaluation"),
+    ],
+)
+def test_evaluation_configuration_modes(
+    config: ppo.Config, manifest: bool, episodes: int | None, error: str | None
+) -> None:
+    values = asdict(config)
+    values["env"] = asdict(
+        VisFlyConfig(evaluation=EvaluationConfig(manifest_path="/tmp/eval.json") if manifest else None)
+    )
+    values["eval_episodes"] = episodes
+    adapter = TypeAdapter(ppo.Config)
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            adapter.validate_json(json.dumps(values))
+    else:
+        parsed = adapter.validate_json(json.dumps(values))
+        assert parsed.eval_episodes == episodes
+        assert adapter.validate_json(adapter.dump_json(parsed)) == parsed
+
+
 def test_evaluation_scores_without_rendering(config: ppo.Config) -> None:
     config = replace(config, env=VisFlyConfig(), eval_episodes=2, video_max_frames=1)
     backends = []
@@ -1135,7 +1163,9 @@ def test_manifest_evaluation_scores_all_routes_and_replays_fixed_and_failed_case
     config: ppo.Config,
     flight_manifest: Manifest,
 ) -> None:
-    config = replace(config, env=VisFlyConfig(evaluation=flight_manifest.generation), eval_episodes=1, eval_video=True)
+    config = replace(
+        config, env=VisFlyConfig(evaluation=flight_manifest.generation), eval_episodes=None, eval_video=True
+    )
     scored = [
         ppo.EpisodeResult(
             episode_return=float(i),

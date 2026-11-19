@@ -146,7 +146,7 @@ episode lacks goal-distance metadata. It uses the same cadence and metric step,
 preserves measured zeros, and is not cumulative. Video replays are excluded from
 all evaluation summaries.
 With env.evaluation configured, VisFly loads its saved scenario manifest or builds
-it once across canonical-JSON-unique test scenes; eval_episodes is ignored. The
+it once across canonical-JSON-unique test scenes; eval_episodes must be null. The
 manifest fixes starts, goals, orientations, velocities, seeds, and route-length-based
 horizons. Scene rotation is disabled. Unsupported categories/scenes are recorded
 in the manifest and report, never replaced with easy cases. Generation can miss
@@ -223,7 +223,7 @@ from operator import itemgetter
 from pathlib import Path
 from statistics import fmean, stdev
 from time import monotonic
-from typing import Annotated, Any, Literal, NamedTuple, Self
+from typing import Annotated, Any, Literal, NamedTuple, Self, cast
 
 # Orbax's epath otherwise loads TensorFlow for gs:// paths when it is installed.
 # That native runtime can crash a later Triton import; use our gcsfs dependency.
@@ -460,7 +460,7 @@ class Config(BaseConfig):
     video_max_frames: Annotated[int, Field(gt=0)] | None = 1000
     video_interval: Annotated[int, Field(ge=0)] = 0
     eval_interval: Annotated[int, Field(ge=0)] = 0
-    eval_episodes: Annotated[int, Field(gt=0)] = 100
+    eval_episodes: Annotated[int, Field(gt=0)] | None = 100
     eval_video: bool = False
     eval_seed: Annotated[int, Field(ge=0, lt=2**32)] = 10_000
     lr_decay: Literal["linear", "cosine"] = "linear"
@@ -476,6 +476,17 @@ class Config(BaseConfig):
             raise ValueError("num_envs must be divisible by num_minibatches to preserve sequences")
         if self.total_steps < self.num_envs * self.num_steps:
             raise ValueError("total_steps must cover at least one rollout")
+        return self
+
+    @model_validator(mode="after")
+    def validate_evaluation(self) -> Self:
+        manifest = isinstance(self.env, VisFlyConfig) and self.env.evaluation is not None
+        if manifest and self.eval_episodes is not None:
+            raise ValueError(
+                "env.evaluation and eval_episodes are mutually exclusive; set eval_episodes: null for manifest evaluation"
+            )
+        if not manifest and self.eval_episodes is None:
+            raise ValueError("eval_episodes is required when env.evaluation is not configured")
         return self
 
 
@@ -1016,7 +1027,7 @@ def log_evaluation(
         if (isinstance(config.env, VisFlyConfig) and config.env.evaluation is not None)
         else None
     )
-    scenarios = manifest.scenarios if manifest is not None else (None,) * config.eval_episodes
+    scenarios = manifest.scenarios if manifest is not None else (None,) * cast(int, config.eval_episodes)
     print(f"Evaluating {len(scenarios)} games at step {step_count}...", flush=True)
     episodes: list[EpisodeResult] = []
     for episode_index, scenario in enumerate(scenarios):

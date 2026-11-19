@@ -252,6 +252,8 @@ def sample_route(
     config: RouteConfig,
     lower: torch.Tensor,  # (3,)
     upper: torch.Tensor,  # (3,)
+    *,
+    long_threshold: float,  # Metres; use the catalogue's generation threshold.
 ) -> Route:
     """Renormalize weights over available levels; jitter endpoints through validated connectors."""
     groups = [[route for route in routes if route.difficulty == level] for level in DIFFICULTIES]
@@ -265,8 +267,9 @@ def sample_route(
     if config.jitter:
         endpoints = torch.tensor([route.points[0], route.points[-1]])  # (2, 3)
         proposed = endpoints + (2 * torch.rand((2, 3)) - 1) * config.jitter  # (2, 3)
+        distance = float((proposed[1] - proposed[0]).norm())
         valid = bool(((proposed >= lower) & (proposed <= upper)).all())
-        valid = valid and float((proposed[1] - proposed[0]).norm()) >= config.min_distance
+        valid = valid and distance >= config.min_distance and (distance >= long_threshold) == route.long
         if valid and bool(segments_clear(endpoints, proposed, collision, clearance, config.probe_step).all()):
             blocked = not bool(segments_clear(proposed[:1], proposed[1:], collision, clearance, config.probe_step)[0])
             # Preserve the selected difficulty; never turn a hard sample into a clear corridor.

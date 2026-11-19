@@ -141,7 +141,8 @@ to restore `goal_distance` sampling. Training allows 30-second episodes. The
 `env.evaluation.manifest_path` enables fixed evaluation over all distinct test-scene
 JSON layouts. The first evaluation generates and saves one route per supported
 category: long traversal, obstacle avoidance, substantial detour, and constrained
-passage. Subsequent evaluations and resumes reuse that file, ignoring `eval_episodes`.
+passage. Subsequent evaluations and resumes reuse that file. Manifest evaluation
+requires `eval_episodes: null`; configuring both modes is rejected.
 Reuse the same manifest path across runs for identical comparisons; choose a new
 path to regenerate. Categories without candidates and invalid scenes are recorded
 in the manifest/report. Deduplication removes identical JSON layouts, not geometric
@@ -154,8 +155,8 @@ Each saved scenario fixes its initial state and horizon (reference length / spee
 plus manoeuvring time). Evaluation disables scene rotation, reports category/scene
 success and collisions, equal-weight scene means, and explicit coverage fractions.
 Videos include fixed category examples, a failure, and the best episode. Set
-`env.evaluation: null` to restore seeded random evaluation. Metrics and artifact
-semantics are inventoried in `src/rl2/train_ppo_gym.py`.
+`env.evaluation: null` and a positive `eval_episodes` to restore seeded random
+evaluation. Metrics and artifact semantics are inventoried in `src/rl2/train_ppo_gym.py`.
 
 ## Useful links and references
 

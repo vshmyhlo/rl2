@@ -5,7 +5,7 @@ env:
   scene_rotation_env_steps: 128000 # Reload after 4000 steps per agent (80 seconds); truncate ongoing episodes
   route_sampling:
     weights: [0.2, 0.4, 0.4] # Easy clear, long clear, obstacle-crossing; renormalize over available levels
-    spacing: 0.75 # Metres; bounded 3D roadmap, cached per loaded scene
+    spacing: 0.75 # Metres; uniform PRM sample density, cached per loaded scene
     jitter: 0.2 # Metres; validated endpoint perturbations at each reset
   evaluation:
     manifest_path: ${ckpt_dir}/visfly_eval_manifest.json # Generate once; reuse fixed routes on resume
@@ -86,7 +86,7 @@ max_grad_norm: 0.5
 video_fps: 50.0
 video_interval: 0 # Record videos only during evaluation
 eval_interval: 100
-eval_episodes: 10 # Used only when env.evaluation is disabled; manifests score all saved scenarios
+eval_episodes: null # Required with env.evaluation; use a positive count only when env.evaluation is null
 eval_video: true
 run_id: ppo_gym_visfly_rgbd_ne${num_envs}_ns${num_steps}_mb${num_minibatches}_ue${update_epochs}_fp${env.kwargs.failure_penalty}_seed${seed}
 ckpt_dir: /runs/ppo_gym/${run_id}
