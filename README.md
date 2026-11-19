@@ -154,7 +154,9 @@ paths establish geometric feasibility, not dynamic feasibility or optimality.
 Each saved scenario fixes its initial state and horizon (reference length / speed
 plus manoeuvring time). Evaluation disables scene rotation, reports category/scene
 success and collisions, equal-weight scene means, and explicit coverage fractions.
-Videos include fixed category examples, a failure, and the best episode. Set
+Videos select the first failure and highest-return episode per scene-group/category
+pair, without duplicate replays. Groups use the scene JSON's relative parent folder;
+missing outcomes do not count as failures. Set
 `env.evaluation: null` and a positive `eval_episodes` to restore seeded random
 evaluation. Metrics and artifact semantics are inventoried in `src/rl2/train_ppo_gym.py`.
 

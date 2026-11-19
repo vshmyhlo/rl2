@@ -976,6 +976,46 @@ def test_train_orchestration_uses_host_env_and_closes_resources(
         assert "train/gradient_clip_fraction" not in scalars
 
 
+def test_checkpoint_shutdown_failure_reaches_logger(config: ppo.Config) -> None:
+    env = Mock(action_space=gym.spaces.Discrete(2))
+    env.reset.return_value = np.zeros((2, 3), dtype=np.float32)  # (B, O)
+    model = Mock()
+    model.initial_carry.return_value = ()
+    model.init.return_value = {"params": {"weight": jnp.ones(1)}}  # (1,)
+    manager = Mock()
+    failure = RuntimeError("async checkpoint write failed")
+    manager.close.side_effect = failure
+    writer = MagicMock()
+    writer.__enter__.return_value = writer
+
+    def completed_progress(
+        manager: ppo.ocp.CheckpointManager, state: TrainState, settings: ppo.Config
+    ) -> ppo.TrainingProgress:
+        return ppo.TrainingProgress(
+            train_state=state,
+            key=jax.random.key(0),  # ()
+            rollout_count=2,
+            episode_count=0,
+            episode_return_sum=0.0,
+            episode_length_sum=0,
+            env_steps=settings.total_steps,
+        )
+
+    with (
+        patch.object(ppo, "make_env", return_value=env),
+        patch.object(ppo, "ActorCritic", return_value=model),
+        patch.object(ppo, "checkpoint_manager", return_value=manager),
+        patch.object(ppo, "restore_checkpoint", side_effect=completed_progress),
+        patch.object(ppo, "MLflowLogger", return_value=writer),
+        pytest.raises(RuntimeError, match="async checkpoint write failed"),
+    ):
+        ppo.train(config)
+    env.close.assert_called_once_with()
+    manager.close.assert_called_once_with()
+    writer.__exit__.assert_called_once()
+    assert writer.__exit__.call_args.args[-2] is failure
+
+
 def scalar_policy(
     variables: dict[str, dict[str, jax.Array]],  # parameter leaves: ()
     observations: jax.Array,  # (B, T, 1)
@@ -1159,7 +1199,7 @@ def flight_manifest(tmp_path: Path) -> Manifest:
     )
 
 
-def test_manifest_evaluation_scores_all_routes_and_replays_fixed_and_failed_cases(
+def test_manifest_evaluation_scores_all_routes_and_replays_group_failures_and_best(
     config: ppo.Config,
     flight_manifest: Manifest,
 ) -> None:
@@ -1182,12 +1222,20 @@ def test_manifest_evaluation_scores_all_routes_and_replays_fixed_and_failed_case
     writer = Mock()
     with (
         patch.object(ppo, "evaluation_manifest", return_value=flight_manifest),
-        patch.object(ppo, "play_episode", side_effect=[*scored, replay, replay, replay]) as play,
+        patch.object(ppo, "play_episode", side_effect=[*scored, replay, replay]) as play,
+        patch.object(ppo, "make_env", return_value=Mock()) as make,
     ):
         ppo.log_evaluation(Mock(), config, writer, 9, 40, initial_carry=())
-    assert play.call_count == 6
+    assert play.call_count == 5
+    make.assert_called_once()
+    assert all(call.kwargs["env"] is make.return_value for call in play.call_args_list)
+    make.return_value.close.assert_called_once()
     assert [call.kwargs["scenario"] for call in play.call_args_list[:3]] == list(flight_manifest.scenarios)
-    assert [call.kwargs["scenario"] for call in play.call_args_list[3:]] == list(flight_manifest.scenarios)
+    # In test/long_traversal, the failure is also best; test/obstacle_avoidance is separate.
+    assert [call.kwargs["scenario"] for call in play.call_args_list[3:]] == [
+        flight_manifest.scenarios[1],
+        flight_manifest.scenarios[2],
+    ]
     metrics, step = writer.log_metrics.call_args.args
     assert step == 40
     assert metrics["eval/return"] == 1
@@ -1205,7 +1253,34 @@ def test_manifest_evaluation_scores_all_routes_and_replays_fixed_and_failed_case
     assert len(report["episodes"]) == 3
     assert report["episodes"][0]["scenario"]["scene"] == "test/a.json"
     assert len(report["manifest"]["coverage"]) == 3
-    assert writer.log_video.call_count == 3
+    assert writer.log_video.call_count == 2
+
+
+def test_scenario_replays_group_by_folder_and_category(flight_manifest: Manifest) -> None:
+    cases = [
+        # Multiple scenes in one group: first failure and highest return, with first-on-tie behavior.
+        ("box30_test/a.json", "long_traversal", 0.0, StopReason.SUCCESS),
+        ("box30_test/b.json", "long_traversal", -1.0, StopReason.COLLISION),
+        ("box30_test/c.json", "long_traversal", 3.0, StopReason.SUCCESS),
+        ("box30_test/d.json", "long_traversal", 3.0, StopReason.SUCCESS),
+        # Same category in another group; a timed-out best episode also fills the failure role.
+        ("garage_test/a.json", "long_traversal", 2.0, StopReason.TIME_LIMIT),
+        ("garage_test/b.json", "long_traversal", 1.0, StopReason.COLLISION),
+        # Same group, different category; unknown outcomes must not add a failure replay.
+        ("box30_test/a.json", "obstacle_avoidance", -2.0, None),
+        ("box30_test/b.json", "obstacle_avoidance", 2.0, StopReason.SUCCESS),
+        # Root-level scenes share a group instead of being grouped by filename.
+        ("a.json", "long_traversal", 1.0, StopReason.SUCCESS),
+        ("b.json", "long_traversal", 2.0, StopReason.SUCCESS),
+    ]
+    scenarios = tuple(
+        replace(flight_manifest.scenarios[0], scene=scene, category=category) for scene, category, _, _ in cases
+    )
+    episodes = [
+        ppo.EpisodeResult(episode_return=reward, length=1, frames=[], stop_reason=reason)
+        for _, _, reward, reason in cases
+    ]
+    assert ppo.scenario_replay_indices(episodes, scenarios) == [1, 2, 4, 7, 9]
 
 
 def test_fixed_scenario_overrides_training_sampling_horizon_and_rotation(
@@ -1227,7 +1302,7 @@ def test_fixed_scenario_overrides_training_sampling_horizon_and_rotation(
     assert kwargs["seed"] == scenario.seed
     assert kwargs["max_episode_steps"] == scenario.max_episode_steps
     assert "route_sampling" not in kwargs
-    assert "random_kwargs" not in kwargs
+    assert kwargs["random_kwargs"] == {"scene_iter": False}
     assert result.stop_reason == StopReason.SUCCESS
     assert backend.closed
 

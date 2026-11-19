@@ -31,7 +31,14 @@ from rl2.envs.gym_style_env import (
 )
 from rl2.envs.visfly.render import RenderContext, depth_panel, diagnostics_panel
 from rl2.envs.visfly.routes import CATEGORIES, RouteConfig
-from rl2.envs.visfly.scenarios import EvaluationConfig, Manifest, SceneCoverage, select_scenarios, unique_scenes
+from rl2.envs.visfly.scenarios import (
+    EvaluationConfig,
+    Manifest,
+    Scenario,
+    SceneCoverage,
+    select_scenarios,
+    unique_scenes,
+)
 from rl2.utils import read_optional, write_bytes
 
 
@@ -106,7 +113,7 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
     @contextmanager
     def _use_rng(self) -> Generator[None]:
         """Isolate scene-loader shuffling and CPU sampling, including autoresets."""
-        with torch.random.fork_rng(devices=[]):
+        with torch.inference_mode(), torch.random.fork_rng(devices=[]):
             torch.set_rng_state(self._rng_state)
             python_rng = random.getstate()
             random.setstate(self._python_rng_state)
@@ -154,6 +161,16 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
             if self.backend.num_envs != num_envs:
                 raise ValueError("VisFly environment count does not match num_envs")
             resources.pop_all()
+
+    def configure_scenario(self, scenario: Scenario) -> None:
+        """Reset the private RNGs and select a scenario before reset(), reusing its scene."""
+        self._rng_state = torch.Generator().manual_seed(scenario.seed).get_state()  # (R,)
+        self._python_rng_state = random.Random(scenario.seed).getstate()
+        self.config = replace(
+            self.config, kwargs={**self.config.kwargs, "max_episode_steps": scenario.max_episode_steps}
+        )
+        with self._use_rng():
+            self.backend.configure_scenario(scenario)
 
     def reset(self) -> VisFlyObservation[NDArray[Any]]:
         """Return (B, S) state, (B, 3) target, (B, H, W, 3) RGB, and optional (B, H, W, 1) depth."""
@@ -257,6 +274,7 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
             max_episode_steps=self.config.kwargs.get("max_episode_steps"),
         )  # (H, W_debug, 3)
 
+    @torch.inference_mode()
     def render(self) -> NDArray[np.uint8]:  # (B, H, W_scene + W_agent + W_depth + W_debug, 3)
         """Return (B, H, W_scene + W_agent + W_depth + W_debug, 3) scene/RGB/depth/diagnostics.
 
@@ -313,6 +331,7 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         result[:, -panel.shape[1] :] = panel
         return result  # (H, W, 3)
 
+    @torch.inference_mode()
     def close(self) -> None:
         self.backend.close()
 

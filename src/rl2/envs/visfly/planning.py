@@ -18,7 +18,7 @@ from scipy.sparse.csgraph import connected_components, dijkstra
 
 from rl2.envs.visfly.routes import DIFFICULTIES, Point, Route, RouteConfig
 
-type CollisionQuery = Callable[[torch.Tensor, float], NDArray[np.bool_]]  # (N, 3), radius -> (N,)
+type CollisionQuery = Callable[[NDArray[np.float32], float], NDArray[np.bool_]]  # (N, 3), radius -> (N,)
 
 
 def space_information(
@@ -37,7 +37,7 @@ def space_information(
     space.setLongestValidSegmentFraction(min(0.99, step / space.getMaximumExtent()))
 
     def valid(state: ob.RealVectorStateType) -> bool:
-        point = torch.tensor([[state[axis] for axis in range(3)]])  # (1, 3)
+        point = np.array([[state[axis] for axis in range(3)]], dtype=np.float32)  # (1, 3)
         # Inflate spheres to cover gaps between the discrete validator's probes.
         return not bool(collision(point, radius + step / 2)[0])
 
@@ -173,7 +173,7 @@ def build_roadmap(
     if count > config.max_nodes:
         raise ValueError(f"Route roadmap needs {count} samples; increase spacing or max_nodes")
     samples = lower + torch.rand((count, 3)) * (upper - lower)  # (G, 3)
-    free = ~torch.from_numpy(collision(samples, clearance + config.probe_step / 2))  # (G,)
+    free = ~torch.from_numpy(collision(samples.numpy(), clearance + config.probe_step / 2))  # (G,)
     points = samples[free]  # (N, 3)
     info = space_information(lower, upper, collision, clearance, config.probe_step)
     pairs = prm_edges(points, info, config.neighbors)  # (E, 2)
@@ -186,7 +186,7 @@ def build_roadmap(
     wide_edges = sparse_graph(left[wide], right[wide], lengths[wide], len(points))  # (N, N)
     _, labels = connected_components(wide_edges, directed=False)  # (N,)
     # Isolated valid nodes have distinct labels; invalid nodes cannot mark a passage endpoint.
-    invalid = collision(points, clearance + config.passage_margin + config.probe_step / 2)  # (N,)
+    invalid = collision(points.numpy(), clearance + config.passage_margin + config.probe_step / 2)  # (N,)
     labels[invalid] = -1
     return Roadmap(
         points=points,

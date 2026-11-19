@@ -30,6 +30,13 @@ def collision_free(positions: torch.Tensor, **kwargs: Any) -> NDArray[np.bool_]:
     return np.zeros(len(positions), dtype=bool)  # (N,)
 
 
+def empty_geometry() -> SimpleNamespace:
+    def query(*, pt: NDArray[np.float64], max_search_radius: float) -> SimpleNamespace:  # (3, 1)
+        return SimpleNamespace(hit_pos=pt.reshape(3) + 100, is_out_bound=False)
+
+    return SimpleNamespace(get_closest_collision_point=query, seed=Mock())
+
+
 class GeneratedState(NamedTuple):
     position: torch.Tensor  # (N, 3)
     angles: torch.Tensor  # (N, 3)
@@ -63,7 +70,7 @@ class NavigationStub:
         root = scene_kwargs.get("path", ".")
         paths = (
             [str(path) for path in Path(root).rglob("*.scene_instance.json")]
-            if scene_kwargs
+            if "path" in scene_kwargs
             else ["scene_c", "scene_a", "scene_b"]
         )
         self.envs = SimpleNamespace(
@@ -592,6 +599,7 @@ def test_fixed_scenario_pins_scene_state_and_partial_reset_targets(navigation_cl
     env = navigation_class(
         scene_randomization=True, scene_split="test", scenario=asdict(scenario), scene_kwargs={"path": str(root)}
     )
+    env.envs.sceneManager.scenes = [empty_geometry(), empty_geometry()]
     assert env.envs.sceneManager._scene_loader.paths == [str(root / scenario.scene)]
     for generator in env.envs.stateGenerators:
         sampled = generator.safe_generate(num=2)
@@ -618,7 +626,7 @@ def test_route_catalogues_refresh_on_scene_rotation_and_metrics_drain(navigation
     config = RouteConfig(spacing=3, sources=2, goals_per_source=3, jitter=0)
     env = navigation_class(scene_randomization=True, route_sampling=asdict(config))
     manager = env.envs.sceneManager
-    manager.scenes = [object(), object()]
+    manager.scenes = [empty_geometry(), empty_geometry()]
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(4)
         first = env.route_catalogue(0, config)
@@ -626,7 +634,7 @@ def test_route_catalogues_refresh_on_scene_rotation_and_metrics_drain(navigation
         assert all(route.long == (route.initial_distance >= env._route_catalogues[0].long_threshold) for route in first)
         sampled = env._sample_route(0)
         assert sampled in first or tuple(reversed(sampled.points)) in [route.points for route in first]
-        manager.scenes[0] = object()
+        manager.scenes[0] = empty_geometry()
         manager._scene_bounds[0] = SimpleNamespace(min=[-20, 0, -20], max=[-10, 4, -10])
         second = env.route_catalogue(0, config)
     assert second is not first

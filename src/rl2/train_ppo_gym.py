@@ -107,7 +107,7 @@ Latest settings and session timings:
         video encoding/upload, or evaluation through gameplay/report uploads.
         Logged per operation at video_interval or eval_interval iterations and on
         normal completion when enabled; omitted when the operation does not run.
-        Includes fresh environment setup/cleanup; excludes logging the timing itself.
+        Includes environment setup/cleanup and scene switches; excludes logging the timing itself.
     checkpoint/save_seconds: Blocking wall seconds to prepare and submit an async
         checkpoint, including any wait for a previous save inside manager.save.
         Excludes background writes and the final drain at manager close. Logged per
@@ -175,8 +175,11 @@ constrained_passage. Detours use smoothed reference lengths; constrained passage
 connect regions disconnected in the extra-clearance roadmap. Scene/category
 geometry and inventory mappings are saved in eval/report/<step>.json.
 With eval_video=true (default: false), seed-based evaluation replays its highest-return
-episode (first on ties). Manifest evaluation replays the first scenario per category,
-first non-success, and highest-return scenario, deduplicating scenario indices.
+episode (first on ties). Manifest evaluation selects the first known non-success
+and highest-return episode within each scene-group/category pair, replaying an
+episode only once if it fills both roles. Scene groups are relative parent folders
+of scene JSON files; root-level scenes share the "." group. Ties follow manifest
+order; missing stop reasons are not treated as failures.
 All replays reuse initial conditions, are excluded from score statistics, and are
 included in eval/evaluation_seconds, independently of video_interval.
 Standalone gameplay is disabled by default (video_interval=0); a positive
@@ -184,9 +187,14 @@ video_interval enables recording at that iteration interval and on normal comple
 video_max_frames caps recording (default: 1000). Standalone gameplay and evaluation
 replays execute the action for each recorded frame, then stop at that cap;
 scored evaluation episodes always run to completion.
+Manifest scoring and replay group episodes by scene and reuse one simulator,
+while reports and replay selection retain manifest order. Each episode resets its
+saved conditions, horizon, RNG, and recurrent memory.
 Gameplay is saved as looping GIFs at video_fps, with frame boundaries rounded to
 10 ms and a 10 ms minimum frame delay. Evaluation and playback create fresh,
-single-environment instances seeded independently of training. Frames are rendered
+single-environment instances seeded independently of training; manifest episodes
+share their loaded scene. CPU VisFly Euler physics uses compiled JAX substeps;
+other integrators and CUDA dynamics retain the upstream implementation. Frames are rendered
 before actions; autoreset frames are excluded. video_max_frames=None records the
 full episode. VisFly requires its simulator dependencies, scene assets, and RGB
 render settings for video; scoring alone does not require RGB rendering. VisFly's
@@ -215,7 +223,7 @@ import argparse
 import json
 import os
 from collections.abc import Callable
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, nullcontext
 from dataclasses import asdict, fields, replace
 from functools import partial
 from math import sqrt
@@ -851,6 +859,27 @@ def deterministic_policy_step(
     raise TypeError(f"Unsupported deterministic policy: {type(policy).__name__}")
 
 
+def scenario_config(config: Config, scenario: Scenario) -> Config:
+    """Disable training sampling/rotation and apply the saved scenario's horizon."""
+    if not isinstance(config.env, VisFlyConfig):
+        raise ValueError("Fixed flight scenarios require VisFly")
+    return replace(
+        config,
+        env=replace(
+            config.env,
+            route_sampling=None,
+            scene_rotation_env_steps=None,
+            kwargs={
+                **config.env.kwargs,
+                "scenario": asdict(scenario),
+                "scene_randomization": True,
+                "max_episode_steps": scenario.max_episode_steps,
+                "random_kwargs": {**config.env.kwargs.get("random_kwargs", {}), "scene_iter": False},
+            },
+        ),
+    )
+
+
 def play_episode(
     train_state: TrainState,
     config: Config,
@@ -860,27 +889,15 @@ def play_episode(
     record: bool,
     deterministic: bool = False,
     scenario: Scenario | None = None,
+    env: VisFlyEnv | None = None,
 ) -> EpisodeResult:
-    """Run a fresh episode, or record up to the frame cap; render before actions, excluding autoresets."""
+    """Reset an episode, optionally sharing a VisFly scene; render before actions up to the frame cap."""
     seed = int(jax.random.bits(key, dtype=jnp.uint32))
     if scenario is not None:
-        if not isinstance(config.env, VisFlyConfig):
-            raise ValueError("Fixed flight scenarios require VisFly")
         seed = scenario.seed
-        config = replace(
-            config,
-            env=replace(
-                config.env,
-                route_sampling=None,
-                scene_rotation_env_steps=None,
-                kwargs={
-                    **config.env.kwargs,
-                    "scenario": asdict(scenario),
-                    "scene_randomization": True,
-                    "max_episode_steps": scenario.max_episode_steps,
-                },
-            ),
-        )
+        config = scenario_config(config, scenario)
+        if env is not None:
+            env.configure_scenario(scenario)
     frames = []  # each (H, W, 3)
     episode_return = 0.0
     length = 0
@@ -889,7 +906,9 @@ def play_episode(
     final_goal_distance = None
     memory = initial_carry  # leaves: (1, H)
     starts = jnp.ones(1, dtype=bool)  # (1,)
-    with closing(make_env(config, seed=seed, evaluation=True, record=record)) as env:
+    with (
+        closing(make_env(config, seed=seed, evaluation=True, record=record)) if env is None else nullcontext(env)
+    ) as env:
         observations = jax.device_put(env.reset())  # leaves: (1, *O)
         while True:
             if record and config.video_max_frames is not None and len(frames) >= config.video_max_frames:
@@ -1011,6 +1030,26 @@ def scenario_metrics(episodes: list[EpisodeResult], manifest: Manifest) -> dict[
     return scalars
 
 
+def scenario_replay_indices(episodes: list[EpisodeResult], scenarios: tuple[Scenario, ...]) -> list[int]:
+    """Select the first failure and best return per scene folder/category, without duplicate replays."""
+    groups: dict[tuple[str, str], list[int]] = {}
+    for index, scenario in enumerate(scenarios):
+        group = (Path(scenario.scene).parent.as_posix(), scenario.category)
+        groups.setdefault(group, []).append(index)
+    returns = [episode.episode_return for episode in episodes]
+    selected = []
+    for indices in groups.values():
+        failure = next(
+            (index for index in indices if episodes[index].stop_reason not in (None, StopReason.SUCCESS)), None
+        )
+        best = max(indices, key=returns.__getitem__)
+        if failure is not None:
+            selected.append(failure)
+        if best != failure:
+            selected.append(best)
+    return selected
+
+
 def log_evaluation(
     train_state: TrainState,
     config: Config,
@@ -1029,45 +1068,62 @@ def log_evaluation(
     )
     scenarios = manifest.scenarios if manifest is not None else (None,) * cast(int, config.eval_episodes)
     print(f"Evaluating {len(scenarios)} games at step {step_count}...", flush=True)
-    episodes: list[EpisodeResult] = []
-    for episode_index, scenario in enumerate(scenarios):
-        episode = play_episode(
-            train_state,
-            config,
-            jax.random.fold_in(jax.random.key(config.eval_seed), episode_index),
-            initial_carry,
-            record=False,
-            deterministic=True,
-            **({"scenario": scenario} if scenario is not None else {}),
-        )
-        episodes.append(episode)
-    returns = [episode.episode_return for episode in episodes]
-    if config.eval_video:
-        best_episode_index = max(range(len(returns)), key=returns.__getitem__)
-        replay_indices = [best_episode_index]
+    with ExitStack() as resources:
+        shared_env = None
         if manifest is not None:
-            fixed = [
-                next((i for i, scenario in enumerate(manifest.scenarios) if scenario.category == category), None)
-                for category in CATEGORIES
-            ]
-            failure = next((i for i, episode in enumerate(episodes) if episode.stop_reason != StopReason.SUCCESS), None)
-            replay_indices = list(dict.fromkeys(i for i in [*fixed, failure, best_episode_index] if i is not None))
-        for index in replay_indices:
-            scenario = scenarios[index]
-            replay = play_episode(
+            first = manifest.scenarios[0]
+            shared_env = cast(
+                VisFlyEnv,
+                resources.enter_context(
+                    closing(make_env(scenario_config(config, first), seed=first.seed, evaluation=True))
+                ),
+            )
+        indexed_episodes: dict[int, EpisodeResult] = {}
+        order = (
+            sorted(range(len(scenarios)), key=lambda index: manifest.scenarios[index].scene)
+            if manifest
+            else range(len(scenarios))
+        )
+        for episode_index in order:
+            scenario = scenarios[episode_index]
+            episode = play_episode(
                 train_state,
                 config,
-                jax.random.fold_in(jax.random.key(config.eval_seed), index),
+                jax.random.fold_in(jax.random.key(config.eval_seed), episode_index),
                 initial_carry,
-                record=True,
+                record=False,
                 deterministic=True,
-                **({"scenario": scenario} if scenario is not None else {}),
+                **({"scenario": scenario, "env": shared_env} if scenario is not None else {}),
             )
-            if replay.frames:
-                path = (
-                    f"eval/gameplay/{step_count}.gif" if manifest is None else f"eval/gameplay/{step_count}/{index}.gif"
+            indexed_episodes[episode_index] = episode
+        episodes = [indexed_episodes[index] for index in range(len(scenarios))]
+        returns = [episode.episode_return for episode in episodes]
+        if config.eval_video:
+            replay_indices = (
+                scenario_replay_indices(episodes, manifest.scenarios)
+                if manifest is not None
+                else [max(range(len(returns)), key=returns.__getitem__)]
+            )
+            if manifest is not None:
+                replay_indices.sort(key=lambda index: manifest.scenarios[index].scene)
+            for index in replay_indices:
+                scenario = scenarios[index]
+                replay = play_episode(
+                    train_state,
+                    config,
+                    jax.random.fold_in(jax.random.key(config.eval_seed), index),
+                    initial_carry,
+                    record=True,
+                    deterministic=True,
+                    **({"scenario": scenario, "env": shared_env} if scenario is not None else {}),
                 )
-                writer.log_video(replay.frames, path, fps=config.video_fps)
+                if replay.frames:
+                    path = (
+                        f"eval/gameplay/{step_count}.gif"
+                        if manifest is None
+                        else f"eval/gameplay/{step_count}/{index}.gif"
+                    )
+                    writer.log_video(replay.frames, path, fps=config.video_fps)
     std = stdev(returns) if len(returns) > 1 else None
     result = {
         "env_id": config.env.id,
@@ -1469,13 +1525,17 @@ def training_mesh(config: Config) -> Mesh:
 
 def train(config: Config) -> TrainState:
     """Train with a fully resolved config, as returned by load_config."""
-    with ExitStack() as resources, jax.set_mesh(training_mesh(config)):
-        configure_compilation_cache()
+    configure_compilation_cache()
+    # Keep logging active through environment cleanup and the async checkpoint drain.
+    with (
+        jax.set_mesh(training_mesh(config)),
+        MLflowLogger(experiment="ppo_gym", run_name=config.run_id) as writer,
+        closing(make_env(config)) as envs,
+        closing(checkpoint_manager(config.ckpt_dir)) as manager,
+    ):
         replicated = PartitionSpec()
         batched = PartitionSpec("batch")
         batch_size = config.num_envs * config.num_steps
-        envs = resources.enter_context(closing(make_env(config)))
-        manager = resources.enter_context(closing(checkpoint_manager(config.ckpt_dir)))
         key, init_key = jax.random.split(jax.random.key(config.seed))  # each () typed PRNG key
         obs = jax.device_put(envs.reset())  # leaves: (B, *O)
         model = ActorCritic(
@@ -1513,7 +1573,6 @@ def train(config: Config) -> TrainState:
             # The environment and recurrent memory were freshly initialized above.
         key, metrics = jax.device_put((key, metrics), replicated)  # key: (); metrics: scalar leaves
         initial_step_count = progress.env_steps if progress is not None else 0
-        writer = resources.enter_context(MLflowLogger(experiment="ppo_gym", run_name=config.run_id))
         if progress is not None:
             print(f"Resumed run {config.run_id} at step {initial_step_count}", flush=True)
         writer.log_text(yaml.safe_dump(asdict(config)), f"config/{initial_step_count}.yaml")

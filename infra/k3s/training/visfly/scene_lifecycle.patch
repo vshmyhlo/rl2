@@ -1,9 +1,25 @@
 --- a/utils/SceneManager.py
 +++ b/utils/SceneManager.py
-@@ -831,11 +831,15 @@
+@@ -130,6 +130,7 @@
+             is_object_collidable=False,
+             col_refine_steps=0,
+             dt=0.03,
++            build_navmesh=True,
+     ):
+ 
+         if reset_settings is None:
+@@ -143,6 +144,7 @@
+             sensor_settings = []
+ 
+         self.render_settings = render_settings
++        self.build_navmesh = build_navmesh
+         self._get_datasets_info(path)
+         self.root_path = path
+         self.num_scene = num_scene
+@@ -831,11 +833,15 @@
          indices = [indices] if not hasattr(indices, "__iter__") else indices
          scene_paths = self._scene_loader.next(len(indices))
-
+ 
 +        # The first simulator owns the GL context shared by later scenes.
 +        # Release dependent resources before that context, then reload the batch.
 +        for scene_id in reversed(indices):
@@ -19,10 +35,20 @@
              self.scenes[scene_id] = self._load_scene(scene_path)
              self._scene_bounds[scene_id] = self.scenes[scene_id].get_active_scene_graph().get_root_node().cumulative_bb
              # if self.is_find_path:
-@@ -1034,10 +1038,11 @@
-
+@@ -925,7 +931,8 @@
+ 
+         NavmeshSetting = habitat_sim.NavMeshSettings()
+         NavmeshSetting.include_static_objects = True
+-        env.recompute_navmesh(env.pathfinder, NavmeshSetting)
++        if self.build_navmesh:
++            env.recompute_navmesh(env.pathfinder, NavmeshSetting)
+         return env
+ 
+     def reset(self, std_positions: Tensor, std_orientations: Tensor) -> Tuple[List, List]:
+@@ -1034,10 +1041,11 @@
+ 
          return sensor_cfgs_list
-
+ 
 -    def close(self):
 -        for scene_id in range(self.num_scene):
 -            self.scenes[scene_id].close()
@@ -32,6 +58,6 @@
 +            if self.scenes[scene_id] is not None:
 +                self.scenes[scene_id].close()
 +                self.scenes[scene_id] = None
-
+ 
      @property
      def is_out_bounds(self):

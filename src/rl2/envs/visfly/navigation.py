@@ -13,12 +13,15 @@ from typing import Any, Literal, NamedTuple
 import numpy as np
 import torch
 from habitat_sim import SensorType
+from numpy.typing import NDArray
 from pydantic import TypeAdapter
 from VisFly.envs.NavigationEnv import NavigationEnv
 from VisFly.utils.common import habitat_to_std
 from VisFly.utils.maths import Quaternion
 from VisFly.utils.type import TensorDict
 
+from rl2.envs.visfly.collision import collision_points
+from rl2.envs.visfly.dynamics import CompiledEuler
 from rl2.envs.visfly.planning import build_roadmap, build_routes, sample_route, segments_clear
 from rl2.envs.visfly.routes import Route, RouteConfig
 from rl2.envs.visfly.sampling import sample_positions
@@ -107,8 +110,8 @@ class SceneStateRandomizer:
             bounds = sampling_bounds(self.manager._scene_bounds[self.scene_id], self.clearance, self.height)
             points = torch.tensor(scenario.route.points)  # (P, 3)
 
-            def collision(positions: torch.Tensor, radius: float) -> np.ndarray:  # (N, 3) -> (N,)
-                return self.manager.get_point_is_collision(positions, scene_id=self.scene_id, uav_radius=radius)
+            def collision(positions: NDArray[np.float32], radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
+                return collision_points(self.manager.scenes[self.scene_id], positions, radius)
 
             if not bool(((points >= bounds.lower) & (points <= bounds.upper)).all()) or not bool(
                 segments_clear(points[:-1], points[1:], collision, self.clearance, scenario.probe_step).all()
@@ -169,6 +172,7 @@ class RGBNavigationEnv(NavigationEnv):
         route_sampling: dict[str, Any] | None = None,
         scenario: dict[str, Any] | None = None,
         scene_path: str | None = None,
+        compiled_dynamics: bool = True,
         **kwargs: Any,
     ) -> None:
         if kwargs.get("dynamics_kwargs", {}).get("ori_output_type", "quaternion") != "quaternion":
@@ -223,9 +227,17 @@ class RGBNavigationEnv(NavigationEnv):
             ):
                 if tuple(sensors["color"].get(key, default)) != tuple(sensors["depth"].get(key, default)):
                     raise ValueError(f"RGBNavigationEnv requires matching RGB/depth {key}")
+        # Flight collision/route queries use mesh geometry, not Habitat's walking navmesh.
+        kwargs["scene_kwargs"] = {"build_navmesh": False, **kwargs.get("scene_kwargs", {})}
         super().__init__(visual=True, sensor_kwargs=sensor_kwargs, **kwargs)
         with ExitStack() as resources:
             resources.enter_context(closing(self))
+            if (
+                compiled_dynamics
+                and self.envs.dynamics._integrator == "euler"
+                and torch.device(self.device).type == "cpu"
+            ):
+                self.envs.dynamics.step = CompiledEuler(self.envs.dynamics).step
             if spawn_clearance < self.envs.uav_radius:
                 raise ValueError(
                     f"spawn_clearance must be at least the drone collision radius ({self.envs.uav_radius} m)"
@@ -245,6 +257,7 @@ class RGBNavigationEnv(NavigationEnv):
             ]
             if not loader.paths:
                 raise ValueError(f"No scenes in the {scene_split} split under {root}")
+            self._scene_paths = frozenset(loader.paths)
             if self.scenario is not None:
                 scene_path = str(root / self.scenario.scene)
             self._pinned_scene = scene_path
@@ -275,6 +288,31 @@ class RGBNavigationEnv(NavigationEnv):
                 ]
             resources.pop_all()
 
+    def configure_scenario(self, scenario: Scenario) -> None:
+        """Select deterministic conditions, retaining loaded geometry within a scene."""
+        manager = self.envs.sceneManager
+        scene_path = str(Path(manager.root_path) / scenario.scene)
+        if scene_path not in self._scene_paths:
+            raise ValueError(f"Requested scene is not in the evaluation split: {scene_path}")
+        changed = scene_path != self._pinned_scene
+        self.scenario = scenario
+        self.max_episode_steps = scenario.max_episode_steps
+        self._pinned_scene = scene_path
+        loader = manager._scene_loader
+        loader.paths = [scene_path]
+        loader._select_index = [0]
+        self.envs._scene_iter = False
+        self.envs.set_seed(scenario.seed)
+        for generator in self.envs.stateGenerators:
+            generator.scenario = scenario
+            generator.route = None
+        if changed:
+            self._route_catalogues.clear()
+            manager.load_scenes()
+        for scene in manager.scenes:
+            if scene is not None:
+                scene.seed(scenario.seed)
+
     def _load_valid_scene(self, scene_path: str) -> Any:
         """Load a scene with nonempty spawn bounds, trying at most one inventory pass."""
         loader = self.envs.sceneManager._scene_loader
@@ -304,9 +342,9 @@ class RGBNavigationEnv(NavigationEnv):
         raise ValueError("No compatible VisFly scenes remain. " + "; ".join(self._rejected_scenes.values()))
 
     def _route_collision(
-        self, positions: torch.Tensor, radius: float, *, scene_id: int
-    ) -> np.ndarray:  # (N, 3) -> (N,)
-        return self.envs.sceneManager.get_point_is_collision(positions, scene_id=scene_id, uav_radius=radius)
+        self, positions: NDArray[np.float32], radius: float, *, scene_id: int
+    ) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
+        return collision_points(self.envs.sceneManager.scenes[scene_id], positions, radius)
 
     def route_catalogue(self, scene_id: int, config: RouteConfig) -> list[Route]:
         manager = self.envs.sceneManager

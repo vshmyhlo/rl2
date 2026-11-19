@@ -24,19 +24,19 @@ from rl2.envs.visfly.routes import Route, RouteConfig
 from rl2.envs.visfly.scenarios import EvaluationConfig, Manifest, SceneCoverage, select_scenarios, unique_scenes
 
 
-def empty_scene(points: torch.Tensor, radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
+def empty_scene(points: NDArray[np.float32], radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
     return np.zeros(len(points), dtype=bool)  # (N,)
 
 
-def doorway(points: torch.Tensor, radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
+def doorway(points: NDArray[np.float32], radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
     # A wall across all heights, with an 0.8 m opening centered at y=2.5.
-    return (
-        (abs(points[:, 0] - 3) < radius + 0.1) & ((points[:, 1] < 2.1 + radius) | (points[:, 1] > 2.9 - radius))
-    ).numpy()  # (N,)
+    return (abs(points[:, 0] - 3) < radius + 0.1) & (
+        (points[:, 1] < 2.1 + radius) | (points[:, 1] > 2.9 - radius)
+    )  # (N,)
 
 
-def closed_wall(points: torch.Tensor, radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
-    return (abs(points[:, 0] - 3) < radius + 0.01).numpy()  # (N,)
+def closed_wall(points: NDArray[np.float32], radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
+    return abs(points[:, 0] - 3) < radius + 0.01  # (N,)
 
 
 @pytest.fixture(scope="module")
@@ -96,8 +96,8 @@ def test_open_room_paths_are_smoothed_and_not_labeled_detours() -> None:
 
 @pytest.mark.parametrize("free_node", [False, True], ids=["no_free_space", "isolated_node"])
 def test_roadmap_without_edges_has_no_routes(free_node: bool, monkeypatch: pytest.MonkeyPatch) -> None:
-    def collision(points: torch.Tensor, radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
-        return (points.ne(0).any(dim=-1) | (not free_node)).numpy()  # (N,)
+    def collision(points: NDArray[np.float32], radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
+        return (points != 0).any(axis=-1) | (not free_node)  # (N,)
 
     samples = torch.arange(24).reshape(8, 3) / 24  # (8, 3)
     samples[0] = 0
@@ -262,8 +262,8 @@ def test_route_weights_validation(weights: tuple[float, float, float]) -> None:
 def test_prm_export_preserves_indices_with_isolated_samples() -> None:
     points = torch.tensor([[-1.0, 0, 0], [1.0, 0, 0], [2.0, 0, 0], [3.0, 0, 0]])  # (4, 3)
 
-    def wall(positions: torch.Tensor, radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
-        return (positions[:, 0].abs() < radius).numpy()  # (N,)
+    def wall(positions: NDArray[np.float32], radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
+        return np.abs(positions[:, 0]) < radius  # (N,)
 
     info = space_information(torch.tensor([-2.0, -1, -1]), torch.tensor([4.0, 1, 1]), wall, 0.1, 0.2)
     edges = prm_edges(points, info, neighbors=3)  # (E, 2)
@@ -297,8 +297,8 @@ def test_segment_validation_checks_invalid_starts_and_zero_length() -> None:
 
 
 def test_shortcut_preserves_clearance_when_inserting_vertices() -> None:
-    def obstacle(points: torch.Tensor, radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
-        return (points.norm(dim=-1) < radius).numpy()  # (N,)
+    def obstacle(points: NDArray[np.float32], radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
+        return np.linalg.norm(points, axis=-1) < radius  # (N,)
 
     # The original edge clears the swept sphere, but a new midpoint at x=0 lacks
     # the additional half-probe margin required for replay validation.
