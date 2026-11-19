@@ -631,7 +631,10 @@ bounding box. `flight_height` is relative to its lowest point, `spawn_clearance`
 sets obstacle clearance (at least the drone collision radius, currently 0.1 m),
 and `goal_distance` bounds start-to-goal separation, all in metres. Sampling also
 respects the pinned dynamics limits: X/Y in [-100, 100] m and Z in [0, 20] m.
-Sampling is bounded and fails if no valid placement is found; endpoint
+Scenes with empty spawn bounds after height, clearance, and dynamics clipping
+are skipped and cached for the adapter's lifetime, with their paths and bounds
+logged. Replacements come from the same split; exhausting the inventory fails
+with diagnostics. Collision sampling is bounded and fails if no valid placement is found; endpoint
 checks do not guarantee a connected flight path. Orientation and linear/angular
 velocities also vary; the pinned backend's drag randomization has broken batched
 reset indexing and remains disabled. The trainer reserves directories named `test`

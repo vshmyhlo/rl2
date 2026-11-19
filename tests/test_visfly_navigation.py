@@ -1,6 +1,9 @@
 """RGB/RGB-D backend behavior without loading Habitat's native renderer."""
 
 import runpy
+from contextlib import closing
+from functools import partial
+from itertools import cycle
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, NamedTuple
@@ -67,6 +70,7 @@ class NavigationStub:
                 scenes=[None, None],
                 root_path=root,
                 _scene_loader=SimpleNamespace(paths=paths, shuffle=scene_kwargs.get("shuffle", True)),
+                _load_scene=Mock(),
                 _scene_bounds=[SimpleNamespace(min=[-10, 0, -10], max=[0, 4, 0])] * 2,
                 get_point_is_collision=collision_free,
             ),
@@ -294,8 +298,9 @@ def test_sampling_bounds_intersect_dynamics_limits(
     expected_lower: list[float],
     expected_upper: list[float],
 ) -> None:
-    manager = SimpleNamespace(_scene_bounds=[SimpleNamespace(min=scene_min, max=scene_max)])
-    bounds = navigation_module.sampling_bounds(manager, scene_id=0, clearance=0.3, height=height)
+    bounds = navigation_module.sampling_bounds(
+        SimpleNamespace(min=scene_min, max=scene_max), clearance=0.3, height=height
+    )
     assert bounds.lower.shape == bounds.upper.shape == (3,)
     torch.testing.assert_close(bounds.lower, torch.tensor(expected_lower, dtype=torch.float32))
     torch.testing.assert_close(bounds.upper, torch.tensor(expected_upper, dtype=torch.float32))
@@ -315,6 +320,118 @@ def test_randomization_rejects_scenes_outside_dynamics_limits(navigation_class: 
     manager.get_point_is_collision.assert_not_called()
 
 
+def scene_stub(scene_min: list[float], scene_max: list[float]) -> Mock:
+    scene = Mock()
+    scene.get_active_scene_graph.return_value.get_root_node.return_value.cumulative_bb = SimpleNamespace(
+        min=scene_min, max=scene_max
+    )
+    return scene
+
+
+@pytest.mark.parametrize(
+    ("scene_min", "scene_max"),
+    [
+        pytest.param([-10, -5, -10], [0, -1, 0], id="below_dynamics_floor"),
+        pytest.param([-0.5, 0, -10], [0, 4, 0], id="narrower_than_clearance"),
+        pytest.param([-10, 0, -10], [0, 0.5, 0], id="below_minimum_flight_height"),
+    ],
+)
+def test_scene_loading_skips_and_caches_empty_bounds(
+    navigation_class: type[Any], caplog: pytest.LogCaptureFixture, scene_min: list[float], scene_max: list[float]
+) -> None:
+    env = navigation_class(scene_randomization=True)
+    manager = env.envs.sceneManager
+    bad = scene_stub(scene_min, scene_max)
+    good = scene_stub([-10, 0, -10], [0, 4, 0])
+    env._load_unchecked_scene.side_effect = [bad, good, good]
+    manager._scene_loader.paths = ["bad", "good"]
+    manager._scene_loader.next = Mock(side_effect=[["bad"], ["good"], ["good"]])
+
+    assert manager._load_scene("bad") is good
+    bad.close.assert_called_once_with()
+    good.close.assert_not_called()
+    assert "bad: no sampling volume" in caplog.text
+    assert "lower=" in caplog.text and "upper=" in caplog.text
+    assert "clearance=0.3" in caplog.text and "flight_height=(0.5, 2.5)" in caplog.text
+    assert manager._load_scene("bad") is good
+    assert [call.args[0] for call in env._load_unchecked_scene.call_args_list] == ["bad", "good", "good"]
+
+
+def test_scene_loading_stops_when_inventory_is_incompatible(navigation_class: type[Any]) -> None:
+    env = navigation_class(scene_randomization=True)
+    manager = env.envs.sceneManager
+    scenes = [scene_stub([-10, -5, -10], [0, -1, 0]) for _ in range(2)]
+    env._load_unchecked_scene.side_effect = scenes
+    manager._scene_loader.paths = ["bad_a", "bad_b"]
+    manager._scene_loader.next = Mock(side_effect=[["bad_a"], ["bad_b"]])
+    with pytest.raises(ValueError, match="No compatible VisFly scenes remain.*bad_a.*bad_b"):
+        manager._load_scene("bad_a")
+    assert env._load_unchecked_scene.call_count == 2
+    for scene in scenes:
+        scene.close.assert_called_once_with()
+
+
+def test_scene_loading_preserves_unrelated_errors(navigation_class: type[Any]) -> None:
+    env = navigation_class(scene_randomization=True)
+    env._load_unchecked_scene.side_effect = RuntimeError("renderer failed")
+    with pytest.raises(RuntimeError, match="renderer failed"):
+        env.envs.sceneManager._load_scene("broken")
+    assert not env._rejected_scenes
+
+
+def test_scene_validation_is_disabled_without_randomization(navigation_class: type[Any]) -> None:
+    env = navigation_class()
+    assert isinstance(env.envs.sceneManager._load_scene, Mock)
+
+
+def test_reset_replaces_invalid_scene_during_rotation(navigation_class: type[Any]) -> None:
+    paths = cycle(["good", "good", "bad", "good"])
+
+    def next_paths(count: int) -> list[str]:
+        return [next(paths) for _ in range(count)]
+
+    def load_scene(path: str) -> Mock:
+        if path == "bad":
+            return scene_stub([-10, -5, -10], [0, -1, 0])
+        return scene_stub([-10, 0, -10], [0, 4, 0])
+
+    raw_load = Mock(side_effect=load_scene)
+    initialize = NavigationStub.__init__
+
+    def init(self: Any, **kwargs: Any) -> None:
+        initialize(self, **kwargs)
+        self.envs.sceneManager._load_scene = raw_load
+
+    with patch.object(NavigationStub, "__init__", init):
+        env = navigation_class(scene_randomization=True)
+    manager = env.envs.sceneManager
+    manager._scene_loader.paths = ["good", "bad"]
+
+    def reset(self: Any, state: Any = None, **kwargs: Any) -> dict[str, torch.Tensor]:
+        # Match upstream batch loading and reverse-order context cleanup.
+        selected = manager._scene_loader.next(2)
+        for scene in reversed(manager.scenes):
+            if scene is not None:
+                scene.close()
+        for index, path in enumerate(selected):
+            scene = manager._load_scene(path)
+            manager.scenes[index] = scene
+            manager._scene_bounds[index] = scene.get_active_scene_graph().get_root_node().cumulative_bb
+        return self.get_full_observation()  # leaves: (B, *O)
+
+    manager._scene_loader.next = next_paths
+    with patch.object(NavigationStub, "reset", reset), torch.random.fork_rng(devices=[]):
+        torch.manual_seed(7)
+        for _ in range(3):
+            observations = env.reset()  # leaves: (B, *O)
+            assert observations["target"].shape == (2, 3)
+            assert observations["rgb"].shape == (2, 3, 64, 64)
+            distances = (observations["target"] - env.position).norm(dim=-1)  # (B,)
+            assert torch.all((distances >= 2) & (distances <= 8))
+    assert list(env._rejected_scenes) == ["bad"]
+    assert sum(call.args[0] == "bad" for call in raw_load.call_args_list) == 1
+
+
 def test_spawn_clearance_accepts_drone_radius(navigation_class: type[Any]) -> None:
     env = navigation_class(scene_randomization=True, spawn_clearance=0.1)
     assert env.spawn_clearance == env.envs.uav_radius
@@ -330,13 +447,25 @@ def test_spawn_clearance_rejects_less_than_drone_radius(navigation_class: type[A
     close.call_args.args[0].envs.dynamics.close.assert_called_once_with()
 
 
-def test_close_releases_loaded_scenes_after_partial_reset(navigation_class: type[Any]) -> None:
+@pytest.mark.parametrize("loaded_count", [pytest.param(2, id="partial_reset"), pytest.param(3, id="full_reset")])
+def test_close_preserves_reset_error_with_shared_context(navigation_class: type[Any], loaded_count: int) -> None:
     env = navigation_class()
-    scene = Mock()
-    env.envs.sceneManager.scenes = [scene, None]
-    env.close()
+    active = set(range(loaded_count))
+
+    def close_scene(index: int) -> None:
+        assert 0 in active, "GL::Context::current(): no current context"
+        active.remove(index)
+
+    scenes = [Mock(close=Mock(side_effect=partial(close_scene, index))) for index in range(loaded_count)]
+    env.envs.sceneManager.scenes = scenes + [None] * (3 - loaded_count)
+    with pytest.raises(ValueError, match="reset failed"), closing(env):
+        raise ValueError("reset failed")
+    assert not active
+    assert env.envs.sceneManager.scenes == [None] * 3
     env.envs.dynamics.close.assert_called_once_with()
-    scene.close.assert_called_once_with()
+    env.close()
+    for scene in scenes:
+        scene.close.assert_called_once_with()
 
 
 def test_reset_goals_preserve_other_agents_and_terminal_targets(navigation_class: type[Any]) -> None:

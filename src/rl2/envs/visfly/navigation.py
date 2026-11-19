@@ -1,5 +1,6 @@
 """Navigation rewards and dynamics with RGB and optional aligned depth observations."""
 
+import logging
 from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from functools import partial
@@ -23,9 +24,8 @@ class SamplingBounds(NamedTuple):
     upper: torch.Tensor  # (3,)
 
 
-def sampling_bounds(manager: Any, scene_id: int, clearance: float, height: tuple[float, float]) -> SamplingBounds:
+def sampling_bounds(bounds: Any, clearance: float, height: tuple[float, float]) -> SamplingBounds:
     """Return (3,) bounds within dynamics limits; height is relative to the scene AABB floor."""
-    bounds = manager._scene_bounds[scene_id]
     corners, _ = habitat_to_std(np.array([bounds.min, bounds.max]))  # (2, 3)
     lower = corners.amin(dim=0) + clearance  # (3,)
     upper = corners.amax(dim=0) - clearance  # (3,)
@@ -55,7 +55,7 @@ class SceneStateRandomizer:
 
     def safe_generate(self, num: int = 1, **kwargs: Any) -> SampledState:
         """Return (N, 3) position/velocities and (N, 4) quaternion orientation."""
-        bounds = sampling_bounds(self.manager, self.scene_id, self.clearance, self.height)
+        bounds = sampling_bounds(self.manager._scene_bounds[self.scene_id], self.clearance, self.height)
         position = sample_positions(
             lower=bounds.lower,
             upper=bounds.upper,
@@ -160,6 +160,9 @@ class RGBNavigationEnv(NavigationEnv):
                 Random(kwargs.get("seed", 42)).shuffle(loader.paths)
             loader._select_index = list(range(len(loader.paths)))
             if scene_randomization:
+                self._rejected_scenes: dict[str, str] = {}
+                self._load_unchecked_scene = manager._load_scene
+                manager._load_scene = self._load_valid_scene
                 self.envs.stateGenerators = [
                     SceneStateRandomizer(
                         base=base,
@@ -171,6 +174,32 @@ class RGBNavigationEnv(NavigationEnv):
                     for index, base in enumerate(self.envs.stateGenerators)
                 ]
             resources.pop_all()
+
+    def _load_valid_scene(self, scene_path: str) -> Any:
+        """Load a scene with nonempty spawn bounds, trying at most one inventory pass."""
+        loader = self.envs.sceneManager._scene_loader
+        for attempt in range(len(loader.paths) + 1):
+            if scene_path not in self._rejected_scenes:
+                with ExitStack() as resources:
+                    scene = resources.enter_context(closing(self._load_unchecked_scene(scene_path)))
+                    bounds = sampling_bounds(
+                        scene.get_active_scene_graph().get_root_node().cumulative_bb,
+                        self.spawn_clearance,
+                        self.flight_height,
+                    )
+                    if torch.all(bounds.upper > bounds.lower):
+                        resources.pop_all()
+                        return scene
+                    reason = (
+                        f"{scene_path}: no sampling volume; lower={bounds.lower.tolist()}, "
+                        f"upper={bounds.upper.tolist()}, clearance={self.spawn_clearance}, "
+                        f"flight_height={self.flight_height}"
+                    )
+                    self._rejected_scenes[scene_path] = reason
+                    logging.getLogger(__name__).warning("Skipping VisFly scene %s", reason)
+            if attempt < len(loader.paths):
+                scene_path = loader.next(1)[0]
+        raise ValueError("No compatible VisFly scenes remain. " + "; ".join(self._rejected_scenes.values()))
 
     def get_reward(
         self,
@@ -199,7 +228,7 @@ class RGBNavigationEnv(NavigationEnv):
         scene_ids = indices // self.num_agent_per_scene  # (N,)
         for scene_id in scene_ids.unique().tolist():
             agents = indices[scene_ids == scene_id]  # (M,)
-            bounds = sampling_bounds(manager, scene_id, self.spawn_clearance, self.flight_height)
+            bounds = sampling_bounds(manager._scene_bounds[scene_id], self.spawn_clearance, self.flight_height)
             targets[agents] = sample_positions(
                 lower=bounds.lower,
                 upper=bounds.upper,
@@ -256,7 +285,10 @@ class RGBNavigationEnv(NavigationEnv):
     def close(self) -> None:
         """Release dynamics and loaded scenes, including before the first successful reset."""
         self.envs.dynamics.close()
-        # Upstream close assumes every scene has loaded, even when reset failed.
-        for scene in self.envs.sceneManager.scenes:
+        # The first scene owns the shared GL context; release its dependents first.
+        scenes = self.envs.sceneManager.scenes
+        for index in reversed(range(len(scenes))):
+            scene = scenes[index]
             if scene is not None:
                 scene.close()
+                scenes[index] = None
