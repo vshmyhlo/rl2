@@ -2,6 +2,7 @@
 
 import runpy
 from contextlib import closing
+from dataclasses import asdict, replace
 from functools import partial
 from itertools import cycle
 from pathlib import Path
@@ -16,6 +17,8 @@ import torch
 from numpy.typing import NDArray
 
 from rl2.envs import visfly_env
+from rl2.envs.visfly.routes import Route, RouteConfig
+from rl2.envs.visfly.scenarios import Scenario
 
 
 def habitat_to_std(corners: NDArray[Any]) -> tuple[torch.Tensor, None]:  # (2, 3) -> (2, 3)
@@ -562,3 +565,74 @@ def test_rgb_backend_rejects_incompatible_sensors(navigation_class: type[Any], k
 def test_scene_randomization_rejects_invalid_ranges(navigation_class: type[Any], kwargs: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
         navigation_class(scene_randomization=True, **kwargs)
+
+
+def test_fixed_scenario_pins_scene_state_and_partial_reset_targets(navigation_class: type[Any], tmp_path: Path) -> None:
+    root = tmp_path / "test"
+    root.mkdir()
+    for name in ("a", "b"):
+        (root / f"{name}.scene_instance.json").write_text("{}")
+    route = Route(
+        points=((1.0, 1.0, 1.0), (8.0, 8.0, 1.0)),
+        direct_blocked=False,
+        constrained=False,
+        long=True,
+        detour_threshold=1.25,
+    )
+    scenario = Scenario(
+        scene="b.scene_instance.json",
+        category="long_traversal",
+        route=route,
+        orientation=(1.0, 0.0, 0.0, 0.0),
+        velocity=(0.0, 0.0, 0.0),
+        angular_velocity=(0.0, 0.0, 0.0),
+        max_episode_steps=1000,
+        seed=3,
+    )
+    env = navigation_class(
+        scene_randomization=True, scene_split="test", scenario=asdict(scenario), scene_kwargs={"path": str(root)}
+    )
+    assert env.envs.sceneManager._scene_loader.paths == [str(root / scenario.scene)]
+    for generator in env.envs.stateGenerators:
+        sampled = generator.safe_generate(num=2)
+        assert sampled.position.shape == sampled.velocity.shape == sampled.angular_velocity.shape == (2, 3)
+        assert sampled.orientation.shape == (2, 4)
+        torch.testing.assert_close(sampled.position, torch.tensor([route.points[0]] * 2))
+        torch.testing.assert_close(sampled.orientation, torch.tensor([scenario.orientation] * 2))
+        assert sampled.velocity.count_nonzero() == 0
+    env._randomize_targets(torch.arange(2))
+    previous = env.target  # (B, 3)
+    env.envs.stateGenerators[1].safe_generate()
+    env._randomize_targets(torch.tensor([1]))
+    assert previous.data_ptr() != env.target.data_ptr()
+    torch.testing.assert_close(env.target, torch.tensor([route.points[-1]] * 2))
+    # Replay rejects stale geometry rather than silently selecting another route.
+    env.envs.sceneManager.get_point_is_collision = Mock(return_value=np.ones(1000, dtype=bool))
+    bad = replace(scenario, route=replace(route, points=((-1.0, 1.0, 1.0), (8.0, 8.0, 1.0))))
+    env.envs.stateGenerators[0].scenario = bad
+    with pytest.raises(ValueError, match="Saved evaluation route"):
+        env.envs.stateGenerators[0].safe_generate()
+
+
+def test_route_catalogues_refresh_on_scene_rotation_and_metrics_drain(navigation_class: type[Any]) -> None:
+    config = RouteConfig(spacing=3, sources=2, goals_per_source=3, jitter=0)
+    env = navigation_class(scene_randomization=True, route_sampling=asdict(config))
+    manager = env.envs.sceneManager
+    manager.scenes = [object(), object()]
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(4)
+        first = env.route_catalogue(0, config)
+        assert first is env.route_catalogue(0, config)
+        sampled = env._sample_route(0)
+        assert sampled in first or tuple(reversed(sampled.points)) in [route.points for route in first]
+        manager.scenes[0] = object()
+        manager._scene_bounds[0] = SimpleNamespace(min=[-20, 0, -20], max=[-10, 4, -10])
+        second = env.route_catalogue(0, config)
+    assert second is not first
+    assert all(route.points[0][0] >= 10 for route in second)
+    metrics = env.sampling_metrics()
+    assert metrics["rollout/sampled_episode_count"] == 1
+    assert metrics["rollout/direct_path_blocked_fraction"] == 0
+    assert metrics["rollout/difficulty_fraction/hard"] == 0
+    assert sum(metrics[f"rollout/difficulty_fraction/{level}"] for level in ("easy", "medium", "hard")) == 1
+    assert env.sampling_metrics() == {}

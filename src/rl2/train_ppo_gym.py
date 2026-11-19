@@ -75,6 +75,22 @@ Window metrics:
         Windows end after the required metric device-to-host transfer; the first
         starts before collection. Startup and final logging/checkpoint drain are excluded.
 
+VisFly route-sampling window metrics (only with env.route_sampling):
+    rollout/sampled_episode_count: Number of starts sampled since the preceding
+        log window, including initial starts in the first window; not cumulative.
+    rollout/initial_goal_distance_meters, rollout/reference_route_length_meters:
+        Means over those starts of Euclidean goal distance and collision-checked,
+        smoothed roadmap path length. Reference paths are not exact shortest paths.
+    rollout/direct_path_blocked_fraction: Fraction of those starts whose direct
+        swept-drone corridor is obstructed.
+    rollout/difficulty_fraction/easy, rollout/difficulty_fraction/medium,
+    rollout/difficulty_fraction/hard: Fractions of sampled starts with short clear,
+        long clear, or obstructed direct corridors. Weights renormalize over levels
+        available in each loaded scene. These summaries describe sampled episodes,
+        not completed episodes or transitions. Omit all when no starts were sampled.
+        Log at log_interval and final windows using completed environment steps;
+        sums reset after logging and are not restored from checkpoints.
+
 Lifetime metrics:
     train/iterations_total, train/updates_total, train/episodes_total, train/env_steps_total:
         Completed iteration, accepted update, episode, and environment transition counts.
@@ -110,7 +126,8 @@ standalone gameplay sample actions. Evaluation uses fixed environment seeds and
 logs raw episode return mean, sample standard deviation, and standard error as
 eval/return, eval/return_std, and
 eval/return_sem after each evaluation (eval_interval iterations and normal completion
-when enabled). These use raw reward units; SEM is sample std / sqrt(eval_episodes).
+when enabled). These use raw reward units; SEM is sample std / sqrt(scored episodes).
+For fixed scenarios this is descriptive dispersion, not independent-test uncertainty.
 eval/training_episodes_total is the lifetime
 completed training episode count at evaluation. Uncertainty metrics are omitted
 for a single episode. eval/stop_fraction/success, eval/stop_fraction/collision,
@@ -128,10 +145,40 @@ end, before autoreset or scene rotation, over all scored episodes; omit it if an
 episode lacks goal-distance metadata. It uses the same cadence and metric step,
 preserves measured zeros, and is not cumulative. Video replays are excluded from
 all evaluation summaries.
-With eval_video=true (default: false), evaluation replays its
-highest-return episode with the same seed, choosing the first on ties, independently
-of video_interval.
-The replay is excluded from score statistics and included in eval/evaluation_seconds.
+With env.evaluation configured, VisFly loads its saved scenario manifest or builds
+it once across canonical-JSON-unique test scenes; eval_episodes is ignored. The
+manifest fixes starts, goals, orientations, velocities, seeds, and route-length-based
+horizons. Scene rotation is disabled. Unsupported categories/scenes are recorded
+in the manifest and report, never replaced with easy cases. Generation can miss
+routes through passages finer than its grid. The first evaluation's timing includes
+manifest generation/persistence; subsequent timings include manifest reads.
+Additional metrics, emitted once per evaluation at the training environment-step
+count (none are cumulative; omit them outside manifest evaluation):
+    eval/initial_goal_distance_meters, eval/reference_route_length_meters:
+        Episode means of initial Euclidean distance and feasible reference length.
+    eval/direct_path_blocked_fraction: Fraction of scored scenarios with an
+        obstructed direct corridor, including measured zero.
+    eval/scene_coverage_fraction: Represented scenes / unique inventory scenes.
+    eval/category_coverage_fraction/<category>: Scenes with that category / unique
+        inventory scenes, including zero for unsupported categories.
+    eval/success_fraction/<category>, eval/collision_fraction/<category>:
+        Outcome fractions over scored episodes in the category. Omit empty groups
+        or groups with missing stop reasons; retain measured zeros.
+    eval/success_fraction/scene_<index>, eval/collision_fraction/scene_<index>:
+        Outcome fractions over each scene's scored episodes, with the same omission
+        rules. Index is the zero-padded, four-digit manifest coverage index.
+    eval/scene_success_fraction, eval/scene_collision_fraction: Equal-weight means
+        of represented scene outcome fractions. Omit if any outcome is unavailable;
+        unrepresented scenes affect coverage, not outcome means.
+Category labels are long_traversal, obstacle_avoidance, substantial_detour, and
+constrained_passage. Detours use smoothed reference lengths; constrained passages
+connect regions disconnected in the extra-clearance roadmap. Scene/category
+geometry and inventory mappings are saved in eval/report/<step>.json.
+With eval_video=true (default: false), seed-based evaluation replays its highest-return
+episode (first on ties). Manifest evaluation replays the first scenario per category,
+first non-success, and highest-return scenario, deduplicating scenario indices.
+All replays reuse initial conditions, are excluded from score statistics, and are
+included in eval/evaluation_seconds, independently of video_interval.
 Standalone gameplay is disabled by default (video_interval=0); a positive
 video_interval enables recording at that iteration interval and on normal completion.
 video_max_frames caps recording (default: 1000). Standalone gameplay and evaluation
@@ -151,8 +198,10 @@ terminal observation. This hold adds no environment steps.
 
 Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
 model/parameter_count/<step>.txt, eval/report/<step>.json, gameplay/<step>.gif,
-and eval/gameplay/<step>.gif. Config parameters use dotted keys; existing values
-are preserved on resume. Startup console logs include per-environment observation
+eval/gameplay/<step>.gif, and manifest replays at eval/gameplay/<step>/<index>.gif.
+The scenario manifest is persisted at env.evaluation.manifest_path (local or gs://).
+Config parameters use dotted keys; existing values are preserved on resume.
+Startup console logs include per-environment observation
 shapes/dtypes and the action space (discrete count or continuous shape/bounds),
 including on resume. Checkpoints retain parameters, optimizer state, RNG,
 completed iterations, environment steps, and episode totals. Legacy checkpoints
@@ -209,8 +258,10 @@ from rl2.actions import (
 )
 from rl2.configuration import BaseConfig, load_config
 from rl2.envs.gym_env import GymConfig, GymEnv, GymObservation
-from rl2.envs.gym_style_env import STOP_REASON_NAMES, GymStyleEnv
-from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv, VisFlyObservation
+from rl2.envs.gym_style_env import STOP_REASON_NAMES, GymStyleEnv, StopReason
+from rl2.envs.visfly.routes import CATEGORIES
+from rl2.envs.visfly.scenarios import Manifest, Scenario
+from rl2.envs.visfly_env import VisFlyConfig, VisFlyEnv, VisFlyObservation, evaluation_manifest
 from rl2.jax_cache import configure_compilation_cache
 from rl2.lstm import LSTMStack, LSTMStackCarry
 from rl2.mlflow_logging import MLflowLogger
@@ -797,9 +848,28 @@ def play_episode(
     *,
     record: bool,
     deterministic: bool = False,
+    scenario: Scenario | None = None,
 ) -> EpisodeResult:
     """Run a fresh episode, or record up to the frame cap; render before actions, excluding autoresets."""
     seed = int(jax.random.bits(key, dtype=jnp.uint32))
+    if scenario is not None:
+        if not isinstance(config.env, VisFlyConfig):
+            raise ValueError("Fixed flight scenarios require VisFly")
+        seed = scenario.seed
+        config = replace(
+            config,
+            env=replace(
+                config.env,
+                route_sampling=None,
+                scene_rotation_env_steps=None,
+                kwargs={
+                    **config.env.kwargs,
+                    "scenario": asdict(scenario),
+                    "scene_randomization": True,
+                    "max_episode_steps": scenario.max_episode_steps,
+                },
+            ),
+        )
     frames = []  # each (H, W, 3)
     episode_return = 0.0
     length = 0
@@ -894,6 +964,42 @@ def log_video(
     )
 
 
+def scenario_metrics(episodes: list[EpisodeResult], manifest: Manifest) -> dict[str, float]:
+    """Reduce scenario geometry and outcomes; scene means give each represented scene equal weight."""
+    scenarios = manifest.scenarios
+    scalars = {
+        "eval/initial_goal_distance_meters": fmean(item.route.initial_distance for item in scenarios),
+        "eval/reference_route_length_meters": fmean(item.route.length for item in scenarios),
+        "eval/direct_path_blocked_fraction": fmean(item.route.direct_blocked for item in scenarios),
+        "eval/scene_coverage_fraction": len({item.scene for item in scenarios}) / len(manifest.coverage),
+    }
+    for category in CATEGORIES:
+        scalars[f"eval/category_coverage_fraction/{category}"] = sum(
+            item.category == category for item in scenarios
+        ) / len(manifest.coverage)
+    groups = {category: [i for i, item in enumerate(scenarios) if item.category == category] for category in CATEGORIES}
+    groups.update(
+        {
+            f"scene_{index:04d}": [i for i, item in enumerate(scenarios) if item.scene == coverage.scene]
+            for index, coverage in enumerate(manifest.coverage)
+        }
+    )
+    for label, indices in groups.items():
+        if indices and all(episodes[i].stop_reason is not None for i in indices):
+            scalars[f"eval/success_fraction/{label}"] = fmean(
+                episodes[i].stop_reason == StopReason.SUCCESS for i in indices
+            )
+            scalars[f"eval/collision_fraction/{label}"] = fmean(
+                episodes[i].stop_reason == StopReason.COLLISION for i in indices
+            )
+    if all(episode.stop_reason is not None for episode in episodes):
+        for outcome in ("success", "collision"):
+            scalars[f"eval/scene_{outcome}_fraction"] = fmean(
+                value for key, value in scalars.items() if key.startswith(f"eval/{outcome}_fraction/scene_")
+            )
+    return scalars
+
+
 def log_evaluation(
     train_state: TrainState,
     config: Config,
@@ -903,11 +1009,17 @@ def log_evaluation(
     *,
     initial_carry: RecurrentCarry,  # leaves: (1, H)
 ) -> None:
-    """Evaluate fixed seeds, log raw scores, and optionally replay the best episode."""
-    print(f"Evaluating {config.eval_episodes} games at step {step_count}...", flush=True)
+    """Evaluate fixed scenarios or seeds; video replays are excluded from summaries."""
     started = monotonic()
+    manifest = (
+        evaluation_manifest(config.env, config.eval_seed)
+        if (isinstance(config.env, VisFlyConfig) and config.env.evaluation is not None)
+        else None
+    )
+    scenarios = manifest.scenarios if manifest is not None else (None,) * config.eval_episodes
+    print(f"Evaluating {len(scenarios)} games at step {step_count}...", flush=True)
     episodes: list[EpisodeResult] = []
-    for episode_index in range(config.eval_episodes):
+    for episode_index, scenario in enumerate(scenarios):
         episode = play_episode(
             train_state,
             config,
@@ -915,27 +1027,42 @@ def log_evaluation(
             initial_carry,
             record=False,
             deterministic=True,
+            **({"scenario": scenario} if scenario is not None else {}),
         )
         episodes.append(episode)
     returns = [episode.episode_return for episode in episodes]
     if config.eval_video:
         best_episode_index = max(range(len(returns)), key=returns.__getitem__)
-        replay = play_episode(
-            train_state,
-            config,
-            jax.random.fold_in(jax.random.key(config.eval_seed), best_episode_index),
-            initial_carry,
-            record=True,
-            deterministic=True,
-        )
-        if replay.frames:
-            writer.log_video(replay.frames, f"eval/gameplay/{step_count}.gif", fps=config.video_fps)
+        replay_indices = [best_episode_index]
+        if manifest is not None:
+            fixed = [
+                next((i for i, scenario in enumerate(manifest.scenarios) if scenario.category == category), None)
+                for category in CATEGORIES
+            ]
+            failure = next((i for i, episode in enumerate(episodes) if episode.stop_reason != StopReason.SUCCESS), None)
+            replay_indices = list(dict.fromkeys(i for i in [*fixed, failure, best_episode_index] if i is not None))
+        for index in replay_indices:
+            scenario = scenarios[index]
+            replay = play_episode(
+                train_state,
+                config,
+                jax.random.fold_in(jax.random.key(config.eval_seed), index),
+                initial_carry,
+                record=True,
+                deterministic=True,
+                **({"scenario": scenario} if scenario is not None else {}),
+            )
+            if replay.frames:
+                path = (
+                    f"eval/gameplay/{step_count}.gif" if manifest is None else f"eval/gameplay/{step_count}/{index}.gif"
+                )
+                writer.log_video(replay.frames, path, fps=config.video_fps)
     std = stdev(returns) if len(returns) > 1 else None
     result = {
         "env_id": config.env.id,
         "return_mean": fmean(returns),
         "return_std": std,
-        "return_sem": std / sqrt(config.eval_episodes) if std is not None else None,
+        "return_sem": std / sqrt(len(episodes)) if std is not None else None,
         "episodes": [
             {
                 "return": episode.episode_return,
@@ -956,6 +1083,12 @@ def log_evaluation(
         "training_steps": step_count,
         "training_episodes": episode_count,
     }
+    if manifest is not None:
+        result["manifest"] = asdict(manifest)
+        for entry, scenario in zip(result["episodes"], manifest.scenarios):
+            entry["scenario"] = asdict(scenario)
+            entry["initial_goal_distance_meters"] = scenario.route.initial_distance
+            entry["reference_route_length_meters"] = scenario.route.length
     scalars = {
         "eval/return": result["return_mean"],
         "eval/training_episodes_total": episode_count,
@@ -971,12 +1104,14 @@ def log_evaluation(
         scalars["eval/final_goal_distance_meters"] = fmean(distances)
     if std is not None:
         scalars.update({"eval/return_std": std, "eval/return_sem": result["return_sem"]})
+    if manifest is not None:
+        scalars.update(scenario_metrics(episodes, manifest))
     writer.log_text(json.dumps(result, indent=2, allow_nan=False), f"eval/report/{step_count}.json")
     seconds = monotonic() - started
     scalars["eval/evaluation_seconds"] = seconds
     writer.log_metrics(scalars, step_count)
     print(
-        f"Evaluation: return={result['return_mean']:.1f} over {config.eval_episodes} games in {seconds:.1f}s",
+        f"Evaluation: return={result['return_mean']:.1f} over {len(episodes)} games in {seconds:.1f}s",
         flush=True,
     )
 
@@ -1484,6 +1619,8 @@ def train(config: Config) -> TrainState:
                 if episode_count:
                     scalars["train/return"] = float(total.episode_return_sum) / episode_count
                     scalars["train/episode_length_steps"] = int(total.episode_length_sum) / episode_count
+                if isinstance(envs, VisFlyEnv) and config.env.route_sampling is not None:
+                    scalars.update(envs.backend.sampling_metrics())
                 writer.log_metrics(scalars, step_count)
                 episode_return_text = f"{scalars['rollout/return']:.1f}" if window_episode_count else "n/a"
                 episode_length_text = (

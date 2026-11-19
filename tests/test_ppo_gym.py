@@ -25,6 +25,8 @@ from rl2.envs import GymStyleEnv, GymStyleStep
 from rl2.envs.gym_env import GymConfig, GymEnv
 from rl2.envs.gym_style_env import StopReason
 from rl2.envs.visfly.render import RenderContext, diagnostics_panel
+from rl2.envs.visfly.routes import CATEGORIES, Route, RouteConfig
+from rl2.envs.visfly.scenarios import EvaluationConfig, Manifest, Scenario, SceneCoverage
 from rl2.envs.visfly_env import RawVisFlyObservation, VisFlyConfig, VisFlyEnv
 from rl2.model.encoders.conv2d import ConvStage
 
@@ -837,6 +839,11 @@ def test_train_orchestration_uses_host_env_and_closes_resources(
 ) -> None:
     config = replace(config, total_steps=11 if resume else 4, anneal_lr=True, run_id="host-test")
     env = Mock(action_space=gym.spaces.Discrete(2))
+    if accepted and not resume:
+        config = replace(config, env=VisFlyConfig(route_sampling=RouteConfig()))
+        env = Mock(spec=VisFlyEnv, action_space=gym.spaces.Discrete(2))
+        env.backend = Mock()
+        env.backend.sampling_metrics.return_value = {"rollout/direct_path_blocked_fraction": 0.75}
     env.reset.return_value = np.zeros((2, 3), dtype=np.float32)  # (B, O)
     model = Mock()
     model.initial_carry.side_effect = lambda batch: ((jnp.zeros((batch, 1)), jnp.zeros((batch, 1))),)
@@ -918,6 +925,9 @@ def test_train_orchestration_uses_host_env_and_closes_resources(
         scalars["train/policy_loss"] + config.value_coef * scalars["train/value_loss"] + scalars["train/entropy_loss"]
     )
     assert scalars["rollout/episode_count"] == 0
+    if accepted and not resume:
+        assert scalars["rollout/direct_path_blocked_fraction"] == 0.75
+        env.backend.sampling_metrics.assert_called_once_with()
     assert scalars["train/episodes_total"] == (5 if resume else 0)
     assert "rollout/episode_length_steps" not in scalars
     if resume:
@@ -1073,3 +1083,128 @@ def test_final_kl_uses_final_parameters_and_full_batch(
     assert int(window.update_count) == (1 if early_stop else 2)
     assert int(window.early_stop_count) == int(early_stop)
     assert float(window.minibatch_metrics.gradient_norm) == pytest.approx(2.0 if early_stop else 3.95)
+
+
+@pytest.fixture
+def flight_manifest(tmp_path: Path) -> Manifest:
+    route = Route(
+        points=((1.0, 1.0, 1.0), (1.0, 5.0, 1.0), (8.0, 5.0, 1.0)),
+        direct_blocked=True,
+        constrained=False,
+        long=True,
+        detour_threshold=1.25,
+    )
+    scenarios = tuple(
+        Scenario(
+            scene=scene,
+            category=category,
+            route=route,
+            orientation=(1.0, 0.0, 0.0, 0.0),
+            velocity=(0.0, 0.0, 0.0),
+            angular_velocity=(0.0, 0.0, 0.0),
+            max_episode_steps=2000,
+            seed=seed,
+        )
+        for scene, category, seed in [
+            ("test/a.json", "long_traversal", 1),
+            ("test/a.json", "obstacle_avoidance", 2),
+            ("test/b.json", "long_traversal", 3),
+        ]
+    )
+    return Manifest(
+        scenarios=scenarios,
+        coverage=tuple(
+            SceneCoverage(
+                scene=scene,
+                aliases=(),
+                unavailable=tuple(
+                    category
+                    for category in CATEGORIES
+                    if category not in {s.category for s in scenarios if s.scene == scene}
+                ),
+            )
+            for scene in ("test/a.json", "test/b.json", "test/unavailable.json")
+        ),
+        seed=8,
+        generation=EvaluationConfig(manifest_path=str(tmp_path / "manifest.json")),
+        control_dt=0.02,
+    )
+
+
+def test_manifest_evaluation_scores_all_routes_and_replays_fixed_and_failed_cases(
+    config: ppo.Config,
+    flight_manifest: Manifest,
+) -> None:
+    config = replace(config, env=VisFlyConfig(evaluation=flight_manifest.generation), eval_episodes=1, eval_video=True)
+    scored = [
+        ppo.EpisodeResult(
+            episode_return=float(i),
+            length=1,
+            frames=[],
+            terminated=True,
+            stop_reason=StopReason.SUCCESS if i < 2 else StopReason.COLLISION,
+        )
+        for i in range(3)
+    ]
+    replay = ppo.EpisodeResult(
+        episode_return=1000.0, length=1, frames=[np.zeros((2, 2, 3), dtype=np.uint8)]
+    )  # (H, W, 3)
+    writer = Mock()
+    with (
+        patch.object(ppo, "evaluation_manifest", return_value=flight_manifest),
+        patch.object(ppo, "play_episode", side_effect=[*scored, replay, replay, replay]) as play,
+    ):
+        ppo.log_evaluation(Mock(), config, writer, 9, 40, initial_carry=())
+    assert play.call_count == 6
+    assert [call.kwargs["scenario"] for call in play.call_args_list[:3]] == list(flight_manifest.scenarios)
+    assert [call.kwargs["scenario"] for call in play.call_args_list[3:]] == list(flight_manifest.scenarios)
+    metrics, step = writer.log_metrics.call_args.args
+    assert step == 40
+    assert metrics["eval/return"] == 1
+    assert metrics["eval/return_sem"] == pytest.approx(1 / np.sqrt(3))
+    assert metrics["eval/stop_fraction/success"] == pytest.approx(2 / 3)
+    assert metrics["eval/scene_success_fraction"] == 0.5
+    assert metrics["eval/scene_collision_fraction"] == 0.5
+    assert metrics["eval/success_fraction/scene_0000"] == 1
+    assert metrics["eval/success_fraction/long_traversal"] == 0.5
+    assert metrics["eval/collision_fraction/obstacle_avoidance"] == 0
+    assert "eval/success_fraction/scene_0002" not in metrics
+    assert metrics["eval/scene_coverage_fraction"] == pytest.approx(2 / 3)
+    assert metrics["eval/category_coverage_fraction/constrained_passage"] == 0
+    report = json.loads(writer.log_text.call_args.args[0])
+    assert len(report["episodes"]) == 3
+    assert report["episodes"][0]["scenario"]["scene"] == "test/a.json"
+    assert len(report["manifest"]["coverage"]) == 3
+    assert writer.log_video.call_count == 3
+
+
+def test_fixed_scenario_overrides_training_sampling_horizon_and_rotation(
+    config: ppo.Config,
+    flight_manifest: Manifest,
+) -> None:
+    scenario = flight_manifest.scenarios[0]
+    config = replace(config, env=VisFlyConfig(scene_rotation_env_steps=1, route_sampling=RouteConfig()))
+    backend = VisFlyBatch(num_envs=1)
+    creator = Mock(return_value=backend)
+    state = TrainState.create(apply_fn=value_policy, params={}, tx=optax.sgd(0.1))
+    memory = ((jnp.zeros((1, 1)), jnp.zeros((1, 1))),)  # leaves: (1, 1)
+    with patch("rl2.envs.visfly_env.load_env_creator", return_value=creator):
+        result = ppo.play_episode(
+            state, config, jax.random.key(0), memory, record=False, deterministic=True, scenario=scenario
+        )
+    kwargs = creator.call_args.kwargs
+    assert kwargs["scenario"] == asdict(scenario)
+    assert kwargs["seed"] == scenario.seed
+    assert kwargs["max_episode_steps"] == scenario.max_episode_steps
+    assert "route_sampling" not in kwargs
+    assert "random_kwargs" not in kwargs
+    assert result.stop_reason == StopReason.SUCCESS
+    assert backend.closed
+
+
+def test_scenario_metrics_omit_unavailable_outcomes(flight_manifest: Manifest) -> None:
+    episodes = [ppo.EpisodeResult(episode_return=0, length=1, frames=[]) for _ in flight_manifest.scenarios]
+    metrics = ppo.scenario_metrics(episodes, flight_manifest)
+    assert "eval/scene_success_fraction" not in metrics
+    assert not any(key.startswith("eval/success_fraction/") for key in metrics)
+    assert metrics["eval/direct_path_blocked_fraction"] == 1

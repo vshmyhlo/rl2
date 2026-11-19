@@ -2,10 +2,15 @@
 
 import os
 from contextlib import closing
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
 import pytest
+
+from rl2.envs.visfly.routes import RouteConfig
+from rl2.envs.visfly.scenarios import EvaluationConfig
+from rl2.envs.visfly_env import evaluation_manifest
 
 # Exercise the trainer's native-library import order before constructing VisFly.
 from rl2.train_ppo_gym import VisFlyConfig, VisFlyEnv
@@ -70,3 +75,38 @@ def test_rendered_reset_step_and_autoreset(num_envs: int, num_scenes: int, scene
         assert result.final_observations["depth"].shape == result.observations["depth"].shape == depth.shape
         assert (rgb > 0).any()
         assert env.step(actions).truncated.all()
+
+
+def test_generated_manifest_replays_real_scene_after_autoreset(tmp_path: Path) -> None:
+    root = tmp_path / "test"
+    root.mkdir()
+    source = Path(os.environ["VISFLY_SCENE_PATH"]) / "garage_empty/garage_empty_0.scene_instance.json"
+    (root / "room.scene_instance.json").write_bytes(source.read_bytes())
+    config = VisFlyConfig(
+        evaluation=EvaluationConfig(
+            manifest_path=str(tmp_path / "manifest.json"), routes=RouteConfig(spacing=2, sources=2, goals_per_source=3)
+        ),
+        kwargs={
+            "device": "cpu",
+            "visual": True,
+            "scene_randomization": True,
+            "scene_split": "test",
+            "scene_kwargs": {"path": str(root), "scene_type": "json"},
+            "dynamics_kwargs": {"action_type": "bodyrate", "dt": 0.03, "ctrl_dt": 0.03},
+            "sensor_kwargs": [{"sensor_type": "COLOR", "uuid": "color", "resolution": [16, 16]}],
+        },
+    )
+    manifest = evaluation_manifest(config, seed=7)
+    assert len(manifest.coverage) == 1
+    scenario = replace(manifest.scenarios[0], max_episode_steps=1)
+    config = replace(config, kwargs={**config.kwargs, "scenario": asdict(scenario), "max_episode_steps": 1})
+    with closing(VisFlyEnv(config=config, num_envs=1, seed=scenario.seed, evaluation=True)) as env:
+        initial = env.reset()  # leaves: (1, *O)
+        np.testing.assert_allclose(initial["state"][0, :3], scenario.route.points[0])
+        np.testing.assert_allclose(initial["state"][0, 3:7], scenario.orientation)
+        np.testing.assert_allclose(initial["target"][0], scenario.route.points[-1])
+        transition = env.step(np.zeros((1, 4), dtype=np.float32))
+        assert (transition.terminated | transition.truncated).all()
+        assert transition.observations["rgb"].shape == (1, 16, 16, 3)
+        np.testing.assert_allclose(transition.observations["state"][0, :3], scenario.route.points[0])
+        np.testing.assert_allclose(transition.final_observations["target"][0], scenario.route.points[-1])

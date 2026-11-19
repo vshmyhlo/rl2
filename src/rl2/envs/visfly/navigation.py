@@ -1,8 +1,10 @@
 """Navigation rewards and dynamics with RGB and optional aligned depth observations."""
 
 import logging
+from collections import Counter
+from collections.abc import Callable
 from contextlib import ExitStack, closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from random import Random
@@ -11,12 +13,15 @@ from typing import Any, Literal, NamedTuple
 import numpy as np
 import torch
 from habitat_sim import SensorType
+from pydantic import TypeAdapter
 from VisFly.envs.NavigationEnv import NavigationEnv
 from VisFly.utils.common import habitat_to_std
 from VisFly.utils.maths import Quaternion
 from VisFly.utils.type import TensorDict
 
+from rl2.envs.visfly.routes import Route, RouteConfig, build_roadmap, build_routes, sample_route, segments_clear
 from rl2.envs.visfly.sampling import sample_positions
+from rl2.envs.visfly.scenarios import Scenario
 
 
 class SamplingBounds(NamedTuple):
@@ -46,22 +51,95 @@ class SampledState(NamedTuple):
 
 
 @dataclass
+class RouteCatalogue:
+    scene: Any
+    config: RouteConfig
+    routes: list[Route]
+
+
+@dataclass
+class RouteStatistics:
+    count: int = 0
+    initial_distance: float = 0.0
+    reference_length: float = 0.0
+    blocked: int = 0
+    difficulties: Counter[str] = field(default_factory=Counter)
+
+    def add(self, route: Route) -> None:
+        self.count += 1
+        self.initial_distance += route.initial_distance
+        self.reference_length += route.length
+        self.blocked += route.direct_blocked
+        self.difficulties[route.difficulty] += 1
+
+    def metrics(self) -> dict[str, float]:
+        if self.count == 0:
+            return {}
+        return {
+            "rollout/sampled_episode_count": self.count,
+            "rollout/initial_goal_distance_meters": self.initial_distance / self.count,
+            "rollout/reference_route_length_meters": self.reference_length / self.count,
+            "rollout/direct_path_blocked_fraction": self.blocked / self.count,
+            **{
+                f"rollout/difficulty_fraction/{level}": self.difficulties[level] / self.count
+                for level in ("easy", "medium", "hard")
+            },
+        }
+
+
+@dataclass
 class SceneStateRandomizer:
     base: Any
     manager: Any
     scene_id: int
     clearance: float
     height: tuple[float, float]
+    route_sampler: Callable[[int], Route] | None = None
+    scenario: Scenario | None = None
+    route: Route | None = None
 
     def safe_generate(self, num: int = 1, **kwargs: Any) -> SampledState:
         """Return (N, 3) position/velocities and (N, 4) quaternion orientation."""
+        if self.scenario is not None:
+            scenario = self.scenario
+            bounds = sampling_bounds(self.manager._scene_bounds[self.scene_id], self.clearance, self.height)
+            points = torch.tensor(scenario.route.points)  # (P, 3)
+
+            def collision(positions: torch.Tensor, radius: float) -> np.ndarray:  # (N, 3) -> (N,)
+                return self.manager.get_point_is_collision(positions, scene_id=self.scene_id, uav_radius=radius)
+
+            if not bool(((points >= bounds.lower) & (points <= bounds.upper)).all()) or not bool(
+                segments_clear(points[:-1], points[1:], collision, self.clearance, scenario.probe_step).all()
+            ):
+                raise ValueError(
+                    f"Saved evaluation route is outside current flight bounds or obstructed: {scenario.scene}"
+                )
+            self.route = scenario.route
+            return SampledState(
+                position=torch.tensor(scenario.route.points[0], device=self.base.device)
+                .expand(num, 3)
+                .clone(),  # (N, 3)
+                orientation=torch.tensor(scenario.orientation, device=self.base.device)
+                .expand(num, 4)
+                .clone(),  # (N, 4)
+                velocity=torch.tensor(scenario.velocity, device=self.base.device).expand(num, 3).clone(),  # (N, 3)
+                angular_velocity=torch.tensor(scenario.angular_velocity, device=self.base.device)
+                .expand(num, 3)
+                .clone(),  # (N, 3)
+            )
         bounds = sampling_bounds(self.manager._scene_bounds[self.scene_id], self.clearance, self.height)
-        position = sample_positions(
-            lower=bounds.lower,
-            upper=bounds.upper,
-            count=num,
-            collision=partial(self.manager.get_point_is_collision, scene_id=self.scene_id, uav_radius=self.clearance),
-        )  # (N, 3)
+        if self.route_sampler is not None:
+            self.route = self.route_sampler(self.scene_id)
+            position = torch.tensor(self.route.points[0]).expand(num, 3).clone()  # (N, 3)
+        else:
+            position = sample_positions(
+                lower=bounds.lower,
+                upper=bounds.upper,
+                count=num,
+                collision=partial(
+                    self.manager.get_point_is_collision, scene_id=self.scene_id, uav_radius=self.clearance
+                ),
+            )  # (N, 3)
         _, angles, velocity, angular_velocity = self.base.generate(num, **kwargs)  # each (N, 3)
         orientation = Quaternion.from_euler(*angles.T).toTensor().T  # (N, 4)
         return SampledState(
@@ -86,6 +164,9 @@ class RGBNavigationEnv(NavigationEnv):
         flight_height: tuple[float, float] = (0.5, 2.5),
         goal_distance: tuple[float, float] = (2.0, 8.0),
         failure_penalty: float = 0.0,
+        route_sampling: dict[str, Any] | None = None,
+        scenario: dict[str, Any] | None = None,
+        scene_path: str | None = None,
         **kwargs: Any,
     ) -> None:
         if kwargs.get("dynamics_kwargs", {}).get("ori_output_type", "quaternion") != "quaternion":
@@ -98,6 +179,14 @@ class RGBNavigationEnv(NavigationEnv):
             )
         if not 0.5 < goal_distance[0] < goal_distance[1]:
             raise ValueError("goal_distance must be an increasing range above the 0.5 m success radius")
+        self.route_config = (
+            TypeAdapter(RouteConfig).validate_python(route_sampling) if route_sampling is not None else None
+        )
+        self.scenario = TypeAdapter(Scenario).validate_python(scenario) if scenario is not None else None
+        if (self.route_config is not None or self.scenario is not None) and not scene_randomization:
+            raise ValueError("Route sampling and fixed scenarios require scene_randomization=True")
+        self._route_catalogues: dict[int, RouteCatalogue] = {}
+        self.route_statistics = RouteStatistics()
         self.scene_randomization = scene_randomization
         self.spawn_clearance = spawn_clearance
         self.flight_height = flight_height
@@ -154,6 +243,13 @@ class RGBNavigationEnv(NavigationEnv):
             ]
             if not loader.paths:
                 raise ValueError(f"No scenes in the {scene_split} split under {root}")
+            if self.scenario is not None:
+                scene_path = str(root / self.scenario.scene)
+            self._pinned_scene = scene_path
+            if scene_path is not None:
+                if scene_path not in loader.paths:
+                    raise ValueError(f"Requested scene is not in the {scene_split} split: {scene_path}")
+                loader.paths = [scene_path]
             # Filter before the first reset, then cycle through the selected inventory.
             loader.paths = sorted(loader.paths)
             if loader.shuffle:
@@ -170,6 +266,8 @@ class RGBNavigationEnv(NavigationEnv):
                         scene_id=index // self.num_agent_per_scene,
                         clearance=spawn_clearance,
                         height=flight_height,
+                        route_sampler=self._sample_route if self.route_config is not None else None,
+                        scenario=self.scenario,
                     )
                     for index, base in enumerate(self.envs.stateGenerators)
                 ]
@@ -196,10 +294,54 @@ class RGBNavigationEnv(NavigationEnv):
                         f"flight_height={self.flight_height}"
                     )
                     self._rejected_scenes[scene_path] = reason
+                    if self._pinned_scene is not None:
+                        raise ValueError(reason)
                     logging.getLogger(__name__).warning("Skipping VisFly scene %s", reason)
             if attempt < len(loader.paths):
                 scene_path = loader.next(1)[0]
         raise ValueError("No compatible VisFly scenes remain. " + "; ".join(self._rejected_scenes.values()))
+
+    def _route_collision(
+        self, positions: torch.Tensor, radius: float, *, scene_id: int
+    ) -> np.ndarray:  # (N, 3) -> (N,)
+        return self.envs.sceneManager.get_point_is_collision(positions, scene_id=scene_id, uav_radius=radius)
+
+    def route_catalogue(self, scene_id: int, config: RouteConfig) -> list[Route]:
+        manager = self.envs.sceneManager
+        scene = manager.scenes[scene_id]
+        cached = self._route_catalogues.get(scene_id)
+        if cached is not None and cached.scene is scene and cached.config == config:
+            return cached.routes
+        bounds = sampling_bounds(manager._scene_bounds[scene_id], self.spawn_clearance, self.flight_height)
+        collision = partial(self._route_collision, scene_id=scene_id)
+        graph = build_roadmap(bounds.lower, bounds.upper, collision, self.spawn_clearance, config)
+        routes = build_routes(graph, collision, self.spawn_clearance, config)
+        self._route_catalogues[scene_id] = RouteCatalogue(scene=scene, config=config, routes=routes)
+        counts = {level: sum(route.difficulty == level for route in routes) for level in ("easy", "medium", "hard")}
+        logging.getLogger(__name__).info("VisFly scene %s route catalogue: %s", scene_id, counts)
+        return routes
+
+    def _sample_route(self, scene_id: int) -> Route:
+        config = self.route_config
+        assert config is not None
+        bounds = sampling_bounds(
+            self.envs.sceneManager._scene_bounds[scene_id], self.spawn_clearance, self.flight_height
+        )
+        route = sample_route(
+            self.route_catalogue(scene_id, config),
+            partial(self._route_collision, scene_id=scene_id),
+            self.spawn_clearance,
+            config,
+            bounds.lower,
+            bounds.upper,
+        )
+        self.route_statistics.add(route)
+        return route
+
+    def sampling_metrics(self) -> dict[str, float]:
+        metrics = self.route_statistics.metrics()
+        self.route_statistics = RouteStatistics()
+        return metrics
 
     def get_reward(
         self,
@@ -223,6 +365,13 @@ class RGBNavigationEnv(NavigationEnv):
 
     def _randomize_targets(self, indices: torch.Tensor) -> None:  # (N,) agent indices
         manager = self.envs.sceneManager
+        if self.scenario is not None or self.route_config is not None:
+            targets = self.target.clone()  # (B, 3)
+            for index in indices.tolist():
+                route = self.envs.stateGenerators[index].route
+                targets[index] = targets.new_tensor(route.points[-1])  # (3,)
+            self.target = targets  # (B, 3)
+            return
         # Preserve targets referenced by terminal observations before autoreset.
         targets = self.target.clone()  # (B, 3)
         scene_ids = indices // self.num_agent_per_scene  # (N,)

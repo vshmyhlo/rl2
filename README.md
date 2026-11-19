@@ -121,6 +121,32 @@ rendering; `eval_video: true` or a positive `video_interval` requires appropriat
 `scene_kwargs.render_settings`. Checkpoints save the full configuration, but resume
 uses the current configuration and starts fresh environments and recurrent memory.
 
+The VisFly preset samples collision-checked routes with an easy/medium/hard mixture
+of 20/40/40: short clear flights, long clear flights, and obstacle-crossing flights.
+A bounded 3D roadmap is cached per loaded scene; endpoint jitter provides fresh
+starts/goals. Missing difficulty levels are excluded and weights renormalized.
+`env.route_sampling.weights` controls the mixture; set `env.route_sampling: null`
+to restore `goal_distance` sampling. Training allows 30-second episodes. The
+`rollout/difficulty_fraction/*` and distance metrics describe newly sampled starts.
+
+`env.evaluation.manifest_path` enables fixed evaluation over all distinct test-scene
+JSON layouts. The first evaluation generates and saves one route per supported
+category: long traversal, obstacle avoidance, substantial detour, and constrained
+passage. Subsequent evaluations and resumes reuse that file, ignoring `eval_episodes`.
+Reuse the same manifest path across runs for identical comparisons; choose a new
+path to regenerate. Categories without candidates and invalid scenes are recorded
+in the manifest/report. Deduplication removes identical JSON layouts, not geometric
+near-duplicates. The coarse roadmap can miss narrow passages; increase
+`env.evaluation.routes.max_nodes` or decrease `spacing` when needed. Reference
+paths establish geometric feasibility, not dynamic feasibility or optimality.
+
+Each saved scenario fixes its initial state and horizon (reference length / speed
+plus manoeuvring time). Evaluation disables scene rotation, reports category/scene
+success and collisions, equal-weight scene means, and explicit coverage fractions.
+Videos include fixed category examples, a failure, and the best episode. Set
+`env.evaluation: null` to restore seeded random evaluation. Metrics and artifact
+semantics are inventoried in `src/rl2/train_ppo_gym.py`.
+
 ## Useful links and references
 
 | Link | Description |

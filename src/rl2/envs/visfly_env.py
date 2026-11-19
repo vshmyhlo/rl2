@@ -3,11 +3,14 @@
 Omit goal distances if a backend omits any completed episode's terminal observation.
 """
 
+import json
+import logging
 import random
 from collections.abc import Generator
 from contextlib import ExitStack, closing, contextmanager
 from copy import deepcopy
-from dataclasses import field, replace
+from dataclasses import asdict, field, replace
+from pathlib import Path
 from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 import cv2
@@ -16,7 +19,7 @@ import numpy as np
 import torch
 from gymnasium.envs.registration import load_env_creator
 from numpy.typing import NDArray
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, TypeAdapter
 from pydantic.dataclasses import dataclass
 
 from rl2.envs.gym_style_env import (
@@ -27,6 +30,9 @@ from rl2.envs.gym_style_env import (
     replace_observation,
 )
 from rl2.envs.visfly.render import RenderContext, depth_panel, diagnostics_panel
+from rl2.envs.visfly.routes import CATEGORIES, RouteConfig
+from rl2.envs.visfly.scenarios import EvaluationConfig, Manifest, SceneCoverage, select_scenarios, unique_scenes
+from rl2.utils import read_optional, write_bytes
 
 
 class RawVisFlyObservation[Array](TypedDict):
@@ -90,6 +96,8 @@ class VisFlyConfig:
     scene_rotation_env_steps: Annotated[int, Field(gt=0)] | None = None  # Across all agents; checked per vector step.
     kwargs: dict[str, Any] = field(default_factory=dict, hash=False)
     channels_first: bool = True  # Backend images are CHW; False accepts already-HWC images.
+    route_sampling: RouteConfig | None = None
+    evaluation: EvaluationConfig | None = None
 
 
 class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
@@ -123,6 +131,8 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
         if reserved:
             raise ValueError(f"VisFly kwargs are managed by the trainer: {sorted(reserved)}")
         kwargs = deepcopy(config.kwargs)
+        if config.route_sampling is not None:
+            kwargs["route_sampling"] = asdict(config.route_sampling)
         if config.scene_rotation_env_steps is not None:
             kwargs.setdefault("random_kwargs", {})["scene_iter"] = True
         self._rng_state = torch.Generator().manual_seed(seed).get_state()  # (R,) serialized CPU RNG state
@@ -305,3 +315,58 @@ class VisFlyEnv(GymStyleEnv[VisFlyObservation[NDArray[Any]]]):
 
     def close(self) -> None:
         self.backend.close()
+
+
+def evaluation_manifest(config: VisFlyConfig, seed: int) -> Manifest:
+    """Load fixed scenarios, or generate and persist the complete test-scene inventory once."""
+    settings = config.evaluation
+    assert settings is not None
+    existing = read_optional(settings.manifest_path)
+    if existing is not None:
+        return TypeAdapter(Manifest).validate_json(existing)
+    generation_config = replace(
+        config,
+        route_sampling=None,
+        scene_rotation_env_steps=None,
+        kwargs={**config.kwargs, "scene_split": "test", "scene_randomization": True},
+    )
+    with closing(VisFlyEnv(config=generation_config, num_envs=1, seed=seed, evaluation=True)) as env:
+        manager = env.backend.envs.sceneManager
+        root = Path(manager.root_path)
+        inventory = unique_scenes(manager._scene_loader.paths, root)
+        control_dt = float(env.backend.envs.dynamics.ctrl_dt)
+    scenarios = []
+    coverage = []
+    for index, (scene, aliases) in enumerate(inventory):
+        scene_seed = (seed + index * len(CATEGORIES)) % 2**32
+        scene_config = replace(generation_config, kwargs={**generation_config.kwargs, "scene_path": str(root / scene)})
+        reason = None
+        selected = ()
+        try:
+            with (
+                closing(VisFlyEnv(config=scene_config, num_envs=1, seed=scene_seed, evaluation=True)) as env,
+                env._use_rng(),
+            ):
+                # Geometry construction needs loaded scenes but no rendered agent observations.
+                env.backend.envs.sceneManager.load_scenes()
+                routes = env.backend.route_catalogue(0, settings.routes)
+                selected = select_scenarios(scene, routes, settings, scene_seed, control_dt)
+        except ValueError as error:
+            reason = str(error)
+        missing = tuple(category for category in CATEGORIES if category not in {item.category for item in selected})
+        if missing:
+            logging.getLogger(__name__).warning(
+                "VisFly evaluation %s: unavailable %s; %s",
+                scene,
+                missing,
+                reason or "no qualifying route in the sampled roadmap",
+            )
+        coverage.append(SceneCoverage(scene=scene, aliases=aliases, unavailable=missing, reason=reason))
+        scenarios.extend(selected)
+    if not scenarios:
+        raise ValueError(f"No evaluation routes found: {coverage}")
+    manifest = Manifest(
+        scenarios=tuple(scenarios), coverage=tuple(coverage), seed=seed, generation=settings, control_dt=control_dt
+    )
+    write_bytes(settings.manifest_path, json.dumps(asdict(manifest), indent=2, allow_nan=False).encode())
+    return manifest
