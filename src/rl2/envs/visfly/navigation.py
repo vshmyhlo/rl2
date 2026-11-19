@@ -19,7 +19,8 @@ from VisFly.utils.common import habitat_to_std
 from VisFly.utils.maths import Quaternion
 from VisFly.utils.type import TensorDict
 
-from rl2.envs.visfly.routes import Route, RouteConfig, build_roadmap, build_routes, sample_route, segments_clear
+from rl2.envs.visfly.planning import build_roadmap, build_routes, sample_route, segments_clear
+from rl2.envs.visfly.routes import Route, RouteConfig
 from rl2.envs.visfly.sampling import sample_positions
 from rl2.envs.visfly.scenarios import Scenario
 

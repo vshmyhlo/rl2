@@ -3,6 +3,7 @@
 import json
 from dataclasses import asdict, replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -10,7 +11,16 @@ import torch
 from numpy.typing import NDArray
 from pydantic import TypeAdapter
 
-from rl2.envs.visfly.routes import Route, RouteConfig, build_roadmap, build_routes, sample_route, segments_clear
+from rl2.envs.visfly.planning import (
+    build_roadmap,
+    build_routes,
+    prm_edges,
+    sample_route,
+    segments_clear,
+    shortcut_path,
+    space_information,
+)
+from rl2.envs.visfly.routes import Route, RouteConfig
 from rl2.envs.visfly.scenarios import EvaluationConfig, Manifest, SceneCoverage, select_scenarios, unique_scenes
 
 
@@ -85,10 +95,13 @@ def test_open_room_paths_are_smoothed_and_not_labeled_detours() -> None:
 
 
 @pytest.mark.parametrize("free_node", [False, True], ids=["no_free_space", "isolated_node"])
-def test_roadmap_without_edges_has_no_routes(free_node: bool) -> None:
+def test_roadmap_without_edges_has_no_routes(free_node: bool, monkeypatch: pytest.MonkeyPatch) -> None:
     def collision(points: torch.Tensor, radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
         return (points.ne(0).any(dim=-1) | (not free_node)).numpy()  # (N,)
 
+    samples = torch.arange(24).reshape(8, 3) / 24  # (8, 3)
+    samples[0] = 0
+    monkeypatch.setattr(torch, "rand", Mock(return_value=samples))
     config = RouteConfig(spacing=1)
     graph = build_roadmap(torch.zeros(3), torch.ones(3), collision, 0.1, config)
     count = int(free_node)
@@ -100,21 +113,23 @@ def test_roadmap_without_edges_has_no_routes(free_node: bool) -> None:
     assert build_routes(graph, collision, 0.1, config) == []
 
 
-def test_default_route_budget_supports_large_scene() -> None:
-    # The failed training reset needed 81 * 81 * 4 nodes at 0.75 m spacing.
+def test_default_route_budget_supports_large_scene(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Test the failed reset's volume without constructing a large graph in a unit test.
+    edges = Mock(return_value=torch.empty((0, 2), dtype=torch.int64))
+    monkeypatch.setattr("rl2.envs.visfly.planning.prm_edges", edges)
     lower = torch.tensor([-30.0, -30.0, 0.5])  # (3,)
     upper = torch.tensor([30.0, 30.0, 2.5])  # (3,)
     graph = build_roadmap(lower, upper, empty_scene, 0.3, RouteConfig())
     assert graph.points.shape == (26244, 3)
     assert graph.edges.shape == (26244, 26244)
     assert graph.wide_components.shape == (26244,)
-    torch.testing.assert_close(graph.points.amin(dim=0), lower)
-    torch.testing.assert_close(graph.points.amax(dim=0), upper)
+    assert (graph.points >= lower).all() and (graph.points <= upper).all()
+    assert edges.call_args.args[0] is graph.points
 
 
-def test_route_grid_budget_and_empty_bounds() -> None:
+def test_route_sample_budget_and_empty_bounds() -> None:
     config = RouteConfig(max_nodes=8)
-    with pytest.raises(ValueError, match="nodes"):
+    with pytest.raises(ValueError, match="samples"):
         build_roadmap(torch.zeros(3), torch.ones(3) * 10, empty_scene, 0.1, config)
     with pytest.raises(ValueError, match="sampling volume"):
         build_roadmap(torch.ones(3), torch.zeros(3), empty_scene, 0.1, config)
@@ -167,7 +182,10 @@ def test_evaluation_categories_horizons_and_serialization(door_routes: list[Rout
         generation=config,
         control_dt=0.02,
     )
-    assert TypeAdapter(Manifest).validate_json(json.dumps(asdict(manifest))) == manifest
+    encoded = asdict(manifest)
+    assert TypeAdapter(Manifest).validate_json(json.dumps(encoded)) == manifest
+    del encoded["generation"]["routes"]["neighbors"]
+    assert TypeAdapter(Manifest).validate_json(json.dumps(encoded)) == manifest
     with pytest.raises(ValueError, match="coverage"):
         replace(
             manifest, coverage=(SceneCoverage(scene="test/room.json", aliases=(), unavailable=("long_traversal",)),)
@@ -191,3 +209,55 @@ def test_unique_scene_layouts_preserve_obstacle_variants(tmp_path: Path) -> None
 def test_route_weights_validation(weights: tuple[float, float, float]) -> None:
     with pytest.raises(ValueError, match="weights"):
         RouteConfig(weights=weights)
+
+
+def test_prm_export_preserves_indices_with_isolated_samples() -> None:
+    points = torch.tensor([[-1.0, 0, 0], [1.0, 0, 0], [2.0, 0, 0], [3.0, 0, 0]])  # (4, 3)
+
+    def wall(positions: torch.Tensor, radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
+        return (positions[:, 0].abs() < radius).numpy()  # (N,)
+
+    info = space_information(torch.tensor([-2.0, -1, -1]), torch.tensor([4.0, 1, 1]), wall, 0.1, 0.2)
+    edges = prm_edges(points, info, neighbors=3)  # (E, 2)
+    assert edges.shape == (3, 2)
+    assert {tuple(sorted(pair)) for pair in edges.tolist()} == {(1, 2), (1, 3), (2, 3)}
+
+
+def test_catalogue_is_repeatable_after_unrelated_planning() -> None:
+    config = RouteConfig(spacing=1, sources=6, goals_per_source=3, min_distance=1)
+    lower, upper = torch.zeros(3), torch.tensor([6.0, 5.0, 1.0])  # each (3,)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(17)
+        first = build_roadmap(lower, upper, doorway, 0.1, config)
+        routes = build_routes(first, doorway, 0.1, config)
+        build_roadmap(lower, upper, doorway, 0.1, config)
+        torch.manual_seed(17)
+        second = build_roadmap(lower, upper, doorway, 0.1, config)
+        repeated = build_routes(second, doorway, 0.1, config)
+    torch.testing.assert_close(first.points, second.points, rtol=0, atol=0)
+    assert (first.edges != second.edges).nnz == 0
+    assert any(route.direct_blocked for route in routes)
+    assert routes == repeated
+
+
+def test_segment_validation_checks_invalid_starts_and_zero_length() -> None:
+    starts = torch.tensor([[3.0, 0, 1], [2.0, 0, 1], [3.0, 0, 1]])  # (3, 3)
+    ends = torch.tensor([[2.0, 0, 1], [2.0, 0, 1], [3.0, 0, 1]])  # (3, 3)
+    clear = segments_clear(starts, ends, closed_wall, radius=0.1, step=0.2)  # (3,)
+    assert clear.shape == (3,)
+    assert clear.tolist() == [False, True, False]
+
+
+def test_shortcut_preserves_clearance_when_inserting_vertices() -> None:
+    def obstacle(points: torch.Tensor, radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
+        return (points.norm(dim=-1) < radius).numpy()  # (N,)
+
+    # The original edge clears the swept sphere, but a new midpoint at x=0 lacks
+    # the additional half-probe margin required for replay validation.
+    points = torch.tensor([[-1.6, 0.17, 0], [1.6, 0.17, 0], [1.6, -0.17, 0]])  # (3, 3)
+    assert segments_clear(points[:-1], points[1:], obstacle, radius=0.05, step=0.3).all()
+    info = space_information(torch.tensor([-2.0, -1, -1]), torch.tensor([2.0, 1, 1]), obstacle, 0.05, 0.3)
+    result = torch.tensor(shortcut_path(points, info))  # (P, 3)
+    assert result.shape[1:] == (3,)
+    torch.testing.assert_close(result[[0, -1]], points[[0, -1]])
+    assert segments_clear(result[:-1], result[1:], obstacle, radius=0.05, step=0.3).all()

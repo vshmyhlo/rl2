@@ -123,11 +123,17 @@ uses the current configuration and starts fresh environments and recurrent memor
 
 The VisFly preset samples collision-checked routes with an easy/medium/hard mixture
 of 20/40/40: short clear flights, long clear flights, and obstacle-crossing flights.
-A bounded 3D roadmap is cached per loaded scene; endpoint jitter provides fresh
+An OMPL PRM route catalogue is cached per loaded scene; endpoint jitter provides fresh
 starts/goals. Missing difficulty levels are excluded and weights renormalized.
-Training and evaluation default to 0.75 m spacing and a 32,768-node limit, enough
-for a 60 × 60 × 2 m sampling volume. Larger grids require increasing `max_nodes`
-or `spacing`; resolution is never reduced automatically.
+OMPL 2.0.1 requires Python 3.12 or 3.13. It supplies roadmap construction,
+discrete motion validation, and deterministic rope shortcutting; SciPy supplies
+shortest paths and extra-clearance connectivity. Validation retains the half-probe
+clearance margin. Generation uses seeded uniform samples and a fixed count, not a
+time limit. `spacing` controls sampling density: the candidate count is the product
+of `max(2, ceil(axis_length / spacing) + 1)` across three axes. Defaults of 0.75 m
+and `max_nodes: 32768` support a 60 × 60 × 2 m volume. Occupied samples are discarded;
+`neighbors` (default 10) controls PRM connections. Larger volumes require increasing
+`max_nodes` or `spacing`; density is never reduced automatically.
 `env.route_sampling.weights` controls the mixture; set `env.route_sampling: null`
 to restore `goal_distance` sampling. Training allows 30-second episodes. The
 `rollout/difficulty_fraction/*` and distance metrics describe newly sampled starts.
@@ -139,8 +145,9 @@ passage. Subsequent evaluations and resumes reuse that file, ignoring `eval_epis
 Reuse the same manifest path across runs for identical comparisons; choose a new
 path to regenerate. Categories without candidates and invalid scenes are recorded
 in the manifest/report. Deduplication removes identical JSON layouts, not geometric
-near-duplicates. The coarse roadmap can miss narrow passages; increase
-`env.evaluation.routes.max_nodes` or decrease `spacing` when needed. Reference
+near-duplicates. Finite sampling can miss narrow passages; decrease
+`env.evaluation.routes.spacing` and raise `max_nodes` if necessary. Existing saved
+manifests remain usable; select a new manifest path to generate OMPL routes. Reference
 paths establish geometric feasibility, not dynamic feasibility or optimality.
 
 Each saved scenario fixes its initial state and horizon (reference length / speed

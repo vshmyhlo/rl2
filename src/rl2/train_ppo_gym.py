@@ -150,7 +150,7 @@ it once across canonical-JSON-unique test scenes; eval_episodes is ignored. The
 manifest fixes starts, goals, orientations, velocities, seeds, and route-length-based
 horizons. Scene rotation is disabled. Unsupported categories/scenes are recorded
 in the manifest and report, never replaced with easy cases. Generation can miss
-routes through passages finer than its grid. The first evaluation's timing includes
+routes through narrow passages with its finite PRM sample budget. The first evaluation's timing includes
 manifest generation/persistence; subsequent timings include manifest reads.
 Additional metrics, emitted once per evaluation at the training environment-step
 count (none are cumulative; omit them outside manifest evaluation):
