@@ -78,6 +78,9 @@ class NavigationStub:
             uav_radius=0.1,
             sceneManager=SimpleNamespace(
                 scenes=[None, None],
+                render_settings=None,
+                is_multi_drone=False,
+                obj_settings=None,
                 root_path=root,
                 _scene_loader=SimpleNamespace(paths=paths, shuffle=scene_kwargs.get("shuffle", True)),
                 _load_scene=Mock(),

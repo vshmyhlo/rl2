@@ -28,12 +28,14 @@ class RandomTransition(NamedTuple):
 
 
 def random_backend(*, seed: int, **kwargs: Any) -> Mock:
+    assert torch.is_inference_mode_enabled()
     torch.manual_seed(seed)  # Match upstream construction's global seeding and draws.
     torch.rand(1)
     random.random()  # The upstream scene/object loaders also consume Python's global RNG.
     backend = Mock(num_envs=1, action_space=gym.spaces.Box(low=-1, high=1, shape=(4,)))
 
     def observation() -> RawVisFlyObservation[torch.Tensor]:
+        assert torch.is_inference_mode_enabled()
         return RawVisFlyObservation(
             state=torch.rand((1, 13)),  # (B, S)
             target=torch.rand((1, 3)) + random.random(),  # (B, 3)
@@ -41,6 +43,7 @@ def random_backend(*, seed: int, **kwargs: Any) -> Mock:
         )
 
     def step(actions: np.ndarray) -> RandomTransition:  # (B, A)
+        assert torch.is_inference_mode_enabled()
         # An autoreset also consumes the backend's global RNG inside step().
         terminal = observation()  # leaves: (B, *O)
         return RandomTransition(
@@ -69,6 +72,7 @@ def test_rng_streams_are_independent_of_evaluation_and_global_draws() -> None:
             expected_steps = [baseline.step(actions), baseline.step(actions)]
         torch.testing.assert_close(torch.get_rng_state(), initial_rng)
         assert random.getstate() == initial_python_rng
+        assert not torch.is_inference_mode_enabled()
 
         with closing(VisFlyEnv(config=config, num_envs=1, seed=7)) as training:
             actual_reset = training.reset()  # leaves: (B, *O)

@@ -142,7 +142,7 @@ def shortcut_path(points: torch.Tensor, info: ob.SpaceInformation) -> tuple[Poin
 
 @dataclass
 class Roadmap:
-    points: torch.Tensor  # (N, 3), CPU; geometry API consumes Torch tensors
+    points: torch.Tensor  # (N, 3), CPU route samples
     edges: csr_matrix  # (N, N), symmetric edge lengths in metres
     wide_components: NDArray[np.int32]  # (N,), -1 for points without extra clearance
     extent: float

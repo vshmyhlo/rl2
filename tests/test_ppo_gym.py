@@ -1313,3 +1313,35 @@ def test_scenario_metrics_omit_unavailable_outcomes(flight_manifest: Manifest) -
     assert "eval/scene_success_fraction" not in metrics
     assert not any(key.startswith("eval/success_fraction/") for key in metrics)
     assert metrics["eval/direct_path_blocked_fraction"] == 1
+
+
+def test_evaluation_scene_grouping_preserves_report_order(config: ppo.Config, flight_manifest: Manifest) -> None:
+    manifest = replace(flight_manifest, scenarios=tuple(flight_manifest.scenarios[i] for i in (2, 0, 1)))
+    config = replace(config, env=VisFlyConfig(evaluation=manifest.generation), eval_episodes=None)
+
+    def play(*args: Any, scenario: Scenario, **kwargs: Any) -> ppo.EpisodeResult:
+        return ppo.EpisodeResult(episode_return=float(scenario.seed), length=1, frames=[])
+
+    writer = Mock()
+    with (
+        patch.object(ppo, "evaluation_manifest", return_value=manifest),
+        patch.object(ppo, "make_env", return_value=Mock()) as make,
+        patch.object(ppo, "play_episode", side_effect=play) as run,
+    ):
+        ppo.log_evaluation(Mock(), config, writer, 0, 0, initial_carry=())
+    assert [call.kwargs["scenario"].seed for call in run.call_args_list] == [1, 2, 3]
+    report = json.loads(writer.log_text.call_args.args[0])
+    assert [episode["return"] for episode in report["episodes"]] == [3, 1, 2]
+    make.return_value.close.assert_called_once()
+
+
+def test_evaluation_shared_environment_closes_on_failure(config: ppo.Config, flight_manifest: Manifest) -> None:
+    config = replace(config, env=VisFlyConfig(evaluation=flight_manifest.generation), eval_episodes=None)
+    with (
+        patch.object(ppo, "evaluation_manifest", return_value=flight_manifest),
+        patch.object(ppo, "make_env", return_value=Mock()) as make,
+        patch.object(ppo, "play_episode", side_effect=RuntimeError("step failed")),
+        pytest.raises(RuntimeError, match="step failed"),
+    ):
+        ppo.log_evaluation(Mock(), config, Mock(), 0, 0, initial_carry=())
+    make.return_value.close.assert_called_once()

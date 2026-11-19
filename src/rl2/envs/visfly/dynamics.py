@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
+from jax.sharding import Mesh
 from numpy.typing import NDArray
 
 
@@ -55,7 +56,7 @@ def rotate(orientation: jax.Array, vector: jax.Array) -> jax.Array:  # (4, B), (
     return quaternion_product(quaternion_product(orientation, pure), conjugate)[1:]  # (3, B)
 
 
-@partial(jax.jit, backend="cpu", static_argnames=("steps", "delay"))
+@partial(jax.jit, static_argnames=("steps", "delay"))
 def integrate_euler(
     state: FlightState[jax.Array],  # leaves: (3, B) or (4, B)
     parameters: PhysicsParameters[jax.Array],
@@ -136,6 +137,7 @@ class CompiledEuler:
     def __init__(self, dynamics: Any) -> None:
         self.dynamics = dynamics
         self.device = jax.devices("cpu")[0]
+        self.mesh = Mesh(devices=[self.device], axis_names=("physics",))
         self.parameters = jax.device_put(
             jax.tree.map(
                 host_array,
@@ -181,20 +183,22 @@ class CompiledEuler:
             self.device,
         )
         parameters = self.parameters._replace(linear_drag=linear_drag, quadratic_drag=quadratic_drag)
-        result = jax.tree.map(
-            writable_tensor,
-            jax.device_get(
-                integrate_euler(
-                    state,
-                    parameters,
-                    desired,
-                    wind,
-                    dynamics.dt,
-                    steps=dynamics._interval_steps,
-                    delay=dynamics._ctrl_delay,
-                )
-            ),
-        )
+        # Training's policy mesh may use GPUs; the simulator's host state stays on CPU.
+        with jax.set_mesh(self.mesh):
+            result = jax.tree.map(
+                writable_tensor,
+                jax.device_get(
+                    integrate_euler(
+                        state,
+                        parameters,
+                        desired,
+                        wind,
+                        dynamics.dt,
+                        steps=dynamics._interval_steps,
+                        delay=dynamics._ctrl_delay,
+                    )
+                ),
+            )
         dynamics._position = result.state.position  # (3, B)
         w, x, y, z = result.state.orientation  # each (B,)
         dynamics._orientation = type(dynamics._orientation)(w=w, x=x, y=y, z=z)

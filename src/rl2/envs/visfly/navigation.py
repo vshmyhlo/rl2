@@ -192,6 +192,8 @@ class RGBNavigationEnv(NavigationEnv):
         if (self.route_config is not None or self.scenario is not None) and not scene_randomization:
             raise ValueError("Route sampling and fixed scenarios require scene_randomization=True")
         self._route_catalogues: dict[int, RouteCatalogue] = {}
+        self._initial_scene_objects: dict[int, tuple[Any, list[Any]]] = {}
+        self._wind_settings = kwargs.get("dynamics_kwargs", {}).get("wind_settings", [0, 0, 0])
         self.route_statistics = RouteStatistics()
         self.scene_randomization = scene_randomization
         self.spawn_clearance = spawn_clearance
@@ -294,7 +296,7 @@ class RGBNavigationEnv(NavigationEnv):
         scene_path = str(Path(manager.root_path) / scenario.scene)
         if scene_path not in self._scene_paths:
             raise ValueError(f"Requested scene is not in the evaluation split: {scene_path}")
-        changed = scene_path != self._pinned_scene
+        changed = scene_path != self._pinned_scene or bool(manager.obj_settings)
         self.scenario = scenario
         self.max_episode_steps = scenario.max_episode_steps
         self._pinned_scene = scene_path
@@ -303,6 +305,8 @@ class RGBNavigationEnv(NavigationEnv):
         loader._select_index = [0]
         self.envs._scene_iter = False
         self.envs.set_seed(scenario.seed)
+        self.envs.dynamics._t.zero_()
+        self.envs.dynamics._create_wind(self._wind_settings)
         for generator in self.envs.stateGenerators:
             generator.scenario = scenario
             generator.route = None
@@ -433,7 +437,22 @@ class RGBNavigationEnv(NavigationEnv):
 
     def reset(self, state: Any = None, **kwargs: Any) -> TensorDict:
         """Return batched observations after scene loading and start/goal randomization."""
+        manager = self.envs.sceneManager
+        # Fresh scenes start visual drone objects at their template poses. Restore
+        # those poses before sensing a reused scene, rather than showing the last flight.
+        for index, (scene, transforms) in self._initial_scene_objects.items():
+            if manager.scenes[index] is scene:
+                for drone, transform in zip(manager._drones[index], transforms, strict=True):
+                    drone.root_scene_node.transformation = transform
         observations = super().reset(state=state, **kwargs)  # leaves: (B, *O)
+        if manager.render_settings is not None or manager.is_multi_drone:
+            for index, scene in enumerate(manager.scenes):
+                cached = self._initial_scene_objects.get(index)
+                if cached is None or cached[0] is not scene:
+                    self._initial_scene_objects[index] = (
+                        scene,
+                        [drone.root_scene_node.transformation for drone in manager._drones[index]],
+                    )
         if self.scene_randomization:
             self._randomize_targets(torch.arange(self.num_envs))
             observations["target"] = self.target.to(self.device)  # (B, 3); retain the existing camera snapshots

@@ -862,7 +862,7 @@ def deterministic_policy_step(
 def scenario_config(config: Config, scenario: Scenario) -> Config:
     """Disable training sampling/rotation and apply the saved scenario's horizon."""
     if not isinstance(config.env, VisFlyConfig):
-        raise ValueError("Fixed flight scenarios require VisFly")
+        raise TypeError("Fixed flight scenarios require VisFly")
     return replace(
         config,
         env=replace(
@@ -908,13 +908,13 @@ def play_episode(
     starts = jnp.ones(1, dtype=bool)  # (1,)
     with (
         closing(make_env(config, seed=seed, evaluation=True, record=record)) if env is None else nullcontext(env)
-    ) as env:
-        observations = jax.device_put(env.reset())  # leaves: (1, *O)
+    ) as episode_env:
+        observations = jax.device_put(episode_env.reset())  # leaves: (1, *O)
         while True:
             if record and config.video_max_frames is not None and len(frames) >= config.video_max_frames:
                 break
             if record:
-                frames.append(env.render()[0])  # (H, W, 3)
+                frames.append(episode_env.render()[0])  # (H, W, 3)
             if deterministic:
                 memory, actions = deterministic_policy_step(
                     train_state.apply_fn, train_state.params, observations, memory, starts
@@ -925,7 +925,7 @@ def play_episode(
                 )
                 memory, key = sampled.memory, sampled.key  # leaves: (1, H); ()
                 actions = sampled.actions  # (1, *action_shape)
-            transition = env.step(jax.device_get(actions))
+            transition = episode_env.step(jax.device_get(actions))
             observations = jax.device_put(transition.observations)  # leaves: (1, *O)
             episode_return += float(transition.rewards[0])
             length += 1
@@ -939,11 +939,11 @@ def play_episode(
                         final_goal_distance = float(transition.info["goal_distance"][0])
                 if (
                     frames
-                    and isinstance(env, VisFlyEnv)
+                    and isinstance(episode_env, VisFlyEnv)
                     and transition.info is not None
                     and "goal_distance" in transition.info
                 ):
-                    outcome = env.render_outcome(frames[-1], transition.final_observations)  # (H, W, 3)
+                    outcome = episode_env.render_outcome(frames[-1], transition.final_observations)  # (H, W, 3)
                     remaining = (
                         max(1, round(config.video_fps))
                         if config.video_max_frames is None
