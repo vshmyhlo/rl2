@@ -125,6 +125,9 @@ The VisFly preset samples collision-checked routes with an easy/medium/hard mixt
 of 20/40/40: short clear flights, long clear flights, and obstacle-crossing flights.
 A bounded 3D roadmap is cached per loaded scene; endpoint jitter provides fresh
 starts/goals. Missing difficulty levels are excluded and weights renormalized.
+Training and evaluation default to 0.75 m spacing and a 32,768-node limit, enough
+for a 60 × 60 × 2 m sampling volume. Larger grids require increasing `max_nodes`
+or `spacing`; resolution is never reduced automatically.
 `env.route_sampling.weights` controls the mixture; set `env.route_sampling: null`
 to restore `goal_distance` sampling. Training allows 30-second episodes. The
 `rollout/difficulty_fraction/*` and distance metrics describe newly sampled starts.

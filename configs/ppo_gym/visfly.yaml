@@ -15,7 +15,7 @@ env:
     device: cpu # VisFly tensors/dynamics; Habitat still renders on GPU alongside JAX
     visual: true
     max_episode_steps: 1500 # 30 seconds at 50 Hz; evaluation uses each saved route budget
-    failure_penalty: 20.0 # Subtract once on terminal failure; 0 disables. Success and truncation alone are exempt.
+    failure_penalty: 0.0 # Subtract once on terminal failure; 0 disables. Success and truncation alone are exempt.
     scene_randomization: true
     spawn_clearance: 0.3 # Metres from geometry
     flight_height: [0.5, 2.5] # Metres above each scene's bounding-box floor
@@ -53,7 +53,7 @@ env:
       - sensor_type: DEPTH
         uuid: depth
         resolution: [64, 64]
-seed: 8
+seed: 10
 total_steps: 10000000
 num_envs: 32
 num_steps: 100 # 2 simulated seconds per agent at 50 Hz

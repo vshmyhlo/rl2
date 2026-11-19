@@ -1,13 +1,13 @@
 """Bounded host-side flight roadmaps using VisFly's CPU collision queries.
 
 The grid can miss passages; a missing route is not proof of impossibility.
-Reference lengths describe smoothed feasible paths, not exact shortest paths.
+SciPy supplies sparse graph connectivity and shortest paths. Reference lengths
+describe smoothed feasible paths, not exact continuous-space shortest paths.
 """
 
 from collections.abc import Callable
 from dataclasses import dataclass as std_dataclass
 from dataclasses import replace
-from heapq import heappop, heappush
 from math import ceil, dist, prod
 from typing import Annotated, Literal, Self
 
@@ -16,6 +16,8 @@ import torch
 from numpy.typing import NDArray
 from pydantic import ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components, dijkstra
 
 type Point = tuple[float, float, float]
 type Category = Literal["long_traversal", "obstacle_avoidance", "substantial_detour", "constrained_passage"]
@@ -29,7 +31,7 @@ DIFFICULTIES: tuple[Difficulty, ...] = ("easy", "medium", "hard")
 class RouteConfig:
     spacing: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 0.75
     probe_step: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 0.2
-    max_nodes: Annotated[int, Field(ge=8)] = 16000
+    max_nodes: Annotated[int, Field(ge=8)] = 32768
     sources: Annotated[int, Field(gt=0)] = 24
     goals_per_source: Annotated[int, Field(ge=3)] = 12
     min_distance: Annotated[float, Field(gt=0.5, allow_inf_nan=False)] = 2.0
@@ -101,24 +103,20 @@ def segments_clear(
 @std_dataclass
 class Roadmap:
     points: torch.Tensor  # (N, 3), CPU; geometry API consumes Torch tensors
-    edges: list[list[tuple[int, float]]]
-    wide_components: list[int]  # -1 for points without extra clearance
+    edges: csr_matrix  # (N, N), symmetric edge lengths in metres
+    wide_components: NDArray[np.int32]  # (N,), -1 for points without extra clearance
     extent: float
 
 
-def components(edges: list[list[tuple[int, float]]], valid: list[bool]) -> list[int]:
-    labels = [-1] * len(edges)
-    for root in range(len(edges)):
-        if labels[root] != -1 or not valid[root]:
-            continue
-        labels[root] = root
-        pending = [root]
-        while pending:
-            for neighbor, _ in edges[pending.pop()]:
-                if labels[neighbor] == -1 and valid[neighbor]:
-                    labels[neighbor] = root
-                    pending.append(neighbor)
-    return labels
+def sparse_graph(
+    starts: torch.Tensor,  # (E,) node indices
+    ends: torch.Tensor,  # (E,) node indices
+    lengths: torch.Tensor,  # (E,) edge lengths in metres
+    node_count: int,
+) -> csr_matrix:  # (N, N)
+    """Store each undirected edge in both directions for SciPy's graph routines."""
+    edges = csr_matrix((lengths.numpy(), (starts.numpy(), ends.numpy())), shape=(node_count, node_count))  # (N, N)
+    return edges + edges.T  # (N, N)
 
 
 def build_roadmap(
@@ -141,8 +139,7 @@ def build_roadmap(
     ids = torch.full((len(grid),), -1, dtype=torch.int64)  # (G,)
     ids[free] = torch.arange(len(points))
     ids = ids.reshape(sizes)  # (X, Y, Z)
-    edges: list[list[tuple[int, float]]] = [[] for _ in points]
-    wide_edges: list[list[tuple[int, float]]] = [[] for _ in points]
+    starts, ends, weights, wide_masks = [], [], [], []  # each contains three (C_axis,) CPU tensors
     for axis in range(3):
         a = ids.narrow(axis, 0, sizes[axis] - 1).flatten()  # (E,)
         b = ids.narrow(axis, 1, sizes[axis] - 1).flatten()  # (E,)
@@ -153,38 +150,23 @@ def build_roadmap(
         wide = segments_clear(
             points[a], points[b], collision, clearance + config.passage_margin, config.probe_step
         )  # (C,)
-        lengths = (points[a] - points[b]).norm(dim=-1).tolist()  # C edge lengths
-        for left, right, length, is_wide in zip(a.tolist(), b.tolist(), lengths, wide.tolist()):
-            edges[left].append((right, length))
-            edges[right].append((left, length))
-            if is_wide:
-                wide_edges[left].append((right, length))
-                wide_edges[right].append((left, length))
-    wide_free = ~torch.from_numpy(collision(points, clearance + config.passage_margin + config.probe_step / 2))  # (N,)
+        starts.append(a)
+        ends.append(b)
+        weights.append((points[a] - points[b]).norm(dim=-1))  # (C,)
+        wide_masks.append(wide)
+    left, right, lengths, wide = map(torch.cat, (starts, ends, weights, wide_masks))  # each (E,)
+    edges = sparse_graph(left, right, lengths, len(points))  # (N, N)
+    wide_edges = sparse_graph(left[wide], right[wide], lengths[wide], len(points))  # (N, N)
+    _, labels = connected_components(wide_edges, directed=False)  # (N,)
+    # Isolated valid nodes have distinct labels; invalid nodes cannot mark a passage endpoint.
+    invalid = collision(points, clearance + config.passage_margin + config.probe_step / 2)  # (N,)
+    labels[invalid] = -1
     return Roadmap(
         points=points,
         edges=edges,
-        wide_components=components(wide_edges, wide_free.tolist()),
+        wide_components=labels,  # (N,)
         extent=float((points.amax(dim=0) - points.amin(dim=0)).norm()) if len(points) else 0.0,
     )
-
-
-def shortest_paths(graph: Roadmap, start: int) -> tuple[list[float], list[int]]:
-    distances = [float("inf")] * len(graph.points)
-    parents = [-1] * len(graph.points)
-    distances[start] = 0.0
-    pending = [(0.0, start)]
-    while pending:
-        distance, node = heappop(pending)
-        if distance != distances[node]:
-            continue
-        for neighbor, length in graph.edges[node]:
-            candidate = distance + length
-            if candidate < distances[neighbor]:
-                distances[neighbor] = candidate
-                parents[neighbor] = node
-                heappush(pending, (candidate, neighbor))
-    return distances, parents
 
 
 def smooth_path(
@@ -207,7 +189,9 @@ def build_routes(graph: Roadmap, collision: CollisionQuery, clearance: float, co
     routes = []
     seen: set[tuple[int, int]] = set()
     for source in torch.randperm(len(graph.points))[: config.sources].tolist():
-        distances, parents = shortest_paths(graph, source)
+        distances, parents = dijkstra(
+            graph.edges, directed=False, indices=source, return_predecessors=True
+        )  # both (N,); one source at a time bounds memory
         separation = (graph.points - graph.points[source]).norm(dim=-1)  # (N,)
         separations = separation.tolist()
         candidates = [
@@ -226,7 +210,7 @@ def build_routes(graph: Roadmap, collision: CollisionQuery, clearance: float, co
             seen.add(pair)
             path = [goal]
             while path[-1] != source:
-                path.append(parents[path[-1]])
+                path.append(int(parents[path[-1]]))
             points = graph.points[list(reversed(path))]  # (K, 3)
             direct = bool(segments_clear(points[:1], points[-1:], collision, clearance, config.probe_step)[0])
             smoothed = (

@@ -73,10 +73,43 @@ def test_swept_clearance_catches_thin_obstacles_between_probes() -> None:
 def test_open_room_paths_are_smoothed_and_not_labeled_detours() -> None:
     config = RouteConfig(spacing=1, sources=2, goals_per_source=3, min_distance=1)
     graph = build_roadmap(torch.tensor([0.0, 0.0, 1.0]), torch.tensor([3.0, 3.0, 2.0]), empty_scene, 0.1, config)
+    assert graph.edges.shape == (len(graph.points), len(graph.points))
+    assert (graph.edges != graph.edges.T).nnz == 0
+    edges = graph.edges.tocoo()  # (N, N), stored edges only
+    lengths = (graph.points[edges.row] - graph.points[edges.col]).norm(dim=-1)  # (E,)
+    np.testing.assert_allclose(edges.data, lengths.numpy())
     routes = build_routes(graph, empty_scene, 0.1, config)
     assert routes
     assert all(len(route.points) == 2 and not route.direct_blocked and not route.constrained for route in routes)
     assert all(route.length == route.initial_distance for route in routes)
+
+
+@pytest.mark.parametrize("free_node", [False, True], ids=["no_free_space", "isolated_node"])
+def test_roadmap_without_edges_has_no_routes(free_node: bool) -> None:
+    def collision(points: torch.Tensor, radius: float) -> NDArray[np.bool_]:  # (N, 3) -> (N,)
+        return (points.ne(0).any(dim=-1) | (not free_node)).numpy()  # (N,)
+
+    config = RouteConfig(spacing=1)
+    graph = build_roadmap(torch.zeros(3), torch.ones(3), collision, 0.1, config)
+    count = int(free_node)
+    assert graph.points.shape == (count, 3)
+    assert graph.edges.shape == (count, count)
+    assert graph.edges.nnz == 0
+    assert graph.wide_components.shape == (count,)
+    assert graph.wide_components.tolist() == ([0] if free_node else [])
+    assert build_routes(graph, collision, 0.1, config) == []
+
+
+def test_default_route_budget_supports_large_scene() -> None:
+    # The failed training reset needed 81 * 81 * 4 nodes at 0.75 m spacing.
+    lower = torch.tensor([-30.0, -30.0, 0.5])  # (3,)
+    upper = torch.tensor([30.0, 30.0, 2.5])  # (3,)
+    graph = build_roadmap(lower, upper, empty_scene, 0.3, RouteConfig())
+    assert graph.points.shape == (26244, 3)
+    assert graph.edges.shape == (26244, 26244)
+    assert graph.wide_components.shape == (26244,)
+    torch.testing.assert_close(graph.points.amin(dim=0), lower)
+    torch.testing.assert_close(graph.points.amax(dim=0), upper)
 
 
 def test_route_grid_budget_and_empty_bounds() -> None:

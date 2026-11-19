@@ -60,6 +60,7 @@ dependencies = [
     "rlax>=0.1.8,<0.2",
     "ruff>=0.16.9",
     "safetensors>=0.8,<0.9",
+    "scipy>=1.14,<2",
     "sentencepiece>=0.2,<0.3",
     "soundfile>=0.13,<0.14; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
     "tfp-nightly>=0.26.0.dev0,<0.27",
