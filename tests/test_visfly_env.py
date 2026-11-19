@@ -2,9 +2,6 @@
 
 import random
 from contextlib import closing
-from dataclasses import replace
-from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, NamedTuple
 from unittest.mock import Mock, patch
 
@@ -15,9 +12,7 @@ import torch
 
 from rl2.envs.gym_style_env import StopReason
 from rl2.envs.visfly.render import depth_panel
-from rl2.envs.visfly.routes import Route
-from rl2.envs.visfly.scenarios import EvaluationConfig
-from rl2.envs.visfly_env import RawVisFlyObservation, VisFlyConfig, VisFlyEnv, convert_observation, evaluation_manifest
+from rl2.envs.visfly_env import RawVisFlyObservation, VisFlyConfig, VisFlyEnv, convert_observation
 
 
 class RandomTransition(NamedTuple):
@@ -457,53 +452,3 @@ def test_visfly_render_rejects_invalid_images(frame_shape: tuple[int, ...], mess
         pytest.raises(ValueError, match=message),
     ):
         env.render()
-
-
-def test_manifest_covers_unique_scenes_and_reuses_saved_states(tmp_path: Path) -> None:
-    root = tmp_path / "test"
-    root.mkdir()
-    paths = []
-    for name, layout in (("a", 1), ("alias_a", 1), ("b", 2), ("bad", 3)):
-        path = root / f"{name}.json"
-        path.write_text(f'{{"layout": {layout}}}')
-        paths.append(str(path))
-    backends = []
-    route = Route(
-        points=((1.0, 1.0, 1.0), (8.0, 8.0, 1.0)),
-        direct_blocked=False,
-        constrained=False,
-        long=True,
-        detour_threshold=1.25,
-    )
-
-    def create(**kwargs: Any) -> Mock:
-        assert kwargs["scene_split"] == "test"
-        backend = Mock(num_envs=1, action_space=gym.spaces.Box(low=-1, high=1, shape=(4,)))
-        backend.envs = SimpleNamespace(
-            dynamics=SimpleNamespace(ctrl_dt=0.03),
-            sceneManager=SimpleNamespace(
-                root_path=str(root), _scene_loader=SimpleNamespace(paths=paths), load_scenes=Mock()
-            ),
-        )
-        backend.route_catalogue.return_value = [route]
-        if kwargs.get("scene_path", "").endswith("bad.json"):
-            backend.route_catalogue.side_effect = ValueError("no sampling volume")
-        backends.append(backend)
-        return backend
-
-    config = VisFlyConfig(
-        kwargs={"scene_kwargs": {"path": str(root)}},
-        evaluation=EvaluationConfig(manifest_path=str(tmp_path / "manifest.json")),
-    )
-    with patch("rl2.envs.visfly_env.load_env_creator", return_value=create):
-        manifest = evaluation_manifest(config, seed=3)
-    assert len(backends) == 4  # Inventory plus three unique layouts.
-    assert all(backend.close.call_count == 1 for backend in backends)
-    assert [item.scene for item in manifest.scenarios] == ["a.json", "b.json"]
-    assert manifest.control_dt == 0.03
-    assert manifest.coverage[0].aliases == ("alias_a.json",)
-    assert manifest.coverage[-1].reason == "no sampling volume"
-    assert len(manifest.coverage[-1].unavailable) == 4
-    with patch("rl2.envs.visfly_env.load_env_creator", side_effect=AssertionError("must reuse manifest")):
-        changed = replace(config, evaluation=replace(config.evaluation, reference_speed=5))
-        assert evaluation_manifest(changed, seed=99) == manifest

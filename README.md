@@ -82,9 +82,11 @@ is omitted. Quaternion sign does not affect the encoding. `model.encoder.goal_sc
 `velocity_scale`, and `angular_velocity_scale` divide these vectors by 10 m,
 5 m/s, and 10 rad/s by default, without clipping. Raw environment observations
 are preserved; preprocessing runs in JAX during inference and updates.
-On the local k3s cluster, build the simulator and bundle its example scenes with:
+On the local k3s cluster, generate with an existing VisFly image, then submit training:
 
 ```bash
+VISFLY_IMAGE='rl2.local/train:<image-tag>' VISFLY_GPU=0 scripts/generate_visfly_manifest.sh --workers 4
+# Generate using an existing VisFly image, then build training with the saved manifest.
 ./submit.py --visfly -- uv run python -m rl2.train_ppo_gym --config configs/ppo_gym/visfly.yaml
 ```
 
@@ -138,17 +140,32 @@ and `max_nodes: 32768` support a 60 × 60 × 2 m volume. Occupied samples are di
 to restore `goal_distance` sampling. Training allows 30-second episodes. The
 `rollout/difficulty_fraction/*` and distance metrics describe newly sampled starts.
 
-`env.evaluation.manifest_path` enables fixed evaluation over all distinct test-scene
-JSON layouts. The first evaluation generates and saves one route per supported
-category: long traversal, obstacle avoidance, substantial detour, and constrained
-passage. Subsequent evaluations and resumes reuse that file. Manifest evaluation
-requires `eval_episodes: null`; configuring both modes is rejected.
-Reuse the same manifest path across runs for identical comparisons; choose a new
-path to regenerate. Categories without candidates and invalid scenes are recorded
-in the manifest/report. Deduplication removes identical JSON layouts, not geometric
+`env.evaluation.manifest_path` requires a pre-generated manifest over distinct
+test-scene JSON layouts. When evaluation is enabled, training fails before
+initialization if the manifest is missing or invalid; evaluation never generates routes. Generate it
+in a VisFly runtime before training:
+
+```bash
+scripts/generate_visfly_manifest.sh --workers 4
+```
+
+The command uses four spawned scene workers by default (`--workers 1` is serial)
+and saves one route per supported category: long traversal, obstacle
+avoidance, substantial detour, and constrained passage. Completed scenes are
+saved under `<manifest_path>.scenes/`; rerun the same command to resume. Only a
+completed inventory publishes the final manifest. Local paths and `gs://` are
+supported. The preset writes `data/visfly/eval_manifest.json` in the repository;
+training images bundle that file. Per-scene caches are ignored by Git and image builds.
+Scene caches track configuration, seed, control interval, and scene
+JSON; use a new manifest path after changing referenced assets or planner code.
+An existing final manifest is reused without regeneration.
+
+Manifest evaluation requires `eval_episodes: null`; configuring both modes is
+rejected. Reuse the same manifest across runs for identical comparisons; choose
+a new path to regenerate. Unsupported categories and invalid scenes appear in
+the manifest/report. Deduplication removes identical JSON layouts, not geometric
 near-duplicates. Finite sampling can miss narrow passages; decrease
-`env.evaluation.routes.spacing` and raise `max_nodes` if necessary. Existing saved
-manifests remain usable; select a new manifest path to generate OMPL routes. Reference
+`env.evaluation.routes.spacing` and raise `max_nodes` if necessary. Reference
 paths establish geometric feasibility, not dynamic feasibility or optimality.
 
 Each saved scenario fixes its initial state and horizon (reference length / speed

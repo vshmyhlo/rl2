@@ -145,13 +145,13 @@ end, before autoreset or scene rotation, over all scored episodes; omit it if an
 episode lacks goal-distance metadata. It uses the same cadence and metric step,
 preserves measured zeros, and is not cumulative. Video replays are excluded from
 all evaluation summaries.
-With env.evaluation configured, VisFly loads its saved scenario manifest or builds
-it once across canonical-JSON-unique test scenes; eval_episodes must be null. The
-manifest fixes starts, goals, orientations, velocities, seeds, and route-length-based
+With env.evaluation configured, VisFly requires a pre-generated scenario manifest;
+eval_episodes must be null. When evaluation is enabled, training validates the manifest
+before initialization. The manifest fixes starts, goals, orientations, velocities, seeds, and route-length-based
 horizons. Scene rotation is disabled. Unsupported categories/scenes are recorded
 in the manifest and report, never replaced with easy cases. Generation can miss
-routes through narrow passages with its finite PRM sample budget. The first evaluation's timing includes
-manifest generation/persistence; subsequent timings include manifest reads.
+routes through narrow passages with its finite PRM sample budget. Evaluation timing
+includes manifest reads; offline generation is excluded.
 Additional metrics, emitted once per evaluation at the training environment-step
 count (none are cumulative; omit them outside manifest evaluation):
     eval/initial_goal_distance_meters, eval/reference_route_length_meters:
@@ -207,7 +207,7 @@ terminal observation. This hold adds no environment steps.
 Artifacts: config/<step>.yaml, devices/<step>.txt, logs/<session>.log,
 model/parameter_count/<step>.txt, eval/report/<step>.json, gameplay/<step>.gif,
 eval/gameplay/<step>.gif, and manifest replays at eval/gameplay/<step>/<index>.gif.
-The scenario manifest is persisted at env.evaluation.manifest_path (local or gs://).
+The pre-generated scenario manifest is read from env.evaluation.manifest_path (local or gs://).
 Config parameters use dotted keys; existing values are preserved on resume.
 Startup console logs include per-environment observation
 shapes/dtypes and the action space (discrete count or continuous shape/bounds),
@@ -1062,7 +1062,7 @@ def log_evaluation(
     """Evaluate fixed scenarios or seeds; video replays are excluded from summaries."""
     started = monotonic()
     manifest = (
-        evaluation_manifest(config.env, config.eval_seed)
+        evaluation_manifest(config.env)
         if (isinstance(config.env, VisFlyConfig) and config.env.evaluation is not None)
         else None
     )
@@ -1525,6 +1525,8 @@ def training_mesh(config: Config) -> Mesh:
 
 def train(config: Config) -> TrainState:
     """Train with a fully resolved config, as returned by load_config."""
+    if config.eval_interval and isinstance(config.env, VisFlyConfig) and config.env.evaluation is not None:
+        evaluation_manifest(config.env)
     configure_compilation_cache()
     # Keep logging active through environment cleanup and the async checkpoint drain.
     with (

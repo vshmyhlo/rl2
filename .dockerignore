@@ -25,6 +25,7 @@ cluster-runs
 checkpoints
 mlruns
 mlflow.db*
+data/visfly/*.scenes
 **/build
 **/dist
 **/wheels

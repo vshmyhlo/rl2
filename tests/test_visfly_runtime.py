@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh
 
+from rl2.envs.visfly.generate_manifest import generate_manifest
 from rl2.envs.visfly.routes import RouteConfig
 from rl2.envs.visfly.scenarios import EvaluationConfig
 from rl2.envs.visfly_env import evaluation_manifest
@@ -85,6 +86,8 @@ def test_generated_manifest_replays_real_scene_after_autoreset(tmp_path: Path) -
     source = Path(os.environ["VISFLY_SCENE_PATH"]) / "box30_test/box30_test_0.scene_instance.json"
     (root / "room.scene_instance.json").write_bytes(source.read_bytes())
     (root / "alias.scene_instance.json").write_bytes(source.read_bytes())
+    wall = Path(os.environ["VISFLY_SCENE_PATH"]) / "box30_wall_high_test/box30_wall_high_test_0.scene_instance.json"
+    (root / "wall.scene_instance.json").write_bytes(wall.read_bytes())
     config = VisFlyConfig(
         evaluation=EvaluationConfig(
             manifest_path=str(tmp_path / "manifest.json"), routes=RouteConfig(spacing=6, sources=4, goals_per_source=4)
@@ -103,8 +106,9 @@ def test_generated_manifest_replays_real_scene_after_autoreset(tmp_path: Path) -
             "sensor_kwargs": [{"sensor_type": "COLOR", "uuid": "color", "resolution": [16, 16]}],
         },
     )
-    manifest = evaluation_manifest(config, seed=7)
-    assert len(manifest.coverage) == 1
+    manifest = generate_manifest(config, seed=7, workers=2)
+    assert evaluation_manifest(config) == manifest
+    assert len(manifest.coverage) == 2
     scenario = replace(manifest.scenarios[0], max_episode_steps=1)
     config = replace(config, kwargs={**config.kwargs, "scenario": asdict(scenario), "max_episode_steps": 1})
     with closing(VisFlyEnv(config=config, num_envs=1, seed=scenario.seed, evaluation=True)) as env:

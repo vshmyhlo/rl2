@@ -17,13 +17,14 @@ import pytest
 import torch
 from flax.training.train_state import TrainState
 from numpy.typing import NDArray
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from rl2 import train_ppo_gym as ppo
 from rl2.actions import BetaPolicy, CategoricalPolicy, ContinuousSpace, Policy, TruncatedGaussianPolicy
 from rl2.envs import GymStyleEnv, GymStyleStep
 from rl2.envs.gym_env import GymConfig, GymEnv
 from rl2.envs.gym_style_env import StopReason
+from rl2.envs.visfly import generate_manifest as manifest_generation
 from rl2.envs.visfly.render import RenderContext, diagnostics_panel
 from rl2.envs.visfly.routes import CATEGORIES, Route, RouteConfig
 from rl2.envs.visfly.scenarios import EvaluationConfig, Manifest, Scenario, SceneCoverage
@@ -1345,3 +1346,58 @@ def test_evaluation_shared_environment_closes_on_failure(config: ppo.Config, fli
     ):
         ppo.log_evaluation(Mock(), config, Mock(), 0, 0, initial_carry=())
     make.return_value.close.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("content", "error"),
+    [(None, FileNotFoundError), (b"{}", ValidationError)],
+    ids=["missing", "invalid"],
+)
+def test_training_checks_manifest_before_initialization(
+    config: ppo.Config, tmp_path: Path, content: bytes | None, error: type[Exception]
+) -> None:
+    path = tmp_path / "manifest.json"
+    if content is not None:
+        path.write_bytes(content)
+    config = replace(
+        config,
+        env=VisFlyConfig(evaluation=EvaluationConfig(manifest_path=str(path))),
+        eval_episodes=None,
+        eval_interval=1,
+    )
+    with (
+        patch.object(ppo, "configure_compilation_cache") as cache,
+        patch.object(ppo, "MLflowLogger") as logger,
+        patch.object(ppo, "make_env") as make_env,
+        pytest.raises(error),
+    ):
+        ppo.train(config)
+    cache.assert_not_called()
+    logger.assert_not_called()
+    make_env.assert_not_called()
+
+
+def test_offline_manifest_cli_uses_training_config(config: ppo.Config, flight_manifest: Manifest) -> None:
+    config = replace(
+        config,
+        env=VisFlyConfig(evaluation=flight_manifest.generation),
+        eval_episodes=None,
+        eval_seed=123,
+    )
+    with (
+        patch.object(manifest_generation, "load_config", return_value=config) as load,
+        patch.object(manifest_generation, "generate_manifest", return_value=flight_manifest) as generate,
+    ):
+        manifest_generation.main(["--config", "fixture.yaml", "--workers", "2"])
+    load.assert_called_once_with("fixture.yaml", ppo.Config)
+    generate.assert_called_once_with(config.env, config.eval_seed, workers=2)
+
+
+def test_offline_manifest_cli_rejects_other_environments(config: ppo.Config) -> None:
+    with (
+        patch.object(manifest_generation, "load_config", return_value=config),
+        patch.object(manifest_generation, "generate_manifest") as generate,
+        pytest.raises(SystemExit, match="2"),
+    ):
+        manifest_generation.main(["--config", "fixture.yaml", "--workers", "2"])
+    generate.assert_not_called()

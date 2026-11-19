@@ -597,8 +597,18 @@ For VisFly, add `--visfly` to build the pinned headless Habitat-Sim fork and bun
 the example scenes. The image sets `PYTHONPATH` and `VISFLY_SCENE_PATH`:
 
 ```bash
+VISFLY_IMAGE='rl2.local/train:<image-tag>' VISFLY_GPU=0 scripts/generate_visfly_manifest.sh --workers 4
+# Generate using an existing VisFly image, then build training with the saved manifest.
 ./submit.py --visfly -- uv run python -m rl2.train_ppo_gym --config configs/ppo_gym/visfly.yaml
 ```
+
+Choose an idle GPU for `VISFLY_GPU`. The script mounts repository source/config and
+writes `data/visfly/eval_manifest.json` back into the repository. The next training
+image includes it; per-scene caches are excluded from image builds. Generation uses
+four isolated processes by default; adjust `--workers` for CPU and memory limits.
+Training requires the pre-generated evaluation manifest. Rerun the generation
+command after interruption to reuse completed scenes in `<manifest_path>.scenes/`.
+The final manifest is published after all scenes finish and is reused on later runs.
 
 The VisFly image sets `XLA_PYTHON_CLIENT_PREALLOCATE=true` and
 `XLA_CLIENT_MEM_FRACTION=0.50`, overriding the 90% default loaded from `nvida.env`.

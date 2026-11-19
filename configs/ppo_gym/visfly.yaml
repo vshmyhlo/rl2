@@ -8,7 +8,7 @@ env:
     spacing: 0.75 # Metres; uniform PRM sample density, cached per loaded scene
     jitter: 0.2 # Metres; validated endpoint perturbations at each reset
   evaluation:
-    manifest_path: ${ckpt_dir}/visfly_eval_manifest.json # Generate once; reuse fixed routes on resume
+    manifest_path: data/visfly/eval_manifest.json # Required: generate offline before training
     reference_speed: 1.0 # m/s for route-length-based time budgets
     maneuver_seconds: 10.0
   kwargs:
