@@ -15,8 +15,8 @@ class SceneCollision:
 
     def __call__(
         self,
-        positions: NDArray[np.float32],
-        radius: float,  # (N, 3)
+        positions: NDArray[np.float32],  # (N, 3)
+        radius: float,
     ) -> NDArray[np.bool_]:  # (N,)
         return self.scene.route_points_collide(np.ascontiguousarray(positions), radius)  # (N,)
 

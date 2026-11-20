@@ -67,6 +67,10 @@ Window metrics:
         Number of episodes completed in the window and their raw return/length
         means (length in environment steps per episode); omit unavailable means.
         Episodes spanning windows contribute their full return and length on completion.
+    rollout/reward: Mean raw reward per environment transition across all environments
+        in the window, including terminal transitions and unfinished episodes; excludes
+        timeout bootstrap corrections. Uses raw reward units, preserves measured zeros,
+        and is omitted for empty windows. Resets after logging; not cumulative or restored.
     train/iterations_per_second, train/env_steps_per_second, train/updates_per_second:
         Completed batches, environment transitions across all environments, and
         accepted minibatch updates divided by window wall seconds, respectively.
@@ -86,7 +90,7 @@ VisFly consumption window metrics (only with env.power):
         retain measurements. Log at log_interval and final windows at completed
         environment steps; omit empty windows or disabled models. Sums reset after
         logging, survive episode/scene resets, and are not restored from checkpoints.
-        Measurements arrive through step info and are accumulated on the host.
+        Step info is reduced on the host; sums/counts join the compiled batch/window reduction.
 
 VisFly route-sampling window metrics (only with env.route_sampling):
     rollout/sampled_episode_count: Number of starts sampled since the preceding
@@ -105,7 +109,7 @@ VisFly route-sampling window metrics (only with env.route_sampling):
         not completed episodes or transitions. Omit all when no starts were sampled.
         Log at log_interval and final windows using completed environment steps;
         Step info includes starts from initial resets, autoresets, and scene rotations.
-        Host sums reset after logging and are not restored from checkpoints.
+        Device sums/counts reset after logging and are not restored from checkpoints.
 
 Lifetime metrics:
     train/iterations_total, train/updates_total, train/episodes_total, train/env_steps_total:
@@ -356,35 +360,48 @@ class RolloutCarry(NamedTuple):
     episode_step_counts: jax.Array  # (B,)
 
 
-class RolloutInfoMetrics:
-    """Host summaries of step info, weighted by transitions or sampled starts."""
+type InfoMetrics[Value] = dict[str, tuple[Value, Value]]  # Metric name -> (sum, count).
 
-    def __init__(self) -> None:
-        self.sums: dict[str, float] = {}
-        self.counts: dict[str, int] = {}
 
-    def _add_mean(self, name: str, values: NDArray[Any]) -> None:  # (N,)
-        if values.size:
-            self.sums[name] = self.sums.get(name, 0.0) + float(values.sum())
-            self.counts[name] = self.counts.get(name, 0) + values.size
-
-    def add(self, info: GymStyleInfo) -> None:
+def step_info_metrics(info: GymStyleInfo | None = None) -> InfoMetrics[float | int]:
+    """Reduce optional (B,) transition or (N,) sampled-start arrays to sums/counts."""
+    values: dict[str, NDArray[Any]] = {}  # (B,) or (N,) leaves
+    if info is not None:
         for name in ("power_ratio", "power_penalty"):
             if name in info:
-                self._add_mean(name, info[name])
+                values[name] = info[name]  # (B,)
         if "route_sampling" in info:
-            sampled = info["route_sampling"]
+            sampled = info["route_sampling"]  # (N,) leaves
             for name in ("initial_goal_distance_meters", "reference_route_length_meters"):
-                self._add_mean(name, sampled[name])
-            self._add_mean("direct_path_blocked_fraction", sampled["direct_path_blocked"])
+                values[name] = sampled[name]  # (N,)
+            values["direct_path_blocked_fraction"] = sampled["direct_path_blocked"]  # (N,)
             for level in ("easy", "medium", "hard"):
-                self._add_mean(f"difficulty_fraction/{level}", sampled["difficulty"] == level)
+                values[f"difficulty_fraction/{level}"] = sampled["difficulty"] == level  # (N,)
+    # Missing measurements keep the pytree fixed and contribute no samples.
+    metrics = dict.fromkeys(
+        (
+            "power_ratio",
+            "power_penalty",
+            "initial_goal_distance_meters",
+            "reference_route_length_meters",
+            "direct_path_blocked_fraction",
+            "difficulty_fraction/easy",
+            "difficulty_fraction/medium",
+            "difficulty_fraction/hard",
+        ),
+        (0.0, 0),
+    )
+    metrics.update({name: (float(samples.sum()), samples.size) for name, samples in values.items()})
+    return metrics
 
-    def metrics(self) -> dict[str, float]:
-        metrics = {f"rollout/{name}": value / self.counts[name] for name, value in self.sums.items()}
-        if "initial_goal_distance_meters" in self.counts:
-            metrics["rollout/sampled_episode_count"] = self.counts["initial_goal_distance_meters"]
-        return metrics
+
+def info_metric_means(metrics: InfoMetrics[NDArray[Any]]) -> dict[str, float]:  # () input leaves
+    """Format () host sums/counts, omitting unmeasured means."""
+    means = {f"rollout/{name}": float(total) / int(count) for name, (total, count) in metrics.items() if count}
+    count = int(metrics["initial_goal_distance_meters"][1])
+    if count:
+        means["rollout/sampled_episode_count"] = count
+    return means
 
 
 class RolloutResult(NamedTuple):
@@ -396,6 +413,8 @@ class RolloutResult(NamedTuple):
         episode_return_sum: () sum of raw returns for completed episodes.
         episode_length_sum: () sum of lengths for completed episodes.
         episode_count: () number of completed episodes.
+        reward_sum: () sum of raw rewards across all collected transitions.
+        info_metrics: (T,) optional step-info sums and counts per rollout step.
     """
 
     batch: PPOBatch  # observations: (B, T, *O); targets/starts: (B, T); model_carry leaves: (B, H)
@@ -403,6 +422,8 @@ class RolloutResult(NamedTuple):
     episode_return_sum: jax.Array  # ()
     episode_length_sum: jax.Array  # ()
     episode_count: jax.Array  # ()
+    reward_sum: jax.Array  # ()
+    info_metrics: InfoMetrics[jax.Array]  # (T,) leaves
 
 
 @struct.dataclass
@@ -429,6 +450,8 @@ class EpisodeMetrics(NamedTuple):
 
 class WindowMetrics(NamedTuple):
     episodes: EpisodeMetrics  # scalar leaves
+    info: InfoMetrics[jax.Array]  # () leaves
+    reward_sum: jax.Array  # () raw rewards summed over all window transitions
     minibatch_metrics: MinibatchMetrics  # scalar leaves, including KL-rejected minibatches
     explained_variance_sum: jax.Array  # () summed over rollouts with defined variance
     explained_variance_count: jax.Array  # () rollouts with defined variance
@@ -605,6 +628,8 @@ def init_metrics(progress: TrainingProgress | None = None) -> TrainingMetrics:
         )
         window = WindowMetrics(
             episodes=RunningSum.init(total),  # scalar leaves
+            info=jax.device_put(step_info_metrics()),  # () leaves
+            reward_sum=jnp.zeros((), jnp.float64),  # ()
             minibatch_metrics=MinibatchMetrics(
                 **{field.name: jnp.zeros((), jnp.float64) for field in fields(MinibatchMetrics)}
             ),
@@ -1353,13 +1378,12 @@ def collect_rollout(
     envs: PPOEnv,
     config: Config,
     key: jax.Array,  # () typed PRNG key
-    info_metrics: RolloutInfoMetrics | None = None,
 ) -> tuple[RolloutCarry, RolloutResult]:
     """Collect (B, T, ...) transitions with host environments and JAX policy/GAE.
 
     Timeouts bootstrap from final observations; both end flags reset recurrence.
     Completed episode returns, lengths, and count are reduced to scalars on device.
-    When supplied, info_metrics accumulates optional step measurements on the host.
+    Optional step-info sums/counts are collected for the compiled window update.
     """
 
     class Transition(NamedTuple):
@@ -1370,6 +1394,7 @@ def collect_rollout(
         log_probs: jax.Array  # (*S,)
         values: jax.Array  # (*S,)
         rewards: jax.Array  # (*S,)
+        raw_rewards: jax.Array  # (*S,)
         episode_ends: jax.Array  # (*S,)
         episode_starts: jax.Array  # (*S,)
 
@@ -1380,6 +1405,7 @@ def collect_rollout(
     )
     advanced = rollout_carry
     transitions = []
+    info_metrics: list[InfoMetrics[float | int]] = []
     for _ in range(config.num_steps):
         current = advanced
         sampled = sample_policy_step(
@@ -1392,8 +1418,7 @@ def collect_rollout(
         )
         key = sampled.key  # ()
         transition = envs.step(jax.device_get(sampled.actions))
-        if info_metrics is not None and transition.info is not None:
-            info_metrics.add(transition.info)
+        info_metrics.append(step_info_metrics(transition.info))
         # End flags originate on the host; checking them here avoids a device scalar readback.
         timeout = transition.truncated & ~transition.terminated  # (B,)
         observations, raw_rewards, episode_ends = jax.device_put(
@@ -1422,6 +1447,7 @@ def collect_rollout(
                 log_probs=sampled.log_probs,  # (B,)
                 values=sampled.values,  # (B,)
                 rewards=rewards,  # (B,)
+                raw_rewards=raw_rewards,  # (B,)
                 episode_ends=episode_ends,  # (B,)
                 episode_starts=current.episode_starts,  # (B,)
             )
@@ -1446,19 +1472,23 @@ def collect_rollout(
         model_carry=rollout_carry.model_carry,  # leaves: (B, H)
         episode_starts=trajectory.episode_starts,  # (B, T)
     )
+    with jax.enable_x64():
+        stacked_info = jax.device_put(jax.tree.map(lambda *values: np.asarray(values), *info_metrics))  # (T,) leaves
     return advanced, RolloutResult(
         batch=batch,  # observations: (B, T, *O); targets/starts: (B, T); model_carry leaves: (B, H)
         key=key,  # ()
         episode_return_sum=episode_metrics.episode_return_sum,  # ()
         episode_length_sum=episode_metrics.episode_length_sum,  # ()
         episode_count=episode_metrics.episode_count,  # ()
+        reward_sum=trajectory.raw_rewards.sum(),  # ()
+        info_metrics=stacked_info,  # (T,) leaves
     )
 
 
 @partial(jax.jit, static_argnames=("config",), donate_argnames=("train_state",))
 def optimize_rollout(
     rollout_carry: RolloutCarry,  # observations: (B, *O); memory: (B, H)
-    rollout: RolloutResult,  # batch leaves: (B, T, ...); key/statistics: ()
+    rollout: RolloutResult,  # batch: (B, T, ...); info: (T,); key/statistics: ()
     train_state: TrainState,
     config: Config,
     metrics: TrainingMetrics,  # scalar leaves
@@ -1545,8 +1575,12 @@ def optimize_rollout(
     )
     variance = explained_variance(batch.values, batch.returns)  # () undefined for constant returns
     variance_defined = ~jnp.isnan(variance)  # ()
+    with jax.enable_x64():
+        info_metrics = jax.tree.map(jnp.sum, rollout.info_metrics)  # () leaves
     window = WindowMetrics(
         episodes=episodes,  # scalar leaves
+        info=info_metrics,  # () leaves
+        reward_sum=rollout.reward_sum,  # ()
         minibatch_metrics=updated.minibatch_metrics,  # scalar leaves
         explained_variance_sum=jnp.where(variance_defined, variance, 0.0),  # ()
         explained_variance_count=variance_defined.astype(jnp.int32),  # ()
@@ -1579,10 +1613,9 @@ def train_step(
     key: jax.Array,  # () typed PRNG key
     metrics: TrainingMetrics,  # scalar leaves
     schedule_index: int | jax.Array = 0,  # () completed environment steps // batch size
-    info_metrics: RolloutInfoMetrics | None = None,
 ) -> TrainStepResult:
     """Collect on the host, then run compiled PPO epochs over the collected batch."""
-    rollout_carry, rollout = collect_rollout(rollout_carry, train_state, envs, config, key, info_metrics)
+    rollout_carry, rollout = collect_rollout(rollout_carry, train_state, envs, config, key)
     return optimize_rollout(rollout_carry, rollout, train_state, config, metrics, schedule_index)
 
 
@@ -1674,14 +1707,13 @@ def train(config: Config) -> TrainState:
         rollout_carry = jax.device_put(rollout_carry, batched)  # leaves: (B, ...)
 
         window_start = monotonic()
-        info_metrics = RolloutInfoMetrics()
         window_start_step_count = initial_step_count
         planned_rollout_count = start_rollout_index + max(config.total_steps - initial_step_count, 0) // batch_size
         step_count = initial_step_count
         for rollout_index in range(start_rollout_index, planned_rollout_count):
             schedule_index = step_count // batch_size
             train_state, rollout_carry, key, metrics = train_step(
-                rollout_carry, train_state, envs, config, key, metrics, schedule_index, info_metrics=info_metrics
+                rollout_carry, train_state, envs, config, key, metrics, schedule_index
             )  # memory: (B, H); key/metrics: ()
             rollout_count = rollout_index + 1
             is_final_rollout = rollout_count == planned_rollout_count
@@ -1746,6 +1778,7 @@ def train(config: Config) -> TrainState:
                     "train/updates_total": int(train_state.step),
                     "train/progress_fraction": step_count / config.total_steps,
                     "rollout/episode_count": window_episode_count,
+                    "rollout/reward": float(window.reward_sum) / (step_count - window_start_step_count),
                 }
                 if window_update_count:
                     scalars["train/gradient_norm"] = float(window.minibatch_metrics.gradient_norm) / window_update_count
@@ -1766,7 +1799,7 @@ def train(config: Config) -> TrainState:
                 if episode_count:
                     scalars["train/return"] = float(total.episode_return_sum) / episode_count
                     scalars["train/episode_length_steps"] = int(total.episode_length_sum) / episode_count
-                scalars.update(info_metrics.metrics())
+                scalars.update(info_metric_means(window.info))
                 writer.log_metrics(scalars, step_count)
                 episode_return_text = f"{scalars['rollout/return']:.1f}" if window_episode_count else "n/a"
                 episode_length_text = (
@@ -1794,7 +1827,6 @@ def train(config: Config) -> TrainState:
                     flush=True,
                 )
                 window_start = now
-                info_metrics = RolloutInfoMetrics()
                 window_start_step_count = step_count
                 with jax.enable_x64():
                     metrics = metrics._replace(window=RunningSum.init(metrics.window))  # scalar leaves

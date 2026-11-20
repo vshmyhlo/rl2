@@ -169,9 +169,10 @@ def test_power_snapshots_survive_scene_reset_and_preserve_measured_zeros() -> No
         )
         transition = env.step(np.zeros((1, 4), dtype=np.float32))
         env.backend.power_usage.energy.zero_()
-        assert transition.info["energy_hover_seconds"].shape == (1,)
+        assert "energy_hover_seconds" not in transition.info
+        assert transition.info["power_ratio"].shape == (1,)
+        assert transition.info["power_penalty"].shape == (1,)
         assert "power_ratio_max" not in transition.info
-        np.testing.assert_allclose(transition.info["energy_hover_seconds"], 0.04)
         np.testing.assert_allclose(transition.info["power_ratio"], 2.0)
         np.testing.assert_allclose(transition.info["power_penalty"], 0.11)
         env.reset()
@@ -180,7 +181,7 @@ def test_power_snapshots_survive_scene_reset_and_preserve_measured_zeros() -> No
             excess=torch.zeros(1),  # (B,)
         )
         transition = env.step(np.zeros((1, 4), dtype=np.float32))
-        for name in ("energy_hover_seconds", "power_ratio", "power_penalty"):
+        for name in ("power_ratio", "power_penalty"):
             assert transition.info[name].shape == (1,)
             np.testing.assert_array_equal(transition.info[name], [0.0])
 

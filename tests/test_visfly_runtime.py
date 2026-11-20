@@ -418,6 +418,6 @@ def test_compiled_physics_matches_upstream_through_autoresets(num_envs: int, del
         np.testing.assert_allclose(actual.rewards, expected.rewards, atol=2e-5, rtol=2e-5)
         np.testing.assert_array_equal(actual.terminated, expected.terminated)
         np.testing.assert_array_equal(actual.truncated, expected.truncated)
-        for key in ("energy_hover_seconds", "power_ratio", "power_penalty"):
+        for key in ("power_ratio", "power_penalty"):
             assert actual.info[key].shape == (num_envs,)
             np.testing.assert_allclose(actual.info[key], expected.info[key], atol=2e-5, rtol=2e-5)

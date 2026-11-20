@@ -358,12 +358,19 @@ def test_deterministic_policy_step(kind: str, action_shape: tuple[int, ...]) -> 
 
 
 def test_step_info_metrics_weight_samples_preserve_zeros_and_omit_missing_values() -> None:
-    metrics = ppo.RolloutInfoMetrics()
-    metrics.add(GymStyleInfo(stop_reason=np.zeros(2, dtype=np.int32)))  # (B,)
-    assert metrics.metrics() == {}
-    metrics.add(
+    metrics = ppo.init_metrics().window.info  # () leaves
+    update = jax.jit(ppo.RunningSum.update)
+
+    def add(info: GymStyleInfo | None) -> None:
+        nonlocal metrics
+        with jax.enable_x64(), jax.transfer_guard_device_to_host("disallow"):
+            increment = jax.device_put(ppo.step_info_metrics(info))  # () leaves
+            metrics = update(metrics, increment)  # () leaves
+
+    add(GymStyleInfo(stop_reason=np.zeros(2, dtype=np.int32)))  # (B,)
+    assert ppo.info_metric_means(jax.device_get(metrics)) == {}
+    add(
         GymStyleInfo(
-            energy_hover_seconds=np.array([0.04, 0.0], dtype=np.float32),  # (B,)
             power_ratio=np.array([2.0, 0.0], dtype=np.float32),  # (B,)
             power_penalty=np.zeros(2, dtype=np.float32),  # (B,)
             route_sampling=RouteSamplingInfo(
@@ -375,9 +382,8 @@ def test_step_info_metrics_weight_samples_preserve_zeros_and_omit_missing_values
         )
     )
     # A later step has fewer sampled starts; averages must weight starts, not steps.
-    metrics.add(
+    add(
         GymStyleInfo(
-            energy_hover_seconds=np.array([0.02, 0.06], dtype=np.float32),  # (B,)
             power_ratio=np.array([1.0, 3.0], dtype=np.float32),  # (B,)
             power_penalty=np.zeros(2, dtype=np.float32),  # (B,)
             route_sampling=RouteSamplingInfo(
@@ -388,7 +394,25 @@ def test_step_info_metrics_weight_samples_preserve_zeros_and_omit_missing_values
             ),
         )
     )
-    assert metrics.metrics() == pytest.approx(
+    add(None)
+    add(
+        GymStyleInfo(
+            power_penalty=np.zeros(1, dtype=np.float32),  # (B,)
+            route_sampling=RouteSamplingInfo(
+                initial_goal_distance_meters=np.empty(0),  # (N=0,)
+                reference_route_length_meters=np.empty(0),  # (N=0,)
+                direct_path_blocked=np.empty(0, dtype=bool),  # (N=0,)
+                difficulty=np.empty(0, dtype=str),  # (N=0,)
+            ),
+        )
+    )
+    host = jax.device_get(metrics)  # () leaves
+    assert all(leaf.shape == () for leaf in jax.tree.leaves(host))
+    assert all(leaf.dtype == np.float64 for leaf, _ in host.values())
+    assert all(leaf.dtype == np.int64 for _, leaf in host.values())
+    assert host["power_ratio"][1] == 4
+    assert host["power_penalty"][1] == 5
+    assert ppo.info_metric_means(host) == pytest.approx(
         {
             "rollout/power_ratio": 1.5,
             "rollout/power_penalty": 0.0,
@@ -401,6 +425,11 @@ def test_step_info_metrics_weight_samples_preserve_zeros_and_omit_missing_values
             "rollout/difficulty_fraction/hard": 0.25,
         }
     )
+
+    with jax.enable_x64():
+        reset = ppo.RunningSum.init(metrics)  # () leaves
+    assert ppo.info_metric_means(jax.device_get(reset)) == {}
+    assert ppo.info_metric_means(jax.device_get(metrics)) == ppo.info_metric_means(host)
 
 
 def test_rollout_bootstraps_timeout_with_final_observation_and_memory(config: ppo.Config) -> None:
@@ -429,9 +458,11 @@ def test_rollout_bootstraps_timeout_with_final_observation_and_memory(config: pp
             jax.transfer_guard_device_to_host("disallow"),
             patch.object(type(runner.episode_starts), "__bool__", side_effect=AssertionError("Device scalar readback")),
         ):
-            info_metrics = ppo.RolloutInfoMetrics()
-            advanced, rollout = ppo.collect_rollout(runner, state, env, config, key, info_metrics)
-        assert info_metrics.metrics() == pytest.approx(
+            advanced, rollout = ppo.collect_rollout(runner, state, env, config, key)
+        assert all(leaf.shape == (config.num_steps,) for leaf in jax.tree.leaves(rollout.info_metrics))
+        with jax.enable_x64():
+            info = jax.tree.map(jnp.sum, rollout.info_metrics)  # () leaves
+        assert ppo.info_metric_means(jax.device_get(info)) == pytest.approx(
             {
                 "rollout/power_ratio": 2.0,
                 "rollout/power_penalty": 0.0,
@@ -448,6 +479,8 @@ def test_rollout_bootstraps_timeout_with_final_observation_and_memory(config: pp
         np.testing.assert_array_equal(advanced.model_carry[0][0][:, 0], [1, 1, 1, 2])
         assert int(rollout.episode_count) == 6
         assert float(rollout.episode_return_sum) == 12.0  # raw rewards, excluding timeout correction
+        assert rollout.reward_sum.shape == ()
+        assert float(rollout.reward_sum) == 20.0  # Includes unfinished episodes, excludes timeout correction.
         assert int(rollout.episode_length_sum) == 6
         np.testing.assert_array_equal(advanced.episode_returns, [0, 0, 0, 8])
         np.testing.assert_array_equal(batch.observations["state"][:, 0], jax.device_get(runner.observations["state"]))
@@ -472,7 +505,30 @@ def test_real_gym_rollout_compiled_update_and_checkpoint(config: ppo.Config, tmp
             episode_step_counts=jnp.zeros(2, dtype=jnp.int32),
         )
         original = np.asarray(state.params["value_output"]["kernel"]).copy()  # (H, 1)
-        result = ppo.train_step(runner, state, env, config, jax.random.key(1), ppo.init_metrics())
+        env_step = env.step
+        powers = iter(([2.0, 0.0], [1.0, 3.0]))
+
+        def step(actions: NDArray[Any]) -> GymStyleStep[Any]:  # actions: (B, D)
+            transition = env_step(actions)
+            return transition._replace(
+                info=GymStyleInfo(power_ratio=np.asarray(next(powers), dtype=np.float32))  # (B,)
+            )
+
+        metrics = ppo.init_metrics()  # () leaves
+        with jax.enable_x64():
+            prior_info = jax.device_put(
+                ppo.step_info_metrics(GymStyleInfo(power_ratio=np.array([6.0])))  # (N=1,)
+            )  # () leaves
+        metrics = metrics._replace(window=metrics.window._replace(info=prior_info))
+        with patch.object(env, "step", side_effect=step):
+            result = ppo.train_step(runner, state, env, config, jax.random.key(1), metrics)
+        info = jax.device_get(result.metrics.window.info)  # () leaves
+        assert all(leaf.shape == () for leaf in jax.tree.leaves(info))
+        assert ppo.info_metric_means(info) == {"rollout/power_ratio": 12.0 / 5}
+        assert info["power_ratio"][1] == 5
+        with jax.enable_x64():
+            reset = ppo.RunningSum.init(result.metrics.window)  # () leaves
+        assert ppo.info_metric_means(jax.device_get(reset.info)) == {}
         assert int(result.train_state.step) == 1
         assert int(result.metrics.total.episode_count) == 2
         assert not np.array_equal(result.train_state.params["value_output"]["kernel"], original)
@@ -1009,12 +1065,17 @@ def test_train_orchestration_uses_host_env_and_closes_resources(
         key: jax.Array,  # ()
         metrics: ppo.TrainingMetrics,
         schedule_index: int,
-        info_metrics: ppo.RolloutInfoMetrics,
     ) -> ppo.TrainStepResult:
         assert envs is env
-        info_metrics.add(GymStyleInfo(power_ratio=np.array([1.25, 0.0], dtype=np.float32)))  # (B,)
         assert schedule_index == (1 if resume else 0)
+        with jax.enable_x64():
+            info = jax.device_put(
+                ppo.step_info_metrics(
+                    GymStyleInfo(power_ratio=np.array([1.25, 0.0], dtype=np.float32))  # (B,)
+                )
+            )  # () leaves
         window = metrics.window._replace(
+            info=info,  # () leaves
             minibatch_count=jnp.asarray(3),
             rollout_count=jnp.asarray(1),
             update_count=jnp.asarray(2 if accepted else 0),
@@ -1027,6 +1088,7 @@ def test_train_orchestration_uses_host_env_and_closes_resources(
                 gradient_clip_fraction=jnp.asarray(1.0 if accepted else 0.0),  # () accepted clipping count
             ),
             final_approx_kl_sum=jnp.asarray(0.03),  # ()
+            reward_sum=jnp.asarray(6.0 if accepted else 0.0),  # ()
         )
         return ppo.TrainStepResult(
             train_state=state.replace(step=state.step + (2 if accepted else 0)),
@@ -1056,6 +1118,7 @@ def test_train_orchestration_uses_host_env_and_closes_resources(
     assert scalars["train/learning_rate"] == pytest.approx(config.learning_rate / (2 if resume else 1))
     assert scalars["train/progress_fraction"] == pytest.approx(10 / 11 if resume else 1)
     assert "rollout/return" not in scalars
+    assert scalars["rollout/reward"] == (1.5 if accepted else 0.0)
     assert scalars["train/final_approx_kl"] == pytest.approx(0.03)
     assert scalars["train/entropy"] == 2
     assert scalars["train/entropy_loss"] == pytest.approx(-0.02)
@@ -1238,6 +1301,8 @@ def test_final_kl_uses_final_parameters_and_full_batch(
         episode_return_sum=jnp.asarray(0.0),  # ()
         episode_length_sum=jnp.asarray(0),  # ()
         episode_count=jnp.asarray(0),  # ()
+        reward_sum=jnp.asarray(3.0),  # ()
+        info_metrics=jax.tree.map(lambda leaf: leaf[None], ppo.init_metrics().window.info),  # (T=1,) leaves
     )
     carry = ppo.RolloutCarry(
         observations=scalar_batch.observations[:, 0],  # (B, O)
@@ -1253,6 +1318,8 @@ def test_final_kl_uses_final_parameters_and_full_batch(
     log_ratio = output.policy.log_prob(scalar_batch.actions) - scalar_batch.old_log_probs  # (B, T)
     expected = (jnp.expm1(log_ratio) - log_ratio).mean()  # ()
     window = result.metrics.window
+    assert window.reward_sum.shape == ()
+    assert float(window.reward_sum) == 3.0
     assert window.final_approx_kl_sum.shape == ()
     assert float(window.final_approx_kl_sum) == pytest.approx(float(expected), rel=1e-4, abs=1e-9)
     assert float(window.final_approx_kl_sum) > 0

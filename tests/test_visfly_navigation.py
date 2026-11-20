@@ -644,14 +644,20 @@ def test_rgb_backend_rejects_incompatible_sensors(navigation_class: type[Any], k
     "kwargs",
     [
         pytest.param({"spawn_clearance": 0}, id="zero_clearance"),
+        pytest.param({"spawn_clearance": float("nan")}, id="nan_clearance"),
+        pytest.param({"spawn_clearance": float("inf")}, id="infinite_clearance"),
         pytest.param({"flight_height": (2.0, 1.0)}, id="reversed_height"),
         pytest.param({"goal_distance": (0.1, 2.0)}, id="goal_inside_success_radius"),
         pytest.param({"goal_distance": (3.0, 2.0)}, id="reversed_goal_distance"),
     ],
 )
 def test_scene_randomization_rejects_invalid_ranges(navigation_class: type[Any], kwargs: dict[str, Any]) -> None:
-    with pytest.raises(ValueError):
+    with (
+        patch.object(NavigationStub, "__init__", autospec=True, side_effect=NavigationStub.__init__) as initialize,
+        pytest.raises(ValueError),
+    ):
         navigation_class(scene_randomization=True, **kwargs)
+    initialize.assert_not_called()
 
 
 def test_fixed_scenario_pins_scene_state_and_partial_reset_targets(navigation_class: type[Any], tmp_path: Path) -> None:
